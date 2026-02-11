@@ -9,25 +9,24 @@ Key Features:
 - Streaming pipeline to handle videos of arbitrary length without RAM exhaustion.
 - Temporal smoothing to stabilize masks across frames.
 - Topological hole filling to close enclosed gaps in masks.
-- Robust error handling for OpenCV/FFmpeg edge cases.
 
 Usage:
     # Basic usage (default angles 0-315 by 45)
-    python Council.py input.mp4 --model yolov8x-seg.pt
+    python tta_seg.py input.mp4 --model yolov8x-seg.pt
 
     # Production usage with ensemble and temporal smoothing
-    python Council.py input.mp4 \
-        --model yolov8x-seg.pt,yolov8l-seg.pt \
-        --angle 0,90,180,270 \
-        --imgsz 640 \
-        --conf 0.25 \
-        --temporal 2 \
-        --save_labels \
-        --save_binary \
+    python tta_seg.py input.mp4 \\
+        --model yolov8x-seg.pt,yolov8l-seg.pt \\
+        --angle 0,90,180,270 \\
+        --imgsz 640 \\
+        --conf 0.25 \\
+        --temporal 2 \\
+        --save_labels \\
+        --save_binary \\
         --no_temp
 
     # High performance (requires TensorRT exported model)
-    python Council.py input.mp4 --model yolov8x-seg.engine --int8
+    python tta_seg.py input.mp4 --model yolov8x-seg.engine --int8
 """
 
 import argparse
@@ -395,18 +394,12 @@ def main():
                         cv2.cvtColor(final_mask, cv2.COLOR_GRAY2BGR))
 
                 # Overlay video
-                # FIX: Blend full frames first to avoid OpenCV errors on sliced arrays
                 overlay = target['orig'].copy()
                 green = np.zeros_like(overlay)
                 green[:, :, 1] = 255
-
-                # Blend (addWeighted works reliably on full contiguous frames)
-                blended = cv2.addWeighted(overlay, 0.5, green, 0.5, 0)
-
-                # Assign using numpy mask (works reliably on slices)
                 m_bool = final_mask > 0
-                overlay[m_bool] = blended[m_bool]
-
+                overlay[m_bool] = cv2.addWeighted(
+                    overlay[m_bool], 0.5, green[m_bool], 0.5, 0)
                 final_writer.write(overlay)
 
                 # Prune buffer
