@@ -99,9 +99,7 @@ def ffmpeg_pipe(output_path, w, h, fps, mode="temp"):
     ]
 
     if mode == "temp":
-#        cmd += ["-c:v", "h264_nvenc", "-preset", "lossless",
-
-        cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "0",
+        cmd += ["-c:v", "h264_nvenc", "-preset", "lossless",
                 "-pix_fmt", "yuv444p", str(output_path)]
     elif mode == "final":
         cmd += ["-c:v", "ffv1", "-pix_fmt", "bgr24", str(output_path)]
@@ -322,7 +320,8 @@ def main():
             if not ret:
                 break
             aug_frame = aug.forward(frame)
-            writer.stdin.write(aug_frame.tobytes())
+            # Avoid an extra full-frame memcpy; numpy arrays support the buffer protocol.
+            writer.stdin.write(aug_frame)
             count += 1
 
         cap.release()
@@ -375,13 +374,22 @@ def main():
                     break
 
                 if r.masks is not None and len(r.masks.data) > 0:
-                    conf = float(r.boxes.conf.max().cpu())
+                    conf = float(r.boxes.conf.max().item())
                     if conf > max_confs[fi]:
                         max_confs[fi] = conf
 
-                    # Union detections: pure numpy, no torch import needed
-                    masks_np = r.masks.data.cpu().numpy()  # (N, H, W) float32
-                    var_union = (masks_np.max(axis=0) > 0.5).astype(np.uint8) * 255
+                    # CRITICAL PERF FIX:
+                    # The old code copied the full (N,H,W) float32 mask stack from GPU->CPU
+                    # every frame (often N is large with iou=1.0). We only need the per-frame
+                    # union, so compute it on the device first and transfer a single (H,W)
+                    # uint8 mask.
+                    var_union = (
+                        (r.masks.data.max(dim=0)[0] > 0.5)
+                        .byte()
+                        .mul_(255)
+                        .cpu()
+                        .numpy()
+                    )
 
                     if var_union.shape != (args.imgsz, args.imgsz):
                         var_union = cv2.resize(var_union,
@@ -540,7 +548,8 @@ def main():
 
         # -- Binary mask --
         if args.save_binary:
-            bin_pipe.stdin.write(mask.tobytes())
+            # Avoid extra memcpy on every frame.
+            bin_pipe.stdin.write(mask)
             tiff_path = binary_dir / f"{stem}_Binary_{i:04d}.tiff"
             cv2.imwrite(str(tiff_path), mask)
 
@@ -551,7 +560,8 @@ def main():
             overlay[roi] = cv2.addWeighted(
                 frame[roi], 0.5,
                 blue_layer[roi], 0.5, 0)
-        vid_pipe.stdin.write(overlay.tobytes())
+        # Avoid extra memcpy on every frame.
+        vid_pipe.stdin.write(overlay)
 
         if (i + 1) % 100 == 0 or i == n_frames - 1:
             print(f"  Frame {i + 1}/{n_frames}", end="\r")
