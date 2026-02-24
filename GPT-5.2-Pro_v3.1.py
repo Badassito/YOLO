@@ -208,7 +208,10 @@ def create_sagittal_and_coronal_views(
     for y in range(Y):
         frame = np.ascontiguousarray(mm[:, y, :, :])  # (T, X, 3)
         sag_p.stdin.write(frame.tobytes())
+    # Workaround for Python 3.12+ 'ValueError: flush of closed file' when calling communicate()
+    # after closing stdin. We close stdin to signal EOF, then set it to None so communicate() won't flush it.
     sag_p.stdin.close()
+    sag_p.stdin = None
     _, sag_err = sag_p.communicate()
     if sag_p.returncode != 0:
         raise RuntimeError(f"FFmpeg sagittal encode failed:\n{sag_err.decode('utf-8', errors='ignore')}")
@@ -219,7 +222,9 @@ def create_sagittal_and_coronal_views(
     for x in range(X):
         frame = np.ascontiguousarray(mm[:, :, x, :])  # (T, Y, 3)
         cor_p.stdin.write(frame.tobytes())
+    # Workaround for Python 3.12+ 'ValueError: flush of closed file' when calling communicate()
     cor_p.stdin.close()
+    cor_p.stdin = None
     _, cor_err = cor_p.communicate()
     if cor_p.returncode != 0:
         raise RuntimeError(f"FFmpeg coronal encode failed:\n{cor_err.decode('utf-8', errors='ignore')}")
@@ -1100,7 +1105,9 @@ def save_binary_masks(
             cv2.imwrite(str(tif), m)
         p.stdin.write(m.tobytes())
 
+    # Workaround for Python 3.12+ 'ValueError: flush of closed file' in communicate() after stdin.close().
     p.stdin.close()
+    p.stdin = None
     _, err = p.communicate()
     if p.returncode != 0:
         raise RuntimeError(f"FFmpeg binary mask video encode failed:\n{err.decode('utf-8', errors='ignore')}")
