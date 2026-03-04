@@ -41,7 +41,7 @@ Implements the requested pipeline:
    - Final transverse overlay MKV (FFV1): original frames + blue (50% alpha) mask.
    - Optional YOLO segmentation labels (blank files for no-detection frames).
    - Optional binary mask TIFF sequence + binary MKV (FFV1).
-   - Optional white-pixel count marker file (named "{count}.txt").
+   - Optional white-pixel count marker file (named "{count}").
 
 Dependencies (Python):
   pip install opencv-python numpy scipy scikit-image tifffile tqdm ultralytics
@@ -484,13 +484,19 @@ def bytes_for_packbits(h: int, w: int) -> int:
 
 
 def pack_mask(mask01: np.ndarray) -> np.ndarray:
-    flat = mask01.reshape(-1).astype(np.uint8)
-    return np.packbits(flat)
+    """Pack a 2D/1D binary mask (bool or 0/1 uint8) into np.packbits uint8."""
+    flat = np.asarray(mask01).reshape(-1)
+    # np.packbits supports bool directly; for numeric inputs we treat nonzero as 1.
+    if flat.dtype == np.bool_:
+        return np.packbits(flat)
+    else:
+        return np.packbits((flat != 0).astype(np.uint8, copy=False))
 
 
 def unpack_mask(packed: np.ndarray, h: int, w: int) -> np.ndarray:
+    """Unpack a packed-bit mask into a 2D uint8 array of shape (h,w) with values {0,1}."""
     flat = np.unpackbits(packed)[: h * w]
-    return flat.reshape((h, w)).astype(np.bool_)
+    return flat.reshape((h, w)).astype(np.uint8, copy=False)
 
 
 def any_mask(packed: np.ndarray) -> bool:
@@ -683,16 +689,57 @@ def apply_min_conf_filter_inplace(
 
 
 def fill_2d_holes_inplace(union_mm: np.memmap, h: int, w: int) -> None:
-    """Fill all 2D holes per slice (donut-hole fill)."""
+    """Fill all 2D holes per slice (donut-hole fill).
+
+    NOTE:
+      We intentionally avoid scipy.ndimage.binary_fill_holes() here. On very large
+      slices (e.g., 3072x3072) and long runs, SciPy's implementation can create
+      large transient allocations and may destabilize the process depending on
+      the system / BLAS / OpenMP configuration.
+
+      This implementation uses an OpenCV flood-fill on the inverted mask with a
+      1-pixel constant-black border, which is robust and memory-stable:
+
+        holes = background components NOT connected to the padded image boundary
+        filled = mask OR holes
+    """
     n = union_mm.shape[0]
+
+    # Preallocate scratch buffers (reduces allocator churn / fragmentation).
+    pad = np.zeros((h + 2, w + 2), dtype=np.uint8)          # 0/1 with a black border
+    inv = np.empty_like(pad)                                # 0/1 inverse of pad
+    flood = np.empty_like(pad)                              # working image for floodFill
+    ffmask = np.zeros((h + 4, w + 4), dtype=np.uint8)        # floodFill mask: (H+2, W+2)
+    holes = np.empty(pad.shape, dtype=np.bool_)              # boolean scratch
+
     for i in tqdm(range(n), desc="2D hole fill"):
         packed = np.asarray(union_mm[i])
         if not any_mask(packed):
             continue
-        mask = unpack_mask(packed, h, w)
-        filled = ndi.binary_fill_holes(mask)
-        union_mm[i, :] = pack_mask(filled.astype(np.uint8))
 
+        m = unpack_mask(packed, h, w)  # uint8 {0,1}
+
+        # Build padded mask
+        pad.fill(0)
+        pad[1:-1, 1:-1] = m
+
+        # inv = 1 - pad (still {0,1})
+        inv[:] = 1
+        inv -= pad
+
+        # Flood-fill the outside background (connected to the padded boundary)
+        flood[:] = inv
+        ffmask.fill(0)
+        # New value=2 so we can distinguish "reached outside background" from "unreached holes" (=1)
+        cv2.floodFill(flood, ffmask, seedPoint=(0, 0), newVal=2)
+
+        # Holes are inverse-background pixels still == 1 after flood fill
+        np.equal(flood, 1, out=holes)
+        if holes.any():
+            pad[holes] = 1
+
+        filled = pad[1:-1, 1:-1]
+        union_mm[i, :] = pack_mask(filled)
 
 # --------------------------
 # 3D assembly + postprocessing
@@ -720,7 +767,7 @@ def assemble_model_volume_into_ensemble(
 
     for t in tqdm(range(T), desc="Assembling volume from transverse"):
         m = unpack_mask(np.asarray(transverse[t]), H, W)
-        ensemble_mm[t, :, :] |= m.astype(np.uint8)
+        ensemble_mm[t, :, :] |= m
 
     if disable_multiplanar:
         return
@@ -731,7 +778,7 @@ def assemble_model_volume_into_ensemble(
 
     for y in tqdm(range(H), desc="Assembling volume from sagittal"):
         m = unpack_mask(np.asarray(sagittal[y]), T, W)
-        ensemble_mm[:, y, :] |= m.astype(np.uint8)
+        ensemble_mm[:, y, :] |= m
 
     coronal = view_union_mms["coronal"]
     bytes_ty = bytes_for_packbits(T, H)
@@ -739,7 +786,7 @@ def assemble_model_volume_into_ensemble(
 
     for x in tqdm(range(W), desc="Assembling volume from coronal"):
         m = unpack_mask(np.asarray(coronal[x]), T, H)  # (T,H) cols are y
-        ensemble_mm[:, :, x] |= m.astype(np.uint8)
+        ensemble_mm[:, :, x] |= m
 
 
 def fill_3d_voids(mask_u8: np.ndarray) -> np.ndarray:
