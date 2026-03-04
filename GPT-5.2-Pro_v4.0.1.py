@@ -73,6 +73,7 @@ except Exception as e:  # pragma: no cover
 from scipy import ndimage as ndi  # type: ignore
 
 try:
+    # 3D skeletonization for optional interpolation
     from skimage.morphology import skeletonize  # type: ignore
 except Exception as e:  # pragma: no cover
     raise RuntimeError("scikit-image is required: pip install scikit-image") from e
@@ -294,12 +295,30 @@ def ffmpeg_rawvideo_writer(
 
 
 def close_ffmpeg_writer(proc: subprocess.Popen) -> None:
-    assert proc.stdin is not None
-    proc.stdin.close()
+    """Close an ffmpeg writer Popen safely (Python 3.12+ compatible).
+
+    IMPORTANT:
+      Calling proc.stdin.close() and then proc.communicate() triggers
+      'ValueError: flush of closed file' on Python 3.12, because communicate()
+      tries to flush stdin even if it is already closed. We therefore:
+        1) close stdin (if open)
+        2) set proc.stdin = None
+        3) call communicate() to drain stdout/stderr
+    """
+    if proc.stdin is not None and not proc.stdin.closed:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+
+    # Prevent subprocess.communicate() from flushing a closed stdin (Py3.12 behavior)
+    proc.stdin = None  # type: ignore[attr-defined]
+
     _, err = proc.communicate()
     if proc.returncode not in (0, None):
         msg = err.decode("utf-8", errors="ignore") if isinstance(err, (bytes, bytearray)) else str(err)
         raise RuntimeError(f"ffmpeg write failed: {msg}")
+
 
 
 # --------------------------
@@ -349,7 +368,10 @@ def build_affine(
       - rotation around padded center
       - scale to out_size x out_size
       - shift in destination space
-    OpenCV warpAffine uses a matrix mapping destination -> source.
+    OpenCV cv2.warpAffine expects a matrix that maps source->destination (unless WARP_INVERSE_MAP is set).
+    We compute M_out_to_src (out->src) and its inverse M_src_to_out (src->out) so we can:
+      - generate augmented frames with M_src_to_out
+      - map predicted masks back with M_out_to_src
     """
     if pad_mode not in ("clamp", "pad"):
         raise ValueError("pad_mode must be 'clamp' or 'pad'")
@@ -513,7 +535,7 @@ def predict_video_and_accumulate(
     # accumulation into per-view union stack (native resolution, packed bits)
     view_union_mm: np.memmap,          # uint8 packbits, shape (num_slices, bytes_native)
     view_conf_mm: np.memmap,           # float16, shape (num_slices,)
-    M_native_to_out: np.ndarray,       # 2x3, maps destination(native)->source(out) for warpAffine
+    M_out_to_native: np.ndarray,       # 2x3, maps augmented(out)->native for cv2.warpAffine (src->dst)
     native_h: int,
     native_w: int,
 ) -> None:
@@ -587,10 +609,10 @@ def predict_video_and_accumulate(
         pred_mask_mm[idx, :] = pack_mask(union)
         pred_conf_mm[idx] = np.float16(conf_val)
 
-        # Undo augmentation (warp from out->native by supplying native->out matrix)
+        # Undo augmentation (warp predicted mask from augmented(out) back to native view)
         mask_back = cv2.warpAffine(
             union,
-            M_native_to_out,
+            M_out_to_native,
             dsize=(native_w, native_h),
             flags=cv2.INTER_NEAREST,
             borderMode=cv2.BORDER_CONSTANT,
@@ -851,7 +873,7 @@ def interpolate_skeleton_extensions(
             if sub.sum() < 8:
                 continue
 
-            skel = skeletonize_3d(sub).astype(bool)
+            skel = skeletonize(sub).astype(bool)
             if not skel.any():
                 continue
 
@@ -1170,7 +1192,7 @@ def main() -> None:
                         for frame in tqdm(iter_view_frames(volume_rgb, view), total=view.num_slices, desc=f"Augment {view.name} {aug_id}"):
                             out = cv2.warpAffine(
                                 frame,
-                                aff.M_out_to_src,
+                                aff.M_src_to_out,
                                 dsize=(args.imgsz, args.imgsz),
                                 flags=cv2.INTER_LINEAR,
                                 borderMode=cv2.BORDER_CONSTANT,
@@ -1208,7 +1230,7 @@ def main() -> None:
                         cfg=pred_cfg,
                         view_union_mm=union_by_model[model_name][view.name],
                         view_conf_mm=conf_by_model[model_name][view.name],
-                        M_native_to_out=aff.M_src_to_out,  # native (dst) -> out (src)
+                        M_out_to_native=aff.M_out_to_src,  # out (src) -> native (dst)
                         native_h=view.src_h,
                         native_w=view.src_w,
                     )
@@ -1285,7 +1307,7 @@ def main() -> None:
 
     if args.binary:
         count = int(np.sum(ensemble_u8))
-        (out_dir / f"{count}.txt").write_text(str(count) + "\n")
+        (out_dir / str(count)).write_text(str(count) + "\n")
 
     # Troubleshooting outputs without interpolation
     if args.troubleshooting and nointerp_mask is not None:
