@@ -1319,7 +1319,7 @@ def write_binary_outputs(
 
     for t in tqdm(range(T), desc=f"Writing binary TIFF sequence ({tiff_subdir})"):
         img = (mask_u8[t] * 255).astype(np.uint8)
-        tifffile.imwrite(str(tiff_dir / f"{tiff_prefix}_{t:04d}.tiff"), img)
+        tifffile.imwrite(str(tiff_dir / f"{tiff_prefix}_{t+1:04d}.tiff"), img)
 
     vid_path = out_dir / video_name
     proc = ffmpeg_rawvideo_writer(
@@ -1411,7 +1411,7 @@ def write_yolo_labels(
         frame_prefix = stem
 
     for t in tqdm(range(T), desc=f"Writing YOLO labels ({labels_subdir})"):
-        fp = labels_dir / f"{frame_prefix}_{t:04d}.txt"
+        fp = labels_dir / f"{frame_prefix}_{t+1:04d}.txt"
         m = (mask_u8[t] > 0)
         if not m.any():
             fp.write_text("")
