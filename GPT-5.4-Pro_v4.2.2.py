@@ -155,10 +155,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--troubleshooting", action="store_true",
                    help="Keep temp files and save pass snapshots before each interpolation pass")
 
-    p.add_argument("--interpolate", default=5, type=int,
+    p.add_argument("--interpolate", default=15, type=int,
                    help="Spherical-sector radius N (voxels). 0 disables interpolation.")
     p.add_argument("--interpolate_passes", default=1, type=int,
                    help="Run the interpolation process this many passes, treating the previous pass as real")
+    p.add_argument("--interpolate_min_radius", default=3, type=float,
+                   help="Skip candidate bridges whose effective radius is <= this value")
     p.add_argument("--cone_half_angle", default=15.0, type=float,
                    help="Spherical-sector half-angle in degrees. 0=ray, 90=hemisphere")
     return p
@@ -872,7 +874,30 @@ class EndpointSeed:
     label: int
     point: Tuple[int, int, int]      # (z, y, x)
     direction: np.ndarray            # unit vector in (z, y, x)
-    tube_radius: float
+    support_radius: float            # robust local radius for this endpoint
+
+
+@dataclass(frozen=True)
+class BridgeCandidate:
+    source_label: int
+    target_label: int
+    source_point: Tuple[int, int, int]
+    target_point: Tuple[int, int, int]
+    hit_point: Tuple[int, int, int]
+    distance: float
+    source_radius: float
+    target_radius: float
+    bridge_radius: float
+
+
+@dataclass(frozen=True)
+class PlannedBridge:
+    pair_labels: Tuple[int, int]
+    p0: Tuple[int, int, int]
+    p1: Tuple[int, int, int]
+    radius0: float
+    radius1: float
+    bridge_radius: float
 
 
 def skeletonize_volume(mask_bool: np.ndarray) -> np.ndarray:
@@ -950,6 +975,33 @@ def _trace_inward_path(
     return path
 
 
+def _estimate_seed_support_radius(
+    dist_sub: np.ndarray,
+    path: List[Tuple[int, int, int]],
+    extension_radius: int,
+) -> float:
+    """
+    Estimate a robust local support radius for an endpoint by sampling several voxels
+    inward along the skeleton path instead of trusting only the terminal endpoint voxel.
+    This suppresses tiny bead-like bridges caused by noisy terminal skeleton branches.
+    """
+    if not path:
+        return 1.0
+
+    max_samples = max(2, min(len(path), max(3, min(8, int(extension_radius) + 1))))
+    vals: List[float] = []
+    for pt in path[:max_samples]:
+        v = float(dist_sub[pt])
+        if v > 0:
+            vals.append(v)
+
+    if not vals:
+        return 1.0
+
+    radius_cap = max(1.0, float(extension_radius))
+    return max(1.0, min(max(vals), radius_cap))
+
+
 def _build_endpoint_seeds(
     labels_real: np.ndarray,
     extension_radius: int,
@@ -958,7 +1010,7 @@ def _build_endpoint_seeds(
     objs = ndi.find_objects(labels_real)
     seeds: List[EndpointSeed] = []
     endpoint_count = 0
-    direction_depth = max(2, min(6, int(extension_radius)))
+    direction_depth = max(2, min(8, int(extension_radius)))
 
     for lbl, sl in enumerate(objs, start=1):
         if sl is None:
@@ -978,7 +1030,6 @@ def _build_endpoint_seeds(
             continue
 
         z0, y0, x0 = sl[0].start, sl[1].start, sl[2].start
-        radius_cap = max(1.0, 0.5 * float(extension_radius) + 1.0)
 
         for ep in ep_coords:
             ep_t = (int(ep[0]), int(ep[1]), int(ep[2]))
@@ -997,18 +1048,106 @@ def _build_endpoint_seeds(
                     continue
             direction /= norm
 
-            endpoint_radius = float(dist_sub[ep_t]) if float(dist_sub[ep_t]) > 0 else 1.0
             seeds.append(
                 EndpointSeed(
                     label=int(lbl),
                     point=(z0 + ep_t[0], y0 + ep_t[1], x0 + ep_t[2]),
                     direction=direction.astype(np.float32),
-                    tube_radius=max(1.0, min(endpoint_radius, radius_cap)),
+                    support_radius=_estimate_seed_support_radius(
+                        dist_sub=dist_sub,
+                        path=path,
+                        extension_radius=extension_radius,
+                    ),
                 )
             )
             endpoint_count += 1
 
     return seeds, endpoint_count
+
+
+def _estimate_local_object_radius(
+    labels_real: np.ndarray,
+    label: int,
+    center: Tuple[int, int, int],
+    radius_cap: int,
+) -> float:
+    """
+    Approximate the largest integer-radius sphere fully contained in a labeled object around `center`.
+    This avoids allocating a full-volume EDT while still producing a stable bridge radius estimate.
+    """
+    z0, y0, x0 = center
+    Z, Y, X = labels_real.shape
+    if not (0 <= z0 < Z and 0 <= y0 < Y and 0 <= x0 < X):
+        return 0.0
+    if int(labels_real[z0, y0, x0]) != int(label):
+        return 0.0
+
+    best = 1
+    for r in range(2, max(2, int(radius_cap)) + 1):
+        offsets = _integer_sphere_offsets(r)
+        dz = offsets[:, 0].astype(np.int64, copy=False)
+        dy = offsets[:, 1].astype(np.int64, copy=False)
+        dx = offsets[:, 2].astype(np.int64, copy=False)
+
+        zz = z0 + dz
+        yy = y0 + dy
+        xx = x0 + dx
+        inside = (
+            (zz >= 0) & (zz < Z) &
+            (yy >= 0) & (yy < Y) &
+            (xx >= 0) & (xx < X)
+        )
+        if not np.all(inside):
+            break
+        if not np.all(labels_real[zz, yy, xx] == int(label)):
+            break
+        best = r
+
+    return float(max(1, best))
+
+
+def _estimate_target_anchor_and_radius(
+    labels_real: np.ndarray,
+    target_label: int,
+    hit_point: Tuple[int, int, int],
+    direction: np.ndarray,
+    radius_cap: int,
+    max_steps: int,
+) -> Tuple[Tuple[int, int, int], float]:
+    """
+    Starting from the first target intercept, walk a few voxels deeper into the target
+    along the connection direction and keep the in-object point with the strongest local support.
+    This avoids deriving bridge width from a single surface voxel.
+    """
+    direction = np.asarray(direction, dtype=np.float32)
+    dnorm = float(np.linalg.norm(direction))
+    if dnorm <= 0:
+        return hit_point, max(1.0, _estimate_local_object_radius(labels_real, target_label, hit_point, radius_cap))
+
+    direction = direction / dnorm
+    best_point = hit_point
+    best_radius = max(1.0, _estimate_local_object_radius(labels_real, target_label, hit_point, radius_cap))
+    Z, Y, X = labels_real.shape
+    seen: set[Tuple[int, int, int]] = {hit_point}
+
+    for step in range(1, max(1, int(max_steps)) + 1):
+        q = tuple(int(round(hit_point[i] + float(direction[i]) * float(step))) for i in range(3))
+        if q in seen:
+            continue
+        seen.add(q)
+
+        qz, qy, qx = q
+        if not (0 <= qz < Z and 0 <= qy < Y and 0 <= qx < X):
+            break
+        if int(labels_real[qz, qy, qx]) != int(target_label):
+            break
+
+        r = _estimate_local_object_radius(labels_real, target_label, q, radius_cap)
+        if r > best_radius + 1e-6:
+            best_radius = r
+            best_point = q
+
+    return best_point, max(1.0, best_radius)
 
 
 def _sorted_sphere_offsets(radius: int) -> List[Tuple[float, int, int, int]]:
@@ -1076,6 +1215,171 @@ def _closest_sector_hit(
             return (qz, qy, qx), other, dist
 
     return None
+
+
+def _build_bridge_candidates(
+    labels_real: np.ndarray,
+    seeds: List[EndpointSeed],
+    extension_radius: int,
+    cone_half_angle_deg: float,
+) -> List[BridgeCandidate]:
+    sphere_offsets = _sorted_sphere_offsets(int(extension_radius))
+    anchor_depth = max(2, min(6, int(extension_radius)))
+    radius_cap = max(1, int(extension_radius))
+
+    candidates: List[BridgeCandidate] = []
+    for seed in seeds:
+        hit = _closest_sector_hit(
+            labels_real=labels_real,
+            source_label=seed.label,
+            point=seed.point,
+            direction=seed.direction,
+            extension_radius=int(extension_radius),
+            cone_half_angle_deg=float(cone_half_angle_deg),
+            sphere_offsets=sphere_offsets,
+        )
+        if hit is None:
+            continue
+
+        hit_point, hit_label, hit_distance = hit
+        target_point, target_radius = _estimate_target_anchor_and_radius(
+            labels_real=labels_real,
+            target_label=int(hit_label),
+            hit_point=hit_point,
+            direction=seed.direction,
+            radius_cap=radius_cap,
+            max_steps=anchor_depth,
+        )
+        bridge_radius = min(float(seed.support_radius), float(target_radius))
+        candidates.append(
+            BridgeCandidate(
+                source_label=int(seed.label),
+                target_label=int(hit_label),
+                source_point=seed.point,
+                target_point=target_point,
+                hit_point=hit_point,
+                distance=float(hit_distance),
+                source_radius=float(seed.support_radius),
+                target_radius=float(target_radius),
+                bridge_radius=float(bridge_radius),
+            )
+        )
+
+    return candidates
+
+
+def _euclidean_distance(p0: Tuple[int, int, int], p1: Tuple[int, int, int]) -> float:
+    dz = float(p0[0] - p1[0])
+    dy = float(p0[1] - p1[1])
+    dx = float(p0[2] - p1[2])
+    return math.sqrt(dz * dz + dy * dy + dx * dx)
+
+
+def _reciprocal_pair_score(
+    c_ab: BridgeCandidate,
+    c_ba: BridgeCandidate,
+) -> Tuple[float, float, float]:
+    """
+    Prefer reciprocal candidates that point toward each other's supported anchor region,
+    then prefer shorter intercepts, then prefer wider connections.
+    """
+    consistency = (
+        _euclidean_distance(c_ab.target_point, c_ba.source_point) +
+        _euclidean_distance(c_ba.target_point, c_ab.source_point)
+    )
+    return (
+        float(consistency),
+        float(c_ab.distance + c_ba.distance),
+        -float(min(c_ab.bridge_radius, c_ba.bridge_radius)),
+    )
+
+
+def _plan_pairwise_bridges(
+    candidates: List[BridgeCandidate],
+    interpolate_min_radius: float,
+) -> Tuple[List[PlannedBridge], Dict[str, int]]:
+    """
+    Collapse many endpoint-level candidate hits into at most one bridge per unordered object pair.
+    This directly suppresses the failure mode where multiple nearby endpoints create many small
+    circular bridges instead of one larger bridge.
+    """
+    by_pair: Dict[Tuple[int, int], List[BridgeCandidate]] = {}
+    for cand in candidates:
+        key = (
+            min(int(cand.source_label), int(cand.target_label)),
+            max(int(cand.source_label), int(cand.target_label)),
+        )
+        by_pair.setdefault(key, []).append(cand)
+
+    planned: List[PlannedBridge] = []
+    skipped_by_min_radius = 0
+
+    for pair_key, group in by_pair.items():
+        a, b = pair_key
+        ab = [c for c in group if int(c.source_label) == int(a) and int(c.target_label) == int(b)]
+        ba = [c for c in group if int(c.source_label) == int(b) and int(c.target_label) == int(a)]
+
+        if ab and ba:
+            best_pair: Optional[Tuple[BridgeCandidate, BridgeCandidate]] = None
+            best_score: Optional[Tuple[float, float, float]] = None
+            for c_ab in ab:
+                for c_ba in ba:
+                    score = _reciprocal_pair_score(c_ab, c_ba)
+                    if best_score is None or score < best_score:
+                        best_score = score
+                        best_pair = (c_ab, c_ba)
+
+            assert best_pair is not None
+            c_ab, c_ba = best_pair
+
+            radius0 = max(float(c.source_radius) for c in ab)
+            radius1 = max(float(c.source_radius) for c in ba)
+            bridge_radius = min(radius0, radius1)
+            if bridge_radius <= float(interpolate_min_radius):
+                skipped_by_min_radius += 1
+                continue
+
+            planned.append(
+                PlannedBridge(
+                    pair_labels=pair_key,
+                    p0=c_ab.source_point,
+                    p1=c_ba.source_point,
+                    radius0=float(radius0),
+                    radius1=float(radius1),
+                    bridge_radius=float(bridge_radius),
+                )
+            )
+            continue
+
+        best = min(group, key=lambda c: (float(c.distance), -float(c.bridge_radius)))
+
+        # With only one directional hit, the target-side radius estimate is usually the least stable
+        # because the first intercept occurs at the target surface. Use the source-side support radius
+        # to decide whether the bridge is too small, and keep the deeper target anchor only for geometry.
+        radius0 = max(float(c.source_radius) for c in group if int(c.source_label) == int(best.source_label))
+        target_radius = max(float(c.target_radius) for c in group)
+        radius1 = max(radius0, target_radius)
+        bridge_radius = radius0
+        if bridge_radius <= float(interpolate_min_radius):
+            skipped_by_min_radius += 1
+            continue
+
+        planned.append(
+            PlannedBridge(
+                pair_labels=pair_key,
+                p0=best.source_point,
+                p1=best.target_point,
+                radius0=float(radius0),
+                radius1=float(radius1),
+                bridge_radius=float(bridge_radius),
+            )
+        )
+
+    return planned, {
+        "pair_groups": int(len(by_pair)),
+        "accepted_connections": int(len(planned)),
+        "skipped_by_min_radius": int(skipped_by_min_radius),
+    }
 
 
 _SPHERE_PAINT_CACHE: Dict[int, np.ndarray] = {}
@@ -1190,14 +1494,21 @@ def _paint_connection_tube(
     mask: np.ndarray,
     p0: Tuple[int, int, int],
     p1: Tuple[int, int, int],
-    radius: float,
+    radius0: float,
+    radius1: Optional[float] = None,
 ) -> int:
     pts = bresenham3d(p0, p1)
     if not pts:
         return 0
 
+    if radius1 is None:
+        radius1 = radius0
+
+    radius0 = max(0.5, float(radius0))
+    radius1 = max(0.5, float(radius1))
     added = 0
-    if radius <= 1.0:
+
+    if max(radius0, radius1) <= 1.0:
         for pt in pts:
             z, y, x = pt
             if not mask[z, y, x]:
@@ -1205,7 +1516,10 @@ def _paint_connection_tube(
                 added += 1
         return added
 
-    for pt in pts:
+    denom = max(1, len(pts) - 1)
+    for idx, pt in enumerate(pts):
+        alpha = float(idx) / float(denom)
+        radius = (1.0 - alpha) * radius0 + alpha * radius1
         added += _paint_sphere(mask, pt, radius)
 
     return added
@@ -1215,6 +1529,7 @@ def interpolate_spherical_sector_pass(
     mask_u8: np.ndarray,
     extension_radius: int,
     cone_half_angle_deg: float,
+    interpolate_min_radius: float,
 ) -> Tuple[np.ndarray, Dict[str, object]]:
     """
     One interpolation pass using spherical-sector interception from skeleton endpoints.
@@ -1225,12 +1540,18 @@ def interpolate_spherical_sector_pass(
       - New interpolation added during this pass is transparent to the search, and only becomes "real"
         in the next pass (handled by the caller).
       - If multiple objects are intercepted, the closest intercept is used.
+      - Multiple endpoint-level hits between the same unordered object pair are collapsed into at most
+        one painted bridge for the pass, which suppresses the common "many small circular bridges"
+        failure mode.
     """
     if extension_radius <= 0:
         return np.asarray(mask_u8, dtype=np.uint8), {
             "num_objects": 0,
             "num_endpoints": 0,
             "candidate_connections": 0,
+            "pair_groups": 0,
+            "accepted_connections": 0,
+            "skipped_by_min_radius": 0,
             "added_voxels": 0,
             "skipped": True,
         }
@@ -1242,6 +1563,9 @@ def interpolate_spherical_sector_pass(
             "num_objects": int(num_objects),
             "num_endpoints": 0,
             "candidate_connections": 0,
+            "pair_groups": 0,
+            "accepted_connections": 0,
+            "skipped_by_min_radius": 0,
             "added_voxels": 0,
             "skipped": num_objects <= 1,
         }
@@ -1252,41 +1576,42 @@ def interpolate_spherical_sector_pass(
             "num_objects": int(num_objects),
             "num_endpoints": int(num_endpoints),
             "candidate_connections": 0,
+            "pair_groups": 0,
+            "accepted_connections": 0,
+            "skipped_by_min_radius": 0,
             "added_voxels": 0,
             "skipped": False,
         }
 
-    sphere_offsets = _sorted_sphere_offsets(int(extension_radius))
+    candidates = _build_bridge_candidates(
+        labels_real=labels_real,
+        seeds=seeds,
+        extension_radius=int(extension_radius),
+        cone_half_angle_deg=float(cone_half_angle_deg),
+    )
+    planned_bridges, plan_stats = _plan_pairwise_bridges(
+        candidates=candidates,
+        interpolate_min_radius=float(interpolate_min_radius),
+    )
+
     work_mask = pass_real.copy()
     added_voxels = 0
-    candidate_connections = 0
-
-    for seed in seeds:
-        hit = _closest_sector_hit(
-            labels_real=labels_real,
-            source_label=seed.label,
-            point=seed.point,
-            direction=seed.direction,
-            extension_radius=int(extension_radius),
-            cone_half_angle_deg=float(cone_half_angle_deg),
-            sphere_offsets=sphere_offsets,
-        )
-        if hit is None:
-            continue
-
-        hit_point, _hit_label, _hit_distance = hit
-        candidate_connections += 1
+    for bridge in planned_bridges:
         added_voxels += _paint_connection_tube(
             work_mask,
-            p0=seed.point,
-            p1=hit_point,
-            radius=seed.tube_radius,
+            p0=bridge.p0,
+            p1=bridge.p1,
+            radius0=bridge.radius0,
+            radius1=bridge.radius1,
         )
 
     stats: Dict[str, object] = {
         "num_objects": int(num_objects),
         "num_endpoints": int(num_endpoints),
-        "candidate_connections": int(candidate_connections),
+        "candidate_connections": int(len(candidates)),
+        "pair_groups": int(plan_stats["pair_groups"]),
+        "accepted_connections": int(plan_stats["accepted_connections"]),
+        "skipped_by_min_radius": int(plan_stats["skipped_by_min_radius"]),
         "added_voxels": int(added_voxels),
         "skipped": False,
     }
@@ -1518,6 +1843,8 @@ def main() -> None:
         raise ValueError("--interpolate must be >= 0")
     if int(args.interpolate_passes) < 1:
         raise ValueError("--interpolate_passes must be >= 1")
+    if float(args.interpolate_min_radius) < 0:
+        raise ValueError("--interpolate_min_radius must be >= 0")
     if not (0.0 <= float(args.cone_half_angle) <= 90.0):
         raise ValueError("--cone_half_angle must be between 0 and 90 degrees inclusive")
 
@@ -1759,15 +2086,22 @@ def main() -> None:
         for pass_idx in range(1, total_passes + 1):
             print(
                 f"\n=== Interpolation pass {pass_idx}/{total_passes} "
-                f"(radius={int(args.interpolate)}, cone_half_angle={float(args.cone_half_angle):g}) ==="
+                f"(radius={int(args.interpolate)}, min_radius={float(args.interpolate_min_radius):g}, "
+                f"cone_half_angle={float(args.cone_half_angle):g}) ==="
             )
             ensemble_u8, pass_stats = interpolate_spherical_sector_pass(
                 ensemble_u8,
                 extension_radius=int(args.interpolate),
                 cone_half_angle_deg=float(args.cone_half_angle),
+                interpolate_min_radius=float(args.interpolate_min_radius),
             )
+
+            # Spec 10: fill enclosed 3D voids after interpolation.
+            ensemble_u8 = fill_3d_voids(ensemble_u8)
+
             pass_stats = dict(pass_stats)
             pass_stats["pass_index"] = int(pass_idx)
+            pass_stats["post_interpolation_void_fill"] = True
             interpolation_stats.append(pass_stats)
 
             if args.troubleshooting and pass_idx < total_passes:
@@ -1789,7 +2123,11 @@ def main() -> None:
                 "num_objects": 0,
                 "num_endpoints": 0,
                 "candidate_connections": 0,
+                "pair_groups": 0,
+                "accepted_connections": 0,
+                "skipped_by_min_radius": 0,
                 "added_voxels": 0,
+                "post_interpolation_void_fill": False,
                 "skipped": True,
             }
         )
