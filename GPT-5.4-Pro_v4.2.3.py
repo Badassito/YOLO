@@ -893,6 +893,8 @@ class BridgeCandidate:
 @dataclass(frozen=True)
 class PlannedBridge:
     pair_labels: Tuple[int, int]
+    label0: int
+    label1: int
     p0: Tuple[int, int, int]
     p1: Tuple[int, int, int]
     radius0: float
@@ -1342,6 +1344,8 @@ def _plan_pairwise_bridges(
             planned.append(
                 PlannedBridge(
                     pair_labels=pair_key,
+                    label0=int(a),
+                    label1=int(b),
                     p0=c_ab.source_point,
                     p1=c_ba.source_point,
                     radius0=float(radius0),
@@ -1367,6 +1371,8 @@ def _plan_pairwise_bridges(
         planned.append(
             PlannedBridge(
                 pair_labels=pair_key,
+                label0=int(best.source_label),
+                label1=int(best.target_label),
                 p0=best.source_point,
                 p1=best.target_point,
                 radius0=float(radius0),
@@ -1490,39 +1496,350 @@ def bresenham3d(p0: Tuple[int, int, int], p1: Tuple[int, int, int]) -> List[Tupl
         return out
 
 
+_PLANE_GRID_CACHE: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+
+
+def _normalize_vec(v: np.ndarray) -> np.ndarray:
+    arr = np.asarray(v, dtype=np.float32)
+    n = float(np.linalg.norm(arr))
+    if n <= 0:
+        return arr
+    return arr / n
+
+
+def _orthonormal_basis(axis: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    axis_u = _normalize_vec(axis)
+    if float(np.linalg.norm(axis_u)) <= 0:
+        axis_u = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+
+    if abs(float(axis_u[0])) < 0.9:
+        ref = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+    else:
+        ref = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
+
+    u_axis = np.cross(axis_u, ref)
+    if float(np.linalg.norm(u_axis)) <= 1e-6:
+        ref = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+        u_axis = np.cross(axis_u, ref)
+    u_axis = _normalize_vec(u_axis)
+    v_axis = _normalize_vec(np.cross(axis_u, u_axis))
+    return axis_u, u_axis, v_axis
+
+
+def _plane_uv_grid(half_width: int) -> Tuple[np.ndarray, np.ndarray]:
+    cached = _PLANE_GRID_CACHE.get(int(half_width))
+    if cached is not None:
+        return cached
+
+    coords = np.arange(-int(half_width), int(half_width) + 1, dtype=np.float32)
+    vv, uu = np.meshgrid(coords, coords, indexing="ij")
+    _PLANE_GRID_CACHE[int(half_width)] = (uu, vv)
+    return uu, vv
+
+
+def _keep_center_component_2d(mask2d: np.ndarray) -> np.ndarray:
+    mask2d = np.asarray(mask2d, dtype=bool)
+    if not mask2d.any():
+        return mask2d
+
+    labels2d, num = ndi.label(mask2d, structure=np.ones((3, 3), dtype=bool))
+    if num <= 1:
+        return np.asarray(ndi.binary_fill_holes(mask2d), dtype=bool)
+
+    cy = mask2d.shape[0] // 2
+    cx = mask2d.shape[1] // 2
+    keep = int(labels2d[cy, cx])
+    if keep == 0:
+        pts = np.argwhere(labels2d > 0)
+        if pts.size == 0:
+            return np.zeros_like(mask2d, dtype=bool)
+        d2 = (pts[:, 0] - cy) ** 2 + (pts[:, 1] - cx) ** 2
+        py, px = pts[int(np.argmin(d2))]
+        keep = int(labels2d[py, px])
+
+    kept = (labels2d == keep)
+    return np.asarray(ndi.binary_fill_holes(kept), dtype=bool)
+
+
+def _mask_touches_border(mask2d: np.ndarray) -> bool:
+    if mask2d.size == 0 or not np.any(mask2d):
+        return False
+    return bool(
+        np.any(mask2d[0, :]) or
+        np.any(mask2d[-1, :]) or
+        np.any(mask2d[:, 0]) or
+        np.any(mask2d[:, -1])
+    )
+
+
+def _disk_mask_2d(half_width: int, radius: float) -> np.ndarray:
+    radius = max(0.5, float(radius))
+    uu, vv = _plane_uv_grid(int(half_width))
+    return np.asarray((uu * uu + vv * vv) <= (radius * radius + 1e-6), dtype=bool)
+
+
+def _signed_distance_2d(mask2d: np.ndarray) -> np.ndarray:
+    mask2d = np.asarray(mask2d, dtype=bool)
+    inside = ndi.distance_transform_edt(mask2d)
+    outside = ndi.distance_transform_edt(~mask2d)
+    return np.asarray(inside - outside, dtype=np.float32)
+
+
+def _best_in_object_axis_anchor(
+    labels_real: np.ndarray,
+    label: int,
+    start: Tuple[int, int, int],
+    direction: np.ndarray,
+    radius_hint: float,
+    max_steps: int,
+) -> Tuple[Tuple[int, int, int], float]:
+    direction = _normalize_vec(direction)
+    if float(np.linalg.norm(direction)) <= 0:
+        return start, max(1.0, float(radius_hint))
+
+    start_arr = np.asarray(start, dtype=np.float32)
+    Z, Y, X = labels_real.shape
+    radius_cap = max(1, int(math.ceil(max(1.0, float(radius_hint))) + 2))
+
+    best_point: Optional[Tuple[int, int, int]] = None
+    best_radius = 0.0
+    best_step = -1
+    seen: set[Tuple[int, int, int]] = set()
+
+    for step in range(0, max(0, int(max_steps)) + 1):
+        q = tuple(int(round(float(start_arr[i] + float(direction[i]) * float(step)))) for i in range(3))
+        if q in seen:
+            continue
+        seen.add(q)
+        qz, qy, qx = q
+        if not (0 <= qz < Z and 0 <= qy < Y and 0 <= qx < X):
+            continue
+        if int(labels_real[qz, qy, qx]) != int(label):
+            continue
+
+        r = float(_estimate_local_object_radius(labels_real, int(label), q, radius_cap))
+        if (
+            best_point is None or
+            r > best_radius + 1e-6 or
+            (abs(r - best_radius) <= 1e-6 and step > best_step)
+        ):
+            best_point = q
+            best_radius = r
+            best_step = step
+
+    if best_point is None:
+        return start, max(1.0, float(radius_hint))
+    return best_point, max(1.0, float(best_radius))
+
+
+def _extract_local_plane_mask(
+    labels_real: np.ndarray,
+    label: int,
+    center: np.ndarray,
+    axis: np.ndarray,
+    half_width: int,
+    plane_half_thickness: float = 0.75,
+) -> np.ndarray:
+    axis_u, u_axis, v_axis = _orthonormal_basis(axis)
+    uu, vv = _plane_uv_grid(int(half_width))
+
+    center = np.asarray(center, dtype=np.float32)
+    base = center.reshape(1, 1, 3) + (
+        uu[..., None] * u_axis.reshape(1, 1, 3) +
+        vv[..., None] * v_axis.reshape(1, 1, 3)
+    )
+
+    if plane_half_thickness > 0:
+        offsets = (-float(plane_half_thickness), 0.0, float(plane_half_thickness))
+    else:
+        offsets = (0.0,)
+
+    acc = np.zeros(uu.shape, dtype=bool)
+    Z, Y, X = labels_real.shape
+    for off in offsets:
+        coords = base + axis_u.reshape(1, 1, 3) * float(off)
+        zz = np.rint(coords[..., 0]).astype(np.int32)
+        yy = np.rint(coords[..., 1]).astype(np.int32)
+        xx = np.rint(coords[..., 2]).astype(np.int32)
+
+        valid = (
+            (zz >= 0) & (zz < Z) &
+            (yy >= 0) & (yy < Y) &
+            (xx >= 0) & (xx < X)
+        )
+        if not np.any(valid):
+            continue
+        hit = np.zeros_like(acc, dtype=bool)
+        hit[valid] = (labels_real[zz[valid], yy[valid], xx[valid]] == int(label))
+        acc |= hit
+
+    if not np.any(acc):
+        return acc
+    return _keep_center_component_2d(acc)
+
+
+def _paint_plane_section(
+    mask: np.ndarray,
+    center: np.ndarray,
+    axis: np.ndarray,
+    section_mask: np.ndarray,
+    plane_half_thickness: float = 0.49,
+) -> int:
+    section_mask = np.asarray(section_mask, dtype=bool)
+    if not section_mask.any():
+        return 0
+
+    axis_u, u_axis, v_axis = _orthonormal_basis(axis)
+    center = np.asarray(center, dtype=np.float32)
+    half_width = section_mask.shape[0] // 2
+    pts2d = np.argwhere(section_mask)
+    if pts2d.size == 0:
+        return 0
+
+    vv = (pts2d[:, 0].astype(np.float32) - float(half_width))
+    uu = (pts2d[:, 1].astype(np.float32) - float(half_width))
+    base = (
+        center.reshape(1, 3) +
+        uu[:, None] * u_axis.reshape(1, 3) +
+        vv[:, None] * v_axis.reshape(1, 3)
+    )
+
+    if plane_half_thickness > 0:
+        offsets = (-float(plane_half_thickness), 0.0, float(plane_half_thickness))
+    else:
+        offsets = (0.0,)
+
+    clouds = [base + axis_u.reshape(1, 3) * float(off) for off in offsets]
+    coords = np.concatenate(clouds, axis=0)
+    ijk = np.rint(coords).astype(np.int32)
+
+    Z, Y, X = mask.shape
+    valid = (
+        (ijk[:, 0] >= 0) & (ijk[:, 0] < Z) &
+        (ijk[:, 1] >= 0) & (ijk[:, 1] < Y) &
+        (ijk[:, 2] >= 0) & (ijk[:, 2] < X)
+    )
+    if not np.any(valid):
+        return 0
+
+    pts = np.unique(ijk[valid], axis=0)
+    current = mask[pts[:, 0], pts[:, 1], pts[:, 2]]
+    mask[pts[:, 0], pts[:, 1], pts[:, 2]] = True
+    return int(np.count_nonzero(~current))
+
+
 def _paint_connection_tube(
     mask: np.ndarray,
+    labels_real: np.ndarray,
+    label0: int,
+    label1: int,
     p0: Tuple[int, int, int],
     p1: Tuple[int, int, int],
     radius0: float,
     radius1: Optional[float] = None,
 ) -> int:
-    pts = bresenham3d(p0, p1)
-    if not pts:
-        return 0
-
     if radius1 is None:
         radius1 = radius0
 
     radius0 = max(0.5, float(radius0))
     radius1 = max(0.5, float(radius1))
+
+    p0_arr = np.asarray(p0, dtype=np.float32)
+    p1_arr = np.asarray(p1, dtype=np.float32)
+    axis = p1_arr - p0_arr
+    axis_len = float(np.linalg.norm(axis))
+    if axis_len <= 0:
+        return 0
+    axis_u = axis / axis_len
+
+    anchor_steps0 = max(2, min(12, int(math.ceil(radius0 * 2.0)) + 2))
+    anchor_steps1 = max(2, min(12, int(math.ceil(radius1 * 2.0)) + 2))
+    c0, local_r0 = _best_in_object_axis_anchor(
+        labels_real=labels_real,
+        label=int(label0),
+        start=p0,
+        direction=-axis_u,
+        radius_hint=radius0,
+        max_steps=anchor_steps0,
+    )
+    c1, local_r1 = _best_in_object_axis_anchor(
+        labels_real=labels_real,
+        label=int(label1),
+        start=p1,
+        direction=axis_u,
+        radius_hint=radius1,
+        max_steps=anchor_steps1,
+    )
+
+    c0_arr = np.asarray(c0, dtype=np.float32)
+    c1_arr = np.asarray(c1, dtype=np.float32)
+    section_axis = c1_arr - c0_arr
+    section_len = float(np.linalg.norm(section_axis))
+    if section_len <= 0:
+        section_axis = axis_u.copy()
+        section_len = axis_len
+    else:
+        section_axis = section_axis / section_len
+
+    base_radius = max(radius0, radius1, float(local_r0), float(local_r1))
+    half_width = max(3, int(math.ceil(base_radius * 2.0)) + 1)
+    max_half_width = max(half_width, min(96, int(math.ceil(base_radius * 4.0)) + 6))
+
+    while True:
+        section0 = _extract_local_plane_mask(
+            labels_real=labels_real,
+            label=int(label0),
+            center=c0_arr,
+            axis=section_axis,
+            half_width=half_width,
+            plane_half_thickness=0.75,
+        )
+        section1 = _extract_local_plane_mask(
+            labels_real=labels_real,
+            label=int(label1),
+            center=c1_arr,
+            axis=section_axis,
+            half_width=half_width,
+            plane_half_thickness=0.75,
+        )
+        if (
+            half_width >= max_half_width or
+            (not _mask_touches_border(section0) and not _mask_touches_border(section1))
+        ):
+            break
+        half_width = min(max_half_width, max(half_width + 1, half_width * 2))
+
+    if not np.any(section0):
+        section0 = _disk_mask_2d(half_width, max(radius0, float(local_r0)))
+    if not np.any(section1):
+        section1 = _disk_mask_2d(half_width, max(radius1, float(local_r1)))
+
+    section0 = _keep_center_component_2d(section0)
+    section1 = _keep_center_component_2d(section1)
+
+    sdf0 = _signed_distance_2d(section0)
+    sdf1 = _signed_distance_2d(section1)
+
+    steps = max(1, int(math.ceil(section_len)))
+    if steps <= 1:
+        alphas = [0.5]
+    else:
+        alphas = [float(idx) / float(steps) for idx in range(1, steps)]
+
     added = 0
+    for alpha in alphas:
+        center = (1.0 - alpha) * c0_arr + alpha * c1_arr
+        section = ((1.0 - alpha) * sdf0 + alpha * sdf1) >= 0.0
+        section = _keep_center_component_2d(section)
+        added += _paint_plane_section(
+            mask=mask,
+            center=center,
+            axis=section_axis,
+            section_mask=section,
+            plane_half_thickness=0.49,
+        )
 
-    if max(radius0, radius1) <= 1.0:
-        for pt in pts:
-            z, y, x = pt
-            if not mask[z, y, x]:
-                mask[z, y, x] = True
-                added += 1
-        return added
-
-    denom = max(1, len(pts) - 1)
-    for idx, pt in enumerate(pts):
-        alpha = float(idx) / float(denom)
-        radius = (1.0 - alpha) * radius0 + alpha * radius1
-        added += _paint_sphere(mask, pt, radius)
-
-    return added
+    return int(added)
 
 
 def interpolate_spherical_sector_pass(
@@ -1543,6 +1860,9 @@ def interpolate_spherical_sector_pass(
       - Multiple endpoint-level hits between the same unordered object pair are collapsed into at most
         one painted bridge for the pass, which suppresses the common "many small circular bridges"
         failure mode.
+      - Spherical sectors are used only to choose connection targets. The bridge geometry itself is
+        produced by linear interpolation between local real cross-sectional masks, which yields tubes
+        instead of chains of nearly spherical blobs.
     """
     if extension_radius <= 0:
         return np.asarray(mask_u8, dtype=np.uint8), {
@@ -1599,6 +1919,9 @@ def interpolate_spherical_sector_pass(
     for bridge in planned_bridges:
         added_voxels += _paint_connection_tube(
             work_mask,
+            labels_real=labels_real,
+            label0=int(bridge.label0),
+            label1=int(bridge.label1),
             p0=bridge.p0,
             p1=bridge.p1,
             radius0=bridge.radius0,
