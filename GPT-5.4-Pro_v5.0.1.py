@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-YOLO segmentation test-time augmentation (TTA) for large transverse video volumes.
+YOLO segmentation test-time augmentation (TTA) for large video volumes.
 
-This v5.0-oriented script:
+This v5.0.1-compliant script:
   - builds transverse, sagittal and coronal views (unless --disable_multiplanar)
   - generates rotated / scaled / shifted FFV1 MKV augmentations via a single affine transform per variant
   - runs Ultralytics YOLO segmentation sequentially on the pre-generated augmentation videos
-  - stores per-augmentation results to disk, undoes the affine transforms and unions masks per slice
-  - applies --min_conf directly to per-slice unions, fills 2D holes, and optionally interpolates each view volume independently
-  - unions the final per-view / per-model volumes, fills enclosed 3D voids, optionally filters small transverse-plane components via --min_radius
-  - writes the final transverse overlay video plus optional YOLO labels, binary TIFF/MKV outputs, NRRD, and a summary text file
+  - stores per-augmentation traces to disk, undoes the affine transforms and unions masks per slice
+  - tracks native per-pixel max confidence so --min_conf is applied per connected 2D union rather than per whole slice
+  - interpolates each view volume independently with a streamed slice-graph endpoint search
+  - unions the final per-view / per-model volumes, fills enclosed 3D voids with a streamed boundary-background pass, optionally filters small transverse-plane components via --min_radius
+  - writes the final transverse overlay video plus optional multiplanar overlays, YOLO labels, binary TIFF/MKV outputs, NRRD, and a summary text file
 
 Dependencies (Python):
   pip install opencv-python numpy scipy scikit-image tifffile tqdm ultralytics
@@ -125,6 +126,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--save_binary", nargs="?", const="__DEFAULT__", default=None, type=str,
                    help="Save final binary masks as TIFF sequence + FFV1 MKV. Optional custom TIFF pattern, e.g. binary_masks/{Filename}_Binary_%%04d.tiff")
     p.add_argument("--save_nrrd", action="store_true", help="Save the final binary mask volume as an NRRD file")
+    p.add_argument("--save_multiplanar", action="store_true",
+                   help="Save additional Sagittal and Coronal final outputs even though the default output is transverse-only")
     p.add_argument("--voxel_volume", action="store_true", help="Count white voxels in the final binary output and save to the summary text file")
     p.add_argument("--binary", action="store_true", dest="voxel_volume", help=argparse.SUPPRESS)
     p.add_argument("--troubleshooting", action="store_true",
@@ -361,11 +364,13 @@ def build_affine(
     Build a single affine transform that performs, in one pass:
 
       source(native view) -> optional black-padding canvas -> rotation around canvas center
-      -> scale to out_size x out_size -> optional shift in output space
+      -> optional shift in native/canvas pixels -> scale to out_size x out_size
 
-    Transverse uses pad_mode='clamp', which rotates directly on the source-sized canvas so
-    non-90° content that leaves the source frame is discarded. Sagittal/Coronal use pad_mode='pad'
-    with a square black canvas large enough to preserve the full rotation before scaling.
+    This matches the v5.0.1 expectation that --shift is expressed in pre-scale view pixels, not
+    in already-resized imgsz pixels. Transverse uses pad_mode='clamp', which rotates directly on the
+    source-sized canvas so non-90° content that leaves the source frame is discarded.
+    Sagittal/Coronal use pad_mode='pad' with a square black canvas large enough to preserve the full
+    rotation before scaling.
     """
     if pad_mode not in ("clamp", "pad"):
         raise ValueError("pad_mode must be 'clamp' or 'pad'")
@@ -395,18 +400,27 @@ def build_affine(
 
     M_rot = _affine2x3_to_3x3(cv2.getRotationMatrix2D((cx_canvas, cy_canvas), angle_deg, 1.0))
 
-    sx = out_size / float(canvas_w)
-    sy = out_size / float(canvas_h)
-    M_scale_shift = np.array(
+    M_shift_canvas = np.array(
         [
-            [sx, 0.0, cx_out + float(shift_dx) - sx * cx_canvas],
-            [0.0, sy, cy_out + float(shift_dy) - sy * cy_canvas],
+            [1.0, 0.0, float(shift_dx)],
+            [0.0, 1.0, float(shift_dy)],
             [0.0, 0.0, 1.0],
         ],
         dtype=np.float64,
     )
 
-    M_src_to_out3 = M_scale_shift @ M_rot @ M_pad
+    sx = out_size / float(canvas_w)
+    sy = out_size / float(canvas_h)
+    M_scale = np.array(
+        [
+            [sx, 0.0, cx_out - sx * cx_canvas],
+            [0.0, sy, cy_out - sy * cy_canvas],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+    M_src_to_out3 = M_scale @ M_shift_canvas @ M_rot @ M_pad
     M_out_to_src3 = np.linalg.inv(M_src_to_out3)
 
     return AffineSpec(
@@ -533,30 +547,37 @@ def predict_video_and_accumulate(
     cfg: PredictConfig,
     # accumulation into per-view union stack (native resolution, packed bits)
     view_union_mm: np.memmap,          # uint8 packbits, shape (num_slices, bytes_native)
-    view_conf_mm: np.memmap,           # float16, shape (num_slices,)
+    view_confmap_mm: np.memmap,        # float16 confidence map, shape (num_slices, native_h, native_w)
     M_out_to_native: np.ndarray,       # 2x3, maps augmented(out)->native for cv2.warpAffine (src->dst)
     native_h: int,
     native_w: int,
 ) -> None:
     """
-    Runs YOLO predict(stream=True) on a pre-generated augmented video,
-    stores per-frame union mask + max confidence to disk, and accumulates
-    the inverse-transformed mask into the per-view union stack.
+    Run YOLO predict(stream=True) on a pre-generated augmented video, store a lightweight
+    per-augmentation trace to disk, and accumulate the inverse-transformed native masks.
+
+    v5.0.1 requires unioning overlapping masks with the highest confidence score of the
+    combined masks. To preserve that behavior without exploding memory, we keep two native
+    accumulators per slice:
+      1) a packed-bit union mask
+      2) a per-pixel max-confidence map
+
+    Later, --min_conf is applied per connected component on the native-orientation union.
     """
     pred_out_prefix.parent.mkdir(parents=True, exist_ok=True)
 
     out_bytes = bytes_for_packbits(out_size, out_size)
 
     pred_mask_mm = np.memmap(
-        pred_out_prefix.with_suffix(".mask.packbits.dat"),
+        pred_out_prefix.with_suffix('.mask.packbits.dat'),
         dtype=np.uint8,
-        mode="w+",
+        mode='w+',
         shape=(num_frames, out_bytes),
     )
     pred_conf_mm = np.memmap(
-        pred_out_prefix.with_suffix(".conf.f16.dat"),
+        pred_out_prefix.with_suffix('.conf.f16.dat'),
         dtype=np.float16,
-        mode="w+",
+        mode='w+',
         shape=(num_frames,),
     )
     pred_mask_mm[:] = 0
@@ -569,7 +590,7 @@ def predict_video_and_accumulate(
         iou=1.0,
         save=False,
         stream=True,
-        task="segment",
+        task='segment',
         retina_masks=True,
         batch=1,
         device=cfg.device,
@@ -582,93 +603,147 @@ def predict_video_and_accumulate(
         if idx >= num_frames:
             break
 
-        # Union all instance masks in this frame -> single binary mask
-        if getattr(r, "masks", None) is None or r.masks is None or r.masks.data is None:
-            union = np.zeros((out_size, out_size), dtype=np.uint8)
-            conf_val = 0.0
-        else:
-            m = r.masks.data  # (n,h,w)
+        frame_union = np.zeros((out_size, out_size), dtype=np.uint8)
+        frame_max_conf = 0.0
+
+        if getattr(r, 'masks', None) is None or r.masks is None or r.masks.data is None:
+            pred_mask_mm[idx, :] = pack_mask(frame_union)
+            pred_conf_mm[idx] = np.float16(0.0)
+            continue
+
+        masks_data = r.masks.data  # (n,h,w)
+        try:
+            masks_np = masks_data.cpu().numpy()
+        except Exception:
+            masks_np = np.asarray(masks_data)
+
+        num_inst = int(masks_np.shape[0]) if masks_np.ndim == 3 else 0
+        if num_inst <= 0:
+            pred_mask_mm[idx, :] = pack_mask(frame_union)
+            pred_conf_mm[idx] = np.float16(0.0)
+            continue
+
+        if getattr(r, 'boxes', None) is not None and r.boxes is not None and getattr(r.boxes, 'conf', None) is not None:
             try:
-                import torch  # type: ignore
-                union_t = (m.sum(dim=0) > 0).to(torch.uint8)
-                union = union_t.cpu().numpy()
+                confs_np = r.boxes.conf.detach().cpu().numpy().astype(np.float32, copy=False)
             except Exception:
-                union = (np.sum(np.asarray(m), axis=0) > 0).astype(np.uint8)
+                confs_np = np.asarray(r.boxes.conf, dtype=np.float32)
+        else:
+            confs_np = np.zeros((num_inst,), dtype=np.float32)
 
-            conf_val = 0.0
-            if getattr(r, "boxes", None) is not None and r.boxes is not None and getattr(r.boxes, "conf", None) is not None:
-                try:
-                    conf_val = float(r.boxes.conf.max().cpu().item())
-                except Exception:
-                    conf_val = float(np.max(np.asarray(r.boxes.conf)))
+        if confs_np.ndim == 0:
+            confs_np = np.full((num_inst,), float(confs_np), dtype=np.float32)
+        elif confs_np.shape[0] != num_inst:
+            confs_np = np.resize(confs_np, (num_inst,)).astype(np.float32, copy=False)
 
-        # Ensure union mask matches expected size (Ultralytics should return masks at image size, but be defensive)
-        if union.shape[0] != out_size or union.shape[1] != out_size:
-            union = cv2.resize(union.astype(np.uint8), (out_size, out_size), interpolation=cv2.INTER_NEAREST)
+        conf_slice = view_confmap_mm[idx]
+        native_union_frame = np.zeros((native_h, native_w), dtype=np.uint8)
 
-        # Store per-augmentation result to disk (packed)
-        pred_mask_mm[idx, :] = pack_mask(union)
-        pred_conf_mm[idx] = np.float16(conf_val)
+        for inst_idx in range(num_inst):
+            inst = np.asarray(masks_np[inst_idx], dtype=np.uint8)
+            if inst.shape[0] != out_size or inst.shape[1] != out_size:
+                inst = cv2.resize(inst, (out_size, out_size), interpolation=cv2.INTER_NEAREST)
+            inst = (inst > 0).astype(np.uint8, copy=False)
+            if not np.any(inst):
+                continue
+
+            frame_union |= inst
+            conf_val = float(confs_np[inst_idx])
+            if conf_val > frame_max_conf:
+                frame_max_conf = conf_val
+
+            native_mask = cv2.warpAffine(
+                inst,
+                M_out_to_native,
+                dsize=(native_w, native_h),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+            native_mask_bool = native_mask > 0
+            if not np.any(native_mask_bool):
+                continue
+
+            native_union_frame[native_mask_bool] = 1
+            conf_slice[native_mask_bool] = np.maximum(
+                conf_slice[native_mask_bool],
+                np.float16(conf_val),
+            )
+
+        if np.any(native_union_frame):
+            view_union_mm[idx, :] |= pack_mask(native_union_frame)
+
+        pred_mask_mm[idx, :] = pack_mask(frame_union)
+        pred_conf_mm[idx] = np.float16(frame_max_conf)
 
     pred_mask_mm.flush()
     pred_conf_mm.flush()
-
-    # Read the stored per-augmentation results back from disk, undo the augmentation,
-    # and accumulate into the native-orientation union stack.
-    for idx in range(num_frames):
-        packed_pred = np.asarray(pred_mask_mm[idx])
-        if not any_mask(packed_pred):
-            continue
-
-        union = unpack_mask(packed_pred, out_size, out_size)
-        conf_val = float(pred_conf_mm[idx])
-
-        mask_back = cv2.warpAffine(
-            union,
-            M_out_to_native,
-            dsize=(native_w, native_h),
-            flags=cv2.INTER_NEAREST,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        )
-        packed_back = pack_mask((mask_back > 0).astype(np.uint8))
-
-        view_union_mm[idx, :] |= packed_back
-        if conf_val > float(view_conf_mm[idx]):
-            view_conf_mm[idx] = np.float16(conf_val)
+    view_confmap_mm.flush()
+    view_union_mm.flush()
 
     meta = {
-        "video": str(video_path),
-        "num_frames": int(num_frames),
-        "out_size": int(out_size),
-        "mask_packbits_bytes": int(out_bytes),
-        "cfg": {
-            "imgsz": int(cfg.imgsz),
-            "conf": float(cfg.conf),
-            "device": str(cfg.device),
-            "half": bool(cfg.half),
-            "int8": bool(cfg.int8),
+        'video': str(video_path),
+        'num_frames': int(num_frames),
+        'out_size': int(out_size),
+        'mask_packbits_bytes': int(out_bytes),
+        'cfg': {
+            'imgsz': int(cfg.imgsz),
+            'conf': float(cfg.conf),
+            'device': str(cfg.device),
+            'half': bool(cfg.half),
+            'int8': bool(cfg.int8),
         },
     }
-    pred_out_prefix.with_suffix(".meta.json").write_text(json.dumps(meta, indent=2))
+    pred_out_prefix.with_suffix('.meta.json').write_text(json.dumps(meta, indent=2))
 
 
 # --------------------------
 # Per-view postprocessing
 # --------------------------
 
-def apply_min_conf_filter_inplace(
+def apply_min_conf_filter_with_confmap_inplace(
     union_mm: np.memmap,
-    conf_mm: np.memmap,
+    confmap_mm: np.memmap,
     min_conf: float,
+    h: int,
+    w: int,
 ) -> None:
-    """Remove any per-slice union whose stored confidence is below ``min_conf``."""
+    """Remove native 2D connected components whose max confidence is below ``min_conf``.
+
+    This matches the v5.0.1 rule to union overlapping masks and attach the highest confidence
+    score of the combined mask, instead of using a single slice-wide score.
+    """
     n = union_mm.shape[0]
-    for i in tqdm(range(n), desc="min_conf thresholding"):
-        if float(conf_mm[i]) >= float(min_conf):
+    structure2 = np.ones((3, 3), dtype=bool)
+
+    for i in tqdm(range(n), desc='min_conf thresholding'):
+        packed = np.asarray(union_mm[i])
+        if not any_mask(packed):
+            confmap_mm[i, :, :] = np.float16(0.0)
             continue
-        union_mm[i, :] = 0
-        conf_mm[i] = np.float16(0.0)
+
+        union = unpack_mask(packed, h, w).astype(bool, copy=False)
+        labels2d, num = ndi.label(union, structure=structure2)
+        if int(num) <= 0:
+            union_mm[i, :] = 0
+            confmap_mm[i, :, :] = np.float16(0.0)
+            continue
+
+        conf_slice = np.asarray(confmap_mm[i], dtype=np.float32)
+        label_ids = np.arange(1, int(num) + 1, dtype=np.int32)
+        maxima = ndi.maximum(conf_slice, labels=labels2d, index=label_ids)
+        maxima = np.asarray(maxima, dtype=np.float32)
+        keep_ids = label_ids[maxima >= float(min_conf)]
+
+        if keep_ids.size == 0:
+            union_mm[i, :] = 0
+            confmap_mm[i, :, :] = np.float16(0.0)
+            continue
+
+        keep = np.isin(labels2d, keep_ids)
+        union_mm[i, :] = pack_mask(keep.astype(np.uint8, copy=False))
+        conf_slice[~keep] = 0.0
+        confmap_mm[i, :, :] = conf_slice.astype(np.float16, copy=False)
 
 
 def fill_2d_holes_inplace(union_mm: np.memmap, h: int, w: int) -> None:
@@ -695,7 +770,7 @@ def fill_2d_holes_inplace(union_mm: np.memmap, h: int, w: int) -> None:
     ffmask = np.zeros((h + 4, w + 4), dtype=np.uint8)        # floodFill mask: (H+2, W+2)
     holes = np.empty(pad.shape, dtype=np.bool_)              # boolean scratch
 
-    for i in tqdm(range(n), desc="2D hole fill"):
+    for i in tqdm(range(n), desc='2D hole fill'):
         packed = np.asarray(union_mm[i])
         if not any_mask(packed):
             continue
@@ -770,6 +845,346 @@ def assemble_model_volume_into_ensemble(
     for x in tqdm(range(W), desc="Assembling volume from coronal"):
         m = unpack_mask(np.asarray(coronal[x]), T, H)  # (T,H) cols are y
         ensemble_mm[:, :, x] |= m
+
+
+class _UnionFind:
+    """Simple dynamic union-find for slice-streamed 3D connected-components."""
+
+    def __init__(self) -> None:
+        self.parent: List[int] = [0]
+        self.rank: List[int] = [0]
+        self.touches_boundary: List[bool] = [False]
+
+    def new_ids(self, count: int) -> np.ndarray:
+        if count <= 0:
+            return np.zeros((0,), dtype=np.uint32)
+        start = len(self.parent)
+        stop = start + int(count)
+        if stop >= 2 ** 32:
+            raise RuntimeError('3D component id space exceeded uint32 capacity')
+        self.parent.extend(range(start, stop))
+        self.rank.extend([0] * int(count))
+        self.touches_boundary.extend([False] * int(count))
+        return np.arange(start, stop, dtype=np.uint32)
+
+    def find(self, x: int) -> int:
+        parent = self.parent
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(self, a: int, b: int) -> int:
+        ra = self.find(int(a))
+        rb = self.find(int(b))
+        if ra == rb:
+            return ra
+
+        if self.rank[ra] < self.rank[rb]:
+            ra, rb = rb, ra
+
+        self.parent[rb] = ra
+        self.touches_boundary[ra] = bool(self.touches_boundary[ra] or self.touches_boundary[rb])
+        if self.rank[ra] == self.rank[rb]:
+            self.rank[ra] += 1
+        return ra
+
+    def mark_boundary(self, x: int) -> None:
+        self.touches_boundary[self.find(int(x))] = True
+
+    def root_map(self) -> np.ndarray:
+        out = np.zeros((len(self.parent),), dtype=np.uint32)
+        for i in range(1, len(self.parent)):
+            out[i] = np.uint32(self.find(i))
+        return out
+
+
+def _iter_adjacent_gid_pairs(prev_gid: np.ndarray, curr_gid: np.ndarray) -> Iterator[Tuple[int, int]]:
+    """Yield unique touching component-id pairs across adjacent z-slices using 26-connectivity."""
+    h, w = prev_gid.shape
+    seen: set[int] = set()
+
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            py0 = max(0, -dy)
+            py1 = min(h, h - dy)
+            cy0 = max(0, dy)
+            cy1 = min(h, h + dy)
+            px0 = max(0, -dx)
+            px1 = min(w, w - dx)
+            cx0 = max(0, dx)
+            cx1 = min(w, w + dx)
+
+            a = prev_gid[py0:py1, px0:px1]
+            b = curr_gid[cy0:cy1, cx0:cx1]
+            overlap = (a > 0) & (b > 0)
+            if not np.any(overlap):
+                continue
+
+            codes = (a[overlap].astype(np.uint64, copy=False) << np.uint64(32)) | b[overlap].astype(np.uint64, copy=False)
+            for code in np.unique(codes):
+                code_i = int(code)
+                if code_i in seen:
+                    continue
+                seen.add(code_i)
+                yield (code_i >> 32), (code_i & 0xFFFFFFFF)
+
+
+def _mark_boundary_components_from_local_labels(
+    uf: _UnionFind,
+    local_to_gid: np.ndarray,
+    labels2d: np.ndarray,
+    z: int,
+    z_max: int,
+) -> None:
+    if labels2d.size == 0 or local_to_gid.size <= 1:
+        return
+
+    if z == 0 or z == z_max:
+        for gid in local_to_gid[1:]:
+            uf.mark_boundary(int(gid))
+
+    border_vals = np.unique(np.concatenate([
+        labels2d[0, :],
+        labels2d[-1, :],
+        labels2d[:, 0],
+        labels2d[:, -1],
+    ]))
+    border_vals = border_vals[border_vals > 0]
+    for local_lbl in border_vals.tolist():
+        uf.mark_boundary(int(local_to_gid[int(local_lbl)]))
+
+
+def fill_3d_voids_inplace_streaming(
+    mask_mm: np.memmap,
+    work_prefix: Path,
+    keep_temp: bool = False,
+) -> None:
+    """Fill enclosed 3D voids without allocating a full in-memory 3D label volume.
+
+    The bottleneck in the original implementation was ``ndi.label`` over the entire 3D background,
+    which requires several full-volume arrays. This streaming variant labels 2D background components
+    slice-by-slice, unions only touching components across adjacent slices, tracks which components
+    reach the volume boundary, and finally fills only the enclosed components.
+    """
+    z_dim, h, w = mask_mm.shape
+    if z_dim <= 0:
+        return
+
+    bg_gid_path = work_prefix.with_suffix('.bg_gid.u32.dat')
+    bg_gid_path.parent.mkdir(parents=True, exist_ok=True)
+    bg_gid_mm = np.memmap(bg_gid_path, dtype=np.uint32, mode='w+', shape=(z_dim, h, w))
+
+    uf = _UnionFind()
+    prev_gid_slice: Optional[np.ndarray] = None
+
+    for z in tqdm(range(z_dim), desc='3D void fill: slice labeling'):
+        bg = (np.asarray(mask_mm[z]) == 0).astype(np.uint8, copy=False)
+        num_labels, labels2d = cv2.connectedComponents(bg, connectivity=8, ltype=cv2.CV_32S)
+        if int(num_labels) <= 1:
+            bg_gid_mm[z, :, :] = 0
+            prev_gid_slice = None
+            continue
+
+        local_to_gid = np.zeros((int(num_labels),), dtype=np.uint32)
+        local_to_gid[1:] = uf.new_ids(int(num_labels) - 1)
+        gid_slice = local_to_gid[labels2d]
+        bg_gid_mm[z, :, :] = gid_slice
+
+        _mark_boundary_components_from_local_labels(uf, local_to_gid, labels2d, z=z, z_max=z_dim - 1)
+
+        if prev_gid_slice is not None and np.any(prev_gid_slice) and np.any(gid_slice):
+            for a, b in _iter_adjacent_gid_pairs(prev_gid_slice, gid_slice):
+                uf.union(int(a), int(b))
+
+        prev_gid_slice = np.asarray(gid_slice)
+
+    root_map = uf.root_map()
+    touches_by_gid = np.zeros(root_map.shape, dtype=bool)
+    for gid in range(1, root_map.shape[0]):
+        touches_by_gid[gid] = bool(uf.touches_boundary[int(root_map[gid])])
+
+    for z in tqdm(range(z_dim), desc='3D void fill: apply enclosed components'):
+        gid_slice = np.asarray(bg_gid_mm[z])
+        enclosed = (gid_slice > 0) & (~touches_by_gid[gid_slice])
+        if np.any(enclosed):
+            mask_mm[z, enclosed] = np.uint8(1)
+
+    mask_mm.flush()
+    del bg_gid_mm
+    if not keep_temp:
+        try:
+            bg_gid_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def label_foreground_volume_streaming(
+    mask_mm: np.ndarray,
+    work_prefix: Path,
+    keep_temp: bool = False,
+) -> Tuple[np.memmap, int, List[Path]]:
+    """Label a 3D foreground volume using slice-streamed 26-connectivity.
+
+    Returns a compact uint32 label volume memmap, the number of 3D objects, and the list of
+    temporary files backing the labeling work.
+    """
+    z_dim, h, w = mask_mm.shape
+    work_prefix.parent.mkdir(parents=True, exist_ok=True)
+    provisional_path = work_prefix.with_suffix('.fg_provisional.u32.dat')
+    compact_path = work_prefix.with_suffix('.fg_compact.u32.dat')
+
+    provisional_mm = np.memmap(provisional_path, dtype=np.uint32, mode='w+', shape=(z_dim, h, w))
+    uf = _UnionFind()
+    prev_gid_slice: Optional[np.ndarray] = None
+
+    for z in tqdm(range(z_dim), desc='Interpolation: slice labeling'):
+        fg = (np.asarray(mask_mm[z]) > 0).astype(np.uint8, copy=False)
+        num_labels, labels2d = cv2.connectedComponents(fg, connectivity=8, ltype=cv2.CV_32S)
+        if int(num_labels) <= 1:
+            provisional_mm[z, :, :] = 0
+            prev_gid_slice = None
+            continue
+
+        local_to_gid = np.zeros((int(num_labels),), dtype=np.uint32)
+        local_to_gid[1:] = uf.new_ids(int(num_labels) - 1)
+        gid_slice = local_to_gid[labels2d]
+        provisional_mm[z, :, :] = gid_slice
+
+        if prev_gid_slice is not None and np.any(prev_gid_slice) and np.any(gid_slice):
+            for a, b in _iter_adjacent_gid_pairs(prev_gid_slice, gid_slice):
+                uf.union(int(a), int(b))
+
+        prev_gid_slice = np.asarray(gid_slice)
+
+    root_map = uf.root_map()
+    if root_map.shape[0] <= 1:
+        compact_mm = np.memmap(compact_path, dtype=np.uint32, mode='w+', shape=(z_dim, h, w))
+        compact_mm[:] = 0
+        compact_mm.flush()
+        del provisional_mm
+        if not keep_temp:
+            try:
+                provisional_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return compact_mm, 0, [compact_path]
+
+    unique_roots = np.unique(root_map[1:])
+    unique_roots = unique_roots[unique_roots > 0]
+    compact_root_ids = np.zeros(root_map.shape, dtype=np.uint32)
+    compact_root_ids[unique_roots] = np.arange(1, unique_roots.size + 1, dtype=np.uint32)
+
+    compact_mm = np.memmap(compact_path, dtype=np.uint32, mode='w+', shape=(z_dim, h, w))
+    for z in tqdm(range(z_dim), desc='Interpolation: compact relabel'):
+        gid_slice = np.asarray(provisional_mm[z])
+        compact_mm[z, :, :] = compact_root_ids[root_map[gid_slice]]
+    compact_mm.flush()
+
+    del provisional_mm
+    if not keep_temp:
+        try:
+            provisional_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    return compact_mm, int(unique_roots.size), [compact_path]
+
+
+def build_slice_endpoint_seeds_from_label_volume(labels_real: np.ndarray) -> Tuple[List[SliceEndpointSeed], int]:
+    """Create interpolation seeds from per-slice branch terminals rather than full 3D skeletonization.
+
+    The original implementation skeletonized every 3D object subvolume, which is expensive for the
+    target volumes. The v5.0.1 interpolation acts strictly along the slice axis, so it is sufficient
+    and faster to treat each per-slice object component as a graph node and emit endpoint seeds for
+    nodes that have no predecessor and/or no successor in adjacent slices. This still captures
+    bifurcations and one-slice orphan objects.
+    """
+    z_dim = labels_real.shape[0]
+    if z_dim <= 0:
+        return [], 0
+
+    seeds: List[SliceEndpointSeed] = []
+    kernel2 = np.ones((3, 3), dtype=np.uint8)
+
+    prev_slice: Optional[np.ndarray] = None
+    curr_slice = np.asarray(labels_real[0])
+    next_slice = np.asarray(labels_real[1]) if z_dim > 1 else None
+
+    for z in tqdm(range(z_dim), desc='Interpolation: endpoint scan'):
+        if z > 0:
+            prev_slice = curr_slice
+            curr_slice = next_slice if next_slice is not None else np.zeros_like(curr_slice)
+            next_slice = np.asarray(labels_real[z + 1]) if (z + 1) < z_dim else None
+
+        present = np.unique(curr_slice)
+        present = present[present > 0]
+        if present.size == 0:
+            continue
+
+        for obj_id in present.tolist():
+            obj_mask = (curr_slice == int(obj_id)).astype(np.uint8, copy=False)
+            num_cc, cc = cv2.connectedComponents(obj_mask, connectivity=8, ltype=cv2.CV_32S)
+            if int(num_cc) <= 1:
+                continue
+
+            prev_same = (prev_slice == int(obj_id)) if prev_slice is not None else None
+            next_same = (next_slice == int(obj_id)) if next_slice is not None else None
+
+            for local_lbl in range(1, int(num_cc)):
+                comp = cc == int(local_lbl)
+                if not np.any(comp):
+                    continue
+                anchor = _component_centroid_anchor(comp)
+                if anchor is None:
+                    continue
+
+                dil = cv2.dilate(comp.astype(np.uint8, copy=False), kernel2, iterations=1) > 0
+                has_prev = bool(prev_same is not None and np.any(dil & prev_same))
+                has_next = bool(next_same is not None and np.any(dil & next_same))
+
+                if not has_prev:
+                    seeds.append(SliceEndpointSeed(
+                        label=int(obj_id),
+                        point=(int(z), int(anchor[0]), int(anchor[1])),
+                        direction_sign=-1,
+                    ))
+                if not has_next:
+                    seeds.append(SliceEndpointSeed(
+                        label=int(obj_id),
+                        point=(int(z), int(anchor[0]), int(anchor[1])),
+                        direction_sign=1,
+                    ))
+
+    return seeds, int(len(seeds))
+
+
+def apply_transverse_min_radius_filter_inplace(mask_mm: np.memmap, min_radius: float) -> None:
+    """In-place transverse-plane radius filter to avoid a full extra volume copy."""
+    if float(min_radius) <= 0:
+        return
+
+    struct2 = np.ones((3, 3), dtype=bool)
+    for t in tqdm(range(mask_mm.shape[0]), desc='Transverse min-radius filter'):
+        sl = np.asarray(mask_mm[t]) > 0
+        if not np.any(sl):
+            continue
+
+        labels2d, num = ndi.label(sl, structure=struct2)
+        if int(num) <= 0:
+            mask_mm[t, :, :] = 0
+            continue
+
+        keep = np.zeros(sl.shape, dtype=bool)
+        for lbl in range(1, int(num) + 1):
+            comp = labels2d == lbl
+            if not np.any(comp):
+                continue
+            radius = float(np.max(ndi.distance_transform_edt(comp)))
+            if radius >= float(min_radius):
+                keep |= comp
+
+        mask_mm[t, :, :] = keep.astype(np.uint8, copy=False)
+    mask_mm.flush()
 
 
 def fill_3d_voids(mask_u8: np.ndarray) -> np.ndarray:
@@ -2429,62 +2844,100 @@ def _paint_linear_slice_bridge(
     return int(added)
 
 
-def interpolate_view_volume_pass(
-    mask_u8: np.ndarray,
+def interpolate_view_volume_pass_inplace(
+    mask_mm: np.memmap,
+    work_dir: Path,
+    pass_tag: str,
     max_slice_distance: int,
     search_angle_deg: float,
     interpolation_walk_back: int,
     interpolate_min_radius: float,
-) -> Tuple[np.ndarray, Dict[str, object]]:
+    keep_temp: bool = False,
+) -> Dict[str, object]:
+    """Apply one interpolation pass directly to a view-volume memmap.
+
+    Bottleneck fix:
+      - avoids ``ndi.label`` over the full 3D volume in RAM
+      - avoids allocating a full in-memory boolean bridge volume
+      - uses a streamed 3D foreground label volume on disk plus an on-disk bridge volume
+      - derives interpolation endpoints from slice-graph terminals instead of full-object
+        3D skeletonization, which is both faster and better aligned with the slice-direction
+        projection rules in v5.0.1
+    """
     if int(max_slice_distance) <= 0:
-        return np.asarray(mask_u8, dtype=np.uint8), {
-            "num_objects": 0,
-            "num_endpoints": 0,
-            "candidate_connections": 0,
-            "accepted_connections": 0,
-            "walk_back_bridges": 0,
-            "skipped_by_min_radius": 0,
-            "added_voxels": 0,
-            "skipped": True,
+        return {
+            'num_objects': 0,
+            'num_endpoints': 0,
+            'candidate_connections': 0,
+            'accepted_connections': 0,
+            'default_bridges': 0,
+            'walk_back_bridges': 0,
+            'skipped_by_min_radius': 0,
+            'added_voxels': 0,
+            'skipped': True,
         }
 
-    pass_real = np.asarray(mask_u8, dtype=bool)
-    labels_real, num_objects = ndi.label(pass_real, structure=STRUCTURE26)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    labels_mm, num_objects, label_paths = label_foreground_volume_streaming(
+        mask_mm,
+        work_dir / f'{pass_tag}_labels',
+        keep_temp=True,
+    )
+
     if int(num_objects) <= 1:
-        return pass_real.astype(np.uint8), {
-            "num_objects": int(num_objects),
-            "num_endpoints": 0,
-            "candidate_connections": 0,
-            "accepted_connections": 0,
-            "walk_back_bridges": 0,
-            "skipped_by_min_radius": 0,
-            "added_voxels": 0,
-            "skipped": int(num_objects) <= 1,
+        del labels_mm
+        if not keep_temp:
+            for p in label_paths:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        return {
+            'num_objects': int(num_objects),
+            'num_endpoints': 0,
+            'candidate_connections': 0,
+            'accepted_connections': 0,
+            'default_bridges': 0,
+            'walk_back_bridges': 0,
+            'skipped_by_min_radius': 0,
+            'added_voxels': 0,
+            'skipped': int(num_objects) <= 1,
         }
 
-    seeds, num_endpoints = _build_slice_endpoint_seeds(labels_real, extension_slices=max_slice_distance)
+    seeds, num_endpoints = build_slice_endpoint_seeds_from_label_volume(labels_mm)
     if not seeds:
-        return pass_real.astype(np.uint8), {
-            "num_objects": int(num_objects),
-            "num_endpoints": int(num_endpoints),
-            "candidate_connections": 0,
-            "accepted_connections": 0,
-            "walk_back_bridges": 0,
-            "skipped_by_min_radius": 0,
-            "added_voxels": 0,
-            "skipped": False,
+        del labels_mm
+        if not keep_temp:
+            for p in label_paths:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        return {
+            'num_objects': int(num_objects),
+            'num_endpoints': int(num_endpoints),
+            'candidate_connections': 0,
+            'accepted_connections': 0,
+            'default_bridges': 0,
+            'walk_back_bridges': 0,
+            'skipped_by_min_radius': 0,
+            'added_voxels': 0,
+            'skipped': False,
         }
 
-    bridge_volume = np.zeros(pass_real.shape, dtype=bool)
+    bridge_path = work_dir / f'{pass_tag}_bridges.u8.dat'
+    bridge_mm = np.memmap(bridge_path, dtype=np.uint8, mode='w+', shape=mask_mm.shape)
+
     candidate_connections = 0
     accepted_connections = 0
+    default_bridges = 0
     walk_back_bridges = 0
     skipped_by_min_radius = 0
     added_voxels = 0
 
     for seed in seeds:
         candidate = _find_slice_projection_candidate(
-            labels_real=labels_real,
+            labels_real=labels_mm,
             seed=seed,
             max_slice_distance=int(max_slice_distance),
             search_angle_deg=float(search_angle_deg),
@@ -2493,23 +2946,24 @@ def interpolate_view_volume_pass(
             continue
 
         candidate_connections += 1
+        target_component, target_anchor = _component_mask_and_anchor(
+            labels_mm[candidate.target_point[0]] == int(candidate.target_label),
+            (candidate.target_point[1], candidate.target_point[2]),
+        )
+        target_radius = _component_max_radius(target_component) if target_anchor is not None else 0.0
+
         source_points = [candidate.source_point] + _collect_walkback_source_points(
-            labels_real=labels_real,
+            labels_real=labels_mm,
             label=int(candidate.source_label),
             start_point=candidate.source_point,
             direction_sign=int(seed.direction_sign),
             walk_back=int(interpolation_walk_back),
         )
 
-        target_component, target_anchor = _component_mask_and_anchor(
-            labels_real[candidate.target_point[0]] == int(candidate.target_label),
-            (candidate.target_point[1], candidate.target_point[2]),
-        )
-        target_radius = _component_max_radius(target_component) if target_anchor is not None else 0.0
-
+        accepted_this_candidate = False
         for walk_idx, src_point in enumerate(source_points):
             source_component, source_anchor = _component_mask_and_anchor(
-                labels_real[src_point[0]] == int(candidate.source_label),
+                labels_mm[src_point[0]] == int(candidate.source_label),
                 (src_point[1], src_point[2]),
             )
             source_radius = _component_max_radius(source_component) if source_anchor is not None else 0.0
@@ -2518,31 +2972,54 @@ def interpolate_view_volume_pass(
                 skipped_by_min_radius += 1
                 continue
 
-            accepted_connections += 1
-            if walk_idx > 0:
+            if walk_idx == 0:
+                default_bridges += 1
+            else:
                 walk_back_bridges += 1
 
+            if not accepted_this_candidate:
+                accepted_connections += 1
+                accepted_this_candidate = True
+
             added_voxels += _paint_linear_slice_bridge(
-                bridge_volume=bridge_volume,
-                labels_real=labels_real,
+                bridge_volume=bridge_mm,
+                labels_real=labels_mm,
                 source_label=int(candidate.source_label),
                 target_label=int(candidate.target_label),
                 source_point=src_point,
                 target_point=candidate.target_point,
             )
 
-    work = np.asarray(pass_real | bridge_volume, dtype=np.uint8)
-    stats: Dict[str, object] = {
-        "num_objects": int(num_objects),
-        "num_endpoints": int(num_endpoints),
-        "candidate_connections": int(candidate_connections),
-        "accepted_connections": int(accepted_connections),
-        "walk_back_bridges": int(walk_back_bridges),
-        "skipped_by_min_radius": int(skipped_by_min_radius),
-        "added_voxels": int(added_voxels),
-        "skipped": False,
+    for z in tqdm(range(mask_mm.shape[0]), desc='Interpolation: merge bridges'):
+        bridge_slice = np.asarray(bridge_mm[z])
+        if np.any(bridge_slice):
+            mask_mm[z, :, :] |= bridge_slice
+    mask_mm.flush()
+
+    del bridge_mm
+    del labels_mm
+    if not keep_temp:
+        for p in label_paths:
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+        try:
+            bridge_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    return {
+        'num_objects': int(num_objects),
+        'num_endpoints': int(num_endpoints),
+        'candidate_connections': int(candidate_connections),
+        'accepted_connections': int(accepted_connections),
+        'default_bridges': int(default_bridges),
+        'walk_back_bridges': int(walk_back_bridges),
+        'skipped_by_min_radius': int(skipped_by_min_radius),
+        'added_voxels': int(added_voxels),
+        'skipped': False,
     }
-    return work.astype(np.uint8), stats
 
 
 # --------------------------
@@ -2907,6 +3384,185 @@ def write_pipeline_outputs(
     return result_paths
 
 
+def iter_view_mask_frames(mask_u8: np.ndarray, view: ViewInfo) -> Iterator[np.ndarray]:
+    if view.name == 'transverse':
+        for t in range(view.num_slices):
+            yield np.asarray(mask_u8[t])
+    elif view.name == 'sagittal':
+        for y in range(view.num_slices):
+            yield np.ascontiguousarray(mask_u8[:, y, :])
+    elif view.name == 'coronal':
+        for x in range(view.num_slices):
+            yield np.ascontiguousarray(mask_u8[:, :, x])
+    else:  # pragma: no cover
+        raise ValueError(f'Unknown view: {view.name}')
+
+
+def write_overlay_video_for_view(
+    volume_rgb: np.memmap,
+    mask_u8: np.ndarray,
+    view: ViewInfo,
+    out_path: Path,
+    fps: float,
+) -> None:
+    if view.name == 'transverse':
+        write_overlay_video(volume_rgb, mask_u8, out_path, fps=fps)
+        return
+
+    proc = ffmpeg_rawvideo_writer(
+        out_path,
+        width=view.src_w,
+        height=view.src_h,
+        fps=fps,
+        pix_fmt_in='rgb24',
+        codec='ffv1',
+        pix_fmt_out='yuv444p',
+    )
+    blue = np.array([0, 0, 255], dtype=np.uint8)
+
+    try:
+        assert proc.stdin is not None
+        for frame_rgb, frame_mask in tqdm(
+            zip(iter_view_frames(volume_rgb, view), iter_view_mask_frames(mask_u8, view)),
+            total=view.num_slices,
+            desc=f'Writing {view.name} overlay video ({out_path.name})',
+        ):
+            frame = np.asarray(frame_rgb).copy()
+            m = np.asarray(frame_mask, dtype=bool)
+            if np.any(m):
+                frame[m] = ((frame[m].astype(np.uint16) + blue.astype(np.uint16)) // 2).astype(np.uint8)
+            proc.stdin.write(frame.tobytes())
+    finally:
+        close_ffmpeg_writer(proc)
+
+
+def write_view_yolo_labels_from_pattern(
+    mask_u8: np.ndarray,
+    view: ViewInfo,
+    pattern_path: Path,
+) -> Path:
+    pattern_path.parent.mkdir(parents=True, exist_ok=True)
+    for idx, frame_mask in enumerate(tqdm(iter_view_mask_frames(mask_u8, view), total=view.num_slices, desc=f'Writing YOLO labels ({pattern_path.parent.name})')):
+        fp = _format_frame_path(pattern_path, idx + 1)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        m = np.asarray(frame_mask) > 0
+        if not np.any(m):
+            fp.write_text('')
+            continue
+        polys = mask_to_yolo_polygons(m.astype(np.uint8))
+        if not polys:
+            fp.write_text('')
+            continue
+        lines: List[str] = []
+        for poly in polys:
+            coords: List[str] = []
+            for x, y in poly:
+                coords.append(f'{x:.6f}')
+                coords.append(f'{y:.6f}')
+            lines.append('0 ' + ' '.join(coords))
+        fp.write_text('\n'.join(lines) + '\n')
+    return pattern_path.parent
+
+
+def write_view_binary_outputs_from_pattern(
+    mask_u8: np.ndarray,
+    view: ViewInfo,
+    pattern_path: Path,
+    video_path: Path,
+    fps: float,
+) -> Tuple[Path, Path]:
+    pattern_path.parent.mkdir(parents=True, exist_ok=True)
+
+    for idx, frame_mask in enumerate(tqdm(iter_view_mask_frames(mask_u8, view), total=view.num_slices, desc=f'Writing binary TIFF sequence ({pattern_path.parent.name})')):
+        img = (np.asarray(frame_mask) * 255).astype(np.uint8)
+        fp = _format_frame_path(pattern_path, idx + 1)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        tifffile.imwrite(str(fp), img)
+
+    proc = ffmpeg_rawvideo_writer(
+        video_path,
+        width=view.src_w,
+        height=view.src_h,
+        fps=fps,
+        pix_fmt_in='gray',
+        codec='ffv1',
+        pix_fmt_out='gray',
+    )
+    try:
+        assert proc.stdin is not None
+        for frame_mask in tqdm(iter_view_mask_frames(mask_u8, view), total=view.num_slices, desc=f'Writing binary MKV ({video_path.name})'):
+            img = (np.asarray(frame_mask) * 255).astype(np.uint8)
+            proc.stdin.write(img.tobytes())
+    finally:
+        close_ffmpeg_writer(proc)
+
+    return pattern_path.parent, video_path
+
+
+def write_additional_view_outputs(
+    *,
+    volume_rgb: np.memmap,
+    mask_u8: np.ndarray,
+    view: ViewInfo,
+    out_dir: Path,
+    stem: str,
+    fps: float,
+    save_binary_pattern_value: Optional[str],
+    save_labels_pattern_value: Optional[str],
+    tag: Optional[str] = None,
+) -> Dict[str, Path]:
+    pretty = view.name.capitalize()
+    tag_suffix = f'_{tag}' if tag else ''
+    overlay_path = out_dir / f'{stem}_{pretty}_Overlay{tag_suffix}.mkv'
+    write_overlay_video_for_view(volume_rgb, mask_u8, view, overlay_path, fps=fps)
+    result_paths: Dict[str, Path] = {f'{view.name}_overlay': overlay_path}
+
+    labels_pattern = _resolve_output_pattern(save_labels_pattern_value, DEFAULT_LABEL_PATTERN, out_dir, stem)
+    if labels_pattern is not None:
+        labels_pattern = _tag_frame_pattern(labels_pattern, pretty if tag is None else f'{pretty}_{tag}')
+        labels_dir = write_view_yolo_labels_from_pattern(mask_u8, view, labels_pattern)
+        result_paths[f'{view.name}_labels_dir'] = labels_dir
+
+    binary_pattern = _resolve_output_pattern(save_binary_pattern_value, DEFAULT_BINARY_PATTERN, out_dir, stem)
+    if binary_pattern is not None:
+        binary_pattern = _tag_frame_pattern(binary_pattern, pretty if tag is None else f'{pretty}_{tag}')
+        binary_video_path = out_dir / f'{stem}_{pretty}_Binary{tag_suffix}.mkv'
+        tiff_dir, binary_video_path = write_view_binary_outputs_from_pattern(mask_u8, view, binary_pattern, binary_video_path, fps)
+        result_paths[f'{view.name}_binary_tiff_dir'] = tiff_dir
+        result_paths[f'{view.name}_binary_video'] = binary_video_path
+
+    return result_paths
+
+
+def write_multiplanar_outputs(
+    *,
+    volume_rgb: np.memmap,
+    mask_u8: np.ndarray,
+    out_dir: Path,
+    stem: str,
+    fps: float,
+    save_binary_pattern_value: Optional[str],
+    save_labels_pattern_value: Optional[str],
+    tag: Optional[str] = None,
+) -> Dict[str, Path]:
+    t_dim, h_dim, w_dim = mask_u8.shape
+    views = {v.name: v for v in get_view_infos(t_dim, h_dim, w_dim, disable_multiplanar=False)}
+    result_paths: Dict[str, Path] = {}
+    for view_name in ('sagittal', 'coronal'):
+        result_paths.update(write_additional_view_outputs(
+            volume_rgb=volume_rgb,
+            mask_u8=mask_u8,
+            view=views[view_name],
+            out_dir=out_dir,
+            stem=stem,
+            fps=fps,
+            save_binary_pattern_value=save_binary_pattern_value,
+            save_labels_pattern_value=save_labels_pattern_value,
+            tag=tag,
+        ))
+    return result_paths
+
+
 def write_summary_file(
     out_path: Path,
     *,
@@ -2922,23 +3578,56 @@ def write_summary_file(
     final_paths: Dict[str, Path],
 ) -> Path:
     lines: List[str] = []
-    lines.append(f"Command: {command}")
-    lines.append(f"Input: {input_path}")
-    lines.append(f"Output directory: {out_dir}")
-    lines.append(f"Volume shape (t, Y, X): {volume_shape}")
-    lines.append(f"FPS: {fps}")
-    lines.append(f"Models: {', '.join(str(Path(m)) for m in model_paths)}")
-    lines.append(f"Views: {', '.join(view_names)}")
-    lines.append("")
-    lines.append("Interpolation statistics:")
-    lines.append(json.dumps(interpolation_stats, indent=2))
+    lines.append(f'Command: {command}')
+    lines.append(f'Input: {input_path}')
+    lines.append(f'Output directory: {out_dir}')
+    lines.append(f'Volume shape (t, Y, X): {volume_shape}')
+    lines.append(f'FPS: {fps}')
+    lines.append(f'Models: {", ".join(str(Path(m)) for m in model_paths)}')
+    lines.append(f'Views: {", ".join(view_names)}')
+
+    if interpolation_stats:
+        lines.append('')
+        lines.append('Interpolation statistics (per pass):')
+        pass_indices = sorted({int(s.get('pass_index', 0)) for s in interpolation_stats})
+        for pass_idx in pass_indices:
+            stats_this_pass = [s for s in interpolation_stats if int(s.get('pass_index', 0)) == pass_idx]
+            total_objects = sum(int(s.get('num_objects', 0)) for s in stats_this_pass)
+            total_endpoints = sum(int(s.get('num_endpoints', 0)) for s in stats_this_pass)
+            total_candidates = sum(int(s.get('candidate_connections', 0)) for s in stats_this_pass)
+            total_accepted = sum(int(s.get('accepted_connections', 0)) for s in stats_this_pass)
+            total_default_bridges = sum(int(s.get('default_bridges', 0)) for s in stats_this_pass)
+            total_walk_back = sum(int(s.get('walk_back_bridges', 0)) for s in stats_this_pass)
+            total_skipped = sum(int(s.get('skipped_by_min_radius', 0)) for s in stats_this_pass)
+            total_added_voxels = sum(int(s.get('added_voxels', 0)) for s in stats_this_pass)
+            lines.append(
+                f'  Pass {pass_idx}: objects={total_objects}, endpoints={total_endpoints}, '
+                f'candidate_connections={total_candidates}, accepted_connections={total_accepted}, '
+                f'default_bridges={total_default_bridges}, walk_back_bridges={total_walk_back}, '
+                f'bridges_skipped_by_--interpolate_min_radius={total_skipped}, added_voxels={total_added_voxels}'
+            )
+            for s in sorted(stats_this_pass, key=lambda d: (str(d.get('model', '')), str(d.get('view', '')))):
+                lines.append(
+                    f"    {s.get('model', '?')}/{s.get('view', '?')}: "
+                    f"objects={int(s.get('num_objects', 0))}, "
+                    f"endpoints={int(s.get('num_endpoints', 0))}, "
+                    f"candidate_connections={int(s.get('candidate_connections', 0))}, "
+                    f"accepted_connections={int(s.get('accepted_connections', 0))}, "
+                    f"default_bridges={int(s.get('default_bridges', 0))}, "
+                    f"walk_back_bridges={int(s.get('walk_back_bridges', 0))}, "
+                    f"bridges_skipped_by_--interpolate_min_radius={int(s.get('skipped_by_min_radius', 0))}, "
+                    f"added_voxels={int(s.get('added_voxels', 0))}, "
+                    f"skipped={bool(s.get('skipped', False))}"
+                )
+
     if voxel_volume is not None:
-        lines.append("")
-        lines.append(f"voxel_volume: {int(voxel_volume)}")
-    lines.append("")
-    lines.append("Final outputs:")
+        lines.append('')
+        lines.append(f'voxel_volume: {int(voxel_volume)}')
+
+    lines.append('')
+    lines.append('Final outputs:')
     for key in sorted(final_paths.keys()):
-        lines.append(f"{key}: {final_paths[key]}")
+        lines.append(f'{key}: {final_paths[key]}')
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines) + "\n")
@@ -3032,34 +3721,40 @@ def main() -> None:
         int8=bool(args.int8),
     )
 
-    union_by_model: Dict[str, Dict[str, np.memmap]] = {}
-    conf_by_model: Dict[str, Dict[str, np.memmap]] = {}
-
-    for model_name, _ in yolo_models:
-        union_by_model[model_name] = {}
-        conf_by_model[model_name] = {}
-        for view in views:
-            bytes_native = bytes_for_packbits(view.src_h, view.src_w)
-            union_path = temp_dir / "union" / model_name / f"{view.name}.union.packbits.dat"
-            conf_path = temp_dir / "union" / model_name / f"{view.name}.union_conf.f16.dat"
-            union_path.parent.mkdir(parents=True, exist_ok=True)
-            union_mm = np.memmap(union_path, dtype=np.uint8, mode="w+", shape=(view.num_slices, bytes_native))
-            conf_mm = np.memmap(conf_path, dtype=np.float16, mode="w+", shape=(view.num_slices,))
-            union_mm[:] = 0
-            conf_mm[:] = 0
-            union_mm.flush()
-            conf_mm.flush()
-            union_by_model[model_name][view.name] = union_mm
-            conf_by_model[model_name][view.name] = conf_mm
+    view_volumes_by_model: Dict[str, Dict[str, np.memmap]] = {model_name: {} for model_name, _ in yolo_models}
 
     for view in views:
         print(f"\n=== View: {view.name} ({view.src_w}x{view.src_h}, slices={view.num_slices}) ===")
+
+        union_by_model_view: Dict[str, np.memmap] = {}
+        confmap_by_model_view: Dict[str, np.memmap] = {}
+        union_paths: Dict[str, Path] = {}
+        confmap_paths: Dict[str, Path] = {}
+
+        for model_name, _ in yolo_models:
+            bytes_native = bytes_for_packbits(view.src_h, view.src_w)
+            union_path = temp_dir / 'union' / model_name / f'{view.name}.union.packbits.dat'
+            confmap_path = temp_dir / 'union' / model_name / f'{view.name}.confmap.f16.dat'
+            union_path.parent.mkdir(parents=True, exist_ok=True)
+
+            union_mm = np.memmap(union_path, dtype=np.uint8, mode='w+', shape=(view.num_slices, bytes_native))
+            union_mm[:] = 0
+            union_mm.flush()
+
+            confmap_mm = np.memmap(confmap_path, dtype=np.float16, mode='w+', shape=(view.num_slices, view.src_h, view.src_w))
+            confmap_mm.flush()
+
+            union_by_model_view[model_name] = union_mm
+            confmap_by_model_view[model_name] = confmap_mm
+            union_paths[model_name] = union_path
+            confmap_paths[model_name] = confmap_path
+
         for angle in angles:
             for dx, dy, sname in shifts:
-                aug_id = f"a{angle:g}_dx{dx}_dy{dy}_{sname}"
-                aug_dir = temp_dir / "aug" / view.name
-                aug_video = aug_dir / f"{view.name}_{aug_id}.mkv"
-                aug_meta = aug_dir / f"{view.name}_{aug_id}.meta.json"
+                aug_id = f'a{angle:g}_dx{dx}_dy{dy}_{sname}'
+                aug_dir = temp_dir / 'aug' / view.name
+                aug_video = aug_dir / f'{view.name}_{aug_id}.mkv'
+                aug_meta = aug_dir / f'{view.name}_{aug_id}.meta.json'
 
                 aff = build_affine(
                     view=view.name,
@@ -3079,16 +3774,16 @@ def main() -> None:
                         width=args.imgsz,
                         height=args.imgsz,
                         fps=fps,
-                        pix_fmt_in="rgb24",
-                        codec="ffv1",
-                        pix_fmt_out="yuv444p",
+                        pix_fmt_in='rgb24',
+                        codec='ffv1',
+                        pix_fmt_out='yuv444p',
                     )
                     try:
                         assert writer.stdin is not None
                         for frame in tqdm(
                             iter_view_frames(volume_rgb, view),
                             total=view.num_slices,
-                            desc=f"Augment {view.name} {aug_id}",
+                            desc=f'Augment {view.name} {aug_id}',
                         ):
                             out = cv2.warpAffine(
                                 frame,
@@ -3105,28 +3800,28 @@ def main() -> None:
                     aug_meta.write_text(
                         json.dumps(
                             {
-                                "view": view.name,
-                                "angle_deg": float(angle),
-                                "shift_dx": int(dx),
-                                "shift_dy": int(dy),
-                                "src_w": view.src_w,
-                                "src_h": view.src_h,
-                                "out_size": int(args.imgsz),
-                                "pad_mode": view.pad_mode,
-                                "canvas_w": int(aff.canvas_w),
-                                "canvas_h": int(aff.canvas_h),
-                                "pad_size": int(aff.pad_size),
-                                "pad_off_x": float(aff.pad_off_x),
-                                "pad_off_y": float(aff.pad_off_y),
-                                "M_out_to_src": aff.M_out_to_src.tolist(),
-                                "M_src_to_out": aff.M_src_to_out.tolist(),
+                                'view': view.name,
+                                'angle_deg': float(angle),
+                                'shift_dx': int(dx),
+                                'shift_dy': int(dy),
+                                'src_w': view.src_w,
+                                'src_h': view.src_h,
+                                'out_size': int(args.imgsz),
+                                'pad_mode': view.pad_mode,
+                                'canvas_w': int(aff.canvas_w),
+                                'canvas_h': int(aff.canvas_h),
+                                'pad_size': int(aff.pad_size),
+                                'pad_off_x': float(aff.pad_off_x),
+                                'pad_off_y': float(aff.pad_off_y),
+                                'M_out_to_src': aff.M_out_to_src.tolist(),
+                                'M_src_to_out': aff.M_src_to_out.tolist(),
                             },
                             indent=2,
                         )
                     )
 
                 for model_name, yolo in yolo_models:
-                    pred_prefix = temp_dir / "preds" / model_name / view.name / f"{view.name}_{aug_id}"
+                    pred_prefix = temp_dir / 'preds' / model_name / view.name / f'{view.name}_{aug_id}'
                     predict_video_and_accumulate(
                         model=yolo,
                         video_path=aug_video,
@@ -3134,8 +3829,8 @@ def main() -> None:
                         out_size=args.imgsz,
                         pred_out_prefix=pred_prefix,
                         cfg=pred_cfg,
-                        view_union_mm=union_by_model[model_name][view.name],
-                        view_conf_mm=conf_by_model[model_name][view.name],
+                        view_union_mm=union_by_model_view[model_name],
+                        view_confmap_mm=confmap_by_model_view[model_name],
                         M_out_to_native=aff.M_out_to_src,
                         native_h=view.src_h,
                         native_w=view.src_w,
@@ -3151,61 +3846,92 @@ def main() -> None:
         for model_name, _ in yolo_models:
             print(f"\n--- Postprocessing view '{view.name}' for model '{model_name}' ---")
             if args.min_conf > 0:
-                apply_min_conf_filter_inplace(
-                    union_by_model[model_name][view.name],
-                    conf_by_model[model_name][view.name],
+                apply_min_conf_filter_with_confmap_inplace(
+                    union_by_model_view[model_name],
+                    confmap_by_model_view[model_name],
                     float(args.min_conf),
+                    view.src_h,
+                    view.src_w,
                 )
-                union_by_model[model_name][view.name].flush()
-                conf_by_model[model_name][view.name].flush()
+                union_by_model_view[model_name].flush()
+                confmap_by_model_view[model_name].flush()
 
-            fill_2d_holes_inplace(union_by_model[model_name][view.name], view.src_h, view.src_w)
-            union_by_model[model_name][view.name].flush()
+            fill_2d_holes_inplace(union_by_model_view[model_name], view.src_h, view.src_w)
+            union_by_model_view[model_name].flush()
 
-    view_volumes_by_model: Dict[str, Dict[str, np.memmap]] = {}
-    for model_name, _ in yolo_models:
-        view_volumes_by_model[model_name] = {}
-        for view in views:
-            out_path = temp_dir / "view_volumes" / model_name / f"{view.name}.u8.dat"
+            out_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.u8.dat'
             view_volumes_by_model[model_name][view.name] = unpack_view_union_to_volume(
-                union_mm=union_by_model[model_name][view.name],
+                union_mm=union_by_model_view[model_name],
                 num_slices=view.num_slices,
                 h=view.src_h,
                 w=view.src_w,
                 out_path=out_path,
-                desc=f"Unpacking {model_name}/{view.name}",
+                desc=f'Unpacking {model_name}/{view.name}',
             )
 
-    def build_current_finalized_volume(snapshot_stem: str) -> np.ndarray:
+            if not args.troubleshooting:
+                try:
+                    del confmap_by_model_view[model_name]
+                except Exception:
+                    pass
+                try:
+                    del union_by_model_view[model_name]
+                except Exception:
+                    pass
+                try:
+                    confmap_paths[model_name].unlink(missing_ok=True)
+                except Exception:
+                    pass
+                try:
+                    union_paths[model_name].unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    def build_current_finalized_volume(snapshot_stem: str) -> np.memmap:
         ensemble_mm = assemble_current_ensemble_volume(
             view_volumes_by_model=view_volumes_by_model,
             T=T,
             H=H,
             W=W,
             disable_multiplanar=args.disable_multiplanar,
-            out_path=temp_dir / f"{snapshot_stem}.u8.dat",
+            out_path=temp_dir / f'{snapshot_stem}.u8.dat',
         )
-        ensemble_u8 = fill_3d_voids(np.asarray(ensemble_mm))
+        fill_3d_voids_inplace_streaming(
+            ensemble_mm,
+            temp_dir / f'{snapshot_stem}_voidfill',
+            keep_temp=bool(args.troubleshooting),
+        )
         if float(args.min_radius) > 0:
-            ensemble_u8 = apply_transverse_min_radius_filter(ensemble_u8, float(args.min_radius))
-        return ensemble_u8
+            apply_transverse_min_radius_filter_inplace(ensemble_mm, float(args.min_radius))
+        return ensemble_mm
 
     interpolation_stats: List[Dict[str, object]] = []
 
     if bool(args.troubleshooting) and int(args.interpolate) > 0:
-        print("\n=== Writing troubleshooting outputs: pass 0 (pre-interpolation) ===")
-        pass0_u8 = build_current_finalized_volume("ensemble_pass0")
-        write_pipeline_outputs(
+        print('\n=== Writing troubleshooting outputs: pass 0 (pre-interpolation) ===')
+        pass0_mm = build_current_finalized_volume('ensemble_pass0')
+        pass0_paths = write_pipeline_outputs(
             volume_rgb=volume_rgb,
-            mask_u8=pass0_u8,
+            mask_u8=pass0_mm,
             out_dir=out_dir,
             stem=input_path.stem,
             fps=fps,
             save_binary_pattern_value=args.save_binary,
             save_labels_pattern_value=args.save_labels,
             save_nrrd_flag=bool(args.save_nrrd),
-            tag="Pass0",
+            tag='Pass0',
         )
+        if bool(args.save_multiplanar):
+            pass0_paths.update(write_multiplanar_outputs(
+                volume_rgb=volume_rgb,
+                mask_u8=pass0_mm,
+                out_dir=out_dir,
+                stem=input_path.stem,
+                fps=fps,
+                save_binary_pattern_value=args.save_binary,
+                save_labels_pattern_value=args.save_labels,
+                tag='Pass0',
+            ))
 
     if int(args.interpolate) > 0:
         total_passes = int(args.interpolate_passes)
@@ -3220,59 +3946,72 @@ def main() -> None:
                 for view in views:
                     print(f"\n--- Interpolating model '{model_name}' view '{view.name}' ---")
                     current_mm = view_volumes_by_model[model_name][view.name]
-                    next_u8, stats = interpolate_view_volume_pass(
-                        np.asarray(current_mm),
+                    stats = interpolate_view_volume_pass_inplace(
+                        mask_mm=current_mm,
+                        work_dir=temp_dir / 'interpolation' / model_name / view.name,
+                        pass_tag=f'pass{pass_idx}',
                         max_slice_distance=int(args.interpolate),
                         search_angle_deg=float(args.interpolation_search_angle),
                         interpolation_walk_back=int(args.interpolation_walk_back),
                         interpolate_min_radius=float(args.interpolate_min_radius),
+                        keep_temp=bool(args.troubleshooting),
                     )
-                    current_mm[:, :, :] = next_u8
-                    current_mm.flush()
 
                     stats = dict(stats)
                     stats.update({
-                        "pass_index": int(pass_idx),
-                        "model": str(model_name),
-                        "view": str(view.name),
-                        "max_slice_distance": int(args.interpolate),
-                        "interpolation_walk_back": int(args.interpolation_walk_back),
-                        "interpolation_search_angle": float(args.interpolation_search_angle),
+                        'pass_index': int(pass_idx),
+                        'model': str(model_name),
+                        'view': str(view.name),
+                        'max_slice_distance': int(args.interpolate),
+                        'interpolation_walk_back': int(args.interpolation_walk_back),
+                        'interpolation_search_angle': float(args.interpolation_search_angle),
                     })
                     interpolation_stats.append(stats)
 
             if bool(args.troubleshooting) and pass_idx < total_passes:
                 print(f"\n=== Writing troubleshooting outputs: pass {pass_idx} ===")
-                pass_u8 = build_current_finalized_volume(f"ensemble_pass{pass_idx}")
-                write_pipeline_outputs(
+                pass_mm = build_current_finalized_volume(f'ensemble_pass{pass_idx}')
+                pass_paths = write_pipeline_outputs(
                     volume_rgb=volume_rgb,
-                    mask_u8=pass_u8,
+                    mask_u8=pass_mm,
                     out_dir=out_dir,
                     stem=input_path.stem,
                     fps=fps,
                     save_binary_pattern_value=args.save_binary,
                     save_labels_pattern_value=args.save_labels,
                     save_nrrd_flag=bool(args.save_nrrd),
-                    tag=f"Pass{pass_idx}",
+                    tag=f'Pass{pass_idx}',
                 )
+                if bool(args.save_multiplanar):
+                    pass_paths.update(write_multiplanar_outputs(
+                        volume_rgb=volume_rgb,
+                        mask_u8=pass_mm,
+                        out_dir=out_dir,
+                        stem=input_path.stem,
+                        fps=fps,
+                        save_binary_pattern_value=args.save_binary,
+                        save_labels_pattern_value=args.save_labels,
+                        tag=f'Pass{pass_idx}',
+                    ))
     else:
         for model_name in sorted(view_volumes_by_model.keys()):
             for view in views:
                 interpolation_stats.append({
-                    "pass_index": 0,
-                    "model": str(model_name),
-                    "view": str(view.name),
-                    "max_slice_distance": int(args.interpolate),
-                    "interpolation_walk_back": int(args.interpolation_walk_back),
-                    "interpolation_search_angle": float(args.interpolation_search_angle),
-                    "num_objects": 0,
-                    "num_endpoints": 0,
-                    "candidate_connections": 0,
-                    "accepted_connections": 0,
-                    "walk_back_bridges": 0,
-                    "skipped_by_min_radius": 0,
-                    "added_voxels": 0,
-                    "skipped": True,
+                    'pass_index': 0,
+                    'model': str(model_name),
+                    'view': str(view.name),
+                    'max_slice_distance': int(args.interpolate),
+                    'interpolation_walk_back': int(args.interpolation_walk_back),
+                    'interpolation_search_angle': float(args.interpolation_search_angle),
+                    'num_objects': 0,
+                    'num_endpoints': 0,
+                    'candidate_connections': 0,
+                    'accepted_connections': 0,
+                    'default_bridges': 0,
+                    'walk_back_bridges': 0,
+                    'skipped_by_min_radius': 0,
+                    'added_voxels': 0,
+                    'skipped': True,
                 })
 
     final_ensemble_mm = assemble_current_ensemble_volume(
@@ -3281,17 +4020,21 @@ def main() -> None:
         H=H,
         W=W,
         disable_multiplanar=args.disable_multiplanar,
-        out_path=temp_dir / "ensemble_volume_final.u8.dat",
+        out_path=temp_dir / 'ensemble_volume_final.u8.dat',
     )
 
-    print("\n=== 3D void fill after multiplanar/model union ===")
-    ensemble_u8 = fill_3d_voids(np.asarray(final_ensemble_mm))
+    print('\n=== 3D void fill after multiplanar/model union ===')
+    fill_3d_voids_inplace_streaming(
+        final_ensemble_mm,
+        temp_dir / 'ensemble_volume_final_voidfill',
+        keep_temp=bool(args.troubleshooting),
+    )
     if float(args.min_radius) > 0:
-        ensemble_u8 = apply_transverse_min_radius_filter(ensemble_u8, float(args.min_radius))
+        apply_transverse_min_radius_filter_inplace(final_ensemble_mm, float(args.min_radius))
 
     final_paths = write_pipeline_outputs(
         volume_rgb=volume_rgb,
-        mask_u8=ensemble_u8,
+        mask_u8=final_ensemble_mm,
         out_dir=out_dir,
         stem=input_path.stem,
         fps=fps,
@@ -3300,10 +4043,26 @@ def main() -> None:
         save_nrrd_flag=bool(args.save_nrrd),
         tag=None,
     )
+    if bool(args.save_multiplanar):
+        final_paths.update(write_multiplanar_outputs(
+            volume_rgb=volume_rgb,
+            mask_u8=final_ensemble_mm,
+            out_dir=out_dir,
+            stem=input_path.stem,
+            fps=fps,
+            save_binary_pattern_value=args.save_binary,
+            save_labels_pattern_value=args.save_labels,
+            tag=None,
+        ))
 
-    voxel_volume = int(np.count_nonzero(ensemble_u8)) if bool(args.voxel_volume) else None
+    voxel_volume = None
+    if bool(args.voxel_volume):
+        voxel_volume = 0
+        for z in tqdm(range(final_ensemble_mm.shape[0]), desc='Counting voxel_volume'):
+            voxel_volume += int(np.count_nonzero(np.asarray(final_ensemble_mm[z])))
+
     summary_path = write_summary_file(
-        out_dir / f"{input_path.stem}_Summary.txt",
+        out_dir / f'{input_path.stem}_Summary.txt',
         command=shlex.join([str(x) for x in sys.argv]),
         input_path=input_path,
         out_dir=out_dir,
@@ -3326,10 +4085,10 @@ def main() -> None:
             except Exception:
                 pass
 
-    print("\nDone.")
-    print(f"Output dir: {out_dir}")
+    print('\nDone.')
+    print(f'Output dir: {out_dir}')
     print(f"Final overlay: {final_paths['overlay']}")
-    print(f"Summary: {summary_path}")
+    print(f'Summary: {summary_path}')
 
 
 if __name__ == "__main__":
