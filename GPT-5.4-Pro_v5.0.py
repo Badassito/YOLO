@@ -1,29 +1,19 @@
 #!/usr/bin/env python3
 """
-YOLO segmentation test-time augmentation pipeline for v4.2.4.
+YOLO segmentation test-time augmentation (TTA) for large transverse video volumes.
 
-Pipeline summary:
-1) Decode the input video once to a (t, y, x, rgb) memmap and derive Transverse,
-   Sagittal, and Coronal views unless --disable_multiplanar is active.
-2) For each view / angle / optional shift, build one affine transform that rotates,
-   pads or clamps according to the view rules, scales to --imgsz, and applies the
-   requested shift. Each augmented stack is saved as FFV1/MKV in temp/.
-3) Run Ultralytics YOLO segmentation on the pre-generated augmented videos
-   sequentially for every requested model.
-4) Read the stored masks back from disk, undo the affine transform, union the
-   per-frame masks into one class-0 mask, keep the max confidence, apply --min_conf,
-   and fill 2D holes.
-5) Assemble one native-orientation 3D volume per model and per view. If
-   --interpolate > 0, run the v4.2.4 skeleton / spherical-sector interpolation
-   independently on each view volume for the requested number of passes.
-6) Union the current view volumes (or the Transverse view only), union the model
-   volumes, fill enclosed 3D voids, optionally remove small transverse components
-   via --min_radius, and emit the requested outputs.
-7) Outputs may include the transverse overlay MKV, YOLO labels, binary TIFF + MKV,
-   NRRD, command.txt, and the --voxel_volume marker file.
+This v5.0-oriented script:
+  - builds transverse, sagittal and coronal views (unless --disable_multiplanar)
+  - generates rotated / scaled / shifted FFV1 MKV augmentations via a single affine transform per variant
+  - runs Ultralytics YOLO segmentation sequentially on the pre-generated augmentation videos
+  - stores per-augmentation results to disk, undoes the affine transforms and unions masks per slice
+  - applies --min_conf directly to per-slice unions, fills 2D holes, and optionally interpolates each view volume independently
+  - unions the final per-view / per-model volumes, fills enclosed 3D voids, optionally filters small transverse-plane components via --min_radius
+  - writes the final transverse overlay video plus optional YOLO labels, binary TIFF/MKV outputs, NRRD, and a summary text file
 
 Dependencies (Python):
   pip install opencv-python numpy scipy scikit-image tifffile tqdm ultralytics
+  pip install pynrrd   # only needed for --save_nrrd
 
 System:
   ffmpeg + ffprobe on PATH.
@@ -35,8 +25,10 @@ import argparse
 import json
 import math
 import re
+import shlex
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
@@ -122,26 +114,33 @@ def build_argparser() -> argparse.ArgumentParser:
 
     p.add_argument("--conf", default=0.15, type=float, help="Passed to YOLO predict")
     p.add_argument("--min_conf", default=0.30, type=float,
-                   help="If >0: low-confidence slice pruning threshold (must be >= --conf). 0 disables.")
+                   help="Remove per-slice unions whose confidence is below this threshold (must be >= --conf)")
+    p.add_argument("--min_radius", default=0.0, type=float,
+                   help="Remove final transverse-plane connected components whose radius is smaller than this value")
     p.add_argument("--half", action="store_true", help="Enable FP16 inference (Ultralytics half=True)")
     p.add_argument("--int8", action="store_true", help="Enable INT8 inference if supported (Ultralytics int8=True)")
 
-    p.add_argument("--save_labels", action="store_true", help="Save final YOLO segmentation labels per frame")
-    p.add_argument("--save_binary", action="store_true",
-                   help="Save final binary masks as TIFF sequence + FFV1 MKV")
-    p.add_argument("--binary", action="store_true",
-                   help="Count white pixels in final binary output and create an empty file named with that count")
+    p.add_argument("--save_labels", nargs="?", const="__DEFAULT__", default=None, type=str,
+                   help="Save final YOLO segmentation labels per frame. Optional custom pattern, e.g. labels/{Filename}_%%04d.txt")
+    p.add_argument("--save_binary", nargs="?", const="__DEFAULT__", default=None, type=str,
+                   help="Save final binary masks as TIFF sequence + FFV1 MKV. Optional custom TIFF pattern, e.g. binary_masks/{Filename}_Binary_%%04d.tiff")
+    p.add_argument("--save_nrrd", action="store_true", help="Save the final binary mask volume as an NRRD file")
+    p.add_argument("--voxel_volume", action="store_true", help="Count white voxels in the final binary output and save to the summary text file")
+    p.add_argument("--binary", action="store_true", dest="voxel_volume", help=argparse.SUPPRESS)
     p.add_argument("--troubleshooting", action="store_true",
                    help="Keep temp files and save pass snapshots before each interpolation pass")
 
     p.add_argument("--interpolate", default=15, type=int,
-                   help="Spherical-sector radius N (voxels). 0 disables interpolation.")
+                   help="Maximum slice-distance used to search for interpolation candidates. 0 disables interpolation")
+    p.add_argument("--interpolation_walk_back", default=3, type=int,
+                   help="Additional source slices to bridge before the endpoint slice. 0 disables walk-back bridges")
     p.add_argument("--interpolate_passes", default=1, type=int,
                    help="Run the interpolation process this many passes, treating the previous pass as real")
     p.add_argument("--interpolate_min_radius", default=3, type=float,
-                   help="Skip candidate bridges whose effective radius is <= this value")
-    p.add_argument("--cone_half_angle", default=15.0, type=float,
-                   help="Spherical-sector half-angle in degrees. 0=ray, 90=hemisphere")
+                   help="Skip interpolation bridges whose effective radius is <= this value")
+    p.add_argument("--interpolation_search_angle", default=15.0, type=float,
+                   help="Projection growth angle in degrees. Must be greater than -90 and less than 90")
+    p.add_argument("--cone_half_angle", dest="interpolation_search_angle", type=float, help=argparse.SUPPRESS)
     return p
 
 
@@ -663,31 +662,13 @@ def apply_min_conf_filter_inplace(
     conf_mm: np.memmap,
     min_conf: float,
 ) -> None:
-    """
-    For any slice with conf < min_conf:
-      - if no overlap with either neighbor slice, delete it (mask->0)
-    """
+    """Remove any per-slice union whose stored confidence is below ``min_conf``."""
     n = union_mm.shape[0]
-    for i in tqdm(range(n), desc="min_conf neighbor pruning"):
-        if float(conf_mm[i]) >= min_conf:
+    for i in tqdm(range(n), desc="min_conf thresholding"):
+        if float(conf_mm[i]) >= float(min_conf):
             continue
-        cur = np.asarray(union_mm[i])
-        if not any_mask(cur):
-            continue
-
-        keep = False
-        if i - 1 >= 0:
-            prev = np.asarray(union_mm[i - 1])
-            if any_mask(prev) and overlap_any(cur, prev):
-                keep = True
-        if not keep and i + 1 < n:
-            nxt = np.asarray(union_mm[i + 1])
-            if any_mask(nxt) and overlap_any(cur, nxt):
-                keep = True
-
-        if not keep:
-            union_mm[i, :] = 0
-            conf_mm[i] = np.float16(0.0)
+        union_mm[i, :] = 0
+        conf_mm[i] = np.float16(0.0)
 
 
 def fill_2d_holes_inplace(union_mm: np.memmap, h: int, w: int) -> None:
@@ -826,6 +807,112 @@ def fill_3d_voids(mask_u8: np.ndarray) -> np.ndarray:
     out = mask_bool.copy()
     out[enclosed] = True
     return out.astype(np.uint8)
+
+
+def unpack_view_union_to_volume(
+    union_mm: np.memmap,
+    num_slices: int,
+    h: int,
+    w: int,
+    out_path: Path,
+    desc: str,
+) -> np.memmap:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    vol_mm = np.memmap(out_path, dtype=np.uint8, mode="w+", shape=(num_slices, h, w))
+    for i in tqdm(range(num_slices), desc=desc):
+        packed = np.asarray(union_mm[i])
+        if any_mask(packed):
+            vol_mm[i, :, :] = unpack_mask(packed, h, w)
+        else:
+            vol_mm[i, :, :] = 0
+    vol_mm.flush()
+    return vol_mm
+
+
+def apply_transverse_min_radius_filter(mask_u8: np.ndarray, min_radius: float) -> np.ndarray:
+    """Remove 2D connected components whose transverse-plane radius is smaller than ``min_radius``."""
+    if float(min_radius) <= 0:
+        return np.asarray(mask_u8, dtype=np.uint8)
+
+    out = np.asarray(mask_u8, dtype=np.uint8).copy()
+    struct2 = np.ones((3, 3), dtype=bool)
+
+    for t in tqdm(range(out.shape[0]), desc="Transverse min-radius filter"):
+        sl = out[t] > 0
+        if not sl.any():
+            continue
+
+        labels2d, num = ndi.label(sl, structure=struct2)
+        if num <= 0:
+            out[t, :, :] = 0
+            continue
+
+        keep = np.zeros(sl.shape, dtype=bool)
+        for lbl in range(1, int(num) + 1):
+            comp = labels2d == lbl
+            if not comp.any():
+                continue
+            radius = float(np.max(ndi.distance_transform_edt(comp)))
+            if radius >= float(min_radius):
+                keep |= comp
+
+        out[t, :, :] = keep.astype(np.uint8)
+
+    return out.astype(np.uint8)
+
+
+def assemble_model_volume_from_view_volumes(
+    ensemble_mm: np.memmap,
+    view_volume_mms: Dict[str, np.memmap],
+    T: int,
+    H: int,
+    W: int,
+    disable_multiplanar: bool,
+) -> None:
+    transverse = np.asarray(view_volume_mms["transverse"])
+    assert transverse.shape == (T, H, W)
+    ensemble_mm[:, :, :] |= transverse
+
+    if disable_multiplanar:
+        return
+
+    sagittal = np.asarray(view_volume_mms["sagittal"])
+    assert sagittal.shape == (H, T, W)
+    for y in tqdm(range(H), desc="Assembling volume from sagittal view volume"):
+        ensemble_mm[:, y, :] |= sagittal[y, :, :]
+
+    coronal = np.asarray(view_volume_mms["coronal"])
+    assert coronal.shape == (W, T, H)
+    for x in tqdm(range(W), desc="Assembling volume from coronal view volume"):
+        ensemble_mm[:, :, x] |= coronal[x, :, :]
+
+
+def assemble_current_ensemble_volume(
+    view_volumes_by_model: Dict[str, Dict[str, np.memmap]],
+    T: int,
+    H: int,
+    W: int,
+    disable_multiplanar: bool,
+    out_path: Path,
+) -> np.memmap:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    ensemble_mm = np.memmap(out_path, dtype=np.uint8, mode="w+", shape=(T, H, W))
+    ensemble_mm[:] = 0
+    ensemble_mm.flush()
+
+    for model_name in sorted(view_volumes_by_model.keys()):
+        print(f"\n=== Assembling model into ensemble volume: {model_name} ===")
+        assemble_model_volume_from_view_volumes(
+            ensemble_mm=ensemble_mm,
+            view_volume_mms=view_volumes_by_model[model_name],
+            T=T,
+            H=H,
+            W=W,
+            disable_multiplanar=disable_multiplanar,
+        )
+        ensemble_mm.flush()
+
+    return ensemble_mm
 
 
 # --------------------------
@@ -1657,14 +1744,6 @@ def _extract_local_plane_mask(
     return _keep_center_component_2d(acc)
 
 
-
-
-def _section_radius_2d(section_mask: np.ndarray) -> float:
-    section_mask = np.asarray(section_mask, dtype=bool)
-    if not np.any(section_mask):
-        return 0.0
-    return float(np.max(ndi.distance_transform_edt(section_mask)))
-
 def _paint_plane_section(
     mask: np.ndarray,
     center: np.ndarray,
@@ -1928,6 +2007,544 @@ def interpolate_spherical_sector_pass(
     return work_mask.astype(np.uint8), stats
 
 
+@dataclass(frozen=True)
+class SliceEndpointSeed:
+    label: int
+    point: Tuple[int, int, int]  # (slice, row, col)
+    direction_sign: int          # -1 or +1 along the slice axis
+
+
+@dataclass(frozen=True)
+class SliceProjectionCandidate:
+    source_label: int
+    target_label: int
+    source_point: Tuple[int, int, int]
+    target_point: Tuple[int, int, int]
+    slice_distance: int
+
+
+def _nearest_point_in_mask(mask2d: np.ndarray, ref_yx: Tuple[int, int]) -> Optional[Tuple[int, int]]:
+    ys, xs = np.nonzero(mask2d)
+    if ys.size == 0:
+        return None
+    d2 = (ys.astype(np.int64) - int(ref_yx[0])) ** 2 + (xs.astype(np.int64) - int(ref_yx[1])) ** 2
+    idx = int(np.argmin(d2))
+    return int(ys[idx]), int(xs[idx])
+
+
+def _component_mask_and_anchor(mask2d: np.ndarray, point_yx: Tuple[int, int]) -> Tuple[np.ndarray, Optional[Tuple[int, int]]]:
+    mask2d = np.asarray(mask2d, dtype=bool)
+    if not mask2d.any():
+        return np.zeros(mask2d.shape, dtype=bool), None
+
+    labels2d, num = ndi.label(mask2d, structure=np.ones((3, 3), dtype=bool))
+    if num <= 0:
+        return np.zeros(mask2d.shape, dtype=bool), None
+
+    py = int(np.clip(int(point_yx[0]), 0, mask2d.shape[0] - 1))
+    px = int(np.clip(int(point_yx[1]), 0, mask2d.shape[1] - 1))
+    lbl = int(labels2d[py, px])
+    if lbl <= 0:
+        nearest = _nearest_point_in_mask(mask2d, (py, px))
+        if nearest is None:
+            return np.zeros(mask2d.shape, dtype=bool), None
+        lbl = int(labels2d[nearest[0], nearest[1]])
+        py, px = nearest
+
+    comp = labels2d == lbl
+    anchor = _nearest_point_in_mask(comp, (py, px))
+    return comp.astype(bool), anchor
+
+
+def _component_centroid_anchor(mask2d: np.ndarray) -> Optional[Tuple[int, int]]:
+    ys, xs = np.nonzero(mask2d)
+    if ys.size == 0:
+        return None
+    cy = float(np.mean(ys))
+    cx = float(np.mean(xs))
+    d2 = (ys.astype(np.float32) - cy) ** 2 + (xs.astype(np.float32) - cx) ** 2
+    idx = int(np.argmin(d2))
+    return int(ys[idx]), int(xs[idx])
+
+
+def _component_max_radius(mask2d: np.ndarray) -> float:
+    if not np.any(mask2d):
+        return 0.0
+    return float(np.max(ndi.distance_transform_edt(np.asarray(mask2d, dtype=bool))))
+
+
+def _follow_branch_component(
+    slice_mask: np.ndarray,
+    prev_component_mask: np.ndarray,
+    prev_anchor: Tuple[int, int],
+) -> Tuple[np.ndarray, Optional[Tuple[int, int]]]:
+    slice_mask = np.asarray(slice_mask, dtype=bool)
+    if not slice_mask.any():
+        return np.zeros(slice_mask.shape, dtype=bool), None
+
+    labels2d, num = ndi.label(slice_mask, structure=np.ones((3, 3), dtype=bool))
+    if num <= 0:
+        return np.zeros(slice_mask.shape, dtype=bool), None
+
+    if num == 1:
+        comp = labels2d == 1
+        return comp.astype(bool), _nearest_point_in_mask(comp, prev_anchor)
+
+    dil_prev = ndi.binary_dilation(np.asarray(prev_component_mask, dtype=bool), structure=np.ones((3, 3), dtype=bool))
+
+    best_lbl = 0
+    best_score: Optional[Tuple[int, int, int]] = None
+    for lbl in range(1, int(num) + 1):
+        comp = labels2d == lbl
+        overlap = int(np.count_nonzero(comp & dil_prev))
+        anchor = _nearest_point_in_mask(comp, prev_anchor)
+        if anchor is None:
+            continue
+        d2 = int((anchor[0] - int(prev_anchor[0])) ** 2 + (anchor[1] - int(prev_anchor[1])) ** 2)
+        area = int(np.count_nonzero(comp))
+        score = (overlap, -d2, area)
+        if best_score is None or score > best_score:
+            best_score = score
+            best_lbl = int(lbl)
+
+    if best_lbl <= 0:
+        return np.zeros(slice_mask.shape, dtype=bool), None
+
+    comp = labels2d == best_lbl
+    return comp.astype(bool), _nearest_point_in_mask(comp, prev_anchor)
+
+
+def _component_to_local_canvas(mask2d: np.ndarray, anchor_yx: Tuple[int, int], half_width: int) -> np.ndarray:
+    size = int(2 * half_width + 1)
+    local = np.zeros((size, size), dtype=bool)
+    ys, xs = np.nonzero(mask2d)
+    if ys.size == 0:
+        return local
+
+    yy = ys.astype(np.int64) - int(anchor_yx[0]) + int(half_width)
+    xx = xs.astype(np.int64) - int(anchor_yx[1]) + int(half_width)
+    valid = (yy >= 0) & (yy < size) & (xx >= 0) & (xx < size)
+    local[yy[valid], xx[valid]] = True
+    return local
+
+
+def _paste_local_mask_onto_slice(dest_slice: np.ndarray, local_mask: np.ndarray, center_yx: Tuple[float, float]) -> int:
+    if not np.any(local_mask):
+        return 0
+
+    size_y, size_x = local_mask.shape
+    hh_y = size_y // 2
+    hh_x = size_x // 2
+    cy = int(round(float(center_yx[0])))
+    cx = int(round(float(center_yx[1])))
+
+    y0 = cy - hh_y
+    x0 = cx - hh_x
+    y1 = y0 + size_y
+    x1 = x0 + size_x
+
+    dy0 = max(0, -y0)
+    dx0 = max(0, -x0)
+    dy1 = max(0, y1 - dest_slice.shape[0])
+    dx1 = max(0, x1 - dest_slice.shape[1])
+
+    src_y0 = dy0
+    src_y1 = size_y - dy1
+    src_x0 = dx0
+    src_x1 = size_x - dx1
+
+    dst_y0 = y0 + dy0
+    dst_y1 = y1 - dy1
+    dst_x0 = x0 + dx0
+    dst_x1 = x1 - dx1
+
+    if src_y0 >= src_y1 or src_x0 >= src_x1:
+        return 0
+
+    patch = np.asarray(local_mask[src_y0:src_y1, src_x0:src_x1], dtype=bool)
+    current = np.asarray(dest_slice[dst_y0:dst_y1, dst_x0:dst_x1], dtype=bool)
+    added = int(np.count_nonzero(patch & (~current)))
+    dest_slice[dst_y0:dst_y1, dst_x0:dst_x1] |= patch
+    return added
+
+
+def _local_half_width_for_components(
+    source_component: np.ndarray,
+    source_anchor: Tuple[int, int],
+    target_component: np.ndarray,
+    target_anchor: Tuple[int, int],
+) -> int:
+    max_extent = 0.0
+    for comp, anchor in ((source_component, source_anchor), (target_component, target_anchor)):
+        ys, xs = np.nonzero(comp)
+        if ys.size == 0:
+            continue
+        max_extent = max(
+            max_extent,
+            float(np.max(np.abs(ys.astype(np.int64) - int(anchor[0])))),
+            float(np.max(np.abs(xs.astype(np.int64) - int(anchor[1])))),
+        )
+
+    max_extent = max(
+        max_extent,
+        float(abs(int(target_anchor[0]) - int(source_anchor[0]))),
+        float(abs(int(target_anchor[1]) - int(source_anchor[1]))),
+    )
+    return max(4, int(math.ceil(max_extent)) + 4)
+
+
+def _build_slice_endpoint_seeds(
+    labels_real: np.ndarray,
+    extension_slices: int,
+) -> Tuple[List[SliceEndpointSeed], int]:
+    objs = ndi.find_objects(labels_real)
+    seeds: List[SliceEndpointSeed] = []
+    direction_depth = max(2, min(8, int(extension_slices) + 1))
+
+    for lbl, sl in enumerate(objs, start=1):
+        if sl is None:
+            continue
+        sub = labels_real[sl] == lbl
+        if not np.any(sub):
+            continue
+
+        grouped: Dict[Tuple[int, int, int, int, int], SliceEndpointSeed] = {}
+        slice_start = int(sl[0].start)
+        slice_stop = int(sl[0].stop) - 1
+
+        skel = skeletonize_volume(sub)
+        if np.any(skel):
+            neigh = ndi.convolve(skel.astype(np.uint8), KERNEL_3, mode="constant", cval=0) - skel.astype(np.uint8)
+            ep_coords = np.argwhere(np.logical_and(skel, neigh == 1))
+        else:
+            ep_coords = np.zeros((0, 3), dtype=np.int64)
+
+        for ep in ep_coords:
+            ep_t = (int(ep[0]), int(ep[1]), int(ep[2]))
+            path = _trace_inward_path(skel, ep_t, max_steps=direction_depth)
+            ref = path[-1] if len(path) > 1 else ep_t
+            outward = np.asarray(ep_t, dtype=np.float32) - np.asarray(ref, dtype=np.float32)
+            if float(abs(outward[0])) > 1e-6:
+                direction_sign = 1 if float(outward[0]) > 0 else -1
+            else:
+                gz = slice_start + int(ep_t[0])
+                dist_min = abs(gz - slice_start)
+                dist_max = abs(slice_stop - gz)
+                direction_sign = -1 if dist_min <= dist_max else 1
+
+            gpoint = (slice_start + int(ep_t[0]), int(sl[1].start) + int(ep_t[1]), int(sl[2].start) + int(ep_t[2]))
+            comp, _ = _component_mask_and_anchor(labels_real[gpoint[0]] == lbl, (gpoint[1], gpoint[2]))
+            cent = _component_centroid_anchor(comp)
+            if cent is None:
+                continue
+            key = (int(lbl), int(gpoint[0]), int(direction_sign), int(cent[0]), int(cent[1]))
+            grouped[key] = SliceEndpointSeed(label=int(lbl), point=gpoint, direction_sign=int(direction_sign))
+
+        if not grouped:
+            slice_any = np.any(sub, axis=(1, 2))
+            slice_indices = np.flatnonzero(slice_any)
+            if slice_indices.size:
+                extremes: List[Tuple[int, int]] = []
+                first_local = int(slice_indices[0])
+                last_local = int(slice_indices[-1])
+                extremes.append((first_local, -1))
+                if last_local != first_local:
+                    extremes.append((last_local, 1))
+                else:
+                    extremes.append((last_local, 1))
+
+                for local_slice_idx, direction_sign in extremes:
+                    global_slice_idx = slice_start + int(local_slice_idx)
+                    labels2d, num = ndi.label(sub[local_slice_idx], structure=np.ones((3, 3), dtype=bool))
+                    for comp_lbl in range(1, int(num) + 1):
+                        comp = labels2d == comp_lbl
+                        cent = _component_centroid_anchor(comp)
+                        if cent is None:
+                            continue
+                        gpoint = (int(global_slice_idx), int(sl[1].start) + int(cent[0]), int(sl[2].start) + int(cent[1]))
+                        key = (int(lbl), int(gpoint[0]), int(direction_sign), int(gpoint[1]), int(gpoint[2]))
+                        grouped[key] = SliceEndpointSeed(label=int(lbl), point=gpoint, direction_sign=int(direction_sign))
+
+        seeds.extend(grouped.values())
+
+    return seeds, int(len(seeds))
+
+
+def _find_slice_projection_candidate(
+    labels_real: np.ndarray,
+    seed: SliceEndpointSeed,
+    max_slice_distance: int,
+    search_angle_deg: float,
+) -> Optional[SliceProjectionCandidate]:
+    if int(max_slice_distance) <= 0:
+        return None
+
+    s0, y0, x0 = seed.point
+    source_component, source_anchor = _component_mask_and_anchor(labels_real[s0] == int(seed.label), (y0, x0))
+    if source_anchor is None or not np.any(source_component):
+        return None
+
+    sdf = _signed_distance_2d(source_component)
+    slope = math.tan(math.radians(float(search_angle_deg)))
+    num_slices = labels_real.shape[0]
+
+    for step in range(1, int(max_slice_distance) + 1):
+        s = int(s0 + int(seed.direction_sign) * step)
+        if s < 0 or s >= num_slices:
+            break
+
+        threshold = -float(slope) * float(step)
+        projection = sdf >= threshold
+        if not np.any(projection):
+            if float(search_angle_deg) < 0.0:
+                break
+            continue
+
+        labels2d = labels_real[s]
+        overlap = projection & (labels2d > 0) & (labels2d != int(seed.label))
+        if not np.any(overlap):
+            continue
+
+        ys, xs = np.nonzero(overlap)
+        lbls = labels2d[ys, xs].astype(np.int64, copy=False)
+
+        best: Optional[Tuple[int, int, int, int]] = None
+        for target_label in np.unique(lbls):
+            if int(target_label) <= 0 or int(target_label) == int(seed.label):
+                continue
+            use = lbls == int(target_label)
+            ys_t = ys[use]
+            xs_t = xs[use]
+            if ys_t.size == 0:
+                continue
+            d2 = (ys_t.astype(np.int64) - int(source_anchor[0])) ** 2 + (xs_t.astype(np.int64) - int(source_anchor[1])) ** 2
+            idx = int(np.argmin(d2))
+            cand = (int(d2[idx]), int(target_label), int(ys_t[idx]), int(xs_t[idx]))
+            if best is None or cand < best:
+                best = cand
+
+        if best is None:
+            continue
+
+        _, target_label, ty, tx = best
+        return SliceProjectionCandidate(
+            source_label=int(seed.label),
+            target_label=int(target_label),
+            source_point=(int(s0), int(y0), int(x0)),
+            target_point=(int(s), int(ty), int(tx)),
+            slice_distance=int(step),
+        )
+
+    return None
+
+
+def _collect_walkback_source_points(
+    labels_real: np.ndarray,
+    label: int,
+    start_point: Tuple[int, int, int],
+    direction_sign: int,
+    walk_back: int,
+) -> List[Tuple[int, int, int]]:
+    if int(walk_back) <= 0:
+        return []
+
+    s0, y0, x0 = start_point
+    current_component, current_anchor = _component_mask_and_anchor(labels_real[s0] == int(label), (y0, x0))
+    if current_anchor is None or not np.any(current_component):
+        return []
+
+    out: List[Tuple[int, int, int]] = []
+    current_slice = int(s0)
+    num_slices = labels_real.shape[0]
+
+    for _ in range(int(walk_back)):
+        next_slice = int(current_slice - int(direction_sign))
+        if next_slice < 0 or next_slice >= num_slices:
+            break
+
+        next_slice_mask = labels_real[next_slice] == int(label)
+        if not np.any(next_slice_mask):
+            break
+
+        next_component, next_anchor = _follow_branch_component(next_slice_mask, current_component, current_anchor)
+        if next_anchor is None or not np.any(next_component):
+            break
+
+        out.append((int(next_slice), int(next_anchor[0]), int(next_anchor[1])))
+        current_slice = int(next_slice)
+        current_component = next_component
+        current_anchor = next_anchor
+
+    return out
+
+
+def _paint_linear_slice_bridge(
+    bridge_volume: np.ndarray,
+    labels_real: np.ndarray,
+    source_label: int,
+    target_label: int,
+    source_point: Tuple[int, int, int],
+    target_point: Tuple[int, int, int],
+) -> int:
+    s0, y0, x0 = source_point
+    s1, y1, x1 = target_point
+    if int(s0) == int(s1):
+        return 0
+
+    source_component, source_anchor = _component_mask_and_anchor(labels_real[s0] == int(source_label), (y0, x0))
+    target_component, target_anchor = _component_mask_and_anchor(labels_real[s1] == int(target_label), (y1, x1))
+    if source_anchor is None or target_anchor is None:
+        return 0
+    if not np.any(source_component) or not np.any(target_component):
+        return 0
+
+    half_width = _local_half_width_for_components(source_component, source_anchor, target_component, target_anchor)
+    source_local = _component_to_local_canvas(source_component, source_anchor, half_width)
+    target_local = _component_to_local_canvas(target_component, target_anchor, half_width)
+    if not np.any(source_local) or not np.any(target_local):
+        return 0
+
+    sdf0 = _signed_distance_2d(source_local)
+    sdf1 = _signed_distance_2d(target_local)
+
+    steps = int(abs(int(s1) - int(s0)))
+    if steps <= 0:
+        return 0
+
+    sign = 1 if int(s1) > int(s0) else -1
+    added = 0
+    for idx in range(1, steps):
+        alpha = float(idx) / float(steps)
+        section = ((1.0 - alpha) * sdf0 + alpha * sdf1) >= 0.0
+        if not np.any(section):
+            continue
+        section = _keep_center_component_2d(section)
+        s = int(s0 + sign * idx)
+        center = (
+            (1.0 - alpha) * float(source_anchor[0]) + alpha * float(target_anchor[0]),
+            (1.0 - alpha) * float(source_anchor[1]) + alpha * float(target_anchor[1]),
+        )
+        added += _paste_local_mask_onto_slice(bridge_volume[s], section, center)
+
+    return int(added)
+
+
+def interpolate_view_volume_pass(
+    mask_u8: np.ndarray,
+    max_slice_distance: int,
+    search_angle_deg: float,
+    interpolation_walk_back: int,
+    interpolate_min_radius: float,
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    if int(max_slice_distance) <= 0:
+        return np.asarray(mask_u8, dtype=np.uint8), {
+            "num_objects": 0,
+            "num_endpoints": 0,
+            "candidate_connections": 0,
+            "accepted_connections": 0,
+            "walk_back_bridges": 0,
+            "skipped_by_min_radius": 0,
+            "added_voxels": 0,
+            "skipped": True,
+        }
+
+    pass_real = np.asarray(mask_u8, dtype=bool)
+    labels_real, num_objects = ndi.label(pass_real, structure=STRUCTURE26)
+    if int(num_objects) <= 1:
+        return pass_real.astype(np.uint8), {
+            "num_objects": int(num_objects),
+            "num_endpoints": 0,
+            "candidate_connections": 0,
+            "accepted_connections": 0,
+            "walk_back_bridges": 0,
+            "skipped_by_min_radius": 0,
+            "added_voxels": 0,
+            "skipped": int(num_objects) <= 1,
+        }
+
+    seeds, num_endpoints = _build_slice_endpoint_seeds(labels_real, extension_slices=max_slice_distance)
+    if not seeds:
+        return pass_real.astype(np.uint8), {
+            "num_objects": int(num_objects),
+            "num_endpoints": int(num_endpoints),
+            "candidate_connections": 0,
+            "accepted_connections": 0,
+            "walk_back_bridges": 0,
+            "skipped_by_min_radius": 0,
+            "added_voxels": 0,
+            "skipped": False,
+        }
+
+    bridge_volume = np.zeros(pass_real.shape, dtype=bool)
+    candidate_connections = 0
+    accepted_connections = 0
+    walk_back_bridges = 0
+    skipped_by_min_radius = 0
+    added_voxels = 0
+
+    for seed in seeds:
+        candidate = _find_slice_projection_candidate(
+            labels_real=labels_real,
+            seed=seed,
+            max_slice_distance=int(max_slice_distance),
+            search_angle_deg=float(search_angle_deg),
+        )
+        if candidate is None:
+            continue
+
+        candidate_connections += 1
+        source_points = [candidate.source_point] + _collect_walkback_source_points(
+            labels_real=labels_real,
+            label=int(candidate.source_label),
+            start_point=candidate.source_point,
+            direction_sign=int(seed.direction_sign),
+            walk_back=int(interpolation_walk_back),
+        )
+
+        target_component, target_anchor = _component_mask_and_anchor(
+            labels_real[candidate.target_point[0]] == int(candidate.target_label),
+            (candidate.target_point[1], candidate.target_point[2]),
+        )
+        target_radius = _component_max_radius(target_component) if target_anchor is not None else 0.0
+
+        for walk_idx, src_point in enumerate(source_points):
+            source_component, source_anchor = _component_mask_and_anchor(
+                labels_real[src_point[0]] == int(candidate.source_label),
+                (src_point[1], src_point[2]),
+            )
+            source_radius = _component_max_radius(source_component) if source_anchor is not None else 0.0
+            bridge_radius = min(float(source_radius), float(target_radius))
+            if bridge_radius <= float(interpolate_min_radius):
+                skipped_by_min_radius += 1
+                continue
+
+            accepted_connections += 1
+            if walk_idx > 0:
+                walk_back_bridges += 1
+
+            added_voxels += _paint_linear_slice_bridge(
+                bridge_volume=bridge_volume,
+                labels_real=labels_real,
+                source_label=int(candidate.source_label),
+                target_label=int(candidate.target_label),
+                source_point=src_point,
+                target_point=candidate.target_point,
+            )
+
+    work = np.asarray(pass_real | bridge_volume, dtype=np.uint8)
+    stats: Dict[str, object] = {
+        "num_objects": int(num_objects),
+        "num_endpoints": int(num_endpoints),
+        "candidate_connections": int(candidate_connections),
+        "accepted_connections": int(accepted_connections),
+        "walk_back_bridges": int(walk_back_bridges),
+        "skipped_by_min_radius": int(skipped_by_min_radius),
+        "added_voxels": int(added_voxels),
+        "skipped": False,
+    }
+    return work.astype(np.uint8), stats
+
+
 # --------------------------
 # Final outputs
 # --------------------------
@@ -2127,6 +2744,207 @@ def write_result_set(
     return result_paths
 
 
+DEFAULT_LABEL_PATTERN = "labels/{Filename}_%04d.txt"
+DEFAULT_BINARY_PATTERN = "binary_masks/{Filename}_Binary_%04d.tiff"
+
+
+def _resolve_output_pattern(pattern_value: Optional[str], default_pattern: str, out_dir: Path, stem: str) -> Optional[Path]:
+    if pattern_value is None:
+        return None
+    pattern = default_pattern if str(pattern_value) == "__DEFAULT__" else str(pattern_value)
+    pattern = pattern.replace("{Filename}", stem)
+    path = Path(pattern)
+    if not path.is_absolute():
+        path = out_dir / path
+    return path
+
+
+def _tag_regular_path(path: Path, tag: str) -> Path:
+    suffix = "".join(path.suffixes)
+    base = path.name[:-len(suffix)] if suffix else path.name
+    return path.with_name(f"{base}_{tag}{suffix}")
+
+
+def _tag_frame_pattern(path: Path, tag: str) -> Path:
+    parent = path.parent
+    if parent.name:
+        parent = parent.with_name(f"{parent.name}_{tag.lower()}")
+
+    name = path.name
+    m = re.search(r"(%0\d+d)", name)
+    if m is not None:
+        prefix = name[:m.start()]
+        if prefix.endswith("_"):
+            name = prefix + f"{tag}_" + name[m.start():]
+        else:
+            name = prefix + f"_{tag}_" + name[m.start():]
+    else:
+        suffix = "".join(path.suffixes)
+        base = name[:-len(suffix)] if suffix else name
+        name = f"{base}_{tag}{suffix}"
+    return parent / name
+
+
+def _format_frame_path(pattern_path: Path, frame_idx_1based: int) -> Path:
+    as_str = str(pattern_path)
+    if "%" in as_str:
+        try:
+            return Path(as_str % int(frame_idx_1based))
+        except TypeError:
+            pass
+    return pattern_path.with_name(f"{pattern_path.stem}_{int(frame_idx_1based):04d}{pattern_path.suffix}")
+
+
+def write_yolo_labels_from_pattern(mask_u8: np.ndarray, pattern_path: Path) -> Path:
+    pattern_path.parent.mkdir(parents=True, exist_ok=True)
+    T, H, W = mask_u8.shape
+    for t in tqdm(range(T), desc=f"Writing YOLO labels ({pattern_path.parent.name})"):
+        fp = _format_frame_path(pattern_path, t + 1)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        m = mask_u8[t] > 0
+        if not np.any(m):
+            fp.write_text("")
+            continue
+        polys = mask_to_yolo_polygons(m.astype(np.uint8))
+        if not polys:
+            fp.write_text("")
+            continue
+        lines: List[str] = []
+        for poly in polys:
+            coords: List[str] = []
+            for x, y in poly:
+                coords.append(f"{x:.6f}")
+                coords.append(f"{y:.6f}")
+            lines.append("0 " + " ".join(coords))
+        fp.write_text("\n".join(lines) + "\n")
+    return pattern_path.parent
+
+
+def write_binary_outputs_from_pattern(
+    mask_u8: np.ndarray,
+    pattern_path: Path,
+    video_path: Path,
+    fps: float,
+) -> Tuple[Path, Path]:
+    T, H, W = mask_u8.shape
+    pattern_path.parent.mkdir(parents=True, exist_ok=True)
+
+    for t in tqdm(range(T), desc=f"Writing binary TIFF sequence ({pattern_path.parent.name})"):
+        img = (mask_u8[t] * 255).astype(np.uint8)
+        fp = _format_frame_path(pattern_path, t + 1)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        tifffile.imwrite(str(fp), img)
+
+    proc = ffmpeg_rawvideo_writer(
+        video_path,
+        width=W,
+        height=H,
+        fps=fps,
+        pix_fmt_in="gray",
+        codec="ffv1",
+        pix_fmt_out="gray",
+    )
+    try:
+        assert proc.stdin is not None
+        for t in tqdm(range(T), desc=f"Writing binary MKV ({video_path.name})"):
+            img = (mask_u8[t] * 255).astype(np.uint8)
+            proc.stdin.write(img.tobytes())
+    finally:
+        close_ffmpeg_writer(proc)
+
+    return pattern_path.parent, video_path
+
+
+def write_nrrd(mask_u8: np.ndarray, out_path: Path) -> Path:
+    try:
+        import nrrd  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("pynrrd is required for --save_nrrd: pip install pynrrd") from e
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    nrrd.write(str(out_path), np.asarray(mask_u8, dtype=np.uint8))
+    return out_path
+
+
+def write_pipeline_outputs(
+    *,
+    volume_rgb: np.memmap,
+    mask_u8: np.ndarray,
+    out_dir: Path,
+    stem: str,
+    fps: float,
+    save_binary_pattern_value: Optional[str],
+    save_labels_pattern_value: Optional[str],
+    save_nrrd_flag: bool,
+    tag: Optional[str] = None,
+) -> Dict[str, Path]:
+    tag_suffix = f"_{tag}" if tag else ""
+
+    overlay_path = out_dir / f"{stem}_Overlay{tag_suffix}.mkv"
+    write_overlay_video(volume_rgb, mask_u8, overlay_path, fps=fps)
+    result_paths: Dict[str, Path] = {"overlay": overlay_path}
+
+    labels_pattern = _resolve_output_pattern(save_labels_pattern_value, DEFAULT_LABEL_PATTERN, out_dir, stem)
+    if labels_pattern is not None:
+        if tag is not None:
+            labels_pattern = _tag_frame_pattern(labels_pattern, tag)
+        labels_dir = write_yolo_labels_from_pattern(mask_u8, labels_pattern)
+        result_paths["labels_dir"] = labels_dir
+
+    binary_pattern = _resolve_output_pattern(save_binary_pattern_value, DEFAULT_BINARY_PATTERN, out_dir, stem)
+    if binary_pattern is not None:
+        if tag is not None:
+            binary_pattern = _tag_frame_pattern(binary_pattern, tag)
+        binary_video_path = out_dir / f"{stem}_Binary{tag_suffix}.mkv"
+        tiff_dir, binary_video_path = write_binary_outputs_from_pattern(mask_u8, binary_pattern, binary_video_path, fps=fps)
+        result_paths["binary_tiff_dir"] = tiff_dir
+        result_paths["binary_video"] = binary_video_path
+
+    if bool(save_nrrd_flag):
+        nrrd_path = out_dir / f"{stem}{tag_suffix}.nrrd"
+        result_paths["nrrd"] = write_nrrd(mask_u8, nrrd_path)
+
+    return result_paths
+
+
+def write_summary_file(
+    out_path: Path,
+    *,
+    command: str,
+    input_path: Path,
+    out_dir: Path,
+    volume_shape: Tuple[int, int, int],
+    fps: float,
+    model_paths: Sequence[str],
+    view_names: Sequence[str],
+    interpolation_stats: List[Dict[str, object]],
+    voxel_volume: Optional[int],
+    final_paths: Dict[str, Path],
+) -> Path:
+    lines: List[str] = []
+    lines.append(f"Command: {command}")
+    lines.append(f"Input: {input_path}")
+    lines.append(f"Output directory: {out_dir}")
+    lines.append(f"Volume shape (t, Y, X): {volume_shape}")
+    lines.append(f"FPS: {fps}")
+    lines.append(f"Models: {', '.join(str(Path(m)) for m in model_paths)}")
+    lines.append(f"Views: {', '.join(view_names)}")
+    lines.append("")
+    lines.append("Interpolation statistics:")
+    lines.append(json.dumps(interpolation_stats, indent=2))
+    if voxel_volume is not None:
+        lines.append("")
+        lines.append(f"voxel_volume: {int(voxel_volume)}")
+    lines.append("")
+    lines.append("Final outputs:")
+    for key in sorted(final_paths.keys()):
+        lines.append(f"{key}: {final_paths[key]}")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines) + "\n")
+    return out_path
+
+
 # --------------------------
 # Main
 # --------------------------
@@ -2148,15 +2966,19 @@ def main() -> None:
     angles = _parse_angles(args.angle) or [0.0, 120.0, 240.0]
 
     if args.min_conf > 0 and args.min_conf < args.conf:
-        raise ValueError("--min_conf must be 0 (disabled) or >= --conf")
+        raise ValueError("--min_conf must be equal to or greater than --conf")
     if int(args.interpolate) < 0:
         raise ValueError("--interpolate must be >= 0")
+    if int(args.interpolation_walk_back) < 0:
+        raise ValueError("--interpolation_walk_back must be >= 0")
     if int(args.interpolate_passes) < 1:
         raise ValueError("--interpolate_passes must be >= 1")
     if float(args.interpolate_min_radius) < 0:
         raise ValueError("--interpolate_min_radius must be >= 0")
-    if not (0.0 <= float(args.cone_half_angle) <= 90.0):
-        raise ValueError("--cone_half_angle must be between 0 and 90 degrees inclusive")
+    if float(args.min_radius) < 0:
+        raise ValueError("--min_radius must be >= 0")
+    if not (-90.0 < float(args.interpolation_search_angle) < 90.0):
+        raise ValueError("--interpolation_search_angle must be greater than -90 and less than 90")
 
     out_dir = Path(args.output).expanduser().resolve() if args.output else (Path.cwd() / input_path.stem)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -2164,14 +2986,12 @@ def main() -> None:
     temp_dir = out_dir / "temp"
     temp_dir.mkdir(parents=True, exist_ok=True)
 
-    # Probe input
     info = ffprobe_info(input_path)
     W = int(info["width"])
     H = int(info["height"])
     T = int(info["num_frames"])
     fps = float(info["fps"])
 
-    # Decode input to memmap (needed for sagittal/coronal slicing)
     vol_path = temp_dir / "input_volume.rgb24.dat"
     volume_rgb = decode_video_to_memmap_rgb24(
         input_video=input_path,
@@ -2185,10 +3005,8 @@ def main() -> None:
         json.dumps({"shape": [T, H, W, 3], "dtype": "uint8", "fps": fps}, indent=2)
     )
 
-    # Views
     views = get_view_infos(T=T, H=H, W=W, disable_multiplanar=args.disable_multiplanar)
 
-    # Shift variants
     shifts: List[Tuple[int, int, str]] = [(0, 0, "none")]
     if int(args.shift) != 0:
         s = abs(int(args.shift))
@@ -2200,7 +3018,6 @@ def main() -> None:
             (+s, 0, "right"),
         ]
 
-    # Load models
     yolo_models: List[Tuple[str, object]] = []
     for m in model_paths:
         name = Path(m).stem
@@ -2215,7 +3032,6 @@ def main() -> None:
         int8=bool(args.int8),
     )
 
-    # Allocate per-model, per-view union stacks (packed bits) + confidences
     union_by_model: Dict[str, Dict[str, np.memmap]] = {}
     conf_by_model: Dict[str, Dict[str, np.memmap]] = {}
 
@@ -2236,7 +3052,6 @@ def main() -> None:
             union_by_model[model_name][view.name] = union_mm
             conf_by_model[model_name][view.name] = conf_mm
 
-    # Augmentation + prediction loops (generate each augmented video ONCE, run all models on it, then delete)
     for view in views:
         print(f"\n=== View: {view.name} ({view.src_w}x{view.src_h}, slices={view.num_slices}) ===")
         for angle in angles:
@@ -2257,7 +3072,6 @@ def main() -> None:
                     pad_mode=view.pad_mode,
                 )
 
-                # Generate augmented video if needed
                 if not aug_video.exists():
                     aug_dir.mkdir(parents=True, exist_ok=True)
                     writer = ffmpeg_rawvideo_writer(
@@ -2311,7 +3125,6 @@ def main() -> None:
                         )
                     )
 
-                # Run inference sequentially for each model on this augmented video
                 for model_name, yolo in yolo_models:
                     pred_prefix = temp_dir / "preds" / model_name / view.name / f"{view.name}_{aug_id}"
                     predict_video_and_accumulate(
@@ -2328,7 +3141,6 @@ def main() -> None:
                         native_w=view.src_w,
                     )
 
-                # Cleanup augmented video unless troubleshooting
                 if not args.troubleshooting:
                     try:
                         aug_video.unlink(missing_ok=True)
@@ -2336,7 +3148,6 @@ def main() -> None:
                     except Exception:
                         pass
 
-        # Postprocess this view for each model: min_conf + 2D hole fill
         for model_name, _ in yolo_models:
             print(f"\n--- Postprocessing view '{view.name}' for model '{model_name}' ---")
             if args.min_conf > 0:
@@ -2351,43 +3162,48 @@ def main() -> None:
             fill_2d_holes_inplace(union_by_model[model_name][view.name], view.src_h, view.src_w)
             union_by_model[model_name][view.name].flush()
 
-    # Assemble all models into an ensemble volume on disk (uint8)
-    ensemble_path = temp_dir / "ensemble_volume.u8.dat"
-    ensemble_mm = np.memmap(ensemble_path, dtype=np.uint8, mode="w+", shape=(T, H, W))
-    ensemble_mm[:] = 0
-    ensemble_mm.flush()
-
+    view_volumes_by_model: Dict[str, Dict[str, np.memmap]] = {}
     for model_name, _ in yolo_models:
-        print(f"\n=== Assembling model into ensemble: {model_name} ===")
-        assemble_model_volume_into_ensemble(
-            ensemble_mm=ensemble_mm,
-            view_union_mms=union_by_model[model_name],
+        view_volumes_by_model[model_name] = {}
+        for view in views:
+            out_path = temp_dir / "view_volumes" / model_name / f"{view.name}.u8.dat"
+            view_volumes_by_model[model_name][view.name] = unpack_view_union_to_volume(
+                union_mm=union_by_model[model_name][view.name],
+                num_slices=view.num_slices,
+                h=view.src_h,
+                w=view.src_w,
+                out_path=out_path,
+                desc=f"Unpacking {model_name}/{view.name}",
+            )
+
+    def build_current_finalized_volume(snapshot_stem: str) -> np.ndarray:
+        ensemble_mm = assemble_current_ensemble_volume(
+            view_volumes_by_model=view_volumes_by_model,
             T=T,
             H=H,
             W=W,
             disable_multiplanar=args.disable_multiplanar,
+            out_path=temp_dir / f"{snapshot_stem}.u8.dat",
         )
-        ensemble_mm.flush()
-
-        if not args.troubleshooting:
-            shutil.rmtree(temp_dir / "preds" / model_name, ignore_errors=True)
-
-    # 3D void fill after multiplanar + model ensemble union
-    print("\n=== 3D void fill (boundary-connected background labeling) ===")
-    ensemble_u8 = np.asarray(ensemble_mm)
-    ensemble_u8 = fill_3d_voids(ensemble_u8)
+        ensemble_u8 = fill_3d_voids(np.asarray(ensemble_mm))
+        if float(args.min_radius) > 0:
+            ensemble_u8 = apply_transverse_min_radius_filter(ensemble_u8, float(args.min_radius))
+        return ensemble_u8
 
     interpolation_stats: List[Dict[str, object]] = []
-    if args.troubleshooting:
+
+    if bool(args.troubleshooting) and int(args.interpolate) > 0:
         print("\n=== Writing troubleshooting outputs: pass 0 (pre-interpolation) ===")
-        write_result_set(
+        pass0_u8 = build_current_finalized_volume("ensemble_pass0")
+        write_pipeline_outputs(
             volume_rgb=volume_rgb,
-            mask_u8=ensemble_u8,
+            mask_u8=pass0_u8,
             out_dir=out_dir,
             stem=input_path.stem,
             fps=fps,
-            save_binary=bool(args.save_binary),
-            save_labels=bool(args.save_labels),
+            save_binary_pattern_value=args.save_binary,
+            save_labels_pattern_value=args.save_labels,
+            save_nrrd_flag=bool(args.save_nrrd),
             tag="Pass0",
         )
 
@@ -2396,1523 +3212,109 @@ def main() -> None:
         for pass_idx in range(1, total_passes + 1):
             print(
                 f"\n=== Interpolation pass {pass_idx}/{total_passes} "
-                f"(radius={int(args.interpolate)}, min_radius={float(args.interpolate_min_radius):g}, "
-                f"cone_half_angle={float(args.cone_half_angle):g}) ==="
+                f"(distance={int(args.interpolate)}, walk_back={int(args.interpolation_walk_back)}, "
+                f"min_radius={float(args.interpolate_min_radius):g}, "
+                f"search_angle={float(args.interpolation_search_angle):g}) ==="
             )
-            ensemble_u8, pass_stats = interpolate_spherical_sector_pass(
-                ensemble_u8,
-                extension_radius=int(args.interpolate),
-                cone_half_angle_deg=float(args.cone_half_angle),
-                interpolate_min_radius=float(args.interpolate_min_radius),
-            )
+            for model_name in sorted(view_volumes_by_model.keys()):
+                for view in views:
+                    print(f"\n--- Interpolating model '{model_name}' view '{view.name}' ---")
+                    current_mm = view_volumes_by_model[model_name][view.name]
+                    next_u8, stats = interpolate_view_volume_pass(
+                        np.asarray(current_mm),
+                        max_slice_distance=int(args.interpolate),
+                        search_angle_deg=float(args.interpolation_search_angle),
+                        interpolation_walk_back=int(args.interpolation_walk_back),
+                        interpolate_min_radius=float(args.interpolate_min_radius),
+                    )
+                    current_mm[:, :, :] = next_u8
+                    current_mm.flush()
 
-            # Spec 10: fill enclosed 3D voids after interpolation.
-            ensemble_u8 = fill_3d_voids(ensemble_u8)
+                    stats = dict(stats)
+                    stats.update({
+                        "pass_index": int(pass_idx),
+                        "model": str(model_name),
+                        "view": str(view.name),
+                        "max_slice_distance": int(args.interpolate),
+                        "interpolation_walk_back": int(args.interpolation_walk_back),
+                        "interpolation_search_angle": float(args.interpolation_search_angle),
+                    })
+                    interpolation_stats.append(stats)
 
-            pass_stats = dict(pass_stats)
-            pass_stats["pass_index"] = int(pass_idx)
-            pass_stats["post_interpolation_void_fill"] = True
-            interpolation_stats.append(pass_stats)
-
-            if args.troubleshooting and pass_idx < total_passes:
+            if bool(args.troubleshooting) and pass_idx < total_passes:
                 print(f"\n=== Writing troubleshooting outputs: pass {pass_idx} ===")
-                write_result_set(
+                pass_u8 = build_current_finalized_volume(f"ensemble_pass{pass_idx}")
+                write_pipeline_outputs(
                     volume_rgb=volume_rgb,
-                    mask_u8=ensemble_u8,
+                    mask_u8=pass_u8,
                     out_dir=out_dir,
                     stem=input_path.stem,
                     fps=fps,
-                    save_binary=bool(args.save_binary),
-                    save_labels=bool(args.save_labels),
+                    save_binary_pattern_value=args.save_binary,
+                    save_labels_pattern_value=args.save_labels,
+                    save_nrrd_flag=bool(args.save_nrrd),
                     tag=f"Pass{pass_idx}",
                 )
     else:
-        interpolation_stats.append(
-            {
-                "pass_index": 0,
-                "num_objects": 0,
-                "num_endpoints": 0,
-                "candidate_connections": 0,
-                "pair_groups": 0,
-                "accepted_connections": 0,
-                "skipped_by_min_radius": 0,
-                "added_voxels": 0,
-                "post_interpolation_void_fill": False,
-                "skipped": True,
-            }
-        )
+        for model_name in sorted(view_volumes_by_model.keys()):
+            for view in views:
+                interpolation_stats.append({
+                    "pass_index": 0,
+                    "model": str(model_name),
+                    "view": str(view.name),
+                    "max_slice_distance": int(args.interpolate),
+                    "interpolation_walk_back": int(args.interpolation_walk_back),
+                    "interpolation_search_angle": float(args.interpolation_search_angle),
+                    "num_objects": 0,
+                    "num_endpoints": 0,
+                    "candidate_connections": 0,
+                    "accepted_connections": 0,
+                    "walk_back_bridges": 0,
+                    "skipped_by_min_radius": 0,
+                    "added_voxels": 0,
+                    "skipped": True,
+                })
 
-    (temp_dir / "interpolation_stats.json").write_text(json.dumps(interpolation_stats, indent=2))
+    final_ensemble_mm = assemble_current_ensemble_volume(
+        view_volumes_by_model=view_volumes_by_model,
+        T=T,
+        H=H,
+        W=W,
+        disable_multiplanar=args.disable_multiplanar,
+        out_path=temp_dir / "ensemble_volume_final.u8.dat",
+    )
 
-    # Persist final mask back to disk
-    ensemble_mm[:] = ensemble_u8
-    ensemble_mm.flush()
+    print("\n=== 3D void fill after multiplanar/model union ===")
+    ensemble_u8 = fill_3d_voids(np.asarray(final_ensemble_mm))
+    if float(args.min_radius) > 0:
+        ensemble_u8 = apply_transverse_min_radius_filter(ensemble_u8, float(args.min_radius))
 
-    # Final outputs
-    final_paths = write_result_set(
+    final_paths = write_pipeline_outputs(
         volume_rgb=volume_rgb,
         mask_u8=ensemble_u8,
         out_dir=out_dir,
         stem=input_path.stem,
         fps=fps,
-        save_binary=bool(args.save_binary),
-        save_labels=bool(args.save_labels),
+        save_binary_pattern_value=args.save_binary,
+        save_labels_pattern_value=args.save_labels,
+        save_nrrd_flag=bool(args.save_nrrd),
         tag=None,
     )
 
-    if args.binary:
-        count = int(np.sum(ensemble_u8))
-        (out_dir / str(count)).write_text(str(count) + "\n")
-
-    # Cleanup temp if not troubleshooting (keep an empty temp/ folder in the output tree)
-    if not args.troubleshooting:
-        for child in list(temp_dir.iterdir()):
-            try:
-                if child.is_dir():
-                    shutil.rmtree(child, ignore_errors=True)
-                else:
-                    child.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-    print("\nDone.")
-    print(f"Output dir: {out_dir}")
-    print(f"Final overlay: {final_paths['overlay']}")
-
-
-
-
-# ==========================
-# v4.2.4 overrides
-# ==========================
-
-import gzip
-import shlex
-import sys
-
-try:
-    from scipy.spatial import cKDTree as _cKDTree  # type: ignore
-except Exception:
-    _cKDTree = None
-
-
-def build_argparser() -> argparse.ArgumentParser:
-    """
-    v4.2.4 CLI.
-
-    Notes:
-      - --binary was renamed to --voxel_volume. A hidden legacy alias is retained
-        so older command lines still parse, but the public flag is --voxel_volume.
-      - --min_radius removes small connected components in the final transverse
-        output volume after multiplanar/model union + 3D void filling.
-      - --save_nrrd exports the final binary volume as a .nrrd.
-    """
-    p = argparse.ArgumentParser(
-        description="v4.2.4 multiplanar YOLO-segmentation TTA for large videos.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-
-    p.add_argument("--input", required=True, type=str, help="Input video path")
-    p.add_argument("--output", default=None, type=str, help="Output directory (default ./{Filename}/)")
-    p.add_argument("--device", default="0", type=str, help="Device passed to YOLO predict")
-    p.add_argument("--model", required=True, nargs="+", type=str, help="One or more YOLO segmentation model paths")
-
-    p.add_argument(
-        "--disable_multiplanar",
-        action="store_true",
-        help="Only create and use the Transverse view during augmentation/inference",
-    )
-    p.add_argument(
-        "--angle",
-        default="0,120,240",
-        type=str,
-        help="Rotation angles in degrees for augmentation (comma or whitespace separated)",
-    )
-    p.add_argument("--imgsz", default=1536, type=int, help="Square input size passed to YOLO predict")
-    p.add_argument(
-        "--shift",
-        default=0,
-        type=int,
-        help="If nonzero, create the 4 shifted variants (up/down/left/right) per rotation per view",
-    )
-
-    p.add_argument("--conf", default=0.15, type=float, help="Confidence threshold passed to YOLO predict")
-    p.add_argument(
-        "--min_conf",
-        default=0.30,
-        type=float,
-        help="After 2D union, drop low-confidence slices that have no overlapping mask in either neighbor slice",
-    )
-    p.add_argument("--half", action="store_true", help="Enable FP16 inference (Ultralytics half=True)")
-    p.add_argument("--int8", action="store_true", help="Enable INT8 inference if supported (Ultralytics int8=True)")
-
-    p.add_argument("--save_labels", action="store_true", help="Save final YOLO segmentation labels per transverse frame")
-    p.add_argument("--save_binary", action="store_true", help="Save final binary masks as TIFF sequence + FFV1 MKV")
-    p.add_argument("--save_nrrd", action="store_true", help="Save the final binary volume as a .nrrd")
-    p.add_argument(
-        "--voxel_volume",
-        action="store_true",
-        help="Count foreground voxels in the final binary output and create an empty file named with that count",
-    )
-    p.add_argument("--binary", dest="voxel_volume", action="store_true", help=argparse.SUPPRESS)
-    p.add_argument(
-        "--troubleshooting",
-        action="store_true",
-        help="Keep temp files and save additional output sets before each interpolation pass",
-    )
-
-    p.add_argument(
-        "--interpolate",
-        default=15,
-        type=int,
-        help="Spherical-sector search radius N in voxels. 0 disables interpolation",
-    )
-    p.add_argument(
-        "--interpolate_passes",
-        default=1,
-        type=int,
-        help="Run the interpolation process this many passes, treating the previous pass as real",
-    )
-    p.add_argument(
-        "--interpolate_min_radius",
-        default=3,
-        type=float,
-        help="Skip candidate bridges whose effective radius is <= this value",
-    )
-    p.add_argument(
-        "--cone_half_angle",
-        default=15.0,
-        type=float,
-        help="Spherical-sector half-angle in degrees. 0=ray, 90=hemisphere",
-    )
-    p.add_argument(
-        "--min_radius",
-        default=0.0,
-        type=float,
-        help="Remove final transverse connected components whose 2D radius is smaller than this value",
-    )
-    return p
-
-
-def write_command_file(out_dir: Path) -> Path:
-    """Persist the exact command line used for this run."""
-    out_path = out_dir / "command.txt"
-    cmd = shlex.join(sys.argv)
-    out_path.write_text(cmd + "\n")
-    return out_path
-
-
-def assemble_view_volume_from_union(
-    *,
-    out_path: Path,
-    view_name: str,
-    union_mm: np.memmap,
-    T: int,
-    H: int,
-    W: int,
-) -> np.memmap:
-    """
-    Assemble one native-orientation 3D volume for a single view.
-
-    Output shape is always (T, H, W) in transverse/native orientation, regardless of
-    whether the source slices came from transverse, sagittal, or coronal inference.
-    """
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    vol = np.memmap(out_path, dtype=np.uint8, mode="w+", shape=(T, H, W))
-    vol[:] = 0
-
-    if view_name == "transverse":
-        for t in tqdm(range(T), desc=f"Assembling {view_name} volume"):
-            vol[t, :, :] = unpack_mask(np.asarray(union_mm[t]), H, W)
-    elif view_name == "sagittal":
-        for y in tqdm(range(H), desc=f"Assembling {view_name} volume"):
-            vol[:, y, :] = unpack_mask(np.asarray(union_mm[y]), T, W)
-    elif view_name == "coronal":
-        for x in tqdm(range(W), desc=f"Assembling {view_name} volume"):
-            vol[:, :, x] = unpack_mask(np.asarray(union_mm[x]), T, H)
-    else:
-        raise ValueError(f"Unknown view name: {view_name}")
-
-    vol.flush()
-    return vol
-
-
-def apply_min_radius_transverse(mask_u8: np.ndarray, min_radius: float) -> np.ndarray:
-    """
-    Remove final transverse-plane connected components whose inscribed-circle radius is
-    smaller than --min_radius. The radius is the max EDT value of each 2D component.
-    """
-    if float(min_radius) <= 0:
-        return np.asarray(mask_u8, dtype=np.uint8)
-
-    arr = np.asarray(mask_u8, dtype=np.uint8)
-    out = np.array(arr, copy=True, dtype=np.uint8)
-    structure2 = np.ones((3, 3), dtype=bool)
-
-    for t in tqdm(range(out.shape[0]), desc=f"Applying min_radius >= {float(min_radius):g} in transverse"):
-        m = out[t].astype(bool)
-        if not m.any():
-            continue
-
-        labels2d, num = ndi.label(m, structure=structure2)
-        if num <= 0:
-            continue
-
-        dist = ndi.distance_transform_edt(m)
-        idx = np.arange(1, num + 1, dtype=np.int32)
-        max_radius = np.asarray(ndi.maximum(dist, labels=labels2d, index=idx), dtype=np.float32).reshape(-1)
-
-        keep_lookup = np.zeros(num + 1, dtype=np.uint8)
-        keep_lookup[idx[max_radius >= float(min_radius)]] = 1
-        out[t, :, :] = keep_lookup[labels2d]
-
-    return out
-
-
-def write_nrrd_output(mask_u8: np.ndarray, out_path: Path) -> Path:
-    """
-    Write the final binary volume as a gzip-encoded attached NRRD.
-
-    The array is written in native transverse order: (t, y, x). This keeps the
-    export streaming and avoids a full-volume transpose copy for very large data.
-    """
-    T, H, W = mask_u8.shape
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    header = "\n".join(
-        [
-            "NRRD0005",
-            "# Generated by YOLO multiplanar TTA v4.2.4",
-            "type: uint8",
-            "dimension: 3",
-            f"sizes: {T} {H} {W}",
-            "encoding: gzip",
-            "kinds: list domain domain",
-            'labels: "t" "y" "x"',
-            "content: binary segmentation volume in native transverse order (t,y,x)",
-            "",
-            "",
-        ]
-    ).encode("ascii")
-
-    with open(out_path, "wb") as f:
-        f.write(header)
-        with gzip.GzipFile(fileobj=f, mode="wb", compresslevel=1) as gz:
-            for t in tqdm(range(T), desc=f"Writing NRRD ({out_path.name})"):
-                sl = np.ascontiguousarray(np.asarray(mask_u8[t], dtype=np.uint8))
-                gz.write(sl.tobytes())
-
-    return out_path
-
-
-def write_voxel_volume_marker(out_dir: Path, count: int) -> Path:
-    """Create the v4.2.4 voxel-count marker file (empty file named with the count)."""
-    for child in out_dir.iterdir():
-        if child.is_file() and re.fullmatch(r"\d+", child.name):
-            try:
-                child.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-    marker = out_dir / str(int(count))
-    marker.touch()
-    return marker
-
-
-def assemble_current_output_volume(
-    *,
-    out_path: Path,
-    view_volumes_by_model: Dict[str, Dict[str, np.memmap]],
-    T: int,
-    H: int,
-    W: int,
-    disable_multiplanar: bool,
-    min_radius: float,
-) -> np.memmap:
-    """
-    Assemble the current final output volume from the current per-model/per-view volumes.
-
-    v4.2.4 order:
-      1) Union the current view volumes (or transverse only if --disable_multiplanar)
-      2) Union across all models
-      3) Fill enclosed 3D voids
-      4) Apply --min_radius in the transverse plane
-    """
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    ensemble_mm = np.memmap(out_path, dtype=np.uint8, mode="w+", shape=(T, H, W))
-    ensemble_mm[:] = 0
-
-    for model_name in sorted(view_volumes_by_model):
-        model_views = view_volumes_by_model[model_name]
-        if disable_multiplanar:
-            if "transverse" in model_views:
-                np.bitwise_or(ensemble_mm, np.asarray(model_views["transverse"], dtype=np.uint8), out=ensemble_mm)
-            continue
-
-        for view_name in ("transverse", "sagittal", "coronal"):
-            if view_name in model_views:
-                np.bitwise_or(ensemble_mm, np.asarray(model_views[view_name], dtype=np.uint8), out=ensemble_mm)
-
-    ensemble_mm.flush()
-
-    current = np.asarray(ensemble_mm)
-    current = fill_3d_voids(current)
-    if float(min_radius) > 0:
-        current = apply_min_radius_transverse(current, float(min_radius))
-
-    ensemble_mm[:] = current
-    ensemble_mm.flush()
-    return ensemble_mm
-
-
-def write_result_set(
-    *,
-    volume_rgb: np.memmap,
-    mask_u8: np.ndarray,
-    out_dir: Path,
-    stem: str,
-    fps: float,
-    save_binary: bool,
-    save_labels: bool,
-    save_nrrd: bool,
-    tag: Optional[str] = None,
-) -> Dict[str, Path]:
-    """
-    Write one result set.
-
-    Final names:
-      - overlay video:        {stem}_Overlay.mkv
-      - binary TIFF sequence: binary_masks/{stem}_Binary_%04d.tiff
-      - binary video:         {stem}_Binary.mkv
-      - labels:               labels/{stem}_%04d.txt
-      - nrrd (optional):      {stem}_Binary.nrrd
-
-    Troubleshooting snapshots use suffixed names/folders so pass 0 / pass N outputs can coexist.
-    """
-    if tag is None:
-        overlay_name = f"{stem}_Overlay.mkv"
-        binary_subdir = "binary_masks"
-        binary_prefix = f"{stem}_Binary"
-        binary_video = f"{stem}_Binary.mkv"
-        labels_subdir = "labels"
-        labels_prefix = stem
-        nrrd_name = f"{stem}_Binary.nrrd"
-    else:
-        overlay_name = f"{stem}_Overlay_{tag}.mkv"
-        binary_subdir = f"binary_masks_{tag.lower()}"
-        binary_prefix = f"{stem}_Binary_{tag}"
-        binary_video = f"{stem}_Binary_{tag}.mkv"
-        labels_subdir = f"labels_{tag.lower()}"
-        labels_prefix = f"{stem}_{tag}"
-        nrrd_name = f"{stem}_Binary_{tag}.nrrd"
-
-    overlay_path = out_dir / overlay_name
-    write_overlay_video(volume_rgb, np.asarray(mask_u8, dtype=np.uint8), overlay_path, fps=fps)
-
-    result_paths: Dict[str, Path] = {"overlay": overlay_path}
-
-    if save_binary:
-        tiff_dir, vid_path = write_binary_outputs(
-            np.asarray(mask_u8, dtype=np.uint8),
-            out_dir=out_dir,
-            stem=stem,
-            fps=fps,
-            tiff_subdir=binary_subdir,
-            tiff_prefix=binary_prefix,
-            video_name=binary_video,
-        )
-        result_paths["binary_tiff_dir"] = tiff_dir
-        result_paths["binary_video"] = vid_path
-
-    if save_labels:
-        labels_dir = write_yolo_labels(
-            np.asarray(mask_u8, dtype=np.uint8),
-            out_dir=out_dir,
-            stem=stem,
-            labels_subdir=labels_subdir,
-            frame_prefix=labels_prefix,
-        )
-        result_paths["labels_dir"] = labels_dir
-
-    if save_nrrd:
-        nrrd_path = write_nrrd_output(np.asarray(mask_u8, dtype=np.uint8), out_dir / nrrd_name)
-        result_paths["nrrd"] = nrrd_path
-
-    return result_paths
-
-
-@dataclass(frozen=True)
-class V424ObjectInfo:
-    label: int
-    bbox: Tuple[slice, slice, slice]
-    skeleton_points: np.ndarray  # (N,3) global integer coordinates
-    tree: Optional[object]
-
-
-@dataclass(frozen=True)
-class V424BridgeCandidate:
-    source_label: int
-    target_label: int
-    source_point: Tuple[int, int, int]           # A
-    hit_point: Tuple[int, int, int]              # B
-    target_skeleton_point: Tuple[int, int, int]  # C
-    source_axis: np.ndarray
-    target_axis: np.ndarray
-    source_radius: float
-    target_real_radius: float
-    target_support_radius: float
-    bridge_radius: float
-    distance: float
-
-
-@dataclass(frozen=True)
-class V424PlannedBridge:
-    pair_labels: Tuple[int, int]
-    source_label: int
-    target_label: int
-    source_point: Tuple[int, int, int]
-    hit_point: Tuple[int, int, int]
-    target_skeleton_point: Tuple[int, int, int]
-    source_axis: np.ndarray
-    target_axis: np.ndarray
-    source_radius: float
-    target_real_radius: float
-    target_support_radius: float
-    bridge_radius: float
-
-
-def _principal_axis(points: np.ndarray) -> np.ndarray:
-    pts = np.asarray(points, dtype=np.float32)
-    if pts.ndim != 2 or pts.shape[0] == 0:
-        return np.zeros(3, dtype=np.float32)
-    if pts.shape[0] == 1:
-        return np.zeros(3, dtype=np.float32)
-    ctr = pts.mean(axis=0, dtype=np.float32)
-    centered = pts - ctr
-    cov = centered.T @ centered
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    axis = eigvecs[:, int(np.argmax(eigvals))]
-    return _normalize_vec(axis.astype(np.float32))
-
-
-def _build_v424_objects_and_seeds(
-    labels_real: np.ndarray,
-    extension_radius: int,
-) -> Tuple[Dict[int, V424ObjectInfo], List[EndpointSeed], int]:
-    """
-    Skeletonize each real object once, capture endpoint seeds, and retain per-object
-    skeleton point clouds so B can be projected onto O2's skeleton (point C).
-    """
-    objs = ndi.find_objects(labels_real)
-    object_infos: Dict[int, V424ObjectInfo] = {}
-    seeds: List[EndpointSeed] = []
-    endpoint_count = 0
-    direction_depth = max(2, min(8, int(extension_radius)))
-
-    for lbl, sl in enumerate(objs, start=1):
-        if sl is None:
-            continue
-
-        sub = (labels_real[sl] == lbl)
-        if not sub.any():
-            continue
-
-        skel = skeletonize_volume(sub)
-        if not skel.any():
-            continue
-
-        local_pts = np.argwhere(skel)
-        if local_pts.size == 0:
-            continue
-
-        offset = np.asarray([sl[0].start, sl[1].start, sl[2].start], dtype=np.int32)
-        global_pts = local_pts.astype(np.int32) + offset.reshape(1, 3)
-
-        tree: Optional[object]
-        if _cKDTree is not None:
-            try:
-                tree = _cKDTree(global_pts.astype(np.float32))
-            except Exception:
-                tree = None
-        else:
-            tree = None
-
-        object_infos[int(lbl)] = V424ObjectInfo(
-            label=int(lbl),
-            bbox=sl,
-            skeleton_points=global_pts,
-            tree=tree,
-        )
-
-        dist_sub = ndi.distance_transform_edt(sub)
-        neigh = ndi.convolve(skel.astype(np.uint8), KERNEL_3, mode="constant", cval=0) - skel.astype(np.uint8)
-        ep_coords = np.argwhere(np.logical_and(skel, neigh == 1))
-        if ep_coords.size == 0:
-            continue
-
-        for ep in ep_coords:
-            ep_t = (int(ep[0]), int(ep[1]), int(ep[2]))
-            path = _trace_inward_path(skel, ep_t, max_steps=direction_depth)
-            ref = path[-1] if len(path) > 1 else ep_t
-
-            direction = np.asarray(ep_t, dtype=np.float32) - np.asarray(ref, dtype=np.float32)
-            norm = float(np.linalg.norm(direction))
-            if norm <= 0:
-                nbs = _skeleton_neighbors(skel, ep_t)
-                if not nbs:
-                    continue
-                direction = np.asarray(ep_t, dtype=np.float32) - np.asarray(nbs[0], dtype=np.float32)
-                norm = float(np.linalg.norm(direction))
-                if norm <= 0:
-                    continue
-            direction /= norm
-
-            global_ep = tuple(int(v) for v in (np.asarray(ep_t, dtype=np.int32) + offset).tolist())
-            seeds.append(
-                EndpointSeed(
-                    label=int(lbl),
-                    point=global_ep,
-                    direction=direction.astype(np.float32),
-                    support_radius=_estimate_seed_support_radius(
-                        dist_sub=dist_sub,
-                        path=path,
-                        extension_radius=extension_radius,
-                    ),
-                )
-            )
-            endpoint_count += 1
-
-    return object_infos, seeds, endpoint_count
-
-
-def _project_point_to_skeleton(info: V424ObjectInfo, point: Tuple[int, int, int]) -> Tuple[int, int, int]:
-    pts = np.asarray(info.skeleton_points, dtype=np.float32)
-    if pts.size == 0:
-        return point
-
-    query_pt = np.asarray(point, dtype=np.float32)
-    if info.tree is not None:
-        try:
-            _, idx = info.tree.query(query_pt, k=1)
-            row = info.skeleton_points[int(np.asarray(idx).reshape(-1)[0])]
-            return tuple(int(v) for v in row.tolist())
-        except Exception:
-            pass
-
-    d2 = np.sum((pts - query_pt.reshape(1, 3)) ** 2, axis=1)
-    row = info.skeleton_points[int(np.argmin(d2))]
-    return tuple(int(v) for v in row.tolist())
-
-
-def _estimate_object_tangent(
-    info: V424ObjectInfo,
-    point: Tuple[int, int, int],
-    fallback_axis: np.ndarray,
-    neighborhood_radius: float = 3.0,
-) -> np.ndarray:
-    """
-    Estimate the local skeleton tangent at an arbitrary skeleton point using a
-    small PCA neighborhood. The sign is aligned with fallback_axis to minimize
-    unnecessary 180° flips when constructing the virtual cross section bridge.
-    """
-    fallback = _normalize_vec(fallback_axis)
-    pts = np.asarray(info.skeleton_points, dtype=np.float32)
-    if pts.size == 0:
-        return fallback
-
-    query_pt = np.asarray(point, dtype=np.float32)
-    selected_pts: np.ndarray
-
-    if info.tree is not None:
-        try:
-            idxs = info.tree.query_ball_point(query_pt, r=float(neighborhood_radius))
-            if len(idxs) < 2:
-                k = min(8, pts.shape[0])
-                _, idxs_knn = info.tree.query(query_pt, k=k)
-                idxs = [int(i) for i in np.asarray(idxs_knn).reshape(-1).tolist()]
-            selected_pts = pts[np.asarray(idxs, dtype=np.int64)]
-        except Exception:
-            d2 = np.sum((pts - query_pt.reshape(1, 3)) ** 2, axis=1)
-            order = np.argsort(d2)
-            selected_pts = pts[order[: min(8, pts.shape[0])]]
-    else:
-        d2 = np.sum((pts - query_pt.reshape(1, 3)) ** 2, axis=1)
-        order = np.argsort(d2)
-        selected_pts = pts[order[: min(8, pts.shape[0])]]
-
-    axis = _principal_axis(selected_pts)
-    if float(np.linalg.norm(axis)) <= 0:
-        axis = fallback.copy()
-    if float(np.linalg.norm(axis)) <= 0:
-        axis = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
-
-    if float(np.linalg.norm(fallback)) > 0 and float(np.dot(axis, fallback)) < 0:
-        axis = -axis
-
-    return _normalize_vec(axis)
-
-
-def _pad_section_to_half_width(section_mask: np.ndarray, half_width: int) -> np.ndarray:
-    section_mask = np.asarray(section_mask, dtype=bool)
-    cur_half = section_mask.shape[0] // 2
-    if cur_half == int(half_width):
-        return section_mask
-    if cur_half > int(half_width):
-        trim = cur_half - int(half_width)
-        return section_mask[trim:-trim, trim:-trim]
-    pad = int(half_width) - cur_half
-    return np.pad(section_mask, ((pad, pad), (pad, pad)), mode="constant", constant_values=False)
-
-
-def _slerp_unit_vectors(v0: np.ndarray, v1: np.ndarray, alpha: float) -> np.ndarray:
-    a = _normalize_vec(v0)
-    b = _normalize_vec(v1)
-    if float(np.linalg.norm(a)) <= 0:
-        return b
-    if float(np.linalg.norm(b)) <= 0:
-        return a
-    if float(np.dot(a, b)) < 0:
-        b = -b
-
-    dot = float(np.clip(np.dot(a, b), -1.0, 1.0))
-    if dot > 0.9995:
-        return _normalize_vec((1.0 - float(alpha)) * a + float(alpha) * b)
-
-    theta = math.acos(dot)
-    sin_theta = math.sin(theta)
-    if abs(sin_theta) <= 1e-8:
-        return a
-
-    w0 = math.sin((1.0 - float(alpha)) * theta) / sin_theta
-    w1 = math.sin(float(alpha) * theta) / sin_theta
-    return _normalize_vec(w0 * a + w1 * b)
-
-
-def _extract_anchor_section(
-    labels_real: np.ndarray,
-    label: int,
-    center: Tuple[int, int, int],
-    axis: np.ndarray,
-    radius_hint: float,
-    min_reach: Optional[float] = None,
-) -> np.ndarray:
-    """
-    Extract a local real cross section around an anchor point. When min_reach is set,
-    the section is guaranteed to extend to at least that radius so the B intercept can
-    sit on the edge of O2's real section as required by v4.2.4.
-    """
-    radius_hint = max(1.0, float(radius_hint))
-    reach = radius_hint
-    if min_reach is not None:
-        reach = max(reach, float(min_reach))
-
-    half_width = max(4, int(math.ceil(reach * 2.0)) + 2)
-    max_half_width = max(half_width, min(128, int(math.ceil(reach * 4.0)) + 8))
-
-    while True:
-        section = _extract_local_plane_mask(
-            labels_real=labels_real,
-            label=int(label),
-            center=np.asarray(center, dtype=np.float32),
-            axis=np.asarray(axis, dtype=np.float32),
-            half_width=half_width,
-            plane_half_thickness=0.75,
-        )
-        if half_width >= max_half_width or not _mask_touches_border(section):
-            break
-        half_width = min(max_half_width, max(half_width + 2, half_width * 2))
-
-    if min_reach is not None and float(min_reach) > 0:
-        section = np.logical_or(section, _disk_mask_2d(half_width, float(min_reach)))
-
-    if not np.any(section):
-        section = _disk_mask_2d(half_width, reach)
-
-    return _keep_center_component_2d(section)
-
-
-def _paint_plane_section(
-    mask: np.ndarray,
-    center: np.ndarray,
-    axis: np.ndarray,
-    section_mask: np.ndarray,
-    plane_half_thickness: float = 0.49,
-) -> int:
-    """
-    Paint a thick planar cross section into the 3D mask.
-
-    Unlike the earlier sparse three-layer version, this v4.2.4 override samples a
-    dense stack of parallel offsets so every interpolated bridge is a smooth, solid,
-    contiguous section rather than a set of thin fins.
-    """
-    section_mask = np.asarray(section_mask, dtype=bool)
-    if not section_mask.any():
-        return 0
-
-    axis_u, u_axis, v_axis = _orthonormal_basis(axis)
-    center = np.asarray(center, dtype=np.float32)
-    half_width = section_mask.shape[0] // 2
-    pts2d = np.argwhere(section_mask)
-    if pts2d.size == 0:
-        return 0
-
-    vv = pts2d[:, 0].astype(np.float32) - float(half_width)
-    uu = pts2d[:, 1].astype(np.float32) - float(half_width)
-    base = (
-        center.reshape(1, 3)
-        + uu[:, None] * u_axis.reshape(1, 3)
-        + vv[:, None] * v_axis.reshape(1, 3)
-    )
-
-    if plane_half_thickness > 0:
-        offset_step = 0.5
-        num_layers = max(1, int(math.ceil((2.0 * float(plane_half_thickness)) / offset_step)))
-        offsets = np.linspace(
-            -float(plane_half_thickness),
-            float(plane_half_thickness),
-            num_layers + 1,
-            dtype=np.float32,
-        )
-    else:
-        offsets = np.asarray([0.0], dtype=np.float32)
-
-    coords = np.concatenate(
-        [base + axis_u.reshape(1, 3) * float(off) for off in offsets],
-        axis=0,
-    )
-    ijk = np.rint(coords).astype(np.int32)
-
-    Z, Y, X = mask.shape
-    valid = (
-        (ijk[:, 0] >= 0) & (ijk[:, 0] < Z) &
-        (ijk[:, 1] >= 0) & (ijk[:, 1] < Y) &
-        (ijk[:, 2] >= 0) & (ijk[:, 2] < X)
-    )
-    if not np.any(valid):
-        return 0
-
-    pts = np.unique(ijk[valid], axis=0)
-    current = mask[pts[:, 0], pts[:, 1], pts[:, 2]]
-    mask[pts[:, 0], pts[:, 1], pts[:, 2]] = True
-    return int(np.count_nonzero(~current))
-
-
-def _dense_section_loft(
-    mask: np.ndarray,
-    *,
-    center0: Tuple[int, int, int],
-    axis0: np.ndarray,
-    section0: np.ndarray,
-    center1: Tuple[int, int, int],
-    axis1: np.ndarray,
-    section1: np.ndarray,
-) -> int:
-    """
-    Create a solid bridge by densely sweeping interpolated cross sections.
-
-    This is intentionally oversampled relative to voxel spacing so the bridge is a
-    single contiguous solid section instead of a comb of separated slices.
-    """
-    axis0_u = _normalize_vec(axis0)
-    axis1_u = _normalize_vec(axis1)
-    if float(np.linalg.norm(axis0_u)) <= 0:
-        axis0_u = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
-    if float(np.linalg.norm(axis1_u)) <= 0:
-        axis1_u = axis0_u.copy()
-    if float(np.dot(axis0_u, axis1_u)) < 0:
-        axis1_u = -axis1_u
-
-    half_width = max(section0.shape[0] // 2, section1.shape[0] // 2)
-    section0_p = _pad_section_to_half_width(section0, half_width)
-    section1_p = _pad_section_to_half_width(section1, half_width)
-    sdf0 = _signed_distance_2d(section0_p)
-    sdf1 = _signed_distance_2d(section1_p)
-
-    c0 = np.asarray(center0, dtype=np.float32)
-    c1 = np.asarray(center1, dtype=np.float32)
-    center_len = float(np.linalg.norm(c1 - c0))
-    angle_deg = math.degrees(math.acos(float(np.clip(np.dot(axis0_u, axis1_u), -1.0, 1.0))))
-
-    samples = max(1, int(math.ceil(max(center_len / 0.35, angle_deg / 3.0))))
-    if center_len < 1e-6 and angle_deg < 1e-4:
-        alphas = np.asarray([0.0], dtype=np.float32)
-        plane_half_thickness = 0.85
-    else:
-        alphas = np.linspace(0.0, 1.0, samples + 1, dtype=np.float32)
-        step_len = center_len / float(samples)
-        plane_half_thickness = max(0.85, min(1.75, 0.75 + 0.5 * step_len))
-
-    added = 0
-    for alpha in alphas:
-        alpha_f = float(alpha)
-        center = (1.0 - alpha_f) * c0 + alpha_f * c1
-        axis = _slerp_unit_vectors(axis0_u, axis1_u, alpha_f)
-        section = (((1.0 - alpha_f) * sdf0 + alpha_f * sdf1) >= 0.0)
-        section = _keep_center_component_2d(section)
-        added += _paint_plane_section(
-            mask=mask,
-            center=center,
-            axis=axis,
-            section_mask=section,
-            plane_half_thickness=plane_half_thickness,
-        )
-
-    return int(added)
-
-
-def _build_v424_bridge_candidates(
-    labels_real: np.ndarray,
-    object_infos: Dict[int, V424ObjectInfo],
-    seeds: List[EndpointSeed],
-    extension_radius: int,
-    cone_half_angle_deg: float,
-) -> List[V424BridgeCandidate]:
-    """
-    Build v4.2.4 bridge candidates:
-      A = source endpoint on O1
-      B = first sector intercept on O2
-      C = projection of B onto O2's skeleton
-
-    The bridge radius is estimated from the actual local 2D cross sections at A and C
-    rather than from a 3D inscribed sphere. This avoids falsely classifying wide endcaps
-    as tiny bridges just because the anchor happens to sit near a tip voxel.
-    """
-    sphere_offsets = _sorted_sphere_offsets(int(extension_radius))
-
-    candidates: List[V424BridgeCandidate] = []
-    for seed in seeds:
-        hit = _closest_sector_hit(
-            labels_real=labels_real,
-            source_label=seed.label,
-            point=seed.point,
-            direction=seed.direction,
-            extension_radius=int(extension_radius),
-            cone_half_angle_deg=float(cone_half_angle_deg),
-            sphere_offsets=sphere_offsets,
-        )
-        if hit is None:
-            continue
-
-        hit_point, hit_label, hit_distance = hit
-        target_info = object_infos.get(int(hit_label))
-        if target_info is None:
-            continue
-
-        source_axis = np.asarray(seed.direction, dtype=np.float32)
-        source_section = _extract_anchor_section(
-            labels_real=labels_real,
-            label=int(seed.label),
-            center=seed.point,
-            axis=source_axis,
-            radius_hint=max(1.0, float(seed.support_radius)),
-            min_reach=None,
-        )
-        source_section_radius = max(1.0, _section_radius_2d(source_section))
-
-        c_point = _project_point_to_skeleton(target_info, hit_point)
-        target_axis = _estimate_object_tangent(
-            target_info,
-            c_point,
-            fallback_axis=source_axis,
-            neighborhood_radius=max(2.0, min(5.0, float(extension_radius) / 3.0)),
-        )
-        target_real_radius = max(1.0, _euclidean_distance(c_point, hit_point))
-
-        target_section = _extract_anchor_section(
-            labels_real=labels_real,
-            label=int(hit_label),
-            center=c_point,
-            axis=target_axis,
-            radius_hint=max(source_section_radius, target_real_radius),
-            min_reach=target_real_radius,
-        )
-        target_section_radius = max(1.0, _section_radius_2d(target_section))
-
-        bridge_radius = min(float(source_section_radius), float(target_section_radius))
-
-        candidates.append(
-            V424BridgeCandidate(
-                source_label=int(seed.label),
-                target_label=int(hit_label),
-                source_point=seed.point,
-                hit_point=hit_point,
-                target_skeleton_point=c_point,
-                source_axis=source_axis,
-                target_axis=np.asarray(target_axis, dtype=np.float32),
-                source_radius=float(source_section_radius),
-                target_real_radius=float(target_real_radius),
-                target_support_radius=float(target_section_radius),
-                bridge_radius=float(bridge_radius),
-                distance=float(hit_distance),
-            )
-        )
-
-    return candidates
-
-
-def _plan_v424_pairwise_bridges(
-    candidates: List[V424BridgeCandidate],
-    interpolate_min_radius: float,
-) -> Tuple[List[V424PlannedBridge], Dict[str, int]]:
-    """
-    Collapse endpoint-level hits to at most one bridge per unordered object pair.
-
-    This intentionally suppresses the common many-endpoint / many-thin-bridge failure
-    mode that produces CPU-cooler-like fins instead of one continuous bridge.
-    """
-    by_pair: Dict[Tuple[int, int], List[V424BridgeCandidate]] = {}
-    for cand in candidates:
-        key = (
-            min(int(cand.source_label), int(cand.target_label)),
-            max(int(cand.source_label), int(cand.target_label)),
-        )
-        by_pair.setdefault(key, []).append(cand)
-
-    planned: List[V424PlannedBridge] = []
-    skipped_by_min_radius = 0
-
-    for pair_key, group in by_pair.items():
-        best = min(
-            group,
-            key=lambda c: (
-                float(c.distance),
-                -float(c.bridge_radius),
-                -float(c.source_radius),
-            ),
-        )
-
-        if float(best.bridge_radius) <= float(interpolate_min_radius):
-            skipped_by_min_radius += 1
-            continue
-
-        planned.append(
-            V424PlannedBridge(
-                pair_labels=pair_key,
-                source_label=int(best.source_label),
-                target_label=int(best.target_label),
-                source_point=best.source_point,
-                hit_point=best.hit_point,
-                target_skeleton_point=best.target_skeleton_point,
-                source_axis=np.asarray(best.source_axis, dtype=np.float32),
-                target_axis=np.asarray(best.target_axis, dtype=np.float32),
-                source_radius=float(best.source_radius),
-                target_real_radius=float(best.target_real_radius),
-                target_support_radius=float(best.target_support_radius),
-                bridge_radius=float(best.bridge_radius),
-            )
-        )
-
-    return planned, {
-        "pair_groups": int(len(by_pair)),
-        "accepted_connections": int(len(planned)),
-        "skipped_by_min_radius": int(skipped_by_min_radius),
-    }
-
-
-def _paint_v424_bridge(
-    mask: np.ndarray,
-    labels_real: np.ndarray,
-    bridge: V424PlannedBridge,
-) -> int:
-    """
-    Create the two solid v4.2.4 bridges:
-      1) O1 real section at A -> O2 virtual section at C
-      2) O2 virtual section at C -> O2 real section at C
-    """
-    source_axis = _normalize_vec(bridge.source_axis)
-    target_axis = _normalize_vec(bridge.target_axis)
-    if float(np.linalg.norm(source_axis)) <= 0:
-        source_axis = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
-    if float(np.linalg.norm(target_axis)) <= 0:
-        target_axis = source_axis.copy()
-
-    source_section = _extract_anchor_section(
-        labels_real=labels_real,
-        label=int(bridge.source_label),
-        center=bridge.source_point,
-        axis=source_axis,
-        radius_hint=max(float(bridge.source_radius), float(bridge.bridge_radius)),
-        min_reach=None,
-    )
-
-    target_section = _extract_anchor_section(
-        labels_real=labels_real,
-        label=int(bridge.target_label),
-        center=bridge.target_skeleton_point,
-        axis=target_axis,
-        radius_hint=max(float(bridge.target_support_radius), float(bridge.target_real_radius)),
-        min_reach=float(bridge.target_real_radius),
-    )
-
-    added = 0
-    added += _dense_section_loft(
-        mask,
-        center0=bridge.source_point,
-        axis0=source_axis,
-        section0=source_section,
-        center1=bridge.target_skeleton_point,
-        axis1=source_axis,
-        section1=target_section,
-    )
-    added += _dense_section_loft(
-        mask,
-        center0=bridge.target_skeleton_point,
-        axis0=source_axis,
-        section0=target_section,
-        center1=bridge.target_skeleton_point,
-        axis1=target_axis,
-        section1=target_section,
-    )
-    return int(added)
-
-
-def interpolate_spherical_sector_pass(
-    mask_u8: np.ndarray,
-    extension_radius: int,
-    cone_half_angle_deg: float,
-    interpolate_min_radius: float,
-) -> Tuple[np.ndarray, Dict[str, object]]:
-    """
-    One v4.2.4 interpolation pass on a single 3D view volume.
-
-    Process:
-      - Define each connected 3D object from the current pass as the current set of "real" sections.
-      - Skeletonize every object and enumerate all skeleton endpoints.
-      - From each endpoint A, cast a spherical sector to find the nearest target-object intercept B.
-      - Project B onto the target object's skeleton to get C.
-      - Use O1's real section at A, O2's real section at C, and a virtual copy of O2's section at C
-        reoriented parallel to O1 to create two dense solid bridges.
-      - New interpolation created during this pass does not influence other searches until the next pass.
-    """
-    if extension_radius <= 0:
-        return np.asarray(mask_u8, dtype=np.uint8), {
-            "num_objects": 0,
-            "num_endpoints": 0,
-            "candidate_connections": 0,
-            "pair_groups": 0,
-            "accepted_connections": 0,
-            "skipped_by_min_radius": 0,
-            "added_voxels": 0,
-            "skipped": True,
-        }
-
-    pass_real = np.asarray(mask_u8, dtype=bool)
-    labels_real, num_objects = ndi.label(pass_real, structure=STRUCTURE26)
-    if num_objects <= 1:
-        return pass_real.astype(np.uint8), {
-            "num_objects": int(num_objects),
-            "num_endpoints": 0,
-            "candidate_connections": 0,
-            "pair_groups": 0,
-            "accepted_connections": 0,
-            "skipped_by_min_radius": 0,
-            "added_voxels": 0,
-            "skipped": num_objects <= 1,
-        }
-
-    object_infos, seeds, num_endpoints = _build_v424_objects_and_seeds(
-        labels_real,
-        extension_radius=int(extension_radius),
-    )
-    if not seeds:
-        return pass_real.astype(np.uint8), {
-            "num_objects": int(num_objects),
-            "num_endpoints": int(num_endpoints),
-            "candidate_connections": 0,
-            "pair_groups": 0,
-            "accepted_connections": 0,
-            "skipped_by_min_radius": 0,
-            "added_voxels": 0,
-            "skipped": False,
-        }
-
-    candidates = _build_v424_bridge_candidates(
-        labels_real=labels_real,
-        object_infos=object_infos,
-        seeds=seeds,
-        extension_radius=int(extension_radius),
-        cone_half_angle_deg=float(cone_half_angle_deg),
-    )
-    planned_bridges, plan_stats = _plan_v424_pairwise_bridges(
-        candidates=candidates,
-        interpolate_min_radius=float(interpolate_min_radius),
-    )
-
-    work_mask = pass_real.copy()
-    added_voxels = 0
-    for bridge in planned_bridges:
-        added_voxels += _paint_v424_bridge(
-            mask=work_mask,
-            labels_real=labels_real,
-            bridge=bridge,
-        )
-
-    stats: Dict[str, object] = {
-        "num_objects": int(num_objects),
-        "num_endpoints": int(num_endpoints),
-        "candidate_connections": int(len(candidates)),
-        "pair_groups": int(plan_stats["pair_groups"]),
-        "accepted_connections": int(plan_stats["accepted_connections"]),
-        "skipped_by_min_radius": int(plan_stats["skipped_by_min_radius"]),
-        "added_voxels": int(added_voxels),
-        "skipped": False,
-    }
-    return work_mask.astype(np.uint8), stats
-
-
-def main() -> None:
-    args = build_argparser().parse_args()
-
-    input_path = Path(args.input).expanduser().resolve()
-    if not input_path.exists():
-        raise FileNotFoundError(input_path)
-
-    model_paths = _parse_models(args.model)
-    if not model_paths:
-        raise ValueError("--model must specify at least one model path")
-    for m in model_paths:
-        if not Path(m).expanduser().exists():
-            raise FileNotFoundError(m)
-
-    angles = _parse_angles(args.angle) or [0.0, 120.0, 240.0]
-
-    if args.min_conf > 0 and args.min_conf < args.conf:
-        raise ValueError("--min_conf must be 0 (disabled) or >= --conf")
-    if int(args.interpolate) < 0:
-        raise ValueError("--interpolate must be >= 0")
-    if int(args.interpolate_passes) < 1:
-        raise ValueError("--interpolate_passes must be >= 1")
-    if float(args.interpolate_min_radius) < 0:
-        raise ValueError("--interpolate_min_radius must be >= 0")
-    if float(args.min_radius) < 0:
-        raise ValueError("--min_radius must be >= 0")
-    if not (0.0 <= float(args.cone_half_angle) <= 90.0):
-        raise ValueError("--cone_half_angle must be between 0 and 90 degrees inclusive")
-
-    out_dir = Path(args.output).expanduser().resolve() if args.output else (Path.cwd() / input_path.stem)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    temp_dir = out_dir / "temp"
-    temp_dir.mkdir(parents=True, exist_ok=True)
-
-    write_command_file(out_dir)
-
-    info = ffprobe_info(input_path)
-    W = int(info["width"])
-    H = int(info["height"])
-    T = int(info["num_frames"])
-    fps = float(info["fps"])
-
-    vol_path = temp_dir / "input_volume.rgb24.dat"
-    volume_rgb = decode_video_to_memmap_rgb24(
-        input_video=input_path,
-        out_dat=vol_path,
-        num_frames=T,
-        width=W,
-        height=H,
-        overwrite=False,
-    )
-    (temp_dir / "input_volume.meta.json").write_text(
-        json.dumps({"shape": [T, H, W, 3], "dtype": "uint8", "fps": fps}, indent=2)
-    )
-
-    views = get_view_infos(T=T, H=H, W=W, disable_multiplanar=args.disable_multiplanar)
-
-    shifts: List[Tuple[int, int, str]] = [(0, 0, "none")]
-    if int(args.shift) != 0:
-        s = abs(int(args.shift))
-        shifts = [
-            (0, 0, "none"),
-            (0, -s, "up"),
-            (0, +s, "down"),
-            (-s, 0, "left"),
-            (+s, 0, "right"),
-        ]
-
-    yolo_models: List[Tuple[str, object]] = []
-    for m in model_paths:
-        name = Path(m).stem
-        print(f"Loading model: {name} ({m})")
-        yolo_models.append((name, load_ultralytics_model(m)))
-
-    pred_cfg = PredictConfig(
-        imgsz=args.imgsz,
-        conf=args.conf,
-        device=str(args.device),
-        half=bool(args.half),
-        int8=bool(args.int8),
-    )
-
-    union_by_model: Dict[str, Dict[str, np.memmap]] = {}
-    conf_by_model: Dict[str, Dict[str, np.memmap]] = {}
-
-    for model_name, _ in yolo_models:
-        union_by_model[model_name] = {}
-        conf_by_model[model_name] = {}
-        for view in views:
-            bytes_native = bytes_for_packbits(view.src_h, view.src_w)
-            union_path = temp_dir / "union" / model_name / f"{view.name}.union.packbits.dat"
-            conf_path = temp_dir / "union" / model_name / f"{view.name}.union_conf.f16.dat"
-            union_path.parent.mkdir(parents=True, exist_ok=True)
-
-            union_mm = np.memmap(union_path, dtype=np.uint8, mode="w+", shape=(view.num_slices, bytes_native))
-            conf_mm = np.memmap(conf_path, dtype=np.float16, mode="w+", shape=(view.num_slices,))
-            union_mm[:] = 0
-            conf_mm[:] = 0
-            union_mm.flush()
-            conf_mm.flush()
-
-            union_by_model[model_name][view.name] = union_mm
-            conf_by_model[model_name][view.name] = conf_mm
-
-    # Generate each augmented video once, run every model on it sequentially, and
-    # accumulate native-orientation packed masks for that view/model.
-    for view in views:
-        print(f"\n=== View: {view.name} ({view.src_w}x{view.src_h}, slices={view.num_slices}) ===")
-        for angle in angles:
-            for dx, dy, shift_name in shifts:
-                aug_id = f"a{angle:g}_dx{dx}_dy{dy}_{shift_name}"
-                aug_dir = temp_dir / "aug" / view.name
-                aug_video = aug_dir / f"{view.name}_{aug_id}.mkv"
-                aug_meta = aug_dir / f"{view.name}_{aug_id}.meta.json"
-
-                aff = build_affine(
-                    view=view.name,
-                    src_w=view.src_w,
-                    src_h=view.src_h,
-                    out_size=args.imgsz,
-                    angle_deg=float(angle),
-                    shift_dx=int(dx),
-                    shift_dy=int(dy),
-                    pad_mode=view.pad_mode,
-                )
-
-                if not aug_video.exists():
-                    aug_dir.mkdir(parents=True, exist_ok=True)
-                    writer = ffmpeg_rawvideo_writer(
-                        aug_video,
-                        width=args.imgsz,
-                        height=args.imgsz,
-                        fps=fps,
-                        pix_fmt_in="rgb24",
-                        codec="ffv1",
-                        pix_fmt_out="yuv444p",
-                    )
-                    try:
-                        assert writer.stdin is not None
-                        for frame in tqdm(
-                            iter_view_frames(volume_rgb, view),
-                            total=view.num_slices,
-                            desc=f"Augment {view.name} {aug_id}",
-                        ):
-                            out = cv2.warpAffine(
-                                frame,
-                                aff.M_src_to_out,
-                                dsize=(args.imgsz, args.imgsz),
-                                flags=cv2.INTER_LINEAR,
-                                borderMode=cv2.BORDER_CONSTANT,
-                                borderValue=(0, 0, 0),
-                            )
-                            writer.stdin.write(out.tobytes())
-                    finally:
-                        close_ffmpeg_writer(writer)
-
-                    aug_meta.write_text(
-                        json.dumps(
-                            {
-                                "view": view.name,
-                                "angle_deg": float(angle),
-                                "shift_dx": int(dx),
-                                "shift_dy": int(dy),
-                                "src_w": view.src_w,
-                                "src_h": view.src_h,
-                                "out_size": int(args.imgsz),
-                                "pad_mode": view.pad_mode,
-                                "canvas_w": int(aff.canvas_w),
-                                "canvas_h": int(aff.canvas_h),
-                                "pad_size": int(aff.pad_size),
-                                "pad_off_x": float(aff.pad_off_x),
-                                "pad_off_y": float(aff.pad_off_y),
-                                "M_out_to_src": aff.M_out_to_src.tolist(),
-                                "M_src_to_out": aff.M_src_to_out.tolist(),
-                            },
-                            indent=2,
-                        )
-                    )
-
-                for model_name, yolo in yolo_models:
-                    pred_prefix = temp_dir / "preds" / model_name / view.name / f"{view.name}_{aug_id}"
-                    predict_video_and_accumulate(
-                        model=yolo,
-                        video_path=aug_video,
-                        num_frames=view.num_slices,
-                        out_size=args.imgsz,
-                        pred_out_prefix=pred_prefix,
-                        cfg=pred_cfg,
-                        view_union_mm=union_by_model[model_name][view.name],
-                        view_conf_mm=conf_by_model[model_name][view.name],
-                        M_out_to_native=aff.M_out_to_src,
-                        native_h=view.src_h,
-                        native_w=view.src_w,
-                    )
-
-                if not args.troubleshooting:
-                    try:
-                        aug_video.unlink(missing_ok=True)
-                        aug_meta.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-
-        # Per-view 2D postprocessing for every model:
-        #   1) apply --min_conf
-        #   2) fill 2D holes created by mask union / iou=1.0 overlap
-        for model_name, _ in yolo_models:
-            print(f"\n--- Postprocessing view '{view.name}' for model '{model_name}' ---")
-            if args.min_conf > 0:
-                apply_min_conf_filter_inplace(
-                    union_by_model[model_name][view.name],
-                    conf_by_model[model_name][view.name],
-                    float(args.min_conf),
-                )
-                union_by_model[model_name][view.name].flush()
-                conf_by_model[model_name][view.name].flush()
-
-            fill_2d_holes_inplace(union_by_model[model_name][view.name], view.src_h, view.src_w)
-            union_by_model[model_name][view.name].flush()
-
-    # Assemble one native-orientation 3D volume per model and per view.
-    view_volumes_by_model: Dict[str, Dict[str, np.memmap]] = {}
-    for model_name, _ in yolo_models:
-        view_volumes_by_model[model_name] = {}
-        for view in views:
-            vol_out = temp_dir / "view_volumes" / model_name / f"{view.name}.u8.dat"
-            view_volumes_by_model[model_name][view.name] = assemble_view_volume_from_union(
-                out_path=vol_out,
-                view_name=view.name,
-                union_mm=union_by_model[model_name][view.name],
-                T=T,
-                H=H,
-                W=W,
-            )
-
-        if not args.troubleshooting:
-            shutil.rmtree(temp_dir / "preds" / model_name, ignore_errors=True)
-
-    interpolation_stats: List[Dict[str, object]] = []
-
-    # Troubleshooting pass 0 = before any interpolation pass, but after each view has
-    # completed 2D postprocessing and has been assembled into a 3D native-orientation volume.
-    current_output_path = temp_dir / "current_output_volume.u8.dat"
-    if args.troubleshooting and int(args.interpolate) > 0:
-        print("\n=== Writing troubleshooting outputs: pass 0 (pre-interpolation) ===")
-        current_output_mm = assemble_current_output_volume(
-            out_path=current_output_path,
-            view_volumes_by_model=view_volumes_by_model,
-            T=T,
-            H=H,
-            W=W,
-            disable_multiplanar=bool(args.disable_multiplanar),
-            min_radius=float(args.min_radius),
-        )
-        write_result_set(
-            volume_rgb=volume_rgb,
-            mask_u8=np.asarray(current_output_mm, dtype=np.uint8),
-            out_dir=out_dir,
-            stem=input_path.stem,
-            fps=fps,
-            save_binary=bool(args.save_binary),
-            save_labels=bool(args.save_labels),
-            save_nrrd=bool(args.save_nrrd),
-            tag="Pass0",
-        )
-
-    if int(args.interpolate) > 0:
-        total_passes = int(args.interpolate_passes)
-        for pass_idx in range(1, total_passes + 1):
-            print(
-                f"\n=== Interpolation pass {pass_idx}/{total_passes} "
-                f"(radius={int(args.interpolate)}, min_radius={float(args.interpolate_min_radius):g}, "
-                f"cone_half_angle={float(args.cone_half_angle):g}) ==="
-            )
-
-            pass_record: Dict[str, object] = {"pass_index": int(pass_idx), "models": {}}
-
-            for model_name, _ in yolo_models:
-                model_record: Dict[str, object] = {}
-                for view in views:
-                    print(f"  -> model={model_name}, view={view.name}")
-                    current_view = np.asarray(view_volumes_by_model[model_name][view.name], dtype=np.uint8)
-                    next_view, stats = interpolate_spherical_sector_pass(
-                        current_view,
-                        extension_radius=int(args.interpolate),
-                        cone_half_angle_deg=float(args.cone_half_angle),
-                        interpolate_min_radius=float(args.interpolate_min_radius),
-                    )
-                    view_volumes_by_model[model_name][view.name][:] = next_view
-                    view_volumes_by_model[model_name][view.name].flush()
-                    model_record[view.name] = stats
-                pass_record["models"][model_name] = model_record
-
-            interpolation_stats.append(pass_record)
-
-            if args.troubleshooting and pass_idx < total_passes:
-                print(f"\n=== Writing troubleshooting outputs: pass {pass_idx} ===")
-                current_output_mm = assemble_current_output_volume(
-                    out_path=current_output_path,
-                    view_volumes_by_model=view_volumes_by_model,
-                    T=T,
-                    H=H,
-                    W=W,
-                    disable_multiplanar=bool(args.disable_multiplanar),
-                    min_radius=float(args.min_radius),
-                )
-                write_result_set(
-                    volume_rgb=volume_rgb,
-                    mask_u8=np.asarray(current_output_mm, dtype=np.uint8),
-                    out_dir=out_dir,
-                    stem=input_path.stem,
-                    fps=fps,
-                    save_binary=bool(args.save_binary),
-                    save_labels=bool(args.save_labels),
-                    save_nrrd=bool(args.save_nrrd),
-                    tag=f"Pass{pass_idx}",
-                )
-    else:
-        interpolation_stats.append(
-            {
-                "pass_index": 0,
-                "models": {},
-                "skipped": True,
-            }
-        )
-
-    (temp_dir / "interpolation_stats.json").write_text(json.dumps(interpolation_stats, indent=2))
-
-    # Final current output = union current per-view/per-model volumes -> 3D void fill -> min_radius
-    current_output_mm = assemble_current_output_volume(
-        out_path=current_output_path,
-        view_volumes_by_model=view_volumes_by_model,
-        T=T,
-        H=H,
-        W=W,
-        disable_multiplanar=bool(args.disable_multiplanar),
-        min_radius=float(args.min_radius),
-    )
-
-    final_paths = write_result_set(
-        volume_rgb=volume_rgb,
-        mask_u8=np.asarray(current_output_mm, dtype=np.uint8),
+    voxel_volume = int(np.count_nonzero(ensemble_u8)) if bool(args.voxel_volume) else None
+    summary_path = write_summary_file(
+        out_dir / f"{input_path.stem}_Summary.txt",
+        command=shlex.join([str(x) for x in sys.argv]),
+        input_path=input_path,
         out_dir=out_dir,
-        stem=input_path.stem,
+        volume_shape=(T, H, W),
         fps=fps,
-        save_binary=bool(args.save_binary),
-        save_labels=bool(args.save_labels),
-        save_nrrd=bool(args.save_nrrd),
-        tag=None,
+        model_paths=model_paths,
+        view_names=[v.name for v in views],
+        interpolation_stats=interpolation_stats,
+        voxel_volume=voxel_volume,
+        final_paths=final_paths,
     )
-
-    if args.voxel_volume:
-        count = int(np.sum(np.asarray(current_output_mm, dtype=np.uint8)))
-        write_voxel_volume_marker(out_dir, count)
 
     if not args.troubleshooting:
         for child in list(temp_dir.iterdir()):
@@ -3927,6 +3329,7 @@ def main() -> None:
     print("\nDone.")
     print(f"Output dir: {out_dir}")
     print(f"Final overlay: {final_paths['overlay']}")
+    print(f"Summary: {summary_path}")
 
 
 if __name__ == "__main__":
