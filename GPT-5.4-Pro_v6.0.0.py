@@ -2,15 +2,14 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large video volumes.
 
-This v5.0.1-compliant script:
-  - builds transverse, sagittal and coronal views (unless --disable_multiplanar)
+This v6.0.0-compliant script:
+  - builds transverse, sagittal, coronal and optional radial view families
   - generates rotated / scaled / shifted FFV1 MKV augmentations via a single affine transform per variant
   - runs Ultralytics YOLO segmentation sequentially on the pre-generated augmentation videos
-  - stores per-augmentation traces to disk, undoes the affine transforms and unions masks per slice
-  - tracks native per-pixel max confidence so --min_conf is applied per connected 2D union rather than per whole slice
-  - interpolates each view volume independently with a streamed slice-graph endpoint search
-  - unions the final per-view / per-model volumes, fills enclosed 3D voids with a streamed boundary-background pass, optionally filters small transverse-plane components via --min_radius
-  - writes the final transverse overlay video plus optional multiplanar overlays, YOLO labels, binary TIFF/MKV outputs, NRRD, and a summary text file
+  - stores per-augmentation traces to disk, undoes the affine transforms, unions masks per slice and tracks per-pixel max confidence for --min_conf
+  - fills 2D holes after per-frame unions, interpolates only Cartesian view volumes, and unions final per-view / per-model volumes including optional radial backprojection
+  - fills enclosed 3D voids with a streamed boundary-background pass, optionally filters small transverse-plane components via --min_radius
+  - prefers RAM/ZRAM-backed scratch storage for the heaviest temporary volumes while preserving the existing troubleshooting outputs and final summary file
 
 Dependencies (Python):
   pip install opencv-python numpy scipy scikit-image tifffile tqdm ultralytics
@@ -25,11 +24,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
@@ -106,7 +107,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--model", required=True, nargs="+", type=str, help="One or more YOLO segmentation model paths")
 
     p.add_argument("--disable_multiplanar", action="store_true",
-                   help="Only use Transverse view (skip Sagittal/Coronal)")
+                   help="Only use Transverse view for Cartesian augmentation (skip Sagittal/Coronal)")
+    p.add_argument("--azimuth_angle", default=0.0, type=float,
+                   help="Angular spacing in degrees for radial diameter slices over [0,180). 0 disables radial views")
     p.add_argument("--angle", default="0,120,240", type=str,
                    help="Rotation angles in degrees for augmentation (comma/space separated)")
     p.add_argument("--imgsz", default=1536, type=int, help="Square input size for YOLO predict")
@@ -132,11 +135,15 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--binary", action="store_true", dest="voxel_volume", help=argparse.SUPPRESS)
     p.add_argument("--troubleshooting", action="store_true",
                    help="Keep temp files and save pass snapshots before each interpolation pass")
+    p.add_argument("--scratch_dir", default=None, type=str,
+                   help="Optional scratch/temp root. Defaults to a RAM-first auto-selected location such as /dev/shm when available")
 
     p.add_argument("--interpolate", default=15, type=int,
                    help="Maximum slice-distance used to search for interpolation candidates. 0 disables interpolation")
     p.add_argument("--interpolation_walk_back", default=3, type=int,
                    help="Additional source slices to bridge before the endpoint slice. 0 disables walk-back bridges")
+    p.add_argument("--interpolation_candidates", default=1, type=int,
+                   help="Accept up to the Nth nearest interpolation candidate per endpoint projection")
     p.add_argument("--interpolate_passes", default=1, type=int,
                    help="Run the interpolation process this many passes, treating the previous pass as real")
     p.add_argument("--interpolate_min_radius", default=3, type=float,
@@ -145,6 +152,93 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Projection growth angle in degrees. Must be greater than -90 and less than 90")
     p.add_argument("--cone_half_angle", dest="interpolation_search_angle", type=float, help=argparse.SUPPRESS)
     return p
+
+
+# --------------------------
+# Scratch / temp layout
+# --------------------------
+
+def _path_free_bytes(path: Path) -> int:
+    try:
+        usage = shutil.disk_usage(str(path))
+        return int(usage.free)
+    except Exception:
+        return 0
+
+
+def choose_scratch_dir(preferred: Optional[str], out_dir: Path, stem: str) -> Path:
+    """Pick a RAM/ZRAM-first scratch root, falling back to the output directory."""
+    candidates: List[Path] = []
+    seen: set[str] = set()
+
+    def _add_candidate(p: Path) -> None:
+        key = str(p)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(p)
+
+    if preferred:
+        _add_candidate(Path(preferred).expanduser())
+    env_pref = os.environ.get('YOLO_TTA_SCRATCH_DIR', '').strip()
+    if env_pref:
+        _add_candidate(Path(env_pref).expanduser())
+
+    for raw in ('/dev/shm', '/run/shm', tempfile.gettempdir()):
+        _add_candidate(Path(raw))
+
+    _add_candidate(out_dir)
+
+    chosen_root: Optional[Path] = None
+    for cand in candidates:
+        try:
+            cand = cand.resolve()
+        except Exception:
+            cand = cand
+        if cand.exists() and os.access(str(cand), os.W_OK):
+            chosen_root = cand
+            break
+
+    if chosen_root is None:
+        chosen_root = out_dir
+
+    if chosen_root == out_dir:
+        scratch_dir = out_dir / 'temp'
+    else:
+        scratch_dir = chosen_root / f'{stem}_{os.getpid()}_temp'
+
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    return scratch_dir
+
+
+def expose_scratch_in_output(out_dir: Path, scratch_dir: Path) -> Path:
+    """Expose the active scratch directory from the output tree when possible."""
+    temp_entry = out_dir / 'temp'
+    try:
+        if temp_entry.exists() or temp_entry.is_symlink():
+            if temp_entry.is_symlink() or temp_entry.is_file():
+                temp_entry.unlink(missing_ok=True)
+            elif temp_entry.resolve() != scratch_dir.resolve():
+                shutil.rmtree(temp_entry, ignore_errors=True)
+    except Exception:
+        pass
+
+    try:
+        if temp_entry.resolve() == scratch_dir.resolve():
+            return temp_entry
+    except Exception:
+        pass
+
+    if temp_entry.exists() or temp_entry.is_symlink():
+        return temp_entry
+
+    try:
+        os.symlink(str(scratch_dir), str(temp_entry), target_is_directory=True)
+        return temp_entry
+    except Exception:
+        temp_entry.mkdir(parents=True, exist_ok=True)
+        (temp_entry / 'SCRATCH_LOCATION.txt').write_text(str(scratch_dir) + '\n')
+        return temp_entry
 
 
 # --------------------------
@@ -452,16 +546,161 @@ class ViewInfo:
     src_h: int
     src_w: int
     pad_mode: str  # 'clamp' or 'pad'
+    family: str = 'orthogonal'
+    azimuths_deg: Tuple[float, ...] = ()
+    diameter: int = 0
+    center_x: float = 0.0
+    center_y: float = 0.0
+    roi_radius: float = 0.0
+    full_h: int = 0
+    full_w: int = 0
 
 
-def get_view_infos(T: int, H: int, W: int, disable_multiplanar: bool) -> List[ViewInfo]:
+def build_radial_azimuths(azimuth_angle: float) -> List[float]:
+    if float(azimuth_angle) <= 0.0:
+        return []
+    out: List[float] = []
+    a = 0.0
+    step = float(azimuth_angle)
+    while a < 180.0 - 1e-9:
+        out.append(float(a))
+        a += step
+    if not out:
+        out.append(0.0)
+    return out
+
+
+def get_view_infos(
+    T: int,
+    H: int,
+    W: int,
+    disable_multiplanar: bool,
+    azimuth_angle: float = 0.0,
+    include_radial: bool = True,
+) -> List[ViewInfo]:
     views = [
-        ViewInfo(name="transverse", num_slices=T, src_h=H, src_w=W, pad_mode="clamp"),
+        ViewInfo(name='transverse', num_slices=T, src_h=H, src_w=W, pad_mode='clamp', family='orthogonal', full_h=H, full_w=W),
     ]
     if not disable_multiplanar:
-        views.append(ViewInfo(name="sagittal", num_slices=H, src_h=T, src_w=W, pad_mode="pad"))
-        views.append(ViewInfo(name="coronal", num_slices=W, src_h=T, src_w=H, pad_mode="pad"))
+        views.append(ViewInfo(name='sagittal', num_slices=H, src_h=T, src_w=W, pad_mode='pad', family='orthogonal', full_h=H, full_w=W))
+        views.append(ViewInfo(name='coronal', num_slices=W, src_h=T, src_w=H, pad_mode='pad', family='orthogonal', full_h=H, full_w=W))
+
+    if include_radial and float(azimuth_angle) > 0.0:
+        azimuths = tuple(build_radial_azimuths(float(azimuth_angle)))
+        diameter = int(min(W, H))
+        roi_radius = float(max(0.0, (diameter - 1) / 2.0))
+        views.append(
+            ViewInfo(
+                name='radial',
+                num_slices=len(azimuths),
+                src_h=T,
+                src_w=diameter,
+                pad_mode='pad',
+                family='radial',
+                azimuths_deg=azimuths,
+                diameter=diameter,
+                center_x=float((W - 1) / 2.0),
+                center_y=float((H - 1) / 2.0),
+                roi_radius=roi_radius,
+                full_h=H,
+                full_w=W,
+            )
+        )
     return views
+
+
+def orthogonal_views_only(views: Sequence[ViewInfo]) -> List[ViewInfo]:
+    return [v for v in views if v.family == 'orthogonal']
+
+
+@dataclass(frozen=True)
+class RadialSampler:
+    angle_deg: float
+    diameter: int
+    x_idx: np.ndarray
+    y_idx: np.ndarray
+    x_w: np.ndarray
+    y_w: np.ndarray
+    nn_x: np.ndarray
+    nn_y: np.ndarray
+
+
+_RADIAL_SAMPLER_CACHE: Dict[Tuple[int, int, int, float], RadialSampler] = {}
+
+
+def _lanczos_kernel(x: np.ndarray, a: int = 5) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    out = np.sinc(x) * np.sinc(x / float(a))
+    out[np.abs(x) >= float(a)] = 0.0
+    return out.astype(np.float32, copy=False)
+
+
+def get_radial_sampler(view: ViewInfo, angle_deg: float) -> RadialSampler:
+    if view.family != 'radial':
+        raise ValueError('Radial sampler requested for a non-radial view')
+
+    key = (int(view.full_w), int(view.full_h), int(view.diameter), round(float(angle_deg), 6))
+    cached = _RADIAL_SAMPLER_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    diameter = int(view.diameter)
+    coords = np.linspace(-float(view.roi_radius), float(view.roi_radius), diameter, dtype=np.float32)
+    theta = math.radians(float(angle_deg))
+    xs = np.asarray(float(view.center_x) + coords * math.cos(theta), dtype=np.float32)
+    ys = np.asarray(float(view.center_y) + coords * math.sin(theta), dtype=np.float32)
+
+    offsets = np.arange(-4, 6, dtype=np.int32)
+    x0 = np.floor(xs).astype(np.int32, copy=False)
+    y0 = np.floor(ys).astype(np.int32, copy=False)
+
+    x_idx_raw = x0[:, None] + offsets[None, :]
+    y_idx_raw = y0[:, None] + offsets[None, :]
+
+    x_w = _lanczos_kernel(xs[:, None] - x_idx_raw, a=5)
+    y_w = _lanczos_kernel(ys[:, None] - y_idx_raw, a=5)
+
+    x_valid = (x_idx_raw >= 0) & (x_idx_raw < int(view.full_w))
+    y_valid = (y_idx_raw >= 0) & (y_idx_raw < int(view.full_h))
+    x_w *= x_valid.astype(np.float32, copy=False)
+    y_w *= y_valid.astype(np.float32, copy=False)
+
+    x_idx = np.clip(x_idx_raw, 0, int(view.full_w) - 1).astype(np.int32, copy=False)
+    y_idx = np.clip(y_idx_raw, 0, int(view.full_h) - 1).astype(np.int32, copy=False)
+
+    sampler = RadialSampler(
+        angle_deg=float(angle_deg),
+        diameter=diameter,
+        x_idx=x_idx,
+        y_idx=y_idx,
+        x_w=x_w.astype(np.float32, copy=False),
+        y_w=y_w.astype(np.float32, copy=False),
+        nn_x=np.clip(np.rint(xs).astype(np.int32, copy=False), 0, int(view.full_w) - 1),
+        nn_y=np.clip(np.rint(ys).astype(np.int32, copy=False), 0, int(view.full_h) - 1),
+    )
+    _RADIAL_SAMPLER_CACHE[key] = sampler
+    return sampler
+
+
+def sample_radial_line_rgb_lanczos5(frame_rgb: np.ndarray, sampler: RadialSampler) -> np.ndarray:
+    if frame_rgb.ndim != 3 or frame_rgb.shape[2] != 3:
+        raise ValueError('Expected frame_rgb with shape (H,W,3)')
+
+    out = np.zeros((sampler.diameter, 3), dtype=np.float32)
+    for yi in range(sampler.y_idx.shape[1]):
+        samples = frame_rgb[sampler.y_idx[:, yi][:, None], sampler.x_idx, :].astype(np.float32, copy=False)
+        row = np.sum(samples * sampler.x_w[:, :, None], axis=1)
+        out += row * sampler.y_w[:, yi][:, None]
+
+    return np.clip(np.rint(out), 0.0, 255.0).astype(np.uint8)
+
+
+def extract_radial_slice_frame(volume_rgb: np.memmap, sampler: RadialSampler) -> np.ndarray:
+    t_dim = int(volume_rgb.shape[0])
+    out = np.empty((t_dim, sampler.diameter, 3), dtype=np.uint8)
+    for t in range(t_dim):
+        out[t, :, :] = sample_radial_line_rgb_lanczos5(np.asarray(volume_rgb[t]), sampler)
+    return out
 
 
 def iter_view_frames(volume_rgb: np.memmap, view: ViewInfo) -> Iterator[np.ndarray]:
@@ -469,17 +708,21 @@ def iter_view_frames(volume_rgb: np.memmap, view: ViewInfo) -> Iterator[np.ndarr
     T, H, W, C = volume_rgb.shape
     assert C == 3
 
-    if view.name == "transverse":
+    if view.name == 'transverse':
         for t in range(T):
             yield np.asarray(volume_rgb[t])  # (H,W,3)
-    elif view.name == "sagittal":
+    elif view.name == 'sagittal':
         for y in range(H):
             yield np.ascontiguousarray(volume_rgb[:, y, :, :])  # (T,W,3)
-    elif view.name == "coronal":
+    elif view.name == 'coronal':
         for x in range(W):
             yield np.ascontiguousarray(volume_rgb[:, :, x, :])  # (T,H,3)
+    elif view.name == 'radial':
+        for angle_deg in view.azimuths_deg:
+            sampler = get_radial_sampler(view, float(angle_deg))
+            yield np.ascontiguousarray(extract_radial_slice_frame(volume_rgb, sampler))  # (T,D,3)
     else:
-        raise ValueError(f"Unknown view: {view.name}")
+        raise ValueError(f'Unknown view: {view.name}')
 
 
 # --------------------------
@@ -551,7 +794,7 @@ def predict_video_and_accumulate(
     M_out_to_native: np.ndarray,       # 2x3, maps augmented(out)->native for cv2.warpAffine (src->dst)
     native_h: int,
     native_w: int,
-) -> None:
+) -> Dict[str, int]:
     """
     Run YOLO predict(stream=True) on a pre-generated augmented video, store a lightweight
     per-augmentation trace to disk, and accumulate the inverse-transformed native masks.
@@ -580,8 +823,9 @@ def predict_video_and_accumulate(
         mode='w+',
         shape=(num_frames,),
     )
-    pred_mask_mm[:] = 0
-    pred_conf_mm[:] = 0
+
+    prediction_count = 0
+    frames_with_predictions = 0
 
     results = model.predict(
         source=str(video_path),
@@ -622,6 +866,9 @@ def predict_video_and_accumulate(
             pred_mask_mm[idx, :] = pack_mask(frame_union)
             pred_conf_mm[idx] = np.float16(0.0)
             continue
+
+        prediction_count += int(num_inst)
+        frames_with_predictions += 1
 
         if getattr(r, 'boxes', None) is not None and r.boxes is not None and getattr(r.boxes, 'conf', None) is not None:
             try:
@@ -686,6 +933,8 @@ def predict_video_and_accumulate(
         'num_frames': int(num_frames),
         'out_size': int(out_size),
         'mask_packbits_bytes': int(out_bytes),
+        'prediction_count': int(prediction_count),
+        'frames_with_predictions': int(frames_with_predictions),
         'cfg': {
             'imgsz': int(cfg.imgsz),
             'conf': float(cfg.conf),
@@ -695,6 +944,10 @@ def predict_video_and_accumulate(
         },
     }
     pred_out_prefix.with_suffix('.meta.json').write_text(json.dumps(meta, indent=2))
+    return {
+        'prediction_count': int(prediction_count),
+        'frames_with_predictions': int(frames_with_predictions),
+    }
 
 
 # --------------------------
@@ -818,6 +1071,7 @@ def assemble_model_volume_into_ensemble(
       - transverse: slices along t, each slice is HxW
       - sagittal: slices along y, each slice is T x W, mapped into ensemble[:, y, :]
       - coronal: slices along x, each slice is T x H, mapped into ensemble[:, :, x]
+      - radial: optional already-backprojected (T,H,W) volume
     """
     transverse = view_union_mms["transverse"]
     bytes_xy = bytes_for_packbits(H, W)
@@ -827,24 +1081,28 @@ def assemble_model_volume_into_ensemble(
         m = unpack_mask(np.asarray(transverse[t]), H, W)
         ensemble_mm[t, :, :] |= m
 
-    if disable_multiplanar:
-        return
+    if not disable_multiplanar and "sagittal" in view_union_mms:
+        sagittal = view_union_mms["sagittal"]
+        bytes_tx = bytes_for_packbits(T, W)
+        assert sagittal.shape == (H, bytes_tx)
 
-    sagittal = view_union_mms["sagittal"]
-    bytes_tx = bytes_for_packbits(T, W)
-    assert sagittal.shape == (H, bytes_tx)
+        for y in tqdm(range(H), desc="Assembling volume from sagittal"):
+            m = unpack_mask(np.asarray(sagittal[y]), T, W)
+            ensemble_mm[:, y, :] |= m
 
-    for y in tqdm(range(H), desc="Assembling volume from sagittal"):
-        m = unpack_mask(np.asarray(sagittal[y]), T, W)
-        ensemble_mm[:, y, :] |= m
+    if not disable_multiplanar and "coronal" in view_union_mms:
+        coronal = view_union_mms["coronal"]
+        bytes_ty = bytes_for_packbits(T, H)
+        assert coronal.shape == (W, bytes_ty)
 
-    coronal = view_union_mms["coronal"]
-    bytes_ty = bytes_for_packbits(T, H)
-    assert coronal.shape == (W, bytes_ty)
+        for x in tqdm(range(W), desc="Assembling volume from coronal"):
+            m = unpack_mask(np.asarray(coronal[x]), T, H)  # (T,H) cols are y
+            ensemble_mm[:, :, x] |= m
 
-    for x in tqdm(range(W), desc="Assembling volume from coronal"):
-        m = unpack_mask(np.asarray(coronal[x]), T, H)  # (T,H) cols are y
-        ensemble_mm[:, :, x] |= m
+    if "radial" in view_union_mms:
+        radial = np.asarray(view_union_mms["radial"])
+        assert radial.shape == (T, H, W)
+        ensemble_mm[:, :, :] |= radial
 
 
 class _UnionFind:
@@ -1060,7 +1318,6 @@ def label_foreground_volume_streaming(
     root_map = uf.root_map()
     if root_map.shape[0] <= 1:
         compact_mm = np.memmap(compact_path, dtype=np.uint32, mode='w+', shape=(z_dim, h, w))
-        compact_mm[:] = 0
         compact_mm.flush()
         del provisional_mm
         if not keep_temp:
@@ -1244,6 +1501,38 @@ def unpack_view_union_to_volume(
     return vol_mm
 
 
+def backproject_radial_union_to_volume(
+    union_mm: np.memmap,
+    radial_view: ViewInfo,
+    out_path: Path,
+    desc: str,
+) -> np.memmap:
+    if radial_view.family != 'radial':
+        raise ValueError('backproject_radial_union_to_volume expects a radial view')
+
+    t_dim = int(radial_view.src_h)
+    out_h = int(radial_view.full_h)
+    out_w = int(radial_view.full_w)
+    diameter = int(radial_view.src_w)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    vol_mm = np.memmap(out_path, dtype=np.uint8, mode='w+', shape=(t_dim, out_h, out_w))
+
+    for angle_idx, angle_deg in enumerate(tqdm(radial_view.azimuths_deg, desc=desc)):
+        packed = np.asarray(union_mm[angle_idx])
+        if not any_mask(packed):
+            continue
+        radial_mask = unpack_mask(packed, t_dim, diameter).astype(bool, copy=False)
+        tt, uu = np.nonzero(radial_mask)
+        if tt.size == 0:
+            continue
+        sampler = get_radial_sampler(radial_view, float(angle_deg))
+        vol_mm[tt, sampler.nn_y[uu], sampler.nn_x[uu]] = 1
+
+    vol_mm.flush()
+    return vol_mm
+
+
 def apply_transverse_min_radius_filter(mask_u8: np.ndarray, min_radius: float) -> np.ndarray:
     """Remove 2D connected components whose transverse-plane radius is smaller than ``min_radius``."""
     if float(min_radius) <= 0:
@@ -1288,18 +1577,22 @@ def assemble_model_volume_from_view_volumes(
     assert transverse.shape == (T, H, W)
     ensemble_mm[:, :, :] |= transverse
 
-    if disable_multiplanar:
-        return
+    if not disable_multiplanar and "sagittal" in view_volume_mms:
+        sagittal = np.asarray(view_volume_mms["sagittal"])
+        assert sagittal.shape == (H, T, W)
+        for y in tqdm(range(H), desc="Assembling volume from sagittal view volume"):
+            ensemble_mm[:, y, :] |= sagittal[y, :, :]
 
-    sagittal = np.asarray(view_volume_mms["sagittal"])
-    assert sagittal.shape == (H, T, W)
-    for y in tqdm(range(H), desc="Assembling volume from sagittal view volume"):
-        ensemble_mm[:, y, :] |= sagittal[y, :, :]
+    if not disable_multiplanar and "coronal" in view_volume_mms:
+        coronal = np.asarray(view_volume_mms["coronal"])
+        assert coronal.shape == (W, T, H)
+        for x in tqdm(range(W), desc="Assembling volume from coronal view volume"):
+            ensemble_mm[:, :, x] |= coronal[x, :, :]
 
-    coronal = np.asarray(view_volume_mms["coronal"])
-    assert coronal.shape == (W, T, H)
-    for x in tqdm(range(W), desc="Assembling volume from coronal view volume"):
-        ensemble_mm[:, :, x] |= coronal[x, :, :]
+    if "radial" in view_volume_mms:
+        radial = np.asarray(view_volume_mms["radial"])
+        assert radial.shape == (T, H, W)
+        ensemble_mm[:, :, :] |= radial
 
 
 def assemble_current_ensemble_volume(
@@ -1312,8 +1605,6 @@ def assemble_current_ensemble_volume(
 ) -> np.memmap:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     ensemble_mm = np.memmap(out_path, dtype=np.uint8, mode="w+", shape=(T, H, W))
-    ensemble_mm[:] = 0
-    ensemble_mm.flush()
 
     for model_name in sorted(view_volumes_by_model.keys()):
         print(f"\n=== Assembling model into ensemble volume: {model_name} ===")
@@ -2685,14 +2976,76 @@ def _build_slice_endpoint_seeds(
     return seeds, int(len(seeds))
 
 
-def _find_slice_projection_candidate(
+def _find_slice_projection_candidates(
     labels_real: np.ndarray,
     seed: SliceEndpointSeed,
     max_slice_distance: int,
     search_angle_deg: float,
-) -> Optional[SliceProjectionCandidate]:
-    if int(max_slice_distance) <= 0:
-        return None
+    max_candidates: int,
+) -> List[SliceProjectionCandidate]:
+    if int(max_slice_distance) <= 0 or int(max_candidates) <= 0:
+        return []
+
+    s0, y0, x0 = seed.point
+    source_component, source_anchor = _component_mask_and_anchor(labels_real[s0] == int(seed.label), (y0, x0))
+    if source_anchor is None or not np.any(source_component):
+        return []
+
+    sdf = _signed_distance_2d(source_component)
+    slope = math.tan(math.radians(float(search_angle_deg)))
+    num_slices = labels_real.shape[0]
+    found: Dict[int, SliceProjectionCandidate] = {}
+
+    for step in range(1, int(max_slice_distance) + 1):
+        s = int(s0 + int(seed.direction_sign) * step)
+        if s < 0 or s >= num_slices:
+            break
+
+        threshold = -float(slope) * float(step)
+        projection = sdf >= threshold
+        if not np.any(projection):
+            if float(search_angle_deg) < 0.0:
+                break
+            continue
+
+        labels2d = labels_real[s]
+        overlap = projection & (labels2d > 0) & (labels2d != int(seed.label))
+        if not np.any(overlap):
+            continue
+
+        ys, xs = np.nonzero(overlap)
+        lbls = labels2d[ys, xs].astype(np.int64, copy=False)
+        for target_label in np.unique(lbls):
+            target_label_i = int(target_label)
+            if target_label_i <= 0 or target_label_i == int(seed.label) or target_label_i in found:
+                continue
+            use = lbls == target_label_i
+            ys_t = ys[use]
+            xs_t = xs[use]
+            if ys_t.size == 0:
+                continue
+            d2 = (ys_t.astype(np.int64) - int(source_anchor[0])) ** 2 + (xs_t.astype(np.int64) - int(source_anchor[1])) ** 2
+            idx = int(np.argmin(d2))
+            found[target_label_i] = SliceProjectionCandidate(
+                source_label=int(seed.label),
+                target_label=target_label_i,
+                source_point=(int(s0), int(y0), int(x0)),
+                target_point=(int(s), int(ys_t[idx]), int(xs_t[idx])),
+                slice_distance=int(step),
+            )
+
+        if len(found) >= int(max_candidates):
+            break
+
+    ordered = sorted(
+        found.values(),
+        key=lambda c: (
+            int(c.slice_distance),
+            (int(c.target_point[1]) - int(source_anchor[0])) ** 2 + (int(c.target_point[2]) - int(source_anchor[1])) ** 2,
+            int(c.target_label),
+        ),
+    )
+    return ordered[: int(max_candidates)]
 
     s0, y0, x0 = seed.point
     source_component, source_anchor = _component_mask_and_anchor(labels_real[s0] == int(seed.label), (y0, x0))
@@ -2851,6 +3204,7 @@ def interpolate_view_volume_pass_inplace(
     max_slice_distance: int,
     search_angle_deg: float,
     interpolation_walk_back: int,
+    interpolation_candidates: int,
     interpolate_min_radius: float,
     keep_temp: bool = False,
 ) -> Dict[str, object]:
@@ -2936,59 +3290,61 @@ def interpolate_view_volume_pass_inplace(
     added_voxels = 0
 
     for seed in seeds:
-        candidate = _find_slice_projection_candidate(
+        candidates = _find_slice_projection_candidates(
             labels_real=labels_mm,
             seed=seed,
             max_slice_distance=int(max_slice_distance),
             search_angle_deg=float(search_angle_deg),
+            max_candidates=int(interpolation_candidates),
         )
-        if candidate is None:
+        if not candidates:
             continue
 
-        candidate_connections += 1
-        target_component, target_anchor = _component_mask_and_anchor(
-            labels_mm[candidate.target_point[0]] == int(candidate.target_label),
-            (candidate.target_point[1], candidate.target_point[2]),
-        )
-        target_radius = _component_max_radius(target_component) if target_anchor is not None else 0.0
-
-        source_points = [candidate.source_point] + _collect_walkback_source_points(
-            labels_real=labels_mm,
-            label=int(candidate.source_label),
-            start_point=candidate.source_point,
-            direction_sign=int(seed.direction_sign),
-            walk_back=int(interpolation_walk_back),
-        )
-
-        accepted_this_candidate = False
-        for walk_idx, src_point in enumerate(source_points):
-            source_component, source_anchor = _component_mask_and_anchor(
-                labels_mm[src_point[0]] == int(candidate.source_label),
-                (src_point[1], src_point[2]),
+        for candidate in candidates:
+            candidate_connections += 1
+            target_component, target_anchor = _component_mask_and_anchor(
+                labels_mm[candidate.target_point[0]] == int(candidate.target_label),
+                (candidate.target_point[1], candidate.target_point[2]),
             )
-            source_radius = _component_max_radius(source_component) if source_anchor is not None else 0.0
-            bridge_radius = min(float(source_radius), float(target_radius))
-            if bridge_radius <= float(interpolate_min_radius):
-                skipped_by_min_radius += 1
-                continue
+            target_radius = _component_max_radius(target_component) if target_anchor is not None else 0.0
 
-            if walk_idx == 0:
-                default_bridges += 1
-            else:
-                walk_back_bridges += 1
-
-            if not accepted_this_candidate:
-                accepted_connections += 1
-                accepted_this_candidate = True
-
-            added_voxels += _paint_linear_slice_bridge(
-                bridge_volume=bridge_mm,
+            source_points = [candidate.source_point] + _collect_walkback_source_points(
                 labels_real=labels_mm,
-                source_label=int(candidate.source_label),
-                target_label=int(candidate.target_label),
-                source_point=src_point,
-                target_point=candidate.target_point,
+                label=int(candidate.source_label),
+                start_point=candidate.source_point,
+                direction_sign=int(seed.direction_sign),
+                walk_back=int(interpolation_walk_back),
             )
+
+            accepted_this_candidate = False
+            for walk_idx, src_point in enumerate(source_points):
+                source_component, source_anchor = _component_mask_and_anchor(
+                    labels_mm[src_point[0]] == int(candidate.source_label),
+                    (src_point[1], src_point[2]),
+                )
+                source_radius = _component_max_radius(source_component) if source_anchor is not None else 0.0
+                bridge_radius = min(float(source_radius), float(target_radius))
+                if bridge_radius <= float(interpolate_min_radius):
+                    skipped_by_min_radius += 1
+                    continue
+
+                if walk_idx == 0:
+                    default_bridges += 1
+                else:
+                    walk_back_bridges += 1
+
+                if not accepted_this_candidate:
+                    accepted_connections += 1
+                    accepted_this_candidate = True
+
+                added_voxels += _paint_linear_slice_bridge(
+                    bridge_volume=bridge_mm,
+                    labels_real=labels_mm,
+                    source_label=int(candidate.source_label),
+                    target_label=int(candidate.target_label),
+                    source_point=src_point,
+                    target_point=candidate.target_point,
+                )
 
     for z in tqdm(range(mask_mm.shape[0]), desc='Interpolation: merge bridges'):
         bridge_slice = np.asarray(bridge_mm[z])
@@ -3546,7 +3902,7 @@ def write_multiplanar_outputs(
     tag: Optional[str] = None,
 ) -> Dict[str, Path]:
     t_dim, h_dim, w_dim = mask_u8.shape
-    views = {v.name: v for v in get_view_infos(t_dim, h_dim, w_dim, disable_multiplanar=False)}
+    views = {v.name: v for v in get_view_infos(t_dim, h_dim, w_dim, disable_multiplanar=False, azimuth_angle=0.0, include_radial=False)}
     result_paths: Dict[str, Path] = {}
     for view_name in ('sagittal', 'coronal'):
         result_paths.update(write_additional_view_outputs(
@@ -3569,10 +3925,12 @@ def write_summary_file(
     command: str,
     input_path: Path,
     out_dir: Path,
+    scratch_dir: Path,
     volume_shape: Tuple[int, int, int],
     fps: float,
     model_paths: Sequence[str],
     view_names: Sequence[str],
+    view_prediction_stats: Dict[str, int],
     interpolation_stats: List[Dict[str, object]],
     voxel_volume: Optional[int],
     final_paths: Dict[str, Path],
@@ -3583,8 +3941,18 @@ def write_summary_file(
     lines.append(f'Output directory: {out_dir}')
     lines.append(f'Volume shape (t, Y, X): {volume_shape}')
     lines.append(f'FPS: {fps}')
+    lines.append(f'Scratch directory: {scratch_dir}')
     lines.append(f'Models: {", ".join(str(Path(m)) for m in model_paths)}')
     lines.append(f'Views: {", ".join(view_names)}')
+
+    lines.append('')
+    lines.append('View statistics:')
+    total_prediction_count = 0
+    for view_key in ('transverse', 'sagittal', 'coronal', 'radial'):
+        count = int(view_prediction_stats.get(view_key, 0))
+        total_prediction_count += count
+        lines.append(f'  {view_key.capitalize()}: predictions={count}')
+    lines.append(f'  Total prediction count: {int(total_prediction_count)}')
 
     if interpolation_stats:
         lines.append('')
@@ -3647,7 +4015,7 @@ def main() -> None:
 
     model_paths = _parse_models(args.model)
     if not model_paths:
-        raise ValueError("--model must specify at least one model path")
+        raise ValueError('--model must specify at least one model path')
     for m in model_paths:
         if not Path(m).expanduser().exists():
             raise FileNotFoundError(m)
@@ -3655,33 +4023,37 @@ def main() -> None:
     angles = _parse_angles(args.angle) or [0.0, 120.0, 240.0]
 
     if args.min_conf > 0 and args.min_conf < args.conf:
-        raise ValueError("--min_conf must be equal to or greater than --conf")
+        raise ValueError('--min_conf must be equal to or greater than --conf')
     if int(args.interpolate) < 0:
-        raise ValueError("--interpolate must be >= 0")
+        raise ValueError('--interpolate must be >= 0')
     if int(args.interpolation_walk_back) < 0:
-        raise ValueError("--interpolation_walk_back must be >= 0")
+        raise ValueError('--interpolation_walk_back must be >= 0')
+    if int(args.interpolation_candidates) < 1:
+        raise ValueError('--interpolation_candidates must be >= 1')
     if int(args.interpolate_passes) < 1:
-        raise ValueError("--interpolate_passes must be >= 1")
+        raise ValueError('--interpolate_passes must be >= 1')
     if float(args.interpolate_min_radius) < 0:
-        raise ValueError("--interpolate_min_radius must be >= 0")
+        raise ValueError('--interpolate_min_radius must be >= 0')
     if float(args.min_radius) < 0:
-        raise ValueError("--min_radius must be >= 0")
+        raise ValueError('--min_radius must be >= 0')
+    if float(args.azimuth_angle) < 0:
+        raise ValueError('--azimuth_angle must be >= 0')
     if not (-90.0 < float(args.interpolation_search_angle) < 90.0):
-        raise ValueError("--interpolation_search_angle must be greater than -90 and less than 90")
+        raise ValueError('--interpolation_search_angle must be greater than -90 and less than 90')
 
     out_dir = Path(args.output).expanduser().resolve() if args.output else (Path.cwd() / input_path.stem)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    temp_dir = out_dir / "temp"
-    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir = choose_scratch_dir(args.scratch_dir, out_dir, input_path.stem)
+    expose_scratch_in_output(out_dir, temp_dir)
 
     info = ffprobe_info(input_path)
-    W = int(info["width"])
-    H = int(info["height"])
-    T = int(info["num_frames"])
-    fps = float(info["fps"])
+    W = int(info['width'])
+    H = int(info['height'])
+    T = int(info['num_frames'])
+    fps = float(info['fps'])
 
-    vol_path = temp_dir / "input_volume.rgb24.dat"
+    vol_path = temp_dir / 'input_volume.rgb24.dat'
     volume_rgb = decode_video_to_memmap_rgb24(
         input_video=input_path,
         out_dat=vol_path,
@@ -3690,27 +4062,35 @@ def main() -> None:
         height=H,
         overwrite=False,
     )
-    (temp_dir / "input_volume.meta.json").write_text(
-        json.dumps({"shape": [T, H, W, 3], "dtype": "uint8", "fps": fps}, indent=2)
+    (temp_dir / 'input_volume.meta.json').write_text(
+        json.dumps({'shape': [T, H, W, 3], 'dtype': 'uint8', 'fps': fps}, indent=2)
     )
 
-    views = get_view_infos(T=T, H=H, W=W, disable_multiplanar=args.disable_multiplanar)
+    views = get_view_infos(
+        T=T,
+        H=H,
+        W=W,
+        disable_multiplanar=bool(args.disable_multiplanar),
+        azimuth_angle=float(args.azimuth_angle),
+        include_radial=True,
+    )
+    cartesian_views = orthogonal_views_only(views)
 
-    shifts: List[Tuple[int, int, str]] = [(0, 0, "none")]
+    shifts: List[Tuple[int, int, str]] = [(0, 0, 'none')]
     if int(args.shift) != 0:
         s = abs(int(args.shift))
         shifts = [
-            (0, 0, "none"),
-            (0, -s, "up"),
-            (0, +s, "down"),
-            (-s, 0, "left"),
-            (+s, 0, "right"),
+            (0, 0, 'none'),
+            (0, -s, 'up'),
+            (0, +s, 'down'),
+            (-s, 0, 'left'),
+            (+s, 0, 'right'),
         ]
 
     yolo_models: List[Tuple[str, object]] = []
     for m in model_paths:
         name = Path(m).stem
-        print(f"Loading model: {name} ({m})")
+        print(f'Loading model: {name} ({m})')
         yolo_models.append((name, load_ultralytics_model(m)))
 
     pred_cfg = PredictConfig(
@@ -3722,9 +4102,18 @@ def main() -> None:
     )
 
     view_volumes_by_model: Dict[str, Dict[str, np.memmap]] = {model_name: {} for model_name, _ in yolo_models}
+    view_prediction_stats: Dict[str, int] = {
+        'transverse': 0,
+        'sagittal': 0,
+        'coronal': 0,
+        'radial': 0,
+    }
 
     for view in views:
-        print(f"\n=== View: {view.name} ({view.src_w}x{view.src_h}, slices={view.num_slices}) ===")
+        extra = ''
+        if view.family == 'radial':
+            extra = f', azimuths={view.num_slices}'
+        print(f"\n=== View: {view.name} ({view.src_w}x{view.src_h}, slices={view.num_slices}{extra}) ===")
 
         union_by_model_view: Dict[str, np.memmap] = {}
         confmap_by_model_view: Dict[str, np.memmap] = {}
@@ -3738,11 +4127,7 @@ def main() -> None:
             union_path.parent.mkdir(parents=True, exist_ok=True)
 
             union_mm = np.memmap(union_path, dtype=np.uint8, mode='w+', shape=(view.num_slices, bytes_native))
-            union_mm[:] = 0
-            union_mm.flush()
-
             confmap_mm = np.memmap(confmap_path, dtype=np.float16, mode='w+', shape=(view.num_slices, view.src_h, view.src_w))
-            confmap_mm.flush()
 
             union_by_model_view[model_name] = union_mm
             confmap_by_model_view[model_name] = confmap_mm
@@ -3801,6 +4186,7 @@ def main() -> None:
                         json.dumps(
                             {
                                 'view': view.name,
+                                'family': view.family,
                                 'angle_deg': float(angle),
                                 'shift_dx': int(dx),
                                 'shift_dy': int(dy),
@@ -3822,7 +4208,7 @@ def main() -> None:
 
                 for model_name, yolo in yolo_models:
                     pred_prefix = temp_dir / 'preds' / model_name / view.name / f'{view.name}_{aug_id}'
-                    predict_video_and_accumulate(
+                    pred_stats = predict_video_and_accumulate(
                         model=yolo,
                         video_path=aug_video,
                         num_frames=view.num_slices,
@@ -3835,6 +4221,7 @@ def main() -> None:
                         native_h=view.src_h,
                         native_w=view.src_w,
                     )
+                    view_prediction_stats[view.name] = int(view_prediction_stats.get(view.name, 0)) + int(pred_stats.get('prediction_count', 0))
 
                 if not args.troubleshooting:
                     try:
@@ -3860,14 +4247,22 @@ def main() -> None:
             union_by_model_view[model_name].flush()
 
             out_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.u8.dat'
-            view_volumes_by_model[model_name][view.name] = unpack_view_union_to_volume(
-                union_mm=union_by_model_view[model_name],
-                num_slices=view.num_slices,
-                h=view.src_h,
-                w=view.src_w,
-                out_path=out_path,
-                desc=f'Unpacking {model_name}/{view.name}',
-            )
+            if view.family == 'radial':
+                view_volumes_by_model[model_name][view.name] = backproject_radial_union_to_volume(
+                    union_mm=union_by_model_view[model_name],
+                    radial_view=view,
+                    out_path=out_path,
+                    desc=f'Backprojecting {model_name}/{view.name}',
+                )
+            else:
+                view_volumes_by_model[model_name][view.name] = unpack_view_union_to_volume(
+                    union_mm=union_by_model_view[model_name],
+                    num_slices=view.num_slices,
+                    h=view.src_h,
+                    w=view.src_w,
+                    out_path=out_path,
+                    desc=f'Unpacking {model_name}/{view.name}',
+                )
 
             if not args.troubleshooting:
                 try:
@@ -3893,7 +4288,7 @@ def main() -> None:
             T=T,
             H=H,
             W=W,
-            disable_multiplanar=args.disable_multiplanar,
+            disable_multiplanar=bool(args.disable_multiplanar),
             out_path=temp_dir / f'{snapshot_stem}.u8.dat',
         )
         fill_3d_voids_inplace_streaming(
@@ -3939,11 +4334,12 @@ def main() -> None:
             print(
                 f"\n=== Interpolation pass {pass_idx}/{total_passes} "
                 f"(distance={int(args.interpolate)}, walk_back={int(args.interpolation_walk_back)}, "
+                f"candidates={int(args.interpolation_candidates)}, "
                 f"min_radius={float(args.interpolate_min_radius):g}, "
                 f"search_angle={float(args.interpolation_search_angle):g}) ==="
             )
             for model_name in sorted(view_volumes_by_model.keys()):
-                for view in views:
+                for view in cartesian_views:
                     print(f"\n--- Interpolating model '{model_name}' view '{view.name}' ---")
                     current_mm = view_volumes_by_model[model_name][view.name]
                     stats = interpolate_view_volume_pass_inplace(
@@ -3953,6 +4349,7 @@ def main() -> None:
                         max_slice_distance=int(args.interpolate),
                         search_angle_deg=float(args.interpolation_search_angle),
                         interpolation_walk_back=int(args.interpolation_walk_back),
+                        interpolation_candidates=int(args.interpolation_candidates),
                         interpolate_min_radius=float(args.interpolate_min_radius),
                         keep_temp=bool(args.troubleshooting),
                     )
@@ -3964,6 +4361,7 @@ def main() -> None:
                         'view': str(view.name),
                         'max_slice_distance': int(args.interpolate),
                         'interpolation_walk_back': int(args.interpolation_walk_back),
+                        'interpolation_candidates': int(args.interpolation_candidates),
                         'interpolation_search_angle': float(args.interpolation_search_angle),
                     })
                     interpolation_stats.append(stats)
@@ -3995,13 +4393,14 @@ def main() -> None:
                     ))
     else:
         for model_name in sorted(view_volumes_by_model.keys()):
-            for view in views:
+            for view in cartesian_views:
                 interpolation_stats.append({
                     'pass_index': 0,
                     'model': str(model_name),
                     'view': str(view.name),
                     'max_slice_distance': int(args.interpolate),
                     'interpolation_walk_back': int(args.interpolation_walk_back),
+                    'interpolation_candidates': int(args.interpolation_candidates),
                     'interpolation_search_angle': float(args.interpolation_search_angle),
                     'num_objects': 0,
                     'num_endpoints': 0,
@@ -4019,7 +4418,7 @@ def main() -> None:
         T=T,
         H=H,
         W=W,
-        disable_multiplanar=args.disable_multiplanar,
+        disable_multiplanar=bool(args.disable_multiplanar),
         out_path=temp_dir / 'ensemble_volume_final.u8.dat',
     )
 
@@ -4066,27 +4465,41 @@ def main() -> None:
         command=shlex.join([str(x) for x in sys.argv]),
         input_path=input_path,
         out_dir=out_dir,
+        scratch_dir=temp_dir,
         volume_shape=(T, H, W),
         fps=fps,
         model_paths=model_paths,
         view_names=[v.name for v in views],
+        view_prediction_stats=view_prediction_stats,
         interpolation_stats=interpolation_stats,
         voxel_volume=voxel_volume,
         final_paths=final_paths,
     )
 
     if not args.troubleshooting:
-        for child in list(temp_dir.iterdir()):
-            try:
-                if child.is_dir():
-                    shutil.rmtree(child, ignore_errors=True)
-                else:
-                    child.unlink(missing_ok=True)
-            except Exception:
-                pass
+        try:
+            for child in list(temp_dir.iterdir()):
+                try:
+                    if child.is_dir():
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        child.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if temp_dir != out_dir / 'temp':
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                temp_link = out_dir / 'temp'
+                if temp_link.is_symlink():
+                    temp_link.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     print('\nDone.')
     print(f'Output dir: {out_dir}')
+    print(f'Scratch dir: {temp_dir}')
     print(f"Final overlay: {final_paths['overlay']}")
     print(f'Summary: {summary_path}')
 
