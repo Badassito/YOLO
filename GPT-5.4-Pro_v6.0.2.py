@@ -2,7 +2,7 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large video volumes.
 
-This v6.0.1 hotfix script:
+This v6.0.2 hotfix script:
   - builds transverse, sagittal, coronal and optional radial view families
   - generates rotated / scaled / shifted FFV1 MKV augmentations via a single affine transform per variant
   - runs Ultralytics YOLO segmentation sequentially on the pre-generated augmentation videos
@@ -11,6 +11,7 @@ This v6.0.1 hotfix script:
   - fills enclosed 3D voids with a streamed boundary-background pass, optionally filters small transverse-plane components via --min_radius
   - keeps bulk persistent scratch on disk by default to avoid tmpfs SIGBUS failures
   - uses RAM/ZRAM more heavily for 3D interpolation / 3D void-filling workspaces via in-memory arrays when enough memory+swap is available
+  - speeds up radial view generation by slicing azimuths in blocks and reusing native radial slices across all radial TTA variants
 
 Dependencies (Python):
   pip install opencv-python numpy scipy scikit-image tifffile tqdm ultralytics
@@ -201,7 +202,7 @@ def should_use_in_memory_workspace(required_bytes: int, reserve_bytes: int = 16 
 def choose_scratch_dir(preferred: Optional[str], out_dir: Path, stem: str) -> Path:
     """Pick the bulk disk-backed scratch root.
 
-    v6.0.1 hotfix:
+    v6.0.2 hotfix:
       - no longer auto-selects tmpfs locations like /dev/shm for the whole pipeline
       - defaults to {output}/temp so large persistent memmaps stay off tmpfs unless the user explicitly opts in
     """
@@ -469,6 +470,18 @@ class AffineSpec:
     pad_off_y: float
     M_out_to_src: np.ndarray  # 2x3 float32
     M_src_to_out: np.ndarray  # 2x3 float32
+
+
+@dataclass(frozen=True)
+class AugJob:
+    aug_id: str
+    angle_deg: float
+    shift_dx: int
+    shift_dy: int
+    shift_name: str
+    video_path: Path
+    meta_path: Path
+    aff: AffineSpec
 
 
 def _expanded_pad_size(w: int, h: int, angle_deg: float) -> int:
@@ -745,6 +758,228 @@ def extract_radial_slice_frame(volume_rgb: np.memmap, sampler: RadialSampler) ->
     for t in range(t_dim):
         out[t, :, :] = sample_radial_line_rgb_lanczos5(np.asarray(volume_rgb[t]), sampler)
     return out
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    s = str(raw).strip().lower()
+    if s in ("", "0", "false", "no", "off"):
+        return False
+    return True
+
+
+def radial_fast_path_enabled() -> bool:
+    """Fast blocked radial sampler.
+
+    Default: enabled.
+    Set YOLO_TTA_RADIAL_FAST=0 to force the strict exact Lanczos-5 path.
+    """
+    return _env_flag('YOLO_TTA_RADIAL_FAST', True)
+
+
+def choose_radial_block_size(view: ViewInfo, target_bytes: int = 1 * GIB) -> int:
+    env = os.environ.get('YOLO_TTA_RADIAL_BLOCK_ANGLES', '').strip()
+    if env:
+        try:
+            return max(1, int(env))
+        except Exception:
+            pass
+
+    bytes_per_angle = max(1, int(view.src_h) * int(view.src_w) * 3)
+    block = max(1, int(target_bytes // bytes_per_angle))
+    return max(1, min(32, block))
+
+
+def build_radial_block_maps(view: ViewInfo, angles_deg: Sequence[float]) -> Tuple[np.ndarray, np.ndarray]:
+    if view.family != 'radial':
+        raise ValueError('Radial block maps requested for a non-radial view')
+
+    diameter = int(view.diameter)
+    coords = np.linspace(-float(view.roi_radius), float(view.roi_radius), diameter, dtype=np.float32)
+    map_x = np.empty((len(angles_deg), diameter), dtype=np.float32)
+    map_y = np.empty((len(angles_deg), diameter), dtype=np.float32)
+
+    for i, angle_deg in enumerate(angles_deg):
+        theta = math.radians(float(angle_deg))
+        map_x[i, :] = np.asarray(float(view.center_x) + coords * math.cos(theta), dtype=np.float32)
+        map_y[i, :] = np.asarray(float(view.center_y) + coords * math.sin(theta), dtype=np.float32)
+
+    return map_x, map_y
+
+
+def write_aug_job_meta(job: AugJob, view: ViewInfo) -> None:
+    job.meta_path.parent.mkdir(parents=True, exist_ok=True)
+    job.meta_path.write_text(
+        json.dumps(
+            {
+                'view': view.name,
+                'family': view.family,
+                'angle_deg': float(job.angle_deg),
+                'shift_dx': int(job.shift_dx),
+                'shift_dy': int(job.shift_dy),
+                'src_w': view.src_w,
+                'src_h': view.src_h,
+                'out_size': int(job.aff.out_size),
+                'pad_mode': view.pad_mode,
+                'canvas_w': int(job.aff.canvas_w),
+                'canvas_h': int(job.aff.canvas_h),
+                'pad_size': int(job.aff.pad_size),
+                'pad_off_x': float(job.aff.pad_off_x),
+                'pad_off_y': float(job.aff.pad_off_y),
+                'M_out_to_src': job.aff.M_out_to_src.tolist(),
+                'M_src_to_out': job.aff.M_src_to_out.tolist(),
+            },
+            indent=2,
+        )
+    )
+
+
+def build_aug_jobs_for_view(
+    view: ViewInfo,
+    angles: Sequence[float],
+    shifts: Sequence[Tuple[int, int, str]],
+    out_size: int,
+    temp_dir: Path,
+) -> List[AugJob]:
+    aug_dir = temp_dir / 'aug' / view.name
+    jobs: List[AugJob] = []
+
+    for angle in angles:
+        for dx, dy, sname in shifts:
+            aug_id = f'a{angle:g}_dx{dx}_dy{dy}_{sname}'
+            aff = build_affine(
+                view=view.name,
+                src_w=view.src_w,
+                src_h=view.src_h,
+                out_size=out_size,
+                angle_deg=float(angle),
+                shift_dx=int(dx),
+                shift_dy=int(dy),
+                pad_mode=view.pad_mode,
+            )
+            jobs.append(
+                AugJob(
+                    aug_id=aug_id,
+                    angle_deg=float(angle),
+                    shift_dx=int(dx),
+                    shift_dy=int(dy),
+                    shift_name=str(sname),
+                    video_path=aug_dir / f'{view.name}_{aug_id}.mkv',
+                    meta_path=aug_dir / f'{view.name}_{aug_id}.meta.json',
+                    aff=aff,
+                )
+            )
+    return jobs
+
+
+def ensure_radial_augmented_videos(
+    volume_rgb: np.memmap,
+    view: ViewInfo,
+    aug_jobs: Sequence[AugJob],
+    fps: float,
+) -> None:
+    if view.family != 'radial':
+        raise ValueError('ensure_radial_augmented_videos expects a radial view')
+
+    missing_jobs = [job for job in aug_jobs if not job.video_path.exists()]
+    for job in aug_jobs:
+        if not job.meta_path.exists():
+            write_aug_job_meta(job, view)
+
+    if not missing_jobs:
+        return
+
+    for job in missing_jobs:
+        job.video_path.parent.mkdir(parents=True, exist_ok=True)
+
+    writers: Dict[str, subprocess.Popen] = {}
+    try:
+        for job in missing_jobs:
+            writers[job.aug_id] = ffmpeg_rawvideo_writer(
+                job.video_path,
+                width=int(job.aff.out_size),
+                height=int(job.aff.out_size),
+                fps=fps,
+                pix_fmt_in='rgb24',
+                codec='ffv1',
+                pix_fmt_out='yuv444p',
+            )
+
+        if radial_fast_path_enabled():
+            block_size = choose_radial_block_size(view)
+            print(
+                f"Radial fast path: OpenCV remap blocks of {block_size} azimuths, "
+                f"reused across {len(missing_jobs)} augmentation(s)"
+            )
+            for block_start in range(0, len(view.azimuths_deg), block_size):
+                block_end = min(len(view.azimuths_deg), block_start + block_size)
+                block_angles = view.azimuths_deg[block_start:block_end]
+                map_x, map_y = build_radial_block_maps(view, block_angles)
+                native_block = np.empty((len(block_angles), int(view.src_h), int(view.src_w), 3), dtype=np.uint8)
+
+                for t in tqdm(
+                    range(int(view.src_h)),
+                    total=int(view.src_h),
+                    desc=f'Radial slice block {block_start + 1}-{block_end}',
+                ):
+                    frame_rgb = np.asarray(volume_rgb[t])
+                    sampled = cv2.remap(
+                        frame_rgb,
+                        map_x,
+                        map_y,
+                        interpolation=cv2.INTER_LANCZOS4,
+                        borderMode=cv2.BORDER_CONSTANT,
+                        borderValue=(0, 0, 0),
+                    )
+                    if sampled.ndim == 2:
+                        sampled = sampled[:, :, None]
+                    native_block[:, t, :, :] = sampled
+
+                for local_idx in tqdm(
+                    range(len(block_angles)),
+                    total=len(block_angles),
+                    desc=f'Radial augment block {block_start + 1}-{block_end}',
+                ):
+                    native_frame = np.ascontiguousarray(native_block[local_idx])
+                    for job in missing_jobs:
+                        out = cv2.warpAffine(
+                            native_frame,
+                            job.aff.M_src_to_out,
+                            dsize=(int(job.aff.out_size), int(job.aff.out_size)),
+                            flags=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_CONSTANT,
+                            borderValue=(0, 0, 0),
+                        )
+                        writer = writers[job.aug_id]
+                        assert writer.stdin is not None
+                        writer.stdin.write(out.tobytes())
+
+                del native_block
+        else:
+            print(
+                f"Radial strict path: exact Lanczos-5, reused across {len(missing_jobs)} augmentation(s) "
+                f"(set YOLO_TTA_RADIAL_FAST=1 to enable the faster block remap path)"
+            )
+            for angle_deg in tqdm(view.azimuths_deg, total=len(view.azimuths_deg), desc='Radial slicing (exact Lanczos-5)'):
+                sampler = get_radial_sampler(view, float(angle_deg))
+                native_frame = np.ascontiguousarray(extract_radial_slice_frame(volume_rgb, sampler))
+                for job in missing_jobs:
+                    out = cv2.warpAffine(
+                        native_frame,
+                        job.aff.M_src_to_out,
+                        dsize=(int(job.aff.out_size), int(job.aff.out_size)),
+                        flags=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_CONSTANT,
+                        borderValue=(0, 0, 0),
+                    )
+                    writer = writers[job.aug_id]
+                    assert writer.stdin is not None
+                    writer.stdin.write(out.tobytes())
+    finally:
+        for writer in writers.values():
+            close_ffmpeg_writer(writer)
 
 
 def iter_view_frames(volume_rgb: np.memmap, view: ViewInfo) -> Iterator[np.ndarray]:
@@ -1266,7 +1501,7 @@ def fill_3d_voids_inplace_streaming(
 ) -> None:
     """Fill enclosed 3D voids with an in-memory-first streamed implementation.
 
-    v6.0.1 hotfix:
+    v6.0.2 hotfix:
       - prefers anonymous RAM/swap-backed arrays for the 3D background-ID workspace
       - falls back to a disk-backed memmap only when the estimated working set would be too large
       - avoids tmpfs-backed bulk scratch files that could previously SIGBUS when /dev/shm filled
@@ -1343,7 +1578,7 @@ def label_foreground_volume_streaming(
 ) -> Tuple[np.ndarray, int, List[Path]]:
     """Label a 3D foreground volume using slice-streamed 26-connectivity.
 
-    v6.0.1 hotfix:
+    v6.0.2 hotfix:
       - prefers an anonymous in-memory uint32 label volume when enough RAM+swap is available
       - otherwise uses a single disk-backed provisional label volume and compacts labels in place,
         avoiding the previous second full uint32 relabel volume
@@ -4215,101 +4450,84 @@ def main() -> None:
             union_paths[model_name] = union_path
             confmap_paths[model_name] = confmap_path
 
-        for angle in angles:
-            for dx, dy, sname in shifts:
-                aug_id = f'a{angle:g}_dx{dx}_dy{dy}_{sname}'
-                aug_dir = temp_dir / 'aug' / view.name
-                aug_video = aug_dir / f'{view.name}_{aug_id}.mkv'
-                aug_meta = aug_dir / f'{view.name}_{aug_id}.meta.json'
+        aug_jobs = build_aug_jobs_for_view(
+            view=view,
+            angles=angles,
+            shifts=shifts,
+            out_size=args.imgsz,
+            temp_dir=temp_dir,
+        )
 
-                aff = build_affine(
-                    view=view.name,
-                    src_w=view.src_w,
-                    src_h=view.src_h,
-                    out_size=args.imgsz,
-                    angle_deg=float(angle),
-                    shift_dx=int(dx),
-                    shift_dy=int(dy),
-                    pad_mode=view.pad_mode,
+        if view.family == 'radial':
+            ensure_radial_augmented_videos(
+                volume_rgb=volume_rgb,
+                view=view,
+                aug_jobs=aug_jobs,
+                fps=fps,
+            )
+
+        for job in aug_jobs:
+            aug_id = job.aug_id
+            aug_video = job.video_path
+            aug_meta = job.meta_path
+            aff = job.aff
+
+            if view.family != 'radial' and not aug_video.exists():
+                aug_video.parent.mkdir(parents=True, exist_ok=True)
+                writer = ffmpeg_rawvideo_writer(
+                    aug_video,
+                    width=args.imgsz,
+                    height=args.imgsz,
+                    fps=fps,
+                    pix_fmt_in='rgb24',
+                    codec='ffv1',
+                    pix_fmt_out='yuv444p',
                 )
-
-                if not aug_video.exists():
-                    aug_dir.mkdir(parents=True, exist_ok=True)
-                    writer = ffmpeg_rawvideo_writer(
-                        aug_video,
-                        width=args.imgsz,
-                        height=args.imgsz,
-                        fps=fps,
-                        pix_fmt_in='rgb24',
-                        codec='ffv1',
-                        pix_fmt_out='yuv444p',
-                    )
-                    try:
-                        assert writer.stdin is not None
-                        for frame in tqdm(
-                            iter_view_frames(volume_rgb, view),
-                            total=view.num_slices,
-                            desc=f'Augment {view.name} {aug_id}',
-                        ):
-                            out = cv2.warpAffine(
-                                frame,
-                                aff.M_src_to_out,
-                                dsize=(args.imgsz, args.imgsz),
-                                flags=cv2.INTER_LINEAR,
-                                borderMode=cv2.BORDER_CONSTANT,
-                                borderValue=(0, 0, 0),
-                            )
-                            writer.stdin.write(out.tobytes())
-                    finally:
-                        close_ffmpeg_writer(writer)
-
-                    aug_meta.write_text(
-                        json.dumps(
-                            {
-                                'view': view.name,
-                                'family': view.family,
-                                'angle_deg': float(angle),
-                                'shift_dx': int(dx),
-                                'shift_dy': int(dy),
-                                'src_w': view.src_w,
-                                'src_h': view.src_h,
-                                'out_size': int(args.imgsz),
-                                'pad_mode': view.pad_mode,
-                                'canvas_w': int(aff.canvas_w),
-                                'canvas_h': int(aff.canvas_h),
-                                'pad_size': int(aff.pad_size),
-                                'pad_off_x': float(aff.pad_off_x),
-                                'pad_off_y': float(aff.pad_off_y),
-                                'M_out_to_src': aff.M_out_to_src.tolist(),
-                                'M_src_to_out': aff.M_src_to_out.tolist(),
-                            },
-                            indent=2,
+                try:
+                    assert writer.stdin is not None
+                    for frame in tqdm(
+                        iter_view_frames(volume_rgb, view),
+                        total=view.num_slices,
+                        desc=f'Augment {view.name} {aug_id}',
+                    ):
+                        out = cv2.warpAffine(
+                            frame,
+                            aff.M_src_to_out,
+                            dsize=(args.imgsz, args.imgsz),
+                            flags=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_CONSTANT,
+                            borderValue=(0, 0, 0),
                         )
-                    )
+                        writer.stdin.write(out.tobytes())
+                finally:
+                    close_ffmpeg_writer(writer)
 
-                for model_name, yolo in yolo_models:
-                    pred_prefix = temp_dir / 'preds' / model_name / view.name / f'{view.name}_{aug_id}'
-                    pred_stats = predict_video_and_accumulate(
-                        model=yolo,
-                        video_path=aug_video,
-                        num_frames=view.num_slices,
-                        out_size=args.imgsz,
-                        pred_out_prefix=pred_prefix,
-                        cfg=pred_cfg,
-                        view_union_mm=union_by_model_view[model_name],
-                        view_confmap_mm=confmap_by_model_view[model_name],
-                        M_out_to_native=aff.M_out_to_src,
-                        native_h=view.src_h,
-                        native_w=view.src_w,
-                    )
-                    view_prediction_stats[view.name] = int(view_prediction_stats.get(view.name, 0)) + int(pred_stats.get('prediction_count', 0))
+                if not aug_meta.exists():
+                    write_aug_job_meta(job, view)
 
-                if not args.troubleshooting:
-                    try:
-                        aug_video.unlink(missing_ok=True)
-                        aug_meta.unlink(missing_ok=True)
-                    except Exception:
-                        pass
+            for model_name, yolo in yolo_models:
+                pred_prefix = temp_dir / 'preds' / model_name / view.name / f'{view.name}_{aug_id}'
+                pred_stats = predict_video_and_accumulate(
+                    model=yolo,
+                    video_path=aug_video,
+                    num_frames=view.num_slices,
+                    out_size=args.imgsz,
+                    pred_out_prefix=pred_prefix,
+                    cfg=pred_cfg,
+                    view_union_mm=union_by_model_view[model_name],
+                    view_confmap_mm=confmap_by_model_view[model_name],
+                    M_out_to_native=aff.M_out_to_src,
+                    native_h=view.src_h,
+                    native_w=view.src_w,
+                )
+                view_prediction_stats[view.name] = int(view_prediction_stats.get(view.name, 0)) + int(pred_stats.get('prediction_count', 0))
+
+            if not args.troubleshooting:
+                try:
+                    aug_video.unlink(missing_ok=True)
+                    aug_meta.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
         for model_name, _ in yolo_models:
             print(f"\n--- Postprocessing view '{view.name}' for model '{model_name}' ---")
