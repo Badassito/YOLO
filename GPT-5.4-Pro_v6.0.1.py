@@ -2,14 +2,15 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large video volumes.
 
-This v6.0.0-compliant script:
+This v6.0.1 hotfix script:
   - builds transverse, sagittal, coronal and optional radial view families
   - generates rotated / scaled / shifted FFV1 MKV augmentations via a single affine transform per variant
   - runs Ultralytics YOLO segmentation sequentially on the pre-generated augmentation videos
   - stores per-augmentation traces to disk, undoes the affine transforms, unions masks per slice and tracks per-pixel max confidence for --min_conf
   - fills 2D holes after per-frame unions, interpolates only Cartesian view volumes, and unions final per-view / per-model volumes including optional radial backprojection
   - fills enclosed 3D voids with a streamed boundary-background pass, optionally filters small transverse-plane components via --min_radius
-  - prefers RAM/ZRAM-backed scratch storage for the heaviest temporary volumes while preserving the existing troubleshooting outputs and final summary file
+  - keeps bulk persistent scratch on disk by default to avoid tmpfs SIGBUS failures
+  - uses RAM/ZRAM more heavily for 3D interpolation / 3D void-filling workspaces via in-memory arrays when enough memory+swap is available
 
 Dependencies (Python):
   pip install opencv-python numpy scipy scikit-image tifffile tqdm ultralytics
@@ -32,6 +33,8 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
+
+GIB = 1024 ** 3
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -136,7 +139,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--troubleshooting", action="store_true",
                    help="Keep temp files and save pass snapshots before each interpolation pass")
     p.add_argument("--scratch_dir", default=None, type=str,
-                   help="Optional scratch/temp root. Defaults to a RAM-first auto-selected location such as /dev/shm when available")
+                   help="Optional bulk scratch/temp root for disk-backed working files. Defaults to {output}/temp")
 
     p.add_argument("--interpolate", default=15, type=int,
                    help="Maximum slice-distance used to search for interpolation candidates. 0 disables interpolation")
@@ -166,8 +169,42 @@ def _path_free_bytes(path: Path) -> int:
         return 0
 
 
+def _read_meminfo_bytes() -> Dict[str, int]:
+    info: Dict[str, int] = {}
+    try:
+        for line in Path('/proc/meminfo').read_text().splitlines():
+            parts = line.split(':', 1)
+            if len(parts) != 2:
+                continue
+            key = parts[0].strip()
+            raw_val = parts[1].strip().split()[0]
+            info[key] = int(raw_val) * 1024
+    except Exception:
+        pass
+    return info
+
+
+def available_anon_work_bytes() -> int:
+    info = _read_meminfo_bytes()
+    mem_avail = int(info.get('MemAvailable', 0))
+    swap_free = int(info.get('SwapFree', 0))
+    return max(0, mem_avail + swap_free)
+
+
+def should_use_in_memory_workspace(required_bytes: int, reserve_bytes: int = 16 * GIB) -> bool:
+    if int(required_bytes) <= 0:
+        return False
+    avail = available_anon_work_bytes()
+    return avail >= int(required_bytes) + int(max(0, reserve_bytes))
+
+
 def choose_scratch_dir(preferred: Optional[str], out_dir: Path, stem: str) -> Path:
-    """Pick a RAM/ZRAM-first scratch root, falling back to the output directory."""
+    """Pick the bulk disk-backed scratch root.
+
+    v6.0.1 hotfix:
+      - no longer auto-selects tmpfs locations like /dev/shm for the whole pipeline
+      - defaults to {output}/temp so large persistent memmaps stay off tmpfs unless the user explicitly opts in
+    """
     candidates: List[Path] = []
     seen: set[str] = set()
 
@@ -183,10 +220,6 @@ def choose_scratch_dir(preferred: Optional[str], out_dir: Path, stem: str) -> Pa
     env_pref = os.environ.get('YOLO_TTA_SCRATCH_DIR', '').strip()
     if env_pref:
         _add_candidate(Path(env_pref).expanduser())
-
-    for raw in ('/dev/shm', '/run/shm', tempfile.gettempdir()):
-        _add_candidate(Path(raw))
-
     _add_candidate(out_dir)
 
     chosen_root: Optional[Path] = None
@@ -209,6 +242,17 @@ def choose_scratch_dir(preferred: Optional[str], out_dir: Path, stem: str) -> Pa
 
     scratch_dir.mkdir(parents=True, exist_ok=True)
     return scratch_dir
+
+
+def estimate_voidfill_workspace_bytes(shape: Tuple[int, int, int]) -> int:
+    z_dim, h, w = shape
+    return int(z_dim) * int(h) * int(w) * np.dtype(np.uint32).itemsize
+
+
+def estimate_interpolation_workspace_bytes(shape: Tuple[int, int, int]) -> int:
+    z_dim, h, w = shape
+    voxels = int(z_dim) * int(h) * int(w)
+    return voxels * (np.dtype(np.uint32).itemsize + np.dtype(np.uint8).itemsize)
 
 
 def expose_scratch_in_output(out_dir: Path, scratch_dir: Path) -> Path:
@@ -1217,21 +1261,31 @@ def fill_3d_voids_inplace_streaming(
     mask_mm: np.memmap,
     work_prefix: Path,
     keep_temp: bool = False,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 16 * GIB,
 ) -> None:
-    """Fill enclosed 3D voids without allocating a full in-memory 3D label volume.
+    """Fill enclosed 3D voids with an in-memory-first streamed implementation.
 
-    The bottleneck in the original implementation was ``ndi.label`` over the entire 3D background,
-    which requires several full-volume arrays. This streaming variant labels 2D background components
-    slice-by-slice, unions only touching components across adjacent slices, tracks which components
-    reach the volume boundary, and finally fills only the enclosed components.
+    v6.0.1 hotfix:
+      - prefers anonymous RAM/swap-backed arrays for the 3D background-ID workspace
+      - falls back to a disk-backed memmap only when the estimated working set would be too large
+      - avoids tmpfs-backed bulk scratch files that could previously SIGBUS when /dev/shm filled
     """
     z_dim, h, w = mask_mm.shape
     if z_dim <= 0:
         return
 
-    bg_gid_path = work_prefix.with_suffix('.bg_gid.u32.dat')
-    bg_gid_path.parent.mkdir(parents=True, exist_ok=True)
-    bg_gid_mm = np.memmap(bg_gid_path, dtype=np.uint32, mode='w+', shape=(z_dim, h, w))
+    estimated_bytes = estimate_voidfill_workspace_bytes((z_dim, h, w))
+    use_in_memory = bool(prefer_memory) and should_use_in_memory_workspace(estimated_bytes, reserve_bytes=reserve_bytes)
+    if use_in_memory:
+        print(f"3D void fill workspace: in-memory ({estimated_bytes / GIB:.1f} GiB estimated)")
+        bg_gid_store: np.ndarray = np.zeros((z_dim, h, w), dtype=np.uint32)
+        bg_gid_path: Optional[Path] = None
+    else:
+        print(f"3D void fill workspace: disk-backed ({estimated_bytes / GIB:.1f} GiB estimated) -> {work_prefix.parent}")
+        bg_gid_path = work_prefix.with_suffix('.bg_gid.u32.dat')
+        bg_gid_path.parent.mkdir(parents=True, exist_ok=True)
+        bg_gid_store = np.memmap(bg_gid_path, dtype=np.uint32, mode='w+', shape=(z_dim, h, w))
 
     uf = _UnionFind()
     prev_gid_slice: Optional[np.ndarray] = None
@@ -1240,14 +1294,14 @@ def fill_3d_voids_inplace_streaming(
         bg = (np.asarray(mask_mm[z]) == 0).astype(np.uint8, copy=False)
         num_labels, labels2d = cv2.connectedComponents(bg, connectivity=8, ltype=cv2.CV_32S)
         if int(num_labels) <= 1:
-            bg_gid_mm[z, :, :] = 0
+            bg_gid_store[z, :, :] = 0
             prev_gid_slice = None
             continue
 
         local_to_gid = np.zeros((int(num_labels),), dtype=np.uint32)
         local_to_gid[1:] = uf.new_ids(int(num_labels) - 1)
         gid_slice = local_to_gid[labels2d]
-        bg_gid_mm[z, :, :] = gid_slice
+        bg_gid_store[z, :, :] = gid_slice
 
         _mark_boundary_components_from_local_labels(uf, local_to_gid, labels2d, z=z, z_max=z_dim - 1)
 
@@ -1263,36 +1317,53 @@ def fill_3d_voids_inplace_streaming(
         touches_by_gid[gid] = bool(uf.touches_boundary[int(root_map[gid])])
 
     for z in tqdm(range(z_dim), desc='3D void fill: apply enclosed components'):
-        gid_slice = np.asarray(bg_gid_mm[z])
+        gid_slice = np.asarray(bg_gid_store[z])
         enclosed = (gid_slice > 0) & (~touches_by_gid[gid_slice])
         if np.any(enclosed):
             mask_mm[z, enclosed] = np.uint8(1)
 
     mask_mm.flush()
-    del bg_gid_mm
-    if not keep_temp:
+    if isinstance(bg_gid_store, np.memmap):
+        bg_gid_store.flush()
+    del bg_gid_store
+    if bg_gid_path is not None and not keep_temp:
         try:
             bg_gid_path.unlink(missing_ok=True)
         except Exception:
             pass
 
 
+
 def label_foreground_volume_streaming(
     mask_mm: np.ndarray,
     work_prefix: Path,
     keep_temp: bool = False,
-) -> Tuple[np.memmap, int, List[Path]]:
+    prefer_memory: bool = True,
+    reserve_bytes: int = 16 * GIB,
+) -> Tuple[np.ndarray, int, List[Path]]:
     """Label a 3D foreground volume using slice-streamed 26-connectivity.
 
-    Returns a compact uint32 label volume memmap, the number of 3D objects, and the list of
-    temporary files backing the labeling work.
+    v6.0.1 hotfix:
+      - prefers an anonymous in-memory uint32 label volume when enough RAM+swap is available
+      - otherwise uses a single disk-backed provisional label volume and compacts labels in place,
+        avoiding the previous second full uint32 relabel volume
     """
     z_dim, h, w = mask_mm.shape
-    work_prefix.parent.mkdir(parents=True, exist_ok=True)
-    provisional_path = work_prefix.with_suffix('.fg_provisional.u32.dat')
-    compact_path = work_prefix.with_suffix('.fg_compact.u32.dat')
+    estimated_bytes = estimate_voidfill_workspace_bytes((z_dim, h, w))
+    use_in_memory = bool(prefer_memory) and should_use_in_memory_workspace(estimated_bytes, reserve_bytes=reserve_bytes)
 
-    provisional_mm = np.memmap(provisional_path, dtype=np.uint32, mode='w+', shape=(z_dim, h, w))
+    work_prefix.parent.mkdir(parents=True, exist_ok=True)
+    provisional_path = work_prefix.with_suffix('.fg_labels.u32.dat')
+    label_paths: List[Path] = []
+
+    if use_in_memory:
+        print(f"Interpolation label workspace: in-memory ({estimated_bytes / GIB:.1f} GiB estimated)")
+        labels_store: np.ndarray = np.zeros((z_dim, h, w), dtype=np.uint32)
+    else:
+        print(f"Interpolation label workspace: disk-backed ({estimated_bytes / GIB:.1f} GiB estimated) -> {work_prefix.parent}")
+        labels_store = np.memmap(provisional_path, dtype=np.uint32, mode='w+', shape=(z_dim, h, w))
+        label_paths = [provisional_path]
+
     uf = _UnionFind()
     prev_gid_slice: Optional[np.ndarray] = None
 
@@ -1300,14 +1371,14 @@ def label_foreground_volume_streaming(
         fg = (np.asarray(mask_mm[z]) > 0).astype(np.uint8, copy=False)
         num_labels, labels2d = cv2.connectedComponents(fg, connectivity=8, ltype=cv2.CV_32S)
         if int(num_labels) <= 1:
-            provisional_mm[z, :, :] = 0
+            labels_store[z, :, :] = 0
             prev_gid_slice = None
             continue
 
         local_to_gid = np.zeros((int(num_labels),), dtype=np.uint32)
         local_to_gid[1:] = uf.new_ids(int(num_labels) - 1)
         gid_slice = local_to_gid[labels2d]
-        provisional_mm[z, :, :] = gid_slice
+        labels_store[z, :, :] = gid_slice
 
         if prev_gid_slice is not None and np.any(prev_gid_slice) and np.any(gid_slice):
             for a, b in _iter_adjacent_gid_pairs(prev_gid_slice, gid_slice):
@@ -1317,34 +1388,23 @@ def label_foreground_volume_streaming(
 
     root_map = uf.root_map()
     if root_map.shape[0] <= 1:
-        compact_mm = np.memmap(compact_path, dtype=np.uint32, mode='w+', shape=(z_dim, h, w))
-        compact_mm.flush()
-        del provisional_mm
-        if not keep_temp:
-            try:
-                provisional_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-        return compact_mm, 0, [compact_path]
+        if isinstance(labels_store, np.memmap):
+            labels_store.flush()
+        return labels_store, 0, label_paths
 
     unique_roots = np.unique(root_map[1:])
     unique_roots = unique_roots[unique_roots > 0]
     compact_root_ids = np.zeros(root_map.shape, dtype=np.uint32)
     compact_root_ids[unique_roots] = np.arange(1, unique_roots.size + 1, dtype=np.uint32)
 
-    compact_mm = np.memmap(compact_path, dtype=np.uint32, mode='w+', shape=(z_dim, h, w))
     for z in tqdm(range(z_dim), desc='Interpolation: compact relabel'):
-        gid_slice = np.asarray(provisional_mm[z])
-        compact_mm[z, :, :] = compact_root_ids[root_map[gid_slice]]
-    compact_mm.flush()
+        gid_slice = np.asarray(labels_store[z])
+        labels_store[z, :, :] = compact_root_ids[root_map[gid_slice]]
 
-    del provisional_mm
-    if not keep_temp:
-        try:
-            provisional_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-    return compact_mm, int(unique_roots.size), [compact_path]
+    if isinstance(labels_store, np.memmap):
+        labels_store.flush()
+    return labels_store, int(unique_roots.size), label_paths
+
 
 
 def build_slice_endpoint_seeds_from_label_volume(labels_real: np.ndarray) -> Tuple[List[SliceEndpointSeed], int]:
@@ -3207,6 +3267,8 @@ def interpolate_view_volume_pass_inplace(
     interpolation_candidates: int,
     interpolate_min_radius: float,
     keep_temp: bool = False,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 16 * GIB,
 ) -> Dict[str, object]:
     """Apply one interpolation pass directly to a view-volume memmap.
 
@@ -3232,10 +3294,19 @@ def interpolate_view_volume_pass_inplace(
         }
 
     work_dir.mkdir(parents=True, exist_ok=True)
+    estimated_bytes = estimate_interpolation_workspace_bytes(tuple(int(x) for x in mask_mm.shape))
+    use_in_memory = bool(prefer_memory) and should_use_in_memory_workspace(estimated_bytes, reserve_bytes=reserve_bytes)
+    if use_in_memory:
+        print(f"Interpolation workspace ({pass_tag}): in-memory ({estimated_bytes / GIB:.1f} GiB estimated)")
+    else:
+        print(f"Interpolation workspace ({pass_tag}): disk-backed ({estimated_bytes / GIB:.1f} GiB estimated) -> {work_dir}")
+
     labels_mm, num_objects, label_paths = label_foreground_volume_streaming(
         mask_mm,
         work_dir / f'{pass_tag}_labels',
         keep_temp=True,
+        prefer_memory=use_in_memory,
+        reserve_bytes=reserve_bytes,
     )
 
     if int(num_objects) <= 1:
@@ -3279,8 +3350,12 @@ def interpolate_view_volume_pass_inplace(
             'skipped': False,
         }
 
-    bridge_path = work_dir / f'{pass_tag}_bridges.u8.dat'
-    bridge_mm = np.memmap(bridge_path, dtype=np.uint8, mode='w+', shape=mask_mm.shape)
+    bridge_path: Optional[Path] = None
+    if use_in_memory:
+        bridge_mm: np.ndarray = np.zeros(mask_mm.shape, dtype=np.uint8)
+    else:
+        bridge_path = work_dir / f'{pass_tag}_bridges.u8.dat'
+        bridge_mm = np.memmap(bridge_path, dtype=np.uint8, mode='w+', shape=mask_mm.shape)
 
     candidate_connections = 0
     accepted_connections = 0
@@ -3352,7 +3427,11 @@ def interpolate_view_volume_pass_inplace(
             mask_mm[z, :, :] |= bridge_slice
     mask_mm.flush()
 
+    if isinstance(bridge_mm, np.memmap):
+        bridge_mm.flush()
     del bridge_mm
+    if isinstance(labels_mm, np.memmap):
+        labels_mm.flush()
     del labels_mm
     if not keep_temp:
         for p in label_paths:
@@ -3360,10 +3439,11 @@ def interpolate_view_volume_pass_inplace(
                 p.unlink(missing_ok=True)
             except Exception:
                 pass
-        try:
-            bridge_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        if bridge_path is not None:
+            try:
+                bridge_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     return {
         'num_objects': int(num_objects),
@@ -4046,6 +4126,7 @@ def main() -> None:
 
     temp_dir = choose_scratch_dir(args.scratch_dir, out_dir, input_path.stem)
     expose_scratch_in_output(out_dir, temp_dir)
+    print(f"Bulk scratch dir: {temp_dir}")
 
     info = ffprobe_info(input_path)
     W = int(info['width'])
@@ -4295,6 +4376,7 @@ def main() -> None:
             ensemble_mm,
             temp_dir / f'{snapshot_stem}_voidfill',
             keep_temp=bool(args.troubleshooting),
+            prefer_memory=True,
         )
         if float(args.min_radius) > 0:
             apply_transverse_min_radius_filter_inplace(ensemble_mm, float(args.min_radius))
@@ -4352,6 +4434,7 @@ def main() -> None:
                         interpolation_candidates=int(args.interpolation_candidates),
                         interpolate_min_radius=float(args.interpolate_min_radius),
                         keep_temp=bool(args.troubleshooting),
+                        prefer_memory=True,
                     )
 
                     stats = dict(stats)
@@ -4427,6 +4510,7 @@ def main() -> None:
         final_ensemble_mm,
         temp_dir / 'ensemble_volume_final_voidfill',
         keep_temp=bool(args.troubleshooting),
+        prefer_memory=True,
     )
     if float(args.min_radius) > 0:
         apply_transverse_min_radius_filter_inplace(final_ensemble_mm, float(args.min_radius))
