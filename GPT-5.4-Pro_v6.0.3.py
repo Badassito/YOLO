@@ -2,7 +2,7 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large video volumes.
 
-This v6.0.2 hotfix script:
+This v6.0.3 hardening patch script:
   - builds transverse, sagittal, coronal and optional radial view families
   - generates rotated / scaled / shifted FFV1 MKV augmentations via a single affine transform per variant
   - runs Ultralytics YOLO segmentation sequentially on the pre-generated augmentation videos
@@ -24,6 +24,7 @@ System:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import os
@@ -192,11 +193,68 @@ def available_anon_work_bytes() -> int:
     return max(0, mem_avail + swap_free)
 
 
+def total_anon_capacity_bytes() -> int:
+    info = _read_meminfo_bytes()
+    mem_total = int(info.get('MemTotal', 0))
+    swap_total = int(info.get('SwapTotal', 0))
+    return max(0, mem_total + swap_total)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, '').strip()
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
+def workspace_anon_cap_bytes() -> int:
+    """Return the soft cap for anonymous in-memory workspaces.
+
+    Defaults are intentionally conservative for workstation stability on very large volumes:
+      - YOLO_TTA_MAX_ANON_WORKSPACE_GIB: hard GiB cap (default 48)
+      - YOLO_TTA_MAX_ANON_WORKSPACE_FRACTION: fraction of total RAM+swap (default 0.25)
+    The lower non-zero cap wins.
+    """
+    hard_cap_gib = max(0.0, _env_float('YOLO_TTA_MAX_ANON_WORKSPACE_GIB', 48.0))
+    fraction = max(0.0, _env_float('YOLO_TTA_MAX_ANON_WORKSPACE_FRACTION', 0.25))
+
+    hard_cap = int(hard_cap_gib * GIB)
+    total_cap = int(total_anon_capacity_bytes() * fraction) if fraction > 0.0 else 0
+
+    caps = [v for v in (hard_cap, total_cap) if int(v) > 0]
+    if not caps:
+        return 0
+    return int(min(caps))
+
+
+def workspace_budget_summary(required_bytes: int, reserve_bytes: int = 16 * GIB) -> str:
+    avail = available_anon_work_bytes()
+    cap = workspace_anon_cap_bytes()
+    reserve = int(max(0, reserve_bytes))
+    parts = [
+        f'need={required_bytes / GIB:.1f} GiB',
+        f'avail+swap={avail / GIB:.1f} GiB',
+        f'reserve={reserve / GIB:.1f} GiB',
+    ]
+    if cap > 0:
+        parts.append(f'anon-cap={cap / GIB:.1f} GiB')
+    return ', '.join(parts)
+
+
 def should_use_in_memory_workspace(required_bytes: int, reserve_bytes: int = 16 * GIB) -> bool:
     if int(required_bytes) <= 0:
         return False
+
     avail = available_anon_work_bytes()
-    return avail >= int(required_bytes) + int(max(0, reserve_bytes))
+    reserve = int(max(0, reserve_bytes))
+    cap = workspace_anon_cap_bytes()
+
+    if cap > 0 and int(required_bytes) > cap:
+        return False
+    return avail >= int(required_bytes) + reserve
 
 
 def choose_scratch_dir(preferred: Optional[str], out_dir: Path, stem: str) -> Path:
@@ -284,6 +342,22 @@ def expose_scratch_in_output(out_dir: Path, scratch_dir: Path) -> Path:
         temp_entry.mkdir(parents=True, exist_ok=True)
         (temp_entry / 'SCRATCH_LOCATION.txt').write_text(str(scratch_dir) + '\n')
         return temp_entry
+
+
+def close_memmap_array(arr: object) -> None:
+    if arr is None:
+        return
+    try:
+        if isinstance(arr, np.memmap):
+            arr.flush()
+    except Exception:
+        pass
+    try:
+        mmap_obj = getattr(arr, '_mmap', None)
+        if mmap_obj is not None:
+            mmap_obj.close()
+    except Exception:
+        pass
 
 
 # --------------------------
@@ -789,7 +863,7 @@ def choose_radial_block_size(view: ViewInfo, target_bytes: int = 1 * GIB) -> int
 
     bytes_per_angle = max(1, int(view.src_h) * int(view.src_w) * 3)
     block = max(1, int(target_bytes // bytes_per_angle))
-    return max(1, min(32, block))
+    return max(1, min(128, block))
 
 
 def build_radial_block_maps(view: ViewInfo, angles_deg: Sequence[float]) -> Tuple[np.ndarray, np.ndarray]:
@@ -1512,12 +1586,13 @@ def fill_3d_voids_inplace_streaming(
 
     estimated_bytes = estimate_voidfill_workspace_bytes((z_dim, h, w))
     use_in_memory = bool(prefer_memory) and should_use_in_memory_workspace(estimated_bytes, reserve_bytes=reserve_bytes)
+    budget = workspace_budget_summary(estimated_bytes, reserve_bytes=reserve_bytes)
     if use_in_memory:
-        print(f"3D void fill workspace: in-memory ({estimated_bytes / GIB:.1f} GiB estimated)")
+        print(f"3D void fill workspace: in-memory ({budget})")
         bg_gid_store: np.ndarray = np.zeros((z_dim, h, w), dtype=np.uint32)
         bg_gid_path: Optional[Path] = None
     else:
-        print(f"3D void fill workspace: disk-backed ({estimated_bytes / GIB:.1f} GiB estimated) -> {work_prefix.parent}")
+        print(f"3D void fill workspace: disk-backed ({budget}) -> {work_prefix.parent}")
         bg_gid_path = work_prefix.with_suffix('.bg_gid.u32.dat')
         bg_gid_path.parent.mkdir(parents=True, exist_ok=True)
         bg_gid_store = np.memmap(bg_gid_path, dtype=np.uint32, mode='w+', shape=(z_dim, h, w))
@@ -1591,11 +1666,12 @@ def label_foreground_volume_streaming(
     provisional_path = work_prefix.with_suffix('.fg_labels.u32.dat')
     label_paths: List[Path] = []
 
+    budget = workspace_budget_summary(estimated_bytes, reserve_bytes=reserve_bytes)
     if use_in_memory:
-        print(f"Interpolation label workspace: in-memory ({estimated_bytes / GIB:.1f} GiB estimated)")
+        print(f"Interpolation label workspace: in-memory ({budget})")
         labels_store: np.ndarray = np.zeros((z_dim, h, w), dtype=np.uint32)
     else:
-        print(f"Interpolation label workspace: disk-backed ({estimated_bytes / GIB:.1f} GiB estimated) -> {work_prefix.parent}")
+        print(f"Interpolation label workspace: disk-backed ({budget}) -> {work_prefix.parent}")
         labels_store = np.memmap(provisional_path, dtype=np.uint32, mode='w+', shape=(z_dim, h, w))
         label_paths = [provisional_path]
 
@@ -1870,7 +1946,8 @@ def assemble_model_volume_from_view_volumes(
 ) -> None:
     transverse = np.asarray(view_volume_mms["transverse"])
     assert transverse.shape == (T, H, W)
-    ensemble_mm[:, :, :] |= transverse
+    for t in tqdm(range(T), desc="Assembling volume from transverse view volume"):
+        ensemble_mm[t, :, :] |= transverse[t, :, :]
 
     if not disable_multiplanar and "sagittal" in view_volume_mms:
         sagittal = np.asarray(view_volume_mms["sagittal"])
@@ -1887,7 +1964,8 @@ def assemble_model_volume_from_view_volumes(
     if "radial" in view_volume_mms:
         radial = np.asarray(view_volume_mms["radial"])
         assert radial.shape == (T, H, W)
-        ensemble_mm[:, :, :] |= radial
+        for t in tqdm(range(T), desc="Assembling volume from radial view volume"):
+            ensemble_mm[t, :, :] |= radial[t, :, :]
 
 
 def assemble_current_ensemble_volume(
@@ -4563,15 +4641,13 @@ def main() -> None:
                     desc=f'Unpacking {model_name}/{view.name}',
                 )
 
+            confmap_mm_done = confmap_by_model_view.pop(model_name, None)
+            union_mm_done = union_by_model_view.pop(model_name, None)
+            close_memmap_array(confmap_mm_done)
+            close_memmap_array(union_mm_done)
+            del confmap_mm_done, union_mm_done
+
             if not args.troubleshooting:
-                try:
-                    del confmap_by_model_view[model_name]
-                except Exception:
-                    pass
-                try:
-                    del union_by_model_view[model_name]
-                except Exception:
-                    pass
                 try:
                     confmap_paths[model_name].unlink(missing_ok=True)
                 except Exception:
@@ -4580,6 +4656,12 @@ def main() -> None:
                     union_paths[model_name].unlink(missing_ok=True)
                 except Exception:
                     pass
+
+        union_by_model_view.clear()
+        confmap_by_model_view.clear()
+        gc.collect()
+
+    gc.collect()
 
     def build_current_finalized_volume(snapshot_stem: str) -> np.memmap:
         ensemble_mm = assemble_current_ensemble_volume(
@@ -4627,6 +4709,9 @@ def main() -> None:
                 save_labels_pattern_value=args.save_labels,
                 tag='Pass0',
             ))
+        close_memmap_array(pass0_mm)
+        del pass0_mm
+        gc.collect()
 
     if int(args.interpolate) > 0:
         total_passes = int(args.interpolate_passes)
@@ -4692,6 +4777,9 @@ def main() -> None:
                         save_labels_pattern_value=args.save_labels,
                         tag=f'Pass{pass_idx}',
                     ))
+                close_memmap_array(pass_mm)
+                del pass_mm
+                gc.collect()
     else:
         for model_name in sorted(view_volumes_by_model.keys()):
             for view in cartesian_views:
@@ -4777,6 +4865,14 @@ def main() -> None:
         voxel_volume=voxel_volume,
         final_paths=final_paths,
     )
+
+    close_memmap_array(final_ensemble_mm)
+    for model_views in view_volumes_by_model.values():
+        for mm in model_views.values():
+            close_memmap_array(mm)
+        model_views.clear()
+    close_memmap_array(volume_rgb)
+    gc.collect()
 
     if not args.troubleshooting:
         try:
