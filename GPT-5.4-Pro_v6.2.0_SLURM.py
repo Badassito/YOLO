@@ -2,15 +2,14 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large video volumes.
 
-This v6.1.0 specification-aligned script:
+This v6.2.0_SLURM specification-aligned script:
   - builds transverse, sagittal, coronal and optional radial view families
   - generates rotated / scaled / shifted FFV1 MKV augmentations via a single affine transform per variant
   - runs Ultralytics YOLO segmentation sequentially on the pre-generated augmentation videos
   - stores per-augmentation traces to disk, undoes the affine transforms, unions masks per slice and tracks per-pixel max confidence for --min_conf
-  - fills 2D holes after per-frame unions, interpolates active orthogonal views in their native slice direction, and interpolates the radial backprojection in both Cartesian sagittal and coronal directions before the final multiplanar / multi-model union
-  - fills enclosed 3D voids with a streamed boundary-background pass and applies --min_radius in the transverse plane before interpolation
+  - fills 2D holes after per-frame unions, interpolates Cartesian view volumes only in their native slice direction, unions the interpolated view volumes, and performs the final 3D void fill once after that union
   - prefers in-memory workspaces on the SLURM target and falls back to disk-backed scratch only when the working set is too large
-  - parallelizes augmentation generation across independent slices, overlaps in-memory augmentation staging with ordered video writes, parallelizes slice-independent postprocessing, and parallelizes interpolation across independent view/model volumes
+  - parallelizes augmentation generation across independent slices, overlaps in-memory augmentation staging with ordered video writes, parallelizes slice-independent postprocessing and assembly, and overlaps independent output creation in background workers
   - extracts radial diameter slices with exact Lanczos-5 interpolation by default
 
 Dependencies (Python):
@@ -33,9 +32,8 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 GIB = 1024 ** 3
@@ -260,6 +258,21 @@ def default_interpolation_workers() -> int:
     return 1
 
 
+def default_output_workers() -> int:
+    cpu = _cpu_count()
+    if cpu >= 128:
+        return 12
+    if cpu >= 64:
+        return 8
+    if cpu >= 32:
+        return 6
+    if cpu >= 16:
+        return 4
+    if cpu >= 8:
+        return 3
+    return 2
+
+
 def resolve_worker_count(requested: int, env_name: str, auto_value: int, max_tasks: Optional[int] = None) -> int:
     workers = int(requested)
     if workers <= 0:
@@ -365,6 +378,7 @@ def parallel_for_indices(
     *,
     max_workers: int,
     desc: str,
+    show_progress: bool = True,
 ) -> None:
     total = max(0, int(count))
     if total <= 0:
@@ -372,22 +386,27 @@ def parallel_for_indices(
 
     workers = max(1, min(int(max_workers), total))
     if workers <= 1:
-        for idx in tqdm(range(total), desc=desc):
+        iterable = tqdm(range(total), desc=desc) if show_progress else range(total)
+        for idx in iterable:
             func(int(idx))
         return
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [executor.submit(func, int(idx)) for idx in range(total)]
-        with tqdm(total=total, desc=desc) as pbar:
+        if show_progress:
+            with tqdm(total=total, desc=desc) as pbar:
+                for fut in as_completed(futures):
+                    fut.result()
+                    pbar.update(1)
+        else:
             for fut in as_completed(futures):
                 fut.result()
-                pbar.update(1)
 
 
 def workspace_anon_cap_bytes() -> int:
     """Return the soft cap for anonymous in-memory workspaces.
 
-    The v6.1.0 target system has large RAM+ZRAM capacity, so the default policy now prefers
+    The v6.2.0 target system has large RAM+ZRAM capacity, so the default policy now prefers
     a capacity-relative cap instead of a small fixed hard limit:
       - YOLO_TTA_MAX_ANON_WORKSPACE_GIB: hard GiB cap (default 0 = disabled)
       - YOLO_TTA_MAX_ANON_WORKSPACE_FRACTION: fraction of total RAM+swap (default 0.50)
@@ -661,7 +680,7 @@ def decode_video_to_memmap_rgb24(
 ) -> np.ndarray:
     """Decode input video to a (T,H,W,3) uint8 workspace in RGB24.
 
-    On the v6.1.0 SLURM target the default policy is to keep the decoded source volume in RAM.
+    On the v6.2.0 SLURM target the default policy is to keep the decoded source volume in RAM.
     A disk-backed memmap is used only when the working set would be too large.
     """
     _require_bin("ffmpeg")
@@ -1134,7 +1153,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 def radial_fast_path_enabled() -> bool:
     """Fast blocked radial sampler override.
 
-    Default: disabled so the default v6.1.0 behavior remains exact Lanczos-5.
+    Default: disabled so the default v6.2.0 behavior remains exact Lanczos-5.
     Set YOLO_TTA_RADIAL_FAST=1 to opt into the faster OpenCV remap path.
     """
     return _env_flag('YOLO_TTA_RADIAL_FAST', False)
@@ -1740,7 +1759,7 @@ def _process_prediction_frame(
 ) -> Tuple[int, int]:
     """Collapse one streamed result into trace + native accumulators.
 
-    Key optimization for the v6.1.0 wall-time target:
+    Key optimization for the v6.2.0 wall-time target:
       - build the augmented-space union mask once
       - build the augmented-space per-pixel max-confidence map once
       - inverse-warp each of those exactly once
@@ -2678,29 +2697,68 @@ def assemble_model_volume_from_view_volumes(
     H: int,
     W: int,
     disable_multiplanar: bool,
+    *,
+    workers: int = 1,
 ) -> None:
     transverse = np.asarray(view_volume_mms["transverse"])
     assert transverse.shape == (T, H, W)
-    for t in tqdm(range(T), desc="Assembling volume from transverse view volume"):
-        ensemble_mm[t, :, :] |= transverse[t, :, :]
+
+    transverse_workers = choose_slice_parallel_workers(int(workers), int(T))
+
+    def _merge_transverse(t: int) -> None:
+        ensemble_mm[int(t), :, :] |= transverse[int(t), :, :]
+
+    parallel_for_indices(
+        int(T),
+        _merge_transverse,
+        max_workers=transverse_workers,
+        desc="Assembling volume from transverse view volume",
+    )
 
     if not disable_multiplanar and "sagittal" in view_volume_mms:
         sagittal = np.asarray(view_volume_mms["sagittal"])
         assert sagittal.shape == (H, T, W)
-        for y in tqdm(range(H), desc="Assembling volume from sagittal view volume"):
-            ensemble_mm[:, y, :] |= sagittal[y, :, :]
+        sagittal_workers = choose_slice_parallel_workers(int(workers), int(H))
+
+        def _merge_sagittal(y: int) -> None:
+            ensemble_mm[:, int(y), :] |= sagittal[int(y), :, :]
+
+        parallel_for_indices(
+            int(H),
+            _merge_sagittal,
+            max_workers=sagittal_workers,
+            desc="Assembling volume from sagittal view volume",
+        )
 
     if not disable_multiplanar and "coronal" in view_volume_mms:
         coronal = np.asarray(view_volume_mms["coronal"])
         assert coronal.shape == (W, T, H)
-        for x in tqdm(range(W), desc="Assembling volume from coronal view volume"):
-            ensemble_mm[:, :, x] |= coronal[x, :, :]
+        coronal_workers = choose_slice_parallel_workers(int(workers), int(W))
+
+        def _merge_coronal(x: int) -> None:
+            ensemble_mm[:, :, int(x)] |= coronal[int(x), :, :]
+
+        parallel_for_indices(
+            int(W),
+            _merge_coronal,
+            max_workers=coronal_workers,
+            desc="Assembling volume from coronal view volume",
+        )
 
     if "radial" in view_volume_mms:
         radial = np.asarray(view_volume_mms["radial"])
         assert radial.shape == (T, H, W)
-        for t in tqdm(range(T), desc="Assembling volume from radial view volume"):
-            ensemble_mm[t, :, :] |= radial[t, :, :]
+        radial_workers = choose_slice_parallel_workers(int(workers), int(T))
+
+        def _merge_radial(t: int) -> None:
+            ensemble_mm[int(t), :, :] |= radial[int(t), :, :]
+
+        parallel_for_indices(
+            int(T),
+            _merge_radial,
+            max_workers=radial_workers,
+            desc="Assembling volume from radial view volume",
+        )
 
 
 def assemble_current_ensemble_volume(
@@ -2713,6 +2771,7 @@ def assemble_current_ensemble_volume(
     *,
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
+    workers: int = 1,
 ) -> np.ndarray:
     ensemble_mm = allocate_workspace_array(
         shape=(T, H, W),
@@ -2732,6 +2791,7 @@ def assemble_current_ensemble_volume(
             H=H,
             W=W,
             disable_multiplanar=disable_multiplanar,
+            workers=int(workers),
         )
         flush_array(ensemble_mm)
 
@@ -2741,6 +2801,7 @@ def assemble_current_ensemble_volume(
 # --------------------------
 # Skeleton-based interpolation (optional)
 # --------------------------
+
 
 def _neighbors26() -> List[Tuple[int, int, int]]:
     out = []
@@ -4703,247 +4764,15 @@ def interpolate_view_volume_pass_inplace(
     }
 
 
-def _copy_volume_to_oriented_memmap(
-    src_volume_mm: np.ndarray,
-    orientation: str,
-    out_path: Path,
-    *,
-    prefer_memory: bool = True,
-    reserve_bytes: int = 16 * GIB,
-    workers: int = 1,
-) -> np.ndarray:
-    """Copy a Cartesian (T,H,W) volume into an oriented stack for slice-direction interpolation."""
-    t_dim, h_dim, w_dim = src_volume_mm.shape
-
-    if orientation == 'sagittal':
-        oriented_mm = allocate_workspace_array(
-            shape=(h_dim, t_dim, w_dim),
-            dtype=np.uint8,
-            path=out_path,
-            desc=f'Cartesian->{orientation} interpolation workspace',
-            prefer_memory=bool(prefer_memory),
-            reserve_bytes=int(reserve_bytes),
-        )
-
-        def _copy_y(y: int) -> None:
-            oriented_mm[int(y), :, :] = np.asarray(src_volume_mm[:, int(y), :], dtype=np.uint8)
-
-        parallel_for_indices(
-            int(h_dim),
-            _copy_y,
-            max_workers=choose_slice_parallel_workers(int(workers), int(h_dim)),
-            desc=f'Copy radial volume -> {orientation}',
-        )
-    elif orientation == 'coronal':
-        oriented_mm = allocate_workspace_array(
-            shape=(w_dim, t_dim, h_dim),
-            dtype=np.uint8,
-            path=out_path,
-            desc=f'Cartesian->{orientation} interpolation workspace',
-            prefer_memory=bool(prefer_memory),
-            reserve_bytes=int(reserve_bytes),
-        )
-
-        def _copy_x(x: int) -> None:
-            oriented_mm[int(x), :, :] = np.asarray(src_volume_mm[:, :, int(x)], dtype=np.uint8)
-
-        parallel_for_indices(
-            int(w_dim),
-            _copy_x,
-            max_workers=choose_slice_parallel_workers(int(workers), int(w_dim)),
-            desc=f'Copy radial volume -> {orientation}',
-        )
-    else:  # pragma: no cover
-        raise ValueError(f'Unsupported orientation for radial interpolation: {orientation}')
-
-    flush_array(oriented_mm)
-    return oriented_mm
-
-
-def _merge_added_oriented_volume_into_bridge_union(
-    src_volume_mm: np.ndarray,
-    oriented_mm: np.ndarray,
-    orientation: str,
-    bridge_union_mm: np.ndarray,
-    *,
-    workers: int = 1,
-) -> None:
-    """Collect only newly added voxels from an oriented interpolation run back into Cartesian space."""
-    t_dim, h_dim, w_dim = src_volume_mm.shape
-
-    if orientation == 'sagittal':
-        def _merge_y(y: int) -> None:
-            src_slice = np.asarray(src_volume_mm[:, int(y), :], dtype=np.uint8)
-            out_slice = np.asarray(oriented_mm[int(y)], dtype=np.uint8)
-            added = (out_slice > 0) & (src_slice == 0)
-            if np.any(added):
-                bridge_union_mm[:, int(y), :] |= added.astype(np.uint8, copy=False)
-
-        parallel_for_indices(
-            int(h_dim),
-            _merge_y,
-            max_workers=choose_slice_parallel_workers(int(workers), int(h_dim)),
-            desc=f'Collect radial {orientation} bridges',
-        )
-    elif orientation == 'coronal':
-        def _merge_x(x: int) -> None:
-            src_slice = np.asarray(src_volume_mm[:, :, int(x)], dtype=np.uint8)
-            out_slice = np.asarray(oriented_mm[int(x)], dtype=np.uint8)
-            added = (out_slice > 0) & (src_slice == 0)
-            if np.any(added):
-                bridge_union_mm[:, :, int(x)] |= added.astype(np.uint8, copy=False)
-
-        parallel_for_indices(
-            int(w_dim),
-            _merge_x,
-            max_workers=choose_slice_parallel_workers(int(workers), int(w_dim)),
-            desc=f'Collect radial {orientation} bridges',
-        )
-    else:  # pragma: no cover
-        raise ValueError(f'Unsupported orientation for radial interpolation: {orientation}')
-
-
-def interpolate_radial_view_pass_inplace(
-    mask_mm: np.ndarray,
-    work_dir: Path,
-    pass_tag: str,
-    max_slice_distance: int,
-    search_angle_deg: float,
-    interpolation_walk_back: int,
-    interpolation_candidates: int,
-    interpolate_min_radius: float,
-    keep_temp: bool = False,
-    prefer_memory: bool = True,
-    reserve_bytes: int = 16 * GIB,
-    workers: int = 1,
-) -> Dict[str, object]:
-    """Interpolate a radial backprojection in Cartesian sagittal and coronal directions simultaneously."""
-    if int(max_slice_distance) <= 0:
-        return {
-            'num_objects': 0,
-            'num_endpoints': 0,
-            'candidate_connections': 0,
-            'accepted_connections': 0,
-            'default_bridges': 0,
-            'walk_back_bridges': 0,
-            'skipped_by_min_radius': 0,
-            'added_voxels': 0,
-            'direction_modes': 'sagittal+coronal',
-            'skipped': True,
-        }
-
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    bridge_union_bytes = int(np.prod(mask_mm.shape, dtype=np.int64)) * np.dtype(np.uint8).itemsize
-    use_in_memory = bool(prefer_memory) and should_use_in_memory_workspace(bridge_union_bytes, reserve_bytes=reserve_bytes)
-    budget = workspace_budget_summary(bridge_union_bytes, reserve_bytes=reserve_bytes)
-    if use_in_memory:
-        print(f"Radial Cartesian interpolation bridge union ({pass_tag}): in-memory ({budget})")
-        bridge_union_mm: np.ndarray = np.zeros(mask_mm.shape, dtype=np.uint8)
-        bridge_union_path: Optional[Path] = None
-    else:
-        bridge_union_path = work_dir / f'{pass_tag}_radial_bridge_union.u8.dat'
-        print(f"Radial Cartesian interpolation bridge union ({pass_tag}): disk-backed ({budget}) -> {bridge_union_path.parent}")
-        bridge_union_mm = np.memmap(bridge_union_path, dtype=np.uint8, mode='w+', shape=mask_mm.shape)
-
-    directional_stats: List[Tuple[str, Dict[str, object]]] = []
-    try:
-        for orientation in ('sagittal', 'coronal'):
-            oriented_path = work_dir / f'{pass_tag}_{orientation}.u8.dat'
-            oriented_mm = _copy_volume_to_oriented_memmap(
-                mask_mm,
-                orientation,
-                oriented_path,
-                prefer_memory=bool(prefer_memory),
-                reserve_bytes=int(reserve_bytes),
-                workers=int(workers),
-            )
-            try:
-                stats = interpolate_view_volume_pass_inplace(
-                    mask_mm=oriented_mm,
-                    work_dir=work_dir / orientation,
-                    pass_tag=f'{pass_tag}_{orientation}',
-                    max_slice_distance=int(max_slice_distance),
-                    search_angle_deg=float(search_angle_deg),
-                    interpolation_walk_back=int(interpolation_walk_back),
-                    interpolation_candidates=int(interpolation_candidates),
-                    interpolate_min_radius=float(interpolate_min_radius),
-                    keep_temp=bool(keep_temp),
-                    prefer_memory=bool(prefer_memory),
-                    reserve_bytes=int(reserve_bytes),
-                    workers=int(workers),
-                )
-                directional_stats.append((orientation, dict(stats)))
-                _merge_added_oriented_volume_into_bridge_union(
-                    mask_mm,
-                    oriented_mm,
-                    orientation,
-                    bridge_union_mm,
-                    workers=int(workers),
-                )
-            finally:
-                close_memmap_array(oriented_mm)
-                del oriented_mm
-                if not keep_temp:
-                    try:
-                        oriented_path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-
-        def _merge_slice(t: int) -> None:
-            bridge_slice = np.asarray(bridge_union_mm[int(t)])
-            if np.any(bridge_slice):
-                mask_mm[int(t), :, :] |= bridge_slice
-
-        parallel_for_indices(
-            int(mask_mm.shape[0]),
-            _merge_slice,
-            max_workers=choose_slice_parallel_workers(int(workers), int(mask_mm.shape[0])),
-            desc='Interpolation: merge radial sagittal/coronal bridges',
-        )
-        flush_array(mask_mm)
-
-        if directional_stats:
-            aggregated: Dict[str, object] = {
-                'num_objects': int(max(int(s.get('num_objects', 0)) for _, s in directional_stats)),
-                'num_endpoints': int(sum(int(s.get('num_endpoints', 0)) for _, s in directional_stats)),
-                'candidate_connections': int(sum(int(s.get('candidate_connections', 0)) for _, s in directional_stats)),
-                'accepted_connections': int(sum(int(s.get('accepted_connections', 0)) for _, s in directional_stats)),
-                'default_bridges': int(sum(int(s.get('default_bridges', 0)) for _, s in directional_stats)),
-                'walk_back_bridges': int(sum(int(s.get('walk_back_bridges', 0)) for _, s in directional_stats)),
-                'skipped_by_min_radius': int(sum(int(s.get('skipped_by_min_radius', 0)) for _, s in directional_stats)),
-                'added_voxels': int(sum(int(s.get('added_voxels', 0)) for _, s in directional_stats)),
-                'direction_modes': 'sagittal+coronal',
-                'skipped': bool(all(bool(s.get('skipped', False)) for _, s in directional_stats)),
-            }
-        else:
-            aggregated = {
-                'num_objects': 0,
-                'num_endpoints': 0,
-                'candidate_connections': 0,
-                'accepted_connections': 0,
-                'default_bridges': 0,
-                'walk_back_bridges': 0,
-                'skipped_by_min_radius': 0,
-                'added_voxels': 0,
-                'direction_modes': 'sagittal+coronal',
-                'skipped': True,
-            }
-
-        return aggregated
-    finally:
-        close_memmap_array(bridge_union_mm)
-        del bridge_union_mm
-        if bridge_union_path is not None and not keep_temp:
-            try:
-                bridge_union_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+# Radial interpolation was removed in v6.2.0_SLURM.
+# Radial views still participate in inference, inverse mapping and final union,
+# but interpolation is now applied only to the Cartesian view families.
 
 
 # --------------------------
 # Final outputs
 # --------------------------
+
 
 def write_binary_outputs(
     mask_u8: np.ndarray,  # (T,H,W) 0/1
@@ -4995,6 +4824,7 @@ def write_overlay_video(
     mask_u8: np.ndarray,    # (T,H,W) 0/1
     out_path: Path,
     fps: float,
+    show_progress: bool = True,
 ) -> None:
     """Overlay blue masks (50% alpha) on original transverse frames."""
     T, H, W, _ = volume_rgb.shape
@@ -5014,7 +4844,7 @@ def write_overlay_video(
 
     try:
         assert proc.stdin is not None
-        for t in tqdm(range(T), desc=f"Writing overlay video ({out_path.name})"):
+        for t in tqdm(range(T), desc=f"Writing overlay video ({out_path.name})", disable=not show_progress):
             frame = np.asarray(volume_rgb[t]).copy()
             m = mask_u8[t].astype(bool)
             if m.any():
@@ -5079,67 +4909,6 @@ def write_yolo_labels(
     return labels_dir
 
 
-def write_result_set(
-    *,
-    volume_rgb: np.memmap,
-    mask_u8: np.ndarray,
-    out_dir: Path,
-    stem: str,
-    fps: float,
-    save_binary: bool,
-    save_labels: bool,
-    tag: Optional[str] = None,
-) -> Dict[str, Path]:
-    """
-    Write one result set. When tag is None, standard final-output names are used.
-    For troubleshooting tags, outputs are suffixed with _{tag} and placed into tag-specific folders.
-    """
-    if tag is None:
-        overlay_name = f"{stem}_Overlay.mkv"
-        binary_subdir = "binary_masks"
-        binary_prefix = f"{stem}_Binary"
-        binary_video = f"{stem}_Binary.mkv"
-        labels_subdir = "labels"
-        labels_prefix = stem
-    else:
-        overlay_name = f"{stem}_Overlay_{tag}.mkv"
-        binary_subdir = f"binary_masks_{tag.lower()}"
-        binary_prefix = f"{stem}_Binary_{tag}"
-        binary_video = f"{stem}_Binary_{tag}.mkv"
-        labels_subdir = f"labels_{tag.lower()}"
-        labels_prefix = f"{stem}_{tag}"
-
-    overlay_path = out_dir / overlay_name
-    write_overlay_video(volume_rgb, mask_u8, overlay_path, fps=fps)
-
-    result_paths: Dict[str, Path] = {"overlay": overlay_path}
-
-    if save_binary:
-        tiff_dir, vid_path = write_binary_outputs(
-            mask_u8,
-            out_dir=out_dir,
-            stem=stem,
-            fps=fps,
-            tiff_subdir=binary_subdir,
-            tiff_prefix=binary_prefix,
-            video_name=binary_video,
-        )
-        result_paths["binary_tiff_dir"] = tiff_dir
-        result_paths["binary_video"] = vid_path
-
-    if save_labels:
-        labels_dir = write_yolo_labels(
-            mask_u8,
-            out_dir=out_dir,
-            stem=stem,
-            labels_subdir=labels_subdir,
-            frame_prefix=labels_prefix,
-        )
-        result_paths["labels_dir"] = labels_dir
-
-    return result_paths
-
-
 DEFAULT_LABEL_PATTERN = "labels/{Filename}_%04d.txt"
 DEFAULT_BINARY_PATTERN = "binary_masks/{Filename}_Binary_%04d.tiff"
 
@@ -5153,12 +4922,6 @@ def _resolve_output_pattern(pattern_value: Optional[str], default_pattern: str, 
     if not path.is_absolute():
         path = out_dir / path
     return path
-
-
-def _tag_regular_path(path: Path, tag: str) -> Path:
-    suffix = "".join(path.suffixes)
-    base = path.name[:-len(suffix)] if suffix else path.name
-    return path.with_name(f"{base}_{tag}{suffix}")
 
 
 def _tag_frame_pattern(path: Path, tag: str) -> Path:
@@ -5191,46 +4954,86 @@ def _format_frame_path(pattern_path: Path, frame_idx_1based: int) -> Path:
     return pattern_path.with_name(f"{pattern_path.stem}_{int(frame_idx_1based):04d}{pattern_path.suffix}")
 
 
-def write_yolo_labels_from_pattern(mask_u8: np.ndarray, pattern_path: Path) -> Path:
+def _write_label_file_from_mask(mask2d: np.ndarray, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    m = np.asarray(mask2d) > 0
+    if not np.any(m):
+        out_path.write_text("")
+        return
+
+    polys = mask_to_yolo_polygons(m.astype(np.uint8))
+    if not polys:
+        out_path.write_text("")
+        return
+
+    lines: List[str] = []
+    for poly in polys:
+        coords: List[str] = []
+        for x, y in poly:
+            coords.append(f"{x:.6f}")
+            coords.append(f"{y:.6f}")
+        lines.append("0 " + " ".join(coords))
+    out_path.write_text("\n".join(lines) + "\n")
+
+
+def _write_binary_tiff_frame(mask2d: np.ndarray, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tifffile.imwrite(str(out_path), (np.asarray(mask2d) * 255).astype(np.uint8))
+
+
+def write_yolo_labels_from_pattern(
+    mask_u8: np.ndarray,
+    pattern_path: Path,
+    workers: int = 1,
+    show_progress: bool = True,
+) -> Path:
     pattern_path.parent.mkdir(parents=True, exist_ok=True)
-    T, H, W = mask_u8.shape
-    for t in tqdm(range(T), desc=f"Writing YOLO labels ({pattern_path.parent.name})"):
-        fp = _format_frame_path(pattern_path, t + 1)
-        fp.parent.mkdir(parents=True, exist_ok=True)
-        m = mask_u8[t] > 0
-        if not np.any(m):
-            fp.write_text("")
-            continue
-        polys = mask_to_yolo_polygons(m.astype(np.uint8))
-        if not polys:
-            fp.write_text("")
-            continue
-        lines: List[str] = []
-        for poly in polys:
-            coords: List[str] = []
-            for x, y in poly:
-                coords.append(f"{x:.6f}")
-                coords.append(f"{y:.6f}")
-            lines.append("0 " + " ".join(coords))
-        fp.write_text("\n".join(lines) + "\n")
+    total = int(mask_u8.shape[0])
+
+    def _write_frame(t: int) -> None:
+        fp = _format_frame_path(pattern_path, int(t) + 1)
+        _write_label_file_from_mask(np.asarray(mask_u8[int(t)]), fp)
+
+    parallel_for_indices(
+        total,
+        _write_frame,
+        max_workers=choose_slice_parallel_workers(int(workers), total),
+        desc=f"Writing YOLO labels ({pattern_path.parent.name})",
+        show_progress=show_progress,
+    )
     return pattern_path.parent
 
 
-def write_binary_outputs_from_pattern(
+def write_binary_tiff_sequence_from_pattern(
     mask_u8: np.ndarray,
     pattern_path: Path,
+    workers: int = 1,
+    show_progress: bool = True,
+) -> Path:
+    pattern_path.parent.mkdir(parents=True, exist_ok=True)
+    total = int(mask_u8.shape[0])
+
+    def _write_frame(t: int) -> None:
+        fp = _format_frame_path(pattern_path, int(t) + 1)
+        _write_binary_tiff_frame(np.asarray(mask_u8[int(t)]), fp)
+
+    parallel_for_indices(
+        total,
+        _write_frame,
+        max_workers=choose_slice_parallel_workers(int(workers), total),
+        desc=f"Writing binary TIFF sequence ({pattern_path.parent.name})",
+        show_progress=show_progress,
+    )
+    return pattern_path.parent
+
+
+def write_binary_video_from_mask_volume(
+    mask_u8: np.ndarray,
     video_path: Path,
     fps: float,
-) -> Tuple[Path, Path]:
+    show_progress: bool = True,
+) -> Path:
     T, H, W = mask_u8.shape
-    pattern_path.parent.mkdir(parents=True, exist_ok=True)
-
-    for t in tqdm(range(T), desc=f"Writing binary TIFF sequence ({pattern_path.parent.name})"):
-        img = (mask_u8[t] * 255).astype(np.uint8)
-        fp = _format_frame_path(pattern_path, t + 1)
-        fp.parent.mkdir(parents=True, exist_ok=True)
-        tifffile.imwrite(str(fp), img)
-
     proc = ffmpeg_rawvideo_writer(
         video_path,
         width=W,
@@ -5242,13 +5045,34 @@ def write_binary_outputs_from_pattern(
     )
     try:
         assert proc.stdin is not None
-        for t in tqdm(range(T), desc=f"Writing binary MKV ({video_path.name})"):
-            img = (mask_u8[t] * 255).astype(np.uint8)
-            proc.stdin.write(img.tobytes())
+        for t in tqdm(range(T), desc=f"Writing binary MKV ({video_path.name})", disable=not show_progress):
+            proc.stdin.write((np.asarray(mask_u8[t]) * 255).astype(np.uint8).tobytes())
     finally:
         close_ffmpeg_writer(proc)
+    return video_path
 
-    return pattern_path.parent, video_path
+
+def write_binary_outputs_from_pattern(
+    mask_u8: np.ndarray,
+    pattern_path: Path,
+    video_path: Path,
+    fps: float,
+    workers: int = 1,
+    show_progress: bool = True,
+) -> Tuple[Path, Path]:
+    tiff_dir = write_binary_tiff_sequence_from_pattern(
+        mask_u8,
+        pattern_path,
+        workers=int(workers),
+        show_progress=show_progress,
+    )
+    binary_video_path = write_binary_video_from_mask_volume(
+        mask_u8,
+        video_path,
+        fps,
+        show_progress=show_progress,
+    )
+    return tiff_dir, binary_video_path
 
 
 def write_nrrd(mask_u8: np.ndarray, out_path: Path) -> Path:
@@ -5273,26 +5097,39 @@ def write_pipeline_outputs(
     save_labels_pattern_value: Optional[str],
     save_nrrd_flag: bool,
     tag: Optional[str] = None,
+    workers: int = 1,
+    show_progress: bool = True,
 ) -> Dict[str, Path]:
     tag_suffix = f"_{tag}" if tag else ""
 
     overlay_path = out_dir / f"{stem}_Overlay{tag_suffix}.mkv"
-    write_overlay_video(volume_rgb, mask_u8, overlay_path, fps=fps)
+    write_overlay_video(volume_rgb, mask_u8, overlay_path, fps=fps, show_progress=show_progress)
     result_paths: Dict[str, Path] = {"overlay": overlay_path}
 
     labels_pattern = _resolve_output_pattern(save_labels_pattern_value, DEFAULT_LABEL_PATTERN, out_dir, stem)
     if labels_pattern is not None:
         if tag is not None:
             labels_pattern = _tag_frame_pattern(labels_pattern, tag)
-        labels_dir = write_yolo_labels_from_pattern(mask_u8, labels_pattern)
-        result_paths["labels_dir"] = labels_dir
+        result_paths["labels_dir"] = write_yolo_labels_from_pattern(
+            mask_u8,
+            labels_pattern,
+            workers=int(workers),
+            show_progress=show_progress,
+        )
 
     binary_pattern = _resolve_output_pattern(save_binary_pattern_value, DEFAULT_BINARY_PATTERN, out_dir, stem)
     if binary_pattern is not None:
         if tag is not None:
             binary_pattern = _tag_frame_pattern(binary_pattern, tag)
         binary_video_path = out_dir / f"{stem}_Binary{tag_suffix}.mkv"
-        tiff_dir, binary_video_path = write_binary_outputs_from_pattern(mask_u8, binary_pattern, binary_video_path, fps=fps)
+        tiff_dir, binary_video_path = write_binary_outputs_from_pattern(
+            mask_u8,
+            binary_pattern,
+            binary_video_path,
+            fps,
+            workers=int(workers),
+            show_progress=show_progress,
+        )
         result_paths["binary_tiff_dir"] = tiff_dir
         result_paths["binary_video"] = binary_video_path
 
@@ -5303,18 +5140,19 @@ def write_pipeline_outputs(
     return result_paths
 
 
-def iter_view_mask_frames(mask_u8: np.ndarray, view: ViewInfo) -> Iterator[np.ndarray]:
+def get_view_mask_frame_by_index(mask_u8: np.ndarray, view: ViewInfo, index: int) -> np.ndarray:
     if view.name == 'transverse':
-        for t in range(view.num_slices):
-            yield np.asarray(mask_u8[t])
-    elif view.name == 'sagittal':
-        for y in range(view.num_slices):
-            yield np.ascontiguousarray(mask_u8[:, y, :])
-    elif view.name == 'coronal':
-        for x in range(view.num_slices):
-            yield np.ascontiguousarray(mask_u8[:, :, x])
-    else:  # pragma: no cover
-        raise ValueError(f'Unknown view: {view.name}')
+        return np.asarray(mask_u8[int(index)])
+    if view.name == 'sagittal':
+        return np.ascontiguousarray(mask_u8[:, int(index), :])
+    if view.name == 'coronal':
+        return np.ascontiguousarray(mask_u8[:, :, int(index)])
+    raise ValueError(f'Unknown view: {view.name}')
+
+
+def iter_view_mask_frames(mask_u8: np.ndarray, view: ViewInfo) -> Iterator[np.ndarray]:
+    for idx in range(int(view.num_slices)):
+        yield get_view_mask_frame_by_index(mask_u8, view, int(idx))
 
 
 def write_overlay_video_for_view(
@@ -5323,9 +5161,10 @@ def write_overlay_video_for_view(
     view: ViewInfo,
     out_path: Path,
     fps: float,
+    show_progress: bool = True,
 ) -> None:
     if view.name == 'transverse':
-        write_overlay_video(volume_rgb, mask_u8, out_path, fps=fps)
+        write_overlay_video(volume_rgb, mask_u8, out_path, fps, show_progress=show_progress)
         return
 
     proc = ffmpeg_rawvideo_writer(
@@ -5341,10 +5180,12 @@ def write_overlay_video_for_view(
 
     try:
         assert proc.stdin is not None
+        iterator = zip(iter_view_frames(volume_rgb, view), iter_view_mask_frames(mask_u8, view))
         for frame_rgb, frame_mask in tqdm(
-            zip(iter_view_frames(volume_rgb, view), iter_view_mask_frames(mask_u8, view)),
+            iterator,
             total=view.num_slices,
             desc=f'Writing {view.name} overlay video ({out_path.name})',
+            disable=not show_progress,
         ):
             frame = np.asarray(frame_rgb).copy()
             m = np.asarray(frame_mask, dtype=bool)
@@ -5359,45 +5200,57 @@ def write_view_yolo_labels_from_pattern(
     mask_u8: np.ndarray,
     view: ViewInfo,
     pattern_path: Path,
+    workers: int = 1,
+    show_progress: bool = True,
 ) -> Path:
     pattern_path.parent.mkdir(parents=True, exist_ok=True)
-    for idx, frame_mask in enumerate(tqdm(iter_view_mask_frames(mask_u8, view), total=view.num_slices, desc=f'Writing YOLO labels ({pattern_path.parent.name})')):
-        fp = _format_frame_path(pattern_path, idx + 1)
-        fp.parent.mkdir(parents=True, exist_ok=True)
-        m = np.asarray(frame_mask) > 0
-        if not np.any(m):
-            fp.write_text('')
-            continue
-        polys = mask_to_yolo_polygons(m.astype(np.uint8))
-        if not polys:
-            fp.write_text('')
-            continue
-        lines: List[str] = []
-        for poly in polys:
-            coords: List[str] = []
-            for x, y in poly:
-                coords.append(f'{x:.6f}')
-                coords.append(f'{y:.6f}')
-            lines.append('0 ' + ' '.join(coords))
-        fp.write_text('\n'.join(lines) + '\n')
+    total = int(view.num_slices)
+
+    def _write_frame(idx: int) -> None:
+        fp = _format_frame_path(pattern_path, int(idx) + 1)
+        _write_label_file_from_mask(get_view_mask_frame_by_index(mask_u8, view, int(idx)), fp)
+
+    parallel_for_indices(
+        total,
+        _write_frame,
+        max_workers=choose_slice_parallel_workers(int(workers), total),
+        desc=f'Writing YOLO labels ({pattern_path.parent.name})',
+        show_progress=show_progress,
+    )
     return pattern_path.parent
 
 
-def write_view_binary_outputs_from_pattern(
+def write_view_binary_tiff_sequence_from_pattern(
     mask_u8: np.ndarray,
     view: ViewInfo,
     pattern_path: Path,
+    workers: int = 1,
+    show_progress: bool = True,
+) -> Path:
+    pattern_path.parent.mkdir(parents=True, exist_ok=True)
+    total = int(view.num_slices)
+
+    def _write_frame(idx: int) -> None:
+        fp = _format_frame_path(pattern_path, int(idx) + 1)
+        _write_binary_tiff_frame(get_view_mask_frame_by_index(mask_u8, view, int(idx)), fp)
+
+    parallel_for_indices(
+        total,
+        _write_frame,
+        max_workers=choose_slice_parallel_workers(int(workers), total),
+        desc=f'Writing binary TIFF sequence ({pattern_path.parent.name})',
+        show_progress=show_progress,
+    )
+    return pattern_path.parent
+
+
+def write_view_binary_video_from_mask_volume(
+    mask_u8: np.ndarray,
+    view: ViewInfo,
     video_path: Path,
     fps: float,
-) -> Tuple[Path, Path]:
-    pattern_path.parent.mkdir(parents=True, exist_ok=True)
-
-    for idx, frame_mask in enumerate(tqdm(iter_view_mask_frames(mask_u8, view), total=view.num_slices, desc=f'Writing binary TIFF sequence ({pattern_path.parent.name})')):
-        img = (np.asarray(frame_mask) * 255).astype(np.uint8)
-        fp = _format_frame_path(pattern_path, idx + 1)
-        fp.parent.mkdir(parents=True, exist_ok=True)
-        tifffile.imwrite(str(fp), img)
-
+    show_progress: bool = True,
+) -> Path:
     proc = ffmpeg_rawvideo_writer(
         video_path,
         width=view.src_w,
@@ -5409,13 +5262,37 @@ def write_view_binary_outputs_from_pattern(
     )
     try:
         assert proc.stdin is not None
-        for frame_mask in tqdm(iter_view_mask_frames(mask_u8, view), total=view.num_slices, desc=f'Writing binary MKV ({video_path.name})'):
-            img = (np.asarray(frame_mask) * 255).astype(np.uint8)
-            proc.stdin.write(img.tobytes())
+        for idx in tqdm(range(view.num_slices), total=view.num_slices, desc=f'Writing binary MKV ({video_path.name})', disable=not show_progress):
+            proc.stdin.write((np.asarray(get_view_mask_frame_by_index(mask_u8, view, int(idx))) * 255).astype(np.uint8).tobytes())
     finally:
         close_ffmpeg_writer(proc)
+    return video_path
 
-    return pattern_path.parent, video_path
+
+def write_view_binary_outputs_from_pattern(
+    mask_u8: np.ndarray,
+    view: ViewInfo,
+    pattern_path: Path,
+    video_path: Path,
+    fps: float,
+    workers: int = 1,
+    show_progress: bool = True,
+) -> Tuple[Path, Path]:
+    tiff_dir = write_view_binary_tiff_sequence_from_pattern(
+        mask_u8,
+        view,
+        pattern_path,
+        workers=int(workers),
+        show_progress=show_progress,
+    )
+    binary_video_path = write_view_binary_video_from_mask_volume(
+        mask_u8,
+        view,
+        video_path,
+        fps,
+        show_progress=show_progress,
+    )
+    return tiff_dir, binary_video_path
 
 
 def write_additional_view_outputs(
@@ -5429,24 +5306,40 @@ def write_additional_view_outputs(
     save_binary_pattern_value: Optional[str],
     save_labels_pattern_value: Optional[str],
     tag: Optional[str] = None,
+    workers: int = 1,
+    show_progress: bool = True,
 ) -> Dict[str, Path]:
     pretty = view.name.capitalize()
     tag_suffix = f'_{tag}' if tag else ''
     overlay_path = out_dir / f'{stem}_{pretty}_Overlay{tag_suffix}.mkv'
-    write_overlay_video_for_view(volume_rgb, mask_u8, view, overlay_path, fps=fps)
+    write_overlay_video_for_view(volume_rgb, mask_u8, view, overlay_path, fps, show_progress=show_progress)
     result_paths: Dict[str, Path] = {f'{view.name}_overlay': overlay_path}
 
     labels_pattern = _resolve_output_pattern(save_labels_pattern_value, DEFAULT_LABEL_PATTERN, out_dir, stem)
     if labels_pattern is not None:
         labels_pattern = _tag_frame_pattern(labels_pattern, pretty if tag is None else f'{pretty}_{tag}')
-        labels_dir = write_view_yolo_labels_from_pattern(mask_u8, view, labels_pattern)
+        labels_dir = write_view_yolo_labels_from_pattern(
+            mask_u8,
+            view,
+            labels_pattern,
+            workers=int(workers),
+            show_progress=show_progress,
+        )
         result_paths[f'{view.name}_labels_dir'] = labels_dir
 
     binary_pattern = _resolve_output_pattern(save_binary_pattern_value, DEFAULT_BINARY_PATTERN, out_dir, stem)
     if binary_pattern is not None:
         binary_pattern = _tag_frame_pattern(binary_pattern, pretty if tag is None else f'{pretty}_{tag}')
         binary_video_path = out_dir / f'{stem}_{pretty}_Binary{tag_suffix}.mkv'
-        tiff_dir, binary_video_path = write_view_binary_outputs_from_pattern(mask_u8, view, binary_pattern, binary_video_path, fps)
+        tiff_dir, binary_video_path = write_view_binary_outputs_from_pattern(
+            mask_u8,
+            view,
+            binary_pattern,
+            binary_video_path,
+            fps,
+            workers=int(workers),
+            show_progress=show_progress,
+        )
         result_paths[f'{view.name}_binary_tiff_dir'] = tiff_dir
         result_paths[f'{view.name}_binary_video'] = binary_video_path
 
@@ -5463,6 +5356,8 @@ def write_multiplanar_outputs(
     save_binary_pattern_value: Optional[str],
     save_labels_pattern_value: Optional[str],
     tag: Optional[str] = None,
+    workers: int = 1,
+    show_progress: bool = True,
 ) -> Dict[str, Path]:
     t_dim, h_dim, w_dim = mask_u8.shape
     views = {v.name: v for v in get_view_infos(t_dim, h_dim, w_dim, disable_multiplanar=False, azimuth_angle=0.0, include_radial=False)}
@@ -5478,8 +5373,161 @@ def write_multiplanar_outputs(
             save_binary_pattern_value=save_binary_pattern_value,
             save_labels_pattern_value=save_labels_pattern_value,
             tag=tag,
+            workers=int(workers),
+            show_progress=show_progress,
         ))
     return result_paths
+
+
+@dataclass
+class BackgroundOutputSubmission:
+    label: str
+    result_paths: Dict[str, Path]
+    futures: List[Future] = field(default_factory=list)
+    resources: List[object] = field(default_factory=list)
+
+    def wait(self) -> Dict[str, Path]:
+        error: Optional[BaseException] = None
+        try:
+            for fut in self.futures:
+                fut.result()
+        except BaseException as exc:  # pragma: no cover - surfaced to main
+            error = exc
+        finally:
+            for resource in self.resources:
+                close_memmap_array(resource)
+        if error is not None:
+            raise RuntimeError(f'Background output generation failed for {self.label}') from error
+        return self.result_paths
+
+
+class BackgroundOutputManager:
+    def __init__(self, max_workers: int) -> None:
+        self.max_workers = max(1, int(max_workers))
+        self.executor = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix='yolo-output')
+        self.pending: List[BackgroundOutputSubmission] = []
+
+    def submit(self, submission: BackgroundOutputSubmission) -> Dict[str, Path]:
+        self.pending.append(submission)
+        return submission.result_paths
+
+    def reap_completed(self) -> None:
+        remaining: List[BackgroundOutputSubmission] = []
+        for submission in self.pending:
+            if all(fut.done() for fut in submission.futures):
+                submission.wait()
+            else:
+                remaining.append(submission)
+        self.pending = remaining
+
+    def wait(self) -> None:
+        error: Optional[BaseException] = None
+        try:
+            while self.pending:
+                submission = self.pending.pop(0)
+                try:
+                    submission.wait()
+                except BaseException as exc:  # pragma: no cover - surfaced to main
+                    if error is None:
+                        error = exc
+        finally:
+            self.executor.shutdown(wait=True)
+        if error is not None:
+            raise error
+
+
+def collect_pipeline_output_futures(
+    executor: ThreadPoolExecutor,
+    *,
+    volume_rgb: np.memmap,
+    mask_u8: np.ndarray,
+    out_dir: Path,
+    stem: str,
+    fps: float,
+    save_binary_pattern_value: Optional[str],
+    save_labels_pattern_value: Optional[str],
+    save_nrrd_flag: bool,
+    tag: Optional[str] = None,
+    frame_workers: int = 1,
+    show_progress: bool = False,
+) -> Tuple[Dict[str, Path], List[Future]]:
+    futures: List[Future] = []
+    result_paths: Dict[str, Path] = {}
+    tag_suffix = f"_{tag}" if tag else ""
+
+    overlay_path = out_dir / f"{stem}_Overlay{tag_suffix}.mkv"
+    futures.append(executor.submit(write_overlay_video, volume_rgb, mask_u8, overlay_path, fps, show_progress))
+    result_paths["overlay"] = overlay_path
+
+    labels_pattern = _resolve_output_pattern(save_labels_pattern_value, DEFAULT_LABEL_PATTERN, out_dir, stem)
+    if labels_pattern is not None:
+        if tag is not None:
+            labels_pattern = _tag_frame_pattern(labels_pattern, tag)
+        futures.append(executor.submit(write_yolo_labels_from_pattern, mask_u8, labels_pattern, int(frame_workers), show_progress))
+        result_paths["labels_dir"] = labels_pattern.parent
+
+    binary_pattern = _resolve_output_pattern(save_binary_pattern_value, DEFAULT_BINARY_PATTERN, out_dir, stem)
+    if binary_pattern is not None:
+        if tag is not None:
+            binary_pattern = _tag_frame_pattern(binary_pattern, tag)
+        binary_video_path = out_dir / f"{stem}_Binary{tag_suffix}.mkv"
+        futures.append(executor.submit(write_binary_tiff_sequence_from_pattern, mask_u8, binary_pattern, int(frame_workers), show_progress))
+        futures.append(executor.submit(write_binary_video_from_mask_volume, mask_u8, binary_video_path, fps, show_progress))
+        result_paths["binary_tiff_dir"] = binary_pattern.parent
+        result_paths["binary_video"] = binary_video_path
+
+    if bool(save_nrrd_flag):
+        nrrd_path = out_dir / f"{stem}{tag_suffix}.nrrd"
+        futures.append(executor.submit(write_nrrd, mask_u8, nrrd_path))
+        result_paths["nrrd"] = nrrd_path
+
+    return result_paths, futures
+
+
+def collect_multiplanar_output_futures(
+    executor: ThreadPoolExecutor,
+    *,
+    volume_rgb: np.memmap,
+    mask_u8: np.ndarray,
+    out_dir: Path,
+    stem: str,
+    fps: float,
+    save_binary_pattern_value: Optional[str],
+    save_labels_pattern_value: Optional[str],
+    tag: Optional[str] = None,
+    frame_workers: int = 1,
+    show_progress: bool = False,
+) -> Tuple[Dict[str, Path], List[Future]]:
+    t_dim, h_dim, w_dim = mask_u8.shape
+    views = {v.name: v for v in get_view_infos(t_dim, h_dim, w_dim, disable_multiplanar=False, azimuth_angle=0.0, include_radial=False)}
+    futures: List[Future] = []
+    result_paths: Dict[str, Path] = {}
+
+    for view_name in ('sagittal', 'coronal'):
+        view = views[view_name]
+        pretty = view.name.capitalize()
+        tag_suffix = f'_{tag}' if tag else ''
+
+        overlay_path = out_dir / f'{stem}_{pretty}_Overlay{tag_suffix}.mkv'
+        futures.append(executor.submit(write_overlay_video_for_view, volume_rgb, mask_u8, view, overlay_path, fps, show_progress))
+        result_paths[f'{view.name}_overlay'] = overlay_path
+
+        labels_pattern = _resolve_output_pattern(save_labels_pattern_value, DEFAULT_LABEL_PATTERN, out_dir, stem)
+        if labels_pattern is not None:
+            labels_pattern = _tag_frame_pattern(labels_pattern, pretty if tag is None else f'{pretty}_{tag}')
+            futures.append(executor.submit(write_view_yolo_labels_from_pattern, mask_u8, view, labels_pattern, int(frame_workers), show_progress))
+            result_paths[f'{view.name}_labels_dir'] = labels_pattern.parent
+
+        binary_pattern = _resolve_output_pattern(save_binary_pattern_value, DEFAULT_BINARY_PATTERN, out_dir, stem)
+        if binary_pattern is not None:
+            binary_pattern = _tag_frame_pattern(binary_pattern, pretty if tag is None else f'{pretty}_{tag}')
+            binary_video_path = out_dir / f'{stem}_{pretty}_Binary{tag_suffix}.mkv'
+            futures.append(executor.submit(write_view_binary_tiff_sequence_from_pattern, mask_u8, view, binary_pattern, int(frame_workers), show_progress))
+            futures.append(executor.submit(write_view_binary_video_from_mask_volume, mask_u8, view, binary_video_path, fps, show_progress))
+            result_paths[f'{view.name}_binary_tiff_dir'] = binary_pattern.parent
+            result_paths[f'{view.name}_binary_video'] = binary_video_path
+
+    return result_paths, futures
 
 
 def write_summary_file(
@@ -5500,6 +5548,7 @@ def write_summary_file(
     augmentation_workers: int,
     slice_postprocess_workers: int,
     interpolation_workers: int,
+    output_workers: int,
 ) -> Path:
     lines: List[str] = []
     lines.append(f'Command: {command}')
@@ -5512,6 +5561,7 @@ def write_summary_file(
     lines.append(f'Augmentation workers: {int(augmentation_workers)}')
     lines.append(f'Slice-parallel postprocess workers: {int(slice_postprocess_workers)}')
     lines.append(f'Interpolation workers: {int(interpolation_workers)}')
+    lines.append(f'Output workers: {int(output_workers)}')
     lines.append(f'Models: {", ".join(str(Path(m)) for m in model_paths)}')
     lines.append(f'Views: {", ".join(view_names)}')
 
@@ -5545,9 +5595,6 @@ def write_summary_file(
                 f'bridges_skipped_by_--interpolate_min_radius={total_skipped}, added_voxels={total_added_voxels}'
             )
             for s in sorted(stats_this_pass, key=lambda d: (str(d.get('model', '')), str(d.get('view', '')))):
-                mode_suffix = ''
-                if s.get('direction_modes'):
-                    mode_suffix = f", direction_modes={s.get('direction_modes')}"
                 lines.append(
                     f"    {s.get('model', '?')}/{s.get('view', '?')}: "
                     f"objects={int(s.get('num_objects', 0))}, "
@@ -5558,7 +5605,7 @@ def write_summary_file(
                     f"walk_back_bridges={int(s.get('walk_back_bridges', 0))}, "
                     f"bridges_skipped_by_--interpolate_min_radius={int(s.get('skipped_by_min_radius', 0))}, "
                     f"added_voxels={int(s.get('added_voxels', 0))}, "
-                    f"skipped={bool(s.get('skipped', False))}{mode_suffix}"
+                    f"skipped={bool(s.get('skipped', False))}"
                 )
 
     if voxel_volume is not None:
@@ -5686,16 +5733,26 @@ def main() -> None:
         int(args.interpolation_workers),
         'YOLO_TTA_INTERPOLATION_WORKERS',
         default_interpolation_workers(),
-        max_tasks=max(1, len(yolo_models) * len(views)),
+        max_tasks=max(1, len(yolo_models) * len(cartesian_views)),
     )
+    output_workers = resolve_worker_count(
+        0,
+        'YOLO_TTA_OUTPUT_WORKERS',
+        default_output_workers(),
+        max_tasks=12,
+    )
+    output_frame_workers = max(1, min(8, _env_int('YOLO_TTA_OUTPUT_FRAME_WORKERS', max(1, min(4, output_workers)))))
     slice_postprocess_workers = max(1, int(augmentation_workers))
     predict_postprocess_workers = max(1, min(16, _env_int('YOLO_TTA_PREDICT_POSTPROCESS_WORKERS', slice_postprocess_workers)))
     print(f'Augmentation workers: {augmentation_workers}')
     print(f'Slice-parallel postprocess workers: {slice_postprocess_workers}')
     print(f'Inference postprocess workers: {predict_postprocess_workers}')
     print(f'Interpolation workers: {interpolation_workers}')
+    print(f'Background output workers: {output_workers} (frame workers per labels/TIFF task: {output_frame_workers})')
 
-    if augmentation_workers > 1 or interpolation_workers > 1 or slice_postprocess_workers > 1:
+    output_manager = BackgroundOutputManager(max_workers=output_workers)
+
+    if augmentation_workers > 1 or interpolation_workers > 1 or slice_postprocess_workers > 1 or output_workers > 1:
         try:
             cv2.setNumThreads(1)
         except Exception:
@@ -5866,7 +5923,7 @@ def main() -> None:
 
     gc.collect()
 
-    def build_current_finalized_volume(snapshot_stem: str) -> np.ndarray:
+    def build_current_snapshot_volume(snapshot_stem: str, *, apply_void_fill: bool) -> np.ndarray:
         ensemble_mm = assemble_current_ensemble_volume(
             view_volumes_by_model=view_volumes_by_model,
             T=T,
@@ -5875,21 +5932,24 @@ def main() -> None:
             disable_multiplanar=bool(args.disable_multiplanar),
             out_path=temp_dir / f'{snapshot_stem}.u8.dat',
             prefer_memory=True,
+            workers=slice_postprocess_workers,
         )
-        fill_3d_voids_inplace_streaming(
-            ensemble_mm,
-            temp_dir / f'{snapshot_stem}_voidfill',
-            keep_temp=bool(args.troubleshooting),
-            prefer_memory=True,
-        )
+        if bool(apply_void_fill):
+            fill_3d_voids_inplace_streaming(
+                ensemble_mm,
+                temp_dir / f'{snapshot_stem}_voidfill',
+                keep_temp=bool(args.troubleshooting),
+                prefer_memory=True,
+            )
         return ensemble_mm
 
     interpolation_stats: List[Dict[str, object]] = []
 
     if bool(args.troubleshooting) and int(args.interpolate) > 0:
-        print('\n=== Writing troubleshooting outputs: pass 0 (pre-interpolation) ===')
-        pass0_mm = build_current_finalized_volume('ensemble_pass0')
-        pass0_paths = write_pipeline_outputs(
+        print('\n=== Scheduling troubleshooting outputs: pass 0 (pre-interpolation, pre-void-fill) ===')
+        pass0_mm = build_current_snapshot_volume('ensemble_pass0', apply_void_fill=False)
+        pass0_paths, pass0_futures = collect_pipeline_output_futures(
+            output_manager.executor,
             volume_rgb=volume_rgb,
             mask_u8=pass0_mm,
             out_dir=out_dir,
@@ -5899,9 +5959,12 @@ def main() -> None:
             save_labels_pattern_value=args.save_labels,
             save_nrrd_flag=bool(args.save_nrrd),
             tag='Pass0',
+            frame_workers=output_frame_workers,
+            show_progress=False,
         )
         if bool(args.save_multiplanar):
-            pass0_paths.update(write_multiplanar_outputs(
+            extra_paths, extra_futures = collect_multiplanar_output_futures(
+                output_manager.executor,
                 volume_rgb=volume_rgb,
                 mask_u8=pass0_mm,
                 out_dir=out_dir,
@@ -5910,8 +5973,17 @@ def main() -> None:
                 save_binary_pattern_value=args.save_binary,
                 save_labels_pattern_value=args.save_labels,
                 tag='Pass0',
-            ))
-        close_memmap_array(pass0_mm)
+                frame_workers=output_frame_workers,
+                show_progress=False,
+            )
+            pass0_paths.update(extra_paths)
+            pass0_futures.extend(extra_futures)
+        output_manager.submit(BackgroundOutputSubmission(
+            label='Pass0 outputs',
+            result_paths=pass0_paths,
+            futures=pass0_futures,
+            resources=[pass0_mm],
+        ))
         del pass0_mm
         gc.collect()
 
@@ -5925,10 +5997,12 @@ def main() -> None:
                 f"min_radius={float(args.interpolate_min_radius):g}, "
                 f"search_angle={float(args.interpolation_search_angle):g}) ==="
             )
+            output_manager.reap_completed()
+
             task_specs: List[Tuple[str, ViewInfo]] = [
                 (model_name, view)
                 for model_name in sorted(view_volumes_by_model.keys())
-                for view in views
+                for view in cartesian_views
             ]
             outer_interpolation_workers = min(int(interpolation_workers), max(1, len(task_specs)))
             per_task_interpolation_workers = max(
@@ -5944,34 +6018,19 @@ def main() -> None:
                 model_name, view = task_specs[int(task_index)]
                 print(f"\n--- Interpolating model '{model_name}' view '{view.name}' ---")
                 current_mm = view_volumes_by_model[model_name][view.name]
-                if view.family == 'radial':
-                    stats_local = interpolate_radial_view_pass_inplace(
-                        mask_mm=current_mm,
-                        work_dir=temp_dir / 'interpolation' / model_name / view.name,
-                        pass_tag=f'pass{pass_idx}',
-                        max_slice_distance=int(args.interpolate),
-                        search_angle_deg=float(args.interpolation_search_angle),
-                        interpolation_walk_back=int(args.interpolation_walk_back),
-                        interpolation_candidates=int(args.interpolation_candidates),
-                        interpolate_min_radius=float(args.interpolate_min_radius),
-                        keep_temp=bool(args.troubleshooting),
-                        prefer_memory=True,
-                        workers=per_task_interpolation_workers,
-                    )
-                else:
-                    stats_local = interpolate_view_volume_pass_inplace(
-                        mask_mm=current_mm,
-                        work_dir=temp_dir / 'interpolation' / model_name / view.name,
-                        pass_tag=f'pass{pass_idx}',
-                        max_slice_distance=int(args.interpolate),
-                        search_angle_deg=float(args.interpolation_search_angle),
-                        interpolation_walk_back=int(args.interpolation_walk_back),
-                        interpolation_candidates=int(args.interpolation_candidates),
-                        interpolate_min_radius=float(args.interpolate_min_radius),
-                        keep_temp=bool(args.troubleshooting),
-                        prefer_memory=True,
-                        workers=per_task_interpolation_workers,
-                    )
+                stats_local = interpolate_view_volume_pass_inplace(
+                    mask_mm=current_mm,
+                    work_dir=temp_dir / 'interpolation' / model_name / view.name,
+                    pass_tag=f'pass{pass_idx}',
+                    max_slice_distance=int(args.interpolate),
+                    search_angle_deg=float(args.interpolation_search_angle),
+                    interpolation_walk_back=int(args.interpolation_walk_back),
+                    interpolation_candidates=int(args.interpolation_candidates),
+                    interpolate_min_radius=float(args.interpolate_min_radius),
+                    keep_temp=bool(args.troubleshooting),
+                    prefer_memory=True,
+                    workers=per_task_interpolation_workers,
+                )
 
                 stats_local = dict(stats_local)
                 stats_local.update({
@@ -5998,9 +6057,10 @@ def main() -> None:
                     interpolation_stats.append(_run_interpolation_task(task_idx))
 
             if bool(args.troubleshooting) and pass_idx < total_passes:
-                print(f"\n=== Writing troubleshooting outputs: pass {pass_idx} ===")
-                pass_mm = build_current_finalized_volume(f'ensemble_pass{pass_idx}')
-                pass_paths = write_pipeline_outputs(
+                print(f"\n=== Scheduling troubleshooting outputs: pass {pass_idx} (pre-next-pass, pre-void-fill) ===")
+                pass_mm = build_current_snapshot_volume(f'ensemble_pass{pass_idx}', apply_void_fill=False)
+                pass_paths, pass_futures = collect_pipeline_output_futures(
+                    output_manager.executor,
                     volume_rgb=volume_rgb,
                     mask_u8=pass_mm,
                     out_dir=out_dir,
@@ -6010,9 +6070,12 @@ def main() -> None:
                     save_labels_pattern_value=args.save_labels,
                     save_nrrd_flag=bool(args.save_nrrd),
                     tag=f'Pass{pass_idx}',
+                    frame_workers=output_frame_workers,
+                    show_progress=False,
                 )
                 if bool(args.save_multiplanar):
-                    pass_paths.update(write_multiplanar_outputs(
+                    extra_paths, extra_futures = collect_multiplanar_output_futures(
+                        output_manager.executor,
                         volume_rgb=volume_rgb,
                         mask_u8=pass_mm,
                         out_dir=out_dir,
@@ -6021,13 +6084,22 @@ def main() -> None:
                         save_binary_pattern_value=args.save_binary,
                         save_labels_pattern_value=args.save_labels,
                         tag=f'Pass{pass_idx}',
-                    ))
-                close_memmap_array(pass_mm)
+                        frame_workers=output_frame_workers,
+                        show_progress=False,
+                    )
+                    pass_paths.update(extra_paths)
+                    pass_futures.extend(extra_futures)
+                output_manager.submit(BackgroundOutputSubmission(
+                    label=f'Pass{pass_idx} outputs',
+                    result_paths=pass_paths,
+                    futures=pass_futures,
+                    resources=[pass_mm],
+                ))
                 del pass_mm
                 gc.collect()
     else:
         for model_name in sorted(view_volumes_by_model.keys()):
-            for view in views:
+            for view in cartesian_views:
                 entry: Dict[str, object] = {
                     'pass_index': 0,
                     'model': str(model_name),
@@ -6046,9 +6118,9 @@ def main() -> None:
                     'added_voxels': 0,
                     'skipped': True,
                 }
-                if view.family == 'radial':
-                    entry['direction_modes'] = 'sagittal+coronal'
                 interpolation_stats.append(entry)
+
+    output_manager.reap_completed()
 
     final_ensemble_mm = assemble_current_ensemble_volume(
         view_volumes_by_model=view_volumes_by_model,
@@ -6058,6 +6130,7 @@ def main() -> None:
         disable_multiplanar=bool(args.disable_multiplanar),
         out_path=temp_dir / 'ensemble_volume_final.u8.dat',
         prefer_memory=True,
+        workers=slice_postprocess_workers,
     )
 
     print('\n=== 3D void fill after multiplanar/model union ===')
@@ -6067,7 +6140,10 @@ def main() -> None:
         keep_temp=bool(args.troubleshooting),
         prefer_memory=True,
     )
-    final_paths = write_pipeline_outputs(
+
+    print('\n=== Scheduling final outputs in background ===')
+    final_paths, final_futures = collect_pipeline_output_futures(
+        output_manager.executor,
         volume_rgb=volume_rgb,
         mask_u8=final_ensemble_mm,
         out_dir=out_dir,
@@ -6077,9 +6153,12 @@ def main() -> None:
         save_labels_pattern_value=args.save_labels,
         save_nrrd_flag=bool(args.save_nrrd),
         tag=None,
+        frame_workers=output_frame_workers,
+        show_progress=False,
     )
     if bool(args.save_multiplanar):
-        final_paths.update(write_multiplanar_outputs(
+        extra_paths, extra_futures = collect_multiplanar_output_futures(
+            output_manager.executor,
             volume_rgb=volume_rgb,
             mask_u8=final_ensemble_mm,
             out_dir=out_dir,
@@ -6088,13 +6167,32 @@ def main() -> None:
             save_binary_pattern_value=args.save_binary,
             save_labels_pattern_value=args.save_labels,
             tag=None,
-        ))
+            frame_workers=output_frame_workers,
+            show_progress=False,
+        )
+        final_paths.update(extra_paths)
+        final_futures.extend(extra_futures)
+    output_manager.submit(BackgroundOutputSubmission(
+        label='final outputs',
+        result_paths=final_paths,
+        futures=final_futures,
+        resources=[],
+    ))
 
     voxel_volume = None
     if bool(args.voxel_volume):
-        voxel_volume = 0
-        for z in tqdm(range(final_ensemble_mm.shape[0]), desc='Counting voxel_volume'):
-            voxel_volume += int(np.count_nonzero(np.asarray(final_ensemble_mm[z])))
+        voxel_counts = np.zeros((int(final_ensemble_mm.shape[0]),), dtype=np.int64)
+
+        def _count_voxels(z: int) -> None:
+            voxel_counts[int(z)] = np.int64(np.count_nonzero(np.asarray(final_ensemble_mm[int(z)])))
+
+        parallel_for_indices(
+            int(final_ensemble_mm.shape[0]),
+            _count_voxels,
+            max_workers=choose_slice_parallel_workers(int(slice_postprocess_workers), int(final_ensemble_mm.shape[0])),
+            desc='Counting voxel_volume',
+        )
+        voxel_volume = int(np.sum(voxel_counts, dtype=np.int64))
 
     summary_path = write_summary_file(
         out_dir / f'{input_path.stem}_Summary.txt',
@@ -6113,7 +6211,10 @@ def main() -> None:
         augmentation_workers=augmentation_workers,
         slice_postprocess_workers=slice_postprocess_workers,
         interpolation_workers=interpolation_workers,
+        output_workers=output_workers,
     )
+
+    output_manager.wait()
 
     close_memmap_array(final_ensemble_mm)
     for model_views in view_volumes_by_model.values():
