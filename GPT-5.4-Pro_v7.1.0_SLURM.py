@@ -2,14 +2,14 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large video volumes.
 
-This v7.0.2_SLURM specification-aligned script:
+This v7.1.0_SLURM specification-aligned script:
   - builds transverse, sagittal, coronal and optional radial view families
   - generates rotated / scaled / shifted FFV1 MKV augmentations via a single affine transform per variant
   - runs Ultralytics YOLO segmentation sequentially on the pre-generated augmentation videos
   - stores per-augmentation traces to disk, undoes the affine transforms, unions masks per slice and tracks per-pixel max confidence for --min_conf
   - fills 2D holes after per-frame unions, interpolates Cartesian view volumes only in their native slice direction, unions the interpolated view volumes, and performs the final 3D void fill once after that union
   - prefers in-memory workspaces on the SLURM target and falls back to disk-backed scratch only when the working set is too large
-  - parallelizes augmentation generation across independent slices, overlaps in-memory augmentation staging with ordered video writes, parallelizes slice-independent postprocessing and assembly, parallelizes CPR branch-build work across independent Cartesian components, and overlaps independent output creation in background workers
+  - parallelizes augmentation generation across independent slices, overlaps in-memory augmentation staging with ordered video writes, parallelizes slice-independent postprocessing and assembly, parallelizes CPR branch-build work across independent Cartesian components, overlaps CPR branch video writing in a separate background process with sequential CPR inference, and overlaps independent output creation in background workers
   - extracts radial diameter slices with exact Lanczos-5 interpolation by default
 
 Dependencies (Python):
@@ -146,6 +146,8 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Save additional Sagittal and Coronal outputs. If multiplanar inference was disabled, these are resliced from the final unified volume for saving only")
     p.add_argument("--save_radial", action="store_true",
                    help="Save additional Radial outputs when radial views are active")
+    p.add_argument("--save_cpr", action="store_true",
+                   help="Save additional CPR outputs when CPR refinement is active")
     p.add_argument("--voxel_volume", action="store_true", help="Count white voxels in the final binary output and save to the summary text file")
     p.add_argument("--troubleshooting", action="store_true",
                    help="Keep temp files and save pass snapshots before each interpolation pass")
@@ -2726,13 +2728,19 @@ def _orthonormal_basis(axis: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.nda
 
 
 def _plane_uv_grid(half_width: int) -> Tuple[np.ndarray, np.ndarray]:
-    cached = _PLANE_GRID_CACHE.get(int(half_width))
-    if cached is not None:
-        return cached
+    half_width_i = int(half_width)
+    cache_limit = max(0, _env_int('YOLO_TTA_PLANE_GRID_CACHE_MAX_HALF_WIDTH', 512))
 
-    coords = np.arange(-int(half_width), int(half_width) + 1, dtype=np.float32)
+    if half_width_i <= cache_limit:
+        cached = _PLANE_GRID_CACHE.get(half_width_i)
+        if cached is not None:
+            return cached
+
+    coords = np.arange(-half_width_i, half_width_i + 1, dtype=np.float32)
     vv, uu = np.meshgrid(coords, coords, indexing="ij")
-    _PLANE_GRID_CACHE[int(half_width)] = (uu, vv)
+
+    if half_width_i <= cache_limit:
+        _PLANE_GRID_CACHE[half_width_i] = (uu, vv)
     return uu, vv
 
 
@@ -3654,11 +3662,42 @@ def interpolate_view_volume_pass_inplace(
 @dataclass(frozen=True)
 class CPRBranch:
     branch_id: int
-    points: np.ndarray                                                        
-    smoothed_points: np.ndarray                
-    tangents: np.ndarray                       
-    half_width: int
-    native_size: int
+    points: np.ndarray
+    smoothed_points: np.ndarray
+    tangents: np.ndarray
+    frame_half_widths: np.ndarray
+
+    @property
+    def num_frames(self) -> int:
+        return int(self.smoothed_points.shape[0])
+
+    @property
+    def min_half_width(self) -> int:
+        if int(self.frame_half_widths.size) <= 0:
+            return 0
+        return int(np.min(np.asarray(self.frame_half_widths, dtype=np.int32)))
+
+    @property
+    def max_half_width(self) -> int:
+        if int(self.frame_half_widths.size) <= 0:
+            return 0
+        return int(np.max(np.asarray(self.frame_half_widths, dtype=np.int32)))
+
+    @property
+    def min_native_size(self) -> int:
+        return int(2 * int(self.min_half_width) + 1)
+
+    @property
+    def max_native_size(self) -> int:
+        return int(2 * int(self.max_half_width) + 1)
+
+    def half_width_for_frame(self, idx: int) -> int:
+        if int(self.frame_half_widths.size) <= 0:
+            return 0
+        return int(np.asarray(self.frame_half_widths, dtype=np.int32)[int(idx)])
+
+    def native_size_for_frame(self, idx: int) -> int:
+        return int(2 * int(self.half_width_for_frame(int(idx))) + 1)
 
 
 def _edge_key_3d(a: Tuple[int, int, int], b: Tuple[int, int, int]) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
@@ -3711,7 +3750,6 @@ def decompose_skeleton_into_branches(skel: np.ndarray) -> List[np.ndarray]:
 
             branches.append(np.asarray(path, dtype=np.int32))
 
-                                                                                   
     for node in sorted(pts):
         for nbr in neighbors[node]:
             edge = _edge_key_3d(node, nbr)
@@ -3739,7 +3777,6 @@ def decompose_skeleton_into_branches(skel: np.ndarray) -> List[np.ndarray]:
 
             branches.append(np.asarray(path, dtype=np.int32))
 
-                                                         
     out: List[np.ndarray] = []
     seen_keys: set[Tuple[Tuple[int, int, int], ...]] = set()
     for branch in branches:
@@ -3794,12 +3831,50 @@ def compute_centerline_tangents(points: np.ndarray) -> np.ndarray:
     return tangents
 
 
+def cpr_max_plane_half_width(volume_shape: Tuple[int, int, int], center: np.ndarray, tangent: np.ndarray) -> int:
+    bounds_max = np.asarray([int(volume_shape[0]) - 1, int(volume_shape[1]) - 1, int(volume_shape[2]) - 1], dtype=np.float32)
+    center_f = np.clip(np.asarray(center, dtype=np.float32), 0.0, bounds_max)
+    _, u_axis, v_axis = _orthonormal_basis(tangent)
+    coeff = np.abs(u_axis) + np.abs(v_axis)
+
+    max_half = float('inf')
+    for dim in range(3):
+        dim_coeff = float(coeff[dim])
+        if dim_coeff <= 1e-6:
+            continue
+        max_half = min(
+            max_half,
+            float(center_f[dim]) / dim_coeff,
+            float(bounds_max[dim] - center_f[dim]) / dim_coeff,
+        )
+
+    if not math.isfinite(max_half):
+        return 0
+    return max(0, int(math.floor(max_half + 1e-6)))
+
+
+def compute_cpr_frame_half_widths(
+    volume_shape: Tuple[int, int, int],
+    centers: np.ndarray,
+    tangents: np.ndarray,
+) -> np.ndarray:
+    centers_f = np.asarray(centers, dtype=np.float32)
+    tangents_f = np.asarray(tangents, dtype=np.float32)
+    if centers_f.ndim != 2 or centers_f.shape[1] != 3 or tangents_f.shape != centers_f.shape:
+        raise ValueError('CPR centers/tangents must have matching shape (N, 3)')
+
+    out = np.zeros((int(centers_f.shape[0]),), dtype=np.int32)
+    for idx in range(int(centers_f.shape[0])):
+        out[idx] = np.int32(cpr_max_plane_half_width(volume_shape, centers_f[idx], tangents_f[idx]))
+    return out
+
+
 def _make_cpr_component_task(
     labels_mm: np.ndarray,
     label: int,
     sl: Tuple[slice, slice, slice],
-    max_half_width: int,
-) -> Tuple[int, Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]], np.ndarray, int]:
+    volume_shape: Tuple[int, int, int],
+) -> Tuple[int, Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]], np.ndarray, Tuple[int, int, int]]:
     z_sl, y_sl, x_sl = sl
     bounds = (
         (int(z_sl.start), int(z_sl.stop)),
@@ -3807,13 +3882,13 @@ def _make_cpr_component_task(
         (int(x_sl.start), int(x_sl.stop)),
     )
     submask = np.ascontiguousarray(np.asarray(labels_mm[z_sl, y_sl, x_sl] == int(label), dtype=np.uint8))
-    return int(label), bounds, submask, int(max_half_width)
+    return int(label), bounds, submask, tuple(int(x) for x in volume_shape)
 
 
 def _build_cpr_component_branches_task(
-    task: Tuple[int, Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]], np.ndarray, int]
-) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]]:
-    _, bounds, submask_u8, max_half_width = task
+    task: Tuple[int, Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]], np.ndarray, Tuple[int, int, int]]
+) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    _, bounds, submask_u8, volume_shape = task
     submask = np.asarray(submask_u8, dtype=bool)
     if not np.any(submask):
         return []
@@ -3823,35 +3898,29 @@ def _build_cpr_component_branches_task(
     if not raw_branches:
         return []
 
-    dist = ndi.distance_transform_edt(submask)
     z0, _ = bounds[0]
     y0, _ = bounds[1]
     x0, _ = bounds[2]
     offset_i32 = np.asarray([int(z0), int(y0), int(x0)], dtype=np.int32)
     offset_f32 = np.asarray([float(z0), float(y0), float(x0)], dtype=np.float32)
+    bounds_max = np.asarray([int(volume_shape[0]) - 1, int(volume_shape[1]) - 1, int(volume_shape[2]) - 1], dtype=np.float32)
 
-    out: List[Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]] = []
+    out: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
     for pts in raw_branches:
         pts = np.asarray(pts, dtype=np.int32)
         if pts.ndim != 2 or pts.shape[1] != 3 or int(pts.shape[0]) <= 0:
             continue
 
-        smoothed = smooth_centerline(pts.astype(np.float32), window=min(9, max(3, int(pts.shape[0]) | 1)))
-        tangents = compute_centerline_tangents(smoothed)
-
-        idx_z = np.clip(pts[:, 0], 0, submask.shape[0] - 1)
-        idx_y = np.clip(pts[:, 1], 0, submask.shape[1] - 1)
-        idx_x = np.clip(pts[:, 2], 0, submask.shape[2] - 1)
-        radii = np.asarray(dist[idx_z, idx_y, idx_x], dtype=np.float32)
-        robust_radius = float(np.percentile(radii, 95.0)) if radii.size else 1.0
-        half_width = int(max(8, min(int(max_half_width), math.ceil(max(1.0, robust_radius) * 2.0) + 4)))
+        smoothed_local = smooth_centerline(pts.astype(np.float32), window=min(9, max(3, int(pts.shape[0]) | 1)))
+        smoothed_global = np.clip(smoothed_local + offset_f32[None, :], 0.0, bounds_max)
+        tangents = compute_centerline_tangents(smoothed_global)
+        frame_half_widths = compute_cpr_frame_half_widths(volume_shape, smoothed_global, tangents)
 
         out.append((
             np.ascontiguousarray(pts + offset_i32[None, :], dtype=np.int32),
-            np.ascontiguousarray(smoothed + offset_f32[None, :], dtype=np.float32),
+            np.ascontiguousarray(smoothed_global, dtype=np.float32),
             np.ascontiguousarray(tangents, dtype=np.float32),
-            int(half_width),
-            int(2 * half_width + 1),
+            np.ascontiguousarray(frame_half_widths, dtype=np.int32),
         ))
 
     return out
@@ -3902,23 +3971,22 @@ def build_cpr_branches(
         return []
 
     component_workers = choose_slice_parallel_workers(int(workers), len(objects))
-    global_max_half_width = max(8, min(255, int(min(mask_arr.shape[1], mask_arr.shape[2]) // 2)))
+    volume_shape = tuple(int(x) for x in mask_arr.shape)
     print(f'CPR: skeletonizing {len(objects)} connected component(s) with {component_workers} worker(s)')
 
     branches: List[CPRBranch] = []
     next_branch_id = 1
 
-    def _append_component_branches(component_branches: List[Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]]) -> None:
+    def _append_component_branches(component_branches: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]) -> None:
         nonlocal next_branch_id
-        for points, smoothed_points, tangents, half_width, native_size in component_branches:
+        for points, smoothed_points, tangents, frame_half_widths in component_branches:
             branches.append(
                 CPRBranch(
                     branch_id=int(next_branch_id),
                     points=np.asarray(points, dtype=np.int32),
                     smoothed_points=np.asarray(smoothed_points, dtype=np.float32),
                     tangents=np.asarray(tangents, dtype=np.float32),
-                    half_width=int(half_width),
-                    native_size=int(native_size),
+                    frame_half_widths=np.asarray(frame_half_widths, dtype=np.int32),
                 )
             )
             next_branch_id += 1
@@ -3926,12 +3994,12 @@ def build_cpr_branches(
     try:
         if component_workers <= 1 or len(objects) <= 1:
             for label, sl in tqdm(objects, desc='CPR: build branches'):
-                task = _make_cpr_component_task(labels_mm, int(label), sl, int(global_max_half_width))
+                task = _make_cpr_component_task(labels_mm, int(label), sl, volume_shape)
                 _append_component_branches(_build_cpr_component_branches_task(task))
         else:
-            def _task_index_worker(idx: int) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]]:
+            def _task_index_worker(idx: int) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
                 label, sl = objects[int(idx)]
-                task = _make_cpr_component_task(labels_mm, int(label), sl, int(global_max_half_width))
+                task = _make_cpr_component_task(labels_mm, int(label), sl, volume_shape)
                 return _build_cpr_component_branches_task(task)
 
             use_process_pool = __name__ == '__main__'
@@ -3945,7 +4013,7 @@ def build_cpr_branches(
                         while next_idx < len(objects) or pending:
                             while next_idx < len(objects) and len(pending) < max_pending:
                                 label, sl = objects[next_idx]
-                                task = _make_cpr_component_task(labels_mm, int(label), sl, int(global_max_half_width))
+                                task = _make_cpr_component_task(labels_mm, int(label), sl, volume_shape)
                                 pending.append(executor.submit(_build_cpr_component_branches_task, task))
                                 next_idx += 1
 
@@ -3970,7 +4038,6 @@ def build_cpr_branches(
                     p.unlink(missing_ok=True)
                 except Exception:
                     pass
-
 
 def build_cpr_support_labels(
     mask_u8: np.ndarray,
@@ -4139,18 +4206,8 @@ def write_cpr_branch_video(
     out_path: Path,
     imgsz: int,
     fps: float,
-) -> AffineSpec:
-    aff = build_affine(
-        view=f'cpr_branch_{branch.branch_id}',
-        src_w=int(branch.native_size),
-        src_h=int(branch.native_size),
-        out_size=int(imgsz),
-        angle_deg=0.0,
-        shift_dx=0,
-        shift_dy=0,
-        pad_mode='clamp',
-    )
-
+    meta_path: Optional[Path] = None,
+) -> Dict[str, object]:
     writer = ffmpeg_rawvideo_writer(
         out_path,
         width=int(imgsz),
@@ -4162,29 +4219,136 @@ def write_cpr_branch_video(
     )
     try:
         assert writer.stdin is not None
-        for idx in tqdm(range(int(branch.smoothed_points.shape[0])), desc=f'CPR branch {branch.branch_id}: writing video'):
+        for idx in range(int(branch.num_frames)):
+            half_width = int(branch.half_width_for_frame(idx))
+            native_size = int(branch.native_size_for_frame(idx))
             native = sample_cpr_plane_rgb_lanczos5(
                 volume_rgb=volume_rgb,
                 center=np.asarray(branch.smoothed_points[idx], dtype=np.float32),
                 tangent=np.asarray(branch.tangents[idx], dtype=np.float32),
-                half_width=int(branch.half_width),
+                half_width=half_width,
             )
-            if int(imgsz) == int(branch.native_size):
+            if int(imgsz) == native_size:
                 frame = native
             else:
-                frame = cv2.warpAffine(
-                    native,
-                    aff.M_src_to_out,
-                    dsize=(int(imgsz), int(imgsz)),
-                    flags=cv2.INTER_LINEAR,
-                    borderMode=cv2.BORDER_CONSTANT,
-                    borderValue=(0, 0, 0),
-                )
+                frame = cv2.resize(native, (int(imgsz), int(imgsz)), interpolation=cv2.INTER_LINEAR)
             writer.stdin.write(np.ascontiguousarray(frame).tobytes())
     finally:
         close_ffmpeg_writer(writer)
 
-    return aff
+    meta: Dict[str, object] = {
+        'branch_id': int(branch.branch_id),
+        'num_frames': int(branch.num_frames),
+        'imgsz': int(imgsz),
+        'frame_half_widths': [int(x) for x in np.asarray(branch.frame_half_widths, dtype=np.int32).tolist()],
+        'frame_native_sizes': [int(2 * int(x) + 1) for x in np.asarray(branch.frame_half_widths, dtype=np.int32).tolist()],
+        'min_native_size': int(branch.min_native_size),
+        'max_native_size': int(branch.max_native_size),
+    }
+    if meta_path is not None:
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(json.dumps(meta, indent=2))
+    return meta
+
+
+def _write_cpr_branch_video_worker(
+    volume_dat_path: str,
+    volume_shape: Tuple[int, int, int, int],
+    branch: CPRBranch,
+    out_path_str: str,
+    imgsz: int,
+    fps: float,
+    meta_path_str: Optional[str] = None,
+) -> Dict[str, object]:
+    volume_rgb = np.memmap(volume_dat_path, dtype=np.uint8, mode='r', shape=tuple(int(x) for x in volume_shape))
+    try:
+        meta_path = Path(meta_path_str) if meta_path_str else None
+        return write_cpr_branch_video(
+            volume_rgb=volume_rgb,
+            branch=branch,
+            out_path=Path(out_path_str),
+            imgsz=int(imgsz),
+            fps=float(fps),
+            meta_path=meta_path,
+        )
+    finally:
+        close_memmap_array(volume_rgb)
+
+
+def _build_prediction_union_confmap(
+    masks_np: Optional[np.ndarray],
+    confs_np: Optional[np.ndarray],
+    out_size: int,
+) -> Tuple[np.ndarray, np.ndarray, float, int]:
+    frame_union = np.zeros((int(out_size), int(out_size)), dtype=np.uint8)
+    frame_confmap = np.zeros((int(out_size), int(out_size)), dtype=np.float32)
+    frame_max_conf = 0.0
+
+    if masks_np is None or confs_np is None or masks_np.ndim != 3 or int(masks_np.shape[0]) <= 0:
+        return frame_union, frame_confmap, float(frame_max_conf), 0
+
+    num_inst = int(masks_np.shape[0])
+    for inst_idx in range(num_inst):
+        inst = np.asarray(masks_np[inst_idx], dtype=np.uint8)
+        if inst.shape[0] != int(out_size) or inst.shape[1] != int(out_size):
+            inst = cv2.resize(inst, (int(out_size), int(out_size)), interpolation=cv2.INTER_NEAREST)
+        inst = (inst > 0).astype(np.uint8, copy=False)
+        if not np.any(inst):
+            continue
+
+        conf_val = float(confs_np[inst_idx]) if inst_idx < int(confs_np.shape[0]) else 0.0
+        frame_union |= inst
+        if conf_val > frame_max_conf:
+            frame_max_conf = conf_val
+        inst_bool = inst > 0
+        frame_confmap[inst_bool] = np.maximum(frame_confmap[inst_bool], np.float32(conf_val))
+
+    return frame_union, frame_confmap, float(frame_max_conf), int(num_inst)
+
+
+def _resize_cpr_prediction_to_native(
+    frame_union_out: np.ndarray,
+    frame_confmap_out: np.ndarray,
+    native_size: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    native_size_i = max(1, int(native_size))
+    if frame_union_out.shape[0] == native_size_i and frame_union_out.shape[1] == native_size_i:
+        native_union = np.asarray(frame_union_out, dtype=np.uint8)
+        native_conf = np.asarray(frame_confmap_out, dtype=np.float32)
+    else:
+        native_union = cv2.resize(np.asarray(frame_union_out, dtype=np.uint8), (native_size_i, native_size_i), interpolation=cv2.INTER_NEAREST)
+        native_conf = cv2.resize(np.asarray(frame_confmap_out, dtype=np.float32), (native_size_i, native_size_i), interpolation=cv2.INTER_NEAREST)
+    return np.asarray(native_union, dtype=np.uint8), np.asarray(native_conf, dtype=np.float32)
+
+
+def _coords_conf_to_local_bbox(
+    coords_list: Sequence[np.ndarray],
+    conf_list: Sequence[np.ndarray],
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[Tuple[slice, slice, slice]]]:
+    if not coords_list:
+        return None, None, None
+
+    coords_all = np.concatenate([np.asarray(c, dtype=np.int32) for c in coords_list], axis=0)
+    conf_all = np.concatenate([np.asarray(c, dtype=np.float32) for c in conf_list], axis=0)
+    if coords_all.size == 0 or conf_all.size == 0:
+        return None, None, None
+
+    mins = np.min(coords_all, axis=0).astype(np.int32, copy=False)
+    maxs = np.max(coords_all, axis=0).astype(np.int32, copy=False)
+    local_shape = tuple(int(maxs[d] - mins[d] + 1) for d in range(3))
+    bbox = (
+        slice(int(mins[0]), int(maxs[0]) + 1),
+        slice(int(mins[1]), int(maxs[1]) + 1),
+        slice(int(mins[2]), int(maxs[2]) + 1),
+    )
+
+    local_conf = np.zeros(local_shape, dtype=np.float16)
+    local_flat = local_conf.reshape(-1)
+    local_coords = coords_all - mins[None, :]
+    flat_idx = np.ravel_multi_index(local_coords.T, local_shape)
+    np.maximum.at(local_flat, flat_idx, conf_all.astype(np.float16, copy=False))
+    local_mask = (local_conf > 0).astype(np.uint8, copy=False)
+    return local_mask, local_conf, bbox
 
 
 def apply_3d_min_conf_filter_inplace(mask_u8: np.ndarray, conf_map: np.ndarray, min_conf: float) -> None:
@@ -4219,67 +4383,145 @@ def apply_3d_min_conf_filter_inplace(mask_u8: np.ndarray, conf_map: np.ndarray, 
     np.asarray(conf_map)[:] = conf_arr.astype(conf_map.dtype, copy=False)
 
 
-def map_cpr_branch_predictions_to_local_bbox(
+def predict_cpr_video_to_local_bbox(
     branch: CPRBranch,
-    union_mm: np.ndarray,
-    confmap_mm: np.ndarray,
+    video_path: Path,
+    yolo_models: Sequence[Tuple[str, object]],
+    cfg: PredictConfig,
+    branch_dir: Path,
     volume_shape: Tuple[int, int, int],
-) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[Tuple[slice, slice, slice]]]:
+    *,
+    save_pred_traces: bool = False,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[Tuple[slice, slice, slice]], Dict[str, int]]:
+    num_frames = int(branch.num_frames)
+    out_size = int(cfg.imgsz)
     coords_list: List[np.ndarray] = []
     conf_list: List[np.ndarray] = []
+    prediction_count = 0
+    frames_with_predictions = 0
 
-    native_size = int(branch.native_size)
+    frame_half_widths = np.asarray(branch.frame_half_widths, dtype=np.int32)
 
-    for idx in range(int(branch.smoothed_points.shape[0])):
-        packed = np.asarray(union_mm[idx])
-        if not any_mask(packed):
-            continue
+    for model_name, yolo in yolo_models:
+        pred_mask_mm: Optional[np.ndarray] = None
+        pred_conf_mm: Optional[np.ndarray] = None
+        pred_prefix = branch_dir / 'preds' / model_name / 'cpr'
+        model_prediction_count = 0
+        model_frames_with_predictions = 0
 
-        mask2d = unpack_mask(packed, native_size, native_size).astype(bool, copy=False)
-        if not np.any(mask2d):
-            continue
+        if bool(save_pred_traces):
+            pred_prefix.parent.mkdir(parents=True, exist_ok=True)
+            out_bytes = bytes_for_packbits(out_size, out_size)
+            pred_mask_mm = np.memmap(
+                pred_prefix.with_suffix('.mask.packbits.dat'),
+                dtype=np.uint8,
+                mode='w+',
+                shape=(num_frames, out_bytes),
+            )
+            pred_conf_mm = np.memmap(
+                pred_prefix.with_suffix('.conf.f16.dat'),
+                dtype=np.float16,
+                mode='w+',
+                shape=(num_frames,),
+            )
+            pred_mask_mm[:, :] = 0
+            pred_conf_mm[:] = np.float16(0.0)
 
-        z_idx, y_idx, x_idx = build_cpr_frame_nn_maps(
-            volume_shape=volume_shape,
-            center=np.asarray(branch.smoothed_points[idx], dtype=np.float32),
-            tangent=np.asarray(branch.tangents[idx], dtype=np.float32),
-            half_width=int(branch.half_width),
-        )
-        yy, xx = np.nonzero(mask2d)
-        if yy.size == 0:
-            continue
+        try:
+            results = yolo.predict(
+                source=str(video_path),
+                imgsz=cfg.imgsz,
+                conf=cfg.conf,
+                iou=1.0,
+                save=False,
+                stream=True,
+                task='segment',
+                retina_masks=True,
+                batch=1,
+                device=cfg.device,
+                half=cfg.half,
+                int8=cfg.int8,
+                verbose=False,
+            )
 
-        coords = np.stack([z_idx[yy, xx], y_idx[yy, xx], x_idx[yy, xx]], axis=1).astype(np.int32, copy=False)
-        conf_vals = np.asarray(confmap_mm[idx], dtype=np.float32)[yy, xx]
-        keep = conf_vals > 0.0
-        if not np.any(keep):
-            continue
+            for idx, r in enumerate(results):
+                if idx >= num_frames:
+                    break
 
-        coords_list.append(coords[keep])
-        conf_list.append(conf_vals[keep].astype(np.float32, copy=False))
+                masks_np, confs_np = _extract_result_masks_and_confs(r)
+                frame_union_out, frame_confmap_out, frame_max_conf, num_inst = _build_prediction_union_confmap(
+                    masks_np,
+                    confs_np,
+                    out_size,
+                )
+                prediction_count += int(num_inst)
+                model_prediction_count += int(num_inst)
 
-    if not coords_list:
-        return None, None, None
+                if pred_mask_mm is not None and pred_conf_mm is not None:
+                    pred_mask_mm[idx, :] = pack_mask(frame_union_out)
+                    pred_conf_mm[idx] = np.float16(frame_max_conf)
 
-    coords_all = np.concatenate(coords_list, axis=0)
-    conf_all = np.concatenate(conf_list, axis=0)
+                if not np.any(frame_union_out):
+                    continue
 
-    mins = np.min(coords_all, axis=0).astype(np.int32, copy=False)
-    maxs = np.max(coords_all, axis=0).astype(np.int32, copy=False)
-    local_shape = tuple(int(maxs[d] - mins[d] + 1) for d in range(3))
-    bbox = (
-        slice(int(mins[0]), int(maxs[0]) + 1),
-        slice(int(mins[1]), int(maxs[1]) + 1),
-        slice(int(mins[2]), int(maxs[2]) + 1),
-    )
+                native_size = max(1, int(2 * int(frame_half_widths[idx]) + 1))
+                native_union, native_conf = _resize_cpr_prediction_to_native(
+                    frame_union_out,
+                    frame_confmap_out,
+                    native_size,
+                )
+                if not np.any(native_union):
+                    continue
 
-    local_conf = np.zeros(local_shape, dtype=np.float16)
-    local_flat = local_conf.reshape(-1)
-    local_coords = coords_all - mins[None, :]
-    flat_idx = np.ravel_multi_index(local_coords.T, local_shape)
-    np.maximum.at(local_flat, flat_idx, conf_all.astype(np.float16, copy=False))
-    local_mask = (local_conf > 0).astype(np.uint8, copy=False)
-    return local_mask, local_conf, bbox
+                z_idx, y_idx, x_idx = build_cpr_frame_nn_maps(
+                    volume_shape=volume_shape,
+                    center=np.asarray(branch.smoothed_points[idx], dtype=np.float32),
+                    tangent=np.asarray(branch.tangents[idx], dtype=np.float32),
+                    half_width=int(frame_half_widths[idx]),
+                )
+                yy, xx = np.nonzero(native_union > 0)
+                if yy.size == 0:
+                    continue
+
+                conf_vals = np.asarray(native_conf[yy, xx], dtype=np.float32)
+                keep = conf_vals > 0.0
+                if not np.any(keep):
+                    continue
+
+                coords = np.stack([z_idx[yy, xx], y_idx[yy, xx], x_idx[yy, xx]], axis=1).astype(np.int32, copy=False)
+                coords_list.append(coords[keep])
+                conf_list.append(conf_vals[keep].astype(np.float32, copy=False))
+                frames_with_predictions += 1
+                model_frames_with_predictions += 1
+        finally:
+            if pred_mask_mm is not None and pred_conf_mm is not None:
+                flush_array(pred_mask_mm)
+                flush_array(pred_conf_mm)
+                meta = {
+                    'video': str(video_path),
+                    'num_frames': int(num_frames),
+                    'out_size': int(out_size),
+                    'mask_packbits_bytes': int(bytes_for_packbits(out_size, out_size)),
+                    'prediction_count': int(model_prediction_count),
+                    'frames_with_predictions': int(model_frames_with_predictions),
+                    'cfg': {
+                        'imgsz': int(cfg.imgsz),
+                        'conf': float(cfg.conf),
+                        'device': str(cfg.device),
+                        'half': bool(cfg.half),
+                        'int8': bool(cfg.int8),
+                    },
+                    'cpr_native_size_mode': 'per-frame-boundary-clamped',
+                }
+                pred_prefix.with_suffix('.meta.json').write_text(json.dumps(meta, indent=2))
+                close_memmap_array(pred_mask_mm)
+                close_memmap_array(pred_conf_mm)
+
+    local_mask, local_conf, bbox = _coords_conf_to_local_bbox(coords_list, conf_list)
+    return local_mask, local_conf, bbox, {
+        'prediction_count': int(prediction_count),
+        'frames_with_predictions': int(frames_with_predictions),
+    }
 
 
 def gate_cpr_components_by_support(
@@ -4311,6 +4553,7 @@ def gate_cpr_components_by_support(
 def apply_cpr_refinement_inplace(
     cartesian_mm: np.ndarray,
     volume_rgb: np.ndarray,
+    volume_dat_path: Path,
     yolo_models: Sequence[Tuple[str, object]],
     pred_cfg: PredictConfig,
     temp_dir: Path,
@@ -4321,7 +4564,11 @@ def apply_cpr_refinement_inplace(
     predict_postprocess_workers: int = 1,
     slice_workers: int = 1,
     troubleshooting: bool = False,
+    save_cpr: bool = False,
+    output_dir: Optional[Path] = None,
 ) -> Dict[str, int]:
+    del predict_postprocess_workers  # CPR inference remains sequential; video writing is overlapped in a background process.
+
     cartesian_view = np.asarray(cartesian_mm)
     if not np.any(cartesian_view):
         return {
@@ -4332,12 +4579,17 @@ def apply_cpr_refinement_inplace(
             'added_voxels': 0,
         }
 
-    cpr_root = temp_dir / 'cpr'
-    cpr_root.mkdir(parents=True, exist_ok=True)
+    cpr_work_root = temp_dir / 'cpr'
+    cpr_work_root.mkdir(parents=True, exist_ok=True)
+    cpr_output_root = (Path(output_dir).expanduser().resolve() / 'cpr') if bool(save_cpr) and output_dir is not None else cpr_work_root
+    cpr_output_root.mkdir(parents=True, exist_ok=True)
+
+    if not Path(volume_dat_path).exists():
+        raise FileNotFoundError(f'CPR background video writer requires a file-backed decoded volume: {volume_dat_path}')
 
     branches = build_cpr_branches(
         cartesian_view,
-        cpr_root / 'branch_build',
+        cpr_work_root / 'branch_build',
         keep_temp=bool(troubleshooting),
         workers=max(1, int(slice_workers)),
     )
@@ -4354,107 +4606,122 @@ def apply_cpr_refinement_inplace(
     support_mm = build_cpr_support_labels(
         cartesian_view,
         branches,
-        cpr_root / 'support_regions.u32.dat',
+        cpr_work_root / 'support_regions.u32.dat',
         prefer_memory=True,
     )
 
-    total_branch_frames = int(sum(int(b.smoothed_points.shape[0]) for b in branches))
+    total_branch_frames = int(sum(int(b.num_frames) for b in branches))
     total_components = 0
     accepted_components = 0
     added_voxels = 0
 
+    cpr_write_ahead = max(1, _env_int('YOLO_TTA_CPR_WRITE_AHEAD', 2))
+    print(f'CPR: background video writer process enabled (write-ahead={cpr_write_ahead})')
+
     try:
-        for branch in branches:
-            branch_dir = cpr_root / f'branch_{branch.branch_id:04d}'
-            branch_dir.mkdir(parents=True, exist_ok=True)
-            video_path = branch_dir / 'cpr.mkv'
+        mp_ctx = mp.get_context('spawn')
+        with ProcessPoolExecutor(max_workers=1, mp_context=mp_ctx) as video_writer_pool:
+            pending_videos: Dict[int, Tuple[Future, Path, Path, Path]] = {}
+            next_submit_idx = 0
 
-            print(
-                f"CPR: branch {branch.branch_id}/{len(branches)} "
-                f"(samples={int(branch.smoothed_points.shape[0])}, native={int(branch.native_size)}x{int(branch.native_size)})"
-            )
-            aff = write_cpr_branch_video(
-                volume_rgb=volume_rgb,
-                branch=branch,
-                out_path=video_path,
-                imgsz=int(pred_cfg.imgsz),
-                fps=float(fps),
-            )
-
-            num_frames = int(branch.smoothed_points.shape[0])
-            native_size = int(branch.native_size)
-            bytes_native = bytes_for_packbits(native_size, native_size)
-
-            branch_union = allocate_workspace_array(
-                shape=(num_frames, bytes_native),
-                dtype=np.uint8,
-                path=branch_dir / 'mapped_union.packbits.dat',
-                desc=f'CPR branch {branch.branch_id} union workspace',
-                prefer_memory=True,
-            )
-            branch_conf = allocate_workspace_array(
-                shape=(num_frames, native_size, native_size),
-                dtype=np.float16,
-                path=branch_dir / 'mapped_conf.f16.dat',
-                desc=f'CPR branch {branch.branch_id} confidence workspace',
-                prefer_memory=True,
-            )
-            branch_union[:] = 0
-            branch_conf[:] = np.float16(0.0)
-
-            try:
-                for model_name, yolo in yolo_models:
-                    pred_prefix = branch_dir / 'preds' / model_name / 'cpr'
-                    predict_video_and_accumulate(
-                        model=yolo,
-                        video_path=video_path,
-                        num_frames=num_frames,
-                        out_size=int(pred_cfg.imgsz),
-                        pred_out_prefix=pred_prefix,
-                        cfg=pred_cfg,
-                        view_union_mm=branch_union,
-                        view_confmap_mm=branch_conf,
-                        M_out_to_native=aff.M_out_to_src,
-                        native_h=native_size,
-                        native_w=native_size,
-                        postprocess_workers=int(predict_postprocess_workers),
+            def _submit_pending_videos() -> None:
+                nonlocal next_submit_idx
+                while next_submit_idx < len(branches) and len(pending_videos) < int(cpr_write_ahead):
+                    branch = branches[next_submit_idx]
+                    branch_dir = cpr_output_root / f'branch_{branch.branch_id:04d}'
+                    branch_dir.mkdir(parents=True, exist_ok=True)
+                    video_path = branch_dir / 'cpr.mkv'
+                    meta_path = branch_dir / 'cpr.meta.json'
+                    future = video_writer_pool.submit(
+                        _write_cpr_branch_video_worker,
+                        str(volume_dat_path),
+                        tuple(int(x) for x in np.asarray(volume_rgb).shape),
+                        branch,
+                        str(video_path),
+                        int(pred_cfg.imgsz),
+                        float(fps),
+                        str(meta_path),
                     )
+                    pending_videos[int(branch.branch_id)] = (future, branch_dir, video_path, meta_path)
+                    next_submit_idx += 1
 
-                local_mask, local_conf, bbox = map_cpr_branch_predictions_to_local_bbox(
-                    branch=branch,
-                    union_mm=branch_union,
-                    confmap_mm=branch_conf,
-                    volume_shape=tuple(int(x) for x in cartesian_view.shape),
+            _submit_pending_videos()
+
+            for branch_idx, branch in enumerate(branches, start=1):
+                _submit_pending_videos()
+                future, branch_dir, video_path, meta_path = pending_videos.pop(int(branch.branch_id))
+                video_meta = future.result()
+                _submit_pending_videos()
+
+                print(
+                    f"CPR: branch {branch.branch_id}/{len(branches)} "
+                    f"(samples={int(branch.num_frames)}, native={int(branch.min_native_size)}..{int(branch.max_native_size)})"
                 )
-            finally:
-                close_memmap_array(branch_union)
-                close_memmap_array(branch_conf)
 
-            if local_mask is None or local_conf is None or bbox is None or not np.any(local_mask):
-                if not troubleshooting:
+                local_mask, local_conf, bbox, pred_stats = predict_cpr_video_to_local_bbox(
+                    branch=branch,
+                    video_path=video_path,
+                    yolo_models=yolo_models,
+                    cfg=pred_cfg,
+                    branch_dir=branch_dir,
+                    volume_shape=tuple(int(x) for x in cartesian_view.shape),
+                    save_pred_traces=bool(save_cpr or troubleshooting),
+                )
+
+                if bool(save_cpr or troubleshooting):
+                    summary_path = branch_dir / 'branch_summary.json'
+                    bbox_payload = None if bbox is None else [
+                        [int(bbox[0].start), int(bbox[0].stop)],
+                        [int(bbox[1].start), int(bbox[1].stop)],
+                        [int(bbox[2].start), int(bbox[2].stop)],
+                    ]
+                    summary_path.write_text(json.dumps({
+                        'branch_id': int(branch.branch_id),
+                        'branch_index': int(branch_idx),
+                        'num_frames': int(branch.num_frames),
+                        'min_native_size': int(branch.min_native_size),
+                        'max_native_size': int(branch.max_native_size),
+                        'prediction_count': int(pred_stats.get('prediction_count', 0)),
+                        'frames_with_predictions': int(pred_stats.get('frames_with_predictions', 0)),
+                        'local_bbox_zyx': bbox_payload,
+                        'video_meta': video_meta,
+                    }, indent=2))
+
+                if local_mask is None or local_conf is None or bbox is None or not np.any(local_mask):
+                    if not troubleshooting and not save_cpr:
+                        shutil.rmtree(branch_dir, ignore_errors=True)
+                    continue
+
+                if float(min_conf) > 0.0:
+                    apply_3d_min_conf_filter_inplace(local_mask, local_conf, float(min_conf))
+                if float(min_radius) > 0.0 and np.any(local_mask):
+                    apply_transverse_min_radius_filter_inplace(local_mask, float(min_radius), workers=max(1, min(int(slice_workers), int(local_mask.shape[0]))))
+                    local_conf[np.asarray(local_mask) == 0] = np.float16(0.0)
+
+                support_local = np.asarray(support_mm[bbox]) == int(branch.branch_id)
+                gated_mask, gated_conf, num_components, num_accepted = gate_cpr_components_by_support(local_mask, local_conf, support_local)
+                total_components += int(num_components)
+                accepted_components += int(num_accepted)
+
+                if bool(save_cpr or troubleshooting):
+                    summary_path = branch_dir / 'branch_summary.json'
+                    payload = json.loads(summary_path.read_text()) if summary_path.exists() else {}
+                    payload.update({
+                        'candidate_components': int(num_components),
+                        'accepted_components': int(num_accepted),
+                        'accepted_local_voxels': int(np.count_nonzero(np.asarray(gated_mask))),
+                    })
+                    summary_path.write_text(json.dumps(payload, indent=2))
+
+                if np.any(gated_mask):
+                    target = np.asarray(cartesian_mm[bbox])
+                    add = np.asarray(gated_mask, dtype=bool) & (~np.asarray(target, dtype=bool))
+                    added_voxels += int(np.count_nonzero(add))
+                    np.asarray(cartesian_mm[bbox])[:] = np.asarray(target, dtype=np.uint8) | np.asarray(gated_mask, dtype=np.uint8)
+                    flush_array(cartesian_mm)
+
+                if not troubleshooting and not save_cpr:
                     shutil.rmtree(branch_dir, ignore_errors=True)
-                continue
-
-            if float(min_conf) > 0.0:
-                apply_3d_min_conf_filter_inplace(local_mask, local_conf, float(min_conf))
-            if float(min_radius) > 0.0 and np.any(local_mask):
-                apply_transverse_min_radius_filter_inplace(local_mask, float(min_radius), workers=max(1, min(int(slice_workers), int(local_mask.shape[0]))))
-                local_conf[np.asarray(local_mask) == 0] = np.float16(0.0)
-
-            support_local = np.asarray(support_mm[bbox]) == int(branch.branch_id)
-            gated_mask, gated_conf, num_components, num_accepted = gate_cpr_components_by_support(local_mask, local_conf, support_local)
-            total_components += int(num_components)
-            accepted_components += int(num_accepted)
-
-            if np.any(gated_mask):
-                target = np.asarray(cartesian_mm[bbox])
-                add = np.asarray(gated_mask, dtype=bool) & (~np.asarray(target, dtype=bool))
-                added_voxels += int(np.count_nonzero(add))
-                np.asarray(cartesian_mm[bbox])[:] = np.asarray(target, dtype=np.uint8) | np.asarray(gated_mask, dtype=np.uint8)
-                flush_array(cartesian_mm)
-
-            if not troubleshooting:
-                shutil.rmtree(branch_dir, ignore_errors=True)
 
         return {
             'branches': int(len(branches)),
@@ -4467,16 +4734,10 @@ def apply_cpr_refinement_inplace(
         close_memmap_array(support_mm)
         if not troubleshooting:
             try:
-                support_path = cpr_root / 'support_regions.u32.dat'
+                support_path = cpr_work_root / 'support_regions.u32.dat'
                 support_path.unlink(missing_ok=True)
             except Exception:
                 pass
-
-
-                            
-               
-                            
-
 
 def _write_video_from_rendered_frames(
     render_frame: Callable[[int], np.ndarray],
@@ -5401,7 +5662,7 @@ def main() -> None:
         width=W,
         height=H,
         overwrite=False,
-        prefer_memory=True,
+        prefer_memory=not bool(args.enable_cpr),
     )
     (temp_dir / 'input_volume.meta.json').write_text(
         json.dumps({'shape': [T, H, W, 3], 'dtype': 'uint8', 'fps': fps}, indent=2)
@@ -5417,6 +5678,9 @@ def main() -> None:
     )
     cartesian_views = orthogonal_views_only(views)
     radial_view = next((v for v in views if v.name == 'radial'), None)
+
+    if bool(args.save_cpr) and not bool(args.enable_cpr):
+        print('Warning: --save_cpr requested but --enable_cpr is not active, so CPR outputs will not be saved.')
 
     shifts: List[Tuple[int, int, str]] = [(0, 0, 'none')]
     if int(args.shift) != 0:
@@ -5769,6 +6033,7 @@ def main() -> None:
                 })
                 return stats_local
 
+            pass_stats_this_round: List[Dict[str, object]] = []
             if outer_interpolation_workers > 1 and len(task_specs) > 1:
                 for stats in parallel_map_in_order(
                     _run_interpolation_task,
@@ -5776,12 +6041,21 @@ def main() -> None:
                     max_workers=outer_interpolation_workers,
                     max_pending=outer_interpolation_workers,
                 ):
-                    interpolation_stats.append(dict(stats))
+                    stats_dict = dict(stats)
+                    interpolation_stats.append(stats_dict)
+                    pass_stats_this_round.append(stats_dict)
             else:
                 for task_idx in range(len(task_specs)):
-                    interpolation_stats.append(_run_interpolation_task(task_idx))
+                    stats_dict = dict(_run_interpolation_task(task_idx))
+                    interpolation_stats.append(stats_dict)
+                    pass_stats_this_round.append(stats_dict)
 
-            if bool(args.troubleshooting) and pass_idx < total_passes:
+            pass_added_voxels = int(sum(int(s.get('added_voxels', 0)) for s in pass_stats_this_round))
+            stop_after_this_pass = pass_added_voxels <= 0
+            if stop_after_this_pass:
+                print(f"Interpolation: early stop after pass {pass_idx} because no voxels were added.")
+
+            if bool(args.troubleshooting) and pass_idx < total_passes and not stop_after_this_pass:
                 print(f"\\n=== Scheduling troubleshooting outputs: pass {pass_idx} (Cartesian union after interpolation pass {pass_idx}, before CPR / radial union / void-fill) ===")
                 pass_mm = build_current_snapshot_volume(f'ensemble_pass{pass_idx}', apply_void_fill=False)
                 pass_paths, pass_futures = collect_pipeline_output_futures(
@@ -5822,6 +6096,9 @@ def main() -> None:
                 ))
                 del pass_mm
                 gc.collect()
+
+            if stop_after_this_pass:
+                break
     else:
         for model_name in sorted(view_volumes_by_model.keys()):
             for view in cartesian_views:
@@ -5868,10 +6145,11 @@ def main() -> None:
         'added_voxels': 0,
     }
     if bool(args.enable_cpr):
-        print('\\n=== Curved Planar Reformation refinement ===')
+        print('\n=== Curved Planar Reformation refinement ===')
         cpr_stats = apply_cpr_refinement_inplace(
             cartesian_mm=cartesian_ensemble_mm,
             volume_rgb=volume_rgb,
+            volume_dat_path=vol_path,
             yolo_models=yolo_models,
             pred_cfg=pred_cfg,
             temp_dir=temp_dir,
@@ -5881,6 +6159,8 @@ def main() -> None:
             predict_postprocess_workers=predict_postprocess_workers,
             slice_workers=slice_postprocess_workers,
             troubleshooting=bool(args.troubleshooting),
+            save_cpr=bool(args.save_cpr),
+            output_dir=out_dir,
         )
         print(
             'CPR summary: '
@@ -5955,6 +6235,11 @@ def main() -> None:
         futures=final_futures,
         resources=[],
     ))
+
+    if bool(args.save_cpr) and bool(args.enable_cpr):
+        cpr_dir = out_dir / 'cpr'
+        if cpr_dir.exists():
+            final_paths['cpr_dir'] = cpr_dir
 
     if bool(args.save_radial):
         if radial_view is None:
