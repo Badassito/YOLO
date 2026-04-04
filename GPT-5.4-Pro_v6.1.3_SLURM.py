@@ -2365,33 +2365,37 @@ def label_foreground_volume_streaming(
 
 
 
-def build_slice_endpoint_seeds_from_label_volume(labels_real: np.ndarray) -> Tuple[List[SliceEndpointSeed], int]:
-    """Legacy faster endpoint scan retained for reference.
+def build_slice_endpoint_seeds_from_label_volume(
+    labels_real: np.ndarray,
+    workers: int = 1,
+    desc: str = 'Interpolation: endpoint seeds [scan]',
+) -> Tuple[List[SliceEndpointSeed], int]:
+    """Fast slice-graph endpoint scan for slice-direction interpolation.
 
-    v6.1.0 now uses per-object 3D skeletonization via ``_build_slice_endpoint_seeds`` for actual
-    interpolation passes, but this slice-graph terminal scan is kept as an alternative helper.
+    This avoids per-object 3D voxel skeletonization on large relabeled volumes, which can become
+    prohibitively slow when an object's bounding box spans a large fraction of the volume. Endpoints
+    are identified from connected components in each slice that do not continue into the previous or
+    next slice of the same relabeled object.
     """
-    z_dim = labels_real.shape[0]
+    z_dim = int(labels_real.shape[0])
     if z_dim <= 0:
         return [], 0
 
-    seeds: List[SliceEndpointSeed] = []
     kernel2 = np.ones((3, 3), dtype=np.uint8)
 
-    prev_slice: Optional[np.ndarray] = None
-    curr_slice = np.asarray(labels_real[0])
-    next_slice = np.asarray(labels_real[1]) if z_dim > 1 else None
+    def _scan_slice(z: int) -> List[SliceEndpointSeed]:
+        curr_slice = np.asarray(labels_real[int(z)])
+        if not np.any(curr_slice):
+            return []
 
-    for z in tqdm(range(z_dim), desc='Interpolation: endpoint scan'):
-        if z > 0:
-            prev_slice = curr_slice
-            curr_slice = next_slice if next_slice is not None else np.zeros_like(curr_slice)
-            next_slice = np.asarray(labels_real[z + 1]) if (z + 1) < z_dim else None
+        prev_slice = np.asarray(labels_real[int(z) - 1]) if int(z) > 0 else None
+        next_slice = np.asarray(labels_real[int(z) + 1]) if (int(z) + 1) < z_dim else None
 
+        seeds_local: List[SliceEndpointSeed] = []
         present = np.unique(curr_slice)
         present = present[present > 0]
         if present.size == 0:
-            continue
+            return seeds_local
 
         for obj_id in present.tolist():
             obj_mask = (curr_slice == int(obj_id)).astype(np.uint8, copy=False)
@@ -2415,18 +2419,36 @@ def build_slice_endpoint_seeds_from_label_volume(labels_real: np.ndarray) -> Tup
                 has_next = bool(next_same is not None and np.any(dil & next_same))
 
                 if not has_prev:
-                    seeds.append(SliceEndpointSeed(
+                    seeds_local.append(SliceEndpointSeed(
                         label=int(obj_id),
                         point=(int(z), int(anchor[0]), int(anchor[1])),
                         direction_sign=-1,
                     ))
                 if not has_next:
-                    seeds.append(SliceEndpointSeed(
+                    seeds_local.append(SliceEndpointSeed(
                         label=int(obj_id),
                         point=(int(z), int(anchor[0]), int(anchor[1])),
                         direction_sign=1,
                     ))
 
+        return seeds_local
+
+    worker_count = choose_slice_parallel_workers(int(workers), z_dim)
+    seeds: List[SliceEndpointSeed] = []
+
+    if worker_count <= 1:
+        for z in tqdm(range(z_dim), desc=desc):
+            seeds.extend(_scan_slice(int(z)))
+    else:
+        pending = max(worker_count, worker_count * 2)
+        for seeds_local in tqdm(
+            parallel_map_in_order(_scan_slice, range(z_dim), max_workers=worker_count, max_pending=pending),
+            total=z_dim,
+            desc=desc,
+        ):
+            seeds.extend(seeds_local)
+
+    seeds.sort(key=lambda s: (int(s.label), int(s.point[0]), int(s.direction_sign), int(s.point[1]), int(s.point[2])))
     return seeds, int(len(seeds))
 
 
@@ -4239,10 +4261,49 @@ def _build_slice_endpoint_seeds(
     extension_slices: int,
     workers: int = 1,
 ) -> Tuple[List[SliceEndpointSeed], int]:
+    """Build interpolation endpoint seeds.
+
+    Endpoint mode is controlled by ``YOLO_TTA_INTERPOLATION_ENDPOINT_MODE``:
+      - ``scan`` (default): always use the fast slice-graph terminal scan
+      - ``hybrid``: use per-object 3D skeletonization only when every object bounding box is small
+      - ``skeleton``: always use per-object 3D skeletonization
+
+    The scan path is the safe default for SLURM-scale volumes because a single object can have a
+    massive bounding box after compact relabel, making voxel skeletonization effectively intractable.
+    """
+    mode = os.environ.get('YOLO_TTA_INTERPOLATION_ENDPOINT_MODE', 'scan').strip().lower()
+    if mode not in {'scan', 'hybrid', 'skeleton'}:
+        mode = 'scan'
+
+    if mode == 'scan':
+        return build_slice_endpoint_seeds_from_label_volume(
+            labels_real,
+            workers=int(workers),
+            desc='Interpolation: endpoint seeds [scan]',
+        )
+
     objs = ndi.find_objects(labels_real)
     tasks = [(lbl, sl) for lbl, sl in enumerate(objs, start=1) if sl is not None]
     if not tasks:
         return [], 0
+
+    if mode == 'hybrid':
+        max_bbox_voxels = max(
+            (int(sl[0].stop - sl[0].start) * int(sl[1].stop - sl[1].start) * int(sl[2].stop - sl[2].start) for _, sl in tasks),
+            default=0,
+        )
+        max_allowed_bbox_voxels = max(0, _env_int('YOLO_TTA_MAX_SKELETON_BBOX_VOXELS', 64 * 1024 * 1024))
+        if max_allowed_bbox_voxels > 0 and int(max_bbox_voxels) > int(max_allowed_bbox_voxels):
+            print(
+                'Interpolation endpoint discovery: switching to slice scan '
+                f'(largest compact-relabel bbox={int(max_bbox_voxels):,} voxels exceeds '
+                f'YOLO_TTA_MAX_SKELETON_BBOX_VOXELS={int(max_allowed_bbox_voxels):,})'
+            )
+            return build_slice_endpoint_seeds_from_label_volume(
+                labels_real,
+                workers=int(workers),
+                desc='Interpolation: endpoint seeds [scan]',
+            )
 
     seeds: List[SliceEndpointSeed] = []
     direction_depth = max(2, min(8, int(extension_slices) + 1))
@@ -4253,14 +4314,14 @@ def _build_slice_endpoint_seeds(
         return _build_slice_endpoint_seeds_for_label(labels_real, int(lbl), sl, direction_depth)
 
     if worker_count <= 1:
-        for idx in tqdm(range(len(tasks)), desc='Interpolation: endpoint seeds'):
+        for idx in tqdm(range(len(tasks)), desc='Interpolation: endpoint seeds [skeleton]'):
             seeds.extend(_process(int(idx)))
     else:
         pending = max(worker_count, worker_count * 2)
         for seed_group in tqdm(
             parallel_map_in_order(_process, range(len(tasks)), max_workers=worker_count, max_pending=pending),
             total=len(tasks),
-            desc='Interpolation: endpoint seeds',
+            desc='Interpolation: endpoint seeds [skeleton]',
         ):
             seeds.extend(seed_group)
 
