@@ -36,7 +36,7 @@ import sys
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 GIB = 1024 ** 3
 from pathlib import Path
@@ -1688,6 +1688,125 @@ class PredictConfig:
     int8: bool
 
 
+def _extract_result_masks_and_confs(r) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Detach one streamed YOLO result into CPU-owned numpy arrays for asynchronous postprocess."""
+    if getattr(r, 'masks', None) is None or r.masks is None or r.masks.data is None:
+        return None, None
+
+    masks_data = r.masks.data  # (n,h,w)
+    try:
+        masks_np = np.asarray(masks_data.detach().cpu().numpy(), dtype=np.uint8)
+    except Exception:
+        try:
+            masks_np = np.asarray(masks_data.cpu().numpy(), dtype=np.uint8)
+        except Exception:
+            masks_np = np.asarray(masks_data, dtype=np.uint8)
+
+    if masks_np.ndim != 3 or int(masks_np.shape[0]) <= 0:
+        return None, None
+
+    num_inst = int(masks_np.shape[0])
+    if getattr(r, 'boxes', None) is not None and r.boxes is not None and getattr(r.boxes, 'conf', None) is not None:
+        try:
+            confs_np = np.asarray(r.boxes.conf.detach().cpu().numpy(), dtype=np.float32)
+        except Exception:
+            try:
+                confs_np = np.asarray(r.boxes.conf.cpu().numpy(), dtype=np.float32)
+            except Exception:
+                confs_np = np.asarray(r.boxes.conf, dtype=np.float32)
+    else:
+        confs_np = np.zeros((num_inst,), dtype=np.float32)
+
+    if confs_np.ndim == 0:
+        confs_np = np.full((num_inst,), float(confs_np), dtype=np.float32)
+    elif int(confs_np.shape[0]) != num_inst:
+        confs_np = np.resize(confs_np, (num_inst,)).astype(np.float32, copy=False)
+
+    return np.ascontiguousarray(masks_np), np.ascontiguousarray(confs_np)
+
+
+def _process_prediction_frame(
+    idx: int,
+    masks_np: Optional[np.ndarray],
+    confs_np: Optional[np.ndarray],
+    out_size: int,
+    pred_mask_mm: np.ndarray,
+    pred_conf_mm: np.ndarray,
+    view_union_mm: np.ndarray,
+    view_confmap_mm: np.ndarray,
+    M_out_to_native: np.ndarray,
+    native_h: int,
+    native_w: int,
+) -> Tuple[int, int]:
+    """Collapse one streamed result into trace + native accumulators.
+
+    Key optimization for the v6.1.0 wall-time target:
+      - build the augmented-space union mask once
+      - build the augmented-space per-pixel max-confidence map once
+      - inverse-warp each of those exactly once
+
+    This preserves the required semantics of unioning masks and retaining the highest confidence
+    score per covered pixel, while avoiding one native warp per detected instance.
+    """
+    pred_mask_mm[idx, :] = 0
+    pred_conf_mm[idx] = np.float16(0.0)
+
+    if masks_np is None or confs_np is None or masks_np.ndim != 3 or int(masks_np.shape[0]) <= 0:
+        return 0, 0
+
+    frame_union = np.zeros((out_size, out_size), dtype=np.uint8)
+    frame_confmap = np.zeros((out_size, out_size), dtype=np.float32)
+    frame_max_conf = 0.0
+    num_inst = int(masks_np.shape[0])
+
+    for inst_idx in range(num_inst):
+        inst = np.asarray(masks_np[inst_idx], dtype=np.uint8)
+        if inst.shape[0] != out_size or inst.shape[1] != out_size:
+            inst = cv2.resize(inst, (out_size, out_size), interpolation=cv2.INTER_NEAREST)
+        inst = (inst > 0).astype(np.uint8, copy=False)
+        if not np.any(inst):
+            continue
+
+        conf_val = float(confs_np[inst_idx]) if inst_idx < int(confs_np.shape[0]) else 0.0
+        frame_union |= inst
+        if conf_val > frame_max_conf:
+            frame_max_conf = conf_val
+        inst_bool = inst > 0
+        frame_confmap[inst_bool] = np.maximum(frame_confmap[inst_bool], np.float32(conf_val))
+
+    pred_mask_mm[idx, :] = pack_mask(frame_union)
+    pred_conf_mm[idx] = np.float16(frame_max_conf)
+    if not np.any(frame_union):
+        return int(num_inst), 1
+
+    native_union = cv2.warpAffine(
+        frame_union,
+        M_out_to_native,
+        dsize=(native_w, native_h),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    if np.any(native_union):
+        view_union_mm[idx, :] |= pack_mask(native_union)
+
+    if frame_max_conf > 0.0:
+        native_conf = cv2.warpAffine(
+            frame_confmap,
+            M_out_to_native,
+            dsize=(native_w, native_h),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0.0,
+        )
+        if np.any(native_conf > 0.0):
+            conf_slice = view_confmap_mm[idx]
+            native_conf_f16 = native_conf.astype(np.float16, copy=False)
+            np.maximum(conf_slice, native_conf_f16, out=conf_slice)
+
+    return int(num_inst), 1
+
+
 def predict_video_and_accumulate(
     model,
     video_path: Path,
@@ -1696,23 +1815,20 @@ def predict_video_and_accumulate(
     pred_out_prefix: Path,
     cfg: PredictConfig,
     # accumulation into per-view union stack (native resolution, packed bits)
-    view_union_mm: np.memmap,          # uint8 packbits, shape (num_slices, bytes_native)
-    view_confmap_mm: np.memmap,        # float16 confidence map, shape (num_slices, native_h, native_w)
+    view_union_mm: np.ndarray,          # uint8 packbits, shape (num_slices, bytes_native)
+    view_confmap_mm: np.ndarray,        # float16 confidence map, shape (num_slices, native_h, native_w)
     M_out_to_native: np.ndarray,       # 2x3, maps augmented(out)->native for cv2.warpAffine (src->dst)
     native_h: int,
     native_w: int,
+    postprocess_workers: int = 1,
 ) -> Dict[str, int]:
     """
     Run YOLO predict(stream=True) on a pre-generated augmented video, store a lightweight
     per-augmentation trace to disk, and accumulate the inverse-transformed native masks.
 
-    v5.0.1 requires unioning overlapping masks with the highest confidence score of the
-    combined masks. To preserve that behavior without exploding memory, we keep two native
-    accumulators per slice:
-      1) a packed-bit union mask
-      2) a per-pixel max-confidence map
-
-    Later, --min_conf is applied per connected component on the native-orientation union.
+    The sequential portion remains the YOLO inference stream itself. CPU-side result handling is
+    overlapped with that stream when ``postprocess_workers > 1`` so native reorientation and trace
+    writes do not unnecessarily serialize GPU inference.
     """
     pred_out_prefix.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1730,6 +1846,8 @@ def predict_video_and_accumulate(
         mode='w+',
         shape=(num_frames,),
     )
+    pred_mask_mm[:, :] = 0
+    pred_conf_mm[:] = np.float16(0.0)
 
     prediction_count = 0
     frames_with_predictions = 0
@@ -1750,85 +1868,62 @@ def predict_video_and_accumulate(
         verbose=False,
     )
 
-    for idx, r in enumerate(results):
-        if idx >= num_frames:
-            break
+    worker_count = max(1, min(int(postprocess_workers), int(num_frames)))
+    pending_limit = max(worker_count, worker_count * 2)
 
-        frame_union = np.zeros((out_size, out_size), dtype=np.uint8)
-        frame_max_conf = 0.0
-
-        if getattr(r, 'masks', None) is None or r.masks is None or r.masks.data is None:
-            pred_mask_mm[idx, :] = pack_mask(frame_union)
-            pred_conf_mm[idx] = np.float16(0.0)
-            continue
-
-        masks_data = r.masks.data  # (n,h,w)
-        try:
-            masks_np = masks_data.cpu().numpy()
-        except Exception:
-            masks_np = np.asarray(masks_data)
-
-        num_inst = int(masks_np.shape[0]) if masks_np.ndim == 3 else 0
-        if num_inst <= 0:
-            pred_mask_mm[idx, :] = pack_mask(frame_union)
-            pred_conf_mm[idx] = np.float16(0.0)
-            continue
-
-        prediction_count += int(num_inst)
-        frames_with_predictions += 1
-
-        if getattr(r, 'boxes', None) is not None and r.boxes is not None and getattr(r.boxes, 'conf', None) is not None:
-            try:
-                confs_np = r.boxes.conf.detach().cpu().numpy().astype(np.float32, copy=False)
-            except Exception:
-                confs_np = np.asarray(r.boxes.conf, dtype=np.float32)
-        else:
-            confs_np = np.zeros((num_inst,), dtype=np.float32)
-
-        if confs_np.ndim == 0:
-            confs_np = np.full((num_inst,), float(confs_np), dtype=np.float32)
-        elif confs_np.shape[0] != num_inst:
-            confs_np = np.resize(confs_np, (num_inst,)).astype(np.float32, copy=False)
-
-        conf_slice = view_confmap_mm[idx]
-        native_union_frame = np.zeros((native_h, native_w), dtype=np.uint8)
-
-        for inst_idx in range(num_inst):
-            inst = np.asarray(masks_np[inst_idx], dtype=np.uint8)
-            if inst.shape[0] != out_size or inst.shape[1] != out_size:
-                inst = cv2.resize(inst, (out_size, out_size), interpolation=cv2.INTER_NEAREST)
-            inst = (inst > 0).astype(np.uint8, copy=False)
-            if not np.any(inst):
-                continue
-
-            frame_union |= inst
-            conf_val = float(confs_np[inst_idx])
-            if conf_val > frame_max_conf:
-                frame_max_conf = conf_val
-
-            native_mask = cv2.warpAffine(
-                inst,
-                M_out_to_native,
-                dsize=(native_w, native_h),
-                flags=cv2.INTER_NEAREST,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=0,
+    if worker_count <= 1:
+        for idx, r in enumerate(results):
+            if idx >= num_frames:
+                break
+            masks_np, confs_np = _extract_result_masks_and_confs(r)
+            pred_inc, frame_inc = _process_prediction_frame(
+                idx=idx,
+                masks_np=masks_np,
+                confs_np=confs_np,
+                out_size=out_size,
+                pred_mask_mm=pred_mask_mm,
+                pred_conf_mm=pred_conf_mm,
+                view_union_mm=view_union_mm,
+                view_confmap_mm=view_confmap_mm,
+                M_out_to_native=M_out_to_native,
+                native_h=native_h,
+                native_w=native_w,
             )
-            native_mask_bool = native_mask > 0
-            if not np.any(native_mask_bool):
-                continue
+            prediction_count += int(pred_inc)
+            frames_with_predictions += int(frame_inc)
+    else:
+        pending: List[object] = []
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            for idx, r in enumerate(results):
+                if idx >= num_frames:
+                    break
 
-            native_union_frame[native_mask_bool] = 1
-            conf_slice[native_mask_bool] = np.maximum(
-                conf_slice[native_mask_bool],
-                np.float16(conf_val),
-            )
+                masks_np, confs_np = _extract_result_masks_and_confs(r)
+                pending.append(executor.submit(
+                    _process_prediction_frame,
+                    idx,
+                    masks_np,
+                    confs_np,
+                    out_size,
+                    pred_mask_mm,
+                    pred_conf_mm,
+                    view_union_mm,
+                    view_confmap_mm,
+                    M_out_to_native,
+                    native_h,
+                    native_w,
+                ))
+                if len(pending) >= pending_limit:
+                    fut = pending.pop(0)
+                    pred_inc, frame_inc = fut.result()
+                    prediction_count += int(pred_inc)
+                    frames_with_predictions += int(frame_inc)
 
-        if np.any(native_union_frame):
-            view_union_mm[idx, :] |= pack_mask(native_union_frame)
-
-        pred_mask_mm[idx, :] = pack_mask(frame_union)
-        pred_conf_mm[idx] = np.float16(frame_max_conf)
+            while pending:
+                fut = pending.pop(0)
+                pred_inc, frame_inc = fut.result()
+                prediction_count += int(pred_inc)
+                frames_with_predictions += int(frame_inc)
 
     flush_array(pred_mask_mm)
     flush_array(pred_conf_mm)
@@ -1842,6 +1937,7 @@ def predict_video_and_accumulate(
         'mask_packbits_bytes': int(out_bytes),
         'prediction_count': int(prediction_count),
         'frames_with_predictions': int(frames_with_predictions),
+        'postprocess_workers': int(worker_count),
         'cfg': {
             'imgsz': int(cfg.imgsz),
             'conf': float(cfg.conf),
@@ -3898,83 +3994,6 @@ def _local_half_width_for_components(
     return max(4, int(math.ceil(max_extent)) + 4)
 
 
-def _build_slice_endpoint_seeds(
-    labels_real: np.ndarray,
-    extension_slices: int,
-) -> Tuple[List[SliceEndpointSeed], int]:
-    objs = ndi.find_objects(labels_real)
-    seeds: List[SliceEndpointSeed] = []
-    direction_depth = max(2, min(8, int(extension_slices) + 1))
-
-    for lbl, sl in enumerate(objs, start=1):
-        if sl is None:
-            continue
-        sub = labels_real[sl] == lbl
-        if not np.any(sub):
-            continue
-
-        grouped: Dict[Tuple[int, int, int, int, int], SliceEndpointSeed] = {}
-        slice_start = int(sl[0].start)
-        slice_stop = int(sl[0].stop) - 1
-
-        skel = skeletonize_volume(sub)
-        if np.any(skel):
-            neigh = ndi.convolve(skel.astype(np.uint8), KERNEL_3, mode="constant", cval=0) - skel.astype(np.uint8)
-            ep_coords = np.argwhere(np.logical_and(skel, neigh == 1))
-        else:
-            ep_coords = np.zeros((0, 3), dtype=np.int64)
-
-        for ep in ep_coords:
-            ep_t = (int(ep[0]), int(ep[1]), int(ep[2]))
-            path = _trace_inward_path(skel, ep_t, max_steps=direction_depth)
-            ref = path[-1] if len(path) > 1 else ep_t
-            outward = np.asarray(ep_t, dtype=np.float32) - np.asarray(ref, dtype=np.float32)
-            if float(abs(outward[0])) > 1e-6:
-                direction_sign = 1 if float(outward[0]) > 0 else -1
-            else:
-                gz = slice_start + int(ep_t[0])
-                dist_min = abs(gz - slice_start)
-                dist_max = abs(slice_stop - gz)
-                direction_sign = -1 if dist_min <= dist_max else 1
-
-            gpoint = (slice_start + int(ep_t[0]), int(sl[1].start) + int(ep_t[1]), int(sl[2].start) + int(ep_t[2]))
-            comp, _ = _component_mask_and_anchor(labels_real[gpoint[0]] == lbl, (gpoint[1], gpoint[2]))
-            cent = _component_centroid_anchor(comp)
-            if cent is None:
-                continue
-            key = (int(lbl), int(gpoint[0]), int(direction_sign), int(cent[0]), int(cent[1]))
-            grouped[key] = SliceEndpointSeed(label=int(lbl), point=gpoint, direction_sign=int(direction_sign))
-
-        if not grouped:
-            slice_any = np.any(sub, axis=(1, 2))
-            slice_indices = np.flatnonzero(slice_any)
-            if slice_indices.size:
-                extremes: List[Tuple[int, int]] = []
-                first_local = int(slice_indices[0])
-                last_local = int(slice_indices[-1])
-                extremes.append((first_local, -1))
-                if last_local != first_local:
-                    extremes.append((last_local, 1))
-                else:
-                    extremes.append((last_local, 1))
-
-                for local_slice_idx, direction_sign in extremes:
-                    global_slice_idx = slice_start + int(local_slice_idx)
-                    labels2d, num = ndi.label(sub[local_slice_idx], structure=np.ones((3, 3), dtype=bool))
-                    for comp_lbl in range(1, int(num) + 1):
-                        comp = labels2d == comp_lbl
-                        cent = _component_centroid_anchor(comp)
-                        if cent is None:
-                            continue
-                        gpoint = (int(global_slice_idx), int(sl[1].start) + int(cent[0]), int(sl[2].start) + int(cent[1]))
-                        key = (int(lbl), int(gpoint[0]), int(direction_sign), int(gpoint[1]), int(gpoint[2]))
-                        grouped[key] = SliceEndpointSeed(label=int(lbl), point=gpoint, direction_sign=int(direction_sign))
-
-        seeds.extend(grouped.values())
-
-    return seeds, int(len(seeds))
-
-
 def _find_slice_projection_candidates(
     labels_real: np.ndarray,
     seed: SliceEndpointSeed,
@@ -4046,64 +4065,6 @@ def _find_slice_projection_candidates(
     )
     return ordered[: int(max_candidates)]
 
-    s0, y0, x0 = seed.point
-    source_component, source_anchor = _component_mask_and_anchor(labels_real[s0] == int(seed.label), (y0, x0))
-    if source_anchor is None or not np.any(source_component):
-        return None
-
-    sdf = _signed_distance_2d(source_component)
-    slope = math.tan(math.radians(float(search_angle_deg)))
-    num_slices = labels_real.shape[0]
-
-    for step in range(1, int(max_slice_distance) + 1):
-        s = int(s0 + int(seed.direction_sign) * step)
-        if s < 0 or s >= num_slices:
-            break
-
-        threshold = -float(slope) * float(step)
-        projection = sdf >= threshold
-        if not np.any(projection):
-            if float(search_angle_deg) < 0.0:
-                break
-            continue
-
-        labels2d = labels_real[s]
-        overlap = projection & (labels2d > 0) & (labels2d != int(seed.label))
-        if not np.any(overlap):
-            continue
-
-        ys, xs = np.nonzero(overlap)
-        lbls = labels2d[ys, xs].astype(np.int64, copy=False)
-
-        best: Optional[Tuple[int, int, int, int]] = None
-        for target_label in np.unique(lbls):
-            if int(target_label) <= 0 or int(target_label) == int(seed.label):
-                continue
-            use = lbls == int(target_label)
-            ys_t = ys[use]
-            xs_t = xs[use]
-            if ys_t.size == 0:
-                continue
-            d2 = (ys_t.astype(np.int64) - int(source_anchor[0])) ** 2 + (xs_t.astype(np.int64) - int(source_anchor[1])) ** 2
-            idx = int(np.argmin(d2))
-            cand = (int(d2[idx]), int(target_label), int(ys_t[idx]), int(xs_t[idx]))
-            if best is None or cand < best:
-                best = cand
-
-        if best is None:
-            continue
-
-        _, target_label, ty, tx = best
-        return SliceProjectionCandidate(
-            source_label=int(seed.label),
-            target_label=int(target_label),
-            source_point=(int(s0), int(y0), int(x0)),
-            target_point=(int(s), int(ty), int(tx)),
-            slice_distance=int(step),
-        )
-
-    return None
-
 
 def _collect_walkback_source_points(
     labels_real: np.ndarray,
@@ -4145,101 +4106,323 @@ def _collect_walkback_source_points(
     return out
 
 
-def _estimate_linear_slice_bridge_min_radius(
+@dataclass(frozen=True)
+class SliceBridgeRenderPlan:
+    source_label: int
+    target_label: int
+    source_point: Tuple[int, int, int]
+    target_point: Tuple[int, int, int]
+    source_anchor: Tuple[int, int]
+    target_anchor: Tuple[int, int]
+    steps: int
+    sign: int
+    sdf0: np.ndarray
+    sdf1: np.ndarray
+
+
+@dataclass
+class SliceSeedBridgePlanResult:
+    candidate_connections: int = 0
+    accepted_connections: int = 0
+    default_bridges: int = 0
+    walk_back_bridges: int = 0
+    skipped_by_min_radius: int = 0
+    plans: List[SliceBridgeRenderPlan] = field(default_factory=list)
+
+
+def _build_slice_endpoint_seeds_for_label(
+    labels_real: np.ndarray,
+    lbl: int,
+    sl: Tuple[slice, slice, slice],
+    direction_depth: int,
+) -> List[SliceEndpointSeed]:
+    sub = labels_real[sl] == int(lbl)
+    if not np.any(sub):
+        return []
+
+    grouped: Dict[Tuple[int, int, int, int, int], SliceEndpointSeed] = {}
+    slice_start = int(sl[0].start)
+    slice_stop = int(sl[0].stop) - 1
+    structure2 = np.ones((3, 3), dtype=bool)
+    slice_cache: Dict[int, Tuple[np.ndarray, Dict[int, Tuple[int, int]]]] = {}
+
+    def _slice_centroid(local_slice_idx: int, local_y: int, local_x: int) -> Optional[Tuple[int, int]]:
+        entry = slice_cache.get(int(local_slice_idx))
+        if entry is None:
+            labels2d, num = ndi.label(sub[int(local_slice_idx)], structure=structure2)
+            centroids: Dict[int, Tuple[int, int]] = {}
+            for comp_lbl in range(1, int(num) + 1):
+                cent = _component_centroid_anchor(labels2d == comp_lbl)
+                if cent is not None:
+                    centroids[int(comp_lbl)] = cent
+            entry = (labels2d, centroids)
+            slice_cache[int(local_slice_idx)] = entry
+
+        labels2d, centroids = entry
+        comp_lbl = int(labels2d[int(local_y), int(local_x)])
+        if comp_lbl <= 0:
+            return None
+        cent = centroids.get(comp_lbl)
+        if cent is not None:
+            return cent
+        return _component_centroid_anchor(labels2d == comp_lbl)
+
+    skel = skeletonize_volume(sub)
+    if np.any(skel):
+        neigh = ndi.convolve(skel.astype(np.uint8), KERNEL_3, mode='constant', cval=0) - skel.astype(np.uint8)
+        ep_coords = np.argwhere(np.logical_and(skel, neigh == 1))
+    else:
+        ep_coords = np.zeros((0, 3), dtype=np.int64)
+
+    for ep in ep_coords:
+        ep_t = (int(ep[0]), int(ep[1]), int(ep[2]))
+        path = _trace_inward_path(skel, ep_t, max_steps=direction_depth)
+        ref = path[-1] if len(path) > 1 else ep_t
+        outward = np.asarray(ep_t, dtype=np.float32) - np.asarray(ref, dtype=np.float32)
+        if float(abs(outward[0])) > 1e-6:
+            direction_sign = 1 if float(outward[0]) > 0 else -1
+        else:
+            gz = slice_start + int(ep_t[0])
+            dist_min = abs(gz - slice_start)
+            dist_max = abs(slice_stop - gz)
+            direction_sign = -1 if dist_min <= dist_max else 1
+
+        cent = _slice_centroid(int(ep_t[0]), int(ep_t[1]), int(ep_t[2]))
+        if cent is None:
+            continue
+        gpoint = (slice_start + int(ep_t[0]), int(sl[1].start) + int(ep_t[1]), int(sl[2].start) + int(ep_t[2]))
+        key = (int(lbl), int(gpoint[0]), int(direction_sign), int(cent[0]), int(cent[1]))
+        grouped[key] = SliceEndpointSeed(label=int(lbl), point=gpoint, direction_sign=int(direction_sign))
+
+    if not grouped:
+        slice_any = np.any(sub, axis=(1, 2))
+        slice_indices = np.flatnonzero(slice_any)
+        if slice_indices.size:
+            extremes: List[Tuple[int, int]] = []
+            first_local = int(slice_indices[0])
+            last_local = int(slice_indices[-1])
+            extremes.append((first_local, -1))
+            extremes.append((last_local, 1))
+
+            for local_slice_idx, direction_sign in extremes:
+                entry = slice_cache.get(int(local_slice_idx))
+                if entry is None:
+                    labels2d, num = ndi.label(sub[int(local_slice_idx)], structure=structure2)
+                    centroids: Dict[int, Tuple[int, int]] = {}
+                    for comp_lbl in range(1, int(num) + 1):
+                        cent = _component_centroid_anchor(labels2d == comp_lbl)
+                        if cent is not None:
+                            centroids[int(comp_lbl)] = cent
+                    entry = (labels2d, centroids)
+                    slice_cache[int(local_slice_idx)] = entry
+                labels2d, centroids = entry
+                num = int(np.max(labels2d))
+                for comp_lbl in range(1, num + 1):
+                    cent = centroids.get(int(comp_lbl))
+                    if cent is None:
+                        cent = _component_centroid_anchor(labels2d == comp_lbl)
+                    if cent is None:
+                        continue
+                    gpoint = (
+                        slice_start + int(local_slice_idx),
+                        int(sl[1].start) + int(cent[0]),
+                        int(sl[2].start) + int(cent[1]),
+                    )
+                    key = (int(lbl), int(gpoint[0]), int(direction_sign), int(gpoint[1]), int(gpoint[2]))
+                    grouped[key] = SliceEndpointSeed(label=int(lbl), point=gpoint, direction_sign=int(direction_sign))
+
+    return [grouped[k] for k in sorted(grouped.keys())]
+
+
+def _build_slice_endpoint_seeds(
+    labels_real: np.ndarray,
+    extension_slices: int,
+    workers: int = 1,
+) -> Tuple[List[SliceEndpointSeed], int]:
+    objs = ndi.find_objects(labels_real)
+    tasks = [(lbl, sl) for lbl, sl in enumerate(objs, start=1) if sl is not None]
+    if not tasks:
+        return [], 0
+
+    seeds: List[SliceEndpointSeed] = []
+    direction_depth = max(2, min(8, int(extension_slices) + 1))
+    worker_count = choose_slice_parallel_workers(int(workers), len(tasks))
+
+    def _process(idx: int) -> List[SliceEndpointSeed]:
+        lbl, sl = tasks[int(idx)]
+        return _build_slice_endpoint_seeds_for_label(labels_real, int(lbl), sl, direction_depth)
+
+    if worker_count <= 1:
+        for idx in tqdm(range(len(tasks)), desc='Interpolation: endpoint seeds'):
+            seeds.extend(_process(int(idx)))
+    else:
+        pending = max(worker_count, worker_count * 2)
+        for seed_group in tqdm(
+            parallel_map_in_order(_process, range(len(tasks)), max_workers=worker_count, max_pending=pending),
+            total=len(tasks),
+            desc='Interpolation: endpoint seeds',
+        ):
+            seeds.extend(seed_group)
+
+    seeds.sort(key=lambda s: (int(s.label), int(s.point[0]), int(s.direction_sign), int(s.point[1]), int(s.point[2])))
+    return seeds, int(len(seeds))
+
+
+def _build_linear_slice_bridge_plan(
     labels_real: np.ndarray,
     source_label: int,
     target_label: int,
     source_point: Tuple[int, int, int],
     target_point: Tuple[int, int, int],
-) -> float:
-    """Return the smallest effective radius encountered along a linear slice bridge."""
+) -> Optional[SliceBridgeRenderPlan]:
     s0, y0, x0 = source_point
     s1, y1, x1 = target_point
     if int(s0) == int(s1):
-        return 0.0
+        return None
 
     source_component, source_anchor = _component_mask_and_anchor(labels_real[s0] == int(source_label), (y0, x0))
     target_component, target_anchor = _component_mask_and_anchor(labels_real[s1] == int(target_label), (y1, x1))
     if source_anchor is None or target_anchor is None:
-        return 0.0
+        return None
     if not np.any(source_component) or not np.any(target_component):
-        return 0.0
+        return None
 
     half_width = _local_half_width_for_components(source_component, source_anchor, target_component, target_anchor)
     source_local = _component_to_local_canvas(source_component, source_anchor, half_width)
     target_local = _component_to_local_canvas(target_component, target_anchor, half_width)
+    if not np.any(source_local) or not np.any(target_local):
+        return None
+
+    steps = int(abs(int(s1) - int(s0)))
+    if steps <= 0:
+        return None
+
+    return SliceBridgeRenderPlan(
+        source_label=int(source_label),
+        target_label=int(target_label),
+        source_point=(int(s0), int(y0), int(x0)),
+        target_point=(int(s1), int(y1), int(x1)),
+        source_anchor=(int(source_anchor[0]), int(source_anchor[1])),
+        target_anchor=(int(target_anchor[0]), int(target_anchor[1])),
+        steps=int(steps),
+        sign=1 if int(s1) > int(s0) else -1,
+        sdf0=np.ascontiguousarray(_signed_distance_2d(source_local)),
+        sdf1=np.ascontiguousarray(_signed_distance_2d(target_local)),
+    )
+
+
+def _estimate_linear_slice_bridge_min_radius_from_plan(plan: SliceBridgeRenderPlan) -> float:
+    source_local = np.asarray(plan.sdf0 >= 0.0, dtype=bool)
+    target_local = np.asarray(plan.sdf1 >= 0.0, dtype=bool)
     if not np.any(source_local) or not np.any(target_local):
         return 0.0
 
     min_radius = min(_component_max_radius(source_local), _component_max_radius(target_local))
-    sdf0 = _signed_distance_2d(source_local)
-    sdf1 = _signed_distance_2d(target_local)
-
-    steps = int(abs(int(s1) - int(s0)))
-    if steps <= 0:
-        return 0.0
-
-    for idx in range(1, steps):
-        alpha = float(idx) / float(steps)
-        section = ((1.0 - alpha) * sdf0 + alpha * sdf1) >= 0.0
+    for idx in range(1, int(plan.steps)):
+        alpha = float(idx) / float(plan.steps)
+        section = ((1.0 - alpha) * plan.sdf0 + alpha * plan.sdf1) >= 0.0
         if not np.any(section):
             return 0.0
         section = _keep_center_component_2d(section)
         min_radius = min(min_radius, _component_max_radius(section))
-
     return float(min_radius)
 
 
-def _paint_linear_slice_bridge(
-    bridge_volume: np.ndarray,
-    labels_real: np.ndarray,
-    source_label: int,
-    target_label: int,
-    source_point: Tuple[int, int, int],
-    target_point: Tuple[int, int, int],
+def _paint_linear_slice_bridge_plan_onto_slice(
+    dest_slice: np.ndarray,
+    plan: SliceBridgeRenderPlan,
+    step_idx: int,
 ) -> int:
-    s0, y0, x0 = source_point
-    s1, y1, x1 = target_point
-    if int(s0) == int(s1):
+    if int(step_idx) <= 0 or int(step_idx) >= int(plan.steps):
         return 0
 
-    source_component, source_anchor = _component_mask_and_anchor(labels_real[s0] == int(source_label), (y0, x0))
-    target_component, target_anchor = _component_mask_and_anchor(labels_real[s1] == int(target_label), (y1, x1))
-    if source_anchor is None or target_anchor is None:
+    alpha = float(step_idx) / float(plan.steps)
+    section = ((1.0 - alpha) * plan.sdf0 + alpha * plan.sdf1) >= 0.0
+    if not np.any(section):
         return 0
-    if not np.any(source_component) or not np.any(target_component):
-        return 0
+    section = _keep_center_component_2d(section)
+    center = (
+        (1.0 - alpha) * float(plan.source_anchor[0]) + alpha * float(plan.target_anchor[0]),
+        (1.0 - alpha) * float(plan.source_anchor[1]) + alpha * float(plan.target_anchor[1]),
+    )
+    return _paste_local_mask_onto_slice(dest_slice, section, center)
 
-    half_width = _local_half_width_for_components(source_component, source_anchor, target_component, target_anchor)
-    source_local = _component_to_local_canvas(source_component, source_anchor, half_width)
-    target_local = _component_to_local_canvas(target_component, target_anchor, half_width)
-    if not np.any(source_local) or not np.any(target_local):
-        return 0
 
-    sdf0 = _signed_distance_2d(source_local)
-    sdf1 = _signed_distance_2d(target_local)
+def _plan_slice_seed_bridges(
+    labels_real: np.ndarray,
+    seed: SliceEndpointSeed,
+    max_slice_distance: int,
+    search_angle_deg: float,
+    interpolation_walk_back: int,
+    interpolation_candidates: int,
+    interpolate_min_radius: float,
+) -> SliceSeedBridgePlanResult:
+    result = SliceSeedBridgePlanResult()
 
-    steps = int(abs(int(s1) - int(s0)))
-    if steps <= 0:
-        return 0
+    candidates = _find_slice_projection_candidates(
+        labels_real=labels_real,
+        seed=seed,
+        max_slice_distance=int(max_slice_distance),
+        search_angle_deg=float(search_angle_deg),
+        max_candidates=int(interpolation_candidates),
+    )
+    if not candidates:
+        return result
 
-    sign = 1 if int(s1) > int(s0) else -1
-    added = 0
-    for idx in range(1, steps):
-        alpha = float(idx) / float(steps)
-        section = ((1.0 - alpha) * sdf0 + alpha * sdf1) >= 0.0
-        if not np.any(section):
-            continue
-        section = _keep_center_component_2d(section)
-        s = int(s0 + sign * idx)
-        center = (
-            (1.0 - alpha) * float(source_anchor[0]) + alpha * float(target_anchor[0]),
-            (1.0 - alpha) * float(source_anchor[1]) + alpha * float(target_anchor[1]),
-        )
-        added += _paste_local_mask_onto_slice(bridge_volume[s], section, center)
+    result.candidate_connections = int(len(candidates))
+    source_points = [seed.point] + _collect_walkback_source_points(
+        labels_real=labels_real,
+        label=int(seed.label),
+        start_point=seed.point,
+        direction_sign=int(seed.direction_sign),
+        walk_back=int(interpolation_walk_back),
+    )
 
-    return int(added)
+    for candidate in candidates:
+        accepted_this_candidate = False
+        for walk_idx, src_point in enumerate(source_points):
+            plan = _build_linear_slice_bridge_plan(
+                labels_real=labels_real,
+                source_label=int(candidate.source_label),
+                target_label=int(candidate.target_label),
+                source_point=src_point,
+                target_point=candidate.target_point,
+            )
+            if plan is None:
+                continue
 
+            if float(interpolate_min_radius) > 0.0:
+                bridge_radius = _estimate_linear_slice_bridge_min_radius_from_plan(plan)
+                if bridge_radius <= float(interpolate_min_radius):
+                    result.skipped_by_min_radius += 1
+                    continue
+
+            if walk_idx == 0:
+                result.default_bridges += 1
+            else:
+                result.walk_back_bridges += 1
+
+            if not accepted_this_candidate:
+                result.accepted_connections += 1
+                accepted_this_candidate = True
+
+            result.plans.append(plan)
+
+    return result
+
+
+def _build_slice_bridge_render_schedule(
+    plans: Sequence[SliceBridgeRenderPlan],
+    num_slices: int,
+) -> List[List[Tuple[int, int]]]:
+    schedule: List[List[Tuple[int, int]]] = [[] for _ in range(int(num_slices))]
+    for plan_idx, plan in enumerate(plans):
+        start_slice = int(plan.source_point[0])
+        for step_idx in range(1, int(plan.steps)):
+            s = int(start_slice + int(plan.sign) * step_idx)
+            if 0 <= s < int(num_slices):
+                schedule[s].append((int(plan_idx), int(step_idx)))
+    return schedule
 
 def interpolate_view_volume_pass_inplace(
     mask_mm: np.ndarray,
@@ -4253,13 +4436,14 @@ def interpolate_view_volume_pass_inplace(
     keep_temp: bool = False,
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
+    workers: int = 1,
 ) -> Dict[str, object]:
     """Apply one interpolation pass directly to a view-volume stack.
 
     The pass keeps bridge creation simultaneous by searching against a frozen label snapshot and
-    merging all newly created bridge voxels only after planning is complete. Endpoint discovery
-    uses per-object 3D skeletonization with a one-slice fallback for orphaned objects so the
-    implementation matches the v6.1.0 slice-direction interpolation rules more closely.
+    merging all newly created bridge voxels only after planning is complete. Endpoint discovery,
+    candidate search, bridge planning and slice rendering are parallelized across independent
+    objects / seeds / slices to reduce the long single-threaded stretch after compact relabel.
     """
     if int(max_slice_distance) <= 0:
         return {
@@ -4310,7 +4494,12 @@ def interpolate_view_volume_pass_inplace(
             'skipped': int(num_objects) <= 1,
         }
 
-    seeds, num_endpoints = _build_slice_endpoint_seeds(labels_mm, extension_slices=int(max_slice_distance))
+    worker_count = choose_slice_parallel_workers(int(workers), max(1, int(num_objects)))
+    seeds, num_endpoints = _build_slice_endpoint_seeds(
+        labels_mm,
+        extension_slices=int(max_slice_distance),
+        workers=worker_count,
+    )
     if not seeds:
         del labels_mm
         if not keep_temp:
@@ -4344,95 +4533,101 @@ def interpolate_view_volume_pass_inplace(
     walk_back_bridges = 0
     skipped_by_min_radius = 0
     added_voxels = 0
+    plans: List[SliceBridgeRenderPlan] = []
 
-    for seed in seeds:
-        candidates = _find_slice_projection_candidates(
-            labels_real=labels_mm,
-            seed=seed,
-            max_slice_distance=int(max_slice_distance),
-            search_angle_deg=float(search_angle_deg),
-            max_candidates=int(interpolation_candidates),
-        )
-        if not candidates:
-            continue
+    try:
+        plan_workers = choose_slice_parallel_workers(int(workers), len(seeds))
 
-        for candidate in candidates:
-            candidate_connections += 1
-            target_component, target_anchor = _component_mask_and_anchor(
-                labels_mm[candidate.target_point[0]] == int(candidate.target_label),
-                (candidate.target_point[1], candidate.target_point[2]),
-            )
-            target_radius = _component_max_radius(target_component) if target_anchor is not None else 0.0
-
-            source_points = [candidate.source_point] + _collect_walkback_source_points(
+        def _plan_seed(idx: int) -> SliceSeedBridgePlanResult:
+            return _plan_slice_seed_bridges(
                 labels_real=labels_mm,
-                label=int(candidate.source_label),
-                start_point=candidate.source_point,
-                direction_sign=int(seed.direction_sign),
-                walk_back=int(interpolation_walk_back),
+                seed=seeds[int(idx)],
+                max_slice_distance=int(max_slice_distance),
+                search_angle_deg=float(search_angle_deg),
+                interpolation_walk_back=int(interpolation_walk_back),
+                interpolation_candidates=int(interpolation_candidates),
+                interpolate_min_radius=float(interpolate_min_radius),
             )
 
-            accepted_this_candidate = False
-            for walk_idx, src_point in enumerate(source_points):
-                source_component, source_anchor = _component_mask_and_anchor(
-                    labels_mm[src_point[0]] == int(candidate.source_label),
-                    (src_point[1], src_point[2]),
-                )
-                source_radius = _component_max_radius(source_component) if source_anchor is not None else 0.0
-                bridge_radius = min(float(source_radius), float(target_radius))
-                if float(interpolate_min_radius) > 0.0:
-                    bridge_radius = _estimate_linear_slice_bridge_min_radius(
-                        labels_real=labels_mm,
-                        source_label=int(candidate.source_label),
-                        target_label=int(candidate.target_label),
-                        source_point=src_point,
-                        target_point=candidate.target_point,
+        pending = max(plan_workers, plan_workers * 2)
+        if plan_workers <= 1:
+            iterable = (_plan_seed(int(idx)) for idx in range(len(seeds)))
+        else:
+            iterable = parallel_map_in_order(
+                _plan_seed,
+                range(len(seeds)),
+                max_workers=plan_workers,
+                max_pending=pending,
+            )
+
+        for seed_result in tqdm(iterable, total=len(seeds), desc='Interpolation: seed planning'):
+            candidate_connections += int(seed_result.candidate_connections)
+            accepted_connections += int(seed_result.accepted_connections)
+            default_bridges += int(seed_result.default_bridges)
+            walk_back_bridges += int(seed_result.walk_back_bridges)
+            skipped_by_min_radius += int(seed_result.skipped_by_min_radius)
+            if seed_result.plans:
+                plans.extend(seed_result.plans)
+
+        if plans:
+            schedule = _build_slice_bridge_render_schedule(plans, int(mask_mm.shape[0]))
+            added_counts = np.zeros((int(mask_mm.shape[0]),), dtype=np.int64)
+            render_workers = choose_slice_parallel_workers(int(workers), int(mask_mm.shape[0]))
+
+            def _render_slice(z: int) -> None:
+                contribs = schedule[int(z)]
+                if not contribs:
+                    return
+                bridge_slice = bridge_mm[int(z)]
+                local_added = 0
+                for plan_idx, step_idx in contribs:
+                    local_added += _paint_linear_slice_bridge_plan_onto_slice(
+                        bridge_slice,
+                        plans[int(plan_idx)],
+                        int(step_idx),
                     )
-                    if bridge_radius <= float(interpolate_min_radius):
-                        skipped_by_min_radius += 1
-                        continue
+                added_counts[int(z)] = np.int64(local_added)
 
-                if walk_idx == 0:
-                    default_bridges += 1
-                else:
-                    walk_back_bridges += 1
+            parallel_for_indices(
+                int(mask_mm.shape[0]),
+                _render_slice,
+                max_workers=render_workers,
+                desc='Interpolation: render bridges',
+            )
+            added_voxels = int(np.sum(added_counts, dtype=np.int64))
+            del schedule
+            del added_counts
 
-                if not accepted_this_candidate:
-                    accepted_connections += 1
-                    accepted_this_candidate = True
+            def _merge_slice(z: int) -> None:
+                bridge_slice = np.asarray(bridge_mm[int(z)])
+                if np.any(bridge_slice):
+                    mask_mm[int(z), :, :] |= bridge_slice
 
-                added_voxels += _paint_linear_slice_bridge(
-                    bridge_volume=bridge_mm,
-                    labels_real=labels_mm,
-                    source_label=int(candidate.source_label),
-                    target_label=int(candidate.target_label),
-                    source_point=src_point,
-                    target_point=candidate.target_point,
-                )
-
-    for z in tqdm(range(mask_mm.shape[0]), desc='Interpolation: merge bridges'):
-        bridge_slice = np.asarray(bridge_mm[z])
-        if np.any(bridge_slice):
-            mask_mm[z, :, :] |= bridge_slice
-    flush_array(mask_mm)
-
-    if isinstance(bridge_mm, np.memmap):
-        flush_array(bridge_mm)
-    del bridge_mm
-    if isinstance(labels_mm, np.memmap):
-        flush_array(labels_mm)
-    del labels_mm
-    if not keep_temp:
-        for p in label_paths:
-            try:
-                p.unlink(missing_ok=True)
-            except Exception:
-                pass
-        if bridge_path is not None:
-            try:
-                bridge_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+            parallel_for_indices(
+                int(mask_mm.shape[0]),
+                _merge_slice,
+                max_workers=render_workers,
+                desc='Interpolation: merge bridges',
+            )
+            flush_array(mask_mm)
+    finally:
+        if isinstance(bridge_mm, np.memmap):
+            flush_array(bridge_mm)
+        del bridge_mm
+        if isinstance(labels_mm, np.memmap):
+            flush_array(labels_mm)
+        del labels_mm
+        if not keep_temp:
+            for p in label_paths:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            if bridge_path is not None:
+                try:
+                    bridge_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     return {
         'num_objects': int(num_objects),
@@ -4454,6 +4649,7 @@ def _copy_volume_to_oriented_memmap(
     *,
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
+    workers: int = 1,
 ) -> np.ndarray:
     """Copy a Cartesian (T,H,W) volume into an oriented stack for slice-direction interpolation."""
     t_dim, h_dim, w_dim = src_volume_mm.shape
@@ -4467,8 +4663,16 @@ def _copy_volume_to_oriented_memmap(
             prefer_memory=bool(prefer_memory),
             reserve_bytes=int(reserve_bytes),
         )
-        for y in tqdm(range(h_dim), desc=f'Copy radial volume -> {orientation}'):
-            oriented_mm[y, :, :] = np.asarray(src_volume_mm[:, y, :], dtype=np.uint8)
+
+        def _copy_y(y: int) -> None:
+            oriented_mm[int(y), :, :] = np.asarray(src_volume_mm[:, int(y), :], dtype=np.uint8)
+
+        parallel_for_indices(
+            int(h_dim),
+            _copy_y,
+            max_workers=choose_slice_parallel_workers(int(workers), int(h_dim)),
+            desc=f'Copy radial volume -> {orientation}',
+        )
     elif orientation == 'coronal':
         oriented_mm = allocate_workspace_array(
             shape=(w_dim, t_dim, h_dim),
@@ -4478,8 +4682,16 @@ def _copy_volume_to_oriented_memmap(
             prefer_memory=bool(prefer_memory),
             reserve_bytes=int(reserve_bytes),
         )
-        for x in tqdm(range(w_dim), desc=f'Copy radial volume -> {orientation}'):
-            oriented_mm[x, :, :] = np.asarray(src_volume_mm[:, :, x], dtype=np.uint8)
+
+        def _copy_x(x: int) -> None:
+            oriented_mm[int(x), :, :] = np.asarray(src_volume_mm[:, :, int(x)], dtype=np.uint8)
+
+        parallel_for_indices(
+            int(w_dim),
+            _copy_x,
+            max_workers=choose_slice_parallel_workers(int(workers), int(w_dim)),
+            desc=f'Copy radial volume -> {orientation}',
+        )
     else:  # pragma: no cover
         raise ValueError(f'Unsupported orientation for radial interpolation: {orientation}')
 
@@ -4492,24 +4704,40 @@ def _merge_added_oriented_volume_into_bridge_union(
     oriented_mm: np.ndarray,
     orientation: str,
     bridge_union_mm: np.ndarray,
+    *,
+    workers: int = 1,
 ) -> None:
     """Collect only newly added voxels from an oriented interpolation run back into Cartesian space."""
     t_dim, h_dim, w_dim = src_volume_mm.shape
 
     if orientation == 'sagittal':
-        for y in tqdm(range(h_dim), desc=f'Collect radial {orientation} bridges'):
-            src_slice = np.asarray(src_volume_mm[:, y, :], dtype=np.uint8)
-            out_slice = np.asarray(oriented_mm[y], dtype=np.uint8)
+        def _merge_y(y: int) -> None:
+            src_slice = np.asarray(src_volume_mm[:, int(y), :], dtype=np.uint8)
+            out_slice = np.asarray(oriented_mm[int(y)], dtype=np.uint8)
             added = (out_slice > 0) & (src_slice == 0)
             if np.any(added):
-                bridge_union_mm[:, y, :] |= added.astype(np.uint8, copy=False)
+                bridge_union_mm[:, int(y), :] |= added.astype(np.uint8, copy=False)
+
+        parallel_for_indices(
+            int(h_dim),
+            _merge_y,
+            max_workers=choose_slice_parallel_workers(int(workers), int(h_dim)),
+            desc=f'Collect radial {orientation} bridges',
+        )
     elif orientation == 'coronal':
-        for x in tqdm(range(w_dim), desc=f'Collect radial {orientation} bridges'):
-            src_slice = np.asarray(src_volume_mm[:, :, x], dtype=np.uint8)
-            out_slice = np.asarray(oriented_mm[x], dtype=np.uint8)
+        def _merge_x(x: int) -> None:
+            src_slice = np.asarray(src_volume_mm[:, :, int(x)], dtype=np.uint8)
+            out_slice = np.asarray(oriented_mm[int(x)], dtype=np.uint8)
             added = (out_slice > 0) & (src_slice == 0)
             if np.any(added):
-                bridge_union_mm[:, :, x] |= added.astype(np.uint8, copy=False)
+                bridge_union_mm[:, :, int(x)] |= added.astype(np.uint8, copy=False)
+
+        parallel_for_indices(
+            int(w_dim),
+            _merge_x,
+            max_workers=choose_slice_parallel_workers(int(workers), int(w_dim)),
+            desc=f'Collect radial {orientation} bridges',
+        )
     else:  # pragma: no cover
         raise ValueError(f'Unsupported orientation for radial interpolation: {orientation}')
 
@@ -4526,6 +4754,7 @@ def interpolate_radial_view_pass_inplace(
     keep_temp: bool = False,
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
+    workers: int = 1,
 ) -> Dict[str, object]:
     """Interpolate a radial backprojection in Cartesian sagittal and coronal directions simultaneously."""
     if int(max_slice_distance) <= 0:
@@ -4566,6 +4795,7 @@ def interpolate_radial_view_pass_inplace(
                 oriented_path,
                 prefer_memory=bool(prefer_memory),
                 reserve_bytes=int(reserve_bytes),
+                workers=int(workers),
             )
             try:
                 stats = interpolate_view_volume_pass_inplace(
@@ -4580,9 +4810,16 @@ def interpolate_radial_view_pass_inplace(
                     keep_temp=bool(keep_temp),
                     prefer_memory=bool(prefer_memory),
                     reserve_bytes=int(reserve_bytes),
+                    workers=int(workers),
                 )
                 directional_stats.append((orientation, dict(stats)))
-                _merge_added_oriented_volume_into_bridge_union(mask_mm, oriented_mm, orientation, bridge_union_mm)
+                _merge_added_oriented_volume_into_bridge_union(
+                    mask_mm,
+                    oriented_mm,
+                    orientation,
+                    bridge_union_mm,
+                    workers=int(workers),
+                )
             finally:
                 close_memmap_array(oriented_mm)
                 del oriented_mm
@@ -4592,10 +4829,17 @@ def interpolate_radial_view_pass_inplace(
                     except Exception:
                         pass
 
-        for t in tqdm(range(mask_mm.shape[0]), desc='Interpolation: merge radial sagittal/coronal bridges'):
-            bridge_slice = np.asarray(bridge_union_mm[t])
+        def _merge_slice(t: int) -> None:
+            bridge_slice = np.asarray(bridge_union_mm[int(t)])
             if np.any(bridge_slice):
-                mask_mm[t, :, :] |= bridge_slice
+                mask_mm[int(t), :, :] |= bridge_slice
+
+        parallel_for_indices(
+            int(mask_mm.shape[0]),
+            _merge_slice,
+            max_workers=choose_slice_parallel_workers(int(workers), int(mask_mm.shape[0])),
+            desc='Interpolation: merge radial sagittal/coronal bridges',
+        )
         flush_array(mask_mm)
 
         if directional_stats:
@@ -5384,8 +5628,10 @@ def main() -> None:
         max_tasks=max(1, len(yolo_models) * len(views)),
     )
     slice_postprocess_workers = max(1, int(augmentation_workers))
+    predict_postprocess_workers = max(1, min(16, _env_int('YOLO_TTA_PREDICT_POSTPROCESS_WORKERS', slice_postprocess_workers)))
     print(f'Augmentation workers: {augmentation_workers}')
     print(f'Slice-parallel postprocess workers: {slice_postprocess_workers}')
+    print(f'Inference postprocess workers: {predict_postprocess_workers}')
     print(f'Interpolation workers: {interpolation_workers}')
 
     if augmentation_workers > 1 or interpolation_workers > 1 or slice_postprocess_workers > 1:
@@ -5475,6 +5721,7 @@ def main() -> None:
                     M_out_to_native=aff.M_out_to_src,
                     native_h=view.src_h,
                     native_w=view.src_w,
+                    postprocess_workers=predict_postprocess_workers,
                 )
                 view_prediction_stats[view.name] = int(view_prediction_stats.get(view.name, 0)) + int(pred_stats.get('prediction_count', 0))
 
@@ -5622,6 +5869,15 @@ def main() -> None:
                 for model_name in sorted(view_volumes_by_model.keys())
                 for view in views
             ]
+            outer_interpolation_workers = min(int(interpolation_workers), max(1, len(task_specs)))
+            per_task_interpolation_workers = max(
+                1,
+                min(16, _env_int('YOLO_TTA_INTERPOLATION_TASK_WORKERS', max(1, _cpu_count() // max(1, outer_interpolation_workers)))),
+            )
+            print(
+                f"Interpolation pass worker layout: outer={outer_interpolation_workers}, "
+                f"per-task={per_task_interpolation_workers}"
+            )
 
             def _run_interpolation_task(task_index: int) -> Dict[str, object]:
                 model_name, view = task_specs[int(task_index)]
@@ -5639,6 +5895,7 @@ def main() -> None:
                         interpolate_min_radius=float(args.interpolate_min_radius),
                         keep_temp=bool(args.troubleshooting),
                         prefer_memory=True,
+                        workers=per_task_interpolation_workers,
                     )
                 else:
                     stats_local = interpolate_view_volume_pass_inplace(
@@ -5652,6 +5909,7 @@ def main() -> None:
                         interpolate_min_radius=float(args.interpolate_min_radius),
                         keep_temp=bool(args.troubleshooting),
                         prefer_memory=True,
+                        workers=per_task_interpolation_workers,
                     )
 
                 stats_local = dict(stats_local)
@@ -5666,12 +5924,12 @@ def main() -> None:
                 })
                 return stats_local
 
-            if interpolation_workers > 1 and len(task_specs) > 1:
+            if outer_interpolation_workers > 1 and len(task_specs) > 1:
                 for stats in parallel_map_in_order(
                     _run_interpolation_task,
                     range(len(task_specs)),
-                    max_workers=min(interpolation_workers, len(task_specs)),
-                    max_pending=min(interpolation_workers, len(task_specs)),
+                    max_workers=outer_interpolation_workers,
+                    max_pending=outer_interpolation_workers,
                 ):
                     interpolation_stats.append(dict(stats))
             else:
