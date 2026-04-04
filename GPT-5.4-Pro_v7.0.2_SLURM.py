@@ -2,19 +2,19 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large video volumes.
 
-This v7.0.0_SLURM specification-aligned script:
+This v7.0.2_SLURM specification-aligned script:
   - builds transverse, sagittal, coronal and optional radial view families
   - generates rotated / scaled / shifted FFV1 MKV augmentations via a single affine transform per variant
   - runs Ultralytics YOLO segmentation sequentially on the pre-generated augmentation videos
   - stores per-augmentation traces to disk, undoes the affine transforms, unions masks per slice and tracks per-pixel max confidence for --min_conf
   - fills 2D holes after per-frame unions, interpolates Cartesian view volumes only in their native slice direction, unions the interpolated view volumes, and performs the final 3D void fill once after that union
   - prefers in-memory workspaces on the SLURM target and falls back to disk-backed scratch only when the working set is too large
-  - parallelizes augmentation generation across independent slices, overlaps in-memory augmentation staging with ordered video writes, parallelizes slice-independent postprocessing and assembly, and overlaps independent output creation in background workers
+  - parallelizes augmentation generation across independent slices, overlaps in-memory augmentation staging with ordered video writes, parallelizes slice-independent postprocessing and assembly, parallelizes CPR branch-build work across independent Cartesian components, and overlaps independent output creation in background workers
   - extracts radial diameter slices with exact Lanczos-5 interpolation by default
 
 Dependencies (Python):
   pip install opencv-python numpy scipy scikit-image tifffile tqdm ultralytics
-  pip install pynrrd   # only needed for --save_nrrd
+  pip install pynrrd (only needed for --save_nrrd)
 
 System:
   ffmpeg + ffprobe on PATH.
@@ -26,6 +26,7 @@ import argparse
 import gc
 import json
 import math
+import multiprocessing as mp
 import os
 import re
 import shlex
@@ -33,7 +34,7 @@ import shutil
 import subprocess
 import sys
 import threading
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 GIB = 1024 ** 3
@@ -42,38 +43,38 @@ from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence,
 
 import numpy as np
 
-# --- third-party ---
+                     
 try:
-    import cv2  # type: ignore
-except Exception as e:  # pragma: no cover
+    import cv2                
+except Exception as e:                    
     raise RuntimeError("OpenCV (cv2) is required: pip install opencv-python") from e
 
-from scipy import ndimage as ndi  # type: ignore
-from scipy.spatial import cKDTree  # type: ignore
+from scipy import ndimage as ndi                
+from scipy.spatial import cKDTree                
 
 try:
-    from skimage.morphology import skeletonize as _skimage_skeletonize  # type: ignore
+    from skimage.morphology import skeletonize as _skimage_skeletonize                
     try:
-        from skimage.morphology import skeletonize_3d as _skimage_skeletonize_3d  # type: ignore
+        from skimage.morphology import skeletonize_3d as _skimage_skeletonize_3d                
     except Exception:
         _skimage_skeletonize_3d = None
-except Exception as e:  # pragma: no cover
+except Exception as e:                    
     raise RuntimeError("scikit-image is required: pip install scikit-image") from e
 
 try:
-    import tifffile  # type: ignore
-except Exception as e:  # pragma: no cover
+    import tifffile                
+except Exception as e:                    
     raise RuntimeError("tifffile is required: pip install tifffile") from e
 
 try:
-    from tqdm import tqdm  # type: ignore
-except Exception as e:  # pragma: no cover
+    from tqdm import tqdm                
+except Exception as e:                    
     raise RuntimeError("tqdm is required: pip install tqdm") from e
 
 
-# --------------------------
-# CLI / args
-# --------------------------
+                            
+            
+                            
 
 def _parse_angles(s: str) -> List[float]:
     """Accepts comma or whitespace separated angles."""
@@ -101,7 +102,6 @@ def _parse_models(values: Sequence[str]) -> List[str]:
     return [x for x in out if x]
 
 
-
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="YOLO segmentation test-time augmentation for large cylindrical video volumes.",
@@ -115,7 +115,6 @@ def build_argparser() -> argparse.ArgumentParser:
 
     p.add_argument("--enable_multiplanar", action="store_true",
                    help="Enable Sagittal and Coronal view families in addition to the required Transverse view family")
-    p.add_argument("--disable_multiplanar", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--azimuth_angle", default=0.0, type=float,
                    help="Angular spacing in degrees for radial diameter slices over [0,180). 0 disables radial views")
     p.add_argument("--enable_cpr", action="store_true",
@@ -148,7 +147,6 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--save_radial", action="store_true",
                    help="Save additional Radial outputs when radial views are active")
     p.add_argument("--voxel_volume", action="store_true", help="Count white voxels in the final binary output and save to the summary text file")
-    p.add_argument("--binary", action="store_true", dest="voxel_volume", help=argparse.SUPPRESS)
     p.add_argument("--troubleshooting", action="store_true",
                    help="Keep temp files and save pass snapshots before each interpolation pass")
     p.add_argument("--scratch_dir", default=None, type=str,
@@ -170,20 +168,12 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Skip interpolation bridges whose effective radius is <= this value")
     p.add_argument("--interpolation_search_angle", default=15.0, type=float,
                    help="Projection growth angle in degrees. Must be greater than -90 and less than 90")
-    p.add_argument("--cone_half_angle", dest="interpolation_search_angle", type=float, help=argparse.SUPPRESS)
     return p
 
 
-# --------------------------
-# Scratch / temp layout
-# --------------------------
-
-def _path_free_bytes(path: Path) -> int:
-    try:
-        usage = shutil.disk_usage(str(path))
-        return int(usage.free)
-    except Exception:
-        return 0
+                            
+                       
+                            
 
 
 def _read_meminfo_bytes() -> Dict[str, int]:
@@ -623,9 +613,9 @@ def close_memmap_array(arr: object) -> None:
         pass
 
 
-# --------------------------
-# ffmpeg helpers
-# --------------------------
+                            
+                
+                            
 
 def _require_bin(name: str) -> None:
     if shutil.which(name) is None:
@@ -804,8 +794,8 @@ def close_ffmpeg_writer(proc: subprocess.Popen) -> None:
         except Exception:
             pass
 
-    # Prevent subprocess.communicate() from flushing a closed stdin (Py3.12 behavior)
-    proc.stdin = None  # type: ignore[attr-defined]
+                                                                                     
+    proc.stdin = None                              
 
     _, err = proc.communicate()
     if proc.returncode not in (0, None):
@@ -813,10 +803,9 @@ def close_ffmpeg_writer(proc: subprocess.Popen) -> None:
         raise RuntimeError(f"ffmpeg write failed: {msg}")
 
 
-
-# --------------------------
-# Affine transforms
-# --------------------------
+                            
+                   
+                            
 
 @dataclass(frozen=True)
 class AffineSpec:
@@ -832,8 +821,8 @@ class AffineSpec:
     pad_size: int
     pad_off_x: float
     pad_off_y: float
-    M_out_to_src: np.ndarray  # 2x3 float32
-    M_src_to_out: np.ndarray  # 2x3 float32
+    M_out_to_src: np.ndarray               
+    M_src_to_out: np.ndarray               
 
 
 @dataclass(frozen=True)
@@ -956,9 +945,9 @@ def build_affine(
     )
 
 
-# --------------------------
-# View slicing
-# --------------------------
+                            
+              
+                            
 
 @dataclass(frozen=True)
 class ViewInfo:
@@ -966,7 +955,7 @@ class ViewInfo:
     num_slices: int
     src_h: int
     src_w: int
-    pad_mode: str  # 'clamp' or 'pad'
+    pad_mode: str                    
     family: str = 'orthogonal'
     azimuths_deg: Tuple[float, ...] = ()
     diameter: int = 0
@@ -989,7 +978,6 @@ def build_radial_azimuths(azimuth_angle: float) -> List[float]:
     if not out:
         out.append(0.0)
     return out
-
 
 
 def get_view_infos(
@@ -1104,19 +1092,6 @@ def get_radial_sampler(view: ViewInfo, angle_deg: float) -> RadialSampler:
     return sampler
 
 
-def sample_radial_line_rgb_lanczos5(frame_rgb: np.ndarray, sampler: RadialSampler) -> np.ndarray:
-    if frame_rgb.ndim != 3 or frame_rgb.shape[2] != 3:
-        raise ValueError('Expected frame_rgb with shape (H,W,3)')
-
-    out = np.zeros((sampler.diameter, 3), dtype=np.float32)
-    for yi in range(sampler.y_idx.shape[1]):
-        samples = frame_rgb[sampler.y_idx[:, yi][:, None], sampler.x_idx, :].astype(np.float32, copy=False)
-        row = np.sum(samples * sampler.x_w[:, :, None], axis=1)
-        out += row * sampler.y_w[:, yi][:, None]
-
-    return np.clip(np.rint(out), 0.0, 255.0).astype(np.uint8)
-
-
 def choose_radial_exact_block_frames(diameter: int, target_bytes: int = 256 * 1024 * 1024) -> int:
     env = os.environ.get('YOLO_TTA_RADIAL_EXACT_BLOCK_FRAMES', '').strip()
     if env:
@@ -1128,7 +1103,6 @@ def choose_radial_exact_block_frames(diameter: int, target_bytes: int = 256 * 10
     bytes_per_frame = max(1, int(diameter) * 10 * 3 * np.dtype(np.float32).itemsize)
     block = max(1, int(target_bytes // bytes_per_frame))
     return max(1, min(256, block))
-
 
 
 def extract_radial_slice_frame(volume_rgb: np.ndarray, sampler: RadialSampler) -> np.ndarray:
@@ -1169,19 +1143,6 @@ def radial_fast_path_enabled() -> bool:
     Set YOLO_TTA_RADIAL_FAST=1 to opt into the faster OpenCV remap path.
     """
     return _env_flag('YOLO_TTA_RADIAL_FAST', False)
-
-
-def choose_radial_block_size(view: ViewInfo, target_bytes: int = 1 * GIB) -> int:
-    env = os.environ.get('YOLO_TTA_RADIAL_BLOCK_ANGLES', '').strip()
-    if env:
-        try:
-            return max(1, int(env))
-        except Exception:
-            pass
-
-    bytes_per_angle = max(1, int(view.src_h) * int(view.src_w) * 3)
-    block = max(1, int(target_bytes // bytes_per_angle))
-    return max(1, min(32, block))
 
 
 def build_radial_block_maps(view: ViewInfo, angles_deg: Sequence[float]) -> Tuple[np.ndarray, np.ndarray]:
@@ -1264,136 +1225,6 @@ def build_aug_jobs_for_view(
                 )
             )
     return jobs
-
-
-def ensure_radial_augmented_videos(
-    volume_rgb: np.memmap,
-    view: ViewInfo,
-    aug_jobs: Sequence[AugJob],
-    fps: float,
-) -> None:
-    if view.family != 'radial':
-        raise ValueError('ensure_radial_augmented_videos expects a radial view')
-
-    missing_jobs = [job for job in aug_jobs if not job.video_path.exists()]
-    for job in aug_jobs:
-        if not job.meta_path.exists():
-            write_aug_job_meta(job, view)
-
-    if not missing_jobs:
-        return
-
-    for job in missing_jobs:
-        job.video_path.parent.mkdir(parents=True, exist_ok=True)
-
-    writers: Dict[str, subprocess.Popen] = {}
-    try:
-        for job in missing_jobs:
-            writers[job.aug_id] = ffmpeg_rawvideo_writer(
-                job.video_path,
-                width=int(job.aff.out_size),
-                height=int(job.aff.out_size),
-                fps=fps,
-                pix_fmt_in='rgb24',
-                codec='ffv1',
-                pix_fmt_out='yuv444p',
-            )
-
-        if radial_fast_path_enabled():
-            block_size = choose_radial_block_size(view)
-            print(
-                f"Radial fast path: OpenCV remap blocks of {block_size} azimuths, "
-                f"reused across {len(missing_jobs)} augmentation(s)"
-            )
-            for block_start in range(0, len(view.azimuths_deg), block_size):
-                block_end = min(len(view.azimuths_deg), block_start + block_size)
-                block_angles = view.azimuths_deg[block_start:block_end]
-                map_x, map_y = build_radial_block_maps(view, block_angles)
-                native_block = np.empty((len(block_angles), int(view.src_h), int(view.src_w), 3), dtype=np.uint8)
-
-                for t in tqdm(
-                    range(int(view.src_h)),
-                    total=int(view.src_h),
-                    desc=f'Radial slice block {block_start + 1}-{block_end}',
-                ):
-                    frame_rgb = np.asarray(volume_rgb[t])
-                    sampled = cv2.remap(
-                        frame_rgb,
-                        map_x,
-                        map_y,
-                        interpolation=cv2.INTER_LANCZOS4,
-                        borderMode=cv2.BORDER_CONSTANT,
-                        borderValue=(0, 0, 0),
-                    )
-                    if sampled.ndim == 2:
-                        sampled = sampled[:, :, None]
-                    native_block[:, t, :, :] = sampled
-
-                for local_idx in tqdm(
-                    range(len(block_angles)),
-                    total=len(block_angles),
-                    desc=f'Radial augment block {block_start + 1}-{block_end}',
-                ):
-                    native_frame = np.ascontiguousarray(native_block[local_idx])
-                    for job in missing_jobs:
-                        out = cv2.warpAffine(
-                            native_frame,
-                            job.aff.M_src_to_out,
-                            dsize=(int(job.aff.out_size), int(job.aff.out_size)),
-                            flags=cv2.INTER_LINEAR,
-                            borderMode=cv2.BORDER_CONSTANT,
-                            borderValue=(0, 0, 0),
-                        )
-                        writer = writers[job.aug_id]
-                        assert writer.stdin is not None
-                        writer.stdin.write(out.tobytes())
-
-                del native_block
-        else:
-            print(
-                f"Radial strict path: exact Lanczos-5, reused across {len(missing_jobs)} augmentation(s) "
-                f"(set YOLO_TTA_RADIAL_FAST=1 to enable the faster block remap path)"
-            )
-            for angle_deg in tqdm(view.azimuths_deg, total=len(view.azimuths_deg), desc='Radial slicing (exact Lanczos-5)'):
-                sampler = get_radial_sampler(view, float(angle_deg))
-                native_frame = np.ascontiguousarray(extract_radial_slice_frame(volume_rgb, sampler))
-                for job in missing_jobs:
-                    out = cv2.warpAffine(
-                        native_frame,
-                        job.aff.M_src_to_out,
-                        dsize=(int(job.aff.out_size), int(job.aff.out_size)),
-                        flags=cv2.INTER_LINEAR,
-                        borderMode=cv2.BORDER_CONSTANT,
-                        borderValue=(0, 0, 0),
-                    )
-                    writer = writers[job.aug_id]
-                    assert writer.stdin is not None
-                    writer.stdin.write(out.tobytes())
-    finally:
-        for writer in writers.values():
-            close_ffmpeg_writer(writer)
-
-
-def iter_view_frames(volume_rgb: np.memmap, view: ViewInfo) -> Iterator[np.ndarray]:
-    """Yield frames for a view, in slice order (0..num_slices-1)."""
-    T, H, W, C = volume_rgb.shape
-    assert C == 3
-
-    if view.name == 'transverse':
-        for t in range(T):
-            yield np.asarray(volume_rgb[t])  # (H,W,3)
-    elif view.name == 'sagittal':
-        for y in range(H):
-            yield np.ascontiguousarray(volume_rgb[:, y, :, :])  # (T,W,3)
-    elif view.name == 'coronal':
-        for x in range(W):
-            yield np.ascontiguousarray(volume_rgb[:, :, x, :])  # (T,H,3)
-    elif view.name == 'radial':
-        for angle_deg in view.azimuths_deg:
-            sampler = get_radial_sampler(view, float(angle_deg))
-            yield np.ascontiguousarray(extract_radial_slice_frame(volume_rgb, sampler))  # (T,D,3)
-    else:
-        raise ValueError(f'Unknown view: {view.name}')
 
 
 def get_view_frame_by_index(volume_rgb: np.ndarray, view: ViewInfo, index: int) -> np.ndarray:
@@ -1479,13 +1310,13 @@ def _write_augmented_video_from_stage(
                 if stop_event.is_set() and not bool(ready_flags[idx]):
                     return
             proc.stdin.write(np.ascontiguousarray(staged_frames[idx]).tobytes())
-    except BaseException as exc:  # pragma: no cover - propagated through the future result path
+    except BaseException as exc:                                                                
         caught = exc
     finally:
         if proc is not None:
             try:
                 close_ffmpeg_writer(proc)
-            except BaseException as exc:  # pragma: no cover - propagated through the future result path
+            except BaseException as exc:                                                                
                 if caught is None:
                     caught = exc
         if caught is not None:
@@ -1493,7 +1324,6 @@ def _write_augmented_video_from_stage(
             with ready_cond:
                 ready_cond.notify_all()
             raise caught
-
 
 
 def _ensure_augmented_videos_with_staging(
@@ -1582,7 +1412,6 @@ def _ensure_augmented_videos_with_staging(
         gc.collect()
 
 
-
 def _ensure_augmented_videos_streaming(
     volume_rgb: np.ndarray,
     view: ViewInfo,
@@ -1618,7 +1447,6 @@ def _ensure_augmented_videos_streaming(
     finally:
         for writer in writers.values():
             close_ffmpeg_writer(writer)
-
 
 
 def ensure_augmented_videos(
@@ -1663,9 +1491,9 @@ def ensure_augmented_videos(
     )
 
 
-# --------------------------
-# Packed mask IO
-# --------------------------
+                            
+                
+                            
 
 def bytes_for_packbits(h: int, w: int) -> int:
     return (h * w + 7) // 8
@@ -1674,7 +1502,7 @@ def bytes_for_packbits(h: int, w: int) -> int:
 def pack_mask(mask01: np.ndarray) -> np.ndarray:
     """Pack a 2D/1D binary mask (bool or 0/1 uint8) into np.packbits uint8."""
     flat = np.asarray(mask01).reshape(-1)
-    # np.packbits supports bool directly; for numeric inputs we treat nonzero as 1.
+                                                                                   
     if flat.dtype == np.bool_:
         return np.packbits(flat)
     else:
@@ -1691,17 +1519,13 @@ def any_mask(packed: np.ndarray) -> bool:
     return bool(np.any(packed))
 
 
-def overlap_any(packed_a: np.ndarray, packed_b: np.ndarray) -> bool:
-    return bool(np.any(np.bitwise_and(packed_a, packed_b)))
-
-
-# --------------------------
-# YOLO inference
-# --------------------------
+                            
+                
+                            
 
 def load_ultralytics_model(path: str):
     try:
-        from ultralytics import YOLO  # type: ignore
+        from ultralytics import YOLO                
     except Exception as e:
         raise RuntimeError(
             "Ultralytics is required. Install with: pip install ultralytics\n"
@@ -1724,7 +1548,7 @@ def _extract_result_masks_and_confs(r) -> Tuple[Optional[np.ndarray], Optional[n
     if getattr(r, 'masks', None) is None or r.masks is None or r.masks.data is None:
         return None, None
 
-    masks_data = r.masks.data  # (n,h,w)
+    masks_data = r.masks.data           
     try:
         masks_np = np.asarray(masks_data.detach().cpu().numpy(), dtype=np.uint8)
     except Exception:
@@ -1845,10 +1669,10 @@ def predict_video_and_accumulate(
     out_size: int,
     pred_out_prefix: Path,
     cfg: PredictConfig,
-    # accumulation into per-view union stack (native resolution, packed bits)
-    view_union_mm: np.ndarray,          # uint8 packbits, shape (num_slices, bytes_native)
-    view_confmap_mm: np.ndarray,        # float16 confidence map, shape (num_slices, native_h, native_w)
-    M_out_to_native: np.ndarray,       # 2x3, maps augmented(out)->native for cv2.warpAffine (src->dst)
+                                                                             
+    view_union_mm: np.ndarray,                                                            
+    view_confmap_mm: np.ndarray,                                                                        
+    M_out_to_native: np.ndarray,                                                                       
     native_h: int,
     native_w: int,
     postprocess_workers: int = 1,
@@ -1984,9 +1808,9 @@ def predict_video_and_accumulate(
     }
 
 
-# --------------------------
-# Per-view postprocessing
-# --------------------------
+                            
+                         
+                            
 
 def apply_min_conf_filter_with_confmap_inplace(
     union_mm: np.ndarray,
@@ -2086,57 +1910,9 @@ def fill_2d_holes_inplace(
         desc='2D hole fill',
     )
 
-# --------------------------
-# 3D assembly + postprocessing
-# --------------------------
-
-def assemble_model_volume_into_ensemble(
-    ensemble_mm: np.ndarray,  # uint8 (0/1) shape (T,H,W)
-    view_union_mms: Dict[str, np.memmap],
-    T: int,
-    H: int,
-    W: int,
-    disable_multiplanar: bool,
-) -> None:
-    """
-    OR the per-view union stacks for ONE model into the 3D ensemble volume.
-
-    Views:
-      - transverse: slices along t, each slice is HxW
-      - sagittal: slices along y, each slice is T x W, mapped into ensemble[:, y, :]
-      - coronal: slices along x, each slice is T x H, mapped into ensemble[:, :, x]
-      - radial: optional already-backprojected (T,H,W) volume
-    """
-    transverse = view_union_mms["transverse"]
-    bytes_xy = bytes_for_packbits(H, W)
-    assert transverse.shape == (T, bytes_xy)
-
-    for t in tqdm(range(T), desc="Assembling volume from transverse"):
-        m = unpack_mask(np.asarray(transverse[t]), H, W)
-        ensemble_mm[t, :, :] |= m
-
-    if not disable_multiplanar and "sagittal" in view_union_mms:
-        sagittal = view_union_mms["sagittal"]
-        bytes_tx = bytes_for_packbits(T, W)
-        assert sagittal.shape == (H, bytes_tx)
-
-        for y in tqdm(range(H), desc="Assembling volume from sagittal"):
-            m = unpack_mask(np.asarray(sagittal[y]), T, W)
-            ensemble_mm[:, y, :] |= m
-
-    if not disable_multiplanar and "coronal" in view_union_mms:
-        coronal = view_union_mms["coronal"]
-        bytes_ty = bytes_for_packbits(T, H)
-        assert coronal.shape == (W, bytes_ty)
-
-        for x in tqdm(range(W), desc="Assembling volume from coronal"):
-            m = unpack_mask(np.asarray(coronal[x]), T, H)  # (T,H) cols are y
-            ensemble_mm[:, :, x] |= m
-
-    if "radial" in view_union_mms:
-        radial = np.asarray(view_union_mms["radial"])
-        assert radial.shape == (T, H, W)
-        ensemble_mm[:, :, :] |= radial
+                            
+                              
+                            
 
 
 class _UnionFind:
@@ -2378,7 +2154,6 @@ def fill_3d_voids_inplace_streaming(
             pass
 
 
-
 def label_foreground_volume_streaming(
     mask_mm: np.ndarray,
     work_prefix: Path,
@@ -2467,7 +2242,6 @@ def label_foreground_volume_streaming(
 
     flush_array(labels_store)
     return labels_store, int(unique_roots.size), label_paths
-
 
 
 def build_slice_endpoint_seeds_from_label_volume(
@@ -2616,7 +2390,7 @@ def apply_view_min_radius_filter_inplace(
         transverse_view = np.transpose(mask_mm, (1, 0, 2))
     elif view.name == 'coronal':
         transverse_view = np.transpose(mask_mm, (1, 2, 0))
-    else:  # pragma: no cover
+    else:                    
         raise ValueError(f'Unsupported view for min-radius filtering: {view.name}')
 
     print(f"Applying --min_radius in the transverse plane for view '{view.name}'")
@@ -2626,43 +2400,6 @@ def apply_view_min_radius_filter_inplace(
         workers=choose_slice_parallel_workers(int(workers), int(transverse_view.shape[0])),
     )
     flush_array(mask_mm)
-
-
-def fill_3d_voids(mask_u8: np.ndarray) -> np.ndarray:
-    """Fill enclosed 3D voids by labeling background CCs and keeping only those connected to a boundary."""
-    mask_bool = np.asarray(mask_u8, dtype=bool)
-    if mask_bool.size == 0:
-        return mask_bool.astype(np.uint8)
-
-    bg = np.logical_not(mask_bool)
-    labels_bg, num_bg = ndi.label(bg, structure=np.ones((3, 3, 3), dtype=bool))
-    if num_bg == 0:
-        return mask_bool.astype(np.uint8)
-
-    boundary_labels: List[np.ndarray] = []
-    for slab in (
-        labels_bg[0, :, :],
-        labels_bg[-1, :, :],
-        labels_bg[:, 0, :],
-        labels_bg[:, -1, :],
-        labels_bg[:, :, 0],
-        labels_bg[:, :, -1],
-    ):
-        vals = slab[slab > 0]
-        if vals.size:
-            boundary_labels.append(np.unique(vals))
-
-    if boundary_labels:
-        touching = np.unique(np.concatenate(boundary_labels))
-        touches_boundary = np.zeros(num_bg + 1, dtype=bool)
-        touches_boundary[touching] = True
-        enclosed = (labels_bg > 0) & (~touches_boundary[labels_bg])
-    else:
-        enclosed = labels_bg > 0
-
-    out = mask_bool.copy()
-    out[enclosed] = True
-    return out.astype(np.uint8)
 
 
 def unpack_view_union_to_volume(
@@ -2742,39 +2479,6 @@ def backproject_radial_union_to_volume(
 
     flush_array(vol_mm)
     return vol_mm
-
-
-def apply_transverse_min_radius_filter(mask_u8: np.ndarray, min_radius: float) -> np.ndarray:
-    """Remove 2D connected components whose transverse-plane radius is smaller than ``min_radius``."""
-    if float(min_radius) <= 0:
-        return np.asarray(mask_u8, dtype=np.uint8)
-
-    out = np.asarray(mask_u8, dtype=np.uint8).copy()
-    struct2 = np.ones((3, 3), dtype=bool)
-
-    for t in tqdm(range(out.shape[0]), desc="Transverse min-radius filter"):
-        sl = out[t] > 0
-        if not sl.any():
-            continue
-
-        labels2d, num = ndi.label(sl, structure=struct2)
-        if num <= 0:
-            out[t, :, :] = 0
-            continue
-
-        keep = np.zeros(sl.shape, dtype=bool)
-        for lbl in range(1, int(num) + 1):
-            comp = labels2d == lbl
-            if not comp.any():
-                continue
-            radius = float(np.max(ndi.distance_transform_edt(comp)))
-            if radius >= float(min_radius):
-                keep |= comp
-
-        out[t, :, :] = keep.astype(np.uint8)
-
-    return out.astype(np.uint8)
-
 
 
 def assemble_model_volume_from_view_volumes(
@@ -2892,9 +2596,9 @@ def assemble_current_ensemble_volume(
     return ensemble_mm
 
 
-# --------------------------
-# Skeleton-based interpolation (optional)
-# --------------------------
+                            
+                                         
+                            
 
 
 def _neighbors26() -> List[Tuple[int, int, int]]:
@@ -2911,39 +2615,6 @@ def _neighbors26() -> List[Tuple[int, int, int]]:
 NEIGH26 = _neighbors26()
 KERNEL_3 = np.ones((3, 3, 3), dtype=np.uint8)
 STRUCTURE26 = np.ones((3, 3, 3), dtype=bool)
-
-
-@dataclass(frozen=True)
-class EndpointSeed:
-    label: int
-    point: Tuple[int, int, int]      # (z, y, x)
-    direction: np.ndarray            # unit vector in (z, y, x)
-    support_radius: float            # robust local radius for this endpoint
-
-
-@dataclass(frozen=True)
-class BridgeCandidate:
-    source_label: int
-    target_label: int
-    source_point: Tuple[int, int, int]
-    target_point: Tuple[int, int, int]
-    hit_point: Tuple[int, int, int]
-    distance: float
-    source_radius: float
-    target_radius: float
-    bridge_radius: float
-
-
-@dataclass(frozen=True)
-class PlannedBridge:
-    pair_labels: Tuple[int, int]
-    label0: int
-    label1: int
-    p0: Tuple[int, int, int]
-    p1: Tuple[int, int, int]
-    radius0: float
-    radius1: float
-    bridge_radius: float
 
 
 def skeletonize_volume(mask_bool: np.ndarray) -> np.ndarray:
@@ -3021,523 +2692,7 @@ def _trace_inward_path(
     return path
 
 
-def _estimate_seed_support_radius(
-    dist_sub: np.ndarray,
-    path: List[Tuple[int, int, int]],
-    extension_radius: int,
-) -> float:
-    """
-    Estimate a robust local support radius for an endpoint by sampling several voxels
-    inward along the skeleton path instead of trusting only the terminal endpoint voxel.
-    This suppresses tiny bead-like bridges caused by noisy terminal skeleton branches.
-    """
-    if not path:
-        return 1.0
-
-    max_samples = max(2, min(len(path), max(3, min(8, int(extension_radius) + 1))))
-    vals: List[float] = []
-    for pt in path[:max_samples]:
-        v = float(dist_sub[pt])
-        if v > 0:
-            vals.append(v)
-
-    if not vals:
-        return 1.0
-
-    radius_cap = max(1.0, float(extension_radius))
-    return max(1.0, min(max(vals), radius_cap))
-
-
-def _build_endpoint_seeds(
-    labels_real: np.ndarray,
-    extension_radius: int,
-) -> Tuple[List[EndpointSeed], int]:
-    """Skeletonize every real 3D object and return endpoint seeds with local tangent directions."""
-    objs = ndi.find_objects(labels_real)
-    seeds: List[EndpointSeed] = []
-    endpoint_count = 0
-    direction_depth = max(2, min(8, int(extension_radius)))
-
-    for lbl, sl in enumerate(objs, start=1):
-        if sl is None:
-            continue
-        sub = (labels_real[sl] == lbl)
-        if not sub.any():
-            continue
-
-        skel = skeletonize_volume(sub)
-        if not skel.any():
-            continue
-
-        dist_sub = ndi.distance_transform_edt(sub)
-        neigh = ndi.convolve(skel.astype(np.uint8), KERNEL_3, mode="constant", cval=0) - skel.astype(np.uint8)
-        ep_coords = np.argwhere(np.logical_and(skel, neigh == 1))
-        if ep_coords.size == 0:
-            continue
-
-        z0, y0, x0 = sl[0].start, sl[1].start, sl[2].start
-
-        for ep in ep_coords:
-            ep_t = (int(ep[0]), int(ep[1]), int(ep[2]))
-            path = _trace_inward_path(skel, ep_t, max_steps=direction_depth)
-            ref = path[-1] if len(path) > 1 else ep_t
-
-            direction = np.asarray(ep_t, dtype=np.float32) - np.asarray(ref, dtype=np.float32)
-            norm = float(np.linalg.norm(direction))
-            if norm <= 0:
-                nbs = _skeleton_neighbors(skel, ep_t)
-                if not nbs:
-                    continue
-                direction = np.asarray(ep_t, dtype=np.float32) - np.asarray(nbs[0], dtype=np.float32)
-                norm = float(np.linalg.norm(direction))
-                if norm <= 0:
-                    continue
-            direction /= norm
-
-            seeds.append(
-                EndpointSeed(
-                    label=int(lbl),
-                    point=(z0 + ep_t[0], y0 + ep_t[1], x0 + ep_t[2]),
-                    direction=direction.astype(np.float32),
-                    support_radius=_estimate_seed_support_radius(
-                        dist_sub=dist_sub,
-                        path=path,
-                        extension_radius=extension_radius,
-                    ),
-                )
-            )
-            endpoint_count += 1
-
-    return seeds, endpoint_count
-
-
-def _estimate_local_object_radius(
-    labels_real: np.ndarray,
-    label: int,
-    center: Tuple[int, int, int],
-    radius_cap: int,
-) -> float:
-    """
-    Approximate the largest integer-radius sphere fully contained in a labeled object around `center`.
-    This avoids allocating a full-volume EDT while still producing a stable bridge radius estimate.
-    """
-    z0, y0, x0 = center
-    Z, Y, X = labels_real.shape
-    if not (0 <= z0 < Z and 0 <= y0 < Y and 0 <= x0 < X):
-        return 0.0
-    if int(labels_real[z0, y0, x0]) != int(label):
-        return 0.0
-
-    best = 1
-    for r in range(2, max(2, int(radius_cap)) + 1):
-        offsets = _integer_sphere_offsets(r)
-        dz = offsets[:, 0].astype(np.int64, copy=False)
-        dy = offsets[:, 1].astype(np.int64, copy=False)
-        dx = offsets[:, 2].astype(np.int64, copy=False)
-
-        zz = z0 + dz
-        yy = y0 + dy
-        xx = x0 + dx
-        inside = (
-            (zz >= 0) & (zz < Z) &
-            (yy >= 0) & (yy < Y) &
-            (xx >= 0) & (xx < X)
-        )
-        if not np.all(inside):
-            break
-        if not np.all(labels_real[zz, yy, xx] == int(label)):
-            break
-        best = r
-
-    return float(max(1, best))
-
-
-def _estimate_target_anchor_and_radius(
-    labels_real: np.ndarray,
-    target_label: int,
-    hit_point: Tuple[int, int, int],
-    direction: np.ndarray,
-    radius_cap: int,
-    max_steps: int,
-) -> Tuple[Tuple[int, int, int], float]:
-    """
-    Starting from the first target intercept, walk a few voxels deeper into the target
-    along the connection direction and keep the in-object point with the strongest local support.
-    This avoids deriving bridge width from a single surface voxel.
-    """
-    direction = np.asarray(direction, dtype=np.float32)
-    dnorm = float(np.linalg.norm(direction))
-    if dnorm <= 0:
-        return hit_point, max(1.0, _estimate_local_object_radius(labels_real, target_label, hit_point, radius_cap))
-
-    direction = direction / dnorm
-    best_point = hit_point
-    best_radius = max(1.0, _estimate_local_object_radius(labels_real, target_label, hit_point, radius_cap))
-    Z, Y, X = labels_real.shape
-    seen: set[Tuple[int, int, int]] = {hit_point}
-
-    for step in range(1, max(1, int(max_steps)) + 1):
-        q = tuple(int(round(hit_point[i] + float(direction[i]) * float(step))) for i in range(3))
-        if q in seen:
-            continue
-        seen.add(q)
-
-        qz, qy, qx = q
-        if not (0 <= qz < Z and 0 <= qy < Y and 0 <= qx < X):
-            break
-        if int(labels_real[qz, qy, qx]) != int(target_label):
-            break
-
-        r = _estimate_local_object_radius(labels_real, target_label, q, radius_cap)
-        if r > best_radius + 1e-6:
-            best_radius = r
-            best_point = q
-
-    return best_point, max(1.0, best_radius)
-
-
-def _sorted_sphere_offsets(radius: int) -> List[Tuple[float, int, int, int]]:
-    out: List[Tuple[float, int, int, int]] = []
-    r2 = float(radius * radius)
-    for dz in range(-radius, radius + 1):
-        for dy in range(-radius, radius + 1):
-            for dx in range(-radius, radius + 1):
-                d2 = float(dz * dz + dy * dy + dx * dx)
-                if d2 <= 0.0 or d2 > r2:
-                    continue
-                out.append((math.sqrt(d2), dz, dy, dx))
-    out.sort(key=lambda item: item[0])
-    return out
-
-
-def _closest_sector_hit(
-    labels_real: np.ndarray,
-    source_label: int,
-    point: Tuple[int, int, int],
-    direction: np.ndarray,
-    extension_radius: int,
-    cone_half_angle_deg: float,
-    sphere_offsets: List[Tuple[float, int, int, int]],
-) -> Optional[Tuple[Tuple[int, int, int], int, float]]:
-    """
-    Return the closest intercept inside the spherical sector.
-    For cone_half_angle == 0 the sector degenerates to a ray sampled at unit steps.
-    """
-    z0, y0, x0 = point
-    Z, Y, X = labels_real.shape
-    direction = np.asarray(direction, dtype=np.float32)
-    dnorm = float(np.linalg.norm(direction))
-    if dnorm <= 0:
-        return None
-    direction = direction / dnorm
-
-    if cone_half_angle_deg <= 0.0:
-        seen: set[Tuple[int, int, int]] = set()
-        for step in range(1, int(extension_radius) + 1):
-            q = tuple(int(round(point[i] + float(direction[i]) * float(step))) for i in range(3))
-            if q in seen:
-                continue
-            seen.add(q)
-            qz, qy, qx = q
-            if not (0 <= qz < Z and 0 <= qy < Y and 0 <= qx < X):
-                break
-            other = int(labels_real[qz, qy, qx])
-            if other != 0 and other != int(source_label):
-                return q, other, float(step)
-        return None
-
-    cos_thresh = math.cos(math.radians(min(90.0, max(0.0, cone_half_angle_deg))))
-    for dist, dz, dy, dx in sphere_offsets:
-        dot = (dz * float(direction[0]) + dy * float(direction[1]) + dx * float(direction[2])) / dist
-        if dot + 1e-9 < cos_thresh:
-            continue
-        qz = z0 + dz
-        qy = y0 + dy
-        qx = x0 + dx
-        if not (0 <= qz < Z and 0 <= qy < Y and 0 <= qx < X):
-            continue
-        other = int(labels_real[qz, qy, qx])
-        if other != 0 and other != int(source_label):
-            return (qz, qy, qx), other, dist
-
-    return None
-
-
-def _build_bridge_candidates(
-    labels_real: np.ndarray,
-    seeds: List[EndpointSeed],
-    extension_radius: int,
-    cone_half_angle_deg: float,
-) -> List[BridgeCandidate]:
-    sphere_offsets = _sorted_sphere_offsets(int(extension_radius))
-    anchor_depth = max(2, min(6, int(extension_radius)))
-    radius_cap = max(1, int(extension_radius))
-
-    candidates: List[BridgeCandidate] = []
-    for seed in seeds:
-        hit = _closest_sector_hit(
-            labels_real=labels_real,
-            source_label=seed.label,
-            point=seed.point,
-            direction=seed.direction,
-            extension_radius=int(extension_radius),
-            cone_half_angle_deg=float(cone_half_angle_deg),
-            sphere_offsets=sphere_offsets,
-        )
-        if hit is None:
-            continue
-
-        hit_point, hit_label, hit_distance = hit
-        target_point, target_radius = _estimate_target_anchor_and_radius(
-            labels_real=labels_real,
-            target_label=int(hit_label),
-            hit_point=hit_point,
-            direction=seed.direction,
-            radius_cap=radius_cap,
-            max_steps=anchor_depth,
-        )
-        bridge_radius = min(float(seed.support_radius), float(target_radius))
-        candidates.append(
-            BridgeCandidate(
-                source_label=int(seed.label),
-                target_label=int(hit_label),
-                source_point=seed.point,
-                target_point=target_point,
-                hit_point=hit_point,
-                distance=float(hit_distance),
-                source_radius=float(seed.support_radius),
-                target_radius=float(target_radius),
-                bridge_radius=float(bridge_radius),
-            )
-        )
-
-    return candidates
-
-
-def _euclidean_distance(p0: Tuple[int, int, int], p1: Tuple[int, int, int]) -> float:
-    dz = float(p0[0] - p1[0])
-    dy = float(p0[1] - p1[1])
-    dx = float(p0[2] - p1[2])
-    return math.sqrt(dz * dz + dy * dy + dx * dx)
-
-
-def _reciprocal_pair_score(
-    c_ab: BridgeCandidate,
-    c_ba: BridgeCandidate,
-) -> Tuple[float, float, float]:
-    """
-    Prefer reciprocal candidates that point toward each other's supported anchor region,
-    then prefer shorter intercepts, then prefer wider connections.
-    """
-    consistency = (
-        _euclidean_distance(c_ab.target_point, c_ba.source_point) +
-        _euclidean_distance(c_ba.target_point, c_ab.source_point)
-    )
-    return (
-        float(consistency),
-        float(c_ab.distance + c_ba.distance),
-        -float(min(c_ab.bridge_radius, c_ba.bridge_radius)),
-    )
-
-
-def _plan_pairwise_bridges(
-    candidates: List[BridgeCandidate],
-    interpolate_min_radius: float,
-) -> Tuple[List[PlannedBridge], Dict[str, int]]:
-    """
-    Collapse many endpoint-level candidate hits into at most one bridge per unordered object pair.
-    This directly suppresses the failure mode where multiple nearby endpoints create many small
-    circular bridges instead of one larger bridge.
-    """
-    by_pair: Dict[Tuple[int, int], List[BridgeCandidate]] = {}
-    for cand in candidates:
-        key = (
-            min(int(cand.source_label), int(cand.target_label)),
-            max(int(cand.source_label), int(cand.target_label)),
-        )
-        by_pair.setdefault(key, []).append(cand)
-
-    planned: List[PlannedBridge] = []
-    skipped_by_min_radius = 0
-
-    for pair_key, group in by_pair.items():
-        a, b = pair_key
-        ab = [c for c in group if int(c.source_label) == int(a) and int(c.target_label) == int(b)]
-        ba = [c for c in group if int(c.source_label) == int(b) and int(c.target_label) == int(a)]
-
-        if ab and ba:
-            best_pair: Optional[Tuple[BridgeCandidate, BridgeCandidate]] = None
-            best_score: Optional[Tuple[float, float, float]] = None
-            for c_ab in ab:
-                for c_ba in ba:
-                    score = _reciprocal_pair_score(c_ab, c_ba)
-                    if best_score is None or score < best_score:
-                        best_score = score
-                        best_pair = (c_ab, c_ba)
-
-            assert best_pair is not None
-            c_ab, c_ba = best_pair
-
-            radius0 = max(float(c.source_radius) for c in ab)
-            radius1 = max(float(c.source_radius) for c in ba)
-            bridge_radius = min(radius0, radius1)
-            if bridge_radius <= float(interpolate_min_radius):
-                skipped_by_min_radius += 1
-                continue
-
-            planned.append(
-                PlannedBridge(
-                    pair_labels=pair_key,
-                    label0=int(a),
-                    label1=int(b),
-                    p0=c_ab.source_point,
-                    p1=c_ba.source_point,
-                    radius0=float(radius0),
-                    radius1=float(radius1),
-                    bridge_radius=float(bridge_radius),
-                )
-            )
-            continue
-
-        best = min(group, key=lambda c: (float(c.distance), -float(c.bridge_radius)))
-
-        # With only one directional hit, the target-side radius estimate is usually the least stable
-        # because the first intercept occurs at the target surface. Use the source-side support radius
-        # to decide whether the bridge is too small, and keep the deeper target anchor only for geometry.
-        radius0 = max(float(c.source_radius) for c in group if int(c.source_label) == int(best.source_label))
-        target_radius = max(float(c.target_radius) for c in group)
-        radius1 = max(radius0, target_radius)
-        bridge_radius = radius0
-        if bridge_radius <= float(interpolate_min_radius):
-            skipped_by_min_radius += 1
-            continue
-
-        planned.append(
-            PlannedBridge(
-                pair_labels=pair_key,
-                label0=int(best.source_label),
-                label1=int(best.target_label),
-                p0=best.source_point,
-                p1=best.target_point,
-                radius0=float(radius0),
-                radius1=float(radius1),
-                bridge_radius=float(bridge_radius),
-            )
-        )
-
-    return planned, {
-        "pair_groups": int(len(by_pair)),
-        "accepted_connections": int(len(planned)),
-        "skipped_by_min_radius": int(skipped_by_min_radius),
-    }
-
-
 _SPHERE_PAINT_CACHE: Dict[int, np.ndarray] = {}
-
-
-def _integer_sphere_offsets(radius: int) -> np.ndarray:
-    cached = _SPHERE_PAINT_CACHE.get(int(radius))
-    if cached is not None:
-        return cached
-
-    pts: List[Tuple[int, int, int, int]] = []
-    r2 = radius * radius
-    for dz in range(-radius, radius + 1):
-        for dy in range(-radius, radius + 1):
-            for dx in range(-radius, radius + 1):
-                d2 = dz * dz + dy * dy + dx * dx
-                if d2 <= r2:
-                    pts.append((dz, dy, dx, d2))
-    arr = np.asarray(pts, dtype=np.int16 if radius <= 127 else np.int32)
-    _SPHERE_PAINT_CACHE[int(radius)] = arr
-    return arr
-
-
-def _paint_sphere(mask: np.ndarray, center: Tuple[int, int, int], radius: float) -> int:
-    radius = max(0.5, float(radius))
-    ir = int(math.ceil(radius))
-    offsets = _integer_sphere_offsets(ir)
-    rr2 = float(radius * radius) + 1e-6
-
-    z0, y0, x0 = center
-    Z, Y, X = mask.shape
-    added = 0
-
-    for dz, dy, dx, d2 in offsets.tolist():
-        if float(d2) > rr2:
-            continue
-        zz = z0 + int(dz)
-        yy = y0 + int(dy)
-        xx = x0 + int(dx)
-        if 0 <= zz < Z and 0 <= yy < Y and 0 <= xx < X and not mask[zz, yy, xx]:
-            mask[zz, yy, xx] = True
-            added += 1
-
-    return added
-
-
-def bresenham3d(p0: Tuple[int, int, int], p1: Tuple[int, int, int]) -> List[Tuple[int, int, int]]:
-    """3D Bresenham line between integer points p0 and p1 (z,y,x)."""
-    z0, y0, x0 = p0
-    z1, y1, x1 = p1
-    dz = abs(z1 - z0)
-    dy = abs(y1 - y0)
-    dx = abs(x1 - x0)
-    sz = 1 if z1 >= z0 else -1
-    sy = 1 if y1 >= y0 else -1
-    sx = 1 if x1 >= x0 else -1
-
-    if dx >= dy and dx >= dz:
-        p1_err = 2 * dy - dx
-        p2_err = 2 * dz - dx
-        z, y, x = z0, y0, x0
-        out = []
-        for _ in range(dx + 1):
-            out.append((z, y, x))
-            if p1_err >= 0:
-                y += sy
-                p1_err -= 2 * dx
-            if p2_err >= 0:
-                z += sz
-                p2_err -= 2 * dx
-            p1_err += 2 * dy
-            p2_err += 2 * dz
-            x += sx
-        return out
-    elif dy >= dx and dy >= dz:
-        p1_err = 2 * dx - dy
-        p2_err = 2 * dz - dy
-        z, y, x = z0, y0, x0
-        out = []
-        for _ in range(dy + 1):
-            out.append((z, y, x))
-            if p1_err >= 0:
-                x += sx
-                p1_err -= 2 * dy
-            if p2_err >= 0:
-                z += sz
-                p2_err -= 2 * dy
-            p1_err += 2 * dx
-            p2_err += 2 * dz
-            y += sy
-        return out
-    else:
-        p1_err = 2 * dy - dz
-        p2_err = 2 * dx - dz
-        z, y, x = z0, y0, x0
-        out = []
-        for _ in range(dz + 1):
-            out.append((z, y, x))
-            if p1_err >= 0:
-                y += sy
-                p1_err -= 2 * dz
-            if p2_err >= 0:
-                x += sx
-                p2_err -= 2 * dz
-            p1_err += 2 * dy
-            p2_err += 2 * dx
-            z += sz
-        return out
 
 
 _PLANE_GRID_CACHE: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
@@ -3605,23 +2760,6 @@ def _keep_center_component_2d(mask2d: np.ndarray) -> np.ndarray:
     return np.asarray(ndi.binary_fill_holes(kept), dtype=bool)
 
 
-def _mask_touches_border(mask2d: np.ndarray) -> bool:
-    if mask2d.size == 0 or not np.any(mask2d):
-        return False
-    return bool(
-        np.any(mask2d[0, :]) or
-        np.any(mask2d[-1, :]) or
-        np.any(mask2d[:, 0]) or
-        np.any(mask2d[:, -1])
-    )
-
-
-def _disk_mask_2d(half_width: int, radius: float) -> np.ndarray:
-    radius = max(0.5, float(radius))
-    uu, vv = _plane_uv_grid(int(half_width))
-    return np.asarray((uu * uu + vv * vv) <= (radius * radius + 1e-6), dtype=bool)
-
-
 def _signed_distance_2d(mask2d: np.ndarray) -> np.ndarray:
     mask2d = np.asarray(mask2d, dtype=bool)
     inside = ndi.distance_transform_edt(mask2d)
@@ -3629,367 +2767,11 @@ def _signed_distance_2d(mask2d: np.ndarray) -> np.ndarray:
     return np.asarray(inside - outside, dtype=np.float32)
 
 
-def _best_in_object_axis_anchor(
-    labels_real: np.ndarray,
-    label: int,
-    start: Tuple[int, int, int],
-    direction: np.ndarray,
-    radius_hint: float,
-    max_steps: int,
-) -> Tuple[Tuple[int, int, int], float]:
-    direction = _normalize_vec(direction)
-    if float(np.linalg.norm(direction)) <= 0:
-        return start, max(1.0, float(radius_hint))
-
-    start_arr = np.asarray(start, dtype=np.float32)
-    Z, Y, X = labels_real.shape
-    radius_cap = max(1, int(math.ceil(max(1.0, float(radius_hint))) + 2))
-
-    best_point: Optional[Tuple[int, int, int]] = None
-    best_radius = 0.0
-    best_step = -1
-    seen: set[Tuple[int, int, int]] = set()
-
-    for step in range(0, max(0, int(max_steps)) + 1):
-        q = tuple(int(round(float(start_arr[i] + float(direction[i]) * float(step)))) for i in range(3))
-        if q in seen:
-            continue
-        seen.add(q)
-        qz, qy, qx = q
-        if not (0 <= qz < Z and 0 <= qy < Y and 0 <= qx < X):
-            continue
-        if int(labels_real[qz, qy, qx]) != int(label):
-            continue
-
-        r = float(_estimate_local_object_radius(labels_real, int(label), q, radius_cap))
-        if (
-            best_point is None or
-            r > best_radius + 1e-6 or
-            (abs(r - best_radius) <= 1e-6 and step > best_step)
-        ):
-            best_point = q
-            best_radius = r
-            best_step = step
-
-    if best_point is None:
-        return start, max(1.0, float(radius_hint))
-    return best_point, max(1.0, float(best_radius))
-
-
-def _extract_local_plane_mask(
-    labels_real: np.ndarray,
-    label: int,
-    center: np.ndarray,
-    axis: np.ndarray,
-    half_width: int,
-    plane_half_thickness: float = 0.75,
-) -> np.ndarray:
-    axis_u, u_axis, v_axis = _orthonormal_basis(axis)
-    uu, vv = _plane_uv_grid(int(half_width))
-
-    center = np.asarray(center, dtype=np.float32)
-    base = center.reshape(1, 1, 3) + (
-        uu[..., None] * u_axis.reshape(1, 1, 3) +
-        vv[..., None] * v_axis.reshape(1, 1, 3)
-    )
-
-    if plane_half_thickness > 0:
-        offsets = (-float(plane_half_thickness), 0.0, float(plane_half_thickness))
-    else:
-        offsets = (0.0,)
-
-    acc = np.zeros(uu.shape, dtype=bool)
-    Z, Y, X = labels_real.shape
-    for off in offsets:
-        coords = base + axis_u.reshape(1, 1, 3) * float(off)
-        zz = np.rint(coords[..., 0]).astype(np.int32)
-        yy = np.rint(coords[..., 1]).astype(np.int32)
-        xx = np.rint(coords[..., 2]).astype(np.int32)
-
-        valid = (
-            (zz >= 0) & (zz < Z) &
-            (yy >= 0) & (yy < Y) &
-            (xx >= 0) & (xx < X)
-        )
-        if not np.any(valid):
-            continue
-        hit = np.zeros_like(acc, dtype=bool)
-        hit[valid] = (labels_real[zz[valid], yy[valid], xx[valid]] == int(label))
-        acc |= hit
-
-    if not np.any(acc):
-        return acc
-    return _keep_center_component_2d(acc)
-
-
-def _paint_plane_section(
-    mask: np.ndarray,
-    center: np.ndarray,
-    axis: np.ndarray,
-    section_mask: np.ndarray,
-    plane_half_thickness: float = 0.49,
-) -> int:
-    section_mask = np.asarray(section_mask, dtype=bool)
-    if not section_mask.any():
-        return 0
-
-    axis_u, u_axis, v_axis = _orthonormal_basis(axis)
-    center = np.asarray(center, dtype=np.float32)
-    half_width = section_mask.shape[0] // 2
-    pts2d = np.argwhere(section_mask)
-    if pts2d.size == 0:
-        return 0
-
-    vv = (pts2d[:, 0].astype(np.float32) - float(half_width))
-    uu = (pts2d[:, 1].astype(np.float32) - float(half_width))
-    base = (
-        center.reshape(1, 3) +
-        uu[:, None] * u_axis.reshape(1, 3) +
-        vv[:, None] * v_axis.reshape(1, 3)
-    )
-
-    if plane_half_thickness > 0:
-        offsets = (-float(plane_half_thickness), 0.0, float(plane_half_thickness))
-    else:
-        offsets = (0.0,)
-
-    clouds = [base + axis_u.reshape(1, 3) * float(off) for off in offsets]
-    coords = np.concatenate(clouds, axis=0)
-    ijk = np.rint(coords).astype(np.int32)
-
-    Z, Y, X = mask.shape
-    valid = (
-        (ijk[:, 0] >= 0) & (ijk[:, 0] < Z) &
-        (ijk[:, 1] >= 0) & (ijk[:, 1] < Y) &
-        (ijk[:, 2] >= 0) & (ijk[:, 2] < X)
-    )
-    if not np.any(valid):
-        return 0
-
-    pts = np.unique(ijk[valid], axis=0)
-    current = mask[pts[:, 0], pts[:, 1], pts[:, 2]]
-    mask[pts[:, 0], pts[:, 1], pts[:, 2]] = True
-    return int(np.count_nonzero(~current))
-
-
-def _paint_connection_tube(
-    mask: np.ndarray,
-    labels_real: np.ndarray,
-    label0: int,
-    label1: int,
-    p0: Tuple[int, int, int],
-    p1: Tuple[int, int, int],
-    radius0: float,
-    radius1: Optional[float] = None,
-) -> int:
-    if radius1 is None:
-        radius1 = radius0
-
-    radius0 = max(0.5, float(radius0))
-    radius1 = max(0.5, float(radius1))
-
-    p0_arr = np.asarray(p0, dtype=np.float32)
-    p1_arr = np.asarray(p1, dtype=np.float32)
-    axis = p1_arr - p0_arr
-    axis_len = float(np.linalg.norm(axis))
-    if axis_len <= 0:
-        return 0
-    axis_u = axis / axis_len
-
-    anchor_steps0 = max(2, min(12, int(math.ceil(radius0 * 2.0)) + 2))
-    anchor_steps1 = max(2, min(12, int(math.ceil(radius1 * 2.0)) + 2))
-    c0, local_r0 = _best_in_object_axis_anchor(
-        labels_real=labels_real,
-        label=int(label0),
-        start=p0,
-        direction=-axis_u,
-        radius_hint=radius0,
-        max_steps=anchor_steps0,
-    )
-    c1, local_r1 = _best_in_object_axis_anchor(
-        labels_real=labels_real,
-        label=int(label1),
-        start=p1,
-        direction=axis_u,
-        radius_hint=radius1,
-        max_steps=anchor_steps1,
-    )
-
-    c0_arr = np.asarray(c0, dtype=np.float32)
-    c1_arr = np.asarray(c1, dtype=np.float32)
-    section_axis = c1_arr - c0_arr
-    section_len = float(np.linalg.norm(section_axis))
-    if section_len <= 0:
-        section_axis = axis_u.copy()
-        section_len = axis_len
-    else:
-        section_axis = section_axis / section_len
-
-    base_radius = max(radius0, radius1, float(local_r0), float(local_r1))
-    half_width = max(3, int(math.ceil(base_radius * 2.0)) + 1)
-    max_half_width = max(half_width, min(96, int(math.ceil(base_radius * 4.0)) + 6))
-
-    while True:
-        section0 = _extract_local_plane_mask(
-            labels_real=labels_real,
-            label=int(label0),
-            center=c0_arr,
-            axis=section_axis,
-            half_width=half_width,
-            plane_half_thickness=0.75,
-        )
-        section1 = _extract_local_plane_mask(
-            labels_real=labels_real,
-            label=int(label1),
-            center=c1_arr,
-            axis=section_axis,
-            half_width=half_width,
-            plane_half_thickness=0.75,
-        )
-        if (
-            half_width >= max_half_width or
-            (not _mask_touches_border(section0) and not _mask_touches_border(section1))
-        ):
-            break
-        half_width = min(max_half_width, max(half_width + 1, half_width * 2))
-
-    if not np.any(section0):
-        section0 = _disk_mask_2d(half_width, max(radius0, float(local_r0)))
-    if not np.any(section1):
-        section1 = _disk_mask_2d(half_width, max(radius1, float(local_r1)))
-
-    section0 = _keep_center_component_2d(section0)
-    section1 = _keep_center_component_2d(section1)
-
-    sdf0 = _signed_distance_2d(section0)
-    sdf1 = _signed_distance_2d(section1)
-
-    steps = max(1, int(math.ceil(section_len)))
-    if steps <= 1:
-        alphas = [0.5]
-    else:
-        alphas = [float(idx) / float(steps) for idx in range(1, steps)]
-
-    added = 0
-    for alpha in alphas:
-        center = (1.0 - alpha) * c0_arr + alpha * c1_arr
-        section = ((1.0 - alpha) * sdf0 + alpha * sdf1) >= 0.0
-        section = _keep_center_component_2d(section)
-        added += _paint_plane_section(
-            mask=mask,
-            center=center,
-            axis=section_axis,
-            section_mask=section,
-            plane_half_thickness=0.49,
-        )
-
-    return int(added)
-
-
-def interpolate_spherical_sector_pass(
-    mask_u8: np.ndarray,
-    extension_radius: int,
-    cone_half_angle_deg: float,
-    interpolate_min_radius: float,
-) -> Tuple[np.ndarray, Dict[str, object]]:
-    """
-    One interpolation pass using spherical-sector interception from skeleton endpoints.
-
-    Rules implemented:
-      - The current mask at the start of the pass is the set of "real" sections for this pass.
-      - Sector interception is computed only against those real sections.
-      - New interpolation added during this pass is transparent to the search, and only becomes "real"
-        in the next pass (handled by the caller).
-      - If multiple objects are intercepted, the closest intercept is used.
-      - Multiple endpoint-level hits between the same unordered object pair are collapsed into at most
-        one painted bridge for the pass, which suppresses the common "many small circular bridges"
-        failure mode.
-      - Spherical sectors are used only to choose connection targets. The bridge geometry itself is
-        produced by linear interpolation between local real cross-sectional masks, which yields tubes
-        instead of chains of nearly spherical blobs.
-    """
-    if extension_radius <= 0:
-        return np.asarray(mask_u8, dtype=np.uint8), {
-            "num_objects": 0,
-            "num_endpoints": 0,
-            "candidate_connections": 0,
-            "pair_groups": 0,
-            "accepted_connections": 0,
-            "skipped_by_min_radius": 0,
-            "added_voxels": 0,
-            "skipped": True,
-        }
-
-    pass_real = np.asarray(mask_u8, dtype=bool)
-    labels_real, num_objects = ndi.label(pass_real, structure=STRUCTURE26)
-    if num_objects <= 1:
-        return pass_real.astype(np.uint8), {
-            "num_objects": int(num_objects),
-            "num_endpoints": 0,
-            "candidate_connections": 0,
-            "pair_groups": 0,
-            "accepted_connections": 0,
-            "skipped_by_min_radius": 0,
-            "added_voxels": 0,
-            "skipped": num_objects <= 1,
-        }
-
-    seeds, num_endpoints = _build_endpoint_seeds(labels_real, extension_radius=extension_radius)
-    if not seeds:
-        return pass_real.astype(np.uint8), {
-            "num_objects": int(num_objects),
-            "num_endpoints": int(num_endpoints),
-            "candidate_connections": 0,
-            "pair_groups": 0,
-            "accepted_connections": 0,
-            "skipped_by_min_radius": 0,
-            "added_voxels": 0,
-            "skipped": False,
-        }
-
-    candidates = _build_bridge_candidates(
-        labels_real=labels_real,
-        seeds=seeds,
-        extension_radius=int(extension_radius),
-        cone_half_angle_deg=float(cone_half_angle_deg),
-    )
-    planned_bridges, plan_stats = _plan_pairwise_bridges(
-        candidates=candidates,
-        interpolate_min_radius=float(interpolate_min_radius),
-    )
-
-    work_mask = pass_real.copy()
-    added_voxels = 0
-    for bridge in planned_bridges:
-        added_voxels += _paint_connection_tube(
-            work_mask,
-            labels_real=labels_real,
-            label0=int(bridge.label0),
-            label1=int(bridge.label1),
-            p0=bridge.p0,
-            p1=bridge.p1,
-            radius0=bridge.radius0,
-            radius1=bridge.radius1,
-        )
-
-    stats: Dict[str, object] = {
-        "num_objects": int(num_objects),
-        "num_endpoints": int(num_endpoints),
-        "candidate_connections": int(len(candidates)),
-        "pair_groups": int(plan_stats["pair_groups"]),
-        "accepted_connections": int(plan_stats["accepted_connections"]),
-        "skipped_by_min_radius": int(plan_stats["skipped_by_min_radius"]),
-        "added_voxels": int(added_voxels),
-        "skipped": False,
-    }
-    return work_mask.astype(np.uint8), stats
-
-
 @dataclass(frozen=True)
 class SliceEndpointSeed:
     label: int
-    point: Tuple[int, int, int]  # (slice, row, col)
-    direction_sign: int          # -1 or +1 along the slice axis
+    point: Tuple[int, int, int]                     
+    direction_sign: int                                         
 
 
 @dataclass(frozen=True)
@@ -4859,22 +3641,22 @@ def interpolate_view_volume_pass_inplace(
     }
 
 
-# Radial interpolation remains disabled for v7.0.0_SLURM (radial views are inferred and unioned, but only Cartesian view families are interpolated).
-# Radial views still participate in inference, inverse mapping and final union,
-# but interpolation is now applied only to the Cartesian view families.
+                                                                                                                                                    
+                                                                               
+                                                                       
 
 
-# --------------------------
-# Curved Planar Reformation (optional)
-# --------------------------
+                            
+                                      
+                            
 
 
 @dataclass(frozen=True)
 class CPRBranch:
     branch_id: int
-    points: np.ndarray          # (N,3) int32, skeleton voxel order in (z,y,x)
-    smoothed_points: np.ndarray # (N,3) float32
-    tangents: np.ndarray        # (N,3) float32
+    points: np.ndarray                                                        
+    smoothed_points: np.ndarray                
+    tangents: np.ndarray                       
     half_width: int
     native_size: int
 
@@ -4929,7 +3711,7 @@ def decompose_skeleton_into_branches(skel: np.ndarray) -> List[np.ndarray]:
 
             branches.append(np.asarray(path, dtype=np.int32))
 
-    # Closed loops have no degree!=2 nodes, so trace any remaining unvisited edges.
+                                                                                   
     for node in sorted(pts):
         for nbr in neighbors[node]:
             edge = _edge_key_3d(node, nbr)
@@ -4957,7 +3739,7 @@ def decompose_skeleton_into_branches(skel: np.ndarray) -> List[np.ndarray]:
 
             branches.append(np.asarray(path, dtype=np.int32))
 
-    # Deduplicate trivial repeats while preserving order.
+                                                         
     out: List[np.ndarray] = []
     seen_keys: set[Tuple[Tuple[int, int, int], ...]] = set()
     for branch in branches:
@@ -5012,47 +3794,182 @@ def compute_centerline_tangents(points: np.ndarray) -> np.ndarray:
     return tangents
 
 
-def build_cpr_branches(mask_u8: np.ndarray) -> List[CPRBranch]:
-    mask_bool = np.asarray(mask_u8, dtype=bool)
-    if not np.any(mask_bool):
+def _make_cpr_component_task(
+    labels_mm: np.ndarray,
+    label: int,
+    sl: Tuple[slice, slice, slice],
+    max_half_width: int,
+) -> Tuple[int, Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]], np.ndarray, int]:
+    z_sl, y_sl, x_sl = sl
+    bounds = (
+        (int(z_sl.start), int(z_sl.stop)),
+        (int(y_sl.start), int(y_sl.stop)),
+        (int(x_sl.start), int(x_sl.stop)),
+    )
+    submask = np.ascontiguousarray(np.asarray(labels_mm[z_sl, y_sl, x_sl] == int(label), dtype=np.uint8))
+    return int(label), bounds, submask, int(max_half_width)
+
+
+def _build_cpr_component_branches_task(
+    task: Tuple[int, Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]], np.ndarray, int]
+) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]]:
+    _, bounds, submask_u8, max_half_width = task
+    submask = np.asarray(submask_u8, dtype=bool)
+    if not np.any(submask):
         return []
 
-    print('CPR: skeletonizing Cartesian source volume')
-    skel = skeletonize_volume(mask_bool)
+    skel = skeletonize_volume(submask)
     raw_branches = decompose_skeleton_into_branches(skel)
     if not raw_branches:
         return []
 
-    dist = ndi.distance_transform_edt(mask_bool)
-    branches: List[CPRBranch] = []
-    max_half_width = max(8, min(255, int(min(mask_bool.shape[1], mask_bool.shape[2]) // 2)))
+    dist = ndi.distance_transform_edt(submask)
+    z0, _ = bounds[0]
+    y0, _ = bounds[1]
+    x0, _ = bounds[2]
+    offset_i32 = np.asarray([int(z0), int(y0), int(x0)], dtype=np.int32)
+    offset_f32 = np.asarray([float(z0), float(y0), float(x0)], dtype=np.float32)
 
-    for branch_id, pts in enumerate(raw_branches, start=1):
+    out: List[Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]] = []
+    for pts in raw_branches:
         pts = np.asarray(pts, dtype=np.int32)
         if pts.ndim != 2 or pts.shape[1] != 3 or int(pts.shape[0]) <= 0:
             continue
+
         smoothed = smooth_centerline(pts.astype(np.float32), window=min(9, max(3, int(pts.shape[0]) | 1)))
         tangents = compute_centerline_tangents(smoothed)
 
-        idx_z = np.clip(pts[:, 0], 0, mask_bool.shape[0] - 1)
-        idx_y = np.clip(pts[:, 1], 0, mask_bool.shape[1] - 1)
-        idx_x = np.clip(pts[:, 2], 0, mask_bool.shape[2] - 1)
+        idx_z = np.clip(pts[:, 0], 0, submask.shape[0] - 1)
+        idx_y = np.clip(pts[:, 1], 0, submask.shape[1] - 1)
+        idx_x = np.clip(pts[:, 2], 0, submask.shape[2] - 1)
         radii = np.asarray(dist[idx_z, idx_y, idx_x], dtype=np.float32)
         robust_radius = float(np.percentile(radii, 95.0)) if radii.size else 1.0
-        half_width = int(max(8, min(max_half_width, math.ceil(max(1.0, robust_radius) * 2.0) + 4)))
+        half_width = int(max(8, min(int(max_half_width), math.ceil(max(1.0, robust_radius) * 2.0) + 4)))
 
-        branches.append(
-            CPRBranch(
-                branch_id=int(branch_id),
-                points=pts,
-                smoothed_points=np.asarray(smoothed, dtype=np.float32),
-                tangents=np.asarray(tangents, dtype=np.float32),
-                half_width=int(half_width),
-                native_size=int(2 * half_width + 1),
+        out.append((
+            np.ascontiguousarray(pts + offset_i32[None, :], dtype=np.int32),
+            np.ascontiguousarray(smoothed + offset_f32[None, :], dtype=np.float32),
+            np.ascontiguousarray(tangents, dtype=np.float32),
+            int(half_width),
+            int(2 * half_width + 1),
+        ))
+
+    return out
+
+
+def build_cpr_branches(
+    mask_u8: np.ndarray,
+    work_dir: Path,
+    *,
+    keep_temp: bool = False,
+    workers: int = 1,
+) -> List[CPRBranch]:
+    mask_arr = np.asarray(mask_u8)
+    if mask_arr.ndim != 3 or not np.any(mask_arr):
+        return []
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    label_workers = choose_slice_parallel_workers(int(workers), int(mask_arr.shape[0]))
+    print(f'CPR: labeling Cartesian source volume with {label_workers} worker(s)')
+
+    labels_mm, num_objects, label_paths = label_foreground_volume_streaming(
+        mask_arr,
+        work_dir / 'source_components',
+        keep_temp=True,
+        prefer_memory=True,
+        workers=label_workers,
+    )
+
+    if int(num_objects) <= 0:
+        close_memmap_array(labels_mm)
+        if not keep_temp:
+            for p in label_paths:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        return []
+
+    objects = [(int(lbl), sl) for lbl, sl in enumerate(ndi.find_objects(labels_mm), start=1) if sl is not None]
+    if not objects:
+        close_memmap_array(labels_mm)
+        if not keep_temp:
+            for p in label_paths:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        return []
+
+    component_workers = choose_slice_parallel_workers(int(workers), len(objects))
+    global_max_half_width = max(8, min(255, int(min(mask_arr.shape[1], mask_arr.shape[2]) // 2)))
+    print(f'CPR: skeletonizing {len(objects)} connected component(s) with {component_workers} worker(s)')
+
+    branches: List[CPRBranch] = []
+    next_branch_id = 1
+
+    def _append_component_branches(component_branches: List[Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]]) -> None:
+        nonlocal next_branch_id
+        for points, smoothed_points, tangents, half_width, native_size in component_branches:
+            branches.append(
+                CPRBranch(
+                    branch_id=int(next_branch_id),
+                    points=np.asarray(points, dtype=np.int32),
+                    smoothed_points=np.asarray(smoothed_points, dtype=np.float32),
+                    tangents=np.asarray(tangents, dtype=np.float32),
+                    half_width=int(half_width),
+                    native_size=int(native_size),
+                )
             )
-        )
+            next_branch_id += 1
 
-    return branches
+    try:
+        if component_workers <= 1 or len(objects) <= 1:
+            for label, sl in tqdm(objects, desc='CPR: build branches'):
+                task = _make_cpr_component_task(labels_mm, int(label), sl, int(global_max_half_width))
+                _append_component_branches(_build_cpr_component_branches_task(task))
+        else:
+            def _task_index_worker(idx: int) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]]:
+                label, sl = objects[int(idx)]
+                task = _make_cpr_component_task(labels_mm, int(label), sl, int(global_max_half_width))
+                return _build_cpr_component_branches_task(task)
+
+            use_process_pool = __name__ == '__main__'
+            if use_process_pool:
+                max_pending = max(component_workers, component_workers * 2)
+                mp_ctx = mp.get_context('spawn')
+                with ProcessPoolExecutor(max_workers=component_workers, mp_context=mp_ctx) as executor:
+                    pending: List[Future] = []
+                    next_idx = 0
+                    with tqdm(total=len(objects), desc='CPR: build branches') as pbar:
+                        while next_idx < len(objects) or pending:
+                            while next_idx < len(objects) and len(pending) < max_pending:
+                                label, sl = objects[next_idx]
+                                task = _make_cpr_component_task(labels_mm, int(label), sl, int(global_max_half_width))
+                                pending.append(executor.submit(_build_cpr_component_branches_task, task))
+                                next_idx += 1
+
+                            component_branches = pending.pop(0).result()
+                            _append_component_branches(component_branches)
+                            pbar.update(1)
+            else:
+                pending = max(component_workers, component_workers * 2)
+                for component_branches in tqdm(
+                    parallel_map_in_order(_task_index_worker, range(len(objects)), max_workers=component_workers, max_pending=pending),
+                    total=len(objects),
+                    desc='CPR: build branches',
+                ):
+                    _append_component_branches(component_branches)
+
+        return branches
+    finally:
+        close_memmap_array(labels_mm)
+        if not keep_temp:
+            for p in label_paths:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
 
 def build_cpr_support_labels(
@@ -5089,7 +4006,7 @@ def build_cpr_support_labels(
     tree = cKDTree(branch_points)
     try:
         _, nn_idx = tree.query(fg.astype(np.float32), k=1, workers=-1)
-    except TypeError:  # older SciPy
+    except TypeError:               
         _, nn_idx = tree.query(fg.astype(np.float32), k=1)
     support_mm[tuple(fg.T)] = branch_ids[np.asarray(nn_idx, dtype=np.int64)]
     flush_array(support_mm)
@@ -5418,7 +4335,12 @@ def apply_cpr_refinement_inplace(
     cpr_root = temp_dir / 'cpr'
     cpr_root.mkdir(parents=True, exist_ok=True)
 
-    branches = build_cpr_branches(cartesian_view)
+    branches = build_cpr_branches(
+        cartesian_view,
+        cpr_root / 'branch_build',
+        keep_temp=bool(troubleshooting),
+        workers=max(1, int(slice_workers)),
+    )
     if not branches:
         return {
             'branches': 0,
@@ -5551,54 +4473,9 @@ def apply_cpr_refinement_inplace(
                 pass
 
 
-# --------------------------
-# Final outputs
-# --------------------------
-
-
-def write_binary_outputs(
-    mask_u8: np.ndarray,  # (T,H,W) 0/1
-    out_dir: Path,
-    stem: str,
-    fps: float,
-    *,
-    tiff_subdir: str = "binary_masks",
-    tiff_prefix: Optional[str] = None,
-    video_name: Optional[str] = None,
-) -> Tuple[Path, Path]:
-    """Write TIFF sequence + FFV1 MKV for a binary mask volume."""
-    T, H, W = mask_u8.shape
-    tiff_dir = out_dir / tiff_subdir
-    tiff_dir.mkdir(parents=True, exist_ok=True)
-
-    if tiff_prefix is None:
-        tiff_prefix = f"{stem}_Binary"
-    if video_name is None:
-        video_name = f"{stem}_Binary.mkv"
-
-    for t in tqdm(range(T), desc=f"Writing binary TIFF sequence ({tiff_subdir})"):
-        img = (mask_u8[t] * 255).astype(np.uint8)
-        tifffile.imwrite(str(tiff_dir / f"{tiff_prefix}_{t+1:04d}.tiff"), img)
-
-    vid_path = out_dir / video_name
-    proc = ffmpeg_rawvideo_writer(
-        vid_path,
-        width=W,
-        height=H,
-        fps=fps,
-        pix_fmt_in="gray",
-        codec="ffv1",
-        pix_fmt_out="gray",
-    )
-    try:
-        assert proc.stdin is not None
-        for t in tqdm(range(T), desc=f"Writing binary MKV ({video_name})"):
-            img = (mask_u8[t] * 255).astype(np.uint8)
-            proc.stdin.write(img.tobytes())
-    finally:
-        close_ffmpeg_writer(proc)
-
-    return tiff_dir, vid_path
+                            
+               
+                            
 
 
 def _write_video_from_rendered_frames(
@@ -5643,8 +4520,8 @@ def _write_video_from_rendered_frames(
 
 
 def write_overlay_video(
-    volume_rgb: np.memmap,  # (T,H,W,3) RGB
-    mask_u8: np.ndarray,    # (T,H,W) 0/1
+    volume_rgb: np.memmap,                 
+    mask_u8: np.ndarray,                 
     out_path: Path,
     fps: float,
     workers: int = 1,
@@ -5654,7 +4531,7 @@ def write_overlay_video(
     T, H, W, _ = volume_rgb.shape
     assert mask_u8.shape == (T, H, W)
 
-    blue = np.array([0, 0, 255], dtype=np.uint16)  # RGB blue
+    blue = np.array([0, 0, 255], dtype=np.uint16)            
 
     def _render_frame(t: int) -> np.ndarray:
         frame = np.asarray(volume_rgb[int(t)]).copy()
@@ -5679,7 +4556,6 @@ def write_overlay_video(
     )
 
 
-
 def mask_to_yolo_polygons(mask01: np.ndarray) -> List[List[Tuple[float, float]]]:
     """Convert a binary mask (H,W) to a list of external polygons with normalized coords."""
     h, w = mask01.shape
@@ -5696,43 +4572,6 @@ def mask_to_yolo_polygons(mask01: np.ndarray) -> List[List[Tuple[float, float]]]
         pts = approx.reshape(-1, 2)
         polys.append([(float(x) / float(w), float(y) / float(h)) for (x, y) in pts])
     return polys
-
-
-def write_yolo_labels(
-    mask_u8: np.ndarray,
-    out_dir: Path,
-    stem: str,
-    *,
-    labels_subdir: str = "labels",
-    frame_prefix: Optional[str] = None,
-) -> Path:
-    """Write YOLO seg labels, including blank files for frames with no detections."""
-    labels_dir = out_dir / labels_subdir
-    labels_dir.mkdir(parents=True, exist_ok=True)
-    T, H, W = mask_u8.shape
-
-    if frame_prefix is None:
-        frame_prefix = stem
-
-    for t in tqdm(range(T), desc=f"Writing YOLO labels ({labels_subdir})"):
-        fp = labels_dir / f"{frame_prefix}_{t+1:04d}.txt"
-        m = (mask_u8[t] > 0)
-        if not m.any():
-            fp.write_text("")
-            continue
-        polys = mask_to_yolo_polygons(m.astype(np.uint8))
-        if not polys:
-            fp.write_text("")
-            continue
-        lines = []
-        for poly in polys:
-            coords = []
-            for (x, y) in poly:
-                coords.append(f"{x:.6f}")
-                coords.append(f"{y:.6f}")
-            lines.append("0 " + " ".join(coords))
-        fp.write_text("\n".join(lines) + "\n")
-    return labels_dir
 
 
 DEFAULT_LABEL_PATTERN = "labels/{Filename}_%04d.txt"
@@ -5882,95 +4721,15 @@ def write_binary_video_from_mask_volume(
     return video_path
 
 
-
-def write_binary_outputs_from_pattern(
-    mask_u8: np.ndarray,
-    pattern_path: Path,
-    video_path: Path,
-    fps: float,
-    workers: int = 1,
-    show_progress: bool = True,
-) -> Tuple[Path, Path]:
-    tiff_dir = write_binary_tiff_sequence_from_pattern(
-        mask_u8,
-        pattern_path,
-        workers=int(workers),
-        show_progress=show_progress,
-    )
-    binary_video_path = write_binary_video_from_mask_volume(
-        mask_u8,
-        video_path,
-        fps,
-        workers=int(workers),
-        show_progress=show_progress,
-    )
-    return tiff_dir, binary_video_path
-
-
 def write_nrrd(mask_u8: np.ndarray, out_path: Path) -> Path:
     try:
-        import nrrd  # type: ignore
-    except Exception as e:  # pragma: no cover
+        import nrrd                
+    except Exception as e:                    
         raise RuntimeError("pynrrd is required for --save_nrrd: pip install pynrrd") from e
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     nrrd.write(str(out_path), np.asarray(mask_u8, dtype=np.uint8))
     return out_path
-
-
-def write_pipeline_outputs(
-    *,
-    volume_rgb: np.memmap,
-    mask_u8: np.ndarray,
-    out_dir: Path,
-    stem: str,
-    fps: float,
-    save_binary_pattern_value: Optional[str],
-    save_labels_pattern_value: Optional[str],
-    save_nrrd_flag: bool,
-    tag: Optional[str] = None,
-    workers: int = 1,
-    show_progress: bool = True,
-) -> Dict[str, Path]:
-    tag_suffix = f"_{tag}" if tag else ""
-
-    overlay_path = out_dir / f"{stem}_Overlay{tag_suffix}.mkv"
-    write_overlay_video(volume_rgb, mask_u8, overlay_path, fps=fps, workers=int(workers), show_progress=show_progress)
-    result_paths: Dict[str, Path] = {"overlay": overlay_path}
-
-    labels_pattern = _resolve_output_pattern(save_labels_pattern_value, DEFAULT_LABEL_PATTERN, out_dir, stem)
-    if labels_pattern is not None:
-        if tag is not None:
-            labels_pattern = _tag_frame_pattern(labels_pattern, tag)
-        result_paths["labels_dir"] = write_yolo_labels_from_pattern(
-            mask_u8,
-            labels_pattern,
-            workers=int(workers),
-            show_progress=show_progress,
-        )
-
-    binary_pattern = _resolve_output_pattern(save_binary_pattern_value, DEFAULT_BINARY_PATTERN, out_dir, stem)
-    if binary_pattern is not None:
-        if tag is not None:
-            binary_pattern = _tag_frame_pattern(binary_pattern, tag)
-        binary_video_path = out_dir / f"{stem}_Binary{tag_suffix}.mkv"
-        tiff_dir, binary_video_path = write_binary_outputs_from_pattern(
-            mask_u8,
-            binary_pattern,
-            binary_video_path,
-            fps,
-            workers=int(workers),
-            show_progress=show_progress,
-        )
-        result_paths["binary_tiff_dir"] = tiff_dir
-        result_paths["binary_video"] = binary_video_path
-
-    if bool(save_nrrd_flag):
-        nrrd_path = out_dir / f"{stem}{tag_suffix}.nrrd"
-        result_paths["nrrd"] = write_nrrd(mask_u8, nrrd_path)
-
-    return result_paths
-
 
 
 def extract_radial_mask_frame(mask_u8: np.ndarray, sampler: RadialSampler) -> np.ndarray:
@@ -5992,11 +4751,6 @@ def get_view_mask_frame_by_index(mask_u8: np.ndarray, view: ViewInfo, index: int
         sampler = get_radial_sampler(view, angle_deg)
         return np.ascontiguousarray(extract_radial_mask_frame(mask_u8, sampler))
     raise ValueError(f'Unknown view: {view.name}')
-
-
-def iter_view_mask_frames(mask_u8: np.ndarray, view: ViewInfo) -> Iterator[np.ndarray]:
-    for idx in range(int(view.num_slices)):
-        yield get_view_mask_frame_by_index(mask_u8, view, int(idx))
 
 
 def write_view_image_sequence(
@@ -6176,7 +4930,6 @@ def write_overlay_video_for_view(
     )
 
 
-
 def write_view_yolo_labels_from_pattern(
     mask_u8: np.ndarray,
     view: ViewInfo,
@@ -6251,7 +5004,6 @@ def write_view_binary_video_from_mask_volume(
         show_progress=show_progress,
     )
     return video_path
-
 
 
 def write_view_binary_outputs_from_pattern(
@@ -6332,39 +5084,6 @@ def write_additional_view_outputs(
     return result_paths
 
 
-def write_multiplanar_outputs(
-    *,
-    volume_rgb: np.memmap,
-    mask_u8: np.ndarray,
-    out_dir: Path,
-    stem: str,
-    fps: float,
-    save_binary_pattern_value: Optional[str],
-    save_labels_pattern_value: Optional[str],
-    tag: Optional[str] = None,
-    workers: int = 1,
-    show_progress: bool = True,
-) -> Dict[str, Path]:
-    t_dim, h_dim, w_dim = mask_u8.shape
-    views = {v.name: v for v in get_view_infos(t_dim, h_dim, w_dim, enable_multiplanar=True, azimuth_angle=0.0, include_radial=False)}
-    result_paths: Dict[str, Path] = {}
-    for view_name in ('sagittal', 'coronal'):
-        result_paths.update(write_additional_view_outputs(
-            volume_rgb=volume_rgb,
-            mask_u8=mask_u8,
-            view=views[view_name],
-            out_dir=out_dir,
-            stem=stem,
-            fps=fps,
-            save_binary_pattern_value=save_binary_pattern_value,
-            save_labels_pattern_value=save_labels_pattern_value,
-            tag=tag,
-            workers=int(workers),
-            show_progress=show_progress,
-        ))
-    return result_paths
-
-
 @dataclass
 class BackgroundOutputSubmission:
     label: str
@@ -6377,7 +5096,7 @@ class BackgroundOutputSubmission:
         try:
             for fut in self.futures:
                 fut.result()
-        except BaseException as exc:  # pragma: no cover - surfaced to main
+        except BaseException as exc:                                       
             error = exc
         finally:
             for resource in self.resources:
@@ -6413,7 +5132,7 @@ class BackgroundOutputManager:
                 submission = self.pending.pop(0)
                 try:
                     submission.wait()
-                except BaseException as exc:  # pragma: no cover - surfaced to main
+                except BaseException as exc:                                       
                     if error is None:
                         error = exc
         finally:
@@ -6610,9 +5329,9 @@ def write_summary_file(
     return out_path
 
 
-# --------------------------
-# Main
-# --------------------------
+                            
+      
+                            
 
 
 def main() -> None:
@@ -6627,11 +5346,7 @@ def main() -> None:
 
     args = build_argparser().parse_args()
 
-    if bool(args.enable_multiplanar) and bool(args.disable_multiplanar):
-        raise ValueError('Use either --enable_multiplanar or the deprecated --disable_multiplanar alias, not both')
     enable_multiplanar = bool(args.enable_multiplanar)
-    if bool(args.disable_multiplanar):
-        enable_multiplanar = False
 
     input_path = Path(args.input).expanduser().resolve()
     if not input_path.exists():
