@@ -5626,6 +5626,1092 @@ def write_summary_file(
 # Main
 # --------------------------
 
+
+from scipy.spatial import cKDTree  # type: ignore
+
+
+# --------------------------
+# v7.0.0 overrides / additions
+# --------------------------
+
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="v7.0.0 SLURM-aligned YOLO segmentation TTA for large cylindrical video volumes.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    p.add_argument("--input", required=True, type=str, help="Input video path")
+    p.add_argument("--output", default=None, type=str, help="Output directory (default ./{Filename}/)")
+    p.add_argument("--device", default="0", type=str, help="Device for YOLO predict")
+    p.add_argument("--model", required=True, nargs="+", type=str, help="One or more YOLO segmentation model paths")
+
+    multiplanar_group = p.add_mutually_exclusive_group()
+    multiplanar_group.add_argument(
+        "--enable_multiplanar",
+        action="store_true",
+        help="Enable Sagittal and Coronal view families in addition to the mandatory Transverse views",
+    )
+    multiplanar_group.add_argument(
+        "--disable_multiplanar",
+        dest="enable_multiplanar",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    p.set_defaults(enable_multiplanar=False)
+
+    p.add_argument("--azimuth_angle", default=0.0, type=float,
+                   help="Angular spacing in degrees for radial diameter slices over [0,180]. 0 disables radial views")
+    p.add_argument("--enable_cpr", action="store_true",
+                   help="Enable Curved Planar Reformation refinement after Cartesian multiplanar union")
+    p.add_argument("--angle", default="0,120,240", type=str,
+                   help="Rotation angles in degrees for augmentation (comma/space separated)")
+    p.add_argument("--imgsz", default=1536, type=int, help="Square input size for scaling and YOLO predict")
+    p.add_argument("--shift", default=0, type=int,
+                   help="If nonzero, create 4 shifted variants (U/D/L/R) per rotation per view, plus the unshifted variant")
+
+    p.add_argument("--conf", default=0.15, type=float, help="Passed to YOLO predict")
+    p.add_argument("--min_conf", default=0.30, type=float,
+                   help="Remove masks/components whose confidence is below this threshold (must be >= --conf)")
+    p.add_argument("--min_radius", default=0.0, type=float,
+                   help="Remove masks/components whose transverse-plane radius is smaller than this value")
+    p.add_argument("--half", action="store_true", help="Enable FP16 inference (Ultralytics half=True)")
+    p.add_argument("--int8", action="store_true", help="Enable INT8 inference if supported (Ultralytics int8=True)")
+
+    p.add_argument("--save_images", action="store_true",
+                   help="Save unlabeled image sequences for all active view families")
+    p.add_argument("--save_labels", nargs="?", const="__DEFAULT__", default=None, type=str,
+                   help="Save final YOLO segmentation labels per frame. Optional custom pattern, e.g. labels/{Filename}_%%04d.txt")
+    p.add_argument("--save_TTA", action="store_true",
+                   help="Save augmented videos and final labels mapped to each augmentation variant")
+    p.add_argument("--save_binary", nargs="?", const="__DEFAULT__", default=None, type=str,
+                   help="Save final binary masks as TIFF sequence + FFV1 MKV. Optional custom TIFF pattern, e.g. binary_masks/{Filename}_Binary_%%04d.tiff")
+    p.add_argument("--save_nrrd", action="store_true", help="Save the final binary mask volume as an NRRD file")
+    p.add_argument("--save_multiplanar", action="store_true",
+                   help="Save Sagittal and Coronal outputs. If multiplanar inference is disabled, the final unified volume is resliced for saving only")
+    p.add_argument("--save_radial", action="store_true",
+                   help="Save Radial outputs. Warns and skips if --azimuth_angle is 0")
+    p.add_argument("--voxel_volume", action="store_true", help="Count white voxels in the final binary output and save to the summary text file")
+    p.add_argument("--binary", action="store_true", dest="voxel_volume", help=argparse.SUPPRESS)
+    p.add_argument("--troubleshooting", action="store_true",
+                   help="Keep temp files and save pass snapshots before each interpolation pass")
+    p.add_argument("--scratch_dir", default=None, type=str,
+                   help="Optional bulk scratch/temp root for disk-backed working files. Defaults to {output}/temp")
+    p.add_argument("--augmentation_workers", default=0, type=int,
+                   help="Worker threads for augmentation generation. 0 = auto-tuned for the SLURM target")
+    p.add_argument("--interpolation_workers", default=0, type=int,
+                   help="Worker threads for running independent per-view interpolation passes. 0 = auto-tuned")
+
+    p.add_argument("--interpolate", default=15, type=int,
+                   help="Maximum slice-distance used to search for interpolation candidates. 0 disables interpolation")
+    p.add_argument("--interpolation_walk_back", default=3, type=int,
+                   help="Additional source slices to bridge before the endpoint slice. 0 disables walk-back bridges")
+    p.add_argument("--interpolation_candidates", default=1, type=int,
+                   help="Accept up to the Nth nearest interpolation candidate per endpoint projection")
+    p.add_argument("--interpolate_passes", default=1, type=int,
+                   help="Run the interpolation process this many passes, treating the previous pass as real")
+    p.add_argument("--interpolate_min_radius", default=3, type=float,
+                   help="Skip interpolation bridges whose effective radius is <= this value")
+    p.add_argument("--interpolation_search_angle", default=15.0, type=float,
+                   help="Projection growth angle in degrees. Must be greater than -90 and less than 90")
+    p.add_argument("--cone_half_angle", dest="interpolation_search_angle", type=float, help=argparse.SUPPRESS)
+    return p
+
+
+def build_affine(
+    view: str,
+    src_w: int,
+    src_h: int,
+    out_size: int,
+    angle_deg: float,
+    shift_dx: int,
+    shift_dy: int,
+    pad_mode: str,
+) -> AffineSpec:
+    """
+    v7.0.0 transform order:
+
+      source(native view) -> optional black-padding canvas -> rotation around the canvas center
+      -> scale to imgsz -> optional translation in the final imgsz/output pixel space
+
+    This matches the v7 wording of having one non-shifted rotation plus 4 scaled+shifted variants
+    per rotation per view. Transverse still rotates on the unclamped source-sized canvas.
+    """
+    if pad_mode not in ("clamp", "pad"):
+        raise ValueError("pad_mode must be 'clamp' or 'pad'")
+
+    if pad_mode == "pad":
+        canvas_w = canvas_h = _expanded_pad_size(src_w, src_h, angle_deg)
+    else:
+        canvas_w = src_w
+        canvas_h = src_h
+
+    off_x = (canvas_w - src_w) / 2.0
+    off_y = (canvas_h - src_h) / 2.0
+
+    cx_canvas = (canvas_w - 1) / 2.0
+    cy_canvas = (canvas_h - 1) / 2.0
+    cx_out = (out_size - 1) / 2.0
+    cy_out = (out_size - 1) / 2.0
+
+    M_pad = np.array(
+        [
+            [1.0, 0.0, off_x],
+            [0.0, 1.0, off_y],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+    M_rot = _affine2x3_to_3x3(cv2.getRotationMatrix2D((cx_canvas, cy_canvas), angle_deg, 1.0))
+
+    sx = out_size / float(canvas_w)
+    sy = out_size / float(canvas_h)
+    M_scale = np.array(
+        [
+            [sx, 0.0, cx_out - sx * cx_canvas],
+            [0.0, sy, cy_out - sy * cy_canvas],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+    M_shift_out = np.array(
+        [
+            [1.0, 0.0, float(shift_dx)],
+            [0.0, 1.0, float(shift_dy)],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+    M_src_to_out3 = M_shift_out @ M_scale @ M_rot @ M_pad
+    M_out_to_src3 = np.linalg.inv(M_src_to_out3)
+
+    return AffineSpec(
+        view=view,
+        angle_deg=float(angle_deg),
+        shift_dx=int(shift_dx),
+        shift_dy=int(shift_dy),
+        src_w=src_w,
+        src_h=src_h,
+        out_size=out_size,
+        canvas_w=int(canvas_w),
+        canvas_h=int(canvas_h),
+        pad_size=int(max(canvas_w, canvas_h)),
+        pad_off_x=float(off_x),
+        pad_off_y=float(off_y),
+        M_out_to_src=M_out_to_src3[:2, :3].astype(np.float32),
+        M_src_to_out=M_src_to_out3[:2, :3].astype(np.float32),
+    )
+
+
+def get_view_mask_frame_by_index(mask_u8: np.ndarray, view: ViewInfo, index: int) -> np.ndarray:
+    if view.name == 'transverse':
+        return np.asarray(mask_u8[int(index)])
+    if view.name == 'sagittal':
+        return np.ascontiguousarray(mask_u8[:, int(index), :])
+    if view.name == 'coronal':
+        return np.ascontiguousarray(mask_u8[:, :, int(index)])
+    if view.name == 'radial':
+        angle_deg = float(view.azimuths_deg[int(index)])
+        sampler = get_radial_sampler(view, angle_deg)
+        return np.ascontiguousarray(mask_u8[:, sampler.nn_y, sampler.nn_x])
+    raise ValueError(f'Unknown view: {view.name}')
+
+
+def write_summary_file(
+    out_path: Path,
+    *,
+    command: str,
+    input_path: Path,
+    out_dir: Path,
+    scratch_dir: Path,
+    volume_shape: Tuple[int, int, int],
+    fps: float,
+    model_paths: Sequence[str],
+    view_names: Sequence[str],
+    view_prediction_stats: Dict[str, int],
+    interpolation_stats: List[Dict[str, object]],
+    voxel_volume: Optional[int],
+    final_paths: Dict[str, Path],
+    augmentation_workers: int,
+    slice_postprocess_workers: int,
+    interpolation_workers: int,
+    output_workers: int,
+) -> Path:
+    lines: List[str] = []
+    lines.append(f'Command: {command}')
+    lines.append(f'Input: {input_path}')
+    lines.append(f'Output directory: {out_dir}')
+    lines.append(f'Volume shape (t, Y, X): {volume_shape}')
+    lines.append(f'FPS: {fps}')
+    lines.append(f'Scratch directory: {scratch_dir}')
+    lines.append('Workspace policy: in-memory first with disk fallback when the working set exceeds available RAM/swap')
+    lines.append(f'Augmentation workers: {int(augmentation_workers)}')
+    lines.append(f'Slice-parallel postprocess workers: {int(slice_postprocess_workers)}')
+    lines.append(f'Interpolation workers: {int(interpolation_workers)}')
+    lines.append(f'Output workers: {int(output_workers)}')
+    lines.append(f'Models: {", ".join(str(Path(m)) for m in model_paths)}')
+    lines.append(f'Views: {", ".join(view_names)}')
+
+    lines.append('')
+    lines.append('View statistics:')
+    base_order = ['transverse', 'sagittal', 'coronal', 'radial']
+    extra_keys = sorted(k for k in view_prediction_stats.keys() if k not in base_order)
+    total_prediction_count = 0
+    for view_key in base_order + extra_keys:
+        count = int(view_prediction_stats.get(view_key, 0))
+        total_prediction_count += count
+        lines.append(f'  {view_key.capitalize()}: predictions={count}')
+    lines.append(f'  Total prediction count: {int(total_prediction_count)}')
+
+    if interpolation_stats:
+        lines.append('')
+        lines.append('Interpolation statistics (per pass):')
+        pass_indices = sorted({int(s.get('pass_index', 0)) for s in interpolation_stats})
+        for pass_idx in pass_indices:
+            stats_this_pass = [s for s in interpolation_stats if int(s.get('pass_index', 0)) == pass_idx]
+            total_objects = sum(int(s.get('num_objects', 0)) for s in stats_this_pass)
+            total_endpoints = sum(int(s.get('num_endpoints', 0)) for s in stats_this_pass)
+            total_candidates = sum(int(s.get('candidate_connections', 0)) for s in stats_this_pass)
+            total_accepted = sum(int(s.get('accepted_connections', 0)) for s in stats_this_pass)
+            total_default_bridges = sum(int(s.get('default_bridges', 0)) for s in stats_this_pass)
+            total_walk_back = sum(int(s.get('walk_back_bridges', 0)) for s in stats_this_pass)
+            total_skipped = sum(int(s.get('skipped_by_min_radius', 0)) for s in stats_this_pass)
+            total_added_voxels = sum(int(s.get('added_voxels', 0)) for s in stats_this_pass)
+            lines.append(
+                f'  Pass {pass_idx}: objects={total_objects}, endpoints={total_endpoints}, '
+                f'candidate_connections={total_candidates}, accepted_connections={total_accepted}, '
+                f'default_bridges={total_default_bridges}, walk_back_bridges={total_walk_back}, '
+                f'bridges_skipped_by_--interpolate_min_radius={total_skipped}, added_voxels={total_added_voxels}'
+            )
+            for s in sorted(stats_this_pass, key=lambda d: (str(d.get('model', '')), str(d.get('view', '')))):
+                lines.append(
+                    f"    {s.get('model', '?')}/{s.get('view', '?')}: "
+                    f"objects={int(s.get('num_objects', 0))}, "
+                    f"endpoints={int(s.get('num_endpoints', 0))}, "
+                    f"candidate_connections={int(s.get('candidate_connections', 0))}, "
+                    f"accepted_connections={int(s.get('accepted_connections', 0))}, "
+                    f"default_bridges={int(s.get('default_bridges', 0))}, "
+                    f"walk_back_bridges={int(s.get('walk_back_bridges', 0))}, "
+                    f"bridges_skipped_by_--interpolate_min_radius={int(s.get('skipped_by_min_radius', 0))}, "
+                    f"added_voxels={int(s.get('added_voxels', 0))}, "
+                    f"skipped={bool(s.get('skipped', False))}"
+                )
+
+    if voxel_volume is not None:
+        lines.append('')
+        lines.append(f'voxel_volume: {int(voxel_volume)}')
+
+    lines.append('')
+    lines.append('Final outputs:')
+    for key in sorted(final_paths.keys()):
+        lines.append(f'{key}: {final_paths[key]}')
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines) + "\n")
+    return out_path
+
+
+def filter_view_volumes_by_names(
+    view_volumes_by_model: Dict[str, Dict[str, np.ndarray]],
+    allowed_names: Sequence[str],
+) -> Dict[str, Dict[str, np.ndarray]]:
+    allowed = {str(name) for name in allowed_names}
+    out: Dict[str, Dict[str, np.ndarray]] = {}
+    for model_name, model_views in view_volumes_by_model.items():
+        out[model_name] = {
+            view_name: mm
+            for view_name, mm in model_views.items()
+            if str(view_name) in allowed
+        }
+    return out
+
+
+def merge_radial_view_volumes_into_ensemble(
+    ensemble_mm: np.ndarray,
+    view_volumes_by_model: Dict[str, Dict[str, np.ndarray]],
+    *,
+    workers: int = 1,
+) -> None:
+    radial_volumes = [model_views['radial'] for model_views in view_volumes_by_model.values() if 'radial' in model_views]
+    if not radial_volumes:
+        return
+
+    total_slices = int(ensemble_mm.shape[0])
+
+    def _merge_slice(t: int) -> None:
+        dst = np.asarray(ensemble_mm[int(t)])
+        for radial_mm in radial_volumes:
+            dst |= np.asarray(radial_mm[int(t)])
+
+    parallel_for_indices(
+        total_slices,
+        _merge_slice,
+        max_workers=choose_slice_parallel_workers(int(workers), total_slices),
+        desc='Unioning radial views into final ensemble',
+    )
+    flush_array(ensemble_mm)
+
+
+def collect_single_view_output_futures(
+    executor: ThreadPoolExecutor,
+    *,
+    volume_rgb: np.memmap,
+    mask_u8: np.ndarray,
+    view: ViewInfo,
+    out_dir: Path,
+    stem: str,
+    fps: float,
+    save_binary_pattern_value: Optional[str],
+    save_labels_pattern_value: Optional[str],
+    tag: Optional[str] = None,
+    frame_workers: int = 1,
+    show_progress: bool = False,
+) -> Tuple[Dict[str, Path], List[Future]]:
+    futures: List[Future] = []
+    result_paths: Dict[str, Path] = {}
+    pretty = view.name.capitalize()
+    tag_suffix = f'_{tag}' if tag else ''
+
+    overlay_path = out_dir / f'{stem}_{pretty}_Overlay{tag_suffix}.mkv'
+    futures.append(executor.submit(write_overlay_video_for_view, volume_rgb, mask_u8, view, overlay_path, fps, show_progress))
+    result_paths[f'{view.name}_overlay'] = overlay_path
+
+    labels_pattern = _resolve_output_pattern(save_labels_pattern_value, DEFAULT_LABEL_PATTERN, out_dir, stem)
+    if labels_pattern is not None:
+        labels_pattern = _tag_frame_pattern(labels_pattern, pretty if tag is None else f'{pretty}_{tag}')
+        futures.append(executor.submit(write_view_yolo_labels_from_pattern, mask_u8, view, labels_pattern, int(frame_workers), show_progress))
+        result_paths[f'{view.name}_labels_dir'] = labels_pattern.parent
+
+    binary_pattern = _resolve_output_pattern(save_binary_pattern_value, DEFAULT_BINARY_PATTERN, out_dir, stem)
+    if binary_pattern is not None:
+        binary_pattern = _tag_frame_pattern(binary_pattern, pretty if tag is None else f'{pretty}_{tag}')
+        binary_video_path = out_dir / f'{stem}_{pretty}_Binary{tag_suffix}.mkv'
+        futures.append(executor.submit(write_view_binary_tiff_sequence_from_pattern, mask_u8, view, binary_pattern, int(frame_workers), show_progress))
+        futures.append(executor.submit(write_view_binary_video_from_mask_volume, mask_u8, view, binary_video_path, fps, show_progress))
+        result_paths[f'{view.name}_binary_tiff_dir'] = binary_pattern.parent
+        result_paths[f'{view.name}_binary_video'] = binary_video_path
+
+    return result_paths, futures
+
+
+def write_view_image_sequence(
+    volume_rgb: np.memmap,
+    view: ViewInfo,
+    out_dir: Path,
+    stem: str,
+    *,
+    show_progress: bool = True,
+) -> Path:
+    image_dir = out_dir / 'images' / view.name
+    image_dir.mkdir(parents=True, exist_ok=True)
+
+    iterator = iter_view_frames(volume_rgb, view)
+    for idx, frame_rgb in enumerate(
+        tqdm(iterator, total=view.num_slices, desc=f'Writing {view.name} image sequence', disable=not show_progress),
+        start=1,
+    ):
+        out_path = image_dir / f'{stem}_{view.name}_{idx:04d}.png'
+        frame_bgr = cv2.cvtColor(np.asarray(frame_rgb), cv2.COLOR_RGB2BGR)
+        cv2.imwrite(str(out_path), frame_bgr)
+
+    return image_dir
+
+
+def collect_view_image_output_futures(
+    executor: ThreadPoolExecutor,
+    *,
+    volume_rgb: np.memmap,
+    views: Sequence[ViewInfo],
+    out_dir: Path,
+    stem: str,
+    show_progress: bool = False,
+) -> Tuple[Dict[str, Path], List[Future]]:
+    result_paths: Dict[str, Path] = {}
+    futures: List[Future] = []
+    for view in views:
+        image_dir = out_dir / 'images' / view.name
+        futures.append(executor.submit(write_view_image_sequence, volume_rgb, view, out_dir, stem, show_progress=show_progress))
+        result_paths[f'images_{view.name}_dir'] = image_dir
+    return result_paths, futures
+
+
+def _hardlink_or_copy_file(src: Path, dst: Path) -> Path:
+    if not src.exists():
+        raise FileNotFoundError(src)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists() or dst.is_symlink():
+        try:
+            dst.unlink()
+        except Exception:
+            pass
+    try:
+        os.link(str(src), str(dst))
+    except Exception:
+        shutil.copy2(str(src), str(dst))
+    return dst
+
+
+def write_tta_outputs_for_job(
+    mask_u8: np.ndarray,
+    view: ViewInfo,
+    job: AugJob,
+    out_root: Path,
+    stem: str,
+    *,
+    show_progress: bool = True,
+) -> Tuple[Path, Path]:
+    video_dir = out_root / 'videos' / view.name
+    labels_dir = out_root / 'labels' / view.name / job.aug_id
+    meta_dir = out_root / 'meta' / view.name
+    video_dir.mkdir(parents=True, exist_ok=True)
+    labels_dir.mkdir(parents=True, exist_ok=True)
+    meta_dir.mkdir(parents=True, exist_ok=True)
+
+    out_video_path = video_dir / job.video_path.name
+    _hardlink_or_copy_file(job.video_path, out_video_path)
+    if job.meta_path.exists():
+        _hardlink_or_copy_file(job.meta_path, meta_dir / job.meta_path.name)
+
+    total = int(view.num_slices)
+    for idx in tqdm(range(total), desc=f'Saving TTA labels {view.name}/{job.aug_id}', disable=not show_progress):
+        native_mask = np.asarray(get_view_mask_frame_by_index(mask_u8, view, int(idx)), dtype=np.uint8)
+        aug_mask = cv2.warpAffine(
+            native_mask,
+            job.aff.M_src_to_out,
+            dsize=(int(job.aff.out_size), int(job.aff.out_size)),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        _write_label_file_from_mask(aug_mask > 0, labels_dir / f'{stem}_{int(idx) + 1:04d}.txt')
+
+    return out_video_path, labels_dir
+
+
+def collect_tta_output_futures(
+    executor: ThreadPoolExecutor,
+    *,
+    mask_u8: np.ndarray,
+    views: Sequence[ViewInfo],
+    aug_jobs_by_view: Dict[str, Sequence[AugJob]],
+    out_dir: Path,
+    stem: str,
+    show_progress: bool = False,
+) -> Tuple[Dict[str, Path], List[Future]]:
+    out_root = out_dir / 'TTA'
+    result_paths: Dict[str, Path] = {'tta_root': out_root}
+    futures: List[Future] = []
+
+    for view in views:
+        jobs = list(aug_jobs_by_view.get(view.name, []))
+        if not jobs:
+            continue
+        for job in jobs:
+            futures.append(executor.submit(
+                write_tta_outputs_for_job,
+                mask_u8,
+                view,
+                job,
+                out_root,
+                stem,
+                show_progress=show_progress,
+            ))
+
+    return result_paths, futures
+
+
+@dataclass
+class CPRBranch:
+    branch_id: int
+    points_zyx: np.ndarray
+    tangents_zyx: np.ndarray
+    plane_half_width: int = 8
+    support_bbox: Optional[Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]] = None
+
+
+@dataclass
+class CPRBranchContext:
+    branch: CPRBranch
+    video_path: Path
+    native_size: int
+    nn_coords: np.ndarray
+    valid_mask: np.ndarray
+    bbox_min: np.ndarray
+    bbox_max: np.ndarray
+
+
+def _edge_key_3d(a: Tuple[int, int, int], b: Tuple[int, int, int]) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
+    return (a, b) if a <= b else (b, a)
+
+
+def _extract_skeleton_branch_paths(skel: np.ndarray) -> List[List[Tuple[int, int, int]]]:
+    if not np.any(skel):
+        return []
+
+    deg = ndi.convolve(skel.astype(np.uint8), KERNEL_3, mode='constant', cval=0) - skel.astype(np.uint8)
+    specials = {tuple(p) for p in np.argwhere(np.logical_and(skel, deg != 2))}
+    visited_edges: set[Tuple[Tuple[int, int, int], Tuple[int, int, int]]] = set()
+    paths: List[List[Tuple[int, int, int]]] = []
+
+    def _trace(start: Tuple[int, int, int], nxt: Tuple[int, int, int]) -> List[Tuple[int, int, int]]:
+        path = [start, nxt]
+        visited_edges.add(_edge_key_3d(start, nxt))
+        prev = start
+        cur = nxt
+        while True:
+            nbs = [n for n in _skeleton_neighbors(skel, cur) if n != prev]
+            if cur in specials or len(nbs) == 0:
+                break
+            unvisited = [n for n in nbs if _edge_key_3d(cur, n) not in visited_edges]
+            if not unvisited:
+                break
+            nxt2 = unvisited[0]
+            path.append(nxt2)
+            visited_edges.add(_edge_key_3d(cur, nxt2))
+            prev, cur = cur, nxt2
+        return path
+
+    for start in sorted(specials):
+        for nxt in _skeleton_neighbors(skel, start):
+            key = _edge_key_3d(start, nxt)
+            if key in visited_edges:
+                continue
+            path = _trace(start, nxt)
+            if len(path) >= 2:
+                paths.append(path)
+
+    skel_points = [tuple(p) for p in np.argwhere(skel)]
+    for start in skel_points:
+        for nxt in _skeleton_neighbors(skel, start):
+            key = _edge_key_3d(start, nxt)
+            if key in visited_edges:
+                continue
+            path = _trace(start, nxt)
+            if len(path) >= 2:
+                paths.append(path)
+
+    if not paths and skel_points:
+        ordered = sorted(skel_points)
+        if len(ordered) >= 2:
+            paths.append(ordered)
+        else:
+            paths.append([ordered[0], ordered[0]])
+
+    return paths
+
+
+def _smooth_cpr_branch_path(path: Sequence[Tuple[int, int, int]]) -> Tuple[np.ndarray, np.ndarray]:
+    pts = np.asarray(path, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise ValueError('Expected CPR branch path with shape (N,3)')
+
+    if pts.shape[0] >= 5:
+        sm = pts.copy()
+        for ax in range(3):
+            sm[:, ax] = ndi.gaussian_filter1d(pts[:, ax], sigma=1.0, mode='nearest')
+        sm[0] = pts[0]
+        sm[-1] = pts[-1]
+        pts = sm
+
+    tang = np.zeros_like(pts, dtype=np.float32)
+    if pts.shape[0] == 1:
+        tang[0] = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+    else:
+        tang[0] = pts[1] - pts[0]
+        tang[-1] = pts[-1] - pts[-2]
+        if pts.shape[0] > 2:
+            tang[1:-1] = pts[2:] - pts[:-2]
+
+    for idx in range(tang.shape[0]):
+        n = float(np.linalg.norm(tang[idx]))
+        if n <= 0.0:
+            if idx > 0:
+                tang[idx] = tang[idx - 1]
+            else:
+                tang[idx] = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+            n = float(np.linalg.norm(tang[idx]))
+        tang[idx] /= max(n, 1e-6)
+
+    return pts.astype(np.float32, copy=False), tang.astype(np.float32, copy=False)
+
+
+def build_cpr_branches_from_volume(mask_u8: np.ndarray) -> List[CPRBranch]:
+    mask_bool = np.asarray(mask_u8, dtype=bool)
+    if not np.any(mask_bool):
+        return []
+
+    skel = skeletonize_volume(mask_bool)
+    if not np.any(skel):
+        return []
+
+    branches: List[CPRBranch] = []
+    for branch_id, path in enumerate(_extract_skeleton_branch_paths(skel), start=1):
+        pts, tang = _smooth_cpr_branch_path(path)
+        branches.append(CPRBranch(
+            branch_id=int(branch_id),
+            points_zyx=pts,
+            tangents_zyx=tang,
+        ))
+
+    return branches
+
+
+def assign_source_voxels_to_cpr_branches(
+    source_mask_mm: np.ndarray,
+    branches: List[CPRBranch],
+    work_path: Path,
+    *,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 16 * GIB,
+) -> np.ndarray:
+    if not branches:
+        raise ValueError('CPR support assignment requires at least one branch')
+
+    dtype: np.dtype = np.uint16 if len(branches) < np.iinfo(np.uint16).max else np.uint32
+    support_mm = allocate_workspace_array(
+        shape=source_mask_mm.shape,
+        dtype=dtype,
+        path=work_path,
+        desc='CPR support-region labels',
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
+    )
+    support_mm[:] = 0
+
+    sample_points = np.concatenate([branch.points_zyx for branch in branches], axis=0).astype(np.float32, copy=False)
+    sample_branch_ids = np.concatenate([
+        np.full((branch.points_zyx.shape[0],), int(branch.branch_id), dtype=np.int32)
+        for branch in branches
+    ], axis=0)
+    tree = cKDTree(sample_points)
+
+    max_dist = np.zeros((len(branches) + 1,), dtype=np.float32)
+    bbox_min = np.full((len(branches) + 1, 3), np.iinfo(np.int32).max, dtype=np.int32)
+    bbox_max = np.full((len(branches) + 1, 3), -1, dtype=np.int32)
+
+    z_dim = int(source_mask_mm.shape[0])
+    for z in tqdm(range(z_dim), desc='CPR support assignment'):
+        fg = np.asarray(source_mask_mm[int(z)]) > 0
+        ys, xs = np.nonzero(fg)
+        if ys.size == 0:
+            continue
+
+        coords = np.column_stack((
+            np.full((ys.size,), int(z), dtype=np.float32),
+            ys.astype(np.float32, copy=False),
+            xs.astype(np.float32, copy=False),
+        ))
+        dists, sample_idx = tree.query(coords, k=1, workers=1)
+        branch_ids = sample_branch_ids[np.asarray(sample_idx, dtype=np.int64)]
+        support_mm[int(z), ys, xs] = branch_ids.astype(dtype, copy=False)
+        np.maximum.at(max_dist, branch_ids, np.asarray(dists, dtype=np.float32))
+
+        for branch_id in np.unique(branch_ids):
+            use = branch_ids == int(branch_id)
+            if not np.any(use):
+                continue
+            bbox_min[int(branch_id), 0] = min(int(bbox_min[int(branch_id), 0]), int(z))
+            bbox_max[int(branch_id), 0] = max(int(bbox_max[int(branch_id), 0]), int(z))
+            bbox_min[int(branch_id), 1] = min(int(bbox_min[int(branch_id), 1]), int(np.min(ys[use])))
+            bbox_max[int(branch_id), 1] = max(int(bbox_max[int(branch_id), 1]), int(np.max(ys[use])))
+            bbox_min[int(branch_id), 2] = min(int(bbox_min[int(branch_id), 2]), int(np.min(xs[use])))
+            bbox_max[int(branch_id), 2] = max(int(bbox_max[int(branch_id), 2]), int(np.max(xs[use])))
+
+    z_dim, y_dim, x_dim = (int(source_mask_mm.shape[0]), int(source_mask_mm.shape[1]), int(source_mask_mm.shape[2]))
+    for branch in branches:
+        branch.plane_half_width = max(8, int(math.ceil(float(max_dist[int(branch.branch_id)]))) + 4)
+        if int(bbox_max[int(branch.branch_id), 0]) >= 0:
+            branch.support_bbox = (
+                (int(max(0, bbox_min[int(branch.branch_id), 0] - 1)), int(min(z_dim - 1, bbox_max[int(branch.branch_id), 0] + 1))),
+                (int(max(0, bbox_min[int(branch.branch_id), 1] - 1)), int(min(y_dim - 1, bbox_max[int(branch.branch_id), 1] + 1))),
+                (int(max(0, bbox_min[int(branch.branch_id), 2] - 1)), int(min(x_dim - 1, bbox_max[int(branch.branch_id), 2] + 1))),
+            )
+        else:
+            pts = np.rint(branch.points_zyx).astype(np.int32)
+            branch.support_bbox = (
+                (int(max(0, np.min(pts[:, 0]) - 1)), int(min(z_dim - 1, np.max(pts[:, 0]) + 1))),
+                (int(max(0, np.min(pts[:, 1]) - 1)), int(min(y_dim - 1, np.max(pts[:, 1]) + 1))),
+                (int(max(0, np.min(pts[:, 2]) - 1)), int(min(x_dim - 1, np.max(pts[:, 2]) + 1))),
+            )
+
+    flush_array(support_mm)
+    return support_mm
+
+
+def _lanczos_axis_indices_weights(coords: np.ndarray, limit: int) -> Tuple[np.ndarray, np.ndarray]:
+    offsets = np.arange(-4, 6, dtype=np.int32)
+    base = np.floor(coords).astype(np.int32, copy=False)
+    idx_raw = base[..., None] + offsets.reshape((1,) * coords.ndim + (10,))
+    weights = _lanczos_kernel(coords[..., None] - idx_raw, a=5)
+    valid = (idx_raw >= 0) & (idx_raw < int(limit))
+    weights *= valid.astype(np.float32, copy=False)
+    idx = np.clip(idx_raw, 0, int(limit) - 1).astype(np.int32, copy=False)
+    return idx, weights.astype(np.float32, copy=False)
+
+
+def sample_volume_rgb_lanczos5(
+    volume_rgb: np.ndarray,
+    zf: np.ndarray,
+    yf: np.ndarray,
+    xf: np.ndarray,
+) -> np.ndarray:
+    z_idx, z_w = _lanczos_axis_indices_weights(np.asarray(zf, dtype=np.float32), int(volume_rgb.shape[0]))
+    y_idx, y_w = _lanczos_axis_indices_weights(np.asarray(yf, dtype=np.float32), int(volume_rgb.shape[1]))
+    x_idx, x_w = _lanczos_axis_indices_weights(np.asarray(xf, dtype=np.float32), int(volume_rgb.shape[2]))
+
+    out = np.zeros(zf.shape + (3,), dtype=np.float32)
+    for kz in range(z_idx.shape[-1]):
+        wz = z_w[..., kz]
+        if not np.any(wz):
+            continue
+        zz = z_idx[..., kz]
+        for ky in range(y_idx.shape[-1]):
+            wy = y_w[..., ky]
+            wzy = wz * wy
+            if not np.any(wzy):
+                continue
+            yy = y_idx[..., ky]
+            for kx in range(x_idx.shape[-1]):
+                wx = x_w[..., kx]
+                w = wzy * wx
+                if not np.any(w):
+                    continue
+                xx = x_idx[..., kx]
+                out += volume_rgb[zz, yy, xx, :].astype(np.float32, copy=False) * w[..., None]
+
+    return np.clip(np.rint(out), 0.0, 255.0).astype(np.uint8)
+
+
+def prepare_cpr_branch_video(
+    volume_rgb: np.ndarray,
+    branch: CPRBranch,
+    work_dir: Path,
+    fps: float,
+    imgsz: int,
+) -> CPRBranchContext:
+    work_dir.mkdir(parents=True, exist_ok=True)
+    native_size = int(2 * int(branch.plane_half_width) + 1)
+    num_frames = int(branch.points_zyx.shape[0])
+
+    nn_coords = np.zeros((num_frames, native_size, native_size, 3), dtype=np.int32)
+    valid_mask = np.zeros((num_frames, native_size, native_size), dtype=np.bool_)
+
+    video_path = work_dir / f'branch_{int(branch.branch_id):04d}.mkv'
+    meta_path = work_dir / f'branch_{int(branch.branch_id):04d}.meta.json'
+    proc = ffmpeg_rawvideo_writer(
+        video_path,
+        width=int(imgsz),
+        height=int(imgsz),
+        fps=fps,
+        pix_fmt_in='rgb24',
+        codec='ffv1',
+        pix_fmt_out='yuv444p',
+    )
+
+    bbox_min = np.asarray([np.iinfo(np.int32).max] * 3, dtype=np.int32)
+    bbox_max = np.asarray([-1] * 3, dtype=np.int32)
+    uu, vv = _plane_uv_grid(int(branch.plane_half_width))
+    z_dim, y_dim, x_dim = (int(volume_rgb.shape[0]), int(volume_rgb.shape[1]), int(volume_rgb.shape[2]))
+
+    try:
+        assert proc.stdin is not None
+        for frame_idx in tqdm(range(num_frames), desc=f'CPR reslicing branch {int(branch.branch_id):04d}'):
+            center = np.asarray(branch.points_zyx[int(frame_idx)], dtype=np.float32)
+            tangent = np.asarray(branch.tangents_zyx[int(frame_idx)], dtype=np.float32)
+            _, u_axis, v_axis = _orthonormal_basis(tangent)
+
+            coords = center.reshape(1, 1, 3) + (
+                uu[..., None] * u_axis.reshape(1, 1, 3) +
+                vv[..., None] * v_axis.reshape(1, 1, 3)
+            )
+            zf = np.asarray(coords[..., 0], dtype=np.float32)
+            yf = np.asarray(coords[..., 1], dtype=np.float32)
+            xf = np.asarray(coords[..., 2], dtype=np.float32)
+
+            native_rgb = sample_volume_rgb_lanczos5(volume_rgb, zf, yf, xf)
+            if int(imgsz) != native_size:
+                out_rgb = cv2.resize(native_rgb, (int(imgsz), int(imgsz)), interpolation=cv2.INTER_LINEAR)
+            else:
+                out_rgb = native_rgb
+            proc.stdin.write(np.ascontiguousarray(out_rgb).tobytes())
+
+            nn = np.rint(coords).astype(np.int32, copy=False)
+            valid = (
+                (nn[..., 0] >= 0) & (nn[..., 0] < z_dim) &
+                (nn[..., 1] >= 0) & (nn[..., 1] < y_dim) &
+                (nn[..., 2] >= 0) & (nn[..., 2] < x_dim)
+            )
+            nn[..., 0] = np.clip(nn[..., 0], 0, z_dim - 1)
+            nn[..., 1] = np.clip(nn[..., 1], 0, y_dim - 1)
+            nn[..., 2] = np.clip(nn[..., 2], 0, x_dim - 1)
+
+            nn_coords[int(frame_idx)] = nn
+            valid_mask[int(frame_idx)] = valid
+
+            if np.any(valid):
+                pts = nn[valid]
+                bbox_min = np.minimum(bbox_min, np.min(pts, axis=0).astype(np.int32, copy=False))
+                bbox_max = np.maximum(bbox_max, np.max(pts, axis=0).astype(np.int32, copy=False))
+    finally:
+        close_ffmpeg_writer(proc)
+
+    if branch.support_bbox is not None:
+        bbox_min = np.minimum(
+            bbox_min,
+            np.asarray([branch.support_bbox[0][0], branch.support_bbox[1][0], branch.support_bbox[2][0]], dtype=np.int32),
+        )
+        bbox_max = np.maximum(
+            bbox_max,
+            np.asarray([branch.support_bbox[0][1], branch.support_bbox[1][1], branch.support_bbox[2][1]], dtype=np.int32),
+        )
+
+    if np.any(bbox_max < bbox_min):
+        pts = np.rint(branch.points_zyx).astype(np.int32, copy=False)
+        bbox_min = np.asarray(np.min(pts, axis=0), dtype=np.int32)
+        bbox_max = np.asarray(np.max(pts, axis=0), dtype=np.int32)
+
+    bbox_min = np.maximum(bbox_min - 1, 0)
+    bbox_max = np.minimum(
+        bbox_max + 1,
+        np.asarray([z_dim - 1, y_dim - 1, x_dim - 1], dtype=np.int32),
+    )
+
+    meta_path.write_text(json.dumps({
+        'branch_id': int(branch.branch_id),
+        'num_frames': int(num_frames),
+        'native_size': int(native_size),
+        'imgsz': int(imgsz),
+        'plane_half_width': int(branch.plane_half_width),
+        'bbox_min': [int(x) for x in bbox_min.tolist()],
+        'bbox_max': [int(x) for x in bbox_max.tolist()],
+    }, indent=2))
+
+    return CPRBranchContext(
+        branch=branch,
+        video_path=video_path,
+        native_size=int(native_size),
+        nn_coords=nn_coords,
+        valid_mask=valid_mask,
+        bbox_min=bbox_min.astype(np.int32, copy=False),
+        bbox_max=bbox_max.astype(np.int32, copy=False),
+    )
+
+
+def predict_cpr_branch_components(
+    context: CPRBranchContext,
+    *,
+    yolo_models: Sequence[Tuple[str, object]],
+    pred_cfg: PredictConfig,
+    support_mm: np.ndarray,
+    min_conf: float,
+    min_radius: float,
+) -> Tuple[np.ndarray, int, int]:
+    bbox_min = np.asarray(context.bbox_min, dtype=np.int32)
+    bbox_max = np.asarray(context.bbox_max, dtype=np.int32)
+    local_shape = tuple(int(bbox_max[i] - bbox_min[i] + 1) for i in range(3))
+    local_conf = np.zeros(local_shape, dtype=np.float32)
+
+    prediction_count = 0
+    num_frames = int(context.nn_coords.shape[0])
+
+    for _, model in yolo_models:
+        results = model.predict(
+            source=str(context.video_path),
+            imgsz=pred_cfg.imgsz,
+            conf=pred_cfg.conf,
+            iou=1.0,
+            save=False,
+            stream=True,
+            task='segment',
+            retina_masks=True,
+            batch=1,
+            device=pred_cfg.device,
+            half=pred_cfg.half,
+            int8=pred_cfg.int8,
+            verbose=False,
+        )
+
+        for frame_idx, r in enumerate(results):
+            if frame_idx >= num_frames:
+                break
+            masks_np, confs_np = _extract_result_masks_and_confs(r)
+            if masks_np is None or confs_np is None or masks_np.ndim != 3 or int(masks_np.shape[0]) <= 0:
+                continue
+
+            prediction_count += int(masks_np.shape[0])
+            frame_conf = np.zeros((int(pred_cfg.imgsz), int(pred_cfg.imgsz)), dtype=np.float32)
+            for inst_idx in range(int(masks_np.shape[0])):
+                inst = np.asarray(masks_np[int(inst_idx)], dtype=np.uint8)
+                if inst.shape[0] != int(pred_cfg.imgsz) or inst.shape[1] != int(pred_cfg.imgsz):
+                    inst = cv2.resize(inst, (int(pred_cfg.imgsz), int(pred_cfg.imgsz)), interpolation=cv2.INTER_NEAREST)
+                inst = inst > 0
+                if not np.any(inst):
+                    continue
+                conf_val = float(confs_np[int(inst_idx)]) if int(inst_idx) < int(confs_np.shape[0]) else 0.0
+                frame_conf[inst] = np.maximum(frame_conf[inst], np.float32(conf_val))
+
+            if not np.any(frame_conf > 0):
+                continue
+
+            if int(context.native_size) != int(pred_cfg.imgsz):
+                native_conf = cv2.resize(frame_conf, (int(context.native_size), int(context.native_size)), interpolation=cv2.INTER_NEAREST)
+            else:
+                native_conf = frame_conf
+
+            valid = np.asarray(context.valid_mask[int(frame_idx)], dtype=bool)
+            if not np.any(valid):
+                continue
+
+            conf_vals = np.asarray(native_conf[valid], dtype=np.float32)
+            active = conf_vals > 0.0
+            if not np.any(active):
+                continue
+
+            coords = np.asarray(context.nn_coords[int(frame_idx)][valid], dtype=np.int32)[active]
+            coords -= bbox_min.reshape(1, 3)
+            flat = np.ravel_multi_index((coords[:, 0], coords[:, 1], coords[:, 2]), local_shape)
+            np.maximum.at(local_conf.reshape(-1), flat, conf_vals[active])
+
+    local_mask = local_conf > 0.0
+    if not np.any(local_mask):
+        return np.zeros(local_shape, dtype=np.uint8), int(prediction_count), 0
+
+    z0, y0, x0 = [int(v) for v in bbox_min.tolist()]
+    z1, y1, x1 = [int(v) for v in bbox_max.tolist()]
+    support_local = np.asarray(support_mm[z0:z1 + 1, y0:y1 + 1, x0:x1 + 1])
+
+    labels3d, num_comp = ndi.label(local_mask, structure=np.ones((3, 3, 3), dtype=bool))
+    accepted = np.zeros(local_mask.shape, dtype=bool)
+    accepted_components = 0
+
+    for comp_idx in range(1, int(num_comp) + 1):
+        comp = labels3d == int(comp_idx)
+        if not np.any(comp):
+            continue
+        if not np.any((support_local == int(context.branch.branch_id)) & comp):
+            continue
+        if float(min_conf) > 0.0 and float(np.max(local_conf[comp])) < float(min_conf):
+            continue
+        accepted |= comp
+        accepted_components += 1
+
+    accepted_u8 = accepted.astype(np.uint8, copy=False)
+    if float(min_radius) > 0.0 and np.any(accepted_u8):
+        accepted_u8 = apply_transverse_min_radius_filter(accepted_u8, float(min_radius))
+
+    local_conf[accepted_u8 == 0] = 0.0
+    return accepted_u8.astype(np.uint8, copy=False), int(prediction_count), int(accepted_components)
+
+
+def run_cpr_refinement_on_cartesian_volume(
+    cartesian_mm: np.ndarray,
+    volume_rgb: np.ndarray,
+    *,
+    yolo_models: Sequence[Tuple[str, object]],
+    pred_cfg: PredictConfig,
+    work_dir: Path,
+    fps: float,
+    min_conf: float,
+    min_radius: float,
+    troubleshooting: bool = False,
+) -> Dict[str, int]:
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    print('\n=== CPR: skeletonizing current Cartesian source volume ===')
+    branches = build_cpr_branches_from_volume(cartesian_mm)
+    if not branches:
+        print('CPR: no branches found, skipping.')
+        return {
+            'num_branches': 0,
+            'prediction_count': 0,
+            'accepted_components': 0,
+            'added_voxels': 0,
+        }
+
+    print(f'CPR: extracted {len(branches)} branch segment(s)')
+    support_mm = assign_source_voxels_to_cpr_branches(
+        cartesian_mm,
+        branches,
+        work_dir / 'support_labels.u32.dat',
+        prefer_memory=True,
+    )
+
+    prediction_count = 0
+    accepted_components = 0
+    added_voxels = 0
+
+    try:
+        for branch in branches:
+            print(
+                f"CPR: branch {int(branch.branch_id):04d} "
+                f"(samples={int(branch.points_zyx.shape[0])}, plane_half_width={int(branch.plane_half_width)})"
+            )
+            context = prepare_cpr_branch_video(
+                volume_rgb=volume_rgb,
+                branch=branch,
+                work_dir=work_dir,
+                fps=fps,
+                imgsz=int(pred_cfg.imgsz),
+            )
+            try:
+                local_mask_u8, pred_count, accepted_count = predict_cpr_branch_components(
+                    context,
+                    yolo_models=yolo_models,
+                    pred_cfg=pred_cfg,
+                    support_mm=support_mm,
+                    min_conf=float(min_conf),
+                    min_radius=float(min_radius),
+                )
+                prediction_count += int(pred_count)
+                accepted_components += int(accepted_count)
+
+                if np.any(local_mask_u8):
+                    z0, y0, x0 = [int(v) for v in context.bbox_min.tolist()]
+                    z1, y1, x1 = [int(v) for v in context.bbox_max.tolist()]
+                    dest = np.asarray(cartesian_mm[z0:z1 + 1, y0:y1 + 1, x0:x1 + 1])
+                    new_voxels = (dest == 0) & (np.asarray(local_mask_u8) > 0)
+                    added_voxels += int(np.count_nonzero(new_voxels))
+                    dest |= np.asarray(local_mask_u8)
+                    flush_array(cartesian_mm)
+
+            finally:
+                del context.nn_coords
+                del context.valid_mask
+                if not troubleshooting:
+                    try:
+                        context.video_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    try:
+                        context.video_path.with_suffix('.meta.json').unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+    finally:
+        close_memmap_array(support_mm)
+        if isinstance(support_mm, np.memmap) and not troubleshooting:
+            try:
+                Path(support_mm.filename).unlink(missing_ok=True)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        del support_mm
+        gc.collect()
+
+    print(
+        f'CPR: prediction_count={int(prediction_count)}, '
+        f'accepted_components={int(accepted_components)}, '
+        f'added_voxels={int(added_voxels)}'
+    )
+    return {
+        'num_branches': int(len(branches)),
+        'prediction_count': int(prediction_count),
+        'accepted_components': int(accepted_components),
+        'added_voxels': int(added_voxels),
+    }
+
+
 def main() -> None:
     args = build_argparser().parse_args()
 
@@ -5641,6 +6727,7 @@ def main() -> None:
             raise FileNotFoundError(m)
 
     angles = _parse_angles(args.angle) or [0.0, 120.0, 240.0]
+    disable_multiplanar = not bool(args.enable_multiplanar)
 
     if args.min_conf > 0 and args.min_conf < args.conf:
         raise ValueError('--min_conf must be equal to or greater than --conf')
@@ -5692,10 +6779,11 @@ def main() -> None:
         T=T,
         H=H,
         W=W,
-        disable_multiplanar=bool(args.disable_multiplanar),
+        disable_multiplanar=bool(disable_multiplanar),
         azimuth_angle=float(args.azimuth_angle),
         include_radial=True,
     )
+    views_by_name = {view.name: view for view in views}
     cartesian_views = orthogonal_views_only(views)
 
     shifts: List[Tuple[int, int, str]] = [(0, 0, 'none')]
@@ -5759,6 +6847,7 @@ def main() -> None:
             pass
 
     view_volumes_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
+    aug_jobs_by_view: Dict[str, List[AugJob]] = {}
     view_prediction_stats: Dict[str, int] = {
         'transverse': 0,
         'sagittal': 0,
@@ -5810,6 +6899,7 @@ def main() -> None:
             out_size=args.imgsz,
             temp_dir=temp_dir,
         )
+        aug_jobs_by_view[view.name] = list(aug_jobs)
 
         ensure_augmented_videos(
             volume_rgb=volume_rgb,
@@ -5843,7 +6933,7 @@ def main() -> None:
                 )
                 view_prediction_stats[view.name] = int(view_prediction_stats.get(view.name, 0)) + int(pred_stats.get('prediction_count', 0))
 
-            if not args.troubleshooting:
+            if not args.troubleshooting and not bool(args.save_TTA):
                 try:
                     aug_video.unlink(missing_ok=True)
                     aug_meta.unlink(missing_ok=True)
@@ -5929,7 +7019,7 @@ def main() -> None:
             T=T,
             H=H,
             W=W,
-            disable_multiplanar=bool(args.disable_multiplanar),
+            disable_multiplanar=bool(disable_multiplanar),
             out_path=temp_dir / f'{snapshot_stem}.u8.dat',
             prefer_memory=True,
             workers=slice_postprocess_workers,
@@ -6100,7 +7190,7 @@ def main() -> None:
     else:
         for model_name in sorted(view_volumes_by_model.keys()):
             for view in cartesian_views:
-                entry: Dict[str, object] = {
+                interpolation_stats.append({
                     'pass_index': 0,
                     'model': str(model_name),
                     'view': str(view.name),
@@ -6117,23 +7207,61 @@ def main() -> None:
                     'skipped_by_min_radius': 0,
                     'added_voxels': 0,
                     'skipped': True,
-                }
-                interpolation_stats.append(entry)
+                })
 
     output_manager.reap_completed()
 
-    final_ensemble_mm = assemble_current_ensemble_volume(
-        view_volumes_by_model=view_volumes_by_model,
-        T=T,
-        H=H,
-        W=W,
-        disable_multiplanar=bool(args.disable_multiplanar),
-        out_path=temp_dir / 'ensemble_volume_final.u8.dat',
-        prefer_memory=True,
-        workers=slice_postprocess_workers,
-    )
+    final_ensemble_mm: np.ndarray
+    if bool(args.enable_cpr):
+        print('\n=== Assembling Cartesian ensemble prior to CPR ===')
+        cartesian_view_volumes = filter_view_volumes_by_names(
+            view_volumes_by_model,
+            ['transverse', 'sagittal', 'coronal'],
+        )
+        final_ensemble_mm = assemble_current_ensemble_volume(
+            view_volumes_by_model=cartesian_view_volumes,
+            T=T,
+            H=H,
+            W=W,
+            disable_multiplanar=bool(disable_multiplanar),
+            out_path=temp_dir / 'ensemble_volume_cartesian_cpr.u8.dat',
+            prefer_memory=True,
+            workers=slice_postprocess_workers,
+        )
 
-    print('\n=== 3D void fill after multiplanar/model union ===')
+        cpr_stats = run_cpr_refinement_on_cartesian_volume(
+            final_ensemble_mm,
+            volume_rgb,
+            yolo_models=yolo_models,
+            pred_cfg=pred_cfg,
+            work_dir=temp_dir / 'cpr',
+            fps=fps,
+            min_conf=float(args.min_conf),
+            min_radius=float(args.min_radius),
+            troubleshooting=bool(args.troubleshooting),
+        )
+        view_prediction_stats['cpr'] = int(cpr_stats.get('prediction_count', 0))
+
+        if 'radial' in views_by_name:
+            print('\n=== Unioning radial results after CPR refinement ===')
+            merge_radial_view_volumes_into_ensemble(
+                final_ensemble_mm,
+                view_volumes_by_model,
+                workers=slice_postprocess_workers,
+            )
+    else:
+        final_ensemble_mm = assemble_current_ensemble_volume(
+            view_volumes_by_model=view_volumes_by_model,
+            T=T,
+            H=H,
+            W=W,
+            disable_multiplanar=bool(disable_multiplanar),
+            out_path=temp_dir / 'ensemble_volume_final.u8.dat',
+            prefer_memory=True,
+            workers=slice_postprocess_workers,
+        )
+
+    print('\n=== 3D void fill after multiplanar/model/CPR/radial union ===')
     fill_3d_voids_inplace_streaming(
         final_ensemble_mm,
         temp_dir / 'ensemble_volume_final_voidfill',
@@ -6156,6 +7284,7 @@ def main() -> None:
         frame_workers=output_frame_workers,
         show_progress=False,
     )
+
     if bool(args.save_multiplanar):
         extra_paths, extra_futures = collect_multiplanar_output_futures(
             output_manager.executor,
@@ -6172,6 +7301,53 @@ def main() -> None:
         )
         final_paths.update(extra_paths)
         final_futures.extend(extra_futures)
+
+    if bool(args.save_radial):
+        if float(args.azimuth_angle) <= 0.0 or 'radial' not in views_by_name:
+            print('Warning: --save_radial requested but --azimuth_angle is 0. Radial outputs were not saved.')
+        else:
+            radial_paths, radial_futures = collect_single_view_output_futures(
+                output_manager.executor,
+                volume_rgb=volume_rgb,
+                mask_u8=final_ensemble_mm,
+                view=views_by_name['radial'],
+                out_dir=out_dir,
+                stem=input_path.stem,
+                fps=fps,
+                save_binary_pattern_value=args.save_binary,
+                save_labels_pattern_value=args.save_labels,
+                tag=None,
+                frame_workers=output_frame_workers,
+                show_progress=False,
+            )
+            final_paths.update(radial_paths)
+            final_futures.extend(radial_futures)
+
+    if bool(args.save_images):
+        image_paths, image_futures = collect_view_image_output_futures(
+            output_manager.executor,
+            volume_rgb=volume_rgb,
+            views=views,
+            out_dir=out_dir,
+            stem=input_path.stem,
+            show_progress=False,
+        )
+        final_paths.update(image_paths)
+        final_futures.extend(image_futures)
+
+    if bool(args.save_TTA):
+        tta_paths, tta_futures = collect_tta_output_futures(
+            output_manager.executor,
+            mask_u8=final_ensemble_mm,
+            views=views,
+            aug_jobs_by_view=aug_jobs_by_view,
+            out_dir=out_dir,
+            stem=input_path.stem,
+            show_progress=False,
+        )
+        final_paths.update(tta_paths)
+        final_futures.extend(tta_futures)
+
     output_manager.submit(BackgroundOutputSubmission(
         label='final outputs',
         result_paths=final_paths,
@@ -6203,7 +7379,7 @@ def main() -> None:
         volume_shape=(T, H, W),
         fps=fps,
         model_paths=model_paths,
-        view_names=[v.name for v in views],
+        view_names=[v.name for v in views] + (['cpr'] if bool(args.enable_cpr) else []),
         view_prediction_stats=view_prediction_stats,
         interpolation_stats=interpolation_stats,
         voxel_volume=voxel_volume,
