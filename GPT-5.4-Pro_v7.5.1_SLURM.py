@@ -220,29 +220,49 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _slurm_allocated_cpu_count() -> Optional[int]:
+    for env_name in ('SLURM_CPUS_PER_TASK', 'SLURM_CPUS_ON_NODE', 'SLURM_JOB_CPUS_PER_NODE'):
+        raw = os.environ.get(env_name, '').strip()
+        if not raw:
+            continue
+        m = re.search(r'(\d+)', raw)
+        if m is not None:
+            try:
+                return max(1, int(m.group(1)))
+            except Exception:
+                continue
+    return None
+
+
 def _cpu_count() -> int:
+    try:
+        affinity = os.sched_getaffinity(0)
+        if affinity:
+            return max(1, int(len(affinity)))
+    except Exception:
+        pass
+
+    slurm_cpus = _slurm_allocated_cpu_count()
+    if slurm_cpus is not None:
+        return max(1, int(slurm_cpus))
+
     return max(1, int(os.cpu_count() or 1))
 
 
+def default_worker_budget() -> int:
+    return 1200 if int(_cpu_count()) > 128 else 16
+
+
 def default_augmentation_workers() -> int:
-    cpu = _cpu_count()
-    if cpu >= 128:
-        return 1200
-    return 16
+    return int(default_worker_budget())
 
 
 def default_interpolation_workers() -> int:
-    cpu = _cpu_count()
-    if cpu >= 128:
-        return 1200
-    return 16
+    return int(default_worker_budget())
 
 
 def default_output_workers() -> int:
-    cpu = _cpu_count()
-    if cpu >= 128:
-        return 1200
-    return 16
+    return int(default_worker_budget())
 
 
 def resolve_worker_count(requested: int, env_name: str, auto_value: int, max_tasks: Optional[int] = None) -> int:
@@ -1336,6 +1356,7 @@ def render_view_video_with_affine(
     workers: int = 1,
     interpolation: int = cv2.INTER_LINEAR,
     desc: Optional[str] = None,
+    show_progress: bool = True,
 ) -> None:
     proc = ffmpeg_rawvideo_writer(
         out_path,
@@ -1362,7 +1383,12 @@ def render_view_video_with_affine(
 
         pending = min(int(view.num_slices), max(2, int(workers) * 4))
         iterable = parallel_map_in_order(_render, range(int(view.num_slices)), max_workers=max(1, int(workers)), max_pending=pending)
-        for frame in tqdm(iterable, total=int(view.num_slices), desc=desc or f'Rendering {out_path.name}'):
+        for frame in tqdm(
+            iterable,
+            total=int(view.num_slices),
+            desc=desc or f'Rendering {out_path.name}',
+            disable=not bool(show_progress),
+        ):
             proc.stdin.write(np.ascontiguousarray(frame).tobytes())
     finally:
         close_ffmpeg_writer(proc)
@@ -1374,6 +1400,7 @@ def ensure_dense_tile_video(
     job: DenseTileJob,
     fps: float,
     workers: int,
+    show_progress: bool = True,
 ) -> None:
     if not job.meta_path.exists():
         write_dense_tile_job_meta(job)
@@ -1391,7 +1418,52 @@ def ensure_dense_tile_video(
         workers=max(1, int(workers)),
         interpolation=cv2.INTER_LINEAR,
         desc=f'Dense tile {view.name} {job.tile_id}',
+        show_progress=bool(show_progress),
     )
+
+
+def submit_dense_tile_video_jobs(
+    executor: ThreadPoolExecutor,
+    volume_rgb: np.ndarray,
+    view: ViewInfo,
+    tile_jobs: Sequence[DenseTileJob],
+    fps: float,
+    workers_per_job: int,
+) -> Tuple[List[DenseTileJob], Dict[Future, DenseTileJob]]:
+    ready_jobs: List[DenseTileJob] = []
+    future_to_job: Dict[Future, DenseTileJob] = {}
+
+    for job in tile_jobs:
+        if not job.meta_path.exists():
+            write_dense_tile_job_meta(job)
+        if job.video_path.exists():
+            ready_jobs.append(job)
+            continue
+        fut = executor.submit(
+            ensure_dense_tile_video,
+            volume_rgb,
+            view,
+            job,
+            float(fps),
+            max(1, int(workers_per_job)),
+            False,
+        )
+        future_to_job[fut] = job
+
+    return ready_jobs, future_to_job
+
+
+def iter_dense_tile_jobs_in_completion_order(
+    ready_jobs: Sequence[DenseTileJob],
+    future_to_job: Dict[Future, DenseTileJob],
+) -> Iterator[DenseTileJob]:
+    for job in ready_jobs:
+        yield job
+    if not future_to_job:
+        return
+    for fut in as_completed(list(future_to_job.keys())):
+        fut.result()
+        yield future_to_job[fut]
 
 
 def iter_view_frames(volume_rgb: np.memmap, view: ViewInfo) -> Iterator[np.ndarray]:
@@ -4795,27 +4867,30 @@ def main() -> None:
         int8=bool(args.int8),
     )
 
+    worker_budget = int(default_worker_budget())
     augmentation_workers = resolve_worker_count(
         0,
         'YOLO_TTA_AUG_WORKERS',
-        default_augmentation_workers(),
+        worker_budget,
         max_tasks=max(1, max(v.num_slices for v in views)),
     )
     interpolation_workers = resolve_worker_count(
         0,
         'YOLO_TTA_INTERPOLATION_WORKERS',
-        default_interpolation_workers(),
+        worker_budget,
         max_tasks=max(1, len(yolo_models) * len(cartesian_views)),
     )
     output_workers = resolve_worker_count(
         0,
         'YOLO_TTA_OUTPUT_WORKERS',
-        default_output_workers(),
+        worker_budget,
         max_tasks=12,
     )
     output_frame_workers = max(1, min(8, _env_int('YOLO_TTA_OUTPUT_FRAME_WORKERS', max(1, min(4, output_workers)))))
     slice_postprocess_workers = max(1, int(augmentation_workers))
     predict_postprocess_workers = max(1, min(16, _env_int('YOLO_TTA_PREDICT_POSTPROCESS_WORKERS', slice_postprocess_workers)))
+    print(f'Allocated CPU count: {_cpu_count()}')
+    print(f'Worker budget: {worker_budget}')
     print(f'Augmentation workers: {augmentation_workers}')
     print(f'Slice-parallel postprocess workers: {slice_postprocess_workers}')
     print(f'Inference postprocess workers: {predict_postprocess_workers}')
@@ -4920,47 +4995,80 @@ def main() -> None:
             augmentation_workers=augmentation_workers,
         )
 
-        for job in aug_jobs:
-            aug_id = job.aug_id
-            aug_video = job.video_path
-            aug_meta = job.meta_path
-            aff = job.aff
+        tile_jobs_for_view: List[DenseTileJob] = []
+        tile_ready_jobs: List[DenseTileJob] = []
+        tile_future_to_job: Dict[Future, DenseTileJob] = {}
+        tile_executor: Optional[ThreadPoolExecutor] = None
+        tile_video_workers = 0
 
-            for model_name, yolo in yolo_models:
-                pred_prefix = temp_dir / 'preds' / model_name / view.name / f'{view.name}_{aug_id}'
-                pred_stats = predict_video_and_accumulate(
-                    model=yolo,
-                    video_path=aug_video,
-                    num_frames=view.num_slices,
-                    out_size=args.imgsz,
-                    pred_out_prefix=pred_prefix,
-                    cfg=pred_cfg,
-                    view_union_mm=baseline_union_by_model_view[model_name],
-                    view_confmap_mm=baseline_confmap_by_model_view[model_name],
-                    M_out_to_native=aff.M_out_to_src,
-                    native_h=view.src_h,
-                    native_w=view.src_w,
-                    postprocess_workers=predict_postprocess_workers,
-                )
-                view_prediction_stats[view.name] = int(view_prediction_stats.get(view.name, 0)) + int(pred_stats.get('prediction_count', 0))
-
-            if dense_tiling_active and view.family == 'orthogonal':
-                tile_jobs = build_dense_tile_jobs_for_aug(
+        if dense_tiling_active and view.family == 'orthogonal':
+            for job in aug_jobs:
+                tile_jobs_for_view.extend(build_dense_tile_jobs_for_aug(
                     view=view,
                     aug_job=job,
                     tile_size=int(args.tile_size),
                     tile_stride=int(args.tile_stride),
                     out_size=int(args.imgsz),
                     temp_dir=temp_dir,
+                ))
+            if tile_jobs_for_view:
+                tile_video_workers = max(1, min(int(worker_budget), int(len(tile_jobs_for_view))))
+                print(
+                    f"Starting background dense tile rendering for {view.name}: "
+                    f"{len(tile_jobs_for_view)} tile video(s) with {tile_video_workers} worker(s)"
                 )
-                for tile_job in tile_jobs:
-                    ensure_dense_tile_video(
-                        volume_rgb=volume_rgb,
-                        view=view,
-                        job=tile_job,
-                        fps=float(fps),
-                        workers=max(1, int(augmentation_workers)),
+                tile_executor = ThreadPoolExecutor(
+                    max_workers=int(tile_video_workers),
+                    thread_name_prefix=f'dense-tile-{view.name}',
+                )
+                tile_ready_jobs, tile_future_to_job = submit_dense_tile_video_jobs(
+                    executor=tile_executor,
+                    volume_rgb=volume_rgb,
+                    view=view,
+                    tile_jobs=tile_jobs_for_view,
+                    fps=float(fps),
+                    workers_per_job=1,
+                )
+
+        try:
+            for job in aug_jobs:
+                aug_id = job.aug_id
+                aug_video = job.video_path
+                aug_meta = job.meta_path
+                aff = job.aff
+
+                for model_name, yolo in yolo_models:
+                    pred_prefix = temp_dir / 'preds' / model_name / view.name / f'{view.name}_{aug_id}'
+                    pred_stats = predict_video_and_accumulate(
+                        model=yolo,
+                        video_path=aug_video,
+                        num_frames=view.num_slices,
+                        out_size=args.imgsz,
+                        pred_out_prefix=pred_prefix,
+                        cfg=pred_cfg,
+                        view_union_mm=baseline_union_by_model_view[model_name],
+                        view_confmap_mm=baseline_confmap_by_model_view[model_name],
+                        M_out_to_native=aff.M_out_to_src,
+                        native_h=view.src_h,
+                        native_w=view.src_w,
+                        postprocess_workers=predict_postprocess_workers,
                     )
+                    view_prediction_stats[view.name] = int(view_prediction_stats.get(view.name, 0)) + int(pred_stats.get('prediction_count', 0))
+
+                if not args.troubleshooting and not args.save_TTA:
+                    try:
+                        aug_video.unlink(missing_ok=True)
+                        aug_meta.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+            if dense_tiling_active and view.family == 'orthogonal' and tile_jobs_for_view:
+                ready_iter = iter_dense_tile_jobs_in_completion_order(tile_ready_jobs, tile_future_to_job)
+                for tile_job in tqdm(
+                    ready_iter,
+                    total=len(tile_jobs_for_view),
+                    desc=f'Dense tiled inference {view.name}',
+                ):
                     for model_name, yolo in yolo_models:
                         pred_prefix = temp_dir / 'preds' / model_name / view.name / 'tiles' / tile_job.tile_id
                         pred_stats = predict_video_and_accumulate(
@@ -4985,13 +5093,9 @@ def main() -> None:
                             tile_job.meta_path.unlink(missing_ok=True)
                         except Exception:
                             pass
-
-            if not args.troubleshooting and not args.save_TTA:
-                try:
-                    aug_video.unlink(missing_ok=True)
-                    aug_meta.unlink(missing_ok=True)
-                except Exception:
-                    pass
+        finally:
+            if tile_executor is not None:
+                tile_executor.shutdown(wait=True)
 
         for model_name, _ in yolo_models:
             print(f"\n--- Postprocessing view '{view.name}' for model '{model_name}' ---")
