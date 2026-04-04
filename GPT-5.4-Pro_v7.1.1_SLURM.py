@@ -2,7 +2,7 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large video volumes.
 
-This v7.1.0_SLURM specification-aligned script:
+This v7.1.1_SLURM specification-aligned script:
   - builds transverse, sagittal, coronal and optional radial view families
   - generates rotated / scaled / shifted FFV1 MKV augmentations via a single affine transform per variant
   - runs Ultralytics YOLO segmentation sequentially on the pre-generated augmentation videos
@@ -2333,13 +2333,21 @@ def build_slice_endpoint_seeds_from_label_volume(
     return seeds, int(len(seeds))
 
 
+
 def apply_transverse_min_radius_filter_inplace(
     mask_mm: np.ndarray,
     min_radius: float,
     *,
     workers: int = 1,
+    show_progress: bool = True,
 ) -> None:
-    """In-place transverse-plane radius filter to avoid a full extra volume copy."""
+    """In-place transverse-plane radius filter to avoid a full extra volume copy.
+
+    Performance fix:
+      - compute the Euclidean distance transform once per slice
+      - reduce per-component radii with a labeled maximum
+    This preserves the original semantics while avoiding an expensive EDT per component.
+    """
     if float(min_radius) <= 0:
         return
 
@@ -2356,15 +2364,17 @@ def apply_transverse_min_radius_filter_inplace(
             mask_mm[int(t), :, :] = 0
             return
 
-        keep = np.zeros(sl.shape, dtype=bool)
-        for lbl in range(1, int(num) + 1):
-            comp = labels2d == lbl
-            if not np.any(comp):
-                continue
-            radius = float(np.max(ndi.distance_transform_edt(comp)))
-            if radius >= float(min_radius):
-                keep |= comp
+        dist = ndi.distance_transform_edt(sl)
+        label_ids = np.arange(1, int(num) + 1, dtype=np.int32)
+        radii = ndi.maximum(dist, labels=labels2d, index=label_ids)
+        radii = np.asarray(radii, dtype=np.float32)
+        keep_ids = label_ids[radii >= float(min_radius)]
 
+        if keep_ids.size == 0:
+            mask_mm[int(t), :, :] = 0
+            return
+
+        keep = np.isin(labels2d, keep_ids)
         mask_mm[int(t), :, :] = keep.astype(np.uint8, copy=False)
 
     parallel_for_indices(
@@ -2372,9 +2382,9 @@ def apply_transverse_min_radius_filter_inplace(
         _process,
         max_workers=choose_slice_parallel_workers(int(workers), num_slices),
         desc='Transverse min-radius filter',
+        show_progress=bool(show_progress),
     )
     flush_array(mask_mm)
-
 
 def apply_view_min_radius_filter_inplace(
     mask_mm: np.ndarray,
@@ -4200,6 +4210,38 @@ def build_cpr_frame_nn_maps(
     return z_idx, y_idx, x_idx
 
 
+def build_cpr_frame_nn_coords_for_pixels(
+    volume_shape: Tuple[int, int, int],
+    center: np.ndarray,
+    tangent: np.ndarray,
+    half_width: int,
+    yy: np.ndarray,
+    xx: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Nearest-neighbor inverse map for only the requested CPR pixels.
+
+    This avoids allocating full native-size z/y/x index grids during mapped-back CPR prediction,
+    which is especially important for large boundary-limited planes.
+    """
+    yy_i = np.asarray(yy, dtype=np.int32).reshape(-1)
+    xx_i = np.asarray(xx, dtype=np.int32).reshape(-1)
+    if yy_i.size == 0 or xx_i.size == 0:
+        empty = np.zeros((0,), dtype=np.int32)
+        return empty, empty, empty
+
+    center_f = np.asarray(center, dtype=np.float32)
+    _, u_axis, v_axis = _orthonormal_basis(tangent)
+
+    du = xx_i.astype(np.float32, copy=False) - float(int(half_width))
+    dv = yy_i.astype(np.float32, copy=False) - float(int(half_width))
+    coords = center_f[None, :] + du[:, None] * u_axis[None, :] + dv[:, None] * v_axis[None, :]
+
+    z_idx = np.clip(np.rint(coords[:, 0]).astype(np.int32, copy=False), 0, int(volume_shape[0]) - 1)
+    y_idx = np.clip(np.rint(coords[:, 1]).astype(np.int32, copy=False), 0, int(volume_shape[1]) - 1)
+    x_idx = np.clip(np.rint(coords[:, 2]).astype(np.int32, copy=False), 0, int(volume_shape[2]) - 1)
+    return z_idx, y_idx, x_idx
+
+
 def write_cpr_branch_video(
     volume_rgb: np.ndarray,
     branch: CPRBranch,
@@ -4473,15 +4515,18 @@ def predict_cpr_video_to_local_bbox(
                 if not np.any(native_union):
                     continue
 
-                z_idx, y_idx, x_idx = build_cpr_frame_nn_maps(
+                yy, xx = np.nonzero(native_union > 0)
+                if yy.size == 0:
+                    continue
+
+                z_idx, y_idx, x_idx = build_cpr_frame_nn_coords_for_pixels(
                     volume_shape=volume_shape,
                     center=np.asarray(branch.smoothed_points[idx], dtype=np.float32),
                     tangent=np.asarray(branch.tangents[idx], dtype=np.float32),
                     half_width=int(frame_half_widths[idx]),
+                    yy=yy,
+                    xx=xx,
                 )
-                yy, xx = np.nonzero(native_union > 0)
-                if yy.size == 0:
-                    continue
 
                 conf_vals = np.asarray(native_conf[yy, xx], dtype=np.float32)
                 keep = conf_vals > 0.0
@@ -4528,26 +4573,50 @@ def gate_cpr_components_by_support(
     mask_u8: np.ndarray,
     conf_map: np.ndarray,
     support_local: np.ndarray,
+    *,
+    min_conf: float = 0.0,
+    min_radius: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray, int, int]:
-    mask_bool = np.asarray(mask_u8, dtype=bool)
+    """Gate mapped-back CPR components against support after inline CPR-space filtering.
+
+    The min-confidence and min-radius filters are applied in Cartesian CPR space before support
+    gating, matching the previous semantics, but the transverse min-radius step now uses the
+    optimized one-EDT-per-slice path and stays silent inside the CPR branch loop.
+    """
+    work_mask = np.asarray(mask_u8, dtype=np.uint8).copy()
+    work_conf = np.asarray(conf_map).copy()
+
+    if float(min_conf) > 0.0:
+        apply_3d_min_conf_filter_inplace(work_mask, work_conf, float(min_conf))
+    if float(min_radius) > 0.0 and np.any(work_mask):
+        apply_transverse_min_radius_filter_inplace(
+            work_mask,
+            float(min_radius),
+            workers=1,
+            show_progress=False,
+        )
+        work_conf[np.asarray(work_mask) == 0] = np.float16(0.0)
+
+    mask_bool = np.asarray(work_mask, dtype=bool)
     labels, num = ndi.label(mask_bool, structure=STRUCTURE26)
     if int(num) <= 0:
-        return np.zeros_like(mask_u8, dtype=np.uint8), np.zeros_like(conf_map, dtype=conf_map.dtype), 0, 0
+        return np.zeros_like(work_mask, dtype=np.uint8), np.zeros_like(work_conf, dtype=work_conf.dtype), 0, 0
 
     accepted = np.zeros(mask_bool.shape, dtype=bool)
+    support_bool = np.asarray(support_local, dtype=bool)
     accepted_components = 0
     for lbl in range(1, int(num) + 1):
         comp = labels == int(lbl)
         if not np.any(comp):
             continue
-        if np.any(comp & np.asarray(support_local, dtype=bool)):
+        if np.any(comp & support_bool):
             accepted |= comp
             accepted_components += 1
 
     out_mask = accepted.astype(np.uint8, copy=False)
-    out_conf = np.asarray(conf_map).copy()
+    out_conf = np.asarray(work_conf).copy()
     out_conf[~accepted] = 0
-    return out_mask, out_conf.astype(conf_map.dtype, copy=False), int(num), int(accepted_components)
+    return out_mask, out_conf.astype(work_conf.dtype, copy=False), int(num), int(accepted_components)
 
 
 def apply_cpr_refinement_inplace(
@@ -4615,12 +4684,16 @@ def apply_cpr_refinement_inplace(
     accepted_components = 0
     added_voxels = 0
 
-    cpr_write_ahead = max(1, _env_int('YOLO_TTA_CPR_WRITE_AHEAD', 2))
-    print(f'CPR: background video writer process enabled (write-ahead={cpr_write_ahead})')
+    cpr_video_writers = max(1, _env_int('YOLO_TTA_CPR_VIDEO_WRITERS', min(4, max(1, _cpu_count() // 32))))
+    cpr_write_ahead = max(int(cpr_video_writers), _env_int('YOLO_TTA_CPR_WRITE_AHEAD', max(2, int(cpr_video_writers) * 2)))
+    print(
+        f'CPR: background video writer processes={int(cpr_video_writers)} '
+        f'(write-ahead={int(cpr_write_ahead)})'
+    )
 
     try:
         mp_ctx = mp.get_context('spawn')
-        with ProcessPoolExecutor(max_workers=1, mp_context=mp_ctx) as video_writer_pool:
+        with ProcessPoolExecutor(max_workers=int(cpr_video_writers), mp_context=mp_ctx) as video_writer_pool:
             pending_videos: Dict[int, Tuple[Future, Path, Path, Path]] = {}
             next_submit_idx = 0
 
@@ -4692,14 +4765,14 @@ def apply_cpr_refinement_inplace(
                         shutil.rmtree(branch_dir, ignore_errors=True)
                     continue
 
-                if float(min_conf) > 0.0:
-                    apply_3d_min_conf_filter_inplace(local_mask, local_conf, float(min_conf))
-                if float(min_radius) > 0.0 and np.any(local_mask):
-                    apply_transverse_min_radius_filter_inplace(local_mask, float(min_radius), workers=max(1, min(int(slice_workers), int(local_mask.shape[0]))))
-                    local_conf[np.asarray(local_mask) == 0] = np.float16(0.0)
-
                 support_local = np.asarray(support_mm[bbox]) == int(branch.branch_id)
-                gated_mask, gated_conf, num_components, num_accepted = gate_cpr_components_by_support(local_mask, local_conf, support_local)
+                gated_mask, gated_conf, num_components, num_accepted = gate_cpr_components_by_support(
+                    local_mask,
+                    local_conf,
+                    support_local,
+                    min_conf=float(min_conf),
+                    min_radius=float(min_radius),
+                )
                 total_components += int(num_components)
                 accepted_components += int(num_accepted)
 
