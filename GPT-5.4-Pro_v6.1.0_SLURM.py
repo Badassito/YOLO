@@ -2,16 +2,16 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large video volumes.
 
-This v6.0.3 hardening patch script:
+This v6.1.0 specification-aligned script:
   - builds transverse, sagittal, coronal and optional radial view families
   - generates rotated / scaled / shifted FFV1 MKV augmentations via a single affine transform per variant
   - runs Ultralytics YOLO segmentation sequentially on the pre-generated augmentation videos
   - stores per-augmentation traces to disk, undoes the affine transforms, unions masks per slice and tracks per-pixel max confidence for --min_conf
-  - fills 2D holes after per-frame unions, interpolates only Cartesian view volumes, and unions final per-view / per-model volumes including optional radial backprojection
-  - fills enclosed 3D voids with a streamed boundary-background pass, optionally filters small transverse-plane components via --min_radius
-  - keeps bulk persistent scratch on disk by default to avoid tmpfs SIGBUS failures
-  - uses RAM/ZRAM more heavily for 3D interpolation / 3D void-filling workspaces via in-memory arrays when enough memory+swap is available
-  - speeds up radial view generation by slicing azimuths in blocks and reusing native radial slices across all radial TTA variants
+  - fills 2D holes after per-frame unions, interpolates active orthogonal views in their native slice direction, and interpolates the radial backprojection in both Cartesian sagittal and coronal directions before the final multiplanar / multi-model union
+  - fills enclosed 3D voids with a streamed boundary-background pass and applies --min_radius in the transverse plane before interpolation
+  - prefers in-memory workspaces on the SLURM target and falls back to disk-backed scratch only when the working set is too large
+  - parallelizes augmentation generation across independent slices and interpolation across independent view/model volumes
+  - extracts radial diameter slices with exact Lanczos-5 interpolation by default
 
 Dependencies (Python):
   pip install opencv-python numpy scipy scikit-image tifffile tqdm ultralytics
@@ -34,11 +34,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 GIB = 1024 ** 3
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -142,6 +143,10 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Keep temp files and save pass snapshots before each interpolation pass")
     p.add_argument("--scratch_dir", default=None, type=str,
                    help="Optional bulk scratch/temp root for disk-backed working files. Defaults to {output}/temp")
+    p.add_argument("--augmentation_workers", default=0, type=int,
+                   help="Worker threads for augmentation generation. 0 = auto-tuned for the SLURM target")
+    p.add_argument("--interpolation_workers", default=0, type=int,
+                   help="Worker threads for running independent per-view interpolation passes. 0 = auto-tuned")
 
     p.add_argument("--interpolate", default=15, type=int,
                    help="Maximum slice-distance used to search for interpolation candidates. 0 disables interpolation")
@@ -210,15 +215,159 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, '').strip()
+    if not raw:
+        return int(default)
+    try:
+        return int(raw)
+    except Exception:
+        return int(default)
+
+
+def _cpu_count() -> int:
+    return max(1, int(os.cpu_count() or 1))
+
+
+def default_augmentation_workers() -> int:
+    cpu = _cpu_count()
+    if cpu >= 128:
+        return 24
+    if cpu >= 64:
+        return 16
+    if cpu >= 32:
+        return 12
+    if cpu >= 16:
+        return 8
+    if cpu >= 8:
+        return 4
+    return 1
+
+
+def default_interpolation_workers() -> int:
+    cpu = _cpu_count()
+    if cpu >= 128:
+        return 8
+    if cpu >= 64:
+        return 6
+    if cpu >= 32:
+        return 4
+    if cpu >= 16:
+        return 3
+    if cpu >= 8:
+        return 2
+    return 1
+
+
+def resolve_worker_count(requested: int, env_name: str, auto_value: int, max_tasks: Optional[int] = None) -> int:
+    workers = int(requested)
+    if workers <= 0:
+        workers = _env_int(env_name, int(auto_value))
+    workers = max(1, int(workers))
+    if max_tasks is not None:
+        workers = max(1, min(int(workers), int(max_tasks)))
+    return workers
+
+
+def array_nbytes(shape: Sequence[int], dtype: np.dtype | str | type) -> int:
+    dtype_obj = np.dtype(dtype)
+    total = 1
+    for dim in shape:
+        total *= int(dim)
+    return int(total) * int(dtype_obj.itemsize)
+
+
+def flush_array(arr: object) -> None:
+    if arr is None:
+        return
+
+    try:
+        if isinstance(arr, np.memmap):
+            arr.flush()
+            return
+    except Exception:
+        pass
+
+    base = getattr(arr, 'base', None)
+    try:
+        if isinstance(base, np.memmap):
+            base.flush()
+    except Exception:
+        pass
+
+
+def allocate_workspace_array(
+    shape: Sequence[int],
+    dtype: np.dtype | str | type,
+    path: Optional[Path],
+    desc: str,
+    *,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 16 * GIB,
+    reuse_existing: bool = False,
+) -> np.ndarray:
+    dtype_obj = np.dtype(dtype)
+    need_bytes = array_nbytes(shape, dtype_obj)
+    budget = workspace_budget_summary(need_bytes, reserve_bytes=reserve_bytes)
+    use_in_memory = bool(prefer_memory) and should_use_in_memory_workspace(need_bytes, reserve_bytes=reserve_bytes)
+
+    if use_in_memory:
+        try:
+            print(f"{desc}: in-memory ({budget})")
+            return np.zeros(tuple(int(x) for x in shape), dtype=dtype_obj)
+        except MemoryError:
+            print(f"{desc}: in-memory allocation failed, falling back to disk ({budget})")
+
+    if path is None:
+        raise ValueError(f"{desc}: disk fallback requires a filesystem path")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if reuse_existing and path.exists():
+        print(f"{desc}: disk-backed reuse ({budget}) -> {path}")
+        return np.memmap(path, dtype=dtype_obj, mode='r+', shape=tuple(int(x) for x in shape))
+
+    if path.exists():
+        path.unlink()
+    print(f"{desc}: disk-backed ({budget}) -> {path}")
+    return np.memmap(path, dtype=dtype_obj, mode='w+', shape=tuple(int(x) for x in shape))
+
+
+def parallel_map_in_order(
+    func: Callable[[int], object],
+    items: Iterable[int],
+    *,
+    max_workers: int,
+    max_pending: Optional[int] = None,
+) -> Iterator[object]:
+    workers = max(1, int(max_workers))
+    if workers <= 1:
+        for item in items:
+            yield func(int(item))
+        return
+
+    pending_limit = max(workers, int(max_pending) if max_pending is not None else workers + 1)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        queue: List[object] = []
+        for item in items:
+            queue.append(executor.submit(func, int(item)))
+            if len(queue) >= pending_limit:
+                fut = queue.pop(0)
+                yield fut.result()
+        while queue:
+            fut = queue.pop(0)
+            yield fut.result()
+
+
 def workspace_anon_cap_bytes() -> int:
     """Return the soft cap for anonymous in-memory workspaces.
 
-    Defaults are intentionally conservative for workstation stability on very large volumes:
-      - YOLO_TTA_MAX_ANON_WORKSPACE_GIB: hard GiB cap (default 48)
+    The v6.1.0 target system has large RAM+ZRAM capacity, so the default policy now prefers
+    a capacity-relative cap instead of a small fixed hard limit:
+      - YOLO_TTA_MAX_ANON_WORKSPACE_GIB: hard GiB cap (default 0 = disabled)
       - YOLO_TTA_MAX_ANON_WORKSPACE_FRACTION: fraction of total RAM+swap (default 0.25)
     The lower non-zero cap wins.
     """
-    hard_cap_gib = max(0.0, _env_float('YOLO_TTA_MAX_ANON_WORKSPACE_GIB', 48.0))
+    hard_cap_gib = max(0.0, _env_float('YOLO_TTA_MAX_ANON_WORKSPACE_GIB', 0.0))
     fraction = max(0.0, _env_float('YOLO_TTA_MAX_ANON_WORKSPACE_FRACTION', 0.25))
 
     hard_cap = int(hard_cap_gib * GIB)
@@ -347,15 +496,21 @@ def expose_scratch_in_output(out_dir: Path, scratch_dir: Path) -> Path:
 def close_memmap_array(arr: object) -> None:
     if arr is None:
         return
+    flush_array(arr)
     try:
         if isinstance(arr, np.memmap):
-            arr.flush()
+            mmap_obj = getattr(arr, '_mmap', None)
+            if mmap_obj is not None:
+                mmap_obj.close()
+            return
     except Exception:
         pass
     try:
-        mmap_obj = getattr(arr, '_mmap', None)
-        if mmap_obj is not None:
-            mmap_obj.close()
+        base = getattr(arr, 'base', None)
+        if isinstance(base, np.memmap):
+            mmap_obj = getattr(base, '_mmap', None)
+            if mmap_obj is not None:
+                mmap_obj.close()
     except Exception:
         pass
 
@@ -422,18 +577,38 @@ def decode_video_to_memmap_rgb24(
     width: int,
     height: int,
     overwrite: bool = False,
-) -> np.memmap:
-    """Decode input video to a (T,H,W,3) uint8 memmap in RGB24."""
+    *,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 32 * GIB,
+) -> np.ndarray:
+    """Decode input video to a (T,H,W,3) uint8 workspace in RGB24.
+
+    On the v6.1.0 SLURM target the default policy is to keep the decoded source volume in RAM.
+    A disk-backed memmap is used only when the working set would be too large.
+    """
     _require_bin("ffmpeg")
-    if out_dat.exists() and not overwrite:
-        return np.memmap(out_dat, dtype=np.uint8, mode="r+", shape=(num_frames, height, width, 3))
 
-    if out_dat.exists():
-        out_dat.unlink()
+    shape = (num_frames, height, width, 3)
+    reuse_existing = bool(not overwrite and out_dat.exists() and not prefer_memory)
+    arr = allocate_workspace_array(
+        shape=shape,
+        dtype=np.uint8,
+        path=out_dat,
+        desc='Decoded RGB24 input volume',
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
+        reuse_existing=bool(reuse_existing),
+    )
+    if reuse_existing and isinstance(arr, np.memmap):
+        return arr
 
-    out_dat.parent.mkdir(parents=True, exist_ok=True)
-    mm = np.memmap(out_dat, dtype=np.uint8, mode="w+", shape=(num_frames, height, width, 3))
-    frame_bytes = width * height * 3
+    raw_bytes = memoryview(np.ascontiguousarray(arr) if not arr.flags['C_CONTIGUOUS'] else arr).cast('B')
+    if raw_bytes.obj is not arr:
+        arr = np.asarray(raw_bytes.obj).reshape(shape)
+        raw_bytes = memoryview(arr).cast('B')
+
+    frame_bytes = int(width) * int(height) * 3
+    chunk_frames = max(1, min(64, max(1, (256 * 1024 * 1024) // max(1, frame_bytes))))
 
     cmd = [
         "ffmpeg",
@@ -448,13 +623,20 @@ def decode_video_to_memmap_rgb24(
     assert proc.stdout is not None
 
     try:
-        for i in tqdm(range(num_frames), desc="Decoding input -> memmap (rgb24)"):
-            buf = proc.stdout.read(frame_bytes)
-            if buf is None or len(buf) < frame_bytes:
-                raise RuntimeError(f"Unexpected EOF while decoding frame {i}/{num_frames}")
-            frame = np.frombuffer(buf, dtype=np.uint8).reshape((height, width, 3))
-            mm[i, :, :, :] = frame
-        mm.flush()
+        with tqdm(total=num_frames, desc='Decoding input volume (rgb24)') as pbar:
+            for start in range(0, num_frames, chunk_frames):
+                nframes = min(chunk_frames, num_frames - start)
+                need = int(nframes) * int(frame_bytes)
+                offset = int(start) * int(frame_bytes)
+                view = raw_bytes[offset:offset + need]
+                filled = 0
+                while filled < need:
+                    nread = proc.stdout.readinto(view[filled:])
+                    if nread is None or nread <= 0:
+                        raise RuntimeError(f'Unexpected EOF while decoding frames starting at {start}/{num_frames}')
+                    filled += int(nread)
+                pbar.update(int(nframes))
+        flush_array(arr)
     finally:
         if proc.stdout:
             proc.stdout.close()
@@ -462,7 +644,7 @@ def decode_video_to_memmap_rgb24(
         if proc.returncode not in (0, None):
             msg = err.decode("utf-8", errors="ignore") if isinstance(err, (bytes, bytearray)) else str(err)
             raise RuntimeError(f"ffmpeg decode failed: {msg}")
-    return mm
+    return arr
 
 
 def ffmpeg_rawvideo_writer(
@@ -845,12 +1027,12 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 def radial_fast_path_enabled() -> bool:
-    """Fast blocked radial sampler.
+    """Fast blocked radial sampler override.
 
-    Default: enabled.
-    Set YOLO_TTA_RADIAL_FAST=0 to force the strict exact Lanczos-5 path.
+    Default: disabled so the default v6.1.0 behavior remains exact Lanczos-5.
+    Set YOLO_TTA_RADIAL_FAST=1 to opt into the faster OpenCV remap path.
     """
-    return _env_flag('YOLO_TTA_RADIAL_FAST', True)
+    return _env_flag('YOLO_TTA_RADIAL_FAST', False)
 
 
 def choose_radial_block_size(view: ViewInfo, target_bytes: int = 1 * GIB) -> int:
@@ -863,7 +1045,7 @@ def choose_radial_block_size(view: ViewInfo, target_bytes: int = 1 * GIB) -> int
 
     bytes_per_angle = max(1, int(view.src_h) * int(view.src_w) * 3)
     block = max(1, int(target_bytes // bytes_per_angle))
-    return max(1, min(128, block))
+    return max(1, min(32, block))
 
 
 def build_radial_block_maps(view: ViewInfo, angles_deg: Sequence[float]) -> Tuple[np.ndarray, np.ndarray]:
@@ -1078,6 +1260,111 @@ def iter_view_frames(volume_rgb: np.memmap, view: ViewInfo) -> Iterator[np.ndarr
         raise ValueError(f'Unknown view: {view.name}')
 
 
+def get_view_frame_by_index(volume_rgb: np.ndarray, view: ViewInfo, index: int) -> np.ndarray:
+    T, H, W, C = volume_rgb.shape
+    assert C == 3
+
+    if view.name == 'transverse':
+        return np.asarray(volume_rgb[int(index)])
+    if view.name == 'sagittal':
+        return np.ascontiguousarray(volume_rgb[:, int(index), :, :])
+    if view.name == 'coronal':
+        return np.ascontiguousarray(volume_rgb[:, :, int(index), :])
+    if view.name == 'radial':
+        angle_deg = float(view.azimuths_deg[int(index)])
+        if radial_fast_path_enabled():
+            map_x, map_y = build_radial_block_maps(view, [angle_deg])
+            map_x = np.ascontiguousarray(map_x.astype(np.float32, copy=False))
+            map_y = np.ascontiguousarray(map_y.astype(np.float32, copy=False))
+            out = np.empty((int(view.src_h), int(view.src_w), 3), dtype=np.uint8)
+            for t in range(T):
+                sampled = cv2.remap(
+                    np.asarray(volume_rgb[t]),
+                    map_x,
+                    map_y,
+                    interpolation=cv2.INTER_LANCZOS4,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=(0, 0, 0),
+                )
+                if sampled.ndim == 2:
+                    sampled = sampled[:, :, None]
+                out[t, :, :] = np.asarray(sampled[0])
+            return out
+
+        sampler = get_radial_sampler(view, angle_deg)
+        return np.ascontiguousarray(extract_radial_slice_frame(volume_rgb, sampler))
+
+    raise ValueError(f'Unknown view: {view.name}')
+
+
+def _render_augmented_bundle_for_index(volume_rgb: np.ndarray, view: ViewInfo, jobs: Sequence[AugJob], index: int) -> List[np.ndarray]:
+    native_frame = np.ascontiguousarray(get_view_frame_by_index(volume_rgb, view, int(index)))
+    bundle: List[np.ndarray] = []
+    for job in jobs:
+        bundle.append(cv2.warpAffine(
+            native_frame,
+            job.aff.M_src_to_out,
+            dsize=(int(job.aff.out_size), int(job.aff.out_size)),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0),
+        ))
+    return bundle
+
+
+def ensure_augmented_videos(
+    volume_rgb: np.ndarray,
+    view: ViewInfo,
+    aug_jobs: Sequence[AugJob],
+    fps: float,
+    augmentation_workers: int,
+) -> None:
+    missing_jobs = [job for job in aug_jobs if not job.video_path.exists()]
+    for job in aug_jobs:
+        if not job.meta_path.exists():
+            write_aug_job_meta(job, view)
+
+    if not missing_jobs:
+        return
+
+    worker_count = max(1, min(int(augmentation_workers), int(view.num_slices)))
+    mode_suffix = ''
+    if view.family == 'radial':
+        mode_suffix = ' [OpenCV remap fast path]' if radial_fast_path_enabled() else ' [exact Lanczos-5]'
+    print(
+        f"Generating {len(missing_jobs)} augmented {view.name} video(s) over {view.num_slices} slice(s) "
+        f"with {worker_count} worker thread(s){mode_suffix}"
+    )
+
+    writers: Dict[str, subprocess.Popen] = {}
+    try:
+        for job in missing_jobs:
+            job.video_path.parent.mkdir(parents=True, exist_ok=True)
+            writers[job.aug_id] = ffmpeg_rawvideo_writer(
+                job.video_path,
+                width=int(job.aff.out_size),
+                height=int(job.aff.out_size),
+                fps=fps,
+                pix_fmt_in='rgb24',
+                codec='ffv1',
+                pix_fmt_out='yuv444p',
+            )
+
+        render = lambda idx: _render_augmented_bundle_for_index(volume_rgb, view, missing_jobs, idx)
+        for bundle in tqdm(
+            parallel_map_in_order(render, range(view.num_slices), max_workers=worker_count, max_pending=worker_count + 1),
+            total=view.num_slices,
+            desc=f'Augment {view.name} -> {len(missing_jobs)} video(s)',
+        ):
+            for job, out in zip(missing_jobs, bundle):
+                writer = writers[job.aug_id]
+                assert writer.stdin is not None
+                writer.stdin.write(np.ascontiguousarray(out).tobytes())
+    finally:
+        for writer in writers.values():
+            close_ffmpeg_writer(writer)
+
+
 # --------------------------
 # Packed mask IO
 # --------------------------
@@ -1276,10 +1563,10 @@ def predict_video_and_accumulate(
         pred_mask_mm[idx, :] = pack_mask(frame_union)
         pred_conf_mm[idx] = np.float16(frame_max_conf)
 
-    pred_mask_mm.flush()
-    pred_conf_mm.flush()
-    view_confmap_mm.flush()
-    view_union_mm.flush()
+    flush_array(pred_mask_mm)
+    flush_array(pred_conf_mm)
+    flush_array(view_confmap_mm)
+    flush_array(view_union_mm)
 
     meta = {
         'video': str(video_path),
@@ -1410,7 +1697,7 @@ def fill_2d_holes_inplace(union_mm: np.memmap, h: int, w: int) -> None:
 # --------------------------
 
 def assemble_model_volume_into_ensemble(
-    ensemble_mm: np.memmap,  # uint8 (0/1) shape (T,H,W)
+    ensemble_mm: np.ndarray,  # uint8 (0/1) shape (T,H,W)
     view_union_mms: Dict[str, np.memmap],
     T: int,
     H: int,
@@ -1632,9 +1919,8 @@ def fill_3d_voids_inplace_streaming(
         if np.any(enclosed):
             mask_mm[z, enclosed] = np.uint8(1)
 
-    mask_mm.flush()
-    if isinstance(bg_gid_store, np.memmap):
-        bg_gid_store.flush()
+    flush_array(mask_mm)
+    flush_array(bg_gid_store)
     del bg_gid_store
     if bg_gid_path is not None and not keep_temp:
         try:
@@ -1699,8 +1985,7 @@ def label_foreground_volume_streaming(
 
     root_map = uf.root_map()
     if root_map.shape[0] <= 1:
-        if isinstance(labels_store, np.memmap):
-            labels_store.flush()
+        flush_array(labels_store)
         return labels_store, 0, label_paths
 
     unique_roots = np.unique(root_map[1:])
@@ -1712,20 +1997,16 @@ def label_foreground_volume_streaming(
         gid_slice = np.asarray(labels_store[z])
         labels_store[z, :, :] = compact_root_ids[root_map[gid_slice]]
 
-    if isinstance(labels_store, np.memmap):
-        labels_store.flush()
+    flush_array(labels_store)
     return labels_store, int(unique_roots.size), label_paths
 
 
 
 def build_slice_endpoint_seeds_from_label_volume(labels_real: np.ndarray) -> Tuple[List[SliceEndpointSeed], int]:
-    """Create interpolation seeds from per-slice branch terminals rather than full 3D skeletonization.
+    """Legacy faster endpoint scan retained for reference.
 
-    The original implementation skeletonized every 3D object subvolume, which is expensive for the
-    target volumes. The v5.0.1 interpolation acts strictly along the slice axis, so it is sufficient
-    and faster to treat each per-slice object component as a graph node and emit endpoint seeds for
-    nodes that have no predecessor and/or no successor in adjacent slices. This still captures
-    bifurcations and one-slice orphan objects.
+    v6.1.0 now uses per-object 3D skeletonization via ``_build_slice_endpoint_seeds`` for actual
+    interpolation passes, but this slice-graph terminal scan is kept as an alternative helper.
     """
     z_dim = labels_real.shape[0]
     if z_dim <= 0:
@@ -1786,7 +2067,7 @@ def build_slice_endpoint_seeds_from_label_volume(labels_real: np.ndarray) -> Tup
     return seeds, int(len(seeds))
 
 
-def apply_transverse_min_radius_filter_inplace(mask_mm: np.memmap, min_radius: float) -> None:
+def apply_transverse_min_radius_filter_inplace(mask_mm: np.ndarray, min_radius: float) -> None:
     """In-place transverse-plane radius filter to avoid a full extra volume copy."""
     if float(min_radius) <= 0:
         return
@@ -1812,7 +2093,25 @@ def apply_transverse_min_radius_filter_inplace(mask_mm: np.memmap, min_radius: f
                 keep |= comp
 
         mask_mm[t, :, :] = keep.astype(np.uint8, copy=False)
-    mask_mm.flush()
+    flush_array(mask_mm)
+
+
+def apply_view_min_radius_filter_inplace(mask_mm: np.ndarray, view: ViewInfo, min_radius: float) -> None:
+    if float(min_radius) <= 0:
+        return
+
+    if view.name in ('transverse', 'radial'):
+        transverse_view = mask_mm
+    elif view.name == 'sagittal':
+        transverse_view = np.transpose(mask_mm, (1, 0, 2))
+    elif view.name == 'coronal':
+        transverse_view = np.transpose(mask_mm, (1, 2, 0))
+    else:  # pragma: no cover
+        raise ValueError(f'Unsupported view for min-radius filtering: {view.name}')
+
+    print(f"Applying --min_radius in the transverse plane for view '{view.name}'")
+    apply_transverse_min_radius_filter_inplace(transverse_view, float(min_radius))
+    flush_array(mask_mm)
 
 
 def fill_3d_voids(mask_u8: np.ndarray) -> np.ndarray:
@@ -1853,31 +2152,43 @@ def fill_3d_voids(mask_u8: np.ndarray) -> np.ndarray:
 
 
 def unpack_view_union_to_volume(
-    union_mm: np.memmap,
+    union_mm: np.ndarray,
     num_slices: int,
     h: int,
     w: int,
     out_path: Path,
     desc: str,
-) -> np.memmap:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    vol_mm = np.memmap(out_path, dtype=np.uint8, mode="w+", shape=(num_slices, h, w))
+    *,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 16 * GIB,
+) -> np.ndarray:
+    vol_mm = allocate_workspace_array(
+        shape=(num_slices, h, w),
+        dtype=np.uint8,
+        path=out_path,
+        desc=f'{desc} workspace',
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
+    )
     for i in tqdm(range(num_slices), desc=desc):
         packed = np.asarray(union_mm[i])
         if any_mask(packed):
             vol_mm[i, :, :] = unpack_mask(packed, h, w)
         else:
             vol_mm[i, :, :] = 0
-    vol_mm.flush()
+    flush_array(vol_mm)
     return vol_mm
 
 
 def backproject_radial_union_to_volume(
-    union_mm: np.memmap,
+    union_mm: np.ndarray,
     radial_view: ViewInfo,
     out_path: Path,
     desc: str,
-) -> np.memmap:
+    *,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 16 * GIB,
+) -> np.ndarray:
     if radial_view.family != 'radial':
         raise ValueError('backproject_radial_union_to_volume expects a radial view')
 
@@ -1886,8 +2197,14 @@ def backproject_radial_union_to_volume(
     out_w = int(radial_view.full_w)
     diameter = int(radial_view.src_w)
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    vol_mm = np.memmap(out_path, dtype=np.uint8, mode='w+', shape=(t_dim, out_h, out_w))
+    vol_mm = allocate_workspace_array(
+        shape=(t_dim, out_h, out_w),
+        dtype=np.uint8,
+        path=out_path,
+        desc=f'{desc} workspace',
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
+    )
 
     for angle_idx, angle_deg in enumerate(tqdm(radial_view.azimuths_deg, desc=desc)):
         packed = np.asarray(union_mm[angle_idx])
@@ -1900,7 +2217,7 @@ def backproject_radial_union_to_volume(
         sampler = get_radial_sampler(radial_view, float(angle_deg))
         vol_mm[tt, sampler.nn_y[uu], sampler.nn_x[uu]] = 1
 
-    vol_mm.flush()
+    flush_array(vol_mm)
     return vol_mm
 
 
@@ -1937,8 +2254,8 @@ def apply_transverse_min_radius_filter(mask_u8: np.ndarray, min_radius: float) -
 
 
 def assemble_model_volume_from_view_volumes(
-    ensemble_mm: np.memmap,
-    view_volume_mms: Dict[str, np.memmap],
+    ensemble_mm: np.ndarray,
+    view_volume_mms: Dict[str, np.ndarray],
     T: int,
     H: int,
     W: int,
@@ -1969,15 +2286,24 @@ def assemble_model_volume_from_view_volumes(
 
 
 def assemble_current_ensemble_volume(
-    view_volumes_by_model: Dict[str, Dict[str, np.memmap]],
+    view_volumes_by_model: Dict[str, Dict[str, np.ndarray]],
     T: int,
     H: int,
     W: int,
     disable_multiplanar: bool,
     out_path: Path,
-) -> np.memmap:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    ensemble_mm = np.memmap(out_path, dtype=np.uint8, mode="w+", shape=(T, H, W))
+    *,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 16 * GIB,
+) -> np.ndarray:
+    ensemble_mm = allocate_workspace_array(
+        shape=(T, H, W),
+        dtype=np.uint8,
+        path=out_path,
+        desc='Ensemble volume',
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
+    )
 
     for model_name in sorted(view_volumes_by_model.keys()):
         print(f"\n=== Assembling model into ensemble volume: {model_name} ===")
@@ -1989,7 +2315,7 @@ def assemble_current_ensemble_volume(
             W=W,
             disable_multiplanar=disable_multiplanar,
         )
-        ensemble_mm.flush()
+        flush_array(ensemble_mm)
 
     return ensemble_mm
 
@@ -3519,6 +3845,51 @@ def _collect_walkback_source_points(
     return out
 
 
+def _estimate_linear_slice_bridge_min_radius(
+    labels_real: np.ndarray,
+    source_label: int,
+    target_label: int,
+    source_point: Tuple[int, int, int],
+    target_point: Tuple[int, int, int],
+) -> float:
+    """Return the smallest effective radius encountered along a linear slice bridge."""
+    s0, y0, x0 = source_point
+    s1, y1, x1 = target_point
+    if int(s0) == int(s1):
+        return 0.0
+
+    source_component, source_anchor = _component_mask_and_anchor(labels_real[s0] == int(source_label), (y0, x0))
+    target_component, target_anchor = _component_mask_and_anchor(labels_real[s1] == int(target_label), (y1, x1))
+    if source_anchor is None or target_anchor is None:
+        return 0.0
+    if not np.any(source_component) or not np.any(target_component):
+        return 0.0
+
+    half_width = _local_half_width_for_components(source_component, source_anchor, target_component, target_anchor)
+    source_local = _component_to_local_canvas(source_component, source_anchor, half_width)
+    target_local = _component_to_local_canvas(target_component, target_anchor, half_width)
+    if not np.any(source_local) or not np.any(target_local):
+        return 0.0
+
+    min_radius = min(_component_max_radius(source_local), _component_max_radius(target_local))
+    sdf0 = _signed_distance_2d(source_local)
+    sdf1 = _signed_distance_2d(target_local)
+
+    steps = int(abs(int(s1) - int(s0)))
+    if steps <= 0:
+        return 0.0
+
+    for idx in range(1, steps):
+        alpha = float(idx) / float(steps)
+        section = ((1.0 - alpha) * sdf0 + alpha * sdf1) >= 0.0
+        if not np.any(section):
+            return 0.0
+        section = _keep_center_component_2d(section)
+        min_radius = min(min_radius, _component_max_radius(section))
+
+    return float(min_radius)
+
+
 def _paint_linear_slice_bridge(
     bridge_volume: np.ndarray,
     labels_real: np.ndarray,
@@ -3571,7 +3942,7 @@ def _paint_linear_slice_bridge(
 
 
 def interpolate_view_volume_pass_inplace(
-    mask_mm: np.memmap,
+    mask_mm: np.ndarray,
     work_dir: Path,
     pass_tag: str,
     max_slice_distance: int,
@@ -3583,15 +3954,12 @@ def interpolate_view_volume_pass_inplace(
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
 ) -> Dict[str, object]:
-    """Apply one interpolation pass directly to a view-volume memmap.
+    """Apply one interpolation pass directly to a view-volume stack.
 
-    Bottleneck fix:
-      - avoids ``ndi.label`` over the full 3D volume in RAM
-      - avoids allocating a full in-memory boolean bridge volume
-      - uses a streamed 3D foreground label volume on disk plus an on-disk bridge volume
-      - derives interpolation endpoints from slice-graph terminals instead of full-object
-        3D skeletonization, which is both faster and better aligned with the slice-direction
-        projection rules in v5.0.1
+    The pass keeps bridge creation simultaneous by searching against a frozen label snapshot and
+    merging all newly created bridge voxels only after planning is complete. Endpoint discovery
+    uses per-object 3D skeletonization with a one-slice fallback for orphaned objects so the
+    implementation matches the v6.1.0 slice-direction interpolation rules more closely.
     """
     if int(max_slice_distance) <= 0:
         return {
@@ -3642,7 +4010,7 @@ def interpolate_view_volume_pass_inplace(
             'skipped': int(num_objects) <= 1,
         }
 
-    seeds, num_endpoints = build_slice_endpoint_seeds_from_label_volume(labels_mm)
+    seeds, num_endpoints = _build_slice_endpoint_seeds(labels_mm, extension_slices=int(max_slice_distance))
     if not seeds:
         del labels_mm
         if not keep_temp:
@@ -3712,9 +4080,17 @@ def interpolate_view_volume_pass_inplace(
                 )
                 source_radius = _component_max_radius(source_component) if source_anchor is not None else 0.0
                 bridge_radius = min(float(source_radius), float(target_radius))
-                if bridge_radius <= float(interpolate_min_radius):
-                    skipped_by_min_radius += 1
-                    continue
+                if float(interpolate_min_radius) > 0.0:
+                    bridge_radius = _estimate_linear_slice_bridge_min_radius(
+                        labels_real=labels_mm,
+                        source_label=int(candidate.source_label),
+                        target_label=int(candidate.target_label),
+                        source_point=src_point,
+                        target_point=candidate.target_point,
+                    )
+                    if bridge_radius <= float(interpolate_min_radius):
+                        skipped_by_min_radius += 1
+                        continue
 
                 if walk_idx == 0:
                     default_bridges += 1
@@ -3738,13 +4114,13 @@ def interpolate_view_volume_pass_inplace(
         bridge_slice = np.asarray(bridge_mm[z])
         if np.any(bridge_slice):
             mask_mm[z, :, :] |= bridge_slice
-    mask_mm.flush()
+    flush_array(mask_mm)
 
     if isinstance(bridge_mm, np.memmap):
-        bridge_mm.flush()
+        flush_array(bridge_mm)
     del bridge_mm
     if isinstance(labels_mm, np.memmap):
-        labels_mm.flush()
+        flush_array(labels_mm)
     del labels_mm
     if not keep_temp:
         for p in label_paths:
@@ -3769,6 +4145,195 @@ def interpolate_view_volume_pass_inplace(
         'added_voxels': int(added_voxels),
         'skipped': False,
     }
+
+
+def _copy_volume_to_oriented_memmap(
+    src_volume_mm: np.ndarray,
+    orientation: str,
+    out_path: Path,
+    *,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 16 * GIB,
+) -> np.ndarray:
+    """Copy a Cartesian (T,H,W) volume into an oriented stack for slice-direction interpolation."""
+    t_dim, h_dim, w_dim = src_volume_mm.shape
+
+    if orientation == 'sagittal':
+        oriented_mm = allocate_workspace_array(
+            shape=(h_dim, t_dim, w_dim),
+            dtype=np.uint8,
+            path=out_path,
+            desc=f'Cartesian->{orientation} interpolation workspace',
+            prefer_memory=bool(prefer_memory),
+            reserve_bytes=int(reserve_bytes),
+        )
+        for y in tqdm(range(h_dim), desc=f'Copy radial volume -> {orientation}'):
+            oriented_mm[y, :, :] = np.asarray(src_volume_mm[:, y, :], dtype=np.uint8)
+    elif orientation == 'coronal':
+        oriented_mm = allocate_workspace_array(
+            shape=(w_dim, t_dim, h_dim),
+            dtype=np.uint8,
+            path=out_path,
+            desc=f'Cartesian->{orientation} interpolation workspace',
+            prefer_memory=bool(prefer_memory),
+            reserve_bytes=int(reserve_bytes),
+        )
+        for x in tqdm(range(w_dim), desc=f'Copy radial volume -> {orientation}'):
+            oriented_mm[x, :, :] = np.asarray(src_volume_mm[:, :, x], dtype=np.uint8)
+    else:  # pragma: no cover
+        raise ValueError(f'Unsupported orientation for radial interpolation: {orientation}')
+
+    flush_array(oriented_mm)
+    return oriented_mm
+
+
+def _merge_added_oriented_volume_into_bridge_union(
+    src_volume_mm: np.ndarray,
+    oriented_mm: np.ndarray,
+    orientation: str,
+    bridge_union_mm: np.ndarray,
+) -> None:
+    """Collect only newly added voxels from an oriented interpolation run back into Cartesian space."""
+    t_dim, h_dim, w_dim = src_volume_mm.shape
+
+    if orientation == 'sagittal':
+        for y in tqdm(range(h_dim), desc=f'Collect radial {orientation} bridges'):
+            src_slice = np.asarray(src_volume_mm[:, y, :], dtype=np.uint8)
+            out_slice = np.asarray(oriented_mm[y], dtype=np.uint8)
+            added = (out_slice > 0) & (src_slice == 0)
+            if np.any(added):
+                bridge_union_mm[:, y, :] |= added.astype(np.uint8, copy=False)
+    elif orientation == 'coronal':
+        for x in tqdm(range(w_dim), desc=f'Collect radial {orientation} bridges'):
+            src_slice = np.asarray(src_volume_mm[:, :, x], dtype=np.uint8)
+            out_slice = np.asarray(oriented_mm[x], dtype=np.uint8)
+            added = (out_slice > 0) & (src_slice == 0)
+            if np.any(added):
+                bridge_union_mm[:, :, x] |= added.astype(np.uint8, copy=False)
+    else:  # pragma: no cover
+        raise ValueError(f'Unsupported orientation for radial interpolation: {orientation}')
+
+
+def interpolate_radial_view_pass_inplace(
+    mask_mm: np.ndarray,
+    work_dir: Path,
+    pass_tag: str,
+    max_slice_distance: int,
+    search_angle_deg: float,
+    interpolation_walk_back: int,
+    interpolation_candidates: int,
+    interpolate_min_radius: float,
+    keep_temp: bool = False,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 16 * GIB,
+) -> Dict[str, object]:
+    """Interpolate a radial backprojection in Cartesian sagittal and coronal directions simultaneously."""
+    if int(max_slice_distance) <= 0:
+        return {
+            'num_objects': 0,
+            'num_endpoints': 0,
+            'candidate_connections': 0,
+            'accepted_connections': 0,
+            'default_bridges': 0,
+            'walk_back_bridges': 0,
+            'skipped_by_min_radius': 0,
+            'added_voxels': 0,
+            'direction_modes': 'sagittal+coronal',
+            'skipped': True,
+        }
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    bridge_union_bytes = int(np.prod(mask_mm.shape, dtype=np.int64)) * np.dtype(np.uint8).itemsize
+    use_in_memory = bool(prefer_memory) and should_use_in_memory_workspace(bridge_union_bytes, reserve_bytes=reserve_bytes)
+    budget = workspace_budget_summary(bridge_union_bytes, reserve_bytes=reserve_bytes)
+    if use_in_memory:
+        print(f"Radial Cartesian interpolation bridge union ({pass_tag}): in-memory ({budget})")
+        bridge_union_mm: np.ndarray = np.zeros(mask_mm.shape, dtype=np.uint8)
+        bridge_union_path: Optional[Path] = None
+    else:
+        bridge_union_path = work_dir / f'{pass_tag}_radial_bridge_union.u8.dat'
+        print(f"Radial Cartesian interpolation bridge union ({pass_tag}): disk-backed ({budget}) -> {bridge_union_path.parent}")
+        bridge_union_mm = np.memmap(bridge_union_path, dtype=np.uint8, mode='w+', shape=mask_mm.shape)
+
+    directional_stats: List[Tuple[str, Dict[str, object]]] = []
+    try:
+        for orientation in ('sagittal', 'coronal'):
+            oriented_path = work_dir / f'{pass_tag}_{orientation}.u8.dat'
+            oriented_mm = _copy_volume_to_oriented_memmap(
+                mask_mm,
+                orientation,
+                oriented_path,
+                prefer_memory=bool(prefer_memory),
+                reserve_bytes=int(reserve_bytes),
+            )
+            try:
+                stats = interpolate_view_volume_pass_inplace(
+                    mask_mm=oriented_mm,
+                    work_dir=work_dir / orientation,
+                    pass_tag=f'{pass_tag}_{orientation}',
+                    max_slice_distance=int(max_slice_distance),
+                    search_angle_deg=float(search_angle_deg),
+                    interpolation_walk_back=int(interpolation_walk_back),
+                    interpolation_candidates=int(interpolation_candidates),
+                    interpolate_min_radius=float(interpolate_min_radius),
+                    keep_temp=bool(keep_temp),
+                    prefer_memory=bool(prefer_memory),
+                    reserve_bytes=int(reserve_bytes),
+                )
+                directional_stats.append((orientation, dict(stats)))
+                _merge_added_oriented_volume_into_bridge_union(mask_mm, oriented_mm, orientation, bridge_union_mm)
+            finally:
+                close_memmap_array(oriented_mm)
+                del oriented_mm
+                if not keep_temp:
+                    try:
+                        oriented_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+        for t in tqdm(range(mask_mm.shape[0]), desc='Interpolation: merge radial sagittal/coronal bridges'):
+            bridge_slice = np.asarray(bridge_union_mm[t])
+            if np.any(bridge_slice):
+                mask_mm[t, :, :] |= bridge_slice
+        flush_array(mask_mm)
+
+        if directional_stats:
+            aggregated: Dict[str, object] = {
+                'num_objects': int(max(int(s.get('num_objects', 0)) for _, s in directional_stats)),
+                'num_endpoints': int(sum(int(s.get('num_endpoints', 0)) for _, s in directional_stats)),
+                'candidate_connections': int(sum(int(s.get('candidate_connections', 0)) for _, s in directional_stats)),
+                'accepted_connections': int(sum(int(s.get('accepted_connections', 0)) for _, s in directional_stats)),
+                'default_bridges': int(sum(int(s.get('default_bridges', 0)) for _, s in directional_stats)),
+                'walk_back_bridges': int(sum(int(s.get('walk_back_bridges', 0)) for _, s in directional_stats)),
+                'skipped_by_min_radius': int(sum(int(s.get('skipped_by_min_radius', 0)) for _, s in directional_stats)),
+                'added_voxels': int(sum(int(s.get('added_voxels', 0)) for _, s in directional_stats)),
+                'direction_modes': 'sagittal+coronal',
+                'skipped': bool(all(bool(s.get('skipped', False)) for _, s in directional_stats)),
+            }
+        else:
+            aggregated = {
+                'num_objects': 0,
+                'num_endpoints': 0,
+                'candidate_connections': 0,
+                'accepted_connections': 0,
+                'default_bridges': 0,
+                'walk_back_bridges': 0,
+                'skipped_by_min_radius': 0,
+                'added_voxels': 0,
+                'direction_modes': 'sagittal+coronal',
+                'skipped': True,
+            }
+
+        return aggregated
+    finally:
+        close_memmap_array(bridge_union_mm)
+        del bridge_union_mm
+        if bridge_union_path is not None and not keep_temp:
+            try:
+                bridge_union_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 # --------------------------
@@ -4327,6 +4892,8 @@ def write_summary_file(
     interpolation_stats: List[Dict[str, object]],
     voxel_volume: Optional[int],
     final_paths: Dict[str, Path],
+    augmentation_workers: int,
+    interpolation_workers: int,
 ) -> Path:
     lines: List[str] = []
     lines.append(f'Command: {command}')
@@ -4335,6 +4902,9 @@ def write_summary_file(
     lines.append(f'Volume shape (t, Y, X): {volume_shape}')
     lines.append(f'FPS: {fps}')
     lines.append(f'Scratch directory: {scratch_dir}')
+    lines.append('Workspace policy: in-memory first with disk fallback when the working set exceeds available RAM/swap')
+    lines.append(f'Augmentation workers: {int(augmentation_workers)}')
+    lines.append(f'Interpolation workers: {int(interpolation_workers)}')
     lines.append(f'Models: {", ".join(str(Path(m)) for m in model_paths)}')
     lines.append(f'Views: {", ".join(view_names)}')
 
@@ -4368,6 +4938,9 @@ def write_summary_file(
                 f'bridges_skipped_by_--interpolate_min_radius={total_skipped}, added_voxels={total_added_voxels}'
             )
             for s in sorted(stats_this_pass, key=lambda d: (str(d.get('model', '')), str(d.get('view', '')))):
+                mode_suffix = ''
+                if s.get('direction_modes'):
+                    mode_suffix = f", direction_modes={s.get('direction_modes')}"
                 lines.append(
                     f"    {s.get('model', '?')}/{s.get('view', '?')}: "
                     f"objects={int(s.get('num_objects', 0))}, "
@@ -4378,7 +4951,7 @@ def write_summary_file(
                     f"walk_back_bridges={int(s.get('walk_back_bridges', 0))}, "
                     f"bridges_skipped_by_--interpolate_min_radius={int(s.get('skipped_by_min_radius', 0))}, "
                     f"added_voxels={int(s.get('added_voxels', 0))}, "
-                    f"skipped={bool(s.get('skipped', False))}"
+                    f"skipped={bool(s.get('skipped', False))}{mode_suffix}"
                 )
 
     if voxel_volume is not None:
@@ -4455,6 +5028,7 @@ def main() -> None:
         width=W,
         height=H,
         overwrite=False,
+        prefer_memory=True,
     )
     (temp_dir / 'input_volume.meta.json').write_text(
         json.dumps({'shape': [T, H, W, 3], 'dtype': 'uint8', 'fps': fps}, indent=2)
@@ -4495,7 +5069,28 @@ def main() -> None:
         int8=bool(args.int8),
     )
 
-    view_volumes_by_model: Dict[str, Dict[str, np.memmap]] = {model_name: {} for model_name, _ in yolo_models}
+    augmentation_workers = resolve_worker_count(
+        int(args.augmentation_workers),
+        'YOLO_TTA_AUG_WORKERS',
+        default_augmentation_workers(),
+        max_tasks=max(1, max(v.num_slices for v in views)),
+    )
+    interpolation_workers = resolve_worker_count(
+        int(args.interpolation_workers),
+        'YOLO_TTA_INTERPOLATION_WORKERS',
+        default_interpolation_workers(),
+        max_tasks=max(1, len(yolo_models) * len(views)),
+    )
+    print(f'Augmentation workers: {augmentation_workers}')
+    print(f'Interpolation workers: {interpolation_workers}')
+
+    if augmentation_workers > 1 or interpolation_workers > 1:
+        try:
+            cv2.setNumThreads(1)
+        except Exception:
+            pass
+
+    view_volumes_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
     view_prediction_stats: Dict[str, int] = {
         'transverse': 0,
         'sagittal': 0,
@@ -4509,8 +5104,8 @@ def main() -> None:
             extra = f', azimuths={view.num_slices}'
         print(f"\n=== View: {view.name} ({view.src_w}x{view.src_h}, slices={view.num_slices}{extra}) ===")
 
-        union_by_model_view: Dict[str, np.memmap] = {}
-        confmap_by_model_view: Dict[str, np.memmap] = {}
+        union_by_model_view: Dict[str, np.ndarray] = {}
+        confmap_by_model_view: Dict[str, np.ndarray] = {}
         union_paths: Dict[str, Path] = {}
         confmap_paths: Dict[str, Path] = {}
 
@@ -4520,8 +5115,20 @@ def main() -> None:
             confmap_path = temp_dir / 'union' / model_name / f'{view.name}.confmap.f16.dat'
             union_path.parent.mkdir(parents=True, exist_ok=True)
 
-            union_mm = np.memmap(union_path, dtype=np.uint8, mode='w+', shape=(view.num_slices, bytes_native))
-            confmap_mm = np.memmap(confmap_path, dtype=np.float16, mode='w+', shape=(view.num_slices, view.src_h, view.src_w))
+            union_mm = allocate_workspace_array(
+                shape=(view.num_slices, bytes_native),
+                dtype=np.uint8,
+                path=union_path,
+                desc=f'{model_name}/{view.name} union workspace',
+                prefer_memory=True,
+            )
+            confmap_mm = allocate_workspace_array(
+                shape=(view.num_slices, view.src_h, view.src_w),
+                dtype=np.float16,
+                path=confmap_path,
+                desc=f'{model_name}/{view.name} confidence workspace',
+                prefer_memory=True,
+            )
 
             union_by_model_view[model_name] = union_mm
             confmap_by_model_view[model_name] = confmap_mm
@@ -4536,52 +5143,19 @@ def main() -> None:
             temp_dir=temp_dir,
         )
 
-        if view.family == 'radial':
-            ensure_radial_augmented_videos(
-                volume_rgb=volume_rgb,
-                view=view,
-                aug_jobs=aug_jobs,
-                fps=fps,
-            )
+        ensure_augmented_videos(
+            volume_rgb=volume_rgb,
+            view=view,
+            aug_jobs=aug_jobs,
+            fps=fps,
+            augmentation_workers=augmentation_workers,
+        )
 
         for job in aug_jobs:
             aug_id = job.aug_id
             aug_video = job.video_path
             aug_meta = job.meta_path
             aff = job.aff
-
-            if view.family != 'radial' and not aug_video.exists():
-                aug_video.parent.mkdir(parents=True, exist_ok=True)
-                writer = ffmpeg_rawvideo_writer(
-                    aug_video,
-                    width=args.imgsz,
-                    height=args.imgsz,
-                    fps=fps,
-                    pix_fmt_in='rgb24',
-                    codec='ffv1',
-                    pix_fmt_out='yuv444p',
-                )
-                try:
-                    assert writer.stdin is not None
-                    for frame in tqdm(
-                        iter_view_frames(volume_rgb, view),
-                        total=view.num_slices,
-                        desc=f'Augment {view.name} {aug_id}',
-                    ):
-                        out = cv2.warpAffine(
-                            frame,
-                            aff.M_src_to_out,
-                            dsize=(args.imgsz, args.imgsz),
-                            flags=cv2.INTER_LINEAR,
-                            borderMode=cv2.BORDER_CONSTANT,
-                            borderValue=(0, 0, 0),
-                        )
-                        writer.stdin.write(out.tobytes())
-                finally:
-                    close_ffmpeg_writer(writer)
-
-                if not aug_meta.exists():
-                    write_aug_job_meta(job, view)
 
             for model_name, yolo in yolo_models:
                 pred_prefix = temp_dir / 'preds' / model_name / view.name / f'{view.name}_{aug_id}'
@@ -4617,11 +5191,11 @@ def main() -> None:
                     view.src_h,
                     view.src_w,
                 )
-                union_by_model_view[model_name].flush()
-                confmap_by_model_view[model_name].flush()
+                flush_array(union_by_model_view[model_name])
+                flush_array(confmap_by_model_view[model_name])
 
             fill_2d_holes_inplace(union_by_model_view[model_name], view.src_h, view.src_w)
-            union_by_model_view[model_name].flush()
+            flush_array(union_by_model_view[model_name])
 
             out_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.u8.dat'
             if view.family == 'radial':
@@ -4630,6 +5204,7 @@ def main() -> None:
                     radial_view=view,
                     out_path=out_path,
                     desc=f'Backprojecting {model_name}/{view.name}',
+                    prefer_memory=True,
                 )
             else:
                 view_volumes_by_model[model_name][view.name] = unpack_view_union_to_volume(
@@ -4639,6 +5214,14 @@ def main() -> None:
                     w=view.src_w,
                     out_path=out_path,
                     desc=f'Unpacking {model_name}/{view.name}',
+                    prefer_memory=True,
+                )
+
+            if float(args.min_radius) > 0:
+                apply_view_min_radius_filter_inplace(
+                    view_volumes_by_model[model_name][view.name],
+                    view,
+                    float(args.min_radius),
                 )
 
             confmap_mm_done = confmap_by_model_view.pop(model_name, None)
@@ -4663,7 +5246,7 @@ def main() -> None:
 
     gc.collect()
 
-    def build_current_finalized_volume(snapshot_stem: str) -> np.memmap:
+    def build_current_finalized_volume(snapshot_stem: str) -> np.ndarray:
         ensemble_mm = assemble_current_ensemble_volume(
             view_volumes_by_model=view_volumes_by_model,
             T=T,
@@ -4671,6 +5254,7 @@ def main() -> None:
             W=W,
             disable_multiplanar=bool(args.disable_multiplanar),
             out_path=temp_dir / f'{snapshot_stem}.u8.dat',
+            prefer_memory=True,
         )
         fill_3d_voids_inplace_streaming(
             ensemble_mm,
@@ -4678,8 +5262,6 @@ def main() -> None:
             keep_temp=bool(args.troubleshooting),
             prefer_memory=True,
         )
-        if float(args.min_radius) > 0:
-            apply_transverse_min_radius_filter_inplace(ensemble_mm, float(args.min_radius))
         return ensemble_mm
 
     interpolation_stats: List[Dict[str, object]] = []
@@ -4723,11 +5305,31 @@ def main() -> None:
                 f"min_radius={float(args.interpolate_min_radius):g}, "
                 f"search_angle={float(args.interpolation_search_angle):g}) ==="
             )
-            for model_name in sorted(view_volumes_by_model.keys()):
-                for view in cartesian_views:
-                    print(f"\n--- Interpolating model '{model_name}' view '{view.name}' ---")
-                    current_mm = view_volumes_by_model[model_name][view.name]
-                    stats = interpolate_view_volume_pass_inplace(
+            task_specs: List[Tuple[str, ViewInfo]] = [
+                (model_name, view)
+                for model_name in sorted(view_volumes_by_model.keys())
+                for view in views
+            ]
+
+            def _run_interpolation_task(task_index: int) -> Dict[str, object]:
+                model_name, view = task_specs[int(task_index)]
+                print(f"\n--- Interpolating model '{model_name}' view '{view.name}' ---")
+                current_mm = view_volumes_by_model[model_name][view.name]
+                if view.family == 'radial':
+                    stats_local = interpolate_radial_view_pass_inplace(
+                        mask_mm=current_mm,
+                        work_dir=temp_dir / 'interpolation' / model_name / view.name,
+                        pass_tag=f'pass{pass_idx}',
+                        max_slice_distance=int(args.interpolate),
+                        search_angle_deg=float(args.interpolation_search_angle),
+                        interpolation_walk_back=int(args.interpolation_walk_back),
+                        interpolation_candidates=int(args.interpolation_candidates),
+                        interpolate_min_radius=float(args.interpolate_min_radius),
+                        keep_temp=bool(args.troubleshooting),
+                        prefer_memory=True,
+                    )
+                else:
+                    stats_local = interpolate_view_volume_pass_inplace(
                         mask_mm=current_mm,
                         work_dir=temp_dir / 'interpolation' / model_name / view.name,
                         pass_tag=f'pass{pass_idx}',
@@ -4740,17 +5342,29 @@ def main() -> None:
                         prefer_memory=True,
                     )
 
-                    stats = dict(stats)
-                    stats.update({
-                        'pass_index': int(pass_idx),
-                        'model': str(model_name),
-                        'view': str(view.name),
-                        'max_slice_distance': int(args.interpolate),
-                        'interpolation_walk_back': int(args.interpolation_walk_back),
-                        'interpolation_candidates': int(args.interpolation_candidates),
-                        'interpolation_search_angle': float(args.interpolation_search_angle),
-                    })
-                    interpolation_stats.append(stats)
+                stats_local = dict(stats_local)
+                stats_local.update({
+                    'pass_index': int(pass_idx),
+                    'model': str(model_name),
+                    'view': str(view.name),
+                    'max_slice_distance': int(args.interpolate),
+                    'interpolation_walk_back': int(args.interpolation_walk_back),
+                    'interpolation_candidates': int(args.interpolation_candidates),
+                    'interpolation_search_angle': float(args.interpolation_search_angle),
+                })
+                return stats_local
+
+            if interpolation_workers > 1 and len(task_specs) > 1:
+                for stats in parallel_map_in_order(
+                    _run_interpolation_task,
+                    range(len(task_specs)),
+                    max_workers=min(interpolation_workers, len(task_specs)),
+                    max_pending=min(interpolation_workers, len(task_specs)),
+                ):
+                    interpolation_stats.append(dict(stats))
+            else:
+                for task_idx in range(len(task_specs)):
+                    interpolation_stats.append(_run_interpolation_task(task_idx))
 
             if bool(args.troubleshooting) and pass_idx < total_passes:
                 print(f"\n=== Writing troubleshooting outputs: pass {pass_idx} ===")
@@ -4782,8 +5396,8 @@ def main() -> None:
                 gc.collect()
     else:
         for model_name in sorted(view_volumes_by_model.keys()):
-            for view in cartesian_views:
-                interpolation_stats.append({
+            for view in views:
+                entry: Dict[str, object] = {
                     'pass_index': 0,
                     'model': str(model_name),
                     'view': str(view.name),
@@ -4800,7 +5414,10 @@ def main() -> None:
                     'skipped_by_min_radius': 0,
                     'added_voxels': 0,
                     'skipped': True,
-                })
+                }
+                if view.family == 'radial':
+                    entry['direction_modes'] = 'sagittal+coronal'
+                interpolation_stats.append(entry)
 
     final_ensemble_mm = assemble_current_ensemble_volume(
         view_volumes_by_model=view_volumes_by_model,
@@ -4809,6 +5426,7 @@ def main() -> None:
         W=W,
         disable_multiplanar=bool(args.disable_multiplanar),
         out_path=temp_dir / 'ensemble_volume_final.u8.dat',
+        prefer_memory=True,
     )
 
     print('\n=== 3D void fill after multiplanar/model union ===')
@@ -4818,9 +5436,6 @@ def main() -> None:
         keep_temp=bool(args.troubleshooting),
         prefer_memory=True,
     )
-    if float(args.min_radius) > 0:
-        apply_transverse_min_radius_filter_inplace(final_ensemble_mm, float(args.min_radius))
-
     final_paths = write_pipeline_outputs(
         volume_rgb=volume_rgb,
         mask_u8=final_ensemble_mm,
@@ -4864,6 +5479,8 @@ def main() -> None:
         interpolation_stats=interpolation_stats,
         voxel_volume=voxel_volume,
         final_paths=final_paths,
+        augmentation_workers=augmentation_workers,
+        interpolation_workers=interpolation_workers,
     )
 
     close_memmap_array(final_ensemble_mm)
