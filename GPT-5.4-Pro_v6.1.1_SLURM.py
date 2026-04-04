@@ -10,7 +10,7 @@ This v6.1.0 specification-aligned script:
   - fills 2D holes after per-frame unions, interpolates active orthogonal views in their native slice direction, and interpolates the radial backprojection in both Cartesian sagittal and coronal directions before the final multiplanar / multi-model union
   - fills enclosed 3D voids with a streamed boundary-background pass and applies --min_radius in the transverse plane before interpolation
   - prefers in-memory workspaces on the SLURM target and falls back to disk-backed scratch only when the working set is too large
-  - parallelizes augmentation generation across independent slices and interpolation across independent view/model volumes
+  - parallelizes augmentation generation across independent slices, overlaps in-memory augmentation staging with ordered video writes, parallelizes slice-independent postprocessing, and parallelizes interpolation across independent view/model volumes
   - extracts radial diameter slices with exact Lanczos-5 interpolation by default
 
 Dependencies (Python):
@@ -34,7 +34,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 GIB = 1024 ** 3
@@ -358,17 +359,42 @@ def parallel_map_in_order(
             yield fut.result()
 
 
+def parallel_for_indices(
+    count: int,
+    func: Callable[[int], None],
+    *,
+    max_workers: int,
+    desc: str,
+) -> None:
+    total = max(0, int(count))
+    if total <= 0:
+        return
+
+    workers = max(1, min(int(max_workers), total))
+    if workers <= 1:
+        for idx in tqdm(range(total), desc=desc):
+            func(int(idx))
+        return
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(func, int(idx)) for idx in range(total)]
+        with tqdm(total=total, desc=desc) as pbar:
+            for fut in as_completed(futures):
+                fut.result()
+                pbar.update(1)
+
+
 def workspace_anon_cap_bytes() -> int:
     """Return the soft cap for anonymous in-memory workspaces.
 
     The v6.1.0 target system has large RAM+ZRAM capacity, so the default policy now prefers
     a capacity-relative cap instead of a small fixed hard limit:
       - YOLO_TTA_MAX_ANON_WORKSPACE_GIB: hard GiB cap (default 0 = disabled)
-      - YOLO_TTA_MAX_ANON_WORKSPACE_FRACTION: fraction of total RAM+swap (default 0.25)
+      - YOLO_TTA_MAX_ANON_WORKSPACE_FRACTION: fraction of total RAM+swap (default 0.50)
     The lower non-zero cap wins.
     """
     hard_cap_gib = max(0.0, _env_float('YOLO_TTA_MAX_ANON_WORKSPACE_GIB', 0.0))
-    fraction = max(0.0, _env_float('YOLO_TTA_MAX_ANON_WORKSPACE_FRACTION', 0.25))
+    fraction = max(0.0, _env_float('YOLO_TTA_MAX_ANON_WORKSPACE_FRACTION', 0.50))
 
     hard_cap = int(hard_cap_gib * GIB)
     total_cap = int(total_anon_capacity_bytes() * fraction) if fraction > 0.0 else 0
@@ -404,6 +430,58 @@ def should_use_in_memory_workspace(required_bytes: int, reserve_bytes: int = 16 
     if cap > 0 and int(required_bytes) > cap:
         return False
     return avail >= int(required_bytes) + reserve
+
+
+def augmentation_staging_cap_bytes() -> int:
+    hard_cap_gib = max(0.0, _env_float('YOLO_TTA_MAX_AUG_STAGING_GIB', 0.0))
+    fraction = max(0.0, _env_float('YOLO_TTA_MAX_AUG_STAGING_FRACTION', 0.75))
+
+    hard_cap = int(hard_cap_gib * GIB)
+    total_cap = int(total_anon_capacity_bytes() * fraction) if fraction > 0.0 else 0
+
+    caps = [v for v in (hard_cap, total_cap) if int(v) > 0]
+    if not caps:
+        return 0
+    return int(min(caps))
+
+
+def augmentation_staging_budget_summary(required_bytes: int, reserve_bytes: int = 64 * GIB) -> str:
+    avail = available_anon_work_bytes()
+    cap = augmentation_staging_cap_bytes()
+    reserve = int(max(0, reserve_bytes))
+    parts = [
+        f'need={required_bytes / GIB:.1f} GiB',
+        f'avail+swap={avail / GIB:.1f} GiB',
+        f'reserve={reserve / GIB:.1f} GiB',
+    ]
+    if cap > 0:
+        parts.append(f'aug-staging-cap={cap / GIB:.1f} GiB')
+    return ', '.join(parts)
+
+
+def should_use_in_memory_augmentation_staging(required_bytes: int, reserve_bytes: int = 64 * GIB) -> bool:
+    if int(required_bytes) <= 0:
+        return False
+
+    avail = available_anon_work_bytes()
+    reserve = int(max(0, reserve_bytes))
+    cap = augmentation_staging_cap_bytes()
+
+    if cap > 0 and int(required_bytes) > cap:
+        return False
+    return avail >= int(required_bytes) + reserve
+
+
+def estimate_augmented_view_staging_bytes(num_slices: int, out_size: int, num_jobs: int) -> int:
+    return array_nbytes((int(num_jobs), int(num_slices), int(out_size), int(out_size), 3), np.uint8)
+
+
+def choose_slice_parallel_workers(requested_workers: int, num_items: int) -> int:
+    return max(1, min(int(requested_workers), int(max(1, num_items))))
+
+
+def choose_augmentation_writer_workers(num_jobs: int) -> int:
+    return max(1, int(num_jobs))
 
 
 def choose_scratch_dir(preferred: Optional[str], out_dir: Path, stem: str) -> Path:
@@ -1008,11 +1086,38 @@ def sample_radial_line_rgb_lanczos5(frame_rgb: np.ndarray, sampler: RadialSample
     return np.clip(np.rint(out), 0.0, 255.0).astype(np.uint8)
 
 
-def extract_radial_slice_frame(volume_rgb: np.memmap, sampler: RadialSampler) -> np.ndarray:
+def choose_radial_exact_block_frames(diameter: int, target_bytes: int = 256 * 1024 * 1024) -> int:
+    env = os.environ.get('YOLO_TTA_RADIAL_EXACT_BLOCK_FRAMES', '').strip()
+    if env:
+        try:
+            return max(1, int(env))
+        except Exception:
+            pass
+
+    bytes_per_frame = max(1, int(diameter) * 10 * 3 * np.dtype(np.float32).itemsize)
+    block = max(1, int(target_bytes // bytes_per_frame))
+    return max(1, min(256, block))
+
+
+
+def extract_radial_slice_frame(volume_rgb: np.ndarray, sampler: RadialSampler) -> np.ndarray:
     t_dim = int(volume_rgb.shape[0])
     out = np.empty((t_dim, sampler.diameter, 3), dtype=np.uint8)
-    for t in range(t_dim):
-        out[t, :, :] = sample_radial_line_rgb_lanczos5(np.asarray(volume_rgb[t]), sampler)
+
+    x_w = np.asarray(sampler.x_w, dtype=np.float32)[None, :, :, None]
+    y_w = np.asarray(sampler.y_w, dtype=np.float32)
+    block_frames = choose_radial_exact_block_frames(sampler.diameter)
+
+    for start in range(0, t_dim, block_frames):
+        stop = min(t_dim, start + block_frames)
+        block = np.asarray(volume_rgb[start:stop])
+        acc = np.zeros((stop - start, sampler.diameter, 3), dtype=np.float32)
+        for yi in range(sampler.y_idx.shape[1]):
+            samples = block[:, sampler.y_idx[:, yi][:, None], sampler.x_idx, :].astype(np.float32, copy=False)
+            row = np.sum(samples * x_w, axis=2)
+            acc += row * y_w[:, yi][None, :, None]
+        out[start:stop, :, :] = np.clip(np.rint(acc), 0.0, 255.0).astype(np.uint8)
+
     return out
 
 
@@ -1312,30 +1417,148 @@ def _render_augmented_bundle_for_index(volume_rgb: np.ndarray, view: ViewInfo, j
     return bundle
 
 
-def ensure_augmented_videos(
+def _write_augmented_video_from_stage(
+    job: AugJob,
+    staged_frames: np.ndarray,
+    ready_flags: np.ndarray,
+    ready_cond: threading.Condition,
+    stop_event: threading.Event,
+    fps: float,
+    num_slices: int,
+) -> None:
+    proc: Optional[subprocess.Popen] = None
+    caught: Optional[BaseException] = None
+
+    try:
+        proc = ffmpeg_rawvideo_writer(
+            job.video_path,
+            width=int(job.aff.out_size),
+            height=int(job.aff.out_size),
+            fps=fps,
+            pix_fmt_in='rgb24',
+            codec='ffv1',
+            pix_fmt_out='yuv444p',
+        )
+        assert proc.stdin is not None
+
+        for idx in range(int(num_slices)):
+            with ready_cond:
+                while not bool(ready_flags[idx]) and not stop_event.is_set():
+                    ready_cond.wait()
+                if stop_event.is_set() and not bool(ready_flags[idx]):
+                    return
+            proc.stdin.write(np.ascontiguousarray(staged_frames[idx]).tobytes())
+    except BaseException as exc:  # pragma: no cover - propagated through the future result path
+        caught = exc
+    finally:
+        if proc is not None:
+            try:
+                close_ffmpeg_writer(proc)
+            except BaseException as exc:  # pragma: no cover - propagated through the future result path
+                if caught is None:
+                    caught = exc
+        if caught is not None:
+            stop_event.set()
+            with ready_cond:
+                ready_cond.notify_all()
+            raise caught
+
+
+
+def _ensure_augmented_videos_with_staging(
     volume_rgb: np.ndarray,
     view: ViewInfo,
-    aug_jobs: Sequence[AugJob],
+    missing_jobs: Sequence[AugJob],
     fps: float,
-    augmentation_workers: int,
-) -> None:
-    missing_jobs = [job for job in aug_jobs if not job.video_path.exists()]
-    for job in aug_jobs:
-        if not job.meta_path.exists():
-            write_aug_job_meta(job, view)
-
+    worker_count: int,
+) -> bool:
     if not missing_jobs:
-        return
+        return True
 
-    worker_count = max(1, min(int(augmentation_workers), int(view.num_slices)))
-    mode_suffix = ''
-    if view.family == 'radial':
-        mode_suffix = ' [OpenCV remap fast path]' if radial_fast_path_enabled() else ' [exact Lanczos-5]'
-    print(
-        f"Generating {len(missing_jobs)} augmented {view.name} video(s) over {view.num_slices} slice(s) "
-        f"with {worker_count} worker thread(s){mode_suffix}"
-    )
+    out_size = int(missing_jobs[0].aff.out_size)
+    stage_bytes = estimate_augmented_view_staging_bytes(view.num_slices, out_size, len(missing_jobs))
+    budget = augmentation_staging_budget_summary(stage_bytes)
+    if not should_use_in_memory_augmentation_staging(stage_bytes):
+        print(f'Augmentation staging disabled for {view.name}: {budget}')
+        return False
 
+    print(f'Augmentation staging for {view.name}: in-memory ({budget})')
+    staged_frames: Dict[str, np.ndarray] = {}
+    try:
+        for job in missing_jobs:
+            staged_frames[job.aug_id] = np.empty((int(view.num_slices), out_size, out_size, 3), dtype=np.uint8)
+    except MemoryError:
+        staged_frames.clear()
+        gc.collect()
+        print(f'Augmentation staging allocation failed for {view.name}; falling back to streaming writers')
+        return False
+
+    ready_flags = np.zeros((int(view.num_slices),), dtype=np.uint8)
+    ready_cond = threading.Condition()
+    stop_event = threading.Event()
+    writer_workers = choose_augmentation_writer_workers(len(missing_jobs))
+
+    for job in missing_jobs:
+        job.video_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def render_index(idx: int) -> None:
+        if stop_event.is_set():
+            return
+        bundle = _render_augmented_bundle_for_index(volume_rgb, view, missing_jobs, int(idx))
+        for job, out in zip(missing_jobs, bundle):
+            staged_frames[job.aug_id][int(idx), :, :, :] = np.ascontiguousarray(out)
+        with ready_cond:
+            ready_flags[int(idx)] = 1
+            ready_cond.notify_all()
+
+    try:
+        with ThreadPoolExecutor(max_workers=writer_workers) as writer_pool:
+            writer_futures = [
+                writer_pool.submit(
+                    _write_augmented_video_from_stage,
+                    job,
+                    staged_frames[job.aug_id],
+                    ready_flags,
+                    ready_cond,
+                    stop_event,
+                    fps,
+                    int(view.num_slices),
+                )
+                for job in missing_jobs
+            ]
+
+            try:
+                parallel_for_indices(
+                    int(view.num_slices),
+                    render_index,
+                    max_workers=worker_count,
+                    desc=f'Augment {view.name} -> {len(missing_jobs)} video(s) [staged]',
+                )
+            except BaseException:
+                stop_event.set()
+                with ready_cond:
+                    ready_cond.notify_all()
+                raise
+            finally:
+                with ready_cond:
+                    ready_cond.notify_all()
+
+            for fut in writer_futures:
+                fut.result()
+        return True
+    finally:
+        staged_frames.clear()
+        gc.collect()
+
+
+
+def _ensure_augmented_videos_streaming(
+    volume_rgb: np.ndarray,
+    view: ViewInfo,
+    missing_jobs: Sequence[AugJob],
+    fps: float,
+    worker_count: int,
+) -> None:
     writers: Dict[str, subprocess.Popen] = {}
     try:
         for job in missing_jobs:
@@ -1351,10 +1574,11 @@ def ensure_augmented_videos(
             )
 
         render = lambda idx: _render_augmented_bundle_for_index(volume_rgb, view, missing_jobs, idx)
+        pending = min(int(view.num_slices), max(worker_count + 1, worker_count * 8))
         for bundle in tqdm(
-            parallel_map_in_order(render, range(view.num_slices), max_workers=worker_count, max_pending=worker_count + 1),
+            parallel_map_in_order(render, range(view.num_slices), max_workers=worker_count, max_pending=pending),
             total=view.num_slices,
-            desc=f'Augment {view.name} -> {len(missing_jobs)} video(s)',
+            desc=f'Augment {view.name} -> {len(missing_jobs)} video(s) [streaming]',
         ):
             for job, out in zip(missing_jobs, bundle):
                 writer = writers[job.aug_id]
@@ -1363,6 +1587,49 @@ def ensure_augmented_videos(
     finally:
         for writer in writers.values():
             close_ffmpeg_writer(writer)
+
+
+
+def ensure_augmented_videos(
+    volume_rgb: np.ndarray,
+    view: ViewInfo,
+    aug_jobs: Sequence[AugJob],
+    fps: float,
+    augmentation_workers: int,
+) -> None:
+    missing_jobs = [job for job in aug_jobs if not job.video_path.exists()]
+    for job in aug_jobs:
+        if not job.meta_path.exists():
+            write_aug_job_meta(job, view)
+
+    if not missing_jobs:
+        return
+
+    worker_count = choose_slice_parallel_workers(int(augmentation_workers), int(view.num_slices))
+    mode_suffix = ''
+    if view.family == 'radial':
+        mode_suffix = ' [OpenCV remap fast path]' if radial_fast_path_enabled() else ' [exact Lanczos-5]'
+    print(
+        f"Generating {len(missing_jobs)} augmented {view.name} video(s) over {view.num_slices} slice(s) "
+        f"with {worker_count} worker thread(s){mode_suffix}"
+    )
+
+    if _ensure_augmented_videos_with_staging(
+        volume_rgb=volume_rgb,
+        view=view,
+        missing_jobs=missing_jobs,
+        fps=fps,
+        worker_count=worker_count,
+    ):
+        return
+
+    _ensure_augmented_videos_streaming(
+        volume_rgb=volume_rgb,
+        view=view,
+        missing_jobs=missing_jobs,
+        fps=fps,
+        worker_count=worker_count,
+    )
 
 
 # --------------------------
@@ -1595,102 +1862,102 @@ def predict_video_and_accumulate(
 # --------------------------
 
 def apply_min_conf_filter_with_confmap_inplace(
-    union_mm: np.memmap,
-    confmap_mm: np.memmap,
+    union_mm: np.ndarray,
+    confmap_mm: np.ndarray,
     min_conf: float,
     h: int,
     w: int,
+    *,
+    workers: int = 1,
 ) -> None:
     """Remove native 2D connected components whose max confidence is below ``min_conf``.
 
     This matches the v5.0.1 rule to union overlapping masks and attach the highest confidence
     score of the combined mask, instead of using a single slice-wide score.
     """
-    n = union_mm.shape[0]
+    n = int(union_mm.shape[0])
     structure2 = np.ones((3, 3), dtype=bool)
 
-    for i in tqdm(range(n), desc='min_conf thresholding'):
-        packed = np.asarray(union_mm[i])
+    def _process(i: int) -> None:
+        packed = np.asarray(union_mm[int(i)])
         if not any_mask(packed):
-            confmap_mm[i, :, :] = np.float16(0.0)
-            continue
+            confmap_mm[int(i), :, :] = np.float16(0.0)
+            return
 
         union = unpack_mask(packed, h, w).astype(bool, copy=False)
         labels2d, num = ndi.label(union, structure=structure2)
         if int(num) <= 0:
-            union_mm[i, :] = 0
-            confmap_mm[i, :, :] = np.float16(0.0)
-            continue
+            union_mm[int(i), :] = 0
+            confmap_mm[int(i), :, :] = np.float16(0.0)
+            return
 
-        conf_slice = np.asarray(confmap_mm[i], dtype=np.float32)
+        conf_slice = np.asarray(confmap_mm[int(i)], dtype=np.float32)
         label_ids = np.arange(1, int(num) + 1, dtype=np.int32)
         maxima = ndi.maximum(conf_slice, labels=labels2d, index=label_ids)
         maxima = np.asarray(maxima, dtype=np.float32)
         keep_ids = label_ids[maxima >= float(min_conf)]
 
         if keep_ids.size == 0:
-            union_mm[i, :] = 0
-            confmap_mm[i, :, :] = np.float16(0.0)
-            continue
+            union_mm[int(i), :] = 0
+            confmap_mm[int(i), :, :] = np.float16(0.0)
+            return
 
         keep = np.isin(labels2d, keep_ids)
-        union_mm[i, :] = pack_mask(keep.astype(np.uint8, copy=False))
+        union_mm[int(i), :] = pack_mask(keep.astype(np.uint8, copy=False))
         conf_slice[~keep] = 0.0
-        confmap_mm[i, :, :] = conf_slice.astype(np.float16, copy=False)
+        confmap_mm[int(i), :, :] = conf_slice.astype(np.float16, copy=False)
+
+    parallel_for_indices(
+        n,
+        _process,
+        max_workers=choose_slice_parallel_workers(int(workers), n),
+        desc='min_conf thresholding',
+    )
 
 
-def fill_2d_holes_inplace(union_mm: np.memmap, h: int, w: int) -> None:
-    """Fill all 2D holes per slice (donut-hole fill).
+def fill_2d_holes_inplace(
+    union_mm: np.ndarray,
+    h: int,
+    w: int,
+    *,
+    workers: int = 1,
+) -> None:
+    """Fill all 2D holes per slice (donut-hole fill)."""
+    n = int(union_mm.shape[0])
 
-    NOTE:
-      We intentionally avoid scipy.ndimage.binary_fill_holes() here. On very large
-      slices (e.g., 3072x3072) and long runs, SciPy's implementation can create
-      large transient allocations and may destabilize the process depending on
-      the system / BLAS / OpenMP configuration.
-
-      This implementation uses an OpenCV flood-fill on the inverted mask with a
-      1-pixel constant-black border, which is robust and memory-stable:
-
-        holes = background components NOT connected to the padded image boundary
-        filled = mask OR holes
-    """
-    n = union_mm.shape[0]
-
-    # Preallocate scratch buffers (reduces allocator churn / fragmentation).
-    pad = np.zeros((h + 2, w + 2), dtype=np.uint8)          # 0/1 with a black border
-    inv = np.empty_like(pad)                                # 0/1 inverse of pad
-    flood = np.empty_like(pad)                              # working image for floodFill
-    ffmask = np.zeros((h + 4, w + 4), dtype=np.uint8)        # floodFill mask: (H+2, W+2)
-    holes = np.empty(pad.shape, dtype=np.bool_)              # boolean scratch
-
-    for i in tqdm(range(n), desc='2D hole fill'):
-        packed = np.asarray(union_mm[i])
+    def _process(i: int) -> None:
+        packed = np.asarray(union_mm[int(i)])
         if not any_mask(packed):
-            continue
+            return
 
-        m = unpack_mask(packed, h, w)  # uint8 {0,1}
+        pad = np.zeros((h + 2, w + 2), dtype=np.uint8)
+        inv = np.empty_like(pad)
+        flood = np.empty_like(pad)
+        ffmask = np.zeros((h + 4, w + 4), dtype=np.uint8)
+        holes = np.empty(pad.shape, dtype=np.bool_)
 
-        # Build padded mask
+        m = unpack_mask(packed, h, w)
         pad.fill(0)
         pad[1:-1, 1:-1] = m
-
-        # inv = 1 - pad (still {0,1})
         inv[:] = 1
         inv -= pad
 
-        # Flood-fill the outside background (connected to the padded boundary)
         flood[:] = inv
         ffmask.fill(0)
-        # New value=2 so we can distinguish "reached outside background" from "unreached holes" (=1)
         cv2.floodFill(flood, ffmask, seedPoint=(0, 0), newVal=2)
 
-        # Holes are inverse-background pixels still == 1 after flood fill
         np.equal(flood, 1, out=holes)
         if holes.any():
             pad[holes] = 1
 
-        filled = pad[1:-1, 1:-1]
-        union_mm[i, :] = pack_mask(filled)
+        union_mm[int(i), :] = pack_mask(pad[1:-1, 1:-1])
+
+    parallel_for_indices(
+        n,
+        _process,
+        max_workers=choose_slice_parallel_workers(int(workers), n),
+        desc='2D hole fill',
+    )
 
 # --------------------------
 # 3D assembly + postprocessing
@@ -2067,21 +2334,28 @@ def build_slice_endpoint_seeds_from_label_volume(labels_real: np.ndarray) -> Tup
     return seeds, int(len(seeds))
 
 
-def apply_transverse_min_radius_filter_inplace(mask_mm: np.ndarray, min_radius: float) -> None:
+def apply_transverse_min_radius_filter_inplace(
+    mask_mm: np.ndarray,
+    min_radius: float,
+    *,
+    workers: int = 1,
+) -> None:
     """In-place transverse-plane radius filter to avoid a full extra volume copy."""
     if float(min_radius) <= 0:
         return
 
     struct2 = np.ones((3, 3), dtype=bool)
-    for t in tqdm(range(mask_mm.shape[0]), desc='Transverse min-radius filter'):
-        sl = np.asarray(mask_mm[t]) > 0
+    num_slices = int(mask_mm.shape[0])
+
+    def _process(t: int) -> None:
+        sl = np.asarray(mask_mm[int(t)]) > 0
         if not np.any(sl):
-            continue
+            return
 
         labels2d, num = ndi.label(sl, structure=struct2)
         if int(num) <= 0:
-            mask_mm[t, :, :] = 0
-            continue
+            mask_mm[int(t), :, :] = 0
+            return
 
         keep = np.zeros(sl.shape, dtype=bool)
         for lbl in range(1, int(num) + 1):
@@ -2092,11 +2366,24 @@ def apply_transverse_min_radius_filter_inplace(mask_mm: np.ndarray, min_radius: 
             if radius >= float(min_radius):
                 keep |= comp
 
-        mask_mm[t, :, :] = keep.astype(np.uint8, copy=False)
+        mask_mm[int(t), :, :] = keep.astype(np.uint8, copy=False)
+
+    parallel_for_indices(
+        num_slices,
+        _process,
+        max_workers=choose_slice_parallel_workers(int(workers), num_slices),
+        desc='Transverse min-radius filter',
+    )
     flush_array(mask_mm)
 
 
-def apply_view_min_radius_filter_inplace(mask_mm: np.ndarray, view: ViewInfo, min_radius: float) -> None:
+def apply_view_min_radius_filter_inplace(
+    mask_mm: np.ndarray,
+    view: ViewInfo,
+    min_radius: float,
+    *,
+    workers: int = 1,
+) -> None:
     if float(min_radius) <= 0:
         return
 
@@ -2110,7 +2397,11 @@ def apply_view_min_radius_filter_inplace(mask_mm: np.ndarray, view: ViewInfo, mi
         raise ValueError(f'Unsupported view for min-radius filtering: {view.name}')
 
     print(f"Applying --min_radius in the transverse plane for view '{view.name}'")
-    apply_transverse_min_radius_filter_inplace(transverse_view, float(min_radius))
+    apply_transverse_min_radius_filter_inplace(
+        transverse_view,
+        float(min_radius),
+        workers=choose_slice_parallel_workers(int(workers), int(transverse_view.shape[0])),
+    )
     flush_array(mask_mm)
 
 
@@ -2161,6 +2452,7 @@ def unpack_view_union_to_volume(
     *,
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
+    workers: int = 1,
 ) -> np.ndarray:
     vol_mm = allocate_workspace_array(
         shape=(num_slices, h, w),
@@ -2170,12 +2462,20 @@ def unpack_view_union_to_volume(
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
     )
-    for i in tqdm(range(num_slices), desc=desc):
-        packed = np.asarray(union_mm[i])
+
+    def _process(i: int) -> None:
+        packed = np.asarray(union_mm[int(i)])
         if any_mask(packed):
-            vol_mm[i, :, :] = unpack_mask(packed, h, w)
+            vol_mm[int(i), :, :] = unpack_mask(packed, h, w)
         else:
-            vol_mm[i, :, :] = 0
+            vol_mm[int(i), :, :] = 0
+
+    parallel_for_indices(
+        int(num_slices),
+        _process,
+        max_workers=choose_slice_parallel_workers(int(workers), int(num_slices)),
+        desc=desc,
+    )
     flush_array(vol_mm)
     return vol_mm
 
@@ -4893,6 +5193,7 @@ def write_summary_file(
     voxel_volume: Optional[int],
     final_paths: Dict[str, Path],
     augmentation_workers: int,
+    slice_postprocess_workers: int,
     interpolation_workers: int,
 ) -> Path:
     lines: List[str] = []
@@ -4904,6 +5205,7 @@ def write_summary_file(
     lines.append(f'Scratch directory: {scratch_dir}')
     lines.append('Workspace policy: in-memory first with disk fallback when the working set exceeds available RAM/swap')
     lines.append(f'Augmentation workers: {int(augmentation_workers)}')
+    lines.append(f'Slice-parallel postprocess workers: {int(slice_postprocess_workers)}')
     lines.append(f'Interpolation workers: {int(interpolation_workers)}')
     lines.append(f'Models: {", ".join(str(Path(m)) for m in model_paths)}')
     lines.append(f'Views: {", ".join(view_names)}')
@@ -5081,10 +5383,12 @@ def main() -> None:
         default_interpolation_workers(),
         max_tasks=max(1, len(yolo_models) * len(views)),
     )
+    slice_postprocess_workers = max(1, int(augmentation_workers))
     print(f'Augmentation workers: {augmentation_workers}')
+    print(f'Slice-parallel postprocess workers: {slice_postprocess_workers}')
     print(f'Interpolation workers: {interpolation_workers}')
 
-    if augmentation_workers > 1 or interpolation_workers > 1:
+    if augmentation_workers > 1 or interpolation_workers > 1 or slice_postprocess_workers > 1:
         try:
             cv2.setNumThreads(1)
         except Exception:
@@ -5190,11 +5494,17 @@ def main() -> None:
                     float(args.min_conf),
                     view.src_h,
                     view.src_w,
+                    workers=slice_postprocess_workers,
                 )
                 flush_array(union_by_model_view[model_name])
                 flush_array(confmap_by_model_view[model_name])
 
-            fill_2d_holes_inplace(union_by_model_view[model_name], view.src_h, view.src_w)
+            fill_2d_holes_inplace(
+                union_by_model_view[model_name],
+                view.src_h,
+                view.src_w,
+                workers=slice_postprocess_workers,
+            )
             flush_array(union_by_model_view[model_name])
 
             out_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.u8.dat'
@@ -5215,6 +5525,7 @@ def main() -> None:
                     out_path=out_path,
                     desc=f'Unpacking {model_name}/{view.name}',
                     prefer_memory=True,
+                    workers=slice_postprocess_workers,
                 )
 
             if float(args.min_radius) > 0:
@@ -5222,6 +5533,7 @@ def main() -> None:
                     view_volumes_by_model[model_name][view.name],
                     view,
                     float(args.min_radius),
+                    workers=slice_postprocess_workers,
                 )
 
             confmap_mm_done = confmap_by_model_view.pop(model_name, None)
@@ -5480,6 +5792,7 @@ def main() -> None:
         voxel_volume=voxel_volume,
         final_paths=final_paths,
         augmentation_workers=augmentation_workers,
+        slice_postprocess_workers=slice_postprocess_workers,
         interpolation_workers=interpolation_workers,
     )
 
