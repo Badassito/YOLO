@@ -2,10 +2,11 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v7.5.0_SLURM-aligned script:
+This v7.6.0_SLURM-aligned script:
   - builds Transverse, optional Sagittal/Coronal, and optional Radial view families
-  - generates rotated and shifted FFV1 MKV augmentation videos ahead of inference
-  - supports dense tiled Cartesian inference with object-wise gated OR back into the baseline volume
+  - generates rotated FFV1 MKV augmentation videos ahead of inference
+  - supports dense tiled inference for all active views, including multi-configuration sliding-window sets,
+    with object-wise gated OR back into the baseline view volume
   - runs Ultralytics YOLO segmentation sequentially on each pre-generated video source
   - inverse-maps predictions into native view coordinates, applies confidence filtering, hole filling, interpolation, and final 3D void fill
   - saves the transverse default overlay plus optional labels, binary masks, NRRD, multiplanar, radial, image-sequence, and TTA outputs
@@ -98,6 +99,22 @@ def _parse_models(values: Sequence[str]) -> List[str]:
     return [x for x in out if x]
 
 
+def _parse_int_list(values: Sequence[str] | str | int | None) -> List[int]:
+    """Accept comma and/or whitespace separated integer lists."""
+    if values is None:
+        return []
+    if isinstance(values, int):
+        return [int(values)]
+    raw_values = [values] if isinstance(values, str) else [str(v) for v in values]
+    parts: List[str] = []
+    for raw in raw_values:
+        raw = str(raw).strip()
+        if not raw:
+            continue
+        parts.extend([p for p in re.split(r"[,\s]+", raw) if p])
+    return [int(p) for p in parts]
+
+
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="YOLO segmentation TTA for large cylindrical video volumes.",
@@ -118,8 +135,6 @@ def build_argparser() -> argparse.ArgumentParser:
 
     p.add_argument("--angle", default="0,120,240", type=str,
                    help="Rotation angles in degrees for augmentation (comma or whitespace separated)")
-    p.add_argument("--shift", default=0, type=int,
-                   help="If nonzero, create 4 shifted variants (up/down/left/right) per rotation per view, plus the unshifted version")
     p.add_argument("--min_radius", default=0.0, type=float,
                    help="Remove objects with a transverse-plane radius smaller than this value. 0 disables the check")
 
@@ -128,16 +143,16 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--azimuth_angle", default=0.0, type=float,
                    help="Angular spacing in degrees for radial diameter slices over [0,180]. 0 disables radial views")
 
-    p.add_argument("--tile_size", default=0, type=int,
-                   help="Square dense-tile size in source pixels for Cartesian views. 0 disables dense tiled predictions")
-    p.add_argument("--tile_stride", default=0, type=int,
-                   help="Dense-tile stride in source pixels. Required when --tile_size is active")
+    p.add_argument("--tile_size", nargs="+", default=["0"], type=str,
+                   help="One or more square dense-tile side lengths in source pixels for all active views. 0 disables dense tiled predictions")
+    p.add_argument("--tile_stride", nargs="+", default=["0"], type=str,
+                   help="One or more dense-tile strides in source pixels. Must match --tile_size when dense tiling is active")
 
     p.add_argument("--save_images", action="store_true", help="Save unlabeled image sequences for all active views")
     p.add_argument("--save_labels", nargs="?", const="__DEFAULT__", default=None, type=str,
                    help="Save final YOLO segmentation labels per frame. Optional custom pattern, e.g. labels/{Filename}_%%04d.txt")
     p.add_argument("--save_TTA", action="store_true",
-                   help="Save the rotated and shifted augmentation videos together with the final labels mapped to each augmentation")
+                   help="Save the rotated augmentation videos together with the final labels mapped to each augmentation")
     p.add_argument("--save_binary", nargs="?", const="__DEFAULT__", default=None, type=str,
                    help="Save final binary masks as a TIFF sequence plus an FFV1 MKV. Optional custom TIFF pattern, e.g. binary_masks/{Filename}_Binary_%%04d.tiff")
     p.add_argument("--save_nrrd", action="store_true", help="Save the final binary mask volume as an NRRD file")
@@ -250,7 +265,7 @@ def _cpu_count() -> int:
 
 
 def default_worker_budget() -> int:
-    return 1200 if int(_cpu_count()) > 128 else 16
+    return max(1, int(_cpu_count()))
 
 
 def default_augmentation_workers() -> int:
@@ -802,8 +817,6 @@ def close_ffmpeg_writer(proc: subprocess.Popen) -> None:
 class AffineSpec:
     view: str
     angle_deg: float
-    shift_dx: int
-    shift_dy: int
     src_w: int
     src_h: int
     out_size: int
@@ -822,9 +835,6 @@ class AffineSpec:
 class AugJob:
     aug_id: str
     angle_deg: float
-    shift_dx: int
-    shift_dy: int
-    shift_name: str
     video_path: Path
     meta_path: Path
     aff: AffineSpec
@@ -847,27 +857,28 @@ def _affine2x3_to_3x3(M: np.ndarray) -> np.ndarray:
     return out
 
 
+def _format_angle_aug_id(angle_deg: float) -> str:
+    token = f'{float(angle_deg):g}'.replace('-', 'm').replace('.', 'p')
+    return f'a{token}'
+
+
 def build_affine(
     view: str,
     src_w: int,
     src_h: int,
     out_size: int,
     angle_deg: float,
-    shift_dx: int,
-    shift_dy: int,
     pad_mode: str,
 ) -> AffineSpec:
     """
     Build a single affine transform that performs, in one pass:
 
       source(native view) -> optional black-padding canvas -> rotation around canvas center
-      -> optional shift in native/canvas pixels -> scale to out_size x out_size
+      -> scale to out_size x out_size
 
-    --shift is expressed in pre-scale view pixels, not
-    in already-resized imgsz pixels. Transverse uses pad_mode='clamp', which rotates directly on the
-    source-sized canvas so non-90° content that leaves the source frame is discarded.
-    Sagittal/Coronal use pad_mode='pad' with a square black canvas large enough to preserve the full
-    rotation before scaling.
+    Transverse uses pad_mode='clamp', which rotates directly on the source-sized canvas so non-90°
+    content that leaves the source frame is discarded. Sagittal/Coronal/Radial use pad_mode='pad'
+    with a square black canvas large enough to preserve the full rotation before scaling.
     """
     if pad_mode not in ("clamp", "pad"):
         raise ValueError("pad_mode must be 'clamp' or 'pad'")
@@ -897,15 +908,6 @@ def build_affine(
 
     M_rot = _affine2x3_to_3x3(cv2.getRotationMatrix2D((cx_canvas, cy_canvas), angle_deg, 1.0))
 
-    M_shift_canvas = np.array(
-        [
-            [1.0, 0.0, float(shift_dx)],
-            [0.0, 1.0, float(shift_dy)],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float64,
-    )
-
     sx = out_size / float(canvas_w)
     sy = out_size / float(canvas_h)
     M_scale = np.array(
@@ -917,7 +919,7 @@ def build_affine(
         dtype=np.float64,
     )
 
-    M_src_to_canvas3 = M_shift_canvas @ M_rot @ M_pad
+    M_src_to_canvas3 = M_rot @ M_pad
     M_canvas_to_src3 = np.linalg.inv(M_src_to_canvas3)
     M_src_to_out3 = M_scale @ M_src_to_canvas3
     M_out_to_src3 = np.linalg.inv(M_src_to_out3)
@@ -925,8 +927,6 @@ def build_affine(
     return AffineSpec(
         view=view,
         angle_deg=float(angle_deg),
-        shift_dx=int(shift_dx),
-        shift_dy=int(shift_dy),
         src_w=src_w,
         src_h=src_h,
         out_size=out_size,
@@ -1168,8 +1168,6 @@ def write_aug_job_meta(job: AugJob, view: ViewInfo) -> None:
                 'view': view.name,
                 'family': view.family,
                 'angle_deg': float(job.angle_deg),
-                'shift_dx': int(job.shift_dx),
-                'shift_dy': int(job.shift_dy),
                 'src_w': view.src_w,
                 'src_h': view.src_h,
                 'out_size': int(job.aff.out_size),
@@ -1190,7 +1188,6 @@ def write_aug_job_meta(job: AugJob, view: ViewInfo) -> None:
 def build_aug_jobs_for_view(
     view: ViewInfo,
     angles: Sequence[float],
-    shifts: Sequence[Tuple[int, int, str]],
     out_size: int,
     temp_dir: Path,
 ) -> List[AugJob]:
@@ -1198,41 +1195,79 @@ def build_aug_jobs_for_view(
     jobs: List[AugJob] = []
 
     for angle in angles:
-        for dx, dy, sname in shifts:
-            aug_id = f'a{angle:g}_dx{dx}_dy{dy}_{sname}'
-            aff = build_affine(
-                view=view.name,
-                src_w=view.src_w,
-                src_h=view.src_h,
-                out_size=out_size,
+        aug_id = _format_angle_aug_id(float(angle))
+        aff = build_affine(
+            view=view.name,
+            src_w=view.src_w,
+            src_h=view.src_h,
+            out_size=out_size,
+            angle_deg=float(angle),
+            pad_mode=view.pad_mode,
+        )
+        jobs.append(
+            AugJob(
+                aug_id=aug_id,
                 angle_deg=float(angle),
-                shift_dx=int(dx),
-                shift_dy=int(dy),
-                pad_mode=view.pad_mode,
+                video_path=aug_dir / f'{view.name}_{aug_id}.mkv',
+                meta_path=aug_dir / f'{view.name}_{aug_id}.meta.json',
+                aff=aff,
             )
-            jobs.append(
-                AugJob(
-                    aug_id=aug_id,
-                    angle_deg=float(angle),
-                    shift_dx=int(dx),
-                    shift_dy=int(dy),
-                    shift_name=str(sname),
-                    video_path=aug_dir / f'{view.name}_{aug_id}.mkv',
-                    meta_path=aug_dir / f'{view.name}_{aug_id}.meta.json',
-                    aff=aff,
-                )
-            )
+        )
     return jobs
+
+
+@dataclass(frozen=True)
+class TileConfig:
+    tile_size: int
+    tile_stride: int
+    config_id: str
+
+
+def resolve_tile_configs(tile_sizes_raw: Sequence[str] | str | int | None, tile_strides_raw: Sequence[str] | str | int | None) -> List[TileConfig]:
+    tile_sizes = _parse_int_list(tile_sizes_raw)
+    tile_strides = _parse_int_list(tile_strides_raw)
+
+    if not tile_sizes:
+        tile_sizes = [0]
+    if not tile_strides:
+        tile_strides = [0]
+
+    if len(tile_sizes) != len(tile_strides):
+        raise ValueError('--tile_size and --tile_stride must contain the same number of values')
+
+    if len(tile_sizes) == 1 and int(tile_sizes[0]) == 0:
+        if any(int(v) != 0 for v in tile_strides):
+            raise ValueError('--tile_stride must be 0 when --tile_size disables tiled predictions')
+        return []
+
+    configs: List[TileConfig] = []
+    seen: set[str] = set()
+    for tile_size, tile_stride in zip(tile_sizes, tile_strides):
+        if int(tile_size) <= 0:
+            raise ValueError('--tile_size values must be > 0 when dense tiling is active')
+        if int(tile_stride) <= 0:
+            raise ValueError('--tile_stride values must be > 0 when dense tiling is active')
+        if int(tile_stride) > int(tile_size):
+            raise ValueError('--tile_stride must be less than or equal to the corresponding --tile_size')
+        config_id = f's{int(tile_size)}_st{int(tile_stride)}'
+        if config_id in seen:
+            raise ValueError(f'Duplicate dense tile configuration: tile_size={int(tile_size)}, tile_stride={int(tile_stride)}')
+        seen.add(config_id)
+        configs.append(TileConfig(tile_size=int(tile_size), tile_stride=int(tile_stride), config_id=config_id))
+
+    return configs
 
 
 @dataclass(frozen=True)
 class DenseTileJob:
     view: str
     aug_id: str
+    config_id: str
     tile_id: str
     tile_x: int
     tile_y: int
     tile_size: int
+    tile_stride: int
     out_size: int
     video_path: Path
     meta_path: Path
@@ -1278,23 +1313,19 @@ def dense_tile_positions(length: int, tile_size: int, stride: int) -> List[int]:
 def build_dense_tile_jobs_for_aug(
     view: ViewInfo,
     aug_job: AugJob,
-    tile_size: int,
-    tile_stride: int,
+    tile_cfg: TileConfig,
     out_size: int,
     temp_dir: Path,
 ) -> List[DenseTileJob]:
-    if view.family != 'orthogonal':
-        return []
-
-    tile_dir = temp_dir / 'tiles' / view.name / aug_job.aug_id
-    xs = dense_tile_positions(int(aug_job.aff.canvas_w), int(tile_size), int(tile_stride))
-    ys = dense_tile_positions(int(aug_job.aff.canvas_h), int(tile_size), int(tile_stride))
+    tile_dir = temp_dir / 'tiles' / view.name / tile_cfg.config_id / aug_job.aug_id
+    xs = dense_tile_positions(int(aug_job.aff.canvas_w), int(tile_cfg.tile_size), int(tile_cfg.tile_stride))
+    ys = dense_tile_positions(int(aug_job.aff.canvas_h), int(tile_cfg.tile_size), int(tile_cfg.tile_stride))
     jobs: List[DenseTileJob] = []
 
     M_src_to_canvas3 = _affine2x3_to_3x3(aug_job.aff.M_src_to_canvas)
     for tile_y in ys:
         for tile_x in xs:
-            tile_id = f'{aug_job.aug_id}_x{int(tile_x):04d}_y{int(tile_y):04d}'
+            tile_id = f'{tile_cfg.config_id}_{aug_job.aug_id}_x{int(tile_x):04d}_y{int(tile_y):04d}'
             M_crop = np.array(
                 [
                     [1.0, 0.0, -float(tile_x)],
@@ -1303,17 +1334,19 @@ def build_dense_tile_jobs_for_aug(
                 ],
                 dtype=np.float64,
             )
-            M_scale = _center_preserving_scale_matrix(int(tile_size), int(tile_size), int(out_size), int(out_size))
+            M_scale = _center_preserving_scale_matrix(int(tile_cfg.tile_size), int(tile_cfg.tile_size), int(out_size), int(out_size))
             M_src_to_out3 = M_scale @ M_crop @ M_src_to_canvas3
             M_out_to_src3 = np.linalg.inv(M_src_to_out3)
             jobs.append(
                 DenseTileJob(
                     view=view.name,
                     aug_id=aug_job.aug_id,
+                    config_id=tile_cfg.config_id,
                     tile_id=tile_id,
                     tile_x=int(tile_x),
                     tile_y=int(tile_y),
-                    tile_size=int(tile_size),
+                    tile_size=int(tile_cfg.tile_size),
+                    tile_stride=int(tile_cfg.tile_stride),
                     out_size=int(out_size),
                     video_path=tile_dir / f'{view.name}_{tile_id}.mkv',
                     meta_path=tile_dir / f'{view.name}_{tile_id}.meta.json',
@@ -1331,10 +1364,12 @@ def write_dense_tile_job_meta(job: DenseTileJob) -> None:
             {
                 'view': job.view,
                 'aug_id': job.aug_id,
+                'config_id': job.config_id,
                 'tile_id': job.tile_id,
                 'tile_x': int(job.tile_x),
                 'tile_y': int(job.tile_y),
                 'tile_size': int(job.tile_size),
+                'tile_stride': int(job.tile_stride),
                 'out_size': int(job.out_size),
                 'M_out_to_src': job.M_out_to_src.tolist(),
                 'M_src_to_out': job.M_src_to_out.tolist(),
@@ -1849,15 +1884,13 @@ def _process_prediction_frame(
     masks_np: Optional[np.ndarray],
     confs_np: Optional[np.ndarray],
     out_size: int,
-    pred_mask_mm: np.ndarray,
-    pred_conf_mm: np.ndarray,
     view_union_mm: np.ndarray,
     view_confmap_mm: np.ndarray,
     M_out_to_native: np.ndarray,
     native_h: int,
     native_w: int,
 ) -> Tuple[int, int]:
-    """Collapse one streamed result into trace + native accumulators.
+    """Collapse one streamed result directly into the native-view union + confidence accumulators.
 
     Key optimization:
       - build the augmented-space union mask once
@@ -1865,11 +1898,9 @@ def _process_prediction_frame(
       - inverse-warp each of those exactly once
 
     This preserves the required semantics of unioning masks and retaining the highest confidence
-    score per covered pixel, while avoiding one native warp per detected instance.
+    score per covered pixel, while avoiding one native warp per detected instance and avoiding
+    per-augmentation trace files on disk.
     """
-    pred_mask_mm[idx, :] = 0
-    pred_conf_mm[idx] = np.float16(0.0)
-
     if masks_np is None or confs_np is None or masks_np.ndim != 3 or int(masks_np.shape[0]) <= 0:
         return 0, 0
 
@@ -1893,8 +1924,6 @@ def _process_prediction_frame(
         inst_bool = inst > 0
         frame_confmap[inst_bool] = np.maximum(frame_confmap[inst_bool], np.float32(conf_val))
 
-    pred_mask_mm[idx, :] = pack_mask(frame_union)
-    pred_conf_mm[idx] = np.float16(frame_max_conf)
     if not np.any(frame_union):
         return int(num_inst), 1
 
@@ -1942,32 +1971,13 @@ def predict_video_and_accumulate(
     postprocess_workers: int = 1,
 ) -> Dict[str, int]:
     """
-    Run YOLO predict(stream=True) on a pre-generated augmented video, store a lightweight
-    per-augmentation trace to disk, and accumulate the inverse-transformed native masks.
+    Run YOLO predict(stream=True) on a pre-generated augmented video and accumulate the inverse-
+    transformed native masks in memory-backed workspaces.
 
     The sequential portion remains the YOLO inference stream itself. CPU-side result handling is
-    overlapped with that stream when ``postprocess_workers > 1`` so native reorientation and trace
-    writes do not unnecessarily serialize GPU inference.
+    overlapped with that stream when ``postprocess_workers > 1`` so native reorientation and
+    confidence-map updates do not unnecessarily serialize GPU inference.
     """
-    pred_out_prefix.parent.mkdir(parents=True, exist_ok=True)
-
-    out_bytes = bytes_for_packbits(out_size, out_size)
-
-    pred_mask_mm = np.memmap(
-        pred_out_prefix.with_suffix('.mask.packbits.dat'),
-        dtype=np.uint8,
-        mode='w+',
-        shape=(num_frames, out_bytes),
-    )
-    pred_conf_mm = np.memmap(
-        pred_out_prefix.with_suffix('.conf.f16.dat'),
-        dtype=np.float16,
-        mode='w+',
-        shape=(num_frames,),
-    )
-    pred_mask_mm[:, :] = 0
-    pred_conf_mm[:] = np.float16(0.0)
-
     prediction_count = 0
     frames_with_predictions = 0
 
@@ -2000,8 +2010,6 @@ def predict_video_and_accumulate(
                 masks_np=masks_np,
                 confs_np=confs_np,
                 out_size=out_size,
-                pred_mask_mm=pred_mask_mm,
-                pred_conf_mm=pred_conf_mm,
                 view_union_mm=view_union_mm,
                 view_confmap_mm=view_confmap_mm,
                 M_out_to_native=M_out_to_native,
@@ -2024,8 +2032,6 @@ def predict_video_and_accumulate(
                     masks_np,
                     confs_np,
                     out_size,
-                    pred_mask_mm,
-                    pred_conf_mm,
                     view_union_mm,
                     view_confmap_mm,
                     M_out_to_native,
@@ -2044,28 +2050,9 @@ def predict_video_and_accumulate(
                 prediction_count += int(pred_inc)
                 frames_with_predictions += int(frame_inc)
 
-    flush_array(pred_mask_mm)
-    flush_array(pred_conf_mm)
     flush_array(view_confmap_mm)
     flush_array(view_union_mm)
 
-    meta = {
-        'video': str(video_path),
-        'num_frames': int(num_frames),
-        'out_size': int(out_size),
-        'mask_packbits_bytes': int(out_bytes),
-        'prediction_count': int(prediction_count),
-        'frames_with_predictions': int(frames_with_predictions),
-        'postprocess_workers': int(worker_count),
-        'cfg': {
-            'imgsz': int(cfg.imgsz),
-            'conf': float(cfg.conf),
-            'device': str(cfg.device),
-            'half': bool(cfg.half),
-            'int8': bool(cfg.int8),
-        },
-    }
-    pred_out_prefix.with_suffix('.meta.json').write_text(json.dumps(meta, indent=2))
     return {
         'prediction_count': int(prediction_count),
         'frames_with_predictions': int(frames_with_predictions),
@@ -2179,13 +2166,41 @@ def objectwise_gated_or_inplace(
     tiled_confmap_mm: np.ndarray,
     work_dir: Path,
     *,
+    baseline_labels_mm: Optional[np.ndarray] = None,
+    baseline_objects: Optional[int] = None,
     keep_temp: bool = False,
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
 ) -> Dict[str, int]:
+    created_baseline_labels = False
+    created_baseline_paths: List[Path] = []
+
+    if baseline_labels_mm is None or baseline_objects is None:
+        if not np.any(np.asarray(baseline_mask_mm)):
+            baseline_objects = 0
+            baseline_labels_mm = None
+        else:
+            work_dir.mkdir(parents=True, exist_ok=True)
+            baseline_labels_mm, baseline_objects, created_baseline_paths = label_foreground_volume_streaming(
+                baseline_mask_mm,
+                work_dir / 'baseline',
+                keep_temp=True,
+                prefer_memory=bool(prefer_memory),
+                reserve_bytes=int(reserve_bytes),
+            )
+            created_baseline_labels = True
+
     if not np.any(np.asarray(tiled_mask_mm)):
+        if created_baseline_labels and baseline_labels_mm is not None:
+            close_memmap_array(baseline_labels_mm)
+        if not keep_temp:
+            for p in created_baseline_paths:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
         return {
-            'baseline_objects': 0,
+            'baseline_objects': int(baseline_objects or 0),
             'tiled_objects': 0,
             'accepted_tiled_objects': 0,
             'rejected_tiled_objects': 0,
@@ -2193,13 +2208,6 @@ def objectwise_gated_or_inplace(
         }
 
     work_dir.mkdir(parents=True, exist_ok=True)
-    baseline_labels, baseline_objects, baseline_paths = label_foreground_volume_streaming(
-        baseline_mask_mm,
-        work_dir / 'baseline',
-        keep_temp=True,
-        prefer_memory=bool(prefer_memory),
-        reserve_bytes=int(reserve_bytes),
-    )
     tiled_labels, tiled_objects, tiled_paths = label_foreground_volume_streaming(
         tiled_mask_mm,
         work_dir / 'tiled',
@@ -2209,10 +2217,10 @@ def objectwise_gated_or_inplace(
     )
 
     accepted_tiled = np.zeros((int(tiled_objects) + 1,), dtype=bool)
-    if int(tiled_objects) > 0 and int(baseline_objects) > 0:
+    if int(tiled_objects) > 0 and int(baseline_objects or 0) > 0 and baseline_labels_mm is not None:
         for z in tqdm(range(int(tiled_mask_mm.shape[0])), desc='Dense tiled gating: overlap scan'):
             tile_lbl = np.asarray(tiled_labels[int(z)])
-            base_lbl = np.asarray(baseline_labels[int(z)])
+            base_lbl = np.asarray(baseline_labels_mm[int(z)])
             overlap = (tile_lbl > 0) & (base_lbl > 0)
             if not np.any(overlap):
                 continue
@@ -2238,7 +2246,7 @@ def objectwise_gated_or_inplace(
         added_counts[int(z)] = np.int64(np.count_nonzero(after & (~before)))
 
     stats = {
-        'baseline_objects': int(baseline_objects),
+        'baseline_objects': int(baseline_objects or 0),
         'tiled_objects': int(tiled_objects),
         'accepted_tiled_objects': int(np.count_nonzero(accepted_tiled[1:])),
         'rejected_tiled_objects': int(max(0, int(tiled_objects) - int(np.count_nonzero(accepted_tiled[1:])))),
@@ -2247,10 +2255,11 @@ def objectwise_gated_or_inplace(
 
     flush_array(baseline_mask_mm)
     flush_array(baseline_confmap_mm)
-    close_memmap_array(baseline_labels)
+    if created_baseline_labels and baseline_labels_mm is not None:
+        close_memmap_array(baseline_labels_mm)
     close_memmap_array(tiled_labels)
     if not keep_temp:
-        for p in baseline_paths + tiled_paths:
+        for p in created_baseline_paths + tiled_paths:
             try:
                 p.unlink(missing_ok=True)
             except Exception:
@@ -2713,8 +2722,8 @@ def unpack_view_union_to_volume(
     return vol_mm
 
 
-def backproject_radial_union_to_volume(
-    union_mm: np.ndarray,
+def backproject_radial_volume_to_volume(
+    radial_mask_mm: np.ndarray,
     radial_view: ViewInfo,
     out_path: Path,
     desc: str,
@@ -2723,12 +2732,11 @@ def backproject_radial_union_to_volume(
     reserve_bytes: int = 16 * GIB,
 ) -> np.ndarray:
     if radial_view.family != 'radial':
-        raise ValueError('backproject_radial_union_to_volume expects a radial view')
+        raise ValueError('backproject_radial_volume_to_volume expects a radial view')
 
     t_dim = int(radial_view.src_h)
     out_h = int(radial_view.full_h)
     out_w = int(radial_view.full_w)
-    diameter = int(radial_view.src_w)
 
     vol_mm = allocate_workspace_array(
         shape=(t_dim, out_h, out_w),
@@ -2740,10 +2748,9 @@ def backproject_radial_union_to_volume(
     )
 
     for angle_idx, angle_deg in enumerate(tqdm(radial_view.azimuths_deg, desc=desc)):
-        packed = np.asarray(union_mm[angle_idx])
-        if not any_mask(packed):
+        radial_mask = np.asarray(radial_mask_mm[int(angle_idx)], dtype=bool)
+        if not np.any(radial_mask):
             continue
-        radial_mask = unpack_mask(packed, t_dim, diameter).astype(bool, copy=False)
         tt, uu = np.nonzero(radial_mask)
         if tt.size == 0:
             continue
@@ -4776,6 +4783,7 @@ def main() -> None:
             raise FileNotFoundError(m)
 
     angles = _parse_angles(args.angle) or [0.0, 120.0, 240.0]
+    tile_configs = resolve_tile_configs(args.tile_size, args.tile_stride)
 
     if args.min_conf > 0 and args.min_conf < args.conf:
         raise ValueError('--min_conf must be equal to or greater than --conf')
@@ -4793,15 +4801,6 @@ def main() -> None:
         raise ValueError('--min_radius must be >= 0')
     if float(args.azimuth_angle) < 0:
         raise ValueError('--azimuth_angle must be >= 0')
-    if int(args.tile_size) < 0:
-        raise ValueError('--tile_size must be >= 0')
-    if int(args.tile_stride) < 0:
-        raise ValueError('--tile_stride must be >= 0')
-    if int(args.tile_size) > 0:
-        if int(args.tile_stride) <= 0:
-            raise ValueError('--tile_stride must be > 0 when --tile_size is active')
-        if int(args.tile_stride) > int(args.tile_size):
-            raise ValueError('--tile_stride must be less than or equal to --tile_size')
     if not (-90.0 < float(args.interpolation_search_angle) < 90.0):
         raise ValueError('--interpolation_search_angle must be greater than -90 and less than 90')
 
@@ -4841,17 +4840,6 @@ def main() -> None:
         include_radial=True,
     )
     cartesian_views = orthogonal_views_only(views)
-
-    shifts: List[Tuple[int, int, str]] = [(0, 0, 'none')]
-    if int(args.shift) != 0:
-        s = abs(int(args.shift))
-        shifts = [
-            (0, 0, 'none'),
-            (0, -s, 'up'),
-            (0, +s, 'down'),
-            (-s, 0, 'left'),
-            (+s, 0, 'right'),
-        ]
 
     yolo_models: List[Tuple[str, object]] = []
     for m in model_paths:
@@ -4907,7 +4895,7 @@ def main() -> None:
 
     view_volumes_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
     aug_jobs_by_view: Dict[str, List[AugJob]] = {}
-    dense_tiling_active = int(args.tile_size) > 0
+    dense_tiling_active = len(tile_configs) > 0
     view_prediction_stats: Dict[str, int] = {
         'transverse': 0,
         'sagittal': 0,
@@ -4925,10 +4913,10 @@ def main() -> None:
         baseline_confmap_by_model_view: Dict[str, np.ndarray] = {}
         baseline_union_paths: Dict[str, Path] = {}
         baseline_confmap_paths: Dict[str, Path] = {}
-        tiled_union_by_model_view: Dict[str, np.ndarray] = {}
-        tiled_confmap_by_model_view: Dict[str, np.ndarray] = {}
-        tiled_union_paths: Dict[str, Path] = {}
-        tiled_confmap_paths: Dict[str, Path] = {}
+        tiled_union_by_model_view: Dict[str, Dict[str, np.ndarray]] = {}
+        tiled_confmap_by_model_view: Dict[str, Dict[str, np.ndarray]] = {}
+        tiled_union_paths: Dict[str, Dict[str, Path]] = {}
+        tiled_confmap_paths: Dict[str, Dict[str, Path]] = {}
 
         for model_name, _ in yolo_models:
             bytes_native = bytes_for_packbits(view.src_h, view.src_w)
@@ -4956,32 +4944,36 @@ def main() -> None:
             baseline_union_paths[model_name] = union_path
             baseline_confmap_paths[model_name] = confmap_path
 
-            if dense_tiling_active and view.family == 'orthogonal':
-                tiled_union_path = temp_dir / 'union' / model_name / f'{view.name}.tiled.union.packbits.dat'
-                tiled_confmap_path = temp_dir / 'union' / model_name / f'{view.name}.tiled.confmap.f16.dat'
-                tiled_union_mm = allocate_workspace_array(
-                    shape=(view.num_slices, bytes_native),
-                    dtype=np.uint8,
-                    path=tiled_union_path,
-                    desc=f'{model_name}/{view.name} tiled union workspace',
-                    prefer_memory=True,
-                )
-                tiled_confmap_mm = allocate_workspace_array(
-                    shape=(view.num_slices, view.src_h, view.src_w),
-                    dtype=np.float16,
-                    path=tiled_confmap_path,
-                    desc=f'{model_name}/{view.name} tiled confidence workspace',
-                    prefer_memory=True,
-                )
-                tiled_union_by_model_view[model_name] = tiled_union_mm
-                tiled_confmap_by_model_view[model_name] = tiled_confmap_mm
-                tiled_union_paths[model_name] = tiled_union_path
-                tiled_confmap_paths[model_name] = tiled_confmap_path
+            if dense_tiling_active:
+                tiled_union_by_model_view[model_name] = {}
+                tiled_confmap_by_model_view[model_name] = {}
+                tiled_union_paths[model_name] = {}
+                tiled_confmap_paths[model_name] = {}
+                for tile_cfg in tile_configs:
+                    tiled_union_path = temp_dir / 'union' / model_name / f'{view.name}.{tile_cfg.config_id}.tiled.union.packbits.dat'
+                    tiled_confmap_path = temp_dir / 'union' / model_name / f'{view.name}.{tile_cfg.config_id}.tiled.confmap.f16.dat'
+                    tiled_union_mm = allocate_workspace_array(
+                        shape=(view.num_slices, bytes_native),
+                        dtype=np.uint8,
+                        path=tiled_union_path,
+                        desc=f'{model_name}/{view.name} tiled union workspace [{tile_cfg.config_id}]',
+                        prefer_memory=True,
+                    )
+                    tiled_confmap_mm = allocate_workspace_array(
+                        shape=(view.num_slices, view.src_h, view.src_w),
+                        dtype=np.float16,
+                        path=tiled_confmap_path,
+                        desc=f'{model_name}/{view.name} tiled confidence workspace [{tile_cfg.config_id}]',
+                        prefer_memory=True,
+                    )
+                    tiled_union_by_model_view[model_name][tile_cfg.config_id] = tiled_union_mm
+                    tiled_confmap_by_model_view[model_name][tile_cfg.config_id] = tiled_confmap_mm
+                    tiled_union_paths[model_name][tile_cfg.config_id] = tiled_union_path
+                    tiled_confmap_paths[model_name][tile_cfg.config_id] = tiled_confmap_path
 
         aug_jobs = build_aug_jobs_for_view(
             view=view,
             angles=angles,
-            shifts=shifts,
             out_size=args.imgsz,
             temp_dir=temp_dir,
         )
@@ -5001,21 +4993,22 @@ def main() -> None:
         tile_executor: Optional[ThreadPoolExecutor] = None
         tile_video_workers = 0
 
-        if dense_tiling_active and view.family == 'orthogonal':
-            for job in aug_jobs:
-                tile_jobs_for_view.extend(build_dense_tile_jobs_for_aug(
-                    view=view,
-                    aug_job=job,
-                    tile_size=int(args.tile_size),
-                    tile_stride=int(args.tile_stride),
-                    out_size=int(args.imgsz),
-                    temp_dir=temp_dir,
-                ))
+        if dense_tiling_active:
+            for tile_cfg in tile_configs:
+                for job in aug_jobs:
+                    tile_jobs_for_view.extend(build_dense_tile_jobs_for_aug(
+                        view=view,
+                        aug_job=job,
+                        tile_cfg=tile_cfg,
+                        out_size=int(args.imgsz),
+                        temp_dir=temp_dir,
+                    ))
             if tile_jobs_for_view:
                 tile_video_workers = max(1, min(int(worker_budget), int(len(tile_jobs_for_view))))
                 print(
                     f"Starting background dense tile rendering for {view.name}: "
-                    f"{len(tile_jobs_for_view)} tile video(s) with {tile_video_workers} worker(s)"
+                    f"{len(tile_jobs_for_view)} tile video(s) across {len(tile_configs)} tile configuration(s) "
+                    f"with {tile_video_workers} worker(s)"
                 )
                 tile_executor = ThreadPoolExecutor(
                     max_workers=int(tile_video_workers),
@@ -5062,7 +5055,7 @@ def main() -> None:
                     except Exception:
                         pass
 
-            if dense_tiling_active and view.family == 'orthogonal' and tile_jobs_for_view:
+            if dense_tiling_active and tile_jobs_for_view:
                 ready_iter = iter_dense_tile_jobs_in_completion_order(tile_ready_jobs, tile_future_to_job)
                 for tile_job in tqdm(
                     ready_iter,
@@ -5078,8 +5071,8 @@ def main() -> None:
                             out_size=args.imgsz,
                             pred_out_prefix=pred_prefix,
                             cfg=pred_cfg,
-                            view_union_mm=tiled_union_by_model_view[model_name],
-                            view_confmap_mm=tiled_confmap_by_model_view[model_name],
+                            view_union_mm=tiled_union_by_model_view[model_name][tile_job.config_id],
+                            view_confmap_mm=tiled_confmap_by_model_view[model_name][tile_job.config_id],
                             M_out_to_native=tile_job.M_out_to_src,
                             native_h=view.src_h,
                             native_w=view.src_w,
@@ -5111,88 +5104,120 @@ def main() -> None:
                 flush_array(baseline_union_by_model_view[model_name])
                 flush_array(baseline_confmap_by_model_view[model_name])
 
-            out_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.u8.dat'
-            if view.family == 'radial':
-                baseline_volume = backproject_radial_union_to_volume(
-                    union_mm=baseline_union_by_model_view[model_name],
-                    radial_view=view,
-                    out_path=out_path,
-                    desc=f'Backprojecting {model_name}/{view.name}',
-                    prefer_memory=True,
-                )
-            else:
-                baseline_volume = unpack_view_union_to_volume(
-                    union_mm=baseline_union_by_model_view[model_name],
-                    num_slices=view.num_slices,
-                    h=view.src_h,
-                    w=view.src_w,
-                    out_path=out_path,
-                    desc=f'Unpacking {model_name}/{view.name}',
-                    prefer_memory=True,
-                    workers=slice_postprocess_workers,
-                )
-
-            if dense_tiling_active and view.family == 'orthogonal':
-                if args.min_conf > 0:
-                    apply_min_conf_filter_with_confmap_inplace(
-                        tiled_union_by_model_view[model_name],
-                        tiled_confmap_by_model_view[model_name],
-                        float(args.min_conf),
-                        view.src_h,
-                        view.src_w,
-                        workers=slice_postprocess_workers,
-                    )
-                    flush_array(tiled_union_by_model_view[model_name])
-                    flush_array(tiled_confmap_by_model_view[model_name])
-
-                tiled_volume_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.tiled.u8.dat'
-                tiled_volume = unpack_view_union_to_volume(
-                    union_mm=tiled_union_by_model_view[model_name],
-                    num_slices=view.num_slices,
-                    h=view.src_h,
-                    w=view.src_w,
-                    out_path=tiled_volume_path,
-                    desc=f'Unpacking {model_name}/{view.name} tiled',
-                    prefer_memory=True,
-                    workers=slice_postprocess_workers,
-                )
-                gate_stats = objectwise_gated_or_inplace(
-                    baseline_mask_mm=baseline_volume,
-                    baseline_confmap_mm=baseline_confmap_by_model_view[model_name],
-                    tiled_mask_mm=tiled_volume,
-                    tiled_confmap_mm=tiled_confmap_by_model_view[model_name],
-                    work_dir=temp_dir / 'gated_or' / model_name / view.name,
-                    keep_temp=bool(args.troubleshooting),
-                    prefer_memory=True,
-                )
-                print(
-                    f"Dense tiled gating {model_name}/{view.name}: baseline_objects={gate_stats['baseline_objects']}, "
-                    f"tiled_objects={gate_stats['tiled_objects']}, "
-                    f"accepted_tiled_objects={gate_stats['accepted_tiled_objects']}, "
-                    f"rejected_tiled_objects={gate_stats['rejected_tiled_objects']}, "
-                    f"gated_added_voxels={gate_stats['gated_added_voxels']}"
-                )
-                close_memmap_array(tiled_volume)
-                if not args.troubleshooting:
-                    try:
-                        tiled_volume_path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-
-            fill_2d_holes_volume_inplace(
-                baseline_volume,
+            native_volume_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.native.u8.dat'
+            baseline_native_volume = unpack_view_union_to_volume(
+                union_mm=baseline_union_by_model_view[model_name],
+                num_slices=view.num_slices,
+                h=view.src_h,
+                w=view.src_w,
+                out_path=native_volume_path,
+                desc=f'Unpacking {model_name}/{view.name}',
+                prefer_memory=True,
                 workers=slice_postprocess_workers,
             )
 
-            if float(args.min_radius) > 0:
-                apply_view_min_radius_filter_inplace(
-                    baseline_volume,
-                    view,
-                    float(args.min_radius),
+            baseline_labels_mm: Optional[np.ndarray] = None
+            baseline_label_paths: List[Path] = []
+            baseline_objects = 0
+            try:
+                if dense_tiling_active and tile_configs:
+                    if np.any(np.asarray(baseline_native_volume)):
+                        baseline_labels_mm, baseline_objects, baseline_label_paths = label_foreground_volume_streaming(
+                            baseline_native_volume,
+                            temp_dir / 'gated_or' / model_name / view.name / 'baseline_support',
+                            keep_temp=True,
+                            prefer_memory=True,
+                        )
+                    for tile_cfg in tile_configs:
+                        if args.min_conf > 0:
+                            apply_min_conf_filter_with_confmap_inplace(
+                                tiled_union_by_model_view[model_name][tile_cfg.config_id],
+                                tiled_confmap_by_model_view[model_name][tile_cfg.config_id],
+                                float(args.min_conf),
+                                view.src_h,
+                                view.src_w,
+                                workers=slice_postprocess_workers,
+                            )
+                            flush_array(tiled_union_by_model_view[model_name][tile_cfg.config_id])
+                            flush_array(tiled_confmap_by_model_view[model_name][tile_cfg.config_id])
+
+                        tiled_volume_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.{tile_cfg.config_id}.tiled.native.u8.dat'
+                        tiled_native_volume = unpack_view_union_to_volume(
+                            union_mm=tiled_union_by_model_view[model_name][tile_cfg.config_id],
+                            num_slices=view.num_slices,
+                            h=view.src_h,
+                            w=view.src_w,
+                            out_path=tiled_volume_path,
+                            desc=f'Unpacking {model_name}/{view.name} tiled [{tile_cfg.config_id}]',
+                            prefer_memory=True,
+                            workers=slice_postprocess_workers,
+                        )
+                        gate_stats = objectwise_gated_or_inplace(
+                            baseline_mask_mm=baseline_native_volume,
+                            baseline_confmap_mm=baseline_confmap_by_model_view[model_name],
+                            tiled_mask_mm=tiled_native_volume,
+                            tiled_confmap_mm=tiled_confmap_by_model_view[model_name][tile_cfg.config_id],
+                            work_dir=temp_dir / 'gated_or' / model_name / view.name / tile_cfg.config_id,
+                            baseline_labels_mm=baseline_labels_mm,
+                            baseline_objects=baseline_objects,
+                            keep_temp=bool(args.troubleshooting),
+                            prefer_memory=True,
+                        )
+                        print(
+                            f"Dense tiled gating {model_name}/{view.name} [{tile_cfg.config_id}]: baseline_objects={gate_stats['baseline_objects']}, "
+                            f"tiled_objects={gate_stats['tiled_objects']}, "
+                            f"accepted_tiled_objects={gate_stats['accepted_tiled_objects']}, "
+                            f"rejected_tiled_objects={gate_stats['rejected_tiled_objects']}, "
+                            f"gated_added_voxels={gate_stats['gated_added_voxels']}"
+                        )
+                        close_memmap_array(tiled_native_volume)
+                        if not args.troubleshooting:
+                            try:
+                                tiled_volume_path.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+
+                fill_2d_holes_volume_inplace(
+                    baseline_native_volume,
                     workers=slice_postprocess_workers,
                 )
 
-            view_volumes_by_model[model_name][view.name] = baseline_volume
+                if view.family == 'radial':
+                    out_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.u8.dat'
+                    baseline_volume = backproject_radial_volume_to_volume(
+                        radial_mask_mm=baseline_native_volume,
+                        radial_view=view,
+                        out_path=out_path,
+                        desc=f'Backprojecting {model_name}/{view.name}',
+                        prefer_memory=True,
+                    )
+                    close_memmap_array(baseline_native_volume)
+                    if not args.troubleshooting:
+                        try:
+                            native_volume_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                else:
+                    baseline_volume = baseline_native_volume
+
+                if float(args.min_radius) > 0:
+                    apply_view_min_radius_filter_inplace(
+                        baseline_volume,
+                        view,
+                        float(args.min_radius),
+                        workers=slice_postprocess_workers,
+                    )
+
+                view_volumes_by_model[model_name][view.name] = baseline_volume
+            finally:
+                if baseline_labels_mm is not None:
+                    close_memmap_array(baseline_labels_mm)
+                if not args.troubleshooting:
+                    for p in baseline_label_paths:
+                        try:
+                            p.unlink(missing_ok=True)
+                        except Exception:
+                            pass
 
             confmap_mm_done = baseline_confmap_by_model_view.pop(model_name, None)
             union_mm_done = baseline_union_by_model_view.pop(model_name, None)
@@ -5201,11 +5226,13 @@ def main() -> None:
             del confmap_mm_done, union_mm_done
 
             if model_name in tiled_confmap_by_model_view:
-                tiled_confmap_mm_done = tiled_confmap_by_model_view.pop(model_name, None)
-                tiled_union_mm_done = tiled_union_by_model_view.pop(model_name, None)
-                close_memmap_array(tiled_confmap_mm_done)
-                close_memmap_array(tiled_union_mm_done)
-                del tiled_confmap_mm_done, tiled_union_mm_done
+                tiled_confmaps_done = tiled_confmap_by_model_view.pop(model_name, {})
+                tiled_unions_done = tiled_union_by_model_view.pop(model_name, {})
+                for mm in tiled_confmaps_done.values():
+                    close_memmap_array(mm)
+                for mm in tiled_unions_done.values():
+                    close_memmap_array(mm)
+                del tiled_confmaps_done, tiled_unions_done
 
             if not args.troubleshooting:
                 try:
@@ -5217,14 +5244,16 @@ def main() -> None:
                 except Exception:
                     pass
                 if model_name in tiled_confmap_paths:
-                    try:
-                        tiled_confmap_paths[model_name].unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                    try:
-                        tiled_union_paths[model_name].unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                    for p in tiled_confmap_paths[model_name].values():
+                        try:
+                            p.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                    for p in tiled_union_paths[model_name].values():
+                        try:
+                            p.unlink(missing_ok=True)
+                        except Exception:
+                            pass
 
         baseline_union_by_model_view.clear()
         baseline_confmap_by_model_view.clear()
