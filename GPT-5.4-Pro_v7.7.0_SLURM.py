@@ -2,14 +2,19 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v7.6.0_SLURM-aligned script:
+This v7.7.0_SLURM-aligned script:
   - builds Transverse, optional Sagittal/Coronal, and optional Radial view families
   - generates rotated FFV1 MKV augmentation videos ahead of inference
   - supports dense tiled inference for all active views, including multi-configuration sliding-window sets,
     with object-wise gated OR back into the baseline view volume
-  - runs Ultralytics YOLO segmentation sequentially on each pre-generated video source
-  - inverse-maps predictions into native view coordinates, applies confidence filtering, hole filling, interpolation, and final 3D void fill
-  - saves the transverse default overlay plus optional labels, binary masks, NRRD, multiplanar, radial, image-sequence, and TTA outputs
+  - adds HPC-friendly parallel inference queues controlled by --workers, while keeping each queue thread-safe
+    by instantiating its own Ultralytics YOLO model
+  - keeps auto worker sizing at allocated vCPUs // 4, but oversubscribes CPU runtime threads to 16 per
+    inference worker by default for traditional HPC nodes
+  - inverse-maps predictions into native view coordinates, applies confidence filtering, hole filling,
+    interpolation with early termination when a pass adds no voxels, and final 3D void fill
+  - saves the transverse default overlay plus optional labels, binary masks, NRRD, multiplanar, radial,
+    image-sequence, and TTA outputs
 
 Dependencies (Python):
   pip install opencv-python numpy scipy scikit-image tifffile tqdm ultralytics
@@ -123,7 +128,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
     p.add_argument("--input", required=True, type=str, help="Input video path")
     p.add_argument("--output", default=None, type=str, help="Output directory (default ./{Filename}/)")
-    p.add_argument("--device", default="0", type=str, help="Device passed to YOLO predict")
+    p.add_argument("--device", default="cpu", type=str, help="Device passed to YOLO predict")
     p.add_argument("--model", required=True, nargs="+", type=str, help="One or more YOLO segmentation model paths")
 
     p.add_argument("--imgsz", default=1536, type=int, help="Square input size used for YOLO predict")
@@ -137,6 +142,8 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Rotation angles in degrees for augmentation (comma or whitespace separated)")
     p.add_argument("--min_radius", default=0.0, type=float,
                    help="Remove objects with a transverse-plane radius smaller than this value. 0 disables the check")
+    p.add_argument("--workers", default="auto", type=str,
+                   help="Number of parallel inference queues. \"auto\" uses the allocated vCPU count // 4; runtime CPU threads default to 16 per worker")
 
     p.add_argument("--enable_multiplanar", action="store_true",
                    help="Enable Sagittal and Coronal Cartesian views in addition to the required Transverse view")
@@ -264,8 +271,16 @@ def _cpu_count() -> int:
     return max(1, int(os.cpu_count() or 1))
 
 
+DEFAULT_INFERENCE_VCPUS_PER_QUEUE = 4
+DEFAULT_INFERENCE_THREADS_PER_QUEUE = 32
+
+
 def default_worker_budget() -> int:
     return max(1, int(_cpu_count()))
+
+
+def default_inference_queue_workers(vcpus_per_queue: int = DEFAULT_INFERENCE_VCPUS_PER_QUEUE) -> int:
+    return max(1, int(_cpu_count()) // max(1, int(vcpus_per_queue)))
 
 
 def default_augmentation_workers() -> int:
@@ -280,6 +295,32 @@ def default_output_workers() -> int:
     return int(default_worker_budget())
 
 
+def resolve_inference_queue_workers(
+    requested: object,
+    env_name: str = 'YOLO_TTA_WORKERS',
+    vcpus_per_queue: int = DEFAULT_INFERENCE_VCPUS_PER_QUEUE,
+    max_tasks: Optional[int] = None,
+) -> int:
+    auto_value = max(1, int(_cpu_count()) // max(1, int(vcpus_per_queue)))
+
+    raw = '' if requested is None else str(requested).strip()
+    if not raw:
+        raw = os.environ.get(env_name, '').strip()
+
+    if not raw or raw.lower() == 'auto':
+        workers = int(auto_value)
+    else:
+        try:
+            workers = int(raw)
+        except Exception as e:
+            raise ValueError('--workers must be "auto" or a positive integer') from e
+
+    workers = max(1, int(workers))
+    if max_tasks is not None:
+        workers = max(1, min(int(workers), int(max_tasks)))
+    return workers
+
+
 def resolve_worker_count(requested: int, env_name: str, auto_value: int, max_tasks: Optional[int] = None) -> int:
     workers = int(requested)
     if workers <= 0:
@@ -288,6 +329,51 @@ def resolve_worker_count(requested: int, env_name: str, auto_value: int, max_tas
     if max_tasks is not None:
         workers = max(1, min(int(workers), int(max_tasks)))
     return workers
+
+
+def choose_predict_postprocess_workers(worker_budget: int, active_inference_queues: int) -> int:
+    active = max(1, int(active_inference_queues))
+    auto_value = min(
+        int(worker_budget),
+        max(4, min(32, max(8, int(worker_budget) // active))),
+    )
+    return max(1, _env_int('YOLO_TTA_PREDICT_POSTPROCESS_WORKERS', int(auto_value)))
+
+
+def resolve_inference_runtime_threads_per_worker(
+    default_threads_per_worker: int = DEFAULT_INFERENCE_THREADS_PER_QUEUE,
+    env_name: str = 'YOLO_TTA_INFERENCE_THREADS_PER_WORKER',
+) -> int:
+    return max(1, _env_int(env_name, int(default_threads_per_worker)))
+
+
+def configure_inference_runtime_threads(runtime_threads_per_worker: int = DEFAULT_INFERENCE_THREADS_PER_QUEUE) -> int:
+    thread_count = max(1, int(resolve_inference_runtime_threads_per_worker(int(runtime_threads_per_worker))))
+
+    for env_name in (
+        'OMP_NUM_THREADS',
+        'MKL_NUM_THREADS',
+        'OPENBLAS_NUM_THREADS',
+        'NUMEXPR_NUM_THREADS',
+        'VECLIB_MAXIMUM_THREADS',
+        'BLIS_NUM_THREADS',
+    ):
+        if not os.environ.get(env_name, '').strip():
+            os.environ[env_name] = str(thread_count)
+
+    try:
+        import torch  # type: ignore
+
+        torch.set_num_threads(thread_count)
+        if hasattr(torch, 'set_num_interop_threads'):
+            try:
+                torch.set_num_interop_threads(1)
+            except RuntimeError:
+                pass
+    except Exception:
+        pass
+
+    return int(thread_count)
 
 
 def array_nbytes(shape: Sequence[int], dtype: np.dtype | str | type) -> int:
@@ -633,9 +719,8 @@ def ffprobe_info(video_path: Path) -> Dict[str, object]:
     cmd = [
         "ffprobe",
         "-v", "error",
-        "-count_frames",
         "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,r_frame_rate,avg_frame_rate,nb_read_frames,nb_frames",
+        "-show_entries", "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames",
         "-of", "json",
         str(video_path),
     ]
@@ -661,13 +746,24 @@ def ffprobe_info(video_path: Path) -> Dict[str, object]:
     if fps <= 0:
         fps = 30.0
 
-    nf = st.get("nb_read_frames", None)
+    nf = st.get("nb_frames", None)
     if nf is None or str(nf).strip() == "" or str(nf) == "N/A":
-        nf = st.get("nb_frames", None)
+        # Fast fallback: count packets without decoding
+        fallback_cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-count_packets",
+            "-show_entries", "stream=nb_read_packets",
+            "-of", "json",
+            str(video_path),
+        ]
+        p2 = subprocess.run(fallback_cmd, capture_output=True, text=True, check=True)
+        info2 = json.loads(p2.stdout)
+        nf = info2["streams"][0].get("nb_read_packets", None)
     if nf is None or str(nf).strip() == "" or str(nf) == "N/A":
         raise RuntimeError(
-            "ffprobe could not determine frame count (nb_read_frames/nb_frames missing). "
-            "Please provide an input with a known frame count."
+            "ffprobe could not determine frame count (nb_frames/nb_read_packets missing)."
         )
     num_frames = int(nf)
     return {"width": width, "height": height, "fps": fps, "num_frames": num_frames}
@@ -1840,6 +1936,88 @@ class PredictConfig:
     device: str
     half: bool
     int8: bool
+
+
+@dataclass(frozen=True)
+class InferenceVideoTask:
+    label: str
+    video_path: Path
+    meta_path: Optional[Path]
+    num_frames: int
+    out_size: int
+    pred_out_prefix: Path
+    M_out_to_native: np.ndarray
+    wait_future: Optional[Future] = None
+
+
+def run_inference_video_queue(
+    *,
+    model_path: str,
+    queue_label: str,
+    video_tasks: Sequence[InferenceVideoTask],
+    pred_cfg: PredictConfig,
+    view_union_mm: np.ndarray,
+    view_confmap_mm: np.ndarray,
+    native_h: int,
+    native_w: int,
+    postprocess_workers: int,
+    runtime_threads_per_worker: int = DEFAULT_INFERENCE_THREADS_PER_QUEUE,
+) -> Dict[str, int]:
+    if not video_tasks:
+        return {
+            'prediction_count': 0,
+            'frames_with_predictions': 0,
+            'videos_processed': 0,
+        }
+
+    actual_runtime_threads = configure_inference_runtime_threads(int(runtime_threads_per_worker))
+    print(
+        f"Launching inference queue {queue_label}: "
+        f"{len(video_tasks)} video(s), postprocess_workers={int(postprocess_workers)}, "
+        f"runtime_threads={int(actual_runtime_threads)}"
+    )
+
+    model = load_ultralytics_model(model_path)
+    prediction_count = 0
+    frames_with_predictions = 0
+
+    try:
+        for task in video_tasks:
+            if task.wait_future is not None:
+                task.wait_future.result()
+            if not task.video_path.exists():
+                raise FileNotFoundError(task.video_path)
+
+            pred_stats = predict_video_and_accumulate(
+                model=model,
+                video_path=task.video_path,
+                num_frames=int(task.num_frames),
+                out_size=int(task.out_size),
+                pred_out_prefix=task.pred_out_prefix,
+                cfg=pred_cfg,
+                view_union_mm=view_union_mm,
+                view_confmap_mm=view_confmap_mm,
+                M_out_to_native=task.M_out_to_native,
+                native_h=int(native_h),
+                native_w=int(native_w),
+                postprocess_workers=int(postprocess_workers),
+            )
+            prediction_count += int(pred_stats.get('prediction_count', 0))
+            frames_with_predictions += int(pred_stats.get('frames_with_predictions', 0))
+    finally:
+        del model
+        gc.collect()
+
+    print(
+        f"Finished inference queue {queue_label}: "
+        f"videos={len(video_tasks)}, predictions={int(prediction_count)}, "
+        f"frames_with_predictions={int(frames_with_predictions)}"
+    )
+    return {
+        'prediction_count': int(prediction_count),
+        'frames_with_predictions': int(frames_with_predictions),
+        'videos_processed': int(len(video_tasks)),
+    }
 
 
 def _extract_result_masks_and_confs(r) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
@@ -4687,10 +4865,14 @@ def write_summary_file(
     interpolation_stats: List[Dict[str, object]],
     voxel_volume: Optional[int],
     final_paths: Dict[str, Path],
+    inference_queue_workers: int,
     augmentation_workers: int,
     slice_postprocess_workers: int,
+    predict_postprocess_workers: int,
     interpolation_workers: int,
     output_workers: int,
+    output_frame_workers: int,
+    inference_runtime_threads_per_worker: int,
 ) -> Path:
     lines: List[str] = []
     lines.append(f'Command: {command}')
@@ -4700,10 +4882,17 @@ def write_summary_file(
     lines.append(f'FPS: {fps}')
     lines.append(f'Scratch directory: {scratch_dir}')
     lines.append('Workspace policy: in-memory first with disk fallback when the working set exceeds available RAM/swap')
+    lines.append(f'Inference queue workers (--workers): {int(inference_queue_workers)}')
+    lines.append(
+        f'Inference runtime threads per worker: {int(inference_runtime_threads_per_worker)} '
+        f'(auto worker count still uses allocated vCPUs // {DEFAULT_INFERENCE_VCPUS_PER_QUEUE})'
+    )
     lines.append(f'Augmentation workers: {int(augmentation_workers)}')
     lines.append(f'Slice-parallel postprocess workers: {int(slice_postprocess_workers)}')
+    lines.append(f'Inference postprocess workers (max used): {int(predict_postprocess_workers)}')
     lines.append(f'Interpolation workers: {int(interpolation_workers)}')
     lines.append(f'Output workers: {int(output_workers)}')
+    lines.append(f'Output frame workers per label/TIFF task: {int(output_frame_workers)}')
     lines.append(f'Models: {", ".join(str(Path(m)) for m in model_paths)}')
     lines.append(f'Views: {", ".join(view_names)}')
 
@@ -4841,11 +5030,11 @@ def main() -> None:
     )
     cartesian_views = orthogonal_views_only(views)
 
-    yolo_models: List[Tuple[str, object]] = []
+    model_specs: List[Tuple[str, str]] = []
     for m in model_paths:
         name = Path(m).stem
-        print(f'Loading model: {name} ({m})')
-        yolo_models.append((name, load_ultralytics_model(m)))
+        print(f'Registered model: {name} ({m})')
+        model_specs.append((name, m))
 
     pred_cfg = PredictConfig(
         imgsz=args.imgsz,
@@ -4856,6 +5045,8 @@ def main() -> None:
     )
 
     worker_budget = int(default_worker_budget())
+    inference_queue_workers = resolve_inference_queue_workers(args.workers)
+    inference_runtime_threads_per_worker = resolve_inference_runtime_threads_per_worker()
     augmentation_workers = resolve_worker_count(
         0,
         'YOLO_TTA_AUG_WORKERS',
@@ -4866,34 +5057,63 @@ def main() -> None:
         0,
         'YOLO_TTA_INTERPOLATION_WORKERS',
         worker_budget,
-        max_tasks=max(1, len(yolo_models) * len(cartesian_views)),
+        max_tasks=max(1, len(model_specs) * len(cartesian_views)),
     )
     output_workers = resolve_worker_count(
         0,
         'YOLO_TTA_OUTPUT_WORKERS',
-        worker_budget,
-        max_tasks=12,
+        max(4, min(worker_budget, max(16, int(inference_queue_workers)))),
+        max_tasks=max(4, min(32, worker_budget)),
     )
-    output_frame_workers = max(1, min(8, _env_int('YOLO_TTA_OUTPUT_FRAME_WORKERS', max(1, min(4, output_workers)))))
+    output_frame_workers = max(
+        1,
+        min(
+            16,
+            _env_int(
+                'YOLO_TTA_OUTPUT_FRAME_WORKERS',
+                max(1, min(16, max(4, output_workers // 2))),
+            ),
+        ),
+    )
     slice_postprocess_workers = max(1, int(augmentation_workers))
-    predict_postprocess_workers = max(1, min(16, _env_int('YOLO_TTA_PREDICT_POSTPROCESS_WORKERS', slice_postprocess_workers)))
+    predict_postprocess_workers_max_used = 0
     print(f'Allocated CPU count: {_cpu_count()}')
     print(f'Worker budget: {worker_budget}')
+    print(
+        f'Inference queue workers (--workers): {inference_queue_workers} '
+        f'(auto = allocated vCPUs // {DEFAULT_INFERENCE_VCPUS_PER_QUEUE})'
+    )
+    print(
+        f'Inference runtime threads per worker: {inference_runtime_threads_per_worker} '
+        f'(oversubscribed relative to the 4-vCPU worker sizing basis)'
+    )
     print(f'Augmentation workers: {augmentation_workers}')
     print(f'Slice-parallel postprocess workers: {slice_postprocess_workers}')
-    print(f'Inference postprocess workers: {predict_postprocess_workers}')
+    print('Inference postprocess workers: dynamic per active queue set '
+          '(override with YOLO_TTA_PREDICT_POSTPROCESS_WORKERS)')
     print(f'Interpolation workers: {interpolation_workers}')
     print(f'Background output workers: {output_workers} (frame workers per labels/TIFF task: {output_frame_workers})')
+    if str(args.device).strip().lower() != 'cpu' and int(inference_queue_workers) > 1:
+        print(
+            f'Warning: device={args.device} with --workers={inference_queue_workers} will create '
+            'one YOLO model instance per active inference queue, which increases accelerator memory usage.'
+        )
 
     output_manager = BackgroundOutputManager(max_workers=output_workers)
 
-    if augmentation_workers > 1 or interpolation_workers > 1 or slice_postprocess_workers > 1 or output_workers > 1:
+    if (
+        inference_queue_workers > 1
+        or augmentation_workers > 1
+        or interpolation_workers > 1
+        or slice_postprocess_workers > 1
+        or output_workers > 1
+    ):
         try:
             cv2.setNumThreads(1)
         except Exception:
             pass
 
-    view_volumes_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
+    view_volumes_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in model_specs}
     aug_jobs_by_view: Dict[str, List[AugJob]] = {}
     dense_tiling_active = len(tile_configs) > 0
     view_prediction_stats: Dict[str, int] = {
@@ -4918,7 +5138,7 @@ def main() -> None:
         tiled_union_paths: Dict[str, Dict[str, Path]] = {}
         tiled_confmap_paths: Dict[str, Dict[str, Path]] = {}
 
-        for model_name, _ in yolo_models:
+        for model_name, _ in model_specs:
             bytes_native = bytes_for_packbits(view.src_h, view.src_w)
             union_path = temp_dir / 'union' / model_name / f'{view.name}.union.packbits.dat'
             confmap_path = temp_dir / 'union' / model_name / f'{view.name}.confmap.f16.dat'
@@ -5023,74 +5243,142 @@ def main() -> None:
                     workers_per_job=1,
                 )
 
+        tile_jobs_by_config: Dict[str, List[DenseTileJob]] = {}
+        tile_future_by_tile_id: Dict[str, Future] = {}
+        if dense_tiling_active:
+            for tile_job in tile_jobs_for_view:
+                tile_jobs_by_config.setdefault(tile_job.config_id, []).append(tile_job)
+            for fut, tile_job in tile_future_to_job.items():
+                tile_future_by_tile_id[tile_job.tile_id] = fut
+
         try:
-            for job in aug_jobs:
-                aug_id = job.aug_id
-                aug_video = job.video_path
-                aug_meta = job.meta_path
-                aff = job.aff
+            inference_queue_specs: List[Tuple[str, str, List[InferenceVideoTask], np.ndarray, np.ndarray]] = []
 
-                for model_name, yolo in yolo_models:
-                    pred_prefix = temp_dir / 'preds' / model_name / view.name / f'{view.name}_{aug_id}'
-                    pred_stats = predict_video_and_accumulate(
-                        model=yolo,
-                        video_path=aug_video,
-                        num_frames=view.num_slices,
-                        out_size=args.imgsz,
-                        pred_out_prefix=pred_prefix,
-                        cfg=pred_cfg,
-                        view_union_mm=baseline_union_by_model_view[model_name],
-                        view_confmap_mm=baseline_confmap_by_model_view[model_name],
-                        M_out_to_native=aff.M_out_to_src,
-                        native_h=view.src_h,
-                        native_w=view.src_w,
-                        postprocess_workers=predict_postprocess_workers,
+            for model_name, model_path in model_specs:
+                baseline_video_tasks = [
+                    InferenceVideoTask(
+                        label=f'{view.name}_{job.aug_id}',
+                        video_path=job.video_path,
+                        meta_path=job.meta_path,
+                        num_frames=int(view.num_slices),
+                        out_size=int(args.imgsz),
+                        pred_out_prefix=temp_dir / 'preds' / model_name / view.name / f'{view.name}_{job.aug_id}',
+                        M_out_to_native=job.aff.M_out_to_src,
+                        wait_future=None,
                     )
-                    view_prediction_stats[view.name] = int(view_prediction_stats.get(view.name, 0)) + int(pred_stats.get('prediction_count', 0))
+                    for job in aug_jobs
+                ]
+                inference_queue_specs.append((
+                    f'{view.name}/{model_name}/baseline',
+                    model_path,
+                    baseline_video_tasks,
+                    baseline_union_by_model_view[model_name],
+                    baseline_confmap_by_model_view[model_name],
+                ))
 
-                if not args.troubleshooting and not args.save_TTA:
+                if dense_tiling_active and tile_configs:
+                    for tile_cfg in tile_configs:
+                        tile_video_tasks = [
+                            InferenceVideoTask(
+                                label=tile_job.tile_id,
+                                video_path=tile_job.video_path,
+                                meta_path=tile_job.meta_path,
+                                num_frames=int(view.num_slices),
+                                out_size=int(args.imgsz),
+                                pred_out_prefix=temp_dir / 'preds' / model_name / view.name / 'tiles' / tile_job.tile_id,
+                                M_out_to_native=tile_job.M_out_to_src,
+                                wait_future=tile_future_by_tile_id.get(tile_job.tile_id),
+                            )
+                            for tile_job in tile_jobs_by_config.get(tile_cfg.config_id, [])
+                        ]
+                        if tile_video_tasks:
+                            inference_queue_specs.append((
+                                f'{view.name}/{model_name}/{tile_cfg.config_id}',
+                                model_path,
+                                tile_video_tasks,
+                                tiled_union_by_model_view[model_name][tile_cfg.config_id],
+                                tiled_confmap_by_model_view[model_name][tile_cfg.config_id],
+                            ))
+
+            active_inference_queue_workers = max(1, min(int(inference_queue_workers), len(inference_queue_specs)))
+            predict_postprocess_workers = choose_predict_postprocess_workers(
+                int(worker_budget),
+                int(active_inference_queue_workers),
+            )
+            predict_postprocess_workers_max_used = max(
+                int(predict_postprocess_workers_max_used),
+                int(predict_postprocess_workers),
+            )
+            print(
+                f"Launching inference queues for {view.name}: requested={int(inference_queue_workers)}, "
+                f"active={int(active_inference_queue_workers)}, "
+                f"postprocess_workers_per_queue={int(predict_postprocess_workers)}"
+            )
+
+            if active_inference_queue_workers > 1 and len(inference_queue_specs) > 1:
+                with ThreadPoolExecutor(
+                    max_workers=int(active_inference_queue_workers),
+                    thread_name_prefix=f'infer-{view.name}',
+                ) as inference_executor:
+                    future_to_queue = {
+                        inference_executor.submit(
+                            run_inference_video_queue,
+                            model_path=model_path,
+                            queue_label=queue_label,
+                            video_tasks=video_tasks,
+                            pred_cfg=pred_cfg,
+                            view_union_mm=union_mm,
+                            view_confmap_mm=confmap_mm,
+                            native_h=int(view.src_h),
+                            native_w=int(view.src_w),
+                            postprocess_workers=int(predict_postprocess_workers),
+                            runtime_threads_per_worker=int(inference_runtime_threads_per_worker),
+                        ): queue_label
+                        for queue_label, model_path, video_tasks, union_mm, confmap_mm in inference_queue_specs
+                    }
+                    for fut in tqdm(
+                        as_completed(list(future_to_queue.keys())),
+                        total=len(future_to_queue),
+                        desc=f'Inference queues {view.name}',
+                    ):
+                        queue_stats = fut.result()
+                        view_prediction_stats[view.name] = int(view_prediction_stats.get(view.name, 0)) + int(queue_stats.get('prediction_count', 0))
+            else:
+                for queue_label, model_path, video_tasks, union_mm, confmap_mm in inference_queue_specs:
+                    queue_stats = run_inference_video_queue(
+                        model_path=model_path,
+                        queue_label=queue_label,
+                        video_tasks=video_tasks,
+                        pred_cfg=pred_cfg,
+                        view_union_mm=union_mm,
+                        view_confmap_mm=confmap_mm,
+                        native_h=int(view.src_h),
+                        native_w=int(view.src_w),
+                        postprocess_workers=int(predict_postprocess_workers),
+                        runtime_threads_per_worker=int(inference_runtime_threads_per_worker),
+                    )
+                    view_prediction_stats[view.name] = int(view_prediction_stats.get(view.name, 0)) + int(queue_stats.get('prediction_count', 0))
+
+            if not args.troubleshooting and not args.save_TTA:
+                for job in aug_jobs:
                     try:
-                        aug_video.unlink(missing_ok=True)
-                        aug_meta.unlink(missing_ok=True)
+                        job.video_path.unlink(missing_ok=True)
+                        job.meta_path.unlink(missing_ok=True)
                     except Exception:
                         pass
 
-            if dense_tiling_active and tile_jobs_for_view:
-                ready_iter = iter_dense_tile_jobs_in_completion_order(tile_ready_jobs, tile_future_to_job)
-                for tile_job in tqdm(
-                    ready_iter,
-                    total=len(tile_jobs_for_view),
-                    desc=f'Dense tiled inference {view.name}',
-                ):
-                    for model_name, yolo in yolo_models:
-                        pred_prefix = temp_dir / 'preds' / model_name / view.name / 'tiles' / tile_job.tile_id
-                        pred_stats = predict_video_and_accumulate(
-                            model=yolo,
-                            video_path=tile_job.video_path,
-                            num_frames=view.num_slices,
-                            out_size=args.imgsz,
-                            pred_out_prefix=pred_prefix,
-                            cfg=pred_cfg,
-                            view_union_mm=tiled_union_by_model_view[model_name][tile_job.config_id],
-                            view_confmap_mm=tiled_confmap_by_model_view[model_name][tile_job.config_id],
-                            M_out_to_native=tile_job.M_out_to_src,
-                            native_h=view.src_h,
-                            native_w=view.src_w,
-                            postprocess_workers=predict_postprocess_workers,
-                        )
-                        view_prediction_stats[view.name] = int(view_prediction_stats.get(view.name, 0)) + int(pred_stats.get('prediction_count', 0))
-
-                    if not args.troubleshooting:
-                        try:
-                            tile_job.video_path.unlink(missing_ok=True)
-                            tile_job.meta_path.unlink(missing_ok=True)
-                        except Exception:
-                            pass
+            if not args.troubleshooting:
+                for tile_job in tile_jobs_for_view:
+                    try:
+                        tile_job.video_path.unlink(missing_ok=True)
+                        tile_job.meta_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
         finally:
             if tile_executor is not None:
                 tile_executor.shutdown(wait=True)
 
-        for model_name, _ in yolo_models:
+        for model_name, _ in model_specs:
             print(f"\n--- Postprocessing view '{view.name}' for model '{model_name}' ---")
             if args.min_conf > 0:
                 apply_min_conf_filter_with_confmap_inplace(
@@ -5397,6 +5685,18 @@ def main() -> None:
                 for task_idx in range(len(task_specs)):
                     interpolation_stats.append(_run_interpolation_task(task_idx))
 
+            added_voxels_this_pass = sum(
+                int(s.get('added_voxels', 0))
+                for s in interpolation_stats
+                if int(s.get('pass_index', 0)) == int(pass_idx)
+            )
+            if added_voxels_this_pass <= 0:
+                print(
+                    f"No interpolation voxels were added during pass {pass_idx}; "
+                    "terminating remaining interpolation passes early."
+                )
+                break
+
             if bool(args.troubleshooting) and pass_idx < total_passes:
                 print(f"\n=== Scheduling troubleshooting outputs: pass {pass_idx} (pre-next-pass, pre-void-fill) ===")
                 pass_mm = build_current_snapshot_volume(f'ensemble_pass{pass_idx}', apply_void_fill=False)
@@ -5597,10 +5897,14 @@ def main() -> None:
         interpolation_stats=interpolation_stats,
         voxel_volume=voxel_volume,
         final_paths=final_paths,
+        inference_queue_workers=inference_queue_workers,
         augmentation_workers=augmentation_workers,
         slice_postprocess_workers=slice_postprocess_workers,
+        predict_postprocess_workers=predict_postprocess_workers_max_used,
         interpolation_workers=interpolation_workers,
         output_workers=output_workers,
+        output_frame_workers=output_frame_workers,
+        inference_runtime_threads_per_worker=inference_runtime_threads_per_worker,
     )
 
     close_memmap_array(final_ensemble_mm)
