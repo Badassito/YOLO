@@ -2,11 +2,14 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v7.8.0_SLURM-aligned script:
+This v7.8.1_SLURM-aligned script:
   - builds Transverse, optional Sagittal/Coronal, and optional Radial view families
+  - prefetches active-view render assets so view creation can overlap across active families
   - generates rotated FFV1 MKV augmentation videos ahead of inference
   - supports dense tiled inference for all active views, including multi-configuration sliding-window sets,
     with direct per-tile gated OR back into the parent full-frame view volume
+  - reuses a native radial frame cache during dense tiled rendering so radial tiles do not recompute
+    the same Lanczos-5 slices for every tile location
   - runs Ultralytics YOLO segmentation sequentially on each pre-generated video source
   - inverse-maps predictions into native view coordinates, applies confidence filtering, hole filling, interpolation, and final 3D void fill
   - saves the transverse default overlay plus optional labels, binary masks, NRRD, multiplanar, radial, image-sequence, and TTA outputs
@@ -1438,6 +1441,7 @@ def render_view_video_with_affine(
     out_w: int,
     out_h: int,
     *,
+    view_frames: Optional[np.ndarray] = None,
     workers: int = 1,
     interpolation: int = cv2.INTER_LINEAR,
     desc: Optional[str] = None,
@@ -1456,7 +1460,7 @@ def render_view_video_with_affine(
         assert proc.stdin is not None
 
         def _render(idx: int) -> np.ndarray:
-            native_frame = np.ascontiguousarray(get_view_frame_by_index(volume_rgb, view, int(idx)))
+            native_frame = np.ascontiguousarray(get_view_frame_by_index(volume_rgb, view, int(idx), view_frames=view_frames))
             return cv2.warpAffine(
                 native_frame,
                 M_src_to_out,
@@ -1485,6 +1489,7 @@ def ensure_dense_tile_video(
     job: DenseTileJob,
     fps: float,
     workers: int,
+    view_frames: Optional[np.ndarray] = None,
     show_progress: bool = True,
 ) -> None:
     if not job.meta_path.exists():
@@ -1500,6 +1505,7 @@ def ensure_dense_tile_video(
         M_src_to_out=job.M_src_to_out,
         out_w=int(job.out_size),
         out_h=int(job.out_size),
+        view_frames=view_frames,
         workers=max(1, int(workers)),
         interpolation=cv2.INTER_LINEAR,
         desc=f'Dense tile {view.name} {job.tile_id}',
@@ -1514,6 +1520,7 @@ def submit_dense_tile_video_jobs(
     tile_jobs: Sequence[DenseTileJob],
     fps: float,
     workers_per_job: int,
+    view_frames: Optional[np.ndarray] = None,
 ) -> Tuple[List[DenseTileJob], Dict[Future, DenseTileJob]]:
     ready_jobs: List[DenseTileJob] = []
     future_to_job: Dict[Future, DenseTileJob] = {}
@@ -1531,6 +1538,7 @@ def submit_dense_tile_video_jobs(
             job,
             float(fps),
             max(1, int(workers_per_job)),
+            view_frames,
             False,
         )
         future_to_job[fut] = job
@@ -1551,8 +1559,78 @@ def iter_dense_tile_jobs_in_completion_order(
         yield future_to_job[fut]
 
 
-def iter_view_frames(volume_rgb: np.memmap, view: ViewInfo) -> Iterator[np.ndarray]:
+def should_cache_view_frames(view: ViewInfo, dense_tiling_active: bool) -> bool:
+    """Return True when precomputing native RGB frames is worthwhile for this view.
+
+    Radial view extraction is the dominant CPU cost during dense tiled rendering because every
+    tile video currently traverses the same expensive Lanczos-5 radial slices independently.
+    Caching the native radial frames once lets both full-frame augmentation and all tile videos
+    reuse that work.
+    """
+    return bool(dense_tiling_active) and view.family == 'radial'
+
+
+def estimate_view_frame_cache_bytes(view: ViewInfo) -> int:
+    return array_nbytes((int(view.num_slices), int(view.src_h), int(view.src_w), 3), np.uint8)
+
+
+def build_view_frame_cache(
+    volume_rgb: np.ndarray,
+    view: ViewInfo,
+    out_path: Path,
+    desc: str,
+    *,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 64 * GIB,
+    workers: int = 1,
+) -> np.ndarray:
+    """Materialize native RGB frames for a view into a reusable cache volume.
+
+    This is used primarily for the radial view when dense tiling is enabled so later tile video
+    generation no longer recomputes the same radial slices for every tile location.
+    """
+    cache_mm = allocate_workspace_array(
+        shape=(int(view.num_slices), int(view.src_h), int(view.src_w), 3),
+        dtype=np.uint8,
+        path=out_path,
+        desc=desc,
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
+    )
+
+    worker_count = choose_slice_parallel_workers(int(workers), int(view.num_slices))
+    print(
+        f"Preparing reusable native frame cache for view '{view.name}' over {int(view.num_slices)} slice(s) "
+        f"with {int(worker_count)} worker thread(s)"
+    )
+
+    def _build(idx: int) -> None:
+        cache_mm[int(idx), :, :, :] = np.ascontiguousarray(
+            get_view_frame_by_index(volume_rgb, view, int(idx), view_frames=None)
+        )
+
+    parallel_for_indices(
+        int(view.num_slices),
+        _build,
+        max_workers=worker_count,
+        desc=f'Caching {view.name} native frames',
+        show_progress=False,
+    )
+    flush_array(cache_mm)
+    return cache_mm
+
+
+def iter_view_frames(
+    volume_rgb: np.memmap,
+    view: ViewInfo,
+    view_frames: Optional[np.ndarray] = None,
+) -> Iterator[np.ndarray]:
     """Yield frames for a view, in slice order (0..num_slices-1)."""
+    if view_frames is not None:
+        for idx in range(int(view.num_slices)):
+            yield np.asarray(view_frames[int(idx)])
+        return
+
     T, H, W, C = volume_rgb.shape
     assert C == 3
 
@@ -1573,7 +1651,15 @@ def iter_view_frames(volume_rgb: np.memmap, view: ViewInfo) -> Iterator[np.ndarr
         raise ValueError(f'Unknown view: {view.name}')
 
 
-def get_view_frame_by_index(volume_rgb: np.ndarray, view: ViewInfo, index: int) -> np.ndarray:
+def get_view_frame_by_index(
+    volume_rgb: np.ndarray,
+    view: ViewInfo,
+    index: int,
+    view_frames: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    if view_frames is not None:
+        return np.asarray(view_frames[int(index)])
+
     T, H, W, C = volume_rgb.shape
     assert C == 3
 
@@ -1610,8 +1696,14 @@ def get_view_frame_by_index(volume_rgb: np.ndarray, view: ViewInfo, index: int) 
     raise ValueError(f'Unknown view: {view.name}')
 
 
-def _render_augmented_bundle_for_index(volume_rgb: np.ndarray, view: ViewInfo, jobs: Sequence[AugJob], index: int) -> List[np.ndarray]:
-    native_frame = np.ascontiguousarray(get_view_frame_by_index(volume_rgb, view, int(index)))
+def _render_augmented_bundle_for_index(
+    volume_rgb: np.ndarray,
+    view: ViewInfo,
+    jobs: Sequence[AugJob],
+    index: int,
+    view_frames: Optional[np.ndarray] = None,
+) -> List[np.ndarray]:
+    native_frame = np.ascontiguousarray(get_view_frame_by_index(volume_rgb, view, int(index), view_frames=view_frames))
     bundle: List[np.ndarray] = []
     for job in jobs:
         bundle.append(cv2.warpAffine(
@@ -1679,6 +1771,7 @@ def _ensure_augmented_videos_with_staging(
     missing_jobs: Sequence[AugJob],
     fps: float,
     worker_count: int,
+    view_frames: Optional[np.ndarray] = None,
 ) -> bool:
     if not missing_jobs:
         return True
@@ -1712,7 +1805,7 @@ def _ensure_augmented_videos_with_staging(
     def render_index(idx: int) -> None:
         if stop_event.is_set():
             return
-        bundle = _render_augmented_bundle_for_index(volume_rgb, view, missing_jobs, int(idx))
+        bundle = _render_augmented_bundle_for_index(volume_rgb, view, missing_jobs, int(idx), view_frames=view_frames)
         for job, out in zip(missing_jobs, bundle):
             staged_frames[job.aug_id][int(idx), :, :, :] = np.ascontiguousarray(out)
         with ready_cond:
@@ -1766,6 +1859,7 @@ def _ensure_augmented_videos_streaming(
     missing_jobs: Sequence[AugJob],
     fps: float,
     worker_count: int,
+    view_frames: Optional[np.ndarray] = None,
 ) -> None:
     writers: Dict[str, subprocess.Popen] = {}
     try:
@@ -1781,7 +1875,7 @@ def _ensure_augmented_videos_streaming(
                 pix_fmt_out='yuv444p',
             )
 
-        render = lambda idx: _render_augmented_bundle_for_index(volume_rgb, view, missing_jobs, idx)
+        render = lambda idx: _render_augmented_bundle_for_index(volume_rgb, view, missing_jobs, idx, view_frames=view_frames)
         pending = min(int(view.num_slices), max(worker_count + 1, worker_count * 8))
         for bundle in tqdm(
             parallel_map_in_order(render, range(view.num_slices), max_workers=worker_count, max_pending=pending),
@@ -1804,6 +1898,7 @@ def ensure_augmented_videos(
     aug_jobs: Sequence[AugJob],
     fps: float,
     augmentation_workers: int,
+    view_frames: Optional[np.ndarray] = None,
 ) -> None:
     missing_jobs = [job for job in aug_jobs if not job.video_path.exists()]
     for job in aug_jobs:
@@ -1821,6 +1916,8 @@ def ensure_augmented_videos(
         f"Generating {len(missing_jobs)} augmented {view.name} video(s) over {view.num_slices} slice(s) "
         f"with {worker_count} worker thread(s){mode_suffix}"
     )
+    if view_frames is not None:
+        print(f"Augmented {view.name} rendering will reuse the native frame cache")
 
     if _ensure_augmented_videos_with_staging(
         volume_rgb=volume_rgb,
@@ -1828,6 +1925,7 @@ def ensure_augmented_videos(
         missing_jobs=missing_jobs,
         fps=fps,
         worker_count=worker_count,
+        view_frames=view_frames,
     ):
         return
 
@@ -1837,7 +1935,56 @@ def ensure_augmented_videos(
         missing_jobs=missing_jobs,
         fps=fps,
         worker_count=worker_count,
+        view_frames=view_frames,
     )
+
+
+@dataclass
+class ViewPrefetchResult:
+    view_frames: Optional[np.ndarray]
+    view_frame_cache_path: Optional[Path]
+
+
+def prepare_view_render_assets(
+    volume_rgb: np.ndarray,
+    view: ViewInfo,
+    aug_jobs: Sequence[AugJob],
+    fps: float,
+    augmentation_workers: int,
+    dense_tiling_active: bool,
+    temp_dir: Path,
+) -> ViewPrefetchResult:
+    """Prefetch reusable render assets for a view.
+
+    This runs ahead of the main view-processing loop so expensive view construction can overlap
+    across active views within the global CPU budget.
+    """
+    view_frames: Optional[np.ndarray] = None
+    cache_path: Optional[Path] = None
+
+    print(f"Prefetching render assets for view '{view.name}'")
+
+    if should_cache_view_frames(view, dense_tiling_active):
+        cache_path = temp_dir / 'view_frames' / f'{view.name}.rgb24.dat'
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        view_frames = build_view_frame_cache(
+            volume_rgb=volume_rgb,
+            view=view,
+            out_path=cache_path,
+            desc=f'{view.name} native frame cache',
+            prefer_memory=True,
+            workers=max(1, int(augmentation_workers)),
+        )
+
+    ensure_augmented_videos(
+        volume_rgb=volume_rgb,
+        view=view,
+        aug_jobs=aug_jobs,
+        fps=float(fps),
+        augmentation_workers=max(1, int(augmentation_workers)),
+        view_frames=view_frames,
+    )
+    return ViewPrefetchResult(view_frames=view_frames, view_frame_cache_path=cache_path)
 
 
 # --------------------------
@@ -5142,10 +5289,54 @@ def main() -> None:
     }
 
     for view in views:
+        aug_jobs_by_view[view.name] = build_aug_jobs_for_view(
+            view=view,
+            angles=angles,
+            out_size=args.imgsz,
+            temp_dir=temp_dir,
+        )
+
+    view_prefetch_workers = max(
+        1,
+        min(len(views), max(1, augmentation_workers), _env_int('YOLO_TTA_VIEW_PREFETCH_WORKERS', max(1, len(views)))),
+    )
+    per_view_prefetch_workers = max(1, augmentation_workers // max(1, view_prefetch_workers))
+    print(
+        f'View render prefetch workers: {view_prefetch_workers} '
+        f'(per-view render workers: {per_view_prefetch_workers})'
+    )
+
+    view_prefetch_executor = ThreadPoolExecutor(
+        max_workers=int(view_prefetch_workers),
+        thread_name_prefix='view-prefetch',
+    )
+    view_prefetch_futures: Dict[str, Future] = {}
+    for view in views:
+        view_prefetch_futures[view.name] = view_prefetch_executor.submit(
+            prepare_view_render_assets,
+            volume_rgb,
+            view,
+            list(aug_jobs_by_view[view.name]),
+            float(fps),
+            int(per_view_prefetch_workers),
+            bool(dense_tiling_active),
+            temp_dir,
+        )
+
+    for view in views:
         extra = ''
         if view.family == 'radial':
             extra = f', azimuths={view.num_slices}'
         print(f"\n=== View: {view.name} ({view.src_w}x{view.src_h}, slices={view.num_slices}{extra}) ===")
+
+        if not view_prefetch_futures[view.name].done():
+            print(f"Waiting for prefetched render assets for view '{view.name}' to finish...")
+        prefetch_result = view_prefetch_futures[view.name].result()
+        view_frame_cache = prefetch_result.view_frames
+        view_frame_cache_path = prefetch_result.view_frame_cache_path
+        aug_jobs = list(aug_jobs_by_view[view.name])
+        if view_frame_cache is not None:
+            print(f"Using reusable native frame cache for view '{view.name}'")
 
         baseline_union_by_model_view: Dict[str, np.ndarray] = {}
         baseline_confmap_by_model_view: Dict[str, np.ndarray] = {}
@@ -5193,27 +5384,12 @@ def main() -> None:
             baseline_union_paths[model_name] = union_path
             baseline_confmap_paths[model_name] = confmap_path
 
-        aug_jobs = build_aug_jobs_for_view(
-            view=view,
-            angles=angles,
-            out_size=args.imgsz,
-            temp_dir=temp_dir,
-        )
-        aug_jobs_by_view[view.name] = list(aug_jobs)
-
-        ensure_augmented_videos(
-            volume_rgb=volume_rgb,
-            view=view,
-            aug_jobs=aug_jobs,
-            fps=fps,
-            augmentation_workers=augmentation_workers,
-        )
-
         tile_jobs_for_view: List[DenseTileJob] = []
         tile_ready_jobs: List[DenseTileJob] = []
         tile_future_to_job: Dict[Future, DenseTileJob] = {}
         tile_executor: Optional[ThreadPoolExecutor] = None
         tile_video_workers = 0
+        tile_workers_per_job = 1
 
         if dense_tiling_active:
             for tile_cfg in tile_configs:
@@ -5226,12 +5402,19 @@ def main() -> None:
                         temp_dir=temp_dir,
                     ))
             if tile_jobs_for_view:
-                tile_video_workers = max(1, min(int(worker_budget), int(len(tile_jobs_for_view))))
+                if view_frame_cache is not None:
+                    tile_workers_per_job = max(1, min(8, int(worker_budget // max(1, len(tile_jobs_for_view)))))
+                tile_video_workers = max(1, min(int(len(tile_jobs_for_view)), int(worker_budget // max(1, tile_workers_per_job))))
                 print(
                     f"Starting background dense tile rendering for {view.name}: "
                     f"{len(tile_jobs_for_view)} tile video(s) across {len(tile_configs)} tile configuration(s) "
-                    f"with {tile_video_workers} worker(s)"
+                    f"with {tile_video_workers} outer worker(s)"
                 )
+                if view_frame_cache is not None:
+                    print(
+                        f"Dense tile rendering for {view.name} will reuse the native frame cache "
+                        f"with {tile_workers_per_job} slice worker(s) per tile video"
+                    )
                 tile_executor = ThreadPoolExecutor(
                     max_workers=int(tile_video_workers),
                     thread_name_prefix=f'dense-tile-{view.name}',
@@ -5242,7 +5425,8 @@ def main() -> None:
                     view=view,
                     tile_jobs=tile_jobs_for_view,
                     fps=float(fps),
-                    workers_per_job=1,
+                    workers_per_job=int(tile_workers_per_job),
+                    view_frames=view_frame_cache,
                 )
 
         try:
@@ -5325,6 +5509,8 @@ def main() -> None:
                         pass
 
             if dense_tiling_active and tile_jobs_for_view:
+                if not tile_ready_jobs and tile_future_to_job:
+                    print(f"Waiting for the first background dense tile video for view '{view.name}' to finish rendering...")
                 ready_iter = iter_dense_tile_jobs_in_completion_order(tile_ready_jobs, tile_future_to_job)
                 for tile_job in tqdm(
                     ready_iter,
@@ -5431,7 +5617,17 @@ def main() -> None:
         baseline_confmap_by_model_view.clear()
         baseline_native_by_model_view.clear()
         baseline_support_by_model_view.clear()
+
+        close_memmap_array(view_frame_cache)
+        if not args.troubleshooting and view_frame_cache_path is not None:
+            try:
+                view_frame_cache_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
         gc.collect()
+
+    view_prefetch_executor.shutdown(wait=True)
 
     gc.collect()
     gc.collect()
