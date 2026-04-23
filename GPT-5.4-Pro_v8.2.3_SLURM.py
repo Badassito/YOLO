@@ -515,6 +515,78 @@ def parallel_for_indices(
 
 
 
+def choose_parallel_chunk_size(
+    total_items: int,
+    max_workers: int,
+    *,
+    target_chunks_per_worker: int = 4,
+    min_chunk_size: int = 1,
+    max_chunk_size: Optional[int] = None,
+) -> int:
+    total = max(0, int(total_items))
+    workers = max(1, int(max_workers))
+    if total <= 0:
+        return max(1, int(min_chunk_size))
+
+    denom = max(1, workers * max(1, int(target_chunks_per_worker)))
+    chunk = max(int(min_chunk_size), int(math.ceil(float(total) / float(denom))))
+    if max_chunk_size is not None:
+        chunk = min(int(chunk), max(1, int(max_chunk_size)))
+    return max(1, int(chunk))
+
+
+
+def parallel_for_indices_chunked(
+    count: int,
+    func: Callable[[int], None],
+    *,
+    max_workers: int,
+    desc: str,
+    show_progress: bool = True,
+    chunk_size: Optional[int] = None,
+    target_chunks_per_worker: int = 4,
+) -> None:
+    total = max(0, int(count))
+    if total <= 0:
+        return
+
+    workers = max(1, min(int(max_workers), total))
+    if workers <= 1:
+        iterable = tqdm(range(total), desc=desc) if show_progress else range(total)
+        for idx in iterable:
+            func(int(idx))
+        return
+
+    if chunk_size is None or int(chunk_size) <= 0:
+        chunk = choose_parallel_chunk_size(
+            total,
+            workers,
+            target_chunks_per_worker=int(target_chunks_per_worker),
+            min_chunk_size=1,
+        )
+    else:
+        chunk = max(1, int(chunk_size))
+
+    ranges = [(int(start), int(min(total, start + chunk))) for start in range(0, total, chunk)]
+
+    def _run_range(range_idx: int) -> int:
+        start, stop = ranges[int(range_idx)]
+        for idx in range(int(start), int(stop)):
+            func(int(idx))
+        return int(stop - start)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_run_range, int(range_idx)) for range_idx in range(len(ranges))]
+        if show_progress:
+            with tqdm(total=total, desc=desc) as pbar:
+                for fut in as_completed(futures):
+                    pbar.update(int(fut.result()))
+        else:
+            for fut in as_completed(futures):
+                fut.result()
+
+
+
 def workspace_anon_cap_bytes() -> int:
     """Return the optional anonymous-workspace cap.
 
@@ -3180,6 +3252,56 @@ def _fill_holes_2d(mask_bool: np.ndarray) -> np.ndarray:
     return np.asarray(ndi.binary_fill_holes(np.asarray(mask_bool, dtype=bool)), dtype=bool)
 
 
+
+def _filter_connected_components_by_min_radius(
+    mask_bool: np.ndarray,
+    structure2: np.ndarray,
+    min_radius: float,
+) -> np.ndarray:
+    labels2d, num = ndi.label(mask_bool, structure=structure2)
+    if int(num) <= 0:
+        return np.zeros(mask_bool.shape, dtype=bool)
+
+    label_ids = np.arange(1, int(num) + 1, dtype=np.int32)
+    dist = np.asarray(ndi.distance_transform_edt(mask_bool), dtype=np.float32)
+    radii = np.asarray(ndi.maximum(dist, labels=labels2d, index=label_ids), dtype=np.float32)
+    keep_ids = label_ids[radii >= float(min_radius)]
+    if keep_ids.size <= 0:
+        return np.zeros(mask_bool.shape, dtype=bool)
+    return np.isin(labels2d, keep_ids)
+
+
+
+def _build_supported_component_mask(
+    tile_slice: np.ndarray,
+    support_slice: np.ndarray,
+) -> Tuple[np.ndarray, int, int]:
+    num_labels, labels2d = cv2.connectedComponents(
+        np.asarray(tile_slice, dtype=np.uint8),
+        connectivity=8,
+        ltype=cv2.CV_32S,
+    )
+    if int(num_labels) <= 1:
+        return np.zeros(tile_slice.shape, dtype=bool), 0, 0
+
+    label_ids = np.arange(1, int(num_labels), dtype=np.int32)
+    supported = np.asarray(
+        ndi.maximum(
+            np.asarray(support_slice, dtype=np.uint8),
+            labels=labels2d,
+            index=label_ids,
+        ),
+        dtype=np.uint8,
+    )
+    keep_ids = label_ids[supported > 0]
+    if keep_ids.size <= 0:
+        return np.zeros(tile_slice.shape, dtype=bool), 0, int(num_labels) - 1
+
+    keep = np.isin(labels2d, keep_ids)
+    return keep, int(keep_ids.size), int((int(num_labels) - 1) - int(keep_ids.size))
+
+
+
 def fused_slice_cleanup_inplace(
     mask_mm: np.ndarray,
     confmap_mm: Optional[np.ndarray] = None,
@@ -3189,9 +3311,21 @@ def fused_slice_cleanup_inplace(
     workers: int = 1,
     desc: str = 'Fused slice cleanup',
 ) -> None:
+    """Slice-parallel cleanup with chunked worker fan-out.
+
+    The old path delegated one future per slice and, when ``--min_radius`` was active, performed a
+    Python loop plus one EDT per connected component. On large sparse slices that makes the stage
+    look effectively single-threaded even though it nominally uses a thread pool. The updated path
+    keeps the same semantics but:
+      - submits chunked slice ranges so worker threads stay busy with lower dispatch overhead
+      - computes connected-component radii with one EDT + one reduce per slice instead of one EDT
+        per component
+    """
     num_slices = int(mask_mm.shape[0])
     structure2 = np.ones((3, 3), dtype=bool)
     min_conf_u8 = int(min_conf_to_u8_threshold(float(min_conf)))
+    worker_count = choose_slice_parallel_workers(int(workers), num_slices)
+    chunk_size = choose_parallel_chunk_size(num_slices, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
 
     def _process(i: int) -> None:
         mask_slice = np.asarray(mask_mm[int(i)], dtype=bool)
@@ -3214,19 +3348,11 @@ def fused_slice_cleanup_inplace(
             mask_slice = _fill_holes_2d(mask_slice)
 
         if np.any(mask_slice) and float(min_radius) > 0.0:
-            labels2d, num = ndi.label(mask_slice, structure=structure2)
-            if int(num) > 0:
-                keep = np.zeros(mask_slice.shape, dtype=bool)
-                for lbl in range(1, int(num) + 1):
-                    comp = labels2d == lbl
-                    if not np.any(comp):
-                        continue
-                    radius = float(np.max(ndi.distance_transform_edt(comp)))
-                    if radius >= float(min_radius):
-                        keep |= comp
-                mask_slice = keep
-            else:
-                mask_slice = np.zeros(mask_slice.shape, dtype=bool)
+            mask_slice = _filter_connected_components_by_min_radius(
+                mask_slice,
+                structure2,
+                float(min_radius),
+            )
 
         mask_mm[int(i), :, :] = mask_slice.astype(np.uint8, copy=False)
         if conf_slice is not None:
@@ -3236,11 +3362,12 @@ def fused_slice_cleanup_inplace(
                 conf_slice.fill(np.uint8(0))
             confmap_mm[int(i), :, :] = conf_slice.astype(np.uint8, copy=False)
 
-    parallel_for_indices(
+    parallel_for_indices_chunked(
         num_slices,
         _process,
-        max_workers=choose_slice_parallel_workers(int(workers), num_slices),
+        max_workers=worker_count,
         desc=desc,
+        chunk_size=chunk_size,
     )
     flush_array(mask_mm)
     if confmap_mm is not None:
@@ -3640,33 +3767,27 @@ def apply_transverse_min_radius_filter_inplace(
 
     struct2 = np.ones((3, 3), dtype=bool)
     num_slices = int(mask_mm.shape[0])
+    worker_count = choose_slice_parallel_workers(int(workers), num_slices)
+    chunk_size = choose_parallel_chunk_size(num_slices, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
 
     def _process(t: int) -> None:
         sl = np.asarray(mask_mm[int(t)]) > 0
         if not np.any(sl):
             return
 
-        labels2d, num = ndi.label(sl, structure=struct2)
-        if int(num) <= 0:
-            mask_mm[int(t), :, :] = 0
-            return
-
-        keep = np.zeros(sl.shape, dtype=bool)
-        for lbl in range(1, int(num) + 1):
-            comp = labels2d == lbl
-            if not np.any(comp):
-                continue
-            radius = float(np.max(ndi.distance_transform_edt(comp)))
-            if radius >= float(min_radius):
-                keep |= comp
-
+        keep = _filter_connected_components_by_min_radius(
+            sl,
+            struct2,
+            float(min_radius),
+        )
         mask_mm[int(t), :, :] = keep.astype(np.uint8, copy=False)
 
-    parallel_for_indices(
+    parallel_for_indices_chunked(
         num_slices,
         _process,
-        max_workers=choose_slice_parallel_workers(int(workers), num_slices),
+        max_workers=worker_count,
         desc='Transverse min-radius filter',
+        chunk_size=chunk_size,
     )
     flush_array(mask_mm)
 
@@ -5087,6 +5208,8 @@ def gate_tile_volume_against_parent_inplace(
     accepted_components = np.zeros((num_slices,), dtype=np.int64)
     rejected_components = np.zeros((num_slices,), dtype=np.int64)
     kept_voxels = np.zeros((num_slices,), dtype=np.int64)
+    worker_count = choose_slice_parallel_workers(int(workers), num_slices)
+    chunk_size = choose_parallel_chunk_size(num_slices, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
 
     def _process(idx: int) -> None:
         tile_slice = np.asarray(tile_mask_mm[int(idx)], dtype=bool)
@@ -5095,39 +5218,19 @@ def gate_tile_volume_against_parent_inplace(
             return
 
         support_slice = np.asarray(parent_support_mm[int(idx)], dtype=bool)
-        num_labels, labels2d = cv2.connectedComponents(
-            tile_slice.astype(np.uint8, copy=False),
-            connectivity=8,
-            ltype=cv2.CV_32S,
-        )
-        if int(num_labels) <= 1:
-            tile_mask_mm[int(idx), :, :] = np.uint8(0)
-            return
-
-        keep = np.zeros(tile_slice.shape, dtype=bool)
-        accepted = 0
-        rejected = 0
-        for lbl in range(1, int(num_labels)):
-            comp = labels2d == int(lbl)
-            if not np.any(comp):
-                continue
-            if np.any(comp & support_slice):
-                keep |= comp
-                accepted += 1
-            else:
-                rejected += 1
-
+        keep, accepted, rejected = _build_supported_component_mask(tile_slice, support_slice)
         tile_mask_mm[int(idx), :, :] = keep.astype(np.uint8, copy=False)
-        accepted_components[int(idx)] = np.int64(accepted)
-        rejected_components[int(idx)] = np.int64(rejected)
+        accepted_components[int(idx)] = np.int64(int(accepted))
+        rejected_components[int(idx)] = np.int64(int(rejected))
         kept_voxels[int(idx)] = np.int64(np.count_nonzero(keep))
 
-    parallel_for_indices(
+    parallel_for_indices_chunked(
         num_slices,
         _process,
-        max_workers=choose_slice_parallel_workers(int(workers), num_slices),
+        max_workers=worker_count,
         desc=desc,
         show_progress=False,
+        chunk_size=chunk_size,
     )
     flush_array(tile_mask_mm)
 
@@ -6311,7 +6414,17 @@ def main() -> None:
     )
 
     tile_postprocess_workers = max(1, _env_int('YOLO_TTA_TILE_POSTPROCESS_WORKERS', worker_budget))
-    tile_slice_postprocess_workers = max(1, _env_int('YOLO_TTA_TILE_SLICE_WORKERS', 2))
+    tile_slice_postprocess_workers_default = max(
+        1,
+        min(
+            16,
+            max(2, _cpu_count() // max(1, min(16, tile_postprocess_workers))),
+        ),
+    )
+    tile_slice_postprocess_workers = max(
+        1,
+        _env_int('YOLO_TTA_TILE_SLICE_WORKERS', tile_slice_postprocess_workers_default),
+    )
     tile_interpolation_task_workers = max(1, _env_int('YOLO_TTA_TILE_INTERPOLATION_TASK_WORKERS', 1))
 
     print(f'Allocated CPU count: {_cpu_count()}')
