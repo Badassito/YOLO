@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import heapq
 import json
 import math
 import os
@@ -2544,6 +2545,95 @@ def load_ultralytics_model(path: str, task: str = 'segment'):
     return YOLO(path, task=task)
 
 
+def canonical_single_device(device: str) -> str:
+    raw = str(device or '').strip()
+    if not raw:
+        return 'cpu'
+
+    token = raw.split(',')[0].strip()
+    low = token.lower()
+    if low in ('cpu', 'mps'):
+        return low
+    if low.startswith('cuda'):
+        return low
+    if token.isdigit():
+        return f'cuda:{token}'
+    return token
+
+
+def ensure_yolo_ready_for_predict(model: object, cfg: 'PredictConfig') -> None:
+    """Keep the active YOLO backend resident on the requested device.
+
+    The scheduling contract wants the GPU to stay hot until work is exhausted. Offloading the model
+    between videos can leave Ultralytics with CUDA inputs but CPU weights on the next predict() call.
+    This helper lazily restores the requested device/dtype when needed and is a cheap no-op while the
+    model already matches the active predict configuration.
+    """
+    try:
+        import torch  # type: ignore
+    except Exception:
+        return
+
+    target = canonical_single_device(str(cfg.device))
+    wants_half = bool(cfg.half) and str(target).startswith('cuda')
+    state = (str(target), bool(wants_half))
+    if getattr(model, '_tta_predict_state', None) == state:
+        return
+
+    candidates: List[object] = [model]
+    direct_model = getattr(model, 'model', None)
+    if direct_model is not None:
+        candidates.append(direct_model)
+    predictor = getattr(model, 'predictor', None)
+    predictor_model = getattr(predictor, 'model', None) if predictor is not None else None
+    if predictor_model is not None and predictor_model is not direct_model:
+        candidates.append(predictor_model)
+
+    seen_ids: set[int] = set()
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        cid = id(candidate)
+        if cid in seen_ids:
+            continue
+        seen_ids.add(cid)
+
+        to_fn = getattr(candidate, 'to', None)
+        if callable(to_fn):
+            try:
+                to_fn(target)
+            except Exception:
+                pass
+
+        precision_fn = getattr(candidate, 'half', None) if wants_half else getattr(candidate, 'float', None)
+        if callable(precision_fn):
+            try:
+                precision_fn()
+            except Exception:
+                pass
+
+    if predictor is not None:
+        try:
+            setattr(predictor, 'device', torch.device(target))
+        except Exception:
+            pass
+        args_obj = getattr(predictor, 'args', None)
+        if args_obj is not None:
+            try:
+                setattr(args_obj, 'device', target)
+            except Exception:
+                pass
+
+    try:
+        setattr(model, '_tta_predict_state', state)
+    except Exception:
+        pass
+
+
+def offload_between_jobs_enabled() -> bool:
+    return _env_flag('YOLO_TTA_OFFLOAD_BETWEEN_JOBS', False)
+
+
 def trim_cuda_memory() -> None:
     try:
         import torch  # type: ignore
@@ -2579,6 +2669,11 @@ def offload_yolo_from_gpu(model: object) -> None:
                 to_fn('cpu')
         except Exception:
             pass
+
+    try:
+        setattr(model, '_tta_predict_state', None)
+    except Exception:
+        pass
 
     trim_cuda_memory()
 
@@ -2741,6 +2836,8 @@ def predict_video_and_accumulate(
     overlapped with that stream when ``postprocess_workers > 1`` so native reorientation and
     confidence-map updates do not unnecessarily serialize GPU inference.
     """
+    ensure_yolo_ready_for_predict(model, cfg)
+
     prediction_count = 0
     frames_with_predictions = 0
 
@@ -2984,6 +3081,8 @@ def predict_tile_video_and_gate(
     postprocess_workers: int = 1,
 ) -> Dict[str, int]:
     """Run tiled inference and gate accepted masks into an isolated tiled-view volume."""
+    ensure_yolo_ready_for_predict(model, cfg)
+
     results = model.predict(
         source=str(video_path),
         imgsz=cfg.imgsz,
@@ -4846,6 +4945,23 @@ class TilePostprocessTask:
     tile_confmap_path: Path
 
 
+@dataclass
+class TilePostprocessResult:
+    model_name: str
+    view_name: str
+    config_id: str
+    tile_id: str
+    tile_mask_mm: np.ndarray
+    tile_mask_path: Path
+
+
+def _volume_has_foreground(mask_mm: np.ndarray) -> bool:
+    for idx in range(int(mask_mm.shape[0])):
+        if np.any(np.asarray(mask_mm[int(idx)], dtype=bool)):
+            return True
+    return False
+
+
 def prepare_view_volume_after_fullframe(
     *,
     model_name: str,
@@ -4955,25 +5071,82 @@ def prepare_view_volume_after_fullframe(
     )
 
 
-def finalize_tile_volume_after_inference(
+def gate_tile_volume_against_parent_inplace(
+    tile_mask_mm: np.ndarray,
+    parent_support_mm: np.ndarray,
+    *,
+    workers: int = 1,
+    desc: str = 'Tile gated OR',
+) -> Dict[str, int]:
+    """Keep only tile components that intersect the frozen parent support on the same slice.
+
+    The gating result for one slice never affects another slice, so this stage can be parallelized
+    aggressively across the slice axis without violating the v8.2.0_SLURM semantics.
+    """
+    num_slices = int(tile_mask_mm.shape[0])
+    accepted_components = np.zeros((num_slices,), dtype=np.int64)
+    rejected_components = np.zeros((num_slices,), dtype=np.int64)
+    kept_voxels = np.zeros((num_slices,), dtype=np.int64)
+
+    def _process(idx: int) -> None:
+        tile_slice = np.asarray(tile_mask_mm[int(idx)], dtype=bool)
+        if not np.any(tile_slice):
+            tile_mask_mm[int(idx), :, :] = np.uint8(0)
+            return
+
+        support_slice = np.asarray(parent_support_mm[int(idx)], dtype=bool)
+        num_labels, labels2d = cv2.connectedComponents(
+            tile_slice.astype(np.uint8, copy=False),
+            connectivity=8,
+            ltype=cv2.CV_32S,
+        )
+        if int(num_labels) <= 1:
+            tile_mask_mm[int(idx), :, :] = np.uint8(0)
+            return
+
+        keep = np.zeros(tile_slice.shape, dtype=bool)
+        accepted = 0
+        rejected = 0
+        for lbl in range(1, int(num_labels)):
+            comp = labels2d == int(lbl)
+            if not np.any(comp):
+                continue
+            if np.any(comp & support_slice):
+                keep |= comp
+                accepted += 1
+            else:
+                rejected += 1
+
+        tile_mask_mm[int(idx), :, :] = keep.astype(np.uint8, copy=False)
+        accepted_components[int(idx)] = np.int64(accepted)
+        rejected_components[int(idx)] = np.int64(rejected)
+        kept_voxels[int(idx)] = np.int64(np.count_nonzero(keep))
+
+    parallel_for_indices(
+        num_slices,
+        _process,
+        max_workers=choose_slice_parallel_workers(int(workers), num_slices),
+        desc=desc,
+        show_progress=False,
+    )
+    flush_array(tile_mask_mm)
+
+    return {
+        'accepted_components': int(np.sum(accepted_components, dtype=np.int64)),
+        'rejected_components': int(np.sum(rejected_components, dtype=np.int64)),
+        'kept_voxels': int(np.sum(kept_voxels, dtype=np.int64)),
+    }
+
+
+def postprocess_tile_volume_after_inference(
     task: TilePostprocessTask,
     *,
     view: ViewInfo,
-    destination_mm: np.ndarray,
-    destination_lock: threading.Lock,
-    temp_dir: Path,
     min_conf: float,
     min_radius: float,
-    interpolate: int,
-    interpolation_walk_back: int,
-    interpolation_candidates: int,
-    interpolate_passes: int,
-    interpolate_min_radius: float,
-    interpolation_search_angle: float,
     keep_temp: bool,
     slice_workers: int,
-    interpolation_task_workers: int,
-) -> List[Dict[str, object]]:
+) -> Optional[TilePostprocessResult]:
     cleanup_view_volume_after_prediction_inplace(
         task.tile_mask_mm,
         task.tile_confmap_mm,
@@ -4989,6 +5162,59 @@ def finalize_tile_volume_after_inference(
             task.tile_confmap_path.unlink(missing_ok=True)
         except Exception:
             pass
+
+    if not _volume_has_foreground(task.tile_mask_mm):
+        close_memmap_array(task.tile_mask_mm)
+        if not keep_temp:
+            try:
+                task.tile_mask_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return None
+
+    return TilePostprocessResult(
+        model_name=str(task.model_name),
+        view_name=str(task.view_name),
+        config_id=str(task.config_id),
+        tile_id=str(task.tile_id),
+        tile_mask_mm=task.tile_mask_mm,
+        tile_mask_path=task.tile_mask_path,
+    )
+
+
+def finalize_tile_volume_after_parent_ready(
+    task: TilePostprocessResult,
+    *,
+    view: ViewInfo,
+    parent_support_mm: np.ndarray,
+    destination_mm: np.ndarray,
+    destination_lock: threading.Lock,
+    temp_dir: Path,
+    interpolate: int,
+    interpolation_walk_back: int,
+    interpolation_candidates: int,
+    interpolate_passes: int,
+    interpolate_min_radius: float,
+    interpolation_search_angle: float,
+    keep_temp: bool,
+    slice_workers: int,
+    interpolation_task_workers: int,
+) -> List[Dict[str, object]]:
+    gate_stats = gate_tile_volume_against_parent_inplace(
+        task.tile_mask_mm,
+        parent_support_mm,
+        workers=int(slice_workers),
+        desc=f'Gated OR ({task.model_name}/{task.view_name}/{task.tile_id})',
+    )
+
+    if int(gate_stats.get('accepted_components', 0)) <= 0 or int(gate_stats.get('kept_voxels', 0)) <= 0:
+        close_memmap_array(task.tile_mask_mm)
+        if not keep_temp:
+            try:
+                task.tile_mask_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return []
 
     interpolation_stats: List[Dict[str, object]] = []
     if view.family == 'orthogonal' and int(interpolate) > 0:
@@ -6046,6 +6272,7 @@ def main() -> None:
         name = Path(m).stem
         print(f'Loading model: {name} ({m})')
         yolo_models.append((name, load_ultralytics_model(m, task='segment')))
+    yolo_by_model_name: Dict[str, object] = {name: model for name, model in yolo_models}
 
     pred_cfg = PredictConfig(
         imgsz=args.imgsz,
@@ -6076,11 +6303,16 @@ def main() -> None:
     output_frame_workers = max(1, _env_int('YOLO_TTA_OUTPUT_FRAME_WORKERS', max(1, min(8, output_workers))))
     slice_postprocess_workers = max(1, int(augmentation_workers))
     predict_postprocess_workers = max(1, min(32, _env_int('YOLO_TTA_PREDICT_POSTPROCESS_WORKERS', slice_postprocess_workers)))
-    background_cpu_workers = max(1, min(int(interpolation_workers), max(1, len(yolo_models) * max(1, len(views)))))
-    per_task_interpolation_workers = max(
+
+    parent_postprocess_workers = max(1, min(int(interpolation_workers), max(1, len(yolo_models) * max(1, len(views)))))
+    parent_interpolation_task_workers = max(
         1,
-        min(16, _env_int('YOLO_TTA_INTERPOLATION_TASK_WORKERS', max(1, _cpu_count() // max(1, background_cpu_workers)))),
+        min(16, _env_int('YOLO_TTA_INTERPOLATION_TASK_WORKERS', max(1, _cpu_count() // max(1, parent_postprocess_workers)))),
     )
+
+    tile_postprocess_workers = max(1, _env_int('YOLO_TTA_TILE_POSTPROCESS_WORKERS', worker_budget))
+    tile_slice_postprocess_workers = max(1, _env_int('YOLO_TTA_TILE_SLICE_WORKERS', 2))
+    tile_interpolation_task_workers = max(1, _env_int('YOLO_TTA_TILE_INTERPOLATION_TASK_WORKERS', 1))
 
     print(f'Allocated CPU count: {_cpu_count()}')
     print(f'Worker budget: {worker_budget}')
@@ -6088,7 +6320,15 @@ def main() -> None:
     print(f'Augmentation workers: {augmentation_workers}')
     print(f'Slice-parallel postprocess workers: {slice_postprocess_workers}')
     print(f'Inference postprocess workers: {predict_postprocess_workers}')
-    print(f'Background CPU postprocess workers: {background_cpu_workers} (per-task workers: {per_task_interpolation_workers})')
+    print(
+        'Parent full-frame postprocess workers: '
+        f'{parent_postprocess_workers} (per-parent interpolation workers: {parent_interpolation_task_workers})'
+    )
+    print(
+        'Tile postprocess workers: '
+        f'{tile_postprocess_workers} (per-tile slice workers: {tile_slice_postprocess_workers}, '
+        f'per-tile interpolation workers: {tile_interpolation_task_workers})'
+    )
     print(f'Background output workers: {output_workers} (frame workers per labels/TIFF task: {output_frame_workers})')
 
     output_manager = BackgroundOutputManager(max_workers=output_workers)
@@ -6224,10 +6464,13 @@ def main() -> None:
     )
 
     render_executor = ThreadPoolExecutor(max_workers=int(video_render_workers), thread_name_prefix='video-render')
-    postprocess_executor = ThreadPoolExecutor(max_workers=int(background_cpu_workers), thread_name_prefix='cpu-postprocess')
+    parent_postprocess_executor = ThreadPoolExecutor(max_workers=int(parent_postprocess_workers), thread_name_prefix='parent-postprocess')
+    tile_postprocess_executor = ThreadPoolExecutor(max_workers=int(tile_postprocess_workers), thread_name_prefix='tile-postprocess')
 
 
     canvas_futures_by_aug: Dict[Tuple[str, str], Future] = {}
+    canvas_future_processed: set[Tuple[str, str]] = set()
+    pending_tile_batches_by_aug: Dict[Tuple[str, str], Tuple[ViewInfo, AugJob, Tuple[DenseTileJob, ...]]] = {}
     fullframe_video_futures: Dict[Future, Tuple[ViewInfo, AugJob]] = {}
     tile_batch_video_futures: Dict[Future, Tuple[ViewInfo, Tuple[DenseTileJob, ...]]] = {}
     pending_fullframe_futures: set[Future] = set()
@@ -6236,12 +6479,14 @@ def main() -> None:
     tile_batch_render_submitted: set[Tuple[str, str]] = set()
 
     ready_fullframe: deque[Tuple[ViewInfo, AugJob]] = deque()
-    ready_tile: deque[Tuple[str, ViewInfo, DenseTileJob]] = deque()
+    ready_tile_infer: deque[Tuple[str, ViewInfo, DenseTileJob]] = deque()
     tile_inference_enqueued: set[Tuple[str, str, str]] = set()
     tile_inference_done: set[Tuple[str, str, str]] = set()
 
     view_processing_futures: Dict[Future, Tuple[str, str]] = {}
     view_processing_submitted: set[Tuple[str, str]] = set()
+    tile_cleanup_futures: Dict[Future, Tuple[str, str, str]] = {}
+    postprocessed_tiles_waiting_by_parent: Dict[Tuple[str, str], Dict[str, TilePostprocessResult]] = {}
     tile_finalize_futures: Dict[Future, Tuple[str, str, str]] = {}
 
     def _get_canvas_future(view: ViewInfo, job: AugJob) -> Future:
@@ -6276,17 +6521,15 @@ def main() -> None:
         fullframe_video_futures[fut] = (view, job)
         pending_fullframe_futures.add(fut)
 
-    def _submit_tile_video_batch(view: ViewInfo, aug_job: AugJob, tile_jobs: Sequence[DenseTileJob]) -> None:
+    def _submit_tile_video_batch_now(view: ViewInfo, aug_job: AugJob, tile_jobs: Sequence[DenseTileJob]) -> None:
         batch_key = (view.name, aug_job.aug_id)
         if batch_key in tile_batch_render_submitted:
             return
         tile_jobs = tuple(tile_jobs)
         if not tile_jobs:
             return
-        canvas_future = _get_canvas_future(view, aug_job)
         fut = render_executor.submit(
-            ensure_dense_tile_video_batch_after_canvas,
-            canvas_future,
+            ensure_dense_tile_video_batch_from_canvas,
             aug_job,
             view,
             tile_jobs,
@@ -6297,6 +6540,20 @@ def main() -> None:
         pending_tile_video_futures.add(fut)
         tile_batch_render_submitted.add(batch_key)
 
+    def _submit_tile_video_batch(view: ViewInfo, aug_job: AugJob, tile_jobs: Sequence[DenseTileJob]) -> None:
+        batch_key = (view.name, aug_job.aug_id)
+        if batch_key in tile_batch_render_submitted:
+            return
+        tile_jobs = tuple(tile_jobs)
+        if not tile_jobs:
+            return
+        canvas_future = _get_canvas_future(view, aug_job)
+        if canvas_future.done():
+            canvas_future.result()
+            _submit_tile_video_batch_now(view, aug_job, tile_jobs)
+            return
+        pending_tile_batches_by_aug[batch_key] = (view, aug_job, tile_jobs)
+
     for view in views:
         for aug_job in aug_jobs_by_view[view.name]:
             _submit_fullframe_video(view, aug_job)
@@ -6305,13 +6562,18 @@ def main() -> None:
                 if tile_jobs:
                     _submit_tile_video_batch(view, aug_job, tile_jobs)
 
+    def _push_ready_fullframe(view: ViewInfo, job: AugJob) -> None:
+        ready_fullframe.append((view, job))
+
+    def _push_ready_tile(model_name: str, view: ViewInfo, tile_job: DenseTileJob) -> None:
+        ready_tile_infer.append((str(model_name), view, tile_job))
+
+
     def _maybe_enqueue_tile_inference(model_name: str, view_name: str, tile_job: DenseTileJob) -> None:
         ready_key = (str(model_name), str(view_name), str(tile_job.tile_id))
         if ready_key in tile_inference_done or ready_key in tile_inference_enqueued:
             return
-        if view_name not in native_view_support_by_model.get(model_name, {}):
-            return
-        ready_tile.append((str(model_name), view_infos_by_name[view_name], tile_job))
+        _push_ready_tile(str(model_name), view_infos_by_name[view_name], tile_job)
         tile_inference_enqueued.add(ready_key)
 
     def _submit_view_prepare(model_name: str, view: ViewInfo) -> None:
@@ -6323,7 +6585,7 @@ def main() -> None:
         confmap_mm = baseline_confmap_by_model_view.pop(key)
         union_path = baseline_union_paths.pop(key)
         confmap_path = baseline_confmap_paths.pop(key)
-        fut = postprocess_executor.submit(
+        fut = parent_postprocess_executor.submit(
             prepare_view_volume_after_fullframe,
             model_name=str(model_name),
             view=view,
@@ -6343,19 +6605,81 @@ def main() -> None:
             interpolation_search_angle=float(args.interpolation_search_angle),
             keep_temp=bool(args.troubleshooting),
             slice_workers=int(slice_postprocess_workers),
-            interpolation_task_workers=int(per_task_interpolation_workers),
+            interpolation_task_workers=int(parent_interpolation_task_workers),
         )
         view_processing_futures[fut] = key
 
+    def _submit_tile_finalize(result: TilePostprocessResult) -> None:
+        parent_key = (str(result.model_name), str(result.view_name))
+        support_by_view = native_view_support_by_model.get(result.model_name, {})
+        if result.view_name not in support_by_view:
+            waiting = postprocessed_tiles_waiting_by_parent.setdefault(parent_key, {})
+            waiting[str(result.tile_id)] = result
+            return
+
+        waiting = postprocessed_tiles_waiting_by_parent.get(parent_key)
+        if waiting is not None:
+            waiting.pop(str(result.tile_id), None)
+            if not waiting:
+                postprocessed_tiles_waiting_by_parent.pop(parent_key, None)
+
+        view = view_infos_by_name[result.view_name]
+        if view.family == 'radial':
+            destination_mm = radial_native_output_by_model[result.model_name][result.view_name]
+        else:
+            destination_mm = view_volumes_by_model[result.model_name][result.view_name]
+
+        fut = tile_postprocess_executor.submit(
+            finalize_tile_volume_after_parent_ready,
+            result,
+            view=view,
+            parent_support_mm=support_by_view[result.view_name],
+            destination_mm=destination_mm,
+            destination_lock=view_volume_locks[(result.model_name, result.view_name)],
+            temp_dir=temp_dir,
+            interpolate=int(args.interpolate),
+            interpolation_walk_back=int(args.interpolation_walk_back),
+            interpolation_candidates=int(args.interpolation_candidates),
+            interpolate_passes=int(args.interpolate_passes),
+            interpolate_min_radius=float(args.interpolate_min_radius),
+            interpolation_search_angle=float(args.interpolation_search_angle),
+            keep_temp=bool(args.troubleshooting),
+            slice_workers=int(tile_slice_postprocess_workers),
+            interpolation_task_workers=int(tile_interpolation_task_workers),
+        )
+        tile_finalize_futures[fut] = (str(result.model_name), str(result.view_name), str(result.tile_id))
+
+    def _flush_ready_postprocessed_tiles() -> None:
+        ready_results: List[TilePostprocessResult] = []
+        for parent_key, waiting in list(postprocessed_tiles_waiting_by_parent.items()):
+            model_name, view_name = parent_key
+            if view_name not in native_view_support_by_model.get(model_name, {}):
+                continue
+            ready_results.extend(list(waiting.values()))
+            del postprocessed_tiles_waiting_by_parent[parent_key]
+
+        for result in ready_results:
+            _submit_tile_finalize(result)
+
 
     def _drain_completed_render_futures() -> None:
+        for key, fut in list(canvas_futures_by_aug.items()):
+            if key in canvas_future_processed or not fut.done():
+                continue
+            fut.result()
+            canvas_future_processed.add(key)
+            pending = pending_tile_batches_by_aug.pop(key, None)
+            if pending is not None:
+                pending_view, pending_aug_job, pending_tile_jobs = pending
+                _submit_tile_video_batch_now(pending_view, pending_aug_job, pending_tile_jobs)
+
         for fut in list(pending_fullframe_futures):
             if not fut.done():
                 continue
             pending_fullframe_futures.remove(fut)
             view, job = fullframe_video_futures.pop(fut)
             fut.result()
-            ready_fullframe.append((view, job))
+            _push_ready_fullframe(view, job)
             if dense_tiling_active and view.family == 'radial':
                 tile_jobs = tile_jobs_by_aug.get((view.name, job.aug_id), [])
                 if tile_jobs:
@@ -6388,8 +6712,16 @@ def main() -> None:
                 else:
                     view_volumes_by_model[result.model_name][result.view_name] = result.final_view_volume_mm
 
-            for tile_job in rendered_tile_jobs_by_view.get(result.view_name, {}).values():
-                _maybe_enqueue_tile_inference(result.model_name, result.view_name, tile_job)
+        for fut in list(tile_cleanup_futures.keys()):
+            if not fut.done():
+                continue
+            result = fut.result()
+            del tile_cleanup_futures[fut]
+            if result is None:
+                continue
+            _submit_tile_finalize(result)
+
+        _flush_ready_postprocessed_tiles()
 
         for fut in list(tile_finalize_futures.keys()):
             if not fut.done():
@@ -6398,6 +6730,7 @@ def main() -> None:
             del tile_finalize_futures[fut]
 
         output_manager.reap_completed()
+
 
     try:
         while True:
@@ -6423,7 +6756,8 @@ def main() -> None:
                         native_w=view.src_w,
                         postprocess_workers=predict_postprocess_workers,
                     )
-                    offload_yolo_from_gpu(yolo)
+                    if offload_between_jobs_enabled():
+                        offload_yolo_from_gpu(yolo)
                     view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(pred_stats.get('prediction_count', 0))
 
                     remaining_key = (model_name, view.name)
@@ -6432,58 +6766,58 @@ def main() -> None:
                         _submit_view_prepare(model_name, view)
                 continue
 
-            if ready_tile:
-                model_name, view, tile_job = ready_tile.popleft()
+            if ready_tile_infer:
+                model_name, view, tile_job = ready_tile_infer.popleft()
                 ready_key = (str(model_name), str(view.name), str(tile_job.tile_id))
                 tile_inference_enqueued.discard(ready_key)
                 if ready_key in tile_inference_done:
                     continue
-                if view.name not in native_view_support_by_model.get(model_name, {}):
-                    continue
 
                 print(f"Inferencing tile video: {model_name}/{view.name}/{tile_job.tile_id}")
-                support_mm = native_view_support_by_model[model_name][view.name]
+                tile_shape = (int(view.num_slices), int(view.src_h), int(view.src_w))
                 tile_mask_path = temp_dir / 'tile_volumes' / model_name / view.name / f'{tile_job.tile_id}.u8.dat'
                 tile_conf_path = temp_dir / 'tile_volumes' / model_name / view.name / f'{tile_job.tile_id}.confmap.u8.dat'
                 tile_mask_path.parent.mkdir(parents=True, exist_ok=True)
 
-                accepted_mask_mm = allocate_workspace_array(
-                    shape=support_mm.shape,
+                tile_mask_mm = allocate_workspace_array(
+                    shape=tile_shape,
                     dtype=np.uint8,
                     path=tile_mask_path,
-                    desc=f'{model_name}/{view.name}/{tile_job.tile_id} accepted tile volume',
+                    desc=f'{model_name}/{view.name}/{tile_job.tile_id} raw tile volume',
                     prefer_memory=True,
                 )
-                accepted_conf_mm = allocate_workspace_array(
-                    shape=support_mm.shape,
+                tile_conf_mm = allocate_workspace_array(
+                    shape=tile_shape,
                     dtype=np.uint8,
                     path=tile_conf_path,
-                    desc=f'{model_name}/{view.name}/{tile_job.tile_id} accepted tile confidence workspace',
+                    desc=f'{model_name}/{view.name}/{tile_job.tile_id} raw tile confidence workspace',
                     prefer_memory=True,
                 )
 
-                yolo = next(model for name, model in yolo_models if name == model_name)
-                gate_stats = predict_tile_video_and_gate(
+                yolo = yolo_by_model_name[str(model_name)]
+                pred_prefix = temp_dir / 'tile_preds' / model_name / view.name / f'{tile_job.tile_id}'
+                pred_stats = predict_video_and_accumulate(
                     model=yolo,
                     video_path=tile_job.video_path,
                     num_frames=view.num_slices,
                     out_size=int(args.imgsz),
+                    pred_out_prefix=pred_prefix,
                     cfg=pred_cfg,
-                    baseline_support_mm=support_mm,
-                    baseline_mask_mm=accepted_mask_mm,
-                    baseline_confmap_mm=accepted_conf_mm,
+                    view_union_mm=tile_mask_mm,
+                    view_confmap_mm=tile_conf_mm,
                     M_out_to_native=tile_job.M_out_to_src,
                     native_h=view.src_h,
                     native_w=view.src_w,
                     postprocess_workers=predict_postprocess_workers,
                 )
-                offload_yolo_from_gpu(yolo)
+                if offload_between_jobs_enabled():
+                    offload_yolo_from_gpu(yolo)
                 tile_inference_done.add(ready_key)
-                view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(gate_stats.get('prediction_count', 0))
+                view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(pred_stats.get('prediction_count', 0))
 
-                if int(gate_stats.get('accepted_components', 0)) <= 0:
-                    close_memmap_array(accepted_mask_mm)
-                    close_memmap_array(accepted_conf_mm)
+                if int(pred_stats.get('frames_with_predictions', 0)) <= 0:
+                    close_memmap_array(tile_mask_mm)
+                    close_memmap_array(tile_conf_mm)
                     if not args.troubleshooting:
                         try:
                             tile_mask_path.unlink(missing_ok=True)
@@ -6495,54 +6829,49 @@ def main() -> None:
                             pass
                     continue
 
-                if view.family == 'radial':
-                    destination_mm = radial_native_output_by_model[model_name][view.name]
-                else:
-                    destination_mm = view_volumes_by_model[model_name][view.name]
-
                 task = TilePostprocessTask(
                     model_name=str(model_name),
                     view_name=str(view.name),
                     config_id=str(tile_job.config_id),
                     tile_id=str(tile_job.tile_id),
-                    tile_mask_mm=accepted_mask_mm,
-                    tile_confmap_mm=accepted_conf_mm,
+                    tile_mask_mm=tile_mask_mm,
+                    tile_confmap_mm=tile_conf_mm,
                     tile_mask_path=tile_mask_path,
                     tile_confmap_path=tile_conf_path,
                 )
-                fut = postprocess_executor.submit(
-                    finalize_tile_volume_after_inference,
+                fut = tile_postprocess_executor.submit(
+                    postprocess_tile_volume_after_inference,
                     task,
                     view=view,
-                    destination_mm=destination_mm,
-                    destination_lock=view_volume_locks[(model_name, view.name)],
-                    temp_dir=temp_dir,
                     min_conf=float(args.min_conf),
                     min_radius=float(args.min_radius),
-                    interpolate=int(args.interpolate),
-                    interpolation_walk_back=int(args.interpolation_walk_back),
-                    interpolation_candidates=int(args.interpolation_candidates),
-                    interpolate_passes=int(args.interpolate_passes),
-                    interpolate_min_radius=float(args.interpolate_min_radius),
-                    interpolation_search_angle=float(args.interpolation_search_angle),
                     keep_temp=bool(args.troubleshooting),
-                    slice_workers=int(slice_postprocess_workers),
-                    interpolation_task_workers=int(per_task_interpolation_workers),
+                    slice_workers=int(tile_slice_postprocess_workers),
                 )
-                tile_finalize_futures[fut] = ready_key
+                tile_cleanup_futures[fut] = ready_key
                 continue
 
-            waitables: List[Future] = list(pending_fullframe_futures)
+            waitables: List[Future] = [
+                fut
+                for key, fut in canvas_futures_by_aug.items()
+                if key not in canvas_future_processed
+            ]
+            waitables.extend(list(pending_fullframe_futures))
             waitables.extend(list(pending_tile_video_futures))
             waitables.extend(list(view_processing_futures.keys()))
+            waitables.extend(list(tile_cleanup_futures.keys()))
             waitables.extend(list(tile_finalize_futures.keys()))
             if not waitables:
-                break
+                _flush_ready_postprocessed_tiles()
+                if not tile_finalize_futures and not tile_cleanup_futures and not view_processing_futures:
+                    break
+                continue
             wait(waitables, return_when=FIRST_COMPLETED)
 
     finally:
         render_executor.shutdown(wait=True)
-        postprocess_executor.shutdown(wait=True)
+        parent_postprocess_executor.shutdown(wait=True)
+        tile_postprocess_executor.shutdown(wait=True)
 
     _drain_completed_render_futures()
     _drain_completed_background_futures()
