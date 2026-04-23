@@ -2,19 +2,19 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v8.3.0_SLURM single-channel-aligned script:
+This v8.3.1_SLURM single-channel-aligned script:
   - builds Transverse, optional Tilted Transverse, optional Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - renders parent/full-frame videos directly from the native view transform so inference no longer waits on
     a separately rendered canvas video, and derives non-radial tile videos from shared canvas batches so the
     same rotated frames are not re-decoded once per tile
   - keeps parent/full-frame videos and non-radial tile batches rendering concurrently so the GPU can consume
     whichever inference job becomes ready first, while still preferring ready parent/full-frame jobs over tile jobs
-  - keeps tile acceptance mask-wise gated against the frozen parent full-frame support and runs tile
-    interpolation independently per tile after that gating step
+  - keeps tile acceptance mask-wise gated against the frozen parent full-frame support, consolidates
+    accepted tile masks per parent view, and interpolates the consolidated gated-tile volume once per parent view
   - removes dense-tile pruning and keeps temporary/intermediate mask volumes unpacked throughout
   - fuses per-slice cleanup work where the slice orientation matches the required semantics
     (notably min_conf filtering, 2D hole filling, and min_radius where applicable)
-  - overlaps GPU inference with CPU-side view interpolation, tile interpolation, and output writing
+  - overlaps GPU inference with CPU-side view interpolation, consolidated-tile interpolation, and output writing
   - reuses a native radial frame cache during dense tiled rendering so radial tiles do not recompute
     the same Lanczos-5 slices for every tile location
   - inverse-maps predictions into native view coordinates, applies confidence filtering, hole filling,
@@ -3926,24 +3926,36 @@ def assemble_model_volume_from_view_volumes(
     *,
     workers: int = 1,
 ) -> None:
-    transverse = np.asarray(view_volume_mms["transverse"])
-    assert transverse.shape == (T, H, W)
+    """OR all per-view volumes for one model into the native transverse ensemble.
 
-    transverse_workers = choose_slice_parallel_workers(int(workers), int(T))
+    Transverse, Tilted Transverse, and already backprojected Radial volumes all have native
+    (T,H,W) shape and are merged slice-wise. Sagittal and Coronal retain their native view stacks
+    and are mapped back into the transverse coordinate system. This fixes the prior omission where
+    tilted-transverse prediction sets could be computed but not included in the final union.
+    """
+    consumed: set[str] = set()
 
-    def _merge_transverse(t: int) -> None:
-        ensemble_mm[int(t), :, :] |= transverse[int(t), :, :]
+    if "transverse" in view_volume_mms:
+        transverse = np.asarray(view_volume_mms["transverse"])
+        assert transverse.shape == (T, H, W)
+        consumed.add("transverse")
 
-    parallel_for_indices(
-        int(T),
-        _merge_transverse,
-        max_workers=transverse_workers,
-        desc="Assembling volume from transverse view volume",
-    )
+        transverse_workers = choose_slice_parallel_workers(int(workers), int(T))
+
+        def _merge_transverse(t: int) -> None:
+            ensemble_mm[int(t), :, :] |= transverse[int(t), :, :]
+
+        parallel_for_indices(
+            int(T),
+            _merge_transverse,
+            max_workers=transverse_workers,
+            desc="Assembling volume from transverse view volume",
+        )
 
     if not disable_multiplanar and "sagittal" in view_volume_mms:
         sagittal = np.asarray(view_volume_mms["sagittal"])
         assert sagittal.shape == (H, T, W)
+        consumed.add("sagittal")
         sagittal_workers = choose_slice_parallel_workers(int(workers), int(H))
 
         def _merge_sagittal(y: int) -> None:
@@ -3959,6 +3971,7 @@ def assemble_model_volume_from_view_volumes(
     if not disable_multiplanar and "coronal" in view_volume_mms:
         coronal = np.asarray(view_volume_mms["coronal"])
         assert coronal.shape == (W, T, H)
+        consumed.add("coronal")
         coronal_workers = choose_slice_parallel_workers(int(workers), int(W))
 
         def _merge_coronal(x: int) -> None:
@@ -3971,19 +3984,25 @@ def assemble_model_volume_from_view_volumes(
             desc="Assembling volume from coronal view volume",
         )
 
-    if "radial" in view_volume_mms:
-        radial = np.asarray(view_volume_mms["radial"])
-        assert radial.shape == (T, H, W)
-        radial_workers = choose_slice_parallel_workers(int(workers), int(T))
+    for view_name in sorted(view_volume_mms.keys()):
+        if view_name in consumed:
+            continue
+        vol = np.asarray(view_volume_mms[view_name])
+        if vol.shape != (T, H, W):
+            raise ValueError(
+                f"View volume '{view_name}' has shape {tuple(vol.shape)}; expected native volume shape {(T, H, W)} "
+                "or a handled sagittal/coronal stack."
+            )
+        native_workers = choose_slice_parallel_workers(int(workers), int(T))
 
-        def _merge_radial(t: int) -> None:
-            ensemble_mm[int(t), :, :] |= radial[int(t), :, :]
+        def _merge_native(t: int, *, _vol: np.ndarray = vol) -> None:
+            ensemble_mm[int(t), :, :] |= _vol[int(t), :, :]
 
         parallel_for_indices(
             int(T),
-            _merge_radial,
-            max_workers=radial_workers,
-            desc="Assembling volume from radial view volume",
+            _merge_native,
+            max_workers=native_workers,
+            desc=f"Assembling volume from {view_name} view volume",
         )
 
 
@@ -5109,6 +5128,7 @@ class PreparedViewResult:
     native_support_mm: np.ndarray
     final_view_volume_mm: Optional[np.ndarray]
     interpolation_stats: List[Dict[str, object]]
+    pass_snapshots: Dict[int, VolumeSnapshotRef] = field(default_factory=dict)
 
 
 @dataclass
@@ -5141,6 +5161,118 @@ class DeferredTilePostprocessResult:
     tile_id: str
     tile_mask_path: Path
     tile_shape: Tuple[int, int, int]
+
+
+@dataclass(frozen=True)
+class VolumeSnapshotRef:
+    model_name: str
+    view_name: str
+    source: str  # fullframe or tile
+    pass_index: int
+    path: Path
+    shape: Tuple[int, int, int]
+    dtype: str = 'uint8'
+
+
+@dataclass(frozen=True)
+class TileGateResult:
+    model_name: str
+    view_name: str
+    config_id: str
+    tile_id: str
+    gate_stats: Dict[str, int]
+
+
+@dataclass(frozen=True)
+class TileConsolidationResult:
+    model_name: str
+    view_name: str
+    interpolation_stats: List[Dict[str, object]]
+    pass_snapshots: Dict[int, VolumeSnapshotRef]
+
+
+def _view_uses_interpolation(view: ViewInfo, interpolate: int) -> bool:
+    return bool(view.family == 'orthogonal' and int(interpolate) > 0)
+
+
+def _snapshot_volume_for_troubleshooting(
+    volume: np.ndarray,
+    *,
+    temp_dir: Path,
+    model_name: str,
+    view_name: str,
+    source: str,
+    pass_index: int,
+    enabled: bool,
+    workers: int = 1,
+) -> Optional[VolumeSnapshotRef]:
+    if not bool(enabled):
+        return None
+
+    path = (
+        temp_dir / 'troubleshooting_pass_snapshots' / str(source) / str(model_name) /
+        str(view_name) / f'pass{int(pass_index)}.u8.dat'
+    )
+    snap_mm = copy_workspace_array(
+        np.asarray(volume),
+        path,
+        desc=f'Troubleshooting snapshot {source}/{model_name}/{view_name}/pass{int(pass_index)}',
+        prefer_memory=False,
+        workers=int(workers),
+    )
+    shape = tuple(int(x) for x in np.asarray(snap_mm).shape)
+    close_memmap_array(snap_mm)
+    return VolumeSnapshotRef(
+        model_name=str(model_name),
+        view_name=str(view_name),
+        source=str(source),
+        pass_index=int(pass_index),
+        path=path,
+        shape=(int(shape[0]), int(shape[1]), int(shape[2])),
+        dtype='uint8',
+    )
+
+
+def _drain_volume_to_mmap(
+    volume: np.ndarray,
+    path: Path,
+    desc: str,
+    *,
+    workers: int = 1,
+) -> np.ndarray:
+    drained = copy_workspace_array(
+        np.asarray(volume),
+        path,
+        desc=desc,
+        prefer_memory=False,
+        workers=int(workers),
+    )
+    flush_array(drained)
+    return drained
+
+
+def _open_snapshot_ref(ref: VolumeSnapshotRef, mode: str = 'r') -> np.memmap:
+    return np.memmap(
+        ref.path,
+        dtype=np.dtype(ref.dtype),
+        mode=str(mode),
+        shape=tuple(int(x) for x in ref.shape),
+    )
+
+
+def _resolve_snapshot_ref(
+    snapshot_refs: Dict[Tuple[str, str, str, int], VolumeSnapshotRef],
+    *,
+    source: str,
+    model_name: str,
+    view_name: str,
+    pass_index: int,
+) -> Optional[VolumeSnapshotRef]:
+    for idx in range(int(pass_index), -1, -1):
+        ref = snapshot_refs.get((str(source), str(model_name), str(view_name), int(idx)))
+        if ref is not None:
+            return ref
+    return None
 
 
 def _volume_has_foreground(mask_mm: np.ndarray) -> bool:
@@ -5190,8 +5322,22 @@ def prepare_view_volume_after_fullframe(
         except Exception:
             pass
 
+    pass_snapshots: Dict[int, VolumeSnapshotRef] = {}
+    snap0 = _snapshot_volume_for_troubleshooting(
+        baseline_native_volume,
+        temp_dir=temp_dir,
+        model_name=str(model_name),
+        view_name=str(view.name),
+        source='fullframe',
+        pass_index=0,
+        enabled=bool(keep_temp) and int(interpolate) > 0,
+        workers=int(slice_workers),
+    )
+    if snap0 is not None:
+        pass_snapshots[0] = snap0
+
     interpolation_stats: List[Dict[str, object]] = []
-    if view.family == 'orthogonal' and int(interpolate) > 0:
+    if _view_uses_interpolation(view, int(interpolate)):
         total_passes = int(interpolate_passes)
         for pass_idx in range(1, total_passes + 1):
             stats_local = interpolate_view_volume_pass_inplace(
@@ -5212,25 +5358,61 @@ def prepare_view_volume_after_fullframe(
                 'pass_index': int(pass_idx),
                 'model': str(model_name),
                 'view': str(view.name),
+                'source': 'fullframe',
                 'max_slice_distance': int(interpolate),
                 'interpolation_walk_back': int(interpolation_walk_back),
                 'interpolation_candidates': int(interpolation_candidates),
                 'interpolation_search_angle': float(interpolation_search_angle),
             })
             interpolation_stats.append(stats_local)
+
+            snap = _snapshot_volume_for_troubleshooting(
+                baseline_native_volume,
+                temp_dir=temp_dir,
+                model_name=str(model_name),
+                view_name=str(view.name),
+                source='fullframe',
+                pass_index=int(pass_idx),
+                enabled=bool(keep_temp) and int(interpolate) > 0,
+                workers=int(slice_workers),
+            )
+            if snap is not None:
+                pass_snapshots[int(pass_idx)] = snap
+
             if int(stats_local.get('added_voxels', 0)) <= 0:
                 break
+    else:
+        # Tilted Transverse and Radial views (and all views when --interpolate 0) do not undergo
+        # interpolation. Drain them to a disk-backed mmap so they can wait cheaply until final union.
+        drained_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.noninterpolated_native.u8.dat'
+        old_volume = baseline_native_volume
+        baseline_native_volume = _drain_volume_to_mmap(
+            old_volume,
+            drained_path,
+            desc=f'{model_name}/{view.name} non-interpolated native drain',
+            workers=int(slice_workers),
+        )
+        if old_volume is not baseline_native_volume:
+            close_memmap_array(old_volume)
+            if not keep_temp:
+                try:
+                    union_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     final_view_volume: Optional[np.ndarray] = None
     if bool(dense_tiling_active):
-        final_copy_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.final.u8.dat'
-        final_view_volume = copy_workspace_array(
-            baseline_native_volume,
-            final_copy_path,
-            desc=f'{model_name}/{view.name} frozen support copy',
-            prefer_memory=True,
-            workers=int(slice_workers),
-        )
+        if _view_uses_interpolation(view, int(interpolate)):
+            final_copy_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.final_fullframe.u8.dat'
+            final_view_volume = copy_workspace_array(
+                baseline_native_volume,
+                final_copy_path,
+                desc=f'{model_name}/{view.name} frozen full-frame support copy',
+                prefer_memory=True,
+                workers=int(slice_workers),
+            )
+        else:
+            final_view_volume = baseline_native_volume
     elif view.family == 'radial':
         out_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.u8.dat'
         final_view_volume = backproject_radial_volume_to_volume(
@@ -5238,7 +5420,7 @@ def prepare_view_volume_after_fullframe(
             radial_view=view,
             out_path=out_path,
             desc=f'Backprojecting {model_name}/{view.name}',
-            prefer_memory=True,
+            prefer_memory=False,
         )
         if float(min_radius) > 0.0:
             print(f"Applying --min_radius in the transverse plane for backprojected view '{view.name}'")
@@ -5256,6 +5438,7 @@ def prepare_view_volume_after_fullframe(
         native_support_mm=baseline_native_volume,
         final_view_volume_mm=final_view_volume,
         interpolation_stats=interpolation_stats,
+        pass_snapshots=pass_snapshots,
     )
 
 
@@ -5357,6 +5540,7 @@ def spill_waiting_tile_result_to_mmap(
     temp_dir: Path,
     *,
     workers: int = 1,
+    keep_original: bool = False,
 ) -> DeferredTilePostprocessResult:
     """Drain a postprocessed tile volume to temp storage while it waits for parent gated OR.
 
@@ -5374,7 +5558,10 @@ def spill_waiting_tile_result_to_mmap(
         flush_array(result.tile_mask_mm)
         close_memmap_array(result.tile_mask_mm)
         if result.tile_mask_path.resolve() != wait_path.resolve():
-            shutil.move(str(result.tile_mask_path), str(wait_path))
+            if bool(keep_original):
+                shutil.copy2(str(result.tile_mask_path), str(wait_path))
+            else:
+                shutil.move(str(result.tile_mask_path), str(wait_path))
     else:
         spilled_mm = copy_workspace_array(
             np.asarray(result.tile_mask_mm),
@@ -5413,11 +5600,59 @@ def load_waiting_tile_result_from_mmap(waiting: DeferredTilePostprocessResult) -
     )
 
 
-def finalize_tile_volume_after_parent_ready(
+def gate_tile_volume_into_consolidated_parent(
     task: TilePostprocessResult,
     *,
-    view: ViewInfo,
     parent_support_mm: np.ndarray,
+    tile_accumulator_mm: np.ndarray,
+    tile_accumulator_lock: threading.Lock,
+    keep_temp: bool,
+    slice_workers: int,
+) -> TileGateResult:
+    """Gate one tile volume, then OR accepted components into the parent-view tile accumulator.
+
+    v8.3.1 intentionally consolidates all accepted tiles for a parent view before interpolation.
+    This replaces the previous per-tile interpolation path while preserving the mask-wise OR gate:
+    accepted tile components still must intersect the frozen parent full-frame support, and accepted
+    tiles cannot accept other tiles because the support image is not the accumulator.
+    """
+    gate_stats = gate_tile_volume_against_parent_inplace(
+        task.tile_mask_mm,
+        parent_support_mm,
+        workers=int(slice_workers),
+        desc=f'Gated OR ({task.model_name}/{task.view_name}/{task.tile_id})',
+    )
+
+    if int(gate_stats.get('accepted_components', 0)) > 0 and int(gate_stats.get('kept_voxels', 0)) > 0:
+        with tile_accumulator_lock:
+            union_volume_into_volume(
+                tile_accumulator_mm,
+                task.tile_mask_mm,
+                workers=int(slice_workers),
+                desc=f'Consolidate accepted tile {task.model_name}/{task.view_name}/{task.tile_id}',
+            )
+
+    close_memmap_array(task.tile_mask_mm)
+    if not keep_temp:
+        try:
+            task.tile_mask_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    return TileGateResult(
+        model_name=str(task.model_name),
+        view_name=str(task.view_name),
+        config_id=str(task.config_id),
+        tile_id=str(task.tile_id),
+        gate_stats={k: int(v) for k, v in gate_stats.items()},
+    )
+
+
+def finalize_consolidated_tile_volume_for_parent(
+    *,
+    model_name: str,
+    view: ViewInfo,
+    tile_accumulator_mm: np.ndarray,
     destination_mm: np.ndarray,
     destination_lock: threading.Lock,
     temp_dir: Path,
@@ -5430,30 +5665,42 @@ def finalize_tile_volume_after_parent_ready(
     keep_temp: bool,
     slice_workers: int,
     interpolation_task_workers: int,
-) -> List[Dict[str, object]]:
-    gate_stats = gate_tile_volume_against_parent_inplace(
-        task.tile_mask_mm,
-        parent_support_mm,
-        workers=int(slice_workers),
-        desc=f'Gated OR ({task.model_name}/{task.view_name}/{task.tile_id})',
-    )
+) -> TileConsolidationResult:
+    """Interpolate the consolidated gated-tile volume once for the parent view, then union it.
 
-    if int(gate_stats.get('accepted_components', 0)) <= 0 or int(gate_stats.get('kept_voxels', 0)) <= 0:
-        close_memmap_array(task.tile_mask_mm)
-        if not keep_temp:
-            try:
-                task.tile_mask_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-        return []
-
+    The input accumulator already contains the OR of every accepted tile mask for this parent view.
+    Interpolation is now performed once on that consolidated volume instead of once per tile.
+    """
     interpolation_stats: List[Dict[str, object]] = []
-    if view.family == 'orthogonal' and int(interpolate) > 0:
+    pass_snapshots: Dict[int, VolumeSnapshotRef] = {}
+
+    if not _volume_has_foreground(tile_accumulator_mm):
+        return TileConsolidationResult(
+            model_name=str(model_name),
+            view_name=str(view.name),
+            interpolation_stats=interpolation_stats,
+            pass_snapshots=pass_snapshots,
+        )
+
+    snap0 = _snapshot_volume_for_troubleshooting(
+        tile_accumulator_mm,
+        temp_dir=temp_dir,
+        model_name=str(model_name),
+        view_name=str(view.name),
+        source='tile',
+        pass_index=0,
+        enabled=bool(keep_temp) and int(interpolate) > 0,
+        workers=int(slice_workers),
+    )
+    if snap0 is not None:
+        pass_snapshots[0] = snap0
+
+    if _view_uses_interpolation(view, int(interpolate)):
         total_passes = int(interpolate_passes)
         for pass_idx in range(1, total_passes + 1):
             stats_local = interpolate_view_volume_pass_inplace(
-                mask_mm=task.tile_mask_mm,
-                work_dir=temp_dir / 'tile_interpolation' / task.model_name / task.view_name / task.config_id / task.tile_id,
+                mask_mm=tile_accumulator_mm,
+                work_dir=temp_dir / 'tile_interpolation' / str(model_name) / view.name / 'consolidated',
                 pass_tag=f'pass{pass_idx}',
                 max_slice_distance=int(interpolate),
                 search_angle_deg=float(interpolation_search_angle),
@@ -5467,33 +5714,46 @@ def finalize_tile_volume_after_parent_ready(
             stats_local = dict(stats_local)
             stats_local.update({
                 'pass_index': int(pass_idx),
-                'model': str(task.model_name),
-                'view': f'{task.view_name}[tile:{task.config_id}/{task.tile_id}]',
+                'model': str(model_name),
+                'view': f'{view.name}[tiles:consolidated]',
+                'source': 'tile',
                 'max_slice_distance': int(interpolate),
                 'interpolation_walk_back': int(interpolation_walk_back),
                 'interpolation_candidates': int(interpolation_candidates),
                 'interpolation_search_angle': float(interpolation_search_angle),
             })
             interpolation_stats.append(stats_local)
+
+            snap = _snapshot_volume_for_troubleshooting(
+                tile_accumulator_mm,
+                temp_dir=temp_dir,
+                model_name=str(model_name),
+                view_name=str(view.name),
+                source='tile',
+                pass_index=int(pass_idx),
+                enabled=bool(keep_temp) and int(interpolate) > 0,
+                workers=int(slice_workers),
+            )
+            if snap is not None:
+                pass_snapshots[int(pass_idx)] = snap
+
             if int(stats_local.get('added_voxels', 0)) <= 0:
                 break
 
     with destination_lock:
         union_volume_into_volume(
             destination_mm,
-            task.tile_mask_mm,
+            tile_accumulator_mm,
             workers=int(slice_workers),
-            desc=f'Union accepted tile {task.model_name}/{task.view_name}/{task.tile_id}',
+            desc=f'Union consolidated gated tiles {model_name}/{view.name}',
         )
 
-    close_memmap_array(task.tile_mask_mm)
-    if not keep_temp:
-        try:
-            task.tile_mask_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    return interpolation_stats
+    return TileConsolidationResult(
+        model_name=str(model_name),
+        view_name=str(view.name),
+        interpolation_stats=interpolation_stats,
+        pass_snapshots=pass_snapshots,
+    )
 
 
 # --------------------------
@@ -6088,6 +6348,237 @@ def collect_multiplanar_output_futures(
     return result_paths, futures
 
 
+
+
+def _build_snapshot_native_union_for_view(
+    *,
+    snapshot_refs: Dict[Tuple[str, str, str, int], VolumeSnapshotRef],
+    model_name: str,
+    view: ViewInfo,
+    pass_index: int,
+    temp_dir: Path,
+    workers: int,
+) -> Optional[np.ndarray]:
+    refs: List[VolumeSnapshotRef] = []
+    full_ref = _resolve_snapshot_ref(
+        snapshot_refs,
+        source='fullframe',
+        model_name=str(model_name),
+        view_name=str(view.name),
+        pass_index=int(pass_index),
+    )
+    tile_ref = _resolve_snapshot_ref(
+        snapshot_refs,
+        source='tile',
+        model_name=str(model_name),
+        view_name=str(view.name),
+        pass_index=int(pass_index),
+    )
+    if full_ref is not None:
+        refs.append(full_ref)
+    if tile_ref is not None:
+        refs.append(tile_ref)
+    if not refs:
+        return None
+
+    shape = tuple(int(x) for x in refs[0].shape)
+    for ref in refs[1:]:
+        if tuple(int(x) for x in ref.shape) != shape:
+            raise ValueError(
+                f'Troubleshooting snapshot shape mismatch for {model_name}/{view.name}/pass{pass_index}: '
+                f'{shape} vs {tuple(int(x) for x in ref.shape)}'
+            )
+
+    union_path = (
+        temp_dir / 'troubleshooting_pass_assembly' / f'pass{int(pass_index)}' /
+        str(model_name) / f'{view.name}.native_union.u8.dat'
+    )
+    native_union = allocate_workspace_array(
+        shape=shape,
+        dtype=np.uint8,
+        path=union_path,
+        desc=f'Troubleshooting pass {int(pass_index)} native union {model_name}/{view.name}',
+        prefer_memory=False,
+    )
+
+    for ref in refs:
+        src = _open_snapshot_ref(ref, mode='r')
+        try:
+            union_volume_into_volume(
+                native_union,
+                src,
+                workers=int(workers),
+                desc=f'Assembling troubleshooting snapshot {ref.source}/{model_name}/{view.name}/pass{int(ref.pass_index)}',
+            )
+        finally:
+            close_memmap_array(src)
+
+    return native_union
+
+
+def build_troubleshooting_pass_ensemble(
+    *,
+    snapshot_refs: Dict[Tuple[str, str, str, int], VolumeSnapshotRef],
+    model_names: Sequence[str],
+    views: Sequence[ViewInfo],
+    pass_index: int,
+    T: int,
+    H: int,
+    W: int,
+    enable_multiplanar: bool,
+    min_radius: float,
+    temp_dir: Path,
+    keep_temp: bool,
+    workers: int,
+) -> np.ndarray:
+    view_volumes_for_pass: Dict[str, Dict[str, np.ndarray]] = {str(model_name): {} for model_name in model_names}
+    intermediate_volumes: List[np.ndarray] = []
+
+    try:
+        for model_name in model_names:
+            for view in views:
+                native_union = _build_snapshot_native_union_for_view(
+                    snapshot_refs=snapshot_refs,
+                    model_name=str(model_name),
+                    view=view,
+                    pass_index=int(pass_index),
+                    temp_dir=temp_dir,
+                    workers=int(workers),
+                )
+                if native_union is None:
+                    continue
+                intermediate_volumes.append(native_union)
+
+                if view.family == 'radial':
+                    if tuple(int(x) for x in native_union.shape) == (int(T), int(H), int(W)):
+                        radial_volume = native_union
+                    else:
+                        radial_volume = backproject_radial_volume_to_volume(
+                            radial_mask_mm=native_union,
+                            radial_view=view,
+                            out_path=(
+                                temp_dir / 'troubleshooting_pass_assembly' / f'pass{int(pass_index)}' /
+                                str(model_name) / f'{view.name}.backprojected.u8.dat'
+                            ),
+                            desc=f'Backprojecting troubleshooting pass {int(pass_index)} {model_name}/{view.name}',
+                            prefer_memory=False,
+                        )
+                        intermediate_volumes.append(radial_volume)
+                    if float(min_radius) > 0.0:
+                        apply_transverse_min_radius_filter_inplace(
+                            radial_volume,
+                            float(min_radius),
+                            workers=int(workers),
+                        )
+                    view_volumes_for_pass[str(model_name)][view.name] = radial_volume
+                else:
+                    view_volumes_for_pass[str(model_name)][view.name] = native_union
+
+        ensemble = assemble_final_ensemble_after_view_union(
+            view_volumes_by_model=view_volumes_for_pass,
+            T=int(T),
+            H=int(H),
+            W=int(W),
+            disable_multiplanar=not bool(enable_multiplanar),
+            out_path=temp_dir / 'troubleshooting_pass_outputs' / f'ensemble_pass{int(pass_index)}.u8.dat',
+            temp_dir=temp_dir / 'troubleshooting_pass_outputs' / f'pass{int(pass_index)}',
+            keep_temp=bool(keep_temp),
+            prefer_memory=False,
+            workers=int(workers),
+        )
+        return ensemble
+    finally:
+        for vol in intermediate_volumes:
+            close_memmap_array(vol)
+
+
+def schedule_troubleshooting_pass_outputs(
+    *,
+    output_manager: BackgroundOutputManager,
+    snapshot_refs: Dict[Tuple[str, str, str, int], VolumeSnapshotRef],
+    model_names: Sequence[str],
+    views: Sequence[ViewInfo],
+    volume_rgb: np.ndarray,
+    out_dir: Path,
+    stem: str,
+    fps: float,
+    save_binary_pattern_value: Optional[str],
+    save_labels_pattern_value: Optional[str],
+    save_nrrd_flag: bool,
+    save_multiplanar_flag: bool,
+    total_passes: int,
+    T: int,
+    H: int,
+    W: int,
+    enable_multiplanar: bool,
+    min_radius: float,
+    temp_dir: Path,
+    keep_temp: bool,
+    frame_workers: int,
+    workers: int,
+) -> Dict[str, Path]:
+    if int(total_passes) < 0 or not snapshot_refs:
+        return {}
+
+    all_paths: Dict[str, Path] = {}
+    for pass_idx in range(0, int(total_passes) + 1):
+        print(f"\n=== Scheduling troubleshooting outputs: pass {int(pass_idx)} ===")
+        pass_ensemble = build_troubleshooting_pass_ensemble(
+            snapshot_refs=snapshot_refs,
+            model_names=model_names,
+            views=views,
+            pass_index=int(pass_idx),
+            T=int(T),
+            H=int(H),
+            W=int(W),
+            enable_multiplanar=bool(enable_multiplanar),
+            min_radius=float(min_radius),
+            temp_dir=temp_dir,
+            keep_temp=bool(keep_temp),
+            workers=int(workers),
+        )
+        tag = f'Pass{int(pass_idx)}'
+        pass_paths, pass_futures = collect_pipeline_output_futures(
+            output_manager.executor,
+            volume_rgb=volume_rgb,
+            mask_u8=pass_ensemble,
+            out_dir=out_dir,
+            stem=stem,
+            fps=float(fps),
+            save_binary_pattern_value=save_binary_pattern_value,
+            save_labels_pattern_value=save_labels_pattern_value,
+            save_nrrd_flag=bool(save_nrrd_flag),
+            tag=tag,
+            frame_workers=int(frame_workers),
+            show_progress=False,
+        )
+        if bool(save_multiplanar_flag):
+            extra_paths, extra_futures = collect_multiplanar_output_futures(
+                output_manager.executor,
+                volume_rgb=volume_rgb,
+                mask_u8=pass_ensemble,
+                out_dir=out_dir,
+                stem=stem,
+                fps=float(fps),
+                save_binary_pattern_value=save_binary_pattern_value,
+                save_labels_pattern_value=save_labels_pattern_value,
+                tag=tag,
+                frame_workers=int(frame_workers),
+                show_progress=False,
+            )
+            pass_paths.update(extra_paths)
+            pass_futures.extend(extra_futures)
+
+        output_manager.submit(BackgroundOutputSubmission(
+            label=f'troubleshooting pass {int(pass_idx)} outputs',
+            result_paths=pass_paths,
+            futures=pass_futures,
+            resources=[pass_ensemble],
+        ))
+        for key, path in pass_paths.items():
+            all_paths[f'troubleshooting_pass{int(pass_idx)}_{key}'] = path
+    return all_paths
+
 def link_or_copy_file(src: Path, dst: Path) -> Path:
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists() or dst.is_symlink():
@@ -6575,7 +7066,7 @@ def main() -> None:
     print(
         'Tile postprocess workers: '
         f'{tile_postprocess_workers} (per-tile slice workers: {tile_slice_postprocess_workers}, '
-        f'per-tile interpolation workers: {tile_interpolation_task_workers})'
+        f'consolidated-tile interpolation workers: {tile_interpolation_task_workers})'
     )
     print(f'Background output workers: {output_workers} (frame workers per labels/TIFF task: {output_frame_workers})')
 
@@ -6610,6 +7101,11 @@ def main() -> None:
         'radial': 0,
     }
     interpolation_stats: List[Dict[str, object]] = []
+    pass_snapshot_refs: Dict[Tuple[str, str, str, int], VolumeSnapshotRef] = {}
+
+    def _register_pass_snapshots(snapshots: Dict[int, VolumeSnapshotRef]) -> None:
+        for ref in snapshots.values():
+            pass_snapshot_refs[(str(ref.source), str(ref.model_name), str(ref.view_name), int(ref.pass_index))] = ref
 
     for view in views:
         jobs = build_aug_jobs_for_view(
@@ -6638,6 +7134,18 @@ def main() -> None:
                     jobs_by_config[tile_cfg.config_id] = cfg_jobs
             if jobs_by_config:
                 tile_jobs_by_view_config[view.name] = jobs_by_config
+
+    tile_expected_by_parent: Dict[Tuple[str, str], int] = {}
+    if dense_tiling_active:
+        for view in views:
+            expected_for_view = sum(
+                len(tile_jobs_by_aug.get((view.name, aug_job.aug_id), []))
+                for aug_job in aug_jobs_by_view.get(view.name, [])
+            )
+            if expected_for_view <= 0:
+                continue
+            for model_name, _ in yolo_models:
+                tile_expected_by_parent[(str(model_name), str(view.name))] = int(expected_for_view)
 
     view_frame_caches: Dict[str, np.ndarray] = {}
     view_frame_cache_paths: Dict[str, Path] = {}
@@ -6762,6 +7270,11 @@ def main() -> None:
     tile_cleanup_futures: Dict[Future, Tuple[str, str, str]] = {}
     postprocessed_tiles_waiting_by_parent: Dict[Tuple[str, str], Dict[str, DeferredTilePostprocessResult]] = {}
     tile_finalize_futures: Dict[Future, Tuple[str, str, str]] = {}
+    tile_consolidation_futures: Dict[Future, Tuple[str, str]] = {}
+    tile_accumulator_by_parent: Dict[Tuple[str, str], np.ndarray] = {}
+    tile_accumulator_paths: Dict[Tuple[str, str], Path] = {}
+    tile_completed_by_parent: Dict[Tuple[str, str], set[str]] = {}
+    tile_consolidation_submitted: set[Tuple[str, str]] = set()
 
     def _get_canvas_future(view: ViewInfo, job: AugJob) -> Future:
         key = (view.name, job.aug_id)
@@ -6884,37 +7397,62 @@ def main() -> None:
         )
         view_processing_futures[fut] = key
 
-    def _submit_tile_finalize(result: TilePostprocessResult) -> None:
-        parent_key = (str(result.model_name), str(result.view_name))
-        support_by_view = native_view_support_by_model.get(result.model_name, {})
-        if result.view_name not in support_by_view:
-            waiting = postprocessed_tiles_waiting_by_parent.setdefault(parent_key, {})
-            waiting[str(result.tile_id)] = spill_waiting_tile_result_to_mmap(
-                result,
-                temp_dir,
-                workers=int(tile_slice_postprocess_workers),
-            )
+    def _get_tile_accumulator(model_name: str, view_name: str) -> np.ndarray:
+        key = (str(model_name), str(view_name))
+        acc = tile_accumulator_by_parent.get(key)
+        if acc is not None:
+            return acc
+        view = view_infos_by_name[str(view_name)]
+        acc_path = temp_dir / 'tile_consolidated' / str(model_name) / str(view_name) / 'gated_or.u8.dat'
+        acc = allocate_workspace_array(
+            shape=(int(view.num_slices), int(view.src_h), int(view.src_w)),
+            dtype=np.uint8,
+            path=acc_path,
+            desc=f'{model_name}/{view_name} consolidated gated-tile accumulator',
+            prefer_memory=False,
+        )
+        tile_accumulator_by_parent[key] = acc
+        tile_accumulator_paths[key] = acc_path
+        return acc
+
+    def _parent_destination_ready(model_name: str, view_name: str) -> bool:
+        view = view_infos_by_name[str(view_name)]
+        if view.family == 'radial':
+            return str(view_name) in radial_native_output_by_model.get(str(model_name), {})
+        return str(view_name) in view_volumes_by_model.get(str(model_name), {})
+
+    def _parent_destination_volume(model_name: str, view_name: str) -> np.ndarray:
+        view = view_infos_by_name[str(view_name)]
+        if view.family == 'radial':
+            return radial_native_output_by_model[str(model_name)][str(view_name)]
+        return view_volumes_by_model[str(model_name)][str(view_name)]
+
+    def _maybe_submit_tile_consolidation(model_name: str, view_name: str) -> None:
+        parent_key = (str(model_name), str(view_name))
+        if parent_key in tile_consolidation_submitted:
+            return
+        expected = int(tile_expected_by_parent.get(parent_key, 0))
+        if expected <= 0:
+            return
+        if len(tile_completed_by_parent.get(parent_key, set())) < expected:
+            return
+        if not _parent_destination_ready(str(model_name), str(view_name)):
             return
 
-        waiting = postprocessed_tiles_waiting_by_parent.get(parent_key)
-        if waiting is not None:
-            waiting.pop(str(result.tile_id), None)
-            if not waiting:
-                postprocessed_tiles_waiting_by_parent.pop(parent_key, None)
+        tile_consolidation_submitted.add(parent_key)
+        acc = tile_accumulator_by_parent.get(parent_key)
+        if acc is None:
+            # All tiles completed but none survived cleanup/gating. Nothing to interpolate or union.
+            return
 
-        view = view_infos_by_name[result.view_name]
-        if view.family == 'radial':
-            destination_mm = radial_native_output_by_model[result.model_name][result.view_name]
-        else:
-            destination_mm = view_volumes_by_model[result.model_name][result.view_name]
-
+        view = view_infos_by_name[str(view_name)]
         fut = tile_postprocess_executor.submit(
-            finalize_tile_volume_after_parent_ready,
-            result,
+            finalize_consolidated_tile_volume_for_parent,
+            model_name=str(model_name),
             view=view,
-            parent_support_mm=support_by_view[result.view_name],
-            destination_mm=destination_mm,
-            destination_lock=view_volume_locks[(result.model_name, result.view_name)],
+            tile_accumulator_mm=acc,
+            destination_mm=_parent_destination_volume(str(model_name), str(view_name)),
+            destination_lock=view_volume_locks[(str(model_name), str(view_name))],
             temp_dir=temp_dir,
             interpolate=int(args.interpolate),
             interpolation_walk_back=int(args.interpolation_walk_back),
@@ -6925,6 +7463,46 @@ def main() -> None:
             keep_temp=bool(args.troubleshooting),
             slice_workers=int(tile_slice_postprocess_workers),
             interpolation_task_workers=int(tile_interpolation_task_workers),
+        )
+        tile_consolidation_futures[fut] = parent_key
+
+    def _mark_tile_complete(model_name: str, view_name: str, tile_id: str) -> None:
+        parent_key = (str(model_name), str(view_name))
+        if parent_key not in tile_expected_by_parent:
+            return
+        completed = tile_completed_by_parent.setdefault(parent_key, set())
+        completed.add(str(tile_id))
+        _maybe_submit_tile_consolidation(str(model_name), str(view_name))
+
+    def _submit_tile_finalize(result: TilePostprocessResult) -> None:
+        parent_key = (str(result.model_name), str(result.view_name))
+        support_by_view = native_view_support_by_model.get(result.model_name, {})
+        if result.view_name not in support_by_view:
+            waiting = postprocessed_tiles_waiting_by_parent.setdefault(parent_key, {})
+            waiting[str(result.tile_id)] = spill_waiting_tile_result_to_mmap(
+                result,
+                temp_dir,
+                workers=int(tile_slice_postprocess_workers),
+                keep_original=bool(args.troubleshooting),
+            )
+            return
+
+        waiting = postprocessed_tiles_waiting_by_parent.get(parent_key)
+        if waiting is not None:
+            waiting.pop(str(result.tile_id), None)
+            if not waiting:
+                postprocessed_tiles_waiting_by_parent.pop(parent_key, None)
+
+        tile_accumulator_mm = _get_tile_accumulator(result.model_name, result.view_name)
+
+        fut = tile_postprocess_executor.submit(
+            gate_tile_volume_into_consolidated_parent,
+            result,
+            parent_support_mm=support_by_view[result.view_name],
+            tile_accumulator_mm=tile_accumulator_mm,
+            tile_accumulator_lock=view_volume_locks[(result.model_name, result.view_name)],
+            keep_temp=bool(args.troubleshooting),
+            slice_workers=int(tile_slice_postprocess_workers),
         )
         tile_finalize_futures[fut] = (str(result.model_name), str(result.view_name), str(result.tile_id))
 
@@ -6983,6 +7561,7 @@ def main() -> None:
             del view_processing_futures[fut]
             native_view_support_by_model[result.model_name][result.view_name] = result.native_support_mm
             interpolation_stats.extend(result.interpolation_stats)
+            _register_pass_snapshots(result.pass_snapshots)
 
             view_info = view_infos_by_name[result.view_name]
             if result.final_view_volume_mm is not None:
@@ -6990,13 +7569,15 @@ def main() -> None:
                     radial_native_output_by_model[result.model_name][result.view_name] = result.final_view_volume_mm
                 else:
                     view_volumes_by_model[result.model_name][result.view_name] = result.final_view_volume_mm
+            _maybe_submit_tile_consolidation(result.model_name, result.view_name)
 
         for fut in list(tile_cleanup_futures.keys()):
             if not fut.done():
                 continue
+            ready_key = tile_cleanup_futures.pop(fut)
             result = fut.result()
-            del tile_cleanup_futures[fut]
             if result is None:
+                _mark_tile_complete(str(ready_key[0]), str(ready_key[1]), str(ready_key[2]))
                 continue
             _submit_tile_finalize(result)
 
@@ -7005,8 +7586,17 @@ def main() -> None:
         for fut in list(tile_finalize_futures.keys()):
             if not fut.done():
                 continue
-            interpolation_stats.extend(fut.result())
-            del tile_finalize_futures[fut]
+            model_name, view_name, tile_id = tile_finalize_futures.pop(fut)
+            fut.result()
+            _mark_tile_complete(str(model_name), str(view_name), str(tile_id))
+
+        for fut in list(tile_consolidation_futures.keys()):
+            if not fut.done():
+                continue
+            result = fut.result()
+            del tile_consolidation_futures[fut]
+            interpolation_stats.extend(result.interpolation_stats)
+            _register_pass_snapshots(result.pass_snapshots)
 
         output_manager.reap_completed()
 
@@ -7106,6 +7696,7 @@ def main() -> None:
                             tile_conf_path.unlink(missing_ok=True)
                         except Exception:
                             pass
+                    _mark_tile_complete(str(model_name), str(view.name), str(tile_job.tile_id))
                     continue
 
                 task = TilePostprocessTask(
@@ -7140,9 +7731,15 @@ def main() -> None:
             waitables.extend(list(view_processing_futures.keys()))
             waitables.extend(list(tile_cleanup_futures.keys()))
             waitables.extend(list(tile_finalize_futures.keys()))
+            waitables.extend(list(tile_consolidation_futures.keys()))
             if not waitables:
                 _flush_ready_postprocessed_tiles()
-                if not tile_finalize_futures and not tile_cleanup_futures and not view_processing_futures:
+                if (
+                    not tile_finalize_futures and
+                    not tile_cleanup_futures and
+                    not tile_consolidation_futures and
+                    not view_processing_futures
+                ):
                     break
                 continue
             wait(waitables, return_when=FIRST_COMPLETED)
@@ -7185,7 +7782,7 @@ def main() -> None:
                 radial_view=view,
                 out_path=out_path,
                 desc=f'Backprojecting final {model_name}/{view.name}',
-                prefer_memory=True,
+                prefer_memory=False,
             )
             if float(args.min_radius) > 0:
                 print(f"Applying --min_radius in the transverse plane for backprojected view '{view.name}'")
@@ -7212,8 +7809,36 @@ def main() -> None:
         workers=slice_postprocess_workers,
     )
 
+    final_paths: Dict[str, Path] = {}
+
+    if bool(args.troubleshooting) and int(args.interpolate) > 0:
+        final_paths.update(schedule_troubleshooting_pass_outputs(
+            output_manager=output_manager,
+            snapshot_refs=pass_snapshot_refs,
+            model_names=[name for name, _ in yolo_models],
+            views=views,
+            volume_rgb=volume_rgb,
+            out_dir=out_dir,
+            stem=input_path.stem,
+            fps=fps,
+            save_binary_pattern_value=args.save_binary,
+            save_labels_pattern_value=args.save_labels,
+            save_nrrd_flag=bool(args.save_nrrd),
+            save_multiplanar_flag=bool(args.save_multiplanar),
+            total_passes=int(args.interpolate_passes),
+            T=T,
+            H=H,
+            W=W,
+            enable_multiplanar=bool(args.enable_multiplanar),
+            min_radius=float(args.min_radius),
+            temp_dir=temp_dir,
+            keep_temp=bool(args.troubleshooting),
+            frame_workers=output_frame_workers,
+            workers=slice_postprocess_workers,
+        ))
+
     print('\n=== Scheduling final outputs in background ===')
-    final_paths, final_futures = collect_pipeline_output_futures(
+    final_output_paths, final_futures = collect_pipeline_output_futures(
         output_manager.executor,
         volume_rgb=volume_rgb,
         mask_u8=final_ensemble_mm,
@@ -7241,11 +7866,12 @@ def main() -> None:
             frame_workers=output_frame_workers,
             show_progress=False,
         )
-        final_paths.update(extra_paths)
+        final_output_paths.update(extra_paths)
         final_futures.extend(extra_futures)
+    final_paths.update(final_output_paths)
     output_manager.submit(BackgroundOutputSubmission(
         label='final outputs',
-        result_paths=final_paths,
+        result_paths=final_output_paths,
         futures=final_futures,
         resources=[],
     ))
@@ -7376,6 +8002,9 @@ def main() -> None:
         for mm in model_views.values():
             close_memmap_array(mm)
         model_views.clear()
+    for mm in tile_accumulator_by_parent.values():
+        close_memmap_array(mm)
+    tile_accumulator_by_parent.clear()
     for mm in baseline_union_by_model_view.values():
         close_memmap_array(mm)
     for mm in baseline_confmap_by_model_view.values():
