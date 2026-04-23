@@ -2,7 +2,7 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v7.8.1_SLURM-aligned script:
+This v7.8.2_SLURM-aligned script:
   - builds Transverse, optional Sagittal/Coronal, and optional Radial view families
   - prefetches active-view render assets so view creation can overlap across active families
   - generates rotated FFV1 MKV augmentation videos ahead of inference
@@ -11,7 +11,8 @@ This v7.8.1_SLURM-aligned script:
   - reuses a native radial frame cache during dense tiled rendering so radial tiles do not recompute
     the same Lanczos-5 slices for every tile location
   - runs Ultralytics YOLO segmentation sequentially on each pre-generated video source
-  - inverse-maps predictions into native view coordinates, applies confidence filtering, hole filling, interpolation, and final 3D void fill
+  - inverse-maps predictions into native view coordinates, applies confidence filtering, hole filling, interpolation,
+    per-model post-view-union 3D void fill, and final model ensembling
   - saves the transverse default overlay plus optional labels, binary masks, NRRD, multiplanar, radial, image-sequence, and TTA outputs
 
 Dependencies (Python):
@@ -2256,6 +2257,55 @@ def predict_video_and_accumulate(
     }
 
 
+def _union_supported_native_components_into_parent(
+    native_mask_bool: np.ndarray,
+    support_slice_bool: np.ndarray,
+    parent_slice: np.ndarray,
+    conf_slice: np.ndarray,
+    conf_val: float,
+) -> Dict[str, int]:
+    """Union only the connected components that are supported by the frozen full-frame slice.
+
+    A single YOLO mask can contain multiple disconnected islands after inverse mapping. Treat those
+    disconnected regions independently for dense tiled gating so an unsupported island cannot hitch a
+    ride on another supported component from the same tiled instance.
+    """
+    stats = {
+        'accepted_components': 0,
+        'rejected_components': 0,
+        'gated_added_voxels': 0,
+    }
+    if not np.any(native_mask_bool):
+        return stats
+
+    num_labels, labels2d = cv2.connectedComponents(
+        np.asarray(native_mask_bool, dtype=np.uint8),
+        connectivity=8,
+        ltype=cv2.CV_32S,
+    )
+    if int(num_labels) <= 1:
+        return stats
+
+    conf_val_f16 = np.float16(conf_val) if float(conf_val) > 0.0 else np.float16(0.0)
+    for comp_lbl in range(1, int(num_labels)):
+        comp = labels2d == int(comp_lbl)
+        if not np.any(comp):
+            continue
+        if not np.any(comp & support_slice_bool):
+            stats['rejected_components'] += 1
+            continue
+
+        added = comp & (parent_slice == 0)
+        if np.any(added):
+            stats['gated_added_voxels'] += int(np.count_nonzero(added))
+        parent_slice[comp] = np.uint8(1)
+        if float(conf_val) > 0.0:
+            conf_slice[comp] = np.maximum(conf_slice[comp], conf_val_f16)
+        stats['accepted_components'] += 1
+
+    return stats
+
+
 def _process_tile_prediction_frame(
     idx: int,
     masks_np: Optional[np.ndarray],
@@ -2273,14 +2323,17 @@ def _process_tile_prediction_frame(
 
     v7.8.0 requires tiled masks to be compared against the parent full-frame slice without
     consolidating tiles across locations first. We therefore keep tiled masks instance-wise,
-    inverse-map each mask to the parent native view, test it against the frozen full-frame support
-    slice, and only then union accepted masks into the mutable parent view volume.
+    inverse-map each mask to the parent native view, split the inverse-mapped mask into connected
+    components, test each component against the frozen full-frame support slice, and only then union
+    the supported components into the mutable parent view volume.
     """
     stats = {
         'prediction_count': 0,
         'frames_with_predictions': 0,
         'accepted_masks': 0,
         'rejected_masks': 0,
+        'accepted_components': 0,
+        'rejected_components': 0,
         'rejected_min_conf': 0,
         'gated_added_voxels': 0,
     }
@@ -2288,7 +2341,7 @@ def _process_tile_prediction_frame(
     if masks_np is None or confs_np is None or masks_np.ndim != 3 or int(masks_np.shape[0]) <= 0:
         return stats
 
-    support_slice = np.asarray(baseline_support_mm[int(idx)], dtype=np.uint8)
+    support_slice = np.asarray(baseline_support_mm[int(idx)], dtype=bool)
     parent_slice = np.asarray(baseline_mask_mm[int(idx)], dtype=np.uint8)
     conf_slice = baseline_confmap_mm[int(idx)]
 
@@ -2323,18 +2376,21 @@ def _process_tile_prediction_frame(
             stats['rejected_masks'] += 1
             continue
 
-        if not np.any(native_mask_bool & (support_slice > 0)):
-            stats['rejected_masks'] += 1
-            continue
+        component_stats = _union_supported_native_components_into_parent(
+            native_mask_bool=native_mask_bool,
+            support_slice_bool=support_slice,
+            parent_slice=parent_slice,
+            conf_slice=conf_slice,
+            conf_val=conf_val,
+        )
+        stats['accepted_components'] += int(component_stats['accepted_components'])
+        stats['rejected_components'] += int(component_stats['rejected_components'])
+        stats['gated_added_voxels'] += int(component_stats['gated_added_voxels'])
 
-        added = native_mask_bool & (parent_slice == 0)
-        if np.any(added):
-            stats['gated_added_voxels'] += int(np.count_nonzero(added))
-        parent_slice[native_mask_bool] = np.uint8(1)
-        if conf_val > 0.0:
-            conf_val_f16 = np.float16(conf_val)
-            conf_slice[native_mask_bool] = np.maximum(conf_slice[native_mask_bool], conf_val_f16)
-        stats['accepted_masks'] += 1
+        if int(component_stats['accepted_components']) > 0:
+            stats['accepted_masks'] += 1
+        else:
+            stats['rejected_masks'] += 1
 
     return stats
 
@@ -2376,6 +2432,8 @@ def predict_tile_video_and_gate(
         'frames_with_predictions': 0,
         'accepted_masks': 0,
         'rejected_masks': 0,
+        'accepted_components': 0,
+        'rejected_components': 0,
         'rejected_min_conf': 0,
         'gated_added_voxels': 0,
     }
@@ -3245,6 +3303,105 @@ def assemble_current_ensemble_volume(
             workers=int(workers),
         )
         flush_array(ensemble_mm)
+
+    return ensemble_mm
+
+
+def union_volume_into_volume(
+    dst_mm: np.ndarray,
+    src_mm: np.ndarray,
+    *,
+    workers: int = 1,
+    desc: str = 'Union volumes',
+) -> None:
+    num_slices = int(dst_mm.shape[0]) if int(dst_mm.ndim) > 0 else 0
+
+    def _merge_slice(idx: int) -> None:
+        dst_mm[int(idx), :, :] |= np.asarray(src_mm[int(idx)], dtype=np.uint8)
+
+    parallel_for_indices(
+        num_slices,
+        _merge_slice,
+        max_workers=choose_slice_parallel_workers(int(workers), num_slices),
+        desc=desc,
+        show_progress=False,
+    )
+    flush_array(dst_mm)
+
+
+
+def assemble_final_ensemble_after_view_union(
+    view_volumes_by_model: Dict[str, Dict[str, np.ndarray]],
+    T: int,
+    H: int,
+    W: int,
+    disable_multiplanar: bool,
+    out_path: Path,
+    temp_dir: Path,
+    *,
+    keep_temp: bool = False,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 16 * GIB,
+    workers: int = 1,
+) -> np.ndarray:
+    """Build the final ensemble with 3D void fill only after each per-model view union."""
+    ensemble_mm = allocate_workspace_array(
+        shape=(T, H, W),
+        dtype=np.uint8,
+        path=out_path,
+        desc='Final ensemble volume',
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
+    )
+
+    per_model_dir = temp_dir / 'final_model_unions'
+    per_model_dir.mkdir(parents=True, exist_ok=True)
+
+    for model_name in sorted(view_volumes_by_model.keys()):
+        print(f"\n=== Assembling post-view-union volume for model: {model_name} ===")
+        model_union_path = per_model_dir / f'{model_name}.u8.dat'
+        model_union_mm = allocate_workspace_array(
+            shape=(T, H, W),
+            dtype=np.uint8,
+            path=model_union_path,
+            desc=f'{model_name} post-view-union volume',
+            prefer_memory=bool(prefer_memory),
+            reserve_bytes=int(reserve_bytes),
+        )
+        try:
+            assemble_model_volume_from_view_volumes(
+                ensemble_mm=model_union_mm,
+                view_volume_mms=view_volumes_by_model[model_name],
+                T=T,
+                H=H,
+                W=W,
+                disable_multiplanar=disable_multiplanar,
+                workers=int(workers),
+            )
+            flush_array(model_union_mm)
+
+            print(f"\n=== 3D void fill after view union for model '{model_name}' ===")
+            fill_3d_voids_inplace_streaming(
+                model_union_mm,
+                per_model_dir / f'{model_name}_voidfill',
+                keep_temp=bool(keep_temp),
+                prefer_memory=bool(prefer_memory),
+                reserve_bytes=int(reserve_bytes),
+            )
+
+            union_volume_into_volume(
+                ensemble_mm,
+                model_union_mm,
+                workers=int(workers),
+                desc=f'Final ensemble union from model {model_name}',
+            )
+        finally:
+            close_memmap_array(model_union_mm)
+            if not keep_temp:
+                try:
+                    model_union_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     return ensemble_mm
 
@@ -5352,6 +5509,8 @@ def main() -> None:
                 'frames_with_predictions': 0,
                 'accepted_masks': 0,
                 'rejected_masks': 0,
+                'accepted_components': 0,
+                'rejected_components': 0,
                 'rejected_min_conf': 0,
                 'gated_added_voxels': 0,
             }
@@ -5551,6 +5710,8 @@ def main() -> None:
                         f"predictions={gate_stats['prediction_count']}, "
                         f"accepted_masks={gate_stats['accepted_masks']}, "
                         f"rejected_masks={gate_stats['rejected_masks']}, "
+                        f"accepted_components={gate_stats['accepted_components']}, "
+                        f"rejected_components={gate_stats['rejected_components']}, "
                         f"rejected_min_conf={gate_stats['rejected_min_conf']}, "
                         f"gated_added_voxels={gate_stats['gated_added_voxels']}"
                     )
@@ -5633,7 +5794,21 @@ def main() -> None:
     gc.collect()
 
     def build_current_snapshot_volume(snapshot_stem: str, *, apply_void_fill: bool) -> np.ndarray:
-        ensemble_mm = assemble_current_ensemble_volume(
+        if bool(apply_void_fill):
+            return assemble_final_ensemble_after_view_union(
+                view_volumes_by_model=view_volumes_by_model,
+                T=T,
+                H=H,
+                W=W,
+                disable_multiplanar=not bool(args.enable_multiplanar),
+                out_path=temp_dir / f'{snapshot_stem}.u8.dat',
+                temp_dir=temp_dir / f'{snapshot_stem}_post_view_union',
+                keep_temp=bool(args.troubleshooting),
+                prefer_memory=True,
+                workers=slice_postprocess_workers,
+            )
+
+        return assemble_current_ensemble_volume(
             view_volumes_by_model=view_volumes_by_model,
             T=T,
             H=H,
@@ -5643,14 +5818,6 @@ def main() -> None:
             prefer_memory=True,
             workers=slice_postprocess_workers,
         )
-        if bool(apply_void_fill):
-            fill_3d_voids_inplace_streaming(
-                ensemble_mm,
-                temp_dir / f'{snapshot_stem}_voidfill',
-                keep_temp=bool(args.troubleshooting),
-                prefer_memory=True,
-            )
-        return ensemble_mm
 
     interpolation_stats: List[Dict[str, object]] = []
 
@@ -5844,24 +6011,20 @@ def main() -> None:
 
     output_manager.reap_completed()
 
-    final_ensemble_mm = assemble_current_ensemble_volume(
+    print('\n=== Building final ensemble after per-model view union ===')
+    final_ensemble_mm = assemble_final_ensemble_after_view_union(
         view_volumes_by_model=view_volumes_by_model,
         T=T,
         H=H,
         W=W,
         disable_multiplanar=not bool(args.enable_multiplanar),
         out_path=temp_dir / 'ensemble_volume_final.u8.dat',
+        temp_dir=temp_dir,
+        keep_temp=bool(args.troubleshooting),
         prefer_memory=True,
         workers=slice_postprocess_workers,
     )
 
-    print('\n=== 3D void fill after multiplanar/model union ===')
-    fill_3d_voids_inplace_streaming(
-        final_ensemble_mm,
-        temp_dir / 'ensemble_volume_final_voidfill',
-        keep_temp=bool(args.troubleshooting),
-        prefer_memory=True,
-    )
 
     print('\n=== Scheduling final outputs in background ===')
     final_paths, final_futures = collect_pipeline_output_futures(
