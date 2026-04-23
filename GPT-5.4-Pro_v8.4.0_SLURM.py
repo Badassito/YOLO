@@ -2,7 +2,7 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v8.3.1_SLURM single-channel-aligned script:
+This v8.4.0_SLURM single-channel-aligned script:
   - builds Transverse, optional Tilted Transverse, optional Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - renders parent/full-frame videos directly from the native view transform so inference no longer waits on
     a separately rendered canvas video, and derives non-radial tile videos from shared canvas batches so the
@@ -18,7 +18,8 @@ This v8.3.1_SLURM single-channel-aligned script:
   - reuses a native radial frame cache during dense tiled rendering so radial tiles do not recompute
     the same Lanczos-5 slices for every tile location
   - inverse-maps predictions into native view coordinates, applies confidence filtering, hole filling,
-    interpolation, a single final 3D void fill after the global union, and final model ensembling
+    interpolation, and final model ensembling
+  - applies exactly one final 3D void fill after the final global union of all active views, tiles, and models
   - saves the transverse default color overlay plus optional labels, single-channel binary masks, NRRD, multiplanar, radial,
     tilted-transverse, image-sequence, low-quality, and TTA outputs, with FFV1 used for spec-required MKVs
 
@@ -3522,35 +3523,75 @@ class _UnionFind:
         return out
 
 
-def _iter_adjacent_gid_pairs(prev_gid: np.ndarray, curr_gid: np.ndarray) -> Iterator[Tuple[int, int]]:
-    """Yield unique touching component-id pairs across adjacent z-slices using 26-connectivity."""
+def _adjacent_xy_offsets_for_3d_connectivity(connectivity: int) -> Tuple[Tuple[int, int], ...]:
+    """Return XY offsets that connect components across adjacent z-slices.
+
+    Connectivity is interpreted in the standard cubic-neighborhood sense:
+      - 6-connected: only face adjacency across z, so the same (y, x) position
+      - 18-connected: face/edge adjacency, so same position plus cardinal XY offsets
+      - 26-connected: face/edge/corner adjacency, so the full 3x3 XY neighborhood
+    """
+    connectivity_i = int(connectivity)
+    if connectivity_i == 6:
+        return ((0, 0),)
+    if connectivity_i == 18:
+        return tuple((dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1) if abs(dy) + abs(dx) <= 1)
+    if connectivity_i == 26:
+        return tuple((dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1))
+    raise ValueError('3D connectivity must be one of 6, 18, or 26')
+
+
+def _slice_connectivity_for_3d_connectivity(connectivity: int) -> int:
+    connectivity_i = int(connectivity)
+    if connectivity_i == 6:
+        return 4
+    if connectivity_i in (18, 26):
+        return 8
+    raise ValueError('3D connectivity must be one of 6, 18, or 26')
+
+
+def _iter_adjacent_gid_pairs(
+    prev_gid: np.ndarray,
+    curr_gid: np.ndarray,
+    xy_offsets: Optional[Sequence[Tuple[int, int]]] = None,
+) -> Iterator[Tuple[int, int]]:
+    """Yield unique touching component-id pairs across adjacent z-slices.
+
+    ``xy_offsets`` controls the 3D connectivity across adjacent slices. When omitted, the
+    existing 26-connected behavior is used for foreground interpolation labeling.
+    """
     h, w = prev_gid.shape
     seen: set[int] = set()
+    offsets = tuple(xy_offsets) if xy_offsets is not None else _adjacent_xy_offsets_for_3d_connectivity(26)
 
-    for dy in (-1, 0, 1):
-        for dx in (-1, 0, 1):
-            py0 = max(0, -dy)
-            py1 = min(h, h - dy)
-            cy0 = max(0, dy)
-            cy1 = min(h, h + dy)
-            px0 = max(0, -dx)
-            px1 = min(w, w - dx)
-            cx0 = max(0, dx)
-            cx1 = min(w, w + dx)
+    for dy, dx in offsets:
+        dy_i = int(dy)
+        dx_i = int(dx)
+        py0 = max(0, -dy_i)
+        py1 = min(h, h - dy_i)
+        cy0 = max(0, dy_i)
+        cy1 = min(h, h + dy_i)
+        px0 = max(0, -dx_i)
+        px1 = min(w, w - dx_i)
+        cx0 = max(0, dx_i)
+        cx1 = min(w, w + dx_i)
 
-            a = prev_gid[py0:py1, px0:px1]
-            b = curr_gid[cy0:cy1, cx0:cx1]
-            overlap = (a > 0) & (b > 0)
-            if not np.any(overlap):
+        if py0 >= py1 or px0 >= px1 or cy0 >= cy1 or cx0 >= cx1:
+            continue
+
+        a = prev_gid[py0:py1, px0:px1]
+        b = curr_gid[cy0:cy1, cx0:cx1]
+        overlap = (a > 0) & (b > 0)
+        if not np.any(overlap):
+            continue
+
+        codes = (a[overlap].astype(np.uint64, copy=False) << np.uint64(32)) | b[overlap].astype(np.uint64, copy=False)
+        for code in np.unique(codes):
+            code_i = int(code)
+            if code_i in seen:
                 continue
-
-            codes = (a[overlap].astype(np.uint64, copy=False) << np.uint64(32)) | b[overlap].astype(np.uint64, copy=False)
-            for code in np.unique(codes):
-                code_i = int(code)
-                if code_i in seen:
-                    continue
-                seen.add(code_i)
-                yield (code_i >> 32), (code_i & 0xFFFFFFFF)
+            seen.add(code_i)
+            yield (code_i >> 32), (code_i & 0xFFFFFFFF)
 
 
 def _mark_boundary_components_from_local_labels(
@@ -3579,31 +3620,53 @@ def _mark_boundary_components_from_local_labels(
 
 
 def fill_3d_voids_inplace_streaming(
-    mask_mm: np.memmap,
+    mask_mm: np.ndarray,
     work_prefix: Path,
     keep_temp: bool = False,
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
+    connectivity: int = 6,
 ) -> None:
-    """Fill enclosed 3D voids with an in-memory-first streamed implementation.
+    """Fill enclosed 3D voids by labeling background connected components once.
+
+    v8.4.0 requires 3D void fill to occur only after the final global union. This
+    function performs that operation by labeling the background volume, marking any
+    background component connected to the volume boundary, and converting all other
+    background components to foreground. The default 6-connected background matches
+    the usual enclosed-void interpretation used by binary hole filling; set
+    ``YOLO_TTA_VOIDFILL_CONNECTIVITY`` or pass ``connectivity`` explicitly to use 18
+    or 26 connectivity.
 
       - prefers anonymous RAM/swap-backed arrays for the 3D background-ID workspace
       - falls back to a disk-backed memmap only when the estimated working set would be too large
       - avoids tmpfs-backed bulk scratch files that could previously SIGBUS when /dev/shm filled
     """
+    env_conn = os.environ.get('YOLO_TTA_VOIDFILL_CONNECTIVITY', '').strip()
+    if env_conn:
+        try:
+            connectivity = int(env_conn)
+        except Exception:
+            pass
+    connectivity = int(connectivity)
+    if connectivity not in (6, 18, 26):
+        raise ValueError('3D void fill connectivity must be one of 6, 18, or 26')
+
     z_dim, h, w = mask_mm.shape
     if z_dim <= 0:
         return
+
+    slice_connectivity = _slice_connectivity_for_3d_connectivity(connectivity)
+    adjacent_offsets = _adjacent_xy_offsets_for_3d_connectivity(connectivity)
 
     estimated_bytes = estimate_voidfill_workspace_bytes((z_dim, h, w))
     use_in_memory = bool(prefer_memory) and should_use_in_memory_workspace(estimated_bytes, reserve_bytes=reserve_bytes)
     budget = workspace_budget_summary(estimated_bytes, reserve_bytes=reserve_bytes)
     if use_in_memory:
-        print(f"3D void fill workspace: in-memory ({budget})")
+        print(f"3D void fill workspace: in-memory ({budget}, background connectivity={connectivity})")
         bg_gid_store: np.ndarray = np.zeros((z_dim, h, w), dtype=np.uint32)
         bg_gid_path: Optional[Path] = None
     else:
-        print(f"3D void fill workspace: disk-backed ({budget}) -> {work_prefix.parent}")
+        print(f"3D void fill workspace: disk-backed ({budget}, background connectivity={connectivity}) -> {work_prefix.parent}")
         bg_gid_path = work_prefix.with_suffix('.bg_gid.u32.dat')
         bg_gid_path.parent.mkdir(parents=True, exist_ok=True)
         bg_gid_store = np.memmap(bg_gid_path, dtype=np.uint32, mode='w+', shape=(z_dim, h, w))
@@ -3613,7 +3676,7 @@ def fill_3d_voids_inplace_streaming(
 
     for z in tqdm(range(z_dim), desc='3D void fill: slice labeling'):
         bg = (np.asarray(mask_mm[z]) == 0).astype(np.uint8, copy=False)
-        num_labels, labels2d = cv2.connectedComponents(bg, connectivity=8, ltype=cv2.CV_32S)
+        num_labels, labels2d = cv2.connectedComponents(bg, connectivity=slice_connectivity, ltype=cv2.CV_32S)
         if int(num_labels) <= 1:
             bg_gid_store[z, :, :] = 0
             prev_gid_slice = None
@@ -3627,7 +3690,7 @@ def fill_3d_voids_inplace_streaming(
         _mark_boundary_components_from_local_labels(uf, local_to_gid, labels2d, z=z, z_max=z_dim - 1)
 
         if prev_gid_slice is not None and np.any(prev_gid_slice) and np.any(gid_slice):
-            for a, b in _iter_adjacent_gid_pairs(prev_gid_slice, gid_slice):
+            for a, b in _iter_adjacent_gid_pairs(prev_gid_slice, gid_slice, adjacent_offsets):
                 uf.union(int(a), int(b))
 
         prev_gid_slice = np.asarray(gid_slice)
@@ -5611,7 +5674,7 @@ def gate_tile_volume_into_consolidated_parent(
 ) -> TileGateResult:
     """Gate one tile volume, then OR accepted components into the parent-view tile accumulator.
 
-    v8.3.1 intentionally consolidates all accepted tiles for a parent view before interpolation.
+    v8.4.0 intentionally consolidates all accepted tiles for a parent view before interpolation.
     This replaces the previous per-tile interpolation path while preserving the mask-wise OR gate:
     accepted tile components still must intersect the frozen parent full-frame support, and accepted
     tiles cannot accept other tiles because the support image is not the accumulator.
@@ -6474,15 +6537,17 @@ def build_troubleshooting_pass_ensemble(
                 else:
                     view_volumes_for_pass[str(model_name)][view.name] = native_union
 
-        ensemble = assemble_final_ensemble_after_view_union(
+        # Troubleshooting pass outputs are stage snapshots taken before the corresponding
+        # interpolation pass. They must not run the final 3D void fill; v8.4.0 requires
+        # 3D void fill exactly once, after the final global union used by the normal final
+        # output.
+        ensemble = assemble_current_ensemble_volume(
             view_volumes_by_model=view_volumes_for_pass,
             T=int(T),
             H=int(H),
             W=int(W),
             disable_multiplanar=not bool(enable_multiplanar),
             out_path=temp_dir / 'troubleshooting_pass_outputs' / f'ensemble_pass{int(pass_index)}.u8.dat',
-            temp_dir=temp_dir / 'troubleshooting_pass_outputs' / f'pass{int(pass_index)}',
-            keep_temp=bool(keep_temp),
             prefer_memory=False,
             workers=int(workers),
         )
@@ -6520,9 +6585,21 @@ def schedule_troubleshooting_pass_outputs(
     if int(total_passes) < 0 or not snapshot_refs:
         return {}
 
+    # Save only the additional pre-interpolation troubleshooting passes. For example,
+    # --interpolate_passes 2 saves Pass0 and Pass1 here; the normal final output is Pass2
+    # and is saved untagged by the main output path. Use actual captured snapshot indices
+    # so early interpolation termination does not synthesize duplicate pass outputs.
+    available_prepass_indices = sorted({
+        int(ref.pass_index)
+        for ref in snapshot_refs.values()
+        if 0 <= int(ref.pass_index) < int(total_passes)
+    })
+    if 0 not in available_prepass_indices:
+        available_prepass_indices.insert(0, 0)
+
     all_paths: Dict[str, Path] = {}
-    for pass_idx in range(0, int(total_passes) + 1):
-        print(f"\n=== Scheduling troubleshooting outputs: pass {int(pass_idx)} ===")
+    for pass_idx in available_prepass_indices:
+        print(f"\n=== Scheduling troubleshooting pre-interpolation outputs: pass {int(pass_idx)} ===")
         pass_ensemble = build_troubleshooting_pass_ensemble(
             snapshot_refs=snapshot_refs,
             model_names=model_names,
@@ -6845,6 +6922,8 @@ def write_summary_file(
     lines.append(f'FPS: {fps}')
     lines.append(f'Scratch directory: {scratch_dir}')
     lines.append('Workspace policy: in-memory first with disk fallback when the working set exceeds available RAM/swap')
+    lines.append('3D void fill: applied once after the final global union; troubleshooting pre-pass outputs are not void-filled')
+    lines.append('3D void fill background connectivity: default 6-connected; override with YOLO_TTA_VOIDFILL_CONNECTIVITY=18 or 26 if needed')
     lines.append(f'Augmentation workers: {int(augmentation_workers)}')
     lines.append(f'Slice-parallel postprocess workers: {int(slice_postprocess_workers)}')
     lines.append(f'Interpolation workers: {int(interpolation_workers)}')
