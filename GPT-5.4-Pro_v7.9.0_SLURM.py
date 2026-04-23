@@ -2,12 +2,12 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v7.8.2_SLURM-aligned script:
+This v7.9.0_SLURM-aligned script:
   - builds Transverse, optional Sagittal/Coronal, and optional Radial view families
   - prefetches active-view render assets so view creation can overlap across active families
   - generates rotated FFV1 MKV augmentation videos ahead of inference
   - supports dense tiled inference for all active views, including multi-configuration sliding-window sets,
-    with direct per-tile gated OR back into the parent full-frame view volume
+    with post-full-frame-interpolation gated acceptance into isolated tiled-view volumes before final union
   - reuses a native radial frame cache during dense tiled rendering so radial tiles do not recompute
     the same Lanczos-5 slices for every tile location
   - runs Ultralytics YOLO segmentation sequentially on each pre-generated video source
@@ -2319,13 +2319,13 @@ def _process_tile_prediction_frame(
     native_w: int,
     min_conf: float,
 ) -> Dict[str, int]:
-    """Gate one tiled frame directly against the frozen parent full-frame slice.
+    """Gate one tiled frame against the frozen parent full-frame slice into an isolated tiled volume.
 
-    v7.8.0 requires tiled masks to be compared against the parent full-frame slice without
-    consolidating tiles across locations first. We therefore keep tiled masks instance-wise,
-    inverse-map each mask to the parent native view, split the inverse-mapped mask into connected
-    components, test each component against the frozen full-frame support slice, and only then union
-    the supported components into the mutable parent view volume.
+    v7.9.0 requires tiled masks to be compared against the parent full-frame slice without
+    consolidating tile locations first, while also keeping tiled prediction sets independent until
+    after their own post-processing and optional interpolation. This function therefore accepts or
+    rejects each inverse-mapped tiled component against the frozen parent support slice, but unions
+    accepted components into a dedicated tiled-view volume rather than mutating the parent view.
     """
     stats = {
         'prediction_count': 0,
@@ -2342,7 +2342,7 @@ def _process_tile_prediction_frame(
         return stats
 
     support_slice = np.asarray(baseline_support_mm[int(idx)], dtype=bool)
-    parent_slice = np.asarray(baseline_mask_mm[int(idx)], dtype=np.uint8)
+    tiled_slice = np.asarray(baseline_mask_mm[int(idx)], dtype=np.uint8)
     conf_slice = baseline_confmap_mm[int(idx)]
 
     num_inst = int(masks_np.shape[0])
@@ -2379,7 +2379,7 @@ def _process_tile_prediction_frame(
         component_stats = _union_supported_native_components_into_parent(
             native_mask_bool=native_mask_bool,
             support_slice_bool=support_slice,
-            parent_slice=parent_slice,
+            parent_slice=tiled_slice,
             conf_slice=conf_slice,
             conf_val=conf_val,
         )
@@ -2410,7 +2410,7 @@ def predict_tile_video_and_gate(
     min_conf: float,
     postprocess_workers: int = 1,
 ) -> Dict[str, int]:
-    """Run tiled inference and gate accepted masks directly into the parent full-frame volume."""
+    """Run tiled inference and gate accepted masks into an isolated tiled-view volume."""
     results = model.predict(
         source=str(video_path),
         imgsz=cfg.imgsz,
@@ -2553,6 +2553,59 @@ def apply_min_conf_filter_with_confmap_inplace(
         max_workers=choose_slice_parallel_workers(int(workers), n),
         desc='min_conf thresholding',
     )
+
+
+def apply_min_conf_filter_on_native_volume_inplace(
+    mask_mm: np.ndarray,
+    confmap_mm: np.ndarray,
+    min_conf: float,
+    *,
+    workers: int = 1,
+) -> None:
+    """Remove native 2D connected components whose max confidence is below ``min_conf``.
+
+    This variant operates on unpacked native-view volumes, which is used for isolated tiled-view
+    prediction sets after tiled masks have been accepted against the frozen full-frame parent view.
+    """
+    n = int(mask_mm.shape[0])
+    structure2 = np.ones((3, 3), dtype=bool)
+
+    def _process(i: int) -> None:
+        mask_slice = np.asarray(mask_mm[int(i)], dtype=bool)
+        if not np.any(mask_slice):
+            confmap_mm[int(i), :, :] = np.float16(0.0)
+            return
+
+        labels2d, num = ndi.label(mask_slice, structure=structure2)
+        if int(num) <= 0:
+            mask_mm[int(i), :, :] = 0
+            confmap_mm[int(i), :, :] = np.float16(0.0)
+            return
+
+        conf_slice = np.asarray(confmap_mm[int(i)], dtype=np.float32)
+        label_ids = np.arange(1, int(num) + 1, dtype=np.int32)
+        maxima = ndi.maximum(conf_slice, labels=labels2d, index=label_ids)
+        maxima = np.asarray(maxima, dtype=np.float32)
+        keep_ids = label_ids[maxima >= float(min_conf)]
+
+        if keep_ids.size == 0:
+            mask_mm[int(i), :, :] = 0
+            confmap_mm[int(i), :, :] = np.float16(0.0)
+            return
+
+        keep = np.isin(labels2d, keep_ids)
+        mask_mm[int(i), :, :] = keep.astype(np.uint8, copy=False)
+        conf_slice[~keep] = 0.0
+        confmap_mm[int(i), :, :] = conf_slice.astype(np.float16, copy=False)
+
+    parallel_for_indices(
+        n,
+        _process,
+        max_workers=choose_slice_parallel_workers(int(workers), n),
+        desc='tile/native min_conf thresholding',
+    )
+    flush_array(mask_mm)
+    flush_array(confmap_mm)
 
 
 def fill_2d_holes_volume_inplace(
@@ -4006,14 +4059,15 @@ def _build_slice_endpoint_seeds(
     """Build interpolation endpoint seeds.
 
     Endpoint mode is controlled by ``YOLO_TTA_INTERPOLATION_ENDPOINT_MODE``:
-      - ``scan`` (default): always use the fast slice-graph terminal scan
-      - ``hybrid``: use per-object 3D skeletonization only when every object bounding box is small
+      - ``hybrid`` (default): use per-object 3D skeletonization when the compact-relabel bounding box
+        is tractable, falling back to the fast slice-graph terminal scan for oversized objects
+      - ``scan``: always use the fast slice-graph terminal scan
       - ``skeleton``: always use per-object 3D skeletonization
 
-    The scan path is the safe default for SLURM-scale volumes because a single object can have a
-    massive bounding box after compact relabel, making voxel skeletonization effectively intractable.
+    The hybrid path keeps 3D skeletonization as the default v7.9.0-compliant behavior while still
+    protecting large SLURM-scale volumes from pathological all-voxel skeletonization costs.
     """
-    mode = os.environ.get('YOLO_TTA_INTERPOLATION_ENDPOINT_MODE', 'scan').strip().lower()
+    mode = os.environ.get('YOLO_TTA_INTERPOLATION_ENDPOINT_MODE', 'hybrid').strip().lower()
     if mode not in {'scan', 'hybrid', 'skeleton'}:
         mode = 'scan'
 
@@ -5436,7 +5490,9 @@ def main() -> None:
             pass
 
     view_volumes_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
+    native_view_support_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
     aug_jobs_by_view: Dict[str, List[AugJob]] = {}
+    tile_jobs_by_view_config: Dict[str, Dict[str, List[DenseTileJob]]] = {view.name: {} for view in views}
     dense_tiling_active = len(tile_configs) > 0
     view_prediction_stats: Dict[str, int] = {
         'transverse': 0,
@@ -5484,7 +5540,7 @@ def main() -> None:
         extra = ''
         if view.family == 'radial':
             extra = f', azimuths={view.num_slices}'
-        print(f"\n=== View: {view.name} ({view.src_w}x{view.src_h}, slices={view.num_slices}{extra}) ===")
+        print(f'\n=== View: {view.name} ({view.src_w}x{view.src_h}, slices={view.num_slices}{extra}) ===')
 
         if not view_prefetch_futures[view.name].done():
             print(f"Waiting for prefetched render assets for view '{view.name}' to finish...")
@@ -5497,25 +5553,9 @@ def main() -> None:
 
         baseline_union_by_model_view: Dict[str, np.ndarray] = {}
         baseline_confmap_by_model_view: Dict[str, np.ndarray] = {}
-        baseline_native_by_model_view: Dict[str, np.ndarray] = {}
-        baseline_support_by_model_view: Dict[str, np.ndarray] = {}
         baseline_union_paths: Dict[str, Path] = {}
         baseline_confmap_paths: Dict[str, Path] = {}
         baseline_native_paths: Dict[str, Path] = {}
-        baseline_support_paths: Dict[str, Path] = {}
-        tile_gate_stats_by_model: Dict[str, Dict[str, int]] = {
-            model_name: {
-                'prediction_count': 0,
-                'frames_with_predictions': 0,
-                'accepted_masks': 0,
-                'rejected_masks': 0,
-                'accepted_components': 0,
-                'rejected_components': 0,
-                'rejected_min_conf': 0,
-                'gated_added_voxels': 0,
-            }
-            for model_name, _ in yolo_models
-        }
 
         for model_name, _ in yolo_models:
             bytes_native = bytes_for_packbits(view.src_h, view.src_w)
@@ -5544,29 +5584,34 @@ def main() -> None:
             baseline_confmap_paths[model_name] = confmap_path
 
         tile_jobs_for_view: List[DenseTileJob] = []
+        tile_jobs_for_view_by_config: Dict[str, List[DenseTileJob]] = {}
         tile_ready_jobs: List[DenseTileJob] = []
         tile_future_to_job: Dict[Future, DenseTileJob] = {}
         tile_executor: Optional[ThreadPoolExecutor] = None
-        tile_video_workers = 0
         tile_workers_per_job = 1
 
         if dense_tiling_active:
             for tile_cfg in tile_configs:
+                jobs_for_cfg: List[DenseTileJob] = []
                 for job in aug_jobs:
-                    tile_jobs_for_view.extend(build_dense_tile_jobs_for_aug(
+                    jobs_for_cfg.extend(build_dense_tile_jobs_for_aug(
                         view=view,
                         aug_job=job,
                         tile_cfg=tile_cfg,
                         out_size=int(args.imgsz),
                         temp_dir=temp_dir,
                     ))
+                if jobs_for_cfg:
+                    tile_jobs_for_view_by_config[tile_cfg.config_id] = jobs_for_cfg
+                    tile_jobs_for_view.extend(jobs_for_cfg)
+
             if tile_jobs_for_view:
                 if view_frame_cache is not None:
                     tile_workers_per_job = max(1, min(8, int(worker_budget // max(1, len(tile_jobs_for_view)))))
                 tile_video_workers = max(1, min(int(len(tile_jobs_for_view)), int(worker_budget // max(1, tile_workers_per_job))))
                 print(
                     f"Starting background dense tile rendering for {view.name}: "
-                    f"{len(tile_jobs_for_view)} tile video(s) across {len(tile_configs)} tile configuration(s) "
+                    f"{len(tile_jobs_for_view)} tile video(s) across {len(tile_jobs_for_view_by_config)} tile configuration(s) "
                     f"with {tile_video_workers} outer worker(s)"
                 )
                 if view_frame_cache is not None:
@@ -5619,149 +5664,93 @@ def main() -> None:
                         aug_meta.unlink(missing_ok=True)
                     except Exception:
                         pass
-
-            for model_name, _ in yolo_models:
-                print(f"\n--- Preparing full-frame baseline for view '{view.name}' and model '{model_name}' ---")
-                if args.min_conf > 0:
-                    apply_min_conf_filter_with_confmap_inplace(
-                        baseline_union_by_model_view[model_name],
-                        baseline_confmap_by_model_view[model_name],
-                        float(args.min_conf),
-                        view.src_h,
-                        view.src_w,
-                        workers=slice_postprocess_workers,
-                    )
-                    flush_array(baseline_union_by_model_view[model_name])
-                    flush_array(baseline_confmap_by_model_view[model_name])
-
-                native_volume_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.native.u8.dat'
-                baseline_native_volume = unpack_view_union_to_volume(
-                    union_mm=baseline_union_by_model_view[model_name],
-                    num_slices=view.num_slices,
-                    h=view.src_h,
-                    w=view.src_w,
-                    out_path=native_volume_path,
-                    desc=f'Unpacking {model_name}/{view.name}',
-                    prefer_memory=True,
-                    workers=slice_postprocess_workers,
-                )
-                baseline_native_by_model_view[model_name] = baseline_native_volume
-                baseline_native_paths[model_name] = native_volume_path
-
-                if dense_tiling_active and tile_jobs_for_view:
-                    support_volume_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.support.u8.dat'
-                    baseline_support_by_model_view[model_name] = copy_workspace_array(
-                        baseline_native_volume,
-                        support_volume_path,
-                        desc=f'{model_name}/{view.name} frozen full-frame support volume',
-                        prefer_memory=True,
-                        workers=slice_postprocess_workers,
-                    )
-                    baseline_support_paths[model_name] = support_volume_path
-
-                union_mm_done = baseline_union_by_model_view.pop(model_name, None)
-                close_memmap_array(union_mm_done)
-                if not args.troubleshooting:
-                    try:
-                        baseline_union_paths[model_name].unlink(missing_ok=True)
-                    except Exception:
-                        pass
-
-            if dense_tiling_active and tile_jobs_for_view:
-                if not tile_ready_jobs and tile_future_to_job:
-                    print(f"Waiting for the first background dense tile video for view '{view.name}' to finish rendering...")
-                ready_iter = iter_dense_tile_jobs_in_completion_order(tile_ready_jobs, tile_future_to_job)
-                for tile_job in tqdm(
-                    ready_iter,
-                    total=len(tile_jobs_for_view),
-                    desc=f'Dense tiled inference {view.name}',
-                ):
-                    for model_name, yolo in yolo_models:
-                        pred_stats = predict_tile_video_and_gate(
-                            model=yolo,
-                            video_path=tile_job.video_path,
-                            num_frames=view.num_slices,
-                            out_size=args.imgsz,
-                            cfg=pred_cfg,
-                            baseline_support_mm=baseline_support_by_model_view[model_name],
-                            baseline_mask_mm=baseline_native_by_model_view[model_name],
-                            baseline_confmap_mm=baseline_confmap_by_model_view[model_name],
-                            M_out_to_native=tile_job.M_out_to_src,
-                            native_h=view.src_h,
-                            native_w=view.src_w,
-                            min_conf=float(args.min_conf),
-                            postprocess_workers=predict_postprocess_workers,
-                        )
-                        view_prediction_stats[view.name] = int(view_prediction_stats.get(view.name, 0)) + int(pred_stats.get('prediction_count', 0))
-                        for key in tile_gate_stats_by_model[model_name].keys():
-                            tile_gate_stats_by_model[model_name][key] += int(pred_stats.get(key, 0))
-
-                    if not args.troubleshooting:
-                        try:
-                            tile_job.video_path.unlink(missing_ok=True)
-                            tile_job.meta_path.unlink(missing_ok=True)
-                        except Exception:
-                            pass
-
-                for model_name in sorted(tile_gate_stats_by_model.keys()):
-                    gate_stats = tile_gate_stats_by_model[model_name]
-                    print(
-                        f"Dense tiled gating {model_name}/{view.name}: "
-                        f"predictions={gate_stats['prediction_count']}, "
-                        f"accepted_masks={gate_stats['accepted_masks']}, "
-                        f"rejected_masks={gate_stats['rejected_masks']}, "
-                        f"accepted_components={gate_stats['accepted_components']}, "
-                        f"rejected_components={gate_stats['rejected_components']}, "
-                        f"rejected_min_conf={gate_stats['rejected_min_conf']}, "
-                        f"gated_added_voxels={gate_stats['gated_added_voxels']}"
-                    )
         finally:
             if tile_executor is not None:
+                if tile_future_to_job:
+                    if not tile_ready_jobs:
+                        print(f"Waiting for the first background dense tile video for view '{view.name}' to finish rendering...")
+                    for fut in tqdm(
+                        as_completed(list(tile_future_to_job.keys())),
+                        total=len(tile_future_to_job),
+                        desc=f'Preparing dense tiles {view.name}',
+                    ):
+                        fut.result()
                 tile_executor.shutdown(wait=True)
 
+        if tile_jobs_for_view_by_config:
+            tile_jobs_by_view_config[view.name] = {
+                config_id: list(jobs)
+                for config_id, jobs in tile_jobs_for_view_by_config.items()
+                if jobs
+            }
+
         for model_name, _ in yolo_models:
-            print(f"\n--- Finalizing view '{view.name}' for model '{model_name}' ---")
-            baseline_native_volume = baseline_native_by_model_view.pop(model_name)
-            try:
-                support_mm_done = baseline_support_by_model_view.pop(model_name, None)
-                close_memmap_array(support_mm_done)
-                if not args.troubleshooting and model_name in baseline_support_paths:
-                    try:
-                        baseline_support_paths[model_name].unlink(missing_ok=True)
-                    except Exception:
-                        pass
-
-                confmap_mm_done = baseline_confmap_by_model_view.pop(model_name, None)
-                close_memmap_array(confmap_mm_done)
-                if not args.troubleshooting:
-                    try:
-                        baseline_confmap_paths[model_name].unlink(missing_ok=True)
-                    except Exception:
-                        pass
-
-                fill_2d_holes_volume_inplace(
-                    baseline_native_volume,
+            print(f"\n--- Preparing full-frame baseline for view '{view.name}' and model '{model_name}' ---")
+            if args.min_conf > 0:
+                apply_min_conf_filter_with_confmap_inplace(
+                    baseline_union_by_model_view[model_name],
+                    baseline_confmap_by_model_view[model_name],
+                    float(args.min_conf),
+                    view.src_h,
+                    view.src_w,
                     workers=slice_postprocess_workers,
                 )
+                flush_array(baseline_union_by_model_view[model_name])
+                flush_array(baseline_confmap_by_model_view[model_name])
 
-                if view.family == 'radial':
-                    out_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.u8.dat'
-                    baseline_volume = backproject_radial_volume_to_volume(
-                        radial_mask_mm=baseline_native_volume,
-                        radial_view=view,
-                        out_path=out_path,
-                        desc=f'Backprojecting {model_name}/{view.name}',
-                        prefer_memory=True,
+            native_volume_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.native.u8.dat'
+            baseline_native_volume = unpack_view_union_to_volume(
+                union_mm=baseline_union_by_model_view[model_name],
+                num_slices=view.num_slices,
+                h=view.src_h,
+                w=view.src_w,
+                out_path=native_volume_path,
+                desc=f'Unpacking {model_name}/{view.name}',
+                prefer_memory=True,
+                workers=slice_postprocess_workers,
+            )
+            baseline_native_paths[model_name] = native_volume_path
+
+            union_mm_done = baseline_union_by_model_view.pop(model_name, None)
+            close_memmap_array(union_mm_done)
+            if not args.troubleshooting:
+                try:
+                    baseline_union_paths[model_name].unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+            confmap_mm_done = baseline_confmap_by_model_view.pop(model_name, None)
+            close_memmap_array(confmap_mm_done)
+            if not args.troubleshooting:
+                try:
+                    baseline_confmap_paths[model_name].unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+            fill_2d_holes_volume_inplace(
+                baseline_native_volume,
+                workers=slice_postprocess_workers,
+            )
+
+            if view.family == 'radial':
+                native_view_support_by_model[model_name][view.name] = baseline_native_volume
+                out_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.u8.dat'
+                baseline_volume = backproject_radial_volume_to_volume(
+                    radial_mask_mm=baseline_native_volume,
+                    radial_view=view,
+                    out_path=out_path,
+                    desc=f'Backprojecting {model_name}/{view.name}',
+                    prefer_memory=True,
+                )
+                if float(args.min_radius) > 0:
+                    print(f"Applying --min_radius in the transverse plane for backprojected view '{view.name}'")
+                    apply_transverse_min_radius_filter_inplace(
+                        baseline_volume,
+                        float(args.min_radius),
+                        workers=slice_postprocess_workers,
                     )
-                    close_memmap_array(baseline_native_volume)
-                    if not args.troubleshooting:
-                        try:
-                            baseline_native_paths[model_name].unlink(missing_ok=True)
-                        except Exception:
-                            pass
-                else:
-                    baseline_volume = baseline_native_volume
-
+            else:
+                baseline_volume = baseline_native_volume
                 if float(args.min_radius) > 0:
                     apply_view_min_radius_filter_inplace(
                         baseline_volume,
@@ -5770,14 +5759,10 @@ def main() -> None:
                         workers=slice_postprocess_workers,
                     )
 
-                view_volumes_by_model[model_name][view.name] = baseline_volume
-            finally:
-                baseline_native_by_model_view.pop(model_name, None)
+            view_volumes_by_model[model_name][view.name] = baseline_volume
 
         baseline_union_by_model_view.clear()
         baseline_confmap_by_model_view.clear()
-        baseline_native_by_model_view.clear()
-        baseline_support_by_model_view.clear()
 
         close_memmap_array(view_frame_cache)
         if not args.troubleshooting and view_frame_cache_path is not None:
@@ -5787,6 +5772,7 @@ def main() -> None:
                 pass
 
         gc.collect()
+
 
     view_prefetch_executor.shutdown(wait=True)
 
@@ -6009,6 +5995,238 @@ def main() -> None:
                 }
                 interpolation_stats.append(entry)
 
+    if dense_tiling_active:
+        tile_interpolation_task_workers = max(
+            1,
+            min(16, _env_int('YOLO_TTA_INTERPOLATION_TASK_WORKERS', max(1, interpolation_workers))),
+        )
+        print('\n=== Dense tiled prediction stage (post full-frame interpolation) ===')
+        for view in views:
+            jobs_by_config = tile_jobs_by_view_config.get(view.name, {})
+            if not jobs_by_config:
+                continue
+
+            print(f"\n=== Dense tiled view: {view.name} ===")
+            for model_name, yolo in yolo_models:
+                if view.family == 'radial':
+                    support_source = native_view_support_by_model[model_name].get(view.name)
+                else:
+                    support_source = view_volumes_by_model[model_name].get(view.name)
+
+                if support_source is None:
+                    continue
+
+                support_snapshot_path = temp_dir / 'tile_support' / model_name / f'{view.name}.u8.dat'
+                support_snapshot = copy_workspace_array(
+                    support_source,
+                    support_snapshot_path,
+                    desc=f'{model_name}/{view.name} frozen post-full-frame support volume',
+                    prefer_memory=True,
+                    workers=slice_postprocess_workers,
+                )
+
+                try:
+                    for tile_cfg in tile_configs:
+                        tile_jobs = list(jobs_by_config.get(tile_cfg.config_id, []))
+                        if not tile_jobs:
+                            continue
+
+                        print(
+                            f"\n--- Dense tiled inference for model '{model_name}', view '{view.name}', "
+                            f"config '{tile_cfg.config_id}' ---"
+                        )
+                        tile_mask_path = temp_dir / 'tile_volumes' / model_name / view.name / f'{tile_cfg.config_id}.u8.dat'
+                        tile_conf_path = temp_dir / 'tile_volumes' / model_name / view.name / f'{tile_cfg.config_id}.confmap.f16.dat'
+                        tile_mask_mm = allocate_workspace_array(
+                            shape=support_snapshot.shape,
+                            dtype=np.uint8,
+                            path=tile_mask_path,
+                            desc=f'{model_name}/{view.name}/{tile_cfg.config_id} accepted tiled volume',
+                            prefer_memory=True,
+                        )
+                        tile_conf_mm = allocate_workspace_array(
+                            shape=support_snapshot.shape,
+                            dtype=np.float16,
+                            path=tile_conf_path,
+                            desc=f'{model_name}/{view.name}/{tile_cfg.config_id} accepted tiled confidence workspace',
+                            prefer_memory=True,
+                        )
+                        tile_back_mm: Optional[np.ndarray] = None
+                        tile_back_path: Optional[Path] = None
+                        gate_stats = {
+                            'prediction_count': 0,
+                            'frames_with_predictions': 0,
+                            'accepted_masks': 0,
+                            'rejected_masks': 0,
+                            'accepted_components': 0,
+                            'rejected_components': 0,
+                            'rejected_min_conf': 0,
+                            'gated_added_voxels': 0,
+                        }
+
+                        try:
+                            for tile_job in tqdm(
+                                tile_jobs,
+                                total=len(tile_jobs),
+                                desc=f'Dense tiled inference {view.name}/{tile_cfg.config_id}',
+                            ):
+                                pred_stats = predict_tile_video_and_gate(
+                                    model=yolo,
+                                    video_path=tile_job.video_path,
+                                    num_frames=view.num_slices,
+                                    out_size=args.imgsz,
+                                    cfg=pred_cfg,
+                                    baseline_support_mm=support_snapshot,
+                                    baseline_mask_mm=tile_mask_mm,
+                                    baseline_confmap_mm=tile_conf_mm,
+                                    M_out_to_native=tile_job.M_out_to_src,
+                                    native_h=view.src_h,
+                                    native_w=view.src_w,
+                                    min_conf=0.0,
+                                    postprocess_workers=predict_postprocess_workers,
+                                )
+                                view_prediction_stats[view.name] = int(view_prediction_stats.get(view.name, 0)) + int(pred_stats.get('prediction_count', 0))
+                                for key in gate_stats.keys():
+                                    gate_stats[key] += int(pred_stats.get(key, 0))
+
+                                if not args.troubleshooting:
+                                    try:
+                                        tile_job.video_path.unlink(missing_ok=True)
+                                        tile_job.meta_path.unlink(missing_ok=True)
+                                    except Exception:
+                                        pass
+
+                            print(
+                                f"Dense tiled gating {model_name}/{view.name}/{tile_cfg.config_id}: "
+                                f"predictions={gate_stats['prediction_count']}, "
+                                f"accepted_masks={gate_stats['accepted_masks']}, "
+                                f"rejected_masks={gate_stats['rejected_masks']}, "
+                                f"accepted_components={gate_stats['accepted_components']}, "
+                                f"rejected_components={gate_stats['rejected_components']}, "
+                                f"rejected_min_conf={gate_stats['rejected_min_conf']}, "
+                                f"gated_added_voxels={gate_stats['gated_added_voxels']}"
+                            )
+
+                            if args.min_conf > 0:
+                                apply_min_conf_filter_on_native_volume_inplace(
+                                    tile_mask_mm,
+                                    tile_conf_mm,
+                                    float(args.min_conf),
+                                    workers=slice_postprocess_workers,
+                                )
+
+                            close_memmap_array(tile_conf_mm)
+                            tile_conf_mm = None
+                            if not args.troubleshooting:
+                                try:
+                                    tile_conf_path.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+
+                            fill_2d_holes_volume_inplace(
+                                tile_mask_mm,
+                                workers=slice_postprocess_workers,
+                            )
+
+                            if view.family != 'radial' and float(args.min_radius) > 0:
+                                apply_view_min_radius_filter_inplace(
+                                    tile_mask_mm,
+                                    view,
+                                    float(args.min_radius),
+                                    workers=slice_postprocess_workers,
+                                )
+
+                            if int(args.interpolate) > 0 and view.family == 'orthogonal':
+                                total_tile_passes = int(args.interpolate_passes)
+                                for pass_idx in range(1, total_tile_passes + 1):
+                                    stats_local = interpolate_view_volume_pass_inplace(
+                                        mask_mm=tile_mask_mm,
+                                        work_dir=temp_dir / 'tile_interpolation' / model_name / view.name / tile_cfg.config_id,
+                                        pass_tag=f'pass{pass_idx}',
+                                        max_slice_distance=int(args.interpolate),
+                                        search_angle_deg=float(args.interpolation_search_angle),
+                                        interpolation_walk_back=int(args.interpolation_walk_back),
+                                        interpolation_candidates=int(args.interpolation_candidates),
+                                        interpolate_min_radius=float(args.interpolate_min_radius),
+                                        keep_temp=bool(args.troubleshooting),
+                                        prefer_memory=True,
+                                        workers=tile_interpolation_task_workers,
+                                    )
+                                    stats_local = dict(stats_local)
+                                    stats_local.update({
+                                        'pass_index': int(pass_idx),
+                                        'model': str(model_name),
+                                        'view': f'{view.name}[tile:{tile_cfg.config_id}]',
+                                        'max_slice_distance': int(args.interpolate),
+                                        'interpolation_walk_back': int(args.interpolation_walk_back),
+                                        'interpolation_candidates': int(args.interpolation_candidates),
+                                        'interpolation_search_angle': float(args.interpolation_search_angle),
+                                    })
+                                    interpolation_stats.append(stats_local)
+                                    if int(stats_local.get('added_voxels', 0)) <= 0:
+                                        break
+
+                            if view.family == 'radial':
+                                tile_back_path = temp_dir / 'tile_volumes' / model_name / view.name / f'{tile_cfg.config_id}.backproject.u8.dat'
+                                tile_back_mm = backproject_radial_volume_to_volume(
+                                    radial_mask_mm=tile_mask_mm,
+                                    radial_view=view,
+                                    out_path=tile_back_path,
+                                    desc=f'Backprojecting {model_name}/{view.name}/{tile_cfg.config_id}',
+                                    prefer_memory=True,
+                                )
+                                if float(args.min_radius) > 0:
+                                    print(
+                                        f"Applying --min_radius in the transverse plane for backprojected tiled view "
+                                        f"'{view.name}/{tile_cfg.config_id}'"
+                                    )
+                                    apply_transverse_min_radius_filter_inplace(
+                                        tile_back_mm,
+                                        float(args.min_radius),
+                                        workers=slice_postprocess_workers,
+                                    )
+                                union_volume_into_volume(
+                                    view_volumes_by_model[model_name][view.name],
+                                    tile_back_mm,
+                                    workers=slice_postprocess_workers,
+                                    desc=f'Union {model_name}/{view.name}/{tile_cfg.config_id} into parent view',
+                                )
+                            else:
+                                union_volume_into_volume(
+                                    view_volumes_by_model[model_name][view.name],
+                                    tile_mask_mm,
+                                    workers=slice_postprocess_workers,
+                                    desc=f'Union {model_name}/{view.name}/{tile_cfg.config_id} into parent view',
+                                )
+                        finally:
+                            if tile_back_mm is not None:
+                                close_memmap_array(tile_back_mm)
+                                if tile_back_path is not None and not args.troubleshooting:
+                                    try:
+                                        tile_back_path.unlink(missing_ok=True)
+                                    except Exception:
+                                        pass
+                            if tile_conf_mm is not None:
+                                close_memmap_array(tile_conf_mm)
+                                if not args.troubleshooting:
+                                    try:
+                                        tile_conf_path.unlink(missing_ok=True)
+                                    except Exception:
+                                        pass
+                            close_memmap_array(tile_mask_mm)
+                            if not args.troubleshooting:
+                                try:
+                                    tile_mask_path.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+                finally:
+                    close_memmap_array(support_snapshot)
+                    if not args.troubleshooting:
+                        try:
+                            support_snapshot_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+
     output_manager.reap_completed()
 
     print('\n=== Building final ensemble after per-model view union ===')
@@ -6148,6 +6366,10 @@ def main() -> None:
     )
 
     close_memmap_array(final_ensemble_mm)
+    for model_support in native_view_support_by_model.values():
+        for mm in model_support.values():
+            close_memmap_array(mm)
+        model_support.clear()
     for model_views in view_volumes_by_model.values():
         for mm in model_views.values():
             close_memmap_array(mm)
