@@ -1491,6 +1491,71 @@ def build_aug_jobs_for_view(
     return jobs
 
 
+def iter_aug_jobs_round_robin(
+    views: Sequence[ViewInfo],
+    aug_jobs_by_view: Dict[str, Sequence[AugJob]],
+) -> Iterator[Tuple[ViewInfo, AugJob]]:
+    """Yield augmentation jobs one round per view so later view families start earlier.
+
+    The prior FIFO submission order rendered every augmentation for early views before later
+    views even entered the render queue. That could leave later families, notably tilted
+    transverse variants, sitting behind a long tail of earlier canvas/tile work even while the GPU
+    had no ready inference job. Round-robin submission starts one job per active view first, then
+    the second job per view, and so on.
+    """
+    queues: Dict[str, deque[AugJob]] = {
+        str(view.name): deque(aug_jobs_by_view.get(view.name, ()))
+        for view in views
+    }
+    while True:
+        emitted = False
+        for view in views:
+            q = queues[str(view.name)]
+            if not q:
+                continue
+            emitted = True
+            yield view, q.popleft()
+        if not emitted:
+            break
+
+
+def split_video_render_workers(total_workers: int, total_fullframe_tasks: int, total_tile_tasks: int) -> Tuple[int, int]:
+    """Reserve render capacity for full-frame jobs so later parents do not queue behind tiles.
+
+    Returns ``(fullframe_workers, tile_workers)``. Tile rendering gets a smaller share because the
+    GPU scheduler already prefers ready full-frame videos over ready tile videos, and keeping parent
+    rendering moving prevents the GPU from stalling while it waits for later views to appear.
+    """
+    total_workers = max(1, int(total_workers))
+    total_fullframe_tasks = max(0, int(total_fullframe_tasks))
+    total_tile_tasks = max(0, int(total_tile_tasks))
+
+    if total_tile_tasks <= 0:
+        return max(1, min(total_workers, max(1, total_fullframe_tasks))), 0
+
+    if total_workers <= 1:
+        return 1, 0
+
+    tile_workers = min(total_tile_tasks, max(1, total_workers // 3))
+    fullframe_workers = max(1, total_workers - tile_workers)
+
+    if total_fullframe_tasks > 0:
+        fullframe_workers = min(fullframe_workers, total_fullframe_tasks)
+    else:
+        fullframe_workers = 0
+
+    tile_workers = total_workers - fullframe_workers
+    if tile_workers <= 0 and total_tile_tasks > 0:
+        tile_workers = 1
+        fullframe_workers = max(1, total_workers - tile_workers)
+
+    if total_fullframe_tasks > 0 and fullframe_workers <= 0:
+        fullframe_workers = 1
+        tile_workers = max(0, total_workers - fullframe_workers)
+
+    return int(fullframe_workers), int(min(tile_workers, total_tile_tasks))
+
+
 @dataclass(frozen=True)
 class TileConfig:
     tile_size: int
@@ -5076,6 +5141,16 @@ class TilePostprocessResult:
     tile_mask_path: Path
 
 
+@dataclass(frozen=True)
+class DeferredTilePostprocessResult:
+    model_name: str
+    view_name: str
+    config_id: str
+    tile_id: str
+    tile_mask_path: Path
+    tile_shape: Tuple[int, int, int]
+
+
 def _volume_has_foreground(mask_mm: np.ndarray) -> bool:
     for idx in range(int(mask_mm.shape[0])):
         if np.any(np.asarray(mask_mm[int(idx)], dtype=bool)):
@@ -5282,6 +5357,67 @@ def postprocess_tile_volume_after_inference(
         tile_id=str(task.tile_id),
         tile_mask_mm=task.tile_mask_mm,
         tile_mask_path=task.tile_mask_path,
+    )
+
+
+def spill_waiting_tile_result_to_mmap(
+    result: TilePostprocessResult,
+    temp_dir: Path,
+    *,
+    workers: int = 1,
+) -> DeferredTilePostprocessResult:
+    """Drain a postprocessed tile volume to temp storage while it waits for parent gated OR.
+
+    Tile cleanup can complete long before the matching parent view finishes interpolation. Holding
+    those cleaned tile volumes open in RAM needlessly inflates the working set and can delay other
+    CPU work. Persist them to a dedicated temp-directory memmap and reopen them only after the
+    parent support becomes available.
+    """
+    wait_path = temp_dir / 'waiting_tiles' / result.model_name / result.view_name / result.config_id / f'{result.tile_id}.u8.dat'
+    wait_path.parent.mkdir(parents=True, exist_ok=True)
+    tile_shape = tuple(int(x) for x in np.asarray(result.tile_mask_mm).shape)
+
+    is_disk_backed = bool(isinstance(result.tile_mask_mm, np.memmap) and result.tile_mask_path.exists())
+    if is_disk_backed:
+        flush_array(result.tile_mask_mm)
+        close_memmap_array(result.tile_mask_mm)
+        if result.tile_mask_path.resolve() != wait_path.resolve():
+            shutil.move(str(result.tile_mask_path), str(wait_path))
+    else:
+        spilled_mm = copy_workspace_array(
+            np.asarray(result.tile_mask_mm),
+            wait_path,
+            desc=f'Waiting tile spill {result.model_name}/{result.view_name}/{result.tile_id}',
+            prefer_memory=False,
+            workers=int(workers),
+        )
+        close_memmap_array(spilled_mm)
+        close_memmap_array(result.tile_mask_mm)
+
+    return DeferredTilePostprocessResult(
+        model_name=str(result.model_name),
+        view_name=str(result.view_name),
+        config_id=str(result.config_id),
+        tile_id=str(result.tile_id),
+        tile_mask_path=wait_path,
+        tile_shape=(int(tile_shape[0]), int(tile_shape[1]), int(tile_shape[2])),
+    )
+
+
+def load_waiting_tile_result_from_mmap(waiting: DeferredTilePostprocessResult) -> TilePostprocessResult:
+    tile_mask_mm = np.memmap(
+        waiting.tile_mask_path,
+        dtype=np.uint8,
+        mode='r+',
+        shape=tuple(int(x) for x in waiting.tile_shape),
+    )
+    return TilePostprocessResult(
+        model_name=str(waiting.model_name),
+        view_name=str(waiting.view_name),
+        config_id=str(waiting.config_id),
+        tile_id=str(waiting.tile_id),
+        tile_mask_mm=tile_mask_mm,
+        tile_mask_path=waiting.tile_mask_path,
     )
 
 
@@ -6413,14 +6549,9 @@ def main() -> None:
         min(16, _env_int('YOLO_TTA_INTERPOLATION_TASK_WORKERS', max(1, _cpu_count() // max(1, parent_postprocess_workers)))),
     )
 
-    tile_postprocess_workers = max(1, _env_int('YOLO_TTA_TILE_POSTPROCESS_WORKERS', worker_budget))
-    tile_slice_postprocess_workers_default = max(
-        1,
-        min(
-            16,
-            max(2, _cpu_count() // max(1, min(16, tile_postprocess_workers))),
-        ),
-    )
+    tile_postprocess_workers_default = int(worker_budget)
+    tile_postprocess_workers = max(1, _env_int('YOLO_TTA_TILE_POSTPROCESS_WORKERS', tile_postprocess_workers_default))
+    tile_slice_postprocess_workers_default = int(worker_budget)
     tile_slice_postprocess_workers = max(
         1,
         _env_int('YOLO_TTA_TILE_SLICE_WORKERS', tile_slice_postprocess_workers_default),
@@ -6556,13 +6687,20 @@ def main() -> None:
         for view in views if view.family != 'radial'
         for aug_job in aug_jobs_by_view[view.name]
     )
+    total_canvas_render_tasks = sum(
+        1
+        for view in views if view.family != 'radial'
+        for aug_job in aug_jobs_by_view[view.name]
+        if tile_jobs_by_aug.get((view.name, aug_job.aug_id), [])
+    )
     total_tile_render_batches = sum(
         1
         for view in views
         for aug_job in aug_jobs_by_view[view.name]
         if tile_jobs_by_aug.get((view.name, aug_job.aug_id), [])
     )
-    total_render_tasks = int(total_fullframe_jobs + total_tile_render_batches)
+    total_tile_render_tasks = int(total_canvas_render_tasks + total_tile_render_batches)
+    total_render_tasks = int(total_fullframe_jobs + total_tile_render_tasks)
     video_render_workers = max(
         1,
         min(
@@ -6570,15 +6708,34 @@ def main() -> None:
             max(1, _env_int('YOLO_TTA_VIDEO_RENDER_WORKERS', max(1, min(augmentation_workers, total_render_tasks)))),
         ),
     )
+    use_split_render_executors = bool(dense_tiling_active) and int(video_render_workers) > 1 and int(total_tile_render_tasks) > 0
+    if use_split_render_executors:
+        fullframe_render_workers, tile_render_workers = split_video_render_workers(
+            int(video_render_workers),
+            int(total_fullframe_jobs),
+            int(total_tile_render_tasks),
+        )
+    else:
+        fullframe_render_workers = int(video_render_workers)
+        tile_render_workers = 0
     per_video_render_workers = max(1, int(max(1, augmentation_workers) // max(1, video_render_workers)))
     print(
         f'Video render workers: {video_render_workers} '
-        f'(per-video slice workers: {per_video_render_workers}, render tasks: {total_render_tasks})'
+        f'(full-frame queue: {fullframe_render_workers}, tile/canvas queue: {tile_render_workers}, '
+        f'per-video slice workers: {per_video_render_workers}, render tasks: {total_render_tasks})'
     )
 
-    render_executor = ThreadPoolExecutor(max_workers=int(video_render_workers), thread_name_prefix='video-render')
+    fullframe_render_executor = ThreadPoolExecutor(max_workers=int(max(1, fullframe_render_workers)), thread_name_prefix='fullframe-render')
+    tile_render_executor = (
+        ThreadPoolExecutor(max_workers=int(tile_render_workers), thread_name_prefix='tile-render')
+        if int(tile_render_workers) > 0 else None
+    )
     parent_postprocess_executor = ThreadPoolExecutor(max_workers=int(parent_postprocess_workers), thread_name_prefix='parent-postprocess')
     tile_postprocess_executor = ThreadPoolExecutor(max_workers=int(tile_postprocess_workers), thread_name_prefix='tile-postprocess')
+
+    def _tile_render_submit(fn: Callable[..., object], /, *fn_args: object) -> Future:
+        executor = tile_render_executor if tile_render_executor is not None else fullframe_render_executor
+        return executor.submit(fn, *fn_args)
 
 
     canvas_futures_by_aug: Dict[Tuple[str, str], Future] = {}
@@ -6599,7 +6756,7 @@ def main() -> None:
     view_processing_futures: Dict[Future, Tuple[str, str]] = {}
     view_processing_submitted: set[Tuple[str, str]] = set()
     tile_cleanup_futures: Dict[Future, Tuple[str, str, str]] = {}
-    postprocessed_tiles_waiting_by_parent: Dict[Tuple[str, str], Dict[str, TilePostprocessResult]] = {}
+    postprocessed_tiles_waiting_by_parent: Dict[Tuple[str, str], Dict[str, DeferredTilePostprocessResult]] = {}
     tile_finalize_futures: Dict[Future, Tuple[str, str, str]] = {}
 
     def _get_canvas_future(view: ViewInfo, job: AugJob) -> Future:
@@ -6607,7 +6764,7 @@ def main() -> None:
         fut = canvas_futures_by_aug.get(key)
         if fut is not None:
             return fut
-        fut = render_executor.submit(
+        fut = _tile_render_submit(
             ensure_canvas_video_only,
             volume_rgb,
             view,
@@ -6621,7 +6778,7 @@ def main() -> None:
         return fut
 
     def _submit_fullframe_video(view: ViewInfo, job: AugJob) -> None:
-        fut = render_executor.submit(
+        fut = fullframe_render_executor.submit(
             ensure_fullframe_video_only,
             volume_rgb,
             view,
@@ -6641,7 +6798,7 @@ def main() -> None:
         tile_jobs = tuple(tile_jobs)
         if not tile_jobs:
             return
-        fut = render_executor.submit(
+        fut = _tile_render_submit(
             ensure_dense_tile_video_batch_from_canvas,
             aug_job,
             view,
@@ -6667,13 +6824,14 @@ def main() -> None:
             return
         pending_tile_batches_by_aug[batch_key] = (view, aug_job, tile_jobs)
 
-    for view in views:
-        for aug_job in aug_jobs_by_view[view.name]:
-            _submit_fullframe_video(view, aug_job)
-            if dense_tiling_active and view.family != 'radial':
-                tile_jobs = tile_jobs_by_aug.get((view.name, aug_job.aug_id), [])
-                if tile_jobs:
-                    _submit_tile_video_batch(view, aug_job, tile_jobs)
+    for view, aug_job in iter_aug_jobs_round_robin(views, aug_jobs_by_view):
+        _submit_fullframe_video(view, aug_job)
+
+    for view, aug_job in iter_aug_jobs_round_robin(views, aug_jobs_by_view):
+        if dense_tiling_active and view.family != 'radial':
+            tile_jobs = tile_jobs_by_aug.get((view.name, aug_job.aug_id), [])
+            if tile_jobs:
+                _submit_tile_video_batch(view, aug_job, tile_jobs)
 
     def _push_ready_fullframe(view: ViewInfo, job: AugJob) -> None:
         ready_fullframe.append((view, job))
@@ -6727,7 +6885,11 @@ def main() -> None:
         support_by_view = native_view_support_by_model.get(result.model_name, {})
         if result.view_name not in support_by_view:
             waiting = postprocessed_tiles_waiting_by_parent.setdefault(parent_key, {})
-            waiting[str(result.tile_id)] = result
+            waiting[str(result.tile_id)] = spill_waiting_tile_result_to_mmap(
+                result,
+                temp_dir,
+                workers=int(tile_slice_postprocess_workers),
+            )
             return
 
         waiting = postprocessed_tiles_waiting_by_parent.get(parent_key)
@@ -6768,7 +6930,7 @@ def main() -> None:
             model_name, view_name = parent_key
             if view_name not in native_view_support_by_model.get(model_name, {}):
                 continue
-            ready_results.extend(list(waiting.values()))
+            ready_results.extend(load_waiting_tile_result_from_mmap(wait_result) for wait_result in waiting.values())
             del postprocessed_tiles_waiting_by_parent[parent_key]
 
         for result in ready_results:
@@ -6982,7 +7144,9 @@ def main() -> None:
             wait(waitables, return_when=FIRST_COMPLETED)
 
     finally:
-        render_executor.shutdown(wait=True)
+        fullframe_render_executor.shutdown(wait=True)
+        if tile_render_executor is not None:
+            tile_render_executor.shutdown(wait=True)
         parent_postprocess_executor.shutdown(wait=True)
         tile_postprocess_executor.shutdown(wait=True)
 
