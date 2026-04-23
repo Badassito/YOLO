@@ -2,8 +2,8 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v8.2.0_SLURM-aligned script:
-  - builds Transverse, optional Tilted Transverse, optional Sagittal/Coronal, and optional Radial view families
+This v8.3.0_SLURM single-channel-aligned script:
+  - builds Transverse, optional Tilted Transverse, optional Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - renders parent/full-frame videos directly from the native view transform so inference no longer waits on
     a separately rendered canvas video, and derives non-radial tile videos from shared canvas batches so the
     same rotated frames are not re-decoded once per tile
@@ -19,7 +19,7 @@ This v8.2.0_SLURM-aligned script:
     the same Lanczos-5 slices for every tile location
   - inverse-maps predictions into native view coordinates, applies confidence filtering, hole filling,
     interpolation, a single final 3D void fill after the global union, and final model ensembling
-  - saves the transverse default overlay plus optional labels, binary masks, NRRD, multiplanar, radial,
+  - saves the transverse default color overlay plus optional labels, single-channel binary masks, NRRD, multiplanar, radial,
     tilted-transverse, image-sequence, low-quality, and TTA outputs, with FFV1 used for spec-required MKVs
 
 Dependencies (Python):
@@ -813,7 +813,7 @@ def ffprobe_info(video_path: Path) -> Dict[str, object]:
     return {"width": width, "height": height, "fps": fps, "num_frames": num_frames}
 
 
-def decode_video_to_memmap_rgb24(
+def decode_video_to_memmap_gray8(
     input_video: Path,
     out_dat: Path,
     num_frames: int,
@@ -824,20 +824,21 @@ def decode_video_to_memmap_rgb24(
     prefer_memory: bool = True,
     reserve_bytes: int = 32 * GIB,
 ) -> np.ndarray:
-    """Decode input video to a (T,H,W,3) uint8 workspace in RGB24.
+    """Decode input video to a (T,H,W) uint8 gray/luma workspace.
 
-    The default policy keeps the decoded source volume in RAM when the workspace budget allows it.
-    A disk-backed memmap is used only when the working set would be too large.
+    ffmpeg's ``gray`` pixel format accepts RGB, YUV, and already single-channel inputs and
+    normalizes them to one luma channel. This keeps the source volume and all view-rendering
+    intermediates single-channel; color expansion is deferred to optional presentation outputs.
     """
     _require_bin("ffmpeg")
 
-    shape = (num_frames, height, width, 3)
+    shape = (int(num_frames), int(height), int(width))
     reuse_existing = bool(not overwrite and out_dat.exists() and not prefer_memory)
     arr = allocate_workspace_array(
         shape=shape,
         dtype=np.uint8,
         path=out_dat,
-        desc='Decoded RGB24 input volume',
+        desc='Decoded gray8 input volume',
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
         reuse_existing=bool(reuse_existing),
@@ -850,15 +851,15 @@ def decode_video_to_memmap_rgb24(
         arr = np.asarray(raw_bytes.obj).reshape(shape)
         raw_bytes = memoryview(arr).cast('B')
 
-    frame_bytes = int(width) * int(height) * 3
-    chunk_frames = max(1, min(64, max(1, (256 * 1024 * 1024) // max(1, frame_bytes))))
+    frame_bytes = int(width) * int(height)
+    chunk_frames = max(1, min(128, max(1, (256 * 1024 * 1024) // max(1, frame_bytes))))
 
     cmd = [
         "ffmpeg",
         "-v", "error",
         "-i", str(input_video),
         "-f", "rawvideo",
-        "-pix_fmt", "rgb24",
+        "-pix_fmt", "gray",
         "-vsync", "0",
         "-",
     ]
@@ -866,7 +867,7 @@ def decode_video_to_memmap_rgb24(
     assert proc.stdout is not None
 
     try:
-        with tqdm(total=num_frames, desc='Decoding input volume (rgb24)') as pbar:
+        with tqdm(total=num_frames, desc='Decoding input volume (gray8)') as pbar:
             for start in range(0, num_frames, chunk_frames):
                 nframes = min(chunk_frames, num_frames - start)
                 need = int(nframes) * int(frame_bytes)
@@ -895,9 +896,9 @@ def ffmpeg_rawvideo_writer(
     width: int,
     height: int,
     fps: float,
-    pix_fmt_in: str = "rgb24",
+    pix_fmt_in: str = "gray",
     codec: str = "ffv1",
-    pix_fmt_out: Optional[str] = "yuv444p",
+    pix_fmt_out: Optional[str] = "gray",
     codec_args: Optional[Sequence[str]] = None,
 ) -> subprocess.Popen:
     """Return a Popen with stdin open for writing raw frames."""
@@ -952,13 +953,31 @@ def ffmpeg_lossless_rgb_writer(
 
 
 
+def ffmpeg_ffv1_gray_writer(
+    out_path: Path,
+    width: int,
+    height: int,
+    fps: float,
+) -> subprocess.Popen:
+    """FFV1 MKV writer for single-channel temporary, prediction, and binary videos."""
+    return ffmpeg_rawvideo_writer(
+        out_path=out_path,
+        width=int(width),
+        height=int(height),
+        fps=float(fps),
+        pix_fmt_in='gray',
+        codec='ffv1',
+        pix_fmt_out='gray',
+    )
+
+
 def ffmpeg_ffv1_rgb_writer(
     out_path: Path,
     width: int,
     height: int,
     fps: float,
 ) -> subprocess.Popen:
-    """FFV1 MKV writer used for spec-compliant temporary and final videos."""
+    """FFV1 MKV writer for color presentation overlays."""
     return ffmpeg_rawvideo_writer(
         out_path=out_path,
         width=int(width),
@@ -1371,7 +1390,7 @@ def choose_radial_exact_block_frames(diameter: int, target_bytes: int = 256 * 10
         except Exception:
             pass
 
-    bytes_per_frame = max(1, int(diameter) * 10 * 3 * np.dtype(np.float32).itemsize)
+    bytes_per_frame = max(1, int(diameter) * 10 * np.dtype(np.float32).itemsize)
     block = max(1, int(target_bytes // bytes_per_frame))
     return max(1, min(256, block))
 
@@ -1379,21 +1398,21 @@ def choose_radial_exact_block_frames(diameter: int, target_bytes: int = 256 * 10
 
 def extract_radial_slice_frame(volume_rgb: np.ndarray, sampler: RadialSampler) -> np.ndarray:
     t_dim = int(volume_rgb.shape[0])
-    out = np.empty((t_dim, sampler.diameter, 3), dtype=np.uint8)
+    out = np.empty((t_dim, sampler.diameter), dtype=np.uint8)
 
-    x_w = np.asarray(sampler.x_w, dtype=np.float32)[None, :, :, None]
+    x_w = np.asarray(sampler.x_w, dtype=np.float32)[None, :, :]
     y_w = np.asarray(sampler.y_w, dtype=np.float32)
     block_frames = choose_radial_exact_block_frames(sampler.diameter)
 
     for start in range(0, t_dim, block_frames):
         stop = min(t_dim, start + block_frames)
         block = np.asarray(volume_rgb[start:stop])
-        acc = np.zeros((stop - start, sampler.diameter, 3), dtype=np.float32)
+        acc = np.zeros((stop - start, sampler.diameter), dtype=np.float32)
         for yi in range(sampler.y_idx.shape[1]):
-            samples = block[:, sampler.y_idx[:, yi][:, None], sampler.x_idx, :].astype(np.float32, copy=False)
+            samples = block[:, sampler.y_idx[:, yi][:, None], sampler.x_idx].astype(np.float32, copy=False)
             row = np.sum(samples * x_w, axis=2)
-            acc += row * y_w[:, yi][None, :, None]
-        out[start:stop, :, :] = np.clip(np.rint(acc), 0.0, 255.0).astype(np.uint8)
+            acc += row * y_w[:, yi][None, :]
+        out[start:stop, :] = np.clip(np.rint(acc), 0.0, 255.0).astype(np.uint8)
 
     return out
 
@@ -1734,7 +1753,7 @@ def ffmpeg_rawvideo_reader(
     input_path: Path,
     width: int,
     height: int,
-    pix_fmt: str = 'rgb24',
+    pix_fmt: str = 'gray',
 ) -> subprocess.Popen:
     _require_bin('ffmpeg')
     cmd = [
@@ -1751,14 +1770,14 @@ def ffmpeg_rawvideo_reader(
     return proc
 
 
-def iter_ffmpeg_rgb24_frames(
+def iter_ffmpeg_gray8_frames(
     input_path: Path,
     width: int,
     height: int,
     num_frames: int,
 ) -> Iterator[np.ndarray]:
-    proc = ffmpeg_rawvideo_reader(input_path, int(width), int(height), pix_fmt='rgb24')
-    frame_bytes = int(width) * int(height) * 3
+    proc = ffmpeg_rawvideo_reader(input_path, int(width), int(height), pix_fmt='gray')
+    frame_bytes = int(width) * int(height)
     assert proc.stdout is not None
     try:
         for idx in range(int(num_frames)):
@@ -1770,7 +1789,7 @@ def iter_ffmpeg_rgb24_frames(
                 if nread is None or nread <= 0:
                     raise RuntimeError(f'Unexpected EOF while decoding {input_path} at frame {idx}/{num_frames}')
                 filled += int(nread)
-            yield np.frombuffer(buf, dtype=np.uint8).reshape((int(height), int(width), 3)).copy()
+            yield np.frombuffer(buf, dtype=np.uint8).reshape((int(height), int(width))).copy()
     finally:
         if proc.stdout is not None:
             proc.stdout.close()
@@ -1781,7 +1800,7 @@ def iter_ffmpeg_rgb24_frames(
 
 
 def _extract_padded_tile_frame(frame: np.ndarray, x0: int, y0: int, tile_size: int) -> np.ndarray:
-    tile = np.zeros((int(tile_size), int(tile_size), frame.shape[2]), dtype=frame.dtype)
+    tile = np.zeros((int(tile_size), int(tile_size)), dtype=frame.dtype)
     src_x0 = max(0, int(x0))
     src_y0 = max(0, int(y0))
     src_x1 = min(int(frame.shape[1]), int(x0) + int(tile_size))
@@ -1792,7 +1811,7 @@ def _extract_padded_tile_frame(frame: np.ndarray, x0: int, y0: int, tile_size: i
     dst_y0 = src_y0 - int(y0)
     dst_x1 = dst_x0 + (src_x1 - src_x0)
     dst_y1 = dst_y0 + (src_y1 - src_y0)
-    tile[dst_y0:dst_y1, dst_x0:dst_x1, :] = frame[src_y0:src_y1, src_x0:src_x1, :]
+    tile[dst_y0:dst_y1, dst_x0:dst_x1] = frame[src_y0:src_y1, src_x0:src_x1]
     return tile
 
 
@@ -1804,7 +1823,7 @@ def _resize_frame_centered(frame: np.ndarray, out_w: int, out_h: int, interpolat
         dsize=(int(out_w), int(out_h)),
         flags=int(interpolation),
         borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(0, 0, 0),
+        borderValue=0,
     )
 
 
@@ -1870,7 +1889,7 @@ def render_tilted_frame_on_grid(
     plan = get_tilted_render_plan(view, M_grid_to_src, int(grid_h), int(grid_w))
     tan_alpha = float(math.tan(math.radians(float(view.tilt_angle_deg))))
     t_dim = int(volume_rgb.shape[0])
-    out = np.zeros((int(grid_h), int(grid_w), 3), dtype=np.uint8)
+    out = np.zeros((int(grid_h), int(grid_w)), dtype=np.uint8)
 
     for y0 in range(0, int(grid_h), int(block_rows)):
         y1 = min(int(grid_h), y0 + int(block_rows))
@@ -1892,7 +1911,7 @@ def render_tilted_frame_on_grid(
         xs = np.asarray(plan.x_idx[y0:y1], dtype=np.int32)
         f0 = np.asarray(volume_rgb[t0, ys, xs], dtype=np.float32)
         f1 = np.asarray(volume_rgb[t1, ys, xs], dtype=np.float32)
-        blend = np.clip(np.rint(((1.0 - alpha)[..., None] * f0) + (alpha[..., None] * f1)), 0.0, 255.0).astype(np.uint8)
+        blend = np.clip(np.rint(((1.0 - alpha) * f0) + (alpha * f1)), 0.0, 255.0).astype(np.uint8)
         out_block = out[y0:y1]
         out_block[valid] = blend[valid]
 
@@ -2030,7 +2049,7 @@ def render_canvas_frame_for_job(
         dsize=(int(job.aff.canvas_w), int(job.aff.canvas_h)),
         flags=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(0, 0, 0),
+        borderValue=0,
     )
 
 
@@ -2044,14 +2063,11 @@ def render_canvas_video_for_job(
     workers: int = 1,
     show_progress: bool = True,
 ) -> None:
-    proc = ffmpeg_rawvideo_writer(
+    proc = ffmpeg_ffv1_gray_writer(
         job.canvas_video_path,
         width=int(job.aff.canvas_w),
         height=int(job.aff.canvas_h),
         fps=float(fps),
-        pix_fmt_in='rgb24',
-        codec='ffv1',
-        pix_fmt_out='yuv444p',
     )
     try:
         assert proc.stdin is not None
@@ -2087,14 +2103,11 @@ def render_tilted_fullframe_video_for_job(
     workers: int = 1,
     show_progress: bool = True,
 ) -> None:
-    proc = ffmpeg_rawvideo_writer(
+    proc = ffmpeg_ffv1_gray_writer(
         job.video_path,
         width=int(job.aff.out_size),
         height=int(job.aff.out_size),
         fps=float(fps),
-        pix_fmt_in='rgb24',
-        codec='ffv1',
-        pix_fmt_out='yuv444p',
     )
     try:
         assert proc.stdin is not None
@@ -2133,19 +2146,16 @@ def derive_fullframe_video_from_canvas(
     *,
     show_progress: bool = True,
 ) -> None:
-    proc = ffmpeg_rawvideo_writer(
+    proc = ffmpeg_ffv1_gray_writer(
         out_path,
         width=int(out_size),
         height=int(out_size),
         fps=float(fps),
-        pix_fmt_in='rgb24',
-        codec='ffv1',
-        pix_fmt_out='yuv444p',
     )
     try:
         assert proc.stdin is not None
         for frame in tqdm(
-            iter_ffmpeg_rgb24_frames(canvas_video_path, int(canvas_w), int(canvas_h), int(num_frames)),
+            iter_ffmpeg_gray8_frames(canvas_video_path, int(canvas_w), int(canvas_h), int(num_frames)),
             total=int(num_frames),
             desc=f'Deriving full-frame {out_path.name}',
             disable=not bool(show_progress),
@@ -2166,7 +2176,7 @@ def derive_dense_tile_video_from_canvas(
     *,
     show_progress: bool = True,
 ) -> None:
-    proc = ffmpeg_ffv1_rgb_writer(
+    proc = ffmpeg_ffv1_gray_writer(
         job.video_path,
         width=int(job.out_size),
         height=int(job.out_size),
@@ -2175,7 +2185,7 @@ def derive_dense_tile_video_from_canvas(
     try:
         assert proc.stdin is not None
         for frame in tqdm(
-            iter_ffmpeg_rgb24_frames(canvas_video_path, int(canvas_w), int(canvas_h), int(num_frames)),
+            iter_ffmpeg_gray8_frames(canvas_video_path, int(canvas_w), int(canvas_h), int(num_frames)),
             total=int(num_frames),
             desc=f'Deriving dense tile {job.view} {job.tile_id}',
             disable=not bool(show_progress),
@@ -2212,7 +2222,7 @@ def render_fullframe_frame_for_job(
         dsize=(int(job.aff.out_size), int(job.aff.out_size)),
         flags=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(0, 0, 0),
+        borderValue=0,
     )
 
 
@@ -2237,7 +2247,7 @@ def render_fullframe_video_for_job(
         )
         return
 
-    proc = ffmpeg_ffv1_rgb_writer(
+    proc = ffmpeg_ffv1_gray_writer(
         job.video_path,
         width=int(job.aff.out_size),
         height=int(job.aff.out_size),
@@ -2440,7 +2450,7 @@ def derive_dense_tile_videos_from_canvas_batch(
                 '-level', '3',
                 '-slices', '30',
                 '-threads', str(encoder_threads),
-                '-pix_fmt', 'yuv444p',
+                '-pix_fmt', 'gray',
                 str(job.video_path),
             ])
 
@@ -2507,7 +2517,7 @@ def ensure_dense_tile_video_batch_from_canvas(
 
 
 def should_cache_view_frames(view: ViewInfo, dense_tiling_active: bool) -> bool:
-    """Return True when precomputing native RGB frames is worthwhile for this view.
+    """Return True when precomputing native single-channel frames is worthwhile for this view.
 
     Radial view extraction is the dominant CPU cost during dense tiled rendering because every
     tile video currently traverses the same expensive Lanczos-5 radial slices independently.
@@ -2529,13 +2539,13 @@ def build_view_frame_cache(
     reserve_bytes: int = 64 * GIB,
     workers: int = 1,
 ) -> np.ndarray:
-    """Materialize native RGB frames for a view into a reusable cache volume.
+    """Materialize native single-channel frames for a view into a reusable cache volume.
 
     This is used primarily for the radial view when dense tiling is enabled so later tile video
     generation no longer recomputes the same radial slices for every tile location.
     """
     cache_mm = allocate_workspace_array(
-        shape=(int(view.num_slices), int(view.src_h), int(view.src_w), 3),
+        shape=(int(view.num_slices), int(view.src_h), int(view.src_w)),
         dtype=np.uint8,
         path=out_path,
         desc=desc,
@@ -2545,12 +2555,12 @@ def build_view_frame_cache(
 
     worker_count = choose_slice_parallel_workers(int(workers), int(view.num_slices))
     print(
-        f"Preparing reusable native frame cache for view '{view.name}' over {int(view.num_slices)} slice(s) "
+        f"Preparing reusable native single-channel frame cache for view '{view.name}' over {int(view.num_slices)} slice(s) "
         f"with {int(worker_count)} worker thread(s)"
     )
 
     def _build(idx: int) -> None:
-        cache_mm[int(idx), :, :, :] = np.ascontiguousarray(
+        cache_mm[int(idx), :, :] = np.ascontiguousarray(
             get_view_frame_by_index(volume_rgb, view, int(idx), view_frames=None)
         )
 
@@ -2570,28 +2580,27 @@ def iter_view_frames(
     view: ViewInfo,
     view_frames: Optional[np.ndarray] = None,
 ) -> Iterator[np.ndarray]:
-    """Yield frames for a view, in slice order (0..num_slices-1)."""
+    """Yield single-channel frames for a view, in slice order (0..num_slices-1)."""
     if view_frames is not None:
         for idx in range(int(view.num_slices)):
             yield np.asarray(view_frames[int(idx)])
         return
 
-    T, H, W, C = volume_rgb.shape
-    assert C == 3
+    T, H, W = volume_rgb.shape
 
     if view.name == 'transverse':
         for t in range(T):
-            yield np.asarray(volume_rgb[t])  # (H,W,3)
+            yield np.asarray(volume_rgb[t])  # (H,W)
     elif view.name == 'sagittal':
         for y in range(H):
-            yield np.ascontiguousarray(volume_rgb[:, y, :, :])  # (T,W,3)
+            yield np.ascontiguousarray(volume_rgb[:, y, :])  # (T,W)
     elif view.name == 'coronal':
         for x in range(W):
-            yield np.ascontiguousarray(volume_rgb[:, :, x, :])  # (T,H,3)
+            yield np.ascontiguousarray(volume_rgb[:, :, x])  # (T,H)
     elif view.name == 'radial':
         for angle_deg in view.azimuths_deg:
             sampler = get_radial_sampler(view, float(angle_deg))
-            yield np.ascontiguousarray(extract_radial_slice_frame(volume_rgb, sampler))  # (T,D,3)
+            yield np.ascontiguousarray(extract_radial_slice_frame(volume_rgb, sampler))  # (T,D)
     elif view.family == 'tilted_transverse':
         for t in range(T):
             yield render_tilted_native_frame(volume_rgb, view, int(t))
@@ -2608,22 +2617,21 @@ def get_view_frame_by_index(
     if view_frames is not None:
         return np.asarray(view_frames[int(index)])
 
-    T, H, W, C = volume_rgb.shape
-    assert C == 3
+    T, H, W = volume_rgb.shape
 
     if view.name == 'transverse':
         return np.asarray(volume_rgb[int(index)])
     if view.name == 'sagittal':
-        return np.ascontiguousarray(volume_rgb[:, int(index), :, :])
+        return np.ascontiguousarray(volume_rgb[:, int(index), :])
     if view.name == 'coronal':
-        return np.ascontiguousarray(volume_rgb[:, :, int(index), :])
+        return np.ascontiguousarray(volume_rgb[:, :, int(index)])
     if view.name == 'radial':
         angle_deg = float(view.azimuths_deg[int(index)])
         if radial_fast_path_enabled():
             map_x, map_y = build_radial_block_maps(view, [angle_deg])
             map_x = np.ascontiguousarray(map_x.astype(np.float32, copy=False))
             map_y = np.ascontiguousarray(map_y.astype(np.float32, copy=False))
-            out = np.empty((int(view.src_h), int(view.src_w), 3), dtype=np.uint8)
+            out = np.empty((int(view.src_h), int(view.src_w)), dtype=np.uint8)
             for t in range(T):
                 sampled = cv2.remap(
                     np.asarray(volume_rgb[t]),
@@ -2631,11 +2639,9 @@ def get_view_frame_by_index(
                     map_y,
                     interpolation=cv2.INTER_LANCZOS4,
                     borderMode=cv2.BORDER_CONSTANT,
-                    borderValue=(0, 0, 0),
+                    borderValue=0,
                 )
-                if sampled.ndim == 2:
-                    sampled = sampled[:, :, None]
-                out[t, :, :] = np.asarray(sampled[0])
+                out[t, :] = np.asarray(sampled[0])
             return out
 
         sampler = get_radial_sampler(view, angle_deg)
@@ -2648,22 +2654,8 @@ def get_view_frame_by_index(
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # --------------------------
+# Native mask accumulation# --------------------------
 # Native mask accumulation
 # --------------------------
 
@@ -5514,15 +5506,30 @@ def finalize_tile_volume_after_parent_ready(
 # --------------------------
 
 
+def _gray_to_rgb_frame(frame_gray: np.ndarray) -> np.ndarray:
+    arr = np.asarray(frame_gray, dtype=np.uint8)
+    if arr.ndim == 3 and arr.shape[-1] == 3:
+        return np.ascontiguousarray(arr)
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        arr = arr[:, :, 0]
+    if arr.ndim != 2:
+        raise ValueError(f'Expected a 2D gray frame, got shape {arr.shape}')
+    return np.repeat(arr[:, :, None], 3, axis=2)
+
+
 def write_overlay_video(
-    volume_rgb: np.memmap,  # (T,H,W,3) RGB
+    volume_rgb: np.memmap,  # (T,H,W) gray/luma
     mask_u8: np.ndarray,    # (T,H,W) 0/1
     out_path: Path,
     fps: float,
     show_progress: bool = True,
 ) -> None:
-    """Overlay blue masks (50% alpha) on original transverse frames."""
-    T, H, W, _ = volume_rgb.shape
+    """Overlay blue masks (50% alpha) on original transverse frames.
+
+    The working source volume is single-channel; frames are expanded to RGB only for this
+    presentation video so the segmentation can remain blue.
+    """
+    T, H, W = volume_rgb.shape
     assert mask_u8.shape == (T, H, W)
 
     proc = ffmpeg_ffv1_rgb_writer(
@@ -5537,11 +5544,11 @@ def write_overlay_video(
     try:
         assert proc.stdin is not None
         for t in tqdm(range(T), desc=f"Writing overlay video ({out_path.name})", disable=not show_progress):
-            frame = np.asarray(volume_rgb[t]).copy()
+            frame = _gray_to_rgb_frame(np.asarray(volume_rgb[t]))
             m = mask_u8[t].astype(bool)
             if m.any():
                 frame[m] = ((frame[m].astype(np.uint16) + blue.astype(np.uint16)) // 2).astype(np.uint8)
-            proc.stdin.write(frame.tobytes())
+            proc.stdin.write(np.ascontiguousarray(frame).tobytes())
     finally:
         close_ffmpeg_writer(proc)
 
@@ -5689,7 +5696,7 @@ def write_binary_video_from_mask_volume(
     show_progress: bool = True,
 ) -> Path:
     T, H, W = mask_u8.shape
-    proc = ffmpeg_ffv1_rgb_writer(
+    proc = ffmpeg_ffv1_gray_writer(
         video_path,
         width=W,
         height=H,
@@ -5699,8 +5706,7 @@ def write_binary_video_from_mask_volume(
         assert proc.stdin is not None
         for t in tqdm(range(T), desc=f"Writing binary MKV ({video_path.name})", disable=not show_progress):
             gray = (np.asarray(mask_u8[t]) * 255).astype(np.uint8)
-            rgb = np.repeat(gray[:, :, None], 3, axis=2)
-            proc.stdin.write(np.ascontiguousarray(rgb).tobytes())
+            proc.stdin.write(np.ascontiguousarray(gray).tobytes())
     finally:
         close_ffmpeg_writer(proc)
     return video_path
@@ -5774,11 +5780,11 @@ def write_overlay_video_for_view(
             desc=f'Writing {view.name} overlay video ({out_path.name})',
             disable=not show_progress,
         ):
-            frame = np.asarray(frame_rgb).copy()
+            frame = _gray_to_rgb_frame(np.asarray(frame_rgb))
             m = np.asarray(frame_mask, dtype=bool)
             if np.any(m):
                 frame[m] = ((frame[m].astype(np.uint16) + blue.astype(np.uint16)) // 2).astype(np.uint8)
-            proc.stdin.write(frame.tobytes())
+            proc.stdin.write(np.ascontiguousarray(frame).tobytes())
     finally:
         close_ffmpeg_writer(proc)
 
@@ -5838,7 +5844,7 @@ def write_view_binary_video_from_mask_volume(
     fps: float,
     show_progress: bool = True,
 ) -> Path:
-    proc = ffmpeg_ffv1_rgb_writer(
+    proc = ffmpeg_ffv1_gray_writer(
         video_path,
         width=view.src_w,
         height=view.src_h,
@@ -5848,8 +5854,7 @@ def write_view_binary_video_from_mask_volume(
         assert proc.stdin is not None
         for idx in tqdm(range(view.num_slices), total=view.num_slices, desc=f'Writing binary MKV ({video_path.name})', disable=not show_progress):
             gray = (np.asarray(get_view_mask_frame_by_index(mask_u8, view, int(idx))) * 255).astype(np.uint8)
-            rgb = np.repeat(gray[:, :, None], 3, axis=2)
-            proc.stdin.write(np.ascontiguousarray(rgb).tobytes())
+            proc.stdin.write(np.ascontiguousarray(gray).tobytes())
     finally:
         close_ffmpeg_writer(proc)
     return video_path
@@ -6164,8 +6169,7 @@ def write_view_images(
     def _write_frame(idx: int) -> None:
         frame = np.ascontiguousarray(get_view_frame_by_index(volume_rgb, view, int(idx)))
         out_path = view_dir / f'{stem}_{view.name}_{int(idx) + 1:04d}.png'
-        bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        if not cv2.imwrite(str(out_path), bgr):
+        if not cv2.imwrite(str(out_path), frame):
             raise RuntimeError(f'Failed to write image: {out_path}')
 
     parallel_for_indices(
@@ -6480,8 +6484,8 @@ def main() -> None:
     T = int(info['num_frames'])
     fps = float(info['fps'])
 
-    vol_path = temp_dir / 'input_volume.rgb24.dat'
-    volume_rgb = decode_video_to_memmap_rgb24(
+    vol_path = temp_dir / 'input_volume.gray8.dat'
+    volume_rgb = decode_video_to_memmap_gray8(
         input_video=input_path,
         out_dat=vol_path,
         num_frames=T,
@@ -6491,7 +6495,7 @@ def main() -> None:
         prefer_memory=True,
     )
     (temp_dir / 'input_volume.meta.json').write_text(
-        json.dumps({'shape': [T, H, W, 3], 'dtype': 'uint8', 'fps': fps}, indent=2)
+        json.dumps({'shape': [T, H, W], 'dtype': 'uint8', 'channels': 1, 'fps': fps}, indent=2)
     )
 
     views = get_view_infos(
@@ -6639,7 +6643,7 @@ def main() -> None:
     view_frame_cache_paths: Dict[str, Path] = {}
     for view in views:
         if should_cache_view_frames(view, dense_tiling_active):
-            cache_path = temp_dir / 'view_frames' / f'{view.name}.rgb24.dat'
+            cache_path = temp_dir / 'view_frames' / f'{view.name}.gray8.dat'
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             view_frame_caches[view.name] = build_view_frame_cache(
                 volume_rgb=volume_rgb,
