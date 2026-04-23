@@ -17,8 +17,8 @@ This v8.4.0_SLURM single-channel-aligned script:
   - overlaps GPU inference with CPU-side view interpolation, consolidated-tile interpolation, and output writing
   - reuses a native radial frame cache during dense tiled rendering so radial tiles do not recompute
     the same Lanczos-5 slices for every tile location
-  - inverse-maps predictions into native view coordinates, applies confidence filtering, hole filling,
-    interpolation, and final model ensembling
+  - inverse-maps predictions into native view coordinates, including Tilted Transverse slice-axis
+    shear back-projection, then applies confidence filtering, hole filling, interpolation, and final model ensembling
   - applies exactly one final 3D void fill after the final global union of all active views, tiles, and models
   - saves the transverse default color overlay plus optional labels, single-channel binary masks, NRRD, multiplanar, radial,
     tilted-transverse, image-sequence, low-quality, and TTA outputs, with FFV1 used for spec-required MKVs
@@ -2879,6 +2879,66 @@ def _extract_result_masks_and_confs(r) -> Tuple[Optional[np.ndarray], Optional[n
 
 
 
+def _scatter_tilted_native_xy_to_volume(
+    frame_idx: int,
+    native_union: np.ndarray,
+    native_conf: Optional[np.ndarray],
+    tilted_view: ViewInfo,
+    view_union_mm: np.ndarray,
+    view_confmap_mm: np.ndarray,
+) -> None:
+    """Back-project one Tilted Transverse prediction frame into the native (t, Y, X) volume.
+
+    Tilted transverse rendering samples the native XY grid while shifting only the slice
+    coordinate: ``t = frame_idx + tan(alpha) * axis_offset``. The inverse therefore must
+    not place every predicted pixel back into ``frame_idx``. Doing so creates duplicated
+    structures displaced along the transverse slice axis.
+    """
+    if tilted_view.family != 'tilted_transverse':
+        raise ValueError('Tilted inverse projection requested for a non-tilted view')
+
+    mask_bool = np.asarray(native_union, dtype=bool)
+    if not np.any(mask_bool):
+        return
+
+    ys, xs = np.nonzero(mask_bool)
+    if ys.size <= 0:
+        return
+
+    tan_alpha = float(math.tan(math.radians(float(tilted_view.tilt_angle_deg))))
+    if str(tilted_view.tilt_direction) == 'vertical':
+        cy = float((int(tilted_view.full_h) - 1) / 2.0)
+        t_float = float(frame_idx) + tan_alpha * (ys.astype(np.float32, copy=False) - cy)
+    elif str(tilted_view.tilt_direction) == 'horizontal':
+        cx = float((int(tilted_view.full_w) - 1) / 2.0)
+        t_float = float(frame_idx) + tan_alpha * (xs.astype(np.float32, copy=False) - cx)
+    else:  # pragma: no cover
+        raise ValueError(f'Unsupported tilt direction: {tilted_view.tilt_direction}')
+
+    t_idx = np.rint(t_float).astype(np.int32, copy=False)
+    valid = (t_idx >= 0) & (t_idx < int(view_union_mm.shape[0]))
+    if not np.any(valid):
+        return
+
+    tt = t_idx[valid]
+    yy = ys[valid]
+    xx = xs[valid]
+    view_union_mm[tt, yy, xx] = np.uint8(1)
+
+    if native_conf is None:
+        return
+
+    native_conf_u8 = np.asarray(native_conf, dtype=np.uint8)
+    conf_vals = native_conf_u8[yy, xx]
+    has_conf = conf_vals > 0
+    if np.any(has_conf):
+        np.maximum.at(
+            view_confmap_mm,
+            (tt[has_conf], yy[has_conf], xx[has_conf]),
+            conf_vals[has_conf],
+        )
+
+
 def _process_prediction_frame(
     idx: int,
     masks_np: Optional[np.ndarray],
@@ -2889,6 +2949,7 @@ def _process_prediction_frame(
     M_out_to_native: np.ndarray,
     native_h: int,
     native_w: int,
+    tilted_view: Optional[ViewInfo] = None,
 ) -> Tuple[int, int]:
     """Collapse one streamed result directly into unpacked native-view union + confidence volumes."""
     if masks_np is None or confs_np is None or masks_np.ndim != 3 or int(masks_np.shape[0]) <= 0:
@@ -2923,9 +2984,8 @@ def _process_prediction_frame(
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=0,
     ) > 0
-    if np.any(native_union):
-        view_union_mm[idx, :, :] |= native_union.astype(np.uint8, copy=False)
 
+    native_conf: Optional[np.ndarray] = None
     if np.any(frame_confmap):
         native_conf = cv2.warpAffine(
             frame_confmap,
@@ -2934,14 +2994,26 @@ def _process_prediction_frame(
             flags=cv2.INTER_NEAREST,
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=0,
+        ).astype(np.uint8, copy=False)
+
+    if tilted_view is not None:
+        _scatter_tilted_native_xy_to_volume(
+            frame_idx=int(idx),
+            native_union=native_union,
+            native_conf=native_conf,
+            tilted_view=tilted_view,
+            view_union_mm=view_union_mm,
+            view_confmap_mm=view_confmap_mm,
         )
-        if np.any(native_conf):
+    else:
+        if np.any(native_union):
+            view_union_mm[idx, :, :] |= native_union.astype(np.uint8, copy=False)
+
+        if native_conf is not None and np.any(native_conf):
             conf_slice = view_confmap_mm[idx]
-            native_conf_u8 = native_conf.astype(np.uint8, copy=False)
-            np.maximum(conf_slice, native_conf_u8, out=conf_slice)
+            np.maximum(conf_slice, native_conf, out=conf_slice)
 
     return int(num_inst), 1
-
 
 def predict_video_and_accumulate(
     model,
@@ -2957,6 +3029,7 @@ def predict_video_and_accumulate(
     native_h: int,
     native_w: int,
     postprocess_workers: int = 1,
+    tilted_view: Optional[ViewInfo] = None,
 ) -> Dict[str, int]:
     """
     Run YOLO predict(stream=True) on a pre-generated augmented video and accumulate the inverse-
@@ -2986,7 +3059,13 @@ def predict_video_and_accumulate(
         verbose=False,
     )
 
-    worker_count = max(1, min(int(postprocess_workers), int(num_frames)))
+    # Tilted transverse inverse projection scatters one prediction frame across native
+    # t-slices. Process those frames serially to avoid non-atomic writes from multiple
+    # postprocess workers into the same native volume voxels/confidence map.
+    if tilted_view is not None:
+        worker_count = 1
+    else:
+        worker_count = max(1, min(int(postprocess_workers), int(num_frames)))
     pending_limit = max(worker_count, worker_count * 2)
 
     if worker_count <= 1:
@@ -3004,6 +3083,7 @@ def predict_video_and_accumulate(
                 M_out_to_native=M_out_to_native,
                 native_h=native_h,
                 native_w=native_w,
+                tilted_view=tilted_view,
             )
             prediction_count += int(pred_inc)
             frames_with_predictions += int(frame_inc)
@@ -3026,6 +3106,7 @@ def predict_video_and_accumulate(
                     M_out_to_native,
                     native_h,
                     native_w,
+                    tilted_view,
                 ))
                 if len(pending) >= pending_limit:
                     fut = pending.pop(0)
@@ -7703,6 +7784,7 @@ def main() -> None:
                         native_h=view.src_h,
                         native_w=view.src_w,
                         postprocess_workers=predict_postprocess_workers,
+                        tilted_view=view if view.family == 'tilted_transverse' else None,
                     )
                     if offload_between_jobs_enabled():
                         offload_yolo_from_gpu(yolo)
@@ -7757,6 +7839,7 @@ def main() -> None:
                     native_h=view.src_h,
                     native_w=view.src_w,
                     postprocess_workers=predict_postprocess_workers,
+                    tilted_view=view if view.family == 'tilted_transverse' else None,
                 )
                 if offload_between_jobs_enabled():
                     offload_yolo_from_gpu(yolo)
