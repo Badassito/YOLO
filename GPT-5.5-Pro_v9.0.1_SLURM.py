@@ -21,6 +21,9 @@ This v9.0.0_SLURM single-channel-aligned script:
     shear back-projection, then applies confidence filtering, hole filling, interpolation, and final single-model view union
   - treats --model as a single YOLO segmentation model path; multiple-model inference is not supported in v9.0.0
   - applies final 3D void fill only when --enable_3d_void_fill is active, and only once after the global union
+  - applies --object_interpolation_smoothing as independent per-view frozen-state smoothing jobs
+    (Transverse, and Sagittal/Coronal when multiplanar inference is enabled) before unioning their
+    smoothed deltas back into the final native volume
   - saves the transverse default color overlay plus optional labels, single-channel binary masks, NRRD, multiplanar, radial,
     tilted-transverse, image-sequence, low-quality, and TTA outputs, with FFV1 used for spec-required MKVs
 
@@ -221,7 +224,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--enable_3d_void_fill", action="store_true",
                    help="Apply one final 3D enclosed-void fill after the global union. Disabled by default")
     p.add_argument("--object_interpolation_smoothing", action="store_true",
-                   help="Apply frozen-state object mask interpolation smoothing after the final union")
+                   help="Apply frozen-state object mask interpolation smoothing independently per eligible view, then union the smoothed deltas")
 
     p.add_argument("--troubleshooting", action="store_true",
                    help="Keep temporary files and save outputs before each interpolation pass")
@@ -5927,10 +5930,13 @@ def _smooth_one_axis_from_frozen_labels(
     axis_name: str,
     workers: int = 1,
 ) -> int:
-    """Apply frozen-state N/N+2 -> N+1 object smoothing along one axis.
+    """Create frozen-state N/N+2 -> N+1 object-smoothing deltas along one axis.
 
-    The source masks and object labels are frozen before the pass. Newly synthesized middle-slice
-    masks are only ORed into ``dst_axis_view`` and cannot become sources for later smoothing pairs.
+    ``dst_axis_view`` is expected to be an initially empty per-view delta volume in the same
+    orientation as ``frozen_axis_view``. The source masks and labels are frozen before the pass.
+    Newly synthesized middle-slice masks are written only when they are absent from the frozen
+    source, so Transverse/Sagittal/Coronal smoothing jobs can run independently and be unioned
+    after all view jobs finish.
     """
     axis_len = int(frozen_axis_view.shape[0])
     if axis_len < 3:
@@ -5977,12 +5983,16 @@ def _smooth_one_axis_from_frozen_labels(
         if not np.any(local):
             return
 
+        local_new = np.asarray(local, dtype=bool) & (np.asarray(frozen_axis_view[im]) == 0)
+        if not np.any(local_new):
+            return
+
         with locks[im]:
             dst = dst_axis_view[im]
-            before_new = local.astype(bool) & (np.asarray(dst) == 0)
+            before_new = local_new & (np.asarray(dst) == 0)
             if np.any(before_new):
                 added_by_plane[im] += np.int64(np.count_nonzero(before_new))
-            dst |= local
+            dst[local_new] = np.uint8(1)
 
     parallel_for_indices_chunked(
         axis_len - 2,
@@ -5995,85 +6005,296 @@ def _smooth_one_axis_from_frozen_labels(
     return int(np.sum(added_by_plane, dtype=np.int64))
 
 
-def apply_object_interpolation_smoothing_inplace(
-    mask_mm: np.ndarray,
-    temp_dir: Path,
+@dataclass
+class ObjectSmoothingViewResult:
+    view_name: str
+    display_name: str
+    added_voxels: int
+    num_objects: int
+    delta_mm: Optional[np.ndarray]
+    delta_path: Optional[Path]
+
+
+def _eligible_object_smoothing_views(views: Sequence[ViewInfo], enable_multiplanar: bool) -> List[ViewInfo]:
+    view_by_name = {str(v.name): v for v in views}
+    wanted = ['transverse']
+    if bool(enable_multiplanar):
+        wanted.extend(['sagittal', 'coronal'])
+    out: List[ViewInfo] = []
+    for name in wanted:
+        view = view_by_name.get(name)
+        if view is not None and view.family == 'orthogonal':
+            out.append(view)
+    return out
+
+
+def _smooth_one_view_volume_to_delta(
     *,
-    enable_multiplanar: bool,
-    keep_temp: bool = False,
-    workers: int = 1,
-) -> Dict[str, int]:
-    """Apply v9.0.0 object interpolation smoothing after the final union.
+    model_name: str,
+    view: ViewInfo,
+    source_mm: np.ndarray,
+    smoothing_dir: Path,
+    keep_temp: bool,
+    workers: int,
+) -> ObjectSmoothingViewResult:
+    """Smooth one frozen parent-view volume and return a view-oriented delta volume.
 
-    Transverse smoothing is always applied. Sagittal and Coronal smoothing are also applied when
-    ``--enable_multiplanar`` is active. Radial and tiled views are not used as smoothing axes.
+    The input is a parent full-frame support volume in that view's own orientation. This keeps
+    object interpolation smoothing independent per view and avoids using Radial, Tilted Transverse,
+    or tiled predictions as smoothing sources.
     """
-    stats: Dict[str, int] = {'transverse_added_voxels': 0, 'sagittal_added_voxels': 0, 'coronal_added_voxels': 0}
-    smoothing_dir = temp_dir / 'object_interpolation_smoothing'
-    smoothing_dir.mkdir(parents=True, exist_ok=True)
-
-    frozen_path = smoothing_dir / 'frozen_final_union.u8.dat'
-    frozen_mm = copy_workspace_array(
-        np.asarray(mask_mm),
-        frozen_path,
-        desc='Object interpolation smoothing frozen source copy',
-        prefer_memory=False,
-        workers=int(workers),
-    )
-
-    labels_mm: Optional[np.ndarray] = None
+    view_dir = smoothing_dir / str(model_name) / str(view.name)
+    view_dir.mkdir(parents=True, exist_ok=True)
     label_paths: List[Path] = []
+    labels_mm: Optional[np.ndarray] = None
+    delta_mm: Optional[np.ndarray] = None
+    delta_path: Optional[Path] = None
+
     try:
         labels_mm, num_objects, label_paths = label_foreground_volume_streaming(
-            frozen_mm,
-            smoothing_dir / 'frozen_labels',
+            source_mm,
+            view_dir / 'frozen_labels',
             keep_temp=True,
             prefer_memory=False,
         )
         if int(num_objects) <= 0:
-            return stats
+            return ObjectSmoothingViewResult(
+                view_name=str(view.name),
+                display_name=pretty_view_name(view),
+                added_voxels=0,
+                num_objects=int(num_objects),
+                delta_mm=None,
+                delta_path=None,
+            )
 
-        stats['transverse_added_voxels'] = _smooth_one_axis_from_frozen_labels(
-            dst_axis_view=np.asarray(mask_mm),
-            frozen_axis_view=np.asarray(frozen_mm),
+        delta_path = view_dir / f'{view.name}.smoothing_delta.u8.dat'
+        delta_mm = allocate_workspace_array(
+            shape=tuple(int(x) for x in np.asarray(source_mm).shape),
+            dtype=np.uint8,
+            path=delta_path,
+            desc=f'{model_name}/{view.name} object-smoothing delta',
+            prefer_memory=False,
+        )
+        added = _smooth_one_axis_from_frozen_labels(
+            dst_axis_view=delta_mm,
+            frozen_axis_view=np.asarray(source_mm),
             labels_axis_view=np.asarray(labels_mm),
-            axis_name='Transverse',
+            axis_name=pretty_view_name(view),
             workers=int(workers),
         )
 
-        if bool(enable_multiplanar):
-            stats['sagittal_added_voxels'] = _smooth_one_axis_from_frozen_labels(
-                dst_axis_view=np.moveaxis(mask_mm, 1, 0),
-                frozen_axis_view=np.moveaxis(frozen_mm, 1, 0),
-                labels_axis_view=np.moveaxis(labels_mm, 1, 0),
-                axis_name='Sagittal',
-                workers=int(workers),
-            )
-            stats['coronal_added_voxels'] = _smooth_one_axis_from_frozen_labels(
-                dst_axis_view=np.moveaxis(mask_mm, 2, 0),
-                frozen_axis_view=np.moveaxis(frozen_mm, 2, 0),
-                labels_axis_view=np.moveaxis(labels_mm, 2, 0),
-                axis_name='Coronal',
-                workers=int(workers),
-            )
+        if int(added) <= 0:
+            close_memmap_array(delta_mm)
+            if not bool(keep_temp) and delta_path is not None:
+                try:
+                    delta_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            delta_mm = None
+            delta_path = None
 
-        flush_array(mask_mm)
-        return stats
+        return ObjectSmoothingViewResult(
+            view_name=str(view.name),
+            display_name=pretty_view_name(view),
+            added_voxels=int(added),
+            num_objects=int(num_objects),
+            delta_mm=delta_mm,
+            delta_path=delta_path,
+        )
     finally:
         if labels_mm is not None:
             close_memmap_array(labels_mm)
-        close_memmap_array(frozen_mm)
         if not bool(keep_temp):
             for lp in label_paths:
                 try:
                     lp.unlink(missing_ok=True)
                 except Exception:
                     pass
-            try:
-                frozen_path.unlink(missing_ok=True)
-            except Exception:
-                pass
 
+
+def union_view_oriented_delta_into_native_inplace(
+    dst_native_mm: np.ndarray,
+    delta_mm: np.ndarray,
+    view: ViewInfo,
+    *,
+    workers: int = 1,
+    desc: str = 'Union object-smoothing delta',
+) -> int:
+    """Union one view-oriented smoothing delta into the native transverse volume."""
+    added_by_slice = np.zeros((max(1, int(delta_mm.shape[0])),), dtype=np.int64)
+
+    if view.name == 'transverse':
+        if tuple(int(x) for x in delta_mm.shape) != tuple(int(x) for x in dst_native_mm.shape):
+            raise ValueError(
+                f"Transverse smoothing delta shape {tuple(delta_mm.shape)} does not match native shape {tuple(dst_native_mm.shape)}"
+            )
+        num_slices = int(dst_native_mm.shape[0])
+
+        def _merge_transverse(t: int) -> None:
+            src = np.asarray(delta_mm[int(t)], dtype=np.uint8)
+            if not np.any(src):
+                return
+            dst = dst_native_mm[int(t)]
+            src_bool = src > 0
+            added_by_slice[int(t)] = np.int64(np.count_nonzero(src_bool & (np.asarray(dst) == 0)))
+            np.maximum(dst, src, out=dst)
+
+        parallel_for_indices(
+            num_slices,
+            _merge_transverse,
+            max_workers=choose_slice_parallel_workers(int(workers), num_slices),
+            desc=desc,
+            show_progress=False,
+        )
+    elif view.name == 'sagittal':
+        expected = (int(dst_native_mm.shape[1]), int(dst_native_mm.shape[0]), int(dst_native_mm.shape[2]))
+        if tuple(int(x) for x in delta_mm.shape) != expected:
+            raise ValueError(f"Sagittal smoothing delta shape {tuple(delta_mm.shape)}; expected {expected}")
+        num_slices = int(delta_mm.shape[0])
+        added_by_slice = np.zeros((num_slices,), dtype=np.int64)
+
+        def _merge_sagittal(y: int) -> None:
+            src = np.asarray(delta_mm[int(y)], dtype=np.uint8)
+            if not np.any(src):
+                return
+            dst = dst_native_mm[:, int(y), :]
+            src_bool = src > 0
+            added_by_slice[int(y)] = np.int64(np.count_nonzero(src_bool & (np.asarray(dst) == 0)))
+            np.maximum(dst, src, out=dst)
+
+        parallel_for_indices(
+            num_slices,
+            _merge_sagittal,
+            max_workers=choose_slice_parallel_workers(int(workers), num_slices),
+            desc=desc,
+            show_progress=False,
+        )
+    elif view.name == 'coronal':
+        expected = (int(dst_native_mm.shape[2]), int(dst_native_mm.shape[0]), int(dst_native_mm.shape[1]))
+        if tuple(int(x) for x in delta_mm.shape) != expected:
+            raise ValueError(f"Coronal smoothing delta shape {tuple(delta_mm.shape)}; expected {expected}")
+        num_slices = int(delta_mm.shape[0])
+        added_by_slice = np.zeros((num_slices,), dtype=np.int64)
+
+        def _merge_coronal(x: int) -> None:
+            src = np.asarray(delta_mm[int(x)], dtype=np.uint8)
+            if not np.any(src):
+                return
+            dst = dst_native_mm[:, :, int(x)]
+            src_bool = src > 0
+            added_by_slice[int(x)] = np.int64(np.count_nonzero(src_bool & (np.asarray(dst) == 0)))
+            np.maximum(dst, src, out=dst)
+
+        parallel_for_indices(
+            num_slices,
+            _merge_coronal,
+            max_workers=choose_slice_parallel_workers(int(workers), num_slices),
+            desc=desc,
+            show_progress=False,
+        )
+    else:
+        raise ValueError(f'Object interpolation smoothing is not defined for view: {view.name}')
+
+    flush_array(dst_native_mm)
+    return int(np.sum(added_by_slice, dtype=np.int64))
+
+
+def apply_object_interpolation_smoothing_inplace(
+    mask_mm: np.ndarray,
+    view_support_by_model: Dict[str, Dict[str, np.ndarray]],
+    views: Sequence[ViewInfo],
+    temp_dir: Path,
+    *,
+    enable_multiplanar: bool,
+    keep_temp: bool = False,
+    workers: int = 1,
+) -> Dict[str, int]:
+    """Apply v9.0.0 object interpolation smoothing as independent per-view jobs.
+
+    Transverse smoothing is always sourced from the frozen Transverse parent-view support. Sagittal
+    and Coronal smoothing are sourced from their own frozen parent-view supports only when
+    ``--enable_multiplanar`` is active. Radial, Tilted Transverse, and tiled predictions are not
+    used as smoothing sources. Each eligible view writes a separate delta volume; all deltas are
+    unioned into ``mask_mm`` only after the view-level smoothing jobs have completed.
+    """
+    if len(view_support_by_model) != 1:
+        raise ValueError('v9.0.0_SLURM supports exactly one --model; multiple-model smoothing has been removed')
+
+    model_name = next(iter(view_support_by_model.keys()))
+    support_by_view = view_support_by_model[model_name]
+    eligible_views = [v for v in _eligible_object_smoothing_views(views, bool(enable_multiplanar)) if v.name in support_by_view]
+
+    stats: Dict[str, int] = {
+        'transverse_added_voxels': 0,
+        'sagittal_added_voxels': 0,
+        'coronal_added_voxels': 0,
+        'transverse_union_added_voxels': 0,
+        'sagittal_union_added_voxels': 0,
+        'coronal_union_added_voxels': 0,
+        'total_union_added_voxels': 0,
+    }
+    if not eligible_views:
+        return stats
+
+    smoothing_dir = temp_dir / 'object_interpolation_smoothing'
+    smoothing_dir.mkdir(parents=True, exist_ok=True)
+
+    requested_view_workers = _env_int('YOLO_TTA_OBJECT_SMOOTHING_VIEW_WORKERS', len(eligible_views))
+    view_workers = max(1, min(len(eligible_views), int(requested_view_workers)))
+    per_view_workers = max(1, int(workers) // max(1, view_workers))
+    print(
+        'Object interpolation smoothing view workers: '
+        f'{int(view_workers)} (per-view slice workers: {int(per_view_workers)})'
+    )
+
+    results: List[ObjectSmoothingViewResult] = []
+    with ThreadPoolExecutor(max_workers=int(view_workers), thread_name_prefix='object-smoothing-view') as executor:
+        future_to_view: Dict[Future, ViewInfo] = {}
+        for view in eligible_views:
+            future = executor.submit(
+                _smooth_one_view_volume_to_delta,
+                model_name=str(model_name),
+                view=view,
+                source_mm=support_by_view[view.name],
+                smoothing_dir=smoothing_dir,
+                keep_temp=bool(keep_temp),
+                workers=int(per_view_workers),
+            )
+            future_to_view[future] = view
+
+        for future in as_completed(future_to_view):
+            result = future.result()
+            results.append(result)
+            stats[f'{result.view_name}_added_voxels'] = int(result.added_voxels)
+            print(
+                f'Object interpolation smoothing finished for {result.display_name}: '
+                f'objects={int(result.num_objects)}, added_voxels={int(result.added_voxels)}'
+            )
+
+    for result in sorted(results, key=lambda r: ('transverse', 'sagittal', 'coronal').index(r.view_name) if r.view_name in ('transverse', 'sagittal', 'coronal') else 99):
+        if result.delta_mm is None or int(result.added_voxels) <= 0:
+            continue
+        view = next(v for v in eligible_views if v.name == result.view_name)
+        try:
+            union_added = union_view_oriented_delta_into_native_inplace(
+                mask_mm,
+                result.delta_mm,
+                view,
+                workers=int(workers),
+                desc=f'Union object-smoothing delta ({result.display_name})',
+            )
+            stats[f'{result.view_name}_union_added_voxels'] = int(union_added)
+            stats['total_union_added_voxels'] += int(union_added)
+        finally:
+            close_memmap_array(result.delta_mm)
+            if not bool(keep_temp) and result.delta_path is not None:
+                try:
+                    result.delta_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    flush_array(mask_mm)
+    return stats
 
 # --------------------------
 # Final outputs
@@ -7242,12 +7463,19 @@ def write_summary_file(
 
     if object_interpolation_smoothing_stats is not None:
         lines.append('')
-        lines.append('Object interpolation smoothing: enabled')
+        lines.append('Object interpolation smoothing: enabled; per-view jobs are run independently and unioned after all smoothing jobs finish')
         lines.append(
-            '  added_voxels: '
+            '  per-view added_voxels: '
             f"transverse={int(object_interpolation_smoothing_stats.get('transverse_added_voxels', 0))}, "
             f"sagittal={int(object_interpolation_smoothing_stats.get('sagittal_added_voxels', 0))}, "
             f"coronal={int(object_interpolation_smoothing_stats.get('coronal_added_voxels', 0))}"
+        )
+        lines.append(
+            '  union_added_voxels: '
+            f"transverse={int(object_interpolation_smoothing_stats.get('transverse_union_added_voxels', 0))}, "
+            f"sagittal={int(object_interpolation_smoothing_stats.get('sagittal_union_added_voxels', 0))}, "
+            f"coronal={int(object_interpolation_smoothing_stats.get('coronal_union_added_voxels', 0))}, "
+            f"total={int(object_interpolation_smoothing_stats.get('total_union_added_voxels', 0))}"
         )
     else:
         lines.append('')
@@ -8172,6 +8400,8 @@ def main() -> None:
         print('\n=== Applying object interpolation smoothing ===')
         object_interpolation_smoothing_stats = apply_object_interpolation_smoothing_inplace(
             final_union_mm,
+            view_support_by_model=native_view_support_by_model,
+            views=views,
             temp_dir=temp_dir,
             enable_multiplanar=bool(args.enable_multiplanar),
             keep_temp=bool(args.troubleshooting),
