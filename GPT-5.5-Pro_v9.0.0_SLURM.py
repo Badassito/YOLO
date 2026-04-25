@@ -2,7 +2,7 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v8.4.0_SLURM single-channel-aligned script:
+This v9.0.0_SLURM single-channel-aligned script:
   - builds Transverse, optional Tilted Transverse, optional Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - renders parent/full-frame videos directly from the native view transform so inference no longer waits on
     a separately rendered canvas video, and derives non-radial tile videos from shared canvas batches so the
@@ -18,8 +18,9 @@ This v8.4.0_SLURM single-channel-aligned script:
   - reuses a native radial frame cache during dense tiled rendering so radial tiles do not recompute
     the same Lanczos-5 slices for every tile location
   - inverse-maps predictions into native view coordinates, including Tilted Transverse slice-axis
-    shear back-projection, then applies confidence filtering, hole filling, interpolation, and final model ensembling
-  - applies exactly one final 3D void fill after the final global union of all active views, tiles, and models
+    shear back-projection, then applies confidence filtering, hole filling, interpolation, and final single-model view union
+  - treats --model as a single YOLO segmentation model path; multiple-model inference is not supported in v9.0.0
+  - applies final 3D void fill only when --enable_3d_void_fill is active, and only once after the global union
   - saves the transverse default color overlay plus optional labels, single-channel binary masks, NRRD, multiplanar, radial,
     tilted-transverse, image-sequence, low-quality, and TTA outputs, with FFV1 used for spec-required MKVs
 
@@ -99,21 +100,6 @@ def _parse_angles(s: str) -> List[float]:
     return [float(p) for p in parts if p != ""]
 
 
-def _parse_models(values: Sequence[str]) -> List[str]:
-    """
-    Accepts:
-      --model m1.pt m2.pt
-      --model "m1.pt,m2.pt"
-    """
-    out: List[str] = []
-    for v in values:
-        if "," in v:
-            out.extend([x.strip() for x in v.split(",") if x.strip()])
-        else:
-            out.append(v.strip())
-    return [x for x in out if x]
-
-
 def _parse_int_list(values: Sequence[str] | str | int | None) -> List[int]:
     """Accept comma and/or whitespace separated integer lists."""
     if values is None:
@@ -187,7 +173,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--input", required=True, type=str, help="Input video path")
     p.add_argument("--output", default=None, type=str, help="Output directory (default ./{Filename}/)")
     p.add_argument("--device", default="0", type=str, help="Device passed to YOLO predict")
-    p.add_argument("--model", required=True, nargs="+", type=str, help="One or more YOLO segmentation model paths")
+    p.add_argument("--model", required=True, type=str, help="Path to a single YOLO segmentation model")
 
     p.add_argument("--imgsz", default=1536, type=int, help="Square input size used for YOLO predict")
     p.add_argument("--conf", default=0.15, type=float, help="Passed to YOLO predict")
@@ -232,6 +218,10 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--save_low_quality", action="store_true",
                    help="Save additional low-quality presentation copies using libx264, preset slow, yuv420p, and a 1024px maximum dimension")
     p.add_argument("--voxel_volume", action="store_true", help="Count white voxels in the final binary output and save the value to the summary text file")
+    p.add_argument("--enable_3d_void_fill", action="store_true",
+                   help="Apply one final 3D enclosed-void fill after the global union. Disabled by default")
+    p.add_argument("--object_interpolation_smoothing", action="store_true",
+                   help="Apply frozen-state object mask interpolation smoothing after the final union")
 
     p.add_argument("--troubleshooting", action="store_true",
                    help="Keep temporary files and save outputs before each interpolation pass")
@@ -338,7 +328,7 @@ def _cpu_count() -> int:
 def default_worker_budget() -> int:
     """Intentional CPU oversubscription for mixed GPU/IO/CPU workloads.
 
-    The v8.1.0 SLURM target has enough CPU headroom that running roughly 2x the visible CPU count
+    The v9.0.0 SLURM target has enough CPU headroom that running roughly 2x the visible CPU count
     helps keep ffmpeg, view rendering, interpolation planning, and output writers busy while the GPU
     is inferencing or waiting on a different stage.
     """
@@ -3710,7 +3700,7 @@ def fill_3d_voids_inplace_streaming(
 ) -> None:
     """Fill enclosed 3D voids by labeling background connected components once.
 
-    v8.4.0 requires 3D void fill to occur only after the final global union. This
+    v9.0.0 allows 3D void fill only as an optional final global-union step. This
     function performs that operation by labeling the background volume, marking any
     background component connected to the volume boundary, and converting all other
     background components to foreground. The default 6-connected background matches
@@ -4060,8 +4050,8 @@ def backproject_radial_volume_to_volume(
     return vol_mm
 
 
-def assemble_model_volume_from_view_volumes(
-    ensemble_mm: np.ndarray,
+def assemble_view_volumes_into_native_union(
+    final_union_mm: np.ndarray,
     view_volume_mms: Dict[str, np.ndarray],
     T: int,
     H: int,
@@ -4070,12 +4060,11 @@ def assemble_model_volume_from_view_volumes(
     *,
     workers: int = 1,
 ) -> None:
-    """OR all per-view volumes for one model into the native transverse ensemble.
+    """OR all per-view prediction volumes from the single active model into native (t, Y, X).
 
     Transverse, Tilted Transverse, and already backprojected Radial volumes all have native
     (T,H,W) shape and are merged slice-wise. Sagittal and Coronal retain their native view stacks
-    and are mapped back into the transverse coordinate system. This fixes the prior omission where
-    tilted-transverse prediction sets could be computed but not included in the final union.
+    and are mapped back into the transverse coordinate system.
     """
     consumed: set[str] = set()
 
@@ -4087,13 +4076,13 @@ def assemble_model_volume_from_view_volumes(
         transverse_workers = choose_slice_parallel_workers(int(workers), int(T))
 
         def _merge_transverse(t: int) -> None:
-            ensemble_mm[int(t), :, :] |= transverse[int(t), :, :]
+            final_union_mm[int(t), :, :] |= transverse[int(t), :, :]
 
         parallel_for_indices(
             int(T),
             _merge_transverse,
             max_workers=transverse_workers,
-            desc="Assembling volume from transverse view volume",
+            desc="Assembling final union from transverse view volume",
         )
 
     if not disable_multiplanar and "sagittal" in view_volume_mms:
@@ -4103,13 +4092,13 @@ def assemble_model_volume_from_view_volumes(
         sagittal_workers = choose_slice_parallel_workers(int(workers), int(H))
 
         def _merge_sagittal(y: int) -> None:
-            ensemble_mm[:, int(y), :] |= sagittal[int(y), :, :]
+            final_union_mm[:, int(y), :] |= sagittal[int(y), :, :]
 
         parallel_for_indices(
             int(H),
             _merge_sagittal,
             max_workers=sagittal_workers,
-            desc="Assembling volume from sagittal view volume",
+            desc="Assembling final union from sagittal view volume",
         )
 
     if not disable_multiplanar and "coronal" in view_volume_mms:
@@ -4119,13 +4108,13 @@ def assemble_model_volume_from_view_volumes(
         coronal_workers = choose_slice_parallel_workers(int(workers), int(W))
 
         def _merge_coronal(x: int) -> None:
-            ensemble_mm[:, :, int(x)] |= coronal[int(x), :, :]
+            final_union_mm[:, :, int(x)] |= coronal[int(x), :, :]
 
         parallel_for_indices(
             int(W),
             _merge_coronal,
             max_workers=coronal_workers,
-            desc="Assembling volume from coronal view volume",
+            desc="Assembling final union from coronal view volume",
         )
 
     for view_name in sorted(view_volume_mms.keys()):
@@ -4140,17 +4129,17 @@ def assemble_model_volume_from_view_volumes(
         native_workers = choose_slice_parallel_workers(int(workers), int(T))
 
         def _merge_native(t: int, *, _vol: np.ndarray = vol) -> None:
-            ensemble_mm[int(t), :, :] |= _vol[int(t), :, :]
+            final_union_mm[int(t), :, :] |= _vol[int(t), :, :]
 
         parallel_for_indices(
             int(T),
             _merge_native,
             max_workers=native_workers,
-            desc=f"Assembling volume from {view_name} view volume",
+            desc=f"Assembling final union from {view_name} view volume",
         )
 
 
-def assemble_current_ensemble_volume(
+def assemble_current_view_union_volume(
     view_volumes_by_model: Dict[str, Dict[str, np.ndarray]],
     T: int,
     H: int,
@@ -4162,29 +4151,37 @@ def assemble_current_ensemble_volume(
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
 ) -> np.ndarray:
-    ensemble_mm = allocate_workspace_array(
+    """Build the single-model final view union.
+
+    The mapping is kept keyed by model name because earlier pipeline stages store temporary
+    workspaces under the model stem. v9.0.0 rejects multiple model entries and never
+    combines outputs from more than one model.
+    """
+    if len(view_volumes_by_model) != 1:
+        raise ValueError('v9.0.0_SLURM supports exactly one --model; multiple-model inference has been removed')
+
+    model_name = next(iter(view_volumes_by_model.keys()))
+    final_union_mm = allocate_workspace_array(
         shape=(T, H, W),
         dtype=np.uint8,
         path=out_path,
-        desc='Ensemble volume',
+        desc='Final single-model view-union volume',
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
     )
 
-    for model_name in sorted(view_volumes_by_model.keys()):
-        print(f"\n=== Assembling model into ensemble volume: {model_name} ===")
-        assemble_model_volume_from_view_volumes(
-            ensemble_mm=ensemble_mm,
-            view_volume_mms=view_volumes_by_model[model_name],
-            T=T,
-            H=H,
-            W=W,
-            disable_multiplanar=disable_multiplanar,
-            workers=int(workers),
-        )
-        flush_array(ensemble_mm)
-
-    return ensemble_mm
+    print(f"\n=== Assembling final view union for model: {model_name} ===")
+    assemble_view_volumes_into_native_union(
+        final_union_mm=final_union_mm,
+        view_volume_mms=view_volumes_by_model[model_name],
+        T=T,
+        H=H,
+        W=W,
+        disable_multiplanar=disable_multiplanar,
+        workers=int(workers),
+    )
+    flush_array(final_union_mm)
+    return final_union_mm
 
 
 def union_volume_into_volume(
@@ -4209,8 +4206,7 @@ def union_volume_into_volume(
     flush_array(dst_mm)
 
 
-
-def assemble_final_ensemble_after_view_union(
+def assemble_final_union_after_view_union(
     view_volumes_by_model: Dict[str, Dict[str, np.ndarray]],
     T: int,
     H: int,
@@ -4219,13 +4215,14 @@ def assemble_final_ensemble_after_view_union(
     out_path: Path,
     temp_dir: Path,
     *,
+    enable_3d_void_fill: bool = False,
     keep_temp: bool = False,
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
 ) -> np.ndarray:
-    """Build the final ensemble and apply 3D void fill once after the global union."""
-    ensemble_mm = assemble_current_ensemble_volume(
+    """Build the final single-model view union and optionally apply one 3D void fill."""
+    final_union_mm = assemble_current_view_union_volume(
         view_volumes_by_model=view_volumes_by_model,
         T=T,
         H=H,
@@ -4237,17 +4234,20 @@ def assemble_final_ensemble_after_view_union(
         workers=int(workers),
     )
 
-    print('\n=== 3D void fill after final global union ===')
-    final_void_dir = temp_dir / 'final_global_void_fill'
-    final_void_dir.mkdir(parents=True, exist_ok=True)
-    fill_3d_voids_inplace_streaming(
-        ensemble_mm,
-        final_void_dir / 'ensemble',
-        keep_temp=bool(keep_temp),
-        prefer_memory=bool(prefer_memory),
-        reserve_bytes=int(reserve_bytes),
-    )
-    return ensemble_mm
+    if bool(enable_3d_void_fill):
+        print('\n=== Optional 3D void fill after final global union ===')
+        final_void_dir = temp_dir / 'final_global_void_fill'
+        final_void_dir.mkdir(parents=True, exist_ok=True)
+        fill_3d_voids_inplace_streaming(
+            final_union_mm,
+            final_void_dir / 'final_union',
+            keep_temp=bool(keep_temp),
+            prefer_memory=bool(prefer_memory),
+            reserve_bytes=int(reserve_bytes),
+        )
+    else:
+        print('\n=== Optional 3D void fill disabled (--enable_3d_void_fill not set) ===')
+    return final_union_mm
 
 
 # --------------------------
@@ -4828,7 +4828,7 @@ def _build_slice_endpoint_seeds(
       - ``scan``: always use the fast slice-graph terminal scan
       - ``skeleton``: always use per-object 3D skeletonization
 
-    The hybrid path keeps 3D skeletonization as the default v8.1.0-compliant behavior while still
+    The hybrid path keeps 3D skeletonization as the default v9.0.0-compliant behavior while still
     protecting large SLURM-scale volumes from pathological all-voxel skeletonization costs.
     """
     mode = os.environ.get('YOLO_TTA_INTERPOLATION_ENDPOINT_MODE', 'hybrid').strip().lower()
@@ -5596,7 +5596,7 @@ def gate_tile_volume_against_parent_inplace(
     """Keep only tile components that intersect the frozen parent support on the same slice.
 
     The gating result for one slice never affects another slice, so this stage can be parallelized
-    aggressively across the slice axis without violating the v8.2.0_SLURM semantics.
+    aggressively across the slice axis without violating the v9.0.0_SLURM semantics.
     """
     num_slices = int(tile_mask_mm.shape[0])
     accepted_components = np.zeros((num_slices,), dtype=np.int64)
@@ -5755,7 +5755,7 @@ def gate_tile_volume_into_consolidated_parent(
 ) -> TileGateResult:
     """Gate one tile volume, then OR accepted components into the parent-view tile accumulator.
 
-    v8.4.0 intentionally consolidates all accepted tiles for a parent view before interpolation.
+    v9.0.0 intentionally consolidates all accepted tiles for a parent view before interpolation.
     This replaces the previous per-tile interpolation path while preserving the mask-wise OR gate:
     accepted tile components still must intersect the frozen parent full-frame support, and accepted
     tiles cannot accept other tiles because the support image is not the accumulator.
@@ -5898,6 +5898,181 @@ def finalize_consolidated_tile_volume_for_parent(
         interpolation_stats=interpolation_stats,
         pass_snapshots=pass_snapshots,
     )
+
+
+# --------------------------
+# Final object interpolation smoothing (optional)
+# --------------------------
+
+
+def _bbox2d_for_masks(mask_a: np.ndarray, mask_b: np.ndarray, margin: int = 4) -> Optional[Tuple[slice, slice]]:
+    ys_a, xs_a = np.nonzero(mask_a)
+    ys_b, xs_b = np.nonzero(mask_b)
+    if ys_a.size == 0 or ys_b.size == 0:
+        return None
+    y0 = max(0, int(min(int(np.min(ys_a)), int(np.min(ys_b)))) - int(margin))
+    y1 = min(mask_a.shape[0], int(max(int(np.max(ys_a)), int(np.max(ys_b)))) + int(margin) + 1)
+    x0 = max(0, int(min(int(np.min(xs_a)), int(np.min(xs_b)))) - int(margin))
+    x1 = min(mask_a.shape[1], int(max(int(np.max(xs_a)), int(np.max(xs_b)))) + int(margin) + 1)
+    if y0 >= y1 or x0 >= x1:
+        return None
+    return slice(y0, y1), slice(x0, x1)
+
+
+def _smooth_one_axis_from_frozen_labels(
+    dst_axis_view: np.ndarray,
+    frozen_axis_view: np.ndarray,
+    labels_axis_view: np.ndarray,
+    *,
+    axis_name: str,
+    workers: int = 1,
+) -> int:
+    """Apply frozen-state N/N+2 -> N+1 object smoothing along one axis.
+
+    The source masks and object labels are frozen before the pass. Newly synthesized middle-slice
+    masks are only ORed into ``dst_axis_view`` and cannot become sources for later smoothing pairs.
+    """
+    axis_len = int(frozen_axis_view.shape[0])
+    if axis_len < 3:
+        return 0
+
+    added_by_plane = np.zeros((axis_len,), dtype=np.int64)
+    worker_count = choose_slice_parallel_workers(int(workers), max(1, axis_len - 2))
+    chunk_size = choose_parallel_chunk_size(max(1, axis_len - 2), worker_count, target_chunks_per_worker=2, min_chunk_size=1)
+    locks = [threading.Lock() for _ in range(axis_len)]
+
+    def _process(i: int) -> None:
+        i0 = int(i)
+        i1 = i0 + 2
+        im = i0 + 1
+        labels0 = np.asarray(labels_axis_view[i0])
+        labels1 = np.asarray(labels_axis_view[i1])
+        if not np.any(labels0) or not np.any(labels1):
+            return
+
+        common = np.intersect1d(np.unique(labels0[labels0 > 0]), np.unique(labels1[labels1 > 0]), assume_unique=False)
+        if common.size == 0:
+            return
+
+        local = np.zeros(frozen_axis_view.shape[1:], dtype=np.uint8)
+        for lbl in common.tolist():
+            src = labels0 == int(lbl)
+            tgt = labels1 == int(lbl)
+            if not np.any(src) or not np.any(tgt):
+                continue
+            bbox = _bbox2d_for_masks(src, tgt, margin=4)
+            if bbox is None:
+                continue
+            ys, xs = bbox
+            src_local = src[ys, xs]
+            tgt_local = tgt[ys, xs]
+            if not np.any(src_local) or not np.any(tgt_local):
+                continue
+            synth = (_signed_distance_2d(src_local) + _signed_distance_2d(tgt_local)) >= 0.0
+            if not np.any(synth):
+                continue
+            local_slice = local[ys, xs]
+            local_slice[synth] = np.uint8(1)
+
+        if not np.any(local):
+            return
+
+        with locks[im]:
+            dst = dst_axis_view[im]
+            before_new = local.astype(bool) & (np.asarray(dst) == 0)
+            if np.any(before_new):
+                added_by_plane[im] += np.int64(np.count_nonzero(before_new))
+            dst |= local
+
+    parallel_for_indices_chunked(
+        axis_len - 2,
+        _process,
+        max_workers=worker_count,
+        desc=f'Object interpolation smoothing ({axis_name})',
+        chunk_size=chunk_size,
+    )
+    flush_array(dst_axis_view)
+    return int(np.sum(added_by_plane, dtype=np.int64))
+
+
+def apply_object_interpolation_smoothing_inplace(
+    mask_mm: np.ndarray,
+    temp_dir: Path,
+    *,
+    enable_multiplanar: bool,
+    keep_temp: bool = False,
+    workers: int = 1,
+) -> Dict[str, int]:
+    """Apply v9.0.0 object interpolation smoothing after the final union.
+
+    Transverse smoothing is always applied. Sagittal and Coronal smoothing are also applied when
+    ``--enable_multiplanar`` is active. Radial and tiled views are not used as smoothing axes.
+    """
+    stats: Dict[str, int] = {'transverse_added_voxels': 0, 'sagittal_added_voxels': 0, 'coronal_added_voxels': 0}
+    smoothing_dir = temp_dir / 'object_interpolation_smoothing'
+    smoothing_dir.mkdir(parents=True, exist_ok=True)
+
+    frozen_path = smoothing_dir / 'frozen_final_union.u8.dat'
+    frozen_mm = copy_workspace_array(
+        np.asarray(mask_mm),
+        frozen_path,
+        desc='Object interpolation smoothing frozen source copy',
+        prefer_memory=False,
+        workers=int(workers),
+    )
+
+    labels_mm: Optional[np.ndarray] = None
+    label_paths: List[Path] = []
+    try:
+        labels_mm, num_objects, label_paths = label_foreground_volume_streaming(
+            frozen_mm,
+            smoothing_dir / 'frozen_labels',
+            keep_temp=True,
+            prefer_memory=False,
+        )
+        if int(num_objects) <= 0:
+            return stats
+
+        stats['transverse_added_voxels'] = _smooth_one_axis_from_frozen_labels(
+            dst_axis_view=np.asarray(mask_mm),
+            frozen_axis_view=np.asarray(frozen_mm),
+            labels_axis_view=np.asarray(labels_mm),
+            axis_name='Transverse',
+            workers=int(workers),
+        )
+
+        if bool(enable_multiplanar):
+            stats['sagittal_added_voxels'] = _smooth_one_axis_from_frozen_labels(
+                dst_axis_view=np.moveaxis(mask_mm, 1, 0),
+                frozen_axis_view=np.moveaxis(frozen_mm, 1, 0),
+                labels_axis_view=np.moveaxis(labels_mm, 1, 0),
+                axis_name='Sagittal',
+                workers=int(workers),
+            )
+            stats['coronal_added_voxels'] = _smooth_one_axis_from_frozen_labels(
+                dst_axis_view=np.moveaxis(mask_mm, 2, 0),
+                frozen_axis_view=np.moveaxis(frozen_mm, 2, 0),
+                labels_axis_view=np.moveaxis(labels_mm, 2, 0),
+                axis_name='Coronal',
+                workers=int(workers),
+            )
+
+        flush_array(mask_mm)
+        return stats
+    finally:
+        if labels_mm is not None:
+            close_memmap_array(labels_mm)
+        close_memmap_array(frozen_mm)
+        if not bool(keep_temp):
+            for lp in label_paths:
+                try:
+                    lp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            try:
+                frozen_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 # --------------------------
@@ -6560,7 +6735,7 @@ def _build_snapshot_native_union_for_view(
     return native_union
 
 
-def build_troubleshooting_pass_ensemble(
+def build_troubleshooting_pass_union(
     *,
     snapshot_refs: Dict[Tuple[str, str, str, int], VolumeSnapshotRef],
     model_names: Sequence[str],
@@ -6575,6 +6750,8 @@ def build_troubleshooting_pass_ensemble(
     keep_temp: bool,
     workers: int,
 ) -> np.ndarray:
+    if len(model_names) != 1:
+        raise ValueError('v9.0.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     view_volumes_for_pass: Dict[str, Dict[str, np.ndarray]] = {str(model_name): {} for model_name in model_names}
     intermediate_volumes: List[np.ndarray] = []
 
@@ -6619,20 +6796,20 @@ def build_troubleshooting_pass_ensemble(
                     view_volumes_for_pass[str(model_name)][view.name] = native_union
 
         # Troubleshooting pass outputs are stage snapshots taken before the corresponding
-        # interpolation pass. They must not run the final 3D void fill; v8.4.0 requires
-        # 3D void fill exactly once, after the final global union used by the normal final
-        # output.
-        ensemble = assemble_current_ensemble_volume(
+        # interpolation pass. They must not run the final 3D void fill; v9.0.0 keeps
+        # 3D void fill out of troubleshooting pre-pass outputs and applies it only when
+        # --enable_3d_void_fill is active for the normal final output.
+        pass_union = assemble_current_view_union_volume(
             view_volumes_by_model=view_volumes_for_pass,
             T=int(T),
             H=int(H),
             W=int(W),
             disable_multiplanar=not bool(enable_multiplanar),
-            out_path=temp_dir / 'troubleshooting_pass_outputs' / f'ensemble_pass{int(pass_index)}.u8.dat',
+            out_path=temp_dir / 'troubleshooting_pass_outputs' / f'final_union_pass{int(pass_index)}.u8.dat',
             prefer_memory=False,
             workers=int(workers),
         )
-        return ensemble
+        return pass_union
     finally:
         for vol in intermediate_volumes:
             close_memmap_array(vol)
@@ -6663,6 +6840,8 @@ def schedule_troubleshooting_pass_outputs(
     frame_workers: int,
     workers: int,
 ) -> Dict[str, Path]:
+    if len(model_names) != 1:
+        raise ValueError('v9.0.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     if int(total_passes) < 0 or not snapshot_refs:
         return {}
 
@@ -6681,7 +6860,7 @@ def schedule_troubleshooting_pass_outputs(
     all_paths: Dict[str, Path] = {}
     for pass_idx in available_prepass_indices:
         print(f"\n=== Scheduling troubleshooting pre-interpolation outputs: pass {int(pass_idx)} ===")
-        pass_ensemble = build_troubleshooting_pass_ensemble(
+        pass_union = build_troubleshooting_pass_union(
             snapshot_refs=snapshot_refs,
             model_names=model_names,
             views=views,
@@ -6699,7 +6878,7 @@ def schedule_troubleshooting_pass_outputs(
         pass_paths, pass_futures = collect_pipeline_output_futures(
             output_manager.executor,
             volume_rgb=volume_rgb,
-            mask_u8=pass_ensemble,
+            mask_u8=pass_union,
             out_dir=out_dir,
             stem=stem,
             fps=float(fps),
@@ -6714,7 +6893,7 @@ def schedule_troubleshooting_pass_outputs(
             extra_paths, extra_futures = collect_multiplanar_output_futures(
                 output_manager.executor,
                 volume_rgb=volume_rgb,
-                mask_u8=pass_ensemble,
+                mask_u8=pass_union,
                 out_dir=out_dir,
                 stem=stem,
                 fps=float(fps),
@@ -6731,7 +6910,7 @@ def schedule_troubleshooting_pass_outputs(
             label=f'troubleshooting pass {int(pass_idx)} outputs',
             result_paths=pass_paths,
             futures=pass_futures,
-            resources=[pass_ensemble],
+            resources=[pass_union],
         ))
         for key, path in pass_paths.items():
             all_paths[f'troubleshooting_pass{int(pass_idx)}_{key}'] = path
@@ -6831,7 +7010,7 @@ def write_view_images(
     return view_dir
 
 
-def union_view_volume_across_models(
+def union_view_volume_for_single_model(
     view_name: str,
     view_volumes_by_model: Dict[str, Dict[str, np.ndarray]],
     out_path: Path,
@@ -6840,37 +7019,33 @@ def union_view_volume_across_models(
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
 ) -> np.ndarray:
-    source_shape: Optional[Tuple[int, ...]] = None
-    for model_name in sorted(view_volumes_by_model.keys()):
-        if view_name in view_volumes_by_model[model_name]:
-            source_shape = tuple(int(x) for x in np.asarray(view_volumes_by_model[model_name][view_name]).shape)
-            break
-    if source_shape is None:
-        raise KeyError(f'No per-model view volume found for {view_name}')
+    if len(view_volumes_by_model) != 1:
+        raise ValueError('v9.0.0_SLURM supports exactly one --model; multiple-model inference has been removed')
+    model_name = next(iter(view_volumes_by_model.keys()))
+    if view_name not in view_volumes_by_model[model_name]:
+        raise KeyError(f'No view volume found for {view_name}')
 
+    source = np.asarray(view_volumes_by_model[model_name][view_name])
+    source_shape = tuple(int(x) for x in source.shape)
     union_mm = allocate_workspace_array(
         shape=source_shape,
         dtype=np.uint8,
         path=out_path,
-        desc=f'Union view volume {view_name}',
+        desc=f'Single-model view volume copy for TTA labels ({view_name})',
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
     )
 
     num_slices = int(source_shape[0]) if len(source_shape) > 0 else 0
 
-    def _merge_slice(idx: int) -> None:
-        dst = union_mm[int(idx)]
-        for model_name in sorted(view_volumes_by_model.keys()):
-            if view_name not in view_volumes_by_model[model_name]:
-                continue
-            dst |= np.asarray(view_volumes_by_model[model_name][view_name][int(idx)], dtype=np.uint8)
+    def _copy_slice(idx: int) -> None:
+        union_mm[int(idx)] = np.asarray(source[int(idx)], dtype=np.uint8)
 
     parallel_for_indices(
         num_slices,
-        _merge_slice,
+        _copy_slice,
         max_workers=choose_slice_parallel_workers(int(workers), num_slices),
-        desc=f'Union per-model view volumes ({view_name})',
+        desc=f'Copy single-model view volume ({view_name})',
         show_progress=False,
     )
     flush_array(union_mm)
@@ -6948,7 +7123,7 @@ def save_tta_outputs(
         aug_jobs = list(aug_jobs_by_view.get(view.name, []))
         if not aug_jobs:
             continue
-        union_mask = union_view_volume_across_models(
+        union_mask = union_view_volume_for_single_model(
             view.name,
             view_volumes_by_model,
             temp_dir / 'tta' / f'{view.name}.u8.dat',
@@ -6988,6 +7163,8 @@ def write_summary_file(
     view_names: Sequence[str],
     view_prediction_stats: Dict[str, int],
     interpolation_stats: List[Dict[str, object]],
+    enable_3d_void_fill: bool,
+    object_interpolation_smoothing_stats: Optional[Dict[str, int]],
     voxel_volume: Optional[int],
     final_paths: Dict[str, Path],
     augmentation_workers: int,
@@ -7003,14 +7180,15 @@ def write_summary_file(
     lines.append(f'FPS: {fps}')
     lines.append(f'Scratch directory: {scratch_dir}')
     lines.append('Workspace policy: in-memory first with disk fallback when the working set exceeds available RAM/swap')
-    lines.append('3D void fill: applied once after the final global union; troubleshooting pre-pass outputs are not void-filled')
-    lines.append('3D void fill background connectivity: default 6-connected; override with YOLO_TTA_VOIDFILL_CONNECTIVITY=18 or 26 if needed')
+    lines.append(f'3D void fill: {"enabled" if bool(enable_3d_void_fill) else "disabled"}; when enabled, it is applied once after the final global union')
+    if bool(enable_3d_void_fill):
+        lines.append('3D void fill background connectivity: default 6-connected; override with YOLO_TTA_VOIDFILL_CONNECTIVITY=18 or 26 if needed')
     lines.append(f'Augmentation workers: {int(augmentation_workers)}')
     lines.append(f'Slice-parallel postprocess workers: {int(slice_postprocess_workers)}')
     lines.append(f'Interpolation workers: {int(interpolation_workers)}')
     lines.append(f'Output workers: {int(output_workers)}')
     lines.append('Worker oversubscription: intentional; the default worker budget targets 2x the visible CPU allocation to overlap GPU waits, ffmpeg IO, and slice-parallel CPU work.')
-    lines.append(f'Models: {", ".join(str(Path(m)) for m in model_paths)}')
+    lines.append(f'Model: {str(Path(model_paths[0])) if model_paths else "<none>"}')
     lines.append(f'Views: {", ".join(view_names)}')
 
     lines.append('')
@@ -7062,6 +7240,19 @@ def write_summary_file(
                     f"skipped={bool(s.get('skipped', False))}"
                 )
 
+    if object_interpolation_smoothing_stats is not None:
+        lines.append('')
+        lines.append('Object interpolation smoothing: enabled')
+        lines.append(
+            '  added_voxels: '
+            f"transverse={int(object_interpolation_smoothing_stats.get('transverse_added_voxels', 0))}, "
+            f"sagittal={int(object_interpolation_smoothing_stats.get('sagittal_added_voxels', 0))}, "
+            f"coronal={int(object_interpolation_smoothing_stats.get('coronal_added_voxels', 0))}"
+        )
+    else:
+        lines.append('')
+        lines.append('Object interpolation smoothing: disabled')
+
     if voxel_volume is not None:
         lines.append('')
         lines.append(f'voxel_volume: {int(voxel_volume)}')
@@ -7088,12 +7279,15 @@ def main() -> None:
     if not input_path.exists():
         raise FileNotFoundError(input_path)
 
-    model_paths = _parse_models(args.model)
-    if not model_paths:
-        raise ValueError('--model must specify at least one model path')
-    for m in model_paths:
-        if not Path(m).expanduser().exists():
-            raise FileNotFoundError(m)
+    model_path = str(args.model).strip()
+    if not model_path:
+        raise ValueError('--model must specify one YOLO segmentation model path')
+    if ',' in model_path:
+        raise ValueError('v9.0.0_SLURM accepts a single --model path; multiple-model inference has been removed')
+    model_path_resolved = str(Path(model_path).expanduser().resolve())
+    if not Path(model_path_resolved).exists():
+        raise FileNotFoundError(model_path_resolved)
+    model_paths = [model_path_resolved]
 
     angles = _parse_angles(args.angle) or [0.0, 120.0, 240.0]
     tilt_angles = resolve_tilt_angles(args.tilt_angle)
@@ -7161,12 +7355,13 @@ def main() -> None:
     )
     cartesian_views = orthogonal_views_only(views)
 
-    yolo_models: List[Tuple[str, object]] = []
-    for m in model_paths:
-        name = Path(m).stem
-        print(f'Loading model: {name} ({m})')
-        yolo_models.append((name, load_ultralytics_model(m, task='segment')))
-    yolo_by_model_name: Dict[str, object] = {name: model for name, model in yolo_models}
+    model_name = Path(model_paths[0]).stem
+    print(f'Loading model: {model_name} ({model_paths[0]})')
+    yolo_model = load_ultralytics_model(model_paths[0], task='segment')
+    # v9.0.0 has no multiple-model inference. A single-item list is retained only to minimize churn in
+    # scheduling structures keyed by model stem.
+    yolo_models: List[Tuple[str, object]] = [(model_name, yolo_model)]
+    yolo_by_model_name: Dict[str, object] = {model_name: yolo_model}
 
     pred_cfg = PredictConfig(
         imgsz=args.imgsz,
@@ -7957,19 +8152,31 @@ def main() -> None:
 
     output_manager.reap_completed()
 
-    print('\n=== Building final ensemble after the global view union ===')
-    final_ensemble_mm = assemble_final_ensemble_after_view_union(
+    print('\n=== Building final single-model view union after the global view union ===')
+    final_union_mm = assemble_final_union_after_view_union(
         view_volumes_by_model=view_volumes_by_model,
         T=T,
         H=H,
         W=W,
         disable_multiplanar=not bool(args.enable_multiplanar),
-        out_path=temp_dir / 'ensemble_volume_final.u8.dat',
+        out_path=temp_dir / 'final_union_volume.u8.dat',
         temp_dir=temp_dir,
+        enable_3d_void_fill=bool(args.enable_3d_void_fill),
         keep_temp=bool(args.troubleshooting),
         prefer_memory=True,
         workers=slice_postprocess_workers,
     )
+
+    object_interpolation_smoothing_stats: Optional[Dict[str, int]] = None
+    if bool(args.object_interpolation_smoothing):
+        print('\n=== Applying object interpolation smoothing ===')
+        object_interpolation_smoothing_stats = apply_object_interpolation_smoothing_inplace(
+            final_union_mm,
+            temp_dir=temp_dir,
+            enable_multiplanar=bool(args.enable_multiplanar),
+            keep_temp=bool(args.troubleshooting),
+            workers=slice_postprocess_workers,
+        )
 
     final_paths: Dict[str, Path] = {}
 
@@ -8003,7 +8210,7 @@ def main() -> None:
     final_output_paths, final_futures = collect_pipeline_output_futures(
         output_manager.executor,
         volume_rgb=volume_rgb,
-        mask_u8=final_ensemble_mm,
+        mask_u8=final_union_mm,
         out_dir=out_dir,
         stem=input_path.stem,
         fps=fps,
@@ -8018,7 +8225,7 @@ def main() -> None:
         extra_paths, extra_futures = collect_multiplanar_output_futures(
             output_manager.executor,
             volume_rgb=volume_rgb,
-            mask_u8=final_ensemble_mm,
+            mask_u8=final_union_mm,
             out_dir=out_dir,
             stem=input_path.stem,
             fps=fps,
@@ -8040,15 +8247,15 @@ def main() -> None:
 
     voxel_volume = None
     if bool(args.voxel_volume):
-        voxel_counts = np.zeros((int(final_ensemble_mm.shape[0]),), dtype=np.int64)
+        voxel_counts = np.zeros((int(final_union_mm.shape[0]),), dtype=np.int64)
 
         def _count_voxels(z: int) -> None:
-            voxel_counts[int(z)] = np.int64(np.count_nonzero(np.asarray(final_ensemble_mm[int(z)])))
+            voxel_counts[int(z)] = np.int64(np.count_nonzero(np.asarray(final_union_mm[int(z)])))
 
         parallel_for_indices(
-            int(final_ensemble_mm.shape[0]),
+            int(final_union_mm.shape[0]),
             _count_voxels,
-            max_workers=choose_slice_parallel_workers(int(slice_postprocess_workers), int(final_ensemble_mm.shape[0])),
+            max_workers=choose_slice_parallel_workers(int(slice_postprocess_workers), int(final_union_mm.shape[0])),
             desc='Counting voxel_volume',
         )
         voxel_volume = int(np.sum(voxel_counts, dtype=np.int64))
@@ -8076,7 +8283,7 @@ def main() -> None:
             print('\n=== Saving radial outputs ===')
             final_paths.update(write_additional_view_outputs(
                 volume_rgb=volume_rgb,
-                mask_u8=final_ensemble_mm,
+                mask_u8=final_union_mm,
                 view=radial_view,
                 out_dir=out_dir,
                 stem=input_path.stem,
@@ -8097,7 +8304,7 @@ def main() -> None:
             for view in tilted_views:
                 final_paths.update(write_additional_view_outputs(
                     volume_rgb=volume_rgb,
-                    mask_u8=final_ensemble_mm,
+                    mask_u8=final_union_mm,
                     view=view,
                     out_dir=out_dir,
                     stem=input_path.stem,
@@ -8143,6 +8350,8 @@ def main() -> None:
         view_names=[v.name for v in views],
         view_prediction_stats=view_prediction_stats,
         interpolation_stats=interpolation_stats,
+        enable_3d_void_fill=bool(args.enable_3d_void_fill),
+        object_interpolation_smoothing_stats=object_interpolation_smoothing_stats,
         voxel_volume=voxel_volume,
         final_paths=final_paths,
         augmentation_workers=augmentation_workers,
@@ -8151,7 +8360,7 @@ def main() -> None:
         output_workers=output_workers,
     )
 
-    close_memmap_array(final_ensemble_mm)
+    close_memmap_array(final_union_mm)
     for model_support in native_view_support_by_model.values():
         for mm in model_support.values():
             close_memmap_array(mm)
