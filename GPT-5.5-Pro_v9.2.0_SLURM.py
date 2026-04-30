@@ -2,7 +2,7 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v9.1.0_SLURM single-channel-aligned script:
+This v9.2.0_SLURM single-channel-aligned script:
   - builds Transverse, optional Tilted Transverse, optional Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - renders parent/full-frame videos directly from the native view transform so inference no longer waits on
     a separately rendered canvas video, and derives non-radial tile videos from shared canvas batches so the
@@ -19,14 +19,13 @@ This v9.1.0_SLURM single-channel-aligned script:
     the same Lanczos-5 slices for every tile location
   - inverse-maps predictions only into each generated video's native view space, keeps Radial and Tilted
     Transverse results view-native through cleanup/interpolation, then backprojects them after per-view processing
-  - treats --model as a single YOLO segmentation model path; multiple-model inference is not supported in v9.1.0
+  - treats --model as a single YOLO segmentation model path; multiple-model inference is not supported in this script
   - applies final 3D void fill only when --enable_3d_void_fill is active, and only once after the global union
-  - applies --object_interpolation_smoothing as independent per-view frozen-state smoothing jobs
-    (Transverse, and Sagittal/Coronal when multiplanar inference is enabled) before unioning their
-    smoothed deltas back into the final native volume
-  - supports v9.1.0 Radial and Tilted Transverse view-native interpolation, and expands Tilted
+  - applies --object_interpolation_smoothing to the final unioned native object, with frozen-state
+    Transverse and optional Sagittal/Coronal deltas repeated by --object_interpolation_smoothing_passes
+  - supports Radial and Tilted Transverse view-native interpolation, and expands Tilted
     Transverse frame counts according to tilt angle so edge frames are represented with black padding
-  - saves the transverse default color overlay plus optional labels, single-channel binary masks, NRRD, multiplanar, radial,
+  - saves the transverse default color overlay plus optional labels, bilevel compressed TIFF binary masks, binary MKVs, NRRD, multiplanar, radial,
     tilted-transverse, image-sequence, low-quality, and TTA outputs, with FFV1 used for spec-required MKVs
 
 Dependencies (Python):
@@ -228,7 +227,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--enable_3d_void_fill", action="store_true",
                    help="Apply one final 3D enclosed-void fill after the global union. Disabled by default")
     p.add_argument("--object_interpolation_smoothing", action="store_true",
-                   help="Apply frozen-state object mask interpolation smoothing independently per eligible view, then union the smoothed deltas")
+                   help="Apply frozen-state object mask interpolation smoothing to the final unioned object")
+    p.add_argument("--object_interpolation_smoothing_passes", default=1, type=int,
+                   help="Apply --object_interpolation_smoothing this many passes, freezing the object state at the start of each pass")
 
     p.add_argument("--troubleshooting", action="store_true",
                    help="Keep temporary files and save outputs before each interpolation pass")
@@ -1478,32 +1479,6 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return True
 
 
-def radial_fast_path_enabled() -> bool:
-    """Fast blocked radial sampler override.
-
-    Default: disabled so the exact Lanczos-5 path remains the default.
-    Set YOLO_TTA_RADIAL_FAST=1 to opt into the faster OpenCV remap path.
-    """
-    return _env_flag('YOLO_TTA_RADIAL_FAST', False)
-
-
-def build_radial_block_maps(view: ViewInfo, angles_deg: Sequence[float]) -> Tuple[np.ndarray, np.ndarray]:
-    if view.family != 'radial':
-        raise ValueError('Radial block maps requested for a non-radial view')
-
-    diameter = int(view.diameter)
-    coords = np.linspace(-float(view.roi_radius), float(view.roi_radius), diameter, dtype=np.float32)
-    map_x = np.empty((len(angles_deg), diameter), dtype=np.float32)
-    map_y = np.empty((len(angles_deg), diameter), dtype=np.float32)
-
-    for i, angle_deg in enumerate(angles_deg):
-        theta = math.radians(float(angle_deg))
-        map_x[i, :] = np.asarray(float(view.center_x) + coords * math.cos(theta), dtype=np.float32)
-        map_y[i, :] = np.asarray(float(view.center_y) + coords * math.sin(theta), dtype=np.float32)
-
-    return map_x, map_y
-
-
 def write_aug_job_meta(job: AugJob, view: ViewInfo) -> None:
     job.meta_path.parent.mkdir(parents=True, exist_ok=True)
     job.meta_path.write_text(
@@ -2686,23 +2661,6 @@ def get_view_frame_by_index(
         return np.ascontiguousarray(volume_rgb[:, :, int(index)])
     if view.name == 'radial':
         angle_deg = float(view.azimuths_deg[int(index)])
-        if radial_fast_path_enabled():
-            map_x, map_y = build_radial_block_maps(view, [angle_deg])
-            map_x = np.ascontiguousarray(map_x.astype(np.float32, copy=False))
-            map_y = np.ascontiguousarray(map_y.astype(np.float32, copy=False))
-            out = np.empty((int(view.src_h), int(view.src_w)), dtype=np.uint8)
-            for t in range(T):
-                sampled = cv2.remap(
-                    np.asarray(volume_rgb[t]),
-                    map_x,
-                    map_y,
-                    interpolation=cv2.INTER_LANCZOS4,
-                    borderMode=cv2.BORDER_CONSTANT,
-                    borderValue=0,
-                )
-                out[t, :] = np.asarray(sampled[0])
-            return out
-
         sampler = get_radial_sampler(view, angle_deg)
         return np.ascontiguousarray(extract_radial_slice_frame(volume_rgb, sampler))
     if view.family == 'tilted_transverse':
@@ -6443,32 +6401,97 @@ def union_view_oriented_delta_into_native_inplace(
     return int(np.sum(added_by_slice, dtype=np.int64))
 
 
+
+def _axis_view_from_native_for_smoothing(native_mm: np.ndarray, view: ViewInfo) -> np.ndarray:
+    """Return a read-only orientation view of a native (t, Y, X) volume for smoothing."""
+    if view.name == 'transverse':
+        return np.asarray(native_mm)
+    if view.name == 'sagittal':
+        return np.transpose(np.asarray(native_mm), (1, 0, 2))
+    if view.name == 'coronal':
+        return np.transpose(np.asarray(native_mm), (2, 0, 1))
+    raise ValueError(f'Object interpolation smoothing is not defined for view: {view.name}')
+
+
+def _smooth_one_final_union_axis_to_delta(
+    *,
+    view: ViewInfo,
+    frozen_native_mm: np.ndarray,
+    labels_native_mm: np.ndarray,
+    smoothing_dir: Path,
+    pass_index: int,
+    keep_temp: bool,
+    workers: int,
+) -> ObjectSmoothingViewResult:
+    """Smooth one axis from the frozen final union and return a view-oriented delta volume."""
+    view_dir = smoothing_dir / f'pass{int(pass_index)}' / str(view.name)
+    view_dir.mkdir(parents=True, exist_ok=True)
+
+    frozen_axis_view = _axis_view_from_native_for_smoothing(frozen_native_mm, view)
+    labels_axis_view = _axis_view_from_native_for_smoothing(labels_native_mm, view)
+
+    delta_path = view_dir / f'{view.name}.smoothing_delta.u8.dat'
+    delta_mm: Optional[np.ndarray] = allocate_workspace_array(
+        shape=tuple(int(x) for x in frozen_axis_view.shape),
+        dtype=np.uint8,
+        path=delta_path,
+        desc=f'final-union/pass{int(pass_index)}/{view.name} object-smoothing delta',
+        prefer_memory=False,
+    )
+
+    added = _smooth_one_axis_from_frozen_labels(
+        dst_axis_view=delta_mm,
+        frozen_axis_view=frozen_axis_view,
+        labels_axis_view=labels_axis_view,
+        axis_name=f'{pretty_view_name(view)} pass {int(pass_index)}',
+        workers=int(workers),
+    )
+
+    if int(added) <= 0:
+        close_memmap_array(delta_mm)
+        if not bool(keep_temp):
+            try:
+                delta_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        delta_mm = None
+        delta_path_out: Optional[Path] = None
+    else:
+        delta_path_out = delta_path
+
+    return ObjectSmoothingViewResult(
+        view_name=str(view.name),
+        display_name=pretty_view_name(view),
+        added_voxels=int(added),
+        num_objects=0,
+        delta_mm=delta_mm,
+        delta_path=delta_path_out,
+    )
+
+
 def apply_object_interpolation_smoothing_inplace(
     mask_mm: np.ndarray,
-    view_support_by_model: Dict[str, Dict[str, np.ndarray]],
     views: Sequence[ViewInfo],
     temp_dir: Path,
     *,
     enable_multiplanar: bool,
+    smoothing_passes: int = 1,
     keep_temp: bool = False,
     workers: int = 1,
 ) -> Dict[str, int]:
-    """Apply v9.1.0 object interpolation smoothing as independent per-view jobs.
+    """Apply object interpolation smoothing to the final unioned native object volume.
 
-    Transverse smoothing is always sourced from the frozen Transverse parent-view support. Sagittal
-    and Coronal smoothing are sourced from their own frozen parent-view supports only when
-    ``--enable_multiplanar`` is active. Radial, Tilted Transverse, and tiled predictions are not
-    used as smoothing sources. Each eligible view writes a separate delta volume; all deltas are
-    unioned into ``mask_mm`` only after the view-level smoothing jobs have completed.
+    Each pass freezes the current final union, labels objects once in native 3D, creates
+    independent Transverse and optional Sagittal/Coronal N/N+2 -> N+1 smoothing deltas, and
+    unions those deltas back only after every axis job in that pass is complete.  Radial,
+    Tilted Transverse, and tiled views are therefore included as part of the final unioned
+    object geometry but are not treated as separate smoothing axes.
     """
-    if len(view_support_by_model) != 1:
-        raise ValueError('v9.1.0_SLURM supports exactly one --model; multiple-model smoothing has been removed')
-
-    model_name = next(iter(view_support_by_model.keys()))
-    support_by_view = view_support_by_model[model_name]
-    eligible_views = [v for v in _eligible_object_smoothing_views(views, bool(enable_multiplanar)) if v.name in support_by_view]
+    eligible_views = _eligible_object_smoothing_views(views, bool(enable_multiplanar))
 
     stats: Dict[str, int] = {
+        'passes_requested': int(smoothing_passes),
+        'passes_completed': 0,
         'transverse_added_voxels': 0,
         'sagittal_added_voxels': 0,
         'coronal_added_voxels': 0,
@@ -6488,54 +6511,97 @@ def apply_object_interpolation_smoothing_inplace(
     per_view_workers = max(1, int(workers) // max(1, view_workers))
     print(
         'Object interpolation smoothing view workers: '
-        f'{int(view_workers)} (per-view slice workers: {int(per_view_workers)})'
+        f'{int(view_workers)} (per-view slice workers: {int(per_view_workers)}, '
+        f'passes: {int(smoothing_passes)})'
     )
 
-    results: List[ObjectSmoothingViewResult] = []
-    with ThreadPoolExecutor(max_workers=int(view_workers), thread_name_prefix='object-smoothing-view') as executor:
-        future_to_view: Dict[Future, ViewInfo] = {}
-        for view in eligible_views:
-            future = executor.submit(
-                _smooth_one_view_volume_to_delta,
-                model_name=str(model_name),
-                view=view,
-                source_mm=support_by_view[view.name],
-                smoothing_dir=smoothing_dir,
-                keep_temp=bool(keep_temp),
-                workers=int(per_view_workers),
-            )
-            future_to_view[future] = view
+    ordered_names = ('transverse', 'sagittal', 'coronal')
 
-        for future in as_completed(future_to_view):
-            result = future.result()
-            results.append(result)
-            stats[f'{result.view_name}_added_voxels'] = int(result.added_voxels)
-            print(
-                f'Object interpolation smoothing finished for {result.display_name}: '
-                f'objects={int(result.num_objects)}, added_voxels={int(result.added_voxels)}'
-            )
+    for pass_idx in range(1, int(smoothing_passes) + 1):
+        pass_dir = smoothing_dir / f'pass{int(pass_idx)}'
+        pass_dir.mkdir(parents=True, exist_ok=True)
+        label_paths: List[Path] = []
+        labels_mm: Optional[np.ndarray] = None
+        pass_union_added = 0
 
-    for result in sorted(results, key=lambda r: ('transverse', 'sagittal', 'coronal').index(r.view_name) if r.view_name in ('transverse', 'sagittal', 'coronal') else 99):
-        if result.delta_mm is None or int(result.added_voxels) <= 0:
-            continue
-        view = next(v for v in eligible_views if v.name == result.view_name)
         try:
-            union_added = union_view_oriented_delta_into_native_inplace(
+            labels_mm, num_objects, label_paths = label_foreground_volume_streaming(
                 mask_mm,
-                result.delta_mm,
-                view,
-                workers=int(workers),
-                desc=f'Union object-smoothing delta ({result.display_name})',
+                pass_dir / 'final_union_frozen_labels',
+                keep_temp=True,
+                prefer_memory=False,
             )
-            stats[f'{result.view_name}_union_added_voxels'] = int(union_added)
-            stats['total_union_added_voxels'] += int(union_added)
-        finally:
-            close_memmap_array(result.delta_mm)
-            if not bool(keep_temp) and result.delta_path is not None:
+            stats[f'pass{int(pass_idx)}_num_objects'] = int(num_objects)
+            if int(num_objects) <= 0:
+                stats['passes_completed'] = int(pass_idx)
+                break
+
+            results: List[ObjectSmoothingViewResult] = []
+            with ThreadPoolExecutor(max_workers=int(view_workers), thread_name_prefix='object-smoothing-view') as executor:
+                future_to_view: Dict[Future, ViewInfo] = {}
+                for view in eligible_views:
+                    future = executor.submit(
+                        _smooth_one_final_union_axis_to_delta,
+                        view=view,
+                        frozen_native_mm=mask_mm,
+                        labels_native_mm=labels_mm,
+                        smoothing_dir=smoothing_dir,
+                        pass_index=int(pass_idx),
+                        keep_temp=bool(keep_temp),
+                        workers=int(per_view_workers),
+                    )
+                    future_to_view[future] = view
+
+                for future in as_completed(future_to_view):
+                    result = future.result()
+                    result.num_objects = int(num_objects)
+                    results.append(result)
+                    stats[f'{result.view_name}_added_voxels'] = int(stats.get(f'{result.view_name}_added_voxels', 0)) + int(result.added_voxels)
+                    stats[f'pass{int(pass_idx)}_{result.view_name}_added_voxels'] = int(result.added_voxels)
+                    print(
+                        f'Object interpolation smoothing finished for {result.display_name} pass {int(pass_idx)}: '
+                        f'objects={int(num_objects)}, added_voxels={int(result.added_voxels)}'
+                    )
+
+            for result in sorted(results, key=lambda r: ordered_names.index(r.view_name) if r.view_name in ordered_names else 99):
+                if result.delta_mm is None or int(result.added_voxels) <= 0:
+                    stats[f'pass{int(pass_idx)}_{result.view_name}_union_added_voxels'] = 0
+                    continue
+                view = next(v for v in eligible_views if v.name == result.view_name)
                 try:
-                    result.delta_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
+                    union_added = union_view_oriented_delta_into_native_inplace(
+                        mask_mm,
+                        result.delta_mm,
+                        view,
+                        workers=int(workers),
+                        desc=f'Union object-smoothing delta ({result.display_name} pass {int(pass_idx)})',
+                    )
+                    stats[f'{result.view_name}_union_added_voxels'] = int(stats.get(f'{result.view_name}_union_added_voxels', 0)) + int(union_added)
+                    stats[f'pass{int(pass_idx)}_{result.view_name}_union_added_voxels'] = int(union_added)
+                    stats['total_union_added_voxels'] += int(union_added)
+                    pass_union_added += int(union_added)
+                finally:
+                    close_memmap_array(result.delta_mm)
+                    if not bool(keep_temp) and result.delta_path is not None:
+                        try:
+                            result.delta_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+
+            stats[f'pass{int(pass_idx)}_total_union_added_voxels'] = int(pass_union_added)
+            stats['passes_completed'] = int(pass_idx)
+        finally:
+            if labels_mm is not None:
+                close_memmap_array(labels_mm)
+            if not bool(keep_temp):
+                for lp in label_paths:
+                    try:
+                        lp.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+        if int(pass_union_added) <= 0:
+            break
 
     flush_array(mask_mm)
     return stats
@@ -6683,8 +6749,19 @@ def _write_label_file_from_mask(mask2d: np.ndarray, out_path: Path) -> None:
 
 
 def _write_binary_tiff_frame(mask2d: np.ndarray, out_path: Path) -> None:
+    """Write one true bilevel binary TIFF frame with DEFLATE compression.
+
+    tifffile stores bool arrays as 1 bit/sample.  This satisfies the required monob
+    TIFF sequence while keeping mask semantics unambiguous: False = black, True = white.
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    tifffile.imwrite(str(out_path), (np.asarray(mask2d) * 255).astype(np.uint8))
+    mask_bool = np.asarray(mask2d, dtype=bool)
+    tifffile.imwrite(
+        str(out_path),
+        mask_bool,
+        photometric='minisblack',
+        compression='deflate',
+    )
 
 
 def write_yolo_labels_from_pattern(
@@ -7724,9 +7801,14 @@ def write_summary_file(
 
     if object_interpolation_smoothing_stats is not None:
         lines.append('')
-        lines.append('Object interpolation smoothing: enabled; per-view jobs are run independently and unioned after all smoothing jobs finish')
+        lines.append('Object interpolation smoothing: enabled; source is the final unioned native object after global view/tile union and optional 3D void fill')
         lines.append(
-            '  per-view added_voxels: '
+            '  passes: '
+            f"requested={int(object_interpolation_smoothing_stats.get('passes_requested', 1))}, "
+            f"completed={int(object_interpolation_smoothing_stats.get('passes_completed', 0))}"
+        )
+        lines.append(
+            '  per-axis generated delta voxels: '
             f"transverse={int(object_interpolation_smoothing_stats.get('transverse_added_voxels', 0))}, "
             f"sagittal={int(object_interpolation_smoothing_stats.get('sagittal_added_voxels', 0))}, "
             f"coronal={int(object_interpolation_smoothing_stats.get('coronal_added_voxels', 0))}"
@@ -7806,6 +7888,8 @@ def main() -> None:
         raise ValueError('--interpolation_candidates must be >= 1')
     if int(args.interpolate_passes) < 1:
         raise ValueError('--interpolate_passes must be >= 1')
+    if int(args.object_interpolation_smoothing_passes) < 1:
+        raise ValueError('--object_interpolation_smoothing_passes must be >= 1')
     if float(args.interpolate_min_radius) < 0:
         raise ValueError('--interpolate_min_radius must be >= 0')
     if float(args.min_radius) < 0:
@@ -8705,10 +8789,10 @@ def main() -> None:
         print('\n=== Applying object interpolation smoothing ===')
         object_interpolation_smoothing_stats = apply_object_interpolation_smoothing_inplace(
             final_union_mm,
-            view_support_by_model=native_view_support_by_model,
             views=views,
             temp_dir=temp_dir,
             enable_multiplanar=bool(args.enable_multiplanar),
+            smoothing_passes=int(args.object_interpolation_smoothing_passes),
             keep_temp=bool(args.troubleshooting),
             workers=slice_postprocess_workers,
         )
