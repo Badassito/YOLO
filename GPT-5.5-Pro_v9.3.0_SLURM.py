@@ -2,7 +2,7 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v9.2.0_SLURM single-channel-aligned script:
+This v9.3.0_SLURM single-channel-aligned script:
   - builds Transverse, optional Tilted Transverse, optional Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - renders parent/full-frame videos directly from the native view transform so inference no longer waits on
     a separately rendered canvas video, and derives non-radial tile videos from shared canvas batches so the
@@ -16,7 +16,7 @@ This v9.2.0_SLURM single-channel-aligned script:
     (notably min_conf filtering, 2D hole filling, and min_radius where applicable)
   - overlaps GPU inference with CPU-side view interpolation, consolidated-tile interpolation, and output writing
   - reuses a native radial frame cache during dense tiled rendering so radial tiles do not recompute
-    the same Lanczos-5 slices for every tile location
+    the same Lanczos-3 slices for every tile location
   - inverse-maps predictions only into each generated video's native view space, keeps Radial and Tilted
     Transverse results view-native through cleanup/interpolation, then backprojects them after per-view processing
   - treats --model as a single YOLO segmentation model path; multiple-model inference is not supported in this script
@@ -195,6 +195,8 @@ def build_argparser() -> argparse.ArgumentParser:
 
     p.add_argument("--enable_multiplanar", action="store_true",
                    help="Enable Sagittal and Coronal Cartesian views in addition to the required Transverse view")
+    p.add_argument("--disable_transverse", action="store_true",
+                   help="Skip standard Transverse full-frame and tiled inferencing only; Transverse output geometry remains available")
     p.add_argument("--azimuth_angle", default=0.0, type=float,
                    help="Angular spacing in degrees for radial diameter slices over [0,180]. 0 disables radial views")
     p.add_argument("--tilt_angle", nargs="+", default=["0"], type=str,
@@ -336,7 +338,7 @@ def _cpu_count() -> int:
 def default_worker_budget() -> int:
     """Intentional CPU oversubscription for mixed GPU/IO/CPU workloads.
 
-    The v9.1.0 SLURM target has enough CPU headroom that running roughly 2x the visible CPU count
+    The v9.3.0 SLURM target has enough CPU headroom that running roughly 2x the visible CPU count
     helps keep ffmpeg, view rendering, interpolation planning, and output writers busy while the GPU
     is inferencing or waiting on a different stage.
     """
@@ -1199,7 +1201,7 @@ def compute_tilt_frame_range(
     """Return inclusive native-center frame range for a Tilted Transverse stack.
 
     A tilted frame centered at native slice coordinate ``N`` samples
-    ``t = N + tan(alpha) * (axis - center)``.  v9.1.0 requires the generated
+    ``t = N + tan(alpha) * (axis - center)``.  v9.3.0 requires the generated
     tilted video to include the incomplete edge frames introduced by this shear,
     rather than forcing the frame count to remain equal to the input transverse
     frame count.  We therefore include every integer center coordinate whose
@@ -1379,12 +1381,24 @@ class RadialSampler:
 
 _RADIAL_SAMPLER_CACHE: Dict[Tuple[int, int, int, float], RadialSampler] = {}
 
+RADIAL_LANCZOS_A = 3
 
-def _lanczos_kernel(x: np.ndarray, a: int = 5) -> np.ndarray:
+
+def _lanczos_kernel(x: np.ndarray, a: int = RADIAL_LANCZOS_A) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
     out = np.sinc(x) * np.sinc(x / float(a))
     out[np.abs(x) >= float(a)] = 0.0
     return out.astype(np.float32, copy=False)
+
+
+def _lanczos_offsets(a: int = RADIAL_LANCZOS_A) -> np.ndarray:
+    """Integer support offsets for a Lanczos-a kernel around floor(sample)."""
+    a_i = max(1, int(a))
+    return np.arange(-(a_i - 1), a_i + 1, dtype=np.int32)
+
+
+def _lanczos_tap_count(a: int = RADIAL_LANCZOS_A) -> int:
+    return int(_lanczos_offsets(int(a)).size)
 
 
 def get_radial_sampler(view: ViewInfo, angle_deg: float) -> RadialSampler:
@@ -1402,15 +1416,15 @@ def get_radial_sampler(view: ViewInfo, angle_deg: float) -> RadialSampler:
     xs = np.asarray(float(view.center_x) + coords * math.cos(theta), dtype=np.float32)
     ys = np.asarray(float(view.center_y) + coords * math.sin(theta), dtype=np.float32)
 
-    offsets = np.arange(-4, 6, dtype=np.int32)
+    offsets = _lanczos_offsets(RADIAL_LANCZOS_A)
     x0 = np.floor(xs).astype(np.int32, copy=False)
     y0 = np.floor(ys).astype(np.int32, copy=False)
 
     x_idx_raw = x0[:, None] + offsets[None, :]
     y_idx_raw = y0[:, None] + offsets[None, :]
 
-    x_w = _lanczos_kernel(xs[:, None] - x_idx_raw, a=5)
-    y_w = _lanczos_kernel(ys[:, None] - y_idx_raw, a=5)
+    x_w = _lanczos_kernel(xs[:, None] - x_idx_raw, a=RADIAL_LANCZOS_A)
+    y_w = _lanczos_kernel(ys[:, None] - y_idx_raw, a=RADIAL_LANCZOS_A)
 
     x_valid = (x_idx_raw >= 0) & (x_idx_raw < int(view.full_w))
     y_valid = (y_idx_raw >= 0) & (y_idx_raw < int(view.full_h))
@@ -1442,7 +1456,7 @@ def choose_radial_exact_block_frames(diameter: int, target_bytes: int = 256 * 10
         except Exception:
             pass
 
-    bytes_per_frame = max(1, int(diameter) * 10 * np.dtype(np.float32).itemsize)
+    bytes_per_frame = max(1, int(diameter) * _lanczos_tap_count(RADIAL_LANCZOS_A) * np.dtype(np.float32).itemsize)
     block = max(1, int(target_bytes // bytes_per_frame))
     return max(1, min(256, block))
 
@@ -2554,7 +2568,7 @@ def should_cache_view_frames(view: ViewInfo, dense_tiling_active: bool) -> bool:
     """Return True when precomputing native single-channel frames is worthwhile for this view.
 
     Radial view extraction is the dominant CPU cost during dense tiled rendering because every
-    tile video currently traverses the same expensive Lanczos-5 radial slices independently.
+    tile video currently traverses the same expensive Lanczos-3 radial slices independently.
     Caching the native radial frames once lets both full-frame augmentation and all tile videos
     reuse that work.
     """
@@ -3727,7 +3741,7 @@ def fill_3d_voids_inplace_streaming(
 ) -> None:
     """Fill enclosed 3D voids by labeling background connected components once.
 
-    v9.1.0 allows 3D void fill only as an optional final global-union step. This
+    v9.3.0 allows 3D void fill only as an optional final global-union step. This
     function performs that operation by labeling the background volume, marking any
     background component connected to the volume boundary, and converting all other
     background components to foreground. The default 6-connected background matches
@@ -4038,6 +4052,98 @@ def apply_view_min_radius_filter_inplace(
     flush_array(mask_mm)
 
 
+@dataclass(frozen=True)
+class RadialBackprojectionSample:
+    angle_deg: float
+    source_index: int
+    reverse_u: bool = False
+
+
+def radial_full_coverage_angle_deg(diameter: int) -> float:
+    """Return the v9.3.0 radial spacing that gives approximately 1x ROI edge coverage."""
+    diameter_i = max(1, int(diameter))
+    return float(360.0 / (math.pi * float(diameter_i)))
+
+
+def _radial_view_nominal_spacing_deg(radial_view: ViewInfo) -> float:
+    az = list(float(a) for a in radial_view.azimuths_deg)
+    if len(az) >= 2:
+        return float(abs(az[1] - az[0]))
+    return 180.0
+
+
+def _nearest_radial_source_for_backprojection(
+    target_angle_deg: float,
+    source_angles_deg: np.ndarray,
+) -> Tuple[int, bool]:
+    """Nearest source plane over the unoriented [0, 180) radial diameter domain.
+
+    When the nearest match crosses the 0/180 boundary, the same diameter plane is reused with
+    the radial coordinate reversed so source raster coordinates still map to the target plane.
+    """
+    if source_angles_deg.size <= 0:
+        raise ValueError('No radial source angles are available for backprojection')
+
+    raw = float(target_angle_deg) - source_angles_deg.astype(np.float64, copy=False)
+    wrapped = ((raw + 90.0) % 180.0) - 90.0
+    idx = int(np.argmin(np.abs(wrapped)))
+    reverse_u = bool(abs(float(raw[idx])) > 90.0)
+    return idx, reverse_u
+
+
+def build_radial_backprojection_plan(radial_view: ViewInfo) -> Tuple[List[RadialBackprojectionSample], Dict[str, float]]:
+    """Build the angular plan used to backproject a radial view into Cartesian space.
+
+    If the user-requested radial spacing is coarser than the v9.3.0 full-coverage spacing,
+    backprojection is densified to the full-coverage spacing and each dense angle samples the
+    nearest completed radial prediction frame. This keeps Radial masks view-native through
+    postprocessing/interpolation while preventing sparse spoke-like Cartesian backprojections.
+    """
+    source_angles = np.asarray([float(a) for a in radial_view.azimuths_deg], dtype=np.float64)
+    if source_angles.size <= 0:
+        return [], {
+            'provided_spacing_deg': 0.0,
+            'coverage_spacing_deg': radial_full_coverage_angle_deg(int(radial_view.diameter)),
+            'effective_spacing_deg': 0.0,
+            'source_frames': 0.0,
+            'backprojection_angles': 0.0,
+            'densified': 0.0,
+        }
+
+    provided_spacing = _radial_view_nominal_spacing_deg(radial_view)
+    coverage_spacing = radial_full_coverage_angle_deg(int(radial_view.diameter))
+    # The specification's guarantee formula is a maximum safe angular spacing.  A smaller
+    # user spacing is already dense enough; a larger spacing is densified during backprojection.
+    effective_spacing = min(float(provided_spacing), float(coverage_spacing))
+
+    if float(provided_spacing) <= float(coverage_spacing) * (1.0 + 1e-9):
+        samples = [
+            RadialBackprojectionSample(angle_deg=float(angle), source_index=int(idx), reverse_u=False)
+            for idx, angle in enumerate(source_angles.tolist())
+        ]
+        densified = False
+    else:
+        dense_angles = build_radial_azimuths(float(effective_spacing))
+        samples = []
+        for dense_angle in dense_angles:
+            source_idx, reverse_u = _nearest_radial_source_for_backprojection(float(dense_angle), source_angles)
+            samples.append(RadialBackprojectionSample(
+                angle_deg=float(dense_angle),
+                source_index=int(source_idx),
+                reverse_u=bool(reverse_u),
+            ))
+        densified = True
+
+    return samples, {
+        'provided_spacing_deg': float(provided_spacing),
+        'coverage_spacing_deg': float(coverage_spacing),
+        'effective_spacing_deg': float(effective_spacing),
+        'source_frames': float(source_angles.size),
+        'backprojection_angles': float(len(samples)),
+        'densified': 1.0 if bool(densified) else 0.0,
+    }
+
+
 def backproject_radial_volume_to_volume(
     radial_mask_mm: np.ndarray,
     radial_view: ViewInfo,
@@ -4046,6 +4152,7 @@ def backproject_radial_volume_to_volume(
     *,
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
+    workers: int = 1,
 ) -> np.ndarray:
     if radial_view.family != 'radial':
         raise ValueError('backproject_radial_volume_to_volume expects a radial view')
@@ -4063,19 +4170,47 @@ def backproject_radial_volume_to_volume(
         reserve_bytes=int(reserve_bytes),
     )
 
-    for angle_idx, angle_deg in enumerate(tqdm(radial_view.azimuths_deg, desc=desc)):
-        radial_mask = np.asarray(radial_mask_mm[int(angle_idx)], dtype=bool)
+    plan, plan_stats = build_radial_backprojection_plan(radial_view)
+    if bool(plan_stats.get('densified', 0.0)):
+        print(
+            f"{desc}: densifying radial backprojection for continuity "
+            f"from {int(plan_stats['source_frames'])} source frame(s) at "
+            f"{float(plan_stats['provided_spacing_deg']):.6g}° spacing to "
+            f"{int(plan_stats['backprojection_angles'])} backprojection angle(s) at "
+            f"{float(plan_stats['effective_spacing_deg']):.6g}° spacing "
+            f"(full-coverage threshold {float(plan_stats['coverage_spacing_deg']):.6g}°)"
+        )
+
+    if not plan:
+        flush_array(vol_mm)
+        return vol_mm
+
+    worker_count = choose_slice_parallel_workers(int(workers), len(plan))
+
+    def _backproject_sample(sample_idx: int) -> None:
+        sample = plan[int(sample_idx)]
+        radial_mask = np.asarray(radial_mask_mm[int(sample.source_index)], dtype=bool)
+        if bool(sample.reverse_u):
+            radial_mask = np.ascontiguousarray(radial_mask[:, ::-1])
         if not np.any(radial_mask):
-            continue
+            return
         tt, uu = np.nonzero(radial_mask)
         if tt.size == 0:
-            continue
-        sampler = get_radial_sampler(radial_view, float(angle_deg))
-        vol_mm[tt, sampler.nn_y[uu], sampler.nn_x[uu]] = 1
+            return
+        sampler = get_radial_sampler(radial_view, float(sample.angle_deg))
+        vol_mm[tt, sampler.nn_y[uu], sampler.nn_x[uu]] = np.uint8(1)
+
+    parallel_for_indices_chunked(
+        len(plan),
+        _backproject_sample,
+        max_workers=worker_count,
+        desc=desc,
+        show_progress=True,
+        target_chunks_per_worker=4,
+    )
 
     flush_array(vol_mm)
     return vol_mm
-
 
 def backproject_tilted_volume_to_volume(
     tilted_mask_mm: np.ndarray,
@@ -4085,13 +4220,15 @@ def backproject_tilted_volume_to_volume(
     *,
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
+    workers: int = 1,
 ) -> np.ndarray:
     """Backproject a Tilted Transverse view-native mask stack into native (t, Y, X).
 
     The tilted view stack remains in generated-video coordinates through cleanup and
     interpolation.  Only at final assembly do we map each foreground pixel from frame
     center ``N`` and native XY coordinates back to the original orthogonal volume using
-    ``t = N + tan(alpha) * axis_offset``.
+    ``t = N + tan(alpha) * axis_offset``. Frame projections are independent and are
+    parallelized; concurrent writes are idempotent foreground assignments.
     """
     if tilted_view.family != 'tilted_transverse':
         raise ValueError('backproject_tilted_volume_to_volume expects a tilted transverse view')
@@ -4119,13 +4256,15 @@ def backproject_tilted_volume_to_volume(
     else:  # pragma: no cover
         raise ValueError(f'Unsupported tilt direction: {tilted_view.tilt_direction}')
 
-    for frame_idx in tqdm(range(int(tilted_view.num_slices)), desc=desc):
+    worker_count = choose_slice_parallel_workers(int(workers), int(tilted_view.num_slices))
+
+    def _backproject_frame(frame_idx: int) -> None:
         tilted_mask = np.asarray(tilted_mask_mm[int(frame_idx)], dtype=bool)
         if not np.any(tilted_mask):
-            continue
+            return
         yy, xx = np.nonzero(tilted_mask)
         if yy.size <= 0:
-            continue
+            return
 
         frame_center = float(tilted_frame_center(tilted_view, int(frame_idx)))
         if str(tilted_view.tilt_direction) == 'vertical':
@@ -4136,12 +4275,20 @@ def backproject_tilted_volume_to_volume(
         tt = np.rint(t_float).astype(np.int32, copy=False)
         valid = (tt >= 0) & (tt < t_dim)
         if not np.any(valid):
-            continue
+            return
         vol_mm[tt[valid], yy[valid], xx[valid]] = np.uint8(1)
+
+    parallel_for_indices_chunked(
+        int(tilted_view.num_slices),
+        _backproject_frame,
+        max_workers=worker_count,
+        desc=desc,
+        show_progress=True,
+        target_chunks_per_worker=4,
+    )
 
     flush_array(vol_mm)
     return vol_mm
-
 
 def assemble_view_volumes_into_native_union(
     final_union_mm: np.ndarray,
@@ -4247,11 +4394,11 @@ def assemble_current_view_union_volume(
     """Build the single-model final view union.
 
     The mapping is kept keyed by model name because earlier pipeline stages store temporary
-    workspaces under the model stem. v9.1.0 rejects multiple model entries and never
+    workspaces under the model stem. v9.3.0 rejects multiple model entries and never
     combines outputs from more than one model.
     """
     if len(view_volumes_by_model) != 1:
-        raise ValueError('v9.1.0_SLURM supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('v9.3.0_SLURM supports exactly one --model; multiple-model inference has been removed')
 
     model_name = next(iter(view_volumes_by_model.keys()))
     final_union_mm = allocate_workspace_array(
@@ -5024,7 +5171,7 @@ def _build_slice_endpoint_seeds(
       - ``scan``: always use the fast slice-graph terminal scan
       - ``skeleton``: always use per-object 3D skeletonization
 
-    The hybrid path keeps 3D skeletonization as the default v9.1.0-compliant behavior while still
+    The hybrid path keeps 3D skeletonization as the default v9.3.0-compliant behavior while still
     protecting large SLURM-scale volumes from pathological all-voxel skeletonization costs.
     """
     mode = os.environ.get('YOLO_TTA_INTERPOLATION_ENDPOINT_MODE', 'hybrid').strip().lower()
@@ -5761,6 +5908,7 @@ def prepare_view_volume_after_fullframe(
             out_path=out_path,
             desc=f'Backprojecting {model_name}/{view.name}',
             prefer_memory=False,
+            workers=int(slice_workers),
         )
         if float(min_radius) > 0.0:
             print(f"Applying --min_radius in the transverse plane for backprojected view '{view.name}'")
@@ -5777,6 +5925,7 @@ def prepare_view_volume_after_fullframe(
             out_path=out_path,
             desc=f'Backprojecting {model_name}/{view.name}',
             prefer_memory=False,
+            workers=int(slice_workers),
         )
     else:
         final_view_volume = baseline_native_volume
@@ -5801,7 +5950,7 @@ def gate_tile_volume_against_parent_inplace(
     """Keep only tile components that intersect the frozen parent support on the same slice.
 
     The gating result for one slice never affects another slice, so this stage can be parallelized
-    aggressively across the slice axis without violating the v9.1.0_SLURM semantics.
+    aggressively across the slice axis without violating the v9.3.0_SLURM semantics.
     """
     num_slices = int(tile_mask_mm.shape[0])
     accepted_components = np.zeros((num_slices,), dtype=np.int64)
@@ -5960,7 +6109,7 @@ def gate_tile_volume_into_consolidated_parent(
 ) -> TileGateResult:
     """Gate one tile volume, then OR accepted components into the parent-view tile accumulator.
 
-    v9.1.0 intentionally consolidates all accepted tiles for a parent view before interpolation.
+    v9.3.0 intentionally consolidates all accepted tiles for a parent view before interpolation.
     This replaces the previous per-tile interpolation path while preserving the mask-wise OR gate:
     accepted tile components still must intersect the frozen parent full-frame support, and accepted
     tiles cannot accept other tiles because the support image is not the accumulator.
@@ -7293,7 +7442,7 @@ def build_troubleshooting_pass_union(
     workers: int,
 ) -> np.ndarray:
     if len(model_names) != 1:
-        raise ValueError('v9.1.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
+        raise ValueError('v9.3.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     view_volumes_for_pass: Dict[str, Dict[str, np.ndarray]] = {str(model_name): {} for model_name in model_names}
     intermediate_volumes: List[np.ndarray] = []
 
@@ -7325,6 +7474,7 @@ def build_troubleshooting_pass_union(
                             ),
                             desc=f'Backprojecting troubleshooting pass {int(pass_index)} {model_name}/{view.name}',
                             prefer_memory=False,
+                            workers=int(workers),
                         )
                         intermediate_volumes.append(radial_volume)
                     if float(min_radius) > 0.0:
@@ -7347,6 +7497,7 @@ def build_troubleshooting_pass_union(
                             ),
                             desc=f'Backprojecting troubleshooting pass {int(pass_index)} {model_name}/{view.name}',
                             prefer_memory=False,
+                            workers=int(workers),
                         )
                         intermediate_volumes.append(tilted_volume)
                     view_volumes_for_pass[str(model_name)][view.name] = tilted_volume
@@ -7354,7 +7505,7 @@ def build_troubleshooting_pass_union(
                     view_volumes_for_pass[str(model_name)][view.name] = native_union
 
         # Troubleshooting pass outputs are stage snapshots taken before the corresponding
-        # interpolation pass. They must not run the final 3D void fill; v9.1.0 keeps
+        # interpolation pass. They must not run the final 3D void fill; v9.3.0 keeps
         # 3D void fill out of troubleshooting pre-pass outputs and applies it only when
         # --enable_3d_void_fill is active for the normal final output.
         pass_union = assemble_current_view_union_volume(
@@ -7399,7 +7550,7 @@ def schedule_troubleshooting_pass_outputs(
     workers: int,
 ) -> Dict[str, Path]:
     if len(model_names) != 1:
-        raise ValueError('v9.1.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
+        raise ValueError('v9.3.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     if int(total_passes) < 0 or not snapshot_refs:
         return {}
 
@@ -7578,7 +7729,7 @@ def union_view_volume_for_single_model(
     workers: int = 1,
 ) -> np.ndarray:
     if len(view_volumes_by_model) != 1:
-        raise ValueError('v9.1.0_SLURM supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('v9.3.0_SLURM supports exactly one --model; multiple-model inference has been removed')
     model_name = next(iter(view_volumes_by_model.keys()))
     if view_name not in view_volumes_by_model[model_name]:
         raise KeyError(f'No view volume found for {view_name}')
@@ -7677,9 +7828,16 @@ def save_tta_outputs(
     show_progress: bool = True,
 ) -> Dict[str, Path]:
     result_paths: Dict[str, Path] = {}
+    model_name = next(iter(view_volumes_by_model.keys())) if view_volumes_by_model else ''
     for view in views:
         aug_jobs = list(aug_jobs_by_view.get(view.name, []))
         if not aug_jobs:
+            continue
+        if model_name and view.name not in view_volumes_by_model.get(model_name, {}):
+            print(
+                f"Warning: --save_TTA skipping {view.name}; no prediction volume was generated "
+                "for this view (for example, because --disable_transverse is active)."
+            )
             continue
         union_mask = union_view_volume_for_single_model(
             view.name,
@@ -7730,6 +7888,7 @@ def write_summary_file(
     slice_postprocess_workers: int,
     interpolation_workers: int,
     output_workers: int,
+    spec_notes: Optional[Sequence[str]] = None,
 ) -> Path:
     lines: List[str] = []
     lines.append(f'Command: {command}')
@@ -7749,6 +7908,11 @@ def write_summary_file(
     lines.append('Worker oversubscription: intentional; the default worker budget targets 2x the visible CPU allocation to overlap GPU waits, ffmpeg IO, and slice-parallel CPU work.')
     lines.append(f'Model: {str(Path(model_paths[0])) if model_paths else "<none>"}')
     lines.append(f'Views: {", ".join(view_names)}')
+    if spec_notes:
+        lines.append('')
+        lines.append('Specification notes:')
+        for note in spec_notes:
+            lines.append(f'  - {note}')
 
     lines.append('')
     lines.append('View statistics:')
@@ -7867,7 +8031,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('v9.1.0_SLURM accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('v9.3.0_SLURM accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -7942,12 +8106,24 @@ def main() -> None:
         tilt_directions=tilt_directions,
     )
     cartesian_views = orthogonal_views_only(views)
-    interpolating_views = [v for v in views if _view_uses_interpolation(v, int(args.interpolate))]
+    transverse_inference_disabled = bool(args.disable_transverse)
+    inference_views = [v for v in views if not (transverse_inference_disabled and v.name == 'transverse')]
+    interpolating_views = [v for v in inference_views if _view_uses_interpolation(v, int(args.interpolate))]
+    spec_notes: List[str] = []
+    if transverse_inference_disabled:
+        note = (
+            'v9.3.0 specification note: Section 2.1.1 says Transverse must always be created, while '
+            'View Flags item 1 adds --disable_transverse to skip Transverse inferencing. This implementation '
+            'keeps Transverse geometry/output paths available and removes only the standard Transverse full-frame '
+            'and tiled prediction jobs.'
+        )
+        spec_notes.append(note)
+        print(note)
 
     model_name = Path(model_paths[0]).stem
     print(f'Loading model: {model_name} ({model_paths[0]})')
     yolo_model = load_ultralytics_model(model_paths[0], task='segment')
-    # v9.1.0 has no multiple-model inference. A single-item list is retained only to minimize churn in
+    # v9.3.0 has no multiple-model inference. A single-item list is retained only to minimize churn in
     # scheduling structures keyed by model stem.
     yolo_models: List[Tuple[str, object]] = [(model_name, yolo_model)]
     yolo_by_model_name: Dict[str, object] = {model_name: yolo_model}
@@ -7965,7 +8141,7 @@ def main() -> None:
         0,
         'YOLO_TTA_AUG_WORKERS',
         worker_budget,
-        max_tasks=max(1, max(v.num_slices for v in views)),
+        max_tasks=max(1, max((v.num_slices for v in inference_views), default=1)),
     )
     interpolation_workers = resolve_worker_count(
         0,
@@ -7982,7 +8158,7 @@ def main() -> None:
     slice_postprocess_workers = max(1, int(augmentation_workers))
     predict_postprocess_workers = max(1, min(32, _env_int('YOLO_TTA_PREDICT_POSTPROCESS_WORKERS', slice_postprocess_workers)))
 
-    parent_postprocess_workers = max(1, min(int(interpolation_workers), max(1, len(yolo_models) * max(1, len(views)))))
+    parent_postprocess_workers = max(1, min(int(interpolation_workers), max(1, len(yolo_models) * max(1, len(inference_views)))))
     parent_interpolation_task_workers = max(
         1,
         min(16, _env_int('YOLO_TTA_INTERPOLATION_TASK_WORKERS', max(1, _cpu_count() // max(1, parent_postprocess_workers)))),
@@ -8052,6 +8228,7 @@ def main() -> None:
         for ref in snapshots.values():
             pass_snapshot_refs[(str(ref.source), str(ref.model_name), str(ref.view_name), int(ref.pass_index))] = ref
 
+    inference_view_names = {v.name for v in inference_views}
     for view in views:
         jobs = build_aug_jobs_for_view(
             view=view,
@@ -8061,7 +8238,7 @@ def main() -> None:
         )
         aug_jobs_by_view[view.name] = jobs
         aug_job_lookup_by_view[view.name] = {job.aug_id: job for job in jobs}
-        if dense_tiling_active:
+        if dense_tiling_active and view.name in inference_view_names:
             jobs_by_config: Dict[str, List[DenseTileJob]] = {}
             for tile_cfg in tile_configs:
                 cfg_jobs: List[DenseTileJob] = []
@@ -8082,7 +8259,7 @@ def main() -> None:
 
     tile_expected_by_parent: Dict[Tuple[str, str], int] = {}
     if dense_tiling_active:
-        for view in views:
+        for view in inference_views:
             expected_for_view = sum(
                 len(tile_jobs_by_aug.get((view.name, aug_job.aug_id), []))
                 for aug_job in aug_jobs_by_view.get(view.name, [])
@@ -8094,7 +8271,7 @@ def main() -> None:
 
     view_frame_caches: Dict[str, np.ndarray] = {}
     view_frame_cache_paths: Dict[str, Path] = {}
-    for view in views:
+    for view in inference_views:
         if should_cache_view_frames(view, dense_tiling_active):
             cache_path = temp_dir / 'view_frames' / f'{view.name}.gray8.dat'
             cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -8114,7 +8291,7 @@ def main() -> None:
     baseline_confmap_paths: Dict[Tuple[str, str], Path] = {}
     fullframe_remaining: Dict[Tuple[str, str], int] = {}
 
-    for view in views:
+    for view in inference_views:
         for model_name, _ in yolo_models:
             union_path = temp_dir / 'union' / model_name / f'{view.name}.union.u8.dat'
             confmap_path = temp_dir / 'union' / model_name / f'{view.name}.confmap.u8.dat'
@@ -8138,21 +8315,21 @@ def main() -> None:
             baseline_confmap_paths[(model_name, view.name)] = confmap_path
             fullframe_remaining[(model_name, view.name)] = int(len(aug_jobs_by_view[view.name]))
 
-    total_fullframe_jobs = sum(len(v) for v in aug_jobs_by_view.values())
+    total_fullframe_jobs = sum(len(aug_jobs_by_view.get(view.name, [])) for view in inference_views)
     total_initial_tile_jobs = sum(
         len(tile_jobs_by_aug.get((view.name, aug_job.aug_id), []))
-        for view in views if view.family != 'radial'
+        for view in inference_views if view.family != 'radial'
         for aug_job in aug_jobs_by_view[view.name]
     )
     total_canvas_render_tasks = sum(
         1
-        for view in views if view.family != 'radial'
+        for view in inference_views if view.family != 'radial'
         for aug_job in aug_jobs_by_view[view.name]
         if tile_jobs_by_aug.get((view.name, aug_job.aug_id), [])
     )
     total_tile_render_batches = sum(
         1
-        for view in views
+        for view in inference_views
         for aug_job in aug_jobs_by_view[view.name]
         if tile_jobs_by_aug.get((view.name, aug_job.aug_id), [])
     )
@@ -8202,7 +8379,7 @@ def main() -> None:
     tile_batch_video_futures: Dict[Future, Tuple[ViewInfo, Tuple[DenseTileJob, ...]]] = {}
     pending_fullframe_futures: set[Future] = set()
     pending_tile_video_futures: set[Future] = set()
-    rendered_tile_jobs_by_view: Dict[str, Dict[str, DenseTileJob]] = {view.name: {} for view in views}
+    rendered_tile_jobs_by_view: Dict[str, Dict[str, DenseTileJob]] = {view.name: {} for view in inference_views}
     tile_batch_render_submitted: set[Tuple[str, str]] = set()
 
     ready_fullframe: deque[Tuple[ViewInfo, AugJob]] = deque()
@@ -8286,10 +8463,10 @@ def main() -> None:
             return
         pending_tile_batches_by_aug[batch_key] = (view, aug_job, tile_jobs)
 
-    for view, aug_job in iter_aug_jobs_round_robin(views, aug_jobs_by_view):
+    for view, aug_job in iter_aug_jobs_round_robin(inference_views, aug_jobs_by_view):
         _submit_fullframe_video(view, aug_job)
 
-    for view, aug_job in iter_aug_jobs_round_robin(views, aug_jobs_by_view):
+    for view, aug_job in iter_aug_jobs_round_robin(inference_views, aug_jobs_by_view):
         if dense_tiling_active and view.family != 'radial':
             tile_jobs = tile_jobs_by_aug.get((view.name, aug_job.aug_id), [])
             if tile_jobs:
@@ -8718,54 +8895,76 @@ def main() -> None:
     view_frame_caches.clear()
     view_frame_cache_paths.clear()
 
+    final_backprojection_jobs: List[Tuple[str, ViewInfo, np.ndarray]] = []
     for view in views:
-        if view.family != 'radial':
+        if view.family not in ('radial', 'tilted_transverse'):
             continue
         for model_name, _ in yolo_models:
             if view.name in view_volumes_by_model[model_name]:
                 continue
-            radial_native = radial_native_output_by_model[model_name].get(view.name)
-            if radial_native is None:
-                radial_native = native_view_support_by_model[model_name].get(view.name)
-            if radial_native is None:
+            if view.family == 'radial':
+                native_source = radial_native_output_by_model[model_name].get(view.name)
+            else:
+                native_source = tilted_native_output_by_model[model_name].get(view.name)
+            if native_source is None:
+                native_source = native_view_support_by_model[model_name].get(view.name)
+            if native_source is None:
                 continue
-            out_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.u8.dat'
-            radial_volume = backproject_radial_volume_to_volume(
-                radial_mask_mm=radial_native,
-                radial_view=view,
-                out_path=out_path,
-                desc=f'Backprojecting final {model_name}/{view.name}',
-                prefer_memory=False,
-            )
-            if float(args.min_radius) > 0:
-                print(f"Applying --min_radius in the transverse plane for backprojected view '{view.name}'")
-                apply_transverse_min_radius_filter_inplace(
-                    radial_volume,
-                    float(args.min_radius),
-                    workers=slice_postprocess_workers,
-                )
-            view_volumes_by_model[model_name][view.name] = radial_volume
+            final_backprojection_jobs.append((str(model_name), view, native_source))
 
-    for view in views:
-        if view.family != 'tilted_transverse':
-            continue
-        for model_name, _ in yolo_models:
-            if view.name in view_volumes_by_model[model_name]:
-                continue
-            tilted_native = tilted_native_output_by_model[model_name].get(view.name)
-            if tilted_native is None:
-                tilted_native = native_view_support_by_model[model_name].get(view.name)
-            if tilted_native is None:
-                continue
-            out_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.u8.dat'
-            tilted_volume = backproject_tilted_volume_to_volume(
-                tilted_mask_mm=tilted_native,
-                tilted_view=view,
-                out_path=out_path,
-                desc=f'Backprojecting final {model_name}/{view.name}',
-                prefer_memory=False,
-            )
-            view_volumes_by_model[model_name][view.name] = tilted_volume
+    if final_backprojection_jobs:
+        requested_backproject_view_workers = _env_int(
+            'YOLO_TTA_BACKPROJECT_VIEW_WORKERS',
+            min(len(final_backprojection_jobs), max(1, _cpu_count() // 16)),
+        )
+        backproject_view_workers = max(1, min(len(final_backprojection_jobs), int(requested_backproject_view_workers)))
+        per_backproject_workers = max(1, int(slice_postprocess_workers) // max(1, int(backproject_view_workers)))
+        print(
+            f'Final view backprojection workers: {int(backproject_view_workers)} '
+            f'(per-view backprojection workers: {int(per_backproject_workers)}, '
+            f'tasks: {len(final_backprojection_jobs)})'
+        )
+
+        def _run_final_backprojection(job_idx: int) -> Tuple[str, str, np.ndarray]:
+            model_name_local, view_local, native_source = final_backprojection_jobs[int(job_idx)]
+            out_path = temp_dir / 'view_volumes' / model_name_local / f'{view_local.name}.u8.dat'
+            if view_local.family == 'radial':
+                projected = backproject_radial_volume_to_volume(
+                    radial_mask_mm=native_source,
+                    radial_view=view_local,
+                    out_path=out_path,
+                    desc=f'Backprojecting final {model_name_local}/{view_local.name}',
+                    prefer_memory=False,
+                    workers=int(per_backproject_workers),
+                )
+                if float(args.min_radius) > 0:
+                    print(f"Applying --min_radius in the transverse plane for backprojected view '{view_local.name}'")
+                    apply_transverse_min_radius_filter_inplace(
+                        projected,
+                        float(args.min_radius),
+                        workers=int(per_backproject_workers),
+                    )
+            elif view_local.family == 'tilted_transverse':
+                projected = backproject_tilted_volume_to_volume(
+                    tilted_mask_mm=native_source,
+                    tilted_view=view_local,
+                    out_path=out_path,
+                    desc=f'Backprojecting final {model_name_local}/{view_local.name}',
+                    prefer_memory=False,
+                    workers=int(per_backproject_workers),
+                )
+            else:  # pragma: no cover
+                raise ValueError(f'Unsupported final backprojection view family: {view_local.family}')
+            return model_name_local, view_local.name, projected
+
+        with ThreadPoolExecutor(max_workers=int(backproject_view_workers), thread_name_prefix='final-backproject') as executor:
+            future_to_job = {
+                executor.submit(_run_final_backprojection, int(idx)): int(idx)
+                for idx in range(len(final_backprojection_jobs))
+            }
+            for future in as_completed(future_to_job):
+                model_name_done, view_name_done, projected_volume = future.result()
+                view_volumes_by_model[model_name_done][view_name_done] = projected_volume
 
     output_manager.reap_completed()
 
@@ -8997,6 +9196,7 @@ def main() -> None:
         slice_postprocess_workers=slice_postprocess_workers,
         interpolation_workers=interpolation_workers,
         output_workers=output_workers,
+        spec_notes=spec_notes,
     )
 
     close_memmap_array(final_union_mm)
