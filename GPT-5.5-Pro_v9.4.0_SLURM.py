@@ -2,8 +2,8 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v9.3.0_SLURM single-channel-aligned script:
-  - builds Transverse, optional Tilted Transverse, optional Sagittal/Coronal, and optional Radial view families using single-channel intermediates
+This v9.4.0_SLURM single-channel-aligned script:
+  - builds Transverse, optional Tilted Transverse, independently optional Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - renders parent/full-frame videos directly from the native view transform so inference no longer waits on
     a separately rendered canvas video, and derives non-radial tile videos from shared canvas batches so the
     same rotated frames are not re-decoded once per tile
@@ -23,9 +23,9 @@ This v9.3.0_SLURM single-channel-aligned script:
   - applies final 3D void fill only when --enable_3d_void_fill is active, and only once after the global union
   - applies --object_interpolation_smoothing to the final unioned native object, with frozen-state
     Transverse and optional Sagittal/Coronal deltas repeated by --object_interpolation_smoothing_passes
-  - supports Radial and Tilted Transverse view-native interpolation, and expands Tilted
-    Transverse frame counts according to tilt angle so edge frames are represented with black padding
-  - saves the transverse default color overlay plus optional labels, bilevel compressed TIFF binary masks, binary MKVs, NRRD, multiplanar, radial,
+  - supports Radial and Tilted Transverse view-native interpolation, and keeps Tilted Transverse frame N centered on native slice N with black-padded out-of-bounds shear samples
+  - resizes the working volume to an approximately cubic orthogonal volume when needed, restores the final mask to the original input dimensions for default outputs,
+    and saves the transverse default color overlay plus optional labels, bilevel compressed TIFF binary masks, binary MKVs, NRRD, sagittal, coronal, radial,
     tilted-transverse, image-sequence, low-quality, and TTA outputs, with FFV1 used for spec-required MKVs
 
 Dependencies (Python):
@@ -193,12 +193,16 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--keep_objects", default=0, type=int,
                    help="Keep the top N largest final 3D objects by volume. 0 keeps all objects")
 
-    p.add_argument("--enable_multiplanar", action="store_true",
-                   help="Enable Sagittal and Coronal Cartesian views in addition to the required Transverse view")
+    p.add_argument("--enable_sagittal", action="store_true",
+                   help="Enable Sagittal (X,t) Cartesian views in addition to the required Transverse view")
+    p.add_argument("--enable_coronal", action="store_true",
+                   help="Enable Coronal (Y,t) Cartesian views in addition to the required Transverse view")
+    p.add_argument("--enable_multiplanar", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--disable_transverse", action="store_true",
                    help="Skip standard Transverse full-frame and tiled inferencing only; Transverse output geometry remains available")
-    p.add_argument("--azimuth_angle", default=0.0, type=float,
-                   help="Angular spacing in degrees for radial diameter slices over [0,180]. 0 disables radial views")
+    p.add_argument("--enable_radial", action="store_true", help="Enable Radial views")
+    p.add_argument("--azimuth_angle", default=None, type=float,
+                   help="Angular spacing in degrees for radial diameter slices over [0,180]. When --enable_radial is active and this is omitted, defaults to the largest angle that guarantees full ROI coverage. 0 disables radial views")
     p.add_argument("--tilt_angle", nargs="+", default=["0"], type=str,
                    help="One or more positive Tilted Transverse angles in degrees. Each value creates both positive and negative variants. 0 disables tilted transverse views")
     p.add_argument("--tilt_direction", nargs="+", default=["vertical"], type=str,
@@ -217,10 +221,13 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--save_binary", nargs="?", const="__DEFAULT__", default=None, type=str,
                    help="Save final binary masks as a TIFF sequence plus an FFV1 MKV. Optional custom TIFF pattern, e.g. binary_masks/{Filename}_Binary_%%04d.tiff")
     p.add_argument("--save_nrrd", action="store_true", help="Save the final binary mask volume as an NRRD file")
-    p.add_argument("--save_multiplanar", action="store_true",
-                   help="Save additional Sagittal and Coronal outputs. If multiplanar inference is disabled, reslice the final unified volume for saving only")
+    p.add_argument("--save_sagittal", action="store_true",
+                   help="Save additional Sagittal outputs. If Sagittal inference is disabled, reslice the final unified volume for saving only")
+    p.add_argument("--save_coronal", action="store_true",
+                   help="Save additional Coronal outputs. If Coronal inference is disabled, reslice the final unified volume for saving only")
+    p.add_argument("--save_multiplanar", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--save_radial", action="store_true",
-                   help="Save additional Radial outputs. A warning is emitted and nothing is saved when --azimuth_angle is 0")
+                   help="Save additional Radial outputs. A warning is emitted and nothing is saved when radial views are disabled")
     p.add_argument("--save_tilted_transverse", action="store_true",
                    help="Save additional Tilted Transverse outputs. Filenames encode the direction and signed tilt angle. A warning is emitted and nothing is saved when --tilt_angle is 0")
     p.add_argument("--save_low_quality", action="store_true",
@@ -338,7 +345,7 @@ def _cpu_count() -> int:
 def default_worker_budget() -> int:
     """Intentional CPU oversubscription for mixed GPU/IO/CPU workloads.
 
-    The v9.3.0 SLURM target has enough CPU headroom that running roughly 2x the visible CPU count
+    The v9.4.0 SLURM target has enough CPU headroom that running roughly 2x the visible CPU count
     helps keep ffmpeg, view rendering, interpolation planning, and output writers busy while the GPU
     is inferencing or waiting on a different stage.
     """
@@ -892,6 +899,199 @@ def decode_video_to_memmap_gray8(
     return arr
 
 
+def compute_cube_resize_shape(
+    t_dim: int,
+    h_dim: int,
+    w_dim: int,
+    tolerance: float = 0.05,
+) -> Tuple[int, int, int]:
+    """Return the minimal processing shape whose dimensions are within tolerance of the longest axis.
+
+    v9.4.0 requires the orthogonal working volume to be approximately cubic.  The implementation
+    preserves any axis that is already within the tolerated band and upsamples shorter axes only
+    enough to reach ``(1 - tolerance) * longest``.  This avoids unnecessary XY resampling for the
+    common 3072x3072x1930 case while still satisfying the 5% cube constraint.
+    """
+    t_i = max(1, int(t_dim))
+    h_i = max(1, int(h_dim))
+    w_i = max(1, int(w_dim))
+    longest = max(t_i, h_i, w_i)
+    lower_bound = int(math.ceil(float(longest) * (1.0 - float(tolerance))))
+    return (
+        max(t_i, lower_bound),
+        max(h_i, lower_bound),
+        max(w_i, lower_bound),
+    )
+
+
+def volume_shape_within_cube_tolerance(
+    shape: Tuple[int, int, int],
+    tolerance: float = 0.05,
+) -> bool:
+    dims = [max(1, int(v)) for v in shape]
+    longest = max(dims)
+    return min(dims) >= float(longest) * (1.0 - float(tolerance))
+
+
+def _linear_source_index(out_idx: int, out_count: int, in_count: int) -> float:
+    if int(out_count) <= 1 or int(in_count) <= 1:
+        return 0.0
+    return float(out_idx) * float(in_count - 1) / float(out_count - 1)
+
+
+def _resize_gray_slice_nearest_or_linear(
+    frame: np.ndarray,
+    out_w: int,
+    out_h: int,
+    interpolation: int,
+) -> np.ndarray:
+    frame_arr = np.asarray(frame, dtype=np.uint8)
+    if int(frame_arr.shape[0]) == int(out_h) and int(frame_arr.shape[1]) == int(out_w):
+        return np.ascontiguousarray(frame_arr)
+    return cv2.resize(
+        np.ascontiguousarray(frame_arr),
+        (int(out_w), int(out_h)),
+        interpolation=int(interpolation),
+    )
+
+
+def resize_volume_to_processing_cube_gray8(
+    volume_gray: np.ndarray,
+    out_shape: Tuple[int, int, int],
+    out_path: Path,
+    *,
+    workers: int = 1,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 32 * GIB,
+) -> np.ndarray:
+    """Resample a gray8 (t,Y,X) volume to the v9.4.0 approximately-cubic processing shape."""
+    in_t, in_h, in_w = (int(volume_gray.shape[0]), int(volume_gray.shape[1]), int(volume_gray.shape[2]))
+    out_t, out_h, out_w = (int(out_shape[0]), int(out_shape[1]), int(out_shape[2]))
+    if (in_t, in_h, in_w) == (out_t, out_h, out_w):
+        return volume_gray
+
+    out_mm = allocate_workspace_array(
+        shape=(out_t, out_h, out_w),
+        dtype=np.uint8,
+        path=out_path,
+        desc='v9.4.0 cubic processing volume',
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
+    )
+
+    worker_count = choose_slice_parallel_workers(int(workers), int(out_t))
+    chunk_size = choose_parallel_chunk_size(out_t, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
+
+    def _render_target_slice(out_z: int) -> None:
+        src_z = _linear_source_index(int(out_z), int(out_t), int(in_t))
+        z0 = int(math.floor(src_z))
+        z1 = min(in_t - 1, z0 + 1)
+        alpha = float(src_z - float(z0))
+
+        f0 = _resize_gray_slice_nearest_or_linear(volume_gray[z0], out_w, out_h, cv2.INTER_LINEAR)
+        if z1 == z0 or alpha <= 1e-7:
+            out_mm[int(out_z), :, :] = f0
+            return
+        f1 = _resize_gray_slice_nearest_or_linear(volume_gray[z1], out_w, out_h, cv2.INTER_LINEAR)
+        blended = np.clip(
+            np.rint((1.0 - alpha) * f0.astype(np.float32, copy=False) + alpha * f1.astype(np.float32, copy=False)),
+            0.0,
+            255.0,
+        ).astype(np.uint8)
+        out_mm[int(out_z), :, :] = blended
+
+    parallel_for_indices_chunked(
+        int(out_t),
+        _render_target_slice,
+        max_workers=worker_count,
+        desc='Resizing orthogonal volume to v9.4.0 cube',
+        chunk_size=chunk_size,
+    )
+    flush_array(out_mm)
+    return out_mm
+
+
+def restore_mask_volume_to_original_shape(
+    mask_u8: np.ndarray,
+    out_shape: Tuple[int, int, int],
+    out_path: Path,
+    *,
+    workers: int = 1,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 16 * GIB,
+) -> np.ndarray:
+    """Map a processing-space binary mask back to the input video's original (t,Y,X) shape."""
+    in_t, in_h, in_w = (int(mask_u8.shape[0]), int(mask_u8.shape[1]), int(mask_u8.shape[2]))
+    out_t, out_h, out_w = (int(out_shape[0]), int(out_shape[1]), int(out_shape[2]))
+    if (in_t, in_h, in_w) == (out_t, out_h, out_w):
+        return mask_u8
+
+    out_mm = allocate_workspace_array(
+        shape=(out_t, out_h, out_w),
+        dtype=np.uint8,
+        path=out_path,
+        desc='Restored final mask in original input geometry',
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
+    )
+    worker_count = choose_slice_parallel_workers(int(workers), int(out_t))
+    chunk_size = choose_parallel_chunk_size(out_t, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
+
+    def _resize_mask_to_output_xy(frame: np.ndarray) -> np.ndarray:
+        frame_u8 = (np.asarray(frame, dtype=np.uint8) > 0).astype(np.uint8, copy=False)
+        if int(frame_u8.shape[0]) == int(out_h) and int(frame_u8.shape[1]) == int(out_w):
+            return np.ascontiguousarray(frame_u8)
+        interp = cv2.INTER_AREA if (int(frame_u8.shape[0]) >= int(out_h) and int(frame_u8.shape[1]) >= int(out_w)) else cv2.INTER_NEAREST
+        scaled = cv2.resize(
+            np.ascontiguousarray(frame_u8 * np.uint8(255)),
+            (int(out_w), int(out_h)),
+            interpolation=int(interp),
+        )
+        return (scaled > 0).astype(np.uint8, copy=False)
+
+    def _restore_slice(out_z: int) -> None:
+        if int(in_t) >= int(out_t):
+            src_start = int(math.floor(float(out_z) * float(in_t) / float(out_t)))
+            src_stop = int(math.ceil(float(out_z + 1) * float(in_t) / float(out_t)))
+            src_start = int(np.clip(src_start, 0, in_t - 1))
+            src_stop = int(np.clip(max(src_start + 1, src_stop), 1, in_t))
+            restored = np.zeros((int(out_h), int(out_w)), dtype=np.uint8)
+            for src_idx in range(src_start, src_stop):
+                restored |= _resize_mask_to_output_xy(mask_u8[int(src_idx)])
+            out_mm[int(out_z), :, :] = restored
+            return
+
+        src_z = _linear_source_index(int(out_z), int(out_t), int(in_t))
+        src_idx = int(np.clip(int(round(src_z)), 0, in_t - 1))
+        out_mm[int(out_z), :, :] = _resize_mask_to_output_xy(mask_u8[src_idx])
+
+    parallel_for_indices_chunked(
+        int(out_t),
+        _restore_slice,
+        max_workers=worker_count,
+        desc='Restoring final mask to original input geometry',
+        chunk_size=chunk_size,
+    )
+    flush_array(out_mm)
+    return out_mm
+
+
+def resolve_radial_azimuth_angle(
+    requested_angle: Optional[float],
+    *,
+    enable_radial: bool,
+    diameter: int,
+) -> float:
+    """Resolve v9.4.0 radial activation and default full-coverage angle."""
+    if requested_angle is not None:
+        if float(requested_angle) <= 0.0:
+            return 0.0
+        return float(requested_angle)
+    if bool(enable_radial):
+        return radial_full_coverage_angle_deg(int(diameter))
+    return 0.0
+
+
 def ffmpeg_rawvideo_writer(
     out_path: Path,
     width: int,
@@ -1085,9 +1285,10 @@ def build_affine(
       source(native view) -> optional black-padding canvas -> rotation around canvas center
       -> scale to out_size x out_size
 
-    Transverse uses pad_mode='clamp', which rotates directly on the source-sized canvas so non-90°
-    content that leaves the source frame is discarded. Sagittal/Coronal/Radial use pad_mode='pad'
-    with a square black canvas large enough to preserve the full rotation before scaling.
+    Cartesian views (Transverse, Sagittal, Coronal, and Tilted Transverse in-plane rotation) use
+    pad_mode='clamp', which rotates directly on the source-sized canvas so non-90° content that
+    leaves the source frame is discarded. Radial uses pad_mode='pad' so non-90° radial rotations are
+    black-padded before scaling.
     """
     if pad_mode not in ("clamp", "pad"):
         raise ValueError("pad_mode must be 'clamp' or 'pad'")
@@ -1198,14 +1399,10 @@ def compute_tilt_frame_range(
     axis_len: int,
     signed_tilt_angle_deg: float,
 ) -> Tuple[int, int]:
-    """Return inclusive native-center frame range for a Tilted Transverse stack.
+    """Return the legacy expanded tilted-frame range for diagnostic callers.
 
-    A tilted frame centered at native slice coordinate ``N`` samples
-    ``t = N + tan(alpha) * (axis - center)``.  v9.3.0 requires the generated
-    tilted video to include the incomplete edge frames introduced by this shear,
-    rather than forcing the frame count to remain equal to the input transverse
-    frame count.  We therefore include every integer center coordinate whose
-    tilted plane intersects the native t-domain [0, t_dim - 1].
+    The v9.4.0 pipeline itself keeps Tilted Transverse frame counts equal to the native
+    transverse frame count and fills out-of-bounds shear samples with black.
     """
     t_dim_i = int(t_dim)
     if t_dim_i <= 0:
@@ -1256,12 +1453,20 @@ def get_view_infos(
     T: int,
     H: int,
     W: int,
-    disable_multiplanar: bool,
+    disable_multiplanar: Optional[bool] = None,
     azimuth_angle: float = 0.0,
     include_radial: bool = True,
     tilt_angles: Optional[Sequence[float]] = None,
     tilt_directions: Optional[Sequence[str]] = None,
+    enable_sagittal: bool = False,
+    enable_coronal: bool = False,
 ) -> List[ViewInfo]:
+    # Backward-compatible alias for older command lines; v9.4.0 controls Sagittal and
+    # Coronal independently via --enable_sagittal and --enable_coronal.
+    if disable_multiplanar is not None:
+        enable_sagittal = bool(enable_sagittal or (not bool(disable_multiplanar)))
+        enable_coronal = bool(enable_coronal or (not bool(disable_multiplanar)))
+
     views = [
         ViewInfo(
             name='transverse',
@@ -1277,13 +1482,13 @@ def get_view_infos(
             full_w=W,
         ),
     ]
-    if not disable_multiplanar:
+    if bool(enable_sagittal):
         views.append(ViewInfo(
             name='sagittal',
             num_slices=H,
             src_h=T,
             src_w=W,
-            pad_mode='pad',
+            pad_mode='clamp',
             family='orthogonal',
             summary_family='sagittal',
             display_name='Sagittal',
@@ -1291,12 +1496,13 @@ def get_view_infos(
             full_h=H,
             full_w=W,
         ))
+    if bool(enable_coronal):
         views.append(ViewInfo(
             name='coronal',
             num_slices=W,
             src_h=T,
             src_w=H,
-            pad_mode='pad',
+            pad_mode='clamp',
             family='orthogonal',
             summary_family='coronal',
             display_name='Coronal',
@@ -1312,15 +1518,13 @@ def get_view_infos(
             for sign in (+1.0, -1.0):
                 signed_angle = float(sign * tilt_angle)
                 token = _format_signed_angle_token(signed_angle)
-                axis_len = int(H) if str(tilt_direction) == 'vertical' else int(W)
-                tilt_frame_start, tilt_frame_stop = compute_tilt_frame_range(
-                    t_dim=int(T),
-                    axis_len=int(axis_len),
-                    signed_tilt_angle_deg=float(signed_angle),
-                )
+                # v9.4.0 keeps Tilted Transverse on the native Transverse frame count:
+                # output frame N is centered on native slice N, with out-of-bounds shear samples
+                # at the start/end filled black.
+                tilt_frame_start, tilt_frame_stop = 0, int(T) - 1
                 views.append(ViewInfo(
                     name=f'tilted_transverse_{tilt_direction}_{token}',
-                    num_slices=max(0, int(tilt_frame_stop) - int(tilt_frame_start) + 1),
+                    num_slices=int(T),
                     src_h=H,
                     src_w=W,
                     pad_mode='clamp',
@@ -3077,6 +3281,7 @@ def predict_video_and_accumulate(
 
     results = model.predict(
         source=str(video_path),
+        task='segment',
         imgsz=cfg.imgsz,
         conf=cfg.conf,
         iou=1.0,
@@ -3327,6 +3532,7 @@ def predict_tile_video_and_gate(
 
     results = model.predict(
         source=str(video_path),
+        task='segment',
         imgsz=cfg.imgsz,
         conf=cfg.conf,
         iou=1.0,
@@ -3741,7 +3947,7 @@ def fill_3d_voids_inplace_streaming(
 ) -> None:
     """Fill enclosed 3D voids by labeling background connected components once.
 
-    v9.3.0 allows 3D void fill only as an optional final global-union step. This
+    v9.4.0 allows 3D void fill only as an optional final global-union step. This
     function performs that operation by labeling the background volume, marking any
     background component connected to the volume boundary, and converting all other
     background components to foreground. The default 6-connected background matches
@@ -4059,8 +4265,18 @@ class RadialBackprojectionSample:
     reverse_u: bool = False
 
 
+@dataclass(frozen=True)
+class DenseRadialBackprojectionMap:
+    valid_mask: np.ndarray
+    source_idx_map: np.ndarray
+    u_idx_map: np.ndarray
+
+
+_DENSE_RADIAL_BACKPROJECT_MAP_CACHE: Dict[Tuple[int, int, int, Tuple[Tuple[float, int, bool], ...]], DenseRadialBackprojectionMap] = {}
+
+
 def radial_full_coverage_angle_deg(diameter: int) -> float:
-    """Return the v9.3.0 radial spacing that gives approximately 1x ROI edge coverage."""
+    """Return the v9.4.0 radial spacing that gives approximately 1x ROI edge coverage."""
     diameter_i = max(1, int(diameter))
     return float(360.0 / (math.pi * float(diameter_i)))
 
@@ -4094,7 +4310,7 @@ def _nearest_radial_source_for_backprojection(
 def build_radial_backprojection_plan(radial_view: ViewInfo) -> Tuple[List[RadialBackprojectionSample], Dict[str, float]]:
     """Build the angular plan used to backproject a radial view into Cartesian space.
 
-    If the user-requested radial spacing is coarser than the v9.3.0 full-coverage spacing,
+    If the user-requested radial spacing is coarser than the v9.4.0 full-coverage spacing,
     backprojection is densified to the full-coverage spacing and each dense angle samples the
     nearest completed radial prediction frame. This keeps Radial masks view-native through
     postprocessing/interpolation while preventing sparse spoke-like Cartesian backprojections.
@@ -4144,6 +4360,93 @@ def build_radial_backprojection_plan(radial_view: ViewInfo) -> Tuple[List[Radial
     }
 
 
+def _radial_plan_signature(plan: Sequence[RadialBackprojectionSample]) -> Tuple[Tuple[float, int, bool], ...]:
+    return tuple((round(float(s.angle_deg), 6), int(s.source_index), bool(s.reverse_u)) for s in plan)
+
+
+def build_dense_radial_backprojection_map(
+    radial_view: ViewInfo,
+    plan: Sequence[RadialBackprojectionSample],
+) -> DenseRadialBackprojectionMap:
+    """Map every Cartesian ROI pixel to its nearest dense radial source frame and radial coordinate.
+
+    This is the dense v9.4.0 backprojection path: instead of painting only the pixels that lie on
+    a set of spokes, every pixel inside the circular ROI receives a sample from the Radial video's
+    own frame/raster coordinate system.  When the user-provided azimuth spacing is too coarse, the
+    supplied ``plan`` is already densified to the full-coverage angular spacing; pixels then select
+    the nearest dense plan angle and that angle's nearest completed source frame.
+    """
+    if not plan:
+        return DenseRadialBackprojectionMap(
+            valid_mask=np.zeros((int(radial_view.full_h), int(radial_view.full_w)), dtype=bool),
+            source_idx_map=np.zeros((int(radial_view.full_h), int(radial_view.full_w)), dtype=np.int32),
+            u_idx_map=np.zeros((int(radial_view.full_h), int(radial_view.full_w)), dtype=np.int32),
+        )
+
+    key = (
+        int(radial_view.full_h),
+        int(radial_view.full_w),
+        int(radial_view.diameter),
+        _radial_plan_signature(plan),
+    )
+    cached = _DENSE_RADIAL_BACKPROJECT_MAP_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    out_h = int(radial_view.full_h)
+    out_w = int(radial_view.full_w)
+    diameter = int(radial_view.diameter)
+    radius = float(radial_view.roi_radius)
+    if radius <= 0.0:
+        radius = max(1.0, float(diameter - 1) / 2.0)
+
+    plan_angles = np.asarray([float(s.angle_deg) % 180.0 for s in plan], dtype=np.float32)
+    plan_sources = np.asarray([int(s.source_index) for s in plan], dtype=np.int32)
+    plan_reverses = np.asarray([bool(s.reverse_u) for s in plan], dtype=bool)
+    n_plan = int(plan_angles.size)
+    if n_plan <= 0:
+        raise ValueError('Dense radial backprojection requires at least one angular plan sample')
+
+    if n_plan >= 2:
+        diffs = np.diff(plan_angles.astype(np.float64, copy=False))
+        positive_diffs = diffs[diffs > 1e-9]
+        step = float(np.median(positive_diffs)) if positive_diffs.size else 180.0 / float(n_plan)
+    else:
+        step = 180.0
+    step = max(float(step), 1e-9)
+
+    yy, xx = np.indices((out_h, out_w), dtype=np.float32)
+    dx = xx - float(radial_view.center_x)
+    dy = yy - float(radial_view.center_y)
+    rr = np.sqrt((dx * dx) + (dy * dy)).astype(np.float32, copy=False)
+    valid = rr <= (float(radius) + 0.5)
+
+    theta = np.degrees(np.arctan2(dy, dx)).astype(np.float32, copy=False)
+    theta = np.mod(theta, 180.0).astype(np.float32, copy=False)
+    nearest_plan_idx = np.mod(np.rint(theta / float(step)).astype(np.int32, copy=False), n_plan)
+
+    target_angles = plan_angles[nearest_plan_idx]
+    cos_t = np.cos(np.deg2rad(target_angles)).astype(np.float32, copy=False)
+    sin_t = np.sin(np.deg2rad(target_angles)).astype(np.float32, copy=False)
+    signed_r = (dx * cos_t) + (dy * sin_t)
+    signed_r[plan_reverses[nearest_plan_idx]] *= -1.0
+
+    u_float = ((signed_r + float(radius)) / max(1e-6, 2.0 * float(radius))) * float(diameter - 1)
+    u_idx = np.clip(np.rint(u_float).astype(np.int32, copy=False), 0, diameter - 1)
+    source_idx = plan_sources[nearest_plan_idx].astype(np.int32, copy=False)
+
+    source_idx[~valid] = 0
+    u_idx[~valid] = 0
+
+    dense_map = DenseRadialBackprojectionMap(
+        valid_mask=np.ascontiguousarray(valid),
+        source_idx_map=np.ascontiguousarray(source_idx),
+        u_idx_map=np.ascontiguousarray(u_idx),
+    )
+    _DENSE_RADIAL_BACKPROJECT_MAP_CACHE[key] = dense_map
+    return dense_map
+
+
 def backproject_radial_volume_to_volume(
     radial_mask_mm: np.ndarray,
     radial_view: ViewInfo,
@@ -4185,28 +4488,28 @@ def backproject_radial_volume_to_volume(
         flush_array(vol_mm)
         return vol_mm
 
-    worker_count = choose_slice_parallel_workers(int(workers), len(plan))
+    dense_map = build_dense_radial_backprojection_map(radial_view, plan)
+    valid = np.asarray(dense_map.valid_mask, dtype=bool)
+    source_idx_map = np.asarray(dense_map.source_idx_map, dtype=np.int32)
+    u_idx_map = np.asarray(dense_map.u_idx_map, dtype=np.int32)
 
-    def _backproject_sample(sample_idx: int) -> None:
-        sample = plan[int(sample_idx)]
-        radial_mask = np.asarray(radial_mask_mm[int(sample.source_index)], dtype=bool)
-        if bool(sample.reverse_u):
-            radial_mask = np.ascontiguousarray(radial_mask[:, ::-1])
-        if not np.any(radial_mask):
-            return
-        tt, uu = np.nonzero(radial_mask)
-        if tt.size == 0:
-            return
-        sampler = get_radial_sampler(radial_view, float(sample.angle_deg))
-        vol_mm[tt, sampler.nn_y[uu], sampler.nn_x[uu]] = np.uint8(1)
+    worker_count = choose_slice_parallel_workers(int(workers), int(t_dim))
+
+    def _backproject_t_slice(t_idx: int) -> None:
+        radial_plane = np.asarray(radial_mask_mm[:, int(t_idx), :], dtype=np.uint8)
+        dst = vol_mm[int(t_idx)]
+        # Dense gather: every in-ROI Cartesian pixel is assigned from the nearest dense radial
+        # angle's source frame and radial raster coordinate. Out-of-ROI remains black.
+        gathered = radial_plane[source_idx_map, u_idx_map]
+        dst[valid] = gathered[valid]
 
     parallel_for_indices_chunked(
-        len(plan),
-        _backproject_sample,
+        int(t_dim),
+        _backproject_t_slice,
         max_workers=worker_count,
         desc=desc,
         show_progress=True,
-        target_chunks_per_worker=4,
+        target_chunks_per_worker=2,
     )
 
     flush_array(vol_mm)
@@ -4325,7 +4628,7 @@ def assemble_view_volumes_into_native_union(
             desc="Assembling final union from transverse view volume",
         )
 
-    if not disable_multiplanar and "sagittal" in view_volume_mms:
+    if "sagittal" in view_volume_mms:
         sagittal = np.asarray(view_volume_mms["sagittal"])
         assert sagittal.shape == (H, T, W)
         consumed.add("sagittal")
@@ -4341,7 +4644,7 @@ def assemble_view_volumes_into_native_union(
             desc="Assembling final union from sagittal view volume",
         )
 
-    if not disable_multiplanar and "coronal" in view_volume_mms:
+    if "coronal" in view_volume_mms:
         coronal = np.asarray(view_volume_mms["coronal"])
         assert coronal.shape == (W, T, H)
         consumed.add("coronal")
@@ -4394,11 +4697,11 @@ def assemble_current_view_union_volume(
     """Build the single-model final view union.
 
     The mapping is kept keyed by model name because earlier pipeline stages store temporary
-    workspaces under the model stem. v9.3.0 rejects multiple model entries and never
+    workspaces under the model stem. v9.4.0 rejects multiple model entries and never
     combines outputs from more than one model.
     """
     if len(view_volumes_by_model) != 1:
-        raise ValueError('v9.3.0_SLURM supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('v9.4.0_SLURM supports exactly one --model; multiple-model inference has been removed')
 
     model_name = next(iter(view_volumes_by_model.keys()))
     final_union_mm = allocate_workspace_array(
@@ -5171,7 +5474,7 @@ def _build_slice_endpoint_seeds(
       - ``scan``: always use the fast slice-graph terminal scan
       - ``skeleton``: always use per-object 3D skeletonization
 
-    The hybrid path keeps 3D skeletonization as the default v9.3.0-compliant behavior while still
+    The hybrid path keeps 3D skeletonization as the default v9.4.0-compliant behavior while still
     protecting large SLURM-scale volumes from pathological all-voxel skeletonization costs.
     """
     mode = os.environ.get('YOLO_TTA_INTERPOLATION_ENDPOINT_MODE', 'hybrid').strip().lower()
@@ -5950,7 +6253,7 @@ def gate_tile_volume_against_parent_inplace(
     """Keep only tile components that intersect the frozen parent support on the same slice.
 
     The gating result for one slice never affects another slice, so this stage can be parallelized
-    aggressively across the slice axis without violating the v9.3.0_SLURM semantics.
+    aggressively across the slice axis without violating the v9.4.0_SLURM semantics.
     """
     num_slices = int(tile_mask_mm.shape[0])
     accepted_components = np.zeros((num_slices,), dtype=np.int64)
@@ -6109,7 +6412,7 @@ def gate_tile_volume_into_consolidated_parent(
 ) -> TileGateResult:
     """Gate one tile volume, then OR accepted components into the parent-view tile accumulator.
 
-    v9.3.0 intentionally consolidates all accepted tiles for a parent view before interpolation.
+    v9.4.0 intentionally consolidates all accepted tiles for a parent view before interpolation.
     This replaces the previous per-tile interpolation path while preserving the mask-wise OR gate:
     accepted tile components still must intersect the frozen parent full-frame support, and accepted
     tiles cannot accept other tiles because the support image is not the accumulator.
@@ -6366,11 +6669,11 @@ class ObjectSmoothingViewResult:
     delta_path: Optional[Path]
 
 
-def _eligible_object_smoothing_views(views: Sequence[ViewInfo], enable_multiplanar: bool) -> List[ViewInfo]:
+def _eligible_object_smoothing_views(views: Sequence[ViewInfo]) -> List[ViewInfo]:
     view_by_name = {str(v.name): v for v in views}
-    wanted = ['transverse']
-    if bool(enable_multiplanar):
-        wanted.extend(['sagittal', 'coronal'])
+    # v9.4.0 splits Sagittal and Coronal activation.  Smooth along whichever of those
+    # orthogonal view axes are actually enabled, in parallel with Transverse.
+    wanted = ['transverse', 'sagittal', 'coronal']
     out: List[ViewInfo] = []
     for name in wanted:
         view = view_by_name.get(name)
@@ -6623,7 +6926,7 @@ def apply_object_interpolation_smoothing_inplace(
     views: Sequence[ViewInfo],
     temp_dir: Path,
     *,
-    enable_multiplanar: bool,
+    enable_multiplanar: bool = False,
     smoothing_passes: int = 1,
     keep_temp: bool = False,
     workers: int = 1,
@@ -6636,7 +6939,7 @@ def apply_object_interpolation_smoothing_inplace(
     Tilted Transverse, and tiled views are therefore included as part of the final unioned
     object geometry but are not treated as separate smoothing axes.
     """
-    eligible_views = _eligible_object_smoothing_views(views, bool(enable_multiplanar))
+    eligible_views = _eligible_object_smoothing_views(views)
 
     stats: Dict[str, int] = {
         'passes_requested': int(smoothing_passes),
@@ -7322,16 +7625,33 @@ def collect_multiplanar_output_futures(
     fps: float,
     save_binary_pattern_value: Optional[str],
     save_labels_pattern_value: Optional[str],
+    save_sagittal_flag: bool = True,
+    save_coronal_flag: bool = True,
     tag: Optional[str] = None,
     frame_workers: int = 1,
     show_progress: bool = False,
 ) -> Tuple[Dict[str, Path], List[Future]]:
     t_dim, h_dim, w_dim = mask_u8.shape
-    views = {v.name: v for v in get_view_infos(t_dim, h_dim, w_dim, disable_multiplanar=False, azimuth_angle=0.0, include_radial=False)}
+    views = {
+        v.name: v for v in get_view_infos(
+            t_dim, h_dim, w_dim,
+            disable_multiplanar=None,
+            azimuth_angle=0.0,
+            include_radial=False,
+            enable_sagittal=True,
+            enable_coronal=True,
+        )
+    }
     futures: List[Future] = []
     result_paths: Dict[str, Path] = {}
 
-    for view_name in ('sagittal', 'coronal'):
+    requested_view_names: List[str] = []
+    if bool(save_sagittal_flag):
+        requested_view_names.append('sagittal')
+    if bool(save_coronal_flag):
+        requested_view_names.append('coronal')
+
+    for view_name in requested_view_names:
         view = views[view_name]
         pretty = view_output_token(view)
         tag_suffix = f'_{tag}' if tag else ''
@@ -7442,7 +7762,7 @@ def build_troubleshooting_pass_union(
     workers: int,
 ) -> np.ndarray:
     if len(model_names) != 1:
-        raise ValueError('v9.3.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
+        raise ValueError('v9.4.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     view_volumes_for_pass: Dict[str, Dict[str, np.ndarray]] = {str(model_name): {} for model_name in model_names}
     intermediate_volumes: List[np.ndarray] = []
 
@@ -7505,7 +7825,7 @@ def build_troubleshooting_pass_union(
                     view_volumes_for_pass[str(model_name)][view.name] = native_union
 
         # Troubleshooting pass outputs are stage snapshots taken before the corresponding
-        # interpolation pass. They must not run the final 3D void fill; v9.3.0 keeps
+        # interpolation pass. They must not run the final 3D void fill; v9.4.0 keeps
         # 3D void fill out of troubleshooting pre-pass outputs and applies it only when
         # --enable_3d_void_fill is active for the normal final output.
         pass_union = assemble_current_view_union_volume(
@@ -7537,7 +7857,8 @@ def schedule_troubleshooting_pass_outputs(
     save_binary_pattern_value: Optional[str],
     save_labels_pattern_value: Optional[str],
     save_nrrd_flag: bool,
-    save_multiplanar_flag: bool,
+    save_sagittal_flag: bool,
+    save_coronal_flag: bool,
     total_passes: int,
     T: int,
     H: int,
@@ -7550,7 +7871,7 @@ def schedule_troubleshooting_pass_outputs(
     workers: int,
 ) -> Dict[str, Path]:
     if len(model_names) != 1:
-        raise ValueError('v9.3.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
+        raise ValueError('v9.4.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     if int(total_passes) < 0 or not snapshot_refs:
         return {}
 
@@ -7598,7 +7919,7 @@ def schedule_troubleshooting_pass_outputs(
             frame_workers=int(frame_workers),
             show_progress=False,
         )
-        if bool(save_multiplanar_flag):
+        if bool(save_sagittal_flag) or bool(save_coronal_flag):
             extra_paths, extra_futures = collect_multiplanar_output_futures(
                 output_manager.executor,
                 volume_rgb=volume_rgb,
@@ -7608,6 +7929,8 @@ def schedule_troubleshooting_pass_outputs(
                 fps=float(fps),
                 save_binary_pattern_value=save_binary_pattern_value,
                 save_labels_pattern_value=save_labels_pattern_value,
+                save_sagittal_flag=bool(save_sagittal_flag),
+                save_coronal_flag=bool(save_coronal_flag),
                 tag=tag,
                 frame_workers=int(frame_workers),
                 show_progress=False,
@@ -7729,7 +8052,7 @@ def union_view_volume_for_single_model(
     workers: int = 1,
 ) -> np.ndarray:
     if len(view_volumes_by_model) != 1:
-        raise ValueError('v9.3.0_SLURM supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('v9.4.0_SLURM supports exactly one --model; multiple-model inference has been removed')
     model_name = next(iter(view_volumes_by_model.keys()))
     if view_name not in view_volumes_by_model[model_name]:
         raise KeyError(f'No view volume found for {view_name}')
@@ -7894,7 +8217,7 @@ def write_summary_file(
     lines.append(f'Command: {command}')
     lines.append(f'Input: {input_path}')
     lines.append(f'Output directory: {out_dir}')
-    lines.append(f'Volume shape (t, Y, X): {volume_shape}')
+    lines.append(f'Processing volume shape (t, Y, X): {volume_shape}')
     lines.append(f'FPS: {fps}')
     lines.append(f'Scratch directory: {scratch_dir}')
     lines.append('Workspace policy: in-memory first with disk fallback when the working set exceeds available RAM/swap')
@@ -8031,7 +8354,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('v9.3.0_SLURM accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('v9.4.0_SLURM accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -8041,6 +8364,11 @@ def main() -> None:
     tilt_angles = resolve_tilt_angles(args.tilt_angle)
     tilt_directions = resolve_tilt_directions(args.tilt_direction)
     tile_configs = resolve_tile_configs(args.tile_size, args.tile_stride)
+    enable_sagittal = bool(args.enable_sagittal or args.enable_multiplanar)
+    enable_coronal = bool(args.enable_coronal or args.enable_multiplanar)
+    save_sagittal = bool(args.save_sagittal or args.save_multiplanar)
+    save_coronal = bool(args.save_coronal or args.save_multiplanar)
+    requested_azimuth_angle = None if args.azimuth_angle is None else float(args.azimuth_angle)
 
     if args.min_conf > 0 and args.min_conf < args.conf:
         raise ValueError('--min_conf must be equal to or greater than --conf')
@@ -8060,7 +8388,7 @@ def main() -> None:
         raise ValueError('--min_radius must be >= 0')
     if int(args.keep_objects) < 0:
         raise ValueError('--keep_objects must be >= 0')
-    if float(args.azimuth_angle) < 0:
+    if requested_azimuth_angle is not None and float(requested_azimuth_angle) < 0:
         raise ValueError('--azimuth_angle must be >= 0')
     for tilt_angle in tilt_angles:
         if not (0.0 < float(tilt_angle) < 45.0):
@@ -8076,31 +8404,73 @@ def main() -> None:
     print(f"Bulk scratch dir: {temp_dir}")
 
     info = ffprobe_info(input_path)
-    W = int(info['width'])
-    H = int(info['height'])
-    T = int(info['num_frames'])
+    input_W = int(info['width'])
+    input_H = int(info['height'])
+    input_T = int(info['num_frames'])
     fps = float(info['fps'])
 
     vol_path = temp_dir / 'input_volume.gray8.dat'
-    volume_rgb = decode_video_to_memmap_gray8(
+    input_volume_rgb = decode_video_to_memmap_gray8(
         input_video=input_path,
         out_dat=vol_path,
-        num_frames=T,
-        width=W,
-        height=H,
+        num_frames=input_T,
+        width=input_W,
+        height=input_H,
         overwrite=False,
         prefer_memory=True,
     )
     (temp_dir / 'input_volume.meta.json').write_text(
-        json.dumps({'shape': [T, H, W], 'dtype': 'uint8', 'channels': 1, 'fps': fps}, indent=2)
+        json.dumps({'shape': [input_T, input_H, input_W], 'dtype': 'uint8', 'channels': 1, 'fps': fps}, indent=2)
+    )
+
+    processing_shape = compute_cube_resize_shape(input_T, input_H, input_W, tolerance=0.05)
+    if processing_shape != (input_T, input_H, input_W):
+        print(
+            'v9.4.0 cubic resize: '
+            f'input shape (t,Y,X)=({input_T},{input_H},{input_W}) -> '
+            f'processing shape (t,Y,X)={processing_shape}'
+        )
+        volume_rgb = resize_volume_to_processing_cube_gray8(
+            input_volume_rgb,
+            processing_shape,
+            temp_dir / 'input_volume.v940_cube.gray8.dat',
+            workers=max(1, default_worker_budget()),
+            prefer_memory=True,
+        )
+    else:
+        print(f'v9.4.0 cubic resize: input shape already within 5% cube tolerance ({processing_shape})')
+        volume_rgb = input_volume_rgb
+
+    T, H, W = (int(processing_shape[0]), int(processing_shape[1]), int(processing_shape[2]))
+    resolved_azimuth_angle = resolve_radial_azimuth_angle(
+        requested_azimuth_angle,
+        enable_radial=bool(args.enable_radial),
+        diameter=min(W, H),
+    )
+    if bool(args.enable_radial) and resolved_azimuth_angle > 0.0 and requested_azimuth_angle is None:
+        print(f'Radial azimuth default: using full-coverage spacing {resolved_azimuth_angle:.8g}° for processing diameter {min(W, H)}')
+
+    (temp_dir / 'processing_volume.meta.json').write_text(
+        json.dumps({
+            'input_shape_t_y_x': [input_T, input_H, input_W],
+            'processing_shape_t_y_x': [T, H, W],
+            'dtype': 'uint8',
+            'channels': 1,
+            'fps': fps,
+            'azimuth_angle_deg': resolved_azimuth_angle,
+            'enable_sagittal': bool(enable_sagittal),
+            'enable_coronal': bool(enable_coronal),
+        }, indent=2)
     )
 
     views = get_view_infos(
         T=T,
         H=H,
         W=W,
-        disable_multiplanar=not bool(args.enable_multiplanar),
-        azimuth_angle=float(args.azimuth_angle),
+        disable_multiplanar=None,
+        enable_sagittal=bool(enable_sagittal),
+        enable_coronal=bool(enable_coronal),
+        azimuth_angle=float(resolved_azimuth_angle),
         include_radial=True,
         tilt_angles=tilt_angles,
         tilt_directions=tilt_directions,
@@ -8110,9 +8480,21 @@ def main() -> None:
     inference_views = [v for v in views if not (transverse_inference_disabled and v.name == 'transverse')]
     interpolating_views = [v for v in inference_views if _view_uses_interpolation(v, int(args.interpolate))]
     spec_notes: List[str] = []
+    if (int(T), int(H), int(W)) != (int(input_T), int(input_H), int(input_W)):
+        spec_notes.append(
+            f'Working volume resized to v9.4.0 approximately-cubic processing geometry '
+            f'(t,Y,X)=({int(T)},{int(H)},{int(W)}); final default outputs are restored to the original '
+            f'input geometry (t,Y,X)=({int(input_T)},{int(input_H)},{int(input_W)}).'
+        )
+    spec_notes.append(
+        f'Sagittal enabled={bool(enable_sagittal)}, Coronal enabled={bool(enable_coronal)}; '
+        'their non-90 degree Cartesian augmentations use clamp-to-frame black fill rather than expanded padding.'
+    )
+    if float(resolved_azimuth_angle) > 0.0:
+        spec_notes.append(f'Radial enabled with azimuth spacing {float(resolved_azimuth_angle):.8g} degrees; Lanczos-3 radial sampling and dense final backprojection are active.')
     if transverse_inference_disabled:
         note = (
-            'v9.3.0 specification note: Section 2.1.1 says Transverse must always be created, while '
+            'v9.4.0 specification note: Section 2.1.1 says Transverse must always be created, while '
             'View Flags item 1 adds --disable_transverse to skip Transverse inferencing. This implementation '
             'keeps Transverse geometry/output paths available and removes only the standard Transverse full-frame '
             'and tiled prediction jobs.'
@@ -8123,7 +8505,7 @@ def main() -> None:
     model_name = Path(model_paths[0]).stem
     print(f'Loading model: {model_name} ({model_paths[0]})')
     yolo_model = load_ultralytics_model(model_paths[0], task='segment')
-    # v9.3.0 has no multiple-model inference. A single-item list is retained only to minimize churn in
+    # v9.4.0 has no multiple-model inference. A single-item list is retained only to minimize churn in
     # scheduling structures keyed by model stem.
     yolo_models: List[Tuple[str, object]] = [(model_name, yolo_model)]
     yolo_by_model_name: Dict[str, object] = {model_name: yolo_model}
@@ -8974,7 +9356,7 @@ def main() -> None:
         T=T,
         H=H,
         W=W,
-        disable_multiplanar=not bool(args.enable_multiplanar),
+        disable_multiplanar=None,
         out_path=temp_dir / 'final_union_volume.u8.dat',
         temp_dir=temp_dir,
         enable_3d_void_fill=bool(args.enable_3d_void_fill),
@@ -8990,7 +9372,7 @@ def main() -> None:
             final_union_mm,
             views=views,
             temp_dir=temp_dir,
-            enable_multiplanar=bool(args.enable_multiplanar),
+            enable_multiplanar=bool(enable_sagittal or enable_coronal),
             smoothing_passes=int(args.object_interpolation_smoothing_passes),
             keep_temp=bool(args.troubleshooting),
             workers=slice_postprocess_workers,
@@ -9008,6 +9390,39 @@ def main() -> None:
             workers=slice_postprocess_workers,
         )
 
+    final_output_mask_mm = final_union_mm
+    output_volume_rgb = input_volume_rgb
+    output_T, output_H, output_W = int(input_T), int(input_H), int(input_W)
+    if (int(T), int(H), int(W)) != (output_T, output_H, output_W):
+        print('\n=== Restoring final mask to original input geometry for default outputs ===')
+        final_output_mask_mm = restore_mask_volume_to_original_shape(
+            final_union_mm,
+            (output_T, output_H, output_W),
+            temp_dir / 'final_union_original_geometry.u8.dat',
+            workers=int(slice_postprocess_workers),
+            prefer_memory=True,
+        )
+
+    output_radial_angle = 0.0
+    if float(resolved_azimuth_angle) > 0.0:
+        output_radial_angle = resolve_radial_azimuth_angle(
+            requested_azimuth_angle,
+            enable_radial=True,
+            diameter=min(output_W, output_H),
+        )
+    output_views = get_view_infos(
+        T=output_T,
+        H=output_H,
+        W=output_W,
+        disable_multiplanar=None,
+        enable_sagittal=bool(enable_sagittal or save_sagittal),
+        enable_coronal=bool(enable_coronal or save_coronal),
+        azimuth_angle=float(output_radial_angle),
+        include_radial=True,
+        tilt_angles=tilt_angles,
+        tilt_directions=tilt_directions,
+    )
+
     final_paths: Dict[str, Path] = {}
 
     if bool(args.troubleshooting) and int(args.interpolate) > 0:
@@ -9023,12 +9438,13 @@ def main() -> None:
             save_binary_pattern_value=args.save_binary,
             save_labels_pattern_value=args.save_labels,
             save_nrrd_flag=bool(args.save_nrrd),
-            save_multiplanar_flag=bool(args.save_multiplanar),
+            save_sagittal_flag=bool(save_sagittal),
+            save_coronal_flag=bool(save_coronal),
             total_passes=int(args.interpolate_passes),
             T=T,
             H=H,
             W=W,
-            enable_multiplanar=bool(args.enable_multiplanar),
+            enable_multiplanar=bool(enable_sagittal or enable_coronal),
             min_radius=float(args.min_radius),
             temp_dir=temp_dir,
             keep_temp=bool(args.troubleshooting),
@@ -9039,8 +9455,8 @@ def main() -> None:
     print('\n=== Scheduling final outputs in background ===')
     final_output_paths, final_futures = collect_pipeline_output_futures(
         output_manager.executor,
-        volume_rgb=volume_rgb,
-        mask_u8=final_union_mm,
+        volume_rgb=output_volume_rgb,
+        mask_u8=final_output_mask_mm,
         out_dir=out_dir,
         stem=input_path.stem,
         fps=fps,
@@ -9051,16 +9467,18 @@ def main() -> None:
         frame_workers=output_frame_workers,
         show_progress=False,
     )
-    if bool(args.save_multiplanar):
+    if bool(save_sagittal) or bool(save_coronal):
         extra_paths, extra_futures = collect_multiplanar_output_futures(
             output_manager.executor,
-            volume_rgb=volume_rgb,
-            mask_u8=final_union_mm,
+            volume_rgb=output_volume_rgb,
+            mask_u8=final_output_mask_mm,
             out_dir=out_dir,
             stem=input_path.stem,
             fps=fps,
             save_binary_pattern_value=args.save_binary,
             save_labels_pattern_value=args.save_labels,
+            save_sagittal_flag=bool(save_sagittal),
+            save_coronal_flag=bool(save_coronal),
             tag=None,
             frame_workers=output_frame_workers,
             show_progress=False,
@@ -9077,15 +9495,15 @@ def main() -> None:
 
     voxel_volume = None
     if bool(args.voxel_volume):
-        voxel_counts = np.zeros((int(final_union_mm.shape[0]),), dtype=np.int64)
+        voxel_counts = np.zeros((int(final_output_mask_mm.shape[0]),), dtype=np.int64)
 
         def _count_voxels(z: int) -> None:
-            voxel_counts[int(z)] = np.int64(np.count_nonzero(np.asarray(final_union_mm[int(z)])))
+            voxel_counts[int(z)] = np.int64(np.count_nonzero(np.asarray(final_output_mask_mm[int(z)])))
 
         parallel_for_indices(
-            int(final_union_mm.shape[0]),
+            int(final_output_mask_mm.shape[0]),
             _count_voxels,
-            max_workers=choose_slice_parallel_workers(int(slice_postprocess_workers), int(final_union_mm.shape[0])),
+            max_workers=choose_slice_parallel_workers(int(slice_postprocess_workers), int(final_output_mask_mm.shape[0])),
             desc='Counting voxel_volume',
         )
         voxel_volume = int(np.sum(voxel_counts, dtype=np.int64))
@@ -9106,14 +9524,14 @@ def main() -> None:
             final_paths[f'{view.name}_images_dir'] = image_dir
 
     if bool(args.save_radial):
-        radial_view = next((v for v in views if v.name == 'radial'), None)
+        radial_view = next((v for v in output_views if v.name == 'radial'), None)
         if radial_view is None:
-            print('Warning: --save_radial requested but --azimuth_angle is 0; skipping radial outputs')
+            print('Warning: --save_radial requested but radial views are disabled; skipping radial outputs')
         else:
             print('\n=== Saving radial outputs ===')
             final_paths.update(write_additional_view_outputs(
-                volume_rgb=volume_rgb,
-                mask_u8=final_union_mm,
+                volume_rgb=output_volume_rgb,
+                mask_u8=final_output_mask_mm,
                 view=radial_view,
                 out_dir=out_dir,
                 stem=input_path.stem,
@@ -9126,15 +9544,15 @@ def main() -> None:
             ))
 
     if bool(args.save_tilted_transverse):
-        tilted_views = [v for v in views if v.family == 'tilted_transverse']
+        tilted_views = [v for v in output_views if v.family == 'tilted_transverse']
         if not tilted_views:
             print('Warning: --save_tilted_transverse requested but --tilt_angle is 0; skipping tilted transverse outputs')
         else:
             print('\n=== Saving tilted transverse outputs ===')
             for view in tilted_views:
                 final_paths.update(write_additional_view_outputs(
-                    volume_rgb=volume_rgb,
-                    mask_u8=final_union_mm,
+                    volume_rgb=output_volume_rgb,
+                    mask_u8=final_output_mask_mm,
                     view=view,
                     out_dir=out_dir,
                     stem=input_path.stem,
@@ -9199,6 +9617,8 @@ def main() -> None:
         spec_notes=spec_notes,
     )
 
+    if final_output_mask_mm is not final_union_mm:
+        close_memmap_array(final_output_mask_mm)
     close_memmap_array(final_union_mm)
     for model_support in native_view_support_by_model.values():
         for mm in model_support.values():
@@ -9225,7 +9645,9 @@ def main() -> None:
         close_memmap_array(mm)
     for _, yolo in yolo_models:
         unload_yolo_model(yolo)
-    close_memmap_array(volume_rgb)
+    if volume_rgb is not input_volume_rgb:
+        close_memmap_array(volume_rgb)
+    close_memmap_array(input_volume_rgb)
     trim_cuda_memory()
     gc.collect()
 
