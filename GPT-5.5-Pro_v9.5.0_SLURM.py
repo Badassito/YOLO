@@ -2,7 +2,7 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v9.4.0_SLURM single-channel-aligned script:
+This v9.5.0_SLURM single-channel-aligned script:
   - builds Transverse, optional Tilted Transverse, independently optional Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - renders parent/full-frame videos directly from the native view transform so inference no longer waits on
     a separately rendered canvas video, and derives non-radial tile videos from shared canvas batches so the
@@ -21,8 +21,8 @@ This v9.4.0_SLURM single-channel-aligned script:
     Transverse results view-native through cleanup/interpolation, then backprojects them after per-view processing
   - treats --model as a single YOLO segmentation model path; multiple-model inference is not supported in this script
   - applies final 3D void fill only when --enable_3d_void_fill is active, and only once after the global union
-  - applies --object_interpolation_smoothing to the final unioned native object, with frozen-state
-    Transverse and optional Sagittal/Coronal deltas repeated by --object_interpolation_smoothing_passes
+  - applies --gaussian_smoothing to the final unioned native object volume, repeated by
+    --gaussian_smoothing_passes when the smoothing sigma is greater than zero
   - supports Radial and Tilted Transverse view-native interpolation, and keeps Tilted Transverse frame N centered on native slice N with black-padded out-of-bounds shear samples
   - resizes the working volume to an approximately cubic orthogonal volume when needed, restores the final mask to the original input dimensions for default outputs,
     and saves the transverse default color overlay plus optional labels, bilevel compressed TIFF binary masks, binary MKVs, NRRD, sagittal, coronal, radial,
@@ -51,6 +51,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
@@ -235,16 +236,16 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--voxel_volume", action="store_true", help="Count white voxels in the final binary output and save the value to the summary text file")
     p.add_argument("--enable_3d_void_fill", action="store_true",
                    help="Apply one final 3D enclosed-void fill after the global union. Disabled by default")
-    p.add_argument("--object_interpolation_smoothing", action="store_true",
-                   help="Apply frozen-state object mask interpolation smoothing to the final unioned object")
-    p.add_argument("--object_interpolation_smoothing_passes", default=1, type=int,
-                   help="Apply --object_interpolation_smoothing this many passes, freezing the object state at the start of each pass")
+    p.add_argument("--gaussian_smoothing", default=3.0, type=float,
+                   help="Gaussian standard deviation, in voxel units, applied to the final binary 3D volume. 0 disables smoothing")
+    p.add_argument("--gaussian_smoothing_passes", default=1, type=int,
+                   help="Apply --gaussian_smoothing this many times when the smoothing sigma is greater than 0")
 
     p.add_argument("--troubleshooting", action="store_true",
                    help="Keep temporary files and save outputs before each interpolation pass")
 
     p.add_argument("--interpolate", default=15, type=int,
-                   help="Maximum slice distance used to search for interpolation candidates in Cartesian views. 0 disables interpolation")
+                   help="Maximum view-native slice/frame distance used to search for interpolation candidates. Radial interpolation wraps around frame order. 0 disables interpolation")
     p.add_argument("--interpolation_walk_back", default=3, type=int,
                    help="Additional source slices to bridge before the endpoint slice. 0 disables walk-back bridges")
     p.add_argument("--interpolation_candidates", default=1, type=int,
@@ -345,7 +346,7 @@ def _cpu_count() -> int:
 def default_worker_budget() -> int:
     """Intentional CPU oversubscription for mixed GPU/IO/CPU workloads.
 
-    The v9.4.0 SLURM target has enough CPU headroom that running roughly 2x the visible CPU count
+    The v9.5.0 SLURM target has enough CPU headroom that running roughly 2x the visible CPU count
     helps keep ffmpeg, view rendering, interpolation planning, and output writers busy while the GPU
     is inferencing or waiting on a different stage.
     """
@@ -907,7 +908,7 @@ def compute_cube_resize_shape(
 ) -> Tuple[int, int, int]:
     """Return the minimal processing shape whose dimensions are within tolerance of the longest axis.
 
-    v9.4.0 requires the orthogonal working volume to be approximately cubic.  The implementation
+    v9.5.0 requires the orthogonal working volume to be approximately cubic.  The implementation
     preserves any axis that is already within the tolerated band and upsamples shorter axes only
     enough to reach ``(1 - tolerance) * longest``.  This avoids unnecessary XY resampling for the
     common 3072x3072x1930 case while still satisfying the 5% cube constraint.
@@ -964,7 +965,7 @@ def resize_volume_to_processing_cube_gray8(
     prefer_memory: bool = True,
     reserve_bytes: int = 32 * GIB,
 ) -> np.ndarray:
-    """Resample a gray8 (t,Y,X) volume to the v9.4.0 approximately-cubic processing shape."""
+    """Resample a gray8 (t,Y,X) volume to the v9.5.0 approximately-cubic processing shape."""
     in_t, in_h, in_w = (int(volume_gray.shape[0]), int(volume_gray.shape[1]), int(volume_gray.shape[2]))
     out_t, out_h, out_w = (int(out_shape[0]), int(out_shape[1]), int(out_shape[2]))
     if (in_t, in_h, in_w) == (out_t, out_h, out_w):
@@ -974,7 +975,7 @@ def resize_volume_to_processing_cube_gray8(
         shape=(out_t, out_h, out_w),
         dtype=np.uint8,
         path=out_path,
-        desc='v9.4.0 cubic processing volume',
+        desc='v9.5.0 cubic processing volume',
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
     )
@@ -1004,7 +1005,7 @@ def resize_volume_to_processing_cube_gray8(
         int(out_t),
         _render_target_slice,
         max_workers=worker_count,
-        desc='Resizing orthogonal volume to v9.4.0 cube',
+        desc='Resizing orthogonal volume to v9.5.0 cube',
         chunk_size=chunk_size,
     )
     flush_array(out_mm)
@@ -1082,7 +1083,7 @@ def resolve_radial_azimuth_angle(
     enable_radial: bool,
     diameter: int,
 ) -> float:
-    """Resolve v9.4.0 radial activation and default full-coverage angle."""
+    """Resolve v9.5.0 radial activation and default full-coverage angle."""
     if requested_angle is not None:
         if float(requested_angle) <= 0.0:
             return 0.0
@@ -1401,7 +1402,7 @@ def compute_tilt_frame_range(
 ) -> Tuple[int, int]:
     """Return the legacy expanded tilted-frame range for diagnostic callers.
 
-    The v9.4.0 pipeline itself keeps Tilted Transverse frame counts equal to the native
+    The v9.5.0 pipeline itself keeps Tilted Transverse frame counts equal to the native
     transverse frame count and fills out-of-bounds shear samples with black.
     """
     t_dim_i = int(t_dim)
@@ -1461,7 +1462,7 @@ def get_view_infos(
     enable_sagittal: bool = False,
     enable_coronal: bool = False,
 ) -> List[ViewInfo]:
-    # Backward-compatible alias for older command lines; v9.4.0 controls Sagittal and
+    # Backward-compatible alias for older command lines; v9.5.0 controls Sagittal and
     # Coronal independently via --enable_sagittal and --enable_coronal.
     if disable_multiplanar is not None:
         enable_sagittal = bool(enable_sagittal or (not bool(disable_multiplanar)))
@@ -1518,7 +1519,7 @@ def get_view_infos(
             for sign in (+1.0, -1.0):
                 signed_angle = float(sign * tilt_angle)
                 token = _format_signed_angle_token(signed_angle)
-                # v9.4.0 keeps Tilted Transverse on the native Transverse frame count:
+                # v9.5.0 keeps Tilted Transverse on the native Transverse frame count:
                 # output frame N is centered on native slice N, with out-of-bounds shear samples
                 # at the start/end filled black.
                 tilt_frame_start, tilt_frame_stop = 0, int(T) - 1
@@ -3947,7 +3948,7 @@ def fill_3d_voids_inplace_streaming(
 ) -> None:
     """Fill enclosed 3D voids by labeling background connected components once.
 
-    v9.4.0 allows 3D void fill only as an optional final global-union step. This
+    v9.5.0 allows 3D void fill only as an optional final global-union step. This
     function performs that operation by labeling the background volume, marking any
     background component connected to the volume boundary, and converting all other
     background components to foreground. The default 6-connected background matches
@@ -4041,12 +4042,15 @@ def label_foreground_volume_streaming(
     keep_temp: bool = False,
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
+    wrap_axis: bool = False,
 ) -> Tuple[np.ndarray, int, List[Path]]:
     """Label a 3D foreground volume using slice-streamed 26-connectivity.
 
       - prefers an anonymous in-memory uint32 label volume when enough RAM+swap is available
       - otherwise uses a single disk-backed provisional label volume and compacts labels in place,
         avoiding the previous second full uint32 relabel volume
+      - when wrap_axis is true, the first and last slices are treated as adjacent. This is used
+        for Radial view-native interpolation over the [0°, 180°) diameter-frame domain.
     """
     z_dim, h, w = mask_mm.shape
     estimated_bytes = estimate_voidfill_workspace_bytes((z_dim, h, w))
@@ -4067,12 +4071,19 @@ def label_foreground_volume_streaming(
 
     uf = _UnionFind()
     prev_gid_slice: Optional[np.ndarray] = None
+    first_gid_slice: Optional[np.ndarray] = None
+    last_gid_slice: Optional[np.ndarray] = None
 
     for z in tqdm(range(z_dim), desc='Interpolation: slice labeling'):
         fg = (np.asarray(mask_mm[z]) > 0).astype(np.uint8, copy=False)
         num_labels, labels2d = cv2.connectedComponents(fg, connectivity=8, ltype=cv2.CV_32S)
         if int(num_labels) <= 1:
             labels_store[z, :, :] = 0
+            gid_slice = np.zeros((h, w), dtype=np.uint32)
+            if int(z) == 0:
+                first_gid_slice = np.asarray(gid_slice)
+            if int(z) == int(z_dim) - 1:
+                last_gid_slice = np.asarray(gid_slice)
             prev_gid_slice = None
             continue
 
@@ -4086,6 +4097,15 @@ def label_foreground_volume_streaming(
                 uf.union(int(a), int(b))
 
         prev_gid_slice = np.asarray(gid_slice)
+        if int(z) == 0:
+            first_gid_slice = np.asarray(gid_slice)
+        if int(z) == int(z_dim) - 1:
+            last_gid_slice = np.asarray(gid_slice)
+
+    if bool(wrap_axis) and int(z_dim) > 1 and first_gid_slice is not None and last_gid_slice is not None:
+        if np.any(first_gid_slice) and np.any(last_gid_slice):
+            for a, b in _iter_adjacent_gid_pairs(last_gid_slice, first_gid_slice):
+                uf.union(int(a), int(b))
 
     root_map = uf.root_map()
     if root_map.shape[0] <= 1:
@@ -4110,13 +4130,15 @@ def build_slice_endpoint_seeds_from_label_volume(
     labels_real: np.ndarray,
     workers: int = 1,
     desc: str = 'Interpolation: endpoint seeds [scan]',
+    wrap_axis: bool = False,
 ) -> Tuple[List[SliceEndpointSeed], int]:
     """Fast slice-graph endpoint scan for slice-direction interpolation.
 
     This avoids per-object 3D voxel skeletonization on large relabeled volumes, which can become
     prohibitively slow when an object's bounding box spans a large fraction of the volume. Endpoints
     are identified from connected components in each slice that do not continue into the previous or
-    next slice of the same relabeled object.
+    next slice of the same relabeled object. When wrap_axis is true, slice 0 and the
+    final slice are also considered adjacent for Radial interpolation.
     """
     z_dim = int(labels_real.shape[0])
     if z_dim <= 0:
@@ -4129,8 +4151,12 @@ def build_slice_endpoint_seeds_from_label_volume(
         if not np.any(curr_slice):
             return []
 
-        prev_slice = np.asarray(labels_real[int(z) - 1]) if int(z) > 0 else None
-        next_slice = np.asarray(labels_real[int(z) + 1]) if (int(z) + 1) < z_dim else None
+        if bool(wrap_axis) and z_dim > 1:
+            prev_slice = np.asarray(labels_real[(int(z) - 1) % z_dim])
+            next_slice = np.asarray(labels_real[(int(z) + 1) % z_dim])
+        else:
+            prev_slice = np.asarray(labels_real[int(z) - 1]) if int(z) > 0 else None
+            next_slice = np.asarray(labels_real[int(z) + 1]) if (int(z) + 1) < z_dim else None
 
         seeds_local: List[SliceEndpointSeed] = []
         present = np.unique(curr_slice)
@@ -4276,7 +4302,7 @@ _DENSE_RADIAL_BACKPROJECT_MAP_CACHE: Dict[Tuple[int, int, int, Tuple[Tuple[float
 
 
 def radial_full_coverage_angle_deg(diameter: int) -> float:
-    """Return the v9.4.0 radial spacing that gives approximately 1x ROI edge coverage."""
+    """Return the v9.5.0 radial spacing that gives approximately 1x ROI edge coverage."""
     diameter_i = max(1, int(diameter))
     return float(360.0 / (math.pi * float(diameter_i)))
 
@@ -4310,7 +4336,7 @@ def _nearest_radial_source_for_backprojection(
 def build_radial_backprojection_plan(radial_view: ViewInfo) -> Tuple[List[RadialBackprojectionSample], Dict[str, float]]:
     """Build the angular plan used to backproject a radial view into Cartesian space.
 
-    If the user-requested radial spacing is coarser than the v9.4.0 full-coverage spacing,
+    If the user-requested radial spacing is coarser than the v9.5.0 full-coverage spacing,
     backprojection is densified to the full-coverage spacing and each dense angle samples the
     nearest completed radial prediction frame. This keeps Radial masks view-native through
     postprocessing/interpolation while preventing sparse spoke-like Cartesian backprojections.
@@ -4370,7 +4396,7 @@ def build_dense_radial_backprojection_map(
 ) -> DenseRadialBackprojectionMap:
     """Map every Cartesian ROI pixel to its nearest dense radial source frame and radial coordinate.
 
-    This is the dense v9.4.0 backprojection path: instead of painting only the pixels that lie on
+    This is the dense v9.5.0 backprojection path: instead of painting only the pixels that lie on
     a set of spokes, every pixel inside the circular ROI receives a sample from the Radial video's
     own frame/raster coordinate system.  When the user-provided azimuth spacing is too coarse, the
     supplied ``plan`` is already densified to the full-coverage angular spacing; pixels then select
@@ -4697,11 +4723,11 @@ def assemble_current_view_union_volume(
     """Build the single-model final view union.
 
     The mapping is kept keyed by model name because earlier pipeline stages store temporary
-    workspaces under the model stem. v9.4.0 rejects multiple model entries and never
+    workspaces under the model stem. v9.5.0 rejects multiple model entries and never
     combines outputs from more than one model.
     """
     if len(view_volumes_by_model) != 1:
-        raise ValueError('v9.4.0_SLURM supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('v9.5.0_SLURM supports exactly one --model; multiple-model inference has been removed')
 
     model_name = next(iter(view_volumes_by_model.keys()))
     final_union_mm = allocate_workspace_array(
@@ -5227,6 +5253,7 @@ def _find_slice_projection_candidates(
     max_slice_distance: int,
     search_angle_deg: float,
     max_candidates: int,
+    wrap_axis: bool = False,
 ) -> List[SliceProjectionCandidate]:
     if int(max_slice_distance) <= 0 or int(max_candidates) <= 0:
         return []
@@ -5241,9 +5268,12 @@ def _find_slice_projection_candidates(
     num_slices = labels_real.shape[0]
     found: Dict[int, SliceProjectionCandidate] = {}
 
-    for step in range(1, int(max_slice_distance) + 1):
+    max_steps = min(int(max_slice_distance), max(0, int(num_slices) - 1)) if bool(wrap_axis) else int(max_slice_distance)
+    for step in range(1, int(max_steps) + 1):
         s = int(s0 + int(seed.direction_sign) * step)
-        if s < 0 or s >= num_slices:
+        if bool(wrap_axis):
+            s = int(s % int(num_slices))
+        elif s < 0 or s >= num_slices:
             break
 
         threshold = -float(slope) * float(step)
@@ -5299,6 +5329,7 @@ def _collect_walkback_source_points(
     start_point: Tuple[int, int, int],
     direction_sign: int,
     walk_back: int,
+    wrap_axis: bool = False,
 ) -> List[Tuple[int, int, int]]:
     if int(walk_back) <= 0:
         return []
@@ -5312,9 +5343,15 @@ def _collect_walkback_source_points(
     current_slice = int(s0)
     num_slices = labels_real.shape[0]
 
-    for _ in range(int(walk_back)):
+    max_walk = min(int(walk_back), max(0, int(num_slices) - 1)) if bool(wrap_axis) else int(walk_back)
+    visited_slices = {int(current_slice)}
+    for _ in range(int(max_walk)):
         next_slice = int(current_slice - int(direction_sign))
-        if next_slice < 0 or next_slice >= num_slices:
+        if bool(wrap_axis):
+            next_slice = int(next_slice % int(num_slices))
+            if next_slice in visited_slices:
+                break
+        elif next_slice < 0 or next_slice >= num_slices:
             break
 
         next_slice_mask = labels_real[next_slice] == int(label)
@@ -5326,6 +5363,7 @@ def _collect_walkback_source_points(
             break
 
         out.append((int(next_slice), int(next_anchor[0]), int(next_anchor[1])))
+        visited_slices.add(int(next_slice))
         current_slice = int(next_slice)
         current_component = next_component
         current_anchor = next_anchor
@@ -5465,6 +5503,7 @@ def _build_slice_endpoint_seeds(
     labels_real: np.ndarray,
     extension_slices: int,
     workers: int = 1,
+    wrap_axis: bool = False,
 ) -> Tuple[List[SliceEndpointSeed], int]:
     """Build interpolation endpoint seeds.
 
@@ -5474,11 +5513,15 @@ def _build_slice_endpoint_seeds(
       - ``scan``: always use the fast slice-graph terminal scan
       - ``skeleton``: always use per-object 3D skeletonization
 
-    The hybrid path keeps 3D skeletonization as the default v9.4.0-compliant behavior while still
+    The hybrid path keeps 3D skeletonization as the default v9.5.0-compliant behavior while still
     protecting large SLURM-scale volumes from pathological all-voxel skeletonization costs.
     """
     mode = os.environ.get('YOLO_TTA_INTERPOLATION_ENDPOINT_MODE', 'hybrid').strip().lower()
     if mode not in {'scan', 'hybrid', 'skeleton'}:
+        mode = 'scan'
+    if bool(wrap_axis):
+        # Skeletonizing a compact bounding box cannot represent the circular first-axis
+        # topology of Radial frame order, so use the slice-graph endpoint scan.
         mode = 'scan'
 
     if mode == 'scan':
@@ -5486,6 +5529,7 @@ def _build_slice_endpoint_seeds(
             labels_real,
             workers=int(workers),
             desc='Interpolation: endpoint seeds [scan]',
+            wrap_axis=bool(wrap_axis),
         )
 
     objs = ndi.find_objects(labels_real)
@@ -5509,6 +5553,7 @@ def _build_slice_endpoint_seeds(
                 labels_real,
                 workers=int(workers),
                 desc='Interpolation: endpoint seeds [scan]',
+                wrap_axis=bool(wrap_axis),
             )
 
     seeds: List[SliceEndpointSeed] = []
@@ -5541,6 +5586,8 @@ def _build_linear_slice_bridge_plan(
     target_label: int,
     source_point: Tuple[int, int, int],
     target_point: Tuple[int, int, int],
+    direction_sign: Optional[int] = None,
+    wrap_axis: bool = False,
 ) -> Optional[SliceBridgeRenderPlan]:
     s0, y0, x0 = source_point
     s1, y1, x1 = target_point
@@ -5560,7 +5607,16 @@ def _build_linear_slice_bridge_plan(
     if not np.any(source_local) or not np.any(target_local):
         return None
 
-    steps = int(abs(int(s1) - int(s0)))
+    if bool(wrap_axis):
+        num_slices = int(labels_real.shape[0])
+        sign = 1 if int(direction_sign or 1) >= 0 else -1
+        if sign > 0:
+            steps = int((int(s1) - int(s0)) % num_slices)
+        else:
+            steps = int((int(s0) - int(s1)) % num_slices)
+    else:
+        steps = int(abs(int(s1) - int(s0)))
+        sign = 1 if int(s1) > int(s0) else -1
     if steps <= 0:
         return None
 
@@ -5572,7 +5628,7 @@ def _build_linear_slice_bridge_plan(
         source_anchor=(int(source_anchor[0]), int(source_anchor[1])),
         target_anchor=(int(target_anchor[0]), int(target_anchor[1])),
         steps=int(steps),
-        sign=1 if int(s1) > int(s0) else -1,
+        sign=int(sign),
         sdf0=np.ascontiguousarray(_signed_distance_2d(source_local)),
         sdf1=np.ascontiguousarray(_signed_distance_2d(target_local)),
     )
@@ -5623,6 +5679,7 @@ def _plan_slice_seed_bridges(
     interpolation_walk_back: int,
     interpolation_candidates: int,
     interpolate_min_radius: float,
+    wrap_axis: bool = False,
 ) -> SliceSeedBridgePlanResult:
     result = SliceSeedBridgePlanResult()
 
@@ -5632,6 +5689,7 @@ def _plan_slice_seed_bridges(
         max_slice_distance=int(max_slice_distance),
         search_angle_deg=float(search_angle_deg),
         max_candidates=int(interpolation_candidates),
+        wrap_axis=bool(wrap_axis),
     )
     if not candidates:
         return result
@@ -5643,6 +5701,7 @@ def _plan_slice_seed_bridges(
         start_point=seed.point,
         direction_sign=int(seed.direction_sign),
         walk_back=int(interpolation_walk_back),
+        wrap_axis=bool(wrap_axis),
     )
 
     for candidate in candidates:
@@ -5654,6 +5713,8 @@ def _plan_slice_seed_bridges(
                 target_label=int(candidate.target_label),
                 source_point=src_point,
                 target_point=candidate.target_point,
+                direction_sign=int(seed.direction_sign),
+                wrap_axis=bool(wrap_axis),
             )
             if plan is None:
                 continue
@@ -5681,13 +5742,17 @@ def _plan_slice_seed_bridges(
 def _build_slice_bridge_render_schedule(
     plans: Sequence[SliceBridgeRenderPlan],
     num_slices: int,
+    wrap_axis: bool = False,
 ) -> List[List[Tuple[int, int]]]:
     schedule: List[List[Tuple[int, int]]] = [[] for _ in range(int(num_slices))]
     for plan_idx, plan in enumerate(plans):
         start_slice = int(plan.source_point[0])
         for step_idx in range(1, int(plan.steps)):
             s = int(start_slice + int(plan.sign) * step_idx)
-            if 0 <= s < int(num_slices):
+            if bool(wrap_axis):
+                s = int(s % int(num_slices))
+                schedule[s].append((int(plan_idx), int(step_idx)))
+            elif 0 <= s < int(num_slices):
                 schedule[s].append((int(plan_idx), int(step_idx)))
     return schedule
 
@@ -5704,6 +5769,7 @@ def interpolate_view_volume_pass_inplace(
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
+    wrap_axis: bool = False,
 ) -> Dict[str, object]:
     """Apply one interpolation pass directly to a view-volume stack.
 
@@ -5711,6 +5777,8 @@ def interpolate_view_volume_pass_inplace(
     merging all newly created bridge voxels only after planning is complete. Endpoint discovery,
     candidate search, bridge planning and slice rendering are parallelized across independent
     objects / seeds / slices to reduce the long single-threaded stretch after compact relabel.
+    For Radial views, wrap_axis lets endpoint search and bridge rendering wrap between the
+    final and first azimuth frames.
     """
     if int(max_slice_distance) <= 0:
         return {
@@ -5723,6 +5791,7 @@ def interpolate_view_volume_pass_inplace(
             'skipped_by_min_radius': 0,
             'added_voxels': 0,
             'skipped': True,
+            'wrap_axis': bool(wrap_axis),
         }
 
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -5739,6 +5808,7 @@ def interpolate_view_volume_pass_inplace(
         keep_temp=True,
         prefer_memory=use_in_memory,
         reserve_bytes=reserve_bytes,
+        wrap_axis=bool(wrap_axis),
     )
 
     if int(num_objects) <= 1:
@@ -5759,6 +5829,7 @@ def interpolate_view_volume_pass_inplace(
             'skipped_by_min_radius': 0,
             'added_voxels': 0,
             'skipped': int(num_objects) <= 1,
+            'wrap_axis': bool(wrap_axis),
         }
 
     worker_count = choose_slice_parallel_workers(int(workers), max(1, int(num_objects)))
@@ -5766,6 +5837,7 @@ def interpolate_view_volume_pass_inplace(
         labels_mm,
         extension_slices=int(max_slice_distance),
         workers=worker_count,
+        wrap_axis=bool(wrap_axis),
     )
     if not seeds:
         del labels_mm
@@ -5785,6 +5857,7 @@ def interpolate_view_volume_pass_inplace(
             'skipped_by_min_radius': 0,
             'added_voxels': 0,
             'skipped': False,
+            'wrap_axis': bool(wrap_axis),
         }
 
     bridge_path: Optional[Path] = None
@@ -5814,6 +5887,7 @@ def interpolate_view_volume_pass_inplace(
                 interpolation_walk_back=int(interpolation_walk_back),
                 interpolation_candidates=int(interpolation_candidates),
                 interpolate_min_radius=float(interpolate_min_radius),
+                wrap_axis=bool(wrap_axis),
             )
 
         pending = max(plan_workers, plan_workers * 2)
@@ -5837,7 +5911,7 @@ def interpolate_view_volume_pass_inplace(
                 plans.extend(seed_result.plans)
 
         if plans:
-            schedule = _build_slice_bridge_render_schedule(plans, int(mask_mm.shape[0]))
+            schedule = _build_slice_bridge_render_schedule(plans, int(mask_mm.shape[0]), wrap_axis=bool(wrap_axis))
             added_counts = np.zeros((int(mask_mm.shape[0]),), dtype=np.int64)
             render_workers = choose_slice_parallel_workers(int(workers), int(mask_mm.shape[0]))
 
@@ -5906,6 +5980,7 @@ def interpolate_view_volume_pass_inplace(
         'skipped_by_min_radius': int(skipped_by_min_radius),
         'added_voxels': int(added_voxels),
         'skipped': False,
+        'wrap_axis': bool(wrap_axis),
     }
 
 
@@ -6142,6 +6217,7 @@ def prepare_view_volume_after_fullframe(
                 keep_temp=bool(keep_temp),
                 prefer_memory=True,
                 workers=int(interpolation_task_workers),
+                wrap_axis=bool(view.family == 'radial'),
             )
             stats_local = dict(stats_local)
             stats_local.update({
@@ -6210,7 +6286,7 @@ def prepare_view_volume_after_fullframe(
             radial_view=view,
             out_path=out_path,
             desc=f'Backprojecting {model_name}/{view.name}',
-            prefer_memory=False,
+            prefer_memory=True,
             workers=int(slice_workers),
         )
         if float(min_radius) > 0.0:
@@ -6227,7 +6303,7 @@ def prepare_view_volume_after_fullframe(
             tilted_view=view,
             out_path=out_path,
             desc=f'Backprojecting {model_name}/{view.name}',
-            prefer_memory=False,
+            prefer_memory=True,
             workers=int(slice_workers),
         )
     else:
@@ -6253,7 +6329,7 @@ def gate_tile_volume_against_parent_inplace(
     """Keep only tile components that intersect the frozen parent support on the same slice.
 
     The gating result for one slice never affects another slice, so this stage can be parallelized
-    aggressively across the slice axis without violating the v9.4.0_SLURM semantics.
+    aggressively across the slice axis without violating the v9.5.0_SLURM semantics.
     """
     num_slices = int(tile_mask_mm.shape[0])
     accepted_components = np.zeros((num_slices,), dtype=np.int64)
@@ -6412,7 +6488,7 @@ def gate_tile_volume_into_consolidated_parent(
 ) -> TileGateResult:
     """Gate one tile volume, then OR accepted components into the parent-view tile accumulator.
 
-    v9.4.0 intentionally consolidates all accepted tiles for a parent view before interpolation.
+    v9.5.0 intentionally consolidates all accepted tiles for a parent view before interpolation.
     This replaces the previous per-tile interpolation path while preserving the mask-wise OR gate:
     accepted tile components still must intersect the frozen parent full-frame support, and accepted
     tiles cannot accept other tiles because the support image is not the accumulator.
@@ -6511,6 +6587,7 @@ def finalize_consolidated_tile_volume_for_parent(
                 keep_temp=bool(keep_temp),
                 prefer_memory=True,
                 workers=int(interpolation_task_workers),
+                wrap_axis=bool(view.family == 'radial'),
             )
             stats_local = dict(stats_local)
             stats_local.update({
@@ -6558,504 +6635,118 @@ def finalize_consolidated_tile_volume_for_parent(
 
 
 # --------------------------
-# Final object interpolation smoothing (optional)
+# Final Gaussian smoothing
 # --------------------------
 
 
-def _bbox2d_for_masks(mask_a: np.ndarray, mask_b: np.ndarray, margin: int = 4) -> Optional[Tuple[slice, slice]]:
-    ys_a, xs_a = np.nonzero(mask_a)
-    ys_b, xs_b = np.nonzero(mask_b)
-    if ys_a.size == 0 or ys_b.size == 0:
-        return None
-    y0 = max(0, int(min(int(np.min(ys_a)), int(np.min(ys_b)))) - int(margin))
-    y1 = min(mask_a.shape[0], int(max(int(np.max(ys_a)), int(np.max(ys_b)))) + int(margin) + 1)
-    x0 = max(0, int(min(int(np.min(xs_a)), int(np.min(xs_b)))) - int(margin))
-    x1 = min(mask_a.shape[1], int(max(int(np.max(xs_a)), int(np.max(xs_b)))) + int(margin) + 1)
-    if y0 >= y1 or x0 >= x1:
-        return None
-    return slice(y0, y1), slice(x0, x1)
-
-
-def _smooth_one_axis_from_frozen_labels(
-    dst_axis_view: np.ndarray,
-    frozen_axis_view: np.ndarray,
-    labels_axis_view: np.ndarray,
-    *,
-    axis_name: str,
-    workers: int = 1,
-) -> int:
-    """Create frozen-state N/N+2 -> N+1 object-smoothing deltas along one axis.
-
-    ``dst_axis_view`` is expected to be an initially empty per-view delta volume in the same
-    orientation as ``frozen_axis_view``. The source masks and labels are frozen before the pass.
-    Newly synthesized middle-slice masks are written only when they are absent from the frozen
-    source, so Transverse/Sagittal/Coronal smoothing jobs can run independently and be unioned
-    after all view jobs finish.
-    """
-    axis_len = int(frozen_axis_view.shape[0])
-    if axis_len < 3:
-        return 0
-
-    added_by_plane = np.zeros((axis_len,), dtype=np.int64)
-    worker_count = choose_slice_parallel_workers(int(workers), max(1, axis_len - 2))
-    chunk_size = choose_parallel_chunk_size(max(1, axis_len - 2), worker_count, target_chunks_per_worker=2, min_chunk_size=1)
-    locks = [threading.Lock() for _ in range(axis_len)]
-
-    def _process(i: int) -> None:
-        i0 = int(i)
-        i1 = i0 + 2
-        im = i0 + 1
-        labels0 = np.asarray(labels_axis_view[i0])
-        labels1 = np.asarray(labels_axis_view[i1])
-        if not np.any(labels0) or not np.any(labels1):
-            return
-
-        common = np.intersect1d(np.unique(labels0[labels0 > 0]), np.unique(labels1[labels1 > 0]), assume_unique=False)
-        if common.size == 0:
-            return
-
-        local = np.zeros(frozen_axis_view.shape[1:], dtype=np.uint8)
-        for lbl in common.tolist():
-            src = labels0 == int(lbl)
-            tgt = labels1 == int(lbl)
-            if not np.any(src) or not np.any(tgt):
-                continue
-            bbox = _bbox2d_for_masks(src, tgt, margin=4)
-            if bbox is None:
-                continue
-            ys, xs = bbox
-            src_local = src[ys, xs]
-            tgt_local = tgt[ys, xs]
-            if not np.any(src_local) or not np.any(tgt_local):
-                continue
-            synth = (_signed_distance_2d(src_local) + _signed_distance_2d(tgt_local)) >= 0.0
-            if not np.any(synth):
-                continue
-            local_slice = local[ys, xs]
-            local_slice[synth] = np.uint8(1)
-
-        if not np.any(local):
-            return
-
-        local_new = np.asarray(local, dtype=bool) & (np.asarray(frozen_axis_view[im]) == 0)
-        if not np.any(local_new):
-            return
-
-        with locks[im]:
-            dst = dst_axis_view[im]
-            before_new = local_new & (np.asarray(dst) == 0)
-            if np.any(before_new):
-                added_by_plane[im] += np.int64(np.count_nonzero(before_new))
-            dst[local_new] = np.uint8(1)
-
-    parallel_for_indices_chunked(
-        axis_len - 2,
-        _process,
-        max_workers=worker_count,
-        desc=f'Object interpolation smoothing ({axis_name})',
-        chunk_size=chunk_size,
-    )
-    flush_array(dst_axis_view)
-    return int(np.sum(added_by_plane, dtype=np.int64))
-
-
-@dataclass
-class ObjectSmoothingViewResult:
-    view_name: str
-    display_name: str
-    added_voxels: int
-    num_objects: int
-    delta_mm: Optional[np.ndarray]
-    delta_path: Optional[Path]
-
-
-def _eligible_object_smoothing_views(views: Sequence[ViewInfo]) -> List[ViewInfo]:
-    view_by_name = {str(v.name): v for v in views}
-    # v9.4.0 splits Sagittal and Coronal activation.  Smooth along whichever of those
-    # orthogonal view axes are actually enabled, in parallel with Transverse.
-    wanted = ['transverse', 'sagittal', 'coronal']
-    out: List[ViewInfo] = []
-    for name in wanted:
-        view = view_by_name.get(name)
-        if view is not None and view.family == 'orthogonal':
-            out.append(view)
-    return out
-
-
-def _smooth_one_view_volume_to_delta(
-    *,
-    model_name: str,
-    view: ViewInfo,
-    source_mm: np.ndarray,
-    smoothing_dir: Path,
-    keep_temp: bool,
-    workers: int,
-) -> ObjectSmoothingViewResult:
-    """Smooth one frozen parent-view volume and return a view-oriented delta volume.
-
-    The input is a parent full-frame support volume in that view's own orientation. This keeps
-    object interpolation smoothing independent per view and avoids using Radial, Tilted Transverse,
-    or tiled predictions as smoothing sources.
-    """
-    view_dir = smoothing_dir / str(model_name) / str(view.name)
-    view_dir.mkdir(parents=True, exist_ok=True)
-    label_paths: List[Path] = []
-    labels_mm: Optional[np.ndarray] = None
-    delta_mm: Optional[np.ndarray] = None
-    delta_path: Optional[Path] = None
-
-    try:
-        labels_mm, num_objects, label_paths = label_foreground_volume_streaming(
-            source_mm,
-            view_dir / 'frozen_labels',
-            keep_temp=True,
-            prefer_memory=False,
-        )
-        if int(num_objects) <= 0:
-            return ObjectSmoothingViewResult(
-                view_name=str(view.name),
-                display_name=pretty_view_name(view),
-                added_voxels=0,
-                num_objects=int(num_objects),
-                delta_mm=None,
-                delta_path=None,
-            )
-
-        delta_path = view_dir / f'{view.name}.smoothing_delta.u8.dat'
-        delta_mm = allocate_workspace_array(
-            shape=tuple(int(x) for x in np.asarray(source_mm).shape),
-            dtype=np.uint8,
-            path=delta_path,
-            desc=f'{model_name}/{view.name} object-smoothing delta',
-            prefer_memory=False,
-        )
-        added = _smooth_one_axis_from_frozen_labels(
-            dst_axis_view=delta_mm,
-            frozen_axis_view=np.asarray(source_mm),
-            labels_axis_view=np.asarray(labels_mm),
-            axis_name=pretty_view_name(view),
-            workers=int(workers),
-        )
-
-        if int(added) <= 0:
-            close_memmap_array(delta_mm)
-            if not bool(keep_temp) and delta_path is not None:
-                try:
-                    delta_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
-            delta_mm = None
-            delta_path = None
-
-        return ObjectSmoothingViewResult(
-            view_name=str(view.name),
-            display_name=pretty_view_name(view),
-            added_voxels=int(added),
-            num_objects=int(num_objects),
-            delta_mm=delta_mm,
-            delta_path=delta_path,
-        )
-    finally:
-        if labels_mm is not None:
-            close_memmap_array(labels_mm)
-        if not bool(keep_temp):
-            for lp in label_paths:
-                try:
-                    lp.unlink(missing_ok=True)
-                except Exception:
-                    pass
-
-
-def union_view_oriented_delta_into_native_inplace(
-    dst_native_mm: np.ndarray,
-    delta_mm: np.ndarray,
-    view: ViewInfo,
-    *,
-    workers: int = 1,
-    desc: str = 'Union object-smoothing delta',
-) -> int:
-    """Union one view-oriented smoothing delta into the native transverse volume."""
-    added_by_slice = np.zeros((max(1, int(delta_mm.shape[0])),), dtype=np.int64)
-
-    if view.name == 'transverse':
-        if tuple(int(x) for x in delta_mm.shape) != tuple(int(x) for x in dst_native_mm.shape):
-            raise ValueError(
-                f"Transverse smoothing delta shape {tuple(delta_mm.shape)} does not match native shape {tuple(dst_native_mm.shape)}"
-            )
-        num_slices = int(dst_native_mm.shape[0])
-
-        def _merge_transverse(t: int) -> None:
-            src = np.asarray(delta_mm[int(t)], dtype=np.uint8)
-            if not np.any(src):
-                return
-            dst = dst_native_mm[int(t)]
-            src_bool = src > 0
-            added_by_slice[int(t)] = np.int64(np.count_nonzero(src_bool & (np.asarray(dst) == 0)))
-            np.maximum(dst, src, out=dst)
-
-        parallel_for_indices(
-            num_slices,
-            _merge_transverse,
-            max_workers=choose_slice_parallel_workers(int(workers), num_slices),
-            desc=desc,
-            show_progress=False,
-        )
-    elif view.name == 'sagittal':
-        expected = (int(dst_native_mm.shape[1]), int(dst_native_mm.shape[0]), int(dst_native_mm.shape[2]))
-        if tuple(int(x) for x in delta_mm.shape) != expected:
-            raise ValueError(f"Sagittal smoothing delta shape {tuple(delta_mm.shape)}; expected {expected}")
-        num_slices = int(delta_mm.shape[0])
-        added_by_slice = np.zeros((num_slices,), dtype=np.int64)
-
-        def _merge_sagittal(y: int) -> None:
-            src = np.asarray(delta_mm[int(y)], dtype=np.uint8)
-            if not np.any(src):
-                return
-            dst = dst_native_mm[:, int(y), :]
-            src_bool = src > 0
-            added_by_slice[int(y)] = np.int64(np.count_nonzero(src_bool & (np.asarray(dst) == 0)))
-            np.maximum(dst, src, out=dst)
-
-        parallel_for_indices(
-            num_slices,
-            _merge_sagittal,
-            max_workers=choose_slice_parallel_workers(int(workers), num_slices),
-            desc=desc,
-            show_progress=False,
-        )
-    elif view.name == 'coronal':
-        expected = (int(dst_native_mm.shape[2]), int(dst_native_mm.shape[0]), int(dst_native_mm.shape[1]))
-        if tuple(int(x) for x in delta_mm.shape) != expected:
-            raise ValueError(f"Coronal smoothing delta shape {tuple(delta_mm.shape)}; expected {expected}")
-        num_slices = int(delta_mm.shape[0])
-        added_by_slice = np.zeros((num_slices,), dtype=np.int64)
-
-        def _merge_coronal(x: int) -> None:
-            src = np.asarray(delta_mm[int(x)], dtype=np.uint8)
-            if not np.any(src):
-                return
-            dst = dst_native_mm[:, :, int(x)]
-            src_bool = src > 0
-            added_by_slice[int(x)] = np.int64(np.count_nonzero(src_bool & (np.asarray(dst) == 0)))
-            np.maximum(dst, src, out=dst)
-
-        parallel_for_indices(
-            num_slices,
-            _merge_coronal,
-            max_workers=choose_slice_parallel_workers(int(workers), num_slices),
-            desc=desc,
-            show_progress=False,
-        )
-    else:
-        raise ValueError(f'Object interpolation smoothing is not defined for view: {view.name}')
-
-    flush_array(dst_native_mm)
-    return int(np.sum(added_by_slice, dtype=np.int64))
-
-
-
-def _axis_view_from_native_for_smoothing(native_mm: np.ndarray, view: ViewInfo) -> np.ndarray:
-    """Return a read-only orientation view of a native (t, Y, X) volume for smoothing."""
-    if view.name == 'transverse':
-        return np.asarray(native_mm)
-    if view.name == 'sagittal':
-        return np.transpose(np.asarray(native_mm), (1, 0, 2))
-    if view.name == 'coronal':
-        return np.transpose(np.asarray(native_mm), (2, 0, 1))
-    raise ValueError(f'Object interpolation smoothing is not defined for view: {view.name}')
-
-
-def _smooth_one_final_union_axis_to_delta(
-    *,
-    view: ViewInfo,
-    frozen_native_mm: np.ndarray,
-    labels_native_mm: np.ndarray,
-    smoothing_dir: Path,
-    pass_index: int,
-    keep_temp: bool,
-    workers: int,
-) -> ObjectSmoothingViewResult:
-    """Smooth one axis from the frozen final union and return a view-oriented delta volume."""
-    view_dir = smoothing_dir / f'pass{int(pass_index)}' / str(view.name)
-    view_dir.mkdir(parents=True, exist_ok=True)
-
-    frozen_axis_view = _axis_view_from_native_for_smoothing(frozen_native_mm, view)
-    labels_axis_view = _axis_view_from_native_for_smoothing(labels_native_mm, view)
-
-    delta_path = view_dir / f'{view.name}.smoothing_delta.u8.dat'
-    delta_mm: Optional[np.ndarray] = allocate_workspace_array(
-        shape=tuple(int(x) for x in frozen_axis_view.shape),
-        dtype=np.uint8,
-        path=delta_path,
-        desc=f'final-union/pass{int(pass_index)}/{view.name} object-smoothing delta',
-        prefer_memory=False,
-    )
-
-    added = _smooth_one_axis_from_frozen_labels(
-        dst_axis_view=delta_mm,
-        frozen_axis_view=frozen_axis_view,
-        labels_axis_view=labels_axis_view,
-        axis_name=f'{pretty_view_name(view)} pass {int(pass_index)}',
-        workers=int(workers),
-    )
-
-    if int(added) <= 0:
-        close_memmap_array(delta_mm)
-        if not bool(keep_temp):
-            try:
-                delta_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-        delta_mm = None
-        delta_path_out: Optional[Path] = None
-    else:
-        delta_path_out = delta_path
-
-    return ObjectSmoothingViewResult(
-        view_name=str(view.name),
-        display_name=pretty_view_name(view),
-        added_voxels=int(added),
-        num_objects=0,
-        delta_mm=delta_mm,
-        delta_path=delta_path_out,
-    )
-
-
-def apply_object_interpolation_smoothing_inplace(
+def apply_gaussian_smoothing_inplace(
     mask_mm: np.ndarray,
-    views: Sequence[ViewInfo],
+    sigma: float,
+    passes: int,
     temp_dir: Path,
     *,
-    enable_multiplanar: bool = False,
-    smoothing_passes: int = 1,
     keep_temp: bool = False,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 16 * GIB,
     workers: int = 1,
-) -> Dict[str, int]:
-    """Apply object interpolation smoothing to the final unioned native object volume.
+) -> Dict[str, int | float]:
+    """Smooth the final binary 3D volume with a Gaussian kernel and re-threshold at 0.5.
 
-    Each pass freezes the current final union, labels objects once in native 3D, creates
-    independent Transverse and optional Sagittal/Coronal N/N+2 -> N+1 smoothing deltas, and
-    unions those deltas back only after every axis job in that pass is complete.  Radial,
-    Tilted Transverse, and tiled views are therefore included as part of the final unioned
-    object geometry but are not treated as separate smoothing axes.
+    The v9.5.0_SLURM smoothing stage is applied after the final view/tile union and optional
+    3D void fill, but before --keep_objects and before resizing back to the source geometry.
+    A single float32 workspace is reused for every pass to avoid retaining multiple dense
+    floating-point copies of the volume.
     """
-    eligible_views = _eligible_object_smoothing_views(views)
-
-    stats: Dict[str, int] = {
-        'passes_requested': int(smoothing_passes),
+    sigma_f = float(sigma)
+    passes_i = int(passes)
+    stats: Dict[str, int | float] = {
+        'enabled': 1 if sigma_f > 0.0 and passes_i > 0 else 0,
+        'sigma': float(sigma_f),
+        'passes_requested': int(max(0, passes_i)),
         'passes_completed': 0,
-        'transverse_added_voxels': 0,
-        'sagittal_added_voxels': 0,
-        'coronal_added_voxels': 0,
-        'transverse_union_added_voxels': 0,
-        'sagittal_union_added_voxels': 0,
-        'coronal_union_added_voxels': 0,
-        'total_union_added_voxels': 0,
+        'total_added_voxels': 0,
+        'total_removed_voxels': 0,
     }
-    if not eligible_views:
+    if sigma_f <= 0.0 or passes_i <= 0:
         return stats
 
-    smoothing_dir = temp_dir / 'object_interpolation_smoothing'
-    smoothing_dir.mkdir(parents=True, exist_ok=True)
-
-    requested_view_workers = _env_int('YOLO_TTA_OBJECT_SMOOTHING_VIEW_WORKERS', len(eligible_views))
-    view_workers = max(1, min(len(eligible_views), int(requested_view_workers)))
-    per_view_workers = max(1, int(workers) // max(1, view_workers))
-    print(
-        'Object interpolation smoothing view workers: '
-        f'{int(view_workers)} (per-view slice workers: {int(per_view_workers)}, '
-        f'passes: {int(smoothing_passes)})'
+    smooth_dir = temp_dir / 'gaussian_smoothing'
+    smooth_dir.mkdir(parents=True, exist_ok=True)
+    work_path = smooth_dir / 'gaussian_float32.dat'
+    work_mm = allocate_workspace_array(
+        shape=tuple(int(x) for x in np.asarray(mask_mm).shape),
+        dtype=np.float32,
+        path=work_path,
+        desc='Gaussian smoothing float32 workspace',
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
     )
 
-    ordered_names = ('transverse', 'sagittal', 'coronal')
+    num_slices = int(mask_mm.shape[0])
+    worker_count = choose_slice_parallel_workers(int(workers), num_slices)
 
-    for pass_idx in range(1, int(smoothing_passes) + 1):
-        pass_dir = smoothing_dir / f'pass{int(pass_idx)}'
-        pass_dir.mkdir(parents=True, exist_ok=True)
-        label_paths: List[Path] = []
-        labels_mm: Optional[np.ndarray] = None
-        pass_union_added = 0
+    try:
+        for pass_idx in range(1, passes_i + 1):
+            print(f'Gaussian smoothing pass {int(pass_idx)}/{int(passes_i)} (sigma={sigma_f:g} voxels)')
 
-        try:
-            labels_mm, num_objects, label_paths = label_foreground_volume_streaming(
-                mask_mm,
-                pass_dir / 'final_union_frozen_labels',
-                keep_temp=True,
-                prefer_memory=False,
+            def _copy_to_float(z: int) -> None:
+                work_mm[int(z), :, :] = np.asarray(mask_mm[int(z)], dtype=np.float32)
+
+            parallel_for_indices_chunked(
+                num_slices,
+                _copy_to_float,
+                max_workers=worker_count,
+                desc=f'Gaussian smoothing pass {int(pass_idx)}: copy binary volume',
+                show_progress=True,
+                target_chunks_per_worker=2,
             )
-            stats[f'pass{int(pass_idx)}_num_objects'] = int(num_objects)
-            if int(num_objects) <= 0:
-                stats['passes_completed'] = int(pass_idx)
-                break
+            flush_array(work_mm)
 
-            results: List[ObjectSmoothingViewResult] = []
-            with ThreadPoolExecutor(max_workers=int(view_workers), thread_name_prefix='object-smoothing-view') as executor:
-                future_to_view: Dict[Future, ViewInfo] = {}
-                for view in eligible_views:
-                    future = executor.submit(
-                        _smooth_one_final_union_axis_to_delta,
-                        view=view,
-                        frozen_native_mm=mask_mm,
-                        labels_native_mm=labels_mm,
-                        smoothing_dir=smoothing_dir,
-                        pass_index=int(pass_idx),
-                        keep_temp=bool(keep_temp),
-                        workers=int(per_view_workers),
-                    )
-                    future_to_view[future] = view
+            ndi.gaussian_filter(
+                input=work_mm,
+                sigma=float(sigma_f),
+                output=work_mm,
+                mode='constant',
+                cval=0.0,
+                truncate=4.0,
+            )
+            flush_array(work_mm)
 
-                for future in as_completed(future_to_view):
-                    result = future.result()
-                    result.num_objects = int(num_objects)
-                    results.append(result)
-                    stats[f'{result.view_name}_added_voxels'] = int(stats.get(f'{result.view_name}_added_voxels', 0)) + int(result.added_voxels)
-                    stats[f'pass{int(pass_idx)}_{result.view_name}_added_voxels'] = int(result.added_voxels)
-                    print(
-                        f'Object interpolation smoothing finished for {result.display_name} pass {int(pass_idx)}: '
-                        f'objects={int(num_objects)}, added_voxels={int(result.added_voxels)}'
-                    )
+            added_by_slice = np.zeros((num_slices,), dtype=np.int64)
+            removed_by_slice = np.zeros((num_slices,), dtype=np.int64)
 
-            for result in sorted(results, key=lambda r: ordered_names.index(r.view_name) if r.view_name in ordered_names else 99):
-                if result.delta_mm is None or int(result.added_voxels) <= 0:
-                    stats[f'pass{int(pass_idx)}_{result.view_name}_union_added_voxels'] = 0
-                    continue
-                view = next(v for v in eligible_views if v.name == result.view_name)
-                try:
-                    union_added = union_view_oriented_delta_into_native_inplace(
-                        mask_mm,
-                        result.delta_mm,
-                        view,
-                        workers=int(workers),
-                        desc=f'Union object-smoothing delta ({result.display_name} pass {int(pass_idx)})',
-                    )
-                    stats[f'{result.view_name}_union_added_voxels'] = int(stats.get(f'{result.view_name}_union_added_voxels', 0)) + int(union_added)
-                    stats[f'pass{int(pass_idx)}_{result.view_name}_union_added_voxels'] = int(union_added)
-                    stats['total_union_added_voxels'] += int(union_added)
-                    pass_union_added += int(union_added)
-                finally:
-                    close_memmap_array(result.delta_mm)
-                    if not bool(keep_temp) and result.delta_path is not None:
-                        try:
-                            result.delta_path.unlink(missing_ok=True)
-                        except Exception:
-                            pass
+            def _threshold_slice(z: int) -> None:
+                old = np.asarray(mask_mm[int(z)], dtype=bool)
+                new = np.asarray(work_mm[int(z)] >= 0.5, dtype=bool)
+                added_by_slice[int(z)] = np.int64(np.count_nonzero(new & (~old)))
+                removed_by_slice[int(z)] = np.int64(np.count_nonzero(old & (~new)))
+                mask_mm[int(z), :, :] = new.astype(np.uint8, copy=False)
 
-            stats[f'pass{int(pass_idx)}_total_union_added_voxels'] = int(pass_union_added)
+            parallel_for_indices_chunked(
+                num_slices,
+                _threshold_slice,
+                max_workers=worker_count,
+                desc=f'Gaussian smoothing pass {int(pass_idx)}: threshold smoothed volume',
+                show_progress=True,
+                target_chunks_per_worker=2,
+            )
+            flush_array(mask_mm)
+
+            added = int(np.sum(added_by_slice, dtype=np.int64))
+            removed = int(np.sum(removed_by_slice, dtype=np.int64))
+            stats[f'pass{int(pass_idx)}_added_voxels'] = int(added)
+            stats[f'pass{int(pass_idx)}_removed_voxels'] = int(removed)
+            stats['total_added_voxels'] = int(stats.get('total_added_voxels', 0)) + int(added)
+            stats['total_removed_voxels'] = int(stats.get('total_removed_voxels', 0)) + int(removed)
             stats['passes_completed'] = int(pass_idx)
-        finally:
-            if labels_mm is not None:
-                close_memmap_array(labels_mm)
-            if not bool(keep_temp):
-                for lp in label_paths:
-                    try:
-                        lp.unlink(missing_ok=True)
-                    except Exception:
-                        pass
+    finally:
+        close_memmap_array(work_mm)
+        if not bool(keep_temp):
+            try:
+                work_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
-        if int(pass_union_added) <= 0:
-            break
-
-    flush_array(mask_mm)
     return stats
 
 # --------------------------
@@ -7286,13 +6977,45 @@ def write_binary_video_from_mask_volume(
 
 
 def write_nrrd(mask_u8: np.ndarray, out_path: Path) -> Path:
+    """Write a Slicer-friendly NRRD label volume.
+
+    Internal masks are stored as (t, Y, X), matching the source transverse video frames.
+    3D Slicer expects image axes to be explicit spatial axes, so the NRRD is written as
+    (X, Y, t) with Fortran/index-order semantics and an identity RAS direction matrix.
+    This keeps Slicer's transverse/axial plane aligned with the transverse overlay videos
+    instead of letting the frame axis be interpreted as an in-plane axis.
+    """
     try:
         import nrrd  # type: ignore
     except Exception as e:  # pragma: no cover
         raise RuntimeError("pynrrd is required for --save_nrrd: pip install pynrrd") from e
 
+    mask = np.asarray(mask_u8, dtype=np.uint8)
+    if mask.ndim != 3:
+        raise ValueError(f'NRRD export expects a 3D mask volume in (t,Y,X) order; got shape {mask.shape}')
+
+    # Convert internal (t, Y, X) storage to NRRD/Slicer (X, Y, t) axes.
+    data_xyz = np.transpose(mask, (2, 1, 0))
+    header = {
+        'type': 'uint8',
+        'dimension': 3,
+        'space': 'right-anterior-superior',
+        'kinds': ['domain', 'domain', 'domain'],
+        'space directions': np.asarray(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        ),
+        'space origin': np.asarray([0.0, 0.0, 0.0], dtype=np.float64),
+        'encoding': 'gzip',
+        'labels': ['X', 'Y', 't'],
+    }
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    nrrd.write(str(out_path), np.asarray(mask_u8, dtype=np.uint8))
+    nrrd.write(str(out_path), data_xyz, header=header, index_order='F')
     return out_path
 
 
@@ -7762,7 +7485,7 @@ def build_troubleshooting_pass_union(
     workers: int,
 ) -> np.ndarray:
     if len(model_names) != 1:
-        raise ValueError('v9.4.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
+        raise ValueError('v9.5.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     view_volumes_for_pass: Dict[str, Dict[str, np.ndarray]] = {str(model_name): {} for model_name in model_names}
     intermediate_volumes: List[np.ndarray] = []
 
@@ -7825,7 +7548,7 @@ def build_troubleshooting_pass_union(
                     view_volumes_for_pass[str(model_name)][view.name] = native_union
 
         # Troubleshooting pass outputs are stage snapshots taken before the corresponding
-        # interpolation pass. They must not run the final 3D void fill; v9.4.0 keeps
+        # interpolation pass. They must not run the final 3D void fill; v9.5.0 keeps
         # 3D void fill out of troubleshooting pre-pass outputs and applies it only when
         # --enable_3d_void_fill is active for the normal final output.
         pass_union = assemble_current_view_union_volume(
@@ -7871,7 +7594,7 @@ def schedule_troubleshooting_pass_outputs(
     workers: int,
 ) -> Dict[str, Path]:
     if len(model_names) != 1:
-        raise ValueError('v9.4.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
+        raise ValueError('v9.5.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     if int(total_passes) < 0 or not snapshot_refs:
         return {}
 
@@ -8052,7 +7775,7 @@ def union_view_volume_for_single_model(
     workers: int = 1,
 ) -> np.ndarray:
     if len(view_volumes_by_model) != 1:
-        raise ValueError('v9.4.0_SLURM supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('v9.5.0_SLURM supports exactly one --model; multiple-model inference has been removed')
     model_name = next(iter(view_volumes_by_model.keys()))
     if view_name not in view_volumes_by_model[model_name]:
         raise KeyError(f'No view volume found for {view_name}')
@@ -8196,6 +7919,7 @@ def write_summary_file(
     input_path: Path,
     out_dir: Path,
     scratch_dir: Path,
+    source_shape_x_y_t: Tuple[int, int, int],
     volume_shape: Tuple[int, int, int],
     fps: float,
     model_paths: Sequence[str],
@@ -8203,7 +7927,7 @@ def write_summary_file(
     view_prediction_stats: Dict[str, int],
     interpolation_stats: List[Dict[str, object]],
     enable_3d_void_fill: bool,
-    object_interpolation_smoothing_stats: Optional[Dict[str, int]],
+    gaussian_smoothing_stats: Optional[Dict[str, int | float]],
     keep_objects_stats: Optional[Dict[str, int]],
     voxel_volume: Optional[int],
     final_paths: Dict[str, Path],
@@ -8217,6 +7941,7 @@ def write_summary_file(
     lines.append(f'Command: {command}')
     lines.append(f'Input: {input_path}')
     lines.append(f'Output directory: {out_dir}')
+    lines.append(f'Source dimensions before cubic resizing (X, Y, t): {source_shape_x_y_t}')
     lines.append(f'Processing volume shape (t, Y, X): {volume_shape}')
     lines.append(f'FPS: {fps}')
     lines.append(f'Scratch directory: {scratch_dir}')
@@ -8286,30 +8011,21 @@ def write_summary_file(
                     f"skipped={bool(s.get('skipped', False))}"
                 )
 
-    if object_interpolation_smoothing_stats is not None:
-        lines.append('')
-        lines.append('Object interpolation smoothing: enabled; source is the final unioned native object after global view/tile union and optional 3D void fill')
+    lines.append('')
+    if gaussian_smoothing_stats is not None and int(gaussian_smoothing_stats.get('enabled', 0)) > 0:
         lines.append(
-            '  passes: '
-            f"requested={int(object_interpolation_smoothing_stats.get('passes_requested', 1))}, "
-            f"completed={int(object_interpolation_smoothing_stats.get('passes_completed', 0))}"
+            'Gaussian smoothing: enabled; '
+            f"sigma={float(gaussian_smoothing_stats.get('sigma', 0.0)):g}, "
+            f"passes_requested={int(gaussian_smoothing_stats.get('passes_requested', 0))}, "
+            f"passes_completed={int(gaussian_smoothing_stats.get('passes_completed', 0))}"
         )
         lines.append(
-            '  per-axis generated delta voxels: '
-            f"transverse={int(object_interpolation_smoothing_stats.get('transverse_added_voxels', 0))}, "
-            f"sagittal={int(object_interpolation_smoothing_stats.get('sagittal_added_voxels', 0))}, "
-            f"coronal={int(object_interpolation_smoothing_stats.get('coronal_added_voxels', 0))}"
-        )
-        lines.append(
-            '  union_added_voxels: '
-            f"transverse={int(object_interpolation_smoothing_stats.get('transverse_union_added_voxels', 0))}, "
-            f"sagittal={int(object_interpolation_smoothing_stats.get('sagittal_union_added_voxels', 0))}, "
-            f"coronal={int(object_interpolation_smoothing_stats.get('coronal_union_added_voxels', 0))}, "
-            f"total={int(object_interpolation_smoothing_stats.get('total_union_added_voxels', 0))}"
+            '  voxel changes after thresholding: '
+            f"added={int(gaussian_smoothing_stats.get('total_added_voxels', 0))}, "
+            f"removed={int(gaussian_smoothing_stats.get('total_removed_voxels', 0))}"
         )
     else:
-        lines.append('')
-        lines.append('Object interpolation smoothing: disabled')
+        lines.append('Gaussian smoothing: disabled')
 
     if keep_objects_stats is not None:
         lines.append('')
@@ -8354,7 +8070,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('v9.4.0_SLURM accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('v9.5.0_SLURM accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -8380,8 +8096,10 @@ def main() -> None:
         raise ValueError('--interpolation_candidates must be >= 1')
     if int(args.interpolate_passes) < 1:
         raise ValueError('--interpolate_passes must be >= 1')
-    if int(args.object_interpolation_smoothing_passes) < 1:
-        raise ValueError('--object_interpolation_smoothing_passes must be >= 1')
+    if float(args.gaussian_smoothing) < 0:
+        raise ValueError('--gaussian_smoothing must be >= 0')
+    if int(args.gaussian_smoothing_passes) < 1:
+        raise ValueError('--gaussian_smoothing_passes must be >= 1')
     if float(args.interpolate_min_radius) < 0:
         raise ValueError('--interpolate_min_radius must be >= 0')
     if float(args.min_radius) < 0:
@@ -8426,19 +8144,19 @@ def main() -> None:
     processing_shape = compute_cube_resize_shape(input_T, input_H, input_W, tolerance=0.05)
     if processing_shape != (input_T, input_H, input_W):
         print(
-            'v9.4.0 cubic resize: '
+            'v9.5.0 cubic resize: '
             f'input shape (t,Y,X)=({input_T},{input_H},{input_W}) -> '
             f'processing shape (t,Y,X)={processing_shape}'
         )
         volume_rgb = resize_volume_to_processing_cube_gray8(
             input_volume_rgb,
             processing_shape,
-            temp_dir / 'input_volume.v940_cube.gray8.dat',
+            temp_dir / 'input_volume.v950_cube.gray8.dat',
             workers=max(1, default_worker_budget()),
             prefer_memory=True,
         )
     else:
-        print(f'v9.4.0 cubic resize: input shape already within 5% cube tolerance ({processing_shape})')
+        print(f'v9.5.0 cubic resize: input shape already within 5% cube tolerance ({processing_shape})')
         volume_rgb = input_volume_rgb
 
     T, H, W = (int(processing_shape[0]), int(processing_shape[1]), int(processing_shape[2]))
@@ -8482,7 +8200,7 @@ def main() -> None:
     spec_notes: List[str] = []
     if (int(T), int(H), int(W)) != (int(input_T), int(input_H), int(input_W)):
         spec_notes.append(
-            f'Working volume resized to v9.4.0 approximately-cubic processing geometry '
+            f'Working volume resized to v9.5.0 approximately-cubic processing geometry '
             f'(t,Y,X)=({int(T)},{int(H)},{int(W)}); final default outputs are restored to the original '
             f'input geometry (t,Y,X)=({int(input_T)},{int(input_H)},{int(input_W)}).'
         )
@@ -8491,10 +8209,19 @@ def main() -> None:
         'their non-90 degree Cartesian augmentations use clamp-to-frame black fill rather than expanded padding.'
     )
     if float(resolved_azimuth_angle) > 0.0:
-        spec_notes.append(f'Radial enabled with azimuth spacing {float(resolved_azimuth_angle):.8g} degrees; Lanczos-3 radial sampling and dense final backprojection are active.')
+        spec_notes.append(
+            f'Radial enabled with azimuth spacing {float(resolved_azimuth_angle):.8g} degrees; '
+            'Lanczos-3 radial sampling, wraparound Radial interpolation, and dense final backprojection are active.'
+        )
+    spec_notes.append('NRRD export writes the final mask as explicit (X,Y,t) RAS axes for 3D Slicer transverse alignment.')
+    if float(args.gaussian_smoothing) > 0.0:
+        spec_notes.append(
+            f'Gaussian smoothing active: sigma={float(args.gaussian_smoothing):g} voxel(s), '
+            f'passes={int(args.gaussian_smoothing_passes)}; applied after final union/optional 3D void fill and before --keep_objects.'
+        )
     if transverse_inference_disabled:
         note = (
-            'v9.4.0 specification note: Section 2.1.1 says Transverse must always be created, while '
+            'v9.5.0 specification note: Section 2.1.1 says Transverse must always be created, while '
             'View Flags item 1 adds --disable_transverse to skip Transverse inferencing. This implementation '
             'keeps Transverse geometry/output paths available and removes only the standard Transverse full-frame '
             'and tiled prediction jobs.'
@@ -8505,7 +8232,7 @@ def main() -> None:
     model_name = Path(model_paths[0]).stem
     print(f'Loading model: {model_name} ({model_paths[0]})')
     yolo_model = load_ultralytics_model(model_paths[0], task='segment')
-    # v9.4.0 has no multiple-model inference. A single-item list is retained only to minimize churn in
+    # v9.5.0 has no multiple-model inference. A single-item list is retained only to minimize churn in
     # scheduling structures keyed by model stem.
     yolo_models: List[Tuple[str, object]] = [(model_name, yolo_model)]
     yolo_by_model_name: Dict[str, object] = {model_name: yolo_model}
@@ -8847,8 +8574,9 @@ def main() -> None:
 
     for view, aug_job in iter_aug_jobs_round_robin(inference_views, aug_jobs_by_view):
         _submit_fullframe_video(view, aug_job)
-
-    for view, aug_job in iter_aug_jobs_round_robin(inference_views, aug_jobs_by_view):
+        # Non-radial tiled views are created alongside their parent view. Radial tiles remain
+        # deferred until the radial parent frame cache/video exists because radial slicing is
+        # substantially more expensive and is the only v9.5.0 exception.
         if dense_tiling_active and view.family != 'radial':
             tile_jobs = tile_jobs_by_aug.get((view.name, aug_job.aug_id), [])
             if tile_jobs:
@@ -9110,6 +8838,30 @@ def main() -> None:
 
         output_manager.reap_completed()
 
+    last_scheduler_wait_log = 0.0
+
+    def _log_scheduler_wait_state(force: bool = False) -> None:
+        nonlocal last_scheduler_wait_log
+        now = time.time()
+        interval = max(5.0, _env_float('YOLO_TTA_SCHEDULER_STATUS_INTERVAL_SEC', 30.0))
+        if not bool(force) and (now - float(last_scheduler_wait_log)) < float(interval):
+            return
+        last_scheduler_wait_log = float(now)
+        pending_canvases = sum(1 for key, fut in canvas_futures_by_aug.items() if key not in canvas_future_processed and not fut.done())
+        waiting_tiles = sum(len(v) for v in postprocessed_tiles_waiting_by_parent.values())
+        print(
+            'Scheduler wait: no inference-ready video; '
+            f'pending_fullframe_renders={len(pending_fullframe_futures)}, '
+            f'pending_canvas_renders={pending_canvases}, '
+            f'pending_tile_video_batches={len(pending_tile_video_futures)}, '
+            f'parent_postprocess={len(view_processing_futures)}, '
+            f'tile_cleanup={len(tile_cleanup_futures)}, '
+            f'tile_finalize={len(tile_finalize_futures)}, '
+            f'tile_consolidation={len(tile_consolidation_futures)}, '
+            f'waiting_tiles_for_parent={waiting_tiles}, '
+            f'ready_fullframe={len(ready_fullframe)}, ready_tiles={len(ready_tile_infer)}'
+        )
+
 
     try:
         while True:
@@ -9254,6 +9006,7 @@ def main() -> None:
                 ):
                     break
                 continue
+            _log_scheduler_wait_state()
             wait(waitables, return_when=FIRST_COMPLETED)
 
     finally:
@@ -9297,7 +9050,7 @@ def main() -> None:
     if final_backprojection_jobs:
         requested_backproject_view_workers = _env_int(
             'YOLO_TTA_BACKPROJECT_VIEW_WORKERS',
-            min(len(final_backprojection_jobs), max(1, _cpu_count() // 16)),
+            min(len(final_backprojection_jobs), max(1, _cpu_count())),
         )
         backproject_view_workers = max(1, min(len(final_backprojection_jobs), int(requested_backproject_view_workers)))
         per_backproject_workers = max(1, int(slice_postprocess_workers) // max(1, int(backproject_view_workers)))
@@ -9316,7 +9069,7 @@ def main() -> None:
                     radial_view=view_local,
                     out_path=out_path,
                     desc=f'Backprojecting final {model_name_local}/{view_local.name}',
-                    prefer_memory=False,
+                    prefer_memory=True,
                     workers=int(per_backproject_workers),
                 )
                 if float(args.min_radius) > 0:
@@ -9332,7 +9085,7 @@ def main() -> None:
                     tilted_view=view_local,
                     out_path=out_path,
                     desc=f'Backprojecting final {model_name_local}/{view_local.name}',
-                    prefer_memory=False,
+                    prefer_memory=True,
                     workers=int(per_backproject_workers),
                 )
             else:  # pragma: no cover
@@ -9365,16 +9118,16 @@ def main() -> None:
         workers=slice_postprocess_workers,
     )
 
-    object_interpolation_smoothing_stats: Optional[Dict[str, int]] = None
-    if bool(args.object_interpolation_smoothing):
-        print('\n=== Applying object interpolation smoothing ===')
-        object_interpolation_smoothing_stats = apply_object_interpolation_smoothing_inplace(
+    gaussian_smoothing_stats: Optional[Dict[str, int | float]] = None
+    if float(args.gaussian_smoothing) > 0.0:
+        print('\n=== Applying Gaussian smoothing ===')
+        gaussian_smoothing_stats = apply_gaussian_smoothing_inplace(
             final_union_mm,
-            views=views,
+            sigma=float(args.gaussian_smoothing),
+            passes=int(args.gaussian_smoothing_passes),
             temp_dir=temp_dir,
-            enable_multiplanar=bool(enable_sagittal or enable_coronal),
-            smoothing_passes=int(args.object_interpolation_smoothing_passes),
             keep_temp=bool(args.troubleshooting),
+            prefer_memory=True,
             workers=slice_postprocess_workers,
         )
 
@@ -9592,6 +9345,7 @@ def main() -> None:
         input_path=input_path,
         out_dir=out_dir,
         scratch_dir=temp_dir,
+        source_shape_x_y_t=(input_W, input_H, input_T),
         volume_shape=(T, H, W),
         fps=fps,
         model_paths=model_paths,
@@ -9606,7 +9360,7 @@ def main() -> None:
         view_prediction_stats=view_prediction_stats,
         interpolation_stats=interpolation_stats,
         enable_3d_void_fill=bool(args.enable_3d_void_fill),
-        object_interpolation_smoothing_stats=object_interpolation_smoothing_stats,
+        gaussian_smoothing_stats=gaussian_smoothing_stats,
         keep_objects_stats=keep_objects_stats,
         voxel_volume=voxel_volume,
         final_paths=final_paths,
