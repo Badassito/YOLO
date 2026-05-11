@@ -2,7 +2,7 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v9.5.1_SLURM single-channel-aligned script:
+This v9.5.2_SLURM single-channel-aligned script:
   - builds Transverse, optional Tilted Transverse, independently optional Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - renders parent/full-frame videos directly from the native view transform so inference no longer waits on
     a separately rendered canvas video, and derives non-radial tile videos from shared canvas batches so the
@@ -57,6 +57,8 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_c
 from dataclasses import dataclass, field
 
 GIB = 1024 ** 3
+NRRD_SPACE = "left-posterior-superior"
+NRRD_AXIS_ORDER_NOTE = "internal mask (t,Y,X) is exported as Slicer spatial axes (X,Y,t)"
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
@@ -3070,7 +3072,7 @@ def resolve_gaussian_smoothing_settings(
     gaussian_smoothing_arg: Optional[float],
     gaussian_smoothing_passes: int,
 ) -> Tuple[bool, float, int]:
-    """Resolve Gaussian smoothing enablement from the v9.5.1 CLI contract.
+    """Resolve Gaussian smoothing enablement from the v9.5.2 CLI contract.
 
     Contract:
       - no --gaussian_smoothing and the default --gaussian_smoothing_passes 1 => disabled
@@ -4756,7 +4758,7 @@ def assemble_current_view_union_volume(
     combines outputs from more than one model.
     """
     if len(view_volumes_by_model) != 1:
-        raise ValueError('v9.5.1_SLURM supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('v9.5.2_SLURM supports exactly one --model; multiple-model inference has been removed')
 
     model_name = next(iter(view_volumes_by_model.keys()))
     final_union_mm = allocate_workspace_array(
@@ -6358,7 +6360,7 @@ def gate_tile_volume_against_parent_inplace(
     """Keep only tile components that intersect the frozen parent support on the same slice.
 
     The gating result for one slice never affects another slice, so this stage can be parallelized
-    aggressively across the slice axis without violating the v9.5.1_SLURM semantics.
+    aggressively across the slice axis without violating the v9.5.2_SLURM semantics.
     """
     num_slices = int(tile_mask_mm.shape[0])
     accepted_components = np.zeros((num_slices,), dtype=np.int64)
@@ -6681,7 +6683,7 @@ def apply_gaussian_smoothing_inplace(
 ) -> Dict[str, int | float]:
     """Smooth the final binary 3D volume with a Gaussian kernel and re-threshold at 0.5.
 
-    The v9.5.1_SLURM smoothing stage is applied after the final view/tile union and optional
+    The v9.5.2_SLURM smoothing stage is applied after the final view/tile union and optional
     3D void fill, but before --keep_objects and before resizing back to the source geometry.
     A single float32 workspace is reused for every pass to avoid retaining multiple dense
     floating-point copies of the volume.
@@ -7005,46 +7007,52 @@ def write_binary_video_from_mask_volume(
     return video_path
 
 
-def write_nrrd(mask_u8: np.ndarray, out_path: Path) -> Path:
-    """Write a Slicer-friendly NRRD label volume.
+def nrrd_mask_to_slicer_xyz(mask_u8: np.ndarray) -> np.ndarray:
+    """Return a Slicer-oriented NRRD payload from the internal mask layout.
 
-    Internal masks are stored as (t, Y, X), matching the source transverse video frames.
-    3D Slicer expects image axes to be explicit spatial axes, so the NRRD is written as
-    (X, Y, t) with Fortran/index-order semantics and an identity RAS direction matrix.
-    This keeps Slicer's transverse/axial plane aligned with the transverse overlay videos
-    instead of letting the frame axis be interpreted as an in-plane axis.
+    The pipeline keeps volumes as ``(t, Y, X)`` / ``(Z, row, column)`` so frame
+    operations and overlays match the source Transverse image sequence.  3D
+    Slicer expects a spatial volume whose axes are ordered as ``(X, Y, Z)`` in
+    the NRRD payload.  Writing the internal array directly makes Slicer treat
+    frame number as the first spatial axis, which presents as rotated/flipped
+    Transverse slices plus swapped Sagittal/Coronal slice families.
     """
-    try:
-        import nrrd  # type: ignore
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError("pynrrd is required for --save_nrrd: pip install pynrrd") from e
+    arr = np.asarray(mask_u8, dtype=np.uint8)
+    if arr.ndim != 3:
+        raise ValueError(f"NRRD export expects a 3D mask volume with shape (t,Y,X), got {arr.shape}")
+    # Internal: (t, Y, X).  NRRD/Slicer spatial payload: (X, Y, t).
+    # Use Fortran-contiguous storage and explicitly request pynrrd's Fortran
+    # index order so the first NumPy dimension remains the first NRRD axis.
+    return np.asfortranarray(np.transpose(arr, (2, 1, 0)))
 
-    mask = np.asarray(mask_u8, dtype=np.uint8)
-    if mask.ndim != 3:
-        raise ValueError(f'NRRD export expects a 3D mask volume in (t,Y,X) order; got shape {mask.shape}')
 
-    # Convert internal (t, Y, X) storage to NRRD/Slicer (X, Y, t) axes.
-    data_xyz = np.transpose(mask, (2, 1, 0))
-    header = {
-        'type': 'uint8',
-        'dimension': 3,
-        'space': 'right-anterior-superior',
-        'kinds': ['domain', 'domain', 'domain'],
-        'space directions': np.asarray(
-            [
-                [1.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0],
-            ],
-            dtype=np.float64,
-        ),
-        'space origin': np.asarray([0.0, 0.0, 0.0], dtype=np.float64),
-        'encoding': 'gzip',
-        'labels': ['X', 'Y', 't'],
+def nrrd_slicer_header(mask_shape_zyx: Tuple[int, int, int]) -> Dict[str, object]:
+    t_dim, h, w = (int(mask_shape_zyx[0]), int(mask_shape_zyx[1]), int(mask_shape_zyx[2]))
+    return {
+        "space": NRRD_SPACE,
+        "kinds": ["domain", "domain", "domain"],
+        "space directions": np.eye(3, dtype=np.float64),
+        "space origin": np.zeros((3,), dtype=np.float64),
+        "content": f"binary segmentation mask; source_shape_tyx=({t_dim},{h},{w}); exported_axes=(X,Y,t)",
     }
 
+
+def write_nrrd(mask_u8: np.ndarray, out_path: Path) -> Path:
+    try:
+        import inspect
+        import nrrd  # type: ignore
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("pynrrd is required for --save_nrrd: pip install pynrrd") from exc
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    nrrd.write(str(out_path), data_xyz, header=header, index_order='F')
+    payload = nrrd_mask_to_slicer_xyz(mask_u8)
+    header = nrrd_slicer_header(tuple(np.asarray(mask_u8).shape))
+    kwargs: Dict[str, object] = {"header": header}
+    try:
+        if "index_order" in inspect.signature(nrrd.write).parameters:
+            kwargs["index_order"] = "F"
+    except Exception:
+        pass
+    nrrd.write(str(out_path), payload, **kwargs)
     return out_path
 
 
@@ -7514,7 +7522,7 @@ def build_troubleshooting_pass_union(
     workers: int,
 ) -> np.ndarray:
     if len(model_names) != 1:
-        raise ValueError('v9.5.1_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
+        raise ValueError('v9.5.2_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     view_volumes_for_pass: Dict[str, Dict[str, np.ndarray]] = {str(model_name): {} for model_name in model_names}
     intermediate_volumes: List[np.ndarray] = []
 
@@ -7623,7 +7631,7 @@ def schedule_troubleshooting_pass_outputs(
     workers: int,
 ) -> Dict[str, Path]:
     if len(model_names) != 1:
-        raise ValueError('v9.5.1_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
+        raise ValueError('v9.5.2_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     if int(total_passes) < 0 or not snapshot_refs:
         return {}
 
@@ -7804,7 +7812,7 @@ def union_view_volume_for_single_model(
     workers: int = 1,
 ) -> np.ndarray:
     if len(view_volumes_by_model) != 1:
-        raise ValueError('v9.5.1_SLURM supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('v9.5.2_SLURM supports exactly one --model; multiple-model inference has been removed')
     model_name = next(iter(view_volumes_by_model.keys()))
     if view_name not in view_volumes_by_model[model_name]:
         raise KeyError(f'No view volume found for {view_name}')
@@ -8099,7 +8107,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('v9.5.1_SLURM accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('v9.5.2_SLURM accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -8246,7 +8254,7 @@ def main() -> None:
             f'Radial enabled with azimuth spacing {float(resolved_azimuth_angle):.8g} degrees; '
             'Lanczos-3 radial sampling, wraparound Radial interpolation, and dense final backprojection are active.'
         )
-    spec_notes.append('NRRD export writes the final mask as explicit (X,Y,t) RAS axes for 3D Slicer transverse alignment.')
+    spec_notes.append(f'NRRD export writes the final mask using the PTA-aligned Slicer layout: {NRRD_AXIS_ORDER_NOTE}; space={NRRD_SPACE}; space_directions=identity.')
     if bool(gaussian_smoothing_enabled):
         spec_notes.append(
             f'Gaussian smoothing active: sigma={float(gaussian_smoothing_sigma):g} voxel(s), '
