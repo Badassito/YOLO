@@ -2,7 +2,7 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v9.5.0_SLURM single-channel-aligned script:
+This v9.5.1_SLURM single-channel-aligned script:
   - builds Transverse, optional Tilted Transverse, independently optional Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - renders parent/full-frame videos directly from the native view transform so inference no longer waits on
     a separately rendered canvas video, and derives non-radial tile videos from shared canvas batches so the
@@ -21,8 +21,8 @@ This v9.5.0_SLURM single-channel-aligned script:
     Transverse results view-native through cleanup/interpolation, then backprojects them after per-view processing
   - treats --model as a single YOLO segmentation model path; multiple-model inference is not supported in this script
   - applies final 3D void fill only when --enable_3d_void_fill is active, and only once after the global union
-  - applies --gaussian_smoothing to the final unioned native object volume, repeated by
-    --gaussian_smoothing_passes when the smoothing sigma is greater than zero
+  - keeps Gaussian smoothing disabled by default; --gaussian_smoothing enables it with an optional sigma,
+    and --gaussian_smoothing_passes > 1 enables it with the default sigma when no sigma is provided
   - supports Radial and Tilted Transverse view-native interpolation, and keeps Tilted Transverse frame N centered on native slice N with black-padded out-of-bounds shear samples
   - resizes the working volume to an approximately cubic orthogonal volume when needed, restores the final mask to the original input dimensions for default outputs,
     and saves the transverse default color overlay plus optional labels, bilevel compressed TIFF binary masks, binary MKVs, NRRD, sagittal, coronal, radial,
@@ -236,10 +236,10 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--voxel_volume", action="store_true", help="Count white voxels in the final binary output and save the value to the summary text file")
     p.add_argument("--enable_3d_void_fill", action="store_true",
                    help="Apply one final 3D enclosed-void fill after the global union. Disabled by default")
-    p.add_argument("--gaussian_smoothing", default=3.0, type=float,
-                   help="Gaussian standard deviation, in voxel units, applied to the final binary 3D volume. 0 disables smoothing")
+    p.add_argument("--gaussian_smoothing", nargs="?", const=3.0, default=None, type=float, metavar="SIGMA",
+                   help="Enable final 3D Gaussian smoothing. Optionally provide the Gaussian standard deviation in voxel units; when the flag is present without a value, SIGMA defaults to 3.0. Disabled by default unless --gaussian_smoothing_passes > 1")
     p.add_argument("--gaussian_smoothing_passes", default=1, type=int,
-                   help="Apply --gaussian_smoothing this many times when the smoothing sigma is greater than 0")
+                   help="Number of Gaussian smoothing passes. The default value of 1 does nothing unless --gaussian_smoothing is provided; values greater than 1 automatically enable smoothing with the default sigma when no sigma is provided")
 
     p.add_argument("--troubleshooting", action="store_true",
                    help="Keep temporary files and save outputs before each interpolation pass")
@@ -3063,6 +3063,35 @@ class PredictConfig:
     int8: bool
 
 
+DEFAULT_GAUSSIAN_SMOOTHING_SIGMA = 3.0
+
+
+def resolve_gaussian_smoothing_settings(
+    gaussian_smoothing_arg: Optional[float],
+    gaussian_smoothing_passes: int,
+) -> Tuple[bool, float, int]:
+    """Resolve Gaussian smoothing enablement from the v9.5.1 CLI contract.
+
+    Contract:
+      - no --gaussian_smoothing and the default --gaussian_smoothing_passes 1 => disabled
+      - --gaussian_smoothing [SIGMA] enables smoothing for passes >= 1
+      - --gaussian_smoothing_passes > 1 enables smoothing with the default sigma when
+        --gaussian_smoothing is omitted
+    """
+    passes_i = int(gaussian_smoothing_passes)
+    sigma_provided = gaussian_smoothing_arg is not None
+    enabled = bool(sigma_provided or passes_i > 1)
+    if not enabled:
+        return False, 0.0, passes_i
+
+    sigma_f = (
+        float(gaussian_smoothing_arg)
+        if sigma_provided
+        else float(DEFAULT_GAUSSIAN_SMOOTHING_SIGMA)
+    )
+    return True, float(sigma_f), passes_i
+
+
 CONF_U8_MAX = 255
 
 
@@ -4727,7 +4756,7 @@ def assemble_current_view_union_volume(
     combines outputs from more than one model.
     """
     if len(view_volumes_by_model) != 1:
-        raise ValueError('v9.5.0_SLURM supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('v9.5.1_SLURM supports exactly one --model; multiple-model inference has been removed')
 
     model_name = next(iter(view_volumes_by_model.keys()))
     final_union_mm = allocate_workspace_array(
@@ -6329,7 +6358,7 @@ def gate_tile_volume_against_parent_inplace(
     """Keep only tile components that intersect the frozen parent support on the same slice.
 
     The gating result for one slice never affects another slice, so this stage can be parallelized
-    aggressively across the slice axis without violating the v9.5.0_SLURM semantics.
+    aggressively across the slice axis without violating the v9.5.1_SLURM semantics.
     """
     num_slices = int(tile_mask_mm.shape[0])
     accepted_components = np.zeros((num_slices,), dtype=np.int64)
@@ -6652,7 +6681,7 @@ def apply_gaussian_smoothing_inplace(
 ) -> Dict[str, int | float]:
     """Smooth the final binary 3D volume with a Gaussian kernel and re-threshold at 0.5.
 
-    The v9.5.0_SLURM smoothing stage is applied after the final view/tile union and optional
+    The v9.5.1_SLURM smoothing stage is applied after the final view/tile union and optional
     3D void fill, but before --keep_objects and before resizing back to the source geometry.
     A single float32 workspace is reused for every pass to avoid retaining multiple dense
     floating-point copies of the volume.
@@ -7485,7 +7514,7 @@ def build_troubleshooting_pass_union(
     workers: int,
 ) -> np.ndarray:
     if len(model_names) != 1:
-        raise ValueError('v9.5.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
+        raise ValueError('v9.5.1_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     view_volumes_for_pass: Dict[str, Dict[str, np.ndarray]] = {str(model_name): {} for model_name in model_names}
     intermediate_volumes: List[np.ndarray] = []
 
@@ -7594,7 +7623,7 @@ def schedule_troubleshooting_pass_outputs(
     workers: int,
 ) -> Dict[str, Path]:
     if len(model_names) != 1:
-        raise ValueError('v9.5.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
+        raise ValueError('v9.5.1_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     if int(total_passes) < 0 or not snapshot_refs:
         return {}
 
@@ -7775,7 +7804,7 @@ def union_view_volume_for_single_model(
     workers: int = 1,
 ) -> np.ndarray:
     if len(view_volumes_by_model) != 1:
-        raise ValueError('v9.5.0_SLURM supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('v9.5.1_SLURM supports exactly one --model; multiple-model inference has been removed')
     model_name = next(iter(view_volumes_by_model.keys()))
     if view_name not in view_volumes_by_model[model_name]:
         raise KeyError(f'No view volume found for {view_name}')
@@ -8070,7 +8099,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('v9.5.0_SLURM accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('v9.5.1_SLURM accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -8096,10 +8125,14 @@ def main() -> None:
         raise ValueError('--interpolation_candidates must be >= 1')
     if int(args.interpolate_passes) < 1:
         raise ValueError('--interpolate_passes must be >= 1')
-    if float(args.gaussian_smoothing) < 0:
-        raise ValueError('--gaussian_smoothing must be >= 0')
     if int(args.gaussian_smoothing_passes) < 1:
         raise ValueError('--gaussian_smoothing_passes must be >= 1')
+    gaussian_smoothing_enabled, gaussian_smoothing_sigma, gaussian_smoothing_passes = resolve_gaussian_smoothing_settings(
+        args.gaussian_smoothing,
+        int(args.gaussian_smoothing_passes),
+    )
+    if bool(gaussian_smoothing_enabled) and float(gaussian_smoothing_sigma) <= 0.0:
+        raise ValueError('--gaussian_smoothing must be > 0 when smoothing is enabled')
     if float(args.interpolate_min_radius) < 0:
         raise ValueError('--interpolate_min_radius must be >= 0')
     if float(args.min_radius) < 0:
@@ -8214,11 +8247,13 @@ def main() -> None:
             'Lanczos-3 radial sampling, wraparound Radial interpolation, and dense final backprojection are active.'
         )
     spec_notes.append('NRRD export writes the final mask as explicit (X,Y,t) RAS axes for 3D Slicer transverse alignment.')
-    if float(args.gaussian_smoothing) > 0.0:
+    if bool(gaussian_smoothing_enabled):
         spec_notes.append(
-            f'Gaussian smoothing active: sigma={float(args.gaussian_smoothing):g} voxel(s), '
-            f'passes={int(args.gaussian_smoothing_passes)}; applied after final union/optional 3D void fill and before --keep_objects.'
+            f'Gaussian smoothing active: sigma={float(gaussian_smoothing_sigma):g} voxel(s), '
+            f'passes={int(gaussian_smoothing_passes)}; applied after final union/optional 3D void fill and before --keep_objects.'
         )
+    else:
+        spec_notes.append('Gaussian smoothing disabled by default; --gaussian_smoothing enables it, and --gaussian_smoothing_passes > 1 enables it with the default sigma.')
     if transverse_inference_disabled:
         note = (
             'v9.5.0 specification note: Section 2.1.1 says Transverse must always be created, while '
@@ -9119,12 +9154,12 @@ def main() -> None:
     )
 
     gaussian_smoothing_stats: Optional[Dict[str, int | float]] = None
-    if float(args.gaussian_smoothing) > 0.0:
+    if bool(gaussian_smoothing_enabled):
         print('\n=== Applying Gaussian smoothing ===')
         gaussian_smoothing_stats = apply_gaussian_smoothing_inplace(
             final_union_mm,
-            sigma=float(args.gaussian_smoothing),
-            passes=int(args.gaussian_smoothing_passes),
+            sigma=float(gaussian_smoothing_sigma),
+            passes=int(gaussian_smoothing_passes),
             temp_dir=temp_dir,
             keep_temp=bool(args.troubleshooting),
             prefer_memory=True,
