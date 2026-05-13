@@ -2,7 +2,7 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v9.5.2_SLURM single-channel-aligned script:
+This v9.5.3_SLURM single-channel-aligned script:
   - builds Transverse, optional Tilted Transverse, independently optional Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - renders parent/full-frame videos directly from the native view transform so inference no longer waits on
     a separately rendered canvas video, and derives non-radial tile videos from shared canvas batches so the
@@ -15,6 +15,9 @@ This v9.5.2_SLURM single-channel-aligned script:
   - fuses per-slice cleanup work where the slice orientation matches the required semantics
     (notably min_conf filtering, 2D hole filling, and min_radius where applicable)
   - overlaps GPU inference with CPU-side view interpolation, consolidated-tile interpolation, and output writing
+  - replaces Ultralytics retina_masks=True GPU native-mask upsampling with an experimental CPU retina reconstruction path
+    that copies only protos, mask coefficients, boxes, and confidences from the GPU, reconstructs bbox-ROI masks on CPU,
+    and buffers queued frame payloads in RAM so GPU inference is not paced by CPU mask accumulation
   - reuses a native radial frame cache during dense tiled rendering so radial tiles do not recompute
     the same Lanczos-3 slices for every tile location
   - inverse-maps predictions only into each generated video's native view space, keeps Radial and Tilted
@@ -3072,7 +3075,7 @@ def resolve_gaussian_smoothing_settings(
     gaussian_smoothing_arg: Optional[float],
     gaussian_smoothing_passes: int,
 ) -> Tuple[bool, float, int]:
-    """Resolve Gaussian smoothing enablement from the v9.5.2 CLI contract.
+    """Resolve Gaussian smoothing enablement from the v9.5.3 CLI contract.
 
     Contract:
       - no --gaussian_smoothing and the default --gaussian_smoothing_passes 1 => disabled
@@ -3107,8 +3110,354 @@ def min_conf_to_u8_threshold(min_conf: float) -> int:
     return int(math.ceil(conf_clamped * float(CONF_U8_MAX) - 1e-9))
 
 
-def _extract_result_masks_and_confs(r) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    """Detach one streamed YOLO result into CPU-owned numpy arrays for asynchronous postprocess."""
+@dataclass(frozen=True)
+class CpuRetinaMaskPayload:
+    """CPU-owned YOLO segmentation tensors needed to reconstruct retina/native masks off-GPU."""
+
+    proto: np.ndarray             # (C, mask_h, mask_w), float32 CPU
+    coeffs: np.ndarray            # (N, C), float32 CPU
+    boxes_xyxy: np.ndarray        # (N, 4), scaled to prediction-video pixel coordinates
+    confs: np.ndarray             # (N,), float32 CPU
+    orig_shape: Tuple[int, int]   # (height, width) of the prediction-video frame
+    img_shape: Tuple[int, int]    # (height, width) of the network input tensor
+    frame_path: str = ''
+
+
+_ULTRALYTICS_CPU_RETINA_PATCHED = False
+_ULTRALYTICS_ORIGINAL_SEG_CONSTRUCT_RESULT: Optional[object] = None
+
+
+def cpu_retina_masks_enabled() -> bool:
+    """Default-on experimental path: move retina/native mask reconstruction from GPU to CPU."""
+    return _env_flag('YOLO_TTA_CPU_RETINA_MASKS', True)
+
+
+def cpu_retina_roi_only_enabled() -> bool:
+    """Use bbox-ROI-only CPU upsampling instead of reconstructing every full-size instance mask."""
+    return _env_flag('YOLO_TTA_CPU_RETINA_ROI_ONLY', True)
+
+
+def cpu_retina_block_detections() -> int:
+    """Number of mask logits to reconstruct per CPU matrix-multiply block."""
+    return max(1, _env_int('YOLO_TTA_CPU_RETINA_BLOCK_DETECTIONS', 8))
+
+
+def cpu_mask_postprocess_pending_limit(worker_count: int, num_frames: int) -> int:
+    """Bound queued CPU mask-reconstruction frames while allowing RAM-backed buffering.
+
+    Setting YOLO_TTA_CPU_MASK_PENDING_FRAMES=0 removes the frame-count cap for sites that
+    intentionally want to absorb the entire CPU backlog in RAM. The default is deliberately much
+    larger than the worker count so GPU inference is not throttled by CPU retina reconstruction under
+    normal SLURM allocations.
+    """
+    workers = max(1, int(worker_count))
+    frames = max(1, int(num_frames))
+    requested = _env_int('YOLO_TTA_CPU_MASK_PENDING_FRAMES', 256)
+    if int(requested) <= 0:
+        return max(workers, frames)
+    return max(workers, min(frames, max(int(requested), workers * 2)))
+
+
+def _as_numpy_float32_cpu(x: object) -> np.ndarray:
+    """Detach torch/array-like tensors into owned, contiguous CPU float32 NumPy arrays."""
+    try:
+        detach = getattr(x, 'detach', None)
+        if callable(detach):
+            x = detach()
+        to_fn = getattr(x, 'to', None)
+        if callable(to_fn):
+            try:
+                import torch  # type: ignore
+                x = to_fn(device='cpu', dtype=torch.float32)
+            except Exception:
+                cpu_fn = getattr(x, 'cpu', None)
+                if callable(cpu_fn):
+                    x = cpu_fn()
+        cpu_fn = getattr(x, 'cpu', None)
+        if callable(cpu_fn):
+            x = cpu_fn()
+        numpy_fn = getattr(x, 'numpy', None)
+        if callable(numpy_fn):
+            arr = numpy_fn()
+        else:
+            arr = np.asarray(x)
+    except Exception:
+        arr = np.asarray(x)
+    return np.ascontiguousarray(arr, dtype=np.float32)
+
+
+def _clip_boxes_np(boxes: np.ndarray, shape: Sequence[int]) -> np.ndarray:
+    h = int(shape[0])
+    w = int(shape[1])
+    boxes[:, 0] = np.clip(boxes[:, 0], 0.0, float(w))
+    boxes[:, 1] = np.clip(boxes[:, 1], 0.0, float(h))
+    boxes[:, 2] = np.clip(boxes[:, 2], 0.0, float(w))
+    boxes[:, 3] = np.clip(boxes[:, 3], 0.0, float(h))
+    return boxes
+
+
+def _scale_boxes_np(
+    img1_shape: Sequence[int],
+    boxes: np.ndarray,
+    img0_shape: Sequence[int],
+    *,
+    padding: bool = True,
+) -> np.ndarray:
+    """NumPy equivalent of Ultralytics ops.scale_boxes for xyxy boxes."""
+    if boxes.size <= 0:
+        return boxes.astype(np.float32, copy=False)
+
+    img1_h, img1_w = int(img1_shape[0]), int(img1_shape[1])
+    img0_h, img0_w = int(img0_shape[0]), int(img0_shape[1])
+    gain = min(float(img1_h) / max(1.0, float(img0_h)), float(img1_w) / max(1.0, float(img0_w)))
+    if gain <= 0.0:
+        return _clip_boxes_np(boxes.astype(np.float32, copy=False), img0_shape)
+
+    pad_x = round((float(img1_w) - round(float(img0_w) * gain)) / 2.0 - 0.1)
+    pad_y = round((float(img1_h) - round(float(img0_h) * gain)) / 2.0 - 0.1)
+    out = boxes.astype(np.float32, copy=True)
+    if bool(padding):
+        out[:, [0, 2]] -= float(pad_x)
+        out[:, [1, 3]] -= float(pad_y)
+    out[:, :4] /= float(gain)
+    return _clip_boxes_np(out, img0_shape)
+
+
+def _scale_masks_crop_slices_np(mask_shape: Tuple[int, int], target_shape: Tuple[int, int]) -> Tuple[slice, slice]:
+    """Return the low-resolution crop used by Ultralytics scale_masks before interpolation."""
+    im1_h, im1_w = int(mask_shape[0]), int(mask_shape[1])
+    im0_h, im0_w = int(target_shape[0]), int(target_shape[1])
+    if im1_h == im0_h and im1_w == im0_w:
+        return slice(0, im1_h), slice(0, im1_w)
+
+    gain = min(float(im1_h) / max(1.0, float(im0_h)), float(im1_w) / max(1.0, float(im0_w)))
+    pad_w = (float(im1_w) - round(float(im0_w) * gain)) / 2.0
+    pad_h = (float(im1_h) - round(float(im0_h) * gain)) / 2.0
+    top = int(round(pad_h - 0.1))
+    left = int(round(pad_w - 0.1))
+    bottom = int(im1_h - round(pad_h + 0.1))
+    right = int(im1_w - round(pad_w + 0.1))
+    top = int(np.clip(top, 0, im1_h))
+    left = int(np.clip(left, 0, im1_w))
+    bottom = int(np.clip(bottom, top + 1, im1_h)) if im1_h > 0 else 0
+    right = int(np.clip(right, left + 1, im1_w)) if im1_w > 0 else 0
+    return slice(top, bottom), slice(left, right)
+
+
+def _bbox_to_integer_roi(box_xyxy: np.ndarray, target_shape: Tuple[int, int]) -> Optional[Tuple[int, int, int, int]]:
+    h, w = int(target_shape[0]), int(target_shape[1])
+    if h <= 0 or w <= 0:
+        return None
+    x1 = int(math.ceil(max(0.0, float(box_xyxy[0]))))
+    y1 = int(math.ceil(max(0.0, float(box_xyxy[1]))))
+    x2 = int(math.ceil(min(float(w), float(box_xyxy[2]))))
+    y2 = int(math.ceil(min(float(h), float(box_xyxy[3]))))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return y1, y2, x1, x2
+
+
+def _resize_lowres_logits_roi(
+    low_logits: np.ndarray,
+    target_shape: Tuple[int, int],
+    roi: Tuple[int, int, int, int],
+) -> np.ndarray:
+    """Upsample only the requested high-resolution ROI using align-corners=False geometry.
+
+    This avoids allocating an N x H x W tensor for hundreds of detections. It is equivalent in
+    coordinate mapping to resizing the low-resolution retina logits to the prediction-video frame and
+    then cropping the bbox ROI, while doing the expensive interpolation only inside the bbox.
+    """
+    y1, y2, x1, x2 = (int(v) for v in roi)
+    target_h, target_w = int(target_shape[0]), int(target_shape[1])
+    low = np.asarray(low_logits, dtype=np.float32)
+    low_h, low_w = int(low.shape[0]), int(low.shape[1])
+    roi_h = int(y2 - y1)
+    roi_w = int(x2 - x1)
+
+    if roi_h <= 0 or roi_w <= 0 or low_h <= 0 or low_w <= 0:
+        return np.zeros((max(0, roi_h), max(0, roi_w)), dtype=np.float32)
+
+    if low_h == target_h and low_w == target_w:
+        return np.ascontiguousarray(low[y1:y2, x1:x2], dtype=np.float32)
+
+    if not cpu_retina_roi_only_enabled():
+        full = cv2.resize(low, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+        return np.ascontiguousarray(full[y1:y2, x1:x2], dtype=np.float32)
+
+    # Destination pixel-center to source-coordinate mapping for bilinear resize with
+    # align_corners=False. Coordinates outside the low-resolution raster are edge-clamped,
+    # matching torch.nn.functional.interpolate and cv2.resize behavior.
+    xs = ((np.arange(x1, x2, dtype=np.float32) + 0.5) * (float(low_w) / float(target_w))) - 0.5
+    ys = ((np.arange(y1, y2, dtype=np.float32) + 0.5) * (float(low_h) / float(target_h))) - 0.5
+    xs = np.clip(xs, 0.0, float(low_w - 1))
+    ys = np.clip(ys, 0.0, float(low_h - 1))
+
+    x0 = np.floor(xs).astype(np.int32, copy=False)
+    y0 = np.floor(ys).astype(np.int32, copy=False)
+    x1_idx = np.minimum(x0 + 1, low_w - 1).astype(np.int32, copy=False)
+    y1_idx = np.minimum(y0 + 1, low_h - 1).astype(np.int32, copy=False)
+    wx = (xs - x0.astype(np.float32, copy=False)).astype(np.float32, copy=False)
+    wy = (ys - y0.astype(np.float32, copy=False)).astype(np.float32, copy=False)
+
+    top = (low[y0[:, None], x0[None, :]] * (1.0 - wx[None, :])) + (low[y0[:, None], x1_idx[None, :]] * wx[None, :])
+    bottom = (low[y1_idx[:, None], x0[None, :]] * (1.0 - wx[None, :])) + (low[y1_idx[:, None], x1_idx[None, :]] * wx[None, :])
+    return np.ascontiguousarray((top * (1.0 - wy[:, None])) + (bottom * wy[:, None]), dtype=np.float32)
+
+
+def _iter_cpu_retina_payload_rois(
+    payload: CpuRetinaMaskPayload,
+    target_shape: Tuple[int, int],
+) -> Iterator[Tuple[int, float, int, int, int, int, np.ndarray]]:
+    """Yield per-instance high-resolution ROI masks reconstructed from CPU protos/coefficients."""
+    proto = np.asarray(payload.proto, dtype=np.float32)
+    if proto.ndim == 4 and int(proto.shape[0]) == 1:
+        proto = proto[0]
+    if proto.ndim != 3:
+        return
+
+    coeffs = np.asarray(payload.coeffs, dtype=np.float32)
+    boxes = np.asarray(payload.boxes_xyxy, dtype=np.float32)
+    confs = np.asarray(payload.confs, dtype=np.float32)
+    if coeffs.ndim != 2 or coeffs.shape[0] <= 0 or coeffs.shape[1] != int(proto.shape[0]):
+        return
+
+    target_h, target_w = int(target_shape[0]), int(target_shape[1])
+    if target_h <= 0 or target_w <= 0:
+        return
+
+    mask_crop_y, mask_crop_x = _scale_masks_crop_slices_np(
+        (int(proto.shape[1]), int(proto.shape[2])),
+        (target_h, target_w),
+    )
+    c, mh, mw = int(proto.shape[0]), int(proto.shape[1]), int(proto.shape[2])
+    proto_flat = np.ascontiguousarray(proto.reshape(c, mh * mw), dtype=np.float32)
+    block = cpu_retina_block_detections()
+    n = int(coeffs.shape[0])
+
+    for start in range(0, n, block):
+        stop = min(n, start + block)
+        logits_block = np.matmul(
+            np.ascontiguousarray(coeffs[start:stop], dtype=np.float32),
+            proto_flat,
+        ).reshape((stop - start, mh, mw))
+
+        for local_idx in range(stop - start):
+            inst_idx = int(start + local_idx)
+            if inst_idx >= int(boxes.shape[0]):
+                continue
+            roi = _bbox_to_integer_roi(boxes[inst_idx], (target_h, target_w))
+            if roi is None:
+                continue
+            y1, y2, x1, x2 = roi
+            low_logits = np.ascontiguousarray(logits_block[local_idx, mask_crop_y, mask_crop_x], dtype=np.float32)
+            roi_logits = _resize_lowres_logits_roi(low_logits, (target_h, target_w), roi)
+            roi_mask = np.asarray(roi_logits > 0.0, dtype=bool)
+            if not np.any(roi_mask):
+                continue
+            conf_val = float(confs[inst_idx]) if inst_idx < int(confs.shape[0]) else 0.0
+            yield inst_idx, conf_val, y1, y2, x1, x2, roi_mask
+
+
+def _accumulate_cpu_retina_payload_to_prediction_frame(
+    payload: CpuRetinaMaskPayload,
+    out_size: int,
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Build a prediction-space union/confidence frame from CPU-side retina payload tensors."""
+    target_shape = (int(out_size), int(out_size))
+    frame_union = np.zeros(target_shape, dtype=np.uint8)
+    frame_confmap = np.zeros(target_shape, dtype=np.uint8)
+    kept_instances = 0
+
+    # The generated inference videos are square --imgsz frames. If a future source ever reports a
+    # different original shape, keep the current --imgsz target because the affine matrices in this
+    # pipeline are defined in that prediction-video coordinate system.
+    for _inst_idx, conf_val, y1, y2, x1, x2, roi_mask in _iter_cpu_retina_payload_rois(payload, target_shape):
+        roi_u8 = roi_mask.astype(np.uint8, copy=False)
+        frame_union[y1:y2, x1:x2] |= roi_u8
+        conf_u8 = quantize_conf_to_u8(float(conf_val))
+        conf_patch = frame_confmap[y1:y2, x1:x2]
+        conf_patch[roi_mask] = np.maximum(conf_patch[roi_mask], conf_u8)
+        kept_instances += 1
+
+    return frame_union, frame_confmap, int(kept_instances)
+
+
+def ensure_cpu_retina_mask_predictor_patch() -> bool:
+    """Patch Ultralytics segmentation postprocess to return CPU retina payloads, not GPU masks."""
+    global _ULTRALYTICS_CPU_RETINA_PATCHED, _ULTRALYTICS_ORIGINAL_SEG_CONSTRUCT_RESULT
+
+    if not cpu_retina_masks_enabled():
+        return False
+    if _ULTRALYTICS_CPU_RETINA_PATCHED:
+        return True
+
+    try:
+        from ultralytics.engine.results import Results  # type: ignore
+        from ultralytics.models.yolo.segment.predict import SegmentationPredictor  # type: ignore
+    except Exception as exc:
+        print(f'Warning: CPU retina-mask predictor patch could not be installed; falling back to Ultralytics masks ({exc})')
+        return False
+
+    original_construct_result = SegmentationPredictor.construct_result
+    _ULTRALYTICS_ORIGINAL_SEG_CONSTRUCT_RESULT = original_construct_result
+
+    def _tta_cpu_retina_construct_result(self, pred, img, orig_img, img_path, proto):  # type: ignore[no-untyped-def]
+        if not cpu_retina_masks_enabled():
+            return original_construct_result(self, pred, img, orig_img, img_path, proto)
+
+        try:
+            img_shape = tuple(int(x) for x in img.shape[2:])
+        except Exception:
+            img_shape = (int(getattr(orig_img, 'shape', (0, 0))[0]), int(getattr(orig_img, 'shape', (0, 0))[1]))
+        try:
+            orig_shape = (int(orig_img.shape[0]), int(orig_img.shape[1]))
+        except Exception:
+            orig_shape = (int(img_shape[0]), int(img_shape[1]))
+
+        pred_cpu = _as_numpy_float32_cpu(pred)
+        if pred_cpu.ndim != 2 or int(pred_cpu.shape[0]) <= 0:
+            empty_boxes = np.zeros((0, 6), dtype=np.float32)
+            return Results(orig_img, path=img_path, names=self.model.names, boxes=empty_boxes, masks=None)
+
+        boxes_scaled = _scale_boxes_np(img_shape, pred_cpu[:, :4], orig_shape)
+        pred_cpu[:, :4] = boxes_scaled
+        proto_cpu = _as_numpy_float32_cpu(proto)
+
+        payload = CpuRetinaMaskPayload(
+            proto=proto_cpu,
+            coeffs=np.ascontiguousarray(pred_cpu[:, 6:], dtype=np.float32),
+            boxes_xyxy=np.ascontiguousarray(pred_cpu[:, :4], dtype=np.float32),
+            confs=np.ascontiguousarray(pred_cpu[:, 4], dtype=np.float32),
+            orig_shape=(int(orig_shape[0]), int(orig_shape[1])),
+            img_shape=(int(img_shape[0]), int(img_shape[1])),
+            frame_path=str(img_path),
+        )
+        result = Results(
+            orig_img,
+            path=img_path,
+            names=self.model.names,
+            boxes=np.ascontiguousarray(pred_cpu[:, :6], dtype=np.float32),
+            masks=None,
+        )
+        setattr(result, '_tta_cpu_retina_payload', payload)
+        return result
+
+    SegmentationPredictor.construct_result = _tta_cpu_retina_construct_result
+    _ULTRALYTICS_CPU_RETINA_PATCHED = True
+    print(
+        'Experimental CPU retina masks enabled: Ultralytics will skip GPU native mask upsampling; '
+        'retina/native masks are reconstructed and accumulated on CPU.'
+    )
+    return True
+
+
+def _extract_result_masks_and_confs(r) -> Tuple[Optional[object], Optional[np.ndarray]]:
+    """Detach one streamed YOLO result into CPU-owned data for asynchronous postprocess."""
+    cpu_payload = getattr(r, '_tta_cpu_retina_payload', None)
+    if isinstance(cpu_payload, CpuRetinaMaskPayload):
+        return cpu_payload, np.ascontiguousarray(cpu_payload.confs, dtype=np.float32)
+
     if getattr(r, 'masks', None) is None or r.masks is None or r.masks.data is None:
         return None, None
 
@@ -3206,9 +3555,68 @@ def _scatter_tilted_native_xy_to_volume(
         )
 
 
+def _process_cpu_retina_prediction_frame(
+    idx: int,
+    payload: CpuRetinaMaskPayload,
+    out_size: int,
+    view_union_mm: np.ndarray,
+    view_confmap_mm: np.ndarray,
+    M_out_to_native: np.ndarray,
+    native_h: int,
+    native_w: int,
+    tilted_view: Optional[ViewInfo] = None,
+) -> Tuple[int, int]:
+    """CPU equivalent of retina_masks=True accumulation without allocating GPU HxW masks."""
+    frame_union, frame_confmap, kept_instances = _accumulate_cpu_retina_payload_to_prediction_frame(
+        payload,
+        int(out_size),
+    )
+    if int(kept_instances) <= 0 or not np.any(frame_union):
+        return int(kept_instances), 0
+
+    native_union = cv2.warpAffine(
+        frame_union,
+        M_out_to_native,
+        dsize=(native_w, native_h),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    ) > 0
+
+    native_conf: Optional[np.ndarray] = None
+    if np.any(frame_confmap):
+        native_conf = cv2.warpAffine(
+            frame_confmap,
+            M_out_to_native,
+            dsize=(native_w, native_h),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        ).astype(np.uint8, copy=False)
+
+    if tilted_view is not None:
+        _scatter_tilted_native_xy_to_volume(
+            frame_idx=int(idx),
+            native_union=native_union,
+            native_conf=native_conf,
+            tilted_view=tilted_view,
+            view_union_mm=view_union_mm,
+            view_confmap_mm=view_confmap_mm,
+        )
+    else:
+        if np.any(native_union):
+            view_union_mm[int(idx), :, :] |= native_union.astype(np.uint8, copy=False)
+
+        if native_conf is not None and np.any(native_conf):
+            conf_slice = view_confmap_mm[int(idx)]
+            np.maximum(conf_slice, native_conf, out=conf_slice)
+
+    return int(kept_instances), 1
+
+
 def _process_prediction_frame(
     idx: int,
-    masks_np: Optional[np.ndarray],
+    masks_np: Optional[object],
     confs_np: Optional[np.ndarray],
     out_size: int,
     view_union_mm: np.ndarray,
@@ -3219,15 +3627,31 @@ def _process_prediction_frame(
     tilted_view: Optional[ViewInfo] = None,
 ) -> Tuple[int, int]:
     """Collapse one streamed result directly into unpacked native-view union + confidence volumes."""
-    if masks_np is None or confs_np is None or masks_np.ndim != 3 or int(masks_np.shape[0]) <= 0:
+    if isinstance(masks_np, CpuRetinaMaskPayload):
+        return _process_cpu_retina_prediction_frame(
+            idx=idx,
+            payload=masks_np,
+            out_size=out_size,
+            view_union_mm=view_union_mm,
+            view_confmap_mm=view_confmap_mm,
+            M_out_to_native=M_out_to_native,
+            native_h=native_h,
+            native_w=native_w,
+            tilted_view=tilted_view,
+        )
+
+    if masks_np is None or confs_np is None:
+        return 0, 0
+    masks_arr = np.asarray(masks_np)
+    if masks_arr.ndim != 3 or int(masks_arr.shape[0]) <= 0:
         return 0, 0
 
     frame_union = np.zeros((out_size, out_size), dtype=np.uint8)
     frame_confmap = np.zeros((out_size, out_size), dtype=np.uint8)
-    num_inst = int(masks_np.shape[0])
+    num_inst = int(masks_arr.shape[0])
 
     for inst_idx in range(num_inst):
-        inst = np.asarray(masks_np[inst_idx], dtype=np.uint8)
+        inst = np.asarray(masks_arr[inst_idx], dtype=np.uint8)
         if inst.shape[0] != out_size or inst.shape[1] != out_size:
             inst = cv2.resize(inst, (out_size, out_size), interpolation=cv2.INTER_NEAREST)
         inst = (inst > 0).astype(np.uint8, copy=False)
@@ -3307,6 +3731,7 @@ def predict_video_and_accumulate(
     confidence-map updates do not unnecessarily serialize GPU inference.
     """
     ensure_yolo_ready_for_predict(model, cfg)
+    use_cpu_retina_masks = ensure_cpu_retina_mask_predictor_patch()
 
     prediction_count = 0
     frames_with_predictions = 0
@@ -3319,7 +3744,9 @@ def predict_video_and_accumulate(
         iou=1.0,
         save=False,
         stream=True,
-        retina_masks=True,
+        # CPU retina path patches Ultralytics construct_result so the GPU returns only
+        # boxes/protos/coefficients; native mask upsampling and crop happen later on CPU.
+        retina_masks=False if use_cpu_retina_masks else True,
         batch=1,
         device=cfg.device,
         half=cfg.half,
@@ -3334,7 +3761,7 @@ def predict_video_and_accumulate(
         worker_count = 1
     else:
         worker_count = max(1, min(int(postprocess_workers), int(num_frames)))
-    pending_limit = max(worker_count, worker_count * 2)
+    pending_limit = cpu_mask_postprocess_pending_limit(worker_count, int(num_frames))
 
     if worker_count <= 1:
         for idx, r in enumerate(results):
@@ -3469,7 +3896,7 @@ def _union_supported_native_components_into_parent(
 
 def _process_tile_prediction_frame(
     idx: int,
-    masks_np: Optional[np.ndarray],
+    masks_np: Optional[object],
     confs_np: Optional[np.ndarray],
     out_size: int,
     baseline_support_mm: np.ndarray,
@@ -3491,21 +3918,63 @@ def _process_tile_prediction_frame(
         'gated_added_voxels': 0,
     }
 
-    if masks_np is None or confs_np is None or masks_np.ndim != 3 or int(masks_np.shape[0]) <= 0:
+    if masks_np is None or confs_np is None:
         return stats
 
     support_slice = np.asarray(baseline_support_mm[int(idx)], dtype=bool)
     tiled_slice = np.asarray(baseline_mask_mm[int(idx)], dtype=np.uint8)
     conf_slice = baseline_confmap_mm[int(idx)]
 
-    num_inst = int(masks_np.shape[0])
+    if isinstance(masks_np, CpuRetinaMaskPayload):
+        frame_shape = (int(out_size), int(out_size))
+        for _inst_idx, conf_val, y1, y2, x1, x2, roi_mask in _iter_cpu_retina_payload_rois(masks_np, frame_shape):
+            stats['prediction_count'] += 1
+            inst = np.zeros(frame_shape, dtype=np.uint8)
+            inst[int(y1):int(y2), int(x1):int(x2)] = roi_mask.astype(np.uint8, copy=False)
+            native_mask = cv2.warpAffine(
+                inst,
+                M_out_to_native,
+                dsize=(native_w, native_h),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+            native_mask_bool = np.asarray(native_mask, dtype=bool)
+            if not np.any(native_mask_bool):
+                stats['rejected_masks'] += 1
+                continue
+
+            component_stats = _union_supported_native_components_into_parent(
+                native_mask_bool=native_mask_bool,
+                support_slice_bool=support_slice,
+                parent_slice=tiled_slice,
+                conf_slice=conf_slice,
+                conf_val=float(conf_val),
+            )
+            stats['accepted_components'] += int(component_stats['accepted_components'])
+            stats['rejected_components'] += int(component_stats['rejected_components'])
+            stats['gated_added_voxels'] += int(component_stats['gated_added_voxels'])
+
+            if int(component_stats['accepted_components']) > 0:
+                stats['accepted_masks'] += 1
+            else:
+                stats['rejected_masks'] += 1
+
+        stats['frames_with_predictions'] = 1 if int(stats['prediction_count']) > 0 else 0
+        return stats
+
+    masks_arr = np.asarray(masks_np)
+    if masks_arr.ndim != 3 or int(masks_arr.shape[0]) <= 0:
+        return stats
+
+    num_inst = int(masks_arr.shape[0])
     stats['prediction_count'] = int(num_inst)
     stats['frames_with_predictions'] = 1
 
     for inst_idx in range(num_inst):
         conf_val = float(confs_np[inst_idx]) if inst_idx < int(confs_np.shape[0]) else 0.0
 
-        inst = np.asarray(masks_np[inst_idx], dtype=np.uint8)
+        inst = np.asarray(masks_arr[inst_idx], dtype=np.uint8)
         if inst.shape[0] != out_size or inst.shape[1] != out_size:
             inst = cv2.resize(inst, (out_size, out_size), interpolation=cv2.INTER_NEAREST)
         inst = (inst > 0).astype(np.uint8, copy=False)
@@ -3561,6 +4030,7 @@ def predict_tile_video_and_gate(
 ) -> Dict[str, int]:
     """Run tiled inference and gate accepted masks into an isolated tiled-view volume."""
     ensure_yolo_ready_for_predict(model, cfg)
+    use_cpu_retina_masks = ensure_cpu_retina_mask_predictor_patch()
 
     results = model.predict(
         source=str(video_path),
@@ -3570,7 +4040,9 @@ def predict_tile_video_and_gate(
         iou=1.0,
         save=False,
         stream=True,
-        retina_masks=True,
+        # CPU retina path patches Ultralytics construct_result so the GPU returns only
+        # boxes/protos/coefficients; native mask upsampling and crop happen later on CPU.
+        retina_masks=False if use_cpu_retina_masks else True,
         batch=1,
         device=cfg.device,
         half=cfg.half,
@@ -3590,7 +4062,7 @@ def predict_tile_video_and_gate(
     }
 
     worker_count = max(1, min(int(postprocess_workers), int(num_frames)))
-    pending_limit = max(worker_count, worker_count * 2)
+    pending_limit = cpu_mask_postprocess_pending_limit(worker_count, int(num_frames))
 
     def _accumulate(stats_local: Dict[str, int]) -> None:
         for key in agg.keys():
@@ -4758,7 +5230,7 @@ def assemble_current_view_union_volume(
     combines outputs from more than one model.
     """
     if len(view_volumes_by_model) != 1:
-        raise ValueError('v9.5.2_SLURM supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('v9.5.3_SLURM supports exactly one --model; multiple-model inference has been removed')
 
     model_name = next(iter(view_volumes_by_model.keys()))
     final_union_mm = allocate_workspace_array(
@@ -6360,7 +6832,7 @@ def gate_tile_volume_against_parent_inplace(
     """Keep only tile components that intersect the frozen parent support on the same slice.
 
     The gating result for one slice never affects another slice, so this stage can be parallelized
-    aggressively across the slice axis without violating the v9.5.2_SLURM semantics.
+    aggressively across the slice axis without violating the v9.5.3_SLURM semantics.
     """
     num_slices = int(tile_mask_mm.shape[0])
     accepted_components = np.zeros((num_slices,), dtype=np.int64)
@@ -6683,7 +7155,7 @@ def apply_gaussian_smoothing_inplace(
 ) -> Dict[str, int | float]:
     """Smooth the final binary 3D volume with a Gaussian kernel and re-threshold at 0.5.
 
-    The v9.5.2_SLURM smoothing stage is applied after the final view/tile union and optional
+    The v9.5.3_SLURM smoothing stage is applied after the final view/tile union and optional
     3D void fill, but before --keep_objects and before resizing back to the source geometry.
     A single float32 workspace is reused for every pass to avoid retaining multiple dense
     floating-point copies of the volume.
@@ -7522,7 +7994,7 @@ def build_troubleshooting_pass_union(
     workers: int,
 ) -> np.ndarray:
     if len(model_names) != 1:
-        raise ValueError('v9.5.2_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
+        raise ValueError('v9.5.3_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     view_volumes_for_pass: Dict[str, Dict[str, np.ndarray]] = {str(model_name): {} for model_name in model_names}
     intermediate_volumes: List[np.ndarray] = []
 
@@ -7631,7 +8103,7 @@ def schedule_troubleshooting_pass_outputs(
     workers: int,
 ) -> Dict[str, Path]:
     if len(model_names) != 1:
-        raise ValueError('v9.5.2_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
+        raise ValueError('v9.5.3_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     if int(total_passes) < 0 or not snapshot_refs:
         return {}
 
@@ -7812,7 +8284,7 @@ def union_view_volume_for_single_model(
     workers: int = 1,
 ) -> np.ndarray:
     if len(view_volumes_by_model) != 1:
-        raise ValueError('v9.5.2_SLURM supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('v9.5.3_SLURM supports exactly one --model; multiple-model inference has been removed')
     model_name = next(iter(view_volumes_by_model.keys()))
     if view_name not in view_volumes_by_model[model_name]:
         raise KeyError(f'No view volume found for {view_name}')
@@ -8107,7 +8579,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('v9.5.2_SLURM accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('v9.5.3_SLURM accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -8255,6 +8727,14 @@ def main() -> None:
             'Lanczos-3 radial sampling, wraparound Radial interpolation, and dense final backprojection are active.'
         )
     spec_notes.append(f'NRRD export writes the final mask using the PTA-aligned Slicer layout: {NRRD_AXIS_ORDER_NOTE}; space={NRRD_SPACE}; space_directions=identity.')
+    if cpu_retina_masks_enabled():
+        spec_notes.append(
+            'Experimental CPU retina-mask reconstruction active: Ultralytics native mask upsampling is bypassed on GPU; '
+            'mask protos/coefficients/boxes are copied to CPU, bbox-ROI retina masks are reconstructed asynchronously, '
+            'and queued frame payloads are buffered in RAM via YOLO_TTA_CPU_MASK_PENDING_FRAMES.'
+        )
+    else:
+        spec_notes.append('Experimental CPU retina-mask reconstruction disabled by YOLO_TTA_CPU_RETINA_MASKS=0; using Ultralytics GPU masks.')
     if bool(gaussian_smoothing_enabled):
         spec_notes.append(
             f'Gaussian smoothing active: sigma={float(gaussian_smoothing_sigma):g} voxel(s), '
