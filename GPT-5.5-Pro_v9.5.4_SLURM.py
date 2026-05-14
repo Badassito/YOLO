@@ -2,7 +2,7 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v9.5.3_SLURM single-channel-aligned script:
+This v9.5.4_SLURM single-channel-aligned script:
   - builds Transverse, optional Tilted Transverse, independently optional Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - renders parent/full-frame videos directly from the native view transform so inference no longer waits on
     a separately rendered canvas video, and derives non-radial tile videos from shared canvas batches so the
@@ -3075,7 +3075,7 @@ def resolve_gaussian_smoothing_settings(
     gaussian_smoothing_arg: Optional[float],
     gaussian_smoothing_passes: int,
 ) -> Tuple[bool, float, int]:
-    """Resolve Gaussian smoothing enablement from the v9.5.3 CLI contract.
+    """Resolve Gaussian smoothing enablement from the v9.5.4 CLI contract.
 
     Contract:
       - no --gaussian_smoothing and the default --gaussian_smoothing_passes 1 => disabled
@@ -3152,7 +3152,7 @@ def cpu_mask_postprocess_pending_limit(worker_count: int, num_frames: int) -> in
     """
     workers = max(1, int(worker_count))
     frames = max(1, int(num_frames))
-    requested = _env_int('YOLO_TTA_CPU_MASK_PENDING_FRAMES', 256)
+    requested = _env_int('YOLO_TTA_CPU_MASK_PENDING_FRAMES', 2560)
     if int(requested) <= 0:
         return max(workers, frames)
     return max(workers, min(frames, max(int(requested), workers * 2)))
@@ -4128,12 +4128,68 @@ def predict_tile_video_and_gate(
 
 
 
-def _fill_holes_2d(mask_bool: np.ndarray) -> np.ndarray:
+def cleanup_backend() -> str:
+    """Return the per-slice cleanup backend.
+
+    OpenCV is the default because the hot operations used here release the GIL and scale better
+    under Python thread pools. Set YOLO_TTA_CLEANUP_BACKEND=scipy to recover the older scipy.ndimage
+    cleanup path for debugging or strict regression comparison.
+    """
+    backend = os.environ.get('YOLO_TTA_CLEANUP_BACKEND', 'opencv').strip().lower()
+    if backend not in {'opencv', 'scipy'}:
+        backend = 'opencv'
+    return backend
+
+
+def _cv2_connected_components(mask_u8: np.ndarray, connectivity: int = 8) -> Tuple[int, np.ndarray]:
+    return cv2.connectedComponents(
+        np.ascontiguousarray(mask_u8, dtype=np.uint8),
+        connectivity=int(connectivity),
+        ltype=cv2.CV_32S,
+    )
+
+
+def _fill_holes_2d_scipy(mask_bool: np.ndarray) -> np.ndarray:
     return np.asarray(ndi.binary_fill_holes(np.asarray(mask_bool, dtype=bool)), dtype=bool)
 
 
+def _fill_holes_2d_opencv(mask_bool: np.ndarray) -> np.ndarray:
+    """Fill 2D holes using background connected components.
 
-def _filter_connected_components_by_min_radius(
+    This matches scipy.ndimage.binary_fill_holes' default 2D background connectivity (4-connected)
+    while avoiding the slower Python-visible scipy path for thousands of large slices.
+    """
+    mask_u8 = np.ascontiguousarray(np.asarray(mask_bool, dtype=np.uint8))
+    if mask_u8.size == 0 or not np.any(mask_u8):
+        return np.zeros(mask_u8.shape, dtype=bool)
+    if bool(np.all(mask_u8)):
+        return np.ones(mask_u8.shape, dtype=bool)
+
+    bg_u8 = (mask_u8 == 0).astype(np.uint8, copy=False)
+    num_labels, labels2d = _cv2_connected_components(bg_u8, connectivity=4)
+    if int(num_labels) <= 1:
+        return mask_u8.astype(bool, copy=False)
+
+    touches_boundary = np.zeros((int(num_labels),), dtype=bool)
+    touches_boundary[np.unique(labels2d[0, :])] = True
+    touches_boundary[np.unique(labels2d[-1, :])] = True
+    touches_boundary[np.unique(labels2d[:, 0])] = True
+    touches_boundary[np.unique(labels2d[:, -1])] = True
+
+    enclosed_bg = (labels2d > 0) & (~touches_boundary[labels2d])
+    if np.any(enclosed_bg):
+        mask_u8 = mask_u8.copy()
+        mask_u8[enclosed_bg] = np.uint8(1)
+    return mask_u8.astype(bool, copy=False)
+
+
+def _fill_holes_2d(mask_bool: np.ndarray) -> np.ndarray:
+    if cleanup_backend() == 'scipy':
+        return _fill_holes_2d_scipy(mask_bool)
+    return _fill_holes_2d_opencv(mask_bool)
+
+
+def _filter_connected_components_by_min_radius_scipy(
     mask_bool: np.ndarray,
     structure2: np.ndarray,
     min_radius: float,
@@ -4150,6 +4206,72 @@ def _filter_connected_components_by_min_radius(
         return np.zeros(mask_bool.shape, dtype=bool)
     return np.isin(labels2d, keep_ids)
 
+
+def _filter_connected_components_by_min_radius_opencv(
+    mask_bool: np.ndarray,
+    min_radius: float,
+) -> np.ndarray:
+    mask_u8 = np.ascontiguousarray(np.asarray(mask_bool, dtype=np.uint8))
+    if mask_u8.size == 0 or not np.any(mask_u8):
+        return np.zeros(mask_u8.shape, dtype=bool)
+
+    num_labels, labels2d = _cv2_connected_components(mask_u8, connectivity=8)
+    if int(num_labels) <= 1:
+        return np.zeros(mask_u8.shape, dtype=bool)
+
+    dist = cv2.distanceTransform(mask_u8, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    radii = np.zeros((int(num_labels),), dtype=np.float32)
+    np.maximum.at(radii, labels2d.ravel(), np.asarray(dist, dtype=np.float32).ravel())
+    keep_lookup = radii >= float(min_radius)
+    keep_lookup[0] = False
+    return keep_lookup[labels2d]
+
+
+def _filter_connected_components_by_min_radius(
+    mask_bool: np.ndarray,
+    structure2: np.ndarray,
+    min_radius: float,
+) -> np.ndarray:
+    if cleanup_backend() == 'scipy':
+        return _filter_connected_components_by_min_radius_scipy(mask_bool, structure2, float(min_radius))
+    return _filter_connected_components_by_min_radius_opencv(mask_bool, float(min_radius))
+
+
+def _filter_connected_components_by_min_conf_opencv(
+    mask_bool: np.ndarray,
+    conf_slice: np.ndarray,
+    min_conf_u8: int,
+) -> np.ndarray:
+    mask_u8 = np.ascontiguousarray(np.asarray(mask_bool, dtype=np.uint8))
+    if mask_u8.size == 0 or not np.any(mask_u8):
+        return np.zeros(mask_u8.shape, dtype=bool)
+
+    num_labels, labels2d = _cv2_connected_components(mask_u8, connectivity=8)
+    if int(num_labels) <= 1:
+        return np.zeros(mask_u8.shape, dtype=bool)
+
+    maxima = np.zeros((int(num_labels),), dtype=np.uint8)
+    np.maximum.at(maxima, labels2d.ravel(), np.asarray(conf_slice, dtype=np.uint8).ravel())
+    keep_lookup = maxima >= int(min_conf_u8)
+    keep_lookup[0] = False
+    return keep_lookup[labels2d]
+
+
+def _filter_connected_components_by_min_conf_scipy(
+    mask_bool: np.ndarray,
+    conf_slice: np.ndarray,
+    min_conf_u8: int,
+    structure2: np.ndarray,
+) -> np.ndarray:
+    labels2d, num = ndi.label(mask_bool, structure=structure2)
+    if int(num) <= 0:
+        return np.zeros(mask_bool.shape, dtype=bool)
+    label_ids = np.arange(1, int(num) + 1, dtype=np.int32)
+    maxima = np.asarray(ndi.maximum(conf_slice, labels=labels2d, index=label_ids), dtype=np.uint8)
+    keep_ids = label_ids[maxima >= int(min_conf_u8)]
+    if keep_ids.size <= 0:
+        return np.zeros(mask_bool.shape, dtype=bool)
+    return np.isin(labels2d, keep_ids)
 
 
 def _build_supported_component_mask(
@@ -4206,33 +4328,45 @@ def fused_slice_cleanup_inplace(
     min_conf_u8 = int(min_conf_to_u8_threshold(float(min_conf)))
     worker_count = choose_slice_parallel_workers(int(workers), num_slices)
     chunk_size = choose_parallel_chunk_size(num_slices, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
+    backend = cleanup_backend()
 
     def _process(i: int) -> None:
         mask_slice = np.asarray(mask_mm[int(i)], dtype=bool)
         conf_slice = None if confmap_mm is None else np.asarray(confmap_mm[int(i)], dtype=np.uint8)
 
         if np.any(mask_slice) and conf_slice is not None and float(min_conf) > 0.0:
-            labels2d, num = ndi.label(mask_slice, structure=structure2)
-            if int(num) > 0:
-                label_ids = np.arange(1, int(num) + 1, dtype=np.int32)
-                maxima = np.asarray(ndi.maximum(conf_slice, labels=labels2d, index=label_ids), dtype=np.uint8)
-                keep_ids = label_ids[maxima >= int(min_conf_u8)]
-                if keep_ids.size > 0:
-                    mask_slice = np.isin(labels2d, keep_ids)
-                else:
-                    mask_slice = np.zeros(mask_slice.shape, dtype=bool)
+            if backend == 'opencv':
+                mask_slice = _filter_connected_components_by_min_conf_opencv(
+                    mask_slice,
+                    conf_slice,
+                    int(min_conf_u8),
+                )
             else:
-                mask_slice = np.zeros(mask_slice.shape, dtype=bool)
+                mask_slice = _filter_connected_components_by_min_conf_scipy(
+                    mask_slice,
+                    conf_slice,
+                    int(min_conf_u8),
+                    structure2,
+                )
 
         if np.any(mask_slice):
-            mask_slice = _fill_holes_2d(mask_slice)
+            if backend == 'opencv':
+                mask_slice = _fill_holes_2d_opencv(mask_slice)
+            else:
+                mask_slice = _fill_holes_2d_scipy(mask_slice)
 
         if np.any(mask_slice) and float(min_radius) > 0.0:
-            mask_slice = _filter_connected_components_by_min_radius(
-                mask_slice,
-                structure2,
-                float(min_radius),
-            )
+            if backend == 'opencv':
+                mask_slice = _filter_connected_components_by_min_radius_opencv(
+                    mask_slice,
+                    float(min_radius),
+                )
+            else:
+                mask_slice = _filter_connected_components_by_min_radius_scipy(
+                    mask_slice,
+                    structure2,
+                    float(min_radius),
+                )
 
         mask_mm[int(i), :, :] = mask_slice.astype(np.uint8, copy=False)
         if conf_slice is not None:
@@ -4372,19 +4506,24 @@ def _slice_connectivity_for_3d_connectivity(connectivity: int) -> int:
     raise ValueError('3D connectivity must be one of 6, 18, or 26')
 
 
-def _iter_adjacent_gid_pairs(
+def _adjacent_gid_pair_codes(
     prev_gid: np.ndarray,
     curr_gid: np.ndarray,
     xy_offsets: Optional[Sequence[Tuple[int, int]]] = None,
-) -> Iterator[Tuple[int, int]]:
-    """Yield unique touching component-id pairs across adjacent z-slices.
+    prev_offset: int = 0,
+    curr_offset: int = 0,
+) -> np.ndarray:
+    """Return unique touching component-id pairs encoded as uint64 values.
 
-    ``xy_offsets`` controls the 3D connectivity across adjacent slices. When omitted, the
-    existing 26-connected behavior is used for foreground interpolation labeling.
+    The upper 32 bits contain the previous-slice gid and the lower 32 bits contain the
+    current-slice gid. ``prev_offset`` and ``curr_offset`` allow callers to pass per-slice
+    local labels and encode global provisional ids without first rewriting the whole volume.
+    Pair extraction is independent for each adjacent slice pair, so callers can run this
+    function concurrently and then apply union-find merges serially.
     """
     h, w = prev_gid.shape
-    seen: set[int] = set()
     offsets = tuple(xy_offsets) if xy_offsets is not None else _adjacent_xy_offsets_for_3d_connectivity(26)
+    code_parts: List[np.ndarray] = []
 
     for dy, dx in offsets:
         dy_i = int(dy)
@@ -4407,13 +4546,36 @@ def _iter_adjacent_gid_pairs(
         if not np.any(overlap):
             continue
 
-        codes = (a[overlap].astype(np.uint64, copy=False) << np.uint64(32)) | b[overlap].astype(np.uint64, copy=False)
-        for code in np.unique(codes):
-            code_i = int(code)
-            if code_i in seen:
-                continue
-            seen.add(code_i)
-            yield (code_i >> 32), (code_i & 0xFFFFFFFF)
+        a_vals = a[overlap].astype(np.uint64, copy=False)
+        b_vals = b[overlap].astype(np.uint64, copy=False)
+        if int(prev_offset) != 0:
+            a_vals = a_vals + np.uint64(int(prev_offset))
+        if int(curr_offset) != 0:
+            b_vals = b_vals + np.uint64(int(curr_offset))
+        codes = (a_vals << np.uint64(32)) | b_vals
+        if codes.size > 0:
+            code_parts.append(np.unique(codes))
+
+    if not code_parts:
+        return np.zeros((0,), dtype=np.uint64)
+    if len(code_parts) == 1:
+        return np.asarray(code_parts[0], dtype=np.uint64)
+    return np.unique(np.concatenate(code_parts).astype(np.uint64, copy=False))
+
+
+def _iter_adjacent_gid_pairs(
+    prev_gid: np.ndarray,
+    curr_gid: np.ndarray,
+    xy_offsets: Optional[Sequence[Tuple[int, int]]] = None,
+) -> Iterator[Tuple[int, int]]:
+    """Yield unique touching component-id pairs across adjacent z-slices.
+
+    ``xy_offsets`` controls the 3D connectivity across adjacent slices. When omitted, the
+    existing 26-connected behavior is used for foreground interpolation labeling.
+    """
+    for code in _adjacent_gid_pair_codes(prev_gid, curr_gid, xy_offsets):
+        code_i = int(code)
+        yield (code_i >> 32), (code_i & 0xFFFFFFFF)
 
 
 def _mark_boundary_components_from_local_labels(
@@ -4546,12 +4708,15 @@ def label_foreground_volume_streaming(
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
     wrap_axis: bool = False,
+    workers: int = 1,
 ) -> Tuple[np.ndarray, int, List[Path]]:
-    """Label a 3D foreground volume using slice-streamed 26-connectivity.
+    """Label a 3D foreground volume using parallel 2D slice labeling plus serial union-find.
 
-      - prefers an anonymous in-memory uint32 label volume when enough RAM+swap is available
-      - otherwise uses a single disk-backed provisional label volume and compacts labels in place,
-        avoiding the previous second full uint32 relabel volume
+      - the expensive per-slice 2D connected-component labeling runs concurrently across slices
+      - local slice labels are promoted to global provisional ids with a parallel pass
+      - adjacent-slice pair extraction can also run concurrently; only the final union-find merges
+        remain serial to preserve deterministic 26-connected object identities
+      - the compact relabel pass is slice-parallel
       - when wrap_axis is true, the first and last slices are treated as adjacent. This is used
         for Radial view-native interpolation over the [0°, 180°) diameter-frame domain.
     """
@@ -4572,43 +4737,108 @@ def label_foreground_volume_streaming(
         labels_store = np.memmap(provisional_path, dtype=np.uint32, mode='w+', shape=(z_dim, h, w))
         label_paths = [provisional_path]
 
-    uf = _UnionFind()
-    prev_gid_slice: Optional[np.ndarray] = None
-    first_gid_slice: Optional[np.ndarray] = None
-    last_gid_slice: Optional[np.ndarray] = None
+    if int(z_dim) <= 0:
+        flush_array(labels_store)
+        return labels_store, 0, label_paths
 
-    for z in tqdm(range(z_dim), desc='Interpolation: slice labeling'):
-        fg = (np.asarray(mask_mm[z]) > 0).astype(np.uint8, copy=False)
-        num_labels, labels2d = cv2.connectedComponents(fg, connectivity=8, ltype=cv2.CV_32S)
+    worker_count = choose_slice_parallel_workers(int(workers), int(z_dim))
+    label_workers = choose_slice_parallel_workers(
+        _env_int('YOLO_TTA_INTERPOLATION_LABEL_WORKERS', worker_count),
+        int(z_dim),
+    )
+    compact_workers = choose_slice_parallel_workers(
+        _env_int('YOLO_TTA_INTERPOLATION_COMPACT_WORKERS', worker_count),
+        int(z_dim),
+    )
+    pair_workers = choose_slice_parallel_workers(
+        _env_int('YOLO_TTA_INTERPOLATION_PAIR_WORKERS', worker_count),
+        max(1, int(z_dim) - 1),
+    )
+
+    component_counts = np.zeros((int(z_dim),), dtype=np.uint32)
+
+    def _label_slice_local(z: int) -> None:
+        fg = (np.asarray(mask_mm[int(z)]) > 0).astype(np.uint8, copy=False)
+        if fg.size == 0 or not np.any(fg):
+            labels_store[int(z), :, :] = np.uint32(0)
+            component_counts[int(z)] = np.uint32(0)
+            return
+
+        num_labels, labels2d = _cv2_connected_components(fg, connectivity=8)
         if int(num_labels) <= 1:
-            labels_store[z, :, :] = 0
-            gid_slice = np.zeros((h, w), dtype=np.uint32)
-            if int(z) == 0:
-                first_gid_slice = np.asarray(gid_slice)
-            if int(z) == int(z_dim) - 1:
-                last_gid_slice = np.asarray(gid_slice)
-            prev_gid_slice = None
-            continue
+            labels_store[int(z), :, :] = np.uint32(0)
+            component_counts[int(z)] = np.uint32(0)
+            return
 
-        local_to_gid = np.zeros((int(num_labels),), dtype=np.uint32)
-        local_to_gid[1:] = uf.new_ids(int(num_labels) - 1)
-        gid_slice = local_to_gid[labels2d]
-        labels_store[z, :, :] = gid_slice
+        labels_store[int(z), :, :] = np.asarray(labels2d, dtype=np.uint32)
+        component_counts[int(z)] = np.uint32(int(num_labels) - 1)
 
-        if prev_gid_slice is not None and np.any(prev_gid_slice) and np.any(gid_slice):
-            for a, b in _iter_adjacent_gid_pairs(prev_gid_slice, gid_slice):
-                uf.union(int(a), int(b))
+    parallel_for_indices_chunked(
+        int(z_dim),
+        _label_slice_local,
+        max_workers=label_workers,
+        desc='Interpolation: 2D slice labeling',
+        show_progress=True,
+        target_chunks_per_worker=2,
+    )
 
-        prev_gid_slice = np.asarray(gid_slice)
-        if int(z) == 0:
-            first_gid_slice = np.asarray(gid_slice)
-        if int(z) == int(z_dim) - 1:
-            last_gid_slice = np.asarray(gid_slice)
+    total_components = int(np.sum(component_counts, dtype=np.uint64))
+    if total_components <= 0:
+        flush_array(labels_store)
+        return labels_store, 0, label_paths
+    if total_components >= 2 ** 32:
+        raise RuntimeError('3D component id space exceeded uint32 capacity')
 
-    if bool(wrap_axis) and int(z_dim) > 1 and first_gid_slice is not None and last_gid_slice is not None:
+    # Slice z's provisional global id range is
+    # [slice_offsets[z] + 1, slice_offsets[z] + component_counts[z]].  The label volume remains
+    # in local per-slice ids until compact relabel so we avoid a full-volume promotion write pass.
+    cumsum = np.cumsum(component_counts.astype(np.uint64, copy=False), dtype=np.uint64)
+    slice_offsets = np.zeros((int(z_dim),), dtype=np.uint32)
+    if int(z_dim) > 1:
+        slice_offsets[1:] = cumsum[:-1].astype(np.uint32, copy=False)
+
+    uf = _UnionFind()
+    uf.new_ids(total_components)
+
+    def _pair_codes_for_z(z: int) -> np.ndarray:
+        prev_local_slice = np.asarray(labels_store[int(z) - 1])
+        curr_local_slice = np.asarray(labels_store[int(z)])
+        if not np.any(prev_local_slice) or not np.any(curr_local_slice):
+            return np.zeros((0,), dtype=np.uint64)
+        return _adjacent_gid_pair_codes(
+            prev_local_slice,
+            curr_local_slice,
+            prev_offset=int(slice_offsets[int(z) - 1]),
+            curr_offset=int(slice_offsets[int(z)]),
+        )
+
+    if int(z_dim) > 1:
+        if pair_workers <= 1:
+            pair_iter: Iterable[np.ndarray] = (_pair_codes_for_z(int(z)) for z in range(1, int(z_dim)))
+        else:
+            pair_iter = parallel_map_in_order(
+                _pair_codes_for_z,
+                range(1, int(z_dim)),
+                max_workers=pair_workers,
+                max_pending=max(pair_workers, pair_workers * 2),
+            )
+        for codes in tqdm(pair_iter, total=max(0, int(z_dim) - 1), desc='Interpolation: cross-slice unions'):
+            for code in np.asarray(codes, dtype=np.uint64):
+                code_i = int(code)
+                uf.union(code_i >> 32, code_i & 0xFFFFFFFF)
+
+    if bool(wrap_axis) and int(z_dim) > 1:
+        first_gid_slice = np.asarray(labels_store[0])
+        last_gid_slice = np.asarray(labels_store[int(z_dim) - 1])
         if np.any(first_gid_slice) and np.any(last_gid_slice):
-            for a, b in _iter_adjacent_gid_pairs(last_gid_slice, first_gid_slice):
-                uf.union(int(a), int(b))
+            for code in _adjacent_gid_pair_codes(
+                last_gid_slice,
+                first_gid_slice,
+                prev_offset=int(slice_offsets[int(z_dim) - 1]),
+                curr_offset=int(slice_offsets[0]),
+            ):
+                code_i = int(code)
+                uf.union(code_i >> 32, code_i & 0xFFFFFFFF)
 
     root_map = uf.root_map()
     if root_map.shape[0] <= 1:
@@ -4620,13 +4850,31 @@ def label_foreground_volume_streaming(
     compact_root_ids = np.zeros(root_map.shape, dtype=np.uint32)
     compact_root_ids[unique_roots] = np.arange(1, unique_roots.size + 1, dtype=np.uint32)
 
-    for z in tqdm(range(z_dim), desc='Interpolation: compact relabel'):
-        gid_slice = np.asarray(labels_store[z])
-        labels_store[z, :, :] = compact_root_ids[root_map[gid_slice]]
+    def _compact_slice(z: int) -> None:
+        local_slice = np.asarray(labels_store[int(z)])
+        if np.any(local_slice):
+            offset = int(slice_offsets[int(z)])
+            if offset != 0:
+                gid_slice = local_slice.astype(np.uint32, copy=True)
+                nz = gid_slice > 0
+                gid_slice[nz] = gid_slice[nz] + np.uint32(offset)
+            else:
+                gid_slice = local_slice
+            labels_store[int(z), :, :] = compact_root_ids[root_map[gid_slice]]
+        else:
+            labels_store[int(z), :, :] = np.uint32(0)
+
+    parallel_for_indices_chunked(
+        int(z_dim),
+        _compact_slice,
+        max_workers=compact_workers,
+        desc='Interpolation: compact relabel',
+        show_progress=True,
+        target_chunks_per_worker=2,
+    )
 
     flush_array(labels_store)
     return labels_store, int(unique_roots.size), label_paths
-
 
 
 def build_slice_endpoint_seeds_from_label_volume(
@@ -5230,7 +5478,7 @@ def assemble_current_view_union_volume(
     combines outputs from more than one model.
     """
     if len(view_volumes_by_model) != 1:
-        raise ValueError('v9.5.3_SLURM supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('v9.5.4_SLURM supports exactly one --model; multiple-model inference has been removed')
 
     model_name = next(iter(view_volumes_by_model.keys()))
     final_union_mm = allocate_workspace_array(
@@ -5301,6 +5549,7 @@ def apply_keep_largest_objects_inplace(
         keep_temp=True,
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
+        workers=int(workers),
     )
 
     if int(num_objects) <= keep_n:
@@ -6312,6 +6561,7 @@ def interpolate_view_volume_pass_inplace(
         prefer_memory=use_in_memory,
         reserve_bytes=reserve_bytes,
         wrap_axis=bool(wrap_axis),
+        workers=int(workers),
     )
 
     if int(num_objects) <= 1:
@@ -6832,7 +7082,7 @@ def gate_tile_volume_against_parent_inplace(
     """Keep only tile components that intersect the frozen parent support on the same slice.
 
     The gating result for one slice never affects another slice, so this stage can be parallelized
-    aggressively across the slice axis without violating the v9.5.3_SLURM semantics.
+    aggressively across the slice axis without violating the v9.5.4_SLURM semantics.
     """
     num_slices = int(tile_mask_mm.shape[0])
     accepted_components = np.zeros((num_slices,), dtype=np.int64)
@@ -7155,7 +7405,7 @@ def apply_gaussian_smoothing_inplace(
 ) -> Dict[str, int | float]:
     """Smooth the final binary 3D volume with a Gaussian kernel and re-threshold at 0.5.
 
-    The v9.5.3_SLURM smoothing stage is applied after the final view/tile union and optional
+    The v9.5.4_SLURM smoothing stage is applied after the final view/tile union and optional
     3D void fill, but before --keep_objects and before resizing back to the source geometry.
     A single float32 workspace is reused for every pass to avoid retaining multiple dense
     floating-point copies of the volume.
@@ -7994,7 +8244,7 @@ def build_troubleshooting_pass_union(
     workers: int,
 ) -> np.ndarray:
     if len(model_names) != 1:
-        raise ValueError('v9.5.3_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
+        raise ValueError('v9.5.4_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     view_volumes_for_pass: Dict[str, Dict[str, np.ndarray]] = {str(model_name): {} for model_name in model_names}
     intermediate_volumes: List[np.ndarray] = []
 
@@ -8103,7 +8353,7 @@ def schedule_troubleshooting_pass_outputs(
     workers: int,
 ) -> Dict[str, Path]:
     if len(model_names) != 1:
-        raise ValueError('v9.5.3_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
+        raise ValueError('v9.5.4_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     if int(total_passes) < 0 or not snapshot_refs:
         return {}
 
@@ -8284,7 +8534,7 @@ def union_view_volume_for_single_model(
     workers: int = 1,
 ) -> np.ndarray:
     if len(view_volumes_by_model) != 1:
-        raise ValueError('v9.5.3_SLURM supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('v9.5.4_SLURM supports exactly one --model; multiple-model inference has been removed')
     model_name = next(iter(view_volumes_by_model.keys()))
     if view_name not in view_volumes_by_model[model_name]:
         raise KeyError(f'No view volume found for {view_name}')
@@ -8579,7 +8829,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('v9.5.3_SLURM accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('v9.5.4_SLURM accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -8791,9 +9041,10 @@ def main() -> None:
     predict_postprocess_workers = max(1, min(32, _env_int('YOLO_TTA_PREDICT_POSTPROCESS_WORKERS', slice_postprocess_workers)))
 
     parent_postprocess_workers = max(1, min(int(interpolation_workers), max(1, len(yolo_models) * max(1, len(inference_views)))))
+    parent_interpolation_task_workers_default = max(1, int(worker_budget) // max(1, int(parent_postprocess_workers)))
     parent_interpolation_task_workers = max(
         1,
-        min(16, _env_int('YOLO_TTA_INTERPOLATION_TASK_WORKERS', max(1, _cpu_count() // max(1, parent_postprocess_workers)))),
+        _env_int('YOLO_TTA_INTERPOLATION_TASK_WORKERS', parent_interpolation_task_workers_default),
     )
 
     tile_postprocess_workers_default = int(worker_budget)
@@ -8803,7 +9054,11 @@ def main() -> None:
         1,
         _env_int('YOLO_TTA_TILE_SLICE_WORKERS', tile_slice_postprocess_workers_default),
     )
-    tile_interpolation_task_workers = max(1, _env_int('YOLO_TTA_TILE_INTERPOLATION_TASK_WORKERS', 1))
+    tile_interpolation_task_workers_default = max(1, _cpu_count())
+    tile_interpolation_task_workers = max(
+        1,
+        _env_int('YOLO_TTA_TILE_INTERPOLATION_TASK_WORKERS', tile_interpolation_task_workers_default),
+    )
 
     print(f'Allocated CPU count: {_cpu_count()}')
     print(f'Worker budget: {worker_budget}')
@@ -8821,6 +9076,14 @@ def main() -> None:
         f'consolidated-tile interpolation workers: {tile_interpolation_task_workers})'
     )
     print(f'Background output workers: {output_workers} (frame workers per labels/TIFF task: {output_frame_workers})')
+    spec_notes.append(
+        f'Fused cleanup backend={cleanup_backend()}; set YOLO_TTA_CLEANUP_BACKEND=scipy to use the previous scipy.ndimage cleanup path.'
+    )
+    spec_notes.append(
+        'Interpolation labeling uses parallel 2D per-slice connected-component labeling, parallel adjacent-slice pair extraction, '
+        'and parallel compact relabeling; tune YOLO_TTA_INTERPOLATION_LABEL_WORKERS, '
+        'YOLO_TTA_INTERPOLATION_PAIR_WORKERS, and YOLO_TTA_INTERPOLATION_COMPACT_WORKERS if needed.'
+    )
 
     output_manager = BackgroundOutputManager(max_workers=output_workers)
 
