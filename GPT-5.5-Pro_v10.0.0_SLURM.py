@@ -2,7 +2,7 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v9.5.4_SLURM single-channel-aligned script:
+This v10.0.0_SLURM single-channel-aligned script:
   - builds Transverse, optional Tilted Transverse, independently optional Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - renders parent/full-frame videos directly from the native view transform so inference no longer waits on
     a separately rendered canvas video, and derives non-radial tile videos from shared canvas batches so the
@@ -28,8 +28,10 @@ This v9.5.4_SLURM single-channel-aligned script:
     and --gaussian_smoothing_passes > 1 enables it with the default sigma when no sigma is provided
   - supports Radial and Tilted Transverse view-native interpolation, and keeps Tilted Transverse frame N centered on native slice N with black-padded out-of-bounds shear samples
   - resizes the working volume to an approximately cubic orthogonal volume when needed, restores the final mask to the original input dimensions for default outputs,
-    and saves the transverse default color overlay plus optional labels, bilevel compressed TIFF binary masks, binary MKVs, NRRD, sagittal, coronal, radial,
+    and saves the transverse default color overlay plus optional labels, bilevel compressed TIFF binary masks, binary MKVs, decomposed multi-layer NRRD, sagittal, coronal, radial,
     tilted-transverse, image-sequence, low-quality, and TTA outputs, with FFV1 used for spec-required MKVs
+  - writes the default NRRD as independently toggleable layers for full-frame YOLO masks, interpolation bridges, tiled masks accepted by parent YOLO masks,
+    tiled masks accepted by parent bridges, consolidated tile bridges, the pre-smoothing global union, smoothing-pass results, and the final output layer
 
 Dependencies (Python):
   pip install opencv-python numpy scipy scikit-image tifffile tqdm ultralytics
@@ -226,7 +228,7 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Save the rotated augmentation videos together with the final labels mapped to each augmentation")
     p.add_argument("--save_binary", nargs="?", const="__DEFAULT__", default=None, type=str,
                    help="Save final binary masks as a TIFF sequence plus an FFV1 MKV. Optional custom TIFF pattern, e.g. binary_masks/{Filename}_Binary_%%04d.tiff")
-    p.add_argument("--save_nrrd", action="store_true", help="Save the final binary mask volume as an NRRD file")
+    p.add_argument("--save_nrrd", action="store_true", help="Save a decomposed multi-layer NRRD plus manifest JSON; troubleshooting pass outputs without layer refs fall back to a single binary NRRD")
     p.add_argument("--save_sagittal", action="store_true",
                    help="Save additional Sagittal outputs. If Sagittal inference is disabled, reslice the final unified volume for saving only")
     p.add_argument("--save_coronal", action="store_true",
@@ -3075,7 +3077,7 @@ def resolve_gaussian_smoothing_settings(
     gaussian_smoothing_arg: Optional[float],
     gaussian_smoothing_passes: int,
 ) -> Tuple[bool, float, int]:
-    """Resolve Gaussian smoothing enablement from the v9.5.4 CLI contract.
+    """Resolve Gaussian smoothing enablement from the v10.0.0 CLI contract.
 
     Contract:
       - no --gaussian_smoothing and the default --gaussian_smoothing_passes 1 => disabled
@@ -3152,7 +3154,7 @@ def cpu_mask_postprocess_pending_limit(worker_count: int, num_frames: int) -> in
     """
     workers = max(1, int(worker_count))
     frames = max(1, int(num_frames))
-    requested = _env_int('YOLO_TTA_CPU_MASK_PENDING_FRAMES', 2560)
+    requested = _env_int('YOLO_TTA_CPU_MASK_PENDING_FRAMES', 256)
     if int(requested) <= 0:
         return max(workers, frames)
     return max(workers, min(frames, max(int(requested), workers * 2)))
@@ -5478,7 +5480,7 @@ def assemble_current_view_union_volume(
     combines outputs from more than one model.
     """
     if len(view_volumes_by_model) != 1:
-        raise ValueError('v9.5.4_SLURM supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('v10.0.0_SLURM supports exactly one --model; multiple-model inference has been removed')
 
     model_name = next(iter(view_volumes_by_model.keys()))
     final_union_mm = allocate_workspace_array(
@@ -6747,6 +6749,9 @@ class PreparedViewResult:
     final_view_volume_mm: Optional[np.ndarray]
     interpolation_stats: List[Dict[str, object]]
     pass_snapshots: Dict[int, VolumeSnapshotRef] = field(default_factory=dict)
+    nrrd_layers: List[NrrdLayerRef] = field(default_factory=list)
+    parent_mask_support_mm: Optional[np.ndarray] = None
+    parent_bridge_support_mm: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -6793,6 +6798,31 @@ class VolumeSnapshotRef:
 
 
 @dataclass(frozen=True)
+class NrrdLayerRef:
+    """One orthogonal-space layer for the decomposed v10.0.0 NRRD export.
+
+    The backing file is always a uint8 binary mask in the pipeline's orthogonal
+    ``(t, Y, X)`` processing geometry.  The NRRD writer converts each layer to
+    the requested output geometry, then writes a 4D NRRD with a leading list axis.
+    """
+
+    key: str
+    name: str
+    path: Path
+    shape: Tuple[int, int, int]
+    dtype: str = 'uint8'
+    model_name: str = ''
+    view_name: str = ''
+    view_family: str = ''
+    source: str = ''  # fullframe, tile, or global
+    mask_kind: str = ''  # yolo, bridge, union, smoothing_result
+    pass_index: int = 0
+    tile_acceptance: str = ''  # parent_mask, parent_bridge, consolidated, or blank
+    stage: str = ''
+    description: str = ''
+
+
+@dataclass(frozen=True)
 class TileGateResult:
     model_name: str
     view_name: str
@@ -6807,6 +6837,7 @@ class TileConsolidationResult:
     view_name: str
     interpolation_stats: List[Dict[str, object]]
     pass_snapshots: Dict[int, VolumeSnapshotRef]
+    nrrd_layers: List[NrrdLayerRef] = field(default_factory=list)
 
 
 def _view_uses_interpolation(view: ViewInfo, interpolate: int) -> bool:
@@ -6900,6 +6931,314 @@ def _volume_has_foreground(mask_mm: np.ndarray) -> bool:
     return False
 
 
+
+def _sanitize_nrrd_layer_token(value: object) -> str:
+    token = re.sub(r'[^A-Za-z0-9_.+-]+', '_', str(value).strip())
+    token = token.strip('_')
+    return token or 'unnamed'
+
+
+def _nrrd_layer_key(
+    *,
+    model_name: str,
+    view_name: str,
+    source: str,
+    mask_kind: str,
+    pass_index: int = 0,
+    tile_acceptance: str = '',
+    stage: str = '',
+) -> str:
+    parts = [
+        _sanitize_nrrd_layer_token(model_name),
+        _sanitize_nrrd_layer_token(view_name),
+        _sanitize_nrrd_layer_token(source),
+        _sanitize_nrrd_layer_token(mask_kind),
+    ]
+    if int(pass_index) > 0:
+        parts.append(f'pass{int(pass_index):02d}')
+    if tile_acceptance:
+        parts.append(_sanitize_nrrd_layer_token(tile_acceptance))
+    if stage:
+        parts.append(_sanitize_nrrd_layer_token(stage))
+    return '__'.join(parts)
+
+
+def _nrrd_layer_name(
+    *,
+    view: Optional[ViewInfo],
+    source: str,
+    mask_kind: str,
+    pass_index: int = 0,
+    tile_acceptance: str = '',
+    stage: str = '',
+) -> str:
+    view_label = pretty_view_name(view) if view is not None else 'Global'
+    pieces = [view_label]
+    if source:
+        pieces.append(str(source))
+    if mask_kind == 'yolo':
+        pieces.append('YOLO mask')
+    elif mask_kind == 'bridge':
+        pieces.append('postprocess bridge')
+    elif mask_kind == 'smoothing_result':
+        pieces.append('smoothing result')
+    elif mask_kind == 'union':
+        pieces.append('union')
+    else:
+        pieces.append(str(mask_kind))
+    if int(pass_index) > 0:
+        pieces.append(f'pass {int(pass_index)}')
+    if tile_acceptance:
+        pieces.append(f'accepted by {str(tile_acceptance).replace("_", " ")}')
+    if stage:
+        pieces.append(str(stage).replace('_', ' '))
+    return ' / '.join(pieces)
+
+
+def subtract_volume_to_mmap(
+    after_mm: np.ndarray,
+    before_mm: np.ndarray,
+    out_path: Path,
+    desc: str,
+    *,
+    workers: int = 1,
+) -> np.ndarray:
+    """Write ``after AND NOT before`` into a disk-backed uint8 volume."""
+    after_arr = np.asarray(after_mm)
+    before_arr = np.asarray(before_mm)
+    if tuple(int(x) for x in after_arr.shape) != tuple(int(x) for x in before_arr.shape):
+        raise ValueError(f'{desc}: shape mismatch {after_arr.shape} vs {before_arr.shape}')
+    out = allocate_workspace_array(
+        shape=tuple(int(x) for x in after_arr.shape),
+        dtype=np.uint8,
+        path=out_path,
+        desc=desc,
+        prefer_memory=False,
+    )
+    total = int(after_arr.shape[0]) if after_arr.ndim > 0 else 0
+
+    def _delta_slice(idx: int) -> None:
+        after_slice = np.asarray(after_arr[int(idx)], dtype=bool)
+        before_slice = np.asarray(before_arr[int(idx)], dtype=bool)
+        out[int(idx), :, :] = (after_slice & (~before_slice)).astype(np.uint8, copy=False)
+
+    parallel_for_indices_chunked(
+        total,
+        _delta_slice,
+        max_workers=choose_slice_parallel_workers(int(workers), total),
+        desc=desc,
+        show_progress=False,
+        target_chunks_per_worker=2,
+    )
+    flush_array(out)
+    return out
+
+
+def project_view_volume_to_orthogonal_volume(
+    view_mask_mm: np.ndarray,
+    view: ViewInfo,
+    out_path: Path,
+    desc: str,
+    *,
+    workers: int = 1,
+) -> np.ndarray:
+    """Project a view-native binary volume into orthogonal processing geometry (t,Y,X)."""
+    t_dim = int(view.full_t) if int(view.full_t) > 0 else int(view_mask_mm.shape[0])
+    h_dim = int(view.full_h) if int(view.full_h) > 0 else int(view.src_h)
+    w_dim = int(view.full_w) if int(view.full_w) > 0 else int(view.src_w)
+
+    if view.family == 'radial':
+        return backproject_radial_volume_to_volume(
+            radial_mask_mm=view_mask_mm,
+            radial_view=view,
+            out_path=out_path,
+            desc=desc,
+            prefer_memory=False,
+            workers=int(workers),
+        )
+
+    if view.family == 'tilted_transverse':
+        return backproject_tilted_volume_to_volume(
+            tilted_mask_mm=view_mask_mm,
+            tilted_view=view,
+            out_path=out_path,
+            desc=desc,
+            prefer_memory=False,
+            workers=int(workers),
+        )
+
+    if view.name == 'transverse':
+        if tuple(int(x) for x in np.asarray(view_mask_mm).shape) != (t_dim, h_dim, w_dim):
+            raise ValueError(f'{desc}: transverse layer shape {tuple(view_mask_mm.shape)} != {(t_dim, h_dim, w_dim)}')
+        return copy_workspace_array(
+            np.asarray(view_mask_mm, dtype=np.uint8),
+            out_path,
+            desc=desc,
+            prefer_memory=False,
+            workers=int(workers),
+        )
+
+    out = allocate_workspace_array(
+        shape=(t_dim, h_dim, w_dim),
+        dtype=np.uint8,
+        path=out_path,
+        desc=desc,
+        prefer_memory=False,
+    )
+
+    if view.name == 'sagittal':
+        src = np.asarray(view_mask_mm)
+        if tuple(int(x) for x in src.shape) != (h_dim, t_dim, w_dim):
+            raise ValueError(f'{desc}: sagittal layer shape {tuple(src.shape)} != {(h_dim, t_dim, w_dim)}')
+        def _copy_y(y_idx: int) -> None:
+            out[:, int(y_idx), :] = np.asarray(src[int(y_idx)], dtype=np.uint8)
+        parallel_for_indices_chunked(
+            h_dim,
+            _copy_y,
+            max_workers=choose_slice_parallel_workers(int(workers), h_dim),
+            desc=desc,
+            show_progress=False,
+            target_chunks_per_worker=2,
+        )
+    elif view.name == 'coronal':
+        src = np.asarray(view_mask_mm)
+        if tuple(int(x) for x in src.shape) != (w_dim, t_dim, h_dim):
+            raise ValueError(f'{desc}: coronal layer shape {tuple(src.shape)} != {(w_dim, t_dim, h_dim)}')
+        def _copy_x(x_idx: int) -> None:
+            out[:, :, int(x_idx)] = np.asarray(src[int(x_idx)], dtype=np.uint8)
+        parallel_for_indices_chunked(
+            w_dim,
+            _copy_x,
+            max_workers=choose_slice_parallel_workers(int(workers), w_dim),
+            desc=desc,
+            show_progress=False,
+            target_chunks_per_worker=2,
+        )
+    else:  # pragma: no cover
+        raise ValueError(f'Unsupported view for orthogonal NRRD projection: {view.name}/{view.family}')
+
+    flush_array(out)
+    return out
+
+
+def materialize_nrrd_view_layer(
+    view_volume_mm: np.ndarray,
+    *,
+    model_name: str,
+    view: ViewInfo,
+    source: str,
+    mask_kind: str,
+    pass_index: int = 0,
+    tile_acceptance: str = '',
+    stage: str = '',
+    description: str = '',
+    temp_dir: Path,
+    workers: int = 1,
+) -> Optional[NrrdLayerRef]:
+    """Persist a view-derived layer in orthogonal processing geometry for the NRRD writer."""
+    if not _volume_has_foreground(view_volume_mm):
+        return None
+
+    key = _nrrd_layer_key(
+        model_name=str(model_name),
+        view_name=str(view.name),
+        source=str(source),
+        mask_kind=str(mask_kind),
+        pass_index=int(pass_index),
+        tile_acceptance=str(tile_acceptance),
+        stage=str(stage),
+    )
+    out_path = temp_dir / 'nrrd_layers' / str(model_name) / str(view.name) / f'{key}.orthogonal.u8.dat'
+    projected = project_view_volume_to_orthogonal_volume(
+        view_volume_mm,
+        view,
+        out_path,
+        desc=f'NRRD layer {key}',
+        workers=int(workers),
+    )
+    shape = tuple(int(x) for x in np.asarray(projected).shape)
+    close_memmap_array(projected)
+    return NrrdLayerRef(
+        key=key,
+        name=_nrrd_layer_name(
+            view=view,
+            source=str(source),
+            mask_kind=str(mask_kind),
+            pass_index=int(pass_index),
+            tile_acceptance=str(tile_acceptance),
+            stage=str(stage),
+        ),
+        path=out_path,
+        shape=(int(shape[0]), int(shape[1]), int(shape[2])),
+        dtype='uint8',
+        model_name=str(model_name),
+        view_name=str(view.name),
+        view_family=str(view.family),
+        source=str(source),
+        mask_kind=str(mask_kind),
+        pass_index=int(pass_index),
+        tile_acceptance=str(tile_acceptance),
+        stage=str(stage),
+        description=str(description),
+    )
+
+
+def materialize_nrrd_global_layer(
+    volume_mm: np.ndarray,
+    *,
+    model_name: str,
+    source: str,
+    mask_kind: str,
+    pass_index: int = 0,
+    stage: str = '',
+    description: str = '',
+    temp_dir: Path,
+    workers: int = 1,
+) -> Optional[NrrdLayerRef]:
+    if not _volume_has_foreground(volume_mm):
+        return None
+    view_name = 'global'
+    key = _nrrd_layer_key(
+        model_name=str(model_name),
+        view_name=view_name,
+        source=str(source),
+        mask_kind=str(mask_kind),
+        pass_index=int(pass_index),
+        stage=str(stage),
+    )
+    out_path = temp_dir / 'nrrd_layers' / str(model_name) / view_name / f'{key}.orthogonal.u8.dat'
+    copied = copy_workspace_array(
+        np.asarray(volume_mm, dtype=np.uint8),
+        out_path,
+        desc=f'NRRD layer {key}',
+        prefer_memory=False,
+        workers=int(workers),
+    )
+    shape = tuple(int(x) for x in np.asarray(copied).shape)
+    close_memmap_array(copied)
+    return NrrdLayerRef(
+        key=key,
+        name=_nrrd_layer_name(
+            view=None,
+            source=str(source),
+            mask_kind=str(mask_kind),
+            pass_index=int(pass_index),
+            stage=str(stage),
+        ),
+        path=out_path,
+        shape=(int(shape[0]), int(shape[1]), int(shape[2])),
+        dtype='uint8',
+        model_name=str(model_name),
+        view_name=view_name,
+        view_family='global',
+        source=str(source),
+        mask_kind=str(mask_kind),
+        pass_index=int(pass_index),
+        stage=str(stage),
+        description=str(description),
+    )
+
+
 def prepare_view_volume_after_fullframe(
     *,
     model_name: str,
@@ -6921,8 +7260,14 @@ def prepare_view_volume_after_fullframe(
     keep_temp: bool,
     slice_workers: int,
     interpolation_task_workers: int,
+    nrrd_layers_enabled: bool = False,
 ) -> PreparedViewResult:
     baseline_native_volume = union_mm
+    nrrd_layers: List[NrrdLayerRef] = []
+    parent_mask_support_mm: Optional[np.ndarray] = None
+    parent_bridge_support_mm: Optional[np.ndarray] = None
+    parent_mask_support_path: Optional[Path] = None
+    parent_bridge_support_path: Optional[Path] = None
 
     cleanup_view_volume_after_prediction_inplace(
         baseline_native_volume,
@@ -6939,6 +7284,30 @@ def prepare_view_volume_after_fullframe(
             confmap_path.unlink(missing_ok=True)
         except Exception:
             pass
+
+    if bool(nrrd_layers_enabled):
+        parent_mask_support_path = temp_dir / 'nrrd_support' / str(model_name) / view.name / 'fullframe_yolo_support.u8.dat'
+        parent_mask_support_mm = copy_workspace_array(
+            baseline_native_volume,
+            parent_mask_support_path,
+            desc=f'NRRD support fullframe YOLO {model_name}/{view.name}',
+            prefer_memory=False,
+            workers=int(slice_workers),
+        )
+        layer_ref = materialize_nrrd_view_layer(
+            parent_mask_support_mm,
+            model_name=str(model_name),
+            view=view,
+            source='fullframe',
+            mask_kind='yolo',
+            pass_index=0,
+            stage='pre_interpolation',
+            description='Cleaned full-frame YOLO mask before interpolation bridges.',
+            temp_dir=temp_dir,
+            workers=int(slice_workers),
+        )
+        if layer_ref is not None:
+            nrrd_layers.append(layer_ref)
 
     pass_snapshots: Dict[int, VolumeSnapshotRef] = {}
     snap0 = _snapshot_volume_for_troubleshooting(
@@ -6958,6 +7327,18 @@ def prepare_view_volume_after_fullframe(
     if _view_uses_interpolation(view, int(interpolate)):
         total_passes = int(interpolate_passes)
         for pass_idx in range(1, total_passes + 1):
+            before_pass_mm: Optional[np.ndarray] = None
+            before_pass_path: Optional[Path] = None
+            if bool(nrrd_layers_enabled):
+                before_pass_path = temp_dir / 'nrrd_work' / str(model_name) / view.name / f'fullframe_before_pass{int(pass_idx):02d}.u8.dat'
+                before_pass_mm = copy_workspace_array(
+                    baseline_native_volume,
+                    before_pass_path,
+                    desc=f'NRRD fullframe before interpolation pass {int(pass_idx)} {model_name}/{view.name}',
+                    prefer_memory=False,
+                    workers=int(slice_workers),
+                )
+
             stats_local = interpolate_view_volume_pass_inplace(
                 mask_mm=baseline_native_volume,
                 work_dir=temp_dir / 'interpolation' / model_name / view.name,
@@ -6984,6 +7365,42 @@ def prepare_view_volume_after_fullframe(
                 'interpolation_search_angle': float(interpolation_search_angle),
             })
             interpolation_stats.append(stats_local)
+
+            if bool(nrrd_layers_enabled) and before_pass_mm is not None:
+                delta_path = temp_dir / 'nrrd_work' / str(model_name) / view.name / f'fullframe_bridge_pass{int(pass_idx):02d}.u8.dat'
+                bridge_delta_mm = subtract_volume_to_mmap(
+                    baseline_native_volume,
+                    before_pass_mm,
+                    delta_path,
+                    desc=f'NRRD fullframe bridge delta pass {int(pass_idx)} {model_name}/{view.name}',
+                    workers=int(slice_workers),
+                )
+                layer_ref = materialize_nrrd_view_layer(
+                    bridge_delta_mm,
+                    model_name=str(model_name),
+                    view=view,
+                    source='fullframe',
+                    mask_kind='bridge',
+                    pass_index=int(pass_idx),
+                    stage='interpolation',
+                    description='Voxels added by this full-frame interpolation pass only.',
+                    temp_dir=temp_dir,
+                    workers=int(slice_workers),
+                )
+                if layer_ref is not None:
+                    nrrd_layers.append(layer_ref)
+                close_memmap_array(bridge_delta_mm)
+                if not bool(keep_temp):
+                    try:
+                        delta_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                close_memmap_array(before_pass_mm)
+                if before_pass_path is not None and not bool(keep_temp):
+                    try:
+                        before_pass_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
             snap = _snapshot_volume_for_troubleshooting(
                 baseline_native_volume,
@@ -7016,6 +7433,24 @@ def prepare_view_volume_after_fullframe(
             if not keep_temp:
                 try:
                     union_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    if bool(nrrd_layers_enabled) and parent_mask_support_mm is not None:
+        parent_bridge_support_path = temp_dir / 'nrrd_support' / str(model_name) / view.name / 'fullframe_bridge_support.u8.dat'
+        parent_bridge_support_mm = subtract_volume_to_mmap(
+            baseline_native_volume,
+            parent_mask_support_mm,
+            parent_bridge_support_path,
+            desc=f'NRRD support fullframe bridges {model_name}/{view.name}',
+            workers=int(slice_workers),
+        )
+        if not _volume_has_foreground(parent_bridge_support_mm):
+            close_memmap_array(parent_bridge_support_mm)
+            parent_bridge_support_mm = None
+            if parent_bridge_support_path is not None and not bool(keep_temp):
+                try:
+                    parent_bridge_support_path.unlink(missing_ok=True)
                 except Exception:
                     pass
 
@@ -7062,6 +7497,23 @@ def prepare_view_volume_after_fullframe(
     else:
         final_view_volume = baseline_native_volume
 
+    returned_parent_mask_support = parent_mask_support_mm if (bool(nrrd_layers_enabled) and bool(dense_tiling_active)) else None
+    returned_parent_bridge_support = parent_bridge_support_mm if (bool(nrrd_layers_enabled) and bool(dense_tiling_active)) else None
+    if parent_mask_support_mm is not None and returned_parent_mask_support is None:
+        close_memmap_array(parent_mask_support_mm)
+        if parent_mask_support_path is not None and not bool(keep_temp):
+            try:
+                parent_mask_support_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+    if parent_bridge_support_mm is not None and returned_parent_bridge_support is None:
+        close_memmap_array(parent_bridge_support_mm)
+        if parent_bridge_support_path is not None and not bool(keep_temp):
+            try:
+                parent_bridge_support_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
     return PreparedViewResult(
         model_name=str(model_name),
         view_name=str(view.name),
@@ -7069,25 +7521,37 @@ def prepare_view_volume_after_fullframe(
         final_view_volume_mm=final_view_volume,
         interpolation_stats=interpolation_stats,
         pass_snapshots=pass_snapshots,
+        nrrd_layers=nrrd_layers,
+        parent_mask_support_mm=returned_parent_mask_support,
+        parent_bridge_support_mm=returned_parent_bridge_support,
     )
-
 
 def gate_tile_volume_against_parent_inplace(
     tile_mask_mm: np.ndarray,
     parent_support_mm: np.ndarray,
     *,
+    parent_mask_support_mm: Optional[np.ndarray] = None,
+    parent_bridge_support_mm: Optional[np.ndarray] = None,
+    accepted_by_parent_mask_mm: Optional[np.ndarray] = None,
+    accepted_by_parent_bridge_mm: Optional[np.ndarray] = None,
     workers: int = 1,
     desc: str = 'Tile gated OR',
 ) -> Dict[str, int]:
-    """Keep only tile components that intersect the frozen parent support on the same slice.
+    """Keep tile components that intersect the frozen parent support on the same slice.
 
-    The gating result for one slice never affects another slice, so this stage can be parallelized
-    aggressively across the slice axis without violating the v9.5.4_SLURM semantics.
+    When parent YOLO-mask and parent-bridge supports are supplied, accepted components are
+    also split into two mutually exclusive categories for the decomposed NRRD export.  If a
+    component intersects both parent supports, it is assigned to ``parent_mask`` first so the
+    category layers can be toggled without double-counting the same tile component.
     """
     num_slices = int(tile_mask_mm.shape[0])
     accepted_components = np.zeros((num_slices,), dtype=np.int64)
     rejected_components = np.zeros((num_slices,), dtype=np.int64)
+    accepted_by_parent_mask_components = np.zeros((num_slices,), dtype=np.int64)
+    accepted_by_parent_bridge_components = np.zeros((num_slices,), dtype=np.int64)
     kept_voxels = np.zeros((num_slices,), dtype=np.int64)
+    accepted_by_parent_mask_voxels = np.zeros((num_slices,), dtype=np.int64)
+    accepted_by_parent_bridge_voxels = np.zeros((num_slices,), dtype=np.int64)
     worker_count = choose_slice_parallel_workers(int(workers), num_slices)
     chunk_size = choose_parallel_chunk_size(num_slices, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
 
@@ -7095,14 +7559,96 @@ def gate_tile_volume_against_parent_inplace(
         tile_slice = np.asarray(tile_mask_mm[int(idx)], dtype=bool)
         if not np.any(tile_slice):
             tile_mask_mm[int(idx), :, :] = np.uint8(0)
+            if accepted_by_parent_mask_mm is not None:
+                accepted_by_parent_mask_mm[int(idx), :, :] = np.uint8(0)
+            if accepted_by_parent_bridge_mm is not None:
+                accepted_by_parent_bridge_mm[int(idx), :, :] = np.uint8(0)
             return
 
         support_slice = np.asarray(parent_support_mm[int(idx)], dtype=bool)
-        keep, accepted, rejected = _build_supported_component_mask(tile_slice, support_slice)
+        parent_mask_slice = (
+            np.asarray(parent_mask_support_mm[int(idx)], dtype=bool)
+            if parent_mask_support_mm is not None else None
+        )
+        parent_bridge_slice = (
+            np.asarray(parent_bridge_support_mm[int(idx)], dtype=bool)
+            if parent_bridge_support_mm is not None else None
+        )
+
+        num_labels, labels2d = cv2.connectedComponents(
+            np.asarray(tile_slice, dtype=np.uint8),
+            connectivity=8,
+            ltype=cv2.CV_32S,
+        )
+        if int(num_labels) <= 1:
+            tile_mask_mm[int(idx), :, :] = np.uint8(0)
+            if accepted_by_parent_mask_mm is not None:
+                accepted_by_parent_mask_mm[int(idx), :, :] = np.uint8(0)
+            if accepted_by_parent_bridge_mm is not None:
+                accepted_by_parent_bridge_mm[int(idx), :, :] = np.uint8(0)
+            return
+
+        keep = np.zeros(tile_slice.shape, dtype=bool)
+        mask_category = np.zeros(tile_slice.shape, dtype=bool) if accepted_by_parent_mask_mm is not None else None
+        bridge_category = np.zeros(tile_slice.shape, dtype=bool) if accepted_by_parent_bridge_mm is not None else None
+
+        accepted = 0
+        rejected = 0
+        accepted_mask = 0
+        accepted_bridge = 0
+        kept_count = 0
+        mask_count = 0
+        bridge_count = 0
+
+        for comp_lbl in range(1, int(num_labels)):
+            comp = labels2d == int(comp_lbl)
+            if not np.any(comp):
+                continue
+
+            supported_by_mask = bool(parent_mask_slice is not None and np.any(comp & parent_mask_slice))
+            supported_by_bridge = bool(parent_bridge_slice is not None and np.any(comp & parent_bridge_slice))
+            supported_by_union = bool(np.any(comp & support_slice))
+            if not supported_by_union:
+                rejected += 1
+                continue
+
+            keep[comp] = True
+            accepted += 1
+            comp_voxels = int(np.count_nonzero(comp))
+            kept_count += comp_voxels
+
+            # Mutually exclusive category assignment. Parent mask wins if both supports intersect.
+            if supported_by_mask or (parent_mask_slice is None and not supported_by_bridge):
+                accepted_mask += 1
+                mask_count += comp_voxels
+                if mask_category is not None:
+                    mask_category[comp] = True
+            elif supported_by_bridge:
+                accepted_bridge += 1
+                bridge_count += comp_voxels
+                if bridge_category is not None:
+                    bridge_category[comp] = True
+            else:
+                # Fallback for pathological cases where the supplied category supports do not
+                # exactly union to parent_support_mm.
+                accepted_mask += 1
+                mask_count += comp_voxels
+                if mask_category is not None:
+                    mask_category[comp] = True
+
         tile_mask_mm[int(idx), :, :] = keep.astype(np.uint8, copy=False)
-        accepted_components[int(idx)] = np.int64(int(accepted))
-        rejected_components[int(idx)] = np.int64(int(rejected))
-        kept_voxels[int(idx)] = np.int64(np.count_nonzero(keep))
+        if accepted_by_parent_mask_mm is not None:
+            accepted_by_parent_mask_mm[int(idx), :, :] = mask_category.astype(np.uint8, copy=False) if mask_category is not None else np.uint8(0)
+        if accepted_by_parent_bridge_mm is not None:
+            accepted_by_parent_bridge_mm[int(idx), :, :] = bridge_category.astype(np.uint8, copy=False) if bridge_category is not None else np.uint8(0)
+
+        accepted_components[int(idx)] = np.int64(accepted)
+        rejected_components[int(idx)] = np.int64(rejected)
+        accepted_by_parent_mask_components[int(idx)] = np.int64(accepted_mask)
+        accepted_by_parent_bridge_components[int(idx)] = np.int64(accepted_bridge)
+        kept_voxels[int(idx)] = np.int64(kept_count)
+        accepted_by_parent_mask_voxels[int(idx)] = np.int64(mask_count)
+        accepted_by_parent_bridge_voxels[int(idx)] = np.int64(bridge_count)
 
     parallel_for_indices_chunked(
         num_slices,
@@ -7113,13 +7659,20 @@ def gate_tile_volume_against_parent_inplace(
         chunk_size=chunk_size,
     )
     flush_array(tile_mask_mm)
+    if accepted_by_parent_mask_mm is not None:
+        flush_array(accepted_by_parent_mask_mm)
+    if accepted_by_parent_bridge_mm is not None:
+        flush_array(accepted_by_parent_bridge_mm)
 
     return {
         'accepted_components': int(np.sum(accepted_components, dtype=np.int64)),
         'rejected_components': int(np.sum(rejected_components, dtype=np.int64)),
+        'accepted_by_parent_mask_components': int(np.sum(accepted_by_parent_mask_components, dtype=np.int64)),
+        'accepted_by_parent_bridge_components': int(np.sum(accepted_by_parent_bridge_components, dtype=np.int64)),
         'kept_voxels': int(np.sum(kept_voxels, dtype=np.int64)),
+        'accepted_by_parent_mask_voxels': int(np.sum(accepted_by_parent_mask_voxels, dtype=np.int64)),
+        'accepted_by_parent_bridge_voxels': int(np.sum(accepted_by_parent_bridge_voxels, dtype=np.int64)),
     }
-
 
 def postprocess_tile_volume_after_inference(
     task: TilePostprocessTask,
@@ -7238,45 +7791,105 @@ def gate_tile_volume_into_consolidated_parent(
     tile_accumulator_lock: threading.Lock,
     keep_temp: bool,
     slice_workers: int,
+    parent_mask_support_mm: Optional[np.ndarray] = None,
+    parent_bridge_support_mm: Optional[np.ndarray] = None,
+    tile_parent_mask_accumulator_mm: Optional[np.ndarray] = None,
+    tile_parent_bridge_accumulator_mm: Optional[np.ndarray] = None,
+    temp_dir: Optional[Path] = None,
 ) -> TileGateResult:
-    """Gate one tile volume, then OR accepted components into the parent-view tile accumulator.
+    """Gate one tile volume, then OR accepted components into parent-view accumulators.
 
-    v9.5.0 intentionally consolidates all accepted tiles for a parent view before interpolation.
-    This replaces the previous per-tile interpolation path while preserving the mask-wise OR gate:
-    accepted tile components still must intersect the frozen parent full-frame support, and accepted
-    tiles cannot accept other tiles because the support image is not the accumulator.
+    The main accumulator preserves the v10.0.0 mask-wise OR gate semantics.  Optional category
+    accumulators are populated only for decomposed NRRD export and split accepted tile components
+    into parent-YOLO-supported and parent-bridge-supported layers.
     """
-    gate_stats = gate_tile_volume_against_parent_inplace(
-        task.tile_mask_mm,
-        parent_support_mm,
-        workers=int(slice_workers),
-        desc=f'Gated OR ({task.model_name}/{task.view_name}/{task.tile_id})',
-    )
+    category_enabled = bool(tile_parent_mask_accumulator_mm is not None or tile_parent_bridge_accumulator_mm is not None)
+    local_parent_mask_mm: Optional[np.ndarray] = None
+    local_parent_bridge_mm: Optional[np.ndarray] = None
+    local_parent_mask_path: Optional[Path] = None
+    local_parent_bridge_path: Optional[Path] = None
 
-    if int(gate_stats.get('accepted_components', 0)) > 0 and int(gate_stats.get('kept_voxels', 0)) > 0:
-        with tile_accumulator_lock:
-            union_volume_into_volume(
-                tile_accumulator_mm,
-                task.tile_mask_mm,
-                workers=int(slice_workers),
-                desc=f'Consolidate accepted tile {task.model_name}/{task.view_name}/{task.tile_id}',
-            )
+    try:
+        if bool(category_enabled):
+            if temp_dir is None:
+                raise ValueError('temp_dir is required for NRRD tile category gating')
+            category_dir = temp_dir / 'nrrd_work' / 'tile_gate_categories' / task.model_name / task.view_name / task.tile_id
+            if tile_parent_mask_accumulator_mm is not None:
+                local_parent_mask_path = category_dir / 'accepted_by_parent_mask.u8.dat'
+                local_parent_mask_mm = allocate_workspace_array(
+                    shape=tuple(int(x) for x in np.asarray(task.tile_mask_mm).shape),
+                    dtype=np.uint8,
+                    path=local_parent_mask_path,
+                    desc=f'NRRD tile category parent-mask {task.model_name}/{task.view_name}/{task.tile_id}',
+                    prefer_memory=False,
+                )
+            if tile_parent_bridge_accumulator_mm is not None:
+                local_parent_bridge_path = category_dir / 'accepted_by_parent_bridge.u8.dat'
+                local_parent_bridge_mm = allocate_workspace_array(
+                    shape=tuple(int(x) for x in np.asarray(task.tile_mask_mm).shape),
+                    dtype=np.uint8,
+                    path=local_parent_bridge_path,
+                    desc=f'NRRD tile category parent-bridge {task.model_name}/{task.view_name}/{task.tile_id}',
+                    prefer_memory=False,
+                )
 
-    close_memmap_array(task.tile_mask_mm)
-    if not keep_temp:
-        try:
-            task.tile_mask_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        gate_stats = gate_tile_volume_against_parent_inplace(
+            task.tile_mask_mm,
+            parent_support_mm,
+            parent_mask_support_mm=parent_mask_support_mm,
+            parent_bridge_support_mm=parent_bridge_support_mm,
+            accepted_by_parent_mask_mm=local_parent_mask_mm,
+            accepted_by_parent_bridge_mm=local_parent_bridge_mm,
+            workers=int(slice_workers),
+            desc=f'Gated OR ({task.model_name}/{task.view_name}/{task.tile_id})',
+        )
 
-    return TileGateResult(
-        model_name=str(task.model_name),
-        view_name=str(task.view_name),
-        config_id=str(task.config_id),
-        tile_id=str(task.tile_id),
-        gate_stats={k: int(v) for k, v in gate_stats.items()},
-    )
+        if int(gate_stats.get('accepted_components', 0)) > 0 and int(gate_stats.get('kept_voxels', 0)) > 0:
+            with tile_accumulator_lock:
+                union_volume_into_volume(
+                    tile_accumulator_mm,
+                    task.tile_mask_mm,
+                    workers=int(slice_workers),
+                    desc=f'Consolidate accepted tile {task.model_name}/{task.view_name}/{task.tile_id}',
+                )
+                if local_parent_mask_mm is not None and tile_parent_mask_accumulator_mm is not None:
+                    union_volume_into_volume(
+                        tile_parent_mask_accumulator_mm,
+                        local_parent_mask_mm,
+                        workers=int(slice_workers),
+                        desc=f'Consolidate parent-mask-accepted tile {task.model_name}/{task.view_name}/{task.tile_id}',
+                    )
+                if local_parent_bridge_mm is not None and tile_parent_bridge_accumulator_mm is not None:
+                    union_volume_into_volume(
+                        tile_parent_bridge_accumulator_mm,
+                        local_parent_bridge_mm,
+                        workers=int(slice_workers),
+                        desc=f'Consolidate parent-bridge-accepted tile {task.model_name}/{task.view_name}/{task.tile_id}',
+                    )
 
+        return TileGateResult(
+            model_name=str(task.model_name),
+            view_name=str(task.view_name),
+            config_id=str(task.config_id),
+            tile_id=str(task.tile_id),
+            gate_stats={k: int(v) for k, v in gate_stats.items()},
+        )
+    finally:
+        close_memmap_array(local_parent_mask_mm)
+        close_memmap_array(local_parent_bridge_mm)
+        if not keep_temp:
+            for path in (local_parent_mask_path, local_parent_bridge_path):
+                if path is not None:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+        close_memmap_array(task.tile_mask_mm)
+        if not keep_temp:
+            try:
+                task.tile_mask_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 def finalize_consolidated_tile_volume_for_parent(
     *,
@@ -7295,14 +7908,21 @@ def finalize_consolidated_tile_volume_for_parent(
     keep_temp: bool,
     slice_workers: int,
     interpolation_task_workers: int,
+    nrrd_layers_enabled: bool = False,
+    tile_parent_mask_accumulator_mm: Optional[np.ndarray] = None,
+    tile_parent_bridge_accumulator_mm: Optional[np.ndarray] = None,
 ) -> TileConsolidationResult:
     """Interpolate the consolidated gated-tile volume once for the parent view, then union it.
 
     The input accumulator already contains the OR of every accepted tile mask for this parent view.
-    Interpolation is now performed once on that consolidated volume instead of once per tile.
+    Interpolation is now performed once on that consolidated volume instead of once per tile.  When
+    NRRD decomposition is enabled, the accepted YOLO tile support is written separately for tiles
+    accepted by parent YOLO masks and by parent interpolation bridges; tile interpolation bridges are
+    then exported per pass as consolidated tile-bridge layers.
     """
     interpolation_stats: List[Dict[str, object]] = []
     pass_snapshots: Dict[int, VolumeSnapshotRef] = {}
+    nrrd_layers: List[NrrdLayerRef] = []
 
     if not _volume_has_foreground(tile_accumulator_mm):
         return TileConsolidationResult(
@@ -7310,7 +7930,61 @@ def finalize_consolidated_tile_volume_for_parent(
             view_name=str(view.name),
             interpolation_stats=interpolation_stats,
             pass_snapshots=pass_snapshots,
+            nrrd_layers=nrrd_layers,
         )
+
+    if bool(nrrd_layers_enabled):
+        emitted_category = False
+        if tile_parent_mask_accumulator_mm is not None:
+            layer_ref = materialize_nrrd_view_layer(
+                tile_parent_mask_accumulator_mm,
+                model_name=str(model_name),
+                view=view,
+                source='tile',
+                mask_kind='yolo',
+                pass_index=0,
+                tile_acceptance='parent_mask',
+                stage='pre_tile_interpolation',
+                description='Accepted tile YOLO masks whose components intersected parent full-frame YOLO support. Parent-mask support has priority when a component intersects both parent mask and parent bridge.',
+                temp_dir=temp_dir,
+                workers=int(slice_workers),
+            )
+            if layer_ref is not None:
+                nrrd_layers.append(layer_ref)
+                emitted_category = True
+        if tile_parent_bridge_accumulator_mm is not None:
+            layer_ref = materialize_nrrd_view_layer(
+                tile_parent_bridge_accumulator_mm,
+                model_name=str(model_name),
+                view=view,
+                source='tile',
+                mask_kind='yolo',
+                pass_index=0,
+                tile_acceptance='parent_bridge',
+                stage='pre_tile_interpolation',
+                description='Accepted tile YOLO masks whose components did not intersect parent YOLO support but did intersect a parent interpolation bridge.',
+                temp_dir=temp_dir,
+                workers=int(slice_workers),
+            )
+            if layer_ref is not None:
+                nrrd_layers.append(layer_ref)
+                emitted_category = True
+        if not emitted_category:
+            layer_ref = materialize_nrrd_view_layer(
+                tile_accumulator_mm,
+                model_name=str(model_name),
+                view=view,
+                source='tile',
+                mask_kind='yolo',
+                pass_index=0,
+                tile_acceptance='parent_support',
+                stage='pre_tile_interpolation',
+                description='Accepted tile YOLO masks before tile interpolation. Parent mask/bridge category supports were unavailable, so the category is the total parent support.',
+                temp_dir=temp_dir,
+                workers=int(slice_workers),
+            )
+            if layer_ref is not None:
+                nrrd_layers.append(layer_ref)
 
     snap0 = _snapshot_volume_for_troubleshooting(
         tile_accumulator_mm,
@@ -7328,6 +8002,18 @@ def finalize_consolidated_tile_volume_for_parent(
     if _view_uses_interpolation(view, int(interpolate)):
         total_passes = int(interpolate_passes)
         for pass_idx in range(1, total_passes + 1):
+            before_pass_mm: Optional[np.ndarray] = None
+            before_pass_path: Optional[Path] = None
+            if bool(nrrd_layers_enabled):
+                before_pass_path = temp_dir / 'nrrd_work' / str(model_name) / view.name / f'tile_before_pass{int(pass_idx):02d}.u8.dat'
+                before_pass_mm = copy_workspace_array(
+                    tile_accumulator_mm,
+                    before_pass_path,
+                    desc=f'NRRD tile before interpolation pass {int(pass_idx)} {model_name}/{view.name}',
+                    prefer_memory=False,
+                    workers=int(slice_workers),
+                )
+
             stats_local = interpolate_view_volume_pass_inplace(
                 mask_mm=tile_accumulator_mm,
                 work_dir=temp_dir / 'tile_interpolation' / str(model_name) / view.name / 'consolidated',
@@ -7354,6 +8040,43 @@ def finalize_consolidated_tile_volume_for_parent(
                 'interpolation_search_angle': float(interpolation_search_angle),
             })
             interpolation_stats.append(stats_local)
+
+            if bool(nrrd_layers_enabled) and before_pass_mm is not None:
+                delta_path = temp_dir / 'nrrd_work' / str(model_name) / view.name / f'tile_bridge_pass{int(pass_idx):02d}.u8.dat'
+                bridge_delta_mm = subtract_volume_to_mmap(
+                    tile_accumulator_mm,
+                    before_pass_mm,
+                    delta_path,
+                    desc=f'NRRD tile bridge delta pass {int(pass_idx)} {model_name}/{view.name}',
+                    workers=int(slice_workers),
+                )
+                layer_ref = materialize_nrrd_view_layer(
+                    bridge_delta_mm,
+                    model_name=str(model_name),
+                    view=view,
+                    source='tile',
+                    mask_kind='bridge',
+                    pass_index=int(pass_idx),
+                    tile_acceptance='consolidated',
+                    stage='tile_interpolation',
+                    description='Voxels added by this consolidated tile interpolation pass. Bridges are generated after accepted tile masks are consolidated, so they are not attributed back to parent-mask vs parent-bridge acceptance categories.',
+                    temp_dir=temp_dir,
+                    workers=int(slice_workers),
+                )
+                if layer_ref is not None:
+                    nrrd_layers.append(layer_ref)
+                close_memmap_array(bridge_delta_mm)
+                if not bool(keep_temp):
+                    try:
+                        delta_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                close_memmap_array(before_pass_mm)
+                if before_pass_path is not None and not bool(keep_temp):
+                    try:
+                        before_pass_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
             snap = _snapshot_volume_for_troubleshooting(
                 tile_accumulator_mm,
@@ -7384,6 +8107,7 @@ def finalize_consolidated_tile_volume_for_parent(
         view_name=str(view.name),
         interpolation_stats=interpolation_stats,
         pass_snapshots=pass_snapshots,
+        nrrd_layers=nrrd_layers,
     )
 
 
@@ -7402,10 +8126,12 @@ def apply_gaussian_smoothing_inplace(
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
+    nrrd_layers: Optional[List[NrrdLayerRef]] = None,
+    nrrd_model_name: str = 'global',
 ) -> Dict[str, int | float]:
     """Smooth the final binary 3D volume with a Gaussian kernel and re-threshold at 0.5.
 
-    The v9.5.4_SLURM smoothing stage is applied after the final view/tile union and optional
+    The v10.0.0_SLURM smoothing stage is applied after the final view/tile union and optional
     3D void fill, but before --keep_objects and before resizing back to the source geometry.
     A single float32 workspace is reused for every pass to avoid retaining multiple dense
     floating-point copies of the volume.
@@ -7484,6 +8210,21 @@ def apply_gaussian_smoothing_inplace(
                 target_chunks_per_worker=2,
             )
             flush_array(mask_mm)
+
+            if nrrd_layers is not None:
+                layer_ref = materialize_nrrd_global_layer(
+                    mask_mm,
+                    model_name=str(nrrd_model_name),
+                    source='global',
+                    mask_kind='smoothing_result',
+                    pass_index=int(pass_idx),
+                    stage='gaussian_smoothing',
+                    description='Full-volume result after this Gaussian smoothing pass.',
+                    temp_dir=temp_dir,
+                    workers=int(workers),
+                )
+                if layer_ref is not None:
+                    nrrd_layers.append(layer_ref)
 
             added = int(np.sum(added_by_slice, dtype=np.int64))
             removed = int(np.sum(removed_by_slice, dtype=np.int64))
@@ -7778,6 +8519,266 @@ def write_nrrd(mask_u8: np.ndarray, out_path: Path) -> Path:
     return out_path
 
 
+
+def _open_nrrd_layer_ref(ref: NrrdLayerRef) -> np.memmap:
+    return np.memmap(
+        ref.path,
+        dtype=np.dtype(ref.dtype),
+        mode='r',
+        shape=tuple(int(x) for x in ref.shape),
+    )
+
+
+def nrrd_decomposed_header(
+    *,
+    output_shape_zyx: Tuple[int, int, int],
+    layer_refs: Sequence[NrrdLayerRef],
+) -> Dict[str, object]:
+    t_dim, h, w = (int(output_shape_zyx[0]), int(output_shape_zyx[1]), int(output_shape_zyx[2]))
+    header: Dict[str, object] = {
+        'space': NRRD_SPACE,
+        'kinds': ['list', 'domain', 'domain', 'domain'],
+        # The leading list axis is non-spatial. pynrrd writes None as "none" for NRRD space directions.
+        'space directions': [None, np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0]), np.array([0.0, 0.0, 1.0])],
+        'space origin': np.zeros((3,), dtype=np.float64),
+        'content': (
+            'decomposed binary segmentation layers; '
+            f'source_shape_tyx=({t_dim},{h},{w}); exported_axes=(layer,X,Y,t); '
+            'layer metadata stored in SegmentN_* fields and sidecar manifest JSON'
+        ),
+        'encoding': 'gzip',
+    }
+    for idx, ref in enumerate(layer_refs):
+        tag_parts = [
+            f'model:{ref.model_name}',
+            f'view:{ref.view_name}',
+            f'view_family:{ref.view_family}',
+            f'source:{ref.source}',
+            f'mask_kind:{ref.mask_kind}',
+            f'pass:{int(ref.pass_index)}',
+        ]
+        if ref.tile_acceptance:
+            tag_parts.append(f'tile_acceptance:{ref.tile_acceptance}')
+        if ref.stage:
+            tag_parts.append(f'stage:{ref.stage}')
+        header[f'Segment{idx}_ID'] = ref.key
+        header[f'Segment{idx}_Name'] = ref.name
+        header[f'Segment{idx}_Layer'] = str(idx)
+        header[f'Segment{idx}_LabelValue'] = '1'
+        header[f'Segment{idx}_Tags'] = '|'.join(tag_parts)
+        header[f'Segment{idx}_Description'] = ref.description
+    return header
+
+
+def _fill_decomposed_payload_layer_from_zyx(
+    payload_lxyt: np.ndarray,
+    layer_idx: int,
+    layer_zyx: np.ndarray,
+    *,
+    workers: int = 1,
+    desc: str = 'Fill decomposed NRRD layer',
+) -> None:
+    src = np.asarray(layer_zyx)
+    if src.ndim != 3:
+        raise ValueError(f'{desc}: expected a 3D (t,Y,X) layer, got {src.shape}')
+    total = int(src.shape[0])
+
+    def _copy_slice(z: int) -> None:
+        payload_lxyt[int(layer_idx), :, :, int(z)] = np.asarray(src[int(z)], dtype=np.uint8).T
+
+    parallel_for_indices_chunked(
+        total,
+        _copy_slice,
+        max_workers=choose_slice_parallel_workers(int(workers), total),
+        desc=desc,
+        show_progress=False,
+        target_chunks_per_worker=2,
+    )
+
+
+def write_decomposed_nrrd(
+    layer_refs: Sequence[NrrdLayerRef],
+    final_mask_u8: np.ndarray,
+    out_path: Path,
+    *,
+    temp_dir: Path,
+    workers: int = 1,
+    include_final_output_layer: bool = True,
+) -> Path:
+    """Write a multi-layer NRRD whose leading axis decomposes the final segmentation.
+
+    Each supplied layer is an orthogonal ``(t,Y,X)`` binary mask in processing geometry.  Layers are
+    restored to the final output geometry when cubic resizing changed the working shape, then written
+    as a 4D payload ordered ``(layer, X, Y, t)``.  A sidecar ``*.manifest.json`` is written next to the
+    NRRD so downstream tools can reconstruct unions without parsing NRRD custom fields.
+    """
+    try:
+        import inspect
+        import nrrd  # type: ignore
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError('pynrrd is required for --save_nrrd: pip install pynrrd') from exc
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    output_shape = tuple(int(x) for x in np.asarray(final_mask_u8).shape)
+    if len(output_shape) != 3:
+        raise ValueError(f'Decomposed NRRD final mask must be 3D (t,Y,X), got {output_shape}')
+
+    effective_refs: List[NrrdLayerRef] = []
+    for ref in layer_refs:
+        if not ref.path.exists():
+            print(f'Warning: skipping missing NRRD layer backing file: {ref.path}')
+            continue
+        effective_refs.append(ref)
+
+    if bool(include_final_output_layer):
+        final_ref_path = temp_dir / 'nrrd_layers' / 'global' / 'final_output_binary.orthogonal.u8.dat'
+        final_ref = materialize_nrrd_global_layer(
+            final_mask_u8,
+            model_name='global',
+            source='global',
+            mask_kind='union',
+            pass_index=0,
+            stage='final_output_after_all_postprocessing',
+            description='Final binary output after view/tile union, optional smoothing, optional keep_objects, and geometry restoration.',
+            temp_dir=temp_dir,
+            workers=int(workers),
+        )
+        if final_ref is None:
+            # Preserve an empty final layer for empty volumes so the NRRD still documents final output.
+            copied = copy_workspace_array(
+                np.asarray(final_mask_u8, dtype=np.uint8),
+                final_ref_path,
+                desc='NRRD layer global final empty output',
+                prefer_memory=False,
+                workers=int(workers),
+            )
+            close_memmap_array(copied)
+            final_ref = NrrdLayerRef(
+                key='global__global__global__union__final_output_after_all_postprocessing',
+                name='Global / global / union / final output after all postprocessing',
+                path=final_ref_path,
+                shape=output_shape,
+                dtype='uint8',
+                model_name='global',
+                view_name='global',
+                view_family='global',
+                source='global',
+                mask_kind='union',
+                pass_index=0,
+                stage='final_output_after_all_postprocessing',
+                description='Final binary output after all postprocessing; empty volume.',
+            )
+        effective_refs.append(final_ref)
+
+    if not effective_refs:
+        return write_nrrd(final_mask_u8, out_path)
+
+    payload_shape = (len(effective_refs), int(output_shape[2]), int(output_shape[1]), int(output_shape[0]))
+    payload_path = temp_dir / 'nrrd_payload' / f'{out_path.stem}.decomposed_payload.u8.dat'
+    payload_path.parent.mkdir(parents=True, exist_ok=True)
+    if payload_path.exists():
+        payload_path.unlink()
+    payload = np.memmap(payload_path, dtype=np.uint8, mode='w+', shape=payload_shape, order='F')
+
+    restored_paths: List[Path] = []
+    restored_arrays: List[np.ndarray] = []
+    try:
+        for layer_idx, ref in enumerate(effective_refs):
+            src = _open_nrrd_layer_ref(ref)
+            layer_src: np.ndarray = src
+            try:
+                if tuple(int(x) for x in ref.shape) != output_shape:
+                    restored_path = temp_dir / 'nrrd_layers_restored' / f'{int(layer_idx):04d}_{ref.key}.u8.dat'
+                    layer_src = restore_mask_volume_to_original_shape(
+                        src,
+                        output_shape,
+                        restored_path,
+                        workers=int(workers),
+                        prefer_memory=False,
+                    )
+                    restored_paths.append(restored_path)
+                    restored_arrays.append(layer_src)
+                _fill_decomposed_payload_layer_from_zyx(
+                    payload,
+                    int(layer_idx),
+                    layer_src,
+                    workers=int(workers),
+                    desc=f'Fill decomposed NRRD layer {int(layer_idx)} {ref.key}',
+                )
+            finally:
+                close_memmap_array(src)
+        flush_array(payload)
+
+        header = nrrd_decomposed_header(output_shape_zyx=output_shape, layer_refs=effective_refs)
+        kwargs: Dict[str, object] = {'header': header}
+        try:
+            if 'index_order' in inspect.signature(nrrd.write).parameters:
+                kwargs['index_order'] = 'F'
+        except Exception:
+            pass
+        try:
+            nrrd.write(str(out_path), payload, **kwargs)
+        except Exception as exc:
+            # Some pynrrd versions are strict about non-spatial list-axis space directions.
+            # Retry with custom metadata intact but without the problematic field.
+            header_retry = dict(header)
+            header_retry.pop('space directions', None)
+            header_retry['content'] = str(header_retry.get('content', '')) + '; space_directions_omitted_after_writer_retry'
+            kwargs['header'] = header_retry
+            print(f'Warning: decomposed NRRD write retried without space directions after: {exc}')
+            nrrd.write(str(out_path), payload, **kwargs)
+    finally:
+        flush_array(payload)
+        close_memmap_array(payload)
+        for arr in restored_arrays:
+            close_memmap_array(arr)
+        for rp in restored_paths:
+            try:
+                rp.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    manifest = {
+        'nrrd_path': str(out_path),
+        'axis_order': '(layer, X, Y, t)',
+        'internal_layer_order': '(t, Y, X)',
+        'output_shape_tyx': [int(output_shape[0]), int(output_shape[1]), int(output_shape[2])],
+        'layer_count': int(len(effective_refs)),
+        'layers': [
+            {
+                'index': int(idx),
+                'key': ref.key,
+                'name': ref.name,
+                'model_name': ref.model_name,
+                'view_name': ref.view_name,
+                'view_family': ref.view_family,
+                'source': ref.source,
+                'mask_kind': ref.mask_kind,
+                'pass_index': int(ref.pass_index),
+                'tile_acceptance': ref.tile_acceptance,
+                'stage': ref.stage,
+                'description': ref.description,
+                'backing_shape_tyx': [int(ref.shape[0]), int(ref.shape[1]), int(ref.shape[2])],
+            }
+            for idx, ref in enumerate(effective_refs)
+        ],
+        'notes': [
+            'YOLO layers are cleaned masks before interpolation bridges.',
+            'Bridge layers contain voxels added by the corresponding interpolation pass only.',
+            'Tile components intersecting both parent YOLO support and parent bridge support are assigned to parent_mask to keep categories mutually exclusive.',
+            'Consolidated tile bridge layers are not attributed back to parent_mask vs parent_bridge acceptance because interpolation occurs after accepted tile masks are unioned.',
+            'The final_output layer is included for direct comparison and can be ignored when recomposing a custom volume from component layers.',
+        ],
+    }
+    manifest_path = out_path.with_suffix(out_path.suffix + '.manifest.json')
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    try:
+        payload_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return out_path
+
+
 def extract_radial_slice_mask_frame(mask_u8: np.ndarray, sampler: RadialSampler) -> np.ndarray:
     t_dim = int(mask_u8.shape[0])
     tt = np.arange(t_dim, dtype=np.int64)[:, None]
@@ -8063,6 +9064,9 @@ def collect_pipeline_output_futures(
     tag: Optional[str] = None,
     frame_workers: int = 1,
     show_progress: bool = False,
+    nrrd_layer_refs: Optional[Sequence[NrrdLayerRef]] = None,
+    nrrd_temp_dir: Optional[Path] = None,
+    nrrd_workers: int = 1,
 ) -> Tuple[Dict[str, Path], List[Future]]:
     futures: List[Future] = []
     result_paths: Dict[str, Path] = {}
@@ -8091,7 +9095,19 @@ def collect_pipeline_output_futures(
 
     if bool(save_nrrd_flag):
         nrrd_path = out_dir / f"{stem}{tag_suffix}.nrrd"
-        futures.append(executor.submit(write_nrrd, mask_u8, nrrd_path))
+        if nrrd_layer_refs is not None and len(nrrd_layer_refs) > 0 and nrrd_temp_dir is not None:
+            futures.append(executor.submit(
+                write_decomposed_nrrd,
+                list(nrrd_layer_refs),
+                mask_u8,
+                nrrd_path,
+                temp_dir=nrrd_temp_dir,
+                workers=int(nrrd_workers),
+                include_final_output_layer=True,
+            ))
+            result_paths["nrrd_manifest"] = nrrd_path.with_suffix(nrrd_path.suffix + '.manifest.json')
+        else:
+            futures.append(executor.submit(write_nrrd, mask_u8, nrrd_path))
         result_paths["nrrd"] = nrrd_path
 
     return result_paths, futures
@@ -8244,7 +9260,7 @@ def build_troubleshooting_pass_union(
     workers: int,
 ) -> np.ndarray:
     if len(model_names) != 1:
-        raise ValueError('v9.5.4_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
+        raise ValueError('v10.0.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     view_volumes_for_pass: Dict[str, Dict[str, np.ndarray]] = {str(model_name): {} for model_name in model_names}
     intermediate_volumes: List[np.ndarray] = []
 
@@ -8353,7 +9369,7 @@ def schedule_troubleshooting_pass_outputs(
     workers: int,
 ) -> Dict[str, Path]:
     if len(model_names) != 1:
-        raise ValueError('v9.5.4_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
+        raise ValueError('v10.0.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     if int(total_passes) < 0 or not snapshot_refs:
         return {}
 
@@ -8534,7 +9550,7 @@ def union_view_volume_for_single_model(
     workers: int = 1,
 ) -> np.ndarray:
     if len(view_volumes_by_model) != 1:
-        raise ValueError('v9.5.4_SLURM supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('v10.0.0_SLURM supports exactly one --model; multiple-model inference has been removed')
     model_name = next(iter(view_volumes_by_model.keys()))
     if view_name not in view_volumes_by_model[model_name]:
         raise KeyError(f'No view volume found for {view_name}')
@@ -8829,7 +9845,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('v9.5.4_SLURM accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('v10.0.0_SLURM accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -8976,7 +9992,12 @@ def main() -> None:
             f'Radial enabled with azimuth spacing {float(resolved_azimuth_angle):.8g} degrees; '
             'Lanczos-3 radial sampling, wraparound Radial interpolation, and dense final backprojection are active.'
         )
-    spec_notes.append(f'NRRD export writes the final mask using the PTA-aligned Slicer layout: {NRRD_AXIS_ORDER_NOTE}; space={NRRD_SPACE}; space_directions=identity.')
+    spec_notes.append(
+        'NRRD export is decomposed by default in v10.0.0: layers are written on a leading list axis as '
+        '(layer,X,Y,t), with manifest JSON and SegmentN metadata for view, source, YOLO-vs-bridge, '
+        'tile acceptance category, pre-smoothing union, smoothing pass results, and final output. '
+        f'Legacy single-volume NRRD writing is retained only for troubleshooting pass outputs without layer refs; space={NRRD_SPACE}.'
+    )
     if cpu_retina_masks_enabled():
         spec_notes.append(
             'Experimental CPU retina-mask reconstruction active: Ultralytics native mask upsampling is bypassed on GPU; '
@@ -9097,8 +10118,11 @@ def main() -> None:
     view_infos_by_name: Dict[str, ViewInfo] = {view.name: view for view in views}
     view_volumes_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
     native_view_support_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
+    parent_mask_support_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
+    parent_bridge_support_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
     radial_native_output_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
     tilted_native_output_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
+    nrrd_layer_refs: List[NrrdLayerRef] = []
     view_volume_locks: Dict[Tuple[str, str], threading.Lock] = {
         (model_name, view.name): threading.Lock()
         for model_name, _ in yolo_models
@@ -9290,6 +10314,8 @@ def main() -> None:
     tile_consolidation_futures: Dict[Future, Tuple[str, str]] = {}
     tile_accumulator_by_parent: Dict[Tuple[str, str], np.ndarray] = {}
     tile_accumulator_paths: Dict[Tuple[str, str], Path] = {}
+    tile_parent_mask_accumulator_by_parent: Dict[Tuple[str, str], np.ndarray] = {}
+    tile_parent_bridge_accumulator_by_parent: Dict[Tuple[str, str], np.ndarray] = {}
     tile_completed_by_parent: Dict[Tuple[str, str], set[str]] = {}
     tile_consolidation_submitted: set[Tuple[str, str]] = set()
 
@@ -9412,6 +10438,7 @@ def main() -> None:
             keep_temp=bool(args.troubleshooting),
             slice_workers=int(slice_postprocess_workers),
             interpolation_task_workers=int(parent_interpolation_task_workers),
+            nrrd_layers_enabled=bool(args.save_nrrd),
         )
         view_processing_futures[fut] = key
 
@@ -9432,6 +10459,30 @@ def main() -> None:
         tile_accumulator_by_parent[key] = acc
         tile_accumulator_paths[key] = acc_path
         return acc
+
+    def _get_tile_category_accumulator(model_name: str, view_name: str, category: str) -> np.ndarray:
+        key = (str(model_name), str(view_name))
+        category_norm = str(category)
+        store = (
+            tile_parent_mask_accumulator_by_parent
+            if category_norm == 'parent_mask'
+            else tile_parent_bridge_accumulator_by_parent
+        )
+        acc = store.get(key)
+        if acc is not None:
+            return acc
+        view = view_infos_by_name[str(view_name)]
+        acc_path = temp_dir / 'tile_consolidated' / str(model_name) / str(view_name) / f'gated_or_accepted_by_{category_norm}.u8.dat'
+        acc = allocate_workspace_array(
+            shape=(int(view.num_slices), int(view.src_h), int(view.src_w)),
+            dtype=np.uint8,
+            path=acc_path,
+            desc=f'{model_name}/{view_name} consolidated gated-tile accumulator accepted by {category_norm}',
+            prefer_memory=False,
+        )
+        store[key] = acc
+        return acc
+
 
     def _parent_destination_ready(model_name: str, view_name: str) -> bool:
         view = view_infos_by_name[str(view_name)]
@@ -9485,6 +10536,9 @@ def main() -> None:
             keep_temp=bool(args.troubleshooting),
             slice_workers=int(tile_slice_postprocess_workers),
             interpolation_task_workers=int(tile_interpolation_task_workers),
+            nrrd_layers_enabled=bool(args.save_nrrd),
+            tile_parent_mask_accumulator_mm=tile_parent_mask_accumulator_by_parent.get(parent_key),
+            tile_parent_bridge_accumulator_mm=tile_parent_bridge_accumulator_by_parent.get(parent_key),
         )
         tile_consolidation_futures[fut] = parent_key
 
@@ -9516,6 +10570,16 @@ def main() -> None:
                 postprocessed_tiles_waiting_by_parent.pop(parent_key, None)
 
         tile_accumulator_mm = _get_tile_accumulator(result.model_name, result.view_name)
+        parent_mask_support_mm = None
+        parent_bridge_support_mm = None
+        tile_parent_mask_accumulator_mm = None
+        tile_parent_bridge_accumulator_mm = None
+        if bool(args.save_nrrd):
+            parent_mask_support_mm = parent_mask_support_by_model.get(result.model_name, {}).get(result.view_name)
+            parent_bridge_support_mm = parent_bridge_support_by_model.get(result.model_name, {}).get(result.view_name)
+            tile_parent_mask_accumulator_mm = _get_tile_category_accumulator(result.model_name, result.view_name, 'parent_mask')
+            if parent_bridge_support_mm is not None:
+                tile_parent_bridge_accumulator_mm = _get_tile_category_accumulator(result.model_name, result.view_name, 'parent_bridge')
 
         fut = tile_postprocess_executor.submit(
             gate_tile_volume_into_consolidated_parent,
@@ -9525,6 +10589,11 @@ def main() -> None:
             tile_accumulator_lock=view_volume_locks[(result.model_name, result.view_name)],
             keep_temp=bool(args.troubleshooting),
             slice_workers=int(tile_slice_postprocess_workers),
+            parent_mask_support_mm=parent_mask_support_mm,
+            parent_bridge_support_mm=parent_bridge_support_mm,
+            tile_parent_mask_accumulator_mm=tile_parent_mask_accumulator_mm,
+            tile_parent_bridge_accumulator_mm=tile_parent_bridge_accumulator_mm,
+            temp_dir=temp_dir,
         )
         tile_finalize_futures[fut] = (str(result.model_name), str(result.view_name), str(result.tile_id))
 
@@ -9582,7 +10651,12 @@ def main() -> None:
             result = fut.result()
             del view_processing_futures[fut]
             native_view_support_by_model[result.model_name][result.view_name] = result.native_support_mm
+            if result.parent_mask_support_mm is not None:
+                parent_mask_support_by_model[result.model_name][result.view_name] = result.parent_mask_support_mm
+            if result.parent_bridge_support_mm is not None:
+                parent_bridge_support_by_model[result.model_name][result.view_name] = result.parent_bridge_support_mm
             interpolation_stats.extend(result.interpolation_stats)
+            nrrd_layer_refs.extend(result.nrrd_layers)
             _register_pass_snapshots(result.pass_snapshots)
 
             view_info = view_infos_by_name[result.view_name]
@@ -9620,6 +10694,7 @@ def main() -> None:
             result = fut.result()
             del tile_consolidation_futures[fut]
             interpolation_stats.extend(result.interpolation_stats)
+            nrrd_layer_refs.extend(result.nrrd_layers)
             _register_pass_snapshots(result.pass_snapshots)
 
         output_manager.reap_completed()
@@ -9904,6 +10979,21 @@ def main() -> None:
         workers=slice_postprocess_workers,
     )
 
+    if bool(args.save_nrrd):
+        pre_smoothing_ref = materialize_nrrd_global_layer(
+            final_union_mm,
+            model_name=str(model_name),
+            source='global',
+            mask_kind='union',
+            pass_index=0,
+            stage='pre_smoothing',
+            description='Global union after all active view/tile layers and optional 3D void fill, before Gaussian smoothing and keep_objects.',
+            temp_dir=temp_dir,
+            workers=int(slice_postprocess_workers),
+        )
+        if pre_smoothing_ref is not None:
+            nrrd_layer_refs.append(pre_smoothing_ref)
+
     gaussian_smoothing_stats: Optional[Dict[str, int | float]] = None
     if bool(gaussian_smoothing_enabled):
         print('\n=== Applying Gaussian smoothing ===')
@@ -9915,6 +11005,8 @@ def main() -> None:
             keep_temp=bool(args.troubleshooting),
             prefer_memory=True,
             workers=slice_postprocess_workers,
+            nrrd_layers=nrrd_layer_refs if bool(args.save_nrrd) else None,
+            nrrd_model_name=str(model_name),
         )
 
     keep_objects_stats: Optional[Dict[str, int]] = None
@@ -10005,6 +11097,9 @@ def main() -> None:
         tag=None,
         frame_workers=output_frame_workers,
         show_progress=False,
+        nrrd_layer_refs=nrrd_layer_refs if bool(args.save_nrrd) else None,
+        nrrd_temp_dir=temp_dir,
+        nrrd_workers=output_frame_workers,
     )
     if bool(save_sagittal) or bool(save_coronal):
         extra_paths, extra_futures = collect_multiplanar_output_futures(
@@ -10124,6 +11219,12 @@ def main() -> None:
             show_progress=False,
         )
         final_paths['low_quality_dir'] = low_quality_dir
+
+    if bool(args.save_nrrd):
+        spec_notes.append(
+            f'Decomposed NRRD component layers prepared: {int(len(nrrd_layer_refs))}; '
+            'the writer appends one final_output layer and writes a .nrrd.manifest.json sidecar.'
+        )
 
     summary_path = write_summary_file(
         out_dir / f'{input_path.stem}_Summary.txt',
