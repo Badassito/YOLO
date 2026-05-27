@@ -2,7 +2,7 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v10.0.0_SLURM single-channel-aligned script:
+This v10.0.1_SLURM single-channel-aligned script:
   - builds Transverse, optional Tilted Transverse, independently optional Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - renders parent/full-frame videos directly from the native view transform so inference no longer waits on
     a separately rendered canvas video, and derives non-radial tile videos from shared canvas batches so the
@@ -44,6 +44,7 @@ System:
 from __future__ import annotations
 
 import argparse
+import colorsys
 import gc
 import heapq
 import json
@@ -3077,7 +3078,7 @@ def resolve_gaussian_smoothing_settings(
     gaussian_smoothing_arg: Optional[float],
     gaussian_smoothing_passes: int,
 ) -> Tuple[bool, float, int]:
-    """Resolve Gaussian smoothing enablement from the v10.0.0 CLI contract.
+    """Resolve Gaussian smoothing enablement from the v10.0.1 CLI contract.
 
     Contract:
       - no --gaussian_smoothing and the default --gaussian_smoothing_passes 1 => disabled
@@ -5480,7 +5481,7 @@ def assemble_current_view_union_volume(
     combines outputs from more than one model.
     """
     if len(view_volumes_by_model) != 1:
-        raise ValueError('v10.0.0_SLURM supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('v10.0.1_SLURM supports exactly one --model; multiple-model inference has been removed')
 
     model_name = next(iter(view_volumes_by_model.keys()))
     final_union_mm = allocate_workspace_array(
@@ -6799,7 +6800,7 @@ class VolumeSnapshotRef:
 
 @dataclass(frozen=True)
 class NrrdLayerRef:
-    """One orthogonal-space layer for the decomposed v10.0.0 NRRD export.
+    """One orthogonal-space layer for the decomposed v10.0.1 NRRD export.
 
     The backing file is always a uint8 binary mask in the pipeline's orthogonal
     ``(t, Y, X)`` processing geometry.  The NRRD writer converts each layer to
@@ -7799,7 +7800,7 @@ def gate_tile_volume_into_consolidated_parent(
 ) -> TileGateResult:
     """Gate one tile volume, then OR accepted components into parent-view accumulators.
 
-    The main accumulator preserves the v10.0.0 mask-wise OR gate semantics.  Optional category
+    The main accumulator preserves the v10.0.1 mask-wise OR gate semantics.  Optional category
     accumulators are populated only for decomposed NRRD export and split accepted tile components
     into parent-YOLO-supported and parent-bridge-supported layers.
     """
@@ -8131,7 +8132,7 @@ def apply_gaussian_smoothing_inplace(
 ) -> Dict[str, int | float]:
     """Smooth the final binary 3D volume with a Gaussian kernel and re-threshold at 0.5.
 
-    The v10.0.0_SLURM smoothing stage is applied after the final view/tile union and optional
+    The v10.0.1_SLURM smoothing stage is applied after the final view/tile union and optional
     3D void fill, but before --keep_objects and before resizing back to the source geometry.
     A single float32 workspace is reused for every pass to avoid retaining multiple dense
     floating-point copies of the volume.
@@ -8470,6 +8471,64 @@ def write_binary_video_from_mask_volume(
     return video_path
 
 
+def _nrrd_ascii_header_text(value: object) -> str:
+    """Return ASCII-safe text for pynrrd header fields.
+
+    pynrrd writes headers as ASCII.  View names can contain characters such as the
+    degree sign, so normalize those before they reach the header.  The sidecar JSON
+    manifest keeps the full Unicode names.
+    """
+    text = str(value)
+    replacements = {
+        '°': 'deg',
+        '±': '+/-',
+        'µ': 'u',
+        '–': '-',
+        '—': '-',
+        '−': '-',
+        '\u00a0': ' ',
+    }
+    for src, dst in replacements.items():
+        text = text.replace(src, dst)
+    text = text.encode('ascii', 'ignore').decode('ascii')
+    return text
+
+
+def _nrrd_space_directions_matrix(spatial_axes: int = 3, list_axis: bool = False) -> np.ndarray:
+    """Return a pynrrd-compatible ``space directions`` matrix.
+
+    pynrrd's default representation is a numeric matrix; non-spatial axes are
+    represented by a row of NaNs, which serializes as ``none``.  This avoids the
+    NumPy inhomogeneous-shape error that can occur when a Python list mixes
+    ``None`` and 3-vectors while pynrrd is still in matrix mode.
+    """
+    spatial_axes_i = max(1, int(spatial_axes))
+    if bool(list_axis):
+        mat = np.full((spatial_axes_i + 1, spatial_axes_i), np.nan, dtype=np.float64)
+        mat[1:, :] = np.eye(spatial_axes_i, dtype=np.float64)
+        return mat
+    return np.eye(spatial_axes_i, dtype=np.float64)
+
+
+def _write_nrrd_matrix_space_directions(nrrd_module: object, out_path: Path, payload: np.ndarray, kwargs: Dict[str, object]) -> None:
+    """Write through pynrrd while forcing matrix-style space directions when supported."""
+    sentinel = object()
+    old_space_directions_type = getattr(nrrd_module, 'SPACE_DIRECTIONS_TYPE', sentinel)
+    try:
+        if old_space_directions_type is not sentinel:
+            try:
+                setattr(nrrd_module, 'SPACE_DIRECTIONS_TYPE', 'double matrix')
+            except Exception:
+                pass
+        nrrd_module.write(str(out_path), payload, **kwargs)
+    finally:
+        if old_space_directions_type is not sentinel:
+            try:
+                setattr(nrrd_module, 'SPACE_DIRECTIONS_TYPE', old_space_directions_type)
+            except Exception:
+                pass
+
+
 def nrrd_mask_to_slicer_xyz(mask_u8: np.ndarray) -> np.ndarray:
     """Return a Slicer-oriented NRRD payload from the internal mask layout.
 
@@ -8494,7 +8553,7 @@ def nrrd_slicer_header(mask_shape_zyx: Tuple[int, int, int]) -> Dict[str, object
     return {
         "space": NRRD_SPACE,
         "kinds": ["domain", "domain", "domain"],
-        "space directions": np.eye(3, dtype=np.float64),
+        "space directions": _nrrd_space_directions_matrix(spatial_axes=3, list_axis=False),
         "space origin": np.zeros((3,), dtype=np.float64),
         "content": f"binary segmentation mask; source_shape_tyx=({t_dim},{h},{w}); exported_axes=(X,Y,t)",
     }
@@ -8515,7 +8574,7 @@ def write_nrrd(mask_u8: np.ndarray, out_path: Path) -> Path:
             kwargs["index_order"] = "F"
     except Exception:
         pass
-    nrrd.write(str(out_path), payload, **kwargs)
+    _write_nrrd_matrix_space_directions(nrrd, out_path, payload, kwargs)
     return out_path
 
 
@@ -8529,17 +8588,80 @@ def _open_nrrd_layer_ref(ref: NrrdLayerRef) -> np.memmap:
     )
 
 
+def _nrrd_empty_segment_extent() -> Tuple[int, int, int, int, int, int]:
+    return (0, -1, 0, -1, 0, -1)
+
+
+def compute_segment_extent_zyx(mask_zyx: np.ndarray) -> Tuple[int, int, int, int, int, int]:
+    """Return Slicer SegmentN_Extent as ``minI maxI minJ maxJ minK maxK``.
+
+    The pipeline layer is ``(t,Y,X)``.  The NRRD payload stores that as spatial
+    ``(X,Y,t)``, so Slicer I/J/K map to X/Y/t respectively.
+    """
+    src = np.asarray(mask_zyx)
+    if src.ndim != 3:
+        raise ValueError(f'compute_segment_extent_zyx expects a 3D (t,Y,X) layer, got {src.shape}')
+
+    t_dim, h_dim, w_dim = (int(src.shape[0]), int(src.shape[1]), int(src.shape[2]))
+    min_t, max_t = t_dim, -1
+    min_y, max_y = h_dim, -1
+    min_x, max_x = w_dim, -1
+
+    for t_idx in range(t_dim):
+        sl = np.asarray(src[int(t_idx)], dtype=bool)
+        if not np.any(sl):
+            continue
+        row_has_fg = np.any(sl, axis=1)
+        col_has_fg = np.any(sl, axis=0)
+        ys = np.flatnonzero(row_has_fg)
+        xs = np.flatnonzero(col_has_fg)
+        if xs.size <= 0 or ys.size <= 0:
+            continue
+        min_t = min(min_t, int(t_idx))
+        max_t = max(max_t, int(t_idx))
+        min_y = min(min_y, int(ys[0]))
+        max_y = max(max_y, int(ys[-1]))
+        min_x = min(min_x, int(xs[0]))
+        max_x = max(max_x, int(xs[-1]))
+
+    if max_t < 0:
+        return _nrrd_empty_segment_extent()
+    return (int(min_x), int(max_x), int(min_y), int(max_y), int(min_t), int(max_t))
+
+
+def _format_segment_extent(extent: Sequence[int]) -> str:
+    values = [int(v) for v in extent]
+    if len(values) != 6:
+        raise ValueError(f'Segment extent must contain 6 values, got {values}')
+    return ' '.join(str(v) for v in values)
+
+
+def _nrrd_segment_color(idx: int) -> str:
+    hue = (float(idx) * 0.6180339887498949) % 1.0
+    r, g, b = colorsys.hsv_to_rgb(hue, 0.55, 0.95)
+    return f'{r:.6g} {g:.6g} {b:.6g}'
+
+
 def nrrd_decomposed_header(
     *,
     output_shape_zyx: Tuple[int, int, int],
     layer_refs: Sequence[NrrdLayerRef],
+    layer_extents: Optional[Sequence[Tuple[int, int, int, int, int, int]]] = None,
 ) -> Dict[str, object]:
     t_dim, h, w = (int(output_shape_zyx[0]), int(output_shape_zyx[1]), int(output_shape_zyx[2]))
+    if layer_extents is None:
+        extents_resolved = [_nrrd_empty_segment_extent() for _ in layer_refs]
+    else:
+        extents_resolved = [tuple(int(v) for v in extent) for extent in layer_extents]
+    if len(extents_resolved) != len(layer_refs):
+        raise ValueError(f'NRRD segment extent count {len(extents_resolved)} does not match layer count {len(layer_refs)}')
+
     header: Dict[str, object] = {
         'space': NRRD_SPACE,
         'kinds': ['list', 'domain', 'domain', 'domain'],
-        # The leading list axis is non-spatial. pynrrd writes None as "none" for NRRD space directions.
-        'space directions': [None, np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0]), np.array([0.0, 0.0, 1.0])],
+        # The leading list axis is non-spatial.  Use pynrrd's matrix-compatible
+        # representation: a NaN row serializes as ``none``.
+        'space directions': _nrrd_space_directions_matrix(spatial_axes=3, list_axis=True),
         'space origin': np.zeros((3,), dtype=np.float64),
         'content': (
             'decomposed binary segmentation layers; '
@@ -8547,6 +8669,11 @@ def nrrd_decomposed_header(
             'layer metadata stored in SegmentN_* fields and sidecar manifest JSON'
         ),
         'encoding': 'gzip',
+        'Segmentation_ContainedRepresentationNames': 'Binary labelmap',
+        'Segmentation_SourceRepresentation': 'Binary labelmap',
+        # Kept for compatibility with older Slicer segmentation metadata readers.
+        'Segmentation_MasterRepresentation': 'Binary labelmap',
+        'Segmentation_ReferenceImageExtentOffset': '0 0 0',
     }
     for idx, ref in enumerate(layer_refs):
         tag_parts = [
@@ -8561,12 +8688,16 @@ def nrrd_decomposed_header(
             tag_parts.append(f'tile_acceptance:{ref.tile_acceptance}')
         if ref.stage:
             tag_parts.append(f'stage:{ref.stage}')
-        header[f'Segment{idx}_ID'] = ref.key
-        header[f'Segment{idx}_Name'] = ref.name
+        header[f'Segment{idx}_ID'] = _nrrd_ascii_header_text(ref.key)
+        header[f'Segment{idx}_Name'] = _nrrd_ascii_header_text(ref.name)
+        header[f'Segment{idx}_NameAutoGenerated'] = '0'
+        header[f'Segment{idx}_Color'] = _nrrd_segment_color(int(idx))
+        header[f'Segment{idx}_ColorAutoGenerated'] = '0'
+        header[f'Segment{idx}_Extent'] = _format_segment_extent(extents_resolved[int(idx)])
         header[f'Segment{idx}_Layer'] = str(idx)
         header[f'Segment{idx}_LabelValue'] = '1'
-        header[f'Segment{idx}_Tags'] = '|'.join(tag_parts)
-        header[f'Segment{idx}_Description'] = ref.description
+        header[f'Segment{idx}_Tags'] = _nrrd_ascii_header_text('|'.join(tag_parts))
+        header[f'Segment{idx}_Description'] = _nrrd_ascii_header_text(ref.description)
     return header
 
 
@@ -8682,6 +8813,7 @@ def write_decomposed_nrrd(
 
     restored_paths: List[Path] = []
     restored_arrays: List[np.ndarray] = []
+    layer_extents: List[Tuple[int, int, int, int, int, int]] = []
     try:
         for layer_idx, ref in enumerate(effective_refs):
             src = _open_nrrd_layer_ref(ref)
@@ -8698,6 +8830,7 @@ def write_decomposed_nrrd(
                     )
                     restored_paths.append(restored_path)
                     restored_arrays.append(layer_src)
+                layer_extents.append(compute_segment_extent_zyx(layer_src))
                 _fill_decomposed_payload_layer_from_zyx(
                     payload,
                     int(layer_idx),
@@ -8709,7 +8842,11 @@ def write_decomposed_nrrd(
                 close_memmap_array(src)
         flush_array(payload)
 
-        header = nrrd_decomposed_header(output_shape_zyx=output_shape, layer_refs=effective_refs)
+        header = nrrd_decomposed_header(
+            output_shape_zyx=output_shape,
+            layer_refs=effective_refs,
+            layer_extents=layer_extents,
+        )
         kwargs: Dict[str, object] = {'header': header}
         try:
             if 'index_order' in inspect.signature(nrrd.write).parameters:
@@ -8717,7 +8854,7 @@ def write_decomposed_nrrd(
         except Exception:
             pass
         try:
-            nrrd.write(str(out_path), payload, **kwargs)
+            _write_nrrd_matrix_space_directions(nrrd, out_path, payload, kwargs)
         except Exception as exc:
             # Some pynrrd versions are strict about non-spatial list-axis space directions.
             # Retry with custom metadata intact but without the problematic field.
@@ -8726,7 +8863,7 @@ def write_decomposed_nrrd(
             header_retry['content'] = str(header_retry.get('content', '')) + '; space_directions_omitted_after_writer_retry'
             kwargs['header'] = header_retry
             print(f'Warning: decomposed NRRD write retried without space directions after: {exc}')
-            nrrd.write(str(out_path), payload, **kwargs)
+            _write_nrrd_matrix_space_directions(nrrd, out_path, payload, kwargs)
     finally:
         flush_array(payload)
         close_memmap_array(payload)
@@ -9260,7 +9397,7 @@ def build_troubleshooting_pass_union(
     workers: int,
 ) -> np.ndarray:
     if len(model_names) != 1:
-        raise ValueError('v10.0.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
+        raise ValueError('v10.0.1_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     view_volumes_for_pass: Dict[str, Dict[str, np.ndarray]] = {str(model_name): {} for model_name in model_names}
     intermediate_volumes: List[np.ndarray] = []
 
@@ -9369,7 +9506,7 @@ def schedule_troubleshooting_pass_outputs(
     workers: int,
 ) -> Dict[str, Path]:
     if len(model_names) != 1:
-        raise ValueError('v10.0.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
+        raise ValueError('v10.0.1_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     if int(total_passes) < 0 or not snapshot_refs:
         return {}
 
@@ -9550,7 +9687,7 @@ def union_view_volume_for_single_model(
     workers: int = 1,
 ) -> np.ndarray:
     if len(view_volumes_by_model) != 1:
-        raise ValueError('v10.0.0_SLURM supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('v10.0.1_SLURM supports exactly one --model; multiple-model inference has been removed')
     model_name = next(iter(view_volumes_by_model.keys()))
     if view_name not in view_volumes_by_model[model_name]:
         raise KeyError(f'No view volume found for {view_name}')
@@ -9845,7 +9982,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('v10.0.0_SLURM accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('v10.0.1_SLURM accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -9993,7 +10130,7 @@ def main() -> None:
             'Lanczos-3 radial sampling, wraparound Radial interpolation, and dense final backprojection are active.'
         )
     spec_notes.append(
-        'NRRD export is decomposed by default in v10.0.0: layers are written on a leading list axis as '
+        'NRRD export is decomposed by default in v10.0.1: layers are written on a leading list axis as '
         '(layer,X,Y,t), with manifest JSON and SegmentN metadata for view, source, YOLO-vs-bridge, '
         'tile acceptance category, pre-smoothing union, smoothing pass results, and final output. '
         f'Legacy single-volume NRRD writing is retained only for troubleshooting pass outputs without layer refs; space={NRRD_SPACE}.'
