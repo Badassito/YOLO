@@ -32,10 +32,11 @@ This v10.0.1_SLURM single-channel-aligned script:
     tilted-transverse, image-sequence, low-quality, and TTA outputs, with FFV1 used for spec-required MKVs
   - writes the default NRRD as independently toggleable layers for full-frame YOLO masks, interpolation bridges, tiled masks accepted by parent YOLO masks,
     tiled masks accepted by parent bridges, consolidated tile bridges, the pre-smoothing global union, smoothing-pass results, and the final output layer
+  - streams NRRD gzip payloads directly from per-layer backing arrays without materializing a full 4D decomposed payload, reducing peak RAM and scratch pressure during final NRRD creation
 
 Dependencies (Python):
   pip install opencv-python numpy scipy scikit-image tifffile tqdm ultralytics
-  pip install pynrrd   # only needed for --save_nrrd
+  # --save_nrrd uses the built-in streaming NRRD writer; pynrrd is no longer required for default exports.
 
 System:
   ffmpeg + ffprobe on PATH.
@@ -46,6 +47,7 @@ from __future__ import annotations
 import argparse
 import colorsys
 import gc
+import gzip
 import heapq
 import json
 import math
@@ -8559,24 +8561,199 @@ def nrrd_slicer_header(mask_shape_zyx: Tuple[int, int, int]) -> Dict[str, object
     }
 
 
-def write_nrrd(mask_u8: np.ndarray, out_path: Path) -> Path:
+def nrrd_gzip_compresslevel() -> int:
+    return int(np.clip(_env_int('YOLO_TTA_NRRD_GZIP_LEVEL', 6), 0, 9))
+
+
+def nrrd_stream_buffer_bytes() -> int:
+    mib = max(1, _env_int('YOLO_TTA_NRRD_STREAM_BUFFER_MIB', 64))
+    return int(mib) * 1024 * 1024
+
+
+def nrrd_madvise_dontneed_interval() -> int:
+    # 0 disables advisory cache dropping.  The default keeps NRRD source-layer page cache
+    # bounded without issuing a syscall after every single slice.
+    return max(0, _env_int('YOLO_TTA_NRRD_MADVISE_DONTNEED_INTERVAL', 16))
+
+
+def _madvise_array_mmap(arr: object, advice_name: str) -> None:
     try:
-        import inspect
-        import nrrd  # type: ignore
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError("pynrrd is required for --save_nrrd: pip install pynrrd") from exc
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = nrrd_mask_to_slicer_xyz(mask_u8)
-    header = nrrd_slicer_header(tuple(np.asarray(mask_u8).shape))
-    kwargs: Dict[str, object] = {"header": header}
-    try:
-        if "index_order" in inspect.signature(nrrd.write).parameters:
-            kwargs["index_order"] = "F"
+        import mmap as _mmap_module  # local import so non-POSIX platforms remain unaffected
+        advice = getattr(_mmap_module, str(advice_name), None)
+        if advice is None:
+            return
+        mmap_obj = getattr(arr, '_mmap', None)
+        if mmap_obj is None:
+            base = getattr(arr, 'base', None)
+            mmap_obj = getattr(base, '_mmap', None)
+        madvise_fn = getattr(mmap_obj, 'madvise', None)
+        if callable(madvise_fn):
+            madvise_fn(advice)
     except Exception:
         pass
-    _write_nrrd_matrix_space_directions(nrrd, out_path, payload, kwargs)
-    return out_path
 
+
+def _nrrd_float_text(value: float) -> str:
+    value_f = float(value)
+    if math.isnan(value_f):
+        return 'none'
+    if math.isinf(value_f):
+        return 'inf' if value_f > 0 else '-inf'
+    return f'{value_f:.17g}'
+
+
+def _nrrd_vector_text(values: Sequence[object]) -> str:
+    return '(' + ','.join(_nrrd_float_text(float(v)) for v in values) + ')'
+
+
+def _nrrd_space_directions_text(value: object) -> str:
+    arr = np.asarray(value, dtype=np.float64)
+    if arr.ndim == 1:
+        return _nrrd_vector_text(arr.tolist())
+    if arr.ndim != 2:
+        raise ValueError(f'NRRD space directions must be 1D or 2D, got shape {arr.shape}')
+    parts: List[str] = []
+    for row in arr:
+        if np.all(np.isnan(row)):
+            parts.append('none')
+        else:
+            parts.append(_nrrd_vector_text(row.tolist()))
+    return ' '.join(parts)
+
+
+def _nrrd_header_value_text(key: str, value: object) -> str:
+    key_l = str(key).strip().lower()
+    if key_l == 'space directions':
+        return _nrrd_space_directions_text(value)
+    if key_l in {'space origin', 'measurement frame'}:
+        arr = np.asarray(value, dtype=np.float64)
+        if arr.ndim == 1:
+            return _nrrd_vector_text(arr.tolist())
+    if isinstance(value, np.ndarray):
+        arr = value
+        if arr.ndim == 1:
+            return ' '.join(_nrrd_float_text(float(v)) for v in arr.tolist())
+        return ' '.join(_nrrd_vector_text(row) for row in arr.tolist())
+    if isinstance(value, (list, tuple)):
+        return ' '.join(_nrrd_ascii_header_text(v) for v in value)
+    if isinstance(value, bool):
+        return 'true' if value else 'false'
+    return _nrrd_ascii_header_text(value).replace('\n', ' ').replace('\r', ' ')
+
+
+_NRRD_STANDARD_FIELDS = {
+    'type', 'dimension', 'sizes', 'spacings', 'thicknesses', 'axis mins', 'axis maxs',
+    'centers', 'labels', 'units', 'min', 'max', 'old min', 'old max', 'endian',
+    'encoding', 'line skip', 'byte skip', 'data file', 'content', 'sample units',
+    'space', 'space dimension', 'space units', 'space origin', 'space directions',
+    'measurement frame', 'kinds', 'block size',
+}
+
+
+def _nrrd_field_separator(key: str) -> str:
+    return ':' if str(key).strip().lower() in _NRRD_STANDARD_FIELDS else ':='
+
+
+def _write_nrrd_ascii_header(
+    fh: object,
+    *,
+    header: Dict[str, object],
+    sizes: Sequence[int],
+    dimension: int,
+    data_type: str = 'uint8',
+    encoding: str = 'gzip',
+) -> None:
+    header_copy: Dict[str, object] = dict(header)
+    for reserved in ('type', 'dimension', 'sizes'):
+        header_copy.pop(reserved, None)
+    header_copy['encoding'] = str(encoding)
+
+    standard_order = [
+        'space', 'space dimension', 'kinds', 'space directions', 'space origin',
+        'measurement frame', 'content', 'encoding', 'endian',
+    ]
+
+    lines: List[str] = [
+        'NRRD0005',
+        '# Complete NRRD file generated by GPT-5.5-Pro_v10.0.1_SLURM.py',
+        f'type: {str(data_type)}',
+        f'dimension: {int(dimension)}',
+        'sizes: ' + ' '.join(str(int(v)) for v in sizes),
+    ]
+
+    emitted: set[str] = set()
+    for key in standard_order:
+        if key in header_copy:
+            lines.append(f'{key}: {_nrrd_header_value_text(key, header_copy[key])}')
+            emitted.add(key)
+
+    for key, value in header_copy.items():
+        if key in emitted or key in {'type', 'dimension', 'sizes'}:
+            continue
+        sep = _nrrd_field_separator(str(key))
+        lines.append(f'{str(key)}{sep} {_nrrd_header_value_text(str(key), value)}')
+
+    text = '\n'.join(lines) + '\n\n'
+    fh.write(text.encode('ascii', errors='ignore'))
+
+
+def _open_gzip_payload_writer(fh: object) -> gzip.GzipFile:
+    level = nrrd_gzip_compresslevel()
+    try:
+        return gzip.GzipFile(fileobj=fh, mode='wb', compresslevel=int(level), mtime=0)
+    except TypeError:  # pragma: no cover - older Python compatibility
+        return gzip.GzipFile(fileobj=fh, mode='wb', compresslevel=int(level))
+
+
+def _nrrd_stream_chunk_rows(layer_count: int, width: int, height: int) -> int:
+    target = max(1, int(nrrd_stream_buffer_bytes()))
+    bytes_per_row = max(1, int(layer_count) * int(width) * np.dtype(np.uint8).itemsize)
+    return max(1, min(int(height), int(target // bytes_per_row)))
+
+
+def _write_single_nrrd_payload_stream(mask_u8: np.ndarray, gz: gzip.GzipFile) -> None:
+    src = np.asarray(mask_u8)
+    if src.ndim != 3:
+        raise ValueError(f'NRRD export expects a 3D mask volume with shape (t,Y,X), got {src.shape}')
+    t_dim, h_dim, w_dim = (int(src.shape[0]), int(src.shape[1]), int(src.shape[2]))
+    chunk_rows = _nrrd_stream_chunk_rows(1, w_dim, h_dim)
+    print(
+        f'NRRD streaming single-volume payload: shape=(X,Y,t)=({w_dim},{h_dim},{t_dim}), '
+        f'row_chunk={int(chunk_rows)}, gzip_level={nrrd_gzip_compresslevel()}'
+    )
+    for z in tqdm(range(t_dim), desc='NRRD streaming: single volume'):
+        frame = np.asarray(src[int(z)], dtype=np.uint8)
+        for y0 in range(0, h_dim, chunk_rows):
+            y1 = min(h_dim, y0 + chunk_rows)
+            block_xy = np.asfortranarray(frame[int(y0):int(y1), :].T)
+            gz.write(block_xy.tobytes(order='F'))
+
+
+def write_nrrd(mask_u8: np.ndarray, out_path: Path) -> Path:
+    """Write a binary 3D NRRD using bounded-memory streaming gzip output.
+
+    This replaces the previous pynrrd path that first transposed the whole volume into a
+    second in-memory payload.  Data are written in NRRD/Slicer spatial axis order
+    ``(X,Y,t)`` with the first axis varying fastest.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    src = np.asarray(mask_u8)
+    if src.ndim != 3:
+        raise ValueError(f'NRRD export expects a 3D mask volume with shape (t,Y,X), got {src.shape}')
+    t_dim, h_dim, w_dim = (int(src.shape[0]), int(src.shape[1]), int(src.shape[2]))
+    header = nrrd_slicer_header((t_dim, h_dim, w_dim))
+    with open(out_path, 'wb') as fh:
+        _write_nrrd_ascii_header(
+            fh,
+            header=header,
+            sizes=(w_dim, h_dim, t_dim),
+            dimension=3,
+            data_type='uint8',
+            encoding='gzip',
+        )
+        with _open_gzip_payload_writer(fh) as gz:
+            _write_single_nrrd_payload_stream(mask_u8, gz)
+    return out_path
 
 
 def _open_nrrd_layer_ref(ref: NrrdLayerRef) -> np.memmap:
@@ -8727,6 +8904,229 @@ def _fill_decomposed_payload_layer_from_zyx(
     )
 
 
+def _restore_source_indices_for_output_z(in_t: int, out_t: int, out_z: int) -> List[int]:
+    in_t_i = max(1, int(in_t))
+    out_t_i = max(1, int(out_t))
+    out_z_i = int(np.clip(int(out_z), 0, out_t_i - 1))
+    if in_t_i >= out_t_i:
+        src_start = int(math.floor(float(out_z_i) * float(in_t_i) / float(out_t_i)))
+        src_stop = int(math.ceil(float(out_z_i + 1) * float(in_t_i) / float(out_t_i)))
+        src_start = int(np.clip(src_start, 0, in_t_i - 1))
+        src_stop = int(np.clip(max(src_start + 1, src_stop), 1, in_t_i))
+        return [int(v) for v in range(src_start, src_stop)]
+
+    src_z = _linear_source_index(out_z_i, out_t_i, in_t_i)
+    return [int(np.clip(int(round(src_z)), 0, in_t_i - 1))]
+
+
+def _resize_binary_mask_frame_to_output_shape(frame: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+    frame_u8 = (np.asarray(frame, dtype=np.uint8) > 0).astype(np.uint8, copy=False)
+    if int(frame_u8.shape[0]) == int(out_h) and int(frame_u8.shape[1]) == int(out_w):
+        return np.ascontiguousarray(frame_u8)
+    interp = cv2.INTER_AREA if (int(frame_u8.shape[0]) >= int(out_h) and int(frame_u8.shape[1]) >= int(out_w)) else cv2.INTER_NEAREST
+    scaled = cv2.resize(
+        np.ascontiguousarray(frame_u8 * np.uint8(255)),
+        (int(out_w), int(out_h)),
+        interpolation=int(interp),
+    )
+    return (scaled > 0).astype(np.uint8, copy=False)
+
+
+def _read_layer_slice_in_output_shape(
+    src: np.ndarray,
+    output_shape: Tuple[int, int, int],
+    out_z: int,
+) -> np.ndarray:
+    """Return one output-geometry ``(Y,X)`` slice for an NRRD layer without materializing the full layer."""
+    in_t, in_h, in_w = (int(src.shape[0]), int(src.shape[1]), int(src.shape[2]))
+    out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
+    out_z_i = int(np.clip(int(out_z), 0, out_t - 1))
+
+    if (in_t, in_h, in_w) == (out_t, out_h, out_w):
+        return np.asarray(src[out_z_i], dtype=np.uint8)
+
+    source_indices = _restore_source_indices_for_output_z(in_t, out_t, out_z_i)
+    if in_h == out_h and in_w == out_w:
+        if len(source_indices) == 1:
+            return np.asarray(src[int(source_indices[0])], dtype=np.uint8)
+        restored = np.zeros((out_h, out_w), dtype=np.uint8)
+        for src_idx in source_indices:
+            restored |= (np.asarray(src[int(src_idx)], dtype=np.uint8) > 0).astype(np.uint8, copy=False)
+        return restored
+
+    restored = np.zeros((out_h, out_w), dtype=np.uint8)
+    for src_idx in source_indices:
+        restored |= _resize_binary_mask_frame_to_output_shape(src[int(src_idx)], out_h, out_w)
+    return restored
+
+
+def _read_layer_row_block_in_output_shape(
+    src: np.ndarray,
+    output_shape: Tuple[int, int, int],
+    out_z: int,
+    y0: int,
+    y1: int,
+) -> np.ndarray:
+    """Return a ``(rows,X)`` block in final output geometry for streaming NRRD writes."""
+    in_t, in_h, in_w = (int(src.shape[0]), int(src.shape[1]), int(src.shape[2]))
+    out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
+    y0_i = int(np.clip(int(y0), 0, out_h))
+    y1_i = int(np.clip(int(y1), y0_i, out_h))
+    out_z_i = int(np.clip(int(out_z), 0, out_t - 1))
+
+    if (in_t, in_h, in_w) == (out_t, out_h, out_w):
+        return np.asarray(src[out_z_i, y0_i:y1_i, :], dtype=np.uint8)
+
+    source_indices = _restore_source_indices_for_output_z(in_t, out_t, out_z_i)
+    if in_h == out_h and in_w == out_w:
+        if len(source_indices) == 1:
+            return np.asarray(src[int(source_indices[0]), y0_i:y1_i, :], dtype=np.uint8)
+        restored = np.zeros((y1_i - y0_i, out_w), dtype=np.uint8)
+        for src_idx in source_indices:
+            restored |= (np.asarray(src[int(src_idx), y0_i:y1_i, :], dtype=np.uint8) > 0).astype(np.uint8, copy=False)
+        return restored
+
+    # Rare fallback for XY geometry changes.  Keep the code simple and still bounded: one
+    # full output slice is materialized for one layer at a time, not for every layer.
+    return _read_layer_slice_in_output_shape(src, output_shape, out_z_i)[y0_i:y1_i, :]
+
+
+def _compute_segment_extent_for_layer_ref(
+    ref: NrrdLayerRef,
+    output_shape: Tuple[int, int, int],
+) -> Tuple[int, int, int, int, int, int]:
+    src = _open_nrrd_layer_ref(ref)
+    try:
+        if tuple(int(x) for x in ref.shape) == tuple(int(x) for x in output_shape):
+            return compute_segment_extent_zyx(src)
+
+        out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
+        min_t, max_t = out_t, -1
+        min_y, max_y = out_h, -1
+        min_x, max_x = out_w, -1
+        for z in range(out_t):
+            sl = np.asarray(_read_layer_slice_in_output_shape(src, output_shape, int(z)), dtype=bool)
+            if not np.any(sl):
+                continue
+            row_has_fg = np.any(sl, axis=1)
+            col_has_fg = np.any(sl, axis=0)
+            ys = np.flatnonzero(row_has_fg)
+            xs = np.flatnonzero(col_has_fg)
+            if xs.size <= 0 or ys.size <= 0:
+                continue
+            min_t = min(min_t, int(z))
+            max_t = max(max_t, int(z))
+            min_y = min(min_y, int(ys[0]))
+            max_y = max(max_y, int(ys[-1]))
+            min_x = min(min_x, int(xs[0]))
+            max_x = max(max_x, int(xs[-1]))
+
+        if max_t < 0:
+            return _nrrd_empty_segment_extent()
+        return (int(min_x), int(max_x), int(min_y), int(max_y), int(min_t), int(max_t))
+    finally:
+        _madvise_array_mmap(src, 'MADV_DONTNEED')
+        close_memmap_array(src)
+
+
+def _write_decomposed_nrrd_payload_stream(
+    effective_refs: Sequence[NrrdLayerRef],
+    output_shape: Tuple[int, int, int],
+    gz: gzip.GzipFile,
+) -> None:
+    """Stream decomposed ``(layer,X,Y,t)`` gzip payload in NRRD Fortran axis order.
+
+    This is the core RAM-reduction change for v10.0.1 updates.  The old implementation built a
+    full ``(layer,X,Y,t)`` memmap and then handed it to pynrrd; OS page cache plus writer-side
+    traversal could push peak resident memory past the SLURM allocation.  This path keeps only a
+    bounded ``(layer,X,row_chunk)`` buffer plus one source row block/slice at a time.
+    """
+    out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
+    layer_count = int(len(effective_refs))
+    chunk_rows = _nrrd_stream_chunk_rows(layer_count, out_w, out_h)
+    buffer_bytes = int(layer_count) * int(out_w) * int(chunk_rows)
+    print(
+        f'NRRD streaming decomposed payload: layers={layer_count}, shape=(layer,X,Y,t)='
+        f'({layer_count},{out_w},{out_h},{out_t}), row_chunk={chunk_rows}, '
+        f'buffer~{buffer_bytes / GIB:.3f} GiB, gzip_level={nrrd_gzip_compresslevel()}'
+    )
+
+    opened: List[np.memmap] = []
+    try:
+        for ref in effective_refs:
+            src = _open_nrrd_layer_ref(ref)
+            _madvise_array_mmap(src, 'MADV_SEQUENTIAL')
+            opened.append(src)
+
+        madvise_interval = nrrd_madvise_dontneed_interval()
+        max_block = np.empty((layer_count, out_w, chunk_rows), dtype=np.uint8, order='F')
+        for z in tqdm(range(out_t), desc='NRRD streaming: decomposed layers'):
+            for y0 in range(0, out_h, chunk_rows):
+                y1 = min(out_h, y0 + chunk_rows)
+                rows = int(y1 - y0)
+                block = max_block[:, :, :rows]
+                for layer_idx, src in enumerate(opened):
+                    row_block_yx = _read_layer_row_block_in_output_shape(
+                        src,
+                        output_shape,
+                        int(z),
+                        int(y0),
+                        int(y1),
+                    )
+                    block[int(layer_idx), :, :] = np.asarray(row_block_yx, dtype=np.uint8).T
+                gz.write(block.tobytes(order='F'))
+            if madvise_interval > 0 and ((int(z) + 1) % int(madvise_interval) == 0):
+                for src in opened:
+                    _madvise_array_mmap(src, 'MADV_DONTNEED')
+    finally:
+        for src in opened:
+            _madvise_array_mmap(src, 'MADV_DONTNEED')
+            close_memmap_array(src)
+
+
+def _write_decomposed_nrrd_manifest(
+    *,
+    out_path: Path,
+    output_shape: Tuple[int, int, int],
+    effective_refs: Sequence[NrrdLayerRef],
+) -> None:
+    manifest = {
+        'nrrd_path': str(out_path),
+        'axis_order': '(layer, X, Y, t)',
+        'internal_layer_order': '(t, Y, X)',
+        'output_shape_tyx': [int(output_shape[0]), int(output_shape[1]), int(output_shape[2])],
+        'layer_count': int(len(effective_refs)),
+        'layers': [
+            {
+                'index': int(idx),
+                'key': ref.key,
+                'name': ref.name,
+                'model_name': ref.model_name,
+                'view_name': ref.view_name,
+                'view_family': ref.view_family,
+                'source': ref.source,
+                'mask_kind': ref.mask_kind,
+                'pass_index': int(ref.pass_index),
+                'tile_acceptance': ref.tile_acceptance,
+                'stage': ref.stage,
+                'description': ref.description,
+                'backing_shape_tyx': [int(ref.shape[0]), int(ref.shape[1]), int(ref.shape[2])],
+            }
+            for idx, ref in enumerate(effective_refs)
+        ],
+        'notes': [
+            'YOLO layers are cleaned masks before interpolation bridges.',
+            'Bridge layers contain voxels added by the corresponding interpolation pass only.',
+            'Tile components intersecting both parent YOLO support and parent bridge support are assigned to parent_mask to keep categories mutually exclusive.',
+            'Consolidated tile bridge layers are not attributed back to parent_mask vs parent_bridge acceptance because interpolation occurs after accepted tile masks are unioned.',
+            'The final_output layer is included for direct comparison and can be ignored when recomposing a custom volume from component layers.',
+            'NRRD payload was written by the bounded-memory streaming writer; no full 4D decomposed payload was materialized.',
+        ],
+    }
+    manifest_path = out_path.with_suffix(out_path.suffix + '.manifest.json')
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+
+
 def write_decomposed_nrrd(
     layer_refs: Sequence[NrrdLayerRef],
     final_mask_u8: np.ndarray,
@@ -8739,16 +9139,11 @@ def write_decomposed_nrrd(
     """Write a multi-layer NRRD whose leading axis decomposes the final segmentation.
 
     Each supplied layer is an orthogonal ``(t,Y,X)`` binary mask in processing geometry.  Layers are
-    restored to the final output geometry when cubic resizing changed the working shape, then written
-    as a 4D payload ordered ``(layer, X, Y, t)``.  A sidecar ``*.manifest.json`` is written next to the
-    NRRD so downstream tools can reconstruct unions without parsing NRRD custom fields.
+    restored to the final output geometry on the fly when cubic resizing changed the working shape,
+    then streamed as a gzip-compressed 4D payload ordered ``(layer, X, Y, t)``.  A sidecar
+    ``*.manifest.json`` is written next to the NRRD so downstream tools can reconstruct unions
+    without parsing NRRD custom fields.
     """
-    try:
-        import inspect
-        import nrrd  # type: ignore
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError('pynrrd is required for --save_nrrd: pip install pynrrd') from exc
-
     out_path.parent.mkdir(parents=True, exist_ok=True)
     output_shape = tuple(int(x) for x in np.asarray(final_mask_u8).shape)
     if len(output_shape) != 3:
@@ -8804,115 +9199,47 @@ def write_decomposed_nrrd(
     if not effective_refs:
         return write_nrrd(final_mask_u8, out_path)
 
-    payload_shape = (len(effective_refs), int(output_shape[2]), int(output_shape[1]), int(output_shape[0]))
-    payload_path = temp_dir / 'nrrd_payload' / f'{out_path.stem}.decomposed_payload.u8.dat'
-    payload_path.parent.mkdir(parents=True, exist_ok=True)
-    if payload_path.exists():
-        payload_path.unlink()
-    payload = np.memmap(payload_path, dtype=np.uint8, mode='w+', shape=payload_shape, order='F')
+    estimated_old_payload_bytes = (
+        int(len(effective_refs)) * int(output_shape[2]) * int(output_shape[1]) * int(output_shape[0])
+    )
+    bounded_buffer_bytes = int(len(effective_refs)) * int(output_shape[2]) * _nrrd_stream_chunk_rows(
+        int(len(effective_refs)),
+        int(output_shape[2]),
+        int(output_shape[1]),
+    )
+    print(
+        'Decomposed NRRD export is using the bounded streaming writer. '
+        f'A full 4D uint8 payload would be ~{estimated_old_payload_bytes / GIB:.1f} GiB; '
+        f'the streaming payload buffer is ~{bounded_buffer_bytes / GIB:.3f} GiB.'
+    )
 
-    restored_paths: List[Path] = []
-    restored_arrays: List[np.ndarray] = []
     layer_extents: List[Tuple[int, int, int, int, int, int]] = []
-    try:
-        for layer_idx, ref in enumerate(effective_refs):
-            src = _open_nrrd_layer_ref(ref)
-            layer_src: np.ndarray = src
-            try:
-                if tuple(int(x) for x in ref.shape) != output_shape:
-                    restored_path = temp_dir / 'nrrd_layers_restored' / f'{int(layer_idx):04d}_{ref.key}.u8.dat'
-                    layer_src = restore_mask_volume_to_original_shape(
-                        src,
-                        output_shape,
-                        restored_path,
-                        workers=int(workers),
-                        prefer_memory=False,
-                    )
-                    restored_paths.append(restored_path)
-                    restored_arrays.append(layer_src)
-                layer_extents.append(compute_segment_extent_zyx(layer_src))
-                _fill_decomposed_payload_layer_from_zyx(
-                    payload,
-                    int(layer_idx),
-                    layer_src,
-                    workers=int(workers),
-                    desc=f'Fill decomposed NRRD layer {int(layer_idx)} {ref.key}',
-                )
-            finally:
-                close_memmap_array(src)
-        flush_array(payload)
+    for ref in tqdm(effective_refs, desc='NRRD streaming: segment extents'):
+        layer_extents.append(_compute_segment_extent_for_layer_ref(ref, output_shape))
 
-        header = nrrd_decomposed_header(
-            output_shape_zyx=output_shape,
-            layer_refs=effective_refs,
-            layer_extents=layer_extents,
+    header = nrrd_decomposed_header(
+        output_shape_zyx=output_shape,
+        layer_refs=effective_refs,
+        layer_extents=layer_extents,
+    )
+
+    with open(out_path, 'wb') as fh:
+        _write_nrrd_ascii_header(
+            fh,
+            header=header,
+            sizes=(len(effective_refs), int(output_shape[2]), int(output_shape[1]), int(output_shape[0])),
+            dimension=4,
+            data_type='uint8',
+            encoding='gzip',
         )
-        kwargs: Dict[str, object] = {'header': header}
-        try:
-            if 'index_order' in inspect.signature(nrrd.write).parameters:
-                kwargs['index_order'] = 'F'
-        except Exception:
-            pass
-        try:
-            _write_nrrd_matrix_space_directions(nrrd, out_path, payload, kwargs)
-        except Exception as exc:
-            # Some pynrrd versions are strict about non-spatial list-axis space directions.
-            # Retry with custom metadata intact but without the problematic field.
-            header_retry = dict(header)
-            header_retry.pop('space directions', None)
-            header_retry['content'] = str(header_retry.get('content', '')) + '; space_directions_omitted_after_writer_retry'
-            kwargs['header'] = header_retry
-            print(f'Warning: decomposed NRRD write retried without space directions after: {exc}')
-            _write_nrrd_matrix_space_directions(nrrd, out_path, payload, kwargs)
-    finally:
-        flush_array(payload)
-        close_memmap_array(payload)
-        for arr in restored_arrays:
-            close_memmap_array(arr)
-        for rp in restored_paths:
-            try:
-                rp.unlink(missing_ok=True)
-            except Exception:
-                pass
+        with _open_gzip_payload_writer(fh) as gz:
+            _write_decomposed_nrrd_payload_stream(effective_refs, output_shape, gz)
 
-    manifest = {
-        'nrrd_path': str(out_path),
-        'axis_order': '(layer, X, Y, t)',
-        'internal_layer_order': '(t, Y, X)',
-        'output_shape_tyx': [int(output_shape[0]), int(output_shape[1]), int(output_shape[2])],
-        'layer_count': int(len(effective_refs)),
-        'layers': [
-            {
-                'index': int(idx),
-                'key': ref.key,
-                'name': ref.name,
-                'model_name': ref.model_name,
-                'view_name': ref.view_name,
-                'view_family': ref.view_family,
-                'source': ref.source,
-                'mask_kind': ref.mask_kind,
-                'pass_index': int(ref.pass_index),
-                'tile_acceptance': ref.tile_acceptance,
-                'stage': ref.stage,
-                'description': ref.description,
-                'backing_shape_tyx': [int(ref.shape[0]), int(ref.shape[1]), int(ref.shape[2])],
-            }
-            for idx, ref in enumerate(effective_refs)
-        ],
-        'notes': [
-            'YOLO layers are cleaned masks before interpolation bridges.',
-            'Bridge layers contain voxels added by the corresponding interpolation pass only.',
-            'Tile components intersecting both parent YOLO support and parent bridge support are assigned to parent_mask to keep categories mutually exclusive.',
-            'Consolidated tile bridge layers are not attributed back to parent_mask vs parent_bridge acceptance because interpolation occurs after accepted tile masks are unioned.',
-            'The final_output layer is included for direct comparison and can be ignored when recomposing a custom volume from component layers.',
-        ],
-    }
-    manifest_path = out_path.with_suffix(out_path.suffix + '.manifest.json')
-    manifest_path.write_text(json.dumps(manifest, indent=2))
-    try:
-        payload_path.unlink(missing_ok=True)
-    except Exception:
-        pass
+    _write_decomposed_nrrd_manifest(
+        out_path=out_path,
+        output_shape=output_shape,
+        effective_refs=effective_refs,
+    )
     return out_path
 
 
@@ -10133,6 +10460,9 @@ def main() -> None:
         'NRRD export is decomposed by default in v10.0.1: layers are written on a leading list axis as '
         '(layer,X,Y,t), with manifest JSON and SegmentN metadata for view, source, YOLO-vs-bridge, '
         'tile acceptance category, pre-smoothing union, smoothing pass results, and final output. '
+        'The NRRD payload is now gzip-streamed directly from backing layers with a bounded row buffer '
+        'instead of materializing the full 4D decomposed payload; tune YOLO_TTA_NRRD_STREAM_BUFFER_MIB '
+        'and YOLO_TTA_NRRD_GZIP_LEVEL if needed. '
         f'Legacy single-volume NRRD writing is retained only for troubleshooting pass outputs without layer refs; space={NRRD_SPACE}.'
     )
     if cpu_retina_masks_enabled():
