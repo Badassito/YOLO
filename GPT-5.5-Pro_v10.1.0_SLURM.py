@@ -2,7 +2,7 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v10.0.1_SLURM single-channel-aligned script:
+This v10.1.0_SLURM single-channel-aligned script:
   - builds Transverse, optional Tilted Transverse, independently optional Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - renders parent/full-frame videos directly from the native view transform so inference no longer waits on
     a separately rendered canvas video, and derives non-radial tile videos from shared canvas batches so the
@@ -28,10 +28,11 @@ This v10.0.1_SLURM single-channel-aligned script:
     and --gaussian_smoothing_passes > 1 enables it with the default sigma when no sigma is provided
   - supports Radial and Tilted Transverse view-native interpolation, and keeps Tilted Transverse frame N centered on native slice N with black-padded out-of-bounds shear samples
   - resizes the working volume to an approximately cubic orthogonal volume when needed, restores the final mask to the original input dimensions for default outputs,
-    and saves the transverse default color overlay plus optional labels, bilevel compressed TIFF binary masks, binary MKVs, decomposed multi-layer NRRD, sagittal, coronal, radial,
-    tilted-transverse, image-sequence, low-quality, and TTA outputs, with FFV1 used for spec-required MKVs
+    and saves the transverse default color overlay plus optional labels, bilevel compressed TIFF binary masks, binary MKVs,
+    decomposed multi-layer NRRD, active-view image sequences, optional skeleton NRRDs/layers, and isotropically downsampled
+    low-quality presentation outputs, with FFV1 used for spec-required MKVs
   - writes the default NRRD as independently toggleable layers for full-frame YOLO masks, interpolation bridges, tiled masks accepted by parent YOLO masks,
-    tiled masks accepted by parent bridges, consolidated tile bridges, the pre-smoothing global union, smoothing-pass results, and the final output layer
+    tiled masks accepted by parent bridges, consolidated tile bridges, the pre-smoothing global union, smoothing-pass results, optional skeleton, and the final output layer
   - streams NRRD gzip payloads directly from per-layer backing arrays without materializing a full 4D decomposed payload, reducing peak RAM and scratch pressure during final NRRD creation
 
 Dependencies (Python):
@@ -131,6 +132,22 @@ def _parse_int_list(values: Sequence[str] | str | int | None) -> List[int]:
     return [int(p) for p in parts]
 
 
+def _parse_float_list(values: Sequence[str] | str | float | int | None) -> List[float]:
+    """Accept comma and/or whitespace separated floating point lists."""
+    if values is None:
+        return []
+    if isinstance(values, (int, float)):
+        return [float(values)]
+    raw_values = [values] if isinstance(values, str) else [str(v) for v in values]
+    parts: List[str] = []
+    for raw in raw_values:
+        raw = str(raw).strip()
+        if not raw:
+            continue
+        parts.extend([p for p in re.split(r"[,\s]+", raw) if p])
+    return [float(p) for p in parts]
+
+
 def _parse_token_list(values: Sequence[str] | str | None) -> List[str]:
     """Accept comma and/or whitespace separated string tokens."""
     if values is None:
@@ -208,7 +225,6 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Enable Sagittal (X,t) Cartesian views in addition to the required Transverse view")
     p.add_argument("--enable_coronal", action="store_true",
                    help="Enable Coronal (Y,t) Cartesian views in addition to the required Transverse view")
-    p.add_argument("--enable_multiplanar", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--disable_transverse", action="store_true",
                    help="Skip standard Transverse full-frame and tiled inferencing only; Transverse output geometry remains available")
     p.add_argument("--enable_radial", action="store_true", help="Enable Radial views")
@@ -227,23 +243,16 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--save_images", action="store_true", help="Save unlabeled image sequences for all active views")
     p.add_argument("--save_labels", nargs="?", const="__DEFAULT__", default=None, type=str,
                    help="Save final YOLO segmentation labels per frame. Optional custom pattern, e.g. labels/{Filename}_%%04d.txt")
-    p.add_argument("--save_TTA", action="store_true",
-                   help="Save the rotated augmentation videos together with the final labels mapped to each augmentation")
     p.add_argument("--save_binary", nargs="?", const="__DEFAULT__", default=None, type=str,
                    help="Save final binary masks as a TIFF sequence plus an FFV1 MKV. Optional custom TIFF pattern, e.g. binary_masks/{Filename}_Binary_%%04d.tiff")
     p.add_argument("--save_nrrd", action="store_true", help="Save a decomposed multi-layer NRRD plus manifest JSON; troubleshooting pass outputs without layer refs fall back to a single binary NRRD")
-    p.add_argument("--save_sagittal", action="store_true",
-                   help="Save additional Sagittal outputs. If Sagittal inference is disabled, reslice the final unified volume for saving only")
-    p.add_argument("--save_coronal", action="store_true",
-                   help="Save additional Coronal outputs. If Coronal inference is disabled, reslice the final unified volume for saving only")
-    p.add_argument("--save_multiplanar", action="store_true", help=argparse.SUPPRESS)
-    p.add_argument("--save_radial", action="store_true",
-                   help="Save additional Radial outputs. A warning is emitted and nothing is saved when radial views are disabled")
-    p.add_argument("--save_tilted_transverse", action="store_true",
-                   help="Save additional Tilted Transverse outputs. Filenames encode the direction and signed tilt angle. A warning is emitted and nothing is saved when --tilt_angle is 0")
+    p.add_argument("--save_skeleton", action="store_true",
+                   help="Compute a 3D skeleton after final postprocessing. With --save_nrrd, add it as a decomposed layer; otherwise write a skeleton-only NRRD")
     p.add_argument("--save_low_quality", action="store_true",
-                   help="Save additional low-quality presentation copies using libx264, preset slow, yuv420p, and a 1024px maximum dimension")
-    p.add_argument("--voxel_volume", action="store_true", help="Count white voxels in the final binary output and save the value to the summary text file")
+                   help="Save additional isotropically downsampled low-quality presentation videos and NRRDs using libx264, preset slow, yuv420p")
+    p.add_argument("--save_low_quality_downbin", nargs="+", default=None, type=str,
+                   help="One or more isotropic low-quality downbins. Floats scale each X/Y/t dimension, e.g. 0.5. Integers scale the largest dimension to that value. Providing this flag implies --save_low_quality")
+    p.add_argument("--voxel_volume", action="store_true", help="Count white voxels in the final binary output after restoration to native input geometry and save the value to the summary text file")
     p.add_argument("--enable_3d_void_fill", action="store_true",
                    help="Apply one final 3D enclosed-void fill after the global union. Disabled by default")
     p.add_argument("--gaussian_smoothing", nargs="?", const=3.0, default=None, type=float, metavar="SIGMA",
@@ -356,7 +365,7 @@ def _cpu_count() -> int:
 def default_worker_budget() -> int:
     """Intentional CPU oversubscription for mixed GPU/IO/CPU workloads.
 
-    The v9.5.0 SLURM target has enough CPU headroom that running roughly 2x the visible CPU count
+    The v10.1.0 SLURM target has enough CPU headroom that running roughly 2x the visible CPU count
     helps keep ffmpeg, view rendering, interpolation planning, and output writers busy while the GPU
     is inferencing or waiting on a different stage.
     """
@@ -918,7 +927,7 @@ def compute_cube_resize_shape(
 ) -> Tuple[int, int, int]:
     """Return the minimal processing shape whose dimensions are within tolerance of the longest axis.
 
-    v9.5.0 requires the orthogonal working volume to be approximately cubic.  The implementation
+    v10.1.0 requires the orthogonal working volume to be approximately cubic.  The implementation
     preserves any axis that is already within the tolerated band and upsamples shorter axes only
     enough to reach ``(1 - tolerance) * longest``.  This avoids unnecessary XY resampling for the
     common 3072x3072x1930 case while still satisfying the 5% cube constraint.
@@ -975,7 +984,7 @@ def resize_volume_to_processing_cube_gray8(
     prefer_memory: bool = True,
     reserve_bytes: int = 32 * GIB,
 ) -> np.ndarray:
-    """Resample a gray8 (t,Y,X) volume to the v9.5.0 approximately-cubic processing shape."""
+    """Resample a gray8 (t,Y,X) volume to the v10.1.0 approximately-cubic processing shape."""
     in_t, in_h, in_w = (int(volume_gray.shape[0]), int(volume_gray.shape[1]), int(volume_gray.shape[2]))
     out_t, out_h, out_w = (int(out_shape[0]), int(out_shape[1]), int(out_shape[2]))
     if (in_t, in_h, in_w) == (out_t, out_h, out_w):
@@ -985,7 +994,7 @@ def resize_volume_to_processing_cube_gray8(
         shape=(out_t, out_h, out_w),
         dtype=np.uint8,
         path=out_path,
-        desc='v9.5.0 cubic processing volume',
+        desc='v10.1.0 cubic processing volume',
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
     )
@@ -1015,7 +1024,7 @@ def resize_volume_to_processing_cube_gray8(
         int(out_t),
         _render_target_slice,
         max_workers=worker_count,
-        desc='Resizing orthogonal volume to v9.5.0 cube',
+        desc='Resizing orthogonal volume to v10.1.0 cube',
         chunk_size=chunk_size,
     )
     flush_array(out_mm)
@@ -1093,7 +1102,7 @@ def resolve_radial_azimuth_angle(
     enable_radial: bool,
     diameter: int,
 ) -> float:
-    """Resolve v9.5.0 radial activation and default full-coverage angle."""
+    """Resolve v10.1.0 radial activation and default full-coverage angle."""
     if requested_angle is not None:
         if float(requested_angle) <= 0.0:
             return 0.0
@@ -1412,7 +1421,7 @@ def compute_tilt_frame_range(
 ) -> Tuple[int, int]:
     """Return the legacy expanded tilted-frame range for diagnostic callers.
 
-    The v9.5.0 pipeline itself keeps Tilted Transverse frame counts equal to the native
+    The v10.1.0 pipeline itself keeps Tilted Transverse frame counts equal to the native
     transverse frame count and fills out-of-bounds shear samples with black.
     """
     t_dim_i = int(t_dim)
@@ -1472,7 +1481,7 @@ def get_view_infos(
     enable_sagittal: bool = False,
     enable_coronal: bool = False,
 ) -> List[ViewInfo]:
-    # Backward-compatible alias for older command lines; v9.5.0 controls Sagittal and
+    # Backward-compatible alias for older command lines; v10.1.0 controls Sagittal and
     # Coronal independently via --enable_sagittal and --enable_coronal.
     if disable_multiplanar is not None:
         enable_sagittal = bool(enable_sagittal or (not bool(disable_multiplanar)))
@@ -1529,7 +1538,7 @@ def get_view_infos(
             for sign in (+1.0, -1.0):
                 signed_angle = float(sign * tilt_angle)
                 token = _format_signed_angle_token(signed_angle)
-                # v9.5.0 keeps Tilted Transverse on the native Transverse frame count:
+                # v10.1.0 keeps Tilted Transverse on the native Transverse frame count:
                 # output frame N is centered on native slice N, with out-of-bounds shear samples
                 # at the start/end filled black.
                 tilt_frame_start, tilt_frame_stop = 0, int(T) - 1
@@ -3080,7 +3089,7 @@ def resolve_gaussian_smoothing_settings(
     gaussian_smoothing_arg: Optional[float],
     gaussian_smoothing_passes: int,
 ) -> Tuple[bool, float, int]:
-    """Resolve Gaussian smoothing enablement from the v10.0.1 CLI contract.
+    """Resolve Gaussian smoothing enablement from the v10.1.0 CLI contract.
 
     Contract:
       - no --gaussian_smoothing and the default --gaussian_smoothing_passes 1 => disabled
@@ -4618,7 +4627,7 @@ def fill_3d_voids_inplace_streaming(
 ) -> None:
     """Fill enclosed 3D voids by labeling background connected components once.
 
-    v9.5.0 allows 3D void fill only as an optional final global-union step. This
+    v10.1.0 allows 3D void fill only as an optional final global-union step. This
     function performs that operation by labeling the background volume, marking any
     background component connected to the volume boundary, and converting all other
     background components to foreground. The default 6-connected background matches
@@ -4900,8 +4909,6 @@ def build_slice_endpoint_seeds_from_label_volume(
     if z_dim <= 0:
         return [], 0
 
-    kernel2 = np.ones((3, 3), dtype=np.uint8)
-
     def _scan_slice(z: int) -> List[SliceEndpointSeed]:
         curr_slice = np.asarray(labels_real[int(z)])
         if not np.any(curr_slice):
@@ -4937,9 +4944,10 @@ def build_slice_endpoint_seeds_from_label_volume(
                 if anchor is None:
                     continue
 
-                dil = cv2.dilate(comp.astype(np.uint8, copy=False), kernel2, iterations=1) > 0
-                has_prev = bool(prev_same is not None and np.any(dil & prev_same))
-                has_next = bool(next_same is not None and np.any(dil & next_same))
+                # v10.1.0 endpoint continuation is defined by direct footprint overlap in
+                # the adjacent slice; do not dilate/skeletonize the component for endpoint discovery.
+                has_prev = bool(prev_same is not None and np.any(comp & prev_same))
+                has_next = bool(next_same is not None and np.any(comp & next_same))
 
                 if not has_prev:
                     seeds_local.append(SliceEndpointSeed(
@@ -5058,7 +5066,7 @@ _DENSE_RADIAL_BACKPROJECT_MAP_CACHE: Dict[Tuple[int, int, int, Tuple[Tuple[float
 
 
 def radial_full_coverage_angle_deg(diameter: int) -> float:
-    """Return the v9.5.0 radial spacing that gives approximately 1x ROI edge coverage."""
+    """Return the v10.1.0 radial spacing that gives approximately 1x ROI edge coverage."""
     diameter_i = max(1, int(diameter))
     return float(360.0 / (math.pi * float(diameter_i)))
 
@@ -5092,7 +5100,7 @@ def _nearest_radial_source_for_backprojection(
 def build_radial_backprojection_plan(radial_view: ViewInfo) -> Tuple[List[RadialBackprojectionSample], Dict[str, float]]:
     """Build the angular plan used to backproject a radial view into Cartesian space.
 
-    If the user-requested radial spacing is coarser than the v9.5.0 full-coverage spacing,
+    If the user-requested radial spacing is coarser than the v10.1.0 full-coverage spacing,
     backprojection is densified to the full-coverage spacing and each dense angle samples the
     nearest completed radial prediction frame. This keeps Radial masks view-native through
     postprocessing/interpolation while preventing sparse spoke-like Cartesian backprojections.
@@ -5152,7 +5160,7 @@ def build_dense_radial_backprojection_map(
 ) -> DenseRadialBackprojectionMap:
     """Map every Cartesian ROI pixel to its nearest dense radial source frame and radial coordinate.
 
-    This is the dense v9.5.0 backprojection path: instead of painting only the pixels that lie on
+    This is the dense v10.1.0 backprojection path: instead of painting only the pixels that lie on
     a set of spokes, every pixel inside the circular ROI receives a sample from the Radial video's
     own frame/raster coordinate system.  When the user-provided azimuth spacing is too coarse, the
     supplied ``plan`` is already densified to the full-coverage angular spacing; pixels then select
@@ -5479,11 +5487,11 @@ def assemble_current_view_union_volume(
     """Build the single-model final view union.
 
     The mapping is kept keyed by model name because earlier pipeline stages store temporary
-    workspaces under the model stem. v9.5.0 rejects multiple model entries and never
+    workspaces under the model stem. v10.1.0 rejects multiple model entries and never
     combines outputs from more than one model.
     """
     if len(view_volumes_by_model) != 1:
-        raise ValueError('v10.0.1_SLURM supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('v10.1.0_SLURM supports exactly one --model; multiple-model inference has been removed')
 
     model_name = next(iter(view_volumes_by_model.keys()))
     final_union_mm = allocate_workspace_array(
@@ -5680,30 +5688,8 @@ def assemble_final_union_after_view_union(
 
 
 # --------------------------
-# Skeleton-based interpolation (optional)
+# Optional skeleton output + scan-based interpolation helpers
 # --------------------------
-
-
-def _neighbors26() -> List[Tuple[int, int, int]]:
-    out = []
-    for dz in (-1, 0, 1):
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                if dz == 0 and dy == 0 and dx == 0:
-                    continue
-                out.append((dz, dy, dx))
-    return out
-
-
-NEIGH26 = _neighbors26()
-KERNEL_3 = np.ones((3, 3, 3), dtype=np.uint8)
-STRUCTURE26 = np.ones((3, 3, 3), dtype=bool)
-
-
-
-
-
-
 
 
 def skeletonize_volume(mask_bool: np.ndarray) -> np.ndarray:
@@ -5726,59 +5712,33 @@ def skeletonize_volume(mask_bool: np.ndarray) -> np.ndarray:
     return np.asarray(_skimage_skeletonize(arr), dtype=bool)
 
 
-def _skeleton_neighbors(skel: np.ndarray, p: Tuple[int, int, int]) -> List[Tuple[int, int, int]]:
-    z, y, x = p
-    out: List[Tuple[int, int, int]] = []
-    for dz, dy, dx in NEIGH26:
-        zz, yy, xx = z + dz, y + dy, x + dx
-        if 0 <= zz < skel.shape[0] and 0 <= yy < skel.shape[1] and 0 <= xx < skel.shape[2]:
-            if skel[zz, yy, xx]:
-                out.append((zz, yy, xx))
-    return out
+def compute_skeleton_volume_to_workspace(
+    mask_u8: np.ndarray,
+    out_path: Path,
+    *,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 16 * GIB,
+) -> np.ndarray:
+    """Compute an optional 3D skeleton as a postprocessing output layer.
 
-
-def _trace_inward_path(
-    skel: np.ndarray,
-    endpoint: Tuple[int, int, int],
-    max_steps: int,
-) -> List[Tuple[int, int, int]]:
+    This is intentionally independent from interpolation. Interpolation endpoint seeds are
+    discovered by per-slice connected-component scanning; this function runs only when
+    --save_skeleton is requested.
     """
-    Trace inward from a skeleton endpoint to estimate the local tangent, preferring smooth continuation
-    if the walk reaches a bifurcation.
-    """
-    path = [endpoint]
-    prev: Optional[Tuple[int, int, int]] = None
-    cur = endpoint
-
-    for _ in range(max_steps):
-        nbs = _skeleton_neighbors(skel, cur)
-        if prev is not None:
-            nbs = [n for n in nbs if n != prev]
-        if not nbs:
-            break
-        if len(nbs) == 1 or prev is None:
-            nxt = nbs[0]
-        else:
-            prev_vec = np.asarray(cur, dtype=np.float32) - np.asarray(prev, dtype=np.float32)
-            prev_norm = float(np.linalg.norm(prev_vec))
-            if prev_norm <= 0:
-                nxt = nbs[0]
-            else:
-                prev_vec /= prev_norm
-
-                def _continuation_score(n: Tuple[int, int, int]) -> float:
-                    step_vec = np.asarray(n, dtype=np.float32) - np.asarray(cur, dtype=np.float32)
-                    step_norm = float(np.linalg.norm(step_vec))
-                    if step_norm <= 0:
-                        return -1.0
-                    step_vec /= step_norm
-                    return float(np.dot(prev_vec, step_vec))
-
-                nxt = max(nbs, key=_continuation_score)
-        path.append(nxt)
-        prev, cur = cur, nxt
-
-    return path
+    shape = tuple(int(x) for x in np.asarray(mask_u8).shape)
+    out_mm = allocate_workspace_array(
+        shape=shape,
+        dtype=np.uint8,
+        path=out_path,
+        desc='Skeleton output workspace',
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
+    )
+    print('Computing optional 3D skeleton output; this is independent of interpolation endpoint discovery.')
+    skeleton_bool = skeletonize_volume(np.asarray(mask_u8, dtype=bool))
+    out_mm[:, :, :] = np.asarray(skeleton_bool, dtype=np.uint8)
+    flush_array(out_mm)
+    return out_mm
 
 
 _SPHERE_PAINT_CACHE: Dict[int, np.ndarray] = {}
@@ -6152,189 +6112,27 @@ class SliceSeedBridgePlanResult:
     plans: List[SliceBridgeRenderPlan] = field(default_factory=list)
 
 
-def _build_slice_endpoint_seeds_for_label(
-    labels_real: np.ndarray,
-    lbl: int,
-    sl: Tuple[slice, slice, slice],
-    direction_depth: int,
-) -> List[SliceEndpointSeed]:
-    sub = labels_real[sl] == int(lbl)
-    if not np.any(sub):
-        return []
-
-    grouped: Dict[Tuple[int, int, int, int, int], SliceEndpointSeed] = {}
-    slice_start = int(sl[0].start)
-    slice_stop = int(sl[0].stop) - 1
-    structure2 = np.ones((3, 3), dtype=bool)
-    slice_cache: Dict[int, Tuple[np.ndarray, Dict[int, Tuple[int, int]]]] = {}
-
-    def _slice_centroid(local_slice_idx: int, local_y: int, local_x: int) -> Optional[Tuple[int, int]]:
-        entry = slice_cache.get(int(local_slice_idx))
-        if entry is None:
-            labels2d, num = ndi.label(sub[int(local_slice_idx)], structure=structure2)
-            centroids: Dict[int, Tuple[int, int]] = {}
-            for comp_lbl in range(1, int(num) + 1):
-                cent = _component_centroid_anchor(labels2d == comp_lbl)
-                if cent is not None:
-                    centroids[int(comp_lbl)] = cent
-            entry = (labels2d, centroids)
-            slice_cache[int(local_slice_idx)] = entry
-
-        labels2d, centroids = entry
-        comp_lbl = int(labels2d[int(local_y), int(local_x)])
-        if comp_lbl <= 0:
-            return None
-        cent = centroids.get(comp_lbl)
-        if cent is not None:
-            return cent
-        return _component_centroid_anchor(labels2d == comp_lbl)
-
-    skel = skeletonize_volume(sub)
-    if np.any(skel):
-        neigh = ndi.convolve(skel.astype(np.uint8), KERNEL_3, mode='constant', cval=0) - skel.astype(np.uint8)
-        ep_coords = np.argwhere(np.logical_and(skel, neigh == 1))
-    else:
-        ep_coords = np.zeros((0, 3), dtype=np.int64)
-
-    for ep in ep_coords:
-        ep_t = (int(ep[0]), int(ep[1]), int(ep[2]))
-        path = _trace_inward_path(skel, ep_t, max_steps=direction_depth)
-        ref = path[-1] if len(path) > 1 else ep_t
-        outward = np.asarray(ep_t, dtype=np.float32) - np.asarray(ref, dtype=np.float32)
-        if float(abs(outward[0])) > 1e-6:
-            direction_sign = 1 if float(outward[0]) > 0 else -1
-        else:
-            gz = slice_start + int(ep_t[0])
-            dist_min = abs(gz - slice_start)
-            dist_max = abs(slice_stop - gz)
-            direction_sign = -1 if dist_min <= dist_max else 1
-
-        cent = _slice_centroid(int(ep_t[0]), int(ep_t[1]), int(ep_t[2]))
-        if cent is None:
-            continue
-        gpoint = (slice_start + int(ep_t[0]), int(sl[1].start) + int(ep_t[1]), int(sl[2].start) + int(ep_t[2]))
-        key = (int(lbl), int(gpoint[0]), int(direction_sign), int(cent[0]), int(cent[1]))
-        grouped[key] = SliceEndpointSeed(label=int(lbl), point=gpoint, direction_sign=int(direction_sign))
-
-    if not grouped:
-        slice_any = np.any(sub, axis=(1, 2))
-        slice_indices = np.flatnonzero(slice_any)
-        if slice_indices.size:
-            extremes: List[Tuple[int, int]] = []
-            first_local = int(slice_indices[0])
-            last_local = int(slice_indices[-1])
-            extremes.append((first_local, -1))
-            extremes.append((last_local, 1))
-
-            for local_slice_idx, direction_sign in extremes:
-                entry = slice_cache.get(int(local_slice_idx))
-                if entry is None:
-                    labels2d, num = ndi.label(sub[int(local_slice_idx)], structure=structure2)
-                    centroids: Dict[int, Tuple[int, int]] = {}
-                    for comp_lbl in range(1, int(num) + 1):
-                        cent = _component_centroid_anchor(labels2d == comp_lbl)
-                        if cent is not None:
-                            centroids[int(comp_lbl)] = cent
-                    entry = (labels2d, centroids)
-                    slice_cache[int(local_slice_idx)] = entry
-                labels2d, centroids = entry
-                num = int(np.max(labels2d))
-                for comp_lbl in range(1, num + 1):
-                    cent = centroids.get(int(comp_lbl))
-                    if cent is None:
-                        cent = _component_centroid_anchor(labels2d == comp_lbl)
-                    if cent is None:
-                        continue
-                    gpoint = (
-                        slice_start + int(local_slice_idx),
-                        int(sl[1].start) + int(cent[0]),
-                        int(sl[2].start) + int(cent[1]),
-                    )
-                    key = (int(lbl), int(gpoint[0]), int(direction_sign), int(gpoint[1]), int(gpoint[2]))
-                    grouped[key] = SliceEndpointSeed(label=int(lbl), point=gpoint, direction_sign=int(direction_sign))
-
-    return [grouped[k] for k in sorted(grouped.keys())]
-
-
 def _build_slice_endpoint_seeds(
     labels_real: np.ndarray,
     extension_slices: int,
     workers: int = 1,
     wrap_axis: bool = False,
 ) -> Tuple[List[SliceEndpointSeed], int]:
-    """Build interpolation endpoint seeds.
+    """Build interpolation endpoint seeds with the v10.1.0 per-slice component scan.
 
-    Endpoint mode is controlled by ``YOLO_TTA_INTERPOLATION_ENDPOINT_MODE``:
-      - ``hybrid`` (default): use per-object 3D skeletonization when the compact-relabel bounding box
-        is tractable, falling back to the fast slice-graph terminal scan for oversized objects
-      - ``scan``: always use the fast slice-graph terminal scan
-      - ``skeleton``: always use per-object 3D skeletonization
-
-    The hybrid path keeps 3D skeletonization as the default v9.5.0-compliant behavior while still
-    protecting large SLURM-scale volumes from pathological all-voxel skeletonization costs.
+    Interpolation no longer uses skeletonization. Each labeled 3D object is scanned slice by
+    slice; every 2D connected component is evaluated independently for overlap continuation
+    into the previous and next slice. Components without continuation become endpoint seeds in
+    the corresponding direction. Radial interpolation can wrap the slice/frame axis so frame 0
+    and the final radial frame are considered adjacent.
     """
-    mode = os.environ.get('YOLO_TTA_INTERPOLATION_ENDPOINT_MODE', 'hybrid').strip().lower()
-    if mode not in {'scan', 'hybrid', 'skeleton'}:
-        mode = 'scan'
-    if bool(wrap_axis):
-        # Skeletonizing a compact bounding box cannot represent the circular first-axis
-        # topology of Radial frame order, so use the slice-graph endpoint scan.
-        mode = 'scan'
-
-    if mode == 'scan':
-        return build_slice_endpoint_seeds_from_label_volume(
-            labels_real,
-            workers=int(workers),
-            desc='Interpolation: endpoint seeds [scan]',
-            wrap_axis=bool(wrap_axis),
-        )
-
-    objs = ndi.find_objects(labels_real)
-    tasks = [(lbl, sl) for lbl, sl in enumerate(objs, start=1) if sl is not None]
-    if not tasks:
-        return [], 0
-
-    if mode == 'hybrid':
-        max_bbox_voxels = max(
-            (int(sl[0].stop - sl[0].start) * int(sl[1].stop - sl[1].start) * int(sl[2].stop - sl[2].start) for _, sl in tasks),
-            default=0,
-        )
-        max_allowed_bbox_voxels = max(0, _env_int('YOLO_TTA_MAX_SKELETON_BBOX_VOXELS', 64 * 1024 * 1024))
-        if max_allowed_bbox_voxels > 0 and int(max_bbox_voxels) > int(max_allowed_bbox_voxels):
-            print(
-                'Interpolation endpoint discovery: switching to slice scan '
-                f'(largest compact-relabel bbox={int(max_bbox_voxels):,} voxels exceeds '
-                f'YOLO_TTA_MAX_SKELETON_BBOX_VOXELS={int(max_allowed_bbox_voxels):,})'
-            )
-            return build_slice_endpoint_seeds_from_label_volume(
-                labels_real,
-                workers=int(workers),
-                desc='Interpolation: endpoint seeds [scan]',
-                wrap_axis=bool(wrap_axis),
-            )
-
-    seeds: List[SliceEndpointSeed] = []
-    direction_depth = max(2, min(8, int(extension_slices) + 1))
-    worker_count = choose_slice_parallel_workers(int(workers), len(tasks))
-
-    def _process(idx: int) -> List[SliceEndpointSeed]:
-        lbl, sl = tasks[int(idx)]
-        return _build_slice_endpoint_seeds_for_label(labels_real, int(lbl), sl, direction_depth)
-
-    if worker_count <= 1:
-        for idx in tqdm(range(len(tasks)), desc='Interpolation: endpoint seeds [skeleton]'):
-            seeds.extend(_process(int(idx)))
-    else:
-        pending = max(worker_count, worker_count * 2)
-        for seed_group in tqdm(
-            parallel_map_in_order(_process, range(len(tasks)), max_workers=worker_count, max_pending=pending),
-            total=len(tasks),
-            desc='Interpolation: endpoint seeds [skeleton]',
-        ):
-            seeds.extend(seed_group)
-
-    seeds.sort(key=lambda s: (int(s.label), int(s.point[0]), int(s.direction_sign), int(s.point[1]), int(s.point[2])))
-    return seeds, int(len(seeds))
+    del extension_slices  # retained for call-site compatibility; scan endpoints do not need it.
+    return build_slice_endpoint_seeds_from_label_volume(
+        labels_real,
+        workers=int(workers),
+        desc='Interpolation: endpoint seeds [scan]',
+        wrap_axis=bool(wrap_axis),
+    )
 
 
 def _build_linear_slice_bridge_plan(
@@ -6549,6 +6347,7 @@ def interpolate_view_volume_pass_inplace(
             'added_voxels': 0,
             'skipped': True,
             'wrap_axis': bool(wrap_axis),
+            'endpoint_method': 'slice_component_scan',
         }
 
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -6588,6 +6387,7 @@ def interpolate_view_volume_pass_inplace(
             'added_voxels': 0,
             'skipped': int(num_objects) <= 1,
             'wrap_axis': bool(wrap_axis),
+            'endpoint_method': 'slice_component_scan',
         }
 
     worker_count = choose_slice_parallel_workers(int(workers), max(1, int(num_objects)))
@@ -6616,6 +6416,7 @@ def interpolate_view_volume_pass_inplace(
             'added_voxels': 0,
             'skipped': False,
             'wrap_axis': bool(wrap_axis),
+            'endpoint_method': 'slice_component_scan',
         }
 
     bridge_path: Optional[Path] = None
@@ -6739,6 +6540,7 @@ def interpolate_view_volume_pass_inplace(
         'added_voxels': int(added_voxels),
         'skipped': False,
         'wrap_axis': bool(wrap_axis),
+        'endpoint_method': 'slice_component_scan',
     }
 
 
@@ -6802,7 +6604,7 @@ class VolumeSnapshotRef:
 
 @dataclass(frozen=True)
 class NrrdLayerRef:
-    """One orthogonal-space layer for the decomposed v10.0.1 NRRD export.
+    """One orthogonal-space layer for the decomposed v10.1.0 NRRD export.
 
     The backing file is always a uint8 binary mask in the pipeline's orthogonal
     ``(t, Y, X)`` processing geometry.  The NRRD writer converts each layer to
@@ -7802,7 +7604,7 @@ def gate_tile_volume_into_consolidated_parent(
 ) -> TileGateResult:
     """Gate one tile volume, then OR accepted components into parent-view accumulators.
 
-    The main accumulator preserves the v10.0.1 mask-wise OR gate semantics.  Optional category
+    The main accumulator preserves the v10.1.0 mask-wise OR gate semantics.  Optional category
     accumulators are populated only for decomposed NRRD export and split accepted tile components
     into parent-YOLO-supported and parent-bridge-supported layers.
     """
@@ -8134,7 +7936,7 @@ def apply_gaussian_smoothing_inplace(
 ) -> Dict[str, int | float]:
     """Smooth the final binary 3D volume with a Gaussian kernel and re-threshold at 0.5.
 
-    The v10.0.1_SLURM smoothing stage is applied after the final view/tile union and optional
+    The v10.1.0_SLURM smoothing stage is applied after the final view/tile union and optional
     3D void fill, but before --keep_objects and before resizing back to the source geometry.
     A single float32 workspace is reused for every pass to avoid retaining multiple dense
     floating-point copies of the volume.
@@ -8675,7 +8477,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.5-Pro_v10.0.1_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.5-Pro_v10.1.0_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -9036,7 +8838,7 @@ def _write_decomposed_nrrd_payload_stream(
 ) -> None:
     """Stream decomposed ``(layer,X,Y,t)`` gzip payload in NRRD Fortran axis order.
 
-    This is the core RAM-reduction change for v10.0.1 updates.  The old implementation built a
+    This is the core RAM-reduction change for v10.1.0 updates.  The old implementation built a
     full ``(layer,X,Y,t)`` memmap and then handed it to pynrrd; OS page cache plus writer-side
     traversal could push peak resident memory past the SLURM allocation.  This path keeps only a
     bounded ``(layer,X,row_chunk)`` buffer plus one source row block/slice at a time.
@@ -9724,7 +9526,7 @@ def build_troubleshooting_pass_union(
     workers: int,
 ) -> np.ndarray:
     if len(model_names) != 1:
-        raise ValueError('v10.0.1_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
+        raise ValueError('v10.1.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     view_volumes_for_pass: Dict[str, Dict[str, np.ndarray]] = {str(model_name): {} for model_name in model_names}
     intermediate_volumes: List[np.ndarray] = []
 
@@ -9787,7 +9589,7 @@ def build_troubleshooting_pass_union(
                     view_volumes_for_pass[str(model_name)][view.name] = native_union
 
         # Troubleshooting pass outputs are stage snapshots taken before the corresponding
-        # interpolation pass. They must not run the final 3D void fill; v9.5.0 keeps
+        # interpolation pass. They must not run the final 3D void fill; v10.1.0 keeps
         # 3D void fill out of troubleshooting pre-pass outputs and applies it only when
         # --enable_3d_void_fill is active for the normal final output.
         pass_union = assemble_current_view_union_volume(
@@ -9833,7 +9635,7 @@ def schedule_troubleshooting_pass_outputs(
     workers: int,
 ) -> Dict[str, Path]:
     if len(model_names) != 1:
-        raise ValueError('v10.0.1_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
+        raise ValueError('v10.1.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     if int(total_passes) < 0 or not snapshot_refs:
         return {}
 
@@ -9924,56 +9726,359 @@ def link_or_copy_file(src: Path, dst: Path) -> Path:
     return dst
 
 
-def write_low_quality_video_copy(src: Path, dst: Path) -> Path:
-    _require_bin('ffmpeg')
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        'ffmpeg',
-        '-y',
-        '-v', 'error',
-        '-i', str(src),
-        '-vsync', '0',
-        '-an',
-        '-vf', 'scale=1024:1024:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2',
-        '-c:v', 'libx264',
-        '-preset', 'slow',
-        '-pix_fmt', 'yuv420p',
-        str(dst),
-    ]
-    subprocess.run(cmd, check=True)
-    return dst
+@dataclass(frozen=True)
+class LowQualityDownbinSpec:
+    raw_value: str
+    token: str
+    scale: float
+    output_shape_t_y_x: Tuple[int, int, int]
+    warning: str = ''
 
 
-def save_low_quality_video_copies(
-    root_dir: Path,
+def _nearest_multiple_of_four(value: float) -> int:
+    return max(4, int(math.floor(float(value) / 4.0 + 0.5)) * 4)
+
+
+def _round_low_quality_dimension(value: float) -> int:
+    # Large SLURM volumes should round to multiples of 4 per spec. For tiny synthetic
+    # tests, avoid changing a sub-4 dimension to 4 unless the scaled value warrants it.
+    value_f = max(1.0, float(value))
+    if value_f < 4.0:
+        return max(1, int(round(value_f)))
+    return _nearest_multiple_of_four(value_f)
+
+
+def _low_quality_token(raw: str, shape_t_y_x: Tuple[int, int, int]) -> str:
+    safe_raw = str(raw).strip().replace('-', 'm').replace('.', 'p').replace(',', '_')
+    t_dim, h_dim, w_dim = (int(shape_t_y_x[0]), int(shape_t_y_x[1]), int(shape_t_y_x[2]))
+    return f'{safe_raw}_{int(w_dim)}x{int(h_dim)}x{int(t_dim)}'
+
+
+def resolve_low_quality_downbin_specs(
+    downbin_values: Sequence[str] | str | None,
+    low_quality_requested: bool,
+    source_shape_t_y_x: Tuple[int, int, int],
+) -> Tuple[List[LowQualityDownbinSpec], List[str]]:
+    """Resolve v10.1.0 isotropic low-quality downbins in native input geometry."""
+    if downbin_values is None and not bool(low_quality_requested):
+        return [], []
+
+    raw_tokens = _parse_token_list(downbin_values) if downbin_values is not None else []
+    if not raw_tokens:
+        raw_tokens = ['1024']
+
+    in_t, in_h, in_w = (int(source_shape_t_y_x[0]), int(source_shape_t_y_x[1]), int(source_shape_t_y_x[2]))
+    max_dim = max(1, int(in_t), int(in_h), int(in_w))
+    specs: List[LowQualityDownbinSpec] = []
+    warnings: List[str] = []
+    seen_shapes: set[Tuple[int, int, int]] = set()
+
+    for raw in raw_tokens:
+        raw_s = str(raw).strip()
+        if not raw_s:
+            continue
+        try:
+            value = float(raw_s)
+        except Exception as exc:
+            raise ValueError(f'--save_low_quality_downbin value is not numeric: {raw_s!r}') from exc
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError('--save_low_quality_downbin values must be positive finite numbers')
+
+        warning = ''
+        raw_lower = raw_s.lower()
+        looks_float = ('.' in raw_s) or ('e' in raw_lower)
+        if looks_float and value <= 1.0:
+            scale = float(value)
+        else:
+            nearest_int = int(round(value))
+            if abs(float(value) - float(nearest_int)) > 1e-6:
+                raise ValueError('Integer --save_low_quality_downbin values >= 1 must be whole numbers; use a fraction such as 0.5 for scale factors')
+            if nearest_int <= 0:
+                raise ValueError('--save_low_quality_downbin integer targets must be positive')
+            rounded_target = _nearest_multiple_of_four(float(nearest_int))
+            if int(rounded_target) != int(nearest_int):
+                warning = (
+                    f'--save_low_quality_downbin {int(nearest_int)} is not a multiple of 4; '
+                    f'rounded to {int(rounded_target)} for isotropic low-quality output.'
+                )
+                warnings.append(warning)
+            scale = float(rounded_target) / float(max_dim)
+
+        out_t = _round_low_quality_dimension(float(in_t) * float(scale))
+        out_h = _round_low_quality_dimension(float(in_h) * float(scale))
+        out_w = _round_low_quality_dimension(float(in_w) * float(scale))
+        shape = (int(out_t), int(out_h), int(out_w))
+        if shape in seen_shapes:
+            continue
+        seen_shapes.add(shape)
+        specs.append(LowQualityDownbinSpec(
+            raw_value=raw_s,
+            token=_low_quality_token(raw_s, shape),
+            scale=float(scale),
+            output_shape_t_y_x=shape,
+            warning=warning,
+        ))
+
+    return specs, warnings
+
+
+def resize_gray_volume_to_shape(
+    volume_gray: np.ndarray,
+    out_shape: Tuple[int, int, int],
+    out_path: Path,
     *,
     workers: int = 1,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 8 * GIB,
+    desc: str = 'Resizing gray volume',
+) -> np.ndarray:
+    in_t, in_h, in_w = (int(volume_gray.shape[0]), int(volume_gray.shape[1]), int(volume_gray.shape[2]))
+    out_t, out_h, out_w = (int(out_shape[0]), int(out_shape[1]), int(out_shape[2]))
+    if (in_t, in_h, in_w) == (out_t, out_h, out_w):
+        return volume_gray
+
+    out_mm = allocate_workspace_array(
+        shape=(out_t, out_h, out_w),
+        dtype=np.uint8,
+        path=out_path,
+        desc=desc,
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
+    )
+    worker_count = choose_slice_parallel_workers(int(workers), int(out_t))
+    chunk_size = choose_parallel_chunk_size(out_t, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
+    xy_interp = cv2.INTER_AREA if (out_h <= in_h and out_w <= in_w) else cv2.INTER_LINEAR
+
+    def _render_target_slice(out_z: int) -> None:
+        src_z = _linear_source_index(int(out_z), int(out_t), int(in_t))
+        z0 = int(math.floor(src_z))
+        z1 = min(in_t - 1, z0 + 1)
+        alpha = float(src_z - float(z0))
+        f0 = _resize_gray_slice_nearest_or_linear(volume_gray[z0], out_w, out_h, xy_interp)
+        if z1 == z0 or alpha <= 1e-7:
+            out_mm[int(out_z), :, :] = f0
+            return
+        f1 = _resize_gray_slice_nearest_or_linear(volume_gray[z1], out_w, out_h, xy_interp)
+        blended = np.clip(
+            np.rint((1.0 - alpha) * f0.astype(np.float32, copy=False) + alpha * f1.astype(np.float32, copy=False)),
+            0.0,
+            255.0,
+        ).astype(np.uint8)
+        out_mm[int(out_z), :, :] = blended
+
+    parallel_for_indices_chunked(
+        int(out_t),
+        _render_target_slice,
+        max_workers=worker_count,
+        desc=desc,
+        chunk_size=chunk_size,
+        show_progress=True,
+    )
+    flush_array(out_mm)
+    return out_mm
+
+
+def resize_binary_mask_volume_to_shape(
+    mask_u8: np.ndarray,
+    out_shape: Tuple[int, int, int],
+    out_path: Path,
+    *,
+    workers: int = 1,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 8 * GIB,
+    desc: str = 'Resizing binary mask volume',
+) -> np.ndarray:
+    in_t, in_h, in_w = (int(mask_u8.shape[0]), int(mask_u8.shape[1]), int(mask_u8.shape[2]))
+    out_t, out_h, out_w = (int(out_shape[0]), int(out_shape[1]), int(out_shape[2]))
+    if (in_t, in_h, in_w) == (out_t, out_h, out_w):
+        return mask_u8
+
+    out_mm = allocate_workspace_array(
+        shape=(out_t, out_h, out_w),
+        dtype=np.uint8,
+        path=out_path,
+        desc=desc,
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
+    )
+    worker_count = choose_slice_parallel_workers(int(workers), int(out_t))
+    chunk_size = choose_parallel_chunk_size(out_t, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
+
+    def _resize_mask_xy(frame: np.ndarray) -> np.ndarray:
+        frame_u8 = (np.asarray(frame, dtype=np.uint8) > 0).astype(np.uint8, copy=False)
+        if int(frame_u8.shape[0]) == int(out_h) and int(frame_u8.shape[1]) == int(out_w):
+            return np.ascontiguousarray(frame_u8)
+        if int(out_h) <= int(frame_u8.shape[0]) and int(out_w) <= int(frame_u8.shape[1]):
+            scaled = cv2.resize(
+                np.ascontiguousarray(frame_u8 * np.uint8(255)),
+                (int(out_w), int(out_h)),
+                interpolation=cv2.INTER_AREA,
+            )
+            return (scaled > 0).astype(np.uint8, copy=False)
+        scaled = cv2.resize(
+            np.ascontiguousarray(frame_u8),
+            (int(out_w), int(out_h)),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        return (scaled > 0).astype(np.uint8, copy=False)
+
+    def _restore_slice(out_z: int) -> None:
+        src_start = int(math.floor(float(out_z) * float(in_t) / float(out_t)))
+        src_stop = int(math.ceil(float(out_z + 1) * float(in_t) / float(out_t)))
+        src_start = int(np.clip(src_start, 0, in_t - 1))
+        src_stop = int(np.clip(max(src_start + 1, src_stop), 1, in_t))
+        restored = np.zeros((int(out_h), int(out_w)), dtype=np.uint8)
+        for src_idx in range(src_start, src_stop):
+            restored |= _resize_mask_xy(mask_u8[int(src_idx)])
+        out_mm[int(out_z), :, :] = restored
+
+    parallel_for_indices_chunked(
+        int(out_t),
+        _restore_slice,
+        max_workers=worker_count,
+        desc=desc,
+        chunk_size=chunk_size,
+        show_progress=True,
+    )
+    flush_array(out_mm)
+    return out_mm
+
+
+def ffmpeg_h264_rgb_writer(out_path: Path, width: int, height: int, fps: float) -> subprocess.Popen:
+    return ffmpeg_rawvideo_writer(
+        out_path=out_path,
+        width=int(width),
+        height=int(height),
+        fps=float(fps),
+        pix_fmt_in='rgb24',
+        codec='libx264',
+        pix_fmt_out='yuv420p',
+        codec_args=['-preset', 'slow'],
+    )
+
+
+def ffmpeg_h264_gray_writer(out_path: Path, width: int, height: int, fps: float) -> subprocess.Popen:
+    return ffmpeg_rawvideo_writer(
+        out_path=out_path,
+        width=int(width),
+        height=int(height),
+        fps=float(fps),
+        pix_fmt_in='gray',
+        codec='libx264',
+        pix_fmt_out='yuv420p',
+        codec_args=['-preset', 'slow'],
+    )
+
+
+def write_low_quality_overlay_video(
+    volume_gray: np.ndarray,
+    mask_u8: np.ndarray,
+    out_path: Path,
+    fps: float,
     show_progress: bool = True,
 ) -> Path:
-    low_root = root_dir / 'low_quality'
+    t_dim, h_dim, w_dim = volume_gray.shape
+    assert mask_u8.shape == (t_dim, h_dim, w_dim)
+    proc = ffmpeg_h264_rgb_writer(out_path, int(w_dim), int(h_dim), float(fps))
+    blue = np.array([0, 0, 255], dtype=np.uint8)
+    try:
+        assert proc.stdin is not None
+        for t in tqdm(range(int(t_dim)), desc=f'Writing low-quality overlay ({out_path.name})', disable=not show_progress):
+            frame = _gray_to_rgb_frame(np.asarray(volume_gray[int(t)]))
+            m = np.asarray(mask_u8[int(t)], dtype=bool)
+            if np.any(m):
+                frame[m] = ((frame[m].astype(np.uint16) + blue.astype(np.uint16)) // 2).astype(np.uint8)
+            proc.stdin.write(np.ascontiguousarray(frame).tobytes())
+    finally:
+        close_ffmpeg_writer(proc)
+    return out_path
+
+
+def write_low_quality_binary_video(
+    mask_u8: np.ndarray,
+    out_path: Path,
+    fps: float,
+    show_progress: bool = True,
+) -> Path:
+    t_dim, h_dim, w_dim = mask_u8.shape
+    proc = ffmpeg_h264_gray_writer(out_path, int(w_dim), int(h_dim), float(fps))
+    try:
+        assert proc.stdin is not None
+        for t in tqdm(range(int(t_dim)), desc=f'Writing low-quality binary ({out_path.name})', disable=not show_progress):
+            frame = (np.asarray(mask_u8[int(t)], dtype=np.uint8) > 0).astype(np.uint8) * np.uint8(255)
+            proc.stdin.write(np.ascontiguousarray(frame).tobytes())
+    finally:
+        close_ffmpeg_writer(proc)
+    return out_path
+
+
+def save_low_quality_outputs(
+    *,
+    volume_gray: np.ndarray,
+    mask_u8: np.ndarray,
+    out_dir: Path,
+    stem: str,
+    fps: float,
+    downbin_specs: Sequence[LowQualityDownbinSpec],
+    temp_dir: Path,
+    workers: int = 1,
+    show_progress: bool = True,
+) -> Dict[str, Path]:
+    """Write v10.1.0 low-quality outputs with isotropic X/Y/t resizing."""
+    low_root = out_dir / 'low_quality'
     low_root.mkdir(parents=True, exist_ok=True)
-    src_videos = [
-        p for p in sorted(root_dir.rglob('*.mkv'))
-        if low_root not in p.parents and 'temp' not in p.parts
-    ]
-    if not src_videos:
-        return low_root
+    result_paths: Dict[str, Path] = {'low_quality_dir': low_root}
+    if not downbin_specs:
+        return result_paths
 
-    def _transcode(idx: int) -> None:
-        src = src_videos[int(idx)]
-        rel = src.relative_to(root_dir)
-        dst = (low_root / rel).with_suffix('.mp4')
-        write_low_quality_video_copy(src, dst)
+    source_t = max(1, int(mask_u8.shape[0]))
+    for spec in downbin_specs:
+        out_t, out_h, out_w = (
+            int(spec.output_shape_t_y_x[0]),
+            int(spec.output_shape_t_y_x[1]),
+            int(spec.output_shape_t_y_x[2]),
+        )
+        spec_dir = low_root / spec.token
+        spec_dir.mkdir(parents=True, exist_ok=True)
+        fps_lq = max(1e-6, float(fps) * float(out_t) / float(source_t))
+        print(
+            f'Low-quality downbin {spec.raw_value}: native (t,Y,X)=({source_t},{int(mask_u8.shape[1])},{int(mask_u8.shape[2])}) '
+            f'-> ({out_t},{out_h},{out_w}); playback fps adjusted {float(fps):g} -> {fps_lq:g}'
+        )
 
-    parallel_for_indices(
-        len(src_videos),
-        _transcode,
-        max_workers=choose_slice_parallel_workers(int(workers), len(src_videos)),
-        desc='Writing low-quality video copies',
-        show_progress=show_progress,
-    )
-    return low_root
+        gray_lq = resize_gray_volume_to_shape(
+            volume_gray,
+            (out_t, out_h, out_w),
+            temp_dir / 'low_quality' / spec.token / 'source.gray8.dat',
+            workers=int(workers),
+            prefer_memory=True,
+            desc=f'Low-quality source resize {spec.token}',
+        )
+        mask_lq = resize_binary_mask_volume_to_shape(
+            mask_u8,
+            (out_t, out_h, out_w),
+            temp_dir / 'low_quality' / spec.token / 'mask.u8.dat',
+            workers=int(workers),
+            prefer_memory=True,
+            desc=f'Low-quality mask resize {spec.token}',
+        )
+        try:
+            overlay_path = spec_dir / f'{stem}_Overlay_LowQuality_{spec.token}.mp4'
+            binary_path = spec_dir / f'{stem}_Binary_LowQuality_{spec.token}.mp4'
+            nrrd_path = spec_dir / f'{stem}_LowQuality_{spec.token}.nrrd'
+            write_low_quality_overlay_video(gray_lq, mask_lq, overlay_path, fps_lq, show_progress=show_progress)
+            write_low_quality_binary_video(mask_lq, binary_path, fps_lq, show_progress=show_progress)
+            write_nrrd(mask_lq, nrrd_path)
+            result_paths[f'low_quality_{spec.token}_overlay'] = overlay_path
+            result_paths[f'low_quality_{spec.token}_binary_video'] = binary_path
+            result_paths[f'low_quality_{spec.token}_nrrd'] = nrrd_path
+        finally:
+            if gray_lq is not volume_gray:
+                close_memmap_array(gray_lq)
+            if mask_lq is not mask_u8:
+                close_memmap_array(mask_lq)
 
+    return result_paths
 
 def write_view_images(
     volume_rgb: np.ndarray,
@@ -10014,7 +10119,7 @@ def union_view_volume_for_single_model(
     workers: int = 1,
 ) -> np.ndarray:
     if len(view_volumes_by_model) != 1:
-        raise ValueError('v10.0.1_SLURM supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('v10.1.0_SLURM supports exactly one --model; multiple-model inference has been removed')
     model_name = next(iter(view_volumes_by_model.keys()))
     if view_name not in view_volumes_by_model[model_name]:
         raise KeyError(f'No view volume found for {view_name}')
@@ -10120,7 +10225,7 @@ def save_tta_outputs(
             continue
         if model_name and view.name not in view_volumes_by_model.get(model_name, {}):
             print(
-                f"Warning: --save_TTA skipping {view.name}; no prediction volume was generated "
+                f"Warning: TTA export skipping {view.name}; no prediction volume was generated "
                 "for this view (for example, because --disable_transverse is active)."
             )
             continue
@@ -10281,7 +10386,7 @@ def write_summary_file(
 
     if voxel_volume is not None:
         lines.append('')
-        lines.append(f'voxel_volume: {int(voxel_volume)}')
+        lines.append(f'voxel_volume_native_input_space: {int(voxel_volume)}')
 
     lines.append('')
     lines.append('Final outputs:')
@@ -10309,7 +10414,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('v10.0.1_SLURM accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('v10.1.0_SLURM accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -10319,10 +10424,12 @@ def main() -> None:
     tilt_angles = resolve_tilt_angles(args.tilt_angle)
     tilt_directions = resolve_tilt_directions(args.tilt_direction)
     tile_configs = resolve_tile_configs(args.tile_size, args.tile_stride)
-    enable_sagittal = bool(args.enable_sagittal or args.enable_multiplanar)
-    enable_coronal = bool(args.enable_coronal or args.enable_multiplanar)
-    save_sagittal = bool(args.save_sagittal or args.save_multiplanar)
-    save_coronal = bool(args.save_coronal or args.save_multiplanar)
+    enable_sagittal = bool(args.enable_sagittal)
+    enable_coronal = bool(args.enable_coronal)
+    # v10.1.0 removed the old per-view save flags. Default outputs stay transverse-only;
+    # active non-transverse views contribute to inference/union but are not separately exported.
+    save_sagittal = False
+    save_coronal = False
     requested_azimuth_angle = None if args.azimuth_angle is None else float(args.azimuth_angle)
 
     if args.min_conf > 0 and args.min_conf < args.conf:
@@ -10356,6 +10463,7 @@ def main() -> None:
             raise ValueError('--tilt_angle values must be greater than 0 and less than 45')
     if not (-90.0 < float(args.interpolation_search_angle) < 90.0):
         raise ValueError('--interpolation_search_angle must be greater than -90 and less than 90')
+    low_quality_requested = bool(args.save_low_quality or args.save_low_quality_downbin is not None)
 
     out_dir = Path(args.output).expanduser().resolve() if args.output else (Path.cwd() / input_path.stem)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -10369,6 +10477,12 @@ def main() -> None:
     input_H = int(info['height'])
     input_T = int(info['num_frames'])
     fps = float(info['fps'])
+
+    low_quality_downbin_specs, low_quality_downbin_warnings = resolve_low_quality_downbin_specs(
+        args.save_low_quality_downbin,
+        bool(low_quality_requested),
+        (input_T, input_H, input_W),
+    )
 
     vol_path = temp_dir / 'input_volume.gray8.dat'
     input_volume_rgb = decode_video_to_memmap_gray8(
@@ -10387,7 +10501,7 @@ def main() -> None:
     processing_shape = compute_cube_resize_shape(input_T, input_H, input_W, tolerance=0.05)
     if processing_shape != (input_T, input_H, input_W):
         print(
-            'v9.5.0 cubic resize: '
+            'v10.1.0 cubic resize: '
             f'input shape (t,Y,X)=({input_T},{input_H},{input_W}) -> '
             f'processing shape (t,Y,X)={processing_shape}'
         )
@@ -10399,7 +10513,7 @@ def main() -> None:
             prefer_memory=True,
         )
     else:
-        print(f'v9.5.0 cubic resize: input shape already within 5% cube tolerance ({processing_shape})')
+        print(f'v10.1.0 cubic resize: input shape already within 5% cube tolerance ({processing_shape})')
         volume_rgb = input_volume_rgb
 
     T, H, W = (int(processing_shape[0]), int(processing_shape[1]), int(processing_shape[2]))
@@ -10441,9 +10555,22 @@ def main() -> None:
     inference_views = [v for v in views if not (transverse_inference_disabled and v.name == 'transverse')]
     interpolating_views = [v for v in inference_views if _view_uses_interpolation(v, int(args.interpolate))]
     spec_notes: List[str] = []
+    spec_notes.append('Voxel-volume reporting, when enabled, counts the final binary mask after restoration to native input geometry, not imgsz or cubic working geometry.')
+    if low_quality_downbin_warnings:
+        for warning in low_quality_downbin_warnings:
+            print(f'Warning: {warning}')
+            spec_notes.append(warning)
+    if low_quality_downbin_specs:
+        spec_notes.append(
+            'Low-quality outputs use isotropic X/Y/t downbinning in native input space; frame count is resampled with the same scale as XY, rather than preserving the original frame count. '
+            + '; '.join(
+                f'{spec.raw_value}->(t,Y,X)={spec.output_shape_t_y_x}'
+                for spec in low_quality_downbin_specs
+            )
+        )
     if (int(T), int(H), int(W)) != (int(input_T), int(input_H), int(input_W)):
         spec_notes.append(
-            f'Working volume resized to v9.5.0 approximately-cubic processing geometry '
+            f'Working volume resized to v10.1.0 approximately-cubic processing geometry '
             f'(t,Y,X)=({int(T)},{int(H)},{int(W)}); final default outputs are restored to the original '
             f'input geometry (t,Y,X)=({int(input_T)},{int(input_H)},{int(input_W)}).'
         )
@@ -10457,7 +10584,7 @@ def main() -> None:
             'Lanczos-3 radial sampling, wraparound Radial interpolation, and dense final backprojection are active.'
         )
     spec_notes.append(
-        'NRRD export is decomposed by default in v10.0.1: layers are written on a leading list axis as '
+        'NRRD export is decomposed by default in v10.1.0: layers are written on a leading list axis as '
         '(layer,X,Y,t), with manifest JSON and SegmentN metadata for view, source, YOLO-vs-bridge, '
         'tile acceptance category, pre-smoothing union, smoothing pass results, and final output. '
         'The NRRD payload is now gzip-streamed directly from backing layers with a bounded row buffer '
@@ -10480,9 +10607,10 @@ def main() -> None:
         )
     else:
         spec_notes.append('Gaussian smoothing disabled by default; --gaussian_smoothing enables it, and --gaussian_smoothing_passes > 1 enables it with the default sigma.')
+    spec_notes.append('Interpolation endpoint discovery uses the v10.1.0 per-slice connected-component scan; skeletonization is never used for interpolation and runs only when --save_skeleton is requested.')
     if transverse_inference_disabled:
         note = (
-            'v9.5.0 specification note: Section 2.1.1 says Transverse must always be created, while '
+            'v10.1.0 specification note: Section 2.1.1 says Transverse must always be created, while '
             'View Flags item 1 adds --disable_transverse to skip Transverse inferencing. This implementation '
             'keeps Transverse geometry/output paths available and removes only the standard Transverse full-frame '
             'and tiled prediction jobs.'
@@ -10493,7 +10621,7 @@ def main() -> None:
     model_name = Path(model_paths[0]).stem
     print(f'Loading model: {model_name} ({model_paths[0]})')
     yolo_model = load_ultralytics_model(model_paths[0], task='segment')
-    # v9.5.0 has no multiple-model inference. A single-item list is retained only to minimize churn in
+    # v10.1.0 has no multiple-model inference. A single-item list is retained only to minimize churn in
     # scheduling structures keyed by model stem.
     yolo_models: List[Tuple[str, object]] = [(model_name, yolo_model)]
     yolo_by_model_name: Dict[str, object] = {model_name: yolo_model}
@@ -10855,7 +10983,7 @@ def main() -> None:
         _submit_fullframe_video(view, aug_job)
         # Non-radial tiled views are created alongside their parent view. Radial tiles remain
         # deferred until the radial parent frame cache/video exists because radial slicing is
-        # substantially more expensive and is the only v9.5.0 exception.
+        # substantially more expensive and is the only v10.1.0 exception.
         if dense_tiling_active and view.family != 'radial':
             tile_jobs = tile_jobs_by_aug.get((view.name, aug_job.aug_id), [])
             if tile_jobs:
@@ -11488,6 +11616,31 @@ def main() -> None:
             workers=slice_postprocess_workers,
         )
 
+    skeleton_processing_mm: Optional[np.ndarray] = None
+    skeleton_output_mm: Optional[np.ndarray] = None
+    skeleton_path: Optional[Path] = None
+    if bool(args.save_skeleton):
+        print('\n=== Computing optional skeleton output ===')
+        skeleton_processing_mm = compute_skeleton_volume_to_workspace(
+            final_union_mm,
+            temp_dir / 'skeleton' / 'final_skeleton_processing_geometry.u8.dat',
+            prefer_memory=True,
+        )
+        if bool(args.save_nrrd):
+            skeleton_ref = materialize_nrrd_global_layer(
+                skeleton_processing_mm,
+                model_name=str(model_name),
+                source='global',
+                mask_kind='skeleton',
+                pass_index=0,
+                stage='skeleton_after_postprocessing',
+                description='Optional skeleton layer computed after final postprocessing and before restoration to native input geometry. Interpolation did not use skeletonization.',
+                temp_dir=temp_dir,
+                workers=int(slice_postprocess_workers),
+            )
+            if skeleton_ref is not None:
+                nrrd_layer_refs.append(skeleton_ref)
+
     final_output_mask_mm = final_union_mm
     output_volume_rgb = input_volume_rgb
     output_T, output_H, output_W = int(input_T), int(input_H), int(input_W)
@@ -11500,6 +11653,24 @@ def main() -> None:
             workers=int(slice_postprocess_workers),
             prefer_memory=True,
         )
+    final_output_volume_for_low_quality = output_volume_rgb
+    final_paths: Dict[str, Path] = {}
+
+    if bool(args.save_skeleton) and not bool(args.save_nrrd) and skeleton_processing_mm is not None:
+        print('\n=== Writing skeleton-only NRRD ===')
+        skeleton_path = out_dir / f'{input_path.stem}_Skeleton.nrrd'
+        if (int(T), int(H), int(W)) != (output_T, output_H, output_W):
+            skeleton_output_mm = restore_mask_volume_to_original_shape(
+                skeleton_processing_mm,
+                (output_T, output_H, output_W),
+                temp_dir / 'skeleton' / 'final_skeleton_original_geometry.u8.dat',
+                workers=int(slice_postprocess_workers),
+                prefer_memory=True,
+            )
+        else:
+            skeleton_output_mm = skeleton_processing_mm
+        write_nrrd(skeleton_output_mm, skeleton_path)
+        final_paths['skeleton_nrrd'] = skeleton_path
 
     output_radial_angle = 0.0
     if float(resolved_azimuth_angle) > 0.0:
@@ -11513,15 +11684,13 @@ def main() -> None:
         H=output_H,
         W=output_W,
         disable_multiplanar=None,
-        enable_sagittal=bool(enable_sagittal or save_sagittal),
-        enable_coronal=bool(enable_coronal or save_coronal),
+        enable_sagittal=bool(enable_sagittal),
+        enable_coronal=bool(enable_coronal),
         azimuth_angle=float(output_radial_angle),
         include_radial=True,
         tilt_angles=tilt_angles,
         tilt_directions=tilt_directions,
     )
-
-    final_paths: Dict[str, Path] = {}
 
     if bool(args.troubleshooting) and int(args.interpolate) > 0:
         final_paths.update(schedule_troubleshooting_pass_outputs(
@@ -11536,8 +11705,8 @@ def main() -> None:
             save_binary_pattern_value=args.save_binary,
             save_labels_pattern_value=args.save_labels,
             save_nrrd_flag=bool(args.save_nrrd),
-            save_sagittal_flag=bool(save_sagittal),
-            save_coronal_flag=bool(save_coronal),
+            save_sagittal_flag=False,
+            save_coronal_flag=False,
             total_passes=int(args.interpolate_passes),
             T=T,
             H=H,
@@ -11578,8 +11747,8 @@ def main() -> None:
             fps=fps,
             save_binary_pattern_value=args.save_binary,
             save_labels_pattern_value=args.save_labels,
-            save_sagittal_flag=bool(save_sagittal),
-            save_coronal_flag=bool(save_coronal),
+            save_sagittal_flag=False,
+            save_coronal_flag=False,
             tag=None,
             frame_workers=output_frame_workers,
             show_progress=False,
@@ -11624,68 +11793,20 @@ def main() -> None:
             )
             final_paths[f'{view.name}_images_dir'] = image_dir
 
-    if bool(args.save_radial):
-        radial_view = next((v for v in output_views if v.name == 'radial'), None)
-        if radial_view is None:
-            print('Warning: --save_radial requested but radial views are disabled; skipping radial outputs')
-        else:
-            print('\n=== Saving radial outputs ===')
-            final_paths.update(write_additional_view_outputs(
-                volume_rgb=output_volume_rgb,
-                mask_u8=final_output_mask_mm,
-                view=radial_view,
-                out_dir=out_dir,
-                stem=input_path.stem,
-                fps=fps,
-                save_binary_pattern_value=args.save_binary,
-                save_labels_pattern_value=args.save_labels,
-                tag=None,
-                workers=output_frame_workers,
-                show_progress=False,
-            ))
-
-    if bool(args.save_tilted_transverse):
-        tilted_views = [v for v in output_views if v.family == 'tilted_transverse']
-        if not tilted_views:
-            print('Warning: --save_tilted_transverse requested but --tilt_angle is 0; skipping tilted transverse outputs')
-        else:
-            print('\n=== Saving tilted transverse outputs ===')
-            for view in tilted_views:
-                final_paths.update(write_additional_view_outputs(
-                    volume_rgb=output_volume_rgb,
-                    mask_u8=final_output_mask_mm,
-                    view=view,
-                    out_dir=out_dir,
-                    stem=input_path.stem,
-                    fps=fps,
-                    save_binary_pattern_value=args.save_binary,
-                    save_labels_pattern_value=args.save_labels,
-                    tag=None,
-                    workers=output_frame_workers,
-                    show_progress=False,
-                ))
-
-    if bool(args.save_TTA):
-        print('\n=== Saving TTA videos and mapped labels ===')
-        final_paths.update(save_tta_outputs(
-            view_volumes_by_model=view_volumes_by_model,
-            views=views,
-            aug_jobs_by_view=aug_jobs_by_view,
-            temp_dir=temp_dir,
+    if bool(low_quality_requested):
+        print('\n=== Saving low-quality isotropic outputs ===')
+        low_quality_paths = save_low_quality_outputs(
+            volume_gray=final_output_volume_for_low_quality,
+            mask_u8=final_output_mask_mm,
             out_dir=out_dir,
             stem=input_path.stem,
-            workers=output_frame_workers,
-            show_progress=False,
-        ))
-
-    if bool(args.save_low_quality):
-        print('\n=== Saving low-quality video copies ===')
-        low_quality_dir = save_low_quality_video_copies(
-            out_dir,
+            fps=fps,
+            downbin_specs=low_quality_downbin_specs,
+            temp_dir=temp_dir,
             workers=output_workers,
             show_progress=False,
         )
-        final_paths['low_quality_dir'] = low_quality_dir
+        final_paths.update(low_quality_paths)
 
     if bool(args.save_nrrd):
         spec_notes.append(
@@ -11725,6 +11846,10 @@ def main() -> None:
         spec_notes=spec_notes,
     )
 
+    if skeleton_output_mm is not None and skeleton_output_mm is not skeleton_processing_mm:
+        close_memmap_array(skeleton_output_mm)
+    if skeleton_processing_mm is not None:
+        close_memmap_array(skeleton_processing_mm)
     if final_output_mask_mm is not final_union_mm:
         close_memmap_array(final_output_mask_mm)
     close_memmap_array(final_union_mm)
