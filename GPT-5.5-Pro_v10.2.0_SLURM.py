@@ -2,7 +2,7 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v10.1.0_SLURM single-channel-aligned script:
+This v10.1.1_SLURM single-channel-aligned script:
   - builds Transverse, optional Tilted Transverse, independently optional Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - renders parent/full-frame videos directly from the native view transform so inference no longer waits on
     a separately rendered canvas video, and derives non-radial tile videos from shared canvas batches so the
@@ -975,6 +975,122 @@ def _resize_gray_slice_nearest_or_linear(
     )
 
 
+def _cube_t_axis_resize_backend() -> str:
+    """Backend used when cubic resizing only changes the slice axis.
+
+    ``slab`` is the default because the common 3072x3072x1930 -> approximately
+    cubic case does not need XY resampling.  It processes row slabs through
+    OpenCV's native vertical resize and fans the slabs out across Python worker
+    threads.  ``slice_exact`` preserves the older endpoint-aligned per-output-slice
+    interpolation path for regression testing.
+    """
+    backend = os.environ.get('YOLO_TTA_CUBE_T_RESIZE_BACKEND', 'slab').strip().lower()
+    if backend not in {'slab', 'slice_exact'}:
+        backend = 'slab'
+    return backend
+
+
+def _cube_t_axis_slab_rows(in_w: int, in_t: int, out_t: int, workers: int) -> int:
+    """Choose a bounded row-slab height for T-axis-only cubic resizing."""
+    del in_t, out_t
+    env_rows = _env_int('YOLO_TTA_CUBE_T_RESIZE_SLAB_ROWS', 0)
+    if env_rows > 0:
+        return max(1, int(env_rows))
+
+    # Keep OpenCV's temporary 2D image width below conservative historical limits,
+    # while also keeping per-task input/output buffers comfortably bounded.
+    max_cv_width = max(1, _env_int('YOLO_TTA_CUBE_T_RESIZE_MAX_CV_WIDTH', 32760))
+    rows_by_width = max(1, int(max_cv_width) // max(1, int(in_w)))
+
+    target_mib = max(16, _env_int('YOLO_TTA_CUBE_T_RESIZE_TARGET_MIB_PER_TASK', 384))
+    bytes_per_row = max(1, int(in_w)) * 2  # one input byte + one output byte, approximate
+    rows_by_memory = max(1, int((target_mib * 1024 * 1024) // max(1, bytes_per_row * max(1, workers))))
+    return max(1, min(rows_by_width, rows_by_memory, 16))
+
+
+def resize_volume_t_axis_only_gray8_slab(
+    volume_gray: np.ndarray,
+    out_t: int,
+    out_path: Path,
+    *,
+    workers: int = 1,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 32 * GIB,
+) -> np.ndarray:
+    """Resize only the first/T axis by processing independent row slabs.
+
+    This is optimized for the dominant SLURM input geometry where X/Y are already
+    at the target size and only the shorter frame axis is upsampled to satisfy the
+    approximate-cube requirement.  Each task views a ``(T, rows*X)`` slab as a 2D
+    OpenCV image and resizes only its height to ``out_t``.
+    """
+    in_t, in_h, in_w = (int(volume_gray.shape[0]), int(volume_gray.shape[1]), int(volume_gray.shape[2]))
+    out_t_i = int(out_t)
+    if int(in_t) == out_t_i:
+        return volume_gray
+
+    out_mm = allocate_workspace_array(
+        shape=(out_t_i, in_h, in_w),
+        dtype=np.uint8,
+        path=out_path,
+        desc='v10.1.1 cubic processing volume (parallel T-axis slab resize)',
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
+    )
+
+    worker_count = choose_slice_parallel_workers(int(workers), int(in_h))
+    rows_per_slab = _cube_t_axis_slab_rows(int(in_w), int(in_t), int(out_t_i), worker_count)
+    ranges = [(int(y0), int(min(in_h, y0 + rows_per_slab))) for y0 in range(0, int(in_h), int(rows_per_slab))]
+    cv_threads = max(1, _env_int('YOLO_TTA_CUBE_T_RESIZE_CV2_THREADS', 1))
+
+    try:
+        previous_cv_threads = cv2.getNumThreads()
+    except Exception:
+        previous_cv_threads = None
+    try:
+        cv2.setNumThreads(int(cv_threads))
+    except Exception:
+        pass
+
+    print(
+        'Cubic resize T-axis slab backend: '
+        f'in=(t,Y,X)=({in_t},{in_h},{in_w}) -> out_t={out_t_i}, '
+        f'slab_rows={rows_per_slab}, slab_tasks={len(ranges)}, workers={worker_count}, '
+        f'cv2_threads_per_task={cv_threads}'
+    )
+
+    def _resize_slab(range_idx: int) -> None:
+        y0, y1 = ranges[int(range_idx)]
+        rows = int(y1 - y0)
+        slab = np.ascontiguousarray(volume_gray[:, y0:y1, :], dtype=np.uint8)
+        slab_2d = slab.reshape((int(in_t), int(rows) * int(in_w)))
+        resized_2d = cv2.resize(
+            slab_2d,
+            (int(rows) * int(in_w), int(out_t_i)),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        out_mm[:, y0:y1, :] = np.ascontiguousarray(resized_2d.reshape((int(out_t_i), int(rows), int(in_w))))
+
+    try:
+        parallel_for_indices_chunked(
+            len(ranges),
+            _resize_slab,
+            max_workers=worker_count,
+            desc='Resizing orthogonal volume to v10.1.1 cube (T-axis slabs)',
+            show_progress=True,
+            chunk_size=1,
+        )
+    finally:
+        if previous_cv_threads is not None:
+            try:
+                cv2.setNumThreads(int(previous_cv_threads))
+            except Exception:
+                pass
+
+    flush_array(out_mm)
+    return out_mm
+
+
 def resize_volume_to_processing_cube_gray8(
     volume_gray: np.ndarray,
     out_shape: Tuple[int, int, int],
@@ -989,6 +1105,16 @@ def resize_volume_to_processing_cube_gray8(
     out_t, out_h, out_w = (int(out_shape[0]), int(out_shape[1]), int(out_shape[2]))
     if (in_t, in_h, in_w) == (out_t, out_h, out_w):
         return volume_gray
+
+    if in_h == out_h and in_w == out_w and _cube_t_axis_resize_backend() == 'slab':
+        return resize_volume_t_axis_only_gray8_slab(
+            volume_gray,
+            out_t,
+            out_path,
+            workers=int(workers),
+            prefer_memory=bool(prefer_memory),
+            reserve_bytes=int(reserve_bytes),
+        )
 
     out_mm = allocate_workspace_array(
         shape=(out_t, out_h, out_w),
@@ -1013,11 +1139,13 @@ def resize_volume_to_processing_cube_gray8(
             out_mm[int(out_z), :, :] = f0
             return
         f1 = _resize_gray_slice_nearest_or_linear(volume_gray[z1], out_w, out_h, cv2.INTER_LINEAR)
-        blended = np.clip(
-            np.rint((1.0 - alpha) * f0.astype(np.float32, copy=False) + alpha * f1.astype(np.float32, copy=False)),
+        blended = cv2.addWeighted(
+            np.ascontiguousarray(f0),
+            float(1.0 - alpha),
+            np.ascontiguousarray(f1),
+            float(alpha),
             0.0,
-            255.0,
-        ).astype(np.uint8)
+        )
         out_mm[int(out_z), :, :] = blended
 
     parallel_for_indices_chunked(
@@ -5692,9 +5820,11 @@ def assemble_final_union_after_view_union(
 # --------------------------
 
 
-def skeletonize_volume(mask_bool: np.ndarray) -> np.ndarray:
-    """Best-effort 3D skeletonization across skimage versions."""
+def _skimage_skeletonize_bool(mask_bool: np.ndarray) -> np.ndarray:
+    """Best-effort 3D Lee skeletonization across scikit-image versions."""
     arr = np.asarray(mask_bool, dtype=bool)
+    if arr.size <= 0 or not np.any(arr):
+        return np.zeros(arr.shape, dtype=bool)
 
     try:
         return np.asarray(_skimage_skeletonize(arr, method="lee"), dtype=bool)
@@ -5712,14 +5842,399 @@ def skeletonize_volume(mask_bool: np.ndarray) -> np.ndarray:
     return np.asarray(_skimage_skeletonize(arr), dtype=bool)
 
 
+def _draw_line_zyx(mask: np.ndarray, p0: Tuple[int, int, int], p1: Tuple[int, int, int]) -> None:
+    z0, y0, x0 = (int(p0[0]), int(p0[1]), int(p0[2]))
+    z1, y1, x1 = (int(p1[0]), int(p1[1]), int(p1[2]))
+    steps = max(abs(z1 - z0), abs(y1 - y0), abs(x1 - x0), 1)
+    for i in range(int(steps) + 1):
+        a = float(i) / float(steps)
+        z = int(round((1.0 - a) * z0 + a * z1))
+        y = int(round((1.0 - a) * y0 + a * y1))
+        x = int(round((1.0 - a) * x0 + a * x1))
+        if 0 <= z < mask.shape[0] and 0 <= y < mask.shape[1] and 0 <= x < mask.shape[2]:
+            mask[z, y, x] = True
+
+
+def _slice_component_anchors(mask2d: np.ndarray) -> List[Tuple[int, int]]:
+    mask_u8 = np.ascontiguousarray(np.asarray(mask2d, dtype=np.uint8))
+    if mask_u8.size == 0 or not np.any(mask_u8):
+        return []
+    num_labels, labels2d = cv2.connectedComponents(mask_u8, connectivity=8, ltype=cv2.CV_32S)
+    anchors: List[Tuple[int, int]] = []
+    for lbl in range(1, int(num_labels)):
+        comp = labels2d == int(lbl)
+        if not np.any(comp):
+            continue
+        comp_u8 = comp.astype(np.uint8, copy=False)
+        dist = cv2.distanceTransform(comp_u8, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+        max_val = float(np.max(dist)) if dist.size else 0.0
+        if max_val > 0.0:
+            pts = np.argwhere(dist >= (max_val - 1e-6))
+        else:
+            pts = np.argwhere(comp)
+        if pts.size <= 0:
+            continue
+        anchor = np.mean(pts, axis=0)
+        anchors.append((int(round(float(anchor[0]))), int(round(float(anchor[1])))))
+    return anchors
+
+
+def _fallback_slice_anchor_centerline(comp_bool: np.ndarray) -> np.ndarray:
+    """Build a smooth-ish centerline graph from per-slice distance-ridge anchors.
+
+    This fallback prevents pathological empty or surface-like skeleton outputs from being
+    written as porous blobs.  It is intentionally conservative: every 2D component in a
+    slice contributes one distance-transform anchor, and adjacent-slice anchors are linked
+    in both nearest-neighbor directions so simple bifurcations remain connected.
+    """
+    comp = np.asarray(comp_bool, dtype=bool)
+    out = np.zeros(comp.shape, dtype=bool)
+    prev: List[Tuple[int, int, int]] = []
+    for z in range(int(comp.shape[0])):
+        anchors2d = _slice_component_anchors(comp[int(z)])
+        curr = [(int(z), int(y), int(x)) for y, x in anchors2d]
+        for p in curr:
+            out[p] = True
+        if prev and curr:
+            used_pairs: set[Tuple[int, int]] = set()
+            for ci, cp in enumerate(curr):
+                pi = min(range(len(prev)), key=lambda j: (prev[j][1] - cp[1]) ** 2 + (prev[j][2] - cp[2]) ** 2)
+                used_pairs.add((int(pi), int(ci)))
+            for pi, pp in enumerate(prev):
+                ci = min(range(len(curr)), key=lambda j: (curr[j][1] - pp[1]) ** 2 + (curr[j][2] - pp[2]) ** 2)
+                used_pairs.add((int(pi), int(ci)))
+            for pi, ci in used_pairs:
+                _draw_line_zyx(out, prev[int(pi)], curr[int(ci)])
+        prev = curr if curr else prev
+    return out
+
+
+def _skeleton_max_density_fraction() -> float:
+    raw = _env_float('YOLO_TTA_SKELETON_MAX_DENSITY_FRACTION', 0.18)
+    return max(0.0, float(raw))
+
+
+def centerline_skeletonize_component(comp_bool: np.ndarray) -> np.ndarray:
+    comp = np.asarray(comp_bool, dtype=bool)
+    if comp.size <= 0 or not np.any(comp):
+        return np.zeros(comp.shape, dtype=bool)
+    if _env_flag('YOLO_TTA_SKELETON_FORCE_SLICE_ANCHOR_CENTERLINE', False):
+        return _fallback_slice_anchor_centerline(comp)
+
+    skel = _skimage_skeletonize_bool(comp)
+    skel_voxels = int(np.count_nonzero(skel))
+    comp_voxels = max(1, int(np.count_nonzero(comp)))
+    max_density = _skeleton_max_density_fraction()
+    if skel_voxels <= 0 or (max_density > 0.0 and float(skel_voxels) / float(comp_voxels) > float(max_density)):
+        fallback = _fallback_slice_anchor_centerline(comp)
+        if np.any(fallback):
+            return fallback
+    return skel
+
+
+def skeletonize_volume(mask_bool: np.ndarray) -> np.ndarray:
+    """Compatibility wrapper returning a 3D centerline skeleton for small arrays.
+
+    Pipeline output uses ``compute_skeleton_volume_to_workspace`` so large volumes are
+    processed component-wise/chunk-wise without materializing another dense returned array.
+    """
+    return centerline_skeletonize_component(mask_bool)
+
+
+def _skeleton_fill_2d_holes_enabled() -> bool:
+    return _env_flag('YOLO_TTA_SKELETON_FILL_2D_HOLES', True)
+
+
+def _skeleton_component_fill_3d_holes_enabled() -> bool:
+    return _env_flag('YOLO_TTA_SKELETON_FILL_COMPONENT_3D_HOLES', False)
+
+
+def _skeleton_chunk_min_voxels() -> int:
+    return max(0, _env_int('YOLO_TTA_SKELETON_CHUNK_MIN_VOXELS', 256 * 1024 * 1024))
+
+
+def _skeleton_chunk_depth() -> int:
+    return max(16, _env_int('YOLO_TTA_SKELETON_CHUNK_DEPTH', 384))
+
+
+def _skeleton_chunk_overlap() -> int:
+    return max(4, _env_int('YOLO_TTA_SKELETON_CHUNK_OVERLAP', 32))
+
+
+def _skeleton_chunk_max_voxels() -> int:
+    return max(1024 * 1024, _env_int('YOLO_TTA_SKELETON_CHUNK_MAX_VOXELS', 96 * 1024 * 1024))
+
+
+def _skeleton_worker_count(requested_workers: int, task_count: int) -> int:
+    default_workers = max(1, min(32, _cpu_count()))
+    workers = _env_int('YOLO_TTA_SKELETON_WORKERS', default_workers)
+    if workers <= 0:
+        workers = int(requested_workers)
+    return choose_slice_parallel_workers(max(1, int(workers)), max(1, int(task_count)))
+
+
+@dataclass(frozen=True)
+class SkeletonChunkTask:
+    label: int
+    read_slice: Tuple[slice, slice, slice]
+    core_slice: Tuple[slice, slice, slice]
+
+
+def _pad_slice_for_shape(sl: slice, dim: int, pad_before: int, pad_after: int) -> slice:
+    start = 0 if sl.start is None else int(sl.start)
+    stop = int(dim) if sl.stop is None else int(sl.stop)
+    return slice(max(0, start - int(pad_before)), min(int(dim), stop + int(pad_after)))
+
+
+def prepare_skeleton_input_volume(
+    mask_u8: np.ndarray,
+    out_path: Path,
+    *,
+    workers: int = 1,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 16 * GIB,
+) -> np.ndarray:
+    """Prepare a cleaner binary input for centerline extraction.
+
+    Small 2D pores in the final mask can make a thinning algorithm return porous
+    skeleton islands instead of a centerline tree.  The default preconditioner fills
+    per-slice enclosed holes in parallel, leaving 3D topology otherwise unchanged.
+    """
+    src = np.asarray(mask_u8, dtype=np.uint8)
+    if not _skeleton_fill_2d_holes_enabled():
+        return mask_u8
+
+    out = allocate_workspace_array(
+        shape=tuple(int(x) for x in src.shape),
+        dtype=np.uint8,
+        path=out_path,
+        desc='Skeleton preconditioned mask workspace',
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
+    )
+    total = int(src.shape[0])
+
+    def _fill_slice(z: int) -> None:
+        sl = np.asarray(src[int(z)], dtype=bool)
+        if np.any(sl):
+            out[int(z), :, :] = _fill_holes_2d(sl).astype(np.uint8, copy=False)
+        else:
+            out[int(z), :, :].fill(np.uint8(0))
+
+    parallel_for_indices_chunked(
+        total,
+        _fill_slice,
+        max_workers=choose_slice_parallel_workers(int(workers), total),
+        desc='Skeleton precondition: fill 2D pores',
+        show_progress=True,
+        target_chunks_per_worker=2,
+    )
+    flush_array(out)
+    return out
+
+
+def _build_skeleton_chunk_tasks(
+    component_slices: Sequence[Optional[Tuple[slice, slice, slice]]],
+    volume_shape: Tuple[int, int, int],
+) -> Tuple[List[SkeletonChunkTask], Dict[str, int]]:
+    z_dim, h_dim, w_dim = (int(volume_shape[0]), int(volume_shape[1]), int(volume_shape[2]))
+    tasks: List[SkeletonChunkTask] = []
+    chunked_components = 0
+    full_components = 0
+    chunk_min_voxels = _skeleton_chunk_min_voxels()
+    chunk_depth = _skeleton_chunk_depth()
+    overlap = _skeleton_chunk_overlap()
+    max_task_voxels = _skeleton_chunk_max_voxels()
+
+    def _axis_chunks(start: int, stop: int, step: int) -> Iterator[Tuple[int, int]]:
+        step_i = max(1, int(step))
+        cur = int(start)
+        while cur < int(stop):
+            nxt = min(int(stop), cur + step_i)
+            yield int(cur), int(nxt)
+            cur = int(nxt)
+
+    def _append_task(label_i: int, core: Tuple[slice, slice, slice], read_pad: int) -> None:
+        cz, cy, cx = core
+        read = (
+            _pad_slice_for_shape(cz, z_dim, read_pad, read_pad),
+            _pad_slice_for_shape(cy, h_dim, read_pad, read_pad),
+            _pad_slice_for_shape(cx, w_dim, read_pad, read_pad),
+        )
+        tasks.append(SkeletonChunkTask(label=int(label_i), read_slice=read, core_slice=core))
+
+    for label, sl in enumerate(component_slices, start=1):
+        if sl is None:
+            continue
+        z_sl, y_sl, x_sl = sl
+        z0, z1 = int(z_sl.start or 0), int(z_sl.stop or 0)
+        y0, y1 = int(y_sl.start or 0), int(y_sl.stop or 0)
+        x0, x1 = int(x_sl.start or 0), int(x_sl.stop or 0)
+        if z1 <= z0 or y1 <= y0 or x1 <= x0:
+            continue
+        bbox_voxels = int(z1 - z0) * int(y1 - y0) * int(x1 - x0)
+
+        if chunk_min_voxels > 0 and bbox_voxels >= chunk_min_voxels and ((z1 - z0) > chunk_depth or bbox_voxels > max_task_voxels):
+            chunked_components += 1
+            core_z_step = min(max(1, chunk_depth), max(1, z1 - z0))
+            # Choose XY tile sizes that keep dense label/bool/skel temporaries bounded while
+            # retaining overlap to reduce boundary discontinuities.
+            area_budget = max(64 * 64, int(max_task_voxels // max(1, core_z_step + 2 * overlap)))
+            side = max(64, int(math.sqrt(float(area_budget))))
+            x_step = max(64, min(x1 - x0, side))
+            y_step = max(64, min(y1 - y0, max(64, int(area_budget // max(1, x_step)))))
+            for core_z0 in range(z0, z1, chunk_depth):
+                core_z1 = min(z1, core_z0 + chunk_depth)
+                for core_y0, core_y1 in _axis_chunks(y0, y1, y_step):
+                    for core_x0, core_x1 in _axis_chunks(x0, x1, x_step):
+                        _append_task(
+                            int(label),
+                            (slice(int(core_z0), int(core_z1)), slice(int(core_y0), int(core_y1)), slice(int(core_x0), int(core_x1))),
+                            int(overlap),
+                        )
+        else:
+            full_components += 1
+            _append_task(int(label), (slice(z0, z1), slice(y0, y1), slice(x0, x1)), 2)
+
+    return tasks, {
+        'tasks': int(len(tasks)),
+        'full_components': int(full_components),
+        'chunked_components': int(chunked_components),
+    }
+
+
+def compute_centerline_skeleton_into_workspace(
+    mask_u8: np.ndarray,
+    out_mm: np.ndarray,
+    *,
+    temp_dir: Path,
+    workers: int = 1,
+    keep_temp: bool = False,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 16 * GIB,
+) -> Dict[str, int]:
+    """Write a 1-voxel centerline skeleton to ``out_mm``.
+
+    The work is decomposed into 3D connected components and, for very large
+    components, overlapping z chunks.  That keeps the optional skeleton output from
+    becoming a single monolithic thinning call while preserving independent object
+    topology as much as possible.
+    """
+    out_mm[:, :, :] = np.uint8(0)
+    flush_array(out_mm)
+
+    skeleton_dir = Path(temp_dir) / 'skeleton'
+    skeleton_dir.mkdir(parents=True, exist_ok=True)
+    prepped = prepare_skeleton_input_volume(
+        mask_u8,
+        skeleton_dir / 'preconditioned_mask.u8.dat',
+        workers=int(workers),
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
+    )
+
+    labels_mm, num_objects, label_paths = label_foreground_volume_streaming(
+        prepped,
+        skeleton_dir / 'component_labels',
+        keep_temp=bool(keep_temp),
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
+        wrap_axis=False,
+        workers=int(workers),
+    )
+    if int(num_objects) <= 0:
+        close_memmap_array(labels_mm)
+        if prepped is not mask_u8:
+            close_memmap_array(prepped)
+        if not bool(keep_temp):
+            for lp in label_paths:
+                try:
+                    lp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        return {'objects': 0, 'tasks': 0, 'chunked_components': 0, 'skeleton_voxels': 0}
+
+    print(f'Skeleton labeling found {int(num_objects)} object component(s); building component bounding boxes.')
+    component_slices = ndi.find_objects(labels_mm, max_label=int(num_objects))
+    tasks, task_stats = _build_skeleton_chunk_tasks(component_slices, tuple(int(x) for x in labels_mm.shape))
+    worker_count = _skeleton_worker_count(int(workers), max(1, len(tasks)))
+    print(
+        'Skeleton centerline tasks: '
+        f'tasks={int(task_stats["tasks"])}, full_components={int(task_stats["full_components"])}, '
+        f'chunked_components={int(task_stats["chunked_components"])}, workers={int(worker_count)}'
+    )
+    skeleton_voxel_counts = np.zeros((len(tasks),), dtype=np.int64)
+
+    def _process_task(task_idx: int) -> None:
+        task = tasks[int(task_idx)]
+        z_sl, y_sl, x_sl = task.read_slice
+        labels_block = np.asarray(labels_mm[z_sl, y_sl, x_sl])
+        comp = labels_block == int(task.label)
+        if not np.any(comp):
+            return
+        if _skeleton_component_fill_3d_holes_enabled():
+            comp = np.asarray(ndi.binary_fill_holes(comp), dtype=bool)
+        skel = centerline_skeletonize_component(comp)
+        if not np.any(skel):
+            return
+
+        core_z, core_y, core_x = task.core_slice
+        read_z0, read_y0, read_x0 = int(z_sl.start or 0), int(y_sl.start or 0), int(x_sl.start or 0)
+        z_rel0 = max(0, int(core_z.start or 0) - read_z0)
+        z_rel1 = min(int(skel.shape[0]), int(core_z.stop or 0) - read_z0)
+        y_rel0 = max(0, int(core_y.start or 0) - read_y0)
+        y_rel1 = min(int(skel.shape[1]), int(core_y.stop or 0) - read_y0)
+        x_rel0 = max(0, int(core_x.start or 0) - read_x0)
+        x_rel1 = min(int(skel.shape[2]), int(core_x.stop or 0) - read_x0)
+        if z_rel1 <= z_rel0 or y_rel1 <= y_rel0 or x_rel1 <= x_rel0:
+            return
+        skel_core = skel[z_rel0:z_rel1, y_rel0:y_rel1, x_rel0:x_rel1]
+        if not np.any(skel_core):
+            return
+
+        dst = out_mm[core_z, core_y, core_x]
+        dst[skel_core] = np.uint8(1)
+        skeleton_voxel_counts[int(task_idx)] = np.int64(np.count_nonzero(skel_core))
+
+    parallel_for_indices_chunked(
+        len(tasks),
+        _process_task,
+        max_workers=worker_count,
+        desc='Skeletonize components/chunks',
+        show_progress=True,
+        target_chunks_per_worker=1,
+    )
+    flush_array(out_mm)
+
+    skeleton_voxels = int(np.sum(skeleton_voxel_counts, dtype=np.int64))
+    close_memmap_array(labels_mm)
+    if prepped is not mask_u8:
+        close_memmap_array(prepped)
+    if not bool(keep_temp):
+        for lp in label_paths:
+            try:
+                lp.unlink(missing_ok=True)
+            except Exception:
+                pass
+    return {
+        'objects': int(num_objects),
+        'tasks': int(len(tasks)),
+        'chunked_components': int(task_stats['chunked_components']),
+        'skeleton_voxels': int(skeleton_voxels),
+    }
+
+
 def compute_skeleton_volume_to_workspace(
     mask_u8: np.ndarray,
     out_path: Path,
     *,
+    temp_dir: Path,
+    workers: int = 1,
+    keep_temp: bool = False,
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
 ) -> np.ndarray:
-    """Compute an optional 3D skeleton as a postprocessing output layer.
+    """Compute an optional 3D centerline skeleton as a postprocessing output layer.
 
     This is intentionally independent from interpolation. Interpolation endpoint seeds are
     discovered by per-slice connected-component scanning; this function runs only when
@@ -5734,9 +6249,22 @@ def compute_skeleton_volume_to_workspace(
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
     )
-    print('Computing optional 3D skeleton output; this is independent of interpolation endpoint discovery.')
-    skeleton_bool = skeletonize_volume(np.asarray(mask_u8, dtype=bool))
-    out_mm[:, :, :] = np.asarray(skeleton_bool, dtype=np.uint8)
+    print('Computing optional 3D centerline skeleton output; this is independent of interpolation endpoint discovery.')
+    stats = compute_centerline_skeleton_into_workspace(
+        mask_u8,
+        out_mm,
+        temp_dir=Path(temp_dir),
+        workers=int(workers),
+        keep_temp=bool(keep_temp),
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
+    )
+    print(
+        'Skeleton output stats: '
+        f'objects={int(stats.get("objects", 0))}, tasks={int(stats.get("tasks", 0))}, '
+        f'chunked_components={int(stats.get("chunked_components", 0))}, '
+        f'skeleton_voxels={int(stats.get("skeleton_voxels", 0))}'
+    )
     flush_array(out_mm)
     return out_mm
 
@@ -8069,20 +8597,58 @@ def _gray_to_rgb_frame(frame_gray: np.ndarray) -> np.ndarray:
     return np.repeat(arr[:, :, None], 3, axis=2)
 
 
+SKELETON_OVERLAY_BASE_DIM = 3072.0
+SKELETON_OVERLAY_BASE_THICKNESS_PX = 10.0
+
+
+def skeleton_overlay_thickness_px(frame_h: int, frame_w: int) -> int:
+    scale = max(float(frame_h), float(frame_w)) / float(SKELETON_OVERLAY_BASE_DIM)
+    return max(1, int(round(float(SKELETON_OVERLAY_BASE_THICKNESS_PX) * scale)))
+
+
+_SKELETON_OVERLAY_KERNEL_CACHE: Dict[int, np.ndarray] = {}
+
+
+def skeleton_overlay_mask_2d(skeleton_slice: np.ndarray, frame_h: int, frame_w: int) -> np.ndarray:
+    skel = np.asarray(skeleton_slice, dtype=np.uint8)
+    if skel.shape != (int(frame_h), int(frame_w)):
+        skel = cv2.resize(
+            (skel > 0).astype(np.uint8, copy=False),
+            (int(frame_w), int(frame_h)),
+            interpolation=cv2.INTER_NEAREST,
+        )
+    skel = (skel > 0).astype(np.uint8, copy=False)
+    if not np.any(skel):
+        return np.zeros((int(frame_h), int(frame_w)), dtype=bool)
+    thickness = skeleton_overlay_thickness_px(int(frame_h), int(frame_w))
+    if thickness <= 1:
+        return skel.astype(bool, copy=False)
+    kernel = _SKELETON_OVERLAY_KERNEL_CACHE.get(int(thickness))
+    if kernel is None:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(thickness), int(thickness)))
+        _SKELETON_OVERLAY_KERNEL_CACHE[int(thickness)] = kernel
+    return cv2.dilate(skel, kernel, iterations=1).astype(bool, copy=False)
+
+
 def write_overlay_video(
     volume_rgb: np.memmap,  # (T,H,W) gray/luma
     mask_u8: np.ndarray,    # (T,H,W) 0/1
     out_path: Path,
     fps: float,
+    skeleton_u8: Optional[np.ndarray] = None,
     show_progress: bool = True,
 ) -> None:
-    """Overlay blue masks (50% alpha) on original transverse frames.
+    """Overlay blue masks (50% alpha) and optional red skeleton on transverse frames.
 
     The working source volume is single-channel; frames are expanded to RGB only for this
-    presentation video so the segmentation can remain blue.
+    presentation video so the segmentation can remain blue.  When supplied, the skeleton
+    is drawn fully opaque red on top of the mask overlay at 10 px for a 3072 px frame,
+    scaled isotropically for other output sizes.
     """
     T, H, W = volume_rgb.shape
     assert mask_u8.shape == (T, H, W)
+    if skeleton_u8 is not None:
+        assert skeleton_u8.shape == (T, H, W)
 
     proc = ffmpeg_ffv1_rgb_writer(
         out_path,
@@ -8092,6 +8658,7 @@ def write_overlay_video(
     )
 
     blue = np.array([0, 0, 255], dtype=np.uint8)  # RGB blue
+    red = np.array([255, 0, 0], dtype=np.uint8)   # RGB red
 
     try:
         assert proc.stdin is not None
@@ -8100,6 +8667,10 @@ def write_overlay_video(
             m = mask_u8[t].astype(bool)
             if m.any():
                 frame[m] = ((frame[m].astype(np.uint16) + blue.astype(np.uint16)) // 2).astype(np.uint8)
+            if skeleton_u8 is not None:
+                skel = skeleton_overlay_mask_2d(np.asarray(skeleton_u8[int(t)]), int(H), int(W))
+                if np.any(skel):
+                    frame[skel] = red
             proc.stdin.write(np.ascontiguousarray(frame).tobytes())
     finally:
         close_ffmpeg_writer(proc)
@@ -9079,10 +9650,11 @@ def write_overlay_video_for_view(
     view: ViewInfo,
     out_path: Path,
     fps: float,
+    skeleton_u8: Optional[np.ndarray] = None,
     show_progress: bool = True,
 ) -> None:
     if view.name == 'transverse':
-        write_overlay_video(volume_rgb, mask_u8, out_path, fps, show_progress=show_progress)
+        write_overlay_video(volume_rgb, mask_u8, out_path, fps, skeleton_u8=skeleton_u8, show_progress=show_progress)
         return
 
     proc = ffmpeg_ffv1_rgb_writer(
@@ -9092,20 +9664,33 @@ def write_overlay_video_for_view(
         fps=fps,
     )
     blue = np.array([0, 0, 255], dtype=np.uint8)
+    red = np.array([255, 0, 0], dtype=np.uint8)
 
     try:
         assert proc.stdin is not None
-        iterator = zip(iter_view_frames(volume_rgb, view), iter_view_mask_frames(mask_u8, view))
-        for frame_rgb, frame_mask in tqdm(
+        if skeleton_u8 is None:
+            iterator = zip(iter_view_frames(volume_rgb, view), iter_view_mask_frames(mask_u8, view))
+        else:
+            iterator = zip(iter_view_frames(volume_rgb, view), iter_view_mask_frames(mask_u8, view), iter_view_mask_frames(skeleton_u8, view))
+        for items in tqdm(
             iterator,
             total=view.num_slices,
             desc=f'Writing {view.name} overlay video ({out_path.name})',
             disable=not show_progress,
         ):
+            if skeleton_u8 is None:
+                frame_rgb, frame_mask = items
+                frame_skeleton = None
+            else:
+                frame_rgb, frame_mask, frame_skeleton = items
             frame = _gray_to_rgb_frame(np.asarray(frame_rgb))
             m = np.asarray(frame_mask, dtype=bool)
             if np.any(m):
                 frame[m] = ((frame[m].astype(np.uint16) + blue.astype(np.uint16)) // 2).astype(np.uint8)
+            if frame_skeleton is not None:
+                skel = skeleton_overlay_mask_2d(np.asarray(frame_skeleton), int(view.src_h), int(view.src_w))
+                if np.any(skel):
+                    frame[skel] = red
             proc.stdin.write(np.ascontiguousarray(frame).tobytes())
     finally:
         close_ffmpeg_writer(proc)
@@ -9212,6 +9797,7 @@ def write_additional_view_outputs(
     *,
     volume_rgb: np.memmap,
     mask_u8: np.ndarray,
+    skeleton_u8: Optional[np.ndarray] = None,
     view: ViewInfo,
     out_dir: Path,
     stem: str,
@@ -9225,7 +9811,7 @@ def write_additional_view_outputs(
     pretty = view_output_token(view)
     tag_suffix = f'_{tag}' if tag else ''
     overlay_path = out_dir / f'{stem}_{pretty}_Overlay{tag_suffix}.mkv'
-    write_overlay_video_for_view(volume_rgb, mask_u8, view, overlay_path, fps, show_progress=show_progress)
+    write_overlay_video_for_view(volume_rgb, mask_u8, view, overlay_path, fps, skeleton_u8=skeleton_u8, show_progress=show_progress)
     result_paths: Dict[str, Path] = {f'{view.name}_overlay': overlay_path}
 
     labels_pattern = _resolve_output_pattern(save_labels_pattern_value, DEFAULT_LABEL_PATTERN, out_dir, stem)
@@ -9321,6 +9907,7 @@ def collect_pipeline_output_futures(
     *,
     volume_rgb: np.memmap,
     mask_u8: np.ndarray,
+    skeleton_u8: Optional[np.ndarray] = None,
     out_dir: Path,
     stem: str,
     fps: float,
@@ -9339,7 +9926,15 @@ def collect_pipeline_output_futures(
     tag_suffix = f"_{tag}" if tag else ""
 
     overlay_path = out_dir / f"{stem}_Overlay{tag_suffix}.mkv"
-    futures.append(executor.submit(write_overlay_video, volume_rgb, mask_u8, overlay_path, fps, show_progress))
+    futures.append(executor.submit(
+        write_overlay_video,
+        volume_rgb,
+        mask_u8,
+        overlay_path,
+        fps,
+        skeleton_u8=skeleton_u8,
+        show_progress=show_progress,
+    ))
     result_paths["overlay"] = overlay_path
 
     labels_pattern = _resolve_output_pattern(save_labels_pattern_value, DEFAULT_LABEL_PATTERN, out_dir, stem)
@@ -9384,6 +9979,7 @@ def collect_multiplanar_output_futures(
     *,
     volume_rgb: np.memmap,
     mask_u8: np.ndarray,
+    skeleton_u8: Optional[np.ndarray] = None,
     out_dir: Path,
     stem: str,
     fps: float,
@@ -9421,7 +10017,16 @@ def collect_multiplanar_output_futures(
         tag_suffix = f'_{tag}' if tag else ''
 
         overlay_path = out_dir / f'{stem}_{pretty}_Overlay{tag_suffix}.mkv'
-        futures.append(executor.submit(write_overlay_video_for_view, volume_rgb, mask_u8, view, overlay_path, fps, show_progress))
+        futures.append(executor.submit(
+            write_overlay_video_for_view,
+            volume_rgb,
+            mask_u8,
+            view,
+            overlay_path,
+            fps,
+            skeleton_u8=skeleton_u8,
+            show_progress=show_progress,
+        ))
         result_paths[f'{view.name}_overlay'] = overlay_path
 
         labels_pattern = _resolve_output_pattern(save_labels_pattern_value, DEFAULT_LABEL_PATTERN, out_dir, stem)
@@ -9975,12 +10580,16 @@ def write_low_quality_overlay_video(
     mask_u8: np.ndarray,
     out_path: Path,
     fps: float,
+    skeleton_u8: Optional[np.ndarray] = None,
     show_progress: bool = True,
 ) -> Path:
     t_dim, h_dim, w_dim = volume_gray.shape
     assert mask_u8.shape == (t_dim, h_dim, w_dim)
+    if skeleton_u8 is not None:
+        assert skeleton_u8.shape == (t_dim, h_dim, w_dim)
     proc = ffmpeg_h264_rgb_writer(out_path, int(w_dim), int(h_dim), float(fps))
     blue = np.array([0, 0, 255], dtype=np.uint8)
+    red = np.array([255, 0, 0], dtype=np.uint8)
     try:
         assert proc.stdin is not None
         for t in tqdm(range(int(t_dim)), desc=f'Writing low-quality overlay ({out_path.name})', disable=not show_progress):
@@ -9988,6 +10597,10 @@ def write_low_quality_overlay_video(
             m = np.asarray(mask_u8[int(t)], dtype=bool)
             if np.any(m):
                 frame[m] = ((frame[m].astype(np.uint16) + blue.astype(np.uint16)) // 2).astype(np.uint8)
+            if skeleton_u8 is not None:
+                skel = skeleton_overlay_mask_2d(np.asarray(skeleton_u8[int(t)]), int(h_dim), int(w_dim))
+                if np.any(skel):
+                    frame[skel] = red
             proc.stdin.write(np.ascontiguousarray(frame).tobytes())
     finally:
         close_ffmpeg_writer(proc)
@@ -10016,15 +10629,17 @@ def save_low_quality_outputs(
     *,
     volume_gray: np.ndarray,
     mask_u8: np.ndarray,
+    skeleton_u8: Optional[np.ndarray] = None,
     out_dir: Path,
     stem: str,
     fps: float,
     downbin_specs: Sequence[LowQualityDownbinSpec],
     temp_dir: Path,
+    nrrd_layer_refs: Optional[Sequence[NrrdLayerRef]] = None,
     workers: int = 1,
     show_progress: bool = True,
 ) -> Dict[str, Path]:
-    """Write v10.1.0 low-quality outputs with isotropic X/Y/t resizing."""
+    """Write v10.1.1 low-quality outputs with isotropic X/Y/t resizing."""
     low_root = out_dir / 'low_quality'
     low_root.mkdir(parents=True, exist_ok=True)
     result_paths: Dict[str, Path] = {'low_quality_dir': low_root}
@@ -10062,13 +10677,34 @@ def save_low_quality_outputs(
             prefer_memory=True,
             desc=f'Low-quality mask resize {spec.token}',
         )
+        skeleton_lq: Optional[np.ndarray] = None
+        if skeleton_u8 is not None:
+            skeleton_lq = resize_binary_mask_volume_to_shape(
+                skeleton_u8,
+                (out_t, out_h, out_w),
+                temp_dir / 'low_quality' / spec.token / 'skeleton.u8.dat',
+                workers=int(workers),
+                prefer_memory=True,
+                desc=f'Low-quality skeleton resize {spec.token}',
+            )
         try:
             overlay_path = spec_dir / f'{stem}_Overlay_LowQuality_{spec.token}.mp4'
             binary_path = spec_dir / f'{stem}_Binary_LowQuality_{spec.token}.mp4'
             nrrd_path = spec_dir / f'{stem}_LowQuality_{spec.token}.nrrd'
-            write_low_quality_overlay_video(gray_lq, mask_lq, overlay_path, fps_lq, show_progress=show_progress)
+            write_low_quality_overlay_video(gray_lq, mask_lq, overlay_path, fps_lq, skeleton_u8=skeleton_lq, show_progress=show_progress)
             write_low_quality_binary_video(mask_lq, binary_path, fps_lq, show_progress=show_progress)
-            write_nrrd(mask_lq, nrrd_path)
+            if nrrd_layer_refs is not None and len(nrrd_layer_refs) > 0:
+                write_decomposed_nrrd(
+                    list(nrrd_layer_refs),
+                    mask_lq,
+                    nrrd_path,
+                    temp_dir=temp_dir / 'low_quality' / spec.token / 'nrrd_decomposed',
+                    workers=int(workers),
+                    include_final_output_layer=True,
+                )
+                result_paths[f'low_quality_{spec.token}_nrrd_manifest'] = nrrd_path.with_suffix(nrrd_path.suffix + '.manifest.json')
+            else:
+                write_nrrd(mask_lq, nrrd_path)
             result_paths[f'low_quality_{spec.token}_overlay'] = overlay_path
             result_paths[f'low_quality_{spec.token}_binary_video'] = binary_path
             result_paths[f'low_quality_{spec.token}_nrrd'] = nrrd_path
@@ -10077,6 +10713,8 @@ def save_low_quality_outputs(
                 close_memmap_array(gray_lq)
             if mask_lq is not mask_u8:
                 close_memmap_array(mask_lq)
+            if skeleton_lq is not None and skeleton_lq is not skeleton_u8:
+                close_memmap_array(skeleton_lq)
 
     return result_paths
 
@@ -10414,7 +11052,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('v10.1.0_SLURM accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('v10.1.1_SLURM accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -10464,6 +11102,10 @@ def main() -> None:
     if not (-90.0 < float(args.interpolation_search_angle) < 90.0):
         raise ValueError('--interpolation_search_angle must be greater than -90 and less than 90')
     low_quality_requested = bool(args.save_low_quality or args.save_low_quality_downbin is not None)
+    # Low-quality NRRDs must mirror the full decomposed NRRD layer stack.  Therefore layer
+    # materialization is needed whenever a low-quality NRRD will be written, even if the user did
+    # not also request the full-size --save_nrrd output.
+    nrrd_layers_needed = bool(args.save_nrrd or low_quality_requested)
 
     out_dir = Path(args.output).expanduser().resolve() if args.output else (Path.cwd() / input_path.stem)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -10568,6 +11210,10 @@ def main() -> None:
                 for spec in low_quality_downbin_specs
             )
         )
+        spec_notes.append(
+            'Low-quality NRRDs use the same decomposed component layer stack as the full NRRD, '
+            'streamed directly into the requested low-quality geometry with its own manifest sidecar.'
+        )
     if (int(T), int(H), int(W)) != (int(input_T), int(input_H), int(input_W)):
         spec_notes.append(
             f'Working volume resized to v10.1.0 approximately-cubic processing geometry '
@@ -10607,7 +11253,16 @@ def main() -> None:
         )
     else:
         spec_notes.append('Gaussian smoothing disabled by default; --gaussian_smoothing enables it, and --gaussian_smoothing_passes > 1 enables it with the default sigma.')
-    spec_notes.append('Interpolation endpoint discovery uses the v10.1.0 per-slice connected-component scan; skeletonization is never used for interpolation and runs only when --save_skeleton is requested.')
+    spec_notes.append(
+        'Interpolation endpoint discovery uses the v10.1.0 per-slice connected-component scan; '
+        'skeletonization is never used for interpolation and runs only when --save_skeleton is requested. '
+        'Optional skeleton output uses slice-parallel pore preconditioning plus component/chunk based 3D Lee thinning; '
+        'overlay videos draw the skeleton as fully opaque red on top of the 50% blue mask overlay.'
+    )
+    spec_notes.append(
+        f'Cubic resize T-axis backend={_cube_t_axis_resize_backend()}; set YOLO_TTA_CUBE_T_RESIZE_BACKEND=slice_exact '
+        'to recover the previous endpoint-aligned per-slice interpolation path.'
+    )
     if transverse_inference_disabled:
         note = (
             'v10.1.0 specification note: Section 2.1.1 says Transverse must always be created, while '
@@ -11033,7 +11688,7 @@ def main() -> None:
             keep_temp=bool(args.troubleshooting),
             slice_workers=int(slice_postprocess_workers),
             interpolation_task_workers=int(parent_interpolation_task_workers),
-            nrrd_layers_enabled=bool(args.save_nrrd),
+            nrrd_layers_enabled=bool(nrrd_layers_needed),
         )
         view_processing_futures[fut] = key
 
@@ -11131,7 +11786,7 @@ def main() -> None:
             keep_temp=bool(args.troubleshooting),
             slice_workers=int(tile_slice_postprocess_workers),
             interpolation_task_workers=int(tile_interpolation_task_workers),
-            nrrd_layers_enabled=bool(args.save_nrrd),
+            nrrd_layers_enabled=bool(nrrd_layers_needed),
             tile_parent_mask_accumulator_mm=tile_parent_mask_accumulator_by_parent.get(parent_key),
             tile_parent_bridge_accumulator_mm=tile_parent_bridge_accumulator_by_parent.get(parent_key),
         )
@@ -11169,7 +11824,7 @@ def main() -> None:
         parent_bridge_support_mm = None
         tile_parent_mask_accumulator_mm = None
         tile_parent_bridge_accumulator_mm = None
-        if bool(args.save_nrrd):
+        if bool(nrrd_layers_needed):
             parent_mask_support_mm = parent_mask_support_by_model.get(result.model_name, {}).get(result.view_name)
             parent_bridge_support_mm = parent_bridge_support_by_model.get(result.model_name, {}).get(result.view_name)
             tile_parent_mask_accumulator_mm = _get_tile_category_accumulator(result.model_name, result.view_name, 'parent_mask')
@@ -11574,7 +12229,7 @@ def main() -> None:
         workers=slice_postprocess_workers,
     )
 
-    if bool(args.save_nrrd):
+    if bool(nrrd_layers_needed):
         pre_smoothing_ref = materialize_nrrd_global_layer(
             final_union_mm,
             model_name=str(model_name),
@@ -11600,7 +12255,7 @@ def main() -> None:
             keep_temp=bool(args.troubleshooting),
             prefer_memory=True,
             workers=slice_postprocess_workers,
-            nrrd_layers=nrrd_layer_refs if bool(args.save_nrrd) else None,
+            nrrd_layers=nrrd_layer_refs if bool(nrrd_layers_needed) else None,
             nrrd_model_name=str(model_name),
         )
 
@@ -11624,9 +12279,12 @@ def main() -> None:
         skeleton_processing_mm = compute_skeleton_volume_to_workspace(
             final_union_mm,
             temp_dir / 'skeleton' / 'final_skeleton_processing_geometry.u8.dat',
+            temp_dir=temp_dir,
+            workers=int(slice_postprocess_workers),
+            keep_temp=bool(args.troubleshooting),
             prefer_memory=True,
         )
-        if bool(args.save_nrrd):
+        if bool(nrrd_layers_needed):
             skeleton_ref = materialize_nrrd_global_layer(
                 skeleton_processing_mm,
                 model_name=str(model_name),
@@ -11656,9 +12314,7 @@ def main() -> None:
     final_output_volume_for_low_quality = output_volume_rgb
     final_paths: Dict[str, Path] = {}
 
-    if bool(args.save_skeleton) and not bool(args.save_nrrd) and skeleton_processing_mm is not None:
-        print('\n=== Writing skeleton-only NRRD ===')
-        skeleton_path = out_dir / f'{input_path.stem}_Skeleton.nrrd'
+    if bool(args.save_skeleton) and skeleton_processing_mm is not None:
         if (int(T), int(H), int(W)) != (output_T, output_H, output_W):
             skeleton_output_mm = restore_mask_volume_to_original_shape(
                 skeleton_processing_mm,
@@ -11669,8 +12325,11 @@ def main() -> None:
             )
         else:
             skeleton_output_mm = skeleton_processing_mm
-        write_nrrd(skeleton_output_mm, skeleton_path)
-        final_paths['skeleton_nrrd'] = skeleton_path
+        if not bool(args.save_nrrd):
+            print('\n=== Writing skeleton-only NRRD ===')
+            skeleton_path = out_dir / f'{input_path.stem}_Skeleton.nrrd'
+            write_nrrd(skeleton_output_mm, skeleton_path)
+            final_paths['skeleton_nrrd'] = skeleton_path
 
     output_radial_angle = 0.0
     if float(resolved_azimuth_angle) > 0.0:
@@ -11724,6 +12383,7 @@ def main() -> None:
         output_manager.executor,
         volume_rgb=output_volume_rgb,
         mask_u8=final_output_mask_mm,
+        skeleton_u8=skeleton_output_mm if bool(args.save_skeleton) else None,
         out_dir=out_dir,
         stem=input_path.stem,
         fps=fps,
@@ -11742,6 +12402,7 @@ def main() -> None:
             output_manager.executor,
             volume_rgb=output_volume_rgb,
             mask_u8=final_output_mask_mm,
+            skeleton_u8=skeleton_output_mm if bool(args.save_skeleton) else None,
             out_dir=out_dir,
             stem=input_path.stem,
             fps=fps,
@@ -11798,20 +12459,22 @@ def main() -> None:
         low_quality_paths = save_low_quality_outputs(
             volume_gray=final_output_volume_for_low_quality,
             mask_u8=final_output_mask_mm,
+            skeleton_u8=skeleton_output_mm if bool(args.save_skeleton) else None,
             out_dir=out_dir,
             stem=input_path.stem,
             fps=fps,
             downbin_specs=low_quality_downbin_specs,
             temp_dir=temp_dir,
+            nrrd_layer_refs=nrrd_layer_refs,
             workers=output_workers,
             show_progress=False,
         )
         final_paths.update(low_quality_paths)
 
-    if bool(args.save_nrrd):
+    if bool(nrrd_layers_needed):
         spec_notes.append(
             f'Decomposed NRRD component layers prepared: {int(len(nrrd_layer_refs))}; '
-            'the writer appends one final_output layer and writes a .nrrd.manifest.json sidecar.'
+            'the writer appends one final_output layer and writes .nrrd.manifest.json sidecars for full-size and low-quality decomposed NRRDs.'
         )
 
     summary_path = write_summary_file(
