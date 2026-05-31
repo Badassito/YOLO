@@ -2,8 +2,8 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v10.1.1_SLURM single-channel-aligned script:
-  - builds Transverse, optional Tilted Transverse, independently optional Sagittal/Coronal, and optional Radial view families using single-channel intermediates
+This v11.0.0_SLURM single-channel-aligned script:
+  - builds Transverse, optional generalized Tilted Views for Transverse/Sagittal/Coronal, independently optional upright Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - renders parent/full-frame videos directly from the native view transform so inference no longer waits on
     a separately rendered canvas video, and derives non-radial tile videos from shared canvas batches so the
     same rotated frames are not re-decoded once per tile
@@ -20,13 +20,12 @@ This v10.1.1_SLURM single-channel-aligned script:
     and buffers queued frame payloads in RAM so GPU inference is not paced by CPU mask accumulation
   - reuses a native radial frame cache during dense tiled rendering so radial tiles do not recompute
     the same Lanczos-3 slices for every tile location
-  - inverse-maps predictions only into each generated video's native view space, keeps Radial and Tilted
-    Transverse results view-native through cleanup/interpolation, then backprojects them after per-view processing
+  - inverse-maps predictions only into each generated video's native view space, keeps Radial and Tilted View results view-native through cleanup/interpolation, then backprojects them after per-view processing
   - treats --model as a single YOLO segmentation model path; multiple-model inference is not supported in this script
   - applies final 3D void fill only when --enable_3d_void_fill is active, and only once after the global union
   - keeps Gaussian smoothing disabled by default; --gaussian_smoothing enables it with an optional sigma,
     and --gaussian_smoothing_passes > 1 enables it with the default sigma when no sigma is provided
-  - supports Radial and Tilted Transverse view-native interpolation, and keeps Tilted Transverse frame N centered on native slice N with black-padded out-of-bounds shear samples
+  - supports Radial and generalized Tilted View-native interpolation, and keeps every Tilted View frame N centered on its base view native slice N with black-padded out-of-bounds shear samples
   - resizes the working volume to an approximately cubic orthogonal volume when needed, restores the final mask to the original input dimensions for default outputs,
     and saves the transverse default color overlay plus optional labels, bilevel compressed TIFF binary masks, binary MKVs,
     decomposed multi-layer NRRD, active-view image sequences, optional skeleton NRRDs/layers, and isotropically downsampled
@@ -132,6 +131,7 @@ def _parse_int_list(values: Sequence[str] | str | int | None) -> List[int]:
     return [int(p) for p in parts]
 
 
+# DEAD_CODE_MARKER(v11): no in-script call sites in the current v11 scheduler; retained for compatibility/regression and intentionally not pruned yet.
 def _parse_float_list(values: Sequence[str] | str | float | int | None) -> List[float]:
     """Accept comma and/or whitespace separated floating point lists."""
     if values is None:
@@ -196,6 +196,25 @@ def resolve_tilt_directions(values: Sequence[str] | str | None) -> List[str]:
     return out
 
 
+def resolve_tilt_views(values: Sequence[str] | str | None) -> List[str]:
+    """Resolve v11 Tilted View base-view selections.
+
+    Tilted Views are derived from Cartesian base views only.  The selected base
+    view does not need to be enabled as an upright view; e.g. ``--tilt_view
+    sagittal`` is valid even without ``--enable_sagittal``.
+    """
+    raw = [str(v).strip().lower() for v in _parse_token_list(values)]
+    out: List[str] = []
+    for token in raw:
+        if token not in ('transverse', 'sagittal', 'coronal'):
+            raise ValueError("--tilt_view values must be transverse, sagittal, or coronal")
+        if token not in out:
+            out.append(token)
+    if not out:
+        out = ['transverse']
+    return out
+
+
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="YOLO segmentation TTA for large cylindrical video volumes.",
@@ -230,15 +249,17 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--enable_radial", action="store_true", help="Enable Radial views")
     p.add_argument("--azimuth_angle", default=None, type=float,
                    help="Angular spacing in degrees for radial diameter slices over [0,180]. When --enable_radial is active and this is omitted, defaults to the largest angle that guarantees full ROI coverage. 0 disables radial views")
+    p.add_argument("--tilt_view", nargs="+", default=["transverse"], type=str,
+                   help="One or more Cartesian base views for v11 Tilted Views: transverse, sagittal, or coronal. A tilted base view does not need to be enabled as an upright view")
     p.add_argument("--tilt_angle", nargs="+", default=["0"], type=str,
-                   help="One or more positive Tilted Transverse angles in degrees. Each value creates both positive and negative variants. 0 disables tilted transverse views")
+                   help="One or more positive Tilted View angles in degrees. Each value creates both positive and negative variants. 0 disables all Tilted Views")
     p.add_argument("--tilt_direction", nargs="+", default=["vertical"], type=str,
-                   help="One or more Tilted Transverse directions: vertical, horizontal, or both")
+                   help="One or more Tilted View directions: vertical, horizontal, or both")
 
     p.add_argument("--tile_size", nargs="+", default=["0"], type=str,
                    help="One or more square dense-tile side lengths in source pixels for all active views. 0 disables dense tiled predictions")
     p.add_argument("--tile_stride", nargs="+", default=["0"], type=str,
-                   help="One or more dense-tile strides in source pixels. Must match --tile_size when dense tiling is active")
+                   help="One or more dense-tile strides in source pixels. v11 forms a Cartesian product with --tile_size; each stride must be <= each active tile size")
 
     p.add_argument("--save_images", action="store_true", help="Save unlabeled image sequences for all active views")
     p.add_argument("--save_labels", nargs="?", const="__DEFAULT__", default=None, type=str,
@@ -255,10 +276,10 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--voxel_volume", action="store_true", help="Count white voxels in the final binary output after restoration to native input geometry and save the value to the summary text file")
     p.add_argument("--enable_3d_void_fill", action="store_true",
                    help="Apply one final 3D enclosed-void fill after the global union. Disabled by default")
-    p.add_argument("--gaussian_smoothing", nargs="?", const=3.0, default=None, type=float, metavar="SIGMA",
-                   help="Enable final 3D Gaussian smoothing. Optionally provide the Gaussian standard deviation in voxel units; when the flag is present without a value, SIGMA defaults to 3.0. Disabled by default unless --gaussian_smoothing_passes > 1")
+    p.add_argument("--gaussian_smoothing", nargs="?", const=3.0, default=3.0, type=float, metavar="SIGMA",
+                   help="Final 3D Gaussian smoothing sigma in voxel units. v11 default is 3.0; set to 0 to disable")
     p.add_argument("--gaussian_smoothing_passes", default=1, type=int,
-                   help="Number of Gaussian smoothing passes. The default value of 1 does nothing unless --gaussian_smoothing is provided; values greater than 1 automatically enable smoothing with the default sigma when no sigma is provided")
+                   help="Number of Gaussian smoothing passes. v11 smoothing is active by default with --gaussian_smoothing 3.0; set --gaussian_smoothing 0 to disable")
 
     p.add_argument("--troubleshooting", action="store_true",
                    help="Keep temporary files and save outputs before each interpolation pass")
@@ -306,6 +327,7 @@ def available_anon_work_bytes() -> int:
     return max(0, mem_avail + swap_free)
 
 
+# DEAD_CODE_MARKER(v11): no in-script call sites in the current v11 scheduler; retained for compatibility/regression and intentionally not pruned yet.
 def total_anon_capacity_bytes() -> int:
     info = _read_meminfo_bytes()
     mem_total = int(info.get('MemTotal', 0))
@@ -365,7 +387,7 @@ def _cpu_count() -> int:
 def default_worker_budget() -> int:
     """Intentional CPU oversubscription for mixed GPU/IO/CPU workloads.
 
-    The v10.1.0 SLURM target has enough CPU headroom that running roughly 2x the visible CPU count
+    The v11.0.0 SLURM target has enough CPU headroom that running roughly 2x the visible CPU count
     helps keep ffmpeg, view rendering, interpolation planning, and output writers busy while the GPU
     is inferencing or waiting on a different stage.
     """
@@ -927,7 +949,7 @@ def compute_cube_resize_shape(
 ) -> Tuple[int, int, int]:
     """Return the minimal processing shape whose dimensions are within tolerance of the longest axis.
 
-    v10.1.0 requires the orthogonal working volume to be approximately cubic.  The implementation
+    v11.0.0 requires the orthogonal working volume to be approximately cubic.  The implementation
     preserves any axis that is already within the tolerated band and upsamples shorter axes only
     enough to reach ``(1 - tolerance) * longest``.  This avoids unnecessary XY resampling for the
     common 3072x3072x1930 case while still satisfying the 5% cube constraint.
@@ -944,6 +966,7 @@ def compute_cube_resize_shape(
     )
 
 
+# DEAD_CODE_MARKER(v11): no in-script call sites in the current v11 scheduler; retained for compatibility/regression and intentionally not pruned yet.
 def volume_shape_within_cube_tolerance(
     shape: Tuple[int, int, int],
     tolerance: float = 0.05,
@@ -1033,7 +1056,7 @@ def resize_volume_t_axis_only_gray8_slab(
         shape=(out_t_i, in_h, in_w),
         dtype=np.uint8,
         path=out_path,
-        desc='v10.1.1 cubic processing volume (parallel T-axis slab resize)',
+        desc='v11.0.0 cubic processing volume (parallel T-axis slab resize)',
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
     )
@@ -1076,7 +1099,7 @@ def resize_volume_t_axis_only_gray8_slab(
             len(ranges),
             _resize_slab,
             max_workers=worker_count,
-            desc='Resizing orthogonal volume to v10.1.1 cube (T-axis slabs)',
+            desc='Resizing orthogonal volume to v11.0.0 cube (T-axis slabs)',
             show_progress=True,
             chunk_size=1,
         )
@@ -1100,7 +1123,7 @@ def resize_volume_to_processing_cube_gray8(
     prefer_memory: bool = True,
     reserve_bytes: int = 32 * GIB,
 ) -> np.ndarray:
-    """Resample a gray8 (t,Y,X) volume to the v10.1.0 approximately-cubic processing shape."""
+    """Resample a gray8 (t,Y,X) volume to the v11.0.0 approximately-cubic processing shape."""
     in_t, in_h, in_w = (int(volume_gray.shape[0]), int(volume_gray.shape[1]), int(volume_gray.shape[2]))
     out_t, out_h, out_w = (int(out_shape[0]), int(out_shape[1]), int(out_shape[2]))
     if (in_t, in_h, in_w) == (out_t, out_h, out_w):
@@ -1120,7 +1143,7 @@ def resize_volume_to_processing_cube_gray8(
         shape=(out_t, out_h, out_w),
         dtype=np.uint8,
         path=out_path,
-        desc='v10.1.0 cubic processing volume',
+        desc='v11.0.0 cubic processing volume',
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
     )
@@ -1152,7 +1175,7 @@ def resize_volume_to_processing_cube_gray8(
         int(out_t),
         _render_target_slice,
         max_workers=worker_count,
-        desc='Resizing orthogonal volume to v10.1.0 cube',
+        desc='Resizing orthogonal volume to v11.0.0 cube',
         chunk_size=chunk_size,
     )
     flush_array(out_mm)
@@ -1230,7 +1253,7 @@ def resolve_radial_azimuth_angle(
     enable_radial: bool,
     diameter: int,
 ) -> float:
-    """Resolve v10.1.0 radial activation and default full-coverage angle."""
+    """Resolve v11.0.0 radial activation and default full-coverage angle."""
     if requested_angle is not None:
         if float(requested_angle) <= 0.0:
             return 0.0
@@ -1282,6 +1305,7 @@ def ffmpeg_rawvideo_writer(
     return proc
 
 
+# DEAD_CODE_MARKER(v11): no in-script call sites in the current v11 scheduler; retained for compatibility/regression and intentionally not pruned yet.
 def ffmpeg_lossless_rgb_writer(
     out_path: Path,
     width: int,
@@ -1433,7 +1457,7 @@ def build_affine(
       source(native view) -> optional black-padding canvas -> rotation around canvas center
       -> scale to out_size x out_size
 
-    Cartesian views (Transverse, Sagittal, Coronal, and Tilted Transverse in-plane rotation) use
+    Cartesian views (Transverse, Sagittal, Coronal, and Tilted View in-plane rotation) use
     pad_mode='clamp', which rotates directly on the source-sized canvas so non-90° content that
     leaves the source frame is discarded. Radial uses pad_mode='pad' so non-90° radial rotations are
     black-padded before scaling.
@@ -1504,6 +1528,10 @@ def build_affine(
 # View slicing
 # --------------------------
 
+TILTED_VIEW_FAMILY = 'tilted'
+LEGACY_TILTED_TRANSVERSE_FAMILY = 'tilted_transverse'
+
+
 @dataclass(frozen=True)
 class ViewInfo:
     name: str
@@ -1526,6 +1554,77 @@ class ViewInfo:
     tilt_direction: str = ''
     tilt_frame_start: int = 0
     tilt_frame_stop: int = 0
+    tilt_base_view: str = ''
+    horizontal_axis: str = ''
+    vertical_axis: str = ''
+    stack_axis: str = ''
+
+
+def is_tilted_view(view: ViewInfo) -> bool:
+    """Return True for v11 generalized Tilted Views and legacy Tilted Transverse records."""
+    return str(view.family) in (TILTED_VIEW_FAMILY, LEGACY_TILTED_TRANSVERSE_FAMILY)
+
+
+def tilted_base_view_name(view: ViewInfo) -> str:
+    if str(view.tilt_base_view):
+        return str(view.tilt_base_view)
+    # DEAD_CODE_MARKER(v11): legacy v10 Tilted Transverse ViewInfo entries did not carry
+    # tilt_base_view. Keep this fallback until old temp metadata is no longer supported.
+    if str(view.family) == LEGACY_TILTED_TRANSVERSE_FAMILY:
+        return 'transverse'
+    return str(view.name)
+
+
+def cartesian_view_axis_spec(base_view: str, T: int, H: int, W: int) -> Dict[str, object]:
+    base = str(base_view).lower()
+    if base == 'transverse':
+        return {
+            'name': 'transverse',
+            'display_name': 'Transverse',
+            'num_slices': int(T),
+            'src_h': int(H),
+            'src_w': int(W),
+            'summary_family': 'transverse',
+            'horizontal_axis': 'x',
+            'vertical_axis': 'y',
+            'stack_axis': 't',
+        }
+    if base == 'sagittal':
+        return {
+            'name': 'sagittal',
+            'display_name': 'Sagittal',
+            'num_slices': int(H),
+            'src_h': int(T),
+            'src_w': int(W),
+            'summary_family': 'sagittal',
+            'horizontal_axis': 'x',
+            'vertical_axis': 't',
+            'stack_axis': 'y',
+        }
+    if base == 'coronal':
+        return {
+            'name': 'coronal',
+            'display_name': 'Coronal',
+            'num_slices': int(W),
+            'src_h': int(T),
+            'src_w': int(H),
+            'summary_family': 'coronal',
+            'horizontal_axis': 'y',
+            'vertical_axis': 't',
+            'stack_axis': 'x',
+        }
+    raise ValueError(f'Unsupported Cartesian base view: {base_view}')
+
+
+def tilted_stack_axis_length(view: ViewInfo) -> int:
+    axis = str(view.stack_axis or cartesian_view_axis_spec(tilted_base_view_name(view), view.full_t, view.full_h, view.full_w)['stack_axis'])
+    if axis == 't':
+        return int(view.full_t)
+    if axis == 'y':
+        return int(view.full_h)
+    if axis == 'x':
+        return int(view.full_w)
+    raise ValueError(f'Unsupported Tilted View stacking axis: {axis}')
 
 
 def build_radial_azimuths(azimuth_angle: float) -> List[float]:
@@ -1542,6 +1641,8 @@ def build_radial_azimuths(azimuth_angle: float) -> List[float]:
     return out
 
 
+# DEAD_CODE_MARKER(v11): diagnostic-only legacy helper retained for compatibility; v11 Tilted
+# Views keep frame N centered on native slice N and black-fill out-of-bounds samples.
 def compute_tilt_frame_range(
     t_dim: int,
     axis_len: int,
@@ -1549,8 +1650,8 @@ def compute_tilt_frame_range(
 ) -> Tuple[int, int]:
     """Return the legacy expanded tilted-frame range for diagnostic callers.
 
-    The v10.1.0 pipeline itself keeps Tilted Transverse frame counts equal to the native
-    transverse frame count and fills out-of-bounds shear samples with black.
+    The v11.0.0 pipeline itself keeps Tilted Views on their base view's native frame count
+    and fills out-of-bounds shear samples with black.
     """
     t_dim_i = int(t_dim)
     if t_dim_i <= 0:
@@ -1591,9 +1692,10 @@ def pretty_view_name(view: ViewInfo) -> str:
 
 
 def view_output_token(view: ViewInfo) -> str:
-    if view.family == 'tilted_transverse':
+    if is_tilted_view(view):
+        base = str(tilted_base_view_name(view)).capitalize()
         direction = str(view.tilt_direction or 'vertical').capitalize()
-        return f'TiltedTransverse_{direction}_{_format_signed_angle_token(float(view.tilt_angle_deg))}'
+        return f'Tilted{base}_{direction}_{_format_signed_angle_token(float(view.tilt_angle_deg))}'
     return pretty_view_name(view).replace(' ', '_')
 
 
@@ -1604,89 +1706,111 @@ def get_view_infos(
     disable_multiplanar: Optional[bool] = None,
     azimuth_angle: float = 0.0,
     include_radial: bool = True,
+    tilt_views: Optional[Sequence[str]] = None,
     tilt_angles: Optional[Sequence[float]] = None,
     tilt_directions: Optional[Sequence[str]] = None,
     enable_sagittal: bool = False,
     enable_coronal: bool = False,
 ) -> List[ViewInfo]:
-    # Backward-compatible alias for older command lines; v10.1.0 controls Sagittal and
+    # Backward-compatible alias for older command lines; v11.0.0 controls Sagittal and
     # Coronal independently via --enable_sagittal and --enable_coronal.
     if disable_multiplanar is not None:
         enable_sagittal = bool(enable_sagittal or (not bool(disable_multiplanar)))
         enable_coronal = bool(enable_coronal or (not bool(disable_multiplanar)))
 
+    transverse_spec = cartesian_view_axis_spec('transverse', T, H, W)
     views = [
         ViewInfo(
-            name='transverse',
-            num_slices=T,
-            src_h=H,
-            src_w=W,
+            name=str(transverse_spec['name']),
+            num_slices=int(transverse_spec['num_slices']),
+            src_h=int(transverse_spec['src_h']),
+            src_w=int(transverse_spec['src_w']),
             pad_mode='clamp',
             family='orthogonal',
-            summary_family='transverse',
-            display_name='Transverse',
+            summary_family=str(transverse_spec['summary_family']),
+            display_name=str(transverse_spec['display_name']),
             full_t=T,
             full_h=H,
             full_w=W,
+            tilt_base_view='transverse',
+            horizontal_axis=str(transverse_spec['horizontal_axis']),
+            vertical_axis=str(transverse_spec['vertical_axis']),
+            stack_axis=str(transverse_spec['stack_axis']),
         ),
     ]
     if bool(enable_sagittal):
+        spec = cartesian_view_axis_spec('sagittal', T, H, W)
         views.append(ViewInfo(
-            name='sagittal',
-            num_slices=H,
-            src_h=T,
-            src_w=W,
+            name=str(spec['name']),
+            num_slices=int(spec['num_slices']),
+            src_h=int(spec['src_h']),
+            src_w=int(spec['src_w']),
             pad_mode='clamp',
             family='orthogonal',
-            summary_family='sagittal',
-            display_name='Sagittal',
+            summary_family=str(spec['summary_family']),
+            display_name=str(spec['display_name']),
             full_t=T,
             full_h=H,
             full_w=W,
+            tilt_base_view='sagittal',
+            horizontal_axis=str(spec['horizontal_axis']),
+            vertical_axis=str(spec['vertical_axis']),
+            stack_axis=str(spec['stack_axis']),
         ))
     if bool(enable_coronal):
+        spec = cartesian_view_axis_spec('coronal', T, H, W)
         views.append(ViewInfo(
-            name='coronal',
-            num_slices=W,
-            src_h=T,
-            src_w=H,
+            name=str(spec['name']),
+            num_slices=int(spec['num_slices']),
+            src_h=int(spec['src_h']),
+            src_w=int(spec['src_w']),
             pad_mode='clamp',
             family='orthogonal',
-            summary_family='coronal',
-            display_name='Coronal',
+            summary_family=str(spec['summary_family']),
+            display_name=str(spec['display_name']),
             full_t=T,
             full_h=H,
             full_w=W,
+            tilt_base_view='coronal',
+            horizontal_axis=str(spec['horizontal_axis']),
+            vertical_axis=str(spec['vertical_axis']),
+            stack_axis=str(spec['stack_axis']),
         ))
 
     tilt_angles_resolved = [float(a) for a in (tilt_angles or []) if float(a) > 0.0]
     tilt_dirs_resolved = [str(v) for v in (tilt_directions or [])]
-    for tilt_direction in tilt_dirs_resolved:
-        for tilt_angle in tilt_angles_resolved:
-            for sign in (+1.0, -1.0):
-                signed_angle = float(sign * tilt_angle)
-                token = _format_signed_angle_token(signed_angle)
-                # v10.1.0 keeps Tilted Transverse on the native Transverse frame count:
-                # output frame N is centered on native slice N, with out-of-bounds shear samples
-                # at the start/end filled black.
-                tilt_frame_start, tilt_frame_stop = 0, int(T) - 1
-                views.append(ViewInfo(
-                    name=f'tilted_transverse_{tilt_direction}_{token}',
-                    num_slices=int(T),
-                    src_h=H,
-                    src_w=W,
-                    pad_mode='clamp',
-                    family='tilted_transverse',
-                    summary_family='tilted_transverse',
-                    display_name=f'Tilted Transverse {tilt_direction} {_format_signed_angle_label(signed_angle)}',
-                    full_t=T,
-                    full_h=H,
-                    full_w=W,
-                    tilt_angle_deg=signed_angle,
-                    tilt_direction=str(tilt_direction),
-                    tilt_frame_start=int(tilt_frame_start),
-                    tilt_frame_stop=int(tilt_frame_stop),
-                ))
+    tilt_views_resolved = resolve_tilt_views(tilt_views if tilt_views is not None else ['transverse'])
+    for base_view in tilt_views_resolved:
+        spec = cartesian_view_axis_spec(str(base_view), T, H, W)
+        for tilt_direction in tilt_dirs_resolved:
+            for tilt_angle in tilt_angles_resolved:
+                for sign in (+1.0, -1.0):
+                    signed_angle = float(sign * tilt_angle)
+                    token = _format_signed_angle_token(signed_angle)
+                    tilt_frame_start, tilt_frame_stop = 0, int(spec['num_slices']) - 1
+                    base_label = str(spec['display_name'])
+                    direction_label = str(tilt_direction).capitalize()
+                    views.append(ViewInfo(
+                        name=f'tilted_{base_view}_{tilt_direction}_{token}',
+                        num_slices=int(spec['num_slices']),
+                        src_h=int(spec['src_h']),
+                        src_w=int(spec['src_w']),
+                        pad_mode='clamp',
+                        family=TILTED_VIEW_FAMILY,
+                        summary_family=f'tilted_{base_view}_{tilt_direction}_{token}',
+                        display_name=f'Tilted {base_label} {direction_label} {_format_signed_angle_label(signed_angle)}',
+                        full_t=T,
+                        full_h=H,
+                        full_w=W,
+                        tilt_angle_deg=signed_angle,
+                        tilt_direction=str(tilt_direction),
+                        tilt_frame_start=int(tilt_frame_start),
+                        tilt_frame_stop=int(tilt_frame_stop),
+                        tilt_base_view=str(base_view),
+                        horizontal_axis=str(spec['horizontal_axis']),
+                        vertical_axis=str(spec['vertical_axis']),
+                        stack_axis=str(spec['stack_axis']),
+                    ))
 
     if include_radial and float(azimuth_angle) > 0.0:
         azimuths = tuple(build_radial_azimuths(float(azimuth_angle)))
@@ -1710,6 +1834,9 @@ def get_view_infos(
                 roi_radius=roi_radius,
                 full_h=H,
                 full_w=W,
+                horizontal_axis='r',
+                vertical_axis='t',
+                stack_axis='azimuth',
             )
         )
     return views
@@ -1859,6 +1986,10 @@ def write_aug_job_meta(job: AugJob, view: ViewInfo) -> None:
                 'src_h': view.src_h,
                 'tilt_angle_deg': float(view.tilt_angle_deg),
                 'tilt_direction': str(view.tilt_direction),
+                'tilt_base_view': str(view.tilt_base_view),
+                'horizontal_axis': str(view.horizontal_axis),
+                'vertical_axis': str(view.vertical_axis),
+                'stack_axis': str(view.stack_axis),
                 'tilt_frame_start': int(view.tilt_frame_start),
                 'tilt_frame_stop': int(view.tilt_frame_stop),
                 'out_size': int(job.aff.out_size),
@@ -1981,6 +2112,12 @@ class TileConfig:
 
 
 def resolve_tile_configs(tile_sizes_raw: Sequence[str] | str | int | None, tile_strides_raw: Sequence[str] | str | int | None) -> List[TileConfig]:
+    """Resolve v11 dense tile configurations as a Cartesian product.
+
+    v11 specifies that ``--tile_size`` and ``--tile_stride`` form a Cartesian
+    product, not paired zip entries.  ``--tile_size 1536,2048 --tile_stride
+    256,512`` therefore creates four tile configurations.
+    """
     tile_sizes = _parse_int_list(tile_sizes_raw)
     tile_strides = _parse_int_list(tile_strides_raw)
 
@@ -1989,28 +2126,29 @@ def resolve_tile_configs(tile_sizes_raw: Sequence[str] | str | int | None, tile_
     if not tile_strides:
         tile_strides = [0]
 
-    if len(tile_sizes) != len(tile_strides):
-        raise ValueError('--tile_size and --tile_stride must contain the same number of values')
+    if any(int(v) == 0 for v in tile_sizes):
+        if len(tile_sizes) == 1 and int(tile_sizes[0]) == 0:
+            if any(int(v) != 0 for v in tile_strides):
+                raise ValueError('--tile_stride must be 0 when --tile_size disables tiled predictions')
+            return []
+        raise ValueError('--tile_size 0 cannot be mixed with active tile sizes')
 
-    if len(tile_sizes) == 1 and int(tile_sizes[0]) == 0:
-        if any(int(v) != 0 for v in tile_strides):
-            raise ValueError('--tile_stride must be 0 when --tile_size disables tiled predictions')
-        return []
+    if any(int(v) <= 0 for v in tile_sizes):
+        raise ValueError('--tile_size values must be > 0 when dense tiling is active')
+    if any(int(v) <= 0 for v in tile_strides):
+        raise ValueError('--tile_stride values must be > 0 when dense tiling is active')
 
     configs: List[TileConfig] = []
     seen: set[str] = set()
-    for tile_size, tile_stride in zip(tile_sizes, tile_strides):
-        if int(tile_size) <= 0:
-            raise ValueError('--tile_size values must be > 0 when dense tiling is active')
-        if int(tile_stride) <= 0:
-            raise ValueError('--tile_stride values must be > 0 when dense tiling is active')
-        if int(tile_stride) > int(tile_size):
-            raise ValueError('--tile_stride must be less than or equal to the corresponding --tile_size')
-        config_id = f's{int(tile_size)}_st{int(tile_stride)}'
-        if config_id in seen:
-            raise ValueError(f'Duplicate dense tile configuration: tile_size={int(tile_size)}, tile_stride={int(tile_stride)}')
-        seen.add(config_id)
-        configs.append(TileConfig(tile_size=int(tile_size), tile_stride=int(tile_stride), config_id=config_id))
+    for tile_size in tile_sizes:
+        for tile_stride in tile_strides:
+            if int(tile_stride) > int(tile_size):
+                raise ValueError('--tile_stride must be less than or equal to every --tile_size value in the Cartesian product')
+            config_id = f's{int(tile_size)}_st{int(tile_stride)}'
+            if config_id in seen:
+                raise ValueError(f'Duplicate dense tile configuration: tile_size={int(tile_size)}, tile_stride={int(tile_stride)}')
+            seen.add(config_id)
+            configs.append(TileConfig(tile_size=int(tile_size), tile_stride=int(tile_stride), config_id=config_id))
 
     return configs
 
@@ -2236,7 +2374,7 @@ def get_tilted_render_plan(
     grid_h: int,
     grid_w: int,
 ) -> TiltedRenderPlan:
-    if view.family != 'tilted_transverse':
+    if not is_tilted_view(view):
         raise ValueError('Tilted render plan requested for a non-tilted view')
 
     key = _tilted_plan_cache_key(view, M_grid_to_src, int(grid_h), int(grid_w))
@@ -2252,16 +2390,16 @@ def get_tilted_render_plan(
     x_nn = np.rint(src_x).astype(np.int32, copy=False)
     y_nn = np.rint(src_y).astype(np.int32, copy=False)
     valid_xy = (
-        (x_nn >= 0) & (x_nn < int(view.full_w)) &
-        (y_nn >= 0) & (y_nn < int(view.full_h))
+        (x_nn >= 0) & (x_nn < int(view.src_w)) &
+        (y_nn >= 0) & (y_nn < int(view.src_h))
     )
-    x_idx = np.clip(x_nn, 0, int(view.full_w) - 1).astype(np.int32, copy=False)
-    y_idx = np.clip(y_nn, 0, int(view.full_h) - 1).astype(np.int32, copy=False)
+    x_idx = np.clip(x_nn, 0, int(view.src_w) - 1).astype(np.int32, copy=False)
+    y_idx = np.clip(y_nn, 0, int(view.src_h) - 1).astype(np.int32, copy=False)
 
     if str(view.tilt_direction) == 'vertical':
-        axis_offset = src_y - float((view.full_h - 1) / 2.0)
+        axis_offset = src_y - float((int(view.src_h) - 1) / 2.0)
     elif str(view.tilt_direction) == 'horizontal':
-        axis_offset = src_x - float((view.full_w - 1) / 2.0)
+        axis_offset = src_x - float((int(view.src_w) - 1) / 2.0)
     else:  # pragma: no cover
         raise ValueError(f'Unsupported tilt direction: {view.tilt_direction}')
 
@@ -2275,6 +2413,80 @@ def get_tilted_render_plan(
     return plan
 
 
+def _render_tilted_array_on_grid(
+    volume_arr: np.ndarray,
+    view: ViewInfo,
+    frame_idx: int,
+    M_grid_to_src: np.ndarray,
+    grid_h: int,
+    grid_w: int,
+    *,
+    mask_mode: bool,
+    block_rows: int = 256,
+) -> np.ndarray:
+    """Render one generalized v11 Tilted View frame.
+
+    ``M_grid_to_src`` maps output/grid pixels into the selected Cartesian base view's
+    native raster coordinates.  The two in-plane axes are rounded to their native
+    grid, while the base view's stacking coordinate is linearly interpolated after
+    applying the signed shear.  This covers Tilted Transverse, Tilted Sagittal, and
+    Tilted Coronal without expanding the output canvas.
+    """
+    if not is_tilted_view(view):
+        raise ValueError('Tilted rendering requested for a non-tilted view')
+
+    plan = get_tilted_render_plan(view, M_grid_to_src, int(grid_h), int(grid_w))
+    tan_alpha = float(math.tan(math.radians(float(view.tilt_angle_deg))))
+    stack_len = int(tilted_stack_axis_length(view))
+    base_view = tilted_base_view_name(view)
+    out = np.zeros((int(grid_h), int(grid_w)), dtype=np.uint8)
+    if stack_len <= 0:
+        return out
+
+    for y0 in range(0, int(grid_h), int(block_rows)):
+        y1 = min(int(grid_h), y0 + int(block_rows))
+        valid_xy = np.asarray(plan.valid_xy[y0:y1], dtype=bool)
+        if not np.any(valid_xy):
+            continue
+
+        frame_center = float(tilted_frame_center(view, int(frame_idx)))
+        stack_src = frame_center + tan_alpha * np.asarray(plan.axis_offset[y0:y1], dtype=np.float32)
+        valid = valid_xy & (stack_src >= 0.0) & (stack_src <= float(stack_len - 1))
+        if not np.any(valid):
+            continue
+
+        s0 = np.floor(stack_src).astype(np.int32, copy=False)
+        s1 = np.clip(s0 + 1, 0, stack_len - 1).astype(np.int32, copy=False)
+        s0 = np.clip(s0, 0, stack_len - 1).astype(np.int32, copy=False)
+        alpha = (stack_src - s0).astype(np.float32, copy=False)
+
+        u_idx = np.asarray(plan.x_idx[y0:y1], dtype=np.int32)  # base-view horizontal axis
+        v_idx = np.asarray(plan.y_idx[y0:y1], dtype=np.int32)  # base-view vertical axis
+        if base_view == 'transverse':
+            f0 = np.asarray(volume_arr[s0, v_idx, u_idx], dtype=np.float32)
+            f1 = np.asarray(volume_arr[s1, v_idx, u_idx], dtype=np.float32)
+        elif base_view == 'sagittal':
+            # Sagittal in-plane axes are (X, t); stacking axis is Y.
+            f0 = np.asarray(volume_arr[v_idx, s0, u_idx], dtype=np.float32)
+            f1 = np.asarray(volume_arr[v_idx, s1, u_idx], dtype=np.float32)
+        elif base_view == 'coronal':
+            # Coronal in-plane axes are (Y, t); stacking axis is X.
+            f0 = np.asarray(volume_arr[v_idx, u_idx, s0], dtype=np.float32)
+            f1 = np.asarray(volume_arr[v_idx, u_idx, s1], dtype=np.float32)
+        else:  # pragma: no cover
+            raise ValueError(f'Unsupported Tilted View base: {base_view}')
+
+        values = ((1.0 - alpha) * f0) + (alpha * f1)
+        if bool(mask_mode):
+            rendered = (values >= 0.5).astype(np.uint8, copy=False)
+        else:
+            rendered = np.clip(np.rint(values), 0.0, 255.0).astype(np.uint8)
+        out_block = out[y0:y1]
+        out_block[valid] = rendered[valid]
+
+    return out
+
+
 def render_tilted_frame_on_grid(
     volume_rgb: np.ndarray,
     view: ViewInfo,
@@ -2284,37 +2496,16 @@ def render_tilted_frame_on_grid(
     grid_w: int,
     block_rows: int = 256,
 ) -> np.ndarray:
-    plan = get_tilted_render_plan(view, M_grid_to_src, int(grid_h), int(grid_w))
-    tan_alpha = float(math.tan(math.radians(float(view.tilt_angle_deg))))
-    t_dim = int(volume_rgb.shape[0])
-    out = np.zeros((int(grid_h), int(grid_w)), dtype=np.uint8)
-
-    for y0 in range(0, int(grid_h), int(block_rows)):
-        y1 = min(int(grid_h), y0 + int(block_rows))
-        valid_xy = np.asarray(plan.valid_xy[y0:y1], dtype=bool)
-        if not np.any(valid_xy):
-            continue
-
-        frame_center = float(tilted_frame_center(view, int(frame_idx)))
-        t_src = frame_center + tan_alpha * np.asarray(plan.axis_offset[y0:y1], dtype=np.float32)
-        valid = valid_xy & (t_src >= 0.0) & (t_src <= float(t_dim - 1))
-        if not np.any(valid):
-            continue
-
-        t0 = np.floor(t_src).astype(np.int32, copy=False)
-        t1 = np.clip(t0 + 1, 0, t_dim - 1).astype(np.int32, copy=False)
-        t0 = np.clip(t0, 0, t_dim - 1).astype(np.int32, copy=False)
-        alpha = (t_src - t0).astype(np.float32, copy=False)
-
-        ys = np.asarray(plan.y_idx[y0:y1], dtype=np.int32)
-        xs = np.asarray(plan.x_idx[y0:y1], dtype=np.int32)
-        f0 = np.asarray(volume_rgb[t0, ys, xs], dtype=np.float32)
-        f1 = np.asarray(volume_rgb[t1, ys, xs], dtype=np.float32)
-        blend = np.clip(np.rint(((1.0 - alpha) * f0) + (alpha * f1)), 0.0, 255.0).astype(np.uint8)
-        out_block = out[y0:y1]
-        out_block[valid] = blend[valid]
-
-    return out
+    return _render_tilted_array_on_grid(
+        volume_rgb,
+        view,
+        int(frame_idx),
+        M_grid_to_src,
+        int(grid_h),
+        int(grid_w),
+        mask_mode=False,
+        block_rows=int(block_rows),
+    )
 
 
 def render_tilted_mask_on_grid(
@@ -2326,37 +2517,16 @@ def render_tilted_mask_on_grid(
     grid_w: int,
     block_rows: int = 256,
 ) -> np.ndarray:
-    plan = get_tilted_render_plan(view, M_grid_to_src, int(grid_h), int(grid_w))
-    tan_alpha = float(math.tan(math.radians(float(view.tilt_angle_deg))))
-    t_dim = int(volume_mask.shape[0])
-    out = np.zeros((int(grid_h), int(grid_w)), dtype=np.uint8)
-
-    for y0 in range(0, int(grid_h), int(block_rows)):
-        y1 = min(int(grid_h), y0 + int(block_rows))
-        valid_xy = np.asarray(plan.valid_xy[y0:y1], dtype=bool)
-        if not np.any(valid_xy):
-            continue
-
-        frame_center = float(tilted_frame_center(view, int(frame_idx)))
-        t_src = frame_center + tan_alpha * np.asarray(plan.axis_offset[y0:y1], dtype=np.float32)
-        valid = valid_xy & (t_src >= 0.0) & (t_src <= float(t_dim - 1))
-        if not np.any(valid):
-            continue
-
-        t0 = np.floor(t_src).astype(np.int32, copy=False)
-        t1 = np.clip(t0 + 1, 0, t_dim - 1).astype(np.int32, copy=False)
-        t0 = np.clip(t0, 0, t_dim - 1).astype(np.int32, copy=False)
-        alpha = (t_src - t0).astype(np.float32, copy=False)
-
-        ys = np.asarray(plan.y_idx[y0:y1], dtype=np.int32)
-        xs = np.asarray(plan.x_idx[y0:y1], dtype=np.int32)
-        f0 = np.asarray(volume_mask[t0, ys, xs], dtype=np.float32)
-        f1 = np.asarray(volume_mask[t1, ys, xs], dtype=np.float32)
-        blend = (((1.0 - alpha) * f0) + (alpha * f1) >= 0.5).astype(np.uint8)
-        out_block = out[y0:y1]
-        out_block[valid] = blend[valid]
-
-    return out
+    return _render_tilted_array_on_grid(
+        volume_mask,
+        view,
+        int(frame_idx),
+        M_grid_to_src,
+        int(grid_h),
+        int(grid_w),
+        mask_mode=True,
+        block_rows=int(block_rows),
+    )
 
 
 def render_tilted_canvas_frame(
@@ -2399,7 +2569,7 @@ _TILTED_NATIVE_AFFINE_CACHE: Dict[Tuple[str, int, int], AffineSpec] = {}
 
 
 def get_tilted_native_affine(view: ViewInfo) -> AffineSpec:
-    if view.family != 'tilted_transverse':
+    if not is_tilted_view(view):
         raise ValueError('Tilted native affine requested for a non-tilted view')
     key = (str(view.name), int(view.src_w), int(view.src_h))
     cached = _TILTED_NATIVE_AFFINE_CACHE.get(key)
@@ -2434,7 +2604,7 @@ def render_canvas_frame_for_job(
     frame_idx: int,
     view_frames: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    if view.family == 'tilted_transverse':
+    if is_tilted_view(view):
         return render_tilted_canvas_frame(
             volume_rgb=volume_rgb,
             view=view,
@@ -2535,6 +2705,7 @@ def render_tilted_fullframe_video_for_job(
         close_ffmpeg_writer(proc)
 
 
+# DEAD_CODE_MARKER(v11): no in-script call sites in the current v11 scheduler; retained for compatibility/regression and intentionally not pruned yet.
 def derive_fullframe_video_from_canvas(
     canvas_video_path: Path,
     out_path: Path,
@@ -2566,6 +2737,7 @@ def derive_fullframe_video_from_canvas(
         close_ffmpeg_writer(proc)
 
 
+# DEAD_CODE_MARKER(v11): no in-script call sites in the current v11 scheduler; retained for compatibility/regression and intentionally not pruned yet.
 def derive_dense_tile_video_from_canvas(
     canvas_video_path: Path,
     job: DenseTileJob,
@@ -2605,7 +2777,7 @@ def render_fullframe_frame_for_job(
     frame_idx: int,
     view_frames: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    if view.family == 'tilted_transverse':
+    if is_tilted_view(view):
         return render_tilted_frame_on_grid(
             volume_rgb=volume_rgb,
             view=view,
@@ -2636,7 +2808,7 @@ def render_fullframe_video_for_job(
     workers: int = 1,
     show_progress: bool = True,
 ) -> None:
-    if view.family == 'tilted_transverse':
+    if is_tilted_view(view):
         render_tilted_fullframe_video_for_job(
             volume_rgb=volume_rgb,
             view=view,
@@ -2678,6 +2850,7 @@ def render_fullframe_video_for_job(
         close_ffmpeg_writer(proc)
 
 
+# DEAD_CODE_MARKER(v11): no in-script call sites in the current v11 scheduler; retained for compatibility/regression and intentionally not pruned yet.
 def ensure_canvas_and_fullframe_video(
     volume_rgb: np.ndarray,
     view: ViewInfo,
@@ -2862,6 +3035,7 @@ def derive_dense_tile_videos_from_canvas_batch(
         _run_ffmpeg_checked(cmd, f'dense tile fan-out from {canvas_video_path.name} (batch {batch_idx})')
 
 
+# DEAD_CODE_MARKER(v11): no in-script call sites in the current v11 scheduler; retained for compatibility/regression and intentionally not pruned yet.
 def ensure_dense_tile_video_batch_after_canvas(
     canvas_future: Future,
     aug_job: AugJob,
@@ -3001,7 +3175,7 @@ def iter_view_frames(
         for angle_deg in view.azimuths_deg:
             sampler = get_radial_sampler(view, float(angle_deg))
             yield np.ascontiguousarray(extract_radial_slice_frame(volume_rgb, sampler))  # (T,D)
-    elif view.family == 'tilted_transverse':
+    elif is_tilted_view(view):
         for t in range(int(view.num_slices)):
             yield render_tilted_native_frame(volume_rgb, view, int(t))
     else:
@@ -3029,7 +3203,7 @@ def get_view_frame_by_index(
         angle_deg = float(view.azimuths_deg[int(index)])
         sampler = get_radial_sampler(view, angle_deg)
         return np.ascontiguousarray(extract_radial_slice_frame(volume_rgb, sampler))
-    if view.family == 'tilted_transverse':
+    if is_tilted_view(view):
         return render_tilted_native_frame(volume_rgb, view, int(index))
 
     raise ValueError(f'Unknown view: {view.name}')
@@ -3217,25 +3391,17 @@ def resolve_gaussian_smoothing_settings(
     gaussian_smoothing_arg: Optional[float],
     gaussian_smoothing_passes: int,
 ) -> Tuple[bool, float, int]:
-    """Resolve Gaussian smoothing enablement from the v10.1.0 CLI contract.
+    """Resolve Gaussian smoothing enablement from the v11.0.0 CLI contract.
 
-    Contract:
-      - no --gaussian_smoothing and the default --gaussian_smoothing_passes 1 => disabled
-      - --gaussian_smoothing [SIGMA] enables smoothing for passes >= 1
-      - --gaussian_smoothing_passes > 1 enables smoothing with the default sigma when
-        --gaussian_smoothing is omitted
+    v11 gives ``--gaussian_smoothing`` a default sigma of 3 voxel lengths.  A
+    sigma of 0 is accepted as an explicit disable switch so users still have a
+    practical way to skip this optional postprocessing stage.
     """
     passes_i = int(gaussian_smoothing_passes)
-    sigma_provided = gaussian_smoothing_arg is not None
-    enabled = bool(sigma_provided or passes_i > 1)
+    sigma_f = float(gaussian_smoothing_arg) if gaussian_smoothing_arg is not None else float(DEFAULT_GAUSSIAN_SMOOTHING_SIGMA)
+    enabled = bool(sigma_f > 0.0 and passes_i > 0)
     if not enabled:
         return False, 0.0, passes_i
-
-    sigma_f = (
-        float(gaussian_smoothing_arg)
-        if sigma_provided
-        else float(DEFAULT_GAUSSIAN_SMOOTHING_SIGMA)
-    )
     return True, float(sigma_f), passes_i
 
 
@@ -3636,6 +3802,9 @@ def _extract_result_masks_and_confs(r) -> Tuple[Optional[object], Optional[np.nd
 
 
 
+# DEAD_CODE_MARKER(v11): retained legacy escape hatch. The v11 scheduler intentionally passes
+# tilted_view=None to prediction accumulation so Tilted masks remain in view-native video space
+# through cleanup/interpolation and are backprojected only once during final assembly.
 def _scatter_tilted_native_xy_to_volume(
     frame_idx: int,
     native_union: np.ndarray,
@@ -3644,55 +3813,63 @@ def _scatter_tilted_native_xy_to_volume(
     view_union_mm: np.ndarray,
     view_confmap_mm: np.ndarray,
 ) -> None:
-    """Back-project one Tilted Transverse prediction frame into the native (t, Y, X) volume.
+    """Legacy immediate Tilted View backprojection for callers that still request it.
 
-    Tilted transverse rendering samples the native XY grid while shifting only the slice
-    coordinate: ``t = frame_idx + tan(alpha) * axis_offset``. The inverse therefore must
-    not place every predicted pixel back into ``frame_idx``. Doing so creates duplicated
-    structures displaced along the transverse slice axis.
+    This is not used by the v11 pipeline.  If invoked, it maps one base-view raster
+    frame into an orthogonal (t,Y,X) destination using the generalized Tilted View
+    stacking-axis shear.
     """
-    if tilted_view.family != 'tilted_transverse':
+    if not is_tilted_view(tilted_view):
         raise ValueError('Tilted inverse projection requested for a non-tilted view')
 
     mask_bool = np.asarray(native_union, dtype=bool)
     if not np.any(mask_bool):
         return
 
-    ys, xs = np.nonzero(mask_bool)
-    if ys.size <= 0:
+    vv, uu = np.nonzero(mask_bool)
+    if vv.size <= 0:
         return
 
     tan_alpha = float(math.tan(math.radians(float(tilted_view.tilt_angle_deg))))
     frame_center = float(tilted_frame_center(tilted_view, int(frame_idx)))
     if str(tilted_view.tilt_direction) == 'vertical':
-        cy = float((int(tilted_view.full_h) - 1) / 2.0)
-        t_float = frame_center + tan_alpha * (ys.astype(np.float32, copy=False) - cy)
+        axis_center = float((int(tilted_view.src_h) - 1) / 2.0)
+        stack_float = frame_center + tan_alpha * (vv.astype(np.float32, copy=False) - axis_center)
     elif str(tilted_view.tilt_direction) == 'horizontal':
-        cx = float((int(tilted_view.full_w) - 1) / 2.0)
-        t_float = frame_center + tan_alpha * (xs.astype(np.float32, copy=False) - cx)
+        axis_center = float((int(tilted_view.src_w) - 1) / 2.0)
+        stack_float = frame_center + tan_alpha * (uu.astype(np.float32, copy=False) - axis_center)
     else:  # pragma: no cover
         raise ValueError(f'Unsupported tilt direction: {tilted_view.tilt_direction}')
 
-    t_idx = np.rint(t_float).astype(np.int32, copy=False)
-    valid = (t_idx >= 0) & (t_idx < int(view_union_mm.shape[0]))
+    ss = np.rint(stack_float).astype(np.int32, copy=False)
+    valid = (ss >= 0) & (ss < int(tilted_stack_axis_length(tilted_view)))
     if not np.any(valid):
         return
 
-    tt = t_idx[valid]
-    yy = ys[valid]
-    xx = xs[valid]
-    view_union_mm[tt, yy, xx] = np.uint8(1)
+    ss_v = ss[valid]
+    vv_v = vv[valid]
+    uu_v = uu[valid]
+    base_view = tilted_base_view_name(tilted_view)
+    if base_view == 'transverse':
+        coords = (ss_v, vv_v, uu_v)
+    elif base_view == 'sagittal':
+        coords = (vv_v, ss_v, uu_v)
+    elif base_view == 'coronal':
+        coords = (vv_v, uu_v, ss_v)
+    else:  # pragma: no cover
+        raise ValueError(f'Unsupported Tilted View base: {base_view}')
+    view_union_mm[coords] = np.uint8(1)
 
     if native_conf is None:
         return
 
     native_conf_u8 = np.asarray(native_conf, dtype=np.uint8)
-    conf_vals = native_conf_u8[yy, xx]
+    conf_vals = native_conf_u8[vv_v, uu_v]
     has_conf = conf_vals > 0
     if np.any(has_conf):
         np.maximum.at(
             view_confmap_mm,
-            (tt[has_conf], yy[has_conf], xx[has_conf]),
+            tuple(c[has_conf] for c in coords),
             conf_vals[has_conf],
         )
 
@@ -3888,7 +4065,7 @@ def predict_video_and_accumulate(
         stream=True,
         # CPU retina path patches Ultralytics construct_result so the GPU returns only
         # boxes/protos/coefficients; native mask upsampling and crop happen later on CPU.
-        retina_masks=False if use_cpu_retina_masks else True,
+        retina_masks=False,
         batch=1,
         device=cfg.device,
         half=cfg.half,
@@ -3896,7 +4073,7 @@ def predict_video_and_accumulate(
         verbose=False,
     )
 
-    # Tilted transverse inverse projection scatters one prediction frame across native
+    # Legacy immediate Tilted View inverse projection scatters one prediction frame across native
     # t-slices. Process those frames serially to avoid non-atomic writes from multiple
     # postprocess workers into the same native volume voxels/confidence map.
     if tilted_view is not None:
@@ -4156,6 +4333,7 @@ def _process_tile_prediction_frame(
     return stats
 
 
+# DEAD_CODE_MARKER(v11): no in-script call sites in the current v11 scheduler; retained for compatibility/regression and intentionally not pruned yet.
 def predict_tile_video_and_gate(
     model,
     video_path: Path,
@@ -4184,7 +4362,7 @@ def predict_tile_video_and_gate(
         stream=True,
         # CPU retina path patches Ultralytics construct_result so the GPU returns only
         # boxes/protos/coefficients; native mask upsampling and crop happen later on CPU.
-        retina_masks=False if use_cpu_retina_masks else True,
+        retina_masks=False,
         batch=1,
         device=cfg.device,
         half=cfg.half,
@@ -4416,6 +4594,7 @@ def _filter_connected_components_by_min_conf_scipy(
     return np.isin(labels2d, keep_ids)
 
 
+# DEAD_CODE_MARKER(v11): no in-script call sites in the current v11 scheduler; retained for compatibility/regression and intentionally not pruned yet.
 def _build_supported_component_mask(
     tile_slice: np.ndarray,
     support_slice: np.ndarray,
@@ -4540,7 +4719,7 @@ def cleanup_view_volume_after_prediction_inplace(
     workers: int = 1,
 ) -> None:
     native_min_radius = 0.0
-    if view.name == 'transverse' or view.family == 'tilted_transverse':
+    if view.name == 'transverse' or (is_tilted_view(view) and tilted_base_view_name(view) == 'transverse'):
         native_min_radius = float(min_radius)
 
     fused_slice_cleanup_inplace(
@@ -4755,7 +4934,7 @@ def fill_3d_voids_inplace_streaming(
 ) -> None:
     """Fill enclosed 3D voids by labeling background connected components once.
 
-    v10.1.0 allows 3D void fill only as an optional final global-union step. This
+    v11.0.0 allows 3D void fill only as an optional final global-union step. This
     function performs that operation by labeling the background volume, marking any
     background component connected to the volume boundary, and converting all other
     background components to foreground. The default 6-connected background matches
@@ -5072,7 +5251,7 @@ def build_slice_endpoint_seeds_from_label_volume(
                 if anchor is None:
                     continue
 
-                # v10.1.0 endpoint continuation is defined by direct footprint overlap in
+                # v11.0.0 endpoint continuation is defined by direct footprint overlap in
                 # the adjacent slice; do not dilate/skeletonize the component for endpoint discovery.
                 has_prev = bool(prev_same is not None and np.any(comp & prev_same))
                 has_next = bool(next_same is not None and np.any(comp & next_same))
@@ -5158,7 +5337,7 @@ def apply_view_min_radius_filter_inplace(
     if float(min_radius) <= 0:
         return
 
-    if view.name == 'transverse' or view.family in ('radial', 'tilted_transverse'):
+    if view.name == 'transverse' or view.family == 'radial' or (is_tilted_view(view) and tilted_base_view_name(view) == 'transverse'):
         transverse_view = mask_mm
     elif view.name == 'sagittal':
         transverse_view = np.transpose(mask_mm, (1, 0, 2))
@@ -5194,7 +5373,7 @@ _DENSE_RADIAL_BACKPROJECT_MAP_CACHE: Dict[Tuple[int, int, int, Tuple[Tuple[float
 
 
 def radial_full_coverage_angle_deg(diameter: int) -> float:
-    """Return the v10.1.0 radial spacing that gives approximately 1x ROI edge coverage."""
+    """Return the v11.0.0 radial spacing that gives approximately 1x ROI edge coverage."""
     diameter_i = max(1, int(diameter))
     return float(360.0 / (math.pi * float(diameter_i)))
 
@@ -5228,7 +5407,7 @@ def _nearest_radial_source_for_backprojection(
 def build_radial_backprojection_plan(radial_view: ViewInfo) -> Tuple[List[RadialBackprojectionSample], Dict[str, float]]:
     """Build the angular plan used to backproject a radial view into Cartesian space.
 
-    If the user-requested radial spacing is coarser than the v10.1.0 full-coverage spacing,
+    If the user-requested radial spacing is coarser than the v11.0.0 full-coverage spacing,
     backprojection is densified to the full-coverage spacing and each dense angle samples the
     nearest completed radial prediction frame. This keeps Radial masks view-native through
     postprocessing/interpolation while preventing sparse spoke-like Cartesian backprojections.
@@ -5288,7 +5467,7 @@ def build_dense_radial_backprojection_map(
 ) -> DenseRadialBackprojectionMap:
     """Map every Cartesian ROI pixel to its nearest dense radial source frame and radial coordinate.
 
-    This is the dense v10.1.0 backprojection path: instead of painting only the pixels that lie on
+    This is the dense v11.0.0 backprojection path: instead of painting only the pixels that lie on
     a set of spokes, every pixel inside the circular ROI receives a sample from the Radial video's
     own frame/raster coordinate system.  When the user-provided azimuth spacing is too coarse, the
     supplied ``plan`` is already densified to the full-coverage angular spacing; pixels then select
@@ -5443,22 +5622,34 @@ def backproject_tilted_volume_to_volume(
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
 ) -> np.ndarray:
-    """Backproject a Tilted Transverse view-native mask stack into native (t, Y, X).
+    """Backproject a v11 Tilted View-native mask stack into native (t, Y, X).
 
-    The tilted view stack remains in generated-video coordinates through cleanup and
-    interpolation.  Only at final assembly do we map each foreground pixel from frame
-    center ``N`` and native XY coordinates back to the original orthogonal volume using
-    ``t = N + tan(alpha) * axis_offset``. Frame projections are independent and are
-    parallelized; concurrent writes are idempotent foreground assignments.
+    The input stack remains in the generated Tilted View's own frame order and
+    base-view raster coordinates through cleanup and interpolation.  Only after
+    all per-view operations are complete do we map each foreground pixel to the
+    orthogonal processing volume by applying the same stacking-axis shear used
+    during rendering:
+
+      * Tilted Transverse: base axes (X, Y), stacking axis t
+      * Tilted Sagittal:  base axes (X, t), stacking axis Y
+      * Tilted Coronal:   base axes (Y, t), stacking axis X
     """
-    if tilted_view.family != 'tilted_transverse':
-        raise ValueError('backproject_tilted_volume_to_volume expects a tilted transverse view')
+    if not is_tilted_view(tilted_view):
+        raise ValueError('backproject_tilted_volume_to_volume expects a Tilted View')
 
     t_dim = int(tilted_view.full_t)
     out_h = int(tilted_view.full_h)
     out_w = int(tilted_view.full_w)
-    if t_dim <= 0:
-        raise ValueError(f'Tilted view {tilted_view.name} has invalid full_t={tilted_view.full_t}')
+    if t_dim <= 0 or out_h <= 0 or out_w <= 0:
+        raise ValueError(
+            f'Tilted view {tilted_view.name} has invalid output geometry '
+            f'(t,Y,X)=({t_dim},{out_h},{out_w})'
+        )
+
+    src = np.asarray(tilted_mask_mm)
+    expected_shape = (int(tilted_view.num_slices), int(tilted_view.src_h), int(tilted_view.src_w))
+    if tuple(int(x) for x in src.shape) != expected_shape:
+        raise ValueError(f'{desc}: tilted layer shape {tuple(src.shape)} != {expected_shape}')
 
     vol_mm = allocate_workspace_array(
         shape=(t_dim, out_h, out_w),
@@ -5471,33 +5662,49 @@ def backproject_tilted_volume_to_volume(
 
     tan_alpha = float(math.tan(math.radians(float(tilted_view.tilt_angle_deg))))
     if str(tilted_view.tilt_direction) == 'vertical':
-        axis_center = float((out_h - 1) / 2.0)
+        axis_center = float((int(tilted_view.src_h) - 1) / 2.0)
     elif str(tilted_view.tilt_direction) == 'horizontal':
-        axis_center = float((out_w - 1) / 2.0)
+        axis_center = float((int(tilted_view.src_w) - 1) / 2.0)
     else:  # pragma: no cover
         raise ValueError(f'Unsupported tilt direction: {tilted_view.tilt_direction}')
 
+    base_view = tilted_base_view_name(tilted_view)
+    stack_len = tilted_stack_axis_length(tilted_view)
     worker_count = choose_slice_parallel_workers(int(workers), int(tilted_view.num_slices))
 
     def _backproject_frame(frame_idx: int) -> None:
-        tilted_mask = np.asarray(tilted_mask_mm[int(frame_idx)], dtype=bool)
+        tilted_mask = np.asarray(src[int(frame_idx)], dtype=bool)
         if not np.any(tilted_mask):
             return
-        yy, xx = np.nonzero(tilted_mask)
-        if yy.size <= 0:
+        vv, uu = np.nonzero(tilted_mask)
+        if vv.size <= 0:
             return
 
         frame_center = float(tilted_frame_center(tilted_view, int(frame_idx)))
         if str(tilted_view.tilt_direction) == 'vertical':
-            t_float = frame_center + tan_alpha * (yy.astype(np.float32, copy=False) - axis_center)
+            stack_float = frame_center + tan_alpha * (vv.astype(np.float32, copy=False) - axis_center)
         else:
-            t_float = frame_center + tan_alpha * (xx.astype(np.float32, copy=False) - axis_center)
+            stack_float = frame_center + tan_alpha * (uu.astype(np.float32, copy=False) - axis_center)
 
-        tt = np.rint(t_float).astype(np.int32, copy=False)
-        valid = (tt >= 0) & (tt < t_dim)
+        ss = np.rint(stack_float).astype(np.int32, copy=False)
+        valid = (ss >= 0) & (ss < int(stack_len))
         if not np.any(valid):
             return
-        vol_mm[tt[valid], yy[valid], xx[valid]] = np.uint8(1)
+
+        ss_v = ss[valid]
+        vv_v = vv[valid]
+        uu_v = uu[valid]
+        if base_view == 'transverse':
+            # base in-plane: horizontal X=uu, vertical Y=vv; stack t=ss
+            vol_mm[ss_v, vv_v, uu_v] = np.uint8(1)
+        elif base_view == 'sagittal':
+            # base in-plane: horizontal X=uu, vertical t=vv; stack Y=ss
+            vol_mm[vv_v, ss_v, uu_v] = np.uint8(1)
+        elif base_view == 'coronal':
+            # base in-plane: horizontal Y=uu, vertical t=vv; stack X=ss
+            vol_mm[vv_v, uu_v, ss_v] = np.uint8(1)
+        else:  # pragma: no cover
+            raise ValueError(f'Unsupported Tilted View base: {base_view}')
 
     parallel_for_indices_chunked(
         int(tilted_view.num_slices),
@@ -5523,7 +5730,7 @@ def assemble_view_volumes_into_native_union(
 ) -> None:
     """OR all per-view prediction volumes from the single active model into native (t, Y, X).
 
-    Transverse, already-backprojected Tilted Transverse, and already-backprojected Radial volumes
+    Transverse, already-backprojected Tilted Views, and already-backprojected Radial volumes
     all have native (T,H,W) shape and are merged slice-wise. Sagittal and Coronal retain their native view stacks
     and are mapped back into the transverse coordinate system.
     """
@@ -5615,11 +5822,11 @@ def assemble_current_view_union_volume(
     """Build the single-model final view union.
 
     The mapping is kept keyed by model name because earlier pipeline stages store temporary
-    workspaces under the model stem. v10.1.0 rejects multiple model entries and never
+    workspaces under the model stem. v11.0.0 rejects multiple model entries and never
     combines outputs from more than one model.
     """
     if len(view_volumes_by_model) != 1:
-        raise ValueError('v10.1.0_SLURM supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('v11.0.0_SLURM supports exactly one --model; multiple-model inference has been removed')
 
     model_name = next(iter(view_volumes_by_model.keys()))
     final_union_mm = allocate_workspace_array(
@@ -5932,6 +6139,7 @@ def centerline_skeletonize_component(comp_bool: np.ndarray) -> np.ndarray:
     return skel
 
 
+# DEAD_CODE_MARKER(v11): no in-script call sites in the current v11 scheduler; retained for compatibility/regression and intentionally not pruned yet.
 def skeletonize_volume(mask_bool: np.ndarray) -> np.ndarray:
     """Compatibility wrapper returning a 3D centerline skeleton for small arrays.
 
@@ -6646,7 +6854,7 @@ def _build_slice_endpoint_seeds(
     workers: int = 1,
     wrap_axis: bool = False,
 ) -> Tuple[List[SliceEndpointSeed], int]:
-    """Build interpolation endpoint seeds with the v10.1.0 per-slice component scan.
+    """Build interpolation endpoint seeds with the v11.0.0 per-slice component scan.
 
     Interpolation no longer uses skeletonization. Each labeled 3D object is scanned slice by
     slice; every 2D connected component is evaluated independently for overlap continuation
@@ -7132,7 +7340,7 @@ class VolumeSnapshotRef:
 
 @dataclass(frozen=True)
 class NrrdLayerRef:
-    """One orthogonal-space layer for the decomposed v10.1.0 NRRD export.
+    """One orthogonal-space layer for the decomposed v11.0.0 NRRD export.
 
     The backing file is always a uint8 binary mask in the pipeline's orthogonal
     ``(t, Y, X)`` processing geometry.  The NRRD writer converts each layer to
@@ -7174,7 +7382,7 @@ class TileConsolidationResult:
 
 
 def _view_uses_interpolation(view: ViewInfo, interpolate: int) -> bool:
-    return bool(view.family in ('orthogonal', 'radial', 'tilted_transverse') and int(interpolate) > 0)
+    return bool((view.family in ('orthogonal', 'radial') or is_tilted_view(view)) and int(interpolate) > 0)
 
 
 def _snapshot_volume_for_troubleshooting(
@@ -7390,7 +7598,7 @@ def project_view_volume_to_orthogonal_volume(
             workers=int(workers),
         )
 
-    if view.family == 'tilted_transverse':
+    if is_tilted_view(view):
         return backproject_tilted_volume_to_volume(
             tilted_mask_mm=view_mask_mm,
             tilted_view=view,
@@ -7817,7 +8025,7 @@ def prepare_view_volume_after_fullframe(
                 float(min_radius),
                 workers=int(slice_workers),
             )
-    elif view.family == 'tilted_transverse':
+    elif is_tilted_view(view):
         out_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.u8.dat'
         final_view_volume = backproject_tilted_volume_to_volume(
             tilted_mask_mm=baseline_native_volume,
@@ -7827,6 +8035,13 @@ def prepare_view_volume_after_fullframe(
             prefer_memory=True,
             workers=int(slice_workers),
         )
+        if float(min_radius) > 0.0:
+            print(f"Applying --min_radius in the transverse plane for backprojected view '{view.name}'")
+            apply_transverse_min_radius_filter_inplace(
+                final_view_volume,
+                float(min_radius),
+                workers=int(slice_workers),
+            )
     else:
         final_view_volume = baseline_native_volume
 
@@ -8132,7 +8347,7 @@ def gate_tile_volume_into_consolidated_parent(
 ) -> TileGateResult:
     """Gate one tile volume, then OR accepted components into parent-view accumulators.
 
-    The main accumulator preserves the v10.1.0 mask-wise OR gate semantics.  Optional category
+    The main accumulator preserves the v11.0.0 mask-wise OR gate semantics.  Optional category
     accumulators are populated only for decomposed NRRD export and split accepted tile components
     into parent-YOLO-supported and parent-bridge-supported layers.
     """
@@ -8464,7 +8679,7 @@ def apply_gaussian_smoothing_inplace(
 ) -> Dict[str, int | float]:
     """Smooth the final binary 3D volume with a Gaussian kernel and re-threshold at 0.5.
 
-    The v10.1.0_SLURM smoothing stage is applied after the final view/tile union and optional
+    The v11.0.0_SLURM smoothing stage is applied after the final view/tile union and optional
     3D void fill, but before --keep_objects and before resizing back to the source geometry.
     A single float32 workspace is reused for every pass to avoid retaining multiple dense
     floating-point copies of the volume.
@@ -8885,6 +9100,7 @@ def _nrrd_space_directions_matrix(spatial_axes: int = 3, list_axis: bool = False
     return np.eye(spatial_axes_i, dtype=np.float64)
 
 
+# DEAD_CODE_MARKER(v11): no in-script call sites in the current v11 scheduler; retained for compatibility/regression and intentionally not pruned yet.
 def _write_nrrd_matrix_space_directions(nrrd_module: object, out_path: Path, payload: np.ndarray, kwargs: Dict[str, object]) -> None:
     """Write through pynrrd while forcing matrix-style space directions when supported."""
     sentinel = object()
@@ -8904,6 +9120,7 @@ def _write_nrrd_matrix_space_directions(nrrd_module: object, out_path: Path, pay
                 pass
 
 
+# DEAD_CODE_MARKER(v11): no in-script call sites in the current v11 scheduler; retained for compatibility/regression and intentionally not pruned yet.
 def nrrd_mask_to_slicer_xyz(mask_u8: np.ndarray) -> np.ndarray:
     """Return a Slicer-oriented NRRD payload from the internal mask layout.
 
@@ -9048,7 +9265,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.5-Pro_v10.1.0_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.5-Pro_v11.0.0_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -9251,6 +9468,7 @@ def nrrd_decomposed_header(
     return header
 
 
+# DEAD_CODE_MARKER(v11): no in-script call sites in the current v11 scheduler; retained for compatibility/regression and intentionally not pruned yet.
 def _fill_decomposed_payload_layer_from_zyx(
     payload_lxyt: np.ndarray,
     layer_idx: int,
@@ -9409,7 +9627,7 @@ def _write_decomposed_nrrd_payload_stream(
 ) -> None:
     """Stream decomposed ``(layer,X,Y,t)`` gzip payload in NRRD Fortran axis order.
 
-    This is the core RAM-reduction change for v10.1.0 updates.  The old implementation built a
+    This is the core RAM-reduction change for v11.0.0 updates.  The old implementation built a
     full ``(layer,X,Y,t)`` memmap and then handed it to pynrrd; OS page cache plus writer-side
     traversal could push peak resident memory past the SLURM allocation.  This path keeps only a
     bounded ``(layer,X,row_chunk)`` buffer plus one source row block/slice at a time.
@@ -9634,7 +9852,7 @@ def get_view_mask_frame_by_index(mask_u8: np.ndarray, view: ViewInfo, index: int
     if view.name == 'radial':
         sampler = get_radial_sampler(view, float(view.azimuths_deg[int(index)]))
         return extract_radial_slice_mask_frame(mask_u8, sampler)
-    if view.family == 'tilted_transverse':
+    if is_tilted_view(view):
         return render_tilted_native_mask_frame(mask_u8, view, int(index))
     raise ValueError(f'Unknown view: {view.name}')
 
@@ -9793,6 +10011,7 @@ def write_view_binary_outputs_from_pattern(
     return tiff_dir, binary_video_path
 
 
+# DEAD_CODE_MARKER(v11): no in-script call sites in the current v11 scheduler; retained for compatibility/regression and intentionally not pruned yet.
 def write_additional_view_outputs(
     *,
     volume_rgb: np.memmap,
@@ -10131,7 +10350,7 @@ def build_troubleshooting_pass_union(
     workers: int,
 ) -> np.ndarray:
     if len(model_names) != 1:
-        raise ValueError('v10.1.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
+        raise ValueError('v11.0.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     view_volumes_for_pass: Dict[str, Dict[str, np.ndarray]] = {str(model_name): {} for model_name in model_names}
     intermediate_volumes: List[np.ndarray] = []
 
@@ -10173,7 +10392,7 @@ def build_troubleshooting_pass_union(
                             workers=int(workers),
                         )
                     view_volumes_for_pass[str(model_name)][view.name] = radial_volume
-                elif view.family == 'tilted_transverse':
+                elif is_tilted_view(view):
                     if tuple(int(x) for x in native_union.shape) == (int(T), int(H), int(W)):
                         tilted_volume = native_union
                     else:
@@ -10194,7 +10413,7 @@ def build_troubleshooting_pass_union(
                     view_volumes_for_pass[str(model_name)][view.name] = native_union
 
         # Troubleshooting pass outputs are stage snapshots taken before the corresponding
-        # interpolation pass. They must not run the final 3D void fill; v10.1.0 keeps
+        # interpolation pass. They must not run the final 3D void fill; v11.0.0 keeps
         # 3D void fill out of troubleshooting pre-pass outputs and applies it only when
         # --enable_3d_void_fill is active for the normal final output.
         pass_union = assemble_current_view_union_volume(
@@ -10240,7 +10459,7 @@ def schedule_troubleshooting_pass_outputs(
     workers: int,
 ) -> Dict[str, Path]:
     if len(model_names) != 1:
-        raise ValueError('v10.1.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
+        raise ValueError('v11.0.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     if int(total_passes) < 0 or not snapshot_refs:
         return {}
 
@@ -10364,7 +10583,7 @@ def resolve_low_quality_downbin_specs(
     low_quality_requested: bool,
     source_shape_t_y_x: Tuple[int, int, int],
 ) -> Tuple[List[LowQualityDownbinSpec], List[str]]:
-    """Resolve v10.1.0 isotropic low-quality downbins in native input geometry."""
+    """Resolve v11.0.0 isotropic low-quality downbins in native input geometry."""
     if downbin_values is None and not bool(low_quality_requested):
         return [], []
 
@@ -10639,7 +10858,7 @@ def save_low_quality_outputs(
     workers: int = 1,
     show_progress: bool = True,
 ) -> Dict[str, Path]:
-    """Write v10.1.1 low-quality outputs with isotropic X/Y/t resizing."""
+    """Write v11.0.0 low-quality outputs with isotropic X/Y/t resizing."""
     low_root = out_dir / 'low_quality'
     low_root.mkdir(parents=True, exist_ok=True)
     result_paths: Dict[str, Path] = {'low_quality_dir': low_root}
@@ -10757,7 +10976,7 @@ def union_view_volume_for_single_model(
     workers: int = 1,
 ) -> np.ndarray:
     if len(view_volumes_by_model) != 1:
-        raise ValueError('v10.1.0_SLURM supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('v11.0.0_SLURM supports exactly one --model; multiple-model inference has been removed')
     model_name = next(iter(view_volumes_by_model.keys()))
     if view_name not in view_volumes_by_model[model_name]:
         raise KeyError(f'No view volume found for {view_name}')
@@ -10844,6 +11063,7 @@ def write_tta_labels_for_view(
     return result_paths
 
 
+# DEAD_CODE_MARKER(v11): no in-script call sites in the current v11 scheduler; retained for compatibility/regression and intentionally not pruned yet.
 def save_tta_outputs(
     *,
     view_volumes_by_model: Dict[str, Dict[str, np.ndarray]],
@@ -10918,6 +11138,7 @@ def write_summary_file(
     interpolation_workers: int,
     output_workers: int,
     spec_notes: Optional[Sequence[str]] = None,
+    view_prediction_labels: Optional[Dict[str, str]] = None,
 ) -> Path:
     lines: List[str] = []
     lines.append(f'Command: {command}')
@@ -10947,13 +11168,12 @@ def write_summary_file(
     lines.append('')
     lines.append('View statistics:')
     total_prediction_count = 0
-    for view_key, label in (
-        ('transverse', 'Transverse'),
-        ('tilted_transverse', 'Tilted Transverse'),
-        ('sagittal', 'Sagittal'),
-        ('coronal', 'Coronal'),
-        ('radial', 'Radial'),
-    ):
+    labels = dict(view_prediction_labels or {})
+    ordered_keys: List[str] = [k for k in ('transverse', 'sagittal', 'coronal', 'radial') if k in view_prediction_stats]
+    tilted_keys = [k for k in view_prediction_stats.keys() if str(k).startswith('tilted_')]
+    other_keys = [k for k in view_prediction_stats.keys() if k not in set(ordered_keys) and k not in set(tilted_keys)]
+    for view_key in ordered_keys + sorted(tilted_keys, key=lambda k: labels.get(k, k)) + sorted(other_keys):
+        label = labels.get(view_key, str(view_key).replace('_', ' ').title())
         count = int(view_prediction_stats.get(view_key, 0))
         total_prediction_count += count
         lines.append(f'  {label}: predictions={count}')
@@ -11052,19 +11272,20 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('v10.1.1_SLURM accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('v11.0.0_SLURM accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
     model_paths = [model_path_resolved]
 
     angles = _parse_angles(args.angle) or [0.0, 120.0, 240.0]
+    tilt_views = resolve_tilt_views(args.tilt_view)
     tilt_angles = resolve_tilt_angles(args.tilt_angle)
     tilt_directions = resolve_tilt_directions(args.tilt_direction)
     tile_configs = resolve_tile_configs(args.tile_size, args.tile_stride)
     enable_sagittal = bool(args.enable_sagittal)
     enable_coronal = bool(args.enable_coronal)
-    # v10.1.0 removed the old per-view save flags. Default outputs stay transverse-only;
+    # v11.0.0 removed the old per-view save flags. Default outputs stay transverse-only;
     # active non-transverse views contribute to inference/union but are not separately exported.
     save_sagittal = False
     save_coronal = False
@@ -11086,8 +11307,8 @@ def main() -> None:
         args.gaussian_smoothing,
         int(args.gaussian_smoothing_passes),
     )
-    if bool(gaussian_smoothing_enabled) and float(gaussian_smoothing_sigma) <= 0.0:
-        raise ValueError('--gaussian_smoothing must be > 0 when smoothing is enabled')
+    if args.gaussian_smoothing is not None and float(args.gaussian_smoothing) < 0.0:
+        raise ValueError('--gaussian_smoothing must be >= 0; use 0 to disable smoothing')
     if float(args.interpolate_min_radius) < 0:
         raise ValueError('--interpolate_min_radius must be >= 0')
     if float(args.min_radius) < 0:
@@ -11143,7 +11364,7 @@ def main() -> None:
     processing_shape = compute_cube_resize_shape(input_T, input_H, input_W, tolerance=0.05)
     if processing_shape != (input_T, input_H, input_W):
         print(
-            'v10.1.0 cubic resize: '
+            'v11.0.0 cubic resize: '
             f'input shape (t,Y,X)=({input_T},{input_H},{input_W}) -> '
             f'processing shape (t,Y,X)={processing_shape}'
         )
@@ -11155,7 +11376,7 @@ def main() -> None:
             prefer_memory=True,
         )
     else:
-        print(f'v10.1.0 cubic resize: input shape already within 5% cube tolerance ({processing_shape})')
+        print(f'v11.0.0 cubic resize: input shape already within 5% cube tolerance ({processing_shape})')
         volume_rgb = input_volume_rgb
 
     T, H, W = (int(processing_shape[0]), int(processing_shape[1]), int(processing_shape[2]))
@@ -11177,6 +11398,9 @@ def main() -> None:
             'azimuth_angle_deg': resolved_azimuth_angle,
             'enable_sagittal': bool(enable_sagittal),
             'enable_coronal': bool(enable_coronal),
+            'tilt_views': list(tilt_views),
+            'tilt_angles_deg': [float(v) for v in tilt_angles],
+            'tilt_directions': list(tilt_directions),
         }, indent=2)
     )
 
@@ -11189,6 +11413,7 @@ def main() -> None:
         enable_coronal=bool(enable_coronal),
         azimuth_angle=float(resolved_azimuth_angle),
         include_radial=True,
+        tilt_views=tilt_views,
         tilt_angles=tilt_angles,
         tilt_directions=tilt_directions,
     )
@@ -11216,7 +11441,7 @@ def main() -> None:
         )
     if (int(T), int(H), int(W)) != (int(input_T), int(input_H), int(input_W)):
         spec_notes.append(
-            f'Working volume resized to v10.1.0 approximately-cubic processing geometry '
+            f'Working volume resized to v11.0.0 approximately-cubic processing geometry '
             f'(t,Y,X)=({int(T)},{int(H)},{int(W)}); final default outputs are restored to the original '
             f'input geometry (t,Y,X)=({int(input_T)},{int(input_H)},{int(input_W)}).'
         )
@@ -11224,13 +11449,23 @@ def main() -> None:
         f'Sagittal enabled={bool(enable_sagittal)}, Coronal enabled={bool(enable_coronal)}; '
         'their non-90 degree Cartesian augmentations use clamp-to-frame black fill rather than expanded padding.'
     )
+    if tilt_angles:
+        active_tilt_labels = ', '.join(pretty_view_name(v) for v in views if is_tilted_view(v))
+        spec_notes.append(
+            f'Generalized v11 Tilted Views active from --tilt_view={list(tilt_views)}, '
+            f'--tilt_direction={list(tilt_directions)}, --tilt_angle={[float(v) for v in tilt_angles]}. '
+            'Tilted base views do not need to be enabled as upright Cartesian views; each base/direction/signed-angle configuration remains independent until final union. '
+            f'Active tilted configurations: {active_tilt_labels}'
+        )
+    else:
+        spec_notes.append('Tilted Views disabled because --tilt_angle resolved to 0/no non-zero angles.')
     if float(resolved_azimuth_angle) > 0.0:
         spec_notes.append(
             f'Radial enabled with azimuth spacing {float(resolved_azimuth_angle):.8g} degrees; '
             'Lanczos-3 radial sampling, wraparound Radial interpolation, and dense final backprojection are active.'
         )
     spec_notes.append(
-        'NRRD export is decomposed by default in v10.1.0: layers are written on a leading list axis as '
+        'NRRD export is decomposed by default in v11.0.0: layers are written on a leading list axis as '
         '(layer,X,Y,t), with manifest JSON and SegmentN metadata for view, source, YOLO-vs-bridge, '
         'tile acceptance category, pre-smoothing union, smoothing pass results, and final output. '
         'The NRRD payload is now gzip-streamed directly from backing layers with a bounded row buffer '
@@ -11245,16 +11480,16 @@ def main() -> None:
             'and queued frame payloads are buffered in RAM via YOLO_TTA_CPU_MASK_PENDING_FRAMES.'
         )
     else:
-        spec_notes.append('Experimental CPU retina-mask reconstruction disabled by YOLO_TTA_CPU_RETINA_MASKS=0; using Ultralytics GPU masks.')
+        spec_notes.append('Experimental CPU retina-mask reconstruction disabled by YOLO_TTA_CPU_RETINA_MASKS=0; using Ultralytics non-retina masks with CPU resize fallback, which is intended only for debugging and is not the v11 default.')
     if bool(gaussian_smoothing_enabled):
         spec_notes.append(
             f'Gaussian smoothing active: sigma={float(gaussian_smoothing_sigma):g} voxel(s), '
             f'passes={int(gaussian_smoothing_passes)}; applied after final union/optional 3D void fill and before --keep_objects.'
         )
     else:
-        spec_notes.append('Gaussian smoothing disabled by default; --gaussian_smoothing enables it, and --gaussian_smoothing_passes > 1 enables it with the default sigma.')
+        spec_notes.append('Gaussian smoothing disabled because --gaussian_smoothing resolved to 0.')
     spec_notes.append(
-        'Interpolation endpoint discovery uses the v10.1.0 per-slice connected-component scan; '
+        'Interpolation endpoint discovery uses the v11.0.0 per-slice connected-component scan; '
         'skeletonization is never used for interpolation and runs only when --save_skeleton is requested. '
         'Optional skeleton output uses slice-parallel pore preconditioning plus component/chunk based 3D Lee thinning; '
         'overlay videos draw the skeleton as fully opaque red on top of the 50% blue mask overlay.'
@@ -11265,7 +11500,7 @@ def main() -> None:
     )
     if transverse_inference_disabled:
         note = (
-            'v10.1.0 specification note: Section 2.1.1 says Transverse must always be created, while '
+            'v11.0.0 specification note: Section 2.1.1 says Transverse must always be created, while '
             'View Flags item 1 adds --disable_transverse to skip Transverse inferencing. This implementation '
             'keeps Transverse geometry/output paths available and removes only the standard Transverse full-frame '
             'and tiled prediction jobs.'
@@ -11276,7 +11511,7 @@ def main() -> None:
     model_name = Path(model_paths[0]).stem
     print(f'Loading model: {model_name} ({model_paths[0]})')
     yolo_model = load_ultralytics_model(model_paths[0], task='segment')
-    # v10.1.0 has no multiple-model inference. A single-item list is retained only to minimize churn in
+    # v11.0.0 has no multiple-model inference. A single-item list is retained only to minimize churn in
     # scheduling structures keyed by model stem.
     yolo_models: List[Tuple[str, object]] = [(model_name, yolo_model)]
     yolo_by_model_name: Dict[str, object] = {model_name: yolo_model}
@@ -11385,11 +11620,20 @@ def main() -> None:
     tile_jobs_by_aug: Dict[Tuple[str, str], List[DenseTileJob]] = {}
     view_prediction_stats: Dict[str, int] = {
         'transverse': 0,
-        'tilted_transverse': 0,
         'sagittal': 0,
         'coronal': 0,
         'radial': 0,
     }
+    view_prediction_labels: Dict[str, str] = {
+        'transverse': 'Transverse',
+        'sagittal': 'Sagittal',
+        'coronal': 'Coronal',
+        'radial': 'Radial',
+    }
+    for _view_for_stats in views:
+        if is_tilted_view(_view_for_stats):
+            view_prediction_stats.setdefault(str(_view_for_stats.summary_family), 0)
+            view_prediction_labels[str(_view_for_stats.summary_family)] = pretty_view_name(_view_for_stats)
     interpolation_stats: List[Dict[str, object]] = []
     pass_snapshot_refs: Dict[Tuple[str, str, str, int], VolumeSnapshotRef] = {}
 
@@ -11638,7 +11882,7 @@ def main() -> None:
         _submit_fullframe_video(view, aug_job)
         # Non-radial tiled views are created alongside their parent view. Radial tiles remain
         # deferred until the radial parent frame cache/video exists because radial slicing is
-        # substantially more expensive and is the only v10.1.0 exception.
+        # substantially more expensive and is the only v11.0.0 exception.
         if dense_tiling_active and view.family != 'radial':
             tile_jobs = tile_jobs_by_aug.get((view.name, aug_job.aug_id), [])
             if tile_jobs:
@@ -11738,7 +11982,7 @@ def main() -> None:
         view = view_infos_by_name[str(view_name)]
         if view.family == 'radial':
             return str(view_name) in radial_native_output_by_model.get(str(model_name), {})
-        if view.family == 'tilted_transverse':
+        if is_tilted_view(view):
             return str(view_name) in tilted_native_output_by_model.get(str(model_name), {})
         return str(view_name) in view_volumes_by_model.get(str(model_name), {})
 
@@ -11746,7 +11990,7 @@ def main() -> None:
         view = view_infos_by_name[str(view_name)]
         if view.family == 'radial':
             return radial_native_output_by_model[str(model_name)][str(view_name)]
-        if view.family == 'tilted_transverse':
+        if is_tilted_view(view):
             return tilted_native_output_by_model[str(model_name)][str(view_name)]
         return view_volumes_by_model[str(model_name)][str(view_name)]
 
@@ -11913,7 +12157,7 @@ def main() -> None:
             if result.final_view_volume_mm is not None:
                 if view_info.family == 'radial' and dense_tiling_active:
                     radial_native_output_by_model[result.model_name][result.view_name] = result.final_view_volume_mm
-                elif view_info.family == 'tilted_transverse' and dense_tiling_active:
+                elif is_tilted_view(view_info) and dense_tiling_active:
                     tilted_native_output_by_model[result.model_name][result.view_name] = result.final_view_volume_mm
                 else:
                     view_volumes_by_model[result.model_name][result.view_name] = result.final_view_volume_mm
@@ -12143,7 +12387,7 @@ def main() -> None:
 
     final_backprojection_jobs: List[Tuple[str, ViewInfo, np.ndarray]] = []
     for view in views:
-        if view.family not in ('radial', 'tilted_transverse'):
+        if (view.family != 'radial' and not is_tilted_view(view)):
             continue
         for model_name, _ in yolo_models:
             if view.name in view_volumes_by_model[model_name]:
@@ -12190,7 +12434,7 @@ def main() -> None:
                         float(args.min_radius),
                         workers=int(per_backproject_workers),
                     )
-            elif view_local.family == 'tilted_transverse':
+            elif is_tilted_view(view_local):
                 projected = backproject_tilted_volume_to_volume(
                     tilted_mask_mm=native_source,
                     tilted_view=view_local,
@@ -12199,6 +12443,13 @@ def main() -> None:
                     prefer_memory=True,
                     workers=int(per_backproject_workers),
                 )
+                if float(args.min_radius) > 0.0:
+                    print(f"Applying --min_radius in the transverse plane for backprojected view '{view_local.name}'")
+                    apply_transverse_min_radius_filter_inplace(
+                        projected,
+                        float(args.min_radius),
+                        workers=int(per_backproject_workers),
+                    )
             else:  # pragma: no cover
                 raise ValueError(f'Unsupported final backprojection view family: {view_local.family}')
             return model_name_local, view_local.name, projected
@@ -12338,6 +12589,8 @@ def main() -> None:
             enable_radial=True,
             diameter=min(output_W, output_H),
         )
+    # DEAD_CODE_MARKER(v11): output_views is currently not consumed by final-output scheduling;
+    # retained as a future geometry mirror for restored-space view exports.
     output_views = get_view_infos(
         T=output_T,
         H=output_H,
@@ -12347,6 +12600,7 @@ def main() -> None:
         enable_coronal=bool(enable_coronal),
         azimuth_angle=float(output_radial_angle),
         include_radial=True,
+        tilt_views=tilt_views,
         tilt_angles=tilt_angles,
         tilt_directions=tilt_directions,
     )
@@ -12490,13 +12744,14 @@ def main() -> None:
         view_names=[
             (
                 f'{v.name} ({int(v.num_slices)} frames; centers {int(v.tilt_frame_start)}..{int(v.tilt_frame_stop)})'
-                if v.family == 'tilted_transverse'
+                if is_tilted_view(v)
                 else f'{v.name} ({int(v.num_slices)} frames)'
             )
             for v in views
         ],
         view_prediction_stats=view_prediction_stats,
         interpolation_stats=interpolation_stats,
+        view_prediction_labels=view_prediction_labels,
         enable_3d_void_fill=bool(args.enable_3d_void_fill),
         gaussian_smoothing_stats=gaussian_smoothing_stats,
         keep_objects_stats=keep_objects_stats,
