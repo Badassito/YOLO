@@ -11,7 +11,7 @@ This v11.1.0_SLURM single-channel-aligned script:
     whichever inference job becomes ready first, while still preferring ready parent/full-frame jobs over tile jobs
   - stages cleaned tiled masks into one parent-view canvas per tile-size/stride set, gates each consolidated canvas
     at the connected-component level against frozen parent full-frame support, then interpolates the accepted tiled volume once per parent view
-  - spills postprocessed waiting tile masks to a user-space ctile cache: per-slice empty elision, nonzero bbox crop, NumPy packbits, and LZ4 compression
+  - spills postprocessed waiting tile masks to a user-space ctile cache and stores decomposed NRRD/support binary volumes as cvol stores: per-slice empty elision, nonzero bbox crop, NumPy packbits, and LZ4 compression
   - removes dense-tile pruning and keeps temporary/intermediate mask volumes unpacked throughout
   - fuses per-slice cleanup work where the slice orientation matches the required semantics
     (notably min_conf filtering, 2D hole filling, and min_radius where applicable)
@@ -32,7 +32,7 @@ This v11.1.0_SLURM single-channel-aligned script:
     low-quality presentation outputs, with FFV1 used for spec-required MKVs
   - writes the default NRRD as independently toggleable layers for full-frame YOLO masks, interpolation bridges, tiled masks accepted by parent YOLO masks,
     tiled masks accepted by parent bridges, consolidated tile bridges, the pre-smoothing global union, smoothing-pass results, optional skeleton, and the final output layer
-  - streams NRRD gzip payloads directly from per-layer backing arrays without materializing a full 4D decomposed payload, reducing peak RAM and scratch pressure during final NRRD creation
+  - streams NRRD gzip payloads directly from per-layer backing arrays or compressed cvol stores without materializing a full 4D decomposed payload, reducing peak RAM and scratch pressure during final NRRD creation
 
 Dependencies (Python):
   pip install opencv-python numpy scipy scikit-image tifffile tqdm ultralytics lz4
@@ -7099,8 +7099,8 @@ class PreparedViewResult:
     interpolation_stats: List[Dict[str, object]]
     pass_snapshots: Dict[int, VolumeSnapshotRef] = field(default_factory=dict)
     nrrd_layers: List[NrrdLayerRef] = field(default_factory=list)
-    parent_mask_support_mm: Optional[np.ndarray] = None
-    parent_bridge_support_mm: Optional[np.ndarray] = None
+    parent_mask_support_mm: Optional[object] = None
+    parent_bridge_support_mm: Optional[object] = None
 
 
 @dataclass
@@ -7139,6 +7139,8 @@ class DeferredTilePostprocessResult:
 
 
 CTILE_FORMAT = 'ctile-mask-v1'
+CVOL_FORMAT = 'cvol-mask-v1'
+COMPRESSED_MASK_FORMATS = {CTILE_FORMAT, CVOL_FORMAT}
 CTILE_BITORDER = 'little'
 CTILE_INDEX_DTYPE = np.dtype([
     ('kind', 'u1'),              # 0 = empty/zero chunk, 1 = LZ4-compressed packbits payload
@@ -7156,7 +7158,7 @@ CTILE_INDEX_DTYPE = np.dtype([
 def _require_lz4_frame() -> object:
     if _lz4_frame is None:
         raise RuntimeError(
-            'The v11.1.0 compressed waiting-tile cache requires lz4. '
+            'The v11.1.0 compressed bitpacked mask stores require lz4. '
             'Install it with: pip install lz4'
         )
     return _lz4_frame
@@ -7176,11 +7178,12 @@ class CompressedTileSlicePayload:
 
 
 class CompressedTileMaskStore:
-    """Read-once adapter for v11.1.0 waiting tile masks.
+    """Read adapter for v11.1.0 compressed bitpacked binary mask volumes.
 
-    The store is a temporary internal representation for postprocessed dense-tile masks that
-    are waiting for parent full-frame support.  Each decoded slice is reconstructed on demand
-    from an optional nonzero bounding box, NumPy packbits bytes, and an LZ4 payload.
+    The same per-slice container is used for waiting tile masks (``ctile-mask-v1``) and
+    for larger binary scratch artifacts such as NRRD support/layer archives
+    (``cvol-mask-v1``). Each decoded slice is reconstructed on demand from an
+    optional nonzero bounding box, NumPy packbits bytes, and an LZ4 payload.
     """
 
     def __init__(self, root: Path, meta: Dict[str, object], index: np.ndarray) -> None:
@@ -7190,7 +7193,7 @@ class CompressedTileMaskStore:
         self.chunks_path = self.root / 'chunks.bin'
         shape = self.meta.get('shape')
         if not isinstance(shape, list) or len(shape) != 3:
-            raise ValueError(f'{self.root}: invalid ctile shape metadata: {shape!r}')
+            raise ValueError(f'{self.root}: invalid compressed-mask shape metadata: {shape!r}')
         self.shape = (int(shape[0]), int(shape[1]), int(shape[2]))
         if int(self.index.shape[0]) != int(self.shape[0]):
             raise ValueError(f'{self.root}: index slice count {int(self.index.shape[0])} != shape[0] {int(self.shape[0])}')
@@ -7204,8 +7207,9 @@ class CompressedTileMaskStore:
         if not meta_path.exists() or not index_path.exists() or not chunks_path.exists():
             raise FileNotFoundError(f'Incomplete compressed tile store: {root}')
         meta = json.loads(meta_path.read_text())
-        if str(meta.get('format', '')) != CTILE_FORMAT:
-            raise ValueError(f'{root}: unsupported compressed tile format {meta.get("format")!r}')
+        fmt = str(meta.get('format', ''))
+        if fmt not in COMPRESSED_MASK_FORMATS:
+            raise ValueError(f'{root}: unsupported compressed mask format {meta.get("format")!r}')
         shape = meta.get('shape')
         if not isinstance(shape, list) or len(shape) != 3:
             raise ValueError(f'{root}: invalid shape metadata {shape!r}')
@@ -7222,7 +7226,7 @@ class CompressedTileMaskStore:
         if int(rec['kind']) == 0:
             return out
         if int(rec['kind']) != 1:
-            raise ValueError(f'{self.root}: invalid ctile chunk marker {int(rec["kind"])} at slice {idx_i}')
+            raise ValueError(f'{self.root}: invalid compressed-mask chunk marker {int(rec["kind"])} at slice {idx_i}')
 
         y0 = int(rec['y0']); x0 = int(rec['x0']); y1 = int(rec['y1']); x1 = int(rec['x1'])
         if not (0 <= y0 < y1 <= int(h) and 0 <= x0 < x1 <= int(w)):
@@ -7260,19 +7264,19 @@ class CompressedTileMaskStore:
         shutil.rmtree(self.root, ignore_errors=True)
 
 
-def _encode_ctile_slice(idx: int, tile_mask_mm: np.ndarray) -> CompressedTileSlicePayload:
+def _encode_bool_mask_slice_payload(idx: int, mask_bool: np.ndarray) -> CompressedTileSlicePayload:
     lz4_frame = _require_lz4_frame()
-    mask_bool = np.asarray(tile_mask_mm[int(idx)], dtype=np.uint8) > 0
-    if mask_bool.size == 0 or not np.any(mask_bool):
+    mask_arr = np.asarray(mask_bool, dtype=bool)
+    if mask_arr.size == 0 or not np.any(mask_arr):
         return CompressedTileSlicePayload(idx=int(idx), is_empty=True)
 
-    rows = np.any(mask_bool, axis=1)
-    cols = np.any(mask_bool, axis=0)
+    rows = np.any(mask_arr, axis=1)
+    cols = np.any(mask_arr, axis=0)
     y0 = int(np.argmax(rows))
     y1 = int(rows.size - np.argmax(rows[::-1]))
     x0 = int(np.argmax(cols))
     x1 = int(cols.size - np.argmax(cols[::-1]))
-    crop = np.ascontiguousarray(mask_bool[y0:y1, x0:x1], dtype=bool)
+    crop = np.ascontiguousarray(mask_arr[y0:y1, x0:x1], dtype=bool)
     packed = np.packbits(crop.reshape(-1), bitorder=CTILE_BITORDER)
     payload = lz4_frame.compress(packed.tobytes(), compression_level=0)
     return CompressedTileSlicePayload(
@@ -7286,6 +7290,282 @@ def _encode_ctile_slice(idx: int, tile_mask_mm: np.ndarray) -> CompressedTileSli
         payload=payload,
         foreground_voxels=int(np.count_nonzero(crop)),
     )
+
+
+def _encode_ctile_slice(idx: int, tile_mask_mm: np.ndarray) -> CompressedTileSlicePayload:
+    mask_bool = np.asarray(tile_mask_mm[int(idx)], dtype=np.uint8) > 0
+    return _encode_bool_mask_slice_payload(int(idx), mask_bool)
+
+
+def _write_compressed_bitpacked_payload_store(
+    *,
+    shape: Tuple[int, int, int],
+    store_dir: Path,
+    encode_slice: Callable[[int], CompressedTileSlicePayload],
+    format_name: str,
+    desc: str,
+    workers: int = 1,
+    extra_meta: Optional[Dict[str, object]] = None,
+) -> Dict[str, int]:
+    """Write a slice-chunked bitpacked+LZ4 binary mask store.
+
+    This is used as a general replacement for raw uint8 temporary volumes when the
+    consumer can tolerate slice-at-a-time reads. Empty slices are represented only
+    in the index, nonempty slices are cropped to their foreground bbox, bit-packed,
+    and compressed with LZ4 level 0 for high throughput.
+    """
+    _require_lz4_frame()
+    fmt = str(format_name)
+    if fmt not in COMPRESSED_MASK_FORMATS:
+        raise ValueError(f'Unsupported compressed bitpacked mask format: {fmt}')
+
+    shape_i = (int(shape[0]), int(shape[1]), int(shape[2]))
+    if any(v < 0 for v in shape_i):
+        raise ValueError(f'{desc}: invalid compressed store shape {shape_i}')
+
+    store_dir = Path(store_dir)
+    if store_dir.exists():
+        shutil.rmtree(store_dir, ignore_errors=True)
+    store_dir.mkdir(parents=True, exist_ok=True)
+    chunks_path = store_dir / 'chunks.bin'
+    index_path = store_dir / 'index.bin'
+    meta_path = store_dir / 'meta.json'
+
+    index = np.zeros((int(shape_i[0]),), dtype=CTILE_INDEX_DTYPE)
+    worker_count = choose_slice_parallel_workers(int(workers), int(shape_i[0]))
+    payload_bytes = 0
+    packed_bytes = 0
+    nonempty_slices = 0
+    foreground_voxels = 0
+
+    if worker_count <= 1:
+        iterable: Iterable[CompressedTileSlicePayload] = (encode_slice(idx) for idx in range(int(shape_i[0])))
+    else:
+        iterable = parallel_map_in_order(
+            encode_slice,
+            range(int(shape_i[0])),
+            max_workers=worker_count,
+            max_pending=max(worker_count, worker_count * 2),
+        )
+
+    offset = 0
+    with chunks_path.open('wb') as chunks_fh:
+        for item in iterable:
+            idx = int(item.idx)
+            if idx < 0 or idx >= int(shape_i[0]):
+                raise ValueError(f'{desc}: encoder returned out-of-range slice index {idx}')
+            if bool(item.is_empty):
+                index[idx]['kind'] = np.uint8(0)
+                continue
+            payload = bytes(item.payload)
+            compressed_size = int(len(payload))
+            chunks_fh.write(payload)
+            index[idx]['kind'] = np.uint8(1)
+            index[idx]['offset'] = np.uint64(offset)
+            index[idx]['compressed_size'] = np.uint64(compressed_size)
+            index[idx]['y0'] = np.uint32(item.y0)
+            index[idx]['x0'] = np.uint32(item.x0)
+            index[idx]['y1'] = np.uint32(item.y1)
+            index[idx]['x1'] = np.uint32(item.x1)
+            index[idx]['packed_nbytes'] = np.uint64(item.packed_nbytes)
+            offset += compressed_size
+            payload_bytes += compressed_size
+            packed_bytes += int(item.packed_nbytes)
+            foreground_voxels += int(item.foreground_voxels)
+            nonempty_slices += 1
+
+    index.tofile(index_path)
+    raw_logical_bytes = int(array_nbytes(shape_i, np.uint8))
+    stats = {
+        'nonempty_slices': int(nonempty_slices),
+        'empty_slices': int(shape_i[0] - nonempty_slices),
+        'foreground_voxels': int(foreground_voxels),
+        'logical_raw_uint8_bytes': int(raw_logical_bytes),
+        'packed_bytes_before_lz4': int(packed_bytes),
+        'compressed_payload_bytes': int(payload_bytes),
+        'index_bytes': int(index.nbytes),
+    }
+    meta = {
+        'format': fmt,
+        'shape': [int(shape_i[0]), int(shape_i[1]), int(shape_i[2])],
+        'dtype': 'bool',
+        'logical_dtype_in_pipeline': 'uint8_0_or_1',
+        'chunking': 'slice',
+        'bitorder': CTILE_BITORDER,
+        'precodec': 'numpy.packbits',
+        'compressor': 'lz4',
+        'bbox_per_chunk': True,
+        'zero_chunk_elision': True,
+        'index_dtype': 'ctile-index-v1',
+        'index_record_bytes': int(CTILE_INDEX_DTYPE.itemsize),
+        'packed_shape_encoding': 'flat_uint8_count_in_index.packed_nbytes',
+        'description': str(desc),
+        'stats': stats,
+    }
+    if extra_meta:
+        meta.update(dict(extra_meta))
+    meta_path.write_text(json.dumps(meta, indent=2) + '\n')
+    print(
+        f'{desc}: compressed bitpacked store {store_dir} '
+        f'(raw={raw_logical_bytes / GIB:.2f} GiB, packed={packed_bytes / GIB:.2f} GiB, '
+        f'lz4_payload={payload_bytes / GIB:.2f} GiB, nonempty_slices={nonempty_slices})'
+    )
+    return stats
+
+
+def write_compressed_bitpacked_mask_store(
+    mask_volume: np.ndarray,
+    store_dir: Path,
+    *,
+    format_name: str = CVOL_FORMAT,
+    desc: str = 'Compressed bitpacked mask store',
+    workers: int = 1,
+    extra_meta: Optional[Dict[str, object]] = None,
+) -> Dict[str, int]:
+    arr = np.asarray(mask_volume)
+    if arr.ndim != 3:
+        raise ValueError(f'{desc}: expected 3D mask volume, got shape {arr.shape}')
+    shape = (int(arr.shape[0]), int(arr.shape[1]), int(arr.shape[2]))
+
+    def _encode(idx: int) -> CompressedTileSlicePayload:
+        return _encode_ctile_slice(int(idx), arr)
+
+    return _write_compressed_bitpacked_payload_store(
+        shape=shape,
+        store_dir=Path(store_dir),
+        encode_slice=_encode,
+        format_name=str(format_name),
+        desc=str(desc),
+        workers=int(workers),
+        extra_meta=extra_meta,
+    )
+
+
+def _volume_shape_tuple(volume: object) -> Tuple[int, int, int]:
+    shape = getattr(volume, 'shape', None)
+    if shape is None:
+        shape = np.asarray(volume).shape
+    if len(shape) != 3:
+        raise ValueError(f'Expected a 3D binary volume, got shape {shape}')
+    return (int(shape[0]), int(shape[1]), int(shape[2]))
+
+
+def _read_binary_volume_slice_u8(volume: object, idx: int) -> np.ndarray:
+    if isinstance(volume, CompressedTileMaskStore):
+        return volume.decode_slice(int(idx), dtype=np.uint8)
+    return np.asarray(volume[int(idx)], dtype=np.uint8)
+
+
+def _read_binary_volume_slice_bool(volume: object, idx: int) -> np.ndarray:
+    return np.asarray(_read_binary_volume_slice_u8(volume, int(idx)), dtype=np.uint8) > 0
+
+
+def subtract_volume_to_compressed_bitpacked_store(
+    after_mm: np.ndarray,
+    before_volume: object,
+    store_dir: Path,
+    *,
+    desc: str,
+    workers: int = 1,
+    format_name: str = CVOL_FORMAT,
+) -> Dict[str, int]:
+    after_shape = _volume_shape_tuple(after_mm)
+    before_shape = _volume_shape_tuple(before_volume)
+    if after_shape != before_shape:
+        raise ValueError(f'{desc}: shape mismatch {after_shape} vs {before_shape}')
+
+    def _encode_delta(idx: int) -> CompressedTileSlicePayload:
+        after_slice = np.asarray(after_mm[int(idx)], dtype=np.uint8) > 0
+        before_slice = _read_binary_volume_slice_bool(before_volume, int(idx))
+        return _encode_bool_mask_slice_payload(int(idx), after_slice & (~before_slice))
+
+    return _write_compressed_bitpacked_payload_store(
+        shape=after_shape,
+        store_dir=Path(store_dir),
+        encode_slice=_encode_delta,
+        format_name=str(format_name),
+        desc=str(desc),
+        workers=int(workers),
+        extra_meta={'operation': 'after_and_not_before'},
+    )
+
+
+def _memmap_backing_path(arr: object) -> Optional[Path]:
+    if arr is None:
+        return None
+    try:
+        if isinstance(arr, np.memmap):
+            filename = getattr(arr, 'filename', None)
+            return Path(filename) if filename else None
+    except Exception:
+        pass
+    try:
+        base = getattr(arr, 'base', None)
+        if isinstance(base, np.memmap):
+            filename = getattr(base, 'filename', None)
+            return Path(filename) if filename else None
+    except Exception:
+        pass
+    return None
+
+
+def temp_binary_archive_enabled() -> bool:
+    return _env_flag('YOLO_TTA_ARCHIVE_TEMP_BINARY_VOLUMES', True)
+
+
+def compressed_nrrd_layers_enabled() -> bool:
+    return _env_flag('YOLO_TTA_COMPRESS_NRRD_LAYERS', True)
+
+
+def archive_or_delete_binary_volume_storage(
+    volume: Optional[np.ndarray],
+    *,
+    keep_temp: bool,
+    workers: int,
+    desc: str,
+    compressed_dir: Optional[Path] = None,
+) -> None:
+    """Close a temporary binary volume and replace kept raw uint8 memmaps with cvol."""
+    if volume is None:
+        return
+
+    raw_path = _memmap_backing_path(volume)
+    if bool(keep_temp) and bool(temp_binary_archive_enabled()) and raw_path is not None:
+        archive_dir = Path(compressed_dir) if compressed_dir is not None else raw_path.with_name(raw_path.name + '.cvol')
+        try:
+            write_compressed_bitpacked_mask_store(
+                np.asarray(volume),
+                archive_dir,
+                format_name=CVOL_FORMAT,
+                desc=f'{desc} archive',
+                workers=int(workers),
+                extra_meta={'archived_from_raw_path': str(raw_path)},
+            )
+            close_memmap_array(volume)
+            try:
+                raw_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return
+        except Exception as exc:
+            print(f'Warning: failed to archive {desc} as compressed bitpacked cvol ({exc}); keeping raw volume {raw_path}')
+
+    close_memmap_array(volume)
+    if not bool(keep_temp) and raw_path is not None:
+        try:
+            raw_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def close_compressed_or_memmap_volume(volume: object, *, keep_temp: bool = True) -> None:
+    if volume is None:
+        return
+    if isinstance(volume, CompressedTileMaskStore):
+        if not bool(keep_temp):
+            volume.unlink()
+        return
+    close_memmap_array(volume)
 
 
 @dataclass(frozen=True)
@@ -7303,9 +7583,10 @@ class VolumeSnapshotRef:
 class NrrdLayerRef:
     """One orthogonal-space layer for the decomposed v11.1.0 NRRD export.
 
-    The backing file is always a uint8 binary mask in the pipeline's orthogonal
-    ``(t, Y, X)`` processing geometry.  The NRRD writer converts each layer to
-    the requested output geometry, then writes a 4D NRRD with a leading list axis.
+    The layer is a binary mask in the pipeline's orthogonal ``(t, Y, X)``
+    processing geometry. The backing path may be a raw uint8 memmap or a
+    compressed cvol bitpacked store; the NRRD writer reads either source
+    slice-by-slice and writes a 4D NRRD with a leading list axis.
     """
 
     key: str
@@ -7313,6 +7594,7 @@ class NrrdLayerRef:
     path: Path
     shape: Tuple[int, int, int]
     dtype: str = 'uint8'
+    storage_format: str = 'raw_u8'
     model_name: str = ''
     view_name: str = ''
     view_family: str = ''
@@ -7650,16 +7932,41 @@ def materialize_nrrd_view_layer(
         tile_acceptance=str(tile_acceptance),
         stage=str(stage),
     )
-    out_path = temp_dir / 'nrrd_layers' / str(model_name) / str(view.name) / f'{key}.orthogonal.u8.dat'
+    layer_dir = temp_dir / 'nrrd_layers' / str(model_name) / str(view.name)
+    storage_format = 'raw_u8'
+    if compressed_nrrd_layers_enabled():
+        raw_path = temp_dir / 'nrrd_work' / 'projected_layers' / str(model_name) / str(view.name) / f'{key}.orthogonal.u8.dat'
+        out_path = layer_dir / f'{key}.orthogonal.cvol'
+    else:
+        raw_path = layer_dir / f'{key}.orthogonal.u8.dat'
+        out_path = raw_path
+
     projected = project_view_volume_to_orthogonal_volume(
         view_volume_mm,
         view,
-        out_path,
+        raw_path,
         desc=f'NRRD layer {key}',
         workers=int(workers),
     )
     shape = tuple(int(x) for x in np.asarray(projected).shape)
-    close_memmap_array(projected)
+    if compressed_nrrd_layers_enabled():
+        write_compressed_bitpacked_mask_store(
+            projected,
+            out_path,
+            format_name=CVOL_FORMAT,
+            desc=f'NRRD layer {key}',
+            workers=int(workers),
+            extra_meta={'nrrd_layer_key': key, 'source_raw_path': str(raw_path)},
+        )
+        storage_format = CVOL_FORMAT
+        close_memmap_array(projected)
+        try:
+            raw_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    else:
+        close_memmap_array(projected)
+
     return NrrdLayerRef(
         key=key,
         name=_nrrd_layer_name(
@@ -7673,6 +7980,7 @@ def materialize_nrrd_view_layer(
         path=out_path,
         shape=(int(shape[0]), int(shape[1]), int(shape[2])),
         dtype='uint8',
+        storage_format=storage_format,
         model_name=str(model_name),
         view_name=str(view.name),
         view_family=str(view.family),
@@ -7708,16 +8016,41 @@ def materialize_nrrd_global_layer(
         pass_index=int(pass_index),
         stage=str(stage),
     )
-    out_path = temp_dir / 'nrrd_layers' / str(model_name) / view_name / f'{key}.orthogonal.u8.dat'
+    layer_dir = temp_dir / 'nrrd_layers' / str(model_name) / view_name
+    storage_format = 'raw_u8'
+    if compressed_nrrd_layers_enabled():
+        raw_path = temp_dir / 'nrrd_work' / 'global_layers' / str(model_name) / f'{key}.orthogonal.u8.dat'
+        out_path = layer_dir / f'{key}.orthogonal.cvol'
+    else:
+        raw_path = layer_dir / f'{key}.orthogonal.u8.dat'
+        out_path = raw_path
+
     copied = copy_workspace_array(
         np.asarray(volume_mm, dtype=np.uint8),
-        out_path,
+        raw_path,
         desc=f'NRRD layer {key}',
         prefer_memory=False,
         workers=int(workers),
     )
     shape = tuple(int(x) for x in np.asarray(copied).shape)
-    close_memmap_array(copied)
+    if compressed_nrrd_layers_enabled():
+        write_compressed_bitpacked_mask_store(
+            copied,
+            out_path,
+            format_name=CVOL_FORMAT,
+            desc=f'NRRD layer {key}',
+            workers=int(workers),
+            extra_meta={'nrrd_layer_key': key, 'source_raw_path': str(raw_path)},
+        )
+        storage_format = CVOL_FORMAT
+        close_memmap_array(copied)
+        try:
+            raw_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    else:
+        close_memmap_array(copied)
+
     return NrrdLayerRef(
         key=key,
         name=_nrrd_layer_name(
@@ -7730,6 +8063,7 @@ def materialize_nrrd_global_layer(
         path=out_path,
         shape=(int(shape[0]), int(shape[1]), int(shape[2])),
         dtype='uint8',
+        storage_format=storage_format,
         model_name=str(model_name),
         view_name=view_name,
         view_family='global',
@@ -7739,7 +8073,6 @@ def materialize_nrrd_global_layer(
         stage=str(stage),
         description=str(description),
     )
-
 
 def prepare_view_volume_after_fullframe(
     *,
@@ -7766,8 +8099,8 @@ def prepare_view_volume_after_fullframe(
 ) -> PreparedViewResult:
     baseline_native_volume = union_mm
     nrrd_layers: List[NrrdLayerRef] = []
-    parent_mask_support_mm: Optional[np.ndarray] = None
-    parent_bridge_support_mm: Optional[np.ndarray] = None
+    parent_mask_support_mm: Optional[object] = None
+    parent_bridge_support_mm: Optional[object] = None
     parent_mask_support_path: Optional[Path] = None
     parent_bridge_support_path: Optional[Path] = None
 
@@ -7788,16 +8121,8 @@ def prepare_view_volume_after_fullframe(
             pass
 
     if bool(nrrd_layers_enabled):
-        parent_mask_support_path = temp_dir / 'nrrd_support' / str(model_name) / view.name / 'fullframe_yolo_support.u8.dat'
-        parent_mask_support_mm = copy_workspace_array(
-            baseline_native_volume,
-            parent_mask_support_path,
-            desc=f'NRRD support fullframe YOLO {model_name}/{view.name}',
-            prefer_memory=False,
-            workers=int(slice_workers),
-        )
         layer_ref = materialize_nrrd_view_layer(
-            parent_mask_support_mm,
+            baseline_native_volume,
             model_name=str(model_name),
             view=view,
             source='fullframe',
@@ -7810,6 +8135,21 @@ def prepare_view_volume_after_fullframe(
         )
         if layer_ref is not None:
             nrrd_layers.append(layer_ref)
+
+        # Only dense tiled NRRD category gating needs a persistent parent-YOLO support copy.
+        # Store it as a slice-chunked cvol instead of a raw uint8 memmap to avoid one
+        # full-volume duplicate per active view.
+        if bool(dense_tiling_active):
+            parent_mask_support_path = temp_dir / 'nrrd_support' / str(model_name) / view.name / 'fullframe_yolo_support.cvol'
+            write_compressed_bitpacked_mask_store(
+                baseline_native_volume,
+                parent_mask_support_path,
+                format_name=CVOL_FORMAT,
+                desc=f'NRRD support fullframe YOLO {model_name}/{view.name}',
+                workers=int(slice_workers),
+                extra_meta={'support_kind': 'fullframe_yolo_pre_interpolation'},
+            )
+            parent_mask_support_mm = CompressedTileMaskStore.open(parent_mask_support_path)
 
     pass_snapshots: Dict[int, VolumeSnapshotRef] = {}
     snap0 = _snapshot_volume_for_troubleshooting(
@@ -7939,22 +8279,24 @@ def prepare_view_volume_after_fullframe(
                     pass
 
     if bool(nrrd_layers_enabled) and parent_mask_support_mm is not None:
-        parent_bridge_support_path = temp_dir / 'nrrd_support' / str(model_name) / view.name / 'fullframe_bridge_support.u8.dat'
-        parent_bridge_support_mm = subtract_volume_to_mmap(
+        parent_bridge_support_path = temp_dir / 'nrrd_support' / str(model_name) / view.name / 'fullframe_bridge_support.cvol'
+        bridge_stats = subtract_volume_to_compressed_bitpacked_store(
             baseline_native_volume,
             parent_mask_support_mm,
             parent_bridge_support_path,
             desc=f'NRRD support fullframe bridges {model_name}/{view.name}',
             workers=int(slice_workers),
+            format_name=CVOL_FORMAT,
         )
-        if not _volume_has_foreground(parent_bridge_support_mm):
-            close_memmap_array(parent_bridge_support_mm)
+        if int(bridge_stats.get('foreground_voxels', 0)) <= 0:
             parent_bridge_support_mm = None
-            if parent_bridge_support_path is not None and not bool(keep_temp):
+            if parent_bridge_support_path is not None:
                 try:
-                    parent_bridge_support_path.unlink(missing_ok=True)
+                    shutil.rmtree(parent_bridge_support_path, ignore_errors=True)
                 except Exception:
                     pass
+        else:
+            parent_bridge_support_mm = CompressedTileMaskStore.open(parent_bridge_support_path)
 
     final_view_volume: Optional[np.ndarray] = None
     if bool(dense_tiling_active):
@@ -8009,19 +8351,9 @@ def prepare_view_volume_after_fullframe(
     returned_parent_mask_support = parent_mask_support_mm if (bool(nrrd_layers_enabled) and bool(dense_tiling_active)) else None
     returned_parent_bridge_support = parent_bridge_support_mm if (bool(nrrd_layers_enabled) and bool(dense_tiling_active)) else None
     if parent_mask_support_mm is not None and returned_parent_mask_support is None:
-        close_memmap_array(parent_mask_support_mm)
-        if parent_mask_support_path is not None and not bool(keep_temp):
-            try:
-                parent_mask_support_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+        close_compressed_or_memmap_volume(parent_mask_support_mm, keep_temp=bool(keep_temp))
     if parent_bridge_support_mm is not None and returned_parent_bridge_support is None:
-        close_memmap_array(parent_bridge_support_mm)
-        if parent_bridge_support_path is not None and not bool(keep_temp):
-            try:
-                parent_bridge_support_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+        close_compressed_or_memmap_volume(parent_bridge_support_mm, keep_temp=bool(keep_temp))
 
     return PreparedViewResult(
         model_name=str(model_name),
@@ -8039,8 +8371,8 @@ def gate_tile_volume_against_parent_inplace(
     tile_mask_mm: np.ndarray,
     parent_support_mm: np.ndarray,
     *,
-    parent_mask_support_mm: Optional[np.ndarray] = None,
-    parent_bridge_support_mm: Optional[np.ndarray] = None,
+    parent_mask_support_mm: Optional[object] = None,
+    parent_bridge_support_mm: Optional[object] = None,
     accepted_by_parent_mask_mm: Optional[np.ndarray] = None,
     accepted_by_parent_bridge_mm: Optional[np.ndarray] = None,
     workers: int = 1,
@@ -8074,13 +8406,13 @@ def gate_tile_volume_against_parent_inplace(
                 accepted_by_parent_bridge_mm[int(idx), :, :] = np.uint8(0)
             return
 
-        support_slice = np.asarray(parent_support_mm[int(idx)], dtype=bool)
+        support_slice = _read_binary_volume_slice_bool(parent_support_mm, int(idx))
         parent_mask_slice = (
-            np.asarray(parent_mask_support_mm[int(idx)], dtype=bool)
+            _read_binary_volume_slice_bool(parent_mask_support_mm, int(idx))
             if parent_mask_support_mm is not None else None
         )
         parent_bridge_slice = (
-            np.asarray(parent_bridge_support_mm[int(idx)], dtype=bool)
+            _read_binary_volume_slice_bool(parent_bridge_support_mm, int(idx))
             if parent_bridge_support_mm is not None else None
         )
 
@@ -8464,8 +8796,8 @@ def gate_tile_volume_into_consolidated_parent(
     tile_accumulator_lock: threading.Lock,
     keep_temp: bool,
     slice_workers: int,
-    parent_mask_support_mm: Optional[np.ndarray] = None,
-    parent_bridge_support_mm: Optional[np.ndarray] = None,
+    parent_mask_support_mm: Optional[object] = None,
+    parent_bridge_support_mm: Optional[object] = None,
     tile_parent_mask_accumulator_mm: Optional[np.ndarray] = None,
     tile_parent_bridge_accumulator_mm: Optional[np.ndarray] = None,
     temp_dir: Optional[Path] = None,
@@ -8563,12 +8895,12 @@ def gate_tile_volume_into_consolidated_parent(
                         path.unlink(missing_ok=True)
                     except Exception:
                         pass
-        close_memmap_array(task.tile_mask_mm)
-        if not keep_temp and task.tile_mask_path is not None:
-            try:
-                Path(task.tile_mask_path).unlink(missing_ok=True)
-            except Exception:
-                pass
+        archive_or_delete_binary_volume_storage(
+            task.tile_mask_mm,
+            keep_temp=bool(keep_temp),
+            workers=int(slice_workers),
+            desc=f'Gated tile-set canvas {task.model_name}/{task.view_name}/{task.tile_id}',
+        )
 
 def finalize_consolidated_tile_volume_for_parent(
     *,
@@ -9441,13 +9773,25 @@ def write_nrrd(mask_u8: np.ndarray, out_path: Path) -> Path:
     return out_path
 
 
-def _open_nrrd_layer_ref(ref: NrrdLayerRef) -> np.memmap:
+def _nrrd_layer_ref_is_compressed(ref: NrrdLayerRef) -> bool:
+    return str(getattr(ref, 'storage_format', 'raw_u8')) in COMPRESSED_MASK_FORMATS or Path(ref.path).is_dir()
+
+
+def _open_nrrd_layer_ref(ref: NrrdLayerRef) -> object:
+    if _nrrd_layer_ref_is_compressed(ref):
+        return CompressedTileMaskStore.open(ref.path)
     return np.memmap(
         ref.path,
         dtype=np.dtype(ref.dtype),
         mode='r',
         shape=tuple(int(x) for x in ref.shape),
     )
+
+
+def _close_nrrd_layer_source(src: object) -> None:
+    if isinstance(src, CompressedTileMaskStore):
+        return
+    close_memmap_array(src)
 
 
 def _nrrd_empty_segment_extent() -> Tuple[int, int, int, int, int, int]:
@@ -9594,57 +9938,57 @@ def _resize_binary_mask_frame_to_output_shape(frame: np.ndarray, out_h: int, out
 
 
 def _read_layer_slice_in_output_shape(
-    src: np.ndarray,
+    src: object,
     output_shape: Tuple[int, int, int],
     out_z: int,
 ) -> np.ndarray:
     """Return one output-geometry ``(Y,X)`` slice for an NRRD layer without materializing the full layer."""
-    in_t, in_h, in_w = (int(src.shape[0]), int(src.shape[1]), int(src.shape[2]))
+    in_t, in_h, in_w = _volume_shape_tuple(src)
     out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
     out_z_i = int(np.clip(int(out_z), 0, out_t - 1))
 
     if (in_t, in_h, in_w) == (out_t, out_h, out_w):
-        return np.asarray(src[out_z_i], dtype=np.uint8)
+        return _read_binary_volume_slice_u8(src, out_z_i)
 
     source_indices = _restore_source_indices_for_output_z(in_t, out_t, out_z_i)
     if in_h == out_h and in_w == out_w:
         if len(source_indices) == 1:
-            return np.asarray(src[int(source_indices[0])], dtype=np.uint8)
+            return _read_binary_volume_slice_u8(src, int(source_indices[0]))
         restored = np.zeros((out_h, out_w), dtype=np.uint8)
         for src_idx in source_indices:
-            restored |= (np.asarray(src[int(src_idx)], dtype=np.uint8) > 0).astype(np.uint8, copy=False)
+            restored |= _read_binary_volume_slice_bool(src, int(src_idx)).astype(np.uint8, copy=False)
         return restored
 
     restored = np.zeros((out_h, out_w), dtype=np.uint8)
     for src_idx in source_indices:
-        restored |= _resize_binary_mask_frame_to_output_shape(src[int(src_idx)], out_h, out_w)
+        restored |= _resize_binary_mask_frame_to_output_shape(_read_binary_volume_slice_u8(src, int(src_idx)), out_h, out_w)
     return restored
 
 
 def _read_layer_row_block_in_output_shape(
-    src: np.ndarray,
+    src: object,
     output_shape: Tuple[int, int, int],
     out_z: int,
     y0: int,
     y1: int,
 ) -> np.ndarray:
     """Return a ``(rows,X)`` block in final output geometry for streaming NRRD writes."""
-    in_t, in_h, in_w = (int(src.shape[0]), int(src.shape[1]), int(src.shape[2]))
+    in_t, in_h, in_w = _volume_shape_tuple(src)
     out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
     y0_i = int(np.clip(int(y0), 0, out_h))
     y1_i = int(np.clip(int(y1), y0_i, out_h))
     out_z_i = int(np.clip(int(out_z), 0, out_t - 1))
 
     if (in_t, in_h, in_w) == (out_t, out_h, out_w):
-        return np.asarray(src[out_z_i, y0_i:y1_i, :], dtype=np.uint8)
+        return _read_binary_volume_slice_u8(src, out_z_i)[y0_i:y1_i, :]
 
     source_indices = _restore_source_indices_for_output_z(in_t, out_t, out_z_i)
     if in_h == out_h and in_w == out_w:
         if len(source_indices) == 1:
-            return np.asarray(src[int(source_indices[0]), y0_i:y1_i, :], dtype=np.uint8)
+            return _read_binary_volume_slice_u8(src, int(source_indices[0]))[y0_i:y1_i, :]
         restored = np.zeros((y1_i - y0_i, out_w), dtype=np.uint8)
         for src_idx in source_indices:
-            restored |= (np.asarray(src[int(src_idx), y0_i:y1_i, :], dtype=np.uint8) > 0).astype(np.uint8, copy=False)
+            restored |= _read_binary_volume_slice_bool(src, int(src_idx))[y0_i:y1_i, :].astype(np.uint8, copy=False)
         return restored
 
     # Rare fallback for XY geometry changes.  Keep the code simple and still bounded: one
@@ -9658,7 +10002,7 @@ def _compute_segment_extent_for_layer_ref(
 ) -> Tuple[int, int, int, int, int, int]:
     src = _open_nrrd_layer_ref(ref)
     try:
-        if tuple(int(x) for x in ref.shape) == tuple(int(x) for x in output_shape):
+        if isinstance(src, np.ndarray) and tuple(int(x) for x in ref.shape) == tuple(int(x) for x in output_shape):
             return compute_segment_extent_zyx(src)
 
         out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
@@ -9687,7 +10031,7 @@ def _compute_segment_extent_for_layer_ref(
         return (int(min_x), int(max_x), int(min_y), int(max_y), int(min_t), int(max_t))
     finally:
         _madvise_array_mmap(src, 'MADV_DONTNEED')
-        close_memmap_array(src)
+        _close_nrrd_layer_source(src)
 
 
 def _write_decomposed_nrrd_payload_stream(
@@ -9712,7 +10056,7 @@ def _write_decomposed_nrrd_payload_stream(
         f'buffer~{buffer_bytes / GIB:.3f} GiB, gzip_level={nrrd_gzip_compresslevel()}'
     )
 
-    opened: List[np.memmap] = []
+    opened: List[object] = []
     try:
         for ref in effective_refs:
             src = _open_nrrd_layer_ref(ref)
@@ -9742,7 +10086,7 @@ def _write_decomposed_nrrd_payload_stream(
     finally:
         for src in opened:
             _madvise_array_mmap(src, 'MADV_DONTNEED')
-            close_memmap_array(src)
+            _close_nrrd_layer_source(src)
 
 
 def _write_decomposed_nrrd_manifest(
@@ -9771,6 +10115,8 @@ def _write_decomposed_nrrd_manifest(
                 'tile_acceptance': ref.tile_acceptance,
                 'stage': ref.stage,
                 'description': ref.description,
+                'storage_format': getattr(ref, 'storage_format', 'raw_u8'),
+                'backing_path': str(ref.path),
                 'backing_shape_tyx': [int(ref.shape[0]), int(ref.shape[1]), int(ref.shape[2])],
             }
             for idx, ref in enumerate(effective_refs)
@@ -9818,7 +10164,10 @@ def write_decomposed_nrrd(
         effective_refs.append(ref)
 
     if bool(include_final_output_layer):
-        final_ref_path = temp_dir / 'nrrd_layers' / 'global' / 'final_output_binary.orthogonal.u8.dat'
+        final_ref_path = (
+            temp_dir / 'nrrd_layers' / 'global' /
+            ('final_output_binary.orthogonal.cvol' if compressed_nrrd_layers_enabled() else 'final_output_binary.orthogonal.u8.dat')
+        )
         final_ref = materialize_nrrd_global_layer(
             final_mask_u8,
             model_name='global',
@@ -9832,20 +10181,33 @@ def write_decomposed_nrrd(
         )
         if final_ref is None:
             # Preserve an empty final layer for empty volumes so the NRRD still documents final output.
-            copied = copy_workspace_array(
-                np.asarray(final_mask_u8, dtype=np.uint8),
-                final_ref_path,
-                desc='NRRD layer global final empty output',
-                prefer_memory=False,
-                workers=int(workers),
-            )
-            close_memmap_array(copied)
+            storage_format = 'raw_u8'
+            if compressed_nrrd_layers_enabled():
+                write_compressed_bitpacked_mask_store(
+                    np.asarray(final_mask_u8, dtype=np.uint8),
+                    final_ref_path,
+                    format_name=CVOL_FORMAT,
+                    desc='NRRD layer global final empty output',
+                    workers=int(workers),
+                    extra_meta={'nrrd_layer_key': 'global__global__global__union__final_output_after_all_postprocessing'},
+                )
+                storage_format = CVOL_FORMAT
+            else:
+                copied = copy_workspace_array(
+                    np.asarray(final_mask_u8, dtype=np.uint8),
+                    final_ref_path,
+                    desc='NRRD layer global final empty output',
+                    prefer_memory=False,
+                    workers=int(workers),
+                )
+                close_memmap_array(copied)
             final_ref = NrrdLayerRef(
                 key='global__global__global__union__final_output_after_all_postprocessing',
                 name='Global / global / union / final output after all postprocessing',
                 path=final_ref_path,
                 shape=output_shape,
                 dtype='uint8',
+                storage_format=storage_format,
                 model_name='global',
                 view_name='global',
                 view_family='global',
@@ -11569,8 +11931,8 @@ def main() -> None:
         'the canvas gate is slice-local and connected-component based, so seam-split tile objects are reassembled before support testing.'
     )
     spec_notes.append(
-        'Postprocessed tiles waiting for parent support use ctile-mask-v1 instead of raw uint8 memmaps: empty slices are elided, '
-        'nonempty slices are cropped to their nonzero parent-view bbox, packed with numpy.packbits(bitorder=little), and compressed with LZ4.'
+        'Postprocessed tiles waiting for parent support use ctile-mask-v1, and decomposed NRRD/support layers use cvol-mask-v1 where enabled, instead of raw uint8 memmaps: empty slices are elided, '
+        'nonempty slices are cropped to their nonzero bbox, packed with numpy.packbits(bitorder=little), and compressed with LZ4.'
     )
     spec_notes.append(
         f'Fused cleanup backend={cleanup_backend()}; set YOLO_TTA_CLEANUP_BACKEND=scipy to use the previous scipy.ndimage cleanup path.'
@@ -11593,8 +11955,8 @@ def main() -> None:
     view_infos_by_name: Dict[str, ViewInfo] = {view.name: view for view in views}
     view_volumes_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
     native_view_support_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
-    parent_mask_support_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
-    parent_bridge_support_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
+    parent_mask_support_by_model: Dict[str, Dict[str, object]] = {model_name: {} for model_name, _ in yolo_models}
+    parent_bridge_support_by_model: Dict[str, Dict[str, object]] = {model_name: {} for model_name, _ in yolo_models}
     radial_native_output_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
     tilted_native_output_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
     nrrd_layer_refs: List[NrrdLayerRef] = []
@@ -11787,7 +12149,7 @@ def main() -> None:
     canvas_future_processed: set[Tuple[str, str]] = set()
     pending_tile_batches_by_aug: Dict[Tuple[str, str], Tuple[ViewInfo, AugJob, Tuple[DenseTileJob, ...]]] = {}
     fullframe_video_futures: Dict[Future, Tuple[ViewInfo, AugJob]] = {}
-    tile_batch_video_futures: Dict[Future, Tuple[ViewInfo, Tuple[DenseTileJob, ...]]] = {}
+    tile_batch_video_futures: Dict[Future, Tuple[ViewInfo, AugJob, Tuple[DenseTileJob, ...]]] = {}
     pending_fullframe_futures: set[Future] = set()
     pending_tile_video_futures: set[Future] = set()
     rendered_tile_jobs_by_view: Dict[str, Dict[str, DenseTileJob]] = {view.name: {} for view in inference_views}
@@ -11864,7 +12226,7 @@ def main() -> None:
             float(fps),
             False,
         )
-        tile_batch_video_futures[fut] = (view, tile_jobs)
+        tile_batch_video_futures[fut] = (view, aug_job, tile_jobs)
         pending_tile_video_futures.add(fut)
         tile_batch_render_submitted.add(batch_key)
 
@@ -12207,8 +12569,13 @@ def main() -> None:
             if not fut.done():
                 continue
             pending_tile_video_futures.remove(fut)
-            view, tile_jobs = tile_batch_video_futures.pop(fut)
+            view, aug_job, tile_jobs = tile_batch_video_futures.pop(fut)
             fut.result()
+            if not bool(args.troubleshooting):
+                try:
+                    aug_job.canvas_video_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
             for tile_job in tile_jobs:
                 rendered_tile_jobs_by_view[view.name][tile_job.tile_id] = tile_job
                 for model_name, _ in yolo_models:
@@ -12271,11 +12638,29 @@ def main() -> None:
         for fut in list(tile_consolidation_futures.keys()):
             if not fut.done():
                 continue
+            parent_key = tile_consolidation_futures.pop(fut)
             result = fut.result()
-            del tile_consolidation_futures[fut]
             interpolation_stats.extend(result.interpolation_stats)
             nrrd_layer_refs.extend(result.nrrd_layers)
             _register_pass_snapshots(result.pass_snapshots)
+
+            # Once the consolidated tile volume has been unioned into its parent destination and
+            # any NRRD layers have been materialized, the raw uint8 accumulators are no longer
+            # needed.  Keep troubleshooting artifacts in compressed cvol form; otherwise delete.
+            for label, store in (
+                ('consolidated gated tiles', tile_accumulator_by_parent),
+                ('tile components accepted by parent mask', tile_parent_mask_accumulator_by_parent),
+                ('tile components accepted by parent bridge', tile_parent_bridge_accumulator_by_parent),
+            ):
+                acc = store.pop(parent_key, None)
+                if acc is not None:
+                    archive_or_delete_binary_volume_storage(
+                        acc,
+                        keep_temp=bool(args.troubleshooting),
+                        workers=int(tile_slice_postprocess_workers),
+                        desc=f'{label} {parent_key[0]}/{parent_key[1]}',
+                    )
+            tile_accumulator_paths.pop(parent_key, None)
 
         output_manager.reap_completed()
 
@@ -12355,6 +12740,11 @@ def main() -> None:
                     fullframe_remaining[remaining_key] = int(fullframe_remaining.get(remaining_key, 0)) - 1
                     if int(fullframe_remaining.get(remaining_key, 0)) == 0:
                         _submit_view_prepare(model_name, view)
+                if not bool(args.troubleshooting):
+                    try:
+                        job.video_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
                 continue
 
             if ready_tile_infer:
@@ -12404,6 +12794,11 @@ def main() -> None:
                 )
                 if offload_between_jobs_enabled():
                     offload_yolo_from_gpu(yolo)
+                if not bool(args.troubleshooting) and len(yolo_models) == 1:
+                    try:
+                        tile_job.video_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
                 tile_inference_done.add(ready_key)
                 view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(pred_stats.get('prediction_count', 0))
 
@@ -12878,17 +13273,45 @@ def main() -> None:
         for mm in model_views.values():
             close_memmap_array(mm)
         model_views.clear()
+    for model_support in parent_mask_support_by_model.values():
+        for mm in model_support.values():
+            close_compressed_or_memmap_volume(mm, keep_temp=bool(args.troubleshooting))
+        model_support.clear()
+    for model_support in parent_bridge_support_by_model.values():
+        for mm in model_support.values():
+            close_compressed_or_memmap_volume(mm, keep_temp=bool(args.troubleshooting))
+        model_support.clear()
     for mm in tile_config_accumulator_by_key.values():
-        close_memmap_array(mm)
+        archive_or_delete_binary_volume_storage(
+            mm,
+            keep_temp=bool(args.troubleshooting),
+            workers=int(tile_slice_postprocess_workers),
+            desc='remaining tile config accumulator',
+        )
     tile_config_accumulator_by_key.clear()
     for mm in tile_accumulator_by_parent.values():
-        close_memmap_array(mm)
+        archive_or_delete_binary_volume_storage(
+            mm,
+            keep_temp=bool(args.troubleshooting),
+            workers=int(tile_slice_postprocess_workers),
+            desc='remaining consolidated tile accumulator',
+        )
     tile_accumulator_by_parent.clear()
     for mm in tile_parent_mask_accumulator_by_parent.values():
-        close_memmap_array(mm)
+        archive_or_delete_binary_volume_storage(
+            mm,
+            keep_temp=bool(args.troubleshooting),
+            workers=int(tile_slice_postprocess_workers),
+            desc='remaining parent-mask tile category accumulator',
+        )
     tile_parent_mask_accumulator_by_parent.clear()
     for mm in tile_parent_bridge_accumulator_by_parent.values():
-        close_memmap_array(mm)
+        archive_or_delete_binary_volume_storage(
+            mm,
+            keep_temp=bool(args.troubleshooting),
+            workers=int(tile_slice_postprocess_workers),
+            desc='remaining parent-bridge tile category accumulator',
+        )
     tile_parent_bridge_accumulator_by_parent.clear()
     for mm in baseline_union_by_model_view.values():
         close_memmap_array(mm)
