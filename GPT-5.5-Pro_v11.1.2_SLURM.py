@@ -2,7 +2,7 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v11.1.0_SLURM single-channel-aligned script:
+This v11.1.2_SLURM implementation of the v11.1.0_SLURM specification:
   - builds Transverse, optional generalized Tilted Views for Transverse/Sagittal/Coronal, independently optional upright Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - renders parent/full-frame videos directly from the native view transform so inference no longer waits on
     a separately rendered canvas video, and derives non-radial tile videos from shared canvas batches so the
@@ -12,6 +12,7 @@ This v11.1.0_SLURM single-channel-aligned script:
   - stages cleaned tiled masks into one parent-view canvas per tile-size/stride set, gates each consolidated canvas
     at the connected-component level against frozen parent full-frame support, then interpolates the accepted tiled volume once per parent view
   - spills postprocessed waiting tile masks to a user-space ctile cache and stores decomposed NRRD/support binary volumes as cvol stores: per-slice empty elision, nonzero bbox crop, NumPy packbits, and LZ4 compression
+  - validates/resizes tile mask volumes to their parent view-native shape before any waiting-tile bitpacking/compression so ctile stores always match the parent canvas
   - removes dense-tile pruning and keeps temporary/intermediate mask volumes unpacked throughout
   - fuses per-slice cleanup work where the slice orientation matches the required semantics
     (notably min_conf filtering, 2D hole filling, and min_radius where applicable)
@@ -32,7 +33,7 @@ This v11.1.0_SLURM single-channel-aligned script:
     low-quality presentation outputs, with FFV1 used for spec-required MKVs
   - writes the default NRRD as independently toggleable layers for full-frame YOLO masks, interpolation bridges, tiled masks accepted by parent YOLO masks,
     tiled masks accepted by parent bridges, consolidated tile bridges, the pre-smoothing global union, smoothing-pass results, optional skeleton, and the final output layer
-  - streams NRRD gzip payloads directly from per-layer backing arrays or compressed cvol stores without materializing a full 4D decomposed payload, reducing peak RAM and scratch pressure during final NRRD creation
+  - streams NRRD gzip payloads directly from per-layer backing arrays or RAM-cached compressed cvol stores without materializing a full 4D decomposed payload, reducing peak scratch pressure during final NRRD creation
 
 Dependencies (Python):
   pip install opencv-python numpy scipy scikit-image tifffile tqdm ultralytics lz4
@@ -242,7 +243,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--tilt_view", nargs="+", default=["transverse"], type=str,
                    help="One or more Cartesian base views for v11 Tilted Views: transverse, sagittal, or coronal. A tilted base view does not need to be enabled as an upright view")
     p.add_argument("--tilt_angle", nargs="+", default=["0"], type=str,
-                   help="One or more positive Tilted View angles in degrees. Each value creates both positive and negative variants. 0 disables all Tilted Views")
+                   help="One or more positive Tilted View angles in degrees. Each value creates both positive and negative variants. 0 disables all Tilted Views. Task #5 permits values up to 45 inclusive")
     p.add_argument("--tilt_direction", nargs="+", default=["vertical"], type=str,
                    help="One or more Tilted View directions: vertical, horizontal, or both")
 
@@ -2218,6 +2219,7 @@ class TiltedRenderPlan:
 _TILTED_RENDER_PLAN_CACHE: Dict[Tuple[str, int, int, Tuple[float, ...]], TiltedRenderPlan] = {}
 
 
+# DEAD_CODE_MARKER(v11.1-review): no remaining live call sites except dead diagnostic frame iterators; retained for future rawvideo debugging.
 def ffmpeg_rawvideo_reader(
     input_path: Path,
     width: int,
@@ -4109,6 +4111,7 @@ def predict_video_and_accumulate(
 
 
 
+# DEAD_CODE_MARKER(v11.1-review): used only by the legacy immediate tile-gating predictor marked dead below; retained for regression reference.
 def _union_supported_native_components_into_parent(
     native_mask_bool: np.ndarray,
     support_slice_bool: np.ndarray,
@@ -7142,6 +7145,7 @@ CTILE_FORMAT = 'ctile-mask-v1'
 CVOL_FORMAT = 'cvol-mask-v1'
 COMPRESSED_MASK_FORMATS = {CTILE_FORMAT, CVOL_FORMAT}
 CTILE_BITORDER = 'little'
+_NRRD_COMPRESSED_STORE_CHUNKS_RAM_CACHE: Dict[Path, bytes] = {}
 CTILE_INDEX_DTYPE = np.dtype([
     ('kind', 'u1'),              # 0 = empty/zero chunk, 1 = LZ4-compressed packbits payload
     ('reserved', 'u1', (7,)),
@@ -7184,13 +7188,25 @@ class CompressedTileMaskStore:
     for larger binary scratch artifacts such as NRRD support/layer archives
     (``cvol-mask-v1``). Each decoded slice is reconstructed on demand from an
     optional nonzero bounding box, NumPy packbits bytes, and an LZ4 payload.
+
+    NRRD segment-extent and decomposed-layer streaming read the same cvol sources
+    repeatedly.  When requested, ``chunks.bin`` is cached as RAM bytes so compressed
+    bitpacked NRRD layers no longer seek/read NVMe for every decoded slice.
     """
 
-    def __init__(self, root: Path, meta: Dict[str, object], index: np.ndarray) -> None:
+    def __init__(
+        self,
+        root: Path,
+        meta: Dict[str, object],
+        index: np.ndarray,
+        *,
+        chunks_bytes: Optional[bytes] = None,
+    ) -> None:
         self.root = Path(root)
         self.meta = dict(meta)
         self.index = np.asarray(index, dtype=CTILE_INDEX_DTYPE)
         self.chunks_path = self.root / 'chunks.bin'
+        self._chunks_bytes: Optional[bytes] = chunks_bytes
         shape = self.meta.get('shape')
         if not isinstance(shape, list) or len(shape) != 3:
             raise ValueError(f'{self.root}: invalid compressed-mask shape metadata: {shape!r}')
@@ -7199,7 +7215,7 @@ class CompressedTileMaskStore:
             raise ValueError(f'{self.root}: index slice count {int(self.index.shape[0])} != shape[0] {int(self.shape[0])}')
 
     @classmethod
-    def open(cls, root: Path) -> 'CompressedTileMaskStore':
+    def open(cls, root: Path, *, cache_payload_in_ram: bool = False) -> 'CompressedTileMaskStore':
         root = Path(root)
         meta_path = root / 'meta.json'
         index_path = root / 'index.bin'
@@ -7214,7 +7230,33 @@ class CompressedTileMaskStore:
         if not isinstance(shape, list) or len(shape) != 3:
             raise ValueError(f'{root}: invalid shape metadata {shape!r}')
         index = np.fromfile(index_path, dtype=CTILE_INDEX_DTYPE, count=int(shape[0]))
-        return cls(root, meta, index)
+        chunks_bytes: Optional[bytes] = None
+        if bool(cache_payload_in_ram):
+            try:
+                cache_key = chunks_path.resolve()
+            except Exception:
+                cache_key = chunks_path
+            chunks_bytes = _NRRD_COMPRESSED_STORE_CHUNKS_RAM_CACHE.get(cache_key)
+            if chunks_bytes is None:
+                chunks_bytes = chunks_path.read_bytes()
+                _NRRD_COMPRESSED_STORE_CHUNKS_RAM_CACHE[cache_key] = chunks_bytes
+                print(
+                    f'Compressed bitpacked store cached in RAM for NRRD streaming: {root} '
+                    f'({len(chunks_bytes) / GIB:.3f} GiB chunks.bin)'
+                )
+            else:
+                print(
+                    f'Compressed bitpacked store reused from RAM for NRRD streaming: {root} '
+                    f'({len(chunks_bytes) / GIB:.3f} GiB chunks.bin)'
+                )
+        return cls(root, meta, index, chunks_bytes=chunks_bytes)
+
+    @property
+    def chunks_cached_in_ram(self) -> bool:
+        return self._chunks_bytes is not None
+
+    def close(self) -> None:
+        self._chunks_bytes = None
 
     def decode_slice(self, idx: int, *, dtype: np.dtype | str | type = np.uint8) -> np.ndarray:
         idx_i = int(idx)
@@ -7237,9 +7279,14 @@ class CompressedTileMaskStore:
             raise ValueError(f'{self.root}: nonempty slice {idx_i} has empty payload metadata')
 
         lz4_frame = _require_lz4_frame()
-        with self.chunks_path.open('rb') as fh:
-            fh.seek(int(rec['offset']))
-            payload = fh.read(int(compressed_size))
+        if self._chunks_bytes is not None:
+            start = int(rec['offset'])
+            stop = start + int(compressed_size)
+            payload = self._chunks_bytes[start:stop]
+        else:
+            with self.chunks_path.open('rb') as fh:
+                fh.seek(int(rec['offset']))
+                payload = fh.read(int(compressed_size))
         if len(payload) != compressed_size:
             raise IOError(f'{self.root}: short read for slice {idx_i}: {len(payload)} != {compressed_size}')
         packed_bytes = lz4_frame.decompress(payload)
@@ -7324,6 +7371,11 @@ def _write_compressed_bitpacked_payload_store(
         raise ValueError(f'{desc}: invalid compressed store shape {shape_i}')
 
     store_dir = Path(store_dir)
+    chunks_path_prewrite = store_dir / 'chunks.bin'
+    try:
+        _NRRD_COMPRESSED_STORE_CHUNKS_RAM_CACHE.pop(chunks_path_prewrite.resolve(), None)
+    except Exception:
+        _NRRD_COMPRESSED_STORE_CHUNKS_RAM_CACHE.pop(chunks_path_prewrite, None)
     if store_dir.exists():
         shutil.rmtree(store_dir, ignore_errors=True)
     store_dir.mkdir(parents=True, exist_ok=True)
@@ -7517,6 +7569,18 @@ def compressed_nrrd_layers_enabled() -> bool:
     return _env_flag('YOLO_TTA_COMPRESS_NRRD_LAYERS', True)
 
 
+def nrrd_cache_compressed_layers_in_ram_enabled() -> bool:
+    """Cache cvol/ctile compressed payload files in RAM during NRRD streaming.
+
+    The NRRD writer uses the same layer backing files for both ``NRRD streaming:
+    segment extents`` and ``NRRD streaming: decomposed layers``.  When those
+    backing files are compressed bitpacked stores, their ``chunks.bin`` payloads
+    are intentionally read into RAM before slice traversal to remove repeated
+    random NVMe reads.
+    """
+    return _env_flag('YOLO_TTA_NRRD_CACHE_COMPRESSED_LAYERS_IN_RAM', True)
+
+
 def archive_or_delete_binary_volume_storage(
     volume: Optional[np.ndarray],
     *,
@@ -7562,6 +7626,7 @@ def close_compressed_or_memmap_volume(volume: object, *, keep_temp: bool = True)
     if volume is None:
         return
     if isinstance(volume, CompressedTileMaskStore):
+        volume.close()
         if not bool(keep_temp):
             volume.unlink()
         return
@@ -8515,6 +8580,78 @@ def gate_tile_volume_against_parent_inplace(
         'accepted_by_parent_bridge_voxels': int(np.sum(accepted_by_parent_bridge_voxels, dtype=np.int64)),
     }
 
+
+def _resize_binary_mask_frame_to_exact_shape_for_tile(frame: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+    frame_u8 = (np.asarray(frame, dtype=np.uint8) > 0).astype(np.uint8, copy=False)
+    if int(frame_u8.shape[0]) == int(out_h) and int(frame_u8.shape[1]) == int(out_w):
+        return np.ascontiguousarray(frame_u8)
+    scaled = cv2.resize(
+        np.ascontiguousarray(frame_u8),
+        (int(out_w), int(out_h)),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    return (scaled > 0).astype(np.uint8, copy=False)
+
+
+def ensure_tile_mask_volume_matches_parent_shape(
+    tile_mask_mm: np.ndarray,
+    expected_parent_shape: Tuple[int, int, int],
+    out_path: Path,
+    *,
+    desc: str,
+    workers: int = 1,
+    prefer_memory: bool = True,
+) -> np.ndarray:
+    """Return a tile mask volume whose shape exactly matches its parent view canvas.
+
+    Prediction-time tile masks should already be inverse-mapped into parent view-native
+    coordinates by ``DenseTileJob.M_out_to_src``.  This guard makes the v11.1.0 tile
+    waiting-store rule explicit: before a tile can be bit-packed/compressed, its volume
+    shape must be ``(parent_frames, parent_height, parent_width)``.  If a future code path
+    produces a different raster size, the binary slices are nearest-neighbor resized to
+    the parent shape before compression/staging.
+    """
+    src = np.asarray(tile_mask_mm)
+    expected = (int(expected_parent_shape[0]), int(expected_parent_shape[1]), int(expected_parent_shape[2]))
+    if tuple(int(x) for x in src.shape) == expected:
+        return tile_mask_mm
+    if src.ndim != 3:
+        raise ValueError(f'{desc}: expected a 3D tile mask volume, got shape {src.shape}')
+
+    print(f'{desc}: resizing tile mask volume to parent shape before bitpacking/compression: {tuple(src.shape)} -> {expected}')
+    out = allocate_workspace_array(
+        shape=expected,
+        dtype=np.uint8,
+        path=Path(out_path),
+        desc=f'{desc} parent-sized tile mask',
+        prefer_memory=bool(prefer_memory),
+    )
+
+    in_t = int(src.shape[0])
+    out_t, out_h, out_w = expected
+    worker_count = choose_slice_parallel_workers(int(workers), max(1, int(out_t)))
+
+    def _resize_out_slice(out_z: int) -> None:
+        if int(in_t) == int(out_t):
+            restored = _resize_binary_mask_frame_to_exact_shape_for_tile(src[int(out_z)], int(out_h), int(out_w))
+        else:
+            restored = np.zeros((int(out_h), int(out_w)), dtype=np.uint8)
+            for src_z in _restore_source_indices_for_output_z(int(in_t), int(out_t), int(out_z)):
+                restored |= _resize_binary_mask_frame_to_exact_shape_for_tile(src[int(src_z)], int(out_h), int(out_w))
+        out[int(out_z), :, :] = restored
+
+    parallel_for_indices_chunked(
+        int(out_t),
+        _resize_out_slice,
+        max_workers=worker_count,
+        desc=f'{desc}: resize tile mask to parent before compression',
+        show_progress=False,
+        target_chunks_per_worker=2,
+    )
+    flush_array(out)
+    return out
+
+
 def postprocess_tile_volume_after_inference(
     task: TilePostprocessTask,
     *,
@@ -8540,11 +8677,34 @@ def postprocess_tile_volume_after_inference(
         except Exception:
             pass
 
-    if not _volume_has_foreground(task.tile_mask_mm):
-        close_memmap_array(task.tile_mask_mm)
+    tile_mask_mm = task.tile_mask_mm
+    tile_mask_path = task.tile_mask_path
+    expected_parent_shape = (int(view.num_slices), int(view.src_h), int(view.src_w))
+    parent_sized_path = tile_mask_path.with_name(tile_mask_path.stem + '.parent_sized.u8.dat')
+    parent_sized_mm = ensure_tile_mask_volume_matches_parent_shape(
+        tile_mask_mm,
+        expected_parent_shape,
+        parent_sized_path,
+        desc=f'{task.model_name}/{task.view_name}/{task.tile_id}',
+        workers=int(slice_workers),
+        prefer_memory=True,
+    )
+    if parent_sized_mm is not tile_mask_mm:
+        old_mask_path = tile_mask_path
+        close_memmap_array(tile_mask_mm)
         if not keep_temp:
             try:
-                task.tile_mask_path.unlink(missing_ok=True)
+                old_mask_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        tile_mask_mm = parent_sized_mm
+        tile_mask_path = parent_sized_path
+
+    if not _volume_has_foreground(tile_mask_mm):
+        close_memmap_array(tile_mask_mm)
+        if not keep_temp:
+            try:
+                tile_mask_path.unlink(missing_ok=True)
             except Exception:
                 pass
         return None
@@ -8554,8 +8714,8 @@ def postprocess_tile_volume_after_inference(
         view_name=str(task.view_name),
         config_id=str(task.config_id),
         tile_id=str(task.tile_id),
-        tile_mask_mm=task.tile_mask_mm,
-        tile_mask_path=task.tile_mask_path,
+        tile_mask_mm=tile_mask_mm,
+        tile_mask_path=tile_mask_path,
     )
 
 
@@ -8566,6 +8726,7 @@ def spill_waiting_tile_result_to_compressed_store(
     *,
     workers: int = 1,
     keep_original: bool = False,
+    expected_parent_shape: Optional[Tuple[int, int, int]] = None,
 ) -> DeferredTilePostprocessResult:
     """Encode a postprocessed waiting tile into the v11.1.0 compressed ctile store.
 
@@ -8578,10 +8739,36 @@ def spill_waiting_tile_result_to_compressed_store(
         raise ValueError('Cannot spill a tile result without a dense tile_mask_mm')
 
     _require_lz4_frame()
-    tile_arr = np.asarray(result.tile_mask_mm)
+    mask_to_spill = result.tile_mask_mm
+    mask_to_spill_path = result.tile_mask_path
+    if expected_parent_shape is not None:
+        expected = (int(expected_parent_shape[0]), int(expected_parent_shape[1]), int(expected_parent_shape[2]))
+        parent_sized_path = temp_dir / 'waiting_tiles_parent_sized' / result.model_name / result.view_name / result.config_id / f'{result.tile_id}.parent_sized.u8.dat'
+        parent_sized_mm = ensure_tile_mask_volume_matches_parent_shape(
+            mask_to_spill,
+            expected,
+            parent_sized_path,
+            desc=f'Waiting tile spill {result.model_name}/{result.view_name}/{result.tile_id}',
+            workers=int(workers),
+            prefer_memory=True,
+        )
+        if parent_sized_mm is not mask_to_spill:
+            old_path = mask_to_spill_path
+            close_memmap_array(mask_to_spill)
+            if not bool(keep_original) and old_path is not None:
+                try:
+                    Path(old_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            mask_to_spill = parent_sized_mm
+            mask_to_spill_path = parent_sized_path
+
+    tile_arr = np.asarray(mask_to_spill)
     if tile_arr.ndim != 3:
         raise ValueError(f'Waiting tile spill expects a 3D mask volume, got shape {tile_arr.shape}')
     tile_shape = tuple(int(x) for x in tile_arr.shape)
+    if expected_parent_shape is not None and tile_shape != tuple(int(x) for x in expected_parent_shape):
+        raise ValueError(f'Waiting tile spill parent-shape guard failed: tile_shape={tile_shape}, expected={tuple(int(x) for x in expected_parent_shape)}')
 
     store_dir = temp_dir / 'waiting_tiles' / result.model_name / result.view_name / result.config_id / f'{result.tile_id}.ctile'
     if store_dir.exists():
@@ -8663,11 +8850,11 @@ def spill_waiting_tile_result_to_compressed_store(
     }
     meta_path.write_text(json.dumps(meta, indent=2) + '\n')
 
-    flush_array(result.tile_mask_mm)
-    close_memmap_array(result.tile_mask_mm)
-    if not bool(keep_original) and result.tile_mask_path is not None:
+    flush_array(mask_to_spill)
+    close_memmap_array(mask_to_spill)
+    if not bool(keep_original) and mask_to_spill_path is not None:
         try:
-            Path(result.tile_mask_path).unlink(missing_ok=True)
+            Path(mask_to_spill_path).unlink(missing_ok=True)
         except Exception:
             pass
 
@@ -9692,7 +9879,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.5-Pro_v11.1.0_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.5-Pro_v11.1.2_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -9779,7 +9966,10 @@ def _nrrd_layer_ref_is_compressed(ref: NrrdLayerRef) -> bool:
 
 def _open_nrrd_layer_ref(ref: NrrdLayerRef) -> object:
     if _nrrd_layer_ref_is_compressed(ref):
-        return CompressedTileMaskStore.open(ref.path)
+        return CompressedTileMaskStore.open(
+            ref.path,
+            cache_payload_in_ram=bool(nrrd_cache_compressed_layers_in_ram_enabled()),
+        )
     return np.memmap(
         ref.path,
         dtype=np.dtype(ref.dtype),
@@ -9790,8 +9980,24 @@ def _open_nrrd_layer_ref(ref: NrrdLayerRef) -> object:
 
 def _close_nrrd_layer_source(src: object) -> None:
     if isinstance(src, CompressedTileMaskStore):
+        src.close()
         return
     close_memmap_array(src)
+
+
+def _log_nrrd_streaming_sources(effective_refs: Sequence[NrrdLayerRef]) -> None:
+    compressed = [ref for ref in effective_refs if _nrrd_layer_ref_is_compressed(ref)]
+    raw = [ref for ref in effective_refs if not _nrrd_layer_ref_is_compressed(ref)]
+    print(
+        'NRRD streaming source files used by both segment-extents and decomposed-layer payload passes: '
+        f'{len(effective_refs)} layer backing path(s); compressed_bitpacked={len(compressed)}, raw_u8={len(raw)}, '
+        f'compressed_payload_ram_cache={nrrd_cache_compressed_layers_in_ram_enabled()}'
+    )
+    preview = list(effective_refs[:8])
+    for ref in preview:
+        print(f'  - {ref.storage_format}: {ref.path}')
+    if len(effective_refs) > len(preview):
+        print(f'  ... {len(effective_refs) - len(preview)} additional layer backing path(s) listed in the NRRD manifest sidecar')
 
 
 def _nrrd_empty_segment_extent() -> Tuple[int, int, int, int, int, int]:
@@ -10235,6 +10441,8 @@ def write_decomposed_nrrd(
         f'A full 4D uint8 payload would be ~{estimated_old_payload_bytes / GIB:.1f} GiB; '
         f'the streaming payload buffer is ~{bounded_buffer_bytes / GIB:.3f} GiB.'
     )
+
+    _log_nrrd_streaming_sources(effective_refs)
 
     layer_extents: List[Tuple[int, int, int, int, int, int]] = []
     for ref in tqdm(effective_refs, desc='NRRD streaming: segment extents'):
@@ -10918,6 +11126,7 @@ def schedule_troubleshooting_pass_outputs(
             all_paths[f'troubleshooting_pass{int(pass_idx)}_{key}'] = path
     return all_paths
 
+# DEAD_CODE_MARKER(v11.1-review): no current output path links/copies staged artifacts with this helper; retained for future hardlink-based exports.
 def link_or_copy_file(src: Path, dst: Path) -> Path:
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists() or dst.is_symlink():
@@ -11655,8 +11864,8 @@ def main() -> None:
     if requested_azimuth_angle is not None and float(requested_azimuth_angle) < 0:
         raise ValueError('--azimuth_angle must be >= 0')
     for tilt_angle in tilt_angles:
-        if not (0.0 < float(tilt_angle) < 45.0):
-            raise ValueError('--tilt_angle values must be greater than 0 and less than 45')
+        if not (0.0 < float(tilt_angle) <= 45.0):
+            raise ValueError('--tilt_angle values must be greater than 0 and less than or equal to 45')
     if not (-90.0 < float(args.interpolation_search_angle) < 90.0):
         raise ValueError('--interpolation_search_angle must be greater than -90 and less than 90')
     low_quality_requested = bool(args.save_low_quality or args.save_low_quality_downbin is not None)
@@ -11760,6 +11969,7 @@ def main() -> None:
     interpolating_views = [v for v in inference_views if _view_uses_interpolation(v, int(args.interpolate))]
     spec_notes: List[str] = []
     spec_notes.append('Voxel-volume reporting, when enabled, counts the final binary mask after restoration to native input geometry, not imgsz or cubic working geometry.')
+    spec_notes.append('Task/spec conflict resolved in favor of Task #5: the v11.1.0 flag text says --tilt_angle must be less than 45, but this implementation accepts values greater than 0 and less than or equal to 45 degrees.')
     if low_quality_downbin_warnings:
         for warning in low_quality_downbin_warnings:
             print(f'Warning: {warning}')
@@ -11808,6 +12018,7 @@ def main() -> None:
         'The NRRD payload is now gzip-streamed directly from backing layers with a bounded row buffer '
         'instead of materializing the full 4D decomposed payload; tune YOLO_TTA_NRRD_STREAM_BUFFER_MIB '
         'and YOLO_TTA_NRRD_GZIP_LEVEL if needed. '
+        'The same layer backing paths are used by the segment-extent scan and the decomposed-layer payload writer; compressed cvol/ctile backing paths cache chunks.bin in RAM by default via YOLO_TTA_NRRD_CACHE_COMPRESSED_LAYERS_IN_RAM=1. '
         f'Legacy single-volume NRRD writing is retained only for troubleshooting pass outputs without layer refs; space={NRRD_SPACE}.'
     )
     if cpu_retina_masks_enabled():
@@ -11928,11 +12139,13 @@ def main() -> None:
     print(f'Background output workers: {output_workers} (frame workers per labels/TIFF task: {output_frame_workers})')
     spec_notes.append(
         'Tiled masks are staged into one consolidated parent-view canvas per --tile_size/--tile_stride configuration before gating; '
-        'the canvas gate is slice-local and connected-component based, so seam-split tile objects are reassembled before support testing.'
+        'the canvas gate is slice-local and connected-component based, so seam-split tile objects are reassembled before support testing. '
+        'A tile mask shape guard validates/resizes every postprocessed tile to its parent view-native shape before any waiting-tile bitpacking/compression.'
     )
     spec_notes.append(
         'Postprocessed tiles waiting for parent support use ctile-mask-v1, and decomposed NRRD/support layers use cvol-mask-v1 where enabled, instead of raw uint8 memmaps: empty slices are elided, '
-        'nonempty slices are cropped to their nonzero bbox, packed with numpy.packbits(bitorder=little), and compressed with LZ4.'
+        'nonempty slices are cropped to their nonzero bbox, packed with numpy.packbits(bitorder=little), and compressed with LZ4. '
+        'Storage review: dense gray8 source/processing volumes and uint8 confidence maps stay raw because they are not sparse binary masks; FFV1/MKV/TIFF outputs are already codec-compressed; labels/summary JSON are negligible; kept raw binary troubleshooting/tile accumulators are the best remaining compression candidates and are archived as cvol when YOLO_TTA_ARCHIVE_TEMP_BINARY_VOLUMES is enabled.'
     )
     spec_notes.append(
         f'Fused cleanup backend={cleanup_backend()}; set YOLO_TTA_CLEANUP_BACKEND=scipy to use the previous scipy.ndimage cleanup path.'
@@ -12499,11 +12712,13 @@ def main() -> None:
         support_by_view = native_view_support_by_model.get(result.model_name, {})
         if result.view_name not in support_by_view:
             waiting = postprocessed_tiles_waiting_by_parent.setdefault(parent_key, {})
+            parent_view = view_infos_by_name[str(result.view_name)]
             waiting[str(result.tile_id)] = spill_waiting_tile_result_to_compressed_store(
                 result,
                 temp_dir,
                 workers=int(tile_slice_postprocess_workers),
                 keep_original=bool(args.troubleshooting),
+                expected_parent_shape=(int(parent_view.num_slices), int(parent_view.src_h), int(parent_view.src_w)),
             )
             return
 
