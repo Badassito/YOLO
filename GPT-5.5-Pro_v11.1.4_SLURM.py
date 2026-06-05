@@ -2,7 +2,7 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v11.1.3_SLURM implementation of the v11.1.0_SLURM specification:
+This v11.1.4_SLURM implementation of the v11.1.0_SLURM specification:
   - builds Transverse, optional generalized Tilted Views for Transverse/Sagittal/Coronal, independently optional upright Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - renders parent/full-frame videos directly from the native view transform so inference no longer waits on
     a separately rendered canvas video, and derives non-radial tile videos from shared canvas batches so the
@@ -35,6 +35,7 @@ This v11.1.3_SLURM implementation of the v11.1.0_SLURM specification:
   - writes the default NRRD as independently toggleable layers for full-frame YOLO masks, interpolation bridges, tiled masks accepted by parent YOLO masks,
     tiled masks accepted by parent bridges, consolidated tile bridges, the pre-smoothing global union, smoothing-pass results, optional skeleton, and the final output layer
   - streams NRRD gzip payloads directly from per-layer backing arrays or RAM-cached compressed cvol stores without materializing a full 4D decomposed payload, reducing peak scratch pressure during final NRRD creation
+  - records NRRD SegmentN_Extent metadata while each layer is materialized, so final NRRD packaging reuses stored extents instead of rescanning every backing layer
 
 Dependencies (Python):
   pip install opencv-python numpy scipy scikit-image tifffile tqdm ultralytics lz4
@@ -3345,7 +3346,7 @@ def cpu_mask_postprocess_pending_limit(worker_count: int, num_frames: int) -> in
     """
     workers = max(1, int(worker_count))
     frames = max(1, int(num_frames))
-    requested = _env_int('YOLO_TTA_CPU_MASK_PENDING_FRAMES', 512)
+    requested = _env_int('YOLO_TTA_CPU_MASK_PENDING_FRAMES', 256)
     if int(requested) <= 0:
         return max(workers, frames)
     return max(workers, min(frames, max(int(requested), workers * 2)))
@@ -7217,6 +7218,69 @@ CTILE_INDEX_DTYPE = np.dtype([
 ])
 
 
+NrrdSegmentExtent = Tuple[int, int, int, int, int, int]
+
+
+def _nrrd_empty_segment_extent() -> NrrdSegmentExtent:
+    return (0, -1, 0, -1, 0, -1)
+
+
+def _coerce_segment_extent(value: object) -> Optional[NrrdSegmentExtent]:
+    if value is None:
+        return None
+    try:
+        vals = [int(v) for v in value]  # type: ignore[arg-type]
+    except Exception:
+        return None
+    if len(vals) != 6:
+        return None
+    return (int(vals[0]), int(vals[1]), int(vals[2]), int(vals[3]), int(vals[4]), int(vals[5]))
+
+
+def _segment_extent_is_empty(extent: Sequence[int]) -> bool:
+    vals = [int(v) for v in extent]
+    return len(vals) != 6 or vals[1] < vals[0] or vals[3] < vals[2] or vals[5] < vals[4]
+
+
+def _segment_extent_to_json(extent: Sequence[int]) -> List[int]:
+    coerced = _coerce_segment_extent(extent)
+    if coerced is None:
+        coerced = _nrrd_empty_segment_extent()
+    return [int(v) for v in coerced]
+
+
+def _compressed_index_segment_extent(
+    index: np.ndarray,
+    shape_tyx: Sequence[int],
+) -> NrrdSegmentExtent:
+    """Compute a Slicer SegmentN extent from cvol/ctile index bboxes without decoding payloads."""
+    try:
+        shape_i = (int(shape_tyx[0]), int(shape_tyx[1]), int(shape_tyx[2]))
+    except Exception:
+        return _nrrd_empty_segment_extent()
+    idx_arr = np.asarray(index, dtype=CTILE_INDEX_DTYPE)
+    if idx_arr.size <= 0 or any(v <= 0 for v in shape_i):
+        return _nrrd_empty_segment_extent()
+    nonempty = np.asarray(idx_arr['kind'] == np.uint8(1), dtype=bool)
+    if not np.any(nonempty):
+        return _nrrd_empty_segment_extent()
+
+    z_vals = np.flatnonzero(nonempty).astype(np.int64, copy=False)
+    x0_vals = np.asarray(idx_arr['x0'][nonempty], dtype=np.int64)
+    x1_vals = np.asarray(idx_arr['x1'][nonempty], dtype=np.int64) - 1
+    y0_vals = np.asarray(idx_arr['y0'][nonempty], dtype=np.int64)
+    y1_vals = np.asarray(idx_arr['y1'][nonempty], dtype=np.int64) - 1
+    min_x = int(np.clip(int(np.min(x0_vals)), 0, max(0, shape_i[2] - 1)))
+    max_x = int(np.clip(int(np.max(x1_vals)), 0, max(0, shape_i[2] - 1)))
+    min_y = int(np.clip(int(np.min(y0_vals)), 0, max(0, shape_i[1] - 1)))
+    max_y = int(np.clip(int(np.max(y1_vals)), 0, max(0, shape_i[1] - 1)))
+    min_t = int(np.clip(int(np.min(z_vals)), 0, max(0, shape_i[0] - 1)))
+    max_t = int(np.clip(int(np.max(z_vals)), 0, max(0, shape_i[0] - 1)))
+    if max_x < min_x or max_y < min_y or max_t < min_t:
+        return _nrrd_empty_segment_extent()
+    return (int(min_x), int(max_x), int(min_y), int(max_y), int(min_t), int(max_t))
+
+
 def _require_lz4_frame() -> object:
     if _lz4_frame is None:
         raise RuntimeError(
@@ -7411,13 +7475,17 @@ def _write_compressed_bitpacked_payload_store(
     desc: str,
     workers: int = 1,
     extra_meta: Optional[Dict[str, object]] = None,
-) -> Dict[str, int]:
+) -> Dict[str, object]:
     """Write a slice-chunked bitpacked+LZ4 binary mask store.
 
     This is used as a general replacement for raw uint8 temporary volumes when the
     consumer can tolerate slice-at-a-time reads. Empty slices are represented only
     in the index, nonempty slices are cropped to their foreground bbox, bit-packed,
     and compressed with LZ4 level 0 for high throughput.
+
+    v11.1.4 also accumulates the Slicer SegmentN_Extent for the stored layer while
+    the slice payloads are written.  Final NRRD assembly can then reuse the stored
+    extent metadata without a separate full-layer extent scan.
     """
     _require_lz4_frame()
     fmt = str(format_name)
@@ -7447,6 +7515,9 @@ def _write_compressed_bitpacked_payload_store(
     packed_bytes = 0
     nonempty_slices = 0
     foreground_voxels = 0
+    min_t, max_t = int(shape_i[0]), -1
+    min_y, max_y = int(shape_i[1]), -1
+    min_x, max_x = int(shape_i[2]), -1
 
     if worker_count <= 1:
         iterable: Iterable[CompressedTileSlicePayload] = (encode_slice(idx) for idx in range(int(shape_i[0])))
@@ -7483,10 +7554,21 @@ def _write_compressed_bitpacked_payload_store(
             packed_bytes += int(item.packed_nbytes)
             foreground_voxels += int(item.foreground_voxels)
             nonempty_slices += 1
+            min_t = min(int(min_t), int(idx))
+            max_t = max(int(max_t), int(idx))
+            min_y = min(int(min_y), int(item.y0))
+            max_y = max(int(max_y), int(item.y1) - 1)
+            min_x = min(int(min_x), int(item.x0))
+            max_x = max(int(max_x), int(item.x1) - 1)
 
     index.tofile(index_path)
     raw_logical_bytes = int(array_nbytes(shape_i, np.uint8))
-    stats = {
+    segment_extent_ijk = (
+        _nrrd_empty_segment_extent()
+        if int(max_t) < 0
+        else (int(min_x), int(max_x), int(min_y), int(max_y), int(min_t), int(max_t))
+    )
+    stats: Dict[str, object] = {
         'nonempty_slices': int(nonempty_slices),
         'empty_slices': int(shape_i[0] - nonempty_slices),
         'foreground_voxels': int(foreground_voxels),
@@ -7494,6 +7576,8 @@ def _write_compressed_bitpacked_payload_store(
         'packed_bytes_before_lz4': int(packed_bytes),
         'compressed_payload_bytes': int(payload_bytes),
         'index_bytes': int(index.nbytes),
+        'segment_extent_ijk': _segment_extent_to_json(segment_extent_ijk),
+        'segment_extent_shape_tyx': [int(shape_i[0]), int(shape_i[1]), int(shape_i[2])],
     }
     meta = {
         'format': fmt,
@@ -7510,6 +7594,9 @@ def _write_compressed_bitpacked_payload_store(
         'index_record_bytes': int(CTILE_INDEX_DTYPE.itemsize),
         'packed_shape_encoding': 'flat_uint8_count_in_index.packed_nbytes',
         'description': str(desc),
+        'segment_extent_ijk': _segment_extent_to_json(segment_extent_ijk),
+        'segment_extent_axis_order': 'Slicer IJK inclusive extent: minX maxX minY maxY minT maxT for internal layer order (t,Y,X)',
+        'segment_extent_shape_tyx': [int(shape_i[0]), int(shape_i[1]), int(shape_i[2])],
         'stats': stats,
     }
     if extra_meta:
@@ -7522,7 +7609,6 @@ def _write_compressed_bitpacked_payload_store(
     )
     return stats
 
-
 def write_compressed_bitpacked_mask_store(
     mask_volume: np.ndarray,
     store_dir: Path,
@@ -7531,7 +7617,7 @@ def write_compressed_bitpacked_mask_store(
     desc: str = 'Compressed bitpacked mask store',
     workers: int = 1,
     extra_meta: Optional[Dict[str, object]] = None,
-) -> Dict[str, int]:
+) -> Dict[str, object]:
     arr = np.asarray(mask_volume)
     if arr.ndim != 3:
         raise ValueError(f'{desc}: expected 3D mask volume, got shape {arr.shape}')
@@ -7578,7 +7664,7 @@ def subtract_volume_to_compressed_bitpacked_store(
     desc: str,
     workers: int = 1,
     format_name: str = CVOL_FORMAT,
-) -> Dict[str, int]:
+) -> Dict[str, object]:
     after_shape = _volume_shape_tuple(after_mm)
     before_shape = _volume_shape_tuple(before_volume)
     if after_shape != before_shape:
@@ -7727,6 +7813,12 @@ class NrrdLayerRef:
     tile_acceptance: str = ''  # parent_mask, parent_bridge, consolidated, or blank
     stage: str = ''
     description: str = ''
+    # Slicer SegmentN_Extent in this layer backing store's own (X,Y,t) index space.
+    # Final NRRD packaging maps this extent into the requested output geometry without
+    # reopening the layer solely to compute header metadata.
+    segment_extent_ijk: Optional[NrrdSegmentExtent] = None
+    segment_extent_shape_tyx: Tuple[int, int, int] = (0, 0, 0)
+    segment_extent_source: str = ''
 
 
 @dataclass(frozen=True)
@@ -8073,7 +8165,7 @@ def materialize_nrrd_view_layer(
     )
     shape = tuple(int(x) for x in np.asarray(projected).shape)
     if compressed_nrrd_layers_enabled():
-        write_compressed_bitpacked_mask_store(
+        layer_stats = write_compressed_bitpacked_mask_store(
             projected,
             out_path,
             format_name=CVOL_FORMAT,
@@ -8081,6 +8173,8 @@ def materialize_nrrd_view_layer(
             workers=int(workers),
             extra_meta={'nrrd_layer_key': key, 'source_raw_path': str(raw_path)},
         )
+        segment_extent = _coerce_segment_extent(layer_stats.get('segment_extent_ijk')) or _nrrd_empty_segment_extent()
+        segment_extent_source = 'compressed_cvol_index'
         storage_format = CVOL_FORMAT
         close_memmap_array(projected)
         try:
@@ -8088,6 +8182,8 @@ def materialize_nrrd_view_layer(
         except Exception:
             pass
     else:
+        segment_extent = compute_segment_extent_zyx(projected)
+        segment_extent_source = 'raw_layer_materialization_scan'
         close_memmap_array(projected)
 
     return NrrdLayerRef(
@@ -8113,8 +8209,10 @@ def materialize_nrrd_view_layer(
         tile_acceptance=str(tile_acceptance),
         stage=str(stage),
         description=str(description),
+        segment_extent_ijk=segment_extent,
+        segment_extent_shape_tyx=(int(shape[0]), int(shape[1]), int(shape[2])),
+        segment_extent_source=segment_extent_source,
     )
-
 
 def materialize_nrrd_global_layer(
     volume_mm: np.ndarray,
@@ -8157,7 +8255,7 @@ def materialize_nrrd_global_layer(
     )
     shape = tuple(int(x) for x in np.asarray(copied).shape)
     if compressed_nrrd_layers_enabled():
-        write_compressed_bitpacked_mask_store(
+        layer_stats = write_compressed_bitpacked_mask_store(
             copied,
             out_path,
             format_name=CVOL_FORMAT,
@@ -8165,6 +8263,8 @@ def materialize_nrrd_global_layer(
             workers=int(workers),
             extra_meta={'nrrd_layer_key': key, 'source_raw_path': str(raw_path)},
         )
+        segment_extent = _coerce_segment_extent(layer_stats.get('segment_extent_ijk')) or _nrrd_empty_segment_extent()
+        segment_extent_source = 'compressed_cvol_index'
         storage_format = CVOL_FORMAT
         close_memmap_array(copied)
         try:
@@ -8172,6 +8272,8 @@ def materialize_nrrd_global_layer(
         except Exception:
             pass
     else:
+        segment_extent = compute_segment_extent_zyx(copied)
+        segment_extent_source = 'raw_layer_materialization_scan'
         close_memmap_array(copied)
 
     return NrrdLayerRef(
@@ -8195,6 +8297,9 @@ def materialize_nrrd_global_layer(
         pass_index=int(pass_index),
         stage=str(stage),
         description=str(description),
+        segment_extent_ijk=segment_extent,
+        segment_extent_shape_tyx=(int(shape[0]), int(shape[1]), int(shape[2])),
+        segment_extent_source=segment_extent_source,
     )
 
 def prepare_view_volume_after_fullframe(
@@ -9828,7 +9933,7 @@ def nrrd_gzip_compresslevel() -> int:
 
 
 def nrrd_stream_buffer_bytes() -> int:
-    mib = max(1, _env_int('YOLO_TTA_NRRD_STREAM_BUFFER_MIB', 512))
+    mib = max(1, _env_int('YOLO_TTA_NRRD_STREAM_BUFFER_MIB', 64))
     return int(mib) * 1024 * 1024
 
 
@@ -9937,7 +10042,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.5-Pro_v11.1.3_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.5-Pro_v11.1.4_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -10047,19 +10152,16 @@ def _log_nrrd_streaming_sources(effective_refs: Sequence[NrrdLayerRef]) -> None:
     compressed = [ref for ref in effective_refs if _nrrd_layer_ref_is_compressed(ref)]
     raw = [ref for ref in effective_refs if not _nrrd_layer_ref_is_compressed(ref)]
     print(
-        'NRRD streaming source files used by both segment-extents and decomposed-layer payload passes: '
+        'NRRD streaming source files used by decomposed-layer payload packaging: '
         f'{len(effective_refs)} layer backing path(s); compressed_bitpacked={len(compressed)}, raw_u8={len(raw)}, '
-        f'compressed_payload_ram_cache={nrrd_cache_compressed_layers_in_ram_enabled()}'
+        f'compressed_payload_ram_cache={nrrd_cache_compressed_layers_in_ram_enabled()}, '
+        f'precomputed_segment_extents={nrrd_precomputed_segment_extents_enabled()}'
     )
     preview = list(effective_refs[:8])
     for ref in preview:
         print(f'  - {ref.storage_format}: {ref.path}')
     if len(effective_refs) > len(preview):
         print(f'  ... {len(effective_refs) - len(preview)} additional layer backing path(s) listed in the NRRD manifest sidecar')
-
-
-def _nrrd_empty_segment_extent() -> Tuple[int, int, int, int, int, int]:
-    return (0, -1, 0, -1, 0, -1)
 
 
 def compute_segment_extent_zyx(mask_zyx: np.ndarray) -> Tuple[int, int, int, int, int, int]:
@@ -10260,10 +10362,143 @@ def _read_layer_row_block_in_output_shape(
     return _read_layer_slice_in_output_shape(src, output_shape, out_z_i)[y0_i:y1_i, :]
 
 
-def _compute_segment_extent_for_layer_ref(
+def nrrd_precomputed_segment_extents_enabled() -> bool:
+    return _env_flag('YOLO_TTA_NRRD_PRECOMPUTED_SEGMENT_EXTENTS', True)
+
+
+def _map_spatial_extent_conservative(
+    min_idx: int,
+    max_idx: int,
+    in_len: int,
+    out_len: int,
+) -> Tuple[int, int]:
+    if int(out_len) <= 0 or int(in_len) <= 0 or int(max_idx) < int(min_idx):
+        return (0, -1)
+    in_len_i = int(in_len)
+    out_len_i = int(out_len)
+    min_i = int(np.clip(int(min_idx), 0, in_len_i - 1))
+    max_i = int(np.clip(int(max_idx), 0, in_len_i - 1))
+    if in_len_i == out_len_i:
+        return (min_i, max_i)
+    # Conservative interval-overlap mapping for cv2 area/nearest resizing. It may include a
+    # one-pixel border in unusual scale ratios, but it never underestimates the layer extent.
+    out_min = int(math.floor(float(min_i) * float(out_len_i) / float(in_len_i)))
+    out_max = int(math.ceil(float(max_i + 1) * float(out_len_i) / float(in_len_i)) - 1)
+    out_min = int(np.clip(out_min, 0, out_len_i - 1))
+    out_max = int(np.clip(out_max, 0, out_len_i - 1))
+    if out_max < out_min:
+        return (0, -1)
+    return (out_min, out_max)
+
+
+def _map_t_extent_for_nrrd_restore(
+    min_t: int,
+    max_t: int,
+    in_t: int,
+    out_t: int,
+) -> Tuple[int, int]:
+    if int(out_t) <= 0 or int(in_t) <= 0 or int(max_t) < int(min_t):
+        return (0, -1)
+    in_t_i = int(in_t)
+    out_t_i = int(out_t)
+    lo = int(np.clip(int(min_t), 0, in_t_i - 1))
+    hi = int(np.clip(int(max_t), 0, in_t_i - 1))
+    if in_t_i == out_t_i:
+        return (lo, hi)
+
+    out_min: Optional[int] = None
+    out_max = -1
+    for out_z in range(out_t_i):
+        src_indices = _restore_source_indices_for_output_z(in_t_i, out_t_i, int(out_z))
+        if any(lo <= int(src_idx) <= hi for src_idx in src_indices):
+            if out_min is None:
+                out_min = int(out_z)
+            out_max = int(out_z)
+    if out_min is None or out_max < out_min:
+        return (0, -1)
+    return (int(out_min), int(out_max))
+
+
+def _transform_segment_extent_to_output_shape(
+    extent: Sequence[int],
+    input_shape: Tuple[int, int, int],
+    output_shape: Tuple[int, int, int],
+) -> Optional[NrrdSegmentExtent]:
+    extent_i = _coerce_segment_extent(extent)
+    if extent_i is None:
+        return None
+    if _segment_extent_is_empty(extent_i):
+        return _nrrd_empty_segment_extent()
+
+    in_t, in_h, in_w = (int(input_shape[0]), int(input_shape[1]), int(input_shape[2]))
+    out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
+    if (in_t, in_h, in_w) == (out_t, out_h, out_w):
+        return extent_i
+
+    x0, x1, y0, y1, t0, t1 = (int(v) for v in extent_i)
+    mapped_t0, mapped_t1 = _map_t_extent_for_nrrd_restore(t0, t1, in_t, out_t)
+    mapped_y0, mapped_y1 = _map_spatial_extent_conservative(y0, y1, in_h, out_h)
+    mapped_x0, mapped_x1 = _map_spatial_extent_conservative(x0, x1, in_w, out_w)
+    mapped = (int(mapped_x0), int(mapped_x1), int(mapped_y0), int(mapped_y1), int(mapped_t0), int(mapped_t1))
+    if _segment_extent_is_empty(mapped):
+        return _nrrd_empty_segment_extent()
+    return mapped
+
+
+def _read_compressed_store_segment_extent(ref: NrrdLayerRef) -> Optional[NrrdSegmentExtent]:
+    if not _nrrd_layer_ref_is_compressed(ref):
+        return None
+    meta_path = Path(ref.path) / 'meta.json'
+    index_path = Path(ref.path) / 'index.bin'
+    if not meta_path.exists():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text())
+    except Exception:
+        return None
+    extent = _coerce_segment_extent(meta.get('segment_extent_ijk'))
+    if extent is not None:
+        return extent
+    try:
+        shape = meta.get('shape', [int(ref.shape[0]), int(ref.shape[1]), int(ref.shape[2])])
+        shape_i = (int(shape[0]), int(shape[1]), int(shape[2]))
+        if index_path.exists():
+            index = np.fromfile(index_path, dtype=CTILE_INDEX_DTYPE, count=int(shape_i[0]))
+            return _compressed_index_segment_extent(index, shape_i)
+    except Exception:
+        return None
+    return None
+
+
+def _precomputed_segment_extent_for_layer_ref(
     ref: NrrdLayerRef,
     output_shape: Tuple[int, int, int],
-) -> Tuple[int, int, int, int, int, int]:
+) -> Optional[Tuple[NrrdSegmentExtent, str]]:
+    if not nrrd_precomputed_segment_extents_enabled():
+        return None
+    stored_extent = _coerce_segment_extent(getattr(ref, 'segment_extent_ijk', None))
+    source = str(getattr(ref, 'segment_extent_source', '') or 'layer_ref_metadata')
+    if stored_extent is None:
+        stored_extent = _read_compressed_store_segment_extent(ref)
+        source = 'compressed_store_metadata'
+    if stored_extent is None:
+        return None
+    transformed = _transform_segment_extent_to_output_shape(
+        stored_extent,
+        tuple(int(x) for x in ref.shape),
+        tuple(int(x) for x in output_shape),
+    )
+    if transformed is None:
+        return None
+    if tuple(int(x) for x in ref.shape) != tuple(int(x) for x in output_shape):
+        source += '_geometry_mapped'
+    return transformed, source
+
+
+def _scan_segment_extent_for_layer_ref(
+    ref: NrrdLayerRef,
+    output_shape: Tuple[int, int, int],
+) -> NrrdSegmentExtent:
     src = _open_nrrd_layer_ref(ref)
     try:
         if isinstance(src, np.ndarray) and tuple(int(x) for x in ref.shape) == tuple(int(x) for x in output_shape):
@@ -10297,6 +10532,22 @@ def _compute_segment_extent_for_layer_ref(
         _madvise_array_mmap(src, 'MADV_DONTNEED')
         _close_nrrd_layer_source(src)
 
+
+def _resolve_segment_extent_for_layer_ref(
+    ref: NrrdLayerRef,
+    output_shape: Tuple[int, int, int],
+) -> Tuple[NrrdSegmentExtent, str]:
+    precomputed = _precomputed_segment_extent_for_layer_ref(ref, output_shape)
+    if precomputed is not None:
+        return precomputed
+    return _scan_segment_extent_for_layer_ref(ref, output_shape), 'fallback_layer_scan'
+
+
+def _compute_segment_extent_for_layer_ref(
+    ref: NrrdLayerRef,
+    output_shape: Tuple[int, int, int],
+) -> NrrdSegmentExtent:
+    return _resolve_segment_extent_for_layer_ref(ref, output_shape)[0]
 
 def _write_decomposed_nrrd_payload_stream(
     effective_refs: Sequence[NrrdLayerRef],
@@ -10358,7 +10609,18 @@ def _write_decomposed_nrrd_manifest(
     out_path: Path,
     output_shape: Tuple[int, int, int],
     effective_refs: Sequence[NrrdLayerRef],
+    layer_extents: Optional[Sequence[NrrdSegmentExtent]] = None,
+    layer_extent_sources: Optional[Sequence[str]] = None,
 ) -> None:
+    extents_resolved: List[NrrdSegmentExtent] = []
+    if layer_extents is None:
+        extents_resolved = [_nrrd_empty_segment_extent() for _ in effective_refs]
+    else:
+        extents_resolved = [(_coerce_segment_extent(extent) or _nrrd_empty_segment_extent()) for extent in layer_extents]
+    sources_resolved = list(layer_extent_sources) if layer_extent_sources is not None else ['unknown'] * len(effective_refs)
+    if len(sources_resolved) != len(effective_refs):
+        sources_resolved = ['unknown'] * len(effective_refs)
+
     manifest = {
         'nrrd_path': str(out_path),
         'axis_order': '(layer, X, Y, t)',
@@ -10382,6 +10644,19 @@ def _write_decomposed_nrrd_manifest(
                 'storage_format': getattr(ref, 'storage_format', 'raw_u8'),
                 'backing_path': str(ref.path),
                 'backing_shape_tyx': [int(ref.shape[0]), int(ref.shape[1]), int(ref.shape[2])],
+                'stored_segment_extent_ijk': (
+                    _segment_extent_to_json(ref.segment_extent_ijk)
+                    if getattr(ref, 'segment_extent_ijk', None) is not None else None
+                ),
+                'stored_segment_extent_shape_tyx': [
+                    int(v) for v in (
+                        getattr(ref, 'segment_extent_shape_tyx', None)
+                        or (int(ref.shape[0]), int(ref.shape[1]), int(ref.shape[2]))
+                    )
+                ],
+                'stored_segment_extent_source': str(getattr(ref, 'segment_extent_source', '')),
+                'nrrd_output_segment_extent_ijk': _segment_extent_to_json(extents_resolved[int(idx)]),
+                'segment_extent_source': str(sources_resolved[int(idx)]),
             }
             for idx, ref in enumerate(effective_refs)
         ],
@@ -10392,11 +10667,11 @@ def _write_decomposed_nrrd_manifest(
             'Consolidated tile bridge layers are not attributed back to parent_mask vs parent_bridge acceptance because interpolation occurs after accepted tile masks are unioned.',
             'The final_output layer is included for direct comparison and can be ignored when recomposing a custom volume from component layers.',
             'NRRD payload was written by the bounded-memory streaming writer; no full 4D decomposed payload was materialized.',
+            'Segment extents are recorded during layer materialization and reused during final packaging whenever possible.',
         ],
     }
     manifest_path = out_path.with_suffix(out_path.suffix + '.manifest.json')
     manifest_path.write_text(json.dumps(manifest, indent=2))
-
 
 def write_decomposed_nrrd(
     layer_refs: Sequence[NrrdLayerRef],
@@ -10480,6 +10755,7 @@ def write_decomposed_nrrd(
                 pass_index=0,
                 stage='final_output_after_all_postprocessing',
                 description='Final binary output after all postprocessing; empty volume.',
+                segment_extent_ijk=_nrrd_empty_segment_extent(),
             )
         effective_refs.append(final_ref)
 
@@ -10502,9 +10778,18 @@ def write_decomposed_nrrd(
 
     _log_nrrd_streaming_sources(effective_refs)
 
-    layer_extents: List[Tuple[int, int, int, int, int, int]] = []
-    for ref in tqdm(effective_refs, desc='NRRD streaming: segment extents'):
-        layer_extents.append(_compute_segment_extent_for_layer_ref(ref, output_shape))
+    layer_extents: List[NrrdSegmentExtent] = []
+    layer_extent_sources: List[str] = []
+    extent_source_counts: Dict[str, int] = {}
+    for ref in tqdm(effective_refs, desc='NRRD segment extents: metadata'):
+        extent, extent_source = _resolve_segment_extent_for_layer_ref(ref, output_shape)
+        layer_extents.append(extent)
+        layer_extent_sources.append(str(extent_source))
+        extent_source_counts[str(extent_source)] = int(extent_source_counts.get(str(extent_source), 0)) + 1
+    print(
+        'NRRD segment extents resolved: ' +
+        ', '.join(f'{key}={value}' for key, value in sorted(extent_source_counts.items()))
+    )
 
     header = nrrd_decomposed_header(
         output_shape_zyx=output_shape,
@@ -10528,6 +10813,8 @@ def write_decomposed_nrrd(
         out_path=out_path,
         output_shape=output_shape,
         effective_refs=effective_refs,
+        layer_extents=layer_extents,
+        layer_extent_sources=layer_extent_sources,
     )
     return out_path
 
@@ -12076,7 +12363,7 @@ def main() -> None:
         'The NRRD payload is now gzip-streamed directly from backing layers with a bounded row buffer '
         'instead of materializing the full 4D decomposed payload; tune YOLO_TTA_NRRD_STREAM_BUFFER_MIB '
         'and YOLO_TTA_NRRD_GZIP_LEVEL if needed. '
-        'The same layer backing paths are used by the segment-extent scan and the decomposed-layer payload writer; compressed cvol/ctile backing paths cache chunks.bin in RAM by default via YOLO_TTA_NRRD_CACHE_COMPRESSED_LAYERS_IN_RAM=1. '
+        'Segment extents are now recorded when each NRRD layer/cvol store is materialized and reused during final packaging; only missing metadata or disabled YOLO_TTA_NRRD_PRECOMPUTED_SEGMENT_EXTENTS falls back to a layer scan. Compressed cvol/ctile backing paths cache chunks.bin in RAM by default via YOLO_TTA_NRRD_CACHE_COMPRESSED_LAYERS_IN_RAM=1 for the payload stream. '
         f'Legacy single-volume NRRD writing is retained only for troubleshooting pass outputs without layer refs; space={NRRD_SPACE}.'
     )
     if cpu_retina_masks_enabled():
@@ -12202,7 +12489,7 @@ def main() -> None:
         'CPU retina reconstruction queue is bounded per prediction video by the number of pending CPU postprocess futures. ' 
         'worker_count=max(1, min(YOLO_TTA_PREDICT_POSTPROCESS_WORKERS, num_frames)) for the live v11 path; ' 
         'pending_limit=cpu_mask_postprocess_pending_limit(worker_count, num_frames) = max(worker_count, min(num_frames, max(YOLO_TTA_CPU_MASK_PENDING_FRAMES, worker_count*2))). ' 
-        'The default YOLO_TTA_CPU_MASK_PENDING_FRAMES is 512; setting it to 0 permits buffering all frames for that video. ' 
+        'The default YOLO_TTA_CPU_MASK_PENDING_FRAMES is 256; setting it to 0 permits buffering all frames for that video. ' 
         f'For this run, the largest active prediction video has {int(max_predict_video_frames)} frame(s), ' 
         f'example worker_count={int(example_cpu_mask_workers)}, pending_limit={int(example_cpu_mask_pending)}.'
     )
@@ -13556,7 +13843,7 @@ def main() -> None:
     if bool(nrrd_layers_needed):
         spec_notes.append(
             f'Decomposed NRRD component layers prepared: {int(len(nrrd_layer_refs))}; '
-            'the writer appends one final_output layer and writes .nrrd.manifest.json sidecars for full-size and low-quality decomposed NRRDs.'
+            'the writer appends one final_output layer, reuses materialization-time SegmentN extents, and writes .nrrd.manifest.json sidecars for full-size and low-quality decomposed NRRDs.'
         )
 
     summary_path = write_summary_file(
