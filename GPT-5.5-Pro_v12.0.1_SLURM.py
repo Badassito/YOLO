@@ -2200,15 +2200,23 @@ class InMemoryYoloVolumeSource:
     Ultralytics' public Python API accepts in-memory numpy inputs, but its built-in
     ``LoadPilAndNumpy`` loader treats a list of arrays as one large batch.  This
     loader is registered as an in-memory loader so the predictor consumes a 3-D
-    slice volume incrementally with ``stream=True`` and ``batch=1``.
+    slice volume incrementally with ``stream=True`` and ``batch=1``.  Slices are
+    yielded as single-channel ``H×W×1`` uint8 arrays; this intentionally avoids
+    the older gray-to-BGR expansion path so single-channel YOLO models receive a
+    single input channel.
     """
 
     def __init__(self, volume_gray: np.ndarray, name: str, batch_size: int = 1, max_frames: Optional[int] = None) -> None:
         if volume_gray is None:
             raise ValueError('InMemoryYoloVolumeSource requires a volume array')
         self.volume_gray = np.asarray(volume_gray)
-        if self.volume_gray.ndim not in (3, 4):
-            raise ValueError(f'Prediction volume must have shape (N,H,W) or (N,H,W,C); got {self.volume_gray.shape}')
+        if self.volume_gray.ndim == 4:
+            if int(self.volume_gray.shape[3]) != 1:
+                raise ValueError(
+                    f'Prediction volume must be single-channel with shape (N,H,W) or (N,H,W,1); got {self.volume_gray.shape}'
+                )
+        elif self.volume_gray.ndim != 3:
+            raise ValueError(f'Prediction volume must have shape (N,H,W) or (N,H,W,1); got {self.volume_gray.shape}')
         self.name = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(name)).strip('_') or 'in_memory_volume'
         self.nf = int(self.volume_gray.shape[0])
         if max_frames is not None:
@@ -2231,15 +2239,14 @@ class InMemoryYoloVolumeSource:
         return int(math.ceil(float(self.nf) / float(self.bs))) if self.nf > 0 else 0
 
     @staticmethod
-    def _frame_to_bgr(frame: np.ndarray) -> np.ndarray:
+    def _frame_to_single_channel(frame: np.ndarray) -> np.ndarray:
+        """Return one prediction frame as contiguous H×W×1 uint8, never H×W×3."""
         frame_u8 = np.asarray(frame, dtype=np.uint8)
         if frame_u8.ndim == 2:
-            return cv2.cvtColor(np.ascontiguousarray(frame_u8), cv2.COLOR_GRAY2BGR)
+            return np.ascontiguousarray(frame_u8[:, :, None])
         if frame_u8.ndim == 3 and int(frame_u8.shape[2]) == 1:
-            return cv2.cvtColor(np.ascontiguousarray(frame_u8[:, :, 0]), cv2.COLOR_GRAY2BGR)
-        if frame_u8.ndim == 3 and int(frame_u8.shape[2]) == 3:
             return np.ascontiguousarray(frame_u8)
-        raise ValueError(f'Unsupported prediction frame shape for YOLO source: {frame_u8.shape}')
+        raise ValueError(f'Unsupported non-single-channel prediction frame shape for YOLO source: {frame_u8.shape}')
 
     def __next__(self) -> Tuple[List[str], List[np.ndarray], List[str]]:
         if self.count >= self.nf:
@@ -2252,7 +2259,7 @@ class InMemoryYoloVolumeSource:
         info: List[str] = []
         for idx in range(start, stop):
             paths.append(f'{self.name}_{idx + 1:06d}.png')
-            imgs.append(self._frame_to_bgr(self.volume_gray[int(idx)]))
+            imgs.append(self._frame_to_single_channel(self.volume_gray[int(idx)]))
             info.append(f'in-memory {self.name} slice {idx + 1}/{self.nf}: ')
         return paths, imgs, info
 
@@ -3568,6 +3575,86 @@ def cpu_mask_postprocess_pending_limit(worker_count: int, num_frames: int) -> in
     return max(workers, min(frames, max(int(requested), workers * 2)))
 
 
+
+
+_ULTRALYTICS_SINGLE_CHANNEL_PREPROCESS_PATCHED = False
+_ULTRALYTICS_ORIGINAL_BASE_PREPROCESS: Optional[object] = None
+
+
+def ensure_single_channel_yolo_preprocess_patch() -> bool:
+    """Patch Ultralytics preprocessing so H×W×1 in-memory slices stay one-channel tensors.
+
+    The v12 in-memory source deliberately yields single-channel image arrays. Recent
+    Ultralytics preprocessors assume OpenCV-style H×W×3 BGR arrays for numpy-image
+    batches and transpose them as BHWC. This patch handles batches that are already
+    single-channel by constructing a BCHW tensor directly, bypassing any gray-to-BGR
+    duplication while leaving normal RGB/BGR and video sources on the original path.
+    """
+    global _ULTRALYTICS_SINGLE_CHANNEL_PREPROCESS_PATCHED, _ULTRALYTICS_ORIGINAL_BASE_PREPROCESS
+
+    if _ULTRALYTICS_SINGLE_CHANNEL_PREPROCESS_PATCHED:
+        return True
+
+    try:
+        import torch  # type: ignore
+        from ultralytics.engine.predictor import BasePredictor  # type: ignore
+    except Exception as exc:  # pragma: no cover - ultralytics is imported lazily on SLURM
+        print(f'Warning: single-channel YOLO preprocess patch could not be installed ({exc})')
+        return False
+
+    original_preprocess = BasePredictor.preprocess
+    _ULTRALYTICS_ORIGINAL_BASE_PREPROCESS = original_preprocess
+
+    def _tta_single_channel_preprocess(self, im):  # type: ignore[no-untyped-def]
+        not_tensor = not isinstance(im, torch.Tensor)
+        if not_tensor:
+            if isinstance(im, np.ndarray):
+                seq = [im]
+            elif isinstance(im, (list, tuple)):
+                seq = list(im)
+            else:
+                seq = []
+
+            if seq:
+                gray_frames: List[np.ndarray] = []
+                single_channel_batch = True
+                for item in seq:
+                    arr = np.asarray(item)
+                    if arr.ndim == 2:
+                        gray = arr
+                    elif arr.ndim == 3 and int(arr.shape[2]) == 1:
+                        gray = arr[:, :, 0]
+                    else:
+                        single_channel_batch = False
+                        break
+                    gray_frames.append(np.ascontiguousarray(gray, dtype=np.uint8))
+
+                if single_channel_batch:
+                    try:
+                        shapes = {tuple(int(v) for v in frame.shape) for frame in gray_frames}
+                        if len(shapes) != 1:
+                            raise ValueError(f'single-channel batch contains mixed shapes: {sorted(shapes)}')
+                        batch = np.stack(gray_frames, axis=0)[:, None, :, :]  # BCHW, C=1
+                        tensor = torch.from_numpy(np.ascontiguousarray(batch))
+                        device = getattr(self, 'device', None)
+                        if device is not None:
+                            tensor = tensor.to(device)
+                        model_obj = getattr(self, 'model', None)
+                        use_half = bool(getattr(model_obj, 'fp16', False))
+                        tensor = tensor.half() if use_half else tensor.float()
+                        tensor /= 255.0
+                        return tensor
+                    except Exception as exc:
+                        raise RuntimeError(f'Failed to preprocess single-channel in-memory YOLO batch: {exc}') from exc
+
+        return original_preprocess(self, im)
+
+    BasePredictor.preprocess = _tta_single_channel_preprocess
+    _ULTRALYTICS_SINGLE_CHANNEL_PREPROCESS_PATCHED = True
+    print('Single-channel YOLO preprocess enabled: in-memory H×W×1 slices are passed as BCHW tensors with C=1.')
+    return True
+
+
 def _as_numpy_float32_cpu(x: object) -> np.ndarray:
     """Detach torch/array-like tensors into owned, contiguous CPU float32 NumPy arrays."""
     try:
@@ -4273,6 +4360,8 @@ def predict_source_and_accumulate(
     behind the streamed GPU inference.
     """
     ensure_yolo_ready_for_predict(model, cfg)
+    if isinstance(source, InMemoryYoloVolumeSource):
+        ensure_single_channel_yolo_preprocess_patch()
     ensure_cpu_retina_mask_predictor_patch()
 
     prediction_count = 0
@@ -12659,8 +12748,9 @@ def main() -> None:
     )
     spec_notes.append(
         'v12 in-memory prediction scheduler active: full-frame and tiled YOLO sources are materialized as '
-        '(slice,--imgsz,--imgsz) uint8 arrays and consumed through InMemoryYoloVolumeSource with stream=True; '
-        'the normal pipeline no longer writes augmented prediction videos, canvas videos, or tile videos to temp. '
+        '(slice,--imgsz,--imgsz) uint8 arrays, yielded as H×W×1 frames through InMemoryYoloVolumeSource, '
+        'and preprocessed into BCHW tensors with C=1; the normal pipeline no longer writes augmented '
+        'prediction videos, canvas videos, or tile videos to temp. '
         f'The build queue is bounded to {int(prediction_volume_queue_slots)} queued prediction volume(s) beyond the current inference.'
     )
     if dense_tiling_active:
