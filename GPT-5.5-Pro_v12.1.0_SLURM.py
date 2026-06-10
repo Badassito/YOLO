@@ -2,11 +2,11 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v12.0.0_SLURM implementation of the v12.0.0_SLURM specification:
+This v12.1.0_SLURM implementation of the v12.1.0_SLURM specification:
   - builds Transverse, optional generalized Tilted Views for Transverse/Sagittal/Coronal, independently optional upright Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - materializes YOLO-ready full-frame and tiled prediction volumes as in-memory slice arrays instead of writing prediction videos to the temp folder
   - feeds those volumes to Ultralytics through a custom in-memory loader with stream=True, while keeping CPU retina reconstruction asynchronous behind GPU inference
-  - bounds prediction-volume creation to the current inference volume plus two queued volumes by default, preserving the priority order while preventing unbounded RAM growth
+  - bounds prediction-volume creation to the current inference volume plus four queued volumes by default, preserving the priority order while preventing unbounded RAM growth
   - stages cleaned tiled masks into one parent-view canvas per tile-size/stride set, gates each consolidated canvas
     at the connected-component level against frozen parent full-frame support, then interpolates the accepted tiled volume once per parent view
   - spills postprocessed waiting tile masks to a user-space ctile cache and stores decomposed NRRD/support binary volumes as cvol stores: per-slice empty elision, nonzero bbox crop, NumPy packbits, and LZ4 compression
@@ -23,7 +23,7 @@ This v12.0.0_SLURM implementation of the v12.0.0_SLURM specification:
   - inverse-maps predictions only into each generated prediction volume's native view space, keeps Radial and Tilted View results view-native through cleanup/interpolation, then backprojects them after per-view processing
   - treats --model as a single YOLO segmentation model path; multiple-model inference is not supported in this script
   - applies final 3D void fill only when --enable_3d_void_fill is active, and only once after the global union
-  - applies Gaussian smoothing by default with sigma 3.0 and one pass; set --gaussian_smoothing 0 to disable it
+  - activates Gaussian smoothing only when --gaussian_smoothing or --gaussian_smoothing_passes is explicitly set; either flag set to 0 disables it
   - supports Radial and generalized Tilted View-native interpolation, and keeps every Tilted View frame N centered on its base view native slice N with black-padded out-of-bounds shear samples
   - resizes the working volume to an approximately cubic orthogonal volume when needed, restores the final mask to the original input dimensions for default outputs,
     and saves the transverse default color overlay plus optional labels, bilevel compressed TIFF binary masks, binary MKVs,
@@ -158,13 +158,14 @@ def resolve_tilt_angles(values: Sequence[str] | str | None) -> List[float]:
     seen: set[float] = set()
     for angle in raw:
         angle_f = float(angle)
-        if abs(angle_f) <= 0.0:
+        if angle_f == 0.0:
             continue
-        angle_pos = abs(angle_f)
-        if angle_pos in seen:
+        if angle_f < 0.0:
+            raise ValueError('--tilt_angle values must be positive; each non-zero value creates both signed tilt variants')
+        if angle_f in seen:
             continue
-        seen.add(angle_pos)
-        out.append(angle_pos)
+        seen.add(angle_f)
+        out.append(angle_f)
     return out
 
 
@@ -242,7 +243,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--tilt_view", nargs="+", default=["transverse"], type=str,
                    help="One or more Cartesian base views for v12 Tilted Views: transverse, sagittal, or coronal. A tilted base view does not need to be enabled as an upright view")
     p.add_argument("--tilt_angle", nargs="+", default=["0"], type=str,
-                   help="One or more positive Tilted View angles in degrees. Each value creates both positive and negative variants. 0 disables all Tilted Views. Values must be greater than 0 and less than 45")
+                   help="One or more positive Tilted View angles in degrees. Each value creates both positive and negative variants. 0 disables all Tilted Views. Values must be greater than 0 and less than or equal to 45")
     p.add_argument("--tilt_direction", nargs="+", default=["vertical"], type=str,
                    help="One or more Tilted View directions: vertical, horizontal, or both")
 
@@ -256,7 +257,7 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Save final YOLO segmentation labels per frame. Optional custom pattern, e.g. labels/{Filename}_%%04d.txt")
     p.add_argument("--save_binary", nargs="?", const="__DEFAULT__", default=None, type=str,
                    help="Save final binary masks as a TIFF sequence plus an FFV1 MKV. Optional custom TIFF pattern, e.g. binary_masks/{Filename}_Binary_%%04d.tiff")
-    p.add_argument("--save_nrrd", action="store_true", help="Save a decomposed multi-layer NRRD plus manifest JSON; troubleshooting pass outputs without layer refs fall back to a single binary NRRD")
+    p.add_argument("--save_nrrd", action="store_true", help="Save a decomposed multi-layer NRRD plus manifest JSON")
     p.add_argument("--save_skeleton", action="store_true",
                    help="Compute a 3D skeleton after final postprocessing. With --save_nrrd, add it as a decomposed layer; otherwise write a skeleton-only NRRD")
     p.add_argument("--save_low_quality", action="store_true",
@@ -266,17 +267,15 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--voxel_volume", action="store_true", help="Count white voxels in the final binary output after restoration to native input geometry and save the value to the summary text file")
     p.add_argument("--enable_3d_void_fill", action="store_true",
                    help="Apply one final 3D enclosed-void fill after the global union. Disabled by default")
-    p.add_argument("--gaussian_smoothing", nargs="?", const=3.0, default=3.0, type=float, metavar="SIGMA",
-                   help="Final 3D Gaussian smoothing sigma in voxel units. v12 default is 3.0; set to 0 to disable")
-    p.add_argument("--gaussian_smoothing_passes", default=1, type=int,
-                   help="Number of Gaussian smoothing passes. v12 smoothing is active by default with --gaussian_smoothing 3.0; set --gaussian_smoothing 0 to disable")
+    p.add_argument("--gaussian_smoothing", nargs="?", const=3.0, default=None, type=float, metavar="SIGMA",
+                   help="Final 3D Gaussian smoothing sigma in voxel units. Unset uses default 3.0 when smoothing is activated by either Gaussian flag; explicitly set 0 to disable")
+    p.add_argument("--gaussian_smoothing_passes", default=None, type=int,
+                   help="Number of Gaussian smoothing passes. Unset uses default 1 when smoothing is activated by either Gaussian flag; explicitly set 0 to disable")
 
     p.add_argument("--troubleshooting", action="store_true",
-                   help="Keep temporary files and save outputs before each interpolation pass")
-    p.add_argument("--validate_retina", action="store_true",
-                   help="Debugging regression: compare this pipeline's CPU retina reconstruction against Ultralytics native retina masks on a small number of generated frames")
-    p.add_argument("--validate_retina_frames", default=8, type=int,
-                   help="Number of in-memory prediction-volume slices to use for --validate_retina")
+                   help="Save FFV1 MKV troubleshooting overlays for each active full-frame view and consolidated tiled prediction set")
+    p.add_argument("--validate_retina", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--validate_retina_frames", default=8, type=int, help=argparse.SUPPRESS)
 
     p.add_argument("--interpolate", default=15, type=int,
                    help="Maximum view-native slice/frame distance used to search for interpolation candidates. Radial interpolation wraps around frame order. 0 disables interpolation")
@@ -375,7 +374,7 @@ def _cpu_count() -> int:
 def default_worker_budget() -> int:
     """Intentional CPU oversubscription for mixed GPU/IO/CPU workloads.
 
-    The v12.0.0 SLURM target has enough CPU headroom that running roughly 2x the visible CPU count
+    The v12.1.0 SLURM target has enough CPU headroom that running roughly 2x the visible CPU count
     helps keep in-memory view-volume construction, interpolation planning, and output writers busy while the GPU
     is inferencing or waiting on a different stage.
     """
@@ -937,7 +936,7 @@ def compute_cube_resize_shape(
 ) -> Tuple[int, int, int]:
     """Return the minimal processing shape whose dimensions are within tolerance of the longest axis.
 
-    v12.0.0 requires the orthogonal working volume to be approximately cubic.  The implementation
+    v12.1.0 requires the orthogonal working volume to be approximately cubic.  The implementation
     preserves any axis that is already within the tolerated band and upsamples shorter axes only
     enough to reach ``(1 - tolerance) * longest``.  This avoids unnecessary XY resampling for the
     common 3072x3072x1930 case while still satisfying the 5% cube constraint.
@@ -1036,7 +1035,7 @@ def resize_volume_t_axis_only_gray8_slab(
         shape=(out_t_i, in_h, in_w),
         dtype=np.uint8,
         path=out_path,
-        desc='v12.0.0 cubic processing volume (parallel T-axis slab resize)',
+        desc='v12.1.0 cubic processing volume (parallel T-axis slab resize)',
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
     )
@@ -1079,7 +1078,7 @@ def resize_volume_t_axis_only_gray8_slab(
             len(ranges),
             _resize_slab,
             max_workers=worker_count,
-            desc='Resizing orthogonal volume to v12.0.0 cube (T-axis slabs)',
+            desc='Resizing orthogonal volume to v12.1.0 cube (T-axis slabs)',
             show_progress=True,
             chunk_size=1,
         )
@@ -1103,7 +1102,7 @@ def resize_volume_to_processing_cube_gray8(
     prefer_memory: bool = True,
     reserve_bytes: int = 32 * GIB,
 ) -> np.ndarray:
-    """Resample a gray8 (t,Y,X) volume to the v12.0.0 approximately-cubic processing shape."""
+    """Resample a gray8 (t,Y,X) volume to the v12.1.0 approximately-cubic processing shape."""
     in_t, in_h, in_w = (int(volume_gray.shape[0]), int(volume_gray.shape[1]), int(volume_gray.shape[2]))
     out_t, out_h, out_w = (int(out_shape[0]), int(out_shape[1]), int(out_shape[2]))
     if (in_t, in_h, in_w) == (out_t, out_h, out_w):
@@ -1123,7 +1122,7 @@ def resize_volume_to_processing_cube_gray8(
         shape=(out_t, out_h, out_w),
         dtype=np.uint8,
         path=out_path,
-        desc='v12.0.0 cubic processing volume',
+        desc='v12.1.0 cubic processing volume',
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
     )
@@ -1155,7 +1154,7 @@ def resize_volume_to_processing_cube_gray8(
         int(out_t),
         _render_target_slice,
         max_workers=worker_count,
-        desc='Resizing orthogonal volume to v12.0.0 cube',
+        desc='Resizing orthogonal volume to v12.1.0 cube',
         chunk_size=chunk_size,
     )
     flush_array(out_mm)
@@ -1233,7 +1232,7 @@ def resolve_radial_azimuth_angle(
     enable_radial: bool,
     diameter: int,
 ) -> float:
-    """Resolve v12.0.0 radial activation and default full-coverage angle."""
+    """Resolve v12.1.0 radial activation and default full-coverage angle."""
     if requested_angle is not None:
         if float(requested_angle) <= 0.0:
             return 0.0
@@ -1434,6 +1433,7 @@ class AffineSpec:
 class AugJob:
     aug_id: str
     angle_deg: float
+    # DEAD_CODE_MARKER(v12.1.0-review): legacy prediction-video path fields retained for old metadata layouts; live scheduling uses in-memory PredictionVolumeRef arrays.
     canvas_video_path: Path
     video_path: Path
     meta_path: Path
@@ -1548,7 +1548,6 @@ def build_affine(
 # --------------------------
 
 TILTED_VIEW_FAMILY = 'tilted'
-LEGACY_TILTED_TRANSVERSE_FAMILY = 'tilted_transverse'
 
 
 @dataclass(frozen=True)
@@ -1580,17 +1579,13 @@ class ViewInfo:
 
 
 def is_tilted_view(view: ViewInfo) -> bool:
-    """Return True for v12 generalized Tilted Views and legacy Tilted Transverse records."""
-    return str(view.family) in (TILTED_VIEW_FAMILY, LEGACY_TILTED_TRANSVERSE_FAMILY)
+    """Return True for v12.1.0 generalized Tilted Views."""
+    return str(view.family) == TILTED_VIEW_FAMILY
 
 
 def tilted_base_view_name(view: ViewInfo) -> str:
     if str(view.tilt_base_view):
         return str(view.tilt_base_view)
-    # DEAD_CODE_MARKER(v11): legacy v10 Tilted Transverse ViewInfo entries did not carry
-    # tilt_base_view. Keep this fallback until old temp metadata is no longer supported.
-    if str(view.family) == LEGACY_TILTED_TRANSVERSE_FAMILY:
-        return 'transverse'
     return str(view.name)
 
 
@@ -1702,7 +1697,7 @@ def get_view_infos(
     enable_sagittal: bool = False,
     enable_coronal: bool = False,
 ) -> List[ViewInfo]:
-    # Backward-compatible alias for older command lines; v12.0.0 controls Sagittal and
+    # Backward-compatible alias for older command lines; v12.1.0 controls Sagittal and
     # Coronal independently via --enable_sagittal and --enable_coronal.
     if disable_multiplanar is not None:
         enable_sagittal = bool(enable_sagittal or (not bool(disable_multiplanar)))
@@ -2057,44 +2052,6 @@ def iter_aug_jobs_round_robin(
             break
 
 
-# DEAD_CODE_MARKER(v12-review): legacy FFV1 render-worker splitter; live v12 scheduling uses bounded in-memory prediction-volume builders.
-def split_video_render_workers(total_workers: int, total_fullframe_tasks: int, total_tile_tasks: int) -> Tuple[int, int]:
-    """Reserve render capacity for full-frame jobs so later parents do not queue behind tiles.
-
-    Returns ``(fullframe_workers, tile_workers)``. Tile rendering gets a smaller share because the
-    GPU scheduler already prefers ready full-frame videos over ready tile videos, and keeping parent
-    rendering moving prevents the GPU from stalling while it waits for later views to appear.
-    """
-    total_workers = max(1, int(total_workers))
-    total_fullframe_tasks = max(0, int(total_fullframe_tasks))
-    total_tile_tasks = max(0, int(total_tile_tasks))
-
-    if total_tile_tasks <= 0:
-        return max(1, min(total_workers, max(1, total_fullframe_tasks))), 0
-
-    if total_workers <= 1:
-        return 1, 0
-
-    tile_workers = min(total_tile_tasks, max(1, total_workers // 3))
-    fullframe_workers = max(1, total_workers - tile_workers)
-
-    if total_fullframe_tasks > 0:
-        fullframe_workers = min(fullframe_workers, total_fullframe_tasks)
-    else:
-        fullframe_workers = 0
-
-    tile_workers = total_workers - fullframe_workers
-    if tile_workers <= 0 and total_tile_tasks > 0:
-        tile_workers = 1
-        fullframe_workers = max(1, total_workers - tile_workers)
-
-    if total_fullframe_tasks > 0 and fullframe_workers <= 0:
-        fullframe_workers = 1
-        tile_workers = max(0, total_workers - fullframe_workers)
-
-    return int(fullframe_workers), int(min(tile_workers, total_tile_tasks))
-
-
 @dataclass(frozen=True)
 class TileConfig:
     tile_size: int
@@ -2155,6 +2112,7 @@ class DenseTileJob:
     tile_size: int
     tile_stride: int
     out_size: int
+    # DEAD_CODE_MARKER(v12.1.0-review): legacy dense-tile video path retained for old metadata layouts; live scheduling uses in-memory tile volumes.
     video_path: Path
     meta_path: Path
     M_out_to_src: np.ndarray
@@ -2642,117 +2600,6 @@ def render_tilted_native_mask_frame(mask_u8: np.ndarray, view: ViewInfo, frame_i
     return render_tilted_mask_canvas_frame(mask_u8, view, int(frame_idx), aff)
 
 
-# DEAD_CODE_MARKER(v12-review): legacy pre-YOLO canvas-video renderer; live v12 path materializes prediction slice arrays directly.
-def render_canvas_frame_for_job(
-    volume_rgb: np.ndarray,
-    view: ViewInfo,
-    job: AugJob,
-    frame_idx: int,
-    view_frames: Optional[np.ndarray] = None,
-) -> np.ndarray:
-    if is_tilted_view(view):
-        return render_tilted_canvas_frame(
-            volume_rgb=volume_rgb,
-            view=view,
-            frame_idx=int(frame_idx),
-            aff=job.aff,
-        )
-
-    native_frame = np.ascontiguousarray(get_view_frame_by_index(volume_rgb, view, int(frame_idx), view_frames=view_frames))
-    return cv2.warpAffine(
-        native_frame,
-        job.aff.M_src_to_canvas,
-        dsize=(int(job.aff.canvas_w), int(job.aff.canvas_h)),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    )
-
-
-# DEAD_CODE_MARKER(v12-review): legacy canvas MKV writer; live v12 path does not create parent/canvas prediction videos.
-def render_canvas_video_for_job(
-    volume_rgb: np.ndarray,
-    view: ViewInfo,
-    job: AugJob,
-    fps: float,
-    *,
-    view_frames: Optional[np.ndarray] = None,
-    workers: int = 1,
-    show_progress: bool = True,
-) -> None:
-    proc = ffmpeg_ffv1_gray_writer(
-        job.canvas_video_path,
-        width=int(job.aff.canvas_w),
-        height=int(job.aff.canvas_h),
-        fps=float(fps),
-    )
-    try:
-        assert proc.stdin is not None
-
-        def _render(idx: int) -> np.ndarray:
-            return render_canvas_frame_for_job(
-                volume_rgb=volume_rgb,
-                view=view,
-                job=job,
-                frame_idx=int(idx),
-                view_frames=view_frames,
-            )
-
-        pending = min(int(view.num_slices), max(2, int(workers) * 2))
-        iterable = parallel_map_in_order(_render, range(int(view.num_slices)), max_workers=max(1, int(workers)), max_pending=pending)
-        for frame in tqdm(
-            iterable,
-            total=int(view.num_slices),
-            desc=f'Rendering canvas {view.name} {job.aug_id}',
-            disable=not bool(show_progress),
-        ):
-            proc.stdin.write(np.ascontiguousarray(frame).tobytes())
-    finally:
-        close_ffmpeg_writer(proc)
-
-
-# DEAD_CODE_MARKER(v12-review): legacy tilted full-frame MKV writer; live v12 path uses materialize_fullframe_prediction_volume_for_job().
-def render_tilted_fullframe_video_for_job(
-    volume_rgb: np.ndarray,
-    view: ViewInfo,
-    job: AugJob,
-    fps: float,
-    *,
-    workers: int = 1,
-    show_progress: bool = True,
-) -> None:
-    proc = ffmpeg_ffv1_gray_writer(
-        job.video_path,
-        width=int(job.aff.out_size),
-        height=int(job.aff.out_size),
-        fps=float(fps),
-    )
-    try:
-        assert proc.stdin is not None
-
-        def _render(idx: int) -> np.ndarray:
-            return render_tilted_frame_on_grid(
-                volume_rgb=volume_rgb,
-                view=view,
-                frame_idx=int(idx),
-                M_grid_to_src=job.aff.M_out_to_src,
-                grid_h=int(job.aff.out_size),
-                grid_w=int(job.aff.out_size),
-            )
-
-        pending = min(int(view.num_slices), max(2, int(workers) * 2))
-        iterable = parallel_map_in_order(_render, range(int(view.num_slices)), max_workers=max(1, int(workers)), max_pending=pending)
-        for frame in tqdm(
-            iterable,
-            total=int(view.num_slices),
-            desc=f'Rendering full-frame {view.name} {job.aug_id}',
-            disable=not bool(show_progress),
-        ):
-            proc.stdin.write(np.ascontiguousarray(frame).tobytes())
-    finally:
-        close_ffmpeg_writer(proc)
-
-
 
 
 
@@ -2943,252 +2790,6 @@ def materialize_dense_tile_prediction_volume_for_job(
         view_name=str(view.name),
         job_id=str(tile_job.tile_id),
         kind='tile',
-    )
-
-
-# DEAD_CODE_MARKER(v12-review): legacy FFV1 prediction-video rendering begins below. The v12
-# scheduler materializes PredictionVolumeRef arrays and passes them to Ultralytics through
-# InMemoryYoloVolumeSource. These helpers are retained only for regression/debug comparisons and
-# are intentionally not used by the live pipeline.
-# DEAD_CODE_MARKER(v12-review): legacy full-frame prediction MKV writer retained for regression/debug comparisons only.
-def render_fullframe_video_for_job(
-    volume_rgb: np.ndarray,
-    view: ViewInfo,
-    job: AugJob,
-    fps: float,
-    *,
-    view_frames: Optional[np.ndarray] = None,
-    workers: int = 1,
-    show_progress: bool = True,
-) -> None:
-    if is_tilted_view(view):
-        render_tilted_fullframe_video_for_job(
-            volume_rgb=volume_rgb,
-            view=view,
-            job=job,
-            fps=float(fps),
-            workers=max(1, int(workers)),
-            show_progress=bool(show_progress),
-        )
-        return
-
-    proc = ffmpeg_ffv1_gray_writer(
-        job.video_path,
-        width=int(job.aff.out_size),
-        height=int(job.aff.out_size),
-        fps=float(fps),
-    )
-    try:
-        assert proc.stdin is not None
-
-        def _render(idx: int) -> np.ndarray:
-            return render_fullframe_frame_for_job(
-                volume_rgb=volume_rgb,
-                view=view,
-                job=job,
-                frame_idx=int(idx),
-                view_frames=view_frames,
-            )
-
-        pending = min(int(view.num_slices), max(2, int(workers) * 2))
-        iterable = parallel_map_in_order(_render, range(int(view.num_slices)), max_workers=max(1, int(workers)), max_pending=pending)
-        for frame in tqdm(
-            iterable,
-            total=int(view.num_slices),
-            desc=f'Rendering full-frame {view.name} {job.aug_id}',
-            disable=not bool(show_progress),
-        ):
-            proc.stdin.write(np.ascontiguousarray(frame).tobytes())
-    finally:
-        close_ffmpeg_writer(proc)
-
-
-
-
-# DEAD_CODE_MARKER(v12-review): legacy canvas-video ensure helper retained only with the dead FFV1 prediction-video path.
-def ensure_canvas_video_only(
-    volume_rgb: np.ndarray,
-    view: ViewInfo,
-    job: AugJob,
-    fps: float,
-    workers: int,
-    view_frames: Optional[np.ndarray] = None,
-    show_progress: bool = True,
-) -> None:
-    if not job.meta_path.exists():
-        write_aug_job_meta(job, view)
-    if job.canvas_video_path.exists():
-        return
-    job.canvas_video_path.parent.mkdir(parents=True, exist_ok=True)
-    render_canvas_video_for_job(
-        volume_rgb=volume_rgb,
-        view=view,
-        job=job,
-        fps=float(fps),
-        view_frames=view_frames,
-        workers=max(1, int(workers)),
-        show_progress=bool(show_progress),
-    )
-
-
-# DEAD_CODE_MARKER(v12-review): legacy full-frame video ensure helper retained only with the dead FFV1 prediction-video path.
-def ensure_fullframe_video_only(
-    volume_rgb: np.ndarray,
-    view: ViewInfo,
-    job: AugJob,
-    fps: float,
-    workers: int,
-    view_frames: Optional[np.ndarray] = None,
-    show_progress: bool = True,
-) -> None:
-    if not job.meta_path.exists():
-        write_aug_job_meta(job, view)
-    if job.video_path.exists():
-        return
-    job.video_path.parent.mkdir(parents=True, exist_ok=True)
-    render_fullframe_video_for_job(
-        volume_rgb=volume_rgb,
-        view=view,
-        job=job,
-        fps=float(fps),
-        view_frames=view_frames,
-        workers=max(1, int(workers)),
-        show_progress=bool(show_progress),
-    )
-
-
-# DEAD_CODE_MARKER(v12-review): legacy ffmpeg tile fan-out helper retained only with dead dense-tile MKV creation.
-def _run_ffmpeg_checked(cmd: Sequence[str], description: str) -> None:
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if proc.returncode != 0:
-        stderr = proc.stderr.decode('utf-8', errors='ignore') if isinstance(proc.stderr, (bytes, bytearray)) else str(proc.stderr)
-        stdout = proc.stdout.decode('utf-8', errors='ignore') if isinstance(proc.stdout, (bytes, bytearray)) else str(proc.stdout)
-        detail = stderr.strip() or stdout.strip()
-        raise RuntimeError(f'{description} failed: {detail}')
-
-
-# DEAD_CODE_MARKER(v12-review): legacy dense-tile MKV fan-out limiter; live v12 tile volumes are built in memory.
-def dense_tile_fanout_limit() -> int:
-    return max(1, _env_int('YOLO_TTA_TILE_FANOUT', 32))
-
-
-# DEAD_CODE_MARKER(v12-review): legacy dense-tile MKV fan-out chunker retained only with the dead video path.
-def _chunk_dense_tile_jobs(jobs: Sequence[DenseTileJob], chunk_size: int) -> Iterator[List[DenseTileJob]]:
-    step = max(1, int(chunk_size))
-    for start in range(0, len(jobs), step):
-        yield list(jobs[start:start + step])
-
-
-# DEAD_CODE_MARKER(v12-review): legacy canvas-to-tile MKV fan-out retained only for regression/debug comparisons.
-def derive_dense_tile_videos_from_canvas_batch(
-    canvas_video_path: Path,
-    jobs: Sequence[DenseTileJob],
-    fps: float,
-    canvas_w: int,
-    canvas_h: int,
-    num_frames: int,
-    *,
-    show_progress: bool = True,
-) -> None:
-    del fps
-    del num_frames
-
-    missing_jobs = [job for job in jobs if not job.video_path.exists()]
-    if not missing_jobs:
-        return
-
-    filter_threads = max(1, _env_int('YOLO_TTA_TILE_FILTER_THREADS', min(8, _cpu_count())))
-    encoder_threads = max(1, _env_int('YOLO_TTA_TILE_FFV1_THREADS', 1))
-    batch_limit = dense_tile_fanout_limit()
-
-    for batch_idx, batch_jobs in enumerate(_chunk_dense_tile_jobs(missing_jobs, batch_limit), start=1):
-        pad_w = max(int(canvas_w), max(int(job.tile_x) + int(job.tile_size) for job in batch_jobs))
-        pad_h = max(int(canvas_h), max(int(job.tile_y) + int(job.tile_size) for job in batch_jobs))
-
-        base_labels = [f'v{i}' for i in range(len(batch_jobs))]
-        filter_parts: List[str] = []
-        if len(batch_jobs) == 1:
-            ops: List[str] = []
-            if pad_w != int(canvas_w) or pad_h != int(canvas_h):
-                ops.append(f'pad={pad_w}:{pad_h}:0:0:black')
-            else:
-                ops.append('null')
-            filter_parts.append(f'[0:v]{",".join(ops)}[{base_labels[0]}]')
-        else:
-            ops = []
-            if pad_w != int(canvas_w) or pad_h != int(canvas_h):
-                ops.append(f'pad={pad_w}:{pad_h}:0:0:black')
-            ops.append(f'split={len(batch_jobs)}' + ''.join(f'[{label}]' for label in base_labels))
-            filter_parts.append(f'[0:v]{",".join(ops)}')
-
-        for out_idx, job in enumerate(batch_jobs):
-            filter_parts.append(
-                f'[{base_labels[out_idx]}]'
-                f'crop={int(job.tile_size)}:{int(job.tile_size)}:{int(job.tile_x)}:{int(job.tile_y)},'
-                f'scale={int(job.out_size)}:{int(job.out_size)}:flags=bilinear'
-                f'[t{out_idx}]'
-            )
-
-        cmd: List[str] = [
-            'ffmpeg',
-            '-y',
-            '-v', 'error',
-            '-filter_complex_threads', str(filter_threads),
-            '-i', str(canvas_video_path),
-            '-vsync', '0',
-            '-filter_complex', ';'.join(filter_parts),
-        ]
-
-        for out_idx, job in enumerate(batch_jobs):
-            job.video_path.parent.mkdir(parents=True, exist_ok=True)
-            cmd.extend([
-                '-map', f'[t{out_idx}]',
-                '-an',
-                '-c:v', 'ffv1',
-                '-level', '3',
-                '-slices', '30',
-                '-threads', str(encoder_threads),
-                '-pix_fmt', 'gray',
-                str(job.video_path),
-            ])
-
-        if show_progress:
-            print(
-                f'Deriving dense tiles from {canvas_video_path.name} '
-                f'(batch {batch_idx}, outputs={len(batch_jobs)})'
-            )
-        _run_ffmpeg_checked(cmd, f'dense tile fan-out from {canvas_video_path.name} (batch {batch_idx})')
-
-
-
-
-# DEAD_CODE_MARKER(v12-review): legacy dense-tile MKV ensure helper retained only with dead video fan-out.
-def ensure_dense_tile_video_batch_from_canvas(
-    aug_job: AugJob,
-    view: ViewInfo,
-    jobs: Sequence[DenseTileJob],
-    fps: float,
-    show_progress: bool = True,
-) -> None:
-    jobs = list(jobs)
-    if not jobs:
-        return
-
-    for job in jobs:
-        if not job.meta_path.exists():
-            write_dense_tile_job_meta(job)
-
-    if all(job.video_path.exists() for job in jobs):
-        return
-
-    derive_dense_tile_videos_from_canvas_batch(
-        canvas_video_path=aug_job.canvas_video_path,
-        jobs=jobs,
-        fps=float(fps),
-        canvas_w=int(aug_job.aff.canvas_w),
-        canvas_h=int(aug_job.aff.canvas_h),
-        num_frames=int(view.num_slices),
-        show_progress=bool(show_progress),
     )
 
 
@@ -3494,24 +3095,35 @@ class PredictConfig:
 
 
 DEFAULT_GAUSSIAN_SMOOTHING_SIGMA = 3.0
+DEFAULT_GAUSSIAN_SMOOTHING_PASSES = 1
 
 
 def resolve_gaussian_smoothing_settings(
     gaussian_smoothing_arg: Optional[float],
-    gaussian_smoothing_passes: int,
+    gaussian_smoothing_passes_arg: Optional[int],
 ) -> Tuple[bool, float, int]:
-    """Resolve Gaussian smoothing enablement from the v12.0.0 CLI contract.
+    """Resolve Gaussian smoothing enablement from the v12.1.0 CLI contract.
 
-    v12 gives ``--gaussian_smoothing`` a default sigma of 3 voxel lengths.  A
-    sigma of 0 is accepted as an explicit disable switch so users still have a
-    practical way to skip this optional postprocessing stage.
+    Gaussian smoothing is active iff at least one Gaussian flag is explicitly set
+    and neither explicitly supplied value is 0. Unset values use the defaults
+    from the specification: sigma=3.0 and passes=1.
     """
-    passes_i = int(gaussian_smoothing_passes)
-    sigma_f = float(gaussian_smoothing_arg) if gaussian_smoothing_arg is not None else float(DEFAULT_GAUSSIAN_SMOOTHING_SIGMA)
-    enabled = bool(sigma_f > 0.0 and passes_i > 0)
+    sigma_explicit = gaussian_smoothing_arg is not None
+    passes_explicit = gaussian_smoothing_passes_arg is not None
+    sigma_f = (
+        float(gaussian_smoothing_arg)
+        if sigma_explicit
+        else float(DEFAULT_GAUSSIAN_SMOOTHING_SIGMA)
+    )
+    passes_i = (
+        int(gaussian_smoothing_passes_arg)
+        if passes_explicit
+        else int(DEFAULT_GAUSSIAN_SMOOTHING_PASSES)
+    )
+    enabled = bool((sigma_explicit or passes_explicit) and sigma_f > 0.0 and passes_i > 0)
     if not enabled:
-        return False, 0.0, passes_i
-    return True, float(sigma_f), passes_i
+        return False, 0.0, max(0, int(passes_i))
+    return True, float(sigma_f), int(passes_i)
 
 
 CONF_U8_MAX = 255
@@ -4009,6 +3621,7 @@ def _result_to_prediction_union_u8(result: object, out_size: int) -> np.ndarray:
     return out
 
 
+# DEAD_CODE_MARKER(v12.1.0-review): retina validation is deprecated; retained only for old regression notebooks and not reachable from the CLI.
 def _collect_retina_validation_unions(
     model: object,
     source: object,
@@ -4052,6 +3665,7 @@ def _collect_retina_validation_unions(
             os.environ['YOLO_TTA_CPU_RETINA_MASKS'] = old_env
 
 
+# DEAD_CODE_MARKER(v12.1.0-review): retina validation is deprecated; retained only for old regression notebooks and not reachable from the CLI.
 def validate_cpu_retina_against_ultralytics(
     model: object,
     source_factory: Callable[[], object],
@@ -4111,80 +3725,6 @@ def validate_cpu_retina_against_ultralytics(
     return stats
 
 
-
-
-# DEAD_CODE_MARKER(v12-review): retained legacy escape hatch. The v12 scheduler intentionally passes
-# tilted_view=None to prediction accumulation so Tilted masks remain in view-native volume space
-# through cleanup/interpolation and are backprojected only once during final assembly.
-def _scatter_tilted_native_xy_to_volume(
-    frame_idx: int,
-    native_union: np.ndarray,
-    native_conf: Optional[np.ndarray],
-    tilted_view: ViewInfo,
-    view_union_mm: np.ndarray,
-    view_confmap_mm: np.ndarray,
-) -> None:
-    """Legacy immediate Tilted View backprojection for callers that still request it.
-
-    This is not used by the v12 pipeline.  If invoked, it maps one base-view raster
-    frame into an orthogonal (t,Y,X) destination using the generalized Tilted View
-    stacking-axis shear.
-    """
-    if not is_tilted_view(tilted_view):
-        raise ValueError('Tilted inverse projection requested for a non-tilted view')
-
-    mask_bool = np.asarray(native_union, dtype=bool)
-    if not np.any(mask_bool):
-        return
-
-    vv, uu = np.nonzero(mask_bool)
-    if vv.size <= 0:
-        return
-
-    tan_alpha = float(math.tan(math.radians(float(tilted_view.tilt_angle_deg))))
-    frame_center = float(tilted_frame_center(tilted_view, int(frame_idx)))
-    if str(tilted_view.tilt_direction) == 'vertical':
-        axis_center = float((int(tilted_view.src_h) - 1) / 2.0)
-        stack_float = frame_center + tan_alpha * (vv.astype(np.float32, copy=False) - axis_center)
-    elif str(tilted_view.tilt_direction) == 'horizontal':
-        axis_center = float((int(tilted_view.src_w) - 1) / 2.0)
-        stack_float = frame_center + tan_alpha * (uu.astype(np.float32, copy=False) - axis_center)
-    else:  # pragma: no cover
-        raise ValueError(f'Unsupported tilt direction: {tilted_view.tilt_direction}')
-
-    ss = np.rint(stack_float).astype(np.int32, copy=False)
-    valid = (ss >= 0) & (ss < int(tilted_stack_axis_length(tilted_view)))
-    if not np.any(valid):
-        return
-
-    ss_v = ss[valid]
-    vv_v = vv[valid]
-    uu_v = uu[valid]
-    base_view = tilted_base_view_name(tilted_view)
-    if base_view == 'transverse':
-        coords = (ss_v, vv_v, uu_v)
-    elif base_view == 'sagittal':
-        coords = (vv_v, ss_v, uu_v)
-    elif base_view == 'coronal':
-        coords = (vv_v, uu_v, ss_v)
-    else:  # pragma: no cover
-        raise ValueError(f'Unsupported Tilted View base: {base_view}')
-    view_union_mm[coords] = np.uint8(1)
-
-    if native_conf is None:
-        return
-
-    native_conf_u8 = np.asarray(native_conf, dtype=np.uint8)
-    conf_vals = native_conf_u8[vv_v, uu_v]
-    has_conf = conf_vals > 0
-    if np.any(has_conf):
-        np.maximum.at(
-            view_confmap_mm,
-            tuple(c[has_conf] for c in coords),
-            conf_vals[has_conf],
-        )
-
-
 def _process_cpu_retina_prediction_frame(
     idx: int,
     payload: CpuRetinaMaskPayload,
@@ -4194,7 +3734,6 @@ def _process_cpu_retina_prediction_frame(
     M_out_to_native: np.ndarray,
     native_h: int,
     native_w: int,
-    tilted_view: Optional[ViewInfo] = None,
 ) -> Tuple[int, int]:
     """CPU equivalent of retina_masks=True accumulation without allocating GPU HxW masks."""
     frame_union, frame_confmap, kept_instances = _accumulate_cpu_retina_payload_to_prediction_frame(
@@ -4224,22 +3763,12 @@ def _process_cpu_retina_prediction_frame(
             borderValue=0,
         ).astype(np.uint8, copy=False)
 
-    if tilted_view is not None:
-        _scatter_tilted_native_xy_to_volume(
-            frame_idx=int(idx),
-            native_union=native_union,
-            native_conf=native_conf,
-            tilted_view=tilted_view,
-            view_union_mm=view_union_mm,
-            view_confmap_mm=view_confmap_mm,
-        )
-    else:
-        if np.any(native_union):
-            view_union_mm[int(idx), :, :] |= native_union.astype(np.uint8, copy=False)
+    if np.any(native_union):
+        view_union_mm[int(idx), :, :] |= native_union.astype(np.uint8, copy=False)
 
-        if native_conf is not None and np.any(native_conf):
-            conf_slice = view_confmap_mm[int(idx)]
-            np.maximum(conf_slice, native_conf, out=conf_slice)
+    if native_conf is not None and np.any(native_conf):
+        conf_slice = view_confmap_mm[int(idx)]
+        np.maximum(conf_slice, native_conf, out=conf_slice)
 
     return int(kept_instances), 1
 
@@ -4254,7 +3783,6 @@ def _process_prediction_frame(
     M_out_to_native: np.ndarray,
     native_h: int,
     native_w: int,
-    tilted_view: Optional[ViewInfo] = None,
 ) -> Tuple[int, int]:
     """Collapse one streamed result directly into unpacked native-view union + confidence volumes."""
     if isinstance(masks_np, CpuRetinaMaskPayload):
@@ -4267,7 +3795,6 @@ def _process_prediction_frame(
             M_out_to_native=M_out_to_native,
             native_h=native_h,
             native_w=native_w,
-            tilted_view=tilted_view,
         )
 
     if masks_np is None or confs_np is None:
@@ -4317,22 +3844,12 @@ def _process_prediction_frame(
             borderValue=0,
         ).astype(np.uint8, copy=False)
 
-    if tilted_view is not None:
-        _scatter_tilted_native_xy_to_volume(
-            frame_idx=int(idx),
-            native_union=native_union,
-            native_conf=native_conf,
-            tilted_view=tilted_view,
-            view_union_mm=view_union_mm,
-            view_confmap_mm=view_confmap_mm,
-        )
-    else:
-        if np.any(native_union):
-            view_union_mm[idx, :, :] |= native_union.astype(np.uint8, copy=False)
+    if np.any(native_union):
+        view_union_mm[idx, :, :] |= native_union.astype(np.uint8, copy=False)
 
-        if native_conf is not None and np.any(native_conf):
-            conf_slice = view_confmap_mm[idx]
-            np.maximum(conf_slice, native_conf, out=conf_slice)
+    if native_conf is not None and np.any(native_conf):
+        conf_slice = view_confmap_mm[idx]
+        np.maximum(conf_slice, native_conf, out=conf_slice)
 
     return int(num_inst), 1
 
@@ -4350,7 +3867,6 @@ def predict_source_and_accumulate(
     native_h: int,
     native_w: int,
     postprocess_workers: int = 1,
-    tilted_view: Optional[ViewInfo] = None,
 ) -> Dict[str, int]:
     """Run YOLO predict(stream=True) on an in-memory source and accumulate native masks.
 
@@ -4383,10 +3899,7 @@ def predict_source_and_accumulate(
         verbose=False,
     )
 
-    if tilted_view is not None:
-        worker_count = 1
-    else:
-        worker_count = max(1, min(int(postprocess_workers), int(num_frames)))
+    worker_count = max(1, min(int(postprocess_workers), int(num_frames)))
     pending_limit = cpu_mask_postprocess_pending_limit(worker_count, int(num_frames))
 
     if worker_count <= 1:
@@ -4404,7 +3917,6 @@ def predict_source_and_accumulate(
                 M_out_to_native=M_out_to_native,
                 native_h=native_h,
                 native_w=native_w,
-                tilted_view=tilted_view,
             )
             prediction_count += int(pred_inc)
             frames_with_predictions += int(frame_inc)
@@ -4427,7 +3939,6 @@ def predict_source_and_accumulate(
                     M_out_to_native,
                     native_h,
                     native_w,
-                    tilted_view,
                 ))
                 if len(pending) >= pending_limit:
                     fut = pending.pop(0)
@@ -4463,7 +3974,6 @@ def predict_in_memory_volume_and_accumulate(
     native_h: int,
     native_w: int,
     postprocess_workers: int = 1,
-    tilted_view: Optional[ViewInfo] = None,
 ) -> Dict[str, int]:
     source = make_in_memory_yolo_source(prediction_volume.array, prediction_volume.name, max_frames=int(num_frames))
     return predict_source_and_accumulate(
@@ -4479,42 +3989,6 @@ def predict_in_memory_volume_and_accumulate(
         native_h=int(native_h),
         native_w=int(native_w),
         postprocess_workers=int(postprocess_workers),
-        tilted_view=tilted_view,
-    )
-
-
-# DEAD_CODE_MARKER(v12-review): legacy video-source predictor retained for regression only.
-# The live scheduler calls predict_in_memory_volume_and_accumulate() with PredictionVolumeRef arrays.
-def predict_video_and_accumulate(
-    model,
-    video_path: Path,
-    num_frames: int,
-    out_size: int,
-    pred_out_prefix: Path,
-    cfg: PredictConfig,
-    view_union_mm: np.ndarray,
-    view_confmap_mm: np.ndarray,
-    M_out_to_native: np.ndarray,
-    native_h: int,
-    native_w: int,
-    postprocess_workers: int = 1,
-    tilted_view: Optional[ViewInfo] = None,
-) -> Dict[str, int]:
-    del pred_out_prefix
-    return predict_source_and_accumulate(
-        model,
-        str(video_path),
-        source_label=str(video_path),
-        num_frames=int(num_frames),
-        out_size=int(out_size),
-        cfg=cfg,
-        view_union_mm=view_union_mm,
-        view_confmap_mm=view_confmap_mm,
-        M_out_to_native=M_out_to_native,
-        native_h=int(native_h),
-        native_w=int(native_w),
-        postprocess_workers=int(postprocess_workers),
-        tilted_view=tilted_view,
     )
 
 
@@ -5013,7 +4487,7 @@ def fill_3d_voids_inplace_streaming(
 ) -> None:
     """Fill enclosed 3D voids by labeling background connected components once.
 
-    v12.0.0 allows 3D void fill only as an optional final global-union step. This
+    v12.1.0 allows 3D void fill only as an optional final global-union step. This
     function performs that operation by labeling the background volume, marking any
     background component connected to the volume boundary, and converting all other
     background components to foreground. The default 6-connected background matches
@@ -5330,7 +4804,7 @@ def build_slice_endpoint_seeds_from_label_volume(
                 if anchor is None:
                     continue
 
-                # v12.0.0 endpoint continuation is defined by direct footprint overlap in
+                # v12.1.0 endpoint continuation is defined by direct footprint overlap in
                 # the adjacent slice; do not dilate/skeletonize the component for endpoint discovery.
                 has_prev = bool(prev_same is not None and np.any(comp & prev_same))
                 has_next = bool(next_same is not None and np.any(comp & next_same))
@@ -5452,7 +4926,7 @@ _DENSE_RADIAL_BACKPROJECT_MAP_CACHE: Dict[Tuple[int, int, int, Tuple[Tuple[float
 
 
 def radial_full_coverage_angle_deg(diameter: int) -> float:
-    """Return the v12.0.0 radial spacing that gives approximately 1x ROI edge coverage."""
+    """Return the v12.1.0 radial spacing that gives approximately 1x ROI edge coverage."""
     diameter_i = max(1, int(diameter))
     return float(360.0 / (math.pi * float(diameter_i)))
 
@@ -5486,7 +4960,7 @@ def _nearest_radial_source_for_backprojection(
 def build_radial_backprojection_plan(radial_view: ViewInfo) -> Tuple[List[RadialBackprojectionSample], Dict[str, float]]:
     """Build the angular plan used to backproject a radial view into Cartesian space.
 
-    If the user-requested radial spacing is coarser than the v12.0.0 full-coverage spacing,
+    If the user-requested radial spacing is coarser than the v12.1.0 full-coverage spacing,
     backprojection is densified to the full-coverage spacing and each dense angle samples the
     nearest completed radial prediction frame. This keeps Radial masks view-native through
     postprocessing/interpolation while preventing sparse spoke-like Cartesian backprojections.
@@ -5546,7 +5020,7 @@ def build_dense_radial_backprojection_map(
 ) -> DenseRadialBackprojectionMap:
     """Map every Cartesian ROI pixel to its nearest dense radial source frame and radial coordinate.
 
-    This is the dense v12.0.0 backprojection path: instead of painting only the pixels that lie on
+    This is the dense v12.1.0 backprojection path: instead of painting only the pixels that lie on
     a set of spokes, every pixel inside the circular ROI receives a sample from the Radial video's
     own frame/raster coordinate system.  When the user-provided azimuth spacing is too coarse, the
     supplied ``plan`` is already densified to the full-coverage angular spacing; pixels then select
@@ -5901,11 +5375,11 @@ def assemble_current_view_union_volume(
     """Build the single-model final view union.
 
     The mapping is kept keyed by model name because earlier pipeline stages store temporary
-    workspaces under the model stem. v12.0.0 rejects multiple model entries and never
+    workspaces under the model stem. v12.1.0 rejects multiple model entries and never
     combines outputs from more than one model.
     """
     if len(view_volumes_by_model) != 1:
-        raise ValueError('v12.0.0_SLURM supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('v12.1.0_SLURM supports exactly one --model; multiple-model inference has been removed')
 
     model_name = next(iter(view_volumes_by_model.keys()))
     final_union_mm = allocate_workspace_array(
@@ -6925,7 +6399,7 @@ def _build_slice_endpoint_seeds(
     workers: int = 1,
     wrap_axis: bool = False,
 ) -> Tuple[List[SliceEndpointSeed], int]:
-    """Build interpolation endpoint seeds with the v12.0.0 per-slice component scan.
+    """Build interpolation endpoint seeds with the v12.1.0 per-slice component scan.
 
     Interpolation no longer uses skeletonization. Each labeled 3D object is scanned slice by
     slice; every 2D connected component is evaluated independently for overlap continuation
@@ -7485,7 +6959,7 @@ def _compressed_index_segment_extent(
 def _require_lz4_frame() -> object:
     if _lz4_frame is None:
         raise RuntimeError(
-            'The v12.0.0 compressed bitpacked mask stores require lz4. '
+            'The v12.1.0 compressed bitpacked mask stores require lz4. '
             'Install it with: pip install lz4'
         )
     return _lz4_frame
@@ -7505,7 +6979,7 @@ class CompressedTileSlicePayload:
 
 
 class CompressedTileMaskStore:
-    """Read adapter for v12.0.0 compressed bitpacked binary mask volumes.
+    """Read adapter for v12.1.0 compressed bitpacked binary mask volumes.
 
     The same per-slice container is used for waiting tile masks (``ctile-mask-v1``) and
     for larger binary scratch artifacts such as NRRD support/layer archives
@@ -7684,7 +7158,7 @@ def _write_compressed_bitpacked_payload_store(
     in the index, nonempty slices are cropped to their foreground bbox, bit-packed,
     and compressed with LZ4 level 0 for high throughput.
 
-    v12.0.0 also accumulates the Slicer SegmentN_Extent for the stored layer while
+    v12.1.0 also accumulates the Slicer SegmentN_Extent for the stored layer while
     the slice payloads are written.  Final NRRD assembly can then reuse the stored
     extent metadata without a separate full-layer extent scan.
     """
@@ -7991,7 +7465,7 @@ class VolumeSnapshotRef:
 
 @dataclass(frozen=True)
 class NrrdLayerRef:
-    """One orthogonal-space layer for the decomposed v12.0.0 NRRD export.
+    """One orthogonal-space layer for the decomposed v12.1.0 NRRD export.
 
     The layer is a binary mask in the pipeline's orthogonal ``(t, Y, X)``
     processing geometry. The backing path may be a raw uint8 memmap or a
@@ -8044,6 +7518,7 @@ def _view_uses_interpolation(view: ViewInfo, interpolate: int) -> bool:
     return bool((view.family in ('orthogonal', 'radial') or is_tilted_view(view)) and int(interpolate) > 0)
 
 
+# DEAD_CODE_MARKER(v12.1.0-review): legacy interpolation-pass troubleshooting snapshots; --troubleshooting now writes only view/tile overlay MKVs.
 def _snapshot_volume_for_troubleshooting(
     volume: np.ndarray,
     *,
@@ -8588,7 +8063,7 @@ def prepare_view_volume_after_fullframe(
         view_name=str(view.name),
         source='fullframe',
         pass_index=0,
-        enabled=bool(keep_temp) and int(interpolate) > 0,
+        enabled=False,  # v12.1.0 legacy troubleshooting pass snapshots are deprecated
         workers=int(slice_workers),
     )
     if snap0 is not None:
@@ -8680,7 +8155,7 @@ def prepare_view_volume_after_fullframe(
                 view_name=str(view.name),
                 source='fullframe',
                 pass_index=int(pass_idx),
-                enabled=bool(keep_temp) and int(interpolate) > 0,
+                enabled=False,  # v12.1.0 legacy troubleshooting pass snapshots are deprecated
                 workers=int(slice_workers),
             )
             if snap is not None:
@@ -8969,7 +8444,7 @@ def ensure_tile_mask_volume_matches_parent_shape(
     """Return a tile mask volume whose shape exactly matches its parent view canvas.
 
     Prediction-time tile masks should already be inverse-mapped into parent view-native
-    coordinates by ``DenseTileJob.M_out_to_src``.  This guard makes the v12.0.0 tile
+    coordinates by ``DenseTileJob.M_out_to_src``.  This guard makes the v12.1.0 tile
     waiting-store rule explicit: before a tile can be bit-packed/compressed, its volume
     shape must be ``(parent_frames, parent_height, parent_width)``.  If a future code path
     produces a different raster size, the binary slices are nearest-neighbor resized to
@@ -9092,7 +8567,7 @@ def spill_waiting_tile_result_to_compressed_store(
     keep_original: bool = False,
     expected_parent_shape: Optional[Tuple[int, int, int]] = None,
 ) -> DeferredTilePostprocessResult:
-    """Encode a postprocessed waiting tile into the v12.0.0 compressed ctile store.
+    """Encode a postprocessed waiting tile into the v12.1.0 compressed ctile store.
 
     The waiting store is deliberately not a pipeline output format.  It is optimized for the
     exact write-once/read-once lifecycle of tile masks whose confidence maps have already been
@@ -9273,7 +8748,7 @@ def stage_tile_result_into_config_canvas(
 ) -> Dict[str, int]:
     """Union one cleaned tile into its tile-size/stride canvas before parent gating.
 
-    This implements the v12.0.0 tile-set staging rule: all positions and angle variants for the
+    This implements the v12.1.0 tile-set staging rule: all positions and angle variants for the
     same --tile_size/--tile_stride configuration are first reassembled into one parent-view canvas.
     The consolidated canvas is gated later at the connected-component level after every tile in
     that configuration has either staged or completed empty.
@@ -9555,7 +9030,7 @@ def finalize_consolidated_tile_volume_for_parent(
         view_name=str(view.name),
         source='tile',
         pass_index=0,
-        enabled=bool(keep_temp) and int(interpolate) > 0,
+        enabled=False,  # v12.1.0 legacy troubleshooting pass snapshots are deprecated
         workers=int(slice_workers),
     )
     if snap0 is not None:
@@ -9647,7 +9122,7 @@ def finalize_consolidated_tile_volume_for_parent(
                 view_name=str(view.name),
                 source='tile',
                 pass_index=int(pass_idx),
-                enabled=bool(keep_temp) and int(interpolate) > 0,
+                enabled=False,  # v12.1.0 legacy troubleshooting pass snapshots are deprecated
                 workers=int(slice_workers),
             )
             if snap is not None:
@@ -9693,7 +9168,7 @@ def apply_gaussian_smoothing_inplace(
 ) -> Dict[str, int | float]:
     """Smooth the final binary 3D volume with a Gaussian kernel and re-threshold at 0.5.
 
-    The v12.0.0_SLURM smoothing stage is applied after the final view/tile union and optional
+    The v12.1.0_SLURM smoothing stage is applied after the final view/tile union and optional
     3D void fill, but before --keep_objects and before resizing back to the source geometry.
     A single float32 workspace is reused for every pass to avoid retaining multiple dense
     floating-point copies of the volume.
@@ -10134,7 +9609,7 @@ def nrrd_gzip_compresslevel() -> int:
 
 
 def nrrd_stream_buffer_bytes() -> int:
-    mib = max(1, _env_int('YOLO_TTA_NRRD_STREAM_BUFFER_MIB', 64))
+    mib = max(1, _env_int('YOLO_TTA_NRRD_STREAM_BUFFER_MIB', 4096))
     return int(mib) * 1024 * 1024
 
 
@@ -10243,7 +9718,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.5-Pro_v12.0.0_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.5-Pro_v12.1.0_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -10757,7 +10232,7 @@ def _write_decomposed_nrrd_payload_stream(
 ) -> None:
     """Stream decomposed ``(layer,X,Y,t)`` gzip payload in NRRD Fortran axis order.
 
-    This is the core RAM-reduction change for v12.0.0 updates.  The old implementation built a
+    This is the core RAM-reduction change for v12.1.0 updates.  The old implementation built a
     full ``(layer,X,Y,t)`` memmap and then handed it to pynrrd; OS page cache plus writer-side
     traversal could push peak resident memory past the SLURM allocation.  This path keeps only a
     bounded ``(layer,X,row_chunk)`` buffer plus one source row block/slice at a time.
@@ -11100,6 +10575,113 @@ def write_overlay_video_for_view(
         close_ffmpeg_writer(proc)
 
 
+def write_native_view_overlay_video(
+    volume_rgb: np.ndarray,
+    native_mask_u8: np.ndarray,
+    view: ViewInfo,
+    out_path: Path,
+    fps: float,
+    *,
+    show_progress: bool = True,
+) -> Path:
+    """Write a v12.1.0 troubleshooting overlay in a view's own slice space.
+
+    The mask is already flattened in the native raster consumed by/produced for
+    the view: shape (view.num_slices, view.src_h, view.src_w). Source frames are
+    resliced from the single-channel orthogonal processing volume only for the
+    presentation overlay.
+    """
+    if tuple(int(x) for x in np.asarray(native_mask_u8).shape) != (int(view.num_slices), int(view.src_h), int(view.src_w)):
+        raise ValueError(
+            f'Troubleshooting overlay for {view.name} expected native mask shape '
+            f'{(int(view.num_slices), int(view.src_h), int(view.src_w))}, got {tuple(np.asarray(native_mask_u8).shape)}'
+        )
+
+    proc = ffmpeg_ffv1_rgb_writer(
+        out_path,
+        width=int(view.src_w),
+        height=int(view.src_h),
+        fps=float(fps),
+    )
+    blue = np.array([0, 0, 255], dtype=np.uint8)
+    try:
+        assert proc.stdin is not None
+        for idx in tqdm(
+            range(int(view.num_slices)),
+            total=int(view.num_slices),
+            desc=f'Writing troubleshooting overlay {view.name} ({out_path.name})',
+            disable=not bool(show_progress),
+        ):
+            frame_gray = get_view_frame_by_index(volume_rgb, view, int(idx))
+            frame = _gray_to_rgb_frame(np.asarray(frame_gray))
+            m = np.asarray(native_mask_u8[int(idx)], dtype=bool)
+            if np.any(m):
+                frame[m] = ((frame[m].astype(np.uint16) + blue.astype(np.uint16)) // 2).astype(np.uint8)
+            proc.stdin.write(np.ascontiguousarray(frame).tobytes())
+    finally:
+        close_ffmpeg_writer(proc)
+    return out_path
+
+
+def collect_troubleshooting_overlay_futures(
+    executor: ThreadPoolExecutor,
+    *,
+    volume_rgb: np.ndarray,
+    model_name: str,
+    views: Sequence[ViewInfo],
+    native_view_support: Dict[str, np.ndarray],
+    consolidated_tile_masks: Dict[str, np.ndarray],
+    out_dir: Path,
+    stem: str,
+    fps: float,
+    show_progress: bool = False,
+) -> Tuple[Dict[str, Path], List[Future]]:
+    """Schedule simplified v12.1.0 troubleshooting overlay MKVs."""
+    result_paths: Dict[str, Path] = {}
+    futures: List[Future] = []
+    troubleshooting_dir = Path(out_dir) / 'troubleshooting'
+    troubleshooting_dir.mkdir(parents=True, exist_ok=True)
+
+    for view in views:
+        view_token = view_output_token(view)
+        full_mask = native_view_support.get(str(view.name))
+        if full_mask is not None:
+            overlay_path = troubleshooting_dir / f'{stem}_Troubleshooting_{view_token}_FullFrame_Overlay.mkv'
+            futures.append(executor.submit(
+                write_native_view_overlay_video,
+                volume_rgb,
+                full_mask,
+                view,
+                overlay_path,
+                fps,
+                show_progress=show_progress,
+            ))
+            result_paths[f'troubleshooting_{view.name}_fullframe_overlay'] = overlay_path
+
+        tile_mask = consolidated_tile_masks.get(str(view.name))
+        if tile_mask is not None:
+            overlay_path = troubleshooting_dir / f'{stem}_Troubleshooting_{view_token}_Tiles_Overlay.mkv'
+            futures.append(executor.submit(
+                write_native_view_overlay_video,
+                volume_rgb,
+                tile_mask,
+                view,
+                overlay_path,
+                fps,
+                show_progress=show_progress,
+            ))
+            result_paths[f'troubleshooting_{view.name}_tiles_overlay'] = overlay_path
+
+    if not futures:
+        note_path = troubleshooting_dir / f'{stem}_Troubleshooting_NoActiveMasks.txt'
+        note_path.write_text(
+            f'No full-frame or consolidated tiled native-view masks were available for model {model_name}.\n'
+        )
+        result_paths['troubleshooting_note'] = note_path
+
+    return result_paths, futures
+
+
 def write_view_yolo_labels_from_pattern(
     mask_u8: np.ndarray,
     view: ViewInfo,
@@ -11379,6 +10961,7 @@ def collect_multiplanar_output_futures(
 
 
 
+# DEAD_CODE_MARKER(v12.1.0-review): legacy troubleshooting pass-output assembly retained but unused by v12.1.0.
 def _build_snapshot_native_union_for_view(
     *,
     snapshot_refs: Dict[Tuple[str, str, str, int], VolumeSnapshotRef],
@@ -11445,6 +11028,7 @@ def _build_snapshot_native_union_for_view(
     return native_union
 
 
+# DEAD_CODE_MARKER(v12.1.0-review): legacy troubleshooting pass-output assembly retained but unused by v12.1.0.
 def build_troubleshooting_pass_union(
     *,
     snapshot_refs: Dict[Tuple[str, str, str, int], VolumeSnapshotRef],
@@ -11461,7 +11045,7 @@ def build_troubleshooting_pass_union(
     workers: int,
 ) -> np.ndarray:
     if len(model_names) != 1:
-        raise ValueError('v12.0.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
+        raise ValueError('v12.1.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     view_volumes_for_pass: Dict[str, Dict[str, np.ndarray]] = {str(model_name): {} for model_name in model_names}
     intermediate_volumes: List[np.ndarray] = []
 
@@ -11524,7 +11108,7 @@ def build_troubleshooting_pass_union(
                     view_volumes_for_pass[str(model_name)][view.name] = native_union
 
         # Troubleshooting pass outputs are stage snapshots taken before the corresponding
-        # interpolation pass. They must not run the final 3D void fill; v12.0.0 keeps
+        # interpolation pass. They must not run the final 3D void fill; v12.1.0 keeps
         # 3D void fill out of troubleshooting pre-pass outputs and applies it only when
         # --enable_3d_void_fill is active for the normal final output.
         pass_union = assemble_current_view_union_volume(
@@ -11543,6 +11127,7 @@ def build_troubleshooting_pass_union(
             close_memmap_array(vol)
 
 
+# DEAD_CODE_MARKER(v12.1.0-review): legacy troubleshooting pre-interpolation output scheduler retained but unused by v12.1.0.
 def schedule_troubleshooting_pass_outputs(
     *,
     output_manager: BackgroundOutputManager,
@@ -11570,7 +11155,7 @@ def schedule_troubleshooting_pass_outputs(
     workers: int,
 ) -> Dict[str, Path]:
     if len(model_names) != 1:
-        raise ValueError('v12.0.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
+        raise ValueError('v12.1.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
     if int(total_passes) < 0 or not snapshot_refs:
         return {}
 
@@ -11682,7 +11267,7 @@ def resolve_low_quality_downbin_specs(
     low_quality_requested: bool,
     source_shape_t_y_x: Tuple[int, int, int],
 ) -> Tuple[List[LowQualityDownbinSpec], List[str]]:
-    """Resolve v12.0.0 isotropic low-quality downbins in native input geometry."""
+    """Resolve v12.1.0 isotropic low-quality downbins in native input geometry."""
     if downbin_values is None and not bool(low_quality_requested):
         return [], []
 
@@ -11957,7 +11542,7 @@ def save_low_quality_outputs(
     workers: int = 1,
     show_progress: bool = True,
 ) -> Dict[str, Path]:
-    """Write v12.0.0 low-quality outputs with isotropic X/Y/t resizing."""
+    """Write v12.1.0 low-quality outputs with isotropic X/Y/t resizing."""
     low_root = out_dir / 'low_quality'
     low_root.mkdir(parents=True, exist_ok=True)
     result_paths: Dict[str, Path] = {'low_quality_dir': low_root}
@@ -12229,7 +11814,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('v12.0.0_SLURM accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('v12.1.0_SLURM accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -12242,7 +11827,7 @@ def main() -> None:
     tile_configs = resolve_tile_configs(args.tile_size, args.tile_stride)
     enable_sagittal = bool(args.enable_sagittal)
     enable_coronal = bool(args.enable_coronal)
-    # v12.0.0 removed the old per-view save flags. Default outputs stay transverse-only;
+    # v12.1.0 retains the v12 single-transverse default-output behavior and omits old per-view save flags. Default outputs stay transverse-only;
     # active non-transverse views contribute to inference/union but are not separately exported.
     save_sagittal = False
     save_coronal = False
@@ -12250,8 +11835,8 @@ def main() -> None:
 
     if args.min_conf > 0 and args.min_conf < args.conf:
         raise ValueError('--min_conf must be equal to or greater than --conf')
-    if int(args.validate_retina_frames) < 1:
-        raise ValueError('--validate_retina_frames must be >= 1')
+    if bool(getattr(args, 'validate_retina', False)):
+        print('Warning: --validate_retina is deprecated in v12.1.0 and is ignored.')
     if int(args.interpolate) < 0:
         raise ValueError('--interpolate must be >= 0')
     if int(args.interpolation_walk_back) < 0:
@@ -12260,14 +11845,19 @@ def main() -> None:
         raise ValueError('--interpolation_candidates must be >= 1')
     if int(args.interpolate_passes) < 1:
         raise ValueError('--interpolate_passes must be >= 1')
-    if int(args.gaussian_smoothing_passes) < 1:
-        raise ValueError('--gaussian_smoothing_passes must be >= 1')
-    gaussian_smoothing_enabled, gaussian_smoothing_sigma, gaussian_smoothing_passes = resolve_gaussian_smoothing_settings(
-        args.gaussian_smoothing,
-        int(args.gaussian_smoothing_passes),
-    )
     if args.gaussian_smoothing is not None and float(args.gaussian_smoothing) < 0.0:
         raise ValueError('--gaussian_smoothing must be >= 0; use 0 to disable smoothing')
+    if args.gaussian_smoothing_passes is not None and int(args.gaussian_smoothing_passes) < 0:
+        raise ValueError('--gaussian_smoothing_passes must be >= 0; use 0 to disable smoothing')
+    gaussian_smoothing_cli_requested = bool(args.gaussian_smoothing is not None or args.gaussian_smoothing_passes is not None)
+    gaussian_smoothing_disabled_by_zero = bool(
+        (args.gaussian_smoothing is not None and float(args.gaussian_smoothing) == 0.0)
+        or (args.gaussian_smoothing_passes is not None and int(args.gaussian_smoothing_passes) == 0)
+    )
+    gaussian_smoothing_enabled, gaussian_smoothing_sigma, gaussian_smoothing_passes = resolve_gaussian_smoothing_settings(
+        args.gaussian_smoothing,
+        args.gaussian_smoothing_passes,
+    )
     if float(args.interpolate_min_radius) < 0:
         raise ValueError('--interpolate_min_radius must be >= 0')
     if float(args.min_radius) < 0:
@@ -12277,8 +11867,8 @@ def main() -> None:
     if requested_azimuth_angle is not None and float(requested_azimuth_angle) < 0:
         raise ValueError('--azimuth_angle must be >= 0')
     for tilt_angle in tilt_angles:
-        if not (0.0 < float(tilt_angle) < 45.0):
-            raise ValueError('--tilt_angle values must be greater than 0 and less than 45')
+        if not (0.0 < float(tilt_angle) <= 45.0):
+            raise ValueError('--tilt_angle values must be greater than 0 and less than or equal to 45')
     if not (-90.0 < float(args.interpolation_search_angle) < 90.0):
         raise ValueError('--interpolation_search_angle must be greater than -90 and less than 90')
     low_quality_requested = bool(args.save_low_quality or args.save_low_quality_downbin is not None)
@@ -12286,6 +11876,10 @@ def main() -> None:
     # materialization is needed whenever a low-quality NRRD will be written, even if the user did
     # not also request the full-size --save_nrrd output.
     nrrd_layers_needed = bool(args.save_nrrd or low_quality_requested)
+    troubleshooting_outputs_enabled = bool(args.troubleshooting)
+    # v12.1.0 --troubleshooting creates overlay MKVs only. Temporary scratch retention is a
+    # separate hidden maintenance escape hatch so troubleshooting no longer changes cleanup semantics.
+    keep_temp_artifacts = bool(_env_flag('YOLO_TTA_KEEP_TEMP', False))
 
     out_dir = Path(args.output).expanduser().resolve() if args.output else (Path.cwd() / input_path.stem)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -12323,7 +11917,7 @@ def main() -> None:
     processing_shape = compute_cube_resize_shape(input_T, input_H, input_W, tolerance=0.05)
     if processing_shape != (input_T, input_H, input_W):
         print(
-            'v12.0.0 cubic resize: '
+            'v12.1.0 cubic resize: '
             f'input shape (t,Y,X)=({input_T},{input_H},{input_W}) -> '
             f'processing shape (t,Y,X)={processing_shape}'
         )
@@ -12335,7 +11929,7 @@ def main() -> None:
             prefer_memory=True,
         )
     else:
-        print(f'v12.0.0 cubic resize: input shape already within 5% cube tolerance ({processing_shape})')
+        print(f'v12.1.0 cubic resize: input shape already within 5% cube tolerance ({processing_shape})')
         volume_rgb = input_volume_rgb
 
     T, H, W = (int(processing_shape[0]), int(processing_shape[1]), int(processing_shape[2]))
@@ -12381,8 +11975,9 @@ def main() -> None:
     inference_views = [v for v in views if not (transverse_inference_disabled and v.name == 'transverse')]
     interpolating_views = [v for v in inference_views if _view_uses_interpolation(v, int(args.interpolate))]
     spec_notes: List[str] = []
+    spec_notes.append('Input video channel handling: RGB/YUV inputs are flattened to one gray/luma channel during decode; single-channel Y/gray inputs remain single-channel, and YOLO receives H×W×1 frames.')
     spec_notes.append('Voxel-volume reporting, when enabled, counts the final binary mask after restoration to native input geometry, not imgsz or cubic working geometry.')
-    spec_notes.append('v12 tilt-angle validation follows the specification: values must be greater than 0 and less than 45 degrees.')
+    spec_notes.append('v12.1.0 tilt-angle validation follows the specification: values must be greater than 0 and less than or equal to 45 degrees.')
     if low_quality_downbin_warnings:
         for warning in low_quality_downbin_warnings:
             print(f'Warning: {warning}')
@@ -12401,7 +11996,7 @@ def main() -> None:
         )
     if (int(T), int(H), int(W)) != (int(input_T), int(input_H), int(input_W)):
         spec_notes.append(
-            f'Working volume resized to v12.0.0 approximately-cubic processing geometry '
+            f'Working volume resized to v12.1.0 approximately-cubic processing geometry '
             f'(t,Y,X)=({int(T)},{int(H)},{int(W)}); final default outputs are restored to the original '
             f'input geometry (t,Y,X)=({int(input_T)},{int(input_H)},{int(input_W)}).'
         )
@@ -12425,14 +12020,14 @@ def main() -> None:
             'Lanczos-3 radial sampling, wraparound Radial interpolation, and dense final backprojection are active.'
         )
     spec_notes.append(
-        'NRRD export is decomposed by default in v12.0.0: layers are written on a leading list axis as '
+        'NRRD export is decomposed by default in v12.1.0: layers are written on a leading list axis as '
         '(layer,X,Y,t), with manifest JSON and SegmentN metadata for view, source, YOLO-vs-bridge, '
         'tile acceptance category, pre-smoothing union, smoothing pass results, and final output. '
         'The NRRD payload is now gzip-streamed directly from backing layers with a bounded row buffer '
         'instead of materializing the full 4D decomposed payload; tune YOLO_TTA_NRRD_STREAM_BUFFER_MIB '
         'and YOLO_TTA_NRRD_GZIP_LEVEL if needed. '
         'Segment extents are now recorded when each NRRD layer/cvol store is materialized and reused during final packaging; only missing metadata or disabled YOLO_TTA_NRRD_PRECOMPUTED_SEGMENT_EXTENTS falls back to a layer scan. Compressed cvol/ctile backing paths cache chunks.bin in RAM by default via YOLO_TTA_NRRD_CACHE_COMPRESSED_LAYERS_IN_RAM=1 for the payload stream. '
-        f'Legacy single-volume NRRD writing is retained only for troubleshooting pass outputs without layer refs; space={NRRD_SPACE}.'
+        f'Legacy single-volume NRRD writing is retained only for deprecated internal callers without layer refs; space={NRRD_SPACE}.'
     )
     if cpu_retina_masks_enabled():
         spec_notes.append(
@@ -12442,19 +12037,28 @@ def main() -> None:
         )
     else:
         spec_notes.append('Experimental CPU retina-mask reconstruction disabled by YOLO_TTA_CPU_RETINA_MASKS=0; using Ultralytics non-retina masks with CPU resize fallback, which is intended only for debugging and is not the v12 default.')
-    spec_notes.append(
-        '--validate_retina is implemented as an in-memory prediction-volume regression check against Ultralytics native retina masks. '
-        'Spec conflict noted: it does not synthesize a separate edge-case suite for boundary boxes, empty detections, tiny boxes, non-square tensors, or dense detections inside this production pipeline script.'
-    )
+    spec_notes.append('--validate_retina is deprecated in v12.1.0, hidden from help, and ignored if supplied for backward compatibility.')
+    if bool(troubleshooting_outputs_enabled):
+        spec_notes.append(
+            '--troubleshooting active: writing FFV1 MKV overlays for each active full-frame native view and each available consolidated tiled prediction set; '
+            'temporary scratch retention is not implied.'
+        )
+    if bool(keep_temp_artifacts):
+        spec_notes.append('YOLO_TTA_KEEP_TEMP=1 active: temporary scratch artifacts are retained independently of --troubleshooting.')
     if bool(gaussian_smoothing_enabled):
         spec_notes.append(
-            f'Gaussian smoothing active: sigma={float(gaussian_smoothing_sigma):g} voxel(s), '
+            f'Gaussian smoothing active by v12.1.0 explicit-flag rule: sigma={float(gaussian_smoothing_sigma):g} voxel(s), '
             f'passes={int(gaussian_smoothing_passes)}; applied after final union/optional 3D void fill and before --keep_objects.'
         )
     else:
-        spec_notes.append('Gaussian smoothing disabled because --gaussian_smoothing resolved to 0.')
+        if not bool(gaussian_smoothing_cli_requested):
+            spec_notes.append('Gaussian smoothing disabled by v12.1.0 activation rule because neither Gaussian flag was explicitly set.')
+        elif bool(gaussian_smoothing_disabled_by_zero):
+            spec_notes.append('Gaussian smoothing disabled because at least one explicitly supplied Gaussian flag was set to 0.')
+        else:
+            spec_notes.append('Gaussian smoothing disabled because the resolved sigma or pass count was not positive.')
     spec_notes.append(
-        'Interpolation endpoint discovery uses the v12.0.0 per-slice connected-component scan; '
+        'Interpolation endpoint discovery uses the v12.1.0 per-slice connected-component scan; '
         'skeletonization is never used for interpolation and runs only when --save_skeleton is requested. '
         'Optional skeleton output uses slice-parallel pore preconditioning plus component/chunk based 3D Lee thinning; '
         'overlay videos draw the skeleton as fully opaque red on top of the 50% blue mask overlay.'
@@ -12465,7 +12069,7 @@ def main() -> None:
     )
     if transverse_inference_disabled:
         note = (
-            'v12.0.0 specification note: Section 2.1.1 says Transverse must always be created, while '
+            'v12.1.0 specification note: Section 2.1.1 says Transverse is enabled by default, while '
             'View Flags item 1 adds --disable_transverse to skip Transverse inferencing. This implementation '
             'keeps Transverse geometry/output paths available and removes only the standard Transverse full-frame '
             'and tiled prediction jobs.'
@@ -12476,7 +12080,7 @@ def main() -> None:
     model_name = Path(model_paths[0]).stem
     print(f'Loading model: {model_name} ({model_paths[0]})')
     yolo_model = load_ultralytics_model(model_paths[0], task='segment')
-    # v12.0.0 has no multiple-model inference. A single-item list is retained only to minimize churn in
+    # v12.1.0 has no multiple-model inference. A single-item list is retained only to minimize churn in
     # scheduling structures keyed by model stem.
     yolo_models: List[Tuple[str, object]] = [(model_name, yolo_model)]
     yolo_by_model_name: Dict[str, object] = {model_name: yolo_model}
@@ -12489,6 +12093,7 @@ def main() -> None:
         int8=bool(args.int8),
     )
 
+    # DEAD_CODE_MARKER(v12.1.0-review): deprecated retina-validation state retained only by the disabled legacy validation branch.
     retina_validation_done = False
     retina_validation_stats: List[Dict[str, float]] = []
 
@@ -12569,7 +12174,7 @@ def main() -> None:
     spec_notes.append(
         'Postprocessed tiles waiting for parent support use ctile-mask-v1, and decomposed NRRD/support layers use cvol-mask-v1 where enabled, instead of raw uint8 memmaps: empty slices are elided, '
         'nonempty slices are cropped to their nonzero bbox, packed with numpy.packbits(bitorder=little), and compressed with LZ4. '
-        'Storage review: dense gray8 source/processing volumes and uint8 confidence maps stay raw because they are not sparse binary masks; FFV1/MKV/TIFF outputs are already codec-compressed; labels/summary JSON are negligible; kept raw binary troubleshooting/tile accumulators are the best remaining compression candidates and are archived as cvol when YOLO_TTA_ARCHIVE_TEMP_BINARY_VOLUMES is enabled.'
+        'Storage review: dense gray8 source/processing volumes and uint8 confidence maps stay raw because they are not sparse binary masks; FFV1/MKV/TIFF outputs are already codec-compressed; labels/summary JSON are negligible; retained raw binary scratch/tile accumulators are the best remaining compression candidates and are archived as cvol when YOLO_TTA_KEEP_TEMP and YOLO_TTA_ARCHIVE_TEMP_BINARY_VOLUMES are enabled.'
     )
     spec_notes.append(
         f'Fused cleanup backend={cleanup_backend()}; set YOLO_TTA_CLEANUP_BACKEND=scipy to use the previous scipy.ndimage cleanup path.'
@@ -12740,7 +12345,7 @@ def main() -> None:
         ),
     )
     per_prediction_volume_workers = max(1, int(max(1, augmentation_workers) // max(1, prediction_volume_builder_workers)))
-    prediction_volume_queue_slots = max(1, _env_int('YOLO_TTA_PREDICTION_VOLUME_QUEUE_SLOTS', 2))
+    prediction_volume_queue_slots = max(1, _env_int('YOLO_TTA_PREDICTION_VOLUME_QUEUE_SLOTS', 4))
     print(
         f'In-memory prediction-volume builders: {prediction_volume_builder_workers} '
         f'(per-volume slice workers: {per_prediction_volume_workers}, build tasks: {total_prediction_volume_build_tasks}, '
@@ -12751,14 +12356,12 @@ def main() -> None:
         '(slice,--imgsz,--imgsz) uint8 arrays, yielded as H×W×1 frames through InMemoryYoloVolumeSource, '
         'and preprocessed into BCHW tensors with C=1; the normal pipeline no longer writes augmented '
         'prediction videos, canvas videos, or tile videos to temp. '
-        f'The build queue is bounded to {int(prediction_volume_queue_slots)} queued prediction volume(s) beyond the current inference.'
+        f'The build queue is bounded to {int(prediction_volume_queue_slots)} queued prediction volume(s) beyond the current inference; the v12.1.0 default is four queued volumes, for a normal total bound of five including the current inference volume.'
     )
     if dense_tiling_active:
         spec_notes.append(
-            'Tiled prediction sources are generated directly from each parent view using the tile source-to-output transform. '
-            'This keeps the tile inference ranges in memory and avoids the legacy canvas-video fanout. '
-            'Specification update suggested: clarify that an implementation may materialize individual tile inference-range '
-            'volumes from a logical magnified tile-set volume, provided the tile footprints, stride order, and inverse mapping are identical.'
+            'Tiled prediction sources follow the deterministic tile footprint, stride order, angle variant, '
+            'and inverse-mapping rules from the v12.1.0 specification.'
         )
 
     prediction_volume_executor = ThreadPoolExecutor(max_workers=int(prediction_volume_builder_workers), thread_name_prefix='prediction-volume')
@@ -12882,7 +12485,7 @@ def main() -> None:
             interpolate_passes=int(args.interpolate_passes),
             interpolate_min_radius=float(args.interpolate_min_radius),
             interpolation_search_angle=float(args.interpolation_search_angle),
-            keep_temp=bool(args.troubleshooting),
+            keep_temp=bool(keep_temp_artifacts),
             slice_workers=int(slice_postprocess_workers),
             interpolation_task_workers=int(parent_interpolation_task_workers),
             nrrd_layers_enabled=bool(nrrd_layers_needed),
@@ -13000,7 +12603,7 @@ def main() -> None:
             interpolate_passes=int(args.interpolate_passes),
             interpolate_min_radius=float(args.interpolate_min_radius),
             interpolation_search_angle=float(args.interpolation_search_angle),
-            keep_temp=bool(args.troubleshooting),
+            keep_temp=bool(keep_temp_artifacts),
             slice_workers=int(tile_slice_postprocess_workers),
             interpolation_task_workers=int(tile_interpolation_task_workers),
             nrrd_layers_enabled=bool(nrrd_layers_needed),
@@ -13063,7 +12666,7 @@ def main() -> None:
             parent_support_mm=support_by_view[str(view_name)],
             tile_accumulator_mm=tile_accumulator_mm,
             tile_accumulator_lock=view_volume_locks[(str(model_name), str(view_name))],
-            keep_temp=bool(args.troubleshooting),
+            keep_temp=bool(keep_temp_artifacts),
             slice_workers=int(tile_slice_postprocess_workers),
             parent_mask_support_mm=parent_mask_support_mm,
             parent_bridge_support_mm=parent_bridge_support_mm,
@@ -13091,7 +12694,7 @@ def main() -> None:
                 result,
                 temp_dir,
                 workers=int(tile_slice_postprocess_workers),
-                keep_original=bool(args.troubleshooting),
+                keep_original=bool(keep_temp_artifacts),
                 expected_parent_shape=(int(parent_view.num_slices), int(parent_view.src_h), int(parent_view.src_w)),
             )
             return
@@ -13112,7 +12715,7 @@ def main() -> None:
             result,
             tile_set_accumulator_mm=config_accumulator_mm,
             tile_set_accumulator_lock=config_lock,
-            keep_temp=bool(args.troubleshooting),
+            keep_temp=bool(keep_temp_artifacts),
             slice_workers=int(tile_slice_postprocess_workers),
         )
         tile_finalize_futures[fut] = (str(result.model_name), str(result.view_name), str(result.config_id), str(result.tile_id))
@@ -13197,22 +12800,26 @@ def main() -> None:
             _register_pass_snapshots(result.pass_snapshots)
 
             # Once the consolidated tile volume has been unioned into its parent destination and
-            # any NRRD layers have been materialized, the raw uint8 accumulators are no longer
-            # needed.  Keep troubleshooting artifacts in compressed cvol form; otherwise delete.
+            # any NRRD layers have been materialized, category accumulators are no longer needed.
+            # The main consolidated tile accumulator is retained until troubleshooting overlays are
+            # scheduled when --troubleshooting is active; final cleanup archives/deletes any survivor.
             for label, store in (
                 ('consolidated gated tiles', tile_accumulator_by_parent),
                 ('tile components accepted by parent mask', tile_parent_mask_accumulator_by_parent),
                 ('tile components accepted by parent bridge', tile_parent_bridge_accumulator_by_parent),
             ):
+                if bool(troubleshooting_outputs_enabled) and label == 'consolidated gated tiles':
+                    continue
                 acc = store.pop(parent_key, None)
                 if acc is not None:
                     archive_or_delete_binary_volume_storage(
                         acc,
-                        keep_temp=bool(args.troubleshooting),
+                        keep_temp=bool(keep_temp_artifacts),
                         workers=int(tile_slice_postprocess_workers),
                         desc=f'{label} {parent_key[0]}/{parent_key[1]}',
                     )
-            tile_accumulator_paths.pop(parent_key, None)
+                    if label == 'consolidated gated tiles':
+                        tile_accumulator_paths.pop(parent_key, None)
 
         output_manager.reap_completed()
 
@@ -13251,7 +12858,8 @@ def main() -> None:
                 print(f"Inferencing full-frame in-memory volume: {view.name}/{job.aug_id}")
                 try:
                     for model_name, yolo in yolo_models:
-                        if bool(args.validate_retina) and not bool(retina_validation_done):
+                        # DEAD_CODE_MARKER(v12.1.0-review): --validate_retina is deprecated and intentionally ignored.
+                        if False and bool(args.validate_retina) and not bool(retina_validation_done):
                             validation_frames = min(int(args.validate_retina_frames), int(view.num_slices))
                             retina_validation_stats = validate_cpu_retina_against_ultralytics(
                                 yolo,
@@ -13282,7 +12890,6 @@ def main() -> None:
                             native_h=view.src_h,
                             native_w=view.src_w,
                             postprocess_workers=predict_postprocess_workers,
-                            tilted_view=None,
                         )
                         if offload_between_jobs_enabled():
                             offload_yolo_from_gpu(yolo)
@@ -13293,7 +12900,7 @@ def main() -> None:
                         if int(fullframe_remaining.get(remaining_key, 0)) == 0:
                             _submit_view_prepare(model_name, view)
                 finally:
-                    close_prediction_volume_ref(prediction_ref, keep_temp=bool(args.troubleshooting))
+                    close_prediction_volume_ref(prediction_ref, keep_temp=bool(keep_temp_artifacts))
                     _pump_prediction_volume_build_queue()
                 continue
 
@@ -13301,7 +12908,7 @@ def main() -> None:
                 model_name, view, tile_job, prediction_ref = ready_tile_infer.popleft()
                 ready_key = (str(model_name), str(view.name), str(tile_job.tile_id))
                 if ready_key in tile_inference_done:
-                    close_prediction_volume_ref(prediction_ref, keep_temp=bool(args.troubleshooting))
+                    close_prediction_volume_ref(prediction_ref, keep_temp=bool(keep_temp_artifacts))
                     continue
 
                 print(f"Inferencing tile in-memory volume: {model_name}/{view.name}/{tile_job.tile_id}")
@@ -13339,10 +12946,9 @@ def main() -> None:
                         native_h=view.src_h,
                         native_w=view.src_w,
                         postprocess_workers=predict_postprocess_workers,
-                        tilted_view=None,
                     )
                 finally:
-                    close_prediction_volume_ref(prediction_ref, keep_temp=bool(args.troubleshooting))
+                    close_prediction_volume_ref(prediction_ref, keep_temp=bool(keep_temp_artifacts))
                     _pump_prediction_volume_build_queue()
                 if offload_between_jobs_enabled():
                     offload_yolo_from_gpu(yolo)
@@ -13352,7 +12958,7 @@ def main() -> None:
                 if int(pred_stats.get('frames_with_predictions', 0)) <= 0:
                     close_memmap_array(tile_mask_mm)
                     close_memmap_array(tile_conf_mm)
-                    if not args.troubleshooting:
+                    if not keep_temp_artifacts:
                         try:
                             tile_mask_path.unlink(missing_ok=True)
                         except Exception:
@@ -13380,7 +12986,7 @@ def main() -> None:
                     view=view,
                     min_conf=float(args.min_conf),
                     min_radius=float(args.min_radius),
-                    keep_temp=bool(args.troubleshooting),
+                    keep_temp=bool(keep_temp_artifacts),
                     slice_workers=int(tile_slice_postprocess_workers),
                 )
                 tile_cleanup_futures[fut] = (str(model_name), str(view.name), str(tile_job.config_id), str(tile_job.tile_id))
@@ -13422,7 +13028,7 @@ def main() -> None:
     for cache_name, cache_mm in list(view_frame_caches.items()):
         close_memmap_array(cache_mm)
         cache_path = view_frame_cache_paths.get(cache_name)
-        if not args.troubleshooting and cache_path is not None:
+        if not keep_temp_artifacts and cache_path is not None:
             try:
                 cache_path.unlink(missing_ok=True)
             except Exception:
@@ -13430,16 +13036,16 @@ def main() -> None:
     view_frame_caches.clear()
     view_frame_cache_paths.clear()
 
-    if not bool(args.troubleshooting):
+    if not bool(keep_temp_artifacts):
         swept_mkvs = purge_remaining_temporary_mkvs(temp_dir, keep_temp=False)
         if int(swept_mkvs) > 0:
             print(f'Final legacy temporary MKV sweep removed {int(swept_mkvs)} leftover file(s).')
         spec_notes.append(
             'No prediction MKVs are produced by the v12 in-memory path. A best-effort final sweep still removes '
-            f'{int(swept_mkvs)} legacy/interrupted scratch MKV file(s) when --troubleshooting is disabled.'
+            f'{int(swept_mkvs)} legacy/interrupted scratch MKV file(s) when YOLO_TTA_KEEP_TEMP is disabled.'
         )
     else:
-        spec_notes.append('--troubleshooting behavior intentionally left unchanged where legacy scratch artifacts are produced; the v12 in-memory inference path itself does not create prediction MKVs.')
+        spec_notes.append('YOLO_TTA_KEEP_TEMP retained scratch artifacts; the v12.1.0 in-memory inference path itself does not create prediction MKVs.')
 
     final_backprojection_jobs: List[Tuple[str, ViewInfo, np.ndarray]] = []
     for view in views:
@@ -13531,7 +13137,7 @@ def main() -> None:
         out_path=temp_dir / 'final_union_volume.u8.dat',
         temp_dir=temp_dir,
         enable_3d_void_fill=bool(args.enable_3d_void_fill),
-        keep_temp=bool(args.troubleshooting),
+        keep_temp=bool(keep_temp_artifacts),
         prefer_memory=True,
         workers=slice_postprocess_workers,
     )
@@ -13559,7 +13165,7 @@ def main() -> None:
             sigma=float(gaussian_smoothing_sigma),
             passes=int(gaussian_smoothing_passes),
             temp_dir=temp_dir,
-            keep_temp=bool(args.troubleshooting),
+            keep_temp=bool(keep_temp_artifacts),
             prefer_memory=True,
             workers=slice_postprocess_workers,
             nrrd_layers=nrrd_layer_refs if bool(nrrd_layers_needed) else None,
@@ -13573,7 +13179,7 @@ def main() -> None:
             final_union_mm,
             int(args.keep_objects),
             temp_dir=temp_dir,
-            keep_temp=bool(args.troubleshooting),
+            keep_temp=bool(keep_temp_artifacts),
             prefer_memory=True,
             workers=slice_postprocess_workers,
         )
@@ -13588,7 +13194,7 @@ def main() -> None:
             temp_dir / 'skeleton' / 'final_skeleton_processing_geometry.u8.dat',
             temp_dir=temp_dir,
             workers=int(slice_postprocess_workers),
-            keep_temp=bool(args.troubleshooting),
+            keep_temp=bool(keep_temp_artifacts),
             prefer_memory=True,
         )
         if bool(nrrd_layers_needed):
@@ -13638,6 +13244,7 @@ def main() -> None:
             write_nrrd(skeleton_output_mm, skeleton_path)
             final_paths['skeleton_nrrd'] = skeleton_path
 
+    # DEAD_CODE_MARKER(v12.1.0-review): retained restored-radial-output planning variable; no current consumer after v12.1.0 troubleshooting simplification.
     output_radial_angle = 0.0
     if float(resolved_azimuth_angle) > 0.0:
         output_radial_angle = resolve_radial_azimuth_angle(
@@ -13646,31 +13253,31 @@ def main() -> None:
             diameter=min(output_W, output_H),
         )
 
-    if bool(args.troubleshooting) and int(args.interpolate) > 0:
-        final_paths.update(schedule_troubleshooting_pass_outputs(
-            output_manager=output_manager,
-            snapshot_refs=pass_snapshot_refs,
-            model_names=[name for name, _ in yolo_models],
-            views=views,
+    if bool(troubleshooting_outputs_enabled):
+        print('\n=== Scheduling v12.1.0 troubleshooting overlays ===')
+        consolidated_tile_masks_for_model = {
+            str(view_name): mask
+            for (tile_model, view_name), mask in tile_accumulator_by_parent.items()
+            if str(tile_model) == str(model_name)
+        }
+        troubleshooting_paths, troubleshooting_futures = collect_troubleshooting_overlay_futures(
+            output_manager.executor,
             volume_rgb=volume_rgb,
+            model_name=str(model_name),
+            views=inference_views,
+            native_view_support=native_view_support_by_model.get(str(model_name), {}),
+            consolidated_tile_masks=consolidated_tile_masks_for_model,
             out_dir=out_dir,
             stem=input_path.stem,
             fps=fps,
-            save_binary_pattern_value=args.save_binary,
-            save_labels_pattern_value=args.save_labels,
-            save_nrrd_flag=bool(args.save_nrrd),
-            save_sagittal_flag=False,
-            save_coronal_flag=False,
-            total_passes=int(args.interpolate_passes),
-            T=T,
-            H=H,
-            W=W,
-            enable_multiplanar=bool(enable_sagittal or enable_coronal),
-            min_radius=float(args.min_radius),
-            temp_dir=temp_dir,
-            keep_temp=bool(args.troubleshooting),
-            frame_workers=output_frame_workers,
-            workers=slice_postprocess_workers,
+            show_progress=False,
+        )
+        final_paths.update(troubleshooting_paths)
+        output_manager.submit(BackgroundOutputSubmission(
+            label='troubleshooting overlays',
+            result_paths=troubleshooting_paths,
+            futures=troubleshooting_futures,
+            resources=[],
         ))
 
     print('\n=== Scheduling final outputs in background ===')
@@ -13830,16 +13437,16 @@ def main() -> None:
         model_views.clear()
     for model_support in parent_mask_support_by_model.values():
         for mm in model_support.values():
-            close_compressed_or_memmap_volume(mm, keep_temp=bool(args.troubleshooting))
+            close_compressed_or_memmap_volume(mm, keep_temp=bool(keep_temp_artifacts))
         model_support.clear()
     for model_support in parent_bridge_support_by_model.values():
         for mm in model_support.values():
-            close_compressed_or_memmap_volume(mm, keep_temp=bool(args.troubleshooting))
+            close_compressed_or_memmap_volume(mm, keep_temp=bool(keep_temp_artifacts))
         model_support.clear()
     for mm in tile_config_accumulator_by_key.values():
         archive_or_delete_binary_volume_storage(
             mm,
-            keep_temp=bool(args.troubleshooting),
+            keep_temp=bool(keep_temp_artifacts),
             workers=int(tile_slice_postprocess_workers),
             desc='remaining tile config accumulator',
         )
@@ -13847,7 +13454,7 @@ def main() -> None:
     for mm in tile_accumulator_by_parent.values():
         archive_or_delete_binary_volume_storage(
             mm,
-            keep_temp=bool(args.troubleshooting),
+            keep_temp=bool(keep_temp_artifacts),
             workers=int(tile_slice_postprocess_workers),
             desc='remaining consolidated tile accumulator',
         )
@@ -13855,7 +13462,7 @@ def main() -> None:
     for mm in tile_parent_mask_accumulator_by_parent.values():
         archive_or_delete_binary_volume_storage(
             mm,
-            keep_temp=bool(args.troubleshooting),
+            keep_temp=bool(keep_temp_artifacts),
             workers=int(tile_slice_postprocess_workers),
             desc='remaining parent-mask tile category accumulator',
         )
@@ -13863,7 +13470,7 @@ def main() -> None:
     for mm in tile_parent_bridge_accumulator_by_parent.values():
         archive_or_delete_binary_volume_storage(
             mm,
-            keep_temp=bool(args.troubleshooting),
+            keep_temp=bool(keep_temp_artifacts),
             workers=int(tile_slice_postprocess_workers),
             desc='remaining parent-bridge tile category accumulator',
         )
@@ -13880,7 +13487,7 @@ def main() -> None:
     trim_cuda_memory()
     gc.collect()
 
-    if not args.troubleshooting:
+    if not keep_temp_artifacts:
         try:
             for child in list(temp_dir.iterdir()):
                 try:
