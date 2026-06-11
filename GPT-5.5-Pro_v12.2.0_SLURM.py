@@ -2,22 +2,20 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v12.1.0_SLURM implementation of the v12.1.0_SLURM specification:
+This v12.2.0_SLURM implementation of the v12.2.0_SLURM specification:
   - builds Transverse, optional generalized Tilted Views for Transverse/Sagittal/Coronal, independently optional upright Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - materializes YOLO-ready full-frame and tiled prediction volumes as in-memory slice arrays instead of writing prediction videos to the temp folder
-  - feeds those volumes to Ultralytics through a custom in-memory loader with stream=True, while keeping CPU retina reconstruction asynchronous behind GPU inference
+  - feeds those volumes to Ultralytics through a custom in-memory loader with stream=True, while using Ultralytics native retina mask reconstruction
   - bounds prediction-volume creation to the current inference volume plus four queued volumes by default, preserving the priority order while preventing unbounded RAM growth
   - stages cleaned tiled masks into one parent-view canvas per tile-size/stride set, gates each consolidated canvas
     at the connected-component level against frozen parent full-frame support, then interpolates the accepted tiled volume once per parent view
-  - spills postprocessed waiting tile masks to a user-space ctile cache and stores decomposed NRRD/support binary volumes as cvol stores: per-slice empty elision, nonzero bbox crop, NumPy packbits, and LZ4 compression
-  - validates/resizes tile mask volumes to their parent view-native shape before any waiting-tile bitpacking/compression so ctile stores always match the parent canvas
+  - spills postprocessed waiting tile masks and decomposed NRRD/support binary volumes to raw slice-bbox stores with no bitpacking or LZ4 compression
+  - validates/resizes tile mask volumes to their parent view-native shape before raw waiting-tile store spill so ctile stores always match the parent canvas
   - removes dense-tile pruning and keeps temporary/intermediate mask volumes unpacked throughout
   - fuses per-slice cleanup work where the slice orientation matches the required semantics
     (notably min_conf filtering, 2D hole filling, and min_radius where applicable)
   - overlaps GPU inference with CPU-side view interpolation, consolidated-tile interpolation, and output writing
-  - replaces Ultralytics retina_masks=True GPU native-mask upsampling with an experimental CPU retina reconstruction path
-    that copies only protos, mask coefficients, boxes, and confidences from the GPU, reconstructs bbox-ROI masks on CPU,
-    and buffers queued frame payloads in RAM so GPU inference is not paced by CPU mask accumulation
+  - uses Ultralytics retina_masks=True native mask upsampling for live inference; the previous custom CPU retina reconstruction helpers are retained as active, opt-in compatibility code but are not the default path
   - reuses a native radial frame cache during dense tiled rendering so radial tiles do not recompute
     the same Lanczos-3 slices for every tile location
   - inverse-maps predictions only into each generated prediction volume's native view space, keeps Radial and Tilted View results view-native through cleanup/interpolation, then backprojects them after per-view processing
@@ -31,15 +29,16 @@ This v12.1.0_SLURM implementation of the v12.1.0_SLURM specification:
     low-quality presentation outputs, with FFV1 used for spec-required MKVs
   - writes the default NRRD as independently toggleable layers for full-frame YOLO masks, interpolation bridges, tiled masks accepted by parent YOLO masks,
     tiled masks accepted by parent bridges, consolidated tile bridges, the pre-smoothing global union, smoothing-pass results, optional skeleton, and the final output layer
-  - streams NRRD gzip payloads directly from per-layer backing arrays or RAM-cached compressed cvol stores without materializing a full 4D decomposed payload, reducing peak scratch pressure during final NRRD creation
+  - streams NRRD gzip-encoded payloads through pigz from per-layer backing arrays or raw cvol stores without materializing a full 4D decomposed payload, reducing peak scratch pressure during final NRRD creation
   - records NRRD SegmentN_Extent metadata while each layer is materialized, so final NRRD packaging reuses stored extents instead of rescanning every backing layer
 
 Dependencies (Python):
-  pip install opencv-python numpy scipy scikit-image tifffile tqdm ultralytics lz4
+  pip install opencv-python numpy scipy scikit-image tifffile tqdm ultralytics
+  # Optional GPU acceleration: cupy-cuda12x for cupyx.scipy.ndimage cleanup/smoothing paths.
   # --save_nrrd uses the built-in streaming NRRD writer; pynrrd is no longer required for default exports.
 
 System:
-  ffmpeg + ffprobe on PATH.
+  ffmpeg + ffprobe + pigz on PATH.
 """
 
 from __future__ import annotations
@@ -47,7 +46,6 @@ from __future__ import annotations
 import argparse
 import colorsys
 import gc
-import gzip
 import heapq
 import json
 import math
@@ -98,12 +96,6 @@ try:
     from tqdm import tqdm  # type: ignore
 except Exception as e:  # pragma: no cover
     raise RuntimeError("tqdm is required: pip install tqdm") from e
-
-try:
-    import lz4.frame as _lz4_frame  # type: ignore
-except Exception:  # pragma: no cover - checked lazily when compressed waiting tiles are used
-    _lz4_frame = None
-
 
 # --------------------------
 # CLI / args
@@ -274,9 +266,6 @@ def build_argparser() -> argparse.ArgumentParser:
 
     p.add_argument("--troubleshooting", action="store_true",
                    help="Save FFV1 MKV troubleshooting overlays for each active full-frame view and consolidated tiled prediction set")
-    p.add_argument("--validate_retina", action="store_true", help=argparse.SUPPRESS)
-    p.add_argument("--validate_retina_frames", default=8, type=int, help=argparse.SUPPRESS)
-
     p.add_argument("--interpolate", default=15, type=int,
                    help="Maximum view-native slice/frame distance used to search for interpolation candidates. Radial interpolation wraps around frame order. 0 disables interpolation")
     p.add_argument("--interpolation_walk_back", default=3, type=int,
@@ -374,7 +363,7 @@ def _cpu_count() -> int:
 def default_worker_budget() -> int:
     """Intentional CPU oversubscription for mixed GPU/IO/CPU workloads.
 
-    The v12.1.0 SLURM target has enough CPU headroom that running roughly 2x the visible CPU count
+    The v12.2.0 SLURM target has enough CPU headroom that running roughly 2x the visible CPU count
     helps keep in-memory view-volume construction, interpolation planning, and output writers busy while the GPU
     is inferencing or waiting on a different stage.
     """
@@ -936,7 +925,7 @@ def compute_cube_resize_shape(
 ) -> Tuple[int, int, int]:
     """Return the minimal processing shape whose dimensions are within tolerance of the longest axis.
 
-    v12.1.0 requires the orthogonal working volume to be approximately cubic.  The implementation
+    v12.2.0 requires the orthogonal working volume to be approximately cubic.  The implementation
     preserves any axis that is already within the tolerated band and upsamples shorter axes only
     enough to reach ``(1 - tolerance) * longest``.  This avoids unnecessary XY resampling for the
     common 3072x3072x1930 case while still satisfying the 5% cube constraint.
@@ -1035,7 +1024,7 @@ def resize_volume_t_axis_only_gray8_slab(
         shape=(out_t_i, in_h, in_w),
         dtype=np.uint8,
         path=out_path,
-        desc='v12.1.0 cubic processing volume (parallel T-axis slab resize)',
+        desc='v12.2.0 cubic processing volume (parallel T-axis slab resize)',
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
     )
@@ -1078,7 +1067,7 @@ def resize_volume_t_axis_only_gray8_slab(
             len(ranges),
             _resize_slab,
             max_workers=worker_count,
-            desc='Resizing orthogonal volume to v12.1.0 cube (T-axis slabs)',
+            desc='Resizing orthogonal volume to v12.2.0 cube (T-axis slabs)',
             show_progress=True,
             chunk_size=1,
         )
@@ -1102,7 +1091,7 @@ def resize_volume_to_processing_cube_gray8(
     prefer_memory: bool = True,
     reserve_bytes: int = 32 * GIB,
 ) -> np.ndarray:
-    """Resample a gray8 (t,Y,X) volume to the v12.1.0 approximately-cubic processing shape."""
+    """Resample a gray8 (t,Y,X) volume to the v12.2.0 approximately-cubic processing shape."""
     in_t, in_h, in_w = (int(volume_gray.shape[0]), int(volume_gray.shape[1]), int(volume_gray.shape[2]))
     out_t, out_h, out_w = (int(out_shape[0]), int(out_shape[1]), int(out_shape[2]))
     if (in_t, in_h, in_w) == (out_t, out_h, out_w):
@@ -1122,7 +1111,7 @@ def resize_volume_to_processing_cube_gray8(
         shape=(out_t, out_h, out_w),
         dtype=np.uint8,
         path=out_path,
-        desc='v12.1.0 cubic processing volume',
+        desc='v12.2.0 cubic processing volume',
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
     )
@@ -1154,7 +1143,7 @@ def resize_volume_to_processing_cube_gray8(
         int(out_t),
         _render_target_slice,
         max_workers=worker_count,
-        desc='Resizing orthogonal volume to v12.1.0 cube',
+        desc='Resizing orthogonal volume to v12.2.0 cube',
         chunk_size=chunk_size,
     )
     flush_array(out_mm)
@@ -1232,7 +1221,7 @@ def resolve_radial_azimuth_angle(
     enable_radial: bool,
     diameter: int,
 ) -> float:
-    """Resolve v12.1.0 radial activation and default full-coverage angle."""
+    """Resolve v12.2.0 radial activation and default full-coverage angle."""
     if requested_angle is not None:
         if float(requested_angle) <= 0.0:
             return 0.0
@@ -1433,9 +1422,6 @@ class AffineSpec:
 class AugJob:
     aug_id: str
     angle_deg: float
-    # DEAD_CODE_MARKER(v12.1.0-review): legacy prediction-video path fields retained for old metadata layouts; live scheduling uses in-memory PredictionVolumeRef arrays.
-    canvas_video_path: Path
-    video_path: Path
     meta_path: Path
     aff: AffineSpec
 
@@ -1579,7 +1565,7 @@ class ViewInfo:
 
 
 def is_tilted_view(view: ViewInfo) -> bool:
-    """Return True for v12.1.0 generalized Tilted Views."""
+    """Return True for v12.2.0 generalized Tilted Views."""
     return str(view.family) == TILTED_VIEW_FAMILY
 
 
@@ -1697,7 +1683,7 @@ def get_view_infos(
     enable_sagittal: bool = False,
     enable_coronal: bool = False,
 ) -> List[ViewInfo]:
-    # Backward-compatible alias for older command lines; v12.1.0 controls Sagittal and
+    # Backward-compatible alias for older command lines; v12.2.0 controls Sagittal and
     # Coronal independently via --enable_sagittal and --enable_coronal.
     if disable_multiplanar is not None:
         enable_sagittal = bool(enable_sagittal or (not bool(disable_multiplanar)))
@@ -2015,8 +2001,6 @@ def build_aug_jobs_for_view(
             AugJob(
                 aug_id=aug_id,
                 angle_deg=float(angle),
-                canvas_video_path=aug_dir / f'{view.name}_{aug_id}.canvas.mkv',
-                video_path=aug_dir / f'{view.name}_{aug_id}.mkv',
                 meta_path=aug_dir / f'{view.name}_{aug_id}.meta.json',
                 aff=aff,
             )
@@ -2112,8 +2096,6 @@ class DenseTileJob:
     tile_size: int
     tile_stride: int
     out_size: int
-    # DEAD_CODE_MARKER(v12.1.0-review): legacy dense-tile video path retained for old metadata layouts; live scheduling uses in-memory tile volumes.
-    video_path: Path
     meta_path: Path
     M_out_to_src: np.ndarray
     M_src_to_out: np.ndarray
@@ -2316,7 +2298,6 @@ def build_dense_tile_jobs_for_aug(
                     tile_size=int(tile_cfg.tile_size),
                     tile_stride=int(tile_cfg.tile_stride),
                     out_size=int(out_size),
-                    video_path=tile_dir / f'{view.name}_{tile_id}.mkv',
                     meta_path=tile_dir / f'{view.name}_{tile_id}.meta.json',
                     M_out_to_src=M_out_to_src3[:2, :3].astype(np.float32),
                     M_src_to_out=M_src_to_out3[:2, :3].astype(np.float32),
@@ -3102,7 +3083,7 @@ def resolve_gaussian_smoothing_settings(
     gaussian_smoothing_arg: Optional[float],
     gaussian_smoothing_passes_arg: Optional[int],
 ) -> Tuple[bool, float, int]:
-    """Resolve Gaussian smoothing enablement from the v12.1.0 CLI contract.
+    """Resolve Gaussian smoothing enablement from the v12.2.0 CLI contract.
 
     Gaussian smoothing is active iff at least one Gaussian flag is explicitly set
     and neither explicitly supplied value is 0. Unset values use the defaults
@@ -3157,8 +3138,15 @@ _ULTRALYTICS_ORIGINAL_SEG_CONSTRUCT_RESULT: Optional[object] = None
 
 
 def cpu_retina_masks_enabled() -> bool:
-    """Default-on experimental path: move retina/native mask reconstruction from GPU to CPU."""
-    return _env_flag('YOLO_TTA_CPU_RETINA_MASKS', True)
+    """Opt-in compatibility path for the retained custom CPU retina reconstruction helper.
+
+    v12.2.0 live inference defaults back to Ultralytics ``retina_masks=True``.
+    The helper is intentionally retained and reachable through this environment flag
+    so maintenance-pruning tools do not treat it as abandoned code.
+    """
+    # ACTIVE_RETAINED_CODE_MARKER(v12.2.0): custom CPU retina reconstruction is retained
+    # as an explicit compatibility/debug path; normal inference uses Ultralytics native retina masks.
+    return _env_flag('YOLO_TTA_CPU_RETINA_MASKS', False)
 
 
 def cpu_retina_roi_only_enabled() -> bool:
@@ -3602,6 +3590,7 @@ def _extract_result_masks_and_confs(r) -> Tuple[Optional[object], Optional[np.nd
     return np.ascontiguousarray(masks_np), np.ascontiguousarray(confs_np)
 
 
+# DEAD_CODE_MARKER(v12.2.0-post-refactor): helper became unreachable after pruning deprecated retina validation; retained for one release for regression notebook compatibility.
 def _result_to_prediction_union_u8(result: object, out_size: int) -> np.ndarray:
     masks_np, confs_np = _extract_result_masks_and_confs(result)
     if isinstance(masks_np, CpuRetinaMaskPayload):
@@ -3621,116 +3610,12 @@ def _result_to_prediction_union_u8(result: object, out_size: int) -> np.ndarray:
     return out
 
 
-# DEAD_CODE_MARKER(v12.1.0-review): retina validation is deprecated; retained only for old regression notebooks and not reachable from the CLI.
-def _collect_retina_validation_unions(
-    model: object,
-    source: object,
-    *,
-    cfg: PredictConfig,
-    out_size: int,
-    num_frames: int,
-    use_cpu_retina: bool,
-) -> List[np.ndarray]:
-    old_env = os.environ.get('YOLO_TTA_CPU_RETINA_MASKS')
-    os.environ['YOLO_TTA_CPU_RETINA_MASKS'] = '1' if bool(use_cpu_retina) else '0'
-    try:
-        if bool(use_cpu_retina):
-            ensure_cpu_retina_mask_predictor_patch()
-        ensure_yolo_ready_for_predict(model, cfg)
-        results = model.predict(
-            source=source,
-            task='segment',
-            imgsz=cfg.imgsz,
-            conf=cfg.conf,
-            iou=1.0,
-            save=False,
-            stream=True,
-            retina_masks=not bool(use_cpu_retina),
-            batch=1,
-            device=cfg.device,
-            half=cfg.half,
-            int8=cfg.int8,
-            verbose=False,
-        )
-        unions: List[np.ndarray] = []
-        for idx, r in enumerate(results):
-            if int(idx) >= int(num_frames):
-                break
-            unions.append(_result_to_prediction_union_u8(r, int(out_size)))
-        return unions
-    finally:
-        if old_env is None:
-            os.environ.pop('YOLO_TTA_CPU_RETINA_MASKS', None)
-        else:
-            os.environ['YOLO_TTA_CPU_RETINA_MASKS'] = old_env
-
-
-# DEAD_CODE_MARKER(v12.1.0-review): retina validation is deprecated; retained only for old regression notebooks and not reachable from the CLI.
-def validate_cpu_retina_against_ultralytics(
-    model: object,
-    source_factory: Callable[[], object],
-    *,
-    cfg: PredictConfig,
-    out_size: int,
-    num_frames: int,
-    source_label: str = 'in-memory prediction volume',
-) -> List[Dict[str, float]]:
-    """Compare CPU retina reconstruction against Ultralytics native retina masks.
-
-    v12 validates against the same in-memory slice source used for live prediction,
-    avoiding the old generated-video validation path.
-    """
-    frame_count = max(1, int(num_frames))
-    min_iou = float(_env_float('YOLO_TTA_VALIDATE_RETINA_MIN_IOU', 0.995))
-    max_disagree = int(_env_int('YOLO_TTA_VALIDATE_RETINA_MAX_DISAGREE_PIXELS', 64))
-    print(
-        f'Validating CPU retina reconstruction on {frame_count} in-memory frame(s) from {source_label}: '
-        f'min_iou={min_iou:g}, max_disagree_pixels={max_disagree}'
-    )
-    cpu_unions = _collect_retina_validation_unions(
-        model,
-        source_factory(),
-        cfg=cfg,
-        out_size=int(out_size),
-        num_frames=frame_count,
-        use_cpu_retina=True,
-    )
-    native_unions = _collect_retina_validation_unions(
-        model,
-        source_factory(),
-        cfg=cfg,
-        out_size=int(out_size),
-        num_frames=frame_count,
-        use_cpu_retina=False,
-    )
-    pairs = min(len(cpu_unions), len(native_unions), frame_count)
-    if pairs <= 0:
-        raise RuntimeError('Retina validation produced no comparable frames')
-
-    stats: List[Dict[str, float]] = []
-    failures: List[str] = []
-    for idx in range(pairs):
-        cpu_mask = np.asarray(cpu_unions[int(idx)], dtype=bool)
-        native_mask = np.asarray(native_unions[int(idx)], dtype=bool)
-        inter = int(np.count_nonzero(cpu_mask & native_mask))
-        union = int(np.count_nonzero(cpu_mask | native_mask))
-        disagree = int(np.count_nonzero(cpu_mask ^ native_mask))
-        iou = 1.0 if union == 0 else float(inter) / float(union)
-        stats.append({'frame': float(idx), 'iou': float(iou), 'pixel_disagreement': float(disagree)})
-        print(f'Retina validation frame {idx}: IoU={iou:.6f}, disagreement_pixels={disagree}')
-        if float(iou) < min_iou or int(disagree) > max_disagree:
-            failures.append(f'frame {idx}: IoU={iou:.6f}, disagreement_pixels={disagree}')
-    if failures:
-        raise RuntimeError('CPU retina validation failed: ' + '; '.join(failures))
-    return stats
-
-
 def _process_cpu_retina_prediction_frame(
     idx: int,
     payload: CpuRetinaMaskPayload,
     out_size: int,
     view_union_mm: np.ndarray,
-    view_confmap_mm: np.ndarray,
+    view_confmap_mm: Optional[np.ndarray],
     M_out_to_native: np.ndarray,
     native_h: int,
     native_w: int,
@@ -3753,7 +3638,7 @@ def _process_cpu_retina_prediction_frame(
     ) > 0
 
     native_conf: Optional[np.ndarray] = None
-    if np.any(frame_confmap):
+    if frame_confmap is not None and np.any(frame_confmap):
         native_conf = cv2.warpAffine(
             frame_confmap,
             M_out_to_native,
@@ -3766,7 +3651,7 @@ def _process_cpu_retina_prediction_frame(
     if np.any(native_union):
         view_union_mm[int(idx), :, :] |= native_union.astype(np.uint8, copy=False)
 
-    if native_conf is not None and np.any(native_conf):
+    if view_confmap_mm is not None and native_conf is not None and np.any(native_conf):
         conf_slice = view_confmap_mm[int(idx)]
         np.maximum(conf_slice, native_conf, out=conf_slice)
 
@@ -3779,7 +3664,7 @@ def _process_prediction_frame(
     confs_np: Optional[np.ndarray],
     out_size: int,
     view_union_mm: np.ndarray,
-    view_confmap_mm: np.ndarray,
+    view_confmap_mm: Optional[np.ndarray],
     M_out_to_native: np.ndarray,
     native_h: int,
     native_w: int,
@@ -3797,14 +3682,15 @@ def _process_prediction_frame(
             native_w=native_w,
         )
 
-    if masks_np is None or confs_np is None:
+    if masks_np is None:
         return 0, 0
     masks_arr = np.asarray(masks_np)
     if masks_arr.ndim != 3 or int(masks_arr.shape[0]) <= 0:
         return 0, 0
 
+    track_conf = view_confmap_mm is not None
     frame_union = np.zeros((out_size, out_size), dtype=np.uint8)
-    frame_confmap = np.zeros((out_size, out_size), dtype=np.uint8)
+    frame_confmap = np.zeros((out_size, out_size), dtype=np.uint8) if track_conf else None
     num_inst = int(masks_arr.shape[0])
 
     for inst_idx in range(num_inst):
@@ -3815,11 +3701,12 @@ def _process_prediction_frame(
         if not np.any(inst):
             continue
 
-        conf_val = float(confs_np[inst_idx]) if inst_idx < int(confs_np.shape[0]) else 0.0
-        conf_u8 = quantize_conf_to_u8(conf_val)
         frame_union |= inst
-        inst_bool = inst > 0
-        frame_confmap[inst_bool] = np.maximum(frame_confmap[inst_bool], conf_u8)
+        if track_conf and frame_confmap is not None:
+            conf_val = float(confs_np[inst_idx]) if (confs_np is not None and inst_idx < int(confs_np.shape[0])) else 0.0
+            conf_u8 = quantize_conf_to_u8(conf_val)
+            inst_bool = inst > 0
+            frame_confmap[inst_bool] = np.maximum(frame_confmap[inst_bool], conf_u8)
 
     if not np.any(frame_union):
         return int(num_inst), 1
@@ -3834,7 +3721,7 @@ def _process_prediction_frame(
     ) > 0
 
     native_conf: Optional[np.ndarray] = None
-    if np.any(frame_confmap):
+    if frame_confmap is not None and np.any(frame_confmap):
         native_conf = cv2.warpAffine(
             frame_confmap,
             M_out_to_native,
@@ -3847,7 +3734,7 @@ def _process_prediction_frame(
     if np.any(native_union):
         view_union_mm[idx, :, :] |= native_union.astype(np.uint8, copy=False)
 
-    if native_conf is not None and np.any(native_conf):
+    if view_confmap_mm is not None and native_conf is not None and np.any(native_conf):
         conf_slice = view_confmap_mm[idx]
         np.maximum(conf_slice, native_conf, out=conf_slice)
 
@@ -3862,7 +3749,7 @@ def predict_source_and_accumulate(
     out_size: int,
     cfg: PredictConfig,
     view_union_mm: np.ndarray,
-    view_confmap_mm: np.ndarray,
+    view_confmap_mm: Optional[np.ndarray],
     M_out_to_native: np.ndarray,
     native_h: int,
     native_w: int,
@@ -3878,7 +3765,9 @@ def predict_source_and_accumulate(
     ensure_yolo_ready_for_predict(model, cfg)
     if isinstance(source, InMemoryYoloVolumeSource):
         ensure_single_channel_yolo_preprocess_patch()
-    ensure_cpu_retina_mask_predictor_patch()
+    use_custom_cpu_retina = bool(cpu_retina_masks_enabled())
+    if use_custom_cpu_retina:
+        ensure_cpu_retina_mask_predictor_patch()
 
     prediction_count = 0
     frames_with_predictions = 0
@@ -3891,7 +3780,7 @@ def predict_source_and_accumulate(
         iou=1.0,
         save=False,
         stream=True,
-        retina_masks=False,
+        retina_masks=not bool(use_custom_cpu_retina),
         batch=1,
         device=cfg.device,
         half=cfg.half,
@@ -3952,7 +3841,8 @@ def predict_source_and_accumulate(
                 prediction_count += int(pred_inc)
                 frames_with_predictions += int(frame_inc)
 
-    flush_array(view_confmap_mm)
+    if view_confmap_mm is not None:
+        flush_array(view_confmap_mm)
     flush_array(view_union_mm)
 
     return {
@@ -3969,7 +3859,7 @@ def predict_in_memory_volume_and_accumulate(
     out_size: int,
     cfg: PredictConfig,
     view_union_mm: np.ndarray,
-    view_confmap_mm: np.ndarray,
+    view_confmap_mm: Optional[np.ndarray],
     M_out_to_native: np.ndarray,
     native_h: int,
     native_w: int,
@@ -4178,6 +4068,208 @@ def _filter_connected_components_by_min_conf_scipy(
 
 
 
+
+_SINGLE_ANGLE_GPU_CLEANUP_ACTIVE = False
+_GPU_CLEANUP_BACKEND_WARNING_EMITTED = False
+
+
+def set_single_angle_gpu_cleanup_active(active: bool) -> None:
+    global _SINGLE_ANGLE_GPU_CLEANUP_ACTIVE
+    _SINGLE_ANGLE_GPU_CLEANUP_ACTIVE = bool(active)
+
+
+def single_angle_gpu_cleanup_active() -> bool:
+    return bool(_SINGLE_ANGLE_GPU_CLEANUP_ACTIVE and _env_flag('YOLO_TTA_SINGLE_ANGLE_GPU_CLEANUP', True))
+
+
+def _cupy_scalar_to_int(value: object) -> int:
+    try:
+        item = getattr(value, 'item', None)
+        if callable(item):
+            return int(item())
+    except Exception:
+        pass
+    return int(value)  # type: ignore[arg-type]
+
+
+def _try_get_gpu_cleanup_backend(*, min_radius: float) -> Optional[Tuple[object, object]]:
+    """Return (cupy, cupyx.scipy.ndimage) for single-angle GPU cleanup, if usable."""
+    try:
+        import cupy as cp  # type: ignore
+        from cupyx.scipy import ndimage as cpx_ndi  # type: ignore
+    except Exception:
+        return None
+    if not hasattr(cpx_ndi, 'label') or not hasattr(cpx_ndi, 'maximum'):
+        return None
+    if float(min_radius) > 0.0 and not hasattr(cpx_ndi, 'distance_transform_edt'):
+        return None
+    return cp, cpx_ndi
+
+
+def _gpu_filter_components_by_min_conf_cp(mask_cp: object, conf_cp: object, min_conf_u8: int, cp: object, cpx_ndi: object) -> object:
+    if int(min_conf_u8) <= 0:
+        return mask_cp
+    structure8 = cp.ones((3, 3), dtype=cp.bool_)
+    labels, num = cpx_ndi.label(mask_cp, structure=structure8)
+    num_i = _cupy_scalar_to_int(num)
+    if num_i <= 0:
+        return cp.zeros_like(mask_cp, dtype=cp.bool_)
+    ids = cp.arange(1, num_i + 1, dtype=labels.dtype)
+    maxima = cpx_ndi.maximum(conf_cp, labels=labels, index=ids)
+    keep_ids = ids[cp.asarray(maxima) >= int(min_conf_u8)]
+    if int(keep_ids.size) <= 0:
+        return cp.zeros_like(mask_cp, dtype=cp.bool_)
+    return cp.isin(labels, keep_ids)
+
+
+def _gpu_fill_holes_2d_cp(mask_cp: object, cp: object, cpx_ndi: object) -> object:
+    # Prefer the scipy-compatible GPU implementation when available; otherwise use
+    # a label-boundary test equivalent to the CPU OpenCV path.
+    fill_fn = getattr(cpx_ndi, 'binary_fill_holes', None)
+    if callable(fill_fn):
+        return fill_fn(mask_cp)
+    structure4 = cp.asarray([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=cp.bool_)
+    bg = cp.logical_not(mask_cp)
+    labels, num = cpx_ndi.label(bg, structure=structure4)
+    if _cupy_scalar_to_int(num) <= 0:
+        return mask_cp
+    boundary = cp.concatenate([labels[0, :].ravel(), labels[-1, :].ravel(), labels[:, 0].ravel(), labels[:, -1].ravel()])
+    boundary_ids = cp.unique(boundary)
+    enclosed = cp.logical_and(labels > 0, cp.logical_not(cp.isin(labels, boundary_ids)))
+    return cp.logical_or(mask_cp, enclosed)
+
+
+def _gpu_filter_components_by_min_radius_cp(mask_cp: object, min_radius: float, cp: object, cpx_ndi: object) -> object:
+    if float(min_radius) <= 0.0:
+        return mask_cp
+    structure8 = cp.ones((3, 3), dtype=cp.bool_)
+    labels, num = cpx_ndi.label(mask_cp, structure=structure8)
+    num_i = _cupy_scalar_to_int(num)
+    if num_i <= 0:
+        return cp.zeros_like(mask_cp, dtype=cp.bool_)
+    dist = cpx_ndi.distance_transform_edt(mask_cp)
+    ids = cp.arange(1, num_i + 1, dtype=labels.dtype)
+    radii = cpx_ndi.maximum(dist, labels=labels, index=ids)
+    keep_ids = ids[cp.asarray(radii) >= float(min_radius)]
+    if int(keep_ids.size) <= 0:
+        return cp.zeros_like(mask_cp, dtype=cp.bool_)
+    return cp.isin(labels, keep_ids)
+
+
+def _cpu_cleanup_slice_fallback(
+    mask_slice: np.ndarray,
+    conf_slice: Optional[np.ndarray],
+    *,
+    min_conf: float,
+    min_radius: float,
+    min_conf_u8: int,
+    structure2: np.ndarray,
+    backend: str,
+) -> np.ndarray:
+    out = np.asarray(mask_slice, dtype=bool)
+    if np.any(out) and conf_slice is not None and float(min_conf) > 0.0:
+        if backend == 'opencv':
+            out = _filter_connected_components_by_min_conf_opencv(out, conf_slice, int(min_conf_u8))
+        else:
+            out = _filter_connected_components_by_min_conf_scipy(out, conf_slice, int(min_conf_u8), structure2)
+    if np.any(out):
+        out = _fill_holes_2d_opencv(out) if backend == 'opencv' else _fill_holes_2d_scipy(out)
+    if np.any(out) and float(min_radius) > 0.0:
+        if backend == 'opencv':
+            out = _filter_connected_components_by_min_radius_opencv(out, float(min_radius))
+        else:
+            out = _filter_connected_components_by_min_radius_scipy(out, structure2, float(min_radius))
+    return np.asarray(out, dtype=bool)
+
+
+def fused_slice_cleanup_gpu_inplace(
+    mask_mm: np.ndarray,
+    confmap_mm: Optional[np.ndarray] = None,
+    *,
+    min_conf: float = 0.0,
+    min_radius: float = 0.0,
+    workers: int = 1,
+    desc: str = 'Single-angle GPU slice cleanup',
+) -> bool:
+    """Run per-slice cleanup on GPU for the single-angle TTA path.
+
+    The volume remains CPU-backed for interpolation, but each slice is uploaded to
+    CuPy, cleaned on GPU, and copied back before interpolation starts.  If CuPy or
+    the required cupyx.ndimage routines are unavailable, callers fall back to the
+    existing CPU cleanup path.
+    """
+    backend_mods = _try_get_gpu_cleanup_backend(min_radius=float(min_radius))
+    if backend_mods is None:
+        global _GPU_CLEANUP_BACKEND_WARNING_EMITTED
+        if not _GPU_CLEANUP_BACKEND_WARNING_EMITTED:
+            print('Warning: single-angle GPU cleanup requested but CuPy/cupyx cleanup backend is unavailable; falling back to CPU cleanup.')
+            _GPU_CLEANUP_BACKEND_WARNING_EMITTED = True
+        return False
+    cp, cpx_ndi = backend_mods
+
+
+    num_slices = int(mask_mm.shape[0])
+    structure2 = np.ones((3, 3), dtype=bool)
+    min_conf_u8 = int(min_conf_to_u8_threshold(float(min_conf))) if float(min_conf) > 0.0 else 0
+    gpu_worker_cap = max(1, _env_int('YOLO_TTA_GPU_CLEANUP_WORKERS', 1))
+    worker_count = choose_slice_parallel_workers(min(int(workers), int(gpu_worker_cap)), num_slices)
+    chunk_size = choose_parallel_chunk_size(num_slices, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
+    cpu_backend = cleanup_backend()
+
+    def _process(i: int) -> None:
+        mask_slice_np = np.asarray(mask_mm[int(i)], dtype=bool)
+        conf_slice_np = None if confmap_mm is None else np.asarray(confmap_mm[int(i)], dtype=np.uint8)
+        if not np.any(mask_slice_np):
+            if confmap_mm is not None:
+                confmap_mm[int(i), :, :].fill(np.uint8(0))
+            return
+        try:
+            mask_cp = cp.asarray(mask_slice_np, dtype=cp.bool_)
+            if conf_slice_np is not None and float(min_conf) > 0.0:
+                conf_cp = cp.asarray(conf_slice_np, dtype=cp.uint8)
+                mask_cp = _gpu_filter_components_by_min_conf_cp(mask_cp, conf_cp, int(min_conf_u8), cp, cpx_ndi)
+            if bool(_cupy_scalar_to_int(cp.any(mask_cp))):
+                mask_cp = _gpu_fill_holes_2d_cp(mask_cp, cp, cpx_ndi)
+            if bool(_cupy_scalar_to_int(cp.any(mask_cp))) and float(min_radius) > 0.0:
+                mask_cp = _gpu_filter_components_by_min_radius_cp(mask_cp, float(min_radius), cp, cpx_ndi)
+            cleaned = cp.asnumpy(mask_cp).astype(bool, copy=False)
+        except Exception:
+            cleaned = _cpu_cleanup_slice_fallback(
+                mask_slice_np,
+                conf_slice_np,
+                min_conf=float(min_conf),
+                min_radius=float(min_radius),
+                min_conf_u8=int(min_conf_u8),
+                structure2=structure2,
+                backend=cpu_backend,
+            )
+        mask_mm[int(i), :, :] = cleaned.astype(np.uint8, copy=False)
+        if confmap_mm is not None:
+            conf_slice = np.zeros_like(conf_slice_np, dtype=np.uint8) if conf_slice_np is not None else None
+            if conf_slice is not None and np.any(cleaned):
+                conf_slice[:, :] = conf_slice_np
+                conf_slice[~cleaned] = np.uint8(0)
+            if conf_slice is not None:
+                confmap_mm[int(i), :, :] = conf_slice
+
+    parallel_for_indices_chunked(
+        num_slices,
+        _process,
+        max_workers=worker_count,
+        desc=desc,
+        chunk_size=chunk_size,
+    )
+    flush_array(mask_mm)
+    if confmap_mm is not None:
+        flush_array(confmap_mm)
+    try:
+        free_all = getattr(cp.get_default_memory_pool(), 'free_all_blocks', None)
+        if callable(free_all):
+            free_all()
+    except Exception:
+        pass
+    return True
+
 def fused_slice_cleanup_inplace(
     mask_mm: np.ndarray,
     confmap_mm: Optional[np.ndarray] = None,
@@ -4197,9 +4289,21 @@ def fused_slice_cleanup_inplace(
       - computes connected-component radii with one EDT + one reduce per slice instead of one EDT
         per component
     """
+    if single_angle_gpu_cleanup_active():
+        gpu_done = fused_slice_cleanup_gpu_inplace(
+            mask_mm,
+            confmap_mm,
+            min_conf=float(min_conf),
+            min_radius=float(min_radius),
+            workers=int(workers),
+            desc=f'{desc} [GPU single-angle]',
+        )
+        if bool(gpu_done):
+            return
+
     num_slices = int(mask_mm.shape[0])
     structure2 = np.ones((3, 3), dtype=bool)
-    min_conf_u8 = int(min_conf_to_u8_threshold(float(min_conf)))
+    min_conf_u8 = int(min_conf_to_u8_threshold(float(min_conf))) if float(min_conf) > 0.0 else 0
     worker_count = choose_slice_parallel_workers(int(workers), num_slices)
     chunk_size = choose_parallel_chunk_size(num_slices, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
     backend = cleanup_backend()
@@ -4275,9 +4379,11 @@ def cleanup_view_volume_after_prediction_inplace(
     if view.name == 'transverse' or (is_tilted_view(view) and tilted_base_view_name(view) == 'transverse'):
         native_min_radius = float(min_radius)
 
+    effective_confmap_mm = confmap_mm if float(min_conf) > 0.0 else None
+
     fused_slice_cleanup_inplace(
         mask_mm,
-        confmap_mm,
+        effective_confmap_mm,
         min_conf=float(min_conf),
         min_radius=float(native_min_radius),
         workers=int(workers),
@@ -4487,7 +4593,7 @@ def fill_3d_voids_inplace_streaming(
 ) -> None:
     """Fill enclosed 3D voids by labeling background connected components once.
 
-    v12.1.0 allows 3D void fill only as an optional final global-union step. This
+    v12.2.0 allows 3D void fill only as an optional final global-union step. This
     function performs that operation by labeling the background volume, marking any
     background component connected to the volume boundary, and converting all other
     background components to foreground. The default 6-connected background matches
@@ -4804,7 +4910,7 @@ def build_slice_endpoint_seeds_from_label_volume(
                 if anchor is None:
                     continue
 
-                # v12.1.0 endpoint continuation is defined by direct footprint overlap in
+                # v12.2.0 endpoint continuation is defined by direct footprint overlap in
                 # the adjacent slice; do not dilate/skeletonize the component for endpoint discovery.
                 has_prev = bool(prev_same is not None and np.any(comp & prev_same))
                 has_next = bool(next_same is not None and np.any(comp & next_same))
@@ -4843,6 +4949,50 @@ def build_slice_endpoint_seeds_from_label_volume(
     return seeds, int(len(seeds))
 
 
+
+def try_apply_transverse_min_radius_filter_gpu_inplace(
+    mask_mm: np.ndarray,
+    min_radius: float,
+    *,
+    workers: int = 1,
+) -> bool:
+    """GPU-only transverse min-radius filter used by the single-angle fast path."""
+    if not single_angle_gpu_cleanup_active() or float(min_radius) <= 0.0:
+        return False
+    backend_mods = _try_get_gpu_cleanup_backend(min_radius=float(min_radius))
+    if backend_mods is None:
+        return False
+    cp, cpx_ndi = backend_mods
+    num_slices = int(mask_mm.shape[0])
+    gpu_worker_cap = max(1, _env_int('YOLO_TTA_GPU_CLEANUP_WORKERS', 1))
+    worker_count = choose_slice_parallel_workers(min(int(workers), int(gpu_worker_cap)), num_slices)
+    chunk_size = choose_parallel_chunk_size(num_slices, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
+
+    def _process(t: int) -> None:
+        sl_np = np.asarray(mask_mm[int(t)]) > 0
+        if not np.any(sl_np):
+            return
+        try:
+            sl_cp = cp.asarray(sl_np, dtype=cp.bool_)
+            keep_cp = _gpu_filter_components_by_min_radius_cp(sl_cp, float(min_radius), cp, cpx_ndi)
+            mask_mm[int(t), :, :] = cp.asnumpy(keep_cp).astype(np.uint8, copy=False)
+        finally:
+            try:
+                cp.get_default_memory_pool().free_all_blocks()
+            except Exception:
+                pass
+
+    print(f'Transverse min-radius filter using GPU single-angle path (min_radius={float(min_radius):g})')
+    parallel_for_indices_chunked(
+        num_slices,
+        _process,
+        max_workers=worker_count,
+        desc='Transverse min-radius filter [GPU single-angle]',
+        chunk_size=chunk_size,
+    )
+    flush_array(mask_mm)
+    return True
+
 def apply_transverse_min_radius_filter_inplace(
     mask_mm: np.ndarray,
     min_radius: float,
@@ -4851,6 +5001,8 @@ def apply_transverse_min_radius_filter_inplace(
 ) -> None:
     """In-place transverse-plane radius filter to avoid a full extra volume copy."""
     if float(min_radius) <= 0:
+        return
+    if try_apply_transverse_min_radius_filter_gpu_inplace(mask_mm, float(min_radius), workers=int(workers)):
         return
 
     struct2 = np.ones((3, 3), dtype=bool)
@@ -4926,7 +5078,7 @@ _DENSE_RADIAL_BACKPROJECT_MAP_CACHE: Dict[Tuple[int, int, int, Tuple[Tuple[float
 
 
 def radial_full_coverage_angle_deg(diameter: int) -> float:
-    """Return the v12.1.0 radial spacing that gives approximately 1x ROI edge coverage."""
+    """Return the v12.2.0 radial spacing that gives approximately 1x ROI edge coverage."""
     diameter_i = max(1, int(diameter))
     return float(360.0 / (math.pi * float(diameter_i)))
 
@@ -4960,7 +5112,7 @@ def _nearest_radial_source_for_backprojection(
 def build_radial_backprojection_plan(radial_view: ViewInfo) -> Tuple[List[RadialBackprojectionSample], Dict[str, float]]:
     """Build the angular plan used to backproject a radial view into Cartesian space.
 
-    If the user-requested radial spacing is coarser than the v12.1.0 full-coverage spacing,
+    If the user-requested radial spacing is coarser than the v12.2.0 full-coverage spacing,
     backprojection is densified to the full-coverage spacing and each dense angle samples the
     nearest completed radial prediction frame. This keeps Radial masks view-native through
     postprocessing/interpolation while preventing sparse spoke-like Cartesian backprojections.
@@ -5020,7 +5172,7 @@ def build_dense_radial_backprojection_map(
 ) -> DenseRadialBackprojectionMap:
     """Map every Cartesian ROI pixel to its nearest dense radial source frame and radial coordinate.
 
-    This is the dense v12.1.0 backprojection path: instead of painting only the pixels that lie on
+    This is the dense v12.2.0 backprojection path: instead of painting only the pixels that lie on
     a set of spokes, every pixel inside the circular ROI receives a sample from the Radial video's
     own frame/raster coordinate system.  When the user-provided azimuth spacing is too coarse, the
     supplied ``plan`` is already densified to the full-coverage angular spacing; pixels then select
@@ -5375,11 +5527,11 @@ def assemble_current_view_union_volume(
     """Build the single-model final view union.
 
     The mapping is kept keyed by model name because earlier pipeline stages store temporary
-    workspaces under the model stem. v12.1.0 rejects multiple model entries and never
+    workspaces under the model stem. v12.2.0 rejects multiple model entries and never
     combines outputs from more than one model.
     """
     if len(view_volumes_by_model) != 1:
-        raise ValueError('v12.1.0_SLURM supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('v12.2.0_SLURM supports exactly one --model; multiple-model inference has been removed')
 
     model_name = next(iter(view_volumes_by_model.keys()))
     final_union_mm = allocate_workspace_array(
@@ -6399,7 +6551,7 @@ def _build_slice_endpoint_seeds(
     workers: int = 1,
     wrap_axis: bool = False,
 ) -> Tuple[List[SliceEndpointSeed], int]:
-    """Build interpolation endpoint seeds with the v12.1.0 per-slice component scan.
+    """Build interpolation endpoint seeds with the v12.2.0 per-slice component scan.
 
     Interpolation no longer uses skeletonization. Each labeled 3D object is scanned slice by
     slice; every 2D connected component is evaluated independently for overlap continuation
@@ -6834,7 +6986,6 @@ class PreparedViewResult:
     native_support_mm: np.ndarray
     final_view_volume_mm: Optional[np.ndarray]
     interpolation_stats: List[Dict[str, object]]
-    pass_snapshots: Dict[int, VolumeSnapshotRef] = field(default_factory=dict)
     nrrd_layers: List[NrrdLayerRef] = field(default_factory=list)
     parent_mask_support_mm: Optional[object] = None
     parent_bridge_support_mm: Optional[object] = None
@@ -6847,9 +6998,9 @@ class TilePostprocessTask:
     config_id: str
     tile_id: str
     tile_mask_mm: np.ndarray
-    tile_confmap_mm: np.ndarray
+    tile_confmap_mm: Optional[np.ndarray]
     tile_mask_path: Path
-    tile_confmap_path: Path
+    tile_confmap_path: Optional[Path]
 
 
 @dataclass
@@ -6860,7 +7011,7 @@ class TilePostprocessResult:
     tile_id: str
     tile_mask_mm: Optional[np.ndarray] = None
     tile_mask_path: Optional[Path] = None
-    tile_mask_store: Optional['CompressedTileMaskStore'] = None
+    tile_mask_store: Optional['RawBBoxMaskStore'] = None
 
 
 @dataclass(frozen=True)
@@ -6871,25 +7022,25 @@ class DeferredTilePostprocessResult:
     tile_id: str
     tile_mask_path: Path
     tile_shape: Tuple[int, int, int]
-    storage_format: str = 'ctile-mask-v1'
+    storage_format: str = 'ctile-mask-v2-raw'
 
 
 
-CTILE_FORMAT = 'ctile-mask-v1'
-CVOL_FORMAT = 'cvol-mask-v1'
-COMPRESSED_MASK_FORMATS = {CTILE_FORMAT, CVOL_FORMAT}
-CTILE_BITORDER = 'little'
-_NRRD_COMPRESSED_STORE_CHUNKS_RAM_CACHE: Dict[Path, bytes] = {}
+CTILE_FORMAT = 'ctile-mask-v2-raw'
+CVOL_FORMAT = 'cvol-mask-v2-raw'
+MASK_STORE_FORMATS = {CTILE_FORMAT, CVOL_FORMAT}
+# RAM cache for raw bbox-store chunks.bin payloads during NRRD streaming.
+_NRRD_RAW_STORE_CHUNKS_RAM_CACHE: Dict[Path, bytes] = {}
 CTILE_INDEX_DTYPE = np.dtype([
-    ('kind', 'u1'),              # 0 = empty/zero chunk, 1 = LZ4-compressed packbits payload
+    ('kind', 'u1'),              # 0 = empty/zero slice, 1 = raw uint8 bbox payload
     ('reserved', 'u1', (7,)),
     ('offset', '<u8'),
-    ('compressed_size', '<u8'),
+    ('payload_size', '<u8'),
     ('y0', '<u4'),
     ('x0', '<u4'),
     ('y1', '<u4'),
     ('x1', '<u4'),
-    ('packed_nbytes', '<u8'),
+    ('payload_nbytes', '<u8'),
 ])
 
 
@@ -6924,11 +7075,11 @@ def _segment_extent_to_json(extent: Sequence[int]) -> List[int]:
     return [int(v) for v in coerced]
 
 
-def _compressed_index_segment_extent(
+def _raw_store_index_segment_extent(
     index: np.ndarray,
     shape_tyx: Sequence[int],
 ) -> NrrdSegmentExtent:
-    """Compute a Slicer SegmentN extent from cvol/ctile index bboxes without decoding payloads."""
+    """Compute a Slicer SegmentN extent from a raw cvol/ctile index without decoding payloads."""
     try:
         shape_i = (int(shape_tyx[0]), int(shape_tyx[1]), int(shape_tyx[2]))
     except Exception:
@@ -6956,39 +7107,30 @@ def _compressed_index_segment_extent(
     return (int(min_x), int(max_x), int(min_y), int(max_y), int(min_t), int(max_t))
 
 
-def _require_lz4_frame() -> object:
-    if _lz4_frame is None:
-        raise RuntimeError(
-            'The v12.1.0 compressed bitpacked mask stores require lz4. '
-            'Install it with: pip install lz4'
-        )
-    return _lz4_frame
-
-
 @dataclass(frozen=True)
-class CompressedTileSlicePayload:
+class RawBBoxSlicePayload:
+    """One slice payload for the raw bbox mask store.
+
+    Payloads are raw uint8 crop bytes in v12.2.0, not bitpacked or LZ4-compressed.
+    """
+
     idx: int
     is_empty: bool
     y0: int = 0
     x0: int = 0
     y1: int = 0
     x1: int = 0
-    packed_nbytes: int = 0
+    payload_nbytes: int = 0
     payload: bytes = b''
     foreground_voxels: int = 0
 
 
-class CompressedTileMaskStore:
-    """Read adapter for v12.1.0 compressed bitpacked binary mask volumes.
+class RawBBoxMaskStore:
+    """Read adapter for v12.2.0 raw slice-bbox binary mask volumes.
 
-    The same per-slice container is used for waiting tile masks (``ctile-mask-v1``) and
-    for larger binary scratch artifacts such as NRRD support/layer archives
-    (``cvol-mask-v1``). Each decoded slice is reconstructed on demand from an
-    optional nonzero bounding box, NumPy packbits bytes, and an LZ4 payload.
-
-    NRRD segment-extent and decomposed-layer streaming read the same cvol sources
-    repeatedly.  When requested, ``chunks.bin`` is cached as RAM bytes so compressed
-    bitpacked NRRD layers no longer seek/read NVMe for every decoded slice.
+    The payload format is uncompressed: empty slices are elided, nonempty slices are cropped to their
+    nonzero bbox, and the crop is written as raw uint8 bytes. No NumPy packbits and
+    no LZ4 are used for waiting tiles or cvol NRRD/support layers.
     """
 
     def __init__(
@@ -7006,23 +7148,23 @@ class CompressedTileMaskStore:
         self._chunks_bytes: Optional[bytes] = chunks_bytes
         shape = self.meta.get('shape')
         if not isinstance(shape, list) or len(shape) != 3:
-            raise ValueError(f'{self.root}: invalid compressed-mask shape metadata: {shape!r}')
+            raise ValueError(f'{self.root}: invalid raw-mask shape metadata: {shape!r}')
         self.shape = (int(shape[0]), int(shape[1]), int(shape[2]))
         if int(self.index.shape[0]) != int(self.shape[0]):
             raise ValueError(f'{self.root}: index slice count {int(self.index.shape[0])} != shape[0] {int(self.shape[0])}')
 
     @classmethod
-    def open(cls, root: Path, *, cache_payload_in_ram: bool = False) -> 'CompressedTileMaskStore':
+    def open(cls, root: Path, *, cache_payload_in_ram: bool = False) -> 'RawBBoxMaskStore':
         root = Path(root)
         meta_path = root / 'meta.json'
         index_path = root / 'index.bin'
         chunks_path = root / 'chunks.bin'
         if not meta_path.exists() or not index_path.exists() or not chunks_path.exists():
-            raise FileNotFoundError(f'Incomplete compressed tile store: {root}')
+            raise FileNotFoundError(f'Incomplete raw mask store: {root}')
         meta = json.loads(meta_path.read_text())
         fmt = str(meta.get('format', ''))
-        if fmt not in COMPRESSED_MASK_FORMATS:
-            raise ValueError(f'{root}: unsupported compressed mask format {meta.get("format")!r}')
+        if fmt not in MASK_STORE_FORMATS:
+            raise ValueError(f'{root}: unsupported raw mask format {meta.get("format")!r}')
         shape = meta.get('shape')
         if not isinstance(shape, list) or len(shape) != 3:
             raise ValueError(f'{root}: invalid shape metadata {shape!r}')
@@ -7033,21 +7175,22 @@ class CompressedTileMaskStore:
                 cache_key = chunks_path.resolve()
             except Exception:
                 cache_key = chunks_path
-            chunks_bytes = _NRRD_COMPRESSED_STORE_CHUNKS_RAM_CACHE.get(cache_key)
+            chunks_bytes = _NRRD_RAW_STORE_CHUNKS_RAM_CACHE.get(cache_key)
             if chunks_bytes is None:
                 chunks_bytes = chunks_path.read_bytes()
-                _NRRD_COMPRESSED_STORE_CHUNKS_RAM_CACHE[cache_key] = chunks_bytes
+                _NRRD_RAW_STORE_CHUNKS_RAM_CACHE[cache_key] = chunks_bytes
                 print(
-                    f'Compressed bitpacked store cached in RAM for NRRD streaming: {root} '
+                    f'Raw bbox mask store cached in RAM for NRRD streaming: {root} '
                     f'({len(chunks_bytes) / GIB:.3f} GiB chunks.bin)'
                 )
             else:
                 print(
-                    f'Compressed bitpacked store reused from RAM for NRRD streaming: {root} '
+                    f'Raw bbox mask store reused from RAM for NRRD streaming: {root} '
                     f'({len(chunks_bytes) / GIB:.3f} GiB chunks.bin)'
                 )
         return cls(root, meta, index, chunks_bytes=chunks_bytes)
 
+    # DEAD_CODE_MARKER(v12.2.0-post-refactor): unused diagnostic property retained for raw-store debugging.
     @property
     def chunks_cached_in_ram(self) -> bool:
         return self._chunks_bytes is not None
@@ -7065,41 +7208,36 @@ class CompressedTileMaskStore:
         if int(rec['kind']) == 0:
             return out
         if int(rec['kind']) != 1:
-            raise ValueError(f'{self.root}: invalid compressed-mask chunk marker {int(rec["kind"])} at slice {idx_i}')
+            raise ValueError(f'{self.root}: invalid raw-mask chunk marker {int(rec["kind"])} at slice {idx_i}')
 
         y0 = int(rec['y0']); x0 = int(rec['x0']); y1 = int(rec['y1']); x1 = int(rec['x1'])
         if not (0 <= y0 < y1 <= int(h) and 0 <= x0 < x1 <= int(w)):
             raise ValueError(f'{self.root}: invalid bbox {(y0, x0, y1, x1)} for shape {(h, w)} at slice {idx_i}')
-        compressed_size = int(rec['compressed_size'])
-        packed_nbytes = int(rec['packed_nbytes'])
-        if compressed_size <= 0 or packed_nbytes <= 0:
+        payload_size = int(rec['payload_size'])
+        payload_nbytes = int(rec['payload_nbytes'])
+        if payload_size <= 0 or payload_nbytes <= 0:
             raise ValueError(f'{self.root}: nonempty slice {idx_i} has empty payload metadata')
 
-        lz4_frame = _require_lz4_frame()
         if self._chunks_bytes is not None:
             start = int(rec['offset'])
-            stop = start + int(compressed_size)
+            stop = start + int(payload_size)
             payload = self._chunks_bytes[start:stop]
         else:
             with self.chunks_path.open('rb') as fh:
                 fh.seek(int(rec['offset']))
-                payload = fh.read(int(compressed_size))
-        if len(payload) != compressed_size:
-            raise IOError(f'{self.root}: short read for slice {idx_i}: {len(payload)} != {compressed_size}')
-        packed_bytes = lz4_frame.decompress(payload)
-        if len(packed_bytes) != packed_nbytes:
-            raise ValueError(f'{self.root}: packed byte count mismatch at slice {idx_i}: {len(packed_bytes)} != {packed_nbytes}')
-        packed = np.frombuffer(packed_bytes, dtype=np.uint8)
+                payload = fh.read(int(payload_size))
+        if len(payload) != payload_size or len(payload) != payload_nbytes:
+            raise IOError(f'{self.root}: short read for slice {idx_i}: {len(payload)} != {payload_size}')
         crop_h = int(y1 - y0)
         crop_w = int(x1 - x0)
-        crop_bits = np.unpackbits(
-            packed,
-            bitorder=CTILE_BITORDER,
-            count=int(crop_h * crop_w),
-        ).reshape((crop_h, crop_w))
-        out[y0:y1, x0:x1] = crop_bits.astype(out.dtype, copy=False)
+        expected = int(crop_h * crop_w)
+        if int(payload_nbytes) != expected:
+            raise ValueError(f'{self.root}: raw payload byte count mismatch at slice {idx_i}: {payload_nbytes} != {expected}')
+        crop = np.frombuffer(payload, dtype=np.uint8, count=expected).reshape((crop_h, crop_w))
+        out[y0:y1, x0:x1] = crop.astype(out.dtype, copy=False)
         return out
 
+    # DEAD_CODE_MARKER(v12.2.0-post-refactor): unused convenience iterator retained for raw-store debugging.
     def iter_slices(self) -> Iterator[np.ndarray]:
         for idx in range(int(self.shape[0])):
             yield self.decode_slice(idx)
@@ -7108,11 +7246,10 @@ class CompressedTileMaskStore:
         shutil.rmtree(self.root, ignore_errors=True)
 
 
-def _encode_bool_mask_slice_payload(idx: int, mask_bool: np.ndarray) -> CompressedTileSlicePayload:
-    lz4_frame = _require_lz4_frame()
+def _encode_bool_mask_slice_payload(idx: int, mask_bool: np.ndarray) -> RawBBoxSlicePayload:
     mask_arr = np.asarray(mask_bool, dtype=bool)
     if mask_arr.size == 0 or not np.any(mask_arr):
-        return CompressedTileSlicePayload(idx=int(idx), is_empty=True)
+        return RawBBoxSlicePayload(idx=int(idx), is_empty=True)
 
     rows = np.any(mask_arr, axis=1)
     cols = np.any(mask_arr, axis=0)
@@ -7120,63 +7257,54 @@ def _encode_bool_mask_slice_payload(idx: int, mask_bool: np.ndarray) -> Compress
     y1 = int(rows.size - np.argmax(rows[::-1]))
     x0 = int(np.argmax(cols))
     x1 = int(cols.size - np.argmax(cols[::-1]))
-    crop = np.ascontiguousarray(mask_arr[y0:y1, x0:x1], dtype=bool)
-    packed = np.packbits(crop.reshape(-1), bitorder=CTILE_BITORDER)
-    payload = lz4_frame.compress(packed.tobytes(), compression_level=0)
-    return CompressedTileSlicePayload(
+    crop = np.ascontiguousarray(mask_arr[y0:y1, x0:x1], dtype=np.uint8)
+    payload = crop.tobytes(order='C')
+    return RawBBoxSlicePayload(
         idx=int(idx),
         is_empty=False,
         y0=int(y0),
         x0=int(x0),
         y1=int(y1),
         x1=int(x1),
-        packed_nbytes=int(packed.nbytes),
+        payload_nbytes=int(len(payload)),
         payload=payload,
         foreground_voxels=int(np.count_nonzero(crop)),
     )
 
 
-def _encode_ctile_slice(idx: int, tile_mask_mm: np.ndarray) -> CompressedTileSlicePayload:
+def _encode_ctile_slice(idx: int, tile_mask_mm: np.ndarray) -> RawBBoxSlicePayload:
     mask_bool = np.asarray(tile_mask_mm[int(idx)], dtype=np.uint8) > 0
     return _encode_bool_mask_slice_payload(int(idx), mask_bool)
 
 
-def _write_compressed_bitpacked_payload_store(
+def _write_raw_bbox_payload_store(
     *,
     shape: Tuple[int, int, int],
     store_dir: Path,
-    encode_slice: Callable[[int], CompressedTileSlicePayload],
+    encode_slice: Callable[[int], RawBBoxSlicePayload],
     format_name: str,
     desc: str,
     workers: int = 1,
     extra_meta: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
-    """Write a slice-chunked bitpacked+LZ4 binary mask store.
+    """Write a slice-chunked raw bbox binary mask store.
 
-    This is used as a general replacement for raw uint8 temporary volumes when the
-    consumer can tolerate slice-at-a-time reads. Empty slices are represented only
-    in the index, nonempty slices are cropped to their foreground bbox, bit-packed,
-    and compressed with LZ4 level 0 for high throughput.
-
-    v12.1.0 also accumulates the Slicer SegmentN_Extent for the stored layer while
-    the slice payloads are written.  Final NRRD assembly can then reuse the stored
-    extent metadata without a separate full-layer extent scan.
+    Write raw uint8 bbox payloads; this stage no longer bitpacks or LZ4-compresses payloads.
     """
-    _require_lz4_frame()
     fmt = str(format_name)
-    if fmt not in COMPRESSED_MASK_FORMATS:
-        raise ValueError(f'Unsupported compressed bitpacked mask format: {fmt}')
+    if fmt not in MASK_STORE_FORMATS:
+        raise ValueError(f'Unsupported raw bbox mask format: {fmt}')
 
     shape_i = (int(shape[0]), int(shape[1]), int(shape[2]))
     if any(v < 0 for v in shape_i):
-        raise ValueError(f'{desc}: invalid compressed store shape {shape_i}')
+        raise ValueError(f'{desc}: invalid raw store shape {shape_i}')
 
     store_dir = Path(store_dir)
     chunks_path_prewrite = store_dir / 'chunks.bin'
     try:
-        _NRRD_COMPRESSED_STORE_CHUNKS_RAM_CACHE.pop(chunks_path_prewrite.resolve(), None)
+        _NRRD_RAW_STORE_CHUNKS_RAM_CACHE.pop(chunks_path_prewrite.resolve(), None)
     except Exception:
-        _NRRD_COMPRESSED_STORE_CHUNKS_RAM_CACHE.pop(chunks_path_prewrite, None)
+        _NRRD_RAW_STORE_CHUNKS_RAM_CACHE.pop(chunks_path_prewrite, None)
     if store_dir.exists():
         shutil.rmtree(store_dir, ignore_errors=True)
     store_dir.mkdir(parents=True, exist_ok=True)
@@ -7187,7 +7315,6 @@ def _write_compressed_bitpacked_payload_store(
     index = np.zeros((int(shape_i[0]),), dtype=CTILE_INDEX_DTYPE)
     worker_count = choose_slice_parallel_workers(int(workers), int(shape_i[0]))
     payload_bytes = 0
-    packed_bytes = 0
     nonempty_slices = 0
     foreground_voxels = 0
     min_t, max_t = int(shape_i[0]), -1
@@ -7195,7 +7322,7 @@ def _write_compressed_bitpacked_payload_store(
     min_x, max_x = int(shape_i[2]), -1
 
     if worker_count <= 1:
-        iterable: Iterable[CompressedTileSlicePayload] = (encode_slice(idx) for idx in range(int(shape_i[0])))
+        iterable: Iterable[RawBBoxSlicePayload] = (encode_slice(idx) for idx in range(int(shape_i[0])))
     else:
         iterable = parallel_map_in_order(
             encode_slice,
@@ -7214,19 +7341,18 @@ def _write_compressed_bitpacked_payload_store(
                 index[idx]['kind'] = np.uint8(0)
                 continue
             payload = bytes(item.payload)
-            compressed_size = int(len(payload))
+            payload_size = int(len(payload))
             chunks_fh.write(payload)
             index[idx]['kind'] = np.uint8(1)
             index[idx]['offset'] = np.uint64(offset)
-            index[idx]['compressed_size'] = np.uint64(compressed_size)
+            index[idx]['payload_size'] = np.uint64(payload_size)
             index[idx]['y0'] = np.uint32(item.y0)
             index[idx]['x0'] = np.uint32(item.x0)
             index[idx]['y1'] = np.uint32(item.y1)
             index[idx]['x1'] = np.uint32(item.x1)
-            index[idx]['packed_nbytes'] = np.uint64(item.packed_nbytes)
-            offset += compressed_size
-            payload_bytes += compressed_size
-            packed_bytes += int(item.packed_nbytes)
+            index[idx]['payload_nbytes'] = np.uint64(item.payload_nbytes)
+            offset += payload_size
+            payload_bytes += payload_size
             foreground_voxels += int(item.foreground_voxels)
             nonempty_slices += 1
             min_t = min(int(min_t), int(idx))
@@ -7248,8 +7374,7 @@ def _write_compressed_bitpacked_payload_store(
         'empty_slices': int(shape_i[0] - nonempty_slices),
         'foreground_voxels': int(foreground_voxels),
         'logical_raw_uint8_bytes': int(raw_logical_bytes),
-        'packed_bytes_before_lz4': int(packed_bytes),
-        'compressed_payload_bytes': int(payload_bytes),
+        'raw_payload_bytes': int(payload_bytes),
         'index_bytes': int(index.nbytes),
         'segment_extent_ijk': _segment_extent_to_json(segment_extent_ijk),
         'segment_extent_shape_tyx': [int(shape_i[0]), int(shape_i[1]), int(shape_i[2])],
@@ -7260,14 +7385,13 @@ def _write_compressed_bitpacked_payload_store(
         'dtype': 'bool',
         'logical_dtype_in_pipeline': 'uint8_0_or_1',
         'chunking': 'slice',
-        'bitorder': CTILE_BITORDER,
-        'precodec': 'numpy.packbits',
-        'compressor': 'lz4',
+        'precodec': 'none',
+        'compressor': 'none',
         'bbox_per_chunk': True,
         'zero_chunk_elision': True,
-        'index_dtype': 'ctile-index-v1',
+        'index_dtype': 'ctile-index-v2-raw',
         'index_record_bytes': int(CTILE_INDEX_DTYPE.itemsize),
-        'packed_shape_encoding': 'flat_uint8_count_in_index.packed_nbytes',
+        'payload_shape_encoding': 'raw_uint8_bbox_shape_from_index',
         'description': str(desc),
         'segment_extent_ijk': _segment_extent_to_json(segment_extent_ijk),
         'segment_extent_axis_order': 'Slicer IJK inclusive extent: minX maxX minY maxY minT maxT for internal layer order (t,Y,X)',
@@ -7278,30 +7402,32 @@ def _write_compressed_bitpacked_payload_store(
         meta.update(dict(extra_meta))
     meta_path.write_text(json.dumps(meta, indent=2) + '\n')
     print(
-        f'{desc}: compressed bitpacked store {store_dir} '
-        f'(raw={raw_logical_bytes / GIB:.2f} GiB, packed={packed_bytes / GIB:.2f} GiB, '
-        f'lz4_payload={payload_bytes / GIB:.2f} GiB, nonempty_slices={nonempty_slices})'
+        f'{desc}: raw bbox mask store {store_dir} '
+        f'(logical_raw={raw_logical_bytes / GIB:.2f} GiB, payload={payload_bytes / GIB:.2f} GiB, '
+        f'nonempty_slices={nonempty_slices})'
     )
     return stats
 
-def write_compressed_bitpacked_mask_store(
+
+def write_raw_bbox_mask_store(
     mask_volume: np.ndarray,
     store_dir: Path,
     *,
     format_name: str = CVOL_FORMAT,
-    desc: str = 'Compressed bitpacked mask store',
+    desc: str = 'Raw bbox mask store',
     workers: int = 1,
     extra_meta: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
+    """Write a v12.2.0 raw bbox mask store."""
     arr = np.asarray(mask_volume)
     if arr.ndim != 3:
         raise ValueError(f'{desc}: expected 3D mask volume, got shape {arr.shape}')
     shape = (int(arr.shape[0]), int(arr.shape[1]), int(arr.shape[2]))
 
-    def _encode(idx: int) -> CompressedTileSlicePayload:
+    def _encode(idx: int) -> RawBBoxSlicePayload:
         return _encode_ctile_slice(int(idx), arr)
 
-    return _write_compressed_bitpacked_payload_store(
+    return _write_raw_bbox_payload_store(
         shape=shape,
         store_dir=Path(store_dir),
         encode_slice=_encode,
@@ -7310,7 +7436,6 @@ def write_compressed_bitpacked_mask_store(
         workers=int(workers),
         extra_meta=extra_meta,
     )
-
 
 def _volume_shape_tuple(volume: object) -> Tuple[int, int, int]:
     shape = getattr(volume, 'shape', None)
@@ -7322,7 +7447,7 @@ def _volume_shape_tuple(volume: object) -> Tuple[int, int, int]:
 
 
 def _read_binary_volume_slice_u8(volume: object, idx: int) -> np.ndarray:
-    if isinstance(volume, CompressedTileMaskStore):
+    if isinstance(volume, RawBBoxMaskStore):
         return volume.decode_slice(int(idx), dtype=np.uint8)
     return np.asarray(volume[int(idx)], dtype=np.uint8)
 
@@ -7331,7 +7456,7 @@ def _read_binary_volume_slice_bool(volume: object, idx: int) -> np.ndarray:
     return np.asarray(_read_binary_volume_slice_u8(volume, int(idx)), dtype=np.uint8) > 0
 
 
-def subtract_volume_to_compressed_bitpacked_store(
+def subtract_volume_to_raw_bbox_store(
     after_mm: np.ndarray,
     before_volume: object,
     store_dir: Path,
@@ -7345,12 +7470,12 @@ def subtract_volume_to_compressed_bitpacked_store(
     if after_shape != before_shape:
         raise ValueError(f'{desc}: shape mismatch {after_shape} vs {before_shape}')
 
-    def _encode_delta(idx: int) -> CompressedTileSlicePayload:
+    def _encode_delta(idx: int) -> RawBBoxSlicePayload:
         after_slice = np.asarray(after_mm[int(idx)], dtype=np.uint8) > 0
         before_slice = _read_binary_volume_slice_bool(before_volume, int(idx))
         return _encode_bool_mask_slice_payload(int(idx), after_slice & (~before_slice))
 
-    return _write_compressed_bitpacked_payload_store(
+    return _write_raw_bbox_payload_store(
         shape=after_shape,
         store_dir=Path(store_dir),
         encode_slice=_encode_delta,
@@ -7384,20 +7509,23 @@ def temp_binary_archive_enabled() -> bool:
     return _env_flag('YOLO_TTA_ARCHIVE_TEMP_BINARY_VOLUMES', True)
 
 
-def compressed_nrrd_layers_enabled() -> bool:
-    return _env_flag('YOLO_TTA_COMPRESS_NRRD_LAYERS', True)
+def raw_bbox_nrrd_layers_enabled() -> bool:
+    raw_env = os.environ.get('YOLO_TTA_RAW_BBOX_NRRD_LAYERS')
+    if raw_env is not None:
+        return _env_flag('YOLO_TTA_RAW_BBOX_NRRD_LAYERS', True)
+    return _env_flag('YOLO_TTA_COMPRESS_NRRD_LAYERS', True)  # backward-compatible alias; payloads are raw bbox stores, not compressed
 
 
-def nrrd_cache_compressed_layers_in_ram_enabled() -> bool:
-    """Cache cvol/ctile compressed payload files in RAM during NRRD streaming.
+def nrrd_cache_raw_bbox_layers_in_ram_enabled() -> bool:
+    """Cache cvol/ctile raw bbox payload files in RAM during NRRD streaming.
 
     The NRRD writer uses the same layer backing files for both ``NRRD streaming:
     segment extents`` and ``NRRD streaming: decomposed layers``.  When those
-    backing files are compressed bitpacked stores, their ``chunks.bin`` payloads
+    backing files are raw bbox stores, their ``chunks.bin`` payloads
     are intentionally read into RAM before slice traversal to remove repeated
     random NVMe reads.
     """
-    return _env_flag('YOLO_TTA_NRRD_CACHE_COMPRESSED_LAYERS_IN_RAM', True)
+    return _env_flag('YOLO_TTA_NRRD_CACHE_RAW_BBOX_LAYERS_IN_RAM', True)
 
 
 def archive_or_delete_binary_volume_storage(
@@ -7406,7 +7534,7 @@ def archive_or_delete_binary_volume_storage(
     keep_temp: bool,
     workers: int,
     desc: str,
-    compressed_dir: Optional[Path] = None,
+    raw_bbox_dir: Optional[Path] = None,
 ) -> None:
     """Close a temporary binary volume and replace kept raw uint8 memmaps with cvol."""
     if volume is None:
@@ -7414,9 +7542,9 @@ def archive_or_delete_binary_volume_storage(
 
     raw_path = _memmap_backing_path(volume)
     if bool(keep_temp) and bool(temp_binary_archive_enabled()) and raw_path is not None:
-        archive_dir = Path(compressed_dir) if compressed_dir is not None else raw_path.with_name(raw_path.name + '.cvol')
+        archive_dir = Path(raw_bbox_dir) if raw_bbox_dir is not None else raw_path.with_name(raw_path.name + '.cvol')
         try:
-            write_compressed_bitpacked_mask_store(
+            write_raw_bbox_mask_store(
                 np.asarray(volume),
                 archive_dir,
                 format_name=CVOL_FORMAT,
@@ -7431,7 +7559,7 @@ def archive_or_delete_binary_volume_storage(
                 pass
             return
         except Exception as exc:
-            print(f'Warning: failed to archive {desc} as compressed bitpacked cvol ({exc}); keeping raw volume {raw_path}')
+            print(f'Warning: failed to archive {desc} as raw bbox cvol ({exc}); keeping raw volume {raw_path}')
 
     close_memmap_array(volume)
     if not bool(keep_temp) and raw_path is not None:
@@ -7441,162 +7569,15 @@ def archive_or_delete_binary_volume_storage(
             pass
 
 
-def close_compressed_or_memmap_volume(volume: object, *, keep_temp: bool = True) -> None:
+def close_raw_store_or_memmap_volume(volume: object, *, keep_temp: bool = True) -> None:
     if volume is None:
         return
-    if isinstance(volume, CompressedTileMaskStore):
+    if isinstance(volume, RawBBoxMaskStore):
         volume.close()
         if not bool(keep_temp):
             volume.unlink()
         return
     close_memmap_array(volume)
-
-
-@dataclass(frozen=True)
-class VolumeSnapshotRef:
-    model_name: str
-    view_name: str
-    source: str  # fullframe or tile
-    pass_index: int
-    path: Path
-    shape: Tuple[int, int, int]
-    dtype: str = 'uint8'
-
-
-@dataclass(frozen=True)
-class NrrdLayerRef:
-    """One orthogonal-space layer for the decomposed v12.1.0 NRRD export.
-
-    The layer is a binary mask in the pipeline's orthogonal ``(t, Y, X)``
-    processing geometry. The backing path may be a raw uint8 memmap or a
-    compressed cvol bitpacked store; the NRRD writer reads either source
-    slice-by-slice and writes a 4D NRRD with a leading list axis.
-    """
-
-    key: str
-    name: str
-    path: Path
-    shape: Tuple[int, int, int]
-    dtype: str = 'uint8'
-    storage_format: str = 'raw_u8'
-    model_name: str = ''
-    view_name: str = ''
-    view_family: str = ''
-    source: str = ''  # fullframe, tile, or global
-    mask_kind: str = ''  # yolo, bridge, union, smoothing_result
-    pass_index: int = 0
-    tile_acceptance: str = ''  # parent_mask, parent_bridge, consolidated, or blank
-    stage: str = ''
-    description: str = ''
-    # Slicer SegmentN_Extent in this layer backing store's own (X,Y,t) index space.
-    # Final NRRD packaging maps this extent into the requested output geometry without
-    # reopening the layer solely to compute header metadata.
-    segment_extent_ijk: Optional[NrrdSegmentExtent] = None
-    segment_extent_shape_tyx: Tuple[int, int, int] = (0, 0, 0)
-    segment_extent_source: str = ''
-
-
-@dataclass(frozen=True)
-class TileGateResult:
-    model_name: str
-    view_name: str
-    config_id: str
-    tile_id: str
-    gate_stats: Dict[str, int]
-
-
-@dataclass(frozen=True)
-class TileConsolidationResult:
-    model_name: str
-    view_name: str
-    interpolation_stats: List[Dict[str, object]]
-    pass_snapshots: Dict[int, VolumeSnapshotRef]
-    nrrd_layers: List[NrrdLayerRef] = field(default_factory=list)
-
-
-def _view_uses_interpolation(view: ViewInfo, interpolate: int) -> bool:
-    return bool((view.family in ('orthogonal', 'radial') or is_tilted_view(view)) and int(interpolate) > 0)
-
-
-# DEAD_CODE_MARKER(v12.1.0-review): legacy interpolation-pass troubleshooting snapshots; --troubleshooting now writes only view/tile overlay MKVs.
-def _snapshot_volume_for_troubleshooting(
-    volume: np.ndarray,
-    *,
-    temp_dir: Path,
-    model_name: str,
-    view_name: str,
-    source: str,
-    pass_index: int,
-    enabled: bool,
-    workers: int = 1,
-) -> Optional[VolumeSnapshotRef]:
-    if not bool(enabled):
-        return None
-
-    path = (
-        temp_dir / 'troubleshooting_pass_snapshots' / str(source) / str(model_name) /
-        str(view_name) / f'pass{int(pass_index)}.u8.dat'
-    )
-    snap_mm = copy_workspace_array(
-        np.asarray(volume),
-        path,
-        desc=f'Troubleshooting snapshot {source}/{model_name}/{view_name}/pass{int(pass_index)}',
-        prefer_memory=False,
-        workers=int(workers),
-    )
-    shape = tuple(int(x) for x in np.asarray(snap_mm).shape)
-    close_memmap_array(snap_mm)
-    return VolumeSnapshotRef(
-        model_name=str(model_name),
-        view_name=str(view_name),
-        source=str(source),
-        pass_index=int(pass_index),
-        path=path,
-        shape=(int(shape[0]), int(shape[1]), int(shape[2])),
-        dtype='uint8',
-    )
-
-
-def _drain_volume_to_mmap(
-    volume: np.ndarray,
-    path: Path,
-    desc: str,
-    *,
-    workers: int = 1,
-) -> np.ndarray:
-    drained = copy_workspace_array(
-        np.asarray(volume),
-        path,
-        desc=desc,
-        prefer_memory=False,
-        workers=int(workers),
-    )
-    flush_array(drained)
-    return drained
-
-
-def _open_snapshot_ref(ref: VolumeSnapshotRef, mode: str = 'r') -> np.memmap:
-    return np.memmap(
-        ref.path,
-        dtype=np.dtype(ref.dtype),
-        mode=str(mode),
-        shape=tuple(int(x) for x in ref.shape),
-    )
-
-
-def _resolve_snapshot_ref(
-    snapshot_refs: Dict[Tuple[str, str, str, int], VolumeSnapshotRef],
-    *,
-    source: str,
-    model_name: str,
-    view_name: str,
-    pass_index: int,
-) -> Optional[VolumeSnapshotRef]:
-    for idx in range(int(pass_index), -1, -1):
-        ref = snapshot_refs.get((str(source), str(model_name), str(view_name), int(idx)))
-        if ref is not None:
-            return ref
-    return None
 
 
 def _volume_has_foreground(mask_mm: np.ndarray) -> bool:
@@ -7825,7 +7806,7 @@ def materialize_nrrd_view_layer(
     )
     layer_dir = temp_dir / 'nrrd_layers' / str(model_name) / str(view.name)
     storage_format = 'raw_u8'
-    if compressed_nrrd_layers_enabled():
+    if raw_bbox_nrrd_layers_enabled():
         raw_path = temp_dir / 'nrrd_work' / 'projected_layers' / str(model_name) / str(view.name) / f'{key}.orthogonal.u8.dat'
         out_path = layer_dir / f'{key}.orthogonal.cvol'
     else:
@@ -7840,8 +7821,8 @@ def materialize_nrrd_view_layer(
         workers=int(workers),
     )
     shape = tuple(int(x) for x in np.asarray(projected).shape)
-    if compressed_nrrd_layers_enabled():
-        layer_stats = write_compressed_bitpacked_mask_store(
+    if raw_bbox_nrrd_layers_enabled():
+        layer_stats = write_raw_bbox_mask_store(
             projected,
             out_path,
             format_name=CVOL_FORMAT,
@@ -7850,7 +7831,7 @@ def materialize_nrrd_view_layer(
             extra_meta={'nrrd_layer_key': key, 'source_raw_path': str(raw_path)},
         )
         segment_extent = _coerce_segment_extent(layer_stats.get('segment_extent_ijk')) or _nrrd_empty_segment_extent()
-        segment_extent_source = 'compressed_cvol_index'
+        segment_extent_source = 'raw_bbox_cvol_index'
         storage_format = CVOL_FORMAT
         close_memmap_array(projected)
         try:
@@ -7915,7 +7896,7 @@ def materialize_nrrd_global_layer(
     )
     layer_dir = temp_dir / 'nrrd_layers' / str(model_name) / view_name
     storage_format = 'raw_u8'
-    if compressed_nrrd_layers_enabled():
+    if raw_bbox_nrrd_layers_enabled():
         raw_path = temp_dir / 'nrrd_work' / 'global_layers' / str(model_name) / f'{key}.orthogonal.u8.dat'
         out_path = layer_dir / f'{key}.orthogonal.cvol'
     else:
@@ -7930,8 +7911,8 @@ def materialize_nrrd_global_layer(
         workers=int(workers),
     )
     shape = tuple(int(x) for x in np.asarray(copied).shape)
-    if compressed_nrrd_layers_enabled():
-        layer_stats = write_compressed_bitpacked_mask_store(
+    if raw_bbox_nrrd_layers_enabled():
+        layer_stats = write_raw_bbox_mask_store(
             copied,
             out_path,
             format_name=CVOL_FORMAT,
@@ -7940,7 +7921,7 @@ def materialize_nrrd_global_layer(
             extra_meta={'nrrd_layer_key': key, 'source_raw_path': str(raw_path)},
         )
         segment_extent = _coerce_segment_extent(layer_stats.get('segment_extent_ijk')) or _nrrd_empty_segment_extent()
-        segment_extent_source = 'compressed_cvol_index'
+        segment_extent_source = 'raw_bbox_cvol_index'
         storage_format = CVOL_FORMAT
         close_memmap_array(copied)
         try:
@@ -7983,9 +7964,9 @@ def prepare_view_volume_after_fullframe(
     model_name: str,
     view: ViewInfo,
     union_mm: np.ndarray,
-    confmap_mm: np.ndarray,
+    confmap_mm: Optional[np.ndarray],
     union_path: Path,
-    confmap_path: Path,
+    confmap_path: Optional[Path],
     temp_dir: Path,
     dense_tiling_active: bool,
     min_conf: float,
@@ -8018,7 +7999,7 @@ def prepare_view_volume_after_fullframe(
     )
 
     close_memmap_array(confmap_mm)
-    if not keep_temp:
+    if confmap_path is not None and not keep_temp:
         try:
             confmap_path.unlink(missing_ok=True)
         except Exception:
@@ -8045,7 +8026,7 @@ def prepare_view_volume_after_fullframe(
         # full-volume duplicate per active view.
         if bool(dense_tiling_active):
             parent_mask_support_path = temp_dir / 'nrrd_support' / str(model_name) / view.name / 'fullframe_yolo_support.cvol'
-            write_compressed_bitpacked_mask_store(
+            write_raw_bbox_mask_store(
                 baseline_native_volume,
                 parent_mask_support_path,
                 format_name=CVOL_FORMAT,
@@ -8053,21 +8034,8 @@ def prepare_view_volume_after_fullframe(
                 workers=int(slice_workers),
                 extra_meta={'support_kind': 'fullframe_yolo_pre_interpolation'},
             )
-            parent_mask_support_mm = CompressedTileMaskStore.open(parent_mask_support_path)
+            parent_mask_support_mm = RawBBoxMaskStore.open(parent_mask_support_path)
 
-    pass_snapshots: Dict[int, VolumeSnapshotRef] = {}
-    snap0 = _snapshot_volume_for_troubleshooting(
-        baseline_native_volume,
-        temp_dir=temp_dir,
-        model_name=str(model_name),
-        view_name=str(view.name),
-        source='fullframe',
-        pass_index=0,
-        enabled=False,  # v12.1.0 legacy troubleshooting pass snapshots are deprecated
-        workers=int(slice_workers),
-    )
-    if snap0 is not None:
-        pass_snapshots[0] = snap0
 
     interpolation_stats: List[Dict[str, object]] = []
     if _view_uses_interpolation(view, int(interpolate)):
@@ -8148,18 +8116,6 @@ def prepare_view_volume_after_fullframe(
                     except Exception:
                         pass
 
-            snap = _snapshot_volume_for_troubleshooting(
-                baseline_native_volume,
-                temp_dir=temp_dir,
-                model_name=str(model_name),
-                view_name=str(view.name),
-                source='fullframe',
-                pass_index=int(pass_idx),
-                enabled=False,  # v12.1.0 legacy troubleshooting pass snapshots are deprecated
-                workers=int(slice_workers),
-            )
-            if snap is not None:
-                pass_snapshots[int(pass_idx)] = snap
 
             if int(stats_local.get('added_voxels', 0)) <= 0:
                 break
@@ -8184,7 +8140,7 @@ def prepare_view_volume_after_fullframe(
 
     if bool(nrrd_layers_enabled) and parent_mask_support_mm is not None:
         parent_bridge_support_path = temp_dir / 'nrrd_support' / str(model_name) / view.name / 'fullframe_bridge_support.cvol'
-        bridge_stats = subtract_volume_to_compressed_bitpacked_store(
+        bridge_stats = subtract_volume_to_raw_bbox_store(
             baseline_native_volume,
             parent_mask_support_mm,
             parent_bridge_support_path,
@@ -8200,7 +8156,7 @@ def prepare_view_volume_after_fullframe(
                 except Exception:
                     pass
         else:
-            parent_bridge_support_mm = CompressedTileMaskStore.open(parent_bridge_support_path)
+            parent_bridge_support_mm = RawBBoxMaskStore.open(parent_bridge_support_path)
 
     final_view_volume: Optional[np.ndarray] = None
     if bool(dense_tiling_active):
@@ -8255,9 +8211,9 @@ def prepare_view_volume_after_fullframe(
     returned_parent_mask_support = parent_mask_support_mm if (bool(nrrd_layers_enabled) and bool(dense_tiling_active)) else None
     returned_parent_bridge_support = parent_bridge_support_mm if (bool(nrrd_layers_enabled) and bool(dense_tiling_active)) else None
     if parent_mask_support_mm is not None and returned_parent_mask_support is None:
-        close_compressed_or_memmap_volume(parent_mask_support_mm, keep_temp=bool(keep_temp))
+        close_raw_store_or_memmap_volume(parent_mask_support_mm, keep_temp=bool(keep_temp))
     if parent_bridge_support_mm is not None and returned_parent_bridge_support is None:
-        close_compressed_or_memmap_volume(parent_bridge_support_mm, keep_temp=bool(keep_temp))
+        close_raw_store_or_memmap_volume(parent_bridge_support_mm, keep_temp=bool(keep_temp))
 
     return PreparedViewResult(
         model_name=str(model_name),
@@ -8265,7 +8221,6 @@ def prepare_view_volume_after_fullframe(
         native_support_mm=baseline_native_volume,
         final_view_volume_mm=final_view_volume,
         interpolation_stats=interpolation_stats,
-        pass_snapshots=pass_snapshots,
         nrrd_layers=nrrd_layers,
         parent_mask_support_mm=returned_parent_mask_support,
         parent_bridge_support_mm=returned_parent_bridge_support,
@@ -8444,8 +8399,8 @@ def ensure_tile_mask_volume_matches_parent_shape(
     """Return a tile mask volume whose shape exactly matches its parent view canvas.
 
     Prediction-time tile masks should already be inverse-mapped into parent view-native
-    coordinates by ``DenseTileJob.M_out_to_src``.  This guard makes the v12.1.0 tile
-    waiting-store rule explicit: before a tile can be bit-packed/compressed, its volume
+    coordinates by ``DenseTileJob.M_out_to_src``.  This guard makes the v12.2.0 tile
+    waiting-store rule explicit: before a tile can be spilled to the raw waiting store, its volume
     shape must be ``(parent_frames, parent_height, parent_width)``.  If a future code path
     produces a different raster size, the binary slices are nearest-neighbor resized to
     the parent shape before compression/staging.
@@ -8457,7 +8412,7 @@ def ensure_tile_mask_volume_matches_parent_shape(
     if src.ndim != 3:
         raise ValueError(f'{desc}: expected a 3D tile mask volume, got shape {src.shape}')
 
-    print(f'{desc}: resizing tile mask volume to parent shape before bitpacking/compression: {tuple(src.shape)} -> {expected}')
+    print(f'{desc}: resizing tile mask volume to parent shape before raw-store spill: {tuple(src.shape)} -> {expected}')
     out = allocate_workspace_array(
         shape=expected,
         dtype=np.uint8,
@@ -8510,7 +8465,7 @@ def postprocess_tile_volume_after_inference(
     )
 
     close_memmap_array(task.tile_confmap_mm)
-    if not keep_temp:
+    if task.tile_confmap_path is not None and not keep_temp:
         try:
             task.tile_confmap_path.unlink(missing_ok=True)
         except Exception:
@@ -8559,7 +8514,7 @@ def postprocess_tile_volume_after_inference(
 
 
 
-def spill_waiting_tile_result_to_compressed_store(
+def spill_waiting_tile_result_to_raw_store(
     result: TilePostprocessResult,
     temp_dir: Path,
     *,
@@ -8567,17 +8522,16 @@ def spill_waiting_tile_result_to_compressed_store(
     keep_original: bool = False,
     expected_parent_shape: Optional[Tuple[int, int, int]] = None,
 ) -> DeferredTilePostprocessResult:
-    """Encode a postprocessed waiting tile into the v12.1.0 compressed ctile store.
+    """Spill a postprocessed waiting tile into the v12.2.0 raw bbox ctile store.
 
-    The waiting store is deliberately not a pipeline output format.  It is optimized for the
-    exact write-once/read-once lifecycle of tile masks whose confidence maps have already been
-    consumed by --min_conf and deleted.  Empty slices are elided, nonempty slices are cropped to
-    their nonzero bounding box, then the cropped bool mask is bit-packed and LZ4-compressed.
+    The function name is retained for stable scheduler call sites. The stored tile
+    payload is no longer bitpacked or LZ4-compressed: empty slices are elided,
+    nonempty slices are cropped to their nonzero bbox, and the crop is written as
+    raw uint8 bytes.
     """
     if result.tile_mask_mm is None:
         raise ValueError('Cannot spill a tile result without a dense tile_mask_mm')
 
-    _require_lz4_frame()
     mask_to_spill = result.tile_mask_mm
     mask_to_spill_path = result.tile_mask_path
     if expected_parent_shape is not None:
@@ -8610,84 +8564,14 @@ def spill_waiting_tile_result_to_compressed_store(
         raise ValueError(f'Waiting tile spill parent-shape guard failed: tile_shape={tile_shape}, expected={tuple(int(x) for x in expected_parent_shape)}')
 
     store_dir = temp_dir / 'waiting_tiles' / result.model_name / result.view_name / result.config_id / f'{result.tile_id}.ctile'
-    if store_dir.exists():
-        shutil.rmtree(store_dir, ignore_errors=True)
-    store_dir.mkdir(parents=True, exist_ok=True)
-    chunks_path = store_dir / 'chunks.bin'
-    index_path = store_dir / 'index.bin'
-    meta_path = store_dir / 'meta.json'
-
-    index = np.zeros((int(tile_shape[0]),), dtype=CTILE_INDEX_DTYPE)
-    worker_count = choose_slice_parallel_workers(int(workers), int(tile_shape[0]))
-    payload_bytes = 0
-    packed_bytes = 0
-    nonempty_slices = 0
-    foreground_voxels = 0
-
-    def _encode(idx: int) -> CompressedTileSlicePayload:
-        return _encode_ctile_slice(int(idx), tile_arr)
-
-    iterable: Iterable[CompressedTileSlicePayload]
-    if worker_count <= 1:
-        iterable = (_encode(idx) for idx in range(int(tile_shape[0])))
-    else:
-        iterable = parallel_map_in_order(
-            _encode,
-            range(int(tile_shape[0])),
-            max_workers=worker_count,
-            max_pending=max(worker_count, worker_count * 2),
-        )
-
-    offset = 0
-    with chunks_path.open('wb') as chunks_fh:
-        for item in iterable:
-            idx = int(item.idx)
-            if bool(item.is_empty):
-                index[idx]['kind'] = np.uint8(0)
-                continue
-            payload = bytes(item.payload)
-            compressed_size = int(len(payload))
-            chunks_fh.write(payload)
-            index[idx]['kind'] = np.uint8(1)
-            index[idx]['offset'] = np.uint64(offset)
-            index[idx]['compressed_size'] = np.uint64(compressed_size)
-            index[idx]['y0'] = np.uint32(item.y0)
-            index[idx]['x0'] = np.uint32(item.x0)
-            index[idx]['y1'] = np.uint32(item.y1)
-            index[idx]['x1'] = np.uint32(item.x1)
-            index[idx]['packed_nbytes'] = np.uint64(item.packed_nbytes)
-            offset += compressed_size
-            payload_bytes += compressed_size
-            packed_bytes += int(item.packed_nbytes)
-            foreground_voxels += int(item.foreground_voxels)
-            nonempty_slices += 1
-
-    index.tofile(index_path)
-    raw_logical_bytes = int(array_nbytes(tile_shape, np.uint8))
-    meta = {
-        'format': CTILE_FORMAT,
-        'shape': [int(tile_shape[0]), int(tile_shape[1]), int(tile_shape[2])],
-        'dtype': 'bool',
-        'logical_dtype_in_pipeline': 'uint8_0_or_1',
-        'chunking': 'slice',
-        'bitorder': CTILE_BITORDER,
-        'precodec': 'numpy.packbits',
-        'compressor': 'lz4',
-        'bbox_per_chunk': True,
-        'zero_chunk_elision': True,
-        'index_dtype': 'ctile-index-v1',
-        'index_record_bytes': int(CTILE_INDEX_DTYPE.itemsize),
-        'packed_shape_encoding': 'flat_uint8_count_in_index.packed_nbytes',
-        'stats': {
-            'nonempty_slices': int(nonempty_slices),
-            'empty_slices': int(tile_shape[0] - nonempty_slices),
-            'foreground_voxels': int(foreground_voxels),
-            'logical_raw_uint8_bytes': int(raw_logical_bytes),
-            'packed_bytes_before_lz4': int(packed_bytes),
-            'compressed_payload_bytes': int(payload_bytes),
-        },
-    }
-    meta_path.write_text(json.dumps(meta, indent=2) + '\n')
+    write_raw_bbox_mask_store(
+        tile_arr,
+        store_dir,
+        format_name=CTILE_FORMAT,
+        desc=f'Waiting tile raw bbox store {result.model_name}/{result.view_name}/{result.config_id}/{result.tile_id}',
+        workers=int(workers),
+        extra_meta={'waiting_tile_id': str(result.tile_id)},
+    )
 
     flush_array(mask_to_spill)
     close_memmap_array(mask_to_spill)
@@ -8707,13 +8591,12 @@ def spill_waiting_tile_result_to_compressed_store(
         storage_format=CTILE_FORMAT,
     )
 
-
-def load_waiting_tile_result_from_compressed_store(waiting: DeferredTilePostprocessResult) -> TilePostprocessResult:
+def load_waiting_tile_result_from_raw_store(waiting: DeferredTilePostprocessResult) -> TilePostprocessResult:
     if str(waiting.storage_format) != CTILE_FORMAT:
         raise ValueError(f'Unsupported waiting tile storage format: {waiting.storage_format}')
-    store = CompressedTileMaskStore.open(waiting.tile_mask_path)
+    store = RawBBoxMaskStore.open(waiting.tile_mask_path)
     if tuple(int(x) for x in store.shape) != tuple(int(x) for x in waiting.tile_shape):
-        raise ValueError(f'Compressed tile shape mismatch: store={store.shape}, expected={waiting.tile_shape}')
+        raise ValueError(f'Raw tile store shape mismatch: store={store.shape}, expected={waiting.tile_shape}')
     return TilePostprocessResult(
         model_name=str(waiting.model_name),
         view_name=str(waiting.view_name),
@@ -8748,7 +8631,7 @@ def stage_tile_result_into_config_canvas(
 ) -> Dict[str, int]:
     """Union one cleaned tile into its tile-size/stride canvas before parent gating.
 
-    This implements the v12.1.0 tile-set staging rule: all positions and angle variants for the
+    This implements the v12.2.0 tile-set staging rule: all positions and angle variants for the
     same --tile_size/--tile_stride configuration are first reassembled into one parent-view canvas.
     The consolidated canvas is gated later at the connected-component level after every tile in
     that configuration has either staged or completed empty.
@@ -8759,7 +8642,7 @@ def stage_tile_result_into_config_canvas(
             store = result.tile_mask_store
             if tuple(int(x) for x in store.shape) != tuple(int(x) for x in np.asarray(tile_set_accumulator_mm).shape):
                 raise ValueError(
-                    f'Compressed tile shape {store.shape} does not match tile-set accumulator '
+                    f'Raw tile store shape {store.shape} does not match tile-set accumulator '
                     f'{tuple(int(x) for x in np.asarray(tile_set_accumulator_mm).shape)}'
                 )
             z_dim = int(store.shape[0])
@@ -8958,7 +8841,6 @@ def finalize_consolidated_tile_volume_for_parent(
     then exported per pass as consolidated tile-bridge layers.
     """
     interpolation_stats: List[Dict[str, object]] = []
-    pass_snapshots: Dict[int, VolumeSnapshotRef] = {}
     nrrd_layers: List[NrrdLayerRef] = []
 
     if not _volume_has_foreground(tile_accumulator_mm):
@@ -8966,8 +8848,7 @@ def finalize_consolidated_tile_volume_for_parent(
             model_name=str(model_name),
             view_name=str(view.name),
             interpolation_stats=interpolation_stats,
-            pass_snapshots=pass_snapshots,
-            nrrd_layers=nrrd_layers,
+                nrrd_layers=nrrd_layers,
         )
 
     if bool(nrrd_layers_enabled):
@@ -9023,18 +8904,6 @@ def finalize_consolidated_tile_volume_for_parent(
             if layer_ref is not None:
                 nrrd_layers.append(layer_ref)
 
-    snap0 = _snapshot_volume_for_troubleshooting(
-        tile_accumulator_mm,
-        temp_dir=temp_dir,
-        model_name=str(model_name),
-        view_name=str(view.name),
-        source='tile',
-        pass_index=0,
-        enabled=False,  # v12.1.0 legacy troubleshooting pass snapshots are deprecated
-        workers=int(slice_workers),
-    )
-    if snap0 is not None:
-        pass_snapshots[0] = snap0
 
     if _view_uses_interpolation(view, int(interpolate)):
         total_passes = int(interpolate_passes)
@@ -9115,18 +8984,6 @@ def finalize_consolidated_tile_volume_for_parent(
                     except Exception:
                         pass
 
-            snap = _snapshot_volume_for_troubleshooting(
-                tile_accumulator_mm,
-                temp_dir=temp_dir,
-                model_name=str(model_name),
-                view_name=str(view.name),
-                source='tile',
-                pass_index=int(pass_idx),
-                enabled=False,  # v12.1.0 legacy troubleshooting pass snapshots are deprecated
-                workers=int(slice_workers),
-            )
-            if snap is not None:
-                pass_snapshots[int(pass_idx)] = snap
 
             if int(stats_local.get('added_voxels', 0)) <= 0:
                 break
@@ -9143,7 +9000,6 @@ def finalize_consolidated_tile_volume_for_parent(
         model_name=str(model_name),
         view_name=str(view.name),
         interpolation_stats=interpolation_stats,
-        pass_snapshots=pass_snapshots,
         nrrd_layers=nrrd_layers,
     )
 
@@ -9152,6 +9008,162 @@ def finalize_consolidated_tile_volume_for_parent(
 # Final Gaussian smoothing
 # --------------------------
 
+
+
+def gaussian_smoothing_gpu_enabled() -> bool:
+    return _env_flag('YOLO_TTA_GAUSSIAN_SMOOTHING_GPU', True)
+
+
+def gaussian_smoothing_gpu_chunk_mib() -> int:
+    return max(256, _env_int('YOLO_TTA_GAUSSIAN_GPU_CHUNK_MIB', 16384))
+
+
+def _try_get_gpu_gaussian_backend() -> Optional[Tuple[object, object]]:
+    try:
+        import cupy as cp  # type: ignore
+        from cupyx.scipy import ndimage as cpx_ndi  # type: ignore
+    except Exception:
+        return None
+    if not hasattr(cpx_ndi, 'gaussian_filter'):
+        return None
+    return cp, cpx_ndi
+
+
+def _gaussian_gpu_core_depth(shape_tyx: Tuple[int, int, int], sigma: float, truncate: float = 4.0) -> Tuple[int, int]:
+    z_dim, h_dim, w_dim = (int(shape_tyx[0]), int(shape_tyx[1]), int(shape_tyx[2]))
+    halo = max(0, int(math.ceil(float(truncate) * float(sigma))))
+    target_bytes = int(gaussian_smoothing_gpu_chunk_mib()) * 1024 * 1024
+    bytes_per_slice = max(1, int(h_dim) * int(w_dim) * np.dtype(np.float32).itemsize)
+    # cupyx.ndimage may allocate temporaries; budget input/output plus one scratch-equivalent.
+    max_read_slices = max(1, int(target_bytes // max(1, bytes_per_slice * 3)))
+    core_depth = max(1, int(max_read_slices) - 2 * int(halo))
+    return min(max(1, int(core_depth)), max(1, int(z_dim))), int(halo)
+
+
+def _try_apply_gaussian_smoothing_gpu_chunked_inplace(
+    mask_mm: np.ndarray,
+    sigma: float,
+    passes: int,
+    temp_dir: Path,
+    *,
+    stats: Dict[str, object],
+    keep_temp: bool = False,
+    workers: int = 1,
+    nrrd_layers: Optional[List[NrrdLayerRef]] = None,
+    nrrd_model_name: str = 'global',
+) -> Optional[Dict[str, object]]:
+    """Apply Gaussian smoothing with a CuPy/cupyx chunk+halo implementation.
+
+    Chunks are split along the t/slice axis and include a halo of ceil(truncate*sigma)
+    slices on both sides.  Each GPU result writes only its core region back to the
+    CPU-backed volume, which makes the chunked result match a whole-volume filter for
+    the unchunked Y/X axes and removes seams along the chunked axis.
+    """
+    if not gaussian_smoothing_gpu_enabled():
+        return None
+    backend = _try_get_gpu_gaussian_backend()
+    if backend is None:
+        print('Warning: Gaussian smoothing GPU backend unavailable (CuPy/cupyx.ndimage); falling back to CPU scipy.ndimage.')
+        return None
+    cp, cpx_ndi = backend
+
+    sigma_f = float(sigma)
+    passes_i = int(passes)
+    if sigma_f <= 0.0 or passes_i <= 0:
+        return stats
+
+    smooth_dir = temp_dir / 'gaussian_smoothing'
+    smooth_dir.mkdir(parents=True, exist_ok=True)
+    shape = tuple(int(x) for x in np.asarray(mask_mm).shape)
+    if len(shape) != 3:
+        raise ValueError(f'Gaussian smoothing expects a 3D volume, got shape {shape}')
+    num_slices = int(shape[0])
+    core_depth, halo = _gaussian_gpu_core_depth(shape, sigma_f, truncate=4.0)
+    stats['backend'] = 'cupy_chunked_gpu'
+    stats['chunk_core_slices'] = int(core_depth)
+    stats['halo_slices'] = int(halo)
+    print(
+        'Gaussian smoothing GPU backend active: '
+        f'shape={shape}, sigma={sigma_f:g}, passes={passes_i}, core_slices={core_depth}, '
+        f'halo={halo}, chunk_budget={gaussian_smoothing_gpu_chunk_mib()} MiB'
+    )
+
+    for pass_idx in range(1, passes_i + 1):
+        print(f'Gaussian smoothing GPU pass {int(pass_idx)}/{int(passes_i)} (sigma={sigma_f:g} voxels)')
+        source_path = smooth_dir / f'pass{int(pass_idx):02d}_source.u8.dat'
+        source_mm = copy_workspace_array(
+            np.asarray(mask_mm, dtype=np.uint8),
+            source_path,
+            desc=f'Gaussian smoothing GPU pass {int(pass_idx)} source snapshot',
+            prefer_memory=False,
+            workers=int(workers),
+        )
+        added_by_slice = np.zeros((num_slices,), dtype=np.int64)
+        removed_by_slice = np.zeros((num_slices,), dtype=np.int64)
+        try:
+            ranges = [(int(z0), int(min(num_slices, z0 + core_depth))) for z0 in range(0, num_slices, core_depth)]
+            for z0, z1 in tqdm(ranges, desc=f'Gaussian smoothing GPU pass {int(pass_idx)}: chunked filter'):
+                read0 = max(0, int(z0) - int(halo))
+                read1 = min(num_slices, int(z1) + int(halo))
+                core0 = int(z0) - int(read0)
+                core1 = core0 + int(z1 - z0)
+                chunk_cpu = np.ascontiguousarray(np.asarray(source_mm[int(read0):int(read1)], dtype=np.float32))
+                chunk_gpu = cp.asarray(chunk_cpu)
+                smoothed_gpu = cpx_ndi.gaussian_filter(
+                    chunk_gpu,
+                    sigma=float(sigma_f),
+                    mode='constant',
+                    cval=0.0,
+                    truncate=4.0,
+                )
+                core_bool = cp.asnumpy(smoothed_gpu[int(core0):int(core1)] >= 0.5).astype(bool, copy=False)
+                old_bool = np.asarray(source_mm[int(z0):int(z1)], dtype=bool)
+                for local_z in range(int(z1 - z0)):
+                    new = core_bool[int(local_z)]
+                    old = old_bool[int(local_z)]
+                    added_by_slice[int(z0) + int(local_z)] = np.int64(np.count_nonzero(new & (~old)))
+                    removed_by_slice[int(z0) + int(local_z)] = np.int64(np.count_nonzero(old & (~new)))
+                mask_mm[int(z0):int(z1), :, :] = core_bool.astype(np.uint8, copy=False)
+                try:
+                    del chunk_gpu, smoothed_gpu, core_bool, chunk_cpu
+                    free_all = getattr(cp.get_default_memory_pool(), 'free_all_blocks', None)
+                    if callable(free_all):
+                        free_all()
+                except Exception:
+                    pass
+        finally:
+            close_memmap_array(source_mm)
+            if not bool(keep_temp):
+                try:
+                    source_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        flush_array(mask_mm)
+        if nrrd_layers is not None:
+            layer_ref = materialize_nrrd_global_layer(
+                mask_mm,
+                model_name=str(nrrd_model_name),
+                source='global',
+                mask_kind='smoothing_result',
+                pass_index=int(pass_idx),
+                stage='gaussian_smoothing',
+                description='Full-volume result after this GPU Gaussian smoothing pass.',
+                temp_dir=temp_dir,
+                workers=int(workers),
+            )
+            if layer_ref is not None:
+                nrrd_layers.append(layer_ref)
+
+        added = int(np.sum(added_by_slice, dtype=np.int64))
+        removed = int(np.sum(removed_by_slice, dtype=np.int64))
+        stats[f'pass{int(pass_idx)}_added_voxels'] = int(added)
+        stats[f'pass{int(pass_idx)}_removed_voxels'] = int(removed)
+        stats['total_added_voxels'] = int(stats.get('total_added_voxels', 0)) + int(added)
+        stats['total_removed_voxels'] = int(stats.get('total_removed_voxels', 0)) + int(removed)
+        stats['passes_completed'] = int(pass_idx)
+
+    return stats
 
 def apply_gaussian_smoothing_inplace(
     mask_mm: np.ndarray,
@@ -9165,17 +9177,17 @@ def apply_gaussian_smoothing_inplace(
     workers: int = 1,
     nrrd_layers: Optional[List[NrrdLayerRef]] = None,
     nrrd_model_name: str = 'global',
-) -> Dict[str, int | float]:
+) -> Dict[str, object]:
     """Smooth the final binary 3D volume with a Gaussian kernel and re-threshold at 0.5.
 
-    The v12.1.0_SLURM smoothing stage is applied after the final view/tile union and optional
+    The v12.2.0_SLURM smoothing stage is applied after the final view/tile union and optional
     3D void fill, but before --keep_objects and before resizing back to the source geometry.
     A single float32 workspace is reused for every pass to avoid retaining multiple dense
     floating-point copies of the volume.
     """
     sigma_f = float(sigma)
     passes_i = int(passes)
-    stats: Dict[str, int | float] = {
+    stats: Dict[str, object] = {
         'enabled': 1 if sigma_f > 0.0 and passes_i > 0 else 0,
         'sigma': float(sigma_f),
         'passes_requested': int(max(0, passes_i)),
@@ -9186,6 +9198,21 @@ def apply_gaussian_smoothing_inplace(
     if sigma_f <= 0.0 or passes_i <= 0:
         return stats
 
+    gpu_stats = _try_apply_gaussian_smoothing_gpu_chunked_inplace(
+        mask_mm,
+        sigma_f,
+        passes_i,
+        temp_dir,
+        stats=stats,
+        keep_temp=bool(keep_temp),
+        workers=int(workers),
+        nrrd_layers=nrrd_layers,
+        nrrd_model_name=str(nrrd_model_name),
+    )
+    if gpu_stats is not None:
+        return gpu_stats
+
+    stats['backend'] = 'cpu_scipy_ndimage'
     smooth_dir = temp_dir / 'gaussian_smoothing'
     smooth_dir.mkdir(parents=True, exist_ok=True)
     work_path = smooth_dir / 'gaussian_float32.dat'
@@ -9604,8 +9631,14 @@ def nrrd_slicer_header(mask_shape_zyx: Tuple[int, int, int]) -> Dict[str, object
     }
 
 
-def nrrd_gzip_compresslevel() -> int:
-    return int(np.clip(_env_int('YOLO_TTA_NRRD_GZIP_LEVEL', 6), 0, 9))
+def nrrd_pigz_compresslevel() -> int:
+    """Compression level passed to pigz for NRRD gzip-encoding."""
+    return int(np.clip(_env_int('YOLO_TTA_NRRD_PIGZ_LEVEL', 6), 0, 9))
+
+
+def nrrd_pigz_threads() -> int:
+    default_threads = max(1, min(_cpu_count(), _env_int('YOLO_TTA_NRRD_PIGZ_MAX_THREADS', 64)))
+    return max(1, _env_int('YOLO_TTA_NRRD_PIGZ_THREADS', int(default_threads)))
 
 
 def nrrd_stream_buffer_bytes() -> int:
@@ -9618,6 +9651,70 @@ def nrrd_madvise_dontneed_interval() -> int:
     # bounded without issuing a syscall after every single slice.
     return max(0, _env_int('YOLO_TTA_NRRD_MADVISE_DONTNEED_INTERVAL', 16))
 
+
+class _PigzPayloadWriter:
+    """Small file-like wrapper that gzip-encodes NRRD payload bytes through pigz."""
+
+    def __init__(self, fh: object) -> None:
+        _require_bin('pigz')
+        level = int(nrrd_pigz_compresslevel())
+        threads = int(nrrd_pigz_threads())
+        level_arg = f'-{level}' if level > 0 else '-0'
+        cmd = ['pigz', '-c', '-n', '-p', str(threads), level_arg]
+        try:
+            flush_fn = getattr(fh, 'flush', None)
+            if callable(flush_fn):
+                flush_fn()
+        except Exception:
+            pass
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=fh, stderr=subprocess.PIPE)
+        if self.proc.stdin is None:
+            raise RuntimeError('pigz stdin was not opened')
+        self.stdin = self.proc.stdin
+        self.cmd = cmd
+
+    def write(self, data: bytes | bytearray | memoryview) -> int:
+        if self.stdin.closed:
+            raise RuntimeError('Cannot write to closed pigz payload stream')
+        written = self.stdin.write(data)
+        return int(0 if written is None else written)
+
+    def close(self) -> None:
+        if self.proc.stdin is not None and not self.proc.stdin.closed:
+            try:
+                self.proc.stdin.close()
+            except Exception:
+                pass
+        self.proc.stdin = None  # type: ignore[assignment]
+        _out, err = self.proc.communicate()
+        if self.proc.returncode not in (0, None):
+            msg = err.decode('utf-8', errors='ignore') if isinstance(err, (bytes, bytearray)) else str(err)
+            raise RuntimeError(f'pigz NRRD payload compression failed: {msg}')
+
+    def __enter__(self) -> '_PigzPayloadWriter':
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if exc_type is None:
+            self.close()
+        else:
+            try:
+                if self.proc.stdin is not None and not self.proc.stdin.closed:
+                    self.proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+            try:
+                self.proc.wait(timeout=5)
+            except Exception:
+                pass
+
+
+def _open_pigz_payload_writer(fh: object) -> _PigzPayloadWriter:
+    return _PigzPayloadWriter(fh)
 
 def _madvise_array_mmap(arr: object, advice_name: str) -> None:
     try:
@@ -9718,7 +9815,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.5-Pro_v12.1.0_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.5-Pro_v12.2.0_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -9740,13 +9837,6 @@ def _write_nrrd_ascii_header(
     fh.write(text.encode('ascii', errors='ignore'))
 
 
-def _open_gzip_payload_writer(fh: object) -> gzip.GzipFile:
-    level = nrrd_gzip_compresslevel()
-    try:
-        return gzip.GzipFile(fileobj=fh, mode='wb', compresslevel=int(level), mtime=0)
-    except TypeError:  # pragma: no cover - older Python compatibility
-        return gzip.GzipFile(fileobj=fh, mode='wb', compresslevel=int(level))
-
 
 def _nrrd_stream_chunk_rows(layer_count: int, width: int, height: int) -> int:
     target = max(1, int(nrrd_stream_buffer_bytes()))
@@ -9754,7 +9844,7 @@ def _nrrd_stream_chunk_rows(layer_count: int, width: int, height: int) -> int:
     return max(1, min(int(height), int(target // bytes_per_row)))
 
 
-def _write_single_nrrd_payload_stream(mask_u8: np.ndarray, gz: gzip.GzipFile) -> None:
+def _write_single_nrrd_payload_stream(mask_u8: np.ndarray, payload_writer: object) -> None:
     src = np.asarray(mask_u8)
     if src.ndim != 3:
         raise ValueError(f'NRRD export expects a 3D mask volume with shape (t,Y,X), got {src.shape}')
@@ -9762,18 +9852,18 @@ def _write_single_nrrd_payload_stream(mask_u8: np.ndarray, gz: gzip.GzipFile) ->
     chunk_rows = _nrrd_stream_chunk_rows(1, w_dim, h_dim)
     print(
         f'NRRD streaming single-volume payload: shape=(X,Y,t)=({w_dim},{h_dim},{t_dim}), '
-        f'row_chunk={int(chunk_rows)}, gzip_level={nrrd_gzip_compresslevel()}'
+        f'row_chunk={int(chunk_rows)}, pigz_level={nrrd_pigz_compresslevel()}, pigz_threads={nrrd_pigz_threads()}'
     )
     for z in tqdm(range(t_dim), desc='NRRD streaming: single volume'):
         frame = np.asarray(src[int(z)], dtype=np.uint8)
         for y0 in range(0, h_dim, chunk_rows):
             y1 = min(h_dim, y0 + chunk_rows)
             block_xy = np.asfortranarray(frame[int(y0):int(y1), :].T)
-            gz.write(block_xy.tobytes(order='F'))
+            payload_writer.write(block_xy.tobytes(order='F'))
 
 
 def write_nrrd(mask_u8: np.ndarray, out_path: Path) -> Path:
-    """Write a binary 3D NRRD using bounded-memory streaming gzip output.
+    """Write a binary 3D NRRD using bounded-memory streaming pigz gzip-encoded output.
 
     This replaces the previous pynrrd path that first transposed the whole volume into a
     second in-memory payload.  Data are written in NRRD/Slicer spatial axis order
@@ -9794,20 +9884,20 @@ def write_nrrd(mask_u8: np.ndarray, out_path: Path) -> Path:
             data_type='uint8',
             encoding='gzip',
         )
-        with _open_gzip_payload_writer(fh) as gz:
-            _write_single_nrrd_payload_stream(mask_u8, gz)
+        with _open_pigz_payload_writer(fh) as payload_writer:
+            _write_single_nrrd_payload_stream(mask_u8, payload_writer)
     return out_path
 
 
-def _nrrd_layer_ref_is_compressed(ref: NrrdLayerRef) -> bool:
-    return str(getattr(ref, 'storage_format', 'raw_u8')) in COMPRESSED_MASK_FORMATS or Path(ref.path).is_dir()
+def _nrrd_layer_ref_is_raw_bbox_store(ref: NrrdLayerRef) -> bool:
+    return str(getattr(ref, 'storage_format', 'raw_u8')) in MASK_STORE_FORMATS or Path(ref.path).is_dir()
 
 
 def _open_nrrd_layer_ref(ref: NrrdLayerRef) -> object:
-    if _nrrd_layer_ref_is_compressed(ref):
-        return CompressedTileMaskStore.open(
+    if _nrrd_layer_ref_is_raw_bbox_store(ref):
+        return RawBBoxMaskStore.open(
             ref.path,
-            cache_payload_in_ram=bool(nrrd_cache_compressed_layers_in_ram_enabled()),
+            cache_payload_in_ram=bool(nrrd_cache_raw_bbox_layers_in_ram_enabled()),
         )
     return np.memmap(
         ref.path,
@@ -9818,19 +9908,19 @@ def _open_nrrd_layer_ref(ref: NrrdLayerRef) -> object:
 
 
 def _close_nrrd_layer_source(src: object) -> None:
-    if isinstance(src, CompressedTileMaskStore):
+    if isinstance(src, RawBBoxMaskStore):
         src.close()
         return
     close_memmap_array(src)
 
 
 def _log_nrrd_streaming_sources(effective_refs: Sequence[NrrdLayerRef]) -> None:
-    compressed = [ref for ref in effective_refs if _nrrd_layer_ref_is_compressed(ref)]
-    raw = [ref for ref in effective_refs if not _nrrd_layer_ref_is_compressed(ref)]
+    raw_bbox = [ref for ref in effective_refs if _nrrd_layer_ref_is_raw_bbox_store(ref)]
+    raw = [ref for ref in effective_refs if not _nrrd_layer_ref_is_raw_bbox_store(ref)]
     print(
         'NRRD streaming source files used by decomposed-layer payload packaging: '
-        f'{len(effective_refs)} layer backing path(s); compressed_bitpacked={len(compressed)}, raw_u8={len(raw)}, '
-        f'compressed_payload_ram_cache={nrrd_cache_compressed_layers_in_ram_enabled()}, '
+        f'{len(effective_refs)} layer backing path(s); raw_bbox_store={len(raw_bbox)}, raw_u8={len(raw)}, '
+        f'raw_bbox_payload_ram_cache={nrrd_cache_raw_bbox_layers_in_ram_enabled()}, '
         f'precomputed_segment_extents={nrrd_precomputed_segment_extents_enabled()}'
     )
     preview = list(effective_refs[:8])
@@ -10121,8 +10211,8 @@ def _transform_segment_extent_to_output_shape(
     return mapped
 
 
-def _read_compressed_store_segment_extent(ref: NrrdLayerRef) -> Optional[NrrdSegmentExtent]:
-    if not _nrrd_layer_ref_is_compressed(ref):
+def _read_raw_store_segment_extent(ref: NrrdLayerRef) -> Optional[NrrdSegmentExtent]:
+    if not _nrrd_layer_ref_is_raw_bbox_store(ref):
         return None
     meta_path = Path(ref.path) / 'meta.json'
     index_path = Path(ref.path) / 'index.bin'
@@ -10140,7 +10230,7 @@ def _read_compressed_store_segment_extent(ref: NrrdLayerRef) -> Optional[NrrdSeg
         shape_i = (int(shape[0]), int(shape[1]), int(shape[2]))
         if index_path.exists():
             index = np.fromfile(index_path, dtype=CTILE_INDEX_DTYPE, count=int(shape_i[0]))
-            return _compressed_index_segment_extent(index, shape_i)
+            return _raw_store_index_segment_extent(index, shape_i)
     except Exception:
         return None
     return None
@@ -10155,8 +10245,8 @@ def _precomputed_segment_extent_for_layer_ref(
     stored_extent = _coerce_segment_extent(getattr(ref, 'segment_extent_ijk', None))
     source = str(getattr(ref, 'segment_extent_source', '') or 'layer_ref_metadata')
     if stored_extent is None:
-        stored_extent = _read_compressed_store_segment_extent(ref)
-        source = 'compressed_store_metadata'
+        stored_extent = _read_raw_store_segment_extent(ref)
+        source = 'raw_bbox_store_metadata'
     if stored_extent is None:
         return None
     transformed = _transform_segment_extent_to_output_shape(
@@ -10219,6 +10309,7 @@ def _resolve_segment_extent_for_layer_ref(
     return _scan_segment_extent_for_layer_ref(ref, output_shape), 'fallback_layer_scan'
 
 
+# DEAD_CODE_MARKER(v12.2.0-post-refactor): compatibility wrapper is no longer called after direct extent/source resolution; keep for one release but do not prune automatically.
 def _compute_segment_extent_for_layer_ref(
     ref: NrrdLayerRef,
     output_shape: Tuple[int, int, int],
@@ -10228,11 +10319,11 @@ def _compute_segment_extent_for_layer_ref(
 def _write_decomposed_nrrd_payload_stream(
     effective_refs: Sequence[NrrdLayerRef],
     output_shape: Tuple[int, int, int],
-    gz: gzip.GzipFile,
+    payload_writer: object,
 ) -> None:
-    """Stream decomposed ``(layer,X,Y,t)`` gzip payload in NRRD Fortran axis order.
+    """Stream decomposed ``(layer,X,Y,t)`` pigz gzip-encoded payload in NRRD Fortran axis order.
 
-    This is the core RAM-reduction change for v12.1.0 updates.  The old implementation built a
+    This is the core RAM-reduction change for v12.2.0 updates.  The old implementation built a
     full ``(layer,X,Y,t)`` memmap and then handed it to pynrrd; OS page cache plus writer-side
     traversal could push peak resident memory past the SLURM allocation.  This path keeps only a
     bounded ``(layer,X,row_chunk)`` buffer plus one source row block/slice at a time.
@@ -10244,7 +10335,7 @@ def _write_decomposed_nrrd_payload_stream(
     print(
         f'NRRD streaming decomposed payload: layers={layer_count}, shape=(layer,X,Y,t)='
         f'({layer_count},{out_w},{out_h},{out_t}), row_chunk={chunk_rows}, '
-        f'buffer~{buffer_bytes / GIB:.3f} GiB, gzip_level={nrrd_gzip_compresslevel()}'
+        f'buffer~{buffer_bytes / GIB:.3f} GiB, pigz_level={nrrd_pigz_compresslevel()}, pigz_threads={nrrd_pigz_threads()}'
     )
 
     opened: List[object] = []
@@ -10270,7 +10361,7 @@ def _write_decomposed_nrrd_payload_stream(
                         int(y1),
                     )
                     block[int(layer_idx), :, :] = np.asarray(row_block_yx, dtype=np.uint8).T
-                gz.write(block.tobytes(order='F'))
+                payload_writer.write(block.tobytes(order='F'))
             if madvise_interval > 0 and ((int(z) + 1) % int(madvise_interval) == 0):
                 for src in opened:
                     _madvise_array_mmap(src, 'MADV_DONTNEED')
@@ -10362,7 +10453,7 @@ def write_decomposed_nrrd(
 
     Each supplied layer is an orthogonal ``(t,Y,X)`` binary mask in processing geometry.  Layers are
     restored to the final output geometry on the fly when cubic resizing changed the working shape,
-    then streamed as a gzip-compressed 4D payload ordered ``(layer, X, Y, t)``.  A sidecar
+    then streamed as a pigz gzip-encoded 4D payload ordered ``(layer, X, Y, t)``.  A sidecar
     ``*.manifest.json`` is written next to the NRRD so downstream tools can reconstruct unions
     without parsing NRRD custom fields.
     """
@@ -10381,7 +10472,7 @@ def write_decomposed_nrrd(
     if bool(include_final_output_layer):
         final_ref_path = (
             temp_dir / 'nrrd_layers' / 'global' /
-            ('final_output_binary.orthogonal.cvol' if compressed_nrrd_layers_enabled() else 'final_output_binary.orthogonal.u8.dat')
+            ('final_output_binary.orthogonal.cvol' if raw_bbox_nrrd_layers_enabled() else 'final_output_binary.orthogonal.u8.dat')
         )
         final_ref = materialize_nrrd_global_layer(
             final_mask_u8,
@@ -10397,8 +10488,8 @@ def write_decomposed_nrrd(
         if final_ref is None:
             # Preserve an empty final layer for empty volumes so the NRRD still documents final output.
             storage_format = 'raw_u8'
-            if compressed_nrrd_layers_enabled():
-                write_compressed_bitpacked_mask_store(
+            if raw_bbox_nrrd_layers_enabled():
+                write_raw_bbox_mask_store(
                     np.asarray(final_mask_u8, dtype=np.uint8),
                     final_ref_path,
                     format_name=CVOL_FORMAT,
@@ -10482,8 +10573,8 @@ def write_decomposed_nrrd(
             data_type='uint8',
             encoding='gzip',
         )
-        with _open_gzip_payload_writer(fh) as gz:
-            _write_decomposed_nrrd_payload_stream(effective_refs, output_shape, gz)
+        with _open_pigz_payload_writer(fh) as payload_writer:
+            _write_decomposed_nrrd_payload_stream(effective_refs, output_shape, payload_writer)
 
     _write_decomposed_nrrd_manifest(
         out_path=out_path,
@@ -10584,7 +10675,7 @@ def write_native_view_overlay_video(
     *,
     show_progress: bool = True,
 ) -> Path:
-    """Write a v12.1.0 troubleshooting overlay in a view's own slice space.
+    """Write a v12.2.0 troubleshooting overlay in a view's own slice space.
 
     The mask is already flattened in the native raster consumed by/produced for
     the view: shape (view.num_slices, view.src_h, view.src_w). Source frames are
@@ -10636,7 +10727,7 @@ def collect_troubleshooting_overlay_futures(
     fps: float,
     show_progress: bool = False,
 ) -> Tuple[Dict[str, Path], List[Future]]:
-    """Schedule simplified v12.1.0 troubleshooting overlay MKVs."""
+    """Schedule simplified v12.2.0 troubleshooting overlay MKVs."""
     result_paths: Dict[str, Path] = {}
     futures: List[Future] = []
     troubleshooting_dir = Path(out_dir) / 'troubleshooting'
@@ -10961,842 +11052,6 @@ def collect_multiplanar_output_futures(
 
 
 
-# DEAD_CODE_MARKER(v12.1.0-review): legacy troubleshooting pass-output assembly retained but unused by v12.1.0.
-def _build_snapshot_native_union_for_view(
-    *,
-    snapshot_refs: Dict[Tuple[str, str, str, int], VolumeSnapshotRef],
-    model_name: str,
-    view: ViewInfo,
-    pass_index: int,
-    temp_dir: Path,
-    workers: int,
-) -> Optional[np.ndarray]:
-    refs: List[VolumeSnapshotRef] = []
-    full_ref = _resolve_snapshot_ref(
-        snapshot_refs,
-        source='fullframe',
-        model_name=str(model_name),
-        view_name=str(view.name),
-        pass_index=int(pass_index),
-    )
-    tile_ref = _resolve_snapshot_ref(
-        snapshot_refs,
-        source='tile',
-        model_name=str(model_name),
-        view_name=str(view.name),
-        pass_index=int(pass_index),
-    )
-    if full_ref is not None:
-        refs.append(full_ref)
-    if tile_ref is not None:
-        refs.append(tile_ref)
-    if not refs:
-        return None
-
-    shape = tuple(int(x) for x in refs[0].shape)
-    for ref in refs[1:]:
-        if tuple(int(x) for x in ref.shape) != shape:
-            raise ValueError(
-                f'Troubleshooting snapshot shape mismatch for {model_name}/{view.name}/pass{pass_index}: '
-                f'{shape} vs {tuple(int(x) for x in ref.shape)}'
-            )
-
-    union_path = (
-        temp_dir / 'troubleshooting_pass_assembly' / f'pass{int(pass_index)}' /
-        str(model_name) / f'{view.name}.native_union.u8.dat'
-    )
-    native_union = allocate_workspace_array(
-        shape=shape,
-        dtype=np.uint8,
-        path=union_path,
-        desc=f'Troubleshooting pass {int(pass_index)} native union {model_name}/{view.name}',
-        prefer_memory=False,
-    )
-
-    for ref in refs:
-        src = _open_snapshot_ref(ref, mode='r')
-        try:
-            union_volume_into_volume(
-                native_union,
-                src,
-                workers=int(workers),
-                desc=f'Assembling troubleshooting snapshot {ref.source}/{model_name}/{view.name}/pass{int(ref.pass_index)}',
-            )
-        finally:
-            close_memmap_array(src)
-
-    return native_union
-
-
-# DEAD_CODE_MARKER(v12.1.0-review): legacy troubleshooting pass-output assembly retained but unused by v12.1.0.
-def build_troubleshooting_pass_union(
-    *,
-    snapshot_refs: Dict[Tuple[str, str, str, int], VolumeSnapshotRef],
-    model_names: Sequence[str],
-    views: Sequence[ViewInfo],
-    pass_index: int,
-    T: int,
-    H: int,
-    W: int,
-    enable_multiplanar: bool,
-    min_radius: float,
-    temp_dir: Path,
-    keep_temp: bool,
-    workers: int,
-) -> np.ndarray:
-    if len(model_names) != 1:
-        raise ValueError('v12.1.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
-    view_volumes_for_pass: Dict[str, Dict[str, np.ndarray]] = {str(model_name): {} for model_name in model_names}
-    intermediate_volumes: List[np.ndarray] = []
-
-    try:
-        for model_name in model_names:
-            for view in views:
-                native_union = _build_snapshot_native_union_for_view(
-                    snapshot_refs=snapshot_refs,
-                    model_name=str(model_name),
-                    view=view,
-                    pass_index=int(pass_index),
-                    temp_dir=temp_dir,
-                    workers=int(workers),
-                )
-                if native_union is None:
-                    continue
-                intermediate_volumes.append(native_union)
-
-                if view.family == 'radial':
-                    if tuple(int(x) for x in native_union.shape) == (int(T), int(H), int(W)):
-                        radial_volume = native_union
-                    else:
-                        radial_volume = backproject_radial_volume_to_volume(
-                            radial_mask_mm=native_union,
-                            radial_view=view,
-                            out_path=(
-                                temp_dir / 'troubleshooting_pass_assembly' / f'pass{int(pass_index)}' /
-                                str(model_name) / f'{view.name}.backprojected.u8.dat'
-                            ),
-                            desc=f'Backprojecting troubleshooting pass {int(pass_index)} {model_name}/{view.name}',
-                            prefer_memory=False,
-                            workers=int(workers),
-                        )
-                        intermediate_volumes.append(radial_volume)
-                    if float(min_radius) > 0.0:
-                        apply_transverse_min_radius_filter_inplace(
-                            radial_volume,
-                            float(min_radius),
-                            workers=int(workers),
-                        )
-                    view_volumes_for_pass[str(model_name)][view.name] = radial_volume
-                elif is_tilted_view(view):
-                    if tuple(int(x) for x in native_union.shape) == (int(T), int(H), int(W)):
-                        tilted_volume = native_union
-                    else:
-                        tilted_volume = backproject_tilted_volume_to_volume(
-                            tilted_mask_mm=native_union,
-                            tilted_view=view,
-                            out_path=(
-                                temp_dir / 'troubleshooting_pass_assembly' / f'pass{int(pass_index)}' /
-                                str(model_name) / f'{view.name}.backprojected.u8.dat'
-                            ),
-                            desc=f'Backprojecting troubleshooting pass {int(pass_index)} {model_name}/{view.name}',
-                            prefer_memory=False,
-                            workers=int(workers),
-                        )
-                        intermediate_volumes.append(tilted_volume)
-                    view_volumes_for_pass[str(model_name)][view.name] = tilted_volume
-                else:
-                    view_volumes_for_pass[str(model_name)][view.name] = native_union
-
-        # Troubleshooting pass outputs are stage snapshots taken before the corresponding
-        # interpolation pass. They must not run the final 3D void fill; v12.1.0 keeps
-        # 3D void fill out of troubleshooting pre-pass outputs and applies it only when
-        # --enable_3d_void_fill is active for the normal final output.
-        pass_union = assemble_current_view_union_volume(
-            view_volumes_by_model=view_volumes_for_pass,
-            T=int(T),
-            H=int(H),
-            W=int(W),
-            disable_multiplanar=not bool(enable_multiplanar),
-            out_path=temp_dir / 'troubleshooting_pass_outputs' / f'final_union_pass{int(pass_index)}.u8.dat',
-            prefer_memory=False,
-            workers=int(workers),
-        )
-        return pass_union
-    finally:
-        for vol in intermediate_volumes:
-            close_memmap_array(vol)
-
-
-# DEAD_CODE_MARKER(v12.1.0-review): legacy troubleshooting pre-interpolation output scheduler retained but unused by v12.1.0.
-def schedule_troubleshooting_pass_outputs(
-    *,
-    output_manager: BackgroundOutputManager,
-    snapshot_refs: Dict[Tuple[str, str, str, int], VolumeSnapshotRef],
-    model_names: Sequence[str],
-    views: Sequence[ViewInfo],
-    volume_rgb: np.ndarray,
-    out_dir: Path,
-    stem: str,
-    fps: float,
-    save_binary_pattern_value: Optional[str],
-    save_labels_pattern_value: Optional[str],
-    save_nrrd_flag: bool,
-    save_sagittal_flag: bool,
-    save_coronal_flag: bool,
-    total_passes: int,
-    T: int,
-    H: int,
-    W: int,
-    enable_multiplanar: bool,
-    min_radius: float,
-    temp_dir: Path,
-    keep_temp: bool,
-    frame_workers: int,
-    workers: int,
-) -> Dict[str, Path]:
-    if len(model_names) != 1:
-        raise ValueError('v12.1.0_SLURM supports exactly one --model; troubleshooting outputs cannot combine multiple models')
-    if int(total_passes) < 0 or not snapshot_refs:
-        return {}
-
-    # Save only the additional pre-interpolation troubleshooting passes. For example,
-    # --interpolate_passes 2 saves Pass0 and Pass1 here; the normal final output is Pass2
-    # and is saved untagged by the main output path. Use actual captured snapshot indices
-    # so early interpolation termination does not synthesize duplicate pass outputs.
-    available_prepass_indices = sorted({
-        int(ref.pass_index)
-        for ref in snapshot_refs.values()
-        if 0 <= int(ref.pass_index) < int(total_passes)
-    })
-    if 0 not in available_prepass_indices:
-        available_prepass_indices.insert(0, 0)
-
-    all_paths: Dict[str, Path] = {}
-    for pass_idx in available_prepass_indices:
-        print(f"\n=== Scheduling troubleshooting pre-interpolation outputs: pass {int(pass_idx)} ===")
-        pass_union = build_troubleshooting_pass_union(
-            snapshot_refs=snapshot_refs,
-            model_names=model_names,
-            views=views,
-            pass_index=int(pass_idx),
-            T=int(T),
-            H=int(H),
-            W=int(W),
-            enable_multiplanar=bool(enable_multiplanar),
-            min_radius=float(min_radius),
-            temp_dir=temp_dir,
-            keep_temp=bool(keep_temp),
-            workers=int(workers),
-        )
-        tag = f'Pass{int(pass_idx)}'
-        pass_paths, pass_futures = collect_pipeline_output_futures(
-            output_manager.executor,
-            volume_rgb=volume_rgb,
-            mask_u8=pass_union,
-            out_dir=out_dir,
-            stem=stem,
-            fps=float(fps),
-            save_binary_pattern_value=save_binary_pattern_value,
-            save_labels_pattern_value=save_labels_pattern_value,
-            save_nrrd_flag=bool(save_nrrd_flag),
-            tag=tag,
-            frame_workers=int(frame_workers),
-            show_progress=False,
-        )
-        if bool(save_sagittal_flag) or bool(save_coronal_flag):
-            extra_paths, extra_futures = collect_multiplanar_output_futures(
-                output_manager.executor,
-                volume_rgb=volume_rgb,
-                mask_u8=pass_union,
-                out_dir=out_dir,
-                stem=stem,
-                fps=float(fps),
-                save_binary_pattern_value=save_binary_pattern_value,
-                save_labels_pattern_value=save_labels_pattern_value,
-                save_sagittal_flag=bool(save_sagittal_flag),
-                save_coronal_flag=bool(save_coronal_flag),
-                tag=tag,
-                frame_workers=int(frame_workers),
-                show_progress=False,
-            )
-            pass_paths.update(extra_paths)
-            pass_futures.extend(extra_futures)
-
-        output_manager.submit(BackgroundOutputSubmission(
-            label=f'troubleshooting pass {int(pass_idx)} outputs',
-            result_paths=pass_paths,
-            futures=pass_futures,
-            resources=[pass_union],
-        ))
-        for key, path in pass_paths.items():
-            all_paths[f'troubleshooting_pass{int(pass_idx)}_{key}'] = path
-    return all_paths
-
-
-
-@dataclass(frozen=True)
-class LowQualityDownbinSpec:
-    raw_value: str
-    token: str
-    scale: float
-    output_shape_t_y_x: Tuple[int, int, int]
-    warning: str = ''
-
-
-def _nearest_multiple_of_four(value: float) -> int:
-    return max(4, int(math.floor(float(value) / 4.0 + 0.5)) * 4)
-
-
-def _round_low_quality_dimension(value: float) -> int:
-    # Large SLURM volumes should round to multiples of 4 per spec. For tiny synthetic
-    # tests, avoid changing a sub-4 dimension to 4 unless the scaled value warrants it.
-    value_f = max(1.0, float(value))
-    if value_f < 4.0:
-        return max(1, int(round(value_f)))
-    return _nearest_multiple_of_four(value_f)
-
-
-def _low_quality_token(raw: str, shape_t_y_x: Tuple[int, int, int]) -> str:
-    safe_raw = str(raw).strip().replace('-', 'm').replace('.', 'p').replace(',', '_')
-    t_dim, h_dim, w_dim = (int(shape_t_y_x[0]), int(shape_t_y_x[1]), int(shape_t_y_x[2]))
-    return f'{safe_raw}_{int(w_dim)}x{int(h_dim)}x{int(t_dim)}'
-
-
-def resolve_low_quality_downbin_specs(
-    downbin_values: Sequence[str] | str | None,
-    low_quality_requested: bool,
-    source_shape_t_y_x: Tuple[int, int, int],
-) -> Tuple[List[LowQualityDownbinSpec], List[str]]:
-    """Resolve v12.1.0 isotropic low-quality downbins in native input geometry."""
-    if downbin_values is None and not bool(low_quality_requested):
-        return [], []
-
-    raw_tokens = _parse_token_list(downbin_values) if downbin_values is not None else []
-    if not raw_tokens:
-        raw_tokens = ['1024']
-
-    in_t, in_h, in_w = (int(source_shape_t_y_x[0]), int(source_shape_t_y_x[1]), int(source_shape_t_y_x[2]))
-    max_dim = max(1, int(in_t), int(in_h), int(in_w))
-    specs: List[LowQualityDownbinSpec] = []
-    warnings: List[str] = []
-    seen_shapes: set[Tuple[int, int, int]] = set()
-
-    for raw in raw_tokens:
-        raw_s = str(raw).strip()
-        if not raw_s:
-            continue
-        try:
-            value = float(raw_s)
-        except Exception as exc:
-            raise ValueError(f'--save_low_quality_downbin value is not numeric: {raw_s!r}') from exc
-        if not math.isfinite(value) or value <= 0.0:
-            raise ValueError('--save_low_quality_downbin values must be positive finite numbers')
-
-        warning = ''
-        raw_lower = raw_s.lower()
-        looks_float = ('.' in raw_s) or ('e' in raw_lower)
-        if looks_float and value <= 1.0:
-            scale = float(value)
-        else:
-            nearest_int = int(round(value))
-            if abs(float(value) - float(nearest_int)) > 1e-6:
-                raise ValueError('Integer --save_low_quality_downbin values >= 1 must be whole numbers; use a fraction such as 0.5 for scale factors')
-            if nearest_int <= 0:
-                raise ValueError('--save_low_quality_downbin integer targets must be positive')
-            rounded_target = _nearest_multiple_of_four(float(nearest_int))
-            if int(rounded_target) != int(nearest_int):
-                warning = (
-                    f'--save_low_quality_downbin {int(nearest_int)} is not a multiple of 4; '
-                    f'rounded to {int(rounded_target)} for isotropic low-quality output.'
-                )
-                warnings.append(warning)
-            scale = float(rounded_target) / float(max_dim)
-
-        out_t = _round_low_quality_dimension(float(in_t) * float(scale))
-        out_h = _round_low_quality_dimension(float(in_h) * float(scale))
-        out_w = _round_low_quality_dimension(float(in_w) * float(scale))
-        shape = (int(out_t), int(out_h), int(out_w))
-        if shape in seen_shapes:
-            continue
-        seen_shapes.add(shape)
-        specs.append(LowQualityDownbinSpec(
-            raw_value=raw_s,
-            token=_low_quality_token(raw_s, shape),
-            scale=float(scale),
-            output_shape_t_y_x=shape,
-            warning=warning,
-        ))
-
-    return specs, warnings
-
-
-def resize_gray_volume_to_shape(
-    volume_gray: np.ndarray,
-    out_shape: Tuple[int, int, int],
-    out_path: Path,
-    *,
-    workers: int = 1,
-    prefer_memory: bool = True,
-    reserve_bytes: int = 8 * GIB,
-    desc: str = 'Resizing gray volume',
-) -> np.ndarray:
-    in_t, in_h, in_w = (int(volume_gray.shape[0]), int(volume_gray.shape[1]), int(volume_gray.shape[2]))
-    out_t, out_h, out_w = (int(out_shape[0]), int(out_shape[1]), int(out_shape[2]))
-    if (in_t, in_h, in_w) == (out_t, out_h, out_w):
-        return volume_gray
-
-    out_mm = allocate_workspace_array(
-        shape=(out_t, out_h, out_w),
-        dtype=np.uint8,
-        path=out_path,
-        desc=desc,
-        prefer_memory=bool(prefer_memory),
-        reserve_bytes=int(reserve_bytes),
-    )
-    worker_count = choose_slice_parallel_workers(int(workers), int(out_t))
-    chunk_size = choose_parallel_chunk_size(out_t, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
-    xy_interp = cv2.INTER_AREA if (out_h <= in_h and out_w <= in_w) else cv2.INTER_LINEAR
-
-    def _render_target_slice(out_z: int) -> None:
-        src_z = _linear_source_index(int(out_z), int(out_t), int(in_t))
-        z0 = int(math.floor(src_z))
-        z1 = min(in_t - 1, z0 + 1)
-        alpha = float(src_z - float(z0))
-        f0 = _resize_gray_slice_nearest_or_linear(volume_gray[z0], out_w, out_h, xy_interp)
-        if z1 == z0 or alpha <= 1e-7:
-            out_mm[int(out_z), :, :] = f0
-            return
-        f1 = _resize_gray_slice_nearest_or_linear(volume_gray[z1], out_w, out_h, xy_interp)
-        blended = np.clip(
-            np.rint((1.0 - alpha) * f0.astype(np.float32, copy=False) + alpha * f1.astype(np.float32, copy=False)),
-            0.0,
-            255.0,
-        ).astype(np.uint8)
-        out_mm[int(out_z), :, :] = blended
-
-    parallel_for_indices_chunked(
-        int(out_t),
-        _render_target_slice,
-        max_workers=worker_count,
-        desc=desc,
-        chunk_size=chunk_size,
-        show_progress=True,
-    )
-    flush_array(out_mm)
-    return out_mm
-
-
-def resize_binary_mask_volume_to_shape(
-    mask_u8: np.ndarray,
-    out_shape: Tuple[int, int, int],
-    out_path: Path,
-    *,
-    workers: int = 1,
-    prefer_memory: bool = True,
-    reserve_bytes: int = 8 * GIB,
-    desc: str = 'Resizing binary mask volume',
-) -> np.ndarray:
-    in_t, in_h, in_w = (int(mask_u8.shape[0]), int(mask_u8.shape[1]), int(mask_u8.shape[2]))
-    out_t, out_h, out_w = (int(out_shape[0]), int(out_shape[1]), int(out_shape[2]))
-    if (in_t, in_h, in_w) == (out_t, out_h, out_w):
-        return mask_u8
-
-    out_mm = allocate_workspace_array(
-        shape=(out_t, out_h, out_w),
-        dtype=np.uint8,
-        path=out_path,
-        desc=desc,
-        prefer_memory=bool(prefer_memory),
-        reserve_bytes=int(reserve_bytes),
-    )
-    worker_count = choose_slice_parallel_workers(int(workers), int(out_t))
-    chunk_size = choose_parallel_chunk_size(out_t, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
-
-    def _resize_mask_xy(frame: np.ndarray) -> np.ndarray:
-        frame_u8 = (np.asarray(frame, dtype=np.uint8) > 0).astype(np.uint8, copy=False)
-        if int(frame_u8.shape[0]) == int(out_h) and int(frame_u8.shape[1]) == int(out_w):
-            return np.ascontiguousarray(frame_u8)
-        if int(out_h) <= int(frame_u8.shape[0]) and int(out_w) <= int(frame_u8.shape[1]):
-            scaled = cv2.resize(
-                np.ascontiguousarray(frame_u8 * np.uint8(255)),
-                (int(out_w), int(out_h)),
-                interpolation=cv2.INTER_AREA,
-            )
-            return (scaled > 0).astype(np.uint8, copy=False)
-        scaled = cv2.resize(
-            np.ascontiguousarray(frame_u8),
-            (int(out_w), int(out_h)),
-            interpolation=cv2.INTER_NEAREST,
-        )
-        return (scaled > 0).astype(np.uint8, copy=False)
-
-    def _restore_slice(out_z: int) -> None:
-        src_start = int(math.floor(float(out_z) * float(in_t) / float(out_t)))
-        src_stop = int(math.ceil(float(out_z + 1) * float(in_t) / float(out_t)))
-        src_start = int(np.clip(src_start, 0, in_t - 1))
-        src_stop = int(np.clip(max(src_start + 1, src_stop), 1, in_t))
-        restored = np.zeros((int(out_h), int(out_w)), dtype=np.uint8)
-        for src_idx in range(src_start, src_stop):
-            restored |= _resize_mask_xy(mask_u8[int(src_idx)])
-        out_mm[int(out_z), :, :] = restored
-
-    parallel_for_indices_chunked(
-        int(out_t),
-        _restore_slice,
-        max_workers=worker_count,
-        desc=desc,
-        chunk_size=chunk_size,
-        show_progress=True,
-    )
-    flush_array(out_mm)
-    return out_mm
-
-
-def ffmpeg_h264_rgb_writer(out_path: Path, width: int, height: int, fps: float) -> subprocess.Popen:
-    return ffmpeg_rawvideo_writer(
-        out_path=out_path,
-        width=int(width),
-        height=int(height),
-        fps=float(fps),
-        pix_fmt_in='rgb24',
-        codec='libx264',
-        pix_fmt_out='yuv420p',
-        codec_args=['-preset', 'slow'],
-    )
-
-
-def ffmpeg_h264_gray_writer(out_path: Path, width: int, height: int, fps: float) -> subprocess.Popen:
-    return ffmpeg_rawvideo_writer(
-        out_path=out_path,
-        width=int(width),
-        height=int(height),
-        fps=float(fps),
-        pix_fmt_in='gray',
-        codec='libx264',
-        pix_fmt_out='yuv420p',
-        codec_args=['-preset', 'slow'],
-    )
-
-
-def write_low_quality_overlay_video(
-    volume_gray: np.ndarray,
-    mask_u8: np.ndarray,
-    out_path: Path,
-    fps: float,
-    skeleton_u8: Optional[np.ndarray] = None,
-    show_progress: bool = True,
-) -> Path:
-    t_dim, h_dim, w_dim = volume_gray.shape
-    assert mask_u8.shape == (t_dim, h_dim, w_dim)
-    if skeleton_u8 is not None:
-        assert skeleton_u8.shape == (t_dim, h_dim, w_dim)
-    proc = ffmpeg_h264_rgb_writer(out_path, int(w_dim), int(h_dim), float(fps))
-    blue = np.array([0, 0, 255], dtype=np.uint8)
-    red = np.array([255, 0, 0], dtype=np.uint8)
-    try:
-        assert proc.stdin is not None
-        for t in tqdm(range(int(t_dim)), desc=f'Writing low-quality overlay ({out_path.name})', disable=not show_progress):
-            frame = _gray_to_rgb_frame(np.asarray(volume_gray[int(t)]))
-            m = np.asarray(mask_u8[int(t)], dtype=bool)
-            if np.any(m):
-                frame[m] = ((frame[m].astype(np.uint16) + blue.astype(np.uint16)) // 2).astype(np.uint8)
-            if skeleton_u8 is not None:
-                skel = skeleton_overlay_mask_2d(np.asarray(skeleton_u8[int(t)]), int(h_dim), int(w_dim))
-                if np.any(skel):
-                    frame[skel] = red
-            proc.stdin.write(np.ascontiguousarray(frame).tobytes())
-    finally:
-        close_ffmpeg_writer(proc)
-    return out_path
-
-
-def write_low_quality_binary_video(
-    mask_u8: np.ndarray,
-    out_path: Path,
-    fps: float,
-    show_progress: bool = True,
-) -> Path:
-    t_dim, h_dim, w_dim = mask_u8.shape
-    proc = ffmpeg_h264_gray_writer(out_path, int(w_dim), int(h_dim), float(fps))
-    try:
-        assert proc.stdin is not None
-        for t in tqdm(range(int(t_dim)), desc=f'Writing low-quality binary ({out_path.name})', disable=not show_progress):
-            frame = (np.asarray(mask_u8[int(t)], dtype=np.uint8) > 0).astype(np.uint8) * np.uint8(255)
-            proc.stdin.write(np.ascontiguousarray(frame).tobytes())
-    finally:
-        close_ffmpeg_writer(proc)
-    return out_path
-
-
-def save_low_quality_outputs(
-    *,
-    volume_gray: np.ndarray,
-    mask_u8: np.ndarray,
-    skeleton_u8: Optional[np.ndarray] = None,
-    out_dir: Path,
-    stem: str,
-    fps: float,
-    downbin_specs: Sequence[LowQualityDownbinSpec],
-    temp_dir: Path,
-    nrrd_layer_refs: Optional[Sequence[NrrdLayerRef]] = None,
-    workers: int = 1,
-    show_progress: bool = True,
-) -> Dict[str, Path]:
-    """Write v12.1.0 low-quality outputs with isotropic X/Y/t resizing."""
-    low_root = out_dir / 'low_quality'
-    low_root.mkdir(parents=True, exist_ok=True)
-    result_paths: Dict[str, Path] = {'low_quality_dir': low_root}
-    if not downbin_specs:
-        return result_paths
-
-    source_t = max(1, int(mask_u8.shape[0]))
-    for spec in downbin_specs:
-        out_t, out_h, out_w = (
-            int(spec.output_shape_t_y_x[0]),
-            int(spec.output_shape_t_y_x[1]),
-            int(spec.output_shape_t_y_x[2]),
-        )
-        spec_dir = low_root / spec.token
-        spec_dir.mkdir(parents=True, exist_ok=True)
-        fps_lq = max(1e-6, float(fps) * float(out_t) / float(source_t))
-        print(
-            f'Low-quality downbin {spec.raw_value}: native (t,Y,X)=({source_t},{int(mask_u8.shape[1])},{int(mask_u8.shape[2])}) '
-            f'-> ({out_t},{out_h},{out_w}); playback fps adjusted {float(fps):g} -> {fps_lq:g}'
-        )
-
-        gray_lq = resize_gray_volume_to_shape(
-            volume_gray,
-            (out_t, out_h, out_w),
-            temp_dir / 'low_quality' / spec.token / 'source.gray8.dat',
-            workers=int(workers),
-            prefer_memory=True,
-            desc=f'Low-quality source resize {spec.token}',
-        )
-        mask_lq = resize_binary_mask_volume_to_shape(
-            mask_u8,
-            (out_t, out_h, out_w),
-            temp_dir / 'low_quality' / spec.token / 'mask.u8.dat',
-            workers=int(workers),
-            prefer_memory=True,
-            desc=f'Low-quality mask resize {spec.token}',
-        )
-        skeleton_lq: Optional[np.ndarray] = None
-        if skeleton_u8 is not None:
-            skeleton_lq = resize_binary_mask_volume_to_shape(
-                skeleton_u8,
-                (out_t, out_h, out_w),
-                temp_dir / 'low_quality' / spec.token / 'skeleton.u8.dat',
-                workers=int(workers),
-                prefer_memory=True,
-                desc=f'Low-quality skeleton resize {spec.token}',
-            )
-        try:
-            overlay_path = spec_dir / f'{stem}_Overlay_LowQuality_{spec.token}.mp4'
-            binary_path = spec_dir / f'{stem}_Binary_LowQuality_{spec.token}.mp4'
-            nrrd_path = spec_dir / f'{stem}_LowQuality_{spec.token}.nrrd'
-            write_low_quality_overlay_video(gray_lq, mask_lq, overlay_path, fps_lq, skeleton_u8=skeleton_lq, show_progress=show_progress)
-            write_low_quality_binary_video(mask_lq, binary_path, fps_lq, show_progress=show_progress)
-            if nrrd_layer_refs is not None and len(nrrd_layer_refs) > 0:
-                write_decomposed_nrrd(
-                    list(nrrd_layer_refs),
-                    mask_lq,
-                    nrrd_path,
-                    temp_dir=temp_dir / 'low_quality' / spec.token / 'nrrd_decomposed',
-                    workers=int(workers),
-                    include_final_output_layer=True,
-                )
-                result_paths[f'low_quality_{spec.token}_nrrd_manifest'] = nrrd_path.with_suffix(nrrd_path.suffix + '.manifest.json')
-            else:
-                write_nrrd(mask_lq, nrrd_path)
-            result_paths[f'low_quality_{spec.token}_overlay'] = overlay_path
-            result_paths[f'low_quality_{spec.token}_binary_video'] = binary_path
-            result_paths[f'low_quality_{spec.token}_nrrd'] = nrrd_path
-        finally:
-            if gray_lq is not volume_gray:
-                close_memmap_array(gray_lq)
-            if mask_lq is not mask_u8:
-                close_memmap_array(mask_lq)
-            if skeleton_lq is not None and skeleton_lq is not skeleton_u8:
-                close_memmap_array(skeleton_lq)
-
-    return result_paths
-
-def write_view_images(
-    volume_rgb: np.ndarray,
-    view: ViewInfo,
-    out_dir: Path,
-    stem: str,
-    *,
-    workers: int = 1,
-    show_progress: bool = True,
-) -> Path:
-    view_dir = out_dir / 'images' / view.name
-    view_dir.mkdir(parents=True, exist_ok=True)
-    total = int(view.num_slices)
-
-    def _write_frame(idx: int) -> None:
-        frame = np.ascontiguousarray(get_view_frame_by_index(volume_rgb, view, int(idx)))
-        out_path = view_dir / f'{stem}_{view.name}_{int(idx) + 1:04d}.png'
-        if not cv2.imwrite(str(out_path), frame):
-            raise RuntimeError(f'Failed to write image: {out_path}')
-
-    parallel_for_indices(
-        total,
-        _write_frame,
-        max_workers=choose_slice_parallel_workers(int(workers), total),
-        desc=f'Writing {view.name} image sequence',
-        show_progress=show_progress,
-    )
-    return view_dir
-
-
-
-
-
-
-
-
-def write_summary_file(
-    out_path: Path,
-    *,
-    command: str,
-    input_path: Path,
-    out_dir: Path,
-    scratch_dir: Path,
-    source_shape_x_y_t: Tuple[int, int, int],
-    volume_shape: Tuple[int, int, int],
-    fps: float,
-    model_paths: Sequence[str],
-    view_names: Sequence[str],
-    view_prediction_stats: Dict[str, int],
-    interpolation_stats: List[Dict[str, object]],
-    enable_3d_void_fill: bool,
-    gaussian_smoothing_stats: Optional[Dict[str, int | float]],
-    keep_objects_stats: Optional[Dict[str, int]],
-    voxel_volume: Optional[int],
-    final_paths: Dict[str, Path],
-    augmentation_workers: int,
-    slice_postprocess_workers: int,
-    interpolation_workers: int,
-    output_workers: int,
-    spec_notes: Optional[Sequence[str]] = None,
-    view_prediction_labels: Optional[Dict[str, str]] = None,
-) -> Path:
-    lines: List[str] = []
-    lines.append(f'Command: {command}')
-    lines.append(f'Input: {input_path}')
-    lines.append(f'Output directory: {out_dir}')
-    lines.append(f'Source dimensions before cubic resizing (X, Y, t): {source_shape_x_y_t}')
-    lines.append(f'Processing volume shape (t, Y, X): {volume_shape}')
-    lines.append(f'FPS: {fps}')
-    lines.append(f'Scratch directory: {scratch_dir}')
-    lines.append('Workspace policy: in-memory first with disk fallback when the working set exceeds available RAM/swap')
-    lines.append(f'3D void fill: {"enabled" if bool(enable_3d_void_fill) else "disabled"}; when enabled, it is applied once after the final global union')
-    if bool(enable_3d_void_fill):
-        lines.append('3D void fill background connectivity: default 6-connected; override with YOLO_TTA_VOIDFILL_CONNECTIVITY=18 or 26 if needed')
-    lines.append(f'Augmentation workers: {int(augmentation_workers)}')
-    lines.append(f'Slice-parallel postprocess workers: {int(slice_postprocess_workers)}')
-    lines.append(f'Interpolation workers: {int(interpolation_workers)}')
-    lines.append(f'Output workers: {int(output_workers)}')
-    lines.append('Worker oversubscription: intentional; the default worker budget targets 2x the visible CPU allocation to overlap GPU waits, ffmpeg IO, and slice-parallel CPU work.')
-    lines.append(f'Model: {str(Path(model_paths[0])) if model_paths else "<none>"}')
-    lines.append(f'Views: {", ".join(view_names)}')
-    if spec_notes:
-        lines.append('')
-        lines.append('Specification notes:')
-        for note in spec_notes:
-            lines.append(f'  - {note}')
-
-    lines.append('')
-    lines.append('View statistics:')
-    total_prediction_count = 0
-    labels = dict(view_prediction_labels or {})
-    ordered_keys: List[str] = [k for k in ('transverse', 'sagittal', 'coronal', 'radial') if k in view_prediction_stats]
-    tilted_keys = [k for k in view_prediction_stats.keys() if str(k).startswith('tilted_')]
-    other_keys = [k for k in view_prediction_stats.keys() if k not in set(ordered_keys) and k not in set(tilted_keys)]
-    for view_key in ordered_keys + sorted(tilted_keys, key=lambda k: labels.get(k, k)) + sorted(other_keys):
-        label = labels.get(view_key, str(view_key).replace('_', ' ').title())
-        count = int(view_prediction_stats.get(view_key, 0))
-        total_prediction_count += count
-        lines.append(f'  {label}: predictions={count}')
-    lines.append(f'  Total prediction count: {int(total_prediction_count)}')
-
-    if interpolation_stats:
-        lines.append('')
-        lines.append('Interpolation statistics (per pass):')
-        pass_indices = sorted({int(s.get('pass_index', 0)) for s in interpolation_stats})
-        for pass_idx in pass_indices:
-            stats_this_pass = [s for s in interpolation_stats if int(s.get('pass_index', 0)) == pass_idx]
-            total_objects = sum(int(s.get('num_objects', 0)) for s in stats_this_pass)
-            total_endpoints = sum(int(s.get('num_endpoints', 0)) for s in stats_this_pass)
-            total_candidates = sum(int(s.get('candidate_connections', 0)) for s in stats_this_pass)
-            total_accepted = sum(int(s.get('accepted_connections', 0)) for s in stats_this_pass)
-            total_default_bridges = sum(int(s.get('default_bridges', 0)) for s in stats_this_pass)
-            total_walk_back = sum(int(s.get('walk_back_bridges', 0)) for s in stats_this_pass)
-            total_skipped = sum(int(s.get('skipped_by_min_radius', 0)) for s in stats_this_pass)
-            total_added_voxels = sum(int(s.get('added_voxels', 0)) for s in stats_this_pass)
-            lines.append(
-                f'  Pass {pass_idx}: objects={total_objects}, endpoints={total_endpoints}, '
-                f'candidate_connections={total_candidates}, accepted_connections={total_accepted}, '
-                f'default_bridges={total_default_bridges}, walk_back_bridges={total_walk_back}, '
-                f'bridges_skipped_by_--interpolate_min_radius={total_skipped}, added_voxels={total_added_voxels}'
-            )
-            for s in sorted(stats_this_pass, key=lambda d: (str(d.get('model', '')), str(d.get('view', '')))):
-                lines.append(
-                    f"    {s.get('model', '?')}/{s.get('view', '?')}: "
-                    f"objects={int(s.get('num_objects', 0))}, "
-                    f"endpoints={int(s.get('num_endpoints', 0))}, "
-                    f"candidate_connections={int(s.get('candidate_connections', 0))}, "
-                    f"accepted_connections={int(s.get('accepted_connections', 0))}, "
-                    f"default_bridges={int(s.get('default_bridges', 0))}, "
-                    f"walk_back_bridges={int(s.get('walk_back_bridges', 0))}, "
-                    f"bridges_skipped_by_--interpolate_min_radius={int(s.get('skipped_by_min_radius', 0))}, "
-                    f"added_voxels={int(s.get('added_voxels', 0))}, "
-                    f"skipped={bool(s.get('skipped', False))}"
-                )
-
-    lines.append('')
-    if gaussian_smoothing_stats is not None and int(gaussian_smoothing_stats.get('enabled', 0)) > 0:
-        lines.append(
-            'Gaussian smoothing: enabled; '
-            f"sigma={float(gaussian_smoothing_stats.get('sigma', 0.0)):g}, "
-            f"passes_requested={int(gaussian_smoothing_stats.get('passes_requested', 0))}, "
-            f"passes_completed={int(gaussian_smoothing_stats.get('passes_completed', 0))}"
-        )
-        lines.append(
-            '  voxel changes after thresholding: '
-            f"added={int(gaussian_smoothing_stats.get('total_added_voxels', 0))}, "
-            f"removed={int(gaussian_smoothing_stats.get('total_removed_voxels', 0))}"
-        )
-    else:
-        lines.append('Gaussian smoothing: disabled')
-
-    if keep_objects_stats is not None:
-        lines.append('')
-        lines.append(
-            'keep_objects: '
-            f"enabled, objects={int(keep_objects_stats.get('num_objects', 0))}, "
-            f"kept={int(keep_objects_stats.get('kept_objects', 0))}, "
-            f"removed_objects={int(keep_objects_stats.get('removed_objects', 0))}, "
-            f"removed_voxels={int(keep_objects_stats.get('removed_voxels', 0))}"
-        )
-    else:
-        lines.append('')
-        lines.append('keep_objects: disabled')
-
-    if voxel_volume is not None:
-        lines.append('')
-        lines.append(f'voxel_volume_native_input_space: {int(voxel_volume)}')
-
-    lines.append('')
-    lines.append('Final outputs:')
-    for key in sorted(final_paths.keys()):
-        lines.append(f'{key}: {final_paths[key]}')
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text("\n".join(lines) + "\n")
-    return out_path
-
 
 # --------------------------
 # Main
@@ -11814,20 +11069,21 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('v12.1.0_SLURM accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('v12.2.0_SLURM accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
     model_paths = [model_path_resolved]
 
     angles = _parse_angles(args.angle) or [0.0, 120.0, 240.0]
+    set_single_angle_gpu_cleanup_active(len(angles) == 1)
     tilt_views = resolve_tilt_views(args.tilt_view)
     tilt_angles = resolve_tilt_angles(args.tilt_angle)
     tilt_directions = resolve_tilt_directions(args.tilt_direction)
     tile_configs = resolve_tile_configs(args.tile_size, args.tile_stride)
     enable_sagittal = bool(args.enable_sagittal)
     enable_coronal = bool(args.enable_coronal)
-    # v12.1.0 retains the v12 single-transverse default-output behavior and omits old per-view save flags. Default outputs stay transverse-only;
+    # v12.2.0 retains the v12 single-transverse default-output behavior and omits old per-view save flags. Default outputs stay transverse-only;
     # active non-transverse views contribute to inference/union but are not separately exported.
     save_sagittal = False
     save_coronal = False
@@ -11835,8 +11091,6 @@ def main() -> None:
 
     if args.min_conf > 0 and args.min_conf < args.conf:
         raise ValueError('--min_conf must be equal to or greater than --conf')
-    if bool(getattr(args, 'validate_retina', False)):
-        print('Warning: --validate_retina is deprecated in v12.1.0 and is ignored.')
     if int(args.interpolate) < 0:
         raise ValueError('--interpolate must be >= 0')
     if int(args.interpolation_walk_back) < 0:
@@ -11877,7 +11131,7 @@ def main() -> None:
     # not also request the full-size --save_nrrd output.
     nrrd_layers_needed = bool(args.save_nrrd or low_quality_requested)
     troubleshooting_outputs_enabled = bool(args.troubleshooting)
-    # v12.1.0 --troubleshooting creates overlay MKVs only. Temporary scratch retention is a
+    # v12.2.0 --troubleshooting creates overlay MKVs only. Temporary scratch retention is a
     # separate hidden maintenance escape hatch so troubleshooting no longer changes cleanup semantics.
     keep_temp_artifacts = bool(_env_flag('YOLO_TTA_KEEP_TEMP', False))
 
@@ -11917,7 +11171,7 @@ def main() -> None:
     processing_shape = compute_cube_resize_shape(input_T, input_H, input_W, tolerance=0.05)
     if processing_shape != (input_T, input_H, input_W):
         print(
-            'v12.1.0 cubic resize: '
+            'v12.2.0 cubic resize: '
             f'input shape (t,Y,X)=({input_T},{input_H},{input_W}) -> '
             f'processing shape (t,Y,X)={processing_shape}'
         )
@@ -11929,7 +11183,7 @@ def main() -> None:
             prefer_memory=True,
         )
     else:
-        print(f'v12.1.0 cubic resize: input shape already within 5% cube tolerance ({processing_shape})')
+        print(f'v12.2.0 cubic resize: input shape already within 5% cube tolerance ({processing_shape})')
         volume_rgb = input_volume_rgb
 
     T, H, W = (int(processing_shape[0]), int(processing_shape[1]), int(processing_shape[2]))
@@ -11977,7 +11231,7 @@ def main() -> None:
     spec_notes: List[str] = []
     spec_notes.append('Input video channel handling: RGB/YUV inputs are flattened to one gray/luma channel during decode; single-channel Y/gray inputs remain single-channel, and YOLO receives H×W×1 frames.')
     spec_notes.append('Voxel-volume reporting, when enabled, counts the final binary mask after restoration to native input geometry, not imgsz or cubic working geometry.')
-    spec_notes.append('v12.1.0 tilt-angle validation follows the specification: values must be greater than 0 and less than or equal to 45 degrees.')
+    spec_notes.append('v12.2.0 tilt-angle validation follows the specification: values must be greater than 0 and less than or equal to 45 degrees.')
     if low_quality_downbin_warnings:
         for warning in low_quality_downbin_warnings:
             print(f'Warning: {warning}')
@@ -11996,7 +11250,7 @@ def main() -> None:
         )
     if (int(T), int(H), int(W)) != (int(input_T), int(input_H), int(input_W)):
         spec_notes.append(
-            f'Working volume resized to v12.1.0 approximately-cubic processing geometry '
+            f'Working volume resized to v12.2.0 approximately-cubic processing geometry '
             f'(t,Y,X)=({int(T)},{int(H)},{int(W)}); final default outputs are restored to the original '
             f'input geometry (t,Y,X)=({int(input_T)},{int(input_H)},{int(input_W)}).'
         )
@@ -12019,14 +11273,19 @@ def main() -> None:
             f'Radial enabled with azimuth spacing {float(resolved_azimuth_angle):.8g} degrees; '
             'Lanczos-3 radial sampling, wraparound Radial interpolation, and dense final backprojection are active.'
         )
+    if single_angle_gpu_cleanup_active():
+        spec_notes.append(
+            'Single-angle --angle mode active: per-slice min_conf filtering, 2D hole filling, and applicable transverse-plane min_radius filtering attempt GPU execution through CuPy/cupyx before CPU interpolation. '
+            'If CuPy/cupyx is unavailable, the script logs a warning and uses the existing CPU cleanup path.'
+        )
     spec_notes.append(
-        'NRRD export is decomposed by default in v12.1.0: layers are written on a leading list axis as '
+        'NRRD export is decomposed by default in v12.2.0: layers are written on a leading list axis as '
         '(layer,X,Y,t), with manifest JSON and SegmentN metadata for view, source, YOLO-vs-bridge, '
         'tile acceptance category, pre-smoothing union, smoothing pass results, and final output. '
-        'The NRRD payload is now gzip-streamed directly from backing layers with a bounded row buffer '
+        'The NRRD payload is now pigz-streamed directly from backing layers with a bounded row buffer '
         'instead of materializing the full 4D decomposed payload; tune YOLO_TTA_NRRD_STREAM_BUFFER_MIB '
-        'and YOLO_TTA_NRRD_GZIP_LEVEL if needed. '
-        'Segment extents are now recorded when each NRRD layer/cvol store is materialized and reused during final packaging; only missing metadata or disabled YOLO_TTA_NRRD_PRECOMPUTED_SEGMENT_EXTENTS falls back to a layer scan. Compressed cvol/ctile backing paths cache chunks.bin in RAM by default via YOLO_TTA_NRRD_CACHE_COMPRESSED_LAYERS_IN_RAM=1 for the payload stream. '
+        'and YOLO_TTA_NRRD_PIGZ_LEVEL if needed. '
+        'Segment extents are now recorded when each NRRD layer/cvol store is materialized and reused during final packaging; only missing metadata or disabled YOLO_TTA_NRRD_PRECOMPUTED_SEGMENT_EXTENTS falls back to a layer scan. Raw cvol/ctile backing paths cache chunks.bin in RAM by default via YOLO_TTA_NRRD_CACHE_RAW_BBOX_LAYERS_IN_RAM=1 for the payload stream. '
         f'Legacy single-volume NRRD writing is retained only for deprecated internal callers without layer refs; space={NRRD_SPACE}.'
     )
     if cpu_retina_masks_enabled():
@@ -12036,8 +11295,7 @@ def main() -> None:
             'and queued frame payloads are buffered in RAM via YOLO_TTA_CPU_MASK_PENDING_FRAMES.'
         )
     else:
-        spec_notes.append('Experimental CPU retina-mask reconstruction disabled by YOLO_TTA_CPU_RETINA_MASKS=0; using Ultralytics non-retina masks with CPU resize fallback, which is intended only for debugging and is not the v12 default.')
-    spec_notes.append('--validate_retina is deprecated in v12.1.0, hidden from help, and ignored if supplied for backward compatibility.')
+        spec_notes.append('Using Ultralytics native retina_masks=True for live inference; the custom CPU retina reconstruction path remains available only when YOLO_TTA_CPU_RETINA_MASKS=1 for compatibility/debugging.')
     if bool(troubleshooting_outputs_enabled):
         spec_notes.append(
             '--troubleshooting active: writing FFV1 MKV overlays for each active full-frame native view and each available consolidated tiled prediction set; '
@@ -12047,18 +11305,19 @@ def main() -> None:
         spec_notes.append('YOLO_TTA_KEEP_TEMP=1 active: temporary scratch artifacts are retained independently of --troubleshooting.')
     if bool(gaussian_smoothing_enabled):
         spec_notes.append(
-            f'Gaussian smoothing active by v12.1.0 explicit-flag rule: sigma={float(gaussian_smoothing_sigma):g} voxel(s), '
-            f'passes={int(gaussian_smoothing_passes)}; applied after final union/optional 3D void fill and before --keep_objects.'
+            f'Gaussian smoothing active by v12.2.0 explicit-flag rule: sigma={float(gaussian_smoothing_sigma):g} voxel(s), '
+            f'passes={int(gaussian_smoothing_passes)}; applied after final union/optional 3D void fill and before --keep_objects. '
+            'The default smoothing backend attempts chunked GPU execution through CuPy/cupyx.scipy.ndimage with halo/core writes, then falls back to scipy.ndimage on CPU if the GPU backend is unavailable.'
         )
     else:
         if not bool(gaussian_smoothing_cli_requested):
-            spec_notes.append('Gaussian smoothing disabled by v12.1.0 activation rule because neither Gaussian flag was explicitly set.')
+            spec_notes.append('Gaussian smoothing disabled by v12.2.0 activation rule because neither Gaussian flag was explicitly set.')
         elif bool(gaussian_smoothing_disabled_by_zero):
             spec_notes.append('Gaussian smoothing disabled because at least one explicitly supplied Gaussian flag was set to 0.')
         else:
             spec_notes.append('Gaussian smoothing disabled because the resolved sigma or pass count was not positive.')
     spec_notes.append(
-        'Interpolation endpoint discovery uses the v12.1.0 per-slice connected-component scan; '
+        'Interpolation endpoint discovery uses the v12.2.0 per-slice connected-component scan; '
         'skeletonization is never used for interpolation and runs only when --save_skeleton is requested. '
         'Optional skeleton output uses slice-parallel pore preconditioning plus component/chunk based 3D Lee thinning; '
         'overlay videos draw the skeleton as fully opaque red on top of the 50% blue mask overlay.'
@@ -12069,7 +11328,7 @@ def main() -> None:
     )
     if transverse_inference_disabled:
         note = (
-            'v12.1.0 specification note: Section 2.1.1 says Transverse is enabled by default, while '
+            'v12.2.0 specification note: Section 2.1.1 says Transverse is enabled by default, while '
             'View Flags item 1 adds --disable_transverse to skip Transverse inferencing. This implementation '
             'keeps Transverse geometry/output paths available and removes only the standard Transverse full-frame '
             'and tiled prediction jobs.'
@@ -12080,7 +11339,7 @@ def main() -> None:
     model_name = Path(model_paths[0]).stem
     print(f'Loading model: {model_name} ({model_paths[0]})')
     yolo_model = load_ultralytics_model(model_paths[0], task='segment')
-    # v12.1.0 has no multiple-model inference. A single-item list is retained only to minimize churn in
+    # v12.2.0 has no multiple-model inference. A single-item list is retained only to minimize churn in
     # scheduling structures keyed by model stem.
     yolo_models: List[Tuple[str, object]] = [(model_name, yolo_model)]
     yolo_by_model_name: Dict[str, object] = {model_name: yolo_model}
@@ -12093,9 +11352,6 @@ def main() -> None:
         int8=bool(args.int8),
     )
 
-    # DEAD_CODE_MARKER(v12.1.0-review): deprecated retina-validation state retained only by the disabled legacy validation branch.
-    retina_validation_done = False
-    retina_validation_stats: List[Dict[str, float]] = []
 
     worker_budget = int(default_worker_budget())
     augmentation_workers = resolve_worker_count(
@@ -12159,7 +11415,7 @@ def main() -> None:
     example_cpu_mask_workers = max(1, min(int(predict_postprocess_workers), int(max_predict_video_frames)))
     example_cpu_mask_pending = cpu_mask_postprocess_pending_limit(int(example_cpu_mask_workers), int(max_predict_video_frames))
     spec_notes.append(
-        'CPU retina reconstruction queue is bounded per in-memory prediction source by the number of pending CPU postprocess futures. ' 
+        'YOLO result accumulation is bounded per in-memory prediction source by the number of pending CPU postprocess futures. ' 
         'worker_count=max(1, min(YOLO_TTA_PREDICT_POSTPROCESS_WORKERS, num_frames)) for the live v12 in-memory source path; ' 
         'pending_limit=cpu_mask_postprocess_pending_limit(worker_count, num_frames) = max(worker_count, min(num_frames, max(YOLO_TTA_CPU_MASK_PENDING_FRAMES, worker_count*2))). ' 
         'The default YOLO_TTA_CPU_MASK_PENDING_FRAMES is 256; setting it to 0 permits buffering all frames for that prediction source. ' 
@@ -12169,12 +11425,12 @@ def main() -> None:
     spec_notes.append(
         'Tiled masks are staged into one consolidated parent-view canvas per --tile_size/--tile_stride configuration before gating; '
         'the canvas gate is slice-local and connected-component based, so seam-split tile objects are reassembled before support testing. '
-        'A tile mask shape guard validates/resizes every postprocessed tile to its parent view-native shape before any waiting-tile bitpacking/compression.'
+        'A tile mask shape guard validates/resizes every postprocessed tile to its parent view-native shape before any waiting-tile raw-store spill.'
     )
     spec_notes.append(
-        'Postprocessed tiles waiting for parent support use ctile-mask-v1, and decomposed NRRD/support layers use cvol-mask-v1 where enabled, instead of raw uint8 memmaps: empty slices are elided, '
-        'nonempty slices are cropped to their nonzero bbox, packed with numpy.packbits(bitorder=little), and compressed with LZ4. '
-        'Storage review: dense gray8 source/processing volumes and uint8 confidence maps stay raw because they are not sparse binary masks; FFV1/MKV/TIFF outputs are already codec-compressed; labels/summary JSON are negligible; retained raw binary scratch/tile accumulators are the best remaining compression candidates and are archived as cvol when YOLO_TTA_KEEP_TEMP and YOLO_TTA_ARCHIVE_TEMP_BINARY_VOLUMES are enabled.'
+        'Postprocessed tiles waiting for parent support use ctile-mask-v2-raw, and decomposed NRRD/support layers use cvol-mask-v2-raw where enabled: empty slices are elided, '
+        'nonempty slices are cropped to their nonzero bbox and written as raw uint8 payload bytes; bitpacking and LZ4 are not used. '
+        'Storage review: dense gray8 source/processing volumes stay raw; uint8 confidence maps are allocated only when --min_conf > 0 and stay raw because they are not sparse binary masks; FFV1/MKV/TIFF outputs remain codec-compressed; labels/summary JSON are negligible; retained sparse binary scratch/tile accumulators can be archived as raw bbox cvol when YOLO_TTA_KEEP_TEMP and YOLO_TTA_ARCHIVE_TEMP_BINARY_VOLUMES are enabled.'
     )
     spec_notes.append(
         f'Fused cleanup backend={cleanup_backend()}; set YOLO_TTA_CLEANUP_BACKEND=scipy to use the previous scipy.ndimage cleanup path.'
@@ -12229,11 +11485,6 @@ def main() -> None:
             view_prediction_stats.setdefault(str(_view_for_stats.summary_family), 0)
             view_prediction_labels[str(_view_for_stats.summary_family)] = pretty_view_name(_view_for_stats)
     interpolation_stats: List[Dict[str, object]] = []
-    pass_snapshot_refs: Dict[Tuple[str, str, str, int], VolumeSnapshotRef] = {}
-
-    def _register_pass_snapshots(snapshots: Dict[int, VolumeSnapshotRef]) -> None:
-        for ref in snapshots.values():
-            pass_snapshot_refs[(str(ref.source), str(ref.model_name), str(ref.view_name), int(ref.pass_index))] = ref
 
     inference_view_names = {v.name for v in inference_views}
     for view in views:
@@ -12301,9 +11552,9 @@ def main() -> None:
             view_frame_cache_paths[view.name] = cache_path
 
     baseline_union_by_model_view: Dict[Tuple[str, str], np.ndarray] = {}
-    baseline_confmap_by_model_view: Dict[Tuple[str, str], np.ndarray] = {}
+    baseline_confmap_by_model_view: Dict[Tuple[str, str], Optional[np.ndarray]] = {}
     baseline_union_paths: Dict[Tuple[str, str], Path] = {}
-    baseline_confmap_paths: Dict[Tuple[str, str], Path] = {}
+    baseline_confmap_paths: Dict[Tuple[str, str], Optional[Path]] = {}
     fullframe_remaining: Dict[Tuple[str, str], int] = {}
 
     for view in inference_views:
@@ -12319,15 +11570,19 @@ def main() -> None:
                 desc=f'{model_name}/{view.name} baseline union workspace',
                 prefer_memory=True,
             )
-            baseline_confmap_by_model_view[(model_name, view.name)] = allocate_workspace_array(
-                shape=(view.num_slices, view.src_h, view.src_w),
-                dtype=np.uint8,
-                path=confmap_path,
-                desc=f'{model_name}/{view.name} baseline confidence workspace',
-                prefer_memory=True,
-            )
+            if float(args.min_conf) > 0.0:
+                baseline_confmap_by_model_view[(model_name, view.name)] = allocate_workspace_array(
+                    shape=(view.num_slices, view.src_h, view.src_w),
+                    dtype=np.uint8,
+                    path=confmap_path,
+                    desc=f'{model_name}/{view.name} baseline confidence workspace',
+                    prefer_memory=True,
+                )
+                baseline_confmap_paths[(model_name, view.name)] = confmap_path
+            else:
+                baseline_confmap_by_model_view[(model_name, view.name)] = None
+                baseline_confmap_paths[(model_name, view.name)] = None
             baseline_union_paths[(model_name, view.name)] = union_path
-            baseline_confmap_paths[(model_name, view.name)] = confmap_path
             fullframe_remaining[(model_name, view.name)] = int(len(aug_jobs_by_view[view.name]))
 
     total_fullframe_jobs = sum(len(aug_jobs_by_view.get(view.name, [])) for view in inference_views)
@@ -12356,12 +11611,12 @@ def main() -> None:
         '(slice,--imgsz,--imgsz) uint8 arrays, yielded as H×W×1 frames through InMemoryYoloVolumeSource, '
         'and preprocessed into BCHW tensors with C=1; the normal pipeline no longer writes augmented '
         'prediction videos, canvas videos, or tile videos to temp. '
-        f'The build queue is bounded to {int(prediction_volume_queue_slots)} queued prediction volume(s) beyond the current inference; the v12.1.0 default is four queued volumes, for a normal total bound of five including the current inference volume.'
+        f'The build queue is bounded to {int(prediction_volume_queue_slots)} queued prediction volume(s) beyond the current inference; the v12.2.0 default is four queued volumes, for a normal total bound of five including the current inference volume.'
     )
     if dense_tiling_active:
         spec_notes.append(
             'Tiled prediction sources follow the deterministic tile footprint, stride order, angle variant, '
-            'and inverse-mapping rules from the v12.1.0 specification.'
+            'and inverse-mapping rules from the v12.2.0 specification.'
         )
 
     prediction_volume_executor = ThreadPoolExecutor(max_workers=int(prediction_volume_builder_workers), thread_name_prefix='prediction-volume')
@@ -12690,7 +11945,7 @@ def main() -> None:
         if result.view_name not in support_by_view:
             waiting = postprocessed_tiles_waiting_by_parent.setdefault(parent_key, {})
             parent_view = view_infos_by_name[str(result.view_name)]
-            waiting[str(result.tile_id)] = spill_waiting_tile_result_to_compressed_store(
+            waiting[str(result.tile_id)] = spill_waiting_tile_result_to_raw_store(
                 result,
                 temp_dir,
                 workers=int(tile_slice_postprocess_workers),
@@ -12726,7 +11981,7 @@ def main() -> None:
             model_name, view_name = parent_key
             if view_name not in native_view_support_by_model.get(model_name, {}):
                 continue
-            ready_results.extend(load_waiting_tile_result_from_compressed_store(wait_result) for wait_result in waiting.values())
+            ready_results.extend(load_waiting_tile_result_from_raw_store(wait_result) for wait_result in waiting.values())
             del postprocessed_tiles_waiting_by_parent[parent_key]
 
         for result in ready_results:
@@ -12749,7 +12004,6 @@ def main() -> None:
                 parent_bridge_support_by_model[result.model_name][result.view_name] = result.parent_bridge_support_mm
             interpolation_stats.extend(result.interpolation_stats)
             nrrd_layer_refs.extend(result.nrrd_layers)
-            _register_pass_snapshots(result.pass_snapshots)
 
             view_info = view_infos_by_name[result.view_name]
             if result.final_view_volume_mm is not None:
@@ -12797,7 +12051,6 @@ def main() -> None:
             result = fut.result()
             interpolation_stats.extend(result.interpolation_stats)
             nrrd_layer_refs.extend(result.nrrd_layers)
-            _register_pass_snapshots(result.pass_snapshots)
 
             # Once the consolidated tile volume has been unioned into its parent destination and
             # any NRRD layers have been materialized, category accumulators are no longer needed.
@@ -12858,26 +12111,6 @@ def main() -> None:
                 print(f"Inferencing full-frame in-memory volume: {view.name}/{job.aug_id}")
                 try:
                     for model_name, yolo in yolo_models:
-                        # DEAD_CODE_MARKER(v12.1.0-review): --validate_retina is deprecated and intentionally ignored.
-                        if False and bool(args.validate_retina) and not bool(retina_validation_done):
-                            validation_frames = min(int(args.validate_retina_frames), int(view.num_slices))
-                            retina_validation_stats = validate_cpu_retina_against_ultralytics(
-                                yolo,
-                                lambda ref=prediction_ref, vf=validation_frames: make_in_memory_yolo_source(ref.array, ref.name, max_frames=int(vf)),
-                                cfg=pred_cfg,
-                                out_size=int(args.imgsz),
-                                num_frames=validation_frames,
-                                source_label=f'{view.name}/{job.aug_id}',
-                            )
-                            spec_notes.append(
-                                'validate_retina passed on in-memory prediction volume '
-                                f'{view.name}/{job.aug_id}: '
-                                + ', '.join(
-                                    f"frame {int(s['frame'])} IoU={float(s['iou']):.6f} disagree={int(s['pixel_disagreement'])}"
-                                    for s in retina_validation_stats
-                                )
-                            )
-                            retina_validation_done = True
                         pred_stats = predict_in_memory_volume_and_accumulate(
                             model=yolo,
                             prediction_volume=prediction_ref,
@@ -12924,13 +12157,18 @@ def main() -> None:
                     desc=f'{model_name}/{view.name}/{tile_job.tile_id} raw tile volume',
                     prefer_memory=True,
                 )
-                tile_conf_mm = allocate_workspace_array(
-                    shape=tile_shape,
-                    dtype=np.uint8,
-                    path=tile_conf_path,
-                    desc=f'{model_name}/{view.name}/{tile_job.tile_id} raw tile confidence workspace',
-                    prefer_memory=True,
-                )
+                if float(args.min_conf) > 0.0:
+                    tile_conf_mm = allocate_workspace_array(
+                        shape=tile_shape,
+                        dtype=np.uint8,
+                        path=tile_conf_path,
+                        desc=f'{model_name}/{view.name}/{tile_job.tile_id} raw tile confidence workspace',
+                        prefer_memory=True,
+                    )
+                    tile_conf_store_path: Optional[Path] = tile_conf_path
+                else:
+                    tile_conf_mm = None
+                    tile_conf_store_path = None
 
                 yolo = yolo_by_model_name[str(model_name)]
                 try:
@@ -12978,7 +12216,7 @@ def main() -> None:
                     tile_mask_mm=tile_mask_mm,
                     tile_confmap_mm=tile_conf_mm,
                     tile_mask_path=tile_mask_path,
-                    tile_confmap_path=tile_conf_path,
+                    tile_confmap_path=tile_conf_store_path,
                 )
                 fut = tile_postprocess_executor.submit(
                     postprocess_tile_volume_after_inference,
@@ -13045,7 +12283,7 @@ def main() -> None:
             f'{int(swept_mkvs)} legacy/interrupted scratch MKV file(s) when YOLO_TTA_KEEP_TEMP is disabled.'
         )
     else:
-        spec_notes.append('YOLO_TTA_KEEP_TEMP retained scratch artifacts; the v12.1.0 in-memory inference path itself does not create prediction MKVs.')
+        spec_notes.append('YOLO_TTA_KEEP_TEMP retained scratch artifacts; the v12.2.0 in-memory inference path itself does not create prediction MKVs.')
 
     final_backprojection_jobs: List[Tuple[str, ViewInfo, np.ndarray]] = []
     for view in views:
@@ -13157,7 +12395,7 @@ def main() -> None:
         if pre_smoothing_ref is not None:
             nrrd_layer_refs.append(pre_smoothing_ref)
 
-    gaussian_smoothing_stats: Optional[Dict[str, int | float]] = None
+    gaussian_smoothing_stats: Optional[Dict[str, object]] = None
     if bool(gaussian_smoothing_enabled):
         print('\n=== Applying Gaussian smoothing ===')
         gaussian_smoothing_stats = apply_gaussian_smoothing_inplace(
@@ -13244,17 +12482,9 @@ def main() -> None:
             write_nrrd(skeleton_output_mm, skeleton_path)
             final_paths['skeleton_nrrd'] = skeleton_path
 
-    # DEAD_CODE_MARKER(v12.1.0-review): retained restored-radial-output planning variable; no current consumer after v12.1.0 troubleshooting simplification.
-    output_radial_angle = 0.0
-    if float(resolved_azimuth_angle) > 0.0:
-        output_radial_angle = resolve_radial_azimuth_angle(
-            requested_azimuth_angle,
-            enable_radial=True,
-            diameter=min(output_W, output_H),
-        )
 
     if bool(troubleshooting_outputs_enabled):
-        print('\n=== Scheduling v12.1.0 troubleshooting overlays ===')
+        print('\n=== Scheduling v12.2.0 troubleshooting overlays ===')
         consolidated_tile_masks_for_model = {
             str(view_name): mask
             for (tile_model, view_name), mask in tile_accumulator_by_parent.items()
@@ -13437,11 +12667,11 @@ def main() -> None:
         model_views.clear()
     for model_support in parent_mask_support_by_model.values():
         for mm in model_support.values():
-            close_compressed_or_memmap_volume(mm, keep_temp=bool(keep_temp_artifacts))
+            close_raw_store_or_memmap_volume(mm, keep_temp=bool(keep_temp_artifacts))
         model_support.clear()
     for model_support in parent_bridge_support_by_model.values():
         for mm in model_support.values():
-            close_compressed_or_memmap_volume(mm, keep_temp=bool(keep_temp_artifacts))
+            close_raw_store_or_memmap_volume(mm, keep_temp=bool(keep_temp_artifacts))
         model_support.clear()
     for mm in tile_config_accumulator_by_key.values():
         archive_or_delete_binary_volume_storage(
