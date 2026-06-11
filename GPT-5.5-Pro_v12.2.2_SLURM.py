@@ -2,8 +2,9 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v12.2.1_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.1 regression patch:
+This v12.2.2_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.1/v12.2.2 performance patches:
   - v12.2.1 restores the low-quality downbin/output helper path and NrrdLayerRef metadata class that were erroneously pruned in v12.2.0
+  - v12.2.2 adds batched in-memory inference with synthetic final-batch padding for fixed-batch backends, batch-sized single-angle GPU cleanup, larger RAM-aware NRRD streaming slabs, parallel low-quality NRRD scheduling, and a hybrid CPU/GPU radial/tilted backprojection queue
   - builds Transverse, optional generalized Tilted Views for Transverse/Sagittal/Coronal, independently optional upright Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - materializes YOLO-ready full-frame and tiled prediction volumes as in-memory slice arrays instead of writing prediction videos to the temp folder
   - feeds those volumes to Ultralytics through a custom in-memory loader with stream=True, while using Ultralytics native retina mask reconstruction
@@ -211,6 +212,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--model", required=True, type=str, help="Path to a single YOLO segmentation model")
 
     p.add_argument("--imgsz", default=2048, type=int, help="Square input size used for YOLO predict")
+    p.add_argument("--batch", default=1, type=int, help="Batch size passed to YOLO predict. The in-memory source pads the final batch by repeating the last real slice and discards synthetic results, which supports fixed-batch engines such as TensorRT builds without dynamic=True")
     p.add_argument("--conf", default=0.15, type=float, help="Passed to YOLO predict")
     p.add_argument("--min_conf", default=0.30, type=float,
                    help="Remove prediction-set objects whose combined confidence is below this threshold. 0 disables the check")
@@ -2136,15 +2138,17 @@ def close_prediction_volume_ref(ref: Optional[PredictionVolumeRef], *, keep_temp
 
 
 class InMemoryYoloVolumeSource:
-    """Ultralytics-compatible in-memory source that streams one volume slice per batch.
+    """Ultralytics-compatible in-memory source that streams fixed-size slice batches.
 
     Ultralytics' public Python API accepts in-memory numpy inputs, but its built-in
     ``LoadPilAndNumpy`` loader treats a list of arrays as one large batch.  This
     loader is registered as an in-memory loader so the predictor consumes a 3-D
-    slice volume incrementally with ``stream=True`` and ``batch=1``.  Slices are
-    yielded as single-channel ``H×W×1`` uint8 arrays; this intentionally avoids
-    the older gray-to-BGR expansion path so single-channel YOLO models receive a
-    single input channel.
+    slice volume incrementally with ``stream=True`` and the requested ``--batch``.
+    Slices are yielded as single-channel ``H×W×1`` uint8 arrays; this intentionally
+    avoids the older gray-to-BGR expansion path so single-channel YOLO models receive
+    a single input channel.  The final batch is padded by repeating the final real
+    slice so fixed-batch engines, e.g. TensorRT without dynamic=True, always receive
+    the same batch size.  Downstream accumulation discards synthetic padded results.
     """
 
     def __init__(self, volume_gray: np.ndarray, name: str, batch_size: int = 1, max_frames: Optional[int] = None) -> None:
@@ -2163,6 +2167,8 @@ class InMemoryYoloVolumeSource:
         if max_frames is not None:
             self.nf = max(0, min(self.nf, int(max_frames)))
         self.bs = max(1, int(batch_size))
+        self.yield_nf = int(math.ceil(float(self.nf) / float(self.bs)) * self.bs) if self.nf > 0 else 0
+        self.synthetic_count = max(0, int(self.yield_nf) - int(self.nf))
         self.mode = 'image'
         self.count = 0
         try:
@@ -2190,18 +2196,27 @@ class InMemoryYoloVolumeSource:
         raise ValueError(f'Unsupported non-single-channel prediction frame shape for YOLO source: {frame_u8.shape}')
 
     def __next__(self) -> Tuple[List[str], List[np.ndarray], List[str]]:
-        if self.count >= self.nf:
+        if self.count >= self.yield_nf:
+            raise StopIteration
+        if self.nf <= 0:
             raise StopIteration
         start = int(self.count)
-        stop = min(int(self.nf), start + int(self.bs))
+        stop = min(int(self.yield_nf), start + int(self.bs))
         self.count = int(stop)
         paths: List[str] = []
         imgs: List[np.ndarray] = []
         info: List[str] = []
+        last_real_idx = max(0, int(self.nf) - 1)
         for idx in range(start, stop):
-            paths.append(f'{self.name}_{idx + 1:06d}.png')
-            imgs.append(self._frame_to_single_channel(self.volume_gray[int(idx)]))
-            info.append(f'in-memory {self.name} slice {idx + 1}/{self.nf}: ')
+            real_idx = int(idx) if int(idx) < int(self.nf) else int(last_real_idx)
+            synthetic = int(idx) >= int(self.nf)
+            suffix = '_synthetic' if synthetic else ''
+            paths.append(f'{self.name}_{idx + 1:06d}{suffix}.png')
+            imgs.append(self._frame_to_single_channel(self.volume_gray[int(real_idx)]))
+            if synthetic:
+                info.append(f'in-memory {self.name} synthetic padded slice {idx + 1}/{self.yield_nf} repeats real slice {real_idx + 1}/{self.nf}: ')
+            else:
+                info.append(f'in-memory {self.name} slice {idx + 1}/{self.nf}: ')
         return paths, imgs, info
 
 
@@ -2221,9 +2236,15 @@ def ensure_ultralytics_accepts_in_memory_volume_source() -> None:
         setattr(ultralytics_build, 'LOADERS', loaders_tuple + (InMemoryYoloVolumeSource,))
 
 
-def make_in_memory_yolo_source(volume_gray: np.ndarray, name: str, *, max_frames: Optional[int] = None) -> InMemoryYoloVolumeSource:
+def make_in_memory_yolo_source(
+    volume_gray: np.ndarray,
+    name: str,
+    *,
+    batch_size: int = 1,
+    max_frames: Optional[int] = None,
+) -> InMemoryYoloVolumeSource:
     ensure_ultralytics_accepts_in_memory_volume_source()
-    return InMemoryYoloVolumeSource(volume_gray, name=name, batch_size=1, max_frames=max_frames)
+    return InMemoryYoloVolumeSource(volume_gray, name=name, batch_size=max(1, int(batch_size)), max_frames=max_frames)
 
 
 def _center_preserving_scale_matrix(src_w: int, src_h: int, out_w: int, out_h: int) -> np.ndarray:
@@ -3074,6 +3095,7 @@ class PredictConfig:
     device: str
     half: bool
     int8: bool
+    batch: int = 1
 
 
 DEFAULT_GAUSSIAN_SMOOTHING_SIGMA = 3.0
@@ -3170,7 +3192,7 @@ def cpu_mask_postprocess_pending_limit(worker_count: int, num_frames: int) -> in
     """
     workers = max(1, int(worker_count))
     frames = max(1, int(num_frames))
-    requested = _env_int('YOLO_TTA_CPU_MASK_PENDING_FRAMES', 4096)
+    requested = _env_int('YOLO_TTA_CPU_MASK_PENDING_FRAMES', 256)
     if int(requested) <= 0:
         return max(workers, frames)
     return max(workers, min(frames, max(int(requested), workers * 2)))
@@ -3782,7 +3804,7 @@ def predict_source_and_accumulate(
         save=False,
         stream=True,
         retina_masks=not bool(use_custom_cpu_retina),
-        batch=1,
+        batch=max(1, int(cfg.batch)),
         device=cfg.device,
         half=cfg.half,
         int8=cfg.int8,
@@ -3795,7 +3817,9 @@ def predict_source_and_accumulate(
     if worker_count <= 1:
         for idx, r in enumerate(results):
             if idx >= num_frames:
-                break
+                # Synthetic final-batch padding is required for fixed-batch inference engines;
+                # consume but discard those results so the predictor stream drains cleanly.
+                continue
             masks_np, confs_np = _extract_result_masks_and_confs(r)
             pred_inc, frame_inc = _process_prediction_frame(
                 idx=idx,
@@ -3815,7 +3839,8 @@ def predict_source_and_accumulate(
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             for idx, r in enumerate(results):
                 if idx >= num_frames:
-                    break
+                    # Discard synthetic repeated-slice results from the padded final batch.
+                    continue
 
                 masks_np, confs_np = _extract_result_masks_and_confs(r)
                 pending.append(executor.submit(
@@ -3866,7 +3891,12 @@ def predict_in_memory_volume_and_accumulate(
     native_w: int,
     postprocess_workers: int = 1,
 ) -> Dict[str, int]:
-    source = make_in_memory_yolo_source(prediction_volume.array, prediction_volume.name, max_frames=int(num_frames))
+    source = make_in_memory_yolo_source(
+        prediction_volume.array,
+        prediction_volume.name,
+        batch_size=max(1, int(cfg.batch)),
+        max_frames=int(num_frames),
+    )
     return predict_source_and_accumulate(
         model,
         source,
@@ -4072,6 +4102,16 @@ def _filter_connected_components_by_min_conf_scipy(
 
 _SINGLE_ANGLE_GPU_CLEANUP_ACTIVE = False
 _GPU_CLEANUP_BACKEND_WARNING_EMITTED = False
+_INFERENCE_BATCH_SIZE = 1
+
+
+def set_inference_batch_size(batch_size: int) -> None:
+    global _INFERENCE_BATCH_SIZE
+    _INFERENCE_BATCH_SIZE = max(1, int(batch_size))
+
+
+def inference_batch_size() -> int:
+    return max(1, int(_INFERENCE_BATCH_SIZE))
 
 
 def set_single_angle_gpu_cleanup_active(active: bool) -> None:
@@ -4183,6 +4223,27 @@ def _cpu_cleanup_slice_fallback(
     return np.asarray(out, dtype=bool)
 
 
+def _gpu_cleanup_one_slice_cp(
+    mask_cp: object,
+    conf_cp: Optional[object],
+    *,
+    min_conf: float,
+    min_radius: float,
+    min_conf_u8: int,
+    cp: object,
+    cpx_ndi: object,
+) -> object:
+    """Clean one already-resident GPU slice and return a GPU boolean slice."""
+    cleaned_cp = mask_cp
+    if conf_cp is not None and float(min_conf) > 0.0:
+        cleaned_cp = _gpu_filter_components_by_min_conf_cp(cleaned_cp, conf_cp, int(min_conf_u8), cp, cpx_ndi)
+    if bool(_cupy_scalar_to_int(cp.any(cleaned_cp))):
+        cleaned_cp = _gpu_fill_holes_2d_cp(cleaned_cp, cp, cpx_ndi)
+    if bool(_cupy_scalar_to_int(cp.any(cleaned_cp))) and float(min_radius) > 0.0:
+        cleaned_cp = _gpu_filter_components_by_min_radius_cp(cleaned_cp, float(min_radius), cp, cpx_ndi)
+    return cleaned_cp
+
+
 def fused_slice_cleanup_gpu_inplace(
     mask_mm: np.ndarray,
     confmap_mm: Optional[np.ndarray] = None,
@@ -4192,12 +4253,15 @@ def fused_slice_cleanup_gpu_inplace(
     workers: int = 1,
     desc: str = 'Single-angle GPU slice cleanup',
 ) -> bool:
-    """Run per-slice cleanup on GPU for the single-angle TTA path.
+    """Run batch-sized cleanup on GPU for the single-angle TTA path.
 
-    The volume remains CPU-backed for interpolation, but each slice is uploaded to
-    CuPy, cleaned on GPU, and copied back before interpolation starts.  If CuPy or
-    the required cupyx.ndimage routines are unavailable, callers fall back to the
-    existing CPU cleanup path.
+    The volume remains CPU-backed for interpolation, but cleanup now uploads and
+    downloads one ``--batch``-sized slab at a time instead of shuttling every slice
+    independently.  The final cleanup slab is padded by repeating the last real
+    slice and synthetic outputs are discarded, matching the fixed-batch inference
+    path.  Within each resident GPU slab, min_conf connected-component filtering,
+    2D hole filling, and applicable min_radius filtering run on CuPy/cupyx before
+    the cleaned slab is copied back for CPU-side interpolation.
     """
     backend_mods = _try_get_gpu_cleanup_backend(min_radius=float(min_radius))
     if backend_mods is None:
@@ -4208,67 +4272,90 @@ def fused_slice_cleanup_gpu_inplace(
         return False
     cp, cpx_ndi = backend_mods
 
-
     num_slices = int(mask_mm.shape[0])
+    if num_slices <= 0:
+        return True
+
     structure2 = np.ones((3, 3), dtype=bool)
     min_conf_u8 = int(min_conf_to_u8_threshold(float(min_conf))) if float(min_conf) > 0.0 else 0
-    gpu_worker_cap = max(1, _env_int('YOLO_TTA_GPU_CLEANUP_WORKERS', 1))
-    worker_count = choose_slice_parallel_workers(min(int(workers), int(gpu_worker_cap)), num_slices)
-    chunk_size = choose_parallel_chunk_size(num_slices, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
     cpu_backend = cleanup_backend()
+    batch_size = max(1, int(inference_batch_size()))
+    print(f'{desc}: GPU cleanup slab size={batch_size} (matches --batch)')
 
-    def _process(i: int) -> None:
-        mask_slice_np = np.asarray(mask_mm[int(i)], dtype=bool)
-        conf_slice_np = None if confmap_mm is None else np.asarray(confmap_mm[int(i)], dtype=np.uint8)
-        if not np.any(mask_slice_np):
-            if confmap_mm is not None:
-                confmap_mm[int(i), :, :].fill(np.uint8(0))
-            return
+    for start in tqdm(range(0, num_slices, batch_size), desc=desc):
+        stop = min(num_slices, int(start) + int(batch_size))
+        actual = int(stop - start)
+        mask_batch_np = np.asarray(mask_mm[int(start):int(stop)], dtype=bool)
+        conf_batch_np = None if confmap_mm is None else np.asarray(confmap_mm[int(start):int(stop)], dtype=np.uint8)
+        if actual <= 0:
+            continue
+
+        padded = actual < batch_size
+        if padded:
+            pad_count = int(batch_size - actual)
+            mask_pad = np.repeat(mask_batch_np[-1:, :, :], pad_count, axis=0)
+            mask_batch_for_gpu = np.concatenate([mask_batch_np, mask_pad], axis=0)
+            if conf_batch_np is not None:
+                conf_pad = np.repeat(conf_batch_np[-1:, :, :], pad_count, axis=0)
+                conf_batch_for_gpu = np.concatenate([conf_batch_np, conf_pad], axis=0)
+            else:
+                conf_batch_for_gpu = None
+        else:
+            mask_batch_for_gpu = mask_batch_np
+            conf_batch_for_gpu = conf_batch_np
+
         try:
-            mask_cp = cp.asarray(mask_slice_np, dtype=cp.bool_)
-            if conf_slice_np is not None and float(min_conf) > 0.0:
-                conf_cp = cp.asarray(conf_slice_np, dtype=cp.uint8)
-                mask_cp = _gpu_filter_components_by_min_conf_cp(mask_cp, conf_cp, int(min_conf_u8), cp, cpx_ndi)
-            if bool(_cupy_scalar_to_int(cp.any(mask_cp))):
-                mask_cp = _gpu_fill_holes_2d_cp(mask_cp, cp, cpx_ndi)
-            if bool(_cupy_scalar_to_int(cp.any(mask_cp))) and float(min_radius) > 0.0:
-                mask_cp = _gpu_filter_components_by_min_radius_cp(mask_cp, float(min_radius), cp, cpx_ndi)
-            cleaned = cp.asnumpy(mask_cp).astype(bool, copy=False)
+            mask_batch_cp = cp.asarray(mask_batch_for_gpu, dtype=cp.bool_)
+            conf_batch_cp = None if conf_batch_for_gpu is None else cp.asarray(conf_batch_for_gpu, dtype=cp.uint8)
+            cleaned_batch_cp = cp.zeros_like(mask_batch_cp, dtype=cp.bool_)
+            for local_idx in range(int(batch_size)):
+                mask_slice_cp = mask_batch_cp[int(local_idx)]
+                if not bool(_cupy_scalar_to_int(cp.any(mask_slice_cp))):
+                    continue
+                conf_slice_cp = None if conf_batch_cp is None else conf_batch_cp[int(local_idx)]
+                cleaned_batch_cp[int(local_idx)] = _gpu_cleanup_one_slice_cp(
+                    mask_slice_cp,
+                    conf_slice_cp,
+                    min_conf=float(min_conf),
+                    min_radius=float(min_radius),
+                    min_conf_u8=int(min_conf_u8),
+                    cp=cp,
+                    cpx_ndi=cpx_ndi,
+                )
+            cleaned_batch = cp.asnumpy(cleaned_batch_cp[:actual]).astype(bool, copy=False)
         except Exception:
-            cleaned = _cpu_cleanup_slice_fallback(
-                mask_slice_np,
-                conf_slice_np,
-                min_conf=float(min_conf),
-                min_radius=float(min_radius),
-                min_conf_u8=int(min_conf_u8),
-                structure2=structure2,
-                backend=cpu_backend,
-            )
-        mask_mm[int(i), :, :] = cleaned.astype(np.uint8, copy=False)
-        if confmap_mm is not None:
-            conf_slice = np.zeros_like(conf_slice_np, dtype=np.uint8) if conf_slice_np is not None else None
-            if conf_slice is not None and np.any(cleaned):
-                conf_slice[:, :] = conf_slice_np
-                conf_slice[~cleaned] = np.uint8(0)
-            if conf_slice is not None:
-                confmap_mm[int(i), :, :] = conf_slice
+            cleaned_slices: List[np.ndarray] = []
+            for local_idx in range(actual):
+                cleaned_slices.append(_cpu_cleanup_slice_fallback(
+                    mask_batch_np[int(local_idx)],
+                    None if conf_batch_np is None else conf_batch_np[int(local_idx)],
+                    min_conf=float(min_conf),
+                    min_radius=float(min_radius),
+                    min_conf_u8=int(min_conf_u8),
+                    structure2=structure2,
+                    backend=cpu_backend,
+                ))
+            cleaned_batch = np.asarray(cleaned_slices, dtype=bool)
 
-    parallel_for_indices_chunked(
-        num_slices,
-        _process,
-        max_workers=worker_count,
-        desc=desc,
-        chunk_size=chunk_size,
-    )
+        mask_mm[int(start):int(stop), :, :] = cleaned_batch.astype(np.uint8, copy=False)
+        if confmap_mm is not None and conf_batch_np is not None:
+            conf_out = np.asarray(conf_batch_np, dtype=np.uint8).copy()
+            if np.any(cleaned_batch):
+                conf_out[~cleaned_batch] = np.uint8(0)
+            else:
+                conf_out.fill(np.uint8(0))
+            confmap_mm[int(start):int(stop), :, :] = conf_out
+
+        try:
+            free_all = getattr(cp.get_default_memory_pool(), 'free_all_blocks', None)
+            if callable(free_all):
+                free_all()
+        except Exception:
+            pass
+
     flush_array(mask_mm)
     if confmap_mm is not None:
         flush_array(confmap_mm)
-    try:
-        free_all = getattr(cp.get_default_memory_pool(), 'free_all_blocks', None)
-        if callable(free_all):
-            free_all()
-    except Exception:
-        pass
     return True
 
 def fused_slice_cleanup_inplace(
@@ -5259,6 +5346,7 @@ def backproject_radial_volume_to_volume(
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
+    backend: str = 'cpu',
 ) -> np.ndarray:
     if radial_view.family != 'radial':
         raise ValueError('backproject_radial_volume_to_volume expects a radial view')
@@ -5296,6 +5384,21 @@ def backproject_radial_volume_to_volume(
     source_idx_map = np.asarray(dense_map.source_idx_map, dtype=np.int32)
     u_idx_map = np.asarray(dense_map.u_idx_map, dtype=np.int32)
 
+    backend_norm = str(backend or 'cpu').strip().lower()
+    if backend_norm in ('gpu', 'auto'):
+        gpu_done = try_backproject_radial_volume_to_volume_gpu(
+            radial_mask_mm=radial_mask_mm,
+            radial_view=radial_view,
+            vol_mm=vol_mm,
+            dense_map=dense_map,
+            desc=desc,
+        )
+        if bool(gpu_done):
+            flush_array(vol_mm)
+            return vol_mm
+        if backend_norm == 'gpu':
+            print(f'{desc}: GPU radial backprojection unavailable or failed; falling back to CPU backend.')
+
     worker_count = choose_slice_parallel_workers(int(workers), int(t_dim))
 
     def _backproject_t_slice(t_idx: int) -> None:
@@ -5327,6 +5430,7 @@ def backproject_tilted_volume_to_volume(
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
+    backend: str = 'cpu',
 ) -> np.ndarray:
     """Backproject a v12 Tilted View-native mask stack into native (t, Y, X).
 
@@ -5376,6 +5480,21 @@ def backproject_tilted_volume_to_volume(
 
     base_view = tilted_base_view_name(tilted_view)
     stack_len = tilted_stack_axis_length(tilted_view)
+
+    backend_norm = str(backend or 'cpu').strip().lower()
+    if backend_norm in ('gpu', 'auto'):
+        gpu_done = try_backproject_tilted_volume_to_volume_gpu(
+            tilted_mask_mm=src,
+            tilted_view=tilted_view,
+            vol_mm=vol_mm,
+            desc=desc,
+        )
+        if bool(gpu_done):
+            flush_array(vol_mm)
+            return vol_mm
+        if backend_norm == 'gpu':
+            print(f'{desc}: GPU tilted backprojection unavailable or failed; falling back to CPU backend.')
+
     worker_count = choose_slice_parallel_workers(int(workers), int(tilted_view.num_slices))
 
     def _backproject_frame(frame_idx: int) -> None:
@@ -5423,6 +5542,255 @@ def backproject_tilted_volume_to_volume(
 
     flush_array(vol_mm)
     return vol_mm
+
+
+
+def _try_import_cupy_for_backprojection() -> Optional[object]:
+    if not _env_flag('YOLO_TTA_BACKPROJECT_GPU', True):
+        return None
+    try:
+        import cupy as cp  # type: ignore
+    except Exception:
+        return None
+    try:
+        if not bool(cp.cuda.runtime.getDeviceCount() > 0):
+            return None
+    except Exception:
+        return None
+    return cp
+
+
+def _cupy_free_bytes(cp: object) -> int:
+    try:
+        free_b, _total_b = cp.cuda.runtime.memGetInfo()
+        return int(free_b)
+    except Exception:
+        return 0
+
+
+def _copy_cupy_volume_to_cpu_workspace(cp: object, vol_cp: object, vol_mm: np.ndarray, desc: str) -> None:
+    z_dim = int(vol_mm.shape[0])
+    copy_chunk = max(1, _env_int('YOLO_TTA_BACKPROJECT_GPU_COPY_SLICES', 8))
+    for z0 in tqdm(range(0, z_dim, copy_chunk), desc=f'{desc}: GPU result copy'):
+        z1 = min(z_dim, int(z0) + int(copy_chunk))
+        vol_mm[int(z0):int(z1), :, :] = cp.asnumpy(vol_cp[int(z0):int(z1), :, :]).astype(np.uint8, copy=False)
+
+
+def try_backproject_radial_volume_to_volume_gpu(
+    *,
+    radial_mask_mm: np.ndarray,
+    radial_view: ViewInfo,
+    vol_mm: np.ndarray,
+    dense_map: DenseRadialBackprojectionMap,
+    desc: str,
+) -> bool:
+    """GPU dense radial backprojection, returning False when unavailable/unsafe."""
+    cp = _try_import_cupy_for_backprojection()
+    if cp is None:
+        return False
+    try:
+        t_dim = int(radial_view.src_h)
+        out_h = int(radial_view.full_h)
+        out_w = int(radial_view.full_w)
+        map_bytes = int(out_h) * int(out_w) * (np.dtype(np.int32).itemsize * 2 + np.dtype(np.bool_).itemsize)
+        batch_slices = max(1, _env_int('YOLO_TTA_RADIAL_BACKPROJECT_GPU_BATCH', max(1, min(16, inference_batch_size()))))
+        source_bytes_per_t = int(radial_mask_mm.shape[0]) * int(radial_mask_mm.shape[2])
+        need_bytes = int(map_bytes) + int(batch_slices) * (int(source_bytes_per_t) + int(out_h) * int(out_w)) + 2 * GIB
+        free_bytes = _cupy_free_bytes(cp)
+        if free_bytes and int(need_bytes) > int(free_bytes):
+            batch_slices = max(1, min(batch_slices, int(max(1, (int(free_bytes) - 2 * GIB - int(map_bytes)) // max(1, int(source_bytes_per_t) + int(out_h) * int(out_w))))))
+        if batch_slices <= 0:
+            return False
+
+        print(f'{desc}: using GPU radial backprojection (batch_t={batch_slices})')
+        valid_cp = cp.asarray(np.asarray(dense_map.valid_mask, dtype=bool))
+        source_idx_cp = cp.asarray(np.asarray(dense_map.source_idx_map, dtype=np.int32))
+        u_idx_cp = cp.asarray(np.asarray(dense_map.u_idx_map, dtype=np.int32))
+        for t0 in tqdm(range(0, t_dim, int(batch_slices)), desc=f'{desc} [GPU radial]'):
+            t1 = min(t_dim, int(t0) + int(batch_slices))
+            planes_np = np.ascontiguousarray(np.asarray(radial_mask_mm[:, int(t0):int(t1), :], dtype=np.uint8))
+            planes_cp = cp.asarray(planes_np, dtype=cp.uint8)
+            out_batch_cp = cp.zeros((int(t1 - t0), int(out_h), int(out_w)), dtype=cp.uint8)
+            for bi in range(int(t1 - t0)):
+                gathered = planes_cp[:, int(bi), :][source_idx_cp, u_idx_cp]
+                out_slice = out_batch_cp[int(bi)]
+                out_slice[valid_cp] = gathered[valid_cp]
+            vol_mm[int(t0):int(t1), :, :] = cp.asnumpy(out_batch_cp).astype(np.uint8, copy=False)
+            try:
+                cp.get_default_memory_pool().free_all_blocks()
+            except Exception:
+                pass
+        flush_array(vol_mm)
+        return True
+    except Exception as exc:
+        print(f'{desc}: GPU radial backprojection failed ({exc}); CPU fallback will be used.')
+        try:
+            cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+        return False
+
+
+def try_backproject_tilted_volume_to_volume_gpu(
+    *,
+    tilted_mask_mm: np.ndarray,
+    tilted_view: ViewInfo,
+    vol_mm: np.ndarray,
+    desc: str,
+) -> bool:
+    """GPU tilted backprojection using a full output uint8 volume on the GPU when it fits."""
+    cp = _try_import_cupy_for_backprojection()
+    if cp is None:
+        return False
+    try:
+        t_dim = int(tilted_view.full_t)
+        out_h = int(tilted_view.full_h)
+        out_w = int(tilted_view.full_w)
+        output_bytes = int(t_dim) * int(out_h) * int(out_w)
+        free_bytes = _cupy_free_bytes(cp)
+        reserve_bytes = int(max(2.0, _env_float('YOLO_TTA_TILTED_BACKPROJECT_GPU_RESERVE_GIB', 8.0)) * GIB)
+        if free_bytes and output_bytes + reserve_bytes > free_bytes:
+            print(
+                f'{desc}: GPU tilted backprojection skipped because output volume needs '
+                f'{output_bytes / GIB:.1f} GiB with reserve {reserve_bytes / GIB:.1f} GiB but only {free_bytes / GIB:.1f} GiB is free.'
+            )
+            return False
+
+        print(f'{desc}: using GPU tilted backprojection (full output volume {output_bytes / GIB:.1f} GiB on GPU)')
+        vol_cp = cp.zeros((int(t_dim), int(out_h), int(out_w)), dtype=cp.uint8)
+        tan_alpha = float(math.tan(math.radians(float(tilted_view.tilt_angle_deg))))
+        if str(tilted_view.tilt_direction) == 'vertical':
+            axis_center = float((int(tilted_view.src_h) - 1) / 2.0)
+        elif str(tilted_view.tilt_direction) == 'horizontal':
+            axis_center = float((int(tilted_view.src_w) - 1) / 2.0)
+        else:
+            return False
+        base_view = tilted_base_view_name(tilted_view)
+        stack_len = tilted_stack_axis_length(tilted_view)
+
+        for frame_idx in tqdm(range(int(tilted_view.num_slices)), desc=f'{desc} [GPU tilted]'):
+            tilted_mask_np = np.asarray(tilted_mask_mm[int(frame_idx)], dtype=bool)
+            if not np.any(tilted_mask_np):
+                continue
+            mask_cp = cp.asarray(tilted_mask_np, dtype=cp.bool_)
+            vv, uu = cp.nonzero(mask_cp)
+            if int(vv.size) <= 0:
+                continue
+            frame_center = float(tilted_frame_center(tilted_view, int(frame_idx)))
+            if str(tilted_view.tilt_direction) == 'vertical':
+                stack_float = frame_center + tan_alpha * (vv.astype(cp.float32, copy=False) - float(axis_center))
+            else:
+                stack_float = frame_center + tan_alpha * (uu.astype(cp.float32, copy=False) - float(axis_center))
+            ss = cp.rint(stack_float).astype(cp.int32, copy=False)
+            valid = cp.logical_and(ss >= 0, ss < int(stack_len))
+            if not bool(_cupy_scalar_to_int(cp.any(valid))):
+                continue
+            ss_v = ss[valid]
+            vv_v = vv[valid]
+            uu_v = uu[valid]
+            if base_view == 'transverse':
+                vol_cp[ss_v, vv_v, uu_v] = cp.uint8(1)
+            elif base_view == 'sagittal':
+                vol_cp[vv_v, ss_v, uu_v] = cp.uint8(1)
+            elif base_view == 'coronal':
+                vol_cp[vv_v, uu_v, ss_v] = cp.uint8(1)
+            else:
+                return False
+        _copy_cupy_volume_to_cpu_workspace(cp, vol_cp, vol_mm, desc)
+        flush_array(vol_mm)
+        try:
+            cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+        return True
+    except Exception as exc:
+        print(f'{desc}: GPU tilted backprojection failed ({exc}); CPU fallback will be used.')
+        try:
+            cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+        return False
+
+
+@dataclass(frozen=True)
+class ViewBackprojectionQueueJob:
+    model_name: str
+    view: ViewInfo
+    native_source: np.ndarray
+    out_path: Path
+    desc: str
+    min_radius: float = 0.0
+    workers: int = 1
+
+
+class HybridBackprojectionQueue:
+    """At most one GPU and one CPU radial/tilted backprojection at a time."""
+
+    def __init__(self, *, cpu_workers: int = 1, gpu_enabled: bool = True) -> None:
+        self.cpu_workers = max(1, int(cpu_workers))
+        self.gpu_enabled = bool(gpu_enabled and _try_import_cupy_for_backprojection() is not None)
+
+    def _run_job(self, job: ViewBackprojectionQueueJob, backend: str) -> Tuple[str, str, np.ndarray]:
+        view_local = job.view
+        if view_local.family == 'radial':
+            projected = backproject_radial_volume_to_volume(
+                radial_mask_mm=job.native_source,
+                radial_view=view_local,
+                out_path=job.out_path,
+                desc=job.desc,
+                prefer_memory=True,
+                workers=int(job.workers),
+                backend=str(backend),
+            )
+        elif is_tilted_view(view_local):
+            projected = backproject_tilted_volume_to_volume(
+                tilted_mask_mm=job.native_source,
+                tilted_view=view_local,
+                out_path=job.out_path,
+                desc=job.desc,
+                prefer_memory=True,
+                workers=int(job.workers),
+                backend=str(backend),
+            )
+        else:  # pragma: no cover
+            raise ValueError(f'Unsupported queued backprojection view family: {view_local.family}')
+
+        if float(job.min_radius) > 0.0:
+            print(f"Applying --min_radius in the transverse plane for backprojected view '{view_local.name}' [{backend}]")
+            apply_transverse_min_radius_filter_inplace(
+                projected,
+                float(job.min_radius),
+                workers=int(job.workers),
+            )
+        return str(job.model_name), str(view_local.name), projected
+
+    def run(self, jobs: Sequence[ViewBackprojectionQueueJob]) -> List[Tuple[str, str, np.ndarray]]:
+        queue = deque(jobs)
+        results: List[Tuple[str, str, np.ndarray]] = []
+        cpu_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='backproject-cpu')
+        gpu_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='backproject-gpu') if self.gpu_enabled else None
+        pending: Dict[Future, str] = {}
+        try:
+            while queue or pending:
+                if self.gpu_enabled and gpu_executor is not None and 'gpu' not in pending.values() and queue:
+                    job = queue.popleft()
+                    print(f'Backprojection queue: assigning {job.model_name}/{job.view.name} to GPU')
+                    pending[gpu_executor.submit(self._run_job, job, 'gpu')] = 'gpu'
+                if 'cpu' not in pending.values() and queue:
+                    job = queue.popleft()
+                    print(f'Backprojection queue: assigning {job.model_name}/{job.view.name} to CPU')
+                    pending[cpu_executor.submit(self._run_job, job, 'cpu')] = 'cpu'
+                if not pending:
+                    continue
+                done, _not_done = wait(list(pending.keys()), return_when=FIRST_COMPLETED)
+                for fut in done:
+                    pending.pop(fut, None)
+                    results.append(fut.result())
+        finally:
+            cpu_executor.shutdown(wait=True)
+            if gpu_executor is not None:
+                gpu_executor.shutdown(wait=True)
+        return results
 
 def assemble_view_volumes_into_native_union(
     final_union_mm: np.ndarray,
@@ -8245,39 +8613,13 @@ def prepare_view_volume_after_fullframe(
         else:
             final_view_volume = baseline_native_volume
     elif view.family == 'radial':
-        out_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.u8.dat'
-        final_view_volume = backproject_radial_volume_to_volume(
-            radial_mask_mm=baseline_native_volume,
-            radial_view=view,
-            out_path=out_path,
-            desc=f'Backprojecting {model_name}/{view.name}',
-            prefer_memory=True,
-            workers=int(slice_workers),
-        )
-        if float(min_radius) > 0.0:
-            print(f"Applying --min_radius in the transverse plane for backprojected view '{view.name}'")
-            apply_transverse_min_radius_filter_inplace(
-                final_view_volume,
-                float(min_radius),
-                workers=int(slice_workers),
-            )
+        # Keep Radial masks in Radial view-native space here.  The final radial/tilted
+        # backprojection queue later assigns at most one set to GPU and one set to CPU.
+        final_view_volume = baseline_native_volume
     elif is_tilted_view(view):
-        out_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.u8.dat'
-        final_view_volume = backproject_tilted_volume_to_volume(
-            tilted_mask_mm=baseline_native_volume,
-            tilted_view=view,
-            out_path=out_path,
-            desc=f'Backprojecting {model_name}/{view.name}',
-            prefer_memory=True,
-            workers=int(slice_workers),
-        )
-        if float(min_radius) > 0.0:
-            print(f"Applying --min_radius in the transverse plane for backprojected view '{view.name}'")
-            apply_transverse_min_radius_filter_inplace(
-                final_view_volume,
-                float(min_radius),
-                workers=int(slice_workers),
-            )
+        # Keep Tilted masks in Tilted view-native space here so the hybrid final
+        # backprojection queue can schedule CPU/GPU work globally across sets.
+        final_view_volume = baseline_native_volume
     else:
         final_view_volume = baseline_native_volume
 
@@ -9714,9 +10056,44 @@ def nrrd_pigz_threads() -> int:
     return max(1, _env_int('YOLO_TTA_NRRD_PIGZ_THREADS', int(default_threads)))
 
 
-def nrrd_stream_buffer_bytes() -> int:
-    mib = max(1, _env_int('YOLO_TTA_NRRD_STREAM_BUFFER_MIB', 4096))
-    return int(mib) * 1024 * 1024
+def nrrd_stream_buffer_bytes(required_bytes: Optional[int] = None) -> int:
+    """Return the RAM budget for one NRRD streaming payload slab.
+
+    v12.2.1 intentionally avoided materializing the full decomposed NRRD payload.
+    v12.2.2 keeps that safety property but uses the hundreds of GiB that are normally
+    free under the SLURM allocation to make the streaming slabs much larger.  An
+    explicit YOLO_TTA_NRRD_STREAM_BUFFER_MIB still wins; otherwise the buffer is a
+    bounded fraction of currently available anonymous memory after a reserve.
+    """
+    explicit = os.environ.get('YOLO_TTA_NRRD_STREAM_BUFFER_MIB', '').strip()
+    if explicit:
+        mib = max(1, _env_int('YOLO_TTA_NRRD_STREAM_BUFFER_MIB', 4096))
+        target = int(mib) * 1024 * 1024
+    else:
+        min_mib = max(1, _env_int('YOLO_TTA_NRRD_STREAM_BUFFER_MIN_MIB', 4096))
+        reserve_gib = max(1.0, _env_float('YOLO_TTA_NRRD_STREAM_BUFFER_RESERVE_GIB', 96.0))
+        max_gib = max(1.0, _env_float('YOLO_TTA_NRRD_STREAM_BUFFER_MAX_GIB', 384.0))
+        fraction = min(0.90, max(0.01, _env_float('YOLO_TTA_NRRD_STREAM_BUFFER_FRACTION', 0.35)))
+        avail = int(available_anon_work_bytes())
+        usable = max(0, int(avail) - int(reserve_gib * GIB))
+        target = int(max(int(min_mib) * 1024 * 1024, min(float(max_gib) * float(GIB), float(usable) * float(fraction))))
+    if required_bytes is not None and int(required_bytes) > 0:
+        target = min(int(target), int(required_bytes))
+    return max(1, int(target))
+
+
+def nrrd_payload_fill_workers(layer_count: int, z_chunk: int = 1) -> int:
+    default_workers = max(1, min(_cpu_count(), int(layer_count) * max(1, int(z_chunk)), 32))
+    return max(1, _env_int('YOLO_TTA_NRRD_PAYLOAD_FILL_WORKERS', int(default_workers)))
+
+
+def _nrrd_full_slice_z_chunk(layer_count: int, width: int, height: int, depth: int) -> int:
+    full_slice_bytes = max(1, int(layer_count) * int(width) * int(height) * np.dtype(np.uint8).itemsize)
+    full_payload_bytes = full_slice_bytes * max(1, int(depth))
+    target = nrrd_stream_buffer_bytes(full_payload_bytes)
+    if target < full_slice_bytes:
+        return 1
+    return max(1, min(int(depth), int(target // full_slice_bytes)))
 
 
 def nrrd_madvise_dontneed_interval() -> int:
@@ -9888,7 +10265,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.5-Pro_v12.2.1_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.5-Pro_v12.2.2_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -9912,7 +10289,8 @@ def _write_nrrd_ascii_header(
 
 
 def _nrrd_stream_chunk_rows(layer_count: int, width: int, height: int) -> int:
-    target = max(1, int(nrrd_stream_buffer_bytes()))
+    required = max(1, int(layer_count) * int(width) * int(height) * np.dtype(np.uint8).itemsize)
+    target = max(1, int(nrrd_stream_buffer_bytes(required)))
     bytes_per_row = max(1, int(layer_count) * int(width) * np.dtype(np.uint8).itemsize)
     return max(1, min(int(height), int(target // bytes_per_row)))
 
@@ -10394,24 +10772,40 @@ def _write_decomposed_nrrd_payload_stream(
     output_shape: Tuple[int, int, int],
     payload_writer: object,
 ) -> None:
-    """Stream decomposed ``(layer,X,Y,t)`` pigz gzip-encoded payload in NRRD Fortran axis order.
+    """Stream decomposed ``(layer,X,Y,t)`` pigz payload using RAM-aware slabs.
 
-    This is the core RAM-reduction change for v12.2.0 updates.  The old implementation built a
-    full ``(layer,X,Y,t)`` memmap and then handed it to pynrrd; OS page cache plus writer-side
-    traversal could push peak resident memory past the SLURM allocation.  This path keeps only a
-    bounded ``(layer,X,row_chunk)`` buffer plus one source row block/slice at a time.
+    This keeps the no-full-4D-payload guarantee while making slabs large enough to
+    exploit the normal SLURM headroom.  When the RAM budget can hold at least one
+    complete ``(layer,X,Y)`` payload slice, the writer batches multiple ``t`` slices
+    per write.  Otherwise it falls back to row slabs.  Layer fills inside each slab
+    are parallelized across worker threads.
     """
     out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
     layer_count = int(len(effective_refs))
-    chunk_rows = _nrrd_stream_chunk_rows(layer_count, out_w, out_h)
-    buffer_bytes = int(layer_count) * int(out_w) * int(chunk_rows)
+    if layer_count <= 0:
+        return
+
+    full_slice_bytes = int(layer_count) * int(out_w) * int(out_h)
+    z_chunk = _nrrd_full_slice_z_chunk(layer_count, out_w, out_h, out_t)
+    use_full_slice_slabs = int(z_chunk) > 1 or nrrd_stream_buffer_bytes(full_slice_bytes) >= int(full_slice_bytes)
+    if use_full_slice_slabs:
+        chunk_rows = int(out_h)
+        buffer_bytes = int(layer_count) * int(out_w) * int(out_h) * int(z_chunk)
+    else:
+        chunk_rows = _nrrd_stream_chunk_rows(layer_count, out_w, out_h)
+        buffer_bytes = int(layer_count) * int(out_w) * int(chunk_rows)
+        z_chunk = 1
+
+    fill_workers = nrrd_payload_fill_workers(layer_count, z_chunk)
     print(
         f'NRRD streaming decomposed payload: layers={layer_count}, shape=(layer,X,Y,t)='
-        f'({layer_count},{out_w},{out_h},{out_t}), row_chunk={chunk_rows}, '
-        f'buffer~{buffer_bytes / GIB:.3f} GiB, pigz_level={nrrd_pigz_compresslevel()}, pigz_threads={nrrd_pigz_threads()}'
+        f'({layer_count},{out_w},{out_h},{out_t}), row_chunk={chunk_rows}, z_chunk={z_chunk}, '
+        f'buffer~{buffer_bytes / GIB:.3f} GiB, fill_workers={fill_workers}, '
+        f'pigz_level={nrrd_pigz_compresslevel()}, pigz_threads={nrrd_pigz_threads()}'
     )
 
     opened: List[object] = []
+    fill_executor: Optional[ThreadPoolExecutor] = None
     try:
         for ref in effective_refs:
             src = _open_nrrd_layer_ref(ref)
@@ -10419,30 +10813,84 @@ def _write_decomposed_nrrd_payload_stream(
             opened.append(src)
 
         madvise_interval = nrrd_madvise_dontneed_interval()
-        max_block = np.empty((layer_count, out_w, chunk_rows), dtype=np.uint8, order='F')
-        for z in tqdm(range(out_t), desc='NRRD streaming: decomposed layers'):
-            for y0 in range(0, out_h, chunk_rows):
-                y1 = min(out_h, y0 + chunk_rows)
-                rows = int(y1 - y0)
-                block = max_block[:, :, :rows]
-                for layer_idx, src in enumerate(opened):
-                    row_block_yx = _read_layer_row_block_in_output_shape(
-                        src,
-                        output_shape,
-                        int(z),
-                        int(y0),
-                        int(y1),
-                    )
-                    block[int(layer_idx), :, :] = np.asarray(row_block_yx, dtype=np.uint8).T
-                payload_writer.write(block.tobytes(order='F'))
-            if madvise_interval > 0 and ((int(z) + 1) % int(madvise_interval) == 0):
-                for src in opened:
-                    _madvise_array_mmap(src, 'MADV_DONTNEED')
+        if int(fill_workers) > 1:
+            fill_executor = ThreadPoolExecutor(max_workers=int(fill_workers), thread_name_prefix='nrrd-fill')
+
+        def _run_fill_tasks(tasks: List[Callable[[], None]]) -> None:
+            if not tasks:
+                return
+            if fill_executor is None:
+                for task in tasks:
+                    task()
+            else:
+                futures = [fill_executor.submit(task) for task in tasks]
+                for fut in futures:
+                    fut.result()
+
+        if bool(use_full_slice_slabs):
+            try:
+                max_block4 = np.empty((layer_count, out_w, out_h, int(z_chunk)), dtype=np.uint8, order='F')
+            except MemoryError:
+                print('Warning: requested NRRD full-slice slab allocation failed; falling back to row-slab streaming for this file.')
+                chunk_rows = _nrrd_stream_chunk_rows(layer_count, out_w, out_h)
+                max_block3 = np.empty((layer_count, out_w, chunk_rows), dtype=np.uint8, order='F')
+                for z in tqdm(range(out_t), desc='NRRD streaming: decomposed layers'):
+                    for y0 in range(0, out_h, chunk_rows):
+                        y1 = min(out_h, y0 + chunk_rows)
+                        rows = int(y1 - y0)
+                        block = max_block3[:, :, :rows]
+                        tasks: List[Callable[[], None]] = []
+                        for layer_idx, src in enumerate(opened):
+                            def _task(layer_idx: int = int(layer_idx), src: object = src, z: int = int(z), y0: int = int(y0), y1: int = int(y1)) -> None:
+                                row_block_yx = _read_layer_row_block_in_output_shape(src, output_shape, z, y0, y1)
+                                block[int(layer_idx), :, :] = np.asarray(row_block_yx, dtype=np.uint8).T
+                            tasks.append(_task)
+                        _run_fill_tasks(tasks)
+                        payload_writer.write(block.tobytes(order='F'))
+                    if madvise_interval > 0 and ((int(z) + 1) % int(madvise_interval) == 0):
+                        for src in opened:
+                            _madvise_array_mmap(src, 'MADV_DONTNEED')
+            else:
+                for z0 in tqdm(range(0, out_t, int(z_chunk)), desc='NRRD streaming: decomposed layers'):
+                    z1 = min(out_t, int(z0) + int(z_chunk))
+                    z_count = int(z1 - z0)
+                    block4 = max_block4[:, :, :, :z_count]
+                    tasks = []
+                    for zi, z in enumerate(range(int(z0), int(z1))):
+                        for layer_idx, src in enumerate(opened):
+                            def _task(layer_idx: int = int(layer_idx), zi: int = int(zi), src: object = src, z: int = int(z)) -> None:
+                                row_block_yx = _read_layer_row_block_in_output_shape(src, output_shape, z, 0, out_h)
+                                block4[int(layer_idx), :, :, int(zi)] = np.asarray(row_block_yx, dtype=np.uint8).T
+                            tasks.append(_task)
+                    _run_fill_tasks(tasks)
+                    payload_writer.write(block4.tobytes(order='F'))
+                    if madvise_interval > 0 and (int(z1) % int(madvise_interval) == 0):
+                        for src in opened:
+                            _madvise_array_mmap(src, 'MADV_DONTNEED')
+        else:
+            max_block = np.empty((layer_count, out_w, chunk_rows), dtype=np.uint8, order='F')
+            for z in tqdm(range(out_t), desc='NRRD streaming: decomposed layers'):
+                for y0 in range(0, out_h, chunk_rows):
+                    y1 = min(out_h, y0 + chunk_rows)
+                    rows = int(y1 - y0)
+                    block = max_block[:, :, :rows]
+                    tasks = []
+                    for layer_idx, src in enumerate(opened):
+                        def _task(layer_idx: int = int(layer_idx), src: object = src, z: int = int(z), y0: int = int(y0), y1: int = int(y1)) -> None:
+                            row_block_yx = _read_layer_row_block_in_output_shape(src, output_shape, z, y0, y1)
+                            block[int(layer_idx), :, :] = np.asarray(row_block_yx, dtype=np.uint8).T
+                        tasks.append(_task)
+                    _run_fill_tasks(tasks)
+                    payload_writer.write(block.tobytes(order='F'))
+                if madvise_interval > 0 and ((int(z) + 1) % int(madvise_interval) == 0):
+                    for src in opened:
+                        _madvise_array_mmap(src, 'MADV_DONTNEED')
     finally:
+        if fill_executor is not None:
+            fill_executor.shutdown(wait=True)
         for src in opened:
             _madvise_array_mmap(src, 'MADV_DONTNEED')
             _close_nrrd_layer_source(src)
-
 
 def _write_decomposed_nrrd_manifest(
     *,
@@ -10605,15 +11053,21 @@ def write_decomposed_nrrd(
     estimated_old_payload_bytes = (
         int(len(effective_refs)) * int(output_shape[2]) * int(output_shape[1]) * int(output_shape[0])
     )
-    bounded_buffer_bytes = int(len(effective_refs)) * int(output_shape[2]) * _nrrd_stream_chunk_rows(
-        int(len(effective_refs)),
-        int(output_shape[2]),
-        int(output_shape[1]),
-    )
+    full_slice_bytes = int(len(effective_refs)) * int(output_shape[2]) * int(output_shape[1])
+    z_chunk_est = _nrrd_full_slice_z_chunk(int(len(effective_refs)), int(output_shape[2]), int(output_shape[1]), int(output_shape[0]))
+    if nrrd_stream_buffer_bytes(full_slice_bytes) >= int(full_slice_bytes):
+        bounded_buffer_bytes = int(full_slice_bytes) * int(z_chunk_est)
+    else:
+        bounded_buffer_bytes = int(len(effective_refs)) * int(output_shape[2]) * _nrrd_stream_chunk_rows(
+            int(len(effective_refs)),
+            int(output_shape[2]),
+            int(output_shape[1]),
+        )
     print(
         'Decomposed NRRD export is using the bounded streaming writer. '
         f'A full 4D uint8 payload would be ~{estimated_old_payload_bytes / GIB:.1f} GiB; '
-        f'the streaming payload buffer is ~{bounded_buffer_bytes / GIB:.3f} GiB.'
+        f'the RAM-aware streaming payload slab is ~{bounded_buffer_bytes / GIB:.3f} GiB '
+        f'(estimated z_chunk={int(z_chunk_est)} when full-slice slabs fit).'
     )
 
     _log_nrrd_streaming_sources(effective_refs)
@@ -11307,6 +11761,35 @@ def save_low_quality_outputs(
 
 
 
+def planned_low_quality_output_paths(
+    *,
+    out_dir: Path,
+    stem: str,
+    downbin_specs: Sequence[LowQualityDownbinSpec],
+    nrrd_layer_refs: Optional[Sequence[NrrdLayerRef]] = None,
+) -> Dict[str, Path]:
+    """Return the paths that save_low_quality_outputs will create.
+
+    This lets the background output manager launch low-quality videos/NRRDs at the
+    same time as full-size outputs, including concurrent full-size and low-quality
+    NRRD streaming, instead of waiting for the full-size output group to finish.
+    """
+    low_root = out_dir / 'low_quality'
+    result_paths: Dict[str, Path] = {'low_quality_dir': low_root}
+    for spec in downbin_specs:
+        spec_dir = low_root / spec.token
+        overlay_path = spec_dir / f'{stem}_Overlay_LowQuality_{spec.token}.mp4'
+        binary_path = spec_dir / f'{stem}_Binary_LowQuality_{spec.token}.mp4'
+        nrrd_path = spec_dir / f'{stem}_LowQuality_{spec.token}.nrrd'
+        result_paths[f'low_quality_{spec.token}_overlay'] = overlay_path
+        result_paths[f'low_quality_{spec.token}_binary_video'] = binary_path
+        result_paths[f'low_quality_{spec.token}_nrrd'] = nrrd_path
+        if nrrd_layer_refs is not None and len(nrrd_layer_refs) > 0:
+            result_paths[f'low_quality_{spec.token}_nrrd_manifest'] = nrrd_path.with_suffix(nrrd_path.suffix + '.manifest.json')
+    return result_paths
+
+
+
 @dataclass
 class BackgroundOutputSubmission:
     label: str
@@ -11708,6 +12191,9 @@ def main() -> None:
     model_paths = [model_path_resolved]
 
     angles = _parse_angles(args.angle) or [0.0, 120.0, 240.0]
+    if int(args.batch) < 1:
+        raise ValueError('--batch must be >= 1')
+    set_inference_batch_size(int(args.batch))
     set_single_angle_gpu_cleanup_active(len(angles) == 1)
     tilt_views = resolve_tilt_views(args.tilt_view)
     tilt_angles = resolve_tilt_angles(args.tilt_angle)
@@ -11878,7 +12364,7 @@ def main() -> None:
         )
         spec_notes.append(
             'Low-quality NRRDs use the same decomposed component layer stack as the full NRRD, '
-            'streamed directly into the requested low-quality geometry with its own manifest sidecar.'
+            'streamed directly into the requested low-quality geometry with its own manifest sidecar, and scheduled in the background alongside full-size outputs so full and low-quality NRRD payload streams can run concurrently when output workers are available.'
         )
     if (int(T), int(H), int(W)) != (int(input_T), int(input_H), int(input_W)):
         spec_notes.append(
@@ -11905,18 +12391,23 @@ def main() -> None:
             f'Radial enabled with azimuth spacing {float(resolved_azimuth_angle):.8g} degrees; '
             'Lanczos-3 radial sampling, wraparound Radial interpolation, and dense final backprojection are active.'
         )
+    if any((v.family == 'radial' or is_tilted_view(v)) for v in views):
+        spec_notes.append(
+            'Final Radial and Tilted backprojection uses a hybrid queue with at most two active sets: GPU is assigned first when CuPy/CUDA is available, and CPU receives work only while the GPU slot is busy or unavailable. Set YOLO_TTA_BACKPROJECT_GPU=0 to force CPU-only backprojection.'
+        )
     if single_angle_gpu_cleanup_active():
         spec_notes.append(
-            'Single-angle --angle mode active: per-slice min_conf filtering, 2D hole filling, and applicable transverse-plane min_radius filtering attempt GPU execution through CuPy/cupyx before CPU interpolation. '
+            f'Single-angle --angle mode active: min_conf filtering, 2D hole filling, and applicable transverse-plane min_radius filtering attempt batch-sized GPU execution through CuPy/cupyx before CPU interpolation; cleanup slab size follows --batch={int(args.batch)}. '
             'If CuPy/cupyx is unavailable, the script logs a warning and uses the existing CPU cleanup path.'
         )
     spec_notes.append(
         'NRRD export is decomposed by default in v12.2.0: layers are written on a leading list axis as '
         '(layer,X,Y,t), with manifest JSON and SegmentN metadata for view, source, YOLO-vs-bridge, '
         'tile acceptance category, pre-smoothing union, smoothing pass results, and final output. '
-        'The NRRD payload is now pigz-streamed directly from backing layers with a bounded row buffer '
-        'instead of materializing the full 4D decomposed payload; tune YOLO_TTA_NRRD_STREAM_BUFFER_MIB '
-        'and YOLO_TTA_NRRD_PIGZ_LEVEL if needed. '
+        'The NRRD payload is pigz-streamed directly from backing layers without materializing the full 4D decomposed payload; '
+        'v12.2.2 uses a RAM-aware slab buffer that can span full (layer,X,Y) slices and multiple t slices when hundreds of GiB are free. '
+        'Tune YOLO_TTA_NRRD_STREAM_BUFFER_MIB, YOLO_TTA_NRRD_STREAM_BUFFER_FRACTION, YOLO_TTA_NRRD_STREAM_BUFFER_MAX_GIB, '
+        'YOLO_TTA_NRRD_PAYLOAD_FILL_WORKERS, and YOLO_TTA_NRRD_PIGZ_LEVEL if needed. '
         'Segment extents are now recorded when each NRRD layer/cvol store is materialized and reused during final packaging; only missing metadata or disabled YOLO_TTA_NRRD_PRECOMPUTED_SEGMENT_EXTENTS falls back to a layer scan. Raw cvol/ctile backing paths cache chunks.bin in RAM by default via YOLO_TTA_NRRD_CACHE_RAW_BBOX_LAYERS_IN_RAM=1 for the payload stream. '
         f'Legacy single-volume NRRD writing is retained only for deprecated internal callers without layer refs; space={NRRD_SPACE}.'
     )
@@ -11982,6 +12473,7 @@ def main() -> None:
         device=str(args.device),
         half=bool(args.half),
         int8=bool(args.int8),
+        batch=max(1, int(args.batch)),
     )
 
 
@@ -12053,6 +12545,9 @@ def main() -> None:
         'The default YOLO_TTA_CPU_MASK_PENDING_FRAMES is 256; setting it to 0 permits buffering all frames for that prediction source. ' 
         f'For this run, the largest active prediction source has {int(max_predict_video_frames)} frame(s), ' 
         f'example worker_count={int(example_cpu_mask_workers)}, pending_limit={int(example_cpu_mask_pending)}.'
+    )
+    spec_notes.append(
+        f'Batched inference active with --batch={int(args.batch)}. InMemoryYoloVolumeSource yields fixed-size H×W×1 batches and pads the final batch by repeating the last real slice; synthetic padded predictions are consumed and discarded. Single-angle GPU cleanup uses the same batch size for its resident CuPy slabs.'
     )
     spec_notes.append(
         'Tiled masks are staged into one consolidated parent-view canvas per --tile_size/--tile_stride configuration before gating; '
@@ -12639,9 +13134,9 @@ def main() -> None:
 
             view_info = view_infos_by_name[result.view_name]
             if result.final_view_volume_mm is not None:
-                if view_info.family == 'radial' and dense_tiling_active:
+                if view_info.family == 'radial':
                     radial_native_output_by_model[result.model_name][result.view_name] = result.final_view_volume_mm
-                elif is_tilted_view(view_info) and dense_tiling_active:
+                elif is_tilted_view(view_info):
                     tilted_native_output_by_model[result.model_name][result.view_name] = result.final_view_volume_mm
                 else:
                     view_volumes_by_model[result.model_name][result.view_name] = result.final_view_volume_mm
@@ -12917,7 +13412,7 @@ def main() -> None:
     else:
         spec_notes.append('YOLO_TTA_KEEP_TEMP retained scratch artifacts; the v12.2.0 in-memory inference path itself does not create prediction MKVs.')
 
-    final_backprojection_jobs: List[Tuple[str, ViewInfo, np.ndarray]] = []
+    final_backprojection_jobs: List[ViewBackprojectionQueueJob] = []
     for view in views:
         if (view.family != 'radial' and not is_tilted_view(view)):
             continue
@@ -12932,68 +13427,44 @@ def main() -> None:
                 native_source = native_view_support_by_model[model_name].get(view.name)
             if native_source is None:
                 continue
-            final_backprojection_jobs.append((str(model_name), view, native_source))
+            final_backprojection_jobs.append(ViewBackprojectionQueueJob(
+                model_name=str(model_name),
+                view=view,
+                native_source=native_source,
+                out_path=temp_dir / 'view_volumes' / str(model_name) / f'{view.name}.u8.dat',
+                desc=f'Backprojecting final {model_name}/{view.name}',
+                min_radius=float(args.min_radius),
+                workers=1,
+            ))
 
     if final_backprojection_jobs:
-        requested_backproject_view_workers = _env_int(
-            'YOLO_TTA_BACKPROJECT_VIEW_WORKERS',
-            min(len(final_backprojection_jobs), max(1, _cpu_count())),
-        )
-        backproject_view_workers = max(1, min(len(final_backprojection_jobs), int(requested_backproject_view_workers)))
-        per_backproject_workers = max(1, int(slice_postprocess_workers) // max(1, int(backproject_view_workers)))
+        # Task #3 queue: at most two sets are active, one GPU and one CPU.  We still pass
+        # a per-set CPU slice-worker budget to whichever backend executes that set.
+        per_backproject_workers = max(1, int(slice_postprocess_workers) // 2)
+        final_backprojection_jobs = [
+            ViewBackprojectionQueueJob(
+                model_name=job.model_name,
+                view=job.view,
+                native_source=job.native_source,
+                out_path=job.out_path,
+                desc=job.desc,
+                min_radius=job.min_radius,
+                workers=int(per_backproject_workers),
+            )
+            for job in final_backprojection_jobs
+        ]
+        gpu_enabled_for_backproject = bool(_env_flag('YOLO_TTA_BACKPROJECT_GPU', True))
         print(
-            f'Final view backprojection workers: {int(backproject_view_workers)} '
-            f'(per-view backprojection workers: {int(per_backproject_workers)}, '
-            f'tasks: {len(final_backprojection_jobs)})'
+            f'Final radial/tilted backprojection queue: tasks={len(final_backprojection_jobs)}, '
+            f'max_active=2 (one GPU if available, one CPU), per-set CPU workers={int(per_backproject_workers)}, '
+            f'gpu_enabled={gpu_enabled_for_backproject}'
         )
-
-        def _run_final_backprojection(job_idx: int) -> Tuple[str, str, np.ndarray]:
-            model_name_local, view_local, native_source = final_backprojection_jobs[int(job_idx)]
-            out_path = temp_dir / 'view_volumes' / model_name_local / f'{view_local.name}.u8.dat'
-            if view_local.family == 'radial':
-                projected = backproject_radial_volume_to_volume(
-                    radial_mask_mm=native_source,
-                    radial_view=view_local,
-                    out_path=out_path,
-                    desc=f'Backprojecting final {model_name_local}/{view_local.name}',
-                    prefer_memory=True,
-                    workers=int(per_backproject_workers),
-                )
-                if float(args.min_radius) > 0:
-                    print(f"Applying --min_radius in the transverse plane for backprojected view '{view_local.name}'")
-                    apply_transverse_min_radius_filter_inplace(
-                        projected,
-                        float(args.min_radius),
-                        workers=int(per_backproject_workers),
-                    )
-            elif is_tilted_view(view_local):
-                projected = backproject_tilted_volume_to_volume(
-                    tilted_mask_mm=native_source,
-                    tilted_view=view_local,
-                    out_path=out_path,
-                    desc=f'Backprojecting final {model_name_local}/{view_local.name}',
-                    prefer_memory=True,
-                    workers=int(per_backproject_workers),
-                )
-                if float(args.min_radius) > 0.0:
-                    print(f"Applying --min_radius in the transverse plane for backprojected view '{view_local.name}'")
-                    apply_transverse_min_radius_filter_inplace(
-                        projected,
-                        float(args.min_radius),
-                        workers=int(per_backproject_workers),
-                    )
-            else:  # pragma: no cover
-                raise ValueError(f'Unsupported final backprojection view family: {view_local.family}')
-            return model_name_local, view_local.name, projected
-
-        with ThreadPoolExecutor(max_workers=int(backproject_view_workers), thread_name_prefix='final-backproject') as executor:
-            future_to_job = {
-                executor.submit(_run_final_backprojection, int(idx)): int(idx)
-                for idx in range(len(final_backprojection_jobs))
-            }
-            for future in as_completed(future_to_job):
-                model_name_done, view_name_done, projected_volume = future.result()
-                view_volumes_by_model[model_name_done][view_name_done] = projected_volume
+        backproject_queue = HybridBackprojectionQueue(
+            cpu_workers=int(per_backproject_workers),
+            gpu_enabled=bool(gpu_enabled_for_backproject),
+        )
+        for model_name_done, view_name_done, projected_volume in backproject_queue.run(final_backprojection_jobs):
+            view_volumes_by_model[model_name_done][view_name_done] = projected_volume
 
     output_manager.reap_completed()
 
@@ -13188,6 +13659,36 @@ def main() -> None:
         resources=[],
     ))
 
+    if bool(low_quality_requested):
+        print('\n=== Scheduling low-quality isotropic outputs in background ===')
+        low_quality_paths = planned_low_quality_output_paths(
+            out_dir=out_dir,
+            stem=input_path.stem,
+            downbin_specs=low_quality_downbin_specs,
+            nrrd_layer_refs=nrrd_layer_refs,
+        )
+        low_quality_future = output_manager.executor.submit(
+            save_low_quality_outputs,
+            volume_gray=final_output_volume_for_low_quality,
+            mask_u8=final_output_mask_mm,
+            skeleton_u8=skeleton_output_mm if bool(args.save_skeleton) else None,
+            out_dir=out_dir,
+            stem=input_path.stem,
+            fps=fps,
+            downbin_specs=low_quality_downbin_specs,
+            temp_dir=temp_dir,
+            nrrd_layer_refs=nrrd_layer_refs,
+            workers=output_workers,
+            show_progress=False,
+        )
+        final_paths.update(low_quality_paths)
+        output_manager.submit(BackgroundOutputSubmission(
+            label='low-quality outputs',
+            result_paths=low_quality_paths,
+            futures=[low_quality_future],
+            resources=[],
+        ))
+
     voxel_volume = None
     if bool(args.voxel_volume):
         voxel_counts = np.zeros((int(final_output_mask_mm.shape[0]),), dtype=np.int64)
@@ -13217,23 +13718,6 @@ def main() -> None:
                 show_progress=False,
             )
             final_paths[f'{view.name}_images_dir'] = image_dir
-
-    if bool(low_quality_requested):
-        print('\n=== Saving low-quality isotropic outputs ===')
-        low_quality_paths = save_low_quality_outputs(
-            volume_gray=final_output_volume_for_low_quality,
-            mask_u8=final_output_mask_mm,
-            skeleton_u8=skeleton_output_mm if bool(args.save_skeleton) else None,
-            out_dir=out_dir,
-            stem=input_path.stem,
-            fps=fps,
-            downbin_specs=low_quality_downbin_specs,
-            temp_dir=temp_dir,
-            nrrd_layer_refs=nrrd_layer_refs,
-            workers=output_workers,
-            show_progress=False,
-        )
-        final_paths.update(low_quality_paths)
 
     if bool(nrrd_layers_needed):
         spec_notes.append(
