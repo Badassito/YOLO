@@ -3,8 +3,9 @@
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
 This v12.2.2_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.1/v12.2.2 performance patches:
+  - this revision removes the dedicated single --angle GPU cleanup fast path: min_conf filtering, 2D hole filling, and min_radius filtering always run through the shared CPU cleanup path regardless of how many --angle values are provided
   - v12.2.1 restores the low-quality downbin/output helper path and NrrdLayerRef metadata class that were erroneously pruned in v12.2.0
-  - v12.2.2 adds batched in-memory inference with synthetic final-batch padding for fixed-batch backends, batch-sized single-angle GPU cleanup, larger RAM-aware NRRD streaming slabs, parallel low-quality NRRD scheduling, and a hybrid CPU/GPU radial/tilted backprojection queue
+  - v12.2.2 adds batched in-memory inference with synthetic final-batch padding for fixed-batch backends, larger RAM-aware NRRD streaming slabs, parallel low-quality NRRD scheduling, and a hybrid CPU/GPU radial/tilted backprojection queue
   - builds Transverse, optional generalized Tilted Views for Transverse/Sagittal/Coronal, independently optional upright Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - materializes YOLO-ready full-frame and tiled prediction volumes as in-memory slice arrays instead of writing prediction videos to the temp folder
   - feeds those volumes to Ultralytics through a custom in-memory loader with stream=True, while using Ultralytics native retina mask reconstruction
@@ -36,7 +37,7 @@ This v12.2.2_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.
 
 Dependencies (Python):
   pip install opencv-python numpy scipy scikit-image tifffile tqdm ultralytics
-  # Optional GPU acceleration: cupy-cuda12x for cupyx.scipy.ndimage cleanup/smoothing paths.
+  # Optional GPU acceleration: cupy-cuda12x for cupyx.scipy.ndimage smoothing and CuPy backprojection paths.
   # --save_nrrd uses the built-in streaming NRRD writer; pynrrd is no longer required for default exports.
 
 System:
@@ -4100,8 +4101,6 @@ def _filter_connected_components_by_min_conf_scipy(
 
 
 
-_SINGLE_ANGLE_GPU_CLEANUP_ACTIVE = False
-_GPU_CLEANUP_BACKEND_WARNING_EMITTED = False
 _INFERENCE_BATCH_SIZE = 1
 
 
@@ -4114,15 +4113,6 @@ def inference_batch_size() -> int:
     return max(1, int(_INFERENCE_BATCH_SIZE))
 
 
-def set_single_angle_gpu_cleanup_active(active: bool) -> None:
-    global _SINGLE_ANGLE_GPU_CLEANUP_ACTIVE
-    _SINGLE_ANGLE_GPU_CLEANUP_ACTIVE = bool(active)
-
-
-def single_angle_gpu_cleanup_active() -> bool:
-    return bool(_SINGLE_ANGLE_GPU_CLEANUP_ACTIVE and _env_flag('YOLO_TTA_SINGLE_ANGLE_GPU_CLEANUP', True))
-
-
 def _cupy_scalar_to_int(value: object) -> int:
     try:
         item = getattr(value, 'item', None)
@@ -4132,231 +4122,6 @@ def _cupy_scalar_to_int(value: object) -> int:
         pass
     return int(value)  # type: ignore[arg-type]
 
-
-def _try_get_gpu_cleanup_backend(*, min_radius: float) -> Optional[Tuple[object, object]]:
-    """Return (cupy, cupyx.scipy.ndimage) for single-angle GPU cleanup, if usable."""
-    try:
-        import cupy as cp  # type: ignore
-        from cupyx.scipy import ndimage as cpx_ndi  # type: ignore
-    except Exception:
-        return None
-    if not hasattr(cpx_ndi, 'label') or not hasattr(cpx_ndi, 'maximum'):
-        return None
-    if float(min_radius) > 0.0 and not hasattr(cpx_ndi, 'distance_transform_edt'):
-        return None
-    return cp, cpx_ndi
-
-
-def _gpu_filter_components_by_min_conf_cp(mask_cp: object, conf_cp: object, min_conf_u8: int, cp: object, cpx_ndi: object) -> object:
-    if int(min_conf_u8) <= 0:
-        return mask_cp
-    structure8 = cp.ones((3, 3), dtype=cp.bool_)
-    labels, num = cpx_ndi.label(mask_cp, structure=structure8)
-    num_i = _cupy_scalar_to_int(num)
-    if num_i <= 0:
-        return cp.zeros_like(mask_cp, dtype=cp.bool_)
-    ids = cp.arange(1, num_i + 1, dtype=labels.dtype)
-    maxima = cpx_ndi.maximum(conf_cp, labels=labels, index=ids)
-    keep_ids = ids[cp.asarray(maxima) >= int(min_conf_u8)]
-    if int(keep_ids.size) <= 0:
-        return cp.zeros_like(mask_cp, dtype=cp.bool_)
-    return cp.isin(labels, keep_ids)
-
-
-def _gpu_fill_holes_2d_cp(mask_cp: object, cp: object, cpx_ndi: object) -> object:
-    # Prefer the scipy-compatible GPU implementation when available; otherwise use
-    # a label-boundary test equivalent to the CPU OpenCV path.
-    fill_fn = getattr(cpx_ndi, 'binary_fill_holes', None)
-    if callable(fill_fn):
-        return fill_fn(mask_cp)
-    structure4 = cp.asarray([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=cp.bool_)
-    bg = cp.logical_not(mask_cp)
-    labels, num = cpx_ndi.label(bg, structure=structure4)
-    if _cupy_scalar_to_int(num) <= 0:
-        return mask_cp
-    boundary = cp.concatenate([labels[0, :].ravel(), labels[-1, :].ravel(), labels[:, 0].ravel(), labels[:, -1].ravel()])
-    boundary_ids = cp.unique(boundary)
-    enclosed = cp.logical_and(labels > 0, cp.logical_not(cp.isin(labels, boundary_ids)))
-    return cp.logical_or(mask_cp, enclosed)
-
-
-def _gpu_filter_components_by_min_radius_cp(mask_cp: object, min_radius: float, cp: object, cpx_ndi: object) -> object:
-    if float(min_radius) <= 0.0:
-        return mask_cp
-    structure8 = cp.ones((3, 3), dtype=cp.bool_)
-    labels, num = cpx_ndi.label(mask_cp, structure=structure8)
-    num_i = _cupy_scalar_to_int(num)
-    if num_i <= 0:
-        return cp.zeros_like(mask_cp, dtype=cp.bool_)
-    dist = cpx_ndi.distance_transform_edt(mask_cp)
-    ids = cp.arange(1, num_i + 1, dtype=labels.dtype)
-    radii = cpx_ndi.maximum(dist, labels=labels, index=ids)
-    keep_ids = ids[cp.asarray(radii) >= float(min_radius)]
-    if int(keep_ids.size) <= 0:
-        return cp.zeros_like(mask_cp, dtype=cp.bool_)
-    return cp.isin(labels, keep_ids)
-
-
-def _cpu_cleanup_slice_fallback(
-    mask_slice: np.ndarray,
-    conf_slice: Optional[np.ndarray],
-    *,
-    min_conf: float,
-    min_radius: float,
-    min_conf_u8: int,
-    structure2: np.ndarray,
-    backend: str,
-) -> np.ndarray:
-    out = np.asarray(mask_slice, dtype=bool)
-    if np.any(out) and conf_slice is not None and float(min_conf) > 0.0:
-        if backend == 'opencv':
-            out = _filter_connected_components_by_min_conf_opencv(out, conf_slice, int(min_conf_u8))
-        else:
-            out = _filter_connected_components_by_min_conf_scipy(out, conf_slice, int(min_conf_u8), structure2)
-    if np.any(out):
-        out = _fill_holes_2d_opencv(out) if backend == 'opencv' else _fill_holes_2d_scipy(out)
-    if np.any(out) and float(min_radius) > 0.0:
-        if backend == 'opencv':
-            out = _filter_connected_components_by_min_radius_opencv(out, float(min_radius))
-        else:
-            out = _filter_connected_components_by_min_radius_scipy(out, structure2, float(min_radius))
-    return np.asarray(out, dtype=bool)
-
-
-def _gpu_cleanup_one_slice_cp(
-    mask_cp: object,
-    conf_cp: Optional[object],
-    *,
-    min_conf: float,
-    min_radius: float,
-    min_conf_u8: int,
-    cp: object,
-    cpx_ndi: object,
-) -> object:
-    """Clean one already-resident GPU slice and return a GPU boolean slice."""
-    cleaned_cp = mask_cp
-    if conf_cp is not None and float(min_conf) > 0.0:
-        cleaned_cp = _gpu_filter_components_by_min_conf_cp(cleaned_cp, conf_cp, int(min_conf_u8), cp, cpx_ndi)
-    if bool(_cupy_scalar_to_int(cp.any(cleaned_cp))):
-        cleaned_cp = _gpu_fill_holes_2d_cp(cleaned_cp, cp, cpx_ndi)
-    if bool(_cupy_scalar_to_int(cp.any(cleaned_cp))) and float(min_radius) > 0.0:
-        cleaned_cp = _gpu_filter_components_by_min_radius_cp(cleaned_cp, float(min_radius), cp, cpx_ndi)
-    return cleaned_cp
-
-
-def fused_slice_cleanup_gpu_inplace(
-    mask_mm: np.ndarray,
-    confmap_mm: Optional[np.ndarray] = None,
-    *,
-    min_conf: float = 0.0,
-    min_radius: float = 0.0,
-    workers: int = 1,
-    desc: str = 'Single-angle GPU slice cleanup',
-) -> bool:
-    """Run batch-sized cleanup on GPU for the single-angle TTA path.
-
-    The volume remains CPU-backed for interpolation, but cleanup now uploads and
-    downloads one ``--batch``-sized slab at a time instead of shuttling every slice
-    independently.  The final cleanup slab is padded by repeating the last real
-    slice and synthetic outputs are discarded, matching the fixed-batch inference
-    path.  Within each resident GPU slab, min_conf connected-component filtering,
-    2D hole filling, and applicable min_radius filtering run on CuPy/cupyx before
-    the cleaned slab is copied back for CPU-side interpolation.
-    """
-    backend_mods = _try_get_gpu_cleanup_backend(min_radius=float(min_radius))
-    if backend_mods is None:
-        global _GPU_CLEANUP_BACKEND_WARNING_EMITTED
-        if not _GPU_CLEANUP_BACKEND_WARNING_EMITTED:
-            print('Warning: single-angle GPU cleanup requested but CuPy/cupyx cleanup backend is unavailable; falling back to CPU cleanup.')
-            _GPU_CLEANUP_BACKEND_WARNING_EMITTED = True
-        return False
-    cp, cpx_ndi = backend_mods
-
-    num_slices = int(mask_mm.shape[0])
-    if num_slices <= 0:
-        return True
-
-    structure2 = np.ones((3, 3), dtype=bool)
-    min_conf_u8 = int(min_conf_to_u8_threshold(float(min_conf))) if float(min_conf) > 0.0 else 0
-    cpu_backend = cleanup_backend()
-    batch_size = max(1, int(inference_batch_size()))
-    print(f'{desc}: GPU cleanup slab size={batch_size} (matches --batch)')
-
-    for start in tqdm(range(0, num_slices, batch_size), desc=desc):
-        stop = min(num_slices, int(start) + int(batch_size))
-        actual = int(stop - start)
-        mask_batch_np = np.asarray(mask_mm[int(start):int(stop)], dtype=bool)
-        conf_batch_np = None if confmap_mm is None else np.asarray(confmap_mm[int(start):int(stop)], dtype=np.uint8)
-        if actual <= 0:
-            continue
-
-        padded = actual < batch_size
-        if padded:
-            pad_count = int(batch_size - actual)
-            mask_pad = np.repeat(mask_batch_np[-1:, :, :], pad_count, axis=0)
-            mask_batch_for_gpu = np.concatenate([mask_batch_np, mask_pad], axis=0)
-            if conf_batch_np is not None:
-                conf_pad = np.repeat(conf_batch_np[-1:, :, :], pad_count, axis=0)
-                conf_batch_for_gpu = np.concatenate([conf_batch_np, conf_pad], axis=0)
-            else:
-                conf_batch_for_gpu = None
-        else:
-            mask_batch_for_gpu = mask_batch_np
-            conf_batch_for_gpu = conf_batch_np
-
-        try:
-            mask_batch_cp = cp.asarray(mask_batch_for_gpu, dtype=cp.bool_)
-            conf_batch_cp = None if conf_batch_for_gpu is None else cp.asarray(conf_batch_for_gpu, dtype=cp.uint8)
-            cleaned_batch_cp = cp.zeros_like(mask_batch_cp, dtype=cp.bool_)
-            for local_idx in range(int(batch_size)):
-                mask_slice_cp = mask_batch_cp[int(local_idx)]
-                if not bool(_cupy_scalar_to_int(cp.any(mask_slice_cp))):
-                    continue
-                conf_slice_cp = None if conf_batch_cp is None else conf_batch_cp[int(local_idx)]
-                cleaned_batch_cp[int(local_idx)] = _gpu_cleanup_one_slice_cp(
-                    mask_slice_cp,
-                    conf_slice_cp,
-                    min_conf=float(min_conf),
-                    min_radius=float(min_radius),
-                    min_conf_u8=int(min_conf_u8),
-                    cp=cp,
-                    cpx_ndi=cpx_ndi,
-                )
-            cleaned_batch = cp.asnumpy(cleaned_batch_cp[:actual]).astype(bool, copy=False)
-        except Exception:
-            cleaned_slices: List[np.ndarray] = []
-            for local_idx in range(actual):
-                cleaned_slices.append(_cpu_cleanup_slice_fallback(
-                    mask_batch_np[int(local_idx)],
-                    None if conf_batch_np is None else conf_batch_np[int(local_idx)],
-                    min_conf=float(min_conf),
-                    min_radius=float(min_radius),
-                    min_conf_u8=int(min_conf_u8),
-                    structure2=structure2,
-                    backend=cpu_backend,
-                ))
-            cleaned_batch = np.asarray(cleaned_slices, dtype=bool)
-
-        mask_mm[int(start):int(stop), :, :] = cleaned_batch.astype(np.uint8, copy=False)
-        if confmap_mm is not None and conf_batch_np is not None:
-            conf_out = np.asarray(conf_batch_np, dtype=np.uint8).copy()
-            if np.any(cleaned_batch):
-                conf_out[~cleaned_batch] = np.uint8(0)
-            else:
-                conf_out.fill(np.uint8(0))
-            confmap_mm[int(start):int(stop), :, :] = conf_out
-
-        try:
-            free_all = getattr(cp.get_default_memory_pool(), 'free_all_blocks', None)
-            if callable(free_all):
-                free_all()
-        except Exception:
-            pass
-
-    flush_array(mask_mm)
-    if confmap_mm is not None:
-        flush_array(confmap_mm)
-    return True
 
 def fused_slice_cleanup_inplace(
     mask_mm: np.ndarray,
@@ -4377,18 +4142,6 @@ def fused_slice_cleanup_inplace(
       - computes connected-component radii with one EDT + one reduce per slice instead of one EDT
         per component
     """
-    if single_angle_gpu_cleanup_active():
-        gpu_done = fused_slice_cleanup_gpu_inplace(
-            mask_mm,
-            confmap_mm,
-            min_conf=float(min_conf),
-            min_radius=float(min_radius),
-            workers=int(workers),
-            desc=f'{desc} [GPU single-angle]',
-        )
-        if bool(gpu_done):
-            return
-
     num_slices = int(mask_mm.shape[0])
     structure2 = np.ones((3, 3), dtype=bool)
     min_conf_u8 = int(min_conf_to_u8_threshold(float(min_conf))) if float(min_conf) > 0.0 else 0
@@ -5038,49 +4791,6 @@ def build_slice_endpoint_seeds_from_label_volume(
 
 
 
-def try_apply_transverse_min_radius_filter_gpu_inplace(
-    mask_mm: np.ndarray,
-    min_radius: float,
-    *,
-    workers: int = 1,
-) -> bool:
-    """GPU-only transverse min-radius filter used by the single-angle fast path."""
-    if not single_angle_gpu_cleanup_active() or float(min_radius) <= 0.0:
-        return False
-    backend_mods = _try_get_gpu_cleanup_backend(min_radius=float(min_radius))
-    if backend_mods is None:
-        return False
-    cp, cpx_ndi = backend_mods
-    num_slices = int(mask_mm.shape[0])
-    gpu_worker_cap = max(1, _env_int('YOLO_TTA_GPU_CLEANUP_WORKERS', 1))
-    worker_count = choose_slice_parallel_workers(min(int(workers), int(gpu_worker_cap)), num_slices)
-    chunk_size = choose_parallel_chunk_size(num_slices, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
-
-    def _process(t: int) -> None:
-        sl_np = np.asarray(mask_mm[int(t)]) > 0
-        if not np.any(sl_np):
-            return
-        try:
-            sl_cp = cp.asarray(sl_np, dtype=cp.bool_)
-            keep_cp = _gpu_filter_components_by_min_radius_cp(sl_cp, float(min_radius), cp, cpx_ndi)
-            mask_mm[int(t), :, :] = cp.asnumpy(keep_cp).astype(np.uint8, copy=False)
-        finally:
-            try:
-                cp.get_default_memory_pool().free_all_blocks()
-            except Exception:
-                pass
-
-    print(f'Transverse min-radius filter using GPU single-angle path (min_radius={float(min_radius):g})')
-    parallel_for_indices_chunked(
-        num_slices,
-        _process,
-        max_workers=worker_count,
-        desc='Transverse min-radius filter [GPU single-angle]',
-        chunk_size=chunk_size,
-    )
-    flush_array(mask_mm)
-    return True
-
 def apply_transverse_min_radius_filter_inplace(
     mask_mm: np.ndarray,
     min_radius: float,
@@ -5089,8 +4799,6 @@ def apply_transverse_min_radius_filter_inplace(
 ) -> None:
     """In-place transverse-plane radius filter to avoid a full extra volume copy."""
     if float(min_radius) <= 0:
-        return
-    if try_apply_transverse_min_radius_filter_gpu_inplace(mask_mm, float(min_radius), workers=int(workers)):
         return
 
     struct2 = np.ones((3, 3), dtype=bool)
@@ -10071,9 +9779,9 @@ def nrrd_stream_buffer_bytes(required_bytes: Optional[int] = None) -> int:
         target = int(mib) * 1024 * 1024
     else:
         min_mib = max(1, _env_int('YOLO_TTA_NRRD_STREAM_BUFFER_MIN_MIB', 4096))
-        reserve_gib = max(1.0, _env_float('YOLO_TTA_NRRD_STREAM_BUFFER_RESERVE_GIB', 96.0))
+        reserve_gib = max(1.0, _env_float('YOLO_TTA_NRRD_STREAM_BUFFER_RESERVE_GIB', 192.0))
         max_gib = max(1.0, _env_float('YOLO_TTA_NRRD_STREAM_BUFFER_MAX_GIB', 384.0))
-        fraction = min(0.90, max(0.01, _env_float('YOLO_TTA_NRRD_STREAM_BUFFER_FRACTION', 0.35)))
+        fraction = min(0.90, max(0.01, _env_float('YOLO_TTA_NRRD_STREAM_BUFFER_FRACTION', 0.25)))
         avail = int(available_anon_work_bytes())
         usable = max(0, int(avail) - int(reserve_gib * GIB))
         target = int(max(int(min_mib) * 1024 * 1024, min(float(max_gib) * float(GIB), float(usable) * float(fraction))))
@@ -12194,7 +11902,6 @@ def main() -> None:
     if int(args.batch) < 1:
         raise ValueError('--batch must be >= 1')
     set_inference_batch_size(int(args.batch))
-    set_single_angle_gpu_cleanup_active(len(angles) == 1)
     tilt_views = resolve_tilt_views(args.tilt_view)
     tilt_angles = resolve_tilt_angles(args.tilt_angle)
     tilt_directions = resolve_tilt_directions(args.tilt_direction)
@@ -12395,11 +12102,6 @@ def main() -> None:
         spec_notes.append(
             'Final Radial and Tilted backprojection uses a hybrid queue with at most two active sets: GPU is assigned first when CuPy/CUDA is available, and CPU receives work only while the GPU slot is busy or unavailable. Set YOLO_TTA_BACKPROJECT_GPU=0 to force CPU-only backprojection.'
         )
-    if single_angle_gpu_cleanup_active():
-        spec_notes.append(
-            f'Single-angle --angle mode active: min_conf filtering, 2D hole filling, and applicable transverse-plane min_radius filtering attempt batch-sized GPU execution through CuPy/cupyx before CPU interpolation; cleanup slab size follows --batch={int(args.batch)}. '
-            'If CuPy/cupyx is unavailable, the script logs a warning and uses the existing CPU cleanup path.'
-        )
     spec_notes.append(
         'NRRD export is decomposed by default in v12.2.0: layers are written on a leading list axis as '
         '(layer,X,Y,t), with manifest JSON and SegmentN metadata for view, source, YOLO-vs-bridge, '
@@ -12547,7 +12249,7 @@ def main() -> None:
         f'example worker_count={int(example_cpu_mask_workers)}, pending_limit={int(example_cpu_mask_pending)}.'
     )
     spec_notes.append(
-        f'Batched inference active with --batch={int(args.batch)}. InMemoryYoloVolumeSource yields fixed-size H×W×1 batches and pads the final batch by repeating the last real slice; synthetic padded predictions are consumed and discarded. Single-angle GPU cleanup uses the same batch size for its resident CuPy slabs.'
+        f'Batched inference active with --batch={int(args.batch)}. InMemoryYoloVolumeSource yields fixed-size H×W×1 batches and pads the final batch by repeating the last real slice; synthetic padded predictions are consumed and discarded.'
     )
     spec_notes.append(
         'Tiled masks are staged into one consolidated parent-view canvas per --tile_size/--tile_stride configuration before gating; '
