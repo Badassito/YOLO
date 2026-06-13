@@ -2,11 +2,12 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v12.2.4_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.1-v12.2.4 performance patches:
+This v12.2.5_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.1-v12.2.5 performance patches:
   - this revision removes the dedicated single --angle GPU cleanup fast path: min_conf filtering, 2D hole filling, and min_radius filtering always run through the shared CPU cleanup path regardless of how many --angle values are provided
   - v12.2.1 restores the low-quality downbin/output helper path and NrrdLayerRef metadata class that were erroneously pruned in v12.2.0
   - v12.2.2 adds batched in-memory inference with synthetic final-batch padding for fixed-batch backends, larger RAM-aware NRRD streaming slabs, parallel low-quality NRRD scheduling, and a hybrid CPU/GPU radial/tilted backprojection queue
   - v12.2.4 aligns the script header with the filename, moves Radial before Tilted in scheduling order, plans interpolation from cached per-slice component tables and local SDF crops, consumes variable-cost seed plans through an unordered bounded completion queue, keeps transient NRRD projection/delta workspaces in RAM when possible, and raises the CPU mask postprocess pending cap to 4096
+  - v12.2.5 improves CPU occupancy during interpolation labeling by compact-relabeling row blocks with per-slice local-to-compact lookup tables, prebuilding per-slice component tables through an unordered bounded queue, and testing endpoint continuation from component-table crops instead of full adjacent slices
   - builds Transverse, optional generalized Tilted Views for Transverse/Sagittal/Coronal, independently optional upright Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - materializes YOLO-ready full-frame and tiled prediction volumes as in-memory slice arrays instead of writing prediction videos to the temp folder
   - feeds those volumes to Ultralytics through a custom in-memory loader with stream=True, while using Ultralytics native retina mask reconstruction
@@ -4719,29 +4720,48 @@ def label_foreground_volume_streaming(
     unique_roots = unique_roots[unique_roots > 0]
     compact_root_ids = np.zeros(root_map.shape, dtype=np.uint32)
     compact_root_ids[unique_roots] = np.arange(1, unique_roots.size + 1, dtype=np.uint32)
+    gid_to_compact = compact_root_ids[root_map]
 
-    def _compact_slice(z: int) -> None:
-        local_slice = np.asarray(labels_store[int(z)])
-        if np.any(local_slice):
+    local_to_compact_by_slice: List[np.ndarray] = []
+    compact_tasks: List[Tuple[int, int, int]] = []
+    row_block = max(1, _env_int('YOLO_TTA_INTERPOLATION_COMPACT_RELABEL_ROWS', 256))
+    for z in range(int(z_dim)):
+        count = int(component_counts[int(z)])
+        local_to_compact = np.zeros((count + 1,), dtype=np.uint32)
+        if count > 0:
             offset = int(slice_offsets[int(z)])
-            if offset != 0:
-                gid_slice = local_slice.astype(np.uint32, copy=True)
-                nz = gid_slice > 0
-                gid_slice[nz] = gid_slice[nz] + np.uint32(offset)
-            else:
-                gid_slice = local_slice
-            labels_store[int(z), :, :] = compact_root_ids[root_map[gid_slice]]
-        else:
-            labels_store[int(z), :, :] = np.uint32(0)
+            local_to_compact[1:] = gid_to_compact[int(offset) + 1:int(offset) + int(count) + 1]
+            for y0 in range(0, int(h), int(row_block)):
+                compact_tasks.append((int(z), int(y0), int(min(int(h), int(y0) + int(row_block)))))
+        local_to_compact_by_slice.append(local_to_compact)
 
-    parallel_for_indices_chunked(
-        int(z_dim),
-        _compact_slice,
-        max_workers=compact_workers,
-        desc='Interpolation: compact relabel',
-        show_progress=True,
-        target_chunks_per_worker=2,
-    )
+    def _compact_block(task_idx: int) -> int:
+        z, y0, y1 = compact_tasks[int(task_idx)]
+        local_to_compact = local_to_compact_by_slice[int(z)]
+        block = np.asarray(labels_store[int(z), int(y0):int(y1), :])
+        if np.any(block):
+            labels_store[int(z), int(y0):int(y1), :] = local_to_compact[block]
+        else:
+            labels_store[int(z), int(y0):int(y1), :].fill(np.uint32(0))
+        return int(y1) - int(y0)
+
+    if compact_tasks:
+        pending = max(compact_workers, compact_workers * 8)
+        if compact_workers <= 1:
+            for task_idx in tqdm(range(len(compact_tasks)), desc='Interpolation: compact relabel'):
+                _compact_block(int(task_idx))
+        else:
+            for _rows_done in tqdm(
+                parallel_map_unordered(
+                    _compact_block,
+                    range(len(compact_tasks)),
+                    max_workers=compact_workers,
+                    max_pending=pending,
+                ),
+                total=len(compact_tasks),
+                desc='Interpolation: compact relabel',
+            ):
+                pass
 
     flush_array(labels_store)
     return labels_store, int(unique_roots.size), label_paths
@@ -4773,38 +4793,39 @@ def build_slice_endpoint_seeds_from_label_volume(
     def _scan_slice_from_cache(z: int) -> List[SliceEndpointSeed]:
         if component_cache is None:
             return []
-        table = component_cache.get(int(z))
+        z_i = int(z)
+        table = component_cache.get(z_i)
         if not table.components:
             return []
 
+        prev_table: Optional[SliceComponentTable] = None
+        next_table: Optional[SliceComponentTable] = None
         if bool(wrap_axis) and z_dim > 1:
-            prev_slice = np.asarray(labels_real[(int(z) - 1) % z_dim])
-            next_slice = np.asarray(labels_real[(int(z) + 1) % z_dim])
+            prev_table = component_cache.get((z_i - 1) % z_dim)
+            next_table = component_cache.get((z_i + 1) % z_dim)
         else:
-            prev_slice = np.asarray(labels_real[int(z) - 1]) if int(z) > 0 else None
-            next_slice = np.asarray(labels_real[int(z) + 1]) if (int(z) + 1) < z_dim else None
+            if z_i > 0:
+                prev_table = component_cache.get(z_i - 1)
+            if (z_i + 1) < z_dim:
+                next_table = component_cache.get(z_i + 1)
 
         seeds_local: List[SliceEndpointSeed] = []
         for record in table.components:
-            y0, x0, y1, x1 = record.bbox
-            comp_crop = np.asarray(record.mask_crop, dtype=bool)
-            has_prev = False
-            has_next = False
-            if prev_slice is not None:
-                has_prev = bool(np.any(comp_crop & (prev_slice[int(y0):int(y1), int(x0):int(x1)] == int(record.label))))
-            if next_slice is not None:
-                has_next = bool(np.any(comp_crop & (next_slice[int(y0):int(y1), int(x0):int(x1)] == int(record.label))))
+            prev_records = prev_table.by_label.get(int(record.label), []) if prev_table is not None else []
+            next_records = next_table.by_label.get(int(record.label), []) if next_table is not None else []
+            has_prev = any(_component_records_directly_overlap(record, other) for other in prev_records)
+            has_next = any(_component_records_directly_overlap(record, other) for other in next_records)
 
             if not has_prev:
                 seeds_local.append(SliceEndpointSeed(
                     label=int(record.label),
-                    point=(int(z), int(record.anchor[0]), int(record.anchor[1])),
+                    point=(z_i, int(record.anchor[0]), int(record.anchor[1])),
                     direction_sign=-1,
                 ))
             if not has_next:
                 seeds_local.append(SliceEndpointSeed(
                     label=int(record.label),
-                    point=(int(z), int(record.anchor[0]), int(record.anchor[1])),
+                    point=(z_i, int(record.anchor[0]), int(record.anchor[1])),
                     direction_sign=1,
                 ))
         return seeds_local
@@ -4868,13 +4889,19 @@ def build_slice_endpoint_seeds_from_label_volume(
         return seeds_local
 
     worker_count = choose_slice_parallel_workers(int(workers), z_dim)
+    if component_cache is not None:
+        component_cache.prebuild(
+            workers=worker_count,
+            desc=f'{desc}: component tables',
+        )
+
     seeds: List[SliceEndpointSeed] = []
 
     if worker_count <= 1:
         for z in tqdm(range(z_dim), desc=desc):
             seeds.extend(_scan_slice(int(z)))
     else:
-        pending = max(worker_count, worker_count * 2)
+        pending = max(worker_count, worker_count * 8)
         for seeds_local in tqdm(
             parallel_map_unordered(_scan_slice, range(z_dim), max_workers=worker_count, max_pending=pending),
             total=z_dim,
@@ -6505,6 +6532,28 @@ class SliceComponentTableCache:
                 self._tables[z_i] = cached
             return cached
 
+    def prebuild(self, *, workers: int = 1, desc: str = 'Interpolation: per-slice component tables') -> None:
+        total = int(self.z_dim)
+        if total <= 0:
+            return
+        worker_count = choose_slice_parallel_workers(int(workers), total)
+
+        def _build(z: int) -> int:
+            return int(len(self.get(int(z)).components))
+
+        if worker_count <= 1:
+            for z in tqdm(range(total), desc=desc):
+                _build(int(z))
+            return
+
+        pending = max(worker_count, worker_count * 8)
+        for _component_count in tqdm(
+            parallel_map_unordered(_build, range(total), max_workers=worker_count, max_pending=pending),
+            total=total,
+            desc=desc,
+        ):
+            pass
+
     def find_record_for_point(
         self,
         z: int,
@@ -6588,21 +6637,65 @@ def _component_record_dilated_overlap_count(prev_record: SliceComponentRecord, c
     return int(np.count_nonzero(prev_block & cand_block))
 
 
+def _component_records_directly_overlap(a: SliceComponentRecord, b: SliceComponentRecord) -> bool:
+    ay0, ax0, ay1, ax1 = a.bbox
+    by0, bx0, by1, bx1 = b.bbox
+    iy0 = max(int(ay0), int(by0))
+    ix0 = max(int(ax0), int(bx0))
+    iy1 = min(int(ay1), int(by1))
+    ix1 = min(int(ax1), int(bx1))
+    if iy0 >= iy1 or ix0 >= ix1:
+        return False
+    a_block = a.mask_crop[iy0 - int(ay0):iy1 - int(ay0), ix0 - int(ax0):ix1 - int(ax0)]
+    b_block = b.mask_crop[iy0 - int(by0):iy1 - int(by0), ix0 - int(bx0):ix1 - int(bx0)]
+    return bool(np.any(a_block & b_block))
+
+
 def _build_slice_component_table(labels2d: np.ndarray, z: int) -> SliceComponentTable:
     labels_arr = np.asarray(labels2d)
     h, w = (int(labels_arr.shape[0]), int(labels_arr.shape[1]))
-    present = np.unique(labels_arr)
-    present = present[present > 0]
     components: List[SliceComponentRecord] = []
     by_label: Dict[int, List[SliceComponentRecord]] = {}
-    if present.size <= 0:
+
+    ys_all, xs_all = np.nonzero(labels_arr)
+    if ys_all.size <= 0:
         return SliceComponentTable(z=int(z), shape=(h, w), components=components, by_label=by_label)
 
-    for label_val in present.tolist():
-        label_i = int(label_val)
-        mask_u8 = np.ascontiguousarray(labels_arr == label_i, dtype=np.uint8)
-        if not np.any(mask_u8):
+    # Build each label's 2D components from sparse foreground coordinates instead of scanning the
+    # full 9 MP slice once per object label.  This keeps endpoint-table construction local to the
+    # actual foreground footprint while preserving the rule that different 3D labels remain separate
+    # even when they touch in this slice.
+    labels_fg = labels_arr[ys_all, xs_all].astype(np.int64, copy=False)
+    order = np.argsort(labels_fg, kind='mergesort')
+    labels_sorted = labels_fg[order]
+    ys_sorted = ys_all[order]
+    xs_sorted = xs_all[order]
+    boundaries = np.flatnonzero(labels_sorted[1:] != labels_sorted[:-1]) + 1
+    starts = np.concatenate(([0], boundaries)).astype(np.int64, copy=False)
+    stops = np.concatenate((boundaries, [labels_sorted.size])).astype(np.int64, copy=False)
+
+    for start_i, stop_i in zip(starts.tolist(), stops.tolist()):
+        if int(stop_i) <= int(start_i):
             continue
+        label_i = int(labels_sorted[int(start_i)])
+        if label_i <= 0:
+            continue
+        ys_g = ys_sorted[int(start_i):int(stop_i)].astype(np.int64, copy=False)
+        xs_g = xs_sorted[int(start_i):int(stop_i)].astype(np.int64, copy=False)
+        if ys_g.size <= 0:
+            continue
+
+        y0 = int(np.min(ys_g))
+        y1 = int(np.max(ys_g)) + 1
+        x0 = int(np.min(xs_g))
+        x1 = int(np.max(xs_g)) + 1
+        crop_h = int(y1 - y0)
+        crop_w = int(x1 - x0)
+        if crop_h <= 0 or crop_w <= 0:
+            continue
+
+        mask_u8 = np.zeros((crop_h, crop_w), dtype=np.uint8)
+        mask_u8[ys_g - int(y0), xs_g - int(x0)] = np.uint8(1)
         num_cc, cc, stats, centroids = cv2.connectedComponentsWithStats(mask_u8, connectivity=8, ltype=cv2.CV_32S)
         for local_lbl in range(1, int(num_cc)):
             area = int(stats[int(local_lbl), cv2.CC_STAT_AREA])
@@ -6626,8 +6719,8 @@ def _build_slice_component_table(labels2d: np.ndarray, z: int) -> SliceComponent
                 z=int(z),
                 label=int(label_i),
                 component_index=int(len(components) + 1),
-                bbox=(int(y), int(x), int(y + height), int(x + width)),
-                anchor=(int(y + int(ys[anchor_idx])), int(x + int(xs[anchor_idx]))),
+                bbox=(int(y0 + y), int(x0 + x), int(y0 + y + height), int(x0 + x + width)),
+                anchor=(int(y0 + y + int(ys[anchor_idx])), int(x0 + x + int(xs[anchor_idx]))),
                 area=int(area),
                 mask_crop=comp_crop,
             )
@@ -10482,7 +10575,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.5-Pro_v12.2.4_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.5-Pro_v12.2.5_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -12777,8 +12870,8 @@ def main() -> None:
     )
     spec_notes.append(
         'Interpolation labeling uses parallel 2D per-slice connected-component labeling, parallel adjacent-slice pair extraction, '
-        'and parallel compact relabeling; tune YOLO_TTA_INTERPOLATION_LABEL_WORKERS, '
-        'YOLO_TTA_INTERPOLATION_PAIR_WORKERS, and YOLO_TTA_INTERPOLATION_COMPACT_WORKERS if needed.'
+        'row-blocked parallel compact relabeling, and unordered prebuilt per-slice component tables for endpoint scanning; tune YOLO_TTA_INTERPOLATION_LABEL_WORKERS, '
+        'YOLO_TTA_INTERPOLATION_PAIR_WORKERS, YOLO_TTA_INTERPOLATION_COMPACT_WORKERS, and YOLO_TTA_INTERPOLATION_COMPACT_RELABEL_ROWS if needed.'
     )
 
     output_manager = BackgroundOutputManager(max_workers=output_workers)
