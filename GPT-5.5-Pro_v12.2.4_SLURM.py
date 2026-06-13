@@ -2,10 +2,11 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v12.2.2_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.1/v12.2.2 performance patches:
+This v12.2.4_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.1-v12.2.4 performance patches:
   - this revision removes the dedicated single --angle GPU cleanup fast path: min_conf filtering, 2D hole filling, and min_radius filtering always run through the shared CPU cleanup path regardless of how many --angle values are provided
   - v12.2.1 restores the low-quality downbin/output helper path and NrrdLayerRef metadata class that were erroneously pruned in v12.2.0
   - v12.2.2 adds batched in-memory inference with synthetic final-batch padding for fixed-batch backends, larger RAM-aware NRRD streaming slabs, parallel low-quality NRRD scheduling, and a hybrid CPU/GPU radial/tilted backprojection queue
+  - v12.2.4 aligns the script header with the filename, moves Radial before Tilted in scheduling order, plans interpolation from cached per-slice component tables and local SDF crops, consumes variable-cost seed plans through an unordered bounded completion queue, keeps transient NRRD projection/delta workspaces in RAM when possible, and raises the CPU mask postprocess pending cap to 4096
   - builds Transverse, optional generalized Tilted Views for Transverse/Sagittal/Coronal, independently optional upright Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - materializes YOLO-ready full-frame and tiled prediction volumes as in-memory slice arrays instead of writing prediction videos to the temp folder
   - feeds those volumes to Ultralytics through a custom in-memory loader with stream=True, while using Ultralytics native retina mask reconstruction
@@ -511,6 +512,48 @@ def parallel_map_in_order(
         while queue:
             fut = queue.pop(0)
             yield fut.result()
+
+
+def parallel_map_unordered(
+    func: Callable[[int], object],
+    items: Iterable[int],
+    *,
+    max_workers: int,
+    max_pending: Optional[int] = None,
+) -> Iterator[object]:
+    """Bounded parallel map that yields results as soon as tasks complete.
+
+    This is intended for variable-cost tasks whose output order does not affect the
+    final binary result, such as interpolation endpoint seed planning.  Unlike
+    ``parallel_map_in_order``, one slow early item cannot block result consumption
+    or prevent later items from being submitted once the pending bound is reached.
+    """
+    workers = max(1, int(max_workers))
+    if workers <= 1:
+        for item in items:
+            yield func(int(item))
+        return
+
+    pending_limit = max(workers, int(max_pending) if max_pending is not None else workers + 1)
+    iterator = iter(items)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        pending: set[Future] = set()
+
+        def _submit_until_full() -> None:
+            while len(pending) < pending_limit:
+                try:
+                    item = next(iterator)
+                except StopIteration:
+                    break
+                pending.add(executor.submit(func, int(item)))
+
+        _submit_until_full()
+        while pending:
+            done, pending_remainder = wait(pending, return_when=FIRST_COMPLETED)
+            pending = set(pending_remainder)
+            for fut in done:
+                yield fut.result()
+            _submit_until_full()
 
 
 def parallel_for_indices(
@@ -1752,9 +1795,42 @@ def get_view_infos(
             stack_axis=str(spec['stack_axis']),
         ))
 
-    tilt_angles_resolved = [float(a) for a in (tilt_angles or []) if float(a) > 0.0]
-    tilt_dirs_resolved = [str(v) for v in (tilt_directions or [])]
-    tilt_views_resolved = resolve_tilt_views(tilt_views if tilt_views is not None else ['transverse'])
+    if include_radial and float(azimuth_angle) > 0.0:
+        azimuths = tuple(build_radial_azimuths(float(azimuth_angle)))
+        diameter = int(min(W, H))
+        roi_radius = float(max(0.0, (diameter - 1) / 2.0))
+        views.append(
+            ViewInfo(
+                name='radial',
+                num_slices=len(azimuths),
+                src_h=T,
+                src_w=diameter,
+                pad_mode='pad',
+                family='radial',
+                summary_family='radial',
+                display_name='Radial',
+                full_t=T,
+                azimuths_deg=azimuths,
+                diameter=diameter,
+                center_x=float((W - 1) / 2.0),
+                center_y=float((H - 1) / 2.0),
+                roi_radius=roi_radius,
+                full_h=H,
+                full_w=W,
+                horizontal_axis='r',
+                vertical_axis='t',
+                stack_axis='azimuth',
+            )
+        )
+
+    # Scheduling order in v12.2.0 is Cartesian upright views, then Radial, then Tilted.
+    # Tilted variants themselves are deterministic: base view Transverse/Sagittal/Coronal,
+    # direction horizontal/vertical, signed angle positive/negative, angle value ascending.
+    tilt_angles_resolved = sorted({float(a) for a in (tilt_angles or []) if float(a) > 0.0})
+    requested_dirs = set(resolve_tilt_directions(tilt_directions if tilt_directions is not None else ['vertical']))
+    tilt_dirs_resolved = [d for d in ('horizontal', 'vertical') if d in requested_dirs]
+    tilt_views_requested = set(resolve_tilt_views(tilt_views if tilt_views is not None else ['transverse']))
+    tilt_views_resolved = [base for base in ('transverse', 'sagittal', 'coronal') if base in tilt_views_requested]
     for base_view in tilt_views_resolved:
         spec = cartesian_view_axis_spec(str(base_view), T, H, W)
         for tilt_direction in tilt_dirs_resolved:
@@ -1787,33 +1863,6 @@ def get_view_infos(
                         stack_axis=str(spec['stack_axis']),
                     ))
 
-    if include_radial and float(azimuth_angle) > 0.0:
-        azimuths = tuple(build_radial_azimuths(float(azimuth_angle)))
-        diameter = int(min(W, H))
-        roi_radius = float(max(0.0, (diameter - 1) / 2.0))
-        views.append(
-            ViewInfo(
-                name='radial',
-                num_slices=len(azimuths),
-                src_h=T,
-                src_w=diameter,
-                pad_mode='pad',
-                family='radial',
-                summary_family='radial',
-                display_name='Radial',
-                full_t=T,
-                azimuths_deg=azimuths,
-                diameter=diameter,
-                center_x=float((W - 1) / 2.0),
-                center_y=float((H - 1) / 2.0),
-                roi_radius=roi_radius,
-                full_h=H,
-                full_w=W,
-                horizontal_axis='r',
-                vertical_axis='t',
-                stack_axis='azimuth',
-            )
-        )
     return views
 
 
@@ -3193,7 +3242,7 @@ def cpu_mask_postprocess_pending_limit(worker_count: int, num_frames: int) -> in
     """
     workers = max(1, int(worker_count))
     frames = max(1, int(num_frames))
-    requested = _env_int('YOLO_TTA_CPU_MASK_PENDING_FRAMES', 256)
+    requested = _env_int('YOLO_TTA_CPU_MASK_PENDING_FRAMES', 4096)
     if int(requested) <= 0:
         return max(workers, frames)
     return max(workers, min(frames, max(int(requested), workers * 2)))
@@ -4703,6 +4752,7 @@ def build_slice_endpoint_seeds_from_label_volume(
     workers: int = 1,
     desc: str = 'Interpolation: endpoint seeds [scan]',
     wrap_axis: bool = False,
+    component_cache: Optional['SliceComponentTableCache'] = None,
 ) -> Tuple[List[SliceEndpointSeed], int]:
     """Fast slice-graph endpoint scan for slice-direction interpolation.
 
@@ -4711,12 +4761,58 @@ def build_slice_endpoint_seeds_from_label_volume(
     are identified from connected components in each slice that do not continue into the previous or
     next slice of the same relabeled object. When wrap_axis is true, slice 0 and the
     final slice are also considered adjacent for Radial interpolation.
+
+    When a component cache is supplied, the scan reuses cached per-slice component tables and tests
+    continuation only inside each component's crop. This makes endpoint discovery and later seed
+    planning share the same component records instead of relabeling slices again per seed/bridge.
     """
     z_dim = int(labels_real.shape[0])
     if z_dim <= 0:
         return [], 0
 
+    def _scan_slice_from_cache(z: int) -> List[SliceEndpointSeed]:
+        if component_cache is None:
+            return []
+        table = component_cache.get(int(z))
+        if not table.components:
+            return []
+
+        if bool(wrap_axis) and z_dim > 1:
+            prev_slice = np.asarray(labels_real[(int(z) - 1) % z_dim])
+            next_slice = np.asarray(labels_real[(int(z) + 1) % z_dim])
+        else:
+            prev_slice = np.asarray(labels_real[int(z) - 1]) if int(z) > 0 else None
+            next_slice = np.asarray(labels_real[int(z) + 1]) if (int(z) + 1) < z_dim else None
+
+        seeds_local: List[SliceEndpointSeed] = []
+        for record in table.components:
+            y0, x0, y1, x1 = record.bbox
+            comp_crop = np.asarray(record.mask_crop, dtype=bool)
+            has_prev = False
+            has_next = False
+            if prev_slice is not None:
+                has_prev = bool(np.any(comp_crop & (prev_slice[int(y0):int(y1), int(x0):int(x1)] == int(record.label))))
+            if next_slice is not None:
+                has_next = bool(np.any(comp_crop & (next_slice[int(y0):int(y1), int(x0):int(x1)] == int(record.label))))
+
+            if not has_prev:
+                seeds_local.append(SliceEndpointSeed(
+                    label=int(record.label),
+                    point=(int(z), int(record.anchor[0]), int(record.anchor[1])),
+                    direction_sign=-1,
+                ))
+            if not has_next:
+                seeds_local.append(SliceEndpointSeed(
+                    label=int(record.label),
+                    point=(int(z), int(record.anchor[0]), int(record.anchor[1])),
+                    direction_sign=1,
+                ))
+        return seeds_local
+
     def _scan_slice(z: int) -> List[SliceEndpointSeed]:
+        if component_cache is not None:
+            return _scan_slice_from_cache(int(z))
+
         curr_slice = np.asarray(labels_real[int(z)])
         if not np.any(curr_slice):
             return []
@@ -4780,7 +4876,7 @@ def build_slice_endpoint_seeds_from_label_volume(
     else:
         pending = max(worker_count, worker_count * 2)
         for seeds_local in tqdm(
-            parallel_map_in_order(_scan_slice, range(z_dim), max_workers=worker_count, max_pending=pending),
+            parallel_map_unordered(_scan_slice, range(z_dim), max_workers=worker_count, max_pending=pending),
             total=z_dim,
             desc=desc,
         ):
@@ -4788,7 +4884,6 @@ def build_slice_endpoint_seeds_from_label_volume(
 
     seeds.sort(key=lambda s: (int(s.label), int(s.point[0]), int(s.direction_sign), int(s.point[1]), int(s.point[2])))
     return seeds, int(len(seeds))
-
 
 
 def apply_transverse_min_radius_filter_inplace(
@@ -6288,6 +6383,301 @@ def _signed_distance_2d(mask2d: np.ndarray) -> np.ndarray:
     return np.asarray(inside - outside, dtype=np.float32)
 
 
+INTERPOLATION_LOCAL_SDF_PAD = 2
+
+
+@dataclass(frozen=True)
+class SliceComponentRecord:
+    z: int
+    label: int
+    component_index: int
+    bbox: Tuple[int, int, int, int]  # y0, x0, y1, x1 in full-slice coordinates
+    anchor: Tuple[int, int]          # centroid-nearest component pixel in full-slice coordinates
+    area: int
+    mask_crop: np.ndarray            # bool crop in bbox coordinates
+
+
+@dataclass(frozen=True)
+class CroppedProjectionSDF:
+    origin_y: int
+    origin_x: int
+    sdf: np.ndarray
+
+
+@dataclass
+class SliceComponentTable:
+    z: int
+    shape: Tuple[int, int]
+    components: List[SliceComponentRecord]
+    by_label: Dict[int, List[SliceComponentRecord]]
+
+    def find_record_for_point(
+        self,
+        label: int,
+        point_yx: Tuple[int, int],
+    ) -> Tuple[Optional[SliceComponentRecord], Optional[Tuple[int, int]]]:
+        records = self.by_label.get(int(label), [])
+        if not records:
+            return None, None
+
+        h, w = int(self.shape[0]), int(self.shape[1])
+        py = int(np.clip(int(point_yx[0]), 0, max(0, h - 1)))
+        px = int(np.clip(int(point_yx[1]), 0, max(0, w - 1)))
+
+        for record in records:
+            y0, x0, y1, x1 = record.bbox
+            if y0 <= py < y1 and x0 <= px < x1 and bool(record.mask_crop[py - y0, px - x0]):
+                return record, (int(py), int(px))
+
+        best_record: Optional[SliceComponentRecord] = None
+        best_point: Optional[Tuple[int, int]] = None
+        best_d2: Optional[int] = None
+        for record in records:
+            nearest = _nearest_point_in_component_record(record, (py, px))
+            if nearest is None:
+                continue
+            d2 = int((int(nearest[0]) - py) ** 2 + (int(nearest[1]) - px) ** 2)
+            if best_d2 is None or d2 < best_d2:
+                best_d2 = int(d2)
+                best_record = record
+                best_point = nearest
+        return best_record, best_point
+
+    def find_branch_continuation(
+        self,
+        label: int,
+        prev_record: SliceComponentRecord,
+        prev_anchor: Tuple[int, int],
+    ) -> Tuple[Optional[SliceComponentRecord], Optional[Tuple[int, int]]]:
+        records = self.by_label.get(int(label), [])
+        if not records:
+            return None, None
+        if len(records) == 1:
+            record = records[0]
+            return record, _nearest_point_in_component_record(record, prev_anchor)
+
+        best_record: Optional[SliceComponentRecord] = None
+        best_anchor: Optional[Tuple[int, int]] = None
+        best_score: Optional[Tuple[int, int, int]] = None
+        for record in records:
+            anchor = _nearest_point_in_component_record(record, prev_anchor)
+            if anchor is None:
+                continue
+            overlap = _component_record_dilated_overlap_count(prev_record, record)
+            d2 = int((int(anchor[0]) - int(prev_anchor[0])) ** 2 + (int(anchor[1]) - int(prev_anchor[1])) ** 2)
+            score = (int(overlap), -int(d2), int(record.area))
+            if best_score is None or score > best_score:
+                best_score = score
+                best_record = record
+                best_anchor = anchor
+        return best_record, best_anchor
+
+
+class SliceComponentTableCache:
+    """Lazy per-slice component table and local projection-SDF cache for interpolation.
+
+    Tables are keyed by slice and store cropped masks/bboxes for each 2D component of
+    each 3D object label.  Projection candidate search then operates only on the source
+    component's bbox expanded by the maximum possible search-angle growth, avoiding
+    full-slice SDFs and full-slice boolean projection scans per seed.
+    """
+
+    def __init__(self, labels_real: np.ndarray) -> None:
+        self.labels_real = labels_real
+        self.z_dim = int(labels_real.shape[0])
+        self.shape_yx = (int(labels_real.shape[1]), int(labels_real.shape[2]))
+        self._tables: Dict[int, SliceComponentTable] = {}
+        self._projection_sdfs: Dict[Tuple[int, int, int, int, float, int], CroppedProjectionSDF] = {}
+        self._table_locks = [threading.Lock() for _ in range(max(1, self.z_dim))]
+        self._sdf_lock = threading.Lock()
+
+    def get(self, z: int) -> SliceComponentTable:
+        z_i = int(z)
+        if z_i < 0 or z_i >= self.z_dim:
+            raise IndexError(z_i)
+        cached = self._tables.get(z_i)
+        if cached is not None:
+            return cached
+        with self._table_locks[z_i]:
+            cached = self._tables.get(z_i)
+            if cached is None:
+                cached = _build_slice_component_table(np.asarray(self.labels_real[z_i]), z_i)
+                self._tables[z_i] = cached
+            return cached
+
+    def find_record_for_point(
+        self,
+        z: int,
+        label: int,
+        point_yx: Tuple[int, int],
+    ) -> Tuple[Optional[SliceComponentRecord], Optional[Tuple[int, int]]]:
+        return self.get(int(z)).find_record_for_point(int(label), point_yx)
+
+    def get_projection_sdf(
+        self,
+        record: SliceComponentRecord,
+        max_slice_distance: int,
+        search_angle_deg: float,
+    ) -> CroppedProjectionSDF:
+        slope = math.tan(math.radians(float(search_angle_deg)))
+        growth = max(0.0, float(slope)) * float(max(0, int(max_slice_distance)))
+        pad = max(int(INTERPOLATION_LOCAL_SDF_PAD), int(math.ceil(growth)) + int(INTERPOLATION_LOCAL_SDF_PAD))
+        key = (
+            int(record.z),
+            int(record.label),
+            int(record.component_index),
+            int(max_slice_distance),
+            round(float(search_angle_deg), 6),
+            int(pad),
+        )
+        with self._sdf_lock:
+            cached = self._projection_sdfs.get(key)
+        if cached is not None:
+            return cached
+
+        h, w = self.shape_yx
+        y0, x0, y1, x1 = record.bbox
+        crop_y0 = max(0, int(y0) - int(pad))
+        crop_x0 = max(0, int(x0) - int(pad))
+        crop_y1 = min(int(h), int(y1) + int(pad))
+        crop_x1 = min(int(w), int(x1) + int(pad))
+        source_crop = np.zeros((int(crop_y1 - crop_y0), int(crop_x1 - crop_x0)), dtype=bool)
+        dy0 = int(y0) - int(crop_y0)
+        dx0 = int(x0) - int(crop_x0)
+        source_crop[dy0:dy0 + int(record.mask_crop.shape[0]), dx0:dx0 + int(record.mask_crop.shape[1])] = record.mask_crop
+        cropped = CroppedProjectionSDF(
+            origin_y=int(crop_y0),
+            origin_x=int(crop_x0),
+            sdf=np.ascontiguousarray(_signed_distance_2d(source_crop)),
+        )
+        with self._sdf_lock:
+            existing = self._projection_sdfs.setdefault(key, cropped)
+        return existing
+
+
+def _nearest_point_in_component_record(record: SliceComponentRecord, ref_yx: Tuple[int, int]) -> Optional[Tuple[int, int]]:
+    ys, xs = np.nonzero(record.mask_crop)
+    if ys.size == 0:
+        return None
+    y0, x0, _y1, _x1 = record.bbox
+    gy = ys.astype(np.int64, copy=False) + int(y0)
+    gx = xs.astype(np.int64, copy=False) + int(x0)
+    d2 = (gy - int(ref_yx[0])) ** 2 + (gx - int(ref_yx[1])) ** 2
+    idx = int(np.argmin(d2))
+    return int(gy[idx]), int(gx[idx])
+
+
+def _component_record_dilated_overlap_count(prev_record: SliceComponentRecord, candidate_record: SliceComponentRecord) -> int:
+    py0, px0, py1, px1 = prev_record.bbox
+    cy0, cx0, cy1, cx1 = candidate_record.bbox
+    # The previous component is dilated by one pixel for branch following, so its
+    # effective bbox expands by one pixel in every direction.
+    iy0 = max(int(py0) - 1, int(cy0))
+    ix0 = max(int(px0) - 1, int(cx0))
+    iy1 = min(int(py1) + 1, int(cy1))
+    ix1 = min(int(px1) + 1, int(cx1))
+    if iy0 >= iy1 or ix0 >= ix1:
+        return 0
+
+    padded_prev = np.pad(np.asarray(prev_record.mask_crop, dtype=np.uint8), 1, mode='constant', constant_values=0)
+    dilated_prev = cv2.dilate(padded_prev, np.ones((3, 3), dtype=np.uint8), iterations=1).astype(bool, copy=False)
+    prev_origin_y = int(py0) - 1
+    prev_origin_x = int(px0) - 1
+    prev_block = dilated_prev[iy0 - prev_origin_y:iy1 - prev_origin_y, ix0 - prev_origin_x:ix1 - prev_origin_x]
+    cand_block = candidate_record.mask_crop[iy0 - int(cy0):iy1 - int(cy0), ix0 - int(cx0):ix1 - int(cx0)]
+    return int(np.count_nonzero(prev_block & cand_block))
+
+
+def _build_slice_component_table(labels2d: np.ndarray, z: int) -> SliceComponentTable:
+    labels_arr = np.asarray(labels2d)
+    h, w = (int(labels_arr.shape[0]), int(labels_arr.shape[1]))
+    present = np.unique(labels_arr)
+    present = present[present > 0]
+    components: List[SliceComponentRecord] = []
+    by_label: Dict[int, List[SliceComponentRecord]] = {}
+    if present.size <= 0:
+        return SliceComponentTable(z=int(z), shape=(h, w), components=components, by_label=by_label)
+
+    for label_val in present.tolist():
+        label_i = int(label_val)
+        mask_u8 = np.ascontiguousarray(labels_arr == label_i, dtype=np.uint8)
+        if not np.any(mask_u8):
+            continue
+        num_cc, cc, stats, centroids = cv2.connectedComponentsWithStats(mask_u8, connectivity=8, ltype=cv2.CV_32S)
+        for local_lbl in range(1, int(num_cc)):
+            area = int(stats[int(local_lbl), cv2.CC_STAT_AREA])
+            if area <= 0:
+                continue
+            x = int(stats[int(local_lbl), cv2.CC_STAT_LEFT])
+            y = int(stats[int(local_lbl), cv2.CC_STAT_TOP])
+            width = int(stats[int(local_lbl), cv2.CC_STAT_WIDTH])
+            height = int(stats[int(local_lbl), cv2.CC_STAT_HEIGHT])
+            if width <= 0 or height <= 0:
+                continue
+            comp_crop = np.ascontiguousarray(cc[y:y + height, x:x + width] == int(local_lbl))
+            ys, xs = np.nonzero(comp_crop)
+            if ys.size <= 0:
+                continue
+            centroid_x = float(centroids[int(local_lbl), 0]) - float(x)
+            centroid_y = float(centroids[int(local_lbl), 1]) - float(y)
+            d2 = (ys.astype(np.float32, copy=False) - centroid_y) ** 2 + (xs.astype(np.float32, copy=False) - centroid_x) ** 2
+            anchor_idx = int(np.argmin(d2))
+            record = SliceComponentRecord(
+                z=int(z),
+                label=int(label_i),
+                component_index=int(len(components) + 1),
+                bbox=(int(y), int(x), int(y + height), int(x + width)),
+                anchor=(int(y + int(ys[anchor_idx])), int(x + int(xs[anchor_idx]))),
+                area=int(area),
+                mask_crop=comp_crop,
+            )
+            components.append(record)
+            by_label.setdefault(int(label_i), []).append(record)
+    return SliceComponentTable(z=int(z), shape=(h, w), components=components, by_label=by_label)
+
+
+def _component_record_to_local_canvas(record: SliceComponentRecord, anchor_yx: Tuple[int, int], half_width: int) -> np.ndarray:
+    size = int(2 * int(half_width) + 1)
+    local = np.zeros((size, size), dtype=bool)
+    ys, xs = np.nonzero(record.mask_crop)
+    if ys.size == 0:
+        return local
+    y0, x0, _y1, _x1 = record.bbox
+    yy = ys.astype(np.int64, copy=False) + int(y0) - int(anchor_yx[0]) + int(half_width)
+    xx = xs.astype(np.int64, copy=False) + int(x0) - int(anchor_yx[1]) + int(half_width)
+    valid = (yy >= 0) & (yy < size) & (xx >= 0) & (xx < size)
+    local[yy[valid], xx[valid]] = True
+    return local
+
+
+def _local_half_width_for_component_records(
+    source_record: SliceComponentRecord,
+    source_anchor: Tuple[int, int],
+    target_record: SliceComponentRecord,
+    target_anchor: Tuple[int, int],
+) -> int:
+    max_extent = 0.0
+    for record, anchor in ((source_record, source_anchor), (target_record, target_anchor)):
+        ys, xs = np.nonzero(record.mask_crop)
+        if ys.size == 0:
+            continue
+        y0, x0, _y1, _x1 = record.bbox
+        gy = ys.astype(np.int64, copy=False) + int(y0)
+        gx = xs.astype(np.int64, copy=False) + int(x0)
+        max_extent = max(
+            max_extent,
+            float(np.max(np.abs(gy - int(anchor[0])))),
+            float(np.max(np.abs(gx - int(anchor[1])))),
+        )
+
+    max_extent = max(
+        max_extent,
+        float(abs(int(target_anchor[0]) - int(source_anchor[0]))),
+        float(abs(int(target_anchor[1]) - int(source_anchor[1]))),
+    )
+    return max(4, int(math.ceil(max_extent)) + 4)
+
+
 @dataclass(frozen=True)
 class SliceEndpointSeed:
     label: int
@@ -6481,21 +6871,39 @@ def _find_slice_projection_candidates(
     search_angle_deg: float,
     max_candidates: int,
     wrap_axis: bool = False,
+    component_cache: Optional[SliceComponentTableCache] = None,
 ) -> List[SliceProjectionCandidate]:
     if int(max_slice_distance) <= 0 or int(max_candidates) <= 0:
         return []
 
     s0, y0, x0 = seed.point
-    source_component, source_anchor = _component_mask_and_anchor(labels_real[s0] == int(seed.label), (y0, x0))
-    if source_anchor is None or not np.any(source_component):
+    num_slices = int(labels_real.shape[0])
+    if num_slices <= 0:
         return []
 
-    sdf = _signed_distance_2d(source_component)
-    slope = math.tan(math.radians(float(search_angle_deg)))
-    num_slices = labels_real.shape[0]
-    found: Dict[int, SliceProjectionCandidate] = {}
+    local_cache = component_cache if component_cache is not None else SliceComponentTableCache(labels_real)
+    source_record, source_anchor = local_cache.find_record_for_point(int(s0), int(seed.label), (int(y0), int(x0)))
+    if source_record is None or source_anchor is None or int(source_record.area) <= 0:
+        return []
 
     max_steps = min(int(max_slice_distance), max(0, int(num_slices) - 1)) if bool(wrap_axis) else int(max_slice_distance)
+    if int(max_steps) <= 0:
+        return []
+
+    cropped_sdf = local_cache.get_projection_sdf(
+        source_record,
+        max_slice_distance=int(max_steps),
+        search_angle_deg=float(search_angle_deg),
+    )
+    sdf = np.asarray(cropped_sdf.sdf, dtype=np.float32)
+    crop_y0 = int(cropped_sdf.origin_y)
+    crop_x0 = int(cropped_sdf.origin_x)
+    crop_y1 = int(crop_y0 + int(sdf.shape[0]))
+    crop_x1 = int(crop_x0 + int(sdf.shape[1]))
+
+    slope = math.tan(math.radians(float(search_angle_deg)))
+    found: Dict[int, SliceProjectionCandidate] = {}
+
     for step in range(1, int(max_steps) + 1):
         s = int(s0 + int(seed.direction_sign) * step)
         if bool(wrap_axis):
@@ -6510,29 +6918,31 @@ def _find_slice_projection_candidates(
                 break
             continue
 
-        labels2d = labels_real[s]
-        overlap = projection & (labels2d > 0) & (labels2d != int(seed.label))
+        labels_crop = np.asarray(labels_real[int(s), crop_y0:crop_y1, crop_x0:crop_x1])
+        overlap = projection & (labels_crop > 0) & (labels_crop != int(seed.label))
         if not np.any(overlap):
             continue
 
-        ys, xs = np.nonzero(overlap)
-        lbls = labels2d[ys, xs].astype(np.int64, copy=False)
+        ys_local, xs_local = np.nonzero(overlap)
+        lbls = labels_crop[ys_local, xs_local].astype(np.int64, copy=False)
         for target_label in np.unique(lbls):
             target_label_i = int(target_label)
             if target_label_i <= 0 or target_label_i == int(seed.label) or target_label_i in found:
                 continue
             use = lbls == target_label_i
-            ys_t = ys[use]
-            xs_t = xs[use]
+            ys_t = ys_local[use]
+            xs_t = xs_local[use]
             if ys_t.size == 0:
                 continue
-            d2 = (ys_t.astype(np.int64) - int(source_anchor[0])) ** 2 + (xs_t.astype(np.int64) - int(source_anchor[1])) ** 2
+            ys_global = ys_t.astype(np.int64, copy=False) + int(crop_y0)
+            xs_global = xs_t.astype(np.int64, copy=False) + int(crop_x0)
+            d2 = (ys_global - int(source_anchor[0])) ** 2 + (xs_global - int(source_anchor[1])) ** 2
             idx = int(np.argmin(d2))
             found[target_label_i] = SliceProjectionCandidate(
                 source_label=int(seed.label),
                 target_label=target_label_i,
                 source_point=(int(s0), int(y0), int(x0)),
-                target_point=(int(s), int(ys_t[idx]), int(xs_t[idx])),
+                target_point=(int(s), int(ys_global[idx]), int(xs_global[idx])),
                 slice_distance=int(step),
             )
 
@@ -6557,18 +6967,51 @@ def _collect_walkback_source_points(
     direction_sign: int,
     walk_back: int,
     wrap_axis: bool = False,
+    component_cache: Optional[SliceComponentTableCache] = None,
 ) -> List[Tuple[int, int, int]]:
     if int(walk_back) <= 0:
         return []
 
     s0, y0, x0 = start_point
+    num_slices = int(labels_real.shape[0])
+
+    if component_cache is not None:
+        current_record, current_anchor = component_cache.find_record_for_point(int(s0), int(label), (int(y0), int(x0)))
+        if current_record is None or current_anchor is None:
+            return []
+        out: List[Tuple[int, int, int]] = []
+        current_slice = int(s0)
+        max_walk = min(int(walk_back), max(0, int(num_slices) - 1)) if bool(wrap_axis) else int(walk_back)
+        visited_slices = {int(current_slice)}
+        for _ in range(int(max_walk)):
+            next_slice = int(current_slice - int(direction_sign))
+            if bool(wrap_axis):
+                next_slice = int(next_slice % int(num_slices))
+                if next_slice in visited_slices:
+                    break
+            elif next_slice < 0 or next_slice >= num_slices:
+                break
+
+            next_record, next_anchor = component_cache.get(next_slice).find_branch_continuation(
+                int(label),
+                current_record,
+                current_anchor,
+            )
+            if next_record is None or next_anchor is None:
+                break
+            out.append((int(next_slice), int(next_anchor[0]), int(next_anchor[1])))
+            visited_slices.add(int(next_slice))
+            current_slice = int(next_slice)
+            current_record = next_record
+            current_anchor = next_anchor
+        return out
+
     current_component, current_anchor = _component_mask_and_anchor(labels_real[s0] == int(label), (y0, x0))
     if current_anchor is None or not np.any(current_component):
         return []
 
     out: List[Tuple[int, int, int]] = []
     current_slice = int(s0)
-    num_slices = labels_real.shape[0]
 
     max_walk = min(int(walk_back), max(0, int(num_slices) - 1)) if bool(wrap_axis) else int(walk_back)
     visited_slices = {int(current_slice)}
@@ -6627,6 +7070,7 @@ def _build_slice_endpoint_seeds(
     extension_slices: int,
     workers: int = 1,
     wrap_axis: bool = False,
+    component_cache: Optional['SliceComponentTableCache'] = None,
 ) -> Tuple[List[SliceEndpointSeed], int]:
     """Build interpolation endpoint seeds with the v12.2.0 per-slice component scan.
 
@@ -6642,6 +7086,7 @@ def _build_slice_endpoint_seeds(
         workers=int(workers),
         desc='Interpolation: endpoint seeds [scan]',
         wrap_axis=bool(wrap_axis),
+        component_cache=component_cache,
     )
 
 
@@ -6653,22 +7098,36 @@ def _build_linear_slice_bridge_plan(
     target_point: Tuple[int, int, int],
     direction_sign: Optional[int] = None,
     wrap_axis: bool = False,
+    component_cache: Optional[SliceComponentTableCache] = None,
 ) -> Optional[SliceBridgeRenderPlan]:
     s0, y0, x0 = source_point
     s1, y1, x1 = target_point
     if int(s0) == int(s1):
         return None
 
-    source_component, source_anchor = _component_mask_and_anchor(labels_real[s0] == int(source_label), (y0, x0))
-    target_component, target_anchor = _component_mask_and_anchor(labels_real[s1] == int(target_label), (y1, x1))
-    if source_anchor is None or target_anchor is None:
-        return None
-    if not np.any(source_component) or not np.any(target_component):
-        return None
+    if component_cache is not None:
+        source_record, source_anchor = component_cache.find_record_for_point(int(s0), int(source_label), (int(y0), int(x0)))
+        target_record, target_anchor = component_cache.find_record_for_point(int(s1), int(target_label), (int(y1), int(x1)))
+        if source_record is None or target_record is None or source_anchor is None or target_anchor is None:
+            return None
+        if int(source_record.area) <= 0 or int(target_record.area) <= 0:
+            return None
 
-    half_width = _local_half_width_for_components(source_component, source_anchor, target_component, target_anchor)
-    source_local = _component_to_local_canvas(source_component, source_anchor, half_width)
-    target_local = _component_to_local_canvas(target_component, target_anchor, half_width)
+        half_width = _local_half_width_for_component_records(source_record, source_anchor, target_record, target_anchor)
+        source_local = _component_record_to_local_canvas(source_record, source_anchor, half_width)
+        target_local = _component_record_to_local_canvas(target_record, target_anchor, half_width)
+    else:
+        source_component, source_anchor = _component_mask_and_anchor(labels_real[s0] == int(source_label), (y0, x0))
+        target_component, target_anchor = _component_mask_and_anchor(labels_real[s1] == int(target_label), (y1, x1))
+        if source_anchor is None or target_anchor is None:
+            return None
+        if not np.any(source_component) or not np.any(target_component):
+            return None
+
+        half_width = _local_half_width_for_components(source_component, source_anchor, target_component, target_anchor)
+        source_local = _component_to_local_canvas(source_component, source_anchor, half_width)
+        target_local = _component_to_local_canvas(target_component, target_anchor, half_width)
+
     if not np.any(source_local) or not np.any(target_local):
         return None
 
@@ -6745,6 +7204,7 @@ def _plan_slice_seed_bridges(
     interpolation_candidates: int,
     interpolate_min_radius: float,
     wrap_axis: bool = False,
+    component_cache: Optional[SliceComponentTableCache] = None,
 ) -> SliceSeedBridgePlanResult:
     result = SliceSeedBridgePlanResult()
 
@@ -6755,6 +7215,7 @@ def _plan_slice_seed_bridges(
         search_angle_deg=float(search_angle_deg),
         max_candidates=int(interpolation_candidates),
         wrap_axis=bool(wrap_axis),
+        component_cache=component_cache,
     )
     if not candidates:
         return result
@@ -6767,6 +7228,7 @@ def _plan_slice_seed_bridges(
         direction_sign=int(seed.direction_sign),
         walk_back=int(interpolation_walk_back),
         wrap_axis=bool(wrap_axis),
+        component_cache=component_cache,
     )
 
     for candidate in candidates:
@@ -6780,6 +7242,7 @@ def _plan_slice_seed_bridges(
                 target_point=candidate.target_point,
                 direction_sign=int(seed.direction_sign),
                 wrap_axis=bool(wrap_axis),
+                component_cache=component_cache,
             )
             if plan is None:
                 continue
@@ -6858,6 +7321,7 @@ def interpolate_view_volume_pass_inplace(
             'skipped': True,
             'wrap_axis': bool(wrap_axis),
             'endpoint_method': 'slice_component_scan',
+            'planning_backend': 'cached_per_slice_component_tables_local_sdf_unordered',
         }
 
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -6898,14 +7362,17 @@ def interpolate_view_volume_pass_inplace(
             'skipped': int(num_objects) <= 1,
             'wrap_axis': bool(wrap_axis),
             'endpoint_method': 'slice_component_scan',
+            'planning_backend': 'cached_per_slice_component_tables_local_sdf_unordered',
         }
 
-    worker_count = choose_slice_parallel_workers(int(workers), max(1, int(num_objects)))
+    component_cache = SliceComponentTableCache(labels_mm)
+    worker_count = choose_slice_parallel_workers(int(workers), int(labels_mm.shape[0]))
     seeds, num_endpoints = _build_slice_endpoint_seeds(
         labels_mm,
         extension_slices=int(max_slice_distance),
         workers=worker_count,
         wrap_axis=bool(wrap_axis),
+        component_cache=component_cache,
     )
     if not seeds:
         del labels_mm
@@ -6927,6 +7394,7 @@ def interpolate_view_volume_pass_inplace(
             'skipped': False,
             'wrap_axis': bool(wrap_axis),
             'endpoint_method': 'slice_component_scan',
+            'planning_backend': 'cached_per_slice_component_tables_local_sdf_unordered',
         }
 
     bridge_path: Optional[Path] = None
@@ -6957,13 +7425,14 @@ def interpolate_view_volume_pass_inplace(
                 interpolation_candidates=int(interpolation_candidates),
                 interpolate_min_radius=float(interpolate_min_radius),
                 wrap_axis=bool(wrap_axis),
+                component_cache=component_cache,
             )
 
         pending = max(plan_workers, plan_workers * 2)
         if plan_workers <= 1:
             iterable = (_plan_seed(int(idx)) for idx in range(len(seeds)))
         else:
-            iterable = parallel_map_in_order(
+            iterable = parallel_map_unordered(
                 _plan_seed,
                 range(len(seeds)),
                 max_workers=plan_workers,
@@ -7024,6 +7493,10 @@ def interpolate_view_volume_pass_inplace(
         if isinstance(bridge_mm, np.memmap):
             flush_array(bridge_mm)
         del bridge_mm
+        try:
+            del component_cache
+        except Exception:
+            pass
         if isinstance(labels_mm, np.memmap):
             flush_array(labels_mm)
         del labels_mm
@@ -7051,6 +7524,7 @@ def interpolate_view_volume_pass_inplace(
         'skipped': False,
         'wrap_axis': bool(wrap_axis),
         'endpoint_method': 'slice_component_scan',
+        'planning_backend': 'cached_per_slice_component_tables_local_sdf_unordered',
     }
 
 
@@ -7807,8 +8281,15 @@ def subtract_volume_to_mmap(
     desc: str,
     *,
     workers: int = 1,
+    prefer_memory: bool = False,
+    reserve_bytes: int = 16 * GIB,
 ) -> np.ndarray:
-    """Write ``after AND NOT before`` into a disk-backed uint8 volume."""
+    """Write ``after AND NOT before`` into a uint8 workspace.
+
+    The historical name is retained for call-site stability.  NRRD delta layers use
+    ``prefer_memory=True`` so short-lived full-volume deltas can stay in RAM when
+    the SLURM allocation has headroom instead of appearing briefly in ``nrrd_work``.
+    """
     after_arr = np.asarray(after_mm)
     before_arr = np.asarray(before_mm)
     if tuple(int(x) for x in after_arr.shape) != tuple(int(x) for x in before_arr.shape):
@@ -7818,7 +8299,8 @@ def subtract_volume_to_mmap(
         dtype=np.uint8,
         path=out_path,
         desc=desc,
-        prefer_memory=False,
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
     )
     total = int(after_arr.shape[0]) if after_arr.ndim > 0 else 0
 
@@ -7846,6 +8328,8 @@ def project_view_volume_to_orthogonal_volume(
     desc: str,
     *,
     workers: int = 1,
+    prefer_memory: bool = False,
+    reserve_bytes: int = 16 * GIB,
 ) -> np.ndarray:
     """Project a view-native binary volume into orthogonal processing geometry (t,Y,X)."""
     t_dim = int(view.full_t) if int(view.full_t) > 0 else int(view_mask_mm.shape[0])
@@ -7858,7 +8342,8 @@ def project_view_volume_to_orthogonal_volume(
             radial_view=view,
             out_path=out_path,
             desc=desc,
-            prefer_memory=False,
+            prefer_memory=bool(prefer_memory),
+            reserve_bytes=int(reserve_bytes),
             workers=int(workers),
         )
 
@@ -7868,7 +8353,8 @@ def project_view_volume_to_orthogonal_volume(
             tilted_view=view,
             out_path=out_path,
             desc=desc,
-            prefer_memory=False,
+            prefer_memory=bool(prefer_memory),
+            reserve_bytes=int(reserve_bytes),
             workers=int(workers),
         )
 
@@ -7879,7 +8365,8 @@ def project_view_volume_to_orthogonal_volume(
             np.asarray(view_mask_mm, dtype=np.uint8),
             out_path,
             desc=desc,
-            prefer_memory=False,
+            prefer_memory=bool(prefer_memory),
+            reserve_bytes=int(reserve_bytes),
             workers=int(workers),
         )
 
@@ -7888,7 +8375,8 @@ def project_view_volume_to_orthogonal_volume(
         dtype=np.uint8,
         path=out_path,
         desc=desc,
-        prefer_memory=False,
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
     )
 
     if view.name == 'sagittal':
@@ -7962,12 +8450,15 @@ def materialize_nrrd_view_layer(
         raw_path = layer_dir / f'{key}.orthogonal.u8.dat'
         out_path = raw_path
 
+    transient_projection_in_memory = bool(raw_bbox_nrrd_layers_enabled())
     projected = project_view_volume_to_orthogonal_volume(
         view_volume_mm,
         view,
         raw_path,
         desc=f'NRRD layer {key}',
         workers=int(workers),
+        prefer_memory=bool(transient_projection_in_memory),
+        reserve_bytes=32 * GIB,
     )
     shape = tuple(int(x) for x in np.asarray(projected).shape)
     if raw_bbox_nrrd_layers_enabled():
@@ -7977,7 +8468,11 @@ def materialize_nrrd_view_layer(
             format_name=CVOL_FORMAT,
             desc=f'NRRD layer {key}',
             workers=int(workers),
-            extra_meta={'nrrd_layer_key': key, 'source_raw_path': str(raw_path)},
+            extra_meta={
+                'nrrd_layer_key': key,
+                'source_raw_path': str(raw_path),
+                'source_raw_workspace': 'in_memory_when_available' if bool(transient_projection_in_memory) else 'disk_backed',
+            },
         )
         segment_extent = _coerce_segment_extent(layer_stats.get('segment_extent_ijk')) or _nrrd_empty_segment_extent()
         segment_extent_source = 'raw_bbox_cvol_index'
@@ -8052,11 +8547,13 @@ def materialize_nrrd_global_layer(
         raw_path = layer_dir / f'{key}.orthogonal.u8.dat'
         out_path = raw_path
 
+    transient_copy_in_memory = bool(raw_bbox_nrrd_layers_enabled())
     copied = copy_workspace_array(
         np.asarray(volume_mm, dtype=np.uint8),
         raw_path,
         desc=f'NRRD layer {key}',
-        prefer_memory=False,
+        prefer_memory=bool(transient_copy_in_memory),
+        reserve_bytes=32 * GIB,
         workers=int(workers),
     )
     shape = tuple(int(x) for x in np.asarray(copied).shape)
@@ -8067,7 +8564,11 @@ def materialize_nrrd_global_layer(
             format_name=CVOL_FORMAT,
             desc=f'NRRD layer {key}',
             workers=int(workers),
-            extra_meta={'nrrd_layer_key': key, 'source_raw_path': str(raw_path)},
+            extra_meta={
+                'nrrd_layer_key': key,
+                'source_raw_path': str(raw_path),
+                'source_raw_workspace': 'in_memory_when_available' if bool(transient_copy_in_memory) else 'disk_backed',
+            },
         )
         segment_extent = _coerce_segment_extent(layer_stats.get('segment_extent_ijk')) or _nrrd_empty_segment_extent()
         segment_extent_source = 'raw_bbox_cvol_index'
@@ -8198,7 +8699,8 @@ def prepare_view_volume_after_fullframe(
                     baseline_native_volume,
                     before_pass_path,
                     desc=f'NRRD fullframe before interpolation pass {int(pass_idx)} {model_name}/{view.name}',
-                    prefer_memory=False,
+                    prefer_memory=True,
+                    reserve_bytes=32 * GIB,
                     workers=int(slice_workers),
                 )
 
@@ -8237,6 +8739,8 @@ def prepare_view_volume_after_fullframe(
                     delta_path,
                     desc=f'NRRD fullframe bridge delta pass {int(pass_idx)} {model_name}/{view.name}',
                     workers=int(slice_workers),
+                    prefer_memory=True,
+                    reserve_bytes=32 * GIB,
                 )
                 layer_ref = materialize_nrrd_view_layer(
                     bridge_delta_mm,
@@ -8864,7 +9368,8 @@ def gate_tile_volume_into_consolidated_parent(
                     dtype=np.uint8,
                     path=local_parent_mask_path,
                     desc=f'NRRD tile category parent-mask {task.model_name}/{task.view_name}/{task.tile_id}',
-                    prefer_memory=False,
+                    prefer_memory=True,
+                    reserve_bytes=32 * GIB,
                 )
             if tile_parent_bridge_accumulator_mm is not None:
                 local_parent_bridge_path = category_dir / 'accepted_by_parent_bridge.u8.dat'
@@ -8873,7 +9378,8 @@ def gate_tile_volume_into_consolidated_parent(
                     dtype=np.uint8,
                     path=local_parent_bridge_path,
                     desc=f'NRRD tile category parent-bridge {task.model_name}/{task.view_name}/{task.tile_id}',
-                    prefer_memory=False,
+                    prefer_memory=True,
+                    reserve_bytes=32 * GIB,
                 )
 
         gate_stats = gate_tile_volume_against_parent_inplace(
@@ -9039,7 +9545,8 @@ def finalize_consolidated_tile_volume_for_parent(
                     tile_accumulator_mm,
                     before_pass_path,
                     desc=f'NRRD tile before interpolation pass {int(pass_idx)} {model_name}/{view.name}',
-                    prefer_memory=False,
+                    prefer_memory=True,
+                    reserve_bytes=32 * GIB,
                     workers=int(slice_workers),
                 )
 
@@ -9078,6 +9585,8 @@ def finalize_consolidated_tile_volume_for_parent(
                     delta_path,
                     desc=f'NRRD tile bridge delta pass {int(pass_idx)} {model_name}/{view.name}',
                     workers=int(slice_workers),
+                    prefer_memory=True,
+                    reserve_bytes=32 * GIB,
                 )
                 layer_ref = materialize_nrrd_view_layer(
                     bridge_delta_mm,
@@ -9779,9 +10288,9 @@ def nrrd_stream_buffer_bytes(required_bytes: Optional[int] = None) -> int:
         target = int(mib) * 1024 * 1024
     else:
         min_mib = max(1, _env_int('YOLO_TTA_NRRD_STREAM_BUFFER_MIN_MIB', 4096))
-        reserve_gib = max(1.0, _env_float('YOLO_TTA_NRRD_STREAM_BUFFER_RESERVE_GIB', 192.0))
+        reserve_gib = max(1.0, _env_float('YOLO_TTA_NRRD_STREAM_BUFFER_RESERVE_GIB', 96.0))
         max_gib = max(1.0, _env_float('YOLO_TTA_NRRD_STREAM_BUFFER_MAX_GIB', 384.0))
-        fraction = min(0.90, max(0.01, _env_float('YOLO_TTA_NRRD_STREAM_BUFFER_FRACTION', 0.25)))
+        fraction = min(0.90, max(0.01, _env_float('YOLO_TTA_NRRD_STREAM_BUFFER_FRACTION', 0.35)))
         avail = int(available_anon_work_bytes())
         usable = max(0, int(avail) - int(reserve_gib * GIB))
         target = int(max(int(min_mib) * 1024 * 1024, min(float(max_gib) * float(GIB), float(usable) * float(fraction))))
@@ -9973,7 +10482,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.5-Pro_v12.2.2_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.5-Pro_v12.2.4_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -12107,10 +12616,11 @@ def main() -> None:
         '(layer,X,Y,t), with manifest JSON and SegmentN metadata for view, source, YOLO-vs-bridge, '
         'tile acceptance category, pre-smoothing union, smoothing pass results, and final output. '
         'The NRRD payload is pigz-streamed directly from backing layers without materializing the full 4D decomposed payload; '
-        'v12.2.2 uses a RAM-aware slab buffer that can span full (layer,X,Y) slices and multiple t slices when hundreds of GiB are free. '
+        'v12.2.2+ uses a RAM-aware slab buffer that can span full (layer,X,Y) slices and multiple t slices when hundreds of GiB are free. '
         'Tune YOLO_TTA_NRRD_STREAM_BUFFER_MIB, YOLO_TTA_NRRD_STREAM_BUFFER_FRACTION, YOLO_TTA_NRRD_STREAM_BUFFER_MAX_GIB, '
         'YOLO_TTA_NRRD_PAYLOAD_FILL_WORKERS, and YOLO_TTA_NRRD_PIGZ_LEVEL if needed. '
         'Segment extents are now recorded when each NRRD layer/cvol store is materialized and reused during final packaging; only missing metadata or disabled YOLO_TTA_NRRD_PRECOMPUTED_SEGMENT_EXTENTS falls back to a layer scan. Raw cvol/ctile backing paths cache chunks.bin in RAM by default via YOLO_TTA_NRRD_CACHE_RAW_BBOX_LAYERS_IN_RAM=1 for the payload stream. '
+        'Transient NRRD projection, before-pass, and bridge-delta workspaces prefer anonymous RAM and fall back to disk only when the workspace budget requires it. '
         f'Legacy single-volume NRRD writing is retained only for deprecated internal callers without layer refs; space={NRRD_SPACE}.'
     )
     if cpu_retina_masks_enabled():
@@ -12142,7 +12652,8 @@ def main() -> None:
         else:
             spec_notes.append('Gaussian smoothing disabled because the resolved sigma or pass count was not positive.')
     spec_notes.append(
-        'Interpolation endpoint discovery uses the v12.2.0 per-slice connected-component scan; '
+        'Interpolation endpoint discovery uses the v12.2.0 per-slice connected-component scan backed by cached per-slice component tables. '
+        'Projection candidate search runs on source-component local SDF crops, and variable-cost seed planning is consumed through a bounded unordered completion queue; '
         'skeletonization is never used for interpolation and runs only when --save_skeleton is requested. '
         'Optional skeleton output uses slice-parallel pore preconditioning plus component/chunk based 3D Lee thinning; '
         'overlay videos draw the skeleton as fully opaque red on top of the 50% blue mask overlay.'
@@ -12244,7 +12755,7 @@ def main() -> None:
         'YOLO result accumulation is bounded per in-memory prediction source by the number of pending CPU postprocess futures. ' 
         'worker_count=max(1, min(YOLO_TTA_PREDICT_POSTPROCESS_WORKERS, num_frames)) for the live v12 in-memory source path; ' 
         'pending_limit=cpu_mask_postprocess_pending_limit(worker_count, num_frames) = max(worker_count, min(num_frames, max(YOLO_TTA_CPU_MASK_PENDING_FRAMES, worker_count*2))). ' 
-        'The default YOLO_TTA_CPU_MASK_PENDING_FRAMES is 256; setting it to 0 permits buffering all frames for that prediction source. ' 
+        'The default YOLO_TTA_CPU_MASK_PENDING_FRAMES is 4096; setting it to 0 permits buffering all frames for that prediction source. ' 
         f'For this run, the largest active prediction source has {int(max_predict_video_frames)} frame(s), ' 
         f'example worker_count={int(example_cpu_mask_workers)}, pending_limit={int(example_cpu_mask_pending)}.'
     )
