@@ -2,15 +2,15 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v12.3.0_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.1-v12.2.6 performance patches and v12.3.0 interpolation isolation:
-  - this revision removes the dedicated single --angle GPU cleanup fast path: min_conf filtering, 2D hole filling, and min_radius filtering always run through the shared CPU cleanup path regardless of how many --angle values are provided
+This v12.2.8_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.1-v12.2.8 performance patches:
+  - v12.2.8 adds a dedicated single --angle streaming cleanup path: when exactly one augmentation angle is requested, min_conf filtering, 2D hole filling, and view-native per-slice min_radius filtering are applied as YOLO slices stream in; only true volume-level cleanup waits for the completed view volume
   - v12.2.1 restores the low-quality downbin/output helper path and NrrdLayerRef metadata class that were erroneously pruned in v12.2.0
   - v12.2.2 adds batched in-memory inference with synthetic final-batch padding for fixed-batch backends, larger RAM-aware NRRD streaming slabs, parallel low-quality NRRD scheduling, and a hybrid CPU/GPU radial/tilted backprojection queue
   - v12.2.4 aligns the script header with the filename, moves Radial before Tilted in scheduling order, plans interpolation from cached per-slice component tables and local SDF crops, consumes variable-cost seed plans through an unordered bounded completion queue, keeps transient NRRD projection/delta workspaces in RAM when possible, and raises the CPU mask postprocess pending cap to 4096
   - v12.2.5 improves CPU occupancy during interpolation labeling by compact-relabeling row blocks with per-slice local-to-compact lookup tables, prebuilding per-slice component tables through an unordered bounded queue, and testing endpoint continuation from component-table crops instead of full adjacent slices
   - v12.2.6 sizes per-parent full-frame interpolation seed planning for the expected live overlap, not the total number of active parent views, so compact relabel and endpoint scans can use most of the SLURM CPU allocation when interpolation is effectively serial or only two parents overlap
-  - v12.3.0 moves full-frame and consolidated-tile interpolation passes into a shared ProcessPoolExecutor by reopening disk-backed memmaps in worker processes, so GIL-heavy interpolation cannot starve prediction-volume builders in the main process
-  - v12.3.0 adds optional Numba no-GIL projection-candidate kernels for interpolation seed planning; set YOLO_TTA_INTERPOLATION_COMPILED_KERNELS=0 to force the Python fallback
+  - v12.2.7 moves full-frame and consolidated-tile interpolation passes into a shared ProcessPoolExecutor by reopening disk-backed memmaps in worker processes, so GIL-heavy interpolation cannot starve prediction-volume builders in the main process
+  - v12.2.7 adds optional Numba no-GIL projection-candidate kernels for interpolation seed planning; set YOLO_TTA_INTERPOLATION_COMPILED_KERNELS=0 to force the Python fallback
   - builds Transverse, optional generalized Tilted Views for Transverse/Sagittal/Coronal, independently optional upright Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - materializes YOLO-ready full-frame and tiled prediction volumes as in-memory slice arrays instead of writing prediction videos to the temp folder
   - feeds those volumes to Ultralytics through a custom in-memory loader with stream=True, while using Ultralytics native retina mask reconstruction
@@ -887,7 +887,7 @@ def _sanitize_filesystem_token(value: object) -> str:
 def interpolation_process_backend_enabled() -> bool:
     """Return True when interpolation passes should run in process workers.
 
-    The default is enabled for v12.3.0 because interpolation seed planning contains
+    The default is enabled for v12.2.7 because interpolation seed planning contains
     Python-heavy control flow.  Running the pass in a separate process prevents that
     GIL-bound work from starving prediction-volume builder threads in the main
     process.  Set YOLO_TTA_INTERPOLATION_PROCESS_BACKEND=0 to recover the legacy
@@ -4177,13 +4177,19 @@ def predict_source_and_accumulate(
     native_h: int,
     native_w: int,
     postprocess_workers: int = 1,
+    streaming_cleanup_enabled: bool = False,
+    streaming_cleanup_min_conf: float = 0.0,
+    streaming_cleanup_min_radius: float = 0.0,
 ) -> Dict[str, int]:
     """Run YOLO predict(stream=True) on an in-memory source and accumulate native masks.
 
     The predictor consumes ``InMemoryYoloVolumeSource`` instances in the v12 path,
     so the GPU no longer reads augmented FFV1 videos from scratch.  CPU-side result
     handling remains bounded by ``cpu_mask_postprocess_pending_limit`` and runs
-    behind the streamed GPU inference.
+    behind the streamed GPU inference.  When the v12.2.8 single-angle cleanup
+    path is enabled, slice-local filtering is appended to the same streamed
+    postprocess unit so a completed prediction slice is already cleaned before
+    the full view volume has finished inferencing.
     """
     ensure_yolo_ready_for_predict(model, cfg)
     if isinstance(source, InMemoryYoloVolumeSource):
@@ -4213,6 +4219,38 @@ def predict_source_and_accumulate(
 
     worker_count = max(1, min(int(postprocess_workers), int(num_frames)))
     pending_limit = cpu_mask_postprocess_pending_limit(worker_count, int(num_frames))
+    stream_cleanup = bool(streaming_cleanup_enabled)
+    stream_backend = cleanup_backend() if stream_cleanup else ''
+    stream_structure2 = np.ones((3, 3), dtype=bool) if stream_cleanup else None
+    stream_min_conf = float(streaming_cleanup_min_conf)
+    stream_min_radius = float(streaming_cleanup_min_radius)
+    stream_min_conf_u8 = int(min_conf_to_u8_threshold(stream_min_conf)) if stream_min_conf > 0.0 else 0
+
+    def _process_prediction_unit(idx_i: int, masks_obj: Optional[object], confs_arr: Optional[np.ndarray]) -> Tuple[int, int]:
+        pred_inc, frame_inc = _process_prediction_frame(
+            idx=int(idx_i),
+            masks_np=masks_obj,
+            confs_np=confs_arr,
+            out_size=out_size,
+            view_union_mm=view_union_mm,
+            view_confmap_mm=view_confmap_mm,
+            M_out_to_native=M_out_to_native,
+            native_h=native_h,
+            native_w=native_w,
+        )
+        if stream_cleanup:
+            cleaned_has_foreground = _cleanup_prediction_slice_inplace(
+                view_union_mm,
+                view_confmap_mm,
+                int(idx_i),
+                min_conf=stream_min_conf,
+                min_radius=stream_min_radius,
+                backend=stream_backend,
+                structure2=stream_structure2,
+                min_conf_u8=stream_min_conf_u8,
+            )
+            frame_inc = 1 if bool(cleaned_has_foreground) else 0
+        return int(pred_inc), int(frame_inc)
 
     if worker_count <= 1:
         for idx, r in enumerate(results):
@@ -4221,17 +4259,7 @@ def predict_source_and_accumulate(
                 # consume but discard those results so the predictor stream drains cleanly.
                 continue
             masks_np, confs_np = _extract_result_masks_and_confs(r)
-            pred_inc, frame_inc = _process_prediction_frame(
-                idx=idx,
-                masks_np=masks_np,
-                confs_np=confs_np,
-                out_size=out_size,
-                view_union_mm=view_union_mm,
-                view_confmap_mm=view_confmap_mm,
-                M_out_to_native=M_out_to_native,
-                native_h=native_h,
-                native_w=native_w,
-            )
+            pred_inc, frame_inc = _process_prediction_unit(int(idx), masks_np, confs_np)
             prediction_count += int(pred_inc)
             frames_with_predictions += int(frame_inc)
     else:
@@ -4243,18 +4271,7 @@ def predict_source_and_accumulate(
                     continue
 
                 masks_np, confs_np = _extract_result_masks_and_confs(r)
-                pending.append(executor.submit(
-                    _process_prediction_frame,
-                    idx,
-                    masks_np,
-                    confs_np,
-                    out_size,
-                    view_union_mm,
-                    view_confmap_mm,
-                    M_out_to_native,
-                    native_h,
-                    native_w,
-                ))
+                pending.append(executor.submit(_process_prediction_unit, int(idx), masks_np, confs_np))
                 if len(pending) >= pending_limit:
                     fut = pending.pop(0)
                     pred_inc, frame_inc = fut.result()
@@ -4290,6 +4307,9 @@ def predict_in_memory_volume_and_accumulate(
     native_h: int,
     native_w: int,
     postprocess_workers: int = 1,
+    streaming_cleanup_enabled: bool = False,
+    streaming_cleanup_min_conf: float = 0.0,
+    streaming_cleanup_min_radius: float = 0.0,
 ) -> Dict[str, int]:
     source = make_in_memory_yolo_source(
         prediction_volume.array,
@@ -4310,6 +4330,9 @@ def predict_in_memory_volume_and_accumulate(
         native_h=int(native_h),
         native_w=int(native_w),
         postprocess_workers=int(postprocess_workers),
+        streaming_cleanup_enabled=bool(streaming_cleanup_enabled),
+        streaming_cleanup_min_conf=float(streaming_cleanup_min_conf),
+        streaming_cleanup_min_radius=float(streaming_cleanup_min_radius),
     )
 
 
@@ -4497,6 +4520,98 @@ def _filter_connected_components_by_min_conf_scipy(
 
 
 
+def _view_native_slice_min_radius(view: ViewInfo, min_radius: float) -> float:
+    """Return the part of --min_radius that is valid for independent view-native slices."""
+    if float(min_radius) <= 0.0:
+        return 0.0
+    if view.name == 'transverse' or (is_tilted_view(view) and tilted_base_view_name(view) == 'transverse'):
+        return float(min_radius)
+    return 0.0
+
+
+def _view_needs_deferred_volume_cleanup_after_streaming(view: ViewInfo, min_radius: float) -> bool:
+    """Return True when streaming slice cleanup cannot finish all view cleanup semantics."""
+    return bool(view.name in ('sagittal', 'coronal') and float(min_radius) > 0.0)
+
+
+def _cleanup_prediction_slice_inplace(
+    mask_mm: np.ndarray,
+    confmap_mm: Optional[np.ndarray],
+    idx: int,
+    *,
+    min_conf: float = 0.0,
+    min_radius: float = 0.0,
+    backend: Optional[str] = None,
+    structure2: Optional[np.ndarray] = None,
+    min_conf_u8: Optional[int] = None,
+) -> bool:
+    """Clean one accumulated native-view prediction slice in place.
+
+    This is the unit used by the v12.2.8 single-angle streaming path and by the
+    older whole-volume cleanup pass. It applies only slice-local semantics:
+    confidence gating, 2D hole filling, and view-native 2D min-radius filtering.
+    Cleanup that depends on a transposed/volume-level view, such as Sagittal or
+    Coronal transverse-plane min-radius filtering, is deliberately deferred until
+    the full view volume exists.
+    """
+    idx_i = int(idx)
+    backend_norm = cleanup_backend() if backend is None else str(backend)
+    structure = np.ones((3, 3), dtype=bool) if structure2 is None else structure2
+    min_conf_u8_i = (
+        int(min_conf_to_u8_threshold(float(min_conf)))
+        if min_conf_u8 is None and float(min_conf) > 0.0
+        else int(min_conf_u8 or 0)
+    )
+
+    mask_slice = np.asarray(mask_mm[idx_i], dtype=bool)
+    conf_slice = None if confmap_mm is None else np.asarray(confmap_mm[idx_i], dtype=np.uint8)
+
+    if np.any(mask_slice) and conf_slice is not None and float(min_conf) > 0.0:
+        if backend_norm == 'opencv':
+            mask_slice = _filter_connected_components_by_min_conf_opencv(
+                mask_slice,
+                conf_slice,
+                int(min_conf_u8_i),
+            )
+        else:
+            mask_slice = _filter_connected_components_by_min_conf_scipy(
+                mask_slice,
+                conf_slice,
+                int(min_conf_u8_i),
+                structure,
+            )
+
+    if np.any(mask_slice):
+        if backend_norm == 'opencv':
+            mask_slice = _fill_holes_2d_opencv(mask_slice)
+        else:
+            mask_slice = _fill_holes_2d_scipy(mask_slice)
+
+    if np.any(mask_slice) and float(min_radius) > 0.0:
+        if backend_norm == 'opencv':
+            mask_slice = _filter_connected_components_by_min_radius_opencv(
+                mask_slice,
+                float(min_radius),
+            )
+        else:
+            mask_slice = _filter_connected_components_by_min_radius_scipy(
+                mask_slice,
+                structure,
+                float(min_radius),
+            )
+
+    has_foreground = bool(np.any(mask_slice))
+    mask_mm[idx_i, :, :] = mask_slice.astype(np.uint8, copy=False)
+    if conf_slice is not None:
+        if has_foreground:
+            conf_slice[~mask_slice] = np.uint8(0)
+        else:
+            conf_slice.fill(np.uint8(0))
+        confmap_mm[idx_i, :, :] = conf_slice.astype(np.uint8, copy=False)
+    return bool(has_foreground)
+
+
+
 
 
 
@@ -4549,50 +4664,16 @@ def fused_slice_cleanup_inplace(
     backend = cleanup_backend()
 
     def _process(i: int) -> None:
-        mask_slice = np.asarray(mask_mm[int(i)], dtype=bool)
-        conf_slice = None if confmap_mm is None else np.asarray(confmap_mm[int(i)], dtype=np.uint8)
-
-        if np.any(mask_slice) and conf_slice is not None and float(min_conf) > 0.0:
-            if backend == 'opencv':
-                mask_slice = _filter_connected_components_by_min_conf_opencv(
-                    mask_slice,
-                    conf_slice,
-                    int(min_conf_u8),
-                )
-            else:
-                mask_slice = _filter_connected_components_by_min_conf_scipy(
-                    mask_slice,
-                    conf_slice,
-                    int(min_conf_u8),
-                    structure2,
-                )
-
-        if np.any(mask_slice):
-            if backend == 'opencv':
-                mask_slice = _fill_holes_2d_opencv(mask_slice)
-            else:
-                mask_slice = _fill_holes_2d_scipy(mask_slice)
-
-        if np.any(mask_slice) and float(min_radius) > 0.0:
-            if backend == 'opencv':
-                mask_slice = _filter_connected_components_by_min_radius_opencv(
-                    mask_slice,
-                    float(min_radius),
-                )
-            else:
-                mask_slice = _filter_connected_components_by_min_radius_scipy(
-                    mask_slice,
-                    structure2,
-                    float(min_radius),
-                )
-
-        mask_mm[int(i), :, :] = mask_slice.astype(np.uint8, copy=False)
-        if conf_slice is not None:
-            if np.any(mask_slice):
-                conf_slice[~mask_slice] = np.uint8(0)
-            else:
-                conf_slice.fill(np.uint8(0))
-            confmap_mm[int(i), :, :] = conf_slice.astype(np.uint8, copy=False)
+        _cleanup_prediction_slice_inplace(
+            mask_mm,
+            confmap_mm,
+            int(i),
+            min_conf=float(min_conf),
+            min_radius=float(min_radius),
+            backend=backend,
+            structure2=structure2,
+            min_conf_u8=int(min_conf_u8),
+        )
 
     parallel_for_indices_chunked(
         num_slices,
@@ -4614,10 +4695,25 @@ def cleanup_view_volume_after_prediction_inplace(
     min_radius: float,
     *,
     workers: int = 1,
+    precleaned_slice_cleanup: bool = False,
 ) -> None:
-    native_min_radius = 0.0
-    if view.name == 'transverse' or (is_tilted_view(view) and tilted_base_view_name(view) == 'transverse'):
-        native_min_radius = float(min_radius)
+    native_min_radius = _view_native_slice_min_radius(view, float(min_radius))
+
+    if bool(precleaned_slice_cleanup):
+        # v12.2.8 single-angle inference has already applied every slice-local cleanup
+        # operation as results streamed in. Only cleanup whose semantics require the
+        # completed view volume remains here.
+        if _view_needs_deferred_volume_cleanup_after_streaming(view, float(min_radius)):
+            apply_view_min_radius_filter_inplace(
+                mask_mm,
+                view,
+                float(min_radius),
+                workers=int(workers),
+            )
+        flush_array(mask_mm)
+        if confmap_mm is not None:
+            flush_array(confmap_mm)
+        return
 
     effective_confmap_mm = confmap_mm if float(min_conf) > 0.0 else None
 
@@ -4630,7 +4726,7 @@ def cleanup_view_volume_after_prediction_inplace(
         desc=f'Fused cleanup ({view.name})',
     )
 
-    if view.name in ('sagittal', 'coronal') and float(min_radius) > 0.0:
+    if _view_needs_deferred_volume_cleanup_after_streaming(view, float(min_radius)):
         apply_view_min_radius_filter_inplace(
             mask_mm,
             view,
@@ -8272,6 +8368,7 @@ class TilePostprocessTask:
     tile_confmap_mm: Optional[np.ndarray]
     tile_mask_path: Path
     tile_confmap_path: Optional[Path]
+    precleaned_slice_cleanup: bool = False
 
 
 @dataclass
@@ -9351,6 +9448,7 @@ def prepare_view_volume_after_fullframe(
     slice_workers: int,
     interpolation_task_workers: int,
     nrrd_layers_enabled: bool = False,
+    precleaned_slice_cleanup: bool = False,
 ) -> PreparedViewResult:
     baseline_native_volume = union_mm
     nrrd_layers: List[NrrdLayerRef] = []
@@ -9366,6 +9464,7 @@ def prepare_view_volume_after_fullframe(
         float(min_conf),
         float(min_radius),
         workers=int(slice_workers),
+        precleaned_slice_cleanup=bool(precleaned_slice_cleanup),
     )
 
     close_memmap_array(confmap_mm)
@@ -9809,6 +9908,7 @@ def postprocess_tile_volume_after_inference(
         float(min_conf),
         float(min_radius),
         workers=int(slice_workers),
+        precleaned_slice_cleanup=bool(task.precleaned_slice_cleanup),
     )
 
     close_memmap_array(task.tile_confmap_mm)
@@ -11202,7 +11302,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.5-Pro_v12.3.0_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.5-Pro_v12.2.8_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -13128,6 +13228,9 @@ def main() -> None:
     model_paths = [model_path_resolved]
 
     angles = _parse_angles(args.angle) or [0.0, 120.0, 240.0]
+    single_angle_streaming_cleanup_active = bool(
+        len(angles) == 1 and _env_flag('YOLO_TTA_SINGLE_ANGLE_STREAMING_CLEANUP', True)
+    )
     if int(args.batch) < 1:
         raise ValueError('--batch must be >= 1')
     set_inference_batch_size(int(args.batch))
@@ -13283,6 +13386,14 @@ def main() -> None:
     inference_views = [v for v in views if not (transverse_inference_disabled and v.name == 'transverse')]
     interpolating_views = [v for v in inference_views if _view_uses_interpolation(v, int(args.interpolate))]
     spec_notes: List[str] = []
+    if bool(single_angle_streaming_cleanup_active):
+        spec_notes.append(
+            'v12.2.8 single-angle streaming cleanup is active: exactly one --angle value was supplied, so YOLO result slices are confidence-filtered, 2D-hole-filled, and view-native min_radius-filtered as they stream in; only Sagittal/Coronal transverse-plane min_radius cleanup waits for the completed view volume before interpolation.'
+        )
+    else:
+        spec_notes.append(
+            'v12.2.8 single-angle streaming cleanup is inactive because multiple --angle values are being accumulated or YOLO_TTA_SINGLE_ANGLE_STREAMING_CLEANUP=0; view cleanup therefore runs after all angle volumes for a view have accumulated.'
+        )
     spec_notes.append('Input video channel handling: RGB/YUV inputs are flattened to one gray/luma channel during decode; single-channel Y/gray inputs remain single-channel, and YOLO receives H×W×1 frames.')
     spec_notes.append('Voxel-volume reporting, when enabled, counts the final binary mask after restoration to native input geometry, not imgsz or cubic working geometry.')
     spec_notes.append('v12.2.0 tilt-angle validation follows the specification: values must be greater than 0 and less than or equal to 45 degrees.')
@@ -13530,12 +13641,12 @@ def main() -> None:
         'YOLO_TTA_INTERPOLATION_COMPACT_RELABEL_ROWS, and YOLO_TTA_INTERPOLATION_CONCURRENT_PARENTS if needed.'
     )
     spec_notes.append(
-        'v12.3.0 interpolation process isolation active by default: full-frame and consolidated-tile interpolation passes reopen uint8 mask volumes from disk-backed memmaps in a ProcessPoolExecutor worker and return only small stats. '
+        'v12.2.7 interpolation process isolation active by default: full-frame and consolidated-tile interpolation passes reopen uint8 mask volumes from disk-backed memmaps in a ProcessPoolExecutor worker and return only small stats. '
         f'Process backend enabled={bool(interpolation_process_backend_active)}, process_workers={int(interpolation_process_workers)}, start_method={interpolation_process_start_method()}, '
         f'fallback_on_worker_failure={bool(interpolation_process_fallback_enabled())}. Anonymous in-memory mask arrays are copied once to a process memmap before interpolation, avoiding multi-GiB pickle payloads.'
     )
     spec_notes.append(
-        f'v12.3.0 compiled interpolation kernels: {interpolation_compiled_kernels_status()}. '
+        f'v12.2.7 compiled interpolation kernels: {interpolation_compiled_kernels_status()}. '
         'The compiled kernel accelerates projection-candidate discovery in seed planning with Numba nogil=True when numba is installed; the exact Python candidate search remains the fallback.'
     )
 
@@ -13849,6 +13960,7 @@ def main() -> None:
             slice_workers=int(slice_postprocess_workers),
             interpolation_task_workers=int(parent_interpolation_task_workers),
             nrrd_layers_enabled=bool(nrrd_layers_needed),
+            precleaned_slice_cleanup=bool(single_angle_streaming_cleanup_active),
         )
         view_processing_futures[fut] = key
 
@@ -14228,6 +14340,9 @@ def main() -> None:
                             native_h=view.src_h,
                             native_w=view.src_w,
                             postprocess_workers=predict_postprocess_workers,
+                            streaming_cleanup_enabled=bool(single_angle_streaming_cleanup_active),
+                            streaming_cleanup_min_conf=float(args.min_conf),
+                            streaming_cleanup_min_radius=_view_native_slice_min_radius(view, float(args.min_radius)),
                         )
                         if offload_between_jobs_enabled():
                             offload_yolo_from_gpu(yolo)
@@ -14289,6 +14404,9 @@ def main() -> None:
                         native_h=view.src_h,
                         native_w=view.src_w,
                         postprocess_workers=predict_postprocess_workers,
+                        streaming_cleanup_enabled=bool(single_angle_streaming_cleanup_active),
+                        streaming_cleanup_min_conf=float(args.min_conf),
+                        streaming_cleanup_min_radius=_view_native_slice_min_radius(view, float(args.min_radius)),
                     )
                 finally:
                     close_prediction_volume_ref(prediction_ref, keep_temp=bool(keep_temp_artifacts))
@@ -14322,6 +14440,7 @@ def main() -> None:
                     tile_confmap_mm=tile_conf_mm,
                     tile_mask_path=tile_mask_path,
                     tile_confmap_path=tile_conf_store_path,
+                    precleaned_slice_cleanup=bool(single_angle_streaming_cleanup_active),
                 )
                 fut = tile_postprocess_executor.submit(
                     postprocess_tile_volume_after_inference,
