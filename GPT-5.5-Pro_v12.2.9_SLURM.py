@@ -2,8 +2,9 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v12.2.8_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.1-v12.2.8 performance patches:
+This v12.2.9_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.1-v12.2.9 performance patches:
   - v12.2.8 adds a dedicated single --angle streaming cleanup path: when exactly one augmentation angle is requested, min_conf filtering, 2D hole filling, and view-native per-slice min_radius filtering are applied as YOLO slices stream in; only true volume-level cleanup waits for the completed view volume
+  - v12.2.9 keeps the GPU-fed queue hot by sizing prediction-volume builders to the active prefetch window, skipping scratch memmap flushes on the prediction hot path by default, and allowing single-angle CPU result accumulation to finish behind the next prediction volume
   - v12.2.1 restores the low-quality downbin/output helper path and NrrdLayerRef metadata class that were erroneously pruned in v12.2.0
   - v12.2.2 adds batched in-memory inference with synthetic final-batch padding for fixed-batch backends, larger RAM-aware NRRD streaming slabs, parallel low-quality NRRD scheduling, and a hybrid CPU/GPU radial/tilted backprojection queue
   - v12.2.4 aligns the script header with the filename, moves Radial before Tilted in scheduling order, plans interpolation from cached per-slice component tables and local SDF crops, consumes variable-cost seed plans through an unordered bounded completion queue, keeps transient NRRD projection/delta workspaces in RAM when possible, and raises the CPU mask postprocess pending cap to 4096
@@ -13,7 +14,7 @@ This v12.2.8_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.
   - v12.2.7 adds optional Numba no-GIL projection-candidate kernels for interpolation seed planning; set YOLO_TTA_INTERPOLATION_COMPILED_KERNELS=0 to force the Python fallback
   - builds Transverse, optional generalized Tilted Views for Transverse/Sagittal/Coronal, independently optional upright Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - materializes YOLO-ready full-frame and tiled prediction volumes as in-memory slice arrays instead of writing prediction videos to the temp folder
-  - feeds those volumes to Ultralytics through a custom in-memory loader with stream=True, while using Ultralytics native retina mask reconstruction
+  - feeds those volumes to Ultralytics through a custom in-memory loader with stream=True, while v12.2.9 defaults to deferred CPU retina-mask reconstruction so large GPU mask tensors are not copied on the scheduler/model-stream thread
   - bounds prediction-volume creation to the current inference volume plus four queued volumes by default, preserving the priority order while preventing unbounded RAM growth
   - stages cleaned tiled masks into one parent-view canvas per tile-size/stride set, gates each consolidated canvas
     at the connected-component level against frozen parent full-frame support, then interpolates the accepted tiled volume once per parent view
@@ -23,7 +24,7 @@ This v12.2.8_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.
   - fuses per-slice cleanup work where the slice orientation matches the required semantics
     (notably min_conf filtering, 2D hole filling, and min_radius where applicable)
   - overlaps GPU inference with CPU-side view interpolation, consolidated-tile interpolation, and output writing
-  - uses Ultralytics retina_masks=True native mask upsampling for live inference; the previous custom CPU retina reconstruction helpers are retained as active, opt-in compatibility code but are not the default path
+  - defaults to deferred CPU retina-mask reconstruction for live inference; set YOLO_TTA_CPU_RETINA_MASKS=0 to restore Ultralytics native retina_masks=True compatibility mode
   - reuses a native radial frame cache during dense tiled rendering so radial tiles do not recompute
     the same Lanczos-3 slices for every tile location
   - inverse-maps predictions only into each generated prediction volume's native view space, keeps Radial and Tilted View results view-native through cleanup/interpolation, then backprojects them after per-view processing
@@ -408,7 +409,7 @@ def resolve_parent_interpolation_worker_allocation(
     """
     budget = max(1, int(worker_budget))
     parent_workers = max(1, int(parent_postprocess_workers))
-    default_overlap = max(1, min(2, parent_workers))
+    default_overlap = max(1, min(1, parent_workers))
     overlap = max(
         1,
         min(
@@ -868,6 +869,38 @@ def close_memmap_array(arr: object) -> None:
                 mmap_obj.close()
     except Exception:
         pass
+
+
+def close_memmap_array_without_flush(arr: object) -> None:
+    """Close a scratch memmap mapping without forcing dirty pages to storage."""
+    if arr is None:
+        return
+    try:
+        if isinstance(arr, np.memmap):
+            mmap_obj = getattr(arr, '_mmap', None)
+            if mmap_obj is not None:
+                mmap_obj.close()
+            return
+    except Exception:
+        pass
+    try:
+        base = getattr(arr, 'base', None)
+        if isinstance(base, np.memmap):
+            mmap_obj = getattr(base, '_mmap', None)
+            if mmap_obj is not None:
+                mmap_obj.close()
+    except Exception:
+        pass
+
+
+def prediction_volume_build_flush_enabled() -> bool:
+    """Return True to force flushing YOLO input volumes before inference."""
+    return _env_flag('YOLO_TTA_FLUSH_PREDICTION_VOLUME_ON_BUILD', False)
+
+
+def prediction_hot_path_flush_enabled() -> bool:
+    """Return True to force per-source prediction accumulation memmap flushes."""
+    return _env_flag('YOLO_TTA_PREDICT_FLUSH_EACH_VOLUME', False)
 
 
 # --------------------------
@@ -2524,12 +2557,20 @@ class PredictionVolumeRef:
 
 
 def close_prediction_volume_ref(ref: Optional[PredictionVolumeRef], *, keep_temp: bool = False) -> None:
-    """Release one materialized prediction volume and remove any fallback backing file."""
+    """Release one materialized prediction volume and remove any fallback backing file.
+
+    Prediction volumes are scratch inputs consumed by this process. When the backing
+    file is about to be deleted, forcing a full memmap flush can stall the scheduler
+    after every inference volume. Flush only when temp artifacts are being kept.
+    """
     if ref is None:
         return
     arr = ref.array
     path = ref.path
-    close_memmap_array(arr)
+    if bool(keep_temp):
+        close_memmap_array(arr)
+    else:
+        close_memmap_array_without_flush(arr)
     if not bool(keep_temp) and path is not None:
         try:
             Path(path).unlink(missing_ok=True)
@@ -3111,7 +3152,8 @@ def _materialize_prediction_volume_from_renderer(
         show_progress=bool(show_progress),
         chunk_size=chunk_size,
     )
-    flush_array(pred_volume)
+    if prediction_volume_build_flush_enabled():
+        flush_array(pred_volume)
     return PredictionVolumeRef(
         array=pred_volume,
         path=out_path if isinstance(pred_volume, np.memmap) else None,
@@ -3498,6 +3540,64 @@ class PredictConfig:
     batch: int = 1
 
 
+def async_predict_postprocess_enabled() -> bool:
+    """Return True when single-angle prediction CPU tails may run behind the GPU."""
+    return _env_flag('YOLO_TTA_ASYNC_PREDICT_POSTPROCESS', True)
+
+
+def async_predict_join_workers(default_value: int) -> int:
+    return max(1, _env_int('YOLO_TTA_ASYNC_PREDICT_JOIN_WORKERS', max(1, int(default_value))))
+
+
+def async_predict_pending_frame_limit(num_frames: int) -> int:
+    """Optional cap for queued async result-worker futures per source.
+
+    The default 0 means source-sized buffering: the GPU-facing iterator will not
+    intentionally wait for CPU result workers while a prediction volume streams.
+    Set YOLO_TTA_ASYNC_PREDICT_PENDING_FRAMES to a positive value to reduce
+    transient CPU/GPU result memory at the cost of some continuity.
+    """
+    requested = _env_int('YOLO_TTA_ASYNC_PREDICT_PENDING_FRAMES', 0)
+    if int(requested) <= 0:
+        return 0
+    return max(1, min(max(1, int(num_frames)), int(requested)))
+
+
+@dataclass
+class PredictionAccumulationHandle:
+    """Background CPU accumulation tail for one streamed prediction source."""
+    source_label: str
+    futures: List[Future]
+    view_union_mm: np.ndarray
+    view_confmap_mm: Optional[np.ndarray]
+    submitted_frames: int = 0
+    synthetic_discarded: int = 0
+    precompleted_prediction_count: int = 0
+    precompleted_frames_with_predictions: int = 0
+    pending_limit: int = 0
+
+    def wait(self) -> Dict[str, int]:
+        prediction_count = int(self.precompleted_prediction_count)
+        frames_with_predictions = int(self.precompleted_frames_with_predictions)
+        try:
+            for fut in as_completed(list(self.futures)):
+                pred_inc, frame_inc = fut.result()
+                prediction_count += int(pred_inc)
+                frames_with_predictions += int(frame_inc)
+        finally:
+            if prediction_hot_path_flush_enabled():
+                if self.view_confmap_mm is not None:
+                    flush_array(self.view_confmap_mm)
+                flush_array(self.view_union_mm)
+        return {
+            'prediction_count': int(prediction_count),
+            'frames_with_predictions': int(frames_with_predictions),
+            'submitted_frames': int(self.submitted_frames),
+            'synthetic_discarded': int(self.synthetic_discarded),
+            'async_accumulation': 1,
+        }
+
+
 DEFAULT_GAUSSIAN_SMOOTHING_SIGMA = 3.0
 DEFAULT_GAUSSIAN_SMOOTHING_PASSES = 1
 
@@ -3556,20 +3656,32 @@ class CpuRetinaMaskPayload:
     frame_path: str = ''
 
 
+
+@dataclass(frozen=True)
+class DeferredCpuRetinaMaskPayload:
+    """Compact GPU tensors captured from Ultralytics and copied in result-worker threads."""
+
+    pred: object
+    proto: object
+    orig_shape: Tuple[int, int]
+    img_shape: Tuple[int, int]
+    frame_path: str = ''
+
+
 _ULTRALYTICS_CPU_RETINA_PATCHED = False
 _ULTRALYTICS_ORIGINAL_SEG_CONSTRUCT_RESULT: Optional[object] = None
 
 
 def cpu_retina_masks_enabled() -> bool:
-    """Opt-in compatibility path for the retained custom CPU retina reconstruction helper.
+    """Use deferred CPU retina reconstruction as the default live-inference result path.
 
-    v12.2.0 live inference defaults back to Ultralytics ``retina_masks=True``.
-    The helper is intentionally retained and reachable through this environment flag
-    so maintenance-pruning tools do not treat it as abandoned code.
+    Native ``retina_masks=True`` can hand large GPU mask tensors to Python result
+    handling. v12.2.9 instead captures compact mask coefficients/protos and
+    reconstructs bbox-local masks in prediction-result workers. Set
+    ``YOLO_TTA_CPU_RETINA_MASKS=0`` to restore Ultralytics native-retina
+    compatibility mode.
     """
-    # ACTIVE_RETAINED_CODE_MARKER(v12.2.0): custom CPU retina reconstruction is retained
-    # as an explicit compatibility/debug path; normal inference uses Ultralytics native retina masks.
-    return _env_flag('YOLO_TTA_CPU_RETINA_MASKS', False)
+    return _env_flag('YOLO_TTA_CPU_RETINA_MASKS', True)
 
 
 def cpu_retina_roi_only_enabled() -> bool:
@@ -3580,6 +3692,20 @@ def cpu_retina_roi_only_enabled() -> bool:
 def cpu_retina_block_detections() -> int:
     """Number of mask logits to reconstruct per CPU matrix-multiply block."""
     return max(1, _env_int('YOLO_TTA_CPU_RETINA_BLOCK_DETECTIONS', 8))
+
+
+
+
+def cpu_retina_deferred_payload_enabled() -> bool:
+    """Defer compact pred/proto CPU copies from Ultralytics construct_result to result workers."""
+    if os.environ.get('YOLO_TTA_CPU_RETINA_DEFER_GPU_COPY') is not None:
+        return _env_flag('YOLO_TTA_CPU_RETINA_DEFER_GPU_COPY', True)
+    return _env_flag('YOLO_TTA_CPU_RETINA_DEFERRED_PAYLOAD', True)
+
+
+def predict_async_gpu_copy_enabled() -> bool:
+    """Use worker-owned CUDA streams and pinned CPU buffers for tensor copies when possible."""
+    return _env_flag('YOLO_TTA_PREDICT_ASYNC_GPU_COPY', True)
 
 
 def cpu_mask_postprocess_pending_limit(worker_count: int, num_frames: int) -> int:
@@ -3903,8 +4029,42 @@ def _accumulate_cpu_retina_payload_to_prediction_frame(
     return frame_union, frame_confmap, int(kept_instances)
 
 
+def _realize_deferred_cpu_retina_payload(payload: DeferredCpuRetinaMaskPayload) -> CpuRetinaMaskPayload:
+    """Copy compact segmentation tensors to CPU and build a CPU-retina payload."""
+    pred_cpu = _as_numpy_float32_cpu(payload.pred)
+    if pred_cpu.ndim != 2 or int(pred_cpu.shape[0]) <= 0:
+        return CpuRetinaMaskPayload(
+            proto=np.zeros((0, 0, 0), dtype=np.float32),
+            coeffs=np.zeros((0, 0), dtype=np.float32),
+            boxes_xyxy=np.zeros((0, 4), dtype=np.float32),
+            confs=np.zeros((0,), dtype=np.float32),
+            orig_shape=(int(payload.orig_shape[0]), int(payload.orig_shape[1])),
+            img_shape=(int(payload.img_shape[0]), int(payload.img_shape[1])),
+            frame_path=str(payload.frame_path),
+        )
+
+    boxes_scaled = _scale_boxes_np(payload.img_shape, pred_cpu[:, :4], payload.orig_shape)
+    pred_cpu[:, :4] = boxes_scaled
+    proto_cpu = _as_numpy_float32_cpu(payload.proto)
+    if proto_cpu.ndim == 4 and int(proto_cpu.shape[0]) == 1:
+        proto_cpu = proto_cpu[0]
+    if proto_cpu.ndim != 3:
+        proto_cpu = np.zeros((0, 0, 0), dtype=np.float32)
+    coeffs = pred_cpu[:, 6:] if int(pred_cpu.shape[1]) > 6 else np.zeros((int(pred_cpu.shape[0]), 0), dtype=np.float32)
+    confs = pred_cpu[:, 4] if int(pred_cpu.shape[1]) > 4 else np.zeros((int(pred_cpu.shape[0]),), dtype=np.float32)
+    return CpuRetinaMaskPayload(
+        proto=np.ascontiguousarray(proto_cpu, dtype=np.float32),
+        coeffs=np.ascontiguousarray(coeffs, dtype=np.float32),
+        boxes_xyxy=np.ascontiguousarray(pred_cpu[:, :4], dtype=np.float32),
+        confs=np.ascontiguousarray(confs, dtype=np.float32),
+        orig_shape=(int(payload.orig_shape[0]), int(payload.orig_shape[1])),
+        img_shape=(int(payload.img_shape[0]), int(payload.img_shape[1])),
+        frame_path=str(payload.frame_path),
+    )
+
+
 def ensure_cpu_retina_mask_predictor_patch() -> bool:
-    """Patch Ultralytics segmentation postprocess to return CPU retina payloads, not GPU masks."""
+    """Patch Ultralytics segmentation postprocess to return CPU-retina payloads, not GPU masks."""
     global _ULTRALYTICS_CPU_RETINA_PATCHED, _ULTRALYTICS_ORIGINAL_SEG_CONSTRUCT_RESULT
 
     if not cpu_retina_masks_enabled():
@@ -3935,45 +4095,52 @@ def ensure_cpu_retina_mask_predictor_patch() -> bool:
         except Exception:
             orig_shape = (int(img_shape[0]), int(img_shape[1]))
 
-        pred_cpu = _as_numpy_float32_cpu(pred)
-        if pred_cpu.ndim != 2 or int(pred_cpu.shape[0]) <= 0:
-            empty_boxes = np.zeros((0, 6), dtype=np.float32)
-            return Results(orig_img, path=img_path, names=self.model.names, boxes=empty_boxes, masks=None)
+        if bool(cpu_retina_deferred_payload_enabled()):
+            # Keep the Results object lightweight; compact pred/proto tensors are realized in
+            # the prediction-result worker, not inside Ultralytics construct_result.
+            result = Results(orig_img, path=img_path, names=self.model.names, boxes=None, masks=None)
+            setattr(result, '_tta_deferred_cpu_retina_payload', DeferredCpuRetinaMaskPayload(
+                pred=pred,
+                proto=proto,
+                orig_shape=(int(orig_shape[0]), int(orig_shape[1])),
+                img_shape=(int(img_shape[0]), int(img_shape[1])),
+                frame_path=str(img_path),
+            ))
+            return result
 
-        boxes_scaled = _scale_boxes_np(img_shape, pred_cpu[:, :4], orig_shape)
-        pred_cpu[:, :4] = boxes_scaled
-        proto_cpu = _as_numpy_float32_cpu(proto)
-
-        payload = CpuRetinaMaskPayload(
-            proto=proto_cpu,
-            coeffs=np.ascontiguousarray(pred_cpu[:, 6:], dtype=np.float32),
-            boxes_xyxy=np.ascontiguousarray(pred_cpu[:, :4], dtype=np.float32),
-            confs=np.ascontiguousarray(pred_cpu[:, 4], dtype=np.float32),
+        payload = _realize_deferred_cpu_retina_payload(DeferredCpuRetinaMaskPayload(
+            pred=pred,
+            proto=proto,
             orig_shape=(int(orig_shape[0]), int(orig_shape[1])),
             img_shape=(int(img_shape[0]), int(img_shape[1])),
             frame_path=str(img_path),
-        )
-        result = Results(
-            orig_img,
-            path=img_path,
-            names=self.model.names,
-            boxes=np.ascontiguousarray(pred_cpu[:, :6], dtype=np.float32),
-            masks=None,
-        )
+        ))
+        boxes_for_result = np.zeros((0, 6), dtype=np.float32)
+        if payload.confs.size > 0 and payload.boxes_xyxy.shape[0] == payload.confs.shape[0]:
+            boxes_for_result = np.concatenate(
+                [payload.boxes_xyxy, payload.confs[:, None], np.zeros((payload.confs.shape[0], 1), dtype=np.float32)],
+                axis=1,
+            ).astype(np.float32, copy=False)
+        result = Results(orig_img, path=img_path, names=self.model.names, boxes=boxes_for_result, masks=None)
         setattr(result, '_tta_cpu_retina_payload', payload)
         return result
 
     SegmentationPredictor.construct_result = _tta_cpu_retina_construct_result
     _ULTRALYTICS_CPU_RETINA_PATCHED = True
     print(
-        'Experimental CPU retina masks enabled: Ultralytics will skip GPU native mask upsampling; '
-        'retina/native masks are reconstructed and accumulated on CPU.'
+        'Deferred CPU retina masks enabled: Ultralytics GPU mask upsampling is bypassed; '
+        'compact mask protos/coefficients are copied and reconstructed in prediction-result workers.'
     )
     return True
 
 
 def _extract_result_masks_and_confs(r) -> Tuple[Optional[object], Optional[np.ndarray]]:
     """Detach one streamed YOLO result into CPU-owned data for asynchronous postprocess."""
+    deferred_payload = getattr(r, '_tta_deferred_cpu_retina_payload', None)
+    if isinstance(deferred_payload, DeferredCpuRetinaMaskPayload):
+        payload = _realize_deferred_cpu_retina_payload(deferred_payload)
+        return payload, np.ascontiguousarray(payload.confs, dtype=np.float32)
+
     cpu_payload = getattr(r, '_tta_cpu_retina_payload', None)
     if isinstance(cpu_payload, CpuRetinaMaskPayload):
         return cpu_payload, np.ascontiguousarray(cpu_payload.confs, dtype=np.float32)
@@ -4194,9 +4361,11 @@ def predict_source_and_accumulate(
     ensure_yolo_ready_for_predict(model, cfg)
     if isinstance(source, InMemoryYoloVolumeSource):
         ensure_single_channel_yolo_preprocess_patch()
-    use_custom_cpu_retina = bool(cpu_retina_masks_enabled())
-    if use_custom_cpu_retina:
-        ensure_cpu_retina_mask_predictor_patch()
+    use_custom_cpu_retina = False
+    if cpu_retina_masks_enabled():
+        use_custom_cpu_retina = bool(ensure_cpu_retina_mask_predictor_patch())
+        if not use_custom_cpu_retina:
+            print('Warning: CPU retina predictor patch unavailable; using Ultralytics native retina_masks=True for this source.')
 
     prediction_count = 0
     frames_with_predictions = 0
@@ -4252,6 +4421,14 @@ def predict_source_and_accumulate(
             frame_inc = 1 if bool(cleaned_has_foreground) else 0
         return int(pred_inc), int(frame_inc)
 
+    def _extract_and_process_result(idx_i: int, result_obj: object) -> Tuple[int, int]:
+        masks_np, confs_np = _extract_result_masks_and_confs(result_obj)
+        try:
+            del result_obj
+        except Exception:
+            pass
+        return _process_prediction_unit(int(idx_i), masks_np, confs_np)
+
     if worker_count <= 1:
         for idx, r in enumerate(results):
             if idx >= num_frames:
@@ -4270,8 +4447,7 @@ def predict_source_and_accumulate(
                     # Discard synthetic repeated-slice results from the padded final batch.
                     continue
 
-                masks_np, confs_np = _extract_result_masks_and_confs(r)
-                pending.append(executor.submit(_process_prediction_unit, int(idx), masks_np, confs_np))
+                pending.append(executor.submit(_extract_and_process_result, int(idx), r))
                 if len(pending) >= pending_limit:
                     fut = pending.pop(0)
                     pred_inc, frame_inc = fut.result()
@@ -4284,15 +4460,183 @@ def predict_source_and_accumulate(
                 prediction_count += int(pred_inc)
                 frames_with_predictions += int(frame_inc)
 
-    if view_confmap_mm is not None:
-        flush_array(view_confmap_mm)
-    flush_array(view_union_mm)
+    if prediction_hot_path_flush_enabled():
+        if view_confmap_mm is not None:
+            flush_array(view_confmap_mm)
+        flush_array(view_union_mm)
 
     return {
         'prediction_count': int(prediction_count),
         'frames_with_predictions': int(frames_with_predictions),
     }
 
+
+
+def predict_source_and_submit_accumulation(
+    model,
+    source: object,
+    *,
+    source_label: str,
+    num_frames: int,
+    out_size: int,
+    cfg: PredictConfig,
+    view_union_mm: np.ndarray,
+    view_confmap_mm: Optional[np.ndarray],
+    M_out_to_native: np.ndarray,
+    native_h: int,
+    native_w: int,
+    postprocess_executor: ThreadPoolExecutor,
+    streaming_cleanup_enabled: bool = False,
+    streaming_cleanup_min_conf: float = 0.0,
+    streaming_cleanup_min_radius: float = 0.0,
+) -> PredictionAccumulationHandle:
+    """Run YOLO streaming inference and enqueue result accumulation without draining it."""
+    ensure_yolo_ready_for_predict(model, cfg)
+    if isinstance(source, InMemoryYoloVolumeSource):
+        ensure_single_channel_yolo_preprocess_patch()
+    use_custom_cpu_retina = False
+    if cpu_retina_masks_enabled():
+        use_custom_cpu_retina = bool(ensure_cpu_retina_mask_predictor_patch())
+        if not use_custom_cpu_retina:
+            print('Warning: CPU retina predictor patch unavailable; using Ultralytics native retina_masks=True for this source.')
+
+    results = model.predict(
+        source=source,
+        task='segment',
+        imgsz=cfg.imgsz,
+        conf=cfg.conf,
+        iou=1.0,
+        save=False,
+        stream=True,
+        retina_masks=not bool(use_custom_cpu_retina),
+        batch=max(1, int(cfg.batch)),
+        device=cfg.device,
+        half=cfg.half,
+        int8=cfg.int8,
+        verbose=False,
+    )
+
+    stream_cleanup = bool(streaming_cleanup_enabled)
+    stream_backend = cleanup_backend() if stream_cleanup else ''
+    stream_structure2 = np.ones((3, 3), dtype=bool) if stream_cleanup else None
+    stream_min_conf = float(streaming_cleanup_min_conf)
+    stream_min_radius = float(streaming_cleanup_min_radius)
+    stream_min_conf_u8 = int(min_conf_to_u8_threshold(stream_min_conf)) if stream_min_conf > 0.0 else 0
+
+    def _process_prediction_unit(idx_i: int, masks_obj: Optional[object], confs_arr: Optional[np.ndarray]) -> Tuple[int, int]:
+        pred_inc, frame_inc = _process_prediction_frame(
+            idx=int(idx_i),
+            masks_np=masks_obj,
+            confs_np=confs_arr,
+            out_size=out_size,
+            view_union_mm=view_union_mm,
+            view_confmap_mm=view_confmap_mm,
+            M_out_to_native=M_out_to_native,
+            native_h=native_h,
+            native_w=native_w,
+        )
+        if stream_cleanup:
+            cleaned_has_foreground = _cleanup_prediction_slice_inplace(
+                view_union_mm,
+                view_confmap_mm,
+                int(idx_i),
+                min_conf=stream_min_conf,
+                min_radius=stream_min_radius,
+                backend=stream_backend,
+                structure2=stream_structure2,
+                min_conf_u8=stream_min_conf_u8,
+            )
+            frame_inc = 1 if bool(cleaned_has_foreground) else 0
+        return int(pred_inc), int(frame_inc)
+
+    def _extract_and_process_result(idx_i: int, result_obj: object) -> Tuple[int, int]:
+        masks_np, confs_np = _extract_result_masks_and_confs(result_obj)
+        try:
+            del result_obj
+        except Exception:
+            pass
+        return _process_prediction_unit(int(idx_i), masks_np, confs_np)
+
+    futures: List[Future] = []
+    submitted_frames = 0
+    synthetic_discarded = 0
+    precompleted_prediction_count = 0
+    precompleted_frames_with_predictions = 0
+    pending_limit = async_predict_pending_frame_limit(int(num_frames))
+
+    def _join_one_pending() -> None:
+        nonlocal futures, precompleted_prediction_count, precompleted_frames_with_predictions
+        if not futures:
+            return
+        done, remaining = wait(set(futures), return_when=FIRST_COMPLETED)
+        futures = list(remaining)
+        for fut_done in done:
+            pred_inc, frame_inc = fut_done.result()
+            precompleted_prediction_count += int(pred_inc)
+            precompleted_frames_with_predictions += int(frame_inc)
+
+    for idx, r in enumerate(results):
+        if int(idx) >= int(num_frames):
+            synthetic_discarded += 1
+            continue
+        submitted_frames += 1
+        futures.append(postprocess_executor.submit(_extract_and_process_result, int(idx), r))
+        while int(pending_limit) > 0 and len(futures) >= int(pending_limit):
+            _join_one_pending()
+
+    return PredictionAccumulationHandle(
+        source_label=str(source_label),
+        futures=futures,
+        view_union_mm=view_union_mm,
+        view_confmap_mm=view_confmap_mm,
+        submitted_frames=int(submitted_frames),
+        synthetic_discarded=int(synthetic_discarded),
+        precompleted_prediction_count=int(precompleted_prediction_count),
+        precompleted_frames_with_predictions=int(precompleted_frames_with_predictions),
+        pending_limit=int(pending_limit),
+    )
+
+
+def predict_in_memory_volume_and_submit_accumulation(
+    model,
+    prediction_volume: PredictionVolumeRef,
+    *,
+    num_frames: int,
+    out_size: int,
+    cfg: PredictConfig,
+    view_union_mm: np.ndarray,
+    view_confmap_mm: Optional[np.ndarray],
+    M_out_to_native: np.ndarray,
+    native_h: int,
+    native_w: int,
+    postprocess_executor: ThreadPoolExecutor,
+    streaming_cleanup_enabled: bool = False,
+    streaming_cleanup_min_conf: float = 0.0,
+    streaming_cleanup_min_radius: float = 0.0,
+) -> PredictionAccumulationHandle:
+    source = make_in_memory_yolo_source(
+        prediction_volume.array,
+        prediction_volume.name,
+        batch_size=max(1, int(cfg.batch)),
+        max_frames=int(num_frames),
+    )
+    return predict_source_and_submit_accumulation(
+        model,
+        source,
+        source_label=prediction_volume.name,
+        num_frames=int(num_frames),
+        out_size=int(out_size),
+        cfg=cfg,
+        view_union_mm=view_union_mm,
+        view_confmap_mm=view_confmap_mm,
+        M_out_to_native=M_out_to_native,
+        native_h=int(native_h),
+        native_w=int(native_w),
+        postprocess_executor=postprocess_executor,
+        streaming_cleanup_enabled=bool(streaming_cleanup_enabled),
+        streaming_cleanup_min_conf=float(streaming_cleanup_min_conf),
+        streaming_cleanup_min_radius=float(streaming_cleanup_min_radius),
+    )
 
 def predict_in_memory_volume_and_accumulate(
     model,
@@ -11108,7 +11452,7 @@ def nrrd_stream_buffer_bytes(required_bytes: Optional[int] = None) -> int:
         target = int(mib) * 1024 * 1024
     else:
         min_mib = max(1, _env_int('YOLO_TTA_NRRD_STREAM_BUFFER_MIN_MIB', 4096))
-        reserve_gib = max(1.0, _env_float('YOLO_TTA_NRRD_STREAM_BUFFER_RESERVE_GIB', 96.0))
+        reserve_gib = max(1.0, _env_float('YOLO_TTA_NRRD_STREAM_BUFFER_RESERVE_GIB', 192.0))
         max_gib = max(1.0, _env_float('YOLO_TTA_NRRD_STREAM_BUFFER_MAX_GIB', 384.0))
         fraction = min(0.90, max(0.01, _env_float('YOLO_TTA_NRRD_STREAM_BUFFER_FRACTION', 0.35)))
         avail = int(available_anon_work_bytes())
@@ -11302,7 +11646,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.5-Pro_v12.2.8_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.5-Pro_v12.2.9_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -13456,12 +13800,12 @@ def main() -> None:
     )
     if cpu_retina_masks_enabled():
         spec_notes.append(
-            'Experimental CPU retina-mask reconstruction active: Ultralytics native mask upsampling is bypassed on GPU; '
-            'mask protos/coefficients/boxes are copied to CPU, bbox-ROI retina masks are reconstructed asynchronously, '
-            'and queued frame payloads are buffered in RAM via YOLO_TTA_CPU_MASK_PENDING_FRAMES.'
+            'Deferred CPU retina-mask reconstruction active: Ultralytics native mask upsampling is bypassed on GPU; '
+            'compact mask protos/coefficients/boxes are copied and bbox-ROI retina masks are reconstructed in prediction-result workers, '
+            'so the scheduler/model-stream thread does not perform per-slice full-mask CPU copies.'
         )
     else:
-        spec_notes.append('Using Ultralytics native retina_masks=True for live inference; the custom CPU retina reconstruction path remains available only when YOLO_TTA_CPU_RETINA_MASKS=1 for compatibility/debugging.')
+        spec_notes.append('Using Ultralytics native retina_masks=True compatibility mode because YOLO_TTA_CPU_RETINA_MASKS=0 or the CPU-retina patch was unavailable.')
     if bool(troubleshooting_outputs_enabled):
         spec_notes.append(
             '--troubleshooting active: writing FFV1 MKV overlays for each active full-frame native view and each available consolidated tiled prediction set; '
@@ -13808,15 +14152,59 @@ def main() -> None:
         for aug_job in aug_jobs_by_view[view.name]
     )
     total_prediction_volume_build_tasks = int(total_fullframe_jobs + total_tile_prediction_jobs)
+    prediction_volume_queue_slots = max(1, _env_int('YOLO_TTA_PREDICTION_VOLUME_QUEUE_SLOTS', 4))
+    active_build_slot_default = max(
+        1,
+        min(
+            int(augmentation_workers),
+            int(prediction_volume_queue_slots),
+            max(1, int(total_prediction_volume_build_tasks)),
+        ),
+    )
+    requested_build_workers = max(
+        1,
+        _env_int('YOLO_TTA_VOLUME_BUILD_WORKERS', int(active_build_slot_default)),
+    )
     prediction_volume_builder_workers = max(
         1,
         min(
             int(augmentation_workers),
-            max(1, _env_int('YOLO_TTA_VOLUME_BUILD_WORKERS', max(1, min(augmentation_workers, total_prediction_volume_build_tasks)))),
+            int(prediction_volume_queue_slots),
+            max(1, int(total_prediction_volume_build_tasks)),
+            int(requested_build_workers),
         ),
     )
     per_prediction_volume_workers = max(1, int(max(1, augmentation_workers) // max(1, prediction_volume_builder_workers)))
-    prediction_volume_queue_slots = max(1, _env_int('YOLO_TTA_PREDICTION_VOLUME_QUEUE_SLOTS', 4))
+    async_prediction_accumulation_active = bool(len(angles) == 1 and async_predict_postprocess_enabled())
+    async_prediction_join_worker_count = async_predict_join_workers(max(2, int(prediction_volume_queue_slots) + 1))
+    default_async_result_workers = max(1, min(int(predict_postprocess_workers), max(1, _cpu_count() // 4), 16))
+    async_prediction_result_worker_count = max(
+        1,
+        min(
+            int(predict_postprocess_workers),
+            _env_int('YOLO_TTA_ASYNC_PREDICT_RESULT_WORKERS', int(default_async_result_workers)),
+        ),
+    )
+    if bool(async_prediction_accumulation_active):
+        print(
+            'Async prediction accumulation: enabled for single-angle run '
+            f'(result workers={int(async_prediction_result_worker_count)}, join workers={int(async_prediction_join_worker_count)})'
+        )
+        spec_notes.append(
+            'v12.2.9 async prediction accumulation is active because exactly one --angle value was supplied. '
+            'YOLO result detach/copy, native inverse-mapping, and streaming cleanup are queued to a shared prediction-result executor; '
+            'the scheduler waits on a lightweight completion future before declaring a view/tile volume complete, so the next ready prediction volume can start as soon as the current result stream is exhausted.'
+        )
+    else:
+        print('Async prediction accumulation: disabled (requires exactly one --angle and YOLO_TTA_ASYNC_PREDICT_POSTPROCESS=1).')
+        spec_notes.append(
+            'v12.2.9 async prediction accumulation is inactive; prediction sources are drained synchronously. '
+            'This preserves ordered full-frame accumulation for multi-angle runs.'
+        )
+    spec_notes.append(
+        'v12.2.9 prediction-volume builders are sized to the active prefetch window, not the total tile/full-frame job count; '
+        'per-source prediction memmap flushes are skipped by default unless YOLO_TTA_FLUSH_PREDICTION_VOLUME_ON_BUILD=1 or YOLO_TTA_PREDICT_FLUSH_EACH_VOLUME=1 is set.'
+    )
     print(
         f'In-memory prediction-volume builders: {prediction_volume_builder_workers} '
         f'(per-volume slice workers: {per_prediction_volume_workers}, build tasks: {total_prediction_volume_build_tasks}, '
@@ -13836,6 +14224,8 @@ def main() -> None:
         )
 
     prediction_volume_executor = ThreadPoolExecutor(max_workers=int(prediction_volume_builder_workers), thread_name_prefix='prediction-volume')
+    prediction_result_executor = ThreadPoolExecutor(max_workers=int(async_prediction_result_worker_count), thread_name_prefix='predict-result')
+    prediction_join_executor = ThreadPoolExecutor(max_workers=int(async_prediction_join_worker_count), thread_name_prefix='predict-join')
     parent_postprocess_executor = ThreadPoolExecutor(max_workers=int(parent_postprocess_workers), thread_name_prefix='parent-postprocess')
     tile_postprocess_executor = ThreadPoolExecutor(max_workers=int(tile_postprocess_workers), thread_name_prefix='tile-postprocess')
 
@@ -13851,6 +14241,7 @@ def main() -> None:
     ready_fullframe: deque[Tuple[ViewInfo, AugJob, PredictionVolumeRef]] = deque()
     ready_tile_infer: deque[Tuple[str, ViewInfo, DenseTileJob, PredictionVolumeRef]] = deque()
     tile_inference_done: set[Tuple[str, str, str]] = set()
+    prediction_accumulation_futures: Dict[Future, Dict[str, object]] = {}
 
     view_processing_futures: Dict[Future, Tuple[str, str]] = {}
     view_processing_submitted: set[Tuple[str, str]] = set()
@@ -14208,6 +14599,91 @@ def main() -> None:
 
     # v12: render futures were replaced by _drain_completed_prediction_volume_futures().
 
+    def _submit_prediction_accumulation_join(handle: PredictionAccumulationHandle, context: Dict[str, object]) -> None:
+        fut = prediction_join_executor.submit(handle.wait)
+        prediction_accumulation_futures[fut] = dict(context)
+
+    def _drain_completed_prediction_accumulation_futures() -> None:
+        for fut in list(prediction_accumulation_futures.keys()):
+            if not fut.done():
+                continue
+            context = prediction_accumulation_futures.pop(fut)
+            pred_stats = fut.result()
+            kind = str(context.get('kind', ''))
+
+            if kind == 'fullframe':
+                model_name = str(context['model_name'])
+                view = context['view']
+                assert isinstance(view, ViewInfo)
+                yolo_obj = context.get('yolo')
+                if offload_between_jobs_enabled() and yolo_obj is not None:
+                    offload_yolo_from_gpu(yolo_obj)
+                view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(pred_stats.get('prediction_count', 0))
+                remaining_key = (model_name, view.name)
+                fullframe_remaining[remaining_key] = int(fullframe_remaining.get(remaining_key, 0)) - 1
+                if int(fullframe_remaining.get(remaining_key, 0)) == 0:
+                    _submit_view_prepare(model_name, view)
+                continue
+
+            if kind == 'tile':
+                model_name = str(context['model_name'])
+                view = context['view']
+                tile_job = context['tile_job']
+                assert isinstance(view, ViewInfo)
+                assert isinstance(tile_job, DenseTileJob)
+                tile_mask_mm = context['tile_mask_mm']
+                tile_conf_mm = context.get('tile_conf_mm')
+                tile_mask_path = Path(context['tile_mask_path'])
+                tile_conf_path_obj = context.get('tile_conf_path')
+                tile_conf_path = Path(tile_conf_path_obj) if tile_conf_path_obj is not None else None
+                ready_key = (str(model_name), str(view.name), str(tile_job.tile_id))
+                yolo_obj = context.get('yolo')
+                if offload_between_jobs_enabled() and yolo_obj is not None:
+                    offload_yolo_from_gpu(yolo_obj)
+                tile_inference_done.add(ready_key)
+                view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(pred_stats.get('prediction_count', 0))
+
+                if int(pred_stats.get('frames_with_predictions', 0)) <= 0:
+                    close_memmap_array(tile_mask_mm)
+                    close_memmap_array(tile_conf_mm)
+                    if not keep_temp_artifacts:
+                        try:
+                            tile_mask_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        if tile_conf_path is not None:
+                            try:
+                                tile_conf_path.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                    _mark_tile_staged(str(model_name), str(view.name), str(tile_job.config_id), str(tile_job.tile_id))
+                    continue
+
+                task = TilePostprocessTask(
+                    model_name=str(model_name),
+                    view_name=str(view.name),
+                    config_id=str(tile_job.config_id),
+                    tile_id=str(tile_job.tile_id),
+                    tile_mask_mm=tile_mask_mm,
+                    tile_confmap_mm=tile_conf_mm,
+                    tile_mask_path=tile_mask_path,
+                    tile_confmap_path=tile_conf_path,
+                    precleaned_slice_cleanup=bool(single_angle_streaming_cleanup_active),
+                )
+                tile_fut = tile_postprocess_executor.submit(
+                    postprocess_tile_volume_after_inference,
+                    task,
+                    view=view,
+                    min_conf=float(args.min_conf),
+                    min_radius=float(args.min_radius),
+                    keep_temp=bool(keep_temp_artifacts),
+                    slice_workers=int(tile_slice_postprocess_workers),
+                )
+                tile_cleanup_futures[tile_fut] = (str(model_name), str(view.name), str(tile_job.config_id), str(tile_job.tile_id))
+                continue
+
+            raise RuntimeError(f'Unknown prediction accumulation kind: {kind!r}')
+
     def _drain_completed_background_futures() -> None:
         for fut in list(view_processing_futures.keys()):
             if not fut.done():
@@ -14307,6 +14783,7 @@ def main() -> None:
             'Scheduler wait: no inference-ready in-memory volume; '
             f'pending_volume_builds={len(pending_prediction_volume_futures)}, '
             f'queued_build_jobs={len(pending_prediction_build_jobs)}, '
+            f'prediction_accumulation={len(prediction_accumulation_futures)}, '
             f'parent_postprocess={len(view_processing_futures)}, '
             f'tile_cleanup={len(tile_cleanup_futures)}, '
             f'tile_finalize={len(tile_finalize_futures)}, '
@@ -14320,6 +14797,7 @@ def main() -> None:
         _pump_prediction_volume_build_queue()
         while True:
             _drain_completed_prediction_volume_futures()
+            _drain_completed_prediction_accumulation_futures()
             _drain_completed_background_futures()
             _pump_prediction_volume_build_queue()
 
@@ -14328,30 +14806,55 @@ def main() -> None:
                 print(f"Inferencing full-frame in-memory volume: {view.name}/{job.aug_id}")
                 try:
                     for model_name, yolo in yolo_models:
-                        pred_stats = predict_in_memory_volume_and_accumulate(
-                            model=yolo,
-                            prediction_volume=prediction_ref,
-                            num_frames=view.num_slices,
-                            out_size=args.imgsz,
-                            cfg=pred_cfg,
-                            view_union_mm=baseline_union_by_model_view[(model_name, view.name)],
-                            view_confmap_mm=baseline_confmap_by_model_view[(model_name, view.name)],
-                            M_out_to_native=job.aff.M_out_to_src,
-                            native_h=view.src_h,
-                            native_w=view.src_w,
-                            postprocess_workers=predict_postprocess_workers,
-                            streaming_cleanup_enabled=bool(single_angle_streaming_cleanup_active),
-                            streaming_cleanup_min_conf=float(args.min_conf),
-                            streaming_cleanup_min_radius=_view_native_slice_min_radius(view, float(args.min_radius)),
-                        )
-                        if offload_between_jobs_enabled():
-                            offload_yolo_from_gpu(yolo)
-                        view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(pred_stats.get('prediction_count', 0))
+                        if bool(async_prediction_accumulation_active):
+                            handle = predict_in_memory_volume_and_submit_accumulation(
+                                model=yolo,
+                                prediction_volume=prediction_ref,
+                                num_frames=view.num_slices,
+                                out_size=args.imgsz,
+                                cfg=pred_cfg,
+                                view_union_mm=baseline_union_by_model_view[(model_name, view.name)],
+                                view_confmap_mm=baseline_confmap_by_model_view[(model_name, view.name)],
+                                M_out_to_native=job.aff.M_out_to_src,
+                                native_h=view.src_h,
+                                native_w=view.src_w,
+                                postprocess_executor=prediction_result_executor,
+                                streaming_cleanup_enabled=bool(single_angle_streaming_cleanup_active),
+                                streaming_cleanup_min_conf=float(args.min_conf),
+                                streaming_cleanup_min_radius=_view_native_slice_min_radius(view, float(args.min_radius)),
+                            )
+                            _submit_prediction_accumulation_join(handle, {
+                                'kind': 'fullframe',
+                                'model_name': str(model_name),
+                                'view': view,
+                                'job': job,
+                                'yolo': yolo,
+                            })
+                        else:
+                            pred_stats = predict_in_memory_volume_and_accumulate(
+                                model=yolo,
+                                prediction_volume=prediction_ref,
+                                num_frames=view.num_slices,
+                                out_size=args.imgsz,
+                                cfg=pred_cfg,
+                                view_union_mm=baseline_union_by_model_view[(model_name, view.name)],
+                                view_confmap_mm=baseline_confmap_by_model_view[(model_name, view.name)],
+                                M_out_to_native=job.aff.M_out_to_src,
+                                native_h=view.src_h,
+                                native_w=view.src_w,
+                                postprocess_workers=predict_postprocess_workers,
+                                streaming_cleanup_enabled=bool(single_angle_streaming_cleanup_active),
+                                streaming_cleanup_min_conf=float(args.min_conf),
+                                streaming_cleanup_min_radius=_view_native_slice_min_radius(view, float(args.min_radius)),
+                            )
+                            if offload_between_jobs_enabled():
+                                offload_yolo_from_gpu(yolo)
+                            view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(pred_stats.get('prediction_count', 0))
 
-                        remaining_key = (model_name, view.name)
-                        fullframe_remaining[remaining_key] = int(fullframe_remaining.get(remaining_key, 0)) - 1
-                        if int(fullframe_remaining.get(remaining_key, 0)) == 0:
-                            _submit_view_prepare(model_name, view)
+                            remaining_key = (model_name, view.name)
+                            fullframe_remaining[remaining_key] = int(fullframe_remaining.get(remaining_key, 0)) - 1
+                            if int(fullframe_remaining.get(remaining_key, 0)) == 0:
+                                _submit_view_prepare(model_name, view)
                 finally:
                     close_prediction_volume_ref(prediction_ref, keep_temp=bool(keep_temp_artifacts))
                     _pump_prediction_volume_build_queue()
@@ -14392,69 +14895,100 @@ def main() -> None:
 
                 yolo = yolo_by_model_name[str(model_name)]
                 try:
-                    pred_stats = predict_in_memory_volume_and_accumulate(
-                        model=yolo,
-                        prediction_volume=prediction_ref,
-                        num_frames=view.num_slices,
-                        out_size=int(args.imgsz),
-                        cfg=pred_cfg,
-                        view_union_mm=tile_mask_mm,
-                        view_confmap_mm=tile_conf_mm,
-                        M_out_to_native=tile_job.M_out_to_src,
-                        native_h=view.src_h,
-                        native_w=view.src_w,
-                        postprocess_workers=predict_postprocess_workers,
-                        streaming_cleanup_enabled=bool(single_angle_streaming_cleanup_active),
-                        streaming_cleanup_min_conf=float(args.min_conf),
-                        streaming_cleanup_min_radius=_view_native_slice_min_radius(view, float(args.min_radius)),
-                    )
+                    if bool(async_prediction_accumulation_active):
+                        handle = predict_in_memory_volume_and_submit_accumulation(
+                            model=yolo,
+                            prediction_volume=prediction_ref,
+                            num_frames=view.num_slices,
+                            out_size=int(args.imgsz),
+                            cfg=pred_cfg,
+                            view_union_mm=tile_mask_mm,
+                            view_confmap_mm=tile_conf_mm,
+                            M_out_to_native=tile_job.M_out_to_src,
+                            native_h=view.src_h,
+                            native_w=view.src_w,
+                            postprocess_executor=prediction_result_executor,
+                            streaming_cleanup_enabled=bool(single_angle_streaming_cleanup_active),
+                            streaming_cleanup_min_conf=float(args.min_conf),
+                            streaming_cleanup_min_radius=_view_native_slice_min_radius(view, float(args.min_radius)),
+                        )
+                        _submit_prediction_accumulation_join(handle, {
+                            'kind': 'tile',
+                            'model_name': str(model_name),
+                            'view': view,
+                            'tile_job': tile_job,
+                            'tile_mask_mm': tile_mask_mm,
+                            'tile_conf_mm': tile_conf_mm,
+                            'tile_mask_path': tile_mask_path,
+                            'tile_conf_path': tile_conf_store_path,
+                            'yolo': yolo,
+                        })
+                    else:
+                        pred_stats = predict_in_memory_volume_and_accumulate(
+                            model=yolo,
+                            prediction_volume=prediction_ref,
+                            num_frames=view.num_slices,
+                            out_size=int(args.imgsz),
+                            cfg=pred_cfg,
+                            view_union_mm=tile_mask_mm,
+                            view_confmap_mm=tile_conf_mm,
+                            M_out_to_native=tile_job.M_out_to_src,
+                            native_h=view.src_h,
+                            native_w=view.src_w,
+                            postprocess_workers=predict_postprocess_workers,
+                            streaming_cleanup_enabled=bool(single_angle_streaming_cleanup_active),
+                            streaming_cleanup_min_conf=float(args.min_conf),
+                            streaming_cleanup_min_radius=_view_native_slice_min_radius(view, float(args.min_radius)),
+                        )
+                        if offload_between_jobs_enabled():
+                            offload_yolo_from_gpu(yolo)
+                        tile_inference_done.add(ready_key)
+                        view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(pred_stats.get('prediction_count', 0))
+
+                        if int(pred_stats.get('frames_with_predictions', 0)) <= 0:
+                            close_memmap_array(tile_mask_mm)
+                            close_memmap_array(tile_conf_mm)
+                            if not keep_temp_artifacts:
+                                try:
+                                    tile_mask_path.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+                                if tile_conf_path is not None:
+                                    try:
+                                        tile_conf_path.unlink(missing_ok=True)
+                                    except Exception:
+                                        pass
+                            _mark_tile_staged(str(model_name), str(view.name), str(tile_job.config_id), str(tile_job.tile_id))
+                            continue
+
+                        task = TilePostprocessTask(
+                            model_name=str(model_name),
+                            view_name=str(view.name),
+                            config_id=str(tile_job.config_id),
+                            tile_id=str(tile_job.tile_id),
+                            tile_mask_mm=tile_mask_mm,
+                            tile_confmap_mm=tile_conf_mm,
+                            tile_mask_path=tile_mask_path,
+                            tile_confmap_path=tile_conf_store_path,
+                            precleaned_slice_cleanup=bool(single_angle_streaming_cleanup_active),
+                        )
+                        fut = tile_postprocess_executor.submit(
+                            postprocess_tile_volume_after_inference,
+                            task,
+                            view=view,
+                            min_conf=float(args.min_conf),
+                            min_radius=float(args.min_radius),
+                            keep_temp=bool(keep_temp_artifacts),
+                            slice_workers=int(tile_slice_postprocess_workers),
+                        )
+                        tile_cleanup_futures[fut] = (str(model_name), str(view.name), str(tile_job.config_id), str(tile_job.tile_id))
                 finally:
                     close_prediction_volume_ref(prediction_ref, keep_temp=bool(keep_temp_artifacts))
                     _pump_prediction_volume_build_queue()
-                if offload_between_jobs_enabled():
-                    offload_yolo_from_gpu(yolo)
-                tile_inference_done.add(ready_key)
-                view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(pred_stats.get('prediction_count', 0))
-
-                if int(pred_stats.get('frames_with_predictions', 0)) <= 0:
-                    close_memmap_array(tile_mask_mm)
-                    close_memmap_array(tile_conf_mm)
-                    if not keep_temp_artifacts:
-                        try:
-                            tile_mask_path.unlink(missing_ok=True)
-                        except Exception:
-                            pass
-                        try:
-                            tile_conf_path.unlink(missing_ok=True)
-                        except Exception:
-                            pass
-                    _mark_tile_staged(str(model_name), str(view.name), str(tile_job.config_id), str(tile_job.tile_id))
-                    continue
-
-                task = TilePostprocessTask(
-                    model_name=str(model_name),
-                    view_name=str(view.name),
-                    config_id=str(tile_job.config_id),
-                    tile_id=str(tile_job.tile_id),
-                    tile_mask_mm=tile_mask_mm,
-                    tile_confmap_mm=tile_conf_mm,
-                    tile_mask_path=tile_mask_path,
-                    tile_confmap_path=tile_conf_store_path,
-                    precleaned_slice_cleanup=bool(single_angle_streaming_cleanup_active),
-                )
-                fut = tile_postprocess_executor.submit(
-                    postprocess_tile_volume_after_inference,
-                    task,
-                    view=view,
-                    min_conf=float(args.min_conf),
-                    min_radius=float(args.min_radius),
-                    keep_temp=bool(keep_temp_artifacts),
-                    slice_workers=int(tile_slice_postprocess_workers),
-                )
-                tile_cleanup_futures[fut] = (str(model_name), str(view.name), str(tile_job.config_id), str(tile_job.tile_id))
                 continue
 
             waitables: List[Future] = list(pending_prediction_volume_futures)
+            waitables.extend(list(prediction_accumulation_futures.keys()))
             waitables.extend(list(view_processing_futures.keys()))
             waitables.extend(list(tile_cleanup_futures.keys()))
             waitables.extend(list(tile_finalize_futures.keys()))
@@ -14466,6 +15000,7 @@ def main() -> None:
                 if (
                     not pending_prediction_build_jobs and
                     not pending_prediction_volume_futures and
+                    not prediction_accumulation_futures and
                     not ready_fullframe and
                     not ready_tile_infer and
                     not tile_finalize_futures and
@@ -14481,6 +15016,8 @@ def main() -> None:
 
     finally:
         prediction_volume_executor.shutdown(wait=True)
+        prediction_join_executor.shutdown(wait=True)
+        prediction_result_executor.shutdown(wait=True)
         parent_postprocess_executor.shutdown(wait=True)
         tile_postprocess_executor.shutdown(wait=True)
         set_interpolation_process_executor(None, 0)
@@ -14491,6 +15028,7 @@ def main() -> None:
                 interpolation_process_executor.shutdown(wait=True)
 
     _drain_completed_prediction_volume_futures()
+    _drain_completed_prediction_accumulation_futures()
     _drain_completed_background_futures()
 
     for cache_name, cache_mm in list(view_frame_caches.items()):
@@ -14962,6 +15500,7 @@ def main() -> None:
     print(f'Scratch dir: {temp_dir}')
     print(f"Final overlay: {final_paths['overlay']}")
     print(f'Summary: {summary_path}')
+
 
 
 if __name__ == "__main__":
