@@ -2,13 +2,15 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v12.2.6_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.1-v12.2.6 performance patches:
+This v12.3.0_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.1-v12.2.6 performance patches and v12.3.0 interpolation isolation:
   - this revision removes the dedicated single --angle GPU cleanup fast path: min_conf filtering, 2D hole filling, and min_radius filtering always run through the shared CPU cleanup path regardless of how many --angle values are provided
   - v12.2.1 restores the low-quality downbin/output helper path and NrrdLayerRef metadata class that were erroneously pruned in v12.2.0
   - v12.2.2 adds batched in-memory inference with synthetic final-batch padding for fixed-batch backends, larger RAM-aware NRRD streaming slabs, parallel low-quality NRRD scheduling, and a hybrid CPU/GPU radial/tilted backprojection queue
   - v12.2.4 aligns the script header with the filename, moves Radial before Tilted in scheduling order, plans interpolation from cached per-slice component tables and local SDF crops, consumes variable-cost seed plans through an unordered bounded completion queue, keeps transient NRRD projection/delta workspaces in RAM when possible, and raises the CPU mask postprocess pending cap to 4096
   - v12.2.5 improves CPU occupancy during interpolation labeling by compact-relabeling row blocks with per-slice local-to-compact lookup tables, prebuilding per-slice component tables through an unordered bounded queue, and testing endpoint continuation from component-table crops instead of full adjacent slices
   - v12.2.6 sizes per-parent full-frame interpolation seed planning for the expected live overlap, not the total number of active parent views, so compact relabel and endpoint scans can use most of the SLURM CPU allocation when interpolation is effectively serial or only two parents overlap
+  - v12.3.0 moves full-frame and consolidated-tile interpolation passes into a shared ProcessPoolExecutor by reopening disk-backed memmaps in worker processes, so GIL-heavy interpolation cannot starve prediction-volume builders in the main process
+  - v12.3.0 adds optional Numba no-GIL projection-candidate kernels for interpolation seed planning; set YOLO_TTA_INTERPOLATION_COMPILED_KERNELS=0 to force the Python fallback
   - builds Transverse, optional generalized Tilted Views for Transverse/Sagittal/Coronal, independently optional upright Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - materializes YOLO-ready full-frame and tiled prediction volumes as in-memory slice arrays instead of writing prediction videos to the temp folder
   - feeds those volumes to Ultralytics through a custom in-memory loader with stream=True, while using Ultralytics native retina mask reconstruction
@@ -40,6 +42,7 @@ This v12.2.6_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.
 
 Dependencies (Python):
   pip install opencv-python numpy scipy scikit-image tifffile tqdm ultralytics
+  # Optional CPU acceleration: numba for no-GIL interpolation seed-planning kernels.
   # Optional GPU acceleration: cupy-cuda12x for cupyx.scipy.ndimage smoothing and CuPy backprojection paths.
   # --save_nrrd uses the built-in streaming NRRD writer; pynrrd is no longer required for default exports.
 
@@ -55,6 +58,7 @@ import gc
 import heapq
 import json
 import math
+import multiprocessing as mp
 import os
 import re
 import shlex
@@ -65,7 +69,7 @@ import sys
 import threading
 import time
 from collections import deque
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
 
 GIB = 1024 ** 3
@@ -102,6 +106,14 @@ try:
     from tqdm import tqdm  # type: ignore
 except Exception as e:  # pragma: no cover
     raise RuntimeError("tqdm is required: pip install tqdm") from e
+
+try:
+    import numba as _numba  # type: ignore
+except Exception as _numba_exc:  # pragma: no cover - optional acceleration
+    _numba = None  # type: ignore[assignment]
+    _NUMBA_IMPORT_ERROR: Optional[BaseException] = _numba_exc
+else:
+    _NUMBA_IMPORT_ERROR = None
 
 # --------------------------
 # CLI / args
@@ -856,6 +868,307 @@ def close_memmap_array(arr: object) -> None:
                 mmap_obj.close()
     except Exception:
         pass
+
+
+# --------------------------
+# Interpolation process isolation
+# --------------------------
+
+_INTERPOLATION_PROCESS_EXECUTOR: Optional[ProcessPoolExecutor] = None
+_INTERPOLATION_PROCESS_MAX_WORKERS = 0
+_INTERPOLATION_PROCESS_WORKER = False
+
+
+def _sanitize_filesystem_token(value: object) -> str:
+    token = re.sub(r'[^A-Za-z0-9_.+-]+', '_', str(value).strip()).strip('_')
+    return token or 'unnamed'
+
+
+def interpolation_process_backend_enabled() -> bool:
+    """Return True when interpolation passes should run in process workers.
+
+    The default is enabled for v12.3.0 because interpolation seed planning contains
+    Python-heavy control flow.  Running the pass in a separate process prevents that
+    GIL-bound work from starving prediction-volume builder threads in the main
+    process.  Set YOLO_TTA_INTERPOLATION_PROCESS_BACKEND=0 to recover the legacy
+    in-process thread-pool path.
+    """
+    return _env_flag('YOLO_TTA_INTERPOLATION_PROCESS_BACKEND', True)
+
+
+def interpolation_process_fallback_enabled() -> bool:
+    """Allow an in-process fallback if a process interpolation task fails.
+
+    The default is fail-fast so accidental reintroduction of the GIL bottleneck is
+    visible.  Set YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK=1 when completing a run is
+    preferred over failing on a worker-process exception.
+    """
+    return _env_flag('YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK', False)
+
+
+def interpolation_process_start_method() -> str:
+    method = os.environ.get('YOLO_TTA_INTERPOLATION_PROCESS_START_METHOD', 'spawn').strip().lower()
+    if method not in {'spawn', 'forkserver', 'fork'}:
+        method = 'spawn'
+    return method
+
+
+def interpolation_process_cv2_threads() -> int:
+    return max(1, _env_int('YOLO_TTA_INTERPOLATION_PROCESS_CV2_THREADS', 1))
+
+
+def _interpolation_process_initializer() -> None:
+    global _INTERPOLATION_PROCESS_WORKER
+    _INTERPOLATION_PROCESS_WORKER = True
+    try:
+        cv2.setNumThreads(int(interpolation_process_cv2_threads()))
+    except Exception:
+        pass
+
+
+def create_interpolation_process_executor(max_workers: int) -> Optional[ProcessPoolExecutor]:
+    if not interpolation_process_backend_enabled():
+        return None
+    workers = max(1, int(max_workers))
+    start_method = interpolation_process_start_method()
+    try:
+        ctx = mp.get_context(start_method)
+    except Exception:
+        start_method = 'spawn'
+        ctx = mp.get_context(start_method)
+    return ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=ctx,
+        initializer=_interpolation_process_initializer,
+    )
+
+
+def set_interpolation_process_executor(executor: Optional[ProcessPoolExecutor], max_workers: int = 0) -> None:
+    global _INTERPOLATION_PROCESS_EXECUTOR, _INTERPOLATION_PROCESS_MAX_WORKERS
+    _INTERPOLATION_PROCESS_EXECUTOR = executor
+    _INTERPOLATION_PROCESS_MAX_WORKERS = max(0, int(max_workers))
+
+
+def _interpolation_array_backing_path(arr: object) -> Optional[Path]:
+    if arr is None:
+        return None
+    try:
+        arr_np = np.asarray(arr)
+        if (
+            isinstance(arr, np.memmap)
+            and bool(arr_np.flags['C_CONTIGUOUS'])
+            and int(getattr(arr, 'offset', 0) or 0) == 0
+        ):
+            filename = getattr(arr, 'filename', None)
+            return Path(filename) if filename else None
+    except Exception:
+        pass
+    # Deliberately do not reuse a base memmap for ndarray views here.  A child
+    # process would need the view's byte offset and strides to reopen it exactly;
+    # interpolation volumes are expected to be full C-contiguous arrays, so views
+    # are copied into a dedicated process memmap instead.
+    return None
+
+
+def _ensure_process_backed_interpolation_volume(
+    mask_mm: np.ndarray,
+    *,
+    work_dir: Path,
+    pass_tag: str,
+    workers: int,
+) -> Tuple[np.ndarray, Path, bool]:
+    """Return a memmap-backed volume that a process worker can reopen by path."""
+    arr = np.asarray(mask_mm)
+    if arr.ndim != 3:
+        raise ValueError(f'Interpolation expects a 3D mask volume, got shape {arr.shape}')
+    if arr.dtype != np.dtype(np.uint8):
+        raise ValueError(f'Interpolation process backend expects uint8 mask volume, got dtype {arr.dtype}')
+
+    backing_path = _interpolation_array_backing_path(mask_mm)
+    if backing_path is not None:
+        flush_array(mask_mm)
+        return mask_mm, Path(backing_path), False
+
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    process_path = work_dir / f'{_sanitize_filesystem_token(pass_tag)}.process_input.u8.dat'
+    process_mm = copy_workspace_array(
+        arr,
+        process_path,
+        desc=f'Interpolation process input {pass_tag}',
+        prefer_memory=False,
+        workers=int(workers),
+    )
+    flush_array(process_mm)
+    return process_mm, process_path, True
+
+
+def _interpolation_process_entry(
+    *,
+    mask_path: str,
+    mask_shape: Tuple[int, int, int],
+    mask_dtype: str,
+    work_dir: str,
+    pass_tag: str,
+    max_slice_distance: int,
+    search_angle_deg: float,
+    interpolation_walk_back: int,
+    interpolation_candidates: int,
+    interpolate_min_radius: float,
+    keep_temp: bool,
+    reserve_bytes: int,
+    workers: int,
+    wrap_axis: bool,
+) -> Dict[str, object]:
+    global _INTERPOLATION_PROCESS_WORKER
+    _INTERPOLATION_PROCESS_WORKER = True
+    try:
+        cv2.setNumThreads(int(interpolation_process_cv2_threads()))
+    except Exception:
+        pass
+
+    mask_mm = np.memmap(
+        Path(mask_path),
+        dtype=np.dtype(mask_dtype),
+        mode='r+',
+        shape=tuple(int(x) for x in mask_shape),
+    )
+    try:
+        stats = interpolate_view_volume_pass_inplace(
+            mask_mm=mask_mm,
+            work_dir=Path(work_dir),
+            pass_tag=str(pass_tag),
+            max_slice_distance=int(max_slice_distance),
+            search_angle_deg=float(search_angle_deg),
+            interpolation_walk_back=int(interpolation_walk_back),
+            interpolation_candidates=int(interpolation_candidates),
+            interpolate_min_radius=float(interpolate_min_radius),
+            keep_temp=bool(keep_temp),
+            prefer_memory=True,
+            reserve_bytes=int(reserve_bytes),
+            workers=int(workers),
+            wrap_axis=bool(wrap_axis),
+        )
+        stats = dict(stats)
+        stats.update({
+            'process_backend': 'process_pool_memmap',
+            'process_pid': int(os.getpid()),
+            'process_workers_inside_pass': int(workers),
+            'process_memmap_path': str(mask_path),
+        })
+        flush_array(mask_mm)
+        return stats
+    finally:
+        close_memmap_array(mask_mm)
+
+
+def interpolate_view_volume_pass_maybe_process(
+    mask_mm: np.ndarray,
+    work_dir: Path,
+    pass_tag: str,
+    max_slice_distance: int,
+    search_angle_deg: float,
+    interpolation_walk_back: int,
+    interpolation_candidates: int,
+    interpolate_min_radius: float,
+    keep_temp: bool = False,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 16 * GIB,
+    workers: int = 1,
+    wrap_axis: bool = False,
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    """Run one interpolation pass, using a child process when configured.
+
+    The returned array may be a new memmap when the input was an anonymous ndarray.
+    Callers must keep using the returned volume for later passes and downstream work.
+    """
+    executor = _INTERPOLATION_PROCESS_EXECUTOR
+    if (
+        _INTERPOLATION_PROCESS_WORKER
+        or executor is None
+        or not interpolation_process_backend_enabled()
+    ):
+        stats = interpolate_view_volume_pass_inplace(
+            mask_mm=mask_mm,
+            work_dir=work_dir,
+            pass_tag=pass_tag,
+            max_slice_distance=int(max_slice_distance),
+            search_angle_deg=float(search_angle_deg),
+            interpolation_walk_back=int(interpolation_walk_back),
+            interpolation_candidates=int(interpolation_candidates),
+            interpolate_min_radius=float(interpolate_min_radius),
+            keep_temp=bool(keep_temp),
+            prefer_memory=bool(prefer_memory),
+            reserve_bytes=int(reserve_bytes),
+            workers=int(workers),
+            wrap_axis=bool(wrap_axis),
+        )
+        stats = dict(stats)
+        stats.setdefault('process_backend', 'disabled_or_unconfigured')
+        return mask_mm, stats
+
+    process_mm, process_path, copied_to_memmap = _ensure_process_backed_interpolation_volume(
+        mask_mm,
+        work_dir=Path(work_dir),
+        pass_tag=str(pass_tag),
+        workers=max(1, min(int(workers), int(mask_mm.shape[0]) if getattr(mask_mm, 'ndim', 0) else int(workers))),
+    )
+    shape = tuple(int(x) for x in np.asarray(process_mm).shape)
+    dtype_str = str(np.asarray(process_mm).dtype)
+    flush_array(process_mm)
+
+    fut = executor.submit(
+        _interpolation_process_entry,
+        mask_path=str(process_path),
+        mask_shape=shape,
+        mask_dtype=dtype_str,
+        work_dir=str(work_dir),
+        pass_tag=str(pass_tag),
+        max_slice_distance=int(max_slice_distance),
+        search_angle_deg=float(search_angle_deg),
+        interpolation_walk_back=int(interpolation_walk_back),
+        interpolation_candidates=int(interpolation_candidates),
+        interpolate_min_radius=float(interpolate_min_radius),
+        keep_temp=bool(keep_temp),
+        reserve_bytes=int(reserve_bytes),
+        workers=int(workers),
+        wrap_axis=bool(wrap_axis),
+    )
+    try:
+        stats = dict(fut.result())
+    except Exception as exc:
+        if not interpolation_process_fallback_enabled():
+            raise RuntimeError(
+                f'Interpolation process worker failed for {pass_tag} at {process_path}. '
+                'Set YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK=1 to rerun this pass in-process for recovery.'
+            ) from exc
+        print(
+            f'Warning: interpolation process worker failed for {pass_tag} ({exc}); '
+            'falling back to legacy in-process interpolation because YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK=1.'
+        )
+        stats = interpolate_view_volume_pass_inplace(
+            mask_mm=process_mm,
+            work_dir=work_dir,
+            pass_tag=pass_tag,
+            max_slice_distance=int(max_slice_distance),
+            search_angle_deg=float(search_angle_deg),
+            interpolation_walk_back=int(interpolation_walk_back),
+            interpolation_candidates=int(interpolation_candidates),
+            interpolate_min_radius=float(interpolate_min_radius),
+            keep_temp=bool(keep_temp),
+            prefer_memory=bool(prefer_memory),
+            reserve_bytes=int(reserve_bytes),
+            workers=int(workers),
+            wrap_axis=bool(wrap_axis),
+        )
+        stats = dict(stats)
+        stats['process_backend'] = 'fallback_in_process_after_worker_failure'
+
+    stats.setdefault('process_backend', 'process_pool_memmap')
+    stats['process_memmap_copied_from_anonymous_array'] = bool(copied_to_memmap)
+    stats['process_pool_workers'] = int(_INTERPOLATION_PROCESS_MAX_WORKERS)
+    flush_array(process_mm)
+    return process_mm, stats
 
 
 # --------------------------
@@ -6993,7 +7306,254 @@ def _local_half_width_for_components(
     return max(4, int(math.ceil(max_extent)) + 4)
 
 
-def _find_slice_projection_candidates(
+
+_NUMBA_PROJECTION_KERNEL_RUNTIME_DISABLED = False
+
+
+def compiled_interpolation_kernels_enabled() -> bool:
+    return bool(_numba is not None and _env_flag('YOLO_TTA_INTERPOLATION_COMPILED_KERNELS', True))
+
+
+def interpolation_projection_numba_max_tracked() -> int:
+    return max(8, _env_int('YOLO_TTA_INTERPOLATION_NUMBA_MAX_TRACKED_CANDIDATES', 64))
+
+
+def interpolation_compiled_kernels_status() -> str:
+    if _numba is None:
+        return f'unavailable ({_NUMBA_IMPORT_ERROR})'
+    if not _env_flag('YOLO_TTA_INTERPOLATION_COMPILED_KERNELS', True):
+        return 'disabled by YOLO_TTA_INTERPOLATION_COMPILED_KERNELS=0'
+    if _NUMBA_PROJECTION_KERNEL_RUNTIME_DISABLED:
+        return 'disabled after runtime compilation/execution failure'
+    return 'enabled: numba no-GIL projection-candidate kernel'
+
+
+def interpolation_planning_backend_name() -> str:
+    base = 'cached_per_slice_component_tables_local_sdf_unordered'
+    if compiled_interpolation_kernels_enabled() and not _NUMBA_PROJECTION_KERNEL_RUNTIME_DISABLED:
+        base += '+numba_nogil_projection_candidates'
+    else:
+        base += '+python_projection_candidates'
+    if _INTERPOLATION_PROCESS_WORKER:
+        base += '+process_isolated_pass'
+    return base
+
+
+if _numba is not None:
+    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+    def _numba_find_projection_candidates_kernel(
+        labels_real: np.ndarray,
+        sdf: np.ndarray,
+        crop_y0: int,
+        crop_x0: int,
+        s0: int,
+        source_anchor_y: int,
+        source_anchor_x: int,
+        seed_label: int,
+        direction_sign: int,
+        max_steps: int,
+        slope: float,
+        max_candidates: int,
+        wrap_axis: bool,
+        search_angle_negative: bool,
+        max_tracked: int,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int]:
+        out_labels = np.zeros((max_tracked,), dtype=np.int64)
+        out_slices = np.zeros((max_tracked,), dtype=np.int64)
+        out_ys = np.zeros((max_tracked,), dtype=np.int64)
+        out_xs = np.zeros((max_tracked,), dtype=np.int64)
+        out_steps = np.zeros((max_tracked,), dtype=np.int64)
+        out_d2 = np.zeros((max_tracked,), dtype=np.int64)
+
+        step_labels = np.zeros((max_tracked,), dtype=np.int64)
+        step_ys = np.zeros((max_tracked,), dtype=np.int64)
+        step_xs = np.zeros((max_tracked,), dtype=np.int64)
+        step_d2 = np.zeros((max_tracked,), dtype=np.int64)
+
+        found_count = 0
+        num_slices = labels_real.shape[0]
+        sdf_h = sdf.shape[0]
+        sdf_w = sdf.shape[1]
+        overflow = 0
+
+        for step in range(1, max_steps + 1):
+            s = s0 + direction_sign * step
+            if wrap_axis:
+                s = s % num_slices
+            else:
+                if s < 0 or s >= num_slices:
+                    break
+
+            threshold = -slope * float(step)
+            any_projection = False
+            step_count = 0
+
+            for yy in range(sdf_h):
+                gy = crop_y0 + yy
+                for xx in range(sdf_w):
+                    if sdf[yy, xx] < threshold:
+                        continue
+                    any_projection = True
+                    gx = crop_x0 + xx
+                    target_label = int(labels_real[s, gy, gx])
+                    if target_label <= 0 or target_label == seed_label:
+                        continue
+
+                    already_found = False
+                    for prev_idx in range(found_count):
+                        if out_labels[prev_idx] == target_label:
+                            already_found = True
+                            break
+                    if already_found:
+                        continue
+
+                    step_idx = -1
+                    for local_idx in range(step_count):
+                        if step_labels[local_idx] == target_label:
+                            step_idx = local_idx
+                            break
+
+                    dy = gy - source_anchor_y
+                    dx = gx - source_anchor_x
+                    d2 = dy * dy + dx * dx
+                    if step_idx < 0:
+                        if step_count >= max_tracked:
+                            overflow = 1
+                            return out_labels, out_slices, out_ys, out_xs, out_steps, out_d2, found_count, overflow
+                        step_labels[step_count] = target_label
+                        step_ys[step_count] = gy
+                        step_xs[step_count] = gx
+                        step_d2[step_count] = d2
+                        step_count += 1
+                    else:
+                        if d2 < step_d2[step_idx]:
+                            step_ys[step_idx] = gy
+                            step_xs[step_idx] = gx
+                            step_d2[step_idx] = d2
+
+            if not any_projection:
+                if search_angle_negative:
+                    break
+                continue
+
+            for local_idx in range(step_count):
+                if found_count >= max_tracked:
+                    overflow = 1
+                    return out_labels, out_slices, out_ys, out_xs, out_steps, out_d2, found_count, overflow
+                out_labels[found_count] = step_labels[local_idx]
+                out_slices[found_count] = s
+                out_ys[found_count] = step_ys[local_idx]
+                out_xs[found_count] = step_xs[local_idx]
+                out_steps[found_count] = step
+                out_d2[found_count] = step_d2[local_idx]
+                found_count += 1
+
+            if found_count >= max_candidates:
+                break
+
+        return out_labels, out_slices, out_ys, out_xs, out_steps, out_d2, found_count, overflow
+else:
+    _numba_find_projection_candidates_kernel = None
+
+
+def _find_slice_projection_candidates_numba(
+    labels_real: np.ndarray,
+    seed: SliceEndpointSeed,
+    max_slice_distance: int,
+    search_angle_deg: float,
+    max_candidates: int,
+    wrap_axis: bool = False,
+    component_cache: Optional[SliceComponentTableCache] = None,
+) -> Optional[List[SliceProjectionCandidate]]:
+    global _NUMBA_PROJECTION_KERNEL_RUNTIME_DISABLED
+    if (
+        _numba_find_projection_candidates_kernel is None
+        or not compiled_interpolation_kernels_enabled()
+        or _NUMBA_PROJECTION_KERNEL_RUNTIME_DISABLED
+    ):
+        return None
+    if int(max_slice_distance) <= 0 or int(max_candidates) <= 0:
+        return []
+
+    s0, y0, x0 = seed.point
+    num_slices = int(labels_real.shape[0])
+    if num_slices <= 0:
+        return []
+
+    local_cache = component_cache if component_cache is not None else SliceComponentTableCache(labels_real)
+    source_record, source_anchor = local_cache.find_record_for_point(int(s0), int(seed.label), (int(y0), int(x0)))
+    if source_record is None or source_anchor is None or int(source_record.area) <= 0:
+        return []
+
+    max_steps = min(int(max_slice_distance), max(0, int(num_slices) - 1)) if bool(wrap_axis) else int(max_slice_distance)
+    if int(max_steps) <= 0:
+        return []
+
+    cropped_sdf = local_cache.get_projection_sdf(
+        source_record,
+        max_slice_distance=int(max_steps),
+        search_angle_deg=float(search_angle_deg),
+    )
+    sdf = np.ascontiguousarray(cropped_sdf.sdf, dtype=np.float32)
+    crop_y0 = int(cropped_sdf.origin_y)
+    crop_x0 = int(cropped_sdf.origin_x)
+    slope = math.tan(math.radians(float(search_angle_deg)))
+    max_tracked = max(int(max_candidates), int(interpolation_projection_numba_max_tracked()))
+
+    try:
+        labels_out, slices_out, ys_out, xs_out, steps_out, d2_out, count, overflow = _numba_find_projection_candidates_kernel(
+            labels_real,
+            sdf,
+            int(crop_y0),
+            int(crop_x0),
+            int(s0),
+            int(source_anchor[0]),
+            int(source_anchor[1]),
+            int(seed.label),
+            int(seed.direction_sign),
+            int(max_steps),
+            float(slope),
+            int(max_candidates),
+            bool(wrap_axis),
+            bool(float(search_angle_deg) < 0.0),
+            int(max_tracked),
+        )
+    except Exception as exc:
+        _NUMBA_PROJECTION_KERNEL_RUNTIME_DISABLED = True
+        print(f'Warning: Numba interpolation projection kernel failed ({exc}); using Python candidate search for remaining calls in this process.')
+        return None
+
+    if int(overflow) != 0:
+        # Preserve exact semantics by falling back to the Python implementation when a single
+        # projection step contains more distinct labels than the fixed-size compiled workspace.
+        return None
+    if int(count) <= 0:
+        return []
+
+    rows: List[Tuple[int, int, int, int, int, int]] = []
+    for idx in range(int(count)):
+        rows.append((
+            int(steps_out[int(idx)]),
+            int(d2_out[int(idx)]),
+            int(labels_out[int(idx)]),
+            int(slices_out[int(idx)]),
+            int(ys_out[int(idx)]),
+            int(xs_out[int(idx)]),
+        ))
+    rows.sort(key=lambda item: (int(item[0]), int(item[1]), int(item[2])))
+    out: List[SliceProjectionCandidate] = []
+    for step, _d2, target_label, target_slice, target_y, target_x in rows[: int(max_candidates)]:
+        out.append(SliceProjectionCandidate(
+            source_label=int(seed.label),
+            target_label=int(target_label),
+            source_point=(int(s0), int(y0), int(x0)),
+            target_point=(int(target_slice), int(target_y), int(target_x)),
+            slice_distance=int(step),
+        ))
+    return out
+
+
+def _find_slice_projection_candidates_python(
     labels_real: np.ndarray,
     seed: SliceEndpointSeed,
     max_slice_distance: int,
@@ -7088,6 +7648,37 @@ def _find_slice_projection_candidates(
     )
     return ordered[: int(max_candidates)]
 
+
+
+def _find_slice_projection_candidates(
+    labels_real: np.ndarray,
+    seed: SliceEndpointSeed,
+    max_slice_distance: int,
+    search_angle_deg: float,
+    max_candidates: int,
+    wrap_axis: bool = False,
+    component_cache: Optional[SliceComponentTableCache] = None,
+) -> List[SliceProjectionCandidate]:
+    fast_candidates = _find_slice_projection_candidates_numba(
+        labels_real=labels_real,
+        seed=seed,
+        max_slice_distance=int(max_slice_distance),
+        search_angle_deg=float(search_angle_deg),
+        max_candidates=int(max_candidates),
+        wrap_axis=bool(wrap_axis),
+        component_cache=component_cache,
+    )
+    if fast_candidates is not None:
+        return fast_candidates
+    return _find_slice_projection_candidates_python(
+        labels_real=labels_real,
+        seed=seed,
+        max_slice_distance=int(max_slice_distance),
+        search_angle_deg=float(search_angle_deg),
+        max_candidates=int(max_candidates),
+        wrap_axis=bool(wrap_axis),
+        component_cache=component_cache,
+    )
 
 def _collect_walkback_source_points(
     labels_real: np.ndarray,
@@ -7450,7 +8041,7 @@ def interpolate_view_volume_pass_inplace(
             'skipped': True,
             'wrap_axis': bool(wrap_axis),
             'endpoint_method': 'slice_component_scan',
-            'planning_backend': 'cached_per_slice_component_tables_local_sdf_unordered',
+            'planning_backend': interpolation_planning_backend_name(),
         }
 
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -7491,7 +8082,7 @@ def interpolate_view_volume_pass_inplace(
             'skipped': int(num_objects) <= 1,
             'wrap_axis': bool(wrap_axis),
             'endpoint_method': 'slice_component_scan',
-            'planning_backend': 'cached_per_slice_component_tables_local_sdf_unordered',
+            'planning_backend': interpolation_planning_backend_name(),
         }
 
     component_cache = SliceComponentTableCache(labels_mm)
@@ -7523,7 +8114,7 @@ def interpolate_view_volume_pass_inplace(
             'skipped': False,
             'wrap_axis': bool(wrap_axis),
             'endpoint_method': 'slice_component_scan',
-            'planning_backend': 'cached_per_slice_component_tables_local_sdf_unordered',
+            'planning_backend': interpolation_planning_backend_name(),
         }
 
     bridge_path: Optional[Path] = None
@@ -7653,7 +8244,7 @@ def interpolate_view_volume_pass_inplace(
         'skipped': False,
         'wrap_axis': bool(wrap_axis),
         'endpoint_method': 'slice_component_scan',
-        'planning_backend': 'cached_per_slice_component_tables_local_sdf_unordered',
+        'planning_backend': interpolation_planning_backend_name(),
     }
 
 
@@ -8833,7 +9424,7 @@ def prepare_view_volume_after_fullframe(
                     workers=int(slice_workers),
                 )
 
-            stats_local = interpolate_view_volume_pass_inplace(
+            baseline_native_volume, stats_local = interpolate_view_volume_pass_maybe_process(
                 mask_mm=baseline_native_volume,
                 work_dir=temp_dir / 'interpolation' / model_name / view.name,
                 pass_tag=f'pass{pass_idx}',
@@ -9679,7 +10270,7 @@ def finalize_consolidated_tile_volume_for_parent(
                     workers=int(slice_workers),
                 )
 
-            stats_local = interpolate_view_volume_pass_inplace(
+            tile_accumulator_mm, stats_local = interpolate_view_volume_pass_maybe_process(
                 mask_mm=tile_accumulator_mm,
                 work_dir=temp_dir / 'tile_interpolation' / str(model_name) / view.name / 'consolidated',
                 pass_tag=f'pass{pass_idx}',
@@ -10611,7 +11202,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.5-Pro_v12.2.6_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.5-Pro_v12.3.0_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -12864,6 +13455,19 @@ def main() -> None:
         _env_int('YOLO_TTA_TILE_INTERPOLATION_TASK_WORKERS', tile_interpolation_task_workers_default),
     )
 
+    interpolation_process_backend_active = bool(interpolation_process_backend_enabled() and int(args.interpolate) > 0)
+    interpolation_process_workers_default = max(
+        1,
+        min(
+            2,
+            max(1, int(parent_postprocess_workers)) + (1 if len(tile_configs) > 0 else 0),
+        ),
+    )
+    interpolation_process_workers = (
+        max(1, _env_int('YOLO_TTA_INTERPOLATION_PROCESS_WORKERS', interpolation_process_workers_default))
+        if bool(interpolation_process_backend_active) else 0
+    )
+
     print(f'Allocated CPU count: {_cpu_count()}')
     print(f'Worker budget: {worker_budget}')
     print('Worker oversubscription is intentional (default budget = 2x visible CPUs).')
@@ -12880,6 +13484,14 @@ def main() -> None:
         f'{tile_postprocess_workers} (per-tile slice workers: {tile_slice_postprocess_workers}, '
         f'consolidated-tile interpolation workers: {tile_interpolation_task_workers})'
     )
+    if bool(interpolation_process_backend_active):
+        print(
+            'Interpolation process backend: enabled '
+            f'(process workers: {int(interpolation_process_workers)}, start_method={interpolation_process_start_method()}, '
+            f'child cv2_threads={interpolation_process_cv2_threads()}, compiled kernels: {interpolation_compiled_kernels_status()})'
+        )
+    else:
+        print('Interpolation process backend: disabled (legacy in-process interpolation path).')
     print(f'Background output workers: {output_workers} (frame workers per labels/TIFF task: {output_frame_workers})')
     max_predict_video_frames = max(1, max((int(v.num_slices) for v in inference_views), default=1))
     example_cpu_mask_workers = max(1, min(int(predict_postprocess_workers), int(max_predict_video_frames)))
@@ -12917,6 +13529,15 @@ def main() -> None:
         'Tune YOLO_TTA_INTERPOLATION_LABEL_WORKERS, YOLO_TTA_INTERPOLATION_PAIR_WORKERS, YOLO_TTA_INTERPOLATION_COMPACT_WORKERS, '
         'YOLO_TTA_INTERPOLATION_COMPACT_RELABEL_ROWS, and YOLO_TTA_INTERPOLATION_CONCURRENT_PARENTS if needed.'
     )
+    spec_notes.append(
+        'v12.3.0 interpolation process isolation active by default: full-frame and consolidated-tile interpolation passes reopen uint8 mask volumes from disk-backed memmaps in a ProcessPoolExecutor worker and return only small stats. '
+        f'Process backend enabled={bool(interpolation_process_backend_active)}, process_workers={int(interpolation_process_workers)}, start_method={interpolation_process_start_method()}, '
+        f'fallback_on_worker_failure={bool(interpolation_process_fallback_enabled())}. Anonymous in-memory mask arrays are copied once to a process memmap before interpolation, avoiding multi-GiB pickle payloads.'
+    )
+    spec_notes.append(
+        f'v12.3.0 compiled interpolation kernels: {interpolation_compiled_kernels_status()}. '
+        'The compiled kernel accelerates projection-candidate discovery in seed planning with Numba nogil=True when numba is installed; the exact Python candidate search remains the fallback.'
+    )
 
     output_manager = BackgroundOutputManager(max_workers=output_workers)
 
@@ -12925,6 +13546,13 @@ def main() -> None:
             cv2.setNumThreads(1)
         except Exception:
             pass
+
+    interpolation_process_executor: Optional[ProcessPoolExecutor] = None
+    if bool(interpolation_process_backend_active):
+        interpolation_process_executor = create_interpolation_process_executor(int(interpolation_process_workers))
+        set_interpolation_process_executor(interpolation_process_executor, int(interpolation_process_workers))
+    else:
+        set_interpolation_process_executor(None, 0)
 
     dense_tiling_active = len(tile_configs) > 0
     view_infos_by_name: Dict[str, ViewInfo] = {view.name: view for view in views}
@@ -13736,6 +14364,12 @@ def main() -> None:
         prediction_volume_executor.shutdown(wait=True)
         parent_postprocess_executor.shutdown(wait=True)
         tile_postprocess_executor.shutdown(wait=True)
+        set_interpolation_process_executor(None, 0)
+        if interpolation_process_executor is not None:
+            try:
+                interpolation_process_executor.shutdown(wait=True, cancel_futures=False)
+            except TypeError:
+                interpolation_process_executor.shutdown(wait=True)
 
     _drain_completed_prediction_volume_futures()
     _drain_completed_background_futures()
