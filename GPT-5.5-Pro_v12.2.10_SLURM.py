@@ -8766,7 +8766,7 @@ class NrrdLayerRef:
     The layer is a binary mask in the pipeline's orthogonal ``(t, Y, X)``
     processing geometry. The backing path may be a raw uint8 memmap or a
     v12.2 raw bbox cvol/ctile store. The NRRD writer reads either source
-    slice-by-slice and writes a 4D NRRD with a leading list axis.
+    slice-by-slice and writes a 4D NRRD with a trailing list axis.
     """
 
     key: str
@@ -11396,18 +11396,28 @@ def _nrrd_ascii_header_text(value: object) -> str:
     return text
 
 
-def _nrrd_space_directions_matrix(spatial_axes: int = 3, list_axis: bool = False) -> np.ndarray:
-    """Return a pynrrd-compatible ``space directions`` matrix.
+def _nrrd_space_directions_matrix(
+    spatial_axes: int = 3,
+    list_axis: bool = False,
+    list_axis_position: str = 'first',
+) -> np.ndarray:
+    """Return a NRRD ``space directions`` matrix with optional non-spatial list axis.
 
-    pynrrd's default representation is a numeric matrix; non-spatial axes are
-    represented by a row of NaNs, which serializes as ``none``.  This avoids the
-    NumPy inhomogeneous-shape error that can occur when a Python list mixes
-    ``None`` and 3-vectors while pynrrd is still in matrix mode.
+    Non-spatial axes are represented by a row of NaNs, which serializes as
+    ``none``.  ``list_axis_position='last'`` is used by decomposed segmentation
+    NRRDs so the on-disk byte stream is one complete ``(t,Y,X)`` layer block
+    followed by the next layer.
     """
     spatial_axes_i = max(1, int(spatial_axes))
     if bool(list_axis):
+        position = str(list_axis_position).strip().lower()
         mat = np.full((spatial_axes_i + 1, spatial_axes_i), np.nan, dtype=np.float64)
-        mat[1:, :] = np.eye(spatial_axes_i, dtype=np.float64)
+        if position == 'last':
+            mat[:spatial_axes_i, :] = np.eye(spatial_axes_i, dtype=np.float64)
+        elif position == 'first':
+            mat[1:, :] = np.eye(spatial_axes_i, dtype=np.float64)
+        else:
+            raise ValueError("list_axis_position must be 'first' or 'last'")
         return mat
     return np.eye(spatial_axes_i, dtype=np.float64)
 
@@ -11681,17 +11691,20 @@ def _write_single_nrrd_payload_stream(mask_u8: np.ndarray, payload_writer: objec
     if src.ndim != 3:
         raise ValueError(f'NRRD export expects a 3D mask volume with shape (t,Y,X), got {src.shape}')
     t_dim, h_dim, w_dim = (int(src.shape[0]), int(src.shape[1]), int(src.shape[2]))
-    chunk_rows = _nrrd_stream_chunk_rows(1, w_dim, h_dim)
+    z_chunk = _nrrd_full_slice_z_chunk(1, w_dim, h_dim, t_dim)
+    buffer_bytes = int(w_dim) * int(h_dim) * int(z_chunk)
     print(
         f'NRRD streaming single-volume payload: shape=(X,Y,t)=({w_dim},{h_dim},{t_dim}), '
-        f'row_chunk={int(chunk_rows)}, pigz_level={nrrd_pigz_compresslevel()}, pigz_threads={nrrd_pigz_threads()}'
+        f'z_chunk={int(z_chunk)}, buffer~{buffer_bytes / GIB:.3f} GiB, '
+        f'pigz_level={nrrd_pigz_compresslevel()}, pigz_threads={nrrd_pigz_threads()}'
     )
-    for z in tqdm(range(t_dim), desc='NRRD streaming: single volume'):
-        frame = np.asarray(src[int(z)], dtype=np.uint8)
-        for y0 in range(0, h_dim, chunk_rows):
-            y1 = min(h_dim, y0 + chunk_rows)
-            block_xy = np.asfortranarray(frame[int(y0):int(y1), :].T)
-            payload_writer.write(block_xy.tobytes(order='F'))
+    for z0 in tqdm(range(0, t_dim, int(z_chunk)), desc='NRRD streaming: single volume'):
+        z1 = min(t_dim, int(z0) + int(z_chunk))
+        chunk = np.asarray(src[int(z0):int(z1)], dtype=np.uint8)
+        if chunk.flags['C_CONTIGUOUS']:
+            payload_writer.write(memoryview(chunk).cast('B'))
+        else:
+            payload_writer.write(np.ascontiguousarray(chunk).tobytes(order='C'))
 
 
 def write_nrrd(mask_u8: np.ndarray, out_path: Path) -> Path:
@@ -11746,13 +11759,23 @@ def _close_nrrd_layer_source(src: object) -> None:
     close_memmap_array(src)
 
 
+def _drop_nrrd_raw_store_chunks_ram_cache(src: object) -> None:
+    if not isinstance(src, RawBBoxMaskStore):
+        return
+    try:
+        cache_key = src.chunks_path.resolve()
+    except Exception:
+        cache_key = src.chunks_path
+    _NRRD_RAW_STORE_CHUNKS_RAM_CACHE.pop(cache_key, None)
+
+
 def _log_nrrd_streaming_sources(effective_refs: Sequence[NrrdLayerRef]) -> None:
     raw_bbox = [ref for ref in effective_refs if _nrrd_layer_ref_is_raw_bbox_store(ref)]
     raw = [ref for ref in effective_refs if not _nrrd_layer_ref_is_raw_bbox_store(ref)]
     print(
         'NRRD streaming source files used by decomposed-layer payload packaging: '
         f'{len(effective_refs)} layer backing path(s); raw_bbox_store={len(raw_bbox)}, raw_u8={len(raw)}, '
-        f'raw_bbox_payload_ram_cache={nrrd_cache_raw_bbox_layers_in_ram_enabled()}, '
+        f'raw_bbox_payload_ram_cache_per_layer={nrrd_cache_raw_bbox_layers_in_ram_enabled()}, '
         f'precomputed_segment_extents={nrrd_precomputed_segment_extents_enabled()}'
     )
     preview = list(effective_refs[:8])
@@ -11828,14 +11851,14 @@ def nrrd_decomposed_header(
 
     header: Dict[str, object] = {
         'space': NRRD_SPACE,
-        'kinds': ['list', 'domain', 'domain', 'domain'],
-        # The leading list axis is non-spatial.  Use pynrrd's matrix-compatible
-        # representation: a NaN row serializes as ``none``.
-        'space directions': _nrrd_space_directions_matrix(spatial_axes=3, list_axis=True),
+        'kinds': ['domain', 'domain', 'domain', 'list'],
+        # The trailing list axis is non-spatial.  Use a NaN row so it serializes
+        # as ``none`` after the three spatial direction vectors.
+        'space directions': _nrrd_space_directions_matrix(spatial_axes=3, list_axis=True, list_axis_position='last'),
         'space origin': np.zeros((3,), dtype=np.float64),
         'content': (
             'decomposed binary segmentation layers; '
-            f'source_shape_tyx=({t_dim},{h},{w}); exported_axes=(layer,X,Y,t); '
+            f'source_shape_tyx=({t_dim},{h},{w}); exported_axes=(X,Y,t,layer); '
             'layer metadata stored in SegmentN_* fields and sidecar manifest JSON'
         ),
         'encoding': 'gzip',
@@ -12153,125 +12176,84 @@ def _write_decomposed_nrrd_payload_stream(
     output_shape: Tuple[int, int, int],
     payload_writer: object,
 ) -> None:
-    """Stream decomposed ``(layer,X,Y,t)`` pigz payload using RAM-aware slabs.
+    """Stream decomposed ``(X,Y,t,layer)`` payload one complete layer at a time.
 
-    This keeps the no-full-4D-payload guarantee while making slabs large enough to
-    exploit the normal SLURM headroom.  When the RAM budget can hold at least one
-    complete ``(layer,X,Y)`` payload slice, the writer batches multiple ``t`` slices
-    per write.  Otherwise it falls back to row slabs.  Layer fills inside each slab
-    are parallelized across worker threads.
+    NRRD stores axis 0 as the fastest-varying axis.  With sizes ``(X,Y,t,layer)``,
+    each layer occupies one contiguous on-disk block whose byte order matches the
+    pipeline's native ``(t,Y,X)`` C-order buffer.  This avoids the old
+    layer-fastest voxel interleave and the per-slice ``(Y,X)->(X,Y)`` transpose.
     """
     out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
     layer_count = int(len(effective_refs))
     if layer_count <= 0:
         return
 
-    full_slice_bytes = int(layer_count) * int(out_w) * int(out_h)
-    z_chunk = _nrrd_full_slice_z_chunk(layer_count, out_w, out_h, out_t)
-    use_full_slice_slabs = int(z_chunk) > 1 or nrrd_stream_buffer_bytes(full_slice_bytes) >= int(full_slice_bytes)
-    if use_full_slice_slabs:
-        chunk_rows = int(out_h)
-        buffer_bytes = int(layer_count) * int(out_w) * int(out_h) * int(z_chunk)
-    else:
-        chunk_rows = _nrrd_stream_chunk_rows(layer_count, out_w, out_h)
-        buffer_bytes = int(layer_count) * int(out_w) * int(chunk_rows)
-        z_chunk = 1
-
-    fill_workers = nrrd_payload_fill_workers(layer_count, z_chunk)
+    z_chunk = _nrrd_full_slice_z_chunk(1, out_w, out_h, out_t)
+    layer_slice_bytes = int(out_w) * int(out_h) * np.dtype(np.uint8).itemsize
+    buffer_bytes = int(layer_slice_bytes) * int(z_chunk)
     print(
-        f'NRRD streaming decomposed payload: layers={layer_count}, shape=(layer,X,Y,t)='
-        f'({layer_count},{out_w},{out_h},{out_t}), row_chunk={chunk_rows}, z_chunk={z_chunk}, '
-        f'buffer~{buffer_bytes / GIB:.3f} GiB, fill_workers={fill_workers}, '
+        f'NRRD streaming decomposed payload: layers={layer_count}, shape=(X,Y,t,layer)='
+        f'({out_w},{out_h},{out_t},{layer_count}), z_chunk={z_chunk}, '
+        f'one_layer_buffer~{buffer_bytes / GIB:.3f} GiB, '
         f'pigz_level={nrrd_pigz_compresslevel()}, pigz_threads={nrrd_pigz_threads()}'
     )
 
-    opened: List[object] = []
-    fill_executor: Optional[ThreadPoolExecutor] = None
-    try:
-        for ref in effective_refs:
-            src = _open_nrrd_layer_ref(ref)
-            _madvise_array_mmap(src, 'MADV_SEQUENTIAL')
-            opened.append(src)
-
-        madvise_interval = nrrd_madvise_dontneed_interval()
-        if int(fill_workers) > 1:
-            fill_executor = ThreadPoolExecutor(max_workers=int(fill_workers), thread_name_prefix='nrrd-fill')
-
-        def _run_fill_tasks(tasks: List[Callable[[], None]]) -> None:
-            if not tasks:
-                return
-            if fill_executor is None:
-                for task in tasks:
-                    task()
-            else:
-                futures = [fill_executor.submit(task) for task in tasks]
-                for fut in futures:
-                    fut.result()
-
-        if bool(use_full_slice_slabs):
+    madvise_interval = nrrd_madvise_dontneed_interval()
+    with tqdm(total=int(layer_count) * int(out_t), desc='NRRD streaming: decomposed layer blocks') as pbar:
+        for layer_idx, ref in enumerate(effective_refs):
+            src: Optional[object] = None
             try:
-                max_block4 = np.empty((layer_count, out_w, out_h, int(z_chunk)), dtype=np.uint8, order='F')
-            except MemoryError:
-                print('Warning: requested NRRD full-slice slab allocation failed; falling back to row-slab streaming for this file.')
-                chunk_rows = _nrrd_stream_chunk_rows(layer_count, out_w, out_h)
-                max_block3 = np.empty((layer_count, out_w, chunk_rows), dtype=np.uint8, order='F')
-                for z in tqdm(range(out_t), desc='NRRD streaming: decomposed layers'):
-                    for y0 in range(0, out_h, chunk_rows):
-                        y1 = min(out_h, y0 + chunk_rows)
-                        rows = int(y1 - y0)
-                        block = max_block3[:, :, :rows]
-                        tasks: List[Callable[[], None]] = []
-                        for layer_idx, src in enumerate(opened):
-                            def _task(layer_idx: int = int(layer_idx), src: object = src, z: int = int(z), y0: int = int(y0), y1: int = int(y1)) -> None:
-                                row_block_yx = _read_layer_row_block_in_output_shape(src, output_shape, z, y0, y1)
-                                block[int(layer_idx), :, :] = np.asarray(row_block_yx, dtype=np.uint8).T
-                            tasks.append(_task)
-                        _run_fill_tasks(tasks)
-                        payload_writer.write(block.tobytes(order='F'))
-                    if madvise_interval > 0 and ((int(z) + 1) % int(madvise_interval) == 0):
-                        for src in opened:
+                src = _open_nrrd_layer_ref(ref)
+                _madvise_array_mmap(src, 'MADV_SEQUENTIAL')
+                in_t, in_h, in_w = _volume_shape_tuple(src)
+                direct_native_stream = (
+                    (int(in_t), int(in_h), int(in_w)) == (int(out_t), int(out_h), int(out_w))
+                    and not isinstance(src, RawBBoxMaskStore)
+                )
+
+                if bool(direct_native_stream):
+                    # The memmap is already a native (t,Y,X) C-order layer.  Write chunks of
+                    # it directly; no transpose, no Fortran conversion, and no layer interleave.
+                    for z0 in range(0, out_t, int(z_chunk)):
+                        z1 = min(out_t, int(z0) + int(z_chunk))
+                        chunk = np.asarray(src[int(z0):int(z1)], dtype=np.uint8)
+                        if chunk.flags['C_CONTIGUOUS']:
+                            payload_writer.write(memoryview(chunk).cast('B'))
+                        else:
+                            payload_writer.write(np.ascontiguousarray(chunk).tobytes(order='C'))
+                        pbar.update(int(z1 - z0))
+                        if madvise_interval > 0 and (int(z1) % int(madvise_interval) == 0):
                             _madvise_array_mmap(src, 'MADV_DONTNEED')
-            else:
-                for z0 in tqdm(range(0, out_t, int(z_chunk)), desc='NRRD streaming: decomposed layers'):
+                    continue
+
+                try:
+                    layer_chunk = np.empty((int(z_chunk), int(out_h), int(out_w)), dtype=np.uint8, order='C')
+                except MemoryError:
+                    if int(z_chunk) != 1:
+                        print(
+                            f'Warning: requested one-layer NRRD chunk allocation failed for layer {int(layer_idx)}; '
+                            'falling back to one output t-slice at a time.'
+                        )
+                    z_chunk = 1
+                    layer_chunk = np.empty((1, int(out_h), int(out_w)), dtype=np.uint8, order='C')
+
+                for z0 in range(0, out_t, int(z_chunk)):
                     z1 = min(out_t, int(z0) + int(z_chunk))
                     z_count = int(z1 - z0)
-                    block4 = max_block4[:, :, :, :z_count]
-                    tasks = []
+                    block = layer_chunk[:z_count, :, :]
                     for zi, z in enumerate(range(int(z0), int(z1))):
-                        for layer_idx, src in enumerate(opened):
-                            def _task(layer_idx: int = int(layer_idx), zi: int = int(zi), src: object = src, z: int = int(z)) -> None:
-                                row_block_yx = _read_layer_row_block_in_output_shape(src, output_shape, z, 0, out_h)
-                                block4[int(layer_idx), :, :, int(zi)] = np.asarray(row_block_yx, dtype=np.uint8).T
-                            tasks.append(_task)
-                    _run_fill_tasks(tasks)
-                    payload_writer.write(block4.tobytes(order='F'))
+                        slice_yx = _read_layer_slice_in_output_shape(src, output_shape, int(z))
+                        block[int(zi), :, :] = np.asarray(slice_yx, dtype=np.uint8)
+                    payload_writer.write(block.tobytes(order='C'))
+                    pbar.update(int(z_count))
                     if madvise_interval > 0 and (int(z1) % int(madvise_interval) == 0):
-                        for src in opened:
-                            _madvise_array_mmap(src, 'MADV_DONTNEED')
-        else:
-            max_block = np.empty((layer_count, out_w, chunk_rows), dtype=np.uint8, order='F')
-            for z in tqdm(range(out_t), desc='NRRD streaming: decomposed layers'):
-                for y0 in range(0, out_h, chunk_rows):
-                    y1 = min(out_h, y0 + chunk_rows)
-                    rows = int(y1 - y0)
-                    block = max_block[:, :, :rows]
-                    tasks = []
-                    for layer_idx, src in enumerate(opened):
-                        def _task(layer_idx: int = int(layer_idx), src: object = src, z: int = int(z), y0: int = int(y0), y1: int = int(y1)) -> None:
-                            row_block_yx = _read_layer_row_block_in_output_shape(src, output_shape, z, y0, y1)
-                            block[int(layer_idx), :, :] = np.asarray(row_block_yx, dtype=np.uint8).T
-                        tasks.append(_task)
-                    _run_fill_tasks(tasks)
-                    payload_writer.write(block.tobytes(order='F'))
-                if madvise_interval > 0 and ((int(z) + 1) % int(madvise_interval) == 0):
-                    for src in opened:
                         _madvise_array_mmap(src, 'MADV_DONTNEED')
-    finally:
-        if fill_executor is not None:
-            fill_executor.shutdown(wait=True)
-        for src in opened:
-            _madvise_array_mmap(src, 'MADV_DONTNEED')
-            _close_nrrd_layer_source(src)
+            finally:
+                if src is not None:
+                    _madvise_array_mmap(src, 'MADV_DONTNEED')
+                    _close_nrrd_layer_source(src)
+                    _drop_nrrd_raw_store_chunks_ram_cache(src)
+
 
 def _write_decomposed_nrrd_manifest(
     *,
@@ -12292,7 +12274,7 @@ def _write_decomposed_nrrd_manifest(
 
     manifest = {
         'nrrd_path': str(out_path),
-        'axis_order': '(layer, X, Y, t)',
+        'axis_order': '(X, Y, t, layer)',
         'internal_layer_order': '(t, Y, X)',
         'output_shape_tyx': [int(output_shape[0]), int(output_shape[1]), int(output_shape[2])],
         'layer_count': int(len(effective_refs)),
@@ -12351,11 +12333,11 @@ def write_decomposed_nrrd(
     workers: int = 1,
     include_final_output_layer: bool = True,
 ) -> Path:
-    """Write a multi-layer NRRD whose leading axis decomposes the final segmentation.
+    """Write a multi-layer NRRD whose trailing axis decomposes the final segmentation.
 
     Each supplied layer is an orthogonal ``(t,Y,X)`` binary mask in processing geometry.  Layers are
     restored to the final output geometry on the fly when cubic resizing changed the working shape,
-    then streamed as a pigz gzip-encoded 4D payload ordered ``(layer, X, Y, t)``.  A sidecar
+    then streamed as a pigz gzip-encoded 4D payload ordered ``(X, Y, t, layer)``.  A sidecar
     ``*.manifest.json`` is written next to the NRRD so downstream tools can reconstruct unions
     without parsing NRRD custom fields.
     """
@@ -12434,21 +12416,15 @@ def write_decomposed_nrrd(
     estimated_old_payload_bytes = (
         int(len(effective_refs)) * int(output_shape[2]) * int(output_shape[1]) * int(output_shape[0])
     )
-    full_slice_bytes = int(len(effective_refs)) * int(output_shape[2]) * int(output_shape[1])
-    z_chunk_est = _nrrd_full_slice_z_chunk(int(len(effective_refs)), int(output_shape[2]), int(output_shape[1]), int(output_shape[0]))
-    if nrrd_stream_buffer_bytes(full_slice_bytes) >= int(full_slice_bytes):
-        bounded_buffer_bytes = int(full_slice_bytes) * int(z_chunk_est)
-    else:
-        bounded_buffer_bytes = int(len(effective_refs)) * int(output_shape[2]) * _nrrd_stream_chunk_rows(
-            int(len(effective_refs)),
-            int(output_shape[2]),
-            int(output_shape[1]),
-        )
+    layer_slice_bytes = int(output_shape[2]) * int(output_shape[1])
+    z_chunk_est = _nrrd_full_slice_z_chunk(1, int(output_shape[2]), int(output_shape[1]), int(output_shape[0]))
+    bounded_buffer_bytes = int(layer_slice_bytes) * int(z_chunk_est)
     print(
-        'Decomposed NRRD export is using the bounded streaming writer. '
+        'Decomposed NRRD export is using the layer-slowest bounded streaming writer. '
         f'A full 4D uint8 payload would be ~{estimated_old_payload_bytes / GIB:.1f} GiB; '
-        f'the RAM-aware streaming payload slab is ~{bounded_buffer_bytes / GIB:.3f} GiB '
-        f'(estimated z_chunk={int(z_chunk_est)} when full-slice slabs fit).'
+        f'the RAM-aware write buffer is one layer chunk, ~{bounded_buffer_bytes / GIB:.3f} GiB '
+        f'(estimated z_chunk={int(z_chunk_est)}). '
+        'The list axis is last, so each layer is written as its native (t,Y,X) C-order byte stream.'
     )
 
     _log_nrrd_streaming_sources(effective_refs)
@@ -12476,7 +12452,7 @@ def write_decomposed_nrrd(
         _write_nrrd_ascii_header(
             fh,
             header=header,
-            sizes=(len(effective_refs), int(output_shape[2]), int(output_shape[1]), int(output_shape[0])),
+            sizes=(int(output_shape[2]), int(output_shape[1]), int(output_shape[0]), len(effective_refs)),
             dimension=4,
             data_type='uint8',
             encoding='gzip',
@@ -13787,14 +13763,14 @@ def main() -> None:
             'Final Radial and Tilted backprojection uses a hybrid queue with at most two active sets: GPU is assigned first when CuPy/CUDA is available, and CPU receives work only while the GPU slot is busy or unavailable. Set YOLO_TTA_BACKPROJECT_GPU=0 to force CPU-only backprojection.'
         )
     spec_notes.append(
-        'NRRD export is decomposed by default in v12.2.0: layers are written on a leading list axis as '
-        '(layer,X,Y,t), with manifest JSON and SegmentN metadata for view, source, YOLO-vs-bridge, '
+        'NRRD export is decomposed by default in v12.2.0: layers are written on a trailing list axis as '
+        '(X,Y,t,layer), with manifest JSON and SegmentN metadata for view, source, YOLO-vs-bridge, '
         'tile acceptance category, pre-smoothing union, smoothing pass results, and final output. '
         'The NRRD payload is pigz-streamed directly from backing layers without materializing the full 4D decomposed payload; '
-        'v12.2.2+ uses a RAM-aware slab buffer that can span full (layer,X,Y) slices and multiple t slices when hundreds of GiB are free. '
+        'The layer-slowest writer uses a RAM-aware one-layer (t,Y,X) chunk buffer and writes layers sequentially without per-voxel interleave or slice transposes. '
         'Tune YOLO_TTA_NRRD_STREAM_BUFFER_MIB, YOLO_TTA_NRRD_STREAM_BUFFER_FRACTION, YOLO_TTA_NRRD_STREAM_BUFFER_MAX_GIB, '
-        'YOLO_TTA_NRRD_PAYLOAD_FILL_WORKERS, and YOLO_TTA_NRRD_PIGZ_LEVEL if needed. '
-        'Segment extents are now recorded when each NRRD layer/cvol store is materialized and reused during final packaging; only missing metadata or disabled YOLO_TTA_NRRD_PRECOMPUTED_SEGMENT_EXTENTS falls back to a layer scan. Raw cvol/ctile backing paths cache chunks.bin in RAM by default via YOLO_TTA_NRRD_CACHE_RAW_BBOX_LAYERS_IN_RAM=1 for the payload stream. '
+        'and YOLO_TTA_NRRD_PIGZ_LEVEL if needed. '
+        "Segment extents are now recorded when each NRRD layer/cvol store is materialized and reused during final packaging; only missing metadata or disabled YOLO_TTA_NRRD_PRECOMPUTED_SEGMENT_EXTENTS falls back to a layer scan. Raw cvol/ctile backing paths cache each layer's chunks.bin in RAM while that layer is streamed via YOLO_TTA_NRRD_CACHE_RAW_BBOX_LAYERS_IN_RAM=1, then release the per-layer cache. "
         'Transient NRRD projection, before-pass, and bridge-delta workspaces prefer anonymous RAM and fall back to disk only when the workspace budget requires it. '
         f'Legacy single-volume NRRD writing is retained only for deprecated internal callers without layer refs; space={NRRD_SPACE}.'
     )
