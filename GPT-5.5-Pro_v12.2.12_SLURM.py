@@ -2,7 +2,8 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v12.2.11_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.1-v12.2.11 performance patches:
+This v12.2.12_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.1-v12.2.12 performance patches:
+  - v12.2.12 changes full-frame/tile YOLO inputs to bounded streaming render sources, so inference starts after the first prefetch batch is rendered instead of after a complete (slice,imgsz,imgsz) prediction volume is materialized
   - v12.2.11 removes GPU backprojection from the final Radial/Tilted path, gives CPU-only backprojection the full slice-worker budget, keeps tile waiting/staging/consolidation canvases in RAM by default, overlaps YOLO model loading with decode/cube preparation, adds threaded ffmpeg decode defaults, and tightens the NRRD writer around the Target_Dummy trailing-list layout with direct raw-bbox chunk fills and full-CPU pigz defaults
   - v12.2.8 adds a dedicated single --angle streaming cleanup path: when exactly one augmentation angle is requested, min_conf filtering, 2D hole filling, and view-native per-slice min_radius filtering are applied as YOLO slices stream in; only true volume-level cleanup waits for the completed view volume
   - v12.2.9 keeps the GPU-fed queue hot by sizing prediction-volume builders to the active prefetch window, skipping scratch memmap flushes on the prediction hot path by default, and allowing single-angle CPU result accumulation to finish behind the next prediction volume
@@ -14,9 +15,9 @@ This v12.2.11_SLURM implementation of the v12.2.0_SLURM specification plus v12.2
   - v12.2.7 moves full-frame and consolidated-tile interpolation passes into a shared ProcessPoolExecutor by reopening disk-backed memmaps in worker processes, so GIL-heavy interpolation cannot starve prediction-volume builders in the main process
   - v12.2.7 adds optional Numba no-GIL projection-candidate kernels for interpolation seed planning; set YOLO_TTA_INTERPOLATION_COMPILED_KERNELS=0 to force the Python fallback
   - builds Transverse, optional generalized Tilted Views for Transverse/Sagittal/Coronal, independently optional upright Sagittal/Coronal, and optional Radial view families using single-channel intermediates
-  - materializes YOLO-ready full-frame and tiled prediction volumes as in-memory slice arrays instead of writing prediction videos to the temp folder
-  - feeds those volumes to Ultralytics through a custom in-memory loader with stream=True, while v12.2.9 defaults to deferred CPU retina-mask reconstruction so large GPU mask tensors are not copied on the scheduler/model-stream thread
-  - bounds prediction-volume creation to the current inference volume plus four queued volumes by default, preserving the priority order while preventing unbounded RAM growth
+  - renders YOLO-ready full-frame and tiled sources from memory through bounded streaming slice iterators instead of writing prediction videos or requiring a full prediction volume before inference
+  - feeds those sources to Ultralytics through custom HxWx1 in-memory loaders with stream=True, while v12.2.9 defaults to deferred CPU retina-mask reconstruction so large GPU mask tensors are not copied on the scheduler/model-stream thread
+  - bounds streaming prediction-source prefetch and legacy prediction-volume creation, preserving priority order while preventing unbounded RAM growth
   - stages cleaned tiled masks into one parent-view canvas per tile-size/stride set, gates each consolidated canvas
     at the connected-component level against frozen parent full-frame support, then interpolates the accepted tiled volume once per parent view
   - spills postprocessed waiting tile masks and decomposed NRRD/support binary volumes to raw slice-bbox stores with no bitpacking or LZ4 compression
@@ -62,6 +63,7 @@ import json
 import math
 import multiprocessing as mp
 import os
+import queue
 import re
 import shlex
 import struct
@@ -1233,6 +1235,98 @@ def ffmpeg_decode_threads() -> int:
     return max(1, _env_int('YOLO_TTA_FFMPEG_DECODE_THREADS', max(1, _cpu_count())))
 
 
+class VolumeReadiness:
+    """Slice-level readiness gate for streaming decode/cube preprocessing."""
+
+    def __init__(self, total_slices: int, desc: str = 'volume') -> None:
+        self.total_slices = max(0, int(total_slices))
+        self.desc = str(desc)
+        self._slice_events = [threading.Event() for _ in range(self.total_slices)]
+        self._all_event = threading.Event()
+        self._lock = threading.Lock()
+        self._ready_count = 0
+        self._exception: Optional[BaseException] = None
+        if self.total_slices <= 0:
+            self._all_event.set()
+
+    def mark_slice_ready(self, idx: int) -> None:
+        idx_i = int(idx)
+        if idx_i < 0 or idx_i >= int(self.total_slices):
+            return
+        ev = self._slice_events[idx_i]
+        if ev.is_set():
+            return
+        with self._lock:
+            if not ev.is_set():
+                ev.set()
+                self._ready_count += 1
+                if self._ready_count >= self.total_slices:
+                    self._all_event.set()
+
+    def mark_all_ready(self) -> None:
+        with self._lock:
+            for ev in self._slice_events:
+                ev.set()
+            self._ready_count = self.total_slices
+            self._all_event.set()
+
+    def mark_failed(self, exc: BaseException) -> None:
+        with self._lock:
+            self._exception = exc
+            for ev in self._slice_events:
+                ev.set()
+            self._all_event.set()
+
+    def _raise_if_failed(self) -> None:
+        exc = self._exception
+        if exc is not None:
+            raise RuntimeError(f'{self.desc} producer failed before required slice data was ready') from exc
+
+    def wait_for_slice(self, idx: int) -> None:
+        idx_i = int(idx)
+        if idx_i < 0 or idx_i >= int(self.total_slices):
+            raise IndexError(idx_i)
+        self._slice_events[idx_i].wait()
+        self._raise_if_failed()
+
+    def wait_all(self) -> None:
+        self._all_event.wait()
+        self._raise_if_failed()
+
+    @property
+    def ready_count(self) -> int:
+        with self._lock:
+            return int(self._ready_count)
+
+
+_VOLUME_READINESS_BY_ARRAY_ID: Dict[int, VolumeReadiness] = {}
+
+
+def streaming_preprocess_enabled() -> bool:
+    """Return True when decode/cube preprocessing may run ahead of consumers."""
+    return _env_flag('YOLO_TTA_STREAMING_PREPROCESS', True)
+
+
+def register_volume_readiness(arr: object, readiness: VolumeReadiness) -> None:
+    _VOLUME_READINESS_BY_ARRAY_ID[id(arr)] = readiness
+
+
+def volume_readiness(arr: object) -> Optional[VolumeReadiness]:
+    return _VOLUME_READINESS_BY_ARRAY_ID.get(id(arr))
+
+
+def wait_for_volume_slice_ready(arr: object, idx: int) -> None:
+    readiness = volume_readiness(arr)
+    if readiness is not None:
+        readiness.wait_for_slice(int(idx))
+
+
+def wait_for_volume_ready(arr: object) -> None:
+    readiness = volume_readiness(arr)
+    if readiness is not None:
+        readiness.wait_all()
+
+
 def ffprobe_info(video_path: Path) -> Dict[str, object]:
     """Return dict with width, height, fps, num_frames."""
     _require_bin("ffprobe")
@@ -1367,6 +1461,87 @@ def decode_video_to_memmap_gray8(
         if proc.returncode not in (0, None):
             msg = err.decode("utf-8", errors="ignore") if isinstance(err, (bytes, bytearray)) else str(err)
             raise RuntimeError(f"ffmpeg decode failed: {msg}")
+    return arr
+
+
+def decode_video_to_memmap_gray8_streaming(
+    input_video: Path,
+    out_dat: Path,
+    num_frames: int,
+    width: int,
+    height: int,
+    overwrite: bool = False,
+    *,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 32 * GIB,
+) -> np.ndarray:
+    """Start ffmpeg gray8 decode in the background and return its destination array immediately."""
+    _require_bin("ffmpeg")
+    shape = (int(num_frames), int(height), int(width))
+    reuse_existing = bool(not overwrite and out_dat.exists() and not prefer_memory)
+    arr = allocate_workspace_array(
+        shape=shape,
+        dtype=np.uint8,
+        path=out_dat,
+        desc='Decoded gray8 input volume [streaming producer]',
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
+        reuse_existing=bool(reuse_existing),
+        initialize_zero=False,
+    )
+    readiness = VolumeReadiness(int(num_frames), desc='streaming ffmpeg gray8 decode')
+    register_volume_readiness(arr, readiness)
+    if reuse_existing and isinstance(arr, np.memmap):
+        readiness.mark_all_ready()
+        return arr
+
+    raw_bytes = memoryview(np.ascontiguousarray(arr) if not arr.flags['C_CONTIGUOUS'] else arr).cast('B')
+    if raw_bytes.obj is not arr:
+        arr = np.asarray(raw_bytes.obj).reshape(shape)
+        raw_bytes = memoryview(arr).cast('B')
+        register_volume_readiness(arr, readiness)
+
+    frame_bytes = int(width) * int(height)
+    chunk_frames = max(1, min(128, max(1, (256 * 1024 * 1024) // max(1, frame_bytes))))
+
+    def _decode_worker() -> None:
+        cmd = [
+            "ffmpeg", "-v", "error", "-threads", str(ffmpeg_decode_threads()),
+            "-i", str(input_video), "-f", "rawvideo", "-pix_fmt", "gray", "-vsync", "0", "-",
+        ]
+        print(f'FFmpeg gray8 streaming decode threads: {ffmpeg_decode_threads()}')
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert proc.stdout is not None
+        try:
+            with tqdm(total=num_frames, desc='Streaming decode input volume (gray8)') as pbar:
+                for start in range(0, int(num_frames), int(chunk_frames)):
+                    nframes = min(int(chunk_frames), int(num_frames) - int(start))
+                    need = int(nframes) * int(frame_bytes)
+                    offset = int(start) * int(frame_bytes)
+                    view = raw_bytes[offset:offset + need]
+                    filled = 0
+                    while filled < need:
+                        nread = proc.stdout.readinto(view[filled:])
+                        if nread is None or nread <= 0:
+                            raise RuntimeError(f'Unexpected EOF while decoding frames starting at {start}/{num_frames}')
+                        filled += int(nread)
+                    for frame_idx in range(int(start), int(start) + int(nframes)):
+                        readiness.mark_slice_ready(int(frame_idx))
+                    pbar.update(int(nframes))
+            flush_array(arr)
+            readiness.mark_all_ready()
+        except BaseException as exc:
+            readiness.mark_failed(exc)
+            raise
+        finally:
+            if proc.stdout:
+                proc.stdout.close()
+            _out, err = proc.communicate()
+            if proc.returncode not in (0, None):
+                msg = err.decode("utf-8", errors="ignore") if isinstance(err, (bytes, bytearray)) else str(err)
+                readiness.mark_failed(RuntimeError(f"ffmpeg decode failed: {msg}"))
+
+    threading.Thread(target=_decode_worker, name='streaming-gray8-decode', daemon=False).start()
     return arr
 
 
@@ -1602,6 +1777,71 @@ def resize_volume_to_processing_cube_gray8(
         chunk_size=chunk_size,
     )
     flush_array(out_mm)
+    return out_mm
+
+
+def resize_volume_to_processing_cube_gray8_streaming(
+    volume_gray: np.ndarray,
+    out_shape: Tuple[int, int, int],
+    out_path: Path,
+    *,
+    workers: int = 1,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 32 * GIB,
+) -> np.ndarray:
+    """Start cubic gray8 preprocessing in the background and return its output array immediately."""
+    in_t, in_h, in_w = (int(volume_gray.shape[0]), int(volume_gray.shape[1]), int(volume_gray.shape[2]))
+    out_t, out_h, out_w = (int(out_shape[0]), int(out_shape[1]), int(out_shape[2]))
+    if (in_t, in_h, in_w) == (out_t, out_h, out_w):
+        input_ready = volume_readiness(volume_gray)
+        if input_ready is not None:
+            register_volume_readiness(volume_gray, input_ready)
+        return volume_gray
+
+    out_mm = allocate_workspace_array(
+        shape=(out_t, out_h, out_w), dtype=np.uint8, path=out_path,
+        desc='v12.2.0 cubic processing volume [streaming producer]',
+        prefer_memory=bool(prefer_memory), reserve_bytes=int(reserve_bytes), initialize_zero=False,
+    )
+    readiness = VolumeReadiness(int(out_t), desc='streaming cubic processing volume')
+    register_volume_readiness(out_mm, readiness)
+    worker_count = choose_slice_parallel_workers(int(workers), int(out_t))
+    chunk_size = choose_parallel_chunk_size(out_t, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
+
+    def _render_target_slice(out_z: int) -> None:
+        src_z = _linear_source_index(int(out_z), int(out_t), int(in_t))
+        z0 = int(math.floor(src_z))
+        z1 = min(in_t - 1, z0 + 1)
+        alpha = float(src_z - float(z0))
+        wait_for_volume_slice_ready(volume_gray, int(z0))
+        f0 = _resize_gray_slice_nearest_or_linear(volume_gray[z0], out_w, out_h, cv2.INTER_LINEAR)
+        if z1 == z0 or alpha <= 1e-7:
+            out_mm[int(out_z), :, :] = f0
+            readiness.mark_slice_ready(int(out_z))
+            return
+        wait_for_volume_slice_ready(volume_gray, int(z1))
+        f1 = _resize_gray_slice_nearest_or_linear(volume_gray[z1], out_w, out_h, cv2.INTER_LINEAR)
+        out_mm[int(out_z), :, :] = cv2.addWeighted(np.ascontiguousarray(f0), float(1.0 - alpha), np.ascontiguousarray(f1), float(alpha), 0.0)
+        readiness.mark_slice_ready(int(out_z))
+
+    def _resize_worker() -> None:
+        try:
+            print(
+                'Streaming cubic resize producer: '
+                f'in=(t,Y,X)=({in_t},{in_h},{in_w}) -> out=(t,Y,X)=({out_t},{out_h},{out_w}), '
+                f'workers={int(worker_count)}, chunk_size={int(chunk_size)}'
+            )
+            parallel_for_indices_chunked(
+                int(out_t), _render_target_slice, max_workers=worker_count,
+                desc='Streaming resize orthogonal volume to v12.2.0 cube', chunk_size=chunk_size,
+            )
+            flush_array(out_mm)
+            readiness.mark_all_ready()
+        except BaseException as exc:
+            readiness.mark_failed(exc)
+            raise
+
+    threading.Thread(target=_resize_worker, name='streaming-cubic-resize', daemon=False).start()
     return out_mm
 
 
@@ -2565,38 +2805,41 @@ class DenseTileJob:
 
 @dataclass
 class PredictionVolumeRef:
-    """A materialized in-memory prediction volume for one active inference job.
+    """One active YOLO input job.
 
-    The array is always indexed as ``(slice, y, x)`` and contains the exact
-    ``--imgsz`` raster that YOLO will consume.  ``path`` is only a last-resort
-    fallback path if the workspace allocator cannot obtain anonymous memory; the
-    normal v12 SLURM path keeps these volumes resident in RAM and never writes
-    prediction videos to scratch.
+    ``array`` is used by the legacy dense-materialization path.  v12.2.12 normally
+    uses ``source``: an Ultralytics-compatible streaming source that renders a
+    bounded prefetch window of slices and lets YOLO start on the first ready batch.
     """
 
-    array: np.ndarray
+    array: Optional[np.ndarray]
     path: Optional[Path]
     name: str
     view_name: str
     job_id: str
     kind: str = 'fullframe'
+    source: Optional[object] = None
 
 
 def close_prediction_volume_ref(ref: Optional[PredictionVolumeRef], *, keep_temp: bool = False) -> None:
-    """Release one materialized prediction volume and remove any fallback backing file.
-
-    Prediction volumes are scratch inputs consumed by this process. When the backing
-    file is about to be deleted, forcing a full memmap flush can stall the scheduler
-    after every inference volume. Flush only when temp artifacts are being kept.
-    """
+    """Release one prediction source and remove any fallback backing file."""
     if ref is None:
         return
-    arr = ref.array
-    path = ref.path
-    if bool(keep_temp):
-        close_memmap_array(arr)
-    else:
-        close_memmap_array_without_flush(arr)
+
+    close_fn = getattr(getattr(ref, 'source', None), 'close', None)
+    if callable(close_fn):
+        try:
+            close_fn()
+        except Exception as exc:
+            print(f'Warning: failed to close streaming prediction source {ref.name} ({exc})')
+
+    arr = getattr(ref, 'array', None)
+    path = getattr(ref, 'path', None)
+    if arr is not None:
+        if bool(keep_temp):
+            close_memmap_array(arr)
+        else:
+            close_memmap_array_without_flush(arr)
     if not bool(keep_temp) and path is not None:
         try:
             Path(path).unlink(missing_ok=True)
@@ -2687,6 +2930,231 @@ class InMemoryYoloVolumeSource:
         return paths, imgs, info
 
 
+
+class StreamingYoloVolumeSource:
+    """Ultralytics-compatible source that renders prediction slices just ahead of YOLO.
+
+    The legacy v12 path first materialized a complete ``(N,imgsz,imgsz)`` uint8
+    array for every full-frame/tile job.  This source keeps only a bounded window
+    of rendered futures alive: the first batch can enter YOLO as soon as those
+    frames are ready, while CPU workers continue rendering later slices behind the
+    GPU stream.
+    """
+
+    def __init__(
+        self,
+        renderer: Callable[[int], np.ndarray],
+        *,
+        num_frames: int,
+        name: str,
+        batch_size: int = 1,
+        max_frames: Optional[int] = None,
+        out_size: Optional[int] = None,
+        render_workers: int = 1,
+        prefetch_frames: Optional[int] = None,
+        autostart: bool = True,
+    ) -> None:
+        self.renderer = renderer
+        self.name = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(name)).strip('_') or 'streaming_volume'
+        self.nf = max(0, int(num_frames))
+        if max_frames is not None:
+            self.nf = max(0, min(self.nf, int(max_frames)))
+        self.out_size = None if out_size is None else int(out_size)
+        self.bs = max(1, int(batch_size))
+        self.yield_nf = int(math.ceil(float(self.nf) / float(self.bs)) * self.bs) if self.nf > 0 else 0
+        self.synthetic_count = max(0, int(self.yield_nf) - int(self.nf))
+        self.render_workers = max(1, min(int(render_workers), max(1, int(self.nf))))
+        default_prefetch = streaming_prediction_source_prefetch_frames(self.bs)
+        self.prefetch_frames = max(self.bs, int(prefetch_frames if prefetch_frames is not None else default_prefetch))
+        self.mode = 'image'
+        self.count = 0
+        self._next_submit = 0
+        self._futures: Dict[int, Future] = {}
+        self._executor: Optional[ThreadPoolExecutor] = None
+        self._lock = threading.Lock()
+        self._closed = False
+        try:
+            from ultralytics.data.loaders import SourceTypes  # type: ignore
+            self.source_type = SourceTypes(stream=False, screenshot=False, from_img=True, tensor=False)
+        except Exception:
+            self.source_type = argparse.Namespace(stream=False, screenshot=False, from_img=True, tensor=False)
+        if bool(autostart):
+            self.start()
+
+    def __len__(self) -> int:
+        return int(math.ceil(float(self.nf) / float(self.bs))) if self.nf > 0 else 0
+
+    def __iter__(self) -> 'StreamingYoloVolumeSource':
+        self.start()
+        self.count = 0
+        self._fill_prefetch_locked(target_index=0)
+        return self
+
+    @staticmethod
+    def _frame_to_single_channel(frame: np.ndarray) -> np.ndarray:
+        return InMemoryYoloVolumeSource._frame_to_single_channel(frame)
+
+    def start(self) -> None:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError(f'Streaming YOLO source {self.name} is already closed')
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(
+                    max_workers=int(self.render_workers),
+                    thread_name_prefix=f'yolo-render-{self.name[:24]}',
+                )
+            self._fill_prefetch_locked(target_index=0)
+
+    def close(self) -> None:
+        executor: Optional[ThreadPoolExecutor]
+        with self._lock:
+            self._closed = True
+            executor = self._executor
+            self._executor = None
+            self._futures.clear()
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                executor.shutdown(wait=False)
+
+    def _submit_locked(self, idx: int) -> None:
+        idx_i = int(idx)
+        if idx_i in self._futures or idx_i >= int(self.nf):
+            return
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=int(self.render_workers),
+                thread_name_prefix=f'yolo-render-{self.name[:24]}',
+            )
+        self._futures[idx_i] = self._executor.submit(self._render_one, idx_i)
+        self._next_submit = max(int(self._next_submit), idx_i + 1)
+
+    def _fill_prefetch_locked(self, target_index: int) -> None:
+        if self._closed or int(self.nf) <= 0:
+            return
+        submit_stop = min(int(self.nf), max(int(self._next_submit), int(target_index) + int(self.prefetch_frames)))
+        while int(self._next_submit) < int(submit_stop):
+            self._submit_locked(int(self._next_submit))
+
+    def _ensure_submitted(self, stop_exclusive: int) -> None:
+        with self._lock:
+            self._fill_prefetch_locked(target_index=max(0, int(stop_exclusive)))
+            while int(self._next_submit) < min(int(self.nf), int(stop_exclusive)):
+                self._submit_locked(int(self._next_submit))
+
+    def _render_one(self, idx: int) -> np.ndarray:
+        frame = np.asarray(self.renderer(int(idx)), dtype=np.uint8)
+        if frame.ndim == 3 and int(frame.shape[-1]) == 1:
+            frame = frame[:, :, 0]
+        if frame.ndim != 2:
+            raise ValueError(f'{self.name}: renderer returned unsupported frame shape {frame.shape} for slice {idx}')
+        if self.out_size is not None and (int(frame.shape[0]) != int(self.out_size) or int(frame.shape[1]) != int(self.out_size)):
+            raise ValueError(f'{self.name}: renderer returned {frame.shape}, expected ({int(self.out_size)}, {int(self.out_size)})')
+        return np.ascontiguousarray(frame, dtype=np.uint8)
+
+    def _get_real_frame(self, idx: int) -> np.ndarray:
+        idx_i = int(np.clip(int(idx), 0, max(0, int(self.nf) - 1)))
+        self._ensure_submitted(idx_i + 1)
+        with self._lock:
+            fut = self._futures.get(idx_i)
+        if fut is None:
+            # Should only happen if close() raced with iteration; render synchronously so the
+            # YOLO stream can still finish deterministically.
+            return self._render_one(idx_i)
+        frame = fut.result()
+        with self._lock:
+            self._futures.pop(idx_i, None)
+        return frame
+
+    def __next__(self) -> Tuple[List[str], List[np.ndarray], List[str]]:
+        if self.count >= self.yield_nf or self.nf <= 0:
+            self.close()
+            raise StopIteration
+        self.start()
+        start = int(self.count)
+        stop = min(int(self.yield_nf), start + int(self.bs))
+        # Ensure the actual batch is ready or rendering before waiting for ordered frames.
+        self._ensure_submitted(min(int(stop), int(self.nf)))
+        paths: List[str] = []
+        imgs: List[np.ndarray] = []
+        info: List[str] = []
+        last_real_idx = max(0, int(self.nf) - 1)
+        for idx in range(start, stop):
+            real_idx = int(idx) if int(idx) < int(self.nf) else int(last_real_idx)
+            synthetic = int(idx) >= int(self.nf)
+            suffix = '_synthetic' if synthetic else ''
+            frame = self._get_real_frame(real_idx)
+            paths.append(f'{self.name}_{idx + 1:06d}{suffix}.png')
+            imgs.append(self._frame_to_single_channel(frame))
+            if synthetic:
+                info.append(f'streaming {self.name} synthetic padded slice {idx + 1}/{self.yield_nf} repeats real slice {real_idx + 1}/{self.nf}: ')
+            else:
+                info.append(f'streaming {self.name} slice {idx + 1}/{self.nf}: ')
+        self.count = int(stop)
+        with self._lock:
+            self._fill_prefetch_locked(target_index=int(self.count))
+        return paths, imgs, info
+
+
+def streaming_prediction_sources_enabled() -> bool:
+    """Return True when YOLO input slices should be rendered lazily instead of prebuilt."""
+    if os.environ.get('YOLO_TTA_STREAMING_PREDICTION_SOURCES') is not None:
+        return _env_flag('YOLO_TTA_STREAMING_PREDICTION_SOURCES', True)
+    if os.environ.get('YOLO_TTA_STREAM_RENDERED_PREDICTION_SOURCES') is not None:
+        return _env_flag('YOLO_TTA_STREAM_RENDERED_PREDICTION_SOURCES', True)
+    return _env_flag('YOLO_TTA_STREAM_RENDERED_PREDICTION', True)
+
+
+def streaming_prediction_source_autostart_enabled() -> bool:
+    if os.environ.get('YOLO_TTA_STREAMING_SOURCE_AUTOSTART') is not None:
+        return _env_flag('YOLO_TTA_STREAMING_SOURCE_AUTOSTART', True)
+    return _env_flag('YOLO_TTA_STREAM_RENDER_AUTOSTART', True)
+
+
+def streaming_prediction_source_prefetch_frames(batch_size: int) -> int:
+    explicit = _env_int('YOLO_TTA_STREAMING_SOURCE_PREFETCH_FRAMES', 0)
+    if explicit <= 0 and os.environ.get('YOLO_TTA_STREAM_RENDER_PREFETCH_FRAMES') is not None:
+        explicit = _env_int('YOLO_TTA_STREAM_RENDER_PREFETCH_FRAMES', 0)
+    if explicit > 0:
+        return max(1, int(explicit))
+    batches = max(1, _env_int('YOLO_TTA_STREAMING_SOURCE_PREFETCH_BATCHES', _env_int('YOLO_TTA_STREAM_RENDER_PREFETCH_BATCHES', 8)))
+    max_frames = max(1, _env_int('YOLO_TTA_STREAMING_SOURCE_PREFETCH_MAX_FRAMES', _env_int('YOLO_TTA_STREAM_RENDER_PREFETCH_MAX_FRAMES', 384)))
+    return max(1, min(int(max_frames), max(int(batch_size), int(batch_size) * int(batches))))
+
+
+def streaming_prediction_source_workers(default_workers: int, num_frames: int) -> int:
+    requested = _env_int('YOLO_TTA_STREAMING_SOURCE_WORKERS', _env_int('YOLO_TTA_STREAM_RENDER_WORKERS', int(default_workers)))
+    return choose_slice_parallel_workers(max(1, int(requested)), max(1, int(num_frames)))
+
+
+def make_streaming_yolo_source(
+    renderer: Callable[[int], np.ndarray],
+    name: str,
+    *,
+    num_frames: int,
+    batch_size: int = 1,
+    max_frames: Optional[int] = None,
+    out_size: Optional[int] = None,
+    render_workers: int = 1,
+    prefetch_frames: Optional[int] = None,
+    autostart: Optional[bool] = None,
+) -> StreamingYoloVolumeSource:
+    ensure_ultralytics_accepts_in_memory_volume_source()
+    source = StreamingYoloVolumeSource(
+        renderer,
+        num_frames=int(num_frames),
+        name=str(name),
+        batch_size=max(1, int(batch_size)),
+        max_frames=max_frames,
+        out_size=out_size,
+        render_workers=max(1, int(render_workers)),
+        prefetch_frames=prefetch_frames,
+        autostart=streaming_prediction_source_autostart_enabled() if autostart is None else bool(autostart),
+    )
+    return source
+
+
 def ensure_ultralytics_accepts_in_memory_volume_source() -> None:
     """Register the v12 in-memory volume loader with Ultralytics' source checker."""
     try:
@@ -2699,8 +3167,12 @@ def ensure_ultralytics_accepts_in_memory_volume_source() -> None:
         loaders_tuple = tuple(loaders)
     except Exception:
         loaders_tuple = ()
-    if InMemoryYoloVolumeSource not in loaders_tuple:
-        setattr(ultralytics_build, 'LOADERS', loaders_tuple + (InMemoryYoloVolumeSource,))
+    additions: List[object] = []
+    for loader_cls in (InMemoryYoloVolumeSource, StreamingYoloVolumeSource):
+        if loader_cls not in loaders_tuple:
+            additions.append(loader_cls)
+    if additions:
+        setattr(ultralytics_build, 'LOADERS', loaders_tuple + tuple(additions))
 
 
 def make_in_memory_yolo_source(
@@ -2712,6 +3184,26 @@ def make_in_memory_yolo_source(
 ) -> InMemoryYoloVolumeSource:
     ensure_ultralytics_accepts_in_memory_volume_source()
     return InMemoryYoloVolumeSource(volume_gray, name=name, batch_size=max(1, int(batch_size)), max_frames=max_frames)
+
+
+def make_prediction_ref_yolo_source(
+    prediction_volume: PredictionVolumeRef,
+    *,
+    batch_size: int = 1,
+    max_frames: Optional[int] = None,
+) -> object:
+    ensure_ultralytics_accepts_in_memory_volume_source()
+    source = getattr(prediction_volume, 'source', None)
+    if source is not None:
+        return source
+    if prediction_volume.array is None:
+        raise ValueError(f'Prediction input {prediction_volume.name} has neither source nor array')
+    return make_in_memory_yolo_source(
+        prediction_volume.array,
+        prediction_volume.name,
+        batch_size=max(1, int(batch_size)),
+        max_frames=max_frames,
+    )
 
 
 def _center_preserving_scale_matrix(src_w: int, src_h: int, out_w: int, out_h: int) -> np.ndarray:
@@ -2786,8 +3278,7 @@ def build_dense_tile_jobs_for_aug(
                     tile_y=int(tile_y),
                     tile_size=int(tile_cfg.tile_size),
                     tile_stride=int(tile_cfg.tile_stride),
-                    out_size=int(out_size),
-                    meta_path=tile_dir / f'{view.name}_{tile_id}.meta.json',
+                            meta_path=tile_dir / f'{view.name}_{tile_id}.meta.json',
                     M_out_to_src=M_out_to_src3[:2, :3].astype(np.float32),
                     M_src_to_out=M_src_to_out3[:2, :3].astype(np.float32),
                 )
@@ -2907,6 +3398,10 @@ def _render_tilted_array_on_grid(
     """
     if not is_tilted_view(view):
         raise ValueError('Tilted rendering requested for a non-tilted view')
+
+    # A tilted output frame can sample a sheared range of the base stack. Wait for
+    # the streaming preprocessing producer to finish before using these views.
+    wait_for_volume_ready(volume_arr)
 
     plan = get_tilted_render_plan(view, M_grid_to_src, int(grid_h), int(grid_w))
     tan_alpha = float(math.tan(math.radians(float(view.tilt_angle_deg))))
@@ -3154,7 +3649,45 @@ def _materialize_prediction_volume_from_renderer(
     job_id: str = '',
     kind: str = 'fullframe',
 ) -> PredictionVolumeRef:
-    """Build a YOLO-ready ``(slice,--imgsz,--imgsz)`` prediction volume in memory."""
+    """Return a YOLO-ready prediction input for one rendered view job.
+
+    v12.2.12 defaults to a lazy render-backed source instead of building a
+    complete ``(slice,--imgsz,--imgsz)`` volume before inference. YOLO can
+    consume the first ready batch while CPU workers continue resizing/warping
+    later slices. Set ``YOLO_TTA_STREAMING_PREDICTION_SOURCES=0`` to recover
+    the legacy whole-volume materialization path for regression testing.
+    """
+    stream_name = str(desc).replace('Materializing in-memory ', 'Streaming render-backed ')
+    if streaming_prediction_sources_enabled():
+        stream_workers = streaming_prediction_source_workers(max(1, int(workers)), max(1, int(num_slices)))
+        stream_prefetch = streaming_prediction_source_prefetch_frames(inference_batch_size())
+        if bool(show_progress):
+            print(
+                f'{stream_name}: streaming source active '
+                f'(frames={int(num_slices)}, out_size={int(out_size)}, '
+                f'workers={stream_workers}, prefetch_frames={stream_prefetch}, '
+                f'autostart={bool(streaming_prediction_source_autostart_enabled())})'
+            )
+        source = StreamingYoloVolumeSource(
+            renderer,
+            num_frames=int(num_slices),
+            name=stream_name,
+            batch_size=inference_batch_size(),
+            out_size=int(out_size),
+            render_workers=stream_workers,
+            prefetch_frames=stream_prefetch,
+            autostart=streaming_prediction_source_autostart_enabled(),
+        )
+        return PredictionVolumeRef(
+            array=None,
+            path=None,
+            name=stream_name,
+            view_name=str(view_name),
+            job_id=str(job_id),
+            kind=str(kind),
+            source=source,
+        )
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     pred_volume = allocate_workspace_array(
         shape=(int(num_slices), int(out_size), int(out_size)),
@@ -3275,12 +3808,11 @@ def materialize_dense_tile_prediction_volume_for_job(
 def should_cache_view_frames(view: ViewInfo, dense_tiling_active: bool) -> bool:
     """Return True when precomputing native single-channel frames is worthwhile for this view.
 
-    Radial view extraction is the dominant CPU cost during dense tiled rendering because every
-    tile video currently traverses the same expensive Lanczos-3 radial slices independently.
-    Caching the native radial frames once lets both full-frame augmentation and all tile videos
-    reuse that work.
+    Radial frame caches can be useful for dense-tile throughput, but building the entire
+    radial cache before inference creates a large time-to-first-prediction barrier.  v12.2.12
+    therefore keeps this prebuild opt-in; streaming sources render only the slices they need.
     """
-    return bool(dense_tiling_active) and view.family == 'radial'
+    return bool(_env_flag('YOLO_TTA_PREBUILD_VIEW_FRAME_CACHES', False)) and bool(dense_tiling_active) and view.family == 'radial'
 
 
 
@@ -3337,7 +3869,13 @@ def iter_view_frames(
     view: ViewInfo,
     view_frames: Optional[np.ndarray] = None,
 ) -> Iterator[np.ndarray]:
-    """Yield single-channel frames for a view, in slice order (0..num_slices-1)."""
+    """Yield single-channel frames for a view, in slice order (0..num_slices-1).
+
+    Streaming preprocessing marks Transverse processing slices ready one by one,
+    so Transverse rendering waits only for the required slice. Sagittal,
+    Coronal, Radial, and Tilted views can sample across the stack and therefore
+    intentionally wait for the preprocessing producer to finish.
+    """
     if view_frames is not None:
         for idx in range(int(view.num_slices)):
             yield np.asarray(view_frames[int(idx)])
@@ -3347,18 +3885,23 @@ def iter_view_frames(
 
     if view.name == 'transverse':
         for t in range(T):
+            wait_for_volume_slice_ready(volume_rgb, int(t))
             yield np.asarray(volume_rgb[t])  # (H,W)
     elif view.name == 'sagittal':
+        wait_for_volume_ready(volume_rgb)
         for y in range(H):
             yield np.ascontiguousarray(volume_rgb[:, y, :])  # (T,W)
     elif view.name == 'coronal':
+        wait_for_volume_ready(volume_rgb)
         for x in range(W):
             yield np.ascontiguousarray(volume_rgb[:, :, x])  # (T,H)
     elif view.name == 'radial':
+        wait_for_volume_ready(volume_rgb)
         for angle_deg in view.azimuths_deg:
             sampler = get_radial_sampler(view, float(angle_deg))
             yield np.ascontiguousarray(extract_radial_slice_frame(volume_rgb, sampler))  # (T,D)
     elif is_tilted_view(view):
+        wait_for_volume_ready(volume_rgb)
         for t in range(int(view.num_slices)):
             yield render_tilted_native_frame(volume_rgb, view, int(t))
     else:
@@ -3377,20 +3920,24 @@ def get_view_frame_by_index(
     T, H, W = volume_rgb.shape
 
     if view.name == 'transverse':
+        wait_for_volume_slice_ready(volume_rgb, int(index))
         return np.asarray(volume_rgb[int(index)])
     if view.name == 'sagittal':
+        wait_for_volume_ready(volume_rgb)
         return np.ascontiguousarray(volume_rgb[:, int(index), :])
     if view.name == 'coronal':
+        wait_for_volume_ready(volume_rgb)
         return np.ascontiguousarray(volume_rgb[:, :, int(index)])
     if view.name == 'radial':
+        wait_for_volume_ready(volume_rgb)
         angle_deg = float(view.azimuths_deg[int(index)])
         sampler = get_radial_sampler(view, angle_deg)
         return np.ascontiguousarray(extract_radial_slice_frame(volume_rgb, sampler))
     if is_tilted_view(view):
+        wait_for_volume_ready(volume_rgb)
         return render_tilted_native_frame(volume_rgb, view, int(index))
 
     raise ValueError(f'Unknown view: {view.name}')
-
 
 
 
@@ -3415,8 +3962,13 @@ def load_ultralytics_model(path: str, task: str = 'segment'):
 
 
 def background_model_load_enabled() -> bool:
-    """Return True when YOLO model loading should overlap CPU volume setup."""
-    return _env_flag('YOLO_TTA_BACKGROUND_MODEL_LOAD', True)
+    """Return True when YOLO model loading should overlap CPU volume setup.
+
+    Model construction is not expected to be the multi-minute startup bottleneck, so
+    the overlap thread is opt-in.  The important fast-start path is streaming CPU
+    resize/render work into the GPU consumer once the processing volume is available.
+    """
+    return _env_flag('YOLO_TTA_BACKGROUND_MODEL_LOAD', False)
 
 
 def canonical_single_device(device: str) -> str:
@@ -4242,6 +4794,7 @@ def _process_cpu_retina_prediction_frame(
     M_out_to_native: np.ndarray,
     native_h: int,
     native_w: int,
+    slice_lock: Optional[threading.Lock] = None,
 ) -> Tuple[int, int]:
     """CPU equivalent of retina_masks=True accumulation without allocating GPU HxW masks."""
     frame_union, frame_confmap, kept_instances = _accumulate_cpu_retina_payload_to_prediction_frame(
@@ -4271,12 +4824,19 @@ def _process_cpu_retina_prediction_frame(
             borderValue=0,
         ).astype(np.uint8, copy=False)
 
-    if np.any(native_union):
-        view_union_mm[int(idx), :, :] |= native_union.astype(np.uint8, copy=False)
+    def _write_native_outputs() -> None:
+        if np.any(native_union):
+            view_union_mm[int(idx), :, :] |= native_union.astype(np.uint8, copy=False)
 
-    if view_confmap_mm is not None and native_conf is not None and np.any(native_conf):
-        conf_slice = view_confmap_mm[int(idx)]
-        np.maximum(conf_slice, native_conf, out=conf_slice)
+        if view_confmap_mm is not None and native_conf is not None and np.any(native_conf):
+            conf_slice = view_confmap_mm[int(idx)]
+            np.maximum(conf_slice, native_conf, out=conf_slice)
+
+    if slice_lock is None:
+        _write_native_outputs()
+    else:
+        with slice_lock:
+            _write_native_outputs()
 
     return int(kept_instances), 1
 
@@ -4291,6 +4851,7 @@ def _process_prediction_frame(
     M_out_to_native: np.ndarray,
     native_h: int,
     native_w: int,
+    slice_lock: Optional[threading.Lock] = None,
 ) -> Tuple[int, int]:
     """Collapse one streamed result directly into unpacked native-view union + confidence volumes."""
     if isinstance(masks_np, CpuRetinaMaskPayload):
@@ -4303,6 +4864,7 @@ def _process_prediction_frame(
             M_out_to_native=M_out_to_native,
             native_h=native_h,
             native_w=native_w,
+            slice_lock=slice_lock,
         )
 
     if masks_np is None:
@@ -4354,12 +4916,19 @@ def _process_prediction_frame(
             borderValue=0,
         ).astype(np.uint8, copy=False)
 
-    if np.any(native_union):
-        view_union_mm[idx, :, :] |= native_union.astype(np.uint8, copy=False)
+    def _write_native_outputs() -> None:
+        if np.any(native_union):
+            view_union_mm[int(idx), :, :] |= native_union.astype(np.uint8, copy=False)
 
-    if view_confmap_mm is not None and native_conf is not None and np.any(native_conf):
-        conf_slice = view_confmap_mm[idx]
-        np.maximum(conf_slice, native_conf, out=conf_slice)
+        if view_confmap_mm is not None and native_conf is not None and np.any(native_conf):
+            conf_slice = view_confmap_mm[int(idx)]
+            np.maximum(conf_slice, native_conf, out=conf_slice)
+
+    if slice_lock is None:
+        _write_native_outputs()
+    else:
+        with slice_lock:
+            _write_native_outputs()
 
     return int(num_inst), 1
 
@@ -4380,6 +4949,7 @@ def predict_source_and_accumulate(
     streaming_cleanup_enabled: bool = False,
     streaming_cleanup_min_conf: float = 0.0,
     streaming_cleanup_min_radius: float = 0.0,
+    slice_locks: Optional[Sequence[threading.Lock]] = None,
 ) -> Dict[str, int]:
     """Run YOLO predict(stream=True) on an in-memory source and accumulate native masks.
 
@@ -4392,7 +4962,7 @@ def predict_source_and_accumulate(
     the full view volume has finished inferencing.
     """
     ensure_yolo_ready_for_predict(model, cfg)
-    if isinstance(source, InMemoryYoloVolumeSource):
+    if isinstance(source, (InMemoryYoloVolumeSource, StreamingYoloVolumeSource)):
         ensure_single_channel_yolo_preprocess_patch()
     use_custom_cpu_retina = False
     if cpu_retina_masks_enabled():
@@ -4429,6 +4999,9 @@ def predict_source_and_accumulate(
     stream_min_conf_u8 = int(min_conf_to_u8_threshold(stream_min_conf)) if stream_min_conf > 0.0 else 0
 
     def _process_prediction_unit(idx_i: int, masks_obj: Optional[object], confs_arr: Optional[np.ndarray]) -> Tuple[int, int]:
+        slice_lock = None
+        if slice_locks is not None and len(slice_locks) > 0:
+            slice_lock = slice_locks[int(idx_i) % len(slice_locks)]
         pred_inc, frame_inc = _process_prediction_frame(
             idx=int(idx_i),
             masks_np=masks_obj,
@@ -4439,6 +5012,7 @@ def predict_source_and_accumulate(
             M_out_to_native=M_out_to_native,
             native_h=native_h,
             native_w=native_w,
+            slice_lock=slice_lock,
         )
         if stream_cleanup:
             cleaned_has_foreground = _cleanup_prediction_slice_inplace(
@@ -4522,10 +5096,11 @@ def predict_source_and_submit_accumulation(
     streaming_cleanup_enabled: bool = False,
     streaming_cleanup_min_conf: float = 0.0,
     streaming_cleanup_min_radius: float = 0.0,
+    slice_locks: Optional[Sequence[threading.Lock]] = None,
 ) -> PredictionAccumulationHandle:
     """Run YOLO streaming inference and enqueue result accumulation without draining it."""
     ensure_yolo_ready_for_predict(model, cfg)
-    if isinstance(source, InMemoryYoloVolumeSource):
+    if isinstance(source, (InMemoryYoloVolumeSource, StreamingYoloVolumeSource)):
         ensure_single_channel_yolo_preprocess_patch()
     use_custom_cpu_retina = False
     if cpu_retina_masks_enabled():
@@ -4557,6 +5132,9 @@ def predict_source_and_submit_accumulation(
     stream_min_conf_u8 = int(min_conf_to_u8_threshold(stream_min_conf)) if stream_min_conf > 0.0 else 0
 
     def _process_prediction_unit(idx_i: int, masks_obj: Optional[object], confs_arr: Optional[np.ndarray]) -> Tuple[int, int]:
+        slice_lock = None
+        if slice_locks is not None and len(slice_locks) > 0:
+            slice_lock = slice_locks[int(idx_i) % len(slice_locks)]
         pred_inc, frame_inc = _process_prediction_frame(
             idx=int(idx_i),
             masks_np=masks_obj,
@@ -4567,6 +5145,7 @@ def predict_source_and_submit_accumulation(
             M_out_to_native=M_out_to_native,
             native_h=native_h,
             native_w=native_w,
+            slice_lock=slice_lock,
         )
         if stream_cleanup:
             cleaned_has_foreground = _cleanup_prediction_slice_inplace(
@@ -4646,10 +5225,10 @@ def predict_in_memory_volume_and_submit_accumulation(
     streaming_cleanup_enabled: bool = False,
     streaming_cleanup_min_conf: float = 0.0,
     streaming_cleanup_min_radius: float = 0.0,
+    slice_locks: Optional[Sequence[threading.Lock]] = None,
 ) -> PredictionAccumulationHandle:
-    source = make_in_memory_yolo_source(
-        prediction_volume.array,
-        prediction_volume.name,
+    source = make_prediction_ref_yolo_source(
+        prediction_volume,
         batch_size=max(1, int(cfg.batch)),
         max_frames=int(num_frames),
     )
@@ -4669,6 +5248,7 @@ def predict_in_memory_volume_and_submit_accumulation(
         streaming_cleanup_enabled=bool(streaming_cleanup_enabled),
         streaming_cleanup_min_conf=float(streaming_cleanup_min_conf),
         streaming_cleanup_min_radius=float(streaming_cleanup_min_radius),
+        slice_locks=slice_locks,
     )
 
 def predict_in_memory_volume_and_accumulate(
@@ -4687,10 +5267,10 @@ def predict_in_memory_volume_and_accumulate(
     streaming_cleanup_enabled: bool = False,
     streaming_cleanup_min_conf: float = 0.0,
     streaming_cleanup_min_radius: float = 0.0,
+    slice_locks: Optional[Sequence[threading.Lock]] = None,
 ) -> Dict[str, int]:
-    source = make_in_memory_yolo_source(
-        prediction_volume.array,
-        prediction_volume.name,
+    source = make_prediction_ref_yolo_source(
+        prediction_volume,
         batch_size=max(1, int(cfg.batch)),
         max_frames=int(num_frames),
     )
@@ -4710,6 +5290,7 @@ def predict_in_memory_volume_and_accumulate(
         streaming_cleanup_enabled=bool(streaming_cleanup_enabled),
         streaming_cleanup_min_conf=float(streaming_cleanup_min_conf),
         streaming_cleanup_min_radius=float(streaming_cleanup_min_radius),
+        slice_locks=slice_locks,
     )
 
 
@@ -11723,7 +12304,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.5-Pro_v12.2.11_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.5-Pro_v12.2.12_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -13743,18 +14324,34 @@ def main() -> None:
         (input_T, input_H, input_W),
     )
 
+    preprocess_streaming_active = bool(streaming_preprocess_enabled())
     vol_path = temp_dir / 'input_volume.gray8.dat'
-    input_volume_rgb = decode_video_to_memmap_gray8(
-        input_video=input_path,
-        out_dat=vol_path,
-        num_frames=input_T,
-        width=input_W,
-        height=input_H,
-        overwrite=False,
-        prefer_memory=True,
-    )
+    if preprocess_streaming_active:
+        print(
+            'v12.2.12 streaming preprocessing active: ffmpeg decode and cubic resize return their destination arrays immediately; '
+            'Transverse consumers wait only for the needed processing slice.'
+        )
+        input_volume_rgb = decode_video_to_memmap_gray8_streaming(
+            input_video=input_path,
+            out_dat=vol_path,
+            num_frames=input_T,
+            width=input_W,
+            height=input_H,
+            overwrite=False,
+            prefer_memory=True,
+        )
+    else:
+        input_volume_rgb = decode_video_to_memmap_gray8(
+            input_video=input_path,
+            out_dat=vol_path,
+            num_frames=input_T,
+            width=input_W,
+            height=input_H,
+            overwrite=False,
+            prefer_memory=True,
+        )
     (temp_dir / 'input_volume.meta.json').write_text(
-        json.dumps({'shape': [input_T, input_H, input_W], 'dtype': 'uint8', 'channels': 1, 'fps': fps}, indent=2)
+        json.dumps({'shape': [input_T, input_H, input_W], 'dtype': 'uint8', 'channels': 1, 'fps': fps, 'streaming_preprocess': bool(preprocess_streaming_active)}, indent=2)
     )
 
     processing_shape = compute_cube_resize_shape(input_T, input_H, input_W, tolerance=0.05)
@@ -13764,13 +14361,22 @@ def main() -> None:
             f'input shape (t,Y,X)=({input_T},{input_H},{input_W}) -> '
             f'processing shape (t,Y,X)={processing_shape}'
         )
-        volume_rgb = resize_volume_to_processing_cube_gray8(
-            input_volume_rgb,
-            processing_shape,
-            temp_dir / 'input_volume.v950_cube.gray8.dat',
-            workers=max(1, default_worker_budget()),
-            prefer_memory=True,
-        )
+        if preprocess_streaming_active:
+            volume_rgb = resize_volume_to_processing_cube_gray8_streaming(
+                input_volume_rgb,
+                processing_shape,
+                temp_dir / 'input_volume.v950_cube.gray8.dat',
+                workers=max(1, default_worker_budget()),
+                prefer_memory=True,
+            )
+        else:
+            volume_rgb = resize_volume_to_processing_cube_gray8(
+                input_volume_rgb,
+                processing_shape,
+                temp_dir / 'input_volume.v950_cube.gray8.dat',
+                workers=max(1, default_worker_budget()),
+                prefer_memory=True,
+            )
     else:
         print(f'v12.2.0 cubic resize: input shape already within 5% cube tolerance ({processing_shape})')
         volume_rgb = input_volume_rgb
@@ -13818,6 +14424,14 @@ def main() -> None:
     inference_views = [v for v in views if not (transverse_inference_disabled and v.name == 'transverse')]
     interpolating_views = [v for v in inference_views if _view_uses_interpolation(v, int(args.interpolate))]
     spec_notes: List[str] = []
+    if preprocess_streaming_active:
+        spec_notes.append(
+            'v12.2.12 streaming preprocessing is active: decode/cube preprocessing can run concurrently with Transverse rendering and GPU inference; Transverse readers wait only for the slice they need, while stack-sampling view families wait for the completed preprocessing volume.'
+        )
+    else:
+        spec_notes.append(
+            'v12.2.12 streaming preprocessing is disabled by YOLO_TTA_STREAMING_PREPROCESS=0; decode and cubic resize finish before inference scheduling begins.'
+        )
     if background_model_load_enabled():
         spec_notes.append(
             'v12.2.11 startup overlap is active: the YOLO model load is submitted before ffprobe/decode/cubic preparation and joined only when the scheduler needs the model for prediction. Set YOLO_TTA_BACKGROUND_MODEL_LOAD=0 to restore synchronous model loading.'
@@ -14066,7 +14680,7 @@ def main() -> None:
         f'example worker_count={int(example_cpu_mask_workers)}, pending_limit={int(example_cpu_mask_pending)}.'
     )
     spec_notes.append(
-        f'Batched inference active with --batch={int(args.batch)}. InMemoryYoloVolumeSource yields fixed-size H×W×1 batches and pads the final batch by repeating the last real slice; synthetic padded predictions are consumed and discarded.'
+        f'Batched inference active with --batch={int(args.batch)}. StreamingYoloVolumeSource is used by default for full-frame/tile sources: it renders a bounded CPU prefetch window of H×W×1 slices and pads the final batch by repeating the last real slice; set YOLO_TTA_STREAMING_PREDICTION_SOURCES=0 to restore dense in-memory prediction-volume materialization.'
     )
     spec_notes.append(
         'Tiled masks are staged into one consolidated parent-view canvas per --tile_size/--tile_stride configuration before gating; '
@@ -14204,11 +14818,22 @@ def main() -> None:
 
     view_frame_caches: Dict[str, np.ndarray] = {}
     view_frame_cache_paths: Dict[str, Path] = {}
-    for view in inference_views:
-        if should_cache_view_frames(view, dense_tiling_active):
+    view_frame_cache_lock = threading.Lock()
+
+    def _get_view_frame_cache(view: ViewInfo) -> Optional[np.ndarray]:
+        if not should_cache_view_frames(view, dense_tiling_active):
+            return None
+        cached = view_frame_caches.get(view.name)
+        if cached is not None:
+            return cached
+        with view_frame_cache_lock:
+            cached = view_frame_caches.get(view.name)
+            if cached is not None:
+                return cached
+            wait_for_volume_ready(volume_rgb)
             cache_path = temp_dir / 'view_frames' / f'{view.name}.gray8.dat'
             cache_path.parent.mkdir(parents=True, exist_ok=True)
-            view_frame_caches[view.name] = build_view_frame_cache(
+            cache_mm = build_view_frame_cache(
                 volume_rgb=volume_rgb,
                 view=view,
                 out_path=cache_path,
@@ -14216,12 +14841,15 @@ def main() -> None:
                 prefer_memory=True,
                 workers=max(1, int(augmentation_workers)),
             )
+            view_frame_caches[view.name] = cache_mm
             view_frame_cache_paths[view.name] = cache_path
+            return cache_mm
 
     baseline_union_by_model_view: Dict[Tuple[str, str], np.ndarray] = {}
     baseline_confmap_by_model_view: Dict[Tuple[str, str], Optional[np.ndarray]] = {}
     baseline_union_paths: Dict[Tuple[str, str], Path] = {}
     baseline_confmap_paths: Dict[Tuple[str, str], Optional[Path]] = {}
+    baseline_slice_locks_by_model_view: Dict[Tuple[str, str], List[threading.Lock]] = {}
     fullframe_remaining: Dict[Tuple[str, str], int] = {}
 
     for view in inference_views:
@@ -14262,7 +14890,8 @@ def main() -> None:
         ),
     )
     per_prediction_volume_workers = max(1, int(max(1, augmentation_workers) // max(1, prediction_volume_builder_workers)))
-    async_prediction_accumulation_active = bool(len(angles) == 1 and async_predict_postprocess_enabled())
+    async_prediction_accumulation_active = bool(async_predict_postprocess_enabled())
+    async_prediction_multiview_locking_active = bool(len(angles) > 1 and async_prediction_accumulation_active)
     async_prediction_join_worker_count = async_predict_join_workers(max(2, int(prediction_volume_queue_slots) + 1))
     default_async_result_workers = max(1, min(int(predict_postprocess_workers), max(1, _cpu_count())))
     async_prediction_result_worker_count = max(
@@ -14274,35 +14903,33 @@ def main() -> None:
     )
     if bool(async_prediction_accumulation_active):
         print(
-            'Async prediction accumulation: enabled for single-angle run '
-            f'(result workers={int(async_prediction_result_worker_count)}, join workers={int(async_prediction_join_worker_count)})'
+            'Async prediction accumulation: enabled '
+            f'(angles={len(angles)}, result workers={int(async_prediction_result_worker_count)}, '
+            f'join workers={int(async_prediction_join_worker_count)}, '
+            f'per-slice locks for multi-angle full-frame writes={bool(async_prediction_multiview_locking_active)})'
         )
         spec_notes.append(
-            'v12.2.9 async prediction accumulation is active because exactly one --angle value was supplied. '
-            'YOLO result detach/copy, native inverse-mapping, and streaming cleanup are queued to a shared prediction-result executor; '
-            'the scheduler waits on a lightweight completion future before declaring a view/tile volume complete, so the next ready prediction volume can start as soon as the current result stream is exhausted.'
+            'v12.2.12 async prediction accumulation is active for all angle counts by default. '
+            'YOLO result detach/copy, native inverse-mapping, and optional streaming cleanup are queued to a shared prediction-result executor; '
+            'for multi-angle full-frame accumulation, per-slice locks protect shared union/confidence slices so the scheduler can start the next source while CPU result work drains.'
         )
     else:
-        print('Async prediction accumulation: disabled (requires exactly one --angle and YOLO_TTA_ASYNC_PREDICT_POSTPROCESS=1).')
+        print('Async prediction accumulation: disabled by YOLO_TTA_ASYNC_PREDICT_POSTPROCESS=0; prediction sources are drained synchronously.')
         spec_notes.append(
-            'v12.2.9 async prediction accumulation is inactive; prediction sources are drained synchronously. '
-            'This preserves ordered full-frame accumulation for multi-angle runs.'
+            'v12.2.12 async prediction accumulation was disabled by configuration; prediction sources are drained synchronously.'
         )
     spec_notes.append(
-        'v12.2.9 prediction-volume builders are sized to the active prefetch window, not the total tile/full-frame job count; '
-        'per-source prediction memmap flushes are skipped by default unless YOLO_TTA_FLUSH_PREDICTION_VOLUME_ON_BUILD=1 or YOLO_TTA_PREDICT_FLUSH_EACH_VOLUME=1 is set.'
+        'v12.2.12 streaming prediction sources are active by default: full-frame and tiled YOLO inputs render only a bounded CPU prefetch window before model.predict starts, rather than materializing a complete (slice,--imgsz,--imgsz) volume first. '
+        'Set YOLO_TTA_STREAMING_PREDICTION_SOURCES=0 to restore the legacy dense prediction-volume path; per-source prediction memmap flushes are still skipped by default unless YOLO_TTA_FLUSH_PREDICTION_VOLUME_ON_BUILD=1 or YOLO_TTA_PREDICT_FLUSH_EACH_VOLUME=1 is set.'
     )
     print(
-        f'In-memory prediction-volume builders: {prediction_volume_builder_workers} '
-        f'(per-volume slice workers: {per_prediction_volume_workers}, build tasks: {total_prediction_volume_build_tasks}, '
-        f'queued-volume bound: {prediction_volume_queue_slots})'
+        f'Streaming prediction-source preparers: {prediction_volume_builder_workers} '
+        f'(per-source render workers: {per_prediction_volume_workers}, source tasks: {total_prediction_volume_build_tasks}, '
+        f'queued-source bound: {prediction_volume_queue_slots})'
     )
     spec_notes.append(
-        'v12 in-memory prediction scheduler active: full-frame and tiled YOLO sources are materialized as '
-        '(slice,--imgsz,--imgsz) uint8 arrays, yielded as H×W×1 frames through InMemoryYoloVolumeSource, '
-        'and preprocessed into BCHW tensors with C=1; the normal pipeline no longer writes augmented '
-        'prediction videos, canvas videos, or tile videos to temp. '
-        f'The build queue is bounded to {int(prediction_volume_queue_slots)} queued prediction volume(s) beyond the current inference; the v12.2.0 default is four queued volumes, for a normal total bound of five including the current inference volume. '
+        'v12.2.12 prediction scheduler active: full-frame and tiled YOLO sources normally stream H×W×1 frames through StreamingYoloVolumeSource, so the GPU can begin after the first prefetch batch while CPU workers continue 2D resize/warp rendering behind it. '
+        f'The build queue is bounded to {int(prediction_volume_queue_slots)} queued prediction source(s) beyond the current inference; the v12.2.0 default is four queued sources, for a normal total bound of five including the current inference source. '
         'v12.2.11 lazily allocates each full-view union/confidence workspace only when that view first reaches inference, avoiding an eager all-views zero-fill before the first prediction.'
     )
     if dense_tiling_active:
@@ -14353,35 +14980,113 @@ def main() -> None:
     def _prediction_volume_queue_depth() -> int:
         return int(len(pending_prediction_volume_futures) + len(ready_fullframe) + len(ready_tile_infer))
 
+    def _make_streaming_fullframe_ref(view: ViewInfo, aug_job: AugJob) -> PredictionVolumeRef:
+        if not aug_job.meta_path.exists():
+            write_aug_job_meta(aug_job, view)
+        render_workers = streaming_prediction_source_workers(int(per_prediction_volume_workers), int(view.num_slices))
+        prefetch_frames = streaming_prediction_source_prefetch_frames(max(1, int(args.batch)))
+
+        def _render(idx: int) -> np.ndarray:
+            return render_fullframe_frame_for_job(
+                volume_rgb=volume_rgb,
+                view=view,
+                job=aug_job,
+                frame_idx=int(idx),
+                view_frames=_get_view_frame_cache(view),
+            )
+
+        name = f'Streaming full-frame prediction source {view.name}/{aug_job.aug_id}'
+        source = StreamingYoloVolumeSource(
+            _render,
+            num_frames=int(view.num_slices),
+            name=name,
+            batch_size=max(1, int(args.batch)),
+            out_size=int(aug_job.aff.out_size),
+            render_workers=int(render_workers),
+            prefetch_frames=int(prefetch_frames),
+            autostart=bool(streaming_prediction_source_autostart_enabled()),
+        )
+        return PredictionVolumeRef(
+            array=None,
+            path=None,
+            name=name,
+            view_name=str(view.name),
+            job_id=str(aug_job.aug_id),
+            kind='fullframe',
+            source=source,
+        )
+
+    def _make_streaming_tile_ref(view: ViewInfo, tile_job: DenseTileJob) -> PredictionVolumeRef:
+        if not tile_job.meta_path.exists():
+            write_dense_tile_job_meta(tile_job)
+        render_workers = streaming_prediction_source_workers(int(per_prediction_volume_workers), int(view.num_slices))
+        prefetch_frames = streaming_prediction_source_prefetch_frames(max(1, int(args.batch)))
+
+        def _render(idx: int) -> np.ndarray:
+            return render_dense_tile_frame_for_job(
+                volume_rgb=volume_rgb,
+                view=view,
+                tile_job=tile_job,
+                frame_idx=int(idx),
+                view_frames=_get_view_frame_cache(view),
+            )
+
+        name = f'Streaming tile prediction source {view.name}/{tile_job.tile_id}'
+        source = StreamingYoloVolumeSource(
+            _render,
+            num_frames=int(view.num_slices),
+            name=name,
+            batch_size=max(1, int(args.batch)),
+            out_size=int(tile_job.out_size),
+            render_workers=int(render_workers),
+            prefetch_frames=int(prefetch_frames),
+            autostart=bool(streaming_prediction_source_autostart_enabled()),
+        )
+        return PredictionVolumeRef(
+            array=None,
+            path=None,
+            name=name,
+            view_name=str(view.name),
+            job_id=str(tile_job.tile_id),
+            kind='tile',
+            source=source,
+        )
+
     def _submit_prediction_volume_build(kind: str, view: ViewInfo, job_obj: object) -> None:
         if str(kind) == 'fullframe':
             aug_job = job_obj
             assert isinstance(aug_job, AugJob)
-            out_path = temp_dir / 'prediction_volumes' / 'fullframe' / view.name / f'{view.name}_{aug_job.aug_id}.u8.dat'
-            fut = prediction_volume_executor.submit(
-                materialize_fullframe_prediction_volume_for_job,
-                volume_rgb,
-                view,
-                aug_job,
-                out_path=out_path,
-                view_frames=view_frame_caches.get(view.name),
-                workers=int(per_prediction_volume_workers),
-                show_progress=False,
-            )
+            if streaming_prediction_sources_enabled():
+                fut = prediction_volume_executor.submit(_make_streaming_fullframe_ref, view, aug_job)
+            else:
+                out_path = temp_dir / 'prediction_volumes' / 'fullframe' / view.name / f'{view.name}_{aug_job.aug_id}.u8.dat'
+                fut = prediction_volume_executor.submit(
+                    materialize_fullframe_prediction_volume_for_job,
+                    volume_rgb,
+                    view,
+                    aug_job,
+                    out_path=out_path,
+                    view_frames=_get_view_frame_cache(view),
+                    workers=int(per_prediction_volume_workers),
+                    show_progress=False,
+                )
         elif str(kind) == 'tile':
             tile_job = job_obj
             assert isinstance(tile_job, DenseTileJob)
-            out_path = temp_dir / 'prediction_volumes' / 'tiles' / view.name / str(tile_job.config_id) / f'{tile_job.tile_id}.u8.dat'
-            fut = prediction_volume_executor.submit(
-                materialize_dense_tile_prediction_volume_for_job,
-                volume_rgb,
-                view,
-                tile_job,
-                out_path=out_path,
-                view_frames=view_frame_caches.get(view.name),
-                workers=int(per_prediction_volume_workers),
-                show_progress=False,
-            )
+            if streaming_prediction_sources_enabled():
+                fut = prediction_volume_executor.submit(_make_streaming_tile_ref, view, tile_job)
+            else:
+                out_path = temp_dir / 'prediction_volumes' / 'tiles' / view.name / str(tile_job.config_id) / f'{tile_job.tile_id}.u8.dat'
+                fut = prediction_volume_executor.submit(
+                    materialize_dense_tile_prediction_volume_for_job,
+                    volume_rgb,
+                    view,
+                    tile_job,
+                    out_path=out_path,
+                    view_frames=_get_view_frame_cache(view),
+                    workers=int(per_prediction_volume_workers),
+                    show_progress=False,
+                )
         else:  # pragma: no cover
             raise ValueError(f'Unknown prediction volume build kind: {kind}')
         prediction_volume_futures[fut] = (str(kind), view, job_obj)
@@ -14424,6 +15129,7 @@ def main() -> None:
             prefer_memory=True,
         )
         baseline_union_paths[key] = union_path
+        baseline_slice_locks_by_model_view[key] = [threading.Lock() for _ in range(int(view.num_slices))]
         if float(args.min_conf) > 0.0:
             baseline_confmap_by_model_view[key] = allocate_workspace_array(
                 shape=(int(view.num_slices), int(view.src_h), int(view.src_w)),
@@ -14446,6 +15152,7 @@ def main() -> None:
         confmap_mm = baseline_confmap_by_model_view.pop(key)
         union_path = baseline_union_paths.pop(key)
         confmap_path = baseline_confmap_paths.pop(key)
+        baseline_slice_locks_by_model_view.pop(key, None)
         fut = parent_postprocess_executor.submit(
             prepare_view_volume_after_fullframe,
             model_name=str(model_name),
@@ -14954,6 +15661,7 @@ def main() -> None:
                                 streaming_cleanup_enabled=bool(single_angle_streaming_cleanup_active),
                                 streaming_cleanup_min_conf=float(args.min_conf),
                                 streaming_cleanup_min_radius=_view_native_slice_min_radius(view, float(args.min_radius)),
+                                slice_locks=baseline_slice_locks_by_model_view.get((str(model_name), str(view.name))),
                             )
                             _submit_prediction_accumulation_join(handle, {
                                 'kind': 'fullframe',
@@ -14978,6 +15686,7 @@ def main() -> None:
                                 streaming_cleanup_enabled=bool(single_angle_streaming_cleanup_active),
                                 streaming_cleanup_min_conf=float(args.min_conf),
                                 streaming_cleanup_min_radius=_view_native_slice_min_radius(view, float(args.min_radius)),
+                                slice_locks=baseline_slice_locks_by_model_view.get((str(model_name), str(view.name))),
                             )
                             if offload_between_jobs_enabled():
                                 offload_yolo_from_gpu(yolo)
@@ -15162,6 +15871,10 @@ def main() -> None:
     _drain_completed_prediction_volume_futures()
     _drain_completed_prediction_accumulation_futures()
     _drain_completed_background_futures()
+
+    if preprocess_streaming_active:
+        print('Ensuring streaming preprocessing producers have completed before final output/backprojection stages.')
+        wait_for_volume_ready(volume_rgb)
 
     for cache_name, cache_mm in list(view_frame_caches.items()):
         close_memmap_array(cache_mm)
