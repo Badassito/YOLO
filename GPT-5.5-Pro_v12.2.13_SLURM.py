@@ -2,7 +2,8 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v12.2.12_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.1-v12.2.12 performance patches:
+This v12.2.13_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.1-v12.2.13 performance patches:
+  - v12.2.13 adds an optional CUDA input-staging queue that preloads a small number of already-normalized BCHW YOLO batches into GPU VRAM ahead of the predictor loop, separate from --batch, so model inference no longer waits on the hot-path RAM->GPU copy when the queue is filled
   - v12.2.12 changes full-frame/tile YOLO inputs to bounded streaming render sources, so inference starts after the first prefetch batch is rendered instead of after a complete (slice,imgsz,imgsz) prediction volume is materialized
   - v12.2.11 removes GPU backprojection from the final Radial/Tilted path, gives CPU-only backprojection the full slice-worker budget, keeps tile waiting/staging/consolidation canvases in RAM by default, overlaps YOLO model loading with decode/cube preparation, adds threaded ffmpeg decode defaults, and tightens the NRRD writer around the Target_Dummy trailing-list layout with direct raw-bbox chunk fills and full-CPU pigz defaults
   - v12.2.8 adds a dedicated single --angle streaming cleanup path: when exactly one augmentation angle is requested, min_conf filtering, 2D hole filling, and view-native per-slice min_radius filtering are applied as YOLO slices stream in; only true volume-level cleanup waits for the completed view volume
@@ -16,7 +17,7 @@ This v12.2.12_SLURM implementation of the v12.2.0_SLURM specification plus v12.2
   - v12.2.7 adds optional Numba no-GIL projection-candidate kernels for interpolation seed planning; set YOLO_TTA_INTERPOLATION_COMPILED_KERNELS=0 to force the Python fallback
   - builds Transverse, optional generalized Tilted Views for Transverse/Sagittal/Coronal, independently optional upright Sagittal/Coronal, and optional Radial view families using single-channel intermediates
   - renders YOLO-ready full-frame and tiled sources from memory through bounded streaming slice iterators instead of writing prediction videos or requiring a full prediction volume before inference
-  - feeds those sources to Ultralytics through custom HxWx1 in-memory loaders with stream=True, while v12.2.9 defaults to deferred CPU retina-mask reconstruction so large GPU mask tensors are not copied on the scheduler/model-stream thread
+  - feeds those sources to Ultralytics through custom HxWx1 in-memory loaders with stream=True, and can stage a bounded queue of preprocessed input tensors in CUDA VRAM; v12.2.9 defaults to deferred CPU retina-mask reconstruction so large GPU mask tensors are not copied on the scheduler/model-stream thread
   - bounds streaming prediction-source prefetch and legacy prediction-volume creation, preserving priority order while preventing unbounded RAM growth
   - stages cleaned tiled masks into one parent-view canvas per tile-size/stride set, gates each consolidated canvas
     at the connected-component level against frozen parent full-frame support, then interpolates the accepted tiled volume once per parent view
@@ -3097,6 +3098,342 @@ class StreamingYoloVolumeSource:
         return paths, imgs, info
 
 
+class GpuPrefetchedYoloBatch(list):
+    """List-like orig-image batch whose YOLO tensor is already staged in GPU VRAM.
+
+    Ultralytics still receives a list of H×W×1 uint8 images for result-shape bookkeeping,
+    while the patched preprocess path consumes ``_tta_gpu_tensor`` directly.  The tensor is
+    BCHW, normalized to [0,1], and already on the requested CUDA device.  A CUDA event is
+    attached when staging used a non-default copy stream so the predictor stream can wait
+    without forcing a CPU synchronization.
+    """
+
+    def __init__(
+        self,
+        frames: Sequence[np.ndarray],
+        *,
+        gpu_tensor: object,
+        ready_event: Optional[object] = None,
+        source_label: str = '',
+        cpu_tensor_ref: Optional[object] = None,
+    ) -> None:
+        super().__init__(frames)
+        self._tta_gpu_tensor = gpu_tensor
+        self._tta_gpu_ready_event = ready_event
+        self._tta_source_label = str(source_label)
+        self._tta_cpu_tensor_ref = cpu_tensor_ref
+        self._tta_normalized = True
+
+    def wait_ready(self) -> object:
+        tensor = self._tta_gpu_tensor
+        event = self._tta_gpu_ready_event
+        if event is not None:
+            try:
+                import torch  # type: ignore
+                current_stream = torch.cuda.current_stream(device=tensor.device)  # type: ignore[attr-defined]
+                current_stream.wait_event(event)
+                record_stream = getattr(tensor, 'record_stream', None)
+                if callable(record_stream):
+                    record_stream(current_stream)
+            except Exception:
+                try:
+                    synchronize = getattr(event, 'synchronize', None)
+                    if callable(synchronize):
+                        synchronize()
+                    self._tta_cpu_tensor_ref = None
+                except Exception:
+                    pass
+        return tensor
+
+
+class GpuPrefetchingYoloSource:
+    """Wrap a YOLO source and keep a bounded queue of preprocessed CUDA input batches.
+
+    This queue is intentionally separate from Ultralytics' ``--batch``.  ``--batch`` remains the
+    number of slices in each inference call; ``queue_batches`` controls how many complete batches
+    are staged in VRAM ahead of the predictor loop.
+    """
+
+    def __init__(
+        self,
+        base_source: object,
+        *,
+        cfg: 'PredictConfig',
+        source_label: str,
+        queue_batches: int = 8,
+        pin_memory: bool = True,
+    ) -> None:
+        self.base_source = base_source
+        self.cfg = cfg
+        self.source_label = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(source_label)).strip('_') or 'gpu_prefetch_source'
+        self.queue_batches = max(1, int(queue_batches))
+        self.pin_memory = bool(pin_memory)
+        self.mode = getattr(base_source, 'mode', 'image')
+        self.count = 0
+        self.bs = max(1, int(getattr(base_source, 'bs', getattr(cfg, 'batch', 1))))
+        self.nf = int(getattr(base_source, 'nf', 0) or 0)
+        self.yield_nf = int(getattr(base_source, 'yield_nf', 0) or 0)
+        self.synthetic_count = int(getattr(base_source, 'synthetic_count', max(0, self.yield_nf - self.nf)))
+        self.source_type = getattr(base_source, 'source_type', argparse.Namespace(stream=False, screenshot=False, from_img=True, tensor=False))
+        self._queue: 'queue.Queue[object]' = queue.Queue(maxsize=self.queue_batches)
+        self._stop_event = threading.Event()
+        self._producer_thread: Optional[threading.Thread] = None
+        self._started = False
+        self._closed = False
+        self._sentinel = object()
+        self._copy_stream: Optional[object] = None
+        self._device_str = canonical_single_device(str(cfg.device))
+        self._dtype_name = 'float16' if bool(cfg.half) and str(self._device_str).startswith('cuda') else 'float32'
+
+    def __len__(self) -> int:
+        try:
+            return int(len(self.base_source))  # type: ignore[arg-type]
+        except Exception:
+            if self.yield_nf > 0 and self.bs > 0:
+                return int(math.ceil(float(self.yield_nf) / float(self.bs)))
+            if self.nf > 0 and self.bs > 0:
+                return int(math.ceil(float(self.nf) / float(self.bs)))
+            return 0
+
+    def __iter__(self) -> 'GpuPrefetchingYoloSource':
+        self.start()
+        return self
+
+    def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        self._producer_thread = threading.Thread(
+            target=self._producer_loop,
+            name=f'yolo-gpu-stage-{self.source_label[:32]}',
+            daemon=True,
+        )
+        self._producer_thread.start()
+
+    def close(self) -> None:
+        self._closed = True
+        self._stop_event.set()
+        close_fn = getattr(self.base_source, 'close', None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                pass
+        thread = self._producer_thread
+        if thread is not None and thread.is_alive():
+            try:
+                thread.join(timeout=2.0)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _stack_single_channel_cpu_tensor(imgs: Sequence[np.ndarray]) -> Tuple[object, List[np.ndarray]]:
+        frames: List[np.ndarray] = []
+        for item in imgs:
+            arr = np.asarray(item)
+            if arr.ndim == 2:
+                gray = arr
+            elif arr.ndim == 3 and int(arr.shape[2]) == 1:
+                gray = arr[:, :, 0]
+            else:
+                raise ValueError(f'GPU input staging expects H×W or H×W×1 uint8 frames, got {arr.shape}')
+            frames.append(np.ascontiguousarray(gray, dtype=np.uint8))
+        shapes = {tuple(int(v) for v in frame.shape) for frame in frames}
+        if len(shapes) != 1:
+            raise ValueError(f'GPU input staging batch contains mixed shapes: {sorted(shapes)}')
+        import torch  # type: ignore
+        batch = np.stack(frames, axis=0)[:, None, :, :]  # BCHW, C=1
+        tensor = torch.from_numpy(np.ascontiguousarray(batch))
+        return tensor, [np.ascontiguousarray(frame[:, :, None]) for frame in frames]
+
+    def _stage_batch(self, batch: object) -> object:
+        paths, imgs, info = batch  # type: ignore[misc]
+        import torch  # type: ignore
+        if not str(self._device_str).startswith('cuda'):
+            return batch
+        if not bool(torch.cuda.is_available()):
+            return batch
+
+        cpu_tensor, cpu_frames = self._stack_single_channel_cpu_tensor(list(imgs))
+        target_device = torch.device(self._device_str)
+        target_dtype = torch.float16 if self._dtype_name == 'float16' else torch.float32
+        ready_event: Optional[object] = None
+
+        if bool(self.pin_memory):
+            try:
+                cpu_tensor = cpu_tensor.pin_memory()
+            except Exception:
+                pass
+
+        try:
+            if self._copy_stream is None:
+                self._copy_stream = torch.cuda.Stream(device=target_device)
+            with torch.cuda.stream(self._copy_stream):
+                gpu_tensor = cpu_tensor.to(device=target_device, dtype=target_dtype, non_blocking=True)
+                gpu_tensor.div_(255.0)
+                ready_event = torch.cuda.Event()
+                ready_event.record(self._copy_stream)
+        except Exception:
+            # Fall back to a synchronous CUDA copy on the producer thread.  This still removes the
+            # RAM->GPU copy from the predictor hot path once the queue has filled.
+            gpu_tensor = cpu_tensor.to(device=target_device, dtype=target_dtype, non_blocking=False)
+            gpu_tensor.div_(255.0)
+            ready_event = None
+
+        gpu_batch = GpuPrefetchedYoloBatch(
+            cpu_frames,
+            gpu_tensor=gpu_tensor,
+            ready_event=ready_event,
+            source_label=self.source_label,
+            cpu_tensor_ref=cpu_tensor,
+        )
+        return paths, gpu_batch, info
+
+    def _put_queue_item(self, item: object) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self._queue.put(item, timeout=0.05)
+                return
+            except queue.Full:
+                continue
+
+    def _producer_loop(self) -> None:
+        try:
+            for batch in self.base_source:  # type: ignore[operator]
+                if self._stop_event.is_set():
+                    break
+                self._put_queue_item(self._stage_batch(batch))
+            self._put_queue_item(self._sentinel)
+        except BaseException as exc:
+            self._put_queue_item(exc)
+            self._put_queue_item(self._sentinel)
+
+    def __next__(self) -> Tuple[List[str], object, List[str]]:
+        self.start()
+        while True:
+            if self._closed and self._queue.empty():
+                raise StopIteration
+            try:
+                item = self._queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if item is self._sentinel:
+                self.close()
+                raise StopIteration
+            if isinstance(item, BaseException):
+                self.close()
+                raise item
+            self.count += 1
+            return item  # type: ignore[return-value]
+
+
+def gpu_input_staging_enabled(cfg: 'PredictConfig') -> bool:
+    """Return True when a small queue of YOLO input batches should be staged in VRAM."""
+    if os.environ.get('YOLO_TTA_GPU_INPUT_STAGING') is not None:
+        requested = _env_flag('YOLO_TTA_GPU_INPUT_STAGING', True)
+    else:
+        requested = _env_flag('YOLO_TTA_GPU_PREFETCH', True)
+    if not bool(requested):
+        return False
+    target = canonical_single_device(str(cfg.device))
+    if not str(target).startswith('cuda'):
+        return False
+    try:
+        import torch  # type: ignore
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def gpu_input_staging_queue_batches() -> int:
+    if os.environ.get('YOLO_TTA_GPU_INPUT_STAGING_BATCHES') is not None:
+        return max(0, _env_int('YOLO_TTA_GPU_INPUT_STAGING_BATCHES', 8))
+    return max(0, _env_int('YOLO_TTA_GPU_PREFETCH_BATCHES', 8))
+
+
+def gpu_input_staging_pin_memory_enabled() -> bool:
+    return _env_flag('YOLO_TTA_GPU_INPUT_STAGING_PIN_MEMORY', True)
+
+
+def gpu_input_staging_min_free_after_bytes() -> int:
+    return int(max(0.0, _env_float('YOLO_TTA_GPU_INPUT_STAGING_MIN_FREE_AFTER_GIB', 2.0)) * GIB)
+
+
+def _source_prediction_out_size(source: object) -> Optional[int]:
+    out_size = getattr(source, 'out_size', None)
+    if out_size is not None:
+        try:
+            return int(out_size)
+        except Exception:
+            pass
+    volume = getattr(source, 'volume_gray', None)
+    if volume is not None:
+        try:
+            arr = np.asarray(volume)
+            if arr.ndim >= 3:
+                return int(arr.shape[1])
+        except Exception:
+            pass
+    return None
+
+
+def gpu_input_staging_preflight_ok(source: object, cfg: 'PredictConfig', queue_batches: int, source_label: str) -> bool:
+    out_size = _source_prediction_out_size(source)
+    if out_size is None or int(out_size) <= 0:
+        return True
+    try:
+        import torch  # type: ignore
+        device = torch.device(canonical_single_device(str(cfg.device)))
+        try:
+            with torch.cuda.device(device):
+                free_bytes, _total_bytes = torch.cuda.mem_get_info()
+        except Exception:
+            free_bytes, _total_bytes = torch.cuda.mem_get_info()
+        dtype_bytes = 2 if bool(cfg.half) else 4
+        frame_slots = int(max(1, queue_batches)) * int(max(1, cfg.batch))
+        need_bytes = int(frame_slots) * int(out_size) * int(out_size) * int(dtype_bytes)
+        reserve_bytes = int(gpu_input_staging_min_free_after_bytes())
+        if int(free_bytes) < int(need_bytes) + int(reserve_bytes):
+            print(
+                f'CUDA input staging skipped for {source_label}: need≈{need_bytes / GIB:.2f} GiB '
+                f'for {int(queue_batches)} queued batch(es) at --batch={int(cfg.batch)}, imgsz={int(out_size)}, '
+                f'dtype_bytes={int(dtype_bytes)}; free={int(free_bytes) / GIB:.2f} GiB, '
+                f'reserve={int(reserve_bytes) / GIB:.2f} GiB.'
+            )
+            return False
+        return True
+    except Exception as exc:
+        print(f'CUDA input staging preflight failed for {source_label} ({exc}); using CPU source path.')
+        return False
+
+
+def maybe_wrap_source_with_gpu_input_staging(source: object, cfg: 'PredictConfig', source_label: str) -> object:
+    if isinstance(source, GpuPrefetchingYoloSource):
+        return source
+    if not gpu_input_staging_enabled(cfg):
+        return source
+    queue_batches = gpu_input_staging_queue_batches()
+    if int(queue_batches) <= 0:
+        return source
+    if not gpu_input_staging_preflight_ok(source, cfg, int(queue_batches), str(source_label)):
+        return source
+    ensure_ultralytics_accepts_in_memory_volume_source()
+    print(
+        f'CUDA input staging active for {source_label}: '
+        f'queue_batches={int(queue_batches)} ({int(queue_batches) * max(1, int(cfg.batch))} frame slots), '
+        f'--batch={int(cfg.batch)}, device={canonical_single_device(str(cfg.device))}, '
+        f'dtype={"float16" if bool(cfg.half) else "float32"}'
+    )
+    return GpuPrefetchingYoloSource(
+        source,
+        cfg=cfg,
+        source_label=str(source_label),
+        queue_batches=int(queue_batches),
+        pin_memory=gpu_input_staging_pin_memory_enabled(),
+    )
+
+
+
 def streaming_prediction_sources_enabled() -> bool:
     """Return True when YOLO input slices should be rendered lazily instead of prebuilt."""
     if os.environ.get('YOLO_TTA_STREAMING_PREDICTION_SOURCES') is not None:
@@ -3168,7 +3505,7 @@ def ensure_ultralytics_accepts_in_memory_volume_source() -> None:
     except Exception:
         loaders_tuple = ()
     additions: List[object] = []
-    for loader_cls in (InMemoryYoloVolumeSource, StreamingYoloVolumeSource):
+    for loader_cls in (InMemoryYoloVolumeSource, StreamingYoloVolumeSource, GpuPrefetchingYoloSource):
         if loader_cls not in loaders_tuple:
             additions.append(loader_cls)
     if additions:
@@ -4340,6 +4677,25 @@ def ensure_single_channel_yolo_preprocess_patch() -> bool:
     _ULTRALYTICS_ORIGINAL_BASE_PREPROCESS = original_preprocess
 
     def _tta_single_channel_preprocess(self, im):  # type: ignore[no-untyped-def]
+        gpu_tensor = getattr(im, '_tta_gpu_tensor', None)
+        if gpu_tensor is not None:
+            try:
+                wait_fn = getattr(im, 'wait_ready', None)
+                if callable(wait_fn):
+                    tensor = wait_fn()
+                else:
+                    tensor = gpu_tensor
+                model_obj = getattr(self, 'model', None)
+                use_half = bool(getattr(model_obj, 'fp16', False))
+                if use_half and getattr(tensor, 'dtype', None) != torch.float16:
+                    tensor = tensor.half()
+                elif (not use_half) and getattr(tensor, 'dtype', None) != torch.float32:
+                    tensor = tensor.float()
+                # GPU-staged batches are already normalized to [0,1].
+                return tensor
+            except Exception as exc:
+                raise RuntimeError(f'Failed to consume GPU-staged YOLO input batch: {exc}') from exc
+
         not_tensor = not isinstance(im, torch.Tensor)
         if not_tensor:
             if isinstance(im, np.ndarray):
@@ -4962,7 +5318,8 @@ def predict_source_and_accumulate(
     the full view volume has finished inferencing.
     """
     ensure_yolo_ready_for_predict(model, cfg)
-    if isinstance(source, (InMemoryYoloVolumeSource, StreamingYoloVolumeSource)):
+    source = maybe_wrap_source_with_gpu_input_staging(source, cfg, source_label)
+    if isinstance(source, (InMemoryYoloVolumeSource, StreamingYoloVolumeSource, GpuPrefetchingYoloSource)):
         ensure_single_channel_yolo_preprocess_patch()
     use_custom_cpu_retina = False
     if cpu_retina_masks_enabled():
@@ -5100,7 +5457,8 @@ def predict_source_and_submit_accumulation(
 ) -> PredictionAccumulationHandle:
     """Run YOLO streaming inference and enqueue result accumulation without draining it."""
     ensure_yolo_ready_for_predict(model, cfg)
-    if isinstance(source, (InMemoryYoloVolumeSource, StreamingYoloVolumeSource)):
+    source = maybe_wrap_source_with_gpu_input_staging(source, cfg, source_label)
+    if isinstance(source, (InMemoryYoloVolumeSource, StreamingYoloVolumeSource, GpuPrefetchingYoloSource)):
         ensure_single_channel_yolo_preprocess_patch()
     use_custom_cpu_retina = False
     if cpu_retina_masks_enabled():
@@ -12304,7 +12662,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.5-Pro_v12.2.12_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.5-Pro_v12.2.13_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -14680,7 +15038,7 @@ def main() -> None:
         f'example worker_count={int(example_cpu_mask_workers)}, pending_limit={int(example_cpu_mask_pending)}.'
     )
     spec_notes.append(
-        f'Batched inference active with --batch={int(args.batch)}. StreamingYoloVolumeSource is used by default for full-frame/tile sources: it renders a bounded CPU prefetch window of H×W×1 slices and pads the final batch by repeating the last real slice; set YOLO_TTA_STREAMING_PREDICTION_SOURCES=0 to restore dense in-memory prediction-volume materialization.'
+        f'Batched inference active with --batch={int(args.batch)}. StreamingYoloVolumeSource is used by default for full-frame/tile sources: it renders a bounded CPU prefetch window of H×W×1 slices and pads the final batch by repeating the last real slice; CUDA input staging can additionally queue YOLO_TTA_GPU_INPUT_STAGING_BATCHES/GPU_PREFETCH_BATCHES complete preprocessed batches in VRAM ahead of inference; set YOLO_TTA_STREAMING_PREDICTION_SOURCES=0 to restore dense in-memory prediction-volume materialization.'
     )
     spec_notes.append(
         'Tiled masks are staged into one consolidated parent-view canvas per --tile_size/--tile_stride configuration before gating; '
@@ -14928,7 +15286,7 @@ def main() -> None:
         f'queued-source bound: {prediction_volume_queue_slots})'
     )
     spec_notes.append(
-        'v12.2.12 prediction scheduler active: full-frame and tiled YOLO sources normally stream H×W×1 frames through StreamingYoloVolumeSource, so the GPU can begin after the first prefetch batch while CPU workers continue 2D resize/warp rendering behind it. '
+        'v12.2.13 prediction scheduler active: full-frame and tiled YOLO sources normally stream H×W×1 frames through StreamingYoloVolumeSource, then CUDA input staging can keep a small queue of already-normalized BCHW batches in VRAM so the predictor loop consumes GPU-resident input while CPU workers continue 2D resize/warp rendering behind it. '
         f'The build queue is bounded to {int(prediction_volume_queue_slots)} queued prediction source(s) beyond the current inference; the v12.2.0 default is four queued sources, for a normal total bound of five including the current inference source. '
         'v12.2.11 lazily allocates each full-view union/confidence workspace only when that view first reaches inference, avoiding an eager all-views zero-fill before the first prediction.'
     )
