@@ -2,7 +2,8 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v12.2.13_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.1-v12.2.13 performance patches:
+This v12.2.14_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.1-v12.2.14 performance patches:
+  - v12.2.14 writes decomposed NRRD payloads as one independently compressed gzip member per layer inside the same attached .nrrd payload by default, adds a legacy single-stream fallback, schedules each low-quality downbin as its own background job with per-bin overlay/binary/NRRD writers running concurrently, increases default prediction-source queueing/prefetch/render-worker aggressiveness, permits unbounded CPU result backlog by default, and can eagerly stage queued prediction sources into CUDA input queues before they become the active YOLO source
   - v12.2.13 adds an optional CUDA input-staging queue that preloads a small number of already-normalized BCHW YOLO batches into GPU VRAM ahead of the predictor loop, separate from --batch, so model inference no longer waits on the hot-path RAM->GPU copy when the queue is filled
   - v12.2.12 changes full-frame/tile YOLO inputs to bounded streaming render sources, so inference starts after the first prefetch batch is rendered instead of after a complete (slice,imgsz,imgsz) prediction volume is materialized
   - v12.2.11 removes GPU backprojection from the final Radial/Tilted path, gives CPU-only backprojection the full slice-worker budget, keeps tile waiting/staging/consolidation canvases in RAM by default, overlaps YOLO model loading with decode/cube preparation, adds threaded ffmpeg decode defaults, and tightens the NRRD writer around the Target_Dummy trailing-list layout with direct raw-bbox chunk fills and full-CPU pigz defaults
@@ -3434,6 +3435,62 @@ def maybe_wrap_source_with_gpu_input_staging(source: object, cfg: 'PredictConfig
 
 
 
+def gpu_input_staging_ahead_sources(default_queue_slots: int) -> int:
+    """Number of queued prediction sources allowed to pre-stage CUDA batches.
+
+    This is intentionally separate from YOLO_TTA_GPU_INPUT_STAGING_BATCHES, which
+    is the number of batches inside each source.  The default stages a few future
+    sources so the next source often has CUDA-resident input ready before the
+    current model.predict() call returns.
+    """
+    raw = os.environ.get('YOLO_TTA_GPU_INPUT_STAGING_AHEAD_SOURCES', '').strip()
+    if not raw and os.environ.get('YOLO_TTA_GPU_PREFETCH_AHEAD_SOURCES') is not None:
+        raw = os.environ.get('YOLO_TTA_GPU_PREFETCH_AHEAD_SOURCES', '').strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except Exception:
+            return 0
+    return max(0, min(max(1, int(default_queue_slots)), _env_int('YOLO_TTA_GPU_INPUT_STAGING_AHEAD_DEFAULT', 4)))
+
+
+def _prediction_ref_has_gpu_input_staging(ref: PredictionVolumeRef) -> bool:
+    return isinstance(getattr(ref, 'source', None), GpuPrefetchingYoloSource)
+
+
+def maybe_eager_stage_prediction_ref_on_gpu(prediction_ref: PredictionVolumeRef, cfg: 'PredictConfig') -> PredictionVolumeRef:
+    """Wrap and start one queued prediction source's CUDA input staging queue.
+
+    The ordinary predict path also wraps sources, but only after they become the
+    active source.  Eager staging lets queued sources render and copy their first
+    batches into VRAM while the GPU is still inferencing the previous source.
+    """
+    if _prediction_ref_has_gpu_input_staging(prediction_ref):
+        source = prediction_ref.source
+    else:
+        source = getattr(prediction_ref, 'source', None)
+        if source is None:
+            if prediction_ref.array is None:
+                return prediction_ref
+            source = make_in_memory_yolo_source(
+                prediction_ref.array,
+                prediction_ref.name,
+                batch_size=max(1, int(cfg.batch)),
+                max_frames=None,
+            )
+        wrapped = maybe_wrap_source_with_gpu_input_staging(source, cfg, prediction_ref.name)
+        prediction_ref.source = wrapped
+        source = wrapped
+    start_fn = getattr(source, 'start', None)
+    if callable(start_fn):
+        try:
+            start_fn()
+        except Exception as exc:
+            print(f'Warning: eager CUDA input staging could not start for {prediction_ref.name} ({exc}); source will stage on demand.')
+    return prediction_ref
+
+
+
 def streaming_prediction_sources_enabled() -> bool:
     """Return True when YOLO input slices should be rendered lazily instead of prebuilt."""
     if os.environ.get('YOLO_TTA_STREAMING_PREDICTION_SOURCES') is not None:
@@ -3455,14 +3512,41 @@ def streaming_prediction_source_prefetch_frames(batch_size: int) -> int:
         explicit = _env_int('YOLO_TTA_STREAM_RENDER_PREFETCH_FRAMES', 0)
     if explicit > 0:
         return max(1, int(explicit))
-    batches = max(1, _env_int('YOLO_TTA_STREAMING_SOURCE_PREFETCH_BATCHES', _env_int('YOLO_TTA_STREAM_RENDER_PREFETCH_BATCHES', 8)))
-    max_frames = max(1, _env_int('YOLO_TTA_STREAMING_SOURCE_PREFETCH_MAX_FRAMES', _env_int('YOLO_TTA_STREAM_RENDER_PREFETCH_MAX_FRAMES', 384)))
+    batches = max(1, _env_int('YOLO_TTA_STREAMING_SOURCE_PREFETCH_BATCHES', _env_int('YOLO_TTA_STREAM_RENDER_PREFETCH_BATCHES', 32)))
+    max_frames = max(1, _env_int('YOLO_TTA_STREAMING_SOURCE_PREFETCH_MAX_FRAMES', _env_int('YOLO_TTA_STREAM_RENDER_PREFETCH_MAX_FRAMES', 2048)))
     return max(1, min(int(max_frames), max(int(batch_size), int(batch_size) * int(batches))))
 
 
 def streaming_prediction_source_workers(default_workers: int, num_frames: int) -> int:
-    requested = _env_int('YOLO_TTA_STREAMING_SOURCE_WORKERS', _env_int('YOLO_TTA_STREAM_RENDER_WORKERS', int(default_workers)))
+    min_default = max(1, min(16, int(math.ceil(float(max(1, _cpu_count())) / 4.0))))
+    min_workers = max(1, _env_int('YOLO_TTA_STREAMING_SOURCE_MIN_WORKERS', min_default))
+    default_resolved = max(1, int(default_workers), int(min_workers))
+    requested = _env_int('YOLO_TTA_STREAMING_SOURCE_WORKERS', _env_int('YOLO_TTA_STREAM_RENDER_WORKERS', int(default_resolved)))
     return choose_slice_parallel_workers(max(1, int(requested)), max(1, int(num_frames)))
+
+
+def resolve_prediction_source_queue_slots(total_tasks: int) -> int:
+    """Resolve how many future YOLO sources may be built/prefetched.
+
+    The previous default was four queued sources.  That was safe but too shallow
+    for high-memory SLURM nodes: one expensive view renderer could empty the ready
+    queue and leave the GPU waiting.  The new default queues up to the visible CPU
+    count worth of sources (bounded by the actual task count).  Explicitly set
+    YOLO_TTA_PREDICTION_VOLUME_QUEUE_SLOTS to a positive value to cap it, or to 0
+    to queue every remaining source.
+    """
+    total = max(1, int(total_tasks))
+    raw = os.environ.get('YOLO_TTA_PREDICTION_VOLUME_QUEUE_SLOTS', '').strip()
+    if raw:
+        try:
+            requested = int(raw)
+        except Exception:
+            requested = 0
+        if int(requested) <= 0:
+            return int(total)
+        return max(1, min(int(total), int(requested)))
+    default_slots = max(8, min(int(total), max(1, int(_cpu_count()))))
+    return int(default_slots)
 
 
 def make_streaming_yolo_source(
@@ -4640,7 +4724,7 @@ def cpu_mask_postprocess_pending_limit(worker_count: int, num_frames: int) -> in
     """
     workers = max(1, int(worker_count))
     frames = max(1, int(num_frames))
-    requested = _env_int('YOLO_TTA_CPU_MASK_PENDING_FRAMES', 4096)
+    requested = _env_int('YOLO_TTA_CPU_MASK_PENDING_FRAMES', 0)
     if int(requested) <= 0:
         return max(workers, frames)
     return max(workers, min(frames, max(int(requested), workers * 2)))
@@ -12662,7 +12746,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.5-Pro_v12.2.13_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.5-Pro_v12.2.14_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -13181,17 +13265,176 @@ def _compute_segment_extent_for_layer_ref(
 ) -> NrrdSegmentExtent:
     return _resolve_segment_extent_for_layer_ref(ref, output_shape)[0]
 
+def _write_one_decomposed_nrrd_layer_payload(
+    ref: NrrdLayerRef,
+    output_shape: Tuple[int, int, int],
+    payload_writer: object,
+    *,
+    z_chunk: int,
+    pbar: Optional[object] = None,
+    layer_idx: int = 0,
+) -> None:
+    """Write exactly one decomposed NRRD layer payload in native layer order.
+
+    The caller decides whether this layer is appended into an already-open gzip
+    stream or into its own gzip member.  In either case the uncompressed bytes for
+    one layer are written as native ``(t,Y,X)`` C-order, which matches the NRRD
+    attached payload order for sizes ``(X,Y,t,layer)`` when the list axis is last.
+    """
+    out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
+    z_chunk_i = max(1, int(z_chunk))
+    madvise_interval = nrrd_madvise_dontneed_interval()
+    src: Optional[object] = None
+    try:
+        src = _open_nrrd_layer_ref(ref)
+        _madvise_array_mmap(src, 'MADV_SEQUENTIAL')
+        in_t, in_h, in_w = _volume_shape_tuple(src)
+        direct_native_stream = (
+            (int(in_t), int(in_h), int(in_w)) == (int(out_t), int(out_h), int(out_w))
+            and not isinstance(src, RawBBoxMaskStore)
+        )
+        raw_store_native_stream = (
+            isinstance(src, RawBBoxMaskStore)
+            and (int(in_t), int(in_h), int(in_w)) == (int(out_t), int(out_h), int(out_w))
+        )
+
+        if bool(direct_native_stream):
+            # The memmap is already a native (t,Y,X) C-order layer.  Write chunks of
+            # it directly; no transpose, no Fortran conversion, and no layer interleave.
+            for z0 in range(0, out_t, int(z_chunk_i)):
+                z1 = min(out_t, int(z0) + int(z_chunk_i))
+                chunk = np.asarray(src[int(z0):int(z1)], dtype=np.uint8)
+                if chunk.flags['C_CONTIGUOUS']:
+                    payload_writer.write(memoryview(chunk).cast('B'))
+                else:
+                    payload_writer.write(np.ascontiguousarray(chunk).tobytes(order='C'))
+                if pbar is not None:
+                    pbar.update(int(z1 - z0))
+                if madvise_interval > 0 and (int(z1) % int(madvise_interval) == 0):
+                    _madvise_array_mmap(src, 'MADV_DONTNEED')
+            return
+
+        if bool(raw_store_native_stream):
+            # Target_Dummy layout keeps the list axis last, so one complete layer is a
+            # native (t,Y,X) byte block.  For cvol/ctile sources, fill the reusable block
+            # directly from each slice bbox payload instead of allocating one full decoded
+            # zeros slice per frame and copying it again into the NRRD write buffer.
+            local_z_chunk = int(z_chunk_i)
+            try:
+                layer_chunk = np.empty((int(local_z_chunk), int(out_h), int(out_w)), dtype=np.uint8, order='C')
+            except MemoryError:
+                if int(local_z_chunk) != 1:
+                    print(
+                        f'Warning: requested raw-bbox NRRD chunk allocation failed for layer {int(layer_idx)}; '
+                        'falling back to one output t-slice at a time.'
+                    )
+                local_z_chunk = 1
+                layer_chunk = np.empty((1, int(out_h), int(out_w)), dtype=np.uint8, order='C')
+
+            for z0 in range(0, out_t, int(local_z_chunk)):
+                z1 = min(out_t, int(z0) + int(local_z_chunk))
+                z_count = int(z1 - z0)
+                block = layer_chunk[:z_count, :, :]
+                for zi, z in enumerate(range(int(z0), int(z1))):
+                    src.fill_decoded_slice_into(int(z), block[int(zi)])
+                if block.flags['C_CONTIGUOUS']:
+                    payload_writer.write(memoryview(block).cast('B'))
+                else:
+                    payload_writer.write(np.ascontiguousarray(block).tobytes(order='C'))
+                if pbar is not None:
+                    pbar.update(int(z_count))
+            return
+
+        local_z_chunk = int(z_chunk_i)
+        try:
+            layer_chunk = np.empty((int(local_z_chunk), int(out_h), int(out_w)), dtype=np.uint8, order='C')
+        except MemoryError:
+            if int(local_z_chunk) != 1:
+                print(
+                    f'Warning: requested one-layer NRRD chunk allocation failed for layer {int(layer_idx)}; '
+                    'falling back to one output t-slice at a time.'
+                )
+            local_z_chunk = 1
+            layer_chunk = np.empty((1, int(out_h), int(out_w)), dtype=np.uint8, order='C')
+
+        for z0 in range(0, out_t, int(local_z_chunk)):
+            z1 = min(out_t, int(z0) + int(local_z_chunk))
+            z_count = int(z1 - z0)
+            block = layer_chunk[:z_count, :, :]
+            for zi, z in enumerate(range(int(z0), int(z1))):
+                slice_yx = _read_layer_slice_in_output_shape(src, output_shape, int(z))
+                block[int(zi), :, :] = np.asarray(slice_yx, dtype=np.uint8)
+            payload_writer.write(block.tobytes(order='C'))
+            if pbar is not None:
+                pbar.update(int(z_count))
+            if madvise_interval > 0 and (int(z1) % int(madvise_interval) == 0):
+                _madvise_array_mmap(src, 'MADV_DONTNEED')
+    finally:
+        if src is not None:
+            _madvise_array_mmap(src, 'MADV_DONTNEED')
+            _close_nrrd_layer_source(src)
+            _drop_nrrd_raw_store_chunks_ram_cache(src)
+
+
+def nrrd_individual_layer_gzip_members_enabled() -> bool:
+    """Return True to write one gzip member per decomposed NRRD layer.
+
+    A standard gzip payload may contain concatenated gzip members.  With NRRD
+    ``encoding: gzip``, readers that use normal gzip/zlib streams see the same
+    decompressed byte sequence, while each layer has an independent compression
+    dictionary and can be inspected or recovered as a separate member if needed.
+    Set ``YOLO_TTA_NRRD_INDIVIDUAL_LAYER_GZIP_MEMBERS=0`` to force the legacy
+    single pigz stream across every layer.
+    """
+    if os.environ.get('YOLO_TTA_NRRD_LAYER_GZIP_MEMBERS') is not None:
+        return _env_flag('YOLO_TTA_NRRD_LAYER_GZIP_MEMBERS', True)
+    return _env_flag('YOLO_TTA_NRRD_INDIVIDUAL_LAYER_GZIP_MEMBERS', True)
+
+
 def _write_decomposed_nrrd_payload_stream(
     effective_refs: Sequence[NrrdLayerRef],
     output_shape: Tuple[int, int, int],
     payload_writer: object,
 ) -> None:
-    """Stream decomposed ``(X,Y,t,layer)`` payload one complete layer at a time.
+    """Stream decomposed ``(X,Y,t,layer)`` payload through one gzip stream."""
+    out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
+    layer_count = int(len(effective_refs))
+    if layer_count <= 0:
+        return
 
-    NRRD stores axis 0 as the fastest-varying axis.  With sizes ``(X,Y,t,layer)``,
-    each layer occupies one contiguous on-disk block whose byte order matches the
-    pipeline's native ``(t,Y,X)`` C-order buffer.  This avoids the old
-    layer-fastest voxel interleave and the per-slice ``(Y,X)->(X,Y)`` transpose.
+    z_chunk = _nrrd_full_slice_z_chunk(1, out_w, out_h, out_t)
+    layer_slice_bytes = int(out_w) * int(out_h) * np.dtype(np.uint8).itemsize
+    buffer_bytes = int(layer_slice_bytes) * int(z_chunk)
+    print(
+        f'NRRD streaming decomposed payload: layers={layer_count}, shape=(X,Y,t,layer)='
+        f'({out_w},{out_h},{out_t},{layer_count}), z_chunk={z_chunk}, '
+        f'one_layer_buffer~{buffer_bytes / GIB:.3f} GiB, '
+        f'pigz_level={nrrd_pigz_compresslevel()}, pigz_threads={nrrd_pigz_threads()}, '
+        'gzip_member_layout=single_stream_legacy'
+    )
+
+    with tqdm(total=int(layer_count) * int(out_t), desc='NRRD streaming: decomposed layer blocks') as pbar:
+        for layer_idx, ref in enumerate(effective_refs):
+            _write_one_decomposed_nrrd_layer_payload(
+                ref,
+                output_shape,
+                payload_writer,
+                z_chunk=int(z_chunk),
+                pbar=pbar,
+                layer_idx=int(layer_idx),
+            )
+
+
+def _write_decomposed_nrrd_payload_layer_gzip_members(
+    effective_refs: Sequence[NrrdLayerRef],
+    output_shape: Tuple[int, int, int],
+    fh: object,
+) -> None:
+    """Append one independently-compressed gzip member per decomposed layer.
+
+    The final file is still one attached NRRD with ``encoding: gzip``.  The gzip
+    payload is a concatenation of members in layer order; the concatenated
+    decompressed byte stream is identical to the legacy single-stream layout.
     """
     out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
     layer_count = int(len(effective_refs))
@@ -13205,98 +13448,28 @@ def _write_decomposed_nrrd_payload_stream(
         f'NRRD streaming decomposed payload: layers={layer_count}, shape=(X,Y,t,layer)='
         f'({out_w},{out_h},{out_t},{layer_count}), z_chunk={z_chunk}, '
         f'one_layer_buffer~{buffer_bytes / GIB:.3f} GiB, '
-        f'pigz_level={nrrd_pigz_compresslevel()}, pigz_threads={nrrd_pigz_threads()}'
+        f'pigz_level={nrrd_pigz_compresslevel()}, pigz_threads={nrrd_pigz_threads()}, '
+        'gzip_member_layout=one_member_per_layer'
     )
 
-    madvise_interval = nrrd_madvise_dontneed_interval()
-    with tqdm(total=int(layer_count) * int(out_t), desc='NRRD streaming: decomposed layer blocks') as pbar:
+    with tqdm(total=int(layer_count) * int(out_t), desc='NRRD streaming: decomposed layer gzip members') as pbar:
         for layer_idx, ref in enumerate(effective_refs):
-            src: Optional[object] = None
+            print(f'NRRD layer gzip member {int(layer_idx) + 1}/{int(layer_count)}: {ref.key}')
+            with _open_pigz_payload_writer(fh) as payload_writer:
+                _write_one_decomposed_nrrd_layer_payload(
+                    ref,
+                    output_shape,
+                    payload_writer,
+                    z_chunk=int(z_chunk),
+                    pbar=pbar,
+                    layer_idx=int(layer_idx),
+                )
             try:
-                src = _open_nrrd_layer_ref(ref)
-                _madvise_array_mmap(src, 'MADV_SEQUENTIAL')
-                in_t, in_h, in_w = _volume_shape_tuple(src)
-                direct_native_stream = (
-                    (int(in_t), int(in_h), int(in_w)) == (int(out_t), int(out_h), int(out_w))
-                    and not isinstance(src, RawBBoxMaskStore)
-                )
-                raw_store_native_stream = (
-                    isinstance(src, RawBBoxMaskStore)
-                    and (int(in_t), int(in_h), int(in_w)) == (int(out_t), int(out_h), int(out_w))
-                )
-
-                if bool(direct_native_stream):
-                    # The memmap is already a native (t,Y,X) C-order layer.  Write chunks of
-                    # it directly; no transpose, no Fortran conversion, and no layer interleave.
-                    for z0 in range(0, out_t, int(z_chunk)):
-                        z1 = min(out_t, int(z0) + int(z_chunk))
-                        chunk = np.asarray(src[int(z0):int(z1)], dtype=np.uint8)
-                        if chunk.flags['C_CONTIGUOUS']:
-                            payload_writer.write(memoryview(chunk).cast('B'))
-                        else:
-                            payload_writer.write(np.ascontiguousarray(chunk).tobytes(order='C'))
-                        pbar.update(int(z1 - z0))
-                        if madvise_interval > 0 and (int(z1) % int(madvise_interval) == 0):
-                            _madvise_array_mmap(src, 'MADV_DONTNEED')
-                    continue
-
-                if bool(raw_store_native_stream):
-                    # Target_Dummy layout keeps the list axis last, so one complete layer is a
-                    # native (t,Y,X) byte block.  For cvol/ctile sources, fill the reusable block
-                    # directly from each slice bbox payload instead of allocating one full decoded
-                    # zeros slice per frame and copying it again into the NRRD write buffer.
-                    try:
-                        layer_chunk = np.empty((int(z_chunk), int(out_h), int(out_w)), dtype=np.uint8, order='C')
-                    except MemoryError:
-                        if int(z_chunk) != 1:
-                            print(
-                                f'Warning: requested raw-bbox NRRD chunk allocation failed for layer {int(layer_idx)}; '
-                                'falling back to one output t-slice at a time.'
-                            )
-                        z_chunk = 1
-                        layer_chunk = np.empty((1, int(out_h), int(out_w)), dtype=np.uint8, order='C')
-
-                    for z0 in range(0, out_t, int(z_chunk)):
-                        z1 = min(out_t, int(z0) + int(z_chunk))
-                        z_count = int(z1 - z0)
-                        block = layer_chunk[:z_count, :, :]
-                        for zi, z in enumerate(range(int(z0), int(z1))):
-                            src.fill_decoded_slice_into(int(z), block[int(zi)])
-                        if block.flags['C_CONTIGUOUS']:
-                            payload_writer.write(memoryview(block).cast('B'))
-                        else:
-                            payload_writer.write(np.ascontiguousarray(block).tobytes(order='C'))
-                        pbar.update(int(z_count))
-                    continue
-
-                try:
-                    layer_chunk = np.empty((int(z_chunk), int(out_h), int(out_w)), dtype=np.uint8, order='C')
-                except MemoryError:
-                    if int(z_chunk) != 1:
-                        print(
-                            f'Warning: requested one-layer NRRD chunk allocation failed for layer {int(layer_idx)}; '
-                            'falling back to one output t-slice at a time.'
-                        )
-                    z_chunk = 1
-                    layer_chunk = np.empty((1, int(out_h), int(out_w)), dtype=np.uint8, order='C')
-
-                for z0 in range(0, out_t, int(z_chunk)):
-                    z1 = min(out_t, int(z0) + int(z_chunk))
-                    z_count = int(z1 - z0)
-                    block = layer_chunk[:z_count, :, :]
-                    for zi, z in enumerate(range(int(z0), int(z1))):
-                        slice_yx = _read_layer_slice_in_output_shape(src, output_shape, int(z))
-                        block[int(zi), :, :] = np.asarray(slice_yx, dtype=np.uint8)
-                    payload_writer.write(block.tobytes(order='C'))
-                    pbar.update(int(z_count))
-                    if madvise_interval > 0 and (int(z1) % int(madvise_interval) == 0):
-                        _madvise_array_mmap(src, 'MADV_DONTNEED')
-            finally:
-                if src is not None:
-                    _madvise_array_mmap(src, 'MADV_DONTNEED')
-                    _close_nrrd_layer_source(src)
-                    _drop_nrrd_raw_store_chunks_ram_cache(src)
-
+                flush_fn = getattr(fh, 'flush', None)
+                if callable(flush_fn):
+                    flush_fn()
+            except Exception:
+                pass
 
 def _write_decomposed_nrrd_manifest(
     *,
@@ -13321,6 +13494,11 @@ def _write_decomposed_nrrd_manifest(
         'internal_layer_order': '(t, Y, X)',
         'output_shape_tyx': [int(output_shape[0]), int(output_shape[1]), int(output_shape[2])],
         'layer_count': int(len(effective_refs)),
+        'gzip_member_layout': (
+            'one_member_per_layer'
+            if bool(nrrd_individual_layer_gzip_members_enabled())
+            else 'single_stream_legacy'
+        ),
         'layers': [
             {
                 'index': int(idx),
@@ -13361,6 +13539,7 @@ def _write_decomposed_nrrd_manifest(
             'Consolidated tile bridge layers are not attributed back to parent_mask vs parent_bridge acceptance because interpolation occurs after accepted tile masks are unioned.',
             'The final_output layer is included for direct comparison and can be ignored when recomposing a custom volume from component layers.',
             'NRRD payload was written by the bounded-memory streaming writer; no full 4D decomposed payload was materialized.',
+            'When gzip_member_layout is one_member_per_layer, the attached NRRD gzip payload concatenates one independently compressed gzip member per layer while preserving the same decompressed (X,Y,t,layer) byte stream.',
             'Segment extents are recorded during layer materialization and reused during final packaging whenever possible.',
         ],
     }
@@ -13380,8 +13559,10 @@ def write_decomposed_nrrd(
 
     Each supplied layer is an orthogonal ``(t,Y,X)`` binary mask in processing geometry.  Layers are
     restored to the final output geometry on the fly when cubic resizing changed the working shape,
-    then streamed as a pigz gzip-encoded 4D payload ordered ``(X, Y, t, layer)``.  A sidecar
-    ``*.manifest.json`` is written next to the NRRD so downstream tools can reconstruct unions
+    then streamed as a pigz gzip-encoded 4D payload ordered ``(X, Y, t, layer)``.
+    By default each layer is an independent gzip member appended to the same attached
+    ``.nrrd`` payload; set YOLO_TTA_NRRD_INDIVIDUAL_LAYER_GZIP_MEMBERS=0 for the legacy
+    single gzip stream.  A sidecar ``*.manifest.json`` is written next to the NRRD so downstream tools can reconstruct unions
     without parsing NRRD custom fields.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -13490,6 +13671,12 @@ def write_decomposed_nrrd(
         layer_refs=effective_refs,
         layer_extents=layer_extents,
     )
+    per_layer_gzip_members = bool(nrrd_individual_layer_gzip_members_enabled())
+    header['TTA_GzipMemberLayout'] = (
+        'one gzip member per decomposed layer'
+        if bool(per_layer_gzip_members)
+        else 'single gzip stream across all decomposed layers'
+    )
 
     with open(out_path, 'wb') as fh:
         _write_nrrd_ascii_header(
@@ -13500,8 +13687,11 @@ def write_decomposed_nrrd(
             data_type='unsigned char',
             encoding='gzip',
         )
-        with _open_pigz_payload_writer(fh) as payload_writer:
-            _write_decomposed_nrrd_payload_stream(effective_refs, output_shape, payload_writer)
+        if bool(per_layer_gzip_members):
+            _write_decomposed_nrrd_payload_layer_gzip_members(effective_refs, output_shape, fh)
+        else:
+            with _open_pigz_payload_writer(fh) as payload_writer:
+                _write_decomposed_nrrd_payload_stream(effective_refs, output_shape, payload_writer)
 
     _write_decomposed_nrrd_manifest(
         out_path=out_path,
@@ -14066,6 +14256,142 @@ def write_low_quality_binary_video(
     return out_path
 
 
+def low_quality_downbin_parallel_workers(spec_count: int, requested_workers: int) -> int:
+    """Number of low-quality downbin specs to process concurrently.
+
+    A value of 0 in YOLO_TTA_LOW_QUALITY_BIN_WORKERS means all requested bins.
+    The default also schedules every bin concurrently; the top-level background
+    output executor remains the outer cap when collect_low_quality_output_futures()
+    is used from the main pipeline.
+    """
+    count = max(0, int(spec_count))
+    if count <= 0:
+        return 1
+    raw = _env_int('YOLO_TTA_LOW_QUALITY_BIN_WORKERS', 0)
+    if raw <= 0:
+        return count
+    return max(1, min(count, int(raw)))
+
+
+def low_quality_per_bin_output_workers(requested_workers: int) -> int:
+    """Number of output writer tasks launched inside one low-quality bin."""
+    default_value = max(1, min(3, int(requested_workers)))
+    return max(1, min(3, _env_int('YOLO_TTA_LOW_QUALITY_OUTPUT_WORKERS_PER_BIN', int(default_value))))
+
+
+def save_single_low_quality_output(
+    *,
+    volume_gray: np.ndarray,
+    mask_u8: np.ndarray,
+    spec: LowQualityDownbinSpec,
+    skeleton_u8: Optional[np.ndarray] = None,
+    out_dir: Path,
+    stem: str,
+    fps: float,
+    temp_dir: Path,
+    nrrd_layer_refs: Optional[Sequence[NrrdLayerRef]] = None,
+    workers: int = 1,
+    show_progress: bool = True,
+) -> Dict[str, Path]:
+    """Write one low-quality downbin, with overlay/binary/NRRD writers overlapped."""
+    low_root = Path(out_dir) / 'low_quality'
+    low_root.mkdir(parents=True, exist_ok=True)
+    source_t = max(1, int(mask_u8.shape[0]))
+    out_t, out_h, out_w = (
+        int(spec.output_shape_t_y_x[0]),
+        int(spec.output_shape_t_y_x[1]),
+        int(spec.output_shape_t_y_x[2]),
+    )
+    spec_dir = low_root / spec.token
+    spec_dir.mkdir(parents=True, exist_ok=True)
+    fps_lq = max(1e-6, float(fps) * float(out_t) / float(source_t))
+    print(
+        f'Low-quality downbin {spec.raw_value}: native (t,Y,X)=({source_t},{int(mask_u8.shape[1])},{int(mask_u8.shape[2])}) '
+        f'-> ({out_t},{out_h},{out_w}); playback fps adjusted {float(fps):g} -> {fps_lq:g}; '
+        f'per-bin output writer concurrency={low_quality_per_bin_output_workers(int(workers))}'
+    )
+
+    gray_lq = resize_gray_volume_to_shape(
+        volume_gray,
+        (out_t, out_h, out_w),
+        Path(temp_dir) / 'low_quality' / spec.token / 'source.gray8.dat',
+        workers=int(workers),
+        prefer_memory=True,
+        desc=f'Low-quality source resize {spec.token}',
+    )
+    mask_lq = resize_binary_mask_volume_to_shape(
+        mask_u8,
+        (out_t, out_h, out_w),
+        Path(temp_dir) / 'low_quality' / spec.token / 'mask.u8.dat',
+        workers=int(workers),
+        prefer_memory=True,
+        desc=f'Low-quality mask resize {spec.token}',
+    )
+    skeleton_lq: Optional[np.ndarray] = None
+    if skeleton_u8 is not None:
+        skeleton_lq = resize_binary_mask_volume_to_shape(
+            skeleton_u8,
+            (out_t, out_h, out_w),
+            Path(temp_dir) / 'low_quality' / spec.token / 'skeleton.u8.dat',
+            workers=int(workers),
+            prefer_memory=True,
+            desc=f'Low-quality skeleton resize {spec.token}',
+        )
+
+    result_paths: Dict[str, Path] = {'low_quality_dir': low_root}
+    try:
+        overlay_path = spec_dir / f'{stem}_Overlay_LowQuality_{spec.token}.mp4'
+        binary_path = spec_dir / f'{stem}_Binary_LowQuality_{spec.token}.mp4'
+        nrrd_path = spec_dir / f'{stem}_LowQuality_{spec.token}.nrrd'
+
+        def _write_lq_overlay() -> Path:
+            return write_low_quality_overlay_video(gray_lq, mask_lq, overlay_path, fps_lq, skeleton_u8=skeleton_lq, show_progress=show_progress)
+
+        def _write_lq_binary() -> Path:
+            return write_low_quality_binary_video(mask_lq, binary_path, fps_lq, show_progress=show_progress)
+
+        def _write_lq_nrrd() -> Path:
+            if nrrd_layer_refs is not None and len(nrrd_layer_refs) > 0:
+                return write_decomposed_nrrd(
+                    list(nrrd_layer_refs),
+                    mask_lq,
+                    nrrd_path,
+                    temp_dir=Path(temp_dir) / 'low_quality' / spec.token / 'nrrd_decomposed',
+                    workers=int(workers),
+                    include_final_output_layer=True,
+                )
+            return write_nrrd(mask_lq, nrrd_path)
+
+        writer_count = low_quality_per_bin_output_workers(int(workers))
+        if writer_count <= 1:
+            _write_lq_overlay()
+            _write_lq_binary()
+            _write_lq_nrrd()
+        else:
+            with ThreadPoolExecutor(max_workers=int(writer_count), thread_name_prefix=f'lq-writer-{spec.token[:16]}') as executor:
+                futures = [
+                    executor.submit(_write_lq_overlay),
+                    executor.submit(_write_lq_binary),
+                    executor.submit(_write_lq_nrrd),
+                ]
+                for fut in as_completed(futures):
+                    fut.result()
+
+        result_paths[f'low_quality_{spec.token}_overlay'] = overlay_path
+        result_paths[f'low_quality_{spec.token}_binary_video'] = binary_path
+        result_paths[f'low_quality_{spec.token}_nrrd'] = nrrd_path
+        if nrrd_layer_refs is not None and len(nrrd_layer_refs) > 0:
+            result_paths[f'low_quality_{spec.token}_nrrd_manifest'] = nrrd_path.with_suffix(nrrd_path.suffix + '.manifest.json')
+        return result_paths
+    finally:
+        if gray_lq is not volume_gray:
+            close_memmap_array(gray_lq)
+        if mask_lq is not mask_u8:
+            close_memmap_array(mask_lq)
+        if skeleton_lq is not None and skeleton_lq is not skeleton_u8:
+            close_memmap_array(skeleton_lq)
+
+
 def save_low_quality_outputs(
     *,
     volume_gray: np.ndarray,
@@ -14080,85 +14406,99 @@ def save_low_quality_outputs(
     workers: int = 1,
     show_progress: bool = True,
 ) -> Dict[str, Path]:
-    """Write v12.2.1 low-quality outputs with isotropic X/Y/t resizing."""
-    low_root = out_dir / 'low_quality'
+    """Write v12.2.1 low-quality outputs with isotropic X/Y/t resizing.
+
+    Multiple bins are processed concurrently by default, and each bin overlaps its
+    overlay, binary-video, and NRRD writers once its resized volumes are ready.
+    """
+    low_root = Path(out_dir) / 'low_quality'
     low_root.mkdir(parents=True, exist_ok=True)
     result_paths: Dict[str, Path] = {'low_quality_dir': low_root}
-    if not downbin_specs:
+    specs = list(downbin_specs)
+    if not specs:
         return result_paths
 
-    source_t = max(1, int(mask_u8.shape[0]))
-    for spec in downbin_specs:
-        out_t, out_h, out_w = (
-            int(spec.output_shape_t_y_x[0]),
-            int(spec.output_shape_t_y_x[1]),
-            int(spec.output_shape_t_y_x[2]),
-        )
-        spec_dir = low_root / spec.token
-        spec_dir.mkdir(parents=True, exist_ok=True)
-        fps_lq = max(1e-6, float(fps) * float(out_t) / float(source_t))
-        print(
-            f'Low-quality downbin {spec.raw_value}: native (t,Y,X)=({source_t},{int(mask_u8.shape[1])},{int(mask_u8.shape[2])}) '
-            f'-> ({out_t},{out_h},{out_w}); playback fps adjusted {float(fps):g} -> {fps_lq:g}'
-        )
-
-        gray_lq = resize_gray_volume_to_shape(
-            volume_gray,
-            (out_t, out_h, out_w),
-            temp_dir / 'low_quality' / spec.token / 'source.gray8.dat',
-            workers=int(workers),
-            prefer_memory=True,
-            desc=f'Low-quality source resize {spec.token}',
-        )
-        mask_lq = resize_binary_mask_volume_to_shape(
-            mask_u8,
-            (out_t, out_h, out_w),
-            temp_dir / 'low_quality' / spec.token / 'mask.u8.dat',
-            workers=int(workers),
-            prefer_memory=True,
-            desc=f'Low-quality mask resize {spec.token}',
-        )
-        skeleton_lq: Optional[np.ndarray] = None
-        if skeleton_u8 is not None:
-            skeleton_lq = resize_binary_mask_volume_to_shape(
-                skeleton_u8,
-                (out_t, out_h, out_w),
-                temp_dir / 'low_quality' / spec.token / 'skeleton.u8.dat',
+    bin_workers = low_quality_downbin_parallel_workers(len(specs), int(workers))
+    if int(bin_workers) <= 1:
+        for spec in specs:
+            result_paths.update(save_single_low_quality_output(
+                volume_gray=volume_gray,
+                mask_u8=mask_u8,
+                skeleton_u8=skeleton_u8,
+                out_dir=out_dir,
+                stem=stem,
+                fps=float(fps),
+                spec=spec,
+                temp_dir=temp_dir,
+                nrrd_layer_refs=nrrd_layer_refs,
                 workers=int(workers),
-                prefer_memory=True,
-                desc=f'Low-quality skeleton resize {spec.token}',
-            )
-        try:
-            overlay_path = spec_dir / f'{stem}_Overlay_LowQuality_{spec.token}.mp4'
-            binary_path = spec_dir / f'{stem}_Binary_LowQuality_{spec.token}.mp4'
-            nrrd_path = spec_dir / f'{stem}_LowQuality_{spec.token}.nrrd'
-            write_low_quality_overlay_video(gray_lq, mask_lq, overlay_path, fps_lq, skeleton_u8=skeleton_lq, show_progress=show_progress)
-            write_low_quality_binary_video(mask_lq, binary_path, fps_lq, show_progress=show_progress)
-            if nrrd_layer_refs is not None and len(nrrd_layer_refs) > 0:
-                write_decomposed_nrrd(
-                    list(nrrd_layer_refs),
-                    mask_lq,
-                    nrrd_path,
-                    temp_dir=temp_dir / 'low_quality' / spec.token / 'nrrd_decomposed',
-                    workers=int(workers),
-                    include_final_output_layer=True,
-                )
-                result_paths[f'low_quality_{spec.token}_nrrd_manifest'] = nrrd_path.with_suffix(nrrd_path.suffix + '.manifest.json')
-            else:
-                write_nrrd(mask_lq, nrrd_path)
-            result_paths[f'low_quality_{spec.token}_overlay'] = overlay_path
-            result_paths[f'low_quality_{spec.token}_binary_video'] = binary_path
-            result_paths[f'low_quality_{spec.token}_nrrd'] = nrrd_path
-        finally:
-            if gray_lq is not volume_gray:
-                close_memmap_array(gray_lq)
-            if mask_lq is not mask_u8:
-                close_memmap_array(mask_lq)
-            if skeleton_lq is not None and skeleton_lq is not skeleton_u8:
-                close_memmap_array(skeleton_lq)
+                show_progress=show_progress,
+            ))
+        return result_paths
 
+    print(f'Low-quality downbin concurrency: {int(bin_workers)} bin(s) in parallel out of {len(specs)} requested.')
+    with ThreadPoolExecutor(max_workers=int(bin_workers), thread_name_prefix='low-quality-bin') as executor:
+        futures = [
+            executor.submit(
+                save_single_low_quality_output,
+                volume_gray=volume_gray,
+                mask_u8=mask_u8,
+                skeleton_u8=skeleton_u8,
+                out_dir=out_dir,
+                stem=stem,
+                fps=float(fps),
+                spec=spec,
+                temp_dir=temp_dir,
+                nrrd_layer_refs=nrrd_layer_refs,
+                workers=int(workers),
+                show_progress=show_progress,
+            )
+            for spec in specs
+        ]
+        for fut in as_completed(futures):
+            result_paths.update(fut.result())
     return result_paths
 
+
+def collect_low_quality_output_futures(
+    executor: ThreadPoolExecutor,
+    *,
+    volume_gray: np.ndarray,
+    mask_u8: np.ndarray,
+    skeleton_u8: Optional[np.ndarray] = None,
+    out_dir: Path,
+    stem: str,
+    fps: float,
+    downbin_specs: Sequence[LowQualityDownbinSpec],
+    temp_dir: Path,
+    nrrd_layer_refs: Optional[Sequence[NrrdLayerRef]] = None,
+    workers: int = 1,
+    show_progress: bool = True,
+) -> Tuple[Dict[str, Path], List[Future]]:
+    """Submit each low-quality downbin as an independent background job."""
+    result_paths = planned_low_quality_output_paths(
+        out_dir=out_dir,
+        stem=stem,
+        downbin_specs=downbin_specs,
+        nrrd_layer_refs=nrrd_layer_refs,
+    )
+    futures: List[Future] = []
+    for spec in list(downbin_specs):
+        futures.append(executor.submit(
+            save_single_low_quality_output,
+            volume_gray=volume_gray,
+            mask_u8=mask_u8,
+            skeleton_u8=skeleton_u8,
+            out_dir=out_dir,
+            stem=stem,
+            fps=float(fps),
+            spec=spec,
+            temp_dir=temp_dir,
+            nrrd_layer_refs=nrrd_layer_refs,
+            workers=int(workers),
+            show_progress=show_progress,
+        ))
+    return result_paths, futures
 
 
 def planned_low_quality_output_paths(
@@ -14819,7 +15159,7 @@ def main() -> None:
         )
         spec_notes.append(
             'Low-quality NRRDs use the same decomposed component layer stack as the full NRRD, '
-            'streamed directly into the requested low-quality geometry with its own manifest sidecar, and scheduled in the background alongside full-size outputs so full and low-quality NRRD payload streams can run concurrently when output workers are available.'
+            'streamed directly into the requested low-quality geometry with its own manifest sidecar; each low-quality downbin is submitted as an independent background job, and each bin can overlap its overlay, binary video, and NRRD writers so all low-quality NRRD payload streams can run alongside the full-size NRRD when output workers are available.'
         )
     if (int(T), int(H), int(W)) != (int(input_T), int(input_H), int(input_W)):
         spec_notes.append(
@@ -14955,7 +15295,7 @@ def main() -> None:
     )
     output_frame_workers = max(1, _env_int('YOLO_TTA_OUTPUT_FRAME_WORKERS', max(1, min(_cpu_count(), output_workers))))
     slice_postprocess_workers = max(1, int(augmentation_workers))
-    predict_postprocess_cap = max(1, _env_int('YOLO_TTA_PREDICT_POSTPROCESS_MAX_WORKERS', max(1, _cpu_count())))
+    predict_postprocess_cap = max(1, _env_int('YOLO_TTA_PREDICT_POSTPROCESS_MAX_WORKERS', max(1, int(worker_budget))))
     predict_postprocess_workers = max(
         1,
         min(
@@ -15031,9 +15371,9 @@ def main() -> None:
     spec_notes.append(
         'YOLO result accumulation is bounded per in-memory prediction source by the number of pending CPU postprocess futures. ' 
         'worker_count=max(1, min(YOLO_TTA_PREDICT_POSTPROCESS_WORKERS, num_frames)) for the live v12 in-memory source path; ' 
-        'v12.2.11 removes the former hard 32-worker ceiling; YOLO_TTA_PREDICT_POSTPROCESS_MAX_WORKERS now defaults to the visible CPU allocation. '
+        'v12.2.14 keeps the former hard 32-worker ceiling removed and now defaults YOLO_TTA_PREDICT_POSTPROCESS_MAX_WORKERS to the oversubscribed worker budget so CPU result processing can queue/drain behind the GPU instead of throttling inference. '
         'pending_limit=cpu_mask_postprocess_pending_limit(worker_count, num_frames) = max(worker_count, min(num_frames, max(YOLO_TTA_CPU_MASK_PENDING_FRAMES, worker_count*2))). ' 
-        'The default YOLO_TTA_CPU_MASK_PENDING_FRAMES is 4096; setting it to 0 permits buffering all frames for that prediction source. ' 
+        'The default YOLO_TTA_CPU_MASK_PENDING_FRAMES is 0, so the GPU-facing iterator can buffer all CPU result work for that prediction source; set it positive only to reintroduce a RAM cap. ' 
         f'For this run, the largest active prediction source has {int(max_predict_video_frames)} frame(s), ' 
         f'example worker_count={int(example_cpu_mask_workers)}, pending_limit={int(example_cpu_mask_pending)}.'
     )
@@ -15225,7 +15565,12 @@ def main() -> None:
         for aug_job in aug_jobs_by_view[view.name]
     )
     total_prediction_volume_build_tasks = int(total_fullframe_jobs + total_tile_prediction_jobs)
-    prediction_volume_queue_slots = max(1, _env_int('YOLO_TTA_PREDICTION_VOLUME_QUEUE_SLOTS', 4))
+    prediction_volume_queue_slots = resolve_prediction_source_queue_slots(total_prediction_volume_build_tasks)
+    eager_gpu_input_staging_ahead_sources = (
+        gpu_input_staging_ahead_sources(int(prediction_volume_queue_slots))
+        if gpu_input_staging_enabled(pred_cfg)
+        else 0
+    )
     active_build_slot_default = max(
         1,
         min(
@@ -15251,7 +15596,7 @@ def main() -> None:
     async_prediction_accumulation_active = bool(async_predict_postprocess_enabled())
     async_prediction_multiview_locking_active = bool(len(angles) > 1 and async_prediction_accumulation_active)
     async_prediction_join_worker_count = async_predict_join_workers(max(2, int(prediction_volume_queue_slots) + 1))
-    default_async_result_workers = max(1, min(int(predict_postprocess_workers), max(1, _cpu_count())))
+    default_async_result_workers = max(1, int(predict_postprocess_workers))
     async_prediction_result_worker_count = max(
         1,
         min(
@@ -15283,11 +15628,13 @@ def main() -> None:
     print(
         f'Streaming prediction-source preparers: {prediction_volume_builder_workers} '
         f'(per-source render workers: {per_prediction_volume_workers}, source tasks: {total_prediction_volume_build_tasks}, '
-        f'queued-source bound: {prediction_volume_queue_slots})'
+        f'queued-source bound: {prediction_volume_queue_slots}, '
+        f'eager CUDA-staged queued sources: {int(eager_gpu_input_staging_ahead_sources)})'
     )
     spec_notes.append(
-        'v12.2.13 prediction scheduler active: full-frame and tiled YOLO sources normally stream H×W×1 frames through StreamingYoloVolumeSource, then CUDA input staging can keep a small queue of already-normalized BCHW batches in VRAM so the predictor loop consumes GPU-resident input while CPU workers continue 2D resize/warp rendering behind it. '
-        f'The build queue is bounded to {int(prediction_volume_queue_slots)} queued prediction source(s) beyond the current inference; the v12.2.0 default is four queued sources, for a normal total bound of five including the current inference source. '
+        'v12.2.14 prediction scheduler active: full-frame and tiled YOLO sources normally stream H×W×1 frames through StreamingYoloVolumeSource, then CUDA input staging can keep queues of already-normalized BCHW batches in VRAM so the predictor loop consumes GPU-resident input while CPU workers continue 2D resize/warp rendering behind it. '
+        f'The build queue is bounded to {int(prediction_volume_queue_slots)} queued prediction source(s) beyond the current inference; the v12.2.14 default is CPU-count-scaled, and YOLO_TTA_PREDICTION_VOLUME_QUEUE_SLOTS=0 queues every remaining source when RAM allows. '
+        f'Up to {int(eager_gpu_input_staging_ahead_sources)} queued source(s) are eagerly CUDA-staged before they become the active model.predict source (YOLO_TTA_GPU_INPUT_STAGING_AHEAD_SOURCES). '
         'v12.2.11 lazily allocates each full-view union/confidence workspace only when that view first reaches inference, avoiding an eager all-views zero-fill before the first prediction.'
     )
     if dense_tiling_active:
@@ -15455,13 +15802,37 @@ def main() -> None:
             kind, view, job_obj = pending_prediction_build_jobs.popleft()
             _submit_prediction_volume_build(str(kind), view, job_obj)
 
+    def _queued_gpu_staging_ref_count() -> int:
+        seen: set[int] = set()
+        count = 0
+        for _view, _job, ref in list(ready_fullframe):
+            rid = id(ref)
+            if rid not in seen and _prediction_ref_has_gpu_input_staging(ref):
+                seen.add(rid)
+                count += 1
+        for _model_name, _view, _tile_job, ref in list(ready_tile_infer):
+            rid = id(ref)
+            if rid not in seen and _prediction_ref_has_gpu_input_staging(ref):
+                seen.add(rid)
+                count += 1
+        return int(count)
+
+    def _maybe_eager_stage_prediction_ref(pred_ref: PredictionVolumeRef) -> PredictionVolumeRef:
+        if int(eager_gpu_input_staging_ahead_sources) <= 0:
+            return pred_ref
+        if _prediction_ref_has_gpu_input_staging(pred_ref):
+            return pred_ref
+        if _queued_gpu_staging_ref_count() >= int(eager_gpu_input_staging_ahead_sources):
+            return pred_ref
+        return maybe_eager_stage_prediction_ref_on_gpu(pred_ref, pred_cfg)
+
     def _drain_completed_prediction_volume_futures() -> None:
         for fut in list(pending_prediction_volume_futures):
             if not fut.done():
                 continue
             pending_prediction_volume_futures.remove(fut)
             kind, view, job_obj = prediction_volume_futures.pop(fut)
-            pred_ref = fut.result()
+            pred_ref = _maybe_eager_stage_prediction_ref(fut.result())
             if str(kind) == 'fullframe':
                 assert isinstance(job_obj, AugJob)
                 ready_fullframe.append((view, job_obj, pred_ref))
@@ -16505,14 +16876,8 @@ def main() -> None:
 
     if bool(low_quality_requested):
         print('\n=== Scheduling low-quality isotropic outputs in background ===')
-        low_quality_paths = planned_low_quality_output_paths(
-            out_dir=out_dir,
-            stem=input_path.stem,
-            downbin_specs=low_quality_downbin_specs,
-            nrrd_layer_refs=nrrd_layer_refs,
-        )
-        low_quality_future = output_manager.executor.submit(
-            save_low_quality_outputs,
+        low_quality_paths, low_quality_futures = collect_low_quality_output_futures(
+            output_manager.executor,
             volume_gray=final_output_volume_for_low_quality,
             mask_u8=final_output_mask_mm,
             skeleton_u8=skeleton_output_mm if bool(args.save_skeleton) else None,
@@ -16529,7 +16894,7 @@ def main() -> None:
         output_manager.submit(BackgroundOutputSubmission(
             label='low-quality outputs',
             result_paths=low_quality_paths,
-            futures=[low_quality_future],
+            futures=low_quality_futures,
             resources=[],
         ))
 
@@ -16566,7 +16931,7 @@ def main() -> None:
     if bool(nrrd_layers_needed):
         spec_notes.append(
             f'Decomposed NRRD component layers prepared: {int(len(nrrd_layer_refs))}; '
-            'the writer appends one final_output layer, reuses materialization-time SegmentN extents, and writes .nrrd.manifest.json sidecars for full-size and low-quality decomposed NRRDs.'
+            'the writer appends one final_output layer, reuses materialization-time SegmentN extents, writes .nrrd.manifest.json sidecars for full-size and low-quality decomposed NRRDs, and by default stores each decomposed layer as an independently compressed gzip member inside the same attached .nrrd payload.'
         )
 
     summary_path = write_summary_file(
