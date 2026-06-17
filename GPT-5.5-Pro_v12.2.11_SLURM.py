@@ -2,11 +2,12 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v12.2.9_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.1-v12.2.9 performance patches:
+This v12.2.11_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.1-v12.2.11 performance patches:
+  - v12.2.11 removes GPU backprojection from the final Radial/Tilted path, gives CPU-only backprojection the full slice-worker budget, keeps tile waiting/staging/consolidation canvases in RAM by default, overlaps YOLO model loading with decode/cube preparation, adds threaded ffmpeg decode defaults, and tightens the NRRD writer around the Target_Dummy trailing-list layout with direct raw-bbox chunk fills and full-CPU pigz defaults
   - v12.2.8 adds a dedicated single --angle streaming cleanup path: when exactly one augmentation angle is requested, min_conf filtering, 2D hole filling, and view-native per-slice min_radius filtering are applied as YOLO slices stream in; only true volume-level cleanup waits for the completed view volume
   - v12.2.9 keeps the GPU-fed queue hot by sizing prediction-volume builders to the active prefetch window, skipping scratch memmap flushes on the prediction hot path by default, and allowing single-angle CPU result accumulation to finish behind the next prediction volume
   - v12.2.1 restores the low-quality downbin/output helper path and NrrdLayerRef metadata class that were erroneously pruned in v12.2.0
-  - v12.2.2 adds batched in-memory inference with synthetic final-batch padding for fixed-batch backends, larger RAM-aware NRRD streaming slabs, parallel low-quality NRRD scheduling, and a hybrid CPU/GPU radial/tilted backprojection queue
+  - v12.2.2 adds batched in-memory inference with synthetic final-batch padding for fixed-batch backends, larger RAM-aware NRRD streaming slabs, parallel low-quality NRRD scheduling, and the now-CPU-only radial/tilted backprojection queue
   - v12.2.4 aligns the script header with the filename, moves Radial before Tilted in scheduling order, plans interpolation from cached per-slice component tables and local SDF crops, consumes variable-cost seed plans through an unordered bounded completion queue, keeps transient NRRD projection/delta workspaces in RAM when possible, and raises the CPU mask postprocess pending cap to 4096
   - v12.2.5 improves CPU occupancy during interpolation labeling by compact-relabeling row blocks with per-slice local-to-compact lookup tables, prebuilding per-slice component tables through an unordered bounded queue, and testing endpoint continuation from component-table crops instead of full adjacent slices
   - v12.2.6 sizes per-parent full-frame interpolation seed planning for the expected live overlap, not the total number of active parent views, so compact relabel and endpoint scans can use most of the SLURM CPU allocation when interpolation is effectively serial or only two parents overlap
@@ -44,7 +45,7 @@ This v12.2.9_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.
 Dependencies (Python):
   pip install opencv-python numpy scipy scikit-image tifffile tqdm ultralytics
   # Optional CPU acceleration: numba for no-GIL interpolation seed-planning kernels.
-  # Optional GPU acceleration: cupy-cuda12x for cupyx.scipy.ndimage smoothing and CuPy backprojection paths.
+  # Optional GPU acceleration: cupy-cuda12x for cupyx.scipy.ndimage smoothing only; final Radial/Tilted backprojection is CPU-only in v12.2.11.
   # --save_nrrd uses the built-in streaming NRRD writer; pynrrd is no longer required for default exports.
 
 System:
@@ -75,7 +76,7 @@ from dataclasses import dataclass, field
 
 GIB = 1024 ** 3
 NRRD_SPACE = "left-posterior-superior"
-NRRD_AXIS_ORDER_NOTE = "internal mask (t,Y,X) is exported as Slicer spatial axes (X,Y,t)"
+NRRD_AXIS_ORDER_NOTE = "internal mask (t,Y,X) is exported as Slicer spatial axes (X,Y,t); decomposed Segment list axis is trailing (X,Y,t,layer)"
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
@@ -471,6 +472,7 @@ def allocate_workspace_array(
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
     reuse_existing: bool = False,
+    initialize_zero: bool = True,
 ) -> np.ndarray:
     dtype_obj = np.dtype(dtype)
     need_bytes = array_nbytes(shape, dtype_obj)
@@ -480,7 +482,12 @@ def allocate_workspace_array(
     if use_in_memory:
         try:
             print(f"{desc}: in-memory ({budget})")
-            return np.zeros(tuple(int(x) for x in shape), dtype=dtype_obj)
+            shape_tuple = tuple(int(x) for x in shape)
+            return (
+                np.zeros(shape_tuple, dtype=dtype_obj)
+                if bool(initialize_zero)
+                else np.empty(shape_tuple, dtype=dtype_obj)
+            )
         except MemoryError:
             print(f"{desc}: in-memory allocation failed, falling back to disk ({budget})")
 
@@ -515,6 +522,7 @@ def copy_workspace_array(
         desc=desc,
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
+        initialize_zero=False,
     )
 
     if src.ndim <= 1:
@@ -1213,6 +1221,18 @@ def _require_bin(name: str) -> None:
         raise RuntimeError(f"Required executable not found on PATH: {name}")
 
 
+def ffmpeg_decode_threads() -> int:
+    """Return the decoder thread count for input-volume materialization.
+
+    The earlier decode path left FFmpeg to choose its own threading.  On large
+    FFV1/Matroska inputs this can silently become a single-decoder bottleneck
+    before the first prediction volume is even scheduled.  Default to the full
+    visible CPU allocation; set ``YOLO_TTA_FFMPEG_DECODE_THREADS`` to pin a
+    smaller value for codecs or filesystems that prefer less parallel decode.
+    """
+    return max(1, _env_int('YOLO_TTA_FFMPEG_DECODE_THREADS', max(1, _cpu_count())))
+
+
 def ffprobe_info(video_path: Path) -> Dict[str, object]:
     """Return dict with width, height, fps, num_frames."""
     _require_bin("ffprobe")
@@ -1298,6 +1318,7 @@ def decode_video_to_memmap_gray8(
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
         reuse_existing=bool(reuse_existing),
+        initialize_zero=False,
     )
     if reuse_existing and isinstance(arr, np.memmap):
         return arr
@@ -1313,12 +1334,14 @@ def decode_video_to_memmap_gray8(
     cmd = [
         "ffmpeg",
         "-v", "error",
+        "-threads", str(ffmpeg_decode_threads()),
         "-i", str(input_video),
         "-f", "rawvideo",
         "-pix_fmt", "gray",
         "-vsync", "0",
         "-",
     ]
+    print(f'FFmpeg gray8 decode threads: {ffmpeg_decode_threads()}')
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert proc.stdout is not None
 
@@ -1457,6 +1480,7 @@ def resize_volume_t_axis_only_gray8_slab(
         desc='v12.2.0 cubic processing volume (parallel T-axis slab resize)',
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
+        initialize_zero=False,
     )
 
     worker_count = choose_slice_parallel_workers(int(workers), int(in_h))
@@ -1544,6 +1568,7 @@ def resize_volume_to_processing_cube_gray8(
         desc='v12.2.0 cubic processing volume',
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
+        initialize_zero=False,
     )
 
     worker_count = choose_slice_parallel_workers(int(workers), int(out_t))
@@ -1602,6 +1627,7 @@ def restore_mask_volume_to_original_shape(
         desc='Restored final mask in original input geometry',
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
+        initialize_zero=False,
     )
     worker_count = choose_slice_parallel_workers(int(workers), int(out_t))
     chunk_size = choose_parallel_chunk_size(out_t, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
@@ -3137,6 +3163,7 @@ def _materialize_prediction_volume_from_renderer(
         desc=desc,
         prefer_memory=True,
         reserve_bytes=32 * GIB,
+        initialize_zero=False,
     )
     worker_count = choose_slice_parallel_workers(int(workers), int(num_slices))
     chunk_size = choose_parallel_chunk_size(int(num_slices), worker_count, target_chunks_per_worker=2, min_chunk_size=1)
@@ -3280,6 +3307,7 @@ def build_view_frame_cache(
         desc=desc,
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
+        initialize_zero=False,
     )
 
     worker_count = choose_slice_parallel_workers(int(workers), int(view.num_slices))
@@ -3384,6 +3412,11 @@ def load_ultralytics_model(path: str, task: str = 'segment'):
             f"Import error: {e}"
         ) from e
     return YOLO(path, task=task)
+
+
+def background_model_load_enabled() -> bool:
+    """Return True when YOLO model loading should overlap CPU volume setup."""
+    return _env_flag('YOLO_TTA_BACKGROUND_MODEL_LOAD', True)
 
 
 def canonical_single_device(device: str) -> str:
@@ -6165,18 +6198,14 @@ def backproject_tilted_volume_to_volume(
 
 
 def _try_import_cupy_for_backprojection() -> Optional[object]:
-    if not _env_flag('YOLO_TTA_BACKPROJECT_GPU', True):
-        return None
-    try:
-        import cupy as cp  # type: ignore
-    except Exception:
-        return None
-    try:
-        if not bool(cp.cuda.runtime.getDeviceCount() > 0):
-            return None
-    except Exception:
-        return None
-    return cp
+    """Backprojection is intentionally CPU-only in v12.2.11.
+
+    CuPy remains available to the optional Gaussian smoothing backend, but Radial
+    and Tilted final backprojection no longer import or schedule CUDA work.  This
+    keeps the GPU dedicated to inference and removes the utilization spikes/dips
+    previously observed around final view projection and NRRD preparation.
+    """
+    return None
 
 
 def _cupy_free_bytes(cp: object) -> int:
@@ -6343,11 +6372,17 @@ class ViewBackprojectionQueueJob:
 
 
 class HybridBackprojectionQueue:
-    """At most one GPU and one CPU radial/tilted backprojection at a time."""
+    """CPU-only radial/tilted backprojection queue.
+
+    The historical class name is retained to avoid churn in scheduler call
+    sites, but v12.2.11 disables the GPU slot entirely.  Each queued set should
+    therefore receive the full resolved CPU slice-worker budget.
+    """
 
     def __init__(self, *, cpu_workers: int = 1, gpu_enabled: bool = True) -> None:
         self.cpu_workers = max(1, int(cpu_workers))
-        self.gpu_enabled = bool(gpu_enabled and _try_import_cupy_for_backprojection() is not None)
+        del gpu_enabled
+        self.gpu_enabled = False
 
     def _run_job(self, job: ViewBackprojectionQueueJob, backend: str) -> Tuple[str, str, np.ndarray]:
         view_local = job.view
@@ -8982,15 +9017,19 @@ class RawBBoxMaskStore:
     def close(self) -> None:
         self._chunks_bytes = None
 
-    def decode_slice(self, idx: int, *, dtype: np.dtype | str | type = np.uint8) -> np.ndarray:
+    def fill_decoded_slice_into(self, idx: int, out: np.ndarray) -> None:
+        """Decode one raw-bbox slice directly into an existing ``(Y,X)`` array."""
         idx_i = int(idx)
         z_dim, h, w = self.shape
         if idx_i < 0 or idx_i >= int(z_dim):
             raise IndexError(idx_i)
-        out = np.zeros((int(h), int(w)), dtype=np.dtype(dtype))
+        out_arr = np.asarray(out)
+        if tuple(int(x) for x in out_arr.shape) != (int(h), int(w)):
+            raise ValueError(f'{self.root}: output slice shape {tuple(out_arr.shape)} != {(int(h), int(w))}')
+        out_arr.fill(np.uint8(0))
         rec = self.index[idx_i]
         if int(rec['kind']) == 0:
-            return out
+            return
         if int(rec['kind']) != 1:
             raise ValueError(f'{self.root}: invalid raw-mask chunk marker {int(rec["kind"])} at slice {idx_i}')
 
@@ -9018,7 +9057,15 @@ class RawBBoxMaskStore:
         if int(payload_nbytes) != expected:
             raise ValueError(f'{self.root}: raw payload byte count mismatch at slice {idx_i}: {payload_nbytes} != {expected}')
         crop = np.frombuffer(payload, dtype=np.uint8, count=expected).reshape((crop_h, crop_w))
-        out[y0:y1, x0:x1] = crop.astype(out.dtype, copy=False)
+        out_arr[y0:y1, x0:x1] = crop.astype(out_arr.dtype, copy=False)
+
+    def decode_slice(self, idx: int, *, dtype: np.dtype | str | type = np.uint8) -> np.ndarray:
+        idx_i = int(idx)
+        z_dim, h, w = self.shape
+        if idx_i < 0 or idx_i >= int(z_dim):
+            raise IndexError(idx_i)
+        out = np.zeros((int(h), int(w)), dtype=np.dtype(dtype))
+        self.fill_decoded_slice_into(idx_i, out)
         return out
 
     # DEAD_CODE_MARKER(v12.2.0-post-refactor): unused convenience iterator retained for raw-store debugging.
@@ -9298,6 +9345,26 @@ def raw_bbox_nrrd_layers_enabled() -> bool:
     if raw_env is not None:
         return _env_flag('YOLO_TTA_RAW_BBOX_NRRD_LAYERS', True)
     return _env_flag('YOLO_TTA_COMPRESS_NRRD_LAYERS', True)  # backward-compatible alias; payloads are raw bbox stores, not compressed
+
+
+def tile_intermediate_accumulators_prefer_memory() -> bool:
+    """Keep tile staging/consolidation canvases in anonymous RAM by default."""
+    return _env_flag('YOLO_TTA_TILE_ACCUMULATORS_IN_RAM', True)
+
+
+def tile_intermediate_accumulator_reserve_bytes() -> int:
+    return int(max(0.0, _env_float('YOLO_TTA_TILE_ACCUMULATOR_RESERVE_GIB', 64.0)) * GIB)
+
+
+def waiting_tile_spill_enabled() -> bool:
+    """Return True to recover legacy waiting-tile ctile spill behavior.
+
+    v12.2.11 keeps postprocessed tiles in RAM while they wait for parent support
+    unless this opt-in escape hatch is enabled.  That avoids the disk write/read
+    cycle for the common SLURM case where the allocation has hundreds of GiB of
+    anonymous memory available.
+    """
+    return _env_flag('YOLO_TTA_SPILL_WAITING_TILES', False)
 
 
 def nrrd_cache_raw_bbox_layers_in_ram_enabled() -> bool:
@@ -11443,7 +11510,7 @@ def nrrd_pigz_compresslevel() -> int:
 
 
 def nrrd_pigz_threads() -> int:
-    default_threads = max(1, min(_cpu_count(), _env_int('YOLO_TTA_NRRD_PIGZ_MAX_THREADS', 64)))
+    default_threads = max(1, min(_cpu_count(), _env_int('YOLO_TTA_NRRD_PIGZ_MAX_THREADS', max(1, _cpu_count()))))
     return max(1, _env_int('YOLO_TTA_NRRD_PIGZ_THREADS', int(default_threads)))
 
 
@@ -11474,7 +11541,7 @@ def nrrd_stream_buffer_bytes(required_bytes: Optional[int] = None) -> int:
 
 
 def nrrd_payload_fill_workers(layer_count: int, z_chunk: int = 1) -> int:
-    default_workers = max(1, min(_cpu_count(), int(layer_count) * max(1, int(z_chunk)), 32))
+    default_workers = max(1, min(_cpu_count(), int(layer_count) * max(1, int(z_chunk))))
     return max(1, _env_int('YOLO_TTA_NRRD_PAYLOAD_FILL_WORKERS', int(default_workers)))
 
 
@@ -11656,7 +11723,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.5-Pro_v12.2.9_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.5-Pro_v12.2.11_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -11672,7 +11739,11 @@ def _write_nrrd_ascii_header(
         if key in emitted or key in {'type', 'dimension', 'sizes'}:
             continue
         sep = _nrrd_field_separator(str(key))
-        lines.append(f'{str(key)}{sep} {_nrrd_header_value_text(str(key), value)}')
+        value_text = _nrrd_header_value_text(str(key), value)
+        if sep == ':=':
+            lines.append(f'{str(key)}{sep}{value_text}')
+        else:
+            lines.append(f'{str(key)}{sep} {value_text}')
 
     text = '\n'.join(lines) + '\n\n'
     fh.write(text.encode('ascii', errors='ignore'))
@@ -11726,7 +11797,7 @@ def write_nrrd(mask_u8: np.ndarray, out_path: Path) -> Path:
             header=header,
             sizes=(w_dim, h_dim, t_dim),
             dimension=3,
-            data_type='uint8',
+            data_type='unsigned char',
             encoding='gzip',
         )
         with _open_pigz_payload_writer(fh) as payload_writer:
@@ -11862,7 +11933,7 @@ def nrrd_decomposed_header(
             'layer metadata stored in SegmentN_* fields and sidecar manifest JSON'
         ),
         'encoding': 'gzip',
-        'Segmentation_ContainedRepresentationNames': 'Binary labelmap',
+        'Segmentation_ContainedRepresentationNames': 'Binary labelmap|',
         'Segmentation_SourceRepresentation': 'Binary labelmap',
         # Kept for compatibility with older Slicer segmentation metadata readers.
         'Segmentation_MasterRepresentation': 'Binary labelmap',
@@ -12210,6 +12281,10 @@ def _write_decomposed_nrrd_payload_stream(
                     (int(in_t), int(in_h), int(in_w)) == (int(out_t), int(out_h), int(out_w))
                     and not isinstance(src, RawBBoxMaskStore)
                 )
+                raw_store_native_stream = (
+                    isinstance(src, RawBBoxMaskStore)
+                    and (int(in_t), int(in_h), int(in_w)) == (int(out_t), int(out_h), int(out_w))
+                )
 
                 if bool(direct_native_stream):
                     # The memmap is already a native (t,Y,X) C-order layer.  Write chunks of
@@ -12224,6 +12299,35 @@ def _write_decomposed_nrrd_payload_stream(
                         pbar.update(int(z1 - z0))
                         if madvise_interval > 0 and (int(z1) % int(madvise_interval) == 0):
                             _madvise_array_mmap(src, 'MADV_DONTNEED')
+                    continue
+
+                if bool(raw_store_native_stream):
+                    # Target_Dummy layout keeps the list axis last, so one complete layer is a
+                    # native (t,Y,X) byte block.  For cvol/ctile sources, fill the reusable block
+                    # directly from each slice bbox payload instead of allocating one full decoded
+                    # zeros slice per frame and copying it again into the NRRD write buffer.
+                    try:
+                        layer_chunk = np.empty((int(z_chunk), int(out_h), int(out_w)), dtype=np.uint8, order='C')
+                    except MemoryError:
+                        if int(z_chunk) != 1:
+                            print(
+                                f'Warning: requested raw-bbox NRRD chunk allocation failed for layer {int(layer_idx)}; '
+                                'falling back to one output t-slice at a time.'
+                            )
+                        z_chunk = 1
+                        layer_chunk = np.empty((1, int(out_h), int(out_w)), dtype=np.uint8, order='C')
+
+                    for z0 in range(0, out_t, int(z_chunk)):
+                        z1 = min(out_t, int(z0) + int(z_chunk))
+                        z_count = int(z1 - z0)
+                        block = layer_chunk[:z_count, :, :]
+                        for zi, z in enumerate(range(int(z0), int(z1))):
+                            src.fill_decoded_slice_into(int(z), block[int(zi)])
+                        if block.flags['C_CONTIGUOUS']:
+                            payload_writer.write(memoryview(block).cast('B'))
+                        else:
+                            payload_writer.write(np.ascontiguousarray(block).tobytes(order='C'))
+                        pbar.update(int(z_count))
                     continue
 
                 try:
@@ -12454,7 +12558,7 @@ def write_decomposed_nrrd(
             header=header,
             sizes=(int(output_shape[2]), int(output_shape[1]), int(output_shape[0]), len(effective_refs)),
             dimension=4,
-            data_type='uint8',
+            data_type='unsigned char',
             encoding='gzip',
         )
         with _open_pigz_payload_writer(fh) as payload_writer:
@@ -13546,6 +13650,14 @@ def main() -> None:
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
     model_paths = [model_path_resolved]
+    model_name = Path(model_paths[0]).stem
+
+    model_load_executor: Optional[ThreadPoolExecutor] = None
+    model_load_future: Optional[Future] = None
+    if background_model_load_enabled():
+        print(f'Loading model in background while input volume is prepared: {model_name} ({model_paths[0]})')
+        model_load_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='model-load')
+        model_load_future = model_load_executor.submit(load_ultralytics_model, model_paths[0], 'segment')
 
     angles = _parse_angles(args.angle) or [0.0, 120.0, 240.0]
     single_angle_streaming_cleanup_active = bool(
@@ -13706,6 +13818,10 @@ def main() -> None:
     inference_views = [v for v in views if not (transverse_inference_disabled and v.name == 'transverse')]
     interpolating_views = [v for v in inference_views if _view_uses_interpolation(v, int(args.interpolate))]
     spec_notes: List[str] = []
+    if background_model_load_enabled():
+        spec_notes.append(
+            'v12.2.11 startup overlap is active: the YOLO model load is submitted before ffprobe/decode/cubic preparation and joined only when the scheduler needs the model for prediction. Set YOLO_TTA_BACKGROUND_MODEL_LOAD=0 to restore synchronous model loading.'
+        )
     if bool(single_angle_streaming_cleanup_active):
         spec_notes.append(
             'v12.2.8 single-angle streaming cleanup is active: exactly one --angle value was supplied, so YOLO result slices are confidence-filtered, 2D-hole-filled, and view-native min_radius-filtered as they stream in; only Sagittal/Coronal transverse-plane min_radius cleanup waits for the completed view volume before interpolation.'
@@ -13760,7 +13876,7 @@ def main() -> None:
         )
     if any((v.family == 'radial' or is_tilted_view(v)) for v in views):
         spec_notes.append(
-            'Final Radial and Tilted backprojection uses a hybrid queue with at most two active sets: GPU is assigned first when CuPy/CUDA is available, and CPU receives work only while the GPU slot is busy or unavailable. Set YOLO_TTA_BACKPROJECT_GPU=0 to force CPU-only backprojection.'
+            'v12.2.11 final Radial and Tilted backprojection is CPU-only. The old CuPy/GPU backprojection slot is disabled so the GPU remains dedicated to YOLO inference; each backprojection set receives the full resolved CPU slice-worker budget.'
         )
     spec_notes.append(
         'NRRD export is decomposed by default in v12.2.0: layers are written on a trailing list axis as '
@@ -13823,9 +13939,15 @@ def main() -> None:
         spec_notes.append(note)
         print(note)
 
-    model_name = Path(model_paths[0]).stem
-    print(f'Loading model: {model_name} ({model_paths[0]})')
-    yolo_model = load_ultralytics_model(model_paths[0], task='segment')
+    if model_load_future is not None:
+        print(f'Waiting for background model load to finish: {model_name} ({model_paths[0]})')
+        yolo_model = model_load_future.result()
+        if model_load_executor is not None:
+            model_load_executor.shutdown(wait=True)
+            model_load_executor = None
+    else:
+        print(f'Loading model: {model_name} ({model_paths[0]})')
+        yolo_model = load_ultralytics_model(model_paths[0], task='segment')
     # v12.2.0 has no multiple-model inference. A single-item list is retained only to minimize churn in
     # scheduling structures keyed by model stem.
     yolo_models: List[Tuple[str, object]] = [(model_name, yolo_model)]
@@ -13859,9 +13981,16 @@ def main() -> None:
         'YOLO_TTA_OUTPUT_WORKERS',
         worker_budget,
     )
-    output_frame_workers = max(1, _env_int('YOLO_TTA_OUTPUT_FRAME_WORKERS', max(1, min(8, output_workers))))
+    output_frame_workers = max(1, _env_int('YOLO_TTA_OUTPUT_FRAME_WORKERS', max(1, min(_cpu_count(), output_workers))))
     slice_postprocess_workers = max(1, int(augmentation_workers))
-    predict_postprocess_workers = max(1, min(32, _env_int('YOLO_TTA_PREDICT_POSTPROCESS_WORKERS', slice_postprocess_workers)))
+    predict_postprocess_cap = max(1, _env_int('YOLO_TTA_PREDICT_POSTPROCESS_MAX_WORKERS', max(1, _cpu_count())))
+    predict_postprocess_workers = max(
+        1,
+        min(
+            int(predict_postprocess_cap),
+            _env_int('YOLO_TTA_PREDICT_POSTPROCESS_WORKERS', slice_postprocess_workers),
+        ),
+    )
 
     parent_postprocess_workers = max(1, min(int(interpolation_workers), max(1, len(yolo_models) * max(1, len(inference_views)))))
     (
@@ -13930,6 +14059,7 @@ def main() -> None:
     spec_notes.append(
         'YOLO result accumulation is bounded per in-memory prediction source by the number of pending CPU postprocess futures. ' 
         'worker_count=max(1, min(YOLO_TTA_PREDICT_POSTPROCESS_WORKERS, num_frames)) for the live v12 in-memory source path; ' 
+        'v12.2.11 removes the former hard 32-worker ceiling; YOLO_TTA_PREDICT_POSTPROCESS_MAX_WORKERS now defaults to the visible CPU allocation. '
         'pending_limit=cpu_mask_postprocess_pending_limit(worker_count, num_frames) = max(worker_count, min(num_frames, max(YOLO_TTA_CPU_MASK_PENDING_FRAMES, worker_count*2))). ' 
         'The default YOLO_TTA_CPU_MASK_PENDING_FRAMES is 4096; setting it to 0 permits buffering all frames for that prediction source. ' 
         f'For this run, the largest active prediction source has {int(max_predict_video_frames)} frame(s), ' 
@@ -13941,10 +14071,11 @@ def main() -> None:
     spec_notes.append(
         'Tiled masks are staged into one consolidated parent-view canvas per --tile_size/--tile_stride configuration before gating; '
         'the canvas gate is slice-local and connected-component based, so seam-split tile objects are reassembled before support testing. '
-        'A tile mask shape guard validates/resizes every postprocessed tile to its parent view-native shape before any waiting-tile raw-store spill.'
+        'A tile mask shape guard validates/resizes every postprocessed tile to its parent view-native shape. '
+        f'v12.2.11 keeps waiting tiles and tile-set/category accumulators in RAM by default (YOLO_TTA_SPILL_WAITING_TILES={int(waiting_tile_spill_enabled())}, YOLO_TTA_TILE_ACCUMULATORS_IN_RAM={int(tile_intermediate_accumulators_prefer_memory())}); disk ctile spill is now opt-in.'
     )
     spec_notes.append(
-        'Postprocessed tiles waiting for parent support use ctile-mask-v2-raw, and decomposed NRRD/support layers use cvol-mask-v2-raw where enabled: empty slices are elided, '
+        'Postprocessed tiles waiting for parent support stay in RAM by default and use ctile-mask-v2-raw only when YOLO_TTA_SPILL_WAITING_TILES=1; decomposed NRRD/support layers use cvol-mask-v2-raw where enabled: empty slices are elided, '
         'nonempty slices are cropped to their nonzero bbox and written as raw uint8 payload bytes; bitpacking and LZ4 are not used. '
         'Storage review: dense gray8 source/processing volumes stay raw; uint8 confidence maps are allocated only when --min_conf > 0 and stay raw because they are not sparse binary masks; FFV1/MKV/TIFF outputs remain codec-compressed; labels/summary JSON are negligible; retained sparse binary scratch/tile accumulators can be archived as raw bbox cvol when YOLO_TTA_KEEP_TEMP and YOLO_TTA_ARCHIVE_TEMP_BINARY_VOLUMES are enabled.'
     )
@@ -14095,30 +14226,10 @@ def main() -> None:
 
     for view in inference_views:
         for model_name, _ in yolo_models:
-            union_path = temp_dir / 'union' / model_name / f'{view.name}.union.u8.dat'
-            confmap_path = temp_dir / 'union' / model_name / f'{view.name}.confmap.u8.dat'
-            union_path.parent.mkdir(parents=True, exist_ok=True)
-
-            baseline_union_by_model_view[(model_name, view.name)] = allocate_workspace_array(
-                shape=(view.num_slices, view.src_h, view.src_w),
-                dtype=np.uint8,
-                path=union_path,
-                desc=f'{model_name}/{view.name} baseline union workspace',
-                prefer_memory=True,
-            )
-            if float(args.min_conf) > 0.0:
-                baseline_confmap_by_model_view[(model_name, view.name)] = allocate_workspace_array(
-                    shape=(view.num_slices, view.src_h, view.src_w),
-                    dtype=np.uint8,
-                    path=confmap_path,
-                    desc=f'{model_name}/{view.name} baseline confidence workspace',
-                    prefer_memory=True,
-                )
-                baseline_confmap_paths[(model_name, view.name)] = confmap_path
-            else:
-                baseline_confmap_by_model_view[(model_name, view.name)] = None
-                baseline_confmap_paths[(model_name, view.name)] = None
-            baseline_union_paths[(model_name, view.name)] = union_path
+            # v12.2.11 lazy allocation: do not zero every full-view accumulator before the
+            # first prediction.  On 20+ view runs those eager zeros can touch hundreds of GiB
+            # and dominate time-to-first-prediction.  Allocate a view's union/confidence
+            # workspaces only when its first full-frame prediction is about to run.
             fullframe_remaining[(model_name, view.name)] = int(len(aug_jobs_by_view[view.name]))
 
     total_fullframe_jobs = sum(len(aug_jobs_by_view.get(view.name, [])) for view in inference_views)
@@ -14153,7 +14264,7 @@ def main() -> None:
     per_prediction_volume_workers = max(1, int(max(1, augmentation_workers) // max(1, prediction_volume_builder_workers)))
     async_prediction_accumulation_active = bool(len(angles) == 1 and async_predict_postprocess_enabled())
     async_prediction_join_worker_count = async_predict_join_workers(max(2, int(prediction_volume_queue_slots) + 1))
-    default_async_result_workers = max(1, min(int(predict_postprocess_workers), max(1, _cpu_count() // 4), 16))
+    default_async_result_workers = max(1, min(int(predict_postprocess_workers), max(1, _cpu_count())))
     async_prediction_result_worker_count = max(
         1,
         min(
@@ -14191,7 +14302,8 @@ def main() -> None:
         '(slice,--imgsz,--imgsz) uint8 arrays, yielded as H×W×1 frames through InMemoryYoloVolumeSource, '
         'and preprocessed into BCHW tensors with C=1; the normal pipeline no longer writes augmented '
         'prediction videos, canvas videos, or tile videos to temp. '
-        f'The build queue is bounded to {int(prediction_volume_queue_slots)} queued prediction volume(s) beyond the current inference; the v12.2.0 default is four queued volumes, for a normal total bound of five including the current inference volume.'
+        f'The build queue is bounded to {int(prediction_volume_queue_slots)} queued prediction volume(s) beyond the current inference; the v12.2.0 default is four queued volumes, for a normal total bound of five including the current inference volume. '
+        'v12.2.11 lazily allocates each full-view union/confidence workspace only when that view first reaches inference, avoiding an eager all-views zero-fill before the first prediction.'
     )
     if dense_tiling_active:
         spec_notes.append(
@@ -14222,7 +14334,7 @@ def main() -> None:
     view_processing_futures: Dict[Future, Tuple[str, str]] = {}
     view_processing_submitted: set[Tuple[str, str]] = set()
     tile_cleanup_futures: Dict[Future, Tuple[str, str, str, str]] = {}
-    postprocessed_tiles_waiting_by_parent: Dict[Tuple[str, str], Dict[str, DeferredTilePostprocessResult]] = {}
+    postprocessed_tiles_waiting_by_parent: Dict[Tuple[str, str], Dict[str, object]] = {}
     tile_finalize_futures: Dict[Future, Tuple[str, str, str, str]] = {}
     tile_config_gate_futures: Dict[Future, Tuple[str, str, str]] = {}
     tile_consolidation_futures: Dict[Future, Tuple[str, str]] = {}
@@ -14296,6 +14408,35 @@ def main() -> None:
                     ready_tile_infer.append((str(model_name), view, job_obj, pred_ref))
         _pump_prediction_volume_build_queue()
 
+    def _ensure_baseline_workspaces(model_name: str, view: ViewInfo) -> None:
+        key = (str(model_name), str(view.name))
+        if key in baseline_union_by_model_view:
+            return
+        union_path = temp_dir / 'union' / str(model_name) / f'{view.name}.union.u8.dat'
+        confmap_path = temp_dir / 'union' / str(model_name) / f'{view.name}.confmap.u8.dat'
+        union_path.parent.mkdir(parents=True, exist_ok=True)
+
+        baseline_union_by_model_view[key] = allocate_workspace_array(
+            shape=(int(view.num_slices), int(view.src_h), int(view.src_w)),
+            dtype=np.uint8,
+            path=union_path,
+            desc=f'{model_name}/{view.name} baseline union workspace',
+            prefer_memory=True,
+        )
+        baseline_union_paths[key] = union_path
+        if float(args.min_conf) > 0.0:
+            baseline_confmap_by_model_view[key] = allocate_workspace_array(
+                shape=(int(view.num_slices), int(view.src_h), int(view.src_w)),
+                dtype=np.uint8,
+                path=confmap_path,
+                desc=f'{model_name}/{view.name} baseline confidence workspace',
+                prefer_memory=True,
+            )
+            baseline_confmap_paths[key] = confmap_path
+        else:
+            baseline_confmap_by_model_view[key] = None
+            baseline_confmap_paths[key] = None
+
     def _submit_view_prepare(model_name: str, view: ViewInfo) -> None:
         key = (str(model_name), str(view.name))
         if key in view_processing_submitted:
@@ -14343,7 +14484,8 @@ def main() -> None:
             dtype=np.uint8,
             path=acc_path,
             desc=f'{model_name}/{view_name} consolidated gated-tile accumulator',
-            prefer_memory=False,
+            prefer_memory=tile_intermediate_accumulators_prefer_memory(),
+            reserve_bytes=tile_intermediate_accumulator_reserve_bytes(),
         )
         tile_accumulator_by_parent[key] = acc
         tile_accumulator_paths[key] = acc_path
@@ -14361,7 +14503,8 @@ def main() -> None:
             dtype=np.uint8,
             path=acc_path,
             desc=f'{model_name}/{view_name}/{config_id} raw consolidated tile-set canvas',
-            prefer_memory=False,
+            prefer_memory=tile_intermediate_accumulators_prefer_memory(),
+            reserve_bytes=tile_intermediate_accumulator_reserve_bytes(),
         )
         tile_config_accumulator_by_key[key] = acc
         tile_config_accumulator_paths[key] = acc_path
@@ -14387,7 +14530,8 @@ def main() -> None:
             dtype=np.uint8,
             path=acc_path,
             desc=f'{model_name}/{view_name} consolidated gated-tile accumulator accepted by {category_norm}',
-            prefer_memory=False,
+            prefer_memory=tile_intermediate_accumulators_prefer_memory(),
+            reserve_bytes=tile_intermediate_accumulator_reserve_bytes(),
         )
         store[key] = acc
         return acc
@@ -14529,13 +14673,18 @@ def main() -> None:
         if result.view_name not in support_by_view:
             waiting = postprocessed_tiles_waiting_by_parent.setdefault(parent_key, {})
             parent_view = view_infos_by_name[str(result.view_name)]
-            waiting[str(result.tile_id)] = spill_waiting_tile_result_to_raw_store(
-                result,
-                temp_dir,
-                workers=int(tile_slice_postprocess_workers),
-                keep_original=bool(keep_temp_artifacts),
-                expected_parent_shape=(int(parent_view.num_slices), int(parent_view.src_h), int(parent_view.src_w)),
-            )
+            if waiting_tile_spill_enabled():
+                waiting[str(result.tile_id)] = spill_waiting_tile_result_to_raw_store(
+                    result,
+                    temp_dir,
+                    workers=int(tile_slice_postprocess_workers),
+                    keep_original=bool(keep_temp_artifacts),
+                    expected_parent_shape=(int(parent_view.num_slices), int(parent_view.src_h), int(parent_view.src_w)),
+                )
+            else:
+                # Keep the already-parent-sized postprocessed tile volume resident instead of
+                # round-tripping through a raw ctile store while waiting for parent support.
+                waiting[str(result.tile_id)] = result
             return
 
         waiting = postprocessed_tiles_waiting_by_parent.get(parent_key)
@@ -14565,7 +14714,13 @@ def main() -> None:
             model_name, view_name = parent_key
             if view_name not in native_view_support_by_model.get(model_name, {}):
                 continue
-            ready_results.extend(load_waiting_tile_result_from_raw_store(wait_result) for wait_result in waiting.values())
+            for wait_result in waiting.values():
+                if isinstance(wait_result, DeferredTilePostprocessResult):
+                    ready_results.append(load_waiting_tile_result_from_raw_store(wait_result))
+                elif isinstance(wait_result, TilePostprocessResult):
+                    ready_results.append(wait_result)
+                else:
+                    raise TypeError(f'Unsupported waiting tile result type: {type(wait_result)!r}')
             del postprocessed_tiles_waiting_by_parent[parent_key]
 
         for result in ready_results:
@@ -14782,6 +14937,7 @@ def main() -> None:
                 print(f"Inferencing full-frame in-memory volume: {view.name}/{job.aug_id}")
                 try:
                     for model_name, yolo in yolo_models:
+                        _ensure_baseline_workspaces(str(model_name), view)
                         if bool(async_prediction_accumulation_active):
                             handle = predict_in_memory_volume_and_submit_accumulation(
                                 model=yolo,
@@ -15055,9 +15211,9 @@ def main() -> None:
             ))
 
     if final_backprojection_jobs:
-        # Task #3 queue: at most two sets are active, one GPU and one CPU.  We still pass
-        # a per-set CPU slice-worker budget to whichever backend executes that set.
-        per_backproject_workers = max(1, int(slice_postprocess_workers) // 2)
+        # v12.2.11: backprojection is CPU-only, so do not halve the CPU budget for a
+        # nonexistent GPU slot.  Run one set at a time with the full slice-worker budget.
+        per_backproject_workers = max(1, int(slice_postprocess_workers))
         final_backprojection_jobs = [
             ViewBackprojectionQueueJob(
                 model_name=job.model_name,
@@ -15070,10 +15226,10 @@ def main() -> None:
             )
             for job in final_backprojection_jobs
         ]
-        gpu_enabled_for_backproject = bool(_env_flag('YOLO_TTA_BACKPROJECT_GPU', True))
+        gpu_enabled_for_backproject = False
         print(
             f'Final radial/tilted backprojection queue: tasks={len(final_backprojection_jobs)}, '
-            f'max_active=2 (one GPU if available, one CPU), per-set CPU workers={int(per_backproject_workers)}, '
+            f'max_active=1 CPU-only, per-set CPU workers={int(per_backproject_workers)}, '
             f'gpu_enabled={gpu_enabled_for_backproject}'
         )
         backproject_queue = HybridBackprojectionQueue(
