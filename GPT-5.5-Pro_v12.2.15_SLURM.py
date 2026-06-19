@@ -2,7 +2,9 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v12.2.14_SLURM implementation of the v12.2.0_SLURM specification plus v12.2.1-v12.2.14 performance patches:
+This v12.2.15_SLURM implementation of the v12.2.15_SLURM scheduling/native-volume rework plus the v12.2.1-v12.2.14 performance patches:
+  - v12.2.15 removes the eager approximate-cube resize from the default processing path: YOLO views now render directly from the decoded gray8 volume in native input geometry unless YOLO_TTA_PROCESSING_VOLUME_MODE=cube or YOLO_TTA_FORCE_PROCESSING_CUBE=1 is set. This avoids a lossy whole-volume interpolation pass and removes its CPU cost; the legacy cube path remains available for strict v12.2.0 comparison.
+  - v12.2.15 unbounds streaming prediction-source creation by default, decouples cheap source/ref creation from CPU rendering, removes the old fixed four-source warmup/staging default, and uses a shared full-budget render pool so one active view/source can consume the complete visible CPU allocation while other CPU stages continue to overlap.
   - v12.2.14 writes decomposed NRRD payloads as one independently compressed gzip member per layer inside the same attached .nrrd payload by default, adds a legacy single-stream fallback, schedules each low-quality downbin as its own background job with per-bin overlay/binary/NRRD writers running concurrently, increases default prediction-source queueing/prefetch/render-worker aggressiveness, permits unbounded CPU result backlog by default, and can eagerly stage queued prediction sources into CUDA input queues before they become the active YOLO source
   - v12.2.13 adds an optional CUDA input-staging queue that preloads a small number of already-normalized BCHW YOLO batches into GPU VRAM ahead of the predictor loop, separate from --batch, so model inference no longer waits on the hot-path RAM->GPU copy when the queue is filled
   - v12.2.12 changes full-frame/tile YOLO inputs to bounded streaming render sources, so inference starts after the first prefetch batch is rendered instead of after a complete (slice,imgsz,imgsz) prediction volume is materialized
@@ -1574,6 +1576,50 @@ def compute_cube_resize_shape(
 
 
 
+def processing_volume_mode() -> str:
+    """Return the v13 processing geometry mode.
+
+    v12.2.15 defaults to native decoded input geometry because every YOLO view renderer
+    already samples/resizes its own H×W prediction raster.  The old v12.2.0 approximate-cube
+    preprocessing volume remains available for strict regression/comparison by setting
+    ``YOLO_TTA_PROCESSING_VOLUME_MODE=cube`` or ``YOLO_TTA_FORCE_PROCESSING_CUBE=1``.
+    """
+    if _env_flag('YOLO_TTA_FORCE_PROCESSING_CUBE', False):
+        return 'cube'
+    raw = os.environ.get('YOLO_TTA_PROCESSING_VOLUME_MODE', '').strip().lower()
+    if not raw:
+        raw = os.environ.get('YOLO_TTA_PROCESSING_GEOMETRY', '').strip().lower()
+    aliases = {
+        '': 'native',
+        'native': 'native',
+        'decoded': 'native',
+        'input': 'native',
+        'none': 'native',
+        'no_resize': 'native',
+        'no-resize': 'native',
+        'cube': 'cube',
+        'cubic': 'cube',
+        'legacy': 'cube',
+        'legacy_cube': 'cube',
+        'v12': 'cube',
+        'v12.2.0': 'cube',
+        'v950': 'cube',
+    }
+    mode = aliases.get(raw)
+    if mode is None:
+        print(f"Warning: unsupported YOLO_TTA_PROCESSING_VOLUME_MODE={raw!r}; using native decoded geometry.")
+        return 'native'
+    return str(mode)
+
+
+def should_resize_to_processing_cube(input_shape: Tuple[int, int, int], cube_shape: Tuple[int, int, int]) -> bool:
+    mode = processing_volume_mode()
+    if mode != 'cube':
+        return False
+    return tuple(int(x) for x in input_shape) != tuple(int(x) for x in cube_shape)
+
+
+
 def _linear_source_index(out_idx: int, out_count: int, in_count: int) -> float:
     if int(out_count) <= 1 or int(in_count) <= 1:
         return 0.0
@@ -2955,6 +3001,7 @@ class StreamingYoloVolumeSource:
         render_workers: int = 1,
         prefetch_frames: Optional[int] = None,
         autostart: bool = True,
+        shared_executor: Optional[ThreadPoolExecutor] = None,
     ) -> None:
         self.renderer = renderer
         self.name = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(name)).strip('_') or 'streaming_volume'
@@ -2972,7 +3019,9 @@ class StreamingYoloVolumeSource:
         self.count = 0
         self._next_submit = 0
         self._futures: Dict[int, Future] = {}
-        self._executor: Optional[ThreadPoolExecutor] = None
+        self._external_executor = shared_executor
+        self._executor: Optional[ThreadPoolExecutor] = shared_executor
+        self._owns_executor = shared_executor is None
         self._lock = threading.Lock()
         self._closed = False
         try:
@@ -2996,25 +3045,44 @@ class StreamingYoloVolumeSource:
     def _frame_to_single_channel(frame: np.ndarray) -> np.ndarray:
         return InMemoryYoloVolumeSource._frame_to_single_channel(frame)
 
+    def _ensure_executor_locked(self) -> ThreadPoolExecutor:
+        if self._executor is not None:
+            return self._executor
+        if self._external_executor is not None:
+            self._executor = self._external_executor
+            self._owns_executor = False
+            return self._executor
+        self._executor = ThreadPoolExecutor(
+            max_workers=int(self.render_workers),
+            thread_name_prefix=f'yolo-render-{self.name[:24]}',
+        )
+        self._owns_executor = True
+        return self._executor
+
     def start(self) -> None:
         with self._lock:
             if self._closed:
                 raise RuntimeError(f'Streaming YOLO source {self.name} is already closed')
-            if self._executor is None:
-                self._executor = ThreadPoolExecutor(
-                    max_workers=int(self.render_workers),
-                    thread_name_prefix=f'yolo-render-{self.name[:24]}',
-                )
+            self._ensure_executor_locked()
             self._fill_prefetch_locked(target_index=0)
 
     def close(self) -> None:
         executor: Optional[ThreadPoolExecutor]
+        futures_to_cancel: List[Future]
+        owns_executor: bool
         with self._lock:
             self._closed = True
             executor = self._executor
+            owns_executor = bool(self._owns_executor)
+            futures_to_cancel = list(self._futures.values())
             self._executor = None
             self._futures.clear()
-        if executor is not None:
+        for fut in futures_to_cancel:
+            try:
+                fut.cancel()
+            except Exception:
+                pass
+        if executor is not None and owns_executor:
             try:
                 executor.shutdown(wait=False, cancel_futures=True)
             except TypeError:
@@ -3024,12 +3092,8 @@ class StreamingYoloVolumeSource:
         idx_i = int(idx)
         if idx_i in self._futures or idx_i >= int(self.nf):
             return
-        if self._executor is None:
-            self._executor = ThreadPoolExecutor(
-                max_workers=int(self.render_workers),
-                thread_name_prefix=f'yolo-render-{self.name[:24]}',
-            )
-        self._futures[idx_i] = self._executor.submit(self._render_one, idx_i)
+        executor = self._ensure_executor_locked()
+        self._futures[idx_i] = executor.submit(self._render_one, idx_i)
         self._next_submit = max(int(self._next_submit), idx_i + 1)
 
     def _fill_prefetch_locked(self, target_index: int) -> None:
@@ -3439,9 +3503,10 @@ def gpu_input_staging_ahead_sources(default_queue_slots: int) -> int:
     """Number of queued prediction sources allowed to pre-stage CUDA batches.
 
     This is intentionally separate from YOLO_TTA_GPU_INPUT_STAGING_BATCHES, which
-    is the number of batches inside each source.  The default stages a few future
-    sources so the next source often has CUDA-resident input ready before the
-    current model.predict() call returns.
+    is the number of batches inside each source.  v13 removes the old fixed four-source
+    default: queued-source CUDA staging now scales with the visible CPU allocation and
+    the resolved source queue, while per-source VRAM preflight still skips staging when
+    the device does not have enough free memory.
     """
     raw = os.environ.get('YOLO_TTA_GPU_INPUT_STAGING_AHEAD_SOURCES', '').strip()
     if not raw and os.environ.get('YOLO_TTA_GPU_PREFETCH_AHEAD_SOURCES') is not None:
@@ -3451,7 +3516,8 @@ def gpu_input_staging_ahead_sources(default_queue_slots: int) -> int:
             return max(0, int(raw))
         except Exception:
             return 0
-    return max(0, min(max(1, int(default_queue_slots)), _env_int('YOLO_TTA_GPU_INPUT_STAGING_AHEAD_DEFAULT', 4)))
+    default_ahead = max(1, _env_int('YOLO_TTA_GPU_INPUT_STAGING_AHEAD_DEFAULT', max(1, _cpu_count())))
+    return max(0, min(max(1, int(default_queue_slots)), int(default_ahead)))
 
 
 def _prediction_ref_has_gpu_input_staging(ref: PredictionVolumeRef) -> bool:
@@ -3501,9 +3567,37 @@ def streaming_prediction_sources_enabled() -> bool:
 
 
 def streaming_prediction_source_autostart_enabled() -> bool:
+    """Return True to let every constructed streaming source immediately pre-render.
+
+    v13 source creation is unbounded by default, so the default autostart policy is now
+    scheduler-controlled CPU warmup rather than every queued source starting its prefetch
+    window at construction time.  Set YOLO_TTA_STREAMING_SOURCE_AUTOSTART=1 to restore
+    eager autostart for every source.
+    """
     if os.environ.get('YOLO_TTA_STREAMING_SOURCE_AUTOSTART') is not None:
         return _env_flag('YOLO_TTA_STREAMING_SOURCE_AUTOSTART', True)
-    return _env_flag('YOLO_TTA_STREAM_RENDER_AUTOSTART', True)
+    if os.environ.get('YOLO_TTA_STREAM_RENDER_AUTOSTART') is not None:
+        return _env_flag('YOLO_TTA_STREAM_RENDER_AUTOSTART', True)
+    return False
+
+
+def queued_streaming_source_cpu_warmup_slots(default_queue_slots: int) -> int:
+    """Resolve how many ready queued streaming sources may pre-render on CPU.
+
+    This keeps v13 source creation unbounded without allowing every future tile/view to enqueue
+    a full prefetch window at once.  The active source can still use the full shared render pool;
+    a bounded number of upcoming sources are kept warm to overlap CPU rendering with inference.
+    """
+    raw = os.environ.get('YOLO_TTA_STREAMING_SOURCE_WARMUP_SOURCES', '').strip()
+    if not raw and os.environ.get('YOLO_TTA_STREAM_RENDER_WARMUP_SOURCES') is not None:
+        raw = os.environ.get('YOLO_TTA_STREAM_RENDER_WARMUP_SOURCES', '').strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except Exception:
+            return 0
+    default_slots = max(1, _env_int('YOLO_TTA_STREAMING_SOURCE_WARMUP_DEFAULT', max(2, min(8, _cpu_count()))))
+    return max(0, min(max(1, int(default_queue_slots)), int(default_slots)))
 
 
 def streaming_prediction_source_prefetch_frames(batch_size: int) -> int:
@@ -3518,22 +3612,43 @@ def streaming_prediction_source_prefetch_frames(batch_size: int) -> int:
 
 
 def streaming_prediction_source_workers(default_workers: int, num_frames: int) -> int:
-    min_default = max(1, min(16, int(math.ceil(float(max(1, _cpu_count())) / 4.0))))
-    min_workers = max(1, _env_int('YOLO_TTA_STREAMING_SOURCE_MIN_WORKERS', min_default))
-    default_resolved = max(1, int(default_workers), int(min_workers))
+    """Resolve the render-worker budget visible to one streaming source.
+
+    v13 gives an active source/view the full CPU allocation by default.  When sources
+    are attached to the shared streaming render pool, this value documents the per-source
+    budget and keeps legacy per-source executors full-budget if the shared pool is disabled.
+    """
+    full_cpu_default = max(1, _env_int('YOLO_TTA_STREAMING_SOURCE_DEFAULT_WORKERS', max(1, _cpu_count())))
+    min_workers = max(1, _env_int('YOLO_TTA_STREAMING_SOURCE_MIN_WORKERS', full_cpu_default))
+    default_resolved = max(1, int(default_workers), int(min_workers), int(full_cpu_default))
     requested = _env_int('YOLO_TTA_STREAMING_SOURCE_WORKERS', _env_int('YOLO_TTA_STREAM_RENDER_WORKERS', int(default_resolved)))
     return choose_slice_parallel_workers(max(1, int(requested)), max(1, int(num_frames)))
 
 
-def resolve_prediction_source_queue_slots(total_tasks: int) -> int:
-    """Resolve how many future YOLO sources may be built/prefetched.
+def shared_streaming_render_pool_enabled() -> bool:
+    """Return True when all streaming YOLO sources should share one CPU render pool."""
+    if os.environ.get('YOLO_TTA_SHARED_STREAMING_RENDER_POOL') is not None:
+        return _env_flag('YOLO_TTA_SHARED_STREAMING_RENDER_POOL', True)
+    return _env_flag('YOLO_TTA_SHARED_RENDER_POOL', True)
 
-    The previous default was four queued sources.  That was safe but too shallow
-    for high-memory SLURM nodes: one expensive view renderer could empty the ready
-    queue and leave the GPU waiting.  The new default queues up to the visible CPU
-    count worth of sources (bounded by the actual task count).  Explicitly set
-    YOLO_TTA_PREDICTION_VOLUME_QUEUE_SLOTS to a positive value to cap it, or to 0
-    to queue every remaining source.
+
+def resolve_prediction_render_workers(default_workers: int, max_frames: int) -> int:
+    requested = _env_int(
+        'YOLO_TTA_PREDICTION_RENDER_WORKERS',
+        _env_int('YOLO_TTA_STREAMING_RENDER_WORKERS', int(default_workers)),
+    )
+    return choose_slice_parallel_workers(max(1, int(requested)), max(1, int(max_frames)))
+
+
+def resolve_prediction_source_queue_slots(total_tasks: int, *, streaming_sources: bool = True) -> int:
+    """Resolve how many future YOLO sources may be created.
+
+    v13 makes streaming source creation unbounded by default because a streaming ref is
+    lightweight and the expensive CPU work is separately governed by the shared render
+    executor and per-source prefetch windows.  Legacy dense prediction-volume materialization
+    keeps the older CPU-count-scaled default to avoid materializing every source in RAM.
+    Explicitly set YOLO_TTA_PREDICTION_VOLUME_QUEUE_SLOTS to a positive value to cap it,
+    or to 0 to queue every remaining source in either mode.
     """
     total = max(1, int(total_tasks))
     raw = os.environ.get('YOLO_TTA_PREDICTION_VOLUME_QUEUE_SLOTS', '').strip()
@@ -3545,6 +3660,8 @@ def resolve_prediction_source_queue_slots(total_tasks: int) -> int:
         if int(requested) <= 0:
             return int(total)
         return max(1, min(int(total), int(requested)))
+    if bool(streaming_sources):
+        return int(total)
     default_slots = max(8, min(int(total), max(1, int(_cpu_count()))))
     return int(default_slots)
 
@@ -3560,6 +3677,7 @@ def make_streaming_yolo_source(
     render_workers: int = 1,
     prefetch_frames: Optional[int] = None,
     autostart: Optional[bool] = None,
+    shared_executor: Optional[ThreadPoolExecutor] = None,
 ) -> StreamingYoloVolumeSource:
     ensure_ultralytics_accepts_in_memory_volume_source()
     source = StreamingYoloVolumeSource(
@@ -3572,6 +3690,7 @@ def make_streaming_yolo_source(
         render_workers=max(1, int(render_workers)),
         prefetch_frames=prefetch_frames,
         autostart=streaming_prediction_source_autostart_enabled() if autostart is None else bool(autostart),
+        shared_executor=shared_executor,
     )
     return source
 
@@ -12746,7 +12865,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.5-Pro_v12.2.14_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.5-Pro_v12.2.15_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -15026,8 +15145,8 @@ def main() -> None:
     vol_path = temp_dir / 'input_volume.gray8.dat'
     if preprocess_streaming_active:
         print(
-            'v12.2.12 streaming preprocessing active: ffmpeg decode and cubic resize return their destination arrays immediately; '
-            'Transverse consumers wait only for the needed processing slice.'
+            'v12.2.15 streaming preprocessing active: ffmpeg decode returns its destination array immediately; '
+            'Transverse/native consumers wait only for the needed decoded slice. Legacy cube resize, if explicitly enabled, also streams.'
         )
         input_volume_rgb = decode_video_to_memmap_gray8_streaming(
             input_video=input_path,
@@ -15052,10 +15171,13 @@ def main() -> None:
         json.dumps({'shape': [input_T, input_H, input_W], 'dtype': 'uint8', 'channels': 1, 'fps': fps, 'streaming_preprocess': bool(preprocess_streaming_active)}, indent=2)
     )
 
-    processing_shape = compute_cube_resize_shape(input_T, input_H, input_W, tolerance=0.05)
-    if processing_shape != (input_T, input_H, input_W):
+    input_processing_shape = (int(input_T), int(input_H), int(input_W))
+    legacy_cube_shape = compute_cube_resize_shape(input_T, input_H, input_W, tolerance=0.05)
+    processing_mode = processing_volume_mode()
+    if should_resize_to_processing_cube(input_processing_shape, legacy_cube_shape):
+        processing_shape = legacy_cube_shape
         print(
-            'v12.2.0 cubic resize: '
+            'v12.2.15 processing geometry: legacy approximate-cube resize enabled. '
             f'input shape (t,Y,X)=({input_T},{input_H},{input_W}) -> '
             f'processing shape (t,Y,X)={processing_shape}'
         )
@@ -15076,8 +15198,16 @@ def main() -> None:
                 prefer_memory=True,
             )
     else:
-        print(f'v12.2.0 cubic resize: input shape already within 5% cube tolerance ({processing_shape})')
+        processing_shape = input_processing_shape
         volume_rgb = input_volume_rgb
+        if processing_mode == 'cube' and legacy_cube_shape == input_processing_shape:
+            print(f'v12.2.15 processing geometry: legacy cube mode requested, but input is already within 5% cube tolerance ({processing_shape}).')
+        else:
+            print(
+                'v12.2.15 processing geometry: native decoded volume, no approximate-cube resize. '
+                f'input/processing shape (t,Y,X)={processing_shape}; legacy cube target would have been {legacy_cube_shape}. '
+                'Set YOLO_TTA_PROCESSING_VOLUME_MODE=cube or YOLO_TTA_FORCE_PROCESSING_CUBE=1 to restore the v12.2.0 cube path.'
+            )
 
     T, H, W = (int(processing_shape[0]), int(processing_shape[1]), int(processing_shape[2]))
     resolved_azimuth_angle = resolve_radial_azimuth_angle(
@@ -15092,6 +15222,9 @@ def main() -> None:
         json.dumps({
             'input_shape_t_y_x': [input_T, input_H, input_W],
             'processing_shape_t_y_x': [T, H, W],
+            'processing_volume_mode': processing_mode,
+            'legacy_cube_shape_t_y_x': [int(legacy_cube_shape[0]), int(legacy_cube_shape[1]), int(legacy_cube_shape[2])],
+            'cube_resize_applied': bool(tuple(int(x) for x in processing_shape) != tuple(int(x) for x in input_processing_shape)),
             'dtype': 'uint8',
             'channels': 1,
             'fps': fps,
@@ -15124,15 +15257,15 @@ def main() -> None:
     spec_notes: List[str] = []
     if preprocess_streaming_active:
         spec_notes.append(
-            'v12.2.12 streaming preprocessing is active: decode/cube preprocessing can run concurrently with Transverse rendering and GPU inference; Transverse readers wait only for the slice they need, while stack-sampling view families wait for the completed preprocessing volume.'
+            'v12.2.15 streaming preprocessing is active: decoded native slices become available as ffmpeg produces them. Transverse readers wait only for the needed decoded slice; stack-sampling view families wait for the completed decoded volume. Legacy cube resize, when explicitly enabled, still streams its output slices.'
         )
     else:
         spec_notes.append(
-            'v12.2.12 streaming preprocessing is disabled by YOLO_TTA_STREAMING_PREPROCESS=0; decode and cubic resize finish before inference scheduling begins.'
+            'v12.2.15 streaming preprocessing is disabled by YOLO_TTA_STREAMING_PREPROCESS=0; decode finishes before inference scheduling begins, and legacy cube resize runs only when explicitly requested.'
         )
     if background_model_load_enabled():
         spec_notes.append(
-            'v12.2.11 startup overlap is active: the YOLO model load is submitted before ffprobe/decode/cubic preparation and joined only when the scheduler needs the model for prediction. Set YOLO_TTA_BACKGROUND_MODEL_LOAD=0 to restore synchronous model loading.'
+            'v12.2.11 startup overlap is active: the YOLO model load is submitted before ffprobe/decode/native-volume preparation and joined only when the scheduler needs the model for prediction. Set YOLO_TTA_BACKGROUND_MODEL_LOAD=0 to restore synchronous model loading.'
         )
     if bool(single_angle_streaming_cleanup_active):
         spec_notes.append(
@@ -15238,8 +15371,10 @@ def main() -> None:
         'overlay videos draw the skeleton as fully opaque red on top of the 50% blue mask overlay.'
     )
     spec_notes.append(
-        f'Cubic resize T-axis backend={_cube_t_axis_resize_backend()}; set YOLO_TTA_CUBE_T_RESIZE_BACKEND=slice_exact '
-        'to recover the previous endpoint-aligned per-slice interpolation path.'
+        f'Processing volume mode={processing_mode}; cube_resize_applied={bool(tuple(int(x) for x in processing_shape) != tuple(int(x) for x in input_processing_shape))}. '
+        'v12.2.15 defaults to native decoded geometry to avoid whole-volume interpolation loss and CPU cost. '
+        f'Legacy cube target would be {tuple(int(x) for x in legacy_cube_shape)}; set YOLO_TTA_PROCESSING_VOLUME_MODE=cube or YOLO_TTA_FORCE_PROCESSING_CUBE=1 to restore it. '
+        f'If legacy cube resize is enabled, T-axis backend={_cube_t_axis_resize_backend()} and YOLO_TTA_CUBE_T_RESIZE_BACKEND=slice_exact restores the previous endpoint-aligned per-slice interpolation path.'
     )
     if transverse_inference_disabled:
         note = (
@@ -15371,7 +15506,7 @@ def main() -> None:
     spec_notes.append(
         'YOLO result accumulation is bounded per in-memory prediction source by the number of pending CPU postprocess futures. ' 
         'worker_count=max(1, min(YOLO_TTA_PREDICT_POSTPROCESS_WORKERS, num_frames)) for the live v12 in-memory source path; ' 
-        'v12.2.14 keeps the former hard 32-worker ceiling removed and now defaults YOLO_TTA_PREDICT_POSTPROCESS_MAX_WORKERS to the oversubscribed worker budget so CPU result processing can queue/drain behind the GPU instead of throttling inference. '
+        'v12.2.15 keeps the v12.2.14 hard 32-worker ceiling removed and defaults YOLO_TTA_PREDICT_POSTPROCESS_MAX_WORKERS to the oversubscribed worker budget so CPU result processing can queue/drain behind the GPU instead of throttling inference. '
         'pending_limit=cpu_mask_postprocess_pending_limit(worker_count, num_frames) = max(worker_count, min(num_frames, max(YOLO_TTA_CPU_MASK_PENDING_FRAMES, worker_count*2))). ' 
         'The default YOLO_TTA_CPU_MASK_PENDING_FRAMES is 0, so the GPU-facing iterator can buffer all CPU result work for that prediction source; set it positive only to reintroduce a RAM cap. ' 
         f'For this run, the largest active prediction source has {int(max_predict_video_frames)} frame(s), ' 
@@ -15565,10 +15700,24 @@ def main() -> None:
         for aug_job in aug_jobs_by_view[view.name]
     )
     total_prediction_volume_build_tasks = int(total_fullframe_jobs + total_tile_prediction_jobs)
-    prediction_volume_queue_slots = resolve_prediction_source_queue_slots(total_prediction_volume_build_tasks)
+    streaming_sources_active = bool(streaming_prediction_sources_enabled())
+    max_prediction_source_frames = max(1, max((int(v.num_slices) for v in inference_views), default=1))
+    prediction_render_workers = resolve_prediction_render_workers(
+        max(1, int(worker_budget)),
+        max_prediction_source_frames,
+    )
+    prediction_volume_queue_slots = resolve_prediction_source_queue_slots(
+        total_prediction_volume_build_tasks,
+        streaming_sources=bool(streaming_sources_active),
+    )
     eager_gpu_input_staging_ahead_sources = (
         gpu_input_staging_ahead_sources(int(prediction_volume_queue_slots))
         if gpu_input_staging_enabled(pred_cfg)
+        else 0
+    )
+    queued_streaming_cpu_warmup_sources = (
+        queued_streaming_source_cpu_warmup_slots(int(prediction_volume_queue_slots))
+        if bool(streaming_sources_active)
         else 0
     )
     active_build_slot_default = max(
@@ -15592,10 +15741,16 @@ def main() -> None:
             int(requested_build_workers),
         ),
     )
-    per_prediction_volume_workers = max(1, int(max(1, augmentation_workers) // max(1, prediction_volume_builder_workers)))
+    legacy_per_prediction_volume_workers = max(1, int(max(1, augmentation_workers) // max(1, prediction_volume_builder_workers)))
+    # Streaming sources submit only a bounded prefetch window, so a single active source should
+    # see the full render pool instead of a divided-by-builder slice of the CPU allocation.
+    per_prediction_volume_workers = int(prediction_render_workers) if bool(streaming_sources_active) else int(legacy_per_prediction_volume_workers)
     async_prediction_accumulation_active = bool(async_predict_postprocess_enabled())
     async_prediction_multiview_locking_active = bool(len(angles) > 1 and async_prediction_accumulation_active)
-    async_prediction_join_worker_count = async_predict_join_workers(max(2, int(prediction_volume_queue_slots) + 1))
+    # Queue slots are unbounded by default in v13, so do not size the lightweight join
+    # executor from the total source count.  The join tasks mostly wait on result futures;
+    # a CPU-count-sized pool is enough to overlap drains without spawning thousands of threads.
+    async_prediction_join_worker_count = async_predict_join_workers(max(2, min(max(1, _cpu_count()), int(worker_budget))))
     default_async_result_workers = max(1, int(predict_postprocess_workers))
     async_prediction_result_worker_count = max(
         1,
@@ -15627,14 +15782,17 @@ def main() -> None:
     )
     print(
         f'Streaming prediction-source preparers: {prediction_volume_builder_workers} '
-        f'(per-source render workers: {per_prediction_volume_workers}, source tasks: {total_prediction_volume_build_tasks}, '
-        f'queued-source bound: {prediction_volume_queue_slots}, '
+        f'(per-source render workers: {per_prediction_volume_workers}, shared render workers: {prediction_render_workers}, '
+        f'source tasks: {total_prediction_volume_build_tasks}, queued-source bound: {prediction_volume_queue_slots}, '
+        f'CPU-warmed queued sources: {int(queued_streaming_cpu_warmup_sources)}, '
         f'eager CUDA-staged queued sources: {int(eager_gpu_input_staging_ahead_sources)})'
     )
     spec_notes.append(
-        'v12.2.14 prediction scheduler active: full-frame and tiled YOLO sources normally stream H×W×1 frames through StreamingYoloVolumeSource, then CUDA input staging can keep queues of already-normalized BCHW batches in VRAM so the predictor loop consumes GPU-resident input while CPU workers continue 2D resize/warp rendering behind it. '
-        f'The build queue is bounded to {int(prediction_volume_queue_slots)} queued prediction source(s) beyond the current inference; the v12.2.14 default is CPU-count-scaled, and YOLO_TTA_PREDICTION_VOLUME_QUEUE_SLOTS=0 queues every remaining source when RAM allows. '
-        f'Up to {int(eager_gpu_input_staging_ahead_sources)} queued source(s) are eagerly CUDA-staged before they become the active model.predict source (YOLO_TTA_GPU_INPUT_STAGING_AHEAD_SOURCES). '
+        'v12.2.15 prediction scheduler active: full-frame and tiled YOLO sources normally stream H×W×1 frames through StreamingYoloVolumeSource. Streaming prediction-source creation is unbounded by default, so cheap source refs for every remaining view/tile can be queued immediately; expensive CPU rendering is separately bounded by the shared render pool and each source prefetch window. '
+        f'The resolved queued-source bound is {int(prediction_volume_queue_slots)} source(s); set YOLO_TTA_PREDICTION_VOLUME_QUEUE_SLOTS to a positive value to cap it or 0 to force all remaining sources in legacy dense mode too. '
+        f'Each active streaming source can submit enough work to use the full shared render pool ({int(prediction_render_workers)} worker thread(s)); legacy dense materialization still uses {int(legacy_per_prediction_volume_workers)} worker(s) per builder. '
+        f'Up to {int(queued_streaming_cpu_warmup_sources)} ready queued source(s) are CPU-warmed at a time (YOLO_TTA_STREAMING_SOURCE_WARMUP_SOURCES), so source creation can be unbounded without every future source enqueueing a prefetch window. '
+        f'Up to {int(eager_gpu_input_staging_ahead_sources)} queued source(s) are eagerly CUDA-staged before they become the active model.predict source (YOLO_TTA_GPU_INPUT_STAGING_AHEAD_SOURCES), with no fixed four-source default. '
         'v12.2.11 lazily allocates each full-view union/confidence workspace only when that view first reaches inference, avoiding an eager all-views zero-fill before the first prediction.'
     )
     if dense_tiling_active:
@@ -15642,6 +15800,13 @@ def main() -> None:
             'Tiled prediction sources follow the deterministic tile footprint, stride order, angle variant, '
             'and inverse-mapping rules from the v12.2.0 specification.'
         )
+
+    prediction_render_executor: Optional[ThreadPoolExecutor] = None
+    if bool(streaming_sources_active) and shared_streaming_render_pool_enabled():
+        prediction_render_executor = ThreadPoolExecutor(max_workers=int(prediction_render_workers), thread_name_prefix='prediction-render')
+        print(f'Shared streaming render pool: enabled ({int(prediction_render_workers)} worker thread(s))')
+    elif bool(streaming_sources_active):
+        print('Shared streaming render pool: disabled; each source owns its render executor.')
 
     prediction_volume_executor = ThreadPoolExecutor(max_workers=int(prediction_volume_builder_workers), thread_name_prefix='prediction-volume')
     prediction_result_executor = ThreadPoolExecutor(max_workers=int(async_prediction_result_worker_count), thread_name_prefix='predict-result')
@@ -15662,6 +15827,7 @@ def main() -> None:
     ready_tile_infer: deque[Tuple[str, ViewInfo, DenseTileJob, PredictionVolumeRef]] = deque()
     tile_inference_done: set[Tuple[str, str, str]] = set()
     prediction_accumulation_futures: Dict[Future, Dict[str, object]] = {}
+    streaming_cpu_warmup_started_refs: set[int] = set()
 
     view_processing_futures: Dict[Future, Tuple[str, str]] = {}
     view_processing_submitted: set[Tuple[str, str]] = set()
@@ -15710,6 +15876,7 @@ def main() -> None:
             render_workers=int(render_workers),
             prefetch_frames=int(prefetch_frames),
             autostart=bool(streaming_prediction_source_autostart_enabled()),
+            shared_executor=prediction_render_executor,
         )
         return PredictionVolumeRef(
             array=None,
@@ -15746,6 +15913,7 @@ def main() -> None:
             render_workers=int(render_workers),
             prefetch_frames=int(prefetch_frames),
             autostart=bool(streaming_prediction_source_autostart_enabled()),
+            shared_executor=prediction_render_executor,
         )
         return PredictionVolumeRef(
             array=None,
@@ -15826,6 +15994,57 @@ def main() -> None:
             return pred_ref
         return maybe_eager_stage_prediction_ref_on_gpu(pred_ref, pred_cfg)
 
+    def _queued_cpu_warmup_ref_count() -> int:
+        seen: set[int] = set()
+        count = 0
+        for _view, _job, ref in list(ready_fullframe):
+            rid = id(ref)
+            if rid in seen:
+                continue
+            if rid in streaming_cpu_warmup_started_refs or _prediction_ref_has_gpu_input_staging(ref):
+                seen.add(rid)
+                count += 1
+        for _model_name, _view, _tile_job, ref in list(ready_tile_infer):
+            rid = id(ref)
+            if rid in seen:
+                continue
+            if rid in streaming_cpu_warmup_started_refs or _prediction_ref_has_gpu_input_staging(ref):
+                seen.add(rid)
+                count += 1
+        return int(count)
+
+    def _maybe_start_cpu_warmup_prediction_ref(pred_ref: PredictionVolumeRef) -> None:
+        if int(queued_streaming_cpu_warmup_sources) <= 0:
+            return
+        if _prediction_ref_has_gpu_input_staging(pred_ref):
+            return
+        rid = id(pred_ref)
+        if rid in streaming_cpu_warmup_started_refs:
+            return
+        if _queued_cpu_warmup_ref_count() >= int(queued_streaming_cpu_warmup_sources):
+            return
+        source = getattr(pred_ref, 'source', None)
+        start_fn = getattr(source, 'start', None)
+        if not callable(start_fn):
+            return
+        try:
+            start_fn()
+            streaming_cpu_warmup_started_refs.add(rid)
+        except Exception as exc:
+            print(f'Warning: queued CPU render warmup could not start for {pred_ref.name} ({exc}); source will start on demand.')
+
+    def _warmup_ready_prediction_sources() -> None:
+        if int(queued_streaming_cpu_warmup_sources) <= 0:
+            return
+        for _view, _job, ref in list(ready_fullframe):
+            _maybe_start_cpu_warmup_prediction_ref(ref)
+            if _queued_cpu_warmup_ref_count() >= int(queued_streaming_cpu_warmup_sources):
+                return
+        for _model_name, _view, _tile_job, ref in list(ready_tile_infer):
+            _maybe_start_cpu_warmup_prediction_ref(ref)
+            if _queued_cpu_warmup_ref_count() >= int(queued_streaming_cpu_warmup_sources):
+                return
+
     def _drain_completed_prediction_volume_futures() -> None:
         for fut in list(pending_prediction_volume_futures):
             if not fut.done():
@@ -15841,6 +16060,7 @@ def main() -> None:
                 for model_name, _ in yolo_models:
                     ready_tile_infer.append((str(model_name), view, job_obj, pred_ref))
         _pump_prediction_volume_build_queue()
+        _warmup_ready_prediction_sources()
 
     def _ensure_baseline_workspaces(model_name: str, view: ViewInfo) -> None:
         key = (str(model_name), str(view.name))
@@ -16367,6 +16587,7 @@ def main() -> None:
             _drain_completed_prediction_accumulation_futures()
             _drain_completed_background_futures()
             _pump_prediction_volume_build_queue()
+            _warmup_ready_prediction_sources()
 
             if ready_fullframe:
                 view, job, prediction_ref = ready_fullframe.popleft()
@@ -16590,6 +16811,11 @@ def main() -> None:
         prediction_result_executor.shutdown(wait=True)
         parent_postprocess_executor.shutdown(wait=True)
         tile_postprocess_executor.shutdown(wait=True)
+        if prediction_render_executor is not None:
+            try:
+                prediction_render_executor.shutdown(wait=True, cancel_futures=True)
+            except TypeError:
+                prediction_render_executor.shutdown(wait=True)
         set_interpolation_process_executor(None, 0)
         if interpolation_process_executor is not None:
             try:
