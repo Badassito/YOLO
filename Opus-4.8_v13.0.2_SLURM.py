@@ -6491,17 +6491,19 @@ def union_conf_volume_into_volume_inplace(
         flush_array(dst_conf_mm)
 
 
-def _worker_render_callable(volume_rgb: np.ndarray, view: ViewInfo, job: object, kind: str) -> Callable[[int], np.ndarray]:
+def _worker_render_callable(volume_rgb: np.ndarray, view: ViewInfo, job: object, kind: str, slice_offset: int = 0) -> Callable[[int], np.ndarray]:
+    # local index -> absolute view slice index (sub-range tasks render a contiguous slice window).
+    off = int(slice_offset)
     if str(kind) == 'tile':
         def _render_tile(idx: int) -> np.ndarray:
             return render_dense_tile_frame_for_job(
-                volume_rgb=volume_rgb, view=view, tile_job=job, frame_idx=int(idx), view_frames=None,
+                volume_rgb=volume_rgb, view=view, tile_job=job, frame_idx=off + int(idx), view_frames=None,
             )
         return _render_tile
 
     def _render_full(idx: int) -> np.ndarray:
         return render_fullframe_frame_for_job(
-            volume_rgb=volume_rgb, view=view, job=job, frame_idx=int(idx), view_frames=None,
+            volume_rgb=volume_rgb, view=view, job=job, frame_idx=off + int(idx), view_frames=None,
         )
     return _render_full
 
@@ -6515,9 +6517,12 @@ def run_prediction_volume_in_worker(model: object, cfg: 'PredictConfig', task: D
     view: ViewInfo = task['view']  # type: ignore[assignment]
     job = task['job']
     kind = str(task['kind'])
-    num_frames = int(view.num_slices)
+    slice_offset = int(task.get('slice_start', 0))
+    slice_count = int(task.get('slice_count', int(view.num_slices)))
+    num_frames = int(slice_count)
     out_size = int(task['out_size'])
-    result_shape = (int(view.num_slices), int(view.src_h), int(view.src_w))
+    # The result memmap covers only this task's contiguous slice window [slice_start, slice_start+count).
+    result_shape = (int(slice_count), int(view.src_h), int(view.src_w))
 
     source_mm: Optional[np.memmap] = None
     result_mask: Optional[np.memmap] = None
@@ -6534,7 +6539,7 @@ def run_prediction_volume_in_worker(model: object, cfg: 'PredictConfig', task: D
             result_conf[:] = 0
 
         source = StreamingYoloVolumeSource(
-            _worker_render_callable(source_mm, view, job, kind),
+            _worker_render_callable(source_mm, view, job, kind, slice_offset=slice_offset),
             num_frames=num_frames,
             name=f"worker-{kind}-{view.name}-{task['job_id']}",
             batch_size=max(1, int(cfg.batch)),
@@ -16540,48 +16545,77 @@ def main() -> None:
     if multi_gpu_active:
         mgpu_result_dir.mkdir(parents=True, exist_ok=True)
         source_volume_path, source_volume_shape, source_volume_dtype = _ensure_source_volume_file_backed()
-        per_worker_workers = max(1, int(_cpu_count()) // max(1, gpu_device_count))
+        # Each GPU worker gets an equal share of the CPU allocation. Crucially the worker drives all
+        # parallelism through its own render/postprocess THREAD POOLS, so OpenCV must run each call
+        # single-threaded (cv2.setNumThreads(1)); otherwise OpenCV's per-process pool funnels every
+        # warpAffine/resize through a handful of threads and the render pool starves the GPUs while
+        # most cores sit idle. YOLO_TTA_MGPU_WORKER_CPU / YOLO_TTA_MGPU_WORKER_CV2_THREADS override.
+        per_worker_workers = max(
+            1, _env_int('YOLO_TTA_MGPU_WORKER_CPU', max(1, int(_cpu_count()) // max(1, gpu_device_count)))
+        )
         worker_init = {
             'imgsz': int(args.imgsz), 'conf': float(args.conf),
             'half': bool(args.half), 'int8': bool(args.int8), 'batch': max(1, int(args.batch)),
             'retina_processor': str(retina_processor),
-            'cv2_threads': max(1, int(_cpu_count()) // max(1, gpu_device_count * 2)),
+            'cv2_threads': max(1, _env_int('YOLO_TTA_MGPU_WORKER_CV2_THREADS', 1)),
         }
         physical_gpu_indices = [int(str(d).split(':')[-1]) for d in inference_devices]
+        # Split each full-frame volume into contiguous slice-range chunks so multiple GPUs can work
+        # the SAME (often huge, e.g. full-coverage Radial) volume in parallel, instead of one GPU per
+        # whole volume leaving the other GPUs idle at the tail. The chunk is large relative to the
+        # render prefetch window so per-chunk render ramp-up stays amortized. Tiles are gated/
+        # consolidated as whole volumes, so they are never slice-split.
+        slice_chunk = max(64, _env_int('YOLO_TTA_MGPU_SLICE_CHUNK', 512))
+        prefetch_frames = streaming_prediction_source_prefetch_frames(max(1, int(args.batch)))
+        fullframe_subtasks_per_view: Dict[Tuple[str, str], int] = {}
         next_task_id = 0
         for kind, view, job_obj in list(pending_prediction_build_jobs):
+            n_slices = int(view.num_slices)
             if str(kind) == 'fullframe':
                 aug_job = job_obj
                 m_out = np.asarray(aug_job.aff.M_out_to_src, dtype=np.float32)
                 out_size = int(aug_job.aff.out_size)
                 job_id = str(aug_job.aug_id)
-                rmask = mgpu_result_dir / f'{view.name}__{job_id}.mask.u8.dat'
-                rconf = (mgpu_result_dir / f'{view.name}__{job_id}.conf.u8.dat') if float(args.min_conf) > 0.0 else None
+                starts = list(range(0, max(1, n_slices), int(slice_chunk))) or [0]
+                key_fv = (str(model_name), str(view.name))
+                fullframe_subtasks_per_view[key_fv] = int(fullframe_subtasks_per_view.get(key_fv, 0)) + len(starts)
+                prefix = f'{view.name}__{job_id}'
             else:
                 tile_job = job_obj
                 m_out = np.asarray(tile_job.M_out_to_src, dtype=np.float32)
                 out_size = int(tile_job.out_size)
                 job_id = str(tile_job.tile_id)
-                rmask = mgpu_result_dir / f'tile__{view.name}__{job_id}.mask.u8.dat'
-                rconf = (mgpu_result_dir / f'tile__{view.name}__{job_id}.conf.u8.dat') if float(args.min_conf) > 0.0 else None
-            render_workers = streaming_prediction_source_workers(int(per_worker_workers), int(view.num_slices))
-            prefetch_frames = streaming_prediction_source_prefetch_frames(max(1, int(args.batch)))
-            task = {
-                'task_id': int(next_task_id), 'kind': str(kind), 'model_name': str(model_name),
-                'view': view, 'job': job_obj, 'job_id': job_id, 'out_size': int(out_size),
-                'M_out_to_src': m_out,
-                'source_volume_path': source_volume_path, 'source_shape': list(source_volume_shape),
-                'source_dtype': source_volume_dtype,
-                'result_mask_path': str(rmask), 'result_conf_path': (str(rconf) if rconf is not None else None),
-                'render_workers': int(render_workers), 'prefetch_frames': int(prefetch_frames),
-                'postprocess_workers': int(per_worker_workers),
-                'streaming_cleanup_enabled': bool(single_angle_streaming_cleanup_active),
-                'streaming_cleanup_min_conf': float(args.min_conf),
-                'streaming_cleanup_min_radius': float(_view_native_slice_min_radius(view, float(args.min_radius))),
-            }
-            mgpu_tasks_by_id[int(next_task_id)] = task
-            next_task_id += 1
+                starts = [0]
+                prefix = f'tile__{view.name}__{job_id}'
+            for chunk_idx, s0 in enumerate(starts):
+                count = (min(int(slice_chunk), n_slices - int(s0)) if str(kind) == 'fullframe' else n_slices)
+                # Size the render pool to this worker's CPU share (NOT streaming_prediction_source_workers,
+                # which returns the full machine CPU count and would have each of N workers spin up an
+                # N-times-too-large render pool). With cv2.setNumThreads(1) these are real render threads.
+                render_workers = max(1, min(int(per_worker_workers), int(count)))
+                rmask = mgpu_result_dir / f'{prefix}__c{chunk_idx}.mask.u8.dat'
+                rconf = (mgpu_result_dir / f'{prefix}__c{chunk_idx}.conf.u8.dat') if float(args.min_conf) > 0.0 else None
+                task = {
+                    'task_id': int(next_task_id), 'kind': str(kind), 'model_name': str(model_name),
+                    'view': view, 'job': job_obj, 'job_id': job_id, 'out_size': int(out_size),
+                    'M_out_to_src': m_out,
+                    'slice_start': int(s0), 'slice_count': int(count),
+                    'source_volume_path': source_volume_path, 'source_shape': list(source_volume_shape),
+                    'source_dtype': source_volume_dtype,
+                    'result_mask_path': str(rmask), 'result_conf_path': (str(rconf) if rconf is not None else None),
+                    'render_workers': int(render_workers), 'prefetch_frames': int(prefetch_frames),
+                    'postprocess_workers': int(per_worker_workers),
+                    'streaming_cleanup_enabled': bool(single_angle_streaming_cleanup_active),
+                    'streaming_cleanup_min_conf': float(args.min_conf),
+                    'streaming_cleanup_min_radius': float(_view_native_slice_min_radius(view, float(args.min_radius))),
+                }
+                mgpu_tasks_by_id[int(next_task_id)] = task
+                next_task_id += 1
         mgpu_total_tasks = int(next_task_id)
+        # A full-frame view is finalized only after every (angle x slice-chunk) result for it has been
+        # unioned, so override fullframe_remaining with the per-view sub-task count.
+        for key_fv, cnt in fullframe_subtasks_per_view.items():
+            fullframe_remaining[key_fv] = int(cnt)
         pending_prediction_build_jobs.clear()
 
         mp_ctx = mp.get_context('spawn')
@@ -16597,7 +16631,8 @@ def main() -> None:
             gpu_worker_processes.append(proc)
         print(
             f'Started {len(gpu_worker_processes)} GPU worker process(es) for physical devices {physical_gpu_indices}; '
-            f'{mgpu_total_tasks} prediction volume task(s) queued; per-worker CPU workers={per_worker_workers}.'
+            f'{mgpu_total_tasks} inference task(s) queued (full-frame volumes slice-chunked at {slice_chunk} '
+            f'slices for cross-GPU load balancing); per-worker CPU workers={per_worker_workers}, cv2 threads=1.'
         )
         for tid in range(mgpu_total_tasks):
             gpu_task_queue.put(mgpu_tasks_by_id[tid])
@@ -16613,15 +16648,22 @@ def main() -> None:
         model_name_s = str(task['model_name'])
         _ensure_baseline_workspaces(model_name_s, view)
         view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(stats.get('prediction_count', 0))
-        result_shape = (int(view.num_slices), int(view.src_h), int(view.src_w))
+        s0 = int(task.get('slice_start', 0))
+        count = int(task.get('slice_count', int(view.num_slices)))
+        # The worker result covers only this task's slice window; union it into that window of the
+        # per-view union. Result handlers run only on the main thread, so concurrent sub-tasks of the
+        # same view never race here.
+        result_shape = (int(count), int(view.src_h), int(view.src_w))
         res_mask = open_existing_gray_memmap(task['result_mask_path'], result_shape, 'uint8', mode='r')
         res_conf = open_existing_gray_memmap(task['result_conf_path'], result_shape, 'uint8', mode='r') if task.get('result_conf_path') else None
+        dst_mask = baseline_union_by_model_view[(model_name_s, str(view.name))]
+        dst_conf = baseline_confmap_by_model_view.get((model_name_s, str(view.name)))
         union_conf_volume_into_volume_inplace(
-            baseline_union_by_model_view[(model_name_s, str(view.name))],
-            baseline_confmap_by_model_view.get((model_name_s, str(view.name))),
+            dst_mask[s0:s0 + count],
+            (dst_conf[s0:s0 + count] if dst_conf is not None else None),
             res_mask, res_conf,
             workers=int(slice_postprocess_workers),
-            desc=f'Union {view.name} worker result',
+            desc=f'Union {view.name}[{s0}:{s0 + count}] worker result',
         )
         close_memmap_array(res_mask)
         if res_conf is not None:
