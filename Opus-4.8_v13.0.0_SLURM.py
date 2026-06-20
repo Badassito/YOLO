@@ -2,14 +2,34 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This v12.2.15_SLURM implementation of the v12.2.15_SLURM scheduling/native-volume rework plus the v12.2.1-v12.2.14 performance patches:
-  - v12.2.15 removes the eager approximate-cube resize from the default processing path: YOLO views now render directly from the decoded gray8 volume in native input geometry unless YOLO_TTA_PROCESSING_VOLUME_MODE=cube or YOLO_TTA_FORCE_PROCESSING_CUBE=1 is set. This avoids a lossy whole-volume interpolation pass and removes its CPU cost; the legacy cube path remains available for strict v12.2.0 comparison.
+This is the v13.0.0_SLURM implementation. It is derived from the v12.2.15_SLURM scheduling/native-volume
+rework plus the v12.2.1-v12.2.14 performance patches, with the following v13.0.0 changes:
+  - v13.0.0 (bug fix) restores approximately-cubic VIRTUAL working geometry as the default: the working
+    volume's dimensions are brought to within 5% of the longest source axis before any view is derived, so
+    e.g. (X,Y,t)=3072x3072x1930 -> ~3072x3072x2919. This keeps the t (Transverse stacking) axis inside the
+    5% band so view slice counts stay isotropic. Set YOLO_TTA_PROCESSING_VOLUME_MODE=native to opt back into
+    the v12.2.15 decoded-native geometry for regression only.
+  - v13.0.0 (bug fix) corrects per-view postprocessing order to --min_conf -> --min_radius -> 2D hole fill.
+    Hole filling now runs on the final per-view volume AFTER radius filtering (spec items 5-6), instead of
+    the previous --min_conf -> hole fill -> --min_radius order.
+  - v13.0.0 removes optional skeletonization entirely: the --save_skeleton feature and all centerline / 3D
+    Lee-thinning code paths are deleted. Interpolation never used skeletonization.
+  - v13.0.0 adds multi-GPU inference scheduling. --device accepts multiple CUDA indices (e.g. 0,1,2,3); one
+    YOLO model replica is loaded per GPU and ready prediction volumes are dynamically dispatched to whichever
+    GPU is free, so no GPU idles while inference-ready work exists. Ultralytics does not load-balance across
+    devices, so the pipeline owns the scheduling.
+  - v13.0.0 adds --retina_mask_processor {cpu,gpu}: CPU retina reconstruction is the single-GPU default;
+    enabling more than one GPU implicitly switches to GPU-side retina masks (explicitly overridable);
+    --device cpu forces CPU and overrides any explicit value.
+  - v12.2.15 removed the eager approximate-cube resize from the default path; v13.0.0 reinstates an
+    approximately-cubic working geometry by default (see above) while keeping the same single-pass view
+    reslicing that scales each reslice to --imgsz.
   - v12.2.15 unbounds streaming prediction-source creation by default, decouples cheap source/ref creation from CPU rendering, removes the old fixed four-source warmup/staging default, and uses a shared full-budget render pool so one active view/source can consume the complete visible CPU allocation while other CPU stages continue to overlap.
   - v12.2.14 writes decomposed NRRD payloads as one independently compressed gzip member per layer inside the same attached .nrrd payload by default, adds a legacy single-stream fallback, schedules each low-quality downbin as its own background job with per-bin overlay/binary/NRRD writers running concurrently, increases default prediction-source queueing/prefetch/render-worker aggressiveness, permits unbounded CPU result backlog by default, and can eagerly stage queued prediction sources into CUDA input queues before they become the active YOLO source
   - v12.2.13 adds an optional CUDA input-staging queue that preloads a small number of already-normalized BCHW YOLO batches into GPU VRAM ahead of the predictor loop, separate from --batch, so model inference no longer waits on the hot-path RAM->GPU copy when the queue is filled
   - v12.2.12 changes full-frame/tile YOLO inputs to bounded streaming render sources, so inference starts after the first prefetch batch is rendered instead of after a complete (slice,imgsz,imgsz) prediction volume is materialized
   - v12.2.11 removes GPU backprojection from the final Radial/Tilted path, gives CPU-only backprojection the full slice-worker budget, keeps tile waiting/staging/consolidation canvases in RAM by default, overlaps YOLO model loading with decode/cube preparation, adds threaded ffmpeg decode defaults, and tightens the NRRD writer around the Target_Dummy trailing-list layout with direct raw-bbox chunk fills and full-CPU pigz defaults
-  - v12.2.8 adds a dedicated single --angle streaming cleanup path: when exactly one augmentation angle is requested, min_conf filtering, 2D hole filling, and view-native per-slice min_radius filtering are applied as YOLO slices stream in; only true volume-level cleanup waits for the completed view volume
+  - v12.2.8 adds a dedicated single --angle streaming cleanup path: when exactly one augmentation angle is requested, min_conf filtering and view-native per-slice min_radius filtering are applied as YOLO slices stream in; volume-level cleanup (deferred transverse-plane min_radius and, in v13.0.0, the final 2D hole fill) waits for the completed view volume
   - v12.2.9 keeps the GPU-fed queue hot by sizing prediction-volume builders to the active prefetch window, skipping scratch memmap flushes on the prediction hot path by default, and allowing single-angle CPU result accumulation to finish behind the next prediction volume
   - v12.2.1 restores the low-quality downbin/output helper path and NrrdLayerRef metadata class that were erroneously pruned in v12.2.0
   - v12.2.2 adds batched in-memory inference with synthetic final-batch padding for fixed-batch backends, larger RAM-aware NRRD streaming slabs, parallel low-quality NRRD scheduling, and the now-CPU-only radial/tilted backprojection queue
@@ -28,9 +48,10 @@ This v12.2.15_SLURM implementation of the v12.2.15_SLURM scheduling/native-volum
   - validates/resizes tile mask volumes to their parent view-native shape before raw waiting-tile store spill so ctile stores always match the parent canvas
   - removes dense-tile pruning and keeps temporary/intermediate mask volumes unpacked throughout
   - fuses per-slice cleanup work where the slice orientation matches the required semantics
-    (notably min_conf filtering, 2D hole filling, and min_radius where applicable)
+    (min_conf filtering and view-native min_radius where applicable); v13.0.0 applies 2D hole filling
+    as a final per-view volume pass after --min_conf and --min_radius (spec items 5-6)
   - overlaps GPU inference with CPU-side view interpolation, consolidated-tile interpolation, and output writing
-  - defaults to deferred CPU retina-mask reconstruction for live inference; set YOLO_TTA_CPU_RETINA_MASKS=0 to restore Ultralytics native retina_masks=True compatibility mode
+  - resolves retina masks per --retina_mask_processor: cpu (default on a single GPU) reconstructs bbox-ROI retina masks on the CPU with retina_masks=False to YOLO; gpu (default when >1 GPU is enabled) uses Ultralytics native retina_masks=True. --device cpu forces cpu
   - reuses a native radial frame cache during dense tiled rendering so radial tiles do not recompute
     the same Lanczos-3 slices for every tile location
   - inverse-maps predictions only into each generated prediction volume's native view space, keeps Radial and Tilted View results view-native through cleanup/interpolation, then backprojects them after per-view processing
@@ -40,15 +61,15 @@ This v12.2.15_SLURM implementation of the v12.2.15_SLURM scheduling/native-volum
   - supports Radial and generalized Tilted View-native interpolation, and keeps every Tilted View frame N centered on its base view native slice N with black-padded out-of-bounds shear samples
   - resizes the working volume to an approximately cubic orthogonal volume when needed, restores the final mask to the original input dimensions for default outputs,
     and saves the transverse default color overlay plus optional labels, bilevel compressed TIFF binary masks, binary MKVs,
-    decomposed multi-layer NRRD, active-view image sequences, optional skeleton NRRDs/layers, and isotropically downsampled
+    decomposed multi-layer NRRD, active-view image sequences, and isotropically downsampled
     low-quality presentation outputs, with FFV1 used for spec-required MKVs
   - writes the default NRRD as independently toggleable layers for full-frame YOLO masks, interpolation bridges, tiled masks accepted by parent YOLO masks,
-    tiled masks accepted by parent bridges, consolidated tile bridges, the pre-smoothing global union, smoothing-pass results, optional skeleton, and the final output layer
+    tiled masks accepted by parent bridges, consolidated tile bridges, the pre-smoothing global union, smoothing-pass results, and the final output layer
   - streams NRRD gzip-encoded payloads through pigz from per-layer backing arrays or raw cvol stores without materializing a full 4D decomposed payload, reducing peak scratch pressure during final NRRD creation
   - records NRRD SegmentN_Extent metadata while each layer is materialized, so final NRRD packaging reuses stored extents instead of rescanning every backing layer
 
 Dependencies (Python):
-  pip install opencv-python numpy scipy scikit-image tifffile tqdm ultralytics
+  pip install opencv-python numpy scipy tifffile tqdm ultralytics
   # Optional CPU acceleration: numba for no-GIL interpolation seed-planning kernels.
   # Optional GPU acceleration: cupy-cuda12x for cupyx.scipy.ndimage smoothing only; final Radial/Tilted backprojection is CPU-only in v12.2.11.
   # --save_nrrd uses the built-in streaming NRRD writer; pynrrd is no longer required for default exports.
@@ -96,14 +117,7 @@ except Exception as e:  # pragma: no cover
 
 from scipy import ndimage as ndi  # type: ignore
 
-try:
-    from skimage.morphology import skeletonize as _skimage_skeletonize  # type: ignore
-    try:
-        from skimage.morphology import skeletonize_3d as _skimage_skeletonize_3d  # type: ignore
-    except Exception:
-        _skimage_skeletonize_3d = None
-except Exception as e:  # pragma: no cover
-    raise RuntimeError("scikit-image is required: pip install scikit-image") from e
+# v13.0.0 removed optional skeletonization, so scikit-image's skeletonize import is no longer required.
 
 try:
     import tifffile  # type: ignore
@@ -232,7 +246,13 @@ def build_argparser() -> argparse.ArgumentParser:
 
     p.add_argument("--input", required=True, type=str, help="Input video path")
     p.add_argument("--output", default=None, type=str, help="Output directory (default ./{Filename}/)")
-    p.add_argument("--device", default="0", type=str, help="Device passed to YOLO predict")
+    p.add_argument("--device", default="0", type=str,
+                   help="Inference device(s). Accepts a single GPU index (0), multiple comma-separated GPU "
+                        "indices (0,1,2,3) for multi-GPU scheduling, or cpu. GPU indices and cpu cannot be mixed")
+    p.add_argument("--retina_mask_processor", default=None, choices=["cpu", "gpu"], type=str,
+                   help="Device that resolves full-resolution retina masks. Default cpu for a single GPU. "
+                        "Enabling more than one GPU via --device implicitly switches this to gpu (explicitly "
+                        "overridable). Setting --device cpu forces cpu and overrides any explicit value")
     p.add_argument("--model", required=True, type=str, help="Path to a single YOLO segmentation model")
 
     p.add_argument("--imgsz", default=2048, type=int, help="Square input size used for YOLO predict")
@@ -277,8 +297,6 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--save_binary", nargs="?", const="__DEFAULT__", default=None, type=str,
                    help="Save final binary masks as a TIFF sequence plus an FFV1 MKV. Optional custom TIFF pattern, e.g. binary_masks/{Filename}_Binary_%%04d.tiff")
     p.add_argument("--save_nrrd", action="store_true", help="Save a decomposed multi-layer NRRD plus manifest JSON")
-    p.add_argument("--save_skeleton", action="store_true",
-                   help="Compute a 3D skeleton after final postprocessing. With --save_nrrd, add it as a decomposed layer; otherwise write a skeleton-only NRRD")
     p.add_argument("--save_low_quality", action="store_true",
                    help="Save additional isotropically downsampled low-quality presentation videos and NRRDs using libx264, preset slow, yuv420p")
     p.add_argument("--save_low_quality_downbin", nargs="+", default=None, type=str,
@@ -1577,12 +1595,16 @@ def compute_cube_resize_shape(
 
 
 def processing_volume_mode() -> str:
-    """Return the v13 processing geometry mode.
+    """Return the v13.0.0 processing geometry mode.
 
-    v12.2.15 defaults to native decoded input geometry because every YOLO view renderer
-    already samples/resizes its own H×W prediction raster.  The old v12.2.0 approximate-cube
-    preprocessing volume remains available for strict regression/comparison by setting
-    ``YOLO_TTA_PROCESSING_VOLUME_MODE=cube`` or ``YOLO_TTA_FORCE_PROCESSING_CUBE=1``.
+    v13.0.0 (bug fix) defaults to the approximately-cubic working geometry required by spec
+    item 2: the virtual working dimensions (X', Y', t') must be within 5% of the longest source
+    axis before views are derived.  v12.2.15 had defaulted to ``native`` decoded geometry, which
+    left the Transverse stacking axis (t) ~37% short of the longest axis for the common
+    3072x3072x1930 case and violated the 5% band.  The literal cubic volume is materialized here
+    as the simplest implementation of the virtual working geometry; the decoded->view reslice
+    still scales to --imgsz in a single pass.  Set ``YOLO_TTA_PROCESSING_VOLUME_MODE=native`` to
+    opt back into the v12.2.15 decoded-native geometry for strict regression/comparison only.
     """
     if _env_flag('YOLO_TTA_FORCE_PROCESSING_CUBE', False):
         return 'cube'
@@ -1590,7 +1612,7 @@ def processing_volume_mode() -> str:
     if not raw:
         raw = os.environ.get('YOLO_TTA_PROCESSING_GEOMETRY', '').strip().lower()
     aliases = {
-        '': 'native',
+        '': 'cube',
         'native': 'native',
         'decoded': 'native',
         'input': 'native',
@@ -1604,11 +1626,13 @@ def processing_volume_mode() -> str:
         'v12': 'cube',
         'v12.2.0': 'cube',
         'v950': 'cube',
+        'v13': 'cube',
+        'v13.0.0': 'cube',
     }
     mode = aliases.get(raw)
     if mode is None:
-        print(f"Warning: unsupported YOLO_TTA_PROCESSING_VOLUME_MODE={raw!r}; using native decoded geometry.")
-        return 'native'
+        print(f"Warning: unsupported YOLO_TTA_PROCESSING_VOLUME_MODE={raw!r}; using approximately-cubic working geometry.")
+        return 'cube'
     return str(mode)
 
 
@@ -4527,6 +4551,89 @@ def canonical_single_device(device: str) -> str:
     return token
 
 
+def _canonical_single_device_token(token: str) -> str:
+    low = str(token).strip().lower()
+    if low in ('cpu', 'mps'):
+        return low
+    if low.startswith('cuda'):
+        return low
+    if low.isdigit():
+        return f'cuda:{low}'
+    return str(token).strip()
+
+
+def parse_device_list(device: str) -> List[str]:
+    """v13.0.0 multi-GPU device parsing.
+
+    --device accepts a single GPU index (``0``), multiple comma/whitespace separated GPU
+    indices (``0,1,2,3``) for multi-GPU scheduling, or ``cpu``.  GPU indices and ``cpu``
+    cannot be mixed.  Returns a de-duplicated, order-preserving list of canonical device
+    strings such as ``['cuda:0', 'cuda:1']`` or ``['cpu']``.
+    """
+    raw = str(device or '').strip()
+    if not raw:
+        return ['cpu']
+    tokens = [t for t in re.split(r'[\s,]+', raw) if t]
+    if not tokens:
+        return ['cpu']
+
+    canon: List[str] = []
+    seen: set[str] = set()
+    saw_cpu = False
+    saw_gpu = False
+    for tok in tokens:
+        dev = _canonical_single_device_token(tok)
+        if dev == 'cpu':
+            saw_cpu = True
+        elif dev == 'mps' or str(dev).startswith('cuda'):
+            saw_gpu = True
+        if dev not in seen:
+            seen.add(dev)
+            canon.append(dev)
+
+    if saw_cpu and saw_gpu:
+        raise ValueError('--device cannot mix cpu and GPU indices; use either cpu or one/more GPU indices')
+    if saw_cpu:
+        # cpu is a single logical device regardless of how many times it was listed.
+        return ['cpu']
+    return canon
+
+
+def is_cpu_device_list(devices: Sequence[str]) -> bool:
+    return all(str(d).strip().lower() == 'cpu' for d in devices)
+
+
+def resolve_retina_mask_processor(explicit: Optional[str], devices: Sequence[str]) -> Tuple[str, str]:
+    """v13.0.0 resolve --retina_mask_processor against --device rules.
+
+    Returns (processor, reason) where processor is 'cpu' or 'gpu'.
+
+      1. --device cpu forces 'cpu' and overrides any explicit value.
+      2. Otherwise an explicit --retina_mask_processor is honored.
+      3. Otherwise more than one GPU implicitly switches to 'gpu'.
+      4. Otherwise the default is 'cpu' (single GPU).
+    """
+    explicit_norm = None if explicit is None else str(explicit).strip().lower()
+    if is_cpu_device_list(devices):
+        return 'cpu', '--device cpu forces CPU retina reconstruction'
+    if explicit_norm in ('cpu', 'gpu'):
+        return explicit_norm, f'explicit --retina_mask_processor {explicit_norm}'
+    if len([d for d in devices if str(d).startswith('cuda')]) > 1:
+        return 'gpu', 'more than one GPU enabled; retina masks resolved on GPU by default'
+    return 'cpu', 'single-GPU default CPU retina reconstruction'
+
+
+# v13.0.0: the active retina-mask processor resolved in main() from --retina_mask_processor and
+# --device. None means "fall back to the YOLO_TTA_CPU_RETINA_MASKS env default" (back-compat).
+_RETINA_MASK_PROCESSOR_IS_CPU: Optional[bool] = None
+
+
+def set_retina_mask_processor(processor: str) -> None:
+    """Set the resolved retina-mask processor ('cpu' or 'gpu') for the run."""
+    global _RETINA_MASK_PROCESSOR_IS_CPU
+    _RETINA_MASK_PROCESSOR_IS_CPU = bool(str(processor).strip().lower() == 'cpu')
+
+
 def ensure_yolo_ready_for_predict(model: object, cfg: 'PredictConfig') -> None:
     """Keep the active YOLO backend resident on the requested device.
 
@@ -4665,6 +4772,19 @@ class PredictConfig:
     batch: int = 1
 
 
+@dataclass
+class GpuInferenceSlot:
+    """v13.0.0: one GPU worker slot holding a model replica pinned to a single device.
+
+    Multi-GPU scheduling owns its own load balancing because Ultralytics does not distribute
+    work across devices. The main-thread scheduler dispatches each ready prediction volume to a
+    free slot; the slot runs predict()+accumulate on its own model/device in a worker thread.
+    """
+    device: str
+    model: object
+    cfg: PredictConfig
+
+
 def async_predict_postprocess_enabled() -> bool:
     """Return True when single-angle prediction CPU tails may run behind the GPU."""
     return _env_flag('YOLO_TTA_ASYNC_PREDICT_POSTPROCESS', True)
@@ -4798,14 +4918,20 @@ _ULTRALYTICS_ORIGINAL_SEG_CONSTRUCT_RESULT: Optional[object] = None
 
 
 def cpu_retina_masks_enabled() -> bool:
-    """Use deferred CPU retina reconstruction as the default live-inference result path.
+    """Return True when retina masks are reconstructed on the CPU.
 
-    Native ``retina_masks=True`` can hand large GPU mask tensors to Python result
-    handling. v12.2.9 instead captures compact mask coefficients/protos and
-    reconstructs bbox-local masks in prediction-result workers. Set
-    ``YOLO_TTA_CPU_RETINA_MASKS=0`` to restore Ultralytics native-retina
-    compatibility mode.
+    v13.0.0: when main() has resolved --retina_mask_processor (against the --device rules),
+    that decision wins: 'cpu' -> deferred CPU retina reconstruction (retina_masks=False to
+    YOLO); 'gpu' -> Ultralytics native retina_masks=True on the GPU. When unset (e.g. helper
+    used standalone), fall back to the YOLO_TTA_CPU_RETINA_MASKS env default.
+
+    CPU reconstruction captures compact mask coefficients/protos and rebuilds bbox-local
+    masks in prediction-result workers, keeping large full-resolution GPU mask tensors off
+    the scheduler/model-stream thread. Resolving them on GPU frees the CPUs for view
+    creation/postprocessing, which is what multi-GPU runs need.
     """
+    if _RETINA_MASK_PROCESSOR_IS_CPU is not None:
+        return bool(_RETINA_MASK_PROCESSOR_IS_CPU)
     return _env_flag('YOLO_TTA_CPU_RETINA_MASKS', True)
 
 
@@ -6067,11 +6193,13 @@ def _cleanup_prediction_slice_inplace(
     """Clean one accumulated native-view prediction slice in place.
 
     This is the unit used by the v12.2.8 single-angle streaming path and by the
-    older whole-volume cleanup pass. It applies only slice-local semantics:
-    confidence gating, 2D hole filling, and view-native 2D min-radius filtering.
-    Cleanup that depends on a transposed/volume-level view, such as Sagittal or
-    Coronal transverse-plane min-radius filtering, is deliberately deferred until
-    the full view volume exists.
+    older whole-volume cleanup pass. v13.0.0 applies the spec-ordered slice-local
+    semantics: confidence gating (--min_conf) followed by view-native 2D min-radius
+    filtering (--min_radius). 2D hole filling is NOT performed here; per spec items
+    5-6 it runs as a final per-view volume pass after all radius filtering, so it is
+    handled by cleanup_view_volume_after_prediction_inplace(). Cleanup that depends
+    on a transposed/volume-level view, such as Sagittal or Coronal transverse-plane
+    min-radius filtering, is also deferred until the full view volume exists.
     """
     idx_i = int(idx)
     backend_norm = cleanup_backend() if backend is None else str(backend)
@@ -6100,12 +6228,11 @@ def _cleanup_prediction_slice_inplace(
                 structure,
             )
 
-    if np.any(mask_slice):
-        if backend_norm == 'opencv':
-            mask_slice = _fill_holes_2d_opencv(mask_slice)
-        else:
-            mask_slice = _fill_holes_2d_scipy(mask_slice)
-
+    # v13.0.0 (bug fix): apply --min_radius BEFORE hole filling. Spec items 5-6 require the order
+    # --min_conf -> --min_radius -> hole fill, with hole filling applied to the FINAL per-view
+    # volume. Hole filling is therefore performed as a separate volume-level 2D pass in
+    # cleanup_view_volume_after_prediction_inplace() after every (native + deferred) radius filter
+    # completes, rather than here in the per-slice unit (which previously hole-filled before radius).
     if np.any(mask_slice) and float(min_radius) > 0.0:
         if backend_norm == 'opencv':
             mask_slice = _filter_connected_components_by_min_radius_opencv(
@@ -6206,6 +6333,47 @@ def fused_slice_cleanup_inplace(
         flush_array(confmap_mm)
 
 
+def fill_view_volume_holes_2d_inplace(
+    mask_mm: np.ndarray,
+    *,
+    workers: int = 1,
+    desc: str = '2D hole fill (per-view volume)',
+) -> None:
+    """v13.0.0: fill 2D enclosed holes per slice across a completed per-view mask volume.
+
+    Spec item 6 applies hole filling to each final per-view volume AFTER --min_conf and
+    --min_radius. Holes appear because unioned overlapping masks can enclose a background
+    region in 2D. This runs slice-parallel; each slice sets to foreground any background
+    connected component fully enclosed by foreground. Empty slices are skipped.
+    """
+    num_slices = int(mask_mm.shape[0])
+    if num_slices <= 0:
+        return
+    backend = cleanup_backend()
+    worker_count = choose_slice_parallel_workers(int(workers), num_slices)
+    chunk_size = choose_parallel_chunk_size(num_slices, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
+
+    def _process(i: int) -> None:
+        idx_i = int(i)
+        mask_slice = np.asarray(mask_mm[idx_i], dtype=bool)
+        if not np.any(mask_slice):
+            return
+        if backend == 'opencv':
+            filled = _fill_holes_2d_opencv(mask_slice)
+        else:
+            filled = _fill_holes_2d_scipy(mask_slice)
+        mask_mm[idx_i, :, :] = filled.astype(np.uint8, copy=False)
+
+    parallel_for_indices_chunked(
+        num_slices,
+        _process,
+        max_workers=worker_count,
+        desc=desc,
+        chunk_size=chunk_size,
+    )
+    flush_array(mask_mm)
+
+
 def cleanup_view_volume_after_prediction_inplace(
     mask_mm: np.ndarray,
     confmap_mm: Optional[np.ndarray],
@@ -6219,9 +6387,10 @@ def cleanup_view_volume_after_prediction_inplace(
     native_min_radius = _view_native_slice_min_radius(view, float(min_radius))
 
     if bool(precleaned_slice_cleanup):
-        # v12.2.8 single-angle inference has already applied every slice-local cleanup
-        # operation as results streamed in. Only cleanup whose semantics require the
-        # completed view volume remains here.
+        # v12.2.8 single-angle inference has already applied per-slice --min_conf and
+        # view-native --min_radius as results streamed in. Only cleanup whose semantics
+        # require the completed view volume (deferred transverse-plane --min_radius for
+        # Sagittal/Coronal) remains before the final hole-fill pass.
         if _view_needs_deferred_volume_cleanup_after_streaming(view, float(min_radius)):
             apply_view_min_radius_filter_inplace(
                 mask_mm,
@@ -6229,29 +6398,38 @@ def cleanup_view_volume_after_prediction_inplace(
                 float(min_radius),
                 workers=int(workers),
             )
-        flush_array(mask_mm)
-        if confmap_mm is not None:
-            flush_array(confmap_mm)
-        return
+    else:
+        effective_confmap_mm = confmap_mm if float(min_conf) > 0.0 else None
 
-    effective_confmap_mm = confmap_mm if float(min_conf) > 0.0 else None
+        fused_slice_cleanup_inplace(
+            mask_mm,
+            effective_confmap_mm,
+            min_conf=float(min_conf),
+            min_radius=float(native_min_radius),
+            workers=int(workers),
+            desc=f'Fused cleanup ({view.name})',
+        )
 
-    fused_slice_cleanup_inplace(
+        if _view_needs_deferred_volume_cleanup_after_streaming(view, float(min_radius)):
+            apply_view_min_radius_filter_inplace(
+                mask_mm,
+                view,
+                float(min_radius),
+                workers=int(workers),
+            )
+
+    # v13.0.0 (bug fix): 2D hole filling is the FINAL per-view step (spec item 6), applied after
+    # --min_conf and every --min_radius filter (native per-slice + deferred transverse-plane).
+    # The previous order hole-filled before --min_radius inside the per-slice unit.
+    fill_view_volume_holes_2d_inplace(
         mask_mm,
-        effective_confmap_mm,
-        min_conf=float(min_conf),
-        min_radius=float(native_min_radius),
         workers=int(workers),
-        desc=f'Fused cleanup ({view.name})',
+        desc=f'2D hole fill ({view.name})',
     )
 
-    if _view_needs_deferred_volume_cleanup_after_streaming(view, float(min_radius)):
-        apply_view_min_radius_filter_inplace(
-            mask_mm,
-            view,
-            float(min_radius),
-            workers=int(workers),
-        )
+    flush_array(mask_mm)
+    if confmap_mm is not None:
+        flush_array(confmap_mm)
 
 
 # --------------------------
@@ -7893,450 +8071,8 @@ def assemble_final_union_after_view_union(
 
 
 # --------------------------
-# Optional skeleton output + scan-based interpolation helpers
+# Scan-based interpolation helpers (v13.0.0 removed optional skeletonization)
 # --------------------------
-
-
-def _skimage_skeletonize_bool(mask_bool: np.ndarray) -> np.ndarray:
-    """Best-effort 3D Lee skeletonization across scikit-image versions."""
-    arr = np.asarray(mask_bool, dtype=bool)
-    if arr.size <= 0 or not np.any(arr):
-        return np.zeros(arr.shape, dtype=bool)
-
-    try:
-        return np.asarray(_skimage_skeletonize(arr, method="lee"), dtype=bool)
-    except TypeError:
-        pass
-    except Exception:
-        pass
-
-    if _skimage_skeletonize_3d is not None:
-        try:
-            return np.asarray(_skimage_skeletonize_3d(arr), dtype=bool)
-        except Exception:
-            pass
-
-    return np.asarray(_skimage_skeletonize(arr), dtype=bool)
-
-
-def _draw_line_zyx(mask: np.ndarray, p0: Tuple[int, int, int], p1: Tuple[int, int, int]) -> None:
-    z0, y0, x0 = (int(p0[0]), int(p0[1]), int(p0[2]))
-    z1, y1, x1 = (int(p1[0]), int(p1[1]), int(p1[2]))
-    steps = max(abs(z1 - z0), abs(y1 - y0), abs(x1 - x0), 1)
-    for i in range(int(steps) + 1):
-        a = float(i) / float(steps)
-        z = int(round((1.0 - a) * z0 + a * z1))
-        y = int(round((1.0 - a) * y0 + a * y1))
-        x = int(round((1.0 - a) * x0 + a * x1))
-        if 0 <= z < mask.shape[0] and 0 <= y < mask.shape[1] and 0 <= x < mask.shape[2]:
-            mask[z, y, x] = True
-
-
-def _slice_component_anchors(mask2d: np.ndarray) -> List[Tuple[int, int]]:
-    mask_u8 = np.ascontiguousarray(np.asarray(mask2d, dtype=np.uint8))
-    if mask_u8.size == 0 or not np.any(mask_u8):
-        return []
-    num_labels, labels2d = cv2.connectedComponents(mask_u8, connectivity=8, ltype=cv2.CV_32S)
-    anchors: List[Tuple[int, int]] = []
-    for lbl in range(1, int(num_labels)):
-        comp = labels2d == int(lbl)
-        if not np.any(comp):
-            continue
-        comp_u8 = comp.astype(np.uint8, copy=False)
-        dist = cv2.distanceTransform(comp_u8, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
-        max_val = float(np.max(dist)) if dist.size else 0.0
-        if max_val > 0.0:
-            pts = np.argwhere(dist >= (max_val - 1e-6))
-        else:
-            pts = np.argwhere(comp)
-        if pts.size <= 0:
-            continue
-        anchor = np.mean(pts, axis=0)
-        anchors.append((int(round(float(anchor[0]))), int(round(float(anchor[1])))))
-    return anchors
-
-
-def _fallback_slice_anchor_centerline(comp_bool: np.ndarray) -> np.ndarray:
-    """Build a smooth-ish centerline graph from per-slice distance-ridge anchors.
-
-    This fallback prevents pathological empty or surface-like skeleton outputs from being
-    written as porous blobs.  It is intentionally conservative: every 2D component in a
-    slice contributes one distance-transform anchor, and adjacent-slice anchors are linked
-    in both nearest-neighbor directions so simple bifurcations remain connected.
-    """
-    comp = np.asarray(comp_bool, dtype=bool)
-    out = np.zeros(comp.shape, dtype=bool)
-    prev: List[Tuple[int, int, int]] = []
-    for z in range(int(comp.shape[0])):
-        anchors2d = _slice_component_anchors(comp[int(z)])
-        curr = [(int(z), int(y), int(x)) for y, x in anchors2d]
-        for p in curr:
-            out[p] = True
-        if prev and curr:
-            used_pairs: set[Tuple[int, int]] = set()
-            for ci, cp in enumerate(curr):
-                pi = min(range(len(prev)), key=lambda j: (prev[j][1] - cp[1]) ** 2 + (prev[j][2] - cp[2]) ** 2)
-                used_pairs.add((int(pi), int(ci)))
-            for pi, pp in enumerate(prev):
-                ci = min(range(len(curr)), key=lambda j: (curr[j][1] - pp[1]) ** 2 + (curr[j][2] - pp[2]) ** 2)
-                used_pairs.add((int(pi), int(ci)))
-            for pi, ci in used_pairs:
-                _draw_line_zyx(out, prev[int(pi)], curr[int(ci)])
-        prev = curr if curr else prev
-    return out
-
-
-def _skeleton_max_density_fraction() -> float:
-    raw = _env_float('YOLO_TTA_SKELETON_MAX_DENSITY_FRACTION', 0.18)
-    return max(0.0, float(raw))
-
-
-def centerline_skeletonize_component(comp_bool: np.ndarray) -> np.ndarray:
-    comp = np.asarray(comp_bool, dtype=bool)
-    if comp.size <= 0 or not np.any(comp):
-        return np.zeros(comp.shape, dtype=bool)
-    if _env_flag('YOLO_TTA_SKELETON_FORCE_SLICE_ANCHOR_CENTERLINE', False):
-        return _fallback_slice_anchor_centerline(comp)
-
-    skel = _skimage_skeletonize_bool(comp)
-    skel_voxels = int(np.count_nonzero(skel))
-    comp_voxels = max(1, int(np.count_nonzero(comp)))
-    max_density = _skeleton_max_density_fraction()
-    if skel_voxels <= 0 or (max_density > 0.0 and float(skel_voxels) / float(comp_voxels) > float(max_density)):
-        fallback = _fallback_slice_anchor_centerline(comp)
-        if np.any(fallback):
-            return fallback
-    return skel
-
-
-
-
-def _skeleton_fill_2d_holes_enabled() -> bool:
-    return _env_flag('YOLO_TTA_SKELETON_FILL_2D_HOLES', True)
-
-
-def _skeleton_component_fill_3d_holes_enabled() -> bool:
-    return _env_flag('YOLO_TTA_SKELETON_FILL_COMPONENT_3D_HOLES', False)
-
-
-def _skeleton_chunk_min_voxels() -> int:
-    return max(0, _env_int('YOLO_TTA_SKELETON_CHUNK_MIN_VOXELS', 256 * 1024 * 1024))
-
-
-def _skeleton_chunk_depth() -> int:
-    return max(16, _env_int('YOLO_TTA_SKELETON_CHUNK_DEPTH', 384))
-
-
-def _skeleton_chunk_overlap() -> int:
-    return max(4, _env_int('YOLO_TTA_SKELETON_CHUNK_OVERLAP', 32))
-
-
-def _skeleton_chunk_max_voxels() -> int:
-    return max(1024 * 1024, _env_int('YOLO_TTA_SKELETON_CHUNK_MAX_VOXELS', 96 * 1024 * 1024))
-
-
-def _skeleton_worker_count(requested_workers: int, task_count: int) -> int:
-    default_workers = max(1, min(32, _cpu_count()))
-    workers = _env_int('YOLO_TTA_SKELETON_WORKERS', default_workers)
-    if workers <= 0:
-        workers = int(requested_workers)
-    return choose_slice_parallel_workers(max(1, int(workers)), max(1, int(task_count)))
-
-
-@dataclass(frozen=True)
-class SkeletonChunkTask:
-    label: int
-    read_slice: Tuple[slice, slice, slice]
-    core_slice: Tuple[slice, slice, slice]
-
-
-def _pad_slice_for_shape(sl: slice, dim: int, pad_before: int, pad_after: int) -> slice:
-    start = 0 if sl.start is None else int(sl.start)
-    stop = int(dim) if sl.stop is None else int(sl.stop)
-    return slice(max(0, start - int(pad_before)), min(int(dim), stop + int(pad_after)))
-
-
-def prepare_skeleton_input_volume(
-    mask_u8: np.ndarray,
-    out_path: Path,
-    *,
-    workers: int = 1,
-    prefer_memory: bool = True,
-    reserve_bytes: int = 16 * GIB,
-) -> np.ndarray:
-    """Prepare a cleaner binary input for centerline extraction.
-
-    Small 2D pores in the final mask can make a thinning algorithm return porous
-    skeleton islands instead of a centerline tree.  The default preconditioner fills
-    per-slice enclosed holes in parallel, leaving 3D topology otherwise unchanged.
-    """
-    src = np.asarray(mask_u8, dtype=np.uint8)
-    if not _skeleton_fill_2d_holes_enabled():
-        return mask_u8
-
-    out = allocate_workspace_array(
-        shape=tuple(int(x) for x in src.shape),
-        dtype=np.uint8,
-        path=out_path,
-        desc='Skeleton preconditioned mask workspace',
-        prefer_memory=bool(prefer_memory),
-        reserve_bytes=int(reserve_bytes),
-    )
-    total = int(src.shape[0])
-
-    def _fill_slice(z: int) -> None:
-        sl = np.asarray(src[int(z)], dtype=bool)
-        if np.any(sl):
-            out[int(z), :, :] = _fill_holes_2d(sl).astype(np.uint8, copy=False)
-        else:
-            out[int(z), :, :].fill(np.uint8(0))
-
-    parallel_for_indices_chunked(
-        total,
-        _fill_slice,
-        max_workers=choose_slice_parallel_workers(int(workers), total),
-        desc='Skeleton precondition: fill 2D pores',
-        show_progress=True,
-        target_chunks_per_worker=2,
-    )
-    flush_array(out)
-    return out
-
-
-def _build_skeleton_chunk_tasks(
-    component_slices: Sequence[Optional[Tuple[slice, slice, slice]]],
-    volume_shape: Tuple[int, int, int],
-) -> Tuple[List[SkeletonChunkTask], Dict[str, int]]:
-    z_dim, h_dim, w_dim = (int(volume_shape[0]), int(volume_shape[1]), int(volume_shape[2]))
-    tasks: List[SkeletonChunkTask] = []
-    chunked_components = 0
-    full_components = 0
-    chunk_min_voxels = _skeleton_chunk_min_voxels()
-    chunk_depth = _skeleton_chunk_depth()
-    overlap = _skeleton_chunk_overlap()
-    max_task_voxels = _skeleton_chunk_max_voxels()
-
-    def _axis_chunks(start: int, stop: int, step: int) -> Iterator[Tuple[int, int]]:
-        step_i = max(1, int(step))
-        cur = int(start)
-        while cur < int(stop):
-            nxt = min(int(stop), cur + step_i)
-            yield int(cur), int(nxt)
-            cur = int(nxt)
-
-    def _append_task(label_i: int, core: Tuple[slice, slice, slice], read_pad: int) -> None:
-        cz, cy, cx = core
-        read = (
-            _pad_slice_for_shape(cz, z_dim, read_pad, read_pad),
-            _pad_slice_for_shape(cy, h_dim, read_pad, read_pad),
-            _pad_slice_for_shape(cx, w_dim, read_pad, read_pad),
-        )
-        tasks.append(SkeletonChunkTask(label=int(label_i), read_slice=read, core_slice=core))
-
-    for label, sl in enumerate(component_slices, start=1):
-        if sl is None:
-            continue
-        z_sl, y_sl, x_sl = sl
-        z0, z1 = int(z_sl.start or 0), int(z_sl.stop or 0)
-        y0, y1 = int(y_sl.start or 0), int(y_sl.stop or 0)
-        x0, x1 = int(x_sl.start or 0), int(x_sl.stop or 0)
-        if z1 <= z0 or y1 <= y0 or x1 <= x0:
-            continue
-        bbox_voxels = int(z1 - z0) * int(y1 - y0) * int(x1 - x0)
-
-        if chunk_min_voxels > 0 and bbox_voxels >= chunk_min_voxels and ((z1 - z0) > chunk_depth or bbox_voxels > max_task_voxels):
-            chunked_components += 1
-            core_z_step = min(max(1, chunk_depth), max(1, z1 - z0))
-            # Choose XY tile sizes that keep dense label/bool/skel temporaries bounded while
-            # retaining overlap to reduce boundary discontinuities.
-            area_budget = max(64 * 64, int(max_task_voxels // max(1, core_z_step + 2 * overlap)))
-            side = max(64, int(math.sqrt(float(area_budget))))
-            x_step = max(64, min(x1 - x0, side))
-            y_step = max(64, min(y1 - y0, max(64, int(area_budget // max(1, x_step)))))
-            for core_z0 in range(z0, z1, chunk_depth):
-                core_z1 = min(z1, core_z0 + chunk_depth)
-                for core_y0, core_y1 in _axis_chunks(y0, y1, y_step):
-                    for core_x0, core_x1 in _axis_chunks(x0, x1, x_step):
-                        _append_task(
-                            int(label),
-                            (slice(int(core_z0), int(core_z1)), slice(int(core_y0), int(core_y1)), slice(int(core_x0), int(core_x1))),
-                            int(overlap),
-                        )
-        else:
-            full_components += 1
-            _append_task(int(label), (slice(z0, z1), slice(y0, y1), slice(x0, x1)), 2)
-
-    return tasks, {
-        'tasks': int(len(tasks)),
-        'full_components': int(full_components),
-        'chunked_components': int(chunked_components),
-    }
-
-
-def compute_centerline_skeleton_into_workspace(
-    mask_u8: np.ndarray,
-    out_mm: np.ndarray,
-    *,
-    temp_dir: Path,
-    workers: int = 1,
-    keep_temp: bool = False,
-    prefer_memory: bool = True,
-    reserve_bytes: int = 16 * GIB,
-) -> Dict[str, int]:
-    """Write a 1-voxel centerline skeleton to ``out_mm``.
-
-    The work is decomposed into 3D connected components and, for very large
-    components, overlapping z chunks.  That keeps the optional skeleton output from
-    becoming a single monolithic thinning call while preserving independent object
-    topology as much as possible.
-    """
-    out_mm[:, :, :] = np.uint8(0)
-    flush_array(out_mm)
-
-    skeleton_dir = Path(temp_dir) / 'skeleton'
-    skeleton_dir.mkdir(parents=True, exist_ok=True)
-    prepped = prepare_skeleton_input_volume(
-        mask_u8,
-        skeleton_dir / 'preconditioned_mask.u8.dat',
-        workers=int(workers),
-        prefer_memory=bool(prefer_memory),
-        reserve_bytes=int(reserve_bytes),
-    )
-
-    labels_mm, num_objects, label_paths = label_foreground_volume_streaming(
-        prepped,
-        skeleton_dir / 'component_labels',
-        keep_temp=bool(keep_temp),
-        prefer_memory=bool(prefer_memory),
-        reserve_bytes=int(reserve_bytes),
-        wrap_axis=False,
-        workers=int(workers),
-    )
-    if int(num_objects) <= 0:
-        close_memmap_array(labels_mm)
-        if prepped is not mask_u8:
-            close_memmap_array(prepped)
-        if not bool(keep_temp):
-            for lp in label_paths:
-                try:
-                    lp.unlink(missing_ok=True)
-                except Exception:
-                    pass
-        return {'objects': 0, 'tasks': 0, 'chunked_components': 0, 'skeleton_voxels': 0}
-
-    print(f'Skeleton labeling found {int(num_objects)} object component(s); building component bounding boxes.')
-    component_slices = ndi.find_objects(labels_mm, max_label=int(num_objects))
-    tasks, task_stats = _build_skeleton_chunk_tasks(component_slices, tuple(int(x) for x in labels_mm.shape))
-    worker_count = _skeleton_worker_count(int(workers), max(1, len(tasks)))
-    print(
-        'Skeleton centerline tasks: '
-        f'tasks={int(task_stats["tasks"])}, full_components={int(task_stats["full_components"])}, '
-        f'chunked_components={int(task_stats["chunked_components"])}, workers={int(worker_count)}'
-    )
-    skeleton_voxel_counts = np.zeros((len(tasks),), dtype=np.int64)
-
-    def _process_task(task_idx: int) -> None:
-        task = tasks[int(task_idx)]
-        z_sl, y_sl, x_sl = task.read_slice
-        labels_block = np.asarray(labels_mm[z_sl, y_sl, x_sl])
-        comp = labels_block == int(task.label)
-        if not np.any(comp):
-            return
-        if _skeleton_component_fill_3d_holes_enabled():
-            comp = np.asarray(ndi.binary_fill_holes(comp), dtype=bool)
-        skel = centerline_skeletonize_component(comp)
-        if not np.any(skel):
-            return
-
-        core_z, core_y, core_x = task.core_slice
-        read_z0, read_y0, read_x0 = int(z_sl.start or 0), int(y_sl.start or 0), int(x_sl.start or 0)
-        z_rel0 = max(0, int(core_z.start or 0) - read_z0)
-        z_rel1 = min(int(skel.shape[0]), int(core_z.stop or 0) - read_z0)
-        y_rel0 = max(0, int(core_y.start or 0) - read_y0)
-        y_rel1 = min(int(skel.shape[1]), int(core_y.stop or 0) - read_y0)
-        x_rel0 = max(0, int(core_x.start or 0) - read_x0)
-        x_rel1 = min(int(skel.shape[2]), int(core_x.stop or 0) - read_x0)
-        if z_rel1 <= z_rel0 or y_rel1 <= y_rel0 or x_rel1 <= x_rel0:
-            return
-        skel_core = skel[z_rel0:z_rel1, y_rel0:y_rel1, x_rel0:x_rel1]
-        if not np.any(skel_core):
-            return
-
-        dst = out_mm[core_z, core_y, core_x]
-        dst[skel_core] = np.uint8(1)
-        skeleton_voxel_counts[int(task_idx)] = np.int64(np.count_nonzero(skel_core))
-
-    parallel_for_indices_chunked(
-        len(tasks),
-        _process_task,
-        max_workers=worker_count,
-        desc='Skeletonize components/chunks',
-        show_progress=True,
-        target_chunks_per_worker=1,
-    )
-    flush_array(out_mm)
-
-    skeleton_voxels = int(np.sum(skeleton_voxel_counts, dtype=np.int64))
-    close_memmap_array(labels_mm)
-    if prepped is not mask_u8:
-        close_memmap_array(prepped)
-    if not bool(keep_temp):
-        for lp in label_paths:
-            try:
-                lp.unlink(missing_ok=True)
-            except Exception:
-                pass
-    return {
-        'objects': int(num_objects),
-        'tasks': int(len(tasks)),
-        'chunked_components': int(task_stats['chunked_components']),
-        'skeleton_voxels': int(skeleton_voxels),
-    }
-
-
-def compute_skeleton_volume_to_workspace(
-    mask_u8: np.ndarray,
-    out_path: Path,
-    *,
-    temp_dir: Path,
-    workers: int = 1,
-    keep_temp: bool = False,
-    prefer_memory: bool = True,
-    reserve_bytes: int = 16 * GIB,
-) -> np.ndarray:
-    """Compute an optional 3D centerline skeleton as a postprocessing output layer.
-
-    This is intentionally independent from interpolation. Interpolation endpoint seeds are
-    discovered by per-slice connected-component scanning; this function runs only when
-    --save_skeleton is requested.
-    """
-    shape = tuple(int(x) for x in np.asarray(mask_u8).shape)
-    out_mm = allocate_workspace_array(
-        shape=shape,
-        dtype=np.uint8,
-        path=out_path,
-        desc='Skeleton output workspace',
-        prefer_memory=bool(prefer_memory),
-        reserve_bytes=int(reserve_bytes),
-    )
-    print('Computing optional 3D centerline skeleton output; this is independent of interpolation endpoint discovery.')
-    stats = compute_centerline_skeleton_into_workspace(
-        mask_u8,
-        out_mm,
-        temp_dir=Path(temp_dir),
-        workers=int(workers),
-        keep_temp=bool(keep_temp),
-        prefer_memory=bool(prefer_memory),
-        reserve_bytes=int(reserve_bytes),
-    )
-    print(
-        'Skeleton output stats: '
-        f'objects={int(stats.get("objects", 0))}, tasks={int(stats.get("tasks", 0))}, '
-        f'chunked_components={int(stats.get("chunked_components", 0))}, '
-        f'skeleton_voxels={int(stats.get("skeleton_voxels", 0))}'
-    )
-    flush_array(out_mm)
-    return out_mm
 
 
 _SPHERE_PAINT_CACHE: Dict[int, np.ndarray] = {}
@@ -12333,58 +12069,20 @@ def _gray_to_rgb_frame(frame_gray: np.ndarray) -> np.ndarray:
     return np.repeat(arr[:, :, None], 3, axis=2)
 
 
-SKELETON_OVERLAY_BASE_DIM = 3072.0
-SKELETON_OVERLAY_BASE_THICKNESS_PX = 10.0
-
-
-def skeleton_overlay_thickness_px(frame_h: int, frame_w: int) -> int:
-    scale = max(float(frame_h), float(frame_w)) / float(SKELETON_OVERLAY_BASE_DIM)
-    return max(1, int(round(float(SKELETON_OVERLAY_BASE_THICKNESS_PX) * scale)))
-
-
-_SKELETON_OVERLAY_KERNEL_CACHE: Dict[int, np.ndarray] = {}
-
-
-def skeleton_overlay_mask_2d(skeleton_slice: np.ndarray, frame_h: int, frame_w: int) -> np.ndarray:
-    skel = np.asarray(skeleton_slice, dtype=np.uint8)
-    if skel.shape != (int(frame_h), int(frame_w)):
-        skel = cv2.resize(
-            (skel > 0).astype(np.uint8, copy=False),
-            (int(frame_w), int(frame_h)),
-            interpolation=cv2.INTER_NEAREST,
-        )
-    skel = (skel > 0).astype(np.uint8, copy=False)
-    if not np.any(skel):
-        return np.zeros((int(frame_h), int(frame_w)), dtype=bool)
-    thickness = skeleton_overlay_thickness_px(int(frame_h), int(frame_w))
-    if thickness <= 1:
-        return skel.astype(bool, copy=False)
-    kernel = _SKELETON_OVERLAY_KERNEL_CACHE.get(int(thickness))
-    if kernel is None:
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(thickness), int(thickness)))
-        _SKELETON_OVERLAY_KERNEL_CACHE[int(thickness)] = kernel
-    return cv2.dilate(skel, kernel, iterations=1).astype(bool, copy=False)
-
-
 def write_overlay_video(
     volume_rgb: np.memmap,  # (T,H,W) gray/luma
     mask_u8: np.ndarray,    # (T,H,W) 0/1
     out_path: Path,
     fps: float,
-    skeleton_u8: Optional[np.ndarray] = None,
     show_progress: bool = True,
 ) -> None:
-    """Overlay blue masks (50% alpha) and optional red skeleton on transverse frames.
+    """Overlay blue masks (50% alpha) on transverse frames.
 
     The working source volume is single-channel; frames are expanded to RGB only for this
-    presentation video so the segmentation can remain blue.  When supplied, the skeleton
-    is drawn fully opaque red on top of the mask overlay at 10 px for a 3072 px frame,
-    scaled isotropically for other output sizes.
+    presentation video so the segmentation can remain blue.
     """
     T, H, W = volume_rgb.shape
     assert mask_u8.shape == (T, H, W)
-    if skeleton_u8 is not None:
-        assert skeleton_u8.shape == (T, H, W)
 
     proc = ffmpeg_ffv1_rgb_writer(
         out_path,
@@ -12394,7 +12092,6 @@ def write_overlay_video(
     )
 
     blue = np.array([0, 0, 255], dtype=np.uint8)  # RGB blue
-    red = np.array([255, 0, 0], dtype=np.uint8)   # RGB red
 
     try:
         assert proc.stdin is not None
@@ -12403,10 +12100,6 @@ def write_overlay_video(
             m = mask_u8[t].astype(bool)
             if m.any():
                 frame[m] = ((frame[m].astype(np.uint16) + blue.astype(np.uint16)) // 2).astype(np.uint8)
-            if skeleton_u8 is not None:
-                skel = skeleton_overlay_mask_2d(np.asarray(skeleton_u8[int(t)]), int(H), int(W))
-                if np.any(skel):
-                    frame[skel] = red
             proc.stdin.write(np.ascontiguousarray(frame).tobytes())
     finally:
         close_ffmpeg_writer(proc)
@@ -13856,11 +13549,10 @@ def write_overlay_video_for_view(
     view: ViewInfo,
     out_path: Path,
     fps: float,
-    skeleton_u8: Optional[np.ndarray] = None,
     show_progress: bool = True,
 ) -> None:
     if view.name == 'transverse':
-        write_overlay_video(volume_rgb, mask_u8, out_path, fps, skeleton_u8=skeleton_u8, show_progress=show_progress)
+        write_overlay_video(volume_rgb, mask_u8, out_path, fps, show_progress=show_progress)
         return
 
     proc = ffmpeg_ffv1_rgb_writer(
@@ -13870,33 +13562,21 @@ def write_overlay_video_for_view(
         fps=fps,
     )
     blue = np.array([0, 0, 255], dtype=np.uint8)
-    red = np.array([255, 0, 0], dtype=np.uint8)
 
     try:
         assert proc.stdin is not None
-        if skeleton_u8 is None:
-            iterator = zip(iter_view_frames(volume_rgb, view), iter_view_mask_frames(mask_u8, view))
-        else:
-            iterator = zip(iter_view_frames(volume_rgb, view), iter_view_mask_frames(mask_u8, view), iter_view_mask_frames(skeleton_u8, view))
+        iterator = zip(iter_view_frames(volume_rgb, view), iter_view_mask_frames(mask_u8, view))
         for items in tqdm(
             iterator,
             total=view.num_slices,
             desc=f'Writing {view.name} overlay video ({out_path.name})',
             disable=not show_progress,
         ):
-            if skeleton_u8 is None:
-                frame_rgb, frame_mask = items
-                frame_skeleton = None
-            else:
-                frame_rgb, frame_mask, frame_skeleton = items
+            frame_rgb, frame_mask = items
             frame = _gray_to_rgb_frame(np.asarray(frame_rgb))
             m = np.asarray(frame_mask, dtype=bool)
             if np.any(m):
                 frame[m] = ((frame[m].astype(np.uint16) + blue.astype(np.uint16)) // 2).astype(np.uint8)
-            if frame_skeleton is not None:
-                skel = skeleton_overlay_mask_2d(np.asarray(frame_skeleton), int(view.src_h), int(view.src_w))
-                if np.any(skel):
-                    frame[skel] = red
             proc.stdin.write(np.ascontiguousarray(frame).tobytes())
     finally:
         close_ffmpeg_writer(proc)
@@ -14330,16 +14010,12 @@ def write_low_quality_overlay_video(
     mask_u8: np.ndarray,
     out_path: Path,
     fps: float,
-    skeleton_u8: Optional[np.ndarray] = None,
     show_progress: bool = True,
 ) -> Path:
     t_dim, h_dim, w_dim = volume_gray.shape
     assert mask_u8.shape == (t_dim, h_dim, w_dim)
-    if skeleton_u8 is not None:
-        assert skeleton_u8.shape == (t_dim, h_dim, w_dim)
     proc = ffmpeg_h264_rgb_writer(out_path, int(w_dim), int(h_dim), float(fps))
     blue = np.array([0, 0, 255], dtype=np.uint8)
-    red = np.array([255, 0, 0], dtype=np.uint8)
     try:
         assert proc.stdin is not None
         for t in tqdm(range(int(t_dim)), desc=f'Writing low-quality overlay ({out_path.name})', disable=not show_progress):
@@ -14347,10 +14023,6 @@ def write_low_quality_overlay_video(
             m = np.asarray(mask_u8[int(t)], dtype=bool)
             if np.any(m):
                 frame[m] = ((frame[m].astype(np.uint16) + blue.astype(np.uint16)) // 2).astype(np.uint8)
-            if skeleton_u8 is not None:
-                skel = skeleton_overlay_mask_2d(np.asarray(skeleton_u8[int(t)]), int(h_dim), int(w_dim))
-                if np.any(skel):
-                    frame[skel] = red
             proc.stdin.write(np.ascontiguousarray(frame).tobytes())
     finally:
         close_ffmpeg_writer(proc)
@@ -14403,7 +14075,6 @@ def save_single_low_quality_output(
     volume_gray: np.ndarray,
     mask_u8: np.ndarray,
     spec: LowQualityDownbinSpec,
-    skeleton_u8: Optional[np.ndarray] = None,
     out_dir: Path,
     stem: str,
     fps: float,
@@ -14446,17 +14117,6 @@ def save_single_low_quality_output(
         prefer_memory=True,
         desc=f'Low-quality mask resize {spec.token}',
     )
-    skeleton_lq: Optional[np.ndarray] = None
-    if skeleton_u8 is not None:
-        skeleton_lq = resize_binary_mask_volume_to_shape(
-            skeleton_u8,
-            (out_t, out_h, out_w),
-            Path(temp_dir) / 'low_quality' / spec.token / 'skeleton.u8.dat',
-            workers=int(workers),
-            prefer_memory=True,
-            desc=f'Low-quality skeleton resize {spec.token}',
-        )
-
     result_paths: Dict[str, Path] = {'low_quality_dir': low_root}
     try:
         overlay_path = spec_dir / f'{stem}_Overlay_LowQuality_{spec.token}.mp4'
@@ -14464,7 +14124,7 @@ def save_single_low_quality_output(
         nrrd_path = spec_dir / f'{stem}_LowQuality_{spec.token}.nrrd'
 
         def _write_lq_overlay() -> Path:
-            return write_low_quality_overlay_video(gray_lq, mask_lq, overlay_path, fps_lq, skeleton_u8=skeleton_lq, show_progress=show_progress)
+            return write_low_quality_overlay_video(gray_lq, mask_lq, overlay_path, fps_lq, show_progress=show_progress)
 
         def _write_lq_binary() -> Path:
             return write_low_quality_binary_video(mask_lq, binary_path, fps_lq, show_progress=show_progress)
@@ -14507,15 +14167,12 @@ def save_single_low_quality_output(
             close_memmap_array(gray_lq)
         if mask_lq is not mask_u8:
             close_memmap_array(mask_lq)
-        if skeleton_lq is not None and skeleton_lq is not skeleton_u8:
-            close_memmap_array(skeleton_lq)
 
 
 def save_low_quality_outputs(
     *,
     volume_gray: np.ndarray,
     mask_u8: np.ndarray,
-    skeleton_u8: Optional[np.ndarray] = None,
     out_dir: Path,
     stem: str,
     fps: float,
@@ -14543,7 +14200,6 @@ def save_low_quality_outputs(
             result_paths.update(save_single_low_quality_output(
                 volume_gray=volume_gray,
                 mask_u8=mask_u8,
-                skeleton_u8=skeleton_u8,
                 out_dir=out_dir,
                 stem=stem,
                 fps=float(fps),
@@ -14562,7 +14218,6 @@ def save_low_quality_outputs(
                 save_single_low_quality_output,
                 volume_gray=volume_gray,
                 mask_u8=mask_u8,
-                skeleton_u8=skeleton_u8,
                 out_dir=out_dir,
                 stem=stem,
                 fps=float(fps),
@@ -14584,7 +14239,6 @@ def collect_low_quality_output_futures(
     *,
     volume_gray: np.ndarray,
     mask_u8: np.ndarray,
-    skeleton_u8: Optional[np.ndarray] = None,
     out_dir: Path,
     stem: str,
     fps: float,
@@ -14607,7 +14261,6 @@ def collect_low_quality_output_futures(
             save_single_low_quality_output,
             volume_gray=volume_gray,
             mask_u8=mask_u8,
-            skeleton_u8=skeleton_u8,
             out_dir=out_dir,
             stem=stem,
             fps=float(fps),
@@ -14711,7 +14364,6 @@ def collect_pipeline_output_futures(
     *,
     volume_rgb: np.memmap,
     mask_u8: np.ndarray,
-    skeleton_u8: Optional[np.ndarray] = None,
     out_dir: Path,
     stem: str,
     fps: float,
@@ -14736,7 +14388,6 @@ def collect_pipeline_output_futures(
         mask_u8,
         overlay_path,
         fps,
-        skeleton_u8=skeleton_u8,
         show_progress=show_progress,
     ))
     result_paths["overlay"] = overlay_path
@@ -14783,7 +14434,6 @@ def collect_multiplanar_output_futures(
     *,
     volume_rgb: np.memmap,
     mask_u8: np.ndarray,
-    skeleton_u8: Optional[np.ndarray] = None,
     out_dir: Path,
     stem: str,
     fps: float,
@@ -14828,7 +14478,6 @@ def collect_multiplanar_output_futures(
             view,
             overlay_path,
             fps,
-            skeleton_u8=skeleton_u8,
             show_progress=show_progress,
         ))
         result_paths[f'{view.name}_overlay'] = overlay_path
@@ -15076,6 +14725,26 @@ def main() -> None:
     save_coronal = False
     requested_azimuth_angle = None if args.azimuth_angle is None else float(args.azimuth_angle)
 
+    # v13.0.0 multi-GPU scheduling + retina-mask-processor resolution.
+    inference_devices = parse_device_list(str(args.device))
+    gpu_device_count = len([d for d in inference_devices if str(d).startswith('cuda')])
+    multi_gpu_active = bool(gpu_device_count > 1)
+    retina_processor, retina_processor_reason = resolve_retina_mask_processor(
+        args.retina_mask_processor, inference_devices
+    )
+    set_retina_mask_processor(retina_processor)
+    print(
+        f'Inference devices: {inference_devices} '
+        f'(multi-GPU scheduling {"active" if multi_gpu_active else "inactive"}); '
+        f'retina mask processor: {retina_processor} ({retina_processor_reason}).'
+    )
+    if multi_gpu_active and os.environ.get('YOLO_TTA_GPU_INPUT_STAGING') is None and os.environ.get('YOLO_TTA_GPU_PREFETCH') is None:
+        # v13.0.0: eager/per-source CUDA input staging targets a single fixed device. With more
+        # than one GPU a ready prediction source may be dispatched to whichever GPU is free, so
+        # default input staging off to avoid cross-device staging; each GPU's predict() still
+        # moves CPU-rendered frames to its own device. Set YOLO_TTA_GPU_INPUT_STAGING=1 to force.
+        os.environ['YOLO_TTA_GPU_INPUT_STAGING'] = '0'
+
     if args.min_conf > 0 and args.min_conf < args.conf:
         raise ValueError('--min_conf must be equal to or greater than --conf')
     if int(args.interpolate) < 0:
@@ -15177,9 +14846,9 @@ def main() -> None:
     if should_resize_to_processing_cube(input_processing_shape, legacy_cube_shape):
         processing_shape = legacy_cube_shape
         print(
-            'v12.2.15 processing geometry: legacy approximate-cube resize enabled. '
+            'v13.0.0 processing geometry: approximately-cubic working volume (default). '
             f'input shape (t,Y,X)=({input_T},{input_H},{input_W}) -> '
-            f'processing shape (t,Y,X)={processing_shape}'
+            f'processing shape (t,Y,X)={processing_shape} (within 5% of the longest source axis).'
         )
         if preprocess_streaming_active:
             volume_rgb = resize_volume_to_processing_cube_gray8_streaming(
@@ -15201,12 +14870,12 @@ def main() -> None:
         processing_shape = input_processing_shape
         volume_rgb = input_volume_rgb
         if processing_mode == 'cube' and legacy_cube_shape == input_processing_shape:
-            print(f'v12.2.15 processing geometry: legacy cube mode requested, but input is already within 5% cube tolerance ({processing_shape}).')
+            print(f'v13.0.0 processing geometry: approximately-cubic (default), input already within 5% cube tolerance ({processing_shape}).')
         else:
             print(
-                'v12.2.15 processing geometry: native decoded volume, no approximate-cube resize. '
-                f'input/processing shape (t,Y,X)={processing_shape}; legacy cube target would have been {legacy_cube_shape}. '
-                'Set YOLO_TTA_PROCESSING_VOLUME_MODE=cube or YOLO_TTA_FORCE_PROCESSING_CUBE=1 to restore the v12.2.0 cube path.'
+                'v13.0.0 processing geometry: native decoded volume (YOLO_TTA_PROCESSING_VOLUME_MODE=native), no cube resize. '
+                f'input/processing shape (t,Y,X)={processing_shape}; approximately-cubic target would have been {legacy_cube_shape}. '
+                'Unset YOLO_TTA_PROCESSING_VOLUME_MODE to use the default approximately-cubic working geometry.'
             )
 
     T, H, W = (int(processing_shape[0]), int(processing_shape[1]), int(processing_shape[2]))
@@ -15269,7 +14938,7 @@ def main() -> None:
         )
     if bool(single_angle_streaming_cleanup_active):
         spec_notes.append(
-            'v12.2.8 single-angle streaming cleanup is active: exactly one --angle value was supplied, so YOLO result slices are confidence-filtered, 2D-hole-filled, and view-native min_radius-filtered as they stream in; only Sagittal/Coronal transverse-plane min_radius cleanup waits for the completed view volume before interpolation.'
+            'v12.2.8 single-angle streaming cleanup is active: exactly one --angle value was supplied, so YOLO result slices are confidence-filtered and view-native min_radius-filtered as they stream in. v13.0.0 (bug fix) defers 2D hole filling to a final per-view volume pass (after --min_conf and all --min_radius), and Sagittal/Coronal transverse-plane min_radius cleanup also waits for the completed view volume, before interpolation.'
         )
     else:
         spec_notes.append(
@@ -15335,14 +15004,32 @@ def main() -> None:
         'Transient NRRD projection, before-pass, and bridge-delta workspaces prefer anonymous RAM and fall back to disk only when the workspace budget requires it. '
         f'Legacy single-volume NRRD writing is retained only for deprecated internal callers without layer refs; space={NRRD_SPACE}.'
     )
+    spec_notes.append(
+        f'v13.0.0 inference devices: {inference_devices} '
+        f'({"multi-GPU dynamic dispatch" if multi_gpu_active else "single device"}). '
+        + (
+            'Multi-GPU scheduling loads one model replica per GPU and dispatches each inference-ready '
+            'full-frame/tile prediction volume to whichever GPU slot is free, so no GPU idles while '
+            'inference-ready work exists. Concurrent same-view accumulation is per-slice-locked. '
+            'CUDA input staging is disabled by default under multi-GPU to avoid binding a source to one device.'
+            if multi_gpu_active else
+            'Single-device inference uses the legacy serial GPU dispatch path.'
+        )
+    )
     if cpu_retina_masks_enabled():
         spec_notes.append(
-            'Deferred CPU retina-mask reconstruction active: Ultralytics native mask upsampling is bypassed on GPU; '
-            'compact mask protos/coefficients/boxes are copied and bbox-ROI retina masks are reconstructed in prediction-result workers, '
-            'so the scheduler/model-stream thread does not perform per-slice full-mask CPU copies.'
+            f'Retina mask processor: cpu ({retina_processor_reason}). Deferred CPU retina-mask reconstruction active: '
+            'retina_masks=False is passed to YOLO; compact mask protos/coefficients/boxes/scores are moved to CPU and '
+            'bbox-ROI retina-quality masks are reconstructed on the CPU by bilinear-upsampling mask logits within each '
+            'detection ROI, thresholding at zero, and dropping empty masks, so the scheduler/model-stream thread does '
+            'not perform per-slice full-mask GPU copies.'
         )
     else:
-        spec_notes.append('Using Ultralytics native retina_masks=True compatibility mode because YOLO_TTA_CPU_RETINA_MASKS=0 or the CPU-retina patch was unavailable.')
+        spec_notes.append(
+            f'Retina mask processor: gpu ({retina_processor_reason}). Ultralytics native retina_masks=True resolves '
+            'full-resolution masks on the GPU, freeing CPU cores for view creation/postprocessing (preferred for '
+            'multi-GPU, CPU-bound configurations).'
+        )
     if bool(troubleshooting_outputs_enabled):
         spec_notes.append(
             '--troubleshooting active: writing FFV1 MKV overlays for each active full-frame native view and each available consolidated tiled prediction set; '
@@ -15364,17 +15051,16 @@ def main() -> None:
         else:
             spec_notes.append('Gaussian smoothing disabled because the resolved sigma or pass count was not positive.')
     spec_notes.append(
-        'Interpolation endpoint discovery uses the v12.2.0 per-slice connected-component scan backed by cached per-slice component tables. '
-        'Projection candidate search runs on source-component local SDF crops, and variable-cost seed planning is consumed through a bounded unordered completion queue; '
-        'skeletonization is never used for interpolation and runs only when --save_skeleton is requested. '
-        'Optional skeleton output uses slice-parallel pore preconditioning plus component/chunk based 3D Lee thinning; '
-        'overlay videos draw the skeleton as fully opaque red on top of the 50% blue mask overlay.'
+        'Interpolation endpoint discovery uses the per-slice connected-component scan backed by cached per-slice component tables. '
+        'Projection candidate search runs on source-component local SDF crops, and variable-cost seed planning is consumed through a bounded unordered completion queue. '
+        'v13.0.0 removed optional skeletonization entirely; interpolation never used skeletonization.'
     )
     spec_notes.append(
         f'Processing volume mode={processing_mode}; cube_resize_applied={bool(tuple(int(x) for x in processing_shape) != tuple(int(x) for x in input_processing_shape))}. '
-        'v12.2.15 defaults to native decoded geometry to avoid whole-volume interpolation loss and CPU cost. '
-        f'Legacy cube target would be {tuple(int(x) for x in legacy_cube_shape)}; set YOLO_TTA_PROCESSING_VOLUME_MODE=cube or YOLO_TTA_FORCE_PROCESSING_CUBE=1 to restore it. '
-        f'If legacy cube resize is enabled, T-axis backend={_cube_t_axis_resize_backend()} and YOLO_TTA_CUBE_T_RESIZE_BACKEND=slice_exact restores the previous endpoint-aligned per-slice interpolation path.'
+        'v13.0.0 (bug fix) defaults to approximately-cubic virtual working geometry so the working dimensions '
+        'stay within 5% of the longest source axis (spec item 2); the t/Transverse stacking axis is no longer left short. '
+        f'Approximately-cubic target = {tuple(int(x) for x in legacy_cube_shape)}. Set YOLO_TTA_PROCESSING_VOLUME_MODE=native to opt back into v12.2.15 decoded-native geometry for regression. '
+        f'Cube T-axis backend={_cube_t_axis_resize_backend()} (YOLO_TTA_CUBE_T_RESIZE_BACKEND=slice_exact restores the endpoint-aligned per-slice interpolation path).'
     )
     if transverse_inference_disabled:
         note = (
@@ -15395,19 +15081,56 @@ def main() -> None:
     else:
         print(f'Loading model: {model_name} ({model_paths[0]})')
         yolo_model = load_ultralytics_model(model_paths[0], task='segment')
-    # v12.2.0 has no multiple-model inference. A single-item list is retained only to minimize churn in
-    # scheduling structures keyed by model stem.
+    # v12.2.0/v13.0.0 has no multiple-model inference. A single-item list is retained only to
+    # minimize churn in scheduling structures keyed by model stem. yolo_by_model_name still maps the
+    # model stem to the primary replica (used by the single-GPU dispatch path).
     yolo_models: List[Tuple[str, object]] = [(model_name, yolo_model)]
     yolo_by_model_name: Dict[str, object] = {model_name: yolo_model}
 
+    # pred_cfg describes the primary device; per-slot cfgs below pin each replica to its own device.
     pred_cfg = PredictConfig(
         imgsz=args.imgsz,
         conf=args.conf,
-        device=str(args.device),
+        device=str(inference_devices[0]),
         half=bool(args.half),
         int8=bool(args.int8),
         batch=max(1, int(args.batch)),
     )
+
+    # v13.0.0 multi-GPU: build one model replica + slot per device. The primary load above provides
+    # the replica for the first device; additional GPUs each get their own independent model
+    # instance so Ultralytics predict() can run concurrently on separate CUDA contexts. CPU and
+    # single-GPU runs keep exactly one replica/slot, and the legacy single-GPU dispatch path is used.
+    gpu_inference_slots: List[GpuInferenceSlot] = []
+    for slot_idx, dev in enumerate(inference_devices):
+        if slot_idx == 0:
+            slot_model = yolo_model
+        else:
+            print(f'Loading model replica {slot_idx} for device {dev}: {model_name} ({model_paths[0]})')
+            slot_model = load_ultralytics_model(model_paths[0], task='segment')
+        slot_cfg = PredictConfig(
+            imgsz=args.imgsz,
+            conf=args.conf,
+            device=str(dev),
+            half=bool(args.half),
+            int8=bool(args.int8),
+            batch=max(1, int(args.batch)),
+        )
+        # Pin each replica to its device up front so concurrent predicts never race a device move.
+        ensure_yolo_ready_for_predict(slot_model, slot_cfg)
+        gpu_inference_slots.append(GpuInferenceSlot(device=str(dev), model=slot_model, cfg=slot_cfg))
+
+    # v13.0.0: Ultralytics monkeypatches are global (class-level). Apply them once on the main
+    # thread now so concurrent multi-GPU predict() calls never race the lazy first-call patching.
+    try:
+        ensure_single_channel_yolo_preprocess_patch()
+    except Exception as _patch_exc:  # pragma: no cover - patch is best-effort
+        print(f'Warning: single-channel preprocess patch could not be pre-applied ({_patch_exc}).')
+    if cpu_retina_masks_enabled():
+        try:
+            ensure_cpu_retina_mask_predictor_patch()
+        except Exception as _patch_exc:  # pragma: no cover - patch is best-effort
+            print(f'Warning: CPU retina predictor patch could not be pre-applied ({_patch_exc}).')
 
 
     worker_budget = int(default_worker_budget())
@@ -16580,6 +16303,182 @@ def main() -> None:
             f'ready_fullframe={len(ready_fullframe)}, ready_tiles={len(ready_tile_infer)}'
         )
 
+    # --------------------------------------------------------------
+    # v13.0.0 multi-GPU inference dispatch (active only when >1 GPU).
+    # Ultralytics does not load-balance across devices, so the scheduler owns it: each ready
+    # prediction volume is dispatched to whichever GPU slot is free; the slot runs predict()+
+    # accumulate on its own model replica/device in a worker thread, and the main thread runs the
+    # post-inference bookkeeping when the future completes. The single-GPU/CPU path is unchanged.
+    # --------------------------------------------------------------
+    gpu_inference_executor: Optional[ThreadPoolExecutor] = None
+    free_gpu_slots: List[GpuInferenceSlot] = []
+    inflight_gpu_futures: Dict[Future, Dict[str, object]] = {}
+    per_gpu_predict_postprocess_workers = max(1, int(predict_postprocess_workers) // max(1, len(gpu_inference_slots)))
+    if multi_gpu_active:
+        gpu_inference_executor = ThreadPoolExecutor(
+            max_workers=len(gpu_inference_slots), thread_name_prefix='gpu-infer'
+        )
+        free_gpu_slots = list(gpu_inference_slots)
+        print(
+            f'Multi-GPU dispatch active across {len(gpu_inference_slots)} device(s): '
+            f'{[s.device for s in gpu_inference_slots]}; per-GPU inference postprocess workers='
+            f'{int(per_gpu_predict_postprocess_workers)} (sync accumulation per slot).'
+        )
+
+    def _run_fullframe_inference_task(slot: GpuInferenceSlot, prediction_ref: PredictionVolumeRef, view: ViewInfo, job: AugJob) -> Dict[str, int]:
+        return predict_in_memory_volume_and_accumulate(
+            model=slot.model,
+            prediction_volume=prediction_ref,
+            num_frames=view.num_slices,
+            out_size=args.imgsz,
+            cfg=slot.cfg,
+            view_union_mm=baseline_union_by_model_view[(model_name, view.name)],
+            view_confmap_mm=baseline_confmap_by_model_view[(model_name, view.name)],
+            M_out_to_native=job.aff.M_out_to_src,
+            native_h=view.src_h,
+            native_w=view.src_w,
+            postprocess_workers=int(per_gpu_predict_postprocess_workers),
+            streaming_cleanup_enabled=bool(single_angle_streaming_cleanup_active),
+            streaming_cleanup_min_conf=float(args.min_conf),
+            streaming_cleanup_min_radius=_view_native_slice_min_radius(view, float(args.min_radius)),
+            slice_locks=baseline_slice_locks_by_model_view.get((str(model_name), str(view.name))),
+        )
+
+    def _run_tile_inference_task(slot: GpuInferenceSlot, prediction_ref: PredictionVolumeRef, view: ViewInfo, tile_job: DenseTileJob, tile_mask_mm: np.ndarray, tile_conf_mm: Optional[np.ndarray]) -> Dict[str, int]:
+        return predict_in_memory_volume_and_accumulate(
+            model=slot.model,
+            prediction_volume=prediction_ref,
+            num_frames=view.num_slices,
+            out_size=int(args.imgsz),
+            cfg=slot.cfg,
+            view_union_mm=tile_mask_mm,
+            view_confmap_mm=tile_conf_mm,
+            M_out_to_native=tile_job.M_out_to_src,
+            native_h=view.src_h,
+            native_w=view.src_w,
+            postprocess_workers=int(per_gpu_predict_postprocess_workers),
+            streaming_cleanup_enabled=bool(single_angle_streaming_cleanup_active),
+            streaming_cleanup_min_conf=float(args.min_conf),
+            streaming_cleanup_min_radius=_view_native_slice_min_radius(view, float(args.min_radius)),
+        )
+
+    def _dispatch_ready_inference_to_free_gpus() -> bool:
+        assert gpu_inference_executor is not None
+        dispatched = False
+        # Full-frame volumes take priority over tiles (Scheduling Notes view priority).
+        while free_gpu_slots and ready_fullframe:
+            view, job, prediction_ref = ready_fullframe.popleft()
+            _ensure_baseline_workspaces(str(model_name), view)
+            slot = free_gpu_slots.pop()
+            print(f"[{slot.device}] Inferencing full-frame in-memory volume: {view.name}/{job.aug_id}")
+            fut = gpu_inference_executor.submit(_run_fullframe_inference_task, slot, prediction_ref, view, job)
+            inflight_gpu_futures[fut] = {
+                'kind': 'fullframe', 'slot': slot, 'view': view, 'job': job,
+                'prediction_ref': prediction_ref,
+            }
+            dispatched = True
+        while free_gpu_slots and ready_tile_infer:
+            tile_model_name, view, tile_job, prediction_ref = ready_tile_infer.popleft()
+            ready_key = (str(tile_model_name), str(view.name), str(tile_job.tile_id))
+            if ready_key in tile_inference_done:
+                close_prediction_volume_ref(prediction_ref, keep_temp=bool(keep_temp_artifacts))
+                continue
+            tile_shape = (int(view.num_slices), int(view.src_h), int(view.src_w))
+            tile_mask_path = temp_dir / 'tile_volumes' / tile_model_name / view.name / f'{tile_job.tile_id}.u8.dat'
+            tile_conf_path = temp_dir / 'tile_volumes' / tile_model_name / view.name / f'{tile_job.tile_id}.confmap.u8.dat'
+            tile_mask_path.parent.mkdir(parents=True, exist_ok=True)
+            tile_mask_mm = allocate_workspace_array(
+                shape=tile_shape, dtype=np.uint8, path=tile_mask_path,
+                desc=f'{tile_model_name}/{view.name}/{tile_job.tile_id} raw tile volume',
+                prefer_memory=True,
+            )
+            if float(args.min_conf) > 0.0:
+                tile_conf_mm = allocate_workspace_array(
+                    shape=tile_shape, dtype=np.uint8, path=tile_conf_path,
+                    desc=f'{tile_model_name}/{view.name}/{tile_job.tile_id} raw tile confidence workspace',
+                    prefer_memory=True,
+                )
+                tile_conf_store_path: Optional[Path] = tile_conf_path
+            else:
+                tile_conf_mm = None
+                tile_conf_store_path = None
+            slot = free_gpu_slots.pop()
+            print(f"[{slot.device}] Inferencing tile in-memory volume: {tile_model_name}/{view.name}/{tile_job.tile_id}")
+            fut = gpu_inference_executor.submit(
+                _run_tile_inference_task, slot, prediction_ref, view, tile_job, tile_mask_mm, tile_conf_mm
+            )
+            inflight_gpu_futures[fut] = {
+                'kind': 'tile', 'slot': slot, 'model_name': str(tile_model_name), 'view': view,
+                'tile_job': tile_job, 'ready_key': ready_key,
+                'tile_mask_mm': tile_mask_mm, 'tile_conf_mm': tile_conf_mm,
+                'tile_mask_path': tile_mask_path, 'tile_conf_path': tile_conf_store_path,
+                'prediction_ref': prediction_ref,
+            }
+            dispatched = True
+        return dispatched
+
+    def _drain_completed_gpu_inference_futures() -> None:
+        for fut in [f for f in list(inflight_gpu_futures.keys()) if f.done()]:
+            ctx = inflight_gpu_futures.pop(fut)
+            free_gpu_slots.append(ctx['slot'])  # type: ignore[arg-type]
+            prediction_ref = ctx['prediction_ref']
+            try:
+                pred_stats = fut.result()
+            finally:
+                close_prediction_volume_ref(prediction_ref, keep_temp=bool(keep_temp_artifacts))
+                _pump_prediction_volume_build_queue()
+            view = ctx['view']
+            view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(pred_stats.get('prediction_count', 0))
+            if str(ctx['kind']) == 'fullframe':
+                remaining_key = (str(model_name), str(view.name))
+                fullframe_remaining[remaining_key] = int(fullframe_remaining.get(remaining_key, 0)) - 1
+                if int(fullframe_remaining.get(remaining_key, 0)) == 0:
+                    _submit_view_prepare(str(model_name), view)
+                continue
+            tile_model_name = str(ctx['model_name'])
+            tile_job = ctx['tile_job']
+            tile_mask_mm = ctx['tile_mask_mm']
+            tile_conf_mm = ctx['tile_conf_mm']
+            tile_mask_path = ctx['tile_mask_path']
+            tile_conf_store_path = ctx['tile_conf_path']
+            tile_inference_done.add(ctx['ready_key'])  # type: ignore[arg-type]
+            if int(pred_stats.get('frames_with_predictions', 0)) <= 0:
+                close_memmap_array(tile_mask_mm)
+                close_memmap_array(tile_conf_mm)
+                if not keep_temp_artifacts:
+                    try:
+                        tile_mask_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    if tile_conf_store_path is not None:
+                        try:
+                            tile_conf_store_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                _mark_tile_staged(tile_model_name, str(view.name), str(tile_job.config_id), str(tile_job.tile_id))
+                continue
+            task = TilePostprocessTask(
+                model_name=tile_model_name,
+                view_name=str(view.name),
+                config_id=str(tile_job.config_id),
+                tile_id=str(tile_job.tile_id),
+                tile_mask_mm=tile_mask_mm,
+                tile_confmap_mm=tile_conf_mm,
+                tile_mask_path=tile_mask_path,
+                tile_confmap_path=tile_conf_store_path,
+                precleaned_slice_cleanup=bool(single_angle_streaming_cleanup_active),
+            )
+            tfut = tile_postprocess_executor.submit(
+                postprocess_tile_volume_after_inference,
+                task,
+                view=view,
+                min_conf=float(args.min_conf),
+                min_radius=float(args.min_radius),
+                keep_temp=bool(keep_temp_artifacts),
+                slice_workers=int(tile_slice_postprocess_workers),
+            )
+            tile_cleanup_futures[tfut] = (tile_model_name, str(view.name), str(tile_job.config_id), str(tile_job.tile_id))
+
     try:
         _pump_prediction_volume_build_queue()
         while True:
@@ -16589,7 +16488,12 @@ def main() -> None:
             _pump_prediction_volume_build_queue()
             _warmup_ready_prediction_sources()
 
-            if ready_fullframe:
+            if multi_gpu_active:
+                _drain_completed_gpu_inference_futures()
+                if _dispatch_ready_inference_to_free_gpus():
+                    continue
+
+            if (not multi_gpu_active) and ready_fullframe:
                 view, job, prediction_ref = ready_fullframe.popleft()
                 print(f"Inferencing full-frame in-memory volume: {view.name}/{job.aug_id}")
                 try:
@@ -16651,7 +16555,7 @@ def main() -> None:
                     _pump_prediction_volume_build_queue()
                 continue
 
-            if ready_tile_infer:
+            if (not multi_gpu_active) and ready_tile_infer:
                 model_name, view, tile_job, prediction_ref = ready_tile_infer.popleft()
                 ready_key = (str(model_name), str(view.name), str(tile_job.tile_id))
                 if ready_key in tile_inference_done:
@@ -16785,6 +16689,8 @@ def main() -> None:
             waitables.extend(list(tile_finalize_futures.keys()))
             waitables.extend(list(tile_config_gate_futures.keys()))
             waitables.extend(list(tile_consolidation_futures.keys()))
+            if multi_gpu_active:
+                waitables.extend(list(inflight_gpu_futures.keys()))
             if not waitables:
                 _flush_ready_postprocessed_tiles()
                 _pump_prediction_volume_build_queue()
@@ -16792,6 +16698,7 @@ def main() -> None:
                     not pending_prediction_build_jobs and
                     not pending_prediction_volume_futures and
                     not prediction_accumulation_futures and
+                    not inflight_gpu_futures and
                     not ready_fullframe and
                     not ready_tile_infer and
                     not tile_finalize_futures and
@@ -16806,6 +16713,8 @@ def main() -> None:
             wait(waitables, return_when=FIRST_COMPLETED)
 
     finally:
+        if gpu_inference_executor is not None:
+            gpu_inference_executor.shutdown(wait=True)
         prediction_volume_executor.shutdown(wait=True)
         prediction_join_executor.shutdown(wait=True)
         prediction_result_executor.shutdown(wait=True)
@@ -16966,34 +16875,6 @@ def main() -> None:
             workers=slice_postprocess_workers,
         )
 
-    skeleton_processing_mm: Optional[np.ndarray] = None
-    skeleton_output_mm: Optional[np.ndarray] = None
-    skeleton_path: Optional[Path] = None
-    if bool(args.save_skeleton):
-        print('\n=== Computing optional skeleton output ===')
-        skeleton_processing_mm = compute_skeleton_volume_to_workspace(
-            final_union_mm,
-            temp_dir / 'skeleton' / 'final_skeleton_processing_geometry.u8.dat',
-            temp_dir=temp_dir,
-            workers=int(slice_postprocess_workers),
-            keep_temp=bool(keep_temp_artifacts),
-            prefer_memory=True,
-        )
-        if bool(nrrd_layers_needed):
-            skeleton_ref = materialize_nrrd_global_layer(
-                skeleton_processing_mm,
-                model_name=str(model_name),
-                source='global',
-                mask_kind='skeleton',
-                pass_index=0,
-                stage='skeleton_after_postprocessing',
-                description='Optional skeleton layer computed after final postprocessing and before restoration to native input geometry. Interpolation did not use skeletonization.',
-                temp_dir=temp_dir,
-                workers=int(slice_postprocess_workers),
-            )
-            if skeleton_ref is not None:
-                nrrd_layer_refs.append(skeleton_ref)
-
     final_output_mask_mm = final_union_mm
     output_volume_rgb = input_volume_rgb
     output_T, output_H, output_W = int(input_T), int(input_H), int(input_W)
@@ -17008,24 +16889,6 @@ def main() -> None:
         )
     final_output_volume_for_low_quality = output_volume_rgb
     final_paths: Dict[str, Path] = {}
-
-    if bool(args.save_skeleton) and skeleton_processing_mm is not None:
-        if (int(T), int(H), int(W)) != (output_T, output_H, output_W):
-            skeleton_output_mm = restore_mask_volume_to_original_shape(
-                skeleton_processing_mm,
-                (output_T, output_H, output_W),
-                temp_dir / 'skeleton' / 'final_skeleton_original_geometry.u8.dat',
-                workers=int(slice_postprocess_workers),
-                prefer_memory=True,
-            )
-        else:
-            skeleton_output_mm = skeleton_processing_mm
-        if not bool(args.save_nrrd):
-            print('\n=== Writing skeleton-only NRRD ===')
-            skeleton_path = out_dir / f'{input_path.stem}_Skeleton.nrrd'
-            write_nrrd(skeleton_output_mm, skeleton_path)
-            final_paths['skeleton_nrrd'] = skeleton_path
-
 
     if bool(troubleshooting_outputs_enabled):
         print('\n=== Scheduling v12.2.0 troubleshooting overlays ===')
@@ -17059,7 +16922,6 @@ def main() -> None:
         output_manager.executor,
         volume_rgb=output_volume_rgb,
         mask_u8=final_output_mask_mm,
-        skeleton_u8=skeleton_output_mm if bool(args.save_skeleton) else None,
         out_dir=out_dir,
         stem=input_path.stem,
         fps=fps,
@@ -17078,7 +16940,6 @@ def main() -> None:
             output_manager.executor,
             volume_rgb=output_volume_rgb,
             mask_u8=final_output_mask_mm,
-            skeleton_u8=skeleton_output_mm if bool(args.save_skeleton) else None,
             out_dir=out_dir,
             stem=input_path.stem,
             fps=fps,
@@ -17106,7 +16967,6 @@ def main() -> None:
             output_manager.executor,
             volume_gray=final_output_volume_for_low_quality,
             mask_u8=final_output_mask_mm,
-            skeleton_u8=skeleton_output_mm if bool(args.save_skeleton) else None,
             out_dir=out_dir,
             stem=input_path.stem,
             fps=fps,
@@ -17193,10 +17053,6 @@ def main() -> None:
         spec_notes=spec_notes,
     )
 
-    if skeleton_output_mm is not None and skeleton_output_mm is not skeleton_processing_mm:
-        close_memmap_array(skeleton_output_mm)
-    if skeleton_processing_mm is not None:
-        close_memmap_array(skeleton_processing_mm)
     if final_output_mask_mm is not final_union_mm:
         close_memmap_array(final_output_mask_mm)
     close_memmap_array(final_union_mm)
