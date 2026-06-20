@@ -14,10 +14,11 @@ rework plus the v12.2.1-v12.2.14 performance patches, with the following v13.0.0
     the previous --min_conf -> hole fill -> --min_radius order.
   - v13.0.0 removes optional skeletonization entirely: the --save_skeleton feature and all centerline / 3D
     Lee-thinning code paths are deleted. Interpolation never used skeletonization.
-  - v13.0.0 adds multi-GPU inference scheduling. --device accepts multiple CUDA indices (e.g. 0,1,2,3); one
-    YOLO model replica is loaded per GPU and ready prediction volumes are dynamically dispatched to whichever
-    GPU is free, so no GPU idles while inference-ready work exists. Ultralytics does not load-balance across
-    devices, so the pipeline owns the scheduling.
+  - v13.0.0 adds multi-GPU inference scheduling. --device accepts multiple CUDA indices (e.g. 0,1,2,3) and
+    runs one worker PROCESS per GPU (each pinned via CUDA_VISIBLE_DEVICES, loading its own model replica),
+    pulling inference-ready prediction volumes from a shared queue so every GPU stays busy. Process-per-GPU
+    avoids the CPython GIL serialization that makes thread-per-GPU inference no faster than a single GPU;
+    Ultralytics does not load-balance across devices, so the pipeline owns the scheduling.
   - v13.0.0 adds --retina_mask_processor {cpu,gpu}: CPU retina reconstruction is the single-GPU default;
     enabling more than one GPU implicitly switches to GPU-side retina masks (explicitly overridable);
     --device cpu forces CPU and overrides any explicit value.
@@ -4772,19 +4773,6 @@ class PredictConfig:
     batch: int = 1
 
 
-@dataclass
-class GpuInferenceSlot:
-    """v13.0.0: one GPU worker slot holding a model replica pinned to a single device.
-
-    Multi-GPU scheduling owns its own load balancing because Ultralytics does not distribute
-    work across devices. The main-thread scheduler dispatches each ready prediction volume to a
-    free slot; the slot runs predict()+accumulate on its own model/device in a worker thread.
-    """
-    device: str
-    model: object
-    cfg: PredictConfig
-
-
 def async_predict_postprocess_enabled() -> bool:
     """Return True when single-angle prediction CPU tails may run behind the GPU."""
     return _env_flag('YOLO_TTA_ASYNC_PREDICT_POSTPROCESS', True)
@@ -6430,6 +6418,233 @@ def cleanup_view_volume_after_prediction_inplace(
     flush_array(mask_mm)
     if confmap_mm is not None:
         flush_array(confmap_mm)
+
+
+# --------------------------
+# v13.0.0 process-per-GPU multi-GPU inference workers
+# --------------------------
+# Thread-per-GPU inference does not scale in CPython: Ultralytics' per-batch Python work
+# (NMS, mask/Results construction, retina-mask handling) holds the GIL, so multiple GPU
+# threads serialize down to roughly single-GPU throughput. v13.0.0 therefore drives each GPU
+# from its own worker PROCESS (separate interpreter, no shared GIL, independent CUDA context).
+# Workers render + predict + accumulate one prediction volume at a time from a shared task
+# queue and write the per-volume native-space result to a file-backed memmap; the main process
+# unions those results into the per-view union and runs all postprocessing/interpolation/output.
+
+
+def open_existing_gray_memmap(path: object, shape: Sequence[int], dtype: object = np.uint8, mode: str = 'r') -> np.memmap:
+    return np.memmap(Path(path), dtype=np.dtype(dtype), mode=str(mode), shape=tuple(int(x) for x in shape))
+
+
+def union_conf_volume_into_volume_inplace(
+    dst_mask_mm: np.ndarray,
+    dst_conf_mm: Optional[np.ndarray],
+    src_mask_mm: np.ndarray,
+    src_conf_mm: Optional[np.ndarray],
+    *,
+    workers: int = 1,
+    desc: str = 'Union view-volume contributions',
+) -> None:
+    """Union one prediction-volume result into the per-view union.
+
+    When confidence maps are present (``--min_conf`` > 0) this performs a per-pixel
+    maximum-confidence union (the surviving pixel keeps the higher confidence), matching the
+    in-thread accumulation semantics. Otherwise it is a plain binary OR.
+    """
+    num_slices = int(dst_mask_mm.shape[0]) if int(dst_mask_mm.ndim) > 0 else 0
+    if num_slices <= 0:
+        return
+    use_conf = bool(dst_conf_mm is not None and src_conf_mm is not None)
+
+    def _merge_slice(idx: int) -> None:
+        i = int(idx)
+        src_mask = np.asarray(src_mask_mm[i], dtype=np.uint8)
+        if not use_conf:
+            dst_mask_mm[i, :, :] |= src_mask
+            return
+        dst_mask = np.asarray(dst_mask_mm[i], dtype=np.uint8)
+        dst_conf = np.asarray(dst_conf_mm[i], dtype=np.uint8)
+        src_conf = np.asarray(src_conf_mm[i], dtype=np.uint8)
+        # A source pixel wins where it is foreground and strictly more confident than the
+        # current destination (ties keep the existing pixel, matching first-writer-wins).
+        take = (src_mask > 0) & (src_conf > dst_conf)
+        if np.any(take):
+            dst_mask = np.where(take, src_mask, dst_mask)
+            dst_conf = np.where(take, src_conf, dst_conf)
+        # Foreground from the source that lands where the destination is empty is also unioned.
+        add = (src_mask > 0) & (dst_mask == 0)
+        if np.any(add):
+            dst_mask = np.where(add, src_mask, dst_mask)
+            dst_conf = np.where(add, src_conf, dst_conf)
+        dst_mask_mm[i, :, :] = dst_mask
+        dst_conf_mm[i, :, :] = dst_conf
+
+    parallel_for_indices(
+        num_slices,
+        _merge_slice,
+        max_workers=choose_slice_parallel_workers(int(workers), num_slices),
+        desc=desc,
+        show_progress=False,
+    )
+    flush_array(dst_mask_mm)
+    if dst_conf_mm is not None:
+        flush_array(dst_conf_mm)
+
+
+def _worker_render_callable(volume_rgb: np.ndarray, view: ViewInfo, job: object, kind: str) -> Callable[[int], np.ndarray]:
+    if str(kind) == 'tile':
+        def _render_tile(idx: int) -> np.ndarray:
+            return render_dense_tile_frame_for_job(
+                volume_rgb=volume_rgb, view=view, tile_job=job, frame_idx=int(idx), view_frames=None,
+            )
+        return _render_tile
+
+    def _render_full(idx: int) -> np.ndarray:
+        return render_fullframe_frame_for_job(
+            volume_rgb=volume_rgb, view=view, job=job, frame_idx=int(idx), view_frames=None,
+        )
+    return _render_full
+
+
+def run_prediction_volume_in_worker(model: object, cfg: 'PredictConfig', task: Dict[str, object]) -> Dict[str, int]:
+    """Render + predict + accumulate one prediction volume in a GPU worker process.
+
+    Writes the per-volume native-view-space mask (and confidence map, if --min_conf > 0) to the
+    file-backed result memmaps named in the task, then returns small inference stats.
+    """
+    view: ViewInfo = task['view']  # type: ignore[assignment]
+    job = task['job']
+    kind = str(task['kind'])
+    num_frames = int(view.num_slices)
+    out_size = int(task['out_size'])
+    result_shape = (int(view.num_slices), int(view.src_h), int(view.src_w))
+
+    source_mm: Optional[np.memmap] = None
+    result_mask: Optional[np.memmap] = None
+    result_conf: Optional[np.memmap] = None
+    source: Optional[StreamingYoloVolumeSource] = None
+    try:
+        source_mm = open_existing_gray_memmap(
+            task['source_volume_path'], task['source_shape'], task.get('source_dtype', 'uint8'), mode='r',
+        )
+        result_mask = np.memmap(Path(str(task['result_mask_path'])), dtype=np.uint8, mode='w+', shape=result_shape)
+        result_mask[:] = 0
+        if task.get('result_conf_path'):
+            result_conf = np.memmap(Path(str(task['result_conf_path'])), dtype=np.uint8, mode='w+', shape=result_shape)
+            result_conf[:] = 0
+
+        source = StreamingYoloVolumeSource(
+            _worker_render_callable(source_mm, view, job, kind),
+            num_frames=num_frames,
+            name=f"worker-{kind}-{view.name}-{task['job_id']}",
+            batch_size=max(1, int(cfg.batch)),
+            out_size=out_size,
+            render_workers=max(1, int(task.get('render_workers', 1))),
+            prefetch_frames=max(1, int(task.get('prefetch_frames', 1))),
+            autostart=True,
+            shared_executor=None,
+        )
+        stats = predict_source_and_accumulate(
+            model,
+            source,
+            source_label=f"{view.name}-{task['job_id']}",
+            num_frames=num_frames,
+            out_size=out_size,
+            cfg=cfg,
+            view_union_mm=result_mask,
+            view_confmap_mm=result_conf,
+            M_out_to_native=np.asarray(task['M_out_to_src'], dtype=np.float32),
+            native_h=int(view.src_h),
+            native_w=int(view.src_w),
+            postprocess_workers=int(task.get('postprocess_workers', 1)),
+            streaming_cleanup_enabled=bool(task.get('streaming_cleanup_enabled', False)),
+            streaming_cleanup_min_conf=float(task.get('streaming_cleanup_min_conf', 0.0)),
+            streaming_cleanup_min_radius=float(task.get('streaming_cleanup_min_radius', 0.0)),
+            slice_locks=None,
+        )
+        if result_mask is not None:
+            flush_array(result_mask)
+        if result_conf is not None:
+            flush_array(result_conf)
+        return {
+            'prediction_count': int(stats.get('prediction_count', 0)),
+            'frames_with_predictions': int(stats.get('frames_with_predictions', 0)),
+        }
+    finally:
+        # Always release the source render threads first, then close every memmap, even when
+        # predict_source_and_accumulate raised, so a persistent worker never leaks fds/mmaps.
+        if source is not None:
+            try:
+                source.close()
+            except Exception:
+                pass
+        for _mm in (result_mask, result_conf, source_mm):
+            if _mm is not None:
+                try:
+                    close_memmap_array(_mm)
+                except Exception:
+                    pass
+
+
+def _gpu_inference_worker_main(
+    gpu_index: int,
+    model_path: str,
+    init_dict: Dict[str, object],
+    task_queue: object,
+    result_queue: object,
+) -> None:
+    """Persistent GPU worker process: pin to one physical GPU, load the model once, serve tasks."""
+    try:
+        # Pin the process to its physical GPU before any CUDA context is created, so the model and
+        # all tensors live on that device and never contend with the other workers' GPUs.
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(int(gpu_index))
+        try:
+            cv2.setNumThreads(max(1, int(init_dict.get('cv2_threads', 1))))
+        except Exception:
+            pass
+        set_retina_mask_processor(str(init_dict.get('retina_processor', 'cpu')))
+        cfg = PredictConfig(
+            imgsz=int(init_dict['imgsz']),
+            conf=float(init_dict['conf']),
+            device='cuda:0',
+            half=bool(init_dict['half']),
+            int8=bool(init_dict['int8']),
+            batch=max(1, int(init_dict['batch'])),
+        )
+        model = load_ultralytics_model(str(model_path), task='segment')
+        ensure_yolo_ready_for_predict(model, cfg)
+        try:
+            ensure_single_channel_yolo_preprocess_patch()
+        except Exception:
+            pass
+        if cpu_retina_masks_enabled():
+            try:
+                ensure_cpu_retina_mask_predictor_patch()
+            except Exception:
+                pass
+        result_queue.put({'type': 'ready', 'gpu_index': int(gpu_index), 'pid': int(os.getpid())})
+    except Exception as exc:  # pragma: no cover - worker init failure surfaced to main
+        import traceback
+        try:
+            result_queue.put({'type': 'fatal', 'gpu_index': int(gpu_index), 'error': repr(exc), 'traceback': traceback.format_exc()})
+        except Exception:
+            pass
+        return
+
+    while True:
+        task = task_queue.get()
+        if task is None:
+            break
+        task_id = int(task['task_id'])
+        try:
+            stats = run_prediction_volume_in_worker(model, cfg, task)
+            result_queue.put({'type': 'result', 'task_id': task_id, 'gpu_index': int(gpu_index), 'ok': True, 'stats': stats})
+        except Exception as exc:  # pragma: no cover - per-task failure surfaced to main
+            import traceback
+            result_queue.put({
+                'type': 'result', 'task_id': task_id, 'gpu_index': int(gpu_index), 'ok': False,
+                'error': repr(exc), 'traceback': traceback.format_exc(),
+            })
 
 
 # --------------------------
@@ -14738,12 +14953,9 @@ def main() -> None:
         f'(multi-GPU scheduling {"active" if multi_gpu_active else "inactive"}); '
         f'retina mask processor: {retina_processor} ({retina_processor_reason}).'
     )
-    if multi_gpu_active and os.environ.get('YOLO_TTA_GPU_INPUT_STAGING') is None and os.environ.get('YOLO_TTA_GPU_PREFETCH') is None:
-        # v13.0.0: eager/per-source CUDA input staging targets a single fixed device. With more
-        # than one GPU a ready prediction source may be dispatched to whichever GPU is free, so
-        # default input staging off to avoid cross-device staging; each GPU's predict() still
-        # moves CPU-rendered frames to its own device. Set YOLO_TTA_GPU_INPUT_STAGING=1 to force.
-        os.environ['YOLO_TTA_GPU_INPUT_STAGING'] = '0'
+    # v13.0.0: under multi-GPU each inference worker is its own process pinned (via
+    # CUDA_VISIBLE_DEVICES) to a single physical GPU exposed as cuda:0, so CUDA input staging is
+    # device-safe per worker and is left at its default. The main process performs no inference.
 
     if args.min_conf > 0 and args.min_conf < args.conf:
         raise ValueError('--min_conf must be equal to or greater than --conf')
@@ -15006,14 +15218,16 @@ def main() -> None:
     )
     spec_notes.append(
         f'v13.0.0 inference devices: {inference_devices} '
-        f'({"multi-GPU dynamic dispatch" if multi_gpu_active else "single device"}). '
+        f'({"multi-GPU process-per-GPU scheduling" if multi_gpu_active else "single device"}). '
         + (
-            'Multi-GPU scheduling loads one model replica per GPU and dispatches each inference-ready '
-            'full-frame/tile prediction volume to whichever GPU slot is free, so no GPU idles while '
-            'inference-ready work exists. Concurrent same-view accumulation is per-slice-locked. '
-            'CUDA input staging is disabled by default under multi-GPU to avoid binding a source to one device.'
+            'Multi-GPU runs one worker PROCESS per GPU (each pinned via CUDA_VISIBLE_DEVICES and loading its '
+            'own model replica), pulling inference-ready full-frame/tile prediction volumes from a shared queue '
+            'so every GPU stays busy while work remains. Processes avoid the CPython GIL serialization that makes '
+            'thread-per-GPU inference no faster than a single GPU. Each worker renders+predicts+accumulates one '
+            'volume into a file-backed per-volume result memmap; the main process unions those results into the '
+            'per-view union (max-confidence) and runs all postprocessing/interpolation/output.'
             if multi_gpu_active else
-            'Single-device inference uses the legacy serial GPU dispatch path.'
+            'Single-device inference uses the in-process serial GPU dispatch path.'
         )
     )
     if cpu_retina_masks_enabled():
@@ -15087,7 +15301,7 @@ def main() -> None:
     yolo_models: List[Tuple[str, object]] = [(model_name, yolo_model)]
     yolo_by_model_name: Dict[str, object] = {model_name: yolo_model}
 
-    # pred_cfg describes the primary device; per-slot cfgs below pin each replica to its own device.
+    # pred_cfg describes the primary device used by the single-GPU/CPU in-process inference path.
     pred_cfg = PredictConfig(
         imgsz=args.imgsz,
         conf=args.conf,
@@ -15097,40 +15311,28 @@ def main() -> None:
         batch=max(1, int(args.batch)),
     )
 
-    # v13.0.0 multi-GPU: build one model replica + slot per device. The primary load above provides
-    # the replica for the first device; additional GPUs each get their own independent model
-    # instance so Ultralytics predict() can run concurrently on separate CUDA contexts. CPU and
-    # single-GPU runs keep exactly one replica/slot, and the legacy single-GPU dispatch path is used.
-    gpu_inference_slots: List[GpuInferenceSlot] = []
-    for slot_idx, dev in enumerate(inference_devices):
-        if slot_idx == 0:
-            slot_model = yolo_model
-        else:
-            print(f'Loading model replica {slot_idx} for device {dev}: {model_name} ({model_paths[0]})')
-            slot_model = load_ultralytics_model(model_paths[0], task='segment')
-        slot_cfg = PredictConfig(
-            imgsz=args.imgsz,
-            conf=args.conf,
-            device=str(dev),
-            half=bool(args.half),
-            int8=bool(args.int8),
-            batch=max(1, int(args.batch)),
-        )
-        # Pin each replica to its device up front so concurrent predicts never race a device move.
-        ensure_yolo_ready_for_predict(slot_model, slot_cfg)
-        gpu_inference_slots.append(GpuInferenceSlot(device=str(dev), model=slot_model, cfg=slot_cfg))
-
-    # v13.0.0: Ultralytics monkeypatches are global (class-level). Apply them once on the main
-    # thread now so concurrent multi-GPU predict() calls never race the lazy first-call patching.
-    try:
-        ensure_single_channel_yolo_preprocess_patch()
-    except Exception as _patch_exc:  # pragma: no cover - patch is best-effort
-        print(f'Warning: single-channel preprocess patch could not be pre-applied ({_patch_exc}).')
-    if cpu_retina_masks_enabled():
+    if not multi_gpu_active:
+        # Single-GPU / CPU: inference runs in the main process. Pin the model to its device and
+        # pre-apply the global Ultralytics monkeypatches once on the main thread.
+        ensure_yolo_ready_for_predict(yolo_model, pred_cfg)
         try:
-            ensure_cpu_retina_mask_predictor_patch()
+            ensure_single_channel_yolo_preprocess_patch()
         except Exception as _patch_exc:  # pragma: no cover - patch is best-effort
-            print(f'Warning: CPU retina predictor patch could not be pre-applied ({_patch_exc}).')
+            print(f'Warning: single-channel preprocess patch could not be pre-applied ({_patch_exc}).')
+        if cpu_retina_masks_enabled():
+            try:
+                ensure_cpu_retina_mask_predictor_patch()
+            except Exception as _patch_exc:  # pragma: no cover - patch is best-effort
+                print(f'Warning: CPU retina predictor patch could not be pre-applied ({_patch_exc}).')
+    else:
+        # Multi-GPU: inference runs in one worker PROCESS per GPU (see _gpu_inference_worker_main).
+        # Each worker loads its own model replica and applies the patches in its own interpreter, so
+        # the main-process model stays on CPU and is not used for inference. This avoids the CPython
+        # GIL serialization that makes thread-per-GPU inference no faster than a single GPU.
+        print(
+            f'Multi-GPU: inference will run in {gpu_device_count} per-GPU worker process(es) '
+            f'{inference_devices}; the main-process model stays on CPU.'
+        )
 
 
     worker_budget = int(default_worker_budget())
@@ -16304,180 +16506,248 @@ def main() -> None:
         )
 
     # --------------------------------------------------------------
-    # v13.0.0 multi-GPU inference dispatch (active only when >1 GPU).
-    # Ultralytics does not load-balance across devices, so the scheduler owns it: each ready
-    # prediction volume is dispatched to whichever GPU slot is free; the slot runs predict()+
-    # accumulate on its own model replica/device in a worker thread, and the main thread runs the
-    # post-inference bookkeeping when the future completes. The single-GPU/CPU path is unchanged.
     # --------------------------------------------------------------
-    gpu_inference_executor: Optional[ThreadPoolExecutor] = None
-    free_gpu_slots: List[GpuInferenceSlot] = []
-    inflight_gpu_futures: Dict[Future, Dict[str, object]] = {}
-    per_gpu_predict_postprocess_workers = max(1, int(predict_postprocess_workers) // max(1, len(gpu_inference_slots)))
+    # v13.0.0 multi-GPU inference: one worker PROCESS per GPU (active only when >1 GPU).
+    # CPython's GIL serializes Ultralytics' per-batch Python work across threads, so thread-per-GPU
+    # inference is no faster than a single GPU. Each GPU therefore gets its own process (separate
+    # interpreter + CUDA context). Workers render+predict+accumulate one prediction volume at a time
+    # from a shared task queue and write the per-volume native-space result to a file-backed memmap;
+    # the main process unions those results into the per-view union and runs all postprocessing.
+    # --------------------------------------------------------------
+    gpu_worker_processes: List[object] = []
+    gpu_task_queue: object = None
+    gpu_result_queue: object = None
+    mgpu_tasks_by_id: Dict[int, Dict[str, object]] = {}
+    mgpu_results_collected = 0
+    mgpu_total_tasks = 0
+    mgpu_result_dir = temp_dir / 'mgpu_results'
+
+    def _ensure_source_volume_file_backed() -> Tuple[str, Tuple[int, int, int], str]:
+        wait_for_volume_ready(volume_rgb)
+        shape = (int(volume_rgb.shape[0]), int(volume_rgb.shape[1]), int(volume_rgb.shape[2]))
+        backing = _memmap_backing_path(volume_rgb)
+        if backing is not None:
+            flush_array(volume_rgb)
+            return str(backing), shape, str(np.asarray(volume_rgb).dtype)
+        shared_path = temp_dir / 'mgpu_source_volume.gray8.dat'
+        shared_mm = copy_workspace_array(
+            np.asarray(volume_rgb), shared_path,
+            desc='Multi-GPU shared source volume', prefer_memory=False, workers=int(worker_budget),
+        )
+        flush_array(shared_mm)
+        return str(shared_path), shape, str(np.asarray(shared_mm).dtype)
+
     if multi_gpu_active:
-        gpu_inference_executor = ThreadPoolExecutor(
-            max_workers=len(gpu_inference_slots), thread_name_prefix='gpu-infer'
-        )
-        free_gpu_slots = list(gpu_inference_slots)
-        print(
-            f'Multi-GPU dispatch active across {len(gpu_inference_slots)} device(s): '
-            f'{[s.device for s in gpu_inference_slots]}; per-GPU inference postprocess workers='
-            f'{int(per_gpu_predict_postprocess_workers)} (sync accumulation per slot).'
-        )
-
-    def _run_fullframe_inference_task(slot: GpuInferenceSlot, prediction_ref: PredictionVolumeRef, view: ViewInfo, job: AugJob) -> Dict[str, int]:
-        return predict_in_memory_volume_and_accumulate(
-            model=slot.model,
-            prediction_volume=prediction_ref,
-            num_frames=view.num_slices,
-            out_size=args.imgsz,
-            cfg=slot.cfg,
-            view_union_mm=baseline_union_by_model_view[(model_name, view.name)],
-            view_confmap_mm=baseline_confmap_by_model_view[(model_name, view.name)],
-            M_out_to_native=job.aff.M_out_to_src,
-            native_h=view.src_h,
-            native_w=view.src_w,
-            postprocess_workers=int(per_gpu_predict_postprocess_workers),
-            streaming_cleanup_enabled=bool(single_angle_streaming_cleanup_active),
-            streaming_cleanup_min_conf=float(args.min_conf),
-            streaming_cleanup_min_radius=_view_native_slice_min_radius(view, float(args.min_radius)),
-            slice_locks=baseline_slice_locks_by_model_view.get((str(model_name), str(view.name))),
-        )
-
-    def _run_tile_inference_task(slot: GpuInferenceSlot, prediction_ref: PredictionVolumeRef, view: ViewInfo, tile_job: DenseTileJob, tile_mask_mm: np.ndarray, tile_conf_mm: Optional[np.ndarray]) -> Dict[str, int]:
-        return predict_in_memory_volume_and_accumulate(
-            model=slot.model,
-            prediction_volume=prediction_ref,
-            num_frames=view.num_slices,
-            out_size=int(args.imgsz),
-            cfg=slot.cfg,
-            view_union_mm=tile_mask_mm,
-            view_confmap_mm=tile_conf_mm,
-            M_out_to_native=tile_job.M_out_to_src,
-            native_h=view.src_h,
-            native_w=view.src_w,
-            postprocess_workers=int(per_gpu_predict_postprocess_workers),
-            streaming_cleanup_enabled=bool(single_angle_streaming_cleanup_active),
-            streaming_cleanup_min_conf=float(args.min_conf),
-            streaming_cleanup_min_radius=_view_native_slice_min_radius(view, float(args.min_radius)),
-        )
-
-    def _dispatch_ready_inference_to_free_gpus() -> bool:
-        assert gpu_inference_executor is not None
-        dispatched = False
-        # Full-frame volumes take priority over tiles (Scheduling Notes view priority).
-        while free_gpu_slots and ready_fullframe:
-            view, job, prediction_ref = ready_fullframe.popleft()
-            _ensure_baseline_workspaces(str(model_name), view)
-            slot = free_gpu_slots.pop()
-            print(f"[{slot.device}] Inferencing full-frame in-memory volume: {view.name}/{job.aug_id}")
-            fut = gpu_inference_executor.submit(_run_fullframe_inference_task, slot, prediction_ref, view, job)
-            inflight_gpu_futures[fut] = {
-                'kind': 'fullframe', 'slot': slot, 'view': view, 'job': job,
-                'prediction_ref': prediction_ref,
-            }
-            dispatched = True
-        while free_gpu_slots and ready_tile_infer:
-            tile_model_name, view, tile_job, prediction_ref = ready_tile_infer.popleft()
-            ready_key = (str(tile_model_name), str(view.name), str(tile_job.tile_id))
-            if ready_key in tile_inference_done:
-                close_prediction_volume_ref(prediction_ref, keep_temp=bool(keep_temp_artifacts))
-                continue
-            tile_shape = (int(view.num_slices), int(view.src_h), int(view.src_w))
-            tile_mask_path = temp_dir / 'tile_volumes' / tile_model_name / view.name / f'{tile_job.tile_id}.u8.dat'
-            tile_conf_path = temp_dir / 'tile_volumes' / tile_model_name / view.name / f'{tile_job.tile_id}.confmap.u8.dat'
-            tile_mask_path.parent.mkdir(parents=True, exist_ok=True)
-            tile_mask_mm = allocate_workspace_array(
-                shape=tile_shape, dtype=np.uint8, path=tile_mask_path,
-                desc=f'{tile_model_name}/{view.name}/{tile_job.tile_id} raw tile volume',
-                prefer_memory=True,
-            )
-            if float(args.min_conf) > 0.0:
-                tile_conf_mm = allocate_workspace_array(
-                    shape=tile_shape, dtype=np.uint8, path=tile_conf_path,
-                    desc=f'{tile_model_name}/{view.name}/{tile_job.tile_id} raw tile confidence workspace',
-                    prefer_memory=True,
-                )
-                tile_conf_store_path: Optional[Path] = tile_conf_path
+        mgpu_result_dir.mkdir(parents=True, exist_ok=True)
+        source_volume_path, source_volume_shape, source_volume_dtype = _ensure_source_volume_file_backed()
+        per_worker_workers = max(1, int(_cpu_count()) // max(1, gpu_device_count))
+        worker_init = {
+            'imgsz': int(args.imgsz), 'conf': float(args.conf),
+            'half': bool(args.half), 'int8': bool(args.int8), 'batch': max(1, int(args.batch)),
+            'retina_processor': str(retina_processor),
+            'cv2_threads': max(1, int(_cpu_count()) // max(1, gpu_device_count * 2)),
+        }
+        physical_gpu_indices = [int(str(d).split(':')[-1]) for d in inference_devices]
+        next_task_id = 0
+        for kind, view, job_obj in list(pending_prediction_build_jobs):
+            if str(kind) == 'fullframe':
+                aug_job = job_obj
+                m_out = np.asarray(aug_job.aff.M_out_to_src, dtype=np.float32)
+                out_size = int(aug_job.aff.out_size)
+                job_id = str(aug_job.aug_id)
+                rmask = mgpu_result_dir / f'{view.name}__{job_id}.mask.u8.dat'
+                rconf = (mgpu_result_dir / f'{view.name}__{job_id}.conf.u8.dat') if float(args.min_conf) > 0.0 else None
             else:
-                tile_conf_mm = None
-                tile_conf_store_path = None
-            slot = free_gpu_slots.pop()
-            print(f"[{slot.device}] Inferencing tile in-memory volume: {tile_model_name}/{view.name}/{tile_job.tile_id}")
-            fut = gpu_inference_executor.submit(
-                _run_tile_inference_task, slot, prediction_ref, view, tile_job, tile_mask_mm, tile_conf_mm
-            )
-            inflight_gpu_futures[fut] = {
-                'kind': 'tile', 'slot': slot, 'model_name': str(tile_model_name), 'view': view,
-                'tile_job': tile_job, 'ready_key': ready_key,
-                'tile_mask_mm': tile_mask_mm, 'tile_conf_mm': tile_conf_mm,
-                'tile_mask_path': tile_mask_path, 'tile_conf_path': tile_conf_store_path,
-                'prediction_ref': prediction_ref,
+                tile_job = job_obj
+                m_out = np.asarray(tile_job.M_out_to_src, dtype=np.float32)
+                out_size = int(tile_job.out_size)
+                job_id = str(tile_job.tile_id)
+                rmask = mgpu_result_dir / f'tile__{view.name}__{job_id}.mask.u8.dat'
+                rconf = (mgpu_result_dir / f'tile__{view.name}__{job_id}.conf.u8.dat') if float(args.min_conf) > 0.0 else None
+            render_workers = streaming_prediction_source_workers(int(per_worker_workers), int(view.num_slices))
+            prefetch_frames = streaming_prediction_source_prefetch_frames(max(1, int(args.batch)))
+            task = {
+                'task_id': int(next_task_id), 'kind': str(kind), 'model_name': str(model_name),
+                'view': view, 'job': job_obj, 'job_id': job_id, 'out_size': int(out_size),
+                'M_out_to_src': m_out,
+                'source_volume_path': source_volume_path, 'source_shape': list(source_volume_shape),
+                'source_dtype': source_volume_dtype,
+                'result_mask_path': str(rmask), 'result_conf_path': (str(rconf) if rconf is not None else None),
+                'render_workers': int(render_workers), 'prefetch_frames': int(prefetch_frames),
+                'postprocess_workers': int(per_worker_workers),
+                'streaming_cleanup_enabled': bool(single_angle_streaming_cleanup_active),
+                'streaming_cleanup_min_conf': float(args.min_conf),
+                'streaming_cleanup_min_radius': float(_view_native_slice_min_radius(view, float(args.min_radius))),
             }
-            dispatched = True
-        return dispatched
+            mgpu_tasks_by_id[int(next_task_id)] = task
+            next_task_id += 1
+        mgpu_total_tasks = int(next_task_id)
+        pending_prediction_build_jobs.clear()
 
-    def _drain_completed_gpu_inference_futures() -> None:
-        for fut in [f for f in list(inflight_gpu_futures.keys()) if f.done()]:
-            ctx = inflight_gpu_futures.pop(fut)
-            free_gpu_slots.append(ctx['slot'])  # type: ignore[arg-type]
-            prediction_ref = ctx['prediction_ref']
-            try:
-                pred_stats = fut.result()
-            finally:
-                close_prediction_volume_ref(prediction_ref, keep_temp=bool(keep_temp_artifacts))
-                _pump_prediction_volume_build_queue()
-            view = ctx['view']
-            view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(pred_stats.get('prediction_count', 0))
-            if str(ctx['kind']) == 'fullframe':
-                remaining_key = (str(model_name), str(view.name))
-                fullframe_remaining[remaining_key] = int(fullframe_remaining.get(remaining_key, 0)) - 1
-                if int(fullframe_remaining.get(remaining_key, 0)) == 0:
-                    _submit_view_prepare(str(model_name), view)
-                continue
-            tile_model_name = str(ctx['model_name'])
-            tile_job = ctx['tile_job']
-            tile_mask_mm = ctx['tile_mask_mm']
-            tile_conf_mm = ctx['tile_conf_mm']
-            tile_mask_path = ctx['tile_mask_path']
-            tile_conf_store_path = ctx['tile_conf_path']
-            tile_inference_done.add(ctx['ready_key'])  # type: ignore[arg-type]
-            if int(pred_stats.get('frames_with_predictions', 0)) <= 0:
-                close_memmap_array(tile_mask_mm)
-                close_memmap_array(tile_conf_mm)
-                if not keep_temp_artifacts:
+        mp_ctx = mp.get_context('spawn')
+        gpu_task_queue = mp_ctx.Queue()
+        gpu_result_queue = mp_ctx.Queue()
+        for gpu_index in physical_gpu_indices:
+            proc = mp_ctx.Process(
+                target=_gpu_inference_worker_main,
+                args=(int(gpu_index), str(model_paths[0]), dict(worker_init), gpu_task_queue, gpu_result_queue),
+                name=f'gpu-worker-{gpu_index}', daemon=True,
+            )
+            proc.start()
+            gpu_worker_processes.append(proc)
+        print(
+            f'Started {len(gpu_worker_processes)} GPU worker process(es) for physical devices {physical_gpu_indices}; '
+            f'{mgpu_total_tasks} prediction volume task(s) queued; per-worker CPU workers={per_worker_workers}.'
+        )
+        for tid in range(mgpu_total_tasks):
+            gpu_task_queue.put(mgpu_tasks_by_id[tid])
+
+    def _finalize_fullframe_view_after_worker(model_name_s: str, view: ViewInfo) -> None:
+        remaining_key = (str(model_name_s), str(view.name))
+        fullframe_remaining[remaining_key] = int(fullframe_remaining.get(remaining_key, 0)) - 1
+        if int(fullframe_remaining.get(remaining_key, 0)) == 0:
+            _submit_view_prepare(str(model_name_s), view)
+
+    def _handle_fullframe_worker_result(task: Dict[str, object], stats: Dict[str, int]) -> None:
+        view = task['view']
+        model_name_s = str(task['model_name'])
+        _ensure_baseline_workspaces(model_name_s, view)
+        view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(stats.get('prediction_count', 0))
+        result_shape = (int(view.num_slices), int(view.src_h), int(view.src_w))
+        res_mask = open_existing_gray_memmap(task['result_mask_path'], result_shape, 'uint8', mode='r')
+        res_conf = open_existing_gray_memmap(task['result_conf_path'], result_shape, 'uint8', mode='r') if task.get('result_conf_path') else None
+        union_conf_volume_into_volume_inplace(
+            baseline_union_by_model_view[(model_name_s, str(view.name))],
+            baseline_confmap_by_model_view.get((model_name_s, str(view.name))),
+            res_mask, res_conf,
+            workers=int(slice_postprocess_workers),
+            desc=f'Union {view.name} worker result',
+        )
+        close_memmap_array(res_mask)
+        if res_conf is not None:
+            close_memmap_array(res_conf)
+        if not keep_temp_artifacts:
+            for pth in (task.get('result_mask_path'), task.get('result_conf_path')):
+                if pth:
                     try:
-                        tile_mask_path.unlink(missing_ok=True)
+                        Path(str(pth)).unlink(missing_ok=True)
                     except Exception:
                         pass
-                    if tile_conf_store_path is not None:
+        _finalize_fullframe_view_after_worker(model_name_s, view)
+
+    def _handle_tile_worker_result(task: Dict[str, object], stats: Dict[str, int]) -> None:
+        view = task['view']
+        model_name_s = str(task['model_name'])
+        tile_job = task['job']
+        view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(stats.get('prediction_count', 0))
+        tile_inference_done.add((model_name_s, str(view.name), str(tile_job.tile_id)))
+        if int(stats.get('frames_with_predictions', 0)) <= 0:
+            if not keep_temp_artifacts:
+                for pth in (task.get('result_mask_path'), task.get('result_conf_path')):
+                    if pth:
                         try:
-                            tile_conf_store_path.unlink(missing_ok=True)
+                            Path(str(pth)).unlink(missing_ok=True)
                         except Exception:
                             pass
-                _mark_tile_staged(tile_model_name, str(view.name), str(tile_job.config_id), str(tile_job.tile_id))
-                continue
-            task = TilePostprocessTask(
-                model_name=tile_model_name,
-                view_name=str(view.name),
-                config_id=str(tile_job.config_id),
-                tile_id=str(tile_job.tile_id),
-                tile_mask_mm=tile_mask_mm,
-                tile_confmap_mm=tile_conf_mm,
-                tile_mask_path=tile_mask_path,
-                tile_confmap_path=tile_conf_store_path,
-                precleaned_slice_cleanup=bool(single_angle_streaming_cleanup_active),
+            _mark_tile_staged(model_name_s, str(view.name), str(tile_job.config_id), str(tile_job.tile_id))
+            return
+        result_shape = (int(view.num_slices), int(view.src_h), int(view.src_w))
+        tile_mask_path = Path(str(task['result_mask_path']))
+        tile_mask_mm = open_existing_gray_memmap(tile_mask_path, result_shape, 'uint8', mode='r+')
+        tile_conf_mm = None
+        tile_conf_path = Path(str(task['result_conf_path'])) if task.get('result_conf_path') else None
+        if tile_conf_path is not None:
+            tile_conf_mm = open_existing_gray_memmap(tile_conf_path, result_shape, 'uint8', mode='r+')
+        ptask = TilePostprocessTask(
+            model_name=model_name_s, view_name=str(view.name),
+            config_id=str(tile_job.config_id), tile_id=str(tile_job.tile_id),
+            tile_mask_mm=tile_mask_mm, tile_confmap_mm=tile_conf_mm,
+            tile_mask_path=tile_mask_path, tile_confmap_path=tile_conf_path,
+            precleaned_slice_cleanup=bool(single_angle_streaming_cleanup_active),
+        )
+        fut = tile_postprocess_executor.submit(
+            postprocess_tile_volume_after_inference, ptask,
+            view=view, min_conf=float(args.min_conf), min_radius=float(args.min_radius),
+            keep_temp=bool(keep_temp_artifacts), slice_workers=int(tile_slice_postprocess_workers),
+        )
+        tile_cleanup_futures[fut] = (model_name_s, str(view.name), str(tile_job.config_id), str(tile_job.tile_id))
+
+    def _process_one_worker_result(msg: Dict[str, object]) -> None:
+        nonlocal mgpu_results_collected
+        mtype = str(msg.get('type'))
+        if mtype == 'ready':
+            print(f"GPU worker ready: device cuda:{msg.get('gpu_index')} (pid {msg.get('pid')}).")
+            return
+        if mtype == 'fatal':
+            raise RuntimeError(
+                f"GPU worker on device {msg.get('gpu_index')} failed to initialize: "
+                f"{msg.get('error')}\n{msg.get('traceback')}"
             )
-            tfut = tile_postprocess_executor.submit(
-                postprocess_tile_volume_after_inference,
-                task,
-                view=view,
-                min_conf=float(args.min_conf),
-                min_radius=float(args.min_radius),
-                keep_temp=bool(keep_temp_artifacts),
-                slice_workers=int(tile_slice_postprocess_workers),
+        mgpu_results_collected += 1
+        if not bool(msg.get('ok')):
+            raise RuntimeError(
+                f"GPU worker task {msg.get('task_id')} failed on device {msg.get('gpu_index')}: "
+                f"{msg.get('error')}\n{msg.get('traceback')}"
             )
-            tile_cleanup_futures[tfut] = (tile_model_name, str(view.name), str(tile_job.config_id), str(tile_job.tile_id))
+        task = mgpu_tasks_by_id[int(msg['task_id'])]
+        stats = dict(msg.get('stats') or {})
+        if str(task['kind']) == 'fullframe':
+            _handle_fullframe_worker_result(task, stats)
+        else:
+            _handle_tile_worker_result(task, stats)
+
+    def _drain_process_inference_results() -> None:
+        if gpu_result_queue is None:
+            return
+        while True:
+            try:
+                msg = gpu_result_queue.get_nowait()
+            except queue.Empty:
+                break
+            _process_one_worker_result(msg)
+
+    def _wait_for_one_process_result(timeout: float) -> None:
+        if gpu_result_queue is None:
+            return
+        try:
+            msg = gpu_result_queue.get(timeout=float(timeout))
+        except queue.Empty:
+            return
+        _process_one_worker_result(msg)
+
+    def _process_inference_outstanding() -> bool:
+        return bool(multi_gpu_active and mgpu_results_collected < mgpu_total_tasks)
+
+    def _check_gpu_workers_alive() -> None:
+        # Fail fast (rather than hang) if a worker process died mid-task, e.g. CUDA OOM or a kill.
+        if not _process_inference_outstanding():
+            return
+        for proc in gpu_worker_processes:
+            if not proc.is_alive():
+                raise RuntimeError(
+                    f'GPU worker {getattr(proc, "name", "?")} exited unexpectedly '
+                    f'(exitcode={getattr(proc, "exitcode", None)}) with '
+                    f'{int(mgpu_total_tasks - mgpu_results_collected)} inference result(s) still outstanding.'
+                )
+
+    def _shutdown_gpu_worker_processes() -> None:
+        if not gpu_worker_processes:
+            return
+        try:
+            for _ in gpu_worker_processes:
+                gpu_task_queue.put(None)
+        except Exception:
+            pass
+        for proc in gpu_worker_processes:
+            try:
+                proc.join(timeout=30)
+            except Exception:
+                pass
+            if proc.is_alive():
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
 
     try:
         _pump_prediction_volume_build_queue()
@@ -16489,9 +16759,12 @@ def main() -> None:
             _warmup_ready_prediction_sources()
 
             if multi_gpu_active:
-                _drain_completed_gpu_inference_futures()
-                if _dispatch_ready_inference_to_free_gpus():
-                    continue
+                # Inference runs in per-GPU worker processes; collect any completed results and union
+                # them into the per-view unions / submit tile postprocessing. No in-process dispatch.
+                _drain_process_inference_results()
+                # Detect a hard worker death (CUDA OOM kill, segfault) within one iteration even while
+                # CPU-side postprocess futures are still pending, instead of only on the idle branch.
+                _check_gpu_workers_alive()
 
             if (not multi_gpu_active) and ready_fullframe:
                 view, job, prediction_ref = ready_fullframe.popleft()
@@ -16689,16 +16962,20 @@ def main() -> None:
             waitables.extend(list(tile_finalize_futures.keys()))
             waitables.extend(list(tile_config_gate_futures.keys()))
             waitables.extend(list(tile_consolidation_futures.keys()))
-            if multi_gpu_active:
-                waitables.extend(list(inflight_gpu_futures.keys()))
             if not waitables:
                 _flush_ready_postprocessed_tiles()
                 _pump_prediction_volume_build_queue()
+                if multi_gpu_active and _process_inference_outstanding():
+                    # GPU worker processes are still inferencing but no CPU-side future is pending;
+                    # block briefly on the process result queue so the loop wakes on the next result.
+                    _wait_for_one_process_result(timeout=0.5)
+                    _check_gpu_workers_alive()
+                    continue
                 if (
                     not pending_prediction_build_jobs and
                     not pending_prediction_volume_futures and
                     not prediction_accumulation_futures and
-                    not inflight_gpu_futures and
+                    not _process_inference_outstanding() and
                     not ready_fullframe and
                     not ready_tile_infer and
                     not tile_finalize_futures and
@@ -16710,11 +16987,13 @@ def main() -> None:
                     break
                 continue
             _log_scheduler_wait_state()
-            wait(waitables, return_when=FIRST_COMPLETED)
+            # Under multi-GPU, also poll the process result queue periodically while CPU-side futures
+            # run, so completed inference results are unioned without waiting for a future to finish.
+            wait(waitables, timeout=(0.1 if multi_gpu_active else None), return_when=FIRST_COMPLETED)
 
     finally:
-        if gpu_inference_executor is not None:
-            gpu_inference_executor.shutdown(wait=True)
+        if multi_gpu_active:
+            _shutdown_gpu_worker_processes()
         prediction_volume_executor.shutdown(wait=True)
         prediction_join_executor.shutdown(wait=True)
         prediction_result_executor.shutdown(wait=True)
