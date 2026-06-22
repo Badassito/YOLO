@@ -2,8 +2,41 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the v13.0.0_SLURM implementation. It is derived from the v12.2.15_SLURM scheduling/native-volume
-rework plus the v12.2.1-v12.2.14 performance patches, with the following v13.0.0 changes:
+This is the v13.1.0_SLURM implementation. It is derived from the v13.0.x_SLURM line (multi-GPU scheduling
+plus the v12.2.x performance patches), with the following v13.1.0 changes:
+  - v13.1.0 (spec) --min_radius is now applied per view in EACH prediction set's OWN native 2D slice plane,
+    BEFORE backprojection, independently per active view (Cartesian, Radial, Tilted, and tiles). The previous
+    transverse-plane semantics are gone: Sagittal/Coronal no longer transpose to a deferred transverse-plane
+    pass, and Radial/Tilted no longer re-apply --min_radius after backprojection. _view_native_slice_min_radius
+    now returns the full radius for every view, so the single per-slice fused cleanup covers all views and the
+    deferred volume-level radius pass is retired. This also simplifies scheduling (no view needs a post-
+    backprojection radius stage). See CONFLICT NOTE 1 in the summary text.
+  - v13.1.0 (bug fix #2.1) the main-process worker budget is now GPU-count aware. The 2x vCPU oversubscription
+    target is shared with the per-GPU inference subprocesses: in multi-GPU runs the subprocesses already consume
+    ~vCPU render threads (vCPU/num_gpu each), so the main process is sized to (2*vCPU - num_gpu*per_gpu_share)
+    instead of a flat 2*vCPU. Single-GPU runs keep the full 2*vCPU budget because inference is in-process there.
+    This stops the GPU-non-blocking main-process pools (cleanup/interpolation/output) from oversubscribing the
+    box to ~8:1 at 4 GPUs and starving the GPU-blocking subprocess render/retina/union pools.
+  - v13.1.0 (bug fix #2.2) when --retina_mask_processor is gpu, the (n,Hn,Wn) retina-mask stack is flattened on
+    the GPU to a per-pixel union plane plus a per-pixel max-confidence plane, and both planes are warped to
+    view-native space ON THE GPU (torch grid_sample, one shared affine grid for both planes), so the
+    host<-device transfer shrinks from O(n*Hn*Wn) to O(2*H*W), the single-threaded per-instance CPU OR/resize
+    loop is removed, and neither affine warp runs on the CPU. The flatten reduction runs eagerly on the
+    model-stream thread so the full (n,Hn,Wn) stack is released immediately, and the postprocess queue is
+    bounded (YOLO_TTA_GPU_RETINA_PENDING_FRAMES) so GPU-resident flattened frames stay capped instead of
+    accumulating a whole view's worth on the device. (YOLO_TTA_GPU_RETINA_FLATTEN / YOLO_TTA_GPU_RETINA_WARP /
+    YOLO_TTA_GPU_RETINA_EAGER_FLATTEN force the legacy CPU paths for regression; a CPU fallback also runs
+    automatically if the GPU warp errors.)
+  - v13.1.0 (bug fix #2.3) single-angle + gpu retina fast path: the entire per-slice cleanup runs on the GPU --
+    low-confidence instances are dropped (exact --min_conf at instance granularity) before the union/flatten,
+    the union is warped to view-native space, and --min_radius + 2D hole fill run on the GPU (cupy) -- so only
+    one finished view-native plane crosses PCIe and the per-slice CPU streaming cleanup is skipped. If cupy is
+    unavailable the connected-component --min_radius/hole-fill fall back to the CPU streaming path.
+  - v13.1.0 (bug fix #2.4) --device accepts space-separated indices (e.g. `--device 0 1 2 3`) in addition to the
+    comma form (`0,1,2,3`), matching the other multi-value flags. cpu still cannot be mixed with GPU indices.
+
+The v13.0.x line this builds on (itself derived from the v12.2.15_SLURM scheduling/native-volume rework plus
+the v12.2.1-v12.2.14 performance patches) introduced the following v13.0.0 changes:
   - v13.0.0 (bug fix) restores approximately-cubic VIRTUAL working geometry as the default: the working
     volume's dimensions are brought to within 5% of the longest source axis before any view is derived, so
     e.g. (X,Y,t)=3072x3072x1930 -> ~3072x3072x2919. This keeps the t (Transverse stacking) axis inside the
@@ -30,7 +63,7 @@ rework plus the v12.2.1-v12.2.14 performance patches, with the following v13.0.0
   - v12.2.13 adds an optional CUDA input-staging queue that preloads a small number of already-normalized BCHW YOLO batches into GPU VRAM ahead of the predictor loop, separate from --batch, so model inference no longer waits on the hot-path RAM->GPU copy when the queue is filled
   - v12.2.12 changes full-frame/tile YOLO inputs to bounded streaming render sources, so inference starts after the first prefetch batch is rendered instead of after a complete (slice,imgsz,imgsz) prediction volume is materialized
   - v12.2.11 removes GPU backprojection from the final Radial/Tilted path, gives CPU-only backprojection the full slice-worker budget, keeps tile waiting/staging/consolidation canvases in RAM by default, overlaps YOLO model loading with decode/cube preparation, adds threaded ffmpeg decode defaults, and tightens the NRRD writer around the Target_Dummy trailing-list layout with direct raw-bbox chunk fills and full-CPU pigz defaults
-  - v12.2.8 adds a dedicated single --angle streaming cleanup path: when exactly one augmentation angle is requested, min_conf filtering and view-native per-slice min_radius filtering are applied as YOLO slices stream in; volume-level cleanup (deferred transverse-plane min_radius and, in v13.0.0, the final 2D hole fill) waits for the completed view volume
+  - v12.2.8 adds a dedicated single --angle streaming cleanup path: when exactly one augmentation angle is requested, min_conf filtering and view-native per-slice min_radius filtering are applied as YOLO slices stream in (v13.1.0: the full --min_radius applies on every view's own native slices, so the v12.2.8 deferred transverse-plane min_radius pass is retired); volume-level cleanup (the final 2D hole fill, v13.0.0+) waits for the completed view volume
   - v12.2.9 keeps the GPU-fed queue hot by sizing prediction-volume builders to the active prefetch window, skipping scratch memmap flushes on the prediction hot path by default, and allowing single-angle CPU result accumulation to finish behind the next prediction volume
   - v12.2.1 restores the low-quality downbin/output helper path and NrrdLayerRef metadata class that were erroneously pruned in v12.2.0
   - v12.2.2 adds batched in-memory inference with synthetic final-batch padding for fixed-batch backends, larger RAM-aware NRRD streaming slabs, parallel low-quality NRRD scheduling, and the now-CPU-only radial/tilted backprojection queue
@@ -247,9 +280,10 @@ def build_argparser() -> argparse.ArgumentParser:
 
     p.add_argument("--input", required=True, type=str, help="Input video path")
     p.add_argument("--output", default=None, type=str, help="Output directory (default ./{Filename}/)")
-    p.add_argument("--device", default="0", type=str,
-                   help="Inference device(s). Accepts a single GPU index (0), multiple comma-separated GPU "
-                        "indices (0,1,2,3) for multi-GPU scheduling, or cpu. GPU indices and cpu cannot be mixed")
+    p.add_argument("--device", nargs="+", default=["0"], type=str,
+                   help="Inference device(s). Accepts a single GPU index (0), multiple GPU indices separated by "
+                        "commas or spaces (0,1,2,3 or 0 1 2 3) for multi-GPU scheduling, or cpu. GPU indices and "
+                        "cpu cannot be mixed")
     p.add_argument("--retina_mask_processor", default=None, choices=["cpu", "gpu"], type=str,
                    help="Device that resolves full-resolution retina masks. Default cpu for a single GPU. "
                         "Enabling more than one GPU via --device implicitly switches this to gpu (explicitly "
@@ -267,7 +301,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--angle", default="0,120,240", type=str,
                    help="Rotation angles in degrees for augmentation (comma or whitespace separated)")
     p.add_argument("--min_radius", default=0.0, type=float,
-                   help="Remove objects with a transverse-plane radius smaller than this value. 0 disables the check")
+                   help="Remove objects whose radius is smaller than this value, measured on the YOLO output masks "
+                        "in each prediction set's own native 2D slice plane, before backprojection, independently "
+                        "per active view. 0 disables the check")
     p.add_argument("--keep_objects", default=0, type=int,
                    help="Keep the top N largest final 3D objects by volume. 0 keeps all objects")
 
@@ -412,8 +448,47 @@ def default_worker_budget() -> int:
     The v12.2.0 SLURM target has enough CPU headroom that running roughly 2x the visible CPU count
     helps keep in-memory view-volume construction, interpolation planning, and output writers busy while the GPU
     is inferencing or waiting on a different stage.
+
+    This is the WHOLE-BOX oversubscription target (2x visible CPUs). For the inference phase, the
+    main process must share that target with the per-GPU inference subprocesses; use
+    main_process_worker_budget() to size main-process pools in a GPU-count-aware way. Pre-inference
+    stages (decode, cube resize) that run while no GPU is inferencing keep using this full budget.
     """
     return max(1, int(_cpu_count()) * 2)
+
+
+def multi_gpu_worker_share(gpu_device_count: int) -> int:
+    """Per-GPU-subprocess CPU share, mirroring the multi-GPU dispatch's per_worker_workers.
+
+    Each per-GPU inference subprocess sizes its render/postprocess pools to roughly
+    floor(visible_cpu / num_gpu) threads (with cv2 single-threaded). This helper computes the same
+    floor so the main-process budget can reserve the cores those subprocesses consume.
+    """
+    cpu = max(1, int(_cpu_count()))
+    n = max(1, int(gpu_device_count))
+    return max(1, cpu // n)
+
+
+def main_process_worker_budget(gpu_device_count: int, multi_gpu_active: bool) -> int:
+    """v13.1.0 (#2.1): GPU-count-aware main-process worker budget for the inference phase.
+
+    The whole-box oversubscription target is 2x visible CPUs (default_worker_budget()). In multi-GPU
+    runs, render + YOLO predict + retina-mask resolution + result union all happen INSIDE the per-GPU
+    inference subprocesses, which together consume ~num_gpu * floor(cpu/num_gpu) ~= cpu render threads
+    (the GPU-blocking pools). To keep the box at the intended ~2:1 overall instead of stacking another
+    flat 2x on top of the subprocesses (~8:1 at 4 GPUs), the GPU-non-blocking main-process pools
+    (cleanup/interpolation/output/backprojection) are sized to the remaining headroom,
+    2*cpu - num_gpu*floor(cpu/num_gpu).
+
+    In single-GPU (or CPU) runs, inference is in-process, so the GPU-blocking pools live in the main
+    process and the full 2x budget is correct -- this returns default_worker_budget() unchanged.
+    """
+    total = int(default_worker_budget())
+    if not bool(multi_gpu_active):
+        return max(1, total)
+    n = max(1, int(gpu_device_count))
+    reserved = int(multi_gpu_worker_share(n)) * n
+    return max(1, total - reserved)
 
 
 def resolve_parent_interpolation_worker_allocation(
@@ -4563,15 +4638,26 @@ def _canonical_single_device_token(token: str) -> str:
     return str(token).strip()
 
 
-def parse_device_list(device: str) -> List[str]:
-    """v13.0.0 multi-GPU device parsing.
+def parse_device_list(device: 'Sequence[str] | str | None') -> List[str]:
+    """v13.0.0 multi-GPU device parsing (v13.1.0 accepts space-separated values).
 
     --device accepts a single GPU index (``0``), multiple comma/whitespace separated GPU
-    indices (``0,1,2,3``) for multi-GPU scheduling, or ``cpu``.  GPU indices and ``cpu``
-    cannot be mixed.  Returns a de-duplicated, order-preserving list of canonical device
-    strings such as ``['cuda:0', 'cuda:1']`` or ``['cpu']``.
+    indices (``0,1,2,3`` or ``0 1 2 3``) for multi-GPU scheduling, or ``cpu``.  GPU indices
+    and ``cpu`` cannot be mixed.  Returns a de-duplicated, order-preserving list of canonical
+    device strings such as ``['cuda:0', 'cuda:1']`` or ``['cpu']``.
+
+    v13.1.0: the argparser now uses ``nargs='+'`` for --device, so ``device`` may arrive as a
+    list of tokens (e.g. ``['0', '1', '2', '3']`` from ``--device 0 1 2 3``) as well as a single
+    string (e.g. ``'0,1,2,3'``). Both forms, and mixtures (``--device "0,1" 2 3``), are flattened
+    here on the same comma/whitespace split, matching the other multi-value flags.
     """
-    raw = str(device or '').strip()
+    if device is None:
+        return ['cpu']
+    if isinstance(device, str):
+        raw = device.strip()
+    else:
+        # nargs='+' list (or any sequence): join on spaces, then split on comma/whitespace below.
+        raw = ' '.join(str(t) for t in device).strip()
     if not raw:
         return ['cpu']
     tokens = [t for t in re.split(r'[\s,]+', raw) if t]
@@ -4633,6 +4719,92 @@ def set_retina_mask_processor(processor: str) -> None:
     """Set the resolved retina-mask processor ('cpu' or 'gpu') for the run."""
     global _RETINA_MASK_PROCESSOR_IS_CPU
     _RETINA_MASK_PROCESSOR_IS_CPU = bool(str(processor).strip().lower() == 'cpu')
+
+
+# v13.1.0 (#2.3): when set, the single-angle + gpu-retina fast path is active. The stored
+# (min_conf, min_radius) drive the on-GPU cleanup: instances below min_conf are dropped before the
+# union/flatten, and min_radius + 2D hole fill run on the GPU (cupy) after the on-GPU warp to
+# view-native space. None disables the fast path. min_conf may be 0.0 (fast path active, no instance
+# drop) so the GPU still does the warp + hole fill (+ min_radius if > 0).
+_SINGLE_ANGLE_GPU_FASTPATH: Optional[Tuple[float, float]] = None
+
+
+def gpu_retina_flatten_enabled() -> bool:
+    """v13.1.0 (#2.2): flatten GPU retina masks (n,H,W) -> union + max-conf planes before PCIe copy.
+
+    Active only when retina masks are resolved on the GPU (not cpu_retina_masks_enabled()). The env
+    flag YOLO_TTA_GPU_RETINA_FLATTEN (default on) allows forcing the legacy whole-stack copy for
+    regression comparison.
+    """
+    return _env_flag('YOLO_TTA_GPU_RETINA_FLATTEN', True)
+
+
+def gpu_retina_warp_enabled() -> bool:
+    """v13.1.0 (#2.2): perform the flattened-plane affine warp to view-native space on the GPU.
+
+    When enabled, the union and max-confidence planes are warped to view-native space on the GPU
+    (torch grid_sample) before the host copy, so neither affine warp runs on the CPU and only the
+    view-native planes cross PCIe. YOLO_TTA_GPU_RETINA_WARP=0 keeps the warps on the CPU (the
+    flattened out-size planes are copied down and cv2.warpAffine'd) for regression comparison.
+    """
+    return _env_flag('YOLO_TTA_GPU_RETINA_WARP', True)
+
+
+def gpu_retina_eager_flatten_enabled() -> bool:
+    """v13.1.0 (#2.2): run the cheap GPU union/max-conf reduction on the model-stream thread.
+
+    When on the GPU-flatten path, reducing each (n,Hr,Wr) stack to 2 small planes as results stream
+    (rather than deferring the reduction to a postprocess worker) lets the full native-resolution
+    retina-mask stack be released immediately, so at most ~the bounded pending count of small planes
+    (not full stacks) stay resident on the GPU. YOLO_TTA_GPU_RETINA_EAGER_FLATTEN=0 defers it.
+    """
+    return _env_flag('YOLO_TTA_GPU_RETINA_EAGER_FLATTEN', True)
+
+
+def gpu_retina_flatten_pending_limit(worker_count: int) -> int:
+    """v13.1.0 (#2.2): bound on queued GPU-resident flattened frames, to cap GPU memory.
+
+    The CPU-RAM-oriented cpu_mask_postprocess_pending_limit defaults to ~num_frames, which is unsafe
+    for GPU-resident intermediates: queuing a whole view's worth of flattened planes (or, worse,
+    un-reduced stacks) can OOM the device. This caps the in-flight count so GPU residency stays
+    bounded while leaving enough work to keep the postprocess workers busy.
+    YOLO_TTA_GPU_RETINA_PENDING_FRAMES overrides it.
+    """
+    wc = max(1, int(worker_count))
+    return max(8, _env_int('YOLO_TTA_GPU_RETINA_PENDING_FRAMES', min(4 * wc, 256)))
+
+
+def gpu_retina_cleanup_enabled() -> bool:
+    """v13.1.0 (#2.3): run --min_radius + 2D hole fill on the GPU for the single-angle fast path.
+
+    Requires cupy/cupyx. YOLO_TTA_GPU_RETINA_CLEANUP=0 forces the connected-component cleanup back
+    onto the CPU (the per-slice streaming cleanup) even when the fast path is otherwise active.
+    """
+    return _env_flag('YOLO_TTA_GPU_RETINA_CLEANUP', True)
+
+
+def set_single_angle_gpu_fastpath(min_conf: Optional[float], min_radius: float = 0.0) -> None:
+    """Enable/disable the v13.1.0 (#2.3) single-angle + gpu-retina fast path.
+
+    min_conf None disables the fast path. A float (incl. 0.0) enables it; min_radius is the radius
+    used for the on-GPU connected-component filter.
+    """
+    global _SINGLE_ANGLE_GPU_FASTPATH
+    if min_conf is None:
+        _SINGLE_ANGLE_GPU_FASTPATH = None
+    else:
+        _SINGLE_ANGLE_GPU_FASTPATH = (float(min_conf), float(min_radius))
+
+
+def single_angle_gpu_fastpath() -> Optional[Tuple[float, float]]:
+    """Return the active (min_conf, min_radius) fast-path config, or None when the fast path is off."""
+    return _SINGLE_ANGLE_GPU_FASTPATH
+
+
+def single_angle_gpu_fastpath_min_conf() -> Optional[float]:
+    """Return the active single-angle gpu-fastpath --min_conf, or None when the fast path is off."""
+    cfg = _SINGLE_ANGLE_GPU_FASTPATH
+    return None if cfg is None else float(cfg[0])
 
 
 def ensure_yolo_ready_for_predict(model: object, cfg: 'PredictConfig') -> None:
@@ -4887,6 +5059,35 @@ class CpuRetinaMaskPayload:
     orig_shape: Tuple[int, int]   # (height, width) of the prediction-video frame
     img_shape: Tuple[int, int]    # (height, width) of the network input tensor
     frame_path: str = ''
+
+
+@dataclass
+class GpuFlattenedRetinaPayload:
+    """v13.1.0 (#2.2/#2.3): one retina-mask frame flattened on the GPU, kept on the GPU.
+
+    Ultralytics produces a native-resolution (n, Hr, Wr) retina-mask stack on the GPU. Instead of
+    copying the whole stack down and OR/resizing it in a single-threaded per-instance CPU loop, the
+    stack is reduced on the GPU to a per-pixel union plane and a per-pixel max-confidence plane. The
+    GPU tensors are retained (not copied to the CPU here) so the affine warp to view-native space --
+    and, for the single-angle fast path, --min_radius + 2D hole fill -- can also run on the GPU; only
+    the finished view-native plane(s) then cross PCIe (#2.2: O(2*H*W); #2.3: one cleaned plane).
+
+    union_gpu is a torch tensor (Hr, Wr) of 0/1 (float or bool). conf_gpu is a torch tensor (Hr, Wr)
+    of per-pixel max confidence in [0,1] (pre-quantization), or None when no boxes.conf was present.
+    instance_count is the number of (kept) instances (prediction-count stats only). min_conf_applied
+    records whether the on-GPU instance-level --min_conf drop ran. run_gpu_cleanup requests the on-GPU
+    --min_radius + hole fill (#2.3); gpu_min_radius is the radius for it. cleanup_done_on_gpu is set by
+    the frame processor once the GPU connected-component cleanup actually completed, so the per-slice
+    CPU streaming cleanup can be skipped for that slice.
+    """
+
+    union_gpu: object
+    conf_gpu: Optional[object]
+    instance_count: int = 0
+    min_conf_applied: bool = False
+    run_gpu_cleanup: bool = False
+    gpu_min_radius: float = 0.0
+    cleanup_done_on_gpu: bool = False
 
 
 
@@ -5392,6 +5593,210 @@ def ensure_cpu_retina_mask_predictor_patch() -> bool:
     return True
 
 
+def _affine_theta_for_grid_sample(
+    M_out_to_native: np.ndarray, out_size: int, native_h: int, native_w: int,
+) -> np.ndarray:
+    """Convert a cv2 pixel-space affine into a torch affine_grid theta (align_corners=False).
+
+    cv2.warpAffine(src(out_size,out_size), M_out_to_native, dsize=(native_w, native_h)) maps each
+    native output pixel back to a source (out-size) pixel using the inverse of M_out_to_native, then
+    samples (nearest). torch.nn.functional.affine_grid expects theta to map normalized OUTPUT coords
+    to normalized INPUT coords. theta = N_in @ Minv_pix @ P_out, where:
+      P_out : normalized native output -> native output pixel
+      Minv_pix : native output pixel -> source (out-size) pixel (inverse of M_out_to_native)
+      N_in : source pixel -> normalized source coords
+    """
+    M = np.asarray(M_out_to_native, dtype=np.float64).reshape(2, 3)
+    M3 = np.vstack([M, [0.0, 0.0, 1.0]])
+    Minv = np.linalg.inv(M3)  # native pixel -> out-size source pixel (3x3)
+    nh = float(native_h)
+    nw = float(native_w)
+    os_ = float(out_size)
+    # normalized native output (onx,ony in [-1,1], align_corners=False) -> native output pixel (cx,ry)
+    P_out = np.array([
+        [nw / 2.0, 0.0, nw / 2.0 - 0.5],
+        [0.0, nh / 2.0, nh / 2.0 - 0.5],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float64)
+    # source pixel (sx,sy) -> normalized source coords (align_corners=False)
+    N_in = np.array([
+        [2.0 / os_, 0.0, 1.0 / os_ - 1.0],
+        [0.0, 2.0 / os_, 1.0 / os_ - 1.0],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float64)
+    theta3 = N_in @ Minv @ P_out
+    return theta3[:2].astype(np.float32, copy=False)
+
+
+def _torch_warp_planes_to_native(
+    planes: 'Sequence[object]', M_out_to_native: np.ndarray, out_size: int, native_h: int, native_w: int,
+) -> 'List[object]':
+    """v13.1.0 (#2.2): nearest affine warp of one or more co-located planes to view-native space.
+
+    Each plane is a torch tensor (Hr, Wr) on the same device/shape; planes are resized to
+    (out_size, out_size) with nearest sampling if needed, stacked on the channel axis, and warped to
+    (native_h, native_w) with a SINGLE affine_grid + grid_sample (nearest, zero-padded) so the grid
+    is built once for all planes. Matches cv2.warpAffine(..., INTER_NEAREST, BORDER_CONSTANT, 0) up to
+    half-pixel rounding ties. Returns a list of float32 (native_h, native_w) tensors on the device.
+    """
+    import torch  # type: ignore
+    import torch.nn.functional as F  # type: ignore
+    prepared = []
+    for p in planes:
+        t = p if p.dtype == torch.float32 else p.to(torch.float32)
+        if int(t.shape[0]) != int(out_size) or int(t.shape[1]) != int(out_size):
+            t = F.interpolate(
+                t.reshape(1, 1, int(t.shape[0]), int(t.shape[1])),
+                size=(int(out_size), int(out_size)), mode='nearest',
+            ).reshape(int(out_size), int(out_size))
+        prepared.append(t)
+    inp = torch.stack(prepared, dim=0).unsqueeze(0)  # (1, K, out_size, out_size)
+    theta_np = _affine_theta_for_grid_sample(M_out_to_native, int(out_size), int(native_h), int(native_w))
+    theta = torch.from_numpy(theta_np).to(device=inp.device, dtype=torch.float32).reshape(1, 2, 3)
+    grid = F.affine_grid(theta, [1, 1, int(native_h), int(native_w)], align_corners=False)
+    out = F.grid_sample(inp, grid, mode='nearest', padding_mode='zeros', align_corners=False)
+    return [out[0, k] for k in range(int(out.shape[1]))]
+
+
+def _torch_warp_plane_to_native(
+    plane_t: object, M_out_to_native: np.ndarray, out_size: int, native_h: int, native_w: int,
+) -> object:
+    """Single-plane convenience wrapper around _torch_warp_planes_to_native."""
+    return _torch_warp_planes_to_native(
+        [plane_t], M_out_to_native, int(out_size), int(native_h), int(native_w),
+    )[0]
+
+
+def _min_radius_filter_ndimage(xp, ndi, mask_bool, min_radius: float):
+    """Backend-agnostic --min_radius filter mirroring _filter_connected_components_by_min_radius_scipy.
+
+    Works with (numpy, scipy.ndimage) on the CPU or (cupy, cupyx.scipy.ndimage) on the GPU. Keeps
+    connected components whose maximum distance-transform value (radius) is >= min_radius.
+    """
+    if float(min_radius) <= 0.0:
+        return mask_bool
+    structure = xp.ones((3, 3), dtype=bool)
+    labels2d, num = ndi.label(mask_bool, structure=structure)
+    num_i = int(num)
+    if num_i <= 0:
+        return xp.zeros(mask_bool.shape, dtype=bool)
+    label_ids = xp.arange(1, num_i + 1)
+    dist = ndi.distance_transform_edt(mask_bool)
+    radii = xp.asarray(ndi.maximum(dist, labels=labels2d, index=label_ids))
+    keep_lookup = xp.zeros((num_i + 1,), dtype=bool)
+    keep_lookup[1:] = radii >= float(min_radius)
+    return keep_lookup[labels2d]
+
+
+def _fill_holes_ndimage(xp, ndi, mask_bool):
+    """Backend-agnostic 2D hole fill mirroring _fill_holes_2d_scipy (binary_fill_holes)."""
+    return ndi.binary_fill_holes(mask_bool)
+
+
+def _try_import_cupy_ndimage():
+    """Return (cupy, cupyx.scipy.ndimage) when both import and a CUDA device is available, else None."""
+    try:
+        import cupy as cp  # type: ignore
+        import cupyx.scipy.ndimage as cpx_ndi  # type: ignore
+    except Exception:
+        return None
+    try:
+        if int(cp.cuda.runtime.getDeviceCount()) <= 0:
+            return None
+    except Exception:
+        return None
+    return cp, cpx_ndi
+
+
+def _try_flatten_gpu_retina_result(r, masks_data: object) -> Optional[GpuFlattenedRetinaPayload]:
+    """v13.1.0 (#2.2/#2.3): reduce a GPU retina-mask stack to GPU-resident union + max-conf planes.
+
+    masks_data is r.masks.data, expected to be a torch tensor of shape (n, Hr, Wr). The union (OR)
+    and per-pixel max confidence are computed on the GPU and KEPT on the GPU so the affine warp to
+    view-native space (and, for the single-angle fast path, --min_radius + hole fill) can also run on
+    the GPU. When the single-angle fast path is active (#2.3), instances below --min_conf are dropped
+    on the GPU before the reduction so the union is already confidence-filtered. Returns None on any
+    unexpected condition so the caller falls back to the legacy whole-stack copy.
+    """
+    try:
+        import torch  # type: ignore
+    except Exception:
+        return None
+    if not isinstance(masks_data, torch.Tensor):
+        return None
+    try:
+        masks = masks_data
+        if masks.ndim != 3:
+            return None
+        h = int(masks.shape[1])
+        w = int(masks.shape[2])
+        n = int(masks.shape[0])
+
+        fastpath = single_angle_gpu_fastpath()
+        fastpath_min_conf = None if fastpath is None else float(fastpath[0])
+        fastpath_min_radius = 0.0 if fastpath is None else float(fastpath[1])
+        run_gpu_cleanup = bool(fastpath is not None and gpu_retina_cleanup_enabled())
+
+        # Pull confidences onto the mask's device as a (n,) float tensor.
+        confs_t = None
+        boxes = getattr(r, 'boxes', None)
+        if boxes is not None and getattr(boxes, 'conf', None) is not None:
+            confs_t = boxes.conf
+            try:
+                confs_t = confs_t.detach()
+            except Exception:
+                pass
+            confs_t = confs_t.to(device=masks.device, dtype=torch.float32).reshape(-1)
+            if int(confs_t.shape[0]) != n:
+                # Length mismatch: fall back rather than guessing an alignment.
+                return None
+
+        masks_bool = masks > 0
+
+        # #2.3 single-angle fast path: drop low-confidence instances on the GPU (exact --min_conf at
+        # instance granularity) before the union/flatten.
+        min_conf_applied = False
+        if (
+            fastpath_min_conf is not None
+            and float(fastpath_min_conf) > 0.0
+            and confs_t is not None
+            and n > 0
+        ):
+            keep = confs_t >= float(fastpath_min_conf)
+            masks_bool = masks_bool[keep]
+            confs_t = confs_t[keep]
+            n = int(masks_bool.shape[0])
+            min_conf_applied = True
+
+        if n <= 0:
+            union_gpu = torch.zeros((h, w), dtype=torch.float32, device=masks.device)
+            conf_gpu = torch.zeros((h, w), dtype=torch.float32, device=masks.device)
+            return GpuFlattenedRetinaPayload(
+                union_gpu=union_gpu, conf_gpu=conf_gpu, instance_count=0,
+                min_conf_applied=min_conf_applied, run_gpu_cleanup=run_gpu_cleanup,
+                gpu_min_radius=float(fastpath_min_radius),
+            )
+
+        union_gpu = masks_bool.any(dim=0).to(torch.float32)  # (h, w) 0/1
+        if confs_t is not None:
+            # Out-of-place clamp: confs_t may be a view onto r.boxes.conf (detach()/to()/reshape()
+            # can share storage), so never mutate it in place.
+            cf = confs_t.clamp(0.0, 1.0)
+            # Per-pixel max confidence among covering instances (pre-quantization, in [0,1]). quantize
+            # is monotonic so a later quantize matches the CPU per-instance accumulation. The
+            # float<-bool promotion in the multiply keeps a single (n,H,W) transient (no separate cast).
+            conf_gpu = (cf.view(-1, 1, 1) * masks_bool).amax(dim=0)
+        else:
+            conf_gpu = None
+        return GpuFlattenedRetinaPayload(
+            union_gpu=union_gpu, conf_gpu=conf_gpu, instance_count=int(n),
+            min_conf_applied=min_conf_applied, run_gpu_cleanup=run_gpu_cleanup,
+            gpu_min_radius=float(fastpath_min_radius),
+        )
+    except Exception:
+        return None
+
+
 def _extract_result_masks_and_confs(r) -> Tuple[Optional[object], Optional[np.ndarray]]:
     """Detach one streamed YOLO result into CPU-owned data for asynchronous postprocess."""
     deferred_payload = getattr(r, '_tta_deferred_cpu_retina_payload', None)
@@ -5407,6 +5812,15 @@ def _extract_result_masks_and_confs(r) -> Tuple[Optional[object], Optional[np.nd
         return None, None
 
     masks_data = r.masks.data  # (n,h,w)
+
+    # v13.1.0 (#2.2/#2.3): in GPU retina mode, flatten (n,H,W) -> union + max-conf on the GPU and copy
+    # only those 2 planes. The flattened payload carries its own confidence plane, so the second
+    # return value is None. Falls back to the legacy whole-stack copy below on any failure.
+    if gpu_retina_flatten_enabled() and not cpu_retina_masks_enabled():
+        flattened = _try_flatten_gpu_retina_result(r, masks_data)
+        if flattened is not None:
+            return flattened, None
+
     try:
         masks_np = np.asarray(masks_data.detach().cpu().numpy(), dtype=np.uint8)
     except Exception:
@@ -5441,6 +5855,15 @@ def _extract_result_masks_and_confs(r) -> Tuple[Optional[object], Optional[np.nd
 # DEAD_CODE_MARKER(v12.2.0-post-refactor): helper became unreachable after pruning deprecated retina validation; retained for one release for regression notebook compatibility.
 def _result_to_prediction_union_u8(result: object, out_size: int) -> np.ndarray:
     masks_np, confs_np = _extract_result_masks_and_confs(result)
+    if isinstance(masks_np, GpuFlattenedRetinaPayload):
+        union_gpu = masks_np.union_gpu
+        if union_gpu is None:
+            return np.zeros((int(out_size), int(out_size)), dtype=np.uint8)
+        frame_union = np.asarray(union_gpu.detach().cpu().numpy())
+        frame_union = (frame_union > 0).astype(np.uint8, copy=False)
+        if int(frame_union.shape[0]) != int(out_size) or int(frame_union.shape[1]) != int(out_size):
+            frame_union = cv2.resize(frame_union, (int(out_size), int(out_size)), interpolation=cv2.INTER_NEAREST)
+        return (frame_union > 0).astype(np.uint8, copy=False)
     if isinstance(masks_np, CpuRetinaMaskPayload):
         frame_union, _frame_conf, _kept = _accumulate_cpu_retina_payload_to_prediction_frame(masks_np, int(out_size))
         return (frame_union > 0).astype(np.uint8, copy=False)
@@ -5514,6 +5937,138 @@ def _process_cpu_retina_prediction_frame(
     return int(kept_instances), 1
 
 
+def _process_gpu_flattened_prediction_frame(
+    idx: int,
+    payload: GpuFlattenedRetinaPayload,
+    out_size: int,
+    view_union_mm: np.ndarray,
+    view_confmap_mm: Optional[np.ndarray],
+    M_out_to_native: np.ndarray,
+    native_h: int,
+    native_w: int,
+    slice_lock: Optional[threading.Lock] = None,
+) -> Tuple[int, int]:
+    """v13.1.0 (#2.2/#2.3): accumulate a GPU-flattened retina frame, warping (and optionally cleaning) on the GPU.
+
+    The (n,Hr,Wr) stack was already reduced on the GPU to a union plane and a max-confidence plane.
+    Here both planes are warped to view-native space ON THE GPU (#2.2: no CPU warp, no per-instance
+    loop) and, for the single-angle fast path (#2.3), --min_radius + 2D hole fill run on the GPU
+    (cupy) on the native union before the host copy; in that case cleanup_done_on_gpu is set so the
+    per-slice CPU streaming cleanup is skipped. Falls back to a CPU warp (and CPU cleanup) if the GPU
+    warp path raises, so results are always produced.
+    """
+    union_gpu = payload.union_gpu
+    if union_gpu is None:
+        return int(payload.instance_count), 0
+
+    track_conf = view_confmap_mm is not None
+    native_union_np: Optional[np.ndarray] = None
+    native_conf_np: Optional[np.ndarray] = None
+    cleaned_on_gpu = False
+
+    try:
+        import torch  # type: ignore
+        if not gpu_retina_warp_enabled():
+            raise RuntimeError('gpu retina warp disabled')
+
+        # Warp union (and conf) to view-native space on the GPU (nearest, zero-padded). Both planes
+        # share one affine_grid / grid_sample call.
+        warp_conf = bool(track_conf and payload.conf_gpu is not None)
+        warped = _torch_warp_planes_to_native(
+            [union_gpu, payload.conf_gpu] if warp_conf else [union_gpu],
+            M_out_to_native, int(out_size), int(native_h), int(native_w),
+        )
+        native_union_t = warped[0]
+        native_union_bool_t = native_union_t > 0.5
+
+        native_conf_t = None
+        if warp_conf:
+            native_conf_f = warped[1]
+            # Quantize to u8 (round-half-even) only where the union is foreground.
+            native_conf_t = torch.where(
+                native_union_bool_t,
+                (native_conf_f.clamp(0.0, 1.0) * float(CONF_U8_MAX)).round(),
+                torch.zeros((), dtype=native_conf_f.dtype, device=native_conf_f.device),
+            ).clamp(0.0, 255.0).to(torch.uint8)
+
+        # #2.3: connected-component --min_radius + 2D hole fill on the GPU (cupy), in native space.
+        if bool(payload.run_gpu_cleanup):
+            cp_mod = _try_import_cupy_ndimage()
+            if cp_mod is not None:
+                cp, cpx_ndi = cp_mod
+                try:
+                    # Pin the cupy device to the torch tensor's CUDA index so cp.asarray does not
+                    # default to device 0 when inference runs on a non-default GPU (e.g. --device 1).
+                    _dev_idx = getattr(native_union_bool_t.device, 'index', None)
+                    _cp_dev = cp.cuda.Device(int(_dev_idx)) if _dev_idx is not None else cp.cuda.Device()
+                    with _cp_dev:
+                        # Move to cupy via uint8 (torch bool tensors do not reliably expose
+                        # __cuda_array_interface__), then back to a boolean mask for the CC ops.
+                        union_cp = cp.asarray(native_union_bool_t.to(torch.uint8).contiguous()) > 0
+                        union_cp = _min_radius_filter_ndimage(cp, cpx_ndi, union_cp, float(payload.gpu_min_radius))
+                        union_cp = _fill_holes_ndimage(cp, cpx_ndi, union_cp)
+                        native_union_np = np.ascontiguousarray(cp.asnumpy(union_cp).astype(np.uint8, copy=False) > 0)
+                    cleaned_on_gpu = True
+                except Exception:
+                    native_union_np = None  # fall back to torch->cpu union, CPU cleanup downstream
+
+        if native_union_np is None:
+            native_union_np = np.ascontiguousarray(native_union_bool_t.detach().cpu().numpy())
+            native_union_np = native_union_np > 0
+        if native_conf_t is not None:
+            native_conf_np = np.ascontiguousarray(native_conf_t.detach().cpu().numpy().astype(np.uint8, copy=False))
+            if bool(cleaned_on_gpu):
+                # Keep confidence only where the cleaned union remains foreground.
+                native_conf_np = np.where(native_union_np, native_conf_np, np.uint8(0)).astype(np.uint8, copy=False)
+    except Exception:
+        # Robust CPU fallback: copy the flattened GPU planes down and warp on the CPU (cv2).
+        native_union_np = None
+        native_conf_np = None
+        cleaned_on_gpu = False
+        try:
+            import torch  # type: ignore
+            frame_union = np.ascontiguousarray((union_gpu.detach().cpu().numpy() > 0).astype(np.uint8))
+        except Exception:
+            return int(payload.instance_count), 0
+        if int(frame_union.shape[0]) != int(out_size) or int(frame_union.shape[1]) != int(out_size):
+            frame_union = cv2.resize(frame_union, (int(out_size), int(out_size)), interpolation=cv2.INTER_NEAREST)
+        native_union_np = cv2.warpAffine(
+            frame_union, M_out_to_native, dsize=(native_w, native_h),
+            flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+        ) > 0
+        if track_conf and payload.conf_gpu is not None:
+            conf_plane = payload.conf_gpu.detach().cpu().numpy()
+            conf_u8 = np.clip(np.rint(np.clip(conf_plane, 0.0, 1.0) * float(CONF_U8_MAX)), 0, 255).astype(np.uint8)
+            if int(conf_u8.shape[0]) != int(out_size) or int(conf_u8.shape[1]) != int(out_size):
+                conf_u8 = cv2.resize(conf_u8, (int(out_size), int(out_size)), interpolation=cv2.INTER_NEAREST)
+            native_conf_np = cv2.warpAffine(
+                conf_u8, M_out_to_native, dsize=(native_w, native_h),
+                flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+            ).astype(np.uint8, copy=False)
+            native_conf_np = np.where(native_union_np, native_conf_np, np.uint8(0)).astype(np.uint8, copy=False)
+
+    if native_union_np is None or not np.any(native_union_np):
+        # Empty after warp/cleanup: nothing written, so report no contributing frame (matches the
+        # CPU retina path). Still record whether the GPU cleanup ran so the CPU cleanup stays skipped.
+        payload.cleanup_done_on_gpu = bool(cleaned_on_gpu)
+        return int(payload.instance_count), 0
+
+    def _write_native_outputs() -> None:
+        view_union_mm[int(idx), :, :] |= native_union_np.astype(np.uint8, copy=False)
+        if view_confmap_mm is not None and native_conf_np is not None and np.any(native_conf_np):
+            conf_slice = view_confmap_mm[int(idx)]
+            np.maximum(conf_slice, native_conf_np, out=conf_slice)
+
+    if slice_lock is None:
+        _write_native_outputs()
+    else:
+        with slice_lock:
+            _write_native_outputs()
+
+    payload.cleanup_done_on_gpu = bool(cleaned_on_gpu)
+    return int(payload.instance_count), 1
+
+
 def _process_prediction_frame(
     idx: int,
     masks_np: Optional[object],
@@ -5527,6 +6082,19 @@ def _process_prediction_frame(
     slice_lock: Optional[threading.Lock] = None,
 ) -> Tuple[int, int]:
     """Collapse one streamed result directly into unpacked native-view union + confidence volumes."""
+    if isinstance(masks_np, GpuFlattenedRetinaPayload):
+        return _process_gpu_flattened_prediction_frame(
+            idx=idx,
+            payload=masks_np,
+            out_size=out_size,
+            view_union_mm=view_union_mm,
+            view_confmap_mm=view_confmap_mm,
+            M_out_to_native=M_out_to_native,
+            native_h=native_h,
+            native_w=native_w,
+            slice_lock=slice_lock,
+        )
+
     if isinstance(masks_np, CpuRetinaMaskPayload):
         return _process_cpu_retina_prediction_frame(
             idx=idx,
@@ -5688,7 +6256,10 @@ def predict_source_and_accumulate(
             native_w=native_w,
             slice_lock=slice_lock,
         )
-        if stream_cleanup:
+        # v13.1.0 (#2.3): skip the per-slice CPU streaming cleanup when the GPU fast path already ran
+        # --min_conf + --min_radius + hole fill on this slice (cleanup_done_on_gpu is set by the frame
+        # processor only when the on-GPU connected-component cleanup actually completed).
+        if stream_cleanup and not bool(getattr(masks_obj, 'cleanup_done_on_gpu', False)):
             cleaned_has_foreground = _cleanup_prediction_slice_inplace(
                 view_union_mm,
                 view_confmap_mm,
@@ -5710,6 +6281,16 @@ def predict_source_and_accumulate(
             pass
         return _process_prediction_unit(int(idx_i), masks_np, confs_np)
 
+    # v13.1.0 (#2.2): on the GPU-flatten path, eagerly reduce each (n,Hr,Wr) GPU stack to 2 small
+    # planes on this (stream) thread so the full stack is released immediately, and bound the queue so
+    # only a capped number of GPU-resident flattened frames stay alive (avoids device OOM).
+    gpu_flatten_eager = bool(
+        gpu_retina_flatten_enabled() and not cpu_retina_masks_enabled() and gpu_retina_eager_flatten_enabled()
+    )
+    effective_pending_limit = int(pending_limit)
+    if gpu_flatten_eager:
+        effective_pending_limit = max(1, min(int(pending_limit), gpu_retina_flatten_pending_limit(worker_count)))
+
     if worker_count <= 1:
         for idx, r in enumerate(results):
             if idx >= num_frames:
@@ -5728,8 +6309,16 @@ def predict_source_and_accumulate(
                     # Discard synthetic repeated-slice results from the padded final batch.
                     continue
 
-                pending.append(executor.submit(_extract_and_process_result, int(idx), r))
-                if len(pending) >= pending_limit:
+                if gpu_flatten_eager:
+                    masks_np, confs_np = _extract_result_masks_and_confs(r)
+                    try:
+                        del r
+                    except Exception:
+                        pass
+                    pending.append(executor.submit(_process_prediction_unit, int(idx), masks_np, confs_np))
+                else:
+                    pending.append(executor.submit(_extract_and_process_result, int(idx), r))
+                if len(pending) >= effective_pending_limit:
                     fut = pending.pop(0)
                     pred_inc, frame_inc = fut.result()
                     prediction_count += int(pred_inc)
@@ -5822,7 +6411,10 @@ def predict_source_and_submit_accumulation(
             native_w=native_w,
             slice_lock=slice_lock,
         )
-        if stream_cleanup:
+        # v13.1.0 (#2.3): skip the per-slice CPU streaming cleanup when the GPU fast path already ran
+        # --min_conf + --min_radius + hole fill on this slice (cleanup_done_on_gpu is set by the frame
+        # processor only when the on-GPU connected-component cleanup actually completed).
+        if stream_cleanup and not bool(getattr(masks_obj, 'cleanup_done_on_gpu', False)):
             cleaned_has_foreground = _cleanup_prediction_slice_inplace(
                 view_union_mm,
                 view_confmap_mm,
@@ -5851,6 +6443,15 @@ def predict_source_and_submit_accumulation(
     precompleted_frames_with_predictions = 0
     pending_limit = async_predict_pending_frame_limit(int(num_frames))
 
+    # v13.1.0 (#2.2): eagerly reduce GPU stacks to 2 small planes on this thread and bound the queue
+    # so GPU-resident flattened frames stay capped (see predict_source_and_accumulate).
+    gpu_flatten_eager = bool(
+        gpu_retina_flatten_enabled() and not cpu_retina_masks_enabled() and gpu_retina_eager_flatten_enabled()
+    )
+    if gpu_flatten_eager:
+        gpu_cap = gpu_retina_flatten_pending_limit(max(1, int(getattr(postprocess_executor, '_max_workers', 1) or 1)))
+        pending_limit = max(1, min(int(pending_limit) if int(pending_limit) > 0 else gpu_cap, gpu_cap))
+
     def _join_one_pending() -> None:
         nonlocal futures, precompleted_prediction_count, precompleted_frames_with_predictions
         if not futures:
@@ -5867,7 +6468,15 @@ def predict_source_and_submit_accumulation(
             synthetic_discarded += 1
             continue
         submitted_frames += 1
-        futures.append(postprocess_executor.submit(_extract_and_process_result, int(idx), r))
+        if gpu_flatten_eager:
+            masks_np, confs_np = _extract_result_masks_and_confs(r)
+            try:
+                del r
+            except Exception:
+                pass
+            futures.append(postprocess_executor.submit(_process_prediction_unit, int(idx), masks_np, confs_np))
+        else:
+            futures.append(postprocess_executor.submit(_extract_and_process_result, int(idx), r))
         while int(pending_limit) > 0 and len(futures) >= int(pending_limit):
             _join_one_pending()
 
@@ -6154,17 +6763,30 @@ def _filter_connected_components_by_min_conf_scipy(
 
 
 def _view_native_slice_min_radius(view: ViewInfo, min_radius: float) -> float:
-    """Return the part of --min_radius that is valid for independent view-native slices."""
+    """Return the --min_radius applied on this view's own native 2D slices.
+
+    v13.1.0 (spec): --min_radius is measured on the YOLO output masks in each prediction set's
+    OWN native 2D slice plane, before backprojection, independently per active view. Every
+    view's native slice plane is therefore the plane --min_radius is measured in, so the full
+    radius is returned for all views (Transverse, Sagittal, Coronal, Radial, Tilted, and tiles).
+    The previous transverse-plane special-casing -- which returned the radius only for Transverse
+    and Tilted-Transverse and deferred Sagittal/Coronal/Radial/Tilted to a transverse-plane pass --
+    is retired, which also removes every deferred/post-backprojection radius stage from scheduling.
+    """
     if float(min_radius) <= 0.0:
         return 0.0
-    if view.name == 'transverse' or (is_tilted_view(view) and tilted_base_view_name(view) == 'transverse'):
-        return float(min_radius)
-    return 0.0
+    return float(min_radius)
 
 
 def _view_needs_deferred_volume_cleanup_after_streaming(view: ViewInfo, min_radius: float) -> bool:
-    """Return True when streaming slice cleanup cannot finish all view cleanup semantics."""
-    return bool(view.name in ('sagittal', 'coronal') and float(min_radius) > 0.0)
+    """Return True when streaming slice cleanup cannot finish all view cleanup semantics.
+
+    v13.1.0 (spec): --min_radius is now fully applied on each view's native slices (see
+    _view_native_slice_min_radius), so no view needs a deferred transverse-plane radius pass.
+    This always returns False and now has no live callers; it is retained for back-compat only.
+    """
+    del view, min_radius
+    return False
 
 
 def _cleanup_prediction_slice_inplace(
@@ -6184,10 +6806,12 @@ def _cleanup_prediction_slice_inplace(
     older whole-volume cleanup pass. v13.0.0 applies the spec-ordered slice-local
     semantics: confidence gating (--min_conf) followed by view-native 2D min-radius
     filtering (--min_radius). 2D hole filling is NOT performed here; per spec items
-    5-6 it runs as a final per-view volume pass after all radius filtering, so it is
-    handled by cleanup_view_volume_after_prediction_inplace(). Cleanup that depends
-    on a transposed/volume-level view, such as Sagittal or Coronal transverse-plane
-    min-radius filtering, is also deferred until the full view volume exists.
+    5-6 it runs as a final per-view volume pass after radius filtering, so it is
+    handled by cleanup_view_volume_after_prediction_inplace(). v13.1.0 (spec): the full
+    --min_radius is valid on every view's own native slice plane, so there is no longer
+    any deferred transposed/transverse-plane radius pass for Sagittal/Coronal (or any
+    post-backprojection radius pass for Radial/Tilted); this per-slice unit is the only
+    radius stage.
     """
     idx_i = int(idx)
     backend_norm = cleanup_backend() if backend is None else str(backend)
@@ -6219,8 +6843,8 @@ def _cleanup_prediction_slice_inplace(
     # v13.0.0 (bug fix): apply --min_radius BEFORE hole filling. Spec items 5-6 require the order
     # --min_conf -> --min_radius -> hole fill, with hole filling applied to the FINAL per-view
     # volume. Hole filling is therefore performed as a separate volume-level 2D pass in
-    # cleanup_view_volume_after_prediction_inplace() after every (native + deferred) radius filter
-    # completes, rather than here in the per-slice unit (which previously hole-filled before radius).
+    # cleanup_view_volume_after_prediction_inplace() after the (v13.1.0: native per-view) radius
+    # filter completes, rather than here in the per-slice unit (which previously hole-filled before radius).
     if np.any(mask_slice) and float(min_radius) > 0.0:
         if backend_norm == 'opencv':
             mask_slice = _filter_connected_components_by_min_radius_opencv(
@@ -6372,20 +6996,18 @@ def cleanup_view_volume_after_prediction_inplace(
     workers: int = 1,
     precleaned_slice_cleanup: bool = False,
 ) -> None:
+    # v13.1.0 (spec): --min_radius is applied on this view's OWN native 2D slices, so the full
+    # radius is valid for the per-slice fused cleanup of every view (no deferred transverse-plane
+    # pass remains for any view -- _view_needs_deferred_volume_cleanup_after_streaming is now
+    # always False, and Radial/Tilted no longer re-filter after backprojection).
     native_min_radius = _view_native_slice_min_radius(view, float(min_radius))
 
     if bool(precleaned_slice_cleanup):
-        # v12.2.8 single-angle inference has already applied per-slice --min_conf and
-        # view-native --min_radius as results streamed in. Only cleanup whose semantics
-        # require the completed view volume (deferred transverse-plane --min_radius for
-        # Sagittal/Coronal) remains before the final hole-fill pass.
-        if _view_needs_deferred_volume_cleanup_after_streaming(view, float(min_radius)):
-            apply_view_min_radius_filter_inplace(
-                mask_mm,
-                view,
-                float(min_radius),
-                workers=int(workers),
-            )
+        # v12.2.8 single-angle inference has already applied per-slice --min_conf and the full
+        # view-native --min_radius as results streamed in (streaming_cleanup_min_radius now equals
+        # the full radius for every view), so nothing radius-related remains before the final
+        # hole-fill pass.
+        pass
     else:
         effective_confmap_mm = confmap_mm if float(min_conf) > 0.0 else None
 
@@ -6398,17 +7020,9 @@ def cleanup_view_volume_after_prediction_inplace(
             desc=f'Fused cleanup ({view.name})',
         )
 
-        if _view_needs_deferred_volume_cleanup_after_streaming(view, float(min_radius)):
-            apply_view_min_radius_filter_inplace(
-                mask_mm,
-                view,
-                float(min_radius),
-                workers=int(workers),
-            )
-
     # v13.0.0 (bug fix): 2D hole filling is the FINAL per-view step (spec item 6), applied after
-    # --min_conf and every --min_radius filter (native per-slice + deferred transverse-plane).
-    # The previous order hole-filled before --min_radius inside the per-slice unit.
+    # --min_conf and the view-native --min_radius filter. The previous order hole-filled before
+    # --min_radius inside the per-slice unit.
     fill_view_volume_holes_2d_inplace(
         mask_mm,
         workers=int(workers),
@@ -6608,6 +7222,14 @@ def _gpu_inference_worker_main(
         except Exception:
             pass
         set_retina_mask_processor(str(init_dict.get('retina_processor', 'cpu')))
+        # v13.1.0 (#2.3): propagate the single-angle GPU fast-path (min_conf, min_radius) into this
+        # worker process (globals do not cross the spawn boundary). None disables the fast path.
+        _fastpath_min_conf = init_dict.get('single_angle_gpu_fastpath_min_conf', None)
+        _fastpath_min_radius = init_dict.get('single_angle_gpu_fastpath_min_radius', 0.0)
+        set_single_angle_gpu_fastpath(
+            None if _fastpath_min_conf is None else float(_fastpath_min_conf),
+            float(_fastpath_min_radius or 0.0),
+        )
         cfg = PredictConfig(
             imgsz=int(init_dict['imgsz']),
             conf=float(init_dict['conf']),
@@ -7281,7 +7903,13 @@ def apply_transverse_min_radius_filter_inplace(
     *,
     workers: int = 1,
 ) -> None:
-    """In-place transverse-plane radius filter to avoid a full extra volume copy."""
+    """In-place transverse-plane radius filter to avoid a full extra volume copy.
+
+    v13.1.0 (spec): retained for back-compat only. --min_radius is now applied in each view's own
+    native 2D slice plane (see _view_native_slice_min_radius / cleanup_view_volume_after_prediction_inplace),
+    so this transverse-plane helper and apply_view_min_radius_filter_inplace are no longer called by the
+    pipeline.
+    """
     if float(min_radius) <= 0:
         return
 
@@ -7949,13 +8577,10 @@ class HybridBackprojectionQueue:
         else:  # pragma: no cover
             raise ValueError(f'Unsupported queued backprojection view family: {view_local.family}')
 
-        if float(job.min_radius) > 0.0:
-            print(f"Applying --min_radius in the transverse plane for backprojected view '{view_local.name}' [{backend}]")
-            apply_transverse_min_radius_filter_inplace(
-                projected,
-                float(job.min_radius),
-                workers=int(job.workers),
-            )
+        # v13.1.0 (spec): --min_radius is applied per view in each view's OWN native 2D slice
+        # plane BEFORE backprojection (during cleanup_view_volume_after_prediction_inplace), so it
+        # is NOT re-applied here in the backprojected (Cartesian/transverse) plane. job.min_radius
+        # is retained on the dataclass for back-compat but is no longer consumed.
         return str(job.model_name), str(view_local.name), projected
 
     def run(self, jobs: Sequence[ViewBackprojectionQueueJob]) -> List[Tuple[str, str, np.ndarray]]:
@@ -14946,18 +15571,49 @@ def main() -> None:
     requested_azimuth_angle = None if args.azimuth_angle is None else float(args.azimuth_angle)
 
     # v13.0.0 multi-GPU scheduling + retina-mask-processor resolution.
-    inference_devices = parse_device_list(str(args.device))
+    inference_devices = parse_device_list(args.device)
     gpu_device_count = len([d for d in inference_devices if str(d).startswith('cuda')])
     multi_gpu_active = bool(gpu_device_count > 1)
     retina_processor, retina_processor_reason = resolve_retina_mask_processor(
         args.retina_mask_processor, inference_devices
     )
     set_retina_mask_processor(retina_processor)
+    # v13.1.0 (#2.3): single-angle + gpu-retina fast path. When exactly one --angle is used and retina
+    # masks are resolved on the GPU, the whole per-slice cleanup runs on the GPU: instances below
+    # --min_conf are dropped before the union/flatten, the union+confidence planes are warped to
+    # view-native space on the GPU, and --min_radius + 2D hole fill run on the GPU (cupy). Only the
+    # finished view-native plane crosses PCIe. None disables the fast path (e.g. multi-angle, where the
+    # full union and cross-angle max-confidence must be preserved before --min_conf is applied at the
+    # volume level); multi-angle gpu runs still get the on-GPU flatten + warp (#2.2).
+    single_angle_gpu_fastpath_active = bool(
+        single_angle_streaming_cleanup_active and str(retina_processor).strip().lower() == 'gpu'
+    )
+    single_angle_gpu_fastpath_min_conf_value = (
+        float(args.min_conf) if single_angle_gpu_fastpath_active else None
+    )
+    single_angle_gpu_fastpath_min_radius_value = (
+        float(args.min_radius) if single_angle_gpu_fastpath_active else 0.0
+    )
+    set_single_angle_gpu_fastpath(
+        single_angle_gpu_fastpath_min_conf_value, single_angle_gpu_fastpath_min_radius_value
+    )
     print(
         f'Inference devices: {inference_devices} '
         f'(multi-GPU scheduling {"active" if multi_gpu_active else "inactive"}); '
         f'retina mask processor: {retina_processor} ({retina_processor_reason}).'
     )
+    if single_angle_gpu_fastpath_active:
+        print(
+            'v13.1.0 single-angle GPU retina fast path active: retina masks are flattened, '
+            f'confidence-filtered (--min_conf={float(args.min_conf):.3f}), warped to view-native space, '
+            f'and --min_radius={float(args.min_radius):g} + 2D hole fill are applied on the GPU before '
+            'the PCIe copy (cupy required for the on-GPU --min_radius/hole-fill; CPU fallback otherwise).'
+        )
+    elif str(retina_processor).strip().lower() == 'gpu':
+        print(
+            'v13.1.0 GPU retina flatten active: the (n,H,W) retina-mask stack is reduced to union + '
+            'max-confidence planes and warped to view-native space on the GPU before the PCIe copy.'
+        )
     # v13.0.0: under multi-GPU each inference worker is its own process pinned (via
     # CUDA_VISIBLE_DEVICES) to a single physical GPU exposed as cuda:0, so CUDA input staging is
     # device-safe per worker and is left at its default. The main process performs no inference.
@@ -15141,6 +15797,31 @@ def main() -> None:
     inference_views = [v for v in views if not (transverse_inference_disabled and v.name == 'transverse')]
     interpolating_views = [v for v in inference_views if _view_uses_interpolation(v, int(args.interpolate))]
     spec_notes: List[str] = []
+    # v13.1.0 spec<->implementation conflict notes (see header docstring and suggested spec edits).
+    spec_notes.append(
+        'CONFLICT NOTE 1 (--min_radius): the task says --min_radius is now applied per view in each '
+        'prediction set\'s own native 2D slice plane before backprojection. Spec flag #8 and item 5 '
+        'already agree, but earlier prose ("transverse-plane radius", deferred Sagittal/Coronal pass, '
+        'post-backprojection Radial/Tilted pass) conflicted. Per the task, --min_radius is now applied '
+        'on every view\'s native slices during per-view cleanup and is NOT re-applied after '
+        'backprojection. Suggested spec edit: delete every "transverse plane" reference for --min_radius '
+        'and state "measured on the YOLO output masks in each prediction set\'s own native 2D slice '
+        'plane, before backprojection, independently per active view".'
+    )
+    if str(retina_processor).strip().lower() == 'gpu':
+        spec_notes.append(
+            'v13.1.0 (#2.2): GPU retina-mask flatten + warp. The (n,H,W) retina-mask stack is reduced on '
+            'the GPU to a union plane and a max-confidence plane, and both are warped to view-native space '
+            'on the GPU (torch grid_sample), so only the view-native planes cross PCIe (O(2*H*W)); no '
+            'affine warp and no per-instance loop run on the CPU.'
+        )
+    if single_angle_gpu_fastpath_active:
+        spec_notes.append(
+            'v13.1.0 (#2.3): single-angle GPU fast path. YOLO -> flatten -> --min_conf -> warp -> '
+            '--min_radius -> 2D hole fill all run on the GPU (--min_radius/hole-fill via cupy; CPU '
+            'fallback if cupy is unavailable), then one finished view-native plane is sent to the CPU for '
+            'interpolation.'
+        )
     if preprocess_streaming_active:
         spec_notes.append(
             'v12.2.15 streaming preprocessing is active: decoded native slices become available as ffmpeg produces them. Transverse readers wait only for the needed decoded slice; stack-sampling view families wait for the completed decoded volume. Legacy cube resize, when explicitly enabled, still streams its output slices.'
@@ -15155,7 +15836,7 @@ def main() -> None:
         )
     if bool(single_angle_streaming_cleanup_active):
         spec_notes.append(
-            'v12.2.8 single-angle streaming cleanup is active: exactly one --angle value was supplied, so YOLO result slices are confidence-filtered and view-native min_radius-filtered as they stream in. v13.0.0 (bug fix) defers 2D hole filling to a final per-view volume pass (after --min_conf and all --min_radius), and Sagittal/Coronal transverse-plane min_radius cleanup also waits for the completed view volume, before interpolation.'
+            'v12.2.8 single-angle streaming cleanup is active: exactly one --angle value was supplied, so YOLO result slices are confidence-filtered and view-native min_radius-filtered as they stream in. v13.1.0 applies the full --min_radius on every view\'s own native 2D slices (no deferred transverse-plane pass and no post-backprojection radius stage). 2D hole filling runs as a final per-view volume pass (after --min_conf and --min_radius) before interpolation.'
         )
     else:
         spec_notes.append(
@@ -15340,7 +16021,12 @@ def main() -> None:
         )
 
 
-    worker_budget = int(default_worker_budget())
+    # v13.1.0 (#2.1): size main-process pools GPU-count aware. In multi-GPU runs the per-GPU
+    # inference subprocesses already consume ~visible_cpu render threads (the GPU-blocking pools), so
+    # the main-process GPU-non-blocking pools take only the remaining headroom of the 2x box target.
+    # Single-GPU keeps the full 2x budget (inference is in-process).
+    worker_budget = int(main_process_worker_budget(int(gpu_device_count), bool(multi_gpu_active)))
+    whole_box_worker_budget = int(default_worker_budget())
     augmentation_workers = resolve_worker_count(
         0,
         'YOLO_TTA_AUG_WORKERS',
@@ -15406,8 +16092,18 @@ def main() -> None:
     )
 
     print(f'Allocated CPU count: {_cpu_count()}')
-    print(f'Worker budget: {worker_budget}')
-    print('Worker oversubscription is intentional (default budget = 2x visible CPUs).')
+    print(f'Worker budget (main process): {worker_budget}')
+    if bool(multi_gpu_active):
+        _gpu_share = int(multi_gpu_worker_share(int(gpu_device_count)))
+        print(
+            'Worker oversubscription is intentional (whole-box target = 2x visible CPUs = '
+            f'{whole_box_worker_budget}). Multi-GPU ({gpu_device_count} GPUs): each per-GPU inference '
+            f'subprocess uses ~{_gpu_share} render thread(s) ({_gpu_share * int(gpu_device_count)} total '
+            'for GPU-blocking work), so the GPU-non-blocking main-process pools are sized to the '
+            f'remaining {worker_budget} to keep the box near 2:1 instead of oversubscribing it.'
+        )
+    else:
+        print('Worker oversubscription is intentional (budget = 2x visible CPUs; inference is in-process).')
     print(f'Augmentation workers: {augmentation_workers}')
     print(f'Slice-parallel postprocess workers: {slice_postprocess_workers}')
     print(f'Inference postprocess workers: {predict_postprocess_workers}')
@@ -16558,6 +17254,9 @@ def main() -> None:
             'half': bool(args.half), 'int8': bool(args.int8), 'batch': max(1, int(args.batch)),
             'retina_processor': str(retina_processor),
             'cv2_threads': max(1, _env_int('YOLO_TTA_MGPU_WORKER_CV2_THREADS', 1)),
+            # v13.1.0 (#2.3): single-angle GPU fast-path (min_conf None when inactive) + min_radius.
+            'single_angle_gpu_fastpath_min_conf': single_angle_gpu_fastpath_min_conf_value,
+            'single_angle_gpu_fastpath_min_radius': single_angle_gpu_fastpath_min_radius_value,
         }
         physical_gpu_indices = [int(str(d).split(':')[-1]) for d in inference_devices]
         # Split each full-frame volume into contiguous slice-range chunks so multiple GPUs can work
@@ -17104,7 +17803,9 @@ def main() -> None:
                 native_source=native_source,
                 out_path=temp_dir / 'view_volumes' / str(model_name) / f'{view.name}.u8.dat',
                 desc=f'Backprojecting final {model_name}/{view.name}',
-                min_radius=float(args.min_radius),
+                # v13.1.0 (spec): --min_radius is already applied in the view-native plane before
+                # backprojection, so the queue no longer re-filters after backprojection.
+                min_radius=0.0,
                 workers=1,
             ))
 
