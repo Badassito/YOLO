@@ -2,8 +2,36 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the v13.1.0_SLURM implementation. It is derived from the v13.0.x_SLURM line (multi-GPU scheduling
-plus the v12.2.x performance patches), with the following v13.1.0 changes:
+This is the v13.2.0_SLURM implementation. It is derived from v13.1.0_SLURM by COPY + surgical edits,
+with the following v13.2.0 changes:
+  - v13.2.0 (task #1) --save_nrrd is reworked from one mega 4D decomposed NRRD (a single file with a
+    trailing list axis, assembled by reading every layer backing store through pigz at the very end)
+    into one single-layer 3-axis NRRD (X,Y,t) per component layer written to nrrd/. Each small layer
+    fits in RAM and is gzip-compressed in one pigz pass, so the layers are produced during the
+    intermediate pipeline steps instead of all at the tail: an NrrdLayerSink writes each layer as it is
+    materialized (e.g. the Transverse layer NRRD compresses while Tiled Transverse is still being
+    inferenced), the Global_union_presmoothing layer is written while Gaussian smoothing runs, and the
+    Global_final_output layer is written at the tail. A single {Filestem}_nrrd_manifest.json lists every
+    written layer. The mega 4D writer (write_decomposed_nrrd + its decomposed-payload/header/manifest
+    helpers) is removed.
+  - v13.2.0 (task #2.1) the model name is dropped from NRRD layer temp folders and layer key/filenames
+    (nrrd_layers/, nrrd_work/, nrrd_support/ and the layer key) — a holdover from model-ensemble runs.
+  - v13.2.0 (task #2.3) the fully deprecated --save_sagittal/--save_coronal machinery is pruned
+    (the always-False save_sagittal/save_coronal locals, the dead output branch, and the now-unused
+    collect_multiplanar_output_futures + its per-view overlay/label/binary writers).
+  - v13.2.0 (task #2.4) the duplicated "3D assembly + postprocessing" comment block is collapsed to one.
+  - v13.2.0 (task #2.5) reviewed the single-angle + gpu-retina fast path: YOLO -> flatten -> --min_conf
+    -> warp -> --min_radius -> 2D hole fill all run on the GPU (cupy), and only the finished view-native
+    plane crosses PCIe; the per-slice CPU cleanup is skipped via cleanup_done_on_gpu. No tqdm bar wraps
+    the inference stream, so any tqdm the user sees that lags the GPU is a different (post-inference)
+    progress bar and is a purely visual artifact — the fast path was left unchanged. See CONFLICT NOTE.
+  - v13.2.0 (task #2.6) low-quality NRRDs no longer run regardless of --save_nrrd: the low-quality NRRD
+    is now a single combined binary volume gated behind --save_nrrd, and NRRD layer materialization is
+    gated on --save_nrrd alone (requesting only low-quality outputs writes the low-quality videos but no
+    NRRD).
+
+It is derived from the v13.0.x_SLURM line (multi-GPU scheduling plus the v12.2.x performance patches),
+with the following v13.1.0 changes:
   - v13.1.0 (spec) --min_radius is now applied per view in EACH prediction set's OWN native 2D slice plane,
     BEFORE backprojection, independently per active view (Cartesian, Radial, Tilted, and tiles). The previous
     transverse-plane semantics are gone: Sagittal/Coronal no longer transpose to a deferred transverse-plane
@@ -95,12 +123,12 @@ the v12.2.1-v12.2.14 performance patches) introduced the following v13.0.0 chang
   - supports Radial and generalized Tilted View-native interpolation, and keeps every Tilted View frame N centered on its base view native slice N with black-padded out-of-bounds shear samples
   - resizes the working volume to an approximately cubic orthogonal volume when needed, restores the final mask to the original input dimensions for default outputs,
     and saves the transverse default color overlay plus optional labels, bilevel compressed TIFF binary masks, binary MKVs,
-    decomposed multi-layer NRRD, active-view image sequences, and isotropically downsampled
+    one single-layer NRRD per component layer, active-view image sequences, and isotropically downsampled
     low-quality presentation outputs, with FFV1 used for spec-required MKVs
-  - writes the default NRRD as independently toggleable layers for full-frame YOLO masks, interpolation bridges, tiled masks accepted by parent YOLO masks,
-    tiled masks accepted by parent bridges, consolidated tile bridges, the pre-smoothing global union, smoothing-pass results, and the final output layer
-  - streams NRRD gzip-encoded payloads through pigz from per-layer backing arrays or raw cvol stores without materializing a full 4D decomposed payload, reducing peak scratch pressure during final NRRD creation
-  - records NRRD SegmentN_Extent metadata while each layer is materialized, so final NRRD packaging reuses stored extents instead of rescanning every backing layer
+  - writes --save_nrrd as one single-layer 3-axis NRRD (X,Y,t) per component layer (full-frame YOLO masks, interpolation bridges,
+    tiled masks accepted by parent YOLO masks, tiled masks accepted by parent bridges, consolidated tile bridges, the pre-smoothing
+    global union, smoothing-pass results, and the final output), each gzip-compressed in one pigz pass and written as it is produced
+    during the intermediate pipeline steps, plus a single nrrd manifest sidecar
 
 Dependencies (Python):
   pip install opencv-python numpy scipy tifffile tqdm ultralytics
@@ -137,7 +165,7 @@ from dataclasses import dataclass, field
 
 GIB = 1024 ** 3
 NRRD_SPACE = "left-posterior-superior"
-NRRD_AXIS_ORDER_NOTE = "internal mask (t,Y,X) is exported as Slicer spatial axes (X,Y,t); decomposed Segment list axis is trailing (X,Y,t,layer)"
+NRRD_AXIS_ORDER_NOTE = "internal mask (t,Y,X) is exported as Slicer spatial axes (X,Y,t); the decomposition is one single-layer 3-axis NRRD (X,Y,t) per component layer"
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
@@ -200,8 +228,6 @@ def _parse_int_list(values: Sequence[str] | str | int | None) -> List[int]:
             continue
         parts.extend([p for p in re.split(r"[,\s]+", raw) if p])
     return [int(p) for p in parts]
-
-
 
 
 def _parse_token_list(values: Sequence[str] | str | None) -> List[str]:
@@ -333,9 +359,9 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Save final YOLO segmentation labels per frame. Optional custom pattern, e.g. labels/{Filename}_%%04d.txt")
     p.add_argument("--save_binary", nargs="?", const="__DEFAULT__", default=None, type=str,
                    help="Save final binary masks as a TIFF sequence plus an FFV1 MKV. Optional custom TIFF pattern, e.g. binary_masks/{Filename}_Binary_%%04d.tiff")
-    p.add_argument("--save_nrrd", action="store_true", help="Save a decomposed multi-layer NRRD plus manifest JSON")
+    p.add_argument("--save_nrrd", action="store_true", help="Save the decomposition as one single-layer NRRD (X,Y,t) per component layer in nrrd/, plus a manifest JSON. Layers are written during the intermediate pipeline steps")
     p.add_argument("--save_low_quality", action="store_true",
-                   help="Save additional isotropically downsampled low-quality presentation videos and NRRDs using libx264, preset slow, yuv420p")
+                   help="Save additional isotropically downsampled low-quality presentation videos (libx264, preset slow, yuv420p). A single combined low-quality NRRD is also written, but only when --save_nrrd is enabled")
     p.add_argument("--save_low_quality_downbin", nargs="+", default=None, type=str,
                    help="One or more isotropic low-quality downbins. Floats scale each X/Y/t dimension, e.g. 0.5. Integers scale the largest dimension to that value. Providing this flag implies --save_low_quality")
     p.add_argument("--voxel_volume", action="store_true", help="Count white voxels in the final binary output after restoration to native input geometry and save the value to the summary text file")
@@ -389,8 +415,6 @@ def available_anon_work_bytes() -> int:
     mem_avail = int(info.get('MemAvailable', 0))
     swap_free = int(info.get('SwapFree', 0))
     return max(0, mem_avail + swap_free)
-
-
 
 
 def _env_float(name: str, default: float) -> float:
@@ -745,7 +769,6 @@ def parallel_for_indices(
                 fut.result()
 
 
-
 def choose_parallel_chunk_size(
     total_items: int,
     max_workers: int,
@@ -764,7 +787,6 @@ def choose_parallel_chunk_size(
     if max_chunk_size is not None:
         chunk = min(int(chunk), max(1, int(max_chunk_size)))
     return max(1, int(chunk))
-
 
 
 def parallel_for_indices_chunked(
@@ -817,7 +839,6 @@ def parallel_for_indices_chunked(
                 fut.result()
 
 
-
 def workspace_anon_cap_bytes() -> int:
     """Return the optional anonymous-workspace cap.
 
@@ -857,18 +878,8 @@ def should_use_in_memory_workspace(required_bytes: int, reserve_bytes: int = 16 
     return avail >= int(required_bytes) + reserve
 
 
-
-
-
-
-
-
-
-
 def choose_slice_parallel_workers(requested_workers: int, num_items: int) -> int:
     return max(1, min(int(requested_workers), int(max(1, num_items))))
-
-
 
 
 def choose_scratch_dir(preferred: Optional[str], out_dir: Path, stem: str) -> Path:
@@ -1668,8 +1679,6 @@ def compute_cube_resize_shape(
     )
 
 
-
-
 def processing_volume_mode() -> str:
     """Return the v13.0.0 processing geometry mode.
 
@@ -1717,7 +1726,6 @@ def should_resize_to_processing_cube(input_shape: Tuple[int, int, int], cube_sha
     if mode != 'cube':
         return False
     return tuple(int(x) for x in input_shape) != tuple(int(x) for x in cube_shape)
-
 
 
 def _linear_source_index(out_idx: int, out_count: int, in_count: int) -> float:
@@ -2117,9 +2125,6 @@ def ffmpeg_rawvideo_writer(
     return proc
 
 
-
-
-
 def ffmpeg_ffv1_gray_writer(
     out_path: Path,
     width: int,
@@ -2237,7 +2242,6 @@ def purge_remaining_temporary_mkvs(temp_dir: Path, *, keep_temp: bool) -> int:
         if purge_temporary_mkv(path, temp_dir=root, keep_temp=False, reason='final scratch sweep'):
             purged += 1
     return int(purged)
-
 
 
 # --------------------------
@@ -2483,8 +2487,6 @@ def build_radial_azimuths(azimuth_angle: float) -> List[float]:
     if not out:
         out.append(0.0)
     return out
-
-
 
 
 def tilted_frame_center(view: ViewInfo, frame_idx: int) -> int:
@@ -2759,7 +2761,6 @@ def choose_radial_exact_block_frames(diameter: int, target_bytes: int = 256 * 10
     bytes_per_frame = max(1, int(diameter) * _lanczos_tap_count(RADIAL_LANCZOS_A) * np.dtype(np.float32).itemsize)
     block = max(1, int(target_bytes // bytes_per_frame))
     return max(1, min(256, block))
-
 
 
 def extract_radial_slice_frame(volume_rgb: np.ndarray, sampler: RadialSampler) -> np.ndarray:
@@ -3076,7 +3077,6 @@ class InMemoryYoloVolumeSource:
             else:
                 info.append(f'in-memory {self.name} slice {idx + 1}/{self.nf}: ')
         return paths, imgs, info
-
 
 
 class StreamingYoloVolumeSource:
@@ -3598,7 +3598,6 @@ def maybe_wrap_source_with_gpu_input_staging(source: object, cfg: 'PredictConfig
     )
 
 
-
 def gpu_input_staging_ahead_sources(default_queue_slots: int) -> int:
     """Number of queued prediction sources allowed to pre-stage CUDA batches.
 
@@ -3654,7 +3653,6 @@ def maybe_eager_stage_prediction_ref_on_gpu(prediction_ref: PredictionVolumeRef,
         except Exception as exc:
             print(f'Warning: eager CUDA input staging could not start for {prediction_ref.name} ({exc}); source will stage on demand.')
     return prediction_ref
-
 
 
 def streaming_prediction_sources_enabled() -> bool:
@@ -3959,14 +3957,6 @@ class TiltedRenderPlan:
 _TILTED_RENDER_PLAN_CACHE: Dict[Tuple[str, int, int, Tuple[float, ...]], TiltedRenderPlan] = {}
 
 
-
-
-
-
-
-
-
-
 def _tilted_plan_cache_key(view: ViewInfo, M_grid_to_src: np.ndarray, grid_h: int, grid_w: int) -> Tuple[str, int, int, Tuple[float, ...]]:
     mat = tuple(round(float(x), 6) for x in np.asarray(M_grid_to_src, dtype=np.float32).reshape(-1).tolist())
     return (str(view.name), int(grid_h), int(grid_w), mat)
@@ -4205,11 +4195,6 @@ def render_tilted_native_mask_frame(mask_u8: np.ndarray, view: ViewInfo, frame_i
     return render_tilted_mask_canvas_frame(mask_u8, view, int(frame_idx), aff)
 
 
-
-
-
-
-
 def render_fullframe_frame_for_job(
     volume_rgb: np.ndarray,
     view: ViewInfo,
@@ -4236,7 +4221,6 @@ def render_fullframe_frame_for_job(
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=0,
     )
-
 
 
 def render_dense_tile_frame_for_job(
@@ -4438,13 +4422,6 @@ def materialize_dense_tile_prediction_volume_for_job(
     )
 
 
-
-
-
-
-
-
-
 def should_cache_view_frames(view: ViewInfo, dense_tiling_active: bool) -> bool:
     """Return True when precomputing native single-channel frames is worthwhile for this view.
 
@@ -4453,8 +4430,6 @@ def should_cache_view_frames(view: ViewInfo, dense_tiling_active: bool) -> bool:
     therefore keeps this prebuild opt-in; streaming sources render only the slices they need.
     """
     return bool(_env_flag('YOLO_TTA_PREBUILD_VIEW_FRAME_CACHES', False)) and bool(dense_tiling_active) and view.family == 'radial'
-
-
 
 
 def build_view_frame_cache(
@@ -4578,7 +4553,6 @@ def get_view_frame_by_index(
         return render_tilted_native_frame(volume_rgb, view, int(index))
 
     raise ValueError(f'Unknown view: {view.name}')
-
 
 
 # --------------------------
@@ -5090,7 +5064,6 @@ class GpuFlattenedRetinaPayload:
     cleanup_done_on_gpu: bool = False
 
 
-
 @dataclass(frozen=True)
 class DeferredCpuRetinaMaskPayload:
     """Compact GPU tensors captured from Ultralytics and copied in result-worker threads."""
@@ -5134,8 +5107,6 @@ def cpu_retina_block_detections() -> int:
     return max(1, _env_int('YOLO_TTA_CPU_RETINA_BLOCK_DETECTIONS', 8))
 
 
-
-
 def cpu_retina_deferred_payload_enabled() -> bool:
     """Defer compact pred/proto CPU copies from Ultralytics construct_result to result workers."""
     if os.environ.get('YOLO_TTA_CPU_RETINA_DEFER_GPU_COPY') is not None:
@@ -5162,8 +5133,6 @@ def cpu_mask_postprocess_pending_limit(worker_count: int, num_frames: int) -> in
     if int(requested) <= 0:
         return max(workers, frames)
     return max(workers, min(frames, max(int(requested), workers * 2)))
-
-
 
 
 _ULTRALYTICS_SINGLE_CHANNEL_PREPROCESS_PATCHED = False
@@ -6341,7 +6310,6 @@ def predict_source_and_accumulate(
     }
 
 
-
 def predict_source_and_submit_accumulation(
     model,
     source: object,
@@ -6578,41 +6546,12 @@ def predict_in_memory_volume_and_accumulate(
     )
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # --------------------------
 # Per-view postprocessing
 # --------------------------
 # --------------------------
 # Per-view postprocessing
 # --------------------------
-
-
 
 
 def cleanup_backend() -> str:
@@ -6761,7 +6700,6 @@ def _filter_connected_components_by_min_conf_scipy(
     return np.isin(labels2d, keep_ids)
 
 
-
 def _view_native_slice_min_radius(view: ViewInfo, min_radius: float) -> float:
     """Return the --min_radius applied on this view's own native 2D slices.
 
@@ -6867,10 +6805,6 @@ def _cleanup_prediction_slice_inplace(
             conf_slice.fill(np.uint8(0))
         confmap_mm[idx_i, :, :] = conf_slice.astype(np.uint8, copy=False)
     return bool(has_foreground)
-
-
-
-
 
 
 _INFERENCE_BATCH_SIZE = 1
@@ -7277,9 +7211,6 @@ def _gpu_inference_worker_main(
 # --------------------------
 # 3D assembly + postprocessing
 # --------------------------
-# --------------------------
-# 3D assembly + postprocessing
-# --------------------------
 
 
 class _UnionFind:
@@ -7553,7 +7484,6 @@ def fill_3d_voids_inplace_streaming(
             bg_gid_path.unlink(missing_ok=True)
         except Exception:
             pass
-
 
 
 def label_foreground_volume_streaming(
@@ -8362,7 +8292,6 @@ def backproject_tilted_volume_to_volume(
 
     flush_array(vol_mm)
     return vol_mm
-
 
 
 def _try_import_cupy_for_backprojection() -> Optional[object]:
@@ -9504,7 +9433,6 @@ def _local_half_width_for_components(
     return max(4, int(math.ceil(max_extent)) + 4)
 
 
-
 _NUMBA_PROJECTION_KERNEL_RUNTIME_DISABLED = False
 
 
@@ -9845,7 +9773,6 @@ def _find_slice_projection_candidates_python(
         ),
     )
     return ordered[: int(max_candidates)]
-
 
 
 def _find_slice_projection_candidates(
@@ -10446,8 +10373,6 @@ def interpolate_view_volume_pass_inplace(
     }
 
 
-
-
 @dataclass
 class PreparedViewResult:
     model_name: str
@@ -10495,7 +10420,6 @@ class DeferredTilePostprocessResult:
     storage_format: str = 'ctile-mask-v2-raw'
 
 
-
 CTILE_FORMAT = 'ctile-mask-v2-raw'
 CVOL_FORMAT = 'cvol-mask-v2-raw'
 MASK_STORE_FORMATS = {CTILE_FORMAT, CVOL_FORMAT}
@@ -10519,12 +10443,13 @@ NrrdSegmentExtent = Tuple[int, int, int, int, int, int]
 
 @dataclass(frozen=True)
 class NrrdLayerRef:
-    """One orthogonal-space layer for decomposed NRRD export.
+    """One orthogonal-space layer for the single-layer NRRD decomposition.
 
     The layer is a binary mask in the pipeline's orthogonal ``(t, Y, X)``
     processing geometry. The backing path may be a raw uint8 memmap or a
-    v12.2 raw bbox cvol/ctile store. The NRRD writer reads either source
-    slice-by-slice and writes a 4D NRRD with a trailing list axis.
+    v12.2 raw bbox cvol/ctile store. v13.2.0 writes one single-layer 3-axis NRRD
+    (X, Y, t) per component layer, restoring each layer to the final output
+    geometry while streaming from this backing store.
     """
 
     key: str
@@ -10605,48 +10530,11 @@ def _coerce_segment_extent(value: object) -> Optional[NrrdSegmentExtent]:
     return (int(vals[0]), int(vals[1]), int(vals[2]), int(vals[3]), int(vals[4]), int(vals[5]))
 
 
-def _segment_extent_is_empty(extent: Sequence[int]) -> bool:
-    vals = [int(v) for v in extent]
-    return len(vals) != 6 or vals[1] < vals[0] or vals[3] < vals[2] or vals[5] < vals[4]
-
-
 def _segment_extent_to_json(extent: Sequence[int]) -> List[int]:
     coerced = _coerce_segment_extent(extent)
     if coerced is None:
         coerced = _nrrd_empty_segment_extent()
     return [int(v) for v in coerced]
-
-
-def _raw_store_index_segment_extent(
-    index: np.ndarray,
-    shape_tyx: Sequence[int],
-) -> NrrdSegmentExtent:
-    """Compute a Slicer SegmentN extent from a raw cvol/ctile index without decoding payloads."""
-    try:
-        shape_i = (int(shape_tyx[0]), int(shape_tyx[1]), int(shape_tyx[2]))
-    except Exception:
-        return _nrrd_empty_segment_extent()
-    idx_arr = np.asarray(index, dtype=CTILE_INDEX_DTYPE)
-    if idx_arr.size <= 0 or any(v <= 0 for v in shape_i):
-        return _nrrd_empty_segment_extent()
-    nonempty = np.asarray(idx_arr['kind'] == np.uint8(1), dtype=bool)
-    if not np.any(nonempty):
-        return _nrrd_empty_segment_extent()
-
-    z_vals = np.flatnonzero(nonempty).astype(np.int64, copy=False)
-    x0_vals = np.asarray(idx_arr['x0'][nonempty], dtype=np.int64)
-    x1_vals = np.asarray(idx_arr['x1'][nonempty], dtype=np.int64) - 1
-    y0_vals = np.asarray(idx_arr['y0'][nonempty], dtype=np.int64)
-    y1_vals = np.asarray(idx_arr['y1'][nonempty], dtype=np.int64) - 1
-    min_x = int(np.clip(int(np.min(x0_vals)), 0, max(0, shape_i[2] - 1)))
-    max_x = int(np.clip(int(np.max(x1_vals)), 0, max(0, shape_i[2] - 1)))
-    min_y = int(np.clip(int(np.min(y0_vals)), 0, max(0, shape_i[1] - 1)))
-    max_y = int(np.clip(int(np.max(y1_vals)), 0, max(0, shape_i[1] - 1)))
-    min_t = int(np.clip(int(np.min(z_vals)), 0, max(0, shape_i[0] - 1)))
-    max_t = int(np.clip(int(np.max(z_vals)), 0, max(0, shape_i[0] - 1)))
-    if max_x < min_x or max_y < min_y or max_t < min_t:
-        return _nrrd_empty_segment_extent()
-    return (int(min_x), int(max_x), int(min_y), int(max_y), int(min_t), int(max_t))
 
 
 @dataclass(frozen=True)
@@ -11161,7 +11049,6 @@ def _volume_has_foreground(mask_mm: np.ndarray) -> bool:
     return False
 
 
-
 def _sanitize_nrrd_layer_token(value: object) -> str:
     token = re.sub(r'[^A-Za-z0-9_.+-]+', '_', str(value).strip())
     token = token.strip('_')
@@ -11170,7 +11057,6 @@ def _sanitize_nrrd_layer_token(value: object) -> str:
 
 def _nrrd_layer_key(
     *,
-    model_name: str,
     view_name: str,
     source: str,
     mask_kind: str,
@@ -11178,8 +11064,9 @@ def _nrrd_layer_key(
     tile_acceptance: str = '',
     stage: str = '',
 ) -> str:
+    # v13.2.0: the model name is no longer part of the layer key/temp-folder names (it was a
+    # model-ensemble holdover; this pipeline runs a single model).
     parts = [
-        _sanitize_nrrd_layer_token(model_name),
         _sanitize_nrrd_layer_token(view_name),
         _sanitize_nrrd_layer_token(source),
         _sanitize_nrrd_layer_token(mask_kind),
@@ -11384,7 +11271,6 @@ def materialize_nrrd_view_layer(
         return None
 
     key = _nrrd_layer_key(
-        model_name=str(model_name),
         view_name=str(view.name),
         source=str(source),
         mask_kind=str(mask_kind),
@@ -11392,10 +11278,10 @@ def materialize_nrrd_view_layer(
         tile_acceptance=str(tile_acceptance),
         stage=str(stage),
     )
-    layer_dir = temp_dir / 'nrrd_layers' / str(model_name) / str(view.name)
+    layer_dir = temp_dir / 'nrrd_layers' / str(view.name)
     storage_format = 'raw_u8'
     if raw_bbox_nrrd_layers_enabled():
-        raw_path = temp_dir / 'nrrd_work' / 'projected_layers' / str(model_name) / str(view.name) / f'{key}.orthogonal.u8.dat'
+        raw_path = temp_dir / 'nrrd_work' / 'projected_layers' / str(view.name) / f'{key}.orthogonal.u8.dat'
         out_path = layer_dir / f'{key}.orthogonal.cvol'
     else:
         raw_path = layer_dir / f'{key}.orthogonal.u8.dat'
@@ -11438,7 +11324,7 @@ def materialize_nrrd_view_layer(
         segment_extent_source = 'raw_layer_materialization_scan'
         close_memmap_array(projected)
 
-    return NrrdLayerRef(
+    layer_ref = NrrdLayerRef(
         key=key,
         name=_nrrd_layer_name(
             view=view,
@@ -11465,6 +11351,20 @@ def materialize_nrrd_view_layer(
         segment_extent_shape_tyx=(int(shape[0]), int(shape[1]), int(shape[2])),
         segment_extent_source=segment_extent_source,
     )
+    sink = nrrd_layer_sink()
+    if sink is not None:
+        sink.submit_layer(
+            layer_ref,
+            nrrd_layer_output_suffix(
+                view_token=view_output_token(view),
+                source=str(source),
+                mask_kind=str(mask_kind),
+                pass_index=int(pass_index),
+                tile_acceptance=str(tile_acceptance),
+                stage=str(stage),
+            ),
+        )
+    return layer_ref
 
 def materialize_nrrd_global_layer(
     volume_mm: np.ndarray,
@@ -11482,17 +11382,16 @@ def materialize_nrrd_global_layer(
         return None
     view_name = 'global'
     key = _nrrd_layer_key(
-        model_name=str(model_name),
         view_name=view_name,
         source=str(source),
         mask_kind=str(mask_kind),
         pass_index=int(pass_index),
         stage=str(stage),
     )
-    layer_dir = temp_dir / 'nrrd_layers' / str(model_name) / view_name
+    layer_dir = temp_dir / 'nrrd_layers' / view_name
     storage_format = 'raw_u8'
     if raw_bbox_nrrd_layers_enabled():
-        raw_path = temp_dir / 'nrrd_work' / 'global_layers' / str(model_name) / f'{key}.orthogonal.u8.dat'
+        raw_path = temp_dir / 'nrrd_work' / 'global_layers' / f'{key}.orthogonal.u8.dat'
         out_path = layer_dir / f'{key}.orthogonal.cvol'
     else:
         raw_path = layer_dir / f'{key}.orthogonal.u8.dat'
@@ -11534,7 +11433,7 @@ def materialize_nrrd_global_layer(
         segment_extent_source = 'raw_layer_materialization_scan'
         close_memmap_array(copied)
 
-    return NrrdLayerRef(
+    layer_ref = NrrdLayerRef(
         key=key,
         name=_nrrd_layer_name(
             view=None,
@@ -11559,6 +11458,19 @@ def materialize_nrrd_global_layer(
         segment_extent_shape_tyx=(int(shape[0]), int(shape[1]), int(shape[2])),
         segment_extent_source=segment_extent_source,
     )
+    sink = nrrd_layer_sink()
+    if sink is not None:
+        sink.submit_layer(
+            layer_ref,
+            nrrd_layer_output_suffix(
+                view_token='Global',
+                source=str(source),
+                mask_kind=str(mask_kind),
+                pass_index=int(pass_index),
+                stage=str(stage),
+            ),
+        )
+    return layer_ref
 
 def prepare_view_volume_after_fullframe(
     *,
@@ -11628,7 +11540,7 @@ def prepare_view_volume_after_fullframe(
         # Store it as a slice-chunked cvol instead of a raw uint8 memmap to avoid one
         # full-volume duplicate per active view.
         if bool(dense_tiling_active):
-            parent_mask_support_path = temp_dir / 'nrrd_support' / str(model_name) / view.name / 'fullframe_yolo_support.cvol'
+            parent_mask_support_path = temp_dir / 'nrrd_support' / view.name / 'fullframe_yolo_support.cvol'
             write_raw_bbox_mask_store(
                 baseline_native_volume,
                 parent_mask_support_path,
@@ -11647,7 +11559,7 @@ def prepare_view_volume_after_fullframe(
             before_pass_mm: Optional[np.ndarray] = None
             before_pass_path: Optional[Path] = None
             if bool(nrrd_layers_enabled):
-                before_pass_path = temp_dir / 'nrrd_work' / str(model_name) / view.name / f'fullframe_before_pass{int(pass_idx):02d}.u8.dat'
+                before_pass_path = temp_dir / 'nrrd_work' / view.name / f'fullframe_before_pass{int(pass_idx):02d}.u8.dat'
                 before_pass_mm = copy_workspace_array(
                     baseline_native_volume,
                     before_pass_path,
@@ -11685,7 +11597,7 @@ def prepare_view_volume_after_fullframe(
             interpolation_stats.append(stats_local)
 
             if bool(nrrd_layers_enabled) and before_pass_mm is not None:
-                delta_path = temp_dir / 'nrrd_work' / str(model_name) / view.name / f'fullframe_bridge_pass{int(pass_idx):02d}.u8.dat'
+                delta_path = temp_dir / 'nrrd_work' / view.name / f'fullframe_bridge_pass{int(pass_idx):02d}.u8.dat'
                 bridge_delta_mm = subtract_volume_to_mmap(
                     baseline_native_volume,
                     before_pass_mm,
@@ -11745,7 +11657,7 @@ def prepare_view_volume_after_fullframe(
                     pass
 
     if bool(nrrd_layers_enabled) and parent_mask_support_mm is not None:
-        parent_bridge_support_path = temp_dir / 'nrrd_support' / str(model_name) / view.name / 'fullframe_bridge_support.cvol'
+        parent_bridge_support_path = temp_dir / 'nrrd_support' / view.name / 'fullframe_bridge_support.cvol'
         bridge_stats = subtract_volume_to_raw_bbox_store(
             baseline_native_volume,
             parent_mask_support_mm,
@@ -12094,7 +12006,6 @@ def postprocess_tile_volume_after_inference(
     )
 
 
-
 def spill_waiting_tile_result_to_raw_store(
     result: TilePostprocessResult,
     temp_dir: Path,
@@ -12277,7 +12188,6 @@ def stage_tile_result_into_config_canvas(
         _delete_tile_result_storage(result, keep_temp=bool(keep_temp))
 
 
-
 def gate_tile_volume_into_consolidated_parent(
     task: TilePostprocessResult,
     *,
@@ -12314,7 +12224,7 @@ def gate_tile_volume_into_consolidated_parent(
         if bool(category_enabled):
             if temp_dir is None:
                 raise ValueError('temp_dir is required for NRRD tile category gating')
-            category_dir = temp_dir / 'nrrd_work' / 'tile_gate_categories' / task.model_name / task.view_name / task.tile_id
+            category_dir = temp_dir / 'nrrd_work' / 'tile_gate_categories' / task.view_name / task.tile_id
             if tile_parent_mask_accumulator_mm is not None:
                 local_parent_mask_path = category_dir / 'accepted_by_parent_mask.u8.dat'
                 local_parent_mask_mm = allocate_workspace_array(
@@ -12494,7 +12404,7 @@ def finalize_consolidated_tile_volume_for_parent(
             before_pass_mm: Optional[np.ndarray] = None
             before_pass_path: Optional[Path] = None
             if bool(nrrd_layers_enabled):
-                before_pass_path = temp_dir / 'nrrd_work' / str(model_name) / view.name / f'tile_before_pass{int(pass_idx):02d}.u8.dat'
+                before_pass_path = temp_dir / 'nrrd_work' / view.name / f'tile_before_pass{int(pass_idx):02d}.u8.dat'
                 before_pass_mm = copy_workspace_array(
                     tile_accumulator_mm,
                     before_pass_path,
@@ -12532,7 +12442,7 @@ def finalize_consolidated_tile_volume_for_parent(
             interpolation_stats.append(stats_local)
 
             if bool(nrrd_layers_enabled) and before_pass_mm is not None:
-                delta_path = temp_dir / 'nrrd_work' / str(model_name) / view.name / f'tile_bridge_pass{int(pass_idx):02d}.u8.dat'
+                delta_path = temp_dir / 'nrrd_work' / view.name / f'tile_bridge_pass{int(pass_idx):02d}.u8.dat'
                 bridge_delta_mm = subtract_volume_to_mmap(
                     tile_accumulator_mm,
                     before_pass_mm,
@@ -12593,7 +12503,6 @@ def finalize_consolidated_tile_volume_for_parent(
 # --------------------------
 # Final Gaussian smoothing
 # --------------------------
-
 
 
 def gaussian_smoothing_gpu_enabled() -> bool:
@@ -13169,10 +13078,6 @@ def _nrrd_space_directions_matrix(
     return np.eye(spatial_axes_i, dtype=np.float64)
 
 
-
-
-
-
 def nrrd_slicer_header(mask_shape_zyx: Tuple[int, int, int]) -> Dict[str, object]:
     t_dim, h, w = (int(mask_shape_zyx[0]), int(mask_shape_zyx[1]), int(mask_shape_zyx[2]))
     return {
@@ -13192,6 +13097,19 @@ def nrrd_pigz_compresslevel() -> int:
 def nrrd_pigz_threads() -> int:
     default_threads = max(1, min(_cpu_count(), _env_int('YOLO_TTA_NRRD_PIGZ_MAX_THREADS', max(1, _cpu_count()))))
     return max(1, _env_int('YOLO_TTA_NRRD_PIGZ_THREADS', int(default_threads)))
+
+
+def nrrd_single_layer_pigz_threads() -> int:
+    """pigz thread count for one single-layer NRRD write.
+
+    v13.2.0 writes one small single-layer NRRD per component layer, often several
+    concurrently (e.g. the Transverse layer compresses while Tiled Transverse is still
+    inferencing).  Capping per-write pigz threads keeps many concurrent layer writes from
+    oversubscribing the box against the GPU-feeding render/postprocess pools.
+    """
+    cores = max(1, _cpu_count())
+    default_threads = max(1, min(cores, max(1, cores // 4)))
+    return max(1, _env_int('YOLO_TTA_NRRD_SINGLE_LAYER_PIGZ_THREADS', int(default_threads)))
 
 
 def nrrd_stream_buffer_bytes(required_bytes: Optional[int] = None) -> int:
@@ -13243,10 +13161,10 @@ def nrrd_madvise_dontneed_interval() -> int:
 class _PigzPayloadWriter:
     """Small file-like wrapper that gzip-encodes NRRD payload bytes through pigz."""
 
-    def __init__(self, fh: object) -> None:
+    def __init__(self, fh: object, *, threads: Optional[int] = None) -> None:
         _require_bin('pigz')
         level = int(nrrd_pigz_compresslevel())
-        threads = int(nrrd_pigz_threads())
+        threads = int(nrrd_pigz_threads()) if threads is None else max(1, int(threads))
         level_arg = f'-{level}' if level > 0 else '-0'
         cmd = ['pigz', '-c', '-n', '-p', str(threads), level_arg]
         try:
@@ -13301,8 +13219,8 @@ class _PigzPayloadWriter:
                 pass
 
 
-def _open_pigz_payload_writer(fh: object) -> _PigzPayloadWriter:
-    return _PigzPayloadWriter(fh)
+def _open_pigz_payload_writer(fh: object, *, threads: Optional[int] = None) -> _PigzPayloadWriter:
+    return _PigzPayloadWriter(fh, threads=threads)
 
 def _madvise_array_mmap(arr: object, advice_name: str) -> None:
     try:
@@ -13403,7 +13321,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.5-Pro_v12.2.15_SLURM.py',
+        '# Complete NRRD file generated by Opus-4.8_v13.2.0_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -13427,7 +13345,6 @@ def _write_nrrd_ascii_header(
 
     text = '\n'.join(lines) + '\n\n'
     fh.write(text.encode('ascii', errors='ignore'))
-
 
 
 def _nrrd_stream_chunk_rows(layer_count: int, width: int, height: int) -> int:
@@ -13485,6 +13402,204 @@ def write_nrrd(mask_u8: np.ndarray, out_path: Path) -> Path:
     return out_path
 
 
+def nrrd_layer_output_suffix(
+    *,
+    view_token: str,
+    source: str,
+    mask_kind: str,
+    pass_index: int = 0,
+    tile_acceptance: str = '',
+    stage: str = '',
+) -> str:
+    """Return the v13.2.0 single-layer NRRD filename suffix for one component layer.
+
+    The decomposition is now one single-layer NRRD per component layer (spec 7), named
+    ``{Filestem}_{suffix}.nrrd`` with the model name dropped (a model-ensemble holdover).
+    """
+    source_l = str(source).strip().lower()
+    mask_kind_l = str(mask_kind).strip().lower()
+    stage_l = str(stage).strip().lower()
+    if source_l == 'global':
+        if stage_l.startswith('final_output'):
+            return 'Global_final_output'
+        if mask_kind_l == 'smoothing_result':
+            return f'Global_smoothing_pass{int(pass_index):02d}'
+        return 'Global_union_presmoothing'
+    vt = _sanitize_nrrd_layer_token(view_token) or 'view'
+    if source_l == 'fullframe':
+        if mask_kind_l == 'bridge':
+            return f'{vt}_fullframe_bridge_pass{int(pass_index):02d}'
+        return f'{vt}_fullframe_yolo'
+    if source_l == 'tile':
+        if mask_kind_l == 'bridge':
+            return f'{vt}_tile_bridge_pass{int(pass_index):02d}'
+        acceptance = _sanitize_nrrd_layer_token(tile_acceptance) or 'parent_support'
+        return f'{vt}_tile_yolo_{acceptance}'
+    parts = [vt, source_l or 'layer', mask_kind_l or 'mask']
+    if int(pass_index) > 0:
+        parts.append(f'pass{int(pass_index):02d}')
+    if tile_acceptance:
+        parts.append(_sanitize_nrrd_layer_token(tile_acceptance))
+    return '_'.join(p for p in parts if p)
+
+
+def write_single_layer_nrrd_from_ref(
+    ref: 'NrrdLayerRef',
+    output_shape: Tuple[int, int, int],
+    out_path: Path,
+    *,
+    pigz_threads: Optional[int] = None,
+) -> Path:
+    """Write one component layer as its own single-layer 3D NRRD (X, Y, t).
+
+    The layer is restored from its backing-store geometry directly to the final output
+    geometry while streaming, reusing the same per-layer restore/stream path as the legacy
+    decomposed writer.  Each file holds one uint8 binary mask, fits in RAM, and is gzip
+    compressed in one pigz pass.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
+    header = nrrd_slicer_header((out_t, out_h, out_w))
+    z_chunk = _nrrd_full_slice_z_chunk(1, out_w, out_h, out_t)
+    threads = int(nrrd_single_layer_pigz_threads()) if pigz_threads is None else max(1, int(pigz_threads))
+    with open(out_path, 'wb') as fh:
+        _write_nrrd_ascii_header(
+            fh,
+            header=header,
+            sizes=(out_w, out_h, out_t),
+            dimension=3,
+            data_type='unsigned char',
+            encoding='gzip',
+        )
+        with _open_pigz_payload_writer(fh, threads=threads) as payload_writer:
+            _write_one_decomposed_nrrd_layer_payload(
+                ref,
+                (out_t, out_h, out_w),
+                payload_writer,
+                z_chunk=int(z_chunk),
+            )
+    return out_path
+
+
+class NrrdLayerSink:
+    """Writes one single-layer NRRD per component layer as the layers are produced.
+
+    v13.2.0 reworks ``--save_nrrd`` from one mega 4D decomposed NRRD assembled at the very
+    end into a set of small single-layer NRRDs created during the intermediate pipeline
+    steps (e.g. the Transverse layer NRRD is compressed while Tiled Transverse is still being
+    inferenced).  Layers are submitted from whichever background postprocess/interpolation
+    thread produced them, written on a small dedicated pool so the writes overlap inference
+    and each other, and recorded in one sidecar manifest.
+    """
+
+    def __init__(
+        self,
+        *,
+        nrrd_dir: Path,
+        stem: str,
+        output_shape_tyx: Tuple[int, int, int],
+        max_workers: int,
+        pigz_threads: int,
+    ) -> None:
+        self.nrrd_dir = Path(nrrd_dir)
+        self.nrrd_dir.mkdir(parents=True, exist_ok=True)
+        self.stem = str(stem)
+        self.output_shape = (int(output_shape_tyx[0]), int(output_shape_tyx[1]), int(output_shape_tyx[2]))
+        self.pigz_threads = max(1, int(pigz_threads))
+        self.executor = ThreadPoolExecutor(max_workers=max(1, int(max_workers)), thread_name_prefix='nrrd-layer')
+        self._lock = threading.Lock()
+        self._futures: List[Future] = []
+        self._manifest: List[Dict[str, object]] = []
+        self._suffix_counts: Dict[str, int] = {}
+
+    def submit_layer(self, ref: Optional['NrrdLayerRef'], suffix: str) -> Optional[Path]:
+        if ref is None:
+            return None
+        with self._lock:
+            seen = int(self._suffix_counts.get(str(suffix), 0))
+            self._suffix_counts[str(suffix)] = seen + 1
+            unique_suffix = str(suffix) if seen == 0 else f'{suffix}_{seen + 1:02d}'
+            out_path = self.nrrd_dir / f'{self.stem}_{unique_suffix}.nrrd'
+            self._manifest.append({
+                'filename': out_path.name,
+                'suffix': unique_suffix,
+                'view_name': getattr(ref, 'view_name', ''),
+                'view_family': getattr(ref, 'view_family', ''),
+                'source': getattr(ref, 'source', ''),
+                'mask_kind': getattr(ref, 'mask_kind', ''),
+                'pass_index': int(getattr(ref, 'pass_index', 0)),
+                'tile_acceptance': getattr(ref, 'tile_acceptance', ''),
+                'stage': getattr(ref, 'stage', ''),
+                'description': getattr(ref, 'description', ''),
+                'backing_shape_tyx': [int(v) for v in getattr(ref, 'shape', (0, 0, 0))],
+                'output_shape_tyx': [int(v) for v in self.output_shape],
+                'exported_axes': '(X, Y, t)',
+            })
+            fut = self.executor.submit(write_single_layer_nrrd_from_ref, ref, self.output_shape, out_path, pigz_threads=self.pigz_threads)
+            self._futures.append(fut)
+        return out_path
+
+    def layer_count(self) -> int:
+        with self._lock:
+            return len(self._manifest)
+
+    def wait(self) -> None:
+        with self._lock:
+            futures = list(self._futures)
+        first_error: Optional[BaseException] = None
+        for fut in futures:
+            try:
+                fut.result()
+            except BaseException as exc:  # pragma: no cover - surfaced to main
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise RuntimeError('Single-layer NRRD writing failed') from first_error
+
+    def shutdown(self) -> None:
+        self.executor.shutdown(wait=True)
+
+    def write_manifest(self) -> Optional[Path]:
+        with self._lock:
+            manifest_layers = list(self._manifest)
+        if not manifest_layers:
+            return None
+        manifest_path = self.nrrd_dir / f'{self.stem}_nrrd_manifest.json'
+        manifest = {
+            'layout': 'one_single_layer_nrrd_per_component',
+            'exported_axes': '(X, Y, t)',
+            'output_shape_tyx': [int(v) for v in self.output_shape],
+            'layer_count': len(manifest_layers),
+            'layers': manifest_layers,
+            'notes': [
+                'Each NRRD is one uint8 binary mask in source output geometry (X, Y, t).',
+                'Files can be recombined (union) or omitted after a full run to build a custom volume without rerunning.',
+                'YOLO layers are cleaned masks before interpolation bridges; bridge layers contain only voxels added by that pass.',
+                'Global_final_output is the final segmentation after all postprocessing and is not intended for recomposition.',
+            ],
+        }
+        manifest_path.write_text(json.dumps(manifest, indent=2))
+        return manifest_path
+
+
+_NRRD_LAYER_SINK: Optional[NrrdLayerSink] = None
+
+
+def set_nrrd_layer_sink(sink: Optional[NrrdLayerSink]) -> None:
+    global _NRRD_LAYER_SINK
+    _NRRD_LAYER_SINK = sink
+
+
+def nrrd_layer_sink() -> Optional[NrrdLayerSink]:
+    return _NRRD_LAYER_SINK
+
+
+def nrrd_layer_sink_workers() -> int:
+    cores = max(1, _cpu_count())
+    default_workers = max(1, min(4, max(1, cores // 8)))
+    return max(1, _env_int('YOLO_TTA_NRRD_LAYER_SINK_WORKERS', int(default_workers)))
+
+
 def _nrrd_layer_ref_is_raw_bbox_store(ref: NrrdLayerRef) -> bool:
     return str(getattr(ref, 'storage_format', 'raw_u8')) in MASK_STORE_FORMATS or Path(ref.path).is_dir()
 
@@ -13518,22 +13633,6 @@ def _drop_nrrd_raw_store_chunks_ram_cache(src: object) -> None:
     except Exception:
         cache_key = src.chunks_path
     _NRRD_RAW_STORE_CHUNKS_RAM_CACHE.pop(cache_key, None)
-
-
-def _log_nrrd_streaming_sources(effective_refs: Sequence[NrrdLayerRef]) -> None:
-    raw_bbox = [ref for ref in effective_refs if _nrrd_layer_ref_is_raw_bbox_store(ref)]
-    raw = [ref for ref in effective_refs if not _nrrd_layer_ref_is_raw_bbox_store(ref)]
-    print(
-        'NRRD streaming source files used by decomposed-layer payload packaging: '
-        f'{len(effective_refs)} layer backing path(s); raw_bbox_store={len(raw_bbox)}, raw_u8={len(raw)}, '
-        f'raw_bbox_payload_ram_cache_per_layer={nrrd_cache_raw_bbox_layers_in_ram_enabled()}, '
-        f'precomputed_segment_extents={nrrd_precomputed_segment_extents_enabled()}'
-    )
-    preview = list(effective_refs[:8])
-    for ref in preview:
-        print(f'  - {ref.storage_format}: {ref.path}')
-    if len(effective_refs) > len(preview):
-        print(f'  ... {len(effective_refs) - len(preview)} additional layer backing path(s) listed in the NRRD manifest sidecar')
 
 
 def compute_segment_extent_zyx(mask_zyx: np.ndarray) -> Tuple[int, int, int, int, int, int]:
@@ -13571,80 +13670,6 @@ def compute_segment_extent_zyx(mask_zyx: np.ndarray) -> Tuple[int, int, int, int
     if max_t < 0:
         return _nrrd_empty_segment_extent()
     return (int(min_x), int(max_x), int(min_y), int(max_y), int(min_t), int(max_t))
-
-
-def _format_segment_extent(extent: Sequence[int]) -> str:
-    values = [int(v) for v in extent]
-    if len(values) != 6:
-        raise ValueError(f'Segment extent must contain 6 values, got {values}')
-    return ' '.join(str(v) for v in values)
-
-
-def _nrrd_segment_color(idx: int) -> str:
-    hue = (float(idx) * 0.6180339887498949) % 1.0
-    r, g, b = colorsys.hsv_to_rgb(hue, 0.55, 0.95)
-    return f'{r:.6g} {g:.6g} {b:.6g}'
-
-
-def nrrd_decomposed_header(
-    *,
-    output_shape_zyx: Tuple[int, int, int],
-    layer_refs: Sequence[NrrdLayerRef],
-    layer_extents: Optional[Sequence[Tuple[int, int, int, int, int, int]]] = None,
-) -> Dict[str, object]:
-    t_dim, h, w = (int(output_shape_zyx[0]), int(output_shape_zyx[1]), int(output_shape_zyx[2]))
-    if layer_extents is None:
-        extents_resolved = [_nrrd_empty_segment_extent() for _ in layer_refs]
-    else:
-        extents_resolved = [tuple(int(v) for v in extent) for extent in layer_extents]
-    if len(extents_resolved) != len(layer_refs):
-        raise ValueError(f'NRRD segment extent count {len(extents_resolved)} does not match layer count {len(layer_refs)}')
-
-    header: Dict[str, object] = {
-        'space': NRRD_SPACE,
-        'kinds': ['domain', 'domain', 'domain', 'list'],
-        # The trailing list axis is non-spatial.  Use a NaN row so it serializes
-        # as ``none`` after the three spatial direction vectors.
-        'space directions': _nrrd_space_directions_matrix(spatial_axes=3, list_axis=True, list_axis_position='last'),
-        'space origin': np.zeros((3,), dtype=np.float64),
-        'content': (
-            'decomposed binary segmentation layers; '
-            f'source_shape_tyx=({t_dim},{h},{w}); exported_axes=(X,Y,t,layer); '
-            'layer metadata stored in SegmentN_* fields and sidecar manifest JSON'
-        ),
-        'encoding': 'gzip',
-        'Segmentation_ContainedRepresentationNames': 'Binary labelmap|',
-        'Segmentation_SourceRepresentation': 'Binary labelmap',
-        # Kept for compatibility with older Slicer segmentation metadata readers.
-        'Segmentation_MasterRepresentation': 'Binary labelmap',
-        'Segmentation_ReferenceImageExtentOffset': '0 0 0',
-    }
-    for idx, ref in enumerate(layer_refs):
-        tag_parts = [
-            f'model:{ref.model_name}',
-            f'view:{ref.view_name}',
-            f'view_family:{ref.view_family}',
-            f'source:{ref.source}',
-            f'mask_kind:{ref.mask_kind}',
-            f'pass:{int(ref.pass_index)}',
-        ]
-        if ref.tile_acceptance:
-            tag_parts.append(f'tile_acceptance:{ref.tile_acceptance}')
-        if ref.stage:
-            tag_parts.append(f'stage:{ref.stage}')
-        header[f'Segment{idx}_ID'] = _nrrd_ascii_header_text(ref.key)
-        header[f'Segment{idx}_Name'] = _nrrd_ascii_header_text(ref.name)
-        header[f'Segment{idx}_NameAutoGenerated'] = '0'
-        header[f'Segment{idx}_Color'] = _nrrd_segment_color(int(idx))
-        header[f'Segment{idx}_ColorAutoGenerated'] = '0'
-        header[f'Segment{idx}_Extent'] = _format_segment_extent(extents_resolved[int(idx)])
-        header[f'Segment{idx}_Layer'] = str(idx)
-        header[f'Segment{idx}_LabelValue'] = '1'
-        header[f'Segment{idx}_Tags'] = _nrrd_ascii_header_text('|'.join(tag_parts))
-        header[f'Segment{idx}_Description'] = _nrrd_ascii_header_text(ref.description)
-    return header
-
-
 
 
 def _restore_source_indices_for_output_z(in_t: int, out_t: int, out_z: int) -> List[int]:
@@ -13733,194 +13758,6 @@ def _read_layer_row_block_in_output_shape(
     # full output slice is materialized for one layer at a time, not for every layer.
     return _read_layer_slice_in_output_shape(src, output_shape, out_z_i)[y0_i:y1_i, :]
 
-
-def nrrd_precomputed_segment_extents_enabled() -> bool:
-    return _env_flag('YOLO_TTA_NRRD_PRECOMPUTED_SEGMENT_EXTENTS', True)
-
-
-def _map_spatial_extent_conservative(
-    min_idx: int,
-    max_idx: int,
-    in_len: int,
-    out_len: int,
-) -> Tuple[int, int]:
-    if int(out_len) <= 0 or int(in_len) <= 0 or int(max_idx) < int(min_idx):
-        return (0, -1)
-    in_len_i = int(in_len)
-    out_len_i = int(out_len)
-    min_i = int(np.clip(int(min_idx), 0, in_len_i - 1))
-    max_i = int(np.clip(int(max_idx), 0, in_len_i - 1))
-    if in_len_i == out_len_i:
-        return (min_i, max_i)
-    # Conservative interval-overlap mapping for cv2 area/nearest resizing. It may include a
-    # one-pixel border in unusual scale ratios, but it never underestimates the layer extent.
-    out_min = int(math.floor(float(min_i) * float(out_len_i) / float(in_len_i)))
-    out_max = int(math.ceil(float(max_i + 1) * float(out_len_i) / float(in_len_i)) - 1)
-    out_min = int(np.clip(out_min, 0, out_len_i - 1))
-    out_max = int(np.clip(out_max, 0, out_len_i - 1))
-    if out_max < out_min:
-        return (0, -1)
-    return (out_min, out_max)
-
-
-def _map_t_extent_for_nrrd_restore(
-    min_t: int,
-    max_t: int,
-    in_t: int,
-    out_t: int,
-) -> Tuple[int, int]:
-    if int(out_t) <= 0 or int(in_t) <= 0 or int(max_t) < int(min_t):
-        return (0, -1)
-    in_t_i = int(in_t)
-    out_t_i = int(out_t)
-    lo = int(np.clip(int(min_t), 0, in_t_i - 1))
-    hi = int(np.clip(int(max_t), 0, in_t_i - 1))
-    if in_t_i == out_t_i:
-        return (lo, hi)
-
-    out_min: Optional[int] = None
-    out_max = -1
-    for out_z in range(out_t_i):
-        src_indices = _restore_source_indices_for_output_z(in_t_i, out_t_i, int(out_z))
-        if any(lo <= int(src_idx) <= hi for src_idx in src_indices):
-            if out_min is None:
-                out_min = int(out_z)
-            out_max = int(out_z)
-    if out_min is None or out_max < out_min:
-        return (0, -1)
-    return (int(out_min), int(out_max))
-
-
-def _transform_segment_extent_to_output_shape(
-    extent: Sequence[int],
-    input_shape: Tuple[int, int, int],
-    output_shape: Tuple[int, int, int],
-) -> Optional[NrrdSegmentExtent]:
-    extent_i = _coerce_segment_extent(extent)
-    if extent_i is None:
-        return None
-    if _segment_extent_is_empty(extent_i):
-        return _nrrd_empty_segment_extent()
-
-    in_t, in_h, in_w = (int(input_shape[0]), int(input_shape[1]), int(input_shape[2]))
-    out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
-    if (in_t, in_h, in_w) == (out_t, out_h, out_w):
-        return extent_i
-
-    x0, x1, y0, y1, t0, t1 = (int(v) for v in extent_i)
-    mapped_t0, mapped_t1 = _map_t_extent_for_nrrd_restore(t0, t1, in_t, out_t)
-    mapped_y0, mapped_y1 = _map_spatial_extent_conservative(y0, y1, in_h, out_h)
-    mapped_x0, mapped_x1 = _map_spatial_extent_conservative(x0, x1, in_w, out_w)
-    mapped = (int(mapped_x0), int(mapped_x1), int(mapped_y0), int(mapped_y1), int(mapped_t0), int(mapped_t1))
-    if _segment_extent_is_empty(mapped):
-        return _nrrd_empty_segment_extent()
-    return mapped
-
-
-def _read_raw_store_segment_extent(ref: NrrdLayerRef) -> Optional[NrrdSegmentExtent]:
-    if not _nrrd_layer_ref_is_raw_bbox_store(ref):
-        return None
-    meta_path = Path(ref.path) / 'meta.json'
-    index_path = Path(ref.path) / 'index.bin'
-    if not meta_path.exists():
-        return None
-    try:
-        meta = json.loads(meta_path.read_text())
-    except Exception:
-        return None
-    extent = _coerce_segment_extent(meta.get('segment_extent_ijk'))
-    if extent is not None:
-        return extent
-    try:
-        shape = meta.get('shape', [int(ref.shape[0]), int(ref.shape[1]), int(ref.shape[2])])
-        shape_i = (int(shape[0]), int(shape[1]), int(shape[2]))
-        if index_path.exists():
-            index = np.fromfile(index_path, dtype=CTILE_INDEX_DTYPE, count=int(shape_i[0]))
-            return _raw_store_index_segment_extent(index, shape_i)
-    except Exception:
-        return None
-    return None
-
-
-def _precomputed_segment_extent_for_layer_ref(
-    ref: NrrdLayerRef,
-    output_shape: Tuple[int, int, int],
-) -> Optional[Tuple[NrrdSegmentExtent, str]]:
-    if not nrrd_precomputed_segment_extents_enabled():
-        return None
-    stored_extent = _coerce_segment_extent(getattr(ref, 'segment_extent_ijk', None))
-    source = str(getattr(ref, 'segment_extent_source', '') or 'layer_ref_metadata')
-    if stored_extent is None:
-        stored_extent = _read_raw_store_segment_extent(ref)
-        source = 'raw_bbox_store_metadata'
-    if stored_extent is None:
-        return None
-    transformed = _transform_segment_extent_to_output_shape(
-        stored_extent,
-        tuple(int(x) for x in ref.shape),
-        tuple(int(x) for x in output_shape),
-    )
-    if transformed is None:
-        return None
-    if tuple(int(x) for x in ref.shape) != tuple(int(x) for x in output_shape):
-        source += '_geometry_mapped'
-    return transformed, source
-
-
-def _scan_segment_extent_for_layer_ref(
-    ref: NrrdLayerRef,
-    output_shape: Tuple[int, int, int],
-) -> NrrdSegmentExtent:
-    src = _open_nrrd_layer_ref(ref)
-    try:
-        if isinstance(src, np.ndarray) and tuple(int(x) for x in ref.shape) == tuple(int(x) for x in output_shape):
-            return compute_segment_extent_zyx(src)
-
-        out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
-        min_t, max_t = out_t, -1
-        min_y, max_y = out_h, -1
-        min_x, max_x = out_w, -1
-        for z in range(out_t):
-            sl = np.asarray(_read_layer_slice_in_output_shape(src, output_shape, int(z)), dtype=bool)
-            if not np.any(sl):
-                continue
-            row_has_fg = np.any(sl, axis=1)
-            col_has_fg = np.any(sl, axis=0)
-            ys = np.flatnonzero(row_has_fg)
-            xs = np.flatnonzero(col_has_fg)
-            if xs.size <= 0 or ys.size <= 0:
-                continue
-            min_t = min(min_t, int(z))
-            max_t = max(max_t, int(z))
-            min_y = min(min_y, int(ys[0]))
-            max_y = max(max_y, int(ys[-1]))
-            min_x = min(min_x, int(xs[0]))
-            max_x = max(max_x, int(xs[-1]))
-
-        if max_t < 0:
-            return _nrrd_empty_segment_extent()
-        return (int(min_x), int(max_x), int(min_y), int(max_y), int(min_t), int(max_t))
-    finally:
-        _madvise_array_mmap(src, 'MADV_DONTNEED')
-        _close_nrrd_layer_source(src)
-
-
-def _resolve_segment_extent_for_layer_ref(
-    ref: NrrdLayerRef,
-    output_shape: Tuple[int, int, int],
-) -> Tuple[NrrdSegmentExtent, str]:
-    precomputed = _precomputed_segment_extent_for_layer_ref(ref, output_shape)
-    if precomputed is not None:
-        return precomputed
-    return _scan_segment_extent_for_layer_ref(ref, output_shape), 'fallback_layer_scan'
-
-
-# DEAD_CODE_MARKER(v12.2.0-post-refactor): compatibility wrapper is no longer called after direct extent/source resolution; keep for one release but do not prune automatically.
-def _compute_segment_extent_for_layer_ref(
-    ref: NrrdLayerRef,
-    output_shape: Tuple[int, int, int],
-) -> NrrdSegmentExtent:
-    return _resolve_segment_extent_for_layer_ref(ref, output_shape)[0]
 
 def _write_one_decomposed_nrrd_layer_payload(
     ref: NrrdLayerRef,
@@ -14033,333 +13870,6 @@ def _write_one_decomposed_nrrd_layer_payload(
             _drop_nrrd_raw_store_chunks_ram_cache(src)
 
 
-def nrrd_individual_layer_gzip_members_enabled() -> bool:
-    """Return True to write one gzip member per decomposed NRRD layer.
-
-    A standard gzip payload may contain concatenated gzip members.  With NRRD
-    ``encoding: gzip``, readers that use normal gzip/zlib streams see the same
-    decompressed byte sequence, while each layer has an independent compression
-    dictionary and can be inspected or recovered as a separate member if needed.
-    Set ``YOLO_TTA_NRRD_INDIVIDUAL_LAYER_GZIP_MEMBERS=0`` to force the legacy
-    single pigz stream across every layer.
-    """
-    if os.environ.get('YOLO_TTA_NRRD_LAYER_GZIP_MEMBERS') is not None:
-        return _env_flag('YOLO_TTA_NRRD_LAYER_GZIP_MEMBERS', True)
-    return _env_flag('YOLO_TTA_NRRD_INDIVIDUAL_LAYER_GZIP_MEMBERS', True)
-
-
-def _write_decomposed_nrrd_payload_stream(
-    effective_refs: Sequence[NrrdLayerRef],
-    output_shape: Tuple[int, int, int],
-    payload_writer: object,
-) -> None:
-    """Stream decomposed ``(X,Y,t,layer)`` payload through one gzip stream."""
-    out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
-    layer_count = int(len(effective_refs))
-    if layer_count <= 0:
-        return
-
-    z_chunk = _nrrd_full_slice_z_chunk(1, out_w, out_h, out_t)
-    layer_slice_bytes = int(out_w) * int(out_h) * np.dtype(np.uint8).itemsize
-    buffer_bytes = int(layer_slice_bytes) * int(z_chunk)
-    print(
-        f'NRRD streaming decomposed payload: layers={layer_count}, shape=(X,Y,t,layer)='
-        f'({out_w},{out_h},{out_t},{layer_count}), z_chunk={z_chunk}, '
-        f'one_layer_buffer~{buffer_bytes / GIB:.3f} GiB, '
-        f'pigz_level={nrrd_pigz_compresslevel()}, pigz_threads={nrrd_pigz_threads()}, '
-        'gzip_member_layout=single_stream_legacy'
-    )
-
-    with tqdm(total=int(layer_count) * int(out_t), desc='NRRD streaming: decomposed layer blocks') as pbar:
-        for layer_idx, ref in enumerate(effective_refs):
-            _write_one_decomposed_nrrd_layer_payload(
-                ref,
-                output_shape,
-                payload_writer,
-                z_chunk=int(z_chunk),
-                pbar=pbar,
-                layer_idx=int(layer_idx),
-            )
-
-
-def _write_decomposed_nrrd_payload_layer_gzip_members(
-    effective_refs: Sequence[NrrdLayerRef],
-    output_shape: Tuple[int, int, int],
-    fh: object,
-) -> None:
-    """Append one independently-compressed gzip member per decomposed layer.
-
-    The final file is still one attached NRRD with ``encoding: gzip``.  The gzip
-    payload is a concatenation of members in layer order; the concatenated
-    decompressed byte stream is identical to the legacy single-stream layout.
-    """
-    out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
-    layer_count = int(len(effective_refs))
-    if layer_count <= 0:
-        return
-
-    z_chunk = _nrrd_full_slice_z_chunk(1, out_w, out_h, out_t)
-    layer_slice_bytes = int(out_w) * int(out_h) * np.dtype(np.uint8).itemsize
-    buffer_bytes = int(layer_slice_bytes) * int(z_chunk)
-    print(
-        f'NRRD streaming decomposed payload: layers={layer_count}, shape=(X,Y,t,layer)='
-        f'({out_w},{out_h},{out_t},{layer_count}), z_chunk={z_chunk}, '
-        f'one_layer_buffer~{buffer_bytes / GIB:.3f} GiB, '
-        f'pigz_level={nrrd_pigz_compresslevel()}, pigz_threads={nrrd_pigz_threads()}, '
-        'gzip_member_layout=one_member_per_layer'
-    )
-
-    with tqdm(total=int(layer_count) * int(out_t), desc='NRRD streaming: decomposed layer gzip members') as pbar:
-        for layer_idx, ref in enumerate(effective_refs):
-            print(f'NRRD layer gzip member {int(layer_idx) + 1}/{int(layer_count)}: {ref.key}')
-            with _open_pigz_payload_writer(fh) as payload_writer:
-                _write_one_decomposed_nrrd_layer_payload(
-                    ref,
-                    output_shape,
-                    payload_writer,
-                    z_chunk=int(z_chunk),
-                    pbar=pbar,
-                    layer_idx=int(layer_idx),
-                )
-            try:
-                flush_fn = getattr(fh, 'flush', None)
-                if callable(flush_fn):
-                    flush_fn()
-            except Exception:
-                pass
-
-def _write_decomposed_nrrd_manifest(
-    *,
-    out_path: Path,
-    output_shape: Tuple[int, int, int],
-    effective_refs: Sequence[NrrdLayerRef],
-    layer_extents: Optional[Sequence[NrrdSegmentExtent]] = None,
-    layer_extent_sources: Optional[Sequence[str]] = None,
-) -> None:
-    extents_resolved: List[NrrdSegmentExtent] = []
-    if layer_extents is None:
-        extents_resolved = [_nrrd_empty_segment_extent() for _ in effective_refs]
-    else:
-        extents_resolved = [(_coerce_segment_extent(extent) or _nrrd_empty_segment_extent()) for extent in layer_extents]
-    sources_resolved = list(layer_extent_sources) if layer_extent_sources is not None else ['unknown'] * len(effective_refs)
-    if len(sources_resolved) != len(effective_refs):
-        sources_resolved = ['unknown'] * len(effective_refs)
-
-    manifest = {
-        'nrrd_path': str(out_path),
-        'axis_order': '(X, Y, t, layer)',
-        'internal_layer_order': '(t, Y, X)',
-        'output_shape_tyx': [int(output_shape[0]), int(output_shape[1]), int(output_shape[2])],
-        'layer_count': int(len(effective_refs)),
-        'gzip_member_layout': (
-            'one_member_per_layer'
-            if bool(nrrd_individual_layer_gzip_members_enabled())
-            else 'single_stream_legacy'
-        ),
-        'layers': [
-            {
-                'index': int(idx),
-                'key': ref.key,
-                'name': ref.name,
-                'model_name': ref.model_name,
-                'view_name': ref.view_name,
-                'view_family': ref.view_family,
-                'source': ref.source,
-                'mask_kind': ref.mask_kind,
-                'pass_index': int(ref.pass_index),
-                'tile_acceptance': ref.tile_acceptance,
-                'stage': ref.stage,
-                'description': ref.description,
-                'storage_format': getattr(ref, 'storage_format', 'raw_u8'),
-                'backing_path': str(ref.path),
-                'backing_shape_tyx': [int(ref.shape[0]), int(ref.shape[1]), int(ref.shape[2])],
-                'stored_segment_extent_ijk': (
-                    _segment_extent_to_json(ref.segment_extent_ijk)
-                    if getattr(ref, 'segment_extent_ijk', None) is not None else None
-                ),
-                'stored_segment_extent_shape_tyx': [
-                    int(v) for v in (
-                        getattr(ref, 'segment_extent_shape_tyx', None)
-                        or (int(ref.shape[0]), int(ref.shape[1]), int(ref.shape[2]))
-                    )
-                ],
-                'stored_segment_extent_source': str(getattr(ref, 'segment_extent_source', '')),
-                'nrrd_output_segment_extent_ijk': _segment_extent_to_json(extents_resolved[int(idx)]),
-                'segment_extent_source': str(sources_resolved[int(idx)]),
-            }
-            for idx, ref in enumerate(effective_refs)
-        ],
-        'notes': [
-            'YOLO layers are cleaned masks before interpolation bridges.',
-            'Bridge layers contain voxels added by the corresponding interpolation pass only.',
-            'Tile components intersecting both parent YOLO support and parent bridge support are assigned to parent_mask to keep categories mutually exclusive.',
-            'Consolidated tile bridge layers are not attributed back to parent_mask vs parent_bridge acceptance because interpolation occurs after accepted tile masks are unioned.',
-            'The final_output layer is included for direct comparison and can be ignored when recomposing a custom volume from component layers.',
-            'NRRD payload was written by the bounded-memory streaming writer; no full 4D decomposed payload was materialized.',
-            'When gzip_member_layout is one_member_per_layer, the attached NRRD gzip payload concatenates one independently compressed gzip member per layer while preserving the same decompressed (X,Y,t,layer) byte stream.',
-            'Segment extents are recorded during layer materialization and reused during final packaging whenever possible.',
-        ],
-    }
-    manifest_path = out_path.with_suffix(out_path.suffix + '.manifest.json')
-    manifest_path.write_text(json.dumps(manifest, indent=2))
-
-def write_decomposed_nrrd(
-    layer_refs: Sequence[NrrdLayerRef],
-    final_mask_u8: np.ndarray,
-    out_path: Path,
-    *,
-    temp_dir: Path,
-    workers: int = 1,
-    include_final_output_layer: bool = True,
-) -> Path:
-    """Write a multi-layer NRRD whose trailing axis decomposes the final segmentation.
-
-    Each supplied layer is an orthogonal ``(t,Y,X)`` binary mask in processing geometry.  Layers are
-    restored to the final output geometry on the fly when cubic resizing changed the working shape,
-    then streamed as a pigz gzip-encoded 4D payload ordered ``(X, Y, t, layer)``.
-    By default each layer is an independent gzip member appended to the same attached
-    ``.nrrd`` payload; set YOLO_TTA_NRRD_INDIVIDUAL_LAYER_GZIP_MEMBERS=0 for the legacy
-    single gzip stream.  A sidecar ``*.manifest.json`` is written next to the NRRD so downstream tools can reconstruct unions
-    without parsing NRRD custom fields.
-    """
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    output_shape = tuple(int(x) for x in np.asarray(final_mask_u8).shape)
-    if len(output_shape) != 3:
-        raise ValueError(f'Decomposed NRRD final mask must be 3D (t,Y,X), got {output_shape}')
-
-    effective_refs: List[NrrdLayerRef] = []
-    for ref in layer_refs:
-        if not ref.path.exists():
-            print(f'Warning: skipping missing NRRD layer backing file: {ref.path}')
-            continue
-        effective_refs.append(ref)
-
-    if bool(include_final_output_layer):
-        final_ref_path = (
-            temp_dir / 'nrrd_layers' / 'global' /
-            ('final_output_binary.orthogonal.cvol' if raw_bbox_nrrd_layers_enabled() else 'final_output_binary.orthogonal.u8.dat')
-        )
-        final_ref = materialize_nrrd_global_layer(
-            final_mask_u8,
-            model_name='global',
-            source='global',
-            mask_kind='union',
-            pass_index=0,
-            stage='final_output_after_all_postprocessing',
-            description='Final binary output after view/tile union, optional smoothing, optional keep_objects, and geometry restoration.',
-            temp_dir=temp_dir,
-            workers=int(workers),
-        )
-        if final_ref is None:
-            # Preserve an empty final layer for empty volumes so the NRRD still documents final output.
-            storage_format = 'raw_u8'
-            if raw_bbox_nrrd_layers_enabled():
-                write_raw_bbox_mask_store(
-                    np.asarray(final_mask_u8, dtype=np.uint8),
-                    final_ref_path,
-                    format_name=CVOL_FORMAT,
-                    desc='NRRD layer global final empty output',
-                    workers=int(workers),
-                    extra_meta={'nrrd_layer_key': 'global__global__global__union__final_output_after_all_postprocessing'},
-                )
-                storage_format = CVOL_FORMAT
-            else:
-                copied = copy_workspace_array(
-                    np.asarray(final_mask_u8, dtype=np.uint8),
-                    final_ref_path,
-                    desc='NRRD layer global final empty output',
-                    prefer_memory=False,
-                    workers=int(workers),
-                )
-                close_memmap_array(copied)
-            final_ref = NrrdLayerRef(
-                key='global__global__global__union__final_output_after_all_postprocessing',
-                name='Global / global / union / final output after all postprocessing',
-                path=final_ref_path,
-                shape=output_shape,
-                dtype='uint8',
-                storage_format=storage_format,
-                model_name='global',
-                view_name='global',
-                view_family='global',
-                source='global',
-                mask_kind='union',
-                pass_index=0,
-                stage='final_output_after_all_postprocessing',
-                description='Final binary output after all postprocessing; empty volume.',
-                segment_extent_ijk=_nrrd_empty_segment_extent(),
-            )
-        effective_refs.append(final_ref)
-
-    if not effective_refs:
-        return write_nrrd(final_mask_u8, out_path)
-
-    estimated_old_payload_bytes = (
-        int(len(effective_refs)) * int(output_shape[2]) * int(output_shape[1]) * int(output_shape[0])
-    )
-    layer_slice_bytes = int(output_shape[2]) * int(output_shape[1])
-    z_chunk_est = _nrrd_full_slice_z_chunk(1, int(output_shape[2]), int(output_shape[1]), int(output_shape[0]))
-    bounded_buffer_bytes = int(layer_slice_bytes) * int(z_chunk_est)
-    print(
-        'Decomposed NRRD export is using the layer-slowest bounded streaming writer. '
-        f'A full 4D uint8 payload would be ~{estimated_old_payload_bytes / GIB:.1f} GiB; '
-        f'the RAM-aware write buffer is one layer chunk, ~{bounded_buffer_bytes / GIB:.3f} GiB '
-        f'(estimated z_chunk={int(z_chunk_est)}). '
-        'The list axis is last, so each layer is written as its native (t,Y,X) C-order byte stream.'
-    )
-
-    _log_nrrd_streaming_sources(effective_refs)
-
-    layer_extents: List[NrrdSegmentExtent] = []
-    layer_extent_sources: List[str] = []
-    extent_source_counts: Dict[str, int] = {}
-    for ref in tqdm(effective_refs, desc='NRRD segment extents: metadata'):
-        extent, extent_source = _resolve_segment_extent_for_layer_ref(ref, output_shape)
-        layer_extents.append(extent)
-        layer_extent_sources.append(str(extent_source))
-        extent_source_counts[str(extent_source)] = int(extent_source_counts.get(str(extent_source), 0)) + 1
-    print(
-        'NRRD segment extents resolved: ' +
-        ', '.join(f'{key}={value}' for key, value in sorted(extent_source_counts.items()))
-    )
-
-    header = nrrd_decomposed_header(
-        output_shape_zyx=output_shape,
-        layer_refs=effective_refs,
-        layer_extents=layer_extents,
-    )
-    per_layer_gzip_members = bool(nrrd_individual_layer_gzip_members_enabled())
-    header['TTA_GzipMemberLayout'] = (
-        'one gzip member per decomposed layer'
-        if bool(per_layer_gzip_members)
-        else 'single gzip stream across all decomposed layers'
-    )
-
-    with open(out_path, 'wb') as fh:
-        _write_nrrd_ascii_header(
-            fh,
-            header=header,
-            sizes=(int(output_shape[2]), int(output_shape[1]), int(output_shape[0]), len(effective_refs)),
-            dimension=4,
-            data_type='unsigned char',
-            encoding='gzip',
-        )
-        if bool(per_layer_gzip_members):
-            _write_decomposed_nrrd_payload_layer_gzip_members(effective_refs, output_shape, fh)
-        else:
-            with _open_pigz_payload_writer(fh) as payload_writer:
-                _write_decomposed_nrrd_payload_stream(effective_refs, output_shape, payload_writer)
-
-    _write_decomposed_nrrd_manifest(
-        out_path=out_path,
-        output_shape=output_shape,
-        effective_refs=effective_refs,
-        layer_extents=layer_extents,
-        layer_extent_sources=layer_extent_sources,
-    )
-    return out_path
-
-
 def extract_radial_slice_mask_frame(mask_u8: np.ndarray, sampler: RadialSampler) -> np.ndarray:
     t_dim = int(mask_u8.shape[0])
     tt = np.arange(t_dim, dtype=np.int64)[:, None]
@@ -14386,45 +13896,6 @@ def get_view_mask_frame_by_index(mask_u8: np.ndarray, view: ViewInfo, index: int
 def iter_view_mask_frames(mask_u8: np.ndarray, view: ViewInfo) -> Iterator[np.ndarray]:
     for idx in range(int(view.num_slices)):
         yield get_view_mask_frame_by_index(mask_u8, view, int(idx))
-
-
-def write_overlay_video_for_view(
-    volume_rgb: np.memmap,
-    mask_u8: np.ndarray,
-    view: ViewInfo,
-    out_path: Path,
-    fps: float,
-    show_progress: bool = True,
-) -> None:
-    if view.name == 'transverse':
-        write_overlay_video(volume_rgb, mask_u8, out_path, fps, show_progress=show_progress)
-        return
-
-    proc = ffmpeg_ffv1_rgb_writer(
-        out_path,
-        width=view.src_w,
-        height=view.src_h,
-        fps=fps,
-    )
-    blue = np.array([0, 0, 255], dtype=np.uint8)
-
-    try:
-        assert proc.stdin is not None
-        iterator = zip(iter_view_frames(volume_rgb, view), iter_view_mask_frames(mask_u8, view))
-        for items in tqdm(
-            iterator,
-            total=view.num_slices,
-            desc=f'Writing {view.name} overlay video ({out_path.name})',
-            disable=not show_progress,
-        ):
-            frame_rgb, frame_mask = items
-            frame = _gray_to_rgb_frame(np.asarray(frame_rgb))
-            m = np.asarray(frame_mask, dtype=bool)
-            if np.any(m):
-                frame[m] = ((frame[m].astype(np.uint16) + blue.astype(np.uint16)) // 2).astype(np.uint8)
-            proc.stdin.write(np.ascontiguousarray(frame).tobytes())
-    finally:
-        close_ffmpeg_writer(proc)
 
 
 def write_native_view_overlay_video(
@@ -14532,78 +14003,6 @@ def collect_troubleshooting_overlay_futures(
         result_paths['troubleshooting_note'] = note_path
 
     return result_paths, futures
-
-
-def write_view_yolo_labels_from_pattern(
-    mask_u8: np.ndarray,
-    view: ViewInfo,
-    pattern_path: Path,
-    workers: int = 1,
-    show_progress: bool = True,
-) -> Path:
-    pattern_path.parent.mkdir(parents=True, exist_ok=True)
-    total = int(view.num_slices)
-
-    def _write_frame(idx: int) -> None:
-        fp = _format_frame_path(pattern_path, int(idx) + 1)
-        _write_label_file_from_mask(get_view_mask_frame_by_index(mask_u8, view, int(idx)), fp)
-
-    parallel_for_indices(
-        total,
-        _write_frame,
-        max_workers=choose_slice_parallel_workers(int(workers), total),
-        desc=f'Writing YOLO labels ({pattern_path.parent.name})',
-        show_progress=show_progress,
-    )
-    return pattern_path.parent
-
-
-def write_view_binary_tiff_sequence_from_pattern(
-    mask_u8: np.ndarray,
-    view: ViewInfo,
-    pattern_path: Path,
-    workers: int = 1,
-    show_progress: bool = True,
-) -> Path:
-    pattern_path.parent.mkdir(parents=True, exist_ok=True)
-    total = int(view.num_slices)
-
-    def _write_frame(idx: int) -> None:
-        fp = _format_frame_path(pattern_path, int(idx) + 1)
-        _write_binary_tiff_frame(get_view_mask_frame_by_index(mask_u8, view, int(idx)), fp)
-
-    parallel_for_indices(
-        total,
-        _write_frame,
-        max_workers=choose_slice_parallel_workers(int(workers), total),
-        desc=f'Writing binary TIFF sequence ({pattern_path.parent.name})',
-        show_progress=show_progress,
-    )
-    return pattern_path.parent
-
-
-def write_view_binary_video_from_mask_volume(
-    mask_u8: np.ndarray,
-    view: ViewInfo,
-    video_path: Path,
-    fps: float,
-    show_progress: bool = True,
-) -> Path:
-    proc = ffmpeg_ffv1_gray_writer(
-        video_path,
-        width=view.src_w,
-        height=view.src_h,
-        fps=fps,
-    )
-    try:
-        assert proc.stdin is not None
-        for idx in tqdm(range(view.num_slices), total=view.num_slices, desc=f'Writing binary MKV ({video_path.name})', disable=not show_progress):
-            gray = (np.asarray(get_view_mask_frame_by_index(mask_u8, view, int(idx))) * 255).astype(np.uint8)
-            proc.stdin.write(np.ascontiguousarray(gray).tobytes())
-    finally:
-        close_ffmpeg_writer(proc)
-    return video_path
-
 
 
 @dataclass(frozen=True)
@@ -14924,11 +14323,16 @@ def save_single_low_quality_output(
     stem: str,
     fps: float,
     temp_dir: Path,
-    nrrd_layer_refs: Optional[Sequence[NrrdLayerRef]] = None,
+    save_nrrd: bool = False,
     workers: int = 1,
     show_progress: bool = True,
 ) -> Dict[str, Path]:
-    """Write one low-quality downbin, with overlay/binary/NRRD writers overlapped."""
+    """Write one low-quality downbin, with overlay/binary/NRRD writers overlapped.
+
+    v13.2.0: the low-quality NRRD is a single combined binary volume for distribution and is
+    written only when ``--save_nrrd`` is also enabled (it no longer runs regardless of
+    --save_nrrd, and it is no longer a decomposed multi-layer NRRD).
+    """
     low_root = Path(out_dir) / 'low_quality'
     low_root.mkdir(parents=True, exist_ok=True)
     source_t = max(1, int(mask_u8.shape[0]))
@@ -14975,37 +14379,26 @@ def save_single_low_quality_output(
             return write_low_quality_binary_video(mask_lq, binary_path, fps_lq, show_progress=show_progress)
 
         def _write_lq_nrrd() -> Path:
-            if nrrd_layer_refs is not None and len(nrrd_layer_refs) > 0:
-                return write_decomposed_nrrd(
-                    list(nrrd_layer_refs),
-                    mask_lq,
-                    nrrd_path,
-                    temp_dir=Path(temp_dir) / 'low_quality' / spec.token / 'nrrd_decomposed',
-                    workers=int(workers),
-                    include_final_output_layer=True,
-                )
             return write_nrrd(mask_lq, nrrd_path)
+
+        writer_thunks = [_write_lq_overlay, _write_lq_binary]
+        if bool(save_nrrd):
+            writer_thunks.append(_write_lq_nrrd)
 
         writer_count = low_quality_per_bin_output_workers(int(workers))
         if writer_count <= 1:
-            _write_lq_overlay()
-            _write_lq_binary()
-            _write_lq_nrrd()
+            for thunk in writer_thunks:
+                thunk()
         else:
             with ThreadPoolExecutor(max_workers=int(writer_count), thread_name_prefix=f'lq-writer-{spec.token[:16]}') as executor:
-                futures = [
-                    executor.submit(_write_lq_overlay),
-                    executor.submit(_write_lq_binary),
-                    executor.submit(_write_lq_nrrd),
-                ]
+                futures = [executor.submit(thunk) for thunk in writer_thunks]
                 for fut in as_completed(futures):
                     fut.result()
 
         result_paths[f'low_quality_{spec.token}_overlay'] = overlay_path
         result_paths[f'low_quality_{spec.token}_binary_video'] = binary_path
-        result_paths[f'low_quality_{spec.token}_nrrd'] = nrrd_path
-        if nrrd_layer_refs is not None and len(nrrd_layer_refs) > 0:
-            result_paths[f'low_quality_{spec.token}_nrrd_manifest'] = nrrd_path.with_suffix(nrrd_path.suffix + '.manifest.json')
+        if bool(save_nrrd):
+            result_paths[f'low_quality_{spec.token}_nrrd'] = nrrd_path
         return result_paths
     finally:
         if gray_lq is not volume_gray:
@@ -15023,7 +14416,7 @@ def save_low_quality_outputs(
     fps: float,
     downbin_specs: Sequence[LowQualityDownbinSpec],
     temp_dir: Path,
-    nrrd_layer_refs: Optional[Sequence[NrrdLayerRef]] = None,
+    save_nrrd: bool = False,
     workers: int = 1,
     show_progress: bool = True,
 ) -> Dict[str, Path]:
@@ -15050,7 +14443,7 @@ def save_low_quality_outputs(
                 fps=float(fps),
                 spec=spec,
                 temp_dir=temp_dir,
-                nrrd_layer_refs=nrrd_layer_refs,
+                save_nrrd=save_nrrd,
                 workers=int(workers),
                 show_progress=show_progress,
             ))
@@ -15068,7 +14461,7 @@ def save_low_quality_outputs(
                 fps=float(fps),
                 spec=spec,
                 temp_dir=temp_dir,
-                nrrd_layer_refs=nrrd_layer_refs,
+                save_nrrd=save_nrrd,
                 workers=int(workers),
                 show_progress=show_progress,
             )
@@ -15089,7 +14482,7 @@ def collect_low_quality_output_futures(
     fps: float,
     downbin_specs: Sequence[LowQualityDownbinSpec],
     temp_dir: Path,
-    nrrd_layer_refs: Optional[Sequence[NrrdLayerRef]] = None,
+    save_nrrd: bool = False,
     workers: int = 1,
     show_progress: bool = True,
 ) -> Tuple[Dict[str, Path], List[Future]]:
@@ -15098,7 +14491,7 @@ def collect_low_quality_output_futures(
         out_dir=out_dir,
         stem=stem,
         downbin_specs=downbin_specs,
-        nrrd_layer_refs=nrrd_layer_refs,
+        save_nrrd=save_nrrd,
     )
     futures: List[Future] = []
     for spec in list(downbin_specs):
@@ -15111,7 +14504,7 @@ def collect_low_quality_output_futures(
             fps=float(fps),
             spec=spec,
             temp_dir=temp_dir,
-            nrrd_layer_refs=nrrd_layer_refs,
+            save_nrrd=save_nrrd,
             workers=int(workers),
             show_progress=show_progress,
         ))
@@ -15123,7 +14516,7 @@ def planned_low_quality_output_paths(
     out_dir: Path,
     stem: str,
     downbin_specs: Sequence[LowQualityDownbinSpec],
-    nrrd_layer_refs: Optional[Sequence[NrrdLayerRef]] = None,
+    save_nrrd: bool = False,
 ) -> Dict[str, Path]:
     """Return the paths that save_low_quality_outputs will create.
 
@@ -15140,11 +14533,9 @@ def planned_low_quality_output_paths(
         nrrd_path = spec_dir / f'{stem}_LowQuality_{spec.token}.nrrd'
         result_paths[f'low_quality_{spec.token}_overlay'] = overlay_path
         result_paths[f'low_quality_{spec.token}_binary_video'] = binary_path
-        result_paths[f'low_quality_{spec.token}_nrrd'] = nrrd_path
-        if nrrd_layer_refs is not None and len(nrrd_layer_refs) > 0:
-            result_paths[f'low_quality_{spec.token}_nrrd_manifest'] = nrrd_path.with_suffix(nrrd_path.suffix + '.manifest.json')
+        if bool(save_nrrd):
+            result_paths[f'low_quality_{spec.token}_nrrd'] = nrrd_path
     return result_paths
-
 
 
 @dataclass
@@ -15254,99 +14645,13 @@ def collect_pipeline_output_futures(
         result_paths["binary_tiff_dir"] = binary_pattern.parent
         result_paths["binary_video"] = binary_video_path
 
-    if bool(save_nrrd_flag):
-        nrrd_path = out_dir / f"{stem}{tag_suffix}.nrrd"
-        if nrrd_layer_refs is not None and len(nrrd_layer_refs) > 0 and nrrd_temp_dir is not None:
-            futures.append(executor.submit(
-                write_decomposed_nrrd,
-                list(nrrd_layer_refs),
-                mask_u8,
-                nrrd_path,
-                temp_dir=nrrd_temp_dir,
-                workers=int(nrrd_workers),
-                include_final_output_layer=True,
-            ))
-            result_paths["nrrd_manifest"] = nrrd_path.with_suffix(nrrd_path.suffix + '.manifest.json')
-        else:
-            futures.append(executor.submit(write_nrrd, mask_u8, nrrd_path))
-        result_paths["nrrd"] = nrrd_path
+    # v13.2.0: --save_nrrd no longer assembles one mega 4D decomposed NRRD here. Each component
+    # layer is written as its own single-layer NRRD by the NrrdLayerSink during the intermediate
+    # pipeline steps (and the Global_final_output layer is materialized in the tail), so this
+    # background output group has no NRRD work. The unused save_nrrd_flag / nrrd_* parameters are
+    # retained for call-site stability.
 
     return result_paths, futures
-
-
-def collect_multiplanar_output_futures(
-    executor: ThreadPoolExecutor,
-    *,
-    volume_rgb: np.memmap,
-    mask_u8: np.ndarray,
-    out_dir: Path,
-    stem: str,
-    fps: float,
-    save_binary_pattern_value: Optional[str],
-    save_labels_pattern_value: Optional[str],
-    save_sagittal_flag: bool = True,
-    save_coronal_flag: bool = True,
-    tag: Optional[str] = None,
-    frame_workers: int = 1,
-    show_progress: bool = False,
-) -> Tuple[Dict[str, Path], List[Future]]:
-    t_dim, h_dim, w_dim = mask_u8.shape
-    views = {
-        v.name: v for v in get_view_infos(
-            t_dim, h_dim, w_dim,
-            disable_multiplanar=None,
-            azimuth_angle=0.0,
-            include_radial=False,
-            enable_sagittal=True,
-            enable_coronal=True,
-        )
-    }
-    futures: List[Future] = []
-    result_paths: Dict[str, Path] = {}
-
-    requested_view_names: List[str] = []
-    if bool(save_sagittal_flag):
-        requested_view_names.append('sagittal')
-    if bool(save_coronal_flag):
-        requested_view_names.append('coronal')
-
-    for view_name in requested_view_names:
-        view = views[view_name]
-        pretty = view_output_token(view)
-        tag_suffix = f'_{tag}' if tag else ''
-
-        overlay_path = out_dir / f'{stem}_{pretty}_Overlay{tag_suffix}.mkv'
-        futures.append(executor.submit(
-            write_overlay_video_for_view,
-            volume_rgb,
-            mask_u8,
-            view,
-            overlay_path,
-            fps,
-            show_progress=show_progress,
-        ))
-        result_paths[f'{view.name}_overlay'] = overlay_path
-
-        labels_pattern = _resolve_output_pattern(save_labels_pattern_value, DEFAULT_LABEL_PATTERN, out_dir, stem)
-        if labels_pattern is not None:
-            labels_pattern = _tag_frame_pattern(labels_pattern, pretty if tag is None else f'{pretty}_{tag}')
-            futures.append(executor.submit(write_view_yolo_labels_from_pattern, mask_u8, view, labels_pattern, int(frame_workers), show_progress))
-            result_paths[f'{view.name}_labels_dir'] = labels_pattern.parent
-
-        binary_pattern = _resolve_output_pattern(save_binary_pattern_value, DEFAULT_BINARY_PATTERN, out_dir, stem)
-        if binary_pattern is not None:
-            binary_pattern = _tag_frame_pattern(binary_pattern, pretty if tag is None else f'{pretty}_{tag}')
-            binary_video_path = out_dir / f'{stem}_{pretty}_Binary{tag_suffix}.mkv'
-            futures.append(executor.submit(write_view_binary_tiff_sequence_from_pattern, mask_u8, view, binary_pattern, int(frame_workers), show_progress))
-            futures.append(executor.submit(write_view_binary_video_from_mask_volume, mask_u8, view, binary_video_path, fps, show_progress))
-            result_paths[f'{view.name}_binary_tiff_dir'] = binary_pattern.parent
-            result_paths[f'{view.name}_binary_video'] = binary_video_path
-
-    return result_paths, futures
-
-
-
-
 
 
 def write_view_images(
@@ -15520,7 +14825,6 @@ def write_summary_file(
     return out_path
 
 
-
 # --------------------------
 # Main
 # --------------------------
@@ -15564,10 +14868,8 @@ def main() -> None:
     tile_configs = resolve_tile_configs(args.tile_size, args.tile_stride)
     enable_sagittal = bool(args.enable_sagittal)
     enable_coronal = bool(args.enable_coronal)
-    # v12.2.0 retains the v12 single-transverse default-output behavior and omits old per-view save flags. Default outputs stay transverse-only;
-    # active non-transverse views contribute to inference/union but are not separately exported.
-    save_sagittal = False
-    save_coronal = False
+    # Default outputs stay transverse-only; active non-transverse views contribute to inference/union
+    # but are not separately exported. (--save_sagittal/--save_coronal were fully deprecated and removed.)
     requested_azimuth_angle = None if args.azimuth_angle is None else float(args.azimuth_angle)
 
     # v13.0.0 multi-GPU scheduling + retina-mask-processor resolution.
@@ -15655,10 +14957,10 @@ def main() -> None:
     if not (-90.0 < float(args.interpolation_search_angle) < 90.0):
         raise ValueError('--interpolation_search_angle must be greater than -90 and less than 90')
     low_quality_requested = bool(args.save_low_quality or args.save_low_quality_downbin is not None)
-    # Low-quality NRRDs must mirror the full decomposed NRRD layer stack.  Therefore layer
-    # materialization is needed whenever a low-quality NRRD will be written, even if the user did
-    # not also request the full-size --save_nrrd output.
-    nrrd_layers_needed = bool(args.save_nrrd or low_quality_requested)
+    # v13.2.0 (#2.6): NRRD component layers are produced only for --save_nrrd. The low-quality NRRD
+    # is now a single combined volume that is also gated behind --save_nrrd, so requesting only
+    # low-quality outputs no longer triggers NRRD layer materialization or any NRRD output.
+    nrrd_layers_needed = bool(args.save_nrrd)
     troubleshooting_outputs_enabled = bool(args.troubleshooting)
     # v12.2.0 --troubleshooting creates overlay MKVs only. Temporary scratch retention is a
     # separate hidden maintenance escape hatch so troubleshooting no longer changes cleanup semantics.
@@ -15682,6 +14984,22 @@ def main() -> None:
         bool(low_quality_requested),
         (input_T, input_H, input_W),
     )
+
+    # v13.2.0: --save_nrrd writes one single-layer NRRD per component layer (in source output
+    # geometry X,Y,t) as the layers are produced during the intermediate pipeline steps. The sink
+    # is configured here (output geometry is now known) and torn down in the tail after the final
+    # global layers are materialized.
+    nrrd_dir = out_dir / 'nrrd'
+    if bool(args.save_nrrd):
+        set_nrrd_layer_sink(NrrdLayerSink(
+            nrrd_dir=nrrd_dir,
+            stem=input_path.stem,
+            output_shape_tyx=(input_T, input_H, input_W),
+            max_workers=nrrd_layer_sink_workers(),
+            pigz_threads=nrrd_single_layer_pigz_threads(),
+        ))
+    else:
+        set_nrrd_layer_sink(None)
 
     preprocess_streaming_active = bool(streaming_preprocess_enabled())
     vol_path = temp_dir / 'input_volume.gray8.dat'
@@ -15858,8 +15176,10 @@ def main() -> None:
             )
         )
         spec_notes.append(
-            'Low-quality NRRDs use the same decomposed component layer stack as the full NRRD, '
-            'streamed directly into the requested low-quality geometry with its own manifest sidecar; each low-quality downbin is submitted as an independent background job, and each bin can overlap its overlay, binary video, and NRRD writers so all low-quality NRRD payload streams can run alongside the full-size NRRD when output workers are available.'
+            'v13.2.0 (#2.6): each low-quality downbin is submitted as an independent background job whose '
+            'overlay and binary videos always run; a single combined low-quality NRRD (one binary volume, not '
+            'decomposed) is written per downbin only when --save_nrrd is also enabled, so requesting only '
+            'low-quality outputs produces the low-quality videos but no NRRD.'
         )
     if (int(T), int(H), int(W)) != (int(input_T), int(input_H), int(input_W)):
         spec_notes.append(
@@ -15891,16 +15211,39 @@ def main() -> None:
             'v12.2.11 final Radial and Tilted backprojection is CPU-only. The old CuPy/GPU backprojection slot is disabled so the GPU remains dedicated to YOLO inference; each backprojection set receives the full resolved CPU slice-worker budget.'
         )
     spec_notes.append(
-        'NRRD export is decomposed by default in v12.2.0: layers are written on a trailing list axis as '
-        '(X,Y,t,layer), with manifest JSON and SegmentN metadata for view, source, YOLO-vs-bridge, '
-        'tile acceptance category, pre-smoothing union, smoothing pass results, and final output. '
-        'The NRRD payload is pigz-streamed directly from backing layers without materializing the full 4D decomposed payload; '
-        'The layer-slowest writer uses a RAM-aware one-layer (t,Y,X) chunk buffer and writes layers sequentially without per-voxel interleave or slice transposes. '
-        'Tune YOLO_TTA_NRRD_STREAM_BUFFER_MIB, YOLO_TTA_NRRD_STREAM_BUFFER_FRACTION, YOLO_TTA_NRRD_STREAM_BUFFER_MAX_GIB, '
-        'and YOLO_TTA_NRRD_PIGZ_LEVEL if needed. '
-        "Segment extents are now recorded when each NRRD layer/cvol store is materialized and reused during final packaging; only missing metadata or disabled YOLO_TTA_NRRD_PRECOMPUTED_SEGMENT_EXTENTS falls back to a layer scan. Raw cvol/ctile backing paths cache each layer's chunks.bin in RAM while that layer is streamed via YOLO_TTA_NRRD_CACHE_RAW_BBOX_LAYERS_IN_RAM=1, then release the per-layer cache. "
-        'Transient NRRD projection, before-pass, and bridge-delta workspaces prefer anonymous RAM and fall back to disk only when the workspace budget requires it. '
-        f'Legacy single-volume NRRD writing is retained only for deprecated internal callers without layer refs; space={NRRD_SPACE}.'
+        'v13.2.0 NRRD export (--save_nrrd) writes one single-layer 3-axis NRRD (X,Y,t) per component layer to '
+        'nrrd/, named {Filestem}_{ViewToken|Global}_{layer}.nrrd (model name dropped). Layer families: full-frame '
+        'YOLO masks, full-frame interpolation bridges per pass, tiled masks accepted by parent YOLO masks, tiled '
+        'masks accepted by parent bridges, consolidated tile bridges per pass, Global_union_presmoothing, '
+        'Global_smoothing_pass<N>, and Global_final_output. Each layer is restored to source output geometry while '
+        'streaming, gzip-compressed in one pigz pass, and written by a background sink as the layer is produced '
+        'during the intermediate pipeline steps (so the Transverse layer compresses while Tiled Transverse is still '
+        'inferencing, and the global union layer is written while smoothing runs). A single '
+        '{Filestem}_nrrd_manifest.json lists every written layer. Tune YOLO_TTA_NRRD_PIGZ_LEVEL, '
+        'YOLO_TTA_NRRD_SINGLE_LAYER_PIGZ_THREADS, and YOLO_TTA_NRRD_LAYER_SINK_WORKERS if needed. The previous mega '
+        f'4D decomposed NRRD (one file, trailing list axis) was removed. space={NRRD_SPACE}.'
+    )
+    spec_notes.append(
+        'CONFLICT NOTE 2 (single-layer NRRD filenames): spec 7.2 lists layer family #5 ("Tiled Bridges") with the '
+        'same filename token as family #4 ("Tiled YOLO masks accepted by Parent Bridges", '
+        '{Filestem}_{ViewToken}_tile_yolo_parent_bridge), which would collide. The implementation keeps them '
+        'distinct: tiles accepted by a parent bridge are {ViewToken}_tile_yolo_parent_bridge, while consolidated '
+        'tile interpolation bridges are {ViewToken}_tile_bridge_pass<N>. Suggested spec edit: rename family #5 to '
+        '{Filestem}_{ViewToken}_tile_bridge_pass<N> to match the per-pass consolidated tile bridge layers.'
+    )
+    spec_notes.append(
+        'CONFLICT NOTE 3 (low-quality NRRD form): spec --save_low_quality says "low bitrate output videos and '
+        'NRRDs". Since the mega decomposed NRRD was removed and per-layer decomposition is a power-user analysis '
+        'feature, the low-quality NRRD is implemented as one single combined binary volume for distribution, gated '
+        'behind --save_nrrd (task #2.6). Suggested spec edit: state that the low-quality NRRD is a single combined '
+        'volume written only when --save_nrrd is enabled.'
+    )
+    spec_notes.append(
+        'Task #2.5 review (single-angle fast path / tqdm): YOLO -> flatten -> --min_conf -> warp -> --min_radius -> '
+        '2D hole fill all run on the GPU (cupy) and only the finished view-native plane crosses PCIe; the per-slice '
+        'CPU cleanup is skipped via cleanup_done_on_gpu. No tqdm bar wraps the inference stream, so any tqdm the '
+        'user sees that does not line up with GPU work is a separate post-inference progress bar (a purely visual '
+        'artifact), not masks being shuttled CPU<->GPU. The fast path was left unchanged, as instructed.'
     )
     spec_notes.append(
         f'v13.0.0 inference devices: {inference_devices} '
@@ -17009,7 +16352,6 @@ def main() -> None:
             _submit_tile_finalize(result)
 
 
-
     # v12: render futures were replaced by _drain_completed_prediction_volume_futures().
 
     def _submit_prediction_accumulation_join(handle: PredictionAccumulationHandle, context: Dict[str, object]) -> None:
@@ -17909,6 +17251,24 @@ def main() -> None:
             workers=int(slice_postprocess_workers),
             prefer_memory=True,
         )
+    if bool(nrrd_layers_needed):
+        # v13.2.0: the Global_final_output single-layer NRRD is materialized here (it was previously
+        # appended inside the now-removed mega decomposed writer) and the sink writes it in the
+        # background while the rest of the default outputs are produced.
+        final_output_ref = materialize_nrrd_global_layer(
+            final_output_mask_mm,
+            model_name=str(model_name),
+            source='global',
+            mask_kind='union',
+            pass_index=0,
+            stage='final_output_after_all_postprocessing',
+            description='Final binary output after view/tile union, optional smoothing, optional keep_objects, and geometry restoration. Not intended for recomposition.',
+            temp_dir=temp_dir,
+            workers=int(slice_postprocess_workers),
+        )
+        if final_output_ref is not None:
+            nrrd_layer_refs.append(final_output_ref)
+
     final_output_volume_for_low_quality = output_volume_rgb
     final_paths: Dict[str, Path] = {}
 
@@ -17957,24 +17317,6 @@ def main() -> None:
         nrrd_temp_dir=temp_dir,
         nrrd_workers=output_frame_workers,
     )
-    if bool(save_sagittal) or bool(save_coronal):
-        extra_paths, extra_futures = collect_multiplanar_output_futures(
-            output_manager.executor,
-            volume_rgb=output_volume_rgb,
-            mask_u8=final_output_mask_mm,
-            out_dir=out_dir,
-            stem=input_path.stem,
-            fps=fps,
-            save_binary_pattern_value=args.save_binary,
-            save_labels_pattern_value=args.save_labels,
-            save_sagittal_flag=False,
-            save_coronal_flag=False,
-            tag=None,
-            frame_workers=output_frame_workers,
-            show_progress=False,
-        )
-        final_output_paths.update(extra_paths)
-        final_futures.extend(extra_futures)
     final_paths.update(final_output_paths)
     output_manager.submit(BackgroundOutputSubmission(
         label='final outputs',
@@ -17994,7 +17336,7 @@ def main() -> None:
             fps=fps,
             downbin_specs=low_quality_downbin_specs,
             temp_dir=temp_dir,
-            nrrd_layer_refs=nrrd_layer_refs,
+            save_nrrd=bool(args.save_nrrd),
             workers=output_workers,
             show_progress=False,
         )
@@ -18023,6 +17365,20 @@ def main() -> None:
 
     output_manager.wait()
 
+    nrrd_manifest_path: Optional[Path] = None
+    nrrd_layer_files_written = 0
+    layer_sink = nrrd_layer_sink()
+    if layer_sink is not None:
+        print('\n=== Finishing single-layer NRRD writes ===')
+        layer_sink.wait()
+        nrrd_layer_files_written = int(layer_sink.layer_count())
+        nrrd_manifest_path = layer_sink.write_manifest()
+        layer_sink.shutdown()
+        set_nrrd_layer_sink(None)
+        final_paths['nrrd_dir'] = nrrd_dir
+        if nrrd_manifest_path is not None:
+            final_paths['nrrd_manifest'] = nrrd_manifest_path
+
     if bool(args.save_images):
         print('\n=== Saving active-view image sequences ===')
         for view in views:
@@ -18038,8 +17394,13 @@ def main() -> None:
 
     if bool(nrrd_layers_needed):
         spec_notes.append(
-            f'Decomposed NRRD component layers prepared: {int(len(nrrd_layer_refs))}; '
-            'the writer appends one final_output layer, reuses materialization-time SegmentN extents, writes .nrrd.manifest.json sidecars for full-size and low-quality decomposed NRRDs, and by default stores each decomposed layer as an independently compressed gzip member inside the same attached .nrrd payload.'
+            f'NRRD decomposition (v13.2.0): {int(nrrd_layer_files_written)} single-layer NRRD file(s) written to '
+            f'{nrrd_dir} as one uint8 binary mask per component layer (X,Y,t source geometry), named '
+            '{Filestem}_{ViewToken|Global}_{layer}.nrrd with the model name dropped. Each layer is created during '
+            'the intermediate pipeline steps (e.g. the Transverse layer compresses while Tiled Transverse is still '
+            'inferencing) and the Global_union_presmoothing layer is written while smoothing runs; a single '
+            f'{input_path.stem}_nrrd_manifest.json sidecar lists every written layer. The previous mega 4D '
+            'decomposed NRRD (one file with a trailing list axis) has been removed.'
         )
 
     summary_path = write_summary_file(
@@ -18172,7 +17533,6 @@ def main() -> None:
     print(f'Scratch dir: {temp_dir}')
     print(f"Final overlay: {final_paths['overlay']}")
     print(f'Summary: {summary_path}')
-
 
 
 if __name__ == "__main__":
