@@ -2,8 +2,21 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the v13.2.0_SLURM implementation. It is derived from v13.1.0_SLURM by COPY + surgical edits,
-with the following v13.2.0 changes:
+This is the v13.2.1_SLURM implementation. It is derived from v13.2.0_SLURM by COPY + surgical edits,
+with the following v13.2.1 bug fixes:
+  - v13.2.1 (bug #1) verified --device accepts comma+space inputs such as "0, 1, 2, 3": the nargs='+'
+    argparser collects the tokens and parse_device_list re-splits them on commas/whitespace, matching
+    the other multi-value flags. Confirmed with --device "0, 1, 2, 3", 0 1 2 3, 0,1,2,3, and a quoted
+    single token; all yield ['cuda:0','cuda:1','cuda:2','cuda:3']. No code change was required.
+  - v13.2.1 (bug #2) low-quality NRRDs now follow the full-quality NRRD format and scheduling: instead
+    of one combined binary volume written at the tail, the NrrdLayerSink mirrors every component layer
+    into one downbinned single-layer NRRD per --save_low_quality_downbin spec under
+    low_quality/<token>/nrrd/, restored from the same NrrdLayerRef and submitted as each view completes.
+    Each downbin gets its own _nrrd_manifest.json with layer suffixes matching the full-quality layers.
+  - v13.2.1 (bug #3) fixed a TypeError in build_dense_tile_jobs_for_aug: the DenseTileJob constructor
+    omitted the required out_size field, so every tiled run crashed. out_size is now passed through.
+
+It is derived from the v13.2.0_SLURM line, with the following v13.2.0 changes:
   - v13.2.0 (task #1) --save_nrrd is reworked from one mega 4D decomposed NRRD (a single file with a
     trailing list axis, assembled by reading every layer backing store through pigz at the very end)
     into one single-layer 3-axis NRRD (X,Y,t) per component layer written to nrrd/. Each small layer
@@ -361,7 +374,7 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Save final binary masks as a TIFF sequence plus an FFV1 MKV. Optional custom TIFF pattern, e.g. binary_masks/{Filename}_Binary_%%04d.tiff")
     p.add_argument("--save_nrrd", action="store_true", help="Save the decomposition as one single-layer NRRD (X,Y,t) per component layer in nrrd/, plus a manifest JSON. Layers are written during the intermediate pipeline steps")
     p.add_argument("--save_low_quality", action="store_true",
-                   help="Save additional isotropically downsampled low-quality presentation videos (libx264, preset slow, yuv420p). A single combined low-quality NRRD is also written, but only when --save_nrrd is enabled")
+                   help="Save additional isotropically downsampled low-quality presentation videos (libx264, preset slow, yuv420p). When --save_nrrd is also enabled, the low-quality NRRD decomposition follows the full-quality format: one downbinned single-layer NRRD per component layer under low_quality/<token>/nrrd/, written as each view completes")
     p.add_argument("--save_low_quality_downbin", nargs="+", default=None, type=str,
                    help="One or more isotropic low-quality downbins. Floats scale each X/Y/t dimension, e.g. 0.5. Integers scale the largest dimension to that value. Providing this flag implies --save_low_quality")
     p.add_argument("--voxel_volume", action="store_true", help="Count white voxels in the final binary output after restoration to native input geometry and save the value to the summary text file")
@@ -3916,7 +3929,8 @@ def build_dense_tile_jobs_for_aug(
                     tile_y=int(tile_y),
                     tile_size=int(tile_cfg.tile_size),
                     tile_stride=int(tile_cfg.tile_stride),
-                            meta_path=tile_dir / f'{view.name}_{tile_id}.meta.json',
+                    out_size=int(out_size),
+                    meta_path=tile_dir / f'{view.name}_{tile_id}.meta.json',
                     M_out_to_src=M_out_to_src3[:2, :3].astype(np.float32),
                     M_src_to_out=M_src_to_out3[:2, :3].astype(np.float32),
                 )
@@ -13500,6 +13514,8 @@ class NrrdLayerSink:
         output_shape_tyx: Tuple[int, int, int],
         max_workers: int,
         pigz_threads: int,
+        low_quality_specs: Optional[Sequence['LowQualityDownbinSpec']] = None,
+        low_quality_root: Optional[Path] = None,
     ) -> None:
         self.nrrd_dir = Path(nrrd_dir)
         self.nrrd_dir.mkdir(parents=True, exist_ok=True)
@@ -13511,6 +13527,21 @@ class NrrdLayerSink:
         self._futures: List[Future] = []
         self._manifest: List[Dict[str, object]] = []
         self._suffix_counts: Dict[str, int] = {}
+        # v13.2.1: low-quality NRRDs now mirror the full-quality decomposition instead of being one
+        # combined volume written at the tail.  Each downbin spec gets its own
+        # one-single-layer-NRRD-per-component decomposition under low_quality/<token>/nrrd/, restored
+        # from the same NrrdLayerRef and submitted here as each view completes (identical scheduling).
+        self.low_quality_specs: List['LowQualityDownbinSpec'] = list(low_quality_specs or [])
+        self.low_quality_root = Path(low_quality_root) if low_quality_root is not None else None
+        self._lq_manifests: Dict[str, List[Dict[str, object]]] = {}
+        if self.low_quality_specs and self.low_quality_root is not None:
+            for spec in self.low_quality_specs:
+                self._lq_nrrd_dir(spec).mkdir(parents=True, exist_ok=True)
+
+    def _lq_nrrd_dir(self, spec: 'LowQualityDownbinSpec') -> Path:
+        if self.low_quality_root is None:
+            raise RuntimeError('low-quality NRRD directory requested without a low_quality_root')
+        return self.low_quality_root / str(spec.token) / 'nrrd'
 
     def submit_layer(self, ref: Optional['NrrdLayerRef'], suffix: str) -> Optional[Path]:
         if ref is None:
@@ -13537,11 +13568,49 @@ class NrrdLayerSink:
             })
             fut = self.executor.submit(write_single_layer_nrrd_from_ref, ref, self.output_shape, out_path, pigz_threads=self.pigz_threads)
             self._futures.append(fut)
+            # v13.2.1: mirror this component layer into each low-quality downbin decomposition,
+            # scheduled now (as the view completes) exactly like the full-quality layer and sharing
+            # the same unique suffix so a low-quality layer maps 1:1 to its full-quality layer.
+            for spec in self.low_quality_specs:
+                if self.low_quality_root is None:
+                    break
+                lq_shape = (
+                    int(spec.output_shape_t_y_x[0]),
+                    int(spec.output_shape_t_y_x[1]),
+                    int(spec.output_shape_t_y_x[2]),
+                )
+                lq_path = self._lq_nrrd_dir(spec) / f'{self.stem}_{unique_suffix}.nrrd'
+                self._lq_manifests.setdefault(str(spec.token), []).append({
+                    'filename': lq_path.name,
+                    'suffix': unique_suffix,
+                    'view_name': getattr(ref, 'view_name', ''),
+                    'view_family': getattr(ref, 'view_family', ''),
+                    'source': getattr(ref, 'source', ''),
+                    'mask_kind': getattr(ref, 'mask_kind', ''),
+                    'pass_index': int(getattr(ref, 'pass_index', 0)),
+                    'tile_acceptance': getattr(ref, 'tile_acceptance', ''),
+                    'stage': getattr(ref, 'stage', ''),
+                    'description': getattr(ref, 'description', ''),
+                    'backing_shape_tyx': [int(v) for v in getattr(ref, 'shape', (0, 0, 0))],
+                    'output_shape_tyx': [int(v) for v in lq_shape],
+                    'downbin_value': str(spec.raw_value),
+                    'downbin_token': str(spec.token),
+                    'downbin_scale': float(spec.scale),
+                    'exported_axes': '(X, Y, t)',
+                })
+                lq_fut = self.executor.submit(
+                    write_single_layer_nrrd_from_ref, ref, lq_shape, lq_path, pigz_threads=self.pigz_threads
+                )
+                self._futures.append(lq_fut)
         return out_path
 
     def layer_count(self) -> int:
         with self._lock:
             return len(self._manifest)
+
+    def low_quality_layer_count(self) -> int:
+        with self._lock:
+            return int(sum(len(entries) for entries in self._lq_manifests.values()))
 
     def wait(self) -> None:
         with self._lock:
@@ -13562,6 +13631,38 @@ class NrrdLayerSink:
     def write_manifest(self) -> Optional[Path]:
         with self._lock:
             manifest_layers = list(self._manifest)
+            lq_manifests = {token: list(entries) for token, entries in self._lq_manifests.items()}
+        # v13.2.1: one manifest per low-quality downbin decomposition, mirroring the full-quality
+        # sidecar so each low-quality nrrd/ folder is self-describing and recomposable on its own.
+        if self.low_quality_root is not None:
+            for spec in self.low_quality_specs:
+                entries = lq_manifests.get(str(spec.token), [])
+                if not entries:
+                    continue
+                lq_shape = (
+                    int(spec.output_shape_t_y_x[0]),
+                    int(spec.output_shape_t_y_x[1]),
+                    int(spec.output_shape_t_y_x[2]),
+                )
+                lq_manifest_path = self._lq_nrrd_dir(spec) / f'{self.stem}_nrrd_manifest.json'
+                lq_manifest_path.write_text(json.dumps({
+                    'layout': 'one_single_layer_nrrd_per_component',
+                    'quality': 'low_quality',
+                    'downbin_value': str(spec.raw_value),
+                    'downbin_token': str(spec.token),
+                    'downbin_scale': float(spec.scale),
+                    'exported_axes': '(X, Y, t)',
+                    'output_shape_tyx': [int(v) for v in lq_shape],
+                    'full_quality_output_shape_tyx': [int(v) for v in self.output_shape],
+                    'layer_count': len(entries),
+                    'layers': entries,
+                    'notes': [
+                        'Low-quality distribution decomposition: the same component layers as the full-quality '
+                        'nrrd/ folder, isotropically downbinned to this spec and written as each view completes.',
+                        'Each NRRD is one uint8 binary mask in source output geometry (X, Y, t), downbinned.',
+                        'Layer suffixes match the full-quality layers, so each low-quality layer maps 1:1 to its full-quality layer.',
+                    ],
+                }, indent=2))
         if not manifest_layers:
             return None
         manifest_path = self.nrrd_dir / f'{self.stem}_nrrd_manifest.json'
@@ -14327,11 +14428,13 @@ def save_single_low_quality_output(
     workers: int = 1,
     show_progress: bool = True,
 ) -> Dict[str, Path]:
-    """Write one low-quality downbin, with overlay/binary/NRRD writers overlapped.
+    """Write one low-quality downbin's overlay and binary videos, overlapped.
 
-    v13.2.0: the low-quality NRRD is a single combined binary volume for distribution and is
-    written only when ``--save_nrrd`` is also enabled (it no longer runs regardless of
-    --save_nrrd, and it is no longer a decomposed multi-layer NRRD).
+    v13.2.1: the low-quality NRRD is no longer written here as one combined volume.  When
+    ``--save_nrrd`` is active the low-quality decomposition now follows the full-quality format and
+    schedule -- one single-layer NRRD per component layer, downbinned and written by the
+    NrrdLayerSink as each view completes (see NrrdLayerSink.submit_layer).  ``save_nrrd`` is retained
+    for call-site compatibility but no longer drives any NRRD write in this function.
     """
     low_root = Path(out_dir) / 'low_quality'
     low_root.mkdir(parents=True, exist_ok=True)
@@ -14370,7 +14473,6 @@ def save_single_low_quality_output(
     try:
         overlay_path = spec_dir / f'{stem}_Overlay_LowQuality_{spec.token}.mp4'
         binary_path = spec_dir / f'{stem}_Binary_LowQuality_{spec.token}.mp4'
-        nrrd_path = spec_dir / f'{stem}_LowQuality_{spec.token}.nrrd'
 
         def _write_lq_overlay() -> Path:
             return write_low_quality_overlay_video(gray_lq, mask_lq, overlay_path, fps_lq, show_progress=show_progress)
@@ -14378,12 +14480,9 @@ def save_single_low_quality_output(
         def _write_lq_binary() -> Path:
             return write_low_quality_binary_video(mask_lq, binary_path, fps_lq, show_progress=show_progress)
 
-        def _write_lq_nrrd() -> Path:
-            return write_nrrd(mask_lq, nrrd_path)
-
+        # v13.2.1: the low-quality NRRD decomposition is produced per component layer by the
+        # NrrdLayerSink as views complete, not here. Only the distribution videos are written below.
         writer_thunks = [_write_lq_overlay, _write_lq_binary]
-        if bool(save_nrrd):
-            writer_thunks.append(_write_lq_nrrd)
 
         writer_count = low_quality_per_bin_output_workers(int(workers))
         if writer_count <= 1:
@@ -14397,8 +14496,6 @@ def save_single_low_quality_output(
 
         result_paths[f'low_quality_{spec.token}_overlay'] = overlay_path
         result_paths[f'low_quality_{spec.token}_binary_video'] = binary_path
-        if bool(save_nrrd):
-            result_paths[f'low_quality_{spec.token}_nrrd'] = nrrd_path
         return result_paths
     finally:
         if gray_lq is not volume_gray:
@@ -14520,9 +14617,12 @@ def planned_low_quality_output_paths(
 ) -> Dict[str, Path]:
     """Return the paths that save_low_quality_outputs will create.
 
-    This lets the background output manager launch low-quality videos/NRRDs at the
-    same time as full-size outputs, including concurrent full-size and low-quality
-    NRRD streaming, instead of waiting for the full-size output group to finish.
+    This lets the background output manager launch the low-quality distribution videos at the
+    same time as the full-size outputs instead of waiting for the full-size output group to finish.
+
+    v13.2.1: low-quality NRRDs are no longer planned here; they are emitted per component layer by
+    the NrrdLayerSink under low_quality/<token>/nrrd/ on the view-completion schedule. ``save_nrrd``
+    is retained for call-site compatibility.
     """
     low_root = out_dir / 'low_quality'
     result_paths: Dict[str, Path] = {'low_quality_dir': low_root}
@@ -14530,11 +14630,8 @@ def planned_low_quality_output_paths(
         spec_dir = low_root / spec.token
         overlay_path = spec_dir / f'{stem}_Overlay_LowQuality_{spec.token}.mp4'
         binary_path = spec_dir / f'{stem}_Binary_LowQuality_{spec.token}.mp4'
-        nrrd_path = spec_dir / f'{stem}_LowQuality_{spec.token}.nrrd'
         result_paths[f'low_quality_{spec.token}_overlay'] = overlay_path
         result_paths[f'low_quality_{spec.token}_binary_video'] = binary_path
-        if bool(save_nrrd):
-            result_paths[f'low_quality_{spec.token}_nrrd'] = nrrd_path
     return result_paths
 
 
@@ -14957,9 +15054,11 @@ def main() -> None:
     if not (-90.0 < float(args.interpolation_search_angle) < 90.0):
         raise ValueError('--interpolation_search_angle must be greater than -90 and less than 90')
     low_quality_requested = bool(args.save_low_quality or args.save_low_quality_downbin is not None)
-    # v13.2.0 (#2.6): NRRD component layers are produced only for --save_nrrd. The low-quality NRRD
-    # is now a single combined volume that is also gated behind --save_nrrd, so requesting only
-    # low-quality outputs no longer triggers NRRD layer materialization or any NRRD output.
+    # v13.2.0 (#2.6): NRRD component layers are produced only for --save_nrrd, so requesting only
+    # low-quality outputs writes the low-quality videos but no NRRD output.
+    # v13.2.1 (bug #2): when both --save_nrrd and a low-quality request are active, the low-quality
+    # NRRD decomposition mirrors the full-quality layers (one downbinned single-layer NRRD per
+    # component layer) on the same view-completion schedule, rather than one combined tail volume.
     nrrd_layers_needed = bool(args.save_nrrd)
     troubleshooting_outputs_enabled = bool(args.troubleshooting)
     # v12.2.0 --troubleshooting creates overlay MKVs only. Temporary scratch retention is a
@@ -14989,14 +15088,21 @@ def main() -> None:
     # geometry X,Y,t) as the layers are produced during the intermediate pipeline steps. The sink
     # is configured here (output geometry is now known) and torn down in the tail after the final
     # global layers are materialized.
+    # v13.2.1: when --save_low_quality is also active, the sink mirrors every component layer into
+    # one downbinned single-layer NRRD per spec under low_quality/<token>/nrrd/, on the same
+    # view-completion schedule as the full-quality layers (the tail no longer writes a combined
+    # low-quality NRRD).
     nrrd_dir = out_dir / 'nrrd'
     if bool(args.save_nrrd):
+        sink_low_quality_specs = list(low_quality_downbin_specs) if bool(low_quality_requested) else []
         set_nrrd_layer_sink(NrrdLayerSink(
             nrrd_dir=nrrd_dir,
             stem=input_path.stem,
             output_shape_tyx=(input_T, input_H, input_W),
             max_workers=nrrd_layer_sink_workers(),
             pigz_threads=nrrd_single_layer_pigz_threads(),
+            low_quality_specs=sink_low_quality_specs,
+            low_quality_root=(out_dir / 'low_quality'),
         ))
     else:
         set_nrrd_layer_sink(None)
@@ -15176,10 +15282,12 @@ def main() -> None:
             )
         )
         spec_notes.append(
-            'v13.2.0 (#2.6): each low-quality downbin is submitted as an independent background job whose '
-            'overlay and binary videos always run; a single combined low-quality NRRD (one binary volume, not '
-            'decomposed) is written per downbin only when --save_nrrd is also enabled, so requesting only '
-            'low-quality outputs produces the low-quality videos but no NRRD.'
+            'v13.2.1 (bug #2): each low-quality downbin is submitted as an independent background job whose '
+            'overlay and binary videos always run. When --save_nrrd is also enabled, the low-quality NRRD now '
+            'follows the full-quality format and schedule: one downbinned single-layer NRRD per component layer '
+            'under low_quality/<token>/nrrd/, written by the NrrdLayerSink as each view completes (sharing the '
+            'full-quality layer suffixes and a per-downbin manifest), replacing the single combined tail volume. '
+            'Requesting only low-quality outputs still produces the low-quality videos but no NRRD.'
         )
     if (int(T), int(H), int(W)) != (int(input_T), int(input_H), int(input_W)):
         spec_notes.append(
@@ -15233,10 +15341,13 @@ def main() -> None:
     )
     spec_notes.append(
         'CONFLICT NOTE 3 (low-quality NRRD form): spec --save_low_quality says "low bitrate output videos and '
-        'NRRDs". Since the mega decomposed NRRD was removed and per-layer decomposition is a power-user analysis '
-        'feature, the low-quality NRRD is implemented as one single combined binary volume for distribution, gated '
-        'behind --save_nrrd (task #2.6). Suggested spec edit: state that the low-quality NRRD is a single combined '
-        'volume written only when --save_nrrd is enabled.'
+        'NRRDs". v13.2.1 (bug #2) makes the low-quality NRRD follow the full-quality NRRD format and scheduling: '
+        'one downbinned single-layer NRRD per component layer under low_quality/<token>/nrrd/, restored from the '
+        'same NrrdLayerRef and written as each view completes, with a per-downbin manifest whose layer suffixes '
+        'match the full-quality nrrd/ folder. This supersedes the v13.2.0 single combined volume. It remains gated '
+        'behind --save_nrrd (the decomposition is only meaningful when --save_nrrd is set). Suggested spec edit: '
+        'state that low-quality NRRDs are emitted as one single-layer NRRD per component layer (downbinned) per '
+        '--save_low_quality_downbin spec, only when --save_nrrd is enabled.'
     )
     spec_notes.append(
         'Task #2.5 review (single-angle fast path / tqdm): YOLO -> flatten -> --min_conf -> warp -> --min_radius -> '
@@ -17367,11 +17478,13 @@ def main() -> None:
 
     nrrd_manifest_path: Optional[Path] = None
     nrrd_layer_files_written = 0
+    nrrd_low_quality_layer_files_written = 0
     layer_sink = nrrd_layer_sink()
     if layer_sink is not None:
         print('\n=== Finishing single-layer NRRD writes ===')
         layer_sink.wait()
         nrrd_layer_files_written = int(layer_sink.layer_count())
+        nrrd_low_quality_layer_files_written = int(layer_sink.low_quality_layer_count())
         nrrd_manifest_path = layer_sink.write_manifest()
         layer_sink.shutdown()
         set_nrrd_layer_sink(None)
@@ -17402,6 +17515,14 @@ def main() -> None:
             f'{input_path.stem}_nrrd_manifest.json sidecar lists every written layer. The previous mega 4D '
             'decomposed NRRD (one file with a trailing list axis) has been removed.'
         )
+        if int(nrrd_low_quality_layer_files_written) > 0:
+            spec_notes.append(
+                f'Low-quality NRRD decomposition (v13.2.1, bug #2): {int(nrrd_low_quality_layer_files_written)} '
+                'downbinned single-layer NRRD file(s) written under low_quality/<token>/nrrd/, mirroring the '
+                'full-quality component layers per --save_low_quality_downbin spec and written on the same '
+                'view-completion schedule. Each downbin has its own {Filestem}_nrrd_manifest.json with layer '
+                'suffixes matching the full-quality nrrd/ folder.'
+            )
 
     summary_path = write_summary_file(
         out_dir / f'{input_path.stem}_Summary.txt',
