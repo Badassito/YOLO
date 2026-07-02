@@ -2,8 +2,93 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the v13.2.1_SLURM implementation. It is derived from v13.2.0_SLURM by COPY + surgical edits,
-with the following v13.2.1 bug fixes:
+This is the v13.2.2_SLURM implementation. It is derived from v13.2.1_SLURM by COPY + surgical edits,
+fixing defects found by a whole-file code review of v13.2.1. Bug numbers below cite that review's
+top-15 findings (see CODE_REVIEW_Opus-4.8_v13.2.1_SLURM.md); review findings #4/#6 (undrained ffmpeg
+decode/encode stderr pipes) are deliberately deferred — inputs are well-conditioned in-house videos.
+  - v13.2.2 (bug #1) in-memory workspace budgeting is cgroup-aware: available_anon_work_bytes() now
+    clamps the node-wide /proc/meminfo MemAvailable+SwapFree figure by the tightest (limit - usage)
+    headroom across the process's cgroup ancestry (v2 memory.max/memory.current, v1
+    limit_in_bytes/usage_in_bytes). Under SLURM ConstrainRAMSpace a shared node no longer lures
+    should_use_in_memory_workspace() into allocations the cgroup OOM killer would SIGKILL (bypassing
+    the MemoryError -> disk-memmap fallback). Usage is corrected by the cgroup's reclaimable file
+    cache (memory.stat inactive_file / total_inactive_file) so this pipeline's own streaming page
+    cache does not collapse the headroom to ~0 mid-run. Node swap is not counted while
+    cgroup-limited. YOLO_TTA_IGNORE_CGROUP_MEMORY_LIMIT=1 restores the old node-wide behavior.
+    Known residual: a cgroup v1 memory controller mounted anywhere other than
+    /sys/fs/cgroup/memory is invisible and falls back to the old node-wide accounting.
+  - v13.2.2 (bugs #2/#12) radial wrap adjacency now mirrors the u axis: the [0°, 180°) full-diameter
+    frame domain continues across the 0°/180° boundary at u -> W-1-u (the same reverse_u relation the
+    radial backprojection uses), not at identical (t, u). Fixed in the 3D label wrap union
+    (label_foreground_volume_streaming), endpoint-seed wrap continuation (both component-table and
+    direct paths), the numba + python projection-candidate kernels (wrap-crossing steps read and
+    report mirrored columns), walk-back branch following across the wrap, and bridge planning/painting
+    (wrap-crossing bridges morph in source-side unrolled coordinates; painted sections and centers are
+    mirrored back on slices beyond the boundary; SliceBridgeRenderPlan carries num_slices for this).
+  - v13.2.2 (bug #3) predict_source_and_accumulate / predict_source_and_submit_accumulation now own
+    the GpuPrefetchingYoloSource they create: a try/finally closes it when inference or accumulation
+    raises, and close() drains the staging queue, so abandoned producer threads no longer spin forever
+    holding VRAM-staged batches and pinned CPU tensors in the persistent multi-GPU workers. The
+    scheduler's error teardown additionally closes every QUEUED eagerly pre-staged prediction source
+    (ready_fullframe/ready_tile_infer) that no predict call ever owned.
+  - v13.2.2 (bug #5) _interpolation_array_backing_path no longer trusts np.memmap.offset alone: a
+    sliced memmap inherits the parent's offset verbatim, so a mid-file view could pass the guard and
+    make the interpolation child process reopen the file at byte 0 (silent two-region corruption).
+    Only root mappings (base is the raw mmap.mmap) with a matching file size are reused by path;
+    views fall back to the dedicated process-input copy.
+  - v13.2.2 (bug #7) the streaming decode and cubic-resize producers are daemon threads with a
+    cancellation path: they poll a module abort event per chunk/slice, abort_streaming_producers()
+    fails every incomplete VolumeReadiness so blocked consumers wake, and it fires BOTH from the
+    scheduler's error teardown (before the wait=True executor shutdowns, which would otherwise block
+    on render tasks parked in wait_for_volume_ready) and from the __main__ wrapper, so a failing run
+    no longer hangs behind a multi-hour decode nobody will consume. VolumeReadiness failure recording
+    is first-exception-wins and fail_if_incomplete checks-and-marks under one lock hold, so the abort
+    can neither mask a producer's real root-cause error nor mark a concurrently-completed volume
+    failed.
+  - v13.2.2 (bug #8) CUDA input-staging admission is TOCTOU-safe: gpu_input_staging_preflight_reserve
+    debits a per-device reservation ledger under a lock instead of comparing each source against the
+    same stale mem_get_info() snapshot; the reservation is handed back as the wrapper materializes
+    staged batches and any remainder is released on close, so eager multi-source staging can no longer
+    collectively blow past the VRAM reserve. A reservation whose wrapper construction fails is
+    credited back immediately, so a transient error cannot poison the ledger and silently veto all
+    later staging on that device.
+  - v13.2.2 (bugs #9/#10) the tilted render plan cache is LRU-bounded by bytes
+    (YOLO_TTA_TILTED_PLAN_CACHE_GIB, default 4 GiB) and per-key single-flight under a lock: one
+    render thread builds a plan while the others wait, eliminating the transient multi-GiB spike of
+    ~64 threads rebuilding the same ~100+ MB plan and the run-long accumulation of every plan ever
+    built. Evictions are logged; frequent eviction lines mean the active working set exceeds the
+    budget (plans are being rebuilt) and the env knob should be raised.
+  - v13.2.2 (bug #11) DeferredCpuRetinaMaskPayload detach+clones pred/proto on the GPU before
+    deferring: buffer-reusing backends (TensorRT engines via AutoBackend) overwrite output bindings on
+    the next batch, which silently corrupted asynchronously realized masks. The clone is a
+    device-side copy, so the GPU->CPU transfer stays off the model-stream thread. A failed clone
+    (e.g. transient CUDA OOM) falls back to SYNCHRONOUS realization for that frame with a warning —
+    never to silent binding aliasing. Known residual: on TensorRT the per-frame clones add
+    backlog-scaled VRAM (same profile torch .pt backends always had); bound it with
+    YOLO_TTA_CPU_MASK_PENDING_FRAMES / YOLO_TTA_ASYNC_PREDICT_PENDING_FRAMES if a card runs tight.
+  - v13.2.2 (bug #13) multi-GPU worker pinning remaps the logical --device index through the
+    inherited CUDA_VISIBLE_DEVICES list (UUID/MIG tokens pass through) instead of overwriting the
+    variable with the raw index, so a SLURM allocation like CUDA_VISIBLE_DEVICES=2,3 no longer lets
+    workers escape onto foreign physical GPUs on nodes without cgroup device isolation.
+    BEHAVIOR CHANGE: --device is now consistently a torch LOGICAL index into the inherited list
+    (matching the single-GPU path); submit scripts that passed physical ids under a restricted list
+    (e.g. --device 2,3 with CUDA_VISIBLE_DEVICES=2,3, the accidental v13.2.1 multi-GPU convention)
+    must switch to --device 0,1. main() validates the indices against the inherited list before
+    spawning workers and fails fast with the correction; the --device help text documents this, and
+    the startup log now reports logical indices plus the physical tokens they pin to.
+  - v13.2.2 (bug #14) finalize_consolidated_tile_volume_for_parent returns the (possibly rebound)
+    final tile accumulator and the scheduler re-points tile_accumulator_by_parent / _paths at it,
+    releasing the superseded pre-interpolation array — keep_temp archives and --troubleshooting
+    overlays now include consolidated tile interpolation bridges instead of silently omitting them
+    when the interpolation process backend is active.
+  - v13.2.2 (bug #15) the raw bbox-store chunks.bin RAM cache is refcounted with single-flight loads:
+    concurrent full-quality + low-quality NRRD writers of the same layer no longer each read a
+    multi-GiB payload into RAM through the unsynchronized get->read->set, and a finishing writer no
+    longer evicts the entry while sibling futures for the same layer still need it. A store whose
+    constructor validation fails after the payload was cached (e.g. truncated index.bin) releases
+    its reference instead of pinning the payload for the life of the process.
+
+It is derived from the v13.2.1_SLURM line, with the following v13.2.1 bug fixes:
   - v13.2.1 (bug #1) verified --device accepts comma+space inputs such as "0, 1, 2, 3": the nargs='+'
     argparser collects the tokens and parse_device_list re-splits them on commas/whitespace, matching
     the other multi-value flags. Confirmed with --device "0, 1, 2, 3", 0 1 2 3, 0,1,2,3, and a quoted
@@ -161,6 +246,7 @@ import gc
 import heapq
 import json
 import math
+import mmap
 import multiprocessing as mp
 import os
 import queue
@@ -172,7 +258,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
 
@@ -322,7 +408,10 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--device", nargs="+", default=["0"], type=str,
                    help="Inference device(s). Accepts a single GPU index (0), multiple GPU indices separated by "
                         "commas or spaces (0,1,2,3 or 0 1 2 3) for multi-GPU scheduling, or cpu. GPU indices and "
-                        "cpu cannot be mixed")
+                        "cpu cannot be mixed. Indices are torch LOGICAL indices: when SLURM (or the shell) "
+                        "exports CUDA_VISIBLE_DEVICES, index N means the (N+1)-th device of that list, not the "
+                        "physical GPU id — e.g. under CUDA_VISIBLE_DEVICES=2,3 use --device 0,1 to run on "
+                        "physical GPUs 2 and 3 (v13.2.2)")
     p.add_argument("--retina_mask_processor", default=None, choices=["cpu", "gpu"], type=str,
                    help="Device that resolves full-resolution retina masks. Default cpu for a single GPU. "
                         "Enabling more than one GPU via --device implicitly switches this to gpu (explicitly "
@@ -423,11 +512,108 @@ def _read_meminfo_bytes() -> Dict[str, int]:
     return info
 
 
+def _cgroup_read_int(path: Path) -> Optional[int]:
+    try:
+        raw = path.read_text().strip()
+    except Exception:
+        return None
+    if not raw or raw == 'max':
+        return None
+    try:
+        value = int(raw)
+    except Exception:
+        return None
+    # cgroup v1 reports "unlimited" as a huge page-rounded sentinel (~2^63).
+    if value <= 0 or value >= (1 << 60):
+        return None
+    return value
+
+
+def _cgroup_reclaimable_file_bytes(node: Path, *, v2: bool) -> int:
+    """Reclaimable file-cache bytes charged to this cgroup subtree (0 when unreadable).
+
+    memory.current/usage_in_bytes charge the job's OWN page cache, and this pipeline
+    streams hundreds of GiB through file-backed memmaps and ffmpeg decode, so the raw
+    counter sits at the limit as a steady state while the kernel would happily reclaim
+    those clean file pages before OOM-killing. Subtract inactive_file (v2) /
+    total_inactive_file (v1) to approximate the kernel's own MemAvailable-style
+    working-set view — otherwise every workspace silently flips to disk mid-run.
+    """
+    key = 'inactive_file' if v2 else 'total_inactive_file'
+    try:
+        for line in (node / 'memory.stat').read_text().splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == key:
+                try:
+                    return max(0, int(parts[1]))
+                except Exception:
+                    return 0
+    except Exception:
+        pass
+    return 0
+
+
+def _cgroup_memory_headroom_bytes() -> Optional[int]:
+    """Tightest (limit - working-set usage) across this process's cgroup ancestry, or None if unlimited.
+
+    SLURM's ConstrainRAMSpace enforces --mem through the job cgroup, so /proc/meminfo wildly
+    overstates what THIS job may still allocate on a shared node, and exceeding the cgroup limit
+    is an uncatchable OOM SIGKILL rather than a MemoryError (v13.2.2 bug #1). The limit may sit on
+    any ancestor (job / step / task cgroup), so walk from the leaf to the mount root and keep the
+    smallest headroom seen. Usage is corrected for reclaimable file cache (see
+    _cgroup_reclaimable_file_bytes).
+    """
+    try:
+        cgroup_text = Path('/proc/self/cgroup').read_text()
+    except Exception:
+        return None
+    headroom: Optional[int] = None
+    for line in cgroup_text.splitlines():
+        parts = line.split(':', 2)
+        if len(parts) != 3:
+            continue
+        hierarchy_id, controllers, cg_path = parts
+        if hierarchy_id == '0' and not controllers:
+            # cgroup v2 unified hierarchy.
+            is_v2 = True
+            base = Path('/sys/fs/cgroup')
+            limit_name, usage_name = 'memory.max', 'memory.current'
+        elif 'memory' in controllers.split(','):
+            # cgroup v1 memory controller.
+            is_v2 = False
+            base = Path('/sys/fs/cgroup/memory')
+            limit_name, usage_name = 'memory.limit_in_bytes', 'memory.usage_in_bytes'
+        else:
+            continue
+        node = base / cg_path.lstrip('/')
+        while node == base or base in node.parents:
+            limit = _cgroup_read_int(node / limit_name)
+            if limit is not None:
+                usage = int(_cgroup_read_int(node / usage_name) or 0)
+                usage = max(0, usage - _cgroup_reclaimable_file_bytes(node, v2=is_v2))
+                level_headroom = max(0, int(limit) - usage)
+                headroom = level_headroom if headroom is None else min(headroom, level_headroom)
+            if node == base:
+                break
+            node = node.parent
+    return headroom
+
+
 def available_anon_work_bytes() -> int:
     info = _read_meminfo_bytes()
     mem_avail = int(info.get('MemAvailable', 0))
     swap_free = int(info.get('SwapFree', 0))
-    return max(0, mem_avail + swap_free)
+    node_avail = max(0, mem_avail + swap_free)
+    if _env_flag('YOLO_TTA_IGNORE_CGROUP_MEMORY_LIMIT', False):
+        return node_avail
+    cgroup_headroom = _cgroup_memory_headroom_bytes()
+    if cgroup_headroom is None:
+        return node_avail
+    # Under a cgroup limit do not count node-wide swap: the cgroup charge is what the OOM killer
+    # enforces (cluster cgroups commonly run with memory.swap.max=0 / memsw==mem), and blowing it
+    # is an uncatchable SIGKILL that bypasses the MemoryError -> disk-memmap fallback, so err on
+    # the tight side.
+    return min(node_avail, int(cgroup_headroom))
 
 
 def _env_float(name: str, default: float) -> float:
@@ -1121,11 +1307,24 @@ def _interpolation_array_backing_path(arr: object) -> Optional[Path]:
         arr_np = np.asarray(arr)
         if (
             isinstance(arr, np.memmap)
+            # A sliced np.memmap is still an np.memmap and inherits the parent's
+            # `offset` attribute verbatim (NOT adjusted for the slice), so offset==0
+            # alone cannot prove the array starts at byte 0 of the file. Only the
+            # root mapping has the raw mmap.mmap buffer as its `base`; views chain
+            # to the parent ndarray instead (v13.2.2 bug #5).
+            and isinstance(getattr(arr, 'base', None), mmap.mmap)
             and bool(arr_np.flags['C_CONTIGUOUS'])
             and int(getattr(arr, 'offset', 0) or 0) == 0
         ):
             filename = getattr(arr, 'filename', None)
-            return Path(filename) if filename else None
+            if not filename:
+                return None
+            path = Path(filename)
+            # The child reopens by (path, shape): the file must actually hold the
+            # full array starting at byte 0.
+            if path.stat().st_size < int(arr_np.nbytes):
+                return None
+            return path
     except Exception:
         pass
     # Deliberately do not reuse a base memmap for ndarray views here.  A child
@@ -1394,10 +1593,17 @@ class VolumeReadiness:
 
     def mark_failed(self, exc: BaseException) -> None:
         with self._lock:
+            self._mark_failed_locked(exc)
+
+    def _mark_failed_locked(self, exc: BaseException) -> None:
+        # First failure wins: never replace a recorded root cause with a later, more
+        # generic one (e.g. the decode finally's returncode error after the real EOF
+        # error, or the shutdown abort after a real producer failure).
+        if self._exception is None:
             self._exception = exc
-            for ev in self._slice_events:
-                ev.set()
-            self._all_event.set()
+        for ev in self._slice_events:
+            ev.set()
+        self._all_event.set()
 
     def _raise_if_failed(self) -> None:
         exc = self._exception
@@ -1420,8 +1626,43 @@ class VolumeReadiness:
         with self._lock:
             return int(self._ready_count)
 
+    def fail_if_incomplete(self, exc: BaseException) -> bool:
+        """mark_failed() unless the volume already completed or failed; True if failed here.
+
+        Check and mark happen under one lock hold, so a producer completing concurrently
+        cannot be marked failed after the fact, and an already-recorded root-cause
+        exception is never replaced by the generic abort error.
+        """
+        with self._lock:
+            if self._all_event.is_set():
+                return False
+            self._mark_failed_locked(exc)
+            return True
+
 
 _VOLUME_READINESS_BY_ARRAY_ID: Dict[int, VolumeReadiness] = {}
+
+# v13.2.2 bug #7: the streaming decode/resize producers were non-daemon threads with no
+# cancellation path, so any fatal main-thread error left threading._shutdown joining a
+# multi-hour decode of a volume nobody would consume. Producers poll this event per
+# chunk/slice and run as daemon threads; abort_streaming_producers() additionally fails
+# every incomplete VolumeReadiness so consumers blocked on wait_for_slice()/wait_all()
+# wake with an error instead of hanging.
+_STREAMING_PRODUCER_ABORT = threading.Event()
+
+
+def streaming_producers_aborted() -> bool:
+    return _STREAMING_PRODUCER_ABORT.is_set()
+
+
+def abort_streaming_producers(reason: str = 'pipeline aborted') -> None:
+    _STREAMING_PRODUCER_ABORT.set()
+    exc = RuntimeError(f'streaming producer aborted: {reason}')
+    for readiness in list(_VOLUME_READINESS_BY_ARRAY_ID.values()):
+        try:
+            readiness.fail_if_incomplete(exc)
+        except Exception:
+            pass
 
 
 def streaming_preprocess_enabled() -> bool:
@@ -1637,6 +1878,8 @@ def decode_video_to_memmap_gray8_streaming(
         try:
             with tqdm(total=num_frames, desc='Streaming decode input volume (gray8)') as pbar:
                 for start in range(0, int(num_frames), int(chunk_frames)):
+                    if streaming_producers_aborted():
+                        raise RuntimeError('streaming gray8 decode aborted by pipeline shutdown')
                     nframes = min(int(chunk_frames), int(num_frames) - int(start))
                     need = int(nframes) * int(frame_bytes)
                     offset = int(start) * int(frame_bytes)
@@ -1654,6 +1897,13 @@ def decode_video_to_memmap_gray8_streaming(
             readiness.mark_all_ready()
         except BaseException as exc:
             readiness.mark_failed(exc)
+            # Unblock the finally's communicate(): a decode we are abandoning must not be
+            # waited on while it still streams the remainder of the input (v13.2.2 bug #7).
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+            except Exception:
+                pass
             raise
         finally:
             if proc.stdout:
@@ -1663,7 +1913,9 @@ def decode_video_to_memmap_gray8_streaming(
                 msg = err.decode("utf-8", errors="ignore") if isinstance(err, (bytes, bytearray)) else str(err)
                 readiness.mark_failed(RuntimeError(f"ffmpeg decode failed: {msg}"))
 
-    threading.Thread(target=_decode_worker, name='streaming-gray8-decode', daemon=False).start()
+    # daemon=True (v13.2.2 bug #7): if main dies without reaching abort_streaming_producers(),
+    # interpreter shutdown must not join a producer that may have hours of decode left.
+    threading.Thread(target=_decode_worker, name='streaming-gray8-decode', daemon=True).start()
     return arr
 
 
@@ -1978,6 +2230,8 @@ def resize_volume_to_processing_cube_gray8_streaming(
     chunk_size = choose_parallel_chunk_size(out_t, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
 
     def _render_target_slice(out_z: int) -> None:
+        if streaming_producers_aborted():
+            raise RuntimeError('streaming cubic resize aborted by pipeline shutdown')
         src_z = _linear_source_index(int(out_z), int(out_t), int(in_t))
         z0 = int(math.floor(src_z))
         z1 = min(in_t - 1, z0 + 1)
@@ -2010,7 +2264,8 @@ def resize_volume_to_processing_cube_gray8_streaming(
             readiness.mark_failed(exc)
             raise
 
-    threading.Thread(target=_resize_worker, name='streaming-cubic-resize', daemon=False).start()
+    # daemon=True (v13.2.2 bug #7): see the streaming decode producer.
+    threading.Thread(target=_resize_worker, name='streaming-cubic-resize', daemon=True).start()
     return out_mm
 
 
@@ -3340,6 +3595,7 @@ class GpuPrefetchingYoloSource:
         source_label: str,
         queue_batches: int = 8,
         pin_memory: bool = True,
+        staging_reservation_bytes: int = 0,
     ) -> None:
         self.base_source = base_source
         self.cfg = cfg
@@ -3362,6 +3618,26 @@ class GpuPrefetchingYoloSource:
         self._copy_stream: Optional[object] = None
         self._device_str = canonical_single_device(str(cfg.device))
         self._dtype_name = 'float16' if bool(cfg.half) and str(self._device_str).startswith('cuda') else 'float32'
+        # v13.2.2 bug #8: VRAM admitted for this source by gpu_input_staging_preflight_reserve;
+        # handed back to the ledger as staged batches materialize, remainder released on close().
+        self._staging_reservation_remaining = max(0, int(staging_reservation_bytes))
+
+    def _consume_staging_reservation(self, staged_bytes: int) -> None:
+        step_cap = max(0, int(staged_bytes))
+        if step_cap <= 0:
+            return
+        with _GPU_STAGING_RESERVATION_LOCK:
+            remaining = int(self._staging_reservation_remaining)
+            step = min(remaining, step_cap)
+            if step <= 0:
+                return
+            self._staging_reservation_remaining = remaining - step
+            key = str(self._device_str)
+            ledger = int(_GPU_STAGING_RESERVED_BYTES.get(key, 0)) - step
+            if ledger > 0:
+                _GPU_STAGING_RESERVED_BYTES[key] = ledger
+            else:
+                _GPU_STAGING_RESERVED_BYTES.pop(key, None)
 
     def __len__(self) -> int:
         try:
@@ -3403,6 +3679,19 @@ class GpuPrefetchingYoloSource:
                 thread.join(timeout=2.0)
             except Exception:
                 pass
+        # v13.2.2 bug #3: drop staged batches that were still queued when iteration
+        # stopped; abandoned GpuPrefetchedYoloBatch items otherwise keep their CUDA
+        # tensors (and pinned CPU tensors) alive for the life of the process.
+        try:
+            while True:
+                self._queue.get_nowait()
+        except queue.Empty:
+            pass
+        # v13.2.2 bug #8: release any admission reservation this source never materialized.
+        try:
+            self._consume_staging_reservation(int(self._staging_reservation_remaining))
+        except Exception:
+            pass
 
     @staticmethod
     def _stack_single_channel_cpu_tensor(imgs: Sequence[np.ndarray]) -> Tuple[object, List[np.ndarray]]:
@@ -3465,6 +3754,12 @@ class GpuPrefetchingYoloSource:
             source_label=self.source_label,
             cpu_tensor_ref=cpu_tensor,
         )
+        # This batch's VRAM is now visible to mem_get_info; stop double-counting it in
+        # the admission ledger (v13.2.2 bug #8).
+        try:
+            self._consume_staging_reservation(int(gpu_tensor.numel()) * int(gpu_tensor.element_size()))
+        except Exception:
+            pass
         return paths, gpu_batch, info
 
     def _put_queue_item(self, item: object) -> None:
@@ -3555,13 +3850,43 @@ def _source_prediction_out_size(source: object) -> Optional[int]:
     return None
 
 
-def gpu_input_staging_preflight_ok(source: object, cfg: 'PredictConfig', queue_batches: int, source_label: str) -> bool:
+# v13.2.2 bug #8: the staging preflight used to compare a one-shot torch.cuda.mem_get_info()
+# snapshot against a single source's need. Eager staging wraps several queued sources within
+# milliseconds, so multiple preflights passed against the same stale free value (TOCTOU) and
+# their producers then cumulatively staged past the reserve. Admission now debits a per-device
+# reservation ledger under a lock; the ledger entry is credited back as the wrapper actually
+# materializes staged batches (at which point the usage is visible to mem_get_info) and any
+# remainder is released by GpuPrefetchingYoloSource.close().
+_GPU_STAGING_RESERVATION_LOCK = threading.Lock()
+_GPU_STAGING_RESERVED_BYTES: Dict[str, int] = {}
+
+
+def _release_gpu_staging_reservation(device_str: str, release_bytes: int) -> None:
+    release = max(0, int(release_bytes))
+    if release <= 0:
+        return
+    key = str(device_str)
+    with _GPU_STAGING_RESERVATION_LOCK:
+        remaining = int(_GPU_STAGING_RESERVED_BYTES.get(key, 0)) - release
+        if remaining > 0:
+            _GPU_STAGING_RESERVED_BYTES[key] = remaining
+        else:
+            _GPU_STAGING_RESERVED_BYTES.pop(key, None)
+
+
+def gpu_input_staging_preflight_reserve(source: object, cfg: 'PredictConfig', queue_batches: int, source_label: str) -> Optional[int]:
+    """Admit one source into CUDA input staging, reserving its VRAM need in the ledger.
+
+    Returns the reserved byte count (0 when the need cannot be estimated) or None when
+    staging must be skipped for this source.
+    """
     out_size = _source_prediction_out_size(source)
     if out_size is None or int(out_size) <= 0:
-        return True
+        return 0
     try:
         import torch  # type: ignore
-        device = torch.device(canonical_single_device(str(cfg.device)))
+        device_str = canonical_single_device(str(cfg.device))
+        device = torch.device(device_str)
         try:
             with torch.cuda.device(device):
                 free_bytes, _total_bytes = torch.cuda.mem_get_info()
@@ -3571,18 +3896,24 @@ def gpu_input_staging_preflight_ok(source: object, cfg: 'PredictConfig', queue_b
         frame_slots = int(max(1, queue_batches)) * int(max(1, cfg.batch))
         need_bytes = int(frame_slots) * int(out_size) * int(out_size) * int(dtype_bytes)
         reserve_bytes = int(gpu_input_staging_min_free_after_bytes())
-        if int(free_bytes) < int(need_bytes) + int(reserve_bytes):
+        with _GPU_STAGING_RESERVATION_LOCK:
+            already_reserved = int(_GPU_STAGING_RESERVED_BYTES.get(str(device_str), 0))
+            admitted = int(free_bytes) - already_reserved >= int(need_bytes) + int(reserve_bytes)
+            if admitted:
+                _GPU_STAGING_RESERVED_BYTES[str(device_str)] = already_reserved + int(need_bytes)
+        if not admitted:
             print(
                 f'CUDA input staging skipped for {source_label}: need≈{need_bytes / GIB:.2f} GiB '
                 f'for {int(queue_batches)} queued batch(es) at --batch={int(cfg.batch)}, imgsz={int(out_size)}, '
                 f'dtype_bytes={int(dtype_bytes)}; free={int(free_bytes) / GIB:.2f} GiB, '
+                f'pending_reservations={already_reserved / GIB:.2f} GiB, '
                 f'reserve={int(reserve_bytes) / GIB:.2f} GiB.'
             )
-            return False
-        return True
+            return None
+        return int(need_bytes)
     except Exception as exc:
         print(f'CUDA input staging preflight failed for {source_label} ({exc}); using CPU source path.')
-        return False
+        return None
 
 
 def maybe_wrap_source_with_gpu_input_staging(source: object, cfg: 'PredictConfig', source_label: str) -> object:
@@ -3593,22 +3924,30 @@ def maybe_wrap_source_with_gpu_input_staging(source: object, cfg: 'PredictConfig
     queue_batches = gpu_input_staging_queue_batches()
     if int(queue_batches) <= 0:
         return source
-    if not gpu_input_staging_preflight_ok(source, cfg, int(queue_batches), str(source_label)):
+    staging_reservation = gpu_input_staging_preflight_reserve(source, cfg, int(queue_batches), str(source_label))
+    if staging_reservation is None:
         return source
-    ensure_ultralytics_accepts_in_memory_volume_source()
-    print(
-        f'CUDA input staging active for {source_label}: '
-        f'queue_batches={int(queue_batches)} ({int(queue_batches) * max(1, int(cfg.batch))} frame slots), '
-        f'--batch={int(cfg.batch)}, device={canonical_single_device(str(cfg.device))}, '
-        f'dtype={"float16" if bool(cfg.half) else "float32"}'
-    )
-    return GpuPrefetchingYoloSource(
-        source,
-        cfg=cfg,
-        source_label=str(source_label),
-        queue_batches=int(queue_batches),
-        pin_memory=gpu_input_staging_pin_memory_enabled(),
-    )
+    try:
+        ensure_ultralytics_accepts_in_memory_volume_source()
+        print(
+            f'CUDA input staging active for {source_label}: '
+            f'queue_batches={int(queue_batches)} ({int(queue_batches) * max(1, int(cfg.batch))} frame slots), '
+            f'--batch={int(cfg.batch)}, device={canonical_single_device(str(cfg.device))}, '
+            f'dtype={"float16" if bool(cfg.half) else "float32"}'
+        )
+        return GpuPrefetchingYoloSource(
+            source,
+            cfg=cfg,
+            source_label=str(source_label),
+            queue_batches=int(queue_batches),
+            pin_memory=gpu_input_staging_pin_memory_enabled(),
+            staging_reservation_bytes=int(staging_reservation),
+        )
+    except BaseException:
+        # No wrapper owns the reservation yet — credit it back or the phantom pending
+        # bytes silently veto every later staging preflight on this device.
+        _release_gpu_staging_reservation(canonical_single_device(str(cfg.device)), int(staging_reservation))
+        raise
 
 
 def gpu_input_staging_ahead_sources(default_queue_slots: int) -> int:
@@ -3968,7 +4307,23 @@ class TiltedRenderPlan:
     axis_offset: np.ndarray
 
 
-_TILTED_RENDER_PLAN_CACHE: Dict[Tuple[str, int, int, Tuple[float, ...]], TiltedRenderPlan] = {}
+# v13.2.2 bugs #9/#10: the tilted plan cache was an unbounded plain dict with a lock-free
+# check-then-act. Every render-pool thread that started a tilted view simultaneously missed the
+# cache together and each rebuilt the same ~100+ MB plan (a transient multi-GiB spike), and every
+# (view, grid, matrix) key ever built stayed resident for the rest of the run. The cache is now
+# LRU-bounded by bytes and per-key single-flight: one thread builds while the others wait.
+_TILTED_RENDER_PLAN_CACHE: 'OrderedDict[Tuple[str, int, int, Tuple[float, ...]], TiltedRenderPlan]' = OrderedDict()
+_TILTED_RENDER_PLAN_CACHE_BYTES = 0
+_TILTED_RENDER_PLAN_CACHE_LOCK = threading.Lock()
+_TILTED_RENDER_PLAN_BUILDS_IN_FLIGHT: Dict[Tuple[str, int, int, Tuple[float, ...]], threading.Event] = {}
+
+
+def tilted_render_plan_cache_max_bytes() -> int:
+    return int(max(0.0, _env_float('YOLO_TTA_TILTED_PLAN_CACHE_GIB', 4.0)) * GIB)
+
+
+def _tilted_render_plan_nbytes(plan: TiltedRenderPlan) -> int:
+    return int(plan.x_idx.nbytes) + int(plan.y_idx.nbytes) + int(plan.valid_xy.nbytes) + int(plan.axis_offset.nbytes)
 
 
 def _tilted_plan_cache_key(view: ViewInfo, M_grid_to_src: np.ndarray, grid_h: int, grid_w: int) -> Tuple[str, int, int, Tuple[float, ...]]:
@@ -3986,10 +4341,54 @@ def get_tilted_render_plan(
         raise ValueError('Tilted render plan requested for a non-tilted view')
 
     key = _tilted_plan_cache_key(view, M_grid_to_src, int(grid_h), int(grid_w))
-    cached = _TILTED_RENDER_PLAN_CACHE.get(key)
-    if cached is not None:
-        return cached
+    while True:
+        with _TILTED_RENDER_PLAN_CACHE_LOCK:
+            cached = _TILTED_RENDER_PLAN_CACHE.get(key)
+            if cached is not None:
+                _TILTED_RENDER_PLAN_CACHE.move_to_end(key)
+                return cached
+            in_flight = _TILTED_RENDER_PLAN_BUILDS_IN_FLIGHT.get(key)
+            if in_flight is None:
+                _TILTED_RENDER_PLAN_BUILDS_IN_FLIGHT[key] = threading.Event()
+                break
+        # Another thread is building this exact plan; wait instead of duplicating the
+        # multi-hundred-MB temporaries. If the builder fails, the loop retries here.
+        in_flight.wait()
+    try:
+        plan = _build_tilted_render_plan(view, M_grid_to_src, int(grid_h), int(grid_w))
+        global _TILTED_RENDER_PLAN_CACHE_BYTES
+        with _TILTED_RENDER_PLAN_CACHE_LOCK:
+            _TILTED_RENDER_PLAN_CACHE[key] = plan
+            _TILTED_RENDER_PLAN_CACHE.move_to_end(key)
+            _TILTED_RENDER_PLAN_CACHE_BYTES += _tilted_render_plan_nbytes(plan)
+            budget = tilted_render_plan_cache_max_bytes()
+            # Evict LRU entries down to the byte budget, always keeping the entry just
+            # inserted (a single oversized plan must still be usable).
+            while _TILTED_RENDER_PLAN_CACHE_BYTES > budget and len(_TILTED_RENDER_PLAN_CACHE) > 1:
+                evict_key, evicted = _TILTED_RENDER_PLAN_CACHE.popitem(last=False)
+                _TILTED_RENDER_PLAN_CACHE_BYTES -= _tilted_render_plan_nbytes(evicted)
+                # Visible signal: frequent evictions mean the active working set exceeds
+                # the budget and plans are being rebuilt — raise YOLO_TTA_TILTED_PLAN_CACHE_GIB.
+                print(
+                    f'Tilted render plan cache evicted {evict_key[0]} '
+                    f'{int(evict_key[1])}x{int(evict_key[2])} '
+                    f'({_tilted_render_plan_nbytes(evicted) / GIB:.2f} GiB freed, '
+                    f'{_TILTED_RENDER_PLAN_CACHE_BYTES / GIB:.2f} GiB cached).'
+                )
+        return plan
+    finally:
+        with _TILTED_RENDER_PLAN_CACHE_LOCK:
+            done_event = _TILTED_RENDER_PLAN_BUILDS_IN_FLIGHT.pop(key, None)
+        if done_event is not None:
+            done_event.set()
 
+
+def _build_tilted_render_plan(
+    view: ViewInfo,
+    M_grid_to_src: np.ndarray,
+    grid_h: int,
+    grid_w: int,
+) -> TiltedRenderPlan:
     yy, xx = np.indices((int(grid_h), int(grid_w)), dtype=np.float32)
     M = np.asarray(M_grid_to_src, dtype=np.float32)
     src_x = (M[0, 0] * xx) + (M[0, 1] * yy) + M[0, 2]
@@ -4011,14 +4410,12 @@ def get_tilted_render_plan(
     else:  # pragma: no cover
         raise ValueError(f'Unsupported tilt direction: {view.tilt_direction}')
 
-    plan = TiltedRenderPlan(
+    return TiltedRenderPlan(
         x_idx=x_idx,
         y_idx=y_idx,
         valid_xy=valid_xy.astype(bool, copy=False),
         axis_offset=np.asarray(axis_offset, dtype=np.float32),
     )
-    _TILTED_RENDER_PLAN_CACHE[key] = plan
-    return plan
 
 
 def _render_tilted_array_on_grid(
@@ -5093,6 +5490,34 @@ _ULTRALYTICS_CPU_RETINA_PATCHED = False
 _ULTRALYTICS_ORIGINAL_SEG_CONSTRUCT_RESULT: Optional[object] = None
 
 
+_DEFERRED_CLONE_FALLBACK_WARNED = False
+
+
+def _detach_clone_tensor_if_torch(value: object) -> object:
+    """Detach+clone a torch tensor so a deferred payload owns its storage.
+
+    Buffer-reusing inference backends (e.g. TensorRT engines through AutoBackend) hand
+    construct_result views of output bindings that the NEXT batch's execute overwrites in
+    place. A payload whose realization is deferred to a worker thread must never alias
+    those bindings, or it reads a later frame's protos (v13.2.2 bug #11). The clone is a
+    device-side copy queued on the current stream — it does not synchronize the host, so
+    the deferral still keeps the GPU->CPU copy off the model-stream thread.
+
+    Non-tensor values pass through unchanged. Clone failures (e.g. a transient CUDA OOM)
+    PROPAGATE: silently returning the aliased binding would reinstate exactly the
+    corruption this exists to prevent — the caller falls back to synchronous
+    realization instead.
+    """
+    detach = getattr(value, 'detach', None)
+    if not callable(detach):
+        return value
+    detached = detach()
+    clone = getattr(detached, 'clone', None)
+    if not callable(clone):
+        return detached
+    return clone()
+
+
 def cpu_retina_masks_enabled() -> bool:
     """Return True when retina masks are reconstructed on the CPU.
 
@@ -5540,15 +5965,31 @@ def ensure_cpu_retina_mask_predictor_patch() -> bool:
         if bool(cpu_retina_deferred_payload_enabled()):
             # Keep the Results object lightweight; compact pred/proto tensors are realized in
             # the prediction-result worker, not inside Ultralytics construct_result.
-            result = Results(orig_img, path=img_path, names=self.model.names, boxes=None, masks=None)
-            setattr(result, '_tta_deferred_cpu_retina_payload', DeferredCpuRetinaMaskPayload(
-                pred=pred,
-                proto=proto,
-                orig_shape=(int(orig_shape[0]), int(orig_shape[1])),
-                img_shape=(int(img_shape[0]), int(img_shape[1])),
-                frame_path=str(img_path),
-            ))
-            return result
+            try:
+                deferred_payload: Optional[DeferredCpuRetinaMaskPayload] = DeferredCpuRetinaMaskPayload(
+                    pred=_detach_clone_tensor_if_torch(pred),
+                    proto=_detach_clone_tensor_if_torch(proto),
+                    orig_shape=(int(orig_shape[0]), int(orig_shape[1])),
+                    img_shape=(int(img_shape[0]), int(img_shape[1])),
+                    frame_path=str(img_path),
+                )
+            except Exception as clone_exc:
+                # v13.2.2 bug #11: a failed clone (e.g. transient CUDA OOM) must NOT fall
+                # back to aliasing the backend's reusable output bindings — that silently
+                # reinstates the corruption. Realize this frame synchronously below (the
+                # CPU copy completes before the next batch executes).
+                global _DEFERRED_CLONE_FALLBACK_WARNED
+                if not _DEFERRED_CLONE_FALLBACK_WARNED:
+                    _DEFERRED_CLONE_FALLBACK_WARNED = True
+                    print(
+                        f'Warning: deferred CPU retina payload clone failed ({clone_exc}); '
+                        'falling back to synchronous realization for affected frames.'
+                    )
+                deferred_payload = None
+            if deferred_payload is not None:
+                result = Results(orig_img, path=img_path, names=self.model.names, boxes=None, masks=None)
+                setattr(result, '_tta_deferred_cpu_retina_payload', deferred_payload)
+                return result
 
         payload = _realize_deferred_cpu_retina_payload(DeferredCpuRetinaMaskPayload(
             pred=pred,
@@ -6186,142 +6627,161 @@ def predict_source_and_accumulate(
     the full view volume has finished inferencing.
     """
     ensure_yolo_ready_for_predict(model, cfg)
+    unwrapped_source = source
     source = maybe_wrap_source_with_gpu_input_staging(source, cfg, source_label)
-    if isinstance(source, (InMemoryYoloVolumeSource, StreamingYoloVolumeSource, GpuPrefetchingYoloSource)):
-        ensure_single_channel_yolo_preprocess_patch()
-    use_custom_cpu_retina = False
-    if cpu_retina_masks_enabled():
-        use_custom_cpu_retina = bool(ensure_cpu_retina_mask_predictor_patch())
-        if not use_custom_cpu_retina:
-            print('Warning: CPU retina predictor patch unavailable; using Ultralytics native retina_masks=True for this source.')
-
-    prediction_count = 0
-    frames_with_predictions = 0
-
-    results = model.predict(
-        source=source,
-        task='segment',
-        imgsz=cfg.imgsz,
-        conf=cfg.conf,
-        iou=1.0,
-        save=False,
-        stream=True,
-        retina_masks=not bool(use_custom_cpu_retina),
-        batch=max(1, int(cfg.batch)),
-        device=cfg.device,
-        half=cfg.half,
-        int8=cfg.int8,
-        verbose=False,
+    # v13.2.2 bug #3: the call above may create a GpuPrefetchingYoloSource that nothing
+    # else owns. If iteration is abandoned by an exception (model.predict setup, a
+    # mid-stream CUDA error, a postprocess future failure), its producer thread and
+    # VRAM-staged queue leaked for the life of the process. Close the wrapper created
+    # here on the way out; on success this is an idempotent no-op (the sentinel path in
+    # GpuPrefetchingYoloSource.__next__ already closed it).
+    owned_staging_wrapper = (
+        source
+        if (source is not unwrapped_source and isinstance(source, GpuPrefetchingYoloSource))
+        else None
     )
+    try:
+        if isinstance(source, (InMemoryYoloVolumeSource, StreamingYoloVolumeSource, GpuPrefetchingYoloSource)):
+            ensure_single_channel_yolo_preprocess_patch()
+        use_custom_cpu_retina = False
+        if cpu_retina_masks_enabled():
+            use_custom_cpu_retina = bool(ensure_cpu_retina_mask_predictor_patch())
+            if not use_custom_cpu_retina:
+                print('Warning: CPU retina predictor patch unavailable; using Ultralytics native retina_masks=True for this source.')
 
-    worker_count = max(1, min(int(postprocess_workers), int(num_frames)))
-    pending_limit = cpu_mask_postprocess_pending_limit(worker_count, int(num_frames))
-    stream_cleanup = bool(streaming_cleanup_enabled)
-    stream_backend = cleanup_backend() if stream_cleanup else ''
-    stream_structure2 = np.ones((3, 3), dtype=bool) if stream_cleanup else None
-    stream_min_conf = float(streaming_cleanup_min_conf)
-    stream_min_radius = float(streaming_cleanup_min_radius)
-    stream_min_conf_u8 = int(min_conf_to_u8_threshold(stream_min_conf)) if stream_min_conf > 0.0 else 0
+        prediction_count = 0
+        frames_with_predictions = 0
 
-    def _process_prediction_unit(idx_i: int, masks_obj: Optional[object], confs_arr: Optional[np.ndarray]) -> Tuple[int, int]:
-        slice_lock = None
-        if slice_locks is not None and len(slice_locks) > 0:
-            slice_lock = slice_locks[int(idx_i) % len(slice_locks)]
-        pred_inc, frame_inc = _process_prediction_frame(
-            idx=int(idx_i),
-            masks_np=masks_obj,
-            confs_np=confs_arr,
-            out_size=out_size,
-            view_union_mm=view_union_mm,
-            view_confmap_mm=view_confmap_mm,
-            M_out_to_native=M_out_to_native,
-            native_h=native_h,
-            native_w=native_w,
-            slice_lock=slice_lock,
+        results = model.predict(
+            source=source,
+            task='segment',
+            imgsz=cfg.imgsz,
+            conf=cfg.conf,
+            iou=1.0,
+            save=False,
+            stream=True,
+            retina_masks=not bool(use_custom_cpu_retina),
+            batch=max(1, int(cfg.batch)),
+            device=cfg.device,
+            half=cfg.half,
+            int8=cfg.int8,
+            verbose=False,
         )
-        # v13.1.0 (#2.3): skip the per-slice CPU streaming cleanup when the GPU fast path already ran
-        # --min_conf + --min_radius + hole fill on this slice (cleanup_done_on_gpu is set by the frame
-        # processor only when the on-GPU connected-component cleanup actually completed).
-        if stream_cleanup and not bool(getattr(masks_obj, 'cleanup_done_on_gpu', False)):
-            cleaned_has_foreground = _cleanup_prediction_slice_inplace(
-                view_union_mm,
-                view_confmap_mm,
-                int(idx_i),
-                min_conf=stream_min_conf,
-                min_radius=stream_min_radius,
-                backend=stream_backend,
-                structure2=stream_structure2,
-                min_conf_u8=stream_min_conf_u8,
+
+        worker_count = max(1, min(int(postprocess_workers), int(num_frames)))
+        pending_limit = cpu_mask_postprocess_pending_limit(worker_count, int(num_frames))
+        stream_cleanup = bool(streaming_cleanup_enabled)
+        stream_backend = cleanup_backend() if stream_cleanup else ''
+        stream_structure2 = np.ones((3, 3), dtype=bool) if stream_cleanup else None
+        stream_min_conf = float(streaming_cleanup_min_conf)
+        stream_min_radius = float(streaming_cleanup_min_radius)
+        stream_min_conf_u8 = int(min_conf_to_u8_threshold(stream_min_conf)) if stream_min_conf > 0.0 else 0
+
+        def _process_prediction_unit(idx_i: int, masks_obj: Optional[object], confs_arr: Optional[np.ndarray]) -> Tuple[int, int]:
+            slice_lock = None
+            if slice_locks is not None and len(slice_locks) > 0:
+                slice_lock = slice_locks[int(idx_i) % len(slice_locks)]
+            pred_inc, frame_inc = _process_prediction_frame(
+                idx=int(idx_i),
+                masks_np=masks_obj,
+                confs_np=confs_arr,
+                out_size=out_size,
+                view_union_mm=view_union_mm,
+                view_confmap_mm=view_confmap_mm,
+                M_out_to_native=M_out_to_native,
+                native_h=native_h,
+                native_w=native_w,
+                slice_lock=slice_lock,
             )
-            frame_inc = 1 if bool(cleaned_has_foreground) else 0
-        return int(pred_inc), int(frame_inc)
+            # v13.1.0 (#2.3): skip the per-slice CPU streaming cleanup when the GPU fast path already ran
+            # --min_conf + --min_radius + hole fill on this slice (cleanup_done_on_gpu is set by the frame
+            # processor only when the on-GPU connected-component cleanup actually completed).
+            if stream_cleanup and not bool(getattr(masks_obj, 'cleanup_done_on_gpu', False)):
+                cleaned_has_foreground = _cleanup_prediction_slice_inplace(
+                    view_union_mm,
+                    view_confmap_mm,
+                    int(idx_i),
+                    min_conf=stream_min_conf,
+                    min_radius=stream_min_radius,
+                    backend=stream_backend,
+                    structure2=stream_structure2,
+                    min_conf_u8=stream_min_conf_u8,
+                )
+                frame_inc = 1 if bool(cleaned_has_foreground) else 0
+            return int(pred_inc), int(frame_inc)
 
-    def _extract_and_process_result(idx_i: int, result_obj: object) -> Tuple[int, int]:
-        masks_np, confs_np = _extract_result_masks_and_confs(result_obj)
-        try:
-            del result_obj
-        except Exception:
-            pass
-        return _process_prediction_unit(int(idx_i), masks_np, confs_np)
+        def _extract_and_process_result(idx_i: int, result_obj: object) -> Tuple[int, int]:
+            masks_np, confs_np = _extract_result_masks_and_confs(result_obj)
+            try:
+                del result_obj
+            except Exception:
+                pass
+            return _process_prediction_unit(int(idx_i), masks_np, confs_np)
 
-    # v13.1.0 (#2.2): on the GPU-flatten path, eagerly reduce each (n,Hr,Wr) GPU stack to 2 small
-    # planes on this (stream) thread so the full stack is released immediately, and bound the queue so
-    # only a capped number of GPU-resident flattened frames stay alive (avoids device OOM).
-    gpu_flatten_eager = bool(
-        gpu_retina_flatten_enabled() and not cpu_retina_masks_enabled() and gpu_retina_eager_flatten_enabled()
-    )
-    effective_pending_limit = int(pending_limit)
-    if gpu_flatten_eager:
-        effective_pending_limit = max(1, min(int(pending_limit), gpu_retina_flatten_pending_limit(worker_count)))
+        # v13.1.0 (#2.2): on the GPU-flatten path, eagerly reduce each (n,Hr,Wr) GPU stack to 2 small
+        # planes on this (stream) thread so the full stack is released immediately, and bound the queue so
+        # only a capped number of GPU-resident flattened frames stay alive (avoids device OOM).
+        gpu_flatten_eager = bool(
+            gpu_retina_flatten_enabled() and not cpu_retina_masks_enabled() and gpu_retina_eager_flatten_enabled()
+        )
+        effective_pending_limit = int(pending_limit)
+        if gpu_flatten_eager:
+            effective_pending_limit = max(1, min(int(pending_limit), gpu_retina_flatten_pending_limit(worker_count)))
 
-    if worker_count <= 1:
-        for idx, r in enumerate(results):
-            if idx >= num_frames:
-                # Synthetic final-batch padding is required for fixed-batch inference engines;
-                # consume but discard those results so the predictor stream drains cleanly.
-                continue
-            masks_np, confs_np = _extract_result_masks_and_confs(r)
-            pred_inc, frame_inc = _process_prediction_unit(int(idx), masks_np, confs_np)
-            prediction_count += int(pred_inc)
-            frames_with_predictions += int(frame_inc)
-    else:
-        pending: List[object] = []
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        if worker_count <= 1:
             for idx, r in enumerate(results):
                 if idx >= num_frames:
-                    # Discard synthetic repeated-slice results from the padded final batch.
+                    # Synthetic final-batch padding is required for fixed-batch inference engines;
+                    # consume but discard those results so the predictor stream drains cleanly.
                     continue
+                masks_np, confs_np = _extract_result_masks_and_confs(r)
+                pred_inc, frame_inc = _process_prediction_unit(int(idx), masks_np, confs_np)
+                prediction_count += int(pred_inc)
+                frames_with_predictions += int(frame_inc)
+        else:
+            pending: List[object] = []
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                for idx, r in enumerate(results):
+                    if idx >= num_frames:
+                        # Discard synthetic repeated-slice results from the padded final batch.
+                        continue
 
-                if gpu_flatten_eager:
-                    masks_np, confs_np = _extract_result_masks_and_confs(r)
-                    try:
-                        del r
-                    except Exception:
-                        pass
-                    pending.append(executor.submit(_process_prediction_unit, int(idx), masks_np, confs_np))
-                else:
-                    pending.append(executor.submit(_extract_and_process_result, int(idx), r))
-                if len(pending) >= effective_pending_limit:
+                    if gpu_flatten_eager:
+                        masks_np, confs_np = _extract_result_masks_and_confs(r)
+                        try:
+                            del r
+                        except Exception:
+                            pass
+                        pending.append(executor.submit(_process_prediction_unit, int(idx), masks_np, confs_np))
+                    else:
+                        pending.append(executor.submit(_extract_and_process_result, int(idx), r))
+                    if len(pending) >= effective_pending_limit:
+                        fut = pending.pop(0)
+                        pred_inc, frame_inc = fut.result()
+                        prediction_count += int(pred_inc)
+                        frames_with_predictions += int(frame_inc)
+
+                while pending:
                     fut = pending.pop(0)
                     pred_inc, frame_inc = fut.result()
                     prediction_count += int(pred_inc)
                     frames_with_predictions += int(frame_inc)
 
-            while pending:
-                fut = pending.pop(0)
-                pred_inc, frame_inc = fut.result()
-                prediction_count += int(pred_inc)
-                frames_with_predictions += int(frame_inc)
+        if prediction_hot_path_flush_enabled():
+            if view_confmap_mm is not None:
+                flush_array(view_confmap_mm)
+            flush_array(view_union_mm)
 
-    if prediction_hot_path_flush_enabled():
-        if view_confmap_mm is not None:
-            flush_array(view_confmap_mm)
-        flush_array(view_union_mm)
-
-    return {
-        'prediction_count': int(prediction_count),
-        'frames_with_predictions': int(frames_with_predictions),
-    }
+        return {
+            'prediction_count': int(prediction_count),
+            'frames_with_predictions': int(frames_with_predictions),
+        }
+    finally:
+        if owned_staging_wrapper is not None:
+            try:
+                owned_staging_wrapper.close()
+            except Exception:
+                pass
 
 
 def predict_source_and_submit_accumulation(
@@ -6345,134 +6805,153 @@ def predict_source_and_submit_accumulation(
 ) -> PredictionAccumulationHandle:
     """Run YOLO streaming inference and enqueue result accumulation without draining it."""
     ensure_yolo_ready_for_predict(model, cfg)
+    unwrapped_source = source
     source = maybe_wrap_source_with_gpu_input_staging(source, cfg, source_label)
-    if isinstance(source, (InMemoryYoloVolumeSource, StreamingYoloVolumeSource, GpuPrefetchingYoloSource)):
-        ensure_single_channel_yolo_preprocess_patch()
-    use_custom_cpu_retina = False
-    if cpu_retina_masks_enabled():
-        use_custom_cpu_retina = bool(ensure_cpu_retina_mask_predictor_patch())
-        if not use_custom_cpu_retina:
-            print('Warning: CPU retina predictor patch unavailable; using Ultralytics native retina_masks=True for this source.')
-
-    results = model.predict(
-        source=source,
-        task='segment',
-        imgsz=cfg.imgsz,
-        conf=cfg.conf,
-        iou=1.0,
-        save=False,
-        stream=True,
-        retina_masks=not bool(use_custom_cpu_retina),
-        batch=max(1, int(cfg.batch)),
-        device=cfg.device,
-        half=cfg.half,
-        int8=cfg.int8,
-        verbose=False,
+    # v13.2.2 bug #3: the call above may create a GpuPrefetchingYoloSource that nothing
+    # else owns. If iteration is abandoned by an exception (model.predict setup, a
+    # mid-stream CUDA error, a postprocess future failure), its producer thread and
+    # VRAM-staged queue leaked for the life of the process. Close the wrapper created
+    # here on the way out; on success this is an idempotent no-op (the sentinel path in
+    # GpuPrefetchingYoloSource.__next__ already closed it).
+    owned_staging_wrapper = (
+        source
+        if (source is not unwrapped_source and isinstance(source, GpuPrefetchingYoloSource))
+        else None
     )
+    try:
+        if isinstance(source, (InMemoryYoloVolumeSource, StreamingYoloVolumeSource, GpuPrefetchingYoloSource)):
+            ensure_single_channel_yolo_preprocess_patch()
+        use_custom_cpu_retina = False
+        if cpu_retina_masks_enabled():
+            use_custom_cpu_retina = bool(ensure_cpu_retina_mask_predictor_patch())
+            if not use_custom_cpu_retina:
+                print('Warning: CPU retina predictor patch unavailable; using Ultralytics native retina_masks=True for this source.')
 
-    stream_cleanup = bool(streaming_cleanup_enabled)
-    stream_backend = cleanup_backend() if stream_cleanup else ''
-    stream_structure2 = np.ones((3, 3), dtype=bool) if stream_cleanup else None
-    stream_min_conf = float(streaming_cleanup_min_conf)
-    stream_min_radius = float(streaming_cleanup_min_radius)
-    stream_min_conf_u8 = int(min_conf_to_u8_threshold(stream_min_conf)) if stream_min_conf > 0.0 else 0
-
-    def _process_prediction_unit(idx_i: int, masks_obj: Optional[object], confs_arr: Optional[np.ndarray]) -> Tuple[int, int]:
-        slice_lock = None
-        if slice_locks is not None and len(slice_locks) > 0:
-            slice_lock = slice_locks[int(idx_i) % len(slice_locks)]
-        pred_inc, frame_inc = _process_prediction_frame(
-            idx=int(idx_i),
-            masks_np=masks_obj,
-            confs_np=confs_arr,
-            out_size=out_size,
-            view_union_mm=view_union_mm,
-            view_confmap_mm=view_confmap_mm,
-            M_out_to_native=M_out_to_native,
-            native_h=native_h,
-            native_w=native_w,
-            slice_lock=slice_lock,
+        results = model.predict(
+            source=source,
+            task='segment',
+            imgsz=cfg.imgsz,
+            conf=cfg.conf,
+            iou=1.0,
+            save=False,
+            stream=True,
+            retina_masks=not bool(use_custom_cpu_retina),
+            batch=max(1, int(cfg.batch)),
+            device=cfg.device,
+            half=cfg.half,
+            int8=cfg.int8,
+            verbose=False,
         )
-        # v13.1.0 (#2.3): skip the per-slice CPU streaming cleanup when the GPU fast path already ran
-        # --min_conf + --min_radius + hole fill on this slice (cleanup_done_on_gpu is set by the frame
-        # processor only when the on-GPU connected-component cleanup actually completed).
-        if stream_cleanup and not bool(getattr(masks_obj, 'cleanup_done_on_gpu', False)):
-            cleaned_has_foreground = _cleanup_prediction_slice_inplace(
-                view_union_mm,
-                view_confmap_mm,
-                int(idx_i),
-                min_conf=stream_min_conf,
-                min_radius=stream_min_radius,
-                backend=stream_backend,
-                structure2=stream_structure2,
-                min_conf_u8=stream_min_conf_u8,
+
+        stream_cleanup = bool(streaming_cleanup_enabled)
+        stream_backend = cleanup_backend() if stream_cleanup else ''
+        stream_structure2 = np.ones((3, 3), dtype=bool) if stream_cleanup else None
+        stream_min_conf = float(streaming_cleanup_min_conf)
+        stream_min_radius = float(streaming_cleanup_min_radius)
+        stream_min_conf_u8 = int(min_conf_to_u8_threshold(stream_min_conf)) if stream_min_conf > 0.0 else 0
+
+        def _process_prediction_unit(idx_i: int, masks_obj: Optional[object], confs_arr: Optional[np.ndarray]) -> Tuple[int, int]:
+            slice_lock = None
+            if slice_locks is not None and len(slice_locks) > 0:
+                slice_lock = slice_locks[int(idx_i) % len(slice_locks)]
+            pred_inc, frame_inc = _process_prediction_frame(
+                idx=int(idx_i),
+                masks_np=masks_obj,
+                confs_np=confs_arr,
+                out_size=out_size,
+                view_union_mm=view_union_mm,
+                view_confmap_mm=view_confmap_mm,
+                M_out_to_native=M_out_to_native,
+                native_h=native_h,
+                native_w=native_w,
+                slice_lock=slice_lock,
             )
-            frame_inc = 1 if bool(cleaned_has_foreground) else 0
-        return int(pred_inc), int(frame_inc)
+            # v13.1.0 (#2.3): skip the per-slice CPU streaming cleanup when the GPU fast path already ran
+            # --min_conf + --min_radius + hole fill on this slice (cleanup_done_on_gpu is set by the frame
+            # processor only when the on-GPU connected-component cleanup actually completed).
+            if stream_cleanup and not bool(getattr(masks_obj, 'cleanup_done_on_gpu', False)):
+                cleaned_has_foreground = _cleanup_prediction_slice_inplace(
+                    view_union_mm,
+                    view_confmap_mm,
+                    int(idx_i),
+                    min_conf=stream_min_conf,
+                    min_radius=stream_min_radius,
+                    backend=stream_backend,
+                    structure2=stream_structure2,
+                    min_conf_u8=stream_min_conf_u8,
+                )
+                frame_inc = 1 if bool(cleaned_has_foreground) else 0
+            return int(pred_inc), int(frame_inc)
 
-    def _extract_and_process_result(idx_i: int, result_obj: object) -> Tuple[int, int]:
-        masks_np, confs_np = _extract_result_masks_and_confs(result_obj)
-        try:
-            del result_obj
-        except Exception:
-            pass
-        return _process_prediction_unit(int(idx_i), masks_np, confs_np)
-
-    futures: List[Future] = []
-    submitted_frames = 0
-    synthetic_discarded = 0
-    precompleted_prediction_count = 0
-    precompleted_frames_with_predictions = 0
-    pending_limit = async_predict_pending_frame_limit(int(num_frames))
-
-    # v13.1.0 (#2.2): eagerly reduce GPU stacks to 2 small planes on this thread and bound the queue
-    # so GPU-resident flattened frames stay capped (see predict_source_and_accumulate).
-    gpu_flatten_eager = bool(
-        gpu_retina_flatten_enabled() and not cpu_retina_masks_enabled() and gpu_retina_eager_flatten_enabled()
-    )
-    if gpu_flatten_eager:
-        gpu_cap = gpu_retina_flatten_pending_limit(max(1, int(getattr(postprocess_executor, '_max_workers', 1) or 1)))
-        pending_limit = max(1, min(int(pending_limit) if int(pending_limit) > 0 else gpu_cap, gpu_cap))
-
-    def _join_one_pending() -> None:
-        nonlocal futures, precompleted_prediction_count, precompleted_frames_with_predictions
-        if not futures:
-            return
-        done, remaining = wait(set(futures), return_when=FIRST_COMPLETED)
-        futures = list(remaining)
-        for fut_done in done:
-            pred_inc, frame_inc = fut_done.result()
-            precompleted_prediction_count += int(pred_inc)
-            precompleted_frames_with_predictions += int(frame_inc)
-
-    for idx, r in enumerate(results):
-        if int(idx) >= int(num_frames):
-            synthetic_discarded += 1
-            continue
-        submitted_frames += 1
-        if gpu_flatten_eager:
-            masks_np, confs_np = _extract_result_masks_and_confs(r)
+        def _extract_and_process_result(idx_i: int, result_obj: object) -> Tuple[int, int]:
+            masks_np, confs_np = _extract_result_masks_and_confs(result_obj)
             try:
-                del r
+                del result_obj
             except Exception:
                 pass
-            futures.append(postprocess_executor.submit(_process_prediction_unit, int(idx), masks_np, confs_np))
-        else:
-            futures.append(postprocess_executor.submit(_extract_and_process_result, int(idx), r))
-        while int(pending_limit) > 0 and len(futures) >= int(pending_limit):
-            _join_one_pending()
+            return _process_prediction_unit(int(idx_i), masks_np, confs_np)
 
-    return PredictionAccumulationHandle(
-        source_label=str(source_label),
-        futures=futures,
-        view_union_mm=view_union_mm,
-        view_confmap_mm=view_confmap_mm,
-        submitted_frames=int(submitted_frames),
-        synthetic_discarded=int(synthetic_discarded),
-        precompleted_prediction_count=int(precompleted_prediction_count),
-        precompleted_frames_with_predictions=int(precompleted_frames_with_predictions),
-        pending_limit=int(pending_limit),
-    )
+        futures: List[Future] = []
+        submitted_frames = 0
+        synthetic_discarded = 0
+        precompleted_prediction_count = 0
+        precompleted_frames_with_predictions = 0
+        pending_limit = async_predict_pending_frame_limit(int(num_frames))
+
+        # v13.1.0 (#2.2): eagerly reduce GPU stacks to 2 small planes on this thread and bound the queue
+        # so GPU-resident flattened frames stay capped (see predict_source_and_accumulate).
+        gpu_flatten_eager = bool(
+            gpu_retina_flatten_enabled() and not cpu_retina_masks_enabled() and gpu_retina_eager_flatten_enabled()
+        )
+        if gpu_flatten_eager:
+            gpu_cap = gpu_retina_flatten_pending_limit(max(1, int(getattr(postprocess_executor, '_max_workers', 1) or 1)))
+            pending_limit = max(1, min(int(pending_limit) if int(pending_limit) > 0 else gpu_cap, gpu_cap))
+
+        def _join_one_pending() -> None:
+            nonlocal futures, precompleted_prediction_count, precompleted_frames_with_predictions
+            if not futures:
+                return
+            done, remaining = wait(set(futures), return_when=FIRST_COMPLETED)
+            futures = list(remaining)
+            for fut_done in done:
+                pred_inc, frame_inc = fut_done.result()
+                precompleted_prediction_count += int(pred_inc)
+                precompleted_frames_with_predictions += int(frame_inc)
+
+        for idx, r in enumerate(results):
+            if int(idx) >= int(num_frames):
+                synthetic_discarded += 1
+                continue
+            submitted_frames += 1
+            if gpu_flatten_eager:
+                masks_np, confs_np = _extract_result_masks_and_confs(r)
+                try:
+                    del r
+                except Exception:
+                    pass
+                futures.append(postprocess_executor.submit(_process_prediction_unit, int(idx), masks_np, confs_np))
+            else:
+                futures.append(postprocess_executor.submit(_extract_and_process_result, int(idx), r))
+            while int(pending_limit) > 0 and len(futures) >= int(pending_limit):
+                _join_one_pending()
+
+        return PredictionAccumulationHandle(
+            source_label=str(source_label),
+            futures=futures,
+            view_union_mm=view_union_mm,
+            view_confmap_mm=view_confmap_mm,
+            submitted_frames=int(submitted_frames),
+            synthetic_discarded=int(synthetic_discarded),
+            precompleted_prediction_count=int(precompleted_prediction_count),
+            precompleted_frames_with_predictions=int(precompleted_frames_with_predictions),
+            pending_limit=int(pending_limit),
+        )
+    finally:
+        if owned_staging_wrapper is not None:
+            try:
+                owned_staging_wrapper.close()
+            except Exception:
+                pass
 
 
 def predict_in_memory_volume_and_submit_accumulation(
@@ -7153,6 +7632,30 @@ def run_prediction_volume_in_worker(model: object, cfg: 'PredictConfig', task: D
                     pass
 
 
+def _pin_cuda_visible_device_token(logical_index: int) -> str:
+    """Resolve a torch logical CUDA index to the CUDA_VISIBLE_DEVICES token that pins it.
+
+    torch's cuda:N indexes into the CUDA_VISIBLE_DEVICES list inherited from the
+    environment (SLURM commonly exports e.g. '2,3' for an allocation). Overwriting the
+    variable with the raw logical index would escape the allocation onto foreign
+    physical GPUs on nodes without cgroup device isolation (v13.2.2 bug #13); index
+    into the inherited list instead. Tokens pass through verbatim so GPU UUIDs and MIG
+    ids keep working. Without an inherited list, logical == physical and the raw index
+    is correct.
+    """
+    idx = int(logical_index)
+    raw = os.environ.get('CUDA_VISIBLE_DEVICES')
+    if raw is None:
+        return str(idx)
+    tokens = [tok.strip() for tok in str(raw).split(',') if tok.strip()]
+    if idx < 0 or idx >= len(tokens):
+        raise RuntimeError(
+            f'--device cuda:{idx} is out of range for inherited CUDA_VISIBLE_DEVICES={raw!r} '
+            f'({len(tokens)} visible device(s))'
+        )
+    return tokens[idx]
+
+
 def _gpu_inference_worker_main(
     gpu_index: int,
     model_path: str,
@@ -7163,8 +7666,10 @@ def _gpu_inference_worker_main(
     """Persistent GPU worker process: pin to one physical GPU, load the model once, serve tasks."""
     try:
         # Pin the process to its physical GPU before any CUDA context is created, so the model and
-        # all tensors live on that device and never contend with the other workers' GPUs.
-        os.environ['CUDA_VISIBLE_DEVICES'] = str(int(gpu_index))
+        # all tensors live on that device and never contend with the other workers' GPUs. The
+        # logical --device index is remapped through the inherited CUDA_VISIBLE_DEVICES list
+        # (v13.2.2 bug #13).
+        os.environ['CUDA_VISIBLE_DEVICES'] = _pin_cuda_visible_device_token(int(gpu_index))
         try:
             cv2.setNumThreads(max(1, int(init_dict.get('cv2_threads', 1))))
         except Exception:
@@ -7630,9 +8135,15 @@ def label_foreground_volume_streaming(
         first_gid_slice = np.asarray(labels_store[0])
         last_gid_slice = np.asarray(labels_store[int(z_dim) - 1])
         if np.any(first_gid_slice) and np.any(last_gid_slice):
+            # v13.2.2 bug #2: the radial angular domain is [0°, 180°) over full-diameter
+            # frames, so the plane that continues the last frame (one Δ short of 180°) is
+            # frame 0 with the u axis REVERSED (u -> D-1-u) — exactly the reverse_u
+            # relation the radial backprojection uses. Comparing at identical (t, u)
+            # instead unioned mirror images through the rotation axis and missed the
+            # true angular continuation.
             for code in _adjacent_gid_pair_codes(
                 last_gid_slice,
-                first_gid_slice,
+                first_gid_slice[:, ::-1],
                 prev_offset=int(slice_offsets[int(z_dim) - 1]),
                 curr_offset=int(slice_offsets[0]),
             ):
@@ -7728,19 +8239,30 @@ def build_slice_endpoint_seeds_from_label_volume(
 
         prev_table: Optional[SliceComponentTable] = None
         next_table: Optional[SliceComponentTable] = None
+        prev_wrapped = False
+        next_wrapped = False
         if bool(wrap_axis) and z_dim > 1:
             prev_table = component_cache.get((z_i - 1) % z_dim)
             next_table = component_cache.get((z_i + 1) % z_dim)
+            # v13.2.2 bug #12: continuation across the radial 0°/180° wrap happens at
+            # u -> width-1-u, not at the same u (see _component_record_mirrored_u).
+            prev_wrapped = z_i == 0
+            next_wrapped = z_i == (z_dim - 1)
         else:
             if z_i > 0:
                 prev_table = component_cache.get(z_i - 1)
             if (z_i + 1) < z_dim:
                 next_table = component_cache.get(z_i + 1)
 
+        slice_w = int(table.shape[1])
         seeds_local: List[SliceEndpointSeed] = []
         for record in table.components:
             prev_records = prev_table.by_label.get(int(record.label), []) if prev_table is not None else []
             next_records = next_table.by_label.get(int(record.label), []) if next_table is not None else []
+            if prev_wrapped:
+                prev_records = [_component_record_mirrored_u(other, slice_w) for other in prev_records]
+            if next_wrapped:
+                next_records = [_component_record_mirrored_u(other, slice_w) for other in next_records]
             has_prev = any(_component_records_directly_overlap(record, other) for other in prev_records)
             has_next = any(_component_records_directly_overlap(record, other) for other in next_records)
 
@@ -7767,8 +8289,14 @@ def build_slice_endpoint_seeds_from_label_volume(
             return []
 
         if bool(wrap_axis) and z_dim > 1:
+            # v13.2.2 bug #12: the wrap-adjacent frame continues at u -> width-1-u, so
+            # mirror the neighbor slice when the adjacency crosses the 0°/180° boundary.
             prev_slice = np.asarray(labels_real[(int(z) - 1) % z_dim])
+            if int(z) == 0:
+                prev_slice = prev_slice[:, ::-1]
             next_slice = np.asarray(labels_real[(int(z) + 1) % z_dim])
+            if int(z) == (z_dim - 1):
+                next_slice = next_slice[:, ::-1]
         else:
             prev_slice = np.asarray(labels_real[int(z) - 1]) if int(z) > 0 else None
             next_slice = np.asarray(labels_real[int(z) + 1]) if (int(z) + 1) < z_dim else None
@@ -9141,6 +9669,27 @@ def _component_records_directly_overlap(a: SliceComponentRecord, b: SliceCompone
     return bool(np.any(a_block & b_block))
 
 
+def _component_record_mirrored_u(record: SliceComponentRecord, width: int) -> SliceComponentRecord:
+    """Mirror a component record along the u (x) axis of its full slice.
+
+    v13.2.2 bug #2/#12: the radial angular domain is [0°, 180°) over full-diameter
+    frames, so the frame that continues across the 0°/180° wrap is the neighbor frame
+    with u REVERSED (u -> width-1-u). Wrap-crossing comparisons mirror one side through
+    this helper so overlap/continuation tests run in a common coordinate frame.
+    """
+    w = int(width)
+    y0, x0, y1, x1 = record.bbox
+    return SliceComponentRecord(
+        z=int(record.z),
+        label=int(record.label),
+        component_index=int(record.component_index),
+        bbox=(int(y0), int(w - int(x1)), int(y1), int(w - int(x0))),
+        anchor=(int(record.anchor[0]), int(w - 1 - int(record.anchor[1]))),
+        area=int(record.area),
+        mask_crop=record.mask_crop[:, ::-1],
+    )
+
+
 def _build_slice_component_table(labels2d: np.ndarray, z: int) -> SliceComponentTable:
     labels_arr = np.asarray(labels2d)
     h, w = (int(labels_arr.shape[0]), int(labels_arr.shape[1]))
@@ -9512,13 +10061,21 @@ if _numba is not None:
 
         found_count = 0
         num_slices = labels_real.shape[0]
+        full_w = labels_real.shape[2]
         sdf_h = sdf.shape[0]
         sdf_w = sdf.shape[1]
         overflow = 0
 
         for step in range(1, max_steps + 1):
             s = s0 + direction_sign * step
+            # v13.2.2 bug #2: a projection step that crosses the radial 0°/180° wrap lands
+            # in a frame whose u axis is REVERSED relative to the projection cone, so read
+            # (and report) the mirrored column there. max_steps <= num_slices-1 caps the
+            # walk at a single crossing.
+            mirrored = False
             if wrap_axis:
+                if s < 0 or s >= num_slices:
+                    mirrored = True
                 s = s % num_slices
             else:
                 if s < 0 or s >= num_slices:
@@ -9535,7 +10092,11 @@ if _numba is not None:
                         continue
                     any_projection = True
                     gx = crop_x0 + xx
-                    target_label = int(labels_real[s, gy, gx])
+                    if mirrored:
+                        gx_read = full_w - 1 - gx
+                    else:
+                        gx_read = gx
+                    target_label = int(labels_real[s, gy, gx_read])
                     if target_label <= 0 or target_label == seed_label:
                         continue
 
@@ -9562,13 +10123,15 @@ if _numba is not None:
                             return out_labels, out_slices, out_ys, out_xs, out_steps, out_d2, found_count, overflow
                         step_labels[step_count] = target_label
                         step_ys[step_count] = gy
-                        step_xs[step_count] = gx
+                        # Candidate points are reported in the target slice's own (actual)
+                        # coordinates; d2 stays in unrolled projection coordinates.
+                        step_xs[step_count] = gx_read
                         step_d2[step_count] = d2
                         step_count += 1
                     else:
                         if d2 < step_d2[step_idx]:
                             step_ys[step_idx] = gy
-                            step_xs[step_idx] = gx
+                            step_xs[step_idx] = gx_read
                             step_d2[step_idx] = d2
 
             if not any_projection:
@@ -9731,14 +10294,25 @@ def _find_slice_projection_candidates_python(
     crop_x1 = int(crop_x0 + int(sdf.shape[1]))
 
     slope = math.tan(math.radians(float(search_angle_deg)))
-    found: Dict[int, SliceProjectionCandidate] = {}
+    full_w = int(labels_real.shape[2])
+    # target_label -> (step, unrolled d2, candidate); d2 is kept separately because the
+    # candidate's target_point is in the target slice's own (actual) coordinates, which
+    # differ from unrolled projection coordinates for wrap-crossing steps.
+    found: Dict[int, Tuple[int, int, SliceProjectionCandidate]] = {}
 
     for step in range(1, int(max_steps) + 1):
-        s = int(s0 + int(seed.direction_sign) * step)
+        s_raw = int(s0 + int(seed.direction_sign) * step)
+        mirrored = False
         if bool(wrap_axis):
-            s = int(s % int(num_slices))
-        elif s < 0 or s >= num_slices:
+            s = int(s_raw % int(num_slices))
+            # v13.2.2 bug #2: a step across the radial 0°/180° wrap lands in a frame whose
+            # u axis is REVERSED relative to the projection cone. max_steps <= num_slices-1
+            # caps the walk at a single crossing.
+            mirrored = bool(s_raw < 0 or s_raw >= int(num_slices))
+        elif s_raw < 0 or s_raw >= num_slices:
             break
+        else:
+            s = s_raw
 
         threshold = -float(slope) * float(step)
         projection = sdf >= threshold
@@ -9747,7 +10321,10 @@ def _find_slice_projection_candidates_python(
                 break
             continue
 
-        labels_crop = np.asarray(labels_real[int(s), crop_y0:crop_y1, crop_x0:crop_x1])
+        slice_view = np.asarray(labels_real[int(s)])
+        if mirrored:
+            slice_view = slice_view[:, ::-1]
+        labels_crop = slice_view[crop_y0:crop_y1, crop_x0:crop_x1]
         overlap = projection & (labels_crop > 0) & (labels_crop != int(seed.label))
         if not np.any(overlap):
             continue
@@ -9767,26 +10344,23 @@ def _find_slice_projection_candidates_python(
             xs_global = xs_t.astype(np.int64, copy=False) + int(crop_x0)
             d2 = (ys_global - int(source_anchor[0])) ** 2 + (xs_global - int(source_anchor[1])) ** 2
             idx = int(np.argmin(d2))
-            found[target_label_i] = SliceProjectionCandidate(
+            x_actual = int(full_w - 1 - int(xs_global[idx])) if mirrored else int(xs_global[idx])
+            found[target_label_i] = (int(step), int(d2[idx]), SliceProjectionCandidate(
                 source_label=int(seed.label),
                 target_label=target_label_i,
                 source_point=(int(s0), int(y0), int(x0)),
-                target_point=(int(s), int(ys_global[idx]), int(xs_global[idx])),
+                target_point=(int(s), int(ys_global[idx]), x_actual),
                 slice_distance=int(step),
-            )
+            ))
 
         if len(found) >= int(max_candidates):
             break
 
     ordered = sorted(
-        found.values(),
-        key=lambda c: (
-            int(c.slice_distance),
-            (int(c.target_point[1]) - int(source_anchor[0])) ** 2 + (int(c.target_point[2]) - int(source_anchor[1])) ** 2,
-            int(c.target_label),
-        ),
+        found.items(),
+        key=lambda item: (int(item[1][0]), int(item[1][1]), int(item[0])),
     )
-    return ordered[: int(max_candidates)]
+    return [candidate for _label, (_step, _d2, candidate) in ordered[: int(max_candidates)]]
 
 
 def _find_slice_projection_candidates(
@@ -9840,21 +10414,33 @@ def _collect_walkback_source_points(
             return []
         out: List[Tuple[int, int, int]] = []
         current_slice = int(s0)
+        slice_w = int(labels_real.shape[2])
         max_walk = min(int(walk_back), max(0, int(num_slices) - 1)) if bool(wrap_axis) else int(walk_back)
         visited_slices = {int(current_slice)}
         for _ in range(int(max_walk)):
-            next_slice = int(current_slice - int(direction_sign))
+            next_slice_raw = int(current_slice - int(direction_sign))
+            wrap_crossed = False
             if bool(wrap_axis):
-                next_slice = int(next_slice % int(num_slices))
+                next_slice = int(next_slice_raw % int(num_slices))
+                wrap_crossed = bool(next_slice_raw < 0 or next_slice_raw >= int(num_slices))
                 if next_slice in visited_slices:
                     break
-            elif next_slice < 0 or next_slice >= num_slices:
+            elif next_slice_raw < 0 or next_slice_raw >= num_slices:
                 break
+            else:
+                next_slice = next_slice_raw
 
+            cmp_record = current_record
+            cmp_anchor = current_anchor
+            if wrap_crossed:
+                # v13.2.2 bug #2: continuation across the radial 0°/180° wrap matches at
+                # u -> width-1-u; mirror the near side into the far frame's coordinates.
+                cmp_record = _component_record_mirrored_u(current_record, slice_w)
+                cmp_anchor = (int(current_anchor[0]), int(slice_w - 1 - int(current_anchor[1])))
             next_record, next_anchor = component_cache.get(next_slice).find_branch_continuation(
                 int(label),
-                current_record,
-                current_anchor,
+                cmp_record,
+                cmp_anchor,
             )
             if next_record is None or next_anchor is None:
                 break
@@ -9871,23 +10457,34 @@ def _collect_walkback_source_points(
 
     out: List[Tuple[int, int, int]] = []
     current_slice = int(s0)
+    slice_w = int(labels_real.shape[2])
 
     max_walk = min(int(walk_back), max(0, int(num_slices) - 1)) if bool(wrap_axis) else int(walk_back)
     visited_slices = {int(current_slice)}
     for _ in range(int(max_walk)):
-        next_slice = int(current_slice - int(direction_sign))
+        next_slice_raw = int(current_slice - int(direction_sign))
+        wrap_crossed = False
         if bool(wrap_axis):
-            next_slice = int(next_slice % int(num_slices))
+            next_slice = int(next_slice_raw % int(num_slices))
+            wrap_crossed = bool(next_slice_raw < 0 or next_slice_raw >= int(num_slices))
             if next_slice in visited_slices:
                 break
-        elif next_slice < 0 or next_slice >= num_slices:
+        elif next_slice_raw < 0 or next_slice_raw >= num_slices:
             break
+        else:
+            next_slice = next_slice_raw
 
         next_slice_mask = labels_real[next_slice] == int(label)
         if not np.any(next_slice_mask):
             break
 
-        next_component, next_anchor = _follow_branch_component(next_slice_mask, current_component, current_anchor)
+        cmp_component = current_component
+        cmp_anchor = current_anchor
+        if wrap_crossed:
+            # v13.2.2 bug #2: match across the radial 0°/180° wrap at u -> width-1-u.
+            cmp_component = current_component[:, ::-1]
+            cmp_anchor = (int(current_anchor[0]), int(slice_w - 1 - int(current_anchor[1])))
+        next_component, next_anchor = _follow_branch_component(next_slice_mask, cmp_component, cmp_anchor)
         if next_anchor is None or not np.any(next_component):
             break
 
@@ -9907,9 +10504,13 @@ class SliceBridgeRenderPlan:
     source_point: Tuple[int, int, int]
     target_point: Tuple[int, int, int]
     source_anchor: Tuple[int, int]
+    # v13.2.2 bug #2: for a bridge crossing the radial 0°/180° wrap, target_anchor and
+    # sdf1 are stored in source-side "unrolled" coordinates (u mirrored relative to the
+    # target slice's own frame); the painter maps wrapped intermediate slices back.
     target_anchor: Tuple[int, int]
     steps: int
     sign: int
+    num_slices: int
     sdf0: np.ndarray
     sdf1: np.ndarray
 
@@ -9964,34 +10565,8 @@ def _build_linear_slice_bridge_plan(
     if int(s0) == int(s1):
         return None
 
-    if component_cache is not None:
-        source_record, source_anchor = component_cache.find_record_for_point(int(s0), int(source_label), (int(y0), int(x0)))
-        target_record, target_anchor = component_cache.find_record_for_point(int(s1), int(target_label), (int(y1), int(x1)))
-        if source_record is None or target_record is None or source_anchor is None or target_anchor is None:
-            return None
-        if int(source_record.area) <= 0 or int(target_record.area) <= 0:
-            return None
-
-        half_width = _local_half_width_for_component_records(source_record, source_anchor, target_record, target_anchor)
-        source_local = _component_record_to_local_canvas(source_record, source_anchor, half_width)
-        target_local = _component_record_to_local_canvas(target_record, target_anchor, half_width)
-    else:
-        source_component, source_anchor = _component_mask_and_anchor(labels_real[s0] == int(source_label), (y0, x0))
-        target_component, target_anchor = _component_mask_and_anchor(labels_real[s1] == int(target_label), (y1, x1))
-        if source_anchor is None or target_anchor is None:
-            return None
-        if not np.any(source_component) or not np.any(target_component):
-            return None
-
-        half_width = _local_half_width_for_components(source_component, source_anchor, target_component, target_anchor)
-        source_local = _component_to_local_canvas(source_component, source_anchor, half_width)
-        target_local = _component_to_local_canvas(target_component, target_anchor, half_width)
-
-    if not np.any(source_local) or not np.any(target_local):
-        return None
-
+    num_slices = int(labels_real.shape[0])
     if bool(wrap_axis):
-        num_slices = int(labels_real.shape[0])
         sign = 1 if int(direction_sign or 1) >= 0 else -1
         if sign > 0:
             steps = int((int(s1) - int(s0)) % num_slices)
@@ -10003,6 +10578,45 @@ def _build_linear_slice_bridge_plan(
     if steps <= 0:
         return None
 
+    # v13.2.2 bug #2: does the raw source->target walk cross the 0°/180° wrap? If so, the
+    # target slice's u axis is REVERSED relative to the source side; build the morph in
+    # source-side "unrolled" coordinates by mirroring the target component and anchor.
+    raw_end = int(s0) + int(sign) * int(steps)
+    wrap_crossed = bool(wrap_axis) and not (0 <= raw_end < num_slices)
+    slice_w = int(labels_real.shape[2])
+
+    if component_cache is not None:
+        source_record, source_anchor = component_cache.find_record_for_point(int(s0), int(source_label), (int(y0), int(x0)))
+        target_record, target_anchor = component_cache.find_record_for_point(int(s1), int(target_label), (int(y1), int(x1)))
+        if source_record is None or target_record is None or source_anchor is None or target_anchor is None:
+            return None
+        if int(source_record.area) <= 0 or int(target_record.area) <= 0:
+            return None
+        if wrap_crossed:
+            target_record = _component_record_mirrored_u(target_record, slice_w)
+            target_anchor = (int(target_anchor[0]), int(slice_w - 1 - int(target_anchor[1])))
+
+        half_width = _local_half_width_for_component_records(source_record, source_anchor, target_record, target_anchor)
+        source_local = _component_record_to_local_canvas(source_record, source_anchor, half_width)
+        target_local = _component_record_to_local_canvas(target_record, target_anchor, half_width)
+    else:
+        source_component, source_anchor = _component_mask_and_anchor(labels_real[s0] == int(source_label), (y0, x0))
+        target_component, target_anchor = _component_mask_and_anchor(labels_real[s1] == int(target_label), (y1, x1))
+        if source_anchor is None or target_anchor is None:
+            return None
+        if not np.any(source_component) or not np.any(target_component):
+            return None
+        if wrap_crossed:
+            target_component = target_component[:, ::-1]
+            target_anchor = (int(target_anchor[0]), int(slice_w - 1 - int(target_anchor[1])))
+
+        half_width = _local_half_width_for_components(source_component, source_anchor, target_component, target_anchor)
+        source_local = _component_to_local_canvas(source_component, source_anchor, half_width)
+        target_local = _component_to_local_canvas(target_component, target_anchor, half_width)
+
+    if not np.any(source_local) or not np.any(target_local):
+        return None
+
     return SliceBridgeRenderPlan(
         source_label=int(source_label),
         target_label=int(target_label),
@@ -10012,6 +10626,7 @@ def _build_linear_slice_bridge_plan(
         target_anchor=(int(target_anchor[0]), int(target_anchor[1])),
         steps=int(steps),
         sign=int(sign),
+        num_slices=int(num_slices),
         sdf0=np.ascontiguousarray(_signed_distance_2d(source_local)),
         sdf1=np.ascontiguousarray(_signed_distance_2d(target_local)),
     )
@@ -10047,11 +10662,17 @@ def _paint_linear_slice_bridge_plan_onto_slice(
     if not np.any(section):
         return 0
     section = _keep_center_component_2d(section)
-    center = (
-        (1.0 - alpha) * float(plan.source_anchor[0]) + alpha * float(plan.target_anchor[0]),
-        (1.0 - alpha) * float(plan.source_anchor[1]) + alpha * float(plan.target_anchor[1]),
-    )
-    return _paste_local_mask_onto_slice(dest_slice, section, center)
+    center_y = (1.0 - alpha) * float(plan.source_anchor[0]) + alpha * float(plan.target_anchor[0])
+    center_x = (1.0 - alpha) * float(plan.source_anchor[1]) + alpha * float(plan.target_anchor[1])
+    # v13.2.2 bug #2: the morph runs in source-side "unrolled" coordinates. Intermediate
+    # slices beyond the radial 0°/180° boundary store the u-mirrored frame, so flip the
+    # section (the local canvas is centered, so a column flip mirrors it about its
+    # center) and mirror the center's u there. Non-wrap plans never leave [0, num_slices).
+    s_raw = int(plan.source_point[0]) + int(plan.sign) * int(step_idx)
+    if int(plan.num_slices) > 0 and (s_raw < 0 or s_raw >= int(plan.num_slices)):
+        section = section[:, ::-1]
+        center_x = float(int(dest_slice.shape[1]) - 1) - center_x
+    return _paste_local_mask_onto_slice(dest_slice, section, (center_y, center_x))
 
 
 def _plan_slice_seed_bridges(
@@ -10438,7 +11059,72 @@ CTILE_FORMAT = 'ctile-mask-v2-raw'
 CVOL_FORMAT = 'cvol-mask-v2-raw'
 MASK_STORE_FORMATS = {CTILE_FORMAT, CVOL_FORMAT}
 # RAM cache for raw bbox-store chunks.bin payloads during NRRD streaming.
-_NRRD_RAW_STORE_CHUNKS_RAM_CACHE: Dict[Path, bytes] = {}
+# v13.2.2 bug #15: the full-quality writer and the per-downbin low-quality writers for
+# the SAME layer run concurrently on the NrrdLayerSink pool. The cache was a plain dict
+# with an unsynchronized get->read->set (N+1 simultaneous RAM copies of a multi-GiB
+# chunks.bin) and each writer's finally evicted the entry while sibling futures still
+# needed it (re-reading the whole file from disk once per output). Entries are now
+# refcounted, loads are single-flight, and eviction happens when the last holder
+# releases.
+_NRRD_RAW_STORE_CHUNKS_RAM_CACHE: Dict[Path, Tuple[bytes, int]] = {}
+_NRRD_RAW_STORE_CHUNKS_RAM_CACHE_LOCK = threading.Lock()
+_NRRD_RAW_STORE_CHUNKS_LOAD_EVENTS: Dict[Path, threading.Event] = {}
+
+
+def _raw_store_chunks_cache_key(chunks_path: Path) -> Path:
+    try:
+        return Path(chunks_path).resolve()
+    except Exception:
+        return Path(chunks_path)
+
+
+def _acquire_raw_store_chunks_ram_cache(chunks_path: Path) -> Tuple[bytes, bool]:
+    """Return (payload, was_cached) and hold one reference on the cache entry."""
+    key = _raw_store_chunks_cache_key(chunks_path)
+    while True:
+        with _NRRD_RAW_STORE_CHUNKS_RAM_CACHE_LOCK:
+            entry = _NRRD_RAW_STORE_CHUNKS_RAM_CACHE.get(key)
+            if entry is not None:
+                payload, refs = entry
+                _NRRD_RAW_STORE_CHUNKS_RAM_CACHE[key] = (payload, int(refs) + 1)
+                return payload, True
+            loading = _NRRD_RAW_STORE_CHUNKS_LOAD_EVENTS.get(key)
+            if loading is None:
+                _NRRD_RAW_STORE_CHUNKS_LOAD_EVENTS[key] = threading.Event()
+                break
+        # Another thread is reading this chunks.bin; wait for it instead of duplicating
+        # the multi-GiB payload in RAM. If the loader fails, the loop retries here.
+        loading.wait()
+    try:
+        payload = Path(chunks_path).read_bytes()
+        with _NRRD_RAW_STORE_CHUNKS_RAM_CACHE_LOCK:
+            _NRRD_RAW_STORE_CHUNKS_RAM_CACHE[key] = (payload, 1)
+        return payload, False
+    finally:
+        with _NRRD_RAW_STORE_CHUNKS_RAM_CACHE_LOCK:
+            load_event = _NRRD_RAW_STORE_CHUNKS_LOAD_EVENTS.pop(key, None)
+        if load_event is not None:
+            load_event.set()
+
+
+def _release_raw_store_chunks_ram_cache(chunks_path: Path) -> None:
+    key = _raw_store_chunks_cache_key(chunks_path)
+    with _NRRD_RAW_STORE_CHUNKS_RAM_CACHE_LOCK:
+        entry = _NRRD_RAW_STORE_CHUNKS_RAM_CACHE.get(key)
+        if entry is None:
+            return
+        payload, refs = entry
+        if int(refs) <= 1:
+            _NRRD_RAW_STORE_CHUNKS_RAM_CACHE.pop(key, None)
+        else:
+            _NRRD_RAW_STORE_CHUNKS_RAM_CACHE[key] = (payload, int(refs) - 1)
+
+
+def _invalidate_raw_store_chunks_ram_cache(chunks_path: Path) -> None:
+    """Drop a cache entry whose backing file is about to be rewritten (any refcount)."""
+    key = _raw_store_chunks_cache_key(chunks_path)
+    with _NRRD_RAW_STORE_CHUNKS_RAM_CACHE_LOCK:
+        _NRRD_RAW_STORE_CHUNKS_RAM_CACHE.pop(key, None)
 CTILE_INDEX_DTYPE = np.dtype([
     ('kind', 'u1'),              # 0 = empty/zero slice, 1 = raw uint8 bbox payload
     ('reserved', 'u1', (7,)),
@@ -10504,6 +11190,10 @@ class TileConsolidationResult:
     view_name: str
     interpolation_stats: List[Dict[str, object]]
     nrrd_layers: List[NrrdLayerRef] = field(default_factory=list)
+    # v13.2.2 bug #14: the interpolation process backend may rebind the consolidated
+    # accumulator to a fresh disk memmap; the scheduler must re-point its registry at the
+    # volume that actually received the interpolation bridges.
+    final_accumulator_mm: Optional[np.ndarray] = None
 
 
 def _view_uses_interpolation(view: ViewInfo, interpolate: int) -> bool:
@@ -10590,6 +11280,9 @@ class RawBBoxMaskStore:
         self.index = np.asarray(index, dtype=CTILE_INDEX_DTYPE)
         self.chunks_path = self.root / 'chunks.bin'
         self._chunks_bytes: Optional[bytes] = chunks_bytes
+        # True when open() holds a reference on the shared RAM cache entry for this
+        # store's chunks.bin (released via _drop_nrrd_raw_store_chunks_ram_cache).
+        self._ram_cache_ref_held = False
         shape = self.meta.get('shape')
         if not isinstance(shape, list) or len(shape) != 3:
             raise ValueError(f'{self.root}: invalid raw-mask shape metadata: {shape!r}')
@@ -10614,25 +11307,30 @@ class RawBBoxMaskStore:
             raise ValueError(f'{root}: invalid shape metadata {shape!r}')
         index = np.fromfile(index_path, dtype=CTILE_INDEX_DTYPE, count=int(shape[0]))
         chunks_bytes: Optional[bytes] = None
+        ram_cache_ref_held = False
         if bool(cache_payload_in_ram):
-            try:
-                cache_key = chunks_path.resolve()
-            except Exception:
-                cache_key = chunks_path
-            chunks_bytes = _NRRD_RAW_STORE_CHUNKS_RAM_CACHE.get(cache_key)
-            if chunks_bytes is None:
-                chunks_bytes = chunks_path.read_bytes()
-                _NRRD_RAW_STORE_CHUNKS_RAM_CACHE[cache_key] = chunks_bytes
+            chunks_bytes, was_cached = _acquire_raw_store_chunks_ram_cache(chunks_path)
+            ram_cache_ref_held = True
+        else:
+            was_cached = False
+        try:
+            if ram_cache_ref_held:
+                verb = 'reused from RAM' if was_cached else 'cached in RAM'
                 print(
-                    f'Raw bbox mask store cached in RAM for NRRD streaming: {root} '
+                    f'Raw bbox mask store {verb} for NRRD streaming: {root} '
                     f'({len(chunks_bytes) / GIB:.3f} GiB chunks.bin)'
                 )
-            else:
-                print(
-                    f'Raw bbox mask store reused from RAM for NRRD streaming: {root} '
-                    f'({len(chunks_bytes) / GIB:.3f} GiB chunks.bin)'
-                )
-        return cls(root, meta, index, chunks_bytes=chunks_bytes)
+            store = cls(root, meta, index, chunks_bytes=chunks_bytes)
+        except BaseException:
+            # Anything failing after the acquire (a print on a dead stdout pipe, or
+            # constructor validation on a truncated index.bin) leaves no store object to
+            # carry the reference, so release it here or the multi-GiB payload stays
+            # pinned in the cache for the life of the process.
+            if ram_cache_ref_held:
+                _release_raw_store_chunks_ram_cache(chunks_path)
+            raise
+        store._ram_cache_ref_held = bool(ram_cache_ref_held)
+        return store
 
     # DEAD_CODE_MARKER(v12.2.0-post-refactor): unused diagnostic property retained for raw-store debugging.
     @property
@@ -10757,10 +11455,7 @@ def _write_raw_bbox_payload_store(
 
     store_dir = Path(store_dir)
     chunks_path_prewrite = store_dir / 'chunks.bin'
-    try:
-        _NRRD_RAW_STORE_CHUNKS_RAM_CACHE.pop(chunks_path_prewrite.resolve(), None)
-    except Exception:
-        _NRRD_RAW_STORE_CHUNKS_RAM_CACHE.pop(chunks_path_prewrite, None)
+    _invalidate_raw_store_chunks_ram_cache(chunks_path_prewrite)
     if store_dir.exists():
         shutil.rmtree(store_dir, ignore_errors=True)
     store_dir.mkdir(parents=True, exist_ok=True)
@@ -12355,7 +13050,8 @@ def finalize_consolidated_tile_volume_for_parent(
             model_name=str(model_name),
             view_name=str(view.name),
             interpolation_stats=interpolation_stats,
-                nrrd_layers=nrrd_layers,
+            nrrd_layers=nrrd_layers,
+            final_accumulator_mm=tile_accumulator_mm,
         )
 
     if bool(nrrd_layers_enabled):
@@ -12511,6 +13207,7 @@ def finalize_consolidated_tile_volume_for_parent(
         view_name=str(view.name),
         interpolation_stats=interpolation_stats,
         nrrd_layers=nrrd_layers,
+        final_accumulator_mm=tile_accumulator_mm,
     )
 
 
@@ -13335,7 +14032,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by Opus-4.8_v13.2.0_SLURM.py',
+        '# Complete NRRD file generated by Fable-5_v13.2.2_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -13729,11 +14426,12 @@ def _close_nrrd_layer_source(src: object) -> None:
 def _drop_nrrd_raw_store_chunks_ram_cache(src: object) -> None:
     if not isinstance(src, RawBBoxMaskStore):
         return
-    try:
-        cache_key = src.chunks_path.resolve()
-    except Exception:
-        cache_key = src.chunks_path
-    _NRRD_RAW_STORE_CHUNKS_RAM_CACHE.pop(cache_key, None)
+    # v13.2.2 bug #15: release (refcount) rather than evict — sibling full-quality /
+    # low-quality writers for the same layer may still hold the entry.
+    if not bool(getattr(src, '_ram_cache_ref_held', False)):
+        return
+    src._ram_cache_ref_held = False
+    _release_raw_store_chunks_ram_cache(src.chunks_path)
 
 
 def compute_segment_extent_zyx(mask_zyx: np.ndarray) -> Tuple[int, int, int, int, int, int]:
@@ -14973,6 +15671,25 @@ def main() -> None:
     inference_devices = parse_device_list(args.device)
     gpu_device_count = len([d for d in inference_devices if str(d).startswith('cuda')])
     multi_gpu_active = bool(gpu_device_count > 1)
+    # v13.2.2 bug #13 follow-up: --device uses torch LOGICAL indices into any inherited
+    # CUDA_VISIBLE_DEVICES list. Validate BEFORE decode/model-load work so a submit script
+    # still using the accidental v13.2.1 physical-id convention (e.g. --device 2,3 under
+    # CUDA_VISIBLE_DEVICES=2,3) fails immediately with the correction instead of hours in.
+    _inherited_cvd = os.environ.get('CUDA_VISIBLE_DEVICES')
+    if _inherited_cvd is not None and gpu_device_count > 0:
+        _visible_tokens = [tok.strip() for tok in str(_inherited_cvd).split(',') if tok.strip()]
+        _logical = [int(str(d).split(':')[-1]) for d in inference_devices if str(d).startswith('cuda')]
+        _bad = [idx for idx in _logical if idx < 0 or idx >= len(_visible_tokens)]
+        if _bad:
+            hint = (
+                f'use --device {",".join(str(i) for i in range(len(_visible_tokens)))} to run on all allocated GPUs'
+                if _visible_tokens else 'no GPUs are visible to this job'
+            )
+            raise SystemExit(
+                f'--device index(es) {_bad} are out of range for the inherited '
+                f'CUDA_VISIBLE_DEVICES={_inherited_cvd!r} ({len(_visible_tokens)} visible device(s)). '
+                f'--device uses torch LOGICAL indices into that list (v13.2.2): {hint}.'
+            )
     retina_processor, retina_processor_reason = resolve_retina_mask_processor(
         args.retina_mask_processor, inference_devices
     )
@@ -16611,6 +17328,31 @@ def main() -> None:
             interpolation_stats.extend(result.interpolation_stats)
             nrrd_layer_refs.extend(result.nrrd_layers)
 
+            # v13.2.2 bug #14: the interpolation process backend may have rebound the
+            # consolidated accumulator to a fresh disk memmap that received the
+            # interpolation bridge voxels. Re-point the registry (used below for
+            # keep_temp archiving and later for troubleshooting overlays) at that final
+            # volume and release the superseded pre-interpolation array.
+            final_acc = result.final_accumulator_mm
+            stale_acc = tile_accumulator_by_parent.get(parent_key)
+            if final_acc is not None and stale_acc is not None and stale_acc is not final_acc:
+                tile_accumulator_by_parent[parent_key] = final_acc
+                final_acc_path = _memmap_backing_path(final_acc)
+                if final_acc_path is not None:
+                    tile_accumulator_paths[parent_key] = Path(final_acc_path)
+                else:
+                    tile_accumulator_paths.pop(parent_key, None)
+                stale_acc_path = _memmap_backing_path(stale_acc)
+                try:
+                    close_memmap_array_without_flush(stale_acc)
+                except Exception:
+                    pass
+                if stale_acc_path is not None and not bool(keep_temp_artifacts):
+                    try:
+                        Path(stale_acc_path).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
             # Once the consolidated tile volume has been unioned into its parent destination and
             # any NRRD layers have been materialized, category accumulators are no longer needed.
             # The main consolidated tile accumulator is retained until troubleshooting overlays are
@@ -16711,7 +17453,10 @@ def main() -> None:
             'single_angle_gpu_fastpath_min_conf': single_angle_gpu_fastpath_min_conf_value,
             'single_angle_gpu_fastpath_min_radius': single_angle_gpu_fastpath_min_radius_value,
         }
-        physical_gpu_indices = [int(str(d).split(':')[-1]) for d in inference_devices]
+        # Torch LOGICAL indices (positions within any inherited CUDA_VISIBLE_DEVICES list);
+        # validated against the inherited list early in main(), and each worker resolves
+        # its physical pin via _pin_cuda_visible_device_token.
+        gpu_logical_indices = [int(str(d).split(':')[-1]) for d in inference_devices]
         # Split each full-frame volume into contiguous slice-range chunks so multiple GPUs can work
         # the SAME (often huge, e.g. full-coverage Radial) volume in parallel, instead of one GPU per
         # whole volume leaving the other GPUs idle at the tail. The chunk is large relative to the
@@ -16773,7 +17518,7 @@ def main() -> None:
         mp_ctx = mp.get_context('spawn')
         gpu_task_queue = mp_ctx.Queue()
         gpu_result_queue = mp_ctx.Queue()
-        for gpu_index in physical_gpu_indices:
+        for gpu_index in gpu_logical_indices:
             proc = mp_ctx.Process(
                 target=_gpu_inference_worker_main,
                 args=(int(gpu_index), str(model_paths[0]), dict(worker_init), gpu_task_queue, gpu_result_queue),
@@ -16781,8 +17526,12 @@ def main() -> None:
             )
             proc.start()
             gpu_worker_processes.append(proc)
+        pinned_tokens = [
+            _pin_cuda_visible_device_token(int(idx)) for idx in gpu_logical_indices
+        ]
         print(
-            f'Started {len(gpu_worker_processes)} GPU worker process(es) for physical devices {physical_gpu_indices}; '
+            f'Started {len(gpu_worker_processes)} GPU worker process(es) for logical devices {gpu_logical_indices} '
+            f'(pinned to CUDA_VISIBLE_DEVICES tokens {pinned_tokens}); '
             f'{mgpu_total_tasks} inference task(s) queued (full-frame volumes slice-chunked at {slice_chunk} '
             f'slices for cross-GPU load balancing); per-worker CPU workers={per_worker_workers}, cv2 threads=1.'
         )
@@ -17186,6 +17935,23 @@ def main() -> None:
             wait(waitables, timeout=(0.1 if multi_gpu_active else None), return_when=FIRST_COMPLETED)
 
     finally:
+        if sys.exc_info()[0] is not None:
+            # v13.2.2 bug #7 (completion): the wait=True shutdowns below block on render
+            # tasks parked in wait_for_volume_ready() for still-running streaming
+            # producers. Abort the producers FIRST on the error path, or a failure during
+            # the decode-overlap window stalls teardown for the remaining multi-hour
+            # decode before the exception can even propagate to __main__.
+            abort_streaming_producers('scheduler error teardown')
+            # v13.2.2 bug #3 (completion): queued eagerly pre-staged prediction sources
+            # were never handed to a predict call, so nothing else closes them — their
+            # producer threads would otherwise keep VRAM-staged batches and ledger
+            # reservations alive (and spin) for the whole teardown.
+            for _view, _job, ref in list(ready_fullframe):
+                close_prediction_volume_ref(ref, keep_temp=bool(keep_temp_artifacts))
+            ready_fullframe.clear()
+            for _model_name, _view, _tile_job, ref in list(ready_tile_infer):
+                close_prediction_volume_ref(ref, keep_temp=bool(keep_temp_artifacts))
+            ready_tile_infer.clear()
         if multi_gpu_active:
             _shutdown_gpu_worker_processes()
         prediction_volume_executor.shutdown(wait=True)
@@ -17657,4 +18423,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException:
+        # v13.2.2 bug #7: cancel background streaming producers so a failing run exits
+        # promptly instead of blocking interpreter shutdown behind a multi-hour decode.
+        abort_streaming_producers('fatal error in main()')
+        raise
