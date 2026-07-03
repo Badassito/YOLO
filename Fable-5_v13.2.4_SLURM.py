@@ -2,7 +2,52 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the v13.2.2_SLURM implementation. It is derived from v13.2.1_SLURM by COPY + surgical edits,
+This is the v13.2.4_SLURM implementation. It is derived from v13.2.3_SLURM by COPY + surgical edits,
+implementing the spec-compliance rulings on final-stage geometry plus two projection efficiency/
+quality fixes:
+  - v13.2.4 (task #1, ruling A1) the final stage now runs in the ORIGINAL SOURCE geometry instead
+    of the approximately-cubic working geometry: Radial and Tilted view results are backprojected
+    from view-native space DIRECTLY into source (t,Y,X) dimensions in a single resample (the dense
+    radial gather map is built on the source raster with working-plane coordinates computed
+    analytically; the tilted scatter maps stack/in-plane coordinates straight to source indices
+    with union-biased floor scaling), Cartesian view stacks are restored working->source with one
+    resample as they are unioned, and the global union / optional 3D void fill / Gaussian
+    smoothing / --keep_objects all execute at source dimensions. --gaussian_smoothing sigma is
+    therefore measured in SOURCE voxels, the tail restore-to-original-geometry step becomes an
+    identity no-op, and the Global_union_presmoothing NRRD layer is captured in source geometry.
+    Working-geometry view creation, inference, per-view cleanup, and interpolation are unchanged.
+  - v13.2.4 (task #2) when --save_nrrd is active, the final Radial/Tilted backprojection no longer
+    re-projects the post-interpolation view volume a second time: because the dense radial gather
+    and tilted scatter commute exactly with union, the final projected volume is assembled as the
+    OR of the view's already-projected NRRD component layers (fullframe YOLO + per-pass bridge
+    deltas + any tile layers), read straight from their raw-bbox stores. One full backprojection
+    per radial/tilted view is eliminated; runs without --save_nrrd keep the single direct
+    backprojection.
+  - v13.2.4 (task #3) the radial Lanczos-3 sampler now renormalizes each sample's separable tap
+    weights after out-of-bounds taps are zeroed, removing the brightness falloff at the circular
+    ROI boundary (the first/last samples of every radial diameter line previously summed to < 1).
+    Fully out-of-bounds samples remain black.
+
+The v13.2.3 base was derived from v13.2.2_SLURM by COPY + surgical edits,
+making the --save_nrrd layer exports import cleanly into 3D Slicer:
+  - v13.2.3 (feature #1) every exported component layer is now named {Filestem}_{suffix}.seg.nrrd
+    (the full-quality nrrd/ folder and every low_quality/<token>/nrrd/ mirror), so 3D Slicer's
+    readers default to importing each file as a Segmentation node instead of a scalar volume.
+  - v13.2.3 (feature #2) each layer NRRD carries the 3D Slicer segmentation header fields
+    (Segmentation_MasterRepresentation / Segmentation_ContainedRepresentationNames plus
+    Segment0_ID/Name/Color/LabelValue/Layer/Extent/Tags) through the existing custom key:=value
+    header path. Segment0_Color is picked from a fixed 20-color palette keyed deterministically off
+    the layer suffix (FNV-1a, so the same layer keeps the same color across runs), with in-run
+    collision probing and a golden-ratio HSV fallback beyond 20 layers, replacing Slicer's
+    every-file-the-same-green default.
+  - v13.2.3 (feature #3) Segment0_Name follows the output filename stem ({Filestem}_{suffix}), so
+    segments no longer import as auto-named "Segment_1"/"Segmentation_1". Segment0_Extent reuses the
+    tight per-layer extent already tracked on NrrdLayerRef, scaled into the output/downbin geometry
+    with a full-extent fallback for empty or unknown extents. Low-quality mirrors share the
+    full-quality layer's segment name and color; the NRRD manifests record each layer's
+    segment_name and segment_color_rgb.
+
+The v13.2.2 base was derived from v13.2.1_SLURM by COPY + surgical edits,
 fixing defects found by a whole-file code review of v13.2.1. Bug numbers below cite that review's
 top-15 findings (see CODE_REVIEW_Opus-4.8_v13.2.1_SLURM.md); review findings #4/#6 (undrained ffmpeg
 decode/encode stderr pipes) are deliberately deferred — inputs are well-conditioned in-house videos.
@@ -219,11 +264,13 @@ the v12.2.1-v12.2.14 performance patches) introduced the following v13.0.0 chang
   - applies final 3D void fill only when --enable_3d_void_fill is active, and only once after the global union
   - activates Gaussian smoothing only when --gaussian_smoothing or --gaussian_smoothing_passes is explicitly set; either flag set to 0 disables it
   - supports Radial and generalized Tilted View-native interpolation, and keeps every Tilted View frame N centered on its base view native slice N with black-padded out-of-bounds shear samples
-  - resizes the working volume to an approximately cubic orthogonal volume when needed, restores the final mask to the original input dimensions for default outputs,
+  - resizes the working volume to an approximately cubic orthogonal volume when needed; v13.2.4 (ruling A1) backprojects Radial/Tilted results directly
+    into the original input dimensions in a single resample, restores Cartesian view stacks with one resample during union assembly, and runs the global
+    union, optional 3D void fill, Gaussian smoothing (sigma in source voxels), and --keep_objects at original input dimensions (no tail restore resample),
     and saves the transverse default color overlay plus optional labels, bilevel compressed TIFF binary masks, binary MKVs,
-    one single-layer NRRD per component layer, active-view image sequences, and isotropically downsampled
+    one single-layer Slicer segmentation NRRD (.seg.nrrd) per component layer, active-view image sequences, and isotropically downsampled
     low-quality presentation outputs, with FFV1 used for spec-required MKVs
-  - writes --save_nrrd as one single-layer 3-axis NRRD (X,Y,t) per component layer (full-frame YOLO masks, interpolation bridges,
+  - writes --save_nrrd as one single-layer 3-axis Slicer segmentation NRRD (.seg.nrrd, X,Y,t) per component layer (full-frame YOLO masks, interpolation bridges,
     tiled masks accepted by parent YOLO masks, tiled masks accepted by parent bridges, consolidated tile bridges, the pre-smoothing
     global union, smoothing-pass results, and the final output), each gzip-compressed in one pigz pass and written as it is produced
     during the intermediate pipeline steps, plus a single nrrd manifest sidecar
@@ -461,9 +508,9 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Save final YOLO segmentation labels per frame. Optional custom pattern, e.g. labels/{Filename}_%%04d.txt")
     p.add_argument("--save_binary", nargs="?", const="__DEFAULT__", default=None, type=str,
                    help="Save final binary masks as a TIFF sequence plus an FFV1 MKV. Optional custom TIFF pattern, e.g. binary_masks/{Filename}_Binary_%%04d.tiff")
-    p.add_argument("--save_nrrd", action="store_true", help="Save the decomposition as one single-layer NRRD (X,Y,t) per component layer in nrrd/, plus a manifest JSON. Layers are written during the intermediate pipeline steps")
+    p.add_argument("--save_nrrd", action="store_true", help="Save the decomposition as one single-layer 3D Slicer segmentation NRRD (.seg.nrrd, X,Y,t axes) per component layer in nrrd/, plus a manifest JSON. Each file imports into Slicer as a segmentation named after the file with a deterministic per-layer color. Layers are written during the intermediate pipeline steps")
     p.add_argument("--save_low_quality", action="store_true",
-                   help="Save additional isotropically downsampled low-quality presentation videos (libx264, preset slow, yuv420p). When --save_nrrd is also enabled, the low-quality NRRD decomposition follows the full-quality format: one downbinned single-layer NRRD per component layer under low_quality/<token>/nrrd/, written as each view completes")
+                   help="Save additional isotropically downsampled low-quality presentation videos (libx264, preset slow, yuv420p). When --save_nrrd is also enabled, the low-quality NRRD decomposition follows the full-quality format: one downbinned single-layer Slicer segmentation NRRD (.seg.nrrd) per component layer under low_quality/<token>/nrrd/, sharing the full-quality layer's segment name and color and written as each view completes")
     p.add_argument("--save_low_quality_downbin", nargs="+", default=None, type=str,
                    help="One or more isotropic low-quality downbins. Floats scale each X/Y/t dimension, e.g. 0.5. Integers scale the largest dimension to that value. Providing this flag implies --save_low_quality")
     p.add_argument("--voxel_volume", action="store_true", help="Count white voxels in the final binary output after restoration to native input geometry and save the value to the summary text file")
@@ -3000,6 +3047,16 @@ def get_radial_sampler(view: ViewInfo, angle_deg: float) -> RadialSampler:
     y_valid = (y_idx_raw >= 0) & (y_idx_raw < int(view.full_h))
     x_w *= x_valid.astype(np.float32, copy=False)
     y_w *= y_valid.astype(np.float32, copy=False)
+
+    # v13.2.4 (task #3): renormalize each sample's separable taps after out-of-bounds zeroing.
+    # The windowed-sinc taps do not sum exactly to 1 even fully in-bounds, and zeroing the
+    # out-of-bounds taps at the diameter endpoints (which land on the image edge for a centered
+    # ROI) previously left the boundary samples summing to < 1, darkening the first/last pixels
+    # of every radial line. Rows whose taps are all out-of-bounds stay zero (black fill).
+    x_w_sum = np.sum(x_w, axis=1, keepdims=True)
+    np.divide(x_w, x_w_sum, out=x_w, where=np.abs(x_w_sum) > 1e-6)
+    y_w_sum = np.sum(y_w, axis=1, keepdims=True)
+    np.divide(y_w, y_w_sum, out=y_w, where=np.abs(y_w_sum) > 1e-6)
 
     x_idx = np.clip(x_idx_raw, 0, int(view.full_w) - 1).astype(np.int32, copy=False)
     y_idx = np.clip(y_idx_raw, 0, int(view.full_h) - 1).astype(np.int32, copy=False)
@@ -8549,6 +8606,8 @@ def _radial_plan_signature(plan: Sequence[RadialBackprojectionSample]) -> Tuple[
 def build_dense_radial_backprojection_map(
     radial_view: ViewInfo,
     plan: Sequence[RadialBackprojectionSample],
+    *,
+    out_shape_hw: Optional[Tuple[int, int]] = None,
 ) -> DenseRadialBackprojectionMap:
     """Map every Cartesian ROI pixel to its nearest dense radial source frame and radial coordinate.
 
@@ -8557,17 +8616,31 @@ def build_dense_radial_backprojection_map(
     own frame/raster coordinate system.  When the user-provided azimuth spacing is too coarse, the
     supplied ``plan`` is already densified to the full-coverage angular spacing; pixels then select
     the nearest dense plan angle and that angle's nearest completed source frame.
+
+    v13.2.4 (task #1, ruling A1): ``out_shape_hw`` builds the map directly on the FINAL SOURCE
+    raster instead of the working plane. Source pixel centers are mapped into the working plane
+    analytically with the same center-aligned convention cv2.resize uses, so backprojecting a
+    radial mask straight to source geometry stays a single resample (no intermediate
+    working-geometry volume). ``None`` keeps the historical working-plane map.
     """
+    work_h = int(radial_view.full_h)
+    work_w = int(radial_view.full_w)
+    if out_shape_hw is None:
+        out_h, out_w = work_h, work_w
+    else:
+        out_h, out_w = (int(out_shape_hw[0]), int(out_shape_hw[1]))
     if not plan:
         return DenseRadialBackprojectionMap(
-            valid_mask=np.zeros((int(radial_view.full_h), int(radial_view.full_w)), dtype=bool),
-            source_idx_map=np.zeros((int(radial_view.full_h), int(radial_view.full_w)), dtype=np.int32),
-            u_idx_map=np.zeros((int(radial_view.full_h), int(radial_view.full_w)), dtype=np.int32),
+            valid_mask=np.zeros((out_h, out_w), dtype=bool),
+            source_idx_map=np.zeros((out_h, out_w), dtype=np.int32),
+            u_idx_map=np.zeros((out_h, out_w), dtype=np.int32),
         )
 
     key = (
-        int(radial_view.full_h),
-        int(radial_view.full_w),
+        int(out_h),
+        int(out_w),
+        int(work_h),
+        int(work_w),
         int(radial_view.diameter),
         _radial_plan_signature(plan),
     )
@@ -8575,8 +8648,6 @@ def build_dense_radial_backprojection_map(
     if cached is not None:
         return cached
 
-    out_h = int(radial_view.full_h)
-    out_w = int(radial_view.full_w)
     diameter = int(radial_view.diameter)
     radius = float(radial_view.roi_radius)
     if radius <= 0.0:
@@ -8598,6 +8669,10 @@ def build_dense_radial_backprojection_map(
     step = max(float(step), 1e-9)
 
     yy, xx = np.indices((out_h, out_w), dtype=np.float32)
+    if (out_h, out_w) != (work_h, work_w):
+        # Source pixel centers mapped into the working plane (cv2.resize center convention).
+        xx = (xx + np.float32(0.5)) * np.float32(float(work_w) / float(out_w)) - np.float32(0.5)
+        yy = (yy + np.float32(0.5)) * np.float32(float(work_h) / float(out_h)) - np.float32(0.5)
     dx = xx - float(radial_view.center_x)
     dy = yy - float(radial_view.center_y)
     rr = np.sqrt((dx * dx) + (dy * dy)).astype(np.float32, copy=False)
@@ -8639,13 +8714,27 @@ def backproject_radial_volume_to_volume(
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
     backend: str = 'cpu',
+    out_shape_tyx: Optional[Tuple[int, int, int]] = None,
 ) -> np.ndarray:
+    """Backproject a radial view-native mask stack into orthogonal (t, Y, X).
+
+    v13.2.4 (task #1, ruling A1): ``out_shape_tyx`` backprojects DIRECTLY into the final source
+    geometry in one resample — the dense map is built on the source XY raster and each source t
+    slice ORs the (working-t) radial rows it covers, mirroring the union-biased semantics of the
+    former tail restore without an intermediate working-geometry volume. ``None`` keeps the
+    historical working-geometry target. The cube resize only ever grows axes, so the working
+    geometry is never smaller than the source geometry.
+    """
     if radial_view.family != 'radial':
         raise ValueError('backproject_radial_volume_to_volume expects a radial view')
 
-    t_dim = int(radial_view.src_h)
-    out_h = int(radial_view.full_h)
-    out_w = int(radial_view.full_w)
+    work_t = int(radial_view.src_h)
+    work_h = int(radial_view.full_h)
+    work_w = int(radial_view.full_w)
+    if out_shape_tyx is None:
+        t_dim, out_h, out_w = work_t, work_h, work_w
+    else:
+        t_dim, out_h, out_w = (int(v) for v in out_shape_tyx)
 
     vol_mm = allocate_workspace_array(
         shape=(t_dim, out_h, out_w),
@@ -8671,13 +8760,17 @@ def backproject_radial_volume_to_volume(
         flush_array(vol_mm)
         return vol_mm
 
-    dense_map = build_dense_radial_backprojection_map(radial_view, plan)
+    dense_map = build_dense_radial_backprojection_map(
+        radial_view, plan, out_shape_hw=None if out_shape_tyx is None else (out_h, out_w)
+    )
     valid = np.asarray(dense_map.valid_mask, dtype=bool)
     source_idx_map = np.asarray(dense_map.source_idx_map, dtype=np.int32)
     u_idx_map = np.asarray(dense_map.u_idx_map, dtype=np.int32)
 
     backend_norm = str(backend or 'cpu').strip().lower()
-    if backend_norm in ('gpu', 'auto'):
+    if backend_norm in ('gpu', 'auto') and (t_dim, out_h, out_w) == (work_t, work_h, work_w):
+        # The dormant GPU helper predates direct source-geometry targets; only offer it the
+        # historical working-geometry case.
         gpu_done = try_backproject_radial_volume_to_volume_gpu(
             radial_mask_mm=radial_mask_mm,
             radial_view=radial_view,
@@ -8692,13 +8785,30 @@ def backproject_radial_volume_to_volume(
             print(f'{desc}: GPU radial backprojection unavailable or failed; falling back to CPU backend.')
 
     worker_count = choose_slice_parallel_workers(int(workers), int(t_dim))
+    same_t_axis = int(work_t) == int(t_dim)
 
     def _backproject_t_slice(t_idx: int) -> None:
-        radial_plane = np.asarray(radial_mask_mm[:, int(t_idx), :], dtype=np.uint8)
         dst = vol_mm[int(t_idx)]
         # Dense gather: every in-ROI Cartesian pixel is assigned from the nearest dense radial
         # angle's source frame and radial raster coordinate. Out-of-ROI remains black.
-        gathered = radial_plane[source_idx_map, u_idx_map]
+        if same_t_axis:
+            radial_plane = np.asarray(radial_mask_mm[:, int(t_idx), :], dtype=np.uint8)
+            gathered = radial_plane[source_idx_map, u_idx_map]
+            dst[valid] = gathered[valid]
+            return
+        # v13.2.4 (A1): source t slice ORs every working-t radial row it covers (working t >= source t).
+        v_start = int(math.floor(float(t_idx) * float(work_t) / float(t_dim)))
+        v_stop = int(math.ceil(float(t_idx + 1) * float(work_t) / float(t_dim)))
+        v_start = int(np.clip(v_start, 0, work_t - 1))
+        v_stop = int(np.clip(max(v_start + 1, v_stop), 1, work_t))
+        gathered: Optional[np.ndarray] = None
+        for v_idx in range(v_start, v_stop):
+            radial_plane = np.asarray(radial_mask_mm[:, int(v_idx), :], dtype=np.uint8)
+            plane_gathered = radial_plane[source_idx_map, u_idx_map]
+            if gathered is None:
+                gathered = plane_gathered
+            else:
+                np.bitwise_or(gathered, plane_gathered, out=gathered)
         dst[valid] = gathered[valid]
 
     parallel_for_indices_chunked(
@@ -8723,25 +8833,35 @@ def backproject_tilted_volume_to_volume(
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
     backend: str = 'cpu',
+    out_shape_tyx: Optional[Tuple[int, int, int]] = None,
 ) -> np.ndarray:
     """Backproject a v12 Tilted View-native mask stack into native (t, Y, X).
 
     The input stack remains in the generated Tilted View's own frame order and
     base-view raster coordinates through cleanup and interpolation.  Only after
-    all per-view operations are complete do we map each foreground pixel to the
-    orthogonal processing volume by applying the same stacking-axis shear used
-    during rendering:
+    all per-view operations are complete do we map each foreground pixel by
+    applying the same stacking-axis shear used during rendering:
 
       * Tilted Transverse: base axes (X, Y), stacking axis t
       * Tilted Sagittal:  base axes (X, t), stacking axis Y
       * Tilted Coronal:   base axes (Y, t), stacking axis X
+
+    v13.2.4 (task #1, ruling A1): ``out_shape_tyx`` scatters DIRECTLY into the final source
+    geometry in one step — working-grid coordinates are mapped to source indices with
+    union-biased floor scaling (every working foreground voxel lands in the source voxel whose
+    footprint contains it), so no intermediate working-geometry volume or second resample
+    exists. ``None`` keeps the historical working-geometry target.
     """
     if not is_tilted_view(tilted_view):
         raise ValueError('backproject_tilted_volume_to_volume expects a Tilted View')
 
-    t_dim = int(tilted_view.full_t)
-    out_h = int(tilted_view.full_h)
-    out_w = int(tilted_view.full_w)
+    work_t = int(tilted_view.full_t)
+    work_h = int(tilted_view.full_h)
+    work_w = int(tilted_view.full_w)
+    if out_shape_tyx is None:
+        t_dim, out_h, out_w = work_t, work_h, work_w
+    else:
+        t_dim, out_h, out_w = (int(v) for v in out_shape_tyx)
     if t_dim <= 0 or out_h <= 0 or out_w <= 0:
         raise ValueError(
             f'Tilted view {tilted_view.name} has invalid output geometry '
@@ -8774,7 +8894,9 @@ def backproject_tilted_volume_to_volume(
     stack_len = tilted_stack_axis_length(tilted_view)
 
     backend_norm = str(backend or 'cpu').strip().lower()
-    if backend_norm in ('gpu', 'auto'):
+    if backend_norm in ('gpu', 'auto') and (t_dim, out_h, out_w) == (work_t, work_h, work_w):
+        # The dormant GPU helper predates direct source-geometry targets; only offer it the
+        # historical working-geometry case.
         gpu_done = try_backproject_tilted_volume_to_volume_gpu(
             tilted_mask_mm=src,
             tilted_view=tilted_view,
@@ -8788,6 +8910,14 @@ def backproject_tilted_volume_to_volume(
             print(f'{desc}: GPU tilted backprojection unavailable or failed; falling back to CPU backend.')
 
     worker_count = choose_slice_parallel_workers(int(workers), int(tilted_view.num_slices))
+
+    def _map_axis_to_out(idx_arr: np.ndarray, in_len: int, out_len: int) -> np.ndarray:
+        # v13.2.4 (A1): union-biased floor scaling from working-grid indices to source indices
+        # (in_len >= out_len; the cube resize only grows axes). Identity when the axis is unscaled.
+        if int(in_len) == int(out_len):
+            return idx_arr
+        mapped = (idx_arr.astype(np.int64, copy=False) * int(out_len)) // int(in_len)
+        return np.minimum(mapped, int(out_len) - 1).astype(np.int32, copy=False)
 
     def _backproject_frame(frame_idx: int) -> None:
         tilted_mask = np.asarray(src[int(frame_idx)], dtype=bool)
@@ -8813,13 +8943,25 @@ def backproject_tilted_volume_to_volume(
         uu_v = uu[valid]
         if base_view == 'transverse':
             # base in-plane: horizontal X=uu, vertical Y=vv; stack t=ss
-            vol_mm[ss_v, vv_v, uu_v] = np.uint8(1)
+            vol_mm[
+                _map_axis_to_out(ss_v, work_t, t_dim),
+                _map_axis_to_out(vv_v, work_h, out_h),
+                _map_axis_to_out(uu_v, work_w, out_w),
+            ] = np.uint8(1)
         elif base_view == 'sagittal':
             # base in-plane: horizontal X=uu, vertical t=vv; stack Y=ss
-            vol_mm[vv_v, ss_v, uu_v] = np.uint8(1)
+            vol_mm[
+                _map_axis_to_out(vv_v, work_t, t_dim),
+                _map_axis_to_out(ss_v, work_h, out_h),
+                _map_axis_to_out(uu_v, work_w, out_w),
+            ] = np.uint8(1)
         elif base_view == 'coronal':
             # base in-plane: horizontal Y=uu, vertical t=vv; stack X=ss
-            vol_mm[vv_v, uu_v, ss_v] = np.uint8(1)
+            vol_mm[
+                _map_axis_to_out(vv_v, work_t, t_dim),
+                _map_axis_to_out(uu_v, work_h, out_h),
+                _map_axis_to_out(ss_v, work_w, out_w),
+            ] = np.uint8(1)
         else:  # pragma: no cover
             raise ValueError(f'Unsupported Tilted View base: {base_view}')
 
@@ -9008,6 +9150,9 @@ class ViewBackprojectionQueueJob:
     desc: str
     min_radius: float = 0.0
     workers: int = 1
+    # v13.2.4 (task #1, ruling A1): final source geometry to backproject directly into
+    # (single resample). None keeps the historical working-geometry target.
+    out_shape_tyx: Optional[Tuple[int, int, int]] = None
 
 
 class HybridBackprojectionQueue:
@@ -9034,6 +9179,7 @@ class HybridBackprojectionQueue:
                 prefer_memory=True,
                 workers=int(job.workers),
                 backend=str(backend),
+                out_shape_tyx=job.out_shape_tyx,
             )
         elif is_tilted_view(view_local):
             projected = backproject_tilted_volume_to_volume(
@@ -9044,6 +9190,7 @@ class HybridBackprojectionQueue:
                 prefer_memory=True,
                 workers=int(job.workers),
                 backend=str(backend),
+                out_shape_tyx=job.out_shape_tyx,
             )
         else:  # pragma: no cover
             raise ValueError(f'Unsupported queued backprojection view family: {view_local.family}')
@@ -9082,6 +9229,98 @@ class HybridBackprojectionQueue:
                 gpu_executor.shutdown(wait=True)
         return results
 
+def _union_projected_layer_ref_into_volume(
+    ref: 'NrrdLayerRef',
+    vol_mm: np.ndarray,
+    *,
+    workers: int = 1,
+    desc: str = 'Layer union',
+) -> None:
+    """OR one already-projected NRRD component layer into ``vol_mm`` (same shape)."""
+    vol_shape = tuple(int(v) for v in vol_mm.shape)
+    if tuple(int(v) for v in ref.shape) != vol_shape:
+        raise ValueError(f'{desc}: layer {ref.key} shape {tuple(ref.shape)} != destination {vol_shape}')
+    z_dim, h_dim, w_dim = vol_shape
+    src = _open_nrrd_layer_ref(ref)
+    try:
+        if isinstance(src, RawBBoxMaskStore):
+            index = src.index
+            scratch_tls = threading.local()
+
+            def _or_store_slice(z_idx: int) -> None:
+                rec = index[int(z_idx)]
+                if int(rec['kind']) != 1:
+                    return
+                buf = getattr(scratch_tls, 'buf', None)
+                if buf is None:
+                    buf = np.zeros((int(h_dim), int(w_dim)), dtype=np.uint8)
+                    scratch_tls.buf = buf
+                src.fill_decoded_slice_into(int(z_idx), buf)
+                y0 = int(rec['y0']); x0 = int(rec['x0']); y1 = int(rec['y1']); x1 = int(rec['x1'])
+                vol_mm[int(z_idx), y0:y1, x0:x1] |= buf[y0:y1, x0:x1]
+
+            parallel_for_indices_chunked(
+                int(z_dim),
+                _or_store_slice,
+                max_workers=choose_slice_parallel_workers(int(workers), int(z_dim)),
+                desc=desc,
+                show_progress=False,
+                target_chunks_per_worker=2,
+            )
+        else:
+            def _or_raw_slice(z_idx: int) -> None:
+                vol_mm[int(z_idx)] |= np.asarray(src[int(z_idx)], dtype=np.uint8)
+
+            parallel_for_indices_chunked(
+                int(z_dim),
+                _or_raw_slice,
+                max_workers=choose_slice_parallel_workers(int(workers), int(z_dim)),
+                desc=desc,
+                show_progress=False,
+                target_chunks_per_worker=2,
+            )
+    finally:
+        _close_nrrd_layer_source(src)
+
+
+def assemble_view_volume_from_projected_layers(
+    layer_refs: Sequence['NrrdLayerRef'],
+    out_shape_tyx: Tuple[int, int, int],
+    out_path: Path,
+    desc: str,
+    *,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 16 * GIB,
+    workers: int = 1,
+) -> np.ndarray:
+    """v13.2.4 (task #2): rebuild a radial/tilted view's final projected volume from its layers.
+
+    The dense radial gather and the tilted shear scatter both commute exactly with union, and the
+    view's final native volume is by construction the union of its component layers (cleaned
+    full-frame YOLO mask, one bridge delta per interpolation pass, and any accepted-tile / tile
+    bridge layers). OR-ing the ALREADY-projected --save_nrrd component layers therefore
+    reproduces the projected final volume bit-for-bit without a second full backprojection.
+    """
+    out_shape = tuple(int(v) for v in out_shape_tyx)
+    vol_mm = allocate_workspace_array(
+        shape=out_shape,
+        dtype=np.uint8,
+        path=out_path,
+        desc=f'{desc} workspace',
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
+    )
+    for ref in layer_refs:
+        _union_projected_layer_ref_into_volume(
+            ref,
+            vol_mm,
+            workers=int(workers),
+            desc=f'{desc}: OR layer {ref.key}',
+        )
+    flush_array(vol_mm)
+    return vol_mm
+
+
 def assemble_view_volumes_into_native_union(
     final_union_mm: np.ndarray,
     view_volume_mms: Dict[str, np.ndarray],
@@ -9090,14 +9329,58 @@ def assemble_view_volumes_into_native_union(
     W: int,
     disable_multiplanar: bool,
     *,
+    out_shape_tyx: Optional[Tuple[int, int, int]] = None,
     workers: int = 1,
 ) -> None:
-    """OR all per-view prediction volumes from the single active model into native (t, Y, X).
+    """OR all per-view prediction volumes from the single active model into the final union.
 
-    Transverse, already-backprojected Tilted Views, and already-backprojected Radial volumes
-    all have native (T,H,W) shape and are merged slice-wise. Sagittal and Coronal retain their native view stacks
-    and are mapped back into the transverse coordinate system.
+    Already-backprojected Tilted/Radial volumes arrive at the union's own (out) geometry and are
+    merged slice-wise. Transverse, Sagittal, and Coronal retain their native working-geometry view
+    stacks; v13.2.4 (task #1, ruling A1) restores each of them working->source with ONE resample
+    while merging (union-biased: a source slice ORs every working slice it covers and XY planes
+    are resized with the same >0-threshold INTER_AREA/NEAREST semantics as the former tail
+    restore). When ``out_shape_tyx`` is None or equals the working geometry, the historical
+    zero-resample axis-permutation merges are used.
     """
+    out_t, out_h, out_w = (int(T), int(H), int(W)) if out_shape_tyx is None else (
+        int(out_shape_tyx[0]), int(out_shape_tyx[1]), int(out_shape_tyx[2]))
+    working_equals_out = (out_t, out_h, out_w) == (int(T), int(H), int(W))
+
+    def _resize_plane_to_out_xy(plane: np.ndarray) -> np.ndarray:
+        plane_u8 = (np.asarray(plane, dtype=np.uint8) > 0).astype(np.uint8, copy=False)
+        if int(plane_u8.shape[0]) == int(out_h) and int(plane_u8.shape[1]) == int(out_w):
+            return plane_u8
+        interp = cv2.INTER_AREA if (int(plane_u8.shape[0]) >= int(out_h) and int(plane_u8.shape[1]) >= int(out_w)) else cv2.INTER_NEAREST
+        scaled = cv2.resize(
+            np.ascontiguousarray(plane_u8 * np.uint8(255)),
+            (int(out_w), int(out_h)),
+            interpolation=int(interp),
+        )
+        return (scaled > 0).astype(np.uint8, copy=False)
+
+    def _or_restore_working_planes_into_union(get_working_plane: Callable[[int], np.ndarray], view_label: str) -> None:
+        # One resample per working plane: t-range OR + XY resize straight into the union.
+        def _merge_out_slice(out_z: int) -> None:
+            v_start = int(math.floor(float(out_z) * float(T) / float(out_t)))
+            v_stop = int(math.ceil(float(out_z + 1) * float(T) / float(out_t)))
+            v_start = int(np.clip(v_start, 0, int(T) - 1))
+            v_stop = int(np.clip(max(v_start + 1, v_stop), 1, int(T)))
+            acc: Optional[np.ndarray] = None
+            for v_idx in range(v_start, v_stop):
+                restored = _resize_plane_to_out_xy(get_working_plane(int(v_idx)))
+                if acc is None:
+                    acc = restored
+                else:
+                    np.bitwise_or(acc, restored, out=acc)
+            final_union_mm[int(out_z), :, :] |= acc
+
+        parallel_for_indices(
+            int(out_t),
+            _merge_out_slice,
+            max_workers=choose_slice_parallel_workers(int(workers), int(out_t)),
+            desc=f"Assembling final union from {view_label} view volume (restored to source geometry)",
+        )
+
     consumed: set[str] = set()
 
     if "transverse" in view_volume_mms:
@@ -9105,66 +9388,81 @@ def assemble_view_volumes_into_native_union(
         assert transverse.shape == (T, H, W)
         consumed.add("transverse")
 
-        transverse_workers = choose_slice_parallel_workers(int(workers), int(T))
+        if working_equals_out:
+            transverse_workers = choose_slice_parallel_workers(int(workers), int(T))
 
-        def _merge_transverse(t: int) -> None:
-            final_union_mm[int(t), :, :] |= transverse[int(t), :, :]
+            def _merge_transverse(t: int) -> None:
+                final_union_mm[int(t), :, :] |= transverse[int(t), :, :]
 
-        parallel_for_indices(
-            int(T),
-            _merge_transverse,
-            max_workers=transverse_workers,
-            desc="Assembling final union from transverse view volume",
-        )
+            parallel_for_indices(
+                int(T),
+                _merge_transverse,
+                max_workers=transverse_workers,
+                desc="Assembling final union from transverse view volume",
+            )
+        else:
+            _or_restore_working_planes_into_union(lambda v: transverse[int(v), :, :], "transverse")
 
     if "sagittal" in view_volume_mms:
         sagittal = np.asarray(view_volume_mms["sagittal"])
         assert sagittal.shape == (H, T, W)
         consumed.add("sagittal")
-        sagittal_workers = choose_slice_parallel_workers(int(workers), int(H))
 
-        def _merge_sagittal(y: int) -> None:
-            final_union_mm[:, int(y), :] |= sagittal[int(y), :, :]
+        if working_equals_out:
+            sagittal_workers = choose_slice_parallel_workers(int(workers), int(H))
 
-        parallel_for_indices(
-            int(H),
-            _merge_sagittal,
-            max_workers=sagittal_workers,
-            desc="Assembling final union from sagittal view volume",
-        )
+            def _merge_sagittal(y: int) -> None:
+                final_union_mm[:, int(y), :] |= sagittal[int(y), :, :]
+
+            parallel_for_indices(
+                int(H),
+                _merge_sagittal,
+                max_workers=sagittal_workers,
+                desc="Assembling final union from sagittal view volume",
+            )
+        else:
+            # Working orthogonal slice t is the (H,W) plane sagittal[:, t, :].
+            _or_restore_working_planes_into_union(lambda v: sagittal[:, int(v), :], "sagittal")
 
     if "coronal" in view_volume_mms:
         coronal = np.asarray(view_volume_mms["coronal"])
         assert coronal.shape == (W, T, H)
         consumed.add("coronal")
-        coronal_workers = choose_slice_parallel_workers(int(workers), int(W))
 
-        def _merge_coronal(x: int) -> None:
-            final_union_mm[:, :, int(x)] |= coronal[int(x), :, :]
+        if working_equals_out:
+            coronal_workers = choose_slice_parallel_workers(int(workers), int(W))
 
-        parallel_for_indices(
-            int(W),
-            _merge_coronal,
-            max_workers=coronal_workers,
-            desc="Assembling final union from coronal view volume",
-        )
+            def _merge_coronal(x: int) -> None:
+                final_union_mm[:, :, int(x)] |= coronal[int(x), :, :]
+
+            parallel_for_indices(
+                int(W),
+                _merge_coronal,
+                max_workers=coronal_workers,
+                desc="Assembling final union from coronal view volume",
+            )
+        else:
+            # Working orthogonal slice t is coronal[:, t, :] with axes (W,H); transpose to (H,W).
+            _or_restore_working_planes_into_union(
+                lambda v: np.ascontiguousarray(np.asarray(coronal[:, int(v), :]).T), "coronal"
+            )
 
     for view_name in sorted(view_volume_mms.keys()):
         if view_name in consumed:
             continue
         vol = np.asarray(view_volume_mms[view_name])
-        if vol.shape != (T, H, W):
+        if vol.shape != (out_t, out_h, out_w):
             raise ValueError(
-                f"View volume '{view_name}' has shape {tuple(vol.shape)}; expected native volume shape {(T, H, W)} "
-                "or a handled sagittal/coronal stack."
+                f"View volume '{view_name}' has shape {tuple(vol.shape)}; expected final output volume shape "
+                f"{(out_t, out_h, out_w)} or a handled transverse/sagittal/coronal working stack."
             )
-        native_workers = choose_slice_parallel_workers(int(workers), int(T))
+        native_workers = choose_slice_parallel_workers(int(workers), int(out_t))
 
         def _merge_native(t: int, *, _vol: np.ndarray = vol) -> None:
             final_union_mm[int(t), :, :] |= _vol[int(t), :, :]
 
         parallel_for_indices(
-            int(T),
+            int(out_t),
             _merge_native,
             max_workers=native_workers,
             desc=f"Assembling final union from {view_name} view volume",
@@ -9179,6 +9477,7 @@ def assemble_current_view_union_volume(
     disable_multiplanar: bool,
     out_path: Path,
     *,
+    out_shape_tyx: Optional[Tuple[int, int, int]] = None,
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
@@ -9187,14 +9486,17 @@ def assemble_current_view_union_volume(
 
     The mapping is kept keyed by model name because earlier pipeline stages store temporary
     workspaces under the model stem. v12.2.0 rejects multiple model entries and never
-    combines outputs from more than one model.
+    combines outputs from more than one model. v13.2.4 (task #1, ruling A1): the union is
+    allocated in the FINAL SOURCE geometry (``out_shape_tyx``) so all downstream global
+    postprocessing runs in source voxels; None keeps the working geometry.
     """
     if len(view_volumes_by_model) != 1:
         raise ValueError('v12.2.0_SLURM supports exactly one --model; multiple-model inference has been removed')
 
+    union_shape = (int(T), int(H), int(W)) if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
     model_name = next(iter(view_volumes_by_model.keys()))
     final_union_mm = allocate_workspace_array(
-        shape=(T, H, W),
+        shape=union_shape,
         dtype=np.uint8,
         path=out_path,
         desc='Final single-model view-union volume',
@@ -9210,6 +9512,7 @@ def assemble_current_view_union_volume(
         H=H,
         W=W,
         disable_multiplanar=disable_multiplanar,
+        out_shape_tyx=out_shape_tyx,
         workers=int(workers),
     )
     flush_array(final_union_mm)
@@ -9351,6 +9654,7 @@ def assemble_final_union_after_view_union(
     out_path: Path,
     temp_dir: Path,
     *,
+    out_shape_tyx: Optional[Tuple[int, int, int]] = None,
     enable_3d_void_fill: bool = False,
     keep_temp: bool = False,
     prefer_memory: bool = True,
@@ -9365,6 +9669,7 @@ def assemble_final_union_after_view_union(
         W=W,
         disable_multiplanar=disable_multiplanar,
         out_path=out_path,
+        out_shape_tyx=out_shape_tyx,
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
         workers=int(workers),
@@ -11868,6 +12173,21 @@ def subtract_volume_to_mmap(
     return out
 
 
+# v13.2.4 (task #1, ruling A1): the final source output geometry (t,Y,X) of the run, set once by
+# run_pipeline. Radial/Tilted NRRD layer projections and the final backprojection queue target it
+# directly so radial/tilted masks are resampled exactly once on their way to source space.
+_FINAL_SOURCE_OUTPUT_SHAPE_TYX: Optional[Tuple[int, int, int]] = None
+
+
+def set_final_source_output_shape(shape_tyx: Optional[Tuple[int, int, int]]) -> None:
+    global _FINAL_SOURCE_OUTPUT_SHAPE_TYX
+    _FINAL_SOURCE_OUTPUT_SHAPE_TYX = None if shape_tyx is None else tuple(int(v) for v in shape_tyx)
+
+
+def final_source_output_shape() -> Optional[Tuple[int, int, int]]:
+    return _FINAL_SOURCE_OUTPUT_SHAPE_TYX
+
+
 def project_view_volume_to_orthogonal_volume(
     view_mask_mm: np.ndarray,
     view: ViewInfo,
@@ -11877,8 +12197,14 @@ def project_view_volume_to_orthogonal_volume(
     workers: int = 1,
     prefer_memory: bool = False,
     reserve_bytes: int = 16 * GIB,
+    out_shape_tyx: Optional[Tuple[int, int, int]] = None,
 ) -> np.ndarray:
-    """Project a view-native binary volume into orthogonal processing geometry (t,Y,X)."""
+    """Project a view-native binary volume into orthogonal (t,Y,X) geometry.
+
+    v13.2.4 (A1): ``out_shape_tyx`` is honored for radial/tilted views (single direct resample to
+    the final source geometry). Cartesian views are pure axis permutations of the working volume
+    (no resample) and must not receive a differing target shape.
+    """
     t_dim = int(view.full_t) if int(view.full_t) > 0 else int(view_mask_mm.shape[0])
     h_dim = int(view.full_h) if int(view.full_h) > 0 else int(view.src_h)
     w_dim = int(view.full_w) if int(view.full_w) > 0 else int(view.src_w)
@@ -11892,6 +12218,7 @@ def project_view_volume_to_orthogonal_volume(
             prefer_memory=bool(prefer_memory),
             reserve_bytes=int(reserve_bytes),
             workers=int(workers),
+            out_shape_tyx=out_shape_tyx,
         )
 
     if is_tilted_view(view):
@@ -11903,6 +12230,13 @@ def project_view_volume_to_orthogonal_volume(
             prefer_memory=bool(prefer_memory),
             reserve_bytes=int(reserve_bytes),
             workers=int(workers),
+            out_shape_tyx=out_shape_tyx,
+        )
+
+    if out_shape_tyx is not None and tuple(int(v) for v in out_shape_tyx) != (t_dim, h_dim, w_dim):
+        raise ValueError(
+            f'{desc}: Cartesian view projection is a pure axis permutation; '
+            f'requested output shape {tuple(out_shape_tyx)} != working {(t_dim, h_dim, w_dim)}'
         )
 
     if view.name == 'transverse':
@@ -11997,6 +12331,13 @@ def materialize_nrrd_view_layer(
         out_path = raw_path
 
     transient_projection_in_memory = bool(raw_bbox_nrrd_layers_enabled())
+    # v13.2.4 (task #1, ruling A1): radial/tilted layers are projected DIRECTLY into the final
+    # source geometry (one resample); the NRRD sink's restore then streams them unchanged, and
+    # the final backprojection stage can reuse them (task #2). Cartesian layers remain working-
+    # geometry axis permutations (their single resample happens in the sink restore).
+    projection_out_shape: Optional[Tuple[int, int, int]] = None
+    if view.family == 'radial' or is_tilted_view(view):
+        projection_out_shape = final_source_output_shape()
     projected = project_view_volume_to_orthogonal_volume(
         view_volume_mm,
         view,
@@ -12005,6 +12346,7 @@ def materialize_nrrd_view_layer(
         workers=int(workers),
         prefer_memory=bool(transient_projection_in_memory),
         reserve_bytes=32 * GIB,
+        out_shape_tyx=projection_out_shape,
     )
     shape = tuple(int(x) for x in np.asarray(projected).shape)
     if raw_bbox_nrrd_layers_enabled():
@@ -13800,6 +14142,126 @@ def nrrd_slicer_header(mask_shape_zyx: Tuple[int, int, int]) -> Dict[str, object
     }
 
 
+# v13.2.3: 3D Slicer segmentation tagging for the single-layer NRRD exports. Each component
+# layer is written as {Filestem}_{suffix}.seg.nrrd carrying the Slicer segmentation custom
+# header fields, so Slicer imports it as a Segmentation node named after the file with a
+# stable per-layer color instead of a scalar volume that renders every layer the same green.
+_SLICER_SEGMENT_COLOR_PALETTE: Tuple[Tuple[float, float, float], ...] = (
+    (0.83, 0.16, 0.16),  # red
+    (0.12, 0.47, 0.71),  # blue
+    (1.00, 0.60, 0.07),  # orange
+    (0.17, 0.63, 0.17),  # green
+    (0.58, 0.40, 0.74),  # purple
+    (0.09, 0.75, 0.81),  # cyan
+    (0.89, 0.47, 0.76),  # pink
+    (0.74, 0.74, 0.13),  # olive
+    (0.55, 0.34, 0.29),  # brown
+    (0.98, 0.75, 0.37),  # light orange
+    (0.68, 0.78, 0.91),  # light blue
+    (0.60, 0.87, 0.54),  # light green
+    (1.00, 0.60, 0.59),  # salmon
+    (0.77, 0.69, 0.84),  # lavender
+    (0.62, 0.85, 0.90),  # pale cyan
+    (0.95, 0.90, 0.45),  # yellow
+    (0.78, 0.58, 0.45),  # tan
+    (0.96, 0.71, 0.82),  # light pink
+    (0.47, 0.05, 0.53),  # violet
+    (0.10, 0.35, 0.20),  # dark green
+)
+
+
+def _stable_layer_color_index(token: str) -> int:
+    """Deterministic FNV-1a hash of a layer token.
+
+    Python's builtin hash() is salted per process, which would shuffle segment colors
+    between runs; the palette pick must be reproducible for the same layer suffix.
+    """
+    h = 0x811C9DC5
+    for b in str(token).encode('utf-8', errors='ignore'):
+        h = ((h ^ int(b)) * 0x01000193) & 0xFFFFFFFF
+    return int(h)
+
+
+def slicer_segment_palette_color(token: str) -> Tuple[float, float, float]:
+    """Deterministic palette color for a layer token (no in-run collision probing)."""
+    palette = _SLICER_SEGMENT_COLOR_PALETTE
+    return palette[_stable_layer_color_index(str(token)) % len(palette)]
+
+
+def _slicer_segment_name_for_out_path(out_path: Path) -> str:
+    name = Path(out_path).name
+    for ext in ('.seg.nrrd', '.nrrd'):
+        if name.lower().endswith(ext):
+            return name[:-len(ext)]
+    return Path(out_path).stem
+
+
+def _slicer_segment_extent_for_output(
+    ref: 'NrrdLayerRef',
+    output_shape_tyx: Tuple[int, int, int],
+) -> NrrdSegmentExtent:
+    """Map the layer's backing-store segment extent into the output geometry.
+
+    Returns the inclusive Slicer (minX maxX minY maxY minT maxT) extent in the exported
+    (X,Y,t) axis order. Extents are expanded outward when the output geometry is scaled
+    (e.g. low-quality downbins) and fall back to the full output extent when the backing
+    extent is unknown or empty, so the header never understates where mask voxels live.
+    """
+    out_t, out_h, out_w = (int(output_shape_tyx[0]), int(output_shape_tyx[1]), int(output_shape_tyx[2]))
+    full: NrrdSegmentExtent = (0, max(0, out_w - 1), 0, max(0, out_h - 1), 0, max(0, out_t - 1))
+    extent = _coerce_segment_extent(getattr(ref, 'segment_extent_ijk', None))
+    if extent is None:
+        return full
+    x0, x1, y0, y1, t0, t1 = (int(v) for v in extent)
+    if x1 < x0 or y1 < y0 or t1 < t0:
+        return full
+    in_t, in_h, in_w = (int(v) for v in getattr(ref, 'segment_extent_shape_tyx', (0, 0, 0)))
+    if in_t <= 0 or in_h <= 0 or in_w <= 0:
+        return full
+
+    def _axis(lo: int, hi: int, n_in: int, n_out: int) -> Tuple[int, int]:
+        if int(n_in) != int(n_out):
+            scale = float(n_out) / float(n_in)
+            lo = int(math.floor(float(lo) * scale))
+            hi = int(math.ceil((float(hi) + 1.0) * scale)) - 1
+        return (max(0, min(int(lo), int(n_out) - 1)), max(0, min(int(hi), int(n_out) - 1)))
+
+    x_lo, x_hi = _axis(x0, x1, in_w, out_w)
+    y_lo, y_hi = _axis(y0, y1, in_h, out_h)
+    t_lo, t_hi = _axis(t0, t1, in_t, out_t)
+    return (x_lo, x_hi, y_lo, y_hi, t_lo, t_hi)
+
+
+def slicer_segmentation_header_fields(
+    *,
+    segment_name: str,
+    color_rgb: Tuple[float, float, float],
+    extent_xyt: NrrdSegmentExtent,
+) -> Dict[str, object]:
+    """3D Slicer .seg.nrrd custom header fields for one single-segment binary labelmap.
+
+    All keys are non-standard NRRD fields, so _write_nrrd_ascii_header emits them with the
+    key:=value separator Slicer expects. Segment0_LabelValue matches the uint8 mask value 1.
+    """
+    r, g, b = (float(color_rgb[0]), float(color_rgb[1]), float(color_rgb[2]))
+    return {
+        'Segmentation_ContainedRepresentationNames': 'Binary labelmap|',
+        'Segmentation_MasterRepresentation': 'Binary labelmap',
+        'Segment0_ID': 'Segment_1',
+        'Segment0_Name': str(segment_name),
+        'Segment0_NameAutoGenerated': '0',
+        'Segment0_Color': f'{r:.6g} {g:.6g} {b:.6g}',
+        'Segment0_ColorAutoGenerated': '0',
+        'Segment0_LabelValue': '1',
+        'Segment0_Layer': '0',
+        'Segment0_Extent': ' '.join(str(int(v)) for v in extent_xyt),
+        'Segment0_Tags': (
+            'TerminologyEntry:Segmentation category and type - 3D Slicer General Anatomy list'
+            '~SCT^85756007^Tissue~SCT^85756007^Tissue~^^~Anatomic codes - DICOM master list~^^~^^|'
+        ),
+    }
+
+
 def nrrd_pigz_compresslevel() -> int:
     """Compression level passed to pigz for NRRD gzip-encoding."""
     return int(np.clip(_env_int('YOLO_TTA_NRRD_PIGZ_LEVEL', 6), 0, 9))
@@ -14032,7 +14494,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by Fable-5_v13.2.2_SLURM.py',
+        '# Complete NRRD file generated by Fable-5_v13.2.4_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -14125,7 +14587,7 @@ def nrrd_layer_output_suffix(
     """Return the v13.2.0 single-layer NRRD filename suffix for one component layer.
 
     The decomposition is now one single-layer NRRD per component layer (spec 7), named
-    ``{Filestem}_{suffix}.nrrd`` with the model name dropped (a model-ensemble holdover).
+    ``{Filestem}_{suffix}.seg.nrrd`` with the model name dropped (a model-ensemble holdover).
     """
     source_l = str(source).strip().lower()
     mask_kind_l = str(mask_kind).strip().lower()
@@ -14160,17 +14622,28 @@ def write_single_layer_nrrd_from_ref(
     out_path: Path,
     *,
     pigz_threads: Optional[int] = None,
+    segment_name: Optional[str] = None,
+    segment_color: Optional[Tuple[float, float, float]] = None,
 ) -> Path:
-    """Write one component layer as its own single-layer 3D NRRD (X, Y, t).
+    """Write one component layer as its own single-layer 3D Slicer segmentation NRRD (X, Y, t).
 
     The layer is restored from its backing-store geometry directly to the final output
     geometry while streaming, reusing the same per-layer restore/stream path as the legacy
     decomposed writer.  Each file holds one uint8 binary mask, fits in RAM, and is gzip
-    compressed in one pigz pass.
+    compressed in one pigz pass.  v13.2.3 tags the header with the 3D Slicer segmentation
+    fields so the .seg.nrrd imports as a Segmentation node; segment_name defaults to the
+    output filename stem and segment_color to the deterministic palette pick for that name.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
     header = nrrd_slicer_header((out_t, out_h, out_w))
+    seg_name = str(segment_name) if segment_name else _slicer_segment_name_for_out_path(out_path)
+    seg_color = segment_color if segment_color is not None else slicer_segment_palette_color(seg_name)
+    header.update(slicer_segmentation_header_fields(
+        segment_name=seg_name,
+        color_rgb=seg_color,
+        extent_xyt=_slicer_segment_extent_for_output(ref, (out_t, out_h, out_w)),
+    ))
     z_chunk = _nrrd_full_slice_z_chunk(1, out_w, out_h, out_t)
     threads = int(nrrd_single_layer_pigz_threads()) if pigz_threads is None else max(1, int(pigz_threads))
     with open(out_path, 'wb') as fh:
@@ -14224,6 +14697,9 @@ class NrrdLayerSink:
         self._futures: List[Future] = []
         self._manifest: List[Dict[str, object]] = []
         self._suffix_counts: Dict[str, int] = {}
+        # v13.2.3: Slicer segment colors already assigned in this run, so two layers whose
+        # suffix hashes collide still render distinctly (deterministic forward probing).
+        self._segment_colors_in_use: set = set()
         # v13.2.1: low-quality NRRDs now mirror the full-quality decomposition instead of being one
         # combined volume written at the tail.  Each downbin spec gets its own
         # one-single-layer-NRRD-per-component decomposition under low_quality/<token>/nrrd/, restored
@@ -14240,6 +14716,23 @@ class NrrdLayerSink:
             raise RuntimeError('low-quality NRRD directory requested without a low_quality_root')
         return self.low_quality_root / str(spec.token) / 'nrrd'
 
+    def _segment_color_for_suffix(self, unique_suffix: str) -> Tuple[float, float, float]:
+        # Called with self._lock held. Deterministic palette pick keyed off the layer suffix
+        # (stable across runs), probing forward past colors already used this run; beyond the
+        # palette size, a golden-ratio HSV walk keeps every additional layer distinct.
+        palette = _SLICER_SEGMENT_COLOR_PALETTE
+        base = _stable_layer_color_index(str(unique_suffix))
+        for probe in range(len(palette)):
+            color = palette[(base + probe) % len(palette)]
+            if color not in self._segment_colors_in_use:
+                self._segment_colors_in_use.add(color)
+                return color
+        hue = (float(base % 4096) / 4096.0 + 0.61803398875 * float(len(self._segment_colors_in_use))) % 1.0
+        r, g, b = colorsys.hsv_to_rgb(hue, 0.72, 0.88)
+        color = (round(float(r), 6), round(float(g), 6), round(float(b), 6))
+        self._segment_colors_in_use.add(color)
+        return color
+
     def submit_layer(self, ref: Optional['NrrdLayerRef'], suffix: str) -> Optional[Path]:
         if ref is None:
             return None
@@ -14247,7 +14740,11 @@ class NrrdLayerSink:
             seen = int(self._suffix_counts.get(str(suffix), 0))
             self._suffix_counts[str(suffix)] = seen + 1
             unique_suffix = str(suffix) if seen == 0 else f'{suffix}_{seen + 1:02d}'
-            out_path = self.nrrd_dir / f'{self.stem}_{unique_suffix}.nrrd'
+            # v13.2.3: .seg.nrrd + Slicer segmentation header fields; the segment is named
+            # after the file and colored from the deterministic per-suffix palette.
+            out_path = self.nrrd_dir / f'{self.stem}_{unique_suffix}.seg.nrrd'
+            segment_name = f'{self.stem}_{unique_suffix}'
+            segment_color = self._segment_color_for_suffix(unique_suffix)
             self._manifest.append({
                 'filename': out_path.name,
                 'suffix': unique_suffix,
@@ -14262,8 +14759,13 @@ class NrrdLayerSink:
                 'backing_shape_tyx': [int(v) for v in getattr(ref, 'shape', (0, 0, 0))],
                 'output_shape_tyx': [int(v) for v in self.output_shape],
                 'exported_axes': '(X, Y, t)',
+                'segment_name': segment_name,
+                'segment_color_rgb': [round(float(c), 6) for c in segment_color],
             })
-            fut = self.executor.submit(write_single_layer_nrrd_from_ref, ref, self.output_shape, out_path, pigz_threads=self.pigz_threads)
+            fut = self.executor.submit(
+                write_single_layer_nrrd_from_ref, ref, self.output_shape, out_path,
+                pigz_threads=self.pigz_threads, segment_name=segment_name, segment_color=segment_color,
+            )
             self._futures.append(fut)
             # v13.2.1: mirror this component layer into each low-quality downbin decomposition,
             # scheduled now (as the view completes) exactly like the full-quality layer and sharing
@@ -14276,7 +14778,7 @@ class NrrdLayerSink:
                     int(spec.output_shape_t_y_x[1]),
                     int(spec.output_shape_t_y_x[2]),
                 )
-                lq_path = self._lq_nrrd_dir(spec) / f'{self.stem}_{unique_suffix}.nrrd'
+                lq_path = self._lq_nrrd_dir(spec) / f'{self.stem}_{unique_suffix}.seg.nrrd'
                 self._lq_manifests.setdefault(str(spec.token), []).append({
                     'filename': lq_path.name,
                     'suffix': unique_suffix,
@@ -14294,9 +14796,12 @@ class NrrdLayerSink:
                     'downbin_token': str(spec.token),
                     'downbin_scale': float(spec.scale),
                     'exported_axes': '(X, Y, t)',
+                    'segment_name': segment_name,
+                    'segment_color_rgb': [round(float(c), 6) for c in segment_color],
                 })
                 lq_fut = self.executor.submit(
-                    write_single_layer_nrrd_from_ref, ref, lq_shape, lq_path, pigz_threads=self.pigz_threads
+                    write_single_layer_nrrd_from_ref, ref, lq_shape, lq_path,
+                    pigz_threads=self.pigz_threads, segment_name=segment_name, segment_color=segment_color,
                 )
                 self._futures.append(lq_fut)
         return out_path
@@ -14357,6 +14862,7 @@ class NrrdLayerSink:
                         'Low-quality distribution decomposition: the same component layers as the full-quality '
                         'nrrd/ folder, isotropically downbinned to this spec and written as each view completes.',
                         'Each NRRD is one uint8 binary mask in source output geometry (X, Y, t), downbinned.',
+                        'v13.2.3: each file is a 3D Slicer segmentation (.seg.nrrd) sharing its full-quality layer\'s segment name and color.',
                         'Layer suffixes match the full-quality layers, so each low-quality layer maps 1:1 to its full-quality layer.',
                     ],
                 }, indent=2))
@@ -14371,6 +14877,7 @@ class NrrdLayerSink:
             'layers': manifest_layers,
             'notes': [
                 'Each NRRD is one uint8 binary mask in source output geometry (X, Y, t).',
+                'v13.2.3: each file is a 3D Slicer segmentation (.seg.nrrd) holding one segment named after the file; segment_color_rgb records the assigned Slicer color.',
                 'Files can be recombined (union) or omitted after a full run to build a custom volume without rerunning.',
                 'YOLO layers are cleaned masks before interpolation bridges; bridge layers contain only voxels added by that pass.',
                 'Global_final_output is the final segmentation after all postprocessing and is not intended for recomposition.',
@@ -15809,6 +16316,10 @@ def main() -> None:
     # one downbinned single-layer NRRD per spec under low_quality/<token>/nrrd/, on the same
     # view-completion schedule as the full-quality layers (the tail no longer writes a combined
     # low-quality NRRD).
+    # v13.2.4 (task #1, ruling A1): record the final source output geometry so radial/tilted
+    # NRRD layer projections and the final backprojection queue target it directly (one resample).
+    set_final_source_output_shape((input_T, input_H, input_W))
+
     nrrd_dir = out_dir / 'nrrd'
     if bool(args.save_nrrd):
         sink_low_quality_specs = list(low_quality_downbin_specs) if bool(low_quality_requested) else []
@@ -16009,8 +16520,12 @@ def main() -> None:
     if (int(T), int(H), int(W)) != (int(input_T), int(input_H), int(input_W)):
         spec_notes.append(
             f'Working volume resized to v12.2.0 approximately-cubic processing geometry '
-            f'(t,Y,X)=({int(T)},{int(H)},{int(W)}); final default outputs are restored to the original '
-            f'input geometry (t,Y,X)=({int(input_T)},{int(input_H)},{int(input_W)}).'
+            f'(t,Y,X)=({int(T)},{int(H)},{int(W)}). v13.2.4 (ruling A1): the final stage runs in the '
+            f'original source geometry (t,Y,X)=({int(input_T)},{int(input_H)},{int(input_W)}) — '
+            'Radial/Tilted results are backprojected directly to source dimensions in a single resample, '
+            'Cartesian view stacks are restored with one resample during union assembly, and the global '
+            'union / optional 3D void fill / Gaussian smoothing (sigma in source voxels) / --keep_objects '
+            'all execute at source dimensions. No tail restore resample occurs.'
         )
     spec_notes.append(
         f'Sagittal enabled={bool(enable_sagittal)}, Coronal enabled={bool(enable_coronal)}; '
@@ -16037,7 +16552,9 @@ def main() -> None:
         )
     spec_notes.append(
         'v13.2.0 NRRD export (--save_nrrd) writes one single-layer 3-axis NRRD (X,Y,t) per component layer to '
-        'nrrd/, named {Filestem}_{ViewToken|Global}_{layer}.nrrd (model name dropped). Layer families: full-frame '
+        'nrrd/, named {Filestem}_{ViewToken|Global}_{layer}.seg.nrrd (model name dropped; v13.2.3 tags each file '
+        'with the 3D Slicer segmentation header fields — segment named after the file, deterministic per-layer '
+        'palette color). Layer families: full-frame '
         'YOLO masks, full-frame interpolation bridges per pass, tiled masks accepted by parent YOLO masks, tiled '
         'masks accepted by parent bridges, consolidated tile bridges per pass, Global_union_presmoothing, '
         'Global_smoothing_pass<N>, and Global_final_output. Each layer is restored to source output geometry while '
@@ -18001,6 +18518,9 @@ def main() -> None:
     else:
         spec_notes.append('YOLO_TTA_KEEP_TEMP retained scratch artifacts; the v12.2.0 in-memory inference path itself does not create prediction MKVs.')
 
+    # v13.2.4 (task #1, ruling A1): radial/tilted results are backprojected DIRECTLY into the
+    # original source geometry (single resample) instead of the working geometry.
+    source_output_shape_tyx = (int(input_T), int(input_H), int(input_W))
     final_backprojection_jobs: List[ViewBackprojectionQueueJob] = []
     for view in views:
         if (view.family != 'radial' and not is_tilted_view(view)):
@@ -18016,6 +18536,34 @@ def main() -> None:
                 native_source = native_view_support_by_model[model_name].get(view.name)
             if native_source is None:
                 continue
+            # v13.2.4 (task #2): with --save_nrrd, this view's component layers were already
+            # projected into source geometry at materialization time (fullframe YOLO + per-pass
+            # bridge deltas + any tile layers), and projection commutes exactly with union — so
+            # the final projected volume is their OR, skipping a second full backprojection.
+            if bool(nrrd_layers_needed):
+                view_projected_layer_refs = [
+                    ref for ref in nrrd_layer_refs
+                    if str(getattr(ref, 'view_name', '')) == str(view.name)
+                ]
+                if view_projected_layer_refs and all(
+                    tuple(int(v) for v in ref.shape) == source_output_shape_tyx
+                    for ref in view_projected_layer_refs
+                ):
+                    print(
+                        f'Final {model_name}/{view.name}: assembling projected volume as the union of '
+                        f'{len(view_projected_layer_refs)} already-projected NRRD layer(s) '
+                        f'(v13.2.4 task #2; no second backprojection).'
+                    )
+                    projected_volume = assemble_view_volume_from_projected_layers(
+                        view_projected_layer_refs,
+                        source_output_shape_tyx,
+                        temp_dir / 'view_volumes' / str(model_name) / f'{view.name}.u8.dat',
+                        f'Assembling final {model_name}/{view.name} from projected layers',
+                        prefer_memory=True,
+                        workers=int(slice_postprocess_workers),
+                    )
+                    view_volumes_by_model[model_name][view.name] = projected_volume
+                    continue
             final_backprojection_jobs.append(ViewBackprojectionQueueJob(
                 model_name=str(model_name),
                 view=view,
@@ -18026,6 +18574,7 @@ def main() -> None:
                 # backprojection, so the queue no longer re-filters after backprojection.
                 min_radius=0.0,
                 workers=1,
+                out_shape_tyx=source_output_shape_tyx,
             ))
 
     if final_backprojection_jobs:
@@ -18041,6 +18590,7 @@ def main() -> None:
                 desc=job.desc,
                 min_radius=job.min_radius,
                 workers=int(per_backproject_workers),
+                out_shape_tyx=job.out_shape_tyx,
             )
             for job in final_backprojection_jobs
         ]
@@ -18060,6 +18610,10 @@ def main() -> None:
     output_manager.reap_completed()
 
     print('\n=== Building final single-model view union after the global view union ===')
+    # v13.2.4 (task #1, ruling A1): the union is assembled at ORIGINAL SOURCE dimensions.
+    # Cartesian working stacks are restored working->source with one resample while merging;
+    # radial/tilted volumes arrive already backprojected to source geometry. Void fill,
+    # Gaussian smoothing (sigma in SOURCE voxels), and --keep_objects all run at source dims.
     final_union_mm = assemble_final_union_after_view_union(
         view_volumes_by_model=view_volumes_by_model,
         T=T,
@@ -18068,6 +18622,7 @@ def main() -> None:
         disable_multiplanar=None,
         out_path=temp_dir / 'final_union_volume.u8.dat',
         temp_dir=temp_dir,
+        out_shape_tyx=source_output_shape_tyx,
         enable_3d_void_fill=bool(args.enable_3d_void_fill),
         keep_temp=bool(keep_temp_artifacts),
         prefer_memory=True,
@@ -18119,7 +18674,9 @@ def main() -> None:
     final_output_mask_mm = final_union_mm
     output_volume_rgb = input_volume_rgb
     output_T, output_H, output_W = int(input_T), int(input_H), int(input_W)
-    if (int(T), int(H), int(W)) != (output_T, output_H, output_W):
+    # v13.2.4 (task #1, ruling A1): the final union is already assembled at source dimensions,
+    # so this tail restore is an identity no-op kept purely as a shape safety net.
+    if tuple(int(v) for v in final_union_mm.shape) != (output_T, output_H, output_W):
         print('\n=== Restoring final mask to original input geometry for default outputs ===')
         final_output_mask_mm = restore_mask_volume_to_original_shape(
             final_union_mm,
@@ -18275,7 +18832,8 @@ def main() -> None:
         spec_notes.append(
             f'NRRD decomposition (v13.2.0): {int(nrrd_layer_files_written)} single-layer NRRD file(s) written to '
             f'{nrrd_dir} as one uint8 binary mask per component layer (X,Y,t source geometry), named '
-            '{Filestem}_{ViewToken|Global}_{layer}.nrrd with the model name dropped. Each layer is created during '
+            '{Filestem}_{ViewToken|Global}_{layer}.seg.nrrd with the model name dropped, tagged as a 3D Slicer '
+            'segmentation (v13.2.3: segment named after the file, deterministic per-layer color). Each layer is created during '
             'the intermediate pipeline steps (e.g. the Transverse layer compresses while Tiled Transverse is still '
             'inferencing) and the Global_union_presmoothing layer is written while smoothing runs; a single '
             f'{input_path.stem}_nrrd_manifest.json sidecar lists every written layer. The previous mega 4D '
