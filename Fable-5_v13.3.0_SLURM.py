@@ -2,7 +2,55 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the v13.2.5_SLURM implementation. It is derived from v13.2.4_SLURM by COPY + surgical edits,
+This is the v13.3.0_SLURM implementation. It is derived from v13.2.5_SLURM by COPY + surgical
+edits, implementing four approved GPU-offload speed items from SPEED_REVIEW_Fable-5_v13.2.5
+(R1, R8, R9, R18, R21) targeting the standard 4-GPU radial+tilted command:
+  - v13.3.0 (R21/R1) GPU-resident worker rendering: each multi-GPU inference worker owns a
+    _GpuWorkerRenderEngine. When the uint8 source volume fits in VRAM next to the engine
+    (torch.cuda.mem_get_info headroom check against YOLO_TTA_GPU_RENDER_RESERVE_GIB, default 12),
+    the volume is uploaded ONCE per GPU and every full-frame view family renders ON DEVICE
+    (transverse/sagittal/coronal slice + cached-grid bilinear affine, tilted plan gather + lerp,
+    radial Lanczos-3 tap gather + fold with taps built on device), batches are assembled as
+    normalized fp16 BCHW tensors on a dedicated render stream, and TensorRT consumes them
+    directly through the existing _tta_gpu_tensor preprocess contract — no CPU render pools, no
+    host staging round trip for those tasks. NOTE: an engine whose TRT optimization profile max
+    batch is large blocks residency; rebuild the engine at max batch 1 (--batch 1) to fit
+    (a TRT context allocates for the PROFILE max, not the runtime batch).
+  - v13.3.0 (R1, VRAM-safe fallback) when the volume does NOT fit resident, radial full-frame
+    tasks still render on the GPU: the worker streams transient source t-blocks
+    (YOLO_TTA_GPU_RENDER_TBLOCK_SLICES, default 256) through an adaptive azimuth-chunked
+    gather+einsum and assembles the task's radial frames into a host slab, which then feeds the
+    unchanged StreamingYoloVolumeSource/CUDA-staging path. The ~1e12 GIL-held CPU gather+MAC
+    radial extraction stage is deleted in both modes. Non-radial views fall back to the
+    existing CPU render path when not resident. YOLO_TTA_GPU_RENDER=0 restores the pure CPU
+    render path; YOLO_TTA_GPU_RENDER_RESIDENT=0 forces the streaming fallback only.
+  - v13.3.0 (R9) proto-resolution retina union: in GPU retina mask mode a construct_result
+    patch (mirroring the CPU retina patch) computes the per-frame union at PROTO resolution —
+    per-instance mask logits are box-cropped at proto scale, reduced with a single max-logit
+    plane, and ONE plane is bilinearly upsampled to the network raster — instead of Ultralytics
+    materializing an (n, imgsz, imgsz) float retina stack per image that the pipeline
+    immediately ORs into one plane. This removes the dominant batch-scaled VRAM transient
+    (batch x n x 16 MB) and the n-plane upsample per frame. Instance-level --min_conf filtering
+    (single-angle fast path) and the optional max-confidence plane are applied at proto
+    resolution. Box-edge differences are sub-voxel scale. YOLO_TTA_GPU_PROTO_UNION=0 restores
+    the Ultralytics native retina stack + flatten path.
+  - v13.3.0 (R8) fast-path warp/cleanup rework: identity warps (every imgsz-folded radial frame
+    at --angle 0) skip affine_grid/grid_sample entirely; non-identity warps reuse ONE cached
+    affine grid per (matrix, geometry) instead of rebuilding a full-resolution grid every frame;
+    and the per-frame GPU 2D hole fill (cupyx binary_fill_holes — an iterative-dilation kernel
+    launch/sync storm) is REMOVED: spec order is --min_conf -> --min_radius -> hole fill and the
+    final per-view volume pass (fill_view_volume_holes_2d_inplace) already performs the hole
+    fill once, so the per-frame fill was pure recompute. cupy now runs only the --min_radius
+    connected-component filter and only when --min_radius > 0 (with --min_radius 0 the fast path
+    no longer touches cupy at all, removing its separate device memory pool).
+  - v13.3.0 (R18) GPU postprocess stream isolation: the flatten/warp/quantize/D2H tail runs on a
+    per-thread side CUDA stream that waits on a producer-recorded event (payloads carry
+    ready_event) instead of the default stream, so postprocess kernels and copies no longer
+    serialize against TensorRT kernel issue; device->host copies go through per-thread pinned
+    staging buffers with non-blocking copies. YOLO_TTA_GPU_POSTPROCESS_STREAM=0 /
+    YOLO_TTA_GPU_POSTPROCESS_PINNED=0 restore the previous default-stream/pageable behavior.
+
+The v13.2.5 base was derived from v13.2.4_SLURM by COPY + surgical edits,
 implementing ruling A2 (paired tiling) plus eleven approved speed optimizations targeting the
 standard 4-GPU radial+tilted command:
   - v13.2.5 (ruling A2) --tile_size/--tile_stride are index-PAIRED, not a Cartesian product:
@@ -344,6 +392,7 @@ from __future__ import annotations
 
 import argparse
 import colorsys
+import contextlib
 import gc
 import json
 import math
@@ -4104,6 +4153,10 @@ def gpu_input_staging_preflight_reserve(source: object, cfg: 'PredictConfig', qu
 def maybe_wrap_source_with_gpu_input_staging(source: object, cfg: 'PredictConfig', source_label: str) -> object:
     if isinstance(source, GpuPrefetchingYoloSource):
         return source
+    # v13.3.0 (R21): GPU-rendered sources already produce device-resident normalized batches;
+    # CPU-side staging would be a pointless host round trip.
+    if isinstance(source, GpuRenderedYoloSource):
+        return source
     if not gpu_input_staging_enabled(cfg):
         return source
     queue_batches = gpu_input_staging_queue_batches()
@@ -4314,7 +4367,7 @@ def ensure_ultralytics_accepts_in_memory_volume_source() -> None:
     except Exception:
         loaders_tuple = ()
     additions: List[object] = []
-    for loader_cls in (InMemoryYoloVolumeSource, StreamingYoloVolumeSource, GpuPrefetchingYoloSource):
+    for loader_cls in (InMemoryYoloVolumeSource, StreamingYoloVolumeSource, GpuPrefetchingYoloSource, GpuRenderedYoloSource):
         if loader_cls not in loaders_tuple:
             additions.append(loader_cls)
     if additions:
@@ -5240,12 +5293,39 @@ def gpu_retina_flatten_pending_limit(worker_count: int) -> int:
 
 
 def gpu_retina_cleanup_enabled() -> bool:
-    """v13.1.0 (#2.3): run --min_radius + 2D hole fill on the GPU for the single-angle fast path.
+    """v13.1.0 (#2.3): run --min_radius on the GPU for the single-angle fast path.
 
     Requires cupy/cupyx. YOLO_TTA_GPU_RETINA_CLEANUP=0 forces the connected-component cleanup back
     onto the CPU (the per-slice streaming cleanup) even when the fast path is otherwise active.
+    v13.3.0 (R8): the per-frame GPU 2D hole fill is removed (the final per-view volume pass
+    performs the hole fill once, in spec order), so this gate now only covers the --min_radius
+    connected-component filter and is a no-op when --min_radius is 0.
     """
     return _env_flag('YOLO_TTA_GPU_RETINA_CLEANUP', True)
+
+
+def gpu_retina_proto_union_enabled() -> bool:
+    """v13.3.0 (R9): compute the GPU retina union at PROTO resolution inside construct_result.
+
+    Active only in GPU retina mask mode. Instead of Ultralytics materializing an
+    (n, imgsz, imgsz) float retina stack per image (a batch-scaled VRAM transient of
+    batch x n x 16 MB that this pipeline immediately reduces to one plane), the patched
+    construct_result box-crops the per-instance mask logits at proto scale, reduces them to a
+    single max-logit plane, and bilinearly upsamples ONE plane to the network raster. Box-edge
+    differences are sub-voxel scale. YOLO_TTA_GPU_PROTO_UNION=0 restores the native retina
+    stack + flatten path.
+    """
+    return _env_flag('YOLO_TTA_GPU_PROTO_UNION', True)
+
+
+def gpu_postprocess_side_stream_enabled() -> bool:
+    """v13.3.0 (R18): run the GPU postprocess tail on a per-thread side CUDA stream."""
+    return _env_flag('YOLO_TTA_GPU_POSTPROCESS_STREAM', True)
+
+
+def gpu_postprocess_pinned_d2h_enabled() -> bool:
+    """v13.3.0 (R18): stage device->host postprocess copies through per-thread pinned buffers."""
+    return _env_flag('YOLO_TTA_GPU_POSTPROCESS_PINNED', True)
 
 
 def set_single_angle_gpu_fastpath(min_conf: Optional[float], min_radius: float = 0.0) -> None:
@@ -5547,6 +5627,9 @@ class GpuFlattenedRetinaPayload:
     run_gpu_cleanup: bool = False
     gpu_min_radius: float = 0.0
     cleanup_done_on_gpu: bool = False
+    # v13.3.0 (R18): CUDA event recorded on the producing stream after union/conf were computed,
+    # so the postprocess side stream can order against the producer without a host sync.
+    ready_event: Optional[object] = None
 
 
 @dataclass(frozen=True)
@@ -6086,6 +6169,174 @@ def ensure_cpu_retina_mask_predictor_patch() -> bool:
     return True
 
 
+_ULTRALYTICS_GPU_PROTO_UNION_PATCHED = False
+_ULTRALYTICS_ORIGINAL_SEG_CONSTRUCT_RESULT_FOR_GPU: Optional[object] = None
+
+
+def _build_gpu_flattened_payload_from_proto(pred: object, img: object, proto: object) -> Optional['GpuFlattenedRetinaPayload']:
+    """v13.3.0 (R9): build the flattened union payload at PROTO resolution.
+
+    Instead of letting Ultralytics materialize the (n, imgsz, imgsz) float retina stack that the
+    pipeline immediately reduces to one plane, the per-instance mask logits are combined from
+    the protos, box-cropped at proto scale, reduced with a single max-logit plane, and ONE plane
+    is bilinearly upsampled to the network raster and thresholded at 0 (union(bilinear(l_i)>0)
+    becomes bilinear(max_i l_i)>0 — identical away from instance box edges, sub-voxel there).
+    Instance-level --min_conf (single-angle fast path) and the optional per-pixel max-confidence
+    plane are applied at proto resolution. Returns None on any unexpected condition so the
+    caller falls back to the unpatched Ultralytics path.
+    """
+    try:
+        import torch  # type: ignore
+        import torch.nn.functional as F  # type: ignore
+    except Exception:
+        return None
+    if not isinstance(pred, torch.Tensor) or not isinstance(proto, torch.Tensor):
+        return None
+    try:
+        proto_t = proto
+        if proto_t.ndim == 4 and int(proto_t.shape[0]) == 1:
+            proto_t = proto_t[0]
+        if proto_t.ndim != 3 or pred.ndim != 2:
+            return None
+        img_h = int(img.shape[2])
+        img_w = int(img.shape[3])
+        if img_h <= 0 or img_w <= 0:
+            return None
+        c, mh, mw = (int(proto_t.shape[0]), int(proto_t.shape[1]), int(proto_t.shape[2]))
+        if c <= 0 or mh <= 0 or mw <= 0 or int(pred.shape[1]) < 6 + c:
+            return None
+
+        fastpath = single_angle_gpu_fastpath()
+        fastpath_min_conf = None if fastpath is None else float(fastpath[0])
+        fastpath_min_radius = 0.0 if fastpath is None else float(fastpath[1])
+        run_gpu_cleanup = bool(
+            fastpath is not None and gpu_retina_cleanup_enabled() and float(fastpath_min_radius) > 0.0
+        )
+
+        pred_t = pred
+        n = int(pred_t.shape[0])
+        confs_t = pred_t[:, 4].to(torch.float32).reshape(-1) if n > 0 else None
+
+        # Single-angle fast path: drop low-confidence instances before the union (exact
+        # instance-level --min_conf, mirroring _try_flatten_gpu_retina_result).
+        min_conf_applied = False
+        if (
+            fastpath_min_conf is not None
+            and float(fastpath_min_conf) > 0.0
+            and confs_t is not None
+            and n > 0
+        ):
+            keep = confs_t >= float(fastpath_min_conf)
+            pred_t = pred_t[keep]
+            confs_t = confs_t[keep]
+            n = int(pred_t.shape[0])
+            min_conf_applied = True
+
+        if n <= 0:
+            return GpuFlattenedRetinaPayload(
+                union_gpu=None, conf_gpu=None, instance_count=0,
+                min_conf_applied=min_conf_applied, run_gpu_cleanup=run_gpu_cleanup,
+                gpu_min_radius=float(fastpath_min_radius),
+            )
+
+        coeffs = pred_t[:, 6:6 + c].to(torch.float32)
+        logits = (coeffs @ proto_t.to(torch.float32).view(c, -1)).view(n, mh, mw)
+
+        # Box crop at proto scale (Ultralytics crop_mask semantics: r >= x1 and r < x2).
+        boxes = pred_t[:, :4].to(torch.float32)
+        sx = float(mw) / float(img_w)
+        sy = float(mh) / float(img_h)
+        x1 = (boxes[:, 0] * sx).view(-1, 1, 1)
+        y1 = (boxes[:, 1] * sy).view(-1, 1, 1)
+        x2 = (boxes[:, 2] * sx).view(-1, 1, 1)
+        y2 = (boxes[:, 3] * sy).view(-1, 1, 1)
+        cols = torch.arange(mw, device=logits.device, dtype=torch.float32).view(1, 1, -1)
+        rows = torch.arange(mh, device=logits.device, dtype=torch.float32).view(1, -1, 1)
+        inside = (cols >= x1) & (cols < x2) & (rows >= y1) & (rows < y2)
+
+        # Crop fill: a bounded "confident background" logit rather than -inf. An extreme fill
+        # bleeds through the bilinear upsample and erodes up to a full proto cell of box
+        # interior; -6 (sigmoid ~0.0025) keeps real logit zero-crossings exact while limiting
+        # crop-edge bleed to ~1 px at the network raster. Ultralytics' own non-retina path
+        # (ops.process_mask) also crops at proto resolution, with a multiplicative zero fill.
+        neg_fill = logits.new_full((), -6.0)
+        max_logit = torch.where(inside, logits, neg_fill).amax(dim=0)  # (mh, mw)
+        union_gpu = (
+            F.interpolate(
+                max_logit.reshape(1, 1, mh, mw), size=(img_h, img_w),
+                mode='bilinear', align_corners=False,
+            ).reshape(img_h, img_w) > 0.0
+        ).to(torch.float32)
+
+        conf_gpu = None
+        if confs_t is not None and gpu_flatten_conf_tracking_enabled():
+            inst_proto = (logits > 0.0) & inside
+            conf_plane = (confs_t.clamp(0.0, 1.0).view(-1, 1, 1) * inst_proto).amax(dim=0)
+            conf_gpu = F.interpolate(
+                conf_plane.reshape(1, 1, mh, mw), size=(img_h, img_w), mode='nearest',
+            ).reshape(img_h, img_w)
+
+        ready_event = None
+        try:
+            if union_gpu.is_cuda:
+                ready_event = torch.cuda.Event()
+                ready_event.record(torch.cuda.current_stream(union_gpu.device))
+        except Exception:
+            ready_event = None
+        return GpuFlattenedRetinaPayload(
+            union_gpu=union_gpu, conf_gpu=conf_gpu, instance_count=int(n),
+            min_conf_applied=min_conf_applied, run_gpu_cleanup=run_gpu_cleanup,
+            gpu_min_radius=float(fastpath_min_radius),
+            ready_event=ready_event,
+        )
+    except Exception:
+        return None
+
+
+def ensure_gpu_retina_proto_union_predictor_patch() -> bool:
+    """v13.3.0 (R9): patch Ultralytics segmentation postprocess for GPU retina mode.
+
+    Mirrors ensure_cpu_retina_mask_predictor_patch: construct_result returns a lightweight
+    Results carrying a prebuilt GpuFlattenedRetinaPayload (union computed at proto resolution)
+    instead of an (n, imgsz, imgsz) retina-mask stack. Any failure falls back per-frame to the
+    original Ultralytics construct_result.
+    """
+    global _ULTRALYTICS_GPU_PROTO_UNION_PATCHED, _ULTRALYTICS_ORIGINAL_SEG_CONSTRUCT_RESULT_FOR_GPU
+
+    if cpu_retina_masks_enabled() or not gpu_retina_proto_union_enabled():
+        return False
+    if _ULTRALYTICS_GPU_PROTO_UNION_PATCHED:
+        return True
+
+    try:
+        from ultralytics.engine.results import Results  # type: ignore
+        from ultralytics.models.yolo.segment.predict import SegmentationPredictor  # type: ignore
+    except Exception as exc:
+        print(f'Warning: GPU proto-union predictor patch could not be installed; keeping Ultralytics retina masks ({exc})')
+        return False
+
+    original_construct_result = SegmentationPredictor.construct_result
+    _ULTRALYTICS_ORIGINAL_SEG_CONSTRUCT_RESULT_FOR_GPU = original_construct_result
+
+    def _tta_gpu_proto_union_construct_result(self, pred, img, orig_img, img_path, proto):  # type: ignore[no-untyped-def]
+        if cpu_retina_masks_enabled() or not gpu_retina_proto_union_enabled():
+            return original_construct_result(self, pred, img, orig_img, img_path, proto)
+        payload = _build_gpu_flattened_payload_from_proto(pred, img, proto)
+        if payload is None:
+            return original_construct_result(self, pred, img, orig_img, img_path, proto)
+        result = Results(orig_img, path=img_path, names=self.model.names, boxes=None, masks=None)
+        setattr(result, '_tta_gpu_flattened_payload', payload)
+        return result
+
+    SegmentationPredictor.construct_result = _tta_gpu_proto_union_construct_result
+    _ULTRALYTICS_GPU_PROTO_UNION_PATCHED = True
+    print(
+        'GPU proto-resolution retina union enabled (v13.3.0 R9): per-frame unions are reduced at '
+        'proto scale and one plane is upsampled, bypassing the (n, imgsz, imgsz) retina stack.'
+    )
+    return True
+
+
 def _affine_theta_for_grid_sample(
     M_out_to_native: np.ndarray, out_size: int, native_h: int, native_w: int,
 ) -> np.ndarray:
@@ -6121,6 +6372,142 @@ def _affine_theta_for_grid_sample(
     return theta3[:2].astype(np.float32, copy=False)
 
 
+def _affine_theta_from_dst_to_src(
+    M_dst_to_src: np.ndarray, src_h: int, src_w: int, dst_h: int, dst_w: int,
+) -> np.ndarray:
+    """v13.3.0: theta for grid_sample given the dst-pixel -> src-pixel affine directly.
+
+    Generalizes _affine_theta_for_grid_sample to non-square sources (used by the GPU render
+    engine, whose AffineSpec already stores M_out_to_src — no inversion needed). Matches
+    cv2.warpAffine(src, inv(M_dst_to_src), dsize=(dst_w, dst_h)) pixel-center conventions with
+    align_corners=False.
+    """
+    M3 = np.vstack([np.asarray(M_dst_to_src, dtype=np.float64).reshape(2, 3), [0.0, 0.0, 1.0]])
+    dh = float(dst_h)
+    dw = float(dst_w)
+    sh = float(src_h)
+    sw = float(src_w)
+    P_dst = np.array([
+        [dw / 2.0, 0.0, dw / 2.0 - 0.5],
+        [0.0, dh / 2.0, dh / 2.0 - 0.5],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float64)
+    N_src = np.array([
+        [2.0 / sw, 0.0, 1.0 / sw - 1.0],
+        [0.0, 2.0 / sh, 1.0 / sh - 1.0],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float64)
+    theta3 = N_src @ M3 @ P_dst
+    return theta3[:2].astype(np.float32, copy=False)
+
+
+def _warp_matrix_is_identity(M: np.ndarray, atol: float = 1e-5) -> bool:
+    """v13.3.0 (R8): True when a cv2-style 2x3 affine is the identity within tolerance."""
+    try:
+        m = np.asarray(M, dtype=np.float64).reshape(2, 3)
+    except Exception:
+        return False
+    return bool(
+        abs(m[0, 0] - 1.0) <= atol and abs(m[1, 1] - 1.0) <= atol
+        and abs(m[0, 1]) <= atol and abs(m[1, 0]) <= atol
+        and abs(m[0, 2]) <= atol and abs(m[1, 2]) <= atol
+    )
+
+
+# v13.3.0 (R8): affine grids are constant per (matrix, geometry, device) — one small LRU
+# replaces a fresh full-resolution affine_grid allocation per frame.
+_AFFINE_GRID_CACHE: 'OrderedDict[Tuple[object, ...], object]' = OrderedDict()
+_AFFINE_GRID_CACHE_LOCK = threading.Lock()
+
+
+def _affine_grid_cache_entries() -> int:
+    return max(1, _env_int('YOLO_TTA_GPU_WARP_GRID_CACHE_ENTRIES', 12))
+
+
+def _get_cached_affine_grid(theta_np: np.ndarray, dst_h: int, dst_w: int, device: object) -> object:
+    import torch  # type: ignore
+    import torch.nn.functional as F  # type: ignore
+    key = (
+        str(device), int(dst_h), int(dst_w),
+        tuple(np.round(np.asarray(theta_np, dtype=np.float64).reshape(-1), 9).tolist()),
+    )
+    with _AFFINE_GRID_CACHE_LOCK:
+        cached = _AFFINE_GRID_CACHE.get(key)
+        if cached is not None:
+            _AFFINE_GRID_CACHE.move_to_end(key)
+            return cached
+    theta = torch.from_numpy(np.asarray(theta_np, dtype=np.float32)).to(device=device).reshape(1, 2, 3)
+    grid = F.affine_grid(theta, [1, 1, int(dst_h), int(dst_w)], align_corners=False)
+    # The grid is built once on the creating thread's stream but read from arbitrary streams
+    # afterwards; synchronize the producing stream once so later cross-stream reads are ordered.
+    try:
+        torch.cuda.current_stream(grid.device).synchronize()
+    except Exception:
+        pass
+    with _AFFINE_GRID_CACHE_LOCK:
+        _AFFINE_GRID_CACHE[key] = grid
+        _AFFINE_GRID_CACHE.move_to_end(key)
+        while len(_AFFINE_GRID_CACHE) > _affine_grid_cache_entries():
+            _AFFINE_GRID_CACHE.popitem(last=False)
+    return grid
+
+
+# v13.3.0 (R18): per-thread side stream + pinned staging buffers for the GPU postprocess tail.
+_GPU_POSTPROCESS_TLS = threading.local()
+
+
+def _gpu_postprocess_side_stream(torch_mod: object, device: object) -> Optional[object]:
+    """Return this thread's postprocess CUDA stream for ``device`` (None when disabled)."""
+    if not gpu_postprocess_side_stream_enabled():
+        return None
+    try:
+        if device is None or getattr(device, 'type', '') != 'cuda':
+            return None
+        streams = getattr(_GPU_POSTPROCESS_TLS, 'streams', None)
+        if streams is None:
+            streams = {}
+            _GPU_POSTPROCESS_TLS.streams = streams
+        dev_key = int(getattr(device, 'index', 0) or 0)
+        stream = streams.get(dev_key)
+        if stream is None:
+            stream = torch_mod.cuda.Stream(device=device)
+            streams[dev_key] = stream
+        return stream
+    except Exception:
+        return None
+
+
+def _tensor_to_host_numpy(torch_mod: object, tensor: object, stream: Optional[object]) -> np.ndarray:
+    """Copy a small device tensor to host, via this thread's pinned staging buffer when enabled.
+
+    The returned array aliases a per-thread reusable pinned buffer (one per dtype); callers must
+    consume it before requesting another transfer of the same dtype on the same thread.
+    """
+    t = tensor.contiguous()
+    if not gpu_postprocess_pinned_d2h_enabled():
+        return t.cpu().numpy()
+    try:
+        pools = getattr(_GPU_POSTPROCESS_TLS, 'pinned', None)
+        if pools is None:
+            pools = {}
+            _GPU_POSTPROCESS_TLS.pinned = pools
+        dtype_key = str(t.dtype)
+        numel = int(t.numel())
+        buf = pools.get(dtype_key)
+        if buf is None or int(buf.numel()) < numel:
+            buf = torch_mod.empty((numel,), dtype=t.dtype, pin_memory=True)
+            pools[dtype_key] = buf
+        view = buf[:numel].view(t.shape)
+        view.copy_(t, non_blocking=True)
+        if stream is not None:
+            stream.synchronize()
+        else:
+            torch_mod.cuda.current_stream(t.device).synchronize()
+        return view.numpy()
+    except Exception:
+        return t.cpu().numpy()
+
+
 def _torch_warp_planes_to_native(
     planes: 'Sequence[object]', M_out_to_native: np.ndarray, out_size: int, native_h: int, native_w: int,
 ) -> 'List[object]':
@@ -6128,9 +6515,12 @@ def _torch_warp_planes_to_native(
 
     Each plane is a torch tensor (Hr, Wr) on the same device/shape; planes are resized to
     (out_size, out_size) with nearest sampling if needed, stacked on the channel axis, and warped to
-    (native_h, native_w) with a SINGLE affine_grid + grid_sample (nearest, zero-padded) so the grid
-    is built once for all planes. Matches cv2.warpAffine(..., INTER_NEAREST, BORDER_CONSTANT, 0) up to
-    half-pixel rounding ties. Returns a list of float32 (native_h, native_w) tensors on the device.
+    (native_h, native_w) with a SINGLE grid_sample (nearest, zero-padded). Matches
+    cv2.warpAffine(..., INTER_NEAREST, BORDER_CONSTANT, 0) up to half-pixel rounding ties.
+    v13.3.0 (R8): identity warps (native == out and M == I, e.g. every imgsz-folded radial frame
+    at --angle 0) skip the sample entirely, and non-identity warps reuse one cached grid per
+    (matrix, geometry) instead of rebuilding a full-resolution affine_grid per frame. Returns a
+    list of float32 (native_h, native_w) tensors on the device.
     """
     import torch  # type: ignore
     import torch.nn.functional as F  # type: ignore
@@ -6143,10 +6533,14 @@ def _torch_warp_planes_to_native(
                 size=(int(out_size), int(out_size)), mode='nearest',
             ).reshape(int(out_size), int(out_size))
         prepared.append(t)
+    if (
+        int(native_h) == int(out_size) and int(native_w) == int(out_size)
+        and _warp_matrix_is_identity(M_out_to_native)
+    ):
+        return prepared
     inp = torch.stack(prepared, dim=0).unsqueeze(0)  # (1, K, out_size, out_size)
     theta_np = _affine_theta_for_grid_sample(M_out_to_native, int(out_size), int(native_h), int(native_w))
-    theta = torch.from_numpy(theta_np).to(device=inp.device, dtype=torch.float32).reshape(1, 2, 3)
-    grid = F.affine_grid(theta, [1, 1, int(native_h), int(native_w)], align_corners=False)
+    grid = _get_cached_affine_grid(theta_np, int(native_h), int(native_w), inp.device)
     out = F.grid_sample(inp, grid, mode='nearest', padding_mode='zeros', align_corners=False)
     return [out[0, k] for k in range(int(out.shape[1]))]
 
@@ -6219,7 +6613,11 @@ def _try_flatten_gpu_retina_result(r, masks_data: object) -> Optional[GpuFlatten
         fastpath = single_angle_gpu_fastpath()
         fastpath_min_conf = None if fastpath is None else float(fastpath[0])
         fastpath_min_radius = 0.0 if fastpath is None else float(fastpath[1])
-        run_gpu_cleanup = bool(fastpath is not None and gpu_retina_cleanup_enabled())
+        # v13.3.0 (R8): the per-frame GPU hole fill is gone (the volume-level pass fills once,
+        # in spec order), so GPU cleanup only has work when a positive --min_radius is set.
+        run_gpu_cleanup = bool(
+            fastpath is not None and gpu_retina_cleanup_enabled() and float(fastpath_min_radius) > 0.0
+        )
 
         # Pull confidences onto the mask's device as a (n,) float tensor.
         confs_t = None
@@ -6274,10 +6672,20 @@ def _try_flatten_gpu_retina_result(r, masks_data: object) -> Optional[GpuFlatten
             conf_gpu = (cf.view(-1, 1, 1) * masks_bool).amax(dim=0)
         else:
             conf_gpu = None
+        # v13.3.0 (R18): record readiness on the producing stream so the postprocess side
+        # stream can wait on the event instead of the whole default stream.
+        ready_event = None
+        try:
+            if union_gpu.is_cuda:
+                ready_event = torch.cuda.Event()
+                ready_event.record(torch.cuda.current_stream(union_gpu.device))
+        except Exception:
+            ready_event = None
         return GpuFlattenedRetinaPayload(
             union_gpu=union_gpu, conf_gpu=conf_gpu, instance_count=int(n),
             min_conf_applied=min_conf_applied, run_gpu_cleanup=run_gpu_cleanup,
             gpu_min_radius=float(fastpath_min_radius),
+            ready_event=ready_event,
         )
     except Exception:
         return None
@@ -6285,6 +6693,12 @@ def _try_flatten_gpu_retina_result(r, masks_data: object) -> Optional[GpuFlatten
 
 def _extract_result_masks_and_confs(r) -> Tuple[Optional[object], Optional[np.ndarray]]:
     """Detach one streamed YOLO result into CPU-owned data for asynchronous postprocess."""
+    # v13.3.0 (R9): the GPU proto-union construct_result patch attaches a prebuilt flattened
+    # payload (union already reduced at proto resolution); nothing remains to extract.
+    prebuilt_payload = getattr(r, '_tta_gpu_flattened_payload', None)
+    if isinstance(prebuilt_payload, GpuFlattenedRetinaPayload):
+        return prebuilt_payload, None
+
     deferred_payload = getattr(r, '_tta_deferred_cpu_retina_payload', None)
     if isinstance(deferred_payload, DeferredCpuRetinaMaskPayload):
         payload = _realize_deferred_cpu_retina_payload(deferred_payload)
@@ -6409,10 +6823,13 @@ def _process_gpu_flattened_prediction_frame(
 
     The (n,Hr,Wr) stack was already reduced on the GPU to a union plane and a max-confidence plane.
     Here both planes are warped to view-native space ON THE GPU (#2.2: no CPU warp, no per-instance
-    loop) and, for the single-angle fast path (#2.3), --min_radius + 2D hole fill run on the GPU
-    (cupy) on the native union before the host copy; in that case cleanup_done_on_gpu is set so the
-    per-slice CPU streaming cleanup is skipped. Falls back to a CPU warp (and CPU cleanup) if the GPU
-    warp path raises, so results are always produced.
+    loop; v13.3.0 R8: identity warps skipped, grids cached) and, for the single-angle fast path
+    (#2.3), a positive --min_radius runs on the GPU (cupy) on the native union before the host
+    copy; in that case cleanup_done_on_gpu is set so the per-slice CPU streaming cleanup is
+    skipped. v13.3.0 (R8): the per-frame GPU 2D hole fill is removed — the final per-view volume
+    pass performs the hole fill once, in spec order. v13.3.0 (R18): all of this runs on a
+    per-thread side CUDA stream with pinned D2H staging. Falls back to a CPU warp (and CPU
+    cleanup) if the GPU warp path raises, so results are always produced.
     """
     union_gpu = payload.union_gpu
     if union_gpu is None:
@@ -6428,55 +6845,83 @@ def _process_gpu_flattened_prediction_frame(
         if not gpu_retina_warp_enabled():
             raise RuntimeError('gpu retina warp disabled')
 
-        # Warp union (and conf) to view-native space on the GPU (nearest, zero-padded). Both planes
-        # share one affine_grid / grid_sample call.
-        warp_conf = bool(track_conf and payload.conf_gpu is not None)
-        warped = _torch_warp_planes_to_native(
-            [union_gpu, payload.conf_gpu] if warp_conf else [union_gpu],
-            M_out_to_native, int(out_size), int(native_h), int(native_w),
-        )
-        native_union_t = warped[0]
-        native_union_bool_t = native_union_t > 0.5
+        # v13.3.0 (R18): the whole postprocess tail runs on this thread's side CUDA stream,
+        # ordered against the producer via the payload's recorded event, so warp/quantize/D2H
+        # no longer serialize with TensorRT kernel issue on the default stream.
+        device = getattr(union_gpu, 'device', None)
+        side_stream = _gpu_postprocess_side_stream(torch, device)
+        stream_ctx = torch.cuda.stream(side_stream) if side_stream is not None else contextlib.nullcontext()
+        with stream_ctx:
+            if side_stream is not None:
+                ready_evt = getattr(payload, 'ready_event', None)
+                if ready_evt is not None:
+                    side_stream.wait_event(ready_evt)
+                else:
+                    side_stream.wait_stream(torch.cuda.default_stream(device))
 
-        native_conf_t = None
-        if warp_conf:
-            native_conf_f = warped[1]
-            # Quantize to u8 (round-half-even) only where the union is foreground.
-            native_conf_t = torch.where(
-                native_union_bool_t,
-                (native_conf_f.clamp(0.0, 1.0) * float(CONF_U8_MAX)).round(),
-                torch.zeros((), dtype=native_conf_f.dtype, device=native_conf_f.device),
-            ).clamp(0.0, 255.0).to(torch.uint8)
+            # Warp union (and conf) to view-native space on the GPU (nearest, zero-padded). Both
+            # planes share one grid_sample; identity warps skip it entirely and non-identity
+            # warps reuse a cached grid (v13.3.0 R8).
+            warp_conf = bool(track_conf and payload.conf_gpu is not None)
+            warped = _torch_warp_planes_to_native(
+                [union_gpu, payload.conf_gpu] if warp_conf else [union_gpu],
+                M_out_to_native, int(out_size), int(native_h), int(native_w),
+            )
+            native_union_t = warped[0]
+            native_union_bool_t = native_union_t > 0.5
 
-        # #2.3: connected-component --min_radius + 2D hole fill on the GPU (cupy), in native space.
-        if bool(payload.run_gpu_cleanup):
-            cp_mod = _try_import_cupy_ndimage()
-            if cp_mod is not None:
-                cp, cpx_ndi = cp_mod
-                try:
-                    # Pin the cupy device to the torch tensor's CUDA index so cp.asarray does not
-                    # default to device 0 when inference runs on a non-default GPU (e.g. --device 1).
-                    _dev_idx = getattr(native_union_bool_t.device, 'index', None)
-                    _cp_dev = cp.cuda.Device(int(_dev_idx)) if _dev_idx is not None else cp.cuda.Device()
-                    with _cp_dev:
-                        # Move to cupy via uint8 (torch bool tensors do not reliably expose
-                        # __cuda_array_interface__), then back to a boolean mask for the CC ops.
-                        union_cp = cp.asarray(native_union_bool_t.to(torch.uint8).contiguous()) > 0
-                        union_cp = _min_radius_filter_ndimage(cp, cpx_ndi, union_cp, float(payload.gpu_min_radius))
-                        union_cp = _fill_holes_ndimage(cp, cpx_ndi, union_cp)
-                        native_union_np = np.ascontiguousarray(cp.asnumpy(union_cp).astype(np.uint8, copy=False) > 0)
-                    cleaned_on_gpu = True
-                except Exception:
-                    native_union_np = None  # fall back to torch->cpu union, CPU cleanup downstream
+            native_conf_t = None
+            if warp_conf:
+                native_conf_f = warped[1]
+                # Quantize to u8 (round-half-even) only where the union is foreground.
+                native_conf_t = torch.where(
+                    native_union_bool_t,
+                    (native_conf_f.clamp(0.0, 1.0) * float(CONF_U8_MAX)).round(),
+                    torch.zeros((), dtype=native_conf_f.dtype, device=native_conf_f.device),
+                ).clamp(0.0, 255.0).to(torch.uint8)
 
-        if native_union_np is None:
-            native_union_np = np.ascontiguousarray(native_union_bool_t.detach().cpu().numpy())
-            native_union_np = native_union_np > 0
-        if native_conf_t is not None:
-            native_conf_np = np.ascontiguousarray(native_conf_t.detach().cpu().numpy().astype(np.uint8, copy=False))
-            if bool(cleaned_on_gpu):
-                # Keep confidence only where the cleaned union remains foreground.
-                native_conf_np = np.where(native_union_np, native_conf_np, np.uint8(0)).astype(np.uint8, copy=False)
+            # #2.3 / v13.3.0 (R8): connected-component --min_radius on the GPU (cupy), in native
+            # space, only when a positive radius is set. The old per-frame 2D hole fill
+            # (cupyx binary_fill_holes, an iterative-dilation kernel/sync storm) is removed:
+            # spec order is --min_conf -> --min_radius -> hole fill and the final per-view
+            # volume pass performs the hole fill once, so the per-frame fill was pure recompute.
+            if bool(payload.run_gpu_cleanup) and float(payload.gpu_min_radius) > 0.0:
+                cp_mod = _try_import_cupy_ndimage()
+                if cp_mod is not None:
+                    cp, cpx_ndi = cp_mod
+                    try:
+                        # Pin the cupy device to the torch tensor's CUDA index so cp.asarray does
+                        # not default to device 0 when inference runs on a non-default GPU.
+                        _dev_idx = getattr(native_union_bool_t.device, 'index', None)
+                        _cp_dev = cp.cuda.Device(int(_dev_idx)) if _dev_idx is not None else cp.cuda.Device()
+                        _cp_stream = (
+                            cp.cuda.ExternalStream(int(side_stream.cuda_stream))
+                            if side_stream is not None else contextlib.nullcontext()
+                        )
+                        with _cp_dev, _cp_stream:
+                            # Move to cupy via uint8 (torch bool tensors do not reliably expose
+                            # __cuda_array_interface__), then back to a boolean mask for the CC ops.
+                            union_cp = cp.asarray(native_union_bool_t.to(torch.uint8).contiguous()) > 0
+                            union_cp = _min_radius_filter_ndimage(cp, cpx_ndi, union_cp, float(payload.gpu_min_radius))
+                            native_union_np = np.ascontiguousarray(cp.asnumpy(union_cp).astype(np.uint8, copy=False) > 0)
+                        cleaned_on_gpu = True
+                    except Exception:
+                        native_union_np = None  # fall back to torch->cpu union, CPU cleanup downstream
+
+            if native_union_np is None:
+                # v13.3.0 (R18): D2H through this thread's pinned staging buffer (non-blocking
+                # copy + stream sync); copy out immediately since the buffer is reused per frame.
+                native_union_np = np.ascontiguousarray(
+                    _tensor_to_host_numpy(torch, native_union_bool_t, side_stream)
+                )
+                native_union_np = native_union_np > 0
+            if native_conf_t is not None:
+                native_conf_np = np.ascontiguousarray(
+                    _tensor_to_host_numpy(torch, native_conf_t, side_stream).astype(np.uint8, copy=True)
+                )
+                if bool(cleaned_on_gpu):
+                    # Keep confidence only where the cleaned union remains foreground.
+                    native_conf_np = np.where(native_union_np, native_conf_np, np.uint8(0)).astype(np.uint8, copy=False)
     except Exception:
         # Robust CPU fallback: copy the flattened GPU planes down and warp on the CPU (cv2).
         native_union_np = None
@@ -6677,13 +7122,17 @@ def predict_source_and_accumulate(
         else None
     )
     try:
-        if isinstance(source, (InMemoryYoloVolumeSource, StreamingYoloVolumeSource, GpuPrefetchingYoloSource)):
+        if isinstance(source, (InMemoryYoloVolumeSource, StreamingYoloVolumeSource, GpuPrefetchingYoloSource, GpuRenderedYoloSource)):
             ensure_single_channel_yolo_preprocess_patch()
         use_custom_cpu_retina = False
         if cpu_retina_masks_enabled():
             use_custom_cpu_retina = bool(ensure_cpu_retina_mask_predictor_patch())
             if not use_custom_cpu_retina:
                 print('Warning: CPU retina predictor patch unavailable; using Ultralytics native retina_masks=True for this source.')
+        else:
+            # v13.3.0 (R9): GPU retina mode — reduce unions at proto resolution inside
+            # construct_result instead of materializing (n, imgsz, imgsz) retina stacks.
+            ensure_gpu_retina_proto_union_predictor_patch()
 
         prediction_count = 0
         frames_with_predictions = 0
@@ -6858,13 +7307,17 @@ def predict_source_and_submit_accumulation(
         else None
     )
     try:
-        if isinstance(source, (InMemoryYoloVolumeSource, StreamingYoloVolumeSource, GpuPrefetchingYoloSource)):
+        if isinstance(source, (InMemoryYoloVolumeSource, StreamingYoloVolumeSource, GpuPrefetchingYoloSource, GpuRenderedYoloSource)):
             ensure_single_channel_yolo_preprocess_patch()
         use_custom_cpu_retina = False
         if cpu_retina_masks_enabled():
             use_custom_cpu_retina = bool(ensure_cpu_retina_mask_predictor_patch())
             if not use_custom_cpu_retina:
                 print('Warning: CPU retina predictor patch unavailable; using Ultralytics native retina_masks=True for this source.')
+        else:
+            # v13.3.0 (R9): GPU retina mode — reduce unions at proto resolution inside
+            # construct_result instead of materializing (n, imgsz, imgsz) retina stacks.
+            ensure_gpu_retina_proto_union_predictor_patch()
 
         results = model.predict(
             source=source,
@@ -7549,6 +8002,486 @@ def union_conf_volume_into_volume_inplace(
         flush_array(dst_conf_mm)
 
 
+# --------------------------
+# v13.3.0 (R1/R21) GPU-resident worker rendering
+# --------------------------
+# Each multi-GPU inference worker owns a _GpuWorkerRenderEngine. Two modes:
+#   resident — the uint8 source volume fits in VRAM (mem_get_info headroom check): every
+#              full-frame view family renders ON DEVICE and batches feed TensorRT directly
+#              through the existing _tta_gpu_tensor preprocess contract (no CPU render pool,
+#              no host staging round trip).
+#   stream   — the volume does not fit: radial full-frame tasks still render on the GPU by
+#              streaming transient source t-blocks through an azimuth-chunked gather and
+#              assembling the task's frames into a HOST slab that feeds the unchanged
+#              StreamingYoloVolumeSource/CUDA-staging path (the ~1e12-op GIL-held CPU radial
+#              extraction disappears in both modes); other views use the existing CPU path.
+
+
+def gpu_worker_render_enabled() -> bool:
+    """v13.3.0 (R1/R21): render full-frame views on the worker's GPU. YOLO_TTA_GPU_RENDER=0 disables."""
+    return _env_flag('YOLO_TTA_GPU_RENDER', True)
+
+
+def gpu_worker_render_resident_enabled() -> bool:
+    """v13.3.0 (R21): allow uploading the whole source volume to the device when it fits."""
+    return _env_flag('YOLO_TTA_GPU_RENDER_RESIDENT', True)
+
+
+def gpu_render_reserve_bytes() -> int:
+    """VRAM headroom that must remain free AFTER a resident source-volume upload."""
+    return int(max(1.0, _env_float('YOLO_TTA_GPU_RENDER_RESERVE_GIB', 12.0)) * GIB)
+
+
+def gpu_render_tblock_slices() -> int:
+    """Transient source t-block size for streaming-mode GPU radial prerendering."""
+    return max(16, _env_int('YOLO_TTA_GPU_RENDER_TBLOCK_SLICES', 256))
+
+
+class _GpuWorkerRenderEngine:
+    """Per-worker-process GPU renderer for full-frame prediction sources (v13.3.0 R1/R21)."""
+
+    def __init__(self, device_str: str = 'cuda:0') -> None:
+        import torch  # type: ignore
+        import torch.nn.functional as F  # type: ignore
+        self.torch = torch
+        self.F = F
+        self.device = torch.device(str(device_str))
+        if self.device.type != 'cuda' or not torch.cuda.is_available():
+            raise RuntimeError('GPU render engine requires a CUDA device')
+        # All renders run on a dedicated stream; consumers order via the batch ready event.
+        self._stream = torch.cuda.Stream(device=self.device)
+        self._volume_key: Optional[Tuple[str, Tuple[int, int, int]]] = None
+        self._volume_mm: Optional[np.ndarray] = None
+        self._volume_gpu: Optional[object] = None
+        self._volume_flat: Optional[object] = None
+        self._mode = 'unresolved'
+        self._tilted_plans: 'OrderedDict[Tuple[str, int, int, Tuple[float, ...]], Dict[str, object]]' = OrderedDict()
+        self._fold_cache: Dict[Tuple[int, int], Tuple[object, object, object]] = {}
+        self._warned_fallback = False
+
+    # ---- volume residency ----
+
+    def ensure_volume(self, path: str, shape: Sequence[int], dtype: str = 'uint8') -> str:
+        torch = self.torch
+        shape_t = tuple(int(x) for x in shape)
+        key = (str(path), shape_t)
+        if self._volume_key == key and self._mode != 'unresolved':
+            return self._mode
+        self._volume_key = key
+        self._volume_mm = np.memmap(Path(str(path)), dtype=np.dtype(str(dtype)), mode='r', shape=shape_t)
+        self._volume_gpu = None
+        self._volume_flat = None
+        self._mode = 'stream'
+        nbytes = int(np.prod(shape_t))
+        if gpu_worker_render_resident_enabled():
+            try:
+                free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
+                need = nbytes + gpu_render_reserve_bytes()
+                if int(free_bytes) >= int(need):
+                    vol = torch.empty(shape_t, dtype=torch.uint8, device=self.device)
+                    chunk = 256
+                    for t0 in range(0, shape_t[0], chunk):
+                        t1 = min(shape_t[0], t0 + chunk)
+                        vol[t0:t1].copy_(torch.from_numpy(np.ascontiguousarray(self._volume_mm[t0:t1])))
+                    self._volume_gpu = vol
+                    self._volume_flat = vol.view(-1)
+                    self._mode = 'resident'
+                else:
+                    print(
+                        f'GPU render: source volume NOT resident ({nbytes / GIB:.1f} GiB needed + '
+                        f'{gpu_render_reserve_bytes() / GIB:.1f} GiB reserve > {free_bytes / GIB:.1f} GiB free); '
+                        'radial tasks use streamed GPU prerendering, other views use CPU rendering. '
+                        'A TensorRT engine rebuilt at max batch 1 frees enough VRAM for residency.'
+                    )
+            except Exception as exc:
+                self._volume_gpu = None
+                self._volume_flat = None
+                self._mode = 'stream'
+                print(f'GPU render: resident upload failed ({exc}); falling back to streaming mode.')
+        if self._mode == 'resident':
+            print(
+                f'GPU render: source volume resident on {self.device} '
+                f'({nbytes / GIB:.1f} GiB uploaded); full-frame views render on device.'
+            )
+        return self._mode
+
+    # ---- radial taps / fold (device) ----
+
+    def _radial_taps_gpu(self, view: ViewInfo, angle_deg: float) -> Tuple[object, object]:
+        """Device port of get_radial_sampler + _radial_sampler_flat_taps for one azimuth."""
+        torch = self.torch
+        dev = self.device
+        full_w = int(view.full_w)
+        full_h = int(view.full_h)
+        n_u = int(view.src_w) if int(view.src_w) > 0 else int(view.diameter)
+        a = int(RADIAL_LANCZOS_A)
+        coords = torch.linspace(
+            -float(view.roi_radius), float(view.roi_radius), n_u, dtype=torch.float32, device=dev,
+        )
+        theta = math.radians(float(angle_deg))
+        xs = float(view.center_x) + coords * float(math.cos(theta))
+        ys = float(view.center_y) + coords * float(math.sin(theta))
+        offs = torch.arange(-(a - 1), a + 1, dtype=torch.float32, device=dev)
+        x_pos = xs.floor().unsqueeze(1) + offs.unsqueeze(0)
+        y_pos = ys.floor().unsqueeze(1) + offs.unsqueeze(0)
+        dx = xs.unsqueeze(1) - x_pos
+        dy = ys.unsqueeze(1) - y_pos
+        zero = torch.zeros((), dtype=torch.float32, device=dev)
+        x_w = torch.where(dx.abs() >= float(a), zero, torch.sinc(dx) * torch.sinc(dx / float(a)))
+        y_w = torch.where(dy.abs() >= float(a), zero, torch.sinc(dy) * torch.sinc(dy / float(a)))
+        x_w = x_w * ((x_pos >= 0) & (x_pos < float(full_w))).to(torch.float32)
+        y_w = y_w * ((y_pos >= 0) & (y_pos < float(full_h))).to(torch.float32)
+        # v13.2.4 (task #3): renormalize each sample's separable taps after OOB zeroing.
+        x_sum = x_w.sum(dim=1, keepdim=True)
+        y_sum = y_w.sum(dim=1, keepdim=True)
+        x_w = torch.where(x_sum.abs() > 1e-6, x_w / x_sum, x_w)
+        y_w = torch.where(y_sum.abs() > 1e-6, y_w / y_sum, y_w)
+        x_idx = x_pos.clamp(0.0, float(full_w - 1)).to(torch.int64)
+        y_idx = y_pos.clamp(0.0, float(full_h - 1)).to(torch.int64)
+        flat_idx = (y_idx.unsqueeze(2) * int(full_w) + x_idx.unsqueeze(1)).reshape(n_u, -1)
+        w2d = (y_w.unsqueeze(2) * x_w.unsqueeze(1)).reshape(n_u, -1)
+        return flat_idx, w2d
+
+    def _radial_fold_indices(self, t_dim: int, rows: int) -> Tuple[object, object, object]:
+        torch = self.torch
+        key = (int(t_dim), int(rows))
+        cached = self._fold_cache.get(key)
+        if cached is not None:
+            return cached
+        rf = (np.arange(int(rows), dtype=np.float64) + 0.5) * (float(t_dim) / float(rows)) - 0.5
+        r0 = np.clip(np.floor(rf).astype(np.int64), 0, int(t_dim) - 1)
+        r1 = np.minimum(r0 + 1, int(t_dim) - 1)
+        alpha = np.clip(rf - r0, 0.0, 1.0).astype(np.float32)[:, None]
+        out = (
+            torch.from_numpy(r0).to(self.device),
+            torch.from_numpy(r1).to(self.device),
+            torch.from_numpy(alpha).to(self.device),
+        )
+        self._fold_cache[key] = out
+        return out
+
+    def _radial_project_blocks(self, view: ViewInfo, block2d: object, flat_idx: object, w2d: object) -> object:
+        """(rows, H*W) u8 block -> (rows, u) float32 Lanczos projection."""
+        samples = block2d[:, flat_idx]
+        return (samples.to(self.torch.float32) * w2d.unsqueeze(0)).sum(dim=-1)
+
+    def _render_radial_native_resident(self, view: ViewInfo, frame_idx: int) -> object:
+        torch = self.torch
+        vol = self._volume_gpu
+        t_dim = int(vol.shape[0])
+        rows_out = int(view.src_h)
+        u_len = int(view.src_w) if int(view.src_w) > 0 else int(view.diameter)
+        flat_idx, w2d = self._radial_taps_gpu(view, float(view.azimuths_deg[int(frame_idx)]))
+        vol2d = vol.view(t_dim, -1)
+        proj = torch.empty((t_dim, u_len), dtype=torch.float32, device=self.device)
+        chunk = 512
+        for t0 in range(0, t_dim, chunk):
+            t1 = min(t_dim, t0 + chunk)
+            proj[t0:t1] = self._radial_project_blocks(view, vol2d[t0:t1], flat_idx, w2d)
+        if rows_out == t_dim:
+            return proj
+        r0, r1, alpha = self._radial_fold_indices(t_dim, rows_out)
+        return proj[r0] * (1.0 - alpha) + proj[r1] * alpha
+
+    def prerender_radial_slab(self, view: ViewInfo, slice_start: int, slice_count: int) -> np.ndarray:
+        """v13.3.0 (R1, stream mode): GPU-render one radial task's frames into a host slab.
+
+        Streams transient source t-blocks to the device and evaluates an adaptive azimuth chunk
+        per block (per-azimuth fp16 t-projections stay device-resident between blocks), then
+        folds/quantizes each frame and copies it into a host uint8 slab. VRAM working set is
+        bounded by the t-block plus the azimuth-chunk projections; the volume is re-uploaded
+        ceil(count/az_chunk) times.
+        """
+        torch = self.torch
+        t_dim, full_h, full_w = (int(x) for x in self._volume_mm.shape)
+        rows_out = int(view.src_h)
+        u_len = int(view.src_w) if int(view.src_w) > 0 else int(view.diameter)
+        count = int(slice_count)
+        slab = np.empty((count, rows_out, u_len), dtype=np.uint8)
+        tblock = int(gpu_render_tblock_slices())
+        per_az_bytes = t_dim * u_len * 2 + u_len * RADIAL_LANCZOS_A * RADIAL_LANCZOS_A * 4 * 12 * 2
+        with torch.cuda.stream(self._stream):
+            try:
+                free_bytes, _total = torch.cuda.mem_get_info(self.device)
+            except Exception:
+                free_bytes = 8 * GIB
+            gather_temp = tblock * u_len * (RADIAL_LANCZOS_A * 2) ** 2 * 4
+            budget = max(0, int(free_bytes) - tblock * full_h * full_w - gather_temp - 2 * GIB)
+            az_chunk = int(np.clip(budget // max(1, per_az_bytes), 1, count))
+            # Each azimuth chunk re-streams the whole source volume; a tiny chunk would multiply
+            # that H2D traffic pathologically — hand the task back to the CPU render path instead.
+            if az_chunk < min(8, count):
+                raise RuntimeError(
+                    f'insufficient free VRAM for streamed radial prerender '
+                    f'(az_chunk={az_chunk}, free={free_bytes / GIB:.1f} GiB)'
+                )
+            fold = rows_out != t_dim
+            if fold:
+                r0, r1, alpha = self._radial_fold_indices(t_dim, rows_out)
+            for a0 in range(0, count, az_chunk):
+                a1 = min(count, a0 + az_chunk)
+                proj = torch.zeros((a1 - a0, t_dim, u_len), dtype=torch.float16, device=self.device)
+                taps = [
+                    self._radial_taps_gpu(view, float(view.azimuths_deg[int(slice_start) + i]))
+                    for i in range(a0, a1)
+                ]
+                for t0 in range(0, t_dim, tblock):
+                    t1 = min(t_dim, t0 + tblock)
+                    block = torch.from_numpy(np.ascontiguousarray(self._volume_mm[t0:t1])).to(self.device)
+                    block2d = block.view(t1 - t0, -1)
+                    for j, (flat_idx, w2d) in enumerate(taps):
+                        proj[j, t0:t1] = self._radial_project_blocks(view, block2d, flat_idx, w2d).to(torch.float16)
+                    del block, block2d
+                for j in range(a1 - a0):
+                    pj = proj[j].to(torch.float32)
+                    folded = (pj[r0] * (1.0 - alpha) + pj[r1] * alpha) if fold else pj
+                    frame_u8 = folded.round().clamp_(0.0, 255.0).to(torch.uint8)
+                    slab[a0 + j] = frame_u8.cpu().numpy()
+                del proj, taps
+        return slab
+
+    # ---- tilted (device) ----
+
+    def _tilted_plan_gpu(self, view: ViewInfo, M_grid_to_src: np.ndarray, grid_h: int, grid_w: int) -> Dict[str, object]:
+        torch = self.torch
+        key = _tilted_plan_cache_key(view, M_grid_to_src, int(grid_h), int(grid_w))
+        cached = self._tilted_plans.get(key)
+        if cached is not None:
+            self._tilted_plans.move_to_end(key)
+            return cached
+        plan = get_tilted_render_plan(view, M_grid_to_src, int(grid_h), int(grid_w))
+        t_dim, full_h, full_w = (int(x) for x in self._volume_gpu.shape)
+        base = tilted_base_view_name(view)
+        x64 = plan.x_idx.astype(np.int64)
+        y64 = plan.y_idx.astype(np.int64)
+        if base == 'transverse':
+            inplane = y64 * full_w + x64
+            stride = full_h * full_w
+        elif base == 'sagittal':
+            inplane = y64 * (full_h * full_w) + x64
+            stride = full_w
+        elif base == 'coronal':
+            inplane = y64 * (full_h * full_w) + x64 * full_w
+            stride = 1
+        else:  # pragma: no cover
+            raise ValueError(f'Unsupported Tilted View base: {base}')
+        tan_alpha = float(math.tan(math.radians(float(view.tilt_angle_deg))))
+        info: Dict[str, object] = {
+            'inplane': torch.from_numpy(np.ascontiguousarray(inplane)).to(self.device),
+            'stack_base': torch.from_numpy(
+                np.ascontiguousarray(np.asarray(plan.axis_offset, dtype=np.float32) * np.float32(tan_alpha))
+            ).to(self.device),
+            'valid_xy': torch.from_numpy(np.ascontiguousarray(plan.valid_xy)).to(self.device),
+            'stride': int(stride),
+            'stack_len': int(tilted_stack_axis_length(view)),
+        }
+        self._tilted_plans[key] = info
+        self._tilted_plans.move_to_end(key)
+        while len(self._tilted_plans) > 10:
+            self._tilted_plans.popitem(last=False)
+        return info
+
+    def _render_tilted_frame(self, view: ViewInfo, M_grid_to_src: np.ndarray, grid_h: int, grid_w: int, frame_idx: int) -> object:
+        torch = self.torch
+        info = self._tilted_plan_gpu(view, M_grid_to_src, int(grid_h), int(grid_w))
+        stack_len = int(info['stack_len'])
+        center = float(tilted_frame_center(view, int(frame_idx)))
+        stack_src = info['stack_base'] + center
+        valid = info['valid_xy'] & (stack_src >= 0.0) & (stack_src <= float(stack_len - 1))
+        s0f = stack_src.floor().clamp(0.0, float(stack_len - 1))
+        s1f = (s0f + 1.0).clamp(max=float(stack_len - 1))
+        alpha = stack_src - s0f
+        inplane = info['inplane']
+        stride = int(info['stride'])
+        f0 = torch.take(self._volume_flat, inplane + s0f.to(torch.int64) * stride).to(torch.float32)
+        f1 = torch.take(self._volume_flat, inplane + s1f.to(torch.int64) * stride).to(torch.float32)
+        vals = f0 + alpha * (f1 - f0)
+        return torch.where(valid, vals, torch.zeros((), dtype=torch.float32, device=self.device))
+
+    # ---- cartesian / dispatch ----
+
+    @staticmethod
+    def _affine_is_identity_render(aff: AffineSpec) -> bool:
+        return bool(
+            int(aff.src_w) == int(aff.out_size)
+            and int(aff.src_h) == int(aff.out_size)
+            and int(aff.canvas_w) == int(aff.src_w)
+            and int(aff.canvas_h) == int(aff.src_h)
+            and float(aff.angle_deg) % 360.0 == 0.0
+        )
+
+    def _render_native_plane(self, view: ViewInfo, frame_idx: int) -> object:
+        vol = self._volume_gpu
+        name = str(view.name)
+        if name == 'transverse':
+            return vol[int(frame_idx)].to(self.torch.float32)
+        if name == 'sagittal':
+            return vol[:, int(frame_idx), :].to(self.torch.float32)
+        if name == 'coronal':
+            return vol[:, :, int(frame_idx)].contiguous().to(self.torch.float32)
+        if str(view.family) == 'radial':
+            return self._render_radial_native_resident(view, int(frame_idx))
+        raise ValueError(f'Unsupported view for GPU native plane: {name}')
+
+    def _render_fullframe_frame(self, view: ViewInfo, aff: AffineSpec, frame_idx: int, out_size: int) -> object:
+        if is_tilted_view(view):
+            return self._render_tilted_frame(view, aff.M_out_to_src, int(out_size), int(out_size), int(frame_idx))
+        plane = self._render_native_plane(view, int(frame_idx))
+        if self._affine_is_identity_render(aff):
+            return plane
+        theta = _affine_theta_from_dst_to_src(
+            aff.M_out_to_src, int(plane.shape[0]), int(plane.shape[1]), int(out_size), int(out_size),
+        )
+        grid = _get_cached_affine_grid(theta, int(out_size), int(out_size), self.device)
+        return self.F.grid_sample(
+            plane.reshape(1, 1, int(plane.shape[0]), int(plane.shape[1])),
+            grid, mode='bilinear', padding_mode='zeros', align_corners=False,
+        ).reshape(int(out_size), int(out_size))
+
+    def render_fullframe_batch(
+        self, view: ViewInfo, job: AugJob, frame_indices: Sequence[int], out_size: int, half: bool,
+    ) -> Tuple[object, object]:
+        """Render one normalized BCHW batch on the render stream; returns (tensor, ready event)."""
+        torch = self.torch
+        with torch.cuda.stream(self._stream):
+            frames = [
+                self._render_fullframe_frame(view, job.aff, int(fi), int(out_size))
+                for fi in frame_indices
+            ]
+            batch = torch.stack(frames, dim=0).unsqueeze(1)
+            batch = batch.clamp_(0.0, 255.0).mul_(1.0 / 255.0)
+            if bool(half):
+                batch = batch.to(torch.float16)
+            ready_event = torch.cuda.Event()
+            ready_event.record(self._stream)
+        return batch, ready_event
+
+
+class GpuRenderedYoloSource:
+    """Ultralytics-compatible source whose batches are rendered AND normalized on the GPU.
+
+    v13.3.0 (R21): used by multi-GPU workers in resident mode. __next__ yields
+    (paths, GpuPrefetchedYoloBatch, info) exactly like GpuPrefetchingYoloSource — the batch
+    carries a device-resident normalized BCHW tensor plus a render-stream event, and the
+    patched BasePredictor.preprocess consumes it via the _tta_gpu_tensor contract. The
+    orig-image entries are zero-strided placeholder frames (only their shape is read).
+    """
+
+    def __init__(
+        self,
+        engine: _GpuWorkerRenderEngine,
+        view: ViewInfo,
+        job: AugJob,
+        *,
+        slice_offset: int,
+        num_frames: int,
+        batch_size: int,
+        out_size: int,
+        half: bool,
+        name: str,
+    ) -> None:
+        self.engine = engine
+        self.view = view
+        self.job = job
+        self.slice_offset = int(slice_offset)
+        self.name = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(name)).strip('_') or 'gpu_rendered_volume'
+        self.out_size = int(out_size)
+        self.half = bool(half)
+        self.nf = max(0, int(num_frames))
+        self.bs = max(1, int(batch_size))
+        self.yield_nf = int(math.ceil(float(self.nf) / float(self.bs)) * self.bs) if self.nf > 0 else 0
+        self.synthetic_count = max(0, int(self.yield_nf) - int(self.nf))
+        self.mode = 'image'
+        self.count = 0
+        self._fake_frame = np.broadcast_to(
+            np.zeros((1, 1, 1), dtype=np.uint8), (self.out_size, self.out_size, 1),
+        )
+        # This source bypasses maybe_wrap_source_with_gpu_input_staging (which is where other
+        # sources get registered), so register with Ultralytics' source checker here.
+        ensure_ultralytics_accepts_in_memory_volume_source()
+        try:
+            from ultralytics.data.loaders import SourceTypes  # type: ignore
+            self.source_type = SourceTypes(stream=False, screenshot=False, from_img=True, tensor=False)
+        except Exception:
+            self.source_type = argparse.Namespace(stream=False, screenshot=False, from_img=True, tensor=False)
+
+    def __len__(self) -> int:
+        return int(math.ceil(float(self.nf) / float(self.bs))) if self.nf > 0 else 0
+
+    def __iter__(self) -> 'GpuRenderedYoloSource':
+        self.count = 0
+        return self
+
+    def start(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+    def __next__(self) -> Tuple[List[str], object, List[str]]:
+        if self.count >= self.yield_nf or self.nf <= 0:
+            raise StopIteration
+        start = int(self.count)
+        stop = min(int(self.yield_nf), start + int(self.bs))
+        self.count = int(stop)
+        paths: List[str] = []
+        info: List[str] = []
+        abs_indices: List[int] = []
+        last_real_idx = max(0, int(self.nf) - 1)
+        for idx in range(start, stop):
+            real_idx = int(idx) if int(idx) < int(self.nf) else int(last_real_idx)
+            synthetic = int(idx) >= int(self.nf)
+            suffix = '_synthetic' if synthetic else ''
+            abs_indices.append(int(self.slice_offset) + int(real_idx))
+            paths.append(f'{self.name}_{idx + 1:06d}{suffix}.png')
+            if synthetic:
+                info.append(f'gpu-rendered {self.name} synthetic padded slice {idx + 1}/{self.yield_nf} repeats real slice {real_idx + 1}/{self.nf}: ')
+            else:
+                info.append(f'gpu-rendered {self.name} slice {idx + 1}/{self.nf}: ')
+        gpu_tensor, ready_event = self.engine.render_fullframe_batch(
+            self.view, self.job, abs_indices, int(self.out_size), bool(self.half),
+        )
+        batch = GpuPrefetchedYoloBatch(
+            [self._fake_frame] * len(abs_indices),
+            gpu_tensor=gpu_tensor,
+            ready_event=ready_event,
+            source_label=self.name,
+        )
+        return paths, batch, info
+
+
+_WORKER_GPU_RENDER_ENGINE: Optional[_GpuWorkerRenderEngine] = None
+
+
+def _worker_gpu_render_engine() -> Optional[_GpuWorkerRenderEngine]:
+    return _WORKER_GPU_RENDER_ENGINE
+
+
+def _init_worker_gpu_render_engine(device_str: str = 'cuda:0') -> Optional[_GpuWorkerRenderEngine]:
+    """Create this worker process's GPU render engine (call after the model/CUDA context exists)."""
+    global _WORKER_GPU_RENDER_ENGINE
+    if _WORKER_GPU_RENDER_ENGINE is not None:
+        return _WORKER_GPU_RENDER_ENGINE
+    if not gpu_worker_render_enabled():
+        return None
+    try:
+        import torch  # type: ignore
+        if not bool(torch.cuda.is_available()):
+            return None
+        _WORKER_GPU_RENDER_ENGINE = _GpuWorkerRenderEngine(str(device_str))
+        print('GPU render engine initialized (v13.3.0 R1/R21); volume residency resolves on the first task.')
+    except Exception as exc:
+        print(f'Warning: GPU render engine unavailable ({exc}); worker uses CPU rendering.')
+        _WORKER_GPU_RENDER_ENGINE = None
+    return _WORKER_GPU_RENDER_ENGINE
+
+
+def _slab_frame_renderer(slab: np.ndarray) -> Callable[[int], np.ndarray]:
+    def _render(idx: int) -> np.ndarray:
+        return slab[int(idx)]
+    return _render
+
+
 def _worker_render_callable(volume_rgb: np.ndarray, view: ViewInfo, job: object, kind: str, slice_offset: int = 0) -> Callable[[int], np.ndarray]:
     # local index -> absolute view slice index (sub-range tasks render a contiguous slice window).
     off = int(slice_offset)
@@ -7585,11 +8518,8 @@ def run_prediction_volume_in_worker(model: object, cfg: 'PredictConfig', task: D
     source_mm: Optional[np.memmap] = None
     result_mask: Optional[np.memmap] = None
     result_conf: Optional[np.memmap] = None
-    source: Optional[StreamingYoloVolumeSource] = None
+    source: Optional[object] = None
     try:
-        source_mm = open_existing_gray_memmap(
-            task['source_volume_path'], task['source_shape'], task.get('source_dtype', 'uint8'), mode='r',
-        )
         # v13.2.5 (speed #6): mode 'w+' truncates and re-extends the file, so fresh result
         # memmaps are already zero-filled — the old explicit [:] = 0 dirtied ~GBs of pages
         # per chunk for nothing.
@@ -7597,17 +8527,65 @@ def run_prediction_volume_in_worker(model: object, cfg: 'PredictConfig', task: D
         if task.get('result_conf_path'):
             result_conf = np.memmap(Path(str(task['result_conf_path'])), dtype=np.uint8, mode='w+', shape=result_shape)
 
-        source = StreamingYoloVolumeSource(
-            _worker_render_callable(source_mm, view, job, kind, slice_offset=slice_offset),
-            num_frames=num_frames,
-            name=f"worker-{kind}-{view.name}-{task['job_id']}",
-            batch_size=max(1, int(cfg.batch)),
-            out_size=out_size,
-            render_workers=max(1, int(task.get('render_workers', 1))),
-            prefetch_frames=max(1, int(task.get('prefetch_frames', 1))),
-            autostart=True,
-            shared_executor=None,
-        )
+        # v13.3.0 (R1/R21): render full-frame sources on this worker's GPU when possible —
+        # resident mode feeds device tensors straight to the predictor; streaming mode still
+        # GPU-prerenders radial tasks into a host slab. Any engine failure falls back to the
+        # unchanged CPU render path for this task.
+        gpu_engine = _worker_gpu_render_engine()
+        if gpu_engine is not None and str(kind) == 'fullframe':
+            try:
+                render_mode = gpu_engine.ensure_volume(
+                    str(task['source_volume_path']),
+                    tuple(int(x) for x in task['source_shape']),
+                    str(task.get('source_dtype', 'uint8')),
+                )
+                if render_mode == 'resident':
+                    source = GpuRenderedYoloSource(
+                        gpu_engine,
+                        view,
+                        job,
+                        slice_offset=slice_offset,
+                        num_frames=num_frames,
+                        batch_size=max(1, int(cfg.batch)),
+                        out_size=out_size,
+                        half=bool(cfg.half),
+                        name=f"gpu-render-{kind}-{view.name}-{task['job_id']}",
+                    )
+                elif str(getattr(view, 'family', '')) == 'radial':
+                    slab = gpu_engine.prerender_radial_slab(view, slice_offset, num_frames)
+                    source = StreamingYoloVolumeSource(
+                        _slab_frame_renderer(slab),
+                        num_frames=num_frames,
+                        name=f"worker-radialslab-{view.name}-{task['job_id']}",
+                        batch_size=max(1, int(cfg.batch)),
+                        out_size=out_size,
+                        render_workers=2,
+                        prefetch_frames=max(1, int(task.get('prefetch_frames', 1))),
+                        autostart=True,
+                        shared_executor=None,
+                    )
+            except Exception as exc:
+                print(
+                    f"Warning: GPU render path failed for {view.name}/{task['job_id']} ({exc}); "
+                    'using the CPU render path for this task.'
+                )
+                source = None
+
+        if source is None:
+            source_mm = open_existing_gray_memmap(
+                task['source_volume_path'], task['source_shape'], task.get('source_dtype', 'uint8'), mode='r',
+            )
+            source = StreamingYoloVolumeSource(
+                _worker_render_callable(source_mm, view, job, kind, slice_offset=slice_offset),
+                num_frames=num_frames,
+                name=f"worker-{kind}-{view.name}-{task['job_id']}",
+                batch_size=max(1, int(cfg.batch)),
+                out_size=out_size,
+                render_workers=max(1, int(task.get('render_workers', 1))),
+                prefetch_frames=max(1, int(task.get('prefetch_frames', 1))),
+                autostart=True,
+                shared_executor=None,
+            )
         stats = predict_source_and_accumulate(
             model,
             source,
@@ -7719,6 +8697,18 @@ def _gpu_inference_worker_main(
                 ensure_cpu_retina_mask_predictor_patch()
             except Exception:
                 pass
+        else:
+            # v13.3.0 (R9): GPU retina mode — reduce per-frame unions at proto resolution.
+            try:
+                ensure_gpu_retina_proto_union_predictor_patch()
+            except Exception:
+                pass
+        # v13.3.0 (R1/R21): per-worker GPU render engine (volume residency resolves lazily on
+        # the first task, once the shared source volume exists and VRAM headroom is known).
+        try:
+            _init_worker_gpu_render_engine('cuda:0')
+        except Exception as _render_engine_exc:
+            print(f'Warning: GPU render engine init failed ({_render_engine_exc}); worker uses CPU rendering.')
         result_queue.put({'type': 'ready', 'gpu_index': int(gpu_index), 'pid': int(os.getpid())})
     except Exception as exc:  # pragma: no cover - worker init failure surfaced to main
         import traceback
@@ -15684,9 +16674,11 @@ def main() -> None:
     if single_angle_gpu_fastpath_active:
         print(
             'v13.1.0 single-angle GPU retina fast path active: retina masks are flattened, '
-            f'confidence-filtered (--min_conf={float(args.min_conf):.3f}), warped to view-native space, '
-            f'and --min_radius={float(args.min_radius):g} + 2D hole fill are applied on the GPU before '
-            'the PCIe copy (cupy required for the on-GPU --min_radius/hole-fill; CPU fallback otherwise).'
+            f'confidence-filtered (--min_conf={float(args.min_conf):.3f}), warped to view-native space '
+            f'(v13.3.0 R8: identity warps skipped, grids cached), and --min_radius={float(args.min_radius):g} '
+            'is applied on the GPU before the PCIe copy when positive (cupy required; CPU fallback '
+            'otherwise). v13.3.0 (R8): the per-frame GPU 2D hole fill is removed — the final per-view '
+            'volume pass performs the hole fill once, in spec order.'
         )
     elif str(retina_processor).strip().lower() == 'gpu':
         print(
@@ -15929,10 +16921,22 @@ def main() -> None:
         )
     if single_angle_gpu_fastpath_active:
         spec_notes.append(
-            'v13.1.0 (#2.3): single-angle GPU fast path. YOLO -> flatten -> --min_conf -> warp -> '
-            '--min_radius -> 2D hole fill all run on the GPU (--min_radius/hole-fill via cupy; CPU '
-            'fallback if cupy is unavailable), then one finished view-native plane is sent to the CPU for '
-            'interpolation.'
+            'v13.1.0 (#2.3) + v13.3.0 (R8): single-angle GPU fast path. YOLO -> proto-resolution union '
+            '(R9) -> --min_conf -> warp (identity-skipped/grid-cached) -> --min_radius (cupy, only when '
+            'positive) run on the GPU, then one finished view-native plane is sent to the CPU. The '
+            'per-frame GPU 2D hole fill is removed: the final per-view volume pass performs the hole '
+            'fill once, preserving the spec order --min_conf -> --min_radius -> hole fill.'
+        )
+    if str(retina_processor).strip().lower() == 'gpu':
+        spec_notes.append(
+            'v13.3.0 (R9/R18/R1/R21): GPU retina unions are reduced at PROTO resolution inside a patched '
+            'construct_result (one plane upsampled per frame instead of an (n, imgsz, imgsz) retina stack; '
+            'YOLO_TTA_GPU_PROTO_UNION=0 restores the native path); the GPU postprocess tail runs on '
+            'per-thread side CUDA streams with pinned D2H staging (YOLO_TTA_GPU_POSTPROCESS_STREAM / '
+            'YOLO_TTA_GPU_POSTPROCESS_PINNED); and multi-GPU workers render full-frame views on their own '
+            'GPU when the source volume fits resident (YOLO_TTA_GPU_RENDER / YOLO_TTA_GPU_RENDER_RESIDENT '
+            '/ YOLO_TTA_GPU_RENDER_RESERVE_GIB), with radial tasks GPU-prerendered from streamed t-blocks '
+            'otherwise (YOLO_TTA_GPU_RENDER_TBLOCK_SLICES).'
         )
     if preprocess_streaming_active:
         spec_notes.append(
