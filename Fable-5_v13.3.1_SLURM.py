@@ -2,7 +2,46 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the v13.3.0_SLURM implementation. It is derived from v13.2.5_SLURM by COPY + surgical
+This is the v13.3.1_SLURM implementation. It is derived from v13.3.0_SLURM by COPY + surgical
+edits, implementing eight approved speed items from SPEED_REVIEW_Fable-5_v13.2.5
+(R3, R4, R7b, R12, R16, R19, R24, R25):
+  - v13.3.1 (R3) scratch memmap msync is OFF by default: flush_array() is now gated behind
+    YOLO_TTA_MSYNC (default 0). Same-host page-cache coherence makes every scratch msync
+    unnecessary (the v13.2.5 speed #6 rationale) — but close_memmap_array still flushed before
+    closing, so every worker task ended with a blocking multi-GB msync while its GPU idled, and the
+    main scheduler msync'd the whole 20-57 GB per-view union after every 512-slice chunk union.
+    Kernel writeback still persists kept artifacts; set YOLO_TTA_MSYNC=1 to restore synchronous
+    flushes everywhere.
+  - v13.3.1 (R4) single-angle multi-GPU workers write their result slice windows DIRECTLY into
+    the shared per-view baseline union memmap (windows are disjoint per task): the per-task
+    result file + reopen + OR-union + unlink round trip (~3 extra full volume passes per view)
+    and the scheduler-thread union serialization are deleted. The per-view union (and confmap
+    when --min_conf > 0) is forced disk-backed and pre-created at task-build time in this mode.
+    Multi-angle runs keep the legacy result-file path. YOLO_TTA_MGPU_DIRECT_UNION=0 disables.
+  - v13.3.1 (R7b) NRRD payload writes are pipelined: the payload z-chunk is bounded
+    (YOLO_TTA_NRRD_Z_CHUNK_SLICES, default 128 — was the entire ~18 GiB volume on large-RAM
+    nodes), each block is decoded/restored by a small GIL-releasing thread pool
+    (YOLO_TTA_NRRD_FILL_WORKERS, default cpu/8) instead of one thread, and blocks are written to
+    pigz from a one-thread writer with double buffering so decode and compression overlap.
+  - v13.3.1 (R12) multi-GPU runs allocate the decoded/cube-resized processing volume
+    DISK-BACKED from the start (page cache keeps it RAM-speed), so
+    _ensure_source_volume_file_backed no longer copies ~27.5 GB to scratch (plus double msync)
+    between decode completion and the first GPU task. The cube-resize decision is now computed
+    before decode (it only needs ffprobe dimensions).
+  - v13.3.1 (R16) foreground scans stop copying: _volume_has_foreground tests raw uint8 slices
+    (no per-slice bool cast copy), the raw-bbox encoder derives the nonzero bbox from row/column
+    reductions on the raw slice and binarizes only the crop (deleting the full-slice bool cast
+    per encoded slice), and interpolation bridge-delta layers skip the has-foreground volume
+    scan entirely (the pass's added_voxels stat already answers it).
+  - v13.3.1 (R19) the interpolation merge step only visits slices the bridge render schedule
+    actually touched, instead of np.any-scanning every slice of the full bridge volume
+    (~25 GB of reads per pass per view for mostly-empty slices).
+  - v13.3.1 (R24) the default NRRD pigz level drops 6 -> 3 (binary masks lose almost nothing;
+    deflate gets 2-3x faster). YOLO_TTA_NRRD_PIGZ_LEVEL still overrides.
+  - v13.3.1 (R25) low-quality MP4 encodes drop x264 -preset slow -> medium
+    (YOLO_TTA_X264_PRESET overrides), freeing tail CPU for the NRRD writers.
+
+The v13.3.0 base was derived from v13.2.5_SLURM by COPY + surgical
 edits, implementing four approved GPU-offload speed items from SPEED_REVIEW_Fable-5_v13.2.5
 (R1, R8, R9, R18, R21) targeting the standard 4-GPU radial+tilted command:
   - v13.3.0 (R21/R1) GPU-resident worker rendering: each multi-GPU inference worker owns a
@@ -861,6 +900,18 @@ def main_process_worker_budget(gpu_device_count: int, multi_gpu_active: bool) ->
     return max(1, total - reserved)
 
 
+def mgpu_direct_union_enabled() -> bool:
+    """v13.3.1 (R4): single-angle multi-GPU workers write straight into the per-view union.
+
+    With exactly one --angle, every (view, slice-window) task contributes exactly once and the
+    windows are disjoint, so the per-task result file + reopen + OR-union + unlink round trip is
+    a pure copy: workers open the shared, pre-zeroed per-view union memmap 'r+' and write their
+    window directly (same-host page-cache coherence). Multi-angle runs keep the legacy result
+    files (their windows overlap across angles). YOLO_TTA_MGPU_DIRECT_UNION=0 disables.
+    """
+    return _env_flag('YOLO_TTA_MGPU_DIRECT_UNION', True)
+
+
 def resolve_parent_interpolation_worker_allocation(
     worker_budget: int,
     parent_postprocess_workers: int,
@@ -914,8 +965,24 @@ def array_nbytes(shape: Sequence[int], dtype: np.dtype | str | type) -> int:
     return int(total) * int(dtype_obj.itemsize)
 
 
-def flush_array(arr: object) -> None:
+def memmap_msync_enabled() -> bool:
+    """v13.3.1 (R3): synchronous scratch-memmap msync is opt-in.
+
+    Every flush_array call in this pipeline targets same-host scratch memmaps, where the
+    unified page cache already makes writes visible to sibling threads/processes without
+    msync (the v13.2.5 speed #6 rationale), and kernel writeback persists kept artifacts.
+    The old behavior — a blocking msync of multi-GB mappings at the end of every stage,
+    every worker-task close, and every per-chunk union — is restored with YOLO_TTA_MSYNC=1.
+    """
+    return _env_flag('YOLO_TTA_MSYNC', False)
+
+
+def flush_array(arr: object, *, force: bool = False) -> None:
     if arr is None:
+        return
+    # v13.3.1 (R3): no-op unless synchronous msync is explicitly requested (or forced by a
+    # caller with a genuine durability boundary).
+    if not force and not memmap_msync_enabled():
         return
 
     try:
@@ -8516,16 +8583,37 @@ def run_prediction_volume_in_worker(model: object, cfg: 'PredictConfig', task: D
     result_shape = (int(slice_count), int(view.src_h), int(view.src_w))
 
     source_mm: Optional[np.memmap] = None
-    result_mask: Optional[np.memmap] = None
-    result_conf: Optional[np.memmap] = None
+    result_mask: Optional[np.ndarray] = None
+    result_conf: Optional[np.ndarray] = None
+    result_mask_full: Optional[np.memmap] = None
+    result_conf_full: Optional[np.memmap] = None
     source: Optional[object] = None
     try:
-        # v13.2.5 (speed #6): mode 'w+' truncates and re-extends the file, so fresh result
-        # memmaps are already zero-filled — the old explicit [:] = 0 dirtied ~GBs of pages
-        # per chunk for nothing.
-        result_mask = np.memmap(Path(str(task['result_mask_path'])), dtype=np.uint8, mode='w+', shape=result_shape)
-        if task.get('result_conf_path'):
-            result_conf = np.memmap(Path(str(task['result_conf_path'])), dtype=np.uint8, mode='w+', shape=result_shape)
+        if str(task.get('result_mode', 'file')) == 'direct_union':
+            # v13.3.1 (R4): single-angle tasks accumulate straight into the shared per-view
+            # union memmap, which the scheduler created zeroed BEFORE enqueueing tasks. Slice
+            # windows are disjoint per task, and same-host page-cache coherence makes the writes
+            # visible to the main process without msync. 'r+' is required — 'w+' would truncate
+            # the shared file under the other workers.
+            union_shape = (
+                int(task.get('union_num_slices', slice_count)), int(view.src_h), int(view.src_w),
+            )
+            result_mask_full = np.memmap(
+                Path(str(task['result_mask_path'])), dtype=np.uint8, mode='r+', shape=union_shape,
+            )
+            result_mask = result_mask_full[slice_offset:slice_offset + slice_count]
+            if task.get('result_conf_path'):
+                result_conf_full = np.memmap(
+                    Path(str(task['result_conf_path'])), dtype=np.uint8, mode='r+', shape=union_shape,
+                )
+                result_conf = result_conf_full[slice_offset:slice_offset + slice_count]
+        else:
+            # v13.2.5 (speed #6): mode 'w+' truncates and re-extends the file, so fresh result
+            # memmaps are already zero-filled — the old explicit [:] = 0 dirtied ~GBs of pages
+            # per chunk for nothing.
+            result_mask = np.memmap(Path(str(task['result_mask_path'])), dtype=np.uint8, mode='w+', shape=result_shape)
+            if task.get('result_conf_path'):
+                result_conf = np.memmap(Path(str(task['result_conf_path'])), dtype=np.uint8, mode='w+', shape=result_shape)
 
         # v13.3.0 (R1/R21): render full-frame sources on this worker's GPU when possible —
         # resident mode feeds device tensors straight to the predictor; streaming mode still
@@ -8619,7 +8707,7 @@ def run_prediction_volume_in_worker(model: object, cfg: 'PredictConfig', task: D
                 source.close()
             except Exception:
                 pass
-        for _mm in (result_mask, result_conf, source_mm):
+        for _mm in (result_mask, result_conf, result_mask_full, result_conf_full, source_mm):
             if _mm is not None:
                 try:
                     close_memmap_array(_mm)
@@ -11972,6 +12060,10 @@ def interpolate_view_volume_pass_inplace(
                 desc='Interpolation: render bridges',
             )
             added_voxels = int(np.sum(added_counts, dtype=np.int64))
+            # v13.3.1 (R19): bridge voxels can only exist on slices the render schedule touched;
+            # merge (and delta-capture) only those instead of np.any-scanning every slice of the
+            # full bridge volume (a mostly-empty ~volume-sized read per pass per view).
+            scheduled_slices = [int(z) for z in range(int(mask_mm.shape[0])) if schedule[int(z)]]
             del schedule
             del added_counts
 
@@ -11983,18 +12075,19 @@ def interpolate_view_volume_pass_inplace(
                 Path(bridge_delta_path).parent.mkdir(parents=True, exist_ok=True)
                 delta_mm = np.memmap(Path(bridge_delta_path), dtype=np.uint8, mode='w+', shape=mask_mm.shape)
 
-            def _merge_slice(z: int) -> None:
-                bridge_slice = np.asarray(bridge_mm[int(z)])
+            def _merge_slice(list_idx: int) -> None:
+                z = int(scheduled_slices[int(list_idx)])
+                bridge_slice = np.asarray(bridge_mm[z])
                 if np.any(bridge_slice):
                     if delta_mm is not None:
-                        mask_slice = np.asarray(mask_mm[int(z)])
-                        delta_mm[int(z), :, :] = np.where(mask_slice == 0, bridge_slice, np.uint8(0))
-                    mask_mm[int(z), :, :] |= bridge_slice
+                        mask_slice = np.asarray(mask_mm[z])
+                        delta_mm[z, :, :] = np.where(mask_slice == 0, bridge_slice, np.uint8(0))
+                    mask_mm[z, :, :] |= bridge_slice
 
             parallel_for_indices(
-                int(mask_mm.shape[0]),
+                len(scheduled_slices),
                 _merge_slice,
-                max_workers=render_workers,
+                max_workers=choose_slice_parallel_workers(int(render_workers), max(1, len(scheduled_slices))),
                 desc='Interpolation: merge bridges',
             )
             flush_array(mask_mm)
@@ -12429,17 +12522,23 @@ class RawBBoxMaskStore:
 
 
 def _encode_bool_mask_slice_payload(idx: int, mask_bool: np.ndarray) -> RawBBoxSlicePayload:
-    mask_arr = np.asarray(mask_bool, dtype=bool)
-    if mask_arr.size == 0 or not np.any(mask_arr):
+    # v13.3.1 (R16): scan the slice as handed in (uint8 or bool — any nonzero is foreground)
+    # instead of casting the whole slice to bool first (a full-slice copy per encoded slice
+    # across >200 G voxels per run). The row reduction doubles as the emptiness test, and the
+    # binarizing compare+copy happens only inside the nonzero bbox crop.
+    mask_arr = np.asarray(mask_bool)
+    if mask_arr.size == 0:
         return RawBBoxSlicePayload(idx=int(idx), is_empty=True)
 
     rows = np.any(mask_arr, axis=1)
+    if not np.any(rows):
+        return RawBBoxSlicePayload(idx=int(idx), is_empty=True)
     cols = np.any(mask_arr, axis=0)
     y0 = int(np.argmax(rows))
     y1 = int(rows.size - np.argmax(rows[::-1]))
     x0 = int(np.argmax(cols))
     x1 = int(cols.size - np.argmax(cols[::-1]))
-    crop = np.ascontiguousarray(mask_arr[y0:y1, x0:x1], dtype=np.uint8)
+    crop = np.ascontiguousarray(np.asarray(mask_arr[y0:y1, x0:x1]) > 0, dtype=np.uint8)
     payload = crop.tobytes(order='C')
     return RawBBoxSlicePayload(
         idx=int(idx),
@@ -12455,8 +12554,9 @@ def _encode_bool_mask_slice_payload(idx: int, mask_bool: np.ndarray) -> RawBBoxS
 
 
 def _encode_ctile_slice(idx: int, tile_mask_mm: np.ndarray) -> RawBBoxSlicePayload:
-    mask_bool = np.asarray(tile_mask_mm[int(idx)], dtype=np.uint8) > 0
-    return _encode_bool_mask_slice_payload(int(idx), mask_bool)
+    # v13.3.1 (R16): the encoder handles raw uint8 slices directly; the old `>0` here was
+    # another full-slice compare+copy per slice.
+    return _encode_bool_mask_slice_payload(int(idx), tile_mask_mm[int(idx)])
 
 
 def _write_raw_bbox_payload_store(
@@ -12780,8 +12880,10 @@ def close_raw_store_or_memmap_volume(volume: object, *, keep_temp: bool = True) 
 
 
 def _volume_has_foreground(mask_mm: np.ndarray) -> bool:
+    # v13.3.1 (R16): np.any tests the raw uint8 slice directly — the old dtype=bool asarray
+    # made a full-slice cast COPY per slice (~25 GB of alloc+copy for a near-empty volume).
     for idx in range(int(mask_mm.shape[0])):
-        if np.any(np.asarray(mask_mm[int(idx)], dtype=bool)):
+        if np.any(np.asarray(mask_mm[int(idx)])):
             return True
     return False
 
@@ -12982,9 +13084,15 @@ def materialize_nrrd_view_layer(
     description: str = '',
     temp_dir: Path,
     workers: int = 1,
+    known_has_foreground: Optional[bool] = None,
 ) -> Optional[NrrdLayerRef]:
     """Persist a view-derived layer in orthogonal processing geometry for the NRRD writer."""
-    if not _volume_has_foreground(view_volume_mm):
+    # v13.3.1 (R16): callers that already know whether the volume has foreground (e.g. the
+    # interpolation pass's added_voxels stat for bridge deltas) skip the per-slice scan.
+    if known_has_foreground is not None:
+        if not bool(known_has_foreground):
+            return None
+    elif not _volume_has_foreground(view_volume_mm):
         return None
 
     key = _nrrd_layer_key(
@@ -13102,8 +13210,13 @@ def materialize_nrrd_global_layer(
     description: str = '',
     temp_dir: Path,
     workers: int = 1,
+    known_has_foreground: Optional[bool] = None,
 ) -> Optional[NrrdLayerRef]:
-    if not _volume_has_foreground(volume_mm):
+    # v13.3.1 (R16): see materialize_nrrd_view_layer.
+    if known_has_foreground is not None:
+        if not bool(known_has_foreground):
+            return None
+    elif not _volume_has_foreground(volume_mm):
         return None
     view_name = 'global'
     key = _nrrd_layer_key(
@@ -13336,6 +13449,8 @@ def prepare_view_volume_after_fullframe(
                         description='Voxels added by this full-frame interpolation pass only.',
                         temp_dir=temp_dir,
                         workers=int(slice_workers),
+                        # v13.3.1 (R16): the pass already counted its added voxels.
+                        known_has_foreground=int(stats_local.get('added_voxels', 0)) > 0,
                     )
                     if layer_ref is not None:
                         nrrd_layers.append(layer_ref)
@@ -14169,6 +14284,8 @@ def finalize_consolidated_tile_volume_for_parent(
                         description='Voxels added by this consolidated tile interpolation pass. Bridges are generated after accepted tile masks are consolidated, so they are not attributed back to parent-mask vs parent-bridge acceptance categories.',
                         temp_dir=temp_dir,
                         workers=int(slice_workers),
+                        # v13.3.1 (R16): the pass already counted its added voxels.
+                        known_has_foreground=int(stats_local.get('added_voxels', 0)) > 0,
                     )
                     if layer_ref is not None:
                         nrrd_layers.append(layer_ref)
@@ -14910,8 +15027,33 @@ def slicer_segmentation_header_fields(
 
 
 def nrrd_pigz_compresslevel() -> int:
-    """Compression level passed to pigz for NRRD gzip-encoding."""
-    return int(np.clip(_env_int('YOLO_TTA_NRRD_PIGZ_LEVEL', 6), 0, 9))
+    """Compression level passed to pigz for NRRD gzip-encoding.
+
+    v13.3.1 (R24): default 6 -> 3. The payloads are sparse binary masks whose deflate ratio
+    barely moves between levels, while level 3 compresses 2-3x faster per core.
+    """
+    return int(np.clip(_env_int('YOLO_TTA_NRRD_PIGZ_LEVEL', 3), 0, 9))
+
+
+def nrrd_z_chunk_cap() -> int:
+    """v13.3.1 (R7b): cap on one NRRD payload block, in output t-slices.
+
+    The RAM-scaled buffer previously resolved to the WHOLE payload on large-RAM nodes, so the
+    writer filled an ~payload-sized block in one thread before pigz saw a byte. Bounded blocks
+    let the (parallel) fill and pigz compression pipeline; two blocks per in-flight write are
+    resident (double buffering).
+    """
+    return max(1, _env_int('YOLO_TTA_NRRD_Z_CHUNK_SLICES', 128))
+
+
+def nrrd_fill_workers() -> int:
+    """v13.3.1 (R7b): threads filling one NRRD payload block.
+
+    The per-slice fill work (raw-bbox store decode memcpys, cv2 restore resizes) releases the
+    GIL, so a small pool per write scales; the sink runs up to nrrd_layer_sink_workers() writes
+    concurrently, so the default keeps total fill threads near half the visible CPUs.
+    """
+    return max(1, _env_int('YOLO_TTA_NRRD_FILL_WORKERS', max(2, _cpu_count() // 8)))
 
 
 def nrrd_pigz_threads() -> int:
@@ -14964,7 +15106,9 @@ def _nrrd_full_slice_z_chunk(layer_count: int, width: int, height: int, depth: i
     target = nrrd_stream_buffer_bytes(full_payload_bytes)
     if target < full_slice_bytes:
         return 1
-    return max(1, min(int(depth), int(target // full_slice_bytes)))
+    # v13.3.1 (R7b): bound the block so fill and compression pipeline instead of the writer
+    # materializing (and single-threadedly filling) the entire payload before pigz starts.
+    return max(1, min(int(depth), int(target // full_slice_bytes), int(nrrd_z_chunk_cap())))
 
 
 def nrrd_madvise_dontneed_interval() -> int:
@@ -15670,61 +15814,89 @@ def _write_one_decomposed_nrrd_layer_payload(
                     _madvise_array_mmap(src, 'MADV_DONTNEED')
             return
 
+        # v13.3.1 (R7b): shared bounded-block streamer — each block is filled by a small
+        # GIL-releasing thread pool (store decode memcpys / cv2 restores) and handed to a
+        # one-thread writer with double buffering, so decode/restore overlaps the pigz
+        # compression instead of a single thread filling the whole payload before pigz starts.
+        fill_workers = int(nrrd_fill_workers())
+
+        def _stream_filled_blocks(fill_one: Callable[[int, np.ndarray], None], *, madvise_src: bool) -> None:
+            local_z_chunk = int(z_chunk_i)
+            buffers: List[np.ndarray] = []
+            for _ in range(2):
+                try:
+                    buffers.append(np.empty((int(local_z_chunk), int(out_h), int(out_w)), dtype=np.uint8, order='C'))
+                except MemoryError:
+                    break
+            if not buffers:
+                if int(local_z_chunk) != 1:
+                    print(
+                        f'Warning: NRRD payload block allocation failed for layer {int(layer_idx)}; '
+                        'falling back to one output t-slice at a time.'
+                    )
+                local_z_chunk = 1
+                buffers = [np.empty((1, int(out_h), int(out_w)), dtype=np.uint8, order='C')]
+
+            writer_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='nrrd-payload-write')
+            pending: Optional[Future] = None
+            try:
+                for block_idx, z0 in enumerate(range(0, out_t, int(local_z_chunk))):
+                    z1 = min(out_t, int(z0) + int(local_z_chunk))
+                    z_count = int(z1 - z0)
+                    if len(buffers) < 2 and pending is not None:
+                        # Single-buffer fallback: the previous write must finish before refill.
+                        pending.result()
+                        pending = None
+                    block = buffers[int(block_idx) % len(buffers)][:z_count, :, :]
+
+                    if int(fill_workers) > 1 and int(z_count) > 1:
+                        def _fill(zi: int, _z0: int = int(z0), _block: np.ndarray = block) -> None:
+                            fill_one(int(_z0 + int(zi)), _block[int(zi)])
+                        parallel_for_indices_chunked(
+                            int(z_count),
+                            _fill,
+                            max_workers=min(int(fill_workers), int(z_count)),
+                            desc='',
+                            show_progress=False,
+                            target_chunks_per_worker=1,
+                        )
+                    else:
+                        for zi in range(int(z_count)):
+                            fill_one(int(z0 + zi), block[int(zi)])
+
+                    if pending is not None:
+                        pending.result()
+                    pending = writer_pool.submit(payload_writer.write, memoryview(block).cast('B'))
+                    if pbar is not None:
+                        pbar.update(int(z_count))
+                    if bool(madvise_src) and madvise_interval > 0 and (int(z1) % int(madvise_interval) == 0):
+                        _madvise_array_mmap(src, 'MADV_DONTNEED')
+                if pending is not None:
+                    pending.result()
+                    pending = None
+            finally:
+                if pending is not None:
+                    try:
+                        pending.result()
+                    except Exception:
+                        pass
+                writer_pool.shutdown(wait=True)
+
         if bool(raw_store_native_stream):
             # Target_Dummy layout keeps the list axis last, so one complete layer is a
             # native (t,Y,X) byte block.  For cvol/ctile sources, fill the reusable block
             # directly from each slice bbox payload instead of allocating one full decoded
             # zeros slice per frame and copying it again into the NRRD write buffer.
-            local_z_chunk = int(z_chunk_i)
-            try:
-                layer_chunk = np.empty((int(local_z_chunk), int(out_h), int(out_w)), dtype=np.uint8, order='C')
-            except MemoryError:
-                if int(local_z_chunk) != 1:
-                    print(
-                        f'Warning: requested raw-bbox NRRD chunk allocation failed for layer {int(layer_idx)}; '
-                        'falling back to one output t-slice at a time.'
-                    )
-                local_z_chunk = 1
-                layer_chunk = np.empty((1, int(out_h), int(out_w)), dtype=np.uint8, order='C')
-
-            for z0 in range(0, out_t, int(local_z_chunk)):
-                z1 = min(out_t, int(z0) + int(local_z_chunk))
-                z_count = int(z1 - z0)
-                block = layer_chunk[:z_count, :, :]
-                for zi, z in enumerate(range(int(z0), int(z1))):
-                    src.fill_decoded_slice_into(int(z), block[int(zi)])
-                if block.flags['C_CONTIGUOUS']:
-                    payload_writer.write(memoryview(block).cast('B'))
-                else:
-                    payload_writer.write(np.ascontiguousarray(block).tobytes(order='C'))
-                if pbar is not None:
-                    pbar.update(int(z_count))
+            _stream_filled_blocks(
+                lambda z, out2d: src.fill_decoded_slice_into(int(z), out2d),
+                madvise_src=False,
+            )
             return
 
-        local_z_chunk = int(z_chunk_i)
-        try:
-            layer_chunk = np.empty((int(local_z_chunk), int(out_h), int(out_w)), dtype=np.uint8, order='C')
-        except MemoryError:
-            if int(local_z_chunk) != 1:
-                print(
-                    f'Warning: requested one-layer NRRD chunk allocation failed for layer {int(layer_idx)}; '
-                    'falling back to one output t-slice at a time.'
-                )
-            local_z_chunk = 1
-            layer_chunk = np.empty((1, int(out_h), int(out_w)), dtype=np.uint8, order='C')
+        def _fill_restored(z: int, out2d: np.ndarray) -> None:
+            np.copyto(out2d, np.asarray(_read_layer_slice_in_output_shape(src, output_shape, int(z)), dtype=np.uint8))
 
-        for z0 in range(0, out_t, int(local_z_chunk)):
-            z1 = min(out_t, int(z0) + int(local_z_chunk))
-            z_count = int(z1 - z0)
-            block = layer_chunk[:z_count, :, :]
-            for zi, z in enumerate(range(int(z0), int(z1))):
-                slice_yx = _read_layer_slice_in_output_shape(src, output_shape, int(z))
-                block[int(zi), :, :] = np.asarray(slice_yx, dtype=np.uint8)
-            payload_writer.write(block.tobytes(order='C'))
-            if pbar is not None:
-                pbar.update(int(z_count))
-            if madvise_interval > 0 and (int(z1) % int(madvise_interval) == 0):
-                _madvise_array_mmap(src, 'MADV_DONTNEED')
+        _stream_filled_blocks(_fill_restored, madvise_src=True)
     finally:
         if src is not None:
             _madvise_array_mmap(src, 'MADV_DONTNEED')
@@ -16057,6 +16229,16 @@ def resize_binary_mask_volume_to_shape(
     return out_mm
 
 
+def x264_preset() -> str:
+    """v13.3.1 (R25): x264 preset for the low-quality MP4 writers.
+
+    'slow' cost 2-4x the encode CPU of 'medium' for marginal size gain on these
+    distribution-quality copies, competing with the NRRD tail for cores.
+    """
+    preset = os.environ.get('YOLO_TTA_X264_PRESET', '').strip().lower()
+    return preset or 'medium'
+
+
 def ffmpeg_h264_rgb_writer(out_path: Path, width: int, height: int, fps: float) -> subprocess.Popen:
     return ffmpeg_rawvideo_writer(
         out_path=out_path,
@@ -16066,7 +16248,7 @@ def ffmpeg_h264_rgb_writer(out_path: Path, width: int, height: int, fps: float) 
         pix_fmt_in='rgb24',
         codec='libx264',
         pix_fmt_out='yuv420p',
-        codec_args=['-preset', 'slow'],
+        codec_args=['-preset', x264_preset()],
     )
 
 
@@ -16079,7 +16261,7 @@ def ffmpeg_h264_gray_writer(out_path: Path, width: int, height: int, fps: float)
         pix_fmt_in='gray',
         codec='libx264',
         pix_fmt_out='yuv420p',
-        codec_args=['-preset', 'slow'],
+        codec_args=['-preset', x264_preset()],
     )
 
 
@@ -16688,6 +16870,19 @@ def main() -> None:
     # v13.0.0: under multi-GPU each inference worker is its own process pinned (via
     # CUDA_VISIBLE_DEVICES) to a single physical GPU exposed as cuda:0, so CUDA input staging is
     # device-safe per worker and is left at its default. The main process performs no inference.
+    # v13.3.1 (R4): with exactly one --angle, worker slice windows are disjoint per view, so
+    # workers write results straight into the shared per-view union memmap (pre-created disk-
+    # backed at task-build time) instead of per-task result files that the scheduler re-reads.
+    mgpu_direct_union_active = bool(
+        multi_gpu_active and len(angles) == 1 and mgpu_direct_union_enabled()
+    )
+    if mgpu_direct_union_active:
+        print(
+            'v13.3.1 (R4) multi-GPU direct union writes active: single-angle worker tasks write '
+            'their disjoint slice windows straight into the disk-backed per-view union '
+            '(no per-task result files, no scheduler-side OR pass). '
+            'Set YOLO_TTA_MGPU_DIRECT_UNION=0 to restore the legacy result-file path.'
+        )
 
     if args.min_conf > 0 and args.min_conf < args.conf:
         raise ValueError('--min_conf must be equal to or greater than --conf')
@@ -16785,6 +16980,17 @@ def main() -> None:
 
     preprocess_streaming_active = bool(streaming_preprocess_enabled())
     vol_path = temp_dir / 'input_volume.gray8.dat'
+    # v13.3.1 (R12): the cube-resize decision only needs the ffprobe dimensions, so resolve it
+    # BEFORE decode. In multi-GPU runs the worker processes read the processing volume from a
+    # file, so whichever array becomes the processing volume (the cube-resize output, or the
+    # decode output when no resize applies) is allocated DISK-BACKED from the start — the page
+    # cache keeps it RAM-speed and _ensure_source_volume_file_backed reuses it directly instead
+    # of copying the whole volume to scratch between decode completion and the first GPU task.
+    input_processing_shape = (int(input_T), int(input_H), int(input_W))
+    legacy_cube_shape = compute_cube_resize_shape(input_T, input_H, input_W, tolerance=0.05)
+    processing_mode = processing_volume_mode()
+    cube_resize_will_apply = bool(should_resize_to_processing_cube(input_processing_shape, legacy_cube_shape))
+    decode_prefer_memory = not (bool(multi_gpu_active) and not cube_resize_will_apply)
     if preprocess_streaming_active:
         print(
             'v12.2.15 streaming preprocessing active: ffmpeg decode returns its destination array immediately; '
@@ -16797,7 +17003,7 @@ def main() -> None:
             width=input_W,
             height=input_H,
             overwrite=False,
-            prefer_memory=True,
+            prefer_memory=decode_prefer_memory,
         )
     else:
         input_volume_rgb = decode_video_to_memmap_gray8(
@@ -16807,16 +17013,13 @@ def main() -> None:
             width=input_W,
             height=input_H,
             overwrite=False,
-            prefer_memory=True,
+            prefer_memory=decode_prefer_memory,
         )
     (temp_dir / 'input_volume.meta.json').write_text(
         json.dumps({'shape': [input_T, input_H, input_W], 'dtype': 'uint8', 'channels': 1, 'fps': fps, 'streaming_preprocess': bool(preprocess_streaming_active)}, indent=2)
     )
 
-    input_processing_shape = (int(input_T), int(input_H), int(input_W))
-    legacy_cube_shape = compute_cube_resize_shape(input_T, input_H, input_W, tolerance=0.05)
-    processing_mode = processing_volume_mode()
-    if should_resize_to_processing_cube(input_processing_shape, legacy_cube_shape):
+    if cube_resize_will_apply:
         processing_shape = legacy_cube_shape
         print(
             'v13.0.0 processing geometry: approximately-cubic working volume (default). '
@@ -16829,7 +17032,7 @@ def main() -> None:
                 processing_shape,
                 temp_dir / 'input_volume.v950_cube.gray8.dat',
                 workers=max(1, default_worker_budget()),
-                prefer_memory=True,
+                prefer_memory=not bool(multi_gpu_active),
             )
         else:
             volume_rgb = resize_volume_to_processing_cube_gray8(
@@ -16837,7 +17040,7 @@ def main() -> None:
                 processing_shape,
                 temp_dir / 'input_volume.v950_cube.gray8.dat',
                 workers=max(1, default_worker_budget()),
-                prefer_memory=True,
+                prefer_memory=not bool(multi_gpu_active),
             )
     else:
         processing_shape = input_processing_shape
@@ -16938,6 +17141,19 @@ def main() -> None:
             '/ YOLO_TTA_GPU_RENDER_RESERVE_GIB), with radial tasks GPU-prerendered from streamed t-blocks '
             'otherwise (YOLO_TTA_GPU_RENDER_TBLOCK_SLICES).'
         )
+    spec_notes.append(
+        'v13.3.1 (R3/R4/R7b/R12/R16/R19/R24/R25): scratch memmap msync is opt-in (YOLO_TTA_MSYNC, '
+        'default off — same-host page-cache coherence needs no synchronous flushes); single-angle '
+        'multi-GPU workers write result slice windows directly into the disk-backed per-view union '
+        '(YOLO_TTA_MGPU_DIRECT_UNION); NRRD payload writes stream bounded double-buffered blocks '
+        '(YOLO_TTA_NRRD_Z_CHUNK_SLICES) filled by a GIL-releasing pool (YOLO_TTA_NRRD_FILL_WORKERS) '
+        'that overlaps pigz; multi-GPU runs allocate the processing volume disk-backed from the start '
+        '(no post-decode copy to scratch); foreground scans and the raw-bbox encoder no longer make '
+        'full-slice cast copies, and interpolation bridge-delta layers reuse the pass added_voxels '
+        'stat instead of rescanning; the interpolation merge visits only schedule-touched slices; '
+        'NRRD pigz level defaults to 3 (YOLO_TTA_NRRD_PIGZ_LEVEL) and low-quality MP4s use x264 '
+        'preset medium (YOLO_TTA_X264_PRESET).'
+    )
     if preprocess_streaming_active:
         spec_notes.append(
             'v12.2.15 streaming preprocessing is active: decoded native slices become available as ffmpeg produces them. Transverse readers wait only for the needed decoded slice; stack-sampling view families wait for the completed decoded volume. Legacy cube resize, when explicitly enabled, still streams its output slices.'
@@ -17854,9 +18070,13 @@ def main() -> None:
         # detects the backing file), eliminating the old full-volume RAM->disk handoff copy per
         # view per pass; page cache keeps reads/writes at RAM speed. Non-interpolating views
         # keep the anonymous-RAM preference.
+        # v13.3.1 (R4): direct union writes require file-backed workspaces the workers can open.
         union_prefer_memory = not (
-            interpolation_process_backend_enabled()
-            and _view_uses_interpolation(view, int(args.interpolate))
+            (
+                interpolation_process_backend_enabled()
+                and _view_uses_interpolation(view, int(args.interpolate))
+            )
+            or mgpu_direct_union_active
         )
         baseline_union_by_model_view[key] = allocate_workspace_array(
             shape=(int(view.num_slices), int(view.src_h), int(view.src_w)),
@@ -17873,7 +18093,7 @@ def main() -> None:
                 dtype=np.uint8,
                 path=confmap_path,
                 desc=f'{model_name}/{view.name} baseline confidence workspace',
-                prefer_memory=True,
+                prefer_memory=not mgpu_direct_union_active,
             )
             baseline_confmap_paths[key] = confmap_path
         else:
@@ -18491,6 +18711,10 @@ def main() -> None:
                 key_fv = (str(model_name), str(view.name))
                 fullframe_subtasks_per_view[key_fv] = int(fullframe_subtasks_per_view.get(key_fv, 0)) + len(starts)
                 prefix = f'{view.name}__{job_id}'
+                if mgpu_direct_union_active:
+                    # v13.3.1 (R4): pre-create the shared per-view union (and confmap) so every
+                    # worker task can open it 'r+' and write its disjoint slice window directly.
+                    _ensure_baseline_workspaces(str(model_name), view)
             else:
                 tile_job = job_obj
                 m_out = np.asarray(tile_job.M_out_to_src, dtype=np.float32)
@@ -18504,8 +18728,16 @@ def main() -> None:
                 # which returns the full machine CPU count and would have each of N workers spin up an
                 # N-times-too-large render pool). With cv2.setNumThreads(1) these are real render threads.
                 render_workers = max(1, min(int(per_worker_workers), int(count)))
-                rmask = mgpu_result_dir / f'{prefix}__c{chunk_idx}.mask.u8.dat'
-                rconf = (mgpu_result_dir / f'{prefix}__c{chunk_idx}.conf.u8.dat') if float(args.min_conf) > 0.0 else None
+                if str(kind) == 'fullframe' and mgpu_direct_union_active:
+                    # v13.3.1 (R4): the "result" paths are the shared per-view union files.
+                    key_direct = (str(model_name), str(view.name))
+                    rmask = baseline_union_paths[key_direct]
+                    rconf = baseline_confmap_paths.get(key_direct)
+                    result_mode = 'direct_union'
+                else:
+                    rmask = mgpu_result_dir / f'{prefix}__c{chunk_idx}.mask.u8.dat'
+                    rconf = (mgpu_result_dir / f'{prefix}__c{chunk_idx}.conf.u8.dat') if float(args.min_conf) > 0.0 else None
+                    result_mode = 'file'
                 task = {
                     'task_id': int(next_task_id), 'kind': str(kind), 'model_name': str(model_name),
                     'view': view, 'job': job_obj, 'job_id': job_id, 'out_size': int(out_size),
@@ -18514,6 +18746,7 @@ def main() -> None:
                     'source_volume_path': source_volume_path, 'source_shape': list(source_volume_shape),
                     'source_dtype': source_volume_dtype,
                     'result_mask_path': str(rmask), 'result_conf_path': (str(rconf) if rconf is not None else None),
+                    'result_mode': str(result_mode), 'union_num_slices': int(n_slices),
                     'render_workers': int(render_workers), 'prefetch_frames': int(prefetch_frames),
                     'postprocess_workers': int(per_worker_workers),
                     'streaming_cleanup_enabled': bool(single_angle_streaming_cleanup_active),
@@ -18545,8 +18778,14 @@ def main() -> None:
     def _handle_fullframe_worker_result(task: Dict[str, object], stats: Dict[str, int]) -> None:
         view = task['view']
         model_name_s = str(task['model_name'])
-        _ensure_baseline_workspaces(model_name_s, view)
         view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(stats.get('prediction_count', 0))
+        if str(task.get('result_mode', 'file')) == 'direct_union':
+            # v13.3.1 (R4): the worker already wrote its disjoint slice window straight into the
+            # shared per-view union memmap — nothing to reopen, OR, flush, or unlink here, and
+            # the scheduler thread is free to drain the next GPU result immediately.
+            _finalize_fullframe_view_after_worker(model_name_s, view)
+            return
+        _ensure_baseline_workspaces(model_name_s, view)
         s0 = int(task.get('slice_start', 0))
         count = int(task.get('slice_count', int(view.num_slices)))
         # The worker result covers only this task's slice window; union it into that window of the
