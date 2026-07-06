@@ -2,9 +2,39 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the v13.3.2_SLURM implementation. It is derived from v13.3.1_SLURM by COPY + surgical
-edits, implementing six approved speed items from SPEED_REVIEW_Fable-5_v13.2.5
-(R5, R6, R10, R14, R15, and the R21 device-union completion):
+This is the v13.3.3_SLURM implementation. It is derived from v13.3.2_SLURM by COPY + surgical
+edits, implementing items from SPEED_OPTIMIZATIONS_Fable-5_v13.3.2_SLURM.md:
+  - v13.3.3 (defaults) rebalanced defaults for the postprocess tail:
+    YOLO_TTA_INTERPOLATION_PROCESS_WORKERS default 2 -> min(6, parents+tiles);
+    YOLO_TTA_INTERPOLATION_CONCURRENT_PARENTS default 1 -> matches the process-worker cap when
+    the process backend is active (per-parent interpolation pools divide accordingly);
+    YOLO_TTA_GPU_BACKPROJECT_T_CHUNK default 8 -> 32;
+    YOLO_TTA_NRRD_LAYER_SINK_WORKERS default min(4, cores//8) -> min(12, cores//8);
+    YOLO_TTA_NRRD_FILL_WORKERS default cores//8 -> min(32, cores//4).
+  - v13.3.3 (S1) radial GPU backprojection: the per-chunk strided np.any scans over the
+    azimuth-major radial memmap are replaced by ONE threaded sequential occupancy pass
+    (per-v row bitmap) before the chunk loop; nonempty pinned row staging is thread-parallel;
+    the compute device is picked by free VRAM (YOLO_TTA_GPU_BACKPROJECT_DEVICE overrides)
+    instead of hardcoding cuda:0.
+  - v13.3.3 (S2) single-angle device-union upgrades: the per-task 2D hole fill runs ON DEVICE
+    (cupy label with a z-disconnected structure, one call per sub-block) before the task-end
+    flush when --min_conf/--min_radius are inactive; the scheduler skips the CPU per-view
+    "2D hole fill" pass when every slice of a view was device-filled
+    (YOLO_TTA_GPU_HOLE_FILL=0 disables). The flush reuses a cached pinned staging buffer
+    (one cudaHostAlloc per worker instead of per task), ping-pongs two pinned buffers so D2H
+    overlaps the host merge, and uses np.copyto for slices written on device (destination
+    windows start zeroed) instead of read-modify-write bitwise OR.
+  - v13.3.3 (S3) CPU 2D hole fill drops the bool->u8->bool churn: slices stay uint8
+    end-to-end and only enclosed-hole pixels are written back.
+  - v13.3.3 (S4) NRRD writes: payload gzip runs IN PROCESS on a shared thread pool
+    (chunked raw deflate + CRC32-combine, pigz-style single-member framing; python-isal used
+    when available, zlib otherwise; all-zero chunks reuse a cached compressed block + CRC and
+    skip deflate entirely). pigz remains as fallback (YOLO_TTA_NRRD_INPROCESS_GZIP=0).
+    Low-quality NRRD mirrors are derived from the full-quality payload blocks as they stream
+    (resize + OR into small in-RAM volumes) instead of re-decoding the full-resolution layer
+    once per downbin spec.
+
+Inherited from v13.3.2 (R5, R6, R10, R14, R15, and the R21 device-union completion):
   - v13.3.2 (R5) CPU tilted rendering restructured: every frame-invariant term (floor/frac of
     the shear, flat in-plane gather indices, per-pixel valid stack-coordinate bounds, per-row
     valid bands) is hoisted into TiltedRenderPlan and computed ONCE per (view, grid, matrix);
@@ -491,6 +521,7 @@ import argparse
 import colorsys
 import contextlib
 import gc
+import io
 import json
 import math
 import mmap
@@ -500,10 +531,12 @@ import queue
 import re
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import threading
 import time
+import zlib
 from collections import OrderedDict, deque
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
@@ -970,6 +1003,14 @@ def mgpu_direct_union_enabled() -> bool:
     return _env_flag('YOLO_TTA_MGPU_DIRECT_UNION', True)
 
 
+# v13.3.3: default cap for interpolation process-pool workers (was hard-capped at 2). The
+# interpolation pass is GIL-bound python inside each child, so extra children are extra usable
+# GILs; RAM is the practical bound (each pass workspace can reach ~O(100 GiB) on large volumes,
+# but workspace allocation is itself memory-gated with a disk-backed fallback). Also used as the
+# default expected parent-interpolation overlap so per-parent thread pools divide accordingly.
+INTERPOLATION_PROCESS_WORKER_DEFAULT_CAP = 6
+
+
 def resolve_parent_interpolation_worker_allocation(
     worker_budget: int,
     parent_postprocess_workers: int,
@@ -986,10 +1027,22 @@ def resolve_parent_interpolation_worker_allocation(
     Returns ``(expected_overlap, default_per_parent_workers, resolved_per_parent_workers)``.
     ``YOLO_TTA_INTERPOLATION_CONCURRENT_PARENTS`` changes the overlap estimate and
     ``YOLO_TTA_INTERPOLATION_TASK_WORKERS`` still overrides the final per-parent worker count.
+
+    v13.3.3: with the interpolation process backend active (the default), up to
+    INTERPOLATION_PROCESS_WORKER_DEFAULT_CAP passes really do run concurrently, so the default
+    overlap matches that cap instead of assuming a single live parent — otherwise each of the
+    concurrent passes spawns a full-budget thread pool and the box oversubscribes ~Nx during
+    the postprocess tail.
     """
     budget = max(1, int(worker_budget))
     parent_workers = max(1, int(parent_postprocess_workers))
-    default_overlap = max(1, min(1, parent_workers))
+    default_overlap = max(
+        1,
+        min(
+            parent_workers,
+            INTERPOLATION_PROCESS_WORKER_DEFAULT_CAP if interpolation_process_backend_enabled() else 1,
+        ),
+    )
     overlap = max(
         1,
         min(
@@ -7344,16 +7397,59 @@ def gpu_device_union_enabled() -> bool:
     return _env_flag('YOLO_TTA_GPU_DEVICE_UNION', True)
 
 
+def gpu_device_hole_fill_enabled() -> bool:
+    """v13.3.3 (S2): 2D-hole-fill the per-task device union on the GPU before the flush.
+
+    Valid only when --min_conf and --min_radius have no work (spec order is conf -> radius ->
+    hole fill) and every frame of the task accumulated on device; the scheduler additionally
+    skips the CPU per-view hole-fill pass only when EVERY slice of the view was device-filled.
+    """
+    return _env_flag('YOLO_TTA_GPU_HOLE_FILL', True)
+
+
+# v13.3.3 (S2): reusable pinned staging buffers for device-union flushes. The old path did one
+# ~chunk-sized cudaHostAlloc + free per task (~70 tasks x ~0.6 GB); this keeps a small pool per
+# process (workers flush one task at a time, so the pool normally holds a single buffer).
+_PINNED_U8_BUFFER_POOL: List[object] = []
+_PINNED_U8_BUFFER_POOL_LOCK = threading.Lock()
+_PINNED_U8_BUFFER_POOL_MAX = 4
+
+
+def _acquire_pinned_u8_buffer(torch_mod: object, numel: int) -> object:
+    need = max(1, int(numel))
+    with _PINNED_U8_BUFFER_POOL_LOCK:
+        for i, buf in enumerate(_PINNED_U8_BUFFER_POOL):
+            if int(buf.numel()) >= need:
+                return _PINNED_U8_BUFFER_POOL.pop(i)
+    return torch_mod.empty((need,), dtype=torch_mod.uint8, pin_memory=True)
+
+
+def _release_pinned_u8_buffer(buf: object) -> None:
+    if buf is None:
+        return
+    with _PINNED_U8_BUFFER_POOL_LOCK:
+        _PINNED_U8_BUFFER_POOL.append(buf)
+        # Keep the largest buffers; drop the smallest beyond the cap.
+        if len(_PINNED_U8_BUFFER_POOL) > _PINNED_U8_BUFFER_POOL_MAX:
+            _PINNED_U8_BUFFER_POOL.sort(key=lambda b: int(b.numel()))
+            del _PINNED_U8_BUFFER_POOL[0]
+
+
 class _DeviceUnionAccumulator:
     """v13.3.2 (R21): per-task on-device native-space union (+confmap) accumulation.
 
     Postprocess side-stream threads write each frame's warped native plane into a
     device-resident uint8 volume slice instead of a per-frame pinned D2H + host ``|=``; the task
-    then performs ONE chunked pinned D2H, OR-merged (max for conf) into the host result windows.
-    OR/max merging keeps host-side writes from frames that fell back to CPU processing (their
-    device slices stay zero) and composes with any pre-existing window content. Each slice index
-    is written at most once per task (single-angle contract; padded synthetic frames repeat a
-    real slice with identical content), so plain assignment is race-free across threads.
+    then performs ONE chunked pinned D2H into the host result windows. Each slice index is
+    written at most once per task (single-angle contract; padded synthetic frames repeat a real
+    slice with identical content), so plain assignment is race-free across threads.
+
+    v13.3.3 (S2): per-slice ``written`` tracking makes the flush precise — device-written slices
+    are plain-copied (their destination rows started zeroed and nothing else wrote them),
+    slices that fell back to host processing are skipped (their device rows are zero, and the
+    host write already happened) — and the flush ping-pongs two halves of a pooled pinned
+    buffer so the D2H of chunk i+1 overlaps the host merge of chunk i. ``fill_holes_2d`` can
+    hole-fill the accumulated union on device before the flush (see gpu_device_hole_fill_enabled).
     """
 
     def __init__(self, torch_mod: object, device: object, num_frames: int, native_h: int, native_w: int, want_conf: bool) -> None:
@@ -7366,6 +7462,14 @@ class _DeviceUnionAccumulator:
             torch_mod.zeros((int(num_frames), int(native_h), int(native_w)), dtype=torch_mod.uint8, device=device)
             if bool(want_conf) else None
         )
+        # Per-slice device-write tracking (GIL-atomic independent cells; indices are disjoint
+        # across postprocess threads). host_written records any frame that bypassed the device
+        # union (CPU fallback / cupy-cleanup frames) and wrote the host window directly.
+        self.written = np.zeros((int(num_frames),), dtype=bool)
+        self.host_written = False
+
+    def mark_host_write(self) -> None:
+        self.host_written = True
 
     def write_frame(self, idx: int, union_bool_t: object, conf_u8_t: Optional[object] = None) -> None:
         # Runs on the calling thread's side stream (inside the frame processor's stream ctx);
@@ -7373,24 +7477,131 @@ class _DeviceUnionAccumulator:
         self.union_dev[int(idx)] = union_bool_t.to(self.torch.uint8)
         if self.conf_dev is not None and conf_u8_t is not None:
             self.conf_dev[int(idx)] = conf_u8_t
+        self.written[int(idx)] = True
+
+    def fill_holes_2d(self) -> int:
+        """v13.3.3 (S2): fill enclosed 2D background per accumulated slice, ON DEVICE, in place.
+
+        One cupy ``label`` call per sub-block with a z-disconnected structure (3x3x3 with only
+        the in-plane 4-neighbourhood set) labels every slice's background independently in a
+        single kernel pass; labels touching a slice border are background, the rest are holes.
+        Matches the CPU path's scipy/cv2 4-connected background semantics. Returns the number
+        of frames now hole-filled (== num_frames), or 0 when skipped or failed (any host-side
+        frame, cupy unavailable, VRAM pressure, or any error -> the CPU per-view pass runs).
+        """
+        torch = self.torch
+        if self.union_dev is None:
+            return 0
+        if bool(self.host_written):
+            # Some frame bypassed the device union and wrote the host window directly; its
+            # device slice is zero, so a device fill would miss it. Report 0 so the CPU
+            # per-view pass covers the whole view. Frames that are merely EMPTY (no payload,
+            # no write anywhere) are fine: filling an empty slice is a no-op on both paths.
+            return 0
+        cp_mod = _try_import_cupy_ndimage()
+        if cp_mod is None:
+            return 0
+        cp, cpx_ndi = cp_mod
+        n, h, w = (int(x) for x in self.union_dev.shape)
+        if n <= 0 or h < 3 or w < 3:
+            return 0
+        try:
+            # Order every postprocess side-stream's writes before the cupy reads.
+            torch.cuda.synchronize(self.device)
+            dev_idx = int(getattr(self.device, 'index', 0) or 0)
+            block = max(1, _env_int('YOLO_TTA_GPU_HOLE_FILL_BLOCK', 64))
+            with cp.cuda.Device(dev_idx):
+                while block > 1:
+                    need = int(block) * h * w * 6 + 512 * 1024 * 1024  # int32 labels + 2x bool
+                    free_bytes, _total = torch.cuda.mem_get_info(self.device)
+                    if int(free_bytes) >= int(need):
+                        break
+                    block //= 2
+                structure = cp.zeros((3, 3, 3), dtype=cp.bool_)
+                structure[1, 1, 1] = True
+                structure[1, 0, 1] = True
+                structure[1, 2, 1] = True
+                structure[1, 1, 0] = True
+                structure[1, 1, 2] = True
+                for z0 in range(0, n, int(block)):
+                    z1 = min(n, z0 + int(block))
+                    blk = cp.asarray(self.union_dev[z0:z1])  # zero-copy CUDA-array-interface view
+                    bg = blk == 0
+                    labels, num = cpx_ndi.label(bg, structure=structure)
+                    if int(num) <= 0:
+                        continue
+                    touches = cp.zeros((int(num) + 1,), dtype=cp.bool_)
+                    touches[cp.unique(labels[:, 0, :])] = True
+                    touches[cp.unique(labels[:, -1, :])] = True
+                    touches[cp.unique(labels[:, :, 0])] = True
+                    touches[cp.unique(labels[:, :, -1])] = True
+                    enclosed = bg & ~touches[labels]
+                    if bool(enclosed.any()):
+                        blk[enclosed] = cp.uint8(1)  # writes through to union_dev
+                cp.cuda.get_current_stream().synchronize()
+            return int(n)
+        except Exception:
+            return 0
+        finally:
+            try:
+                cp.get_default_memory_pool().free_all_blocks()
+            except Exception:
+                pass
 
     def flush_into(self, view_union_mm: np.ndarray, view_confmap_mm: Optional[np.ndarray], chunk_slices: int = 64) -> None:
         torch = self.torch
         # One device-wide sync orders every side stream's writes before the D2H reads.
         torch.cuda.synchronize(self.device)
         n, h, w = (int(x) for x in self.union_dev.shape)
-        chunk = max(1, int(chunk_slices))
-        pin = torch.empty((min(chunk, n), h, w), dtype=torch.uint8, pin_memory=True)
-        pin_np = pin.numpy()
-        for z0 in range(0, n, chunk):
-            z1 = min(n, z0 + chunk)
-            pin[: z1 - z0].copy_(self.union_dev[z0:z1], non_blocking=False)
-            np.bitwise_or(view_union_mm[z0:z1], pin_np[: z1 - z0], out=view_union_mm[z0:z1])
-        if self.conf_dev is not None and view_confmap_mm is not None:
-            for z0 in range(0, n, chunk):
-                z1 = min(n, z0 + chunk)
-                pin[: z1 - z0].copy_(self.conf_dev[z0:z1], non_blocking=False)
-                np.maximum(view_confmap_mm[z0:z1], pin_np[: z1 - z0], out=view_confmap_mm[z0:z1])
+        chunk = max(1, min(int(chunk_slices), n))
+        plane = int(h) * int(w)
+        written = self.written
+        pin_buf = _acquire_pinned_u8_buffer(torch, 2 * chunk * plane)
+        pin_views = (
+            pin_buf[: chunk * plane].view(chunk, h, w),
+            pin_buf[chunk * plane: 2 * chunk * plane].view(chunk, h, w),
+        )
+        pin_np = (pin_views[0].numpy(), pin_views[1].numpy())
+        copy_stream = torch.cuda.Stream(device=self.device)
+        events = (torch.cuda.Event(), torch.cuda.Event())
+        try:
+            def _drain(src_dev: object, dst_mm: np.ndarray) -> None:
+                # Chunks with no device-written slice carry only zeros: skip them outright
+                # (host-side fallback writes for those slices already happened).
+                chunks = [
+                    (z0, min(n, z0 + chunk))
+                    for z0 in range(0, n, chunk)
+                    if bool(written[z0:min(n, z0 + chunk)].any())
+                ]
+                if not chunks:
+                    return
+
+                def _issue(ci: int) -> None:
+                    z0_i, z1_i = chunks[ci]
+                    buf = ci % 2
+                    with torch.cuda.stream(copy_stream):
+                        pin_views[buf][: z1_i - z0_i].copy_(src_dev[z0_i:z1_i], non_blocking=True)
+                        events[buf].record(copy_stream)
+
+                _issue(0)
+                for ci, (z0, z1) in enumerate(chunks):
+                    if ci + 1 < len(chunks):
+                        _issue(ci + 1)  # overlaps the host merge below
+                    events[ci % 2].synchronize()
+                    host = pin_np[ci % 2][: z1 - z0]
+                    wr = written[z0:z1]
+                    if bool(wr.all()):
+                        np.copyto(np.asarray(dst_mm[z0:z1]), host)
+                    else:
+                        for zi in range(z1 - z0):
+                            if wr[zi]:
+                                np.copyto(np.asarray(dst_mm[z0 + zi]), host[zi])
+
+            _drain(self.union_dev, view_union_mm)
+            if self.conf_dev is not None and view_confmap_mm is not None:
+                _drain(self.conf_dev, view_confmap_mm)
+        finally:
+            _release_pinned_u8_buffer(pin_buf)
         self.union_dev = None
         self.conf_dev = None
 
@@ -7584,6 +7795,10 @@ def _process_gpu_flattened_prediction_frame(
             conf_slice = view_confmap_mm[int(idx)]
             np.maximum(conf_slice, native_conf_np, out=conf_slice)
 
+    # v13.3.3 (S2): this frame bypassed the device union (cupy cleanup or CPU fallback) and
+    # writes the host window directly — the device-side hole fill must stand down for this task.
+    if device_union is not None:
+        device_union.mark_host_write()
     if slice_lock is None:
         _write_native_outputs()
     else:
@@ -7623,6 +7838,9 @@ def _process_prediction_frame(
         )
 
     if isinstance(masks_np, CpuRetinaMaskPayload):
+        # v13.3.3 (S2): host-side accumulation path — device hole fill stands down for the task.
+        if device_union is not None:
+            device_union.mark_host_write()
         return _process_cpu_retina_prediction_frame(
             idx=idx,
             payload=masks_np,
@@ -7640,6 +7858,9 @@ def _process_prediction_frame(
     masks_arr = np.asarray(masks_np)
     if masks_arr.ndim != 3 or int(masks_arr.shape[0]) <= 0:
         return 0, 0
+    # v13.3.3 (S2): raw retina-stack frames accumulate host-side below.
+    if device_union is not None:
+        device_union.mark_host_write()
 
     track_conf = view_confmap_mm is not None
     frame_union = np.zeros((out_size, out_size), dtype=np.uint8)
@@ -7718,6 +7939,7 @@ def predict_source_and_accumulate(
     streaming_cleanup_min_conf: float = 0.0,
     streaming_cleanup_min_radius: float = 0.0,
     slice_locks: Optional[Sequence[threading.Lock]] = None,
+    device_hole_fill: bool = False,
 ) -> Dict[str, int]:
     """Run YOLO predict(stream=True) on an in-memory source and accumulate native masks.
 
@@ -7906,8 +8128,15 @@ def predict_source_and_accumulate(
                     prediction_count += int(pred_inc)
                     frames_with_predictions += int(frame_inc)
 
-        # v13.3.2 (R21): one chunked pinned D2H for the whole task, OR/max-merged into the host
-        # result windows (composes with host-side writes from any fallback frames).
+        # v13.3.3 (S2): when requested (single-angle, no min_conf/min_radius work), hole-fill the
+        # accumulated device union per slice ON DEVICE before the flush; the scheduler then skips
+        # the CPU per-view "2D hole fill" pass once every slice of the view reports device-filled.
+        device_hole_filled_frames = 0
+        if device_union is not None and bool(device_hole_fill) and gpu_device_hole_fill_enabled():
+            device_hole_filled_frames = int(device_union.fill_holes_2d())
+
+        # v13.3.2 (R21): one chunked pinned D2H for the whole task into the host result windows
+        # (device-written slices are plain-copied; host-fallback slices are skipped — v13.3.3 S2).
         if device_union is not None:
             device_union.flush_into(view_union_mm, view_confmap_mm)
 
@@ -7919,6 +8148,7 @@ def predict_source_and_accumulate(
         return {
             'prediction_count': int(prediction_count),
             'frames_with_predictions': int(frames_with_predictions),
+            'device_hole_filled_frames': int(device_hole_filled_frames),
         }
     finally:
         if owned_staging_wrapper is not None:
@@ -8250,6 +8480,29 @@ def _fill_holes_2d_opencv(mask_bool: np.ndarray) -> np.ndarray:
     return mask_u8.astype(bool, copy=False)
 
 
+def _fill_holes_2d_opencv_u8_inplace(arr_u8: np.ndarray) -> None:
+    """v13.3.3 (S3): ``_fill_holes_2d_opencv`` without the bool->u8->bool->u8 churn.
+
+    Labels the background of the (contiguous) uint8 slice directly (4-connected, matching
+    scipy.ndimage.binary_fill_holes' default) and writes ONLY the enclosed-hole pixels back,
+    instead of materializing bool/u8 copies and rewriting the full plane.
+    """
+    bg = arr_u8 == 0
+    if not bg.any():
+        return
+    num_labels, labels2d = _cv2_connected_components(bg.view(np.uint8), connectivity=4)
+    if int(num_labels) <= 1:
+        return
+    touches_boundary = np.zeros((int(num_labels),), dtype=bool)
+    touches_boundary[np.unique(labels2d[0, :])] = True
+    touches_boundary[np.unique(labels2d[-1, :])] = True
+    touches_boundary[np.unique(labels2d[:, 0])] = True
+    touches_boundary[np.unique(labels2d[:, -1])] = True
+    enclosed_bg = (labels2d > 0) & (~touches_boundary[labels2d])
+    if np.any(enclosed_bg):
+        arr_u8[enclosed_bg] = np.uint8(1)
+
+
 def _filter_connected_components_by_min_radius_scipy(
     mask_bool: np.ndarray,
     structure2: np.ndarray,
@@ -8524,14 +8777,18 @@ def fill_view_volume_holes_2d_inplace(
 
     def _process(i: int) -> None:
         idx_i = int(i)
-        mask_slice = np.asarray(mask_mm[idx_i], dtype=bool)
-        if not np.any(mask_slice):
+        # v13.3.3 (S3): stay uint8 end-to-end and write back only the enclosed-hole pixels —
+        # the old path cast to bool, filled into a fresh plane, and rewrote the whole slice.
+        arr = np.asarray(mask_mm[idx_i])
+        if not arr.any():
             return
         if backend == 'opencv':
-            filled = _fill_holes_2d_opencv(mask_slice)
+            _fill_holes_2d_opencv_u8_inplace(arr)
         else:
-            filled = _fill_holes_2d_scipy(mask_slice)
-        mask_mm[idx_i, :, :] = filled.astype(np.uint8, copy=False)
+            filled = _fill_holes_2d_scipy(arr > 0)
+            holes = filled & (arr == 0)
+            if bool(np.any(holes)):
+                arr[holes] = np.uint8(1)
 
     parallel_for_indices_chunked(
         num_slices,
@@ -8552,6 +8809,7 @@ def cleanup_view_volume_after_prediction_inplace(
     *,
     workers: int = 1,
     precleaned_slice_cleanup: bool = False,
+    skip_hole_fill: bool = False,
 ) -> None:
     # v13.1.0 (spec): --min_radius is applied on this view's OWN native 2D slices, so the full
     # radius is valid for the per-slice fused cleanup of every view (no deferred transverse-plane
@@ -8579,11 +8837,16 @@ def cleanup_view_volume_after_prediction_inplace(
     # v13.0.0 (bug fix): 2D hole filling is the FINAL per-view step (spec item 6), applied after
     # --min_conf and the view-native --min_radius filter. The previous order hole-filled before
     # --min_radius inside the per-slice unit.
-    fill_view_volume_holes_2d_inplace(
-        mask_mm,
-        workers=int(workers),
-        desc=f'2D hole fill ({view.name})',
-    )
+    # v13.3.3 (S2): skipped when every slice of this view was already hole-filled on device by
+    # the GPU workers (identical per-slice semantics; the CPU pass would be pure recompute).
+    if bool(skip_hole_fill):
+        print(f'2D hole fill ({view.name}): done on device during accumulation (v13.3.3 S2); CPU pass skipped.')
+    else:
+        fill_view_volume_holes_2d_inplace(
+            mask_mm,
+            workers=int(workers),
+            desc=f'2D hole fill ({view.name})',
+        )
 
     flush_array(mask_mm)
     if confmap_mm is not None:
@@ -9283,6 +9546,7 @@ def run_prediction_volume_in_worker(model: object, cfg: 'PredictConfig', task: D
             streaming_cleanup_min_conf=float(task.get('streaming_cleanup_min_conf', 0.0)),
             streaming_cleanup_min_radius=float(task.get('streaming_cleanup_min_radius', 0.0)),
             slice_locks=None,
+            device_hole_fill=bool(task.get('device_hole_fill', False)),
         )
         # v13.2.5 (speed #6): no msync here — the main process reopens the result file on the
         # same host, where page-cache coherence makes the data visible without a blocking
@@ -9290,6 +9554,7 @@ def run_prediction_volume_in_worker(model: object, cfg: 'PredictConfig', task: D
         return {
             'prediction_count': int(stats.get('prediction_count', 0)),
             'frames_with_predictions': int(stats.get('frames_with_predictions', 0)),
+            'device_hole_filled_frames': int(stats.get('device_hole_filled_frames', 0)),
         }
     finally:
         # Always release the source render threads first, then close every memmap, even when
@@ -10422,6 +10687,75 @@ def build_dense_radial_backprojection_map(
     return dense_map
 
 
+def _pick_gpu_compute_device(torch_mod: object) -> object:
+    """v13.3.3 (S1): pick the CUDA device with the most free VRAM for main-process GPU stages.
+
+    The radial/tilted backprojections and other main-process GPU work previously hardcoded
+    cuda:0, piling every stage onto one device while the other GPUs idled.
+    YOLO_TTA_GPU_BACKPROJECT_DEVICE=<index> overrides the choice.
+    """
+    explicit = os.environ.get('YOLO_TTA_GPU_BACKPROJECT_DEVICE', '').strip()
+    if explicit:
+        try:
+            return torch_mod.device(f'cuda:{int(explicit)}')
+        except Exception:
+            pass
+    try:
+        count = int(torch_mod.cuda.device_count())
+    except Exception:
+        count = 1
+    if count <= 1:
+        return torch_mod.device('cuda:0')
+    best_idx = 0
+    best_free = -1
+    for idx in range(count):
+        try:
+            free_bytes, _total = torch_mod.cuda.mem_get_info(torch_mod.device(f'cuda:{idx}'))
+        except Exception:
+            continue
+        if int(free_bytes) > int(best_free):
+            best_free = int(free_bytes)
+            best_idx = int(idx)
+    return torch_mod.device(f'cuda:{best_idx}')
+
+
+def _radial_row_occupancy(radial_mask_mm: np.ndarray, desc: str) -> np.ndarray:
+    """v13.3.3 (S1): per-v foreground bitmap over the azimuth-major radial stack, in ONE pass.
+
+    The chunk loop used to re-scan ``radial_mask_mm[:, v, :]`` per covering row — a strided
+    reduction touching every azimuth plane of the multi-GiB memmap per row, repeated across
+    ~250 chunks. This computes the same information once, azimuth-major (contiguous reads),
+    parallelized over azimuth ranges (the per-plane ``any`` reductions release the GIL).
+    """
+    n_az, work_t, _u_len = (int(x) for x in radial_mask_mm.shape)
+    row_any = np.zeros((work_t,), dtype=bool)
+    if n_az <= 0 or work_t <= 0:
+        return row_any
+    lock = threading.Lock()
+    scan_workers = max(1, min(16, _cpu_count(), n_az))
+    az_chunk = max(1, int(math.ceil(float(n_az) / float(scan_workers * 4))))
+
+    def _scan_range(range_idx: int) -> None:
+        a0 = int(range_idx) * az_chunk
+        a1 = min(n_az, a0 + az_chunk)
+        local = np.zeros((work_t,), dtype=bool)
+        for a in range(a0, a1):
+            plane = np.asarray(radial_mask_mm[a])  # (work_t, u_len) contiguous
+            np.logical_or(local, plane.any(axis=1), out=local)
+        with lock:
+            np.logical_or(row_any, local, out=row_any)
+
+    num_ranges = int(math.ceil(float(n_az) / float(az_chunk)))
+    parallel_for_indices(
+        num_ranges,
+        _scan_range,
+        max_workers=scan_workers,
+        desc=f'{desc} [row occupancy]',
+        show_progress=False,
+    )
+    return row_any
+
+
 def gpu_backproject_enabled() -> bool:
     """v13.3.2 (R6a): stream radial backprojection through the GPU when torch + CUDA exist."""
     return _env_flag('YOLO_TTA_GPU_BACKPROJECT', True)
@@ -10445,6 +10779,11 @@ def _radial_backproject_gpu_streaming(
     device, and the finished output planes come back through one pinned D2H per chunk. Chunks
     whose cross-sections are all empty are skipped entirely (the output is pre-zeroed).
     Returns False when torch/CUDA/VRAM are unavailable so the caller runs the CPU path.
+
+    v13.3.3 (S1): row emptiness comes from one up-front threaded sequential occupancy pass
+    instead of per-chunk strided rescans of the whole azimuth-major memmap; the nonempty row
+    staging into pinned memory is thread-parallel; the device is picked by free VRAM instead
+    of hardcoded cuda:0.
     """
     try:
         import torch  # type: ignore
@@ -10455,10 +10794,12 @@ def _radial_backproject_gpu_streaming(
             return False
     except Exception:
         return False
-    dev = torch.device('cuda:0')
+    dev = _pick_gpu_compute_device(torch)
     n_az, work_t, u_len = (int(x) for x in radial_mask_mm.shape)
     plane_px = int(out_h) * int(out_w)
-    t_chunk = max(1, _env_int('YOLO_TTA_GPU_BACKPROJECT_T_CHUNK', 8))
+    # v13.3.3: default 8 -> 32. Fewer chunks amortize the per-chunk stream sync + host staging;
+    # the VRAM estimate below scales with t_chunk and still gates against free memory.
+    t_chunk = max(1, _env_int('YOLO_TTA_GPU_BACKPROJECT_T_CHUNK', 32))
     # Upper bound on covering rows per chunk (v ranges are monotone with ~work_t/t_dim slope).
     max_rows = int(math.ceil(float(t_chunk) * float(work_t) / float(max(1, t_dim)))) + 2
     cross_bytes = int(n_az) * int(u_len)
@@ -10480,46 +10821,59 @@ def _radial_backproject_gpu_streaming(
         )
         return False
 
-    stream = torch.cuda.Stream(device=dev)
-    with torch.cuda.stream(stream):
-        valid_pos_t = torch.from_numpy(np.ascontiguousarray(valid_pos)).to(dev)
-        flat_src_t = torch.from_numpy(np.ascontiguousarray(flat_src)).to(dev)
-        pin_rows = torch.empty((max_rows, n_az, u_len), dtype=torch.uint8, pin_memory=True)
-        pin_rows_np = pin_rows.numpy()
-        pin_out = torch.empty((t_chunk, plane_px), dtype=torch.uint8, pin_memory=True)
-        pin_out_np = pin_out.numpy()
-        out_dev = torch.empty((t_chunk, plane_px), dtype=torch.uint8, device=dev)
-        for t0 in tqdm(range(0, int(t_dim), t_chunk), desc=f'{desc} [gpu]'):
-            t1 = min(int(t_dim), t0 + t_chunk)
-            v0 = v_range_for_t(int(t0))[0]
-            v1 = v_range_for_t(int(t1 - 1))[1]
-            # Host-side emptiness scan on the strided views (GIL-releasing reduction, no copy).
-            nonempty: List[int] = [
-                int(v) for v in range(int(v0), int(v1)) if np.any(radial_mask_mm[:, int(v), :])
-            ]
-            if not nonempty:
-                continue  # vol_mm is pre-zeroed
-            if len(nonempty) > int(pin_rows.shape[0]):  # pragma: no cover - bound is conservative
-                raise RuntimeError(f'{desc}: covering rows {len(nonempty)} exceed staging bound {pin_rows.shape[0]}')
-            for i, v in enumerate(nonempty):
-                pin_rows_np[i] = radial_mask_mm[:, int(v), :]
-            rows_dev = pin_rows[: len(nonempty)].to(dev, non_blocking=True)
-            gathered = rows_dev.reshape(len(nonempty), -1)[:, flat_src_t]  # (rows, P) u8
-            out_dev.zero_()
-            for t in range(t0, t1):
-                vs, ve = v_range_for_t(int(t))
-                idxs = [i for i, v in enumerate(nonempty) if vs <= v < ve]
-                if not idxs:
-                    continue
-                sub = gathered[idxs[0]] if len(idxs) == 1 else gathered[idxs].amax(dim=0)
-                out_dev[t - t0].index_put_((valid_pos_t,), sub)
-            pin_out[: t1 - t0].copy_(out_dev[: t1 - t0], non_blocking=True)
+    # v13.3.3 (S1): one sequential occupancy pass replaces ~O(chunks x rows) strided rescans.
+    row_any = _radial_row_occupancy(radial_mask_mm, desc)
+    stage_workers = max(1, min(8, _cpu_count()))
+    stage_pool = ThreadPoolExecutor(max_workers=stage_workers, thread_name_prefix='radial-backproject-stage')
+
+    try:
+        stream = torch.cuda.Stream(device=dev)
+        with torch.cuda.stream(stream):
+            valid_pos_t = torch.from_numpy(np.ascontiguousarray(valid_pos)).to(dev)
+            flat_src_t = torch.from_numpy(np.ascontiguousarray(flat_src)).to(dev)
+            pin_rows = torch.empty((max_rows, n_az, u_len), dtype=torch.uint8, pin_memory=True)
+            pin_rows_np = pin_rows.numpy()
+            pin_out = torch.empty((t_chunk, plane_px), dtype=torch.uint8, pin_memory=True)
+            pin_out_np = pin_out.numpy()
+            out_dev = torch.empty((t_chunk, plane_px), dtype=torch.uint8, device=dev)
+            for t0 in tqdm(range(0, int(t_dim), t_chunk), desc=f'{desc} [gpu]'):
+                t1 = min(int(t_dim), t0 + t_chunk)
+                v0 = v_range_for_t(int(t0))[0]
+                v1 = v_range_for_t(int(t1 - 1))[1]
+                nonempty: List[int] = [int(v) for v in range(int(v0), int(v1)) if row_any[int(v)]]
+                if not nonempty:
+                    continue  # vol_mm is pre-zeroed
+                if len(nonempty) > int(pin_rows.shape[0]):  # pragma: no cover - bound is conservative
+                    raise RuntimeError(f'{desc}: covering rows {len(nonempty)} exceed staging bound {pin_rows.shape[0]}')
+
+                # v13.3.3 (S1): the strided (azimuth-major) row gathers release the GIL, so a small
+                # pool overlaps their memory latency instead of walking rows one at a time.
+                def _stage_row(i: int, _nonempty: List[int] = nonempty) -> None:
+                    pin_rows_np[int(i)] = radial_mask_mm[:, int(_nonempty[int(i)]), :]
+
+                if len(nonempty) > 1:
+                    list(stage_pool.map(_stage_row, range(len(nonempty))))
+                else:
+                    _stage_row(0)
+                rows_dev = pin_rows[: len(nonempty)].to(dev, non_blocking=True)
+                gathered = rows_dev.reshape(len(nonempty), -1)[:, flat_src_t]  # (rows, P) u8
+                out_dev.zero_()
+                for t in range(t0, t1):
+                    vs, ve = v_range_for_t(int(t))
+                    idxs = [i for i, v in enumerate(nonempty) if vs <= v < ve]
+                    if not idxs:
+                        continue
+                    sub = gathered[idxs[0]] if len(idxs) == 1 else gathered[idxs].amax(dim=0)
+                    out_dev[t - t0].index_put_((valid_pos_t,), sub)
+                pin_out[: t1 - t0].copy_(out_dev[: t1 - t0], non_blocking=True)
+                stream.synchronize()
+                np.copyto(
+                    np.asarray(vol_mm[t0:t1]).reshape(t1 - t0, -1),
+                    pin_out_np[: t1 - t0],
+                )
             stream.synchronize()
-            np.copyto(
-                np.asarray(vol_mm[t0:t1]).reshape(t1 - t0, -1),
-                pin_out_np[: t1 - t0],
-            )
-        stream.synchronize()
+    finally:
+        stage_pool.shutdown(wait=True)
     print(f'{desc}: GPU streaming backprojection complete ({t_dim} output slices).')
     return True
 
@@ -14257,6 +14611,7 @@ def prepare_view_volume_after_fullframe(
     interpolation_task_workers: int,
     nrrd_layers_enabled: bool = False,
     precleaned_slice_cleanup: bool = False,
+    hole_fill_done_on_device: bool = False,
 ) -> PreparedViewResult:
     baseline_native_volume = union_mm
     nrrd_layers: List[NrrdLayerRef] = []
@@ -14273,6 +14628,7 @@ def prepare_view_volume_after_fullframe(
         float(min_radius),
         workers=int(slice_workers),
         precleaned_slice_cleanup=bool(precleaned_slice_cleanup),
+        skip_hole_fill=bool(hole_fill_done_on_device),
     )
 
     close_memmap_array(confmap_mm)
@@ -15975,9 +16331,10 @@ def nrrd_fill_workers() -> int:
 
     The per-slice fill work (raw-bbox store decode memcpys, cv2 restore resizes) releases the
     GIL, so a small pool per write scales; the sink runs up to nrrd_layer_sink_workers() writes
-    concurrently, so the default keeps total fill threads near half the visible CPUs.
+    concurrently. v13.3.3: default cores//8 -> min(32, cores//4) — fill threads are only live
+    while a block is being decoded, and the write tail runs on an otherwise idle box.
     """
-    return max(1, _env_int('YOLO_TTA_NRRD_FILL_WORKERS', max(2, _cpu_count() // 8)))
+    return max(2, _env_int('YOLO_TTA_NRRD_FILL_WORKERS', max(2, min(32, _cpu_count() // 4))))
 
 
 def nrrd_pigz_threads() -> int:
@@ -16103,6 +16460,252 @@ class _PigzPayloadWriter:
 
 
 def _open_pigz_payload_writer(fh: object, *, threads: Optional[int] = None) -> _PigzPayloadWriter:
+    return _PigzPayloadWriter(fh, threads=threads)
+
+
+# --------------------------
+# v13.3.3 (S4): in-process parallel gzip for NRRD payloads
+# --------------------------
+# The pigz pipe capped every layer write at what ONE feeder thread can push through a 64 KiB
+# kernel pipe, regardless of pigz's thread count, and burned a subprocess + ~GBs of pipe
+# copying per file. This replaces it with pigz's own framing done in-process: fixed-size chunks
+# are raw-deflated concurrently on one shared pool (deflate releases the GIL in both zlib and
+# python-isal), each chunk ends on a byte-aligned Z_FULL_FLUSH boundary, and the chunks are
+# concatenated into a single standard gzip member whose trailer CRC is assembled with
+# crc32_combine. All-zero chunks (empty slices and margins dominate these mask volumes) are
+# served from a tiny cache of precompressed blocks — no deflate, no CRC pass.
+# python-isal (pip install isal) is picked up automatically for a further ~3-5x deflate
+# speedup; plain zlib is the fallback. YOLO_TTA_NRRD_INPROCESS_GZIP=0 restores the pigz pipe.
+
+
+def nrrd_inprocess_gzip_enabled() -> bool:
+    return _env_flag('YOLO_TTA_NRRD_INPROCESS_GZIP', True)
+
+
+def nrrd_gzip_workers() -> int:
+    """Size of the shared in-process deflate pool (all concurrent layer writes share it)."""
+    cores = max(1, _cpu_count())
+    return max(2, _env_int('YOLO_TTA_NRRD_GZIP_WORKERS', max(4, cores // 2)))
+
+
+def nrrd_gzip_chunk_bytes() -> int:
+    return max(1, _env_int('YOLO_TTA_NRRD_GZIP_CHUNK_MIB', 16)) * 1024 * 1024
+
+
+_NRRD_GZIP_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_NRRD_GZIP_EXECUTOR_LOCK = threading.Lock()
+
+
+def _nrrd_gzip_executor() -> ThreadPoolExecutor:
+    global _NRRD_GZIP_EXECUTOR
+    with _NRRD_GZIP_EXECUTOR_LOCK:
+        if _NRRD_GZIP_EXECUTOR is None:
+            _NRRD_GZIP_EXECUTOR = ThreadPoolExecutor(
+                max_workers=int(nrrd_gzip_workers()), thread_name_prefix='nrrd-gzip',
+            )
+        return _NRRD_GZIP_EXECUTOR
+
+
+def _nrrd_deflate_backend() -> Tuple[str, Callable[[], object], Callable[..., int], int, int]:
+    """Return (name, compressobj_factory, crc32_fn, full_flush_const, effective_level).
+
+    python-isal exposes the zlib API at ISA-L speed but only levels 0-3 on its own scale;
+    the configured deflate level (nrrd_pigz_compresslevel, 0-9) is mapped onto it and
+    YOLO_TTA_NRRD_ISAL_LEVEL overrides the mapping.
+    """
+    level = int(nrrd_pigz_compresslevel())
+    try:
+        from isal import isal_zlib  # type: ignore
+
+        isal_level = 0 if level <= 0 else (1 if level <= 4 else (2 if level <= 7 else 3))
+        isal_level = int(np.clip(_env_int('YOLO_TTA_NRRD_ISAL_LEVEL', isal_level), 0, 3))
+        full_flush = int(getattr(isal_zlib, 'Z_FULL_FLUSH', zlib.Z_FULL_FLUSH))
+
+        def _make_isal() -> object:
+            return isal_zlib.compressobj(isal_level, isal_zlib.DEFLATED, -15)
+
+        return 'isal', _make_isal, isal_zlib.crc32, full_flush, int(isal_level)
+    except Exception:
+        def _make_zlib() -> object:
+            return zlib.compressobj(level, zlib.DEFLATED, -15)
+
+        return 'zlib', _make_zlib, zlib.crc32, int(zlib.Z_FULL_FLUSH), int(level)
+
+
+def _gf2_matrix_times(mat: List[int], vec: int) -> int:
+    total = 0
+    idx = 0
+    while vec:
+        if vec & 1:
+            total ^= mat[idx]
+        vec >>= 1
+        idx += 1
+    return total
+
+
+def _gf2_matrix_square(square: List[int], mat: List[int]) -> None:
+    for n in range(32):
+        square[n] = _gf2_matrix_times(mat, mat[n])
+
+
+def _crc32_combine(crc1: int, crc2: int, len2: int) -> int:
+    """Combine CRC-32s of two concatenated byte ranges (port of zlib's crc32_combine)."""
+    if int(len2) <= 0:
+        return int(crc1) & 0xFFFFFFFF
+    even: List[int] = [0] * 32
+    odd: List[int] = [0] * 32
+    odd[0] = 0xEDB88320  # CRC-32 polynomial, reflected
+    row = 1
+    for n in range(1, 32):
+        odd[n] = row
+        row <<= 1
+    _gf2_matrix_square(even, odd)
+    _gf2_matrix_square(odd, even)
+    crc1 = int(crc1) & 0xFFFFFFFF
+    crc2 = int(crc2) & 0xFFFFFFFF
+    n2 = int(len2)
+    while True:
+        _gf2_matrix_square(even, odd)
+        if n2 & 1:
+            crc1 = _gf2_matrix_times(even, crc1)
+        n2 >>= 1
+        if n2 == 0:
+            break
+        _gf2_matrix_square(odd, even)
+        if n2 & 1:
+            crc1 = _gf2_matrix_times(odd, crc1)
+        n2 >>= 1
+        if n2 == 0:
+            break
+    return (crc1 ^ crc2) & 0xFFFFFFFF
+
+
+# Cache of deflated all-zero chunks keyed by (backend, level, byte length): the compressed
+# bytes AND the CRC of a zero run are pure functions of the length.
+_NRRD_GZIP_ZERO_CACHE: Dict[Tuple[str, int, int], Tuple[bytes, int]] = {}
+_NRRD_GZIP_ZERO_CACHE_LOCK = threading.Lock()
+
+
+class _ParallelGzipPayloadWriter:
+    """File-like gzip encoder compressing NRRD payload chunks in parallel, in process.
+
+    ``write(data)`` returns only after every chunk of the call is compressed and appended to
+    the output file, so callers may immediately reuse the buffer behind ``data`` — the same
+    contract as the blocking pigz pipe write it replaces.
+    """
+
+    GZIP_HEADER = b'\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03'  # deflate, no name/mtime, unix
+
+    def __init__(self, fh: object, *, chunk_bytes: Optional[int] = None) -> None:
+        backend, factory, crc_fn, full_flush, eff_level = _nrrd_deflate_backend()
+        self.fh = fh
+        self.backend = str(backend)
+        self.factory = factory
+        self.crc_fn = crc_fn
+        self.full_flush = int(full_flush)
+        self.eff_level = int(eff_level)
+        self.chunk_bytes = int(chunk_bytes) if chunk_bytes else int(nrrd_gzip_chunk_bytes())
+        self.crc = 0
+        self.isize = 0
+        self.closed = False
+        self.fh.write(self.GZIP_HEADER)
+
+    def _compress_chunk(self, mv: memoryview) -> Tuple[bytes, int, int]:
+        ln = len(mv)
+        arr = np.frombuffer(mv, dtype=np.uint8)
+        if not arr.any():
+            key = (self.backend, self.eff_level, int(ln))
+            with _NRRD_GZIP_ZERO_CACHE_LOCK:
+                cached = _NRRD_GZIP_ZERO_CACHE.get(key)
+            if cached is None:
+                cobj = self.factory()
+                comp = cobj.compress(mv) + cobj.flush(self.full_flush)
+                cached = (bytes(comp), int(self.crc_fn(mv)) & 0xFFFFFFFF)
+                with _NRRD_GZIP_ZERO_CACHE_LOCK:
+                    _NRRD_GZIP_ZERO_CACHE[key] = cached
+            return cached[0], cached[1], int(ln)
+        cobj = self.factory()
+        comp = cobj.compress(mv) + cobj.flush(self.full_flush)
+        return comp, int(self.crc_fn(mv)) & 0xFFFFFFFF, int(ln)
+
+    def write(self, data: bytes | bytearray | memoryview) -> int:
+        if self.closed:
+            raise RuntimeError('Cannot write to a closed gzip payload stream')
+        mv = data if isinstance(data, memoryview) else memoryview(data)
+        mv = mv.cast('B')
+        total = len(mv)
+        if total <= 0:
+            return 0
+        executor = _nrrd_gzip_executor()
+        futures = [
+            executor.submit(self._compress_chunk, mv[off:off + self.chunk_bytes])
+            for off in range(0, total, self.chunk_bytes)
+        ]
+        for fut in futures:
+            comp, crc, ln = fut.result()
+            self.fh.write(comp)
+            self.crc = _crc32_combine(self.crc, int(crc), int(ln))
+            self.isize = (self.isize + int(ln)) & 0xFFFFFFFF
+        return int(total)
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        # Terminate the single deflate stream with an empty FINAL static-huffman block (the
+        # same termination pigz emits after its full-flushed chunks), then the gzip trailer.
+        self.fh.write(b'\x03\x00')
+        self.fh.write(struct.pack('<II', self.crc & 0xFFFFFFFF, self.isize & 0xFFFFFFFF))
+
+    def __enter__(self) -> '_ParallelGzipPayloadWriter':
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if exc_type is None:
+            self.close()
+        else:
+            self.closed = True  # broken stream: do not emit a trailer over partial output
+
+
+_NRRD_INPROCESS_GZIP_OK: Optional[bool] = None
+_NRRD_INPROCESS_GZIP_TEST_LOCK = threading.Lock()
+
+
+def _nrrd_inprocess_gzip_self_test() -> bool:
+    """One-time end-to-end validation (framing + CRC combine + zero cache + backend flush).
+
+    Failure of any part quietly reverts every NRRD payload write to the pigz pipe, so a
+    surprising isal/zlib build can never produce corrupt output.
+    """
+    global _NRRD_INPROCESS_GZIP_OK
+    if _NRRD_INPROCESS_GZIP_OK is not None:
+        return bool(_NRRD_INPROCESS_GZIP_OK)
+    with _NRRD_INPROCESS_GZIP_TEST_LOCK:
+        if _NRRD_INPROCESS_GZIP_OK is not None:
+            return bool(_NRRD_INPROCESS_GZIP_OK)
+        try:
+            import gzip as _gzip
+            part_a = bytes(range(256)) * 41 + b'\x00' * 3000  # spans chunk boundaries
+            part_b = b'\x00' * 8192                            # exercises the zero cache
+            part_c = b'nrrd-inprocess-gzip-self-test' * 99
+            sink = io.BytesIO()
+            writer = _ParallelGzipPayloadWriter(sink, chunk_bytes=4096)
+            writer.write(part_a)
+            writer.write(part_b)
+            writer.write(part_c)
+            writer.close()
+            _NRRD_INPROCESS_GZIP_OK = bool(_gzip.decompress(sink.getvalue()) == part_a + part_b + part_c)
+        except Exception:
+            _NRRD_INPROCESS_GZIP_OK = False
+        if not _NRRD_INPROCESS_GZIP_OK:
+            print('Warning: in-process NRRD gzip self-test failed; using the pigz pipe for NRRD payloads.')
+        return bool(_NRRD_INPROCESS_GZIP_OK)
+
+
+def _open_nrrd_payload_writer(fh: object, *, threads: Optional[int] = None) -> object:
+    """v13.3.3 (S4): in-process parallel gzip when enabled and validated, else the pigz pipe."""
+    if nrrd_inprocess_gzip_enabled() and _nrrd_inprocess_gzip_self_test():
+        return _ParallelGzipPayloadWriter(fh)
     return _PigzPayloadWriter(fh, threads=threads)
 
 def _madvise_array_mmap(arr: object, advice_name: str) -> None:
@@ -16279,6 +16882,7 @@ def write_single_layer_nrrd_from_ref(
     pigz_threads: Optional[int] = None,
     segment_name: Optional[str] = None,
     segment_color: Optional[Tuple[float, float, float]] = None,
+    block_consumer: Optional[Callable[[int, np.ndarray], None]] = None,
 ) -> Path:
     """Write one component layer as its own single-layer 3D Slicer segmentation NRRD (X, Y, t).
 
@@ -16310,14 +16914,145 @@ def write_single_layer_nrrd_from_ref(
             data_type='unsigned char',
             encoding='gzip',
         )
-        with _open_pigz_payload_writer(fh, threads=threads) as payload_writer:
+        # v13.3.3 (S4): in-process parallel gzip by default (pigz pipe as validated fallback).
+        with _open_nrrd_payload_writer(fh, threads=threads) as payload_writer:
             _write_one_decomposed_nrrd_layer_payload(
                 ref,
                 (out_t, out_h, out_w),
                 payload_writer,
                 z_chunk=int(z_chunk),
+                block_consumer=block_consumer,
             )
     return out_path
+
+
+def write_layer_nrrd_with_low_quality_mirrors(
+    ref: 'NrrdLayerRef',
+    output_shape: Tuple[int, int, int],
+    out_path: Path,
+    mirrors: Sequence[Tuple[Tuple[int, int, int], Path]],
+    *,
+    pigz_threads: Optional[int] = None,
+    segment_name: Optional[str] = None,
+    segment_color: Optional[Tuple[float, float, float]] = None,
+) -> Path:
+    """v13.3.3 (S4): write the full-quality layer AND its low-quality mirrors in ONE pass.
+
+    Each low-quality mirror used to be an independent write that re-decoded the full-resolution
+    layer store per output slice (3-4 full-res decodes + INTER_AREA resizes per slice, per
+    downbin spec). Here the full-quality write streams exactly as before, and every payload
+    block is additionally folded into small in-RAM mirror volumes (one resize per full-res
+    slice per spec, OR'd into the covering mirror slices — the same resize helper and union
+    semantics as the legacy per-mirror reader, composed through the output geometry, so bin-edge
+    voxels may differ sub-slice from the legacy double-resample). The mirror files are then
+    gzip-encoded straight from RAM. Any tee failure falls back to the legacy per-mirror writer
+    so the full-quality file is never at risk.
+    """
+    out_t = int(output_shape[0])
+    mirror_jobs: List[Dict[str, object]] = []
+    for m_shape, m_path in mirrors:
+        m_t, m_h, m_w = (int(m_shape[0]), int(m_shape[1]), int(m_shape[2]))
+        # Invert the mirror's t mapping once: for each full-quality output z, the mirror
+        # slice(s) whose source range contains it (matches _restore_source_indices_for_output_z).
+        tmp: List[List[int]] = [[] for _ in range(out_t)]
+        for mz in range(m_t):
+            for sz in _restore_source_indices_for_output_z(out_t, m_t, int(mz)):
+                if 0 <= int(sz) < out_t:
+                    tmp[int(sz)].append(int(mz))
+        mirror_jobs.append({
+            'shape': (m_t, m_h, m_w),
+            'path': Path(m_path),
+            'volume': np.zeros((m_t, m_h, m_w), dtype=np.uint8),
+            'src_to_m': [tuple(v) for v in tmp],
+            'locks': [threading.Lock() for _ in range(16)],
+            'failed': False,
+        })
+
+    tee_workers = max(1, min(int(nrrd_fill_workers()), 16))
+
+    def _tee(z0: int, block: np.ndarray) -> None:
+        live_jobs = [j for j in mirror_jobs if not bool(j['failed'])]
+        if not live_jobs:
+            return
+        z_count = int(block.shape[0])
+
+        def _tee_one(zi: int) -> None:
+            full_z = int(z0) + int(zi)
+            if full_z >= out_t:
+                return
+            frame = block[int(zi)]
+            for job in live_jobs:
+                if bool(job['failed']):
+                    continue
+                try:
+                    targets = job['src_to_m'][full_z]
+                    if not targets:
+                        continue
+                    m_t, m_h, m_w = job['shape']  # type: ignore[misc]
+                    resized = _resize_binary_mask_frame_to_output_shape(frame, int(m_h), int(m_w))
+                    vol = job['volume']
+                    locks = job['locks']
+                    for mz in targets:
+                        # Adjacent full-z frames can map to the same mirror slice; stripe locks
+                        # keep the read-modify-write OR race-free without serializing the block.
+                        with locks[int(mz) % len(locks)]:  # type: ignore[index]
+                            np.bitwise_or(vol[int(mz)], resized, out=vol[int(mz)])  # type: ignore[index]
+                except Exception:
+                    job['failed'] = True
+
+        if z_count > 1 and tee_workers > 1:
+            parallel_for_indices_chunked(
+                z_count, _tee_one, max_workers=tee_workers, desc='', show_progress=False,
+                target_chunks_per_worker=1,
+            )
+        else:
+            for zi in range(z_count):
+                _tee_one(int(zi))
+
+    result = write_single_layer_nrrd_from_ref(
+        ref, output_shape, out_path,
+        pigz_threads=pigz_threads, segment_name=segment_name, segment_color=segment_color,
+        block_consumer=(_tee if mirror_jobs else None),
+    )
+
+    for job in mirror_jobs:
+        m_t, m_h, m_w = job['shape']  # type: ignore[misc]
+        m_path: Path = job['path']  # type: ignore[assignment]
+        try:
+            if bool(job['failed']):
+                raise RuntimeError('mirror tee failed during full-quality streaming')
+            m_path.parent.mkdir(parents=True, exist_ok=True)
+            header = nrrd_slicer_header((int(m_t), int(m_h), int(m_w)))
+            seg_name = str(segment_name) if segment_name else _slicer_segment_name_for_out_path(m_path)
+            seg_color = segment_color if segment_color is not None else slicer_segment_palette_color(seg_name)
+            header.update(slicer_segmentation_header_fields(
+                segment_name=seg_name,
+                color_rgb=seg_color,
+                extent_xyt=_slicer_segment_extent_for_output(ref, (int(m_t), int(m_h), int(m_w))),
+            ))
+            vol: np.ndarray = job['volume']  # type: ignore[assignment]
+            step = max(1, int(_nrrd_full_slice_z_chunk(1, int(m_w), int(m_h), int(m_t))))
+            with open(m_path, 'wb') as fh:
+                _write_nrrd_ascii_header(
+                    fh, header=header, sizes=(int(m_w), int(m_h), int(m_t)),
+                    dimension=3, data_type='unsigned char', encoding='gzip',
+                )
+                with _open_nrrd_payload_writer(fh, threads=pigz_threads) as payload_writer:
+                    for z0 in range(0, int(m_t), step):
+                        z1 = min(int(m_t), int(z0) + step)
+                        payload_writer.write(memoryview(vol[z0:z1]).cast('B'))
+        except Exception as exc:
+            print(
+                f'Warning: low-quality NRRD mirror tee failed for {m_path.name} ({exc}); '
+                're-encoding that mirror from the layer store.'
+            )
+            write_single_layer_nrrd_from_ref(
+                ref, (int(m_t), int(m_h), int(m_w)), m_path,
+                pigz_threads=pigz_threads, segment_name=segment_name, segment_color=segment_color,
+            )
+        finally:
+            job['volume'] = None
+    return result
 
 
 class NrrdLayerSink:
@@ -16417,14 +17152,13 @@ class NrrdLayerSink:
                 'segment_name': segment_name,
                 'segment_color_rgb': [round(float(c), 6) for c in segment_color],
             })
-            fut = self.executor.submit(
-                write_single_layer_nrrd_from_ref, ref, self.output_shape, out_path,
-                pigz_threads=self.pigz_threads, segment_name=segment_name, segment_color=segment_color,
-            )
-            self._futures.append(fut)
             # v13.2.1: mirror this component layer into each low-quality downbin decomposition,
             # scheduled now (as the view completes) exactly like the full-quality layer and sharing
             # the same unique suffix so a low-quality layer maps 1:1 to its full-quality layer.
+            # v13.3.3 (S4): the mirrors are derived from the full-quality payload blocks inside ONE
+            # combined write task (write_layer_nrrd_with_low_quality_mirrors) instead of each
+            # re-decoding the full-resolution layer store as an independent task.
+            lq_mirror_args: List[Tuple[Tuple[int, int, int], Path]] = []
             for spec in self.low_quality_specs:
                 if self.low_quality_root is None:
                     break
@@ -16434,6 +17168,7 @@ class NrrdLayerSink:
                     int(spec.output_shape_t_y_x[2]),
                 )
                 lq_path = self._lq_nrrd_dir(spec) / f'{self.stem}_{unique_suffix}.seg.nrrd'
+                lq_mirror_args.append((lq_shape, lq_path))
                 self._lq_manifests.setdefault(str(spec.token), []).append({
                     'filename': lq_path.name,
                     'suffix': unique_suffix,
@@ -16454,11 +17189,18 @@ class NrrdLayerSink:
                     'segment_name': segment_name,
                     'segment_color_rgb': [round(float(c), 6) for c in segment_color],
                 })
-                lq_fut = self.executor.submit(
-                    write_single_layer_nrrd_from_ref, ref, lq_shape, lq_path,
+            if lq_mirror_args:
+                fut = self.executor.submit(
+                    write_layer_nrrd_with_low_quality_mirrors, ref, self.output_shape, out_path,
+                    lq_mirror_args,
                     pigz_threads=self.pigz_threads, segment_name=segment_name, segment_color=segment_color,
                 )
-                self._futures.append(lq_fut)
+            else:
+                fut = self.executor.submit(
+                    write_single_layer_nrrd_from_ref, ref, self.output_shape, out_path,
+                    pigz_threads=self.pigz_threads, segment_name=segment_name, segment_color=segment_color,
+                )
+            self._futures.append(fut)
         return out_path
 
     def layer_count(self) -> int:
@@ -16555,8 +17297,11 @@ def nrrd_layer_sink() -> Optional[NrrdLayerSink]:
 
 
 def nrrd_layer_sink_workers() -> int:
+    # v13.3.3: default cap 4 -> 12. With ~72 queued files (layers x low-quality mirrors) the
+    # 4-slot pool left the box near-idle through the whole write tail; most of the write volume
+    # lands after inference has drained, so a wider pool is safe.
     cores = max(1, _cpu_count())
-    default_workers = max(1, min(4, max(1, cores // 8)))
+    default_workers = max(1, min(12, max(1, cores // 8)))
     return max(1, _env_int('YOLO_TTA_NRRD_LAYER_SINK_WORKERS', int(default_workers)))
 
 
@@ -16697,6 +17442,7 @@ def _write_one_decomposed_nrrd_layer_payload(
     z_chunk: int,
     pbar: Optional[object] = None,
     layer_idx: int = 0,
+    block_consumer: Optional[Callable[[int, np.ndarray], None]] = None,
 ) -> None:
     """Write exactly one decomposed NRRD layer payload in native layer order.
 
@@ -16704,6 +17450,13 @@ def _write_one_decomposed_nrrd_layer_payload(
     stream or into its own gzip member.  In either case the uncompressed bytes for
     one layer are written as native ``(t,Y,X)`` C-order, which matches the NRRD
     attached payload order for sizes ``(X,Y,t,layer)`` when the list axis is last.
+
+    v13.3.3 (S4): ``block_consumer(z0, block)`` (if given) observes every output-geometry
+    payload block right after it is materialized — the low-quality mirror tee derives its
+    downbinned volumes from these blocks instead of re-decoding the layer store per mirror.
+    The consumer must treat the block as read-only and return before reuse; in the
+    double-buffered path it runs on the caller thread while the block's compression proceeds
+    on the writer thread (both only read).
     """
     out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
     z_chunk_i = max(1, int(z_chunk))
@@ -16728,10 +17481,11 @@ def _write_one_decomposed_nrrd_layer_payload(
             for z0 in range(0, out_t, int(z_chunk_i)):
                 z1 = min(out_t, int(z0) + int(z_chunk_i))
                 chunk = np.asarray(src[int(z0):int(z1)], dtype=np.uint8)
-                if chunk.flags['C_CONTIGUOUS']:
-                    payload_writer.write(memoryview(chunk).cast('B'))
-                else:
-                    payload_writer.write(np.ascontiguousarray(chunk).tobytes(order='C'))
+                if not chunk.flags['C_CONTIGUOUS']:
+                    chunk = np.ascontiguousarray(chunk)
+                if block_consumer is not None:
+                    block_consumer(int(z0), chunk)
+                payload_writer.write(memoryview(chunk).cast('B'))
                 if pbar is not None:
                     pbar.update(int(z1 - z0))
                 if madvise_interval > 0 and (int(z1) % int(madvise_interval) == 0):
@@ -16791,6 +17545,11 @@ def _write_one_decomposed_nrrd_layer_payload(
                     if pending is not None:
                         pending.result()
                     pending = writer_pool.submit(payload_writer.write, memoryview(block).cast('B'))
+                    # v13.3.3 (S4): the mirror tee reads the block on this thread while the
+                    # writer thread compresses it — both are read-only; the next refill of this
+                    # buffer is still gated on pending.result() two iterations out.
+                    if block_consumer is not None:
+                        block_consumer(int(z0), block)
                     if pbar is not None:
                         pbar.update(int(z_count))
                     if bool(madvise_src) and madvise_interval > 0 and (int(z1) % int(madvise_interval) == 0):
@@ -18386,10 +19145,13 @@ def main() -> None:
     )
 
     interpolation_process_backend_active = bool(interpolation_process_backend_enabled() and int(args.interpolate) > 0)
+    # v13.3.3: default raised from min(2, ...) — 11 views queued behind 2 process GILs was the
+    # dominant wall-clock tail. Each child allocates its own pass workspace (memory-gated with a
+    # disk-backed fallback), so the cap trades RAM headroom for parallel interpolation GILs.
     interpolation_process_workers_default = max(
         1,
         min(
-            2,
+            int(INTERPOLATION_PROCESS_WORKER_DEFAULT_CAP),
             max(1, int(parent_postprocess_workers)) + (1 if len(tile_configs) > 0 else 0),
         ),
     )
@@ -18617,6 +19379,9 @@ def main() -> None:
     baseline_confmap_paths: Dict[Tuple[str, str], Optional[Path]] = {}
     baseline_slice_locks_by_model_view: Dict[Tuple[str, str], List[threading.Lock]] = {}
     fullframe_remaining: Dict[Tuple[str, str], int] = {}
+    # v13.3.3 (S2): slices per (model, view) hole-filled on device by the GPU workers; when the
+    # sum reaches the view's slice count, the CPU per-view "2D hole fill" pass is skipped.
+    view_device_hole_filled_slices: Dict[Tuple[str, str], int] = {}
 
     for view in inference_views:
         for model_name, _ in yolo_models:
@@ -19049,6 +19814,11 @@ def main() -> None:
         union_path = baseline_union_paths.pop(key)
         confmap_path = baseline_confmap_paths.pop(key)
         baseline_slice_locks_by_model_view.pop(key, None)
+        # v13.3.3 (S2): every slice of this view already hole-filled on device by the GPU
+        # workers -> the CPU "2D hole fill (<view>)" pass is a no-op recompute; skip it.
+        hole_fill_done_on_device = bool(
+            int(view_device_hole_filled_slices.get(key, 0)) >= int(view.num_slices)
+        )
         fut = parent_postprocess_executor.submit(
             prepare_view_volume_after_fullframe,
             model_name=str(model_name),
@@ -19072,6 +19842,7 @@ def main() -> None:
             interpolation_task_workers=int(parent_interpolation_task_workers),
             nrrd_layers_enabled=bool(nrrd_layers_needed),
             precleaned_slice_cleanup=bool(single_angle_streaming_cleanup_active),
+            hole_fill_done_on_device=bool(hole_fill_done_on_device),
         )
         view_processing_futures[fut] = key
 
@@ -19637,6 +20408,16 @@ def main() -> None:
         # consolidated as whole volumes, so they are never slice-split.
         slice_chunk = max(64, _env_int('YOLO_TTA_MGPU_SLICE_CHUNK', 512))
         prefetch_frames = streaming_prediction_source_prefetch_frames(max(1, int(args.batch)))
+        # v13.3.3 (S2): per-task device-side 2D hole fill is valid only when the spec steps that
+        # precede hole fill (--min_conf, --min_radius) have no work, results stream through the
+        # single-angle cleanup path, and the task writes a disjoint direct-union window.
+        mgpu_device_hole_fill = bool(
+            gpu_device_union_enabled()
+            and gpu_device_hole_fill_enabled()
+            and bool(single_angle_streaming_cleanup_active)
+            and float(args.min_conf) <= 0.0
+            and float(args.min_radius) <= 0.0
+        )
         fullframe_subtasks_per_view: Dict[Tuple[str, str], int] = {}
         next_task_id = 0
         for kind, view, job_obj in list(pending_prediction_build_jobs):
@@ -19691,6 +20472,9 @@ def main() -> None:
                     'streaming_cleanup_enabled': bool(single_angle_streaming_cleanup_active),
                     'streaming_cleanup_min_conf': float(args.min_conf),
                     'streaming_cleanup_min_radius': float(_view_native_slice_min_radius(view, float(args.min_radius))),
+                    'device_hole_fill': bool(
+                        mgpu_device_hole_fill and str(kind) == 'fullframe' and str(result_mode) == 'direct_union'
+                    ),
                 }
                 mgpu_tasks_by_id[int(next_task_id)] = task
                 next_task_id += 1
@@ -19718,6 +20502,11 @@ def main() -> None:
         view = task['view']
         model_name_s = str(task['model_name'])
         view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(stats.get('prediction_count', 0))
+        # v13.3.3 (S2): accumulate device-side hole-filled slice counts toward the per-view skip.
+        _filled = int(stats.get('device_hole_filled_frames', 0))
+        if _filled > 0:
+            key_fill = (model_name_s, str(view.name))
+            view_device_hole_filled_slices[key_fill] = int(view_device_hole_filled_slices.get(key_fill, 0)) + _filled
         if str(task.get('result_mode', 'file')) == 'direct_union':
             # v13.3.1 (R4): the worker already wrote its disjoint slice window straight into the
             # shared per-view union memmap — nothing to reopen, OR, flush, or unlink here, and
