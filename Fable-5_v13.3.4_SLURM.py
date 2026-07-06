@@ -2,8 +2,36 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the v13.3.3_SLURM implementation. It is derived from v13.3.2_SLURM by COPY + surgical
-edits, implementing items from SPEED_OPTIMIZATIONS_Fable-5_v13.3.2_SLURM.md:
+This is the v13.3.4_SLURM implementation. It is derived from v13.3.3_SLURM by COPY + surgical
+edits, implementing the interpolation-pipeline and scheduling items from
+SPEED_OPTIMIZATIONS_Fable-5_v13.3.2_SLURM.md:
+  - v13.3.4 (T1) per-slice component tables are built from ONE whole-slice (bbox-cropped)
+    cv2.connectedComponentsWithStats call instead of one call per 3D label per slice (plus a
+    full-slice foreground argsort per slice). In-plane labeling is always 8-connected, so two
+    different 3D labels can never be 8-adjacent within a slice — every whole-slice component
+    lies wholly inside one 3D label and the per-label split is exactly a group-by.
+  - v13.3.4 (T2) _UnionFind is numpy-array-backed: cross-slice pair merges run through one
+    numba nogil batch kernel per slice-pair batch (python fallback preserved), and root_map()
+    is vectorized pointer-jumping instead of a per-id python find loop.
+  - v13.3.4 (T3) the seed-planning inner loop's per-record geometry helpers (nearest-point,
+    local-canvas scatter, half-width extent, dilated-overlap and direct-overlap tests,
+    keep-center-component + hole fill, bridge paste) each dispatch to numba nogil kernels
+    with the original python/cv2 implementations as automatic fallbacks
+    (YOLO_TTA_INTERPOLATION_COMPILED_KERNELS gates all of them, same as the projection
+    kernel). The projection-SDF cache read path is lock-free (insert still locks).
+  - v13.3.4 (T4) after the multi-GPU inference queue drains, the 4 warm GPU worker processes
+    double as EXTRA interpolation hosts: interpolation passes submit to them opportunistically
+    (non-blocking) before falling back to the dedicated interpolation process pool, adding up
+    to gpu_count more GILs to the postprocess tail for free
+    (YOLO_TTA_GPU_WORKER_AUX_INTERPOLATION=0 disables).
+  - v13.3.4 (T5) parallel_map_in_order / parallel_map_unordered / parallel_for_indices(_chunked),
+    the per-task result postprocess pool, the NRRD payload writer thread and the radial
+    backprojection staging pool draw ThreadPoolExecutors from a process-wide checkout cache
+    instead of constructing and tearing one down per call (hundreds of pool builds per run).
+  - (2.1 "more interpolation GILs" was already implemented in v13.3.3: the interpolation
+    process-pool default is min(6, parents+tiles) and the expected parent overlap matches.)
+
+Inherited from v13.3.3 (defaults, S1-S4):
   - v13.3.3 (defaults) rebalanced defaults for the postprocess tail:
     YOLO_TTA_INTERPOLATION_PROCESS_WORKERS default 2 -> min(6, parents+tiles);
     YOLO_TTA_INTERPOLATION_CONCURRENT_PARENTS default 1 -> matches the process-worker cap when
@@ -1194,6 +1222,64 @@ def copy_workspace_array(
     return dst
 
 
+# --------------------------
+# v13.3.4 (T5): process-wide ThreadPoolExecutor checkout cache
+# --------------------------
+# The parallel_* helpers below (and a few hot per-call executors elsewhere) used to construct
+# and tear down a ThreadPoolExecutor per call — thousands of pool builds per run (every
+# labeling pass, every NRRD store, every resize, every prediction task). Pools are now checked
+# out of a per-size cache and returned after the call: semantics are unchanged (each call still
+# gets a DEDICATED pool bounded at its own max_workers, so nested calls cannot deadlock), but
+# sequential calls stop paying thread create/join and OS threads keep their identity (which
+# also preserves any future NUMA pinning). Idle cached threads are bounded by
+# YOLO_TTA_PARALLEL_POOL_CACHE_MAX_THREADS (excess pools are shut down on release).
+
+_PARALLEL_POOL_CACHE: Dict[int, List[ThreadPoolExecutor]] = {}
+_PARALLEL_POOL_CACHE_LOCK = threading.Lock()
+
+
+def _parallel_pool_cache_max_threads() -> int:
+    return max(0, _env_int('YOLO_TTA_PARALLEL_POOL_CACHE_MAX_THREADS', 1024))
+
+
+def _acquire_parallel_pool(workers: int) -> ThreadPoolExecutor:
+    w = max(1, int(workers))
+    with _PARALLEL_POOL_CACHE_LOCK:
+        stack = _PARALLEL_POOL_CACHE.get(w)
+        if stack:
+            return stack.pop()
+    return ThreadPoolExecutor(max_workers=w, thread_name_prefix=f'parallel-{w}')
+
+
+def _release_parallel_pool(workers: int, pool: ThreadPoolExecutor) -> None:
+    w = max(1, int(workers))
+    with _PARALLEL_POOL_CACHE_LOCK:
+        idle_threads = sum(int(size) * len(stack) for size, stack in _PARALLEL_POOL_CACHE.items())
+        if idle_threads + w <= _parallel_pool_cache_max_threads():
+            _PARALLEL_POOL_CACHE.setdefault(w, []).append(pool)
+            return
+    pool.shutdown(wait=False)
+
+
+def _settle_parallel_futures(futures: Iterable[Future]) -> None:
+    """Cancel-or-wait every future so a pool can safely return to the cache.
+
+    Called on abandoned generators / error paths: pending futures either cancel (never ran)
+    or finish; nothing of this call is left running when the pool is released.
+    """
+    remaining = [f for f in futures if f is not None]
+    for fut in remaining:
+        try:
+            fut.cancel()
+        except Exception:
+            pass
+    for fut in remaining:
+        try:
+            fut.exception()  # waits for completion; swallows task errors on cleanup paths
+        except Exception:
+            pass
+
+
 def parallel_map_in_order(
     func: Callable[[int], object],
     items: Iterable[int],
@@ -1208,8 +1294,9 @@ def parallel_map_in_order(
         return
 
     pending_limit = max(workers, int(max_pending) if max_pending is not None else workers + 1)
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        queue: List[object] = []
+    executor = _acquire_parallel_pool(workers)
+    queue: List[Future] = []
+    try:
         for item in items:
             queue.append(executor.submit(func, int(item)))
             if len(queue) >= pending_limit:
@@ -1218,6 +1305,9 @@ def parallel_map_in_order(
         while queue:
             fut = queue.pop(0)
             yield fut.result()
+    finally:
+        _settle_parallel_futures(queue)
+        _release_parallel_pool(workers, executor)
 
 
 def parallel_map_unordered(
@@ -1242,9 +1332,9 @@ def parallel_map_unordered(
 
     pending_limit = max(workers, int(max_pending) if max_pending is not None else workers + 1)
     iterator = iter(items)
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        pending: set[Future] = set()
-
+    executor = _acquire_parallel_pool(workers)
+    pending: set[Future] = set()
+    try:
         def _submit_until_full() -> None:
             while len(pending) < pending_limit:
                 try:
@@ -1260,6 +1350,9 @@ def parallel_map_unordered(
             for fut in done:
                 yield fut.result()
             _submit_until_full()
+    finally:
+        _settle_parallel_futures(pending)
+        _release_parallel_pool(workers, executor)
 
 
 def parallel_for_indices(
@@ -1281,7 +1374,9 @@ def parallel_for_indices(
             func(int(idx))
         return
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
+    executor = _acquire_parallel_pool(workers)
+    futures: List[Future] = []
+    try:
         futures = [executor.submit(func, int(idx)) for idx in range(total)]
         if show_progress:
             with tqdm(total=total, desc=desc) as pbar:
@@ -1291,6 +1386,9 @@ def parallel_for_indices(
         else:
             for fut in as_completed(futures):
                 fut.result()
+    finally:
+        _settle_parallel_futures(futures)
+        _release_parallel_pool(workers, executor)
 
 
 def choose_parallel_chunk_size(
@@ -1352,7 +1450,9 @@ def parallel_for_indices_chunked(
             func(int(idx))
         return int(stop - start)
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
+    executor = _acquire_parallel_pool(workers)
+    futures: List[Future] = []
+    try:
         futures = [executor.submit(_run_range, int(range_idx)) for range_idx in range(len(ranges))]
         if show_progress:
             with tqdm(total=total, desc=desc) as pbar:
@@ -1361,6 +1461,9 @@ def parallel_for_indices_chunked(
         else:
             for fut in as_completed(futures):
                 fut.result()
+    finally:
+        _settle_parallel_futures(futures)
+        _release_parallel_pool(workers, executor)
 
 
 def workspace_anon_cap_bytes() -> int:
@@ -1625,6 +1728,134 @@ def set_interpolation_process_executor(executor: Optional[ProcessPoolExecutor], 
     _INTERPOLATION_PROCESS_MAX_WORKERS = max(0, int(max_workers))
 
 
+# --------------------------
+# v13.3.4 (T4): GPU worker processes as auxiliary interpolation hosts
+# --------------------------
+# The multi-GPU inference workers stay alive (idle in task_queue.get()) through the whole CPU
+# postprocess tail and are only shut down at the very end of main(). Each is a warm process
+# with the module loaded and its own GIL — exactly what the GIL-bound interpolation passes
+# queue for. Once the inference queue drains, interpolation passes submit here
+# opportunistically (non-blocking slot acquire) BEFORE falling back to the dedicated
+# interpolation process pool, adding up to gpu_count extra concurrent passes for free.
+
+
+def gpu_worker_aux_interpolation_enabled() -> bool:
+    return _env_flag('YOLO_TTA_GPU_WORKER_AUX_INTERPOLATION', True)
+
+
+class _GpuWorkerAuxInterpolationPool:
+    """Submission/result bridge between interpolation callers and the GPU worker task queue.
+
+    try_submit is non-blocking (None when the pool is closed, failed, or all worker slots are
+    busy); the caller then uses the regular interpolation process executor. Results flow back
+    through the workers' shared result queue: the main scheduler thread routes
+    'aux_result' messages to complete(), which wakes the waiting submitter thread.
+    """
+
+    def __init__(self, task_queue: object, worker_count: int) -> None:
+        self._task_queue = task_queue
+        self._capacity = max(1, int(worker_count))
+        self._slots = threading.Semaphore(self._capacity)
+        self._lock = threading.Lock()
+        self._pending: Dict[int, Dict[str, object]] = {}
+        self._next_task_id = 2_000_000_000  # disjoint from inference task ids
+        self._enabled = threading.Event()
+        self._failed_reason: Optional[str] = None
+
+    @property
+    def capacity(self) -> int:
+        return int(self._capacity)
+
+    def enable(self) -> None:
+        if not self._enabled.is_set():
+            self._enabled.set()
+            print(
+                f'GPU worker aux interpolation pool open (v13.3.4 T4): up to {self._capacity} '
+                'interpolation pass(es) run on the now-idle GPU worker processes.'
+            )
+
+    def outstanding(self) -> int:
+        with self._lock:
+            return int(len(self._pending))
+
+    def mark_failed(self, reason: str) -> None:
+        with self._lock:
+            if self._failed_reason is None:
+                self._failed_reason = str(reason)
+            entries = list(self._pending.values())
+            self._pending.clear()
+        for entry in entries:
+            if not entry.get('error'):
+                entry['error'] = str(reason)
+            entry['event'].set()  # type: ignore[union-attr]
+
+    def try_submit(self, aux_kwargs: Dict[str, object]) -> Optional[Dict[str, object]]:
+        if not self._enabled.is_set():
+            return None
+        with self._lock:
+            if self._failed_reason is not None:
+                return None
+        if not self._slots.acquire(blocking=False):
+            return None
+        handle: Dict[str, object] = {'event': threading.Event(), 'stats': None, 'error': None}
+        with self._lock:
+            task_id = int(self._next_task_id)
+            self._next_task_id += 1
+            handle['task_id'] = task_id
+            self._pending[task_id] = handle
+        try:
+            self._task_queue.put({
+                'task_id': int(task_id),
+                'task_type': 'interpolation_pass',
+                'aux_kwargs': dict(aux_kwargs),
+            })
+        except Exception:
+            with self._lock:
+                self._pending.pop(task_id, None)
+            self._slots.release()
+            return None
+        return handle
+
+    def complete(self, task_id: int, ok: bool, stats: Optional[Dict[str, object]], error: Optional[str]) -> None:
+        with self._lock:
+            handle = self._pending.pop(int(task_id), None)
+        if handle is None:
+            return
+        if bool(ok):
+            handle['stats'] = dict(stats or {})
+        else:
+            handle['error'] = str(error or 'unknown GPU-worker aux interpolation failure')
+        self._slots.release()
+        handle['event'].set()  # type: ignore[union-attr]
+
+    def wait(self, handle: Dict[str, object], poll_seconds: float = 5.0) -> Dict[str, object]:
+        event: threading.Event = handle['event']  # type: ignore[assignment]
+        while not event.wait(timeout=float(poll_seconds)):
+            with self._lock:
+                failed = self._failed_reason
+            if failed is not None:
+                raise RuntimeError(f'GPU worker aux interpolation pool failed: {failed}')
+        err = handle.get('error')
+        if err:
+            raise RuntimeError(str(err))
+        stats = handle.get('stats')
+        if not isinstance(stats, dict):
+            raise RuntimeError('GPU worker aux interpolation returned no stats')
+        return dict(stats)
+
+
+_GPU_WORKER_AUX_INTERPOLATION_POOL: Optional[_GpuWorkerAuxInterpolationPool] = None
+
+
+def set_gpu_worker_aux_interpolation_pool(pool: Optional[_GpuWorkerAuxInterpolationPool]) -> None:
+    global _GPU_WORKER_AUX_INTERPOLATION_POOL
+    _GPU_WORKER_AUX_INTERPOLATION_POOL = pool
+
+
+def gpu_worker_aux_interpolation_pool() -> Optional[_GpuWorkerAuxInterpolationPool]:
+    return _GPU_WORKER_AUX_INTERPOLATION_POOL
+
+
 def _interpolation_array_backing_path(arr: object) -> Optional[Path]:
     if arr is None:
         return None
@@ -1810,8 +2041,7 @@ def interpolate_view_volume_pass_maybe_process(
     dtype_str = str(np.asarray(process_mm).dtype)
     flush_array(process_mm)
 
-    fut = executor.submit(
-        _interpolation_process_entry,
+    pass_entry_kwargs: Dict[str, object] = dict(
         mask_path=str(process_path),
         mask_shape=shape,
         mask_dtype=dtype_str,
@@ -1828,6 +2058,49 @@ def interpolate_view_volume_pass_maybe_process(
         wrap_axis=bool(wrap_axis),
         bridge_delta_path=str(bridge_delta_path) if bridge_delta_path is not None else None,
     )
+
+    # v13.3.4 (T4): once inference has drained, the warm GPU worker processes serve
+    # interpolation passes too — try them first (non-blocking), then the dedicated pool.
+    aux_pool = gpu_worker_aux_interpolation_pool()
+    if aux_pool is not None:
+        aux_handle = aux_pool.try_submit(pass_entry_kwargs)
+        if aux_handle is not None:
+            try:
+                stats = dict(aux_pool.wait(aux_handle))
+            except Exception as exc:
+                if not interpolation_process_fallback_enabled():
+                    raise RuntimeError(
+                        f'GPU-worker aux interpolation failed for {pass_tag} at {process_path}. '
+                        'Set YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK=1 to rerun failed passes in-process for recovery.'
+                    ) from exc
+                print(
+                    f'Warning: GPU-worker aux interpolation failed for {pass_tag} ({exc}); '
+                    'falling back to in-process interpolation because YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK=1.'
+                )
+                stats = dict(interpolate_view_volume_pass_inplace(
+                    mask_mm=process_mm,
+                    work_dir=work_dir,
+                    pass_tag=pass_tag,
+                    max_slice_distance=int(max_slice_distance),
+                    search_angle_deg=float(search_angle_deg),
+                    interpolation_walk_back=int(interpolation_walk_back),
+                    interpolation_candidates=int(interpolation_candidates),
+                    interpolate_min_radius=float(interpolate_min_radius),
+                    keep_temp=bool(keep_temp),
+                    prefer_memory=bool(prefer_memory),
+                    reserve_bytes=int(reserve_bytes),
+                    workers=int(workers),
+                    wrap_axis=bool(wrap_axis),
+                    bridge_delta_path=bridge_delta_path,
+                ))
+                stats['process_backend'] = 'fallback_in_process_after_aux_failure'
+            stats.setdefault('process_backend', 'gpu_worker_aux_process')
+            stats['process_memmap_copied_from_anonymous_array'] = bool(copied_to_memmap)
+            stats['process_pool_workers'] = int(_INTERPOLATION_PROCESS_MAX_WORKERS)
+            flush_array(process_mm)
+            return process_mm, stats
+
+    fut = executor.submit(_interpolation_process_entry, **pass_entry_kwargs)
     try:
         stats = dict(fut.result())
     except Exception as exc:
@@ -8100,8 +8373,10 @@ def predict_source_and_accumulate(
                 prediction_count += int(pred_inc)
                 frames_with_predictions += int(frame_inc)
         else:
-            pending: List[object] = []
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            pending: List[Future] = []
+            # v13.3.4 (T5): checkout-cached pool — one build per worker process, not per task.
+            executor = _acquire_parallel_pool(worker_count)
+            try:
                 for idx, r in enumerate(results):
                     if idx >= num_frames:
                         # Discard synthetic repeated-slice results from the padded final batch.
@@ -8127,6 +8402,9 @@ def predict_source_and_accumulate(
                     pred_inc, frame_inc = fut.result()
                     prediction_count += int(pred_inc)
                     frames_with_predictions += int(frame_inc)
+            finally:
+                _settle_parallel_futures(pending)
+                _release_parallel_pool(worker_count, executor)
 
         # v13.3.3 (S2): when requested (single-angle, no min_conf/min_radius work), hole-fill the
         # accumulated device union per slice ON DEVICE before the flush; the scheduler then skips
@@ -9668,6 +9946,23 @@ def _gpu_inference_worker_main(
         if task is None:
             break
         task_id = int(task['task_id'])
+        if str(task.get('task_type', 'inference')) == 'interpolation_pass':
+            # v13.3.4 (T4): after the inference queue drains, this warm worker process doubles
+            # as an interpolation host — same memmap-path protocol as the dedicated
+            # interpolation process pool, one pass at a time per worker.
+            try:
+                aux_stats = _interpolation_process_entry(**dict(task['aux_kwargs']))  # type: ignore[arg-type]
+                result_queue.put({
+                    'type': 'aux_result', 'task_id': task_id, 'gpu_index': int(gpu_index),
+                    'ok': True, 'stats': dict(aux_stats),
+                })
+            except Exception as exc:  # pragma: no cover - surfaced to the waiting submitter
+                import traceback
+                result_queue.put({
+                    'type': 'aux_result', 'task_id': task_id, 'gpu_index': int(gpu_index), 'ok': False,
+                    'error': repr(exc), 'traceback': traceback.format_exc(),
+                })
+            continue
         try:
             stats = run_prediction_volume_in_worker(model, cfg, task)
             result_queue.put({'type': 'result', 'task_id': task_id, 'gpu_index': int(gpu_index), 'ok': True, 'stats': stats})
@@ -9684,24 +9979,84 @@ def _gpu_inference_worker_main(
 # --------------------------
 
 
+if _numba is not None:
+    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+    def _numba_union_find_batch_kernel(
+        parent: np.ndarray,   # int64, mutated in place
+        rank: np.ndarray,     # int32, mutated in place
+        touches: np.ndarray,  # bool, mutated in place
+        a_ids: np.ndarray,    # int64
+        b_ids: np.ndarray,    # int64
+    ) -> None:
+        # Identical algorithm to _UnionFind.find/union (path halving + union by rank), applied
+        # to a whole batch of pairs in one nogil call.
+        for i in range(a_ids.shape[0]):
+            ra = a_ids[i]
+            while parent[ra] != ra:
+                parent[ra] = parent[parent[ra]]
+                ra = parent[ra]
+            rb = b_ids[i]
+            while parent[rb] != rb:
+                parent[rb] = parent[parent[rb]]
+                rb = parent[rb]
+            if ra == rb:
+                continue
+            if rank[ra] < rank[rb]:
+                ra, rb = rb, ra
+            parent[rb] = ra
+            if touches[rb]:
+                touches[ra] = True
+            if rank[ra] == rank[rb]:
+                rank[ra] += 1
+else:
+    _numba_union_find_batch_kernel = None
+
+
+_NUMBA_UNION_FIND_KERNEL_RUNTIME_DISABLED = False
+
+
 class _UnionFind:
-    """Simple dynamic union-find for slice-streamed 3D connected-components."""
+    """Dynamic union-find for slice-streamed 3D connected-components.
+
+    v13.3.4 (T2): numpy-array-backed (was python lists). Batched pair merges run through one
+    numba nogil kernel call per batch (``union_pair_codes``; python loop fallback preserves
+    the exact algorithm), and ``root_map`` resolves every id by vectorized pointer jumping
+    instead of a per-id python find loop. Same union-by-rank + path-halving as before, so
+    root representatives are identical for the same union order.
+    """
 
     def __init__(self) -> None:
-        self.parent: List[int] = [0]
-        self.rank: List[int] = [0]
-        self.touches_boundary: List[bool] = [False]
+        cap = 1024
+        self.parent = np.arange(cap, dtype=np.int64)
+        self.rank = np.zeros(cap, dtype=np.int32)
+        self.touches_boundary = np.zeros(cap, dtype=bool)
+        self._size = 1
+
+    def _ensure_capacity(self, need: int) -> None:
+        cap = int(self.parent.shape[0])
+        if int(need) <= cap:
+            return
+        new_cap = max(int(need), cap * 2)
+        new_parent = np.arange(new_cap, dtype=np.int64)
+        new_parent[:cap] = self.parent
+        new_rank = np.zeros(new_cap, dtype=np.int32)
+        new_rank[:cap] = self.rank
+        new_touches = np.zeros(new_cap, dtype=bool)
+        new_touches[:cap] = self.touches_boundary
+        self.parent = new_parent
+        self.rank = new_rank
+        self.touches_boundary = new_touches
 
     def new_ids(self, count: int) -> np.ndarray:
         if count <= 0:
             return np.zeros((0,), dtype=np.uint32)
-        start = len(self.parent)
+        start = int(self._size)
         stop = start + int(count)
         if stop >= 2 ** 32:
             raise RuntimeError('3D component id space exceeded uint32 capacity')
-        self.parent.extend(range(start, stop))
-        self.rank.extend([0] * int(count))
-        self.touches_boundary.extend([False] * int(count))
+        self._ensure_capacity(stop)
+        # parent[start:stop] is already arange-initialized (construction/growth), rank/touches zero.
+        self._size = stop
         return np.arange(start, stop, dtype=np.uint32)
 
     def find(self, x: int) -> int:
@@ -9709,7 +10064,7 @@ class _UnionFind:
         while parent[x] != x:
             parent[x] = parent[parent[x]]
             x = parent[x]
-        return x
+        return int(x)
 
     def union(self, a: int, b: int) -> int:
         ra = self.find(int(a))
@@ -9724,16 +10079,49 @@ class _UnionFind:
         self.touches_boundary[ra] = bool(self.touches_boundary[ra] or self.touches_boundary[rb])
         if self.rank[ra] == self.rank[rb]:
             self.rank[ra] += 1
-        return ra
+        return int(ra)
+
+    def union_pair_codes(self, codes: np.ndarray) -> None:
+        """Merge a batch of uint64 pair codes ((a << 32) | b) in one call."""
+        global _NUMBA_UNION_FIND_KERNEL_RUNTIME_DISABLED
+        codes_arr = np.asarray(codes, dtype=np.uint64)
+        if codes_arr.size <= 0:
+            return
+        a_ids = (codes_arr >> np.uint64(32)).astype(np.int64, copy=False)
+        b_ids = (codes_arr & np.uint64(0xFFFFFFFF)).astype(np.int64, copy=False)
+        if (
+            _numba_union_find_batch_kernel is not None
+            and compiled_interpolation_kernels_enabled()
+            and not _NUMBA_UNION_FIND_KERNEL_RUNTIME_DISABLED
+        ):
+            try:
+                _numba_union_find_batch_kernel(
+                    self.parent, self.rank, self.touches_boundary,
+                    np.ascontiguousarray(a_ids), np.ascontiguousarray(b_ids),
+                )
+                return
+            except Exception as exc:
+                _NUMBA_UNION_FIND_KERNEL_RUNTIME_DISABLED = True
+                print(f'Warning: numba union-find batch kernel failed ({exc}); using the python loop.')
+        for i in range(int(a_ids.shape[0])):
+            self.union(int(a_ids[i]), int(b_ids[i]))
 
     def mark_boundary(self, x: int) -> None:
         self.touches_boundary[self.find(int(x))] = True
 
     def root_map(self) -> np.ndarray:
-        out = np.zeros((len(self.parent),), dtype=np.uint32)
-        for i in range(1, len(self.parent)):
-            out[i] = np.uint32(self.find(i))
-        return out
+        # v13.3.4 (T2): vectorized pointer jumping — every id follows its parent chain in
+        # O(log depth) whole-array passes (depth is tiny thanks to path halving during unions).
+        n = int(self._size)
+        p = self.parent[:n].copy()
+        while True:
+            pp = p[p]
+            if np.array_equal(pp, p):
+                break
+            p = pp
+        out = p.astype(np.uint32, copy=False)
+        out[0] = np.uint32(0)
+        return np.ascontiguousarray(out)
 
 
 def _adjacent_xy_offsets_for_3d_connectivity(connectivity: int) -> Tuple[Tuple[int, int], ...]:
@@ -9931,8 +10319,7 @@ def fill_3d_voids_inplace_streaming(
         _mark_boundary_components_from_local_labels(uf, local_to_gid, labels2d, z=z, z_max=z_dim - 1)
 
         if prev_gid_slice is not None and np.any(prev_gid_slice) and np.any(gid_slice):
-            for a, b in _iter_adjacent_gid_pairs(prev_gid_slice, gid_slice, adjacent_offsets):
-                uf.union(int(a), int(b))
+            uf.union_pair_codes(_adjacent_gid_pair_codes(prev_gid_slice, gid_slice, adjacent_offsets))
 
         prev_gid_slice = np.asarray(gid_slice)
 
@@ -10172,10 +10559,10 @@ def label_foreground_volume_streaming(
                 max_workers=pair_workers,
                 max_pending=max(pair_workers, pair_workers * 2),
             )
+        # v13.3.4 (T2): one batched (numba nogil) union call per slice-pair instead of a python
+        # loop per pair code — the serial merge stops being the cross-slice-unions bottleneck.
         for codes in tqdm(pair_iter, total=max(0, int(z_dim) - 1), desc='Interpolation: cross-slice unions'):
-            for code in np.asarray(codes, dtype=np.uint64):
-                code_i = int(code)
-                uf.union(code_i >> 32, code_i & 0xFFFFFFFF)
+            uf.union_pair_codes(codes)
 
     if bool(wrap_axis) and int(z_dim) > 1:
         first_gid_slice = np.asarray(labels_store[0])
@@ -10187,14 +10574,12 @@ def label_foreground_volume_streaming(
             # relation the radial backprojection uses. Comparing at identical (t, u)
             # instead unioned mirror images through the rotation axis and missed the
             # true angular continuation.
-            for code in _adjacent_gid_pair_codes(
+            uf.union_pair_codes(_adjacent_gid_pair_codes(
                 last_gid_slice,
                 first_gid_slice[:, ::-1],
                 prev_offset=int(slice_offsets[int(z_dim) - 1]),
                 curr_offset=int(slice_offsets[0]),
-            ):
-                code_i = int(code)
-                uf.union(code_i >> 32, code_i & 0xFFFFFFFF)
+            ))
 
     root_map = uf.root_map()
     if root_map.shape[0] <= 1:
@@ -10824,7 +11209,7 @@ def _radial_backproject_gpu_streaming(
     # v13.3.3 (S1): one sequential occupancy pass replaces ~O(chunks x rows) strided rescans.
     row_any = _radial_row_occupancy(radial_mask_mm, desc)
     stage_workers = max(1, min(8, _cpu_count()))
-    stage_pool = ThreadPoolExecutor(max_workers=stage_workers, thread_name_prefix='radial-backproject-stage')
+    stage_pool = _acquire_parallel_pool(stage_workers)  # v13.3.4 (T5): checkout-cached
 
     try:
         stream = torch.cuda.Stream(device=dev)
@@ -10873,7 +11258,7 @@ def _radial_backproject_gpu_streaming(
                 )
             stream.synchronize()
     finally:
-        stage_pool.shutdown(wait=True)
+        _release_parallel_pool(stage_workers, stage_pool)
     print(f'{desc}: GPU streaming backprojection complete ({t_dim} output slices).')
     return True
 
@@ -11722,6 +12107,14 @@ def _keep_center_component_2d(mask2d: np.ndarray) -> np.ndarray:
     if not mask2d.any():
         return mask2d
 
+    if _planning_kernels_active():
+        try:
+            # v13.3.4 (T3): fused keep-center + hole fill in one nogil kernel (two flood
+            # fills on the small canvas) instead of cv2 label + per-edge uniques + fill.
+            return _numba_keep_center_fill_kernel(np.ascontiguousarray(mask2d))
+        except Exception as exc:
+            _disable_planning_kernels(exc)
+
     mask_u8 = np.ascontiguousarray(mask2d.astype(np.uint8, copy=False))
     num_labels, labels2d = _cv2_connected_components(mask_u8, connectivity=8)
     if int(num_labels) <= 2:  # background label 0 + at most one component
@@ -11921,8 +12314,9 @@ class SliceComponentTableCache:
             round(float(search_angle_deg), 6),
             int(pad),
         )
-        with self._sdf_lock:
-            cached = self._projection_sdfs.get(key)
+        # v13.3.4 (T3): lock-free read fast path — CPython dict reads are atomic, and 160
+        # planner threads were serializing on this lock for cache HITS; only inserts lock.
+        cached = self._projection_sdfs.get(key)
         if cached is not None:
             return cached
 
@@ -11947,10 +12341,20 @@ class SliceComponentTableCache:
 
 
 def _nearest_point_in_component_record(record: SliceComponentRecord, ref_yx: Tuple[int, int]) -> Optional[Tuple[int, int]]:
+    y0, x0, _y1, _x1 = record.bbox
+    if _planning_kernels_active():
+        try:
+            by, bx, found = _numba_nearest_true_pixel_kernel(
+                record.mask_crop, int(ref_yx[0]) - int(y0), int(ref_yx[1]) - int(x0),
+            )
+            if int(found) == 0:
+                return None
+            return int(by) + int(y0), int(bx) + int(x0)
+        except Exception as exc:
+            _disable_planning_kernels(exc)
     ys, xs = np.nonzero(record.mask_crop)
     if ys.size == 0:
         return None
-    y0, x0, _y1, _x1 = record.bbox
     gy = ys.astype(np.int64, copy=False) + int(y0)
     gx = xs.astype(np.int64, copy=False) + int(x0)
     d2 = (gy - int(ref_yx[0])) ** 2 + (gx - int(ref_yx[1])) ** 2
@@ -11970,6 +12374,17 @@ def _component_record_dilated_overlap_count(prev_record: SliceComponentRecord, c
     if iy0 >= iy1 or ix0 >= ix1:
         return 0
 
+    if _planning_kernels_active():
+        try:
+            # v13.3.4 (T3): direct 3x3 neighborhood test — no pad, no cv2.dilate materialization.
+            return int(_numba_dilated_overlap_count_kernel(
+                prev_record.mask_crop, int(py0), int(px0),
+                candidate_record.mask_crop, int(cy0), int(cx0),
+                int(iy0), int(ix0), int(iy1), int(ix1),
+            ))
+        except Exception as exc:
+            _disable_planning_kernels(exc)
+
     padded_prev = np.pad(np.asarray(prev_record.mask_crop, dtype=np.uint8), 1, mode='constant', constant_values=0)
     dilated_prev = cv2.dilate(padded_prev, np.ones((3, 3), dtype=np.uint8), iterations=1).astype(bool, copy=False)
     prev_origin_y = int(py0) - 1
@@ -11988,6 +12403,16 @@ def _component_records_directly_overlap(a: SliceComponentRecord, b: SliceCompone
     ix1 = min(int(ax1), int(bx1))
     if iy0 >= iy1 or ix0 >= ix1:
         return False
+    if _planning_kernels_active():
+        try:
+            # v13.3.4 (T3): early-exit scan — no temporary AND plane per test.
+            return bool(_numba_blocks_overlap_any_kernel(
+                a.mask_crop, int(ay0), int(ax0),
+                b.mask_crop, int(by0), int(bx0),
+                int(iy0), int(ix0), int(iy1), int(ix1),
+            ))
+        except Exception as exc:
+            _disable_planning_kernels(exc)
     a_block = a.mask_crop[iy0 - int(ay0):iy1 - int(ay0), ix0 - int(ax0):ix1 - int(ax0)]
     b_block = b.mask_crop[iy0 - int(by0):iy1 - int(by0), ix0 - int(bx0):ix1 - int(bx0)]
     return bool(np.any(a_block & b_block))
@@ -12015,92 +12440,92 @@ def _component_record_mirrored_u(record: SliceComponentRecord, width: int) -> Sl
 
 
 def _build_slice_component_table(labels2d: np.ndarray, z: int) -> SliceComponentTable:
+    """Build the per-slice component records for interpolation planning.
+
+    v13.3.4 (T1): ONE cv2.connectedComponentsWithStats call over the slice's foreground bbox
+    replaces the old per-3D-label scheme (full-slice foreground argsort + one CC call per label
+    on its own bbox crop). In-plane labeling is always 8-connected
+    (label_foreground_volume_streaming), so two different 3D labels can never be 8-adjacent
+    within a slice — every whole-slice 8-connected component therefore lies wholly inside one
+    3D label, and the per-label grouping is recovered by reading the label at any pixel of the
+    component. Records carry identical bboxes/areas/anchors; only the LIST order (whole-slice
+    scan order instead of ascending-label order) and the arbitrary component_index values
+    differ, neither of which affects planning decisions beyond exact ties.
+    """
     labels_arr = np.asarray(labels2d)
     h, w = (int(labels_arr.shape[0]), int(labels_arr.shape[1]))
     components: List[SliceComponentRecord] = []
     by_label: Dict[int, List[SliceComponentRecord]] = {}
 
-    ys_all, xs_all = np.nonzero(labels_arr)
-    if ys_all.size <= 0:
+    rows_any = labels_arr.any(axis=1)
+    if not rows_any.any():
         return SliceComponentTable(z=int(z), shape=(h, w), components=components, by_label=by_label)
+    cols_any = labels_arr.any(axis=0)
+    row_idx = np.flatnonzero(rows_any)
+    col_idx = np.flatnonzero(cols_any)
+    by0 = int(row_idx[0])
+    by1 = int(row_idx[-1]) + 1
+    bx0 = int(col_idx[0])
+    bx1 = int(col_idx[-1]) + 1
 
-    # Build each label's 2D components from sparse foreground coordinates instead of scanning the
-    # full 9 MP slice once per object label.  This keeps endpoint-table construction local to the
-    # actual foreground footprint while preserving the rule that different 3D labels remain separate
-    # even when they touch in this slice.
-    labels_fg = labels_arr[ys_all, xs_all].astype(np.int64, copy=False)
-    order = np.argsort(labels_fg, kind='mergesort')
-    labels_sorted = labels_fg[order]
-    ys_sorted = ys_all[order]
-    xs_sorted = xs_all[order]
-    boundaries = np.flatnonzero(labels_sorted[1:] != labels_sorted[:-1]) + 1
-    starts = np.concatenate(([0], boundaries)).astype(np.int64, copy=False)
-    stops = np.concatenate((boundaries, [labels_sorted.size])).astype(np.int64, copy=False)
-
-    for start_i, stop_i in zip(starts.tolist(), stops.tolist()):
-        if int(stop_i) <= int(start_i):
+    crop_labels = labels_arr[by0:by1, bx0:bx1]
+    fg_u8 = (crop_labels > 0).astype(np.uint8, copy=False)
+    num_cc, cc, stats, centroids = cv2.connectedComponentsWithStats(
+        np.ascontiguousarray(fg_u8), connectivity=8, ltype=cv2.CV_32S,
+    )
+    for local_lbl in range(1, int(num_cc)):
+        area = int(stats[int(local_lbl), cv2.CC_STAT_AREA])
+        if area <= 0:
             continue
-        label_i = int(labels_sorted[int(start_i)])
+        x = int(stats[int(local_lbl), cv2.CC_STAT_LEFT])
+        y = int(stats[int(local_lbl), cv2.CC_STAT_TOP])
+        width = int(stats[int(local_lbl), cv2.CC_STAT_WIDTH])
+        height = int(stats[int(local_lbl), cv2.CC_STAT_HEIGHT])
+        if width <= 0 or height <= 0:
+            continue
+        comp_crop = np.ascontiguousarray(cc[y:y + height, x:x + width] == int(local_lbl))
+        ys, xs = np.nonzero(comp_crop)
+        if ys.size <= 0:
+            continue
+        # Whole component belongs to one 3D label (see docstring): read it at any member pixel.
+        label_i = int(crop_labels[y + int(ys[0]), x + int(xs[0])])
         if label_i <= 0:
             continue
-        ys_g = ys_sorted[int(start_i):int(stop_i)].astype(np.int64, copy=False)
-        xs_g = xs_sorted[int(start_i):int(stop_i)].astype(np.int64, copy=False)
-        if ys_g.size <= 0:
-            continue
-
-        y0 = int(np.min(ys_g))
-        y1 = int(np.max(ys_g)) + 1
-        x0 = int(np.min(xs_g))
-        x1 = int(np.max(xs_g)) + 1
-        crop_h = int(y1 - y0)
-        crop_w = int(x1 - x0)
-        if crop_h <= 0 or crop_w <= 0:
-            continue
-
-        mask_u8 = np.zeros((crop_h, crop_w), dtype=np.uint8)
-        mask_u8[ys_g - int(y0), xs_g - int(x0)] = np.uint8(1)
-        num_cc, cc, stats, centroids = cv2.connectedComponentsWithStats(mask_u8, connectivity=8, ltype=cv2.CV_32S)
-        for local_lbl in range(1, int(num_cc)):
-            area = int(stats[int(local_lbl), cv2.CC_STAT_AREA])
-            if area <= 0:
-                continue
-            x = int(stats[int(local_lbl), cv2.CC_STAT_LEFT])
-            y = int(stats[int(local_lbl), cv2.CC_STAT_TOP])
-            width = int(stats[int(local_lbl), cv2.CC_STAT_WIDTH])
-            height = int(stats[int(local_lbl), cv2.CC_STAT_HEIGHT])
-            if width <= 0 or height <= 0:
-                continue
-            comp_crop = np.ascontiguousarray(cc[y:y + height, x:x + width] == int(local_lbl))
-            ys, xs = np.nonzero(comp_crop)
-            if ys.size <= 0:
-                continue
-            centroid_x = float(centroids[int(local_lbl), 0]) - float(x)
-            centroid_y = float(centroids[int(local_lbl), 1]) - float(y)
-            d2 = (ys.astype(np.float32, copy=False) - centroid_y) ** 2 + (xs.astype(np.float32, copy=False) - centroid_x) ** 2
-            anchor_idx = int(np.argmin(d2))
-            record = SliceComponentRecord(
-                z=int(z),
-                label=int(label_i),
-                component_index=int(len(components) + 1),
-                bbox=(int(y0 + y), int(x0 + x), int(y0 + y + height), int(x0 + x + width)),
-                anchor=(int(y0 + y + int(ys[anchor_idx])), int(x0 + x + int(xs[anchor_idx]))),
-                area=int(area),
-                mask_crop=comp_crop,
-            )
-            components.append(record)
-            by_label.setdefault(int(label_i), []).append(record)
+        centroid_x = float(centroids[int(local_lbl), 0]) - float(x)
+        centroid_y = float(centroids[int(local_lbl), 1]) - float(y)
+        d2 = (ys.astype(np.float32, copy=False) - centroid_y) ** 2 + (xs.astype(np.float32, copy=False) - centroid_x) ** 2
+        anchor_idx = int(np.argmin(d2))
+        record = SliceComponentRecord(
+            z=int(z),
+            label=int(label_i),
+            component_index=int(len(components) + 1),
+            bbox=(int(by0 + y), int(bx0 + x), int(by0 + y + height), int(bx0 + x + width)),
+            anchor=(int(by0 + y + int(ys[anchor_idx])), int(bx0 + x + int(xs[anchor_idx]))),
+            area=int(area),
+            mask_crop=comp_crop,
+        )
+        components.append(record)
+        by_label.setdefault(int(label_i), []).append(record)
     return SliceComponentTable(z=int(z), shape=(h, w), components=components, by_label=by_label)
 
 
 def _component_record_to_local_canvas(record: SliceComponentRecord, anchor_yx: Tuple[int, int], half_width: int) -> np.ndarray:
     size = int(2 * int(half_width) + 1)
     local = np.zeros((size, size), dtype=bool)
+    y0, x0, _y1, _x1 = record.bbox
+    y_off = int(y0) - int(anchor_yx[0]) + int(half_width)
+    x_off = int(x0) - int(anchor_yx[1]) + int(half_width)
+    if _planning_kernels_active():
+        try:
+            _numba_scatter_true_kernel(record.mask_crop, int(y_off), int(x_off), local)
+            return local
+        except Exception as exc:
+            _disable_planning_kernels(exc)
     ys, xs = np.nonzero(record.mask_crop)
     if ys.size == 0:
         return local
-    y0, x0, _y1, _x1 = record.bbox
-    yy = ys.astype(np.int64, copy=False) + int(y0) - int(anchor_yx[0]) + int(half_width)
-    xx = xs.astype(np.int64, copy=False) + int(x0) - int(anchor_yx[1]) + int(half_width)
+    yy = ys.astype(np.int64, copy=False) + int(y_off)
+    xx = xs.astype(np.int64, copy=False) + int(x_off)
     valid = (yy >= 0) & (yy < size) & (xx >= 0) & (xx < size)
     local[yy[valid], xx[valid]] = True
     return local
@@ -12114,10 +12539,20 @@ def _local_half_width_for_component_records(
 ) -> int:
     max_extent = 0.0
     for record, anchor in ((source_record, source_anchor), (target_record, target_anchor)):
+        y0, x0, _y1, _x1 = record.bbox
+        if _planning_kernels_active():
+            try:
+                ext = int(_numba_max_abs_extent_kernel(
+                    record.mask_crop, int(anchor[0]) - int(y0), int(anchor[1]) - int(x0),
+                ))
+                if ext >= 0:
+                    max_extent = max(max_extent, float(ext))
+                continue
+            except Exception as exc:
+                _disable_planning_kernels(exc)
         ys, xs = np.nonzero(record.mask_crop)
         if ys.size == 0:
             continue
-        y0, x0, _y1, _x1 = record.bbox
         gy = ys.astype(np.int64, copy=False) + int(y0)
         gx = xs.astype(np.int64, copy=False) + int(x0)
         max_extent = max(
@@ -12151,6 +12586,16 @@ class SliceProjectionCandidate:
 
 
 def _nearest_point_in_mask(mask2d: np.ndarray, ref_yx: Tuple[int, int]) -> Optional[Tuple[int, int]]:
+    if _planning_kernels_active():
+        try:
+            by, bx, found = _numba_nearest_true_pixel_kernel(
+                np.asarray(mask2d, dtype=bool), int(ref_yx[0]), int(ref_yx[1]),
+            )
+            if int(found) == 0:
+                return None
+            return int(by), int(bx)
+        except Exception as exc:
+            _disable_planning_kernels(exc)
     ys, xs = np.nonzero(mask2d)
     if ys.size == 0:
         return None
@@ -12250,12 +12695,20 @@ def _follow_branch_component(
 def _component_to_local_canvas(mask2d: np.ndarray, anchor_yx: Tuple[int, int], half_width: int) -> np.ndarray:
     size = int(2 * half_width + 1)
     local = np.zeros((size, size), dtype=bool)
+    y_off = -int(anchor_yx[0]) + int(half_width)
+    x_off = -int(anchor_yx[1]) + int(half_width)
+    if _planning_kernels_active():
+        try:
+            _numba_scatter_true_kernel(np.asarray(mask2d, dtype=bool), int(y_off), int(x_off), local)
+            return local
+        except Exception as exc:
+            _disable_planning_kernels(exc)
     ys, xs = np.nonzero(mask2d)
     if ys.size == 0:
         return local
 
-    yy = ys.astype(np.int64) - int(anchor_yx[0]) + int(half_width)
-    xx = xs.astype(np.int64) - int(anchor_yx[1]) + int(half_width)
+    yy = ys.astype(np.int64) + int(y_off)
+    xx = xs.astype(np.int64) + int(x_off)
     valid = (yy >= 0) & (yy < size) & (xx >= 0) & (xx < size)
     local[yy[valid], xx[valid]] = True
     return local
@@ -12294,6 +12747,18 @@ def _paste_local_mask_onto_slice(dest_slice: np.ndarray, local_mask: np.ndarray,
     if src_y0 >= src_y1 or src_x0 >= src_x1:
         return 0
 
+    if _planning_kernels_active():
+        try:
+            # v13.3.4 (T3): one nogil pass counts+writes only newly-set pixels (bridge slices
+            # hold 0/1) instead of two bool temporaries + a count + an OR store per paste.
+            return int(_numba_paste_masked_or_kernel(
+                np.asarray(dest_slice), np.asarray(local_mask, dtype=bool),
+                int(dst_y0), int(dst_x0),
+                int(src_y0), int(src_y1), int(src_x0), int(src_x1),
+            ))
+        except Exception as exc:
+            _disable_planning_kernels(exc)
+
     patch = np.asarray(local_mask[src_y0:src_y1, src_x0:src_x1], dtype=bool)
     current = np.asarray(dest_slice[dst_y0:dst_y1, dst_x0:dst_x1], dtype=bool)
     added = int(np.count_nonzero(patch & (~current)))
@@ -12327,10 +12792,278 @@ def _local_half_width_for_components(
 
 
 _NUMBA_PROJECTION_KERNEL_RUNTIME_DISABLED = False
+_NUMBA_PLANNING_KERNELS_RUNTIME_DISABLED = False
 
 
 def compiled_interpolation_kernels_enabled() -> bool:
     return bool(_numba is not None and _env_flag('YOLO_TTA_INTERPOLATION_COMPILED_KERNELS', True))
+
+
+# --------------------------
+# v13.3.4 (T3): numba nogil kernels for the seed-planning inner loop
+# --------------------------
+# Seed planning ran at ~20-100 seeds/s with 160 planner threads: the per-seed work is dozens of
+# tiny numpy/python steps (nonzero + argmin nearest-point searches, local-canvas scatters,
+# extent reductions, cv2 dilate/label calls on small crops) whose python glue serializes on the
+# GIL. Each helper below compresses one of those steps into a single nogil call; the python
+# implementations remain as automatic fallbacks (first failure disables all planning kernels
+# for the process, mirroring the projection-kernel guard).
+
+if _numba is not None:
+    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+    def _numba_nearest_true_pixel_kernel(mask: np.ndarray, ref_y: int, ref_x: int) -> Tuple[int, int, int]:
+        best_y = -1
+        best_x = -1
+        best_d2 = np.int64(0)
+        found = 0
+        for y in range(mask.shape[0]):
+            for x in range(mask.shape[1]):
+                if not mask[y, x]:
+                    continue
+                dy = np.int64(y - ref_y)
+                dx = np.int64(x - ref_x)
+                d2 = dy * dy + dx * dx
+                if found == 0 or d2 < best_d2:
+                    best_d2 = d2
+                    best_y = y
+                    best_x = x
+                    found = 1
+        return best_y, best_x, found
+
+    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+    def _numba_scatter_true_kernel(mask: np.ndarray, y_off: int, x_off: int, out: np.ndarray) -> None:
+        size_y = out.shape[0]
+        size_x = out.shape[1]
+        for y in range(mask.shape[0]):
+            yy = y + y_off
+            if yy < 0 or yy >= size_y:
+                continue
+            for x in range(mask.shape[1]):
+                if mask[y, x]:
+                    xx = x + x_off
+                    if 0 <= xx < size_x:
+                        out[yy, xx] = True
+
+    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+    def _numba_max_abs_extent_kernel(mask: np.ndarray, ref_y: int, ref_x: int) -> int:
+        best = -1
+        for y in range(mask.shape[0]):
+            for x in range(mask.shape[1]):
+                if not mask[y, x]:
+                    continue
+                dy = y - ref_y
+                if dy < 0:
+                    dy = -dy
+                dx = x - ref_x
+                if dx < 0:
+                    dx = -dx
+                ext = dy if dy > dx else dx
+                if ext > best:
+                    best = ext
+        return best
+
+    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+    def _numba_dilated_overlap_count_kernel(
+        prev_mask: np.ndarray, prev_oy: int, prev_ox: int,
+        cand_mask: np.ndarray, cand_oy: int, cand_ox: int,
+        iy0: int, ix0: int, iy1: int, ix1: int,
+    ) -> int:
+        # Count candidate pixels with any prev pixel in their 3x3 neighborhood — the
+        # dilate(prev, 3x3) & cand overlap without materializing the dilation.
+        ph = prev_mask.shape[0]
+        pw = prev_mask.shape[1]
+        count = 0
+        for gy in range(iy0, iy1):
+            cy = gy - cand_oy
+            for gx in range(ix0, ix1):
+                if not cand_mask[cy, gx - cand_ox]:
+                    continue
+                hit = False
+                for dy in range(-1, 2):
+                    py = gy + dy - prev_oy
+                    if py < 0 or py >= ph:
+                        continue
+                    for dx in range(-1, 2):
+                        px = gx + dx - prev_ox
+                        if 0 <= px < pw and prev_mask[py, px]:
+                            hit = True
+                            break
+                    if hit:
+                        break
+                if hit:
+                    count += 1
+        return count
+
+    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+    def _numba_blocks_overlap_any_kernel(
+        a_mask: np.ndarray, a_oy: int, a_ox: int,
+        b_mask: np.ndarray, b_oy: int, b_ox: int,
+        iy0: int, ix0: int, iy1: int, ix1: int,
+    ) -> int:
+        for gy in range(iy0, iy1):
+            ay = gy - a_oy
+            by = gy - b_oy
+            for gx in range(ix0, ix1):
+                if a_mask[ay, gx - a_ox] and b_mask[by, gx - b_ox]:
+                    return 1
+        return 0
+
+    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+    def _numba_keep_center_fill_kernel(mask: np.ndarray) -> np.ndarray:
+        # keep-center-component (8-connected) + enclosed-hole fill (4-connected background),
+        # fused: result = NOT(border-4-connected component of NOT kept). Matches
+        # _keep_center_component_2d + _fill_holes_2d_opencv semantics exactly.
+        h = mask.shape[0]
+        w = mask.shape[1]
+        out = np.zeros((h, w), dtype=np.bool_)
+        if h <= 0 or w <= 0:
+            return out
+
+        cy = h // 2
+        cx = w // 2
+        seed_y = -1
+        seed_x = -1
+        if mask[cy, cx]:
+            seed_y = cy
+            seed_x = cx
+        else:
+            best_d2 = np.int64(-1)
+            for y in range(h):
+                for x in range(w):
+                    if not mask[y, x]:
+                        continue
+                    dy = np.int64(y - cy)
+                    dx = np.int64(x - cx)
+                    d2 = dy * dy + dx * dx
+                    if best_d2 < 0 or d2 < best_d2:
+                        best_d2 = d2
+                        seed_y = y
+                        seed_x = x
+        if seed_y < 0:
+            return out
+
+        # state: 0 unknown, 1 kept (center component), 2 outside background
+        state = np.zeros((h, w), dtype=np.uint8)
+        stack = np.empty((h * w, 2), dtype=np.int32)
+        sp = 0
+        state[seed_y, seed_x] = 1
+        stack[sp, 0] = seed_y
+        stack[sp, 1] = seed_x
+        sp += 1
+        while sp > 0:
+            sp -= 1
+            y = int(stack[sp, 0])
+            x = int(stack[sp, 1])
+            for dy in range(-1, 2):
+                ny = y + dy
+                if ny < 0 or ny >= h:
+                    continue
+                for dx in range(-1, 2):
+                    if dy == 0 and dx == 0:
+                        continue
+                    nx = x + dx
+                    if nx < 0 or nx >= w:
+                        continue
+                    if state[ny, nx] == 0 and mask[ny, nx]:
+                        state[ny, nx] = 1
+                        stack[sp, 0] = ny
+                        stack[sp, 1] = nx
+                        sp += 1
+
+        # 4-connected flood of NOT-kept from every border pixel -> outside background.
+        sp = 0
+        for x in range(w):
+            if state[0, x] == 0:
+                state[0, x] = 2
+                stack[sp, 0] = 0
+                stack[sp, 1] = x
+                sp += 1
+            if state[h - 1, x] == 0:
+                state[h - 1, x] = 2
+                stack[sp, 0] = h - 1
+                stack[sp, 1] = x
+                sp += 1
+        for y in range(h):
+            if state[y, 0] == 0:
+                state[y, 0] = 2
+                stack[sp, 0] = y
+                stack[sp, 1] = 0
+                sp += 1
+            if state[y, w - 1] == 0:
+                state[y, w - 1] = 2
+                stack[sp, 0] = y
+                stack[sp, 1] = w - 1
+                sp += 1
+        while sp > 0:
+            sp -= 1
+            y = int(stack[sp, 0])
+            x = int(stack[sp, 1])
+            if y > 0 and state[y - 1, x] == 0:
+                state[y - 1, x] = 2
+                stack[sp, 0] = y - 1
+                stack[sp, 1] = x
+                sp += 1
+            if y + 1 < h and state[y + 1, x] == 0:
+                state[y + 1, x] = 2
+                stack[sp, 0] = y + 1
+                stack[sp, 1] = x
+                sp += 1
+            if x > 0 and state[y, x - 1] == 0:
+                state[y, x - 1] = 2
+                stack[sp, 0] = y
+                stack[sp, 1] = x - 1
+                sp += 1
+            if x + 1 < w and state[y, x + 1] == 0:
+                state[y, x + 1] = 2
+                stack[sp, 0] = y
+                stack[sp, 1] = x + 1
+                sp += 1
+
+        for y in range(h):
+            for x in range(w):
+                out[y, x] = state[y, x] != 2
+        return out
+
+    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+    def _numba_paste_masked_or_kernel(
+        dest: np.ndarray, local_mask: np.ndarray,
+        dst_y0: int, dst_x0: int,
+        src_y0: int, src_y1: int, src_x0: int, src_x1: int,
+    ) -> int:
+        added = 0
+        for sy in range(src_y0, src_y1):
+            dy = dst_y0 + (sy - src_y0)
+            for sx in range(src_x0, src_x1):
+                if not local_mask[sy, sx]:
+                    continue
+                dx = dst_x0 + (sx - src_x0)
+                if dest[dy, dx] == 0:
+                    dest[dy, dx] = 1
+                    added += 1
+        return added
+else:
+    _numba_nearest_true_pixel_kernel = None
+    _numba_scatter_true_kernel = None
+    _numba_max_abs_extent_kernel = None
+    _numba_dilated_overlap_count_kernel = None
+    _numba_blocks_overlap_any_kernel = None
+    _numba_keep_center_fill_kernel = None
+    _numba_paste_masked_or_kernel = None
+
+
+def _planning_kernels_active() -> bool:
+    return bool(
+        _numba_nearest_true_pixel_kernel is not None
+        and compiled_interpolation_kernels_enabled()
+        and not _NUMBA_PLANNING_KERNELS_RUNTIME_DISABLED
+    )
+
+
+def _disable_planning_kernels(exc: BaseException) -> None:
+    global _NUMBA_PLANNING_KERNELS_RUNTIME_DISABLED
+    if not _NUMBA_PLANNING_KERNELS_RUNTIME_DISABLED:
+        _NUMBA_PLANNING_KERNELS_RUNTIME_DISABLED = True
+        print(f'Warning: numba planning kernels failed ({exc}); using python planning helpers for remaining calls in this process.')
 
 
 def interpolation_projection_numba_max_tracked() -> int:
@@ -17515,7 +18248,8 @@ def _write_one_decomposed_nrrd_layer_payload(
                 local_z_chunk = 1
                 buffers = [np.empty((1, int(out_h), int(out_w)), dtype=np.uint8, order='C')]
 
-            writer_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='nrrd-payload-write')
+            # v13.3.4 (T5): checkout-cached single-thread writer pool (was one build per layer).
+            writer_pool = _acquire_parallel_pool(1)
             pending: Optional[Future] = None
             try:
                 for block_idx, z0 in enumerate(range(0, out_t, int(local_z_chunk))):
@@ -17563,7 +18297,7 @@ def _write_one_decomposed_nrrd_layer_payload(
                         pending.result()
                     except Exception:
                         pass
-                writer_pool.shutdown(wait=True)
+                _release_parallel_pool(1, writer_pool)
 
         if bool(raw_store_native_stream):
             # Target_Dummy layout keeps the list axis last, so one complete layer is a
@@ -20399,6 +21133,11 @@ def main() -> None:
             f'(pinned to CUDA_VISIBLE_DEVICES tokens {pinned_tokens}); model load/CUDA init overlaps decode; '
             f'per-worker CPU workers={per_worker_workers}, cv2 threads=1. Tasks enqueue once the source volume is ready.'
         )
+        # v13.3.4 (T4): the warm workers double as interpolation hosts once inference drains.
+        if gpu_worker_aux_interpolation_enabled() and bool(interpolation_process_backend_active):
+            set_gpu_worker_aux_interpolation_pool(
+                _GpuWorkerAuxInterpolationPool(gpu_task_queue, len(gpu_worker_processes))
+            )
 
         source_volume_path, source_volume_shape, source_volume_dtype = _ensure_source_volume_file_backed()
         # Split each full-frame volume into contiguous slice-range chunks so multiple GPUs can work
@@ -20591,6 +21330,19 @@ def main() -> None:
                 f"GPU worker on device {msg.get('gpu_index')} failed to initialize: "
                 f"{msg.get('error')}\n{msg.get('traceback')}"
             )
+        if mtype == 'aux_result':
+            # v13.3.4 (T4): auxiliary interpolation-pass result — route to the waiting
+            # submitter thread; failures are ITS to handle (fallback/raise), not the
+            # scheduler's, mirroring the interpolation ProcessPoolExecutor semantics.
+            aux_pool = gpu_worker_aux_interpolation_pool()
+            if aux_pool is not None:
+                aux_pool.complete(
+                    int(msg.get('task_id', -1)),
+                    bool(msg.get('ok')),
+                    msg.get('stats') if isinstance(msg.get('stats'), dict) else None,
+                    str(msg.get('error') or '') + ('\n' + str(msg.get('traceback')) if msg.get('traceback') else ''),
+                )
+            return
         mgpu_results_collected += 1
         if not bool(msg.get('ok')):
             raise RuntimeError(
@@ -20603,6 +21355,12 @@ def main() -> None:
             _handle_fullframe_worker_result(task, stats)
         else:
             _handle_tile_worker_result(task, stats)
+        # v13.3.4 (T4): every inference task is accounted for -> the workers are idle from here
+        # on; open the aux interpolation pool so postprocess passes can use their GILs.
+        if int(mgpu_total_tasks) > 0 and int(mgpu_results_collected) >= int(mgpu_total_tasks):
+            aux_pool = gpu_worker_aux_interpolation_pool()
+            if aux_pool is not None:
+                aux_pool.enable()
 
     def _drain_process_inference_results() -> None:
         if gpu_result_queue is None:
@@ -20628,19 +21386,35 @@ def main() -> None:
 
     def _check_gpu_workers_alive() -> None:
         # Fail fast (rather than hang) if a worker process died mid-task, e.g. CUDA OOM or a kill.
-        if not _process_inference_outstanding():
+        aux_pool = gpu_worker_aux_interpolation_pool()
+        aux_outstanding = int(aux_pool.outstanding()) if aux_pool is not None else 0
+        if not _process_inference_outstanding() and aux_outstanding <= 0:
             return
         for proc in gpu_worker_processes:
             if not proc.is_alive():
-                raise RuntimeError(
+                reason = (
                     f'GPU worker {getattr(proc, "name", "?")} exited unexpectedly '
                     f'(exitcode={getattr(proc, "exitcode", None)}) with '
-                    f'{int(mgpu_total_tasks - mgpu_results_collected)} inference result(s) still outstanding.'
+                    f'{max(0, int(mgpu_total_tasks - mgpu_results_collected))} inference result(s) and '
+                    f'{aux_outstanding} aux interpolation pass(es) still outstanding.'
                 )
+                if aux_pool is not None:
+                    # v13.3.4 (T4): unblock any parent-postprocess threads waiting on aux passes
+                    # before raising, so shutdown does not deadlock on their futures.
+                    aux_pool.mark_failed(reason)
+                raise RuntimeError(reason)
 
     def _shutdown_gpu_worker_processes() -> None:
         if not gpu_worker_processes:
             return
+        # v13.3.4 (T4): on the normal path every aux interpolation pass has completed before
+        # main reaches this finally (a no-op close); on abnormal paths this unblocks any
+        # still-waiting or mid-submit threads so parent_postprocess_executor.shutdown(wait=True)
+        # below cannot deadlock. mark_failed also refuses any racing late submission.
+        aux_pool = gpu_worker_aux_interpolation_pool()
+        if aux_pool is not None:
+            aux_pool.mark_failed('GPU worker processes are shutting down')
+            set_gpu_worker_aux_interpolation_pool(None)
         try:
             for _ in gpu_worker_processes:
                 gpu_task_queue.put(None)
