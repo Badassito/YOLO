@@ -2,9 +2,100 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the v13.3.5_SLURM implementation. It is derived from v13.3.4_SLURM by COPY + surgical
-edits, implementing the NUMA-aware handling items (1.E) from
-SPEED_OPTIMIZATIONS_Fable-5_v13.3.2_SLURM.md:
+This is the v13.3.6_SLURM implementation. It is derived from v13.3.5_SLURM by COPY + surgical
+edits, implementing seven approved items (C2, D1, D2, D3, A1, N3, N6) from
+SPEED_OPTIMIZATIONS_Fable-5_v13.3.5_SLURM.md:
+  - v13.3.6 (C2) direct backend predict loop: on the GPU proto-union fast path,
+    model.predict(stream=True)'s stream_inference machinery is bypassed — the (patched)
+    preprocess and the AutoBackend forward are driven directly, NMS is DELETED (at iou=1.0
+    suppression is a no-op by construction; iou=1.0 exists to maximize recall, and the
+    pipeline's union/amax reductions are idempotent under duplicate boxes, so removing the
+    call cannot drop a voxel — recall can only improve, since the stock path also truncated
+    crowded frames to Ultralytics' max_det=300 default and could abandon NMS on its per-batch
+    time limit), and per-frame Results objects become a payload-only carrier. Confidence
+    gating is one batched nonzero + one tiny bincount readback (2 host syncs per batch)
+    instead of per-stage Profile synchronizes plus per-image boolean-index syncs inside NMS.
+    The predictor itself is still created through one UNITERATED model.predict(stream=True)
+    call, so AutoBackend construction/setup_model/device placement behave exactly as before.
+    Active for CUDA proto-union runs; YOLO_TTA_DIRECT_PREDICT=0 restores model.predict, and
+    setup/output-layout surprises fall back automatically before the first batch is consumed.
+  - v13.3.6 (D1) per-slice foreground metadata rides the device-union flush: two device
+    reductions per task (per-slice any flag, bbox, and bit-packed per-row occupancy — a few
+    hundred KB D2H) return with the worker stats, aggregate per view in the scheduler, and
+    feed prepare_view_volume_after_fullframe. Consumers stop re-reading the union memmaps:
+    the labeling stage skips known-empty slices without touching their pages and crops its
+    CC calls + label-store writes to the known bboxes (FIRST interpolation pass only —
+    bridges invalidate the metadata), the pre-interpolation NRRD layer's foreground gate is
+    answered for free, and the radial layer projection's row-occupancy pass (the S1 GPU scan
+    AND the CPU path's per-row strided np.any reads) is replaced by the precomputed bitmap.
+    Any task without metadata (host-fallback frames) invalidates the whole view and every
+    consumer falls back to scanning.
+  - v13.3.6 (D2) GPU low-quality mirror tee: write_layer_nrrd_with_low_quality_mirrors
+    uploads each streamed full-quality payload block ONCE and derives every mirror spec by
+    adaptive max-pool on device (any-foreground-in-the-covering-window semantics — matches
+    the CPU tee's (INTER_AREA scaled > 0) up to window-boundary voxels), max-merging through
+    the same source->mirror t-mapping into device-resident mirror volumes; one small D2H per
+    mirror after the layer finishes replaces every per-block per-slice cv2 resize and
+    striped-lock OR of the CPU tee. VRAM-gated; the CPU tee is unchanged as the fallback, and
+    a mid-stream GPU failure routes mirrors to the existing re-encode-from-store fallback.
+    YOLO_TTA_NRRD_GPU_MIRROR_TEE=0 disables.
+  - v13.3.6 (D3) GPU per-slice 2D component labeling: label_foreground_volume_streaming's
+    stage A runs ONE z-DISCONNECTED cupy label call per z-block (full 3x3 in-plane
+    neighbourhood only — the S2 device hole-fill trick, so every slice labels independently
+    and 8-connected in a single kernel pass) whenever CUDA is available in the calling
+    process (the aux GPU-worker interpolation hosts and keep_objects in main; dedicated
+    interpolation children stay on the CPU stage unless
+    YOLO_TTA_GPU_SLICE_LABELING_IN_CHILDREN=1, since each would need its own CUDA context).
+    Component slice/area/bbox stats come from torch scatter reductions over the block's
+    foreground coordinates, components are renumbered to per-slice-contiguous LOCAL ids (the
+    cv2 stage's contract) and written back bbox-restricted, so stage C (windowed pair codes +
+    numba union-find) and every downstream consumer are untouched. Any failure re-zeros the
+    store and the CPU stage runs instead. YOLO_TTA_GPU_SLICE_LABELING=0 disables;
+    YOLO_TTA_GPU_SLICE_LABELING_BLOCK sizes the z-block (default 64).
+  - v13.3.6 (A1) the interpolation compact-relabel pass is DELETED by default: the label
+    store keeps per-slice LOCAL ids and the labeler exports the per-slice
+    local->canonical-compact LUTs it was already building for the relabel
+    (component_stats_out['slice_local_luts']). Component tables canonicalize each record's id
+    at build time, the numba projection-candidate kernel takes lut_flat/lut_offsets and
+    canonicalizes at the pixel read (a 1-entry offsets sentinel keeps the canonical-raster
+    mode compiled in), and the python candidate fallback canonicalizes just the SDF crop — so
+    endpoint seeds, walk-back, and bridge planning see exactly the ids the relabel used to
+    write, minus the ~4x-mask-volume uint32 read+write pass per interpolation labeling.
+    keep_objects already consumed local ids through LUTs (R6c) and is unchanged.
+    YOLO_TTA_INTERPOLATION_SKIP_COMPACT_RELABEL=0 restores the relabel pass.
+  - v13.3.6 (N3) immutable global NRRD layers stream from the live volume: the final-output
+    layer no longer pays a synchronous encode-to-raw-store pass on the main thread plus a
+    store read-back pass in the writer — materialize_nrrd_global_layer hands the sink an
+    NrrdLayerRef carrying the live in-RAM volume, the sink streams it zero-copy through the
+    direct-native payload branch, and the Slicer segment extent is computed on the sink's own
+    background worker (deferred, idempotent). Gated to volume_is_immutable call sites (the
+    final output — nothing mutates it afterwards, and it stays open until after
+    layer_sink.wait(); presmoothing/smoothing-pass layers keep the store path because later
+    stages mutate the same volume in place) and disabled under --keep_temp so temp archives
+    still contain the store. YOLO_TTA_NRRD_LIVE_GLOBAL_LAYERS=0 restores the store path.
+  - v13.3.6 (N6) GPU DEFLATE for NRRD payloads via nvCOMP (pip: nvidia-nvcomp): the payload
+    writers emit standard MULTI-MEMBER gzip — each uncompressed chunk (default 64 KiB;
+    DEFLATE's 32 KiB history window makes small independent members nearly free ratio-wise)
+    becomes its own complete member whose raw stream is produced on-device. Each bounded
+    window (default 256 MiB) uploads with ONE H2D and nvcomp compresses device-side views,
+    while the member CRC32s run concurrently on the shared host pool (isal-accelerated when
+    present); all-zero chunks are served from a cached prebuilt member with no GPU round trip.
+    Multi-member gzip is standard (readers loop members; the v12.2.14 payloads already
+    shipped it). A one-time round-trip self-test (encode -> gzip.decompress -> byte compare)
+    gates the path; the fallback order is GPU -> in-process parallel gzip (S4) -> pigz pipe.
+    Per the review ruling, ratio parity with level-3 zlib is NOT required ("good enough"
+    accepted): YOLO_TTA_NRRD_GPU_DEFLATE_ALGO passes nvCOMP's effort knob through when the
+    installed build exposes one, and payloads remain standard gzip so any layer can be
+    re-compressed offline later without rerunning the pipeline. YOLO_TTA_NRRD_GPU_DEFLATE=0
+    disables; YOLO_TTA_NRRD_GPU_DEFLATE_CHUNK_KIB / YOLO_TTA_NRRD_GPU_DEFLATE_BATCH_MIB size
+    the members and the upload window.
+  - (v13.3.6 incidental, A4) the labeling stage hands raw uint8 slices to OpenCV connected
+    components (any nonzero is foreground) instead of paying a full-slice (mask>0) cast copy
+    per slice, and bbox-crops both the call and the label-store write when D1 metadata is
+    present.
+
+Inherited from v13.3.5 (N1-N2, the NUMA-aware handling items from
+SPEED_OPTIMIZATIONS_Fable-5_v13.3.2_SLURM.md):
   - v13.3.5 (N1) each multi-GPU inference worker is CPU-pinned to the NUMA node its GPU hangs
     off. The GPU->node map is DISCOVERED at spawn time — per-worker CUDA_VISIBLE_DEVICES token
     matched against /proc/driver/nvidia/gpus/<bdf>/information (minor number or GPU UUID), then
@@ -576,6 +667,9 @@ Dependencies (Python):
   # Optional CPU acceleration: numba for no-GIL interpolation seed-planning kernels.
   # Optional GPU acceleration: cupy-cuda12x for cupyx.scipy.ndimage smoothing only; final Radial/Tilted backprojection is CPU-only in v12.2.11.
   # --save_nrrd uses the built-in streaming NRRD writer; pynrrd is no longer required for default exports.
+  # v13.3.6 optional accelerators (auto-detected, automatic fallbacks when absent):
+  #   pip install isal            # python-isal: NRRD deflate + CRC32 at ISA-L speed (S4/N6 CRCs)
+  #   pip install nvidia-nvcomp   # nvCOMP: GPU DEFLATE for NRRD payloads (N6)
 
 System:
   ffmpeg + ffprobe + pigz on PATH.
@@ -605,7 +699,7 @@ import time
 import zlib
 from collections import OrderedDict, deque
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dataclasses_replace
 
 GIB = 1024 ** 3
 NRRD_SPACE = "left-posterior-superior"
@@ -2373,6 +2467,8 @@ def _interpolation_process_entry(
     workers: int,
     wrap_axis: bool,
     bridge_delta_path: Optional[str] = None,
+    known_slice_any: Optional[np.ndarray] = None,
+    known_slice_bboxes: Optional[np.ndarray] = None,
 ) -> Dict[str, object]:
     global _INTERPOLATION_PROCESS_WORKER
     _INTERPOLATION_PROCESS_WORKER = True
@@ -2403,6 +2499,8 @@ def _interpolation_process_entry(
             workers=int(workers),
             wrap_axis=bool(wrap_axis),
             bridge_delta_path=Path(bridge_delta_path) if bridge_delta_path else None,
+            known_slice_any=known_slice_any,
+            known_slice_bboxes=known_slice_bboxes,
         )
         stats = dict(stats)
         stats.update({
@@ -2432,11 +2530,16 @@ def interpolate_view_volume_pass_maybe_process(
     workers: int = 1,
     wrap_axis: bool = False,
     bridge_delta_path: Optional[Path] = None,
+    known_slice_any: Optional[np.ndarray] = None,
+    known_slice_bboxes: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, Dict[str, object]]:
     """Run one interpolation pass, using a child process when configured.
 
     The returned array may be a new memmap when the input was an anonymous ndarray.
     Callers must keep using the returned volume for later passes and downstream work.
+    v13.3.6 (D1): known_slice_any/known_slice_bboxes carry the device-union foreground
+    metadata (valid for the FIRST pass only — bridges invalidate them) so the labeling
+    stage skips empty slices without reading them and crops CC calls to known bboxes.
     """
     executor = _INTERPOLATION_PROCESS_EXECUTOR
     if (
@@ -2459,6 +2562,8 @@ def interpolate_view_volume_pass_maybe_process(
             workers=int(workers),
             wrap_axis=bool(wrap_axis),
             bridge_delta_path=bridge_delta_path,
+            known_slice_any=known_slice_any,
+            known_slice_bboxes=known_slice_bboxes,
         )
         stats = dict(stats)
         stats.setdefault('process_backend', 'disabled_or_unconfigured')
@@ -2490,6 +2595,9 @@ def interpolate_view_volume_pass_maybe_process(
         workers=int(workers),
         wrap_axis=bool(wrap_axis),
         bridge_delta_path=str(bridge_delta_path) if bridge_delta_path is not None else None,
+        # v13.3.6 (D1): small per-slice metadata arrays pickle across the process boundary.
+        known_slice_any=known_slice_any,
+        known_slice_bboxes=known_slice_bboxes,
     )
 
     # v13.3.4 (T4): once inference has drained, the warm GPU worker processes serve
@@ -2525,6 +2633,8 @@ def interpolate_view_volume_pass_maybe_process(
                     workers=int(workers),
                     wrap_axis=bool(wrap_axis),
                     bridge_delta_path=bridge_delta_path,
+                    known_slice_any=known_slice_any,
+                    known_slice_bboxes=known_slice_bboxes,
                 ))
                 stats['process_backend'] = 'fallback_in_process_after_aux_failure'
             stats.setdefault('process_backend', 'gpu_worker_aux_process')
@@ -2561,6 +2671,8 @@ def interpolate_view_volume_pass_maybe_process(
             workers=int(workers),
             wrap_axis=bool(wrap_axis),
             bridge_delta_path=bridge_delta_path,
+            known_slice_any=known_slice_any,
+            known_slice_bboxes=known_slice_bboxes,
         )
         stats = dict(stats)
         stats['process_backend'] = 'fallback_in_process_after_worker_failure'
@@ -8254,6 +8366,49 @@ class _DeviceUnionAccumulator:
             except Exception:
                 pass
 
+    def compute_slice_metadata(self) -> Optional[Dict[str, np.ndarray]]:
+        """v13.3.6 (D1): per-slice foreground metadata from the device union, pre-flush.
+
+        Two device reductions over the resident union yield per-slice any flags, bboxes
+        (y0,y1,x0,x1; exclusive stops) and per-(slice,row) occupancy bits — a few hundred
+        KB D2H that lets downstream CPU stages (labeling, foreground gates, the radial
+        backprojection occupancy scan) skip whole read passes over the union memmaps.
+        Frames that fell back to host writes make the device rows unrepresentative, so any
+        host_written task returns None (consumers fall back to scanning). Call AFTER
+        fill_holes_2d (holes are enclosed, so the metadata is identical either way, but
+        the ordering keeps the contract obvious).
+        """
+        torch = self.torch
+        if self.union_dev is None or bool(self.host_written):
+            return None
+        try:
+            torch.cuda.synchronize(self.device)
+            u = self.union_dev
+            n, h, w = (int(x) for x in u.shape)
+            rows = u.amax(dim=2) > 0   # (n, h)
+            cols = u.amax(dim=1) > 0   # (n, w)
+            any_t = rows.any(dim=1)    # (n,)
+            rows_u8 = rows.to(torch.uint8)
+            cols_u8 = cols.to(torch.uint8)
+            y0 = rows_u8.argmax(dim=1)
+            y1 = int(h) - rows_u8.flip(1).argmax(dim=1)
+            x0 = cols_u8.argmax(dim=1)
+            x1 = int(w) - cols_u8.flip(1).argmax(dim=1)
+            bbox_t = torch.stack([y0, y1, x0, x1], dim=1).to(torch.int64)
+            any_np = any_t.cpu().numpy()
+            bbox_np = bbox_t.cpu().numpy()
+            rows_np = rows.cpu().numpy()
+            bbox_np[~any_np] = 0  # argmax on all-zero rows would report a full-extent bbox
+            return {
+                'slice_any': np.ascontiguousarray(any_np),
+                'slice_bboxes': np.ascontiguousarray(bbox_np),
+                # Bit-packed (n, ceil(h/8)) row-occupancy — small enough for the mp result queue.
+                'slice_row_any': np.packbits(np.ascontiguousarray(rows_np), axis=1),
+                'slice_row_count': np.asarray([int(h)], dtype=np.int64),
+            }
+        except Exception:
+            return None
+
     def flush_into(self, view_union_mm: np.ndarray, view_confmap_mm: Optional[np.ndarray], chunk_slices: int = 64) -> None:
         torch = self.torch
         # One device-wide sync orders every side stream's writes before the D2H reads.
@@ -8627,6 +8782,221 @@ def _process_prediction_frame(
 
     return int(num_inst), 1
 
+
+# --------------------------
+# v13.3.6 (C2): direct backend execution loop (no Ultralytics stream_inference)
+# --------------------------
+# On the GPU proto-union fast path, model.predict(stream=True) contributes only per-batch
+# generator plumbing (source bookkeeping, callbacks, and Profile stage timers that call
+# torch.cuda.synchronize on CUDA), ops.non_max_suppression at iou=1.0 (which can never
+# suppress anything — IoU > 1.0 is impossible; iou=1.0 is set precisely to maximize recall —
+# while forcing data-dependent boolean-index syncs per image), and one Results object per
+# frame. The direct loop keeps the two pieces that matter — the patched preprocess (the
+# _tta_gpu_tensor contract) and the AutoBackend forward — and replaces NMS with a pure
+# confidence gate + on-device decode feeding the existing proto-union payload builder.
+# Recall is preserved or improved: the union/amax reductions are idempotent under duplicate
+# boxes, and two recall hazards of the stock path disappear (max_det=300 truncation of
+# crowded frames, and the NMS per-batch time-limit early break). YOLO_TTA_DIRECT_PREDICT=0
+# restores model.predict; setup/shape surprises fall back automatically before the first
+# batch is consumed, and mid-stream layout errors raise (they indicate a wrong model type).
+
+_DIRECT_PREDICT_ANNOUNCED = False
+
+
+def direct_predict_enabled() -> bool:
+    return _env_flag('YOLO_TTA_DIRECT_PREDICT', True)
+
+
+class _DirectPredictResult:
+    """Minimal per-frame result for the direct loop.
+
+    Duck-typed for _extract_result_masks_and_confs: it only carries the prebuilt
+    GpuFlattenedRetinaPayload; no Ultralytics Results object, boxes, paths, or orig
+    images are constructed.
+    """
+
+    __slots__ = ('_tta_gpu_flattened_payload',)
+
+    def __init__(self, payload: GpuFlattenedRetinaPayload) -> None:
+        self._tta_gpu_flattened_payload = payload
+
+
+def _direct_predict_applicable(cfg: 'PredictConfig') -> bool:
+    """Direct loop preconditions: proto-union consume path + a CUDA device."""
+    if not direct_predict_enabled():
+        return False
+    if cpu_retina_masks_enabled() or not gpu_retina_proto_union_enabled():
+        return False
+    try:
+        import torch  # type: ignore
+    except Exception:
+        return False
+    try:
+        if not str(canonical_single_device(str(cfg.device))).startswith('cuda'):
+            return False
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def _ensure_predictor_for_direct_predict(model: object, cfg: 'PredictConfig') -> Optional[object]:
+    """Create/fetch the Ultralytics predictor + backend without running stream_inference.
+
+    Model.predict(..., stream=True) constructs the predictor and calls setup_model
+    (AutoBackend load, device/half placement) eagerly but returns an UNITERATED generator,
+    so no source setup, warmup, or inference runs. The predictor's (patched) preprocess and
+    its AutoBackend are then driven directly by _direct_predict_stream.
+    """
+    try:
+        predictor = getattr(model, 'predictor', None)
+        if predictor is None or getattr(predictor, 'model', None) is None:
+            _ = model.predict(
+                source=np.zeros((32, 32, 3), dtype=np.uint8),
+                task='segment',
+                imgsz=cfg.imgsz,
+                conf=cfg.conf,
+                iou=1.0,
+                save=False,
+                stream=True,
+                retina_masks=True,
+                batch=max(1, int(cfg.batch)),
+                device=cfg.device,
+                half=cfg.half,
+                int8=cfg.int8,
+                verbose=False,
+            )
+            predictor = getattr(model, 'predictor', None)
+        if predictor is None or getattr(predictor, 'model', None) is None:
+            return None
+        ensure_yolo_ready_for_predict(model, cfg)
+        return predictor
+    except Exception as exc:
+        print(f'Warning: direct predict setup failed ({exc}); using model.predict for this source.')
+        return None
+
+
+def _split_segmentation_backend_outputs(preds: object) -> Optional[Tuple[object, object]]:
+    """Return (head, protos) from a raw segmentation forward.
+
+    Mirrors SegmentationPredictor.postprocess's output handling: preds[0] is the
+    (B, 4+nc+nm, A) detection head, preds[1] the (B, nm, mh, mw) prototype tensor (torch
+    .pt backends nest it as the last element of a tuple). None when the structure does not
+    match, so the caller can fail fast instead of mis-decoding.
+    """
+    try:
+        if not isinstance(preds, (list, tuple)) or len(preds) < 2:
+            return None
+        head = preds[0]
+        proto = preds[1]
+        if isinstance(proto, (list, tuple)):
+            proto = proto[-1]
+        if getattr(head, 'ndim', 0) != 3 or getattr(proto, 'ndim', 0) != 4:
+            return None
+        return head, proto
+    except Exception:
+        return None
+
+
+def _direct_predict_stream(
+    predictor: object,
+    source: object,
+    cfg: 'PredictConfig',
+    source_label: str,
+) -> Iterator[_DirectPredictResult]:
+    """v13.3.6 (C2): preprocess -> backend forward -> conf gate -> proto-union payload.
+
+    Yields one payload-carrying result per frame in stream order (synthetic padded frames
+    included, exactly like model.predict's per-frame Results), with TWO host syncs per
+    batch (the nonzero + count readback of the confidence gate) instead of the stock
+    per-stage Profile synchronizes plus per-image boolean-index syncs inside NMS.
+    Instances are decoded to the post-NMS (n, 6+nm) layout the payload builder already
+    consumes: xyxy, conf, cls, mask coefficients — box-only, at network scale.
+    """
+    import torch  # type: ignore
+
+    backend = getattr(predictor, 'model', None)
+    if backend is None:
+        raise RuntimeError('direct predict: predictor has no backend model')
+    names = getattr(backend, 'names', None) or {}
+    nc = max(1, len(names))
+    conf_thres = float(cfg.conf)
+
+    global _DIRECT_PREDICT_ANNOUNCED
+    if not _DIRECT_PREDICT_ANNOUNCED:
+        _DIRECT_PREDICT_ANNOUNCED = True
+        print(
+            'Direct backend predict loop active (v13.3.6 C2): stream_inference, NMS and '
+            'per-frame Results are bypassed; confidence-gated instances feed the '
+            'proto-resolution union directly (YOLO_TTA_DIRECT_PREDICT=0 restores model.predict).'
+        )
+
+    start_fn = getattr(source, 'start', None)
+    if callable(start_fn):
+        try:
+            start_fn()
+        except Exception:
+            pass
+
+    with torch.inference_mode():
+        for _paths, im0s, _info in iter(source):
+            im = predictor.preprocess(im0s)
+            preds = backend(im)
+            split = _split_segmentation_backend_outputs(preds)
+            if split is None:
+                raise RuntimeError(
+                    f'direct predict: unexpected backend output structure for {source_label}; '
+                    'set YOLO_TTA_DIRECT_PREDICT=0 to use model.predict'
+                )
+            head, protos = split
+            bsz = int(im.shape[0])
+            no = int(head.shape[1])
+            nm = int(protos.shape[1])
+            if no != 4 + nc + nm or int(head.shape[0]) != bsz or int(protos.shape[0]) != bsz:
+                raise RuntimeError(
+                    f'direct predict: head/proto layout mismatch for {source_label} '
+                    f'(head channels {no}, nc {nc}, protos {nm}); '
+                    'set YOLO_TTA_DIRECT_PREDICT=0 to use model.predict'
+                )
+            scores = head[:, 4:4 + nc, :]
+            if nc == 1:
+                conf_all = scores[:, 0, :]
+                cls_all = None
+            else:
+                conf_all, cls_all = scores.max(dim=1)
+            keep_mask = conf_all >= conf_thres  # (B, A)
+            nz = keep_mask.nonzero()  # host sync #1; row-major => grouped by image
+            if int(nz.shape[0]) > 0:
+                counts = torch.bincount(nz[:, 0], minlength=bsz).tolist()  # host sync #2 (tiny)
+            else:
+                counts = [0] * bsz
+            offset = 0
+            for i in range(bsz):
+                n_i = int(counts[i])
+                if n_i <= 0:
+                    pred_i = head.new_zeros((0, 6 + nm))
+                else:
+                    rows = nz[offset:offset + n_i, 1]
+                    det = head[i].index_select(1, rows)  # (4+nc+nm, n) — copies out of binding memory
+                    xy = det[0:2, :].transpose(0, 1).to(torch.float32)
+                    half_wh = det[2:4, :].transpose(0, 1).to(torch.float32) * 0.5
+                    conf_i = conf_all[i].index_select(0, rows).to(torch.float32).reshape(-1, 1)
+                    cls_i = (
+                        torch.zeros_like(conf_i)
+                        if cls_all is None
+                        else cls_all[i].index_select(0, rows).to(torch.float32).reshape(-1, 1)
+                    )
+                    coeffs = det[4 + nc:, :].transpose(0, 1).to(torch.float32)
+                    pred_i = torch.cat([xy - half_wh, xy + half_wh, conf_i, cls_i, coeffs], dim=1)
+                offset += n_i
+                payload = _build_gpu_flattened_payload_from_proto(pred_i, im, protos[i])
+                if payload is None:
+                    raise RuntimeError(
+                        f'direct predict: payload construction failed for {source_label}; '
+                        'set YOLO_TTA_DIRECT_PREDICT=0 to use model.predict'
+                    )
+                yield _DirectPredictResult(payload)
+
+
 def predict_source_and_accumulate(
     model,
     source: object,
@@ -8690,21 +9060,29 @@ def predict_source_and_accumulate(
         prediction_count = 0
         frames_with_predictions = 0
 
-        results = model.predict(
-            source=source,
-            task='segment',
-            imgsz=cfg.imgsz,
-            conf=cfg.conf,
-            iou=1.0,
-            save=False,
-            stream=True,
-            retina_masks=not bool(use_custom_cpu_retina),
-            batch=max(1, int(cfg.batch)),
-            device=cfg.device,
-            half=cfg.half,
-            int8=cfg.int8,
-            verbose=False,
-        )
+        # v13.3.6 (C2): drive the backend directly on the proto-union fast path; fall back
+        # to Ultralytics stream_inference when the direct loop's preconditions do not hold.
+        results = None
+        if not use_custom_cpu_retina and _direct_predict_applicable(cfg):
+            predictor_direct = _ensure_predictor_for_direct_predict(model, cfg)
+            if predictor_direct is not None:
+                results = _direct_predict_stream(predictor_direct, source, cfg, source_label)
+        if results is None:
+            results = model.predict(
+                source=source,
+                task='segment',
+                imgsz=cfg.imgsz,
+                conf=cfg.conf,
+                iou=1.0,
+                save=False,
+                stream=True,
+                retina_masks=not bool(use_custom_cpu_retina),
+                batch=max(1, int(cfg.batch)),
+                device=cfg.device,
+                half=cfg.half,
+                int8=cfg.int8,
+                verbose=False,
+            )
 
         worker_count = max(1, min(int(postprocess_workers), int(num_frames)))
         pending_limit = cpu_mask_postprocess_pending_limit(worker_count, int(num_frames))
@@ -8846,6 +9224,10 @@ def predict_source_and_accumulate(
         if device_union is not None and bool(device_hole_fill) and gpu_device_hole_fill_enabled():
             device_hole_filled_frames = int(device_union.fill_holes_2d())
 
+        # v13.3.6 (D1): per-slice foreground metadata from the resident union (post hole
+        # fill, pre flush) — a few hundred KB that saves whole CPU read passes downstream.
+        slice_meta = device_union.compute_slice_metadata() if device_union is not None else None
+
         # v13.3.2 (R21): one chunked pinned D2H for the whole task into the host result windows
         # (device-written slices are plain-copied; host-fallback slices are skipped — v13.3.3 S2).
         if device_union is not None:
@@ -8860,6 +9242,7 @@ def predict_source_and_accumulate(
             'prediction_count': int(prediction_count),
             'frames_with_predictions': int(frames_with_predictions),
             'device_hole_filled_frames': int(device_hole_filled_frames),
+            'slice_meta': slice_meta,
         }
     finally:
         if owned_staging_wrapper is not None:
@@ -8919,21 +9302,28 @@ def predict_source_and_submit_accumulation(
             # construct_result instead of materializing (n, imgsz, imgsz) retina stacks.
             ensure_gpu_retina_proto_union_predictor_patch()
 
-        results = model.predict(
-            source=source,
-            task='segment',
-            imgsz=cfg.imgsz,
-            conf=cfg.conf,
-            iou=1.0,
-            save=False,
-            stream=True,
-            retina_masks=not bool(use_custom_cpu_retina),
-            batch=max(1, int(cfg.batch)),
-            device=cfg.device,
-            half=cfg.half,
-            int8=cfg.int8,
-            verbose=False,
-        )
+        # v13.3.6 (C2): same direct-loop preference as predict_source_and_accumulate.
+        results = None
+        if not use_custom_cpu_retina and _direct_predict_applicable(cfg):
+            predictor_direct = _ensure_predictor_for_direct_predict(model, cfg)
+            if predictor_direct is not None:
+                results = _direct_predict_stream(predictor_direct, source, cfg, source_label)
+        if results is None:
+            results = model.predict(
+                source=source,
+                task='segment',
+                imgsz=cfg.imgsz,
+                conf=cfg.conf,
+                iou=1.0,
+                save=False,
+                stream=True,
+                retina_masks=not bool(use_custom_cpu_retina),
+                batch=max(1, int(cfg.batch)),
+                device=cfg.device,
+                half=cfg.half,
+                int8=cfg.int8,
+                verbose=False,
+            )
 
         stream_cleanup = bool(streaming_cleanup_enabled)
         stream_backend = cleanup_backend() if stream_cleanup else ''
@@ -10266,6 +10656,8 @@ def run_prediction_volume_in_worker(model: object, cfg: 'PredictConfig', task: D
             'prediction_count': int(stats.get('prediction_count', 0)),
             'frames_with_predictions': int(stats.get('frames_with_predictions', 0)),
             'device_hole_filled_frames': int(stats.get('device_hole_filled_frames', 0)),
+            # v13.3.6 (D1): per-slice foreground metadata (or None) rides the result queue.
+            'slice_meta': stats.get('slice_meta'),
         }
     finally:
         # Always release the source render threads first, then close every memmap, even when
@@ -10845,6 +11237,247 @@ else:
     _numba_keep_lut_apply_kernel = None
 
 
+@dataclass(frozen=True)
+class SliceLocalLabelLUTs:
+    """v13.3.6 (A1): per-slice local-id -> canonical-compact-id lookup tables.
+
+    Exported by label_foreground_volume_streaming when the compact relabel pass is
+    skipped: slice z's local label v canonicalizes through
+    ``lut_flat[lut_offsets[z] + v]``. Consumers (component tables, projection-candidate
+    kernels) resolve ids through these tables instead of the full-volume relabel
+    rewriting the ~4x-mask-size uint32 store.
+    """
+
+    lut_flat: np.ndarray       # uint32, concatenated per-slice tables (index 0 of each = 0)
+    lut_offsets: np.ndarray    # int64, one entry per slice
+    component_counts: np.ndarray  # uint32, per-slice 2D component counts
+
+    def lut_for(self, z: int) -> np.ndarray:
+        lo = int(self.lut_offsets[int(z)])
+        return self.lut_flat[lo:lo + int(self.component_counts[int(z)]) + 1]
+
+
+def interpolation_skip_compact_relabel_enabled() -> bool:
+    """v13.3.6 (A1): interpolation consumes per-slice local ids through LUTs by default.
+
+    The compact relabel was a full read+write pass over the uint32 label store (~4x the
+    mask volume) whose only product was canonical ids in the raster; component tables and
+    the candidate kernels now canonicalize at read time. Set
+    YOLO_TTA_INTERPOLATION_SKIP_COMPACT_RELABEL=0 to restore the relabel pass.
+    """
+    return _env_flag('YOLO_TTA_INTERPOLATION_SKIP_COMPACT_RELABEL', True)
+
+
+def gpu_slice_labeling_enabled() -> bool:
+    """v13.3.6 (D3): run per-slice 2D component labeling on the GPU where CUDA is available."""
+    return _env_flag('YOLO_TTA_GPU_SLICE_LABELING', True)
+
+
+def gpu_slice_labeling_in_children_enabled() -> bool:
+    """v13.3.6 (D3): allow GPU labeling inside dedicated interpolation child processes.
+
+    Off by default: each child would have to create its own CUDA context (init latency +
+    VRAM per child, times up to 6 children) just for labeling. The aux GPU-worker
+    interpolation hosts (v13.3.4 T4) already own a warm context and take the GPU path
+    automatically; the main process (keep_objects) does too.
+    """
+    return _env_flag('YOLO_TTA_GPU_SLICE_LABELING_IN_CHILDREN', False)
+
+
+_GPU_SLICE_LABELING_ANNOUNCED = False
+
+
+def _try_label_slices_stage_a_gpu(
+    mask_mm: np.ndarray,
+    labels_store: np.ndarray,
+    component_counts: np.ndarray,
+    slice_bboxes: np.ndarray,
+    slice_areas: Optional[List[Optional[np.ndarray]]],
+    known_slice_any: Optional[np.ndarray] = None,
+) -> bool:
+    """v13.3.6 (D3): GPU drop-in for the per-slice 2D labeling stage (stage A).
+
+    One cupy ``label`` call per z-block with a z-DISCONNECTED structure (full 3x3 in-plane
+    neighbourhood, nothing across z — the same trick as the S2 device hole fill) labels
+    every slice of the block independently and 8-connected in one kernel pass. Component
+    slice/area/bbox stats come from torch scatter reductions over the block's foreground
+    coordinates, components are renumbered to per-slice-contiguous LOCAL ids (the CPU cv2
+    stage's contract: ids 1..k per slice, order arbitrary), and the relabeled block is
+    written back into the uint32 store restricted to each slice's bbox. Stage C (pair
+    codes + union-find) is unchanged — it already consumes per-slice local ids + offsets.
+    Returns False on ANY failure (store re-zeroed if partially written) so the CPU stage
+    runs instead.
+    """
+    if not gpu_slice_labeling_enabled():
+        return False
+    try:
+        import torch  # type: ignore
+        if not bool(torch.cuda.is_available()):
+            return False
+        if (
+            _INTERPOLATION_PROCESS_WORKER
+            and not gpu_slice_labeling_in_children_enabled()
+            and not bool(torch.cuda.is_initialized())
+        ):
+            # Dedicated interpolation children refuse to CREATE a CUDA context just for
+            # labeling (init latency + VRAM, times up to 6 children). The aux GPU-worker
+            # hosts (v13.3.4 T4) enter through the same entry point but already own a live
+            # context from inference — they proceed.
+            return False
+        cp_mod = _try_import_cupy_ndimage()
+        if cp_mod is None:
+            return False
+        cp, cpx_ndi = cp_mod
+    except Exception:
+        return False
+
+    z_dim, h, w = (int(x) for x in mask_mm.shape)
+    if z_dim <= 0 or h < 2 or w < 2:
+        return False
+
+    z_done = 0
+    try:
+        device = _pick_gpu_compute_device(torch)
+        if device is None:
+            return False
+        dev_idx = int(getattr(device, 'index', 0) or 0)
+        plane = int(h) * int(w)
+        # Adaptive z-block: u8 mask + int32 labels + int32 relabel + label() workspace,
+        # ~17 B/voxel, plus ~1 GiB headroom for the coordinate transients.
+        block = max(4, _env_int('YOLO_TTA_GPU_SLICE_LABELING_BLOCK', 64))
+        while block > 4:
+            free_bytes, _total = torch.cuda.mem_get_info(device)
+            if int(free_bytes) >= int(block) * plane * 17 + GIB:
+                break
+            block //= 2
+        free_bytes, _total = torch.cuda.mem_get_info(device)
+        if int(free_bytes) < int(block) * plane * 17 + GIB:
+            return False
+
+        global _GPU_SLICE_LABELING_ANNOUNCED
+        if not _GPU_SLICE_LABELING_ANNOUNCED:
+            _GPU_SLICE_LABELING_ANNOUNCED = True
+            print(
+                f'GPU per-slice labeling active on {device} (v13.3.6 D3, block={int(block)}; '
+                'YOLO_TTA_GPU_SLICE_LABELING=0 disables).'
+            )
+
+        structure = cp.zeros((3, 3, 3), dtype=cp.bool_)
+        structure[1, :, :] = True  # in-plane 8-connectivity; z stays disconnected
+
+        with cp.cuda.Device(dev_idx):
+            for z0 in range(0, z_dim, int(block)):
+                z1 = min(z_dim, z0 + int(block))
+                if known_slice_any is not None and not bool(np.any(known_slice_any[z0:z1])):
+                    component_counts[z0:z1] = np.uint32(0)
+                    z_done = int(z1)
+                    continue
+                bs = int(z1 - z0)
+                host_block = np.ascontiguousarray(np.asarray(mask_mm[z0:z1]))
+                mask_t = torch.from_numpy(host_block).to(device)
+                fg_cp = cp.asarray(mask_t) > 0
+                labels_cp, num = cpx_ndi.label(fg_cp, structure=structure)
+                del fg_cp
+                num_i = int(num)
+                if num_i <= 0:
+                    component_counts[z0:z1] = np.uint32(0)
+                    z_done = int(z1)
+                    continue
+                try:
+                    labels_t = torch.from_dlpack(labels_cp)
+                except Exception:
+                    labels_t = torch.utils.dlpack.from_dlpack(labels_cp.toDlpack())
+                flat = labels_t.reshape(-1)
+                nz = flat.nonzero().squeeze(1)
+                vals = flat.index_select(0, nz).to(torch.int64)
+                zz = torch.div(nz, plane, rounding_mode='floor')
+                rem = nz - zz * plane
+                yy = torch.div(rem, int(w), rounding_mode='floor')
+                xx = rem - yy * int(w)
+                big = torch.iinfo(torch.int64).max
+                comp_area = torch.bincount(vals, minlength=num_i + 1)
+                comp_z = torch.full((num_i + 1,), big, dtype=torch.int64, device=device)
+                comp_z.scatter_reduce_(0, vals, zz, reduce='amin', include_self=True)
+                comp_y0 = torch.full((num_i + 1,), big, dtype=torch.int64, device=device)
+                comp_y0.scatter_reduce_(0, vals, yy, reduce='amin', include_self=True)
+                comp_y1 = torch.full((num_i + 1,), -1, dtype=torch.int64, device=device)
+                comp_y1.scatter_reduce_(0, vals, yy, reduce='amax', include_self=True)
+                comp_x0 = torch.full((num_i + 1,), big, dtype=torch.int64, device=device)
+                comp_x0.scatter_reduce_(0, vals, xx, reduce='amin', include_self=True)
+                comp_x1 = torch.full((num_i + 1,), -1, dtype=torch.int64, device=device)
+                comp_x1.scatter_reduce_(0, vals, xx, reduce='amax', include_self=True)
+                del nz, vals, zz, rem, yy, xx
+                # Per-slice-contiguous local ids: rank components within their slice after a
+                # stable (slice, component-id) ordering.
+                comp_ids = torch.arange(1, num_i + 1, device=device, dtype=torch.int64)
+                order = torch.argsort(comp_z[1:] * (num_i + 2) + comp_ids)
+                sorted_z = comp_z[1:].index_select(0, order)
+                counts_t = torch.bincount(sorted_z, minlength=bs)
+                starts = torch.zeros((bs,), dtype=torch.int64, device=device)
+                if bs > 1:
+                    starts[1:] = torch.cumsum(counts_t, dim=0)[:-1]
+                local_rank = torch.arange(num_i, device=device, dtype=torch.int64) - starts.index_select(0, sorted_z)
+                lut = torch.zeros((num_i + 1,), dtype=torch.int32, device=device)
+                lut.index_copy_(0, order + 1, (local_rank + 1).to(torch.int32))
+                # Relabel in cupy (int32 fancy indexing avoids a full int64 index copy).
+                relabeled_np = cp.asnumpy(cp.take(cp.asarray(lut), labels_cp))
+                del labels_cp, labels_t, flat, lut
+
+                counts_np = counts_t.cpu().numpy()
+                starts_np = starts.cpu().numpy()
+                y0s = comp_y0[1:].index_select(0, order).cpu().numpy()
+                y1s = comp_y1[1:].index_select(0, order).cpu().numpy()
+                x0s = comp_x0[1:].index_select(0, order).cpu().numpy()
+                x1s = comp_x1[1:].index_select(0, order).cpu().numpy()
+                areas_sorted = comp_area[1:].index_select(0, order).cpu().numpy()
+                del comp_area, comp_z, comp_y0, comp_y1, comp_x0, comp_x1, order, sorted_z, counts_t, starts, local_rank, comp_ids
+
+                for zi in range(bs):
+                    z = int(z0 + zi)
+                    k = int(counts_np[zi])
+                    component_counts[z] = np.uint32(k)
+                    if k <= 0:
+                        continue
+                    seg0 = int(starts_np[zi])
+                    seg1 = seg0 + k
+                    by0 = int(y0s[seg0:seg1].min())
+                    by1 = int(y1s[seg0:seg1].max()) + 1
+                    bx0 = int(x0s[seg0:seg1].min())
+                    bx1 = int(x1s[seg0:seg1].max()) + 1
+                    slice_bboxes[z, 0] = by0
+                    slice_bboxes[z, 1] = by1
+                    slice_bboxes[z, 2] = bx0
+                    slice_bboxes[z, 3] = bx1
+                    if slice_areas is not None:
+                        slice_areas[z] = areas_sorted[seg0:seg1].astype(np.int64, copy=True)
+                    np.copyto(
+                        np.asarray(labels_store[z, by0:by1, bx0:bx1]),
+                        relabeled_np[zi, by0:by1, bx0:bx1].astype(np.uint32, copy=False),
+                    )
+                z_done = int(z1)
+            try:
+                cp.get_default_memory_pool().free_all_blocks()
+            except Exception:
+                pass
+        return True
+    except Exception as exc:
+        print(f'Warning: GPU per-slice labeling failed ({exc}); falling back to the CPU labeling stage.')
+        # Zero everything the GPU pass may have written so the CPU stage starts from a
+        # clean store (it only rewrites each nonempty slice's bbox window). z_done tracks
+        # completed blocks; one extra block covers a partially-written one.
+        del z_done  # conservative: re-zero the whole store on this rare failure path
+        for z in range(0, int(z_dim)):
+            try:
+                labels_store[int(z), :, :] = 0
+            except Exception:
+                break
+        try:
+            component_counts[:] = np.uint32(0)
+        except Exception:
+            pass
+        return False
+
+
 def label_foreground_volume_streaming(
     mask_mm: np.ndarray,
     work_prefix: Path,
@@ -10855,6 +11488,8 @@ def label_foreground_volume_streaming(
     workers: int = 1,
     compact_relabel: bool = True,
     component_stats_out: Optional[Dict[str, object]] = None,
+    known_slice_any: Optional[np.ndarray] = None,
+    known_slice_bboxes: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, int, List[Path]]:
     """Label a 3D foreground volume using parallel 2D slice labeling plus serial union-find.
 
@@ -10873,6 +11508,14 @@ def label_foreground_volume_streaming(
     root_areas / total_components so callers (keep_objects) can apply decisions through
     per-slice local->root LUTs. Per-component areas are harvested during 2D labeling
     (cv2.connectedComponentsWithStats) only when stats are requested.
+
+    v13.3.6 (A1): ``component_stats_out`` additionally receives 'slice_local_luts' (a
+    SliceLocalLabelLUTs) — the same per-slice local->canonical-compact table the relabel
+    pass would have applied — so interpolation consumes local ids directly.
+    v13.3.6 (D1): ``known_slice_any``/``known_slice_bboxes`` (device-union metadata) let the
+    labeling stage skip empty slices without reading them and crop CC calls + store writes
+    to the known bboxes. v13.3.6 (D3): where CUDA is live in this process, stage A runs as
+    one z-disconnected cupy label per z-block instead of per-slice cv2 calls.
     """
     z_dim, h, w = mask_mm.shape
     estimated_bytes = estimate_voidfill_workspace_bytes((z_dim, h, w))
@@ -10918,52 +11561,84 @@ def label_foreground_volume_streaming(
     slice_areas: List[Optional[np.ndarray]] = [None] * int(z_dim) if collect_stats else []
 
     def _label_slice_local(z: int) -> None:
-        fg = (np.asarray(mask_mm[int(z)]) > 0).astype(np.uint8, copy=False)
+        z_i = int(z)
+        # v13.3.6 (D1): device-union metadata skips empty slices without touching their
+        # pages and restricts the CC call (and the store write) to the known bbox window.
+        if known_slice_any is not None and not bool(known_slice_any[z_i]):
+            component_counts[z_i] = np.uint32(0)
+            return
+        ky0 = kx0 = 0
+        if known_slice_bboxes is not None:
+            ky0, ky1, kx0, kx1 = (int(v) for v in known_slice_bboxes[z_i])
+            if ky1 <= ky0 or kx1 <= kx0:
+                component_counts[z_i] = np.uint32(0)
+                return
+            src = np.asarray(mask_mm[z_i, ky0:ky1, kx0:kx1])
+        else:
+            src = np.asarray(mask_mm[z_i])
+        # v13.3.6 (A4): OpenCV treats ANY nonzero pixel as foreground, so the raw uint8
+        # slice labels identically to the old (mask>0) cast — the full-slice compare+copy
+        # per slice is deleted (contiguity copy only for bbox crops).
+        fg = np.ascontiguousarray(src)
         if fg.size == 0 or not np.any(fg):
-            # v13.2.5 (speed #11): the store starts zeroed (np.zeros / fresh 'w+' memmap), so
-            # empty slices need no explicit zero write.
-            component_counts[int(z)] = np.uint32(0)
+            component_counts[z_i] = np.uint32(0)
             return
 
         if collect_stats:
             # v13.3.2 (R6c): per-component areas (and the slice bbox) fall out of the stats —
             # this deletes the caller's full-volume bincount pass.
             num_labels, labels2d, cc_stats, _cents = cv2.connectedComponentsWithStats(
-                np.ascontiguousarray(fg, dtype=np.uint8), connectivity=8, ltype=cv2.CV_32S,
+                fg, connectivity=8, ltype=cv2.CV_32S,
             )
             if int(num_labels) <= 1:
-                component_counts[int(z)] = np.uint32(0)
+                component_counts[z_i] = np.uint32(0)
                 return
             tops = cc_stats[1:, cv2.CC_STAT_TOP]
             lefts = cc_stats[1:, cv2.CC_STAT_LEFT]
-            slice_bboxes[int(z), 0] = int(tops.min())
-            slice_bboxes[int(z), 1] = int((tops + cc_stats[1:, cv2.CC_STAT_HEIGHT]).max())
-            slice_bboxes[int(z), 2] = int(lefts.min())
-            slice_bboxes[int(z), 3] = int((lefts + cc_stats[1:, cv2.CC_STAT_WIDTH]).max())
-            slice_areas[int(z)] = cc_stats[1:, cv2.CC_STAT_AREA].astype(np.int64, copy=True)
+            slice_bboxes[z_i, 0] = int(tops.min()) + ky0
+            slice_bboxes[z_i, 1] = int((tops + cc_stats[1:, cv2.CC_STAT_HEIGHT]).max()) + ky0
+            slice_bboxes[z_i, 2] = int(lefts.min()) + kx0
+            slice_bboxes[z_i, 3] = int((lefts + cc_stats[1:, cv2.CC_STAT_WIDTH]).max()) + kx0
+            slice_areas[z_i] = cc_stats[1:, cv2.CC_STAT_AREA].astype(np.int64, copy=True)
         else:
             num_labels, labels2d = _cv2_connected_components(fg, connectivity=8)
             if int(num_labels) <= 1:
-                component_counts[int(z)] = np.uint32(0)
+                component_counts[z_i] = np.uint32(0)
                 return
 
             rows_any = np.flatnonzero(fg.any(axis=1))
             cols_any = np.flatnonzero(fg.any(axis=0))
-            slice_bboxes[int(z), 0] = int(rows_any[0])
-            slice_bboxes[int(z), 1] = int(rows_any[-1]) + 1
-            slice_bboxes[int(z), 2] = int(cols_any[0])
-            slice_bboxes[int(z), 3] = int(cols_any[-1]) + 1
-        labels_store[int(z), :, :] = np.asarray(labels2d, dtype=np.uint32)
-        component_counts[int(z)] = np.uint32(int(num_labels) - 1)
+            slice_bboxes[z_i, 0] = int(rows_any[0]) + ky0
+            slice_bboxes[z_i, 1] = int(rows_any[-1]) + 1 + ky0
+            slice_bboxes[z_i, 2] = int(cols_any[0]) + kx0
+            slice_bboxes[z_i, 3] = int(cols_any[-1]) + 1 + kx0
+        if known_slice_bboxes is not None:
+            labels_store[z_i, ky0:ky0 + int(labels2d.shape[0]), kx0:kx0 + int(labels2d.shape[1])] = (
+                np.asarray(labels2d, dtype=np.uint32)
+            )
+        else:
+            labels_store[z_i, :, :] = np.asarray(labels2d, dtype=np.uint32)
+        component_counts[z_i] = np.uint32(int(num_labels) - 1)
 
-    parallel_for_indices_chunked(
-        int(z_dim),
-        _label_slice_local,
-        max_workers=label_workers,
-        desc='Interpolation: 2D slice labeling',
-        show_progress=True,
-        target_chunks_per_worker=2,
+    # v13.3.6 (D3): one z-disconnected cupy label pass per block on the GPU replaces the
+    # per-slice cv2 stage when CUDA is available in this process; CPU threads otherwise.
+    gpu_stage_a_done = _try_label_slices_stage_a_gpu(
+        mask_mm,
+        labels_store,
+        component_counts,
+        slice_bboxes,
+        slice_areas if collect_stats else None,
+        known_slice_any=known_slice_any,
     )
+    if not gpu_stage_a_done:
+        parallel_for_indices_chunked(
+            int(z_dim),
+            _label_slice_local,
+            max_workers=label_workers,
+            desc='Interpolation: 2D slice labeling',
+            show_progress=True,
+            target_chunks_per_worker=2,
+        )
 
     total_components = int(np.sum(component_counts, dtype=np.uint64))
     if total_components <= 0:
@@ -11048,6 +11723,28 @@ def label_foreground_volume_streaming(
     unique_roots = np.unique(root_map[1:])
     unique_roots = unique_roots[unique_roots > 0]
 
+    compact_root_ids = np.zeros(root_map.shape, dtype=np.uint32)
+    compact_root_ids[unique_roots] = np.arange(1, unique_roots.size + 1, dtype=np.uint32)
+    gid_to_compact = compact_root_ids[root_map]
+
+    # v13.3.2 (R6b): per-slice local->compact LUTs live in one concatenated table (slice z's
+    # local id v maps through lut_flat[lut_offsets[z] + v]), and the relabel touches only each
+    # slice's recorded foreground bbox — labels outside it are guaranteed zero.
+    # v13.3.6 (A1): the same table is now ALSO exported through component_stats_out
+    # ('slice_local_luts') so callers can consume per-slice local ids directly and skip the
+    # full-volume relabel pass entirely.
+    lut_sizes = component_counts.astype(np.int64, copy=False) + 1
+    lut_offsets = np.zeros((int(z_dim),), dtype=np.int64)
+    if int(z_dim) > 1:
+        lut_offsets[1:] = np.cumsum(lut_sizes)[:-1]
+    lut_flat = np.zeros((int(lut_sizes.sum()),), dtype=np.uint32)
+    for z in range(int(z_dim)):
+        count = int(component_counts[int(z)])
+        if count > 0:
+            offset = int(slice_offsets[int(z)])
+            lo = int(lut_offsets[int(z)])
+            lut_flat[lo + 1:lo + count + 1] = gid_to_compact[offset + 1:offset + count + 1]
+
     if collect_stats:
         # v13.3.2 (R6c): per-gid areas -> per-root areas (bincount is one vectorized pass; voxel
         # counts stay far below 2^53 so the float64 accumulation is exact).
@@ -11071,6 +11768,11 @@ def label_foreground_volume_streaming(
             'unique_roots': unique_roots,
             'root_areas': root_areas,
             'total_components': int(total_components),
+            'slice_local_luts': SliceLocalLabelLUTs(
+                lut_flat=lut_flat,
+                lut_offsets=lut_offsets,
+                component_counts=component_counts,
+            ),
         })
 
     if not compact_relabel:
@@ -11078,25 +11780,6 @@ def label_foreground_volume_streaming(
         # full-volume relabel write pass entirely.
         flush_array(labels_store)
         return labels_store, int(unique_roots.size), label_paths
-
-    compact_root_ids = np.zeros(root_map.shape, dtype=np.uint32)
-    compact_root_ids[unique_roots] = np.arange(1, unique_roots.size + 1, dtype=np.uint32)
-    gid_to_compact = compact_root_ids[root_map]
-
-    # v13.3.2 (R6b): per-slice local->compact LUTs live in one concatenated table (slice z's
-    # local id v maps through lut_flat[lut_offsets[z] + v]), and the relabel touches only each
-    # slice's recorded foreground bbox — labels outside it are guaranteed zero.
-    lut_sizes = component_counts.astype(np.int64, copy=False) + 1
-    lut_offsets = np.zeros((int(z_dim),), dtype=np.int64)
-    if int(z_dim) > 1:
-        lut_offsets[1:] = np.cumsum(lut_sizes)[:-1]
-    lut_flat = np.zeros((int(lut_sizes.sum()),), dtype=np.uint32)
-    for z in range(int(z_dim)):
-        count = int(component_counts[int(z)])
-        if count > 0:
-            offset = int(slice_offsets[int(z)])
-            lo = int(lut_offsets[int(z)])
-            lut_flat[lo + 1:lo + count + 1] = gid_to_compact[offset + 1:offset + count + 1]
 
     kernel_done = False
     if compiled_interpolation_kernels_enabled() and _numba_compact_relabel_kernel is not None:
@@ -11615,6 +12298,7 @@ def _radial_backproject_gpu_streaming(
     out_h: int,
     out_w: int,
     desc: str,
+    known_row_occupancy: Optional[np.ndarray] = None,
 ) -> bool:
     """v13.3.2 (R6a): radial backprojection with a <1 GiB streaming GPU working set.
 
@@ -11666,7 +12350,11 @@ def _radial_backproject_gpu_streaming(
         return False
 
     # v13.3.3 (S1): one sequential occupancy pass replaces ~O(chunks x rows) strided rescans.
-    row_any = _radial_row_occupancy(radial_mask_mm, desc)
+    # v13.3.6 (D1): the device union already produced this bitmap; skip even that one pass.
+    if known_row_occupancy is not None and int(np.asarray(known_row_occupancy).shape[0]) == int(work_t):
+        row_any = np.asarray(known_row_occupancy, dtype=bool)
+    else:
+        row_any = _radial_row_occupancy(radial_mask_mm, desc)
     stage_workers = max(1, min(8, _cpu_count()))
     stage_pool = _acquire_parallel_pool(stage_workers)  # v13.3.4 (T5): checkout-cached
 
@@ -11732,6 +12420,7 @@ def backproject_radial_volume_to_volume(
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
     out_shape_tyx: Optional[Tuple[int, int, int]] = None,
+    known_row_occupancy: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Backproject a radial view-native mask stack into orthogonal (t, Y, X).
 
@@ -11809,12 +12498,22 @@ def backproject_radial_volume_to_volume(
         v_stop = int(np.clip(max(v_start + 1, v_stop), 1, work_t))
         return v_start, v_stop
 
+    # v13.3.6 (D1): device-union row occupancy (valid for the pre-interpolation layer only,
+    # per the caller's contract) replaces both the GPU path's occupancy scan and the CPU
+    # path's per-row strided np.any reads.
+    row_occ = None
+    if known_row_occupancy is not None:
+        row_occ = np.asarray(known_row_occupancy, dtype=bool).reshape(-1)
+        if int(row_occ.shape[0]) != int(work_t):
+            row_occ = None
+
     gpu_done = False
     if gpu_backproject_enabled():
         try:
             gpu_done = _radial_backproject_gpu_streaming(
                 radial_mask_mm, vol_mm, valid_pos, flat_src, _v_range_for_t,
                 int(t_dim), int(out_h), int(out_w), desc,
+                known_row_occupancy=row_occ,
             )
         except Exception as exc:
             print(f'{desc}: GPU backprojection failed ({exc}); using the CPU path.')
@@ -11827,6 +12526,8 @@ def backproject_radial_volume_to_volume(
             v_start, v_stop = _v_range_for_t(int(t_idx))
             gathered: Optional[np.ndarray] = None
             for v_idx in range(v_start, v_stop):
+                if row_occ is not None and not bool(row_occ[int(v_idx)]):
+                    continue  # v13.3.6 (D1): known-empty row — skip without touching pages
                 plane_view = radial_mask_mm[:, int(v_idx), :]
                 if not np.any(plane_view):
                     continue
@@ -12703,8 +13404,13 @@ class SliceComponentTableCache:
     full-slice SDFs and full-slice boolean projection scans per seed.
     """
 
-    def __init__(self, labels_real: np.ndarray) -> None:
+    def __init__(self, labels_real: np.ndarray, slice_luts: Optional['SliceLocalLabelLUTs'] = None) -> None:
         self.labels_real = labels_real
+        # v13.3.6 (A1): when the label volume holds per-slice LOCAL ids (compact relabel
+        # skipped), tables canonicalize each component's id through the per-slice LUT at
+        # build time, so every record.label / by_label key is a canonical 3D object id
+        # exactly as if the full-volume relabel had run.
+        self.slice_luts = slice_luts
         self.z_dim = int(labels_real.shape[0])
         self.shape_yx = (int(labels_real.shape[1]), int(labels_real.shape[2]))
         self._tables: Dict[int, SliceComponentTable] = {}
@@ -12722,7 +13428,13 @@ class SliceComponentTableCache:
         with self._table_locks[z_i]:
             cached = self._tables.get(z_i)
             if cached is None:
-                cached = _build_slice_component_table(np.asarray(self.labels_real[z_i]), z_i)
+                cached = _build_slice_component_table(
+                    np.asarray(self.labels_real[z_i]),
+                    z_i,
+                    local_to_canonical=(
+                        self.slice_luts.lut_for(z_i) if self.slice_luts is not None else None
+                    ),
+                )
                 self._tables[z_i] = cached
             return cached
 
@@ -12898,7 +13610,11 @@ def _component_record_mirrored_u(record: SliceComponentRecord, width: int) -> Sl
     )
 
 
-def _build_slice_component_table(labels2d: np.ndarray, z: int) -> SliceComponentTable:
+def _build_slice_component_table(
+    labels2d: np.ndarray,
+    z: int,
+    local_to_canonical: Optional[np.ndarray] = None,
+) -> SliceComponentTable:
     """Build the per-slice component records for interpolation planning.
 
     v13.3.4 (T1): ONE cv2.connectedComponentsWithStats call over the slice's foreground bbox
@@ -12950,6 +13666,11 @@ def _build_slice_component_table(labels2d: np.ndarray, z: int) -> SliceComponent
         label_i = int(crop_labels[y + int(ys[0]), x + int(xs[0])])
         if label_i <= 0:
             continue
+        if local_to_canonical is not None:
+            # v13.3.6 (A1): per-slice LOCAL id -> canonical 3D object id (no relabel pass).
+            label_i = int(local_to_canonical[label_i])
+            if label_i <= 0:
+                continue
         centroid_x = float(centroids[int(local_lbl), 0]) - float(x)
         centroid_y = float(centroids[int(local_lbl), 1]) - float(y)
         d2 = (ys.astype(np.float32, copy=False) - centroid_y) ** 2 + (xs.astype(np.float32, copy=False) - centroid_x) ** 2
@@ -13554,6 +14275,8 @@ if _numba is not None:
     @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
     def _numba_find_projection_candidates_kernel(
         labels_real: np.ndarray,
+        lut_flat: np.ndarray,
+        lut_offsets: np.ndarray,
         sdf: np.ndarray,
         crop_y0: int,
         crop_x0: int,
@@ -13587,6 +14310,10 @@ if _numba is not None:
         sdf_h = sdf.shape[0]
         sdf_w = sdf.shape[1]
         overflow = 0
+        # v13.3.6 (A1): when the label volume holds per-slice LOCAL ids (compact relabel
+        # skipped), lut_offsets has one entry per slice and reads canonicalize through the
+        # concatenated local->canonical table; a shorter array means canonical ids in-raster.
+        use_lut = lut_offsets.shape[0] == num_slices
 
         for step in range(1, max_steps + 1):
             s = s0 + direction_sign * step
@@ -13618,7 +14345,13 @@ if _numba is not None:
                         gx_read = full_w - 1 - gx
                     else:
                         gx_read = gx
-                    target_label = int(labels_real[s, gy, gx_read])
+                    raw_label = int(labels_real[s, gy, gx_read])
+                    if raw_label <= 0:
+                        continue
+                    if use_lut:
+                        target_label = int(lut_flat[lut_offsets[s] + raw_label])
+                    else:
+                        target_label = raw_label
                     if target_label <= 0 or target_label == seed_label:
                         continue
 
@@ -13689,6 +14422,7 @@ def _find_slice_projection_candidates_numba(
     max_candidates: int,
     wrap_axis: bool = False,
     component_cache: Optional[SliceComponentTableCache] = None,
+    slice_luts: Optional['SliceLocalLabelLUTs'] = None,
 ) -> Optional[List[SliceProjectionCandidate]]:
     global _NUMBA_PROJECTION_KERNEL_RUNTIME_DISABLED
     if (
@@ -13705,7 +14439,11 @@ def _find_slice_projection_candidates_numba(
     if num_slices <= 0:
         return []
 
-    local_cache = component_cache if component_cache is not None else SliceComponentTableCache(labels_real)
+    local_cache = (
+        component_cache
+        if component_cache is not None
+        else SliceComponentTableCache(labels_real, slice_luts=slice_luts)
+    )
     source_record, source_anchor = local_cache.find_record_for_point(int(s0), int(seed.label), (int(y0), int(x0)))
     if source_record is None or source_anchor is None or int(source_record.area) <= 0:
         return []
@@ -13725,9 +14463,20 @@ def _find_slice_projection_candidates_numba(
     slope = math.tan(math.radians(float(search_angle_deg)))
     max_tracked = max(int(max_candidates), int(interpolation_projection_numba_max_tracked()))
 
+    # v13.3.6 (A1): pass the per-slice local->canonical LUTs when the label volume holds
+    # local ids; a 1-entry offsets sentinel tells the kernel the raster is already canonical.
+    if slice_luts is not None:
+        lut_flat_arg = slice_luts.lut_flat
+        lut_offsets_arg = slice_luts.lut_offsets
+    else:
+        # 0-length offsets can never equal num_slices (>0 here), so use_lut stays False.
+        lut_flat_arg = np.zeros((1,), dtype=np.uint32)
+        lut_offsets_arg = np.zeros((0,), dtype=np.int64)
     try:
         labels_out, slices_out, ys_out, xs_out, steps_out, d2_out, count, overflow = _numba_find_projection_candidates_kernel(
             labels_real,
+            lut_flat_arg,
+            lut_offsets_arg,
             sdf,
             int(crop_y0),
             int(crop_x0),
@@ -13786,6 +14535,7 @@ def _find_slice_projection_candidates_python(
     max_candidates: int,
     wrap_axis: bool = False,
     component_cache: Optional[SliceComponentTableCache] = None,
+    slice_luts: Optional['SliceLocalLabelLUTs'] = None,
 ) -> List[SliceProjectionCandidate]:
     if int(max_slice_distance) <= 0 or int(max_candidates) <= 0:
         return []
@@ -13795,7 +14545,11 @@ def _find_slice_projection_candidates_python(
     if num_slices <= 0:
         return []
 
-    local_cache = component_cache if component_cache is not None else SliceComponentTableCache(labels_real)
+    local_cache = (
+        component_cache
+        if component_cache is not None
+        else SliceComponentTableCache(labels_real, slice_luts=slice_luts)
+    )
     source_record, source_anchor = local_cache.find_record_for_point(int(s0), int(seed.label), (int(y0), int(x0)))
     if source_record is None or source_anchor is None or int(source_record.area) <= 0:
         return []
@@ -13847,6 +14601,10 @@ def _find_slice_projection_candidates_python(
         if mirrored:
             slice_view = slice_view[:, ::-1]
         labels_crop = slice_view[crop_y0:crop_y1, crop_x0:crop_x1]
+        if slice_luts is not None:
+            # v13.3.6 (A1): local-id raster — canonicalize just the SDF crop (small gather)
+            # instead of relying on a full-volume compact relabel pass.
+            labels_crop = slice_luts.lut_for(int(s))[labels_crop]
         overlap = projection & (labels_crop > 0) & (labels_crop != int(seed.label))
         if not np.any(overlap):
             continue
@@ -13893,6 +14651,7 @@ def _find_slice_projection_candidates(
     max_candidates: int,
     wrap_axis: bool = False,
     component_cache: Optional[SliceComponentTableCache] = None,
+    slice_luts: Optional['SliceLocalLabelLUTs'] = None,
 ) -> List[SliceProjectionCandidate]:
     fast_candidates = _find_slice_projection_candidates_numba(
         labels_real=labels_real,
@@ -13902,6 +14661,7 @@ def _find_slice_projection_candidates(
         max_candidates=int(max_candidates),
         wrap_axis=bool(wrap_axis),
         component_cache=component_cache,
+        slice_luts=slice_luts,
     )
     if fast_candidates is not None:
         return fast_candidates
@@ -13913,6 +14673,7 @@ def _find_slice_projection_candidates(
         max_candidates=int(max_candidates),
         wrap_axis=bool(wrap_axis),
         component_cache=component_cache,
+        slice_luts=slice_luts,
     )
 
 def _collect_walkback_source_points(
@@ -14224,6 +14985,7 @@ def _plan_slice_seed_bridges(
     interpolate_min_radius: float,
     wrap_axis: bool = False,
     component_cache: Optional[SliceComponentTableCache] = None,
+    slice_luts: Optional['SliceLocalLabelLUTs'] = None,
 ) -> SliceSeedBridgePlanResult:
     result = SliceSeedBridgePlanResult()
 
@@ -14235,6 +14997,7 @@ def _plan_slice_seed_bridges(
         max_candidates=int(interpolation_candidates),
         wrap_axis=bool(wrap_axis),
         component_cache=component_cache,
+        slice_luts=slice_luts,
     )
     if not candidates:
         return result
@@ -14320,6 +15083,8 @@ def interpolate_view_volume_pass_inplace(
     workers: int = 1,
     wrap_axis: bool = False,
     bridge_delta_path: Optional[Path] = None,
+    known_slice_any: Optional[np.ndarray] = None,
+    known_slice_bboxes: Optional[np.ndarray] = None,
 ) -> Dict[str, object]:
     """Apply one interpolation pass directly to a view-volume stack.
 
@@ -14359,6 +15124,11 @@ def interpolate_view_volume_pass_inplace(
     else:
         print(f"Interpolation workspace ({pass_tag}): disk-backed ({estimated_bytes / GIB:.1f} GiB estimated) -> {work_dir}")
 
+    # v13.3.6 (A1): keep per-slice LOCAL ids in the label store and consume them through
+    # the exported LUTs (component tables + candidate kernels canonicalize at read time),
+    # deleting the full-volume compact-relabel read+write pass over the uint32 store.
+    skip_relabel = interpolation_skip_compact_relabel_enabled()
+    label_stats: Dict[str, object] = {}
     labels_mm, num_objects, label_paths = label_foreground_volume_streaming(
         mask_mm,
         work_dir / f'{pass_tag}_labels',
@@ -14367,6 +15137,13 @@ def interpolate_view_volume_pass_inplace(
         reserve_bytes=reserve_bytes,
         wrap_axis=bool(wrap_axis),
         workers=int(workers),
+        compact_relabel=not skip_relabel,
+        component_stats_out=label_stats if skip_relabel else None,
+        known_slice_any=known_slice_any,
+        known_slice_bboxes=known_slice_bboxes,
+    )
+    slice_luts: Optional[SliceLocalLabelLUTs] = (
+        label_stats.get('slice_local_luts') if skip_relabel else None  # type: ignore[assignment]
     )
 
     if int(num_objects) <= 1:
@@ -14392,7 +15169,12 @@ def interpolate_view_volume_pass_inplace(
             'planning_backend': interpolation_planning_backend_name(),
         }
 
-    component_cache = SliceComponentTableCache(labels_mm)
+    if skip_relabel and slice_luts is None:
+        # Defensive: a local-id raster without LUTs would be misread downstream. This can
+        # only happen through an unexpected labeler edit; fail loudly rather than corrupt.
+        raise RuntimeError(f'interpolation pass {pass_tag}: local-id label store without slice LUTs')
+
+    component_cache = SliceComponentTableCache(labels_mm, slice_luts=slice_luts)
     worker_count = choose_slice_parallel_workers(int(workers), int(labels_mm.shape[0]))
     seeds, num_endpoints = _build_slice_endpoint_seeds(
         labels_mm,
@@ -14455,6 +15237,7 @@ def interpolate_view_volume_pass_inplace(
                 interpolate_min_radius=float(interpolate_min_radius),
                 wrap_axis=bool(wrap_axis),
                 component_cache=component_cache,
+                slice_luts=slice_luts,
             )
 
         pending = max(plan_workers, plan_workers * 2)
@@ -14575,6 +15358,7 @@ def interpolate_view_volume_pass_inplace(
         'wrap_axis': bool(wrap_axis),
         'endpoint_method': 'slice_component_scan',
         'planning_backend': interpolation_planning_backend_name(),
+        'compact_relabel_skipped': bool(skip_relabel),  # v13.3.6 (A1)
     }
     if bool(bridge_delta_written) and bridge_delta_path is not None:
         result_stats['bridge_delta_path'] = str(bridge_delta_path)
@@ -14746,6 +15530,10 @@ class NrrdLayerRef:
     segment_extent_ijk: Optional[NrrdSegmentExtent] = None
     segment_extent_shape_tyx: Tuple[int, int, int] = (0, 0, 0)
     segment_extent_source: str = ''
+    # v13.3.6 (N3): an IMMUTABLE in-process live volume the sink streams directly (no store
+    # encode, no read-back). Only valid within the producing process; ``path`` is then a
+    # never-created placeholder. compare=False keeps the frozen dataclass hashless-safe.
+    live_array: Optional[np.ndarray] = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -15419,6 +16207,7 @@ def project_view_volume_to_orthogonal_volume(
     reserve_bytes: int = 16 * GIB,
     out_shape_tyx: Optional[Tuple[int, int, int]] = None,
     allow_transverse_passthrough: bool = False,
+    known_row_occupancy: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Project a view-native binary volume into orthogonal (t,Y,X) geometry.
 
@@ -15444,6 +16233,7 @@ def project_view_volume_to_orthogonal_volume(
             reserve_bytes=int(reserve_bytes),
             workers=int(workers),
             out_shape_tyx=out_shape_tyx,
+            known_row_occupancy=known_row_occupancy,
         )
 
     if is_tilted_view(view):
@@ -15552,6 +16342,7 @@ def materialize_nrrd_view_layer(
     temp_dir: Path,
     workers: int = 1,
     known_has_foreground: Optional[bool] = None,
+    known_row_occupancy: Optional[np.ndarray] = None,
 ) -> Optional[NrrdLayerRef]:
     """Persist a view-derived layer in orthogonal processing geometry for the NRRD writer."""
     # v13.3.1 (R16): callers that already know whether the volume has foreground (e.g. the
@@ -15599,6 +16390,9 @@ def materialize_nrrd_view_layer(
         # v13.3.2 (R15): transverse layers headed for a raw-bbox store are encoded straight
         # from the source volume (identity projection, synchronous encode) — no copy.
         allow_transverse_passthrough=bool(raw_bbox_nrrd_layers_enabled()),
+        # v13.3.6 (D1): device-union row occupancy (radial views only; valid for the
+        # pre-interpolation layer, which is the only caller that supplies it).
+        known_row_occupancy=known_row_occupancy,
     )
     projected_is_source = bool(np.may_share_memory(np.asarray(projected), np.asarray(view_volume_mm)))
     shape = tuple(int(x) for x in np.asarray(projected).shape)
@@ -15683,6 +16477,8 @@ def materialize_nrrd_global_layer(
     temp_dir: Path,
     workers: int = 1,
     known_has_foreground: Optional[bool] = None,
+    volume_is_immutable: bool = False,
+    keep_temp: bool = False,
 ) -> Optional[NrrdLayerRef]:
     # v13.3.1 (R16): see materialize_nrrd_view_layer.
     if known_has_foreground is not None:
@@ -15706,6 +16502,62 @@ def materialize_nrrd_global_layer(
     else:
         raw_path = layer_dir / f'{key}.orthogonal.u8.dat'
         out_path = raw_path
+
+    # v13.3.6 (N3): IMMUTABLE global layers (the final output — nothing mutates the volume
+    # after it) skip the store entirely: the sink streams the live in-RAM volume in ONE
+    # pass (segment extent computed on the sink worker), deleting the synchronous
+    # encode-to-store pass on this thread AND the store read-back pass in the writer.
+    # keep_temp keeps the store path so temp archives still contain the layer.
+    sink = nrrd_layer_sink()
+    if (
+        bool(volume_is_immutable)
+        and not bool(keep_temp)
+        and nrrd_live_global_layer_enabled()
+        and sink is not None
+    ):
+        source_arr = np.asarray(volume_mm, dtype=np.uint8)
+        shape = tuple(int(x) for x in source_arr.shape)
+        layer_ref = NrrdLayerRef(
+            key=key,
+            name=_nrrd_layer_name(
+                view=None,
+                source=str(source),
+                mask_kind=str(mask_kind),
+                pass_index=int(pass_index),
+                stage=str(stage),
+            ),
+            path=layer_dir / f'{key}.live_volume',  # placeholder; never created
+            shape=(int(shape[0]), int(shape[1]), int(shape[2])),
+            dtype='uint8',
+            storage_format='live_u8',
+            model_name=str(model_name),
+            view_name=view_name,
+            view_family='global',
+            source=str(source),
+            mask_kind=str(mask_kind),
+            pass_index=int(pass_index),
+            stage=str(stage),
+            description=str(description),
+            segment_extent_ijk=None,  # deferred: computed by the sink worker before the header
+            segment_extent_shape_tyx=(int(shape[0]), int(shape[1]), int(shape[2])),
+            segment_extent_source='deferred_live_volume_scan',
+            live_array=source_arr,
+        )
+        sink.submit_layer(
+            layer_ref,
+            nrrd_layer_output_suffix(
+                view_token='Global',
+                source=str(source),
+                mask_kind=str(mask_kind),
+                pass_index=int(pass_index),
+                stage=str(stage),
+            ),
+        )
+        print(
+            f'NRRD layer {key}: streaming from the live volume '
+            '(v13.3.6 N3; store encode + read-back deleted).'
+        )
+        return layer_ref
 
     if raw_bbox_nrrd_layers_enabled():
         # v13.3.2 (R15): encode the raw-bbox store straight from the source volume. The old
@@ -15806,6 +16658,7 @@ def prepare_view_volume_after_fullframe(
     nrrd_layers_enabled: bool = False,
     precleaned_slice_cleanup: bool = False,
     hole_fill_done_on_device: bool = False,
+    slice_meta: Optional[Dict[str, object]] = None,
 ) -> PreparedViewResult:
     baseline_native_volume = union_mm
     nrrd_layers: List[NrrdLayerRef] = []
@@ -15813,6 +16666,32 @@ def prepare_view_volume_after_fullframe(
     parent_bridge_support_mm: Optional[object] = None
     parent_mask_support_path: Optional[Path] = None
     parent_bridge_support_path: Optional[Path] = None
+
+    # v13.3.6 (D1): device-union slice metadata (aggregated per view by the scheduler).
+    # Valid only while the volume matches the flush state: the (skipped) cleanup and the
+    # device hole fill do not change any/bbox/row-occupancy, but interpolation bridges do —
+    # so it feeds only the pre-interpolation consumers and interpolation pass 1's labeling.
+    meta_valid = bool(slice_meta) and bool(slice_meta.get('valid', False))
+    meta_slice_any: Optional[np.ndarray] = None
+    meta_slice_bboxes: Optional[np.ndarray] = None
+    meta_row_occupancy: Optional[np.ndarray] = None
+    if meta_valid:
+        try:
+            meta_slice_any = np.asarray(slice_meta['slice_any'], dtype=bool)
+            meta_slice_bboxes = np.asarray(slice_meta['slice_bboxes'], dtype=np.int64)
+            rows_packed = slice_meta.get('slice_row_any')
+            row_count = int(slice_meta.get('slice_row_count', 0) or 0)
+            if rows_packed is not None and row_count > 0:
+                meta_row_occupancy = np.unpackbits(
+                    np.asarray(rows_packed, dtype=np.uint8), axis=1, count=row_count,
+                ).astype(bool, copy=False)
+            if int(meta_slice_any.shape[0]) != int(view.num_slices):
+                raise ValueError('slice metadata length mismatch')
+        except Exception:
+            meta_valid = False
+            meta_slice_any = None
+            meta_slice_bboxes = None
+            meta_row_occupancy = None
 
     cleanup_view_volume_after_prediction_inplace(
         baseline_native_volume,
@@ -15844,6 +16723,15 @@ def prepare_view_volume_after_fullframe(
             description='Cleaned full-frame YOLO mask before interpolation bridges.',
             temp_dir=temp_dir,
             workers=int(slice_workers),
+            # v13.3.6 (D1): the device union already answered the foreground question and
+            # (for radial views) the per-row occupancy the backprojection would rescan
+            # (per-azimuth row bits OR-reduced to the (work_t,) bitmap the projection uses).
+            known_has_foreground=(bool(meta_slice_any.any()) if meta_valid and meta_slice_any is not None else None),
+            known_row_occupancy=(
+                np.ascontiguousarray(meta_row_occupancy.any(axis=0))
+                if (meta_valid and meta_row_occupancy is not None and str(view.family) == 'radial')
+                else None
+            ),
         )
         if layer_ref is not None:
             nrrd_layers.append(layer_ref)
@@ -15889,6 +16777,10 @@ def prepare_view_volume_after_fullframe(
                 workers=int(interpolation_task_workers),
                 wrap_axis=bool(view.family == 'radial'),
                 bridge_delta_path=pass_delta_path,
+                # v13.3.6 (D1): pass 1 labels exactly the flushed volume; later passes see
+                # bridge-mutated content, so the metadata is only forwarded for pass 1.
+                known_slice_any=(meta_slice_any if (meta_valid and int(pass_idx) == 1) else None),
+                known_slice_bboxes=(meta_slice_bboxes if (meta_valid and int(pass_idx) == 1) else None),
             )
             stats_local = dict(stats_local)
             stats_local.update({
@@ -17896,8 +18788,264 @@ def _nrrd_inprocess_gzip_self_test() -> bool:
         return bool(_NRRD_INPROCESS_GZIP_OK)
 
 
+# --------------------------
+# v13.3.6 (N6): GPU DEFLATE via nvCOMP for NRRD payloads
+# --------------------------
+# The GPUs are idle during the NRRD tail while the CPU deflates tens of GB. nvCOMP
+# (nvidia-nvcomp, pip-installed) produces RFC-1951 raw deflate streams on-device at tens
+# of GB/s. Framing: every uncompressed sub-chunk becomes its OWN complete gzip member
+# (header + raw stream + CRC32/ISIZE trailer) and members are concatenated in order —
+# multi-member gzip is standard (readers loop members; the v12.2.14 payloads already
+# shipped multi-member and 3D Slicer read them). DEFLATE's 32 KiB history window makes
+# small independent members nearly free ratio-wise. CRC32s of the uncompressed chunks are
+# computed host-side on the shared deflate pool (isal-accelerated when present) WHILE the
+# GPU compresses. A one-time round-trip self-test (encode -> gzip.decompress -> byte
+# compare) gates the whole path; any surprise falls back to the in-process parallel gzip
+# writer, then the pigz pipe. Ratio note (per ruling): "good enough" is accepted — the
+# per-layer compressed size is printed, YOLO_TTA_NRRD_GPU_DEFLATE_ALGO tunes nvCOMP's
+# effort when the installed build exposes it, and payloads remain standard gzip, so any
+# layer can be re-compressed offline later without rerunning the pipeline.
+
+
+def nrrd_gpu_deflate_enabled() -> bool:
+    return _env_flag('YOLO_TTA_NRRD_GPU_DEFLATE', True)
+
+
+def nrrd_gpu_deflate_chunk_bytes() -> int:
+    """Uncompressed bytes per gzip member (also nvCOMP's per-chunk unit)."""
+    return max(16 * 1024, _env_int('YOLO_TTA_NRRD_GPU_DEFLATE_CHUNK_KIB', 64) * 1024)
+
+
+def nrrd_gpu_deflate_batch_bytes() -> int:
+    """Uncompressed bytes per encode() call (bounds the transient VRAM working set)."""
+    return max(1, _env_int('YOLO_TTA_NRRD_GPU_DEFLATE_BATCH_MIB', 256)) * 1024 * 1024
+
+
+class _NvcompDeflateEngine:
+    """Thin adapter around the nvcomp python Codec producing raw deflate streams."""
+
+    def __init__(self) -> None:
+        import torch  # type: ignore
+        from nvidia import nvcomp  # type: ignore
+
+        if not bool(torch.cuda.is_available()):
+            raise RuntimeError('CUDA unavailable')
+        self.torch = torch
+        self.nvcomp = nvcomp
+        self.device = _pick_gpu_compute_device(torch)
+        algo = os.environ.get('YOLO_TTA_NRRD_GPU_DEFLATE_ALGO', '').strip()
+        codec = None
+        last_exc: Optional[BaseException] = None
+        for algo_name in ('Deflate', 'deflate'):
+            codec_kwargs: Dict[str, object] = {'algorithm': algo_name}
+            try:
+                codec_kwargs['bitstream_kind'] = nvcomp.BitstreamKind.RAW
+            except Exception:
+                pass
+            candidates: List[Dict[str, object]] = []
+            if algo:
+                # nvCOMP exposes a deflate effort knob under different names across
+                # releases; try the known spellings before the plain construction.
+                for key in ('algorithm_type', 'algo', 'algorithm_variant'):
+                    candidates.append({**codec_kwargs, key: int(algo)})
+            candidates.append(dict(codec_kwargs))
+            for kwargs in candidates:
+                try:
+                    codec = nvcomp.Codec(**kwargs)
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    continue
+            if codec is not None:
+                break
+        if codec is None:
+            raise RuntimeError(f'nvcomp Codec construction failed ({last_exc})')
+        self.codec = codec
+        self._lock = threading.Lock()
+
+    def compress_window(self, window_np: np.ndarray, spans: List[Tuple[int, int]]) -> List[bytes]:
+        """Compress byte spans of one host window to raw deflate streams.
+
+        The window uploads ONCE (one H2D instead of one per 64 KiB chunk) and the nvcomp
+        input arrays are device-side views into it.
+        """
+        torch = self.torch
+        nvcomp = self.nvcomp
+        out: List[bytes] = []
+        if not window_np.flags.writeable:
+            window_np = window_np.copy()  # torch.from_numpy rejects read-only sources
+        with self._lock:
+            with torch.cuda.device(self.device):
+                dev = torch.from_numpy(window_np).to(self.device)
+                arrays = [nvcomp.as_array(dev[off:off + ln]) for off, ln in spans]
+                encoded = self.codec.encode(arrays)
+                if not isinstance(encoded, (list, tuple)):
+                    encoded = [encoded]
+                for enc in encoded:
+                    out.append(bytes(np.asarray(enc.cpu())))
+                del arrays, dev, encoded
+        return out
+
+
+_NRRD_GPU_DEFLATE_ENGINE: Optional[_NvcompDeflateEngine] = None
+_NRRD_GPU_DEFLATE_STATE: Dict[str, object] = {'checked': False, 'ok': False}
+_NRRD_GPU_DEFLATE_LOCK = threading.Lock()
+# Fully framed all-zero gzip MEMBERS keyed by uncompressed length (zero runs dominate
+# sparse mask payloads; no GPU round trip, no CRC pass).
+_NRRD_GPU_ZERO_MEMBER_CACHE: Dict[int, bytes] = {}
+_NRRD_GPU_ZERO_MEMBER_LOCK = threading.Lock()
+
+
+def _gzip_member_from_raw_stream(raw_stream: bytes, crc: int, length: int) -> bytes:
+    return (
+        _ParallelGzipPayloadWriter.GZIP_HEADER
+        + raw_stream
+        + struct.pack('<II', int(crc) & 0xFFFFFFFF, int(length) & 0xFFFFFFFF)
+    )
+
+
+def _zero_gzip_member(length: int) -> bytes:
+    with _NRRD_GPU_ZERO_MEMBER_LOCK:
+        cached = _NRRD_GPU_ZERO_MEMBER_CACHE.get(int(length))
+    if cached is not None:
+        return cached
+    _backend, _factory, crc_fn, _full_flush, _lvl = _nrrd_deflate_backend()
+    zeros = bytes(int(length))
+    cobj = zlib.compressobj(1, zlib.DEFLATED, -15)
+    raw = cobj.compress(zeros) + cobj.flush(zlib.Z_FINISH)
+    member = _gzip_member_from_raw_stream(raw, int(crc_fn(zeros)) & 0xFFFFFFFF, int(length))
+    with _NRRD_GPU_ZERO_MEMBER_LOCK:
+        _NRRD_GPU_ZERO_MEMBER_CACHE[int(length)] = member
+    return member
+
+
+class _GpuDeflatePayloadWriter:
+    """File-like gzip encoder whose DEFLATE runs on the GPU (nvCOMP), one member per chunk.
+
+    ``write(data)`` returns only after every member of the call is written — the same
+    blocking contract as the writers it can replace. All-zero chunks are served from a
+    cached prebuilt member; nonzero chunks batch-encode on the GPU while their CRC32s
+    run on the shared host pool.
+    """
+
+    def __init__(self, fh: object, engine: _NvcompDeflateEngine) -> None:
+        self.fh = fh
+        self.engine = engine
+        self.chunk_bytes = int(nrrd_gpu_deflate_chunk_bytes())
+        self.batch_bytes = max(self.chunk_bytes, int(nrrd_gpu_deflate_batch_bytes()))
+        _backend, _factory, crc_fn, _full_flush, _lvl = _nrrd_deflate_backend()
+        self.crc_fn = crc_fn
+        self.closed = False
+        self.compressed_bytes = 0
+
+    def write(self, data: bytes | bytearray | memoryview) -> int:
+        if self.closed:
+            raise RuntimeError('Cannot write to a closed GPU deflate payload stream')
+        mv = data if isinstance(data, memoryview) else memoryview(data)
+        mv = mv.cast('B')
+        total = len(mv)
+        if total <= 0:
+            return 0
+        buf = np.frombuffer(mv, dtype=np.uint8)
+        executor = _nrrd_gzip_executor()
+        # Process the call in bounded windows: ONE H2D per window, nonzero chunks compress
+        # as device views while their CRC32s run on the host pool; zero chunks come from
+        # the cached prebuilt member without touching the GPU.
+        for w0 in range(0, total, self.batch_bytes):
+            w1 = min(total, w0 + self.batch_bytes)
+            window = buf[w0:w1]
+            spans: List[Tuple[int, int]] = []        # (offset-in-window, length) nonzero chunks
+            chunk_meta: List[Tuple[int, bool]] = []  # (length, is_zero) in window order
+            crc_futs: List[Optional[Future]] = []
+            for off in range(0, int(w1 - w0), self.chunk_bytes):
+                ln = min(self.chunk_bytes, int(w1 - w0) - off)
+                chunk = window[off:off + ln]
+                if not chunk.any():
+                    chunk_meta.append((ln, True))
+                    crc_futs.append(None)
+                    continue
+                chunk_meta.append((ln, False))
+                spans.append((int(off), int(ln)))
+                crc_futs.append(executor.submit(self.crc_fn, chunk))
+            if spans:
+                raw_streams = self.engine.compress_window(window, spans)
+                if len(raw_streams) != len(spans):
+                    raise RuntimeError('nvcomp returned a mismatched stream count')
+            else:
+                raw_streams = []
+            stream_iter = iter(raw_streams)
+            for (ln, is_zero), crc_fut in zip(chunk_meta, crc_futs):
+                if is_zero:
+                    member = _zero_gzip_member(int(ln))
+                else:
+                    member = _gzip_member_from_raw_stream(
+                        next(stream_iter), int(crc_fut.result()) & 0xFFFFFFFF, int(ln),
+                    )
+                self.fh.write(member)
+                self.compressed_bytes += len(member)
+        return int(total)
+
+    def close(self) -> None:
+        # Members are self-contained; nothing to finalize.
+        self.closed = True
+
+    def __enter__(self) -> '_GpuDeflatePayloadWriter':
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.closed = True
+
+
+def _nrrd_gpu_deflate_engine() -> Optional[_NvcompDeflateEngine]:
+    """One-time constructed + self-tested nvCOMP engine (None when unavailable/invalid)."""
+    global _NRRD_GPU_DEFLATE_ENGINE
+    if bool(_NRRD_GPU_DEFLATE_STATE['checked']):
+        return _NRRD_GPU_DEFLATE_ENGINE if bool(_NRRD_GPU_DEFLATE_STATE['ok']) else None
+    with _NRRD_GPU_DEFLATE_LOCK:
+        if bool(_NRRD_GPU_DEFLATE_STATE['checked']):
+            return _NRRD_GPU_DEFLATE_ENGINE if bool(_NRRD_GPU_DEFLATE_STATE['ok']) else None
+        engine: Optional[_NvcompDeflateEngine] = None
+        ok = False
+        try:
+            import gzip as _gzip
+            engine = _NvcompDeflateEngine()
+            # Round-trip self-test across the framing: mixed content spanning chunk
+            # boundaries, an all-zero chunk (zero-member cache), and a short tail.
+            chunk = int(nrrd_gpu_deflate_chunk_bytes())
+            payload = (
+                (bytes(range(256)) * ((chunk // 256) + 3))[: chunk + 4096]
+                + b'\x00' * chunk
+                + b'nvcomp-gpu-deflate-self-test' * 33
+            )
+            sink = io.BytesIO()
+            writer = _GpuDeflatePayloadWriter(sink, engine)
+            writer.write(payload[: chunk // 2])
+            writer.write(payload[chunk // 2:])
+            writer.close()
+            ok = bool(_gzip.decompress(sink.getvalue()) == payload)
+            if not ok:
+                print('Warning: nvCOMP GPU deflate self-test mismatch; using CPU NRRD compression.')
+        except Exception as exc:
+            ok = False
+            print(f'Warning: nvCOMP GPU deflate unavailable ({exc}); using CPU NRRD compression.')
+        _NRRD_GPU_DEFLATE_ENGINE = engine if ok else None
+        _NRRD_GPU_DEFLATE_STATE['ok'] = bool(ok)
+        _NRRD_GPU_DEFLATE_STATE['checked'] = True
+        if ok:
+            print(
+                f'GPU DEFLATE active for NRRD payloads on {engine.device} (v13.3.6 N6, nvCOMP; '
+                f'{nrrd_gpu_deflate_chunk_bytes() // 1024} KiB gzip members; '
+                'YOLO_TTA_NRRD_GPU_DEFLATE=0 disables).'
+            )
+        return _NRRD_GPU_DEFLATE_ENGINE
+
+
 def _open_nrrd_payload_writer(fh: object, *, threads: Optional[int] = None) -> object:
-    """v13.3.3 (S4): in-process parallel gzip when enabled and validated, else the pigz pipe."""
+    """v13.3.6 (N6): GPU deflate when validated; else v13.3.3 (S4) in-process gzip; else pigz."""
+    if nrrd_gpu_deflate_enabled():
+        engine = _nrrd_gpu_deflate_engine()
+        if engine is not None:
+            return _GpuDeflatePayloadWriter(fh, engine)
     if nrrd_inprocess_gzip_enabled() and _nrrd_inprocess_gzip_self_test():
         return _ParallelGzipPayloadWriter(fh)
     return _PigzPayloadWriter(fh, threads=threads)
@@ -18092,6 +19240,9 @@ def write_single_layer_nrrd_from_ref(
     header = nrrd_slicer_header((out_t, out_h, out_w))
     seg_name = str(segment_name) if segment_name else _slicer_segment_name_for_out_path(out_path)
     seg_color = segment_color if segment_color is not None else slicer_segment_palette_color(seg_name)
+    # v13.3.6 (N3): live-volume layers defer the segment-extent scan to THIS (background
+    # sink) worker instead of blocking the producing thread with a store-encode pass.
+    ref = _resolve_live_ref_extent(ref)
     header.update(slicer_segmentation_header_fields(
         segment_name=seg_name,
         color_rgb=seg_color,
@@ -18120,6 +19271,101 @@ def write_single_layer_nrrd_from_ref(
     return out_path
 
 
+_NRRD_GPU_MIRROR_TEE_ANNOUNCED = False
+
+
+def nrrd_gpu_mirror_tee_enabled() -> bool:
+    """v13.3.6 (D2): derive low-quality NRRD mirror volumes on the GPU."""
+    return _env_flag('YOLO_TTA_NRRD_GPU_MIRROR_TEE', True)
+
+
+class _GpuMirrorTee:
+    """v13.3.6 (D2): GPU tee deriving downbinned mirror volumes from payload blocks.
+
+    Each streamed full-quality block is uploaded once; every mirror spec is produced by an
+    adaptive max-pool on device (any foreground in the covering window -> 1, matching the
+    CPU tee's (INTER_AREA>0) semantics up to window-boundary voxels) and max-merged into a
+    device-resident mirror volume through the same source->mirror t-mapping. The small
+    mirror volumes come back to host once, after the layer finishes. Any failure marks the
+    tee failed and the caller falls back to re-encoding mirrors from the layer store.
+    """
+
+    def __init__(self, torch_mod: object, device: object, mirror_jobs: List[Dict[str, object]], out_t: int) -> None:
+        self.torch = torch_mod
+        self.device = device
+        self.out_t = int(out_t)
+        self.failed = False
+        self.sub_batch = max(1, _env_int('YOLO_TTA_NRRD_GPU_MIRROR_TEE_SUBBATCH', 32))
+        self.specs: List[Dict[str, object]] = []
+        for job in mirror_jobs:
+            m_t, m_h, m_w = (int(v) for v in job['shape'])  # type: ignore[misc]
+            self.specs.append({
+                'job': job,
+                'vol': torch_mod.zeros((m_t, m_h, m_w), dtype=torch_mod.uint8, device=device),
+                'src_to_m': job['src_to_m'],
+                'm_h': int(m_h),
+                'm_w': int(m_w),
+            })
+
+    def tee(self, z0: int, block: np.ndarray) -> None:
+        if self.failed:
+            return
+        torch = self.torch
+        try:
+            import torch.nn.functional as F  # type: ignore
+            z_count = int(block.shape[0])
+            for b0 in range(0, z_count, int(self.sub_batch)):
+                b1 = min(z_count, b0 + int(self.sub_batch))
+                blk = torch.from_numpy(np.ascontiguousarray(block[b0:b1])).to(self.device)
+                blk_f = blk.to(torch.float16).unsqueeze(1)  # (bs, 1, H, W)
+                for spec in self.specs:
+                    pooled = F.adaptive_max_pool2d(blk_f, (int(spec['m_h']), int(spec['m_w'])))
+                    pooled_u8 = (pooled.squeeze(1) > 0).to(torch.uint8)
+                    vol = spec['vol']
+                    src_to_m = spec['src_to_m']
+                    for bi in range(int(b1 - b0)):
+                        full_z = int(z0) + int(b0) + int(bi)
+                        if full_z >= self.out_t:
+                            break
+                        for mz in src_to_m[full_z]:  # type: ignore[index]
+                            torch.maximum(vol[int(mz)], pooled_u8[int(bi)], out=vol[int(mz)])
+                del blk, blk_f
+        except Exception as exc:
+            self.failed = True
+            print(f'Warning: GPU mirror tee failed mid-stream ({exc}); mirrors re-encode from the layer store.')
+
+    def finalize_into_jobs(self) -> bool:
+        if self.failed:
+            return False
+        try:
+            self.torch.cuda.synchronize(self.device)
+            for spec in self.specs:
+                spec['job']['volume'] = spec['vol'].cpu().numpy()  # type: ignore[index]
+                spec['vol'] = None
+            return True
+        except Exception as exc:
+            print(f'Warning: GPU mirror tee finalize failed ({exc}); mirrors re-encode from the layer store.')
+            self.failed = True
+            return False
+
+
+def _try_create_gpu_mirror_tee(mirror_jobs: List[Dict[str, object]], out_t: int) -> Optional['_GpuMirrorTee']:
+    if not nrrd_gpu_mirror_tee_enabled() or not mirror_jobs:
+        return None
+    try:
+        import torch  # type: ignore
+        if not bool(torch.cuda.is_available()):
+            return None
+        device = _pick_gpu_compute_device(torch)
+        need = sum(int(np.prod([int(v) for v in job['shape']])) for job in mirror_jobs)  # type: ignore[misc]
+        free_bytes, _total = torch.cuda.mem_get_info(device)
+        if int(free_bytes) < int(need) + 2 * GIB:
+            return None
+        return _GpuMirrorTee(torch, device, mirror_jobs, int(out_t))
+    except Exception:
+        return None
+
+
 def write_layer_nrrd_with_low_quality_mirrors(
     ref: 'NrrdLayerRef',
     output_shape: Tuple[int, int, int],
@@ -18143,6 +19389,9 @@ def write_layer_nrrd_with_low_quality_mirrors(
     so the full-quality file is never at risk.
     """
     out_t = int(output_shape[0])
+    # v13.3.6 (N3): resolve a live layer's deferred extent once, up front, so the
+    # full-quality header AND every mirror header see the same tight extent.
+    ref = _resolve_live_ref_extent(ref)
     mirror_jobs: List[Dict[str, object]] = []
     for m_shape, m_path in mirrors:
         m_t, m_h, m_w = (int(m_shape[0]), int(m_shape[1]), int(m_shape[2]))
@@ -18156,11 +19405,28 @@ def write_layer_nrrd_with_low_quality_mirrors(
         mirror_jobs.append({
             'shape': (m_t, m_h, m_w),
             'path': Path(m_path),
-            'volume': np.zeros((m_t, m_h, m_w), dtype=np.uint8),
+            'volume': None,  # v13.3.6 (D2): allocated below only when the CPU tee runs
             'src_to_m': [tuple(v) for v in tmp],
             'locks': [threading.Lock() for _ in range(16)],
             'failed': False,
         })
+
+    # v13.3.6 (D2): derive the mirrors on a GPU when one is free — the per-slice resizes
+    # and striped-lock ORs leave the CPU tee entirely; mirror volumes come back in one
+    # small D2H after the layer streams. CPU tee (below) remains the fallback.
+    gpu_tee = _try_create_gpu_mirror_tee(mirror_jobs, out_t)
+    if gpu_tee is not None:
+        global _NRRD_GPU_MIRROR_TEE_ANNOUNCED
+        if not _NRRD_GPU_MIRROR_TEE_ANNOUNCED:
+            _NRRD_GPU_MIRROR_TEE_ANNOUNCED = True
+            print(
+                f'GPU low-quality mirror tee active on {gpu_tee.device} (v13.3.6 D2; '
+                'YOLO_TTA_NRRD_GPU_MIRROR_TEE=0 disables).'
+            )
+    else:
+        for job in mirror_jobs:
+            m_t, m_h, m_w = (int(v) for v in job['shape'])  # type: ignore[misc]
+            job['volume'] = np.zeros((m_t, m_h, m_w), dtype=np.uint8)
 
     tee_workers = max(1, min(int(nrrd_fill_workers()), 16))
 
@@ -18203,11 +19469,29 @@ def write_layer_nrrd_with_low_quality_mirrors(
             for zi in range(z_count):
                 _tee_one(int(zi))
 
+    def _consume_block(z0: int, block: np.ndarray) -> None:
+        if gpu_tee is not None:
+            was_ok = not gpu_tee.failed
+            gpu_tee.tee(int(z0), block)
+            if gpu_tee.failed and was_ok:
+                # Mid-stream GPU failure: earlier blocks never went through the CPU tee,
+                # so partial CPU teeing is useless — mark every mirror for the store
+                # re-encode fallback below.
+                for job in mirror_jobs:
+                    job['failed'] = True
+            return
+        _tee(int(z0), block)
+
     result = write_single_layer_nrrd_from_ref(
         ref, output_shape, out_path,
         pigz_threads=pigz_threads, segment_name=segment_name, segment_color=segment_color,
-        block_consumer=(_tee if mirror_jobs else None),
+        block_consumer=(_consume_block if mirror_jobs else None),
     )
+
+    # v13.3.6 (D2): one small D2H per mirror replaces the per-block CPU resize/OR work.
+    if gpu_tee is not None and not gpu_tee.finalize_into_jobs():
+        for job in mirror_jobs:
+            job['failed'] = True
 
     for job in mirror_jobs:
         m_t, m_h, m_w = job['shape']  # type: ignore[misc]
@@ -18503,7 +19787,58 @@ def _nrrd_layer_ref_is_raw_bbox_store(ref: NrrdLayerRef) -> bool:
     return str(getattr(ref, 'storage_format', 'raw_u8')) in MASK_STORE_FORMATS or Path(ref.path).is_dir()
 
 
+class _LiveArrayLayerSource:
+    """v13.3.6 (N3): read adapter over an in-process live layer volume.
+
+    Duck-typed for the payload streamer (shape + slicing); NOT a RawBBoxMaskStore, so the
+    zero-copy direct-native branch applies when shapes match. The wrapped array is owned by
+    the caller (e.g. the final union volume) and must never be closed by the sink.
+    """
+
+    def __init__(self, arr: np.ndarray) -> None:
+        self.array = np.asarray(arr)
+        self.shape = tuple(int(x) for x in self.array.shape)
+
+    def __getitem__(self, item: object) -> np.ndarray:
+        return self.array[item]
+
+
+def nrrd_live_global_layer_enabled() -> bool:
+    """v13.3.6 (N3): stream IMMUTABLE global layers straight from the live volume.
+
+    The store-encode pass + store read-back that the final/global layers paid purely to
+    hand the sink a path are skipped; the sink reads the caller's in-RAM volume directly
+    (one streaming pass) and the segment extent is computed on the sink worker thread.
+    YOLO_TTA_NRRD_LIVE_GLOBAL_LAYERS=0 restores the raw-bbox store path.
+    """
+    return _env_flag('YOLO_TTA_NRRD_LIVE_GLOBAL_LAYERS', True)
+
+
+def _resolve_live_ref_extent(ref: NrrdLayerRef) -> NrrdLayerRef:
+    """v13.3.6 (N3): compute a live-volume layer's deferred segment extent (idempotent).
+
+    Live refs carry segment_extent_ijk=None so the producing thread never pays the scan;
+    the first sink worker that needs the header resolves it here (one GIL-releasing
+    reduction pass over the live volume) and downstream uses the returned ref.
+    """
+    if (
+        getattr(ref, 'live_array', None) is None
+        or _coerce_segment_extent(getattr(ref, 'segment_extent_ijk', None)) is not None
+    ):
+        return ref
+    live_arr = np.asarray(ref.live_array)
+    return dataclasses_replace(
+        ref,
+        segment_extent_ijk=compute_segment_extent_zyx(live_arr),
+        segment_extent_shape_tyx=tuple(int(x) for x in live_arr.shape),
+        segment_extent_source='live_volume_sink_scan',
+    )
+
+
 def _open_nrrd_layer_ref(ref: NrrdLayerRef) -> object:
+    live = getattr(ref, 'live_array', None)
+    if live is not None:
+        return _LiveArrayLayerSource(live)  # v13.3.6 (N3)
     if _nrrd_layer_ref_is_raw_bbox_store(ref):
         return RawBBoxMaskStore.open(
             ref.path,
@@ -18518,6 +19853,8 @@ def _open_nrrd_layer_ref(ref: NrrdLayerRef) -> object:
 
 
 def _close_nrrd_layer_source(src: object) -> None:
+    if isinstance(src, _LiveArrayLayerSource):
+        return  # v13.3.6 (N3): the live volume belongs to the caller; never close it here
     if isinstance(src, RawBBoxMaskStore):
         src.close()
         return
@@ -20577,6 +21914,10 @@ def main() -> None:
     # v13.3.3 (S2): slices per (model, view) hole-filled on device by the GPU workers; when the
     # sum reaches the view's slice count, the CPU per-view "2D hole fill" pass is skipped.
     view_device_hole_filled_slices: Dict[Tuple[str, str], int] = {}
+    # v13.3.6 (D1): per-(model, view) aggregation of the workers' device-union slice metadata
+    # (any flags / bboxes / bit-packed row occupancy). A single task without metadata marks the
+    # whole view invalid, and every downstream consumer falls back to scanning.
+    view_slice_meta: Dict[Tuple[str, str], Dict[str, object]] = {}
 
     for view in inference_views:
         for model_name, _ in yolo_models:
@@ -21014,6 +22355,11 @@ def main() -> None:
         hole_fill_done_on_device = bool(
             int(view_device_hole_filled_slices.get(key, 0)) >= int(view.num_slices)
         )
+        # v13.3.6 (D1): hand the aggregated device-union slice metadata to the view prepare
+        # (None when any task lacked it — consumers fall back to scanning).
+        slice_meta_holder = view_slice_meta.pop(key, None)
+        if slice_meta_holder is not None and not bool(slice_meta_holder.get('valid', False)):
+            slice_meta_holder = None
         fut = parent_postprocess_executor.submit(
             prepare_view_volume_after_fullframe,
             model_name=str(model_name),
@@ -21038,6 +22384,7 @@ def main() -> None:
             nrrd_layers_enabled=bool(nrrd_layers_needed),
             precleaned_slice_cleanup=bool(single_angle_streaming_cleanup_active),
             hole_fill_done_on_device=bool(hole_fill_done_on_device),
+            slice_meta=slice_meta_holder,
         )
         view_processing_futures[fut] = key
 
@@ -21713,6 +23060,39 @@ def main() -> None:
         if _filled > 0:
             key_fill = (model_name_s, str(view.name))
             view_device_hole_filled_slices[key_fill] = int(view_device_hole_filled_slices.get(key_fill, 0)) + _filled
+        # v13.3.6 (D1): aggregate the task window's device-union slice metadata per view.
+        meta_key = (model_name_s, str(view.name))
+        holder = view_slice_meta.get(meta_key)
+        if holder is None:
+            holder = {
+                'valid': True,
+                'slice_any': np.zeros((int(view.num_slices),), dtype=bool),
+                'slice_bboxes': np.zeros((int(view.num_slices), 4), dtype=np.int64),
+                'slice_row_any': None,
+                'slice_row_count': 0,
+            }
+            view_slice_meta[meta_key] = holder
+        task_meta = stats.get('slice_meta')
+        if not isinstance(task_meta, dict):
+            holder['valid'] = False
+        elif bool(holder['valid']):
+            try:
+                s0_meta = int(task.get('slice_start', 0))
+                any_arr = np.asarray(task_meta['slice_any'], dtype=bool)
+                n_meta = int(any_arr.shape[0])
+                holder['slice_any'][s0_meta:s0_meta + n_meta] = any_arr
+                holder['slice_bboxes'][s0_meta:s0_meta + n_meta] = np.asarray(task_meta['slice_bboxes'], dtype=np.int64)
+                rows_packed = task_meta.get('slice_row_any')
+                if rows_packed is not None:
+                    rows_packed = np.asarray(rows_packed, dtype=np.uint8)
+                    if holder['slice_row_any'] is None:
+                        holder['slice_row_any'] = np.zeros(
+                            (int(view.num_slices), int(rows_packed.shape[1])), dtype=np.uint8,
+                        )
+                        holder['slice_row_count'] = int(np.asarray(task_meta['slice_row_count']).reshape(-1)[0])
+                    holder['slice_row_any'][s0_meta:s0_meta + n_meta] = rows_packed
+            except Exception:
+                holder['valid'] = False
         if str(task.get('result_mode', 'file')) == 'direct_union':
             # v13.3.1 (R4): the worker already wrote its disjoint slice window straight into the
             # shared per-view union memmap — nothing to reopen, OR, flush, or unlink here, and
@@ -22385,6 +23765,11 @@ def main() -> None:
             description='Final binary output after view/tile union, optional smoothing, optional keep_objects, and geometry restoration. Not intended for recomposition.',
             temp_dir=temp_dir,
             workers=int(slice_postprocess_workers),
+            # v13.3.6 (N3): nothing mutates the final volume after this point (overlay/video
+            # writers only read it), and it stays open until after layer_sink.wait() — the
+            # sink streams it directly instead of a store encode + read-back.
+            volume_is_immutable=True,
+            keep_temp=bool(keep_temp_artifacts),
         )
         if final_output_ref is not None:
             nrrd_layer_refs.append(final_output_ref)
