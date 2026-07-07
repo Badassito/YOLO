@@ -2,9 +2,47 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the v13.3.4_SLURM implementation. It is derived from v13.3.3_SLURM by COPY + surgical
-edits, implementing the interpolation-pipeline and scheduling items from
+This is the v13.3.5_SLURM implementation. It is derived from v13.3.4_SLURM by COPY + surgical
+edits, implementing the NUMA-aware handling items (1.E) from
 SPEED_OPTIMIZATIONS_Fable-5_v13.3.2_SLURM.md:
+  - v13.3.5 (N1) each multi-GPU inference worker is CPU-pinned to the NUMA node its GPU hangs
+    off. The GPU->node map is DISCOVERED at spawn time — per-worker CUDA_VISIBLE_DEVICES token
+    matched against /proc/driver/nvidia/gpus/<bdf>/information (minor number or GPU UUID), then
+    /sys/bus/pci/devices/<bdf>/numa_node (local_cpulist fallback; optional pynvml fallback) —
+    and intersected with the ALLOCATED cpuset (sched_getaffinity), so whatever GPU<->socket
+    split SLURM hands out (2+2, 3+1, 4+0, lopsided cpusets, sub-NUMA-clustered nodes) each
+    worker gets an equal disjoint slice of ITS OWN node's allocated cores. Degenerate cases
+    stay on the previous behavior (unpinned): unknown/hidden topology, MIG tokens, a
+    single-node allocation, or a node whose per-worker share would fall below
+    YOLO_TTA_NUMA_WORKER_MIN_CORES (4; such workers get the whole node, overlapping, instead
+    of a starved slice). Pinning is applied to EVERY worker thread (Linux affinity is
+    per-thread), before any CUDA/model work so allocator arenas and TRT host scratch land
+    node-local; a worker temporarily widens all threads back to the full allocation while it
+    hosts a v13.3.4 (T4) aux interpolation pass (whose planner pools are sized for the whole
+    box) and re-pins afterwards. Main-process pools are intentionally NOT pinned — during the
+    postprocess tail they should use every core. YOLO_TTA_NUMA_WORKER_PIN=0 disables pinning,
+    YOLO_TTA_NUMA=0 disables all NUMA handling.
+  - v13.3.5 (N2) big shared allocations are page-interleaved across the allowed NUMA nodes
+    (raw mbind(MPOL_INTERLEAVE) syscall via ctypes — no libnuma/numactl dependency) immediately
+    after allocation and BEFORE first touch, so first-touch no longer parks e.g. the entire
+    decoded cube on the decode thread's socket while both sockets' pools hammer it. The hook is
+    the ALLOCATION PATH, never the mount point: allocate_workspace_array (decoded cube,
+    per-view unions, final unions, interpolation workspaces) plus the void-fill/label/bridge
+    stores. Anonymous RAM (np.zeros/np.empty: >32 MiB glibc allocations are fresh untouched
+    private mmaps) and tmpfs/shm file mappings take the same policy, so this keeps working
+    unchanged when the /dev/shm scratch stopgap is replaced by plain RAM; regular on-disk file
+    mappings (the spill fallback) simply get no benefit — and on this node the NVMe scratch is
+    a multi-drive RAID with no home socket anyway. Buffers below
+    YOLO_TTA_NUMA_INTERLEAVE_MIN_MIB (64) are skipped, and so are processes whose current
+    affinity sits inside one node — an N1-pinned GPU worker therefore keeps its private
+    buffers node-local via first-touch while unpinned processes (main, interpolation children,
+    aux-widened workers) interleave through the same allocator code. The nodemask comes from
+    Mems_allowed_list in /proc/self/status (SLURM cgroups can restrict mems as well as cpus).
+    YOLO_TTA_NUMA_INTERLEAVE=0 disables.
+  - (1.E item 3 — per-socket main-process pools — is intentionally deferred: per the report it
+    is only worth building after N1+N2 have been measured.)
+
+Inherited from v13.3.4 (T1-T5):
   - v13.3.4 (T1) per-slice component tables are built from ONE whole-slice (bbox-cropped)
     cv2.connectedComponentsWithStats call instead of one call per 3D label per slice (plus a
     full-slice foreground argsort per slice). In-plane labeling is always 8-connected, so two
@@ -970,6 +1008,392 @@ def _cpu_count() -> int:
     return max(1, int(os.cpu_count() or 1))
 
 
+# --------------------------
+# v13.3.5 (N1/N2): NUMA-aware handling — topology discovery, GPU-worker pinning, page interleave
+# --------------------------
+# Implements 1.E of SPEED_OPTIMIZATIONS_Fable-5_v13.3.2_SLURM.md. Everything here is
+# best-effort and Linux-only: a non-Linux box, hidden sysfs topology, an unexpected kernel, or
+# a failing syscall degrades to the previous behavior (no pinning, first-touch placement)
+# instead of failing the run. No root and no external packages are required (pynvml is used as
+# an optional fallback for GPU->node mapping when the driver procfs is unavailable).
+
+
+def numa_enabled() -> bool:
+    """Master switch for all v13.3.5 NUMA handling (YOLO_TTA_NUMA=0 disables)."""
+    return sys.platform.startswith('linux') and _env_flag('YOLO_TTA_NUMA', True)
+
+
+def numa_worker_pin_enabled() -> bool:
+    """v13.3.5 (N1): pin each GPU worker's threads to its GPU's NUMA node (=0 disables)."""
+    return _env_flag('YOLO_TTA_NUMA_WORKER_PIN', True)
+
+
+def numa_interleave_enabled() -> bool:
+    """v13.3.5 (N2): mbind big shared allocations MPOL_INTERLEAVE (=0 disables)."""
+    return _env_flag('YOLO_TTA_NUMA_INTERLEAVE', True)
+
+
+def _parse_id_list(text: str) -> set:
+    """Parse a kernel id-list string ('0-3,8,10-11') into a set of ints."""
+    out: set = set()
+    for part in str(text).strip().split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            lo_s, _, hi_s = part.partition('-')
+            out.update(range(int(lo_s), int(hi_s) + 1))
+        else:
+            out.add(int(part))
+    return out
+
+
+_NUMA_TOPOLOGY_CACHE: Optional[Tuple[bool, Optional[Dict[str, object]]]] = None
+_NUMA_TOPOLOGY_LOCK = threading.Lock()
+
+
+def numa_topology() -> Optional[Dict[str, object]]:
+    """Allocation-aware NUMA topology, or None when undiscoverable.
+
+    Returns {'node_cpus': {node_id: set(ALLOCATED cpus on that node)},  # only non-empty nodes
+             'cpu_to_node': {allocated cpu: node_id},
+             'allowed_mems': set(node ids from Mems_allowed_list)}.
+    Everything is intersected with this process's cpuset, so lopsided SLURM allocations are
+    represented as-is. Cached per process (spawn children re-derive their own view).
+    """
+    global _NUMA_TOPOLOGY_CACHE
+    cached = _NUMA_TOPOLOGY_CACHE
+    if cached is not None:
+        return cached[1]
+    with _NUMA_TOPOLOGY_LOCK:
+        cached = _NUMA_TOPOLOGY_CACHE
+        if cached is not None:
+            return cached[1]
+        topo: Optional[Dict[str, object]] = None
+        try:
+            if numa_enabled() and hasattr(os, 'sched_getaffinity'):
+                allowed_cpus = {int(c) for c in os.sched_getaffinity(0)}
+                node_root = '/sys/devices/system/node'
+                node_cpus: Dict[int, set] = {}
+                cpu_to_node: Dict[int, int] = {}
+                for entry in sorted(os.listdir(node_root)):
+                    m = re.fullmatch(r'node(\d+)', entry)
+                    if m is None:
+                        continue
+                    node_id = int(m.group(1))
+                    try:
+                        with open(os.path.join(node_root, entry, 'cpulist'), 'r', encoding='ascii') as fh:
+                            cpus = _parse_id_list(fh.read()) & allowed_cpus
+                    except OSError:
+                        continue
+                    if cpus:
+                        node_cpus[node_id] = cpus
+                        for c in cpus:
+                            cpu_to_node[int(c)] = node_id
+                allowed_mems: set = set()
+                try:
+                    with open('/proc/self/status', 'r', encoding='ascii', errors='replace') as fh:
+                        for line in fh:
+                            if line.startswith('Mems_allowed_list:'):
+                                allowed_mems = _parse_id_list(line.split(':', 1)[1])
+                                break
+                except OSError:
+                    pass
+                if not allowed_mems:
+                    allowed_mems = set(node_cpus.keys())
+                if node_cpus:
+                    topo = {'node_cpus': node_cpus, 'cpu_to_node': cpu_to_node, 'allowed_mems': allowed_mems}
+        except Exception:
+            topo = None
+        _NUMA_TOPOLOGY_CACHE = (True, topo)
+        return topo
+
+
+def _nvidia_gpu_inventory() -> List[Dict[str, object]]:
+    """[{'bdf', 'uuid', 'minor'}] for every GPU the NVIDIA driver exposes via procfs."""
+    entries: List[Dict[str, object]] = []
+    root = '/proc/driver/nvidia/gpus'
+    for name in sorted(os.listdir(root)):
+        info_path = os.path.join(root, name, 'information')
+        uuid: Optional[str] = None
+        minor: Optional[int] = None
+        try:
+            with open(info_path, 'r', encoding='ascii', errors='replace') as fh:
+                for line in fh:
+                    if line.startswith('GPU UUID'):
+                        uuid = line.split(':', 1)[1].strip()
+                    elif line.startswith('Device Minor'):
+                        try:
+                            minor = int(line.split(':', 1)[1].strip())
+                        except ValueError:
+                            minor = None
+        except OSError:
+            continue
+        entries.append({'bdf': str(name).lower(), 'uuid': uuid, 'minor': minor})
+    return entries
+
+
+def _numa_node_of_pci_device(bdf: str, topo: Dict[str, object]) -> Optional[int]:
+    """NUMA node of a PCI device, restricted to nodes that hold allocated cpus."""
+    node_cpus: Dict[int, set] = topo['node_cpus']  # type: ignore[assignment]
+    base = f'/sys/bus/pci/devices/{str(bdf).lower()}'
+    try:
+        with open(base + '/numa_node', 'r', encoding='ascii') as fh:
+            node = int(fh.read().strip())
+        if node >= 0 and node in node_cpus:
+            return node
+    except (OSError, ValueError):
+        pass
+    # numa_node can be -1 (BIOS/kernel hides it); local_cpulist often still knows.
+    try:
+        with open(base + '/local_cpulist', 'r', encoding='ascii') as fh:
+            local_cpus = _parse_id_list(fh.read())
+        cpu_to_node: Dict[int, int] = topo['cpu_to_node']  # type: ignore[assignment]
+        counts: Dict[int, int] = {}
+        for c in local_cpus:
+            nd = cpu_to_node.get(int(c))
+            if nd is not None:
+                counts[nd] = counts.get(nd, 0) + 1
+        if counts:
+            return max(counts.items(), key=lambda kv: kv[1])[0]
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _resolve_gpu_numa_node(cvd_token: str, topo: Dict[str, object]) -> Optional[int]:
+    """Map one CUDA_VISIBLE_DEVICES token (minor index or GPU UUID) to its NUMA node.
+
+    Tokens come from the inherited CUDA_VISIBLE_DEVICES (SLURM sets minor indices or GPU
+    UUIDs), i.e. the NVML/driver device domain — NOT torch's logical order — so they match
+    the driver procfs 'Device Minor' / 'GPU UUID' fields directly. MIG instance tokens are
+    not listed there; those resolve to None (worker stays unpinned).
+    """
+    tok = str(cvd_token).strip()
+    if not tok or tok.upper().startswith('MIG-'):
+        return None
+    try:
+        inventory = _nvidia_gpu_inventory()
+    except Exception:
+        inventory = []
+    match: Optional[Dict[str, object]] = None
+    if tok.upper().startswith('GPU-'):
+        for e in inventory:
+            if str(e.get('uuid') or '').lower() == tok.lower():
+                match = e
+                break
+    else:
+        try:
+            minor = int(tok)
+        except ValueError:
+            minor = None
+        if minor is not None:
+            for e in inventory:
+                if e.get('minor') == minor:
+                    match = e
+                    break
+    if match is not None:
+        node = _numa_node_of_pci_device(str(match['bdf']), topo)
+        if node is not None:
+            return node
+    # Optional fallback: pynvml (pip package), for boxes without the driver procfs.
+    try:
+        import pynvml  # type: ignore[import-not-found]
+        pynvml.nvmlInit()
+        try:
+            if tok.upper().startswith('GPU-'):
+                handle = pynvml.nvmlDeviceGetHandleByUUID(tok.encode('ascii'))
+            else:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(int(tok))
+            pci = pynvml.nvmlDeviceGetPciInfo(handle)
+            bus_id = pci.busId.decode('ascii', 'replace') if isinstance(pci.busId, bytes) else str(pci.busId)
+            bdf = bus_id.strip().strip('\x00').lower()
+            if len(bdf.split(':', 1)[0]) == 8:
+                bdf = bdf[4:]  # NVML uses a 32-bit domain; sysfs uses 4 hex digits
+            return _numa_node_of_pci_device(bdf, topo)
+        finally:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+    except Exception:
+        return None
+
+
+def plan_gpu_worker_affinity(worker_tokens: Sequence[str]) -> List[Optional[List[int]]]:
+    """v13.3.5 (N1): per-worker CPU pin sets; None entries stay unpinned.
+
+    Discovery-driven — no GPU<->socket balance is assumed. GPUs and allocated cpus are each
+    bucketed by measured NUMA node and every node's cpus are split evenly among ITS OWN
+    workers (the last slice absorbs the remainder), so 2+2 / 3+1 / 4+0 splits, lopsided
+    cpusets and sub-NUMA clustering all fall out of the same arithmetic. A node whose
+    per-worker share is below YOLO_TTA_NUMA_WORKER_MIN_CORES gives each of its workers the
+    whole (overlapping) node instead of a starved slice.
+    """
+    n = len(worker_tokens)
+    plan: List[Optional[List[int]]] = [None] * n
+    if n == 0 or not (numa_enabled() and numa_worker_pin_enabled()):
+        return plan
+    topo = numa_topology()
+    if topo is None:
+        print('[numa] worker pinning inactive: NUMA topology not discoverable')
+        return plan
+    node_cpus: Dict[int, set] = topo['node_cpus']  # type: ignore[assignment]
+    if len(node_cpus) < 2:
+        print('[numa] worker pinning inactive: allocation spans a single NUMA node')
+        return plan
+    node_of: List[Optional[int]] = []
+    by_node: Dict[int, List[int]] = {}
+    for i, tok in enumerate(worker_tokens):
+        node = _resolve_gpu_numa_node(str(tok), topo)
+        node_of.append(node)
+        if node is not None and node in node_cpus:
+            by_node.setdefault(int(node), []).append(i)
+    min_cores = max(1, _env_int('YOLO_TTA_NUMA_WORKER_MIN_CORES', 4))
+    for node, idxs in sorted(by_node.items()):
+        cpus = sorted(node_cpus[int(node)])
+        share = len(cpus) // len(idxs)
+        if share < min_cores:
+            for i in idxs:
+                plan[i] = list(cpus)
+            continue
+        for j, i in enumerate(idxs):
+            lo = j * share
+            hi = (j + 1) * share if j + 1 < len(idxs) else len(cpus)
+            plan[i] = list(cpus[lo:hi])
+    for i, tok in enumerate(worker_tokens):
+        cpus_i = plan[i]
+        if cpus_i is not None:
+            print(f'[numa] gpu-worker {i} (token {tok}): node {node_of[i]}, {len(cpus_i)} cpu(s)')
+        else:
+            reason = 'gpu node unresolved' if node_of[i] is None else f'node {node_of[i]} holds no allocated cpus'
+            print(f'[numa] gpu-worker {i} (token {tok}): unpinned ({reason})')
+    return plan
+
+
+def _sched_setaffinity_all_threads(cpus: Sequence[int]) -> bool:
+    """Apply a CPU mask to EVERY thread of this process (Linux affinity is per-thread;
+    os.sched_setaffinity(0, ...) alone would only move the calling thread)."""
+    if not hasattr(os, 'sched_setaffinity'):
+        return False
+    cpu_set = {int(c) for c in cpus}
+    if not cpu_set:
+        return False
+    try:
+        tids = sorted(int(t) for t in os.listdir('/proc/self/task'))
+    except (OSError, ValueError):
+        tids = [0]  # 0 == calling thread
+    ok = False
+    for tid in tids:
+        try:
+            os.sched_setaffinity(tid, cpu_set)
+            ok = True
+        except OSError:
+            continue  # thread exited between listdir and the call
+    return ok
+
+
+# Worker-process pin state (set inside _gpu_inference_worker_main; spawn children only).
+_GPU_WORKER_NUMA_PIN: Optional[set] = None
+_GPU_WORKER_NUMA_FULL: Optional[set] = None
+
+_NUMA_MBIND_STATE = {'failed': False, 'announced': False}
+
+
+def _numa_interleave_range(addr: int, nbytes: int, mems: Sequence[int]) -> bool:
+    """mbind(start, len, MPOL_INTERLEAVE, nodemask, maxnode, 0) via the raw syscall (no libnuma)."""
+    if _NUMA_MBIND_STATE['failed']:
+        return False
+    try:
+        machine = str(os.uname().machine)
+    except Exception:
+        _NUMA_MBIND_STATE['failed'] = True
+        return False
+    syscall_nr = {'x86_64': 237, 'aarch64': 235}.get(machine)
+    max_node = max(int(m) for m in mems)
+    if syscall_nr is None or max_node >= 64:
+        _NUMA_MBIND_STATE['failed'] = True
+        print(f'Warning: [numa] mbind unsupported here (machine={machine}, max node={max_node}); '
+              f'page interleave disabled for this process.')
+        return False
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        page = int(mmap.PAGESIZE)
+        start = int(addr) & ~(page - 1)
+        length = int(nbytes) + (int(addr) - start)
+        mask = 0
+        for m in mems:
+            mask |= 1 << int(m)
+        nodemask = ctypes.c_ulong(mask)
+        rc = libc.syscall(
+            int(syscall_nr),
+            ctypes.c_void_p(start),
+            ctypes.c_size_t(length),
+            ctypes.c_int(3),  # MPOL_INTERLEAVE
+            ctypes.byref(nodemask),
+            ctypes.c_ulong(65),  # maxnode: one 64-bit word of nodemask
+            ctypes.c_uint(0),
+        )
+        if int(rc) != 0:
+            err = int(ctypes.get_errno())
+            _NUMA_MBIND_STATE['failed'] = True
+            print(f'Warning: [numa] mbind(MPOL_INTERLEAVE) failed (errno {err}); '
+                  f'page interleave disabled for this process.')
+            return False
+        return True
+    except Exception as exc:
+        _NUMA_MBIND_STATE['failed'] = True
+        print(f'Warning: [numa] mbind unavailable ({exc}); page interleave disabled for this process.')
+        return False
+
+
+def numa_interleave_memory(arr: object, desc: str = '') -> bool:
+    """v13.3.5 (N2): round-robin a big shared buffer's pages across the allowed NUMA nodes.
+
+    Called by the ALLOCATION paths right after creating a buffer and before first touch — the
+    only moment placement can still be chosen (unprivileged MPOL_MF_MOVE cannot migrate shared
+    multi-process pages later). Keyed on how the buffer was allocated, never on a mount point:
+    anonymous RAM and tmpfs/shm mappings both take the policy; regular on-disk file mappings
+    are silently unaffected. No-ops (returning False) when: NUMA handling is off, topology is
+    unknown, only one memory node is allowed, the buffer is below
+    YOLO_TTA_NUMA_INTERLEAVE_MIN_MIB, or this process's current affinity sits inside a single
+    node (a pinned GPU worker's first-touch is already the better, local placement).
+    """
+    if arr is None or not (numa_enabled() and numa_interleave_enabled()):
+        return False
+    topo = numa_topology()
+    if topo is None:
+        return False
+    mems = sorted(int(m) for m in topo['allowed_mems'])  # type: ignore[call-overload]
+    if len(mems) < 2:
+        return False
+    try:
+        a = np.asarray(arr)
+        if a.nbytes <= 0 or not a.flags['C_CONTIGUOUS']:
+            return False
+        min_bytes = max(0, _env_int('YOLO_TTA_NUMA_INTERLEAVE_MIN_MIB', 64)) * 1024 * 1024
+        if int(a.nbytes) < int(min_bytes):
+            return False
+        if hasattr(os, 'sched_getaffinity'):
+            cpu_to_node: Dict[int, int] = topo['cpu_to_node']  # type: ignore[assignment]
+            nodes_now = {cpu_to_node.get(int(c)) for c in os.sched_getaffinity(0)}
+            nodes_now.discard(None)
+            if len(nodes_now) < 2:
+                return False
+        addr = int(a.ctypes.data)
+        if addr == 0:
+            return False
+        ok = _numa_interleave_range(addr, int(a.nbytes), mems)
+        if ok and not _NUMA_MBIND_STATE['announced']:
+            _NUMA_MBIND_STATE['announced'] = True
+            print(f'[numa] interleaving big shared allocations across nodes {mems} '
+                  f'(first: {desc or "unnamed"}, {a.nbytes / GIB:.1f} GiB; YOLO_TTA_NUMA_INTERLEAVE=0 disables)')
+        return ok
+    except Exception:
+        return False
+
+
 def default_worker_budget() -> int:
     """Intentional CPU oversubscription for mixed GPU/IO/CPU workloads.
 
@@ -1159,11 +1583,16 @@ def allocate_workspace_array(
         try:
             print(f"{desc}: in-memory ({budget})")
             shape_tuple = tuple(int(x) for x in shape)
-            return (
+            arr = (
                 np.zeros(shape_tuple, dtype=dtype_obj)
                 if bool(initialize_zero)
                 else np.empty(shape_tuple, dtype=dtype_obj)
             )
+            # v13.3.5 (N2): big allocations are still untouched here (>32 MiB glibc allocations
+            # are fresh private mmaps, and np.zeros defers to lazily-faulted zero pages), so the
+            # interleave policy lands before first touch.
+            numa_interleave_memory(arr, desc=desc)
+            return arr
         except MemoryError:
             print(f"{desc}: in-memory allocation failed, falling back to disk ({budget})")
 
@@ -1173,12 +1602,16 @@ def allocate_workspace_array(
     path.parent.mkdir(parents=True, exist_ok=True)
     if reuse_existing and path.exists():
         print(f"{desc}: disk-backed reuse ({budget}) -> {path}")
-        return np.memmap(path, dtype=dtype_obj, mode='r+', shape=tuple(int(x) for x in shape))
+        mm = np.memmap(path, dtype=dtype_obj, mode='r+', shape=tuple(int(x) for x in shape))
+        numa_interleave_memory(mm, desc=desc)  # v13.3.5 (N2): best-effort (existing pages stay put)
+        return mm
 
     if path.exists():
         path.unlink()
     print(f"{desc}: disk-backed ({budget}) -> {path}")
-    return np.memmap(path, dtype=dtype_obj, mode='w+', shape=tuple(int(x) for x in shape))
+    mm = np.memmap(path, dtype=dtype_obj, mode='w+', shape=tuple(int(x) for x in shape))
+    numa_interleave_memory(mm, desc=desc)  # v13.3.5 (N2)
+    return mm
 
 
 def copy_workspace_array(
@@ -9882,12 +10315,26 @@ def _gpu_inference_worker_main(
     result_queue: object,
 ) -> None:
     """Persistent GPU worker process: pin to one physical GPU, load the model once, serve tasks."""
+    global _GPU_WORKER_NUMA_PIN, _GPU_WORKER_NUMA_FULL
     try:
         # Pin the process to its physical GPU before any CUDA context is created, so the model and
         # all tensors live on that device and never contend with the other workers' GPUs. The
         # logical --device index is remapped through the inherited CUDA_VISIBLE_DEVICES list
         # (v13.2.2 bug #13).
         os.environ['CUDA_VISIBLE_DEVICES'] = _pin_cuda_visible_device_token(int(gpu_index))
+        # v13.3.5 (N1): pin every thread of this worker to its GPU's NUMA node BEFORE any
+        # CUDA/model work, so allocator arenas, pinned staging and TRT host scratch land
+        # node-local. The parent computed the plan (None = stay unpinned).
+        _numa_pin_cpus = init_dict.get('numa_affinity_cpus', None)
+        if _numa_pin_cpus and hasattr(os, 'sched_getaffinity'):
+            try:
+                _GPU_WORKER_NUMA_FULL = {int(c) for c in os.sched_getaffinity(0)}
+                if _sched_setaffinity_all_threads([int(c) for c in _numa_pin_cpus]):  # type: ignore[union-attr]
+                    _GPU_WORKER_NUMA_PIN = {int(c) for c in _numa_pin_cpus}  # type: ignore[union-attr]
+                    print(f'[numa] gpu-worker {int(gpu_index)}: pinned to {len(_GPU_WORKER_NUMA_PIN)} cpu(s)')
+            except Exception as _numa_exc:
+                _GPU_WORKER_NUMA_PIN = None
+                print(f'Warning: [numa] gpu-worker {int(gpu_index)}: pinning failed ({_numa_exc}); running unpinned.')
         try:
             cv2.setNumThreads(max(1, int(init_dict.get('cv2_threads', 1))))
         except Exception:
@@ -9950,6 +10397,13 @@ def _gpu_inference_worker_main(
             # v13.3.4 (T4): after the inference queue drains, this warm worker process doubles
             # as an interpolation host — same memmap-path protocol as the dedicated
             # interpolation process pool, one pass at a time per worker.
+            # v13.3.5 (N1): the pass's planner pools are sized for the whole allocation, so
+            # widen every thread back to the full cpuset for the pass, then re-pin. (Inference
+            # has drained by the time aux tasks arrive, so the wide window contends with
+            # nothing GPU-side.)
+            _numa_widened = False
+            if _GPU_WORKER_NUMA_PIN is not None and _GPU_WORKER_NUMA_FULL:
+                _numa_widened = _sched_setaffinity_all_threads(sorted(_GPU_WORKER_NUMA_FULL))
             try:
                 aux_stats = _interpolation_process_entry(**dict(task['aux_kwargs']))  # type: ignore[arg-type]
                 result_queue.put({
@@ -9962,6 +10416,9 @@ def _gpu_inference_worker_main(
                     'type': 'aux_result', 'task_id': task_id, 'gpu_index': int(gpu_index), 'ok': False,
                     'error': repr(exc), 'traceback': traceback.format_exc(),
                 })
+            finally:
+                if _numa_widened and _GPU_WORKER_NUMA_PIN is not None:
+                    _sched_setaffinity_all_threads(sorted(_GPU_WORKER_NUMA_PIN))
             continue
         try:
             stats = run_prediction_volume_in_worker(model, cfg, task)
@@ -10299,6 +10756,7 @@ def fill_3d_voids_inplace_streaming(
         bg_gid_path = work_prefix.with_suffix('.bg_gid.u32.dat')
         bg_gid_path.parent.mkdir(parents=True, exist_ok=True)
         bg_gid_store = np.memmap(bg_gid_path, dtype=np.uint32, mode='w+', shape=(z_dim, h, w))
+    numa_interleave_memory(bg_gid_store, desc='3D void fill gid store')  # v13.3.5 (N2)
 
     uf = _UnionFind()
     prev_gid_slice: Optional[np.ndarray] = None
@@ -10432,6 +10890,7 @@ def label_foreground_volume_streaming(
         print(f"Interpolation label workspace: disk-backed ({budget}) -> {work_prefix.parent}")
         labels_store = np.memmap(provisional_path, dtype=np.uint32, mode='w+', shape=(z_dim, h, w))
         label_paths = [provisional_path]
+    numa_interleave_memory(labels_store, desc='Interpolation label store')  # v13.3.5 (N2)
 
     if int(z_dim) <= 0:
         flush_array(labels_store)
@@ -13971,6 +14430,7 @@ def interpolate_view_volume_pass_inplace(
     else:
         bridge_path = work_dir / f'{pass_tag}_bridges.u8.dat'
         bridge_mm = np.memmap(bridge_path, dtype=np.uint8, mode='w+', shape=mask_mm.shape)
+    numa_interleave_memory(bridge_mm, desc='Interpolation bridge canvas')  # v13.3.5 (N2)
 
     candidate_connections = 0
     accepted_connections = 0
@@ -14057,6 +14517,7 @@ def interpolate_view_volume_pass_inplace(
                 # no post-pass subtract). 'w+' memmaps start zero-filled.
                 Path(bridge_delta_path).parent.mkdir(parents=True, exist_ok=True)
                 delta_mm = np.memmap(Path(bridge_delta_path), dtype=np.uint8, mode='w+', shape=mask_mm.shape)
+                numa_interleave_memory(delta_mm, desc='Interpolation bridge delta')  # v13.3.5 (N2)
 
             def _merge_slice(list_idx: int) -> None:
                 z = int(scheduled_slices[int(list_idx)])
@@ -21109,6 +21570,13 @@ def main() -> None:
         # validated against the inherited list early in main(), and each worker resolves
         # its physical pin via _pin_cuda_visible_device_token.
         gpu_logical_indices = [int(str(d).split(':')[-1]) for d in inference_devices]
+        pinned_tokens = [
+            _pin_cuda_visible_device_token(int(idx)) for idx in gpu_logical_indices
+        ]
+        # v13.3.5 (N1): discovery-driven GPU-worker -> NUMA-node CPU pin plan (None entries
+        # stay unpinned). Computed from the PHYSICAL tokens before CUDA_VISIBLE_DEVICES is
+        # narrowed inside the workers.
+        worker_numa_plan = plan_gpu_worker_affinity(pinned_tokens)
 
         # v13.2.5 (speed #8): spawn the worker processes BEFORE blocking on decode/cube-resize
         # completion — workers idle in task_queue.get() while their CUDA context + model load
@@ -21117,17 +21585,16 @@ def main() -> None:
         mp_ctx = mp.get_context('spawn')
         gpu_task_queue = mp_ctx.Queue()
         gpu_result_queue = mp_ctx.Queue()
-        for gpu_index in gpu_logical_indices:
+        for worker_pos, gpu_index in enumerate(gpu_logical_indices):
+            worker_init_i = dict(worker_init)
+            worker_init_i['numa_affinity_cpus'] = worker_numa_plan[int(worker_pos)]
             proc = mp_ctx.Process(
                 target=_gpu_inference_worker_main,
-                args=(int(gpu_index), str(model_paths[0]), dict(worker_init), gpu_task_queue, gpu_result_queue),
+                args=(int(gpu_index), str(model_paths[0]), worker_init_i, gpu_task_queue, gpu_result_queue),
                 name=f'gpu-worker-{gpu_index}', daemon=True,
             )
             proc.start()
             gpu_worker_processes.append(proc)
-        pinned_tokens = [
-            _pin_cuda_visible_device_token(int(idx)) for idx in gpu_logical_indices
-        ]
         print(
             f'Started {len(gpu_worker_processes)} GPU worker process(es) for logical devices {gpu_logical_indices} '
             f'(pinned to CUDA_VISIBLE_DEVICES tokens {pinned_tokens}); model load/CUDA init overlaps decode; '
