@@ -2,9 +2,54 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the v13.3.6_SLURM implementation. It is derived from v13.3.5_SLURM by COPY + surgical
-edits, implementing seven approved items (C2, D1, D2, D3, A1, N3, N6) from
-SPEED_OPTIMIZATIONS_Fable-5_v13.3.5_SLURM.md:
+This is the v13.3.7_SLURM implementation. It is derived from v13.3.6_SLURM by COPY + surgical
+edits, implementing five further approved items (B5, N1, N2, N4, N5) from
+SPEED_OPTIMIZATIONS_Fable-5_v13.3.5_SLURM.md — all in the NRRD write tail:
+  - v13.3.7 (N1) member-parallel in-process gzip: the CPU payload-writer tier emits one
+    INDEPENDENT gzip member per chunk (default 16 MiB; the same multi-member framing as N6,
+    v12.2.14 precedent) and pipelines the WHOLE layer through the shared deflate pool.
+    write() detaches (copies) each nonzero chunk so the caller's double buffer stays
+    immediately reusable, submits it, drains completed members strictly in payload order,
+    and blocks only while the bounded in-flight window
+    (YOLO_TTA_NRRD_MEMBER_GZIP_WINDOW_MIB, default 512) is full. The single-member writer's
+    per-write() barrier — compression parallelism capped at one block's chunk count and
+    draining to zero between blocks — and its pure-Python crc32_combine are gone from this
+    tier; all-zero chunks become cached prebuilt members. It is the CPU tier under the N6
+    GPU writer (fallback order GPU -> member-parallel -> single-member -> pigz), gated by a
+    one-time round-trip self-test. YOLO_TTA_NRRD_MEMBER_GZIP=0 restores the single-member
+    writer.
+  - v13.3.7 (B5/N4) extent-driven zero skipping: every payload writer gained write_zeros()
+    (the GPU and member-parallel tiers emit cached all-zero gzip members; the single-member
+    tier splices cached full-flushed deflate chunks through its CRC-combine; the pigz tier
+    streams a shared literal zero buffer), and the payload streamer consults the layer's
+    recorded segment extent to emit z-blocks fully outside it through write_zeros: no block
+    fill, no mirror tee, and no source page reads/faults for those ranges. Extents are
+    trustworthy for this (raw_bbox_cvol_index / raw_layer_materialization_scan /
+    live_volume_sink_scan all record genuinely scanned data), and the scanned-EMPTY sentinel
+    means an all-zero payload — the deliberate contrast with the Slicer header mapping,
+    which displays empty as full. The t-window inverts the ACTUAL restore mappings
+    (floor/ceil source windows for downscale; the endpoint-aligned _linear_source_index for
+    upscale, whose slope the header's display scaling would undershoot at large factors),
+    padded one slice per side. In-extent all-zero chunks keep hitting the S4/N6 zero caches
+    as before (B5's other half has shipped since v13.3.3). YOLO_TTA_NRRD_EXTENT_ZERO_SKIP=0
+    restores full streaming.
+  - v13.3.7 (N2) the direct-native payload branch (source already in output geometry —
+    exactly the N3 live final/global layers, previously the one branch still fully serial
+    per block) now submits compression to a one-thread writer pool and runs the low-quality
+    mirror tee on the calling thread WHILE the block compresses (both only read it, and
+    chunks are independent views so there is no buffer-reuse hazard). The periodic
+    MADV_DONTNEED first waits for the in-flight write so file-backed pages are never dropped
+    under the compressor.
+  - v13.3.7 (N5) a layer's low-quality mirror files gzip-encode CONCURRENTLY at the layer
+    tail instead of one after another (independent files and handles; the shared deflate
+    pool, zero-member caches, and the lock-serialized nvCOMP engine are all thread-safe).
+    Failure semantics match the serial loop — a failed mirror re-encodes from the layer
+    store, and the first error re-raises after every mirror settles. The item's companion
+    suggestion (device downbin of the mirrors) already shipped as v13.3.6 (D2).
+    YOLO_TTA_NRRD_PARALLEL_MIRROR_ENCODE=0 restores serial encodes.
+
+Inherited from v13.3.6 (the seven items C2, D1, D2, D3, A1, N3, N6 from
+SPEED_OPTIMIZATIONS_Fable-5_v13.3.5_SLURM.md):
   - v13.3.6 (C2) direct backend predict loop: on the GPU proto-union fast path,
     model.predict(stream=True)'s stream_inference machinery is bypassed — the (patched)
     preprocess and the AutoBackend forward are driven directly, NMS is DELETED (at iou=1.0
@@ -18484,6 +18529,18 @@ def nrrd_madvise_dontneed_interval() -> int:
     return max(0, _env_int('YOLO_TTA_NRRD_MADVISE_DONTNEED_INTERVAL', 16))
 
 
+# v13.3.7 (B5/N4): shared literal-zero buffer for write_zeros() paths that must emit real
+# bytes (the pigz pipe). Built lazily so spawned worker processes never pay it at import.
+_NRRD_ZERO_BLOCK: Optional[bytes] = None
+
+
+def _nrrd_zero_block() -> bytes:
+    global _NRRD_ZERO_BLOCK
+    if _NRRD_ZERO_BLOCK is None:
+        _NRRD_ZERO_BLOCK = bytes(1024 * 1024)
+    return _NRRD_ZERO_BLOCK
+
+
 class _PigzPayloadWriter:
     """Small file-like wrapper that gzip-encodes NRRD payload bytes through pigz."""
 
@@ -18510,6 +18567,20 @@ class _PigzPayloadWriter:
             raise RuntimeError('Cannot write to closed pigz payload stream')
         written = self.stdin.write(data)
         return int(0 if written is None else written)
+
+    def write_zeros(self, nbytes: int) -> int:
+        """v13.3.7 (B5/N4): stream literal zeros from the shared buffer.
+
+        pigz still deflates them (this tier has no member/chunk splicing), but the caller
+        never reads its own source pages for the range — the point of the extent skip.
+        """
+        zeros = _nrrd_zero_block()
+        remaining = int(nbytes)
+        while remaining > 0:
+            ln = min(len(zeros), remaining)
+            self.write(zeros if ln == len(zeros) else memoryview(zeros)[:ln])
+            remaining -= int(ln)
+        return int(nbytes)
 
     def close(self) -> None:
         if self.proc.stdin is not None and not self.proc.stdin.closed:
@@ -18696,20 +18767,26 @@ class _ParallelGzipPayloadWriter:
         self.closed = False
         self.fh.write(self.GZIP_HEADER)
 
+    def _zero_flush_chunk(self, ln: int) -> Tuple[bytes, int]:
+        """Cached (deflated bytes, CRC32) of an all-zero chunk of length ``ln``."""
+        key = (self.backend, self.eff_level, int(ln))
+        with _NRRD_GZIP_ZERO_CACHE_LOCK:
+            cached = _NRRD_GZIP_ZERO_CACHE.get(key)
+        if cached is None:
+            zeros = bytes(int(ln))
+            cobj = self.factory()
+            comp = cobj.compress(zeros) + cobj.flush(self.full_flush)
+            cached = (bytes(comp), int(self.crc_fn(zeros)) & 0xFFFFFFFF)
+            with _NRRD_GZIP_ZERO_CACHE_LOCK:
+                _NRRD_GZIP_ZERO_CACHE[key] = cached
+        return cached
+
     def _compress_chunk(self, mv: memoryview) -> Tuple[bytes, int, int]:
         ln = len(mv)
         arr = np.frombuffer(mv, dtype=np.uint8)
         if not arr.any():
-            key = (self.backend, self.eff_level, int(ln))
-            with _NRRD_GZIP_ZERO_CACHE_LOCK:
-                cached = _NRRD_GZIP_ZERO_CACHE.get(key)
-            if cached is None:
-                cobj = self.factory()
-                comp = cobj.compress(mv) + cobj.flush(self.full_flush)
-                cached = (bytes(comp), int(self.crc_fn(mv)) & 0xFFFFFFFF)
-                with _NRRD_GZIP_ZERO_CACHE_LOCK:
-                    _NRRD_GZIP_ZERO_CACHE[key] = cached
-            return cached[0], cached[1], int(ln)
+            comp, crc = self._zero_flush_chunk(int(ln))
+            return comp, int(crc), int(ln)
         cobj = self.factory()
         comp = cobj.compress(mv) + cobj.flush(self.full_flush)
         return comp, int(self.crc_fn(mv)) & 0xFFFFFFFF, int(ln)
@@ -18733,6 +18810,20 @@ class _ParallelGzipPayloadWriter:
             self.crc = _crc32_combine(self.crc, int(crc), int(ln))
             self.isize = (self.isize + int(ln)) & 0xFFFFFFFF
         return int(total)
+
+    def write_zeros(self, nbytes: int) -> int:
+        """v13.3.7 (B5/N4): splice cached deflated zero chunks — no source bytes, no deflate."""
+        if self.closed:
+            raise RuntimeError('Cannot write to a closed gzip payload stream')
+        remaining = int(nbytes)
+        while remaining > 0:
+            ln = min(self.chunk_bytes, remaining)
+            comp, crc = self._zero_flush_chunk(int(ln))
+            self.fh.write(comp)
+            self.crc = _crc32_combine(self.crc, int(crc), int(ln))
+            self.isize = (self.isize + int(ln)) & 0xFFFFFFFF
+            remaining -= int(ln)
+        return int(nbytes)
 
     def close(self) -> None:
         if self.closed:
@@ -18777,7 +18868,7 @@ def _nrrd_inprocess_gzip_self_test() -> bool:
             sink = io.BytesIO()
             writer = _ParallelGzipPayloadWriter(sink, chunk_bytes=4096)
             writer.write(part_a)
-            writer.write(part_b)
+            writer.write_zeros(len(part_b))  # v13.3.7 (B5/N4): the spliced zero path
             writer.write(part_c)
             writer.close()
             _NRRD_INPROCESS_GZIP_OK = bool(_gzip.decompress(sink.getvalue()) == part_a + part_b + part_c)
@@ -18985,6 +19076,19 @@ class _GpuDeflatePayloadWriter:
                 self.compressed_bytes += len(member)
         return int(total)
 
+    def write_zeros(self, nbytes: int) -> int:
+        """v13.3.7 (B5/N4): emit cached all-zero gzip members — no source reads, no GPU."""
+        if self.closed:
+            raise RuntimeError('Cannot write to a closed GPU deflate payload stream')
+        remaining = int(nbytes)
+        while remaining > 0:
+            ln = min(self.chunk_bytes, remaining)
+            member = _zero_gzip_member(int(ln))
+            self.fh.write(member)
+            self.compressed_bytes += len(member)
+            remaining -= int(ln)
+        return int(nbytes)
+
     def close(self) -> None:
         # Members are self-contained; nothing to finalize.
         self.closed = True
@@ -19021,8 +19125,9 @@ def _nrrd_gpu_deflate_engine() -> Optional[_NvcompDeflateEngine]:
             writer = _GpuDeflatePayloadWriter(sink, engine)
             writer.write(payload[: chunk // 2])
             writer.write(payload[chunk // 2:])
+            writer.write_zeros(chunk + 100)  # v13.3.7 (B5/N4): the cached zero-member path
             writer.close()
-            ok = bool(_gzip.decompress(sink.getvalue()) == payload)
+            ok = bool(_gzip.decompress(sink.getvalue()) == payload + b'\x00' * (chunk + 100))
             if not ok:
                 print('Warning: nvCOMP GPU deflate self-test mismatch; using CPU NRRD compression.')
         except Exception as exc:
@@ -19040,14 +19145,181 @@ def _nrrd_gpu_deflate_engine() -> Optional[_NvcompDeflateEngine]:
         return _NRRD_GPU_DEFLATE_ENGINE
 
 
+# --------------------------
+# v13.3.7 (N1): member-parallel in-process gzip for NRRD payloads
+# --------------------------
+# The single-member writer (S4) still drains every chunk of one write() call before
+# returning, so compression parallelism is bounded by one payload block's chunk count and
+# collapses to zero between blocks (a per-write barrier). This writer gives each chunk its
+# OWN complete gzip member — header + raw deflate + per-member CRC32/ISIZE trailer, the
+# same multi-member framing as the GPU writer (v12.2.14 precedent) — and pipelines the
+# WHOLE layer through the shared deflate pool: write() copies each nonzero chunk out (the
+# caller immediately reuses its buffer), submits it, drains completed members strictly in
+# order, and only blocks while the bounded in-flight window is full. Fill, deflate, and
+# file writes overlap end-to-end with no inter-block barrier, the tail of a layer stays
+# embarrassingly parallel until the last chunk, and per-member CRCs remove the pure-Python
+# crc32_combine from this path entirely. All-zero chunks and write_zeros() ranges (B5/N4)
+# become cached prebuilt members: no deflate, no CRC, no copy.
+# YOLO_TTA_NRRD_MEMBER_GZIP=0 restores the single-member writer.
+
+
+def nrrd_member_gzip_enabled() -> bool:
+    return _env_flag('YOLO_TTA_NRRD_MEMBER_GZIP', True)
+
+
+def nrrd_member_gzip_window_bytes() -> int:
+    """Uncompressed bytes one layer writer may hold in flight (copied chunks awaiting deflate)."""
+    return max(64, _env_int('YOLO_TTA_NRRD_MEMBER_GZIP_WINDOW_MIB', 512)) * 1024 * 1024
+
+
+class _MemberParallelGzipPayloadWriter:
+    """File-like gzip encoder emitting one independent gzip member per chunk, pipelined.
+
+    ``write(data)`` detaches (copies) the nonzero chunks it defers, so callers may reuse
+    the buffer behind ``data`` as soon as the call returns — the same buffer contract as
+    the blocking writers — while deflate continues on the shared pool across subsequent
+    write() calls. Members reach the file strictly in payload order.
+    """
+
+    def __init__(self, fh: object, *, chunk_bytes: Optional[int] = None) -> None:
+        _backend, factory, crc_fn, _full_flush, _eff_level = _nrrd_deflate_backend()
+        self.fh = fh
+        self.factory = factory
+        self.crc_fn = crc_fn
+        self.chunk_bytes = int(chunk_bytes) if chunk_bytes else int(nrrd_gzip_chunk_bytes())
+        self.window_bytes = int(nrrd_member_gzip_window_bytes())
+        self.closed = False
+        # Ready members (bytes) and in-flight compressions (Future -> (member, raw_len)),
+        # strictly in payload order.
+        self._queue: deque = deque()
+        self._inflight_bytes = 0
+
+    def _compress_member(self, payload: bytes) -> Tuple[bytes, int]:
+        cobj = self.factory()
+        raw = cobj.compress(payload) + cobj.flush()
+        member = _gzip_member_from_raw_stream(raw, int(self.crc_fn(payload)) & 0xFFFFFFFF, len(payload))
+        return member, len(payload)
+
+    def _drain(self, *, block: bool) -> None:
+        while self._queue:
+            head = self._queue[0]
+            if isinstance(head, (bytes, bytearray)):
+                self._queue.popleft()
+                self.fh.write(head)
+                continue
+            if not (bool(block) or self._inflight_bytes > self.window_bytes or head.done()):
+                break
+            self._queue.popleft()
+            member, ln = head.result()
+            self._inflight_bytes -= int(ln)
+            self.fh.write(member)
+
+    def write(self, data: bytes | bytearray | memoryview) -> int:
+        if self.closed:
+            raise RuntimeError('Cannot write to a closed gzip payload stream')
+        mv = data if isinstance(data, memoryview) else memoryview(data)
+        mv = mv.cast('B')
+        total = len(mv)
+        if total <= 0:
+            return 0
+        executor = _nrrd_gzip_executor()
+        for off in range(0, total, self.chunk_bytes):
+            ln = min(self.chunk_bytes, total - off)
+            chunk_mv = mv[off:off + ln]
+            if not np.frombuffer(chunk_mv, dtype=np.uint8).any():
+                self._queue.append(_zero_gzip_member(int(ln)))
+            else:
+                payload = bytes(chunk_mv)  # detach from the caller's reusable buffer
+                self._inflight_bytes += int(ln)
+                self._queue.append(executor.submit(self._compress_member, payload))
+            self._drain(block=False)
+        return int(total)
+
+    def write_zeros(self, nbytes: int) -> int:
+        """v13.3.7 (B5/N4): emit cached all-zero members without materializing the zeros."""
+        if self.closed:
+            raise RuntimeError('Cannot write to a closed gzip payload stream')
+        remaining = int(nbytes)
+        while remaining > 0:
+            ln = min(self.chunk_bytes, remaining)
+            self._queue.append(_zero_gzip_member(int(ln)))
+            remaining -= int(ln)
+        self._drain(block=False)
+        return int(nbytes)
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self._drain(block=True)
+
+    def __enter__(self) -> '_MemberParallelGzipPayloadWriter':
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if exc_type is None:
+            self.close()
+            return
+        # Broken stream: the file is already failed — abandon pending members.
+        self.closed = True
+        for entry in self._queue:
+            if isinstance(entry, Future):
+                entry.cancel()
+        self._queue.clear()
+
+
+_NRRD_MEMBER_GZIP_OK: Optional[bool] = None
+_NRRD_MEMBER_GZIP_TEST_LOCK = threading.Lock()
+_NRRD_MEMBER_GZIP_ANNOUNCED = False
+
+
+def _nrrd_member_gzip_self_test() -> bool:
+    """One-time round trip across member framing, the zero-member cache, and write_zeros."""
+    global _NRRD_MEMBER_GZIP_OK
+    if _NRRD_MEMBER_GZIP_OK is not None:
+        return bool(_NRRD_MEMBER_GZIP_OK)
+    with _NRRD_MEMBER_GZIP_TEST_LOCK:
+        if _NRRD_MEMBER_GZIP_OK is not None:
+            return bool(_NRRD_MEMBER_GZIP_OK)
+        try:
+            import gzip as _gzip
+            part_a = bytes(range(256)) * 41 + b'\x00' * 3000  # spans members; all-zero tail member
+            part_b = b'\x00' * 8192                            # write_zeros: cached members only
+            part_c = b'nrrd-member-gzip-self-test' * 99
+            sink = io.BytesIO()
+            writer = _MemberParallelGzipPayloadWriter(sink, chunk_bytes=4096)
+            writer.write(part_a)
+            writer.write_zeros(len(part_b))
+            writer.write(part_c)
+            writer.close()
+            _NRRD_MEMBER_GZIP_OK = bool(_gzip.decompress(sink.getvalue()) == part_a + part_b + part_c)
+        except Exception:
+            _NRRD_MEMBER_GZIP_OK = False
+        if not _NRRD_MEMBER_GZIP_OK:
+            print('Warning: member-parallel NRRD gzip self-test failed; using the single-member writer.')
+        return bool(_NRRD_MEMBER_GZIP_OK)
+
+
 def _open_nrrd_payload_writer(fh: object, *, threads: Optional[int] = None) -> object:
-    """v13.3.6 (N6): GPU deflate when validated; else v13.3.3 (S4) in-process gzip; else pigz."""
+    """First validated tier wins: v13.3.6 (N6) GPU deflate -> v13.3.7 (N1) member-parallel
+    gzip -> v13.3.3 (S4) single-member in-process gzip -> pigz pipe."""
     if nrrd_gpu_deflate_enabled():
         engine = _nrrd_gpu_deflate_engine()
         if engine is not None:
             return _GpuDeflatePayloadWriter(fh, engine)
-    if nrrd_inprocess_gzip_enabled() and _nrrd_inprocess_gzip_self_test():
-        return _ParallelGzipPayloadWriter(fh)
+    if nrrd_inprocess_gzip_enabled():
+        if nrrd_member_gzip_enabled() and _nrrd_member_gzip_self_test():
+            global _NRRD_MEMBER_GZIP_ANNOUNCED
+            if not _NRRD_MEMBER_GZIP_ANNOUNCED:
+                _NRRD_MEMBER_GZIP_ANNOUNCED = True
+                print(
+                    f'Member-parallel NRRD gzip active (v13.3.7 N1; '
+                    f'{max(1, nrrd_gzip_chunk_bytes() // (1024 * 1024))} MiB gzip members, '
+                    'whole-layer pipelining; YOLO_TTA_NRRD_MEMBER_GZIP=0 restores the single-member writer).'
+                )
+            return _MemberParallelGzipPayloadWriter(fh)
+        if _nrrd_inprocess_gzip_self_test():
+            return _ParallelGzipPayloadWriter(fh)
     return _PigzPayloadWriter(fh, threads=threads)
 
 def _madvise_array_mmap(arr: object, advice_name: str) -> None:
@@ -19279,6 +19551,17 @@ def nrrd_gpu_mirror_tee_enabled() -> bool:
     return _env_flag('YOLO_TTA_NRRD_GPU_MIRROR_TEE', True)
 
 
+def nrrd_parallel_mirror_encode_enabled() -> bool:
+    """v13.3.7 (N5): gzip-encode a layer's low-quality mirror files concurrently.
+
+    The mirrors of one layer were encoded one after another at the tail of the layer task;
+    they are independent files (own handle, own payload writer) sharing only thread-safe
+    state (the deflate pool, the zero-member caches, the lock-serialized GPU engine), so
+    they encode side by side. YOLO_TTA_NRRD_PARALLEL_MIRROR_ENCODE=0 restores serial encodes.
+    """
+    return _env_flag('YOLO_TTA_NRRD_PARALLEL_MIRROR_ENCODE', True)
+
+
 class _GpuMirrorTee:
     """v13.3.6 (D2): GPU tee deriving downbinned mirror volumes from payload blocks.
 
@@ -19387,6 +19670,9 @@ def write_layer_nrrd_with_low_quality_mirrors(
     voxels may differ sub-slice from the legacy double-resample). The mirror files are then
     gzip-encoded straight from RAM. Any tee failure falls back to the legacy per-mirror writer
     so the full-quality file is never at risk.
+
+    v13.3.7 (N5): the mirror files encode concurrently instead of one after another; see
+    nrrd_parallel_mirror_encode_enabled.
     """
     out_t = int(output_shape[0])
     # v13.3.6 (N3): resolve a live layer's deferred extent once, up front, so the
@@ -19493,7 +19779,7 @@ def write_layer_nrrd_with_low_quality_mirrors(
         for job in mirror_jobs:
             job['failed'] = True
 
-    for job in mirror_jobs:
+    def _encode_mirror(job: Dict[str, object]) -> None:
         m_t, m_h, m_w = job['shape']  # type: ignore[misc]
         m_path: Path = job['path']  # type: ignore[assignment]
         try:
@@ -19530,6 +19816,30 @@ def write_layer_nrrd_with_low_quality_mirrors(
             )
         finally:
             job['volume'] = None
+
+    # v13.3.7 (N5): the mirror files of one layer are independent — encode them side by
+    # side instead of one after another at the tail of the layer task. Every task runs to
+    # completion (a failing mirror re-encodes from the store, matching the serial per-mirror
+    # fallback) and the first error is re-raised after all mirrors settle.
+    if len(mirror_jobs) > 1 and nrrd_parallel_mirror_encode_enabled():
+        pool_size = min(4, len(mirror_jobs))
+        mirror_pool = _acquire_parallel_pool(int(pool_size))
+        first_error: Optional[BaseException] = None
+        try:
+            futures = [mirror_pool.submit(_encode_mirror, job) for job in mirror_jobs]
+            for fut in futures:
+                try:
+                    fut.result()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+        finally:
+            _release_parallel_pool(int(pool_size), mirror_pool)
+        if first_error is not None:
+            raise first_error
+    else:
+        for job in mirror_jobs:
+            _encode_mirror(job)
     return result
 
 
@@ -19965,6 +20275,66 @@ def _read_layer_slice_in_output_shape(
     return restored
 
 
+def nrrd_extent_zero_skip_enabled() -> bool:
+    """v13.3.7 (B5/N4): payload z-ranges outside the layer's recorded segment extent are
+    emitted as cached zero members/chunks without reading (or even faulting in) the source
+    pages. YOLO_TTA_NRRD_EXTENT_ZERO_SKIP=0 restores full-volume streaming."""
+    return _env_flag('YOLO_TTA_NRRD_EXTENT_ZERO_SKIP', True)
+
+
+def _nrrd_layer_zero_skip_window(
+    ref: NrrdLayerRef,
+    output_shape: Tuple[int, int, int],
+) -> Optional[Tuple[int, int]]:
+    """Output-space t-window ``[lo, hi)`` that MAY contain foreground, from the layer extent.
+
+    Returns None when no extent is recorded (nothing can be skipped) and ``(0, 0)`` when
+    the recorded extent is the scanned-empty sentinel — every extent source
+    (raw_bbox_cvol_index / raw_layer_materialization_scan / live_volume_sink_scan) records
+    genuinely scanned data, so empty means the whole payload is zeros. Note the contrast
+    with _slicer_segment_extent_for_output, which maps empty to FULL because Slicer needs
+    a valid display extent; for zero-skipping the empty sentinel is trustworthy as-is.
+
+    The t-axis window inverts the ACTUAL restore mappings rather than reusing the header's
+    outward display scaling: for in_t >= out_t each output z reads sources
+    [floor(z*in/out), ceil((z+1)*in/out)) — the floor/ceil bounds below are exact for that;
+    for in_t < out_t each output z reads round(z*(in-1)/(out-1)) (endpoint-aligned
+    _linear_source_index, whose slope exceeds out/in — the display scaling would UNDERSHOOT
+    it), so the window inverts that line at t0-0.5 / t1+0.5. One slice of padding per side
+    absorbs any residual rounding-rule differences; skipping must never reclassify a
+    foreground slice as zero.
+    """
+    if not nrrd_extent_zero_skip_enabled():
+        return None
+    extent = _coerce_segment_extent(getattr(ref, 'segment_extent_ijk', None))
+    if extent is None:
+        return None
+    out_t = int(output_shape[0])
+    x0, x1, y0, y1, t0, t1 = (int(v) for v in extent)
+    if x1 < x0 or y1 < y0 or t1 < t0:
+        return (0, 0)
+    in_t = int(getattr(ref, 'segment_extent_shape_tyx', (0, 0, 0))[0])
+    if in_t <= 0 or out_t <= 0:
+        return None
+    if in_t >= out_t:
+        # Downscale/identity restore: output z draws sources [floor(z*in/out), ceil((z+1)*in/out)).
+        lo_f = int(math.floor(float(t0) * float(out_t) / float(in_t)))
+        hi_f = int(math.ceil(float(t1 + 1) * float(out_t) / float(in_t))) - 1
+    elif in_t == 1:
+        # Degenerate upscale: every output z draws slice 0, which the extent says is nonzero.
+        lo_f, hi_f = 0, out_t - 1
+    else:
+        # Upscale restore: output z draws round(z * (in-1)/(out-1)).
+        slope = float(out_t - 1) / float(in_t - 1)
+        lo_f = int(math.floor((float(t0) - 0.5) * slope))
+        hi_f = int(math.ceil((float(t1) + 0.5) * slope))
+    lo = max(0, int(lo_f) - 1)
+    hi = min(int(out_t), int(hi_f) + 2)
+    if hi <= lo:
+        return (0, 0)
+    return (int(lo), int(hi))
+
+
 def _write_one_decomposed_nrrd_layer_payload(
     ref: NrrdLayerRef,
     output_shape: Tuple[int, int, int],
@@ -19988,6 +20358,14 @@ def _write_one_decomposed_nrrd_layer_payload(
     The consumer must treat the block as read-only and return before reuse; in the
     double-buffered path it runs on the caller thread while the block's compression proceeds
     on the writer thread (both only read).
+
+    v13.3.7 (B5/N4): z-blocks fully outside the layer's recorded segment extent are never
+    filled, teed, or read — the payload writer emits cached zero members/chunks for them
+    (``write_zeros``). Zero blocks are invisible to ``block_consumer``; they contribute
+    nothing to a mirror union. v13.3.7 (N2): the direct-native branch (final/global layers)
+    now runs its compression on a one-thread writer pool with the mirror tee overlapping on
+    the calling thread, matching the double-buffered branches instead of serializing
+    tee -> compress -> next block.
     """
     out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
     z_chunk_i = max(1, int(z_chunk))
@@ -20005,22 +20383,63 @@ def _write_one_decomposed_nrrd_layer_payload(
             isinstance(src, RawBBoxMaskStore)
             and (int(in_t), int(in_h), int(in_w)) == (int(out_t), int(out_h), int(out_w))
         )
+        # v13.3.7 (B5/N4): z-blocks fully outside this window are emitted as cached zero
+        # members/chunks through write_zeros() — no fill, no tee, no source page reads.
+        zero_window = _nrrd_layer_zero_skip_window(ref, (out_t, out_h, out_w))
+        can_write_zeros = callable(getattr(payload_writer, 'write_zeros', None))
+
+        def _block_is_known_zero(z0: int, z1: int) -> bool:
+            return (
+                zero_window is not None
+                and can_write_zeros
+                and (int(z1) <= int(zero_window[0]) or int(z0) >= int(zero_window[1]))
+            )
 
         if bool(direct_native_stream):
-            # The memmap is already a native (t,Y,X) C-order layer.  Write chunks of
-            # it directly; no transpose, no Fortran conversion, and no layer interleave.
-            for z0 in range(0, out_t, int(z_chunk_i)):
-                z1 = min(out_t, int(z0) + int(z_chunk_i))
-                chunk = np.asarray(src[int(z0):int(z1)], dtype=np.uint8)
-                if not chunk.flags['C_CONTIGUOUS']:
-                    chunk = np.ascontiguousarray(chunk)
-                if block_consumer is not None:
-                    block_consumer(int(z0), chunk)
-                payload_writer.write(memoryview(chunk).cast('B'))
-                if pbar is not None:
-                    pbar.update(int(z1 - z0))
-                if madvise_interval > 0 and (int(z1) % int(madvise_interval) == 0):
-                    _madvise_array_mmap(src, 'MADV_DONTNEED')
+            # The memmap/live volume is already a native (t,Y,X) C-order layer: chunks are
+            # views written directly — no transpose, no Fortran conversion, no layer
+            # interleave. v13.3.7 (N2): the compression call runs on a one-thread writer
+            # pool while THIS thread runs the mirror tee on the same block (both only read
+            # it), so tee and deflate overlap instead of serializing — this branch carries
+            # the final/global layers, previously the one path still fully serial per block.
+            slice_bytes = int(out_h) * int(out_w)
+            writer_pool = _acquire_parallel_pool(1)
+            pending: Optional[Future] = None
+            try:
+                for z0 in range(0, out_t, int(z_chunk_i)):
+                    z1 = min(out_t, int(z0) + int(z_chunk_i))
+                    if _block_is_known_zero(int(z0), int(z1)):
+                        if pending is not None:
+                            pending.result()
+                        pending = writer_pool.submit(payload_writer.write_zeros, int(z1 - z0) * slice_bytes)
+                        if pbar is not None:
+                            pbar.update(int(z1 - z0))
+                        continue
+                    chunk = np.asarray(src[int(z0):int(z1)], dtype=np.uint8)
+                    if not chunk.flags['C_CONTIGUOUS']:
+                        chunk = np.ascontiguousarray(chunk)
+                    if pending is not None:
+                        pending.result()
+                    pending = writer_pool.submit(payload_writer.write, memoryview(chunk).cast('B'))
+                    if block_consumer is not None:
+                        block_consumer(int(z0), chunk)
+                    if pbar is not None:
+                        pbar.update(int(z1 - z0))
+                    if madvise_interval > 0 and (int(z1) % int(madvise_interval) == 0):
+                        # The writer must be done with these pages before dropping them.
+                        pending.result()
+                        pending = None
+                        _madvise_array_mmap(src, 'MADV_DONTNEED')
+                if pending is not None:
+                    pending.result()
+                    pending = None
+            finally:
+                if pending is not None:
+                    try:
+                        pending.result()
+                    except Exception:
+                        pass
+                _release_parallel_pool(1, writer_pool)
             return
 
         # v13.3.1 (R7b): shared bounded-block streamer — each block is filled by a small
@@ -20049,15 +20468,31 @@ def _write_one_decomposed_nrrd_layer_payload(
             # v13.3.4 (T5): checkout-cached single-thread writer pool (was one build per layer).
             writer_pool = _acquire_parallel_pool(1)
             pending: Optional[Future] = None
+            # v13.3.7 (B5/N4): buffers only cycle for blocks that are actually filled;
+            # known-zero blocks go through write_zeros() with no buffer at all. The counter
+            # (not the z index) keeps the double-buffer alternation valid across skips:
+            # at most one write is outstanding, so the buffer being refilled always
+            # finished its own previous write before the intervening submit happened.
+            buf_cycle = 0
             try:
-                for block_idx, z0 in enumerate(range(0, out_t, int(local_z_chunk))):
+                for z0 in range(0, out_t, int(local_z_chunk)):
                     z1 = min(out_t, int(z0) + int(local_z_chunk))
                     z_count = int(z1 - z0)
+                    if _block_is_known_zero(int(z0), int(z1)):
+                        if pending is not None:
+                            pending.result()
+                        pending = writer_pool.submit(
+                            payload_writer.write_zeros, int(z_count) * int(out_h) * int(out_w),
+                        )
+                        if pbar is not None:
+                            pbar.update(int(z_count))
+                        continue
                     if len(buffers) < 2 and pending is not None:
                         # Single-buffer fallback: the previous write must finish before refill.
                         pending.result()
                         pending = None
-                    block = buffers[int(block_idx) % len(buffers)][:z_count, :, :]
+                    block = buffers[int(buf_cycle) % len(buffers)][:z_count, :, :]
+                    buf_cycle += 1
 
                     if int(fill_workers) > 1 and int(z_count) > 1:
                         def _fill(zi: int, _z0: int = int(z0), _block: np.ndarray = block) -> None:
