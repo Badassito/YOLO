@@ -2,9 +2,64 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the v13.3.7_SLURM implementation. It is derived from v13.3.6_SLURM by COPY + surgical
-edits, implementing five further approved items (B5, N1, N2, N4, N5) from
-SPEED_OPTIMIZATIONS_Fable-5_v13.3.5_SLURM.md — all in the NRRD write tail:
+This is the v13.3.8_SLURM implementation. It is derived from v13.3.7_SLURM by COPY + surgical
+edits, implementing the final approved set (A3, A5, E1, E2, G1, G4; A4 was verified already
+shipped as v13.3.6's incidental) from SPEED_OPTIMIZATIONS_Fable-5_v13.3.5_SLURM.md:
+  - v13.3.8 (A3) blocked-transpose union merges: the coronal final-union merge
+    (final_union[:, :, x] |= coronal[x]) wrote one byte per cache line across the whole
+    (t, Y) extent — the ~64x write amplification v13.3.2 (R14) fixed for the projection
+    copy. The same K-column (K=64) per-t tile transpose now drives it. Per the review
+    note, the sibling patterns got the same blocking: the sagittal union merge and the
+    sagittal projection copy (full cache lines but one whole-volume page sweep per y ->
+    one per K-row block; no transpose needed, the destination window is contiguous).
+    Transverse and native-shape merges were already contiguous slice ORs and are untouched.
+  - v13.3.8 (A5) zero-alloc video writers: write_overlay_video, the troubleshooting
+    overlay writer, write_binary_video_from_mask_volume, and both low-quality writers
+    reuse one frame buffer per writer (cvtColor dst= for gray->RGB), blend restricted to
+    the mask's bbox (byte-identical uint16 (frame+blue)//2 arithmetic — validated), and
+    write memoryviews to the ffmpeg pipe — deleting the per-frame np.repeat, full-frame
+    bool cast, masked gather/scatter, and tobytes() copies. _gray_to_rgb_frame is deleted.
+  - v13.3.8 (E1) cube t-axis resize fused into the resident upload: under multi-GPU with
+    a cube resize pending, task enqueue now waits only for the DECODE — each worker
+    uploads the NATIVE decoded volume (smaller than the cube by the t factor) and runs
+    the two-tap t-lerp on device into its resident cube buffer (cv2.resize's
+    center-aligned INTER_LINEAR mapping, the slab backend's convention; validated to
+    +/-1 gray level against cv2). The host cube keeps being produced concurrently for CPU
+    consumers (the decode is now file-backed under this mode so workers need no copy
+    pass); a sentinel written after wait_for_volume_ready+flush gates every file-backed
+    fallback (failed residency, tile tasks, CPU renders), which then behave exactly as
+    before. The MD's "one worker D2Hs the cube back" variant is deliberately NOT
+    implemented (it would need cross-process producer signaling on the host cube);
+    the host-side CPU resize simply stopped gating inference instead.
+    YOLO_TTA_GPU_CUBE_RESIZE=0 restores cube-gated enqueue;
+    YOLO_TTA_GPU_CUBE_RESIZE_CHUNK sizes the device resize chunk (32).
+  - v13.3.8 (E2) low-quality downbins on device: the two full-volume cv2 resize passes
+    per downbin spec (gray + mask) run as chunked GPU passes when a CUDA device is free —
+    adaptive average pooling for gray XY (== INTER_AREA at integer ratios, +/-1 validated;
+    windowed mean at fractional ratios) with the CPU path's endpoint-aligned two-slice
+    t-lerp in float32, and adaptive max pooling + source-range OR for masks (the same
+    any-coverage window semantics as the D2 mirror tee). Any failure falls back to the
+    unchanged CPU per-slice path, which rewrites every slice so a partial GPU pass cannot
+    leak. YOLO_TTA_LOW_QUALITY_GPU_DOWNBIN=0 disables;
+    YOLO_TTA_LOW_QUALITY_GPU_DOWNBIN_CHUNK sizes the t-chunk (32).
+  - v13.3.8 (G1) scheduler push drain: a transport-only daemon thread blocks on the GPU
+    worker result queue and hands messages to the main thread through a local deque +
+    wake event; completed scheduler futures set the same event through one-time
+    done-callbacks (WeakSet-guarded). Worker results, aux interpolation completions, and
+    future completions are processed the instant they arrive instead of after the 0.1 s
+    futures-poll / 0.5 s queue-poll; handlers still run ONLY on the main thread. The
+    heartbeat (YOLO_TTA_SCHEDULER_PUSH_DRAIN_HEARTBEAT, 1.0 s) only bounds the
+    worker-liveness re-check cadence. YOLO_TTA_SCHEDULER_PUSH_DRAIN=0 restores polling.
+  - v13.3.8 (G4) concurrent per-view assembly: with --save_nrrd, the radial/tilted
+    final volumes are unions of already-projected layer stores; the independent per-view
+    assemblies now run up to YOLO_TTA_ASSEMBLE_VIEWS_CONCURRENCY (2) at a time with the
+    slice-worker budget split between them, instead of strictly one view at a time.
+  - (A4 note) "skip the per-slice (mask>0) cast in the labeler" was verified already
+    implemented by v13.3.6's incidental A4 (raw uint8 slices to cv2 CC + D1 bbox crops);
+    no remaining (mask>0).astype sites exist.
+
+Inherited from v13.3.7 (B5, N1, N2, N4, N5 from SPEED_OPTIMIZATIONS_Fable-5_v13.3.5_SLURM.md —
+all in the NRRD write tail):
   - v13.3.7 (N1) member-parallel in-process gzip: the CPU payload-writer tier emits one
     INDEPENDENT gzip member per chunk (default 16 MiB; the same multi-member framing as N6,
     v12.2.14 precedent) and pipelines the WHOLE layer through the shared deflate pool.
@@ -741,6 +796,7 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
 import zlib
 from collections import OrderedDict, deque
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait
@@ -10105,6 +10161,36 @@ def gpu_render_tblock_slices() -> int:
     return max(16, _env_int('YOLO_TTA_GPU_RENDER_TBLOCK_SLICES', 256))
 
 
+def gpu_cube_resize_enabled() -> bool:
+    """v13.3.8 (E1): fuse the cube t-axis resize into the workers' resident upload.
+
+    Each worker uploads the NATIVE decoded volume (smaller than the cube by the t-resize
+    factor) and runs the two-tap t-axis lerp on device into its resident cube buffer, so
+    inference-task enqueue stops waiting for the host cube resize + flush and residency
+    stops page-faulting the (colder, larger) cube file. The host cube keeps being produced
+    concurrently for CPU consumers; non-resident/tile/CPU-render fallbacks wait on a
+    sentinel the main process writes when it completes. YOLO_TTA_GPU_CUBE_RESIZE=0
+    restores cube-gated enqueue and cube-file residency uploads.
+    """
+    return _env_flag('YOLO_TTA_GPU_CUBE_RESIZE', True)
+
+
+def _wait_for_cube_ready_sentinel(sentinel_path: str, *, poll_seconds: float = 0.5) -> None:
+    """v13.3.8 (E1): block until main signals the shared cube volume file is complete.
+
+    Reached only on fallbacks (failed residency, tile tasks, CPU renders) while the host
+    cube is still being produced. Scheduler teardown terminates workers parked here if the
+    producer dies (the sentinel is only ever written after wait_for_volume_ready + flush).
+    """
+    sentinel = Path(str(sentinel_path))
+    announced = False
+    while not sentinel.exists():
+        if not announced:
+            announced = True
+            print('GPU worker: waiting for the shared cube volume to finish before file-backed rendering...')
+        time.sleep(max(0.05, float(poll_seconds)))
+
+
 class _GpuWorkerRenderEngine:
     """Per-worker-process GPU renderer for full-frame prediction sources (v13.3.0 R1/R21)."""
 
@@ -10129,10 +10215,29 @@ class _GpuWorkerRenderEngine:
 
     # ---- volume residency ----
 
-    def ensure_volume(self, path: str, shape: Sequence[int], dtype: str = 'uint8') -> str:
+    def ensure_volume(
+        self,
+        path: str,
+        shape: Sequence[int],
+        dtype: str = 'uint8',
+        *,
+        resize_to_t: Optional[int] = None,
+    ) -> str:
+        """Resolve source-volume residency; optionally t-resize on device while uploading.
+
+        v13.3.8 (E1): with ``resize_to_t`` set, ``path`` is the NATIVE decoded volume and
+        the resident buffer is built at cube geometry by a two-tap t-axis lerp on device
+        (cv2.resize's center-aligned INTER_LINEAR mapping — the same convention as the CPU
+        slab backend it replaces). Residency failure in resize mode returns 'stream' with
+        the engine reset, because streaming-mode consumers require CUBE geometry — the
+        caller must re-resolve against the cube file.
+        """
         torch = self.torch
         shape_t = tuple(int(x) for x in shape)
-        key = (str(path), shape_t)
+        in_t, in_h, in_w = (int(shape_t[0]), int(shape_t[1]), int(shape_t[2]))
+        out_t = int(resize_to_t) if resize_to_t else int(in_t)
+        resize_active = int(out_t) != int(in_t)
+        key = (str(path), shape_t, int(out_t))
         if self._volume_key == key and self._mode != 'unresolved':
             return self._mode
         self._volume_key = key
@@ -10140,17 +10245,43 @@ class _GpuWorkerRenderEngine:
         self._volume_gpu = None
         self._volume_flat = None
         self._mode = 'stream'
-        nbytes = int(np.prod(shape_t))
+        nbytes = int(out_t) * int(in_h) * int(in_w)
         if gpu_worker_render_resident_enabled():
             try:
                 free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
-                need = nbytes + gpu_render_reserve_bytes()
+                chunk_out = max(8, _env_int('YOLO_TTA_GPU_CUBE_RESIZE_CHUNK', 32))
+                # v13.3.8 (E1): transient working set of the on-device t-resize (fp32
+                # source window + gathered/lerped chunk tensors); zero without a resize.
+                resize_transient = (
+                    (int(chunk_out) + 2) * in_h * in_w * (1 + 4) + 3 * int(chunk_out) * in_h * in_w * 4
+                ) if resize_active else 0
+                need = nbytes + int(resize_transient) + gpu_render_reserve_bytes()
                 if int(free_bytes) >= int(need):
-                    vol = torch.empty(shape_t, dtype=torch.uint8, device=self.device)
-                    chunk = 256
-                    for t0 in range(0, shape_t[0], chunk):
-                        t1 = min(shape_t[0], t0 + chunk)
-                        vol[t0:t1].copy_(torch.from_numpy(np.ascontiguousarray(self._volume_mm[t0:t1])))
+                    vol = torch.empty((int(out_t), int(in_h), int(in_w)), dtype=torch.uint8, device=self.device)
+                    if resize_active:
+                        rf = (np.arange(int(out_t), dtype=np.float64) + 0.5) * (float(in_t) / float(out_t)) - 0.5
+                        r0 = np.clip(np.floor(rf).astype(np.int64), 0, int(in_t) - 1)
+                        r1 = np.minimum(r0 + 1, int(in_t) - 1)
+                        alpha = np.clip(rf - r0, 0.0, 1.0).astype(np.float32)
+                        for o0 in range(0, int(out_t), int(chunk_out)):
+                            o1 = min(int(out_t), int(o0) + int(chunk_out))
+                            lo = int(r0[int(o0)])
+                            hi = int(r1[int(o1) - 1]) + 1
+                            win = torch.from_numpy(
+                                np.ascontiguousarray(self._volume_mm[lo:hi])
+                            ).to(self.device).to(torch.float32)
+                            idx0 = torch.from_numpy(r0[int(o0):int(o1)] - lo).to(self.device)
+                            idx1 = torch.from_numpy(r1[int(o0):int(o1)] - lo).to(self.device)
+                            a_col = torch.from_numpy(alpha[int(o0):int(o1)]).to(self.device).view(-1, 1, 1)
+                            f0 = win.index_select(0, idx0)
+                            f1 = win.index_select(0, idx1)
+                            vol[int(o0):int(o1)] = torch.lerp(f0, f1, a_col).round_().clamp_(0, 255).to(torch.uint8)
+                            del win, idx0, idx1, a_col, f0, f1
+                    else:
+                        chunk = 256
+                        for t0 in range(0, shape_t[0], chunk):
+                            t1 = min(shape_t[0], t0 + chunk)
+                            vol[t0:t1].copy_(torch.from_numpy(np.ascontiguousarray(self._volume_mm[t0:t1])))
                     self._volume_gpu = vol
                     self._volume_flat = vol.view(-1)
                     self._mode = 'resident'
@@ -10166,10 +10297,21 @@ class _GpuWorkerRenderEngine:
                 self._volume_flat = None
                 self._mode = 'stream'
                 print(f'GPU render: resident upload failed ({exc}); falling back to streaming mode.')
+        if resize_active and self._mode != 'resident':
+            # v13.3.8 (E1): never leave a native-geometry memmap where streaming-mode
+            # consumers (radial slab prerender, shape probes) expect the cube.
+            self._volume_key = None
+            self._volume_mm = None
+            self._mode = 'unresolved'
+            return 'stream'
         if self._mode == 'resident':
+            resize_note = (
+                f' (v13.3.8 E1: native volume t-resized {in_t}->{out_t} on device during upload)'
+                if resize_active else ''
+            )
             print(
                 f'GPU render: source volume resident on {self.device} '
-                f'({nbytes / GIB:.1f} GiB uploaded); full-frame views render on device.'
+                f'({nbytes / GIB:.1f} GiB){resize_note}; full-frame views render on device.'
             )
         return self._mode
 
@@ -10621,13 +10763,33 @@ def run_prediction_volume_in_worker(model: object, cfg: 'PredictConfig', task: D
         # GPU-prerenders radial tasks into a host slab. Any engine failure falls back to the
         # unchanged CPU render path for this task.
         gpu_engine = _worker_gpu_render_engine()
+        # v13.3.8 (E1): when main enqueued before the host cube finished, the task carries
+        # the native decoded volume + a cube-ready sentinel for every file-backed fallback.
+        native_resize = task.get('native_resize') if isinstance(task.get('native_resize'), dict) else None
         if gpu_engine is not None and str(kind) == 'fullframe':
             try:
-                render_mode = gpu_engine.ensure_volume(
-                    str(task['source_volume_path']),
-                    tuple(int(x) for x in task['source_shape']),
-                    str(task.get('source_dtype', 'uint8')),
-                )
+                if native_resize is not None:
+                    # Residency straight from the (smaller, hotter) native volume with the
+                    # t-resize on device — no wait on the host cube at all.
+                    render_mode = gpu_engine.ensure_volume(
+                        str(native_resize['path']),
+                        tuple(int(x) for x in native_resize['shape']),
+                        str(native_resize.get('dtype', 'uint8')),
+                        resize_to_t=int(task['source_shape'][0]),
+                    )
+                    if render_mode != 'resident':
+                        _wait_for_cube_ready_sentinel(str(native_resize['sentinel']))
+                        render_mode = gpu_engine.ensure_volume(
+                            str(task['source_volume_path']),
+                            tuple(int(x) for x in task['source_shape']),
+                            str(task.get('source_dtype', 'uint8')),
+                        )
+                else:
+                    render_mode = gpu_engine.ensure_volume(
+                        str(task['source_volume_path']),
+                        tuple(int(x) for x in task['source_shape']),
+                        str(task.get('source_dtype', 'uint8')),
+                    )
                 if render_mode == 'resident':
                     source = GpuRenderedYoloSource(
                         gpu_engine,
@@ -10661,6 +10823,9 @@ def run_prediction_volume_in_worker(model: object, cfg: 'PredictConfig', task: D
                 source = None
 
         if source is None:
+            if native_resize is not None:
+                # v13.3.8 (E1): CPU/tile renders read the cube file — wait for it to finish.
+                _wait_for_cube_ready_sentinel(str(native_resize['sentinel']))
             source_mm = open_existing_gray_memmap(
                 task['source_volume_path'], task['source_shape'], task.get('source_dtype', 'uint8'), mode='r',
             )
@@ -12854,6 +13019,35 @@ def _union_projected_layer_ref_into_volume(
         _close_nrrd_layer_source(src)
 
 
+def scheduler_push_drain_enabled() -> bool:
+    """v13.3.8 (G1): push-drain the GPU-worker result queue instead of timeout polling.
+
+    A transport-only daemon thread blocks on the process result queue and hands messages
+    to the main thread through a local deque + wake event; completed scheduler futures set
+    the same event through one-time done-callbacks. Results are processed the instant they
+    arrive instead of after the 0.1 s futures-poll / 0.5 s queue-poll, and handlers still
+    run ONLY on the main thread. YOLO_TTA_SCHEDULER_PUSH_DRAIN=0 restores polling.
+    """
+    return _env_flag('YOLO_TTA_SCHEDULER_PUSH_DRAIN', True)
+
+
+def scheduler_push_drain_heartbeat_seconds() -> float:
+    """v13.3.8 (G1): upper bound on one push-drain sleep (worker-liveness re-check cadence)."""
+    return max(0.05, _env_float('YOLO_TTA_SCHEDULER_PUSH_DRAIN_HEARTBEAT', 1.0))
+
+
+def assemble_views_concurrency() -> int:
+    """v13.3.8 (G4): concurrent assemble-from-projected-layers views.
+
+    The per-view assemblies are independent unions of already-projected layer stores
+    (I/O + memcpy bound), but were run strictly one view at a time. Two concurrent views
+    roughly halve that tail segment on the reference 8-tilted + 1-radial run; the
+    per-view worker budget is split across active assemblies so the total thread count
+    is unchanged. YOLO_TTA_ASSEMBLE_VIEWS_CONCURRENCY=1 restores serial assembly.
+    """
+    return max(1, _env_int('YOLO_TTA_ASSEMBLE_VIEWS_CONCURRENCY', 2))
+
+
 def assemble_view_volume_from_projected_layers(
     layer_refs: Sequence['NrrdLayerRef'],
     out_shape_tyx: Tuple[int, int, int],
@@ -12980,16 +13174,28 @@ def assemble_view_volumes_into_native_union(
         consumed.add("sagittal")
 
         if working_equals_out:
-            sagittal_workers = choose_slice_parallel_workers(int(workers), int(H))
+            # v13.3.8 (A3): the per-y merge (final_union[:, y, :] |= sagittal[y]) swept the
+            # ENTIRE destination volume once per y (T rows of W bytes at stride H*W) — full
+            # cache lines, but H passes of page/TLB traffic. Merge K rows per block instead:
+            # for each t the destination window [t, y0:y1, :] is one contiguous K*W run, so
+            # every destination page is visited once per block (H/K fewer volume sweeps).
+            blk_rows = int(coronal_block_cols())
+            n_blocks = (int(H) + blk_rows - 1) // blk_rows
 
-            def _merge_sagittal(y: int) -> None:
-                final_union_mm[:, int(y), :] |= sagittal[int(y), :, :]
+            def _merge_sagittal_block(block_idx: int) -> None:
+                y0 = int(block_idx) * blk_rows
+                y1 = min(int(H), y0 + blk_rows)
+                sub = np.asarray(sagittal[y0:y1])
+                for t in range(int(T)):
+                    final_union_mm[int(t), y0:y1, :] |= sub[:, int(t), :]
 
-            parallel_for_indices(
-                int(H),
-                _merge_sagittal,
-                max_workers=sagittal_workers,
+            parallel_for_indices_chunked(
+                int(n_blocks),
+                _merge_sagittal_block,
+                max_workers=choose_slice_parallel_workers(int(workers), int(n_blocks)),
                 desc="Assembling final union from sagittal view volume",
+                show_progress=False,
+                target_chunks_per_worker=2,
             )
         else:
             # Working orthogonal slice t is the (H,W) plane sagittal[:, t, :].
@@ -13001,16 +13207,28 @@ def assemble_view_volumes_into_native_union(
         consumed.add("coronal")
 
         if working_equals_out:
-            coronal_workers = choose_slice_parallel_workers(int(workers), int(W))
+            # v13.3.8 (A3): the per-x merge (final_union[:, :, x] |= coronal[x]) wrote one
+            # byte per cache line across the whole (t, Y) extent — the same ~64x write
+            # amplification v13.3.2 (R14) fixed for the projection copy. Same cure: permute
+            # K columns at a time through per-t (K, H) -> (H, K) tile transposes (tiles stay
+            # cache-resident) and OR K contiguous bytes per destination row.
+            blk_cols = int(coronal_block_cols())
+            n_blocks = (int(W) + blk_cols - 1) // blk_cols
 
-            def _merge_coronal(x: int) -> None:
-                final_union_mm[:, :, int(x)] |= coronal[int(x), :, :]
+            def _merge_coronal_block(block_idx: int) -> None:
+                x0 = int(block_idx) * blk_cols
+                x1 = min(int(W), x0 + blk_cols)
+                sub = np.asarray(coronal[x0:x1])
+                for t in range(int(T)):
+                    final_union_mm[int(t), :, x0:x1] |= sub[:, int(t), :].T
 
-            parallel_for_indices(
-                int(W),
-                _merge_coronal,
-                max_workers=coronal_workers,
+            parallel_for_indices_chunked(
+                int(n_blocks),
+                _merge_coronal_block,
+                max_workers=choose_slice_parallel_workers(int(workers), int(n_blocks)),
                 desc="Assembling final union from coronal view volume",
+                show_progress=False,
+                target_chunks_per_worker=2,
             )
         else:
             # Working orthogonal slice t is coronal[:, t, :] with axes (W,H); transpose to (H,W).
@@ -16330,12 +16548,24 @@ def project_view_volume_to_orthogonal_volume(
         src = np.asarray(view_mask_mm)
         if tuple(int(x) for x in src.shape) != (h_dim, t_dim, w_dim):
             raise ValueError(f'{desc}: sagittal layer shape {tuple(src.shape)} != {(h_dim, t_dim, w_dim)}')
-        def _copy_y(y_idx: int) -> None:
-            out[:, int(y_idx), :] = np.asarray(src[int(y_idx)], dtype=np.uint8)
+        # v13.3.8 (A3): the per-y scatter (out[:, y, :] = src[y]) swept every destination
+        # page once per y (T rows of W bytes at stride H*W). Copy K rows per block so each
+        # t-slice window [t, y0:y1, :] is one contiguous K*W write and destination pages
+        # are visited once per block instead of once per y.
+        blk_rows = int(coronal_block_cols())
+        n_row_blocks = (int(h_dim) + blk_rows - 1) // blk_rows
+
+        def _copy_y_block(block_idx: int) -> None:
+            y0 = int(block_idx) * blk_rows
+            y1 = min(int(h_dim), y0 + blk_rows)
+            sub = np.asarray(src[y0:y1])
+            for t in range(int(t_dim)):
+                out[int(t), y0:y1, :] = sub[:, int(t), :]
+
         parallel_for_indices_chunked(
-            h_dim,
-            _copy_y,
-            max_workers=choose_slice_parallel_workers(int(workers), h_dim),
+            n_row_blocks,
+            _copy_y_block,
+            max_workers=choose_slice_parallel_workers(int(workers), n_row_blocks),
             desc=desc,
             show_progress=False,
             target_chunks_per_worker=2,
@@ -18040,15 +18270,39 @@ def apply_gaussian_smoothing_inplace(
 # --------------------------
 
 
-def _gray_to_rgb_frame(frame_gray: np.ndarray) -> np.ndarray:
-    arr = np.asarray(frame_gray, dtype=np.uint8)
-    if arr.ndim == 3 and arr.shape[-1] == 3:
-        return np.ascontiguousarray(arr)
-    if arr.ndim == 3 and arr.shape[-1] == 1:
-        arr = arr[:, :, 0]
-    if arr.ndim != 2:
-        raise ValueError(f'Expected a 2D gray frame, got shape {arr.shape}')
-    return np.repeat(arr[:, :, None], 3, axis=2)
+# v13.3.8 (A5): _gray_to_rgb_frame (np.repeat per frame) is deleted — every writer now
+# expands through _gray_frame_into_rgb_buffer into a reused per-writer buffer.
+_OVERLAY_BLUE_U16 = np.array([0, 0, 255], dtype=np.uint16)  # RGB blue in the uint16 blend domain
+
+
+def _overlay_blend_blue_inplace(frame_rgb: np.ndarray, mask2d: np.ndarray) -> None:
+    """v13.3.8 (A5): 50% blue blend on mask pixels, restricted to the mask's bbox, in place.
+
+    Byte-identical to the legacy full-frame masked path ((frame + blue) // 2 in uint16 on
+    mask pixels, untouched elsewhere) but allocates only bbox-sized temps: no full-frame
+    bool cast, no masked gather/scatter over the whole frame.
+    """
+    m = np.asarray(mask2d)
+    ys = np.flatnonzero(m.any(axis=1))
+    if ys.size == 0:
+        return
+    y0, y1 = int(ys[0]), int(ys[-1]) + 1
+    xs = np.flatnonzero(m[y0:y1].any(axis=0))
+    x0, x1 = int(xs[0]), int(xs[-1]) + 1
+    sub = frame_rgb[y0:y1, x0:x1]
+    msub = m[y0:y1, x0:x1] != 0
+    blended = ((sub.astype(np.uint16) + _OVERLAY_BLUE_U16) // 2).astype(np.uint8)
+    np.copyto(sub, blended, where=msub[:, :, None])
+
+
+def _gray_frame_into_rgb_buffer(frame_gray: np.ndarray, frame_buf: np.ndarray) -> np.ndarray:
+    """v13.3.8 (A5): expand a gray frame into the reused (H, W, 3) buffer, no per-frame alloc.
+
+    Returns the buffer actually written (cv2 falls back to allocating only if dst were
+    incompatible, which the caller's preallocated buffer never is).
+    """
+    gray = np.ascontiguousarray(np.asarray(frame_gray, dtype=np.uint8))
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB, dst=frame_buf)
 
 
 def write_overlay_video(
@@ -18062,6 +18316,11 @@ def write_overlay_video(
 
     The working source volume is single-channel; frames are expanded to RGB only for this
     presentation video so the segmentation can remain blue.
+
+    v13.3.8 (A5): one reused RGB buffer per writer (cvtColor dst=), bbox-restricted blend,
+    and memoryview pipe writes — the three full H*W*3 temps per frame (np.repeat, masked
+    scatter, tobytes) are gone. The blocking pipe write copies before returning, so the
+    buffer is immediately reusable.
     """
     T, H, W = volume_rgb.shape
     assert mask_u8.shape == (T, H, W)
@@ -18073,16 +18332,13 @@ def write_overlay_video(
         fps=fps,
     )
 
-    blue = np.array([0, 0, 255], dtype=np.uint8)  # RGB blue
-
+    frame_buf = np.empty((int(H), int(W), 3), dtype=np.uint8)
     try:
         assert proc.stdin is not None
         for t in tqdm(range(T), desc=f"Writing overlay video ({out_path.name})", disable=not show_progress):
-            frame = _gray_to_rgb_frame(np.asarray(volume_rgb[t]))
-            m = mask_u8[t].astype(bool)
-            if m.any():
-                frame[m] = ((frame[m].astype(np.uint16) + blue.astype(np.uint16)) // 2).astype(np.uint8)
-            proc.stdin.write(np.ascontiguousarray(frame).tobytes())
+            frame = _gray_frame_into_rgb_buffer(volume_rgb[t], frame_buf)
+            _overlay_blend_blue_inplace(frame, mask_u8[t])
+            proc.stdin.write(memoryview(frame).cast('B'))
     finally:
         close_ffmpeg_writer(proc)
 
@@ -18247,11 +18503,14 @@ def write_binary_video_from_mask_volume(
         height=H,
         fps=fps,
     )
+    # v13.3.8 (A5): one reused frame buffer + memoryview pipe writes replace the per-frame
+    # multiply temp + tobytes() copy.
+    frame_buf = np.empty((int(H), int(W)), dtype=np.uint8)
     try:
         assert proc.stdin is not None
         for t in tqdm(range(T), desc=f"Writing binary MKV ({video_path.name})", disable=not show_progress):
-            gray = (np.asarray(mask_u8[t]) * 255).astype(np.uint8)
-            proc.stdin.write(np.ascontiguousarray(gray).tobytes())
+            np.multiply(np.asarray(mask_u8[t]), 255, out=frame_buf)
+            proc.stdin.write(memoryview(frame_buf).cast('B'))
     finally:
         close_ffmpeg_writer(proc)
     return video_path
@@ -20582,7 +20841,8 @@ def write_native_view_overlay_video(
         height=int(view.src_h),
         fps=float(fps),
     )
-    blue = np.array([0, 0, 255], dtype=np.uint8)
+    # v13.3.8 (A5): reused RGB buffer + bbox-restricted blend + memoryview pipe writes.
+    frame_buf = np.empty((int(view.src_h), int(view.src_w), 3), dtype=np.uint8)
     try:
         assert proc.stdin is not None
         for idx in tqdm(
@@ -20592,11 +20852,9 @@ def write_native_view_overlay_video(
             disable=not bool(show_progress),
         ):
             frame_gray = get_view_frame_by_index(volume_rgb, view, int(idx))
-            frame = _gray_to_rgb_frame(np.asarray(frame_gray))
-            m = np.asarray(native_mask_u8[int(idx)], dtype=bool)
-            if np.any(m):
-                frame[m] = ((frame[m].astype(np.uint16) + blue.astype(np.uint16)) // 2).astype(np.uint8)
-            proc.stdin.write(np.ascontiguousarray(frame).tobytes())
+            frame = _gray_frame_into_rgb_buffer(frame_gray, frame_buf)
+            _overlay_blend_blue_inplace(frame, native_mask_u8[int(idx)])
+            proc.stdin.write(memoryview(frame).cast('B'))
     finally:
         close_ffmpeg_writer(proc)
     return out_path
@@ -20757,6 +21015,118 @@ def resolve_low_quality_downbin_specs(
     return specs, warnings
 
 
+# --------------------------
+# v13.3.8 (E2): low-quality volume downbins on device
+# --------------------------
+# The two full-volume cv2 resize passes per downbin spec run at the tail while the GPUs sit
+# idle. XY downbinning is area averaging (gray) / any-coverage (mask) — adaptive average /
+# max pooling on device (identical to cv2.INTER_AREA at integer ratios, a windowed
+# mean/any at fractional ratios — the same window-boundary tolerance as the D2 mirror tee),
+# with the CPU path's endpoint-aligned two-slice t-lerp (gray, float32, single final round)
+# and source-range OR (mask) reproduced exactly. Chunked uploads bound VRAM; any failure
+# falls back to the unchanged CPU per-slice path (which rewrites every slice, so a partial
+# GPU pass can never leak). YOLO_TTA_LOW_QUALITY_GPU_DOWNBIN=0 disables.
+
+
+def low_quality_gpu_downbin_enabled() -> bool:
+    return _env_flag('YOLO_TTA_LOW_QUALITY_GPU_DOWNBIN', True)
+
+
+def low_quality_gpu_downbin_chunk_slices() -> int:
+    return max(1, _env_int('YOLO_TTA_LOW_QUALITY_GPU_DOWNBIN_CHUNK', 32))
+
+
+_LQ_GPU_DOWNBIN_ANNOUNCED = False
+
+
+def _try_gpu_downbin_volume(src_vol: np.ndarray, out_mm: np.ndarray, mode: str) -> bool:
+    """v13.3.8 (E2): fill ``out_mm`` from ``src_vol`` on a GPU; False -> caller's CPU path."""
+    if not low_quality_gpu_downbin_enabled():
+        return False
+    in_t, in_h, in_w = (int(src_vol.shape[0]), int(src_vol.shape[1]), int(src_vol.shape[2]))
+    out_t, out_h, out_w = (int(out_mm.shape[0]), int(out_mm.shape[1]), int(out_mm.shape[2]))
+    if out_h > in_h or out_w > in_w:
+        return False  # upscale specs keep the cv2 INTER_LINEAR/NEAREST semantics
+    try:
+        import torch  # type: ignore
+        import torch.nn.functional as F  # type: ignore
+        if not bool(torch.cuda.is_available()):
+            return False
+        device = _pick_gpu_compute_device(torch)
+        chunk = int(low_quality_gpu_downbin_chunk_slices())
+        # Worst-case source slices one output chunk can pull in (t-downbin gathers
+        # ratio*chunk source slices; t-upscale and the gray lerp need at most chunk+2).
+        src_per_chunk = int(math.ceil(float(in_t) / float(max(1, out_t)) * float(chunk))) + 2
+        fp_bytes = 4 if mode == 'gray' else 2
+        need = (
+            src_per_chunk * in_h * in_w * (1 + fp_bytes)
+            + (chunk + 2) * out_h * out_w * (fp_bytes + 1)
+            + GIB
+        )
+        free_bytes, _total = torch.cuda.mem_get_info(device)
+        if int(free_bytes) < int(need):
+            return False
+        with torch.inference_mode():
+            with torch.cuda.device(device):
+                for o0 in range(0, out_t, chunk):
+                    o1 = min(out_t, int(o0) + chunk)
+                    if mode == 'gray':
+                        # Same two-slice endpoint-aligned lerp as _render_target_slice.
+                        src_pos = [_linear_source_index(int(oz), int(out_t), int(in_t)) for oz in range(o0, o1)]
+                        z0s = [int(math.floor(p)) for p in src_pos]
+                        z1s = [min(in_t - 1, int(z) + 1) for z in z0s]
+                        lo, hi = min(z0s), max(z1s) + 1
+                        blk = torch.from_numpy(np.ascontiguousarray(src_vol[lo:hi])).to(device)
+                        pooled = F.adaptive_avg_pool2d(
+                            blk.to(torch.float32).unsqueeze(1), (int(out_h), int(out_w)),
+                        ).squeeze(1)
+                        rows = []
+                        for i in range(int(o1 - o0)):
+                            alpha = float(src_pos[i] - float(z0s[i]))
+                            f0 = pooled[int(z0s[i] - lo)]
+                            if z1s[i] == z0s[i] or alpha <= 1e-7:
+                                rows.append(f0)
+                            else:
+                                rows.append(torch.lerp(f0, pooled[int(z1s[i] - lo)], alpha))
+                        out_chunk = torch.stack(rows).round_().clamp_(0, 255).to(torch.uint8)
+                    elif mode == 'mask':
+                        # Same source t-range OR as _restore_slice; XY any-coverage max-pool.
+                        starts: List[int] = []
+                        stops: List[int] = []
+                        for oz in range(o0, o1):
+                            s0 = int(math.floor(float(oz) * float(in_t) / float(out_t)))
+                            s1 = int(math.ceil(float(oz + 1) * float(in_t) / float(out_t)))
+                            s0 = int(np.clip(s0, 0, in_t - 1))
+                            s1 = int(np.clip(max(s0 + 1, s1), 1, in_t))
+                            starts.append(s0)
+                            stops.append(s1)
+                        lo, hi = min(starts), max(stops)
+                        blk = torch.from_numpy(np.ascontiguousarray(src_vol[lo:hi])).to(device)
+                        pooled = F.adaptive_max_pool2d(
+                            blk.to(torch.float16).unsqueeze(1), (int(out_h), int(out_w)),
+                        ).squeeze(1)
+                        rows = []
+                        for i in range(int(o1 - o0)):
+                            window = pooled[int(starts[i] - lo):int(stops[i] - lo)]
+                            rows.append(window.amax(dim=0) if int(window.shape[0]) > 1 else window[0])
+                        out_chunk = (torch.stack(rows) > 0).to(torch.uint8)
+                    else:
+                        return False
+                    out_mm[int(o0):int(o1)] = out_chunk.cpu().numpy()
+                    del blk, pooled, rows, out_chunk
+        global _LQ_GPU_DOWNBIN_ANNOUNCED
+        if not _LQ_GPU_DOWNBIN_ANNOUNCED:
+            _LQ_GPU_DOWNBIN_ANNOUNCED = True
+            print(
+                f'GPU low-quality downbin active on {device} (v13.3.8 E2; '
+                'YOLO_TTA_LOW_QUALITY_GPU_DOWNBIN=0 disables).'
+            )
+        return True
+    except Exception as exc:
+        print(f'Warning: GPU low-quality downbin failed ({exc}); using the CPU resize path.')
+        return False
+
+
 def resize_gray_volume_to_shape(
     volume_gray: np.ndarray,
     out_shape: Tuple[int, int, int],
@@ -20780,6 +21150,12 @@ def resize_gray_volume_to_shape(
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
     )
+    # v13.3.8 (E2): downbin on an idle GPU when possible; the per-slice CPU path below is
+    # the unchanged fallback (it rewrites every slice, so a failed GPU pass cannot leak).
+    if _try_gpu_downbin_volume(volume_gray, out_mm, 'gray'):
+        flush_array(out_mm)
+        return out_mm
+
     worker_count = choose_slice_parallel_workers(int(workers), int(out_t))
     chunk_size = choose_parallel_chunk_size(out_t, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
     xy_interp = cv2.INTER_AREA if (out_h <= in_h and out_w <= in_w) else cv2.INTER_LINEAR
@@ -20836,6 +21212,11 @@ def resize_binary_mask_volume_to_shape(
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
     )
+    # v13.3.8 (E2): downbin on an idle GPU when possible; CPU fallback below is unchanged.
+    if _try_gpu_downbin_volume(mask_u8, out_mm, 'mask'):
+        flush_array(out_mm)
+        return out_mm
+
     worker_count = choose_slice_parallel_workers(int(workers), int(out_t))
     chunk_size = choose_parallel_chunk_size(out_t, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
 
@@ -20925,15 +21306,14 @@ def write_low_quality_overlay_video(
     t_dim, h_dim, w_dim = volume_gray.shape
     assert mask_u8.shape == (t_dim, h_dim, w_dim)
     proc = ffmpeg_h264_rgb_writer(out_path, int(w_dim), int(h_dim), float(fps))
-    blue = np.array([0, 0, 255], dtype=np.uint8)
+    # v13.3.8 (A5): reused RGB buffer + bbox-restricted blend + memoryview pipe writes.
+    frame_buf = np.empty((int(h_dim), int(w_dim), 3), dtype=np.uint8)
     try:
         assert proc.stdin is not None
         for t in tqdm(range(int(t_dim)), desc=f'Writing low-quality overlay ({out_path.name})', disable=not show_progress):
-            frame = _gray_to_rgb_frame(np.asarray(volume_gray[int(t)]))
-            m = np.asarray(mask_u8[int(t)], dtype=bool)
-            if np.any(m):
-                frame[m] = ((frame[m].astype(np.uint16) + blue.astype(np.uint16)) // 2).astype(np.uint8)
-            proc.stdin.write(np.ascontiguousarray(frame).tobytes())
+            frame = _gray_frame_into_rgb_buffer(volume_gray[int(t)], frame_buf)
+            _overlay_blend_blue_inplace(frame, mask_u8[int(t)])
+            proc.stdin.write(memoryview(frame).cast('B'))
     finally:
         close_ffmpeg_writer(proc)
     return out_path
@@ -20947,11 +21327,14 @@ def write_low_quality_binary_video(
 ) -> Path:
     t_dim, h_dim, w_dim = mask_u8.shape
     proc = ffmpeg_h264_gray_writer(out_path, int(w_dim), int(h_dim), float(fps))
+    # v13.3.8 (A5): reused frame buffer + memoryview pipe writes; the mask volumes are 0/1
+    # by construction, so multiply-by-255 into the buffer replaces the compare+cast temps.
+    frame_buf = np.empty((int(h_dim), int(w_dim)), dtype=np.uint8)
     try:
         assert proc.stdin is not None
         for t in tqdm(range(int(t_dim)), desc=f'Writing low-quality binary ({out_path.name})', disable=not show_progress):
-            frame = (np.asarray(mask_u8[int(t)], dtype=np.uint8) > 0).astype(np.uint8) * np.uint8(255)
-            proc.stdin.write(np.ascontiguousarray(frame).tobytes())
+            np.multiply(np.asarray(mask_u8[int(t)]), 255, out=frame_buf)
+            proc.stdin.write(memoryview(frame_buf).cast('B'))
     finally:
         close_ffmpeg_writer(proc)
     return out_path
@@ -21640,7 +22023,13 @@ def main() -> None:
     legacy_cube_shape = compute_cube_resize_shape(input_T, input_H, input_W, tolerance=0.05)
     processing_mode = processing_volume_mode()
     cube_resize_will_apply = bool(should_resize_to_processing_cube(input_processing_shape, legacy_cube_shape))
-    decode_prefer_memory = not (bool(multi_gpu_active) and not cube_resize_will_apply)
+    # Multi-GPU workers open the shared source volume as a FILE. Without a cube resize that
+    # file is the decode target itself; v13.3.8 (E1) extends the same rule to cube runs so
+    # workers can resident-upload the NATIVE decoded volume (t-resizing on device) without
+    # a copy pass first.
+    decode_prefer_memory = not (
+        bool(multi_gpu_active) and (not cube_resize_will_apply or gpu_cube_resize_enabled())
+    )
     if preprocess_streaming_active:
         print(
             'v12.2.15 streaming preprocessing active: ffmpeg decode returns its destination array immediately; '
@@ -23388,7 +23777,51 @@ def main() -> None:
                 _GpuWorkerAuxInterpolationPool(gpu_task_queue, len(gpu_worker_processes))
             )
 
-        source_volume_path, source_volume_shape, source_volume_dtype = _ensure_source_volume_file_backed()
+        # v13.3.8 (E1): when the cube resize applies and both volumes are file-backed,
+        # enqueue against the cube PATH without waiting for its content — workers go
+        # resident straight from the NATIVE decoded volume (device t-resize), and a
+        # sentinel written after wait_for_volume_ready+flush gates the file-backed
+        # fallbacks (failed residency, tile tasks, CPU renders). Enqueue then waits only
+        # for the decode, not the resize tail + cube flush.
+        native_resize_task_spec: Optional[Dict[str, object]] = None
+        source_volume_ready_async = False
+        if gpu_cube_resize_enabled() and bool(cube_resize_will_apply) and (volume_rgb is not input_volume_rgb):
+            native_backing = _memmap_backing_path(input_volume_rgb)
+            cube_backing = _memmap_backing_path(volume_rgb)
+            if native_backing is not None and cube_backing is not None:
+                wait_for_volume_ready(input_volume_rgb)
+                flush_array(input_volume_rgb)
+                cube_ready_sentinel = temp_dir / 'mgpu_source_volume.cube_ready.sentinel'
+                native_resize_task_spec = {
+                    'path': str(native_backing),
+                    'shape': [int(x) for x in np.asarray(input_volume_rgb).shape],
+                    'dtype': str(np.asarray(input_volume_rgb).dtype),
+                    'sentinel': str(cube_ready_sentinel),
+                }
+                source_volume_path = str(cube_backing)
+                source_volume_shape = tuple(int(x) for x in volume_rgb.shape)
+                source_volume_dtype = str(np.asarray(volume_rgb).dtype)
+                source_volume_ready_async = True
+
+                def _signal_cube_ready() -> None:
+                    try:
+                        wait_for_volume_ready(volume_rgb)
+                        flush_array(volume_rgb)
+                        cube_ready_sentinel.touch()
+                        print('Shared cube volume complete; sentinel written for file-backed worker fallbacks.')
+                    except BaseException as exc:
+                        # The producer failure also surfaces in main; teardown terminates
+                        # any workers parked on the (never-written) sentinel.
+                        print(f'Warning: cube-ready signaling failed ({exc}).')
+
+                threading.Thread(target=_signal_cube_ready, name='cube-ready-sentinel', daemon=True).start()
+                print(
+                    'v13.3.8 (E1): task enqueue gated on the decode only — GPU workers upload the '
+                    'NATIVE decoded volume and t-resize on device (YOLO_TTA_GPU_CUBE_RESIZE=0 '
+                    'restores cube-gated enqueue).'
+                )
+        if not source_volume_ready_async:
+            source_volume_path, source_volume_shape, source_volume_dtype = _ensure_source_volume_file_backed()
         # Split each full-frame volume into contiguous slice-range chunks so multiple GPUs can work
         # the SAME (often huge, e.g. full-coverage Radial) volume in parallel, instead of one GPU per
         # whole volume leaving the other GPUs idle at the tail. The chunk is large relative to the
@@ -23453,6 +23886,9 @@ def main() -> None:
                     'slice_start': int(s0), 'slice_count': int(count),
                     'source_volume_path': source_volume_path, 'source_shape': list(source_volume_shape),
                     'source_dtype': source_volume_dtype,
+                    # v13.3.8 (E1): native-volume residency spec + cube-ready sentinel
+                    # (None when the cube gated enqueue synchronously, as before).
+                    'native_resize': native_resize_task_spec,
                     'result_mask_path': str(rmask), 'result_conf_path': (str(rconf) if rconf is not None else None),
                     'result_mode': str(result_mode), 'union_num_slices': int(n_slices),
                     'render_workers': int(render_workers), 'prefetch_frames': int(prefetch_frames),
@@ -23644,8 +24080,55 @@ def main() -> None:
             if aux_pool is not None:
                 aux_pool.enable()
 
+    # v13.3.8 (G1): push drain — a transport-only daemon thread blocks on the process
+    # result queue and hands messages to the main thread through a local deque + wake
+    # event. Handlers still run ONLY on the main thread (they mutate scheduler state and
+    # raise scheduler-fatal errors); completed futures set the same event through one-time
+    # done-callbacks, so one event wait covers both wake sources. In push mode the drainer
+    # thread OWNS the mp queue end (a second concurrent get() would race it).
+    push_drain_active = bool(
+        multi_gpu_active and gpu_result_queue is not None and scheduler_push_drain_enabled()
+    )
+    scheduler_wake = threading.Event()
+    push_drain_stop = threading.Event()
+    pushed_worker_results: deque = deque()
+    _wake_hooked_futures: 'weakref.WeakSet' = weakref.WeakSet()
+
+    def _wake_scheduler(_fut: object = None) -> None:
+        scheduler_wake.set()
+
+    def _hook_scheduler_wake(futures_list: Sequence[Future]) -> None:
+        # add_done_callback on an already-done future fires synchronously, so hooking is
+        # race-free: a completion between collection and wait still sets the event.
+        for fut in futures_list:
+            if fut not in _wake_hooked_futures:
+                _wake_hooked_futures.add(fut)
+                fut.add_done_callback(_wake_scheduler)
+
+    def _push_drain_pump() -> None:
+        while not push_drain_stop.is_set():
+            try:
+                msg = gpu_result_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            except (EOFError, OSError):
+                break
+            pushed_worker_results.append(msg)
+            scheduler_wake.set()
+
+    if push_drain_active:
+        threading.Thread(target=_push_drain_pump, name='gpu-result-push-drain', daemon=True).start()
+        print(
+            'Scheduler push drain active (v13.3.8 G1; results handled the instant they '
+            'arrive; YOLO_TTA_SCHEDULER_PUSH_DRAIN=0 restores polling).'
+        )
+
     def _drain_process_inference_results() -> None:
         if gpu_result_queue is None:
+            return
+        if push_drain_active:
+            while pushed_worker_results:
+                _process_one_worker_result(pushed_worker_results.popleft())
             return
         while True:
             try:
@@ -23656,6 +24139,12 @@ def main() -> None:
 
     def _wait_for_one_process_result(timeout: float) -> None:
         if gpu_result_queue is None:
+            return
+        if push_drain_active:
+            if not pushed_worker_results:
+                scheduler_wake.wait(timeout=float(timeout))
+                scheduler_wake.clear()
+            _drain_process_inference_results()
             return
         try:
             msg = gpu_result_queue.get(timeout=float(timeout))
@@ -23951,9 +24440,17 @@ def main() -> None:
                     break
                 continue
             _log_scheduler_wait_state()
-            # Under multi-GPU, also poll the process result queue periodically while CPU-side futures
-            # run, so completed inference results are unioned without waiting for a future to finish.
-            wait(waitables, timeout=(0.1 if multi_gpu_active else None), return_when=FIRST_COMPLETED)
+            if push_drain_active:
+                # v13.3.8 (G1): sleep on the shared wake event — worker results and future
+                # completions both set it, so the loop wakes the instant either happens.
+                # The heartbeat only bounds the worker-liveness re-check cadence.
+                _hook_scheduler_wake(waitables)
+                scheduler_wake.wait(timeout=float(scheduler_push_drain_heartbeat_seconds()))
+                scheduler_wake.clear()
+            else:
+                # Under multi-GPU, also poll the process result queue periodically while CPU-side futures
+                # run, so completed inference results are unioned without waiting for a future to finish.
+                wait(waitables, timeout=(0.1 if multi_gpu_active else None), return_when=FIRST_COMPLETED)
 
     finally:
         if sys.exc_info()[0] is not None:
@@ -23973,6 +24470,7 @@ def main() -> None:
             for _model_name, _view, _tile_job, ref in list(ready_tile_infer):
                 close_prediction_volume_ref(ref, keep_temp=bool(keep_temp_artifacts))
             ready_tile_infer.clear()
+        push_drain_stop.set()  # v13.3.8 (G1): the transport thread exits within one 0.5 s tick
         if multi_gpu_active:
             _shutdown_gpu_worker_processes()
         prediction_volume_executor.shutdown(wait=True)
@@ -24026,6 +24524,7 @@ def main() -> None:
     # original source geometry (single resample) instead of the working geometry.
     source_output_shape_tyx = (int(input_T), int(input_H), int(input_W))
     final_backprojection_jobs: List[ViewBackprojectionQueueJob] = []
+    view_assemble_jobs: List[Tuple[str, ViewInfo, List[NrrdLayerRef]]] = []  # v13.3.8 (G4)
     for view in views:
         if (view.family != 'radial' and not is_tilted_view(view)):
             continue
@@ -24058,15 +24557,9 @@ def main() -> None:
                         f'{len(view_projected_layer_refs)} already-projected NRRD layer(s) '
                         f'(v13.2.4 task #2; no second backprojection).'
                     )
-                    projected_volume = assemble_view_volume_from_projected_layers(
-                        view_projected_layer_refs,
-                        source_output_shape_tyx,
-                        temp_dir / 'view_volumes' / str(model_name) / f'{view.name}.u8.dat',
-                        f'Assembling final {model_name}/{view.name} from projected layers',
-                        prefer_memory=True,
-                        workers=int(slice_postprocess_workers),
-                    )
-                    view_volumes_by_model[model_name][view.name] = projected_volume
+                    # v13.3.8 (G4): collect the assembly instead of running it inline; the
+                    # independent per-view assemblies run concurrently below.
+                    view_assemble_jobs.append((str(model_name), view, list(view_projected_layer_refs)))
                     continue
             final_backprojection_jobs.append(ViewBackprojectionQueueJob(
                 model_name=str(model_name),
@@ -24080,6 +24573,44 @@ def main() -> None:
                 workers=1,
                 out_shape_tyx=source_output_shape_tyx,
             ))
+
+    if view_assemble_jobs:
+        # v13.3.8 (G4): the per-view assemblies are independent unions of already-projected
+        # layer stores (I/O + memcpy bound). Run up to assemble_views_concurrency() of them
+        # side by side, splitting the slice-worker budget so total thread count is unchanged.
+        assemble_concurrency = max(1, min(int(assemble_views_concurrency()), len(view_assemble_jobs)))
+        per_view_workers = max(1, int(slice_postprocess_workers) // int(assemble_concurrency))
+
+        def _run_view_assembly(job: Tuple[str, 'ViewInfo', List[NrrdLayerRef]]) -> np.ndarray:
+            job_model, job_view, job_refs = job
+            return assemble_view_volume_from_projected_layers(
+                job_refs,
+                source_output_shape_tyx,
+                temp_dir / 'view_volumes' / str(job_model) / f'{job_view.name}.u8.dat',
+                f'Assembling final {job_model}/{job_view.name} from projected layers',
+                prefer_memory=True,
+                workers=int(per_view_workers),
+            )
+
+        if assemble_concurrency <= 1:
+            for assemble_job in view_assemble_jobs:
+                view_volumes_by_model[assemble_job[0]][assemble_job[1].name] = _run_view_assembly(assemble_job)
+        else:
+            print(
+                f'v13.3.8 (G4): assembling {len(view_assemble_jobs)} projected view volume(s) with '
+                f'{int(assemble_concurrency)} concurrent assemblies x {int(per_view_workers)} workers '
+                '(YOLO_TTA_ASSEMBLE_VIEWS_CONCURRENCY=1 restores serial).'
+            )
+            assemble_pool = _acquire_parallel_pool(int(assemble_concurrency))
+            try:
+                assemble_futs = [
+                    (assemble_job[0], assemble_job[1], assemble_pool.submit(_run_view_assembly, assemble_job))
+                    for assemble_job in view_assemble_jobs
+                ]
+                for job_model, job_view, fut in assemble_futs:
+                    view_volumes_by_model[job_model][job_view.name] = fut.result()
+            finally:
+                _release_parallel_pool(int(assemble_concurrency), assemble_pool)
 
     if final_backprojection_jobs:
         # v12.2.11: backprojection is CPU-only, so do not halve the CPU budget for a
