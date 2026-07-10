@@ -2,8 +2,24 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the GPT-5.6-Ultra v13.3.9_SLURM implementation. It is derived from
-Fable-5_v13.3.8_SLURM.py by COPY + surgical edits implementing the supplied latest major list:
+This is the GPT-5.6-Ultra v13.3.10_SLURM implementation. It is derived from
+GPT-5.6-Ultra_v13.3.9_SLURM.py by COPY + surgical edits implementing the supplied task list:
+  - v13.3.10 (T6) retains each accepted bridge plan's exact min-radius scan sections
+    and reuses them during painting. YOLO_TTA_INTERPOLATION_CACHE_BRIDGE_SECTIONS=0
+    restores render-time recomputation.
+  - v13.3.10 (T7) tracks the union of each bridge slice's clipped paste bboxes and
+    restricts merge/delta capture to that proven superset of painted voxels.
+    YOLO_TTA_INTERPOLATION_FUSED_BRIDGE_MERGE=0 restores full-slice sweeps.
+  - v13.3.10 (G7) re-expands strictly post-inference CPU pools to the whole-box worker
+    budget after GPU workers and inference/interpolation executors have joined.
+    YOLO_TTA_TAIL_WORKER_BUDGET_EXPAND=0 retains v13.3.9 tail sizing.
+  - v13.3.10 (N9) dispatches late N7 z shards across concurrently active, measured
+    GPU nvCOMP and core-capped CPU member-gzip lanes while preserving ordered standard
+    gzip members. YOLO_TTA_NRRD_DEFLATE_MIX=0 restores the first-tier-wins selector.
+  - v13.3.10 (N10) scans independent segment-extent t slices in parallel and reduces
+    the same exact bounds. YOLO_TTA_NRRD_PARALLEL_EXTENT_SCAN=0 restores the serial scan.
+
+Inherited from v13.3.9:
   - v13.3.9 (G5) fuses Cartesian restore, native fallback views, and source-projected
     radial/tilted NRRD component stores into one disjoint output-z pass. The --save_nrrd
     path no longer materializes one full source-geometry intermediate per radial/tilted
@@ -1731,6 +1747,18 @@ def main_process_worker_budget(gpu_device_count: int, multi_gpu_active: bool) ->
     n = max(1, int(gpu_device_count))
     reserved = int(multi_gpu_worker_share(n)) * n
     return max(1, total - reserved)
+
+
+def tail_worker_budget_expansion_enabled() -> bool:
+    """v13.3.10 (G7): reclaim the per-GPU CPU reservation after inference drains.
+
+    The main-process ``worker_budget`` deliberately leaves room for live multi-GPU render /
+    inference subprocesses.  Once those processes and every inference/interpolation executor
+    have joined, the reservation is dead capacity and strictly tail-only stages may use the
+    whole-box budget again.  Set YOLO_TTA_TAIL_WORKER_BUDGET_EXPAND=0 to retain the v13.3.9
+    tail sizing.
+    """
+    return _env_flag('YOLO_TTA_TAIL_WORKER_BUDGET_EXPAND', True)
 
 
 def mgpu_direct_union_enabled() -> bool:
@@ -14703,7 +14731,20 @@ def _component_to_local_canvas(mask2d: np.ndarray, anchor_yx: Tuple[int, int], h
     return local
 
 
-def _paste_local_mask_onto_slice(dest_slice: np.ndarray, local_mask: np.ndarray, center_yx: Tuple[float, float]) -> int:
+def _paste_local_mask_onto_slice(
+    dest_slice: np.ndarray,
+    local_mask: np.ndarray,
+    center_yx: Tuple[float, float],
+    *,
+    dst_bbox_union: Optional[List[int]] = None,
+) -> int:
+    """OR a centered local mask into a slice and optionally accumulate its clipped dst bbox.
+
+    ``dst_bbox_union`` is a mutable ``[y0, x0, y1, x1]`` initialized by the caller to
+    ``[H, W, 0, 0]``. v13.3.10 T7 uses it while rendering so the later bridge merge and
+    optional delta capture touch only the union of regions that a paste could have changed.
+    The return value and paste arithmetic remain unchanged.
+    """
     if not np.any(local_mask):
         return 0
 
@@ -14735,6 +14776,12 @@ def _paste_local_mask_onto_slice(dest_slice: np.ndarray, local_mask: np.ndarray,
 
     if src_y0 >= src_y1 or src_x0 >= src_x1:
         return 0
+
+    if dst_bbox_union is not None:
+        dst_bbox_union[0] = min(int(dst_bbox_union[0]), int(dst_y0))
+        dst_bbox_union[1] = min(int(dst_bbox_union[1]), int(dst_x0))
+        dst_bbox_union[2] = max(int(dst_bbox_union[2]), int(dst_y1))
+        dst_bbox_union[3] = max(int(dst_bbox_union[3]), int(dst_x1))
 
     if _planning_kernels_active():
         try:
@@ -15589,6 +15636,22 @@ def _collect_walkback_source_points(
     return out
 
 
+def interpolation_cache_bridge_sections_enabled() -> bool:
+    """Reuse accepted min-radius scan sections during painting (v13.3.10 T6).
+
+    ``YOLO_TTA_INTERPOLATION_CACHE_BRIDGE_SECTIONS=0`` restores recomputation.
+    """
+    return _env_flag('YOLO_TTA_INTERPOLATION_CACHE_BRIDGE_SECTIONS', True)
+
+
+def interpolation_fused_bridge_merge_enabled() -> bool:
+    """Restrict bridge merge/delta capture to rendered paste bboxes (v13.3.10 T7).
+
+    ``YOLO_TTA_INTERPOLATION_FUSED_BRIDGE_MERGE=0`` restores full-slice sweeps.
+    """
+    return _env_flag('YOLO_TTA_INTERPOLATION_FUSED_BRIDGE_MERGE', True)
+
+
 @dataclass(frozen=True)
 class SliceBridgeRenderPlan:
     source_label: int
@@ -15605,6 +15668,10 @@ class SliceBridgeRenderPlan:
     num_slices: int
     sdf0: np.ndarray
     sdf1: np.ndarray
+    # v13.3.10 (T6): the min-radius acceptance scan already constructs every
+    # intermediate bool section. Accepted plans retain those exact post-component-filter
+    # arrays by step index so painting does not repeat SDF lerp/threshold/component work.
+    cached_sections: List[Optional[np.ndarray]] = field(default_factory=list, compare=False, repr=False)
 
 
 @dataclass
@@ -15728,6 +15795,7 @@ def _estimate_linear_slice_bridge_min_radius_from_plan(
     plan: SliceBridgeRenderPlan,
     *,
     reject_at_or_below: float = 0.0,
+    cache_sections: bool = False,
 ) -> float:
     """Thinnest inscribed radius along the bridge (endpoints + every intermediate section).
 
@@ -15735,7 +15803,8 @@ def _estimate_linear_slice_bridge_min_radius_from_plan(
     fields (max(sdf) IS the max inscribed radius — no extra distance transforms), and when
     ``reject_at_or_below`` is set the per-step scan returns as soon as the running minimum can
     no longer exceed the rejection threshold (the caller rejects on <=, so no later section
-    can change the outcome).
+    can change the outcome). v13.3.10 T6 optionally retains each post-filter intermediate
+    section on the plan; every accepted plan necessarily completes this scan.
     """
     source_local = np.asarray(plan.sdf0 >= 0.0, dtype=bool)
     target_local = np.asarray(plan.sdf1 >= 0.0, dtype=bool)
@@ -15746,12 +15815,19 @@ def _estimate_linear_slice_bridge_min_radius_from_plan(
     threshold = float(reject_at_or_below)
     if threshold > 0.0 and min_radius <= threshold:
         return float(min_radius)
+    section_cache = plan.cached_sections
+    if bool(cache_sections):
+        section_cache[:] = [None] * (int(plan.steps) + 1)
     for idx in range(1, int(plan.steps)):
         alpha = float(idx) / float(plan.steps)
         section = ((1.0 - alpha) * plan.sdf0 + alpha * plan.sdf1) >= 0.0
         if not np.any(section):
             return 0.0
         section = _keep_center_component_2d(section)
+        if bool(cache_sections):
+            # The painter only reads this array (wrap handling creates a reversed view),
+            # so retaining the exact estimator result is bit-for-bit equivalent.
+            section_cache[int(idx)] = section
         min_radius = min(min_radius, _component_max_radius(section))
         if threshold > 0.0 and min_radius <= threshold:
             return float(min_radius)
@@ -15762,15 +15838,21 @@ def _paint_linear_slice_bridge_plan_onto_slice(
     dest_slice: np.ndarray,
     plan: SliceBridgeRenderPlan,
     step_idx: int,
+    *,
+    dst_bbox_union: Optional[List[int]] = None,
 ) -> int:
     if int(step_idx) <= 0 or int(step_idx) >= int(plan.steps):
         return 0
 
     alpha = float(step_idx) / float(plan.steps)
-    section = ((1.0 - alpha) * plan.sdf0 + alpha * plan.sdf1) >= 0.0
-    if not np.any(section):
-        return 0
-    section = _keep_center_component_2d(section)
+    section: Optional[np.ndarray] = None
+    if int(step_idx) < len(plan.cached_sections):
+        section = plan.cached_sections[int(step_idx)]
+    if section is None:
+        section = ((1.0 - alpha) * plan.sdf0 + alpha * plan.sdf1) >= 0.0
+        if not np.any(section):
+            return 0
+        section = _keep_center_component_2d(section)
     center_y = (1.0 - alpha) * float(plan.source_anchor[0]) + alpha * float(plan.target_anchor[0])
     center_x = (1.0 - alpha) * float(plan.source_anchor[1]) + alpha * float(plan.target_anchor[1])
     # v13.2.2 bug #2: the morph runs in source-side "unrolled" coordinates. Intermediate
@@ -15781,7 +15863,12 @@ def _paint_linear_slice_bridge_plan_onto_slice(
     if int(plan.num_slices) > 0 and (s_raw < 0 or s_raw >= int(plan.num_slices)):
         section = section[:, ::-1]
         center_x = float(int(dest_slice.shape[1]) - 1) - center_x
-    return _paste_local_mask_onto_slice(dest_slice, section, (center_y, center_x))
+    return _paste_local_mask_onto_slice(
+        dest_slice,
+        section,
+        (center_y, center_x),
+        dst_bbox_union=dst_bbox_union,
+    )
 
 
 def _plan_slice_seed_bridges(
@@ -15840,7 +15927,9 @@ def _plan_slice_seed_bridges(
 
             if float(interpolate_min_radius) > 0.0:
                 bridge_radius = _estimate_linear_slice_bridge_min_radius_from_plan(
-                    plan, reject_at_or_below=float(interpolate_min_radius)
+                    plan,
+                    reject_at_or_below=float(interpolate_min_radius),
+                    cache_sections=bool(interpolation_cache_bridge_sections_enabled()),
                 )
                 if bridge_radius <= float(interpolate_min_radius):
                     result.skipped_by_min_radius += 1
@@ -15908,6 +15997,11 @@ def interpolate_view_volume_pass_inplace(
     (bridge AND NOT pre-merge mask) to a disk memmap during the merge step, replacing the old
     full-volume before-copy + subtract the --save_nrrd bridge layers used to require. The stat
     key 'bridge_delta_path' is set when the file was produced; the CALLER owns its cleanup.
+
+    v13.3.10 T6 reuses accepted min-radius scan sections during painting. T7 records the
+    union of clipped paste bboxes for each rendered slice and restricts the simultaneous
+    bridge merge plus optional delta capture to that region. Both optimizations are default-on
+    behind their ``YOLO_TTA_INTERPOLATION_*`` gates and retain the legacy path as fallback.
     """
     if int(max_slice_distance) <= 0:
         return {
@@ -16073,11 +16167,19 @@ def interpolate_view_volume_pass_inplace(
             skipped_by_min_radius += int(seed_result.skipped_by_min_radius)
             if seed_result.plans:
                 plans.extend(seed_result.plans)
+        # The loop variable otherwise retains the final seed result (and its T6 section
+        # caches) independently of the flattened plan list.
+        del seed_result
 
         if plans:
             schedule = _build_slice_bridge_render_schedule(plans, int(mask_mm.shape[0]), wrap_axis=bool(wrap_axis))
             added_counts = np.zeros((int(mask_mm.shape[0]),), dtype=np.int64)
             render_workers = choose_slice_parallel_workers(int(workers), int(mask_mm.shape[0]))
+            fused_bridge_merge = bool(interpolation_fused_bridge_merge_enabled())
+            rendered_paste_bboxes = (
+                np.zeros((int(mask_mm.shape[0]), 4), dtype=np.int64)
+                if fused_bridge_merge else None
+            )
 
             def _render_slice(z: int) -> None:
                 contribs = schedule[int(z)]
@@ -16085,13 +16187,20 @@ def interpolate_view_volume_pass_inplace(
                     return
                 bridge_slice = bridge_mm[int(z)]
                 local_added = 0
+                bbox_union = (
+                    [int(bridge_slice.shape[0]), int(bridge_slice.shape[1]), 0, 0]
+                    if rendered_paste_bboxes is not None else None
+                )
                 for plan_idx, step_idx in contribs:
                     local_added += _paint_linear_slice_bridge_plan_onto_slice(
                         bridge_slice,
                         plans[int(plan_idx)],
                         int(step_idx),
+                        dst_bbox_union=bbox_union,
                     )
                 added_counts[int(z)] = np.int64(local_added)
+                if rendered_paste_bboxes is not None and bbox_union is not None:
+                    rendered_paste_bboxes[int(z)] = np.asarray(bbox_union, dtype=np.int64)
 
             parallel_for_indices(
                 int(mask_mm.shape[0]),
@@ -16106,6 +16215,9 @@ def interpolate_view_volume_pass_inplace(
             scheduled_slices = [int(z) for z in range(int(mask_mm.shape[0])) if schedule[int(z)]]
             del schedule
             del added_counts
+            # Painting is the sole cache consumer. Drop plans (SDFs + T6 bool sections)
+            # before allocating the optional volume-sized delta workspace.
+            plans.clear()
 
             delta_mm: Optional[np.ndarray] = None
             if bridge_delta_path is not None:
@@ -16119,7 +16231,23 @@ def interpolate_view_volume_pass_inplace(
             def _merge_slice(list_idx: int) -> None:
                 z = int(scheduled_slices[int(list_idx)])
                 bridge_slice = np.asarray(bridge_mm[z])
-                if np.any(bridge_slice):
+                if rendered_paste_bboxes is not None:
+                    y0, x0, y1, x1 = (int(v) for v in rendered_paste_bboxes[z])
+                    if y0 >= y1 or x0 >= x1:
+                        return
+                    bridge_region = bridge_slice[y0:y1, x0:x1]
+                    if not np.any(bridge_region):
+                        return
+                    mask_region = np.asarray(mask_mm[z, y0:y1, x0:x1])
+                    if delta_mm is not None:
+                        # The new w+ delta starts zero; only its possible-bridge region
+                        # needs an explicit write. mask_mm remains frozen until this merge.
+                        delta_mm[z, y0:y1, x0:x1] = np.where(
+                            mask_region == 0, bridge_region, np.uint8(0)
+                        )
+                    mask_region |= bridge_region
+                elif np.any(bridge_slice):
+                    # YOLO_TTA_INTERPOLATION_FUSED_BRIDGE_MERGE=0: exact legacy sweep.
                     if delta_mm is not None:
                         mask_slice = np.asarray(mask_mm[z])
                         delta_mm[z, :, :] = np.where(mask_slice == 0, bridge_slice, np.uint8(0))
@@ -17288,7 +17416,7 @@ def materialize_nrrd_view_layer(
             except Exception:
                 pass
     else:
-        segment_extent = compute_segment_extent_zyx(projected)
+        segment_extent = compute_segment_extent_zyx(projected, workers=int(workers))
         segment_extent_source = 'raw_layer_materialization_scan'
         close_memmap_array(projected)
 
@@ -17460,7 +17588,7 @@ def materialize_nrrd_global_layer(
             workers=int(workers),
         )
         shape = tuple(int(x) for x in np.asarray(copied).shape)
-        segment_extent = compute_segment_extent_zyx(copied)
+        segment_extent = compute_segment_extent_zyx(copied, workers=int(workers))
         segment_extent_source = 'raw_layer_materialization_scan'
         close_memmap_array(copied)
 
@@ -19498,12 +19626,38 @@ def nrrd_gzip_workers() -> int:
     return max(2, _env_int('YOLO_TTA_NRRD_GZIP_WORKERS', max(4, cores // 2)))
 
 
+def nrrd_deflate_mix_mode() -> str:
+    """N9 late-tail deflate policy: ``auto`` mixes validated CPU/GPU lanes; ``0`` does not."""
+    raw = os.environ.get('YOLO_TTA_NRRD_DEFLATE_MIX', 'auto').strip().lower()
+    return '0' if raw == '0' else 'auto'
+
+
+def nrrd_deflate_cpu_lane_cores() -> int:
+    """Dedicated N9 ISA-L/member lane size; an explicit zero disables the CPU lane.
+
+    The default deliberately reserves about three quarters of the allocated CPUs for
+    x264 and other tail work.  It is also bounded by the configured general gzip pool.
+    """
+    cpu_total = max(1, int(_cpu_count()))
+    default = max(1, min(int(nrrd_gzip_workers()), int(cpu_total) // 4))
+    requested = _env_int('YOLO_TTA_NRRD_DEFLATE_CPU_LANE_CORES', int(default))
+    if int(requested) <= 0:
+        return 0
+    return max(1, min(int(requested), int(cpu_total), int(nrrd_gzip_workers())))
+
+
 def nrrd_gzip_chunk_bytes() -> int:
     return max(1, _env_int('YOLO_TTA_NRRD_GZIP_CHUNK_MIB', 16)) * 1024 * 1024
 
 
 _NRRD_GZIP_EXECUTOR: Optional[ThreadPoolExecutor] = None
 _NRRD_GZIP_EXECUTOR_LOCK = threading.Lock()
+_NRRD_DEFLATE_MIX_CPU_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_NRRD_DEFLATE_MIX_CPU_EXECUTOR_CORES = 0
+_NRRD_DEFLATE_MIX_CPU_EXECUTOR_LOCK = threading.Lock()
+_NRRD_DEFLATE_MIX_THROUGHPUT_LOCK = threading.Lock()
+_NRRD_DEFLATE_MIX_CPU_BPS: Dict[Tuple[int, str, int, int], float] = {}
+_NRRD_DEFLATE_MIX_GPU_BPS: Dict[int, float] = {}
 
 
 def _nrrd_gzip_executor() -> ThreadPoolExecutor:
@@ -19514,6 +19668,21 @@ def _nrrd_gzip_executor() -> ThreadPoolExecutor:
                 max_workers=int(nrrd_gzip_workers()), thread_name_prefix='nrrd-gzip',
             )
         return _NRRD_GZIP_EXECUTOR
+
+
+def _nrrd_deflate_mix_cpu_executor() -> Optional[ThreadPoolExecutor]:
+    """One process-wide, core-capped CPU lane shared by every concurrent N7 shard."""
+    global _NRRD_DEFLATE_MIX_CPU_EXECUTOR, _NRRD_DEFLATE_MIX_CPU_EXECUTOR_CORES
+    cores = int(nrrd_deflate_cpu_lane_cores())
+    if cores <= 0:
+        return None
+    with _NRRD_DEFLATE_MIX_CPU_EXECUTOR_LOCK:
+        if _NRRD_DEFLATE_MIX_CPU_EXECUTOR is None:
+            _NRRD_DEFLATE_MIX_CPU_EXECUTOR = ThreadPoolExecutor(
+                max_workers=int(cores), thread_name_prefix='nrrd-mix-cpu',
+            )
+            _NRRD_DEFLATE_MIX_CPU_EXECUTOR_CORES = int(cores)
+        return _NRRD_DEFLATE_MIX_CPU_EXECUTOR
 
 
 def _nrrd_deflate_backend() -> Tuple[str, Callable[[], object], Callable[..., int], int, int]:
@@ -19996,8 +20165,9 @@ def _blacklist_nrrd_gpu_deflate_engine(engine: _NvcompDeflateEngine, exc: BaseEx
 
 
 def shutdown_nrrd_gpu_deflate_engines() -> None:
-    """Release N8 owner threads/Codec streams after every payload writer has settled."""
+    """Release N8 GPU lanes and the N9 CPU lane after every payload writer has settled."""
     global _NRRD_GPU_DEFLATE_PRIMARY, _NRRD_GPU_DEFLATE_RR
+    global _NRRD_DEFLATE_MIX_CPU_EXECUTOR, _NRRD_DEFLATE_MIX_CPU_EXECUTOR_CORES
     with _NRRD_GPU_DEFLATE_LOCK:
         engines = list({
             id(e): e
@@ -20021,6 +20191,21 @@ def shutdown_nrrd_gpu_deflate_engines() -> None:
                 torch.cuda.empty_cache()
         except Exception:
             pass
+    with _NRRD_DEFLATE_MIX_CPU_EXECUTOR_LOCK:
+        cpu_executor = _NRRD_DEFLATE_MIX_CPU_EXECUTOR
+        _NRRD_DEFLATE_MIX_CPU_EXECUTOR = None
+        _NRRD_DEFLATE_MIX_CPU_EXECUTOR_CORES = 0
+    if cpu_executor is not None:
+        try:
+            try:
+                cpu_executor.shutdown(wait=True, cancel_futures=False)
+            except TypeError:
+                cpu_executor.shutdown(wait=True)
+        except Exception:
+            pass
+    with _NRRD_DEFLATE_MIX_THROUGHPUT_LOCK:
+        _NRRD_DEFLATE_MIX_CPU_BPS.clear()
+        _NRRD_DEFLATE_MIX_GPU_BPS.clear()
 
 
 def _gzip_member_from_raw_stream(raw_stream: bytes, crc: int, length: int) -> bytes:
@@ -20062,6 +20247,7 @@ class _GpuDeflatePayloadWriter:
         *,
         allow_cpu_fallback: bool = True,
         fallback_threads: Optional[int] = None,
+        fallback_member_executor: Optional[ThreadPoolExecutor] = None,
     ) -> None:
         self.fh = fh
         self.engine = engine
@@ -20073,6 +20259,7 @@ class _GpuDeflatePayloadWriter:
         self.compressed_bytes = 0
         self.allow_cpu_fallback = bool(allow_cpu_fallback)
         self.fallback_threads = None if fallback_threads is None else max(1, int(fallback_threads))
+        self.fallback_member_executor = fallback_member_executor
         self._cpu_fallback: Optional[object] = None
 
     def _prepare_window(self, window: np.ndarray, executor: ThreadPoolExecutor) -> Dict[str, object]:
@@ -20121,7 +20308,9 @@ class _GpuDeflatePayloadWriter:
             # Defined later in the module; preserve the configured/validated CPU tier order
             # (member -> single-member -> pigz) instead of bypassing disable flags/self-tests.
             self._cpu_fallback = _open_nrrd_cpu_payload_writer(  # type: ignore[name-defined]
-                self.fh, threads=self.fallback_threads,
+                self.fh,
+                threads=self.fallback_threads,
+                member_executor=self.fallback_member_executor,
             )
 
     def _write_work(self, work: Dict[str, object]) -> bool:
@@ -20424,13 +20613,20 @@ class _MemberParallelGzipPayloadWriter:
     write() calls. Members reach the file strictly in payload order.
     """
 
-    def __init__(self, fh: object, *, chunk_bytes: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        fh: object,
+        *,
+        chunk_bytes: Optional[int] = None,
+        executor: Optional[ThreadPoolExecutor] = None,
+    ) -> None:
         _backend, factory, crc_fn, _full_flush, _eff_level = _nrrd_deflate_backend()
         self.fh = fh
         self.factory = factory
         self.crc_fn = crc_fn
         self.chunk_bytes = int(chunk_bytes) if chunk_bytes else int(nrrd_gzip_chunk_bytes())
         self.window_bytes = int(nrrd_member_gzip_window_bytes())
+        self.executor = executor
         self.closed = False
         # Ready members (bytes) and in-flight compressions (Future -> (member, raw_len)),
         # strictly in payload order.
@@ -20465,7 +20661,7 @@ class _MemberParallelGzipPayloadWriter:
         total = len(mv)
         if total <= 0:
             return 0
-        executor = _nrrd_gzip_executor()
+        executor = self.executor if self.executor is not None else _nrrd_gzip_executor()
         for off in range(0, total, self.chunk_bytes):
             ln = min(self.chunk_bytes, total - off)
             chunk_mv = mv[off:off + ln]
@@ -20543,7 +20739,12 @@ def _nrrd_member_gzip_self_test() -> bool:
         return bool(_NRRD_MEMBER_GZIP_OK)
 
 
-def _open_nrrd_cpu_payload_writer(fh: object, *, threads: Optional[int] = None) -> object:
+def _open_nrrd_cpu_payload_writer(
+    fh: object,
+    *,
+    threads: Optional[int] = None,
+    member_executor: Optional[ThreadPoolExecutor] = None,
+) -> object:
     """First configured and validated non-GPU gzip tier."""
     if nrrd_inprocess_gzip_enabled():
         if nrrd_member_gzip_enabled() and _nrrd_member_gzip_self_test():
@@ -20555,7 +20756,7 @@ def _open_nrrd_cpu_payload_writer(fh: object, *, threads: Optional[int] = None) 
                     f'{max(1, nrrd_gzip_chunk_bytes() // (1024 * 1024))} MiB gzip members, '
                     'whole-layer pipelining; YOLO_TTA_NRRD_MEMBER_GZIP=0 restores the single-member writer).'
                 )
-            return _MemberParallelGzipPayloadWriter(fh)
+            return _MemberParallelGzipPayloadWriter(fh, executor=member_executor)
         if _nrrd_inprocess_gzip_self_test():
             return _ParallelGzipPayloadWriter(fh)
     return _PigzPayloadWriter(fh, threads=threads)
@@ -20571,6 +20772,240 @@ def _open_nrrd_payload_writer(fh: object, *, threads: Optional[int] = None) -> o
                 fh, engine, fallback_threads=threads,
             )
     return _open_nrrd_cpu_payload_writer(fh, threads=threads)
+
+
+# --------------------------
+# v13.3.10 (N9): measured mixed CPU/GPU DEFLATE lanes for late N7 shards
+# --------------------------
+# A dedicated CPU executor is intentionally separate from the older shared gzip pool: all
+# CPU-assigned shards (and GPU runtime fallbacks) share this ONE capped pool, so K z bands
+# cannot multiply YOLO_TTA_NRRD_DEFLATE_CPU_LANE_CORES.  Planning is post-drain and N7-only;
+# unsharded and pre-drain writers retain the established first-validated-tier behavior.
+
+
+def _nrrd_deflate_benchmark_payload(length: int) -> np.ndarray:
+    """Deterministic sparse binary data representative of component-mask payloads."""
+    payload = np.zeros((max(1, int(length)),), dtype=np.uint8)
+    payload[::97] = np.uint8(1)
+    payload[31::4096] = np.uint8(255)
+    return payload
+
+
+def _measure_nrrd_cpu_deflate_lane(
+    executor: ThreadPoolExecutor,
+    cores: int,
+) -> float:
+    """Measure aggregate member-DEFLATE+CRC throughput of the capped CPU lane once."""
+    backend, factory, crc_fn, _full_flush, eff_level = _nrrd_deflate_backend()
+    key = (int(cores), str(backend), int(eff_level), int(nrrd_gzip_chunk_bytes()))
+    with _NRRD_DEFLATE_MIX_THROUGHPUT_LOCK:
+        cached = _NRRD_DEFLATE_MIX_CPU_BPS.get(key)
+        if cached is not None:
+            return float(cached)
+        futures: List[Future] = []
+        try:
+            total = max(4 * 1024 * 1024, min(32 * 1024 * 1024, int(cores) * 2 * 1024 * 1024))
+            payload = _nrrd_deflate_benchmark_payload(total)
+            piece_bytes = max(
+                256 * 1024,
+                min(
+                    int(nrrd_gzip_chunk_bytes()),
+                    int(math.ceil(float(total) / float(max(1, int(cores) * 2)))),
+                ),
+            )
+
+            def _compress_piece(piece: bytes) -> int:
+                cobj = factory()
+                raw = cobj.compress(piece) + cobj.flush()
+                return int(len(raw)) + int(crc_fn(piece) & 0xFFFFFFFF)
+
+            # Exclude lazy worker/backend construction from the measured steady-state pass.
+            executor.submit(_compress_piece, bytes(payload[: min(piece_bytes, 64 * 1024)])).result()
+            start = time.perf_counter()
+            view = memoryview(payload).cast('B')
+            futures = [
+                executor.submit(_compress_piece, bytes(view[off:off + piece_bytes]))
+                for off in range(0, int(total), int(piece_bytes))
+            ]
+            for fut in futures:
+                fut.result()
+            elapsed = max(1.0e-9, float(time.perf_counter() - start))
+            measured = float(total) / elapsed
+        except Exception as exc:
+            for fut in futures:
+                try:
+                    fut.result()
+                except BaseException:
+                    pass
+            measured = 0.0
+            print(
+                f'Warning: N9 CPU deflate lane measurement failed ({exc}); '
+                'late NRRD shards will use the remaining validated tiers.'
+            )
+        _NRRD_DEFLATE_MIX_CPU_BPS[key] = float(measured)
+        return float(measured)
+
+
+def _measure_nrrd_gpu_deflate_lane(engine: _NvcompDeflateEngine) -> float:
+    """Measure one validated device's aggregate owner-lane nvCOMP throughput once."""
+    cache_key = int(id(engine))
+    with _NRRD_DEFLATE_MIX_THROUGHPUT_LOCK:
+        cached = _NRRD_DEFLATE_MIX_GPU_BPS.get(cache_key)
+        if cached is not None:
+            return float(cached)
+        futures: List[Future] = []
+        try:
+            chunk_bytes = int(nrrd_gpu_deflate_chunk_bytes())
+            window_bytes = max(
+                4 * 1024 * 1024,
+                min(16 * 1024 * 1024, int(chunk_bytes) * 32),
+            )
+            payload = _nrrd_deflate_benchmark_payload(window_bytes)
+            spans = [
+                (int(off), min(int(chunk_bytes), int(window_bytes) - int(off)))
+                for off in range(0, int(window_bytes), int(chunk_bytes))
+            ]
+            lanes = max(1, int(engine.stream_count))
+            start = time.perf_counter()
+            futures = [engine.submit_compress_window(payload, spans) for _ in range(int(lanes))]
+            for fut in futures:
+                raw_streams = fut.result()
+                if len(raw_streams) != len(spans):
+                    raise RuntimeError('nvCOMP benchmark returned a mismatched stream count')
+            elapsed = max(1.0e-9, float(time.perf_counter() - start))
+            measured = float(int(window_bytes) * int(lanes)) / elapsed
+        except Exception as exc:
+            for fut in futures:
+                try:
+                    fut.result()
+                except BaseException:
+                    pass
+            measured = 0.0
+            _blacklist_nrrd_gpu_deflate_engine(engine, exc)
+        _NRRD_DEFLATE_MIX_GPU_BPS[cache_key] = float(measured)
+        return float(measured)
+
+
+def _nrrd_deflate_mixed_lane_plan(
+    shard_count: int,
+) -> Tuple[
+    Optional[List[Tuple[str, Optional[_NvcompDeflateEngine]]]],
+    Optional[ThreadPoolExecutor],
+]:
+    """Return a throughput-weighted N9 lane per ordered N7 shard, or legacy ``None``."""
+    count = max(1, int(shard_count))
+    if (
+        count <= 1
+        or nrrd_deflate_mix_mode() == '0'
+        or not bool(_NRRD_GPU_DEFLATE_POST_DRAIN.is_set())
+    ):
+        return None, None
+
+    cpu_cores = int(nrrd_deflate_cpu_lane_cores())
+    if not (
+        cpu_cores > 0
+        and nrrd_inprocess_gzip_enabled()
+        and nrrd_member_gzip_enabled()
+        and _nrrd_member_gzip_self_test()
+    ):
+        # No mixed CPU member lane: preserve the legacy selector (including N8 RR) rather
+        # than forcing a GPU-only plan.
+        return None, None
+
+    gpu_engines: List[_NvcompDeflateEngine] = []
+    if nrrd_gpu_deflate_enabled():
+        # This call performs the existing per-device N8 self-tests/upgrades. Snapshot only
+        # the currently validated engine per device; superseded pre-drain engines stay out.
+        _nrrd_gpu_deflate_engine()
+        with _NRRD_GPU_DEFLATE_LOCK:
+            gpu_engines = [
+                engine
+                for device_idx, engine in sorted(_NRRD_GPU_DEFLATE_ENGINES.items())
+                if bool(_NRRD_GPU_DEFLATE_DEVICE_STATE.get(int(device_idx), False))
+            ]
+    gpu_lanes: List[Tuple[str, Optional[_NvcompDeflateEngine], float]] = []
+    for engine in gpu_engines:
+        gpu_bps = _measure_nrrd_gpu_deflate_lane(engine)
+        if gpu_bps > 0.0:
+            gpu_lanes.append(('gpu', engine, float(gpu_bps)))
+    gpu_lanes.sort(
+        key=lambda lane: (-float(lane[2]), int(lane[1].device_index)),  # type: ignore[union-attr]
+    )
+
+    if not gpu_lanes:
+        # No validated/measurable GPU lane: retain the full established CPU member pool.
+        return None, None
+
+    cpu_executor = _nrrd_deflate_mix_cpu_executor()
+    if cpu_executor is None:
+        return None, None
+    # Report/use the actual immutable pool size if the environment changed after another
+    # late layer created it.
+    cpu_cores = max(1, int(_NRRD_DEFLATE_MIX_CPU_EXECUTOR_CORES))
+    cpu_bps = _measure_nrrd_cpu_deflate_lane(cpu_executor, cpu_cores)
+    if cpu_bps <= 0.0:
+        return None, None
+    lanes: List[Tuple[str, Optional[_NvcompDeflateEngine], float]] = [
+        ('cpu', None, float(cpu_bps)),
+        *gpu_lanes,
+    ]
+
+    # Weighted round-robin over aggregate lanes. Every available lane starts at virtual
+    # time zero, so with >=2 shards both CPU and GPU engage before throughput weighting
+    # chooses repeats; all resulting part files are still concatenated by z index.
+    virtual_finish = [0.0 for _ in lanes]
+    assignments: List[Tuple[str, Optional[_NvcompDeflateEngine]]] = []
+    for _ in range(int(count)):
+        lane_idx = min(range(len(lanes)), key=lambda idx: (virtual_finish[idx], idx))
+        kind, engine, measured_bps = lanes[int(lane_idx)]
+        assignments.append((str(kind), engine))
+        virtual_finish[int(lane_idx)] += 1.0 / max(1.0, float(measured_bps))
+
+    counts: Dict[str, int] = {}
+    rates: List[str] = []
+    for kind, engine, measured_bps in lanes:
+        label = 'cpu' if kind == 'cpu' else f'cuda:{int(engine.device_index)}'  # type: ignore[union-attr]
+        counts[label] = sum(
+            1
+            for assigned_kind, assigned_engine in assignments
+            if assigned_kind == kind and assigned_engine is engine
+        )
+        rates.append(f'{label}={float(measured_bps) / (1024.0 * 1024.0):.1f} MiB/s')
+    print(
+        f'v13.3.10 (N9): mixed NRRD deflate plan for {int(count)} z shards: '
+        + ', '.join(f'{label}:{int(lane_count)}' for label, lane_count in counts.items())
+        + f' (measured {", ".join(rates)}; CPU lane cores={int(cpu_cores) if cpu_executor is not None else 0}).'
+    )
+    return assignments, cpu_executor
+
+
+def _open_nrrd_mixed_lane_payload_writer(
+    fh: object,
+    lane: Tuple[str, Optional[_NvcompDeflateEngine]],
+    *,
+    threads: Optional[int],
+    cpu_executor: Optional[ThreadPoolExecutor],
+) -> object:
+    """Open one forced N9 shard lane with configured-tier-safe CPU fallback."""
+    kind, engine = lane
+    if kind == 'gpu' and engine is not None:
+        with _NRRD_GPU_DEFLATE_LOCK:
+            engine_ok = bool(
+                _NRRD_GPU_DEFLATE_DEVICE_STATE.get(int(engine.device_index), False)
+                and _NRRD_GPU_DEFLATE_ENGINES.get(int(engine.device_index)) is engine
+            )
+        if engine_ok:
+            return _GpuDeflatePayloadWriter(
+                fh,
+                engine,
+                fallback_threads=threads,
+                fallback_member_executor=cpu_executor,
+            )
+    return _open_nrrd_cpu_payload_writer(
+        fh,
+        threads=threads,
+        member_executor=cpu_executor,
+    )
 
 def _madvise_array_mmap(arr: object, advice_name: str) -> None:
     try:
@@ -20671,7 +21106,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.6-Ultra_v13.3.9_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.6-Ultra_v13.3.10_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -20856,6 +21291,7 @@ def write_single_layer_nrrd_from_ref(
         f'v13.3.9 (N7): {out_path.name} -> {shard_count} ordered z shards '
         f'(min_slices={nrrd_layer_zshard_min_slices()}, z_chunk={shard_z_chunk}).'
     )
+    mixed_lane_plan, mixed_cpu_executor = _nrrd_deflate_mixed_lane_plan(int(shard_count))
 
     def _write_band(i: int) -> Path:
         z0, z1 = bands[int(i)]
@@ -20864,7 +21300,18 @@ def write_single_layer_nrrd_from_ref(
         # semaphore keeps two simultaneous global layers from exceeding the sink-wide budget.
         with _nrrd_zshard_semaphore():  # type: ignore[attr-defined]
             with open(part, 'wb') as pfh:
-                with _open_nrrd_payload_writer(pfh, threads=shard_pigz_threads) as payload_writer:
+                if mixed_lane_plan is None:
+                    payload_writer = _open_nrrd_payload_writer(
+                        pfh, threads=shard_pigz_threads,
+                    )
+                else:
+                    payload_writer = _open_nrrd_mixed_lane_payload_writer(
+                        pfh,
+                        mixed_lane_plan[int(i)],
+                        threads=shard_pigz_threads,
+                        cpu_executor=mixed_cpu_executor,
+                    )
+                with payload_writer:
                     _write_one_decomposed_nrrd_layer_payload(
                         ref,
                         (out_t, out_h, out_w),
@@ -21601,16 +22048,13 @@ def _drop_nrrd_raw_store_chunks_ram_cache(src: object) -> None:
     _release_raw_store_chunks_ram_cache(src.chunks_path)
 
 
-def compute_segment_extent_zyx(mask_zyx: np.ndarray) -> Tuple[int, int, int, int, int, int]:
-    """Return Slicer SegmentN_Extent as ``minI maxI minJ maxJ minK maxK``.
+def nrrd_parallel_extent_scan_enabled() -> bool:
+    """v13.3.10 (N10): parallelize exact per-slice SegmentN_Extent reductions."""
+    return _env_flag('YOLO_TTA_NRRD_PARALLEL_EXTENT_SCAN', True)
 
-    The pipeline layer is ``(t,Y,X)``.  The NRRD payload stores that as spatial
-    ``(X,Y,t)``, so Slicer I/J/K map to X/Y/t respectively.
-    """
-    src = np.asarray(mask_zyx)
-    if src.ndim != 3:
-        raise ValueError(f'compute_segment_extent_zyx expects a 3D (t,Y,X) layer, got {src.shape}')
 
+def _compute_segment_extent_zyx_serial(src: np.ndarray) -> Tuple[int, int, int, int, int, int]:
+    """The v13.3.9 extent scan, retained verbatim as N10's regression fallback."""
     t_dim, h_dim, w_dim = (int(src.shape[0]), int(src.shape[1]), int(src.shape[2]))
     min_t, max_t = t_dim, -1
     min_y, max_y = h_dim, -1
@@ -21636,6 +22080,83 @@ def compute_segment_extent_zyx(mask_zyx: np.ndarray) -> Tuple[int, int, int, int
     if max_t < 0:
         return _nrrd_empty_segment_extent()
     return (int(min_x), int(max_x), int(min_y), int(max_y), int(min_t), int(max_t))
+
+
+def compute_segment_extent_zyx(
+    mask_zyx: np.ndarray,
+    *,
+    workers: Optional[int] = None,
+) -> Tuple[int, int, int, int, int, int]:
+    """Return Slicer SegmentN_Extent as ``minI maxI minJ maxJ minK maxK``.
+
+    The pipeline layer is ``(t,Y,X)``.  The NRRD payload stores that as spatial
+    ``(X,Y,t)``, so Slicer I/J/K map to X/Y/t respectively.
+
+    v13.3.10 (N10) scans independent t-slices concurrently, records one exact y/x
+    extent per slice, then performs a deterministic scalar min/max reduction.  No
+    extent is widened: this metadata also gates payload zero skipping.  Set
+    YOLO_TTA_NRRD_PARALLEL_EXTENT_SCAN=0 for the byte-for-byte v13.3.9 control flow.
+    """
+    src = np.asarray(mask_zyx)
+    if src.ndim != 3:
+        raise ValueError(f'compute_segment_extent_zyx expects a 3D (t,Y,X) layer, got {src.shape}')
+
+    t_dim, h_dim, w_dim = (int(src.shape[0]), int(src.shape[1]), int(src.shape[2]))
+    requested_workers = max(1, int(_cpu_count() if workers is None else workers))
+    scan_workers = choose_slice_parallel_workers(int(requested_workers), int(t_dim))
+    if (
+        not nrrd_parallel_extent_scan_enabled()
+        or int(t_dim) <= 1
+        or int(scan_workers) <= 1
+    ):
+        return _compute_segment_extent_zyx_serial(src)
+
+    # [min_y, max_y, min_x, max_x] for each t slice. Empty slices retain the
+    # max<min sentinel. Each task owns one row, so there is no shared reduction race.
+    slice_bounds = np.empty((int(t_dim), 4), dtype=np.int64)
+    slice_bounds[:, 0] = np.int64(h_dim)
+    slice_bounds[:, 1] = np.int64(-1)
+    slice_bounds[:, 2] = np.int64(w_dim)
+    slice_bounds[:, 3] = np.int64(-1)
+
+    def _scan_slice(t_idx: int) -> None:
+        # Preserve the serial path's truth-value conversion exactly; the pipeline stores
+        # uint8 masks, but this also keeps the fallback-equivalence contract for any caller.
+        sl = np.asarray(src[int(t_idx)], dtype=bool)
+        if not np.any(sl):
+            return
+        row_has_fg = np.any(sl, axis=1)
+        col_has_fg = np.any(sl, axis=0)
+        ys = np.flatnonzero(row_has_fg)
+        xs = np.flatnonzero(col_has_fg)
+        if xs.size <= 0 or ys.size <= 0:
+            return
+        slice_bounds[int(t_idx), :] = (
+            int(ys[0]), int(ys[-1]), int(xs[0]), int(xs[-1]),
+        )
+
+    parallel_for_indices_chunked(
+        int(t_dim),
+        _scan_slice,
+        max_workers=int(scan_workers),
+        desc='NRRD segment extent scan',
+        show_progress=False,
+        target_chunks_per_worker=2,
+    )
+
+    nonempty = slice_bounds[:, 1] >= 0
+    nonempty_t = np.flatnonzero(nonempty)
+    if nonempty_t.size <= 0:
+        return _nrrd_empty_segment_extent()
+    active = slice_bounds[nonempty]
+    return (
+        int(np.min(active[:, 2])),
+        int(np.max(active[:, 3])),
+        int(np.min(active[:, 0])),
+        int(np.max(active[:, 1])),
+        int(nonempty_t[0]),
+        int(nonempty_t[-1]),
+    )
 
 
 def _restore_source_indices_for_output_z(in_t: int, out_t: int, out_z: int) -> List[int]:
@@ -23620,6 +24141,8 @@ def main() -> None:
     # Single-GPU keeps the full 2x budget (inference is in-process).
     worker_budget = int(main_process_worker_budget(int(gpu_device_count), bool(multi_gpu_active)))
     whole_box_worker_budget = int(default_worker_budget())
+    tail_budget_expansion_active = bool(tail_worker_budget_expansion_enabled())
+    tail_worker_budget = int(whole_box_worker_budget if tail_budget_expansion_active else worker_budget)
     augmentation_workers = resolve_worker_count(
         0,
         'YOLO_TTA_AUG_WORKERS',
@@ -23689,6 +24212,11 @@ def main() -> None:
 
     print(f'Allocated CPU count: {_cpu_count()}')
     print(f'Worker budget (main process): {worker_budget}')
+    print(
+        'Post-inference tail worker budget: '
+        f'{int(tail_worker_budget)} '
+        f'(YOLO_TTA_TAIL_WORKER_BUDGET_EXPAND={int(tail_budget_expansion_active)})'
+    )
     if bool(multi_gpu_active):
         _gpu_share = int(multi_gpu_worker_share(int(gpu_device_count)))
         print(
@@ -25415,6 +25943,19 @@ def main() -> None:
                     proc.terminate()
                 except Exception:
                     pass
+                # v13.3.10 (G7): the post-inference budget must not expand until every
+                # GPU worker has actually exited. Reap a terminated worker, escalating to
+                # SIGKILL only if it ignores the graceful termination window.
+                try:
+                    proc.join(timeout=10)
+                except Exception:
+                    pass
+                if proc.is_alive() and hasattr(proc, 'kill'):
+                    try:
+                        proc.kill()
+                        proc.join()
+                    except Exception:
+                        pass
 
     try:
         _pump_prediction_volume_build_queue()
@@ -25713,6 +26254,53 @@ def main() -> None:
     _drain_completed_prediction_accumulation_futures()
     _drain_completed_background_futures()
 
+    # v13.3.10 (G7): the scheduler's finally block above has joined every GPU worker and
+    # inference/interpolation executor.  Only now may CPU-only tail stages reclaim the CPU
+    # reservation that main_process_worker_budget() held for live GPU subprocesses.  Keep
+    # separate aliases so disabling the gate preserves explicit legacy per-stage overrides.
+    tail_slice_workers = int(
+        tail_worker_budget if tail_budget_expansion_active else slice_postprocess_workers
+    )
+    tail_output_workers = int(
+        tail_worker_budget if tail_budget_expansion_active else output_workers
+    )
+    tail_tile_slice_workers = int(
+        tail_worker_budget if tail_budget_expansion_active else tile_slice_postprocess_workers
+    )
+    tail_output_frame_workers = int(
+        max(
+            1,
+            _env_int(
+                'YOLO_TTA_OUTPUT_FRAME_WORKERS',
+                max(1, min(_cpu_count(), int(tail_output_workers))),
+            ),
+        )
+        if tail_budget_expansion_active
+        else output_frame_workers
+    )
+    if tail_budget_expansion_active and int(output_manager.max_workers) != int(tail_output_workers):
+        # BackgroundOutputManager owns a fixed-size executor.  Settle any earlier submissions
+        # before replacing it; in the current schedule none are submitted before this boundary,
+        # but waiting here keeps the transition correct if an earlier output is added later.
+        output_manager.wait()
+        output_manager = BackgroundOutputManager(max_workers=int(tail_output_workers))
+    print(
+        'v13.3.10 G7 post-inference CPU expansion: '
+        f'slice workers={int(tail_slice_workers)}, output workers={int(tail_output_workers)}, '
+        f'output frame workers={int(tail_output_frame_workers)}.'
+    )
+    if tail_budget_expansion_active:
+        spec_notes.append(
+            'v13.3.10 G7 tail CPU expansion: after GPU workers and all inference/interpolation '
+            f'executors joined, strictly post-inference stages used worker_budget={int(tail_worker_budget)}; '
+            'YOLO_TTA_TAIL_WORKER_BUDGET_EXPAND=0 restores inference-phase tail sizing.'
+        )
+    else:
+        spec_notes.append(
+            'v13.3.10 G7 tail CPU expansion was disabled by '
+            'YOLO_TTA_TAIL_WORKER_BUDGET_EXPAND=0; legacy per-stage tail sizing was retained.'
+        )
+
     if preprocess_streaming_active:
         print('Ensuring streaming preprocessing producers have completed before final output/backprojection stages.')
         wait_for_volume_ready(volume_rgb)
@@ -25812,7 +26400,7 @@ def main() -> None:
         # layer stores (I/O + memcpy bound). Run up to assemble_views_concurrency() of them
         # side by side, splitting the slice-worker budget so total thread count is unchanged.
         assemble_concurrency = max(1, min(int(assemble_views_concurrency()), len(view_assemble_jobs)))
-        per_view_workers = max(1, int(slice_postprocess_workers) // int(assemble_concurrency))
+        per_view_workers = max(1, int(tail_slice_workers) // int(assemble_concurrency))
 
         def _run_view_assembly(job: Tuple[str, 'ViewInfo', List[NrrdLayerRef]]) -> np.ndarray:
             job_model, job_view, job_refs = job
@@ -25848,7 +26436,7 @@ def main() -> None:
     if final_backprojection_jobs:
         # v12.2.11: backprojection is CPU-only, so do not halve the CPU budget for a
         # nonexistent GPU slot.  Run one set at a time with the full slice-worker budget.
-        per_backproject_workers = max(1, int(slice_postprocess_workers))
+        per_backproject_workers = max(1, int(tail_slice_workers))
         final_backprojection_jobs = [
             ViewBackprojectionQueueJob(
                 model_name=job.model_name,
@@ -25891,7 +26479,7 @@ def main() -> None:
         enable_3d_void_fill=bool(args.enable_3d_void_fill),
         keep_temp=bool(keep_temp_artifacts),
         prefer_memory=True,
-        workers=slice_postprocess_workers,
+        workers=tail_slice_workers,
         projected_layer_refs=fused_projected_layer_refs,
     )
 
@@ -25905,7 +26493,7 @@ def main() -> None:
             stage='pre_smoothing',
             description='Global union after all active view/tile layers and optional 3D void fill, before Gaussian smoothing and keep_objects.',
             temp_dir=temp_dir,
-            workers=int(slice_postprocess_workers),
+            workers=int(tail_slice_workers),
         )
         if pre_smoothing_ref is not None:
             nrrd_layer_refs.append(pre_smoothing_ref)
@@ -25920,7 +26508,7 @@ def main() -> None:
             temp_dir=temp_dir,
             keep_temp=bool(keep_temp_artifacts),
             prefer_memory=True,
-            workers=slice_postprocess_workers,
+            workers=tail_slice_workers,
             nrrd_layers=nrrd_layer_refs if bool(nrrd_layers_needed) else None,
             nrrd_model_name=str(model_name),
         )
@@ -25934,7 +26522,7 @@ def main() -> None:
             temp_dir=temp_dir,
             keep_temp=bool(keep_temp_artifacts),
             prefer_memory=True,
-            workers=slice_postprocess_workers,
+            workers=tail_slice_workers,
         )
 
     final_output_mask_mm = final_union_mm
@@ -25948,7 +26536,7 @@ def main() -> None:
             final_union_mm,
             (output_T, output_H, output_W),
             temp_dir / 'final_union_original_geometry.u8.dat',
-            workers=int(slice_postprocess_workers),
+            workers=int(tail_slice_workers),
             prefer_memory=True,
         )
     if bool(nrrd_layers_needed):
@@ -25964,7 +26552,7 @@ def main() -> None:
             stage='final_output_after_all_postprocessing',
             description='Final binary output after view/tile union, optional smoothing, optional keep_objects, and geometry restoration. Not intended for recomposition.',
             temp_dir=temp_dir,
-            workers=int(slice_postprocess_workers),
+            workers=int(tail_slice_workers),
             # v13.3.6 (N3): nothing mutates the final volume after this point (overlay/video
             # writers only read it), and it stays open until after layer_sink.wait() — the
             # sink streams it directly instead of a store encode + read-back.
@@ -26016,11 +26604,11 @@ def main() -> None:
         save_labels_pattern_value=args.save_labels,
         save_nrrd_flag=bool(args.save_nrrd),
         tag=None,
-        frame_workers=output_frame_workers,
+        frame_workers=tail_output_frame_workers,
         show_progress=False,
         nrrd_layer_refs=nrrd_layer_refs if bool(args.save_nrrd) else None,
         nrrd_temp_dir=temp_dir,
-        nrrd_workers=output_frame_workers,
+        nrrd_workers=tail_output_frame_workers,
     )
     final_paths.update(final_output_paths)
     output_manager.submit(BackgroundOutputSubmission(
@@ -26042,7 +26630,7 @@ def main() -> None:
             downbin_specs=low_quality_downbin_specs,
             temp_dir=temp_dir,
             save_nrrd=bool(args.save_nrrd),
-            workers=output_workers,
+            workers=tail_output_workers,
             show_progress=False,
         )
         final_paths.update(low_quality_paths)
@@ -26063,7 +26651,7 @@ def main() -> None:
         parallel_for_indices(
             int(final_output_mask_mm.shape[0]),
             _count_voxels,
-            max_workers=choose_slice_parallel_workers(int(slice_postprocess_workers), int(final_output_mask_mm.shape[0])),
+            max_workers=choose_slice_parallel_workers(int(tail_slice_workers), int(final_output_mask_mm.shape[0])),
             desc='Counting voxel_volume',
         )
         voxel_volume = int(np.sum(voxel_counts, dtype=np.int64))
@@ -26098,7 +26686,7 @@ def main() -> None:
                 view=view,
                 out_dir=out_dir,
                 stem=input_path.stem,
-                workers=output_frame_workers,
+                workers=tail_output_frame_workers,
                 show_progress=False,
             )
             final_paths[f'{view.name}_images_dir'] = image_dir
@@ -26152,7 +26740,7 @@ def main() -> None:
         augmentation_workers=augmentation_workers,
         slice_postprocess_workers=slice_postprocess_workers,
         interpolation_workers=interpolation_workers,
-        output_workers=output_workers,
+        output_workers=tail_output_workers,
         spec_notes=spec_notes,
     )
 
@@ -26187,7 +26775,7 @@ def main() -> None:
         archive_or_delete_binary_volume_storage(
             mm,
             keep_temp=bool(keep_temp_artifacts),
-            workers=int(tile_slice_postprocess_workers),
+            workers=int(tail_tile_slice_workers),
             desc='remaining tile config accumulator',
         )
     tile_config_accumulator_by_key.clear()
@@ -26195,7 +26783,7 @@ def main() -> None:
         archive_or_delete_binary_volume_storage(
             mm,
             keep_temp=bool(keep_temp_artifacts),
-            workers=int(tile_slice_postprocess_workers),
+            workers=int(tail_tile_slice_workers),
             desc='remaining consolidated tile accumulator',
         )
     tile_accumulator_by_parent.clear()
@@ -26203,7 +26791,7 @@ def main() -> None:
         archive_or_delete_binary_volume_storage(
             mm,
             keep_temp=bool(keep_temp_artifacts),
-            workers=int(tile_slice_postprocess_workers),
+            workers=int(tail_tile_slice_workers),
             desc='remaining parent-mask tile category accumulator',
         )
     tile_parent_mask_accumulator_by_parent.clear()
@@ -26211,7 +26799,7 @@ def main() -> None:
         archive_or_delete_binary_volume_storage(
             mm,
             keep_temp=bool(keep_temp_artifacts),
-            workers=int(tile_slice_postprocess_workers),
+            workers=int(tail_tile_slice_workers),
             desc='remaining parent-bridge tile category accumulator',
         )
     tile_parent_bridge_accumulator_by_parent.clear()
@@ -26262,4 +26850,16 @@ if __name__ == "__main__":
         # v13.2.2 bug #7: cancel background streaming producers so a failing run exits
         # promptly instead of blocking interpreter shutdown behind a multi-hour decode.
         abort_streaming_producers('fatal error in main()')
+        # v13.3.10 (N9): a tail write failure must settle the layer-sink tasks before
+        # releasing their nvCOMP engines and the shared capped CPU lane.  The success path
+        # performs the same ordering explicitly; this fatal path prevents executor/engine
+        # leaks while preserving the original exception.
+        fatal_layer_sink = nrrd_layer_sink()
+        if fatal_layer_sink is not None:
+            try:
+                fatal_layer_sink.shutdown()
+            except Exception:
+                pass
+            set_nrrd_layer_sink(None)
+        shutdown_nrrd_gpu_deflate_engines()
         raise
