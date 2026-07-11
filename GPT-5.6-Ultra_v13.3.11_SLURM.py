@@ -2,8 +2,33 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the GPT-5.6-Ultra v13.3.10_SLURM implementation. It is derived from
-GPT-5.6-Ultra_v13.3.9_SLURM.py by COPY + surgical edits implementing the supplied task list:
+This is the GPT-5.6-Ultra v13.3.11_SLURM implementation. It is derived from
+GPT-5.6-Ultra_v13.3.10_SLURM.py by COPY + surgical edits implementing the supplied task list:
+  - v13.3.11 (P1/P4) pipelines the fixed batch-1, angle-0 resident-render path through a
+    persistent two-slot device ring: low-priority rendering, high-priority TensorRT enqueue,
+    and a separate mask/warp/union stream use preallocated tensors, metadata, and CUDA events.
+    Static-address CUDA Graph capture and a second TensorRT execution context are enabled only
+    after capability validation; either optimization falls back independently without changing
+    results. Device compaction replaces the confidence nonzero()/tolist() host-synchronization
+    path in the specialized loop.
+  - v13.3.11 (N11) streams native raw-bbox cvol layers directly into 8--16 MiB gzip members:
+    wholly empty members use the cached zero member, while only intersecting members are
+    allocated and populated from indexed crop rows. Sparse-weighted z bands, shared read-only
+    payload mappings, a process-global fill pool, and an ordered direct shard sink remove the
+    former dense-slice rebuild, multi-GiB read_bytes copy, per-shard part files, and multiplied
+    fill pools.
+  - v13.3.11 (N12) carries projected blocks and low-quality mirrors through device-aware
+    compression hand-offs where supported, avoiding the D2H->H2D bounce; all unsupported
+    nvCOMP/torch combinations retain the validated host writer path.
+  - v13.3.11 (R22) carries bridge row-occupancy/bbox metadata from interpolation into radial
+    projection, stages radial rows in t-major order, vectorizes the per-t GPU reduction, and
+    raises projection chunks to 128 (configurable to 256) to remove the sparse bridge access
+    pathology.
+  - v13.3.11 (N13) passes CRC functions an explicit contiguous bytes-like view (fixing the
+    identical zero CRC seen on every GPU), fuses CPU member zero-detection/CRC/deflate work,
+    drains a sequence-indexed completion map, and reports the selected ISA-L or zlib backend.
+
+Inherited from v13.3.10:
   - v13.3.10 (T6) retains each accepted bridge plan's exact min-radius scan sections
     and reuses them during painting. YOLO_TTA_INTERPOLATION_CACHE_BRIDGE_SECTIONS=0
     restores render-time recomputation.
@@ -9039,10 +9064,218 @@ def _process_prediction_frame(
 # batch is consumed, and mid-stream layout errors raise (they indicate a wrong model type).
 
 _DIRECT_PREDICT_ANNOUNCED = False
+_RESIDENT_TRT_RING_ANNOUNCED = False
+_RESIDENT_TRT_RING_FALLBACK_WARNED = False
 
 
 def direct_predict_enabled() -> bool:
     return _env_flag('YOLO_TTA_DIRECT_PREDICT', True)
+
+
+def resident_trt_ring_enabled() -> bool:
+    """Enable the fixed batch-1 resident-render TensorRT pipeline."""
+    return _env_flag('YOLO_TTA_RESIDENT_TRT_RING', True)
+
+
+def resident_trt_cuda_graphs_enabled() -> bool:
+    """Capture each ring slot's static TensorRT and mask-decode launches when supported."""
+    return _env_flag('YOLO_TTA_RESIDENT_TRT_CUDA_GRAPHS', True)
+
+
+def _cuda_stream_priority(torch_mod: object, *, high: bool) -> int:
+    """Return a supported CUDA stream priority, tolerating older torch builds.
+
+    torch reports ``(least_priority, greatest_priority)``; CUDA uses smaller numeric
+    values for higher priority.  A zero priority is universally valid.
+    """
+    try:
+        least, greatest = torch_mod.cuda.get_stream_priority_range()
+        return int(greatest if bool(high) else least)
+    except Exception:
+        return -1 if bool(high) else 0
+
+
+class _ResidentGpuPipelineSlot:
+    """One static-address input/output/event slot in the resident two-entry ring."""
+
+    def __init__(self, torch_mod: object, device: object, out_size: int, half: bool, slot_id: int) -> None:
+        self.slot_id = int(slot_id)
+        self.input = torch_mod.empty(
+            (1, 1, int(out_size), int(out_size)),
+            dtype=torch_mod.float16 if bool(half) else torch_mod.float32,
+            device=device,
+        )
+        # Distinct high-priority streams allow the two TensorRT execution contexts to
+        # overlap.  Mask decode/quantize/union uses a third, ordinary-priority stream.
+        high_priority = _cuda_stream_priority(torch_mod, high=True)
+        low_priority = _cuda_stream_priority(torch_mod, high=False)
+        self.infer_stream = torch_mod.cuda.Stream(device=device, priority=high_priority)
+        self.post_stream = torch_mod.cuda.Stream(device=device, priority=low_priority)
+        # Events are allocated once and re-recorded.  render_done protects input reads,
+        # infer_done protects input reuse, and post_done protects output-binding reuse.
+        self.render_done = torch_mod.cuda.Event(enable_timing=False, blocking=False)
+        self.infer_done = torch_mod.cuda.Event(enable_timing=False, blocking=False)
+        self.post_done = torch_mod.cuda.Event(enable_timing=False, blocking=False)
+        self.infer_valid = False
+        self.post_valid = False
+        self.frame_index = -1
+        self.absolute_index = -1
+        self.synthetic = False
+        self.context = None
+        self.binding_addresses: Optional[List[int]] = None
+        self.head = None
+        self.proto = None
+        self.compact_indices = None
+        self.compact_count = None
+        self.max_logit = None
+        self.conf_proto = None
+        self.native_union = None
+        self.native_conf = None
+        self.infer_graph = None
+        self.post_graph = None
+        # Keep zero-copy cupy array views alive for the lifetime of captured graphs.
+        self._cupy_refs: Dict[str, object] = {}
+
+
+_RESIDENT_MASK_KERNELS: Optional[object] = None
+_RESIDENT_MASK_KERNELS_FAILED = False
+
+
+def _resident_mask_kernels() -> Optional[object]:
+    """Compile the small device compaction/proto-union kernels once with NVRTC.
+
+    The compaction count remains in device memory.  The following proto kernel reads
+    that count directly, so there is no per-frame ``nonzero()``, ``tolist()`` or count
+    readback.  CuPy is already an optional dependency of the GPU cleanup path; failure
+    to import/compile it simply disables this stricter fast path.
+    """
+    global _RESIDENT_MASK_KERNELS, _RESIDENT_MASK_KERNELS_FAILED
+    if _RESIDENT_MASK_KERNELS is not None:
+        return _RESIDENT_MASK_KERNELS
+    if _RESIDENT_MASK_KERNELS_FAILED:
+        return None
+    try:
+        import cupy as cp  # type: ignore
+        src = r'''
+        #include <cuda_fp16.h>
+        extern "C" __global__ void compact_f32(
+            const float* head, int anchors, float threshold, int* indices, int* count) {
+          int a = blockDim.x * blockIdx.x + threadIdx.x;
+          if (a < anchors && head[4 * anchors + a] >= threshold) {
+            int dst = atomicAdd(count, 1);
+            indices[dst] = a;
+          }
+        }
+        extern "C" __global__ void compact_f16(
+            const half* head, int anchors, float threshold, int* indices, int* count) {
+          int a = blockDim.x * blockIdx.x + threadIdx.x;
+          if (a < anchors && __half2float(head[4 * anchors + a]) >= threshold) {
+            int dst = atomicAdd(count, 1);
+            indices[dst] = a;
+          }
+        }
+
+        __device__ __forceinline__ float rd(const float* p, int i) { return p[i]; }
+        __device__ __forceinline__ float rd(const half* p, int i) { return __half2float(p[i]); }
+
+        template <typename H, typename P>
+        __device__ void proto_union_body(
+            const H* head, const P* proto, const int* indices, const int* count,
+            int anchors, int masks, int ph, int pw, int ih, int iw,
+            float* max_logit, float* conf_proto) {
+          int p = blockDim.x * blockIdx.x + threadIdx.x;
+          int pixels = ph * pw;
+          if (p >= pixels) return;
+          int y = p / pw;
+          int x = p - y * pw;
+          float best = -6.0f;
+          float best_conf = 0.0f;
+          int n = *count;
+          for (int j = 0; j < n; ++j) {
+            int a = indices[j];
+            float cx = rd(head, 0 * anchors + a);
+            float cy = rd(head, 1 * anchors + a);
+            float bw = rd(head, 2 * anchors + a);
+            float bh = rd(head, 3 * anchors + a);
+            float x1 = (cx - 0.5f * bw) * ((float)pw / (float)iw);
+            float y1 = (cy - 0.5f * bh) * ((float)ph / (float)ih);
+            float x2 = (cx + 0.5f * bw) * ((float)pw / (float)iw);
+            float y2 = (cy + 0.5f * bh) * ((float)ph / (float)ih);
+            if ((float)x < x1 || (float)x >= x2 || (float)y < y1 || (float)y >= y2) continue;
+            float logit = 0.0f;
+            #pragma unroll 4
+            for (int c = 0; c < masks; ++c) {
+              logit += rd(head, (5 + c) * anchors + a) * rd(proto, c * pixels + p);
+            }
+            best = fmaxf(best, logit);
+            if (conf_proto != nullptr && logit > 0.0f) {
+              best_conf = fmaxf(best_conf, rd(head, 4 * anchors + a));
+            }
+          }
+          max_logit[p] = best;
+          if (conf_proto != nullptr) conf_proto[p] = best_conf;
+        }
+
+        #define DECL_UNION(NAME, HT, PT) \
+        extern "C" __global__ void NAME( \
+            const HT* head, const PT* proto, const int* indices, const int* count, \
+            int anchors, int masks, int ph, int pw, int ih, int iw, \
+            float* max_logit, float* conf_proto) { \
+          proto_union_body(head, proto, indices, count, anchors, masks, ph, pw, ih, iw, \
+                           max_logit, conf_proto); \
+        }
+        DECL_UNION(union_f32_f32, float, float)
+        DECL_UNION(union_f32_f16, float, half)
+        DECL_UNION(union_f16_f32, half, float)
+        DECL_UNION(union_f16_f16, half, half)
+
+        extern "C" __global__ void upsample_quantize(
+            const float* max_logit, const float* conf_proto,
+            int ph, int pw, int oh, int ow, unsigned char* out_union,
+            unsigned char* out_conf) {
+          int q = blockDim.x * blockIdx.x + threadIdx.x;
+          int out_pixels = oh * ow;
+          if (q >= out_pixels) return;
+          int oy = q / ow;
+          int ox = q - oy * ow;
+          float sy = ((float)oy + 0.5f) * ((float)ph / (float)oh) - 0.5f;
+          float sx = ((float)ox + 0.5f) * ((float)pw / (float)ow) - 0.5f;
+          int y0r = (int)floorf(sy), x0r = (int)floorf(sx);
+          float fy = sy - (float)y0r, fx = sx - (float)x0r;
+          int y0 = max(0, min(ph - 1, y0r));
+          int x0 = max(0, min(pw - 1, x0r));
+          int y1 = max(0, min(ph - 1, y0r + 1));
+          int x1 = max(0, min(pw - 1, x0r + 1));
+          float v00 = max_logit[y0 * pw + x0];
+          float v01 = max_logit[y0 * pw + x1];
+          float v10 = max_logit[y1 * pw + x0];
+          float v11 = max_logit[y1 * pw + x1];
+          float v0 = v00 + fx * (v01 - v00);
+          float v1 = v10 + fx * (v11 - v10);
+          unsigned char fg = (v0 + fy * (v1 - v0)) > 0.0f ? 1 : 0;
+          out_union[q] = fg;
+          if (out_conf != nullptr) {
+            int ny = min(ph - 1, (int)((long long)oy * ph / oh));
+            int nx = min(pw - 1, (int)((long long)ox * pw / ow));
+            float cf = fminf(1.0f, fmaxf(0.0f, conf_proto[ny * pw + nx]));
+            out_conf[q] = fg ? (unsigned char)__float2uint_rn(cf * 255.0f) : 0;
+          }
+        }
+        '''
+        names = (
+            'compact_f32', 'compact_f16',
+            'union_f32_f32', 'union_f32_f16', 'union_f16_f32', 'union_f16_f16',
+            'upsample_quantize',
+        )
+        module = cp.RawModule(code=src, options=('--std=c++11',), name_expressions=names)
+        _RESIDENT_MASK_KERNELS = argparse.Namespace(
+            cp=cp,
+            **{name: module.get_function(name) for name in names},
+        )
+        return _RESIDENT_MASK_KERNELS
+    except Exception:
+        _RESIDENT_MASK_KERNELS_FAILED = True
+        return None
 
 
 class _DirectPredictResult:
@@ -9301,6 +9534,7 @@ def predict_source_and_accumulate(
         # v13.3.6 (C2): drive the backend directly on the proto-union fast path; fall back
         # to Ultralytics stream_inference when the direct loop's preconditions do not hold.
         results = None
+        predictor_direct = None
         if not use_custom_cpu_retina and _direct_predict_applicable(cfg):
             predictor_direct = _ensure_predictor_for_direct_predict(model, cfg)
             if predictor_direct is not None:
@@ -9352,6 +9586,26 @@ def predict_source_and_accumulate(
                     f'Device union accumulation active for {source_label}: '
                     f'{int(num_frames)}x{int(native_h)}x{int(native_w)} u8 on device (v13.3.2 R21).'
                 )
+
+        # Fixed batch-1, angle-0, resident-render path: run render -> TensorRT ->
+        # confidence compaction/proto union -> native task union as one device pipeline.
+        # It consumes no Results objects and dispatches no per-frame Futures. Capability
+        # rejection happens before source consumption and leaves ``results`` untouched.
+        specialized_stats: Optional[Dict[str, int]] = None
+        if predictor_direct is not None:
+            specialized_stats = _try_resident_trt_ring_accumulate(
+                predictor_direct, source, cfg,
+                source_label=source_label,
+                num_frames=int(num_frames),
+                out_size=int(out_size),
+                M_out_to_native=M_out_to_native,
+                native_h=int(native_h),
+                native_w=int(native_w),
+                device_union=device_union,
+            )
+            if specialized_stats is not None:
+                prediction_count = int(specialized_stats['prediction_count'])
+                frames_with_predictions = int(specialized_stats['frames_with_predictions'])
 
         def _process_prediction_unit(idx_i: int, masks_obj: Optional[object], confs_arr: Optional[np.ndarray]) -> Tuple[int, int]:
             slice_lock = None
@@ -9411,7 +9665,10 @@ def predict_source_and_accumulate(
         if gpu_flatten_eager:
             effective_pending_limit = max(1, min(int(pending_limit), gpu_retina_flatten_pending_limit(worker_count)))
 
-        if worker_count <= 1:
+        if specialized_stats is not None:
+            # The resident ring wrote the device union and task metadata directly.
+            pass
+        elif worker_count <= 1:
             for idx, r in enumerate(results):
                 if idx >= num_frames:
                     # Synthetic final-batch padding is required for fixed-batch inference engines;
@@ -10336,8 +10593,12 @@ class _GpuWorkerRenderEngine:
         self.device = torch.device(str(device_str))
         if self.device.type != 'cuda' or not torch.cuda.is_available():
             raise RuntimeError('GPU render engine requires a CUDA device')
-        # All renders run on a dedicated stream; consumers order via the batch ready event.
-        self._stream = torch.cuda.Stream(device=self.device)
+        # All renders run on a dedicated LOW-priority stream; the resident batch-1 ring
+        # gives TensorRT distinct high-priority streams so frame n inference can preempt/
+        # overlap frame n+1 rendering. Consumers order through per-slot events.
+        self._stream = torch.cuda.Stream(
+            device=self.device, priority=_cuda_stream_priority(torch, high=False),
+        )
         self._volume_key: Optional[Tuple[str, Tuple[int, int, int], int]] = None
         self._volume_mm: Optional[np.ndarray] = None
         self._volume_gpu: Optional[object] = None
@@ -10834,6 +11095,32 @@ class _GpuWorkerRenderEngine:
             ready_event.record(self._stream)
         return batch, ready_event
 
+    def render_fullframe_into_ring_slot(
+        self,
+        slot: _ResidentGpuPipelineSlot,
+        view: ViewInfo,
+        job: AugJob,
+        frame_index: int,
+        out_size: int,
+    ) -> None:
+        """Render/normalize one frame into a slot's persistent TensorRT input address."""
+        torch = self.torch
+        if tuple(int(x) for x in slot.input.shape) != (1, 1, int(out_size), int(out_size)):
+            raise RuntimeError(
+                f'resident ring input shape {tuple(slot.input.shape)} != (1,1,{int(out_size)},{int(out_size)})'
+            )
+        with torch.cuda.stream(self._stream):
+            if bool(slot.infer_valid):
+                # This slot's preceding TensorRT enqueue has consumed its input before
+                # the low-priority renderer writes the next frame into the same address.
+                self._stream.wait_event(slot.infer_done)
+            plane = self._render_fullframe_frame(view, job.aff, int(frame_index), int(out_size))
+            # Renderers return disposable float planes. Normalize in place and convert
+            # directly into the preallocated fp16/fp32 binding (no stack/cast allocation).
+            plane.clamp_(0.0, 255.0).mul_(1.0 / 255.0)
+            slot.input[0, 0].copy_(plane, non_blocking=True)
+            slot.render_done.record(self._stream)
+
 
 class GpuRenderedYoloSource:
     """Ultralytics-compatible source whose batches are rendered AND normalized on the GPU.
@@ -10871,6 +11158,8 @@ class GpuRenderedYoloSource:
         self.synthetic_count = max(0, int(self.yield_nf) - int(self.nf))
         self.mode = 'image'
         self.count = 0
+        self._direct_count = 0
+        self._direct_ring: Optional[List[_ResidentGpuPipelineSlot]] = None
         self._fake_frame = np.broadcast_to(
             np.zeros((1, 1, 1), dtype=np.uint8), (self.out_size, self.out_size, 1),
         )
@@ -10888,6 +11177,7 @@ class GpuRenderedYoloSource:
 
     def __iter__(self) -> 'GpuRenderedYoloSource':
         self.count = 0
+        self._direct_count = 0
         return self
 
     def start(self) -> None:
@@ -10895,6 +11185,53 @@ class GpuRenderedYoloSource:
 
     def close(self) -> None:
         return None
+
+    def prepare_direct_ring(self) -> List[_ResidentGpuPipelineSlot]:
+        """Allocate (once) the fixed two-entry resident batch-1 device ring."""
+        if self.bs != 1 or self.nf <= 0 or str(getattr(self.engine, '_mode', '')) != 'resident':
+            raise RuntimeError('direct resident ring requires a nonempty batch-1 resident source')
+        if self._direct_ring is None:
+            torch = self.engine.torch
+            self._direct_ring = [
+                _ResidentGpuPipelineSlot(
+                    torch, self.engine.device, int(self.out_size), bool(self.half), slot_id=i,
+                )
+                for i in range(2)
+            ]
+        self._direct_count = 0
+        self.count = 0
+        return self._direct_ring
+
+    def reset_direct_ring(self) -> None:
+        """Reset source position after a pre-consumption capability probe failed."""
+        self._direct_count = 0
+        self.count = 0
+        # The generic fallback never uses these buffers. Drop a rejected probe's static
+        # bindings/events immediately so a capability mismatch does not reserve VRAM for
+        # the remainder of the worker process.
+        self._direct_ring = None
+
+    def next_direct_slot(self) -> Optional[Tuple[int, _ResidentGpuPipelineSlot]]:
+        """Queue one render without constructing paths/info/source tuples.
+
+        This entry point belongs exclusively to the specialized accumulator.  Generic
+        Ultralytics/direct iterators continue to use ``__next__`` unchanged.
+        """
+        if self._direct_ring is None:
+            raise RuntimeError('direct resident ring has not been prepared')
+        if int(self._direct_count) >= int(self.nf):
+            return None
+        local_index = int(self._direct_count)
+        absolute_index = int(self.slice_offset) + local_index
+        slot = self._direct_ring[local_index & 1]
+        slot.frame_index = int(local_index)
+        slot.absolute_index = int(absolute_index)
+        slot.synthetic = False
+        self.engine.render_fullframe_into_ring_slot(
+            slot, self.view, self.job, int(absolute_index), int(self.out_size),
+        )
+        self._direct_count += 1
+        return int(local_index), slot
 
     def __next__(self) -> Tuple[List[str], object, List[str]]:
         if self.count >= self.yield_nf or self.nf <= 0:
@@ -12875,6 +13212,730 @@ def gpu_backproject_enabled() -> bool:
     return _env_flag('YOLO_TTA_GPU_BACKPROJECT', True)
 
 
+def _validated_radial_slice_bboxes(
+    value: Optional[np.ndarray],
+    n_az: int,
+    work_t: int,
+    u_len: int,
+) -> Optional[np.ndarray]:
+    """Validate interpolation-carried ``(t0,t1,u0,u1)`` bounds for radial planes."""
+    if value is None:
+        return None
+    try:
+        bboxes = np.asarray(value, dtype=np.int64)
+    except Exception:
+        return None
+    if tuple(int(v) for v in bboxes.shape) != (int(n_az), 4):
+        return None
+    valid = (
+        (bboxes[:, 0] >= 0) & (bboxes[:, 0] <= bboxes[:, 1]) & (bboxes[:, 1] <= int(work_t))
+        & (bboxes[:, 2] >= 0) & (bboxes[:, 2] <= bboxes[:, 3]) & (bboxes[:, 3] <= int(u_len))
+    )
+    if not bool(np.all(valid)):
+        return None
+    return np.ascontiguousarray(bboxes)
+
+
+def _trt_engine_from_autobackend(backend: object) -> Optional[object]:
+    """Find the ICudaEngine without relying on one Ultralytics release's attribute names."""
+    candidates = [
+        getattr(backend, 'model', None),
+        getattr(backend, 'trt_engine', None),
+        getattr(backend, '_engine', None),
+        getattr(getattr(backend, 'context', None), 'engine', None),
+    ]
+    for candidate in candidates:
+        if candidate is None or isinstance(candidate, (bool, str, Path)):
+            continue
+        if callable(getattr(candidate, 'create_execution_context', None)):
+            return candidate
+    return None
+
+
+def _torch_dtype_for_trt_binding(backend: object, engine: object, name: str, torch_mod: object) -> Optional[object]:
+    """Resolve a binding dtype, preferring AutoBackend's already-validated torch buffers."""
+    try:
+        binding = getattr(backend, 'bindings', {}).get(str(name))
+        data = getattr(binding, 'data', None)
+        if data is not None and getattr(data, 'dtype', None) is not None:
+            return data.dtype
+    except Exception:
+        pass
+    try:
+        import tensorrt as trt  # type: ignore
+        dtype_obj = (
+            engine.get_tensor_dtype(str(name))
+            if callable(getattr(engine, 'get_tensor_dtype', None))
+            else engine.get_binding_dtype(int(engine.get_binding_index(str(name))))
+        )
+        np_dtype = np.dtype(trt.nptype(dtype_obj))
+        mapping = {
+            np.dtype(np.float16): torch_mod.float16,
+            np.dtype(np.float32): torch_mod.float32,
+            np.dtype(np.int8): torch_mod.int8,
+            np.dtype(np.int32): torch_mod.int32,
+            np.dtype(np.int64): torch_mod.int64,
+            np.dtype(np.bool_): torch_mod.bool,
+        }
+        return mapping.get(np_dtype)
+    except Exception:
+        return None
+
+
+class _ResidentTensorRTRingExecutor:
+    """Two independent TensorRT contexts with static input/output addresses.
+
+    This adapter intentionally uses TensorRT's public execution-context API instead of
+    swapping ``AutoBackend.context`` in place.  If the engine, binding metadata, async
+    API, or fixed shapes cannot be proved safe, construction fails before source
+    consumption and the caller retains the ordinary direct-predict path.
+    """
+
+    def __init__(
+        self,
+        backend: object,
+        slots: Sequence[_ResidentGpuPipelineSlot],
+        *,
+        out_size: int,
+        track_conf: bool,
+        confidence_threshold: float,
+    ) -> None:
+        import torch  # type: ignore
+        self.torch = torch
+        self.backend = backend
+        self.engine = _trt_engine_from_autobackend(backend)
+        if self.engine is None:
+            raise RuntimeError('AutoBackend does not expose a TensorRT ICudaEngine')
+        if len(slots) != 2:
+            raise RuntimeError('resident TensorRT ring requires exactly two slots')
+        self.slots = list(slots)
+        self.out_size = int(out_size)
+        self.track_conf = bool(track_conf)
+        self.confidence_threshold = float(confidence_threshold)
+        self.kernels = _resident_mask_kernels()
+        if self.kernels is None:
+            raise RuntimeError('CUDA confidence-compaction kernel is unavailable')
+
+        self.binding_names, self.input_name, self.output_names, self.binding_indices = self._binding_layout()
+        if len(self.output_names) < 2:
+            raise RuntimeError(f'TensorRT segmentation engine exposes only {len(self.output_names)} outputs')
+        input_dtype = _torch_dtype_for_trt_binding(backend, self.engine, self.input_name, torch)
+        if input_dtype is None or input_dtype != self.slots[0].input.dtype:
+            raise RuntimeError(
+                f'TensorRT input dtype {input_dtype} does not match resident ring dtype {self.slots[0].input.dtype}'
+            )
+
+        # AutoBackend already owns one context. Borrow it plus ONE new context so the
+        # worker has two total (not three profile-sized context allocations).  v3 tensor
+        # addresses are restored before returning control to AutoBackend.
+        original_context = getattr(backend, 'context', None)
+        if original_context is None:
+            raise RuntimeError('AutoBackend does not expose its primary TensorRT context')
+        second_context = self.engine.create_execution_context()
+        if second_context is None:
+            raise RuntimeError('TensorRT could not allocate a second independent execution context')
+        contexts: List[object] = [original_context, second_context]
+        if contexts[0] is contexts[1]:
+            raise RuntimeError('TensorRT returned an aliased execution context')
+
+        self._borrowed_context = original_context
+        self._restore_tensor_addresses: Dict[str, int] = {}
+        if callable(getattr(original_context, 'set_tensor_address', None)):
+            for name in self.binding_names:
+                binding = getattr(backend, 'bindings', {}).get(str(name))
+                data = getattr(binding, 'data', None)
+                if data is None or not callable(getattr(data, 'data_ptr', None)):
+                    raise RuntimeError(
+                        f'cannot safely restore AutoBackend TensorRT address for {name!r}'
+                    )
+                self._restore_tensor_addresses[name] = int(data.data_ptr())
+
+        self.infer_graph_count = 0
+        self.post_graph_count = 0
+        try:
+            for slot, context in zip(self.slots, contexts):
+                slot.context = context
+                output_tensors = self._configure_context_and_buffers(slot)
+                split = _split_segmentation_backend_outputs(output_tensors)
+                if split is None:
+                    # Output order is not guaranteed across TensorRT exporter versions; identify
+                    # the detection head/proto by rank, then preserve the direct-loop contract.
+                    rank3 = [x for x in output_tensors if int(getattr(x, 'ndim', 0)) == 3]
+                    rank4 = [x for x in output_tensors if int(getattr(x, 'ndim', 0)) == 4]
+                    if len(rank3) != 1 or len(rank4) != 1:
+                        raise RuntimeError('TensorRT outputs cannot be identified as head + proto')
+                    split = (rank3[0], rank4[0])
+                slot.head, slot.proto = split
+                self._allocate_post_buffers(slot)
+
+            # Shape/layout invariants for the user's single-class segmentation engines.
+            for slot in self.slots:
+                head, proto = slot.head, slot.proto
+                if int(head.shape[0]) != 1 or int(proto.shape[0]) != 1:
+                    raise RuntimeError('resident TensorRT ring is fixed to batch 1')
+                nm = int(proto.shape[1])
+                if int(head.shape[1]) != 5 + nm:
+                    raise RuntimeError(
+                        f'resident TensorRT ring requires one class (head={tuple(head.shape)}, proto={tuple(proto.shape)})'
+                    )
+                if tuple(int(x) for x in head.shape) != tuple(int(x) for x in self.slots[0].head.shape):
+                    raise RuntimeError('TensorRT ring contexts returned different head shapes')
+                if tuple(int(x) for x in proto.shape) != tuple(int(x) for x in self.slots[0].proto.shape):
+                    raise RuntimeError('TensorRT ring contexts returned different proto shapes')
+
+            # Prove that both contexts may be in flight on distinct streams before the
+            # source is consumed. Dynamic-profile restrictions and plugin stream-safety
+            # failures surface at stream synchronization and cleanly reject this fast path.
+            self._validate_concurrent_contexts()
+            if resident_trt_cuda_graphs_enabled():
+                self._capture_static_graphs()
+        except Exception:
+            self.close()
+            raise
+
+    def _binding_layout(self) -> Tuple[List[str], str, List[str], Dict[str, int]]:
+        engine = self.engine
+        names: List[str] = []
+        indices: Dict[str, int] = {}
+        if callable(getattr(engine, 'get_tensor_name', None)):
+            count = int(getattr(engine, 'num_io_tensors'))
+            for i in range(count):
+                name = str(engine.get_tensor_name(i))
+                names.append(name)
+                indices[name] = int(i)
+        elif callable(getattr(engine, 'get_binding_name', None)):
+            count = int(getattr(engine, 'num_bindings'))
+            for i in range(count):
+                name = str(engine.get_binding_name(i))
+                names.append(name)
+                indices[name] = int(i)
+        else:
+            raise RuntimeError('unknown TensorRT binding API')
+
+        backend_outputs = [str(x) for x in (getattr(self.backend, 'output_names', None) or [])]
+        input_name = str(getattr(self.backend, 'input_name', '') or '')
+        if input_name not in names:
+            input_candidates: List[str] = []
+            for name in names:
+                try:
+                    if callable(getattr(engine, 'binding_is_input', None)):
+                        is_input = bool(engine.binding_is_input(indices[name]))
+                    else:
+                        is_input = 'INPUT' in str(engine.get_tensor_mode(name)).upper()
+                    if is_input:
+                        input_candidates.append(name)
+                except Exception:
+                    pass
+            if len(input_candidates) != 1:
+                # AutoBackend bindings are still a reliable final discriminator: outputs
+                # are named explicitly and a segmentation engine has one image input.
+                input_candidates = [name for name in names if name not in set(backend_outputs)]
+            if len(input_candidates) != 1:
+                raise RuntimeError(f'expected one TensorRT image input, found {input_candidates}')
+            input_name = input_candidates[0]
+        output_names = [name for name in backend_outputs if name in names]
+        if not output_names:
+            output_names = [name for name in names if name != input_name]
+        if set(output_names) | {input_name} != set(names):
+            # Shape/control bindings would require separate static values; do not guess.
+            raise RuntimeError('TensorRT engine has auxiliary bindings unsupported by the resident ring')
+        return names, input_name, output_names, indices
+
+    def _set_input_shape(self, context: object, slot: _ResidentGpuPipelineSlot) -> None:
+        shape = tuple(int(x) for x in slot.input.shape)
+        if callable(getattr(context, 'set_input_shape', None)):
+            ok = context.set_input_shape(self.input_name, shape)
+            if ok is False:
+                raise RuntimeError(f'TensorRT rejected static input shape {shape}')
+        elif callable(getattr(context, 'set_binding_shape', None)):
+            ok = context.set_binding_shape(self.binding_indices[self.input_name], shape)
+            if ok is False:
+                raise RuntimeError(f'TensorRT rejected static binding shape {shape}')
+
+    def _context_shape(self, context: object, name: str) -> Tuple[int, ...]:
+        if callable(getattr(context, 'get_tensor_shape', None)):
+            shape = tuple(int(x) for x in context.get_tensor_shape(name))
+        else:
+            shape = tuple(int(x) for x in context.get_binding_shape(self.binding_indices[name]))
+        if not shape or any(int(x) <= 0 for x in shape):
+            raise RuntimeError(f'TensorRT binding {name!r} has unresolved shape {shape}')
+        return shape
+
+    def _configure_context_and_buffers(self, slot: _ResidentGpuPipelineSlot) -> List[object]:
+        torch = self.torch
+        context = slot.context
+        self._set_input_shape(context, slot)
+        outputs: Dict[str, object] = {}
+        for name in self.output_names:
+            dtype = _torch_dtype_for_trt_binding(self.backend, self.engine, name, torch)
+            if dtype is None:
+                raise RuntimeError(f'cannot resolve TensorRT dtype for {name!r}')
+            outputs[name] = torch.empty(
+                self._context_shape(context, name), dtype=dtype, device=slot.input.device,
+            )
+
+        if callable(getattr(context, 'set_tensor_address', None)) and callable(getattr(context, 'execute_async_v3', None)):
+            for name in self.binding_names:
+                tensor = slot.input if name == self.input_name else outputs[name]
+                ok = context.set_tensor_address(name, int(tensor.data_ptr()))
+                if ok is False:
+                    raise RuntimeError(f'TensorRT rejected static address for {name!r}')
+            slot.binding_addresses = None
+        elif callable(getattr(context, 'execute_async_v2', None)):
+            addresses = [0] * len(self.binding_names)
+            for name in self.binding_names:
+                tensor = slot.input if name == self.input_name else outputs[name]
+                addresses[self.binding_indices[name]] = int(tensor.data_ptr())
+            if any(int(x) == 0 for x in addresses):
+                raise RuntimeError('TensorRT v2 binding address table is incomplete')
+            slot.binding_addresses = addresses
+        else:
+            raise RuntimeError('TensorRT context has no asynchronous enqueue API')
+        return [outputs[name] for name in self.output_names]
+
+    def _allocate_post_buffers(self, slot: _ResidentGpuPipelineSlot) -> None:
+        torch = self.torch
+        head, proto = slot.head, slot.proto
+        anchors = int(head.shape[2])
+        ph, pw = int(proto.shape[2]), int(proto.shape[3])
+        device = head.device
+        slot.compact_indices = torch.empty((anchors,), dtype=torch.int32, device=device)
+        slot.compact_count = torch.zeros((1,), dtype=torch.int32, device=device)
+        slot.max_logit = torch.empty((ph, pw), dtype=torch.float32, device=device)
+        slot.conf_proto = (
+            torch.empty((ph, pw), dtype=torch.float32, device=device) if self.track_conf else None
+        )
+        slot.native_union = torch.empty(
+            (self.out_size, self.out_size), dtype=torch.uint8, device=device,
+        )
+        slot.native_conf = (
+            torch.empty((self.out_size, self.out_size), dtype=torch.uint8, device=device)
+            if self.track_conf else None
+        )
+        cp = self.kernels.cp
+        refs = {
+            'head': cp.asarray(head[0]),
+            'proto': cp.asarray(proto[0]),
+            'indices': cp.asarray(slot.compact_indices),
+            'count': cp.asarray(slot.compact_count),
+            'max_logit': cp.asarray(slot.max_logit),
+            'native_union': cp.asarray(slot.native_union),
+        }
+        if slot.conf_proto is not None:
+            refs['conf_proto'] = cp.asarray(slot.conf_proto)
+        if slot.native_conf is not None:
+            refs['native_conf'] = cp.asarray(slot.native_conf)
+        slot._cupy_refs = refs
+
+    def _execute_context(self, slot: _ResidentGpuPipelineSlot) -> None:
+        context = slot.context
+        handle = int(slot.infer_stream.cuda_stream)
+        if slot.binding_addresses is None:
+            try:
+                ok = context.execute_async_v3(stream_handle=handle)
+            except TypeError:
+                ok = context.execute_async_v3(handle)
+        else:
+            try:
+                ok = context.execute_async_v2(bindings=slot.binding_addresses, stream_handle=handle)
+            except TypeError:
+                ok = context.execute_async_v2(slot.binding_addresses, handle)
+        if ok is False:
+            raise RuntimeError(f'TensorRT enqueue failed for ring slot {slot.slot_id}')
+
+    def _launch_post(self, slot: _ResidentGpuPipelineSlot) -> None:
+        cp = self.kernels.cp
+        refs = slot._cupy_refs
+        head, proto = slot.head, slot.proto
+        anchors = int(head.shape[2])
+        masks = int(proto.shape[1])
+        ph, pw = int(proto.shape[2]), int(proto.shape[3])
+        external = cp.cuda.ExternalStream(int(slot.post_stream.cuda_stream))
+        # _launch_post is always entered under torch.cuda.stream(post_stream), so this
+        # clear and the external CuPy launches share the same capture-safe CUDA stream.
+        slot.compact_count.zero_()
+        compact = self.kernels.compact_f16 if head.dtype == self.torch.float16 else self.kernels.compact_f32
+        compact(
+            ((anchors + 255) // 256,), (256,),
+            (refs['head'], np.int32(anchors), np.float32(self.confidence_threshold), refs['indices'], refs['count']),
+            stream=external,
+        )
+        htag = 'f16' if head.dtype == self.torch.float16 else 'f32'
+        ptag = 'f16' if proto.dtype == self.torch.float16 else 'f32'
+        union_kernel = getattr(self.kernels, f'union_{htag}_{ptag}')
+        conf_proto_arg = refs.get('conf_proto', np.uintp(0))
+        pixels = ph * pw
+        union_kernel(
+            ((pixels + 255) // 256,), (256,),
+            (
+                refs['head'], refs['proto'], refs['indices'], refs['count'],
+                np.int32(anchors), np.int32(masks), np.int32(ph), np.int32(pw),
+                np.int32(self.out_size), np.int32(self.out_size), refs['max_logit'], conf_proto_arg,
+            ),
+            stream=external,
+        )
+        out_pixels = self.out_size * self.out_size
+        self.kernels.upsample_quantize(
+            ((out_pixels + 255) // 256,), (256,),
+            (
+                refs['max_logit'], conf_proto_arg, np.int32(ph), np.int32(pw),
+                np.int32(self.out_size), np.int32(self.out_size), refs['native_union'],
+                refs.get('native_conf', np.uintp(0)),
+            ),
+            stream=external,
+        )
+
+    def _validate_concurrent_contexts(self) -> None:
+        """Enqueue both contexts concurrently before admitting the specialized source."""
+        torch = self.torch
+        for slot in self.slots:
+            with torch.cuda.stream(slot.infer_stream):
+                slot.input.zero_()
+                self._execute_context(slot)
+        # Synchronize only after both enqueues. TensorRT reports several profile/plugin
+        # incompatibilities asynchronously, so checking the enqueue return alone is not
+        # sufficient evidence that the two-context schedule is valid.
+        for slot in self.slots:
+            slot.infer_stream.synchronize()
+
+    def _capture_static_graphs(self) -> None:
+        torch = self.torch
+        # Graph capture is opportunistic.  Contexts and buffers remain fully usable if
+        # TensorRT/plugin/CuPy versions reject stream capture.
+        for slot in self.slots:
+            try:
+                with torch.cuda.stream(slot.infer_stream):
+                    slot.input.zero_()
+                    self._execute_context(slot)
+                slot.infer_stream.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=slot.infer_stream):
+                    self._execute_context(slot)
+                slot.infer_stream.synchronize()
+                slot.infer_graph = graph
+                self.infer_graph_count += 1
+            except Exception:
+                slot.infer_graph = None
+                try:
+                    slot.infer_stream.synchronize()
+                except Exception:
+                    pass
+            try:
+                with torch.cuda.stream(slot.post_stream):
+                    self._launch_post(slot)
+                slot.post_stream.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=slot.post_stream):
+                    self._launch_post(slot)
+                slot.post_stream.synchronize()
+                slot.post_graph = graph
+                self.post_graph_count += 1
+            except Exception:
+                slot.post_graph = None
+                try:
+                    slot.post_stream.synchronize()
+                except Exception:
+                    pass
+
+    def enqueue_inference(self, slot: _ResidentGpuPipelineSlot) -> None:
+        torch = self.torch
+        with torch.cuda.stream(slot.infer_stream):
+            slot.infer_stream.wait_event(slot.render_done)
+            if bool(slot.post_valid):
+                # The preceding frame's mask kernel still reads this context's static
+                # output buffers.  Do not let the next enqueue overwrite them early.
+                slot.infer_stream.wait_event(slot.post_done)
+            if slot.infer_graph is not None:
+                slot.infer_graph.replay()
+            else:
+                self._execute_context(slot)
+            slot.infer_done.record(slot.infer_stream)
+        slot.infer_valid = True
+
+    def enqueue_postprocess(
+        self,
+        slot: _ResidentGpuPipelineSlot,
+        *,
+        frame_index: int,
+        device_union: '_DeviceUnionAccumulator',
+        frame_counts_dev: object,
+    ) -> None:
+        torch = self.torch
+        with torch.cuda.stream(slot.post_stream):
+            slot.post_stream.wait_event(slot.infer_done)
+            if slot.post_graph is not None:
+                slot.post_graph.replay()
+            else:
+                self._launch_post(slot)
+            # The static slot output is copied into the task-resident destination before
+            # the slot is released.  No payload/result object or per-frame Future exists.
+            device_union.union_dev[int(frame_index)].copy_(slot.native_union, non_blocking=True)
+            if device_union.conf_dev is not None and slot.native_conf is not None:
+                device_union.conf_dev[int(frame_index)].copy_(slot.native_conf, non_blocking=True)
+            frame_counts_dev[int(frame_index)].copy_(slot.compact_count[0], non_blocking=True)
+            slot.post_done.record(slot.post_stream)
+        device_union.written[int(frame_index)] = True
+        slot.post_valid = True
+
+    def synchronize(self) -> None:
+        for slot in self.slots:
+            if bool(slot.post_valid):
+                slot.post_done.synchronize()
+
+    def close(self) -> None:
+        """Restore the borrowed AutoBackend v3 binding addresses."""
+        context = getattr(self, '_borrowed_context', None)
+        restore = getattr(self, '_restore_tensor_addresses', {})
+        restore_error: Optional[BaseException] = None
+        if context is not None and restore:
+            for name, address in restore.items():
+                try:
+                    ok = context.set_tensor_address(str(name), int(address))
+                    if ok is False:
+                        raise RuntimeError(f'TensorRT rejected restored address for {name!r}')
+                except BaseException as exc:
+                    restore_error = exc
+                    break
+        # Release graph/context/output references promptly; the task-level device union
+        # remains live for metadata, hole fill, and its single D2H drain.
+        for slot in getattr(self, 'slots', []):
+            slot.infer_graph = None
+            slot.post_graph = None
+            slot.context = None
+            slot.binding_addresses = None
+            slot.head = None
+            slot.proto = None
+            slot.compact_indices = None
+            slot.compact_count = None
+            slot.max_logit = None
+            slot.conf_proto = None
+            slot.native_union = None
+            slot.native_conf = None
+            slot._cupy_refs.clear()
+        if restore_error is not None:
+            raise RuntimeError('failed to restore AutoBackend TensorRT binding addresses') from restore_error
+
+
+def _try_resident_trt_ring_accumulate(
+    predictor: object,
+    source: object,
+    cfg: 'PredictConfig',
+    *,
+    source_label: str,
+    num_frames: int,
+    out_size: int,
+    M_out_to_native: np.ndarray,
+    native_h: int,
+    native_w: int,
+    device_union: Optional['_DeviceUnionAccumulator'],
+) -> Optional[Dict[str, int]]:
+    """Run the complete fixed batch-1/angle-0 resident task without result carriers.
+
+    Returns ``None`` only before consuming the source, allowing the existing generic
+    direct loop to take over.  Once admitted, failures are raised: silently replaying a
+    partially written task through another path could corrupt confidence statistics.
+    """
+    global _RESIDENT_TRT_RING_ANNOUNCED, _RESIDENT_TRT_RING_FALLBACK_WARNED
+    if not resident_trt_ring_enabled() or device_union is None:
+        return None
+    # Referencing the class here is safe: this function is invoked only after module load.
+    if not isinstance(source, GpuRenderedYoloSource):
+        return None
+    fastpath = single_angle_gpu_fastpath()
+    if (
+        int(cfg.batch) != 1 or int(getattr(source, 'bs', 0)) != 1
+        or int(getattr(source, 'nf', -1)) != int(num_frames)
+        or abs(float(getattr(getattr(source, 'job', None), 'angle_deg', 999.0))) > 1e-7
+        or str(getattr(getattr(source, 'engine', None), '_mode', '')) != 'resident'
+        or fastpath is None or float(fastpath[1]) > 0.0
+        or int(native_h) != int(out_size) or int(native_w) != int(out_size)
+        or not _warp_matrix_is_identity(M_out_to_native)
+    ):
+        return None
+    backend = getattr(predictor, 'model', None)
+    if (
+        backend is None or _trt_engine_from_autobackend(backend) is None
+        or bool(getattr(backend, 'dynamic', False))
+    ):
+        return None
+    prepare = getattr(source, 'prepare_direct_ring', None)
+    next_slot = getattr(source, 'next_direct_slot', None)
+    if not callable(prepare) or not callable(next_slot):
+        return None
+    try:
+        slots = prepare()
+        if slots is None or len(slots) != 2:
+            return None
+        threshold = max(float(cfg.conf), float(fastpath[0]))
+        executor = _ResidentTensorRTRingExecutor(
+            backend, slots, out_size=int(out_size),
+            track_conf=device_union.conf_dev is not None,
+            confidence_threshold=float(threshold),
+        )
+    except Exception as exc:
+        reset = getattr(source, 'reset_direct_ring', None)
+        if callable(reset):
+            reset()
+        if not _RESIDENT_TRT_RING_FALLBACK_WARNED:
+            _RESIDENT_TRT_RING_FALLBACK_WARNED = True
+            print(
+                f'Resident TensorRT ring unavailable ({exc}); using the existing direct predict loop. '
+                'YOLO_TTA_RESIDENT_TRT_RING=0 suppresses this capability probe.'
+            )
+        return None
+
+    import torch  # type: ignore
+    pending: 'deque[Tuple[int, _ResidentGpuPipelineSlot]]' = deque()
+    try:
+        frame_counts_dev = torch.zeros(
+            (int(num_frames),), dtype=torch.int32, device=device_union.device,
+        )
+        # Prime both slots: render(1) is already queued on the low-priority stream while
+        # context 0 infers frame(0).  Afterwards each loop queues post(n), render(n+2),
+        # and inference(n+2), yielding the requested render/infer/post three-stage overlap.
+        for _ in range(min(2, int(num_frames))):
+            item = next_slot()
+            if item is None:
+                break
+            frame_idx, slot = item
+            executor.enqueue_inference(slot)
+            pending.append((int(frame_idx), slot))
+        submitted = len(pending)
+        while pending:
+            frame_idx, slot = pending.popleft()
+            executor.enqueue_postprocess(
+                slot, frame_index=int(frame_idx), device_union=device_union,
+                frame_counts_dev=frame_counts_dev,
+            )
+            if submitted < int(num_frames):
+                item = next_slot()
+                if item is None:
+                    raise RuntimeError(
+                        f'resident TensorRT ring source ended at {submitted}/{int(num_frames)} frames'
+                    )
+                next_idx, next_pipeline_slot = item
+                executor.enqueue_inference(next_pipeline_slot)
+                pending.append((int(next_idx), next_pipeline_slot))
+                submitted += 1
+        executor.synchronize()
+        prediction_count = int(frame_counts_dev.sum(dtype=torch.int64).item())
+        # One task-level reduction/readback replaces one host count read per frame.
+        frames_with_predictions = int((frame_counts_dev > 0).sum(dtype=torch.int64).item())
+    except Exception:
+        # Admission already consumed/modified the task.  Propagate rather than rerunning
+        # into the same destination and hiding a potentially unsafe TensorRT context failure.
+        raise
+    finally:
+        executor.close()
+
+    if not _RESIDENT_TRT_RING_ANNOUNCED:
+        _RESIDENT_TRT_RING_ANNOUNCED = True
+        print(
+            'Resident TensorRT batch-1 ring active: two independent execution contexts, '
+            'two static input/output slots, low-priority render, high-priority inference, '
+            f'separate mask/union streams; CUDA graphs captured infer={executor.infer_graph_count}/2 '
+            f'post={executor.post_graph_count}/2.'
+        )
+    return {
+        'prediction_count': int(prediction_count),
+        'frames_with_predictions': int(frames_with_predictions),
+    }
+
+
+def _stage_radial_t_major_block(
+    radial_mask_mm: np.ndarray,
+    v0: int,
+    v1: int,
+    out_t_major: np.ndarray,
+    *,
+    slice_bboxes: Optional[np.ndarray] = None,
+    stage_pool: Optional[ThreadPoolExecutor] = None,
+    stage_workers: int = 1,
+) -> np.ndarray:
+    """Stage one contiguous radial row block as ``(t, azimuth, u)``.
+
+    The legacy projection repeatedly gathered ``source[:, t, :]``, which is the slow axis of
+    the azimuth-major interpolation volume.  Dense sources are transposed one block at a time;
+    sparse bridge deltas use their interpolation-carried bboxes and copy only intersecting crop
+    rows.  The returned view always has exactly ``v1-v0`` rows.
+    """
+    n_az, work_t, u_len = (int(v) for v in radial_mask_mm.shape)
+    lo = int(np.clip(int(v0), 0, work_t))
+    hi = int(np.clip(int(v1), lo, work_t))
+    count = int(hi - lo)
+    dest = np.asarray(out_t_major)[:count, :n_az, :u_len]
+    if count <= 0:
+        return dest
+    if slice_bboxes is None:
+        np.copyto(
+            dest,
+            np.transpose(np.asarray(radial_mask_mm[:, lo:hi, :], dtype=np.uint8), (1, 0, 2)),
+        )
+        return dest
+
+    # A bridge delta is sparse by azimuth plane. Clearing one bounded t-major staging block
+    # is much cheaper than reading all of the source volume's implicit zero regions.
+    dest.fill(np.uint8(0))
+    workers_i = max(1, min(int(stage_workers), int(n_az)))
+
+    def _stage_az_range(worker_idx: int) -> None:
+        a0 = int(worker_idx) * int(math.ceil(float(n_az) / float(workers_i)))
+        a1 = min(int(n_az), a0 + int(math.ceil(float(n_az) / float(workers_i))))
+        for az in range(a0, a1):
+            by0, by1, bx0, bx1 = (int(v) for v in slice_bboxes[int(az)])
+            sy0 = max(int(lo), int(by0))
+            sy1 = min(int(hi), int(by1))
+            if sy0 >= sy1 or bx0 >= bx1:
+                continue
+            dest[sy0 - lo:sy1 - lo, int(az), bx0:bx1] = np.asarray(
+                radial_mask_mm[int(az), sy0:sy1, bx0:bx1], dtype=np.uint8,
+            )
+
+    if stage_pool is not None and workers_i > 1:
+        list(stage_pool.map(_stage_az_range, range(workers_i)))
+    else:
+        for worker_idx in range(workers_i):
+            _stage_az_range(int(worker_idx))
+    return dest
+
+
+def _abort_projection_block_callback(
+    callback: Optional[Callable[[int, np.ndarray], None]],
+    reason: BaseException,
+) -> None:
+    """Invalidate a stateful projection callback without changing projection semantics."""
+    if callback is None:
+        return
+    abort = getattr(callback, 'abort', None)
+    if callable(abort):
+        try:
+            abort(reason)
+        except Exception:
+            pass
+
+
+def _emit_projection_block_callback(
+    callback: Optional[Callable[[int, np.ndarray], None]],
+    z0: int,
+    block: np.ndarray,
+    *,
+    desc: str,
+) -> None:
+    """Best-effort block delivery: callback failure must not fail a correct projection."""
+    if callback is None:
+        return
+    try:
+        callback(int(z0), np.asarray(block))
+    except Exception as exc:
+        _abort_projection_block_callback(callback, exc)
+        warn = getattr(callback, 'warn_failed_once', None)
+        if callable(warn):
+            try:
+                warn(f'{desc}: incremental raw-bbox callback failed ({exc})')
+            except Exception:
+                pass
+
+
 def _radial_backproject_gpu_streaming(
     radial_mask_mm: np.ndarray,
     vol_mm: np.ndarray,
@@ -12886,6 +13947,8 @@ def _radial_backproject_gpu_streaming(
     out_w: int,
     desc: str,
     known_row_occupancy: Optional[np.ndarray] = None,
+    known_slice_bboxes: Optional[np.ndarray] = None,
+    projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
 ) -> bool:
     """v13.3.2 (R6a): radial backprojection with a <1 GiB streaming GPU working set.
 
@@ -12912,23 +13975,32 @@ def _radial_backproject_gpu_streaming(
     dev = _pick_gpu_compute_device(torch)
     n_az, work_t, u_len = (int(x) for x in radial_mask_mm.shape)
     plane_px = int(out_h) * int(out_w)
-    # v13.3.3: default 8 -> 32. Fewer chunks amortize the per-chunk stream sync + host staging;
-    # the VRAM estimate below scales with t_chunk and still gates against free memory.
-    t_chunk = max(1, _env_int('YOLO_TTA_GPU_BACKPROJECT_T_CHUNK', 32))
-    # Upper bound on covering rows per chunk (v ranges are monotone with ~work_t/t_dim slope).
-    max_rows = int(math.ceil(float(t_chunk) * float(work_t) / float(max(1, t_dim)))) + 2
+    # v13.3.11: 128 output planes is the default projection quantum (256 is also supported
+    # through the existing environment override). This amortizes map gathers and lets the
+    # source be transposed into t-major order once per block instead of once per row.
+    t_chunk = max(1, _env_int('YOLO_TTA_GPU_BACKPROJECT_T_CHUNK', 128))
     cross_bytes = int(n_az) * int(u_len)
-    need = (
-        int(valid_pos.nbytes) + int(flat_src.nbytes)
-        + max_rows * cross_bytes                      # device cross-section rows
-        + max_rows * int(flat_src.shape[0])           # gathered (rows, P) u8
-        + 2 * t_chunk * plane_px                      # device + pinned output planes
-        + 512 * 1024 * 1024
-    )
     try:
         free_bytes, _total = torch.cuda.mem_get_info(dev)
     except Exception:
         return False
+
+    def _projection_need(chunk_planes: int) -> Tuple[int, int]:
+        rows = int(math.ceil(float(chunk_planes) * float(work_t) / float(max(1, t_dim)))) + 2
+        need_bytes = (
+            int(valid_pos.nbytes) + int(flat_src.nbytes)
+            + rows * cross_bytes                         # t-major source rows
+            + rows * int(flat_src.shape[0])              # gathered (rows, valid P)
+            + int(chunk_planes) * int(flat_src.shape[0]) # vectorized per-t reduction
+            + 2 * int(chunk_planes) * plane_px           # device + pinned output planes
+            + 512 * 1024 * 1024
+        )
+        return int(rows), int(need_bytes)
+
+    max_rows, need = _projection_need(int(t_chunk))
+    while int(t_chunk) > 16 and int(free_bytes) < int(need) + 1 * GIB:
+        t_chunk = max(16, int(t_chunk) // 2)
+        max_rows, need = _projection_need(int(t_chunk))
     if int(free_bytes) < int(need) + 1 * GIB:
         print(
             f'{desc}: GPU backprojection skipped (needs ~{need / GIB:.1f} GiB + 1 GiB headroom, '
@@ -12942,6 +14014,9 @@ def _radial_backproject_gpu_streaming(
         row_any = np.asarray(known_row_occupancy, dtype=bool)
     else:
         row_any = _radial_row_occupancy(radial_mask_mm, desc)
+    slice_bboxes = _validated_radial_slice_bboxes(
+        known_slice_bboxes, int(n_az), int(work_t), int(u_len),
+    )
     stage_workers = max(1, min(8, _cpu_count()))
     stage_pool = _acquire_parallel_pool(stage_workers)  # v13.3.4 (T5): checkout-cached
 
@@ -12955,40 +14030,89 @@ def _radial_backproject_gpu_streaming(
             pin_out = torch.empty((t_chunk, plane_px), dtype=torch.uint8, pin_memory=True)
             pin_out_np = pin_out.numpy()
             out_dev = torch.empty((t_chunk, plane_px), dtype=torch.uint8, device=dev)
+            reduced_dev = torch.empty(
+                (t_chunk, int(valid_pos.shape[0])), dtype=torch.uint8, device=dev,
+            )
+            scatter_reduce_supported = True
             for t0 in tqdm(range(0, int(t_dim), t_chunk), desc=f'{desc} [gpu]'):
                 t1 = min(int(t_dim), t0 + t_chunk)
                 v0 = v_range_for_t(int(t0))[0]
                 v1 = v_range_for_t(int(t1 - 1))[1]
-                nonempty: List[int] = [int(v) for v in range(int(v0), int(v1)) if row_any[int(v)]]
-                if not nonempty:
+                v_count = int(v1 - v0)
+                if not bool(np.any(row_any[int(v0):int(v1)])):
+                    _emit_projection_block_callback(
+                        projection_block_callback,
+                        int(t0),
+                        np.asarray(vol_mm[int(t0):int(t1)]),
+                        desc=desc,
+                    )
                     continue  # vol_mm is pre-zeroed
-                if len(nonempty) > int(pin_rows.shape[0]):  # pragma: no cover - bound is conservative
-                    raise RuntimeError(f'{desc}: covering rows {len(nonempty)} exceed staging bound {pin_rows.shape[0]}')
+                if int(v_count) > int(pin_rows.shape[0]):  # pragma: no cover - conservative bound
+                    raise RuntimeError(f'{desc}: covering rows {v_count} exceed staging bound {pin_rows.shape[0]}')
 
-                # v13.3.3 (S1): the strided (azimuth-major) row gathers release the GIL, so a small
-                # pool overlaps their memory latency instead of walking rows one at a time.
-                def _stage_row(i: int, _nonempty: List[int] = nonempty) -> None:
-                    pin_rows_np[int(i)] = radial_mask_mm[:, int(_nonempty[int(i)]), :]
-
-                if len(nonempty) > 1:
-                    list(stage_pool.map(_stage_row, range(len(nonempty))))
-                else:
-                    _stage_row(0)
-                rows_dev = pin_rows[: len(nonempty)].to(dev, non_blocking=True)
-                gathered = rows_dev.reshape(len(nonempty), -1)[:, flat_src_t]  # (rows, P) u8
+                _stage_radial_t_major_block(
+                    radial_mask_mm,
+                    int(v0),
+                    int(v1),
+                    pin_rows_np,
+                    slice_bboxes=slice_bboxes,
+                    stage_pool=stage_pool,
+                    stage_workers=stage_workers,
+                )
+                rows_dev = pin_rows[:v_count].to(dev, non_blocking=True)
+                gathered = rows_dev.reshape(v_count, -1)[:, flat_src_t]  # (rows, valid P) u8
                 out_dev.zero_()
-                for t in range(t0, t1):
-                    vs, ve = v_range_for_t(int(t))
-                    idxs = [i for i, v in enumerate(nonempty) if vs <= v < ve]
-                    if not idxs:
-                        continue
-                    sub = gathered[idxs[0]] if len(idxs) == 1 else gathered[idxs].amax(dim=0)
-                    out_dev[t - t0].index_put_((valid_pos_t,), sub)
+                t_count = int(t1 - t0)
+                if int(work_t) == int(t_dim):
+                    out_dev[:t_count].index_copy_(1, valid_pos_t, gathered[:t_count])
+                else:
+                    pair_out: List[int] = []
+                    pair_row: List[int] = []
+                    for t in range(int(t0), int(t1)):
+                        vs, ve = v_range_for_t(int(t))
+                        for v in range(int(vs), int(ve)):
+                            pair_out.append(int(t - t0))
+                            pair_row.append(int(v - v0))
+                    if pair_row and scatter_reduce_supported:
+                        try:
+                            pair_row_t = torch.as_tensor(pair_row, dtype=torch.int64, device=dev)
+                            pair_out_t = torch.as_tensor(pair_out, dtype=torch.int64, device=dev)
+                            pair_values = gathered.index_select(0, pair_row_t)
+                            reduced = reduced_dev[:t_count]
+                            reduced.zero_()
+                            reduced.scatter_reduce_(
+                                0,
+                                pair_out_t[:, None].expand(-1, int(gathered.shape[1])),
+                                pair_values,
+                                reduce='amax',
+                                include_self=True,
+                            )
+                            out_dev[:t_count].index_copy_(1, valid_pos_t, reduced)
+                        except (AttributeError, RuntimeError, TypeError):
+                            # Compatibility fallback for older torch/CUDA combinations.
+                            scatter_reduce_supported = False
+                    if pair_row and not scatter_reduce_supported:
+                        for local_t in range(t_count):
+                            idxs = [i for i, target in enumerate(pair_out) if int(target) == int(local_t)]
+                            if not idxs:
+                                continue
+                            row_ids = [int(pair_row[i]) for i in idxs]
+                            sub = gathered[row_ids[0]] if len(row_ids) == 1 else gathered[row_ids].amax(dim=0)
+                            out_dev[local_t].index_put_((valid_pos_t,), sub)
                 pin_out[: t1 - t0].copy_(out_dev[: t1 - t0], non_blocking=True)
                 stream.synchronize()
                 np.copyto(
                     np.asarray(vol_mm[t0:t1]).reshape(t1 - t0, -1),
                     pin_out_np[: t1 - t0],
+                )
+                # Feed the just-completed pinned D2H block straight to the cvol indexer.
+                # The full projected volume remains available only as a failure fallback;
+                # the successful path never scans it again to create the raw-bbox store.
+                _emit_projection_block_callback(
+                    projection_block_callback,
+                    int(t0),
+                    pin_out_np[: t1 - t0].reshape((int(t1 - t0), int(out_h), int(out_w))),
+                    desc=desc,
                 )
             stream.synchronize()
     finally:
@@ -13008,6 +14132,8 @@ def backproject_radial_volume_to_volume(
     workers: int = 1,
     out_shape_tyx: Optional[Tuple[int, int, int]] = None,
     known_row_occupancy: Optional[np.ndarray] = None,
+    known_slice_bboxes: Optional[np.ndarray] = None,
+    projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
 ) -> np.ndarray:
     """Backproject a radial view-native mask stack into orthogonal (t, Y, X).
 
@@ -13050,6 +14176,15 @@ def backproject_radial_volume_to_volume(
         )
 
     if not plan:
+        empty_chunk = max(1, _env_int('YOLO_TTA_CPU_BACKPROJECT_T_CHUNK', 128))
+        for t0 in range(0, int(t_dim), int(empty_chunk)):
+            t1 = min(int(t_dim), int(t0) + int(empty_chunk))
+            _emit_projection_block_callback(
+                projection_block_callback,
+                int(t0),
+                np.asarray(vol_mm[int(t0):int(t1)]),
+                desc=desc,
+            )
         flush_array(vol_mm)
         return vol_mm
 
@@ -13093,6 +14228,12 @@ def backproject_radial_volume_to_volume(
         row_occ = np.asarray(known_row_occupancy, dtype=bool).reshape(-1)
         if int(row_occ.shape[0]) != int(work_t):
             row_occ = None
+    radial_slice_bboxes = _validated_radial_slice_bboxes(
+        known_slice_bboxes,
+        int(radial_mask_mm.shape[0]),
+        int(work_t),
+        int(u_len),
+    )
 
     gpu_done = False
     if gpu_backproject_enabled():
@@ -13101,41 +14242,101 @@ def backproject_radial_volume_to_volume(
                 radial_mask_mm, vol_mm, valid_pos, flat_src, _v_range_for_t,
                 int(t_dim), int(out_h), int(out_w), desc,
                 known_row_occupancy=row_occ,
+                known_slice_bboxes=radial_slice_bboxes,
+                projection_block_callback=projection_block_callback,
             )
         except Exception as exc:
+            # Some GPU blocks may already have been indexed. The CPU retry rewrites all
+            # output blocks, so retain projection correctness but discard that partial store.
+            _abort_projection_block_callback(projection_block_callback, exc)
+            projection_block_callback = None
             print(f'{desc}: GPU backprojection failed ({exc}); using the CPU path.')
             gpu_done = False
 
     if not gpu_done:
-        def _backproject_t_slice(t_idx: int) -> None:
-            # Dense gather: every in-ROI Cartesian pixel is assigned from the nearest dense
-            # radial angle's source frame and radial raster coordinate. Out-of-ROI stays black.
-            v_start, v_stop = _v_range_for_t(int(t_idx))
-            gathered: Optional[np.ndarray] = None
-            for v_idx in range(v_start, v_stop):
-                if row_occ is not None and not bool(row_occ[int(v_idx)]):
-                    continue  # v13.3.6 (D1): known-empty row — skip without touching pages
-                plane_view = radial_mask_mm[:, int(v_idx), :]
-                if not np.any(plane_view):
-                    continue
-                plane_flat = np.ascontiguousarray(plane_view).reshape(-1)
-                plane_gathered = plane_flat.take(flat_src)
-                if gathered is None:
-                    gathered = plane_gathered
-                else:
-                    np.bitwise_or(gathered, plane_gathered, out=gathered)
-            if gathered is None:
-                return  # all covering cross-sections empty; the output slice is already zero
-            vol_mm[int(t_idx)].reshape(-1)[valid_pos] = gathered
+        if row_occ is None:
+            row_occ = _radial_row_occupancy(radial_mask_mm, desc)
+        cpu_t_chunk = max(1, _env_int('YOLO_TTA_CPU_BACKPROJECT_T_CHUNK', 128))
+        n_blocks = int(math.ceil(float(t_dim) / float(cpu_t_chunk)))
+        stage_workers = max(1, min(8, int(worker_count), _cpu_count()))
+        stage_pool = _acquire_parallel_pool(stage_workers)
 
-        parallel_for_indices_chunked(
-            int(t_dim),
-            _backproject_t_slice,
-            max_workers=worker_count,
-            desc=desc,
-            show_progress=True,
-            target_chunks_per_worker=2,
+        # Bound simultaneous vector blocks by an 8 GiB temporary budget. The old per-t
+        # implementation launched many strided readers concurrently; two large t-major
+        # blocks generally saturate memory bandwidth without recreating that contention.
+        max_block_rows = int(math.ceil(float(cpu_t_chunk) * float(work_t) / float(max(1, t_dim)))) + 2
+        per_block_bytes = (
+            int(max_block_rows) * int(radial_mask_mm.shape[0]) * int(u_len)
+            + int(max_block_rows) * int(valid_pos.shape[0])
         )
+        block_workers = max(1, min(
+            int(worker_count),
+            int(n_blocks),
+            2,
+            max(1, int((8 * GIB) // max(1, int(per_block_bytes)))),
+        ))
+
+        def _backproject_t_block(block_idx: int) -> None:
+            t0 = int(block_idx) * int(cpu_t_chunk)
+            t1 = min(int(t_dim), int(t0) + int(cpu_t_chunk))
+            v0 = int(_v_range_for_t(int(t0))[0])
+            v1 = int(_v_range_for_t(int(t1 - 1))[1])
+            if not bool(np.any(row_occ[int(v0):int(v1)])):
+                _emit_projection_block_callback(
+                    projection_block_callback,
+                    int(t0),
+                    np.asarray(vol_mm[int(t0):int(t1)]),
+                    desc=desc,
+                )
+                return
+            t_major = np.empty(
+                (int(v1 - v0), int(radial_mask_mm.shape[0]), int(u_len)), dtype=np.uint8,
+            )
+            _stage_radial_t_major_block(
+                radial_mask_mm,
+                int(v0),
+                int(v1),
+                t_major,
+                slice_bboxes=radial_slice_bboxes,
+                stage_pool=stage_pool,
+                stage_workers=stage_workers,
+            )
+            gathered_rows = t_major.reshape(int(v1 - v0), -1).take(flat_src, axis=1)
+            out_flat = np.asarray(vol_mm[int(t0):int(t1)]).reshape(int(t1 - t0), -1)
+            if same_t_axis:
+                out_flat[:, valid_pos] = gathered_rows[:int(t1 - t0)]
+                _emit_projection_block_callback(
+                    projection_block_callback,
+                    int(t0),
+                    np.asarray(vol_mm[int(t0):int(t1)]),
+                    desc=desc,
+                )
+                return
+            for t in range(int(t0), int(t1)):
+                vs, ve = _v_range_for_t(int(t))
+                local = gathered_rows[int(vs - v0):int(ve - v0)]
+                if int(local.shape[0]) == 1:
+                    reduced = local[0]
+                else:
+                    reduced = np.bitwise_or.reduce(local, axis=0)
+                out_flat[int(t - t0), valid_pos] = reduced
+            _emit_projection_block_callback(
+                projection_block_callback,
+                int(t0),
+                np.asarray(vol_mm[int(t0):int(t1)]),
+                desc=desc,
+            )
+
+        try:
+            parallel_for_indices(
+                int(n_blocks),
+                _backproject_t_block,
+                max_workers=int(block_workers),
+                desc=f'{desc} [t-major x{int(cpu_t_chunk)}]',
+                show_progress=True,
+            )
+        finally:
+            _release_parallel_pool(stage_workers, stage_pool)
 
     flush_array(vol_mm)
     return vol_mm
@@ -16129,6 +17330,11 @@ def interpolate_view_volume_pass_inplace(
     skipped_by_min_radius = 0
     added_voxels = 0
     bridge_delta_written = False
+    # v13.3.11: interpolation already visits every bridge-delta crop while it is hot.
+    # Preserve the exact per-azimuth bounds and per-t row occupancy here so radial
+    # backprojection does not rediscover them by strided scans over the dense delta file.
+    bridge_delta_slice_bboxes: Optional[np.ndarray] = None
+    bridge_delta_rows_by_slice: Optional[np.ndarray] = None
     plans: List[SliceBridgeRenderPlan] = []
 
     try:
@@ -16227,6 +17433,32 @@ def interpolate_view_volume_pass_inplace(
                 Path(bridge_delta_path).parent.mkdir(parents=True, exist_ok=True)
                 delta_mm = np.memmap(Path(bridge_delta_path), dtype=np.uint8, mode='w+', shape=mask_mm.shape)
                 numa_interleave_memory(delta_mm, desc='Interpolation bridge delta')  # v13.3.5 (N2)
+                bridge_delta_slice_bboxes = np.zeros((int(mask_mm.shape[0]), 4), dtype=np.int64)
+                bridge_delta_rows_by_slice = np.zeros(
+                    (int(mask_mm.shape[0]), int(mask_mm.shape[1])), dtype=bool,
+                )
+
+            def _record_bridge_delta_metadata(
+                z: int,
+                delta_region: np.ndarray,
+                base_y: int,
+                base_x: int,
+            ) -> None:
+                if bridge_delta_slice_bboxes is None or bridge_delta_rows_by_slice is None:
+                    return
+                rows = np.any(delta_region, axis=1)
+                if not bool(np.any(rows)):
+                    return
+                cols = np.any(delta_region, axis=0)
+                row_ids = np.flatnonzero(rows)
+                col_ids = np.flatnonzero(cols)
+                bridge_delta_slice_bboxes[int(z)] = np.asarray((
+                    int(base_y) + int(row_ids[0]),
+                    int(base_y) + int(row_ids[-1]) + 1,
+                    int(base_x) + int(col_ids[0]),
+                    int(base_x) + int(col_ids[-1]) + 1,
+                ), dtype=np.int64)
+                bridge_delta_rows_by_slice[int(z), int(base_y):int(base_y) + int(rows.size)] = rows
 
             def _merge_slice(list_idx: int) -> None:
                 z = int(scheduled_slices[int(list_idx)])
@@ -16242,15 +17474,19 @@ def interpolate_view_volume_pass_inplace(
                     if delta_mm is not None:
                         # The new w+ delta starts zero; only its possible-bridge region
                         # needs an explicit write. mask_mm remains frozen until this merge.
-                        delta_mm[z, y0:y1, x0:x1] = np.where(
+                        delta_region = np.where(
                             mask_region == 0, bridge_region, np.uint8(0)
                         )
+                        delta_mm[z, y0:y1, x0:x1] = delta_region
+                        _record_bridge_delta_metadata(int(z), delta_region, int(y0), int(x0))
                     mask_region |= bridge_region
                 elif np.any(bridge_slice):
                     # YOLO_TTA_INTERPOLATION_FUSED_BRIDGE_MERGE=0: exact legacy sweep.
                     if delta_mm is not None:
                         mask_slice = np.asarray(mask_mm[z])
-                        delta_mm[z, :, :] = np.where(mask_slice == 0, bridge_slice, np.uint8(0))
+                        delta_region = np.where(mask_slice == 0, bridge_slice, np.uint8(0))
+                        delta_mm[z, :, :] = delta_region
+                        _record_bridge_delta_metadata(int(z), delta_region, 0, 0)
                     mask_mm[z, :, :] |= bridge_slice
 
             parallel_for_indices(
@@ -16304,6 +17540,12 @@ def interpolate_view_volume_pass_inplace(
     }
     if bool(bridge_delta_written) and bridge_delta_path is not None:
         result_stats['bridge_delta_path'] = str(bridge_delta_path)
+        if bridge_delta_slice_bboxes is not None:
+            result_stats['bridge_delta_slice_bboxes'] = np.ascontiguousarray(bridge_delta_slice_bboxes)
+        if bridge_delta_rows_by_slice is not None:
+            result_stats['bridge_delta_row_occupancy'] = np.ascontiguousarray(
+                np.any(bridge_delta_rows_by_slice, axis=0)
+            )
     return result_stats
 
 
@@ -16357,15 +17599,16 @@ class DeferredTilePostprocessResult:
 CTILE_FORMAT = 'ctile-mask-v2-raw'
 CVOL_FORMAT = 'cvol-mask-v2-raw'
 MASK_STORE_FORMATS = {CTILE_FORMAT, CVOL_FORMAT}
-# RAM cache for raw bbox-store chunks.bin payloads during NRRD streaming.
+# Shared read-only mappings for raw bbox-store chunks.bin payloads during NRRD streaming.
 # v13.2.2 bug #15: the full-quality writer and the per-downbin low-quality writers for
 # the SAME layer run concurrently on the NrrdLayerSink pool. The cache was a plain dict
 # with an unsynchronized get->read->set (N+1 simultaneous RAM copies of a multi-GiB
 # chunks.bin) and each writer's finally evicted the entry while sibling futures still
-# needed it (re-reading the whole file from disk once per output). Entries are now
-# refcounted, loads are single-flight, and eviction happens when the last holder
-# releases.
-_NRRD_RAW_STORE_CHUNKS_RAM_CACHE: Dict[Path, Tuple[bytes, int]] = {}
+# needed it (re-reading the whole file from disk once per output). v13.3.11 replaces the
+# remaining Path.read_bytes() copy with one refcounted MAP_SHARED/ACCESS_READ mapping. The
+# kernel page cache is therefore shared by all full/low-quality readers and remains
+# reclaimable; the Python heap no longer holds a second multi-GiB copy.
+_NRRD_RAW_STORE_CHUNKS_RAM_CACHE: Dict[Path, Tuple[object, int]] = {}
 _NRRD_RAW_STORE_CHUNKS_RAM_CACHE_LOCK = threading.Lock()
 _NRRD_RAW_STORE_CHUNKS_LOAD_EVENTS: Dict[Path, threading.Event] = {}
 
@@ -16377,8 +17620,19 @@ def _raw_store_chunks_cache_key(chunks_path: Path) -> Path:
         return Path(chunks_path)
 
 
-def _acquire_raw_store_chunks_ram_cache(chunks_path: Path) -> Tuple[bytes, bool]:
-    """Return (payload, was_cached) and hold one reference on the cache entry."""
+def _close_raw_store_chunks_mapping(payload: object) -> None:
+    if not isinstance(payload, mmap.mmap):
+        return
+    try:
+        payload.close()
+    except BufferError:
+        # A compressor may be dropping its final exported memoryview concurrently. Once
+        # that view goes away the mmap object's own finalizer releases the mapping.
+        pass
+
+
+def _acquire_raw_store_chunks_ram_cache(chunks_path: Path) -> Tuple[object, bool]:
+    """Return a shared read-only payload buffer and hold one reference on it."""
     key = _raw_store_chunks_cache_key(chunks_path)
     while True:
         with _NRRD_RAW_STORE_CHUNKS_RAM_CACHE_LOCK:
@@ -16391,11 +17645,17 @@ def _acquire_raw_store_chunks_ram_cache(chunks_path: Path) -> Tuple[bytes, bool]
             if loading is None:
                 _NRRD_RAW_STORE_CHUNKS_LOAD_EVENTS[key] = threading.Event()
                 break
-        # Another thread is reading this chunks.bin; wait for it instead of duplicating
-        # the multi-GiB payload in RAM. If the loader fails, the loop retries here.
+        # Another thread is mapping this chunks.bin; wait for it so every reader shares
+        # exactly one mmap object. If the loader fails, the loop retries here.
         loading.wait()
     try:
-        payload = Path(chunks_path).read_bytes()
+        size = int(Path(chunks_path).stat().st_size)
+        if size > 0:
+            with Path(chunks_path).open('rb') as fh:
+                payload: object = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+        else:
+            # mmap cannot map an empty file; empty stores never request a payload view.
+            payload = b''
         with _NRRD_RAW_STORE_CHUNKS_RAM_CACHE_LOCK:
             _NRRD_RAW_STORE_CHUNKS_RAM_CACHE[key] = (payload, 1)
         return payload, False
@@ -16415,15 +17675,21 @@ def _release_raw_store_chunks_ram_cache(chunks_path: Path) -> None:
         payload, refs = entry
         if int(refs) <= 1:
             _NRRD_RAW_STORE_CHUNKS_RAM_CACHE.pop(key, None)
+            close_payload = payload
         else:
             _NRRD_RAW_STORE_CHUNKS_RAM_CACHE[key] = (payload, int(refs) - 1)
+            close_payload = None
+    if close_payload is not None:
+        _close_raw_store_chunks_mapping(close_payload)
 
 
 def _invalidate_raw_store_chunks_ram_cache(chunks_path: Path) -> None:
     """Drop a cache entry whose backing file is about to be rewritten (any refcount)."""
     key = _raw_store_chunks_cache_key(chunks_path)
     with _NRRD_RAW_STORE_CHUNKS_RAM_CACHE_LOCK:
-        _NRRD_RAW_STORE_CHUNKS_RAM_CACHE.pop(key, None)
+        entry = _NRRD_RAW_STORE_CHUNKS_RAM_CACHE.pop(key, None)
+    if entry is not None:
+        _close_raw_store_chunks_mapping(entry[0])
 CTILE_INDEX_DTYPE = np.dtype([
     ('kind', 'u1'),              # 0 = empty/zero slice, 1 = raw uint8 bbox payload
     ('reserved', 'u1', (7,)),
@@ -16562,6 +17828,299 @@ class RawBBoxSlicePayload:
     foreground_voxels: int = 0
 
 
+class IncrementalRawBBoxMaskStoreWriter:
+    """Thread-safe raw-bbox writer fed by completed projection blocks.
+
+    Blocks may arrive in any order. Each nonempty slice reserves an append offset, then
+    writes its normalized crop in bounded row slabs with ``pwrite``; neither block-sized nor
+    whole-crop payload objects are retained. Finalization is allowed only after every output
+    slice has been delivered exactly once, so its index, foreground count, and segment extent
+    have the same semantics as :func:`write_raw_bbox_mask_store`.
+    """
+
+    def __init__(
+        self,
+        *,
+        shape: Tuple[int, int, int],
+        store_dir: Path,
+        format_name: str,
+        desc: str,
+        extra_meta: Optional[Dict[str, object]] = None,
+    ) -> None:
+        fmt = str(format_name)
+        if fmt not in MASK_STORE_FORMATS:
+            raise ValueError(f'Unsupported raw bbox mask format: {fmt}')
+        shape_i = tuple(int(v) for v in shape)
+        if len(shape_i) != 3 or any(int(v) < 0 for v in shape_i):
+            raise ValueError(f'{desc}: invalid incremental raw store shape {shape_i}')
+
+        self.shape = (int(shape_i[0]), int(shape_i[1]), int(shape_i[2]))
+        self.store_dir = Path(store_dir)
+        self.format_name = fmt
+        self.desc = str(desc)
+        self.extra_meta = dict(extra_meta or {})
+        self.chunks_path = self.store_dir / 'chunks.bin'
+        self.index_path = self.store_dir / 'index.bin'
+        self.meta_path = self.store_dir / 'meta.json'
+        self.index = np.zeros((int(self.shape[0]),), dtype=CTILE_INDEX_DTYPE)
+        # 0=not received, 1=payload write in progress, 2=complete.
+        self._slice_state = np.zeros((int(self.shape[0]),), dtype=np.uint8)
+        self._lock = threading.RLock()
+        self._active_callbacks = 0
+        self._next_offset = 0
+        self._nonempty_slices = 0
+        self._foreground_voxels = 0
+        self._min_t, self._max_t = int(self.shape[0]), -1
+        self._min_y, self._max_y = int(self.shape[1]), -1
+        self._min_x, self._max_x = int(self.shape[2]), -1
+        self._failed_reason: Optional[BaseException] = None
+        self._warned_failed = False
+        self._finalized = False
+
+        _invalidate_raw_store_chunks_ram_cache(self.chunks_path)
+        if self.store_dir.exists():
+            shutil.rmtree(self.store_dir, ignore_errors=True)
+        self.store_dir.mkdir(parents=True, exist_ok=True)
+        self._fd: Optional[int] = os.open(
+            self.chunks_path,
+            os.O_CREAT | os.O_TRUNC | os.O_RDWR,
+            0o666,
+        )
+
+    @property
+    def failed(self) -> bool:
+        with self._lock:
+            return self._failed_reason is not None
+
+    @property
+    def failed_reason(self) -> Optional[BaseException]:
+        with self._lock:
+            return self._failed_reason
+
+    def warn_failed_once(self, message: str) -> None:
+        with self._lock:
+            if self._warned_failed:
+                return
+            self._warned_failed = True
+        print(f'Warning: {message}; the completed projected volume will use the regular encoder.')
+
+    def abort(self, reason: BaseException) -> None:
+        with self._lock:
+            if self._failed_reason is None:
+                self._failed_reason = reason
+
+    def __call__(self, z0: int, block: np.ndarray) -> None:
+        self.consume(int(z0), block)
+
+    @staticmethod
+    def _pwrite_all(fd: int, data: memoryview, offset: int) -> None:
+        written = 0
+        while int(written) < int(len(data)):
+            n = int(os.pwrite(int(fd), data[int(written):], int(offset) + int(written)))
+            if n <= 0:
+                raise OSError(f'pwrite returned {n} before completing {len(data)} bytes')
+            written += int(n)
+
+    def _consume_slice(self, z: int, plane: np.ndarray) -> None:
+        z_i = int(z)
+        plane_arr = np.asarray(plane)
+        rows = np.any(plane_arr, axis=1)
+        if not bool(np.any(rows)):
+            with self._lock:
+                if self._failed_reason is not None:
+                    return
+                if int(self._slice_state[z_i]) != 0:
+                    raise ValueError(f'{self.desc}: projected slice {z_i} was delivered more than once')
+                self.index[z_i]['kind'] = np.uint8(0)
+                self._slice_state[z_i] = np.uint8(2)
+            return
+
+        cols = np.any(plane_arr, axis=0)
+        y0 = int(np.argmax(rows))
+        y1 = int(rows.size - np.argmax(rows[::-1]))
+        x0 = int(np.argmax(cols))
+        x1 = int(cols.size - np.argmax(cols[::-1]))
+        payload_nbytes = int(y1 - y0) * int(x1 - x0)
+
+        with self._lock:
+            if self._failed_reason is not None:
+                return
+            if int(self._slice_state[z_i]) != 0:
+                raise ValueError(f'{self.desc}: projected slice {z_i} was delivered more than once')
+            if self._fd is None:
+                raise RuntimeError(f'{self.desc}: chunks payload is already closed')
+            fd = int(self._fd)
+            offset = int(self._next_offset)
+            self._next_offset += int(payload_nbytes)
+            self._slice_state[z_i] = np.uint8(1)
+
+        foreground_voxels = 0
+        row_width = int(x1 - x0)
+        rows_per_slab = max(1, int((1 * 1024 * 1024) // max(1, int(row_width))))
+        for slab_y0 in range(int(y0), int(y1), int(rows_per_slab)):
+            slab_y1 = min(int(y1), int(slab_y0) + int(rows_per_slab))
+            # A <=1 MiB normalized slab keeps syscall count bounded without retaining the
+            # whole bbox crop. pwrite lets out-of-order callback threads fill reservations.
+            slab_u8 = np.ascontiguousarray(
+                plane_arr[int(slab_y0):int(slab_y1), int(x0):int(x1)] != 0,
+                dtype=np.uint8,
+            )
+            foreground_voxels += int(np.count_nonzero(slab_u8))
+            self._pwrite_all(
+                fd,
+                memoryview(slab_u8).cast('B'),
+                int(offset) + int(slab_y0 - y0) * int(row_width),
+            )
+
+        with self._lock:
+            if self._failed_reason is not None:
+                return
+            rec = self.index[z_i]
+            rec['kind'] = np.uint8(1)
+            rec['offset'] = np.uint64(offset)
+            rec['payload_size'] = np.uint64(payload_nbytes)
+            rec['y0'] = np.uint32(y0)
+            rec['x0'] = np.uint32(x0)
+            rec['y1'] = np.uint32(y1)
+            rec['x1'] = np.uint32(x1)
+            rec['payload_nbytes'] = np.uint64(payload_nbytes)
+            self._slice_state[z_i] = np.uint8(2)
+            self._nonempty_slices += 1
+            self._foreground_voxels += int(foreground_voxels)
+            self._min_t = min(int(self._min_t), z_i)
+            self._max_t = max(int(self._max_t), z_i)
+            self._min_y = min(int(self._min_y), y0)
+            self._max_y = max(int(self._max_y), int(y1) - 1)
+            self._min_x = min(int(self._min_x), x0)
+            self._max_x = max(int(self._max_x), int(x1) - 1)
+
+    def consume(self, z0: int, block: np.ndarray) -> None:
+        block_arr = np.asarray(block)
+        if block_arr.ndim != 3:
+            raise ValueError(f'{self.desc}: projection callback expected a 3D block, got {block_arr.shape}')
+        if tuple(int(v) for v in block_arr.shape[1:]) != tuple(int(v) for v in self.shape[1:]):
+            raise ValueError(
+                f'{self.desc}: projection callback plane shape {tuple(block_arr.shape[1:])} '
+                f'!= {tuple(self.shape[1:])}'
+            )
+        start = int(z0)
+        stop = int(start) + int(block_arr.shape[0])
+        if start < 0 or stop > int(self.shape[0]):
+            raise ValueError(f'{self.desc}: projection callback block [{start},{stop}) is out of range')
+
+        with self._lock:
+            if self._failed_reason is not None:
+                return
+            if self._finalized:
+                raise RuntimeError(f'{self.desc}: projection callback arrived after finalization')
+            self._active_callbacks += 1
+        try:
+            for local_z in range(int(block_arr.shape[0])):
+                if self.failed:
+                    return
+                self._consume_slice(int(start) + int(local_z), block_arr[int(local_z)])
+        except Exception as exc:
+            self.abort(exc)
+            raise
+        finally:
+            with self._lock:
+                self._active_callbacks -= 1
+
+    def finalize(self) -> Dict[str, object]:
+        with self._lock:
+            if self._failed_reason is not None:
+                raise RuntimeError(
+                    f'{self.desc}: incremental store was invalidated: {self._failed_reason}'
+                ) from self._failed_reason
+            if self._active_callbacks != 0:
+                raise RuntimeError(f'{self.desc}: finalized with {self._active_callbacks} callback(s) active')
+            missing = np.flatnonzero(self._slice_state != np.uint8(2))
+            if int(missing.size) > 0:
+                raise RuntimeError(
+                    f'{self.desc}: incremental store is missing {int(missing.size)} slice(s); '
+                    f'first missing={int(missing[0])}'
+                )
+            if self._finalized:
+                raise RuntimeError(f'{self.desc}: incremental store was finalized more than once')
+            fd = self._fd
+            self._fd = None
+            self._finalized = True
+            payload_bytes = int(self._next_offset)
+            nonempty_slices = int(self._nonempty_slices)
+            foreground_voxels = int(self._foreground_voxels)
+            extent = (
+                _nrrd_empty_segment_extent()
+                if int(self._max_t) < 0
+                else (
+                    int(self._min_x), int(self._max_x),
+                    int(self._min_y), int(self._max_y),
+                    int(self._min_t), int(self._max_t),
+                )
+            )
+        if fd is not None:
+            # Close publishes every pwrite through the host page cache; an fsync here
+            # would force a multi-GiB durability write that the transient cvol/NRRD
+            # pipeline neither requires nor used in the established encoder.
+            os.close(int(fd))
+
+        self.index.tofile(self.index_path)
+        raw_logical_bytes = int(array_nbytes(self.shape, np.uint8))
+        stats: Dict[str, object] = {
+            'nonempty_slices': int(nonempty_slices),
+            'empty_slices': int(self.shape[0] - nonempty_slices),
+            'foreground_voxels': int(foreground_voxels),
+            'logical_raw_uint8_bytes': int(raw_logical_bytes),
+            'raw_payload_bytes': int(payload_bytes),
+            'index_bytes': int(self.index.nbytes),
+            'segment_extent_ijk': _segment_extent_to_json(extent),
+            'segment_extent_shape_tyx': [int(v) for v in self.shape],
+        }
+        meta: Dict[str, object] = {
+            'format': self.format_name,
+            'shape': [int(v) for v in self.shape],
+            'dtype': 'bool',
+            'logical_dtype_in_pipeline': 'uint8_0_or_1',
+            'chunking': 'slice',
+            'precodec': 'none',
+            'compressor': 'none',
+            'bbox_per_chunk': True,
+            'zero_chunk_elision': True,
+            'index_dtype': 'ctile-index-v2-raw',
+            'index_record_bytes': int(CTILE_INDEX_DTYPE.itemsize),
+            'payload_shape_encoding': 'raw_uint8_bbox_shape_from_index',
+            'description': self.desc,
+            'segment_extent_ijk': _segment_extent_to_json(extent),
+            'segment_extent_axis_order': (
+                'Slicer IJK inclusive extent: minX maxX minY maxY minT maxT '
+                'for internal layer order (t,Y,X)'
+            ),
+            'segment_extent_shape_tyx': [int(v) for v in self.shape],
+            'stats': stats,
+        }
+        meta.update(self.extra_meta)
+        self.meta_path.write_text(json.dumps(meta, indent=2) + '\n')
+        print(
+            f'{self.desc}: incremental raw bbox mask store {self.store_dir} '
+            f'(logical_raw={raw_logical_bytes / GIB:.2f} GiB, '
+            f'payload={payload_bytes / GIB:.2f} GiB, nonempty_slices={nonempty_slices})'
+        )
+        return stats
+
+    def discard(self) -> None:
+        with self._lock:
+            fd = self._fd
+            self._fd = None
+            if self._failed_reason is None and not self._finalized:
+                self._failed_reason = RuntimeError('incremental store discarded')
+        if fd is not None:
+            try:
+                os.close(int(fd))
+            except OSError:
+                pass
+        _invalidate_raw_store_chunks_ram_cache(self.chunks_path)
+        shutil.rmtree(self.store_dir, ignore_errors=True)
+
+
 class RawBBoxMaskStore:
     """Read adapter for v12.2.0 raw slice-bbox binary mask volumes.
 
@@ -16576,14 +18135,16 @@ class RawBBoxMaskStore:
         meta: Dict[str, object],
         index: np.ndarray,
         *,
-        chunks_bytes: Optional[bytes] = None,
+        chunks_bytes: Optional[object] = None,
         mmap_payload: bool = False,
     ) -> None:
         self.root = Path(root)
         self.meta = dict(meta)
         self.index = np.asarray(index, dtype=CTILE_INDEX_DTYPE)
         self.chunks_path = self.root / 'chunks.bin'
-        self._chunks_bytes: Optional[bytes] = chunks_bytes
+        # ``chunks_bytes`` is retained as a compatibility keyword, but v13.3.11 passes
+        # the process-shared read-only mmap instead of a heap-owned bytes copy.
+        self._chunks_bytes: Optional[object] = chunks_bytes
         self._chunks_mmap: Optional[mmap.mmap] = None
         # True when open() holds a reference on the shared RAM cache entry for this
         # store's chunks.bin (released via _drop_nrrd_raw_store_chunks_ram_cache).
@@ -16621,7 +18182,7 @@ class RawBBoxMaskStore:
         if not isinstance(shape, list) or len(shape) != 3:
             raise ValueError(f'{root}: invalid shape metadata {shape!r}')
         index = np.fromfile(index_path, dtype=CTILE_INDEX_DTYPE, count=int(shape[0]))
-        chunks_bytes: Optional[bytes] = None
+        chunks_bytes: Optional[object] = None
         ram_cache_ref_held = False
         if bool(cache_payload_in_ram):
             chunks_bytes, was_cached = _acquire_raw_store_chunks_ram_cache(chunks_path)
@@ -16630,7 +18191,7 @@ class RawBBoxMaskStore:
             was_cached = False
         try:
             if ram_cache_ref_held:
-                verb = 'reused from RAM' if was_cached else 'cached in RAM'
+                verb = 'reused shared mmap' if was_cached else 'mapped read-only'
                 print(
                     f'Raw bbox mask store {verb} for NRRD streaming: {root} '
                     f'({len(chunks_bytes) / GIB:.3f} GiB chunks.bin)'
@@ -16732,6 +18293,93 @@ class RawBBoxMaskStore:
         out = np.zeros((int(h), int(w)), dtype=np.dtype(dtype))
         self.fill_decoded_slice_into(idx_i, out)
         return out
+
+    def iter_native_sparse_members(
+        self,
+        z_start: int,
+        z_stop: int,
+        *,
+        member_bytes: int,
+    ) -> Iterator[Tuple[int, Optional[np.ndarray]]]:
+        """Yield native-order payload members directly from the cvol index.
+
+        ``None`` means that no indexed bbox overlaps the member and lets the payload
+        writer emit its cached compressed-zero member. Intersecting members alone get a
+        zeroed 1-D allocation; bbox crop rows are scattered straight from ``chunks.bin``.
+        No dense output slice is constructed, and occupancy is decided by the index rather
+        than by rescanning the materialized member with ``any()``.
+
+        Member boundaries are relative to this z band (each z shard is an independent gzip
+        member run), while cvol offsets below remain absolute in the full native volume.
+        """
+        z_dim, h, w = (int(v) for v in self.shape)
+        z0 = int(np.clip(int(z_start), 0, z_dim))
+        z1 = int(np.clip(int(z_stop), z0, z_dim))
+        slice_bytes = int(h) * int(w)
+        chunk_bytes = max(1, int(member_bytes))
+        stream_bytes = int(z1 - z0) * int(slice_bytes)
+
+        for local_start in range(0, int(stream_bytes), int(chunk_bytes)):
+            ln = min(int(chunk_bytes), int(stream_bytes) - int(local_start))
+            absolute_start = int(z0) * int(slice_bytes) + int(local_start)
+            absolute_stop = int(absolute_start) + int(ln)
+            first_z = max(z0, int(absolute_start // slice_bytes))
+            last_z = min(z1 - 1, int((absolute_stop - 1) // slice_bytes))
+
+            # Index-only classification. The linear bbox span is a conservative superset
+            # when a member boundary lands in a row gap; a false positive merely deflates
+            # a zero member normally and can never omit foreground.
+            candidates: List[int] = []
+            for z in range(int(first_z), int(last_z) + 1):
+                rec = self.index[int(z)]
+                if int(rec['kind']) == 0:
+                    continue
+                if int(rec['kind']) != 1:
+                    raise ValueError(
+                        f'{self.root}: invalid raw-mask chunk marker '
+                        f'{int(rec["kind"])} at slice {int(z)}'
+                    )
+                y0 = int(rec['y0']); x0 = int(rec['x0'])
+                y1 = int(rec['y1']); x1 = int(rec['x1'])
+                bbox_first = int(z) * slice_bytes + int(y0) * int(w) + int(x0)
+                bbox_stop = int(z) * slice_bytes + int(y1 - 1) * int(w) + int(x1)
+                if int(bbox_first) < int(absolute_stop) and int(bbox_stop) > int(absolute_start):
+                    candidates.append(int(z))
+
+            if not candidates:
+                yield int(ln), None
+                continue
+
+            member = np.zeros((int(ln),), dtype=np.uint8)
+            for z in candidates:
+                decoded = self.decode_slice_crop(int(z), dtype=np.uint8)
+                if decoded is None:  # index changed/truncated after classification
+                    continue
+                y0, x0, y1, x1, crop = decoded
+                slice_base = int(z) * int(slice_bytes)
+
+                # Whole-slice coverage is common at 16 MiB and turns the crop scatter into
+                # one rectangular memcpy instead of thousands of Python row operations.
+                if absolute_start <= slice_base and absolute_stop >= slice_base + slice_bytes:
+                    dst0 = int(slice_base - absolute_start)
+                    plane = member[dst0:dst0 + slice_bytes].reshape((h, w))
+                    plane[int(y0):int(y1), int(x0):int(x1)] = crop
+                    continue
+
+                crop_w = int(x1 - x0)
+                for row_idx, y in enumerate(range(int(y0), int(y1))):
+                    row_start = int(slice_base) + int(y) * int(w) + int(x0)
+                    row_stop = int(row_start) + int(crop_w)
+                    copy_start = max(int(row_start), int(absolute_start))
+                    copy_stop = min(int(row_stop), int(absolute_stop))
+                    if copy_stop <= copy_start:
+                        continue
+                    src0 = int(copy_start - row_start)
+                    dst0 = int(copy_start - absolute_start)
+                    member[dst0:dst0 + int(copy_stop - copy_start)] = crop[
+                        int(row_idx), src0:src0 + int(copy_stop - copy_start)
+                    ]
+            yield int(ln), member
 
 
     def unlink(self) -> None:
@@ -17033,13 +18681,12 @@ def waiting_tile_spill_enabled() -> bool:
 
 
 def nrrd_cache_raw_bbox_layers_in_ram_enabled() -> bool:
-    """Cache cvol/ctile raw bbox payload files in RAM during NRRD streaming.
+    """Share cvol/ctile payloads through a read-only mmap during NRRD streaming.
 
     The NRRD writer uses the same layer backing files for both ``NRRD streaming:
     segment extents`` and ``NRRD streaming: decomposed layers``.  When those
-    backing files are raw bbox stores, their ``chunks.bin`` payloads
-    are intentionally read into RAM before slice traversal to remove repeated
-    random NVMe reads.
+    backing files are raw bbox stores, their ``chunks.bin`` payloads use one
+    refcounted mapping. The legacy environment name is retained for compatibility.
     """
     return _env_flag('YOLO_TTA_NRRD_CACHE_RAW_BBOX_LAYERS_IN_RAM', True)
 
@@ -17193,6 +18840,8 @@ def project_view_volume_to_orthogonal_volume(
     out_shape_tyx: Optional[Tuple[int, int, int]] = None,
     allow_transverse_passthrough: bool = False,
     known_row_occupancy: Optional[np.ndarray] = None,
+    known_slice_bboxes: Optional[np.ndarray] = None,
+    projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
 ) -> np.ndarray:
     """Project a view-native binary volume into orthogonal (t,Y,X) geometry.
 
@@ -17219,6 +18868,8 @@ def project_view_volume_to_orthogonal_volume(
             workers=int(workers),
             out_shape_tyx=out_shape_tyx,
             known_row_occupancy=known_row_occupancy,
+            known_slice_bboxes=known_slice_bboxes,
+            projection_block_callback=projection_block_callback,
         )
 
     if is_tilted_view(view):
@@ -17340,6 +18991,7 @@ def materialize_nrrd_view_layer(
     workers: int = 1,
     known_has_foreground: Optional[bool] = None,
     known_row_occupancy: Optional[np.ndarray] = None,
+    known_slice_bboxes: Optional[np.ndarray] = None,
 ) -> Optional[NrrdLayerRef]:
     """Persist a view-derived layer in orthogonal processing geometry for the NRRD writer."""
     # v13.3.1 (R16): callers that already know whether the volume has foreground (e.g. the
@@ -17375,37 +19027,111 @@ def materialize_nrrd_view_layer(
     projection_out_shape: Optional[Tuple[int, int, int]] = None
     if view.family == 'radial' or is_tilted_view(view):
         projection_out_shape = final_source_output_shape()
-    projected = project_view_volume_to_orthogonal_volume(
-        view_volume_mm,
-        view,
-        raw_path,
-        desc=f'NRRD layer {key}',
-        workers=int(workers),
-        prefer_memory=bool(transient_projection_in_memory),
-        reserve_bytes=32 * GIB,
-        out_shape_tyx=projection_out_shape,
-        # v13.3.2 (R15): transverse layers headed for a raw-bbox store are encoded straight
-        # from the source volume (identity projection, synchronous encode) — no copy.
-        allow_transverse_passthrough=bool(raw_bbox_nrrd_layers_enabled()),
-        # v13.3.6 (D1): device-union row occupancy (radial views only; valid for the
-        # pre-interpolation layer, which is the only caller that supplies it).
-        known_row_occupancy=known_row_occupancy,
-    )
+    incremental_writer: Optional[IncrementalRawBBoxMaskStoreWriter] = None
+    projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None
+    incremental_extra_meta = {
+        'nrrd_layer_key': key,
+        'source_raw_path': str(raw_path),
+        'source_raw_workspace': 'in_memory_when_available' if bool(transient_projection_in_memory) else 'disk_backed',
+        'projection_payload_fusion': 'radial_block_callback',
+    }
+    if bool(raw_bbox_nrrd_layers_enabled()) and str(view.family) == 'radial':
+        expected_shape = (
+            tuple(int(v) for v in projection_out_shape)
+            if projection_out_shape is not None
+            else (int(view.src_h), int(view.full_h), int(view.full_w))
+        )
+        try:
+            incremental_writer = IncrementalRawBBoxMaskStoreWriter(
+                shape=(int(expected_shape[0]), int(expected_shape[1]), int(expected_shape[2])),
+                store_dir=out_path,
+                format_name=CVOL_FORMAT,
+                desc=f'NRRD layer {key}',
+                extra_meta=incremental_extra_meta,
+            )
+            projection_block_callback = incremental_writer
+        except Exception as exc:
+            print(
+                f'Warning: NRRD layer {key}: incremental radial cvol writer unavailable '
+                f'({exc}); the completed projection will use the regular encoder.'
+            )
+            incremental_writer = None
+            projection_block_callback = None
+
+    def _project_layer(
+        block_callback: Optional[Callable[[int, np.ndarray], None]],
+    ) -> np.ndarray:
+        return project_view_volume_to_orthogonal_volume(
+            view_volume_mm,
+            view,
+            raw_path,
+            desc=f'NRRD layer {key}',
+            workers=int(workers),
+            prefer_memory=bool(transient_projection_in_memory),
+            reserve_bytes=32 * GIB,
+            out_shape_tyx=projection_out_shape,
+            # v13.3.2 (R15): transverse layers headed for a raw-bbox store are encoded straight
+            # from the source volume (identity projection, synchronous encode) — no copy.
+            allow_transverse_passthrough=bool(raw_bbox_nrrd_layers_enabled()),
+            # v13.3.6 (D1): device-union row occupancy (radial views only; valid for the
+            # pre-interpolation layer, which is the only caller that supplies it).
+            known_row_occupancy=known_row_occupancy,
+            known_slice_bboxes=known_slice_bboxes,
+            projection_block_callback=block_callback,
+        )
+
+    try:
+        projected = _project_layer(projection_block_callback)
+    except Exception as exc:
+        # A projection failure can leave a callback store incomplete. Discard it and retry
+        # once without fusion; callback failures themselves are swallowed by the emitter and
+        # therefore never compromise the completed projected volume.
+        if incremental_writer is None:
+            raise
+        incremental_writer.abort(exc)
+        incremental_writer.discard()
+        incremental_writer = None
+        projection_block_callback = None
+        try:
+            raw_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        print(
+            f'Warning: NRRD layer {key}: fused radial projection failed ({exc}); '
+            'retrying projection before regular raw-bbox encoding.'
+        )
+        projected = _project_layer(None)
     projected_is_source = bool(np.may_share_memory(np.asarray(projected), np.asarray(view_volume_mm)))
     shape = tuple(int(x) for x in np.asarray(projected).shape)
     if raw_bbox_nrrd_layers_enabled():
-        layer_stats = write_raw_bbox_mask_store(
-            projected,
-            out_path,
-            format_name=CVOL_FORMAT,
-            desc=f'NRRD layer {key}',
-            workers=int(workers),
-            extra_meta={
-                'nrrd_layer_key': key,
-                'source_raw_path': 'encoded_direct_from_view_volume' if projected_is_source else str(raw_path),
-                'source_raw_workspace': 'in_memory_when_available' if bool(transient_projection_in_memory) else 'disk_backed',
-            },
-        )
+        layer_stats: Optional[Dict[str, object]] = None
+        if incremental_writer is not None:
+            try:
+                if tuple(int(v) for v in incremental_writer.shape) != tuple(int(v) for v in shape):
+                    raise ValueError(
+                        f'incremental shape {incremental_writer.shape} != projected shape {shape}'
+                    )
+                layer_stats = incremental_writer.finalize()
+            except Exception as exc:
+                incremental_writer.abort(exc)
+                incremental_writer.warn_failed_once(
+                    f'NRRD layer {key}: incremental radial cvol finalization failed ({exc})'
+                )
+                incremental_writer.discard()
+                layer_stats = None
+        if layer_stats is None:
+            layer_stats = write_raw_bbox_mask_store(
+                projected,
+                out_path,
+                format_name=CVOL_FORMAT,
+                desc=f'NRRD layer {key}',
+                workers=int(workers),
+                extra_meta={
+                    'nrrd_layer_key': key,
+                    'source_raw_path': 'encoded_direct_from_view_volume' if projected_is_source else str(raw_path),
+                    'source_raw_workspace': 'in_memory_when_available' if bool(transient_projection_in_memory) else 'disk_backed',
+                },
+            )
         segment_extent = _coerce_segment_extent(layer_stats.get('segment_extent_ijk')) or _nrrd_empty_segment_extent()
         segment_extent_source = 'raw_bbox_cvol_index'
         storage_format = CVOL_FORMAT
@@ -17814,6 +19540,22 @@ def prepare_view_volume_after_fullframe(
                         workers=int(slice_workers),
                         # v13.3.1 (R16): the pass already counted its added voxels.
                         known_has_foreground=int(stats_local.get('added_voxels', 0)) > 0,
+                        # v13.3.11: interpolation computed these while forming the exact
+                        # delta. Radial projection consumes them without a strided rescan.
+                        known_row_occupancy=(
+                            np.asarray(stats_local.get('bridge_delta_row_occupancy'), dtype=bool)
+                            if (
+                                str(view.family) == 'radial'
+                                and stats_local.get('bridge_delta_row_occupancy') is not None
+                            ) else None
+                        ),
+                        known_slice_bboxes=(
+                            np.asarray(stats_local.get('bridge_delta_slice_bboxes'), dtype=np.int64)
+                            if (
+                                str(view.family) == 'radial'
+                                and stats_local.get('bridge_delta_slice_bboxes') is not None
+                            ) else None
+                        ),
                     )
                     if layer_ref is not None:
                         nrrd_layers.append(layer_ref)
@@ -18649,6 +20391,20 @@ def finalize_consolidated_tile_volume_for_parent(
                         workers=int(slice_workers),
                         # v13.3.1 (R16): the pass already counted its added voxels.
                         known_has_foreground=int(stats_local.get('added_voxels', 0)) > 0,
+                        known_row_occupancy=(
+                            np.asarray(stats_local.get('bridge_delta_row_occupancy'), dtype=bool)
+                            if (
+                                str(view.family) == 'radial'
+                                and stats_local.get('bridge_delta_row_occupancy') is not None
+                            ) else None
+                        ),
+                        known_slice_bboxes=(
+                            np.asarray(stats_local.get('bridge_delta_slice_bboxes'), dtype=np.int64)
+                            if (
+                                str(view.family) == 'radial'
+                                and stats_local.get('bridge_delta_slice_bboxes') is not None
+                            ) else None
+                        ),
                     )
                     if layer_ref is not None:
                         nrrd_layers.append(layer_ref)
@@ -19449,6 +21205,61 @@ def nrrd_fill_workers() -> int:
     return max(2, _env_int('YOLO_TTA_NRRD_FILL_WORKERS', max(2, min(32, _cpu_count() // 4))))
 
 
+# v13.3.11: one process-wide fill executor. Previously every one of up to twelve sink
+# workers checked out its own 32-thread pool, so simultaneous sparse-store reads could
+# launch hundreds of memory-scanning threads. Per-writer jobs below submit a bounded set
+# of ranges to this singleton; the executor itself is the hard global concurrency cap.
+_NRRD_FILL_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_NRRD_FILL_EXECUTOR_LOCK = threading.Lock()
+
+
+def _nrrd_fill_executor() -> ThreadPoolExecutor:
+    global _NRRD_FILL_EXECUTOR
+    with _NRRD_FILL_EXECUTOR_LOCK:
+        if _NRRD_FILL_EXECUTOR is None:
+            _NRRD_FILL_EXECUTOR = ThreadPoolExecutor(
+                max_workers=int(nrrd_fill_workers()),
+                thread_name_prefix='nrrd-fill',
+            )
+        return _NRRD_FILL_EXECUTOR
+
+
+def _nrrd_parallel_fill_indices(
+    count: int,
+    func: Callable[[int], None],
+    *,
+    requested_workers: int,
+) -> None:
+    total = max(0, int(count))
+    lanes = max(1, min(int(requested_workers), int(total))) if total > 0 else 0
+    if lanes <= 1:
+        for idx in range(total):
+            func(int(idx))
+        return
+    # At most one range per requested lane prevents one sink writer from flooding the
+    # shared FIFO with thousands of tiny tasks while preserving GIL-releasing slice work.
+    chunk = max(1, int(math.ceil(float(total) / float(lanes))))
+
+    def _run(start: int, stop: int) -> None:
+        for idx in range(int(start), int(stop)):
+            func(int(idx))
+
+    executor = _nrrd_fill_executor()
+    futures = [
+        executor.submit(_run, int(start), int(min(total, start + chunk)))
+        for start in range(0, total, chunk)
+    ]
+    first_error: Optional[BaseException] = None
+    for fut in futures:
+        try:
+            fut.result()
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise first_error
+
+
 def nrrd_pigz_threads() -> int:
     default_threads = max(1, min(_cpu_count(), _env_int('YOLO_TTA_NRRD_PIGZ_MAX_THREADS', max(1, _cpu_count()))))
     return max(1, _env_int('YOLO_TTA_NRRD_PIGZ_THREADS', int(default_threads)))
@@ -19759,6 +21570,21 @@ def _crc32_combine(crc1: int, crc2: int, len2: int) -> int:
     return (crc1 ^ crc2) & 0xFFFFFFFF
 
 
+def _crc32_byteslike(crc_fn: Callable[..., int], payload: object) -> int:
+    """Call zlib/ISA-L CRC with a contiguous PEP-3118 byte buffer, never an ndarray.
+
+    Some python-isal builds accept a NumPy array without raising but treat its argument
+    incorrectly and return zero.  A byte-cast memoryview exercises the supported bytes-like
+    API for both backends without copying the NRRD chunk.
+    """
+    mv = payload if isinstance(payload, memoryview) else memoryview(payload)  # type: ignore[arg-type]
+    mv = mv.cast('B')
+    try:
+        return int(crc_fn(mv, 0)) & 0xFFFFFFFF
+    except TypeError:
+        return int(crc_fn(mv)) & 0xFFFFFFFF
+
+
 # Cache of deflated all-zero chunks keyed by (backend, level, byte length): the compressed
 # bytes AND the CRC of a zero run are pure functions of the length.
 _NRRD_GZIP_ZERO_CACHE: Dict[Tuple[str, int, int], Tuple[bytes, int]] = {}
@@ -19803,17 +21629,23 @@ class _ParallelGzipPayloadWriter:
                 _NRRD_GZIP_ZERO_CACHE[key] = cached
         return cached
 
-    def _compress_chunk(self, mv: memoryview) -> Tuple[bytes, int, int]:
+    def _compress_chunk(
+        self, mv: memoryview, known_nonzero: bool = False,
+    ) -> Tuple[bytes, int, int]:
         ln = len(mv)
-        arr = np.frombuffer(mv, dtype=np.uint8)
-        if not arr.any():
+        if not bool(known_nonzero) and not np.frombuffer(mv, dtype=np.uint8).any():
             comp, crc = self._zero_flush_chunk(int(ln))
             return comp, int(crc), int(ln)
         cobj = self.factory()
         comp = cobj.compress(mv) + cobj.flush(self.full_flush)
-        return comp, int(self.crc_fn(mv)) & 0xFFFFFFFF, int(ln)
+        return comp, _crc32_byteslike(self.crc_fn, mv), int(ln)
 
-    def write(self, data: bytes | bytearray | memoryview) -> int:
+    def _write_impl(
+        self,
+        data: bytes | bytearray | memoryview,
+        *,
+        known_nonzero: bool,
+    ) -> int:
         if self.closed:
             raise RuntimeError('Cannot write to a closed gzip payload stream')
         mv = data if isinstance(data, memoryview) else memoryview(data)
@@ -19823,7 +21655,11 @@ class _ParallelGzipPayloadWriter:
             return 0
         executor = _nrrd_gzip_executor()
         futures = [
-            executor.submit(self._compress_chunk, mv[off:off + self.chunk_bytes])
+            executor.submit(
+                self._compress_chunk,
+                mv[off:off + self.chunk_bytes],
+                bool(known_nonzero),
+            )
             for off in range(0, total, self.chunk_bytes)
         ]
         for fut in futures:
@@ -19832,6 +21668,13 @@ class _ParallelGzipPayloadWriter:
             self.crc = _crc32_combine(self.crc, int(crc), int(ln))
             self.isize = (self.isize + int(ln)) & 0xFFFFFFFF
         return int(total)
+
+    def write(self, data: bytes | bytearray | memoryview) -> int:
+        return self._write_impl(data, known_nonzero=False)
+
+    def write_known_nonzero(self, data: bytes | bytearray | memoryview) -> int:
+        """Encode an index-classified sparse member without an all-zero scan."""
+        return self._write_impl(data, known_nonzero=True)
 
     def write_zeros(self, nbytes: int) -> int:
         """v13.3.7 (B5/N4): splice cached deflated zero chunks — no source bytes, no deflate."""
@@ -19993,6 +21836,13 @@ class _NvcompDeflateEngine:
             max_workers=int(self.stream_count),
             thread_name_prefix=f'nvcomp-gpu{self.device_index}',
         )
+        # Complete-gzip support is deliberately separate from the established RAW
+        # DEFLATE lane.  Some nvidia-nvcomp wheels expose only BitstreamKind.RAW; those
+        # wheels remain valid for the host-input writer but cannot gzip a device tensor
+        # without first reading its CRC back to the host.  Probe once, by round trip.
+        self._device_gzip_probe_lock = threading.Lock()
+        self._device_gzip_supported: Optional[bool] = None
+        self._device_gzip_reason = 'not probed'
 
     def _make_codec(self, stream: object) -> object:
         """Construct a Codec on (and only for) its eventual owner thread."""
@@ -20037,6 +21887,194 @@ class _NvcompDeflateEngine:
             lane = (stream, codec)
             self._owner_local.lane = lane
         return lane
+
+    def _make_complete_gzip_codec(self, stream: object) -> object:
+        """Construct a codec that emits a COMPLETE RFC-1952 gzip member.
+
+        nvCOMP Python releases differ here: recent bindings may expose
+        ``BitstreamKind.GZIP`` for the Deflate codec, while a few expose a dedicated
+        Gzip algorithm.  No RAW/default fallback is accepted in this method; the
+        round-trip probe below must observe a real gzip header and valid CRC trailer.
+        """
+        nvcomp = self.nvcomp
+        candidates: List[Dict[str, object]] = []
+        bitstream_enum = getattr(nvcomp, 'BitstreamKind', None)
+        gzip_kind = getattr(bitstream_enum, 'GZIP', None) if bitstream_enum is not None else None
+        if gzip_kind is not None:
+            for algorithm in ('Deflate', 'deflate'):
+                candidates.append({
+                    'algorithm': algorithm,
+                    'bitstream_kind': gzip_kind,
+                    'device_id': int(self.device_index),
+                    'cuda_stream': int(stream.cuda_stream),
+                })
+        # Feature-detect bindings which publish gzip as its own algorithm rather than a
+        # Deflate bitstream kind.  The self-test rejects native/raw/zlib output.
+        for algorithm in ('Gzip', 'gzip'):
+            candidates.append({
+                'algorithm': algorithm,
+                'device_id': int(self.device_index),
+                'cuda_stream': int(stream.cuda_stream),
+            })
+
+        last_exc: Optional[BaseException] = None
+        for base in candidates:
+            variants = [dict(base), {
+                k: v for k, v in base.items() if k not in {'device_id', 'cuda_stream'}
+            }]
+            for kwargs in variants:
+                try:
+                    return nvcomp.Codec(**kwargs)
+                except Exception as exc:
+                    last_exc = exc
+        if gzip_kind is None and last_exc is None:
+            raise RuntimeError('installed nvidia-nvcomp exposes neither BitstreamKind.GZIP nor a Gzip codec')
+        raise RuntimeError(f'nvCOMP complete-gzip Codec construction failed ({last_exc})')
+
+    def _owner_complete_gzip_lane(self) -> Tuple[object, object]:
+        """Return this owner thread's private complete-gzip stream/Codec pair."""
+        lane = getattr(self._owner_local, 'complete_gzip_lane', None)
+        if lane is None:
+            torch = self.torch
+            with torch.cuda.device(self.device):
+                stream = torch.cuda.Stream(device=self.device)
+                codec = self._make_complete_gzip_codec(stream)
+            lane = (stream, codec)
+            self._owner_local.complete_gzip_lane = lane
+        return lane
+
+    def _compress_device_gzip_owned(
+        self,
+        tensor: object,
+        *,
+        chunk_bytes: int,
+        batch_bytes: int,
+    ) -> List[bytes]:
+        """Encode a CUDA uint8 tensor directly into complete gzip members.
+
+        Only compressed nvCOMP outputs cross PCIe.  The input is never converted to a
+        NumPy array and never staged through host memory.  The producer must record or
+        synchronize its stream before submitting; the mirror tee does so at finalize.
+        """
+        torch = self.torch
+        nvcomp = self.nvcomp
+        if not bool(getattr(tensor, 'is_cuda', False)):
+            raise TypeError('device-gzip input is not a CUDA tensor')
+        tensor_device = getattr(tensor, 'device', None)
+        tensor_device_index = getattr(tensor_device, 'index', None)
+        if tensor_device_index is None:
+            tensor_device_index = int(torch.cuda.current_device())
+        if int(tensor_device_index) != int(self.device_index):
+            raise ValueError(
+                f'device-gzip tensor is on cuda:{int(tensor_device_index)}, '
+                f'engine owns cuda:{int(self.device_index)}'
+            )
+        if getattr(tensor, 'dtype', None) != torch.uint8:
+            raise TypeError(f'device-gzip requires torch.uint8, got {getattr(tensor, "dtype", None)}')
+
+        flat = tensor.detach().contiguous().reshape(-1)
+        total = int(flat.numel())
+        if total <= 0:
+            return []
+        chunk_i = max(1, int(chunk_bytes))
+        batch_i = max(int(chunk_i), int(batch_bytes))
+        stream, codec = self._owner_complete_gzip_lane()
+        members: List[bytes] = []
+        with torch.cuda.device(self.device):
+            with torch.cuda.stream(stream):
+                # The caller synchronized the producing stream. record_stream keeps the
+                # caching allocator from recycling the storage while this owner stream runs.
+                try:
+                    flat.record_stream(stream)
+                except Exception:
+                    pass
+                for w0 in range(0, total, int(batch_i)):
+                    w1 = min(total, int(w0) + int(batch_i))
+                    arrays: List[object] = []
+                    for off in range(int(w0), int(w1), int(chunk_i)):
+                        ln = min(int(chunk_i), int(w1) - int(off))
+                        view = flat[int(off):int(off) + int(ln)]
+                        try:
+                            arrays.append(nvcomp.as_array(
+                                view, cuda_stream=int(stream.cuda_stream),
+                            ))
+                        except TypeError:
+                            arrays.append(nvcomp.as_array(view))
+                    encoded = codec.encode(arrays)
+                    if not isinstance(encoded, (list, tuple)):
+                        encoded = [encoded]
+
+                    pinned_out: List[object] = []
+                    async_ok = True
+                    try:
+                        for enc in encoded:
+                            try:
+                                enc_t = torch.from_dlpack(enc)
+                            except AttributeError:  # older torch
+                                enc_t = torch.utils.dlpack.from_dlpack(enc)
+                            host_enc = torch.empty_like(enc_t, device='cpu', pin_memory=True)
+                            host_enc.copy_(enc_t, non_blocking=True)
+                            pinned_out.append(host_enc)
+                    except Exception:
+                        async_ok = False
+                    stream.synchronize()
+                    if async_ok and len(pinned_out) == len(encoded):
+                        batch_members = [bytes(np.asarray(item.numpy())) for item in pinned_out]
+                    else:
+                        batch_members = [bytes(np.asarray(enc.cpu())) for enc in encoded]
+                    if len(batch_members) != len(arrays):
+                        raise RuntimeError('nvCOMP complete-gzip returned a mismatched member count')
+                    for member in batch_members:
+                        if len(member) < 18 or member[:3] != b'\x1f\x8b\x08':
+                            raise RuntimeError('nvCOMP complete-gzip output lacks an RFC-1952 header')
+                    members.extend(batch_members)
+                    del arrays, encoded, pinned_out
+        return members
+
+    def compress_device_gzip_members(self, tensor: object) -> List[bytes]:
+        """Blocking device-tensor encode used only after capability validation."""
+        if self._device_gzip_supported is not True:
+            ok, reason = self.device_gzip_capability()
+            if not ok:
+                raise RuntimeError(reason)
+        return self._owner_pool.submit(
+            self._compress_device_gzip_owned,
+            tensor,
+            chunk_bytes=int(nrrd_gpu_deflate_chunk_bytes()),
+            batch_bytes=int(nrrd_gpu_deflate_batch_bytes()),
+        ).result()
+
+    def device_gzip_capability(self) -> Tuple[bool, str]:
+        """Feature-detect and round-trip the no-uncompressed-D2H gzip path once."""
+        if self._device_gzip_supported is not None:
+            return bool(self._device_gzip_supported), str(self._device_gzip_reason)
+        with self._device_gzip_probe_lock:
+            if self._device_gzip_supported is not None:
+                return bool(self._device_gzip_supported), str(self._device_gzip_reason)
+            try:
+                import gzip as _gzip
+                probe = (bytes(range(251)) * 37) + b'device-resident-nvcomp-gzip-probe'
+                with self.torch.cuda.device(self.device):
+                    dev = self.torch.as_tensor(
+                        np.frombuffer(probe, dtype=np.uint8).copy(),
+                        dtype=self.torch.uint8,
+                        device=self.device,
+                    )
+                members = self._owner_pool.submit(
+                    self._compress_device_gzip_owned,
+                    dev,
+                    chunk_bytes=4096,
+                    batch_bytes=16384,
+                ).result()
+                decoded = _gzip.decompress(b''.join(members))
+                if decoded != probe:
+                    raise RuntimeError('complete-gzip round-trip mismatch')
+                self._device_gzip_supported = True
+                self._device_gzip_reason = 'validated complete-gzip device-tensor codec'
+            except Exception as exc:
+                self._device_gzip_supported = False
+                self._device_gzip_reason = str(exc)
+            return bool(self._device_gzip_supported), str(self._device_gzip_reason)
 
     def compress_window(self, window_np: np.ndarray, spans: List[Tuple[int, int]]) -> List[bytes]:
         """Compress byte spans of one host window to raw deflate streams.
@@ -20262,26 +22300,40 @@ class _GpuDeflatePayloadWriter:
         self.fallback_member_executor = fallback_member_executor
         self._cpu_fallback: Optional[object] = None
 
-    def _prepare_window(self, window: np.ndarray, executor: ThreadPoolExecutor) -> Dict[str, object]:
+    def _prepare_window(
+        self,
+        window: np.ndarray,
+        executor: ThreadPoolExecutor,
+        *,
+        known_nonzero: bool = False,
+    ) -> Dict[str, object]:
         spans: List[Tuple[int, int]] = []
         chunk_meta: List[Tuple[int, bool]] = []
         crc_futs: List[Optional[Future]] = []
         for off in range(0, int(window.size), self.chunk_bytes):
             ln = min(self.chunk_bytes, int(window.size) - off)
             chunk = window[off:off + ln]
-            if not chunk.any():
+            # The sparse-cvol iterator already classified an intersecting member from
+            # its bbox index. Conservatively encode every nvCOMP subchunk in that member
+            # instead of rescanning it merely to find zero-only gaps.
+            if not bool(known_nonzero) and not chunk.any():
                 chunk_meta.append((ln, True))
                 crc_futs.append(None)
                 continue
             chunk_meta.append((ln, False))
             spans.append((int(off), int(ln)))
-            crc_futs.append(executor.submit(self.crc_fn, chunk))
+            # v13.3.11: do not hand a NumPy array directly to python-isal's crc32.
+            # Every GPU returning CRC 0 was a host argument bug, not four bad encoders.
+            crc_futs.append(executor.submit(
+                _crc32_byteslike, self.crc_fn, memoryview(chunk).cast('B'),
+            ))
         work: Dict[str, object] = {
             'window': window,
             'spans': spans,
             'chunk_meta': chunk_meta,
             'crc_futs': crc_futs,
             'compression': None,
+            'known_nonzero': bool(known_nonzero),
         }
         return work
 
@@ -20313,6 +22365,15 @@ class _GpuDeflatePayloadWriter:
                 member_executor=self.fallback_member_executor,
             )
 
+    def _write_cpu_fallback(self, data: object, *, known_nonzero: bool) -> int:
+        if self._cpu_fallback is None:
+            raise RuntimeError('CPU gzip fallback is not active')
+        if bool(known_nonzero):
+            write_known = getattr(self._cpu_fallback, 'write_known_nonzero', None)
+            if callable(write_known):
+                return int(write_known(data))
+        return int(self._cpu_fallback.write(data))  # type: ignore[union-attr]
+
     def _write_work(self, work: Dict[str, object]) -> bool:
         """Finish one ordered GPU window; return False when it was retried on CPU."""
         try:
@@ -20336,7 +22397,10 @@ class _GpuDeflatePayloadWriter:
         except Exception as exc:
             self._settle_work(work)
             self._activate_cpu_fallback(exc)
-            self._cpu_fallback.write(memoryview(work['window']).cast('B'))  # type: ignore[union-attr,arg-type]
+            self._write_cpu_fallback(
+                memoryview(work['window']).cast('B'),  # type: ignore[arg-type]
+                known_nonzero=bool(work.get('known_nonzero', False)),
+            )
             return False
 
         # No I/O occurs until every GPU/CRC result for the window is known. An I/O error is
@@ -20346,7 +22410,12 @@ class _GpuDeflatePayloadWriter:
             self.compressed_bytes += len(member)
         return True
 
-    def write(self, data: bytes | bytearray | memoryview) -> int:
+    def _write_impl(
+        self,
+        data: bytes | bytearray | memoryview,
+        *,
+        known_nonzero: bool,
+    ) -> int:
         if self.closed:
             raise RuntimeError('Cannot write to a closed GPU deflate payload stream')
         mv = data if isinstance(data, memoryview) else memoryview(data)
@@ -20355,7 +22424,7 @@ class _GpuDeflatePayloadWriter:
         if total <= 0:
             return 0
         if self._cpu_fallback is not None:
-            return int(self._cpu_fallback.write(mv))  # type: ignore[union-attr]
+            return self._write_cpu_fallback(mv, known_nonzero=bool(known_nonzero))
         buf = np.frombuffer(mv, dtype=np.uint8)
         executor = _nrrd_gzip_executor()
         pending: deque = deque()
@@ -20363,11 +22432,15 @@ class _GpuDeflatePayloadWriter:
         # streams overlap H2D(next) with encode(current); output drains strictly in order.
         for w0 in range(0, total, self.batch_bytes):
             if self._cpu_fallback is not None:
-                self._cpu_fallback.write(mv[w0:])  # type: ignore[union-attr]
+                self._write_cpu_fallback(
+                    mv[w0:], known_nonzero=bool(known_nonzero),
+                )
                 break
             w1 = min(total, w0 + self.batch_bytes)
             window = buf[w0:w1]
-            work = self._prepare_window(window, executor)
+            work = self._prepare_window(
+                window, executor, known_nonzero=bool(known_nonzero),
+            )
             try:
                 if work['spans']:
                     work['compression'] = self.engine.submit_compress_window(  # type: ignore[arg-type]
@@ -20382,10 +22455,15 @@ class _GpuDeflatePayloadWriter:
                         self._write_work(earlier)
                     else:
                         self._settle_work(earlier)
-                        self._cpu_fallback.write(memoryview(earlier['window']).cast('B'))  # type: ignore[union-attr,arg-type]
+                        self._write_cpu_fallback(
+                            memoryview(earlier['window']).cast('B'),  # type: ignore[arg-type]
+                            known_nonzero=bool(earlier.get('known_nonzero', False)),
+                        )
                 self._settle_work(work)
                 self._activate_cpu_fallback(exc)
-                self._cpu_fallback.write(mv[w0:])  # type: ignore[union-attr]
+                self._write_cpu_fallback(
+                    mv[w0:], known_nonzero=bool(known_nonzero),
+                )
                 break
             pending.append(work)
             if len(pending) >= max(1, int(self.engine.stream_count)):
@@ -20396,16 +22474,29 @@ class _GpuDeflatePayloadWriter:
                     while pending:
                         later = pending.popleft()
                         self._settle_work(later)
-                        self._cpu_fallback.write(memoryview(later['window']).cast('B'))  # type: ignore[union-attr,arg-type]
+                        self._write_cpu_fallback(
+                            memoryview(later['window']).cast('B'),  # type: ignore[arg-type]
+                            known_nonzero=bool(later.get('known_nonzero', False)),
+                        )
         while pending:
             ok = self._write_work(pending.popleft())
             if not ok:
                 while pending:
                     later = pending.popleft()
                     self._settle_work(later)
-                    self._cpu_fallback.write(memoryview(later['window']).cast('B'))  # type: ignore[union-attr,arg-type]
+                    self._write_cpu_fallback(
+                        memoryview(later['window']).cast('B'),  # type: ignore[arg-type]
+                        known_nonzero=bool(later.get('known_nonzero', False)),
+                    )
                 break
         return int(total)
+
+    def write(self, data: bytes | bytearray | memoryview) -> int:
+        return self._write_impl(data, known_nonzero=False)
+
+    def write_known_nonzero(self, data: bytes | bytearray | memoryview) -> int:
+        """Encode an index-classified sparse member without an all-zero scan."""
+        return self._write_impl(data, known_nonzero=True)
 
     def write_zeros(self, nbytes: int) -> int:
         """v13.3.7 (B5/N4): emit cached all-zero gzip members — no source reads, no GPU."""
@@ -20607,10 +22698,10 @@ def nrrd_member_gzip_window_bytes() -> int:
 class _MemberParallelGzipPayloadWriter:
     """File-like gzip encoder emitting one independent gzip member per chunk, pipelined.
 
-    ``write(data)`` detaches (copies) the nonzero chunks it defers, so callers may reuse
-    the buffer behind ``data`` as soon as the call returns — the same buffer contract as
-    the blocking writers — while deflate continues on the shared pool across subsequent
-    write() calls. Members reach the file strictly in payload order.
+    ``write(data)`` detaches chunks before deferring them, so callers may immediately reuse
+    their buffers. Completion is unordered, but a sequence-indexed ready map drains the
+    longest available ordered prefix. This prevents a slow early member from hiding later
+    completed work while preserving byte-exact payload order.
     """
 
     def __init__(
@@ -20620,59 +22711,116 @@ class _MemberParallelGzipPayloadWriter:
         chunk_bytes: Optional[int] = None,
         executor: Optional[ThreadPoolExecutor] = None,
     ) -> None:
-        _backend, factory, crc_fn, _full_flush, _eff_level = _nrrd_deflate_backend()
+        backend, _raw_factory, _crc_fn, _full_flush, eff_level = _nrrd_deflate_backend()
         self.fh = fh
-        self.factory = factory
-        self.crc_fn = crc_fn
+        self.backend = str(backend)
+        self.eff_level = int(eff_level)
+        if self.backend == 'isal':
+            from isal import isal_zlib  # type: ignore
+
+            def _make_member_compressor() -> object:
+                # gzip framing makes ISA-L/zlib calculate CRC + DEFLATE in their native pass.
+                return isal_zlib.compressobj(
+                    int(self.eff_level), isal_zlib.DEFLATED,
+                    16 + int(getattr(isal_zlib, 'MAX_WBITS', 15)),
+                )
+        else:
+            def _make_member_compressor() -> object:
+                return zlib.compressobj(
+                    int(self.eff_level), zlib.DEFLATED, 16 + int(zlib.MAX_WBITS),
+                )
+        self.member_factory = _make_member_compressor
         self.chunk_bytes = int(chunk_bytes) if chunk_bytes else int(nrrd_gzip_chunk_bytes())
         self.window_bytes = int(nrrd_member_gzip_window_bytes())
         self.executor = executor
         self.closed = False
-        # Ready members (bytes) and in-flight compressions (Future -> (member, raw_len)),
-        # strictly in payload order.
-        self._queue: deque = deque()
+        self._next_sequence = 0
+        self._next_write_sequence = 0
+        self._pending: Dict[Future, Tuple[int, int]] = {}
+        self._completed: Dict[int, Tuple[bytes, int]] = {}
         self._inflight_bytes = 0
 
-    def _compress_member(self, payload: bytes) -> Tuple[bytes, int]:
-        cobj = self.factory()
-        raw = cobj.compress(payload) + cobj.flush()
-        member = _gzip_member_from_raw_stream(raw, int(self.crc_fn(payload)) & 0xFFFFFFFF, len(payload))
-        return member, len(payload)
+    def _compress_member(self, payload: bytes, known_nonzero: bool) -> Tuple[bytes, int]:
+        """Encode in one native gzip pass; CRC is produced by ISA-L/zlib itself.
+
+        Known zeros enter through ``write_zeros`` from extent/cvol metadata. Unknown data is
+        deliberately not pre-scanned: native DEFLATE handles an unexpected zero member more
+        cheaply than adding a full memory pass to every nonzero member.
+        """
+        del known_nonzero  # retained for the explicit sparse-writer API and future telemetry
+        ln = int(len(payload))
+        cobj = self.member_factory()
+        member = cobj.compress(payload) + cobj.flush()
+        return bytes(member), int(ln)
+
+    def _enqueue_completed(self, member: bytes, ln: int) -> None:
+        seq = int(self._next_sequence)
+        self._next_sequence += 1
+        del ln  # cached members never consume the in-flight detached-payload budget
+        self._completed[seq] = (member, 0)
+
+    def _enqueue_chunk(self, chunk_mv: memoryview, *, known_nonzero: bool) -> None:
+        seq = int(self._next_sequence)
+        self._next_sequence += 1
+        payload = bytes(chunk_mv)  # detach once; classification no longer adds a NumPy scan
+        ln = int(len(payload))
+        executor = self.executor if self.executor is not None else _nrrd_gzip_executor()
+        fut = executor.submit(self._compress_member, payload, bool(known_nonzero))
+        self._pending[fut] = (int(seq), int(ln))
+        self._inflight_bytes += int(ln)
+
+    def _collect_completions(self, *, block: bool) -> int:
+        if not self._pending:
+            return 0
+        if bool(block):
+            done, _not_done = wait(set(self._pending), return_when=FIRST_COMPLETED)
+        else:
+            done = {fut for fut in self._pending if fut.done()}
+        for fut in done:
+            seq, charged = self._pending.pop(fut)
+            member, ln = fut.result()
+            if int(ln) != int(charged):
+                raise RuntimeError(f'NRRD member length mismatch: {ln} != {charged}')
+            self._completed[int(seq)] = (member, int(charged))
+        return int(len(done))
+
+    def _write_ready_prefix(self) -> int:
+        written = 0
+        while int(self._next_write_sequence) in self._completed:
+            member, charged = self._completed.pop(int(self._next_write_sequence))
+            self.fh.write(member)
+            self._inflight_bytes -= int(charged)
+            self._next_write_sequence += 1
+            written += 1
+        return int(written)
 
     def _drain(self, *, block: bool) -> None:
-        while self._queue:
-            head = self._queue[0]
-            if isinstance(head, (bytes, bytearray)):
-                self._queue.popleft()
-                self.fh.write(head)
-                continue
-            if not (bool(block) or self._inflight_bytes > self.window_bytes or head.done()):
-                break
-            self._queue.popleft()
-            member, ln = head.result()
-            self._inflight_bytes -= int(ln)
-            self.fh.write(member)
+        self._collect_completions(block=False)
+        self._write_ready_prefix()
+        while self._pending and (bool(block) or self._inflight_bytes > self.window_bytes):
+            self._collect_completions(block=True)
+            self._write_ready_prefix()
+        if bool(block):
+            self._write_ready_prefix()
 
-    def write(self, data: bytes | bytearray | memoryview) -> int:
+    def _write_impl(self, data: bytes | bytearray | memoryview, *, known_nonzero: bool) -> int:
         if self.closed:
             raise RuntimeError('Cannot write to a closed gzip payload stream')
         mv = data if isinstance(data, memoryview) else memoryview(data)
         mv = mv.cast('B')
         total = len(mv)
-        if total <= 0:
-            return 0
-        executor = self.executor if self.executor is not None else _nrrd_gzip_executor()
         for off in range(0, total, self.chunk_bytes):
             ln = min(self.chunk_bytes, total - off)
-            chunk_mv = mv[off:off + ln]
-            if not np.frombuffer(chunk_mv, dtype=np.uint8).any():
-                self._queue.append(_zero_gzip_member(int(ln)))
-            else:
-                payload = bytes(chunk_mv)  # detach from the caller's reusable buffer
-                self._inflight_bytes += int(ln)
-                self._queue.append(executor.submit(self._compress_member, payload))
+            self._enqueue_chunk(mv[off:off + ln], known_nonzero=bool(known_nonzero))
             self._drain(block=False)
         return int(total)
+
+    def write(self, data: bytes | bytearray | memoryview) -> int:
+        return self._write_impl(data, known_nonzero=False)
+
+    def write_known_nonzero(self, data: bytes | bytearray | memoryview) -> int:
+        """Encode cvol-index-classified bytes without a redundant all-zero scan."""
+        return self._write_impl(data, known_nonzero=True)
 
     def write_zeros(self, nbytes: int) -> int:
         """v13.3.7 (B5/N4): emit cached all-zero members without materializing the zeros."""
@@ -20681,9 +22829,9 @@ class _MemberParallelGzipPayloadWriter:
         remaining = int(nbytes)
         while remaining > 0:
             ln = min(self.chunk_bytes, remaining)
-            self._queue.append(_zero_gzip_member(int(ln)))
+            self._enqueue_completed(_zero_gzip_member(int(ln)), int(ln))
             remaining -= int(ln)
-        self._drain(block=False)
+            self._drain(block=False)
         return int(nbytes)
 
     def close(self) -> None:
@@ -20691,6 +22839,8 @@ class _MemberParallelGzipPayloadWriter:
             return
         self.closed = True
         self._drain(block=True)
+        if self._pending or self._completed or int(self._next_write_sequence) != int(self._next_sequence):
+            raise RuntimeError('NRRD member completion map did not drain completely')
 
     def __enter__(self) -> '_MemberParallelGzipPayloadWriter':
         return self
@@ -20701,15 +22851,31 @@ class _MemberParallelGzipPayloadWriter:
             return
         # Broken stream: the file is already failed — abandon pending members.
         self.closed = True
-        for entry in self._queue:
-            if isinstance(entry, Future):
-                entry.cancel()
-        self._queue.clear()
+        for fut in self._pending:
+            fut.cancel()
+        self._pending.clear()
+        self._completed.clear()
 
 
 _NRRD_MEMBER_GZIP_OK: Optional[bool] = None
 _NRRD_MEMBER_GZIP_TEST_LOCK = threading.Lock()
 _NRRD_MEMBER_GZIP_ANNOUNCED = False
+_NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED = False
+_NRRD_CPU_DEFLATE_BACKEND_ANNOUNCE_LOCK = threading.Lock()
+
+
+def _announce_nrrd_cpu_deflate_backend(tier: str) -> None:
+    """Report the actual CPU encoder selected after its self-test, once per process."""
+    global _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED
+    if _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED:
+        return
+    with _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCE_LOCK:
+        if _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED:
+            return
+        backend, _factory, _crc_fn, _flush, level = _nrrd_deflate_backend()
+        display = 'ISA-L (python-isal)' if str(backend) == 'isal' else 'zlib'
+        print(f'CPU NRRD DEFLATE backend selected: {display}, level={int(level)}, tier={tier}.')
+        _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED = True
 
 
 def _nrrd_member_gzip_self_test() -> bool:
@@ -20756,9 +22922,16 @@ def _open_nrrd_cpu_payload_writer(
                     f'{max(1, nrrd_gzip_chunk_bytes() // (1024 * 1024))} MiB gzip members, '
                     'whole-layer pipelining; YOLO_TTA_NRRD_MEMBER_GZIP=0 restores the single-member writer).'
                 )
+            _announce_nrrd_cpu_deflate_backend('member-parallel gzip')
             return _MemberParallelGzipPayloadWriter(fh, executor=member_executor)
         if _nrrd_inprocess_gzip_self_test():
+            _announce_nrrd_cpu_deflate_backend('single-stream full-flush gzip')
             return _ParallelGzipPayloadWriter(fh)
+    global _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED
+    with _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCE_LOCK:
+        if not _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED:
+            print('CPU NRRD DEFLATE backend selected: external pigz (ISA-L/zlib in-process tiers inactive).')
+            _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED = True
     return _PigzPayloadWriter(fh, threads=threads)
 
 
@@ -21106,7 +23279,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.6-Ultra_v13.3.10_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.6-Ultra_v13.3.11_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -21214,6 +23387,187 @@ def _nrrd_layer_zshard_count(
     return max(1, min(int(out_t), int(by_depth), max(1, int(cap))))
 
 
+def _nrrd_layer_zshard_bands(
+    ref: 'NrrdLayerRef',
+    out_t: int,
+    shard_count: int,
+) -> Tuple[List[Tuple[int, int]], Optional[List[int]]]:
+    """Partition native cvol layers by indexed sparse payload bytes.
+
+    Equal slice bands remain the conservative fallback for resampled/non-cvol layers.
+    The optional second result reports each band's indexed payload weight for logging.
+    """
+    depth = max(0, int(out_t))
+    count = max(1, min(int(shard_count), max(1, depth)))
+    equal = [
+        (int(i * depth // count), int((i + 1) * depth // count))
+        for i in range(count)
+    ]
+    if (
+        depth <= 0
+        or not _nrrd_layer_ref_is_raw_bbox_store(ref)
+        or int(getattr(ref, 'shape', (0, 0, 0))[0]) != int(depth)
+    ):
+        return equal, None
+    try:
+        index_path = Path(ref.path) / 'index.bin'
+        index = np.fromfile(index_path, dtype=CTILE_INDEX_DTYPE, count=int(depth))
+        if int(index.shape[0]) != int(depth):
+            return equal, None
+        weights = np.asarray(index['payload_nbytes'], dtype=np.uint64)
+        total = int(np.sum(weights, dtype=np.uint64))
+        if total <= 0:
+            return equal, [0 for _ in equal]
+        prefix = np.cumsum(weights, dtype=np.uint64)
+        boundaries = [0]
+        for i in range(1, count):
+            target = int((int(total) * int(i) + int(count) - 1) // int(count))
+            boundary = int(np.searchsorted(prefix, np.uint64(target), side='left')) + 1
+            boundary = max(int(boundaries[-1]) + 1, int(boundary))
+            boundary = min(int(boundary), int(depth) - int(count - i))
+            boundaries.append(int(boundary))
+        boundaries.append(int(depth))
+        bands = [(int(boundaries[i]), int(boundaries[i + 1])) for i in range(count)]
+        band_weights = [
+            int(np.sum(weights[int(z0):int(z1)], dtype=np.uint64))
+            for z0, z1 in bands
+        ]
+        return bands, band_weights
+    except Exception:
+        return equal, None
+
+
+class _OrderedNrrdShardDestination:
+    """Bounded ordered fan-in that writes shard bytes straight to the final payload.
+
+    Each compressor writes to its own small queue. The coordinator drains queues in z-band
+    order, so compression overlaps across bands without part files or a later concatenate
+    copy. A lazy OS pipe makes the sink compatible with the pigz subprocess fallback.
+    """
+
+    def __init__(self, fh: object, shard_count: int) -> None:
+        self.fh = fh
+        self.abort = threading.Event()
+        depth = max(2, _env_int('YOLO_TTA_NRRD_SHARD_QUEUE_DEPTH', 8))
+        self.queues: List[queue.Queue] = [queue.Queue(maxsize=int(depth)) for _ in range(int(shard_count))]
+
+    def _put(self, shard: int, item: Tuple[str, object]) -> None:
+        q = self.queues[int(shard)]
+        while True:
+            if self.abort.is_set():
+                raise RuntimeError('ordered NRRD shard destination aborted')
+            try:
+                q.put(item, timeout=0.2)
+                return
+            except queue.Full:
+                continue
+
+    def sink(self, shard: int) -> '_OrderedNrrdShardSink':
+        return _OrderedNrrdShardSink(self, int(shard))
+
+    def drain(self) -> None:
+        try:
+            for shard, q in enumerate(self.queues):
+                while True:
+                    kind, value = q.get()
+                    if kind == 'data':
+                        self.fh.write(value)
+                    elif kind == 'done':
+                        break
+                    elif kind == 'error':
+                        if isinstance(value, BaseException):
+                            raise value
+                        raise RuntimeError(f'NRRD z shard {int(shard)} failed: {value}')
+                    else:
+                        raise RuntimeError(f'NRRD z shard {int(shard)} sent invalid item {kind!r}')
+        except BaseException:
+            self.abort.set()
+            raise
+
+
+class _OrderedNrrdShardSink:
+    def __init__(self, owner: _OrderedNrrdShardDestination, shard: int) -> None:
+        self.owner = owner
+        self.shard = int(shard)
+        self.closed = False
+        self._pipe_r: Optional[int] = None
+        self._pipe_w: Optional[int] = None
+        self._pipe_thread: Optional[threading.Thread] = None
+        self._pipe_error: Optional[BaseException] = None
+
+    def write(self, data: bytes | bytearray | memoryview) -> int:
+        if self.closed:
+            raise RuntimeError('write to closed ordered NRRD shard sink')
+        payload = bytes(data)
+        if payload:
+            self.owner._put(self.shard, ('data', payload))
+        return int(len(payload))
+
+    def flush(self) -> None:
+        return None
+
+    def fileno(self) -> int:
+        if self._pipe_w is not None:
+            return int(self._pipe_w)
+        read_fd, write_fd = os.pipe()
+        self._pipe_r = int(read_fd)
+        self._pipe_w = int(write_fd)
+
+        def _read_pipe() -> None:
+            try:
+                while True:
+                    data = os.read(int(read_fd), 1024 * 1024)
+                    if not data:
+                        break
+                    self.owner._put(self.shard, ('data', data))
+            except BaseException as exc:
+                self._pipe_error = exc
+            finally:
+                try:
+                    os.close(int(read_fd))
+                except OSError:
+                    pass
+
+        self._pipe_thread = threading.Thread(
+            target=_read_pipe,
+            name=f'nrrd-shard-pipe-{int(self.shard)}',
+            daemon=True,
+        )
+        self._pipe_thread.start()
+        return int(write_fd)
+
+    def _close_pipe(self) -> None:
+        if self._pipe_w is not None:
+            try:
+                os.close(int(self._pipe_w))
+            except OSError:
+                pass
+            self._pipe_w = None
+        if self._pipe_thread is not None:
+            self._pipe_thread.join()
+            self._pipe_thread = None
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self._close_pipe()
+        self.closed = True
+        if self._pipe_error is not None:
+            self.owner._put(self.shard, ('error', self._pipe_error))
+        else:
+            self.owner._put(self.shard, ('done', None))
+
+    def fail(self, exc: BaseException) -> None:
+        if self.closed:
+            return
+        self._close_pipe()
+        self.closed = True
+        try:
+            self.owner._put(self.shard, ('error', exc))
+        except Exception:
+            pass
+
+
 def write_single_layer_nrrd_from_ref(
     ref: 'NrrdLayerRef',
     output_shape: Tuple[int, int, int],
@@ -21271,42 +23625,46 @@ def write_single_layer_nrrd_from_ref(
                 )
         return out_path
 
-    # v13.3.9 (N7): every band produces headerless COMPLETE gzip member(s).
-    # Concatenating the parts in z order is therefore a legal multi-member gzip
-    # payload whose decompressed bytes are identical to the serial (t,Y,X) stream.
-    bands = [
-        (int(i * out_t // shard_count), int((i + 1) * out_t // shard_count))
-        for i in range(shard_count)
-    ]
+    # v13.3.11: native sparse stores balance bands by indexed bbox payload bytes, not
+    # merely slice count. Other sources retain equal-z partitioning.
+    bands, band_weights = _nrrd_layer_zshard_bands(ref, int(out_t), int(shard_count))
     token = f'{os.getpid()}.{threading.get_ident()}'
-    part_paths = [
-        out_path.with_name(f'.{out_path.name}.{token}.zshard{i:03d}.part')
-        for i in range(shard_count)
-    ]
     final_tmp = out_path.with_name(f'.{out_path.name}.{token}.assembling')
     shard_z_chunk = max(1, int(z_chunk) // int(shard_count))
-    shard_fill_workers = max(1, int(nrrd_fill_workers()) // int(shard_count))
+    # Every shard may request the configured lane count; _nrrd_fill_executor is the one
+    # true process-wide cap, so this no longer multiplies threads by shard/sink count.
+    shard_fill_workers = int(nrrd_fill_workers())
     shard_pigz_threads = max(1, int(threads) // int(shard_count))
+    weight_note = ''
+    if band_weights is not None:
+        weight_note = (
+            f', sparse_payload={min(band_weights) / (1024 ** 2):.1f}..'
+            f'{max(band_weights) / (1024 ** 2):.1f} MiB/shard'
+        )
     print(
-        f'v13.3.9 (N7): {out_path.name} -> {shard_count} ordered z shards '
-        f'(min_slices={nrrd_layer_zshard_min_slices()}, z_chunk={shard_z_chunk}).'
+        f'v13.3.11: {out_path.name} -> {shard_count} ordered z shards '
+        f'(min_slices={nrrd_layer_zshard_min_slices()}, z_chunk={shard_z_chunk}'
+        f'{weight_note}; direct destination).'
     )
     mixed_lane_plan, mixed_cpu_executor = _nrrd_deflate_mixed_lane_plan(int(shard_count))
+    destination: Optional[_OrderedNrrdShardDestination] = None
 
-    def _write_band(i: int) -> Path:
+    def _write_band(i: int) -> None:
         z0, z1 = bands[int(i)]
-        part = part_paths[int(i)]
-        # Coordinators live in the sink pool, but bands run in cached child pools. A shared
-        # semaphore keeps two simultaneous global layers from exceeding the sink-wide budget.
-        with _nrrd_zshard_semaphore():  # type: ignore[attr-defined]
-            with open(part, 'wb') as pfh:
+        if destination is None:
+            raise RuntimeError('ordered NRRD shard destination was not initialized')
+        shard_sink = destination.sink(int(i))
+        try:
+            # Coordinators live in the sink pool, but bands run in cached child pools. A shared
+            # semaphore keeps simultaneous global layers inside the sink-wide band budget.
+            with _nrrd_zshard_semaphore():  # type: ignore[attr-defined]
                 if mixed_lane_plan is None:
                     payload_writer = _open_nrrd_payload_writer(
-                        pfh, threads=shard_pigz_threads,
+                        shard_sink, threads=shard_pigz_threads,
                     )
                 else:
                     payload_writer = _open_nrrd_mixed_lane_payload_writer(
-                        pfh,
+                        shard_sink,
                         mixed_lane_plan[int(i)],
                         threads=shard_pigz_threads,
                         cpu_executor=mixed_cpu_executor,
@@ -21322,23 +23680,14 @@ def write_single_layer_nrrd_from_ref(
                         z_stop=int(z1),
                         fill_workers_override=shard_fill_workers,
                     )
-        return part
+            shard_sink.close()
+        except BaseException as exc:
+            shard_sink.fail(exc)
+            raise
 
     shard_pool = _acquire_parallel_pool(int(shard_count))
     futures: List[Future] = []
     try:
-        futures = [shard_pool.submit(_write_band, i) for i in range(shard_count)]
-        # Resolve in band order. Work runs concurrently; ordered result collection
-        # makes the later concatenation order explicit and deterministic.
-        first_error: Optional[BaseException] = None
-        for fut in futures:
-            try:
-                fut.result()
-            except BaseException as exc:
-                if first_error is None:
-                    first_error = exc
-        if first_error is not None:
-            raise first_error
         with open(final_tmp, 'wb') as fh:
             _write_nrrd_ascii_header(
                 fh,
@@ -21348,27 +23697,46 @@ def write_single_layer_nrrd_from_ref(
                 data_type='unsigned char',
                 encoding='gzip',
             )
-            for part in part_paths:
-                with open(part, 'rb') as pfh:
-                    shutil.copyfileobj(pfh, fh, length=16 * 1024 * 1024)
+            destination = _OrderedNrrdShardDestination(fh, int(shard_count))
+            futures = [shard_pool.submit(_write_band, i) for i in range(shard_count)]
+            # Compression runs concurrently; only the already-compressed byte streams are
+            # serialized here in band order directly into the destination payload.
+            destination.drain()
+            first_error: Optional[BaseException] = None
+            for fut in futures:
+                try:
+                    fut.result()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+            if first_error is not None:
+                raise first_error
         os.replace(final_tmp, out_path)
     finally:
+        if destination is not None:
+            destination.abort.set()
         _settle_parallel_futures(futures)
         _release_parallel_pool(int(shard_count), shard_pool)
-        for path in [*part_paths, final_tmp]:
-            try:
-                path.unlink(missing_ok=True)
-            except Exception:
-                pass
+        try:
+            final_tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
     return out_path
 
 
 _NRRD_GPU_MIRROR_TEE_ANNOUNCED = False
+_NRRD_GPU_MIRROR_DEVICE_GZIP_ANNOUNCED = False
+_NRRD_GPU_MIRROR_DEVICE_GZIP_INACTIVE_ANNOUNCED = False
 
 
 def nrrd_gpu_mirror_tee_enabled() -> bool:
     """v13.3.6 (D2): derive low-quality NRRD mirror volumes on the GPU."""
     return _env_flag('YOLO_TTA_NRRD_GPU_MIRROR_TEE', True)
+
+
+def nrrd_gpu_mirror_device_gzip_enabled() -> bool:
+    """Keep derived mirrors on-device through complete-gzip nvCOMP encoding."""
+    return _env_flag('YOLO_TTA_NRRD_GPU_MIRROR_DEVICE_GZIP', True)
 
 
 def nrrd_parallel_mirror_encode_enabled() -> bool:
@@ -21393,10 +23761,19 @@ class _GpuMirrorTee:
     tee failed and the caller falls back to re-encoding mirrors from the layer store.
     """
 
-    def __init__(self, torch_mod: object, device: object, mirror_jobs: List[Dict[str, object]], out_t: int) -> None:
+    def __init__(
+        self,
+        torch_mod: object,
+        device: object,
+        mirror_jobs: List[Dict[str, object]],
+        out_t: int,
+        *,
+        device_gzip_engine: Optional['_NvcompDeflateEngine'] = None,
+    ) -> None:
         self.torch = torch_mod
         self.device = device
         self.out_t = int(out_t)
+        self.device_gzip_engine = device_gzip_engine
         self.failed = False
         self.sub_batch = max(1, _env_int('YOLO_TTA_NRRD_GPU_MIRROR_TEE_SUBBATCH', 32))
         self.specs: List[Dict[str, object]] = []
@@ -21467,7 +23844,18 @@ class _GpuMirrorTee:
             # so its order is independent of shard-thread current-stream state.
             self.stream.synchronize()
             for spec in self.specs:
-                spec['job']['volume'] = spec['vol'].cpu().numpy()  # type: ignore[index]
+                if self.device_gzip_engine is not None:
+                    # The capability probe guarantees that this exact nvCOMP engine can
+                    # emit complete RFC-1952 members from a torch CUDA tensor. Retain the
+                    # volume on-device; only compressed bytes will cross PCIe.
+                    spec['job']['device_volume'] = spec['vol']
+                    spec['job']['device_gzip_engine'] = self.device_gzip_engine
+                    spec['job']['device_derived'] = True
+                else:
+                    spec['job']['volume'] = spec['vol'].cpu().numpy()  # type: ignore[index]
+                    # No complete-gzip device codec: make the one unavoidable D2H here,
+                    # then force CPU gzip so the data is never uploaded back to a GPU.
+                    spec['job']['device_derived'] = True
                 spec['vol'] = None
             self.specs.clear()
             return True
@@ -21486,11 +23874,45 @@ def _try_create_gpu_mirror_tee(mirror_jobs: List[Dict[str, object]], out_t: int)
         if not bool(torch.cuda.is_available()):
             return None
         device = _pick_gpu_compute_device(torch)
+        device_gzip_engine: Optional[_NvcompDeflateEngine] = None
+        inactive_reason = ''
+        if not nrrd_gpu_mirror_device_gzip_enabled():
+            inactive_reason = 'YOLO_TTA_NRRD_GPU_MIRROR_DEVICE_GZIP=0'
+        elif not nrrd_gpu_deflate_enabled():
+            inactive_reason = 'YOLO_TTA_NRRD_GPU_DEFLATE=0'
+        else:
+            candidate = _nrrd_gpu_deflate_engine()
+            if candidate is None:
+                inactive_reason = 'no validated nvidia-nvcomp Deflate engine is available'
+            else:
+                capable, reason = candidate.device_gzip_capability()
+                if capable:
+                    device_gzip_engine = candidate
+                    # Keep the mirror on the exact GPU that owns the validated complete-
+                    # gzip codec; nvCOMP never performs an implicit peer/host transfer.
+                    device = candidate.device
+                else:
+                    inactive_reason = str(reason)
+        if inactive_reason:
+            global _NRRD_GPU_MIRROR_DEVICE_GZIP_INACTIVE_ANNOUNCED
+            if not _NRRD_GPU_MIRROR_DEVICE_GZIP_INACTIVE_ANNOUNCED:
+                _NRRD_GPU_MIRROR_DEVICE_GZIP_INACTIVE_ANNOUNCED = True
+                print(
+                    'GPU low-quality mirror device compression inactive: '
+                    f'{inactive_reason}. Mirrors use one D2H followed by CPU gzip; '
+                    'they are never uploaded again.'
+                )
         need = sum(int(np.prod([int(v) for v in job['shape']])) for job in mirror_jobs)  # type: ignore[misc]
         free_bytes, _total = torch.cuda.mem_get_info(device)
         if int(free_bytes) < int(need) + 2 * GIB:
             return None
-        return _GpuMirrorTee(torch, device, mirror_jobs, int(out_t))
+        return _GpuMirrorTee(
+            torch,
+            device,
+            mirror_jobs,
+            int(out_t),
+            device_gzip_engine=device_gzip_engine,
+        )
     except Exception:
         return None
 
@@ -21542,6 +23964,9 @@ def write_layer_nrrd_with_low_quality_mirrors(
             'src_to_m': [tuple(v) for v in tmp],
             'locks': [threading.Lock() for _ in range(16)],
             'failed': False,
+            'device_derived': False,
+            'device_volume': None,
+            'device_gzip_engine': None,
         })
 
     # v13.3.6 (D2): derive the mirrors on a GPU when one is free — the per-slice resizes
@@ -21549,12 +23974,22 @@ def write_layer_nrrd_with_low_quality_mirrors(
     # small D2H after the layer streams. CPU tee (below) remains the fallback.
     gpu_tee = _try_create_gpu_mirror_tee(mirror_jobs, out_t)
     if gpu_tee is not None:
-        global _NRRD_GPU_MIRROR_TEE_ANNOUNCED
+        global _NRRD_GPU_MIRROR_TEE_ANNOUNCED, _NRRD_GPU_MIRROR_DEVICE_GZIP_ANNOUNCED
         if not _NRRD_GPU_MIRROR_TEE_ANNOUNCED:
             _NRRD_GPU_MIRROR_TEE_ANNOUNCED = True
             print(
                 f'GPU low-quality mirror tee active on {gpu_tee.device} (v13.3.6 D2; '
                 'YOLO_TTA_NRRD_GPU_MIRROR_TEE=0 disables).'
+            )
+        if (
+            gpu_tee.device_gzip_engine is not None
+            and not _NRRD_GPU_MIRROR_DEVICE_GZIP_ANNOUNCED
+        ):
+            _NRRD_GPU_MIRROR_DEVICE_GZIP_ANNOUNCED = True
+            print(
+                f'GPU low-quality mirror complete-gzip active on {gpu_tee.device}: '
+                'derived tensors stay device-resident and only compressed RFC-1952 '
+                'members cross PCIe.'
             )
     else:
         for job in mirror_jobs:
@@ -21596,9 +24031,8 @@ def write_layer_nrrd_with_low_quality_mirrors(
                     job['failed'] = True
 
         if z_count > 1 and tee_workers > 1:
-            parallel_for_indices_chunked(
-                z_count, _tee_one, max_workers=tee_workers, desc='', show_progress=False,
-                target_chunks_per_worker=1,
+            _nrrd_parallel_fill_indices(
+                z_count, _tee_one, requested_workers=tee_workers,
             )
         else:
             for zi in range(z_count):
@@ -21651,17 +24085,48 @@ def write_layer_nrrd_with_low_quality_mirrors(
                 color_rgb=seg_color,
                 extent_xyt=_slicer_segment_extent_for_output(ref, (int(m_t), int(m_h), int(m_w))),
             ))
-            vol: np.ndarray = job['volume']  # type: ignore[assignment]
+            device_members: Optional[List[bytes]] = None
+            device_vol = job.get('device_volume')
+            device_engine = job.get('device_gzip_engine')
+            if device_vol is not None and isinstance(device_engine, _NvcompDeflateEngine):
+                try:
+                    # The engine returns complete gzip members. It reads the torch tensor
+                    # in-place on CUDA and copies back only the compressed member bytes.
+                    device_members = device_engine.compress_device_gzip_members(device_vol)
+                except Exception as device_exc:
+                    # Runtime/driver failures after a successful feature probe must not
+                    # lose the mirror. Download once and use the CPU tier; crucially this
+                    # fallback never invokes the ordinary GPU writer and never re-uploads.
+                    print(
+                        f'Warning: device-resident mirror gzip failed for {m_path.name} '
+                        f'({device_exc}); using one-D2H CPU gzip fallback.'
+                    )
+                    job['volume'] = device_vol.cpu().numpy()
+                    device_members = None
+            vol: Optional[np.ndarray] = job.get('volume')  # type: ignore[assignment]
+            if device_members is None and vol is None:
+                raise RuntimeError('mirror tee produced neither a host nor device payload')
             step = max(1, int(_nrrd_full_slice_z_chunk(1, int(m_w), int(m_h), int(m_t))))
             with open(m_path, 'wb') as fh:
                 _write_nrrd_ascii_header(
                     fh, header=header, sizes=(int(m_w), int(m_h), int(m_t)),
                     dimension=3, data_type='unsigned char', encoding='gzip',
                 )
-                with _open_nrrd_payload_writer(fh, threads=pigz_threads) as payload_writer:
-                    for z0 in range(0, int(m_t), step):
-                        z1 = min(int(m_t), int(z0) + step)
-                        payload_writer.write(memoryview(vol[z0:z1]).cast('B'))
+                if device_members is not None:
+                    for member in device_members:
+                        fh.write(member)
+                else:
+                    # A GPU-derived host volume has already paid its only D2H. Select
+                    # CPU DEFLATE explicitly to prevent a D2H->H2D bounce.
+                    writer = (
+                        _open_nrrd_cpu_payload_writer(fh, threads=pigz_threads)
+                        if bool(job.get('device_derived', False))
+                        else _open_nrrd_payload_writer(fh, threads=pigz_threads)
+                    )
+                    with writer as payload_writer:
+                        for z0 in range(0, int(m_t), step):
+                            z1 = min(int(m_t), int(z0) + step)
+                            payload_writer.write(memoryview(vol[z0:z1]).cast('B'))  # type: ignore[index]
         except Exception as exc:
             print(
                 f'Warning: low-quality NRRD mirror tee failed for {m_path.name} ({exc}); '
@@ -21673,6 +24138,8 @@ def write_layer_nrrd_with_low_quality_mirrors(
             )
         finally:
             job['volume'] = None
+            job['device_volume'] = None
+            job['device_gzip_engine'] = None
 
     # v13.3.7 (N5): the mirror files of one layer are independent — encode them side by
     # side instead of one after another at the tail of the layer task. Every task runs to
@@ -22342,6 +24809,60 @@ def _write_one_decomposed_nrrd_layer_payload(
                 and (int(z1) <= int(zero_window[0]) or int(z0) >= int(zero_window[1]))
             )
 
+        if bool(raw_store_native_stream):
+            # v13.3.11 sparse cvol fast path: gzip-sized members are classified from the
+            # slice index and assembled directly in flat native payload order. Empty
+            # members never allocate a source buffer; intersecting members scatter only
+            # bbox crop rows. ``write_known_nonzero`` skips the member writer's former
+            # full 16 MiB np.any scan (a conservative bbox overlap may still contain only
+            # zeros, which remains a valid—merely slightly larger—gzip member).
+            member_bytes = int(np.clip(
+                int(nrrd_gzip_chunk_bytes()),
+                8 * 1024 * 1024,
+                16 * 1024 * 1024,
+            ))
+            write_nonzero = getattr(payload_writer, 'write_known_nonzero', None)
+            if not callable(write_nonzero):
+                write_nonzero = payload_writer.write
+            for raw_len, member in src.iter_native_sparse_members(
+                int(z_begin), int(z_end), member_bytes=int(member_bytes),
+            ):
+                if member is None and can_write_zeros:
+                    payload_writer.write_zeros(int(raw_len))
+                elif member is None:
+                    payload_writer.write(bytes(int(raw_len)))
+                else:
+                    write_nonzero(memoryview(member).cast('B'))
+
+            # Mirror tee compatibility: compression above never needs a dense slice. The
+            # existing consumer API still requires z-aligned dense blocks, so materialize
+            # those only when low-quality mirrors were explicitly requested. This is a
+            # bounded compatibility pass and is not used by ordinary cvol->NRRD writes.
+            if block_consumer is not None:
+                consumer_chunk = max(1, int(z_chunk_i))
+                for z0 in range(int(z_begin), int(z_end), int(consumer_chunk)):
+                    z1 = min(int(z_end), int(z0) + int(consumer_chunk))
+                    if _block_is_known_zero(int(z0), int(z1)):
+                        continue
+                    block = np.empty(
+                        (int(z1 - z0), int(out_h), int(out_w)),
+                        dtype=np.uint8,
+                        order='C',
+                    )
+
+                    def _fill_consumer(zi: int, _z0: int = int(z0), _block: np.ndarray = block) -> None:
+                        src.fill_decoded_slice_into(int(_z0 + int(zi)), _block[int(zi)])
+
+                    _nrrd_parallel_fill_indices(
+                        int(z1 - z0),
+                        _fill_consumer,
+                        requested_workers=min(int(nrrd_fill_workers()), int(z1 - z0)),
+                    )
+                    block_consumer(int(z0), block)
+            if pbar is not None:
+                pbar.update(int(z_end - z_begin))
+            return
+
         if bool(direct_native_stream):
             # The memmap/live volume is already a native (t,Y,X) C-order layer: chunks are
             # views written directly — no transpose, no Fortran conversion, no layer
@@ -22448,13 +24969,10 @@ def _write_one_decomposed_nrrd_layer_payload(
                     if int(fill_workers) > 1 and int(z_count) > 1:
                         def _fill(zi: int, _z0: int = int(z0), _block: np.ndarray = block) -> None:
                             fill_one(int(_z0 + int(zi)), _block[int(zi)])
-                        parallel_for_indices_chunked(
+                        _nrrd_parallel_fill_indices(
                             int(z_count),
                             _fill,
-                            max_workers=min(int(fill_workers), int(z_count)),
-                            desc='',
-                            show_progress=False,
-                            target_chunks_per_worker=1,
+                            requested_workers=min(int(fill_workers), int(z_count)),
                         )
                     else:
                         for zi in range(int(z_count)):
@@ -22482,17 +25000,6 @@ def _write_one_decomposed_nrrd_layer_payload(
                     except Exception:
                         pass
                 _release_parallel_pool(1, writer_pool)
-
-        if bool(raw_store_native_stream):
-            # Target_Dummy layout keeps the list axis last, so one complete layer is a
-            # native (t,Y,X) byte block.  For cvol/ctile sources, fill the reusable block
-            # directly from each slice bbox payload instead of allocating one full decoded
-            # zeros slice per frame and copying it again into the NRRD write buffer.
-            _stream_filled_blocks(
-                lambda z, out2d: src.fill_decoded_slice_into(int(z), out2d),
-                madvise_src=False,
-            )
-            return
 
         def _fill_restored(z: int, out2d: np.ndarray) -> None:
             np.copyto(out2d, np.asarray(_read_layer_slice_in_output_shape(src, output_shape, int(z)), dtype=np.uint8))
