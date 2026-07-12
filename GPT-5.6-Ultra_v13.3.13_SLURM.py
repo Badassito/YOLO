@@ -2,8 +2,23 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the GPT-5.6-Ultra v13.3.12_SLURM implementation. It is derived from
-GPT-5.6-Ultra_v13.3.11_SLURM.py by COPY + surgical edits implementing the supplied task list:
+This is the GPT-5.6-Ultra v13.3.13_SLURM implementation. It is derived from
+GPT-5.6-Ultra_v13.3.12_SLURM.py by COPY + surgical edits implementing the supplied task list:
+  - v13.3.13 (N17/N15) prefers KAT-validated libdeflate complete gzip members ahead of
+    ISA-L/zlib, while retaining every established NRRD fallback tier. Global-layer z-shard
+    counts are resolved when the sink task executes rather than from stale submit-time pool
+    occupancy, and the ordered-shard queue default rises to 32.
+  - v13.3.13 (D6/D7) extracts exact 26-connected adjacent-slice label pairs while each GPU
+    label block is still resident, including retained-plane block boundaries, and distributes
+    independent stage-A blocks across the configured CUDA devices. CPU labeling and pair
+    extraction remain the complete fallback.
+  - v13.3.13 (G8/P4) overlaps a retiring task's sealed device-union D2H/host merge with the
+    next worker task, and gives resident-ring Radial/Tilted views optional fused CUDA renderers
+    that read the uint8 source volume and write normalized pixels directly into TensorRT input
+    bindings. Stable render launches are CUDA-graph captured with device-side frame metadata;
+    per-feature environment gates retain the synchronous/reference paths.
+
+Inherited from v13.3.12:
   - v13.3.12 (D6) retains every non-radial mask on the canonical inference-resolution
     angle-0 grid through accumulation, component cleanup, interpolation, bridge deltas, tile
     gating, and sparse-layer construction. Full-frame/TTA/tile affines compose into that grid;
@@ -8627,6 +8642,44 @@ def gpu_device_hole_fill_enabled() -> bool:
     return _env_flag('YOLO_TTA_GPU_HOLE_FILL', True)
 
 
+def gpu_union_flush_overlap_enabled() -> bool:
+    """Retire a worker task's device union on a background D2H/host-copy lane.
+
+    The multi-GPU worker keeps at most one retiring accumulator while the main worker
+    thread starts inference for the next queued task with a fresh accumulator.  Result
+    publication remains ordered after the retiring flush completes.  Single-process
+    callers retain the synchronous path.
+    """
+    return _env_flag('YOLO_TTA_GPU_UNION_FLUSH_OVERLAP', True)
+
+
+_GPU_UNION_FLUSH_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_GPU_UNION_FLUSH_EXECUTOR_LOCK = threading.Lock()
+
+
+def _gpu_union_flush_executor() -> ThreadPoolExecutor:
+    """One copy/host-merge retirement lane per process (therefore per GPU worker)."""
+    global _GPU_UNION_FLUSH_EXECUTOR
+    with _GPU_UNION_FLUSH_EXECUTOR_LOCK:
+        if _GPU_UNION_FLUSH_EXECUTOR is None:
+            _GPU_UNION_FLUSH_EXECUTOR = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix='gpu-union-flush',
+            )
+        return _GPU_UNION_FLUSH_EXECUTOR
+
+
+def _shutdown_gpu_union_flush_executor() -> None:
+    global _GPU_UNION_FLUSH_EXECUTOR
+    with _GPU_UNION_FLUSH_EXECUTOR_LOCK:
+        executor = _GPU_UNION_FLUSH_EXECUTOR
+        _GPU_UNION_FLUSH_EXECUTOR = None
+    if executor is not None:
+        try:
+            executor.shutdown(wait=True, cancel_futures=False)
+        except TypeError:
+            executor.shutdown(wait=True)
+
+
 # v13.3.3 (S2): reusable pinned staging buffers for device-union flushes. The old path did one
 # ~chunk-sized cudaHostAlloc + free per task (~70 tasks x ~0.6 GB); this keeps a small pool per
 # process (workers flush one task at a time, so the pool normally holds a single buffer).
@@ -8841,10 +8894,24 @@ class _DeviceUnionAccumulator:
         except Exception:
             return None
 
-    def flush_into(self, view_union_mm: np.ndarray, view_confmap_mm: Optional[np.ndarray], chunk_slices: int = 64) -> None:
+    def synchronize_for_retirement(self) -> None:
+        """Seal every producer write before a background flush can overlap new inference."""
+        self.torch.cuda.synchronize(self.device)
+
+    def flush_into(
+        self,
+        view_union_mm: np.ndarray,
+        view_confmap_mm: Optional[np.ndarray],
+        chunk_slices: int = 64,
+        *,
+        synchronize_device: bool = True,
+    ) -> None:
         torch = self.torch
-        # One device-wide sync orders every side stream's writes before the D2H reads.
-        torch.cuda.synchronize(self.device)
+        # The synchronous path orders every side stream here. G8 seals on the worker thread
+        # before submitting this method, so the retirement thread must not device-sync and
+        # accidentally wait on kernels from the NEXT task.
+        if bool(synchronize_device):
+            torch.cuda.synchronize(self.device)
         n, h, w = (int(x) for x in self.union_dev.shape)
         chunk = max(1, min(int(chunk_slices), n))
         plane = int(h) * int(w)
@@ -9320,6 +9387,9 @@ class _ResidentGpuPipelineSlot:
             dtype=input_dtype,
             device=device,
         )
+        # Stable metadata address for P4 renderer launches. A one-thread setter kernel
+        # updates its value on the render stream without a reusable-host-buffer race.
+        self.render_meta = torch_mod.empty((2,), dtype=torch_mod.int32, device=device)
         # Distinct high-priority streams allow the two TensorRT execution contexts to
         # overlap.  Mask decode/quantize/union uses a third, ordinary-priority stream.
         high_priority = _cuda_stream_priority(torch_mod, high=True)
@@ -9348,8 +9418,16 @@ class _ResidentGpuPipelineSlot:
         self.native_conf = None
         self.infer_graph = None
         self.post_graph = None
+        self.render_graph = None
+        self.render_graph_key = None
+        # Prepared once per resident source/task. Graph replay compares this cached key
+        # instead of rebuilding large Radial azimuth-byte geometry keys for every frame.
+        self.render_expected_key = None
         # Keep zero-copy cupy array views alive for the lifetime of captured graphs.
         self._cupy_refs: Dict[str, object] = {}
+        # P4 renderer views are separate from postprocess graph views: the latter mapping
+        # is rebuilt by _ResidentTensorRTRingExecutor after the slots are allocated.
+        self._render_cupy_refs: Dict[str, object] = {}
 
 
 _RESIDENT_MASK_KERNELS: Optional[object] = None
@@ -9921,7 +9999,8 @@ def predict_source_and_accumulate(
     streaming_cleanup_min_radius: float = 0.0,
     slice_locks: Optional[Sequence[threading.Lock]] = None,
     device_hole_fill: bool = False,
-) -> Dict[str, int]:
+    defer_device_union_flush: bool = False,
+) -> Dict[str, object]:
     """Run YOLO predict(stream=True) on an in-memory source and accumulate native masks.
 
     The predictor consumes ``InMemoryYoloVolumeSource`` instances in the v12 path,
@@ -10178,12 +10257,32 @@ def predict_source_and_accumulate(
         # fill, pre flush) — a few hundred KB that saves whole CPU read passes downstream.
         slice_meta = device_union.compute_slice_metadata() if device_union is not None else None
 
-        # v13.3.2 (R21): one chunked pinned D2H for the whole task into the host result windows
-        # (device-written slices are plain-copied; host-fallback slices are skipped — v13.3.3 S2).
+        # v13.3.13 (G8): a multi-GPU worker may retire this accumulator on its private
+        # copy/host-merge thread while the main worker starts the next task with a second
+        # accumulator. Seal all producer streams BEFORE submission; the retirement thread
+        # then skips its old device-wide sync so it cannot accidentally wait on next-task
+        # kernels. The worker withholds this task's result until the returned Future settles.
+        device_union_flush_future: Optional[Future] = None
         if device_union is not None:
-            device_union.flush_into(view_union_mm, view_confmap_mm)
+            if bool(defer_device_union_flush) and gpu_union_flush_overlap_enabled():
+                device_union.synchronize_for_retirement()
 
-        if prediction_hot_path_flush_enabled():
+                def _retire_device_union() -> None:
+                    device_union.flush_into(
+                        view_union_mm, view_confmap_mm, synchronize_device=False,
+                    )
+                    if prediction_hot_path_flush_enabled():
+                        if view_confmap_mm is not None:
+                            flush_array(view_confmap_mm)
+                        flush_array(view_union_mm)
+
+                device_union_flush_future = _gpu_union_flush_executor().submit(
+                    _retire_device_union,
+                )
+            else:
+                device_union.flush_into(view_union_mm, view_confmap_mm)
+
+        if prediction_hot_path_flush_enabled() and device_union_flush_future is None:
             if view_confmap_mm is not None:
                 flush_array(view_confmap_mm)
             flush_array(view_union_mm)
@@ -10193,6 +10292,8 @@ def predict_source_and_accumulate(
             'frames_with_predictions': int(frames_with_predictions),
             'device_hole_filled_frames': int(device_hole_filled_frames),
             'slice_meta': slice_meta,
+            # Private worker protocol; removed before the stats cross the process queue.
+            '_device_union_flush_future': device_union_flush_future,
         }
     finally:
         if owned_staging_wrapper is not None:
@@ -11031,6 +11132,326 @@ def gpu_cube_resize_enabled() -> bool:
     return _env_flag('YOLO_TTA_GPU_CUBE_RESIZE', True)
 
 
+def fused_direct_render_enabled() -> bool:
+    """Allow resident-ring renderers to write normalized pixels straight to TRT bindings."""
+    return _env_flag('YOLO_TTA_FUSED_DIRECT_RENDER', True)
+
+
+def fused_radial_render_enabled() -> bool:
+    """P4 Radial direct-to-binding kernel; zero selects the retained Torch renderer."""
+    return fused_direct_render_enabled() and _env_flag('YOLO_TTA_FUSED_RADIAL_RENDER', True)
+
+
+def fused_tilted_render_enabled() -> bool:
+    """P4 Tilted direct-to-binding kernel; zero selects the retained Torch renderer."""
+    return fused_direct_render_enabled() and _env_flag('YOLO_TTA_FUSED_TILTED_RENDER', True)
+
+
+def fused_render_cuda_graphs_enabled() -> bool:
+    """Capture the stable P4 render kernel; metadata remains a dynamic device-side input."""
+    return (
+        fused_direct_render_enabled()
+        and resident_trt_cuda_graphs_enabled()
+        and _env_flag('YOLO_TTA_FUSED_RENDER_CUDA_GRAPHS', True)
+    )
+
+
+def fused_radial_tap_cache_bytes() -> int:
+    """Maximum device bytes used by an all-azimuth separable Lanczos descriptor table."""
+    return int(max(0.0, _env_float('YOLO_TTA_FUSED_RADIAL_TAPS_GIB', 2.0)) * GIB)
+
+
+_FUSED_DIRECT_RENDER_KERNELS: Optional[object] = None
+_FUSED_DIRECT_RENDER_KERNELS_FAILED = False
+
+
+def _fused_direct_render_kernels() -> Optional[object]:
+    """Compile P4's allocation-free resident Radial/Tilted render kernels once.
+
+    The kernels consume the resident uint8 volume through its CUDA array-interface and
+    write normalized fp16/fp32 values directly into a static TensorRT input binding.  CuPy
+    is optional, so import/NVRTC failures reject this capability before the reference
+    renderer has been bypassed.
+    """
+    global _FUSED_DIRECT_RENDER_KERNELS, _FUSED_DIRECT_RENDER_KERNELS_FAILED
+    if _FUSED_DIRECT_RENDER_KERNELS is not None:
+        return _FUSED_DIRECT_RENDER_KERNELS
+    if _FUSED_DIRECT_RENDER_KERNELS_FAILED:
+        return None
+    try:
+        import cupy as cp  # type: ignore
+        src = r'''
+        #include <cuda_fp16.h>
+        #include <math.h>
+
+        __device__ __forceinline__ float sinc1(float x) {
+          if (fabsf(x) < 1.0e-7f) return 1.0f;
+          float pix = 3.14159265358979323846f * x;
+          return sinf(pix) / pix;
+        }
+
+        extern "C" __global__ void set_render_meta(int* render_meta, int frame_value) {
+          if (blockIdx.x == 0 && threadIdx.x == 0) {
+            render_meta[0] = frame_value;
+            render_meta[1] = 0;
+          }
+        }
+
+        extern "C" __global__ void precompute_radial_taps(
+            const float* angles_deg, int n_angles, int n_u,
+            int full_h, int full_w, float center_x, float center_y, float roi_radius,
+            int* x_idx, int* y_idx, float* x_w, float* y_w) {
+          int p = blockDim.x * blockIdx.x + threadIdx.x;
+          int total = n_angles * n_u;
+          if (p >= total) return;
+          int aidx = p / n_u;
+          int u = p - aidx * n_u;
+          float coord = n_u > 1
+              ? -roi_radius + (2.0f * roi_radius) * ((float)u / (float)(n_u - 1))
+              : -roi_radius;
+          float theta = angles_deg[aidx] * 0.01745329251994329577f;
+          float sx = center_x + coord * cosf(theta);
+          float sy = center_y + coord * sinf(theta);
+          int bx = (int)floorf(sx);
+          int by = (int)floorf(sy);
+          float wx[6], wy[6];
+          int ix[6], iy[6];
+          float sumx = 0.0f, sumy = 0.0f;
+          #pragma unroll
+          for (int k = 0; k < 6; ++k) {
+            int rx = bx + k - 2;
+            int ry = by + k - 2;
+            float dx = sx - (float)rx;
+            float dy = sy - (float)ry;
+            float vx = fabsf(dx) >= 3.0f ? 0.0f : sinc1(dx) * sinc1(dx / 3.0f);
+            float vy = fabsf(dy) >= 3.0f ? 0.0f : sinc1(dy) * sinc1(dy / 3.0f);
+            if (rx < 0 || rx >= full_w) vx = 0.0f;
+            if (ry < 0 || ry >= full_h) vy = 0.0f;
+            ix[k] = max(0, min(full_w - 1, rx));
+            iy[k] = max(0, min(full_h - 1, ry));
+            wx[k] = vx; wy[k] = vy;
+            sumx += vx; sumy += vy;
+          }
+          int off = p * 6;
+          #pragma unroll
+          for (int k = 0; k < 6; ++k) {
+            x_idx[off + k] = ix[k];
+            y_idx[off + k] = iy[k];
+            x_w[off + k] = fabsf(sumx) > 1.0e-6f ? wx[k] / sumx : wx[k];
+            y_w[off + k] = fabsf(sumy) > 1.0e-6f ? wy[k] / sumy : wy[k];
+          }
+        }
+
+        __device__ __forceinline__ float radial_native_value(
+            const unsigned char* volume, int native_t, int full_h, int full_w,
+            int rows, int n_u, int angle_idx, int row, int u,
+            const int* x_idx, const int* y_idx, const float* x_w, const float* y_w) {
+          float rf = ((float)row + 0.5f) * ((float)native_t / (float)rows) - 0.5f;
+          int raw0 = (int)floorf(rf);
+          int t0 = max(0, min(native_t - 1, raw0));
+          int t1 = min(native_t - 1, t0 + 1);
+          float ta = fminf(1.0f, fmaxf(0.0f, rf - (float)t0));
+          int tap = (angle_idx * n_u + u) * 6;
+          long long plane_stride = (long long)full_h * (long long)full_w;
+          float v0 = 0.0f, v1 = 0.0f;
+          #pragma unroll
+          for (int ky = 0; ky < 6; ++ky) {
+            int yy = y_idx[tap + ky];
+            float wy = y_w[tap + ky];
+            long long row_off = (long long)yy * (long long)full_w;
+            #pragma unroll
+            for (int kx = 0; kx < 6; ++kx) {
+              int xx = x_idx[tap + kx];
+              float w = wy * x_w[tap + kx];
+              long long spatial = row_off + (long long)xx;
+              v0 += w * (float)volume[(long long)t0 * plane_stride + spatial];
+              v1 += w * (float)volume[(long long)t1 * plane_stride + spatial];
+            }
+          }
+          return v0 + ta * (v1 - v0);
+        }
+
+        __device__ __forceinline__ float radial_bilinear_value(
+            const unsigned char* volume, int native_t, int full_h, int full_w,
+            int rows, int n_u, int angle_idx, float sy, float sx,
+            const int* x_idx, const int* y_idx, const float* x_w, const float* y_w) {
+          int x0 = (int)floorf(sx), y0 = (int)floorf(sy);
+          int x1 = x0 + 1, y1 = y0 + 1;
+          float fx = sx - (float)x0, fy = sy - (float)y0;
+          float v00 = (x0 >= 0 && x0 < n_u && y0 >= 0 && y0 < rows)
+              ? radial_native_value(volume, native_t, full_h, full_w, rows, n_u,
+                                    angle_idx, y0, x0, x_idx, y_idx, x_w, y_w) : 0.0f;
+          if (fx == 0.0f && fy == 0.0f) return v00;
+          float v01 = (x1 >= 0 && x1 < n_u && y0 >= 0 && y0 < rows)
+              ? radial_native_value(volume, native_t, full_h, full_w, rows, n_u,
+                                    angle_idx, y0, x1, x_idx, y_idx, x_w, y_w) : 0.0f;
+          float v10 = (x0 >= 0 && x0 < n_u && y1 >= 0 && y1 < rows)
+              ? radial_native_value(volume, native_t, full_h, full_w, rows, n_u,
+                                    angle_idx, y1, x0, x_idx, y_idx, x_w, y_w) : 0.0f;
+          float v11 = (x1 >= 0 && x1 < n_u && y1 >= 0 && y1 < rows)
+              ? radial_native_value(volume, native_t, full_h, full_w, rows, n_u,
+                                    angle_idx, y1, x1, x_idx, y_idx, x_w, y_w) : 0.0f;
+          float a = v00 + fx * (v01 - v00);
+          float b = v10 + fx * (v11 - v10);
+          return a + fy * (b - a);
+        }
+
+        template <typename O>
+        __device__ __forceinline__ void wr_norm(O* out, int q, float value);
+        template <>
+        __device__ __forceinline__ void wr_norm<float>(float* out, int q, float value) {
+          out[q] = fminf(255.0f, fmaxf(0.0f, value)) * (1.0f / 255.0f);
+        }
+        template <>
+        __device__ __forceinline__ void wr_norm<half>(half* out, int q, float value) {
+          value = fminf(255.0f, fmaxf(0.0f, value)) * (1.0f / 255.0f);
+          out[q] = __float2half_rn(value);
+        }
+
+        template <typename O>
+        __device__ void radial_direct_body(
+            const unsigned char* volume, int native_t, int full_h, int full_w,
+            int rows, int n_u, const int* render_meta, int oh, int ow,
+            float m00, float m01, float m02, float m10, float m11, float m12,
+            const int* x_idx, const int* y_idx, const float* x_w, const float* y_w,
+            O* out) {
+          int q = blockDim.x * blockIdx.x + threadIdx.x;
+          if (q >= oh * ow) return;
+          int angle_idx = render_meta[0];
+          int oy = q / ow, ox = q - oy * ow;
+          float sx = __fadd_rn(__fadd_rn(__fmul_rn(m00, (float)ox),
+                                         __fmul_rn(m01, (float)oy)), m02);
+          float sy = __fadd_rn(__fadd_rn(__fmul_rn(m10, (float)ox),
+                                         __fmul_rn(m11, (float)oy)), m12);
+          float value = radial_bilinear_value(
+              volume, native_t, full_h, full_w, rows, n_u, angle_idx, sy, sx,
+              x_idx, y_idx, x_w, y_w);
+          wr_norm<O>(out, q, value);
+        }
+
+        #define DECL_RADIAL(NAME, OT) \
+        extern "C" __global__ void NAME( \
+            const unsigned char* volume, int native_t, int full_h, int full_w, \
+            int rows, int n_u, const int* render_meta, int oh, int ow, \
+            float m00, float m01, float m02, float m10, float m11, float m12, \
+            const int* x_idx, const int* y_idx, const float* x_w, const float* y_w, OT* out) { \
+          radial_direct_body<OT>(volume, native_t, full_h, full_w, rows, n_u, render_meta, oh, ow, \
+              m00, m01, m02, m10, m11, m12, x_idx, y_idx, x_w, y_w, out); \
+        }
+        DECL_RADIAL(radial_direct_f32, float)
+        DECL_RADIAL(radial_direct_f16, half)
+
+        __device__ __forceinline__ void logical_t_taps(
+            int logical_idx, int native_t, int logical_t, int* t0, int* t1, float* alpha) {
+          float pos = ((float)logical_idx + 0.5f) * ((float)native_t / (float)logical_t) - 0.5f;
+          int raw0 = (int)floorf(pos);
+          *t0 = max(0, min(native_t - 1, raw0));
+          *t1 = min(native_t - 1, *t0 + 1);
+          *alpha = fminf(1.0f, fmaxf(0.0f, pos - (float)(*t0)));
+        }
+
+        __device__ __forceinline__ float rounded_t_lerp(
+            const unsigned char* volume, long long plane_stride, long long spatial,
+            int t0, int t1, float alpha) {
+          float a = (float)volume[(long long)t0 * plane_stride + spatial];
+          float b = (float)volume[(long long)t1 * plane_stride + spatial];
+          return fminf(255.0f, fmaxf(0.0f, rintf(a + alpha * (b - a))));
+        }
+
+        template <typename O>
+        __device__ void tilted_direct_body(
+            const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
+            int src_h, int src_w, int stack_len, int base_id, int direction_id,
+            const int* render_meta, float tan_tilt, int oh, int ow,
+            float m00, float m01, float m02, float m10, float m11, float m12, O* out) {
+          int q = blockDim.x * blockIdx.x + threadIdx.x;
+          if (q >= oh * ow) return;
+          int frame_center = render_meta[0];
+          int oy = q / ow, ox = q - oy * ow;
+          // The reference plan constructs these float32 arrays as two multiplies and
+          // two adds. Explicit RN operations avoid an FMA changing nearest-pixel ties.
+          float sx = __fadd_rn(__fadd_rn(__fmul_rn(m00, (float)ox),
+                                         __fmul_rn(m01, (float)oy)), m02);
+          float sy = __fadd_rn(__fadd_rn(__fmul_rn(m10, (float)ox),
+                                         __fmul_rn(m11, (float)oy)), m12);
+          int x = __float2int_rn(sx);
+          int y = __float2int_rn(sy);
+          if (x < 0 || x >= src_w || y < 0 || y >= src_h) {
+            wr_norm<O>(out, q, 0.0f); return;
+          }
+          float axis = direction_id == 0
+              ? sy - 0.5f * (float)(src_h - 1)
+              : sx - 0.5f * (float)(src_w - 1);
+          float stack = __fadd_rn((float)frame_center, __fmul_rn(tan_tilt, axis));
+          if (stack < 0.0f || stack > (float)(stack_len - 1)) {
+            wr_norm<O>(out, q, 0.0f); return;
+          }
+          int s0 = max(0, min(stack_len - 1, (int)floorf(stack)));
+          int s1 = min(stack_len - 1, s0 + 1);
+          float sa = stack - (float)s0;
+          long long ps = (long long)full_h * (long long)full_w;
+          float v0, v1;
+          if (base_id == 0) { // transverse: (x,y), stack=t
+            long long spatial = (long long)y * (long long)full_w + (long long)x;
+            if (native_t == logical_t) {
+              v0 = (float)volume[(long long)s0 * ps + spatial];
+              v1 = (float)volume[(long long)s1 * ps + spatial];
+            } else {
+              int a0, a1, b0, b1; float aa, ba;
+              logical_t_taps(s0, native_t, logical_t, &a0, &a1, &aa);
+              logical_t_taps(s1, native_t, logical_t, &b0, &b1, &ba);
+              v0 = rounded_t_lerp(volume, ps, spatial, a0, a1, aa);
+              v1 = rounded_t_lerp(volume, ps, spatial, b0, b1, ba);
+            }
+          } else {
+            int t0, t1; float ta;
+            logical_t_taps(y, native_t, logical_t, &t0, &t1, &ta);
+            long long spatial0, spatial1;
+            if (base_id == 1) { // sagittal: (x,t), stack=y
+              spatial0 = (long long)s0 * (long long)full_w + (long long)x;
+              spatial1 = (long long)s1 * (long long)full_w + (long long)x;
+            } else { // coronal: (y,t), stack=x
+              spatial0 = (long long)x * (long long)full_w + (long long)s0;
+              spatial1 = (long long)x * (long long)full_w + (long long)s1;
+            }
+            if (native_t == logical_t) {
+              v0 = (float)volume[(long long)y * ps + spatial0];
+              v1 = (float)volume[(long long)y * ps + spatial1];
+            } else {
+              v0 = rounded_t_lerp(volume, ps, spatial0, t0, t1, ta);
+              v1 = rounded_t_lerp(volume, ps, spatial1, t0, t1, ta);
+            }
+          }
+          wr_norm<O>(out, q, v0 + sa * (v1 - v0));
+        }
+
+        #define DECL_TILTED(NAME, OT) \
+        extern "C" __global__ void NAME( \
+            const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t, \
+            int src_h, int src_w, int stack_len, int base_id, int direction_id, \
+            const int* render_meta, float tan_tilt, int oh, int ow, \
+            float m00, float m01, float m02, float m10, float m11, float m12, OT* out) { \
+          tilted_direct_body<OT>(volume, native_t, full_h, full_w, logical_t, src_h, src_w, \
+              stack_len, base_id, direction_id, render_meta, tan_tilt, oh, ow, \
+              m00, m01, m02, m10, m11, m12, out); \
+        }
+        DECL_TILTED(tilted_direct_f32, float)
+        DECL_TILTED(tilted_direct_f16, half)
+        '''
+        names = (
+            'set_render_meta', 'precompute_radial_taps', 'radial_direct_f32', 'radial_direct_f16',
+            'tilted_direct_f32', 'tilted_direct_f16',
+        )
+        module = cp.RawModule(code=src, options=('--std=c++11',), name_expressions=names)
+        _FUSED_DIRECT_RENDER_KERNELS = argparse.Namespace(
+            cp=cp, **{name: module.get_function(name) for name in names},
+        )
+        return _FUSED_DIRECT_RENDER_KERNELS
+    except Exception:
+        _FUSED_DIRECT_RENDER_KERNELS_FAILED = True
+        return None
+
+
 def _wait_for_cube_ready_sentinel(sentinel_path: str, *, poll_seconds: float = 0.5) -> None:
     """v13.3.8 (E1): block until main signals the shared cube volume file is complete.
 
@@ -11058,6 +11479,9 @@ class _GpuWorkerRenderEngine:
         self.device = torch.device(str(device_str))
         if self.device.type != 'cuda' or not torch.cuda.is_available():
             raise RuntimeError('GPU render engine requires a CUDA device')
+        # A worker owns exactly one inference/render GPU. Keep CuPy/NVRTC's implicit
+        # current device aligned with the explicit Torch device used below.
+        torch.cuda.set_device(self.device)
         # All renders run on a dedicated LOW-priority stream; the resident batch-1 ring
         # gives TensorRT distinct high-priority streams so frame n inference can preempt/
         # overlap frame n+1 rendering. Consumers order through per-slot events.
@@ -11075,6 +11499,17 @@ class _GpuWorkerRenderEngine:
         self._mode = 'unresolved'
         self._tilted_plans: 'OrderedDict[Tuple[str, int, int, Tuple[float, ...]], Dict[str, object]]' = OrderedDict()
         self._fold_cache: Dict[Tuple[int, int, int], Tuple[object, object, object]] = {}
+        # P4 keeps one all-azimuth separable tap table per resident Radial geometry.
+        # It is generated by one CUDA launch and remains device-resident across task windows.
+        self._fused_radial_taps: 'OrderedDict[object, object]' = OrderedDict()
+        self._fused_volume_ref: Optional[object] = None
+        self._fused_disabled_families: set = set()
+        self._fused_warned_families: set = set()
+        self._fused_announced_families: set = set()
+        self._fused_graph_announced_families: set = set()
+        self._fused_graph_warned_families: set = set()
+        self._fused_graph_rejected_keys: set = set()
+        self._fused_validated_keys: set = set()
         self._warned_fallback = False
         self._resident_runtime_disabled = False
 
@@ -11116,6 +11551,11 @@ class _GpuWorkerRenderEngine:
         self._native_t_map_cache.clear()
         self._fold_cache.clear()
         self._tilted_plans.clear()
+        self._fused_radial_taps.clear()
+        self._fused_volume_ref = None
+        self._fused_disabled_families.clear()
+        self._fused_graph_rejected_keys.clear()
+        self._fused_validated_keys.clear()
         self._mode = 'stream'
         # E3's admission test is based on the NATIVE buffer, not the inflated cube t.
         nbytes = int(in_t) * int(in_h) * int(in_w)
@@ -11188,6 +11628,11 @@ class _GpuWorkerRenderEngine:
         self._native_t_map_cache.clear()
         self._fold_cache.clear()
         self._tilted_plans.clear()
+        self._fused_radial_taps.clear()
+        self._fused_volume_ref = None
+        self._fused_disabled_families.clear()
+        self._fused_graph_rejected_keys.clear()
+        self._fused_validated_keys.clear()
         self._mode = 'unresolved'
         try:
             self.torch.cuda.empty_cache()
@@ -11229,6 +11674,514 @@ class _GpuWorkerRenderEngine:
         f1 = values.index_select(0, r1).to(torch.float32)
         # The old E1 resident cube stored uint8 after cv2-compatible lerp.
         return torch.lerp(f0, f1, a).round_().clamp_(0.0, 255.0)
+
+    # ---- P4 fused resident-ring renderers ----
+
+    def _fused_render_fallback(self, family: str, exc: object) -> None:
+        """Disable one optional fused family after a synchronous capability failure."""
+        family_s = str(family)
+        self._fused_disabled_families.add(family_s)
+        if family_s not in self._fused_warned_families:
+            self._fused_warned_families.add(family_s)
+            gate = (
+                'YOLO_TTA_FUSED_RADIAL_RENDER=0'
+                if family_s == 'radial' else 'YOLO_TTA_FUSED_TILTED_RENDER=0'
+            )
+            print(
+                f'P4 fused {family_s} renderer unavailable ({exc}); using the reference '
+                f'Torch renderer for this worker. {gate} disables the capability probe.'
+            )
+
+    def _fused_cupy_volume(self, kernels: object) -> object:
+        if self._fused_volume_ref is None:
+            self._fused_volume_ref = kernels.cp.asarray(self._volume_gpu)
+        return self._fused_volume_ref
+
+    @staticmethod
+    def _fused_slot_output(slot: _ResidentGpuPipelineSlot, kernels: object) -> object:
+        ref = slot._render_cupy_refs.get('input_plane')
+        ptr = int(slot.input.data_ptr())
+        if ref is None or int(slot._render_cupy_refs.get('input_ptr', -1)) != ptr:
+            ref = kernels.cp.asarray(slot.input[0, 0])
+            slot._render_cupy_refs['input_plane'] = ref
+            slot._render_cupy_refs['input_ptr'] = ptr
+        return ref
+
+    def _fused_slot_metadata(
+        self,
+        slot: _ResidentGpuPipelineSlot,
+        kernels: object,
+        frame_value: Optional[int],
+    ) -> object:
+        """Update dynamic frame metadata without changing its graph-friendly device address."""
+        ref = slot._render_cupy_refs.get('render_meta')
+        ptr = int(slot.render_meta.data_ptr())
+        if ref is None or int(slot._render_cupy_refs.get('render_meta_ptr', -1)) != ptr:
+            ref = kernels.cp.asarray(slot.render_meta)
+            slot._render_cupy_refs['render_meta'] = ref
+            slot._render_cupy_refs['render_meta_ptr'] = ptr
+        if frame_value is not None:
+            kernels.set_render_meta(
+                (1,), (1,), (ref, np.int32(frame_value)),
+                stream=kernels.cp.cuda.ExternalStream(int(self._stream.cuda_stream)),
+            )
+        return ref
+
+    def _ensure_fused_radial_taps(self, view: ViewInfo, kernels: object) -> object:
+        """Generate/cache separable 6+6 tap descriptors for every configured azimuth.
+
+        Storing separable x/y taps costs one third of a flattened 36-tap table while the
+        direct renderer still performs the identical outer-product accumulation.  The table
+        is built in one launch on the render stream, not reconstructed for every frame.
+        """
+        if int(RADIAL_LANCZOS_A) != 3 or int(_lanczos_tap_count(RADIAL_LANCZOS_A)) != 6:
+            raise RuntimeError('fused Radial renderer currently requires Lanczos-3 (six taps per axis)')
+        angles_np = np.ascontiguousarray(np.asarray(view.azimuths_deg, dtype=np.float32))
+        n_angles = int(angles_np.size)
+        n_u = int(view.src_w) if int(view.src_w) > 0 else int(view.diameter)
+        if n_angles <= 0 or n_u <= 0:
+            raise RuntimeError('fused Radial descriptor geometry is empty')
+        key = (
+            int(view.full_h), int(view.full_w), int(n_u),
+            round(float(view.center_x), 5), round(float(view.center_y), 5),
+            round(float(view.roi_radius), 5), angles_np.tobytes(),
+        )
+        cached = self._fused_radial_taps.get(key)
+        if cached is not None:
+            self._fused_radial_taps.move_to_end(key)
+            return cached
+
+        # angle + four [angle,u,6] int32/float32 planes.
+        descriptor_bytes = int(n_angles * 4 + n_angles * n_u * 6 * 16)
+        cache_budget = int(fused_radial_tap_cache_bytes())
+        if cache_budget <= 0 or descriptor_bytes > cache_budget:
+            raise RuntimeError(
+                f'all-azimuth tap table needs {descriptor_bytes / GIB:.2f} GiB, above '
+                f'YOLO_TTA_FUSED_RADIAL_TAPS_GIB={cache_budget / GIB:.2f}'
+            )
+        free_bytes, _total_bytes = self.torch.cuda.mem_get_info(self.device)
+        if descriptor_bytes + 512 * 1024 * 1024 > int(free_bytes):
+            raise RuntimeError(
+                f'all-azimuth tap table needs {descriptor_bytes / GIB:.2f} GiB plus '
+                f'0.50 GiB launch headroom, only {int(free_bytes) / GIB:.2f} GiB free'
+            )
+
+        # A worker has one Radial geometry. If a caller supplies a replacement geometry,
+        # release the old table rather than silently multiplying the persistent cache.
+        self._fused_radial_taps.clear()
+        torch = self.torch
+        angles = torch.from_numpy(angles_np).to(self.device)
+        shape = (n_angles, n_u, 6)
+        x_idx = torch.empty(shape, dtype=torch.int32, device=self.device)
+        y_idx = torch.empty(shape, dtype=torch.int32, device=self.device)
+        x_w = torch.empty(shape, dtype=torch.float32, device=self.device)
+        y_w = torch.empty(shape, dtype=torch.float32, device=self.device)
+        cp = kernels.cp
+        refs = argparse.Namespace(
+            angles=angles, x_idx=x_idx, y_idx=y_idx, x_w=x_w, y_w=y_w,
+            cp_angles=cp.asarray(angles), cp_x_idx=cp.asarray(x_idx),
+            cp_y_idx=cp.asarray(y_idx), cp_x_w=cp.asarray(x_w), cp_y_w=cp.asarray(y_w),
+            n_angles=n_angles, n_u=n_u, nbytes=descriptor_bytes,
+        )
+        external = cp.cuda.ExternalStream(int(self._stream.cuda_stream))
+        total = int(n_angles) * int(n_u)
+        kernels.precompute_radial_taps(
+            ((total + 255) // 256,), (256,),
+            (
+                refs.cp_angles, np.int32(n_angles), np.int32(n_u),
+                np.int32(view.full_h), np.int32(view.full_w),
+                np.float32(view.center_x), np.float32(view.center_y), np.float32(view.roi_radius),
+                refs.cp_x_idx, refs.cp_y_idx, refs.cp_x_w, refs.cp_y_w,
+            ),
+            stream=external,
+        )
+        self._fused_radial_taps[key] = refs
+        print(
+            f'P4 Radial tap cache allocated on {self.device}: {n_angles} azimuths x {n_u} samples '
+            f'({descriptor_bytes / GIB:.2f} GiB, separable Lanczos-3 descriptors).'
+        )
+        return refs
+
+    def _try_fused_radial_into_slot(
+        self,
+        slot: _ResidentGpuPipelineSlot,
+        view: ViewInfo,
+        aff: AffineSpec,
+        frame_index: int,
+        out_size: int,
+        *,
+        stage_metadata: bool = True,
+        disable_on_failure: bool = True,
+    ) -> bool:
+        if not fused_radial_render_enabled() or 'radial' in self._fused_disabled_families:
+            return False
+        try:
+            if str(view.family) != 'radial':
+                return False
+            if self._volume_gpu is None or not bool(self._volume_gpu.is_contiguous()):
+                raise RuntimeError('resident uint8 source volume is unavailable or non-contiguous')
+            if self._volume_gpu.dtype != self.torch.uint8:
+                raise RuntimeError(f'expected uint8 source volume, got {self._volume_gpu.dtype}')
+            if int(view.full_h) != int(self._volume_gpu.shape[1]) or int(view.full_w) != int(self._volume_gpu.shape[2]):
+                raise RuntimeError('Radial view/source-volume XY geometry mismatch')
+            if int(frame_index) < 0 or int(frame_index) >= len(view.azimuths_deg):
+                raise RuntimeError(f'Radial frame index {frame_index} is outside its azimuth table')
+            kernels = _fused_direct_render_kernels()
+            if kernels is None:
+                raise RuntimeError('CuPy/NVRTC direct renderer kernels are unavailable')
+            taps = self._ensure_fused_radial_taps(view, kernels)
+            matrix = np.asarray(aff.M_out_to_src, dtype=np.float32).reshape(2, 3)
+            if not bool(np.all(np.isfinite(matrix))):
+                raise RuntimeError('Radial output-to-source affine is non-finite')
+            cp = kernels.cp
+            external = cp.cuda.ExternalStream(int(self._stream.cuda_stream))
+            kernel = (
+                kernels.radial_direct_f16
+                if slot.input.dtype == self.torch.float16 else kernels.radial_direct_f32
+            )
+            if slot.input.dtype not in (self.torch.float16, self.torch.float32):
+                raise RuntimeError(f'unsupported binding dtype {slot.input.dtype}')
+            pixels = int(out_size) * int(out_size)
+            kernel(
+                ((pixels + 255) // 256,), (256,),
+                (
+                    self._fused_cupy_volume(kernels),
+                    np.int32(self._volume_gpu.shape[0]), np.int32(self._volume_gpu.shape[1]),
+                    np.int32(self._volume_gpu.shape[2]), np.int32(view.src_h), np.int32(taps.n_u),
+                    self._fused_slot_metadata(
+                        slot, kernels, int(frame_index) if bool(stage_metadata) else None,
+                    ),
+                    np.int32(out_size), np.int32(out_size),
+                    *(np.float32(v) for v in matrix.reshape(-1)),
+                    taps.cp_x_idx, taps.cp_y_idx, taps.cp_x_w, taps.cp_y_w,
+                    self._fused_slot_output(slot, kernels),
+                ),
+                stream=external,
+            )
+            if 'radial' not in self._fused_announced_families:
+                self._fused_announced_families.add('radial')
+                print('P4 fused Radial renderer active: uint8 volume -> Lanczos/t-lerp -> TensorRT binding.')
+            return True
+        except Exception as exc:
+            if not bool(disable_on_failure):
+                raise
+            self._fused_radial_taps.clear()
+            self._fused_render_fallback('radial', exc)
+            return False
+
+    def _try_fused_tilted_into_slot(
+        self,
+        slot: _ResidentGpuPipelineSlot,
+        view: ViewInfo,
+        aff: AffineSpec,
+        frame_index: int,
+        out_size: int,
+        *,
+        stage_metadata: bool = True,
+        disable_on_failure: bool = True,
+    ) -> bool:
+        if not fused_tilted_render_enabled() or 'tilted' in self._fused_disabled_families:
+            return False
+        try:
+            if not is_tilted_view(view):
+                return False
+            if self._volume_gpu is None or not bool(self._volume_gpu.is_contiguous()):
+                raise RuntimeError('resident uint8 source volume is unavailable or non-contiguous')
+            if self._volume_gpu.dtype != self.torch.uint8:
+                raise RuntimeError(f'expected uint8 source volume, got {self._volume_gpu.dtype}')
+            native_t, full_h, full_w = (int(v) for v in self._volume_gpu.shape)
+            if int(view.full_h) != full_h or int(view.full_w) != full_w:
+                raise RuntimeError('Tilted view/source-volume XY geometry mismatch')
+            base = str(tilted_base_view_name(view))
+            base_ids = {'transverse': 0, 'sagittal': 1, 'coronal': 2}
+            if base not in base_ids:
+                raise RuntimeError(f'unsupported Tilted base {base!r}')
+            direction = str(view.tilt_direction)
+            if direction not in ('vertical', 'horizontal'):
+                raise RuntimeError(f'unsupported Tilted direction {direction!r}')
+            expected = cartesian_view_axis_spec(base, int(self._logical_t), full_h, full_w)
+            if int(view.src_h) != int(expected['src_h']) or int(view.src_w) != int(expected['src_w']):
+                raise RuntimeError('Tilted source raster does not match its base-view geometry')
+            stack_len = int(tilted_stack_axis_length(view))
+            center = int(tilted_frame_center(view, int(frame_index)))
+            if stack_len <= 0 or center < 0 or center >= stack_len:
+                raise RuntimeError('Tilted frame center is outside the stack geometry')
+            kernels = _fused_direct_render_kernels()
+            if kernels is None:
+                raise RuntimeError('CuPy/NVRTC direct renderer kernels are unavailable')
+            matrix = np.asarray(aff.M_out_to_src, dtype=np.float32).reshape(2, 3)
+            if not bool(np.all(np.isfinite(matrix))):
+                raise RuntimeError('Tilted output-to-source affine is non-finite')
+            cp = kernels.cp
+            external = cp.cuda.ExternalStream(int(self._stream.cuda_stream))
+            kernel = (
+                kernels.tilted_direct_f16
+                if slot.input.dtype == self.torch.float16 else kernels.tilted_direct_f32
+            )
+            if slot.input.dtype not in (self.torch.float16, self.torch.float32):
+                raise RuntimeError(f'unsupported binding dtype {slot.input.dtype}')
+            pixels = int(out_size) * int(out_size)
+            kernel(
+                ((pixels + 255) // 256,), (256,),
+                (
+                    self._fused_cupy_volume(kernels),
+                    np.int32(native_t), np.int32(full_h), np.int32(full_w), np.int32(self._logical_t),
+                    np.int32(view.src_h), np.int32(view.src_w), np.int32(stack_len),
+                    np.int32(base_ids[base]), np.int32(0 if direction == 'vertical' else 1),
+                    self._fused_slot_metadata(
+                        slot, kernels, int(center) if bool(stage_metadata) else None,
+                    ),
+                    np.float32(math.tan(math.radians(float(view.tilt_angle_deg)))),
+                    np.int32(out_size), np.int32(out_size),
+                    *(np.float32(v) for v in matrix.reshape(-1)),
+                    self._fused_slot_output(slot, kernels),
+                ),
+                stream=external,
+            )
+            if 'tilted' not in self._fused_announced_families:
+                self._fused_announced_families.add('tilted')
+                print('P4 fused Tilted renderer active: affine/shear/gathers/lerps -> TensorRT binding.')
+            return True
+        except Exception as exc:
+            if not bool(disable_on_failure):
+                raise
+            self._fused_render_fallback('tilted', exc)
+            return False
+
+    def _try_fused_render_into_ring_slot(
+        self,
+        slot: _ResidentGpuPipelineSlot,
+        view: ViewInfo,
+        aff: AffineSpec,
+        frame_index: int,
+        out_size: int,
+        *,
+        stage_metadata: bool = True,
+        allow_graph_replay: bool = True,
+        disable_on_failure: bool = True,
+    ) -> bool:
+        """Attempt P4 only for resident-ring Radial/Tilted frames.
+
+        Generic batches deliberately retain the reference Torch renderer: only the ring owns
+        a persistent destination binding whose address and dtype have already been validated.
+        """
+        family = 'radial' if str(view.family) == 'radial' else ('tilted' if is_tilted_view(view) else '')
+        if not family:
+            return False
+        if (
+            bool(allow_graph_replay)
+            and slot.render_graph is not None
+            and slot.render_expected_key is not None
+            and slot.render_graph_key == slot.render_expected_key
+            and family not in self._fused_disabled_families
+        ):
+            kernels = _fused_direct_render_kernels()
+            if kernels is None:
+                return False
+            if family == 'radial':
+                if int(frame_index) < 0 or int(frame_index) >= len(view.azimuths_deg):
+                    raise _ResidentTensorRTRingFatalError(
+                        f'P4 Radial graph frame {frame_index} is outside its descriptor table'
+                    )
+                dynamic_value = int(frame_index)
+            else:
+                dynamic_value = int(tilted_frame_center(view, int(frame_index)))
+                if dynamic_value < 0 or dynamic_value >= int(tilted_stack_axis_length(view)):
+                    raise _ResidentTensorRTRingFatalError(
+                        f'P4 Tilted graph center {dynamic_value} is outside its stack'
+                    )
+            try:
+                self._fused_slot_metadata(slot, kernels, dynamic_value)
+                slot.render_graph.replay()
+            except BaseException as exc:
+                # The ring has already borrowed TRT bindings when this path runs. A graph
+                # replay failure cannot enter the worker's generic lazy-render retry safely.
+                raise _ResidentTensorRTRingFatalError(
+                    f'P4 fused {family} renderer CUDA Graph replay failed'
+                ) from exc
+            return True
+        if family == 'radial':
+            return self._try_fused_radial_into_slot(
+                slot, view, aff, frame_index, out_size,
+                stage_metadata=bool(stage_metadata),
+                disable_on_failure=bool(disable_on_failure),
+            )
+        if family == 'tilted':
+            return self._try_fused_tilted_into_slot(
+                slot, view, aff, frame_index, out_size,
+                stage_metadata=bool(stage_metadata),
+                disable_on_failure=bool(disable_on_failure),
+            )
+        return False
+
+    def _fused_renderer_key(
+        self,
+        slot: _ResidentGpuPipelineSlot,
+        view: ViewInfo,
+        aff: AffineSpec,
+        out_size: int,
+    ) -> Tuple[object, ...]:
+        family = 'radial' if str(view.family) == 'radial' else ('tilted' if is_tilted_view(view) else '')
+        matrix_key = tuple(
+            round(float(x), 7)
+            for x in np.asarray(aff.M_out_to_src, dtype=np.float32).reshape(-1).tolist()
+        )
+        if family == 'radial':
+            family_geometry: Tuple[object, ...] = (
+                int(view.src_h), int(view.src_w), int(view.full_h), int(view.full_w),
+                round(float(view.center_x), 6), round(float(view.center_y), 6),
+                round(float(view.roi_radius), 6),
+                np.ascontiguousarray(np.asarray(view.azimuths_deg, dtype=np.float32)).tobytes(),
+            )
+        elif family == 'tilted':
+            family_geometry = (
+                str(tilted_base_view_name(view)), str(view.tilt_direction),
+                round(float(view.tilt_angle_deg), 7), int(view.tilt_frame_start),
+                int(view.tilt_frame_stop), int(view.src_h), int(view.src_w),
+                int(view.full_t), int(view.full_h), int(view.full_w),
+            )
+        else:
+            family_geometry = ()
+        return (
+            self._volume_key, str(view.name), family, int(out_size), str(slot.input.dtype),
+            matrix_key, family_geometry,
+        )
+
+    def validate_fused_ring_renderer(
+        self,
+        slot: _ResidentGpuPipelineSlot,
+        view: ViewInfo,
+        job: AugJob,
+        frame_index: int,
+        out_size: int,
+    ) -> None:
+        """Synchronously prove a P4 launch before the resident source is consumed.
+
+        NVRTC compilation and argument/configuration failures are normally synchronous, but
+        descriptor or render memory faults surface only at a stream boundary.  One probe per
+        volume/view/dtype/affine makes the default-on path a real capability test.  A failed
+        synchronization is fatal rather than a Torch fallback because CUDA execution faults
+        can poison the worker context; the parent already treats this exception as a worker-
+        fatal result.  Successful keys do not add a synchronization to later task windows.
+        """
+        family = 'radial' if str(view.family) == 'radial' else ('tilted' if is_tilted_view(view) else '')
+        if not family:
+            return
+        if family == 'radial' and not fused_radial_render_enabled():
+            return
+        if family == 'tilted' and not fused_tilted_render_enabled():
+            return
+        key = self._fused_renderer_key(slot, view, job.aff, int(out_size))
+        if key in self._fused_validated_keys or family in self._fused_disabled_families:
+            return
+        with self.torch.cuda.stream(self._stream):
+            launched = self._try_fused_render_into_ring_slot(
+                slot, view, job.aff, int(frame_index), int(out_size),
+            )
+        if not launched:
+            # A later launch-argument rejection can occur after descriptor generation was
+            # already queued. Drain it before its Torch owners are recycled by the fallback.
+            try:
+                self._stream.synchronize()
+            except BaseException as exc:
+                raise _ResidentTensorRTRingFatalError(
+                    f'P4 fused {family} renderer failed while draining a rejected probe'
+                ) from exc
+            return
+        try:
+            self._stream.synchronize()
+        except BaseException as exc:
+            raise _ResidentTensorRTRingFatalError(
+                f'P4 fused {family} renderer failed its pre-consumption CUDA probe'
+            ) from exc
+        self._fused_validated_keys.add(key)
+
+    def capture_fused_ring_renderer(
+        self,
+        slot: _ResidentGpuPipelineSlot,
+        view: ViewInfo,
+        job: AugJob,
+        frame_index: int,
+        out_size: int,
+    ) -> None:
+        """Capture and validate one slot's stable P4 render kernel opportunistically.
+
+        The one-thread metadata setter intentionally remains outside the graph. Therefore a
+        replay has fixed volume/descriptor/output addresses but reads the just-staged frame
+        index or Tilted center from ``slot.render_meta``. Capture failures with a healthy
+        stream retain the uncaptured fused launch; failed recovery is worker-fatal.
+        """
+        if not fused_render_cuda_graphs_enabled():
+            return
+        family = 'radial' if str(view.family) == 'radial' else ('tilted' if is_tilted_view(view) else '')
+        if not family or family in self._fused_disabled_families:
+            return
+        key = self._fused_renderer_key(slot, view, job.aff, int(out_size))
+        slot.render_expected_key = key
+        # A slot can be reused after a view/affine/volume change. Never leave an older
+        # executable installed when this new key is rejected or capture fails: otherwise
+        # the frame path could replay stale descriptor pointers and affine constants.
+        if slot.render_graph is not None and slot.render_graph_key != key:
+            slot.render_graph = None
+            slot.render_graph_key = None
+        if key not in self._fused_validated_keys:
+            return
+        if key in self._fused_graph_rejected_keys:
+            return
+        if slot.render_graph is not None and slot.render_graph_key == key:
+            return
+        kernels = _fused_direct_render_kernels()
+        if kernels is None:
+            return
+        dynamic_value = (
+            int(frame_index)
+            if family == 'radial'
+            else int(tilted_frame_center(view, int(frame_index)))
+        )
+        # Create zero-copy wrappers before stream capture; their addresses remain stable.
+        self._fused_slot_metadata(slot, kernels, None)
+        self._fused_slot_output(slot, kernels)
+        graph = None
+        try:
+            graph = self.torch.cuda.CUDAGraph()
+            with self.torch.cuda.graph(graph, stream=self._stream):
+                launched = self._try_fused_render_into_ring_slot(
+                    slot, view, job.aff, int(frame_index), int(out_size),
+                    stage_metadata=False, allow_graph_replay=False,
+                    disable_on_failure=False,
+                )
+            if not launched:
+                graph = None
+                self._stream.synchronize()
+                self._fused_graph_rejected_keys.add(key)
+                return
+            # Prove graph instantiation/replay before source consumption. The dynamic
+            # metadata write is ordered immediately ahead of replay on the same stream.
+            with self.torch.cuda.stream(self._stream):
+                self._fused_slot_metadata(slot, kernels, dynamic_value)
+                graph.replay()
+            self._stream.synchronize()
+        except Exception as exc:
+            graph = None
+            try:
+                self._stream.synchronize()
+            except BaseException as sync_exc:
+                raise _ResidentTensorRTRingFatalError(
+                    f'failed to recover P4 fused {family} renderer stream after graph capture'
+                ) from sync_exc
+            if family not in self._fused_graph_warned_families:
+                self._fused_graph_warned_families.add(family)
+                print(
+                    f'P4 fused {family} renderer CUDA Graph capture unavailable ({exc}); '
+                    'using its uncaptured direct kernel.'
+                )
+            self._fused_graph_rejected_keys.add(key)
+            return
+        slot.render_graph = graph
+        slot.render_graph_key = key
+        if family not in self._fused_graph_announced_families:
+            self._fused_graph_announced_families.add(family)
+            print(f'P4 fused {family} renderer CUDA Graph active (dynamic device metadata).')
 
     # ---- radial taps / fold (device) ----
 
@@ -11579,6 +12532,17 @@ class _GpuWorkerRenderEngine:
                 # This slot's preceding TensorRT enqueue has consumed its input before
                 # the low-priority renderer writes the next frame into the same address.
                 self._stream.wait_event(slot.infer_done)
+            # P4: the specialized ring admits angle-0 jobs only. Radial/Tilted kernels
+            # consume the resident uint8 volume and write normalized pixels directly to
+            # this static binding, avoiding proj/plane/grid/gather/cast intermediates.
+            if (
+                abs(float(job.angle_deg)) <= 1.0e-7
+                and self._try_fused_render_into_ring_slot(
+                    slot, view, job.aff, int(frame_index), int(out_size),
+                )
+            ):
+                slot.render_done.record(self._stream)
+                return
             plane = self._render_fullframe_frame(view, job.aff, int(frame_index), int(out_size))
             # Renderers return disposable float planes. Normalize in place and convert
             # directly into the preallocated fp16/fp32 binding (no stack/cast allocation).
@@ -11681,6 +12645,33 @@ class GpuRenderedYoloSource:
                 )
                 for i in range(2)
             ]
+        if abs(float(self.job.angle_deg)) <= 1.0e-7:
+            family = (
+                'radial' if str(self.view.family) == 'radial'
+                else ('tilted' if is_tilted_view(self.view) else '')
+            )
+            for slot in self._direct_ring:
+                expected_key = (
+                    self.engine._fused_renderer_key(
+                        slot, self.view, self.job.aff, int(self.out_size),
+                    )
+                    if family else None
+                )
+                slot.render_expected_key = expected_key
+                if slot.render_graph is not None and slot.render_graph_key != expected_key:
+                    slot.render_graph = None
+                    slot.render_graph_key = None
+            # P4's first async descriptor/render launch is synchronized here, before
+            # _try_resident_trt_ring_accumulate consumes a frame or borrows TRT bindings.
+            self.engine.validate_fused_ring_renderer(
+                self._direct_ring[0], self.view, self.job,
+                int(self.slice_offset), int(self.out_size),
+            )
+            for slot in self._direct_ring:
+                self.engine.capture_fused_ring_renderer(
+                    slot, self.view, self.job,
+                    int(self.slice_offset), int(self.out_size),
+                )
         self._direct_count = 0
         self.count = 0
         return self._direct_ring
@@ -11797,7 +12788,32 @@ def _worker_render_callable(volume_rgb: np.ndarray, view: ViewInfo, job: object,
     return _render_full
 
 
-def run_prediction_volume_in_worker(model: object, cfg: 'PredictConfig', task: Dict[str, object]) -> Dict[str, int]:
+@dataclass
+class _DeferredGpuWorkerTaskResult:
+    """Task stats whose device-union flush is retiring on the worker's copy lane."""
+
+    stats: Dict[str, object]
+    flush_future: Future
+    memmaps: Tuple[object, ...]
+
+    def finish(self) -> Dict[str, object]:
+        try:
+            self.flush_future.result()
+            return self.stats
+        finally:
+            for mm in self.memmaps:
+                if mm is not None:
+                    try:
+                        close_memmap_array(mm)
+                    except Exception:
+                        pass
+
+
+def run_prediction_volume_in_worker(
+    model: object,
+    cfg: 'PredictConfig',
+    task: Dict[str, object],
+) -> Dict[str, object] | _DeferredGpuWorkerTaskResult:
     """Render + predict + accumulate one prediction volume in a GPU worker process.
 
     Writes the per-volume processing-grid mask (and confidence map, if --min_conf > 0) to the
@@ -11822,6 +12838,7 @@ def run_prediction_volume_in_worker(model: object, cfg: 'PredictConfig', task: D
     result_mask_full: Optional[np.memmap] = None
     result_conf_full: Optional[np.memmap] = None
     source: Optional[object] = None
+    deferred_result: Optional[_DeferredGpuWorkerTaskResult] = None
 
     def _open_cpu_render_source() -> Tuple[np.memmap, object]:
         if native_resize is not None:
@@ -11967,6 +12984,7 @@ def run_prediction_volume_in_worker(model: object, cfg: 'PredictConfig', task: D
                 streaming_cleanup_min_radius=float(task.get('streaming_cleanup_min_radius', 0.0)),
                 slice_locks=None,
                 device_hole_fill=bool(task.get('device_hole_fill', False)),
+                defer_device_union_flush=bool(gpu_union_flush_overlap_enabled()),
             )
 
         retry_with_cpu_render = False
@@ -12013,13 +13031,30 @@ def run_prediction_volume_in_worker(model: object, cfg: 'PredictConfig', task: D
         # v13.2.5 (speed #6): no msync here — the main process reopens the result file on the
         # same host, where page-cache coherence makes the data visible without a blocking
         # multi-GiB writeback per task (msync was crash-durability only).
-        return {
+        public_stats: Dict[str, object] = {
             'prediction_count': int(stats.get('prediction_count', 0)),
             'frames_with_predictions': int(stats.get('frames_with_predictions', 0)),
             'device_hole_filled_frames': int(stats.get('device_hole_filled_frames', 0)),
             # v13.3.6 (D1): per-slice foreground metadata (or None) rides the result queue.
             'slice_meta': stats.get('slice_meta'),
         }
+        flush_future = stats.get('_device_union_flush_future')
+        if isinstance(flush_future, Future):
+            # Keep the result mappings alive until the copy thread has finished its final
+            # np.copyto. The main worker may now start the next task with a fresh device
+            # accumulator; `_gpu_inference_worker_main` publishes these stats only after
+            # `finish()` succeeds.
+            deferred_result = _DeferredGpuWorkerTaskResult(
+                stats=public_stats,
+                flush_future=flush_future,
+                memmaps=(result_mask, result_conf, result_mask_full, result_conf_full),
+            )
+            result_mask = None
+            result_conf = None
+            result_mask_full = None
+            result_conf_full = None
+            return deferred_result
+        return public_stats
     finally:
         # Always release the source render threads first, then close every memmap, even when
         # predict_source_and_accumulate raised, so a persistent worker never leaks fds/mmaps.
@@ -12141,12 +13176,47 @@ def _gpu_inference_worker_main(
             pass
         return
 
-    while True:
-        task = task_queue.get()
+    pending_flush_result: Optional[Tuple[int, _DeferredGpuWorkerTaskResult]] = None
+    prefetched_task: Optional[object] = None
+    has_prefetched_task = False
+    overlap_announced = False
+
+    def _publish_deferred(item: Tuple[int, _DeferredGpuWorkerTaskResult]) -> None:
+        finished_task_id, deferred = item
+        try:
+            finished_stats = deferred.finish()
+            result_queue.put({
+                'type': 'result', 'task_id': int(finished_task_id),
+                'gpu_index': int(gpu_index), 'ok': True, 'stats': finished_stats,
+            })
+        except Exception as exc:  # pragma: no cover - surfaced to scheduler
+            import traceback
+            result_queue.put({
+                'type': 'result', 'task_id': int(finished_task_id),
+                'gpu_index': int(gpu_index), 'ok': False,
+                'error': repr(exc), 'traceback': traceback.format_exc(),
+            })
+
+    try:
+      while True:
+        if has_prefetched_task:
+            task = prefetched_task
+            prefetched_task = None
+            has_prefetched_task = False
+        else:
+            task = task_queue.get()
         if task is None:
+            if pending_flush_result is not None:
+                _publish_deferred(pending_flush_result)
+                pending_flush_result = None
             break
         task_id = int(task['task_id'])
         if str(task.get('task_type', 'inference')) == 'interpolation_pass':
+            # Auxiliary work is submitted only after inference drains, but finalize a
+            # prefetched retiring task defensively before widening CPU affinity/using CUDA.
+            if pending_flush_result is not None:
+                _publish_deferred(pending_flush_result)
+                pending_flush_result = None
             # v13.3.4 (T4): after the inference queue drains, this warm worker process doubles
             # as an interpolation host — same memmap-path protocol as the dedicated
             # interpolation process pool, one pass at a time per worker.
@@ -12182,12 +13252,44 @@ def _gpu_inference_worker_main(
                 1, min(local_cpu_workers, int(task.get('slice_count', 1))),
             )
             task_local['postprocess_workers'] = int(local_cpu_workers)
-            stats = run_prediction_volume_in_worker(model, cfg, task_local)
-            result_queue.put({'type': 'result', 'task_id': task_id, 'gpu_index': int(gpu_index), 'ok': True, 'stats': stats})
+            completed = run_prediction_volume_in_worker(model, cfg, task_local)
+            # The previous task's D2H + host merge has now overlapped this task's complete
+            # render/infer/post stage. Join it before publishing its stats, preserving the
+            # scheduler-visible R4 ordering contract.
+            if pending_flush_result is not None:
+                _publish_deferred(pending_flush_result)
+                pending_flush_result = None
+            if isinstance(completed, _DeferredGpuWorkerTaskResult):
+                pending_flush_result = (int(task_id), completed)
+                if not overlap_announced:
+                    overlap_announced = True
+                    print(
+                        'GPU union flush overlap active (v13.3.13 G8): one retiring '
+                        'device accumulator overlaps the next worker task; '
+                        'YOLO_TTA_GPU_UNION_FLUSH_OVERLAP=0 restores synchronous flushes.'
+                    )
+                # All inference tasks are normally prequeued. If another task is already
+                # available, begin it immediately while this flush retires. When the queue
+                # is momentarily empty (especially the last task), settle now so the parent
+                # never waits for a result before it is able to enqueue the shutdown sentinel.
+                try:
+                    prefetched_task = task_queue.get(timeout=0.02)
+                    has_prefetched_task = True
+                except queue.Empty:
+                    _publish_deferred(pending_flush_result)
+                    pending_flush_result = None
+            else:
+                result_queue.put({
+                    'type': 'result', 'task_id': task_id, 'gpu_index': int(gpu_index),
+                    'ok': True, 'stats': completed,
+                })
         except _ResidentTensorRTRingFatalError as exc:  # pragma: no cover - unsafe TRT state
             # A failed post/infer-stream drain or binding-address restore means this process's
             # TensorRT contexts can no longer be reused safely.  Surface a worker-fatal result
             # and exit instead of dequeuing another view on the compromised backend.
+            if pending_flush_result is not None:
+                _publish_deferred(pending_flush_result)
+                pending_flush_result = None
             import traceback
             result_queue.put({
                 'type': 'fatal', 'task_id': task_id, 'gpu_index': int(gpu_index),
@@ -12195,11 +13297,18 @@ def _gpu_inference_worker_main(
             })
             return
         except Exception as exc:  # pragma: no cover - per-task failure surfaced to main
+            if pending_flush_result is not None:
+                _publish_deferred(pending_flush_result)
+                pending_flush_result = None
             import traceback
             result_queue.put({
                 'type': 'result', 'task_id': task_id, 'gpu_index': int(gpu_index), 'ok': False,
                 'error': repr(exc), 'traceback': traceback.format_exc(),
             })
+    finally:
+        if pending_flush_result is not None:
+            _publish_deferred(pending_flush_result)
+        _shutdown_gpu_union_flush_executor()
 
 
 # --------------------------
@@ -12692,6 +13801,103 @@ def gpu_slice_labeling_in_children_enabled() -> bool:
     return _env_flag('YOLO_TTA_GPU_SLICE_LABELING_IN_CHILDREN', False)
 
 
+def gpu_slice_labeling_pairs_enabled() -> bool:
+    """v13.3.13 (D6): emit adjacent-slice local-id pair codes while labels are on CUDA."""
+    return _env_flag('YOLO_TTA_GPU_SLICE_LABELING_PAIRS', True)
+
+
+_GPU_SLICE_LABELING_CONFIGURED_DEVICES: Optional[Tuple[int, ...]] = None
+
+
+def configure_gpu_slice_labeling_devices(devices: Sequence[str]) -> None:
+    """Remember the CUDA subset selected by ``--device`` for main-process D7 work.
+
+    CUDA worker processes are pinned to one visible device before importing/initializing
+    torch, so their logical device count remains authoritative.  This hint is primarily for
+    the unpinned parent, where every SLURM-visible GPU may otherwise be discoverable even when
+    the command selected a smaller subset.
+    """
+    configured: List[int] = []
+    for device in devices:
+        token = str(device).strip().lower()
+        if not token.startswith('cuda:'):
+            continue
+        try:
+            idx = int(token.split(':', 1)[1])
+        except Exception:
+            continue
+        if idx >= 0 and idx not in configured:
+            configured.append(idx)
+    global _GPU_SLICE_LABELING_CONFIGURED_DEVICES
+    _GPU_SLICE_LABELING_CONFIGURED_DEVICES = tuple(configured) if configured else None
+
+
+@dataclass
+class _GpuSliceLabelBlockResult:
+    z0: int
+    z1: int
+    device_index: int
+    first_plane: Optional[object]
+    last_plane: Optional[object]
+    internal_pair_codes: Dict[int, np.ndarray]
+
+
+def _gpu_adjacent_local_pair_codes_device(
+    cp: object,
+    prev_local: object,
+    curr_local: object,
+    prev_bbox: Sequence[int],
+    curr_bbox: Sequence[int],
+    h: int,
+    w: int,
+) -> object:
+    """D6 device equivalent of ``_adjacent_gid_pair_codes`` for local ids.
+
+    The same one-pixel-expanded bbox-intersection window and the same nine XY shifts are
+    used as the CPU stage-C path.  Local ids are packed into uint64 (previous in the high
+    word, current in the low word); global slice offsets are deliberately applied only after
+    all blocks finish and the complete component-count prefix sum is known.
+    """
+    py0, py1, px0, px1 = (int(v) for v in prev_bbox)
+    cy0, cy1, cx0, cx1 = (int(v) for v in curr_bbox)
+    ry0 = max(0, max(py0, cy0) - 1)
+    ry1 = min(int(h), min(py1, cy1) + 1)
+    rx0 = max(0, max(px0, cx0) - 1)
+    rx1 = min(int(w), min(px1, cx1) + 1)
+    if ry0 >= ry1 or rx0 >= rx1:
+        return cp.empty((0,), dtype=cp.uint64)
+
+    prev_crop = prev_local[ry0:ry1, rx0:rx1]
+    curr_crop = curr_local[ry0:ry1, rx0:rx1]
+    ch = int(ry1 - ry0)
+    cw = int(rx1 - rx0)
+    code_parts: List[object] = []
+    for dy, dx in _adjacent_xy_offsets_for_3d_connectivity(26):
+        dy_i = int(dy)
+        dx_i = int(dx)
+        py0_i = max(0, -dy_i)
+        py1_i = min(ch, ch - dy_i)
+        cy0_i = max(0, dy_i)
+        cy1_i = min(ch, ch + dy_i)
+        px0_i = max(0, -dx_i)
+        px1_i = min(cw, cw - dx_i)
+        cx0_i = max(0, dx_i)
+        cx1_i = min(cw, cw + dx_i)
+        if py0_i >= py1_i or px0_i >= px1_i:
+            continue
+        a = prev_crop[py0_i:py1_i, px0_i:px1_i]
+        b = curr_crop[cy0_i:cy1_i, cx0_i:cx1_i]
+        overlap = (a > 0) & (b > 0)
+        a_vals = a[overlap].astype(cp.uint64, copy=False)
+        b_vals = b[overlap].astype(cp.uint64, copy=False)
+        code_parts.append((a_vals << cp.uint64(32)) | b_vals)
+    if not code_parts:
+        return cp.empty((0,), dtype=cp.uint64)
+    # Exactly one unique reduction per adjacent slice pair.  The caller concatenates every
+    # pair result in the block for one small D2H transfer rather than one transfer per z.
+    return cp.unique(cp.concatenate(code_parts))
+
+
 _GPU_SLICE_LABELING_ANNOUNCED = False
 
 
@@ -12702,8 +13908,8 @@ def _try_label_slices_stage_a_gpu(
     slice_bboxes: np.ndarray,
     slice_areas: Optional[List[Optional[np.ndarray]]],
     known_slice_any: Optional[np.ndarray] = None,
-) -> bool:
-    """v13.3.6 (D3): GPU drop-in for the per-slice 2D labeling stage (stage A).
+) -> Tuple[bool, Optional[List[Optional[np.ndarray]]]]:
+    """D3/D6/D7 GPU drop-in for per-slice labeling and adjacent-pair extraction.
 
     One cupy ``label`` call per z-block with a z-DISCONNECTED structure (full 3x3 in-plane
     neighbourhood, nothing across z — the same trick as the S2 device hole fill) labels
@@ -12714,17 +13920,22 @@ def _try_label_slices_stage_a_gpu(
     written back into the selected local-label store restricted to each slice's bbox.
     v13.3.9 (D5) makes that store uint16 on the default no-compact-relabel path;
     the device-to-host relabel result remains int32 and is narrowed during the
-    bbox-restricted host copy. Stage C (pair
-    codes + union-find) is unchanged — it already consumes per-slice local ids + offsets.
-    Returns False on ANY failure (store re-zeroed if partially written) so the CPU stage
-    runs instead.
+    bbox-restricted host copy.
+
+    v13.3.13 D7 assigns independent blocks round-robin to a bounded one-lane-per-device
+    thread pool. D6 extracts local-id adjacency codes before each relabeled device block is
+    released, including block boundaries from retained edge planes. Stage C applies global
+    prefix offsets and feeds the unchanged union-find. The second return value contains one
+    optional local-code array per z pair; ``None`` means stage C must use its CPU reader.
+    ANY GPU failure re-zeroes the store and returns ``(False, None)`` for the complete CPU
+    fallback.
     """
     if not gpu_slice_labeling_enabled():
-        return False
+        return False, None
     try:
         import torch  # type: ignore
         if not bool(torch.cuda.is_available()):
-            return False
+            return False, None
         if (
             _INTERPOLATION_PROCESS_WORKER
             and not gpu_slice_labeling_in_children_enabled()
@@ -12734,66 +13945,142 @@ def _try_label_slices_stage_a_gpu(
             # labeling (init latency + VRAM, times up to 6 children). The aux GPU-worker
             # hosts (v13.3.4 T4) enter through the same entry point but already own a live
             # context from inference — they proceed.
-            return False
+            return False, None
         cp_mod = _try_import_cupy_ndimage()
         if cp_mod is None:
-            return False
+            return False, None
         cp, cpx_ndi = cp_mod
     except Exception:
-        return False
+        return False, None
 
     z_dim, h, w = (int(x) for x in mask_mm.shape)
     if z_dim <= 0 or h < 2 or w < 2:
-        return False
+        return False, None
 
-    z_done = 0
+    # Filled once D7 admission succeeds.  Keeping this outside the guarded body lets
+    # every exit path release cached allocations on *all* participating devices rather
+    # than whichever CUDA device happens to be current in the coordinator thread.
+    device_indices: List[int] = []
+
+    def _free_admitted_device_pools() -> None:
+        if device_indices:
+            for cleanup_dev_idx in device_indices:
+                try:
+                    with cp.cuda.Device(int(cleanup_dev_idx)):
+                        cp.get_default_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+            return
+        # No D7 device was admitted, so preserve the former best-effort cleanup for
+        # failures that occur before the selected-device list is finalized.
+        try:
+            cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+
     try:
-        device = _pick_gpu_compute_device(torch)
-        if device is None:
-            return False
-        dev_idx = int(getattr(device, 'index', 0) or 0)
+        visible_count = max(0, int(torch.cuda.device_count()))
+        if visible_count <= 0:
+            return False, None
+        configured = _GPU_SLICE_LABELING_CONFIGURED_DEVICES
+        candidate_indices = [
+            int(idx) for idx in (configured if configured is not None else tuple(range(visible_count)))
+            if 0 <= int(idx) < int(visible_count)
+        ]
+        if not candidate_indices:
+            candidate_indices = list(range(visible_count))
+
+        requested_device_cap = max(
+            1,
+            _env_int('YOLO_TTA_GPU_SLICE_LABELING_DEVICES', len(candidate_indices)),
+        )
+        requested_device_cap = min(int(requested_device_cap), len(candidate_indices))
         plane = int(h) * int(w)
         # Adaptive z-block: u8 mask + int32 labels + int32 relabel + label() workspace,
         # ~17 B/voxel, plus ~1 GiB headroom for the coordinate transients.
-        block = max(4, _env_int('YOLO_TTA_GPU_SLICE_LABELING_BLOCK', 64))
-        while block > 4:
-            free_bytes, _total = torch.cuda.mem_get_info(device)
-            if int(free_bytes) >= int(block) * plane * 17 + GIB:
-                break
-            block //= 2
-        free_bytes, _total = torch.cuda.mem_get_info(device)
-        if int(free_bytes) < int(block) * plane * 17 + GIB:
-            return False
+        requested_block = max(4, _env_int('YOLO_TTA_GPU_SLICE_LABELING_BLOCK', 64))
+        device_free: List[Tuple[int, int]] = []
+        for dev_idx in candidate_indices:
+            try:
+                device = torch.device(f'cuda:{int(dev_idx)}')
+                free_bytes, _total = torch.cuda.mem_get_info(device)
+                device_free.append((int(dev_idx), int(free_bytes)))
+            except Exception:
+                continue
+        if not device_free:
+            return False, None
+        if requested_device_cap == 1:
+            # Preserve D3's least-contentious single-device behavior when explicitly forced.
+            selected_free = [max(device_free, key=lambda item: int(item[1]))]
+        else:
+            # Use the freest configured devices, then restore logical-index order so block
+            # assignment is stable and visibly round-robin in logs/profilers.
+            selected_free = sorted(device_free, key=lambda item: int(item[1]), reverse=True)[:requested_device_cap]
+            selected_free.sort(key=lambda item: int(item[0]))
+
+        admitted: List[Tuple[int, int]] = []
+        for dev_idx, free_bytes in selected_free:
+            candidate_block = int(requested_block)
+            while candidate_block > 4 and int(free_bytes) < candidate_block * plane * 17 + GIB:
+                candidate_block = max(4, candidate_block // 2)
+            if int(free_bytes) >= candidate_block * plane * 17 + GIB:
+                admitted.append((int(dev_idx), int(candidate_block)))
+        if not admitted:
+            return False, None
+        device_indices = [int(item[0]) for item in admitted]
+        # Fixed block boundaries make round-robin dispatch and the retained-plane boundary
+        # contract deterministic. Use the smallest admitted block across selected devices.
+        block = min(int(item[1]) for item in admitted)
+        block_specs = [
+            (int(z0), min(int(z_dim), int(z0) + int(block)))
+            for z0 in range(0, int(z_dim), int(block))
+        ]
+        device_indices = device_indices[:max(1, min(len(device_indices), len(block_specs)))]
+        pairs_on_device = bool(gpu_slice_labeling_pairs_enabled())
 
         global _GPU_SLICE_LABELING_ANNOUNCED
         if not _GPU_SLICE_LABELING_ANNOUNCED:
             _GPU_SLICE_LABELING_ANNOUNCED = True
             print(
-                f'GPU per-slice labeling active on {device} (v13.3.6 D3, block={int(block)}; '
-                'YOLO_TTA_GPU_SLICE_LABELING=0 disables).'
+                f'GPU per-slice labeling active on '
+                f'{", ".join(f"cuda:{idx}" for idx in device_indices)} '
+                f'(v13.3.13 D3/D7, block={int(block)}, device-pairs={pairs_on_device}; '
+                'YOLO_TTA_GPU_SLICE_LABELING=0 disables, '
+                'YOLO_TTA_GPU_SLICE_LABELING_DEVICES=1 forces one device).'
             )
 
-        structure = cp.zeros((3, 3, 3), dtype=cp.bool_)
-        structure[1, :, :] = True  # in-plane 8-connectivity; z stays disconnected
+        empty_codes = lambda: np.zeros((0,), dtype=np.uint64)
 
-        with cp.cuda.Device(dev_idx):
-            for z0 in range(0, z_dim, int(block)):
-                z1 = min(z_dim, z0 + int(block))
+        def _label_block(z0: int, z1: int, dev_idx: int) -> _GpuSliceLabelBlockResult:
+            device = torch.device(f'cuda:{int(dev_idx)}')
+            with torch.cuda.device(device), cp.cuda.Device(int(dev_idx)):
+                structure = cp.zeros((3, 3, 3), dtype=cp.bool_)
+                structure[1, :, :] = True  # in-plane 8-connectivity; z disconnected
+                bs = int(z1 - z0)
                 if known_slice_any is not None and not bool(np.any(known_slice_any[z0:z1])):
                     component_counts[z0:z1] = np.uint32(0)
-                    z_done = int(z1)
-                    continue
-                bs = int(z1 - z0)
+                    internal = (
+                        {int(z): empty_codes() for z in range(int(z0) + 1, int(z1))}
+                        if pairs_on_device else {}
+                    )
+                    return _GpuSliceLabelBlockResult(
+                        int(z0), int(z1), int(dev_idx), None, None, internal,
+                    )
                 host_block = np.ascontiguousarray(np.asarray(mask_mm[z0:z1]))
-                mask_t = torch.from_numpy(host_block).to(device)
+                mask_t = torch.from_numpy(host_block).to(device=device, non_blocking=False)
                 fg_cp = cp.asarray(mask_t) > 0
                 labels_cp, num = cpx_ndi.label(fg_cp, structure=structure)
-                del fg_cp
+                del fg_cp, mask_t, host_block
                 num_i = int(num)
                 if num_i <= 0:
                     component_counts[z0:z1] = np.uint32(0)
-                    z_done = int(z1)
-                    continue
+                    internal = (
+                        {int(z): empty_codes() for z in range(int(z0) + 1, int(z1))}
+                        if pairs_on_device else {}
+                    )
+                    return _GpuSliceLabelBlockResult(
+                        int(z0), int(z1), int(dev_idx), None, None, internal,
+                    )
                 try:
                     labels_t = torch.from_dlpack(labels_cp)
                 except Exception:
@@ -12831,7 +14118,7 @@ def _try_label_slices_stage_a_gpu(
                 lut = torch.zeros((num_i + 1,), dtype=torch.int32, device=device)
                 lut.index_copy_(0, order + 1, (local_rank + 1).to(torch.int32))
                 # Relabel in cupy (int32 fancy indexing avoids a full int64 index copy).
-                relabeled_np = cp.asnumpy(cp.take(cp.asarray(lut), labels_cp))
+                relabeled_cp = cp.take(cp.asarray(lut), labels_cp)
                 del labels_cp, labels_t, flat, lut
 
                 counts_np = counts_t.cpu().numpy()
@@ -12844,6 +14131,7 @@ def _try_label_slices_stage_a_gpu(
                 del comp_area, comp_z, comp_y0, comp_y1, comp_x0, comp_x1, order, sorted_z, counts_t, starts, local_rank, comp_ids
 
                 store_dtype = np.dtype(labels_store.dtype)
+                block_bboxes = np.zeros((int(bs), 4), dtype=np.int64)
                 for zi in range(bs):
                     z = int(z0 + zi)
                     k = int(counts_np[zi])
@@ -12857,36 +14145,179 @@ def _try_label_slices_stage_a_gpu(
                     by1 = int(y1s[seg0:seg1].max()) + 1
                     bx0 = int(x0s[seg0:seg1].min())
                     bx1 = int(x1s[seg0:seg1].max()) + 1
+                    block_bboxes[zi, :] = (by0, by1, bx0, bx1)
                     slice_bboxes[z, 0] = by0
                     slice_bboxes[z, 1] = by1
                     slice_bboxes[z, 2] = bx0
                     slice_bboxes[z, 3] = bx1
                     if slice_areas is not None:
                         slice_areas[z] = areas_sorted[seg0:seg1].astype(np.int64, copy=True)
+
+                internal_pair_codes: Dict[int, np.ndarray] = {}
+                if pairs_on_device:
+                    pair_device_arrays: List[object] = []
+                    pair_zs: List[int] = []
+                    for zi in range(1, int(bs)):
+                        z = int(z0 + zi)
+                        pair_zs.append(z)
+                        if int(counts_np[zi - 1]) <= 0 or int(counts_np[zi]) <= 0:
+                            pair_device_arrays.append(cp.empty((0,), dtype=cp.uint64))
+                        else:
+                            pair_device_arrays.append(_gpu_adjacent_local_pair_codes_device(
+                                cp,
+                                relabeled_cp[zi - 1],
+                                relabeled_cp[zi],
+                                block_bboxes[zi - 1],
+                                block_bboxes[zi],
+                                int(h),
+                                int(w),
+                            ))
+                    pair_lengths = [int(arr.size) for arr in pair_device_arrays]
+                    pair_total = int(sum(pair_lengths))
+                    if pair_total > 0:
+                        pair_flat = cp.asnumpy(cp.concatenate(pair_device_arrays))
+                    else:
+                        pair_flat = empty_codes()
+                    cursor = 0
+                    for z, length in zip(pair_zs, pair_lengths):
+                        internal_pair_codes[int(z)] = np.ascontiguousarray(
+                            pair_flat[cursor:cursor + int(length)], dtype=np.uint64,
+                        )
+                        cursor += int(length)
+
+                # Retain only the two block-edge planes on their owning device. Internal
+                # pairs have already consumed the full block; these small references let
+                # the coordinator form the one cross-block pair without rereading labels.
+                first_plane = (
+                    relabeled_cp[0].copy()
+                    if pairs_on_device and int(counts_np[0]) > 0 else None
+                )
+                last_plane = (
+                    relabeled_cp[-1].copy()
+                    if pairs_on_device and int(counts_np[-1]) > 0 else None
+                )
+                # Existing D3 transfer: labels must remain in the local-id store for later
+                # component-table/SDF consumers. Pair codes above add only one tiny D2H block.
+                relabeled_np = cp.asnumpy(relabeled_cp)
+                del relabeled_cp
+                for zi in range(bs):
+                    z = int(z0 + zi)
+                    k = int(counts_np[zi])
+                    if k <= 0:
+                        continue
+                    by0, by1, bx0, bx1 = (int(v) for v in block_bboxes[zi])
                     np.copyto(
                         np.asarray(labels_store[z, by0:by1, bx0:bx1]),
                         relabeled_np[zi, by0:by1, bx0:bx1].astype(store_dtype, copy=False),
                     )
-                z_done = int(z1)
-            try:
-                cp.get_default_memory_pool().free_all_blocks()
-            except Exception:
-                pass
-        return True
+                return _GpuSliceLabelBlockResult(
+                    int(z0), int(z1), int(dev_idx), first_plane, last_plane,
+                    internal_pair_codes,
+                )
+
+        precomputed_pairs: Optional[List[Optional[np.ndarray]]] = (
+            [None] * int(z_dim) if pairs_on_device else None
+        )
+        # Keep no more than one block outstanding per GPU. Block i always returns to lane
+        # i%N, so independent z blocks are genuinely round-robin without concurrent calls
+        # fighting over one device's allocator/default stream.
+        lane_count = max(1, len(device_indices))
+        previous_result: Optional[_GpuSliceLabelBlockResult] = None
+        with ThreadPoolExecutor(max_workers=lane_count, thread_name_prefix='slice-label-gpu') as executor:
+            pending: Dict[int, Future] = {}
+            for block_idx in range(min(lane_count, len(block_specs))):
+                z0, z1 = block_specs[block_idx]
+                dev_idx = device_indices[block_idx % lane_count]
+                pending[block_idx] = executor.submit(_label_block, z0, z1, dev_idx)
+
+            for block_idx in range(len(block_specs)):
+                result = pending.pop(block_idx).result()
+                if precomputed_pairs is not None:
+                    for z, codes in result.internal_pair_codes.items():
+                        precomputed_pairs[int(z)] = np.ascontiguousarray(codes, dtype=np.uint64)
+                    if previous_result is not None:
+                        boundary_z = int(result.z0)
+                        if (
+                            int(component_counts[boundary_z - 1]) <= 0
+                            or int(component_counts[boundary_z]) <= 0
+                        ):
+                            boundary_codes = empty_codes()
+                        else:
+                            if previous_result.last_plane is None or result.first_plane is None:
+                                raise RuntimeError(
+                                    f'missing retained GPU label plane for block boundary z={boundary_z}'
+                                )
+                            # D6 boundary pair: use the retained previous-block device edge
+                            # and current device edge, never re-read either label slice from
+                            # the host store. Peer-copy the one previous plane when round-robin
+                            # placed the blocks on different GPUs; only non-P2P systems use a
+                            # retained-plane host bounce as the correctness fallback.
+                            with (
+                                torch.cuda.device(torch.device(f'cuda:{int(result.device_index)}')),
+                                cp.cuda.Device(int(result.device_index)),
+                            ):
+                                curr_cp = result.first_plane
+                                prev_cp = previous_result.last_plane
+                                copied_prev = None
+                                if int(previous_result.device_index) != int(result.device_index):
+                                    try:
+                                        if not bool(cp.cuda.runtime.deviceCanAccessPeer(
+                                            int(result.device_index),
+                                            int(previous_result.device_index),
+                                        )):
+                                            raise RuntimeError('CUDA peer access unavailable')
+                                        copied_prev = cp.empty(
+                                            tuple(int(v) for v in prev_cp.shape), dtype=prev_cp.dtype,
+                                        )
+                                        cp.cuda.runtime.memcpyPeerAsync(
+                                            int(copied_prev.data.ptr),
+                                            int(result.device_index),
+                                            int(prev_cp.data.ptr),
+                                            int(previous_result.device_index),
+                                            int(prev_cp.nbytes),
+                                            int(cp.cuda.get_current_stream().ptr),
+                                        )
+                                        prev_cp = copied_prev
+                                    except Exception:
+                                        with cp.cuda.Device(int(previous_result.device_index)):
+                                            prev_host = cp.asnumpy(previous_result.last_plane)
+                                        with cp.cuda.Device(int(result.device_index)):
+                                            copied_prev = cp.asarray(prev_host)
+                                        prev_cp = copied_prev
+                                boundary_dev = _gpu_adjacent_local_pair_codes_device(
+                                    cp,
+                                    prev_cp,
+                                    curr_cp,
+                                    slice_bboxes[boundary_z - 1],
+                                    slice_bboxes[boundary_z],
+                                    int(h),
+                                    int(w),
+                                )
+                                boundary_codes = np.ascontiguousarray(
+                                    cp.asnumpy(boundary_dev), dtype=np.uint64,
+                                )
+                                del prev_cp, curr_cp, copied_prev, boundary_dev
+                        precomputed_pairs[boundary_z] = boundary_codes
+                previous_result = result
+
+                next_idx = int(block_idx + lane_count)
+                if next_idx < len(block_specs):
+                    z0, z1 = block_specs[next_idx]
+                    dev_idx = device_indices[next_idx % lane_count]
+                    pending[next_idx] = executor.submit(_label_block, z0, z1, dev_idx)
+
+        _free_admitted_device_pools()
+        return True, precomputed_pairs
     except _LocalLabelCapacityError:
         # The result is data-dependent, not a GPU backend failure. Re-raise before the
         # generic fallback's full-store zero sweep and duplicate CPU labeling pass.
-        try:
-            cp.get_default_memory_pool().free_all_blocks()
-        except Exception:
-            pass
+        _free_admitted_device_pools()
         raise
     except Exception as exc:
         print(f'Warning: GPU per-slice labeling failed ({exc}); falling back to the CPU labeling stage.')
+        _free_admitted_device_pools()
         # Zero everything the GPU pass may have written so the CPU stage starts from a
-        # clean store (it only rewrites each nonempty slice's bbox window). z_done tracks
-        # completed blocks; one extra block covers a partially-written one.
-        del z_done  # conservative: re-zero the whole store on this rare failure path
+        # clean store (the CPU fallback only rewrites each nonempty slice's bbox window).
         for z in range(0, int(z_dim)):
             try:
                 labels_store[int(z), :, :] = 0
@@ -12896,7 +14327,14 @@ def _try_label_slices_stage_a_gpu(
             component_counts[:] = np.uint32(0)
         except Exception:
             pass
-        return False
+        try:
+            slice_bboxes[:] = np.int64(0)
+        except Exception:
+            pass
+        if slice_areas is not None:
+            for z in range(len(slice_areas)):
+                slice_areas[z] = None
+        return False, None
 
 
 def label_foreground_volume_streaming(
@@ -13054,7 +14492,7 @@ def label_foreground_volume_streaming(
 
     # v13.3.6 (D3): one z-disconnected cupy label pass per block on the GPU replaces the
     # per-slice cv2 stage when CUDA is available in this process; CPU threads otherwise.
-    gpu_stage_a_done = _try_label_slices_stage_a_gpu(
+    gpu_stage_a_done, gpu_stage_a_pair_codes = _try_label_slices_stage_a_gpu(
         mask_mm,
         labels_store,
         component_counts,
@@ -13091,6 +14529,24 @@ def label_foreground_volume_streaming(
     uf.new_ids(total_components)
 
     def _pair_codes_for_z(z: int) -> np.ndarray:
+        if gpu_stage_a_pair_codes is not None:
+            local_codes = gpu_stage_a_pair_codes[int(z)]
+            if local_codes is not None:
+                local_codes_u64 = np.asarray(local_codes, dtype=np.uint64)
+                if local_codes_u64.size <= 0:
+                    return np.zeros((0,), dtype=np.uint64)
+                # D6 emitted local ids before the all-slice component prefix existed.
+                # Promote both packed words now; no label-store page is touched.
+                prev_ids = (local_codes_u64 >> np.uint64(32)) + np.uint64(
+                    int(slice_offsets[int(z) - 1])
+                )
+                curr_ids = (local_codes_u64 & np.uint64(0xFFFFFFFF)) + np.uint64(
+                    int(slice_offsets[int(z)])
+                )
+                return np.ascontiguousarray(
+                    (prev_ids << np.uint64(32)) | curr_ids,
+                    dtype=np.uint64,
+                )
         # v13.2.5 (speed #11): the per-slice component counts already say whether a slice has any
         # foreground (no full-slice np.any scans), and the pair extraction is restricted to the
         # 1-pixel-expanded intersection of the two slices' foreground bboxes — every 26-connected
@@ -13116,7 +14572,9 @@ def label_foreground_volume_streaming(
         )
 
     if int(z_dim) > 1:
-        if pair_workers <= 1:
+        # D6 arrays are already compact and host-resident; a large CPU read pool would add
+        # scheduling overhead without any label-store I/O left to overlap.
+        if pair_workers <= 1 or gpu_stage_a_pair_codes is not None:
             pair_iter: Iterable[np.ndarray] = (_pair_codes_for_z(int(z)) for z in range(1, int(z_dim)))
         else:
             pair_iter = parallel_map_in_order(
@@ -14321,6 +15779,9 @@ class _ResidentTensorRTRingExecutor:
         for slot in getattr(self, 'slots', []):
             slot.infer_graph = None
             slot.post_graph = None
+            slot.render_graph = None
+            slot.render_graph_key = None
+            slot.render_expected_key = None
             slot.context = None
             slot.binding_addresses = None
             slot.head = None
@@ -14332,6 +15793,7 @@ class _ResidentTensorRTRingExecutor:
             slot.native_union = None
             slot.native_conf = None
             slot._cupy_refs.clear()
+            slot._render_cupy_refs.clear()
         if restore_error is not None:
             raise _ResidentTensorRTRingFatalError(
                 'failed to restore every AutoBackend TensorRT binding address; fallback is unsafe'
@@ -22572,7 +24034,7 @@ def nrrd_deflate_mix_mode() -> str:
 
 
 def nrrd_deflate_cpu_lane_cores() -> int:
-    """Dedicated N9 ISA-L/member lane size; an explicit zero disables the CPU lane.
+    """Dedicated N9 complete-member lane size; an explicit zero disables the CPU lane.
 
     The default deliberately reserves about three quarters of the allocated CPUs for
     x264 and other tail work.  It is also bounded by the configured general gzip pool.
@@ -23847,9 +25309,100 @@ def _nrrd_gpu_deflate_engine() -> Optional[_NvcompDeflateEngine]:
 # become cached prebuilt members: no deflate, no CRC, no copy.
 # YOLO_TTA_NRRD_MEMBER_GZIP=0 restores the single-member writer.
 
+# v13.3.13 (N17): the independent 8-16 MiB members are also the ideal API shape
+# for python-deflate/libdeflate's one-shot gzip_compress.  Codec selection is kept
+# inside this tier so the established single-member and pigz fallbacks remain intact.
+# ``auto`` probes complete-member encoders in libdeflate -> ISA-L -> zlib order.
+
 
 def nrrd_member_gzip_enabled() -> bool:
     return _env_flag('YOLO_TTA_NRRD_MEMBER_GZIP', True)
+
+
+_NRRD_MEMBER_CODEC_SETTING_WARNED = False
+
+
+def nrrd_member_codec_requested() -> str:
+    """N17 complete-member CPU codec policy: auto, libdeflate, isal, or zlib."""
+    global _NRRD_MEMBER_CODEC_SETTING_WARNED
+    raw = os.environ.get('YOLO_TTA_NRRD_MEMBER_CODEC', 'auto').strip().lower()
+    if raw in {'auto', 'libdeflate', 'isal', 'zlib'}:
+        return str(raw)
+    if not _NRRD_MEMBER_CODEC_SETTING_WARNED:
+        _NRRD_MEMBER_CODEC_SETTING_WARNED = True
+        print(
+            f'Warning: invalid YOLO_TTA_NRRD_MEMBER_CODEC={raw!r}; using auto '
+            '(libdeflate -> ISA-L -> zlib).'
+        )
+    return 'auto'
+
+
+def nrrd_libdeflate_level() -> int:
+    """Compression level for python-deflate/libdeflate complete gzip members.
+
+    libdeflate accepts levels through 12.  The ordinary NRRD level remains the default,
+    while an explicit override permits trading some of N17's throughput margin for ratio.
+    A configured level zero is deliberately left as zero: wheels which reject it fail the
+    codec self-test and fall through to a backend that preserves store-mode semantics.
+    """
+    return int(np.clip(
+        _env_int('YOLO_TTA_NRRD_LIBDEFLATE_LEVEL', int(nrrd_pigz_compresslevel())),
+        0,
+        12,
+    ))
+
+
+def _nrrd_member_codec_candidates() -> Tuple[str, ...]:
+    requested = str(nrrd_member_codec_requested())
+    if requested == 'auto':
+        return ('libdeflate', 'isal', 'zlib')
+    return (requested,)
+
+
+def _nrrd_member_codec_spec(
+    codec_name: str,
+) -> Tuple[str, int, Callable[[bytes], bytes]]:
+    """Resolve one complete-gzip codec without silently substituting another codec."""
+    name = str(codec_name).strip().lower()
+    configured_level = int(nrrd_pigz_compresslevel())
+    if name == 'libdeflate':
+        import deflate  # type: ignore
+
+        level = int(nrrd_libdeflate_level())
+        gzip_compress = getattr(deflate, 'gzip_compress')
+
+        def _compress_libdeflate(payload: bytes) -> bytes:
+            # Positional level is intentional: this is the python-deflate public API and
+            # ensures the exact one-shot call shape is covered by the known-answer test.
+            return bytes(gzip_compress(payload, int(level)))
+
+        return 'libdeflate', int(level), _compress_libdeflate
+    if name == 'isal':
+        from isal import isal_zlib  # type: ignore
+
+        level = 0 if configured_level <= 0 else (
+            1 if configured_level <= 4 else (2 if configured_level <= 7 else 3)
+        )
+        level = int(np.clip(_env_int('YOLO_TTA_NRRD_ISAL_LEVEL', int(level)), 0, 3))
+
+        def _compress_isal(payload: bytes) -> bytes:
+            cobj = isal_zlib.compressobj(
+                int(level),
+                isal_zlib.DEFLATED,
+                16 + int(getattr(isal_zlib, 'MAX_WBITS', 15)),
+            )
+            return bytes(cobj.compress(payload) + cobj.flush())
+
+        return 'isal', int(level), _compress_isal
+    if name == 'zlib':
+        level = int(configured_level)
+
+        def _compress_zlib(payload: bytes) -> bytes:
+            cobj = zlib.compressobj(int(level), zlib.DEFLATED, 16 + int(zlib.MAX_WBITS))
+            return bytes(cobj.compress(payload) + cobj.flush())
+
+        return 'zlib', int(level), _compress_zlib
+    raise ValueError(f'Unsupported NRRD member codec {codec_name!r}')
 
 
 def nrrd_member_gzip_window_bytes() -> int:
@@ -23872,26 +25425,15 @@ class _MemberParallelGzipPayloadWriter:
         *,
         chunk_bytes: Optional[int] = None,
         executor: Optional[ThreadPoolExecutor] = None,
+        codec_spec: Optional[Tuple[str, int, Callable[[bytes], bytes]]] = None,
     ) -> None:
-        backend, _raw_factory, _crc_fn, _full_flush, eff_level = _nrrd_deflate_backend()
+        resolved = codec_spec if codec_spec is not None else _select_nrrd_member_codec()
+        if resolved is None:
+            raise RuntimeError('No validated complete-member NRRD gzip codec is available')
         self.fh = fh
-        self.backend = str(backend)
-        self.eff_level = int(eff_level)
-        if self.backend == 'isal':
-            from isal import isal_zlib  # type: ignore
-
-            def _make_member_compressor() -> object:
-                # gzip framing makes ISA-L/zlib calculate CRC + DEFLATE in their native pass.
-                return isal_zlib.compressobj(
-                    int(self.eff_level), isal_zlib.DEFLATED,
-                    16 + int(getattr(isal_zlib, 'MAX_WBITS', 15)),
-                )
-        else:
-            def _make_member_compressor() -> object:
-                return zlib.compressobj(
-                    int(self.eff_level), zlib.DEFLATED, 16 + int(zlib.MAX_WBITS),
-                )
-        self.member_factory = _make_member_compressor
+        self.backend = str(resolved[0])
+        self.eff_level = int(resolved[1])
+        self.member_compress = resolved[2]
         self.chunk_bytes = int(chunk_bytes) if chunk_bytes else int(nrrd_gzip_chunk_bytes())
         self.window_bytes = int(nrrd_member_gzip_window_bytes())
         self.executor = executor
@@ -23911,9 +25453,9 @@ class _MemberParallelGzipPayloadWriter:
         """
         del known_nonzero  # retained for the explicit sparse-writer API and future telemetry
         ln = int(len(payload))
-        cobj = self.member_factory()
-        member = cobj.compress(payload) + cobj.flush()
-        return bytes(member), int(ln)
+        # libdeflate, ISA-L, and zlib all emit the complete RFC-1952 member here,
+        # including CRC32/ISIZE in their native C pass.
+        return bytes(self.member_compress(payload)), int(ln)
 
     def _enqueue_completed(self, member: bytes, ln: int) -> None:
         seq = int(self._next_sequence)
@@ -24019,14 +25561,19 @@ class _MemberParallelGzipPayloadWriter:
         self._completed.clear()
 
 
-_NRRD_MEMBER_GZIP_OK: Optional[bool] = None
+_NRRD_MEMBER_GZIP_OK: Dict[Tuple[str, int], bool] = {}
 _NRRD_MEMBER_GZIP_TEST_LOCK = threading.Lock()
 _NRRD_MEMBER_GZIP_ANNOUNCED = False
+_NRRD_MEMBER_CODEC_FAILURES_ANNOUNCED: set = set()
 _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED = False
 _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCE_LOCK = threading.Lock()
 
 
-def _announce_nrrd_cpu_deflate_backend(tier: str) -> None:
+def _announce_nrrd_cpu_deflate_backend(
+    tier: str,
+    *,
+    codec_spec: Optional[Tuple[str, int, Callable[[bytes], bytes]]] = None,
+) -> None:
     """Report the actual CPU encoder selected after its self-test, once per process."""
     global _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED
     if _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED:
@@ -24034,37 +25581,82 @@ def _announce_nrrd_cpu_deflate_backend(tier: str) -> None:
     with _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCE_LOCK:
         if _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED:
             return
-        backend, _factory, _crc_fn, _flush, level = _nrrd_deflate_backend()
-        display = 'ISA-L (python-isal)' if str(backend) == 'isal' else 'zlib'
+        if codec_spec is None:
+            backend, _factory, _crc_fn, _flush, level = _nrrd_deflate_backend()
+        else:
+            backend, level, _compress = codec_spec
+        display = {
+            'libdeflate': 'libdeflate (python-deflate)',
+            'isal': 'ISA-L (python-isal)',
+            'zlib': 'zlib',
+        }.get(str(backend), str(backend))
         print(f'CPU NRRD DEFLATE backend selected: {display}, level={int(level)}, tier={tier}.')
         _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED = True
 
 
-def _nrrd_member_gzip_self_test() -> bool:
-    """One-time round trip across member framing, the zero-member cache, and write_zeros."""
-    global _NRRD_MEMBER_GZIP_OK
-    if _NRRD_MEMBER_GZIP_OK is not None:
-        return bool(_NRRD_MEMBER_GZIP_OK)
+def _nrrd_member_codec_self_test(
+    codec_spec: Tuple[str, int, Callable[[bytes], bytes]],
+) -> bool:
+    """KAT one codec's complete framing plus the member writer's ordered/zero paths."""
+    key = (str(codec_spec[0]), int(codec_spec[1]))
+    cached = _NRRD_MEMBER_GZIP_OK.get(key)
+    if cached is not None:
+        return bool(cached)
     with _NRRD_MEMBER_GZIP_TEST_LOCK:
-        if _NRRD_MEMBER_GZIP_OK is not None:
-            return bool(_NRRD_MEMBER_GZIP_OK)
+        cached = _NRRD_MEMBER_GZIP_OK.get(key)
+        if cached is not None:
+            return bool(cached)
         try:
             import gzip as _gzip
             part_a = bytes(range(256)) * 41 + b'\x00' * 3000  # spans members; all-zero tail member
             part_b = b'\x00' * 8192                            # write_zeros: cached members only
             part_c = b'nrrd-member-gzip-self-test' * 99
             sink = io.BytesIO()
-            writer = _MemberParallelGzipPayloadWriter(sink, chunk_bytes=4096)
+            writer = _MemberParallelGzipPayloadWriter(
+                sink,
+                chunk_bytes=4096,
+                codec_spec=codec_spec,
+            )
             writer.write(part_a)
             writer.write_zeros(len(part_b))
             writer.write(part_c)
             writer.close()
-            _NRRD_MEMBER_GZIP_OK = bool(_gzip.decompress(sink.getvalue()) == part_a + part_b + part_c)
+            ok = bool(_gzip.decompress(sink.getvalue()) == part_a + part_b + part_c)
         except Exception:
-            _NRRD_MEMBER_GZIP_OK = False
-        if not _NRRD_MEMBER_GZIP_OK:
-            print('Warning: member-parallel NRRD gzip self-test failed; using the single-member writer.')
-        return bool(_NRRD_MEMBER_GZIP_OK)
+            ok = False
+        _NRRD_MEMBER_GZIP_OK[key] = bool(ok)
+        return bool(ok)
+
+
+def _select_nrrd_member_codec() -> Optional[Tuple[str, int, Callable[[bytes], bytes]]]:
+    """First available and KAT-validated configured complete-member codec wins."""
+    requested = str(nrrd_member_codec_requested())
+    for name in _nrrd_member_codec_candidates():
+        codec_loaded = False
+        try:
+            spec = _nrrd_member_codec_spec(str(name))
+            codec_loaded = True
+            if _nrrd_member_codec_self_test(spec):
+                return spec
+            reason = 'known-answer/round-trip self-test failed'
+        except Exception as exc:
+            reason = str(exc) or type(exc).__name__
+        # Missing optional codecs are expected in auto mode. Forced selection and actual
+        # codec corruption are announced once, without preventing the lower gzip tiers.
+        announce = bool(requested != 'auto' or codec_loaded or str(name) == 'zlib')
+        failure_key = (str(name), str(reason))
+        if announce and failure_key not in _NRRD_MEMBER_CODEC_FAILURES_ANNOUNCED:
+            _NRRD_MEMBER_CODEC_FAILURES_ANNOUNCED.add(failure_key)
+            print(
+                f'Warning: NRRD member codec {name!r} unavailable ({reason}); '
+                'using the next validated NRRD gzip tier.'
+            )
+    return None
+
+
+def _nrrd_member_gzip_self_test() -> bool:
+    """Compatibility predicate used by the N1/N9 tier selectors."""
+    return _select_nrrd_member_codec() is not None
 
 
 def _open_nrrd_cpu_payload_writer(
@@ -24075,17 +25667,26 @@ def _open_nrrd_cpu_payload_writer(
 ) -> object:
     """First configured and validated non-GPU gzip tier."""
     if nrrd_inprocess_gzip_enabled():
-        if nrrd_member_gzip_enabled() and _nrrd_member_gzip_self_test():
+        member_codec = _select_nrrd_member_codec() if nrrd_member_gzip_enabled() else None
+        if member_codec is not None:
             global _NRRD_MEMBER_GZIP_ANNOUNCED
             if not _NRRD_MEMBER_GZIP_ANNOUNCED:
                 _NRRD_MEMBER_GZIP_ANNOUNCED = True
                 print(
-                    f'Member-parallel NRRD gzip active (v13.3.7 N1; '
+                    f'Member-parallel NRRD gzip active (v13.3.13 N17; '
+                    f'codec={member_codec[0]}, level={int(member_codec[1])}, '
                     f'{max(1, nrrd_gzip_chunk_bytes() // (1024 * 1024))} MiB gzip members, '
-                    'whole-layer pipelining; YOLO_TTA_NRRD_MEMBER_GZIP=0 restores the single-member writer).'
+                    'whole-layer pipelining; YOLO_TTA_NRRD_MEMBER_CODEC selects the codec and '
+                    'YOLO_TTA_NRRD_MEMBER_GZIP=0 restores the single-member writer).'
                 )
-            _announce_nrrd_cpu_deflate_backend('member-parallel gzip')
-            return _MemberParallelGzipPayloadWriter(fh, executor=member_executor)
+            _announce_nrrd_cpu_deflate_backend(
+                'member-parallel gzip', codec_spec=member_codec,
+            )
+            return _MemberParallelGzipPayloadWriter(
+                fh,
+                executor=member_executor,
+                codec_spec=member_codec,
+            )
         if _nrrd_inprocess_gzip_self_test():
             _announce_nrrd_cpu_deflate_backend('single-stream full-flush gzip')
             return _ParallelGzipPayloadWriter(fh)
@@ -24098,8 +25699,8 @@ def _open_nrrd_cpu_payload_writer(
 
 
 def _open_nrrd_payload_writer(fh: object, *, threads: Optional[int] = None) -> object:
-    """First validated tier wins: v13.3.6 (N6) GPU deflate -> v13.3.7 (N1) member-parallel
-    gzip -> v13.3.3 (S4) single-member in-process gzip -> pigz pipe."""
+    """First validated tier wins: GPU deflate -> N17 member-parallel
+    (libdeflate -> ISA-L -> zlib) -> single-member in-process gzip -> pigz pipe."""
     if nrrd_gpu_deflate_enabled():
         engine = _nrrd_gpu_deflate_engine()
         if engine is not None:
@@ -24131,7 +25732,10 @@ def _measure_nrrd_cpu_deflate_lane(
     cores: int,
 ) -> float:
     """Measure aggregate member-DEFLATE+CRC throughput of the capped CPU lane once."""
-    backend, factory, crc_fn, _full_flush, eff_level = _nrrd_deflate_backend()
+    codec_spec = _select_nrrd_member_codec()
+    if codec_spec is None:
+        return 0.0
+    backend, eff_level, member_compress = codec_spec
     key = (int(cores), str(backend), int(eff_level), int(nrrd_gzip_chunk_bytes()))
     with _NRRD_DEFLATE_MIX_THROUGHPUT_LOCK:
         cached = _NRRD_DEFLATE_MIX_CPU_BPS.get(key)
@@ -24150,9 +25754,9 @@ def _measure_nrrd_cpu_deflate_lane(
             )
 
             def _compress_piece(piece: bytes) -> int:
-                cobj = factory()
-                raw = cobj.compress(piece) + cobj.flush()
-                return int(len(raw)) + int(crc_fn(piece) & 0xFFFFFFFF)
+                # Measure the exact N17 complete-member operation (native CRC included),
+                # not the raw-deflate backend that may differ from the selected codec.
+                return int(len(member_compress(piece)))
 
             # Exclude lazy worker/backend construction from the measured steady-state pass.
             executor.submit(_compress_piece, bytes(payload[: min(piece_bytes, 64 * 1024)])).result()
@@ -24441,7 +26045,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.6-Ultra_v13.3.12_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.6-Ultra_v13.3.13_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -24521,23 +26125,63 @@ _NRRD_ZSHARD_SEMAPHORE_LOCK = threading.Lock()
 _NRRD_ZSHARD_SEMAPHORES: Dict[int, object] = {}
 
 
-def _nrrd_zshard_semaphore() -> object:
-    """Global N7 band budget shared by concurrently submitted global layers."""
-    capacity = max(1, int(nrrd_layer_sink_workers()))
+def _nrrd_zshard_capacity() -> int:
+    """Process-wide concurrent N7 band capacity (also the semaphore capacity)."""
+    return max(1, int(nrrd_layer_sink_workers()))
+
+
+class _WeightedNrrdZShardSemaphore:
+    """Atomic weighted N7 band budget shared by concurrent layer coordinators.
+
+    Reserving a layer's complete band group atomically is essential with the ordered,
+    bounded destination: if independent later bands consumed every permit and filled their
+    queues while an earlier band still waited for one, the coordinator could not advance to
+    drain those later queues.  Whole-group reservations preserve the hard process-wide cap
+    without that partial-acquisition deadlock.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        self.capacity = max(1, int(capacity))
+        self.available = int(self.capacity)
+        self.condition = threading.Condition()
+
+    def acquire(self, weight: int) -> None:
+        requested = max(1, int(weight))
+        if requested > int(self.capacity):
+            raise ValueError(
+                f'NRRD z-shard reservation {requested} exceeds capacity {self.capacity}'
+            )
+        with self.condition:
+            while int(self.available) < int(requested):
+                self.condition.wait()
+            self.available -= int(requested)
+
+    def release(self, weight: int) -> None:
+        returned = max(1, int(weight))
+        with self.condition:
+            if int(self.available) + int(returned) > int(self.capacity):
+                raise RuntimeError('NRRD z-shard permit pool released too many permits')
+            self.available += int(returned)
+            self.condition.notify_all()
+
+
+def _nrrd_zshard_semaphore() -> _WeightedNrrdZShardSemaphore:
+    """Return the atomic weighted N7 band budget for the configured sink capacity."""
+    capacity = int(_nrrd_zshard_capacity())
     with _NRRD_ZSHARD_SEMAPHORE_LOCK:
         sem = _NRRD_ZSHARD_SEMAPHORES.get(int(capacity))
         if sem is None:
-            sem = threading.BoundedSemaphore(int(capacity))
+            sem = _WeightedNrrdZShardSemaphore(int(capacity))
             _NRRD_ZSHARD_SEMAPHORES[int(capacity)] = sem
-        return sem
+        return sem  # type: ignore[return-value]
 
 
 def _nrrd_layer_zshard_count(
     ref: 'NrrdLayerRef',
     out_t: int,
-    available_workers: int,
+    capacity: Optional[int] = None,
 ) -> int:
-    """N7 shard count; intentionally restricted to late global layers."""
+    """N7 shard count resolved by the executing writer, never sink queue occupancy."""
     if str(getattr(ref, 'source', '')).strip().lower() != 'global':
         return 1
     min_slices = int(nrrd_layer_zshard_min_slices())
@@ -24545,7 +26189,8 @@ def _nrrd_layer_zshard_count(
     requested = int(nrrd_layer_zshards_requested())
     if requested == 1:
         return 1
-    cap = int(available_workers) if requested == 0 else min(int(available_workers), requested)
+    band_capacity = int(_nrrd_zshard_capacity() if capacity is None else max(1, int(capacity)))
+    cap = int(band_capacity) if requested == 0 else min(int(band_capacity), requested)
     return max(1, min(int(out_t), int(by_depth), max(1, int(cap))))
 
 
@@ -24610,7 +26255,9 @@ class _OrderedNrrdShardDestination:
     def __init__(self, fh: object, shard_count: int) -> None:
         self.fh = fh
         self.abort = threading.Event()
-        depth = max(2, _env_int('YOLO_TTA_NRRD_SHARD_QUEUE_DEPTH', 8))
+        # N15: 32 complete members permits each payload-weighted band to remain ahead of
+        # ordered fan-in without the 8-item queue serializing later bands behind band zero.
+        depth = max(2, _env_int('YOLO_TTA_NRRD_SHARD_QUEUE_DEPTH', 32))
         self.queues: List[queue.Queue] = [queue.Queue(maxsize=int(depth)) for _ in range(int(shard_count))]
 
     def _put(self, shard: int, item: Tuple[str, object]) -> None:
@@ -24739,7 +26386,7 @@ def write_single_layer_nrrd_from_ref(
     segment_name: Optional[str] = None,
     segment_color: Optional[Tuple[float, float, float]] = None,
     block_consumer: Optional[Callable[[int, np.ndarray], None]] = None,
-    z_shards: int = 1,
+    z_shards: Optional[int] = None,
 ) -> Path:
     """Write one component layer as its own single-layer 3D Slicer segmentation NRRD (X, Y, t).
 
@@ -24765,7 +26412,17 @@ def write_single_layer_nrrd_from_ref(
     ))
     z_chunk = _nrrd_full_slice_z_chunk(1, out_w, out_h, out_t)
     threads = int(nrrd_single_layer_pigz_threads()) if pigz_threads is None else max(1, int(pigz_threads))
-    shard_count = max(1, min(int(out_t), int(z_shards)))
+    # N15: resolve auto-sharding only after this sink task starts executing. Queue
+    # occupancy at submit time says nothing about the child-band capacity by the time a
+    # late global layer reaches the head of the sink pool. The shared semaphore remains
+    # the hard cross-layer over-sharding guard.
+    if z_shards is None or int(z_shards) <= 0:
+        shard_count = _nrrd_layer_zshard_count(ref, int(out_t))
+    else:
+        shard_count = max(
+            1,
+            min(int(out_t), int(z_shards), int(_nrrd_zshard_capacity())),
+        )
     if shard_count <= 1:
         with open(out_path, 'wb') as fh:
             _write_nrrd_ascii_header(
@@ -24804,7 +26461,7 @@ def write_single_layer_nrrd_from_ref(
             f'{max(band_weights) / (1024 ** 2):.1f} MiB/shard'
         )
     print(
-        f'v13.3.11: {out_path.name} -> {shard_count} ordered z shards '
+        f'v13.3.13 (N15): {out_path.name} -> {shard_count} ordered z shards '
         f'(min_slices={nrrd_layer_zshard_min_slices()}, z_chunk={shard_z_chunk}'
         f'{weight_note}; direct destination).'
     )
@@ -24817,31 +26474,28 @@ def write_single_layer_nrrd_from_ref(
             raise RuntimeError('ordered NRRD shard destination was not initialized')
         shard_sink = destination.sink(int(i))
         try:
-            # Coordinators live in the sink pool, but bands run in cached child pools. A shared
-            # semaphore keeps simultaneous global layers inside the sink-wide band budget.
-            with _nrrd_zshard_semaphore():  # type: ignore[attr-defined]
-                if mixed_lane_plan is None:
-                    payload_writer = _open_nrrd_payload_writer(
-                        shard_sink, threads=shard_pigz_threads,
-                    )
-                else:
-                    payload_writer = _open_nrrd_mixed_lane_payload_writer(
-                        shard_sink,
-                        mixed_lane_plan[int(i)],
-                        threads=shard_pigz_threads,
-                        cpu_executor=mixed_cpu_executor,
-                    )
-                with payload_writer:
-                    _write_one_decomposed_nrrd_layer_payload(
-                        ref,
-                        (out_t, out_h, out_w),
-                        payload_writer,
-                        z_chunk=shard_z_chunk,
-                        block_consumer=block_consumer,
-                        z_start=int(z0),
-                        z_stop=int(z1),
-                        fill_workers_override=shard_fill_workers,
-                    )
+            if mixed_lane_plan is None:
+                payload_writer = _open_nrrd_payload_writer(
+                    shard_sink, threads=shard_pigz_threads,
+                )
+            else:
+                payload_writer = _open_nrrd_mixed_lane_payload_writer(
+                    shard_sink,
+                    mixed_lane_plan[int(i)],
+                    threads=shard_pigz_threads,
+                    cpu_executor=mixed_cpu_executor,
+                )
+            with payload_writer:
+                _write_one_decomposed_nrrd_layer_payload(
+                    ref,
+                    (out_t, out_h, out_w),
+                    payload_writer,
+                    z_chunk=shard_z_chunk,
+                    block_consumer=block_consumer,
+                    z_start=int(z0),
+                    z_stop=int(z1),
+                    fill_workers_override=shard_fill_workers,
+                )
             shard_sink.close()
         except BaseException as exc:
             shard_sink.fail(exc)
@@ -24849,6 +26503,8 @@ def write_single_layer_nrrd_from_ref(
 
     shard_pool = _acquire_parallel_pool(int(shard_count))
     futures: List[Future] = []
+    zshard_permits = _nrrd_zshard_semaphore()
+    permits_acquired = False
     try:
         with open(final_tmp, 'wb') as fh:
             _write_nrrd_ascii_header(
@@ -24860,6 +26516,11 @@ def write_single_layer_nrrd_from_ref(
                 encoding='gzip',
             )
             destination = _OrderedNrrdShardDestination(fh, int(shard_count))
+            # Reserve the entire ordered band group atomically. Independent per-band
+            # reservations can deadlock when later bounded queues fill before shard zero
+            # obtains a permit; the coordinator cannot drain those queues out of order.
+            zshard_permits.acquire(int(shard_count))
+            permits_acquired = True
             futures = [shard_pool.submit(_write_band, i) for i in range(shard_count)]
             # Compression runs concurrently; only the already-compressed byte streams are
             # serialized here in band order directly into the destination payload.
@@ -24878,6 +26539,8 @@ def write_single_layer_nrrd_from_ref(
         if destination is not None:
             destination.abort.set()
         _settle_parallel_futures(futures)
+        if permits_acquired:
+            zshard_permits.release(int(shard_count))
         _release_parallel_pool(int(shard_count), shard_pool)
         try:
             final_tmp.unlink(missing_ok=True)
@@ -25088,7 +26751,7 @@ def write_layer_nrrd_with_low_quality_mirrors(
     pigz_threads: Optional[int] = None,
     segment_name: Optional[str] = None,
     segment_color: Optional[Tuple[float, float, float]] = None,
-    z_shards: int = 1,
+    z_shards: Optional[int] = None,
 ) -> Path:
     """v13.3.3 (S4): write the full-quality layer AND its low-quality mirrors in ONE pass.
 
@@ -25109,6 +26772,15 @@ def write_layer_nrrd_with_low_quality_mirrors(
     # v13.3.6 (N3): resolve a live layer's deferred extent once, up front, so the
     # full-quality header AND every mirror header see the same tight extent.
     ref = _resolve_live_ref_extent(ref)
+    # N15: this function itself is the queued sink task, so this is execution-time—not
+    # submission-time—resolution. Reuse the result for tee scheduling and the full writer.
+    if z_shards is None or int(z_shards) <= 0:
+        resolved_z_shards = _nrrd_layer_zshard_count(ref, int(out_t))
+    else:
+        resolved_z_shards = max(
+            1,
+            min(int(out_t), int(z_shards), int(_nrrd_zshard_capacity())),
+        )
     mirror_jobs: List[Dict[str, object]] = []
     for m_shape, m_path in mirrors:
         m_t, m_h, m_w = (int(m_shape[0]), int(m_shape[1]), int(m_shape[2]))
@@ -25160,7 +26832,7 @@ def write_layer_nrrd_with_low_quality_mirrors(
 
     # N7 already supplies z-band concurrency. Avoid nesting another up-to-16-way CPU pool
     # inside every shard; the unsharded path retains the original slice fan-out.
-    tee_workers = 1 if int(z_shards) > 1 else max(1, min(int(nrrd_fill_workers()), 16))
+    tee_workers = 1 if int(resolved_z_shards) > 1 else max(1, min(int(nrrd_fill_workers()), 16))
 
     def _tee(z0: int, block: np.ndarray) -> None:
         live_jobs = [j for j in mirror_jobs if not bool(j['failed'])]
@@ -25224,7 +26896,7 @@ def write_layer_nrrd_with_low_quality_mirrors(
         ref, output_shape, out_path,
         pigz_threads=pigz_threads, segment_name=segment_name, segment_color=segment_color,
         block_consumer=(_consume_block if mirror_jobs else None),
-        z_shards=int(z_shards),
+        z_shards=int(resolved_z_shards),
     )
 
     # v13.3.6 (D2): one small D2H per mirror replaces the per-block CPU resize/OR work.
@@ -25410,12 +27082,7 @@ class NrrdLayerSink:
             out_path = self.nrrd_dir / f'{self.stem}_{unique_suffix}.seg.nrrd'
             segment_name = f'{self.stem}_{unique_suffix}'
             segment_color = self._segment_color_for_suffix(unique_suffix)
-            unfinished = sum(1 for f in self._futures if not f.done())
-            available_workers = max(1, int(self.max_workers) - int(unfinished))
-            z_shards = _nrrd_layer_zshard_count(
-                ref, int(self.output_shape[0]), int(available_workers),
-            )
-            self._manifest.append({
+            manifest_entry: Dict[str, object] = {
                 'filename': out_path.name,
                 'suffix': unique_suffix,
                 'view_name': getattr(ref, 'view_name', ''),
@@ -25431,8 +27098,12 @@ class NrrdLayerSink:
                 'exported_axes': '(X, Y, t)',
                 'segment_name': segment_name,
                 'segment_color_rgb': [round(float(c), 6) for c in segment_color],
-                'z_shards': int(z_shards),
-            })
+                # N15 resolves the actual count inside the executing writer. Keeping the
+                # policy explicit avoids recording the stale submit-time pool occupancy.
+                'z_shards': None,
+                'z_shards_policy': 'execution_time',
+            }
+            self._manifest.append(manifest_entry)
             # v13.2.1: mirror this component layer into each low-quality downbin decomposition,
             # scheduled now (as the view completes) exactly like the full-quality layer and sharing
             # the same unique suffix so a low-quality layer maps 1:1 to its full-quality layer.
@@ -25470,19 +27141,32 @@ class NrrdLayerSink:
                     'segment_name': segment_name,
                     'segment_color_rgb': [round(float(c), 6) for c in segment_color],
                 })
-            if lq_mirror_args:
-                fut = self.executor.submit(
-                    write_layer_nrrd_with_low_quality_mirrors, ref, self.output_shape, out_path,
-                    lq_mirror_args,
-                    pigz_threads=self.pigz_threads, segment_name=segment_name, segment_color=segment_color,
-                    z_shards=int(z_shards),
+            def _execute_layer_write() -> Path:
+                # This closure begins on the sink executor, so its count reflects execution
+                # time rather than submission-time queue occupancy. Record that exact value
+                # and pass it through to the mirror/full writer as one immutable decision.
+                executed_z_shards = int(_nrrd_layer_zshard_count(
+                    ref, int(self.output_shape[0]),
+                ))
+                with self._lock:
+                    manifest_entry['z_shards'] = int(executed_z_shards)
+                if lq_mirror_args:
+                    return write_layer_nrrd_with_low_quality_mirrors(
+                        ref, self.output_shape, out_path, lq_mirror_args,
+                        pigz_threads=self.pigz_threads,
+                        segment_name=segment_name,
+                        segment_color=segment_color,
+                        z_shards=int(executed_z_shards),
+                    )
+                return write_single_layer_nrrd_from_ref(
+                    ref, self.output_shape, out_path,
+                    pigz_threads=self.pigz_threads,
+                    segment_name=segment_name,
+                    segment_color=segment_color,
+                    z_shards=int(executed_z_shards),
                 )
-            else:
-                fut = self.executor.submit(
-                    write_single_layer_nrrd_from_ref, ref, self.output_shape, out_path,
-                    pigz_threads=self.pigz_threads, segment_name=segment_name, segment_color=segment_color,
-                    z_shards=int(z_shards),
-                )
+
+            fut = self.executor.submit(_execute_layer_write)
             self._futures.append(fut)
         return out_path
 
@@ -27182,6 +28866,7 @@ def main() -> None:
     # Multi-GPU workers each deserialize their own engine; the parent needs only this path/name
     # metadata and must not contend for engine file-cache, host memory, or CUDA resources.
     inference_devices = parse_device_list(args.device)
+    configure_gpu_slice_labeling_devices(inference_devices)
     gpu_device_count = len([d for d in inference_devices if str(d).startswith('cuda')])
     multi_gpu_active = bool(gpu_device_count > 1)
 
@@ -27579,6 +29264,22 @@ def main() -> None:
         'Radius and interpolation-cone thresholds are scaled by the smaller in-plane axis factor; '
         'intermediate added/accepted voxel counters are therefore processing-grid pixel units. '
         'YOLO_TTA_DELAY_NATIVE_EXPANSION=0 restores native-view accumulation.'
+    )
+    spec_notes.append(
+        'v13.3.13 D6/D7/G8/P4: CUDA slice labeling emits exact adjacent-slice pair codes before '
+        'releasing each device block and distributes blocks across the selected devices '
+        '(YOLO_TTA_GPU_SLICE_LABELING_PAIRS / YOLO_TTA_GPU_SLICE_LABELING_DEVICES); multi-GPU '
+        'workers overlap one sealed device-union flush with the next task '
+        '(YOLO_TTA_GPU_UNION_FLUSH_OVERLAP); and resident-ring Radial/Tilted frames can render '
+        'directly from the uint8 source volume into the TensorRT binding '
+        '(YOLO_TTA_FUSED_DIRECT_RENDER and the per-family renderer gates), with stable launches '
+        'captured by YOLO_TTA_FUSED_RENDER_CUDA_GRAPHS.'
+    )
+    spec_notes.append(
+        'v13.3.13 N17/N15: complete-member NRRD compression selects a validated libdeflate, '
+        'ISA-L, or zlib codec via YOLO_TTA_NRRD_MEMBER_CODEC; global z-shard counts are resolved '
+        'at sink execution against the shared band capacity, and the ordered shard queue defaults '
+        'to 32 items.'
     )
     spec_notes.append(
         'v13.3.2 (R5/R6/R10/R14/R15/R21): CPU tilted rendering hoists all frame-invariant shear '
