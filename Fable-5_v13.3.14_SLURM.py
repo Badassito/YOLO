@@ -2,8 +2,77 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the GPT-5.6-Ultra v13.3.13_SLURM implementation. It is derived from
-GPT-5.6-Ultra_v13.3.12_SLURM.py by COPY + surgical edits implementing the supplied task list:
+This is the Fable v13.3.14_SLURM implementation. It is derived from
+GPT-5.6-Ultra_v13.3.13_SLURM.py by COPY + surgical edits implementing the supplied task list:
+  - v13.3.14 (N7) generalizes sparse cvol streaming through the terminal t restore
+    (iter_restored_sparse_members): raw-bbox layers whose X/Y match the output raster —
+    the Cartesian working-t layers that previously missed the N11 native gate and rebuilt
+    dense 3072x3072 planes per output slice — now resolve each output z's source slices,
+    union only their bbox crops, and packetize gzip members from the union bboxes.
+    Separately, when a layer records a tight nonempty extent, its single-layer .seg.nrrd
+    is written as the minimal (t,y,x) raster: identity space directions keep placement
+    exact via a shifted space origin plus Segmentation_ReferenceImageExtentOffset, work
+    becomes proportional to bbox volume, and full-raster mode is preserved for unknown
+    extents, XY-resampled restores, and near-full crops (fill-ratio guard).
+    YOLO_TTA_NRRD_SPARSE_T_RESTORE=0 / YOLO_TTA_NRRD_CROP_TO_EXTENT=0 restore v13.3.13.
+  - v13.3.14 (N6) makes the GPU gzip writer persistent, preallocated, and coalesced:
+    pending encode windows survive across write()/write_zeros() calls on one ordered
+    instance queue (consecutive 8-16 MiB sparse members finally pipeline across both
+    nvCOMP owner lanes), each window is staged ONCE into an engine pinned arena pool
+    (two per lane) so the caller's buffer is immediately reusable, per-lane persistent
+    device-input/pinned-output arenas replace the per-window cudaHostAlloc/device
+    allocations, the post-H2D compatibility sync is skipped on stream-bound nvCOMP
+    builds (Codec AND as_array accepted cuda_stream; round-trip self-test still gates),
+    members default to 1 MiB with a one-time 1/2/4 MiB per-device autotune, window CRCs
+    batch into one pool task, members reach the file as one joined write, and zero runs
+    emit few large cached members (64 MiB default). Per-window atomicity (no I/O until
+    every GPU/CRC result is known) and the ordered CPU-fallback rewrite are preserved, so
+    a mid-file GPU failure still cannot leave a partially written member.
+    YOLO_TTA_NRRD_GPU_DEFLATE_PERSISTENT=0 restores per-call drains and
+    YOLO_TTA_NRRD_GPU_DEFLATE_CONSERVATIVE=1 restores the full v13.3.13 member regime.
+  - v13.3.14 (N2) streams Radial/Tilted projection blocks through a transactional
+    ProjectedLayerSink instead of materializing the disposable dense source-geometry
+    volume (17-27 GiB per layer): ordered (or bounded-reorder) blocks update the
+    incremental cvol index, feed the fused full-quality .seg.nrrd gzip payload (header
+    written up-front with a constant-width extent placeholder that is seek-patched after
+    the store finalizes), and derive every low-quality mirror through the factored
+    _LayerMirrorSet — the Radial GPU producer hands its device-resident block straight to
+    the mirror tee (tee_device), removing the D2H->mirror-H2D bounce. Radial sink-only
+    projection skips the vol_mm workspace entirely; the reduced Tilted terminal restore
+    streams ordered blocks without allocating the restored volume. The sink's .seg.nrrd
+    identity is pre-reserved on the layer sink (same suffix/color/manifest row), and any
+    sink failure discards its partial outputs and reruns ONCE through the established
+    dense path under the same reserved identity. YOLO_TTA_PROJECTED_LAYER_SINK=0 disables.
+  - v13.3.14 (P7) replaces path-only forced file backing for cross-process temporary
+    volumes (direct-union baselines, interpolation process inputs) with memfd_create +
+    MAP_SHARED workspaces: children reopen the allocator's /proc/<pid>/fd/<n> path through
+    the existing path protocol (validated once by a real child-process open probe), the
+    interpolation entry additionally carries a multiprocessing DupFd descriptor as a
+    second transport, allocation is budget-gated behind a 160 GiB anonymous-memory
+    reserve (spilling new allocations to the established NVMe file allocator), anchors
+    release through close_memmap_array, and --keep_temp disables the tier so archived
+    temp trees stay complete. The optional GPU bitpacking companion is deliberately
+    deferred. YOLO_TTA_MEMFD_WORKSPACES=0 disables.
+  - v13.3.14 (M1) adds always-on coarse phase/layer telemetry (striped-lock monotonic
+    counters; YOLO_TTA_TELEMETRY=0 disables) covering projection, fused-sink layers,
+    interpolation passes, resident-ring tasks, NRRD layer writes (logical/indexed-payload/
+    compressed bytes, zero/nonzero member counts, backend, MiB/s, crop/shard facts), and
+    fallback activations, plus an opt-in buffered JSONL event trace
+    (YOLO_TTA_TELEMETRY_TRACE=1) and an end-of-run summary/JSON sidecar.
+  - v13.3.14 (P2) makes the resident TensorRT ring persistent per worker: the second
+    execution context, static bindings, render/infer/post streams, events, CUDA graphs,
+    compaction buffers, and both ring slots are cached per (engine, raster, dtype, native
+    shape, affine, conf) task class — per task only renderer metadata revalidates and the
+    borrowed AutoBackend context's tensor addresses rebind/restore (attach/detach), so
+    the ~70 per-task context builds/graph captures per run disappear. A one-time measured
+    microbenchmark chooses between two-context-concurrent and event-serialized enqueue
+    schedules instead of assuming context concurrency helps every engine, and the
+    per-task device-union allocation draws maximum-sized zeroed slabs from a two-entry
+    worker ring so the G8 retiring flush can drain one slab while the next task fills the
+    other. Any task/TensorRT failure invalidates the cached executor.
+    YOLO_TTA_PERSISTENT_TRT_RING=0 restores per-task executors and unions.
+
+Inherited from v13.3.13:
   - v13.3.13 (N17/N15) prefers KAT-validated libdeflate complete gzip members ahead of
     ISA-L/zlib, while retaining every established NRRD fallback tier. Global-layer z-shard
     counts are resolved when the sink task executes rather than from stale submit-time pool
@@ -1272,6 +1341,189 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+# --------------------------
+# v13.3.14 (M1): phase/layer telemetry
+# --------------------------
+# Coarse monotonic phase counters are ON by default and cheap: one striped-lock dict
+# update per record. The optional JSONL event trace (YOLO_TTA_TELEMETRY_TRACE=1) buffers
+# in RAM and flushes in batches so tracing cannot become its own bottleneck. Counters are
+# process-local; worker processes print their own summary only when tracing is enabled,
+# so the main-process report reflects main-process phases (projection, cvol assembly,
+# NRRD sink, interpolation dispatch) plus every per-layer NRRD row recorded by the sink.
+
+
+def telemetry_enabled() -> bool:
+    """v13.3.14 (M1): coarse phase counters (default on; YOLO_TTA_TELEMETRY=0 disables)."""
+    return _env_flag('YOLO_TTA_TELEMETRY', True)
+
+
+def telemetry_trace_enabled() -> bool:
+    """v13.3.14 (M1): detailed JSONL event trace (default off)."""
+    return _env_flag('YOLO_TTA_TELEMETRY_TRACE', False)
+
+
+class _TelemetryRegistry:
+    """Striped-lock counter registry + bounded per-layer NRRD table + optional trace."""
+
+    _STRIPES = 16
+
+    def __init__(self) -> None:
+        self._locks = [threading.Lock() for _ in range(self._STRIPES)]
+        # stripe -> key -> [count, seconds, bytes]
+        self._shards: List[Dict[str, List[float]]] = [{} for _ in range(self._STRIPES)]
+        self._nrrd_rows: List[Dict[str, object]] = []
+        self._nrrd_lock = threading.Lock()
+        self._trace_lock = threading.Lock()
+        self._trace_buffer: List[str] = []
+        self._trace_path: Optional[Path] = None
+        self._start_monotonic = time.monotonic()
+
+    def add(self, key: str, *, seconds: float = 0.0, nbytes: int = 0, count: int = 1) -> None:
+        if not telemetry_enabled():
+            return
+        stripe = hash(key) % self._STRIPES
+        with self._locks[stripe]:
+            cell = self._shards[stripe].get(key)
+            if cell is None:
+                self._shards[stripe][key] = [float(count), float(seconds), float(nbytes)]
+            else:
+                cell[0] += float(count)
+                cell[1] += float(seconds)
+                cell[2] += float(nbytes)
+
+    @contextlib.contextmanager
+    def phase(self, key: str, *, nbytes: int = 0) -> Iterator[None]:
+        if not telemetry_enabled():
+            yield
+            return
+        t0 = time.monotonic()
+        try:
+            yield
+        finally:
+            self.add(key, seconds=time.monotonic() - t0, nbytes=int(nbytes))
+
+    def set_trace_path(self, path: Optional[Path]) -> None:
+        with self._trace_lock:
+            self._trace_path = None if path is None else Path(path)
+
+    def event(self, name: str, **fields: object) -> None:
+        if not telemetry_trace_enabled():
+            return
+        record = {'t': round(time.monotonic() - self._start_monotonic, 6), 'pid': os.getpid(), 'event': str(name)}
+        record.update({k: v for k, v in fields.items() if v is not None})
+        try:
+            line = json.dumps(record, default=str)
+        except Exception:
+            return
+        flush_lines: Optional[List[str]] = None
+        with self._trace_lock:
+            self._trace_buffer.append(line)
+            if len(self._trace_buffer) >= 256:
+                flush_lines = self._trace_buffer
+                self._trace_buffer = []
+        if flush_lines:
+            self._flush_trace(flush_lines)
+
+    def _flush_trace(self, lines: List[str]) -> None:
+        with self._trace_lock:
+            path = self._trace_path
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open('a', encoding='utf-8') as fh:
+                fh.write('\n'.join(lines) + '\n')
+        except Exception:
+            pass
+
+    def nrrd_layer(self, **fields: object) -> None:
+        """Record one per-NRRD row: logical/payload bytes, member counts, backend, MiB/s."""
+        if not telemetry_enabled():
+            return
+        row = {k: v for k, v in fields.items() if v is not None}
+        with self._nrrd_lock:
+            if len(self._nrrd_rows) < 4096:
+                self._nrrd_rows.append(row)
+
+    def snapshot(self) -> Dict[str, Tuple[int, float, int]]:
+        merged: Dict[str, Tuple[int, float, int]] = {}
+        for stripe in range(self._STRIPES):
+            with self._locks[stripe]:
+                for key, (count, seconds, nbytes) in self._shards[stripe].items():
+                    prev = merged.get(key)
+                    if prev is None:
+                        merged[key] = (int(count), float(seconds), int(nbytes))
+                    else:
+                        merged[key] = (prev[0] + int(count), prev[1] + float(seconds), prev[2] + int(nbytes))
+        return merged
+
+    def report(self, *, json_path: Optional[Path] = None, desc: str = 'telemetry') -> None:
+        if not telemetry_enabled():
+            return
+        with self._trace_lock:
+            pending = self._trace_buffer
+            self._trace_buffer = []
+        if pending:
+            self._flush_trace(pending)
+        merged = self.snapshot()
+        with self._nrrd_lock:
+            nrrd_rows = list(self._nrrd_rows)
+        if not merged and not nrrd_rows:
+            return
+        lines = [f'--- v13.3.14 (M1) {desc} (pid {os.getpid()}) ---']
+        for key in sorted(merged, key=lambda k: -merged[k][1]):
+            count, seconds, nbytes = merged[key]
+            parts = [f'{key}: n={count}']
+            if seconds > 0.0:
+                parts.append(f'wall={seconds:.2f}s')
+            if nbytes > 0:
+                parts.append(f'bytes={nbytes / GIB:.2f}GiB')
+                if seconds > 0.001:
+                    parts.append(f'rate={nbytes / (1024 ** 2) / seconds:.0f}MiB/s')
+            lines.append('  ' + ' '.join(parts))
+        if nrrd_rows:
+            lines.append(f'  NRRD layers recorded: {len(nrrd_rows)}')
+            for row in nrrd_rows[:64]:
+                name = str(row.get('name', '?'))
+                logical = float(row.get('logical_bytes', 0) or 0)
+                payload = float(row.get('indexed_payload_bytes', 0) or 0)
+                compressed = float(row.get('compressed_bytes', 0) or 0)
+                secs = float(row.get('seconds', 0) or 0)
+                rate = (logical / (1024 ** 2) / secs) if secs > 0.001 else 0.0
+                lines.append(
+                    f'    {name}: logical={logical / GIB:.2f}GiB bbox_payload={payload / GIB:.3f}GiB '
+                    f'gz={compressed / GIB:.3f}GiB zero/nz_members={int(row.get("zero_members", 0) or 0)}/'
+                    f'{int(row.get("nonzero_members", 0) or 0)} backend={row.get("backend", "?")} '
+                    f'wall={secs:.1f}s ({rate:.0f}MiB/s logical)'
+                )
+        print('\n'.join(lines))
+        if json_path is not None:
+            try:
+                payload_doc = {
+                    'counters': {k: {'count': v[0], 'seconds': v[1], 'bytes': v[2]} for k, v in merged.items()},
+                    'nrrd_layers': nrrd_rows,
+                }
+                json_path.parent.mkdir(parents=True, exist_ok=True)
+                json_path.write_text(json.dumps(payload_doc, indent=2, default=str) + '\n')
+            except Exception:
+                pass
+
+
+TELEMETRY = _TelemetryRegistry()
+
+
+def tele_add(key: str, *, seconds: float = 0.0, nbytes: int = 0, count: int = 1) -> None:
+    TELEMETRY.add(key, seconds=seconds, nbytes=nbytes, count=count)
+
+
+def tele_phase(key: str) -> object:
+    return TELEMETRY.phase(key)
+
+
+def tele_event(name: str, **fields: object) -> None:
+    TELEMETRY.event(name, **fields)
+
+
 def _slurm_allocated_cpu_count() -> Optional[int]:
     for env_name in ('SLURM_CPUS_PER_TASK', 'SLURM_CPUS_ON_NODE', 'SLURM_JOB_CPUS_PER_NODE'):
         raw = os.environ.get(env_name, '').strip()
@@ -1948,6 +2200,7 @@ def allocate_workspace_array(
     reserve_bytes: int = 16 * GIB,
     reuse_existing: bool = False,
     initialize_zero: bool = True,
+    allow_memfd: bool = False,
 ) -> np.ndarray:
     dtype_obj = np.dtype(dtype)
     need_bytes = array_nbytes(shape, dtype_obj)
@@ -1970,6 +2223,18 @@ def allocate_workspace_array(
             return arr
         except MemoryError:
             print(f"{desc}: in-memory allocation failed, falling back to disk ({budget})")
+
+    # v13.3.14 (P7): callers that need FILE backing only for cross-process visibility
+    # (not durability) get a memfd workspace when the budget and the cross-process probe
+    # admit it: RAM-speed, zero writeback, reopenable by children through mm.filename
+    # (/proc/<pid>/fd/<n>). memfd is anonymous — never valid for reuse_existing readers.
+    if bool(allow_memfd) and not reuse_existing:
+        memfd_mm = _allocate_memfd_workspace(
+            shape, dtype_obj, desc, reserve_bytes=int(reserve_bytes),
+        )
+        if memfd_mm is not None:
+            print(f"{desc}: memfd shared workspace ({budget}) -> {memfd_mm.filename}")
+            return memfd_mm
 
     if path is None:
         raise ValueError(f"{desc}: disk fallback requires a filesystem path")
@@ -1997,6 +2262,7 @@ def copy_workspace_array(
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
+    allow_memfd: bool = False,
 ) -> np.ndarray:
     """Allocate a workspace matching ``src`` and copy the contents in parallel."""
     dst = allocate_workspace_array(
@@ -2007,6 +2273,7 @@ def copy_workspace_array(
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
         initialize_zero=False,
+        allow_memfd=bool(allow_memfd),
     )
 
     if src.ndim <= 1:
@@ -2426,6 +2693,7 @@ def close_memmap_array(arr: object) -> None:
             mmap_obj = getattr(arr, '_mmap', None)
             if mmap_obj is not None:
                 mmap_obj.close()
+            _release_memfd_for_array(arr)  # v13.3.14 (P7): drop the workspace anchor fd
             return
     except Exception:
         pass
@@ -2435,6 +2703,7 @@ def close_memmap_array(arr: object) -> None:
             mmap_obj = getattr(base, '_mmap', None)
             if mmap_obj is not None:
                 mmap_obj.close()
+            _release_memfd_for_array(base)  # v13.3.14 (P7)
     except Exception:
         pass
 
@@ -2448,6 +2717,7 @@ def close_memmap_array_without_flush(arr: object) -> None:
             mmap_obj = getattr(arr, '_mmap', None)
             if mmap_obj is not None:
                 mmap_obj.close()
+            _release_memfd_for_array(arr)  # v13.3.14 (P7)
             return
     except Exception:
         pass
@@ -2457,8 +2727,212 @@ def close_memmap_array_without_flush(arr: object) -> None:
             mmap_obj = getattr(base, '_mmap', None)
             if mmap_obj is not None:
                 mmap_obj.close()
+            _release_memfd_for_array(base)  # v13.3.14 (P7)
     except Exception:
         pass
+
+
+# --------------------------
+# v13.3.14 (P7): cgroup-aware shared memfd workspaces
+# --------------------------
+# Angle-0 direct-union and interpolation volumes were forced onto path-backed disk
+# memmaps SOLELY for cross-process visibility (workers/children reopen by path). Page
+# cache keeps them RAM-speed, but hundreds of GiB of dirty TEMPORARY data still trigger
+# background writeback/dirty throttling even though no durable copy is ever needed.
+# A memfd_create + mmap(MAP_SHARED) workspace has identical cross-process semantics —
+# children open the allocator's /proc/<pid>/fd/<n> "path" (validated once by a real
+# child-process probe; the interpolation entry additionally carries a multiprocessing
+# DupFd descriptor object as a second transport) — with ZERO filesystem writeback.
+# memfd pages consume cgroup memory+swap, so allocation is budget-gated with a large
+# reserve and spills to the established NVMe file allocator instead of breaching it
+# (live MAP_SHARED mappings cannot be migrated post-hoc, so spill happens at allocation
+# time; that IS the LRU boundary for this pipeline's allocate-once workspaces). The
+# device bitpacking companion (1 bit/voxel D2H) is deliberately deferred — it changes
+# the dense interpolation input contract and belongs behind its own validation.
+# YOLO_TTA_MEMFD_WORKSPACES=0 restores plain file-backed workspaces everywhere.
+
+_MEMFD_WORKSPACE_LOCK = threading.Lock()
+_MEMFD_WORKSPACE_REGISTRY: Dict[str, Dict[str, object]] = {}
+_MEMFD_WORKSPACE_SEQ = 0
+_MEMFD_DISABLED_REASON: Optional[str] = None
+_MEMFD_CROSS_PROCESS_OK: Optional[bool] = None
+_MEMFD_ANNOUNCED = False
+
+
+def memfd_workspaces_enabled() -> bool:
+    if sys.platform != 'linux' or not hasattr(os, 'memfd_create'):
+        return False
+    if _MEMFD_DISABLED_REASON is not None:
+        return False
+    return _env_flag('YOLO_TTA_MEMFD_WORKSPACES', True)
+
+
+def set_memfd_workspaces_disabled(reason: str) -> None:
+    """Disable memfd workspaces process-wide (e.g. --keep_temp archives temp files)."""
+    global _MEMFD_DISABLED_REASON
+    _MEMFD_DISABLED_REASON = str(reason)
+
+
+def memfd_workspace_reserve_bytes() -> int:
+    """Anonymous-memory reserve kept free of memfd workspaces (default 160 GiB)."""
+    return max(0, _env_int('YOLO_TTA_MEMFD_RESERVE_GIB', 160)) * GIB
+
+
+def _memfd_registry_bytes() -> int:
+    with _MEMFD_WORKSPACE_LOCK:
+        return int(sum(int(rec.get('nbytes', 0)) for rec in _MEMFD_WORKSPACE_REGISTRY.values()))
+
+
+def _memfd_cross_process_open_ok() -> bool:
+    """One-time probe: can a CHILD process of this uid open our /proc/<pid>/fd/<n>?
+
+    Yama/hardened ptrace policies can reject cross-process /proc fd opens. The probe
+    spawns a bare interpreter child (the same access class as every worker/interpolation
+    child) and round-trips real bytes through a throwaway memfd. Cached per process.
+    """
+    global _MEMFD_CROSS_PROCESS_OK
+    if _MEMFD_CROSS_PROCESS_OK is not None:
+        return bool(_MEMFD_CROSS_PROCESS_OK)
+    with _MEMFD_WORKSPACE_LOCK:
+        if _MEMFD_CROSS_PROCESS_OK is not None:
+            return bool(_MEMFD_CROSS_PROCESS_OK)
+        ok = False
+        fd = -1
+        try:
+            fd = os.memfd_create('yolo_tta_p7_probe', getattr(os, 'MFD_CLOEXEC', 1))
+            os.truncate(fd, 8)
+            os.pwrite(fd, b'P7PROBE!', 0)
+            proc_path = f'/proc/{os.getpid()}/fd/{int(fd)}'
+            probe = subprocess.run(
+                [
+                    sys.executable, '-c',
+                    (
+                        'import sys\n'
+                        f'fh = open({proc_path!r}, "rb+")\n'
+                        'data = fh.read(8)\n'
+                        'fh.seek(0); fh.write(data)\n'  # write access matters for r+ workers
+                        'sys.stdout.write(data.decode("ascii"))\n'
+                    ),
+                ],
+                capture_output=True, text=True, timeout=30.0,
+            )
+            ok = probe.returncode == 0 and probe.stdout == 'P7PROBE!'
+        except Exception:
+            ok = False
+        finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        _MEMFD_CROSS_PROCESS_OK = bool(ok)
+        if not ok:
+            print(
+                'v13.3.14 (P7): cross-process /proc fd open probe failed; memfd workspaces '
+                'stay disabled and path-backed disk workspaces are used as before.'
+            )
+        return bool(ok)
+
+
+def _allocate_memfd_workspace(
+    shape: Sequence[int],
+    dtype: np.dtype,
+    desc: str,
+    *,
+    reserve_bytes: int,
+) -> Optional[np.ndarray]:
+    """Return a memfd-backed shared memmap whose .filename children can reopen, or None."""
+    global _MEMFD_WORKSPACE_SEQ, _MEMFD_ANNOUNCED
+    if not memfd_workspaces_enabled():
+        return None
+    need = array_nbytes(shape, dtype)
+    cap = workspace_anon_cap_bytes()
+    if cap > 0 and int(need) > int(cap):
+        return None
+    reserve = max(int(memfd_workspace_reserve_bytes()), int(max(0, reserve_bytes)))
+    if available_anon_work_bytes() < int(need) + int(reserve):
+        return None  # spill: the caller proceeds with the established NVMe file allocator
+    if not _memfd_cross_process_open_ok():
+        return None
+    fd = -1
+    try:
+        with _MEMFD_WORKSPACE_LOCK:
+            _MEMFD_WORKSPACE_SEQ += 1
+            seq = int(_MEMFD_WORKSPACE_SEQ)
+        name = f'yolo_tta_ws_{seq}'
+        fd = os.memfd_create(name, getattr(os, 'MFD_CLOEXEC', 1))
+        os.truncate(fd, int(need))
+        proc_path = f'/proc/{os.getpid()}/fd/{int(fd)}'
+        # A plain-string path keeps np.memmap's filename attribute at os.path.abspath
+        # (no symlink resolution) — children then reopen this exact path.
+        mm = np.memmap(proc_path, dtype=dtype, mode='r+', shape=tuple(int(x) for x in shape))
+        with _MEMFD_WORKSPACE_LOCK:
+            _MEMFD_WORKSPACE_REGISTRY[proc_path] = {
+                'fd': int(fd), 'nbytes': int(need), 'name': name,
+            }
+        numa_interleave_memory(mm, desc=desc)  # v13.3.5 (N2) policy applies before first touch
+        if not _MEMFD_ANNOUNCED:
+            _MEMFD_ANNOUNCED = True
+            print(
+                'v13.3.14 (P7): memfd shared workspaces active (no filesystem writeback for '
+                'transient cross-process volumes; YOLO_TTA_MEMFD_WORKSPACES=0 disables, '
+                f'reserve={memfd_workspace_reserve_bytes() / GIB:.0f} GiB).'
+            )
+        tele_add('workspace.memfd_alloc', nbytes=int(need))
+        return mm
+    except Exception as exc:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        print(f'{desc}: memfd workspace allocation failed ({exc}); using the file allocator.')
+        return None
+
+
+def memfd_workspace_fd_for_path(path: object) -> Optional[int]:
+    """Registry lookup: the anchor fd for a /proc memfd workspace path, else None."""
+    with _MEMFD_WORKSPACE_LOCK:
+        rec = _MEMFD_WORKSPACE_REGISTRY.get(str(path))
+        return None if rec is None else int(rec['fd'])
+
+
+def release_memfd_workspace_path(path: object) -> bool:
+    """Close a workspace's anchor fd; pages free once every mapping unmaps."""
+    with _MEMFD_WORKSPACE_LOCK:
+        rec = _MEMFD_WORKSPACE_REGISTRY.pop(str(path), None)
+    if rec is None:
+        return False
+    try:
+        os.close(int(rec['fd']))
+    except OSError:
+        pass
+    return True
+
+
+def _release_memfd_for_array(arr: object) -> None:
+    """close_memmap_array hook: drop the anchor when the allocator closes its mapping."""
+    try:
+        filename = getattr(arr, 'filename', None)
+        if filename is None:
+            base = getattr(arr, 'base', None)
+            filename = getattr(base, 'filename', None)
+        if filename is not None:
+            release_memfd_workspace_path(str(filename))
+    except Exception:
+        pass
+
+
+def shutdown_memfd_workspaces() -> None:
+    """Safety net: close every remaining anchor fd at pipeline shutdown."""
+    with _MEMFD_WORKSPACE_LOCK:
+        records = list(_MEMFD_WORKSPACE_REGISTRY.values())
+        _MEMFD_WORKSPACE_REGISTRY.clear()
+    for rec in records:
+        try:
+            os.close(int(rec['fd']))
+        except OSError:
+            pass
 
 
 def prediction_volume_build_flush_enabled() -> bool:
@@ -2712,6 +3186,24 @@ def _interpolation_array_backing_path(arr: object) -> Optional[Path]:
     return None
 
 
+def _interpolation_mask_fd_ref(backing_path: Path) -> Optional[object]:
+    """v13.3.14 (P7): a picklable duplicated-FD descriptor for a memfd-backed volume.
+
+    The primary transport stays the (/proc) path string; this DupFd rides along so a
+    child whose /proc cross-process open is rejected (hardened ptrace policy racing the
+    startup probe, PID-namespace surprises) receives the SAME memfd through the
+    multiprocessing resource sharer instead of failing the pass.
+    """
+    try:
+        anchor_fd = memfd_workspace_fd_for_path(str(backing_path))
+        if anchor_fd is None:
+            return None
+        from multiprocessing import resource_sharer  # lazy: starts the sharer thread
+        return resource_sharer.DupFd(int(anchor_fd))
+    except Exception:
+        return None
+
+
 def _ensure_process_backed_interpolation_volume(
     mask_mm: np.ndarray,
     *,
@@ -2734,15 +3226,19 @@ def _ensure_process_backed_interpolation_volume(
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     process_path = work_dir / f'{_sanitize_filesystem_token(pass_tag)}.process_input.u8.dat'
+    # v13.3.14 (P7): this conversion exists purely for cross-process visibility, so the
+    # copy target is a memfd candidate; the effective backing path rides mm.filename.
     process_mm = copy_workspace_array(
         arr,
         process_path,
         desc=f'Interpolation process input {pass_tag}',
         prefer_memory=False,
         workers=int(workers),
+        allow_memfd=True,
     )
     flush_array(process_mm)
-    return process_mm, process_path, True
+    effective = getattr(process_mm, 'filename', None)
+    return process_mm, (Path(effective) if effective else process_path), True
 
 
 def _interpolation_process_entry(
@@ -2764,6 +3260,7 @@ def _interpolation_process_entry(
     bridge_delta_path: Optional[str] = None,
     known_slice_any: Optional[np.ndarray] = None,
     known_slice_bboxes: Optional[np.ndarray] = None,
+    mask_fd_ref: Optional[object] = None,
 ) -> Dict[str, object]:
     global _INTERPOLATION_PROCESS_WORKER
     _INTERPOLATION_PROCESS_WORKER = True
@@ -2772,12 +3269,27 @@ def _interpolation_process_entry(
     except Exception:
         pass
 
-    mask_mm = np.memmap(
-        Path(mask_path),
-        dtype=np.dtype(mask_dtype),
-        mode='r+',
-        shape=tuple(int(x) for x in mask_shape),
-    )
+    # v13.3.14 (P7): the primary transport stays the path (a /proc/<pid>/fd/<n> string for
+    # memfd workspaces — validated by the startup probe). The DupFd descriptor is the
+    # second transport for children whose /proc open is rejected.
+    try:
+        mask_mm = np.memmap(
+            Path(mask_path),
+            dtype=np.dtype(mask_dtype),
+            mode='r+',
+            shape=tuple(int(x) for x in mask_shape),
+        )
+    except (OSError, PermissionError, FileNotFoundError):
+        if mask_fd_ref is None:
+            raise
+        received_fd = mask_fd_ref.detach()
+        mask_fileobj = os.fdopen(int(received_fd), 'r+b')
+        mask_mm = np.memmap(
+            mask_fileobj,
+            dtype=np.dtype(mask_dtype),
+            mode='r+',
+            shape=tuple(int(x) for x in mask_shape),
+        )
     try:
         stats = interpolate_view_volume_pass_inplace(
             mask_mm=mask_mm,
@@ -2842,24 +3354,25 @@ def interpolate_view_volume_pass_maybe_process(
         or executor is None
         or not interpolation_process_backend_enabled()
     ):
-        stats = interpolate_view_volume_pass_inplace(
-            mask_mm=mask_mm,
-            work_dir=work_dir,
-            pass_tag=pass_tag,
-            max_slice_distance=int(max_slice_distance),
-            search_angle_deg=float(search_angle_deg),
-            interpolation_walk_back=int(interpolation_walk_back),
-            interpolation_candidates=int(interpolation_candidates),
-            interpolate_min_radius=float(interpolate_min_radius),
-            keep_temp=bool(keep_temp),
-            prefer_memory=bool(prefer_memory),
-            reserve_bytes=int(reserve_bytes),
-            workers=int(workers),
-            wrap_axis=bool(wrap_axis),
-            bridge_delta_path=bridge_delta_path,
-            known_slice_any=known_slice_any,
-            known_slice_bboxes=known_slice_bboxes,
-        )
+        with tele_phase('interpolation.pass_inplace'):
+            stats = interpolate_view_volume_pass_inplace(
+                mask_mm=mask_mm,
+                work_dir=work_dir,
+                pass_tag=pass_tag,
+                max_slice_distance=int(max_slice_distance),
+                search_angle_deg=float(search_angle_deg),
+                interpolation_walk_back=int(interpolation_walk_back),
+                interpolation_candidates=int(interpolation_candidates),
+                interpolate_min_radius=float(interpolate_min_radius),
+                keep_temp=bool(keep_temp),
+                prefer_memory=bool(prefer_memory),
+                reserve_bytes=int(reserve_bytes),
+                workers=int(workers),
+                wrap_axis=bool(wrap_axis),
+                bridge_delta_path=bridge_delta_path,
+                known_slice_any=known_slice_any,
+                known_slice_bboxes=known_slice_bboxes,
+            )
         stats = dict(stats)
         stats.setdefault('process_backend', 'disabled_or_unconfigured')
         return mask_mm, stats
@@ -2893,6 +3406,8 @@ def interpolate_view_volume_pass_maybe_process(
         # v13.3.6 (D1): small per-slice metadata arrays pickle across the process boundary.
         known_slice_any=known_slice_any,
         known_slice_bboxes=known_slice_bboxes,
+        # v13.3.14 (P7): duplicated-FD second transport for memfd-backed volumes.
+        mask_fd_ref=_interpolation_mask_fd_ref(process_path),
     )
 
     # v13.3.4 (T4): once inference has drained, the warm GPU worker processes serve
@@ -2940,7 +3455,8 @@ def interpolate_view_volume_pass_maybe_process(
 
     fut = executor.submit(_interpolation_process_entry, **pass_entry_kwargs)
     try:
-        stats = dict(fut.result())
+        with tele_phase('interpolation.pass_process'):
+            stats = dict(fut.result())
     except Exception as exc:
         if not interpolation_process_fallback_enabled():
             raise RuntimeError(
@@ -8725,16 +9241,34 @@ class _DeviceUnionAccumulator:
     hole-fill the accumulated union on device before the flush (see gpu_device_hole_fill_enabled).
     """
 
-    def __init__(self, torch_mod: object, device: object, num_frames: int, native_h: int, native_w: int, want_conf: bool) -> None:
+    def __init__(
+        self,
+        torch_mod: object,
+        device: object,
+        num_frames: int,
+        native_h: int,
+        native_w: int,
+        want_conf: bool,
+        *,
+        slab: Optional[Dict[str, object]] = None,
+    ) -> None:
         self.torch = torch_mod
         self.device = device
-        self.union_dev = torch_mod.zeros(
-            (int(num_frames), int(native_h), int(native_w)), dtype=torch_mod.uint8, device=device,
-        )
-        self.conf_dev = (
-            torch_mod.zeros((int(num_frames), int(native_h), int(native_w)), dtype=torch_mod.uint8, device=device)
-            if bool(want_conf) else None
-        )
+        # v13.3.14 (P2): ``slab`` is a worker-persistent maximum-sized union buffer pair
+        # from the two-entry slab ring — the task uses zeroed leading views instead of a
+        # fresh multi-GiB allocation, and releases the slab after its flush drains.
+        self._slab = slab
+        if slab is not None:
+            self.union_dev = slab['union'][: int(num_frames)]
+            self.conf_dev = slab['conf'][: int(num_frames)] if bool(want_conf) else None
+        else:
+            self.union_dev = torch_mod.zeros(
+                (int(num_frames), int(native_h), int(native_w)), dtype=torch_mod.uint8, device=device,
+            )
+            self.conf_dev = (
+                torch_mod.zeros((int(num_frames), int(native_h), int(native_w)), dtype=torch_mod.uint8, device=device)
+                if bool(want_conf) else None
+            )
         # C3 device-compacted generic payloads write one scalar per slice. Static/legacy
         # payloads leave zero here and continue returning their host-known stats normally.
         self.prediction_counts_dev = torch_mod.zeros(
@@ -8745,6 +9279,12 @@ class _DeviceUnionAccumulator:
         # union (CPU fallback / cupy-cleanup frames) and wrote the host window directly.
         self.written = np.zeros((int(num_frames),), dtype=bool)
         self.host_written = False
+
+    def _release_slab(self) -> None:
+        slab = self._slab
+        self._slab = None
+        if slab is not None:
+            _release_union_slab(slab)
 
     def mark_host_write(self) -> None:
         self.host_written = True
@@ -8965,6 +9505,92 @@ class _DeviceUnionAccumulator:
         self.union_dev = None
         self.conf_dev = None
         self.prediction_counts_dev = None
+        # v13.3.14 (P2): every D2H event above has synchronized, so the slab is reusable.
+        self._release_slab()
+
+
+def persistent_trt_ring_enabled() -> bool:
+    """v13.3.14 (P2): keep TensorRT ring contexts/graphs/slots/union slabs per worker.
+
+    v13.3.13 recreated the second execution context, output tensors, concurrent-context
+    validation, and up to four CUDA graphs for EVERY 512-slice task (~70 tasks/run before
+    data-dependent omissions), and allocated a fresh multi-GiB device union per task.
+    YOLO_TTA_PERSISTENT_TRT_RING=0 restores the per-task executor and unions.
+    """
+    return _env_flag('YOLO_TTA_PERSISTENT_TRT_RING', True)
+
+
+# v13.3.14 (P2): two-entry maximum-sized device-union slab ring per (device, plane,
+# conf) class. Two slabs let a retiring task's sealed D2H/host merge (G8) overlap the
+# next task's accumulation; a task whose flush never ran leaves its slab busy, in which
+# case later tasks simply fall back to the established per-task allocation.
+_WORKER_UNION_SLAB_LOCK = threading.Lock()
+_WORKER_UNION_SLAB_RING: Dict[Tuple[str, int, int, bool], List[Dict[str, object]]] = {}
+
+
+def _release_union_slab(slab: Dict[str, object]) -> None:
+    with _WORKER_UNION_SLAB_LOCK:
+        slab['in_use'] = False
+
+
+def _acquire_union_slab(
+    torch_mod: object, device: object, num_frames: int, native_h: int, native_w: int, want_conf: bool,
+) -> Optional[Dict[str, object]]:
+    """Check a zeroed >=num_frames slab out of the worker ring (None -> per-task alloc)."""
+    if not persistent_trt_ring_enabled():
+        return None
+    key = (str(device), int(native_h), int(native_w), bool(want_conf))
+    grow_needed = False
+    with _WORKER_UNION_SLAB_LOCK:
+        ring = _WORKER_UNION_SLAB_RING.setdefault(key, [])
+        for entry in ring:
+            if not bool(entry['in_use']) and int(entry['cap']) >= int(num_frames):
+                entry['in_use'] = True
+                slab = entry
+                break
+        else:
+            slab = None
+            if len(ring) >= 2:
+                # Replace a FREE undersized slab; if both are busy/large enough is
+                # impossible here, give up and let the task allocate transiently.
+                for i, entry in enumerate(ring):
+                    if not bool(entry['in_use']) and int(entry['cap']) < int(num_frames):
+                        ring.pop(i)
+                        grow_needed = True
+                        break
+                else:
+                    return None
+            else:
+                grow_needed = True
+    if slab is not None:
+        try:
+            slab['union'][: int(num_frames)].zero_()
+            if slab.get('conf') is not None:
+                slab['conf'][: int(num_frames)].zero_()
+            return slab
+        except Exception:
+            _release_union_slab(slab)
+            return None
+    if not grow_needed:
+        return None
+    try:
+        need = int(num_frames) * int(native_h) * int(native_w) * (2 if bool(want_conf) else 1)
+        free_bytes, _total = torch_mod.cuda.mem_get_info(device)
+        if int(free_bytes) < int(need) + 2 * GIB:
+            return None
+        union = torch_mod.zeros(
+            (int(num_frames), int(native_h), int(native_w)), dtype=torch_mod.uint8, device=device,
+        )
+        conf = (
+            torch_mod.zeros((int(num_frames), int(native_h), int(native_w)), dtype=torch_mod.uint8, device=device)
+            if bool(want_conf) else None
+        )
+        slab = {'union': union, 'conf': conf, 'cap': int(num_frames), 'in_use': True}
+        with _WORKER_UNION_SLAB_LOCK:
+            _WORKER_UNION_SLAB_RING.setdefault(key, []).append(slab)
+        return slab
+    except Exception:
+        return None
 
 
 def _try_create_device_union_accumulator(
@@ -8978,6 +9604,15 @@ def _try_create_device_union_accumulator(
         if not str(device_str).startswith('cuda') or not bool(torch.cuda.is_available()):
             return None
         device = torch.device(str(device_str))
+        # v13.3.14 (P2): slab-ring reuse first — no VRAM re-gate for an already-owned slab.
+        slab = _acquire_union_slab(
+            torch, device, int(num_frames), int(native_h), int(native_w), bool(want_conf),
+        )
+        if slab is not None:
+            return _DeviceUnionAccumulator(
+                torch, device, int(num_frames), int(native_h), int(native_w), bool(want_conf),
+                slab=slab,
+            )
         need = int(num_frames) * int(native_h) * int(native_w) * (2 if bool(want_conf) else 1)
         free_bytes, _total = torch.cuda.mem_get_info(device)
         if int(free_bytes) < int(need) + 2 * GIB:
@@ -9331,6 +9966,83 @@ def _process_prediction_frame(
 _DIRECT_PREDICT_ANNOUNCED = False
 _RESIDENT_TRT_RING_ANNOUNCED = False
 _RESIDENT_TRT_RING_FALLBACK_WARNED = False
+
+# v13.3.14 (P2): worker-persistent resident ring executors keyed by
+# (backend id, network raster, input dtype, native shape class, affine, track_conf,
+# threshold). Contexts, static bindings, streams, events, CUDA graphs, compaction
+# buffers, and the two ring slots survive across the ~6-10 slice-chunk tasks per view;
+# per-task work shrinks to renderer revalidation and a borrowed-context address rebind.
+_PERSISTENT_TRT_RING_CACHE: 'OrderedDict[Tuple, Dict[str, object]]' = OrderedDict()
+_PERSISTENT_TRT_RING_LOCK = threading.Lock()
+_PERSISTENT_TRT_RING_ANNOUNCED = False
+
+
+def persistent_trt_ring_cache_limit() -> int:
+    return max(1, _env_int('YOLO_TTA_PERSISTENT_TRT_RING_CACHE', 2))
+
+
+def _persistent_trt_ring_key(
+    backend: object,
+    out_size: int,
+    input_dtype: object,
+    native_h: int,
+    native_w: int,
+    M_out_to_native: np.ndarray,
+    track_conf: bool,
+    threshold: float,
+) -> Tuple:
+    affine = tuple(
+        round(float(x), 9)
+        for x in np.asarray(M_out_to_native, dtype=np.float64).reshape(-1)[:6]
+    )
+    return (
+        int(id(backend)), int(out_size), str(input_dtype),
+        int(native_h), int(native_w), affine, bool(track_conf),
+        round(float(threshold), 6),
+    )
+
+
+def _persistent_trt_ring_lookup(key: Tuple, backend: object) -> Optional[Dict[str, object]]:
+    with _PERSISTENT_TRT_RING_LOCK:
+        entry = _PERSISTENT_TRT_RING_CACHE.get(key)
+        if entry is None:
+            return None
+        if entry.get('backend') is not backend:  # id() reuse guard
+            _PERSISTENT_TRT_RING_CACHE.pop(key, None)
+            return None
+        _PERSISTENT_TRT_RING_CACHE.move_to_end(key)
+        return entry
+
+
+def _persistent_trt_ring_store(key: Tuple, backend: object, slots: List[object], executor: object) -> None:
+    evicted: List[Dict[str, object]] = []
+    with _PERSISTENT_TRT_RING_LOCK:
+        _PERSISTENT_TRT_RING_CACHE[key] = {
+            'backend': backend, 'slots': list(slots), 'executor': executor,
+        }
+        _PERSISTENT_TRT_RING_CACHE.move_to_end(key)
+        while len(_PERSISTENT_TRT_RING_CACHE) > int(persistent_trt_ring_cache_limit()):
+            _old_key, old_entry = _PERSISTENT_TRT_RING_CACHE.popitem(last=False)
+            evicted.append(old_entry)
+    for old_entry in evicted:
+        try:
+            old_entry['executor'].close()
+        except _ResidentTensorRTRingFatalError:
+            raise  # generic fallback must never run after an unproven teardown
+        except Exception:
+            pass
+
+
+def _persistent_trt_ring_evict(key: Tuple, *, close: bool = True) -> None:
+    with _PERSISTENT_TRT_RING_LOCK:
+        entry = _PERSISTENT_TRT_RING_CACHE.pop(key, None)
+    if entry is not None and close:
+        try:
+            entry['executor'].close()
+        except _ResidentTensorRTRingFatalError:
+            raise  # generic fallback must never run after an unproven teardown
+        except Exception:
+            pass
 
 
 def direct_predict_enabled() -> bool:
@@ -12645,6 +13357,13 @@ class GpuRenderedYoloSource:
                 )
                 for i in range(2)
             ]
+        self._finalize_direct_ring_setup()
+        return self._direct_ring
+
+    def _finalize_direct_ring_setup(self) -> None:
+        """Per-task renderer validation/capture + position reset for the active ring."""
+        if self._direct_ring is None:
+            raise RuntimeError('direct resident ring has not been prepared')
         if abs(float(self.job.angle_deg)) <= 1.0e-7:
             family = (
                 'radial' if str(self.view.family) == 'radial'
@@ -12674,6 +13393,46 @@ class GpuRenderedYoloSource:
                 )
         self._direct_count = 0
         self.count = 0
+
+    def adopt_direct_ring(
+        self,
+        slots: Sequence[_ResidentGpuPipelineSlot],
+        input_dtype: Optional[object] = None,
+    ) -> List[_ResidentGpuPipelineSlot]:
+        """v13.3.14 (P2): reuse worker-persistent ring slots for this (new) source/task.
+
+        The persistent executor's CUDA graphs bake these slots' tensor addresses, so the
+        SAME slot objects must serve every task of the cache key. Only per-task metadata
+        (view/job renderer keys, frame counters) is rebound here; dtype/device/geometry
+        mismatches reject adoption so the caller can fall back to a fresh build.
+        """
+        if self.bs != 1 or self.nf <= 0 or str(getattr(self.engine, '_mode', '')) != 'resident':
+            raise RuntimeError('direct resident ring requires a nonempty batch-1 resident source')
+        slots_list = list(slots)
+        if len(slots_list) != 2:
+            raise RuntimeError('persistent resident ring requires exactly two slots')
+        torch = self.engine.torch
+        resolved_dtype = (
+            input_dtype
+            if input_dtype is not None
+            else (torch.float16 if bool(self.half) else torch.float32)
+        )
+        for slot in slots_list:
+            if slot.input.dtype != resolved_dtype:
+                raise RuntimeError(
+                    f'persistent ring slot dtype {slot.input.dtype} != required {resolved_dtype}'
+                )
+            if str(slot.input.device) != str(self.engine.device):
+                raise RuntimeError(
+                    f'persistent ring slot device {slot.input.device} != engine {self.engine.device}'
+                )
+            if tuple(int(v) for v in slot.input.shape[-2:]) != (int(self.out_size), int(self.out_size)):
+                raise RuntimeError(
+                    f'persistent ring slot raster {tuple(slot.input.shape[-2:])} != '
+                    f'({int(self.out_size)}, {int(self.out_size)})'
+                )
+        self._direct_ring = slots_list
+        self._finalize_direct_ring_setup()
         return self._direct_ring
 
     def reset_direct_ring(self) -> None:
@@ -15456,6 +16215,10 @@ class _ResidentTensorRTRingExecutor:
             self._capture_static_graphs(
                 capture_graphs=bool(resident_trt_cuda_graphs_enabled()),
             )
+            # v13.3.14 (P2): never assume two concurrent contexts beat one on this engine —
+            # measure both schedules once (per persistent executor) and keep the faster.
+            self.serialize_inference = False
+            self._autotune_context_schedule()
         except Exception:
             self.close()
             raise
@@ -15513,6 +16276,9 @@ class _ResidentTensorRTRingExecutor:
             slot.binding_addresses = addresses
         else:
             raise RuntimeError('TensorRT context has no asynchronous enqueue API')
+        # v13.3.14 (P2): retained so attach() can re-bind the borrowed context's tensor
+        # addresses between tasks without reallocating outputs (graphs bake these pointers).
+        slot.output_by_name = dict(outputs)
         return [outputs[name] for name in self.output_names]
 
     def _allocate_post_buffers(self, slot: _ResidentGpuPipelineSlot) -> None:
@@ -15700,6 +16466,124 @@ class _ResidentTensorRTRingExecutor:
                             f'for ring slot {slot.slot_id}'
                         ) from sync_exc
 
+    def _autotune_context_schedule(self) -> None:
+        """v13.3.14 (P2): time alternating two-context enqueue vs an event-serialized chain.
+
+        One TensorRT enqueue can already saturate an H100 for some engines, in which case
+        two concurrent contexts merely thrash SMs. The serialized schedule keeps both
+        slots/graphs/buffers (full render/post overlap) and only chains each inference
+        behind the other slot's infer_done event. Both schedules run on warmup data; the
+        faster one is kept. YOLO_TTA_RESIDENT_TRT_CONTEXT_AUTOTUNE=0 skips the benchmark.
+        """
+        if not _env_flag('YOLO_TTA_RESIDENT_TRT_CONTEXT_AUTOTUNE', True):
+            return
+        torch = self.torch
+        frames = 6
+
+        def _reset() -> None:
+            for slot in self.slots:
+                slot.infer_valid = False
+                slot.post_valid = False
+            for slot in self.slots:
+                slot.infer_stream.synchronize()
+
+        def _run(serialize: bool) -> float:
+            self.serialize_inference = bool(serialize)
+            best = float('inf')
+            for _ in range(2):
+                _reset()
+                t0 = time.perf_counter()
+                for k in range(int(frames)):
+                    self.enqueue_inference(self.slots[k & 1])
+                for slot in self.slots:
+                    slot.infer_stream.synchronize()
+                best = min(best, float(time.perf_counter() - t0))
+            return best
+
+        try:
+            concurrent_s = _run(False)
+            serial_s = _run(True)
+            # Require a solid margin before dropping concurrency (noise guard).
+            self.serialize_inference = bool(serial_s < concurrent_s * 0.97)
+        except Exception:
+            self.serialize_inference = False
+        finally:
+            try:
+                for slot in self.slots:
+                    slot.infer_valid = False
+                    slot.post_valid = False
+                    slot.infer_stream.synchronize()
+            except Exception:
+                pass
+
+    def attach(self) -> None:
+        """v13.3.14 (P2): rebind the borrowed context's slot addresses for a new task.
+
+        Only slot 0 borrows AutoBackend's primary context (whose tensor addresses detach()
+        restored for generic use); the ring-private second context keeps its addresses.
+        Captured CUDA graphs replay fixed pointers and are unaffected either way — the
+        rebind matters for the non-graphed _execute_context enqueue path.
+        """
+        slot0 = self.slots[0]
+        context = slot0.context
+        if context is None:
+            raise RuntimeError('persistent resident ring has no borrowed context to attach')
+        if slot0.binding_addresses is None and callable(getattr(context, 'set_tensor_address', None)):
+            outputs = getattr(slot0, 'output_by_name', None) or {}
+            for name in self.binding_names:
+                tensor = slot0.input if name == self.input_name else outputs.get(str(name))
+                if tensor is None:
+                    raise RuntimeError(f'persistent resident ring lost output tensor {name!r}')
+                ok = context.set_tensor_address(name, int(tensor.data_ptr()))
+                if ok is False:
+                    raise RuntimeError(f'TensorRT rejected re-bound address for {name!r}')
+        for slot in self.slots:
+            slot.infer_valid = False
+            slot.post_valid = False
+
+    def detach(self) -> None:
+        """v13.3.14 (P2): quiesce streams and hand AutoBackend its addresses back.
+
+        The executor keeps contexts, graphs, output tensors, and post buffers for the next
+        task; only the borrowed context's tensor addresses are restored so any interleaved
+        generic AutoBackend inference (host-fallback frames, tile tasks) stays correct.
+        Failures are fatal exactly as in close(): generic fallback must never run while a
+        context can still write ring buffers.
+        """
+        self._quiesce_streams_and_restore()
+
+    def _quiesce_streams_and_restore(self) -> None:
+        drain_error: Optional[BaseException] = None
+        for slot in getattr(self, 'slots', []):
+            for stream in (getattr(slot, 'infer_stream', None), getattr(slot, 'post_stream', None)):
+                if stream is None:
+                    continue
+                try:
+                    stream.synchronize()
+                except BaseException as exc:
+                    if drain_error is None:
+                        drain_error = exc
+        context = getattr(self, '_borrowed_context', None)
+        restore = getattr(self, '_restore_tensor_addresses', {})
+        restore_error: Optional[BaseException] = None
+        if context is not None and restore:
+            for name, address in restore.items():
+                try:
+                    ok = context.set_tensor_address(str(name), int(address))
+                    if ok is False:
+                        raise RuntimeError(f'TensorRT rejected restored address for {name!r}')
+                except BaseException as exc:
+                    if restore_error is None:
+                        restore_error = exc
+        if restore_error is not None:
+            raise _ResidentTensorRTRingFatalError(
+                'failed to restore every AutoBackend TensorRT binding address; fallback is unsafe'
+            ) from restore_error
+        if drain_error is not None:
+            raise _ResidentTensorRTRingFatalError(
+                'failed to drain every resident TensorRT ring stream; fallback is unsafe'
+            ) from drain_error
+
     def enqueue_inference(self, slot: _ResidentGpuPipelineSlot) -> None:
         torch = self.torch
         with torch.cuda.stream(slot.infer_stream):
@@ -15708,6 +16592,12 @@ class _ResidentTensorRTRingExecutor:
                 # The preceding frame's mask kernel still reads this context's static
                 # output buffers.  Do not let the next enqueue overwrite them early.
                 slot.infer_stream.wait_event(slot.post_done)
+            if bool(getattr(self, 'serialize_inference', False)):
+                # v13.3.14 (P2): measured-faster single-execution schedule — chain behind
+                # the other slot's inference while keeping full render/post overlap.
+                other = self.slots[0] if slot is self.slots[1] else self.slots[1]
+                if bool(other.infer_valid):
+                    slot.infer_stream.wait_event(other.infer_done)
             if slot.infer_graph is not None:
                 slot.infer_graph.replay()
             else:
@@ -15752,28 +16642,11 @@ class _ResidentTensorRTRingExecutor:
         while a context can still write ring buffers or the borrowed backend points at storage
         this method is about to release.
         """
-        drain_error: Optional[BaseException] = None
-        for slot in getattr(self, 'slots', []):
-            for stream in (getattr(slot, 'infer_stream', None), getattr(slot, 'post_stream', None)):
-                if stream is None:
-                    continue
-                try:
-                    stream.synchronize()
-                except BaseException as exc:
-                    if drain_error is None:
-                        drain_error = exc
-        context = getattr(self, '_borrowed_context', None)
-        restore = getattr(self, '_restore_tensor_addresses', {})
-        restore_error: Optional[BaseException] = None
-        if context is not None and restore:
-            for name, address in restore.items():
-                try:
-                    ok = context.set_tensor_address(str(name), int(address))
-                    if ok is False:
-                        raise RuntimeError(f'TensorRT rejected restored address for {name!r}')
-                except BaseException as exc:
-                    if restore_error is None:
-                        restore_error = exc
+        quiesce_error: Optional[BaseException] = None
+        try:
+            self._quiesce_streams_and_restore()
+        except BaseException as exc:
+            quiesce_error = exc
         # Release graph/context/output references promptly; the task-level device union
         # remains live for metadata, hole fill, and its single D2H drain.
         for slot in getattr(self, 'slots', []):
@@ -15792,16 +16665,12 @@ class _ResidentTensorRTRingExecutor:
             slot.conf_proto = None
             slot.native_union = None
             slot.native_conf = None
+            if getattr(slot, 'output_by_name', None):
+                slot.output_by_name = {}
             slot._cupy_refs.clear()
             slot._render_cupy_refs.clear()
-        if restore_error is not None:
-            raise _ResidentTensorRTRingFatalError(
-                'failed to restore every AutoBackend TensorRT binding address; fallback is unsafe'
-            ) from restore_error
-        if drain_error is not None:
-            raise _ResidentTensorRTRingFatalError(
-                'failed to drain every resident TensorRT ring stream; fallback is unsafe'
-            ) from drain_error
+        if quiesce_error is not None:
+            raise quiesce_error
 
 
 def _try_resident_trt_ring_accumulate(
@@ -15866,6 +16735,9 @@ def _try_resident_trt_ring_accumulate(
     next_slot = getattr(source, 'next_direct_slot', None)
     if not callable(prepare) or not callable(next_slot):
         return None
+    global _PERSISTENT_TRT_RING_ANNOUNCED
+    ring_key: Optional[Tuple] = None
+    persistent_active = bool(persistent_trt_ring_enabled())
     try:
         import torch  # type: ignore
         _names, input_name, _outputs, _indices = _trt_binding_layout_for_backend(backend, trt_engine)
@@ -15874,20 +16746,65 @@ def _try_resident_trt_ring_accumulate(
             raise RuntimeError(
                 f'resident ring cannot allocate unsupported TensorRT input dtype {input_dtype}'
             )
-        # P5: engine binding dtype is the allocation source of truth.  In particular,
-        # an FP16-builder engine with an FP32 image binding gets FP32 static slots and
-        # the renderer's final copy performs the normalized float32 write directly.
-        slots = prepare(input_dtype=input_dtype)
-        if slots is None or len(slots) != 2:
-            return None
         threshold = max(float(cfg.conf), float(fastpath[0]))
-        executor = _ResidentTensorRTRingExecutor(
-            backend, slots, out_size=int(out_size),
-            native_h=int(native_h), native_w=int(native_w),
-            M_out_to_native=np.asarray(M_out_to_native, dtype=np.float32),
-            track_conf=device_union.conf_dev is not None,
-            confidence_threshold=float(threshold),
-        )
+        executor: Optional[_ResidentTensorRTRingExecutor] = None
+        slots: Optional[List[_ResidentGpuPipelineSlot]] = None
+        if persistent_active:
+            # v13.3.14 (P2): reuse this worker's contexts/graphs/slots when the task class
+            # matches; only per-task renderer metadata and the borrowed-context addresses
+            # are rebound. Any adoption surprise closes the cached entry and rebuilds.
+            ring_key = _persistent_trt_ring_key(
+                backend, int(out_size), input_dtype, int(native_h), int(native_w),
+                M_out_to_native, device_union.conf_dev is not None, float(threshold),
+            )
+            entry = _persistent_trt_ring_lookup(ring_key, backend)
+            if entry is not None:
+                adopt = getattr(source, 'adopt_direct_ring', None)
+                try:
+                    if not callable(adopt):
+                        raise RuntimeError('source does not support persistent ring adoption')
+                    slots = adopt(entry['slots'], input_dtype=input_dtype)
+                    executor = entry['executor']  # type: ignore[assignment]
+                    executor.attach()
+                except _ResidentTensorRTRingFatalError:
+                    raise
+                except Exception as adopt_exc:
+                    # Pre-consumption: closing and rebuilding is safe.
+                    _persistent_trt_ring_evict(ring_key)
+                    executor = None
+                    slots = None
+                    print(
+                        f'Persistent TensorRT ring adoption failed ({adopt_exc}); '
+                        'rebuilding the executor for this task.'
+                    )
+        if executor is None:
+            # P5: engine binding dtype is the allocation source of truth.  In particular,
+            # an FP16-builder engine with an FP32 image binding gets FP32 static slots and
+            # the renderer's final copy performs the normalized float32 write directly.
+            slots = prepare(input_dtype=input_dtype)
+            if slots is None or len(slots) != 2:
+                return None
+            executor = _ResidentTensorRTRingExecutor(
+                backend, slots, out_size=int(out_size),
+                native_h=int(native_h), native_w=int(native_w),
+                M_out_to_native=np.asarray(M_out_to_native, dtype=np.float32),
+                track_conf=device_union.conf_dev is not None,
+                confidence_threshold=float(threshold),
+            )
+            if persistent_active and ring_key is not None:
+                _persistent_trt_ring_store(ring_key, backend, list(slots), executor)
+                # Storing may have evicted an older executor sharing the borrowed context,
+                # whose close() restored AutoBackend's addresses — rebind ours.
+                executor.attach()
+                if not _PERSISTENT_TRT_RING_ANNOUNCED:
+                    _PERSISTENT_TRT_RING_ANNOUNCED = True
+                    print(
+                        'v13.3.14 (P2): persistent resident TensorRT ring active — contexts, '
+                        'static bindings, CUDA graphs, ring slots, and device-union slabs are '
+                        'worker-persistent per task class; enqueue schedule='
+                        f'{"event-serialized" if executor.serialize_inference else "two-context-concurrent"} '
+                        '(measured; YOLO_TTA_PERSISTENT_TRT_RING=0 restores per-task executors).'
+                    )
     except _ResidentTensorRTRingFatalError:
         # The borrowed backend may reference ring storage or a CUDA stream may still own it.
         # Do not reset/reuse the source and do not enter generic C3 in this process.
@@ -15905,6 +16822,8 @@ def _try_resident_trt_ring_accumulate(
         return None
 
     pending: 'deque[Tuple[int, _ResidentGpuPipelineSlot]]' = deque()
+    task_started = time.monotonic()
+    task_completed = False
     try:
         frame_counts_dev = torch.zeros(
             (int(num_frames),), dtype=torch.int32, device=device_union.device,
@@ -15940,12 +16859,29 @@ def _try_resident_trt_ring_accumulate(
         prediction_count = int(frame_counts_dev.sum(dtype=torch.int64).item())
         # One task-level reduction/readback replaces one host count read per frame.
         frames_with_predictions = int((frame_counts_dev > 0).sum(dtype=torch.int64).item())
+        task_completed = True
     except Exception:
         # Admission already consumed/modified the task.  Propagate rather than rerunning
         # into the same destination and hiding a potentially unsafe TensorRT context failure.
         raise
     finally:
-        executor.close()
+        if persistent_active and ring_key is not None and task_completed:
+            # v13.3.14 (P2): quiesce + restore AutoBackend addresses, KEEP the executor.
+            try:
+                executor.detach()
+            except BaseException:
+                _persistent_trt_ring_evict(ring_key, close=False)
+                raise
+        else:
+            # Per-task mode, or a failed task: invalidate any cached entry and tear down.
+            if ring_key is not None:
+                _persistent_trt_ring_evict(ring_key, close=False)
+            executor.close()
+        tele_add(
+            'trt.ring_task',
+            seconds=time.monotonic() - task_started,
+            count=int(num_frames),
+        )
 
     if not _RESIDENT_TRT_RING_ANNOUNCED:
         _RESIDENT_TRT_RING_ANNOUNCED = True
@@ -16041,14 +16977,24 @@ def _emit_projection_block_callback(
     block: np.ndarray,
     *,
     desc: str,
+    required: bool = False,
 ) -> None:
-    """Best-effort block delivery: callback failure must not fail a correct projection."""
+    """Best-effort block delivery: callback failure must not fail a correct projection.
+
+    v13.3.14 (N2): ``required=True`` inverts the contract for sink-only projections —
+    the callback IS the output (no dense volume exists), so a delivery failure must fail
+    the projection and trigger the caller's one-shot dense rerun.
+    """
     if callback is None:
+        if required:
+            raise RuntimeError(f'{desc}: sink-only projection has no block callback')
         return
     try:
         callback(int(z0), np.asarray(block))
     except Exception as exc:
         _abort_projection_block_callback(callback, exc)
+        if required:
+            raise
         warn = getattr(callback, 'warn_failed_once', None)
         if callable(warn):
             try:
@@ -16059,7 +17005,7 @@ def _emit_projection_block_callback(
 
 def _radial_backproject_gpu_streaming(
     radial_mask_mm: np.ndarray,
-    vol_mm: np.ndarray,
+    vol_mm: Optional[np.ndarray],
     valid_pos: np.ndarray,
     flat_src: np.ndarray,
     v_range_for_t: Callable[[int], Tuple[int, int]],
@@ -16070,6 +17016,7 @@ def _radial_backproject_gpu_streaming(
     known_row_occupancy: Optional[np.ndarray] = None,
     known_slice_bboxes: Optional[np.ndarray] = None,
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
+    sink_only: bool = False,
 ) -> bool:
     """v13.3.2 (R6a): radial backprojection with a <1 GiB streaming GPU working set.
 
@@ -16155,18 +17102,37 @@ def _radial_backproject_gpu_streaming(
                 (t_chunk, int(valid_pos.shape[0])), dtype=torch.uint8, device=dev,
             )
             scatter_reduce_supported = True
+            # v13.3.14 (N2): sink-only known-zero chunks either use the sink's index-only
+            # zero path or fall back to one shared zeroed staging block.
+            sink_consume = getattr(projection_block_callback, 'consume', None)
+            sink_consume_zeros = getattr(projection_block_callback, 'consume_zeros', None)
+            zeros_block: Optional[np.ndarray] = None
             for t0 in tqdm(range(0, int(t_dim), t_chunk), desc=f'{desc} [gpu]'):
                 t1 = min(int(t_dim), t0 + t_chunk)
                 v0 = v_range_for_t(int(t0))[0]
                 v1 = v_range_for_t(int(t1 - 1))[1]
                 v_count = int(v1 - v0)
                 if not bool(np.any(row_any[int(v0):int(v1)])):
-                    _emit_projection_block_callback(
-                        projection_block_callback,
-                        int(t0),
-                        np.asarray(vol_mm[int(t0):int(t1)]),
-                        desc=desc,
-                    )
+                    if bool(sink_only):
+                        if callable(sink_consume_zeros):
+                            sink_consume_zeros(int(t0), int(t1 - t0))
+                        else:
+                            if zeros_block is None:
+                                zeros_block = np.zeros((int(t_chunk), int(out_h), int(out_w)), dtype=np.uint8)
+                            _emit_projection_block_callback(
+                                projection_block_callback,
+                                int(t0),
+                                zeros_block[: int(t1 - t0)],
+                                desc=desc,
+                                required=True,
+                            )
+                    else:
+                        _emit_projection_block_callback(
+                            projection_block_callback,
+                            int(t0),
+                            np.asarray(vol_mm[int(t0):int(t1)]),
+                            desc=desc,
+                        )
                     continue  # vol_mm is pre-zeroed
                 if int(v_count) > int(pin_rows.shape[0]):  # pragma: no cover - conservative bound
                     raise RuntimeError(f'{desc}: covering rows {v_count} exceed staging bound {pin_rows.shape[0]}')
@@ -16222,6 +17188,27 @@ def _radial_backproject_gpu_streaming(
                             out_dev[local_t].index_put_((valid_pos_t,), sub)
                 pin_out[: t1 - t0].copy_(out_dev[: t1 - t0], non_blocking=True)
                 stream.synchronize()
+                host_block = pin_out_np[: t1 - t0].reshape((int(t1 - t0), int(out_h), int(out_w)))
+                if bool(sink_only):
+                    # v13.3.14 (N2): no dense projected volume exists — the sink IS the
+                    # output. The device view rides along so the mirror tee pools it
+                    # without a re-upload (out_dev is stable until the next chunk's zero_,
+                    # and the stream was just synchronized).
+                    if callable(sink_consume):
+                        sink_consume(
+                            int(t0),
+                            host_block,
+                            device_block=out_dev[: t1 - t0].reshape(
+                                (int(t1 - t0), int(out_h), int(out_w)),
+                            ),
+                            ready_event=None,
+                        )
+                    else:
+                        _emit_projection_block_callback(
+                            projection_block_callback, int(t0), host_block,
+                            desc=desc, required=True,
+                        )
+                    continue
                 np.copyto(
                     np.asarray(vol_mm[t0:t1]).reshape(t1 - t0, -1),
                     pin_out_np[: t1 - t0],
@@ -16232,7 +17219,7 @@ def _radial_backproject_gpu_streaming(
                 _emit_projection_block_callback(
                     projection_block_callback,
                     int(t0),
-                    pin_out_np[: t1 - t0].reshape((int(t1 - t0), int(out_h), int(out_w))),
+                    host_block,
                     desc=desc,
                 )
             stream.synchronize()
@@ -16255,7 +17242,8 @@ def backproject_radial_volume_to_volume(
     known_row_occupancy: Optional[np.ndarray] = None,
     known_slice_bboxes: Optional[np.ndarray] = None,
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
-) -> np.ndarray:
+    sink_only: bool = False,
+) -> Optional[np.ndarray]:
     """Backproject a radial view-native mask stack into orthogonal (t, Y, X).
 
     v13.2.4 (task #1, ruling A1): ``out_shape_tyx`` backprojects DIRECTLY into the final source
@@ -16264,9 +17252,17 @@ def backproject_radial_volume_to_volume(
     former tail restore without an intermediate working-geometry volume. ``None`` keeps the
     historical working-geometry target. The cube resize only ever grows axes, so the working
     geometry is never smaller than the source geometry.
+
+    v13.3.14 (N2): ``sink_only=True`` never allocates the dense output volume — every
+    output block is DELIVERED (required, ordered) through ``projection_block_callback``
+    and the function returns None. A mid-projection failure raises (the caller reruns the
+    dense path once); a GPU admission refusal that consumed nothing still falls through to
+    the CPU path, which delivers the same ordered blocks from per-block staging buffers.
     """
     if radial_view.family != 'radial':
         raise ValueError('backproject_radial_volume_to_volume expects a radial view')
+    if sink_only and projection_block_callback is None:
+        raise ValueError(f'{desc}: sink-only radial projection requires a block callback')
 
     work_t = int(radial_view.src_h)
     work_h = int(radial_view.full_h)
@@ -16276,14 +17272,16 @@ def backproject_radial_volume_to_volume(
     else:
         t_dim, out_h, out_w = (int(v) for v in out_shape_tyx)
 
-    vol_mm = allocate_workspace_array(
-        shape=(t_dim, out_h, out_w),
-        dtype=np.uint8,
-        path=out_path,
-        desc=f'{desc} workspace',
-        prefer_memory=bool(prefer_memory),
-        reserve_bytes=int(reserve_bytes),
-    )
+    vol_mm: Optional[np.ndarray] = None
+    if not sink_only:
+        vol_mm = allocate_workspace_array(
+            shape=(t_dim, out_h, out_w),
+            dtype=np.uint8,
+            path=out_path,
+            desc=f'{desc} workspace',
+            prefer_memory=bool(prefer_memory),
+            reserve_bytes=int(reserve_bytes),
+        )
 
     plan, plan_stats = build_radial_backprojection_plan(radial_view)
     if bool(plan_stats.get('densified', 0.0)):
@@ -16298,6 +17296,21 @@ def backproject_radial_volume_to_volume(
 
     if not plan:
         empty_chunk = max(1, _env_int('YOLO_TTA_CPU_BACKPROJECT_T_CHUNK', 128))
+        if sink_only:
+            sink_consume_zeros = getattr(projection_block_callback, 'consume_zeros', None)
+            zeros_block: Optional[np.ndarray] = None
+            for t0 in range(0, int(t_dim), int(empty_chunk)):
+                t1 = min(int(t_dim), int(t0) + int(empty_chunk))
+                if callable(sink_consume_zeros):
+                    sink_consume_zeros(int(t0), int(t1 - t0))
+                else:
+                    if zeros_block is None:
+                        zeros_block = np.zeros((int(empty_chunk), int(out_h), int(out_w)), dtype=np.uint8)
+                    _emit_projection_block_callback(
+                        projection_block_callback, int(t0), zeros_block[: int(t1 - t0)],
+                        desc=desc, required=True,
+                    )
+            return None
         for t0 in range(0, int(t_dim), int(empty_chunk)):
             t1 = min(int(t_dim), int(t0) + int(empty_chunk))
             _emit_projection_block_callback(
@@ -16365,11 +17378,16 @@ def backproject_radial_volume_to_volume(
                 known_row_occupancy=row_occ,
                 known_slice_bboxes=radial_slice_bboxes,
                 projection_block_callback=projection_block_callback,
+                sink_only=bool(sink_only),
             )
         except Exception as exc:
             # Some GPU blocks may already have been indexed. The CPU retry rewrites all
             # output blocks, so retain projection correctness but discard that partial store.
             _abort_projection_block_callback(projection_block_callback, exc)
+            if sink_only:
+                # v13.3.14 (N2): no dense volume exists to rewrite and the sink enforces
+                # exactly-once delivery — the caller reruns the dense path once.
+                raise
             projection_block_callback = None
             print(f'{desc}: GPU backprojection failed ({exc}); using the CPU path.')
             gpu_done = False
@@ -16396,6 +17414,9 @@ def backproject_radial_volume_to_volume(
             2,
             max(1, int((8 * GIB) // max(1, int(per_block_bytes)))),
         ))
+        sink_consume_zeros = (
+            getattr(projection_block_callback, 'consume_zeros', None) if sink_only else None
+        )
 
         def _backproject_t_block(block_idx: int) -> None:
             t0 = int(block_idx) * int(cpu_t_chunk)
@@ -16403,6 +17424,16 @@ def backproject_radial_volume_to_volume(
             v0 = int(_v_range_for_t(int(t0))[0])
             v1 = int(_v_range_for_t(int(t1 - 1))[1])
             if not bool(np.any(row_occ[int(v0):int(v1)])):
+                if sink_only:
+                    if callable(sink_consume_zeros):
+                        sink_consume_zeros(int(t0), int(t1 - t0))
+                    else:
+                        _emit_projection_block_callback(
+                            projection_block_callback, int(t0),
+                            np.zeros((int(t1 - t0), int(out_h), int(out_w)), dtype=np.uint8),
+                            desc=desc, required=True,
+                        )
+                    return
                 _emit_projection_block_callback(
                     projection_block_callback,
                     int(t0),
@@ -16423,14 +17454,22 @@ def backproject_radial_volume_to_volume(
                 stage_workers=stage_workers,
             )
             gathered_rows = t_major.reshape(int(v1 - v0), -1).take(flat_src, axis=1)
-            out_flat = np.asarray(vol_mm[int(t0):int(t1)]).reshape(int(t1 - t0), -1)
+            if sink_only:
+                # v13.3.14 (N2): per-block staging replaces the dense volume window; the
+                # sink's bounded reorder stash absorbs the <=2 concurrent block workers.
+                block_out = np.zeros((int(t1 - t0), int(out_h) * int(out_w)), dtype=np.uint8)
+                out_flat = block_out
+            else:
+                out_flat = np.asarray(vol_mm[int(t0):int(t1)]).reshape(int(t1 - t0), -1)
             if same_t_axis:
                 out_flat[:, valid_pos] = gathered_rows[:int(t1 - t0)]
                 _emit_projection_block_callback(
                     projection_block_callback,
                     int(t0),
-                    np.asarray(vol_mm[int(t0):int(t1)]),
+                    out_flat.reshape((int(t1 - t0), int(out_h), int(out_w)))
+                    if sink_only else np.asarray(vol_mm[int(t0):int(t1)]),
                     desc=desc,
+                    required=bool(sink_only),
                 )
                 return
             for t in range(int(t0), int(t1)):
@@ -16444,8 +17483,10 @@ def backproject_radial_volume_to_volume(
             _emit_projection_block_callback(
                 projection_block_callback,
                 int(t0),
-                np.asarray(vol_mm[int(t0):int(t1)]),
+                out_flat.reshape((int(t1 - t0), int(out_h), int(out_w)))
+                if sink_only else np.asarray(vol_mm[int(t0):int(t1)]),
                 desc=desc,
+                required=bool(sink_only),
             )
 
         try:
@@ -16459,6 +17500,8 @@ def backproject_radial_volume_to_volume(
         finally:
             _release_parallel_pool(stage_workers, stage_pool)
 
+    if sink_only:
+        return None
     flush_array(vol_mm)
     return vol_mm
 
@@ -16472,7 +17515,9 @@ def backproject_tilted_volume_to_volume(
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
     out_shape_tyx: Optional[Tuple[int, int, int]] = None,
-) -> np.ndarray:
+    projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
+    sink_only: bool = False,
+) -> Optional[np.ndarray]:
     """Backproject a v12 Tilted View-native mask stack into native (t, Y, X).
 
     The input stack remains in the generated Tilted View's own frame order and
@@ -16542,6 +17587,43 @@ def backproject_tilted_volume_to_volume(
                 out_shape_tyx=None,
             )
             target_shape = tuple(int(v) for v in out_shape_tyx)
+
+            if sink_only and projection_block_callback is not None:
+                # v13.3.14 (N2): the terminal restore streams ordered z-blocks straight
+                # into the projected-layer sink — the full source-geometry volume (the
+                # 17-27 GiB disposable dense intermediate) is never allocated. Blocks are
+                # emitted from ONE thread in ascending z; the per-slice restores inside
+                # each block still run on the parallel fill lanes.
+                chunk = max(1, _env_int('YOLO_TTA_CPU_BACKPROJECT_T_CHUNK', 128))
+                block_buf = np.empty(
+                    (int(chunk), int(target_shape[1]), int(target_shape[2])), dtype=np.uint8,
+                )
+                restore_workers = choose_slice_parallel_workers(int(workers), int(chunk))
+                for z0 in tqdm(
+                    range(0, int(target_shape[0]), int(chunk)),
+                    desc=f'{desc} [terminal reduced-grid restore -> sink]',
+                ):
+                    z1 = min(int(target_shape[0]), int(z0) + int(chunk))
+                    block = block_buf[: int(z1 - z0)]
+
+                    def _restore_into(zi: int, _z0: int = int(z0), _block: np.ndarray = block) -> None:
+                        _block[int(zi)] = _read_layer_slice_in_output_shape(
+                            reduced_mm, target_shape, int(_z0 + int(zi)),
+                        )
+
+                    _nrrd_parallel_fill_indices(
+                        int(z1 - z0),
+                        _restore_into,
+                        requested_workers=min(int(restore_workers), int(z1 - z0)),
+                    )
+                    # The sink consumes the block synchronously (store pwrites + payload
+                    # hand-off), so the single staging buffer is immediately reusable.
+                    _emit_projection_block_callback(
+                        projection_block_callback, int(z0), block, desc=desc, required=True,
+                    )
+                restore_succeeded = True
+                return None
+
             restored_mm = allocate_workspace_array(
                 shape=target_shape,
                 dtype=np.uint8,
@@ -16719,6 +17801,27 @@ def backproject_tilted_volume_to_volume(
         show_progress=True,
         target_chunks_per_worker=4,
     )
+
+    if sink_only and projection_block_callback is not None:
+        # v13.3.14 (N2): the per-frame shear scatters to arbitrary stack positions, so the
+        # dense scatter target is unavoidable here — but the SINK path still gets ordered
+        # blocks and the caller never keeps this volume (it is closed and unlinked now).
+        try:
+            chunk = max(1, _env_int('YOLO_TTA_CPU_BACKPROJECT_T_CHUNK', 128))
+            for z0 in range(0, int(t_dim), int(chunk)):
+                z1 = min(int(t_dim), int(z0) + int(chunk))
+                _emit_projection_block_callback(
+                    projection_block_callback, int(z0),
+                    np.asarray(vol_mm[int(z0):int(z1)]),
+                    desc=desc, required=True,
+                )
+        finally:
+            close_memmap_array(vol_mm)
+            try:
+                Path(out_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        return None
 
     flush_array(vol_mm)
     return vol_mm
@@ -20293,6 +21396,28 @@ class IncrementalRawBBoxMaskStoreWriter:
             self._min_x = min(int(self._min_x), x0)
             self._max_x = max(int(self._max_x), int(x1) - 1)
 
+    def consume_empty_range(self, z0: int, z1: int) -> None:
+        """v13.3.14 (N2): record a known-zero z range without materializing any plane.
+
+        The fused projection sink calls this for producer-classified empty chunks; the
+        range keeps the exactly-once delivery contract and counts as scanned-empty for the
+        segment extent, exactly as if zero planes had been consumed.
+        """
+        start, stop = int(z0), int(z1)
+        if start < 0 or stop > int(self.shape[0]) or stop < start:
+            raise ValueError(f'{self.desc}: empty range [{start},{stop}) is out of range')
+        with self._lock:
+            if self._failed_reason is not None:
+                return
+            if self._finalized:
+                raise RuntimeError(f'{self.desc}: projection callback arrived after finalization')
+            if bool(np.any(self._slice_state[start:stop] != np.uint8(0))):
+                raise ValueError(
+                    f'{self.desc}: empty range [{start},{stop}) overlaps already-delivered slices'
+                )
+            self.index[start:stop]['kind'] = np.uint8(0)
+            self._slice_state[start:stop] = np.uint8(2)
+
     def consume(self, z0: int, block: np.ndarray) -> None:
         block_arr = np.asarray(block)
         if block_arr.ndim != 3:
@@ -20677,6 +21802,156 @@ class RawBBoxMaskStore:
                     dst0 = int(copy_start - absolute_start)
                     member[dst0:dst0 + int(copy_stop - copy_start)] = crop[
                         int(row_idx), src0:src0 + int(copy_stop - copy_start)
+                    ]
+            yield int(ln), member
+
+    def _restored_union_crop(
+        self,
+        source_indices: Sequence[int],
+    ) -> Optional[Tuple[int, int, int, int, np.ndarray]]:
+        """Union the bbox crops of ``source_indices`` into one (bbox, crop) pair.
+
+        v13.3.14 (N7): the sparse t-restore materializes only the union bbox instead of a
+        dense output plane. Values stay in the store's 0/1 uint8 domain, so the multi-source
+        union is a bitwise OR — identical to the dense reader's boolean OR restore.
+        """
+        nonempty: List[Tuple[int, int, int, int, np.ndarray]] = []
+        for src_z in source_indices:
+            decoded = self.decode_slice_crop(int(src_z), dtype=np.uint8)
+            if decoded is not None:
+                nonempty.append(decoded)
+        if not nonempty:
+            return None
+        if len(nonempty) == 1:
+            return nonempty[0]
+        uy0 = min(int(item[0]) for item in nonempty)
+        ux0 = min(int(item[1]) for item in nonempty)
+        uy1 = max(int(item[2]) for item in nonempty)
+        ux1 = max(int(item[3]) for item in nonempty)
+        union = np.zeros((int(uy1 - uy0), int(ux1 - ux0)), dtype=np.uint8)
+        for y0, x0, y1, x1, crop in nonempty:
+            np.bitwise_or(
+                union[int(y0 - uy0):int(y1 - uy0), int(x0 - ux0):int(x1 - ux0)],
+                crop,
+                out=union[int(y0 - uy0):int(y1 - uy0), int(x0 - ux0):int(x1 - ux0)],
+            )
+        return int(uy0), int(ux0), int(uy1), int(ux1), union
+
+    def iter_restored_sparse_members(
+        self,
+        z_start: int,
+        z_stop: int,
+        *,
+        member_bytes: int,
+        out_t: int,
+        crop_window: Optional[Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]] = None,
+    ) -> Iterator[Tuple[int, Optional[np.ndarray]]]:
+        """v13.3.14 (N7): sparse gzip members through the terminal t restore (and crop).
+
+        Generalizes :meth:`iter_native_sparse_members` to layers whose X/Y match the
+        output raster while t is restored (the Cartesian working-t -> source-t case that
+        previously rebuilt dense 3072x3072 planes per output slice), and to an optional
+        half-open output crop window ``((t_lo,t_hi),(y_lo,y_hi),(x_lo,x_hi))``. For each
+        output z the source slices come from ``_restore_source_indices_for_output_z`` —
+        exactly the dense reader's mapping — and only their bbox crops are unioned; member
+        occupancy is classified from those union bboxes, so zero members never allocate.
+        ``z_start``/``z_stop`` and member boundaries are relative to the (cropped) output
+        raster; each z shard remains an independent gzip member run.
+        """
+        in_t, in_h, in_w = (int(v) for v in self.shape)
+        out_t_i = max(1, int(out_t))
+        if crop_window is None:
+            t_lo, t_hi = 0, int(out_t_i)
+            y_lo, y_hi = 0, int(in_h)
+            x_lo, x_hi = 0, int(in_w)
+        else:
+            (t_lo, t_hi), (y_lo, y_hi), (x_lo, x_hi) = (
+                (int(crop_window[0][0]), int(crop_window[0][1])),
+                (int(crop_window[1][0]), int(crop_window[1][1])),
+                (int(crop_window[2][0]), int(crop_window[2][1])),
+            )
+        eff_t = max(0, int(t_hi - t_lo))
+        eff_h = max(0, int(y_hi - y_lo))
+        eff_w = max(0, int(x_hi - x_lo))
+        z0 = int(np.clip(int(z_start), 0, eff_t))
+        z1 = int(np.clip(int(z_stop), z0, eff_t))
+        slice_bytes = int(eff_h) * int(eff_w)
+        chunk_bytes = max(1, int(member_bytes))
+        stream_bytes = int(z1 - z0) * int(slice_bytes)
+        if stream_bytes <= 0 or slice_bytes <= 0:
+            return
+
+        # Restored union crops are cached by SOURCE tuple across consecutive members and
+        # consecutive output z: a 9 MiB output plane spans several 8-16 MiB members, and an
+        # upscale restore maps neighbouring output slices onto the same source slice.
+        cache_key: Optional[Tuple[int, ...]] = None
+        cache_crop: Optional[Tuple[int, int, int, int, np.ndarray]] = None
+
+        def _union_for_output_z(eff_z: int) -> Optional[Tuple[int, int, int, int, np.ndarray]]:
+            nonlocal cache_key, cache_crop
+            full_z = int(eff_z) + int(t_lo)
+            if int(in_t) == int(out_t_i):
+                sources: Tuple[int, ...] = (int(full_z),)
+            else:
+                sources = tuple(
+                    int(v) for v in _restore_source_indices_for_output_z(int(in_t), int(out_t_i), int(full_z))
+                )
+            if sources == cache_key:
+                return cache_crop
+            cache_key = sources
+            cache_crop = self._restored_union_crop(sources)
+            return cache_crop
+
+        def _clipped_bbox(item: Tuple[int, int, int, int, np.ndarray]) -> Optional[Tuple[int, int, int, int]]:
+            y0c = max(int(item[0]), int(y_lo))
+            x0c = max(int(item[1]), int(x_lo))
+            y1c = min(int(item[2]), int(y_hi))
+            x1c = min(int(item[3]), int(x_hi))
+            if y0c >= y1c or x0c >= x1c:
+                return None
+            return y0c, x0c, y1c, x1c
+
+        for local_start in range(0, int(stream_bytes), int(chunk_bytes)):
+            ln = min(int(chunk_bytes), int(stream_bytes) - int(local_start))
+            absolute_start = int(z0) * int(slice_bytes) + int(local_start)
+            absolute_stop = int(absolute_start) + int(ln)
+            first_z = max(z0, int(absolute_start // slice_bytes))
+            last_z = min(z1 - 1, int((absolute_stop - 1) // slice_bytes))
+
+            # Classification decodes at most (last_z - first_z + 1) cached union crops; the
+            # linear bbox span remains a conservative superset (a false positive deflates a
+            # zero member normally and can never omit foreground).
+            member: Optional[np.ndarray] = None
+            for eff_z in range(int(first_z), int(last_z) + 1):
+                union = _union_for_output_z(int(eff_z))
+                if union is None:
+                    continue
+                clipped = _clipped_bbox(union)
+                if clipped is None:
+                    continue
+                uy0, ux0, uy1, ux1 = clipped
+                slice_base = int(eff_z) * int(slice_bytes)
+                bbox_first = slice_base + (int(uy0) - int(y_lo)) * int(eff_w) + (int(ux0) - int(x_lo))
+                bbox_stop = slice_base + (int(uy1) - 1 - int(y_lo)) * int(eff_w) + (int(ux1) - int(x_lo))
+                if not (int(bbox_first) < int(absolute_stop) and int(bbox_stop) > int(absolute_start)):
+                    continue
+                if member is None:
+                    member = np.zeros((int(ln),), dtype=np.uint8)
+
+                src_y0, src_x0, _src_y1, _src_x1, crop = union
+                crop_w_clip = int(ux1 - ux0)
+                for y in range(int(uy0), int(uy1)):
+                    row_start = int(slice_base) + (int(y) - int(y_lo)) * int(eff_w) + (int(ux0) - int(x_lo))
+                    row_stop = int(row_start) + int(crop_w_clip)
+                    copy_start = max(int(row_start), int(absolute_start))
+                    copy_stop = min(int(row_stop), int(absolute_stop))
+                    if copy_stop <= copy_start:
+                        continue
+                    src_col0 = int(ux0 - src_x0) + int(copy_start - row_start)
+                    dst0 = int(copy_start - absolute_start)
+                    span = int(copy_stop - copy_start)
+                    member[dst0:dst0 + span] = crop[
+                        int(y - src_y0), src_col0:src_col0 + span
                     ]
             yield int(ln), member
 
@@ -21141,7 +22416,8 @@ def project_view_volume_to_orthogonal_volume(
     known_row_occupancy: Optional[np.ndarray] = None,
     known_slice_bboxes: Optional[np.ndarray] = None,
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
-) -> np.ndarray:
+    sink_only: bool = False,
+) -> Optional[np.ndarray]:
     """Project a view-native binary volume into orthogonal (t,Y,X) geometry.
 
     v13.2.4 (A1): ``out_shape_tyx`` is honored for radial/tilted views (single direct resample to
@@ -21151,6 +22427,10 @@ def project_view_volume_to_orthogonal_volume(
     v13.3.2 (R15): ``allow_transverse_passthrough`` returns the source volume itself for the
     transverse identity branch (no copy). Callers must check np.may_share_memory before closing
     or unlinking the result.
+
+    v13.3.14 (N2): ``sink_only=True`` (radial/tilted only) delivers every output block
+    through the REQUIRED ``projection_block_callback`` and returns None instead of a dense
+    projected volume; a delivery failure raises so the caller can rerun the dense path.
     """
     source_shape = tuple(int(v) for v in np.asarray(view_mask_mm).shape)
     if len(source_shape) != 3:
@@ -21180,31 +22460,39 @@ def project_view_volume_to_orthogonal_volume(
         w_dim = int(view.full_w) if int(view.full_w) > 0 else int(view.src_w)
 
     if view.family == 'radial':
-        return backproject_radial_volume_to_volume(
-            radial_mask_mm=view_mask_mm,
-            radial_view=view,
-            out_path=out_path,
-            desc=desc,
-            prefer_memory=bool(prefer_memory),
-            reserve_bytes=int(reserve_bytes),
-            workers=int(workers),
-            out_shape_tyx=out_shape_tyx,
-            known_row_occupancy=known_row_occupancy,
-            known_slice_bboxes=known_slice_bboxes,
-            projection_block_callback=projection_block_callback,
-        )
+        with tele_phase('projection.radial'):
+            return backproject_radial_volume_to_volume(
+                radial_mask_mm=view_mask_mm,
+                radial_view=view,
+                out_path=out_path,
+                desc=desc,
+                prefer_memory=bool(prefer_memory),
+                reserve_bytes=int(reserve_bytes),
+                workers=int(workers),
+                out_shape_tyx=out_shape_tyx,
+                known_row_occupancy=known_row_occupancy,
+                known_slice_bboxes=known_slice_bboxes,
+                projection_block_callback=projection_block_callback,
+                sink_only=bool(sink_only),
+            )
 
     if is_tilted_view(view):
-        return backproject_tilted_volume_to_volume(
-            tilted_mask_mm=view_mask_mm,
-            tilted_view=view,
-            out_path=out_path,
-            desc=desc,
-            prefer_memory=bool(prefer_memory),
-            reserve_bytes=int(reserve_bytes),
-            workers=int(workers),
-            out_shape_tyx=out_shape_tyx,
-        )
+        with tele_phase('projection.tilted'):
+            return backproject_tilted_volume_to_volume(
+                tilted_mask_mm=view_mask_mm,
+                tilted_view=view,
+                out_path=out_path,
+                desc=desc,
+                prefer_memory=bool(prefer_memory),
+                reserve_bytes=int(reserve_bytes),
+                workers=int(workers),
+                out_shape_tyx=out_shape_tyx,
+                projection_block_callback=projection_block_callback,
+                sink_only=bool(sink_only),
+            )
+
+    if sink_only:
+        raise ValueError(f'{desc}: sink-only projection is admitted for radial/tilted views only')
 
     if out_shape_tyx is not None and tuple(int(v) for v in out_shape_tyx) != (t_dim, h_dim, w_dim):
         raise ValueError(
@@ -21363,6 +22651,161 @@ def materialize_nrrd_view_layer(
         'source_raw_workspace': 'in_memory_when_available' if bool(transient_projection_in_memory) else 'disk_backed',
         'projection_payload_fusion': 'radial_block_callback',
     }
+
+    def _project_layer(
+        block_callback: Optional[Callable[[int, np.ndarray], None]],
+        *,
+        sink_only: bool = False,
+    ) -> Optional[np.ndarray]:
+        return project_view_volume_to_orthogonal_volume(
+            view_volume_mm,
+            view,
+            raw_path,
+            desc=f'NRRD layer {key}',
+            workers=int(workers),
+            prefer_memory=bool(transient_projection_in_memory),
+            reserve_bytes=32 * GIB,
+            out_shape_tyx=projection_out_shape,
+            # v13.3.2 (R15): transverse layers headed for a raw-bbox store are encoded straight
+            # from the source volume (identity projection, synchronous encode) — no copy.
+            allow_transverse_passthrough=bool(raw_bbox_nrrd_layers_enabled()),
+            # v13.3.6 (D1): device-union row occupancy (radial views only; valid for the
+            # pre-interpolation layer, which is the only caller that supplies it).
+            known_row_occupancy=known_row_occupancy,
+            known_slice_bboxes=known_slice_bboxes,
+            projection_block_callback=block_callback,
+            sink_only=bool(sink_only),
+        )
+
+    suffix = nrrd_layer_output_suffix(
+        view_token=view_output_token(view),
+        source=str(source),
+        mask_kind=str(mask_kind),
+        pass_index=int(pass_index),
+        tile_acceptance=str(tile_acceptance),
+        stage=str(stage),
+    )
+
+    def _build_layer_ref(
+        ref_shape: Tuple[int, int, int],
+        segment_extent: NrrdSegmentExtent,
+        segment_extent_source: str,
+        ref_storage_format: str,
+    ) -> NrrdLayerRef:
+        return NrrdLayerRef(
+            key=key,
+            name=_nrrd_layer_name(
+                view=view,
+                source=str(source),
+                mask_kind=str(mask_kind),
+                pass_index=int(pass_index),
+                tile_acceptance=str(tile_acceptance),
+                stage=str(stage),
+            ),
+            path=out_path,
+            shape=(int(ref_shape[0]), int(ref_shape[1]), int(ref_shape[2])),
+            dtype='uint8',
+            storage_format=ref_storage_format,
+            model_name=str(model_name),
+            view_name=str(view.name),
+            view_family=str(view.family),
+            source=str(source),
+            mask_kind=str(mask_kind),
+            pass_index=int(pass_index),
+            tile_acceptance=str(tile_acceptance),
+            stage=str(stage),
+            description=str(description),
+            segment_extent_ijk=segment_extent,
+            segment_extent_shape_tyx=(int(ref_shape[0]), int(ref_shape[1]), int(ref_shape[2])),
+            segment_extent_source=segment_extent_source,
+        )
+
+    # v13.3.14 (N2): stream Radial/Tilted projection blocks straight into the cvol store,
+    # the fused full-quality .seg.nrrd, and every mirror — no disposable dense projected
+    # volume. A sink failure discards its partial outputs and reruns the dense path below.
+    sink = nrrd_layer_sink()
+    pending_reservation: Optional['_NrrdLayerReservation'] = None
+    fused_admissible = (
+        bool(raw_bbox_nrrd_layers_enabled())
+        and projection_out_shape is not None
+        and projected_layer_sink_enabled()
+        and (str(view.family) == 'radial' or is_tilted_view(view))
+    )
+    if fused_admissible:
+        expected_shape = tuple(int(v) for v in projection_out_shape)
+        reservation: Optional['_NrrdLayerReservation'] = None
+        if sink is not None:
+            try:
+                reservation = sink.reserve_layer(
+                    suffix,
+                    view_name=str(view.name),
+                    view_family=str(view.family),
+                    source=str(source),
+                    mask_kind=str(mask_kind),
+                    pass_index=int(pass_index),
+                    tile_acceptance=str(tile_acceptance),
+                    stage=str(stage),
+                    description=str(description),
+                    backing_shape_tyx=expected_shape,
+                )
+            except Exception as exc:
+                reservation = None
+                print(f'Warning: NRRD layer {key}: sink reservation failed ({exc}); store-only fusion.')
+        fused_writer: Optional[IncrementalRawBBoxMaskStoreWriter] = None
+        proj_sink: Optional[ProjectedLayerSink] = None
+        try:
+            fused_writer = IncrementalRawBBoxMaskStoreWriter(
+                shape=(int(expected_shape[0]), int(expected_shape[1]), int(expected_shape[2])),
+                store_dir=out_path,
+                format_name=CVOL_FORMAT,
+                desc=f'NRRD layer {key}',
+                extra_meta={
+                    **incremental_extra_meta,
+                    'projection_payload_fusion': 'projected_layer_sink',
+                },
+            )
+            proj_sink = ProjectedLayerSink(
+                store_writer=fused_writer,
+                output_shape=expected_shape,
+                desc=f'NRRD layer {key}',
+                nrrd_out_path=None if reservation is None else reservation.out_path,
+                segment_name=None if reservation is None else reservation.segment_name,
+                segment_color=None if reservation is None else reservation.segment_color,
+                mirrors=() if reservation is None else reservation.lq_mirror_args,
+                pigz_threads=None if sink is None else int(sink.pigz_threads),
+            )
+            with tele_phase('projection.fused_sink'):
+                fused_result = _project_layer(proj_sink, sink_only=True)
+            if fused_result is not None:
+                raise RuntimeError('sink-only projection unexpectedly returned a dense volume')
+            layer_stats = proj_sink.finalize_store()
+            segment_extent = (
+                _coerce_segment_extent(layer_stats.get('segment_extent_ijk'))
+                or _nrrd_empty_segment_extent()
+            )
+            layer_ref = _build_layer_ref(
+                expected_shape, segment_extent, 'raw_bbox_cvol_index', CVOL_FORMAT,
+            )
+            proj_sink.finalize_outputs(layer_ref)
+            if reservation is not None:
+                reservation.complete(layer_ref)
+            return layer_ref
+        except Exception as exc:
+            tele_add('projection.fused_sink_fallback')
+            if proj_sink is not None:
+                proj_sink.discard()
+            elif fused_writer is not None:
+                fused_writer.discard()
+            pending_reservation = reservation
+            try:
+                raw_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            print(
+                f'Warning: NRRD layer {key}: fused projected-layer sink failed ({exc}); '
+                'rerunning the dense projection path once.'
+            )
+
     if bool(raw_bbox_nrrd_layers_enabled()) and str(view.family) == 'radial':
         expected_shape = (
             tuple(int(v) for v in projection_out_shape)
@@ -21385,28 +22828,6 @@ def materialize_nrrd_view_layer(
             )
             incremental_writer = None
             projection_block_callback = None
-
-    def _project_layer(
-        block_callback: Optional[Callable[[int, np.ndarray], None]],
-    ) -> np.ndarray:
-        return project_view_volume_to_orthogonal_volume(
-            view_volume_mm,
-            view,
-            raw_path,
-            desc=f'NRRD layer {key}',
-            workers=int(workers),
-            prefer_memory=bool(transient_projection_in_memory),
-            reserve_bytes=32 * GIB,
-            out_shape_tyx=projection_out_shape,
-            # v13.3.2 (R15): transverse layers headed for a raw-bbox store are encoded straight
-            # from the source volume (identity projection, synchronous encode) — no copy.
-            allow_transverse_passthrough=bool(raw_bbox_nrrd_layers_enabled()),
-            # v13.3.6 (D1): device-union row occupancy (radial views only; valid for the
-            # pre-interpolation layer, which is the only caller that supplies it).
-            known_row_occupancy=known_row_occupancy,
-            known_slice_bboxes=known_slice_bboxes,
-            projection_block_callback=block_callback,
-        )
 
     try:
         projected = _project_layer(projection_block_callback)
@@ -21474,46 +22895,18 @@ def materialize_nrrd_view_layer(
         segment_extent_source = 'raw_layer_materialization_scan'
         close_memmap_array(projected)
 
-    layer_ref = NrrdLayerRef(
-        key=key,
-        name=_nrrd_layer_name(
-            view=view,
-            source=str(source),
-            mask_kind=str(mask_kind),
-            pass_index=int(pass_index),
-            tile_acceptance=str(tile_acceptance),
-            stage=str(stage),
-        ),
-        path=out_path,
-        shape=(int(shape[0]), int(shape[1]), int(shape[2])),
-        dtype='uint8',
-        storage_format=storage_format,
-        model_name=str(model_name),
-        view_name=str(view.name),
-        view_family=str(view.family),
-        source=str(source),
-        mask_kind=str(mask_kind),
-        pass_index=int(pass_index),
-        tile_acceptance=str(tile_acceptance),
-        stage=str(stage),
-        description=str(description),
-        segment_extent_ijk=segment_extent,
-        segment_extent_shape_tyx=(int(shape[0]), int(shape[1]), int(shape[2])),
-        segment_extent_source=segment_extent_source,
+    layer_ref = _build_layer_ref(
+        (int(shape[0]), int(shape[1]), int(shape[2])),
+        segment_extent,
+        segment_extent_source,
+        storage_format,
     )
-    sink = nrrd_layer_sink()
-    if sink is not None:
-        sink.submit_layer(
-            layer_ref,
-            nrrd_layer_output_suffix(
-                view_token=view_output_token(view),
-                source=str(source),
-                mask_kind=str(mask_kind),
-                pass_index=int(pass_index),
-                tile_acceptance=str(tile_acceptance),
-                stage=str(stage),
-            ),
-        )
+    if pending_reservation is not None:
+        # v13.3.14 (N2): the fused write was abandoned — fulfill the reserved identity
+        # through the established post-hoc combined write instead of a new suffix.
+        pending_reservation.submit_fallback(layer_ref)
+    elif sink is not None:
+        sink.submit_layer(layer_ref, suffix)
     return layer_ref
 
 def materialize_nrrd_global_layer(
@@ -24391,9 +25784,38 @@ def nrrd_gpu_deflate_enabled() -> bool:
     return _env_flag('YOLO_TTA_NRRD_GPU_DEFLATE', True)
 
 
+def nrrd_gpu_deflate_conservative() -> bool:
+    """v13.3.14 (N6): conservative member-size/drain mode.
+
+    Restores the v13.3.13 behavior exactly: 64 KiB gzip members, per-chunk CRC futures,
+    a full pending drain inside every ``write()`` call, per-member file writes, and the
+    unconditional post-H2D compatibility synchronization.
+    """
+    return _env_flag('YOLO_TTA_NRRD_GPU_DEFLATE_CONSERVATIVE', False)
+
+
 def nrrd_gpu_deflate_chunk_bytes() -> int:
-    """Uncompressed bytes per gzip member (also nvCOMP's per-chunk unit)."""
-    return max(16 * 1024, _env_int('YOLO_TTA_NRRD_GPU_DEFLATE_CHUNK_KIB', 64) * 1024)
+    """Uncompressed bytes per gzip member (also nvCOMP's per-chunk unit).
+
+    v13.3.14 (N6): the default rises from 64 KiB to 1 MiB — a 17 GiB logical layer held
+    ~278k chunk/member/CRC/write objects per layer at 64 KiB. The engine's one-time
+    autotune (below) may further choose 1-4 MiB; YOLO_TTA_NRRD_GPU_DEFLATE_CHUNK_KIB
+    pins an explicit size and YOLO_TTA_NRRD_GPU_DEFLATE_CONSERVATIVE=1 restores 64 KiB.
+    """
+    if nrrd_gpu_deflate_conservative():
+        default_kib = 64
+    else:
+        default_kib = 1024
+    return max(16 * 1024, _env_int('YOLO_TTA_NRRD_GPU_DEFLATE_CHUNK_KIB', default_kib) * 1024)
+
+
+def _nrrd_gpu_deflate_chunk_env_pinned() -> bool:
+    return bool(os.environ.get('YOLO_TTA_NRRD_GPU_DEFLATE_CHUNK_KIB', '').strip())
+
+
+def nrrd_gpu_deflate_autotune_enabled() -> bool:
+    """v13.3.14 (N6): benchmark 1/2/4 MiB members once per device (skipped when pinned)."""
+    return _env_flag('YOLO_TTA_NRRD_GPU_DEFLATE_AUTOTUNE', True) and not nrrd_gpu_deflate_conservative()
 
 
 def nrrd_gpu_deflate_batch_bytes() -> int:
@@ -24403,6 +25825,41 @@ def nrrd_gpu_deflate_batch_bytes() -> int:
 
 def nrrd_gpu_deflate_streams() -> int:
     return max(1, _env_int('YOLO_TTA_NRRD_GPU_DEFLATE_STREAMS', 2))
+
+
+def nrrd_gpu_deflate_persistent() -> bool:
+    """v13.3.14 (N6): retain pending encode windows across ``write()`` calls.
+
+    The v13.3.13 writer drained its whole local deque before returning from every
+    ``write()``, so consecutive 8-16 MiB sparse-cvol members never pipelined across the
+    engine's two owner lanes. Persistent mode copies each window into a preallocated
+    pinned arena (so the caller's buffer is immediately reusable), keeps up to
+    2 x stream_count windows in flight across calls, and flushes on close/backpressure.
+    YOLO_TTA_NRRD_GPU_DEFLATE_PERSISTENT=0 (or conservative mode) restores per-call drains.
+    """
+    return (
+        _env_flag('YOLO_TTA_NRRD_GPU_DEFLATE_PERSISTENT', True)
+        and not nrrd_gpu_deflate_conservative()
+    )
+
+
+def nrrd_gpu_deflate_stream_aware() -> bool:
+    """v13.3.14 (N6): skip the post-H2D compatibility sync on stream-bound nvCOMP builds.
+
+    Applies only when BOTH the Codec constructor and as_array accepted explicit
+    cuda_stream keywords (so every operation is ordered on the owner lane's stream) and
+    the round-trip self-test passed with the skip active. Conservative mode forces the sync.
+    """
+    return (
+        _env_flag('YOLO_TTA_NRRD_GPU_DEFLATE_STREAM_AWARE', True)
+        and not nrrd_gpu_deflate_conservative()
+    )
+
+
+def nrrd_gpu_deflate_zero_member_bytes() -> int:
+    """v13.3.14 (N6): cached all-zero gzip member size for zero runs (was chunk-sized)."""
+    mib = int(np.clip(_env_int('YOLO_TTA_NRRD_GPU_DEFLATE_ZERO_MEMBER_MIB', 64), 1, 256))
+    return int(mib) * 1024 * 1024
 
 
 def _configured_nrrd_gpu_deflate_devices(torch_mod: object) -> List[int]:
@@ -24428,6 +25885,9 @@ def _configured_nrrd_gpu_deflate_devices(torch_mod: object) -> List[int]:
 
 
 _NRRD_GPU_DEFLATE_POST_DRAIN = threading.Event()
+# v13.3.14 (N6): per-device member-size autotune results survive engine rebuilds.
+_NRRD_GPU_DEFLATE_AUTOTUNE_CHUNK: Dict[int, int] = {}
+_NRRD_GPU_DEFLATE_AUTOTUNE_LOCK = threading.Lock()
 
 
 def mark_nrrd_gpu_deflate_post_inference() -> None:
@@ -24467,9 +25927,28 @@ class _NvcompDeflateEngine:
         self._device_gzip_probe_lock = threading.Lock()
         self._device_gzip_supported: Optional[bool] = None
         self._device_gzip_reason = 'not probed'
+        # v13.3.14 (N6): writer-facing pinned window arenas — two per owner lane, sized to
+        # the batch window, shared by every writer on this engine (acquire blocks, which is
+        # the persistent writer's byte backpressure). Device-input and pinned-output arenas
+        # are per-lane thread-locals created on first owner use.
+        self._pinned_pool_lock = threading.Lock()
+        self._pinned_pool_cond = threading.Condition(self._pinned_pool_lock)
+        self._pinned_pool: List[object] = []
+        self._pinned_pool_built = 0
+        self._pinned_pool_cap = 2 * int(self.stream_count)
+        self._pinned_pool_bytes = int(nrrd_gpu_deflate_batch_bytes())
+        self._pinned_pool_broken = False
+        # v13.3.14 (N6): one-time 1/2/4 MiB member-size autotune result (None = not run).
+        self._autotune_lock = threading.Lock()
+        self._preferred_chunk_bytes: Optional[int] = None
 
-    def _make_codec(self, stream: object) -> object:
-        """Construct a Codec on (and only for) its eventual owner thread."""
+    def _make_codec(self, stream: object) -> Tuple[object, bool]:
+        """Construct a Codec on (and only for) its eventual owner thread.
+
+        Returns ``(codec, stream_bound)`` — stream_bound is True only when the accepted
+        constructor keywords included this lane's explicit ``cuda_stream`` (v13.3.14 N6:
+        the precondition for skipping the post-H2D compatibility synchronization).
+        """
         nvcomp = self.nvcomp
         last_exc: Optional[BaseException] = None
         for algo_name in ('Deflate', 'deflate'):
@@ -24495,7 +25974,7 @@ class _NvcompDeflateEngine:
             ])
             for kwargs in effort_candidates:
                 try:
-                    return nvcomp.Codec(**kwargs)
+                    return nvcomp.Codec(**kwargs), bool('cuda_stream' in kwargs)
                 except Exception as exc:
                     last_exc = exc
         raise RuntimeError(f'nvcomp Codec construction failed ({last_exc})')
@@ -24507,10 +25986,136 @@ class _NvcompDeflateEngine:
             torch = self.torch
             with torch.cuda.device(self.device):
                 stream = torch.cuda.Stream(device=self.device)
-                codec = self._make_codec(stream)
+                codec, stream_bound = self._make_codec(stream)
             lane = (stream, codec)
             self._owner_local.lane = lane
+            self._owner_local.codec_stream_bound = bool(stream_bound)
+            # None = not yet probed; set False on the first as_array TypeError fallback.
+            self._owner_local.as_array_stream_ok = None
         return lane
+
+    def _owner_arenas(self, need_bytes: int) -> Optional[Dict[str, object]]:
+        """v13.3.14 (N6): per-lane persistent device-input / pinned-output arenas.
+
+        Owner threads are lane-exclusive, and every owned call fully synchronizes its
+        stream before returning bytes, so the arenas are free for reuse whenever the next
+        owned call starts. Returns None (per-call allocation fallback) when the window
+        exceeds the configured batch size or the one-time arena allocation failed.
+        """
+        if int(need_bytes) > int(self._pinned_pool_bytes):
+            return None
+        arenas = getattr(self._owner_local, 'arenas', None)
+        if arenas is False:
+            return None
+        if arenas is None:
+            torch = self.torch
+            try:
+                with torch.cuda.device(self.device):
+                    dev_in = torch.empty(
+                        (int(self._pinned_pool_bytes),), dtype=torch.uint8, device=self.device,
+                    )
+                    pinned_out = torch.empty(
+                        (int(self._pinned_pool_bytes) + 16 * 1024 * 1024,),
+                        dtype=torch.uint8, pin_memory=True,
+                    )
+                arenas = {'dev_in': dev_in, 'pinned_out': pinned_out, 'pinned_out_np': pinned_out.numpy()}
+                self._owner_local.arenas = arenas
+            except Exception:
+                self._owner_local.arenas = False
+                return None
+        return arenas
+
+    def acquire_pinned_window(self, timeout: Optional[float] = None) -> Optional[object]:
+        """Check one batch-sized pinned input arena out of the engine pool (blocking).
+
+        Returns a torch pinned uint8 tensor of ``nrrd_gpu_deflate_batch_bytes()`` elements
+        or None when pinned memory is unavailable. Release via release_pinned_window.
+        """
+        deadline = None if timeout is None else time.monotonic() + float(timeout)
+        with self._pinned_pool_cond:
+            while True:
+                if self._pinned_pool:
+                    return self._pinned_pool.pop()
+                if self._pinned_pool_broken:
+                    return None
+                if int(self._pinned_pool_built) < int(self._pinned_pool_cap):
+                    self._pinned_pool_built += 1
+                    break  # allocate outside the lock
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                if remaining is not None and remaining <= 0.0:
+                    return None
+                self._pinned_pool_cond.wait(timeout=remaining)
+        try:
+            tensor = self.torch.empty(
+                (int(self._pinned_pool_bytes),), dtype=self.torch.uint8, pin_memory=True,
+            )
+            return tensor
+        except Exception:
+            with self._pinned_pool_cond:
+                self._pinned_pool_built -= 1
+                self._pinned_pool_broken = True
+                self._pinned_pool_cond.notify_all()
+            return None
+
+    def release_pinned_window(self, tensor: object) -> None:
+        if tensor is None:
+            return
+        with self._pinned_pool_cond:
+            self._pinned_pool.append(tensor)
+            self._pinned_pool_cond.notify()
+
+    def preferred_chunk_bytes(self) -> int:
+        """v13.3.14 (N6): member size — env-pinned, else a one-time 1/2/4 MiB benchmark.
+
+        The result is cached per DEVICE in module state (stream-count upgrades construct
+        new engine instances for the same GPU and must not re-pay the ~192 MiB benchmark).
+        """
+        configured = int(nrrd_gpu_deflate_chunk_bytes())
+        if _nrrd_gpu_deflate_chunk_env_pinned() or not nrrd_gpu_deflate_autotune_enabled():
+            return configured
+        with self._autotune_lock:
+            if self._preferred_chunk_bytes is not None:
+                return int(self._preferred_chunk_bytes)
+            with _NRRD_GPU_DEFLATE_AUTOTUNE_LOCK:
+                cached = _NRRD_GPU_DEFLATE_AUTOTUNE_CHUNK.get(int(self.device_index))
+            if cached is not None:
+                self._preferred_chunk_bytes = int(cached)
+                return int(cached)
+            best = configured
+            try:
+                probe_total = 64 * 1024 * 1024
+                payload = _nrrd_deflate_benchmark_payload(probe_total)  # type: ignore[name-defined]
+                candidates = [1 * 1024 * 1024, 2 * 1024 * 1024, 4 * 1024 * 1024]
+                best_rate = -1.0
+                for chunk in candidates:
+                    spans = [
+                        (off, min(chunk, probe_total - off))
+                        for off in range(0, probe_total, chunk)
+                    ]
+                    # Warm the lane once, then time one full window per candidate.
+                    self._owner_pool.submit(
+                        self._compress_window_owned, payload[: 2 * chunk], [(0, chunk), (chunk, chunk)],
+                    ).result()
+                    t0 = time.perf_counter()
+                    self._owner_pool.submit(
+                        self._compress_window_owned, payload, spans,
+                    ).result()
+                    rate = float(probe_total) / max(1.0e-9, time.perf_counter() - t0)
+                    if rate > best_rate:
+                        best_rate = rate
+                        best = int(chunk)
+                if best != configured:
+                    print(
+                        f'v13.3.14 (N6): nvCOMP member autotune on cuda:{self.device_index} '
+                        f'chose {best // (1024 * 1024)} MiB members '
+                        f'({best_rate / (1024 ** 3):.1f} GiB/s uncompressed).'
+                    )
+            except Exception:
+                best = configured
+            self._preferred_chunk_bytes = int(best)
+            with _NRRD_GPU_DEFLATE_AUTOTUNE_LOCK:
+                _NRRD_GPU_DEFLATE_AUTOTUNE_CHUNK[int(self.device_index)] = int(best)
+            return int(best)
 
     def _make_complete_gzip_codec(self, stream: object) -> object:
         """Construct a codec that emits a COMPLETE RFC-1952 gzip member.
@@ -24711,12 +26316,22 @@ class _NvcompDeflateEngine:
         return self.submit_compress_window(window_np, spans).result()
 
     def submit_compress_window(
-        self, window_np: np.ndarray, spans: List[Tuple[int, int]],
+        self,
+        window_np: np.ndarray,
+        spans: List[Tuple[int, int]],
+        *,
+        pinned_host: Optional[object] = None,
     ) -> Future:
-        """Queue one window without blocking, enabling two-lane next-window overlap."""
+        """Queue one window without blocking, enabling two-lane next-window overlap.
+
+        v13.3.14 (N6): ``pinned_host`` (an engine pool tensor whose leading bytes already
+        hold the window) skips the owned call's per-window pinned allocation and staging copy.
+        """
         if _NRRD_GPU_DEFLATE_DEVICE_STATE.get(int(self.device_index), True) is False:
             raise RuntimeError(f'cuda:{int(self.device_index)} GPU deflate engine is disabled')
-        return self._owner_pool.submit(self._compress_window_owned, window_np, spans)
+        return self._owner_pool.submit(
+            self._compress_window_owned, window_np, spans, pinned_host,
+        )
 
     def validate_lanes(self, payload: np.ndarray) -> List[bytes]:
         """Force every lazy owner lane to construct and raw-deflate a test payload."""
@@ -24741,40 +26356,81 @@ class _NvcompDeflateEngine:
             self._owner_pool.shutdown(wait=bool(wait_for_lanes))
 
     def _compress_window_owned(
-        self, window_np: np.ndarray, spans: List[Tuple[int, int]],
+        self,
+        window_np: np.ndarray,
+        spans: List[Tuple[int, int]],
+        pinned_host: Optional[object] = None,
     ) -> List[bytes]:
-        """Owner-thread implementation; a Codec never crosses a thread boundary."""
+        """Owner-thread implementation; a Codec never crosses a thread boundary.
+
+        v13.3.14 (N6): the per-window pinned staging tensor, the fresh device tensor, the
+        unconditional post-H2D synchronization, and the per-chunk pinned output tensors are
+        all replaced on the fast path — writer-supplied pool arenas stage the input, each
+        lane owns one persistent device-input and pinned-output arena, and the H2D sync is
+        skipped when this lane's Codec AND as_array are both bound to the lane stream
+        (see nrrd_gpu_deflate_stream_aware; the round-trip self-test validates the skip).
+        """
         torch = self.torch
         nvcomp = self.nvcomp
-        if not window_np.flags.writeable:
-            window_np = window_np.copy()  # torch.from_numpy rejects read-only sources
-        window_np = np.ascontiguousarray(window_np, dtype=np.uint8)
+        window_bytes = int(np.asarray(window_np).size)
         stream, codec = self._owner_lane()
+        arenas = self._owner_arenas(window_bytes)
         with torch.cuda.device(self.device):
             with torch.cuda.stream(stream):
-                # One pinned host staging copy and ONE nonblocking H2D per window.
-                host = torch.empty((int(window_np.size),), dtype=torch.uint8, pin_memory=True)
-                np.copyto(host.numpy(), window_np)
-                dev = host.to(self.device, non_blocking=True)
+                if pinned_host is not None:
+                    host = pinned_host
+                else:
+                    if not window_np.flags.writeable:
+                        window_np = window_np.copy()  # torch.from_numpy rejects read-only sources
+                    window_np = np.ascontiguousarray(window_np, dtype=np.uint8)
+                    # One pinned host staging copy and ONE nonblocking H2D per window.
+                    host = torch.empty((int(window_np.size),), dtype=torch.uint8, pin_memory=True)
+                    np.copyto(host.numpy(), window_np)
+                if arenas is not None:
+                    dev = arenas['dev_in'][:window_bytes]
+                    dev.copy_(host[:window_bytes], non_blocking=True)
+                else:
+                    dev = host[:window_bytes].to(self.device, non_blocking=True)
                 # Older nvCOMP bindings may reject both Codec(cuda_stream=...) and
                 # as_array(cuda_stream=...). Completing H2D here keeps that compatibility
-                # path correct; separate owner lanes still overlap transfer/encode.
-                stream.synchronize()
+                # path correct; stream-bound builds skip it (v13.3.14 N6) because the copy,
+                # as_array registration, and encode are all ordered on this lane stream.
+                stream_aware = (
+                    nrrd_gpu_deflate_stream_aware()
+                    and bool(getattr(self._owner_local, 'codec_stream_bound', False))
+                    and getattr(self._owner_local, 'as_array_stream_ok', None) is not False
+                )
+                if not stream_aware:
+                    stream.synchronize()
                 arrays: List[object] = []
                 for off, ln in spans:
                     try:
                         arrays.append(nvcomp.as_array(
                             dev[int(off):int(off) + int(ln)], cuda_stream=int(stream.cuda_stream),
                         ))
+                        if getattr(self._owner_local, 'as_array_stream_ok', None) is None:
+                            self._owner_local.as_array_stream_ok = True
                     except TypeError:
+                        if getattr(self._owner_local, 'as_array_stream_ok', None) is not False:
+                            self._owner_local.as_array_stream_ok = False
+                            if stream_aware:
+                                # This lane was admitted stream-aware but as_array is not
+                                # stream-capable after all: order the pending H2D now.
+                                stream.synchronize()
+                                stream_aware = False
                         arrays.append(nvcomp.as_array(dev[int(off):int(off) + int(ln)]))
                 encoded = codec.encode(arrays)
                 if not isinstance(encoded, (list, tuple)):
                     encoded = [encoded]
 
-                # Feature-detect zero-copy DLPack output and queue every tiny D2H into pinned
-                # buffers. One stream sync precedes bytes conversion.
+                # Feature-detect zero-copy DLPack output and queue every tiny D2H into a
+                # persistent pinned arena (per-chunk pinned tensors on the fallback path).
+                # One stream sync precedes bytes conversion.
+                out_spans: List[Tuple[int, int]] = []
                 pinned_out: List[object] = []
+                arena_out = None if arenas is None else arenas['pinned_out']
+                arena_out_np = None if arenas is None else arenas['pinned_out_np']
+                arena_used = 0
                 async_ok = True
                 try:
                     for enc in encoded:
@@ -24782,14 +26438,33 @@ class _NvcompDeflateEngine:
                             enc_t = torch.from_dlpack(enc)
                         except AttributeError:  # older torch
                             enc_t = torch.utils.dlpack.from_dlpack(enc)
-                        host_enc = torch.empty_like(enc_t, device='cpu', pin_memory=True)
-                        host_enc.copy_(enc_t, non_blocking=True)
-                        pinned_out.append(host_enc)
+                        enc_len = int(enc_t.numel())
+                        if (
+                            arena_out is not None
+                            and int(arena_used) + enc_len <= int(arena_out.shape[0])
+                            and enc_t.dtype == torch.uint8
+                        ):
+                            arena_out[int(arena_used):int(arena_used) + enc_len].copy_(
+                                enc_t.reshape(-1), non_blocking=True,
+                            )
+                            out_spans.append((int(arena_used), enc_len))
+                            pinned_out.append(None)
+                            arena_used += enc_len
+                        else:
+                            host_enc = torch.empty_like(enc_t, device='cpu', pin_memory=True)
+                            host_enc.copy_(enc_t, non_blocking=True)
+                            out_spans.append((-1, enc_len))
+                            pinned_out.append(host_enc)
                 except Exception:
                     async_ok = False
                 stream.synchronize()
                 if async_ok and len(pinned_out) == len(encoded):
-                    out = [bytes(np.asarray(host_enc.numpy())) for host_enc in pinned_out]
+                    out = []
+                    for (arena_off, enc_len), host_enc in zip(out_spans, pinned_out):
+                        if arena_off >= 0:
+                            out.append(bytes(arena_out_np[int(arena_off):int(arena_off) + int(enc_len)]))
+                        else:
+                            out.append(bytes(np.asarray(host_enc.numpy())))
                 else:
                     # Correct compatibility fallback for bindings without DLPack.
                     out = [bytes(np.asarray(enc.cpu())) for enc in encoded]
@@ -24893,13 +26568,46 @@ def _zero_gzip_member(length: int) -> bytes:
     return member
 
 
+def _write_zero_gzip_members(fh: object, nbytes: int, *, member_bytes: Optional[int] = None) -> int:
+    """v13.3.14 (N6): emit a zero run as few LARGE cached members instead of 64 KiB units.
+
+    A 17 GiB empty band previously wrote ~278k cached 64 KiB members (and as many
+    fh.write calls). The default zero member is nrrd_gpu_deflate_zero_member_bytes()
+    (64 MiB) plus at most one cached tail member per distinct tail length; deflate of an
+    all-zero buffer at level 1 is a one-time ~1000:1 encode per distinct length.
+    Returns the compressed byte count written.
+    """
+    step = int(member_bytes) if member_bytes else int(nrrd_gpu_deflate_zero_member_bytes())
+    step = max(64 * 1024, int(step))
+    remaining = int(nbytes)
+    written = 0
+    while remaining > 0:
+        ln = min(int(step), int(remaining))
+        member = _zero_gzip_member(int(ln))
+        fh.write(member)
+        written += len(member)
+        remaining -= int(ln)
+    return int(written)
+
+
 class _GpuDeflatePayloadWriter:
     """File-like gzip encoder whose DEFLATE runs on the GPU (nvCOMP), one member per chunk.
 
-    ``write(data)`` returns only after every member of the call is written — the same
-    blocking contract as the writers it can replace. All-zero chunks are served from a
-    cached prebuilt member; nonzero chunks batch-encode on the GPU while their CRC32s
-    run on the shared host pool.
+    v13.3.13 semantics: ``write(data)`` returned only after every member of the call was
+    written, so consecutive sparse-cvol members (8-16 MiB, smaller than the 256 MiB GPU
+    batch) never pipelined across the engine's owner lanes.
+
+    v13.3.14 (N6): in persistent mode (default) each window is copied ONCE into an engine
+    pinned arena — the caller's buffer is immediately reusable — and up to
+    2 x stream_count windows stay in flight ACROSS ``write()``/``write_zeros()`` calls.
+    Output order is preserved by a single instance-level pending queue (zero runs enqueue
+    as ordered items and emit large cached members at drain). Windows still become file
+    bytes atomically: no I/O happens for a window until every GPU/CRC result is known, so
+    a mid-file GPU failure re-encodes that window (and everything after it) through the
+    ordered CPU fallback with no partially written member. ``close()`` drains everything.
+    Per-window CRC work runs as ONE batched pool task (v13.3.13 submitted one Future per
+    64 KiB chunk), and each window's members reach the file as ONE joined write.
+    YOLO_TTA_NRRD_GPU_DEFLATE_PERSISTENT=0 / _CONSERVATIVE=1 restore per-call drains.
     """
 
     def __init__(
@@ -24913,16 +26621,27 @@ class _GpuDeflatePayloadWriter:
     ) -> None:
         self.fh = fh
         self.engine = engine
-        self.chunk_bytes = int(nrrd_gpu_deflate_chunk_bytes())
+        self.chunk_bytes = int(engine.preferred_chunk_bytes())
         self.batch_bytes = max(self.chunk_bytes, int(nrrd_gpu_deflate_batch_bytes()))
         _backend, _factory, crc_fn, _full_flush, _lvl = _nrrd_deflate_backend()
         self.crc_fn = crc_fn
         self.closed = False
         self.compressed_bytes = 0
+        self.zero_members = 0
+        self.nonzero_members = 0
         self.allow_cpu_fallback = bool(allow_cpu_fallback)
         self.fallback_threads = None if fallback_threads is None else max(1, int(fallback_threads))
         self.fallback_member_executor = fallback_member_executor
         self._cpu_fallback: Optional[object] = None
+        self.persistent = bool(nrrd_gpu_deflate_persistent())
+        self._pending: deque = deque()
+        self._max_pending = max(2, 2 * int(self.engine.stream_count))
+
+    def _release_lease(self, work: Dict[str, object]) -> None:
+        lease = work.get('lease')
+        if lease is not None:
+            work['lease'] = None
+            self.engine.release_pinned_window(lease)
 
     def _prepare_window(
         self,
@@ -24930,6 +26649,8 @@ class _GpuDeflatePayloadWriter:
         executor: ThreadPoolExecutor,
         *,
         known_nonzero: bool = False,
+        batch_crc: bool = False,
+        lease: Optional[object] = None,
     ) -> Dict[str, object]:
         spans: List[Tuple[int, int]] = []
         chunk_meta: List[Tuple[int, bool]] = []
@@ -24942,27 +26663,47 @@ class _GpuDeflatePayloadWriter:
             # instead of rescanning it merely to find zero-only gaps.
             if not bool(known_nonzero) and not chunk.any():
                 chunk_meta.append((ln, True))
-                crc_futs.append(None)
+                if not batch_crc:
+                    crc_futs.append(None)
                 continue
             chunk_meta.append((ln, False))
             spans.append((int(off), int(ln)))
-            # v13.3.11: do not hand a NumPy array directly to python-isal's crc32.
-            # Every GPU returning CRC 0 was a host argument bug, not four bad encoders.
-            crc_futs.append(executor.submit(
-                _crc32_byteslike, self.crc_fn, memoryview(chunk).cast('B'),
-            ))
+            if not batch_crc:
+                # v13.3.11: do not hand a NumPy array directly to python-isal's crc32.
+                # Every GPU returning CRC 0 was a host argument bug, not four bad encoders.
+                crc_futs.append(executor.submit(
+                    _crc32_byteslike, self.crc_fn, memoryview(chunk).cast('B'),
+                ))
         work: Dict[str, object] = {
+            'kind': 'window',
             'window': window,
             'spans': spans,
             'chunk_meta': chunk_meta,
             'crc_futs': crc_futs,
+            'crc_batch': None,
             'compression': None,
             'known_nonzero': bool(known_nonzero),
+            'lease': lease,
         }
+        if batch_crc and spans:
+            # v13.3.14 (N6): one pool task computes every span CRC of this window in order.
+            # Windows themselves run concurrently, so aggregate CRC parallelism is intact
+            # while the per-64KiB Future/dispatch overhead (~278k objects for a 17 GiB
+            # layer) collapses to one object per 256 MiB window. The window memory is the
+            # engine arena lease (or an owned copy), so it is stable until drained.
+            crc_fn = self.crc_fn
+            span_list = list(spans)
+
+            def _crc_all(_win: np.ndarray = window) -> List[int]:
+                return [
+                    int(_crc32_byteslike(crc_fn, memoryview(_win[off:off + ln]).cast('B'))) & 0xFFFFFFFF
+                    for off, ln in span_list
+                ]
+
+            work['crc_batch'] = executor.submit(_crc_all)
         return work
 
-    @staticmethod
-    def _settle_work(work: Dict[str, object]) -> None:
+    def _settle_work(self, work: Dict[str, object]) -> None:
         comp = work.get('compression')
         if isinstance(comp, Future):
             try:
@@ -24975,12 +26716,19 @@ class _GpuDeflatePayloadWriter:
                     fut.result()
                 except BaseException:
                     pass
+        crc_batch = work.get('crc_batch')
+        if isinstance(crc_batch, Future):
+            try:
+                crc_batch.result()
+            except BaseException:
+                pass
 
     def _activate_cpu_fallback(self, exc: BaseException) -> None:
         if not self.allow_cpu_fallback:
             raise exc
         if self._cpu_fallback is None:
             _blacklist_nrrd_gpu_deflate_engine(self.engine, exc)
+            tele_add('nrrd.gpu_deflate_fallback')
             # Defined later in the module; preserve the configured/validated CPU tier order
             # (member -> single-member -> pigz) instead of bypassing disable flags/self-tests.
             self._cpu_fallback = _open_nrrd_cpu_payload_writer(  # type: ignore[name-defined]
@@ -24998,41 +26746,173 @@ class _GpuDeflatePayloadWriter:
                 return int(write_known(data))
         return int(self._cpu_fallback.write(data))  # type: ignore[union-attr]
 
+    def _fallback_write_work(self, work: Dict[str, object]) -> None:
+        """Route one settled pending item through the ordered CPU fallback."""
+        try:
+            if str(work.get('kind')) == 'zeros':
+                self._cpu_fallback.write_zeros(int(work['nbytes']))  # type: ignore[union-attr]
+            else:
+                self._write_cpu_fallback(
+                    memoryview(work['window']).cast('B'),  # type: ignore[arg-type]
+                    known_nonzero=bool(work.get('known_nonzero', False)),
+                )
+        finally:
+            self._release_lease(work)
+
+    def _drain_pending_via_fallback(self) -> None:
+        while self._pending:
+            later = self._pending.popleft()
+            self._settle_work(later)
+            self._fallback_write_work(later)
+
     def _write_work(self, work: Dict[str, object]) -> bool:
-        """Finish one ordered GPU window; return False when it was retried on CPU."""
+        """Finish one ordered pending item; return False when it was retried on CPU."""
+        if str(work.get('kind')) == 'zeros':
+            written = _write_zero_gzip_members(self.fh, int(work['nbytes']))
+            self.compressed_bytes += int(written)
+            self.zero_members += 1
+            return True
         try:
             spans: List[Tuple[int, int]] = work['spans']  # type: ignore[assignment]
             comp = work.get('compression')
             raw_streams = comp.result() if isinstance(comp, Future) else []
             if len(raw_streams) != len(spans):
                 raise RuntimeError('nvcomp returned a mismatched stream count')
-            crc_values: List[Optional[int]] = []
-            for fut in work['crc_futs']:  # type: ignore[union-attr]
-                crc_values.append(None if fut is None else int(fut.result()) & 0xFFFFFFFF)
+            crc_batch = work.get('crc_batch')
+            if isinstance(crc_batch, Future):
+                span_crcs = list(crc_batch.result())
+                if len(span_crcs) != len(spans):
+                    raise RuntimeError('batched CRC returned a mismatched span count')
+                crc_iter = iter(span_crcs)
+                crc_values: List[Optional[int]] = [
+                    None if is_zero else int(next(crc_iter)) & 0xFFFFFFFF
+                    for (_ln, is_zero) in work['chunk_meta']  # type: ignore[union-attr]
+                ]
+            elif work.get('crc_futs'):
+                crc_values = []
+                for fut in work['crc_futs']:  # type: ignore[union-attr]
+                    crc_values.append(None if fut is None else int(fut.result()) & 0xFFFFFFFF)
+            else:
+                # Batch-CRC window whose every chunk is zero: no spans, no CRC task —
+                # the member loop below must still emit one cached zero member per chunk.
+                crc_values = [None] * len(work['chunk_meta'])  # type: ignore[arg-type]
             stream_iter = iter(raw_streams)
             members: List[bytes] = []
             for ((ln, is_zero), crc_value) in zip(work['chunk_meta'], crc_values):  # type: ignore[arg-type]
                 if is_zero:
                     members.append(_zero_gzip_member(int(ln)))
+                    self.zero_members += 1
                 else:
                     members.append(_gzip_member_from_raw_stream(
                         next(stream_iter), int(crc_value), int(ln),
                     ))
+                    self.nonzero_members += 1
         except Exception as exc:
             self._settle_work(work)
             self._activate_cpu_fallback(exc)
-            self._write_cpu_fallback(
-                memoryview(work['window']).cast('B'),  # type: ignore[arg-type]
-                known_nonzero=bool(work.get('known_nonzero', False)),
-            )
+            self._fallback_write_work(work)
             return False
 
         # No I/O occurs until every GPU/CRC result for the window is known. An I/O error is
         # propagated (retrying after a partial file write could duplicate valid members).
-        for member in members:
-            self.fh.write(member)
-            self.compressed_bytes += len(member)
+        # v13.3.14 (N6): one joined write per window instead of one write per member.
+        self._release_lease(work)
+        joined = members[0] if len(members) == 1 else b''.join(members)
+        self.fh.write(joined)
+        self.compressed_bytes += len(joined)
         return True
+
+    def _drain_head(self) -> None:
+        """Write the oldest pending item; on CPU retry, flush the whole queue in order."""
+        head = self._pending.popleft()
+        ok = self._write_work(head)
+        if not ok:
+            self._drain_pending_via_fallback()
+
+    def _drain_completed_heads(self) -> None:
+        """Opportunistically retire finished head windows without blocking."""
+        while self._pending and self._cpu_fallback is None:
+            head = self._pending[0]
+            if str(head.get('kind')) == 'zeros':
+                self._drain_head()
+                continue
+            comp = head.get('compression')
+            crc_batch = head.get('crc_batch')
+            if isinstance(comp, Future) and not comp.done():
+                break
+            if isinstance(crc_batch, Future) and not crc_batch.done():
+                break
+            self._drain_head()
+
+    def flush_pending(self) -> None:
+        """Drain every queued window/zero-run to the file, preserving order."""
+        if self._cpu_fallback is not None:
+            self._drain_pending_via_fallback()
+            return
+        while self._pending:
+            self._drain_head()
+
+    def _enqueue_persistent_window(
+        self,
+        buf: np.ndarray,
+        w0: int,
+        w1: int,
+        executor: ThreadPoolExecutor,
+        *,
+        known_nonzero: bool,
+    ) -> None:
+        n = int(w1 - w0)
+        # Never block indefinitely on the shared arena pool while this writer's own
+        # pending queue holds leases — draining our head frees exactly those. Concurrent
+        # sink writers share one 2-per-lane pool, so a short bounded wait then a plain
+        # owned copy keeps every writer deadlock-free under pool exhaustion.
+        lease = self.engine.acquire_pinned_window(timeout=0.05)
+        while lease is None and self._pending and self._cpu_fallback is None:
+            self._drain_head()
+            lease = self.engine.acquire_pinned_window(timeout=0.05)
+        if self._cpu_fallback is not None:
+            # A blocking drain above hit a GPU failure and activated the ordered CPU
+            # fallback: this window must follow it, never re-enter the GPU queue.
+            if lease is not None:
+                self.engine.release_pinned_window(lease)
+            self._drain_pending_via_fallback()
+            self._write_cpu_fallback(
+                memoryview(buf[w0:w1]).cast('B'), known_nonzero=bool(known_nonzero),
+            )
+            return
+        if lease is None:
+            lease = self.engine.acquire_pinned_window(timeout=2.0)
+        if lease is not None:
+            lease_np = lease.numpy()
+            np.copyto(lease_np[:n], buf[w0:w1])
+            window = lease_np[:n]
+        else:
+            # Pinned memory unavailable: own the bytes with a plain copy so the caller's
+            # buffer stays immediately reusable (the persistent-queue contract).
+            window = np.array(buf[w0:w1], dtype=np.uint8, copy=True)
+        work = self._prepare_window(
+            window, executor, known_nonzero=bool(known_nonzero),
+            batch_crc=True, lease=lease,
+        )
+        try:
+            if work['spans']:
+                work['compression'] = self.engine.submit_compress_window(
+                    window, work['spans'],
+                    pinned_host=lease,
+                )
+        except Exception as exc:
+            # Another writer may have blacklisted this device between windows. Earlier
+            # queued items still precede this one, so settle/write them first, in order
+            # (flush handles its own per-item CPU retries).
+            self._settle_work(work)
+            self.flush_pending()
+            self._activate_cpu_fallback(exc)
+            self._fallback_write_work(work)
+            return
+        self._pending.append(work)
+        self._drain_completed_heads()
+        while len(self._pending) > int(self._max_pending) and self._cpu_fallback is None:
+            self._drain_head()
 
     def _write_impl(
         self,
@@ -25048,12 +26928,29 @@ class _GpuDeflatePayloadWriter:
         if total <= 0:
             return 0
         if self._cpu_fallback is not None:
+            self._drain_pending_via_fallback()
             return self._write_cpu_fallback(mv, known_nonzero=bool(known_nonzero))
         buf = np.frombuffer(mv, dtype=np.uint8)
         executor = _nrrd_gzip_executor()
+
+        if self.persistent:
+            for w0 in range(0, total, self.batch_bytes):
+                if self._cpu_fallback is not None:
+                    # Order guard: anything still queued precedes this call's remainder.
+                    self._drain_pending_via_fallback()
+                    self._write_cpu_fallback(
+                        mv[w0:], known_nonzero=bool(known_nonzero),
+                    )
+                    return int(total)
+                w1 = min(total, w0 + self.batch_bytes)
+                self._enqueue_persistent_window(
+                    buf, int(w0), int(w1), executor, known_nonzero=bool(known_nonzero),
+                )
+            return int(total)
+
         pending: deque = deque()
-        # Keep up to stream_count consecutive windows in flight. Their owner-thread CUDA
-        # streams overlap H2D(next) with encode(current); output drains strictly in order.
+        # Conservative mode: keep up to stream_count consecutive windows in flight and
+        # drain them all before returning (the v13.3.13 per-call blocking contract).
         for w0 in range(0, total, self.batch_bytes):
             if self._cpu_fallback is not None:
                 self._write_cpu_fallback(
@@ -25079,10 +26976,7 @@ class _GpuDeflatePayloadWriter:
                         self._write_work(earlier)
                     else:
                         self._settle_work(earlier)
-                        self._write_cpu_fallback(
-                            memoryview(earlier['window']).cast('B'),  # type: ignore[arg-type]
-                            known_nonzero=bool(earlier.get('known_nonzero', False)),
-                        )
+                        self._fallback_write_work(earlier)
                 self._settle_work(work)
                 self._activate_cpu_fallback(exc)
                 self._write_cpu_fallback(
@@ -25098,20 +26992,14 @@ class _GpuDeflatePayloadWriter:
                     while pending:
                         later = pending.popleft()
                         self._settle_work(later)
-                        self._write_cpu_fallback(
-                            memoryview(later['window']).cast('B'),  # type: ignore[arg-type]
-                            known_nonzero=bool(later.get('known_nonzero', False)),
-                        )
+                        self._fallback_write_work(later)
         while pending:
             ok = self._write_work(pending.popleft())
             if not ok:
                 while pending:
                     later = pending.popleft()
                     self._settle_work(later)
-                    self._write_cpu_fallback(
-                        memoryview(later['window']).cast('B'),  # type: ignore[arg-type]
-                        known_nonzero=bool(later.get('known_nonzero', False)),
-                    )
+                    self._fallback_write_work(later)
                 break
         return int(total)
 
@@ -25123,26 +27011,37 @@ class _GpuDeflatePayloadWriter:
         return self._write_impl(data, known_nonzero=True)
 
     def write_zeros(self, nbytes: int) -> int:
-        """v13.3.7 (B5/N4): emit cached all-zero gzip members — no source reads, no GPU."""
+        """v13.3.7 (B5/N4): emit cached all-zero gzip members — no source reads, no GPU.
+
+        v13.3.14 (N6): zero runs enter the SAME ordered pending queue in persistent mode
+        (so they interleave correctly with in-flight windows) and emit few large cached
+        members (nrrd_gpu_deflate_zero_member_bytes) instead of one member per 64 KiB.
+        """
         if self.closed:
             raise RuntimeError('Cannot write to a closed GPU deflate payload stream')
+        if int(nbytes) <= 0:
+            return 0
         if self._cpu_fallback is not None:
+            self._drain_pending_via_fallback()
             return int(self._cpu_fallback.write_zeros(int(nbytes)))  # type: ignore[union-attr]
-        remaining = int(nbytes)
-        while remaining > 0:
-            ln = min(self.chunk_bytes, remaining)
-            member = _zero_gzip_member(int(ln))
-            self.fh.write(member)
-            self.compressed_bytes += len(member)
-            remaining -= int(ln)
+        if self.persistent:
+            self._pending.append({'kind': 'zeros', 'nbytes': int(nbytes)})
+            self._drain_completed_heads()
+            return int(nbytes)
+        written = _write_zero_gzip_members(self.fh, int(nbytes))
+        self.compressed_bytes += int(written)
+        self.zero_members += 1
         return int(nbytes)
 
     def close(self) -> None:
         if self.closed:
             return
-        if self._cpu_fallback is not None:
-            self._cpu_fallback.close()  # type: ignore[union-attr]
-        self.closed = True
+        try:
+            self.flush_pending()
+        finally:
+            if self._cpu_fallback is not None:
+                self._cpu_fallback.close()  # type: ignore[union-attr]
+            self.closed = True
 
     def __enter__(self) -> '_GpuDeflatePayloadWriter':
         return self
@@ -25151,6 +27050,12 @@ class _GpuDeflatePayloadWriter:
         if exc_type is None:
             self.close()
         else:
+            # The stream is already failing: settle in-flight GPU work and release arena
+            # leases without attempting further file writes.
+            while self._pending:
+                broken = self._pending.popleft()
+                self._settle_work(broken)
+                self._release_lease(broken)
             if self._cpu_fallback is not None:
                 self._cpu_fallback.__exit__(exc_type, exc, tb)  # type: ignore[union-attr]
             self.closed = True
@@ -26045,7 +27950,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.6-Ultra_v13.3.13_SLURM.py',
+        '# Complete NRRD file generated by Fable_v13.3.14_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -26399,36 +28304,87 @@ def write_single_layer_nrrd_from_ref(
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
+    write_started = time.monotonic()
     header = nrrd_slicer_header((out_t, out_h, out_w))
     seg_name = str(segment_name) if segment_name else _slicer_segment_name_for_out_path(out_path)
     seg_color = segment_color if segment_color is not None else slicer_segment_palette_color(seg_name)
     # v13.3.6 (N3): live-volume layers defer the segment-extent scan to THIS (background
     # sink) worker instead of blocking the producing thread with a store-encode pass.
     ref = _resolve_live_ref_extent(ref)
+    # v13.3.14 (N7): when a tight extent is known, write only the minimal (t,y,x) raster.
+    # The identity space directions make the placement exact: the space origin moves to the
+    # crop's voxel origin and Segmentation_ReferenceImageExtentOffset records the same
+    # offset in IJK, so Slicer overlays the cropped labelmap at the source coordinates and
+    # keeps the reference-grid association. Full-raster mode is preserved whenever no
+    # trustworthy extent exists, the crop is not worthwhile, or the caller disabled it.
+    crop_window = _nrrd_crop_window_for_ref(ref, (out_t, out_h, out_w))
+    if crop_window is not None:
+        (ct_lo, ct_hi), (cy_lo, cy_hi), (cx_lo, cx_hi) = crop_window
+        eff_t, eff_h, eff_w = int(ct_hi - ct_lo), int(cy_hi - cy_lo), int(cx_hi - cx_lo)
+        header['space origin'] = np.asarray([float(cx_lo), float(cy_lo), float(ct_lo)], dtype=np.float64)
+        header['content'] = (
+            f'binary segmentation mask; source_shape_tyx=({out_t},{out_h},{out_w}); '
+            f'exported_axes=(X,Y,t); crop_offset_xyt=({cx_lo},{cy_lo},{ct_lo}); '
+            f'crop_shape_xyt=({eff_w},{eff_h},{eff_t})'
+        )
+        seg_extent: NrrdSegmentExtent = (
+            0, max(0, eff_w - 1), 0, max(0, eff_h - 1), 0, max(0, eff_t - 1),
+        )
+    else:
+        eff_t, eff_h, eff_w = int(out_t), int(out_h), int(out_w)
+        seg_extent = _slicer_segment_extent_for_output(ref, (out_t, out_h, out_w))
     header.update(slicer_segmentation_header_fields(
         segment_name=seg_name,
         color_rgb=seg_color,
-        extent_xyt=_slicer_segment_extent_for_output(ref, (out_t, out_h, out_w)),
+        extent_xyt=seg_extent,
     ))
-    z_chunk = _nrrd_full_slice_z_chunk(1, out_w, out_h, out_t)
+    if crop_window is not None:
+        (ct_lo, ct_hi), (cy_lo, cy_hi), (cx_lo, cx_hi) = crop_window
+        header['Segmentation_ReferenceImageExtentOffset'] = f'{int(cx_lo)} {int(cy_lo)} {int(ct_lo)}'
+        print(
+            f'v13.3.14 (N7): {out_path.name} cropped to known extent '
+            f'(t,y,x)=[{ct_lo}:{ct_hi},{cy_lo}:{cy_hi},{cx_lo}:{cx_hi}] '
+            f'of ({out_t},{out_h},{out_w}) — '
+            f'{100.0 * (eff_t * eff_h * eff_w) / max(1, out_t * out_h * out_w):.1f}% of the full raster.'
+        )
+    z_chunk = _nrrd_full_slice_z_chunk(1, eff_w, eff_h, eff_t)
     threads = int(nrrd_single_layer_pigz_threads()) if pigz_threads is None else max(1, int(pigz_threads))
+    logical_bytes = int(eff_t) * int(eff_h) * int(eff_w)
+
+    def _record_layer_telemetry(writer_obj: object, shards: int) -> None:
+        stats = getattr(ref, 'segment_extent_ijk', None)
+        TELEMETRY.nrrd_layer(
+            name=str(out_path.name),
+            logical_bytes=int(logical_bytes),
+            indexed_payload_bytes=_nrrd_layer_ref_indexed_payload_bytes(ref),
+            compressed_bytes=int(getattr(writer_obj, 'compressed_bytes', 0) or 0) or None,
+            zero_members=int(getattr(writer_obj, 'zero_members', 0) or 0) or None,
+            nonzero_members=int(getattr(writer_obj, 'nonzero_members', 0) or 0) or None,
+            backend=type(writer_obj).__name__ if writer_obj is not None else None,
+            z_shards=int(shards),
+            cropped=bool(crop_window is not None),
+            extent=str(stats) if stats is not None else None,
+            seconds=round(time.monotonic() - write_started, 3),
+        )
+        tele_add('nrrd.layer_write', seconds=time.monotonic() - write_started, nbytes=int(logical_bytes))
+
     # N15: resolve auto-sharding only after this sink task starts executing. Queue
     # occupancy at submit time says nothing about the child-band capacity by the time a
     # late global layer reaches the head of the sink pool. The shared semaphore remains
     # the hard cross-layer over-sharding guard.
     if z_shards is None or int(z_shards) <= 0:
-        shard_count = _nrrd_layer_zshard_count(ref, int(out_t))
+        shard_count = _nrrd_layer_zshard_count(ref, int(eff_t))
     else:
         shard_count = max(
             1,
-            min(int(out_t), int(z_shards), int(_nrrd_zshard_capacity())),
+            min(int(eff_t), int(z_shards), int(_nrrd_zshard_capacity())),
         )
     if shard_count <= 1:
         with open(out_path, 'wb') as fh:
             _write_nrrd_ascii_header(
                 fh,
                 header=header,
-                sizes=(out_w, out_h, out_t),
+                sizes=(eff_w, eff_h, eff_t),
                 dimension=3,
                 data_type='unsigned char',
                 encoding='gzip',
@@ -26441,12 +28397,16 @@ def write_single_layer_nrrd_from_ref(
                     payload_writer,
                     z_chunk=int(z_chunk),
                     block_consumer=block_consumer,
+                    crop_window=crop_window,
                 )
+            _record_layer_telemetry(payload_writer, 1)
         return out_path
 
     # v13.3.11: native sparse stores balance bands by indexed bbox payload bytes, not
-    # merely slice count. Other sources retain equal-z partitioning.
-    bands, band_weights = _nrrd_layer_zshard_bands(ref, int(out_t), int(shard_count))
+    # merely slice count. Other sources retain equal-z partitioning. v13.3.14 (N7):
+    # cropped/restored rasters band over the EFFECTIVE t axis; the weighting helper
+    # falls back to equal bands on its own whenever ref.shape[0] != the banded depth.
+    bands, band_weights = _nrrd_layer_zshard_bands(ref, int(eff_t), int(shard_count))
     token = f'{os.getpid()}.{threading.get_ident()}'
     final_tmp = out_path.with_name(f'.{out_path.name}.{token}.assembling')
     shard_z_chunk = max(1, int(z_chunk) // int(shard_count))
@@ -26495,6 +28455,7 @@ def write_single_layer_nrrd_from_ref(
                     z_start=int(z0),
                     z_stop=int(z1),
                     fill_workers_override=shard_fill_workers,
+                    crop_window=crop_window,
                 )
             shard_sink.close()
         except BaseException as exc:
@@ -26510,7 +28471,7 @@ def write_single_layer_nrrd_from_ref(
             _write_nrrd_ascii_header(
                 fh,
                 header=header,
-                sizes=(out_w, out_h, out_t),
+                sizes=(eff_w, eff_h, eff_t),
                 dimension=3,
                 data_type='unsigned char',
                 encoding='gzip',
@@ -26535,6 +28496,7 @@ def write_single_layer_nrrd_from_ref(
             if first_error is not None:
                 raise first_error
         os.replace(final_tmp, out_path)
+        _record_layer_telemetry(None, int(shard_count))
     finally:
         if destination is not None:
             destination.abort.set()
@@ -26645,6 +28607,58 @@ class _GpuMirrorTee:
             self.failed = True
             print(f'Warning: GPU mirror tee failed mid-stream ({exc}); mirrors re-encode from the layer store.')
 
+    def tee_device(self, z0: int, block_dev: object, ready_event: Optional[object] = None) -> bool:
+        """v13.3.14 (N2): fold an already-device-resident block into the mirror volumes.
+
+        Eliminates the D2H->H2D bounce for GPU projection producers: the producer's
+        (bs,H,W) uint8 CUDA tensor is consumed directly. ``ready_event`` (recorded on the
+        producer's stream after the block was written) orders the reads; this method
+        synchronizes its own stream before returning because the producer reuses the
+        tensor for the next chunk. Returns False (and does NOT mark the tee failed) when
+        the tensor lives on another device — the caller then uses the host-block path.
+        """
+        if self.failed:
+            return True
+        torch = self.torch
+        try:
+            block_device = getattr(block_dev, 'device', None)
+            if block_device is None or str(block_device) != str(self.device):
+                return False
+            if getattr(block_dev, 'dtype', None) != torch.uint8:
+                return False
+        except Exception:
+            return False
+        try:
+            import torch.nn.functional as F  # type: ignore
+            with torch.cuda.device(self.device):
+                with torch.cuda.stream(self.stream):
+                    if ready_event is not None:
+                        self.stream.wait_event(ready_event)
+                    z_count = int(block_dev.shape[0])
+                    for b0 in range(0, z_count, int(self.sub_batch)):
+                        b1 = min(z_count, b0 + int(self.sub_batch))
+                        blk_f = block_dev[b0:b1].to(torch.float16).unsqueeze(1)
+                        for spec in self.specs:
+                            pooled = F.adaptive_max_pool2d(blk_f, (int(spec['m_h']), int(spec['m_w'])))
+                            pooled_u8 = (pooled.squeeze(1) > 0).to(torch.uint8)
+                            vol = spec['vol']
+                            src_to_m = spec['src_to_m']
+                            for bi in range(int(b1 - b0)):
+                                full_z = int(z0) + int(b0) + int(bi)
+                                if full_z >= self.out_t:
+                                    break
+                                for mz in src_to_m[full_z]:  # type: ignore[index]
+                                    torch.maximum(vol[int(mz)], pooled_u8[int(bi)], out=vol[int(mz)])
+                        del blk_f
+                # The producer immediately reuses block_dev for its next chunk; complete
+                # the pooling reads before handing control back.
+                self.stream.synchronize()
+            return True
+        except Exception as exc:
+            self.failed = True
+            print(f'Warning: GPU mirror device tee failed mid-stream ({exc}); mirrors re-encode from the layer store.')
+            return True
+
     def discard(self) -> None:
         """Release all mirror tensors after any failed GPU tee attempt."""
         try:
@@ -26742,102 +28756,103 @@ def _try_create_gpu_mirror_tee(mirror_jobs: List[Dict[str, object]], out_t: int)
         return None
 
 
-def write_layer_nrrd_with_low_quality_mirrors(
-    ref: 'NrrdLayerRef',
-    output_shape: Tuple[int, int, int],
-    out_path: Path,
-    mirrors: Sequence[Tuple[Tuple[int, int, int], Path]],
-    *,
-    pigz_threads: Optional[int] = None,
-    segment_name: Optional[str] = None,
-    segment_color: Optional[Tuple[float, float, float]] = None,
-    z_shards: Optional[int] = None,
-) -> Path:
-    """v13.3.3 (S4): write the full-quality layer AND its low-quality mirrors in ONE pass.
+class _LayerMirrorSet:
+    """v13.3.14 (N2): one layer's low-quality mirror derivation + encoding, factored out.
 
-    Each low-quality mirror used to be an independent write that re-decoded the full-resolution
-    layer store per output slice (3-4 full-res decodes + INTER_AREA resizes per slice, per
-    downbin spec). Here the full-quality write streams exactly as before, and every payload
-    block is additionally folded into small in-RAM mirror volumes (one resize per full-res
-    slice per spec, OR'd into the covering mirror slices — the same resize helper and union
-    semantics as the legacy per-mirror reader, composed through the output geometry, so bin-edge
-    voxels may differ sub-slice from the legacy double-resample). The mirror files are then
-    gzip-encoded straight from RAM. Any tee failure falls back to the legacy per-mirror writer
-    so the full-quality file is never at risk.
-
-    v13.3.7 (N5): the mirror files encode concurrently instead of one after another; see
-    nrrd_parallel_mirror_encode_enabled.
+    Encapsulates exactly the v13.3.3 (S4) / v13.3.6 (D2) machinery that previously lived
+    inline in write_layer_nrrd_with_low_quality_mirrors: mirror job construction, the GPU
+    tee (with device-gzip hand-off) or striped-lock CPU tee, per-block consumption, and the
+    concurrent mirror-file encode with the per-mirror store re-encode fallback. The
+    ProjectedLayerSink feeds the same object during projection — including device-resident
+    blocks through tee_device, which removes the Radial D2H->mirror-H2D bounce.
     """
-    out_t = int(output_shape[0])
-    # v13.3.6 (N3): resolve a live layer's deferred extent once, up front, so the
-    # full-quality header AND every mirror header see the same tight extent.
-    ref = _resolve_live_ref_extent(ref)
-    # N15: this function itself is the queued sink task, so this is execution-time—not
-    # submission-time—resolution. Reuse the result for tee scheduling and the full writer.
-    if z_shards is None or int(z_shards) <= 0:
-        resolved_z_shards = _nrrd_layer_zshard_count(ref, int(out_t))
-    else:
-        resolved_z_shards = max(
-            1,
-            min(int(out_t), int(z_shards), int(_nrrd_zshard_capacity())),
-        )
-    mirror_jobs: List[Dict[str, object]] = []
-    for m_shape, m_path in mirrors:
-        m_t, m_h, m_w = (int(m_shape[0]), int(m_shape[1]), int(m_shape[2]))
-        # Invert the mirror's t mapping once: for each full-quality output z, the mirror
-        # slice(s) whose source range contains it (matches _restore_source_indices_for_output_z).
-        tmp: List[List[int]] = [[] for _ in range(out_t)]
-        for mz in range(m_t):
-            for sz in _restore_source_indices_for_output_z(out_t, m_t, int(mz)):
-                if 0 <= int(sz) < out_t:
-                    tmp[int(sz)].append(int(mz))
-        mirror_jobs.append({
-            'shape': (m_t, m_h, m_w),
-            'path': Path(m_path),
-            'volume': None,  # v13.3.6 (D2): allocated below only when the CPU tee runs
-            'src_to_m': [tuple(v) for v in tmp],
-            'locks': [threading.Lock() for _ in range(16)],
-            'failed': False,
-            'device_derived': False,
-            'device_volume': None,
-            'device_gzip_engine': None,
-        })
 
-    # v13.3.6 (D2): derive the mirrors on a GPU when one is free — the per-slice resizes
-    # and striped-lock ORs leave the CPU tee entirely; mirror volumes come back in one
-    # small D2H after the layer streams. CPU tee (below) remains the fallback.
-    gpu_tee = _try_create_gpu_mirror_tee(mirror_jobs, out_t)
-    if gpu_tee is not None:
-        global _NRRD_GPU_MIRROR_TEE_ANNOUNCED, _NRRD_GPU_MIRROR_DEVICE_GZIP_ANNOUNCED
-        if not _NRRD_GPU_MIRROR_TEE_ANNOUNCED:
-            _NRRD_GPU_MIRROR_TEE_ANNOUNCED = True
-            print(
-                f'GPU low-quality mirror tee active on {gpu_tee.device} (v13.3.6 D2; '
-                'YOLO_TTA_NRRD_GPU_MIRROR_TEE=0 disables).'
-            )
-        if (
-            gpu_tee.device_gzip_engine is not None
-            and not _NRRD_GPU_MIRROR_DEVICE_GZIP_ANNOUNCED
-        ):
-            _NRRD_GPU_MIRROR_DEVICE_GZIP_ANNOUNCED = True
-            print(
-                f'GPU low-quality mirror complete-gzip active on {gpu_tee.device}: '
-                'derived tensors stay device-resident and only compressed RFC-1952 '
-                'members cross PCIe.'
-            )
-    else:
-        for job in mirror_jobs:
-            m_t, m_h, m_w = (int(v) for v in job['shape'])  # type: ignore[misc]
-            job['volume'] = np.zeros((m_t, m_h, m_w), dtype=np.uint8)
+    def __init__(
+        self,
+        output_shape: Tuple[int, int, int],
+        mirrors: Sequence[Tuple[Tuple[int, int, int], Path]],
+        *,
+        pigz_threads: Optional[int] = None,
+        segment_name: Optional[str] = None,
+        segment_color: Optional[Tuple[float, float, float]] = None,
+        tee_workers: int = 1,
+    ) -> None:
+        self.output_shape = tuple(int(v) for v in output_shape)
+        self.out_t = int(self.output_shape[0])
+        self.pigz_threads = pigz_threads
+        self.segment_name = segment_name
+        self.segment_color = segment_color
+        self.tee_workers = max(1, int(tee_workers))
+        out_t = int(self.out_t)
+        self.mirror_jobs: List[Dict[str, object]] = []
+        for m_shape, m_path in mirrors:
+            m_t, m_h, m_w = (int(m_shape[0]), int(m_shape[1]), int(m_shape[2]))
+            # Invert the mirror's t mapping once: for each full-quality output z, the mirror
+            # slice(s) whose source range contains it (matches _restore_source_indices_for_output_z).
+            tmp: List[List[int]] = [[] for _ in range(out_t)]
+            for mz in range(m_t):
+                for sz in _restore_source_indices_for_output_z(out_t, m_t, int(mz)):
+                    if 0 <= int(sz) < out_t:
+                        tmp[int(sz)].append(int(mz))
+            self.mirror_jobs.append({
+                'shape': (m_t, m_h, m_w),
+                'path': Path(m_path),
+                'volume': None,  # v13.3.6 (D2): allocated below only when the CPU tee runs
+                'src_to_m': [tuple(v) for v in tmp],
+                'locks': [threading.Lock() for _ in range(16)],
+                'failed': False,
+                'device_derived': False,
+                'device_volume': None,
+                'device_gzip_engine': None,
+            })
 
-    # N7 already supplies z-band concurrency. Avoid nesting another up-to-16-way CPU pool
-    # inside every shard; the unsharded path retains the original slice fan-out.
-    tee_workers = 1 if int(resolved_z_shards) > 1 else max(1, min(int(nrrd_fill_workers()), 16))
+        # v13.3.6 (D2): derive the mirrors on a GPU when one is free — the per-slice resizes
+        # and striped-lock ORs leave the CPU tee entirely; mirror volumes come back in one
+        # small D2H after the layer streams. CPU tee (below) remains the fallback.
+        self.gpu_tee = _try_create_gpu_mirror_tee(self.mirror_jobs, out_t)
+        if self.gpu_tee is not None:
+            global _NRRD_GPU_MIRROR_TEE_ANNOUNCED, _NRRD_GPU_MIRROR_DEVICE_GZIP_ANNOUNCED
+            if not _NRRD_GPU_MIRROR_TEE_ANNOUNCED:
+                _NRRD_GPU_MIRROR_TEE_ANNOUNCED = True
+                print(
+                    f'GPU low-quality mirror tee active on {self.gpu_tee.device} (v13.3.6 D2; '
+                    'YOLO_TTA_NRRD_GPU_MIRROR_TEE=0 disables).'
+                )
+            if (
+                self.gpu_tee.device_gzip_engine is not None
+                and not _NRRD_GPU_MIRROR_DEVICE_GZIP_ANNOUNCED
+            ):
+                _NRRD_GPU_MIRROR_DEVICE_GZIP_ANNOUNCED = True
+                print(
+                    f'GPU low-quality mirror complete-gzip active on {self.gpu_tee.device}: '
+                    'derived tensors stay device-resident and only compressed RFC-1952 '
+                    'members cross PCIe.'
+                )
+        else:
+            for job in self.mirror_jobs:
+                m_t, m_h, m_w = (int(v) for v in job['shape'])  # type: ignore[misc]
+                job['volume'] = np.zeros((m_t, m_h, m_w), dtype=np.uint8)
 
-    def _tee(z0: int, block: np.ndarray) -> None:
-        live_jobs = [j for j in mirror_jobs if not bool(j['failed'])]
+        # N7 shard consumers can arrive concurrently. CPU mirror updates already use
+        # per-output-z stripe locks; nvCOMP/torch mirror tee state is monolithic, so
+        # serialize only its tee calls while shard compression remains parallel.
+        self._gpu_tee_call_lock = threading.Lock() if self.gpu_tee is not None else None
+        self._finalized_into_jobs = False
+
+    def _fail_all_jobs_after_gpu_tee_break(self) -> None:
+        # Mid-stream GPU failure: earlier blocks never went through the CPU tee, so
+        # partial CPU teeing is useless — mark every mirror for the store re-encode
+        # fallback below.
+        for job in self.mirror_jobs:
+            job['failed'] = True
+        if self.gpu_tee is not None:
+            self.gpu_tee.discard()
+
+    def _tee_cpu(self, z0: int, block: np.ndarray) -> None:
+        live_jobs = [j for j in self.mirror_jobs if not bool(j['failed'])]
         if not live_jobs:
             return
+        out_t = int(self.out_t)
         z_count = int(block.shape[0])
 
         def _tee_one(zi: int) -> None:
@@ -26864,49 +28879,63 @@ def write_layer_nrrd_with_low_quality_mirrors(
                 except Exception:
                     job['failed'] = True
 
-        if z_count > 1 and tee_workers > 1:
+        if z_count > 1 and self.tee_workers > 1:
             _nrrd_parallel_fill_indices(
-                z_count, _tee_one, requested_workers=tee_workers,
+                z_count, _tee_one, requested_workers=int(self.tee_workers),
             )
         else:
             for zi in range(z_count):
                 _tee_one(int(zi))
 
-    # N7 shard consumers can arrive concurrently. CPU mirror updates already use
-    # per-output-z stripe locks; nvCOMP/torch mirror tee state is monolithic, so
-    # serialize only its tee calls while shard compression remains parallel.
-    gpu_tee_call_lock = threading.Lock() if gpu_tee is not None else None
-
-    def _consume_block(z0: int, block: np.ndarray) -> None:
-        if gpu_tee is not None:
-            with gpu_tee_call_lock:  # type: ignore[arg-type]
-                was_ok = not gpu_tee.failed
-                gpu_tee.tee(int(z0), block)
-                if gpu_tee.failed and was_ok:
-                    # Mid-stream GPU failure: earlier blocks never went through the CPU tee,
-                    # so partial CPU teeing is useless — mark every mirror for the store
-                    # re-encode fallback below.
-                    for job in mirror_jobs:
-                        job['failed'] = True
-                    gpu_tee.discard()
+    def consume(
+        self,
+        z0: int,
+        block: np.ndarray,
+        *,
+        device_block: Optional[object] = None,
+        ready_event: Optional[object] = None,
+    ) -> None:
+        """Fold one full-raster payload block into every live mirror volume."""
+        if self.gpu_tee is not None:
+            with self._gpu_tee_call_lock:  # type: ignore[union-attr]
+                was_ok = not self.gpu_tee.failed
+                consumed = False
+                if device_block is not None and was_ok:
+                    # v13.3.14 (N2): device-resident producer path — no H2D re-upload.
+                    consumed = bool(self.gpu_tee.tee_device(int(z0), device_block, ready_event))
+                if not consumed:
+                    self.gpu_tee.tee(int(z0), np.asarray(block))
+                if self.gpu_tee.failed and was_ok:
+                    self._fail_all_jobs_after_gpu_tee_break()
             return
-        _tee(int(z0), block)
+        self._tee_cpu(int(z0), np.asarray(block))
 
-    result = write_single_layer_nrrd_from_ref(
-        ref, output_shape, out_path,
-        pigz_threads=pigz_threads, segment_name=segment_name, segment_color=segment_color,
-        block_consumer=(_consume_block if mirror_jobs else None),
-        z_shards=int(resolved_z_shards),
-    )
+    def finalize_volumes(self) -> None:
+        """One small D2H per mirror replaces the per-block CPU resize/OR work (D2)."""
+        if self._finalized_into_jobs:
+            return
+        self._finalized_into_jobs = True
+        if self.gpu_tee is not None and not self.gpu_tee.finalize_into_jobs():
+            for job in self.mirror_jobs:
+                job['failed'] = True
 
-    # v13.3.6 (D2): one small D2H per mirror replaces the per-block CPU resize/OR work.
-    if gpu_tee is not None and not gpu_tee.finalize_into_jobs():
-        for job in mirror_jobs:
-            job['failed'] = True
+    def discard(self) -> None:
+        if self.gpu_tee is not None:
+            try:
+                self.gpu_tee.discard()
+            except Exception:
+                pass
+        for job in self.mirror_jobs:
+            job['volume'] = None
+            job['device_volume'] = None
+            job['device_gzip_engine'] = None
 
-    def _encode_mirror(job: Dict[str, object]) -> None:
+    def _encode_mirror(self, ref: 'NrrdLayerRef', job: Dict[str, object]) -> None:
         m_t, m_h, m_w = job['shape']  # type: ignore[misc]
         m_path: Path = job['path']  # type: ignore[assignment]
+        segment_name = self.segment_name
+        segment_color = self.segment_color
+        pigz_threads = self.pigz_threads
         try:
             if bool(job['failed']):
                 raise RuntimeError('mirror tee failed during full-quality streaming')
@@ -26966,6 +28995,7 @@ def write_layer_nrrd_with_low_quality_mirrors(
                 f'Warning: low-quality NRRD mirror tee failed for {m_path.name} ({exc}); '
                 're-encoding that mirror from the layer store.'
             )
+            tele_add('nrrd.mirror_reencode_fallback')
             write_single_layer_nrrd_from_ref(
                 ref, (int(m_t), int(m_h), int(m_w)), m_path,
                 pigz_threads=pigz_threads, segment_name=segment_name, segment_color=segment_color,
@@ -26975,30 +29005,530 @@ def write_layer_nrrd_with_low_quality_mirrors(
             job['device_volume'] = None
             job['device_gzip_engine'] = None
 
-    # v13.3.7 (N5): the mirror files of one layer are independent — encode them side by
-    # side instead of one after another at the tail of the layer task. Every task runs to
-    # completion (a failing mirror re-encodes from the store, matching the serial per-mirror
-    # fallback) and the first error is re-raised after all mirrors settle.
-    if len(mirror_jobs) > 1 and nrrd_parallel_mirror_encode_enabled():
-        pool_size = min(4, len(mirror_jobs))
-        mirror_pool = _acquire_parallel_pool(int(pool_size))
-        first_error: Optional[BaseException] = None
-        try:
-            futures = [mirror_pool.submit(_encode_mirror, job) for job in mirror_jobs]
-            for fut in futures:
-                try:
-                    fut.result()
-                except BaseException as exc:
-                    if first_error is None:
-                        first_error = exc
-        finally:
-            _release_parallel_pool(int(pool_size), mirror_pool)
-        if first_error is not None:
-            raise first_error
+    def encode_all(self, ref: 'NrrdLayerRef') -> None:
+        """Encode every mirror file (concurrently when configured); first error re-raises.
+
+        v13.3.7 (N5): the mirror files of one layer are independent — encode them side by
+        side instead of one after another at the tail of the layer task. Every task runs to
+        completion (a failing mirror re-encodes from the store, matching the serial
+        per-mirror fallback) and the first error is re-raised after all mirrors settle.
+        """
+        self.finalize_volumes()
+        if len(self.mirror_jobs) > 1 and nrrd_parallel_mirror_encode_enabled():
+            pool_size = min(4, len(self.mirror_jobs))
+            mirror_pool = _acquire_parallel_pool(int(pool_size))
+            first_error: Optional[BaseException] = None
+            try:
+                futures = [mirror_pool.submit(self._encode_mirror, ref, job) for job in self.mirror_jobs]
+                for fut in futures:
+                    try:
+                        fut.result()
+                    except BaseException as exc:
+                        if first_error is None:
+                            first_error = exc
+            finally:
+                _release_parallel_pool(int(pool_size), mirror_pool)
+            if first_error is not None:
+                raise first_error
+        else:
+            for job in self.mirror_jobs:
+                self._encode_mirror(ref, job)
+
+
+def write_layer_nrrd_with_low_quality_mirrors(
+    ref: 'NrrdLayerRef',
+    output_shape: Tuple[int, int, int],
+    out_path: Path,
+    mirrors: Sequence[Tuple[Tuple[int, int, int], Path]],
+    *,
+    pigz_threads: Optional[int] = None,
+    segment_name: Optional[str] = None,
+    segment_color: Optional[Tuple[float, float, float]] = None,
+    z_shards: Optional[int] = None,
+) -> Path:
+    """v13.3.3 (S4): write the full-quality layer AND its low-quality mirrors in ONE pass.
+
+    Each low-quality mirror used to be an independent write that re-decoded the full-resolution
+    layer store per output slice (3-4 full-res decodes + INTER_AREA resizes per slice, per
+    downbin spec). Here the full-quality write streams exactly as before, and every payload
+    block is additionally folded into small in-RAM mirror volumes (one resize per full-res
+    slice per spec, OR'd into the covering mirror slices — the same resize helper and union
+    semantics as the legacy per-mirror reader, composed through the output geometry, so bin-edge
+    voxels may differ sub-slice from the legacy double-resample). The mirror files are then
+    gzip-encoded straight from RAM. Any tee failure falls back to the legacy per-mirror writer
+    so the full-quality file is never at risk.
+
+    v13.3.7 (N5): the mirror files encode concurrently instead of one after another; see
+    nrrd_parallel_mirror_encode_enabled. v13.3.14 (N2): the tee/encode machinery lives in
+    _LayerMirrorSet so the fused projection sink shares it verbatim.
+    """
+    out_t = int(output_shape[0])
+    # v13.3.6 (N3): resolve a live layer's deferred extent once, up front, so the
+    # full-quality header AND every mirror header see the same tight extent.
+    ref = _resolve_live_ref_extent(ref)
+    # N15: this function itself is the queued sink task, so this is execution-time—not
+    # submission-time—resolution. Reuse the result for tee scheduling and the full writer.
+    if z_shards is None or int(z_shards) <= 0:
+        resolved_z_shards = _nrrd_layer_zshard_count(ref, int(out_t))
     else:
-        for job in mirror_jobs:
-            _encode_mirror(job)
+        resolved_z_shards = max(
+            1,
+            min(int(out_t), int(z_shards), int(_nrrd_zshard_capacity())),
+        )
+    # N7 already supplies z-band concurrency. Avoid nesting another up-to-16-way CPU pool
+    # inside every shard; the unsharded path retains the original slice fan-out.
+    tee_workers = 1 if int(resolved_z_shards) > 1 else max(1, min(int(nrrd_fill_workers()), 16))
+    mirror_set = _LayerMirrorSet(
+        output_shape,
+        mirrors,
+        pigz_threads=pigz_threads,
+        segment_name=segment_name,
+        segment_color=segment_color,
+        tee_workers=int(tee_workers),
+    )
+
+    def _consume_block(z0: int, block: np.ndarray) -> None:
+        mirror_set.consume(int(z0), block)
+
+    result = write_single_layer_nrrd_from_ref(
+        ref, output_shape, out_path,
+        pigz_threads=pigz_threads, segment_name=segment_name, segment_color=segment_color,
+        block_consumer=(_consume_block if mirror_set.mirror_jobs else None),
+        z_shards=int(resolved_z_shards),
+    )
+
+    # v13.3.6 (D2): one small D2H per mirror replaces the per-block CPU resize/OR work.
+    mirror_set.encode_all(ref)
     return result
+
+
+def projected_layer_sink_enabled() -> bool:
+    """v13.3.14 (N2): stream projection blocks straight into cvol/gzip/mirrors.
+
+    Radial and Tilted component layers previously materialized a disposable dense
+    source-geometry volume (17-27 GiB each) that was then rescanned into the cvol store
+    and compressed afterwards. The transactional ProjectedLayerSink consumes ordered (or
+    sequence-buffered) projection z-blocks during projection: it updates the cvol index,
+    feeds the full-quality gzip payload, derives every low-quality mirror (device-resident
+    blocks skip the D2H->H2D bounce), and the finalized store still registers for the G5
+    final union. A sink failure discards its partial outputs and the layer reruns ONCE
+    through the established dense path. YOLO_TTA_PROJECTED_LAYER_SINK=0 disables.
+    """
+    return _env_flag('YOLO_TTA_PROJECTED_LAYER_SINK', True)
+
+
+def _nrrd_fixed_width_extent_text(extent: NrrdSegmentExtent) -> str:
+    """Zero-padded constant-width Segment0_Extent value (in-place patchable)."""
+    return ' '.join(f'{int(v):010d}' for v in extent)
+
+
+class ProjectedLayerSink:
+    """v13.3.14 (N2): transactional consumer for projection z-blocks.
+
+    Accepts ordered or out-of-order ``(z0, block)`` deliveries (out-of-order blocks are
+    copied into a bounded reorder stash; exactly-once delivery is enforced through the
+    wrapped IncrementalRawBBoxMaskStoreWriter). Each in-order block is folded into:
+
+      1. the incremental cvol store (index + bbox payload — order-independent),
+      2. the fused single-layer .seg.nrrd gzip payload (strict z order; the header is
+         written up-front with a constant-width placeholder Segment0_Extent that is
+         seek-patched after the store finalizes, so the tight extent still lands in the
+         header without buffering the payload),
+      3. every low-quality mirror through the shared _LayerMirrorSet (GPU producers pass
+         their device tensor so the tee never re-uploads).
+
+    All failures latch: the projection emitter raises (required-callback semantics), the
+    caller discards this sink's partial outputs, and the dense fallback reruns cleanly.
+    """
+
+    def __init__(
+        self,
+        *,
+        store_writer: 'IncrementalRawBBoxMaskStoreWriter',
+        output_shape: Tuple[int, int, int],
+        desc: str,
+        nrrd_out_path: Optional[Path] = None,
+        segment_name: Optional[str] = None,
+        segment_color: Optional[Tuple[float, float, float]] = None,
+        mirrors: Sequence[Tuple[Tuple[int, int, int], Path]] = (),
+        pigz_threads: Optional[int] = None,
+    ) -> None:
+        self.store_writer = store_writer
+        self.output_shape = tuple(int(v) for v in output_shape)
+        self.desc = str(desc)
+        self.segment_name = segment_name
+        self.segment_color = segment_color
+        self.pigz_threads = pigz_threads
+        self._lock = threading.RLock()
+        self._failed: Optional[BaseException] = None
+        self._warned_failed = False
+        self._next_z = 0
+        self._stash: Dict[int, Tuple[str, object]] = {}
+        self._stash_bytes = 0
+        self._stash_cap = max(1, _env_int('YOLO_TTA_PROJECTED_SINK_STASH_MIB', 4096)) * 1024 * 1024
+        self._delivered_bytes = 0
+        self._started = time.monotonic()
+
+        self.mirror_set: Optional[_LayerMirrorSet] = None
+        if mirrors:
+            self.mirror_set = _LayerMirrorSet(
+                self.output_shape,
+                mirrors,
+                pigz_threads=pigz_threads,
+                segment_name=segment_name,
+                segment_color=segment_color,
+                tee_workers=max(1, min(int(nrrd_fill_workers()), 16)),
+            )
+
+        self.nrrd_out_path: Optional[Path] = None if nrrd_out_path is None else Path(nrrd_out_path)
+        self._nrrd_tmp: Optional[Path] = None
+        self._fh: Optional[object] = None
+        self._payload_writer: Optional[object] = None
+        self._extent_patch_offset = -1
+        if self.nrrd_out_path is not None:
+            out_t, out_h, out_w = self.output_shape
+            self.nrrd_out_path.parent.mkdir(parents=True, exist_ok=True)
+            token = f'{os.getpid()}.{threading.get_ident()}'
+            self._nrrd_tmp = self.nrrd_out_path.with_name(f'.{self.nrrd_out_path.name}.{token}.fusing')
+            header = nrrd_slicer_header((out_t, out_h, out_w))
+            seg_name = (
+                str(segment_name) if segment_name
+                else _slicer_segment_name_for_out_path(self.nrrd_out_path)
+            )
+            seg_color = (
+                segment_color if segment_color is not None
+                else slicer_segment_palette_color(seg_name)
+            )
+            # The full-output extent is the never-understating placeholder (exactly the
+            # unknown-extent fallback Slicer semantics); finalize tightens it in place.
+            placeholder: NrrdSegmentExtent = (
+                0, max(0, out_w - 1), 0, max(0, out_h - 1), 0, max(0, out_t - 1),
+            )
+            header.update(slicer_segmentation_header_fields(
+                segment_name=seg_name,
+                color_rgb=seg_color,
+                extent_xyt=placeholder,
+            ))
+            header['Segment0_Extent'] = _nrrd_fixed_width_extent_text(placeholder)
+            header_buf = io.BytesIO()
+            _write_nrrd_ascii_header(
+                header_buf,
+                header=header,
+                sizes=(out_w, out_h, out_t),
+                dimension=3,
+                data_type='unsigned char',
+                encoding='gzip',
+            )
+            header_bytes = header_buf.getvalue()
+            tag = b'Segment0_Extent:='
+            tag_at = header_bytes.find(tag)
+            if tag_at < 0:
+                raise RuntimeError(f'{self.desc}: fused NRRD header lacks a patchable extent field')
+            self._extent_patch_offset = int(tag_at) + len(tag)
+            self._extent_patch_width = len(_nrrd_fixed_width_extent_text(placeholder))
+            fh = open(self._nrrd_tmp, 'wb')
+            try:
+                fh.write(header_bytes)
+                self._payload_writer = _open_nrrd_payload_writer(fh, threads=pigz_threads)
+            except BaseException:
+                fh.close()
+                try:
+                    self._nrrd_tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise
+            self._fh = fh
+
+    # ---- projection-callback protocol -------------------------------------------------
+    @property
+    def failed(self) -> bool:
+        with self._lock:
+            return self._failed is not None
+
+    def abort(self, reason: BaseException) -> None:
+        with self._lock:
+            if self._failed is None:
+                self._failed = reason
+        self.store_writer.abort(reason)
+
+    def warn_failed_once(self, message: str) -> None:
+        with self._lock:
+            if self._warned_failed:
+                return
+            self._warned_failed = True
+        print(f'Warning: {message}; the layer reruns through the dense projection fallback.')
+
+    def __call__(self, z0: int, block: np.ndarray) -> None:
+        self.consume(int(z0), block)
+
+    def _raise_if_failed(self) -> None:
+        if self._failed is not None:
+            raise RuntimeError(f'{self.desc}: projected layer sink already failed') from self._failed
+
+    def consume(
+        self,
+        z0: int,
+        block: np.ndarray,
+        *,
+        device_block: Optional[object] = None,
+        ready_event: Optional[object] = None,
+    ) -> None:
+        block_arr = np.asarray(block)
+        with self._lock:
+            self._raise_if_failed()
+            try:
+                if int(z0) == int(self._next_z):
+                    self._process_block(int(z0), block_arr, device_block, ready_event)
+                    self._drain_stash()
+                elif int(z0) > int(self._next_z):
+                    # Out-of-order producer (e.g. the 2-worker CPU radial path): own a copy;
+                    # the producer's buffer is reused after this call returns. The stashed
+                    # copy loses its device twin — the mirror tee simply uses the host path.
+                    nbytes = int(block_arr.nbytes)
+                    if self._stash_bytes + nbytes > int(self._stash_cap):
+                        raise RuntimeError(
+                            f'{self.desc}: projected sink reorder stash exceeded '
+                            f'{self._stash_cap / GIB:.1f} GiB waiting for z={int(self._next_z)}'
+                        )
+                    self._stash[int(z0)] = ('block', np.array(block_arr, dtype=np.uint8, copy=True))
+                    self._stash_bytes += nbytes
+                else:
+                    raise RuntimeError(
+                        f'{self.desc}: projected sink received z={int(z0)} behind cursor {int(self._next_z)}'
+                    )
+            except BaseException as exc:
+                if self._failed is None:
+                    self._failed = exc
+                self.store_writer.abort(exc)
+                raise
+
+    def consume_zeros(self, z0: int, count: int) -> None:
+        """Known-zero z range: index-only store marks + cached zero gzip members."""
+        with self._lock:
+            self._raise_if_failed()
+            try:
+                if int(z0) == int(self._next_z):
+                    self._process_zeros(int(z0), int(count))
+                    self._drain_stash()
+                elif int(z0) > int(self._next_z):
+                    self._stash[int(z0)] = ('zeros', int(count))
+                else:
+                    raise RuntimeError(
+                        f'{self.desc}: projected sink received z={int(z0)} behind cursor {int(self._next_z)}'
+                    )
+            except BaseException as exc:
+                if self._failed is None:
+                    self._failed = exc
+                self.store_writer.abort(exc)
+                raise
+
+    def _drain_stash(self) -> None:
+        while self._stash:
+            item = self._stash.pop(int(self._next_z), None)
+            if item is None:
+                return
+            kind, payload = item
+            if kind == 'zeros':
+                self._process_zeros(int(self._next_z), int(payload))  # type: ignore[arg-type]
+            else:
+                arr = payload  # type: ignore[assignment]
+                self._stash_bytes -= int(arr.nbytes)  # type: ignore[union-attr]
+                self._process_block(int(self._next_z), arr, None, None)  # type: ignore[arg-type]
+
+    def _process_block(
+        self,
+        z0: int,
+        block: np.ndarray,
+        device_block: Optional[object],
+        ready_event: Optional[object],
+    ) -> None:
+        if block.ndim != 3:
+            raise ValueError(f'{self.desc}: projected sink expected a 3D block, got {block.shape}')
+        # Store first: it owns exactly-once slice bookkeeping and the bbox index.
+        self.store_writer.consume(int(z0), block)
+        if self.store_writer.failed:
+            reason = self.store_writer.failed_reason
+            raise RuntimeError(f'{self.desc}: incremental store failed') from reason
+        if self._payload_writer is not None:
+            chunk = block if block.flags['C_CONTIGUOUS'] else np.ascontiguousarray(block)
+            self._payload_writer.write(memoryview(chunk).cast('B'))
+        if self.mirror_set is not None:
+            self.mirror_set.consume(
+                int(z0), block, device_block=device_block, ready_event=ready_event,
+            )
+        self._next_z = int(z0) + int(block.shape[0])
+        self._delivered_bytes += int(block.nbytes)
+
+    def _process_zeros(self, z0: int, count: int) -> None:
+        consume_empty = getattr(self.store_writer, 'consume_empty_range', None)
+        if callable(consume_empty):
+            consume_empty(int(z0), int(z0) + int(count))
+            if self.store_writer.failed:
+                reason = self.store_writer.failed_reason
+                raise RuntimeError(f'{self.desc}: incremental store failed') from reason
+        else:  # pragma: no cover - defensive; the writer ships the method below
+            zeros = np.zeros((int(count), int(self.output_shape[1]), int(self.output_shape[2])), dtype=np.uint8)
+            self.store_writer.consume(int(z0), zeros)
+        if self._payload_writer is not None:
+            plane_bytes = int(self.output_shape[1]) * int(self.output_shape[2])
+            write_zeros = getattr(self._payload_writer, 'write_zeros', None)
+            if callable(write_zeros):
+                write_zeros(int(count) * plane_bytes)
+            else:
+                self._payload_writer.write(bytes(int(count) * plane_bytes))
+        # Zero ranges contribute nothing to any mirror union.
+        self._next_z = int(z0) + int(count)
+
+    # ---- finalization ------------------------------------------------------------------
+    def finalize_store(self) -> Dict[str, object]:
+        """Close the payload stream and finalize the cvol store; returns store stats."""
+        with self._lock:
+            self._raise_if_failed()
+            if int(self._next_z) != int(self.output_shape[0]) or self._stash:
+                raise RuntimeError(
+                    f'{self.desc}: projected sink finalized at z={int(self._next_z)}/'
+                    f'{int(self.output_shape[0])} with {len(self._stash)} stashed block(s)'
+                )
+        if self._payload_writer is not None:
+            self._payload_writer.close()
+        stats = self.store_writer.finalize()
+        tele_add(
+            'projection.fused_sink_layer',
+            seconds=time.monotonic() - self._started,
+            nbytes=int(self._delivered_bytes),
+        )
+        return stats
+
+    def finalize_outputs(self, ref: 'NrrdLayerRef') -> Optional[Path]:
+        """Patch the header extent, publish the .seg.nrrd, and encode the mirrors."""
+        out_path = self.nrrd_out_path
+        if out_path is None:
+            if self.mirror_set is not None:
+                self.mirror_set.encode_all(ref)
+            return None
+        fh = self._fh
+        assert fh is not None and self._nrrd_tmp is not None
+        try:
+            extent = _slicer_segment_extent_for_output(ref, self.output_shape)
+            patched = _nrrd_fixed_width_extent_text(extent)
+            if len(patched) != int(self._extent_patch_width):
+                raise RuntimeError(
+                    f'{self.desc}: fused extent patch width changed '
+                    f'({len(patched)} != {int(self._extent_patch_width)})'
+                )
+            fh.flush()
+            fh.seek(int(self._extent_patch_offset))
+            fh.write(patched.encode('ascii'))
+            fh.close()
+            self._fh = None
+            os.replace(self._nrrd_tmp, out_path)
+            self._nrrd_tmp = None
+        except BaseException:
+            self._close_partial_nrrd()
+            raise
+        if self.mirror_set is not None:
+            self.mirror_set.encode_all(ref)
+        return out_path
+
+    def _close_partial_nrrd(self) -> None:
+        writer = self._payload_writer
+        self._payload_writer = None
+        if writer is not None:
+            try:
+                writer.__exit__(RuntimeError, RuntimeError('projected sink discarded'), None)
+            except Exception:
+                pass
+        fh = self._fh
+        self._fh = None
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass
+        if self._nrrd_tmp is not None:
+            try:
+                self._nrrd_tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            self._nrrd_tmp = None
+
+    def discard(self) -> None:
+        """Drop every partial output after a failure; the dense fallback restarts clean."""
+        with self._lock:
+            if self._failed is None:
+                self._failed = RuntimeError('projected layer sink discarded')
+        self._close_partial_nrrd()
+        if self.mirror_set is not None:
+            self.mirror_set.discard()
+        try:
+            self.store_writer.discard()
+        except Exception:
+            pass
+
+
+class _NrrdLayerReservation:
+    """v13.3.14 (N2): a pre-assigned .seg.nrrd identity for one fused projected layer."""
+
+    def __init__(
+        self,
+        *,
+        sink: 'NrrdLayerSink',
+        out_path: Path,
+        segment_name: str,
+        segment_color: Tuple[float, float, float],
+        lq_mirror_args: List[Tuple[Tuple[int, int, int], Path]],
+        manifest_entry: Dict[str, object],
+    ) -> None:
+        self.sink = sink
+        self.out_path = Path(out_path)
+        self.segment_name = str(segment_name)
+        self.segment_color = tuple(float(c) for c in segment_color)
+        self.lq_mirror_args = list(lq_mirror_args)
+        self.manifest_entry = manifest_entry
+        self._settled = False
+
+    def complete(self, ref: 'NrrdLayerRef') -> None:
+        """The fused sink already wrote this layer's file(s) during projection."""
+        with self.sink._lock:
+            self._settled = True
+            self.manifest_entry['z_shards'] = 'fused_projection'
+            self.manifest_entry['backing_shape_tyx'] = [int(v) for v in getattr(ref, 'shape', (0, 0, 0))]
+
+    def submit_fallback(self, ref: Optional['NrrdLayerRef']) -> None:
+        """Fused write abandoned: schedule the established post-hoc write, same identity."""
+        if ref is None:
+            return
+        with self.sink._lock:
+            if self._settled:
+                return
+            self._settled = True
+            self.manifest_entry['z_shards_policy'] = 'execution_time'
+            self.manifest_entry['backing_shape_tyx'] = [int(v) for v in getattr(ref, 'shape', (0, 0, 0))]
+
+            def _execute_layer_write() -> Path:
+                executed_z_shards = int(_nrrd_layer_zshard_count(
+                    ref, int(self.sink.output_shape[0]),
+                ))
+                with self.sink._lock:
+                    self.manifest_entry['z_shards'] = int(executed_z_shards)
+                if self.lq_mirror_args:
+                    return write_layer_nrrd_with_low_quality_mirrors(
+                        ref, self.sink.output_shape, self.out_path, self.lq_mirror_args,
+                        pigz_threads=self.sink.pigz_threads,
+                        segment_name=self.segment_name,
+                        segment_color=self.segment_color,
+                        z_shards=int(executed_z_shards),
+                    )
+                return write_single_layer_nrrd_from_ref(
+                    ref, self.sink.output_shape, self.out_path,
+                    pigz_threads=self.sink.pigz_threads,
+                    segment_name=self.segment_name,
+                    segment_color=self.segment_color,
+                    z_shards=int(executed_z_shards),
+                )
+
+            fut = self.sink.executor.submit(_execute_layer_write)
+            self.sink._futures.append(fut)
 
 
 class NrrdLayerSink:
@@ -27170,6 +29700,95 @@ class NrrdLayerSink:
             self._futures.append(fut)
         return out_path
 
+    def reserve_layer(
+        self,
+        suffix: str,
+        *,
+        view_name: str = '',
+        view_family: str = '',
+        source: str = '',
+        mask_kind: str = '',
+        pass_index: int = 0,
+        tile_acceptance: str = '',
+        stage: str = '',
+        description: str = '',
+        backing_shape_tyx: Tuple[int, int, int] = (0, 0, 0),
+    ) -> '_NrrdLayerReservation':
+        """v13.3.14 (N2): pre-assign a layer's output identity BEFORE projection begins.
+
+        The fused ProjectedLayerSink writes the .seg.nrrd (and mirrors) during projection,
+        so the unique suffix, palette color, output paths, and manifest rows must exist up
+        front. ``complete(ref)`` marks the fused write done; ``submit_fallback(ref)``
+        schedules the established post-hoc combined write under the SAME identity when the
+        fused path had to be abandoned.
+        """
+        with self._lock:
+            seen = int(self._suffix_counts.get(str(suffix), 0))
+            self._suffix_counts[str(suffix)] = seen + 1
+            unique_suffix = str(suffix) if seen == 0 else f'{suffix}_{seen + 1:02d}'
+            out_path = self.nrrd_dir / f'{self.stem}_{unique_suffix}.seg.nrrd'
+            segment_name = f'{self.stem}_{unique_suffix}'
+            segment_color = self._segment_color_for_suffix(unique_suffix)
+            manifest_entry: Dict[str, object] = {
+                'filename': out_path.name,
+                'suffix': unique_suffix,
+                'view_name': str(view_name),
+                'view_family': str(view_family),
+                'source': str(source),
+                'mask_kind': str(mask_kind),
+                'pass_index': int(pass_index),
+                'tile_acceptance': str(tile_acceptance),
+                'stage': str(stage),
+                'description': str(description),
+                'backing_shape_tyx': [int(v) for v in backing_shape_tyx],
+                'output_shape_tyx': [int(v) for v in self.output_shape],
+                'exported_axes': '(X, Y, t)',
+                'segment_name': segment_name,
+                'segment_color_rgb': [round(float(c), 6) for c in segment_color],
+                'z_shards': None,
+                'z_shards_policy': 'fused_projection_reserved',
+            }
+            self._manifest.append(manifest_entry)
+            lq_mirror_args: List[Tuple[Tuple[int, int, int], Path]] = []
+            for spec in self.low_quality_specs:
+                if self.low_quality_root is None:
+                    break
+                lq_shape = (
+                    int(spec.output_shape_t_y_x[0]),
+                    int(spec.output_shape_t_y_x[1]),
+                    int(spec.output_shape_t_y_x[2]),
+                )
+                lq_path = self._lq_nrrd_dir(spec) / f'{self.stem}_{unique_suffix}.seg.nrrd'
+                lq_mirror_args.append((lq_shape, lq_path))
+                self._lq_manifests.setdefault(str(spec.token), []).append({
+                    'filename': lq_path.name,
+                    'suffix': unique_suffix,
+                    'view_name': str(view_name),
+                    'view_family': str(view_family),
+                    'source': str(source),
+                    'mask_kind': str(mask_kind),
+                    'pass_index': int(pass_index),
+                    'tile_acceptance': str(tile_acceptance),
+                    'stage': str(stage),
+                    'description': str(description),
+                    'backing_shape_tyx': [int(v) for v in backing_shape_tyx],
+                    'output_shape_tyx': [int(v) for v in lq_shape],
+                    'downbin_value': str(spec.raw_value),
+                    'downbin_token': str(spec.token),
+                    'downbin_scale': float(spec.scale),
+                    'exported_axes': '(X, Y, t)',
+                    'segment_name': segment_name,
+                    'segment_color_rgb': [round(float(c), 6) for c in segment_color],
+                })
+        return _NrrdLayerReservation(
+            sink=self,
+            out_path=out_path,
+            segment_name=segment_name,
+            segment_color=segment_color,
+            lq_mirror_args=lq_mirror_args,
+            manifest_entry=manifest_entry,
+        )
+
     def layer_count(self) -> int:
         with self._lock:
             return len(self._manifest)
@@ -27274,6 +29893,24 @@ def nrrd_layer_sink_workers() -> int:
 
 def _nrrd_layer_ref_is_raw_bbox_store(ref: NrrdLayerRef) -> bool:
     return str(getattr(ref, 'storage_format', 'raw_u8')) in MASK_STORE_FORMATS or Path(ref.path).is_dir()
+
+
+def _nrrd_layer_ref_indexed_payload_bytes(ref: NrrdLayerRef) -> Optional[int]:
+    """v13.3.14 (M1): summed indexed bbox payload bytes of a raw-bbox layer, else None.
+
+    The index file is tiny (one record per t slice), so this is a telemetry-grade read,
+    never a payload scan.
+    """
+    try:
+        if not _nrrd_layer_ref_is_raw_bbox_store(ref):
+            return None
+        index_path = Path(ref.path) / 'index.bin'
+        if not index_path.exists():
+            return None
+        index = np.fromfile(index_path, dtype=CTILE_INDEX_DTYPE)
+        return int(np.sum(np.asarray(index['payload_nbytes'], dtype=np.uint64), dtype=np.uint64))
+    except Exception:
+        return None
 
 
 class _LiveArrayLayerSource:
@@ -27535,6 +30172,74 @@ def nrrd_extent_zero_skip_enabled() -> bool:
     return _env_flag('YOLO_TTA_NRRD_EXTENT_ZERO_SKIP', True)
 
 
+def nrrd_sparse_t_restore_enabled() -> bool:
+    """v13.3.14 (N7): stream raw-bbox cvols through the terminal t restore sparsely.
+
+    Cartesian layers are commonly stored at the approximately cubic working t and restored
+    to the shorter source t; they miss the N11 native gate (shapes differ on t alone) and
+    previously rebuilt a dense 3072x3072 plane per output slice. The sparse path resolves
+    each output z's source slices, unions only their bbox crops, and packetizes members
+    from the union bboxes. YOLO_TTA_NRRD_SPARSE_T_RESTORE=0 restores dense per-slice rebuilds.
+    """
+    return _env_flag('YOLO_TTA_NRRD_SPARSE_T_RESTORE', True)
+
+
+def nrrd_crop_to_extent_enabled() -> bool:
+    """v13.3.14 (N7): write single-layer NRRDs as the minimal known-extent raster."""
+    return _env_flag('YOLO_TTA_NRRD_CROP_TO_EXTENT', True)
+
+
+def nrrd_crop_to_extent_max_fill() -> float:
+    """Crop only when bbox_voxels/full_voxels stays at or below this ratio (default 0.85)."""
+    return float(np.clip(_env_float('YOLO_TTA_NRRD_CROP_MAX_FILL', 0.85), 0.0, 1.0))
+
+
+NrrdCropWindow = Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]
+
+
+def _nrrd_crop_window_for_ref(
+    ref: 'NrrdLayerRef',
+    output_shape: Tuple[int, int, int],
+) -> Optional[NrrdCropWindow]:
+    """v13.3.14 (N7): half-open output-space crop window ``((t0,t1),(y0,y1),(x0,x1))``.
+
+    Admissible only when the layer records a trustworthy nonempty extent, the backing
+    X/Y raster already matches the output raster (t may differ — the restore mappings are
+    inverted by the established zero-skip window, padded one slice per side), and the crop
+    is actually worthwhile (fill ratio at or below nrrd_crop_to_extent_max_fill). Returns
+    None to keep the established full-raster write.
+    """
+    if not nrrd_crop_to_extent_enabled():
+        return None
+    out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
+    if out_t <= 0 or out_h <= 0 or out_w <= 0:
+        return None
+    extent = _coerce_segment_extent(getattr(ref, 'segment_extent_ijk', None))
+    if extent is None:
+        return None
+    x0, x1, y0, y1, t0, t1 = (int(v) for v in extent)
+    if x1 < x0 or y1 < y0 or t1 < t0:
+        return None  # scanned-empty: zero-skip already reduces this to cached zero members
+    in_t, in_h, in_w = (int(v) for v in getattr(ref, 'segment_extent_shape_tyx', (0, 0, 0)))
+    if in_t <= 0 or in_h != out_h or in_w != out_w:
+        return None  # X/Y-resampled restores keep the full raster
+    t_window = _nrrd_layer_zero_skip_window(ref, (out_t, out_h, out_w))
+    if t_window is None:
+        return None
+    t_lo, t_hi = (int(t_window[0]), int(t_window[1]))
+    if t_hi <= t_lo:
+        return None
+    y_lo = max(0, min(int(y0), out_h - 1))
+    y_hi = max(y_lo + 1, min(int(y1) + 1, out_h))
+    x_lo = max(0, min(int(x0), out_w - 1))
+    x_hi = max(x_lo + 1, min(int(x1) + 1, out_w))
+    crop_voxels = float(t_hi - t_lo) * float(y_hi - y_lo) * float(x_hi - x_lo)
+    full_voxels = float(out_t) * float(out_h) * float(out_w)
+    if full_voxels <= 0.0 or (crop_voxels / full_voxels) > nrrd_crop_to_extent_max_fill():
+        return None
+    return ((int(t_lo), int(t_hi)), (int(y_lo), int(y_hi)), (int(x_lo), int(x_hi)))
+
+
 def _nrrd_layer_zero_skip_window(
     ref: NrrdLayerRef,
     output_shape: Tuple[int, int, int],
@@ -27600,6 +30305,7 @@ def _write_one_decomposed_nrrd_layer_payload(
     z_start: int = 0,
     z_stop: Optional[int] = None,
     fill_workers_override: Optional[int] = None,
+    crop_window: Optional['NrrdCropWindow'] = None,
 ) -> None:
     """Write exactly one decomposed NRRD layer payload in native layer order.
 
@@ -27622,10 +30328,31 @@ def _write_one_decomposed_nrrd_layer_payload(
     now runs its compression on a one-thread writer pool with the mirror tee overlapping on
     the calling thread, matching the double-buffered branches instead of serializing
     tee -> compress -> next block.
+
+    v13.3.14 (N7): ``crop_window`` (half-open output-space ``((t0,t1),(y0,y1),(x0,x1))``)
+    writes the CROPPED raster instead of the full output raster; ``z_start``/``z_stop``
+    are then relative to the cropped t axis. ``block_consumer`` still observes FULL-raster
+    blocks (the mirror tee's contract) through a separate bounded pass. Raw-bbox stores
+    whose X/Y match the output raster additionally stream sparsely through the terminal t
+    restore (iter_restored_sparse_members) instead of rebuilding dense output planes.
     """
     out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
-    z_begin = int(np.clip(int(z_start), 0, out_t))
-    z_end = out_t if z_stop is None else int(np.clip(int(z_stop), z_begin, out_t))
+    if crop_window is not None:
+        (crop_t_lo, crop_t_hi), (crop_y_lo, crop_y_hi), (crop_x_lo, crop_x_hi) = (
+            (int(crop_window[0][0]), int(crop_window[0][1])),
+            (int(crop_window[1][0]), int(crop_window[1][1])),
+            (int(crop_window[2][0]), int(crop_window[2][1])),
+        )
+        eff_t = max(0, int(crop_t_hi - crop_t_lo))
+        eff_h = max(0, int(crop_y_hi - crop_y_lo))
+        eff_w = max(0, int(crop_x_hi - crop_x_lo))
+    else:
+        crop_t_lo, crop_t_hi = 0, int(out_t)
+        crop_y_lo, crop_y_hi = 0, int(out_h)
+        crop_x_lo, crop_x_hi = 0, int(out_w)
+        eff_t, eff_h, eff_w = int(out_t), int(out_h), int(out_w)
+    z_begin = int(np.clip(int(z_start), 0, eff_t))
+    z_end = eff_t if z_stop is None else int(np.clip(int(z_stop), z_begin, eff_t))
     if z_end <= z_begin:
         return
     z_chunk_i = max(1, int(z_chunk))
@@ -27642,11 +30369,27 @@ def _write_one_decomposed_nrrd_layer_payload(
         raw_store_native_stream = (
             isinstance(src, RawBBoxMaskStore)
             and (int(in_t), int(in_h), int(in_w)) == (int(out_t), int(out_h), int(out_w))
+            and crop_window is None
+        )
+        # v13.3.14 (N7): raw-bbox stores with matching X/Y stream sparsely through the
+        # terminal t restore — and through the crop window when one is active (which also
+        # covers the native-t cropped case).
+        raw_store_restored_stream = (
+            isinstance(src, RawBBoxMaskStore)
+            and not raw_store_native_stream
+            and int(in_h) == int(out_h) and int(in_w) == int(out_w)
+            and nrrd_sparse_t_restore_enabled()
         )
         # v13.3.7 (B5/N4): z-blocks fully outside this window are emitted as cached zero
         # members/chunks through write_zeros() — no fill, no tee, no source page reads.
         zero_window = _nrrd_layer_zero_skip_window(ref, (out_t, out_h, out_w))
         can_write_zeros = callable(getattr(payload_writer, 'write_zeros', None))
+        if crop_window is not None and zero_window is not None:
+            # Convert the full-output zero-skip window into cropped coordinates.
+            zero_window = (
+                int(np.clip(int(zero_window[0]) - int(crop_t_lo), 0, eff_t)),
+                int(np.clip(int(zero_window[1]) - int(crop_t_lo), 0, eff_t)),
+            )
 
         def _block_is_known_zero(z0: int, z1: int) -> bool:
             return (
@@ -27654,6 +30397,72 @@ def _write_one_decomposed_nrrd_layer_payload(
                 and can_write_zeros
                 and (int(z1) <= int(zero_window[0]) or int(z0) >= int(zero_window[1]))
             )
+
+        def _run_full_raster_consumer_pass() -> None:
+            """v13.3.14 (N7): bounded mirror-tee compatibility pass in FULL output geometry.
+
+            Used by the sparse restored/cropped payload branches, whose written payload
+            no longer materializes dense output blocks. Known-zero blocks are skipped
+            exactly as in the streaming paths (they contribute nothing to a mirror union).
+            The full-output zero window is recomputed here because the enclosing scope's
+            window may have been rebased into cropped coordinates.
+            """
+            if block_consumer is None:
+                return
+            full_zero_window = _nrrd_layer_zero_skip_window(ref, (out_t, out_h, out_w))
+            consumer_chunk = max(1, int(z_chunk_i))
+            full_z_begin = int(z_begin) + int(crop_t_lo)
+            full_z_end = int(z_end) + int(crop_t_lo)
+            for z0 in range(int(full_z_begin), int(full_z_end), int(consumer_chunk)):
+                z1 = min(int(full_z_end), int(z0) + int(consumer_chunk))
+                if full_zero_window is not None and (
+                    int(z1) <= int(full_zero_window[0]) or int(z0) >= int(full_zero_window[1])
+                ):
+                    continue
+                block = np.empty((int(z1 - z0), int(out_h), int(out_w)), dtype=np.uint8, order='C')
+
+                def _fill_consumer(zi: int, _z0: int = int(z0), _block: np.ndarray = block) -> None:
+                    np.copyto(
+                        _block[int(zi)],
+                        np.asarray(
+                            _read_layer_slice_in_output_shape(src, output_shape, int(_z0 + int(zi))),
+                            dtype=np.uint8,
+                        ),
+                    )
+
+                _nrrd_parallel_fill_indices(
+                    int(z1 - z0),
+                    _fill_consumer,
+                    requested_workers=min(int(nrrd_fill_workers()), int(z1 - z0)),
+                )
+                block_consumer(int(z0), block)
+
+        if bool(raw_store_restored_stream):
+            member_bytes = int(np.clip(
+                int(nrrd_gzip_chunk_bytes()),
+                8 * 1024 * 1024,
+                16 * 1024 * 1024,
+            ))
+            write_nonzero = getattr(payload_writer, 'write_known_nonzero', None)
+            if not callable(write_nonzero):
+                write_nonzero = payload_writer.write
+            with tele_phase('nrrd.sparse_restored_stream'):
+                for raw_len, member in src.iter_restored_sparse_members(
+                    int(z_begin), int(z_end),
+                    member_bytes=int(member_bytes),
+                    out_t=int(out_t),
+                    crop_window=crop_window,
+                ):
+                    if member is None and can_write_zeros:
+                        payload_writer.write_zeros(int(raw_len))
+                    elif member is None:
+                        payload_writer.write(bytes(int(raw_len)))
+                    else:
+                        write_nonzero(memoryview(member).cast('B'))
+            _run_full_raster_consumer_pass()
+            if pbar is not None:
+                pbar.update(int(z_end - z_begin))
+            return
 
         if bool(raw_store_native_stream):
             # v13.3.11 sparse cvol fast path: gzip-sized members are classified from the
@@ -27716,7 +30525,12 @@ def _write_one_decomposed_nrrd_layer_payload(
             # pool while THIS thread runs the mirror tee on the same block (both only read
             # it), so tee and deflate overlap instead of serializing — this branch carries
             # the final/global layers, previously the one path still fully serial per block.
-            slice_bytes = int(out_h) * int(out_w)
+            # v13.3.14 (N7): under a crop window, chunks are cropped (t,y,x) copies and the
+            # z loop walks the cropped t axis; the tee (if any) runs in a separate
+            # full-raster pass afterwards, so the mirror contract is unchanged.
+            cropped_mode = crop_window is not None
+            slice_bytes = int(eff_h) * int(eff_w)
+            direct_consumer = None if cropped_mode else block_consumer
             writer_pool = _acquire_parallel_pool(1)
             pending: Optional[Future] = None
             try:
@@ -27729,14 +30543,24 @@ def _write_one_decomposed_nrrd_layer_payload(
                         if pbar is not None:
                             pbar.update(int(z1 - z0))
                         continue
-                    chunk = np.asarray(src[int(z0):int(z1)], dtype=np.uint8)
-                    if not chunk.flags['C_CONTIGUOUS']:
-                        chunk = np.ascontiguousarray(chunk)
+                    if cropped_mode:
+                        chunk = np.ascontiguousarray(np.asarray(
+                            src[
+                                int(z0) + int(crop_t_lo):int(z1) + int(crop_t_lo),
+                                int(crop_y_lo):int(crop_y_hi),
+                                int(crop_x_lo):int(crop_x_hi),
+                            ],
+                            dtype=np.uint8,
+                        ))
+                    else:
+                        chunk = np.asarray(src[int(z0):int(z1)], dtype=np.uint8)
+                        if not chunk.flags['C_CONTIGUOUS']:
+                            chunk = np.ascontiguousarray(chunk)
                     if pending is not None:
                         pending.result()
                     pending = writer_pool.submit(payload_writer.write, memoryview(chunk).cast('B'))
-                    if block_consumer is not None:
-                        block_consumer(int(z0), chunk)
+                    if direct_consumer is not None:
+                        direct_consumer(int(z0), chunk)
                     if pbar is not None:
                         pbar.update(int(z1 - z0))
                     if madvise_interval > 0 and (int(z1) % int(madvise_interval) == 0):
@@ -27754,6 +30578,8 @@ def _write_one_decomposed_nrrd_layer_payload(
                     except Exception:
                         pass
                 _release_parallel_pool(1, writer_pool)
+            if cropped_mode:
+                _run_full_raster_consumer_pass()
             return
 
         # v13.3.1 (R7b): shared bounded-block streamer — each block is filled by a small
@@ -27767,11 +30593,16 @@ def _write_one_decomposed_nrrd_layer_payload(
         )
 
         def _stream_filled_blocks(fill_one: Callable[[int, np.ndarray], None], *, madvise_src: bool) -> None:
+            # v13.3.14 (N7): under a crop window the payload raster (and therefore the fill
+            # buffers, zero runs, and per-block byte counts) shrink to the effective crop.
+            # The mirror tee never observes cropped blocks — the caller runs the separate
+            # full-raster compatibility pass instead.
+            stream_consumer = block_consumer if crop_window is None else None
             local_z_chunk = int(z_chunk_i)
             buffers: List[np.ndarray] = []
             for _ in range(2):
                 try:
-                    buffers.append(np.empty((int(local_z_chunk), int(out_h), int(out_w)), dtype=np.uint8, order='C'))
+                    buffers.append(np.empty((int(local_z_chunk), int(eff_h), int(eff_w)), dtype=np.uint8, order='C'))
                 except MemoryError:
                     break
             if not buffers:
@@ -27781,7 +30612,7 @@ def _write_one_decomposed_nrrd_layer_payload(
                         'falling back to one output t-slice at a time.'
                     )
                 local_z_chunk = 1
-                buffers = [np.empty((1, int(out_h), int(out_w)), dtype=np.uint8, order='C')]
+                buffers = [np.empty((1, int(eff_h), int(eff_w)), dtype=np.uint8, order='C')]
 
             # v13.3.4 (T5): checkout-cached single-thread writer pool (was one build per layer).
             writer_pool = _acquire_parallel_pool(1)
@@ -27800,7 +30631,7 @@ def _write_one_decomposed_nrrd_layer_payload(
                         if pending is not None:
                             pending.result()
                         pending = writer_pool.submit(
-                            payload_writer.write_zeros, int(z_count) * int(out_h) * int(out_w),
+                            payload_writer.write_zeros, int(z_count) * int(eff_h) * int(eff_w),
                         )
                         if pbar is not None:
                             pbar.update(int(z_count))
@@ -27830,8 +30661,8 @@ def _write_one_decomposed_nrrd_layer_payload(
                     # v13.3.3 (S4): the mirror tee reads the block on this thread while the
                     # writer thread compresses it — both are read-only; the next refill of this
                     # buffer is still gated on pending.result() two iterations out.
-                    if block_consumer is not None:
-                        block_consumer(int(z0), block)
+                    if stream_consumer is not None:
+                        stream_consumer(int(z0), block)
                     if pbar is not None:
                         pbar.update(int(z_count))
                     if bool(madvise_src) and madvise_interval > 0 and (int(z1) % int(madvise_interval) == 0):
@@ -27850,7 +30681,20 @@ def _write_one_decomposed_nrrd_layer_payload(
         def _fill_restored(z: int, out2d: np.ndarray) -> None:
             np.copyto(out2d, np.asarray(_read_layer_slice_in_output_shape(src, output_shape, int(z)), dtype=np.uint8))
 
-        _stream_filled_blocks(_fill_restored, madvise_src=True)
+        def _fill_restored_cropped(z: int, out2d: np.ndarray) -> None:
+            # v13.3.14 (N7): restore in full output geometry, keep only the crop window.
+            plane = np.asarray(
+                _read_layer_slice_in_output_shape(src, output_shape, int(z) + int(crop_t_lo)),
+                dtype=np.uint8,
+            )
+            np.copyto(out2d, plane[int(crop_y_lo):int(crop_y_hi), int(crop_x_lo):int(crop_x_hi)])
+
+        _stream_filled_blocks(
+            _fill_restored if crop_window is None else _fill_restored_cropped,
+            madvise_src=True,
+        )
+        if crop_window is not None:
+            _run_full_raster_consumer_pass()
     finally:
         if src is not None:
             _madvise_array_mmap(src, 'MADV_DONTNEED')
@@ -29027,6 +31871,10 @@ def main() -> None:
     # v12.2.0 --troubleshooting creates overlay MKVs only. Temporary scratch retention is a
     # separate hidden maintenance escape hatch so troubleshooting no longer changes cleanup semantics.
     keep_temp_artifacts = bool(_env_flag('YOLO_TTA_KEEP_TEMP', False))
+    if keep_temp_artifacts:
+        # v13.3.14 (P7): memfd workspaces have no filesystem presence, so retained temp
+        # archives would silently lose the union/interpolation volumes.
+        set_memfd_workspaces_disabled('YOLO_TTA_KEEP_TEMP=1 archives temp files')
 
     out_dir = Path(args.output).expanduser().resolve() if args.output else (Path.cwd() / input_path.stem)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -29034,6 +31882,9 @@ def main() -> None:
     temp_dir = choose_scratch_dir(None, out_dir, input_path.stem)
     expose_scratch_in_output(out_dir, temp_dir)
     print(f"Bulk scratch dir: {temp_dir}")
+    if telemetry_trace_enabled():
+        # v13.3.14 (M1): buffered JSONL event trace (opt-in; counters are always on).
+        TELEMETRY.set_trace_path(temp_dir / 'telemetry_trace.jsonl')
 
     info = ffprobe_info(input_path)
     input_W = int(info['width'])
@@ -30248,32 +33099,44 @@ def main() -> None:
         # view per pass; page cache keeps reads/writes at RAM speed. Non-interpolating views
         # keep the anonymous-RAM preference.
         # v13.3.1 (R4): direct union writes require file-backed workspaces the workers can open.
-        union_prefer_memory = not (
+        # v13.3.14 (P7): that file backing exists ONLY for cross-process visibility, so these
+        # workspaces are memfd candidates — same reopen-by-path protocol via mm.filename
+        # (/proc/<pid>/fd/<n>), zero filesystem writeback. The recorded baseline path is the
+        # EFFECTIVE backing path so direct-union workers and interpolation children open
+        # whichever backing was actually granted.
+        union_cross_process = (
             (
                 interpolation_process_backend_enabled()
                 and _view_uses_interpolation(view, int(args.interpolate))
             )
             or mgpu_direct_union_active
         )
+        union_prefer_memory = not union_cross_process
         processing_shape = view_processing_volume_shape(view, int(args.imgsz))
-        baseline_union_by_model_view[key] = allocate_workspace_array(
+        union_mm_new = allocate_workspace_array(
             shape=processing_shape,
             dtype=np.uint8,
             path=union_path,
             desc=f'{model_name}/{view.name} baseline union workspace',
             prefer_memory=bool(union_prefer_memory),
+            allow_memfd=bool(union_cross_process),
         )
-        baseline_union_paths[key] = union_path
+        baseline_union_by_model_view[key] = union_mm_new
+        union_effective = getattr(union_mm_new, 'filename', None)
+        baseline_union_paths[key] = Path(union_effective) if union_effective else union_path
         baseline_slice_locks_by_model_view[key] = [threading.Lock() for _ in range(int(view.num_slices))]
         if float(args.min_conf) > 0.0:
-            baseline_confmap_by_model_view[key] = allocate_workspace_array(
+            confmap_mm_new = allocate_workspace_array(
                 shape=processing_shape,
                 dtype=np.uint8,
                 path=confmap_path,
                 desc=f'{model_name}/{view.name} baseline confidence workspace',
                 prefer_memory=not mgpu_direct_union_active,
+                allow_memfd=bool(mgpu_direct_union_active),
             )
-            baseline_confmap_paths[key] = confmap_path
+            baseline_confmap_by_model_view[key] = confmap_mm_new
+            conf_effective = getattr(confmap_mm_new, 'filename', None)
+            baseline_confmap_paths[key] = Path(conf_effective) if conf_effective else confmap_path
         else:
             baseline_confmap_by_model_view[key] = None
             baseline_confmap_paths[key] = None
@@ -32117,6 +34980,13 @@ def main() -> None:
     # output_manager and layer_sink are both fully settled: no payload writer can still
     # hold an engine, so release validated and runtime-blacklisted nvCOMP owner pools now.
     shutdown_nrrd_gpu_deflate_engines()
+    # v13.3.14 (P7): close any workspace anchor fds a consumer path did not release.
+    shutdown_memfd_workspaces()
+    # v13.3.14 (M1): coarse phase/layer telemetry summary (+ optional JSON sidecar).
+    TELEMETRY.report(
+        json_path=(out_dir / f'{input_path.stem}_telemetry.json') if telemetry_trace_enabled() else None,
+        desc='phase/layer telemetry',
+    )
 
     if bool(args.save_images):
         print('\n=== Saving active-view image sequences ===')
