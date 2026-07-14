@@ -2,8 +2,17 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the GPT-5.6-Ultra v13.3.15_SLURM implementation. It is derived from
-GPT-5.6-Ultra_v13.3.14_SLURM.py by COPY + surgical edits implementing the supplied task list:
+This is the GPT-5.6-Ultra v13.3.16_SLURM implementation. It is derived from
+GPT-5.6-Ultra_v13.3.15_SLURM.py by COPY + surgical edits driven by run 126080:
+  - v13.3.16 (P4/R24/N19/G9) removes the fused-render NVRTC dependency on the missing
+    system math.h header, pipelines resident Radial source upload and projected-block
+    commits, optionally transposes the resident source to a cache-friendlier t-major GPU
+    layout, makes nvCOMP gzip framing use zlib CRC unconditionally and removes the unsafe
+    compatibility input coalescer, and gives G5 a bounded sequential-z frontier instead of
+    faulting projected stores from hundreds of widely separated slices at once. NRRD source
+    MADV_DONTNEED is now opt-in by default so component pages remain warm for the final union.
+
+Inherited from v13.3.15:
   - v13.3.15 (P1/P4/R23/N18) makes the resident TensorRT executor truly worker-lifetime,
     replaces the failing templated Radial/Tilted NVRTC module with explicit fp16/fp32 kernels
     plus actionable compile diagnostics, adds a full-resident one-kernel Radial backprojection
@@ -4699,6 +4708,24 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return True
 
 
+def _cupy_external_stream(cp: object, torch_stream: object) -> object:
+    """Bridge a Torch CUDA stream into CuPy without the CuPy 14 ExternalStream warning.
+
+    CuPy 14 prefers ``Stream.from_external`` and Torch streams implement the CUDA stream
+    protocol in current builds. Older CuPy/Torch combinations retain the pointer-based
+    ExternalStream fallback so this compatibility cleanup cannot disable an acceleration path.
+    """
+    stream_cls = getattr(getattr(cp, 'cuda', None), 'Stream', None)
+    factory = getattr(stream_cls, 'from_external', None)
+    if callable(factory):
+        for candidate in (torch_stream, int(getattr(torch_stream, 'cuda_stream'))):
+            try:
+                return factory(candidate)
+            except Exception:
+                continue
+    return cp.cuda.ExternalStream(int(getattr(torch_stream, 'cuda_stream')))
+
+
 def write_aug_job_meta(job: AugJob, view: ViewInfo) -> None:
     job.meta_path.parent.mkdir(parents=True, exist_ok=True)
     job.meta_path.write_text(
@@ -9119,7 +9146,7 @@ def _process_gpu_flattened_prediction_frame(
                         _dev_idx = getattr(native_union_bool_t.device, 'index', None)
                         _cp_dev = cp.cuda.Device(int(_dev_idx)) if _dev_idx is not None else cp.cuda.Device()
                         _cp_stream = (
-                            cp.cuda.ExternalStream(int(side_stream.cuda_stream))
+                            _cupy_external_stream(cp, side_stream)
                             if side_stream is not None else contextlib.nullcontext()
                         )
                         with _cp_dev, _cp_stream:
@@ -9783,7 +9810,7 @@ def _build_direct_device_compacted_payload(
 
         cp = kernels.cp
         stream = torch.cuda.current_stream(device)
-        external = cp.cuda.ExternalStream(int(stream.cuda_stream))
+        external = _cupy_external_stream(cp, stream)
         cp_head = cp.asarray(head)
         cp_proto = cp.asarray(proto)
         cp_indices = cp.asarray(indices)
@@ -11193,7 +11220,6 @@ def _fused_direct_render_kernels() -> Optional[object]:
         return None
     src = r'''
     #include <cuda_fp16.h>
-    #include <math.h>
 
     __device__ __forceinline__ int clamp_i(int v, int lo, int hi) {
       return v < lo ? lo : (v > hi ? hi : v);
@@ -11201,8 +11227,19 @@ def _fused_direct_render_kernels() -> Optional[object]:
     __device__ __forceinline__ float clamp_f(float v, float lo, float hi) {
       return v < lo ? lo : (v > hi ? hi : v);
     }
+    // Header-free device math: run 126080 showed NVRTC 13.0 could not locate
+    // the host system math.h. CUDA device math functions need no host header path.
+    __device__ __forceinline__ float abs_f(float v) {
+      return v < 0.0f ? -v : v;
+    }
+    __device__ __forceinline__ int floor_i(float v) {
+      return __float2int_rd(v);
+    }
+    __device__ __forceinline__ float round_nearest_f(float v) {
+      return (float)__float2int_rn(v);
+    }
     __device__ __forceinline__ float sinc1(float x) {
-      if (fabsf(x) < 1.0e-7f) return 1.0f;
+      if (abs_f(x) < 1.0e-7f) return 1.0f;
       float pix = 3.14159265358979323846f * x;
       return sinf(pix) / pix;
     }
@@ -11232,8 +11269,8 @@ def _fused_direct_render_kernels() -> Optional[object]:
       float theta = angles_deg[aidx] * 0.01745329251994329577f;
       float sx = center_x + coord * cosf(theta);
       float sy = center_y + coord * sinf(theta);
-      int bx = (int)floorf(sx);
-      int by = (int)floorf(sy);
+      int bx = floor_i(sx);
+      int by = floor_i(sy);
       float wx[6], wy[6];
       int ix[6], iy[6];
       float sumx = 0.0f, sumy = 0.0f;
@@ -11243,8 +11280,8 @@ def _fused_direct_render_kernels() -> Optional[object]:
         int ry = by + k - 2;
         float dx = sx - (float)rx;
         float dy = sy - (float)ry;
-        float vx = fabsf(dx) >= 3.0f ? 0.0f : sinc1(dx) * sinc1(dx / 3.0f);
-        float vy = fabsf(dy) >= 3.0f ? 0.0f : sinc1(dy) * sinc1(dy / 3.0f);
+        float vx = abs_f(dx) >= 3.0f ? 0.0f : sinc1(dx) * sinc1(dx / 3.0f);
+        float vy = abs_f(dy) >= 3.0f ? 0.0f : sinc1(dy) * sinc1(dy / 3.0f);
         if (rx < 0 || rx >= full_w) vx = 0.0f;
         if (ry < 0 || ry >= full_h) vy = 0.0f;
         ix[k] = clamp_i(rx, 0, full_w - 1);
@@ -11257,8 +11294,8 @@ def _fused_direct_render_kernels() -> Optional[object]:
       for (int k = 0; k < 6; ++k) {
         x_idx[off + k] = ix[k];
         y_idx[off + k] = iy[k];
-        x_w[off + k] = fabsf(sumx) > 1.0e-6f ? wx[k] / sumx : wx[k];
-        y_w[off + k] = fabsf(sumy) > 1.0e-6f ? wy[k] / sumy : wy[k];
+        x_w[off + k] = abs_f(sumx) > 1.0e-6f ? wx[k] / sumx : wx[k];
+        y_w[off + k] = abs_f(sumy) > 1.0e-6f ? wy[k] / sumy : wy[k];
       }
     }
 
@@ -11267,7 +11304,7 @@ def _fused_direct_render_kernels() -> Optional[object]:
         int rows, int n_u, int angle_idx, int row, int u,
         const int* x_idx, const int* y_idx, const float* x_w, const float* y_w) {
       float rf = ((float)row + 0.5f) * ((float)native_t / (float)rows) - 0.5f;
-      int raw0 = (int)floorf(rf);
+      int raw0 = floor_i(rf);
       int t0 = clamp_i(raw0, 0, native_t - 1);
       int t1 = t0 + 1 < native_t ? t0 + 1 : native_t - 1;
       float ta = clamp_f(rf - (float)t0, 0.0f, 1.0f);
@@ -11295,7 +11332,7 @@ def _fused_direct_render_kernels() -> Optional[object]:
         const unsigned char* volume, int native_t, int full_h, int full_w,
         int rows, int n_u, int angle_idx, float sy, float sx,
         const int* x_idx, const int* y_idx, const float* x_w, const float* y_w) {
-      int x0 = (int)floorf(sx), y0 = (int)floorf(sy);
+      int x0 = floor_i(sx), y0 = floor_i(sy);
       int x1 = x0 + 1, y1 = y0 + 1;
       float fx = sx - (float)x0, fy = sy - (float)y0;
       float v00 = (x0 >= 0 && x0 < n_u && y0 >= 0 && y0 < rows)
@@ -11360,7 +11397,7 @@ def _fused_direct_render_kernels() -> Optional[object]:
     __device__ __forceinline__ void logical_t_taps(
         int logical_idx, int native_t, int logical_t, int* t0, int* t1, float* alpha) {
       float pos = ((float)logical_idx + 0.5f) * ((float)native_t / (float)logical_t) - 0.5f;
-      int raw0 = (int)floorf(pos);
+      int raw0 = floor_i(pos);
       *t0 = clamp_i(raw0, 0, native_t - 1);
       *t1 = *t0 + 1 < native_t ? *t0 + 1 : native_t - 1;
       *alpha = clamp_f(pos - (float)(*t0), 0.0f, 1.0f);
@@ -11371,7 +11408,7 @@ def _fused_direct_render_kernels() -> Optional[object]:
         int t0, int t1, float alpha) {
       float a = (float)volume[(long long)t0 * plane_stride + spatial];
       float b = (float)volume[(long long)t1 * plane_stride + spatial];
-      return clamp_f(rintf(a + alpha * (b - a)), 0.0f, 255.0f);
+      return clamp_f(round_nearest_f(a + alpha * (b - a)), 0.0f, 255.0f);
     }
 
     __device__ __forceinline__ float tilted_direct_value(
@@ -11391,7 +11428,7 @@ def _fused_direct_render_kernels() -> Optional[object]:
           : sx - 0.5f * (float)(src_w - 1);
       float stack = __fadd_rn((float)frame_center, __fmul_rn(tan_tilt, axis));
       if (stack < 0.0f || stack > (float)(stack_len - 1)) return 0.0f;
-      int s0 = clamp_i((int)floorf(stack), 0, stack_len - 1);
+      int s0 = clamp_i(floor_i(stack), 0, stack_len - 1);
       int s1 = s0 + 1 < stack_len ? s0 + 1 : stack_len - 1;
       float sa = stack - (float)s0;
       long long ps = (long long)full_h * (long long)full_w;
@@ -11598,7 +11635,7 @@ class _GpuWorkerRenderEngine:
         if self._volume_key == key and self._mode != 'unresolved':
             return self._mode
         self._volume_key = key
-        self._volume_mm = np.memmap(Path(str(path)), dtype=np.dtype(str(dtype)), mode='r', shape=shape_t)
+        self._volume_mm = np.memmap(Path(str(path)), dtype=np.dtype(str(dtype)), mode='c', shape=shape_t)
         self._volume_gpu = None
         self._volume_flat = None
         self._logical_t = int(out_t)
@@ -11777,7 +11814,7 @@ class _GpuWorkerRenderEngine:
         if frame_value is not None:
             kernels.set_render_meta(
                 (1,), (1,), (ref, np.int32(frame_value)),
-                stream=kernels.cp.cuda.ExternalStream(int(self._stream.cuda_stream)),
+                stream=_cupy_external_stream(kernels.cp, self._stream),
             )
         return ref
 
@@ -11837,7 +11874,7 @@ class _GpuWorkerRenderEngine:
             cp_y_idx=cp.asarray(y_idx), cp_x_w=cp.asarray(x_w), cp_y_w=cp.asarray(y_w),
             n_angles=n_angles, n_u=n_u, nbytes=descriptor_bytes,
         )
-        external = cp.cuda.ExternalStream(int(self._stream.cuda_stream))
+        external = _cupy_external_stream(cp, self._stream)
         total = int(n_angles) * int(n_u)
         kernels.precompute_radial_taps(
             ((total + 255) // 256,), (256,),
@@ -11888,7 +11925,7 @@ class _GpuWorkerRenderEngine:
             if not bool(np.all(np.isfinite(matrix))):
                 raise RuntimeError('Radial output-to-source affine is non-finite')
             cp = kernels.cp
-            external = cp.cuda.ExternalStream(int(self._stream.cuda_stream))
+            external = _cupy_external_stream(cp, self._stream)
             kernel = (
                 kernels.radial_direct_f16
                 if slot.input.dtype == self.torch.float16 else kernels.radial_direct_f32
@@ -11967,7 +12004,7 @@ class _GpuWorkerRenderEngine:
             if not bool(np.all(np.isfinite(matrix))):
                 raise RuntimeError('Tilted output-to-source affine is non-finite')
             cp = kernels.cp
-            external = cp.cuda.ExternalStream(int(self._stream.cuda_stream))
+            external = _cupy_external_stream(cp, self._stream)
             kernel = (
                 kernels.tilted_direct_f16
                 if slot.input.dtype == self.torch.float16 else kernels.tilted_direct_f32
@@ -15628,7 +15665,7 @@ class _ResidentTensorRTRingExecutor:
         anchors = int(head.shape[2])
         masks = int(proto.shape[1])
         ph, pw = int(proto.shape[2]), int(proto.shape[3])
-        external = cp.cuda.ExternalStream(int(slot.post_stream.cuda_stream))
+        external = _cupy_external_stream(cp, slot.post_stream)
         # _launch_post is always entered under torch.cuda.stream(post_stream), so this
         # clear and the external CuPy launches share the same capture-safe CUDA stream.
         slot.compact_count.zero_()
@@ -16304,40 +16341,99 @@ def _radial_resident_backproject_kernel() -> Optional[object]:
     try:
         import cupy as cp  # type: ignore
         code = r'''
-        extern "C" __global__ void radial_backproject_u8(
+        extern "C" __global__ void radial_backproject_azmajor_u8(
             const unsigned char* radial, int n_az, int work_t, int u_len,
             const int* source_idx, const int* u_idx, int plane_px,
             int output_t, int output_t0, int output_count, unsigned char* output) {
-          long long q = (long long)blockDim.x * (long long)blockIdx.x + (long long)threadIdx.x;
+          long long q0 = (long long)blockDim.x * (long long)blockIdx.x + (long long)threadIdx.x;
+          long long stride = (long long)blockDim.x * (long long)gridDim.x;
           long long total = (long long)output_count * (long long)plane_px;
-          if (q >= total) return;
-          int local_t = (int)(q / (long long)plane_px);
-          int p = (int)(q - (long long)local_t * (long long)plane_px);
-          int az = source_idx[p];
-          if (az < 0 || az >= n_az) { output[q] = 0; return; }
-          int u = u_idx[p];
-          if (u < 0 || u >= u_len) { output[q] = 0; return; }
-          int t = output_t0 + local_t;
-          int v0 = (int)(((long long)t * (long long)work_t) / (long long)output_t);
-          int v1 = (int)((((long long)(t + 1) * (long long)work_t) + output_t - 1) / (long long)output_t);
-          if (v0 < 0) v0 = 0;
-          if (v1 > work_t) v1 = work_t;
-          if (v1 <= v0) v1 = v0 + 1 <= work_t ? v0 + 1 : work_t;
-          unsigned char value = 0;
-          long long az_base = (long long)az * (long long)work_t * (long long)u_len;
-          for (int v = v0; v < v1; ++v) {
-            unsigned char candidate = radial[az_base + (long long)v * (long long)u_len + (long long)u];
-            value = candidate > value ? candidate : value;
+          for (long long q = q0; q < total; q += stride) {
+            int local_t = (int)(q / (long long)plane_px);
+            int p = (int)(q - (long long)local_t * (long long)plane_px);
+            int az = source_idx[p];
+            int u = u_idx[p];
+            if (az < 0 || az >= n_az || u < 0 || u >= u_len) {
+              output[q] = 0;
+              continue;
+            }
+            int t = output_t0 + local_t;
+            int v0 = (int)(((long long)t * (long long)work_t) / (long long)output_t);
+            int v1 = (int)((((long long)(t + 1) * (long long)work_t) + output_t - 1) / (long long)output_t);
+            if (v0 < 0) v0 = 0;
+            if (v1 > work_t) v1 = work_t;
+            if (v1 <= v0) v1 = v0 + 1 <= work_t ? v0 + 1 : work_t;
+            unsigned char value = 0;
+            long long az_base = (long long)az * (long long)work_t * (long long)u_len;
+            for (int v = v0; v < v1; ++v) {
+              unsigned char candidate = radial[az_base + (long long)v * (long long)u_len + (long long)u];
+              value = candidate > value ? candidate : value;
+            }
+            output[q] = value;
           }
-          output[q] = value;
+        }
+
+        extern "C" __global__ void radial_backproject_tmajor_u8(
+            const unsigned char* radial, int n_az, int work_t, int u_len,
+            const int* source_idx, const int* u_idx, int plane_px,
+            int output_t, int output_t0, int output_count, unsigned char* output) {
+          long long q0 = (long long)blockDim.x * (long long)blockIdx.x + (long long)threadIdx.x;
+          long long stride = (long long)blockDim.x * (long long)gridDim.x;
+          long long total = (long long)output_count * (long long)plane_px;
+          for (long long q = q0; q < total; q += stride) {
+            int local_t = (int)(q / (long long)plane_px);
+            int p = (int)(q - (long long)local_t * (long long)plane_px);
+            int az = source_idx[p];
+            int u = u_idx[p];
+            if (az < 0 || az >= n_az || u < 0 || u >= u_len) {
+              output[q] = 0;
+              continue;
+            }
+            int t = output_t0 + local_t;
+            int v0 = (int)(((long long)t * (long long)work_t) / (long long)output_t);
+            int v1 = (int)((((long long)(t + 1) * (long long)work_t) + output_t - 1) / (long long)output_t);
+            if (v0 < 0) v0 = 0;
+            if (v1 > work_t) v1 = work_t;
+            if (v1 <= v0) v1 = v0 + 1 <= work_t ? v0 + 1 : work_t;
+            unsigned char value = 0;
+            for (int v = v0; v < v1; ++v) {
+              long long index = ((long long)v * (long long)n_az + (long long)az)
+                              * (long long)u_len + (long long)u;
+              unsigned char candidate = radial[index];
+              value = candidate > value ? candidate : value;
+            }
+            output[q] = value;
+          }
+        }
+
+        extern "C" __global__ void radial_azmajor_to_tmajor_u8(
+            const unsigned char* source, int n_az, int work_t, int u_len,
+            unsigned char* target) {
+          long long q0 = (long long)blockDim.x * (long long)blockIdx.x + (long long)threadIdx.x;
+          long long stride = (long long)blockDim.x * (long long)gridDim.x;
+          long long total = (long long)n_az * (long long)work_t * (long long)u_len;
+          for (long long q = q0; q < total; q += stride) {
+            int u = (int)(q % (long long)u_len);
+            long long av = q / (long long)u_len;
+            int v = (int)(av % (long long)work_t);
+            int az = (int)(av / (long long)work_t);
+            target[((long long)v * (long long)n_az + (long long)az) * (long long)u_len + (long long)u]
+                = source[q];
+          }
         }
         '''
         module = cp.RawModule(code=code, options=('--std=c++14',))
         compile_fn = getattr(module, 'compile', None)
         if callable(compile_fn):
             compile_fn()
+        kernel_azmajor = module.get_function('radial_backproject_azmajor_u8')
         _RADIAL_RESIDENT_BACKPROJECT_KERNEL = argparse.Namespace(
-            cp=cp, module=module, kernel=module.get_function('radial_backproject_u8'),
+            cp=cp,
+            module=module,
+            kernel=kernel_azmajor,  # compatibility alias
+            kernel_azmajor=kernel_azmajor,
+            kernel_tmajor=module.get_function('radial_backproject_tmajor_u8'),
+            transpose=module.get_function('radial_azmajor_to_tmajor_u8'),
         )
         return _RADIAL_RESIDENT_BACKPROJECT_KERNEL
     except Exception as exc:
@@ -16364,12 +16460,15 @@ def _radial_backproject_gpu_resident(
     known_row_occupancy: Optional[np.ndarray] = None,
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
 ) -> bool:
-    """Upload the azimuth-major radial volume once and project with one direct kernel.
+    """Project a fully resident radial source with staged upload/commit overlap.
 
-    Unlike R6a/R22, this path never transposes host rows, builds a gathered (rows,P)
-    intermediate, or performs scatter-reduce. It is admitted only when the complete radial
-    source plus maps/output buffers fit with explicit headroom; otherwise the established
-    streaming path remains unchanged.
+    v13.3.16 R24 keeps R23's one-time source upload but fixes the two serial sections
+    visible in run 126080: two pinned source slots overlap host reads with H2D, and two
+    output slots let the next CUDA chunk run while the previous dense block is copied to
+    the destination and encoded into the incremental cvol. When VRAM permits, one device
+    transpose changes the source from (azimuth,t,u) to (t,azimuth,u), reducing the dominant
+    per-warp azimuth stride from work_t*u bytes to u bytes. Every stage retains an automatic
+    fallback to the v13.3.15 azimuth-major/single-slot behavior.
     """
     if not gpu_resident_radial_backproject_enabled():
         return False
@@ -16390,18 +16489,18 @@ def _radial_backproject_gpu_resident(
     source_bytes = int(radial_mask_mm.nbytes)
     map_bytes = int(plane_px) * 2 * np.dtype(np.int32).itemsize
     output_bytes = int(t_chunk) * int(plane_px)
-    need = int(source_bytes + map_bytes + output_bytes + 256 * 1024 * 1024)
+    base_need = int(source_bytes + map_bytes + output_bytes + 256 * 1024 * 1024)
     try:
         free_bytes, _total = torch.cuda.mem_get_info(dev)
     except Exception:
         return False
-    while t_chunk > 8 and int(free_bytes) < int(need) + int(reserve):
+    while t_chunk > 8 and int(free_bytes) < int(base_need) + int(reserve):
         t_chunk //= 2
         output_bytes = int(t_chunk) * int(plane_px)
-        need = int(source_bytes + map_bytes + output_bytes + 256 * 1024 * 1024)
-    if int(free_bytes) < int(need) + int(reserve):
+        base_need = int(source_bytes + map_bytes + output_bytes + 256 * 1024 * 1024)
+    if int(free_bytes) < int(base_need) + int(reserve):
         print(
-            f'{desc}: full-resident GPU backprojection skipped (need≈{need / GIB:.1f} GiB '
+            f'{desc}: full-resident GPU backprojection skipped (need≈{base_need / GIB:.1f} GiB '
             f'+ {reserve / GIB:.1f} GiB reserve, free={int(free_bytes) / GIB:.1f} GiB).'
         )
         return False
@@ -16432,42 +16531,168 @@ def _radial_backproject_gpu_resident(
         except Exception:
             dev_index = 0
     stream = torch.cuda.Stream(device=dev)
+    phase_start = time.perf_counter()
+    upload_seconds = 0.0
+    transpose_seconds = 0.0
+    projection_seconds = 0.0
+    commit_cpu_seconds = 0.0
+    radial_dev = tmajor_dev = source_dev = u_dev = out_dev = None
+    pin_src_slots: List[object] = []
+    pin_out_slots: List[object] = []
+    commit_pool: Optional[ThreadPoolExecutor] = None
+    commit_futures: List[Optional[Future]] = []
     try:
         # Torch and CuPy keep independent current-device state. Pin both explicitly so
-        # the late-tail scheduler may choose any of the visible GPUs, not only cuda:0.
+        # the late-tail scheduler may choose any visible GPU, not only cuda:0.
         with torch.cuda.device(dev), cp.cuda.Device(int(dev_index)), torch.cuda.stream(stream):
             radial_dev = torch.empty((n_az, work_t, u_len), dtype=torch.uint8, device=dev)
-            pin_src = torch.empty((az_chunk, work_t, u_len), dtype=torch.uint8, pin_memory=True)
-            pin_src_np = pin_src.numpy()
-            for a0 in tqdm(range(0, n_az, az_chunk), desc=f'{desc} [resident H2D]'):
+
+            requested_upload_slots = max(1, min(3, _env_int(
+                'YOLO_TTA_GPU_BACKPROJECT_RESIDENT_UPLOAD_SLOTS', 2,
+            )))
+            for _ in range(int(requested_upload_slots)):
+                try:
+                    pin_src_slots.append(torch.empty(
+                        (az_chunk, work_t, u_len), dtype=torch.uint8, pin_memory=True,
+                    ))
+                except Exception:
+                    break
+            if not pin_src_slots:
+                pin_src_slots.append(torch.empty(
+                    (az_chunk, work_t, u_len), dtype=torch.uint8, pin_memory=True,
+                ))
+            pin_src_arrays = [slot.numpy() for slot in pin_src_slots]
+            upload_events: List[Optional[object]] = [None] * len(pin_src_slots)
+            upload_t0 = time.perf_counter()
+            for chunk_idx, a0 in enumerate(tqdm(
+                range(0, n_az, az_chunk), desc=f'{desc} [resident H2D]',
+            )):
+                slot_idx = int(chunk_idx) % len(pin_src_slots)
+                prior = upload_events[slot_idx]
+                if prior is not None:
+                    prior.synchronize()
                 a1 = min(n_az, a0 + az_chunk)
                 count = int(a1 - a0)
-                np.copyto(pin_src_np[:count], np.asarray(radial_mask_mm[a0:a1], dtype=np.uint8))
-                radial_dev[a0:a1].copy_(pin_src[:count], non_blocking=True)
-                stream.synchronize()  # one reusable pinned window; no host transpose
+                np.copyto(
+                    pin_src_arrays[slot_idx][:count],
+                    np.asarray(radial_mask_mm[a0:a1], dtype=np.uint8),
+                )
+                radial_dev[a0:a1].copy_(pin_src_slots[slot_idx][:count], non_blocking=True)
+                event = torch.cuda.Event(blocking=False)
+                event.record(stream)
+                upload_events[slot_idx] = event
+            stream.synchronize()
+            upload_seconds = time.perf_counter() - upload_t0
+
             source_dev = torch.from_numpy(source_flat).to(dev, non_blocking=False)
             u_dev = torch.from_numpy(u_flat).to(dev, non_blocking=False)
-            out_dev = torch.empty((t_chunk, plane_px), dtype=torch.uint8, device=dev)
-            pin_out = torch.empty((t_chunk, plane_px), dtype=torch.uint8, pin_memory=True)
-            pin_out_np = pin_out.numpy()
-            external = cp.cuda.ExternalStream(int(stream.cuda_stream))
-            cp_radial = cp.asarray(radial_dev)
+            external = _cupy_external_stream(cp, stream)
             cp_source = cp.asarray(source_dev)
             cp_u = cp.asarray(u_dev)
+
+            layout = 'azimuth-major'
+            compute_kernel = kernels.kernel_azmajor
+            compute_tensor = radial_dev
+            tmajor_peak = int(2 * source_bytes + map_bytes + output_bytes + 256 * 1024 * 1024)
+            if (
+                _env_flag('YOLO_TTA_GPU_BACKPROJECT_RESIDENT_TMAJOR', True)
+                and int(free_bytes) >= int(tmajor_peak) + int(reserve)
+            ):
+                transpose_t0 = time.perf_counter()
+                try:
+                    tmajor_dev = torch.empty((work_t, n_az, u_len), dtype=torch.uint8, device=dev)
+                    cp_azmajor = cp.asarray(radial_dev)
+                    cp_tmajor = cp.asarray(tmajor_dev)
+                    total_source = int(n_az) * int(work_t) * int(u_len)
+                    transpose_blocks = max(1, min(
+                        (int(total_source) + 255) // 256,
+                        _env_int('YOLO_TTA_GPU_BACKPROJECT_RESIDENT_CUDA_BLOCKS', 65535),
+                    ))
+                    kernels.transpose(
+                        (int(transpose_blocks),), (256,),
+                        (
+                            cp_azmajor, np.int32(n_az), np.int32(work_t), np.int32(u_len),
+                            cp_tmajor,
+                        ),
+                        stream=external,
+                    )
+                    stream.synchronize()
+                    compute_tensor = tmajor_dev
+                    compute_kernel = kernels.kernel_tmajor
+                    layout = 't-major'
+                except Exception as exc:
+                    tmajor_dev = None
+                    compute_tensor = radial_dev
+                    compute_kernel = kernels.kernel_azmajor
+                    print(f'{desc}: t-major resident transpose unavailable ({exc}); using azimuth-major layout.')
+                transpose_seconds = time.perf_counter() - transpose_t0
+
+            cp_radial = cp.asarray(compute_tensor)
+            out_dev = torch.empty((t_chunk, plane_px), dtype=torch.uint8, device=dev)
             cp_out = cp.asarray(out_dev)
-            for t0 in tqdm(range(0, int(t_dim), int(t_chunk)), desc=f'{desc} [resident gpu]'):
+
+            requested_commit_slots = max(1, min(4, _env_int(
+                'YOLO_TTA_GPU_BACKPROJECT_RESIDENT_COMMIT_SLOTS', 2,
+            )))
+            for _ in range(int(requested_commit_slots)):
+                try:
+                    pin_out_slots.append(torch.empty(
+                        (t_chunk, plane_px), dtype=torch.uint8, pin_memory=True,
+                    ))
+                except Exception:
+                    break
+            if not pin_out_slots:
+                pin_out_slots.append(torch.empty(
+                    (t_chunk, plane_px), dtype=torch.uint8, pin_memory=True,
+                ))
+            pin_out_arrays = [slot.numpy() for slot in pin_out_slots]
+            commit_futures = [None] * len(pin_out_slots)
+            commit_pool = _acquire_parallel_pool(len(pin_out_slots))
+
+            def _commit_block(t0_i: int, t1_i: int, block_i: np.ndarray) -> float:
+                started = time.perf_counter()
+                np.copyto(np.asarray(vol_mm[int(t0_i):int(t1_i)]), block_i)
+                _emit_projection_block_callback(
+                    projection_block_callback, int(t0_i), block_i, desc=desc,
+                )
+                return float(time.perf_counter() - started)
+
+            def _settle_commit(slot_idx: int) -> None:
+                nonlocal commit_cpu_seconds
+                fut = commit_futures[int(slot_idx)]
+                if fut is not None:
+                    commit_cpu_seconds += float(fut.result())
+                    commit_futures[int(slot_idx)] = None
+
+            projection_t0 = time.perf_counter()
+            for chunk_idx, t0 in enumerate(tqdm(
+                range(0, int(t_dim), int(t_chunk)), desc=f'{desc} [resident gpu]',
+            )):
                 t1 = min(int(t_dim), int(t0) + int(t_chunk))
                 v0 = v_range_for_t(int(t0))[0]
                 v1 = v_range_for_t(int(t1 - 1))[1]
                 if not bool(np.any(row_any[int(v0):int(v1)])):
-                    _emit_projection_block_callback(
-                        projection_block_callback, int(t0), np.asarray(vol_mm[int(t0):int(t1)]), desc=desc,
-                    )
+                    empty_consumer = getattr(projection_block_callback, 'consume_empty_range', None)
+                    if callable(empty_consumer):
+                        empty_consumer(int(t0), int(t1 - t0))
+                    else:
+                        _emit_projection_block_callback(
+                            projection_block_callback,
+                            int(t0),
+                            np.asarray(vol_mm[int(t0):int(t1)]),
+                            desc=desc,
+                        )
                     continue
+                slot_idx = int(chunk_idx) % len(pin_out_slots)
+                _settle_commit(slot_idx)
                 count = int(t1 - t0)
                 total = int(count) * int(plane_px)
-                kernels.kernel(
-                    ((total + 255) // 256,), (256,),
+                launch_blocks = max(1, min(
+                    (int(total) + 255) // 256,
+                    _env_int('YOLO_TTA_GPU_BACKPROJECT_RESIDENT_CUDA_BLOCKS', 65535),
+                ))
+                compute_kernel(
+                    (int(launch_blocks),), (256,),
                     (
                         cp_radial, np.int32(n_az), np.int32(work_t), np.int32(u_len),
                         cp_source, cp_u, np.int32(plane_px), np.int32(t_dim),
@@ -16475,22 +16700,39 @@ def _radial_backproject_gpu_resident(
                     ),
                     stream=external,
                 )
-                pin_out[:count].copy_(out_dev[:count], non_blocking=True)
+                pin_out_slots[slot_idx][:count].copy_(out_dev[:count], non_blocking=True)
                 stream.synchronize()
-                block = pin_out_np[:count].reshape((count, int(out_h), int(out_w)))
-                np.copyto(np.asarray(vol_mm[t0:t1]), block)
-                _emit_projection_block_callback(
-                    projection_block_callback, int(t0), block, desc=desc,
+                block = pin_out_arrays[slot_idx][:count].reshape((count, int(out_h), int(out_w)))
+                commit_futures[slot_idx] = commit_pool.submit(
+                    _commit_block, int(t0), int(t1), block,
                 )
+            for slot_idx in range(len(commit_futures)):
+                _settle_commit(slot_idx)
             stream.synchronize()
+            projection_seconds = time.perf_counter() - projection_t0
+
+        total_seconds = time.perf_counter() - phase_start
         print(
-            f'{desc}: full-resident GPU backprojection complete; one {source_bytes / GIB:.1f} GiB '
-            'azimuth-major upload, no host t-major staging or gathered/scatter intermediates.'
+            f'{desc}: full-resident GPU backprojection complete; source={source_bytes / GIB:.1f} GiB, '
+            f'layout={layout}, upload_slots={len(pin_src_slots)}, commit_slots={len(pin_out_slots)}, '
+            f'active_rows={int(np.count_nonzero(row_any))}/{int(work_t)}, '
+            f'upload={upload_seconds:.2f}s, transpose={transpose_seconds:.2f}s, '
+            f'project+commit wall={projection_seconds:.2f}s, commit CPU sum={commit_cpu_seconds:.2f}s, '
+            f'total={total_seconds:.2f}s.'
         )
         return True
     finally:
+        if commit_pool is not None:
+            try:
+                for fut in commit_futures:
+                    if fut is not None:
+                        fut.result()
+            except Exception:
+                pass
+            _release_parallel_pool(max(1, len(pin_out_slots)), commit_pool)
         try:
-            del radial_dev, source_dev, u_dev, out_dev, pin_src, pin_out
+            del radial_dev, tmajor_dev, source_dev, u_dev, out_dev
+            del pin_src_slots, pin_out_slots
         except Exception:
             pass
         try:
@@ -17647,8 +17889,16 @@ def assemble_view_volumes_and_projected_layers_fused(
                 src = RawBBoxMaskStore.open(
                     ref.path, cache_payload_in_ram=False, mmap_payload=True,
                 )
+                try:
+                    payload_map = getattr(src, '_chunks_mmap', None)
+                    advice = getattr(mmap, 'MADV_SEQUENTIAL', None)
+                    if payload_map is not None and advice is not None:
+                        payload_map.madvise(advice)
+                except Exception:
+                    pass
             else:
                 src = _open_nrrd_layer_ref(ref)
+                _madvise_array_mmap(src, 'MADV_SEQUENTIAL')
             opened.append((ref, src))
 
         scratch_tls = threading.local()
@@ -17736,14 +17986,40 @@ def assemble_view_volumes_and_projected_layers_fused(
             # guarantees exactly one full-plane destination write for this z.
             final_union_mm[int(out_z), :, :] = acc
 
-        parallel_for_indices_chunked(
+        # v13.3.16 G9: submitting all z chunks to 320 workers made the first
+        # frontier touch roughly z=0..1280 across every projected store simultaneously.
+        # The log's 40 s cold start and second 12 s stall at z=1280 line up exactly with
+        # that frontier. Process bounded sequential z bands so mmap readahead/page-table
+        # locality can work, while retaining enough slice parallelism for cv2 restores.
+        g5_workers = choose_slice_parallel_workers(
+            max(1, _env_int('YOLO_TTA_FUSED_FINAL_VIEW_UNION_WORKERS', min(64, int(workers)))),
             out_t,
-            _merge_out_slice,
-            max_workers=choose_slice_parallel_workers(int(workers), out_t),
-            desc='v13.3.9 G5 fused final view/layer union',
-            show_progress=True,
-            target_chunks_per_worker=2,
         )
+        g5_band = max(
+            int(g5_workers),
+            _env_int('YOLO_TTA_FUSED_FINAL_VIEW_UNION_BAND_SLICES', 256),
+        )
+        print(
+            f'v13.3.16 (G9): G5 locality scheduler uses {int(g5_workers)} worker(s) '
+            f'and sequential {int(g5_band)}-slice z bands.'
+        )
+        with tqdm(total=int(out_t), desc='v13.3.16 G9 fused final view/layer union') as pbar:
+            for band0 in range(0, int(out_t), int(g5_band)):
+                band1 = min(int(out_t), int(band0) + int(g5_band))
+                band_count = int(band1 - band0)
+
+                def _merge_band_slice(local_z: int, _band0: int = int(band0)) -> None:
+                    _merge_out_slice(int(_band0) + int(local_z))
+
+                parallel_for_indices_chunked(
+                    band_count,
+                    _merge_band_slice,
+                    max_workers=min(int(g5_workers), int(band_count)),
+                    desc='v13.3.16 G9 fused final view/layer union band',
+                    show_progress=False,
+                    target_chunks_per_worker=4,
+                )
+                pbar.update(int(band_count))
         flush_array(final_union_mm)
     finally:
         for _ref, src in opened:
@@ -20659,6 +20935,22 @@ class IncrementalRawBBoxMaskStoreWriter:
 
     def __call__(self, z0: int, block: np.ndarray) -> None:
         self.consume(int(z0), block)
+
+    def consume_empty_range(self, z0: int, count: int) -> None:
+        """Register a proven-empty contiguous slice range without scanning dense planes."""
+        start = int(z0)
+        stop = int(start) + max(0, int(count))
+        if start < 0 or stop > int(self.shape[0]):
+            raise IndexError(f'{self.desc}: empty range [{start}, {stop}) is outside {self.shape[0]} slices')
+        with self._lock:
+            if self._failed_reason is not None:
+                return
+            for z_i in range(int(start), int(stop)):
+                if int(self._slice_state[z_i]) != 0:
+                    raise ValueError(f'{self.desc}: projected slice {z_i} was delivered more than once')
+            for z_i in range(int(start), int(stop)):
+                self.index[z_i]['kind'] = np.uint8(0)
+                self._slice_state[z_i] = np.uint8(2)
 
     @staticmethod
     def _pwrite_all(fd: int, data: memoryview, offset: int) -> None:
@@ -24355,9 +24647,11 @@ def _nrrd_full_slice_z_chunk(layer_count: int, width: int, height: int, depth: i
 
 
 def nrrd_madvise_dontneed_interval() -> int:
-    # 0 disables advisory cache dropping.  The default keeps NRRD source-layer page cache
-    # bounded without issuing a syscall after every single slice.
-    return max(0, _env_int('YOLO_TTA_NRRD_MADVISE_DONTNEED_INTERVAL', 16))
+    # v13.3.16 G9: projected cvol pages are reread by the final G5 union. Run 126080
+    # spent ~40 s on its first completion frontier and stalled again at z≈1280 after
+    # concurrent NRRD readers had discarded those pages. Keep them warm by default;
+    # memory-constrained jobs can restore the former interval with an explicit value.
+    return max(0, _env_int('YOLO_TTA_NRRD_MADVISE_DONTNEED_INTERVAL', 0))
 
 
 # v13.3.7 (B5/N4): shared literal-zero buffer for write_zeros() paths that must emit real
@@ -25346,11 +25640,12 @@ def _zero_gzip_member(length: int) -> bytes:
         cached = _NRRD_GPU_ZERO_MEMBER_CACHE.get(int(length))
     if cached is not None:
         return cached
-    _backend, _factory, crc_fn, _full_flush, _lvl = _nrrd_deflate_backend()
     zeros = bytes(int(length))
     cobj = zlib.compressobj(1, zlib.DEFLATED, -15)
     raw = cobj.compress(zeros) + cobj.flush(zlib.Z_FINISH)
-    member = _gzip_member_from_raw_stream(raw, int(crc_fn(zeros)) & 0xFFFFFFFF, int(length))
+    member = _gzip_member_from_raw_stream(
+        raw, _crc32_byteslike(zlib.crc32, zeros), int(length),
+    )
     with _NRRD_GPU_ZERO_MEMBER_LOCK:
         _NRRD_GPU_ZERO_MEMBER_CACHE[int(length)] = member
     return member
@@ -25378,8 +25673,11 @@ class _GpuDeflatePayloadWriter:
         self.engine = engine
         self.chunk_bytes = int(nrrd_gpu_deflate_chunk_bytes())
         self.batch_bytes = max(self.chunk_bytes, int(nrrd_gpu_deflate_batch_bytes()))
-        _backend, _factory, crc_fn, _full_flush, _lvl = _nrrd_deflate_backend()
-        self.crc_fn = crc_fn
+        # v13.3.16 N19: run 126080 still produced a zero trailer CRC on every GPU
+        # even though ISA-L's short KAT passed. GPU DEFLATE and host CRC are independent;
+        # use the stdlib implementation unconditionally for RFC-1952 framing while CPU
+        # payload writers remain free to use ISA-L CRC after their own validation.
+        self.crc_fn = zlib.crc32
         self.closed = False
         self.compressed_bytes = 0
         self.allow_cpu_fallback = bool(allow_cpu_fallback)
@@ -26905,7 +27203,7 @@ def write_single_layer_nrrd_from_ref(
                 )
         return out_path
 
-    # v13.3.15 (N18): each z band compresses into an independent unlinked spool.
+    # v13.3.16 (N19, inherited N18): each z band compresses into an independent unlinked spool.
     # A band holds ONE process-global permit only while it is actually compressing. This
     # lets two 8-band global files use a 12-lane budget concurrently and removes the
     # ordered bounded-queue backpressure that previously kept later compressors idle.
@@ -26922,7 +27220,7 @@ def write_single_layer_nrrd_from_ref(
             f'{max(band_weights) / (1024 ** 2):.1f} MiB/shard'
         )
     print(
-        f'v13.3.15 (N18): {out_path.name} -> {shard_count} independent compressed z spools '
+        f'v13.3.16 (N19): {out_path.name} -> {shard_count} independent compressed z spools '
         f'(min_slices={nrrd_layer_zshard_min_slices()}, z_chunk={shard_z_chunk}'
         f'{weight_note}; one global permit per active band).'
     )
@@ -26931,11 +27229,14 @@ def write_single_layer_nrrd_from_ref(
     spool_dir_raw = os.environ.get('YOLO_TTA_NRRD_SHARD_SPOOL_DIR', '').strip()
     spool_dir = Path(spool_dir_raw).expanduser() if spool_dir_raw else out_path.parent
     spool_dir.mkdir(parents=True, exist_ok=True)
+    n19_started = time.perf_counter()
+    n19_band_metrics: List[Optional[Tuple[float, int, int, int]]] = [None] * int(shard_count)
 
     def _write_band(i: int) -> object:
         z0, z1 = bands[int(i)]
         zshard_permits.acquire(1)
         spool = None
+        band_started = time.perf_counter()
         try:
             # TemporaryFile is unlinked immediately on POSIX, so no partially-compressed
             # artifacts are visible to rsync/watchers and no later cleanup scan is needed.
@@ -26961,7 +27262,15 @@ def write_single_layer_nrrd_from_ref(
                     fill_workers_override=shard_fill_workers,
                 )
             spool.flush()
+            spool.seek(0, os.SEEK_END)
+            compressed_size = int(spool.tell())
             spool.seek(0)
+            n19_band_metrics[int(i)] = (
+                float(time.perf_counter() - band_started),
+                int(compressed_size),
+                int(z0),
+                int(z1),
+            )
             return spool
         except BaseException:
             if spool is not None:
@@ -27031,6 +27340,20 @@ def write_single_layer_nrrd_from_ref(
                 spool.close()
                 spools[-1] = None
         os.replace(final_tmp, out_path)
+        completed_metrics = [m for m in n19_band_metrics if m is not None]
+        compressed_total = sum(int(m[1]) for m in completed_metrics)
+        slowest = max(completed_metrics, key=lambda m: float(m[0])) if completed_metrics else None
+        slowest_note = ''
+        if slowest is not None:
+            slowest_note = (
+                f', slowest_band=z{int(slowest[2])}:{int(slowest[3])} '
+                f'{float(slowest[0]):.2f}s/{int(slowest[1]) / (1024 ** 2):.1f} MiB'
+            )
+        print(
+            f'v13.3.16 (N19): {out_path.name} completed in '
+            f'{time.perf_counter() - n19_started:.2f}s; compressed='
+            f'{compressed_total / GIB:.2f} GiB{slowest_note}.'
+        )
     finally:
         _settle_parallel_futures(futures)
         consumed_ids = {id(spool) for spool in spools if spool is not None}
@@ -35062,7 +35385,7 @@ def _v13314_record_nrrd_stats(writer, **stats):
 
 # Install in dependency order: projection callback before materializer telemetry,
 # TensorRT close interception before generic wrappers, then coarse telemetry.
-_v13314_gpu_writer_runtime_installed = _v13314_install_gpu_writer_runtime(force_input_buffer=True)
+_v13314_gpu_writer_runtime_installed = _v13314_install_gpu_writer_runtime(force_input_buffer=False)
 _v13314_projection_components_installed = _v13314_install_projection_component_registration()
 _v13314_projection_callback_installed = _v13314_install_projection_callback_wrapper()
 _v13314_materializer_installed = _v13314_install_materializer_wrapper()
