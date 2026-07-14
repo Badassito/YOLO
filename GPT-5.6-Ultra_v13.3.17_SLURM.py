@@ -2,8 +2,27 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the GPT-5.6-Ultra v13.3.16_SLURM implementation. It is derived from
-GPT-5.6-Ultra_v13.3.15_SLURM.py by COPY + surgical edits driven by run 126080:
+This is the GPT-5.6-Ultra v13.3.17_SLURM implementation. It is derived from
+GPT-5.6-Ultra_v13.3.16_SLURM.py by COPY + targeted C1/C2/C4/C10/N22/N24 edits.
+  - v13.3.17 C1 groups projected component layers by their actual reduced restore
+    geometry in G5, unions each group before its positive-support restore, and leaves
+    source-native radial layers on the direct sparse crop path. The prioritized layout
+    drops the repeated per-output-slice restores from 16 projected layers to two groups.
+  - v13.3.17 C2 streams Radial projection blocks transactionally into the incremental
+    cvol sink and suppresses the redundant full source-geometry dense raster; callback,
+    coverage, or finalization failures discard the partial store and retain one dense retry.
+  - v13.3.17 C4 packs interpolation local labels as tight per-slice bbox crops, extracts
+    adjacent pairs on GPU before transfer, transfers a narrowed packed crop block, and
+    addresses that arena directly from component tables and the no-GIL candidate kernel.
+  - v13.3.17 C10 represents the T-only processing cube lazily under native-t multi-GPU
+    residency. A real CPU/tile/nonresident fallback requests one shared construction;
+    successful resident inference never allocates or fills the 25+ GiB host cube.
+  - v13.3.17 N22/N24 streams native and restored cvol layers as whole-slice-aligned gzip
+    members, assembles crops with native array operations, transfers member ownership to
+    the compressor, and derives low-quality mirrors from restored sparse crops during the
+    same source pass instead of rereading dense planes.
+
+Inherited from v13.3.16 (run 126080):
   - v13.3.16 (P4/R24/N19/G9) removes the fused-render NVRTC dependency on the missing
     system math.h header, pipelines resident Radial source upload and projected-block
     commits, optionally transposes the resident source to a cache-friendlier t-major GPU
@@ -138,9 +157,10 @@ v13.3.6's incidental) from SPEED_OPTIMIZATIONS_Fable-5_v13.3.5_SLURM.md:
     uploads the NATIVE decoded volume (smaller than the cube by the t factor) and runs
     the two-tap t-lerp on device into its resident cube buffer (cv2.resize's
     center-aligned INTER_LINEAR mapping, the slab backend's convention; validated to
-    +/-1 gray level against cv2). The host cube keeps being produced concurrently for CPU
-    consumers (the decode is now file-backed under this mode so workers need no copy
-    pass); a sentinel written after wait_for_volume_ready+flush gates every file-backed
+    +/-1 gray level against cv2). In that release the host cube kept being produced
+    concurrently for CPU consumers (superseded by v13.3.17 C10 demand materialization);
+    the decode is file-backed under this mode so workers need no copy pass. A sentinel
+    written after wait_for_volume_ready+flush gates every file-backed
     fallback (failed residency, tile tasks, CPU renders), which then behave exactly as
     before. The MD's "one worker D2Hs the cube back" variant is deliberately NOT
     implemented (it would need cross-process producer signaling on the host cube);
@@ -917,6 +937,7 @@ import zlib
 from collections import OrderedDict, deque
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field, replace as dataclasses_replace
+from functools import lru_cache
 
 GIB = 1024 ** 3
 NRRD_SPACE = "left-posterior-superior"
@@ -1941,6 +1962,14 @@ def flush_array(arr: object, *, force: bool = False) -> None:
     if not force and not memmap_msync_enabled():
         return
 
+    lazy_flush = getattr(arr, 'flush', None)
+    if bool(getattr(arr, '_is_lazy_processing_cube', False)) and callable(lazy_flush):
+        try:
+            lazy_flush()
+            return
+        except Exception:
+            pass
+
     try:
         if isinstance(arr, np.memmap):
             arr.flush()
@@ -2438,6 +2467,13 @@ def expose_scratch_in_output(out_dir: Path, scratch_dir: Path) -> Path:
 def close_memmap_array(arr: object) -> None:
     if arr is None:
         return
+    lazy_close = getattr(arr, 'close', None)
+    if bool(getattr(arr, '_is_lazy_processing_cube', False)) and callable(lazy_close):
+        try:
+            lazy_close()
+            return
+        except Exception:
+            pass
     flush_array(arr)
     try:
         if isinstance(arr, np.memmap):
@@ -3142,6 +3178,13 @@ def wait_for_volume_slice_ready(arr: object, idx: int) -> None:
 
 
 def wait_for_volume_ready(arr: object) -> None:
+    # v13.3.17 C10: normal consumers that explicitly wait on a lazy processing cube
+    # necessarily need its bytes. The inference-tail completion check special-cases an
+    # unused proxy and waits only for its decoded source, preserving true laziness.
+    lazy_wait = getattr(arr, '_materialize_for_wait', None)
+    if callable(lazy_wait):
+        lazy_wait()
+        return
     readiness = volume_readiness(arr)
     if readiness is not None:
         readiness.wait_all()
@@ -3724,6 +3767,213 @@ def resize_volume_to_processing_cube_gray8_streaming(
     # daemon=True (v13.2.2 bug #7): see the streaming decode producer.
     threading.Thread(target=_resize_worker, name='streaming-cubic-resize', daemon=True).start()
     return out_mm
+
+
+class LazyProcessingCube:
+    """Demand-materialized shared processing cube (v13.3.17 C10).
+
+    Multi-GPU native-t residency needs the *geometry* of the approximately-cubic volume,
+    but its successful renderer reads the smaller decoded volume and composes the t map on
+    device.  This proxy therefore publishes shape/path metadata immediately and performs the
+    25+ GiB CPU resize only after a real CPU/streaming/tile fallback requests the path.
+
+    Worker processes request materialization through a tiny filesystem marker; a daemon in
+    the owning process performs exactly one resize and publishes the existing ready sentinel.
+    Local ndarray consumers materialize synchronously through ``__array__``/``__getitem__``.
+    """
+
+    _is_lazy_processing_cube = True
+
+    def __init__(
+        self,
+        source: np.ndarray,
+        out_shape: Tuple[int, int, int],
+        out_path: Path,
+        *,
+        workers: int,
+        request_path: Path,
+        ready_path: Path,
+        failed_path: Path,
+        streaming_backend: bool = False,
+    ) -> None:
+        self.source = source
+        self.shape = tuple(int(v) for v in out_shape)
+        self.dtype = np.dtype(np.uint8)
+        self.ndim = 3
+        self.nbytes = int(array_nbytes(self.shape, self.dtype))
+        self.backing_path = Path(out_path)
+        self.request_path = Path(request_path)
+        self.ready_path = Path(ready_path)
+        self.failed_path = Path(failed_path)
+        self.workers = max(1, int(workers))
+        self.streaming_backend = bool(streaming_backend)
+        self._lock = threading.RLock()
+        self._ready = threading.Event()
+        self._stop = threading.Event()
+        self._started = False
+        self._array: Optional[np.ndarray] = None
+        self._error: Optional[BaseException] = None
+        self._watcher: Optional[threading.Thread] = None
+        self.backing_path.parent.mkdir(parents=True, exist_ok=True)
+        for marker in (self.request_path, self.ready_path, self.failed_path):
+            try:
+                marker.unlink(missing_ok=True)
+            except Exception as exc:
+                raise RuntimeError(
+                    f'cannot clear stale lazy-cube marker {marker}: {exc}'
+                ) from exc
+            if marker.exists():
+                raise RuntimeError(f'stale lazy-cube marker survived cleanup: {marker}')
+
+    @property
+    def materialized(self) -> bool:
+        with self._lock:
+            return self._array is not None
+
+    @property
+    def filename(self) -> str:
+        # Metadata-only: exposing the planned path must not trigger construction.
+        return str(self.backing_path)
+
+    def start_request_watcher(self) -> None:
+        with self._lock:
+            if self._watcher is not None:
+                return
+
+            def _watch() -> None:
+                while not self._stop.is_set() and not self._ready.is_set():
+                    if self.request_path.exists():
+                        try:
+                            self.materialize(reason='GPU-worker fallback request')
+                        except Exception as exc:
+                            try:
+                                print(f'Warning: lazy processing cube request failed ({exc}).')
+                            except Exception:
+                                pass
+                        return
+                    self._stop.wait(0.10)
+
+            self._watcher = threading.Thread(
+                target=_watch,
+                name='lazy-processing-cube-request',
+                daemon=True,
+            )
+            self._watcher.start()
+
+    def materialize(self, *, reason: str = 'local fallback consumer') -> np.ndarray:
+        owner = False
+        with self._lock:
+            if self._error is not None:
+                raise RuntimeError('lazy processing cube construction previously failed') from self._error
+            if self._array is not None:
+                return self._array
+            if not self._started:
+                self._started = True
+                owner = True
+        if owner:
+            built: Optional[np.ndarray] = None
+            try:
+                print(
+                    'v13.3.17 C10: materializing deferred processing cube for '
+                    f'{reason}; shape={self.shape}, bytes={self.nbytes / GIB:.2f} GiB.'
+                )
+                # Deferring the cube also defers its dependency on decode completion.  The
+                # fallback is cold and correctness-sensitive, so complete decode first and
+                # use the established exact slab/slice backend once.
+                wait_for_volume_ready(self.source)
+                if bool(self.streaming_backend):
+                    # Preserve the established streaming producer's interpolation
+                    # convention for runs that selected it at startup; only its launch
+                    # time changes. The owner waits here before publishing the sentinel.
+                    built = resize_volume_to_processing_cube_gray8_streaming(
+                        self.source,
+                        self.shape,
+                        self.backing_path,
+                        workers=int(self.workers),
+                        prefer_memory=False,
+                    )
+                    wait_for_volume_ready(built)
+                else:
+                    built = resize_volume_to_processing_cube_gray8(
+                        self.source,
+                        self.shape,
+                        self.backing_path,
+                        workers=int(self.workers),
+                        prefer_memory=False,
+                    )
+                flush_array(built)
+                # The worker-visible sentinel is the transaction commit record. Publish it
+                # before exposing the local array so local and subprocess consumers cannot
+                # disagree about whether the shared cube is usable.
+                self.ready_path.touch()
+                with self._lock:
+                    self._array = built
+            except BaseException as exc:
+                with self._lock:
+                    self._error = exc
+                try:
+                    self.ready_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                if built is not None:
+                    try:
+                        close_memmap_array(built)
+                    except Exception:
+                        pass
+                try:
+                    fail_tmp = self.failed_path.with_name(
+                        f'.{self.failed_path.name}.{os.getpid()}.{threading.get_ident()}.tmp'
+                    )
+                    fail_tmp.write_text(f'{type(exc).__name__}: {exc}\n')
+                    os.replace(fail_tmp, self.failed_path)
+                except Exception:
+                    pass
+            finally:
+                self._ready.set()
+            if self._error is None:
+                # Logging is deliberately outside the construction/publication transaction:
+                # a closed stdout must not turn an already-published cube into failed state.
+                try:
+                    print('v13.3.17 C10: deferred processing cube complete; fallback sentinel published.')
+                except Exception:
+                    pass
+        else:
+            self._ready.wait()
+        with self._lock:
+            if self._error is not None:
+                raise RuntimeError('lazy processing cube construction failed') from self._error
+            if self._array is None:  # pragma: no cover - defensive state guard
+                raise RuntimeError('lazy processing cube completed without an array')
+            return self._array
+
+    def _materialize_for_wait(self) -> None:
+        self.materialize(reason='wait_for_volume_ready consumer')
+
+    def __array__(self, dtype=None, copy=None) -> np.ndarray:
+        arr = np.asarray(self.materialize())
+        if dtype is not None:
+            arr = np.asarray(arr, dtype=dtype)
+        if copy is True:
+            return np.array(arr, copy=True)
+        return arr
+
+    def __getitem__(self, key):
+        return self.materialize()[key]
+
+    def flush(self) -> None:
+        with self._lock:
+            arr = self._array
+        if arr is not None:
+            flush_array(arr)
+
+    def close(self) -> None:
+        self._stop.set()
+        with self._lock:
+            arr = self._array
+            self._array = None
+        if arr is not None:
+            close_memmap_array(arr)
+
 
 
 def restore_mask_volume_to_original_shape(
@@ -11161,9 +11411,9 @@ def gpu_cube_resize_enabled() -> bool:
     """v13.3.9 (E3): retain native t and fold cube-t scaling into GPU renderers.
 
     Each worker uploads the smaller NATIVE decoded volume and applies the two-tap
-    center-aligned t map inside each renderer. The host cube keeps being produced for
-    CPU/tile/nonresident fallbacks, gated by its sentinel. Only T-only slab resizing is
-    eligible. YOLO_TTA_GPU_CUBE_RESIZE=0 restores cube-gated enqueue/residency.
+    center-aligned t map inside each renderer. v13.3.17 C10 constructs the host cube only
+    when a CPU/tile/nonresident fallback requests its sentinel. Only T-only slab resizing
+    is eligible. YOLO_TTA_GPU_CUBE_RESIZE=0 restores cube-gated enqueue/residency.
     """
     return _env_flag('YOLO_TTA_GPU_CUBE_RESIZE', True)
 
@@ -11543,7 +11793,13 @@ def _fused_direct_render_kernels() -> Optional[object]:
                 'The reference Torch renderers remain active.'
             )
         return None
-def _wait_for_cube_ready_sentinel(sentinel_path: str, *, poll_seconds: float = 0.5) -> None:
+def _wait_for_cube_ready_sentinel(
+    sentinel_path: str,
+    *,
+    request_path: Optional[str] = None,
+    failed_path: Optional[str] = None,
+    poll_seconds: float = 0.5,
+) -> None:
     """v13.3.8 (E1): block until main signals the shared cube volume file is complete.
 
     Reached only on fallbacks (failed residency, tile tasks, CPU renders) while the host
@@ -11551,11 +11807,41 @@ def _wait_for_cube_ready_sentinel(sentinel_path: str, *, poll_seconds: float = 0
     producer dies (the sentinel is only ever written after wait_for_volume_ready + flush).
     """
     sentinel = Path(str(sentinel_path))
+    request = Path(str(request_path)) if request_path else None
+    failed = Path(str(failed_path)) if failed_path else None
+    if request is not None:
+        # v13.3.17 C10: this is the first proven need for the host cube. A tiny atomic
+        # marker wakes the main-process materializer; all workers share the same result.
+        request.parent.mkdir(parents=True, exist_ok=True)
+        request.touch(exist_ok=True)
     announced = False
-    while not sentinel.exists():
+    timeout_seconds = max(
+        60.0,
+        _env_float('YOLO_TTA_LAZY_CUBE_WAIT_TIMEOUT_SEC', 3600.0),
+    )
+    deadline = time.monotonic() + float(timeout_seconds)
+    while True:
+        # Failure wins if both records somehow exist; C10 publishes them transactionally,
+        # but this also makes stale/corrupt shared state fail closed.
+        if failed is not None and failed.exists():
+            try:
+                detail = failed.read_text().strip()
+            except Exception:
+                detail = 'unknown producer failure'
+            raise RuntimeError(f'shared cube fallback construction failed: {detail}')
+        if sentinel.exists():
+            return
+        if time.monotonic() >= float(deadline):
+            raise TimeoutError(
+                'timed out waiting for the deferred shared cube after '
+                f'{float(timeout_seconds):.0f}s; ready={sentinel}, failed={failed}'
+            )
         if not announced:
             announced = True
-            print('GPU worker: waiting for the shared cube volume to finish before file-backed rendering...')
+            print(
+                'GPU worker: requested the deferred shared cube and is waiting for '
+                'file-backed fallback rendering...'
+            )
         time.sleep(max(0.05, float(poll_seconds)))
 
 
@@ -12933,7 +13219,11 @@ def run_prediction_volume_in_worker(
 
     def _open_cpu_render_source() -> Tuple[np.memmap, object]:
         if native_resize is not None:
-            _wait_for_cube_ready_sentinel(str(native_resize['sentinel']))
+            _wait_for_cube_ready_sentinel(
+                str(native_resize['sentinel']),
+                request_path=(str(native_resize['request']) if native_resize.get('request') else None),
+                failed_path=(str(native_resize['failed']) if native_resize.get('failed') else None),
+            )
         mm = open_existing_gray_memmap(
             task['source_volume_path'], task['source_shape'], task.get('source_dtype', 'uint8'), mode='r',
         )
@@ -13001,7 +13291,11 @@ def run_prediction_volume_in_worker(
                         resize_to_t=int(task['source_shape'][0]),
                     )
                     if render_mode != 'resident':
-                        _wait_for_cube_ready_sentinel(str(native_resize['sentinel']))
+                        _wait_for_cube_ready_sentinel(
+                            str(native_resize['sentinel']),
+                            request_path=(str(native_resize['request']) if native_resize.get('request') else None),
+                            failed_path=(str(native_resize['failed']) if native_resize.get('failed') else None),
+                        )
                         render_mode = gpu_engine.ensure_volume(
                             str(task['source_volume_path']),
                             tuple(int(x) for x in task['source_shape']),
@@ -13812,9 +14106,32 @@ if _numba is not None:
                 mrow = mask_out[z, y]
                 for x in range(x0, x1):
                     mrow[x] = keep_flat[off + lrow[x]]
+
+    @_numba.njit(cache=True, nogil=True, parallel=True)  # type: ignore[misc]
+    def _numba_sparse_keep_lut_apply_kernel(  # pragma: no cover - jit
+        labels_flat, label_offsets, keep_flat, lut_offsets, bboxes, apply_slice, mask_out,
+    ):
+        """C4 keep-largest apply directly from the packed per-slice label arena."""
+        z_dim = apply_slice.shape[0]
+        for z in _numba.prange(z_dim):
+            if apply_slice[z] == 0:
+                continue
+            keep_off = lut_offsets[z]
+            label_off = label_offsets[z]
+            y0 = bboxes[z, 0]
+            y1 = bboxes[z, 1]
+            x0 = bboxes[z, 2]
+            x1 = bboxes[z, 3]
+            crop_w = x1 - x0
+            for y in range(y0, y1):
+                row_off = label_off + (y - y0) * crop_w
+                mrow = mask_out[z, y]
+                for x in range(x0, x1):
+                    mrow[x] = keep_flat[keep_off + labels_flat[row_off + x - x0]]
 else:
     _numba_compact_relabel_kernel = None
     _numba_keep_lut_apply_kernel = None
+    _numba_sparse_keep_lut_apply_kernel = None
 
 
 @dataclass(frozen=True)
@@ -13835,6 +14152,205 @@ class SliceLocalLabelLUTs:
     def lut_for(self, z: int) -> np.ndarray:
         lo = int(self.lut_offsets[int(z)])
         return self.lut_flat[lo:lo + int(self.component_counts[int(z)]) + 1]
+
+
+def interpolation_sparse_labels_enabled() -> bool:
+    """v13.3.17 (C4): retain only each slice's local-label bbox crop.
+
+    The dense uint16 local-id raster was 22.7--37.1 GiB for the prioritized
+    views even though every consumer already knew the per-slice foreground
+    bbox. Sparse labels are default-on whenever compact relabel is skipped;
+    YOLO_TTA_INTERPOLATION_SPARSE_LABELS=0 restores the dense store.
+    """
+    return _env_flag('YOLO_TTA_INTERPOLATION_SPARSE_LABELS', True)
+
+
+class SparseSliceLabelStore:
+    """Ragged per-slice local-label arena with dense-window compatibility.
+
+    Stage A writes one tight crop per slice. finalize packs those crops into
+    one contiguous typed arena plus offsets/bboxes, so compiled candidate search
+    can address a global (z,y,x) without a dense volume. Compatibility reads
+    materialize only the requested window; a full plane is produced only for a
+    legacy fallback, not the normal component-table/planner path.
+    """
+
+    def __init__(self, shape: Sequence[int], dtype: np.dtype | str | type) -> None:
+        self.shape = tuple(int(v) for v in shape)
+        if len(self.shape) != 3:
+            raise ValueError(f'SparseSliceLabelStore expects 3D shape, got {self.shape}')
+        self.dtype = np.dtype(dtype)
+        self.ndim = 3
+        self._pending: Optional[List[Optional[Tuple[int, int, int, int, np.ndarray]]]] = [
+            None
+        ] * int(self.shape[0])
+        self.bboxes = np.zeros((int(self.shape[0]), 4), dtype=np.int64)
+        self.offsets = np.zeros((int(self.shape[0]) + 1,), dtype=np.int64)
+        self.flat = np.empty((0,), dtype=self.dtype)
+        self._finalized = False
+
+    @property
+    def nbytes(self) -> int:
+        return int(self.flat.nbytes) if self._finalized else int(sum(
+            0 if item is None else int(item[4].nbytes)
+            for item in (self._pending or [])
+        ))
+
+    def write_crop(
+        self,
+        z: int,
+        y0: int,
+        y1: int,
+        x0: int,
+        x1: int,
+        values: np.ndarray,
+    ) -> None:
+        if self._finalized:
+            raise RuntimeError('SparseSliceLabelStore is finalized')
+        z_i = int(z)
+        y0_i, y1_i, x0_i, x1_i = int(y0), int(y1), int(x0), int(x1)
+        h, w = int(self.shape[1]), int(self.shape[2])
+        if not (0 <= z_i < int(self.shape[0])):
+            raise IndexError(z_i)
+        if y1_i <= y0_i or x1_i <= x0_i:
+            self.clear_slice(z_i)
+            return
+        if not (0 <= y0_i < y1_i <= h and 0 <= x0_i < x1_i <= w):
+            raise ValueError(
+                f'sparse label crop {(y0_i, y1_i, x0_i, x1_i)} outside {(h, w)}'
+            )
+        crop = np.ascontiguousarray(values, dtype=self.dtype)
+        if tuple(int(v) for v in crop.shape) != (y1_i - y0_i, x1_i - x0_i):
+            raise ValueError(
+                f'sparse label crop data {tuple(crop.shape)} != '
+                f'{(y1_i - y0_i, x1_i - x0_i)}'
+            )
+        assert self._pending is not None
+        self._pending[z_i] = (y0_i, y1_i, x0_i, x1_i, crop)
+        self.bboxes[z_i] = np.asarray((y0_i, y1_i, x0_i, x1_i), dtype=np.int64)
+
+    def clear_slice(self, z: int) -> None:
+        if self._finalized:
+            raise RuntimeError('SparseSliceLabelStore is finalized')
+        z_i = int(z)
+        assert self._pending is not None
+        self._pending[z_i] = None
+        self.bboxes[z_i] = np.int64(0)
+
+    def finalize(self) -> None:
+        if self._finalized:
+            return
+        pending = self._pending or []
+        sizes = np.zeros((int(self.shape[0]),), dtype=np.int64)
+        for z, item in enumerate(pending):
+            if item is not None:
+                sizes[int(z)] = np.int64(item[4].size)
+        if sizes.size:
+            self.offsets[1:] = np.cumsum(sizes, dtype=np.int64)
+        self.flat = np.empty((int(self.offsets[-1]),), dtype=self.dtype)
+        for z, item in enumerate(pending):
+            if item is None:
+                continue
+            lo, hi = int(self.offsets[int(z)]), int(self.offsets[int(z) + 1])
+            self.flat[lo:hi] = item[4].reshape(-1)
+        self._pending = None
+        self._finalized = True
+
+    def crop_with_origin(self, z: int) -> Tuple[int, int, np.ndarray]:
+        if not self._finalized:
+            self.finalize()
+        z_i = int(z)
+        y0, y1, x0, x1 = (int(v) for v in self.bboxes[z_i])
+        if y1 <= y0 or x1 <= x0:
+            return 0, 0, np.empty((0, 0), dtype=self.dtype)
+        lo, hi = int(self.offsets[z_i]), int(self.offsets[z_i + 1])
+        return y0, x0, self.flat[lo:hi].reshape((y1 - y0, x1 - x0))
+
+    def read_window(self, z: int, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
+        y0_i, y1_i, x0_i, x1_i = int(y0), int(y1), int(x0), int(x1)
+        out = np.zeros(
+            (max(0, y1_i - y0_i), max(0, x1_i - x0_i)), dtype=self.dtype,
+        )
+        if out.size <= 0:
+            return out
+        cy0, cx0, crop = self.crop_with_origin(int(z))
+        if crop.size <= 0:
+            return out
+        cy1, cx1 = cy0 + int(crop.shape[0]), cx0 + int(crop.shape[1])
+        iy0, iy1 = max(y0_i, cy0), min(y1_i, cy1)
+        ix0, ix1 = max(x0_i, cx0), min(x1_i, cx1)
+        if iy0 < iy1 and ix0 < ix1:
+            out[iy0 - y0_i:iy1 - y0_i, ix0 - x0_i:ix1 - x0_i] = crop[
+                iy0 - cy0:iy1 - cy0, ix0 - cx0:ix1 - cx0
+            ]
+        return out
+
+    def _normalize_plane_key(self, selector: object, length: int) -> Tuple[int, int]:
+        if isinstance(selector, slice):
+            start, stop, step = selector.indices(int(length))
+            if int(step) != 1:
+                raise IndexError('SparseSliceLabelStore only supports unit-stride windows')
+            return int(start), int(stop)
+        idx = int(selector)  # type: ignore[arg-type]
+        if idx < 0:
+            idx += int(length)
+        if idx < 0 or idx >= int(length):
+            raise IndexError(idx)
+        return int(idx), int(idx) + 1
+
+    def __getitem__(self, key: object) -> object:
+        z_dim, h, w = self.shape
+        if isinstance(key, tuple):
+            if len(key) != 3:
+                raise IndexError('SparseSliceLabelStore expects (z,y,x)')
+            z_sel, y_sel, x_sel = key
+            if isinstance(z_sel, (int, np.integer)):
+                z_i = int(z_sel)
+                if z_i < 0:
+                    z_i += int(z_dim)
+                y0, y1 = self._normalize_plane_key(y_sel, int(h))
+                x0, x1 = self._normalize_plane_key(x_sel, int(w))
+                window = self.read_window(z_i, y0, y1, x0, x1)
+                if not isinstance(y_sel, slice):
+                    window = window[0]
+                if not isinstance(x_sel, slice):
+                    window = window[..., 0]
+                return window
+            z0, z1 = self._normalize_plane_key(z_sel, int(z_dim))
+            y0, y1 = self._normalize_plane_key(y_sel, int(h))
+            x0, x1 = self._normalize_plane_key(x_sel, int(w))
+            return np.stack(
+                [self.read_window(z, y0, y1, x0, x1) for z in range(z0, z1)],
+                axis=0,
+            )
+        if isinstance(key, (int, np.integer)):
+            return self.read_window(int(key), 0, int(h), 0, int(w))
+        z0, z1 = self._normalize_plane_key(key, int(z_dim))
+        return np.stack(
+            [self.read_window(z, 0, int(h), 0, int(w)) for z in range(z0, z1)],
+            axis=0,
+        )
+
+    def __setitem__(self, key: object, value: object) -> None:
+        # Used only by the GPU failure reset. Normal writers call write_crop.
+        if isinstance(key, tuple) and len(key) == 3 and isinstance(key[0], (int, np.integer)):
+            z_i = int(key[0])
+            if np.isscalar(value) and int(value) == 0:
+                self.clear_slice(z_i)
+                return
+        raise TypeError('SparseSliceLabelStore writes must use write_crop')
+
+    def __array__(self, dtype: Optional[np.dtype] = None, copy: Optional[bool] = None) -> np.ndarray:
+        dense = np.stack(
+            [self.read_window(z, 0, int(self.shape[1]), 0, int(self.shape[2]))
+             for z in range(int(self.shape[0]))],
+            axis=0,
+        )
+        if dtype is not None:
+            dense = dense.astype(dtype, copy=False)
+        if copy:
+            dense = dense.copy()
+        return dense
 
 
 def interpolation_skip_compact_relabel_enabled() -> bool:
@@ -13995,7 +14511,7 @@ _GPU_SLICE_LABELING_ANNOUNCED = False
 
 def _try_label_slices_stage_a_gpu(
     mask_mm: np.ndarray,
-    labels_store: np.ndarray,
+    labels_store: object,
     component_counts: np.ndarray,
     slice_bboxes: np.ndarray,
     slice_areas: Optional[List[Optional[np.ndarray]]],
@@ -14290,18 +14806,59 @@ def _try_label_slices_stage_a_gpu(
                 )
                 # Existing D3 transfer: labels must remain in the local-id store for later
                 # component-table/SDF consumers. Pair codes above add only one tiny D2H block.
-                relabeled_np = cp.asnumpy(relabeled_cp)
-                del relabeled_cp
-                for zi in range(bs):
-                    z = int(z0 + zi)
-                    k = int(counts_np[zi])
-                    if k <= 0:
-                        continue
-                    by0, by1, bx0, bx1 = (int(v) for v in block_bboxes[zi])
-                    np.copyto(
-                        np.asarray(labels_store[z, by0:by1, bx0:bx1]),
-                        relabeled_np[zi, by0:by1, bx0:bx1].astype(store_dtype, copy=False),
-                    )
+                # v13.3.17 C4 packs the tight device crops (already narrowed to the store
+                # dtype) and transfers them once. The normal sparse path therefore never
+                # creates the former dense int32 host block (~1 GiB at 64x2048^2).
+                if isinstance(labels_store, SparseSliceLabelStore):
+                    crop_specs: List[Tuple[int, int, int, int, int, int]] = []
+                    crop_device_parts: List[object] = []
+                    for zi in range(bs):
+                        z = int(z0 + zi)
+                        if int(counts_np[zi]) <= 0:
+                            continue
+                        by0, by1, bx0, bx1 = (int(v) for v in block_bboxes[zi])
+                        size = int((by1 - by0) * (bx1 - bx0))
+                        crop_specs.append((z, by0, by1, bx0, bx1, size))
+                        crop_device_parts.append(
+                            relabeled_cp[zi, by0:by1, bx0:bx1]
+                            .astype(cp.dtype(store_dtype), copy=False)
+                            .reshape(-1)
+                        )
+                    if crop_device_parts:
+                        packed_device = (
+                            crop_device_parts[0]
+                            if len(crop_device_parts) == 1
+                            else cp.concatenate(crop_device_parts)
+                        )
+                        packed_host = cp.asnumpy(packed_device)
+                        del packed_device
+                    else:
+                        packed_host = np.empty((0,), dtype=store_dtype)
+                    del crop_device_parts, relabeled_cp
+                    cursor = 0
+                    for z, by0, by1, bx0, bx1, size in crop_specs:
+                        labels_store.write_crop(
+                            z, by0, by1, bx0, bx1,
+                            packed_host[cursor:cursor + size].reshape(
+                                (by1 - by0, bx1 - bx0),
+                            ),
+                        )
+                        cursor += int(size)
+                    del packed_host, crop_specs
+                else:
+                    relabeled_np = cp.asnumpy(relabeled_cp)
+                    del relabeled_cp
+                    for zi in range(bs):
+                        z = int(z0 + zi)
+                        if int(counts_np[zi]) <= 0:
+                            continue
+                        by0, by1, bx0, bx1 = (int(v) for v in block_bboxes[zi])
+                        np.copyto(
+                            np.asarray(labels_store[z, by0:by1, bx0:bx1]),
+                            relabeled_np[zi, by0:by1, bx0:bx1].astype(
+                                store_dtype, copy=False,
+                            ),
+                        )
                 return _GpuSliceLabelBlockResult(
                     int(z0), int(z1), int(dev_idx), first_plane, last_plane,
                     internal_pair_codes,
@@ -14441,7 +14998,8 @@ def label_foreground_volume_streaming(
     component_stats_out: Optional[Dict[str, object]] = None,
     known_slice_any: Optional[np.ndarray] = None,
     known_slice_bboxes: Optional[np.ndarray] = None,
-) -> Tuple[np.ndarray, int, List[Path]]:
+    sparse_local_labels: bool = False,
+) -> Tuple[object, int, List[Path]]:
     """Label a 3D foreground volume using parallel 2D slice labeling plus serial union-find.
 
       - the expensive per-slice 2D connected-component labeling runs concurrently across slices
@@ -14467,6 +15025,9 @@ def label_foreground_volume_streaming(
     labeling stage skip empty slices without reading them and crop CC calls + store writes
     to the known bboxes. v13.3.6 (D3): where CUDA is live in this process, stage A runs as
     one z-disconnected cupy label per z-block instead of per-slice cv2 calls.
+    v13.3.17 (C4): ``sparse_local_labels`` stores only tight per-slice bbox crops in one
+    packed arena. It is valid only for the local-id/no-compact-relabel path and avoids the
+    prioritized interpolation passes' 22.7--37.1 GiB dense uint16 host raster.
     """
     z_dim, h, w = mask_mm.shape
     # v13.3.9 (D5): when compact relabel is skipped, this raster never holds
@@ -14482,10 +15043,25 @@ def label_foreground_volume_streaming(
     )
     label_paths: List[Path] = []
 
+    sparse_enabled = bool(
+        sparse_local_labels
+        and not bool(compact_relabel)
+        and interpolation_sparse_labels_enabled()
+    )
+    if bool(sparse_local_labels) and bool(compact_relabel):
+        raise ValueError('sparse_local_labels requires compact_relabel=False')
+
     budget = workspace_budget_summary(estimated_bytes, reserve_bytes=reserve_bytes)
-    if use_in_memory:
+    if sparse_enabled:
+        logical_gib = array_nbytes((z_dim, h, w), label_dtype) / GIB
+        print(
+            f'Interpolation label workspace: sparse per-slice arena '
+            f'(dense logical size {logical_gib:.1f} GiB, dtype={label_dtype.name})'
+        )
+        labels_store: object = SparseSliceLabelStore((z_dim, h, w), label_dtype)
+    elif use_in_memory:
         print(f"Interpolation label workspace: in-memory ({budget}, dtype={label_dtype.name})")
-        labels_store: np.ndarray = np.zeros((z_dim, h, w), dtype=label_dtype)
+        labels_store = np.zeros((z_dim, h, w), dtype=label_dtype)
     else:
         print(
             f"Interpolation label workspace: disk-backed ({budget}, dtype={label_dtype.name}) "
@@ -14493,7 +15069,8 @@ def label_foreground_volume_streaming(
         )
         labels_store = np.memmap(provisional_path, dtype=label_dtype, mode='w+', shape=(z_dim, h, w))
         label_paths = [provisional_path]
-    numa_interleave_memory(labels_store, desc='Interpolation label store')  # v13.3.5 (N2)
+    if not sparse_enabled:
+        numa_interleave_memory(labels_store, desc='Interpolation label store')  # v13.3.5 (N2)
 
     if int(z_dim) <= 0:
         flush_array(labels_store)
@@ -14574,12 +15151,24 @@ def label_foreground_volume_streaming(
             slice_bboxes[z_i, 3] = int(cols_any[-1]) + 1 + kx0
         local_count = int(num_labels) - 1
         _check_local_label_store_capacity(local_count, label_dtype, z=z_i)
-        if known_slice_bboxes is not None:
-            labels_store[z_i, ky0:ky0 + int(labels2d.shape[0]), kx0:kx0 + int(labels2d.shape[1])] = (
+        if sparse_enabled:
+            by0, by1, bx0, bx1 = (int(v) for v in slice_bboxes[z_i])
+            labels_store.write_crop(  # type: ignore[union-attr]
+                z_i, by0, by1, bx0, bx1,
+                np.asarray(
+                    labels2d[
+                        by0 - int(ky0):by1 - int(ky0),
+                        bx0 - int(kx0):bx1 - int(kx0),
+                    ],
+                    dtype=label_dtype,
+                ),
+            )
+        elif known_slice_bboxes is not None:
+            labels_store[z_i, ky0:ky0 + int(labels2d.shape[0]), kx0:kx0 + int(labels2d.shape[1])] = (  # type: ignore[index]
                 np.asarray(labels2d, dtype=label_dtype)
             )
         else:
-            labels_store[z_i, :, :] = np.asarray(labels2d, dtype=label_dtype)
+            labels_store[z_i, :, :] = np.asarray(labels2d, dtype=label_dtype)  # type: ignore[index]
         component_counts[z_i] = np.uint32(local_count)
 
     # v13.3.6 (D3): one z-disconnected cupy label pass per block on the GPU replaces the
@@ -14600,6 +15189,16 @@ def label_foreground_volume_streaming(
             desc='Interpolation: 2D slice labeling',
             show_progress=True,
             target_chunks_per_worker=2,
+        )
+
+    if sparse_enabled:
+        labels_store.finalize()  # type: ignore[union-attr]
+        payload_gib = int(labels_store.nbytes) / GIB  # type: ignore[union-attr]
+        logical_bytes = max(1, array_nbytes((z_dim, h, w), label_dtype))
+        pct = 100.0 * float(int(labels_store.nbytes)) / float(logical_bytes)  # type: ignore[union-attr]
+        print(
+            f'Interpolation sparse labels: {payload_gib:.3f} GiB packed '
+            f'({pct:.2f}% of dense local-id raster)'
         )
 
     total_components = int(np.sum(component_counts, dtype=np.uint64))
@@ -14681,8 +15280,6 @@ def label_foreground_volume_streaming(
             uf.union_pair_codes(codes)
 
     if bool(wrap_axis) and int(z_dim) > 1:
-        first_gid_slice = np.asarray(labels_store[0])
-        last_gid_slice = np.asarray(labels_store[int(z_dim) - 1])
         if int(component_counts[0]) > 0 and int(component_counts[int(z_dim) - 1]) > 0:
             # v13.2.2 bug #2: the radial angular domain is [0°, 180°) over full-diameter
             # frames, so the plane that continues the last frame (one Δ short of 180°) is
@@ -14690,9 +15287,33 @@ def label_foreground_volume_streaming(
             # relation the radial backprojection uses. Comparing at identical (t, u)
             # instead unioned mirror images through the rotation axis and missed the
             # true angular continuation.
+            if isinstance(labels_store, SparseSliceLabelStore):
+                ly0, ly1, lx0, lx1 = (
+                    int(v) for v in slice_bboxes[int(z_dim) - 1]
+                )
+                fy0, fy1, fx0, fx1 = (int(v) for v in slice_bboxes[0])
+                mfx0, mfx1 = int(w - fx1), int(w - fx0)
+                ry0 = max(0, max(ly0, fy0) - 1)
+                ry1 = min(int(h), min(ly1, fy1) + 1)
+                rx0 = max(0, max(lx0, mfx0) - 1)
+                rx1 = min(int(w), min(lx1, mfx1) + 1)
+                if ry0 < ry1 and rx0 < rx1:
+                    last_gid_slice = labels_store.read_window(
+                        int(z_dim) - 1, ry0, ry1, rx0, rx1,
+                    )
+                    first_gid_slice = labels_store.read_window(
+                        0, ry0, ry1, int(w - rx1), int(w - rx0),
+                    )[:, ::-1]
+                else:
+                    last_gid_slice = np.empty((0, 0), dtype=label_dtype)
+                    first_gid_slice = np.empty((0, 0), dtype=label_dtype)
+            else:
+                first_gid_slice = np.asarray(labels_store[0])  # type: ignore[index]
+                last_gid_slice = np.asarray(labels_store[int(z_dim) - 1])  # type: ignore[index]
+                first_gid_slice = first_gid_slice[:, ::-1]
             uf.union_pair_codes(_adjacent_gid_pair_codes(
                 last_gid_slice,
-                first_gid_slice[:, ::-1],
+                first_gid_slice,
                 prev_offset=int(slice_offsets[int(z_dim) - 1]),
                 curr_offset=int(slice_offsets[0]),
             ))
@@ -16306,20 +16927,83 @@ def _emit_projection_block_callback(
     block: np.ndarray,
     *,
     desc: str,
+    required: bool = False,
 ) -> None:
-    """Best-effort block delivery: callback failure must not fail a correct projection."""
+    """Deliver a completed projection block.
+
+    Dense projections retain the historical best-effort tee: if the incremental store
+    rejects a block, the complete dense raster is still authoritative.  v13.3.17 C2 adds
+    ``required`` for sink-only projections.  With no redundant dense raster to recover
+    from, callback failure aborts the transaction and propagates immediately so the
+    materializer can discard the partial store and rerun through the dense fallback.
+    """
     if callback is None:
+        if bool(required):
+            raise RuntimeError(f'{desc}: sink-only projection requires a block consumer')
         return
     try:
         callback(int(z0), np.asarray(block))
     except Exception as exc:
         _abort_projection_block_callback(callback, exc)
+        if bool(required):
+            raise
         warn = getattr(callback, 'warn_failed_once', None)
         if callable(warn):
             try:
                 warn(f'{desc}: incremental raw-bbox callback failed ({exc})')
             except Exception:
                 pass
+
+
+def _emit_projection_empty_range(
+    callback: Optional[Callable[[int, np.ndarray], None]],
+    z0: int,
+    count: int,
+    plane_shape: Tuple[int, int],
+    *,
+    desc: str,
+    required: bool = False,
+) -> None:
+    """Deliver a proven-empty range without constructing dense planes when supported."""
+    count_i = max(0, int(count))
+    if count_i <= 0:
+        return
+    if callback is None:
+        if bool(required):
+            raise RuntimeError(f'{desc}: sink-only projection requires an empty-range consumer')
+        return
+    empty_consumer = getattr(callback, 'consume_empty_range', None)
+    if callable(empty_consumer):
+        try:
+            empty_consumer(int(z0), int(count_i))
+            return
+        except Exception as exc:
+            _abort_projection_block_callback(callback, exc)
+            if bool(required):
+                raise
+            warn = getattr(callback, 'warn_failed_once', None)
+            if callable(warn):
+                try:
+                    warn(f'{desc}: incremental empty-range callback failed ({exc})')
+                except Exception:
+                    pass
+            return
+    # Compatibility callbacks that predate consume_empty_range still receive a normal
+    # block.  This allocation is bounded by one projection chunk, never the full raster.
+    _emit_projection_block_callback(
+        callback,
+        int(z0),
+        np.zeros((int(count_i), int(plane_shape[0]), int(plane_shape[1])), dtype=np.uint8),
+        desc=desc,
+        required=bool(required),
+    )
+
+
+@dataclass(frozen=True)
+class SinkOnlyProjectionResult:
+    """Successful projection whose complete representation lives in its block sink."""
+
+    shape: Tuple[int, int, int]
 
 
 _RADIAL_RESIDENT_BACKPROJECT_KERNEL: Optional[object] = None
@@ -16448,7 +17132,7 @@ def _radial_resident_backproject_kernel() -> Optional[object]:
 
 def _radial_backproject_gpu_resident(
     radial_mask_mm: np.ndarray,
-    vol_mm: np.ndarray,
+    vol_mm: Optional[np.ndarray],
     valid_mask: np.ndarray,
     source_idx_map: np.ndarray,
     u_idx_map: np.ndarray,
@@ -16459,6 +17143,7 @@ def _radial_backproject_gpu_resident(
     desc: str,
     known_row_occupancy: Optional[np.ndarray] = None,
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
+    sink_only: bool = False,
 ) -> bool:
     """Project a fully resident radial source with staged upload/commit overlap.
 
@@ -16651,9 +17336,14 @@ def _radial_backproject_gpu_resident(
 
             def _commit_block(t0_i: int, t1_i: int, block_i: np.ndarray) -> float:
                 started = time.perf_counter()
-                np.copyto(np.asarray(vol_mm[int(t0_i):int(t1_i)]), block_i)
+                if vol_mm is not None:
+                    np.copyto(np.asarray(vol_mm[int(t0_i):int(t1_i)]), block_i)
                 _emit_projection_block_callback(
-                    projection_block_callback, int(t0_i), block_i, desc=desc,
+                    projection_block_callback,
+                    int(t0_i),
+                    block_i,
+                    desc=desc,
+                    required=bool(sink_only),
                 )
                 return float(time.perf_counter() - started)
 
@@ -16672,16 +17362,14 @@ def _radial_backproject_gpu_resident(
                 v0 = v_range_for_t(int(t0))[0]
                 v1 = v_range_for_t(int(t1 - 1))[1]
                 if not bool(np.any(row_any[int(v0):int(v1)])):
-                    empty_consumer = getattr(projection_block_callback, 'consume_empty_range', None)
-                    if callable(empty_consumer):
-                        empty_consumer(int(t0), int(t1 - t0))
-                    else:
-                        _emit_projection_block_callback(
-                            projection_block_callback,
-                            int(t0),
-                            np.asarray(vol_mm[int(t0):int(t1)]),
-                            desc=desc,
-                        )
+                    _emit_projection_empty_range(
+                        projection_block_callback,
+                        int(t0),
+                        int(t1 - t0),
+                        (int(out_h), int(out_w)),
+                        desc=desc,
+                        required=bool(sink_only),
+                    )
                     continue
                 slot_idx = int(chunk_idx) % len(pin_out_slots)
                 _settle_commit(slot_idx)
@@ -16715,6 +17403,7 @@ def _radial_backproject_gpu_resident(
         print(
             f'{desc}: full-resident GPU backprojection complete; source={source_bytes / GIB:.1f} GiB, '
             f'layout={layout}, upload_slots={len(pin_src_slots)}, commit_slots={len(pin_out_slots)}, '
+            f'output={"sink-only" if bool(sink_only) else "dense+sink"}, '
             f'active_rows={int(np.count_nonzero(row_any))}/{int(work_t)}, '
             f'upload={upload_seconds:.2f}s, transpose={transpose_seconds:.2f}s, '
             f'project+commit wall={projection_seconds:.2f}s, commit CPU sum={commit_cpu_seconds:.2f}s, '
@@ -16723,12 +17412,13 @@ def _radial_backproject_gpu_resident(
         return True
     finally:
         if commit_pool is not None:
-            try:
-                for fut in commit_futures:
-                    if fut is not None:
-                        fut.result()
-            except Exception:
-                pass
+            # C2 transaction boundary: do not let materialize_nrrd_view_layer discard
+            # and unlink a failed sink while a later resident commit still owns its fd.
+            # Cancel work that has not started, then wait for every running callback even
+            # when an earlier future failed; cleanup must never return a live writer task.
+            _settle_parallel_futures(
+                fut for fut in commit_futures if fut is not None
+            )
             _release_parallel_pool(max(1, len(pin_out_slots)), commit_pool)
         try:
             del radial_dev, tmajor_dev, source_dev, u_dev, out_dev
@@ -16743,7 +17433,7 @@ def _radial_backproject_gpu_resident(
 
 def _radial_backproject_gpu_streaming(
     radial_mask_mm: np.ndarray,
-    vol_mm: np.ndarray,
+    vol_mm: Optional[np.ndarray],
     valid_pos: np.ndarray,
     flat_src: np.ndarray,
     v_range_for_t: Callable[[int], Tuple[int, int]],
@@ -16754,6 +17444,7 @@ def _radial_backproject_gpu_streaming(
     known_row_occupancy: Optional[np.ndarray] = None,
     known_slice_bboxes: Optional[np.ndarray] = None,
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
+    sink_only: bool = False,
 ) -> bool:
     """v13.3.2 (R6a): radial backprojection with a <1 GiB streaming GPU working set.
 
@@ -16845,13 +17536,15 @@ def _radial_backproject_gpu_streaming(
                 v1 = v_range_for_t(int(t1 - 1))[1]
                 v_count = int(v1 - v0)
                 if not bool(np.any(row_any[int(v0):int(v1)])):
-                    _emit_projection_block_callback(
+                    _emit_projection_empty_range(
                         projection_block_callback,
                         int(t0),
-                        np.asarray(vol_mm[int(t0):int(t1)]),
+                        int(t1 - t0),
+                        (int(out_h), int(out_w)),
                         desc=desc,
+                        required=bool(sink_only),
                     )
-                    continue  # vol_mm is pre-zeroed
+                    continue  # dense output (when present) is pre-zeroed
                 if int(v_count) > int(pin_rows.shape[0]):  # pragma: no cover - conservative bound
                     raise RuntimeError(f'{desc}: covering rows {v_count} exceed staging bound {pin_rows.shape[0]}')
 
@@ -16906,10 +17599,11 @@ def _radial_backproject_gpu_streaming(
                             out_dev[local_t].index_put_((valid_pos_t,), sub)
                 pin_out[: t1 - t0].copy_(out_dev[: t1 - t0], non_blocking=True)
                 stream.synchronize()
-                np.copyto(
-                    np.asarray(vol_mm[t0:t1]).reshape(t1 - t0, -1),
-                    pin_out_np[: t1 - t0],
-                )
+                if vol_mm is not None:
+                    np.copyto(
+                        np.asarray(vol_mm[t0:t1]).reshape(t1 - t0, -1),
+                        pin_out_np[: t1 - t0],
+                    )
                 # Feed the just-completed pinned D2H block straight to the cvol indexer.
                 # The full projected volume remains available only as a failure fallback;
                 # the successful path never scans it again to create the raw-bbox store.
@@ -16918,11 +17612,15 @@ def _radial_backproject_gpu_streaming(
                     int(t0),
                     pin_out_np[: t1 - t0].reshape((int(t1 - t0), int(out_h), int(out_w))),
                     desc=desc,
+                    required=bool(sink_only),
                 )
             stream.synchronize()
     finally:
         _release_parallel_pool(stage_workers, stage_pool)
-    print(f'{desc}: GPU streaming backprojection complete ({t_dim} output slices).')
+    print(
+        f'{desc}: GPU streaming backprojection complete ({t_dim} output slices; '
+        f'output={"sink-only" if bool(sink_only) else "dense+sink"}).'
+    )
     return True
 
 
@@ -16939,7 +17637,8 @@ def backproject_radial_volume_to_volume(
     known_row_occupancy: Optional[np.ndarray] = None,
     known_slice_bboxes: Optional[np.ndarray] = None,
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
-) -> np.ndarray:
+    sink_only: bool = False,
+) -> np.ndarray | SinkOnlyProjectionResult:
     """Backproject a radial view-native mask stack into orthogonal (t, Y, X).
 
     v13.2.4 (task #1, ruling A1): ``out_shape_tyx`` backprojects DIRECTLY into the final source
@@ -16948,6 +17647,11 @@ def backproject_radial_volume_to_volume(
     former tail restore without an intermediate working-geometry volume. ``None`` keeps the
     historical working-geometry target. The cube resize only ever grows axes, so the working
     geometry is never smaller than the source geometry.
+
+    v13.3.17 C2: ``sink_only=True`` suppresses the full ``(t,Y,X)`` allocation and makes
+    ``projection_block_callback`` the authoritative transactional destination. Success returns
+    :class:`SinkOnlyProjectionResult`; failures propagate so the caller can discard the partial
+    store and explicitly request the retained dense fallback.
     """
     if radial_view.family != 'radial':
         raise ValueError('backproject_radial_volume_to_volume expects a radial view')
@@ -16960,14 +17664,23 @@ def backproject_radial_volume_to_volume(
     else:
         t_dim, out_h, out_w = (int(v) for v in out_shape_tyx)
 
-    vol_mm = allocate_workspace_array(
-        shape=(t_dim, out_h, out_w),
-        dtype=np.uint8,
-        path=out_path,
-        desc=f'{desc} workspace',
-        prefer_memory=bool(prefer_memory),
-        reserve_bytes=int(reserve_bytes),
-    )
+    if bool(sink_only) and projection_block_callback is None:
+        raise ValueError(f'{desc}: sink_only=True requires projection_block_callback')
+    vol_mm: Optional[np.ndarray] = None
+    if not bool(sink_only):
+        vol_mm = allocate_workspace_array(
+            shape=(t_dim, out_h, out_w),
+            dtype=np.uint8,
+            path=out_path,
+            desc=f'{desc} workspace',
+            prefer_memory=bool(prefer_memory),
+            reserve_bytes=int(reserve_bytes),
+        )
+    else:
+        print(
+            f'{desc}: v13.3.17 C2 sink-only radial projection active; '
+            f'skipping {array_nbytes((t_dim, out_h, out_w), np.uint8) / GIB:.2f} GiB dense workspace.'
+        )
 
     plan, plan_stats = build_radial_backprojection_plan(radial_view)
     if bool(plan_stats.get('densified', 0.0)):
@@ -16981,17 +17694,18 @@ def backproject_radial_volume_to_volume(
         )
 
     if not plan:
-        empty_chunk = max(1, _env_int('YOLO_TTA_CPU_BACKPROJECT_T_CHUNK', 128))
-        for t0 in range(0, int(t_dim), int(empty_chunk)):
-            t1 = min(int(t_dim), int(t0) + int(empty_chunk))
-            _emit_projection_block_callback(
-                projection_block_callback,
-                int(t0),
-                np.asarray(vol_mm[int(t0):int(t1)]),
-                desc=desc,
-            )
-        flush_array(vol_mm)
-        return vol_mm
+        _emit_projection_empty_range(
+            projection_block_callback,
+            0,
+            int(t_dim),
+            (int(out_h), int(out_w)),
+            desc=desc,
+            required=bool(sink_only),
+        )
+        if vol_mm is not None:
+            flush_array(vol_mm)
+            return vol_mm
+        return SinkOnlyProjectionResult((int(t_dim), int(out_h), int(out_w)))
 
     dense_map = build_dense_radial_backprojection_map(
         radial_view, plan, out_shape_hw=None if out_shape_tyx is None else (out_h, out_w)
@@ -17048,6 +17762,7 @@ def backproject_radial_volume_to_volume(
                 int(t_dim), int(out_h), int(out_w), desc,
                 known_row_occupancy=row_occ,
                 projection_block_callback=projection_block_callback,
+                sink_only=bool(sink_only),
             )
             if not gpu_done:
                 gpu_done = _radial_backproject_gpu_streaming(
@@ -17056,11 +17771,14 @@ def backproject_radial_volume_to_volume(
                     known_row_occupancy=row_occ,
                     known_slice_bboxes=radial_slice_bboxes,
                     projection_block_callback=projection_block_callback,
+                    sink_only=bool(sink_only),
                 )
         except Exception as exc:
             # Some GPU blocks may already have been indexed. The CPU retry rewrites all
             # output blocks, so retain projection correctness but discard that partial store.
             _abort_projection_block_callback(projection_block_callback, exc)
+            if bool(sink_only):
+                raise
             projection_block_callback = None
             print(f'{desc}: GPU backprojection failed ({exc}); using the CPU path.')
             gpu_done = False
@@ -17094,11 +17812,13 @@ def backproject_radial_volume_to_volume(
             v0 = int(_v_range_for_t(int(t0))[0])
             v1 = int(_v_range_for_t(int(t1 - 1))[1])
             if not bool(np.any(row_occ[int(v0):int(v1)])):
-                _emit_projection_block_callback(
+                _emit_projection_empty_range(
                     projection_block_callback,
                     int(t0),
-                    np.asarray(vol_mm[int(t0):int(t1)]),
+                    int(t1 - t0),
+                    (int(out_h), int(out_w)),
                     desc=desc,
+                    required=bool(sink_only),
                 )
                 return
             t_major = np.empty(
@@ -17114,14 +17834,20 @@ def backproject_radial_volume_to_volume(
                 stage_workers=stage_workers,
             )
             gathered_rows = t_major.reshape(int(v1 - v0), -1).take(flat_src, axis=1)
-            out_flat = np.asarray(vol_mm[int(t0):int(t1)]).reshape(int(t1 - t0), -1)
+            block_out = (
+                np.asarray(vol_mm[int(t0):int(t1)])
+                if vol_mm is not None
+                else np.zeros((int(t1 - t0), int(out_h), int(out_w)), dtype=np.uint8)
+            )
+            out_flat = block_out.reshape(int(t1 - t0), -1)
             if same_t_axis:
                 out_flat[:, valid_pos] = gathered_rows[:int(t1 - t0)]
                 _emit_projection_block_callback(
                     projection_block_callback,
                     int(t0),
-                    np.asarray(vol_mm[int(t0):int(t1)]),
+                    block_out,
                     desc=desc,
+                    required=bool(sink_only),
                 )
                 return
             for t in range(int(t0), int(t1)):
@@ -17135,8 +17861,9 @@ def backproject_radial_volume_to_volume(
             _emit_projection_block_callback(
                 projection_block_callback,
                 int(t0),
-                np.asarray(vol_mm[int(t0):int(t1)]),
+                block_out,
                 desc=desc,
+                required=bool(sink_only),
             )
 
         try:
@@ -17150,8 +17877,10 @@ def backproject_radial_volume_to_volume(
         finally:
             _release_parallel_pool(stage_workers, stage_pool)
 
-    flush_array(vol_mm)
-    return vol_mm
+    if vol_mm is not None:
+        flush_array(vol_mm)
+        return vol_mm
+    return SinkOnlyProjectionResult((int(t_dim), int(out_h), int(out_w)))
 
 def backproject_tilted_volume_to_volume(
     tilted_mask_mm: np.ndarray,
@@ -17590,6 +18319,18 @@ def fused_final_view_union_enabled() -> bool:
     return _env_flag('YOLO_TTA_FUSED_FINAL_VIEW_UNION', True)
 
 
+def fused_final_restore_geometry_groups_enabled() -> bool:
+    """v13.3.17 (C1): union equal-geometry projected layers before one restore.
+
+    Reduced Tilted component layers share an orthogonal backing geometry.  Binary
+    union commutes with the positive-support INTER_AREA/NEAREST restore, so G5 can
+    decode/OR every layer in one geometry group on its reduced grid and resize the
+    group once.  The escape hatch retains the v13.3.16 per-layer restore for direct
+    regression comparisons.
+    """
+    return _env_flag('YOLO_TTA_FUSED_FINAL_RESTORE_GEOMETRY_GROUPS', True)
+
+
 def _resize_union_plane_to_out_xy(plane: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
     """Exact Cartesian final-union binary-plane restore used by legacy and G5 paths."""
     plane_u8 = (np.asarray(plane, dtype=np.uint8) > 0).astype(np.uint8, copy=False)
@@ -17851,6 +18592,12 @@ def assemble_view_volumes_and_projected_layers_fused(
     binary XY resize. Source-geometry radial/tilted component stores are read
     directly, so their former full-volume per-view intermediates never exist. Each
     worker builds one private output plane and assigns its final slice once.
+
+    v13.3.17 C1 groups reduced projected stores by their identical orthogonal restore
+    geometry.  All source slices/layers in a group are ORed on that reduced grid and
+    the group is resized once; source-native Radial stores retain the direct indexed
+    crop path.  This removes 14 of the 16 per-output-slice Tilted resizes in the
+    reference 8-view/2-layer run without constructing any dense volume intermediate.
     """
     out_t, out_h, out_w = (int(v) for v in out_shape_tyx)
     if (out_t, out_h, out_w) == (int(T), int(H), int(W)):
@@ -17901,14 +18648,54 @@ def assemble_view_volumes_and_projected_layers_fused(
                 _madvise_array_mmap(src, 'MADV_SEQUENTIAL')
             opened.append((ref, src))
 
+        # v13.3.17 C1: shape fully defines the restore transform here because every
+        # projected layer is already in canonical orthogonal (t,Y,X) coordinates.
+        # Grouping is intentionally limited to non-native layers. Native Radial stores
+        # continue to contribute bbox crops directly to the output accumulator.
+        group_restores = bool(fused_final_restore_geometry_groups_enabled())
+        native_projected: List[Tuple['NrrdLayerRef', object]] = []
+        restore_groups: 'OrderedDict[Tuple[int, int, int], List[Tuple[NrrdLayerRef, object]]]' = OrderedDict()
+        if group_restores:
+            for ref, src in opened:
+                geometry = tuple(int(v) for v in _volume_shape_tuple(src))
+                if geometry == (out_t, out_h, out_w):
+                    native_projected.append((ref, src))
+                else:
+                    restore_groups.setdefault(geometry, []).append((ref, src))
+            grouped_layers = sum(len(group) for group in restore_groups.values())
+            group_text = ', '.join(
+                f'{len(group)}x{tuple(int(v) for v in geometry)}'
+                for geometry, group in restore_groups.items()
+            ) or 'none'
+            print(
+                f'v13.3.17 (C1): G5 grouped {int(grouped_layers)} reduced projected '
+                f'layer(s) into {len(restore_groups)} restore geometry group(s) '
+                f'[{group_text}] ({int(grouped_layers)} -> {len(restore_groups)} '
+                f'restores/output-z); {len(native_projected)} native layer(s) remain direct.'
+            )
+
         scratch_tls = threading.local()
 
-        def _scratch_map() -> Dict[int, np.ndarray]:
+        def _scratch_map() -> Dict[object, np.ndarray]:
             buffers = getattr(scratch_tls, 'buffers', None)
             if buffers is None:
                 buffers = {}
                 scratch_tls.buffers = buffers
             return buffers
+
+        def _or_native_source_slice(dst: np.ndarray, src: object, src_z: int) -> None:
+            """OR one source-grid slice, preserving RawBBoxMaskStore crop sparsity."""
+            if isinstance(src, RawBBoxMaskStore):
+                rec = src.index[int(src_z)]
+                if int(rec['kind']) != 1:
+                    return
+                decoded = src.decode_slice_crop(int(src_z), dtype=np.uint8)
+                if decoded is None:  # defensive: index.kind was checked above
+                    return
+                y0, x0, y1, x1, crop = decoded
+                dst[int(y0):int(y1), int(x0):int(x1)] |= crop
+                return
+            np.bitwise_or(dst, np.asarray(src[int(src_z)], dtype=np.uint8), out=dst)
 
         def _merge_out_slice(out_z: int) -> None:
             buffers = _scratch_map()
@@ -17960,27 +18747,54 @@ def assemble_view_volumes_and_projected_layers_fused(
             for _view_name, vol in native_views:
                 np.bitwise_or(acc, np.asarray(vol[int(out_z)], dtype=np.uint8), out=acc)
 
-            for _source_idx, (_ref, src) in enumerate(opened):
-                ref_native = tuple(int(v) for v in _ref.shape) == (out_t, out_h, out_w)
-                if ref_native and isinstance(src, RawBBoxMaskStore):
-                    rec = src.index[int(out_z)]
-                    if int(rec['kind']) != 1:
-                        continue  # exact per-output-z foreground bitmap from the bbox index
-                    decoded = src.decode_slice_crop(int(out_z), dtype=np.uint8)
-                    if decoded is None:  # defensive: index.kind was checked above
-                        continue
-                    y0, x0, y1, x1, crop = decoded
-                    acc[y0:y1, x0:x1] |= crop
-                elif ref_native:
-                    np.bitwise_or(acc, np.asarray(src[int(out_z)], dtype=np.uint8), out=acc)
-                else:
+            if group_restores:
+                # Native projected layers (the two Radial refs in the reference run)
+                # retain the exact C1-independent sparse direct path.
+                for _ref, src in native_projected:
+                    _or_native_source_slice(acc, src, int(out_z))
+
+                # One thread-private reduced plane is reused by groups with equal XY.
+                # Union all t-coverage slices and component layers before the single
+                # positive-support resize. For binary masks this is exactly equivalent
+                # to OR(resize(layer_i)) while eliminating repeated cv2 calls/allocations.
+                for geometry, group in restore_groups.items():
+                    in_t, in_h, in_w = (int(v) for v in geometry)
+                    reduced_key = ('c1_restore', int(in_h), int(in_w))
+                    reduced = buffers.get(reduced_key)
+                    if reduced is None:
+                        reduced = np.zeros((int(in_h), int(in_w)), dtype=np.uint8)
+                        buffers[reduced_key] = reduced
+                    else:
+                        reduced.fill(np.uint8(0))
+                    source_zs = _restore_source_indices_for_output_z(
+                        int(in_t), int(out_t), int(out_z),
+                    )
+                    # Keep each store's adjacent source-z reads together. This retains
+                    # G9's sequential mmap/readahead locality while changing only where
+                    # the group-wide binary restore occurs.
+                    for _ref, src in group:
+                        for src_z in source_zs:
+                            _or_native_source_slice(reduced, src, int(src_z))
                     np.bitwise_or(
                         acc,
-                        _read_layer_slice_in_output_shape(
-                            src, (int(out_t), int(out_h), int(out_w)), int(out_z),
-                        ),
+                        _resize_union_plane_to_out_xy(reduced, int(out_h), int(out_w)),
                         out=acc,
                     )
+            else:
+                # Exact v13.3.16 fallback: restore every reduced component layer
+                # independently. Useful for byte-equivalence/performance A/B checks.
+                for _ref, src in opened:
+                    ref_native = tuple(int(v) for v in _ref.shape) == (out_t, out_h, out_w)
+                    if ref_native:
+                        _or_native_source_slice(acc, src, int(out_z))
+                    else:
+                        np.bitwise_or(
+                            acc,
+                            _read_layer_slice_in_output_shape(
+                                src, (int(out_t), int(out_h), int(out_w)), int(out_z),
+                            ),
+                            out=acc,
+                        )
 
             # final_union is freshly allocated, but assignment is stronger than RMW and
             # guarantees exactly one full-plane destination write for this z.
@@ -18158,6 +18972,9 @@ def apply_keep_largest_objects_inplace(
         workers=int(workers),
         compact_relabel=False,
         component_stats_out=comp_stats,
+        # C4 also covers the prioritized --keep_objects 1 tail: the same local-label
+        # arena and direct packed-LUT apply avoid rebuilding a second dense host cube.
+        sparse_local_labels=True,
     )
 
     if int(num_objects) <= keep_n:
@@ -18215,7 +19032,26 @@ def apply_keep_largest_objects_inplace(
             apply_slice[int(z)] = np.uint8(1)
 
     kernel_done = False
-    if compiled_interpolation_kernels_enabled() and _numba_keep_lut_apply_kernel is not None:
+    if (
+        isinstance(labels_mm, SparseSliceLabelStore)
+        and compiled_interpolation_kernels_enabled()
+        and _numba_sparse_keep_lut_apply_kernel is not None
+    ):
+        try:
+            print(f'keep_objects: applying keep-largest-{keep_n} from sparse labels via numba nogil kernel')
+            _numba_sparse_keep_lut_apply_kernel(
+                labels_mm.flat,
+                labels_mm.offsets,
+                keep_flat,
+                lut_offsets,
+                np.ascontiguousarray(slice_bboxes),
+                apply_slice,
+                np.asarray(mask_mm),
+            )
+            kernel_done = True
+        except Exception as exc:
+            print(f'keep_objects: sparse numba apply unavailable ({exc}); using the thread pool.')
+    elif compiled_interpolation_kernels_enabled() and _numba_keep_lut_apply_kernel is not None:
         try:
             print(f'keep_objects: applying keep-largest-{keep_n} via numba nogil kernel')
             _numba_keep_lut_apply_kernel(
@@ -18465,7 +19301,7 @@ class SliceComponentTableCache:
     full-slice SDFs and full-slice boolean projection scans per seed.
     """
 
-    def __init__(self, labels_real: np.ndarray, slice_luts: Optional['SliceLocalLabelLUTs'] = None) -> None:
+    def __init__(self, labels_real: object, slice_luts: Optional['SliceLocalLabelLUTs'] = None) -> None:
         self.labels_real = labels_real
         # v13.3.6 (A1): when the label volume holds per-slice LOCAL ids (compact relabel
         # skipped), tables canonicalize each component's id through the per-slice LUT at
@@ -18489,12 +19325,19 @@ class SliceComponentTableCache:
         with self._table_locks[z_i]:
             cached = self._tables.get(z_i)
             if cached is None:
+                if isinstance(self.labels_real, SparseSliceLabelStore):
+                    origin_y, origin_x, labels2d = self.labels_real.crop_with_origin(z_i)
+                else:
+                    origin_y, origin_x = 0, 0
+                    labels2d = np.asarray(self.labels_real[z_i])  # type: ignore[index]
                 cached = _build_slice_component_table(
-                    np.asarray(self.labels_real[z_i]),
+                    labels2d,
                     z_i,
                     local_to_canonical=(
                         self.slice_luts.lut_for(z_i) if self.slice_luts is not None else None
                     ),
+                    origin_yx=(int(origin_y), int(origin_x)),
+                    full_shape_yx=self.shape_yx,
                 )
                 self._tables[z_i] = cached
             return cached
@@ -18675,6 +19518,8 @@ def _build_slice_component_table(
     labels2d: np.ndarray,
     z: int,
     local_to_canonical: Optional[np.ndarray] = None,
+    origin_yx: Tuple[int, int] = (0, 0),
+    full_shape_yx: Optional[Tuple[int, int]] = None,
 ) -> SliceComponentTable:
     """Build the per-slice component records for interpolation planning.
 
@@ -18690,12 +19535,19 @@ def _build_slice_component_table(
     """
     labels_arr = np.asarray(labels2d)
     h, w = (int(labels_arr.shape[0]), int(labels_arr.shape[1]))
+    origin_y, origin_x = (int(origin_yx[0]), int(origin_yx[1]))
+    table_shape = (
+        (int(full_shape_yx[0]), int(full_shape_yx[1]))
+        if full_shape_yx is not None else (h, w)
+    )
     components: List[SliceComponentRecord] = []
     by_label: Dict[int, List[SliceComponentRecord]] = {}
 
     rows_any = labels_arr.any(axis=1)
     if not rows_any.any():
-        return SliceComponentTable(z=int(z), shape=(h, w), components=components, by_label=by_label)
+        return SliceComponentTable(
+            z=int(z), shape=table_shape, components=components, by_label=by_label,
+        )
     cols_any = labels_arr.any(axis=0)
     row_idx = np.flatnonzero(rows_any)
     col_idx = np.flatnonzero(cols_any)
@@ -18740,14 +19592,22 @@ def _build_slice_component_table(
             z=int(z),
             label=int(label_i),
             component_index=int(len(components) + 1),
-            bbox=(int(by0 + y), int(bx0 + x), int(by0 + y + height), int(bx0 + x + width)),
-            anchor=(int(by0 + y + int(ys[anchor_idx])), int(bx0 + x + int(xs[anchor_idx]))),
+            bbox=(
+                int(origin_y + by0 + y), int(origin_x + bx0 + x),
+                int(origin_y + by0 + y + height), int(origin_x + bx0 + x + width),
+            ),
+            anchor=(
+                int(origin_y + by0 + y + int(ys[anchor_idx])),
+                int(origin_x + bx0 + x + int(xs[anchor_idx])),
+            ),
             area=int(area),
             mask_crop=comp_crop,
         )
         components.append(record)
         by_label.setdefault(int(label_i), []).append(record)
-    return SliceComponentTable(z=int(z), shape=(h, w), components=components, by_label=by_label)
+    return SliceComponentTable(
+        z=int(z), shape=table_shape, components=components, by_label=by_label,
+    )
 
 
 def _component_record_to_local_canvas(record: SliceComponentRecord, anchor_yx: Tuple[int, int], half_width: int) -> np.ndarray:
@@ -19355,6 +20215,12 @@ if _numba is not None:
     @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
     def _numba_find_projection_candidates_kernel(
         labels_real: np.ndarray,
+        sparse_flat: np.ndarray,
+        sparse_offsets: np.ndarray,
+        sparse_bboxes: np.ndarray,
+        sparse_mode: bool,
+        num_slices_arg: int,
+        full_w_arg: int,
         lut_flat: np.ndarray,
         lut_offsets: np.ndarray,
         sdf: np.ndarray,
@@ -19385,8 +20251,8 @@ if _numba is not None:
         step_d2 = np.zeros((max_tracked,), dtype=np.int64)
 
         found_count = 0
-        num_slices = labels_real.shape[0]
-        full_w = labels_real.shape[2]
+        num_slices = num_slices_arg
+        full_w = full_w_arg
         sdf_h = sdf.shape[0]
         sdf_w = sdf.shape[1]
         overflow = 0
@@ -19425,7 +20291,20 @@ if _numba is not None:
                         gx_read = full_w - 1 - gx
                     else:
                         gx_read = gx
-                    raw_label = int(labels_real[s, gy, gx_read])
+                    if sparse_mode:
+                        sy0 = int(sparse_bboxes[s, 0])
+                        sy1 = int(sparse_bboxes[s, 1])
+                        sx0 = int(sparse_bboxes[s, 2])
+                        sx1 = int(sparse_bboxes[s, 3])
+                        if gy < sy0 or gy >= sy1 or gx_read < sx0 or gx_read >= sx1:
+                            raw_label = 0
+                        else:
+                            sparse_index = int(sparse_offsets[s]) + (
+                                (gy - sy0) * (sx1 - sx0) + (gx_read - sx0)
+                            )
+                            raw_label = int(sparse_flat[sparse_index])
+                    else:
+                        raw_label = int(labels_real[s, gy, gx_read])
                     if raw_label <= 0:
                         continue
                     if use_lut:
@@ -19495,7 +20374,7 @@ else:
 
 
 def _find_slice_projection_candidates_numba(
-    labels_real: np.ndarray,
+    labels_real: object,
     seed: SliceEndpointSeed,
     max_slice_distance: int,
     search_angle_deg: float,
@@ -19552,9 +20431,29 @@ def _find_slice_projection_candidates_numba(
         # 0-length offsets can never equal num_slices (>0 here), so use_lut stays False.
         lut_flat_arg = np.zeros((1,), dtype=np.uint32)
         lut_offsets_arg = np.zeros((0,), dtype=np.int64)
+    if isinstance(labels_real, SparseSliceLabelStore):
+        # Numba cannot accept the Python store object, so pass its native packed arena and
+        # metadata plus a tiny unused dense sentinel. Candidate reads stay wholly compiled.
+        dense_arg = np.empty((0, 0, 0), dtype=labels_real.dtype)
+        sparse_flat_arg = labels_real.flat
+        sparse_offsets_arg = labels_real.offsets
+        sparse_bboxes_arg = labels_real.bboxes
+        sparse_mode_arg = True
+    else:
+        dense_arg = labels_real
+        sparse_flat_arg = np.empty((0,), dtype=np.uint16)
+        sparse_offsets_arg = np.empty((0,), dtype=np.int64)
+        sparse_bboxes_arg = np.empty((0, 4), dtype=np.int64)
+        sparse_mode_arg = False
     try:
         labels_out, slices_out, ys_out, xs_out, steps_out, d2_out, count, overflow = _numba_find_projection_candidates_kernel(
-            labels_real,
+            dense_arg,
+            sparse_flat_arg,
+            sparse_offsets_arg,
+            sparse_bboxes_arg,
+            bool(sparse_mode_arg),
+            int(num_slices),
+            int(labels_real.shape[2]),
             lut_flat_arg,
             lut_offsets_arg,
             sdf,
@@ -19608,7 +20507,7 @@ def _find_slice_projection_candidates_numba(
 
 
 def _find_slice_projection_candidates_python(
-    labels_real: np.ndarray,
+    labels_real: object,
     seed: SliceEndpointSeed,
     max_slice_distance: int,
     search_angle_deg: float,
@@ -19677,10 +20576,25 @@ def _find_slice_projection_candidates_python(
                 break
             continue
 
-        slice_view = np.asarray(labels_real[int(s)])
-        if mirrored:
-            slice_view = slice_view[:, ::-1]
-        labels_crop = slice_view[crop_y0:crop_y1, crop_x0:crop_x1]
+        if isinstance(labels_real, SparseSliceLabelStore):
+            # C4: materialize only the SDF window. A wrap-crossing projection requests
+            # the corresponding actual-u window and reverses that small crop back into
+            # unrolled projection coordinates.
+            if mirrored:
+                actual_x0 = int(full_w - crop_x1)
+                actual_x1 = int(full_w - crop_x0)
+                labels_crop = labels_real.read_window(
+                    int(s), crop_y0, crop_y1, actual_x0, actual_x1,
+                )[:, ::-1]
+            else:
+                labels_crop = labels_real.read_window(
+                    int(s), crop_y0, crop_y1, crop_x0, crop_x1,
+                )
+        else:
+            slice_view = np.asarray(labels_real[int(s)])
+            if mirrored:
+                slice_view = slice_view[:, ::-1]
+            labels_crop = slice_view[crop_y0:crop_y1, crop_x0:crop_x1]
         if slice_luts is not None:
             # v13.3.6 (A1): local-id raster — canonicalize just the SDF crop (small gather)
             # instead of relying on a full-volume compact relabel pass.
@@ -20273,6 +21187,7 @@ def interpolate_view_volume_pass_inplace(
         component_stats_out=label_stats if skip_relabel else None,
         known_slice_any=known_slice_any,
         known_slice_bboxes=known_slice_bboxes,
+        sparse_local_labels=bool(skip_relabel),
     )
     slice_luts: Optional[SliceLocalLabelLUTs] = (
         label_stats.get('slice_local_luts') if skip_relabel else None  # type: ignore[assignment]
@@ -21340,37 +22255,32 @@ class RawBBoxMaskStore:
         z_stop: int,
         *,
         member_bytes: int,
+        sparse_consumer: Optional[Callable[[int, int, int, np.ndarray], None]] = None,
     ) -> Iterator[Tuple[int, Optional[np.ndarray]]]:
-        """Yield native-order payload members directly from the cvol index.
+        """Yield slice-aligned native-order payload members directly from the cvol index.
 
         ``None`` means that no indexed bbox overlaps the member and lets the payload
         writer emit its cached compressed-zero member. Intersecting members alone get a
-        zeroed 1-D allocation; bbox crop rows are scattered straight from ``chunks.bin``.
-        No dense output slice is constructed, and occupancy is decided by the index rather
-        than by rescanning the materialized member with ``any()``.
+        zeroed member allocation; each bbox is copied with one native rectangular NumPy
+        assignment straight from ``chunks.bin``.  Unlike the pre-v13.3.17 implementation,
+        member boundaries are always whole slices.  For the production 3064x3022 geometry
+        this is one 8.83 MiB slice per gzip member, removing the partial-row Python loop.
 
-        Member boundaries are relative to this z band (each z shard is an independent gzip
-        member run), while cvol offsets below remain absolute in the full native volume.
+        ``sparse_consumer`` receives each crop in output coordinates while it is already in
+        cache.  N22's low-quality mirror tee uses that hook instead of making a second dense
+        compatibility pass through the store.
         """
         z_dim, h, w = (int(v) for v in self.shape)
         z0 = int(np.clip(int(z_start), 0, z_dim))
         z1 = int(np.clip(int(z_stop), z0, z_dim))
         slice_bytes = int(h) * int(w)
-        chunk_bytes = max(1, int(member_bytes))
-        stream_bytes = int(z1 - z0) * int(slice_bytes)
+        slices_per_member = max(1, int(member_bytes) // max(1, int(slice_bytes)))
 
-        for local_start in range(0, int(stream_bytes), int(chunk_bytes)):
-            ln = min(int(chunk_bytes), int(stream_bytes) - int(local_start))
-            absolute_start = int(z0) * int(slice_bytes) + int(local_start)
-            absolute_stop = int(absolute_start) + int(ln)
-            first_z = max(z0, int(absolute_start // slice_bytes))
-            last_z = min(z1 - 1, int((absolute_stop - 1) // slice_bytes))
-
-            # Index-only classification. The linear bbox span is a conservative superset
-            # when a member boundary lands in a row gap; a false positive merely deflates
-            # a zero member normally and can never omit foreground.
+        for first_z in range(int(z0), int(z1), int(slices_per_member)):
+            last_z_exclusive = min(int(z1), int(first_z) + int(slices_per_member))
+            ln = int(last_z_exclusive - first_z) * int(slice_bytes)
             candidates: List[int] = []
-            for z in range(int(first_z), int(last_z) + 1):
+            for z in range(int(first_z), int(last_z_exclusive)):
                 rec = self.index[int(z)]
                 if int(rec['kind']) == 0:
                     continue
@@ -21379,47 +22289,137 @@ class RawBBoxMaskStore:
                         f'{self.root}: invalid raw-mask chunk marker '
                         f'{int(rec["kind"])} at slice {int(z)}'
                     )
-                y0 = int(rec['y0']); x0 = int(rec['x0'])
-                y1 = int(rec['y1']); x1 = int(rec['x1'])
-                bbox_first = int(z) * slice_bytes + int(y0) * int(w) + int(x0)
-                bbox_stop = int(z) * slice_bytes + int(y1 - 1) * int(w) + int(x1)
-                if int(bbox_first) < int(absolute_stop) and int(bbox_stop) > int(absolute_start):
-                    candidates.append(int(z))
+                candidates.append(int(z))
 
             if not candidates:
                 yield int(ln), None
                 continue
 
-            member = np.zeros((int(ln),), dtype=np.uint8)
+            # N24: one owned, slice-aligned buffer is handed to the member writer.  All
+            # large zero-fill/copy operations below are NumPy native loops (no Python row
+            # assembly), and the default member writer can retain this allocation directly.
+            member = np.zeros(
+                (int(last_z_exclusive - first_z), int(h), int(w)),
+                dtype=np.uint8,
+                order='C',
+            )
             for z in candidates:
                 decoded = self.decode_slice_crop(int(z), dtype=np.uint8)
                 if decoded is None:  # index changed/truncated after classification
                     continue
                 y0, x0, y1, x1, crop = decoded
-                slice_base = int(z) * int(slice_bytes)
-
-                # Whole-slice coverage is common at 16 MiB and turns the crop scatter into
-                # one rectangular memcpy instead of thousands of Python row operations.
-                if absolute_start <= slice_base and absolute_stop >= slice_base + slice_bytes:
-                    dst0 = int(slice_base - absolute_start)
-                    plane = member[dst0:dst0 + slice_bytes].reshape((h, w))
-                    plane[int(y0):int(y1), int(x0):int(x1)] = crop
-                    continue
-
-                crop_w = int(x1 - x0)
-                for row_idx, y in enumerate(range(int(y0), int(y1))):
-                    row_start = int(slice_base) + int(y) * int(w) + int(x0)
-                    row_stop = int(row_start) + int(crop_w)
-                    copy_start = max(int(row_start), int(absolute_start))
-                    copy_stop = min(int(row_stop), int(absolute_stop))
-                    if copy_stop <= copy_start:
-                        continue
-                    src0 = int(copy_start - row_start)
-                    dst0 = int(copy_start - absolute_start)
-                    member[dst0:dst0 + int(copy_stop - copy_start)] = crop[
-                        int(row_idx), src0:src0 + int(copy_stop - copy_start)
-                    ]
+                plane = member[int(z - first_z)]
+                np.copyto(
+                    plane[int(y0):int(y1), int(x0):int(x1)],
+                    np.asarray(crop, dtype=np.uint8),
+                    casting='unsafe',
+                )
+                if sparse_consumer is not None:
+                    sparse_consumer(int(z), int(y0), int(x0), np.asarray(crop, dtype=np.uint8))
             yield int(ln), member
+
+    def iter_restored_sparse_members(
+        self,
+        output_shape: Tuple[int, int, int],
+        z_start: int,
+        z_stop: int,
+        *,
+        member_bytes: int,
+        sparse_consumer: Optional[Callable[[int, int, int, np.ndarray], None]] = None,
+    ) -> Iterator[Tuple[int, Optional[np.ndarray]]]:
+        """Yield restored cvol payload without constructing intermediate dense planes.
+
+        Temporal restore is resolved from the index and every contributing source bbox is
+        OR-scattered directly into its destination member plane.  XY restore operates on
+        the bbox plus its mathematically required global-coordinate influence halo; it
+        never decodes or resizes an ``in_h x in_w`` zero background.  Members contain an
+        integral number of output slices so gzip, sparse assembly, and mirror tee all share
+        one stable unit of work.
+        """
+        in_t, in_h, in_w = (int(v) for v in self.shape)
+        out_t, out_h, out_w = (int(v) for v in output_shape)
+        z0 = int(np.clip(int(z_start), 0, out_t))
+        z1 = int(np.clip(int(z_stop), z0, out_t))
+        slice_bytes = int(out_h) * int(out_w)
+        slices_per_member = max(1, int(member_bytes) // max(1, int(slice_bytes)))
+
+        for first_z in range(int(z0), int(z1), int(slices_per_member)):
+            last_z_exclusive = min(int(z1), int(first_z) + int(slices_per_member))
+            raw_len = int(last_z_exclusive - first_z) * int(slice_bytes)
+            source_lists: List[Tuple[int, List[int]]] = []
+            any_nonempty = False
+            for out_z in range(int(first_z), int(last_z_exclusive)):
+                sources = _restore_source_indices_for_output_z(int(in_t), int(out_t), int(out_z))
+                active: List[int] = []
+                for src_z in sources:
+                    rec = self.index[int(src_z)]
+                    kind = int(rec['kind'])
+                    if kind == 1:
+                        active.append(int(src_z))
+                    elif kind != 0:
+                        raise ValueError(
+                            f'{self.root}: invalid raw-mask chunk marker {kind} '
+                            f'at slice {int(src_z)}'
+                        )
+                if active:
+                    any_nonempty = True
+                source_lists.append((int(out_z), active))
+
+            if not any_nonempty:
+                yield int(raw_len), None
+                continue
+
+            member = np.zeros(
+                (int(last_z_exclusive - first_z), int(out_h), int(out_w)),
+                dtype=np.uint8,
+                order='C',
+            )
+            for out_z, sources in source_lists:
+                plane = member[int(out_z - first_z)]
+                consumer_y0, consumer_x0 = int(out_h), int(out_w)
+                consumer_y1, consumer_x1 = 0, 0
+                for src_z in sources:
+                    decoded = self.decode_slice_crop(int(src_z), dtype=np.uint8)
+                    if decoded is None:
+                        continue
+                    y0, x0, y1, x1, crop = decoded
+                    if int(in_h) == int(out_h) and int(in_w) == int(out_w):
+                        out_y0, out_x0 = int(y0), int(x0)
+                        restored_crop = np.asarray(crop, dtype=np.uint8)
+                    else:
+                        restored = _resize_sparse_binary_crop_to_output_region(
+                            np.asarray(crop, dtype=np.uint8),
+                            source_shape=(int(in_h), int(in_w)),
+                            source_bbox=(int(y0), int(x0), int(y1), int(x1)),
+                            output_shape=(int(out_h), int(out_w)),
+                        )
+                        if restored is None:
+                            continue
+                        out_y0, out_x0, _out_y1, _out_x1, restored_crop = restored
+                    dst = plane[
+                        int(out_y0):int(out_y0) + int(restored_crop.shape[0]),
+                        int(out_x0):int(out_x0) + int(restored_crop.shape[1]),
+                    ]
+                    np.bitwise_or(dst, restored_crop, out=dst)
+                    consumer_y0 = min(int(consumer_y0), int(out_y0))
+                    consumer_x0 = min(int(consumer_x0), int(out_x0))
+                    consumer_y1 = max(
+                        int(consumer_y1), int(out_y0) + int(restored_crop.shape[0]),
+                    )
+                    consumer_x1 = max(
+                        int(consumer_x1), int(out_x0) + int(restored_crop.shape[1]),
+                    )
+                if sparse_consumer is not None and int(consumer_y1) > int(consumer_y0):
+                    # Tee the temporal union once. Resizing individual contributions could
+                    # lose two sub-half-LSB INTER_AREA slivers whose union rounds to one.
+                    sparse_consumer(
+                        int(out_z), int(consumer_y0), int(consumer_x0),
+                        plane[
+                            int(consumer_y0):int(consumer_y1),
+                            int(consumer_x0):int(consumer_x1),
+                        ],
+                    )
+            yield int(raw_len), member
 
 
     def unlink(self) -> None:
@@ -21673,6 +22673,16 @@ def subtract_volume_to_raw_bbox_store(
 def _memmap_backing_path(arr: object) -> Optional[Path]:
     if arr is None:
         return None
+    lazy_path = (
+        getattr(arr, 'backing_path', None)
+        if bool(getattr(arr, '_is_lazy_processing_cube', False))
+        else None
+    )
+    if lazy_path is not None:
+        try:
+            return Path(lazy_path)
+        except Exception:
+            pass
     try:
         if isinstance(arr, np.memmap):
             filename = getattr(arr, 'filename', None)
@@ -21882,7 +22892,8 @@ def project_view_volume_to_orthogonal_volume(
     known_row_occupancy: Optional[np.ndarray] = None,
     known_slice_bboxes: Optional[np.ndarray] = None,
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
-) -> np.ndarray:
+    sink_only: bool = False,
+) -> np.ndarray | SinkOnlyProjectionResult:
     """Project a view-native binary volume into orthogonal (t,Y,X) geometry.
 
     v13.2.4 (A1): ``out_shape_tyx`` is honored for radial/tilted views (single direct resample to
@@ -21892,6 +22903,9 @@ def project_view_volume_to_orthogonal_volume(
     v13.3.2 (R15): ``allow_transverse_passthrough`` returns the source volume itself for the
     transverse identity branch (no copy). Callers must check np.may_share_memory before closing
     or unlinking the result.
+
+    ``sink_only`` is currently defined only for radial projections, whose kernels naturally
+    complete disjoint output-z blocks. Other view families keep their established dense return.
     """
     source_shape = tuple(int(v) for v in np.asarray(view_mask_mm).shape)
     if len(source_shape) != 3:
@@ -21933,7 +22947,11 @@ def project_view_volume_to_orthogonal_volume(
             known_row_occupancy=known_row_occupancy,
             known_slice_bboxes=known_slice_bboxes,
             projection_block_callback=projection_block_callback,
+            sink_only=bool(sink_only),
         )
+
+    if bool(sink_only):
+        raise ValueError(f'{desc}: sink-only projection is supported only for radial views')
 
     if is_tilted_view(view):
         return backproject_tilted_volume_to_volume(
@@ -22102,7 +23120,7 @@ def materialize_nrrd_view_layer(
         'nrrd_layer_key': key,
         'source_raw_path': str(raw_path),
         'source_raw_workspace': 'in_memory_when_available' if bool(transient_projection_in_memory) else 'disk_backed',
-        'projection_payload_fusion': 'radial_block_callback',
+        'projection_payload_fusion': 'radial_sink_only_v13.3.17',
     }
     if bool(raw_bbox_nrrd_layers_enabled()) and str(view.family) == 'radial':
         expected_shape = (
@@ -22129,7 +23147,9 @@ def materialize_nrrd_view_layer(
 
     def _project_layer(
         block_callback: Optional[Callable[[int, np.ndarray], None]],
-    ) -> np.ndarray:
+        *,
+        sink_only_mode: bool,
+    ) -> np.ndarray | SinkOnlyProjectionResult:
         return project_view_volume_to_orthogonal_volume(
             view_volume_mm,
             view,
@@ -22147,14 +23167,18 @@ def materialize_nrrd_view_layer(
             known_row_occupancy=known_row_occupancy,
             known_slice_bboxes=known_slice_bboxes,
             projection_block_callback=block_callback,
+            sink_only=bool(sink_only_mode),
         )
 
     try:
-        projected = _project_layer(projection_block_callback)
+        projected = _project_layer(
+            projection_block_callback,
+            sink_only_mode=bool(projection_block_callback is not None),
+        )
     except Exception as exc:
         # A projection failure can leave a callback store incomplete. Discard it and retry
-        # once without fusion; callback failures themselves are swallowed by the emitter and
-        # therefore never compromise the completed projected volume.
+        # once without fusion. C2 sink-only delivery is transactional: its callback failures
+        # propagate here because no complete dense projected volume exists to recover from.
         if incremental_writer is None:
             raise
         incremental_writer.abort(exc)
@@ -22166,12 +23190,20 @@ def materialize_nrrd_view_layer(
         except Exception:
             pass
         print(
-            f'Warning: NRRD layer {key}: fused radial projection failed ({exc}); '
-            'retrying projection before regular raw-bbox encoding.'
+            f'Warning: NRRD layer {key}: sink-only radial projection failed ({exc}); '
+            'discarding the partial store and retrying with the dense fallback.'
         )
-        projected = _project_layer(None)
-    projected_is_source = bool(np.may_share_memory(np.asarray(projected), np.asarray(view_volume_mm)))
-    shape = tuple(int(x) for x in np.asarray(projected).shape)
+        projected = _project_layer(None, sink_only_mode=False)
+    projected_sink_only = isinstance(projected, SinkOnlyProjectionResult)
+    projected_is_source = bool(
+        not projected_sink_only
+        and np.may_share_memory(np.asarray(projected), np.asarray(view_volume_mm))
+    )
+    shape = (
+        tuple(int(x) for x in projected.shape)
+        if projected_sink_only
+        else tuple(int(x) for x in np.asarray(projected).shape)
+    )
     if raw_bbox_nrrd_layers_enabled():
         layer_stats: Optional[Dict[str, object]] = None
         if incremental_writer is not None:
@@ -22187,8 +23219,27 @@ def materialize_nrrd_view_layer(
                     f'NRRD layer {key}: incremental radial cvol finalization failed ({exc})'
                 )
                 incremental_writer.discard()
+                incremental_writer = None
                 layer_stats = None
+                if projected_sink_only:
+                    # Finalization (coverage/index/close) is part of the sink transaction.
+                    # If it fails, rebuild once through the authoritative dense path rather
+                    # than attempting to encode a SinkOnlyProjectionResult descriptor.
+                    print(
+                        f'NRRD layer {key}: retrying dense radial projection after '
+                        'sink-only finalization failure.'
+                    )
+                    projected = _project_layer(None, sink_only_mode=False)
+                    projected_sink_only = False
+                    projected_is_source = bool(
+                        np.may_share_memory(np.asarray(projected), np.asarray(view_volume_mm))
+                    )
+                    shape = tuple(int(x) for x in np.asarray(projected).shape)
         if layer_stats is None:
+            if projected_sink_only:
+                raise RuntimeError(
+                    f'NRRD layer {key}: sink-only projection completed without a finalized store'
+                )
             layer_stats = write_raw_bbox_mask_store(
                 projected,
                 out_path,
@@ -22204,13 +23255,15 @@ def materialize_nrrd_view_layer(
         segment_extent = _coerce_segment_extent(layer_stats.get('segment_extent_ijk')) or _nrrd_empty_segment_extent()
         segment_extent_source = 'raw_bbox_cvol_index'
         storage_format = CVOL_FORMAT
-        if not projected_is_source:
+        if not projected_is_source and not projected_sink_only:
             close_memmap_array(projected)
             try:
                 raw_path.unlink(missing_ok=True)
             except Exception:
                 pass
     else:
+        if projected_sink_only:
+            raise RuntimeError(f'NRRD layer {key}: sink-only result requires raw-bbox storage')
         segment_extent = compute_segment_extent_zyx(projected, workers=int(workers))
         segment_extent_source = 'raw_layer_materialization_scan'
         close_memmap_array(projected)
@@ -26205,7 +27258,7 @@ class _MemberParallelGzipPayloadWriter:
         self._completed: Dict[int, Tuple[bytes, int]] = {}
         self._inflight_bytes = 0
 
-    def _compress_member(self, payload: bytes, known_nonzero: bool) -> Tuple[bytes, int]:
+    def _compress_member(self, payload: object, known_nonzero: bool) -> Tuple[bytes, int]:
         """Encode in one native gzip pass; CRC is produced by ISA-L/zlib itself.
 
         Known zeros enter through ``write_zeros`` from extent/cvol metadata. Unknown data is
@@ -26213,10 +27266,17 @@ class _MemberParallelGzipPayloadWriter:
         cheaply than adding a full memory pass to every nonzero member.
         """
         del known_nonzero  # retained for the explicit sparse-writer API and future telemetry
-        ln = int(len(payload))
+        mv = payload if isinstance(payload, memoryview) else memoryview(payload)  # type: ignore[arg-type]
+        mv = mv.cast('B')
+        ln = int(len(mv))
         # libdeflate, ISA-L, and zlib all emit the complete RFC-1952 member here,
         # including CRC32/ISIZE in their native C pass.
-        return bytes(self.member_compress(payload)), int(ln)
+        try:
+            return bytes(self.member_compress(mv)), int(ln)
+        except TypeError:
+            # A codec wheel without generic buffer-protocol support is still valid; make
+            # its one required copy inside the worker, never on the sparse assembly thread.
+            return bytes(self.member_compress(bytes(mv))), int(ln)
 
     def _enqueue_completed(self, member: bytes, ln: int) -> None:
         seq = int(self._next_sequence)
@@ -26231,6 +27291,23 @@ class _MemberParallelGzipPayloadWriter:
         ln = int(len(payload))
         executor = self.executor if self.executor is not None else _nrrd_gzip_executor()
         fut = executor.submit(self._compress_member, payload, bool(known_nonzero))
+        self._pending[fut] = (int(seq), int(ln))
+        self._inflight_bytes += int(ln)
+
+    def _enqueue_owned_chunk(self, owner: object, *, known_nonzero: bool) -> None:
+        """Transfer one caller-owned contiguous allocation to a compressor worker.
+
+        The Future retains ``mv`` (and therefore its NumPy exporter) until native DEFLATE
+        finishes.  This removes the former 8--16 MiB ``bytes()`` detachment copy for every
+        sparse cvol member while preserving the ordinary write() buffer-reuse contract.
+        """
+        mv = owner if isinstance(owner, memoryview) else memoryview(owner)  # type: ignore[arg-type]
+        mv = mv.cast('B')
+        seq = int(self._next_sequence)
+        self._next_sequence += 1
+        ln = int(len(mv))
+        executor = self.executor if self.executor is not None else _nrrd_gzip_executor()
+        fut = executor.submit(self._compress_member, mv, bool(known_nonzero))
         self._pending[fut] = (int(seq), int(ln))
         self._inflight_bytes += int(ln)
 
@@ -26286,6 +27363,29 @@ class _MemberParallelGzipPayloadWriter:
     def write_known_nonzero(self, data: bytes | bytearray | memoryview) -> int:
         """Encode cvol-index-classified bytes without a redundant all-zero scan."""
         return self._write_impl(data, known_nonzero=True)
+
+    def write_owned_known_nonzero(self, data: object) -> int:
+        """N24 ownership-transfer fast path for one already slice-aligned member."""
+        if self.closed:
+            raise RuntimeError('Cannot write to a closed gzip payload stream')
+        mv = data if isinstance(data, memoryview) else memoryview(data)  # type: ignore[arg-type]
+        mv = mv.cast('B')
+        if len(mv) <= 0:
+            return 0
+        self._enqueue_owned_chunk(mv, known_nonzero=True)
+        self._drain(block=False)
+        return int(len(mv))
+
+    def write_aligned_zeros(self, nbytes: int) -> int:
+        """Emit one complete cached zero member matching a whole-slice sparse member."""
+        if self.closed:
+            raise RuntimeError('Cannot write to a closed gzip payload stream')
+        ln = int(nbytes)
+        if ln <= 0:
+            return 0
+        self._enqueue_completed(_zero_gzip_member(int(ln)), int(ln))
+        self._drain(block=False)
+        return int(ln)
 
     def write_zeros(self, nbytes: int) -> int:
         """v13.3.7 (B5/N4): emit cached all-zero members without materializing the zeros."""
@@ -27145,6 +28245,7 @@ def write_single_layer_nrrd_from_ref(
     segment_name: Optional[str] = None,
     segment_color: Optional[Tuple[float, float, float]] = None,
     block_consumer: Optional[Callable[[int, np.ndarray], None]] = None,
+    sparse_consumer: Optional[Callable[[int, int, int, np.ndarray], None]] = None,
     z_shards: Optional[int] = None,
 ) -> Path:
     """Write one component layer as its own single-layer 3D Slicer segmentation NRRD (X, Y, t).
@@ -27200,6 +28301,7 @@ def write_single_layer_nrrd_from_ref(
                     payload_writer,
                     z_chunk=int(z_chunk),
                     block_consumer=block_consumer,
+                    sparse_consumer=sparse_consumer,
                 )
         return out_path
 
@@ -27257,6 +28359,7 @@ def write_single_layer_nrrd_from_ref(
                     payload_writer,
                     z_chunk=shard_z_chunk,
                     block_consumer=block_consumer,
+                    sparse_consumer=sparse_consumer,
                     z_start=int(z0),
                     z_stop=int(z1),
                     fill_workers_override=shard_fill_workers,
@@ -27386,6 +28489,7 @@ def write_single_layer_nrrd_from_ref(
 _NRRD_GPU_MIRROR_TEE_ANNOUNCED = False
 _NRRD_GPU_MIRROR_DEVICE_GZIP_ANNOUNCED = False
 _NRRD_GPU_MIRROR_DEVICE_GZIP_INACTIVE_ANNOUNCED = False
+_NRRD_SPARSE_MIRROR_TEE_ANNOUNCED = False
 
 
 def nrrd_gpu_mirror_tee_enabled() -> bool:
@@ -27606,6 +28710,15 @@ def write_layer_nrrd_with_low_quality_mirrors(
     # v13.3.6 (N3): resolve a live layer's deferred extent once, up front, so the
     # full-quality header AND every mirror header see the same tight extent.
     ref = _resolve_live_ref_extent(ref)
+    # N22 mirror payloads are composed in two geometry steps (backing -> full output ->
+    # low quality). Compose the header extent through that same intermediate geometry;
+    # mapping backing -> mirror directly can understate a positive-support boundary voxel.
+    mirror_extent_ref = dataclasses_replace(
+        ref,
+        segment_extent_ijk=_slicer_segment_extent_for_output(ref, output_shape),
+        segment_extent_shape_tyx=tuple(int(v) for v in output_shape),
+        segment_extent_source='composed_full_output_extent_for_low_quality_mirror',
+    )
     # N15: this function itself is the queued sink task, so this is execution-time—not
     # submission-time—resolution. Reuse the result for tee scheduling and the full writer.
     if z_shards is None or int(z_shards) <= 0:
@@ -27637,10 +28750,16 @@ def write_layer_nrrd_with_low_quality_mirrors(
             'device_gzip_engine': None,
         })
 
+    # v13.3.17 N22: raw bbox stores expose their restored output crops during the same
+    # sparse member pass.  Keep this tee sparse on the CPU: uploading thousands of tiny
+    # crops is slower than the vectorized integral/gather resize, while uploading the old
+    # dense 8.83 MiB plane would forfeit the bandwidth win. Other source types retain D2.
+    sparse_mirror_tee = bool(mirror_jobs and _nrrd_layer_ref_is_raw_bbox_store(ref))
+
     # v13.3.6 (D2): derive the mirrors on a GPU when one is free — the per-slice resizes
     # and striped-lock ORs leave the CPU tee entirely; mirror volumes come back in one
     # small D2H after the layer streams. CPU tee (below) remains the fallback.
-    gpu_tee = _try_create_gpu_mirror_tee(mirror_jobs, out_t)
+    gpu_tee = None if bool(sparse_mirror_tee) else _try_create_gpu_mirror_tee(mirror_jobs, out_t)
     if gpu_tee is not None:
         global _NRRD_GPU_MIRROR_TEE_ANNOUNCED, _NRRD_GPU_MIRROR_DEVICE_GZIP_ANNOUNCED
         if not _NRRD_GPU_MIRROR_TEE_ANNOUNCED:
@@ -27663,6 +28782,14 @@ def write_layer_nrrd_with_low_quality_mirrors(
         for job in mirror_jobs:
             m_t, m_h, m_w = (int(v) for v in job['shape'])  # type: ignore[misc]
             job['volume'] = np.zeros((m_t, m_h, m_w), dtype=np.uint8)
+        if bool(sparse_mirror_tee):
+            global _NRRD_SPARSE_MIRROR_TEE_ANNOUNCED
+            if not _NRRD_SPARSE_MIRROR_TEE_ANNOUNCED:
+                _NRRD_SPARSE_MIRROR_TEE_ANNOUNCED = True
+                print(
+                    'v13.3.17 (N22): crop-aware low-quality NRRD mirror tee active; '
+                    'native/restored cvol layers no longer make a second dense store pass.'
+                )
 
     # N7 already supplies z-band concurrency. Avoid nesting another up-to-16-way CPU pool
     # inside every shard; the unsharded path retains the original slice fan-out.
@@ -27706,6 +28833,42 @@ def write_layer_nrrd_with_low_quality_mirrors(
             for zi in range(z_count):
                 _tee_one(int(zi))
 
+    def _tee_sparse(out_z: int, y0: int, x0: int, crop: np.ndarray) -> None:
+        """Fold one already-restored output crop into every low-quality mirror."""
+        if int(out_z) < 0 or int(out_z) >= int(out_t):
+            return
+        crop_u8 = np.asarray(crop, dtype=np.uint8)
+        if crop_u8.size <= 0:
+            return
+        y1 = int(y0) + int(crop_u8.shape[0])
+        x1 = int(x0) + int(crop_u8.shape[1])
+        out_h, out_w = int(output_shape[1]), int(output_shape[2])
+        for job in mirror_jobs:
+            if bool(job['failed']):
+                continue
+            try:
+                targets = job['src_to_m'][int(out_z)]
+                if not targets:
+                    continue
+                _m_t, m_h, m_w = job['shape']  # type: ignore[misc]
+                resized = _resize_sparse_binary_crop_to_output_region(
+                    crop_u8,
+                    source_shape=(int(out_h), int(out_w)),
+                    source_bbox=(int(y0), int(x0), int(y1), int(x1)),
+                    output_shape=(int(m_h), int(m_w)),
+                )
+                if resized is None:
+                    continue
+                my0, mx0, my1, mx1, mirror_crop = resized
+                vol = job['volume']
+                locks = job['locks']
+                for mz in targets:
+                    with locks[int(mz) % len(locks)]:  # type: ignore[index]
+                        dst = vol[int(mz), int(my0):int(my1), int(mx0):int(mx1)]  # type: ignore[index]
+                        np.bitwise_or(dst, mirror_crop, out=dst)
+            except Exception:
+                job['failed'] = True
+
     # N7 shard consumers can arrive concurrently. CPU mirror updates already use
     # per-output-z stripe locks; nvCOMP/torch mirror tee state is monolithic, so
     # serialize only its tee calls while shard compression remains parallel.
@@ -27729,7 +28892,8 @@ def write_layer_nrrd_with_low_quality_mirrors(
     result = write_single_layer_nrrd_from_ref(
         ref, output_shape, out_path,
         pigz_threads=pigz_threads, segment_name=segment_name, segment_color=segment_color,
-        block_consumer=(_consume_block if mirror_jobs else None),
+        block_consumer=(_consume_block if mirror_jobs and not sparse_mirror_tee else None),
+        sparse_consumer=(_tee_sparse if sparse_mirror_tee else None),
         z_shards=int(resolved_z_shards),
     )
 
@@ -27751,7 +28915,9 @@ def write_layer_nrrd_with_low_quality_mirrors(
             header.update(slicer_segmentation_header_fields(
                 segment_name=seg_name,
                 color_rgb=seg_color,
-                extent_xyt=_slicer_segment_extent_for_output(ref, (int(m_t), int(m_h), int(m_w))),
+                extent_xyt=_slicer_segment_extent_for_output(
+                    mirror_extent_ref, (int(m_t), int(m_h), int(m_w)),
+                ),
             ))
             device_members: Optional[List[bytes]] = None
             device_vol = job.get('device_volume')
@@ -28334,6 +29500,290 @@ def _resize_binary_mask_frame_to_output_shape(frame: np.ndarray, out_h: int, out
     return (scaled > 0).astype(np.uint8, copy=False)
 
 
+@lru_cache(maxsize=32)
+def _nrrd_sparse_resize_axis_map(
+    in_count: int,
+    out_count: int,
+    area: bool,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Cached global-coordinate source support for every output coordinate.
+
+    The returned inclusive-start/exclusive-stop arrays reproduce OpenCV nearest-neighbor
+    sampling or the positive-support footprint of INTER_AREA.  Keeping this map global is
+    what lets N22 resize a bbox independently without shifting its phase to the crop origin.
+    """
+    in_n = max(1, int(in_count))
+    out_n = max(1, int(out_count))
+    coords = np.arange(int(out_n), dtype=np.int64)
+    if bool(area):
+        starts = (coords * np.int64(in_n)) // np.int64(out_n)
+        stops = (
+            ((coords + np.int64(1)) * np.int64(in_n) + np.int64(out_n - 1))
+            // np.int64(out_n)
+        )
+    else:
+        starts = (coords * np.int64(in_n)) // np.int64(out_n)
+        stops = starts + np.int64(1)
+    starts.setflags(write=False)
+    stops.setflags(write=False)
+    return starts, stops
+
+
+_NRRD_SPARSE_AREA_NUMBA_FAILED = False
+_NRRD_SPARSE_AREA_NUMBA_ANNOUNCED = False
+
+
+if _numba is not None:
+    @_numba.njit(cache=True, nogil=True, inline='always')  # type: ignore[misc]
+    def _numba_nrrd_continuous_integral_at(
+        integral: np.ndarray,
+        crop: np.ndarray,
+        y_coord: float,
+        x_coord: float,
+    ) -> float:  # pragma: no cover - compiled implementation
+        crop_h = int(crop.shape[0])
+        crop_w = int(crop.shape[1])
+        yy = min(float(crop_h), max(0.0, float(y_coord)))
+        xx = min(float(crop_w), max(0.0, float(x_coord)))
+        yy_round = round(yy)
+        xx_round = round(xx)
+        if abs(yy - yy_round) < 1e-12:
+            yy = float(yy_round)
+        if abs(xx - xx_round) < 1e-12:
+            xx = float(xx_round)
+        iy = int(math.floor(yy))
+        ix = int(math.floor(xx))
+        fy = float(yy - iy)
+        fx = float(xx - ix)
+        iy_cell = min(int(iy), int(crop_h - 1))
+        ix_cell = min(int(ix), int(crop_w - 1))
+        value = float(integral[int(iy), int(ix)])
+        value += float(
+            integral[int(iy), int(ix_cell + 1)]
+            - integral[int(iy), int(ix_cell)]
+        ) * fx
+        value += float(
+            integral[int(iy_cell + 1), int(ix)]
+            - integral[int(iy_cell), int(ix)]
+        ) * fy
+        value += float(crop[int(iy_cell), int(ix_cell)]) * fy * fx
+        return float(value)
+
+    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+    def _numba_nrrd_area_crop_resize_kernel(
+        integral: np.ndarray,
+        crop: np.ndarray,
+        in_h: int,
+        in_w: int,
+        out_h: int,
+        out_w: int,
+        source_y0: int,
+        source_x0: int,
+        source_y1: int,
+        source_x1: int,
+        out_y0: int,
+        out_x0: int,
+        restored: np.ndarray,
+    ) -> None:  # pragma: no cover - compiled implementation
+        threshold = (
+            (float(in_h) / float(out_h)) * (float(in_w) / float(out_w)) / 510.0
+        )
+        for local_y in range(int(restored.shape[0])):
+            out_y = int(out_y0 + local_y)
+            sy0 = max(
+                float(out_y) * float(in_h) / float(out_h), float(source_y0),
+            ) - float(source_y0)
+            sy1 = min(
+                float(out_y + 1) * float(in_h) / float(out_h), float(source_y1),
+            ) - float(source_y0)
+            for local_x in range(int(restored.shape[1])):
+                out_x = int(out_x0 + local_x)
+                sx0 = max(
+                    float(out_x) * float(in_w) / float(out_w), float(source_x0),
+                ) - float(source_x0)
+                sx1 = min(
+                    float(out_x + 1) * float(in_w) / float(out_w), float(source_x1),
+                ) - float(source_x0)
+                weighted = _numba_nrrd_continuous_integral_at(integral, crop, sy1, sx1)
+                weighted -= _numba_nrrd_continuous_integral_at(integral, crop, sy0, sx1)
+                weighted -= _numba_nrrd_continuous_integral_at(integral, crop, sy1, sx0)
+                weighted += _numba_nrrd_continuous_integral_at(integral, crop, sy0, sx0)
+                restored[int(local_y), int(local_x)] = np.uint8(
+                    1 if float(weighted) >= float(threshold) else 0
+                )
+else:
+    _numba_nrrd_continuous_integral_at = None
+    _numba_nrrd_area_crop_resize_kernel = None
+
+
+def _resize_sparse_binary_crop_to_output_region(
+    crop: np.ndarray,
+    *,
+    source_shape: Tuple[int, int],
+    source_bbox: Tuple[int, int, int, int],
+    output_shape: Tuple[int, int],
+) -> Optional[Tuple[int, int, int, int, np.ndarray]]:
+    """Resize one binary source bbox in the *full frame's* coordinate system.
+
+    Returns ``(out_y0, out_x0, out_y1, out_x1, crop)``.  The output region includes every
+    output pixel whose global sampling footprint can see the source bbox, including the
+    one-pixel influence halo that an area downscale can create.  Work is proportional to
+    the affected region: OpenCV's C integral-image kernel plus vectorized native gathers
+    replace a full zero-plane resize and all Python row loops.
+    """
+    global _NRRD_SPARSE_AREA_NUMBA_FAILED, _NRRD_SPARSE_AREA_NUMBA_ANNOUNCED
+    in_h, in_w = (max(1, int(v)) for v in source_shape)
+    out_h, out_w = (max(1, int(v)) for v in output_shape)
+    y0, x0, y1, x1 = (int(v) for v in source_bbox)
+    crop_arr = np.asarray(crop)
+    # RawBBoxMaskStore and restored member planes are already canonical uint8 0/1.
+    # Preserve their view (including a bbox-width row stride) instead of making the old
+    # compare + astype copy. Non-pipeline callers retain normalization below.
+    if crop_arr.dtype == np.uint8:
+        crop_u8 = crop_arr
+    else:
+        crop_u8 = np.ascontiguousarray(crop_arr > 0, dtype=np.uint8)
+    if (
+        y0 < 0 or x0 < 0 or y1 > int(in_h) or x1 > int(in_w)
+        or y1 <= y0 or x1 <= x0
+        or tuple(int(v) for v in crop_u8.shape) != (int(y1 - y0), int(x1 - x0))
+    ):
+        raise ValueError(
+            f'Invalid sparse resize bbox {(y0, x0, y1, x1)} / crop {crop_u8.shape} '
+            f'for source {(in_h, in_w)}'
+        )
+
+    if int(in_h) == int(out_h) and int(in_w) == int(out_w):
+        return int(y0), int(x0), int(y1), int(x1), np.ascontiguousarray(crop_u8)
+
+    use_area = bool(int(in_h) >= int(out_h) and int(in_w) >= int(out_w))
+    y_starts, y_stops = _nrrd_sparse_resize_axis_map(int(in_h), int(out_h), bool(use_area))
+    x_starts, x_stops = _nrrd_sparse_resize_axis_map(int(in_w), int(out_w), bool(use_area))
+
+    # Support intervals are monotonic. searchsorted finds the affected output bbox without
+    # allocating an out_h/out_w boolean mask for every source crop.
+    out_y0 = int(np.searchsorted(y_stops, int(y0), side='right'))
+    out_y1 = int(np.searchsorted(y_starts, int(y1), side='left'))
+    out_x0 = int(np.searchsorted(x_stops, int(x0), side='right'))
+    out_x1 = int(np.searchsorted(x_starts, int(x1), side='left'))
+    out_y0 = max(0, min(int(out_y0), int(out_h)))
+    out_y1 = max(int(out_y0), min(int(out_y1), int(out_h)))
+    out_x0 = max(0, min(int(out_x0), int(out_w)))
+    out_x1 = max(int(out_x0), min(int(out_x1), int(out_w)))
+    if int(out_y1) <= int(out_y0) or int(out_x1) <= int(out_x0):
+        return None
+
+    if not bool(use_area):
+        src_y = y_starts[int(out_y0):int(out_y1)] - np.int64(y0)
+        src_x = x_starts[int(out_x0):int(out_x1)] - np.int64(x0)
+        restored = crop_u8[src_y[:, None], src_x[None, :]]
+    else:
+        # Reproduce INTER_AREA's global phase and uint8 rounding threshold without padding
+        # a full source plane.  cv2.integral is a compiled, GIL-releasing prefix pass over
+        # the bbox; evaluating its continuous piecewise-constant integral accounts for
+        # fractional first/last source pixels (a plain any() would over-include tiny slivers).
+        integral = cv2.integral(crop_u8, sdepth=cv2.CV_32S)
+        crop_h, crop_w = (int(v) for v in crop_u8.shape)
+        restored = np.empty(
+            (int(out_y1 - out_y0), int(out_x1 - out_x0)), dtype=np.uint8,
+        )
+        compiled_ok = bool(
+            _numba_nrrd_area_crop_resize_kernel is not None
+            and not _NRRD_SPARSE_AREA_NUMBA_FAILED
+        )
+        if compiled_ok:
+            try:
+                _numba_nrrd_area_crop_resize_kernel(
+                    integral,
+                    crop_u8,
+                    int(in_h), int(in_w), int(out_h), int(out_w),
+                    int(y0), int(x0), int(y1), int(x1),
+                    int(out_y0), int(out_x0), restored,
+                )
+                if not _NRRD_SPARSE_AREA_NUMBA_ANNOUNCED:
+                    _NRRD_SPARSE_AREA_NUMBA_ANNOUNCED = True
+                    print(
+                        'v13.3.17 (N24): NRRD sparse INTER_AREA member assembly uses '
+                        'the compiled no-GIL crop kernel.'
+                    )
+            except Exception as exc:
+                _NRRD_SPARSE_AREA_NUMBA_FAILED = True
+                compiled_ok = False
+                print(
+                    f'Warning: compiled NRRD sparse area resize unavailable ({exc}); '
+                    'using vectorized OpenCV/NumPy assembly.'
+                )
+        if bool(compiled_ok):
+            if not np.any(restored):
+                return None
+            return (
+                int(out_y0), int(out_x0), int(out_y1), int(out_x1),
+                np.ascontiguousarray(restored, dtype=np.uint8),
+            )
+
+        out_ys = np.arange(int(out_y0), int(out_y1), dtype=np.float64)
+        out_xs = np.arange(int(out_x0), int(out_x1), dtype=np.float64)
+        src_y0 = np.maximum(out_ys * float(in_h) / float(out_h), float(y0)) - float(y0)
+        src_y1 = np.minimum((out_ys + 1.0) * float(in_h) / float(out_h), float(y1)) - float(y0)
+        src_x0 = np.maximum(out_xs * float(in_w) / float(out_w), float(x0)) - float(x0)
+        src_x1 = np.minimum((out_xs + 1.0) * float(in_w) / float(out_w), float(x1)) - float(x0)
+
+        def _continuous_integral(y_coords: np.ndarray, x_coords: np.ndarray) -> np.ndarray:
+            yy = np.clip(np.asarray(y_coords, dtype=np.float64), 0.0, float(crop_h))
+            xx = np.clip(np.asarray(x_coords, dtype=np.float64), 0.0, float(crop_w))
+            # Snap rational coordinates which should be integers; this avoids selecting
+            # the preceding cell because of a 1-ulp division artifact.
+            yy_round = np.rint(yy)
+            xx_round = np.rint(xx)
+            yy = np.where(np.abs(yy - yy_round) < 1e-12, yy_round, yy)
+            xx = np.where(np.abs(xx - xx_round) < 1e-12, xx_round, xx)
+            iy = np.floor(yy).astype(np.int64)
+            ix = np.floor(xx).astype(np.int64)
+            fy = yy - iy
+            fx = xx - ix
+            iy_cell = np.minimum(iy, int(crop_h - 1))
+            ix_cell = np.minimum(ix, int(crop_w - 1))
+            value = integral[iy[:, None], ix[None, :]].astype(np.float64)
+            value += (
+                integral[iy[:, None], (ix_cell + 1)[None, :]]
+                - integral[iy[:, None], ix_cell[None, :]]
+            ) * fx[None, :]
+            value += (
+                integral[(iy_cell + 1)[:, None], ix[None, :]]
+                - integral[iy_cell[:, None], ix[None, :]]
+            ) * fy[:, None]
+            value += (
+                crop_u8[iy_cell[:, None], ix_cell[None, :]]
+                * fy[:, None] * fx[None, :]
+            )
+            return value
+
+        # Bound float64 temporaries while leaving each batch as a few large native gathers.
+        cols = max(1, int(restored.shape[1]))
+        rows_per_batch = max(1, min(
+            int(restored.shape[0]),
+            (24 * 1024 * 1024) // max(1, int(cols) * 8 * 3),
+        ))
+        positive_threshold = (
+            (float(in_h) / float(out_h)) * (float(in_w) / float(out_w)) / 510.0
+        )
+        for row0 in range(0, int(restored.shape[0]), int(rows_per_batch)):
+            row1 = min(int(restored.shape[0]), int(row0) + int(rows_per_batch))
+            weighted = _continuous_integral(src_y1[row0:row1], src_x1)
+            weighted -= _continuous_integral(src_y0[row0:row1], src_x1)
+            weighted -= _continuous_integral(src_y1[row0:row1], src_x0)
+            weighted += _continuous_integral(src_y0[row0:row1], src_x0)
+            restored[row0:row1] = (weighted >= float(positive_threshold)).astype(
+                np.uint8, copy=False,
+            )
+    if not np.any(restored):
+        return None
+    return (
+        int(out_y0), int(out_x0), int(out_y1), int(out_x1),
+        np.ascontiguousarray(restored, dtype=np.uint8),
+    )
+
+
 def _read_layer_slice_in_output_shape(
     src: object,
     output_shape: Tuple[int, int, int],
@@ -28431,6 +29881,7 @@ def _write_one_decomposed_nrrd_layer_payload(
     pbar: Optional[object] = None,
     layer_idx: int = 0,
     block_consumer: Optional[Callable[[int, np.ndarray], None]] = None,
+    sparse_consumer: Optional[Callable[[int, int, int, np.ndarray], None]] = None,
     z_start: int = 0,
     z_stop: Optional[int] = None,
     fill_workers_override: Optional[int] = None,
@@ -28473,8 +29924,9 @@ def _write_one_decomposed_nrrd_layer_payload(
             (int(in_t), int(in_h), int(in_w)) == (int(out_t), int(out_h), int(out_w))
             and not isinstance(src, RawBBoxMaskStore)
         )
-        raw_store_native_stream = (
-            isinstance(src, RawBBoxMaskStore)
+        raw_store_stream = isinstance(src, RawBBoxMaskStore)
+        raw_store_native_stream = bool(
+            raw_store_stream
             and (int(in_t), int(in_h), int(in_w)) == (int(out_t), int(out_h), int(out_w))
         )
         # v13.3.7 (B5/N4): z-blocks fully outside this window are emitted as cached zero
@@ -28489,56 +29941,55 @@ def _write_one_decomposed_nrrd_layer_payload(
                 and (int(z1) <= int(zero_window[0]) or int(z0) >= int(zero_window[1]))
             )
 
-        if bool(raw_store_native_stream):
-            # v13.3.11 sparse cvol fast path: gzip-sized members are classified from the
-            # slice index and assembled directly in flat native payload order. Empty
-            # members never allocate a source buffer; intersecting members scatter only
-            # bbox crop rows. ``write_known_nonzero`` skips the member writer's former
-            # full 16 MiB np.any scan (a conservative bbox overlap may still contain only
-            # zeros, which remains a valid—merely slightly larger—gzip member).
+        if bool(raw_store_stream):
+            # v13.3.17 (N22/N24): native AND restored cvol sources share one sparse path.
+            # Members end only at output-slice boundaries, large assembly is vectorized
+            # in native libraries, and an owned member can transfer directly to the async
+            # compressor.  The sparse mirror consumer observes crops during this same pass.
             member_bytes = int(np.clip(
                 int(nrrd_gzip_chunk_bytes()),
                 8 * 1024 * 1024,
                 16 * 1024 * 1024,
             ))
-            write_nonzero = getattr(payload_writer, 'write_known_nonzero', None)
+            write_nonzero = getattr(payload_writer, 'write_owned_known_nonzero', None)
+            if not callable(write_nonzero):
+                write_nonzero = getattr(payload_writer, 'write_known_nonzero', None)
             if not callable(write_nonzero):
                 write_nonzero = payload_writer.write
-            for raw_len, member in src.iter_native_sparse_members(
-                int(z_begin), int(z_end), member_bytes=int(member_bytes),
-            ):
+            write_aligned_zeros = getattr(payload_writer, 'write_aligned_zeros', None)
+            if bool(raw_store_native_stream):
+                members = src.iter_native_sparse_members(
+                    int(z_begin), int(z_end), member_bytes=int(member_bytes),
+                    sparse_consumer=sparse_consumer,
+                )
+            else:
+                members = src.iter_restored_sparse_members(
+                    (int(out_t), int(out_h), int(out_w)),
+                    int(z_begin), int(z_end), member_bytes=int(member_bytes),
+                    sparse_consumer=sparse_consumer,
+                )
+            member_z = int(z_begin)
+            for raw_len, member in members:
+                member_slices = int(raw_len) // max(1, int(out_h) * int(out_w))
                 if member is None and can_write_zeros:
-                    payload_writer.write_zeros(int(raw_len))
+                    if callable(write_aligned_zeros):
+                        write_aligned_zeros(int(raw_len))
+                    else:
+                        payload_writer.write_zeros(int(raw_len))
                 elif member is None:
                     payload_writer.write(bytes(int(raw_len)))
                 else:
-                    write_nonzero(memoryview(member).cast('B'))
-
-            # Mirror tee compatibility: compression above never needs a dense slice. The
-            # existing consumer API still requires z-aligned dense blocks, so materialize
-            # those only when low-quality mirrors were explicitly requested. This is a
-            # bounded compatibility pass and is not used by ordinary cvol->NRRD writes.
-            if block_consumer is not None:
-                consumer_chunk = max(1, int(z_chunk_i))
-                for z0 in range(int(z_begin), int(z_end), int(consumer_chunk)):
-                    z1 = min(int(z_end), int(z0) + int(consumer_chunk))
-                    if _block_is_known_zero(int(z0), int(z1)):
-                        continue
-                    block = np.empty(
-                        (int(z1 - z0), int(out_h), int(out_w)),
-                        dtype=np.uint8,
-                        order='C',
-                    )
-
-                    def _fill_consumer(zi: int, _z0: int = int(z0), _block: np.ndarray = block) -> None:
-                        src.fill_decoded_slice_into(int(_z0 + int(zi)), _block[int(zi)])
-
-                    _nrrd_parallel_fill_indices(
-                        int(z1 - z0),
-                        _fill_consumer,
-                        requested_workers=min(int(nrrd_fill_workers()), int(z1 - z0)),
-                    )
-                    block_consumer(int(z0), block)
+                    write_nonzero(member)
+                    # Preserve the generic consumer contract without the old second store
+                    # pass: the aligned member is already an output-geometry dense block.
+                    if block_consumer is not None:
+                        block_consumer(
+                            int(member_z),
+                            np.asarray(member, dtype=np.uint8).reshape(
+                                (int(member_slices), int(out_h), int(out_w)),
+                            ),
+                        )
+                member_z += int(member_slices)
             if pbar is not None:
                 pbar.update(int(z_end - z_begin))
             return
@@ -29962,7 +31413,36 @@ def main() -> None:
             f'input shape (t,Y,X)=({input_T},{input_H},{input_W}) -> '
             f'processing shape (t,Y,X)={processing_shape} (within 5% of the longest source axis).'
         )
-        if preprocess_streaming_active:
+        # v13.3.17 C10: under the native-t resident multi-GPU path, workers only need
+        # the logical cube shape. They upload the decoded native volume and compose the
+        # t map on device, so constructing the 25+ GiB host cube eagerly is wasted work
+        # unless residency/CPU/tile rendering actually falls back.
+        lazy_cube_eligible = bool(
+            multi_gpu_active
+            and gpu_cube_resize_enabled()
+            and tuple(int(v) for v in processing_shape[1:])
+            == tuple(int(v) for v in input_processing_shape[1:])
+            and _cube_t_axis_resize_backend() == 'slab'
+        )
+        if lazy_cube_eligible:
+            lazy_cube_path = temp_dir / 'input_volume.v950_cube.gray8.dat'
+            volume_rgb = LazyProcessingCube(
+                input_volume_rgb,
+                processing_shape,
+                lazy_cube_path,
+                workers=max(1, default_worker_budget()),
+                request_path=temp_dir / 'mgpu_source_volume.cube_request.sentinel',
+                ready_path=temp_dir / 'mgpu_source_volume.cube_ready.sentinel',
+                failed_path=temp_dir / 'mgpu_source_volume.cube_failed.txt',
+                streaming_backend=bool(preprocess_streaming_active),
+            )
+            volume_rgb.start_request_watcher()
+            print(
+                'v13.3.17 C10: host processing cube deferred; native-t GPU residency '
+                f'will avoid {volume_rgb.nbytes / GIB:.2f} GiB of host construction unless '
+                'a file-backed fallback requests it.'
+            )
+        elif preprocess_streaming_active:
             volume_rgb = resize_volume_to_processing_cube_gray8_streaming(
                 input_volume_rgb,
                 processing_shape,
@@ -31754,7 +33234,8 @@ def main() -> None:
         native_resize_task_spec: Optional[Dict[str, object]] = None
         source_volume_ready_async = False
         native_shape_now = tuple(int(x) for x in np.asarray(input_volume_rgb).shape)
-        working_shape_now = tuple(int(x) for x in np.asarray(volume_rgb).shape)
+        # C10 metadata access must not invoke LazyProcessingCube.__array__.
+        working_shape_now = tuple(int(x) for x in volume_rgb.shape)
         native_t_only_resize = bool(
             native_shape_now[1:] == working_shape_now[1:]
             and _cube_t_axis_resize_backend() == 'slab'
@@ -31770,41 +33251,50 @@ def main() -> None:
             if native_backing is not None and cube_backing is not None:
                 wait_for_volume_ready(input_volume_rgb)
                 flush_array(input_volume_rgb)
-                cube_ready_sentinel = temp_dir / 'mgpu_source_volume.cube_ready.sentinel'
-                # A reusable --temp_dir may contain a marker from an interrupted/keep-temp run.
-                # Remove it before the new cube producer can race any file-backed fallback.
-                try:
-                    cube_ready_sentinel.unlink()
-                except FileNotFoundError:
-                    pass
+                lazy_cube = volume_rgb if isinstance(volume_rgb, LazyProcessingCube) else None
+                cube_ready_sentinel = (
+                    lazy_cube.ready_path
+                    if lazy_cube is not None
+                    else temp_dir / 'mgpu_source_volume.cube_ready.sentinel'
+                )
+                if lazy_cube is None:
+                    # A reusable --temp_dir may contain a marker from an interrupted/keep-temp run.
+                    # Remove it before the eager cube producer can race any file-backed fallback.
+                    try:
+                        cube_ready_sentinel.unlink()
+                    except FileNotFoundError:
+                        pass
                 native_resize_task_spec = {
                     'path': str(native_backing),
                     'shape': [int(x) for x in np.asarray(input_volume_rgb).shape],
                     'dtype': str(np.asarray(input_volume_rgb).dtype),
                     'sentinel': str(cube_ready_sentinel),
+                    'request': (str(lazy_cube.request_path) if lazy_cube is not None else None),
+                    'failed': (str(lazy_cube.failed_path) if lazy_cube is not None else None),
                 }
                 source_volume_path = str(cube_backing)
                 source_volume_shape = tuple(int(x) for x in volume_rgb.shape)
-                source_volume_dtype = str(np.asarray(volume_rgb).dtype)
+                source_volume_dtype = str(volume_rgb.dtype)
                 source_volume_ready_async = True
 
-                def _signal_cube_ready() -> None:
-                    try:
-                        wait_for_volume_ready(volume_rgb)
-                        flush_array(volume_rgb)
-                        cube_ready_sentinel.touch()
-                        print('Shared cube volume complete; sentinel written for file-backed worker fallbacks.')
-                    except BaseException as exc:
-                        # The producer failure also surfaces in main; teardown terminates
-                        # any workers parked on the (never-written) sentinel.
-                        print(f'Warning: cube-ready signaling failed ({exc}).')
+                if lazy_cube is None:
+                    def _signal_cube_ready() -> None:
+                        try:
+                            wait_for_volume_ready(volume_rgb)
+                            flush_array(volume_rgb)
+                            cube_ready_sentinel.touch()
+                            print('Shared cube volume complete; sentinel written for file-backed worker fallbacks.')
+                        except BaseException as exc:
+                            # The producer failure also surfaces in main; teardown terminates
+                            # any workers parked on the (never-written) sentinel.
+                            print(f'Warning: cube-ready signaling failed ({exc}).')
 
-                threading.Thread(target=_signal_cube_ready, name='cube-ready-sentinel', daemon=True).start()
+                    threading.Thread(target=_signal_cube_ready, name='cube-ready-sentinel', daemon=True).start()
                 print(
                     'v13.3.9 (E3): task enqueue gated on the decode only — GPU workers retain the '
                     'NATIVE-t decoded volume and fold t scaling into device renderers '
-                    '(YOLO_TTA_GPU_CUBE_RESIZE=0 '
-                    'restores cube-gated enqueue).'
+                    f'({"v13.3.17 C10 host cube is demand-only; " if lazy_cube is not None else ""}'
+                    'YOLO_TTA_GPU_CUBE_RESIZE=0 restores cube-gated enqueue).'
                 )
         elif gpu_cube_resize_enabled() and bool(cube_resize_will_apply) and (volume_rgb is not input_volume_rgb):
             print(
@@ -32579,8 +34069,18 @@ def main() -> None:
         )
 
     if preprocess_streaming_active:
-        print('Ensuring streaming preprocessing producers have completed before final output/backprojection stages.')
-        wait_for_volume_ready(volume_rgb)
+        if isinstance(volume_rgb, LazyProcessingCube) and not volume_rgb.materialized:
+            # v13.3.17 C10: this barrier exists to settle active producers. An untouched
+            # lazy cube has no producer and final source-geometry output reads the decoded
+            # volume, so wait only for decode and preserve the no-cube fast path.
+            print(
+                'Ensuring streaming decode completed; deferred host cube remained unused '
+                '(v13.3.17 C10 fast path).'
+            )
+            wait_for_volume_ready(input_volume_rgb)
+        else:
+            print('Ensuring streaming preprocessing producers have completed before final output/backprojection stages.')
+            wait_for_volume_ready(volume_rgb)
 
     for cache_name, cache_mm in list(view_frame_caches.items()):
         close_memmap_array(cache_mm)
@@ -35393,6 +36893,9 @@ _v13314_trt_installed = _v13314_install_trt_persistence()
 _v13314_telemetry_installed = _v13314_install_telemetry_wrappers()
 _V13314_TELEMETRY.gauge('features', {
     'n7_restored_sparse_present': bool(hasattr(globals().get('RawBBoxMaskStore', object), 'iter_restored_sparse_members')),
+    'n22_crop_aware_mirror_tee': bool(globals().get('_resize_sparse_binary_crop_to_output_region')),
+    'n24_slice_aligned_sparse_members': True,
+    'n24_owned_member_transfer': bool(hasattr(globals().get('_MemberParallelGzipPayloadWriter', object), 'write_owned_known_nonzero')),
     'n6_gpu_writer_present': bool(globals().get('_GpuDeflatePayloadWriter')),
     'n2_projection_callback': _v13314_projection_callback_installed,
     'n2_materializer': _v13314_materializer_installed,
