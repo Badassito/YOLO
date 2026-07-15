@@ -2,8 +2,27 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the GPT-5.6-Ultra v13.3.17_SLURM implementation. It is derived from
-GPT-5.6-Ultra_v13.3.16_SLURM.py by COPY + targeted C1/C2/C4/C10/N22/N24 edits.
+This is the GPT-5.6-Ultra v13.3.18_SLURM implementation. It is derived from
+GPT-5.6-Ultra_v13.3.17_SLURM.py by COPY + targeted C11/C12/C13/C14/N21 edits.
+  - v13.3.18 C11 leaves the steady-state multi-GPU task size alone, bounds the
+    centrally issued inference window, splits a still-central full-frame lease only
+    when dispatch reaches the actual global tail, prioritizes parent-unlocking work,
+    and publishes a retiring device union from a dedicated worker as soon as its D2H
+    future completes instead of waiting for the next inference task to finish.
+  - v13.3.18 C12 gives the single-angle resident Radial path independent CUDA
+    compute/copy streams and device output slots, and emits one Radial YOLO/bridge
+    union layer when bridges exist instead of projecting the components separately.
+  - v13.3.18 C13 batches sparse cross-slice union codes into compiled no-GIL calls
+    and optionally assigns disjoint final-fusion z bands to otherwise-idle GPUs;
+    any CUDA failure falls back to the established CPU fusion path.
+  - v13.3.18 C14 keeps every FFV1 shard and concat list under scratch, assembles full
+    and low-quality videos in a same-filesystem directory outside the publication
+    tree, and publishes only completed results with an atomic replace.
+  - v13.3.18 N21 optionally stores each .seg.nrrd as a tight extent-offset raster
+    (--save_nrrd_tight_crop), with local segment extents, shifted physical origin,
+    full reference geometry metadata, and exact restore-aware crop bounds.
+
+Inherited from v13.3.17:
   - v13.3.17 C1 groups projected component layers by their actual reduced restore
     geometry in G5, unions each group before its positive-support restore, and leaves
     source-native radial layers on the direct sparse crop path. The prioritized layout
@@ -1137,6 +1156,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--save_binary", nargs="?", const="__DEFAULT__", default=None, type=str,
                    help="Save final binary masks as a TIFF sequence plus an FFV1 MKV. Optional custom TIFF pattern, e.g. binary_masks/{Filename}_Binary_%%04d.tiff")
     p.add_argument("--save_nrrd", action="store_true", help="Save the decomposition as one single-layer 3D Slicer segmentation NRRD (.seg.nrrd, X,Y,t axes) per component layer in nrrd/, plus a manifest JSON. Each file imports into Slicer as a segmentation named after the file with a deterministic per-layer color. Layers are written during the intermediate pipeline steps")
+    p.add_argument("--save_nrrd_tight_crop", action="store_true",
+                   help="Store each --save_nrrd segmentation as a tight extent-offset raster instead of a full source-size zero-padded raster. The full reference geometry and crop offset are retained in Slicer metadata and the manifest")
     p.add_argument("--save_low_quality", action="store_true",
                    help="Save additional isotropically downsampled low-quality presentation videos (libx264, preset slow, yuv420p). When --save_nrrd is also enabled, the low-quality NRRD decomposition follows the full-quality format: one downbinned single-layer Slicer segmentation NRRD (.seg.nrrd) per component layer under low_quality/<token>/nrrd/, sharing the full-quality layer's segment name and color and written as each view completes")
     p.add_argument("--save_low_quality_downbin", nargs="+", default=None, type=str,
@@ -1867,6 +1888,39 @@ def mgpu_direct_union_enabled() -> bool:
     files (their windows overlap across angles). YOLO_TTA_MGPU_DIRECT_UNION=0 disables.
     """
     return _env_flag('YOLO_TTA_MGPU_DIRECT_UNION', True)
+
+
+def mgpu_fullframe_task_ranges(
+    n_slices: int,
+    slice_chunk: int,
+    gpu_count: int,
+    inference_batch: int,
+) -> List[Tuple[int, int]]:
+    """Return the profiled steady-state full-frame leases without tail adaptation."""
+    total = max(1, int(n_slices))
+    chunk = max(1, int(slice_chunk))
+    return [
+        (int(start), min(int(total), int(start) + int(chunk)))
+        for start in range(0, int(total), int(chunk))
+    ]
+
+
+def mgpu_tail_split_point(
+    slice_start: int,
+    slice_count: int,
+    inference_batch: int,
+) -> Optional[int]:
+    """C11 batch-aligned midpoint for a dispatch-time tail lease split."""
+    if not _env_flag('YOLO_TTA_MGPU_ADAPTIVE_TAIL_LEASES', True):
+        return None
+    tail0 = int(slice_start)
+    tail1 = int(slice_start) + max(0, int(slice_count))
+    align = max(1, int(inference_batch))
+    min_tail = max(align, _env_int('YOLO_TTA_MGPU_TAIL_MIN_SLICES', 128))
+    midpoint = int(tail0) + ((int(tail1 - tail0) // 2) // int(align)) * int(align)
+    if int(midpoint - tail0) >= int(min_tail) and int(tail1 - midpoint) >= int(min_tail):
+        return int(midpoint)
+    return None
 
 
 # v13.3.3: default cap for interpolation process-pool workers (was hard-capped at 2). The
@@ -13561,9 +13615,8 @@ def _gpu_inference_worker_main(
             pass
         return
 
-    pending_flush_result: Optional[Tuple[int, _DeferredGpuWorkerTaskResult]] = None
-    prefetched_task: Optional[object] = None
-    has_prefetched_task = False
+    publication_queue: 'queue.Queue[Optional[Tuple[int, _DeferredGpuWorkerTaskResult]]]' = queue.Queue(maxsize=1)
+    retirement_gate = threading.Semaphore(1)
     overlap_announced = False
 
     def _publish_deferred(item: Tuple[int, _DeferredGpuWorkerTaskResult]) -> None:
@@ -13582,26 +13635,40 @@ def _gpu_inference_worker_main(
                 'error': repr(exc), 'traceback': traceback.format_exc(),
             })
 
+    def _publisher_main() -> None:
+        while True:
+            item = publication_queue.get()
+            try:
+                if item is None:
+                    return
+                try:
+                    _publish_deferred(item)
+                except BaseException as exc:
+                    # A closed/broken result transport must not kill the publisher while
+                    # leaving queue.join() permanently blocked during worker teardown.
+                    print(f'Warning: GPU retirement publication transport failed ({exc}).')
+            finally:
+                if item is not None:
+                    retirement_gate.release()
+                publication_queue.task_done()
+
+    publication_thread = threading.Thread(
+        target=_publisher_main,
+        name=f'gpu-{int(gpu_index)}-retirement-publisher',
+        daemon=True,
+    )
+    publication_thread.start()
+
     try:
       while True:
-        if has_prefetched_task:
-            task = prefetched_task
-            prefetched_task = None
-            has_prefetched_task = False
-        else:
-            task = task_queue.get()
+        task = task_queue.get()
         if task is None:
-            if pending_flush_result is not None:
-                _publish_deferred(pending_flush_result)
-                pending_flush_result = None
             break
         task_id = int(task['task_id'])
         if str(task.get('task_type', 'inference')) == 'interpolation_pass':
-            # Auxiliary work is submitted only after inference drains, but finalize a
-            # prefetched retiring task defensively before widening CPU affinity/using CUDA.
-            if pending_flush_result is not None:
-                _publish_deferred(pending_flush_result)
-                pending_flush_result = None
+            # Auxiliary work is submitted only after inference drains. Defensively wait
+            # for the prompt publisher before widening affinity or reusing CUDA state.
+            publication_queue.join()
             # v13.3.4 (T4): after the inference queue drains, this warm worker process doubles
             # as an interpolation host — same memmap-path protocol as the dedicated
             # interpolation process pool, one pass at a time per worker.
@@ -13638,31 +13705,20 @@ def _gpu_inference_worker_main(
             )
             task_local['postprocess_workers'] = int(local_cpu_workers)
             completed = run_prediction_volume_in_worker(model, cfg, task_local)
-            # The previous task's D2H + host merge has now overlapped this task's complete
-            # render/infer/post stage. Join it before publishing its stats, preserving the
-            # scheduler-visible R4 ordering contract.
-            if pending_flush_result is not None:
-                _publish_deferred(pending_flush_result)
-                pending_flush_result = None
             if isinstance(completed, _DeferredGpuWorkerTaskResult):
-                pending_flush_result = (int(task_id), completed)
+                # C11: publication is tied to the D2H future itself, not to completion of
+                # the next inference task. The gate admits one retiring accumulator per
+                # worker; a slow retirement blocks only the handoff of the next completed
+                # task and cannot grow an unbounded queue of live device/host mappings.
+                retirement_gate.acquire()
+                publication_queue.put((int(task_id), completed))
                 if not overlap_announced:
                     overlap_announced = True
                     print(
-                        'GPU union flush overlap active (v13.3.14 G8): one retiring '
-                        'device accumulator overlaps the next worker task; '
+                        'GPU union prompt retirement active (v13.3.18 C11): one retiring '
+                        'device accumulator publishes immediately when its D2H future settles; '
                         'YOLO_TTA_GPU_UNION_FLUSH_OVERLAP=0 restores synchronous flushes.'
                     )
-                # All inference tasks are normally prequeued. If another task is already
-                # available, begin it immediately while this flush retires. When the queue
-                # is momentarily empty (especially the last task), settle now so the parent
-                # never waits for a result before it is able to enqueue the shutdown sentinel.
-                try:
-                    prefetched_task = task_queue.get(timeout=0.02)
-                    has_prefetched_task = True
-                except queue.Empty:
-                    _publish_deferred(pending_flush_result)
-                    pending_flush_result = None
             else:
                 result_queue.put({
                     'type': 'result', 'task_id': task_id, 'gpu_index': int(gpu_index),
@@ -13672,9 +13728,6 @@ def _gpu_inference_worker_main(
             # A failed post/infer-stream drain or binding-address restore means this process's
             # TensorRT contexts can no longer be reused safely.  Surface a worker-fatal result
             # and exit instead of dequeuing another view on the compromised backend.
-            if pending_flush_result is not None:
-                _publish_deferred(pending_flush_result)
-                pending_flush_result = None
             import traceback
             result_queue.put({
                 'type': 'fatal', 'task_id': task_id, 'gpu_index': int(gpu_index),
@@ -13682,17 +13735,15 @@ def _gpu_inference_worker_main(
             })
             return
         except Exception as exc:  # pragma: no cover - per-task failure surfaced to main
-            if pending_flush_result is not None:
-                _publish_deferred(pending_flush_result)
-                pending_flush_result = None
             import traceback
             result_queue.put({
                 'type': 'result', 'task_id': task_id, 'gpu_index': int(gpu_index), 'ok': False,
                 'error': repr(exc), 'traceback': traceback.format_exc(),
             })
     finally:
-        if pending_flush_result is not None:
-            _publish_deferred(pending_flush_result)
+        publication_queue.join()
+        publication_queue.put(None)
+        publication_thread.join()
         _shutdown_resident_trt_pipeline_cache()
         _shutdown_gpu_union_flush_executor()
 
@@ -15274,10 +15325,66 @@ def label_foreground_volume_streaming(
                 max_workers=pair_workers,
                 max_pending=max(pair_workers, pair_workers * 2),
             )
-        # v13.3.4 (T2): one batched (numba nogil) union call per slice-pair instead of a python
-        # loop per pair code — the serial merge stops being the cross-slice-unions bottleneck.
-        for codes in tqdm(pair_iter, total=max(0, int(z_dim) - 1), desc='Interpolation: cross-slice unions'):
-            uf.union_pair_codes(codes)
+        compiled_union_batching = bool(
+            _numba_union_find_batch_kernel is not None
+            and compiled_interpolation_kernels_enabled()
+            and not _NUMBA_UNION_FIND_KERNEL_RUNTIME_DISABLED
+        )
+        if not compiled_union_batching:
+            # The Python fallback loops over every pair inside union_pair_codes. Joining
+            # adjacent arrays would add allocation/copy cost without reducing that work.
+            for codes in tqdm(
+                pair_iter,
+                total=max(0, int(z_dim) - 1),
+                desc='Interpolation: cross-slice unions',
+            ):
+                uf.union_pair_codes(np.asarray(codes, dtype=np.uint64))
+        else:
+            # C13: retain pair order but amortize the Python/Numba boundary across adjacent
+            # slice pairs. The cap bounds the temporary (default 8 MiB of uint64 codes), and
+            # oversized single-pair arrays are streamed through the same compiled kernel.
+            union_code_cap = max(1, _env_int(
+                'YOLO_TTA_TOPOLOGY_UNION_BATCH_CODES', 1_048_576,
+            ))
+            pending_codes: List[np.ndarray] = []
+            pending_code_count = 0
+
+            def _flush_topology_codes() -> None:
+                nonlocal pending_code_count
+                if pending_code_count <= 0:
+                    return
+                joined = (
+                    pending_codes[0]
+                    if len(pending_codes) == 1
+                    else np.concatenate(pending_codes).astype(np.uint64, copy=False)
+                )
+                uf.union_pair_codes(np.ascontiguousarray(joined, dtype=np.uint64))
+                pending_codes.clear()
+                pending_code_count = 0
+
+            for codes in tqdm(
+                pair_iter,
+                total=max(0, int(z_dim) - 1),
+                desc='Interpolation: cross-slice unions',
+            ):
+                codes_u64 = np.asarray(codes, dtype=np.uint64)
+                if codes_u64.size <= 0:
+                    continue
+                if (
+                    int(pending_code_count) > 0
+                    and int(pending_code_count) + int(codes_u64.size) > int(union_code_cap)
+                ):
+                    _flush_topology_codes()
+                if int(codes_u64.size) >= int(union_code_cap):
+                    for code0 in range(0, int(codes_u64.size), int(union_code_cap)):
+                        uf.union_pair_codes(np.ascontiguousarray(
+                            codes_u64[int(code0):int(code0) + int(union_code_cap)],
+                            dtype=np.uint64,
+                        ))
+                else:
+                    pending_codes.append(codes_u64)
+                    pending_code_count += int(codes_u64.size)
+            _flush_topology_codes()
 
     if bool(wrap_axis) and int(z_dim) > 1:
         if int(component_counts[0]) > 0 and int(component_counts[int(z_dim) - 1]) > 0:
@@ -17015,6 +17122,11 @@ def gpu_resident_radial_backproject_enabled() -> bool:
     return _env_flag('YOLO_TTA_GPU_BACKPROJECT_RESIDENT', True)
 
 
+def fused_single_angle_radial_component_layer_enabled() -> bool:
+    """C12: project one post-interpolation Radial union in the single-angle fast path."""
+    return _env_flag('YOLO_TTA_FUSED_SINGLE_ANGLE_RADIAL_LAYER', True)
+
+
 def _radial_resident_backproject_kernel() -> Optional[object]:
     global _RADIAL_RESIDENT_BACKPROJECT_KERNEL
     global _RADIAL_RESIDENT_BACKPROJECT_KERNEL_FAILED, _RADIAL_RESIDENT_BACKPROJECT_KERNEL_ERROR
@@ -17170,11 +17282,17 @@ def _radial_backproject_gpu_resident(
     n_az, work_t, u_len = (int(v) for v in radial_mask_mm.shape)
     plane_px = int(out_h) * int(out_w)
     t_chunk = max(1, _env_int('YOLO_TTA_GPU_BACKPROJECT_RESIDENT_T_CHUNK', 64))
+    requested_pipeline_slots = max(1, min(3, _env_int(
+        'YOLO_TTA_GPU_BACKPROJECT_RESIDENT_PIPELINE_SLOTS', 2,
+    )))
     reserve = int(max(0.0, _env_float('YOLO_TTA_GPU_BACKPROJECT_RESIDENT_RESERVE_GIB', 4.0)) * GIB)
     source_bytes = int(radial_mask_mm.nbytes)
     map_bytes = int(plane_px) * 2 * np.dtype(np.int32).itemsize
     output_bytes = int(t_chunk) * int(plane_px)
-    base_need = int(source_bytes + map_bytes + output_bytes + 256 * 1024 * 1024)
+    base_need = int(
+        source_bytes + map_bytes + int(requested_pipeline_slots) * output_bytes
+        + 256 * 1024 * 1024
+    )
     try:
         free_bytes, _total = torch.cuda.mem_get_info(dev)
     except Exception:
@@ -17182,7 +17300,10 @@ def _radial_backproject_gpu_resident(
     while t_chunk > 8 and int(free_bytes) < int(base_need) + int(reserve):
         t_chunk //= 2
         output_bytes = int(t_chunk) * int(plane_px)
-        base_need = int(source_bytes + map_bytes + output_bytes + 256 * 1024 * 1024)
+        base_need = int(
+            source_bytes + map_bytes + int(requested_pipeline_slots) * output_bytes
+            + 256 * 1024 * 1024
+        )
     if int(free_bytes) < int(base_need) + int(reserve):
         print(
             f'{desc}: full-resident GPU backprojection skipped (need≈{base_need / GIB:.1f} GiB '
@@ -17215,13 +17336,15 @@ def _radial_backproject_gpu_resident(
             dev_index = int(torch.cuda.current_device())
         except Exception:
             dev_index = 0
-    stream = torch.cuda.Stream(device=dev)
+    compute_stream = torch.cuda.Stream(device=dev)
+    copy_stream = torch.cuda.Stream(device=dev)
     phase_start = time.perf_counter()
     upload_seconds = 0.0
     transpose_seconds = 0.0
     projection_seconds = 0.0
     commit_cpu_seconds = 0.0
-    radial_dev = tmajor_dev = source_dev = u_dev = out_dev = None
+    radial_dev = tmajor_dev = source_dev = u_dev = None
+    out_dev_slots: List[object] = []
     pin_src_slots: List[object] = []
     pin_out_slots: List[object] = []
     commit_pool: Optional[ThreadPoolExecutor] = None
@@ -17229,7 +17352,7 @@ def _radial_backproject_gpu_resident(
     try:
         # Torch and CuPy keep independent current-device state. Pin both explicitly so
         # the late-tail scheduler may choose any visible GPU, not only cuda:0.
-        with torch.cuda.device(dev), cp.cuda.Device(int(dev_index)), torch.cuda.stream(stream):
+        with torch.cuda.device(dev), cp.cuda.Device(int(dev_index)), torch.cuda.stream(compute_stream):
             radial_dev = torch.empty((n_az, work_t, u_len), dtype=torch.uint8, device=dev)
 
             requested_upload_slots = max(1, min(3, _env_int(
@@ -17264,21 +17387,25 @@ def _radial_backproject_gpu_resident(
                 )
                 radial_dev[a0:a1].copy_(pin_src_slots[slot_idx][:count], non_blocking=True)
                 event = torch.cuda.Event(blocking=False)
-                event.record(stream)
+                event.record(compute_stream)
                 upload_events[slot_idx] = event
-            stream.synchronize()
+            compute_stream.synchronize()
             upload_seconds = time.perf_counter() - upload_t0
 
             source_dev = torch.from_numpy(source_flat).to(dev, non_blocking=False)
             u_dev = torch.from_numpy(u_flat).to(dev, non_blocking=False)
-            external = _cupy_external_stream(cp, stream)
+            external = _cupy_external_stream(cp, compute_stream)
             cp_source = cp.asarray(source_dev)
             cp_u = cp.asarray(u_dev)
 
             layout = 'azimuth-major'
             compute_kernel = kernels.kernel_azmajor
             compute_tensor = radial_dev
-            tmajor_peak = int(2 * source_bytes + map_bytes + output_bytes + 256 * 1024 * 1024)
+            tmajor_peak = int(
+                2 * source_bytes + map_bytes
+                + int(requested_pipeline_slots) * output_bytes
+                + 256 * 1024 * 1024
+            )
             if (
                 _env_flag('YOLO_TTA_GPU_BACKPROJECT_RESIDENT_TMAJOR', True)
                 and int(free_bytes) >= int(tmajor_peak) + int(reserve)
@@ -17301,7 +17428,7 @@ def _radial_backproject_gpu_resident(
                         ),
                         stream=external,
                     )
-                    stream.synchronize()
+                    compute_stream.synchronize()
                     compute_tensor = tmajor_dev
                     compute_kernel = kernels.kernel_tmajor
                     layout = 't-major'
@@ -17313,23 +17440,29 @@ def _radial_backproject_gpu_resident(
                 transpose_seconds = time.perf_counter() - transpose_t0
 
             cp_radial = cp.asarray(compute_tensor)
-            out_dev = torch.empty((t_chunk, plane_px), dtype=torch.uint8, device=dev)
-            cp_out = cp.asarray(out_dev)
-
-            requested_commit_slots = max(1, min(4, _env_int(
-                'YOLO_TTA_GPU_BACKPROJECT_RESIDENT_COMMIT_SLOTS', 2,
-            )))
-            for _ in range(int(requested_commit_slots)):
+            # C12: allocate output device and pinned-host slots as pairs. A slot is not
+            # reused until its D2H event and CPU sink commit have both completed; another
+            # slot can therefore run the next projection while copy/packing proceeds.
+            for _ in range(int(requested_pipeline_slots)):
                 try:
+                    out_dev_slots.append(torch.empty(
+                        (t_chunk, plane_px), dtype=torch.uint8, device=dev,
+                    ))
                     pin_out_slots.append(torch.empty(
                         (t_chunk, plane_px), dtype=torch.uint8, pin_memory=True,
                     ))
                 except Exception:
+                    if len(out_dev_slots) > len(pin_out_slots):
+                        out_dev_slots.pop()
                     break
-            if not pin_out_slots:
+            if not out_dev_slots:
+                out_dev_slots.append(torch.empty(
+                    (t_chunk, plane_px), dtype=torch.uint8, device=dev,
+                ))
                 pin_out_slots.append(torch.empty(
                     (t_chunk, plane_px), dtype=torch.uint8, pin_memory=True,
                 ))
+            cp_out_slots = [cp.asarray(slot) for slot in out_dev_slots]
             pin_out_arrays = [slot.numpy() for slot in pin_out_slots]
             commit_futures = [None] * len(pin_out_slots)
             commit_pool = _acquire_parallel_pool(len(pin_out_slots))
@@ -17354,8 +17487,18 @@ def _radial_backproject_gpu_resident(
                     commit_cpu_seconds += float(fut.result())
                     commit_futures[int(slot_idx)] = None
 
+            def _commit_after_copy(
+                copy_done: object,
+                t0_i: int,
+                t1_i: int,
+                block_i: np.ndarray,
+            ) -> float:
+                copy_done.synchronize()
+                return _commit_block(int(t0_i), int(t1_i), block_i)
+
             projection_t0 = time.perf_counter()
-            for chunk_idx, t0 in enumerate(tqdm(
+            scheduled_idx = 0
+            for _chunk_idx, t0 in enumerate(tqdm(
                 range(0, int(t_dim), int(t_chunk)), desc=f'{desc} [resident gpu]',
             )):
                 t1 = min(int(t_dim), int(t0) + int(t_chunk))
@@ -17371,7 +17514,8 @@ def _radial_backproject_gpu_resident(
                         required=bool(sink_only),
                     )
                     continue
-                slot_idx = int(chunk_idx) % len(pin_out_slots)
+                slot_idx = int(scheduled_idx) % len(pin_out_slots)
+                scheduled_idx += 1
                 _settle_commit(slot_idx)
                 count = int(t1 - t0)
                 total = int(count) * int(plane_px)
@@ -17384,25 +17528,33 @@ def _radial_backproject_gpu_resident(
                     (
                         cp_radial, np.int32(n_az), np.int32(work_t), np.int32(u_len),
                         cp_source, cp_u, np.int32(plane_px), np.int32(t_dim),
-                        np.int32(t0), np.int32(count), cp_out,
+                        np.int32(t0), np.int32(count), cp_out_slots[slot_idx],
                     ),
                     stream=external,
                 )
-                pin_out_slots[slot_idx][:count].copy_(out_dev[:count], non_blocking=True)
-                stream.synchronize()
+                compute_done = torch.cuda.Event(blocking=False)
+                compute_done.record(compute_stream)
+                copy_stream.wait_event(compute_done)
+                with torch.cuda.stream(copy_stream):
+                    pin_out_slots[slot_idx][:count].copy_(
+                        out_dev_slots[slot_idx][:count], non_blocking=True,
+                    )
+                    copy_done = torch.cuda.Event(blocking=False)
+                    copy_done.record(copy_stream)
                 block = pin_out_arrays[slot_idx][:count].reshape((count, int(out_h), int(out_w)))
                 commit_futures[slot_idx] = commit_pool.submit(
-                    _commit_block, int(t0), int(t1), block,
+                    _commit_after_copy, copy_done, int(t0), int(t1), block,
                 )
             for slot_idx in range(len(commit_futures)):
                 _settle_commit(slot_idx)
-            stream.synchronize()
+            compute_stream.synchronize()
+            copy_stream.synchronize()
             projection_seconds = time.perf_counter() - projection_t0
 
         total_seconds = time.perf_counter() - phase_start
         print(
             f'{desc}: full-resident GPU backprojection complete; source={source_bytes / GIB:.1f} GiB, '
-            f'layout={layout}, upload_slots={len(pin_src_slots)}, commit_slots={len(pin_out_slots)}, '
+            f'layout={layout}, upload_slots={len(pin_src_slots)}, pipeline_slots={len(pin_out_slots)}, '
             f'output={"sink-only" if bool(sink_only) else "dense+sink"}, '
             f'active_rows={int(np.count_nonzero(row_any))}/{int(work_t)}, '
             f'upload={upload_seconds:.2f}s, transpose={transpose_seconds:.2f}s, '
@@ -17411,18 +17563,36 @@ def _radial_backproject_gpu_resident(
         )
         return True
     finally:
+        active_exception = sys.exc_info()[0] is not None
+        cleanup_error: Optional[BaseException] = None
+        # C12 exception safety: a callback failure can leave later D2Hs queued while their
+        # commit futures have not started. Quiesce both CUDA streams before any future can
+        # be cancelled and before device/pinned slot references are released.
+        for owned_stream in (compute_stream, copy_stream):
+            try:
+                owned_stream.synchronize()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
         if commit_pool is not None:
-            # C2 transaction boundary: do not let materialize_nrrd_view_layer discard
-            # and unlink a failed sink while a later resident commit still owns its fd.
-            # Cancel work that has not started, then wait for every running callback even
-            # when an earlier future failed; cleanup must never return a live writer task.
-            _settle_parallel_futures(
-                fut for fut in commit_futures if fut is not None
-            )
-            _release_parallel_pool(max(1, len(pin_out_slots)), commit_pool)
+            # Never cancel these event-wait futures: every submitted callback either commits
+            # or reports its own failure after the associated D2H becomes quiescent.
+            for fut in commit_futures:
+                if fut is None:
+                    continue
+                try:
+                    fut.result()
+                except BaseException as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+            try:
+                _release_parallel_pool(max(1, len(pin_out_slots)), commit_pool)
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
         try:
-            del radial_dev, tmajor_dev, source_dev, u_dev, out_dev
-            del pin_src_slots, pin_out_slots
+            del radial_dev, tmajor_dev, source_dev, u_dev
+            del out_dev_slots, pin_src_slots, pin_out_slots
         except Exception:
             pass
         try:
@@ -17430,6 +17600,8 @@ def _radial_backproject_gpu_resident(
                 torch.cuda.empty_cache()
         except Exception:
             pass
+        if cleanup_error is not None and not bool(active_exception):
+            raise cleanup_error
 
 def _radial_backproject_gpu_streaming(
     radial_mask_mm: np.ndarray,
@@ -18331,6 +18503,19 @@ def fused_final_restore_geometry_groups_enabled() -> bool:
     return _env_flag('YOLO_TTA_FUSED_FINAL_RESTORE_GEOMETRY_GROUPS', True)
 
 
+def fused_final_gpu_enabled() -> bool:
+    """C13: optionally move grouped final restore/OR work onto idle inference GPUs.
+
+    Sparse cvol decoding and stack formation are still host-side, so the CUDA path is
+    intentionally opt-in until its pageable H2D traffic is profiled on the target node.
+    """
+    return _env_flag('YOLO_TTA_FUSED_FINAL_GPU', False)
+
+
+def fused_final_gpu_batch_slices() -> int:
+    return max(1, _env_int('YOLO_TTA_FUSED_FINAL_GPU_BATCH_SLICES', 8))
+
+
 def _resize_union_plane_to_out_xy(plane: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
     """Exact Cartesian final-union binary-plane restore used by legacy and G5 paths."""
     plane_u8 = (np.asarray(plane, dtype=np.uint8) > 0).astype(np.uint8, copy=False)
@@ -18696,6 +18881,250 @@ def assemble_view_volumes_and_projected_layers_fused(
                 dst[int(y0):int(y1), int(x0):int(x1)] |= crop
                 return
             np.bitwise_or(dst, np.asarray(src[int(src_z)], dtype=np.uint8), out=dst)
+
+        def _try_gpu_final_fusion() -> bool:
+            """C13 fast path: assign disjoint output-z bands to idle CUDA devices.
+
+            Source cvol decoding remains on the host because it is sparse/file-backed;
+            positive-support restores and the final contributor OR stay on each GPU until
+            one completed band is copied back. A failure may leave partial bands, but the
+            caller then executes the established CPU path, which assigns every output slice.
+            """
+            if not bool(group_restores) or not fused_final_gpu_enabled():
+                return False
+            try:
+                import torch  # type: ignore
+                import torch.nn.functional as F  # type: ignore
+                if not bool(torch.cuda.is_available()):
+                    return False
+            except Exception:
+                return False
+
+            configured = _GPU_SLICE_LABELING_CONFIGURED_DEVICES
+            devices: List[int] = []
+            raw_devices = os.environ.get('YOLO_TTA_FUSED_FINAL_GPU_DEVICES', '').strip()
+            if raw_devices:
+                try:
+                    devices = [int(tok.strip()) for tok in raw_devices.split(',') if tok.strip()]
+                except Exception as exc:
+                    print(f'Warning: invalid YOLO_TTA_FUSED_FINAL_GPU_DEVICES ({exc}); using configured devices.')
+                    devices = []
+            if not devices and configured:
+                devices = [int(v) for v in configured]
+            if not devices:
+                devices = list(range(int(torch.cuda.device_count())))
+            max_devices = max(1, _env_int('YOLO_TTA_FUSED_FINAL_GPU_MAX_DEVICES', 4))
+            devices = list(dict.fromkeys(devices))[:min(int(max_devices), int(out_t))]
+            if not devices:
+                return False
+
+            reserve = int(max(0.0, _env_float(
+                'YOLO_TTA_FUSED_FINAL_GPU_RESERVE_GIB', 2.0,
+            )) * GIB)
+            admitted: List[int] = []
+            for device_idx in devices:
+                try:
+                    free_bytes, _total_bytes = torch.cuda.mem_get_info(int(device_idx))
+                    # Float resize workspace + uint8 input/output. Groups are processed
+                    # sequentially, so admission depends on the largest plane only.
+                    max_plane = max(
+                        [int(out_h) * int(out_w)]
+                        + [int(g[1]) * int(g[2]) for g in restore_groups.keys()]
+                    )
+                    estimate = int(fused_final_gpu_batch_slices()) * (
+                        6 * int(max_plane) + 3 * int(out_h) * int(out_w)
+                    )
+                    if int(free_bytes) >= int(estimate) + int(reserve):
+                        admitted.append(int(device_idx))
+                except Exception:
+                    continue
+            if not admitted:
+                return False
+
+            def _indices(count: int, out_z: int) -> range:
+                count_i = max(1, int(count))
+                if count_i >= int(out_t):
+                    lo = int(math.floor(float(out_z) * float(count_i) / float(out_t)))
+                    hi = int(math.ceil(float(out_z + 1) * float(count_i) / float(out_t)))
+                    lo = int(np.clip(lo, 0, count_i - 1))
+                    hi = int(np.clip(max(lo + 1, hi), 1, count_i))
+                    return range(lo, hi)
+                if int(out_t) <= 1 or count_i <= 1:
+                    return range(0, 1)
+                src_i = int(round(float(out_z) * float(count_i - 1) / float(out_t - 1)))
+                src_i = int(np.clip(src_i, 0, count_i - 1))
+                return range(src_i, src_i + 1)
+
+            def _lane(device_idx: int, z0_lane: int, z1_lane: int) -> None:
+                device = torch.device(f'cuda:{int(device_idx)}')
+                batch_slices = int(fused_final_gpu_batch_slices())
+                with torch.cuda.device(device):
+                    stream = torch.cuda.Stream(device=device)
+                    with torch.cuda.stream(stream):
+                        for batch0 in range(int(z0_lane), int(z1_lane), int(batch_slices)):
+                            batch1 = min(int(z1_lane), int(batch0) + int(batch_slices))
+                            count = int(batch1 - batch0)
+                            acc = torch.zeros(
+                                (count, int(out_h), int(out_w)),
+                                dtype=torch.uint8,
+                                device=device,
+                            )
+
+                            def _or_host_stack(
+                                host_stack: np.ndarray,
+                                acc_dev: object = acc,
+                            ) -> None:
+                                host_u8 = np.ascontiguousarray(host_stack, dtype=np.uint8)
+                                src_dev = torch.from_numpy(host_u8).to(device, non_blocking=False)
+                                in_h = int(host_u8.shape[1])
+                                in_w = int(host_u8.shape[2])
+                                if (in_h, in_w) == (int(out_h), int(out_w)):
+                                    restored = (src_dev > 0).to(torch.uint8)
+                                else:
+                                    src_f = src_dev.to(torch.float32).unsqueeze(1)
+                                    if in_h >= int(out_h) and in_w >= int(out_w):
+                                        scaled = F.interpolate(
+                                            src_f, size=(int(out_h), int(out_w)), mode='area',
+                                        )
+                                        # cv2's uint8 INTER_AREA rounds 255*fraction; >= 0.5
+                                        # therefore matches the legacy >0 test at 1/510.
+                                        restored = (scaled.squeeze(1) >= (1.0 / 510.0)).to(torch.uint8)
+                                    else:
+                                        scaled = F.interpolate(
+                                            src_f, size=(int(out_h), int(out_w)), mode='nearest',
+                                        )
+                                        restored = (scaled.squeeze(1) > 0).to(torch.uint8)
+                                torch.bitwise_or(acc_dev, restored, out=acc_dev)
+
+                            # Keep Cartesian planes in their reduced working geometry;
+                            # their one terminal positive-support restore runs on-device.
+                            if transverse is not None:
+                                transverse_host = np.zeros(
+                                    (count, int(transverse.shape[1]), int(transverse.shape[2])),
+                                    dtype=np.uint8,
+                                )
+                                for local_z, out_z in enumerate(range(int(batch0), int(batch1))):
+                                    for src_z in _indices(int(transverse.shape[0]), int(out_z)):
+                                        transverse_host[local_z] |= np.asarray(
+                                            transverse[int(src_z)], dtype=np.uint8,
+                                        )
+                                _or_host_stack(transverse_host)
+                            if sagittal is not None:
+                                sagittal_host = np.zeros(
+                                    (count, int(sagittal.shape[0]), int(sagittal.shape[2])),
+                                    dtype=np.uint8,
+                                )
+                                for local_z, out_z in enumerate(range(int(batch0), int(batch1))):
+                                    for src_z in _indices(int(sagittal.shape[1]), int(out_z)):
+                                        sagittal_host[local_z] |= np.asarray(
+                                            sagittal[:, int(src_z), :], dtype=np.uint8,
+                                        )
+                                _or_host_stack(sagittal_host)
+                            if coronal is not None:
+                                coronal_host = np.zeros(
+                                    (count, int(coronal.shape[2]), int(coronal.shape[0])),
+                                    dtype=np.uint8,
+                                )
+                                for local_z, out_z in enumerate(range(int(batch0), int(batch1))):
+                                    for src_z in _indices(int(coronal.shape[1]), int(out_z)):
+                                        coronal_host[local_z] |= np.ascontiguousarray(
+                                            coronal[:, int(src_z), :].T,
+                                            dtype=np.uint8,
+                                        )
+                                _or_host_stack(coronal_host)
+
+                            if native_views or native_projected:
+                                native_host = np.zeros(
+                                    (count, int(out_h), int(out_w)), dtype=np.uint8,
+                                )
+                                for local_z, out_z in enumerate(range(int(batch0), int(batch1))):
+                                    for _view_name, vol in native_views:
+                                        native_host[local_z] |= np.asarray(vol[int(out_z)], dtype=np.uint8)
+                                    for _ref, src in native_projected:
+                                        _or_native_source_slice(native_host[local_z], src, int(out_z))
+                                _or_host_stack(native_host)
+
+                            for geometry, group in restore_groups.items():
+                                in_t, in_h, in_w = (int(v) for v in geometry)
+                                reduced_host = np.zeros(
+                                    (count, int(in_h), int(in_w)), dtype=np.uint8,
+                                )
+                                for local_z, out_z in enumerate(range(int(batch0), int(batch1))):
+                                    source_zs = _restore_source_indices_for_output_z(
+                                        int(in_t), int(out_t), int(out_z),
+                                    )
+                                    for _ref, src in group:
+                                        for src_z in source_zs:
+                                            _or_native_source_slice(
+                                                reduced_host[local_z], src, int(src_z),
+                                            )
+                                _or_host_stack(reduced_host)
+
+                            final_union_mm[int(batch0):int(batch1)] = acc.cpu().numpy()
+                            del acc
+                    stream.synchronize()
+
+            bands = _ffv1_contiguous_segments(int(out_t), len(admitted))
+            lane_pool: Optional[ThreadPoolExecutor] = None
+            lane_futures: List[Future] = []
+            first_error: Optional[Exception] = None
+            try:
+                try:
+                    lane_pool = ThreadPoolExecutor(
+                        max_workers=len(admitted), thread_name_prefix='g5-gpu-fusion',
+                    )
+                    for dev, band in zip(admitted, bands):
+                        lane_futures.append(lane_pool.submit(
+                            _lane, int(dev), int(band[0]), int(band[1]),
+                        ))
+                except Exception as exc:
+                    first_error = exc
+                for lane_future in lane_futures:
+                    try:
+                        lane_future.result()
+                    except Exception as exc:
+                        if first_error is None:
+                            first_error = exc
+            finally:
+                try:
+                    if lane_pool is not None:
+                        lane_pool.shutdown(wait=True)
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+                # Futures retain exception tracebacks (and therefore tensor locals). Drop
+                # those references before releasing allocator caches for later nvCOMP/NRRD.
+                lane_futures.clear()
+                try:
+                    del lane_future
+                except UnboundLocalError:
+                    pass
+                gc.collect()
+                for device_idx in admitted:
+                    try:
+                        with torch.cuda.device(int(device_idx)):
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+            error_text = (
+                f'{type(first_error).__name__}: {first_error}'
+                if first_error is not None else ''
+            )
+            if error_text:
+                print(
+                    f'Warning: v13.3.18 C13 GPU final fusion failed ({error_text}); '
+                    'rewriting the complete result with the CPU G5 path.'
+                )
+                return False
+            print(
+                f'v13.3.18 (C13): final grouped restore/OR used {len(admitted)} GPU lane(s), '
+                f'{int(fused_final_gpu_batch_slices())} output slice(s) per batch.'
+            )
+            return True
+
+        if _try_gpu_final_fusion():
+            flush_array(final_union_mm)
+            return
 
         def _merge_out_slice(out_z: int) -> None:
             buffers = _scratch_map()
@@ -21684,6 +22113,19 @@ class NrrdLayerRef:
 
 
 @dataclass(frozen=True)
+class NrrdRasterPlan:
+    """N21 mapping between a full reference raster and the bytes stored in one NRRD."""
+
+    reference_shape_tyx: Tuple[int, int, int]
+    stored_shape_tyx: Tuple[int, int, int]
+    crop_extent_xyt: NrrdSegmentExtent
+    reference_offset_ijk: Tuple[int, int, int]
+    segment_extent_xyt: NrrdSegmentExtent
+    tight_cropped: bool
+    empty_segment: bool
+
+
+@dataclass(frozen=True)
 class TileGateResult:
     model_name: str
     view_name: str
@@ -21878,9 +22320,12 @@ class IncrementalRawBBoxMaskStoreWriter:
 
     def _consume_slice(self, z: int, plane: np.ndarray) -> None:
         z_i = int(z)
-        plane_arr = np.asarray(plane)
-        rows = np.any(plane_arr, axis=1)
-        if not bool(np.any(rows)):
+        plane_arr = np.ascontiguousarray(np.asarray(plane, dtype=np.uint8))
+        # C12: OpenCV performs one compiled scan for both emptiness and the tight bbox.
+        # The previous two NumPy reductions read the entire plane twice and created two
+        # temporary boolean vectors before the sink normalized/copied the crop.
+        x0, y0, bbox_w, bbox_h = (int(v) for v in cv2.boundingRect(plane_arr))
+        if int(bbox_w) <= 0 or int(bbox_h) <= 0:
             with self._lock:
                 if self._failed_reason is not None:
                     return
@@ -21890,11 +22335,8 @@ class IncrementalRawBBoxMaskStoreWriter:
                 self._slice_state[z_i] = np.uint8(2)
             return
 
-        cols = np.any(plane_arr, axis=0)
-        y0 = int(np.argmax(rows))
-        y1 = int(rows.size - np.argmax(rows[::-1]))
-        x0 = int(np.argmax(cols))
-        x1 = int(cols.size - np.argmax(cols[::-1]))
+        x1 = int(x0) + int(bbox_w)
+        y1 = int(y0) + int(bbox_h)
         payload_nbytes = int(y1 - y0) * int(x1 - x0)
 
         with self._lock:
@@ -23504,6 +23946,7 @@ def prepare_view_volume_after_fullframe(
     precleaned_slice_cleanup: bool = False,
     hole_fill_done_on_device: bool = False,
     slice_meta: Optional[Dict[str, object]] = None,
+    fuse_radial_component_layers: bool = False,
 ) -> PreparedViewResult:
     baseline_native_volume = union_mm
     nrrd_layers: List[NrrdLayerRef] = []
@@ -23511,6 +23954,12 @@ def prepare_view_volume_after_fullframe(
     parent_bridge_support_mm: Optional[object] = None
     parent_mask_support_path: Optional[Path] = None
     parent_bridge_support_path: Optional[Path] = None
+    fused_radial_components = bool(
+        fuse_radial_component_layers
+        and nrrd_layers_enabled
+        and str(view.family) == 'radial'
+        and not bool(dense_tiling_active)
+    )
 
     # v13.3.6 (D1): device-union slice metadata (aggregated per view by the scheduler).
     # Valid only while the volume matches the flush state: the (skipped) cleanup and the
@@ -23557,29 +24006,29 @@ def prepare_view_volume_after_fullframe(
             pass
 
     if bool(nrrd_layers_enabled):
-        layer_ref = materialize_nrrd_view_layer(
-            baseline_native_volume,
-            model_name=str(model_name),
-            view=view,
-            source='fullframe',
-            mask_kind='yolo',
-            pass_index=0,
-            stage='pre_interpolation',
-            description='Cleaned full-frame YOLO mask before interpolation bridges.',
-            temp_dir=temp_dir,
-            workers=int(slice_workers),
-            # v13.3.6 (D1): the device union already answered the foreground question and
-            # (for radial views) the per-row occupancy the backprojection would rescan
-            # (per-azimuth row bits OR-reduced to the (work_t,) bitmap the projection uses).
-            known_has_foreground=(bool(meta_slice_any.any()) if meta_valid and meta_slice_any is not None else None),
-            known_row_occupancy=(
-                np.ascontiguousarray(meta_row_occupancy.any(axis=0))
-                if (meta_valid and meta_row_occupancy is not None and str(view.family) == 'radial')
-                else None
-            ),
-        )
-        if layer_ref is not None:
-            nrrd_layers.append(layer_ref)
+        if not bool(fused_radial_components):
+            layer_ref = materialize_nrrd_view_layer(
+                baseline_native_volume,
+                model_name=str(model_name),
+                view=view,
+                source='fullframe',
+                mask_kind='yolo',
+                pass_index=0,
+                stage='pre_interpolation',
+                description='Cleaned full-frame YOLO mask before interpolation bridges.',
+                temp_dir=temp_dir,
+                workers=int(slice_workers),
+                # v13.3.6 (D1): the device union already answered the foreground question and
+                # (for radial views) the per-row occupancy the backprojection would rescan.
+                known_has_foreground=(bool(meta_slice_any.any()) if meta_valid and meta_slice_any is not None else None),
+                known_row_occupancy=(
+                    np.ascontiguousarray(meta_row_occupancy.any(axis=0))
+                    if (meta_valid and meta_row_occupancy is not None and str(view.family) == 'radial')
+                    else None
+                ),
+            )
+            if layer_ref is not None:
+                nrrd_layers.append(layer_ref)
 
         # Only dense tiled NRRD category gating needs a persistent parent-YOLO support copy.
         # Store it as a slice-chunked cvol instead of a raw uint8 memmap to avoid one
@@ -23612,7 +24061,7 @@ def prepare_view_volume_after_fullframe(
             # (bridge AND NOT pre-merge mask) to this path during its merge step, replacing
             # the old full-volume before-copy + subtract bookkeeping.
             pass_delta_path: Optional[Path] = None
-            if bool(nrrd_layers_enabled):
+            if bool(nrrd_layers_enabled) and not bool(fused_radial_components):
                 pass_delta_path = temp_dir / 'nrrd_work' / view.name / f'fullframe_bridge_pass{int(pass_idx):02d}.u8.dat'
 
             baseline_native_volume, stats_local = interpolate_view_volume_pass_maybe_process(
@@ -23718,6 +24167,51 @@ def prepare_view_volume_after_fullframe(
                     union_path.unlink(missing_ok=True)
                 except Exception:
                     pass
+
+    if bool(fused_radial_components):
+        # C12: projection and positive-support restore distribute over binary OR, so the
+        # cleaned YOLO mask and every accepted bridge can be kept in the already-mutated
+        # baseline and projected once. This removes one source-store write and one complete
+        # Radial backprojection per bridge pass on the prioritized single-angle path.
+        fused_added_voxels = sum(
+            max(0, int(item.get('added_voxels', 0) or 0))
+            for item in interpolation_stats
+        )
+        has_fused_bridges = int(fused_added_voxels) > 0
+        layer_ref = materialize_nrrd_view_layer(
+            baseline_native_volume,
+            model_name=str(model_name),
+            view=view,
+            source='fullframe',
+            mask_kind=('union' if has_fused_bridges else 'yolo'),
+            pass_index=0,
+            stage=('post_interpolation' if has_fused_bridges else 'pre_interpolation'),
+            description=(
+                'Cleaned full-frame YOLO mask fused with all interpolation bridges.'
+                if has_fused_bridges
+                else 'Cleaned full-frame YOLO mask; interpolation added no bridge voxels.'
+            ),
+            temp_dir=temp_dir,
+            workers=int(slice_workers),
+            known_has_foreground=(
+                bool(meta_slice_any.any())
+                if meta_valid and meta_slice_any is not None else None
+            ),
+            known_row_occupancy=(
+                np.ascontiguousarray(meta_row_occupancy.any(axis=0))
+                if (
+                    meta_valid and meta_row_occupancy is not None
+                    and not _view_uses_interpolation(view, int(interpolate))
+                ) else None
+            ),
+        )
+        if layer_ref is not None:
+            nrrd_layers.append(layer_ref)
+            print(
+                f'v13.3.18 (C12): {model_name}/{view.name} emitted one Radial '
+                f'{"YOLO+bridge union" if has_fused_bridges else "YOLO"} layer for one '
+                f'projection pass ({int(fused_added_voxels)} bridge voxel(s)).'
+            )
 
     if bool(nrrd_layers_enabled) and parent_mask_support_mm is not None:
         parent_bridge_support_path = temp_dir / 'nrrd_support' / view.name / 'fullframe_bridge_support.cvol'
@@ -24956,6 +25450,58 @@ def _ffv1_contiguous_segments(total_frames: int, segment_count: int) -> List[Tup
     return ranges
 
 
+def _atomic_publication_stage_path(
+    out_path: Path,
+    *,
+    publication_root: Optional[Path] = None,
+) -> Tuple[Path, Path]:
+    """Return a same-filesystem staging path outside the publication tree.
+
+    The staging directory is a sibling of the run's publication root. Recursive rsync or
+    watchers rooted at ``publication_root`` therefore see neither shards nor a growing
+    ``.assembling`` inode; only the final atomic rename enters that tree.
+    """
+    final_path = Path(out_path)
+    root = Path(publication_root) if publication_root is not None else final_path.parent
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    root.parent.mkdir(parents=True, exist_ok=True)
+    # Every publisher owns its directory.  A shared empty staging directory can be
+    # removed by one concurrent writer after another has selected (but not yet
+    # created) its stage file.
+    stage_dir = Path(tempfile.mkdtemp(
+        prefix=f'.{root.name}.atomic-result-',
+        dir=str(root.parent),
+    ))
+    if int(stage_dir.stat().st_dev) != int(final_path.parent.stat().st_dev):
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        raise RuntimeError(
+            f'Atomic publication staging and destination are on different filesystems: '
+            f'{stage_dir} vs {final_path.parent}'
+        )
+    token = f'{os.getpid()}.{threading.get_ident()}.{time.time_ns()}'
+    stage_path = stage_dir / f'.{final_path.stem}.{token}.assembling{final_path.suffix}'
+    return stage_path, stage_dir
+
+
+def _publish_staged_file_atomically(stage_path: Path, out_path: Path) -> None:
+    """Durably replace ``out_path`` with a completed same-filesystem staging file."""
+    stage = Path(stage_path)
+    final_path = Path(out_path)
+    if not stage.is_file() or int(stage.stat().st_size) <= 0:
+        raise RuntimeError(f'Atomic publication stage is missing or empty: {stage}')
+    with open(stage, 'rb') as stage_fh:
+        os.fsync(stage_fh.fileno())
+    os.replace(stage, final_path)
+    try:
+        parent_fd = os.open(str(final_path.parent), os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    except OSError:
+        pass
+
+
 def _run_sharded_ffv1_encode(
     *,
     out_path: Path,
@@ -24963,6 +25509,8 @@ def _run_sharded_ffv1_encode(
     description: str,
     show_progress: bool,
     encode_range: Callable[[int, int, Path, threading.Event, Callable[[subprocess.Popen], None], Callable[[subprocess.Popen], None], Callable[[], None]], None],
+    scratch_dir: Optional[Path] = None,
+    publication_root: Optional[Path] = None,
 ) -> None:
     """Encode contiguous FFV1 shards concurrently, then stream-copy concat atomically.
 
@@ -25018,23 +25566,30 @@ def _run_sharded_ffv1_encode(
     def _progress_one() -> None:
         progress.update(1)
 
-    # Gate value 1 deliberately retains the original direct-to-destination behavior.
-    if segments <= 1:
-        try:
-            encode_range(0, total, Path(out_path), cancel_event, _register, _unregister, _progress_one)
-        finally:
-            progress.close()
-        return
-
     temp_root: Optional[Path] = None
+    scratch_root: Optional[Path] = None
+    joined_path: Optional[Path] = None
+    publication_stage_dir: Optional[Path] = None
     executor: Optional[ThreadPoolExecutor] = None
     futures: List[Future] = []
     first_error: Optional[BaseException] = None
     try:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        scratch_root = (
+            Path(scratch_dir)
+            if scratch_dir is not None
+            else Path(tempfile.gettempdir())
+        ) / 'ffv1'
+        if (
+            publication_root is not None
+            and _path_is_relative_to(scratch_root, Path(publication_root))
+        ):
+            root = Path(publication_root)
+            scratch_root = root.parent / f'.{root.name}.ffv1-temp'
+        scratch_root.mkdir(parents=True, exist_ok=True)
         temp_root = Path(tempfile.mkdtemp(
             prefix=f'.{Path(out_path).stem}.ffv1-segments-',
-            dir=str(Path(out_path).parent),
+            dir=str(scratch_root),
         ))
         ranges = _ffv1_contiguous_segments(total, segments)
         shard_paths = [temp_root / f'segment_{idx:04d}.mkv' for idx in range(len(ranges))]
@@ -25066,24 +25621,37 @@ def _run_sharded_ffv1_encode(
         if missing:
             raise RuntimeError(f'FFV1 encoder did not produce {len(missing)} shard(s): {missing[:3]}')
 
-        # Fixed safe filenames avoid concat-demuxer quoting ambiguity.  All shard paths are
-        # resolved relative to the list file in the same private temporary directory.
-        concat_list = temp_root / 'segments.ffconcat'
-        concat_list.write_text(
-            'ffconcat version 1.0\n' + ''.join(f"file '{path.name}'\n" for path in shard_paths),
-            encoding='utf-8',
+        # C14: shards/list and the growing concat inode all stay outside publication.
+        # The staging directory is a sibling of the run output root on the same filesystem.
+        joined_path, publication_stage_dir = _atomic_publication_stage_path(
+            Path(out_path), publication_root=publication_root,
         )
-        joined_path = temp_root / 'joined.mkv'
-        cmd = [
-            'ffmpeg', '-y', '-v', 'error',
-            '-f', 'concat', '-safe', '0', '-i', str(concat_list),
-            '-map', '0:v:0', '-c', 'copy', str(joined_path),
-        ]
-        completed = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-        if int(completed.returncode) != 0 or not joined_path.is_file() or joined_path.stat().st_size <= 0:
-            stderr = completed.stderr.decode('utf-8', errors='ignore') if isinstance(completed.stderr, (bytes, bytearray)) else str(completed.stderr)
-            raise RuntimeError(f'FFV1 lossless concat failed for {Path(out_path).name}: {stderr}')
-        os.replace(joined_path, Path(out_path))
+        if len(shard_paths) == 1:
+            with open(shard_paths[0], 'rb', buffering=0) as src_fh, open(joined_path, 'wb', buffering=0) as dst_fh:
+                shutil.copyfileobj(src_fh, dst_fh, length=16 * 1024 * 1024)
+                dst_fh.flush()
+                os.fsync(dst_fh.fileno())
+        else:
+            # Fixed safe filenames avoid concat-demuxer quoting ambiguity. All paths are
+            # relative to the list inside the private scratch directory.
+            concat_list = temp_root / 'segments.ffconcat'
+            concat_list.write_text(
+                'ffconcat version 1.0\n' + ''.join(f"file '{path.name}'\n" for path in shard_paths),
+                encoding='utf-8',
+            )
+            cmd = [
+                'ffmpeg', '-y', '-v', 'error',
+                '-f', 'concat', '-safe', '0', '-i', str(concat_list),
+                '-map', '0:v:0', '-c', 'copy', '-f', 'matroska', str(joined_path),
+            ]
+            completed = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            if int(completed.returncode) != 0:
+                stderr = completed.stderr.decode('utf-8', errors='ignore') if isinstance(completed.stderr, (bytes, bytearray)) else str(completed.stderr)
+                raise RuntimeError(f'FFV1 lossless concat failed for {Path(out_path).name}: {stderr}')
+            with open(joined_path, 'rb') as joined_fh:
+                os.fsync(joined_fh.fileno())
+        _publish_staged_file_atomically(joined_path, Path(out_path))
+        joined_path = None
     except BaseException:
         _terminate_active()
         raise
@@ -25094,8 +25662,21 @@ def _run_sharded_ffv1_encode(
             except TypeError:  # Python < 3.9 compatibility
                 executor.shutdown(wait=True)
         progress.close()
+        if joined_path is not None:
+            try:
+                joined_path.unlink(missing_ok=True)
+            except Exception:
+                pass
         if temp_root is not None:
             shutil.rmtree(temp_root, ignore_errors=True)
+        # ``scratch_root`` is a shared container.  Removing it here races another
+        # writer between that writer's mkdir() and mkdtemp(); only the uniquely
+        # owned ``temp_root`` is eligible for per-writer cleanup.
+        if publication_stage_dir is not None:
+            try:
+                publication_stage_dir.rmdir()
+            except OSError:
+                pass
 
 
 def write_overlay_video(
@@ -25104,6 +25685,8 @@ def write_overlay_video(
     out_path: Path,
     fps: float,
     show_progress: bool = True,
+    scratch_dir: Optional[Path] = None,
+    publication_root: Optional[Path] = None,
 ) -> None:
     """Overlay blue masks (50% alpha) on transverse frames.
 
@@ -25168,6 +25751,8 @@ def write_overlay_video(
         description=f"Writing overlay video ({out_path.name})",
         show_progress=bool(show_progress),
         encode_range=_encode_range,
+        scratch_dir=scratch_dir,
+        publication_root=publication_root,
     )
 
 
@@ -25323,6 +25908,8 @@ def write_binary_video_from_mask_volume(
     video_path: Path,
     fps: float,
     show_progress: bool = True,
+    scratch_dir: Optional[Path] = None,
+    publication_root: Optional[Path] = None,
 ) -> Path:
     """Write a binary FFV1 MKV, optionally as concurrent losslessly concatenated t shards."""
     T, H, W = mask_u8.shape
@@ -25374,6 +25961,8 @@ def write_binary_video_from_mask_volume(
         description=f"Writing binary MKV ({video_path.name})",
         show_progress=bool(show_progress),
         encode_range=_encode_range,
+        scratch_dir=scratch_dir,
+        publication_root=publication_root,
     )
     return video_path
 
@@ -25524,8 +26113,182 @@ def _slicer_segment_extent_for_output(
 
     x_lo, x_hi = _axis(x0, x1, in_w, out_w)
     y_lo, y_hi = _axis(y0, y1, in_h, out_h)
-    t_lo, t_hi = _axis(t0, t1, in_t, out_t)
+    # The payload restore is endpoint-aligned nearest-neighbour when temporal
+    # upscaling and interval-OR when downscaling.  A ratio-only extent transform
+    # understates support (for example, source 1 in 3 -> 100 maps to 25..74,
+    # not 33..66), and Slicer may discard payload outside Segment0_Extent.
+    exact_t = _nrrd_output_z_extent_for_source_extent(
+        int(in_t), int(out_t), int(t0), int(t1),
+    )
+    if exact_t is None:
+        return full
+    t_lo, t_hi = (int(exact_t[0]), int(exact_t[1]))
     return (x_lo, x_hi, y_lo, y_hi, t_lo, t_hi)
+
+
+def _nrrd_output_z_extent_for_source_extent(
+    in_t: int,
+    out_t: int,
+    source_z0: int,
+    source_z1: int,
+) -> Optional[Tuple[int, int]]:
+    """Invert the exact payload restore map for a non-empty source-z interval.
+
+    Temporal upscaling is endpoint-aligned nearest-neighbour, while downscaling ORs a
+    floor/ceil coverage range. Ratio-only extent scaling is not equivalent (3 -> 100 with
+    source z=1 is the canonical counterexample), so N21 derives its crop from the same
+    mapping the payload writer uses.
+    """
+    in_t_i = max(1, int(in_t))
+    out_t_i = max(1, int(out_t))
+    source_lo = max(0, min(int(source_z0), in_t_i - 1))
+    source_hi = max(0, min(int(source_z1), in_t_i - 1))
+    if source_hi < source_lo:
+        return None
+    first = -1
+    last = -1
+    for out_z in range(int(out_t_i)):
+        source_indices = _restore_source_indices_for_output_z(
+            int(in_t_i), int(out_t_i), int(out_z),
+        )
+        if not source_indices:
+            continue
+        if int(source_indices[-1]) < int(source_lo) or int(source_indices[0]) > int(source_hi):
+            continue
+        if first < 0:
+            first = int(out_z)
+        last = int(out_z)
+    return None if first < 0 else (int(first), int(last))
+
+
+def _nrrd_raster_plan(
+    ref: 'NrrdLayerRef',
+    output_shape_tyx: Tuple[int, int, int],
+    *,
+    tight_crop: bool,
+) -> NrrdRasterPlan:
+    """Create a Slicer-compatible crop plan after mapping into output geometry.
+
+    ``crop_extent_xyt`` and ``reference_offset_ijk`` use the full reference index frame.
+    ``segment_extent_xyt`` uses the stored raster's local frame, as required by Slicer's
+    SegmentN_Extent field. The writer shifts the NRRD world origin to the crop's first
+    voxel and records the full reference geometry separately in conversion metadata.
+    """
+    out_t, out_h, out_w = (int(v) for v in output_shape_tyx)
+    full_extent: NrrdSegmentExtent = (
+        0, max(0, int(out_w) - 1),
+        0, max(0, int(out_h) - 1),
+        0, max(0, int(out_t) - 1),
+    )
+    raw_extent = _coerce_segment_extent(getattr(ref, 'segment_extent_ijk', None))
+    empty = bool(
+        raw_extent is not None
+        and (
+            int(raw_extent[1]) < int(raw_extent[0])
+            or int(raw_extent[3]) < int(raw_extent[2])
+            or int(raw_extent[5]) < int(raw_extent[4])
+        )
+    )
+    if not bool(tight_crop):
+        segment_extent = (
+            _nrrd_empty_segment_extent()
+            if bool(empty)
+            else _slicer_segment_extent_for_output(ref, output_shape_tyx)
+        )
+        return NrrdRasterPlan(
+            reference_shape_tyx=(out_t, out_h, out_w),
+            stored_shape_tyx=(out_t, out_h, out_w),
+            crop_extent_xyt=full_extent,
+            reference_offset_ijk=(0, 0, 0),
+            segment_extent_xyt=segment_extent,
+            tight_cropped=False,
+            empty_segment=bool(empty),
+        )
+    if bool(empty):
+        return NrrdRasterPlan(
+            reference_shape_tyx=(out_t, out_h, out_w),
+            stored_shape_tyx=(1, 1, 1),
+            crop_extent_xyt=(0, 0, 0, 0, 0, 0),
+            reference_offset_ijk=(0, 0, 0),
+            segment_extent_xyt=_nrrd_empty_segment_extent(),
+            tight_cropped=True,
+            empty_segment=True,
+        )
+    if raw_extent is None:
+        # Unknown extents remain full-size; guessing a crop could discard foreground.
+        mapped = full_extent
+    else:
+        # Includes the exact temporal inverse of the payload restore map.
+        mapped = _slicer_segment_extent_for_output(ref, output_shape_tyx)
+    x0, x1, y0, y1, t0, t1 = (int(v) for v in mapped)
+    in_t, in_h, in_w = (int(v) for v in getattr(ref, 'segment_extent_shape_tyx', (0, 0, 0)))
+    # Outward mapping already encloses the scaled extent. A one-voxel halo on changed
+    # axes protects positive-support boundary rounding while keeping the raster compact.
+    if int(in_w) > 0 and int(in_w) != int(out_w):
+        x0, x1 = max(0, x0 - 1), min(int(out_w) - 1, x1 + 1)
+    if int(in_h) > 0 and int(in_h) != int(out_h):
+        y0, y1 = max(0, y0 - 1), min(int(out_h) - 1, y1 + 1)
+    if int(in_t) > 0 and int(in_t) != int(out_t):
+        t0, t1 = max(0, t0 - 1), min(int(out_t) - 1, t1 + 1)
+    stored_shape = (
+        max(1, int(t1 - t0 + 1)),
+        max(1, int(y1 - y0 + 1)),
+        max(1, int(x1 - x0 + 1)),
+    )
+    if stored_shape == (1, 1, 1):
+        # Slicer reserves a 1x1x1 image as the marker for "no image data". A genuinely
+        # non-empty singleton must therefore carry one zero padding voxel. Prefer padding
+        # within the reference extent; the degenerate 1x1x1 reference pads beyond +X and
+        # the payload writer emits that out-of-reference location as zero.
+        if int(out_w) > 1:
+            if int(x1) < int(out_w) - 1:
+                x1 += 1
+            else:
+                x0 -= 1
+        elif int(out_h) > 1:
+            if int(y1) < int(out_h) - 1:
+                y1 += 1
+            else:
+                y0 -= 1
+        elif int(out_t) > 1:
+            if int(t1) < int(out_t) - 1:
+                t1 += 1
+            else:
+                t0 -= 1
+        else:
+            x1 += 1
+        stored_shape = (
+            max(1, int(t1 - t0 + 1)),
+            max(1, int(y1 - y0 + 1)),
+            max(1, int(x1 - x0 + 1)),
+        )
+    local_segment_extent: NrrdSegmentExtent = (
+        int(mapped[0]) - int(x0), int(mapped[1]) - int(x0),
+        int(mapped[2]) - int(y0), int(mapped[3]) - int(y0),
+        int(mapped[4]) - int(t0), int(mapped[5]) - int(t0),
+    )
+    return NrrdRasterPlan(
+        reference_shape_tyx=(out_t, out_h, out_w),
+        stored_shape_tyx=stored_shape,
+        crop_extent_xyt=(x0, x1, y0, y1, t0, t1),
+        reference_offset_ijk=(x0, y0, t0),
+        segment_extent_xyt=local_segment_extent,
+        tight_cropped=bool((t0, y0, x0) != (0, 0, 0) or stored_shape != (out_t, out_h, out_w)),
+        empty_segment=False,
+    )
+
+
+def _nrrd_mapped_extent_preserve_empty(
+    ref: 'NrrdLayerRef', output_shape_tyx: Tuple[int, int, int],
+) -> NrrdSegmentExtent:
+    extent = _coerce_segment_extent(getattr(ref, 'segment_extent_ijk', None))
+    if extent is not None and (
+        int(extent[1]) < int(extent[0])
+        or int(extent[3]) < int(extent[2])
+        or int(extent[5]) < int(extent[4])
+    ):
+        return _nrrd_empty_segment_extent()
+    return _slicer_segment_extent_for_output(ref, output_shape_tyx)
 
 
 def slicer_segmentation_header_fields(
@@ -25543,6 +26306,7 @@ def slicer_segmentation_header_fields(
     return {
         'Segmentation_ContainedRepresentationNames': 'Binary labelmap|',
         'Segmentation_MasterRepresentation': 'Binary labelmap',
+        'Segmentation_SourceRepresentation': 'Binary labelmap',
         'Segment0_ID': 'Segment_1',
         'Segment0_Name': str(segment_name),
         'Segment0_NameAutoGenerated': '0',
@@ -25556,6 +26320,49 @@ def slicer_segmentation_header_fields(
             '~SCT^85756007^Tissue~SCT^85756007^Tissue~^^~Anatomic codes - DICOM master list~^^~^^|'
         ),
     }
+
+
+def _apply_nrrd_tight_crop_geometry_header(
+    header: Dict[str, object],
+    plan: NrrdRasterPlan,
+) -> None:
+    """Apply the three geometry fields Slicer writes for a cropped labelmap.
+
+    NRRD index zero is the first stored voxel, so its world origin moves to the crop
+    offset. Slicer's custom offset restores the arbitrary reference IJK extent, while
+    the conversion parameter retains the complete uncropped reference bounds.
+    """
+    ref_t, ref_h, ref_w = (int(v) for v in plan.reference_shape_tyx)
+    reference_header = nrrd_slicer_header((ref_t, ref_h, ref_w))
+    directions = np.asarray(reference_header['space directions'], dtype=np.float64)
+    reference_origin = np.asarray(reference_header['space origin'], dtype=np.float64)
+    offset = np.asarray(plan.reference_offset_ijk, dtype=np.float64)
+    header['space origin'] = np.ascontiguousarray(
+        reference_origin + directions.T.dot(offset), dtype=np.float64,
+    )
+    header['Segmentation_ReferenceImageExtentOffset'] = ' '.join(
+        str(int(v)) for v in plan.reference_offset_ijk
+    )
+
+    ijk_to_space = np.eye(4, dtype=np.float64)
+    ijk_to_space[:3, :3] = directions.T
+    ijk_to_space[:3, 3] = reference_origin
+    # NRRD geometry above is LPS; Slicer's serialized reference-geometry converter
+    # parameter is an IJK-to-RAS matrix.
+    ras_from_lps = np.diag(np.asarray([-1.0, -1.0, 1.0, 1.0], dtype=np.float64))
+    ijk_to_slicer_ras = ras_from_lps.dot(ijk_to_space)
+    geometry_values: List[float | int] = [
+        float(v) for v in ijk_to_slicer_ras.reshape(-1).tolist()
+    ]
+    geometry_values.extend((0, ref_w - 1, 0, ref_h - 1, 0, ref_t - 1))
+    geometry = ';'.join(
+        str(int(v)) if isinstance(v, int) else f'{float(v):.17g}'
+        for v in geometry_values
+    ) + ';'
+    header['Segmentation_ConversionParameters'] = (
+        f'Reference image geometry|{geometry}|'
+        'Image geometry description string determining the complete reference labelmap.'
+    )
 
 
 def nrrd_pigz_compresslevel() -> int:
@@ -27906,7 +28713,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.6-Ultra_v13.3.14_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.6-Ultra_v13.3.18_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -28247,6 +29054,7 @@ def write_single_layer_nrrd_from_ref(
     block_consumer: Optional[Callable[[int, np.ndarray], None]] = None,
     sparse_consumer: Optional[Callable[[int, int, int, np.ndarray], None]] = None,
     z_shards: Optional[int] = None,
+    tight_crop: bool = False,
 ) -> Path:
     """Write one component layer as its own single-layer 3D Slicer segmentation NRRD (X, Y, t).
 
@@ -28259,57 +29067,82 @@ def write_single_layer_nrrd_from_ref(
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
-    header = nrrd_slicer_header((out_t, out_h, out_w))
     seg_name = str(segment_name) if segment_name else _slicer_segment_name_for_out_path(out_path)
     seg_color = segment_color if segment_color is not None else slicer_segment_palette_color(seg_name)
     # v13.3.6 (N3): live-volume layers defer the segment-extent scan to THIS (background
     # sink) worker instead of blocking the producing thread with a store-encode pass.
     ref = _resolve_live_ref_extent(ref)
+    raster_plan = _nrrd_raster_plan(
+        ref, (out_t, out_h, out_w), tight_crop=bool(tight_crop),
+    )
+    stored_t, stored_h, stored_w = (int(v) for v in raster_plan.stored_shape_tyx)
+    header = nrrd_slicer_header((stored_t, stored_h, stored_w))
+    header['content'] = (
+        'binary segmentation mask; '
+        f'reference_shape_tyx=({out_t},{out_h},{out_w}); '
+        f'stored_shape_tyx=({stored_t},{stored_h},{stored_w}); exported_axes=(X,Y,t)'
+    )
     header.update(slicer_segmentation_header_fields(
         segment_name=seg_name,
         color_rgb=seg_color,
-        extent_xyt=_slicer_segment_extent_for_output(ref, (out_t, out_h, out_w)),
+        extent_xyt=raster_plan.segment_extent_xyt,
     ))
-    z_chunk = _nrrd_full_slice_z_chunk(1, out_w, out_h, out_t)
+    if bool(tight_crop):
+        _apply_nrrd_tight_crop_geometry_header(header, raster_plan)
+    z_chunk = _nrrd_full_slice_z_chunk(1, stored_w, stored_h, stored_t)
     threads = int(nrrd_single_layer_pigz_threads()) if pigz_threads is None else max(1, int(pigz_threads))
     # N15: resolve auto-sharding only after this sink task starts executing. Queue
     # occupancy at submit time says nothing about the child-band capacity by the time a
     # late global layer reaches the head of the sink pool. The shared semaphore remains
     # the hard cross-layer over-sharding guard.
     if z_shards is None or int(z_shards) <= 0:
-        shard_count = _nrrd_layer_zshard_count(ref, int(out_t))
+        shard_count = _nrrd_layer_zshard_count(ref, int(stored_t))
     else:
         shard_count = max(
             1,
-            min(int(out_t), int(z_shards), int(_nrrd_zshard_capacity())),
+            min(int(stored_t), int(z_shards), int(_nrrd_zshard_capacity())),
         )
     if shard_count <= 1:
         with open(out_path, 'wb') as fh:
             _write_nrrd_ascii_header(
                 fh,
                 header=header,
-                sizes=(out_w, out_h, out_t),
+                sizes=(stored_w, stored_h, stored_t),
                 dimension=3,
                 data_type='unsigned char',
                 encoding='gzip',
             )
             # v13.3.3 (S4): in-process parallel gzip by default (pigz pipe as validated fallback).
             with _open_nrrd_payload_writer(fh, threads=threads) as payload_writer:
-                _write_one_decomposed_nrrd_layer_payload(
-                    ref,
-                    (out_t, out_h, out_w),
-                    payload_writer,
-                    z_chunk=int(z_chunk),
-                    block_consumer=block_consumer,
-                    sparse_consumer=sparse_consumer,
-                )
+                if bool(raster_plan.tight_cropped):
+                    _write_tight_cropped_nrrd_layer_payload(
+                        ref,
+                        (out_t, out_h, out_w),
+                        raster_plan,
+                        payload_writer,
+                        z_chunk=int(z_chunk),
+                        sparse_consumer=sparse_consumer,
+                    )
+                else:
+                    _write_one_decomposed_nrrd_layer_payload(
+                        ref,
+                        (out_t, out_h, out_w),
+                        payload_writer,
+                        z_chunk=int(z_chunk),
+                        block_consumer=block_consumer,
+                        sparse_consumer=sparse_consumer,
+                    )
         return out_path
 
     # v13.3.16 (N19, inherited N18): each z band compresses into an independent unlinked spool.
     # A band holds ONE process-global permit only while it is actually compressing. This
     # lets two 8-band global files use a 12-lane budget concurrently and removes the
     # ordered bounded-queue backpressure that previously kept later compressors idle.
-    bands, band_weights = _nrrd_layer_zshard_bands(ref, int(out_t), int(shard_count))
+    if bool(raster_plan.tight_cropped):
+        bands = _ffv1_contiguous_segments(int(stored_t), int(shard_count))
+        band_weights = None
+    else:
+        bands, band_weights = _nrrd_layer_zshard_bands(ref, int(out_t), int(shard_count))
     token = f'{os.getpid()}.{threading.get_ident()}'
     final_tmp = out_path.with_name(f'.{out_path.name}.{token}.assembling')
     shard_z_chunk = max(1, int(z_chunk) // int(shard_count))
@@ -28353,17 +29186,30 @@ def write_single_layer_nrrd_from_ref(
                     cpu_executor=mixed_cpu_executor,
                 )
             with payload_writer:
-                _write_one_decomposed_nrrd_layer_payload(
-                    ref,
-                    (out_t, out_h, out_w),
-                    payload_writer,
-                    z_chunk=shard_z_chunk,
-                    block_consumer=block_consumer,
-                    sparse_consumer=sparse_consumer,
-                    z_start=int(z0),
-                    z_stop=int(z1),
-                    fill_workers_override=shard_fill_workers,
-                )
+                if bool(raster_plan.tight_cropped):
+                    _write_tight_cropped_nrrd_layer_payload(
+                        ref,
+                        (out_t, out_h, out_w),
+                        raster_plan,
+                        payload_writer,
+                        z_chunk=shard_z_chunk,
+                        sparse_consumer=sparse_consumer,
+                        z_start=int(z0),
+                        z_stop=int(z1),
+                        fill_workers_override=shard_fill_workers,
+                    )
+                else:
+                    _write_one_decomposed_nrrd_layer_payload(
+                        ref,
+                        (out_t, out_h, out_w),
+                        payload_writer,
+                        z_chunk=shard_z_chunk,
+                        block_consumer=block_consumer,
+                        sparse_consumer=sparse_consumer,
+                        z_start=int(z0),
+                        z_stop=int(z1),
+                        fill_workers_override=shard_fill_workers,
+                    )
             spool.flush()
             spool.seek(0, os.SEEK_END)
             compressed_size = int(spool.tell())
@@ -28429,7 +29275,7 @@ def write_single_layer_nrrd_from_ref(
             _write_nrrd_ascii_header(
                 fh,
                 header=header,
-                sizes=(out_w, out_h, out_t),
+                sizes=(stored_w, stored_h, stored_t),
                 dimension=3,
                 data_type='unsigned char',
                 encoding='gzip',
@@ -28690,6 +29536,7 @@ def write_layer_nrrd_with_low_quality_mirrors(
     segment_name: Optional[str] = None,
     segment_color: Optional[Tuple[float, float, float]] = None,
     z_shards: Optional[int] = None,
+    tight_crop: bool = False,
 ) -> Path:
     """v13.3.3 (S4): write the full-quality layer AND its low-quality mirrors in ONE pass.
 
@@ -28710,12 +29557,15 @@ def write_layer_nrrd_with_low_quality_mirrors(
     # v13.3.6 (N3): resolve a live layer's deferred extent once, up front, so the
     # full-quality header AND every mirror header see the same tight extent.
     ref = _resolve_live_ref_extent(ref)
+    full_raster_plan = _nrrd_raster_plan(
+        ref, output_shape, tight_crop=bool(tight_crop),
+    )
     # N22 mirror payloads are composed in two geometry steps (backing -> full output ->
     # low quality). Compose the header extent through that same intermediate geometry;
     # mapping backing -> mirror directly can understate a positive-support boundary voxel.
     mirror_extent_ref = dataclasses_replace(
         ref,
-        segment_extent_ijk=_slicer_segment_extent_for_output(ref, output_shape),
+        segment_extent_ijk=_nrrd_mapped_extent_preserve_empty(ref, output_shape),
         segment_extent_shape_tyx=tuple(int(v) for v in output_shape),
         segment_extent_source='composed_full_output_extent_for_low_quality_mirror',
     )
@@ -28754,7 +29604,13 @@ def write_layer_nrrd_with_low_quality_mirrors(
     # sparse member pass.  Keep this tee sparse on the CPU: uploading thousands of tiny
     # crops is slower than the vectorized integral/gather resize, while uploading the old
     # dense 8.83 MiB plane would forfeit the bandwidth win. Other source types retain D2.
-    sparse_mirror_tee = bool(mirror_jobs and _nrrd_layer_ref_is_raw_bbox_store(ref))
+    sparse_mirror_tee = bool(
+        mirror_jobs
+        and (
+            _nrrd_layer_ref_is_raw_bbox_store(ref)
+            or bool(full_raster_plan.tight_cropped)
+        )
+    )
 
     # v13.3.6 (D2): derive the mirrors on a GPU when one is free — the per-slice resizes
     # and striped-lock ORs leave the CPU tee entirely; mirror volumes come back in one
@@ -28895,6 +29751,7 @@ def write_layer_nrrd_with_low_quality_mirrors(
         block_consumer=(_consume_block if mirror_jobs and not sparse_mirror_tee else None),
         sparse_consumer=(_tee_sparse if sparse_mirror_tee else None),
         z_shards=int(resolved_z_shards),
+        tight_crop=bool(tight_crop),
     )
 
     # v13.3.6 (D2): one small D2H per mirror replaces the per-block CPU resize/OR work.
@@ -28909,16 +29766,27 @@ def write_layer_nrrd_with_low_quality_mirrors(
             if bool(job['failed']):
                 raise RuntimeError('mirror tee failed during full-quality streaming')
             m_path.parent.mkdir(parents=True, exist_ok=True)
-            header = nrrd_slicer_header((int(m_t), int(m_h), int(m_w)))
+            mirror_plan = _nrrd_raster_plan(
+                mirror_extent_ref,
+                (int(m_t), int(m_h), int(m_w)),
+                tight_crop=bool(tight_crop),
+            )
+            stored_t, stored_h, stored_w = (int(v) for v in mirror_plan.stored_shape_tyx)
+            header = nrrd_slicer_header((stored_t, stored_h, stored_w))
+            header['content'] = (
+                'binary segmentation mask; '
+                f'reference_shape_tyx=({int(m_t)},{int(m_h)},{int(m_w)}); '
+                f'stored_shape_tyx=({stored_t},{stored_h},{stored_w}); exported_axes=(X,Y,t)'
+            )
             seg_name = str(segment_name) if segment_name else _slicer_segment_name_for_out_path(m_path)
             seg_color = segment_color if segment_color is not None else slicer_segment_palette_color(seg_name)
             header.update(slicer_segmentation_header_fields(
                 segment_name=seg_name,
                 color_rgb=seg_color,
-                extent_xyt=_slicer_segment_extent_for_output(
-                    mirror_extent_ref, (int(m_t), int(m_h), int(m_w)),
-                ),
+                extent_xyt=mirror_plan.segment_extent_xyt,
             ))
+            if bool(tight_crop):
+                _apply_nrrd_tight_crop_geometry_header(header, mirror_plan)
             device_members: Optional[List[bytes]] = None
             device_vol = job.get('device_volume')
             device_engine = job.get('device_gzip_engine')
@@ -28940,10 +29808,36 @@ def write_layer_nrrd_with_low_quality_mirrors(
             vol: Optional[np.ndarray] = job.get('volume')  # type: ignore[assignment]
             if device_members is None and vol is None:
                 raise RuntimeError('mirror tee produced neither a host nor device payload')
-            step = max(1, int(_nrrd_full_slice_z_chunk(1, int(m_w), int(m_h), int(m_t))))
+            if bool(mirror_plan.tight_cropped) and device_members is not None:
+                raise RuntimeError('tight-cropped mirror unexpectedly reached the dense device-member path')
+            if vol is not None and bool(mirror_plan.tight_cropped):
+                cx0, cx1, cy0, cy1, ct0, ct1 = (int(v) for v in mirror_plan.crop_extent_xyt)
+                # A genuine nonempty 1x1x1 segment is padded beyond the reference
+                # because Slicer reserves a 1x1x1 raster for its empty sentinel.
+                # Ordinary NumPy slicing silently clips that padding and would emit
+                # fewer bytes than the declared header.  Materialize the declared
+                # stored shape, copying only the in-reference intersection.
+                cropped_vol = np.zeros((stored_t, stored_h, stored_w), dtype=np.uint8)
+                src_t0, src_t1 = max(0, ct0), min(int(m_t), int(ct1) + 1)
+                src_y0, src_y1 = max(0, cy0), min(int(m_h), int(cy1) + 1)
+                src_x0, src_x1 = max(0, cx0), min(int(m_w), int(cx1) + 1)
+                if src_t0 < src_t1 and src_y0 < src_y1 and src_x0 < src_x1:
+                    np.copyto(
+                        cropped_vol[
+                            int(src_t0 - ct0):int(src_t1 - ct0),
+                            int(src_y0 - cy0):int(src_y1 - cy0),
+                            int(src_x0 - cx0):int(src_x1 - cx0),
+                        ],
+                        np.asarray(
+                            vol[src_t0:src_t1, src_y0:src_y1, src_x0:src_x1],
+                            dtype=np.uint8,
+                        ),
+                    )
+                vol = cropped_vol
+            step = max(1, int(_nrrd_full_slice_z_chunk(1, stored_w, stored_h, stored_t)))
             with open(m_path, 'wb') as fh:
                 _write_nrrd_ascii_header(
-                    fh, header=header, sizes=(int(m_w), int(m_h), int(m_t)),
+                    fh, header=header, sizes=(stored_w, stored_h, stored_t),
                     dimension=3, data_type='unsigned char', encoding='gzip',
                 )
                 if device_members is not None:
@@ -28958,8 +29852,8 @@ def write_layer_nrrd_with_low_quality_mirrors(
                         else _open_nrrd_payload_writer(fh, threads=pigz_threads)
                     )
                     with writer as payload_writer:
-                        for z0 in range(0, int(m_t), step):
-                            z1 = min(int(m_t), int(z0) + step)
+                        for z0 in range(0, int(stored_t), step):
+                            z1 = min(int(stored_t), int(z0) + step)
                             payload_writer.write(memoryview(vol[z0:z1]).cast('B'))  # type: ignore[index]
         except Exception as exc:
             print(
@@ -28969,6 +29863,7 @@ def write_layer_nrrd_with_low_quality_mirrors(
             write_single_layer_nrrd_from_ref(
                 ref, (int(m_t), int(m_h), int(m_w)), m_path,
                 pigz_threads=pigz_threads, segment_name=segment_name, segment_color=segment_color,
+                tight_crop=bool(tight_crop),
             )
         finally:
             job['volume'] = None
@@ -29022,6 +29917,7 @@ class NrrdLayerSink:
         pigz_threads: int,
         low_quality_specs: Optional[Sequence['LowQualityDownbinSpec']] = None,
         low_quality_root: Optional[Path] = None,
+        tight_crop: bool = False,
     ) -> None:
         self.nrrd_dir = Path(nrrd_dir)
         self.nrrd_dir.mkdir(parents=True, exist_ok=True)
@@ -29044,6 +29940,7 @@ class NrrdLayerSink:
         self.low_quality_specs: List['LowQualityDownbinSpec'] = list(low_quality_specs or [])
         self.low_quality_root = Path(low_quality_root) if low_quality_root is not None else None
         self._lq_manifests: Dict[str, List[Dict[str, object]]] = {}
+        self.tight_crop = bool(tight_crop)
         if self.low_quality_specs and self.low_quality_root is not None:
             for spec in self.low_quality_specs:
                 self._lq_nrrd_dir(spec).mkdir(parents=True, exist_ok=True)
@@ -29095,6 +29992,11 @@ class NrrdLayerSink:
                 'description': getattr(ref, 'description', ''),
                 'backing_shape_tyx': [int(v) for v in getattr(ref, 'shape', (0, 0, 0))],
                 'output_shape_tyx': [int(v) for v in self.output_shape],
+                'stored_shape_tyx': None,
+                'tight_cropped': bool(self.tight_crop),
+                'crop_extent_xyt': None,
+                'reference_image_extent_offset_ijk': None,
+                'empty_segment': None,
                 'exported_axes': '(X, Y, t)',
                 'segment_name': segment_name,
                 'segment_color_rgb': [round(float(c), 6) for c in segment_color],
@@ -29111,6 +30013,7 @@ class NrrdLayerSink:
             # combined write task (write_layer_nrrd_with_low_quality_mirrors) instead of each
             # re-decoding the full-resolution layer store as an independent task.
             lq_mirror_args: List[Tuple[Tuple[int, int, int], Path]] = []
+            lq_manifest_entries: List[Tuple[Tuple[int, int, int], Dict[str, object]]] = []
             for spec in self.low_quality_specs:
                 if self.low_quality_root is None:
                     break
@@ -29121,7 +30024,7 @@ class NrrdLayerSink:
                 )
                 lq_path = self._lq_nrrd_dir(spec) / f'{self.stem}_{unique_suffix}.seg.nrrd'
                 lq_mirror_args.append((lq_shape, lq_path))
-                self._lq_manifests.setdefault(str(spec.token), []).append({
+                lq_manifest_entry: Dict[str, object] = {
                     'filename': lq_path.name,
                     'suffix': unique_suffix,
                     'view_name': getattr(ref, 'view_name', ''),
@@ -29134,36 +30037,75 @@ class NrrdLayerSink:
                     'description': getattr(ref, 'description', ''),
                     'backing_shape_tyx': [int(v) for v in getattr(ref, 'shape', (0, 0, 0))],
                     'output_shape_tyx': [int(v) for v in lq_shape],
+                    'stored_shape_tyx': None,
+                    'tight_cropped': bool(self.tight_crop),
+                    'crop_extent_xyt': None,
+                    'reference_image_extent_offset_ijk': None,
+                    'empty_segment': None,
                     'downbin_value': str(spec.raw_value),
                     'downbin_token': str(spec.token),
                     'downbin_scale': float(spec.scale),
                     'exported_axes': '(X, Y, t)',
                     'segment_name': segment_name,
                     'segment_color_rgb': [round(float(c), 6) for c in segment_color],
-                })
+                }
+                self._lq_manifests.setdefault(str(spec.token), []).append(lq_manifest_entry)
+                lq_manifest_entries.append((lq_shape, lq_manifest_entry))
             def _execute_layer_write() -> Path:
                 # This closure begins on the sink executor, so its count reflects execution
                 # time rather than submission-time queue occupancy. Record that exact value
                 # and pass it through to the mirror/full writer as one immutable decision.
+                resolved_ref = _resolve_live_ref_extent(ref)
+                full_plan = _nrrd_raster_plan(
+                    resolved_ref, self.output_shape, tight_crop=bool(self.tight_crop),
+                )
                 executed_z_shards = int(_nrrd_layer_zshard_count(
-                    ref, int(self.output_shape[0]),
+                    resolved_ref, int(full_plan.stored_shape_tyx[0]),
                 ))
                 with self._lock:
                     manifest_entry['z_shards'] = int(executed_z_shards)
+                    manifest_entry['stored_shape_tyx'] = [int(v) for v in full_plan.stored_shape_tyx]
+                    manifest_entry['tight_cropped'] = bool(full_plan.tight_cropped)
+                    manifest_entry['crop_extent_xyt'] = [int(v) for v in full_plan.crop_extent_xyt]
+                    manifest_entry['reference_image_extent_offset_ijk'] = [
+                        int(v) for v in full_plan.reference_offset_ijk
+                    ]
+                    manifest_entry['empty_segment'] = bool(full_plan.empty_segment)
+                    composed_mirror_ref = dataclasses_replace(
+                        resolved_ref,
+                        segment_extent_ijk=_nrrd_mapped_extent_preserve_empty(
+                            resolved_ref, self.output_shape,
+                        ),
+                        segment_extent_shape_tyx=tuple(int(v) for v in self.output_shape),
+                        segment_extent_source='composed_full_output_extent_for_low_quality_mirror',
+                    )
+                    for lq_shape, lq_entry in lq_manifest_entries:
+                        lq_plan = _nrrd_raster_plan(
+                            composed_mirror_ref, lq_shape, tight_crop=bool(self.tight_crop),
+                        )
+                        lq_entry['stored_shape_tyx'] = [int(v) for v in lq_plan.stored_shape_tyx]
+                        lq_entry['tight_cropped'] = bool(lq_plan.tight_cropped)
+                        lq_entry['crop_extent_xyt'] = [int(v) for v in lq_plan.crop_extent_xyt]
+                        lq_entry['reference_image_extent_offset_ijk'] = [
+                            int(v) for v in lq_plan.reference_offset_ijk
+                        ]
+                        lq_entry['empty_segment'] = bool(lq_plan.empty_segment)
                 if lq_mirror_args:
                     return write_layer_nrrd_with_low_quality_mirrors(
-                        ref, self.output_shape, out_path, lq_mirror_args,
+                        resolved_ref, self.output_shape, out_path, lq_mirror_args,
                         pigz_threads=self.pigz_threads,
                         segment_name=segment_name,
                         segment_color=segment_color,
                         z_shards=int(executed_z_shards),
+                        tight_crop=bool(self.tight_crop),
                     )
                 return write_single_layer_nrrd_from_ref(
-                    ref, self.output_shape, out_path,
+                    resolved_ref, self.output_shape, out_path,
                     pigz_threads=self.pigz_threads,
                     segment_name=segment_name,
                     segment_color=segment_color,
                     z_shards=int(executed_z_shards),
+                    tight_crop=bool(self.tight_crop),
                 )
 
             fut = self.executor.submit(_execute_layer_write)
@@ -29220,6 +30162,7 @@ class NrrdLayerSink:
                     'exported_axes': '(X, Y, t)',
                     'output_shape_tyx': [int(v) for v in lq_shape],
                     'full_quality_output_shape_tyx': [int(v) for v in self.output_shape],
+                    'tight_crop_enabled': bool(self.tight_crop),
                     'layer_count': len(entries),
                     'layers': entries,
                     'notes': [
@@ -29228,6 +30171,7 @@ class NrrdLayerSink:
                         'Each NRRD is one uint8 binary mask in source output geometry (X, Y, t), downbinned.',
                         'v13.2.3: each file is a 3D Slicer segmentation (.seg.nrrd) sharing its full-quality layer\'s segment name and color.',
                         'Layer suffixes match the full-quality layers, so each low-quality layer maps 1:1 to its full-quality layer.',
+                        'When tight_crop_enabled is true, stored_shape_tyx and reference_image_extent_offset_ijk reconstruct each raster in output_shape_tyx.',
                     ],
                 }, indent=2))
         if not manifest_layers:
@@ -29237,6 +30181,7 @@ class NrrdLayerSink:
             'layout': 'one_single_layer_nrrd_per_component',
             'exported_axes': '(X, Y, t)',
             'output_shape_tyx': [int(v) for v in self.output_shape],
+            'tight_crop_enabled': bool(self.tight_crop),
             'layer_count': len(manifest_layers),
             'layers': manifest_layers,
             'notes': [
@@ -29245,6 +30190,7 @@ class NrrdLayerSink:
                 'Files can be recombined (union) or omitted after a full run to build a custom volume without rerunning.',
                 'YOLO layers are cleaned masks before interpolation bridges; bridge layers contain only voxels added by that pass.',
                 'Global_final_output is the final segmentation after all postprocessing and is not intended for recomposition.',
+                'When tight_crop_enabled is true, stored_shape_tyx and reference_image_extent_offset_ijk reconstruct each raster in output_shape_tyx.',
             ],
         }
         manifest_path.write_text(json.dumps(manifest, indent=2))
@@ -29870,6 +30816,163 @@ def _nrrd_layer_zero_skip_window(
     if hi <= lo:
         return (0, 0)
     return (int(lo), int(hi))
+
+
+def _write_tight_cropped_nrrd_layer_payload(
+    ref: NrrdLayerRef,
+    output_shape: Tuple[int, int, int],
+    plan: NrrdRasterPlan,
+    payload_writer: object,
+    *,
+    z_chunk: int,
+    sparse_consumer: Optional[Callable[[int, int, int, np.ndarray], None]] = None,
+    z_start: int = 0,
+    z_stop: Optional[int] = None,
+    fill_workers_override: Optional[int] = None,
+) -> None:
+    """Restore in full coordinates while emitting only the N21 stored crop."""
+    full_t, full_h, full_w = (int(v) for v in output_shape)
+    stored_t, stored_h, stored_w = (int(v) for v in plan.stored_shape_tyx)
+    crop_x0, _crop_x1, crop_y0, _crop_y1, crop_t0, _crop_t1 = (
+        int(v) for v in plan.crop_extent_xyt
+    )
+    local_begin = int(np.clip(int(z_start), 0, stored_t))
+    local_end = stored_t if z_stop is None else int(np.clip(int(z_stop), local_begin, stored_t))
+    if local_end <= local_begin:
+        return
+    src: Optional[object] = None
+    try:
+        src = _open_nrrd_layer_ref(ref)
+        _madvise_array_mmap(src, 'MADV_SEQUENTIAL')
+        in_t, in_h, in_w = _volume_shape_tuple(src)
+
+        def _scatter_crop(
+            dst: np.ndarray,
+            global_y0: int,
+            global_x0: int,
+            crop: np.ndarray,
+        ) -> None:
+            global_y1 = int(global_y0) + int(crop.shape[0])
+            global_x1 = int(global_x0) + int(crop.shape[1])
+            iy0 = max(int(crop_y0), int(global_y0))
+            iy1 = min(int(crop_y0) + int(stored_h), int(global_y1))
+            ix0 = max(int(crop_x0), int(global_x0))
+            ix1 = min(int(crop_x0) + int(stored_w), int(global_x1))
+            if iy0 >= iy1 or ix0 >= ix1:
+                return
+            src_view = np.asarray(crop)[
+                int(iy0 - global_y0):int(iy1 - global_y0),
+                int(ix0 - global_x0):int(ix1 - global_x0),
+            ]
+            dst_view = dst[
+                int(iy0 - crop_y0):int(iy1 - crop_y0),
+                int(ix0 - crop_x0):int(ix1 - crop_x0),
+            ]
+            np.bitwise_or(dst_view, np.asarray(src_view, dtype=np.uint8), out=dst_view)
+
+        def _fill_local_slice(local_z: int, dst: np.ndarray) -> None:
+            dst.fill(np.uint8(0))
+            if bool(plan.empty_segment):
+                return
+            global_z = int(crop_t0) + int(local_z)
+            if int(global_z) < 0 or int(global_z) >= int(full_t):
+                return
+            source_indices = _restore_source_indices_for_output_z(
+                int(in_t), int(full_t), int(global_z),
+            )
+            if isinstance(src, RawBBoxMaskStore):
+                for source_z in source_indices:
+                    decoded = src.decode_slice_crop(int(source_z), dtype=np.uint8)
+                    if decoded is None:
+                        continue
+                    sy0, sx0, sy1, sx1, source_crop = decoded
+                    if (int(in_h), int(in_w)) == (int(full_h), int(full_w)):
+                        _scatter_crop(dst, int(sy0), int(sx0), source_crop)
+                    else:
+                        restored = _resize_sparse_binary_crop_to_output_region(
+                            source_crop,
+                            source_shape=(int(in_h), int(in_w)),
+                            source_bbox=(int(sy0), int(sx0), int(sy1), int(sx1)),
+                            output_shape=(int(full_h), int(full_w)),
+                        )
+                        if restored is not None:
+                            ry0, rx0, _ry1, _rx1, restored_crop = restored
+                            _scatter_crop(dst, int(ry0), int(rx0), restored_crop)
+                return
+            if (int(in_t), int(in_h), int(in_w)) == (int(full_t), int(full_h), int(full_w)):
+                valid_y0 = max(0, int(crop_y0))
+                valid_y1 = min(int(full_h), int(crop_y0) + int(stored_h))
+                valid_x0 = max(0, int(crop_x0))
+                valid_x1 = min(int(full_w), int(crop_x0) + int(stored_w))
+                if valid_y0 < valid_y1 and valid_x0 < valid_x1:
+                    np.copyto(
+                        dst[
+                            int(valid_y0 - crop_y0):int(valid_y1 - crop_y0),
+                            int(valid_x0 - crop_x0):int(valid_x1 - crop_x0),
+                        ],
+                        np.asarray(
+                            src[int(global_z), valid_y0:valid_y1, valid_x0:valid_x1],
+                            dtype=np.uint8,
+                        ),
+                    )
+                return
+            full_plane = _read_layer_slice_in_output_shape(
+                src, (int(full_t), int(full_h), int(full_w)), int(global_z),
+            )
+            valid_y0 = max(0, int(crop_y0))
+            valid_y1 = min(int(full_h), int(crop_y0) + int(stored_h))
+            valid_x0 = max(0, int(crop_x0))
+            valid_x1 = min(int(full_w), int(crop_x0) + int(stored_w))
+            if valid_y0 < valid_y1 and valid_x0 < valid_x1:
+                np.copyto(
+                    dst[
+                        int(valid_y0 - crop_y0):int(valid_y1 - crop_y0),
+                        int(valid_x0 - crop_x0):int(valid_x1 - crop_x0),
+                    ],
+                    np.asarray(full_plane[valid_y0:valid_y1, valid_x0:valid_x1], dtype=np.uint8),
+                )
+
+        local_chunk = max(1, min(int(z_chunk), int(local_end - local_begin)))
+        fill_workers = (
+            int(nrrd_fill_workers())
+            if fill_workers_override is None
+            else max(1, int(fill_workers_override))
+        )
+        write_nonzero = getattr(payload_writer, 'write_owned_known_nonzero', None)
+        if not callable(write_nonzero):
+            write_nonzero = payload_writer.write
+        can_write_zeros = callable(getattr(payload_writer, 'write_zeros', None))
+        for local0 in range(int(local_begin), int(local_end), int(local_chunk)):
+            local1 = min(int(local_end), int(local0) + int(local_chunk))
+            count = int(local1 - local0)
+            block = np.zeros((count, stored_h, stored_w), dtype=np.uint8)
+
+            def _fill_one(i: int) -> None:
+                _fill_local_slice(int(local0) + int(i), block[int(i)])
+
+            _nrrd_parallel_fill_indices(
+                int(count), _fill_one,
+                requested_workers=min(int(fill_workers), int(count)),
+            )
+            if sparse_consumer is not None:
+                for i in range(int(count)):
+                    x, y, w, h = (int(v) for v in cv2.boundingRect(block[int(i)]))
+                    if w > 0 and h > 0:
+                        sparse_consumer(
+                            int(crop_t0) + int(local0) + int(i),
+                            int(crop_y0) + int(y),
+                            int(crop_x0) + int(x),
+                            np.ascontiguousarray(block[int(i), y:y + h, x:x + w]),
+                        )
+            if not bool(np.any(block)) and bool(can_write_zeros):
+                payload_writer.write_zeros(int(block.nbytes))
+            else:
+                write_nonzero(block)
+    finally:
+        if src is not None:
+            _madvise_array_mmap(src, 'MADV_DONTNEED')
+            _close_nrrd_layer_source(src)
+            _drop_nrrd_raw_store_chunks_ram_cache(src)
 
 
 def _write_one_decomposed_nrrd_layer_payload(
@@ -30638,20 +31741,35 @@ def write_low_quality_overlay_video(
     out_path: Path,
     fps: float,
     show_progress: bool = True,
+    publication_root: Optional[Path] = None,
 ) -> Path:
     t_dim, h_dim, w_dim = volume_gray.shape
     assert mask_u8.shape == (t_dim, h_dim, w_dim)
-    proc = ffmpeg_h264_rgb_writer(out_path, int(w_dim), int(h_dim), float(fps))
-    # v13.3.8 (A5): reused RGB buffer + bbox-restricted blend + memoryview pipe writes.
-    frame_buf = np.empty((int(h_dim), int(w_dim), 3), dtype=np.uint8)
+    stage_path, stage_dir = _atomic_publication_stage_path(
+        Path(out_path), publication_root=publication_root,
+    )
     try:
-        assert proc.stdin is not None
-        for t in tqdm(range(int(t_dim)), desc=f'Writing low-quality overlay ({out_path.name})', disable=not show_progress):
-            frame = _gray_frame_into_rgb_buffer(volume_gray[int(t)], frame_buf)
-            _overlay_blend_blue_inplace(frame, mask_u8[int(t)])
-            proc.stdin.write(memoryview(frame).cast('B'))
+        proc = ffmpeg_h264_rgb_writer(stage_path, int(w_dim), int(h_dim), float(fps))
+        # v13.3.8 (A5): reused RGB buffer + bbox-restricted blend + memoryview pipe writes.
+        frame_buf = np.empty((int(h_dim), int(w_dim), 3), dtype=np.uint8)
+        try:
+            assert proc.stdin is not None
+            for t in tqdm(range(int(t_dim)), desc=f'Writing low-quality overlay ({out_path.name})', disable=not show_progress):
+                frame = _gray_frame_into_rgb_buffer(volume_gray[int(t)], frame_buf)
+                _overlay_blend_blue_inplace(frame, mask_u8[int(t)])
+                proc.stdin.write(memoryview(frame).cast('B'))
+        finally:
+            close_ffmpeg_writer(proc)
+        _publish_staged_file_atomically(stage_path, Path(out_path))
     finally:
-        close_ffmpeg_writer(proc)
+        try:
+            stage_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            stage_dir.rmdir()
+        except OSError:
+            pass
     return out_path
 
 
@@ -30660,19 +31778,34 @@ def write_low_quality_binary_video(
     out_path: Path,
     fps: float,
     show_progress: bool = True,
+    publication_root: Optional[Path] = None,
 ) -> Path:
     t_dim, h_dim, w_dim = mask_u8.shape
-    proc = ffmpeg_h264_gray_writer(out_path, int(w_dim), int(h_dim), float(fps))
-    # v13.3.8 (A5): reused frame buffer + memoryview pipe writes; the mask volumes are 0/1
-    # by construction, so multiply-by-255 into the buffer replaces the compare+cast temps.
-    frame_buf = np.empty((int(h_dim), int(w_dim)), dtype=np.uint8)
+    stage_path, stage_dir = _atomic_publication_stage_path(
+        Path(out_path), publication_root=publication_root,
+    )
     try:
-        assert proc.stdin is not None
-        for t in tqdm(range(int(t_dim)), desc=f'Writing low-quality binary ({out_path.name})', disable=not show_progress):
-            np.multiply(np.asarray(mask_u8[int(t)]), 255, out=frame_buf)
-            proc.stdin.write(memoryview(frame_buf).cast('B'))
+        proc = ffmpeg_h264_gray_writer(stage_path, int(w_dim), int(h_dim), float(fps))
+        # v13.3.8 (A5): reused frame buffer + memoryview pipe writes; the mask volumes are
+        # 0/1, so multiply-by-255 into the buffer replaces compare+cast temporaries.
+        frame_buf = np.empty((int(h_dim), int(w_dim)), dtype=np.uint8)
+        try:
+            assert proc.stdin is not None
+            for t in tqdm(range(int(t_dim)), desc=f'Writing low-quality binary ({out_path.name})', disable=not show_progress):
+                np.multiply(np.asarray(mask_u8[int(t)]), 255, out=frame_buf)
+                proc.stdin.write(memoryview(frame_buf).cast('B'))
+        finally:
+            close_ffmpeg_writer(proc)
+        _publish_staged_file_atomically(stage_path, Path(out_path))
     finally:
-        close_ffmpeg_writer(proc)
+        try:
+            stage_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            stage_dir.rmdir()
+        except OSError:
+            pass
     return out_path
 
 
@@ -30742,10 +31875,18 @@ def save_single_low_quality_output(
         binary_path = spec_dir / f'{stem}_Binary_LowQuality_{spec.token}.mp4'
 
         def _write_lq_overlay() -> Path:
-            return write_low_quality_overlay_video(gray_lq, mask_lq, overlay_path, fps_lq, show_progress=show_progress)
+            return write_low_quality_overlay_video(
+                gray_lq, mask_lq, overlay_path, fps_lq,
+                show_progress=show_progress,
+                publication_root=out_dir,
+            )
 
         def _write_lq_binary() -> Path:
-            return write_low_quality_binary_video(mask_lq, binary_path, fps_lq, show_progress=show_progress)
+            return write_low_quality_binary_video(
+                mask_lq, binary_path, fps_lq,
+                show_progress=show_progress,
+                publication_root=out_dir,
+            )
 
         # v13.2.1: the low-quality NRRD decomposition is produced per component layer by the
         # NrrdLayerSink as views complete, not here. Only the distribution videos are written below.
@@ -30924,6 +32065,8 @@ def collect_pipeline_output_futures(
         overlay_path,
         fps,
         show_progress=show_progress,
+        scratch_dir=nrrd_temp_dir,
+        publication_root=out_dir,
     ))
     result_paths["overlay"] = overlay_path
 
@@ -30940,7 +32083,15 @@ def collect_pipeline_output_futures(
             binary_pattern = _tag_frame_pattern(binary_pattern, tag)
         binary_video_path = out_dir / f"{stem}_Binary{tag_suffix}.mkv"
         futures.append(executor.submit(write_binary_tiff_sequence_from_pattern, mask_u8, binary_pattern, int(frame_workers), show_progress))
-        futures.append(executor.submit(write_binary_video_from_mask_volume, mask_u8, binary_video_path, fps, show_progress))
+        futures.append(executor.submit(
+            write_binary_video_from_mask_volume,
+            mask_u8,
+            binary_video_path,
+            fps,
+            show_progress=show_progress,
+            scratch_dir=nrrd_temp_dir,
+            publication_root=out_dir,
+        ))
         result_paths["binary_tiff_dir"] = binary_pattern.parent
         result_paths["binary_video"] = binary_video_path
 
@@ -31308,6 +32459,8 @@ def main() -> None:
     # NRRD decomposition mirrors the full-quality layers (one downbinned single-layer NRRD per
     # component layer) on the same view-completion schedule, rather than one combined tail volume.
     nrrd_layers_needed = bool(args.save_nrrd)
+    if bool(args.save_nrrd_tight_crop) and not bool(args.save_nrrd):
+        raise ValueError('--save_nrrd_tight_crop requires --save_nrrd')
     troubleshooting_outputs_enabled = bool(args.troubleshooting)
     # v12.2.0 --troubleshooting creates overlay MKVs only. Temporary scratch retention is a
     # separate hidden maintenance escape hatch so troubleshooting no longer changes cleanup semantics.
@@ -31355,6 +32508,7 @@ def main() -> None:
             pigz_threads=nrrd_single_layer_pigz_threads(),
             low_quality_specs=sink_low_quality_specs,
             low_quality_root=(out_dir / 'low_quality'),
+            tight_crop=bool(args.save_nrrd_tight_crop),
         ))
     else:
         set_nrrd_layer_sink(None)
@@ -31594,6 +32748,16 @@ def main() -> None:
         'ISA-L, or zlib codec via YOLO_TTA_NRRD_MEMBER_CODEC; global z-shard counts are resolved '
         'at sink execution against the shared band capacity, and the ordered shard queue defaults '
         'to 32 items.'
+    )
+    spec_notes.append(
+        'v13.3.18 C11/C12/C13/C14/N21: the multi-GPU scheduler keeps only a bounded issued '
+        'window, prioritizes parent-unlocking work, and splits a full-frame lease only at the '
+        'actual dispatch tail; deferred device unions publish '
+        'as soon as their D2H Future retires; the single-angle Radial path pipelines projection '
+        'and fuses YOLO+bridge layers; sparse topology unions are compiled in larger batches and '
+        'G5 may use idle GPUs; FFV1 shards remain in scratch and videos enter publication only '
+        'after an atomic replace; '
+        f'tight cropped segmentation rasters are {"enabled" if bool(args.save_nrrd_tight_crop) else "disabled"}.'
     )
     spec_notes.append(
         'v13.3.2 (R5/R6/R10/R14/R15/R21): CPU tilted rendering hoists all frame-invariant shear '
@@ -32637,6 +33801,10 @@ def main() -> None:
             precleaned_slice_cleanup=bool(single_angle_streaming_cleanup_active),
             hole_fill_done_on_device=bool(hole_fill_done_on_device),
             slice_meta=slice_meta_holder,
+            fuse_radial_component_layers=bool(
+                single_angle_gpu_fastpath_active
+                and fused_single_angle_radial_component_layer_enabled()
+            ),
         )
         view_processing_futures[fut] = key
 
@@ -33130,7 +34298,152 @@ def main() -> None:
     mgpu_tasks_by_id: Dict[int, Dict[str, object]] = {}
     mgpu_results_collected = 0
     mgpu_total_tasks = 0
+    mgpu_dispatched_tasks = 0
+    mgpu_next_dynamic_task_id = 0
+    mgpu_pending_task_ids: deque = deque()
     mgpu_result_dir = temp_dir / 'mgpu_results'
+
+    def _mgpu_fullframe_parent_key(task: Dict[str, object]) -> Optional[Tuple[str, str]]:
+        if str(task.get('kind', '')) != 'fullframe':
+            return None
+        view_obj = task.get('view')
+        view_name = getattr(view_obj, 'name', None)
+        if view_name is None:
+            return None
+        return (str(task.get('model_name', '')), str(view_name))
+
+    def _split_one_mgpu_dispatch_tail(
+        issue_slots: int,
+        preferred_parent: Optional[Tuple[str, str]] = None,
+    ) -> bool:
+        """Split one still-central full-frame lease only when issue reaches the tail."""
+        nonlocal mgpu_total_tasks, mgpu_next_dynamic_task_id
+        if int(gpu_device_count) <= 1 or int(issue_slots) <= 0:
+            return False
+        pending_ids = [int(v) for v in mgpu_pending_task_ids]
+        # This is the actual central-queue tail, not a per-view construction-time guess:
+        # every pending descriptor would otherwise be issued by this refill.
+        if not pending_ids or len(pending_ids) > int(issue_slots):
+            return False
+        parent_pending_counts: Dict[Tuple[str, str], int] = {}
+        for task_id in pending_ids:
+            parent_key = _mgpu_fullframe_parent_key(mgpu_tasks_by_id[int(task_id)])
+            if parent_key is not None:
+                parent_pending_counts[parent_key] = int(parent_pending_counts.get(parent_key, 0)) + 1
+        eligible: List[Tuple[int, int, int, int, int]] = []
+        for position, task_id in enumerate(pending_ids):
+            task = mgpu_tasks_by_id[int(task_id)]
+            if str(task.get('kind', '')) != 'fullframe' or bool(task.get('tail_adapted', False)):
+                continue
+            midpoint = mgpu_tail_split_point(
+                int(task.get('slice_start', 0)),
+                int(task.get('slice_count', 0)),
+                int(args.batch),
+            )
+            if midpoint is None:
+                continue
+            parent_key = _mgpu_fullframe_parent_key(task)
+            remaining = int(fullframe_remaining.get(parent_key, 2 ** 31 - 1)) if parent_key is not None else 2 ** 31 - 1
+            # Preserve the lease most likely to unlock parent postprocessing.  In
+            # particular, splitting preferred_parent here would turn its sole
+            # pending lease into two and make _pop_mgpu_pending_task_id skip it.
+            eligible.append((
+                1 if parent_key == preferred_parent else 0,
+                1 if parent_key is not None and int(parent_pending_counts.get(parent_key, 0)) == 1 else 0,
+                -int(remaining), int(position), int(midpoint),
+            ))
+        if not eligible:
+            return False
+        _preferred, _sole_pending, _negative_remaining, position, midpoint = min(eligible)
+        original_id = int(pending_ids[int(position)])
+        original = mgpu_tasks_by_id[original_id]
+        original_start = int(original.get('slice_start', 0))
+        original_stop = int(original_start) + int(original.get('slice_count', 0))
+        child_id = int(mgpu_next_dynamic_task_id)
+        mgpu_next_dynamic_task_id += 1
+        child = dict(original)
+        original['slice_count'] = int(midpoint - original_start)
+        original['render_workers'] = max(
+            1, min(int(original.get('render_workers', 1)), int(midpoint - original_start)),
+        )
+        original['tail_adapted'] = True
+        original['tail_child_task_id'] = int(child_id)
+        child['task_id'] = int(child_id)
+        child['slice_start'] = int(midpoint)
+        child['slice_count'] = int(original_stop - midpoint)
+        child['render_workers'] = max(
+            1, min(int(child.get('render_workers', 1)), int(original_stop - midpoint)),
+        )
+        child['tail_adapted'] = True
+        child['tail_parent_task_id'] = int(original_id)
+        if str(child.get('result_mode', 'file')) != 'direct_union':
+            for field_name in ('result_mask_path', 'result_conf_path'):
+                raw_path = child.get(field_name)
+                if raw_path:
+                    path_obj = Path(str(raw_path))
+                    child[field_name] = str(path_obj.with_name(
+                        f'{path_obj.name}.tail{int(child_id)}'
+                    ))
+        mgpu_tasks_by_id[int(child_id)] = child
+        pending_ids.insert(int(position) + 1, int(child_id))
+        mgpu_pending_task_ids.clear()
+        mgpu_pending_task_ids.extend(pending_ids)
+        mgpu_total_tasks += 1
+        parent_key = _mgpu_fullframe_parent_key(original)
+        if parent_key is not None:
+            fullframe_remaining[parent_key] = int(fullframe_remaining.get(parent_key, 0)) + 1
+        print(
+            f'v13.3.18 (C11): dispatch tail split task {original_id} '
+            f'[{original_start}:{original_stop}] -> [{original_start}:{midpoint}] + '
+            f'[{midpoint}:{original_stop}] as task {child_id}.'
+        )
+        return True
+
+    def _pop_mgpu_pending_task_id(
+        preferred_parent: Optional[Tuple[str, str]] = None,
+    ) -> int:
+        """Prefer a last-unissued full-frame lease that can unlock its parent."""
+        pending_ids = [int(v) for v in mgpu_pending_task_ids]
+        parent_pending_counts: Dict[Tuple[str, str], int] = {}
+        for task_id in pending_ids:
+            parent_key = _mgpu_fullframe_parent_key(mgpu_tasks_by_id[int(task_id)])
+            if parent_key is not None:
+                parent_pending_counts[parent_key] = int(parent_pending_counts.get(parent_key, 0)) + 1
+        unlock_candidates: List[Tuple[int, int, int, int]] = []
+        for position, task_id in enumerate(pending_ids):
+            task = mgpu_tasks_by_id[int(task_id)]
+            parent_key = _mgpu_fullframe_parent_key(task)
+            if parent_key is None or int(parent_pending_counts.get(parent_key, 0)) != 1:
+                continue
+            unlock_candidates.append((
+                0 if parent_key == preferred_parent else 1,
+                int(fullframe_remaining.get(parent_key, 2 ** 31 - 1)),
+                int(position),
+                int(task_id),
+            ))
+        if not unlock_candidates:
+            return int(mgpu_pending_task_ids.popleft())
+        _preferred, _remaining, _position, selected_id = min(unlock_candidates)
+        mgpu_pending_task_ids.remove(int(selected_id))
+        return int(selected_id)
+
+    def _dispatch_mgpu_inference_window(
+        preferred_parent: Optional[Tuple[str, str]] = None,
+    ) -> None:
+        """C11: issue a bounded window, adapting only its actual inference tail."""
+        nonlocal mgpu_dispatched_tasks
+        if gpu_task_queue is None:
+            return
+        per_gpu = max(1, _env_int('YOLO_TTA_MGPU_DISPATCH_WINDOW_PER_GPU', 2))
+        target = max(1, int(gpu_device_count) * int(per_gpu))
+        in_flight = max(0, int(mgpu_dispatched_tasks) - int(mgpu_results_collected))
+        while mgpu_pending_task_ids and int(in_flight) < int(target):
+            issue_slots = int(target) - int(in_flight)
+            _split_one_mgpu_dispatch_tail(int(issue_slots), preferred_parent)
+            task_id = _pop_mgpu_pending_task_id(preferred_parent)
+            gpu_task_queue.put(mgpu_tasks_by_id[task_id])
+            mgpu_dispatched_tasks += 1
+            in_flight += 1
 
     def _ensure_source_volume_file_backed() -> Tuple[str, Tuple[int, int, int], str]:
         wait_for_volume_ready(volume_rgb)
@@ -33330,9 +34643,14 @@ def main() -> None:
                 m_out = np.asarray(aug_job.aff.M_out_to_src, dtype=np.float32)
                 out_size = int(aug_job.aff.out_size)
                 job_id = str(aug_job.aug_id)
-                starts = list(range(0, max(1, n_slices), int(slice_chunk))) or [0]
+                # C11 construction keeps every profiled steady-state lease untouched.
+                # A still-central lease may split later, only when dispatch reaches the
+                # actual global inference tail; tiles are never split.
+                ranges = mgpu_fullframe_task_ranges(
+                    int(n_slices), int(slice_chunk), int(gpu_device_count), int(args.batch),
+                )
                 key_fv = (str(model_name), str(view.name))
-                fullframe_subtasks_per_view[key_fv] = int(fullframe_subtasks_per_view.get(key_fv, 0)) + len(starts)
+                fullframe_subtasks_per_view[key_fv] = int(fullframe_subtasks_per_view.get(key_fv, 0)) + len(ranges)
                 prefix = f'{view.name}__{job_id}'
                 if mgpu_direct_union_active:
                     # v13.3.1 (R4): pre-create the shared per-view union (and confmap) so every
@@ -33343,15 +34661,15 @@ def main() -> None:
                 m_out = np.asarray(tile_job.M_out_to_src, dtype=np.float32)
                 out_size = int(tile_job.out_size)
                 job_id = str(tile_job.tile_id)
-                starts = [0]
+                ranges = [(0, int(n_slices))]
                 prefix = f'tile__{view.name}__{job_id}'
             task_processing_shape = view_processing_volume_shape(view, int(out_size))
             m_out_processing = output_to_view_processing_affine(view, m_out, int(out_size))
             processing_min_radius = view_processing_min_radius(
                 view, float(args.min_radius), task_processing_shape[-2:],
             )
-            for chunk_idx, s0 in enumerate(starts):
-                count = (min(int(slice_chunk), n_slices - int(s0)) if str(kind) == 'fullframe' else n_slices)
+            for chunk_idx, (s0, s1) in enumerate(ranges):
+                count = int(s1) - int(s0)
                 # Size the render pool to this worker's CPU share (NOT streaming_prediction_source_workers,
                 # which returns the full machine CPU count and would have each of N workers spin up an
                 # N-times-too-large render pool). With cv2.setNumThreads(1) these are real render threads.
@@ -33392,18 +34710,20 @@ def main() -> None:
                 mgpu_tasks_by_id[int(next_task_id)] = task
                 next_task_id += 1
         mgpu_total_tasks = int(next_task_id)
+        mgpu_next_dynamic_task_id = int(next_task_id)
         # A full-frame view is finalized only after every (angle x slice-chunk) result for it has been
         # unioned, so override fullframe_remaining with the per-view sub-task count.
         for key_fv, cnt in fullframe_subtasks_per_view.items():
             fullframe_remaining[key_fv] = int(cnt)
         pending_prediction_build_jobs.clear()
 
+        mgpu_pending_task_ids.extend(range(int(mgpu_total_tasks)))
+        _dispatch_mgpu_inference_window()
         print(
-            f'{mgpu_total_tasks} inference task(s) queued to the GPU workers (full-frame volumes '
-            f'slice-chunked at {slice_chunk} slices for cross-GPU load balancing).'
+            f'v13.3.18 (C11): {mgpu_total_tasks} inference task(s) retained in a bounded '
+            f'central dispatch window (normal full-frame chunk={slice_chunk}; eligible '
+            'still-central leases split only when dispatch reaches the global tail; tiles remain whole).'
         )
-        for tid in range(mgpu_total_tasks):
-            gpu_task_queue.put(mgpu_tasks_by_id[tid])
 
     def _finalize_fullframe_view_after_worker(model_name_s: str, view: ViewInfo) -> None:
         remaining_key = (str(model_name_s), str(view.name))
@@ -33564,6 +34884,10 @@ def main() -> None:
             )
         task = mgpu_tasks_by_id[int(msg['task_id'])]
         stats = dict(msg.get('stats') or {})
+        # Refill before scheduler-side memmap union/postprocess so a worker does not wait
+        # behind CPU handling of the result that just freed its window slot. Prefer the
+        # current parent when its last unissued lease can unlock postprocessing.
+        _dispatch_mgpu_inference_window(_mgpu_fullframe_parent_key(task))
         if str(task['kind']) == 'fullframe':
             _handle_fullframe_worker_result(task, stats)
         else:
