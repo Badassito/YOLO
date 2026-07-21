@@ -2,8 +2,27 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the GPT-5.6-Ultra v13.3.18_SLURM implementation. It is derived from
-GPT-5.6-Ultra_v13.3.17_SLURM.py by COPY + targeted C11/C12/C13/C14/N21 edits.
+This is the GPT-5.6-Ultra v14.0.0_SLURM implementation. It is derived from
+GPT-5.6-Ultra_v13.3.18_SLURM.py by COPY + a conservative centerline-guided
+post-union filtering stage.
+  - v14.0.0 C15 snapshots the untouched source-geometry union as pass 0, then
+    runs a bounded number of accurate VMTK-centerline passes before smoothing.
+    VMTK's fast network extractor is used only to auto-detect endpoints; the
+    radius-bearing result comes from vtkvmtkPolyDataCenterlines.
+  - v14.0.0 C16 tests expanded radii strictly in each centerline tangent-normal
+    plane, clusters evidence along the centerline without a short slice-duration
+    cap, densifies across every crossed source slice, and batch-applies only whole
+    2D component decisions after analysis. Deletion is an explicit opt-in because
+    complete legitimate-branch coverage cannot be proven from a corrupted union;
+    the default is audit-first and does not mutate the union.
+    A component containing a protected centerline is never deleted wholesale;
+    its suspected basin is written to a separate watershed-candidate layer.
+  - v14.0.0 N22 writes pass-0/result checkpoints plus sparse removed-component
+    and watershed-candidate audit NRRDs. Audit-only runs do not enable the much
+    larger legacy per-view NRRD decomposition; manifest roles prevent checkpoints,
+    subtractive deltas, and marker layers from being accidentally unioned together.
+
+Inherited from v13.3.18:
   - v13.3.18 C11 leaves the steady-state multi-GPU task size alone, bounds the
     centrally issued inference window, splits a still-central full-frame lease only
     when dispatch reaches the actual global tail, prioritizes parent-unlocking work,
@@ -918,6 +937,7 @@ the v12.2.1-v12.2.14 performance patches) introduced the following v13.0.0 chang
 
 Dependencies (Python):
   pip install opencv-python numpy scipy tifffile tqdm ultralytics
+  # Required for default accurate v14 filtering; optional for legacy/pass-through runs (Python 3.12+): pip install "vmtk>=1.5.0"
   # Optional CPU acceleration: numba for no-GIL interpolation seed-planning kernels.
   # Optional GPU acceleration: cupy-cuda12x for cupyx.scipy.ndimage smoothing only; final Radial/Tilted backprojection is CPU-only in v12.2.11.
   # --save_nrrd uses the built-in streaming NRRD writer; pynrrd is no longer required for default exports.
@@ -1165,6 +1185,22 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--voxel_volume", action="store_true", help="Count white voxels in the final binary output after restoration to native input geometry and save the value to the summary text file")
     p.add_argument("--enable_3d_void_fill", action="store_true",
                    help="Apply one final 3D enclosed-void fill after the global union. Disabled by default")
+    p.add_argument("--centerline_filter_passes", default=2, type=int,
+                   help="Maximum v14 centerline-guided post-union passes. Pass 0 is always the untouched audit checkpoint; 0 disables both filtering and its audit NRRDs")
+    p.add_argument("--centerline_filter_backend", default="vmtk", choices=["auto", "vmtk", "off"],
+                   help="Centerline backend. vmtk (default) uses accurate VMTK centerlines and safely passes through if unavailable; auto permits a marker-only geometric fallback; off disables filtering")
+    p.add_argument("--centerline_auto_remove", action="store_true",
+                   help="Opt in to removing whole unprotected 2D components that satisfy every exact-centerline and temporal guard. The conservative default leaves the union unchanged and writes suspect watershed-marker layers because complete branch coverage cannot be proven from a corrupted union")
+    p.add_argument("--centerline_radius_factor", default=2.5, type=float, metavar="X",
+                   help="Flag foreground that reaches the circle of radius X times VMTK's local maximum-inscribed-sphere radius in the strict tangent-normal 2D plane")
+    p.add_argument("--centerline_temporal_context", default=8, type=int,
+                   help="Clean source slices required on each side before an unprotected 2D component may be removed. Centerline anomaly runs themselves have no duration cap")
+    p.add_argument("--centerline_surface_max_dim", default=512, type=int,
+                   help="Maximum axis of the block-max-pooled foreground crop supplied to VMTK; bounds centerline extraction without striding away thin branches")
+    p.add_argument("--centerline_surface_points", default=5000, type=int,
+                   help="Approximate topology-preserving surface point target used before automatic VMTK endpoint and accurate centerline extraction")
+    p.add_argument("--centerline_vmtk_timeout", default=900.0, type=float,
+                   help="Seconds allowed for isolated VMTK extraction per pass before preserving the current union and using the safe fallback/stop behavior")
     p.add_argument("--gaussian_smoothing", nargs="?", const=3.0, default=None, type=float, metavar="SIGMA",
                    help="Final 3D Gaussian smoothing sigma in voxel units. Unset uses default 3.0 when smoothing is activated by either Gaussian flag; explicitly set 0 to disable")
     p.add_argument("--gaussian_smoothing_passes", default=None, type=int,
@@ -19581,6 +19617,1859 @@ def assemble_final_union_after_view_union(
 
 
 # --------------------------
+# v14 centerline-guided final-union filtering
+# --------------------------
+
+
+@dataclass(frozen=True)
+class V14CenterlineSamples:
+    """Centerline samples in source ``(t,Y,X)`` voxel coordinates.
+
+    ``branch_ids`` identify VMTK polyline-cell occurrences.  VMTK may repeat a
+    common trunk in several root-to-target cells; that is intentional here because
+    each occurrence carries an unambiguous local tangent for the strict 2D plane.
+    """
+
+    points_tyx: np.ndarray
+    tangents_tyx: np.ndarray
+    radii: np.ndarray
+    branch_ids: np.ndarray
+    arc_indices: np.ndarray
+    backend: str
+    endpoint_count: int
+    automatic_removal_allowed: bool
+    details: Dict[str, object] = field(default_factory=dict, compare=False)
+
+
+@dataclass(frozen=True)
+class V14SectionEvidence:
+    sample_index: int
+    branch_id: int
+    arc_index: int
+    center_tyx: Tuple[float, float, float]
+    radius: float
+    voxel_tyx: np.ndarray = field(compare=False, repr=False)
+    used_curved_path: bool = False
+    event_id: int = -1
+
+
+@dataclass(frozen=True)
+class V14CenterlineEvent:
+    event_id: int
+    branch_id: int
+    first_arc_index: int
+    last_arc_index: int
+    evidence_indices: Tuple[int, ...]
+    clean_left: bool
+    clean_right: bool
+    min_t: int
+    max_t: int
+
+    @property
+    def clean_flanks(self) -> bool:
+        return bool(self.clean_left and self.clean_right)
+
+
+def _v14_vmtk_modules_available() -> bool:
+    """Cheap preflight that does not import VTK into the long-lived parent."""
+    try:
+        import importlib.util
+        vtk_ok = importlib.util.find_spec('vtk') is not None
+        vmtk_ok = (
+            importlib.util.find_spec('vmtk') is not None
+            or (
+                importlib.util.find_spec('vtkvmtkComputationalGeometryPython') is not None
+                and importlib.util.find_spec('vtkvmtkMiscPython') is not None
+            )
+        )
+        return bool(vtk_ok and vmtk_ok)
+    except Exception:
+        return False
+
+
+def _v14_import_vmtk_modules() -> Tuple[object, object]:
+    """Load either the PyPI/conda VMTK layout or Slicer's split-module layout."""
+    import vtk  # type: ignore
+    try:
+        from vmtk import vtkvmtk  # type: ignore
+        return vtk, vtkvmtk
+    except (ImportError, OSError):
+        import vtkvmtkComputationalGeometryPython as computational  # type: ignore
+        import vtkvmtkMiscPython as misc  # type: ignore
+
+        class _V14VmtkNamespace:
+            pass
+
+        combined = _V14VmtkNamespace()
+        for module in (computational, misc):
+            for name in dir(module):
+                if str(name).startswith('vtkvmtk'):
+                    setattr(combined, name, getattr(module, name))
+        return vtk, combined
+
+
+def _v14_open_surface_one_triangle(vtk: object, surface: object, position_xyz: Sequence[float]) -> None:
+    locator = vtk.vtkPointLocator()
+    locator.SetDataSet(surface)
+    locator.BuildLocator()
+    point_id = int(locator.FindClosestPoint(tuple(float(v) for v in position_xyz)))
+    if point_id < 0:
+        raise RuntimeError('VMTK endpoint network cannot open an empty surface')
+    surface.BuildLinks()
+    cell_ids = vtk.vtkIdList()
+    surface.GetPointCells(int(point_id), cell_ids)
+    if int(cell_ids.GetNumberOfIds()) <= 0:
+        raise RuntimeError('VMTK endpoint network surface point has no incident triangle')
+    # This matches SlicerVMTK ExtractCenterline: the network extractor needs one
+    # opening, and deleting one incident cell makes the smallest useful hole.
+    surface.DeleteCell(int(cell_ids.GetId(0)))
+    surface.RemoveDeletedCells()
+
+
+def _v14_vmtk_surface_from_coarse_mask(
+    mask_tyx: np.ndarray,
+    *,
+    spacing_tyx: Sequence[float],
+    origin_tyx: Sequence[float],
+    target_points: int,
+) -> Tuple[object, object, object, int]:
+    vtk, vtkvmtk = _v14_import_vmtk_modules()
+    from vtk.util.numpy_support import numpy_to_vtk  # type: ignore
+
+    binary = np.ascontiguousarray(np.asarray(mask_tyx) != 0, dtype=np.uint8)
+    t_dim, h_dim, w_dim = (int(binary.shape[0]), int(binary.shape[1]), int(binary.shape[2]))
+    image = vtk.vtkImageData()
+    image.SetDimensions(int(w_dim), int(h_dim), int(t_dim))
+    image.SetSpacing(
+        float(spacing_tyx[2]), float(spacing_tyx[1]), float(spacing_tyx[0]),
+    )
+    image.SetOrigin(
+        float(origin_tyx[2]), float(origin_tyx[1]), float(origin_tyx[0]),
+    )
+    scalars = numpy_to_vtk(
+        binary.reshape(-1), deep=True, array_type=vtk.VTK_UNSIGNED_CHAR,
+    )
+    image.GetPointData().SetScalars(scalars)
+
+    contour_cls = getattr(vtk, 'vtkFlyingEdges3D', None) or vtk.vtkMarchingCubes
+    contour = contour_cls()
+    contour.SetInputData(image)
+    contour.SetValue(0, 0.5)
+    if hasattr(contour, 'ComputeNormalsOff'):
+        contour.ComputeNormalsOff()
+    if hasattr(contour, 'ComputeGradientsOff'):
+        contour.ComputeGradientsOff()
+    contour.Update()
+
+    cleaner = vtk.vtkCleanPolyData()
+    cleaner.SetInputConnection(contour.GetOutputPort())
+    triangles = vtk.vtkTriangleFilter()
+    triangles.SetInputConnection(cleaner.GetOutputPort())
+    triangles.PassLinesOff()
+    triangles.PassVertsOff()
+    triangles.Update()
+
+    region_counter = vtk.vtkPolyDataConnectivityFilter()
+    region_counter.SetInputConnection(triangles.GetOutputPort())
+    region_counter.SetExtractionModeToAllRegions()
+    region_counter.ColorRegionsOn()
+    region_counter.Update()
+    surface_component_count = int(region_counter.GetNumberOfExtractedRegions())
+
+    # Exact VMTK Delaunay processing is not reliable on disconnected surfaces.
+    # Analyze the largest connected foreground object, but report the full surface
+    # component count so automatic removal can be disabled when centerline coverage
+    # is necessarily incomplete.
+    connectivity = vtk.vtkPolyDataConnectivityFilter()
+    connectivity.SetInputConnection(triangles.GetOutputPort())
+    connectivity.SetExtractionModeToLargestRegion()
+    connectivity.Update()
+    connected = connectivity.GetOutput()
+    if int(connected.GetNumberOfPoints()) < 4 or int(connected.GetNumberOfCells()) < 4:
+        raise RuntimeError('foreground surface is too small for VMTK centerlines')
+
+    surface_input = connected
+    target = max(1000, int(target_points))
+    if int(connected.GetNumberOfPoints()) > int(target * 1.20):
+        decimator = vtk.vtkDecimatePro()
+        decimator.SetInputData(connected)
+        decimator.SetTargetReduction(
+            min(0.995, max(0.0, 1.0 - float(target) / float(connected.GetNumberOfPoints())))
+        )
+        decimator.PreserveTopologyOn()
+        decimator.BoundaryVertexDeletionOff()
+        if hasattr(decimator, 'SplittingOff'):
+            decimator.SplittingOff()
+        decimator.Update()
+        surface_input = decimator.GetOutput()
+
+    final_clean = vtk.vtkCleanPolyData()
+    final_clean.SetInputData(surface_input)
+    final_triangles = vtk.vtkTriangleFilter()
+    final_triangles.SetInputConnection(final_clean.GetOutputPort())
+    normals = vtk.vtkPolyDataNormals()
+    normals.SetInputConnection(final_triangles.GetOutputPort())
+    normals.AutoOrientNormalsOn()
+    normals.ConsistencyOn()
+    normals.SplittingOff()
+    normals.Update()
+    surface = vtk.vtkPolyData()
+    surface.DeepCopy(normals.GetOutput())
+    if int(surface.GetNumberOfPoints()) < 4:
+        raise RuntimeError('VMTK preprocessing produced an empty surface')
+    return vtk, vtkvmtk, surface, int(surface_component_count)
+
+
+def _v14_vmtk_auto_endpoint_positions(vtk: object, vtkvmtk: object, surface: object) -> List[Tuple[float, float, float]]:
+    network_surface = vtk.vtkPolyData()
+    network_surface.DeepCopy(surface)
+    bounds = network_surface.GetBounds()
+    _v14_open_surface_one_triangle(
+        vtk, network_surface, (float(bounds[0]), float(bounds[2]), float(bounds[4])),
+    )
+    network_filter = vtkvmtk.vtkvmtkPolyDataNetworkExtraction()
+    network_filter.SetInputData(network_surface)
+    network_filter.SetAdvancementRatio(1.05)
+    network_filter.SetRadiusArrayName('Radius')
+    network_filter.SetTopologyArrayName('Topology')
+    network_filter.SetMarksArrayName('Marks')
+    network_filter.Update()
+
+    cleaner = vtk.vtkCleanPolyData()
+    cleaner.SetInputConnection(network_filter.GetOutputPort())
+    cleaner.Update()
+    network = cleaner.GetOutput()
+    if int(network.GetNumberOfPoints()) <= 0:
+        raise RuntimeError('VMTK network endpoint detection returned no points')
+    radius_array = network.GetPointData().GetArray('Radius')
+    if radius_array is None:
+        raise RuntimeError('VMTK endpoint network has no Radius array')
+    network.BuildCells()
+    network.BuildLinks(0)
+    endpoint_ids = vtk.vtkIdList()
+    for cell_index in range(int(network.GetNumberOfCells())):
+        cell = network.GetCell(int(cell_index))
+        count = int(cell.GetNumberOfPoints())
+        if count < 2:
+            continue
+        for local_index in (0, count - 1):
+            point_id = int(cell.GetPointId(int(local_index)))
+            incident = vtk.vtkIdList()
+            network.GetPointCells(int(point_id), incident)
+            if int(incident.GetNumberOfIds()) == 1:
+                endpoint_ids.InsertUniqueId(int(point_id))
+    ids = [int(endpoint_ids.GetId(i)) for i in range(int(endpoint_ids.GetNumberOfIds()))]
+    if len(ids) < 2:
+        raise RuntimeError(f'VMTK endpoint network found only {len(ids)} endpoint(s)')
+    root_id = max(ids, key=lambda idx: float(radius_array.GetTuple1(int(idx))))
+    ordered = [int(root_id)] + [idx for idx in ids if int(idx) != int(root_id)]
+    return [tuple(float(v) for v in network.GetPoint(int(idx))) for idx in ordered]
+
+
+def _v14_vmtk_exact_centerline_arrays(
+    vtk: object,
+    vtkvmtk: object,
+    surface: object,
+    endpoint_positions: Sequence[Sequence[float]],
+) -> Dict[str, np.ndarray]:
+    capper = vtkvmtk.vtkvmtkCapPolyData()
+    capper.SetInputData(surface)
+    capper.SetDisplacement(0.0)
+    capper.SetInPlaneDisplacement(0.0)
+    capper.Update()
+    capped = capper.GetOutput()
+
+    locator = vtk.vtkPointLocator()
+    locator.SetDataSet(capped)
+    locator.BuildLocator()
+    seed_ids: List[int] = []
+    for position in endpoint_positions:
+        point_id = int(locator.FindClosestPoint(tuple(float(v) for v in position)))
+        if point_id >= 0 and point_id not in seed_ids:
+            seed_ids.append(int(point_id))
+    if len(seed_ids) < 2:
+        raise RuntimeError('VMTK auto endpoints collapsed to fewer than two exact surface seeds')
+
+    source_ids = vtk.vtkIdList()
+    source_ids.InsertNextId(int(seed_ids[0]))
+    target_ids = vtk.vtkIdList()
+    for point_id in seed_ids[1:]:
+        target_ids.InsertNextId(int(point_id))
+
+    centerline_filter = vtkvmtk.vtkvmtkPolyDataCenterlines()
+    centerline_filter.SetInputData(capped)
+    centerline_filter.SetSourceSeedIds(source_ids)
+    centerline_filter.SetTargetSeedIds(target_ids)
+    centerline_filter.SetRadiusArrayName('MaximumInscribedSphereRadius')
+    centerline_filter.SetCostFunction('1/R')
+    centerline_filter.SetFlipNormals(False)
+    centerline_filter.SetAppendEndPointsToCenterlines(0)
+    # VTK9-compatible SlicerVMTK setting; Voronoi simplification has known
+    # connectivity failures in that combination.
+    centerline_filter.SetSimplifyVoronoi(0)
+    centerline_filter.SetCenterlineResampling(0)
+    centerline_filter.SetResamplingStepLength(1.0)
+    centerline_filter.Update()
+    centerline = centerline_filter.GetOutput()
+    if centerline is None or int(centerline.GetNumberOfPoints()) <= 0:
+        raise RuntimeError('accurate VMTK centerline extraction returned no points')
+    radius_array = centerline.GetPointData().GetArray('MaximumInscribedSphereRadius')
+    if radius_array is None:
+        raise RuntimeError('accurate VMTK centerline has no maximum-inscribed-sphere radius')
+
+    points: List[np.ndarray] = []
+    tangents: List[np.ndarray] = []
+    radii: List[float] = []
+    branches: List[int] = []
+    arcs: List[int] = []
+    for cell_index in range(int(centerline.GetNumberOfCells())):
+        cell = centerline.GetCell(int(cell_index))
+        count = int(cell.GetNumberOfPoints())
+        if count < 2:
+            continue
+        ids = [int(cell.GetPointId(i)) for i in range(count)]
+        for local_index, point_id in enumerate(ids):
+            left = np.asarray(centerline.GetPoint(ids[max(0, local_index - 1)]), dtype=np.float64)
+            right = np.asarray(centerline.GetPoint(ids[min(count - 1, local_index + 1)]), dtype=np.float64)
+            tangent_xyz = right - left
+            norm = float(np.linalg.norm(tangent_xyz))
+            if not np.isfinite(norm) or norm <= 1.0e-8:
+                continue
+            point_xyz = np.asarray(centerline.GetPoint(int(point_id)), dtype=np.float64)
+            radius = float(radius_array.GetTuple1(int(point_id)))
+            if not np.all(np.isfinite(point_xyz)) or not np.isfinite(radius) or radius <= 0.0:
+                continue
+            points.append(point_xyz[[2, 1, 0]])
+            tangents.append((tangent_xyz / norm)[[2, 1, 0]])
+            radii.append(float(radius))
+            branches.append(int(cell_index))
+            arcs.append(int(local_index))
+    if not points:
+        raise RuntimeError('accurate VMTK centerline contained no finite tangent/radius samples')
+    return {
+        'points_tyx': np.asarray(points, dtype=np.float64),
+        'tangents_tyx': np.asarray(tangents, dtype=np.float64),
+        'radii': np.asarray(radii, dtype=np.float64),
+        'branch_ids': np.asarray(branches, dtype=np.int32),
+        'arc_indices': np.asarray(arcs, dtype=np.int32),
+        'endpoint_count': np.asarray([len(seed_ids)], dtype=np.int32),
+    }
+
+
+def _v14_vmtk_worker(
+    coarse_npy: str,
+    spacing_tyx: Tuple[float, float, float],
+    origin_tyx: Tuple[float, float, float],
+    target_points: int,
+    result_npz: str,
+    status_json: str,
+) -> None:
+    """Isolated native VMTK worker; a segfault cannot kill the inference parent."""
+    try:
+        coarse = np.load(str(coarse_npy), mmap_mode='r')
+        vtk, vtkvmtk, surface, surface_component_count = _v14_vmtk_surface_from_coarse_mask(
+            coarse,
+            spacing_tyx=spacing_tyx,
+            origin_tyx=origin_tyx,
+            target_points=int(target_points),
+        )
+        endpoints = _v14_vmtk_auto_endpoint_positions(vtk, vtkvmtk, surface)
+        arrays = _v14_vmtk_exact_centerline_arrays(vtk, vtkvmtk, surface, endpoints)
+        arrays['surface_component_count'] = np.asarray(
+            [int(surface_component_count)], dtype=np.int32,
+        )
+        np.savez_compressed(str(result_npz), **arrays)
+        Path(status_json).write_text(json.dumps({
+            'ok': True,
+            'surface_points': int(surface.GetNumberOfPoints()),
+            'surface_cells': int(surface.GetNumberOfCells()),
+            'surface_component_count': int(surface_component_count),
+            'endpoint_count': int(arrays['endpoint_count'][0]),
+            'sample_count': int(arrays['points_tyx'].shape[0]),
+        }, indent=2) + '\n')
+    except BaseException as exc:
+        import traceback as _traceback
+        Path(status_json).write_text(json.dumps({
+            'ok': False,
+            'error': f'{type(exc).__name__}: {exc}',
+            'traceback': _traceback.format_exc(),
+        }, indent=2) + '\n')
+        raise
+
+
+def _v14_build_coarse_centerline_raster(
+    mask_mm: np.ndarray,
+    *,
+    temp_dir: Path,
+    pass_index: int,
+    max_dim: int,
+    workers: int,
+) -> Tuple[Optional[Path], Dict[str, object]]:
+    extent = compute_segment_extent_zyx(mask_mm, workers=int(workers))
+    x0, x1, y0, y1, t0, t1 = (int(v) for v in extent)
+    if x1 < x0 or y1 < y0 or t1 < t0:
+        return None, {'empty': True, 'extent_xyt': [int(v) for v in extent]}
+    crop_shape = (int(t1 - t0 + 1), int(y1 - y0 + 1), int(x1 - x0 + 1))
+    max_axis = max(int(v) for v in crop_shape)
+    max_dim_i = max(64, int(max_dim))
+    factor_by_dim = int(math.ceil(float(max_axis) / float(max_dim_i)))
+    crop_voxels = int(crop_shape[0]) * int(crop_shape[1]) * int(crop_shape[2])
+    factor_by_voxels = int(math.ceil(max(1.0, (float(crop_voxels) / 64_000_000.0) ** (1.0 / 3.0))))
+    factor = max(1, int(factor_by_dim), int(factor_by_voxels))
+    out_shape = tuple(int(math.ceil(float(dim) / float(factor))) for dim in crop_shape)
+    padded_shape = (int(out_shape[0]) + 2, int(out_shape[1]) + 2, int(out_shape[2]) + 2)
+    work_dir = temp_dir / 'centerline_filter' / f'pass{int(pass_index):02d}'
+    work_dir.mkdir(parents=True, exist_ok=True)
+    coarse_path = work_dir / 'vmtk_blockmax.npy'
+    coarse = np.lib.format.open_memmap(
+        coarse_path, mode='w+', dtype=np.uint8, shape=padded_shape,
+    )
+    coarse[:] = np.uint8(0)
+    y_starts = np.arange(0, int(crop_shape[1]), int(factor), dtype=np.int64)
+    x_starts = np.arange(0, int(crop_shape[2]), int(factor), dtype=np.int64)
+    print(
+        f'v14 centerline pass {int(pass_index)}: block-max foreground crop '
+        f'{crop_shape} -> {out_shape} (factor={int(factor)}, padded={padded_shape}).'
+    )
+    # Sequential T blocks keep reads ordered through the source memmap. NumPy's
+    # reduceat performs the Y/X block maxima in compiled loops; no thin foreground
+    # is lost as it would be by simple striding.
+    for out_t in range(int(out_shape[0])):
+        src_t0 = int(t0) + int(out_t) * int(factor)
+        src_t1 = min(int(t1) + 1, int(src_t0) + int(factor))
+        acc = np.zeros((int(crop_shape[1]), int(crop_shape[2])), dtype=np.uint8)
+        for src_t in range(int(src_t0), int(src_t1)):
+            np.maximum(
+                acc,
+                np.asarray(mask_mm[int(src_t), int(y0):int(y1) + 1, int(x0):int(x1) + 1], dtype=np.uint8),
+                out=acc,
+            )
+        pooled_y = np.maximum.reduceat(acc, y_starts, axis=0)
+        pooled = np.maximum.reduceat(pooled_y, x_starts, axis=1)
+        coarse[int(out_t) + 1, 1:int(out_shape[1]) + 1, 1:int(out_shape[2]) + 1] = pooled
+    coarse.flush()
+    del coarse
+    center_offset = (float(factor) - 1.0) * 0.5
+    origin_tyx = (
+        float(t0) + center_offset - float(factor),
+        float(y0) + center_offset - float(factor),
+        float(x0) + center_offset - float(factor),
+    )
+    return coarse_path, {
+        'empty': False,
+        'extent_xyt': [int(v) for v in extent],
+        'crop_shape_tyx': [int(v) for v in crop_shape],
+        'coarse_shape_tyx': [int(v) for v in padded_shape],
+        'blockmax_factor': int(factor),
+        'spacing_tyx': [float(factor), float(factor), float(factor)],
+        'origin_tyx': [float(v) for v in origin_tyx],
+    }
+
+
+def _v14_fallback_centerline_samples(
+    mask_mm: np.ndarray,
+    *,
+    extent_xyt: Sequence[int],
+    max_samples: int = 512,
+) -> V14CenterlineSamples:
+    """Marker-only geometric ridge used when optional VMTK is unavailable.
+
+    This is deliberately not authorized to remove voxels. It finds the deepest
+    point in the largest 2D component on ordered source slices, forming a bounded
+    approximate ridge so audit markers can still be generated and synthetic tests
+    can exercise the full plane/component machinery.
+    """
+    x0, x1, y0, y1, t0, t1 = (int(v) for v in extent_xyt)
+    if x1 < x0 or y1 < y0 or t1 < t0:
+        return V14CenterlineSamples(
+            np.empty((0, 3), dtype=np.float64), np.empty((0, 3), dtype=np.float64),
+            np.empty((0,), dtype=np.float64), np.empty((0,), dtype=np.int32),
+            np.empty((0,), dtype=np.int32), 'geometric_marker_only', 0, False,
+            {'reason': 'empty_union'},
+        )
+    span = int(t1 - t0 + 1)
+    stride = max(1, int(math.ceil(float(span) / float(max(2, int(max_samples))))))
+    slice_ids = list(range(int(t0), int(t1) + 1, int(stride)))
+    if slice_ids and int(slice_ids[-1]) != int(t1):
+        slice_ids.append(int(t1))
+    points: List[Tuple[float, float, float]] = []
+    radii: List[float] = []
+    for t_idx in slice_ids:
+        crop = np.ascontiguousarray(
+            np.asarray(mask_mm[int(t_idx), int(y0):int(y1) + 1, int(x0):int(x1) + 1]) != 0,
+            dtype=np.uint8,
+        )
+        local_x0, local_y0, local_w, local_h = (int(v) for v in cv2.boundingRect(crop))
+        if local_w <= 0 or local_h <= 0:
+            continue
+        crop = np.ascontiguousarray(
+            crop[
+                int(local_y0):int(local_y0) + int(local_h),
+                int(local_x0):int(local_x0) + int(local_w),
+            ],
+            dtype=np.uint8,
+        )
+        count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            crop, connectivity=8, ltype=cv2.CV_32S,
+        )
+        if int(count) <= 1:
+            continue
+        largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        component = np.ascontiguousarray(labels == int(largest), dtype=np.uint8)
+        dist = cv2.distanceTransform(component, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+        _min_val, max_val, _min_loc, max_loc = cv2.minMaxLoc(dist)
+        if float(max_val) <= 0.0:
+            continue
+        points.append((
+            float(t_idx),
+            float(y0 + int(local_y0) + int(max_loc[1])),
+            float(x0 + int(local_x0) + int(max_loc[0])),
+        ))
+        radii.append(float(max_val))
+    if len(points) < 2:
+        return V14CenterlineSamples(
+            np.asarray(points, dtype=np.float64).reshape((-1, 3)),
+            np.zeros((len(points), 3), dtype=np.float64), np.asarray(radii, dtype=np.float64),
+            np.zeros((len(points),), dtype=np.int32), np.arange(len(points), dtype=np.int32),
+            'geometric_marker_only', 0, False,
+            {'reason': 'fewer_than_two_ridge_samples', 'stride': int(stride)},
+        )
+    point_array = np.asarray(points, dtype=np.float64)
+    tangents = np.zeros_like(point_array)
+    for idx in range(int(point_array.shape[0])):
+        left = point_array[max(0, idx - 1)]
+        right = point_array[min(int(point_array.shape[0]) - 1, idx + 1)]
+        delta = right - left
+        norm = float(np.linalg.norm(delta))
+        if norm > 0.0:
+            tangents[idx] = delta / norm
+    return V14CenterlineSamples(
+        point_array, tangents, np.asarray(radii, dtype=np.float64),
+        np.zeros((len(points),), dtype=np.int32), np.arange(len(points), dtype=np.int32),
+        'geometric_marker_only', 0, False,
+        {'stride': int(stride), 'sample_count': int(len(points))},
+    )
+
+
+def _v14_run_isolated_process(
+    process: mp.Process,
+    *,
+    timeout_seconds: float,
+) -> Tuple[Optional[int], str]:
+    """Run a native-code child without allowing it to strand interpreter exit."""
+    try:
+        process.start()
+    except BaseException as exc:
+        try:
+            process.close()
+        except Exception:
+            pass
+        return None, f'could not start isolated VMTK process: {type(exc).__name__}: {exc}'
+    error = ''
+    try:
+        process.join(timeout=max(1.0, float(timeout_seconds)))
+        if process.is_alive():
+            error = f'timed out after {float(timeout_seconds):g}s'
+            process.terminate()
+            process.join(timeout=30.0)
+        if process.is_alive():
+            if hasattr(process, 'kill'):
+                process.kill()
+            else:  # pragma: no cover - Python versions without Process.kill
+                process.terminate()
+            process.join(timeout=10.0)
+        if process.is_alive():
+            return None, f'{error}; isolated VMTK process could not be stopped'
+        return int(process.exitcode) if process.exitcode is not None else None, str(error)
+    finally:
+        if not process.is_alive():
+            try:
+                process.close()
+            except Exception:
+                pass
+
+
+def _v14_extract_centerline_samples(
+    mask_mm: np.ndarray,
+    *,
+    temp_dir: Path,
+    pass_index: int,
+    backend: str,
+    surface_max_dim: int,
+    surface_points: int,
+    timeout_seconds: float,
+    workers: int,
+    keep_temp: bool,
+) -> V14CenterlineSamples:
+    requested = str(backend).strip().lower()
+    modules_available = _v14_vmtk_modules_available()
+    # Do not build/read a second full block-max raster when auto mode already
+    # knows that optional VMTK is absent. The fallback needs only one exact extent
+    # scan plus its bounded set of source slices.
+    if requested in {'auto', 'vmtk'} and not bool(modules_available):
+        extent = compute_segment_extent_zyx(mask_mm, workers=int(workers))
+        missing_error = 'VTK/VMTK Python modules are not installed'
+        if requested == 'vmtk':
+            print(
+                f'Warning: v14 accurate VMTK extraction unavailable ({missing_error}); '
+                'preserving the union and emitting empty/pass-through audit stages.'
+            )
+            return V14CenterlineSamples(
+                np.empty((0, 3), dtype=np.float64), np.empty((0, 3), dtype=np.float64),
+                np.empty((0,), dtype=np.float64), np.empty((0,), dtype=np.int32),
+                np.empty((0,), dtype=np.int32), 'vmtk_unavailable_pass_through', 0, False,
+                {'extent_xyt': [int(v) for v in extent], 'error': missing_error},
+            )
+        print(
+            f'Warning: v14 accurate VMTK extraction unavailable ({missing_error}); '
+            'using the geometric marker-only fallback. Automatic removal remains disabled.'
+        )
+        fallback = _v14_fallback_centerline_samples(mask_mm, extent_xyt=extent)
+        return dataclasses_replace(
+            fallback,
+            details={**dict(fallback.details), 'extent_xyt': [int(v) for v in extent], 'vmtk_error': missing_error},
+        )
+
+    coarse_path, raster_info = _v14_build_coarse_centerline_raster(
+        mask_mm,
+        temp_dir=temp_dir,
+        pass_index=int(pass_index),
+        max_dim=int(surface_max_dim),
+        workers=int(workers),
+    )
+    if coarse_path is None:
+        return _v14_fallback_centerline_samples(
+            mask_mm, extent_xyt=raster_info.get('extent_xyt', _nrrd_empty_segment_extent()),
+        )
+
+    vmtk_error = ''
+    if requested in {'auto', 'vmtk'} and bool(modules_available):
+        work_dir = Path(coarse_path).parent
+        result_path = work_dir / 'vmtk_centerlines.npz'
+        status_path = work_dir / 'vmtk_status.json'
+        context = mp.get_context('spawn')
+        process = context.Process(
+            target=_v14_vmtk_worker,
+            args=(
+                str(coarse_path),
+                tuple(float(v) for v in raster_info['spacing_tyx']),
+                tuple(float(v) for v in raster_info['origin_tyx']),
+                int(surface_points),
+                str(result_path),
+                str(status_path),
+            ),
+            daemon=False,
+        )
+        process_exitcode, process_error = _v14_run_isolated_process(
+            process, timeout_seconds=float(timeout_seconds),
+        )
+        if process_error:
+            vmtk_error = str(process_error)
+        elif int(process_exitcode or 0) != 0:
+            vmtk_error = f'isolated process exit code {process_exitcode}'
+        elif not result_path.exists():
+            vmtk_error = 'isolated process produced no result file'
+        else:
+            try:
+                with np.load(result_path, allow_pickle=False) as data:
+                    samples = V14CenterlineSamples(
+                        np.asarray(data['points_tyx'], dtype=np.float64).copy(),
+                        np.asarray(data['tangents_tyx'], dtype=np.float64).copy(),
+                        np.asarray(data['radii'], dtype=np.float64).copy(),
+                        np.asarray(data['branch_ids'], dtype=np.int32).copy(),
+                        np.asarray(data['arc_indices'], dtype=np.int32).copy(),
+                        'vmtk_centerlines',
+                        int(np.asarray(data['endpoint_count']).reshape(-1)[0]),
+                        bool(int(np.asarray(
+                            data['surface_component_count']
+                            if 'surface_component_count' in data.files
+                            else np.asarray([1], dtype=np.int32)
+                        ).reshape(-1)[0]) == 1),
+                        dict(raster_info),
+                    )
+            except Exception as exc:
+                vmtk_error = f'invalid isolated VMTK result: {type(exc).__name__}: {exc}'
+            else:
+                if status_path.exists():
+                    try:
+                        samples.details.update(json.loads(status_path.read_text()))
+                    except Exception:
+                        pass
+                if not bool(keep_temp):
+                    for path in (result_path, status_path, coarse_path):
+                        try:
+                            Path(path).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                print(
+                    f'v14 centerline pass {int(pass_index)}: accurate VMTK centerlines, '
+                    f'samples={int(samples.points_tyx.shape[0])}, endpoints={int(samples.endpoint_count)}.'
+                )
+                return samples
+        if status_path.exists():
+            try:
+                status = json.loads(status_path.read_text())
+                vmtk_error = str(status.get('error', vmtk_error))
+            except Exception:
+                pass
+    elif requested in {'auto', 'vmtk'}:
+        vmtk_error = 'VTK/VMTK Python modules are not installed'
+
+    if not bool(keep_temp):
+        for path in (
+            Path(coarse_path),
+            Path(coarse_path).parent / 'vmtk_centerlines.npz',
+            Path(coarse_path).parent / 'vmtk_status.json',
+        ):
+            try:
+                Path(path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    if requested == 'vmtk':
+        print(
+            f'Warning: v14 accurate VMTK extraction unavailable ({vmtk_error}); '
+            'preserving pass 0 and skipping the current filter pass.'
+        )
+        return V14CenterlineSamples(
+            np.empty((0, 3), dtype=np.float64), np.empty((0, 3), dtype=np.float64),
+            np.empty((0,), dtype=np.float64), np.empty((0,), dtype=np.int32),
+            np.empty((0,), dtype=np.int32), 'vmtk_unavailable_pass_through', 0, False,
+            {**dict(raster_info), 'error': str(vmtk_error)},
+        )
+
+    print(
+        f'Warning: v14 accurate VMTK extraction unavailable ({vmtk_error}); '
+        'using the geometric marker-only fallback. Automatic removal remains disabled.'
+    )
+    fallback = _v14_fallback_centerline_samples(
+        mask_mm, extent_xyt=raster_info.get('extent_xyt', _nrrd_empty_segment_extent()),
+    )
+    return dataclasses_replace(
+        fallback,
+        details={**dict(raster_info), **dict(fallback.details), 'vmtk_error': str(vmtk_error)},
+    )
+
+
+def _v14_subsample_centerline_samples(samples: V14CenterlineSamples) -> V14CenterlineSamples:
+    """Densify ordered cells so anomaly spans cover every crossed source slice.
+
+    The historical name is retained to avoid disturbing callers.  Radius-adaptive
+    spacing still bounds in-plane work, but the t increment is never greater than
+    0.75 source voxels.  Thus a 100-slice web is inspected on all crossed source
+    slices instead of only at sparse VMTK vertices.  If the global safety cap is
+    reached, deletion is disabled and the retained samples remain marker-only.
+    """
+    input_count = int(samples.points_tyx.shape[0])
+    if input_count <= 1:
+        return samples
+    max_samples = max(1000, _env_int('YOLO_TTA_CENTERLINE_MAX_DENSE_SAMPLES', 50000))
+    points_out: List[np.ndarray] = []
+    tangents_out: List[np.ndarray] = []
+    radii_out: List[float] = []
+    branches_out: List[int] = []
+    arcs_out: List[int] = []
+    truncated = False
+    for branch_id in np.unique(samples.branch_ids):
+        branch_idx = np.flatnonzero(samples.branch_ids == int(branch_id))
+        if int(branch_idx.size) <= 0:
+            continue
+        order = branch_idx[np.argsort(samples.arc_indices[branch_idx], kind='stable')]
+        branch_arc = 0
+        if int(order.size) == 1:
+            only = int(order[0])
+            points_out.append(np.asarray(samples.points_tyx[only], dtype=np.float64))
+            tangents_out.append(np.asarray(samples.tangents_tyx[only], dtype=np.float64))
+            radii_out.append(float(samples.radii[only]))
+            branches_out.append(int(branch_id))
+            arcs_out.append(0)
+            if len(points_out) >= int(max_samples):
+                truncated = True
+                break
+            continue
+        for local_pos in range(max(1, int(order.size) - 1)):
+            idx0 = int(order[min(local_pos, int(order.size) - 1)])
+            idx1 = int(order[min(local_pos + 1, int(order.size) - 1)])
+            point0 = np.asarray(samples.points_tyx[idx0], dtype=np.float64)
+            point1 = np.asarray(samples.points_tyx[idx1], dtype=np.float64)
+            delta = point1 - point0
+            distance = float(np.linalg.norm(delta))
+            desired = max(1.0, min(4.0, 0.5 * max(
+                float(samples.radii[idx0]), float(samples.radii[idx1]), 0.5,
+            )))
+            steps = max(
+                1,
+                int(math.ceil(abs(float(delta[0])) / 0.75)),
+                int(math.ceil(float(distance) / float(desired))),
+            )
+            first_step = 0 if local_pos == 0 else 1
+            for step in range(int(first_step), int(steps) + 1):
+                alpha = float(step) / float(max(1, steps))
+                point = point0 + alpha * delta
+                tangent = (
+                    (1.0 - alpha) * np.asarray(samples.tangents_tyx[idx0], dtype=np.float64)
+                    + alpha * np.asarray(samples.tangents_tyx[idx1], dtype=np.float64)
+                )
+                tangent_norm = float(np.linalg.norm(tangent))
+                if tangent_norm <= 1.0e-8 and distance > 1.0e-8:
+                    tangent = delta / distance
+                elif tangent_norm > 1.0e-8:
+                    tangent = tangent / tangent_norm
+                points_out.append(point)
+                tangents_out.append(tangent)
+                radii_out.append(float(
+                    (1.0 - alpha) * float(samples.radii[idx0])
+                    + alpha * float(samples.radii[idx1])
+                ))
+                branches_out.append(int(branch_id))
+                arcs_out.append(int(branch_arc))
+                branch_arc += 1
+                if len(points_out) >= int(max_samples):
+                    truncated = True
+                    break
+            if truncated:
+                break
+        if truncated:
+            break
+    if not points_out:
+        return samples
+    return V14CenterlineSamples(
+        np.asarray(points_out, dtype=np.float64),
+        np.asarray(tangents_out, dtype=np.float64),
+        np.asarray(radii_out, dtype=np.float64),
+        np.asarray(branches_out, dtype=np.int32),
+        np.asarray(arcs_out, dtype=np.int32),
+        str(samples.backend), int(samples.endpoint_count),
+        bool(samples.automatic_removal_allowed and not truncated),
+        {
+            **dict(samples.details),
+            'pre_dense_sample_count': int(input_count),
+            'sample_count': int(len(points_out)),
+            'dense_sample_cap': int(max_samples),
+            'dense_sample_cap_reached': bool(truncated),
+        },
+    )
+
+
+def _v14_round_and_sample_mask(
+    mask_mm: np.ndarray,
+    coords_tyx: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    coords = np.asarray(coords_tyx, dtype=np.float64).reshape((-1, 3))
+    rounded = np.rint(coords).astype(np.int64, copy=False)
+    shape = tuple(int(v) for v in mask_mm.shape)
+    valid = (
+        (rounded[:, 0] >= 0) & (rounded[:, 0] < int(shape[0]))
+        & (rounded[:, 1] >= 0) & (rounded[:, 1] < int(shape[1]))
+        & (rounded[:, 2] >= 0) & (rounded[:, 2] < int(shape[2]))
+    )
+    values = np.zeros((int(rounded.shape[0]),), dtype=bool)
+    if np.any(valid):
+        active = rounded[valid]
+        values[valid] = np.asarray(
+            mask_mm[active[:, 0], active[:, 1], active[:, 2]], dtype=np.uint8,
+        ) != 0
+    return rounded, valid, values
+
+
+def _v14_snap_center_to_foreground(
+    mask_mm: np.ndarray,
+    point_tyx: np.ndarray,
+    radius: float,
+) -> Optional[np.ndarray]:
+    point = np.asarray(point_tyx, dtype=np.float64).reshape(3)
+    rounded, valid, values = _v14_round_and_sample_mask(mask_mm, point.reshape(1, 3))
+    if bool(valid[0]) and bool(values[0]):
+        return np.asarray(rounded[0], dtype=np.float64)
+    reach = max(1, min(3, int(math.ceil(max(0.5, float(radius)) * 0.5))))
+    base = np.rint(point).astype(np.int64)
+    t0 = max(0, int(base[0]) - reach)
+    t1 = min(int(mask_mm.shape[0]), int(base[0]) + reach + 1)
+    y0 = max(0, int(base[1]) - reach)
+    y1 = min(int(mask_mm.shape[1]), int(base[1]) + reach + 1)
+    x0 = max(0, int(base[2]) - reach)
+    x1 = min(int(mask_mm.shape[2]), int(base[2]) + reach + 1)
+    local = np.argwhere(np.asarray(mask_mm[t0:t1, y0:y1, x0:x1]) != 0)
+    if int(local.shape[0]) <= 0:
+        return None
+    global_coords = local.astype(np.float64)
+    global_coords[:, 0] += float(t0)
+    global_coords[:, 1] += float(y0)
+    global_coords[:, 2] += float(x0)
+    distances = np.sum((global_coords - point.reshape(1, 3)) ** 2, axis=1)
+    return global_coords[int(np.argmin(distances))]
+
+
+def _v14_plane_basis(tangent_tyx: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    normal = np.asarray(tangent_tyx, dtype=np.float64).reshape(3)
+    norm = float(np.linalg.norm(normal))
+    if not np.isfinite(norm) or norm <= 1.0e-8:
+        return None
+    normal = normal / norm
+    axis = np.eye(3, dtype=np.float64)[int(np.argmin(np.abs(normal)))]
+    first = np.cross(normal, axis)
+    first_norm = float(np.linalg.norm(first))
+    if first_norm <= 1.0e-8:
+        return None
+    first /= first_norm
+    second = np.cross(normal, first)
+    second_norm = float(np.linalg.norm(second))
+    if second_norm <= 1.0e-8:
+        return None
+    second /= second_norm
+    return normal, first, second
+
+
+def _v14_unique_foreground_voxels(mask_mm: np.ndarray, coords_tyx: np.ndarray) -> np.ndarray:
+    rounded, valid, values = _v14_round_and_sample_mask(mask_mm, coords_tyx)
+    keep = valid & values
+    if not np.any(keep):
+        return np.empty((0, 3), dtype=np.int32)
+    return np.unique(np.asarray(rounded[keep], dtype=np.int32), axis=0)
+
+
+def _v14_sample_one_normal_section(
+    mask_mm: np.ndarray,
+    samples: V14CenterlineSamples,
+    sample_index: int,
+    radius_factor: float,
+    plane_half_cap: int,
+) -> Tuple[str, Optional[V14SectionEvidence]]:
+    """Return ``(state, evidence)`` where state is anomaly, clean, or unknown.
+
+    Unknown is deliberately distinct from a tested clean section: an invalid
+    tangent, clipped plane, failed center snap, or safety cap may never serve as
+    a clean longitudinal flank that authorizes deletion.
+    """
+    idx = int(sample_index)
+    radius = float(samples.radii[idx])
+    if not np.isfinite(radius) or radius < 0.5:
+        return 'unknown', None
+    basis = _v14_plane_basis(samples.tangents_tyx[idx])
+    if basis is None:
+        return 'unknown', None
+    _normal, first, second = basis
+    center = _v14_snap_center_to_foreground(mask_mm, samples.points_tyx[idx], radius)
+    if center is None:
+        return 'unknown', None
+    expanded_radius = float(radius_factor) * float(radius)
+    if not np.isfinite(expanded_radius) or expanded_radius <= radius:
+        return 'unknown', None
+
+    ring_count = max(32, min(2048, int(math.ceil(2.0 * math.pi * expanded_radius))))
+    angles = np.linspace(0.0, 2.0 * math.pi, int(ring_count), endpoint=False, dtype=np.float64)
+    ring_coords = (
+        center.reshape(1, 3)
+        + expanded_radius
+        * (
+            np.cos(angles).reshape(-1, 1) * first.reshape(1, 3)
+            + np.sin(angles).reshape(-1, 1) * second.reshape(1, 3)
+        )
+    )
+    ring_rounded, ring_valid, ring_values = _v14_round_and_sample_mask(mask_mm, ring_coords)
+    hit_indices = np.flatnonzero(ring_valid & ring_values)
+    ring_complete = bool(np.all(ring_valid))
+    if int(hit_indices.size) <= 0:
+        return ('clean', None) if ring_complete else ('unknown', None)
+
+    # Fast path: check a bounded, angularly distributed set of straight paths in
+    # this exact plane. This is the user's proposed line test and avoids the plane
+    # raster/connected-component allocation for the common case.
+    if int(hit_indices.size) > 24:
+        choose = np.linspace(0, int(hit_indices.size) - 1, 24, dtype=np.int64)
+        path_hit_indices = hit_indices[choose]
+    else:
+        path_hit_indices = hit_indices
+    evidence_coords: List[np.ndarray] = []
+    path_step = 0.75
+    path_count = max(2, int(math.ceil(expanded_radius / path_step)) + 1)
+    alpha = np.linspace(0.0, 1.0, int(path_count), dtype=np.float64)
+    outer_threshold = max(float(radius) + 0.75, 1.10 * float(radius))
+    for hit_idx in path_hit_indices:
+        endpoint = ring_coords[int(hit_idx)]
+        line = center.reshape(1, 3) + alpha.reshape(-1, 1) * (endpoint - center).reshape(1, 3)
+        _rounded, valid, values = _v14_round_and_sample_mask(mask_mm, line)
+        if bool(np.all(valid & values)):
+            distances = alpha * expanded_radius
+            outer = line[distances >= outer_threshold]
+            if int(outer.shape[0]) > 0:
+                evidence_coords.append(outer)
+    if evidence_coords:
+        voxels = _v14_unique_foreground_voxels(mask_mm, np.concatenate(evidence_coords, axis=0))
+        if int(voxels.shape[0]) > 0:
+            return 'anomaly', V14SectionEvidence(
+                idx, int(samples.branch_ids[idx]), int(samples.arc_indices[idx]),
+                tuple(float(v) for v in center), float(radius), voxels, False,
+            )
+
+    # Curved-path fallback: rasterize only the tangent-normal plane, label it in
+    # 2D, and require the center's foreground component to reach the expanded
+    # circle. No equivalent-radius sphere is sampled anywhere in this test.
+    half = int(math.ceil(expanded_radius + 1.5))
+    if half > int(plane_half_cap):
+        return 'unknown', None
+    offsets = np.arange(-int(half), int(half) + 1, dtype=np.float64)
+    vv, uu = np.meshgrid(offsets, offsets, indexing='ij')
+    plane_coords = (
+        center.reshape(1, 1, 3)
+        + uu[..., None] * first.reshape(1, 1, 3)
+        + vv[..., None] * second.reshape(1, 1, 3)
+    )
+    _plane_rounded, plane_valid, plane_values = _v14_round_and_sample_mask(
+        mask_mm, plane_coords.reshape((-1, 3)),
+    )
+    plane_complete = bool(np.all(plane_valid))
+    plane_fg = (plane_valid & plane_values).reshape(plane_coords.shape[:2]).astype(np.uint8)
+    center_rc = (int(half), int(half))
+    if int(plane_fg[center_rc]) == 0:
+        local_fg = np.argwhere(plane_fg != 0)
+        if int(local_fg.shape[0]) <= 0:
+            return 'unknown', None
+        center_dist2 = np.sum((local_fg - np.asarray(center_rc).reshape(1, 2)) ** 2, axis=1)
+        nearest_i = int(np.argmin(center_dist2))
+        if float(center_dist2[nearest_i]) > 9.0:
+            return 'unknown', None
+        center_rc = (int(local_fg[nearest_i, 0]), int(local_fg[nearest_i, 1]))
+    label_count, labels = cv2.connectedComponents(plane_fg, connectivity=8, ltype=cv2.CV_32S)
+    center_label = int(labels[center_rc])
+    if int(label_count) <= 1 or center_label <= 0:
+        return ('clean', None) if plane_complete else ('unknown', None)
+    radial = np.sqrt(uu * uu + vv * vv)
+    annulus = np.abs(radial - expanded_radius) <= 1.25
+    center_component = labels == int(center_label)
+    if not np.any(center_component & annulus):
+        return ('clean', None) if plane_complete else ('unknown', None)
+    evidence_grid = center_component & (radial >= outer_threshold)
+    evidence_plane_coords = plane_coords[evidence_grid]
+    if int(evidence_plane_coords.shape[0]) > 16384:
+        select = np.linspace(
+            0, int(evidence_plane_coords.shape[0]) - 1, 16384, dtype=np.int64,
+        )
+        evidence_plane_coords = evidence_plane_coords[select]
+    voxels = _v14_unique_foreground_voxels(mask_mm, evidence_plane_coords)
+    if int(voxels.shape[0]) <= 0:
+        return 'unknown', None
+    return 'anomaly', V14SectionEvidence(
+        idx, int(samples.branch_ids[idx]), int(samples.arc_indices[idx]),
+        tuple(float(v) for v in center), float(radius), voxels, True,
+    )
+
+
+def _v14_detect_normal_plane_evidence(
+    mask_mm: np.ndarray,
+    samples: V14CenterlineSamples,
+    *,
+    radius_factor: float,
+    workers: int,
+) -> List[V14SectionEvidence]:
+    count = int(samples.points_tyx.shape[0])
+    if count <= 0:
+        return []
+    plane_cap = max(32, _env_int('YOLO_TTA_CENTERLINE_PLANE_HALF_CAP', 256))
+    worker_count = max(1, min(8, choose_slice_parallel_workers(int(workers), int(count))))
+
+    def _sample(idx: int) -> Tuple[str, Optional[V14SectionEvidence]]:
+        return _v14_sample_one_normal_section(
+            mask_mm, samples, int(idx), float(radius_factor), int(plane_cap),
+        )
+
+    print(
+        f'v14 centerline: testing {int(count)} tangent-normal 2D section(s) '
+        f'with {int(worker_count)} worker(s), radius factor X={float(radius_factor):g}.'
+    )
+    if int(worker_count) <= 1:
+        results = [_sample(i) for i in range(int(count))]
+    else:
+        pool = _acquire_parallel_pool(int(worker_count))
+        try:
+            results = list(pool.map(_sample, range(int(count))))
+        finally:
+            _release_parallel_pool(int(worker_count), pool)
+    tested_indices = [
+        int(idx) for idx, (state, _item) in enumerate(results)
+        if str(state) in {'clean', 'anomaly'}
+    ]
+    unknown_indices = [
+        int(idx) for idx, (state, _item) in enumerate(results)
+        if str(state) == 'unknown'
+    ]
+    # ``details`` is intentionally a mutable audit dictionary even though the
+    # sample arrays are held in a frozen dataclass.
+    samples.details['tested_section_sample_indices'] = tested_indices
+    samples.details['unknown_section_sample_indices'] = unknown_indices
+    return [item for state, item in results if str(state) == 'anomaly' and item is not None]
+
+
+def _v14_cluster_centerline_events(
+    samples: V14CenterlineSamples,
+    evidence: Sequence[V14SectionEvidence],
+    *,
+    minimum_samples: int = 3,
+    close_gap: int = 2,
+    clean_flank_samples: int = 3,
+) -> Tuple[List[V14CenterlineEvent], List[V14SectionEvidence]]:
+    evidence_by_sample: Dict[int, V14SectionEvidence] = {
+        int(item.sample_index): item for item in evidence
+    }
+    tested_raw = samples.details.get('tested_section_sample_indices')
+    if tested_raw is None:
+        # Conservative behavior for callers that did not run the tri-state
+        # detector: evidence is tested-positive; all other samples are unknown.
+        tested_samples = set(int(v) for v in evidence_by_sample)
+    else:
+        tested_samples = set(int(v) for v in tested_raw)
+    events: List[V14CenterlineEvent] = []
+    selected: List[V14SectionEvidence] = []
+    next_event_id = 0
+    for branch_id in np.unique(samples.branch_ids):
+        branch_idx = np.flatnonzero(samples.branch_ids == int(branch_id))
+        if int(branch_idx.size) <= 0:
+            continue
+        order = branch_idx[np.argsort(samples.arc_indices[branch_idx], kind='stable')]
+        anomaly = np.asarray(
+            [int(idx) in evidence_by_sample for idx in order], dtype=bool,
+        )
+        tested_clean = np.asarray(
+            [int(idx) in tested_samples and int(idx) not in evidence_by_sample for idx in order],
+            dtype=bool,
+        )
+        # Close only tiny longitudinal gaps; there is intentionally no maximum
+        # anomaly/event duration, so a webbed run spanning hundreds of slices remains one event.
+        closed = anomaly.copy()
+        pos = 0
+        while pos < int(closed.size):
+            if bool(closed[pos]):
+                pos += 1
+                continue
+            start = int(pos)
+            while pos < int(closed.size) and not bool(closed[pos]):
+                pos += 1
+            stop = int(pos)
+            if (
+                start > 0 and stop < int(closed.size)
+                and int(stop - start) <= int(close_gap)
+                and bool(closed[start - 1]) and bool(closed[stop])
+                and bool(np.all(tested_clean[int(start):int(stop)]))
+            ):
+                closed[start:stop] = True
+        pos = 0
+        while pos < int(closed.size):
+            if not bool(closed[pos]):
+                pos += 1
+                continue
+            run_start = int(pos)
+            while pos < int(closed.size) and bool(closed[pos]):
+                pos += 1
+            run_stop = int(pos)
+            actual = [
+                evidence_by_sample[int(order[k])]
+                for k in range(int(run_start), int(run_stop))
+                if int(order[k]) in evidence_by_sample
+            ]
+            if len(actual) < int(minimum_samples):
+                continue
+            clean_left = bool(
+                int(run_start) >= int(clean_flank_samples)
+                and np.all(tested_clean[int(run_start) - int(clean_flank_samples):int(run_start)])
+            )
+            clean_right = bool(
+                int(run_stop) + int(clean_flank_samples) <= int(anomaly.size)
+                and np.all(tested_clean[int(run_stop):int(run_stop) + int(clean_flank_samples)])
+            )
+            voxel_blocks = [item.voxel_tyx for item in actual if int(item.voxel_tyx.shape[0]) > 0]
+            if not voxel_blocks:
+                continue
+            all_voxels = np.concatenate(voxel_blocks, axis=0)
+            event_selected_indices: List[int] = []
+            for item in actual:
+                event_selected_indices.append(len(selected))
+                selected.append(dataclasses_replace(item, event_id=int(next_event_id)))
+            events.append(V14CenterlineEvent(
+                int(next_event_id), int(branch_id),
+                int(samples.arc_indices[int(order[run_start])]),
+                int(samples.arc_indices[int(order[run_stop - 1])]),
+                tuple(int(v) for v in event_selected_indices),
+                bool(clean_left), bool(clean_right),
+                int(np.min(all_voxels[:, 0])), int(np.max(all_voxels[:, 0])),
+            ))
+            next_event_id += 1
+    return events, selected
+
+
+def _v14_dense_centerline_seeds_by_slice(
+    mask_mm: np.ndarray,
+    samples: V14CenterlineSamples,
+) -> Dict[int, List[Tuple[int, int, float]]]:
+    seeds: Dict[int, Dict[Tuple[int, int], float]] = {}
+
+    def _add_protection_seeds(point_tyx: np.ndarray, radius: float) -> None:
+        """Rasterize a bounded swept tube used only as a do-not-delete guard.
+
+        Anomaly evidence is still obtained exclusively from the tangent-normal
+        2D circle/path test. This small 3D neighborhood is deliberately allowed
+        only to make protection more conservative for oblique centerlines whose
+        central voxel falls on a neighboring source slice.
+        """
+        point = np.asarray(point_tyx, dtype=np.float64).reshape(3)
+        protect_radius = max(1.0, float(radius))
+        t_reach = min(8, int(math.ceil(protect_radius)))
+        center_t = int(round(float(point[0])))
+        for t_idx in range(int(center_t) - int(t_reach), int(center_t) + int(t_reach) + 1):
+            if t_idx < 0 or t_idx >= int(mask_mm.shape[0]):
+                continue
+            dt = abs(float(t_idx) - float(point[0]))
+            inplane = math.sqrt(max(0.0, protect_radius * protect_radius - dt * dt))
+            if inplane < 0.5:
+                continue
+            center_y = int(round(float(point[1])))
+            center_x = int(round(float(point[2])))
+            selected: Optional[Tuple[int, int]] = None
+            if (
+                0 <= center_y < int(mask_mm.shape[1])
+                and 0 <= center_x < int(mask_mm.shape[2])
+                and int(mask_mm[int(t_idx), int(center_y), int(center_x)]) != 0
+            ):
+                selected = (int(center_y), int(center_x))
+            else:
+                reach = min(12, max(1, int(math.ceil(inplane))))
+                y0 = max(0, int(center_y) - int(reach))
+                y1 = min(int(mask_mm.shape[1]), int(center_y) + int(reach) + 1)
+                x0 = max(0, int(center_x) - int(reach))
+                x1 = min(int(mask_mm.shape[2]), int(center_x) + int(reach) + 1)
+                local = np.argwhere(np.asarray(mask_mm[int(t_idx), y0:y1, x0:x1]) != 0)
+                if int(local.shape[0]) > 0:
+                    global_y = local[:, 0].astype(np.float64) + float(y0)
+                    global_x = local[:, 1].astype(np.float64) + float(x0)
+                    dist2 = (global_y - float(point[1])) ** 2 + (global_x - float(point[2])) ** 2
+                    best = int(np.argmin(dist2))
+                    if float(dist2[best]) <= float(inplane * inplane):
+                        selected = (int(round(global_y[best])), int(round(global_x[best])))
+            if selected is not None:
+                per_slice = seeds.setdefault(int(t_idx), {})
+                per_slice[selected] = max(
+                    float(radius), float(per_slice.get(selected, 0.0)),
+                )
+
+    for branch_id in np.unique(samples.branch_ids):
+        branch_idx = np.flatnonzero(samples.branch_ids == int(branch_id))
+        if int(branch_idx.size) <= 0:
+            continue
+        order = branch_idx[np.argsort(samples.arc_indices[branch_idx], kind='stable')]
+        for local_pos in range(int(order.size)):
+            idx0 = int(order[local_pos])
+            idx1 = int(order[min(int(order.size) - 1, local_pos + 1)])
+            point0 = np.asarray(samples.points_tyx[idx0], dtype=np.float64)
+            point1 = np.asarray(samples.points_tyx[idx1], dtype=np.float64)
+            radius0 = float(samples.radii[idx0])
+            radius1 = float(samples.radii[idx1])
+            delta = point1 - point0
+            distance = float(np.linalg.norm(delta))
+            if distance > max(32.0, 10.0 * max(radius0, radius1, 1.0)):
+                steps = 1
+            else:
+                steps = max(1, int(math.ceil(distance / 0.5)))
+            for step in range(int(steps) + 1):
+                alpha = float(step) / float(max(1, steps))
+                point = point0 + alpha * delta
+                radius = (1.0 - alpha) * radius0 + alpha * radius1
+                snapped = _v14_snap_center_to_foreground(mask_mm, point, radius)
+                if snapped is None:
+                    continue
+                _add_protection_seeds(snapped, float(radius))
+    return {
+        int(t_idx): [(int(y), int(x), float(radius)) for (y, x), radius in sorted(per_slice.items())]
+        for t_idx, per_slice in seeds.items()
+    }
+
+
+def _v14_watershed_candidate_basin(
+    component_u8: np.ndarray,
+    good_seeds_yxr: Sequence[Tuple[int, int, float]],
+    bad_seeds_yx: Sequence[Tuple[int, int]],
+) -> np.ndarray:
+    component = np.ascontiguousarray(np.asarray(component_u8) != 0, dtype=np.uint8)
+    if not np.any(component):
+        return np.zeros_like(component, dtype=np.uint8)
+    good = np.zeros_like(component, dtype=np.uint8)
+    for y, x, radius in good_seeds_yxr:
+        if 0 <= int(y) < int(component.shape[0]) and 0 <= int(x) < int(component.shape[1]):
+            seed_radius = max(1, min(8, int(round(0.25 * max(1.0, float(radius))))))
+            cv2.circle(good, (int(x), int(y)), int(seed_radius), 1, thickness=-1)
+    good &= component
+    bad = np.zeros_like(component, dtype=np.uint8)
+    for y, x in bad_seeds_yx:
+        if 0 <= int(y) < int(component.shape[0]) and 0 <= int(x) < int(component.shape[1]):
+            bad[int(y), int(x)] = np.uint8(1)
+    if np.any(bad):
+        bad = cv2.dilate(bad, np.ones((3, 3), dtype=np.uint8), iterations=1)
+    bad &= component
+    bad[good != 0] = np.uint8(0)
+    fallback = np.ascontiguousarray(bad != 0, dtype=np.uint8)
+    if not np.any(bad):
+        return fallback
+    if not np.any(good):
+        # With no trusted centerline seed there is no defensible watershed
+        # partition. Mark the complete suspect 2D component so audit-first output
+        # is actionable instead of emitting a few seed dots.
+        return np.ascontiguousarray(component != 0, dtype=np.uint8)
+    dist = cv2.distanceTransform(component, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    max_dist = float(np.max(dist))
+    if max_dist <= 0.0:
+        return fallback
+    topography = np.uint8(np.clip(255.0 - 254.0 * dist / max_dist, 0.0, 255.0))
+    topography[component == 0] = np.uint8(255)
+    markers = np.zeros(component.shape, dtype=np.int32)
+    markers[good != 0] = np.int32(1)
+    markers[bad != 0] = np.int32(2)
+    # watershed_ift has no mask argument. Pre-seeding all background as a third
+    # region prevents good/bad fronts from taking a shortcut outside the component.
+    markers[component == 0] = np.int32(3)
+    try:
+        watershed = ndi.watershed_ift(
+            topography, markers, structure=np.ones((3, 3), dtype=np.uint8),
+        )
+        artifact = np.ascontiguousarray((watershed == 2) & (component != 0), dtype=np.uint8)
+        if np.any(artifact[good != 0]):
+            return fallback
+        if np.any(artifact):
+            return artifact
+    except Exception:
+        pass
+    return fallback
+
+
+def _v14_submit_sparse_audit_layer(
+    *,
+    store_dir: Path,
+    store_stats: Dict[str, object],
+    shape_tyx: Tuple[int, int, int],
+    model_name: str,
+    mask_kind: str,
+    pass_index: int,
+    description: str,
+) -> 'NrrdLayerRef':
+    key = _nrrd_layer_key(
+        view_name='global', source='centerline_filter', mask_kind=str(mask_kind),
+        pass_index=int(pass_index), stage='',
+    )
+    extent = _coerce_segment_extent(store_stats.get('segment_extent_ijk')) or _nrrd_empty_segment_extent()
+    is_removed_delta = str(mask_kind) == 'removed_components'
+    ref = NrrdLayerRef(
+        key=str(key),
+        name=_nrrd_layer_name(
+            view=None, source='centerline_filter', mask_kind=str(mask_kind),
+            pass_index=int(pass_index), stage='',
+        ),
+        path=Path(store_dir),
+        shape=tuple(int(v) for v in shape_tyx),
+        dtype='uint8', storage_format=CVOL_FORMAT,
+        model_name=str(model_name), view_name='global', view_family='global',
+        source='centerline_filter', mask_kind=str(mask_kind),
+        pass_index=int(pass_index), stage='', description=str(description),
+        layer_role='subtractive_delta' if is_removed_delta else 'marker_only',
+        recomposition_op='subtract_from_previous_checkpoint' if is_removed_delta else 'none',
+        # Max-pool downbinning does not commute with subtraction.  Sparse audit
+        # masks therefore stay full-quality only; downbinned result checkpoints
+        # remain the valid low-quality representation of each pass.
+        low_quality_recomposition_op='diagnostic_only' if is_removed_delta else 'none',
+        force_tight_crop=True,
+        mirror_low_quality=False,
+        segment_extent_ijk=extent,
+        segment_extent_shape_tyx=tuple(int(v) for v in shape_tyx),
+        segment_extent_source='incremental_centerline_audit_cvol_index',
+    )
+    sink = nrrd_layer_sink()
+    if sink is None:
+        raise RuntimeError('v14 centerline audit layer requested without an NRRD sink')
+    sink.submit_layer(
+        ref,
+        nrrd_layer_output_suffix(
+            view_token='Global', source='centerline_filter', mask_kind=str(mask_kind),
+            pass_index=int(pass_index), stage='',
+        ),
+    )
+    return ref
+
+
+def _v14_component_flank_is_clear(
+    mask_mm: np.ndarray,
+    component_crop: np.ndarray,
+    bbox_yxyx: Tuple[int, int, int, int],
+    event: V14CenterlineEvent,
+    temporal_context: int,
+) -> bool:
+    y0, y1, x0, x1 = (int(v) for v in bbox_yxyx)
+    context = max(1, int(temporal_context))
+    left_start = int(event.min_t) - int(context)
+    left_stop = int(event.min_t)
+    right_start = int(event.max_t) + 1
+    right_stop = int(event.max_t) + int(context) + 1
+    if left_start < 0 or right_stop > int(mask_mm.shape[0]):
+        return False
+    component = np.asarray(component_crop) != 0
+    area = max(1, int(np.count_nonzero(component)))
+    # Permit modest source-slice motion while testing continuity.  Dilating the
+    # candidate support makes the guard conservative: nearby anatomy in *any* of
+    # the requested clean slices prevents deletion.
+    default_motion = max(2, min(8, int(math.ceil(math.sqrt(float(context))))))
+    motion = max(0, _env_int('YOLO_TTA_CENTERLINE_FLANK_MOTION_PX', default_motion))
+    expanded_y0 = max(0, int(y0) - int(motion))
+    expanded_y1 = min(int(mask_mm.shape[1]), int(y1) + int(motion))
+    expanded_x0 = max(0, int(x0) - int(motion))
+    expanded_x1 = min(int(mask_mm.shape[2]), int(x1) + int(motion))
+    support = np.zeros(
+        (int(expanded_y1 - expanded_y0), int(expanded_x1 - expanded_x0)), dtype=np.uint8,
+    )
+    support[
+        int(y0 - expanded_y0):int(y1 - expanded_y0),
+        int(x0 - expanded_x0):int(x1 - expanded_x0),
+    ] = np.asarray(component, dtype=np.uint8)
+    if int(motion) > 0:
+        size = 2 * int(motion) + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(size), int(size)))
+        support = cv2.dilate(support, kernel, iterations=1)
+    for flank_t in list(range(int(left_start), int(left_stop))) + list(range(int(right_start), int(right_stop))):
+        flank = np.ascontiguousarray(
+            np.asarray(mask_mm[
+                int(flank_t), int(expanded_y0):int(expanded_y1), int(expanded_x0):int(expanded_x1)
+            ]) != 0,
+            dtype=np.uint8,
+        )
+        overlap = int(np.count_nonzero((support != 0) & (flank != 0)))
+        if float(overlap) / float(area) > 0.01:
+            return False
+    return True
+
+
+def _v14_apply_component_removal_plan(
+    mask_mm: np.ndarray,
+    anchors_by_t: Dict[int, List[Tuple[int, int]]],
+    *,
+    workers: int,
+) -> int:
+    if not anchors_by_t:
+        return 0
+    slice_ids = np.asarray(sorted(int(v) for v in anchors_by_t), dtype=np.int64)
+    removed_counts = np.zeros((int(slice_ids.size),), dtype=np.int64)
+
+    def _apply(local_index: int) -> None:
+        t_idx = int(slice_ids[int(local_index)])
+        plane = np.asarray(mask_mm[int(t_idx)], dtype=np.uint8)
+        x0, y0, width, height = (int(v) for v in cv2.boundingRect(plane))
+        if width <= 0 or height <= 0:
+            return
+        crop = np.ascontiguousarray(
+            plane[int(y0):int(y0) + int(height), int(x0):int(x0) + int(width)] != 0,
+            dtype=np.uint8,
+        )
+        _count, labels = cv2.connectedComponents(crop, connectivity=8, ltype=cv2.CV_32S)
+        label_ids: set[int] = set()
+        for anchor_y, anchor_x in anchors_by_t[int(t_idx)]:
+            local_y = int(anchor_y) - int(y0)
+            local_x = int(anchor_x) - int(x0)
+            if 0 <= local_y < int(labels.shape[0]) and 0 <= local_x < int(labels.shape[1]):
+                label_id = int(labels[local_y, local_x])
+                if label_id > 0:
+                    label_ids.add(int(label_id))
+        if not label_ids:
+            return
+        remove_mask = np.zeros(labels.shape, dtype=bool)
+        for label_id in sorted(label_ids):
+            remove_mask |= labels == int(label_id)
+        removed_counts[int(local_index)] = np.int64(np.count_nonzero(remove_mask))
+        dst_crop = plane[int(y0):int(y0) + int(height), int(x0):int(x0) + int(width)]
+        dst_crop[remove_mask] = np.uint8(0)
+
+    parallel_for_indices(
+        int(slice_ids.size), _apply,
+        max_workers=choose_slice_parallel_workers(int(workers), int(slice_ids.size)),
+        desc='v14 centerline: applying safe 2D component removals',
+        show_progress=True,
+    )
+    flush_array(mask_mm)
+    return int(np.sum(removed_counts, dtype=np.int64))
+
+
+def _v14_plan_components_and_write_sparse_audits(
+    mask_mm: np.ndarray,
+    samples: V14CenterlineSamples,
+    events: Sequence[V14CenterlineEvent],
+    evidence: Sequence[V14SectionEvidence],
+    center_seeds_by_t: Dict[int, List[Tuple[int, int, float]]],
+    *,
+    temp_dir: Path,
+    model_name: str,
+    pass_index: int,
+    temporal_context: int,
+    automatic_removal_enabled: bool,
+    workers: int,
+    nrrd_layer_refs: List['NrrdLayerRef'],
+) -> Dict[str, object]:
+    shape = tuple(int(v) for v in mask_mm.shape)
+    pass_dir = temp_dir / 'centerline_filter' / f'pass{int(pass_index):02d}'
+    removed_store_dir = pass_dir / 'removed_components.cvol'
+    watershed_store_dir = pass_dir / 'watershed_candidates.cvol'
+    removed_writer = IncrementalRawBBoxMaskStoreWriter(
+        shape=shape, store_dir=removed_store_dir, format_name=CVOL_FORMAT,
+        desc=f'v14 pass {int(pass_index)} removed 2D components',
+        extra_meta={'source': 'centerline_filter', 'pass_index': int(pass_index)},
+    )
+    watershed_writer = IncrementalRawBBoxMaskStoreWriter(
+        shape=shape, store_dir=watershed_store_dir, format_name=CVOL_FORMAT,
+        desc=f'v14 pass {int(pass_index)} watershed candidates',
+        extra_meta={'source': 'centerline_filter', 'pass_index': int(pass_index)},
+    )
+    event_by_id = {int(event.event_id): event for event in events}
+    evidence_by_t: Dict[int, List[Tuple[V14SectionEvidence, int, int]]] = {}
+    for item in evidence:
+        for voxel in np.asarray(item.voxel_tyx, dtype=np.int32):
+            t_idx, y_idx, x_idx = (int(v) for v in voxel)
+            if 0 <= t_idx < int(shape[0]):
+                evidence_by_t.setdefault(int(t_idx), []).append((item, int(y_idx), int(x_idx)))
+    candidate_slices = sorted(int(v) for v in evidence_by_t)
+    anchors_by_t: Dict[int, List[Tuple[int, int]]] = {}
+    candidate_components = 0
+    protected_components = 0
+    deletion_plans = 0
+    marker_only_components = 0
+    min_component_area = max(1, _env_int('YOLO_TTA_CENTERLINE_MIN_COMPONENT_AREA', 32))
+    min_evidence_coverage = min(
+        1.0, max(0.0, _env_float('YOLO_TTA_CENTERLINE_MIN_EVIDENCE_COVERAGE', 0.25)),
+    )
+    cursor = 0
+    try:
+        for t_idx in candidate_slices:
+            if int(t_idx) > int(cursor):
+                removed_writer.consume_empty_range(int(cursor), int(t_idx) - int(cursor))
+                watershed_writer.consume_empty_range(int(cursor), int(t_idx) - int(cursor))
+            removed_plane = np.zeros((int(shape[1]), int(shape[2])), dtype=np.uint8)
+            watershed_plane = np.zeros_like(removed_plane)
+            plane = np.asarray(mask_mm[int(t_idx)], dtype=np.uint8)
+            x0, y0, width, height = (int(v) for v in cv2.boundingRect(plane))
+            if width > 0 and height > 0:
+                crop = np.ascontiguousarray(
+                    plane[int(y0):int(y0) + int(height), int(x0):int(x0) + int(width)] != 0,
+                    dtype=np.uint8,
+                )
+                count, labels, cc_stats, _centroids = cv2.connectedComponentsWithStats(
+                    crop, connectivity=8, ltype=cv2.CV_32S,
+                )
+                bad_by_label: Dict[int, List[Tuple[V14SectionEvidence, int, int]]] = {}
+                for item, global_y, global_x in evidence_by_t[int(t_idx)]:
+                    local_y = int(global_y) - int(y0)
+                    local_x = int(global_x) - int(x0)
+                    if 0 <= local_y < int(labels.shape[0]) and 0 <= local_x < int(labels.shape[1]):
+                        label_id = int(labels[local_y, local_x])
+                        if label_id > 0:
+                            bad_by_label.setdefault(int(label_id), []).append(
+                                (item, int(local_y), int(local_x)),
+                            )
+                good_by_label: Dict[int, List[Tuple[int, int, float]]] = {}
+                for global_y, global_x, radius in center_seeds_by_t.get(int(t_idx), []):
+                    local_y = int(global_y) - int(y0)
+                    local_x = int(global_x) - int(x0)
+                    if 0 <= local_y < int(labels.shape[0]) and 0 <= local_x < int(labels.shape[1]):
+                        label_id = int(labels[local_y, local_x])
+                        if label_id > 0:
+                            good_by_label.setdefault(int(label_id), []).append(
+                                (int(local_y), int(local_x), float(radius)),
+                            )
+
+                for label_id, bad_items in sorted(bad_by_label.items()):
+                    if int(label_id) <= 0 or int(label_id) >= int(count):
+                        continue
+                    candidate_components += 1
+                    component = labels == int(label_id)
+                    area = int(cc_stats[int(label_id), cv2.CC_STAT_AREA])
+                    bad_yx = sorted(set((int(y), int(x)) for _item, y, x in bad_items))
+                    good_yxr = good_by_label.get(int(label_id), [])
+                    relevant_events = [
+                        event_by_id[int(event_id)]
+                        for event_id in sorted(set(int(item.event_id) for item, _y, _x in bad_items))
+                        if int(event_id) in event_by_id
+                    ]
+                    protected = bool(good_yxr)
+                    if protected:
+                        protected_components += 1
+
+                    bad_seed_mask = np.zeros(component.shape, dtype=np.uint8)
+                    for bad_y, bad_x in bad_yx:
+                        bad_seed_mask[int(bad_y), int(bad_x)] = np.uint8(1)
+                    bad_coverage_mask = cv2.dilate(
+                        bad_seed_mask, np.ones((5, 5), dtype=np.uint8), iterations=1,
+                    )
+                    evidence_coverage = float(np.count_nonzero((bad_coverage_mask != 0) & component)) / float(max(1, area))
+
+                    can_remove = bool(
+                        automatic_removal_enabled
+                        and
+                        samples.automatic_removal_allowed
+                        and not protected
+                        and int(area) >= int(min_component_area)
+                        and float(evidence_coverage) >= float(min_evidence_coverage)
+                        and bool(relevant_events)
+                        and all(bool(event.clean_flanks) for event in relevant_events)
+                    )
+                    if can_remove:
+                        bbox = (
+                            int(y0), int(y0) + int(height),
+                            int(x0), int(x0) + int(width),
+                        )
+                        can_remove = all(
+                            _v14_component_flank_is_clear(
+                                mask_mm, component, bbox, event, int(temporal_context),
+                            )
+                            for event in relevant_events
+                        )
+
+                    if can_remove:
+                        removed_crop = removed_plane[
+                            int(y0):int(y0) + int(height), int(x0):int(x0) + int(width)
+                        ]
+                        removed_crop[component] = np.uint8(1)
+                        first_y, first_x = bad_yx[0]
+                        anchors_by_t.setdefault(int(t_idx), []).append(
+                            (int(y0) + int(first_y), int(x0) + int(first_x)),
+                        )
+                        deletion_plans += 1
+                    else:
+                        basin = _v14_watershed_candidate_basin(
+                            np.ascontiguousarray(component, dtype=np.uint8),
+                            good_yxr, bad_yx,
+                        )
+                        marker_crop = watershed_plane[
+                            int(y0):int(y0) + int(height), int(x0):int(x0) + int(width)
+                        ]
+                        marker_crop[basin != 0] = np.uint8(1)
+                        marker_only_components += 1
+
+            removed_writer.consume(int(t_idx), removed_plane.reshape((1, int(shape[1]), int(shape[2]))))
+            watershed_writer.consume(int(t_idx), watershed_plane.reshape((1, int(shape[1]), int(shape[2]))))
+            cursor = int(t_idx) + 1
+        if int(cursor) < int(shape[0]):
+            removed_writer.consume_empty_range(int(cursor), int(shape[0]) - int(cursor))
+            watershed_writer.consume_empty_range(int(cursor), int(shape[0]) - int(cursor))
+        removed_stats = removed_writer.finalize()
+        watershed_stats = watershed_writer.finalize()
+    except BaseException:
+        removed_writer.discard()
+        watershed_writer.discard()
+        raise
+
+    removed_ref = _v14_submit_sparse_audit_layer(
+        store_dir=removed_store_dir, store_stats=removed_stats, shape_tyx=shape,
+        model_name=str(model_name), mask_kind='removed_components',
+        pass_index=int(pass_index),
+        description=(
+            'Whole 2D source-slice components approved for removal by exact centerline, '
+            'clean-flank, evidence-coverage, and centerline-protection guards.'
+        ),
+    )
+    watershed_ref = _v14_submit_sparse_audit_layer(
+        store_dir=watershed_store_dir, store_stats=watershed_stats, shape_tyx=shape,
+        model_name=str(model_name), mask_kind='watershed_candidates',
+        pass_index=int(pass_index),
+        description=(
+            'Marker-only artifact basins for suspect components that contain protected '
+            'centerline anatomy or do not satisfy every automatic-removal guard.'
+        ),
+    )
+    nrrd_layer_refs.extend([removed_ref, watershed_ref])
+    applied_removed_voxels = _v14_apply_component_removal_plan(
+        mask_mm, anchors_by_t, workers=int(workers),
+    )
+    planned_removed_voxels = int(removed_stats.get('foreground_voxels', 0))
+    if int(applied_removed_voxels) != int(planned_removed_voxels):
+        raise RuntimeError(
+            f'v14 centerline removal audit mismatch: planned={planned_removed_voxels}, '
+            f'applied={applied_removed_voxels}'
+        )
+    return {
+        'candidate_slices': int(len(candidate_slices)),
+        'candidate_components': int(candidate_components),
+        'protected_components': int(protected_components),
+        'removed_components': int(deletion_plans),
+        'removed_voxels': int(applied_removed_voxels),
+        'watershed_components': int(marker_only_components),
+        'watershed_voxels': int(watershed_stats.get('foreground_voxels', 0)),
+        'minimum_component_area': int(min_component_area),
+        'minimum_evidence_coverage': float(min_evidence_coverage),
+    }
+
+
+def apply_v14_centerline_filter_inplace(
+    final_union_mm: np.ndarray,
+    *,
+    model_name: str,
+    temp_dir: Path,
+    passes: int,
+    backend: str,
+    radius_factor: float,
+    temporal_context: int,
+    automatic_removal_enabled: bool,
+    surface_max_dim: int,
+    surface_points: int,
+    timeout_seconds: float,
+    workers: int,
+    keep_temp: bool,
+    nrrd_layer_refs: List['NrrdLayerRef'],
+) -> Dict[str, object]:
+    """Iteratively filter the post-union volume and preserve every audit stage."""
+    requested_passes = max(0, int(passes))
+    stats: Dict[str, object] = {
+        'enabled': bool(requested_passes > 0 and str(backend).lower() != 'off'),
+        'requested_passes': int(requested_passes),
+        'requested_backend': str(backend),
+        'radius_factor': float(radius_factor),
+        'temporal_context': int(temporal_context),
+        'automatic_removal_enabled': bool(automatic_removal_enabled),
+        'passes': [],
+        'stop_reason': 'disabled',
+    }
+    if not bool(stats['enabled']):
+        return stats
+
+    print('\n=== v14 centerline filter: immutable pass-0 checkpoint ===')
+    pass0_ref = materialize_nrrd_global_layer(
+        final_union_mm,
+        model_name=str(model_name), source='centerline_filter', mask_kind='pass00_input',
+        pass_index=0, stage='',
+        description=(
+            'Untouched final source-geometry union before v14 centerline filtering. '
+            'This is the exact pass-0 recovery checkpoint.'
+        ),
+        temp_dir=temp_dir, workers=int(workers), known_has_foreground=True,
+        volume_is_immutable=False, keep_temp=bool(keep_temp),
+        layer_role='checkpoint', recomposition_op='select',
+        low_quality_recomposition_op='select', force_tight_crop=True,
+    )
+    if pass0_ref is not None:
+        nrrd_layer_refs.append(pass0_ref)
+
+    if str(backend).strip().lower() == 'vmtk' and not _v14_vmtk_modules_available():
+        stats['passes_completed'] = 0
+        stats['stop_reason'] = 'backend_unavailable_pass_through'
+        stats['total_removed_components'] = 0
+        stats['total_removed_voxels'] = 0
+        stats['total_watershed_voxels'] = 0
+        print(
+            'v14 centerline filter: VTK/VMTK is unavailable; pass 0 is preserved '
+            'and no duplicate pass/result volumes will be generated.'
+        )
+        return stats
+
+    pass_records: List[Dict[str, object]] = []
+    stop_reason = 'pass_limit_exhausted'
+    for pass_index in range(1, int(requested_passes) + 1):
+        print(f'\n=== v14 centerline filter pass {int(pass_index)}/{int(requested_passes)} ===')
+        pass_started = time.monotonic()
+        samples = _v14_extract_centerline_samples(
+            final_union_mm,
+            temp_dir=temp_dir, pass_index=int(pass_index), backend=str(backend),
+            surface_max_dim=int(surface_max_dim), surface_points=int(surface_points),
+            timeout_seconds=float(timeout_seconds), workers=int(workers),
+            keep_temp=bool(keep_temp),
+        )
+        samples = _v14_subsample_centerline_samples(samples)
+        if int(samples.points_tyx.shape[0]) <= 0:
+            pass_record = {
+                'pass_index': int(pass_index),
+                'backend': str(samples.backend),
+                'endpoint_count': int(samples.endpoint_count),
+                'centerline_samples': 0,
+                'section_evidence_samples': 0,
+                'longitudinal_events': 0,
+                'clean_flank_events': 0,
+                'candidate_slices': 0,
+                'candidate_components': 0,
+                'protected_components': 0,
+                'removed_components': 0,
+                'removed_voxels': 0,
+                'watershed_components': 0,
+                'watershed_voxels': 0,
+                'seconds': round(float(time.monotonic() - pass_started), 3),
+            }
+            if samples.details.get('error'):
+                pass_record['backend_error'] = str(samples.details.get('error'))
+            elif samples.details.get('vmtk_error'):
+                pass_record['backend_error'] = str(samples.details.get('vmtk_error'))
+            pass_records.append(pass_record)
+            stop_reason = 'backend_unavailable_pass_through'
+            print(
+                f'v14 centerline pass {int(pass_index)}: backend={samples.backend}; '
+                'no centerline samples, preserving pass 0 without writing a duplicate result checkpoint.'
+            )
+            break
+        evidence = _v14_detect_normal_plane_evidence(
+            final_union_mm, samples,
+            radius_factor=float(radius_factor), workers=int(workers),
+        )
+        events, selected_evidence = _v14_cluster_centerline_events(
+            samples, evidence, minimum_samples=3, close_gap=2, clean_flank_samples=3,
+        )
+        center_seeds = _v14_dense_centerline_seeds_by_slice(final_union_mm, samples)
+        component_stats = _v14_plan_components_and_write_sparse_audits(
+            final_union_mm, samples, events, selected_evidence, center_seeds,
+            temp_dir=temp_dir, model_name=str(model_name), pass_index=int(pass_index),
+            temporal_context=int(temporal_context),
+            automatic_removal_enabled=bool(automatic_removal_enabled), workers=int(workers),
+            nrrd_layer_refs=nrrd_layer_refs,
+        )
+        result_ref = materialize_nrrd_global_layer(
+            final_union_mm,
+            model_name=str(model_name), source='centerline_filter', mask_kind='result',
+            pass_index=int(pass_index), stage='',
+            description=(
+                f'Post-union result after v14 centerline filter pass {int(pass_index)}; '
+                'watershed-candidate voxels remain present unless their complete 2D component '
+                'separately satisfied every automatic-removal guard.'
+            ),
+            temp_dir=temp_dir, workers=int(workers), known_has_foreground=True,
+            volume_is_immutable=False, keep_temp=bool(keep_temp),
+            layer_role='checkpoint', recomposition_op='select',
+            low_quality_recomposition_op='select', force_tight_crop=True,
+        )
+        if result_ref is not None:
+            nrrd_layer_refs.append(result_ref)
+        pass_record: Dict[str, object] = {
+            'pass_index': int(pass_index),
+            'backend': str(samples.backend),
+            'endpoint_count': int(samples.endpoint_count),
+            'centerline_samples': int(samples.points_tyx.shape[0]),
+            'section_evidence_samples': int(len(evidence)),
+            'longitudinal_events': int(len(events)),
+            'clean_flank_events': int(sum(1 for event in events if event.clean_flanks)),
+            **component_stats,
+            'seconds': round(float(time.monotonic() - pass_started), 3),
+        }
+        if samples.details.get('error'):
+            pass_record['backend_error'] = str(samples.details.get('error'))
+        elif samples.details.get('vmtk_error'):
+            pass_record['backend_error'] = str(samples.details.get('vmtk_error'))
+        pass_records.append(pass_record)
+        print(
+            f'v14 centerline pass {int(pass_index)}: backend={samples.backend}, '
+            f'events={len(events)}, removed_components={int(component_stats["removed_components"])}, '
+            f'removed_voxels={int(component_stats["removed_voxels"])}, '
+            f'watershed_voxels={int(component_stats["watershed_voxels"])}.'
+        )
+        if int(component_stats['removed_voxels']) <= 0:
+            stop_reason = (
+                'backend_unavailable_pass_through'
+                if int(samples.points_tyx.shape[0]) <= 0
+                else 'no_safe_removals'
+            )
+            break
+    stats['passes'] = pass_records
+    stats['passes_completed'] = int(len(pass_records))
+    stats['stop_reason'] = str(stop_reason)
+    stats['total_removed_components'] = int(sum(int(item['removed_components']) for item in pass_records))
+    stats['total_removed_voxels'] = int(sum(int(item['removed_voxels']) for item in pass_records))
+    stats['total_watershed_voxels'] = int(sum(int(item['watershed_voxels']) for item in pass_records))
+    return stats
+
+
+# --------------------------
 # Scan-based interpolation helpers (v13.0.0 removed optional skeletonization)
 # --------------------------
 
@@ -22100,6 +23989,14 @@ class NrrdLayerRef:
     tile_acceptance: str = ''  # parent_mask, parent_bridge, consolidated, or blank
     stage: str = ''
     description: str = ''
+    # v14: make recomposition semantics explicit.  Legacy view contributors are
+    # additive by default; global checkpoints and centerline audit deltas override
+    # these values at construction time.
+    layer_role: str = 'additive_component'
+    recomposition_op: str = 'union'
+    low_quality_recomposition_op: str = 'union'
+    force_tight_crop: bool = False
+    mirror_low_quality: bool = True
     # Slicer SegmentN_Extent in this layer backing store's own (X,Y,t) index space.
     # Final NRRD packaging maps this extent into the requested output geometry without
     # reopening the layer solely to compute header metadata.
@@ -23766,6 +25663,11 @@ def materialize_nrrd_global_layer(
     known_has_foreground: Optional[bool] = None,
     volume_is_immutable: bool = False,
     keep_temp: bool = False,
+    layer_role: str = 'checkpoint',
+    recomposition_op: str = 'select',
+    low_quality_recomposition_op: str = 'select',
+    force_tight_crop: bool = False,
+    mirror_low_quality: bool = True,
 ) -> Optional[NrrdLayerRef]:
     # v13.3.1 (R16): see materialize_nrrd_view_layer.
     if known_has_foreground is not None:
@@ -23825,6 +25727,11 @@ def materialize_nrrd_global_layer(
             pass_index=int(pass_index),
             stage=str(stage),
             description=str(description),
+            layer_role=str(layer_role),
+            recomposition_op=str(recomposition_op),
+            low_quality_recomposition_op=str(low_quality_recomposition_op),
+            force_tight_crop=bool(force_tight_crop),
+            mirror_low_quality=bool(mirror_low_quality),
             segment_extent_ijk=None,  # deferred: computed by the sink worker before the header
             segment_extent_shape_tyx=(int(shape[0]), int(shape[1]), int(shape[2])),
             segment_extent_source='deferred_live_volume_scan',
@@ -23903,6 +25810,11 @@ def materialize_nrrd_global_layer(
         pass_index=int(pass_index),
         stage=str(stage),
         description=str(description),
+        layer_role=str(layer_role),
+        recomposition_op=str(recomposition_op),
+        low_quality_recomposition_op=str(low_quality_recomposition_op),
+        force_tight_crop=bool(force_tight_crop),
+        mirror_low_quality=bool(mirror_low_quality),
         segment_extent_ijk=segment_extent,
         segment_extent_shape_tyx=(int(shape[0]), int(shape[1]), int(shape[2])),
         segment_extent_source=segment_extent_source,
@@ -28713,7 +30625,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.6-Ultra_v13.3.18_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.6-Ultra_v14.0.0_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -29970,6 +31882,13 @@ class NrrdLayerSink:
     def submit_layer(self, ref: Optional['NrrdLayerRef'], suffix: str) -> Optional[Path]:
         if ref is None:
             return None
+        layer_tight_crop = bool(self.tight_crop or getattr(ref, 'force_tight_crop', False))
+        layer_role = str(getattr(ref, 'layer_role', 'additive_component'))
+        recomposition_op = str(getattr(ref, 'recomposition_op', 'union'))
+        low_quality_recomposition_op = str(
+            getattr(ref, 'low_quality_recomposition_op', recomposition_op)
+        )
+        mirror_low_quality = bool(getattr(ref, 'mirror_low_quality', True))
         with self._lock:
             seen = int(self._suffix_counts.get(str(suffix), 0))
             self._suffix_counts[str(suffix)] = seen + 1
@@ -29990,10 +31909,12 @@ class NrrdLayerSink:
                 'tile_acceptance': getattr(ref, 'tile_acceptance', ''),
                 'stage': getattr(ref, 'stage', ''),
                 'description': getattr(ref, 'description', ''),
+                'layer_role': layer_role,
+                'recomposition_op': recomposition_op,
                 'backing_shape_tyx': [int(v) for v in getattr(ref, 'shape', (0, 0, 0))],
                 'output_shape_tyx': [int(v) for v in self.output_shape],
                 'stored_shape_tyx': None,
-                'tight_cropped': bool(self.tight_crop),
+                'tight_cropped': bool(layer_tight_crop),
                 'crop_extent_xyt': None,
                 'reference_image_extent_offset_ijk': None,
                 'empty_segment': None,
@@ -30014,7 +31935,7 @@ class NrrdLayerSink:
             # re-decoding the full-resolution layer store as an independent task.
             lq_mirror_args: List[Tuple[Tuple[int, int, int], Path]] = []
             lq_manifest_entries: List[Tuple[Tuple[int, int, int], Dict[str, object]]] = []
-            for spec in self.low_quality_specs:
+            for spec in self.low_quality_specs if mirror_low_quality else []:
                 if self.low_quality_root is None:
                     break
                 lq_shape = (
@@ -30035,10 +31956,13 @@ class NrrdLayerSink:
                     'tile_acceptance': getattr(ref, 'tile_acceptance', ''),
                     'stage': getattr(ref, 'stage', ''),
                     'description': getattr(ref, 'description', ''),
+                    'layer_role': layer_role,
+                    'recomposition_op': low_quality_recomposition_op,
+                    'full_quality_recomposition_op': recomposition_op,
                     'backing_shape_tyx': [int(v) for v in getattr(ref, 'shape', (0, 0, 0))],
                     'output_shape_tyx': [int(v) for v in lq_shape],
                     'stored_shape_tyx': None,
-                    'tight_cropped': bool(self.tight_crop),
+                    'tight_cropped': bool(layer_tight_crop),
                     'crop_extent_xyt': None,
                     'reference_image_extent_offset_ijk': None,
                     'empty_segment': None,
@@ -30057,7 +31981,7 @@ class NrrdLayerSink:
                 # and pass it through to the mirror/full writer as one immutable decision.
                 resolved_ref = _resolve_live_ref_extent(ref)
                 full_plan = _nrrd_raster_plan(
-                    resolved_ref, self.output_shape, tight_crop=bool(self.tight_crop),
+                    resolved_ref, self.output_shape, tight_crop=bool(layer_tight_crop),
                 )
                 executed_z_shards = int(_nrrd_layer_zshard_count(
                     resolved_ref, int(full_plan.stored_shape_tyx[0]),
@@ -30081,7 +32005,7 @@ class NrrdLayerSink:
                     )
                     for lq_shape, lq_entry in lq_manifest_entries:
                         lq_plan = _nrrd_raster_plan(
-                            composed_mirror_ref, lq_shape, tight_crop=bool(self.tight_crop),
+                            composed_mirror_ref, lq_shape, tight_crop=bool(layer_tight_crop),
                         )
                         lq_entry['stored_shape_tyx'] = [int(v) for v in lq_plan.stored_shape_tyx]
                         lq_entry['tight_cropped'] = bool(lq_plan.tight_cropped)
@@ -30097,7 +32021,7 @@ class NrrdLayerSink:
                         segment_name=segment_name,
                         segment_color=segment_color,
                         z_shards=int(executed_z_shards),
-                        tight_crop=bool(self.tight_crop),
+                        tight_crop=bool(layer_tight_crop),
                     )
                 return write_single_layer_nrrd_from_ref(
                     resolved_ref, self.output_shape, out_path,
@@ -30105,7 +32029,7 @@ class NrrdLayerSink:
                     segment_name=segment_name,
                     segment_color=segment_color,
                     z_shards=int(executed_z_shards),
-                    tight_crop=bool(self.tight_crop),
+                    tight_crop=bool(layer_tight_crop),
                 )
 
             fut = self.executor.submit(_execute_layer_write)
@@ -30116,9 +32040,25 @@ class NrrdLayerSink:
         with self._lock:
             return len(self._manifest)
 
+    def centerline_audit_layer_count(self) -> int:
+        with self._lock:
+            return int(sum(
+                1 for entry in self._manifest
+                if str(entry.get('source', '')) == 'centerline_filter'
+            ))
+
     def low_quality_layer_count(self) -> int:
         with self._lock:
             return int(sum(len(entries) for entries in self._lq_manifests.values()))
+
+    def low_quality_centerline_audit_layer_count(self) -> int:
+        with self._lock:
+            return int(sum(
+                1
+                for entries in self._lq_manifests.values()
+                for entry in entries
+                if str(entry.get('source', '')) == 'centerline_filter'
+            ))
 
     def wait(self) -> None:
         with self._lock:
@@ -30162,16 +32102,18 @@ class NrrdLayerSink:
                     'exported_axes': '(X, Y, t)',
                     'output_shape_tyx': [int(v) for v in lq_shape],
                     'full_quality_output_shape_tyx': [int(v) for v in self.output_shape],
-                    'tight_crop_enabled': bool(self.tight_crop),
+                    'tight_crop_enabled': bool(any(bool(item.get('tight_cropped', False)) for item in entries)),
+                    'tight_crop_enabled_by_default': bool(self.tight_crop),
                     'layer_count': len(entries),
                     'layers': entries,
                     'notes': [
-                        'Low-quality distribution decomposition: the same component layers as the full-quality '
-                        'nrrd/ folder, isotropically downbinned to this spec and written as each view completes.',
+                        'Low-quality distribution: eligible component layers and complete checkpoints from the '
+                        'full-quality nrrd/ folder, isotropically downbinned to this spec.',
                         'Each NRRD is one uint8 binary mask in source output geometry (X, Y, t), downbinned.',
                         'v13.2.3: each file is a 3D Slicer segmentation (.seg.nrrd) sharing its full-quality layer\'s segment name and color.',
-                        'Layer suffixes match the full-quality layers, so each low-quality layer maps 1:1 to its full-quality layer.',
-                        'When tight_crop_enabled is true, stored_shape_tyx and reference_image_extent_offset_ijk reconstruct each raster in output_shape_tyx.',
+                        'Layer suffixes match the corresponding full-quality layers. Sparse subtractive and marker-only audit layers are intentionally not mirrored.',
+                        'Use each layer\'s recomposition_op. Only union entries marked union; select entries are complete checkpoints.',
+                        'When a layer\'s tight_cropped field is true, stored_shape_tyx and reference_image_extent_offset_ijk reconstruct its raster in output_shape_tyx.',
                     ],
                 }, indent=2))
         if not manifest_layers:
@@ -30181,16 +32123,20 @@ class NrrdLayerSink:
             'layout': 'one_single_layer_nrrd_per_component',
             'exported_axes': '(X, Y, t)',
             'output_shape_tyx': [int(v) for v in self.output_shape],
-            'tight_crop_enabled': bool(self.tight_crop),
+            'tight_crop_enabled': bool(any(
+                bool(item.get('tight_cropped', False)) for item in manifest_layers
+            )),
+            'tight_crop_enabled_by_default': bool(self.tight_crop),
             'layer_count': len(manifest_layers),
             'layers': manifest_layers,
             'notes': [
                 'Each NRRD is one uint8 binary mask in source output geometry (X, Y, t).',
                 'v13.2.3: each file is a 3D Slicer segmentation (.seg.nrrd) holding one segment named after the file; segment_color_rgb records the assigned Slicer color.',
-                'Files can be recombined (union) or omitted after a full run to build a custom volume without rerunning.',
+                'Recomposition is role-aware: union only layers whose recomposition_op is union; select chooses a complete checkpoint; subtract_from_previous_checkpoint removes that full-quality delta; none is diagnostic only.',
                 'YOLO layers are cleaned masks before interpolation bridges; bridge layers contain only voxels added by that pass.',
-                'Global_final_output is the final segmentation after all postprocessing and is not intended for recomposition.',
-                'When tight_crop_enabled is true, stored_shape_tyx and reference_image_extent_offset_ijk reconstruct each raster in output_shape_tyx.',
+                'Global checkpoints, including centerline pass00_input/result and Global_final_output, are complete alternatives and must never be unioned with component or audit layers.',
+                'The manifest lists only this run. In a reused output directory, similarly named files absent from this manifest are stale and must be ignored.',
+                'When a layer\'s tight_cropped field is true, stored_shape_tyx and reference_image_extent_offset_ijk reconstruct its raster in output_shape_tyx.',
             ],
         }
         manifest_path.write_text(json.dumps(manifest, indent=2))
@@ -32298,6 +34244,35 @@ def main() -> None:
     model_paths = [model_path_resolved]
     model_name = Path(model_paths[0]).stem
 
+    # Resolve v14 post-union behavior before starting the background model loader.
+    # Invalid settings therefore cannot leave a heavyweight loader thread running.
+    if int(args.centerline_filter_passes) < 0:
+        raise ValueError('--centerline_filter_passes must be >= 0; use 0 to disable')
+    if float(args.centerline_radius_factor) <= 1.0:
+        raise ValueError('--centerline_radius_factor must be > 1.0')
+    if int(args.centerline_temporal_context) < 0:
+        raise ValueError('--centerline_temporal_context must be >= 0')
+    if int(args.centerline_surface_max_dim) < 64:
+        raise ValueError('--centerline_surface_max_dim must be >= 64')
+    if int(args.centerline_surface_points) < 1000:
+        raise ValueError('--centerline_surface_points must be >= 1000')
+    if float(args.centerline_vmtk_timeout) <= 0.0:
+        raise ValueError('--centerline_vmtk_timeout must be > 0')
+    centerline_filter_enabled = bool(
+        int(args.centerline_filter_passes) > 0
+        and str(args.centerline_filter_backend).strip().lower() != 'off'
+    )
+    if (
+        centerline_filter_enabled
+        and str(args.centerline_filter_backend).strip().lower() == 'vmtk'
+        and not _v14_vmtk_modules_available()
+    ):
+        print(
+            'Warning: --centerline_filter_backend vmtk was requested but VTK/VMTK '
+            'is not importable. The pipeline will still run, preserve pass 0, skip '
+            'the filter pass, and make no automatic removals.'
+        )
+
     # P9: resolve process-local inference topology before considering a parent model load.
     # Multi-GPU workers each deserialize their own engine; the parent needs only this path/name
     # metadata and must not contend for engine file-cache, host memory, or CUDA resources.
@@ -32458,7 +34433,12 @@ def main() -> None:
     # v13.2.1 (bug #2): when both --save_nrrd and a low-quality request are active, the low-quality
     # NRRD decomposition mirrors the full-quality layers (one downbinned single-layer NRRD per
     # component layer) on the same view-completion schedule, rather than one combined tail volume.
+    # Keep these booleans separate. ``nrrd_layers_needed`` controls the established,
+    # expensive per-view decomposition and G5 projected-layer behavior. v14 audit-only
+    # runs need a sink but must not broaden any of those paths.
     nrrd_layers_needed = bool(args.save_nrrd)
+    centerline_audit_nrrd_needed = bool(centerline_filter_enabled)
+    nrrd_sink_needed = bool(nrrd_layers_needed or centerline_audit_nrrd_needed)
     if bool(args.save_nrrd_tight_crop) and not bool(args.save_nrrd):
         raise ValueError('--save_nrrd_tight_crop requires --save_nrrd')
     troubleshooting_outputs_enabled = bool(args.troubleshooting)
@@ -32498,8 +34478,12 @@ def main() -> None:
     set_final_source_output_shape((input_T, input_H, input_W))
 
     nrrd_dir = out_dir / 'nrrd'
-    if bool(args.save_nrrd):
-        sink_low_quality_specs = list(low_quality_downbin_specs) if bool(low_quality_requested) else []
+    if bool(nrrd_sink_needed):
+        sink_low_quality_specs = (
+            list(low_quality_downbin_specs)
+            if bool(args.save_nrrd) and bool(low_quality_requested)
+            else []
+        )
         set_nrrd_layer_sink(NrrdLayerSink(
             nrrd_dir=nrrd_dir,
             stem=input_path.stem,
@@ -32508,7 +34492,9 @@ def main() -> None:
             pigz_threads=nrrd_single_layer_pigz_threads(),
             low_quality_specs=sink_low_quality_specs,
             low_quality_root=(out_dir / 'low_quality'),
-            tight_crop=bool(args.save_nrrd_tight_crop),
+            # Audit-only checkpoints default to recoverable tight rasters so enabling
+            # the safety stage does not multiply full-volume NRRD storage.
+            tight_crop=(bool(args.save_nrrd_tight_crop) if bool(args.save_nrrd) else True),
         ))
     else:
         set_nrrd_layer_sink(None)
@@ -32757,7 +34743,8 @@ def main() -> None:
         'and fuses YOLO+bridge layers; sparse topology unions are compiled in larger batches and '
         'G5 may use idle GPUs; FFV1 shards remain in scratch and videos enter publication only '
         'after an atomic replace; '
-        f'tight cropped segmentation rasters are {"enabled" if bool(args.save_nrrd_tight_crop) else "disabled"}.'
+        f'legacy component-layer tight cropping is {"enabled" if bool(args.save_nrrd_tight_crop) else "disabled"}; '
+        'v14 centerline audit/checkpoint layers always use compact recoverable rasters.'
     )
     spec_notes.append(
         'v13.3.2 (R5/R6/R10/R14/R15/R21): CPU tilted rendering hoists all frame-invariant shear '
@@ -35581,6 +37568,41 @@ def main() -> None:
         projected_layer_refs=fused_projected_layer_refs,
     )
 
+    centerline_filter_stats: Dict[str, object] = apply_v14_centerline_filter_inplace(
+        final_union_mm,
+        model_name=str(model_name), temp_dir=temp_dir,
+        passes=int(args.centerline_filter_passes),
+        backend=str(args.centerline_filter_backend),
+        radius_factor=float(args.centerline_radius_factor),
+        temporal_context=int(args.centerline_temporal_context),
+        automatic_removal_enabled=bool(args.centerline_auto_remove),
+        surface_max_dim=int(args.centerline_surface_max_dim),
+        surface_points=int(args.centerline_surface_points),
+        timeout_seconds=float(args.centerline_vmtk_timeout),
+        workers=int(tail_slice_workers), keep_temp=bool(keep_temp_artifacts),
+        nrrd_layer_refs=nrrd_layer_refs,
+    )
+    if bool(centerline_filter_stats.get('enabled', False)):
+        pass_summaries = [
+            (
+                f"pass {int(record.get('pass_index', 0))}: backend={record.get('backend', 'unknown')}, "
+                f"events={int(record.get('longitudinal_events', 0))}, "
+                f"removed_components={int(record.get('removed_components', 0))}, "
+                f"removed_voxels={int(record.get('removed_voxels', 0))}, "
+                f"watershed_voxels={int(record.get('watershed_voxels', 0))}"
+            )
+            for record in centerline_filter_stats.get('passes', [])
+        ]
+        spec_notes.append(
+            'v14.0.0 centerline post-union filter: pass 0 preserves the untouched union; '
+            'network extraction is endpoint-only and accurate centerlines provide maximum-inscribed '
+            f'radii; X={float(args.centerline_radius_factor):g}; anomaly duration is uncapped; '
+            f'automatic component removal={"enabled" if bool(args.centerline_auto_remove) else "disabled (audit-first)"}; '
+            'protected or otherwise unsafe 2D components are marker-only; '
+            f"stop={centerline_filter_stats.get('stop_reason', 'unknown')}. "
+            + ('; '.join(pass_summaries) if pass_summaries else 'No filter pass completed.')
+        )
+
     if bool(nrrd_layers_needed):
         pre_smoothing_ref = materialize_nrrd_global_layer(
             final_union_mm,
@@ -35589,7 +37611,7 @@ def main() -> None:
             mask_kind='union',
             pass_index=0,
             stage='pre_smoothing',
-            description='Global union after all active view/tile layers and optional 3D void fill, before Gaussian smoothing and keep_objects.',
+            description='Global union after all active view/tile layers, optional 3D void fill, and v14 centerline filtering; before Gaussian smoothing and keep_objects.',
             temp_dir=temp_dir,
             workers=int(tail_slice_workers),
         )
@@ -35759,12 +37781,18 @@ def main() -> None:
     nrrd_manifest_path: Optional[Path] = None
     nrrd_layer_files_written = 0
     nrrd_low_quality_layer_files_written = 0
+    nrrd_centerline_audit_files_written = 0
+    nrrd_low_quality_centerline_audit_files_written = 0
     layer_sink = nrrd_layer_sink()
     if layer_sink is not None:
         print('\n=== Finishing single-layer NRRD writes ===')
         layer_sink.wait()
         nrrd_layer_files_written = int(layer_sink.layer_count())
         nrrd_low_quality_layer_files_written = int(layer_sink.low_quality_layer_count())
+        nrrd_centerline_audit_files_written = int(layer_sink.centerline_audit_layer_count())
+        nrrd_low_quality_centerline_audit_files_written = int(
+            layer_sink.low_quality_centerline_audit_layer_count()
+        )
         nrrd_manifest_path = layer_sink.write_manifest()
         layer_sink.shutdown()
         set_nrrd_layer_sink(None)
@@ -35790,8 +37818,11 @@ def main() -> None:
             final_paths[f'{view.name}_images_dir'] = image_dir
 
     if bool(nrrd_layers_needed):
+        legacy_nrrd_count = max(
+            0, int(nrrd_layer_files_written) - int(nrrd_centerline_audit_files_written),
+        )
         spec_notes.append(
-            f'NRRD decomposition (v13.2.0): {int(nrrd_layer_files_written)} single-layer NRRD file(s) written to '
+            f'NRRD decomposition (v13.2.0): {int(legacy_nrrd_count)} legacy component/checkpoint NRRD file(s) written to '
             f'{nrrd_dir} as one uint8 binary mask per component layer (X,Y,t source geometry), named '
             '{Filestem}_{ViewToken|Global}_{layer}.seg.nrrd with the model name dropped, tagged as a 3D Slicer '
             'segmentation (v13.2.3: segment named after the file, deterministic per-layer color). Each layer is created during '
@@ -35801,13 +37832,27 @@ def main() -> None:
             'decomposed NRRD (one file with a trailing list axis) has been removed.'
         )
         if int(nrrd_low_quality_layer_files_written) > 0:
+            legacy_lq_nrrd_count = max(
+                0,
+                int(nrrd_low_quality_layer_files_written)
+                - int(nrrd_low_quality_centerline_audit_files_written),
+            )
             spec_notes.append(
-                f'Low-quality NRRD decomposition (v13.2.1, bug #2): {int(nrrd_low_quality_layer_files_written)} '
+                f'Low-quality NRRD decomposition (v13.2.1, bug #2): {int(legacy_lq_nrrd_count)} legacy '
                 'downbinned single-layer NRRD file(s) written under low_quality/<token>/nrrd/, mirroring the '
                 'full-quality component layers per --save_low_quality_downbin spec and written on the same '
                 'view-completion schedule. Each downbin has its own {Filestem}_nrrd_manifest.json with layer '
                 'suffixes matching the full-quality nrrd/ folder.'
             )
+    if bool(centerline_audit_nrrd_needed):
+        spec_notes.append(
+            f'v14.0.0 centerline audit NRRDs: pass 0 and, for each completed detection pass, '
+            f'sparse removed-component/watershed-candidate layers plus a result checkpoint were written under '
+            f'{nrrd_dir}. Audit-only mode uses tight recoverable rasters and does not enable '
+            f'the legacy per-view decomposition. The manifest identifies explicit select/subtract/marker '
+            f'roles for {int(nrrd_centerline_audit_files_written)} centerline audit file(s) and '
+            f'{int(nrrd_layer_files_written)} total layer file(s) from this run.'
+        )
 
     summary_path = write_summary_file(
         out_dir / f'{input_path.stem}_Summary.txt',
