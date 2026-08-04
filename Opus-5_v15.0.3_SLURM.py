@@ -467,19 +467,36 @@ def _cgroup_reclaimable_file_bytes(node: Path, *, v2: bool) -> int:
     those clean file pages before OOM-killing. Subtract inactive_file (v2) /
     total_inactive_file (v1) to approximate the kernel's own MemAvailable-style
     working-set view — otherwise every workspace silently flips to disk mid-run.
+
+    v15.0.3 fix: inactive_file also counts DIRTY and under-writeback pages, which the
+    kernel cannot hand back until they reach the backing store. This pipeline writes
+    hundreds of GiB through file-backed memmaps and deliberately skips msync (v13.2.5
+    speed #6 / v13.3.1 R3), so at steady state a large slice of inactive_file is dirty.
+    Counting it as headroom over-reports what may still be allocated, and the resulting
+    anonymous workspace decision (should_use_in_memory_workspace) overshoots into an
+    uncatchable cgroup OOM SIGKILL. Net out file_dirty + file_writeback so only genuinely
+    reclaimable clean page cache is credited.
     """
-    key = 'inactive_file' if v2 else 'total_inactive_file'
+    if v2:
+        keys = ('inactive_file', 'file_dirty', 'file_writeback')
+    else:
+        keys = ('total_inactive_file', 'total_dirty', 'total_writeback')
+    found: Dict[str, int] = {}
     try:
         for line in (node / 'memory.stat').read_text().splitlines():
             parts = line.split()
-            if len(parts) == 2 and parts[0] == key:
+            if len(parts) == 2 and parts[0] in keys:
                 try:
-                    return max(0, int(parts[1]))
+                    found[parts[0]] = int(parts[1])
                 except Exception:
-                    return 0
+                    continue
     except Exception:
-        pass
-    return 0
+        return 0
+    inactive = int(found.get(keys[0], 0))
+    if inactive <= 0:
+        return 0
+    unreclaimable = int(found.get(keys[1], 0)) + int(found.get(keys[2], 0))
+    return max(0, inactive - unreclaimable)
 
 
 def _cgroup_memory_headroom_bytes() -> Optional[int]:
@@ -1651,12 +1668,117 @@ def choose_slice_parallel_workers(requested_workers: int, num_items: int) -> int
     return max(1, min(int(requested_workers), int(max(1, num_items))))
 
 
-def choose_scratch_dir(preferred: Optional[str], out_dir: Path, stem: str) -> Path:
-    """Pick the bulk disk-backed scratch root.
+_MEMORY_BACKED_FSTYPES = ('tmpfs', 'ramfs', 'hugetlbfs')
+_SCRATCH_DIR_IS_MEMORY_BACKED = False
 
-      - no longer auto-selects tmpfs locations like /dev/shm for the whole pipeline
-      - defaults to {output}/temp so large persistent memmaps stay off tmpfs unless the user explicitly opts in
+
+def _mount_fstype_for_path(path: Path) -> Optional[str]:
+    """Filesystem type of the longest mount point containing ``path``, or None if unknown."""
+    try:
+        target = Path(path).resolve()
+    except Exception:
+        target = Path(path)
+    try:
+        lines = Path('/proc/mounts').read_text().splitlines()
+    except Exception:
+        return None
+    best_depth = -1
+    best_fstype: Optional[str] = None
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        try:
+            # /proc/mounts octal-escapes spaces and friends in the mount point.
+            mount_point = Path(parts[1].replace('\\040', ' '))
+        except Exception:
+            continue
+        if target != mount_point and mount_point not in target.parents:
+            continue
+        depth = len(mount_point.parts)
+        if depth > best_depth:
+            best_depth = depth
+            best_fstype = str(parts[2])
+    return best_fstype
+
+
+def path_is_memory_backed(path: Path) -> bool:
+    """True when ``path`` lives on tmpfs/ramfs/hugetlbfs, i.e. its 'files' are RAM pages."""
+    fstype = _mount_fstype_for_path(path)
+    return bool(fstype is not None and str(fstype).lower() in _MEMORY_BACKED_FSTYPES)
+
+
+def _filesystem_free_bytes(path: Path) -> int:
+    try:
+        return int(shutil.disk_usage(str(path)).free)
+    except Exception:
+        return 0
+
+
+def scratch_shm_required_free_bytes() -> int:
+    """Free bytes a memory-backed mount must show before it is auto-selected for scratch."""
+    return int(max(0.0, _env_float('YOLO_TTA_SCRATCH_SHM_MIN_FREE_GIB', 256.0)) * GIB)
+
+
+def _auto_shm_scratch_candidate() -> Optional[Path]:
+    """v15.0.3 (T10): a memory-backed scratch root, but only when it is demonstrably roomy.
+
+    The bar is deliberately high. A tmpfs that fills mid-run SIGBUSes the writing process
+    instead of returning ENOSPC — that is why whole-pipeline shm auto-selection was removed —
+    and tmpfs pages are charged to this job's cgroup exactly like anonymous memory, so a roomy
+    mount on a node whose SLURM allocation is nearly spent is still the wrong place (an
+    overrun there is an uncatchable OOM kill, not a MemoryError the disk fallback can catch).
+    Both the mount's free space and the cgroup headroom must therefore clear the requirement.
     """
+    mode = os.environ.get('YOLO_TTA_SCRATCH_PREFER_SHM', '').strip().lower()
+    if mode in ('0', 'false', 'no', 'off', 'never'):
+        return None
+    forced = mode in ('1', 'true', 'yes', 'on', 'always', 'force')
+
+    roots = [
+        raw for raw in (os.environ.get('YOLO_TTA_SCRATCH_SHM_DIR', '').strip(), '/dev/shm') if raw
+    ]
+    required = scratch_shm_required_free_bytes()
+    for raw in roots:
+        cand = Path(raw).expanduser()
+        try:
+            if not (cand.is_dir() and os.access(str(cand), os.W_OK)):
+                continue
+        except Exception:
+            continue
+        if not path_is_memory_backed(cand):
+            continue
+        if forced:
+            return cand
+        if required <= 0:
+            continue
+        if _filesystem_free_bytes(cand) < required:
+            continue
+        headroom = available_anon_work_bytes()
+        if headroom > 0 and headroom < required:
+            continue
+        return cand
+    return None
+
+
+def scratch_dir_is_memory_backed() -> bool:
+    """Whether the scratch root chosen by ``choose_scratch_dir`` is RAM rather than disk."""
+    return bool(_SCRATCH_DIR_IS_MEMORY_BACKED)
+
+
+def choose_scratch_dir(preferred: Optional[str], out_dir: Path, stem: str) -> Path:
+    """Pick the bulk scratch root.
+
+      - an explicit preference (argument, then YOLO_TTA_SCRATCH_DIR) always wins
+      - v15.0.3 (T10): a memory-backed mount is auto-selected when ``_auto_shm_scratch_candidate``
+        can prove it has room. This matters most for the tile path: since T4 the
+        per-configuration tile canvas is a real file that every GPU worker opens 'r+' to OR its
+        crops into, so on a shared filesystem it sits in the critical section, while on shm it
+        is RAM that all processes map to the same physical pages. The shared source volume
+        lands on the same mount because it is allocated under this scratch dir too.
+      - otherwise defaults to {output}/temp so large persistent memmaps stay off tmpfs
+    """
+    global _SCRATCH_DIR_IS_MEMORY_BACKED
     candidates: List[Path] = []
     seen: set[str] = set()
 
@@ -1672,6 +1794,9 @@ def choose_scratch_dir(preferred: Optional[str], out_dir: Path, stem: str) -> Pa
     env_pref = os.environ.get('YOLO_TTA_SCRATCH_DIR', '').strip()
     if env_pref:
         _add_candidate(Path(env_pref).expanduser())
+    shm_candidate = _auto_shm_scratch_candidate()
+    if shm_candidate is not None:
+        _add_candidate(shm_candidate)
     _add_candidate(out_dir)
 
     chosen_root: Optional[Path] = None
@@ -1693,6 +1818,7 @@ def choose_scratch_dir(preferred: Optional[str], out_dir: Path, stem: str) -> Pa
         scratch_dir = chosen_root / f'{stem}_{os.getpid()}_temp'
 
     scratch_dir.mkdir(parents=True, exist_ok=True)
+    _SCRATCH_DIR_IS_MEMORY_BACKED = bool(path_is_memory_backed(scratch_dir))
     return scratch_dir
 
 
@@ -5805,12 +5931,21 @@ def build_dense_tile_jobs_for_aug(
     out_size: int,
     temp_dir: Path,
 ) -> List[DenseTileJob]:
-    tile_dir = temp_dir / 'tiles' / view.name / tile_cfg.config_id / aug_job.aug_id
+    # T11: one consolidated diagnostic sidecar per (view, configuration) instead of one
+    # indented JSON file per tile. See write_dense_tile_job_meta.
+    tile_meta_path = temp_dir / 'tiles' / view.name / tile_cfg.config_id / 'tiles.jsonl'
     xs = dense_tile_positions(int(aug_job.aff.canvas_w), int(tile_cfg.tile_size), int(tile_cfg.tile_stride))
     ys = dense_tile_positions(int(aug_job.aff.canvas_h), int(tile_cfg.tile_size), int(tile_cfg.tile_stride))
-    jobs: List[DenseTileJob] = []
 
     M_src_to_canvas3 = _affine2x3_to_3x3(aug_job.aff.M_src_to_canvas)
+    # Depends only on tile_size/out_size, so it is the same matrix for every tile of this
+    # configuration — build it once instead of once per tile.
+    M_scale = _center_preserving_scale_matrix(
+        int(tile_cfg.tile_size), int(tile_cfg.tile_size), int(out_size), int(out_size),
+    )
+
+    tile_specs: List[Tuple[str, int, int]] = []
+    forward_mats: List[np.ndarray] = []
     for tile_y in ys:
         for tile_x in xs:
             tile_id = f'{tile_cfg.config_id}_{aug_job.aug_id}_x{int(tile_x):04d}_y{int(tile_y):04d}'
@@ -5822,25 +5957,34 @@ def build_dense_tile_jobs_for_aug(
                 ],
                 dtype=np.float64,
             )
-            M_scale = _center_preserving_scale_matrix(int(tile_cfg.tile_size), int(tile_cfg.tile_size), int(out_size), int(out_size))
-            M_src_to_out3 = M_scale @ M_crop @ M_src_to_canvas3
-            M_out_to_src3 = np.linalg.inv(M_src_to_out3)
-            jobs.append(
-                DenseTileJob(
-                    view=view.name,
-                    aug_id=aug_job.aug_id,
-                    config_id=tile_cfg.config_id,
-                    tile_id=tile_id,
-                    tile_x=int(tile_x),
-                    tile_y=int(tile_y),
-                    tile_size=int(tile_cfg.tile_size),
-                    tile_stride=int(tile_cfg.tile_stride),
-                    out_size=int(out_size),
-                    meta_path=tile_dir / f'{view.name}_{tile_id}.meta.json',
-                    M_out_to_src=M_out_to_src3[:2, :3].astype(np.float32),
-                    M_src_to_out=M_src_to_out3[:2, :3].astype(np.float32),
-                )
-            )
+            forward_mats.append(M_scale @ M_crop @ M_src_to_canvas3)
+            tile_specs.append((tile_id, int(tile_x), int(tile_y)))
+
+    if not tile_specs:
+        return []
+
+    # T11: one batched inversion over the whole (N, 3, 3) stack rather than a np.linalg.inv
+    # call per tile.
+    M_src_to_out_stack = np.stack(forward_mats, axis=0)
+    M_out_to_src_stack = np.linalg.inv(M_src_to_out_stack)
+
+    jobs: List[DenseTileJob] = [
+        DenseTileJob(
+            view=view.name,
+            aug_id=aug_job.aug_id,
+            config_id=tile_cfg.config_id,
+            tile_id=tile_id,
+            tile_x=int(tile_x),
+            tile_y=int(tile_y),
+            tile_size=int(tile_cfg.tile_size),
+            tile_stride=int(tile_cfg.tile_stride),
+            out_size=int(out_size),
+            meta_path=tile_meta_path,
+            M_out_to_src=M_out_to_src_stack[i][:2, :3].astype(np.float32),
+            M_src_to_out=M_src_to_out_stack[i][:2, :3].astype(np.float32),
+        )
+        for i, (tile_id, tile_x, tile_y) in enumerate(tile_specs)
+    ]
 
     # T1: resolve every tile's parent-grid crop window against one shared (h, w), so a whole
     # configuration can share a single uniformly shaped result volume.
@@ -5856,36 +6000,72 @@ def build_dense_tile_jobs_for_aug(
     return jobs
 
 
+_TILE_META_STREAM_LOCK = threading.Lock()
+_TILE_META_STREAM_WRITTEN: Dict[str, set[str]] = {}
+
+
 def write_dense_tile_job_meta(
     job: DenseTileJob,
     channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
 ) -> None:
+    """Append one tile's geometry to the consolidated per-(view, configuration) tiles.jsonl.
+
+    v15.0.3 (T11): this used to be one ``mkdir`` plus one indented JSON file per tile. On a
+    shared parallel filesystem, hundreds of small-file creates per view is a metadata-op storm
+    that shows up as multi-second stalls in the enqueue phase, and these files are purely
+    diagnostic sidecars — nothing downstream reads or globs them. Now each configuration
+    creates one directory and one file, and every tile is one appended line.
+
+    Several call sites may touch the same tile (the streaming ref builder and the tile-group
+    builder both do). Overwriting a per-tile file made that idempotent for free; with an
+    append-mode stream it has to be explicit, so repeat tiles are dropped — which also makes
+    the repeat calls cheaper than the writes they replace.
+    """
     fmt = resolve_channel_format(channel_format)
-    job.meta_path.parent.mkdir(parents=True, exist_ok=True)
-    job.meta_path.write_text(
-        json.dumps(
-            {
-                'view': job.view,
-                'aug_id': job.aug_id,
-                'config_id': job.config_id,
-                'tile_id': job.tile_id,
-                'tile_x': int(job.tile_x),
-                'tile_y': int(job.tile_y),
-                'tile_size': int(job.tile_size),
-                'tile_stride': int(job.tile_stride),
-                'out_size': int(job.out_size),
-                'M_out_to_src': job.M_out_to_src.tolist(),
-                'M_src_to_out': job.M_src_to_out.tolist(),
-                'channel_format': fmt.token,
-                'model_input_channels': int(fmt.channel_count),
-                'channel_stride': int(fmt.stride),
-                'channel_offsets': [int(v) for v in fmt.offsets],
-                'channel_boundary_policy': 'edge_clamp',
-                'prediction_slice_policy': 'center_N_only',
-            },
-            indent=2,
-        )
+    path = Path(job.meta_path)
+    key = str(path)
+    record = json.dumps(
+        {
+            'view': job.view,
+            'aug_id': job.aug_id,
+            'config_id': job.config_id,
+            'tile_id': job.tile_id,
+            'tile_x': int(job.tile_x),
+            'tile_y': int(job.tile_y),
+            'tile_size': int(job.tile_size),
+            'tile_stride': int(job.tile_stride),
+            'out_size': int(job.out_size),
+            'M_out_to_src': job.M_out_to_src.tolist(),
+            'M_src_to_out': job.M_src_to_out.tolist(),
+            'channel_format': fmt.token,
+            'model_input_channels': int(fmt.channel_count),
+            'channel_stride': int(fmt.stride),
+            'channel_offsets': [int(v) for v in fmt.offsets],
+            'channel_boundary_policy': 'edge_clamp',
+            'prediction_slice_policy': 'center_N_only',
+        },
+        separators=(',', ':'),
     )
+    with _TILE_META_STREAM_LOCK:
+        written = _TILE_META_STREAM_WRITTEN.get(key)
+        if written is None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # Drop any stream left behind by an earlier run so the sidecar describes this one.
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            written = set()
+            _TILE_META_STREAM_WRITTEN[key] = written
+        tile_key = str(job.tile_id)
+        if tile_key in written:
+            return
+        written.add(tile_key)
+        try:
+            with path.open('a', encoding='utf-8') as handle:
+                handle.write(record + '\n')
+        except Exception as exc:
+            print(f'Warning: could not append tile metadata for {job.tile_id} to {path} ({exc})')
 
 
 @dataclass(frozen=True)
@@ -8850,6 +9030,28 @@ def gpu_union_flush_overlap_enabled() -> bool:
     return _env_flag('YOLO_TTA_GPU_UNION_FLUSH_OVERLAP', True)
 
 
+# v15.0.3 fix: process-wide mutual exclusion between CUDA graph capture and every other
+# CUDA-touching thread in this process.
+#
+# torch.cuda.graph() defaults to capture_error_mode='global'. Under that mode ANY thread
+# that issues a capture-unsafe call (cudaEventSynchronize, cudaStreamSynchronize,
+# cudaStreamCreate, cudaEventCreate, cudaHostAlloc, ...) while a capture is live fails with
+# cudaErrorStreamCaptureUnsupported — and the error surfaces in the innocent thread, not the
+# capturing one. The device-union flush executor does exactly that: _DeviceUnionAccumulator
+# .flush_into allocates a pinned buffer, creates a stream and two events, and calls
+# Event.synchronize() per chunk. Whenever a flush overlapped a resident-ring or fused-render
+# capture the flush thread raised and the task was reported as a worker failure.
+#
+# Hold this lock for the duration of every capture and around the flush path's CUDA section
+# so the two can never overlap. 'global' mode is retained on purpose: it stays a live
+# detector for any OTHER unguarded thread, which is preferable to thread_local silently
+# admitting a corrupted graph into steady-state replay.
+#
+# Deadlock-free by construction: the flush path waits only on events it recorded on its own
+# copy stream over already-resident device memory, and never on work the capturing thread
+# must still enqueue.
+_CUDA_GRAPH_CAPTURE_LOCK = threading.RLock()
+
 _GPU_UNION_FLUSH_EXECUTOR: Optional[ThreadPoolExecutor] = None
 _GPU_UNION_FLUSH_EXECUTOR_LOCK = threading.Lock()
 
@@ -9113,52 +9315,59 @@ class _DeviceUnionAccumulator:
         chunk = max(1, min(int(chunk_slices), n))
         plane = int(h) * int(w)
         written = self.written
-        pin_buf = _acquire_pinned_u8_buffer(torch, 2 * chunk * plane)
-        pin_views = (
-            pin_buf[: chunk * plane].view(chunk, h, w),
-            pin_buf[chunk * plane: 2 * chunk * plane].view(chunk, h, w),
-        )
-        pin_np = (pin_views[0].numpy(), pin_views[1].numpy())
-        copy_stream = torch.cuda.Stream(device=self.device)
-        events = (torch.cuda.Event(), torch.cuda.Event())
-        try:
-            def _drain(src_dev: object, dst_mm: np.ndarray) -> None:
-                # Chunks with no device-written slice carry only zeros: skip them outright
-                # (host-side fallback writes for those slices already happened).
-                chunks = [
-                    (z0, min(n, z0 + chunk))
-                    for z0 in range(0, n, chunk)
-                    if bool(written[z0:min(n, z0 + chunk)].any())
-                ]
-                if not chunks:
-                    return
+        # v15.0.3 fix: every CUDA call below — the pinned cudaHostAlloc, the stream and event
+        # creations, and the per-chunk Event.synchronize() — is capture-unsafe. Under
+        # capture_error_mode='global' any of them raises cudaErrorStreamCaptureUnsupported if a
+        # graph capture is live on ANOTHER thread. Serialize against capture for the whole
+        # section rather than the synchronize alone: an unguarded gap between chunks would let a
+        # capture start while this stream still has async copies in flight.
+        with _CUDA_GRAPH_CAPTURE_LOCK:
+            pin_buf = _acquire_pinned_u8_buffer(torch, 2 * chunk * plane)
+            pin_views = (
+                pin_buf[: chunk * plane].view(chunk, h, w),
+                pin_buf[chunk * plane: 2 * chunk * plane].view(chunk, h, w),
+            )
+            pin_np = (pin_views[0].numpy(), pin_views[1].numpy())
+            copy_stream = torch.cuda.Stream(device=self.device)
+            events = (torch.cuda.Event(), torch.cuda.Event())
+            try:
+                def _drain(src_dev: object, dst_mm: np.ndarray) -> None:
+                    # Chunks with no device-written slice carry only zeros: skip them outright
+                    # (host-side fallback writes for those slices already happened).
+                    chunks = [
+                        (z0, min(n, z0 + chunk))
+                        for z0 in range(0, n, chunk)
+                        if bool(written[z0:min(n, z0 + chunk)].any())
+                    ]
+                    if not chunks:
+                        return
 
-                def _issue(ci: int) -> None:
-                    z0_i, z1_i = chunks[ci]
-                    buf = ci % 2
-                    with torch.cuda.stream(copy_stream):
-                        pin_views[buf][: z1_i - z0_i].copy_(src_dev[z0_i:z1_i], non_blocking=True)
-                        events[buf].record(copy_stream)
+                    def _issue(ci: int) -> None:
+                        z0_i, z1_i = chunks[ci]
+                        buf = ci % 2
+                        with torch.cuda.stream(copy_stream):
+                            pin_views[buf][: z1_i - z0_i].copy_(src_dev[z0_i:z1_i], non_blocking=True)
+                            events[buf].record(copy_stream)
 
-                _issue(0)
-                for ci, (z0, z1) in enumerate(chunks):
-                    if ci + 1 < len(chunks):
-                        _issue(ci + 1)  # overlaps the host merge below
-                    events[ci % 2].synchronize()
-                    host = pin_np[ci % 2][: z1 - z0]
-                    wr = written[z0:z1]
-                    if bool(wr.all()):
-                        np.copyto(np.asarray(dst_mm[z0:z1]), host)
-                    else:
-                        for zi in range(z1 - z0):
-                            if wr[zi]:
-                                np.copyto(np.asarray(dst_mm[z0 + zi]), host[zi])
+                    _issue(0)
+                    for ci, (z0, z1) in enumerate(chunks):
+                        if ci + 1 < len(chunks):
+                            _issue(ci + 1)  # overlaps the host merge below
+                        events[ci % 2].synchronize()
+                        host = pin_np[ci % 2][: z1 - z0]
+                        wr = written[z0:z1]
+                        if bool(wr.all()):
+                            np.copyto(np.asarray(dst_mm[z0:z1]), host)
+                        else:
+                            for zi in range(z1 - z0):
+                                if wr[zi]:
+                                    np.copyto(np.asarray(dst_mm[z0 + zi]), host[zi])
 
-            _drain(self.union_dev, view_union_mm)
-            if self.conf_dev is not None and view_confmap_mm is not None:
-                _drain(self.conf_dev, view_confmap_mm)
-        finally:
-            _release_pinned_u8_buffer(pin_buf)
+                _drain(self.union_dev, view_union_mm)
+                if self.conf_dev is not None and view_confmap_mm is not None:
+                    _drain(self.conf_dev, view_confmap_mm)
+            finally:
+                _release_pinned_u8_buffer(pin_buf)
         self.union_dev = None
         self.conf_dev = None
         self.prediction_counts_dev = None
@@ -12491,12 +12700,15 @@ class _GpuWorkerRenderEngine:
         graph = None
         try:
             graph = self.torch.cuda.CUDAGraph()
-            with self.torch.cuda.graph(graph, stream=self._stream):
-                launched = self._try_fused_render_into_ring_slot(
-                    slot, view, job.aff, int(frame_index), int(out_size),
-                    stage_metadata=False, allow_graph_replay=False,
-                    disable_on_failure=False,
-                )
+            # v15.0.3 fix: exclude every other CUDA-touching thread (notably the device-union
+            # flush executor) for the capture window. See _CUDA_GRAPH_CAPTURE_LOCK.
+            with _CUDA_GRAPH_CAPTURE_LOCK:
+                with self.torch.cuda.graph(graph, stream=self._stream):
+                    launched = self._try_fused_render_into_ring_slot(
+                        slot, view, job.aff, int(frame_index), int(out_size),
+                        stage_metadata=False, allow_graph_replay=False,
+                        disable_on_failure=False,
+                    )
             if not launched:
                 graph = None
                 self._stream.synchronize()
@@ -17115,9 +17327,11 @@ class _ResidentTensorRTRingExecutor:
             if bool(capture_graphs):
                 try:
                     graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph, stream=slot.infer_stream):
-                        self._execute_context(slot)
-                    slot.infer_stream.synchronize()
+                    # v15.0.3 fix: see _CUDA_GRAPH_CAPTURE_LOCK.
+                    with _CUDA_GRAPH_CAPTURE_LOCK:
+                        with torch.cuda.graph(graph, stream=slot.infer_stream):
+                            self._execute_context(slot)
+                        slot.infer_stream.synchronize()
                     slot.infer_graph = graph
                     self.infer_graph_count += 1
                 except Exception:
@@ -17140,9 +17354,11 @@ class _ResidentTensorRTRingExecutor:
             if bool(capture_graphs):
                 try:
                     graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph, stream=slot.post_stream):
-                        self._launch_post(slot)
-                    slot.post_stream.synchronize()
+                    # v15.0.3 fix: see _CUDA_GRAPH_CAPTURE_LOCK.
+                    with _CUDA_GRAPH_CAPTURE_LOCK:
+                        with torch.cuda.graph(graph, stream=slot.post_stream):
+                            self._launch_post(slot)
+                        slot.post_stream.synchronize()
                     slot.post_graph = graph
                     self.post_graph_count += 1
                 except Exception:
@@ -26629,7 +26845,24 @@ def tile_intermediate_accumulators_prefer_memory() -> bool:
 
 
 def tile_intermediate_accumulator_reserve_bytes() -> int:
-    return int(max(0.0, _env_float('YOLO_TTA_TILE_ACCUMULATOR_RESERVE_GIB', 64.0)) * GIB)
+    """Headroom the tile accumulators leave free when they ask for anonymous RAM.
+
+    v15.0.3 (T10): the reserve is now sized against ``available_anon_work_bytes`` — which is
+    already corrected for the SLURM cgroup limit, unlike raw MemFree — instead of a flat
+    64 GiB that was simultaneously too big and too small. Too big on a 128 GiB allocation:
+    a 2 GiB canvas would need 66 GiB free, so every accumulator silently demoted to disk and
+    the tile path was starved by whatever the parent workspaces happened to be holding. Too
+    small on a 1 TiB node, where 64 GiB is noise. An explicit
+    ``YOLO_TTA_TILE_ACCUMULATOR_RESERVE_GIB`` still wins outright, and the proportional form
+    is bounded by ``..._RESERVE_MIN_GIB`` / ``..._RESERVE_MAX_GIB``.
+    """
+    if os.environ.get('YOLO_TTA_TILE_ACCUMULATOR_RESERVE_GIB', '').strip():
+        return int(max(0.0, _env_float('YOLO_TTA_TILE_ACCUMULATOR_RESERVE_GIB', 64.0)) * GIB)
+    fraction = min(0.9, max(0.0, _env_float('YOLO_TTA_TILE_ACCUMULATOR_RESERVE_FRACTION', 0.15)))
+    floor_bytes = int(max(0.0, _env_float('YOLO_TTA_TILE_ACCUMULATOR_RESERVE_MIN_GIB', 8.0)) * GIB)
+    cap_bytes = int(max(0.0, _env_float('YOLO_TTA_TILE_ACCUMULATOR_RESERVE_MAX_GIB', 64.0)) * GIB)
+    proportional = int(float(max(0, available_anon_work_bytes())) * float(fraction))
+    return int(min(max(floor_bytes, proportional), max(floor_bytes, cap_bytes)))
 
 
 def waiting_tile_spill_enabled() -> bool:
@@ -27931,6 +28164,9 @@ def gate_tile_volume_against_parent_inplace(
     parent_bridge_support_mm: Optional[object] = None,
     accepted_by_parent_mask_mm: Optional[np.ndarray] = None,
     accepted_by_parent_bridge_mm: Optional[np.ndarray] = None,
+    accepted_by_parent_mask_locks: Optional[Sequence[threading.Lock]] = None,
+    accepted_by_parent_bridge_locks: Optional[Sequence[threading.Lock]] = None,
+    category_accumulate: bool = False,
     workers: int = 1,
     desc: str = 'Tile gated OR',
 ) -> Dict[str, int]:
@@ -27940,6 +28176,18 @@ def gate_tile_volume_against_parent_inplace(
     also split into two mutually exclusive categories for the decomposed NRRD export.  If a
     component intersects both parent supports, it is assigned to ``parent_mask`` first so the
     category layers can be toggled without double-counting the same tile component.
+
+    v15.0.3 (T5): the per-component Python loop is gone.  One ``connectedComponentsWithStats``
+    pass supplies the label image and every component's area, three ``np.bincount`` reductions
+    over the label image answer "does component *l* intersect this support?" for all *l* at
+    once, and the two output masks are LUT gathers over the labels.  Cost per slice drops from
+    ``O(K · H · W)`` with three full-plane temporaries *per component* to a handful of full-plane
+    passes independent of the component count ``K``.
+
+    v15.0.3 (T14): with ``category_accumulate`` the category masks are OR-ed straight into
+    persistent destination accumulators under ``*_locks`` (z-sharded exactly like
+    ``union_volume_into_volume(..., slice_locks=)``), so no caller needs to allocate a
+    parent-sized intermediate per gate just to OR it in afterwards.
     """
     num_slices = int(tile_mask_mm.shape[0])
     accepted_components = np.zeros((num_slices,), dtype=np.int64)
@@ -27951,15 +28199,41 @@ def gate_tile_volume_against_parent_inplace(
     accepted_by_parent_bridge_voxels = np.zeros((num_slices,), dtype=np.int64)
     worker_count = choose_slice_parallel_workers(int(workers), num_slices)
     chunk_size = choose_parallel_chunk_size(num_slices, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
+    mask_lock_count = int(len(accepted_by_parent_mask_locks)) if accepted_by_parent_mask_locks else 0
+    bridge_lock_count = int(len(accepted_by_parent_bridge_locks)) if accepted_by_parent_bridge_locks else 0
+
+    def _write_category(
+        dst_mm: Optional[np.ndarray],
+        locks: Optional[Sequence[threading.Lock]],
+        lock_count: int,
+        idx: int,
+        plane_u8: Optional[np.ndarray],
+    ) -> None:
+        """Emit one category slice, either as an overwrite or as a locked OR (T14)."""
+        if dst_mm is None:
+            return
+        if not bool(category_accumulate):
+            dst_mm[int(idx), :, :] = np.uint8(0) if plane_u8 is None else plane_u8
+            return
+        # Accumulating into a shared destination: an all-zero plane is a no-op, so skip the
+        # lock and the read-modify-write entirely rather than OR-ing zeros in.
+        if plane_u8 is None:
+            return
+        if lock_count > 0 and locks is not None:
+            with locks[int(idx) % int(lock_count)]:
+                dst_mm[int(idx), :, :] |= plane_u8
+        else:
+            dst_mm[int(idx), :, :] |= plane_u8
+
+    def _emit_empty_slice(idx: int) -> None:
+        tile_mask_mm[int(idx), :, :] = np.uint8(0)
+        _write_category(accepted_by_parent_mask_mm, accepted_by_parent_mask_locks, mask_lock_count, int(idx), None)
+        _write_category(accepted_by_parent_bridge_mm, accepted_by_parent_bridge_locks, bridge_lock_count, int(idx), None)
 
     def _process(idx: int) -> None:
         tile_slice = np.asarray(tile_mask_mm[int(idx)], dtype=bool)
         if not np.any(tile_slice):
-            tile_mask_mm[int(idx), :, :] = np.uint8(0)
-            if accepted_by_parent_mask_mm is not None:
-                accepted_by_parent_mask_mm[int(idx), :, :] = np.uint8(0)
-            if accepted_by_parent_bridge_mm is not None:
-                accepted_by_parent_bridge_mm[int(idx), :, :] = np.uint8(0)
+            _emit_empty_slice(int(idx))
             return
 
         support_slice = _read_binary_volume_slice_bool(parent_support_mm, int(idx))
@@ -27972,80 +28246,69 @@ def gate_tile_volume_against_parent_inplace(
             if parent_bridge_support_mm is not None else None
         )
 
-        num_labels, labels2d = cv2.connectedComponents(
+        # T5: ``WithStats`` costs the same as plain ``connectedComponents`` here and hands back
+        # every component's area, which removes the fourth bincount over the label image.
+        num_labels, labels2d, stats, _centroids = cv2.connectedComponentsWithStats(
             np.asarray(tile_slice, dtype=np.uint8),
             connectivity=8,
             ltype=cv2.CV_32S,
         )
-        if int(num_labels) <= 1:
-            tile_mask_mm[int(idx), :, :] = np.uint8(0)
-            if accepted_by_parent_mask_mm is not None:
-                accepted_by_parent_mask_mm[int(idx), :, :] = np.uint8(0)
-            if accepted_by_parent_bridge_mm is not None:
-                accepted_by_parent_bridge_mm[int(idx), :, :] = np.uint8(0)
+        num_labels = int(num_labels)
+        if num_labels <= 1:
+            _emit_empty_slice(int(idx))
             return
 
-        keep = np.zeros(tile_slice.shape, dtype=bool)
-        mask_category = np.zeros(tile_slice.shape, dtype=bool) if accepted_by_parent_mask_mm is not None else None
-        bridge_category = np.zeros(tile_slice.shape, dtype=bool) if accepted_by_parent_bridge_mm is not None else None
+        sizes = np.asarray(stats[:, cv2.CC_STAT_AREA], dtype=np.int64)[:num_labels]
+        present = sizes > 0
+        present[0] = False  # label 0 is background and never participates
 
-        accepted = 0
-        rejected = 0
-        accepted_mask = 0
-        accepted_bridge = 0
-        kept_count = 0
-        mask_count = 0
-        bridge_count = 0
+        # "Does component l intersect this support?" for every l at once. Indexing the label
+        # image by a boolean support mask yields the labels under that support; their bincount
+        # is the per-component intersection count.
+        supported = present & (np.bincount(labels2d[support_slice], minlength=num_labels)[:num_labels] > 0)
 
-        for comp_lbl in range(1, int(num_labels)):
-            comp = labels2d == int(comp_lbl)
-            if not np.any(comp):
-                continue
+        if not bool(np.any(supported)):
+            _emit_empty_slice(int(idx))
+            rejected_components[int(idx)] = np.int64(int(np.count_nonzero(present)))
+            return
 
-            supported_by_mask = bool(parent_mask_slice is not None and np.any(comp & parent_mask_slice))
-            supported_by_bridge = bool(parent_bridge_slice is not None and np.any(comp & parent_bridge_slice))
-            supported_by_union = bool(np.any(comp & support_slice))
-            if not supported_by_union:
-                rejected += 1
-                continue
+        supported_by_mask = (
+            np.bincount(labels2d[parent_mask_slice], minlength=num_labels)[:num_labels] > 0
+            if parent_mask_slice is not None
+            else np.zeros((num_labels,), dtype=bool)
+        )
+        supported_by_bridge = (
+            np.bincount(labels2d[parent_bridge_slice], minlength=num_labels)[:num_labels] > 0
+            if parent_bridge_slice is not None
+            else np.zeros((num_labels,), dtype=bool)
+        )
 
-            keep[comp] = True
-            accepted += 1
-            comp_voxels = int(np.count_nonzero(comp))
-            kept_count += comp_voxels
+        # Mutually exclusive category assignment. Parent mask wins if both supports intersect,
+        # and an accepted component supported by neither category still falls back to parent
+        # mask (the pathological case where the category supports do not union to
+        # parent_support_mm) — both rules collapse to "bridge only when bridge alone".
+        to_bridge = supported & (~supported_by_mask) & supported_by_bridge
+        to_mask = supported & (~to_bridge)
 
-            # Mutually exclusive category assignment. Parent mask wins if both supports intersect.
-            if supported_by_mask or (parent_mask_slice is None and not supported_by_bridge):
-                accepted_mask += 1
-                mask_count += comp_voxels
-                if mask_category is not None:
-                    mask_category[comp] = True
-            elif supported_by_bridge:
-                accepted_bridge += 1
-                bridge_count += comp_voxels
-                if bridge_category is not None:
-                    bridge_category[comp] = True
-            else:
-                # Fallback for pathological cases where the supplied category supports do not
-                # exactly union to parent_support_mm.
-                accepted_mask += 1
-                mask_count += comp_voxels
-                if mask_category is not None:
-                    mask_category[comp] = True
-
-        tile_mask_mm[int(idx), :, :] = keep.astype(np.uint8, copy=False)
+        tile_mask_mm[int(idx), :, :] = supported.astype(np.uint8, copy=False)[labels2d]
         if accepted_by_parent_mask_mm is not None:
-            accepted_by_parent_mask_mm[int(idx), :, :] = mask_category.astype(np.uint8, copy=False) if mask_category is not None else np.uint8(0)
+            _write_category(
+                accepted_by_parent_mask_mm, accepted_by_parent_mask_locks, mask_lock_count, int(idx),
+                to_mask.astype(np.uint8, copy=False)[labels2d] if bool(np.any(to_mask)) else None,
+            )
         if accepted_by_parent_bridge_mm is not None:
-            accepted_by_parent_bridge_mm[int(idx), :, :] = bridge_category.astype(np.uint8, copy=False) if bridge_category is not None else np.uint8(0)
+            _write_category(
+                accepted_by_parent_bridge_mm, accepted_by_parent_bridge_locks, bridge_lock_count, int(idx),
+                to_bridge.astype(np.uint8, copy=False)[labels2d] if bool(np.any(to_bridge)) else None,
+            )
 
-        accepted_components[int(idx)] = np.int64(accepted)
-        rejected_components[int(idx)] = np.int64(rejected)
-        accepted_by_parent_mask_components[int(idx)] = np.int64(accepted_mask)
-        accepted_by_parent_bridge_components[int(idx)] = np.int64(accepted_bridge)
-        kept_voxels[int(idx)] = np.int64(kept_count)
-        accepted_by_parent_mask_voxels[int(idx)] = np.int64(mask_count)
-        accepted_by_parent_bridge_voxels[int(idx)] = np.int64(bridge_count)
+        accepted_components[int(idx)] = np.int64(int(np.count_nonzero(supported)))
+        rejected_components[int(idx)] = np.int64(int(np.count_nonzero(present & (~supported))))
+        accepted_by_parent_mask_components[int(idx)] = np.int64(int(np.count_nonzero(to_mask)))
+        accepted_by_parent_bridge_components[int(idx)] = np.int64(int(np.count_nonzero(to_bridge)))
+        kept_voxels[int(idx)] = np.int64(int(sizes[supported].sum()))
+        accepted_by_parent_mask_voxels[int(idx)] = np.int64(int(sizes[to_mask].sum()))
+        accepted_by_parent_bridge_voxels[int(idx)] = np.int64(int(sizes[to_bridge].sum()))
 
     parallel_for_indices_chunked(
         num_slices,
@@ -28417,7 +28680,8 @@ def gate_tile_volume_into_consolidated_parent(
     parent_bridge_support_mm: Optional[object] = None,
     tile_parent_mask_accumulator_mm: Optional[np.ndarray] = None,
     tile_parent_bridge_accumulator_mm: Optional[np.ndarray] = None,
-    temp_dir: Optional[Path] = None,
+    tile_parent_mask_accumulator_locks: Optional[Sequence[threading.Lock]] = None,
+    tile_parent_bridge_accumulator_locks: Optional[Sequence[threading.Lock]] = None,
 ) -> TileGateResult:
     """Gate one consolidated tile-set canvas, then OR accepted components into parent accumulators.
 
@@ -28427,49 +28691,28 @@ def gate_tile_volume_into_consolidated_parent(
     component when any part intersects parent support.  Optional category accumulators are
     populated only for decomposed NRRD export and split accepted tile components into
     parent-YOLO-supported and parent-bridge-supported layers.
+
+    v15.0.3 (T14): the two parent-sized category intermediates this used to allocate (and
+    zero-fill, and OR in a second full-volume pass, and delete) per gate invocation are gone.
+    The gate writes its per-slice category LUT gathers straight into the persistent per-parent
+    accumulators under the z-sharded slice locks T8 introduced, which is safe because the
+    category of a component is decided before either write, so the two layers stay mutually
+    exclusive.  The tile canvas itself is still OR-ed under the whole-volume parent lock.
     """
     if task.tile_mask_mm is None:
         raise ValueError('Tile-set gate requires a dense staged tile_mask_mm canvas')
-    tile_mask_shape = tuple(int(x) for x in np.asarray(task.tile_mask_mm).shape)
-    category_enabled = bool(tile_parent_mask_accumulator_mm is not None or tile_parent_bridge_accumulator_mm is not None)
-    local_parent_mask_mm: Optional[np.ndarray] = None
-    local_parent_bridge_mm: Optional[np.ndarray] = None
-    local_parent_mask_path: Optional[Path] = None
-    local_parent_bridge_path: Optional[Path] = None
 
     try:
-        if bool(category_enabled):
-            if temp_dir is None:
-                raise ValueError('temp_dir is required for NRRD tile category gating')
-            category_dir = temp_dir / 'nrrd_work' / 'tile_gate_categories' / task.view_name / task.tile_id
-            if tile_parent_mask_accumulator_mm is not None:
-                local_parent_mask_path = category_dir / 'accepted_by_parent_mask.u8.dat'
-                local_parent_mask_mm = allocate_workspace_array(
-                    shape=tile_mask_shape,
-                    dtype=np.uint8,
-                    path=local_parent_mask_path,
-                    desc=f'NRRD tile category parent-mask {task.model_name}/{task.view_name}/{task.tile_id}',
-                    prefer_memory=True,
-                    reserve_bytes=32 * GIB,
-                )
-            if tile_parent_bridge_accumulator_mm is not None:
-                local_parent_bridge_path = category_dir / 'accepted_by_parent_bridge.u8.dat'
-                local_parent_bridge_mm = allocate_workspace_array(
-                    shape=tile_mask_shape,
-                    dtype=np.uint8,
-                    path=local_parent_bridge_path,
-                    desc=f'NRRD tile category parent-bridge {task.model_name}/{task.view_name}/{task.tile_id}',
-                    prefer_memory=True,
-                    reserve_bytes=32 * GIB,
-                )
-
         gate_stats = gate_tile_volume_against_parent_inplace(
             task.tile_mask_mm,
             parent_support_mm,
             parent_mask_support_mm=parent_mask_support_mm,
             parent_bridge_support_mm=parent_bridge_support_mm,
-            accepted_by_parent_mask_mm=local_parent_mask_mm,
-            accepted_by_parent_bridge_mm=local_parent_bridge_mm,
+            accepted_by_parent_mask_mm=tile_parent_mask_accumulator_mm,
+            accepted_by_parent_bridge_mm=tile_parent_bridge_accumulator_mm,
+            accepted_by_parent_mask_locks=tile_parent_mask_accumulator_locks,
+            accepted_by_parent_bridge_locks=tile_parent_bridge_accumulator_locks,
+            category_accumulate=True,
             workers=int(slice_workers),
             desc=f'Gated OR ({task.model_name}/{task.view_name}/{task.tile_id})',
         )
@@ -28482,20 +28725,6 @@ def gate_tile_volume_into_consolidated_parent(
                     workers=int(slice_workers),
                     desc=f'Consolidate accepted tile {task.model_name}/{task.view_name}/{task.tile_id}',
                 )
-                if local_parent_mask_mm is not None and tile_parent_mask_accumulator_mm is not None:
-                    union_volume_into_volume(
-                        tile_parent_mask_accumulator_mm,
-                        local_parent_mask_mm,
-                        workers=int(slice_workers),
-                        desc=f'Consolidate parent-mask-accepted tile {task.model_name}/{task.view_name}/{task.tile_id}',
-                    )
-                if local_parent_bridge_mm is not None and tile_parent_bridge_accumulator_mm is not None:
-                    union_volume_into_volume(
-                        tile_parent_bridge_accumulator_mm,
-                        local_parent_bridge_mm,
-                        workers=int(slice_workers),
-                        desc=f'Consolidate parent-bridge-accepted tile {task.model_name}/{task.view_name}/{task.tile_id}',
-                    )
 
         return TileGateResult(
             model_name=str(task.model_name),
@@ -28505,15 +28734,6 @@ def gate_tile_volume_into_consolidated_parent(
             gate_stats={k: int(v) for k, v in gate_stats.items()},
         )
     finally:
-        close_memmap_array(local_parent_mask_mm)
-        close_memmap_array(local_parent_bridge_mm)
-        if not keep_temp:
-            for path in (local_parent_mask_path, local_parent_bridge_path):
-                if path is not None:
-                    try:
-                        path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
         archive_or_delete_binary_volume_storage(
             task.tile_mask_mm,
             keep_temp=bool(keep_temp),
@@ -34402,7 +34622,14 @@ def main() -> None:
 
     temp_dir = choose_scratch_dir(None, out_dir, input_path.stem)
     expose_scratch_in_output(out_dir, temp_dir)
-    print(f"Bulk scratch dir: {temp_dir}")
+    # T10: say which kind of scratch this is. Memory-backed scratch is what takes the shared
+    # tile canvas (and the shared source volume, which is allocated under the same root) off
+    # the filesystem entirely; disk-backed scratch is the safe default.
+    print(
+        f"Bulk scratch dir: {temp_dir} "
+        f"[{'MEMORY-backed (' + str(_mount_fstype_for_path(temp_dir) or 'tmpfs') + ')' if scratch_dir_is_memory_backed() else 'disk-backed'}, "
+        f"free={_filesystem_free_bytes(temp_dir) / GIB:.1f} GiB]"
+    )
 
     info = ffprobe_info(input_path)
     input_W = int(info['width'])
@@ -35130,7 +35357,12 @@ def main() -> None:
         'Tiled masks are staged into one consolidated parent-view canvas per --tile_size/--tile_stride configuration before gating; '
         'the canvas gate is slice-local and connected-component based, so seam-split tile objects are reassembled before support testing. '
         'A tile mask shape guard validates/resizes every postprocessed tile to its parent view-native shape. '
-        f'v12.2.11 keeps waiting tiles and tile-set/category accumulators in RAM by default (YOLO_TTA_SPILL_WAITING_TILES={int(waiting_tile_spill_enabled())}, YOLO_TTA_TILE_ACCUMULATORS_IN_RAM={int(tile_intermediate_accumulators_prefer_memory())}); disk ctile spill is now opt-in.'
+        f'v12.2.11 keeps waiting tiles and tile-set/category accumulators in RAM by default (YOLO_TTA_SPILL_WAITING_TILES={int(waiting_tile_spill_enabled())}, YOLO_TTA_TILE_ACCUMULATORS_IN_RAM={int(tile_intermediate_accumulators_prefer_memory())}); disk ctile spill is now opt-in. '
+        f'v15.0.3 (T10) sizes the tile-accumulator RAM reserve against the cgroup-corrected available anonymous memory '
+        f'(now {tile_intermediate_accumulator_reserve_bytes() / GIB:.1f} GiB; YOLO_TTA_TILE_ACCUMULATOR_RESERVE_GIB pins it, '
+        f'YOLO_TTA_TILE_ACCUMULATOR_RESERVE_FRACTION/_MIN_GIB/_MAX_GIB shape it) and auto-selects a memory-backed scratch mount '
+        f'when one has provable room (scratch is memory-backed={int(scratch_dir_is_memory_backed())}; '
+        f'YOLO_TTA_SCRATCH_PREFER_SHM=0 disables, =1 forces, YOLO_TTA_SCRATCH_SHM_MIN_FREE_GIB sets the bar).'
     )
     spec_notes.append(
         'Postprocessed tiles waiting for parent support stay in RAM by default and use ctile-mask-v2-raw only when YOLO_TTA_SPILL_WAITING_TILES=1; decomposed NRRD/support layers use cvol-mask-v2-raw where enabled: empty slices are elided, '
@@ -35450,7 +35682,9 @@ def main() -> None:
     prediction_volume_futures: Dict[Future, Tuple[str, ViewInfo, object]] = {}
     pending_prediction_volume_futures: set[Future] = set()
     ready_fullframe: deque[Tuple[ViewInfo, AugJob, PredictionVolumeRef]] = deque()
-    ready_tile_infer: deque[Tuple[str, ViewInfo, DenseTileJob, PredictionVolumeRef]] = deque()
+    # T11: the ref is Optional because with several models only the first entry for a tile
+    # carries the source that was already built; the rest build their own at pop time.
+    ready_tile_infer: deque[Tuple[str, ViewInfo, DenseTileJob, Optional[PredictionVolumeRef]]] = deque()
     tile_inference_done: set[Tuple[str, str, str]] = set()
     prediction_accumulation_futures: Dict[Future, Dict[str, object]] = {}
     streaming_cpu_warmup_started_refs: set[int] = set()
@@ -35479,6 +35713,9 @@ def main() -> None:
     tile_accumulator_paths: Dict[Tuple[str, str], Path] = {}
     tile_parent_mask_accumulator_by_parent: Dict[Tuple[str, str], np.ndarray] = {}
     tile_parent_bridge_accumulator_by_parent: Dict[Tuple[str, str], np.ndarray] = {}
+    # T14: gates now OR their category masks straight into these accumulators, so each one
+    # needs the same z-band lock sharding the config canvases use.
+    tile_category_accumulator_locks: Dict[Tuple[str, str, str], List[threading.Lock]] = {}
     tile_completed_by_parent_config: Dict[Tuple[str, str, str], set[str]] = {}
     tile_config_gated_by_parent: Dict[Tuple[str, str], set[str]] = {}
     tile_config_gate_submitted: set[Tuple[str, str, str]] = set()
@@ -35617,6 +35854,8 @@ def main() -> None:
                 seen.add(rid)
                 count += 1
         for _model_name, _view, _tile_job, ref in list(ready_tile_infer):
+            if ref is None:  # T11: a queued tile whose source is not built yet
+                continue
             rid = id(ref)
             if rid not in seen and _prediction_ref_has_gpu_input_staging(ref):
                 seen.add(rid)
@@ -35643,6 +35882,8 @@ def main() -> None:
                 seen.add(rid)
                 count += 1
         for _model_name, _view, _tile_job, ref in list(ready_tile_infer):
+            if ref is None:  # T11: a queued tile whose source is not built yet
+                continue
             rid = id(ref)
             if rid in seen:
                 continue
@@ -35679,6 +35920,8 @@ def main() -> None:
             if _queued_cpu_warmup_ref_count() >= int(queued_streaming_cpu_warmup_sources):
                 return
         for _model_name, _view, _tile_job, ref in list(ready_tile_infer):
+            if ref is None:  # T11: a queued tile whose source is not built yet
+                continue
             _maybe_start_cpu_warmup_prediction_ref(ref)
             if _queued_cpu_warmup_ref_count() >= int(queued_streaming_cpu_warmup_sources):
                 return
@@ -35695,8 +35938,19 @@ def main() -> None:
                 ready_fullframe.append((view, job_obj, pred_ref))
             else:
                 assert isinstance(job_obj, DenseTileJob)
-                for model_name, _ in yolo_models:
-                    ready_tile_infer.append((str(model_name), view, job_obj, pred_ref))
+                # T11: StreamingYoloVolumeSource is single-use — __next__ close()s it on
+                # exhaustion and start() then raises — and the in-process tile path also
+                # closes the ref in its finally. Queueing the SAME ref once per model
+                # therefore handed every model after the first a closed source. Each model
+                # now gets its own, built lazily at pop time so N models do not spin up N
+                # prefetch pipelines for a tile that is still sitting in the queue.
+                tile_model_names = [str(name) for name, _ in yolo_models]
+                for position, model_name in enumerate(tile_model_names):
+                    ready_tile_infer.append(
+                        (str(model_name), view, job_obj, pred_ref if position == 0 else None)
+                    )
+                if not tile_model_names:
+                    close_prediction_volume_ref(pred_ref, keep_temp=bool(keep_temp_artifacts))
         _pump_prediction_volume_build_queue()
         _warmup_ready_prediction_sources()
 
@@ -35827,6 +36081,7 @@ def main() -> None:
             shape=view_processing_volume_shape(view, int(args.imgsz)),
             dtype=np.uint8,
             path=acc_path,
+            desc=f'{model_name}/{view_name} tile configuration {config_id} raw canvas',
             # T4: tile groups OR straight into this canvas from the GPU worker processes, so
             # it must be a file mapping they can open 'r+'. (Point YOLO_TTA_SCRATCH_DIR at a
             # shm/tmpfs mount to keep it in RAM; flush_array is a no-op by default, so the
@@ -35851,6 +36106,10 @@ def main() -> None:
             tile_parent_mask_accumulator_by_parent
             if category_norm == 'parent_mask'
             else tile_parent_bridge_accumulator_by_parent
+        )
+        tile_category_accumulator_locks.setdefault(
+            (key[0], key[1], category_norm),
+            [threading.Lock() for _ in range(int(tile_canvas_zband_lock_count()))],
         )
         acc = store.get(key)
         if acc is not None:
@@ -35987,7 +36246,8 @@ def main() -> None:
             parent_bridge_support_mm=parent_bridge_support_mm,
             tile_parent_mask_accumulator_mm=tile_parent_mask_accumulator_mm,
             tile_parent_bridge_accumulator_mm=tile_parent_bridge_accumulator_mm,
-            temp_dir=temp_dir,
+            tile_parent_mask_accumulator_locks=tile_category_accumulator_locks.get((str(model_name), str(view_name), 'parent_mask')),
+            tile_parent_bridge_accumulator_locks=tile_category_accumulator_locks.get((str(model_name), str(view_name), 'parent_bridge')),
         )
         tile_config_gate_futures[fut] = key
 
@@ -36454,6 +36714,9 @@ def main() -> None:
         if backing is not None:
             flush_array(volume_rgb)
             return str(backing), shape, str(np.asarray(volume_rgb).dtype)
+        # T10: both this copy and the decode target it usually replaces live under the scratch
+        # root, so a memory-backed scratch dir puts the shared source volume in RAM with the
+        # tile canvases — one set of physical pages mapped by all GPU workers, no filesystem.
         shared_path = temp_dir / 'mgpu_source_volume.gray8.dat'
         shared_mm = copy_workspace_array(
             np.asarray(volume_rgb), shared_path,
@@ -37289,9 +37552,23 @@ def main() -> None:
                 if proc.is_alive() and hasattr(proc, 'kill'):
                     try:
                         proc.kill()
-                        proc.join()
+                        # v15.0.3 fix: never join unbounded after SIGKILL. A worker wedged in
+                        # uninterruptible sleep (GPU context teardown after an aborted capture,
+                        # mmap writeback, OOM reclaim) is not reaped by SIGKILL, so an unbounded
+                        # join blocks this process forever. SLURM then cannot clean the step,
+                        # UnkillableStepTimeout expires, and the node is drained and marked
+                        # down — a job-level bug escalated into a node-level outage.
+                        proc.join(timeout=30)
                     except Exception:
                         pass
+                    if proc.is_alive():
+                        print(
+                            f'WARNING: GPU worker pid={getattr(proc, "pid", "?")} survived '
+                            f'SIGKILL after 30s and is being abandoned. It is most likely '
+                            f'stuck in D state; this node may need manual cleanup before it '
+                            f'accepts another job.',
+                            flush=True,
+                        )
 
     try:
         _pump_prediction_volume_build_queue()
@@ -37385,6 +37662,11 @@ def main() -> None:
                 if ready_key in tile_inference_done:
                     close_prediction_volume_ref(prediction_ref, keep_temp=bool(keep_temp_artifacts))
                     continue
+                if prediction_ref is None:
+                    # T11: this model's own single-use source for the tile (see the drain).
+                    prediction_ref = _maybe_eager_stage_prediction_ref(
+                        _make_streaming_tile_ref(view, tile_job)
+                    )
 
                 print(f"Inferencing tile in-memory volume: {model_name}/{view.name}/{tile_job.tile_id}")
                 tile_shape = view_processing_volume_shape(view, int(args.imgsz))
