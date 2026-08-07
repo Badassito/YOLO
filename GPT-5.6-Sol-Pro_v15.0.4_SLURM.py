@@ -2,76 +2,26 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the GPT-5.6-Ultra v15.0.1_SLURM implementation. It is derived from
-GPT-5.6-Ultra_v14.0.1_SLURM.py and adds configurable 2D/2.5D model inputs while
-retaining the conservative centerline-guided post-union filtering stage.
-  - --channel_format accepts gray/grey, RGB, or C{odd}S{stride}. Gray keeps the
-    HxWx1 center input; RGB triplicates center slice N; custom formats stack
-    globally edge-clamped neighboring view slices in ascending offset order,
-    e.g. C5S1 = [N-2, N-1, N, N+1, N+2].
-  - The same channel construction applies to full-frame and dense-tile inputs
-    across Transverse, Sagittal, Coronal, Radial, and Tilted views. Every
-    prediction and label remains attached only to center slice N.
-  - Custom formats create one forward channel order. The PTA script's additional
-    reverse-order augmentation set is intentionally not generated for inference.
-  - v15.0.1 extends the persistent batch-1 TensorRT ring to static [1,C,H,W]
-    inputs. C=1 may use the fused direct renderer; arbitrary C uses the
-    channel-aware resident renderer with the same persistent inference and
-    postprocess pipeline.
-  - v15.0.1 extends nonresident Radial GPU prerendering to RGB/custom formats
-    through a sparse bank of globally clamped context planes. The job affine is
-    applied before stacking and context never changes the center result count.
-  - v15.0.1 reduces NRRD compression to KAT-validated member-parallel
-    libdeflate/ISA-L/zlib, retains N19 CPU z-sharding, and preserves GPU
-    low-quality downbinning with one final D2H per mirror.
+This is the GPT-5.6-Sol-Pro v15.0.4 SLURM maintenance release, copied from
+Opus-5_v15.0.3_SLURM.py. It keeps the v15 channel-aware inference pipeline while
+removing retired NRRD tight-crop and v13.3.14 bit-packed workspace paths.
 
 Current runtime behavior:
-  - builds Transverse, optional generalized Tilted Views for Transverse/Sagittal/Coronal, independently optional upright Sagittal/Coronal, and optional Radial view families from one gray/luma source volume
-  - renders YOLO-ready full-frame and tiled sources from memory through bounded streaming slice iterators instead of writing prediction videos or requiring a full prediction volume before inference
-  - feeds those sources to Ultralytics through channel-aware HxWxC in-memory loaders with stream=True, and can stage a bounded queue of preprocessed input tensors in CUDA VRAM; CPU retina reconstruction avoids copying large mask tensors on the scheduler/model stream
-  - bounds streaming prediction-source prefetch and legacy prediction-volume creation, preserving priority order while preventing unbounded RAM growth
-  - stages cleaned tiled masks into one parent-view canvas per tile-size/stride set, gates each consolidated canvas
-    at the connected-component level against frozen parent full-frame support, then interpolates the accepted tiled volume once per parent view
-  - spills postprocessed waiting tile masks and decomposed NRRD/support binary volumes to raw slice-bbox stores with no bitpacking or LZ4 compression
-  - validates/resizes tile mask volumes to their parent view-native shape before raw waiting-tile store spill so ctile stores always match the parent canvas
-  - removes dense-tile pruning and keeps temporary/intermediate mask volumes unpacked throughout
-  - fuses per-slice cleanup work where the slice orientation matches the required semantics
-    (min_conf filtering and view-native min_radius where applicable); v13.0.0 applies 2D hole filling
-    as a final per-view volume pass after --min_conf and --min_radius (spec items 5-6)
-  - overlaps GPU inference with CPU-side view interpolation, consolidated-tile interpolation, and output writing
-  - resolves retina masks per --retina_mask_processor: cpu (default on a single GPU) reconstructs bbox-ROI retina masks on the CPU with retina_masks=False to YOLO; gpu (default when >1 GPU is enabled) uses Ultralytics native retina_masks=True. --device cpu forces cpu
-  - reuses a native radial frame cache during dense tiled rendering so radial tiles do not recompute
-    the same Lanczos-3 slices for every tile location
-  - inverse-maps predictions only into each generated prediction volume's native view space, keeps Radial and Tilted View results view-native through cleanup/interpolation, then backprojects them after per-view processing
-  - treats --model as a single YOLO segmentation model path; multiple-model inference is not supported in this script
-  - applies final 3D void fill only when --enable_3d_void_fill is active, and only once after the global union
-  - activates Gaussian smoothing only when --gaussian_smoothing or --gaussian_smoothing_passes is explicitly set; either flag set to 0 disables it
-  - supports Radial and generalized Tilted View-native interpolation, and keeps every Tilted View frame N centered on its base view native slice N with black-padded out-of-bounds shear samples
-  - resizes the working volume to an approximately cubic orthogonal volume when needed; v13.2.4 (ruling A1) backprojects Radial/Tilted results directly
-    into the original input dimensions in a single resample, restores Cartesian view stacks with one resample during union assembly, and runs the global
-    union, optional 3D void fill, Gaussian smoothing (sigma in source voxels), and --keep_objects at original input dimensions (no tail restore resample),
-    and saves the transverse default color overlay plus optional labels, bilevel compressed TIFF binary masks, binary MKVs,
-    one single-layer Slicer segmentation NRRD (.seg.nrrd) per component layer, active-view image sequences, and isotropically downsampled
-    low-quality presentation outputs, with FFV1 used for spec-required MKVs
-  - writes --save_nrrd as one single-layer 3-axis Slicer segmentation NRRD (.seg.nrrd, X,Y,t) per component layer (full-frame YOLO masks, interpolation bridges,
-    tiled masks accepted by parent YOLO masks, tiled masks accepted by parent bridges, consolidated tile bridges, the pre-smoothing
-    global union, smoothing-pass results, and the final output), each gzip-compressed by the selected validated streaming backend and written as it is produced
-    during the intermediate pipeline steps, plus a single nrrd manifest sidecar
+  - accepts gray/grey, RGB, or C{odd}S{stride} model-input channel layouts
+  - streams full-frame and tiled inputs, with optional GPU-resident rendering
+  - uses process-per-GPU scheduling for every CUDA run, including one-GPU runs
+  - supports GPU device-union accumulation, overlapped D2H retirement, grouped tiles,
+    parent-aware tile dispatch, native-t resident rendering, and the persistent
+    batch-1 TensorRT ring whenever their capability checks pass
+  - uses Ultralytics' unified quantize setting for inference precision
+  - stores temporary binary volumes as ordinary unpacked uint8 arrays or raw bbox stores
+  - writes every single-layer Slicer segmentation NRRD in the complete output geometry
+  - overlaps inference, view cleanup/interpolation, backprojection, and output writing
 
-Dependencies (Python):
+Dependencies:
   pip install opencv-python numpy scipy tifffile tqdm ultralytics
-  # v14.0.1 default centerline filtering uses NumPy/SciPy/OpenCV only.
-  # Optional A/B backend when separately available: VTK + VMTK.
-  # Optional CPU acceleration: numba for no-GIL interpolation seed-planning kernels.
-  # Optional GPU acceleration: cupy-cuda12x for supported ndimage cleanup,
-  # component/interpolation helpers, and resident CUDA paths. Individual
-  # operations retain explicit CPU/capability fallbacks.
-  # --save_nrrd uses the built-in streaming NRRD writer; pynrrd is no longer required for default exports.
-  # Optional NRRD member codecs: pip install deflate isal
-  # Stdlib zlib is the always-available validated fallback.
-
-System:
-  ffmpeg + ffprobe on PATH.
+  Optional: numba, cupy-cuda12x, deflate, isal, VTK/VMTK.
+  System: ffmpeg and ffprobe on PATH.
 """
 
 from __future__ import annotations
@@ -296,6 +246,53 @@ def resolve_channel_format(value: str | ChannelFormat | None) -> ChannelFormat:
     )
 
 
+# Keep this alias table aligned with current Ultralytics configuration semantics.
+QUANTIZE_ALIASES: Dict[str, int | str] = {
+    '8': 8,
+    '16': 16,
+    '32': 32,
+    'int8': 8,
+    'fp16': 16,
+    'fp32': 32,
+    'w8a8': 8,
+    'w16a16': 16,
+    'w32a32': 32,
+    'w8a16': 'w8a16',
+    'w8a32': 'w8a32',
+}
+
+
+def resolve_quantize(value: object) -> int | str | None:
+    """Canonicalize the unified Ultralytics inference-precision setting."""
+    if value is None:
+        return None
+    token = str(value).strip().lower()
+    if token in {'', 'none', 'null', 'default'}:
+        return None
+    resolved = QUANTIZE_ALIASES.get(token)
+    if resolved is None:
+        valid = ', '.join(repr(v) for v in QUANTIZE_ALIASES)
+        raise ValueError(f'unsupported --quantize value {value!r}; expected one of {valid}, or none')
+    return resolved
+
+
+def _parse_quantize_arg(value: str) -> int | str | None:
+    try:
+        return resolve_quantize(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def quantize_uses_fp16(value: object) -> bool:
+    """True only for the FP16 inference scheme; exported INT8 backends own their binding dtype."""
+    return resolve_quantize(value) == 16
+
+
+def quantize_display(value: object) -> str:
+    resolved = resolve_quantize(value)
+    return 'default/fp32' if resolved is None else str(resolved)
+
+
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="YOLO segmentation TTA for large cylindrical video volumes.",
@@ -306,15 +303,15 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--output", default=None, type=str, help="Output directory (default ./{Filename}/)")
     p.add_argument("--device", nargs="+", default=["0"], type=str,
                    help="Inference device(s). Accepts a single GPU index (0), multiple GPU indices separated by "
-                        "commas or spaces (0,1,2,3 or 0 1 2 3) for multi-GPU scheduling, or cpu. GPU indices and "
+                        "commas or spaces (0,1,2,3 or 0 1 2 3) for process-per-GPU scheduling, or cpu. GPU indices and "
                         "cpu cannot be mixed. Indices are torch LOGICAL indices: when SLURM (or the shell) "
                         "exports CUDA_VISIBLE_DEVICES, index N means the (N+1)-th device of that list, not the "
                         "physical GPU id — e.g. under CUDA_VISIBLE_DEVICES=2,3 use --device 0,1 to run on "
                         "physical GPUs 2 and 3 (v13.2.2)")
     p.add_argument("--retina_mask_processor", default=None, choices=["cpu", "gpu"], type=str,
-                   help="Device that resolves full-resolution retina masks. Default cpu for a single GPU. "
-                        "Enabling more than one GPU via --device implicitly switches this to gpu (explicitly "
-                        "overridable). Setting --device cpu forces cpu and overrides any explicit value")
+                   help="Device that resolves full-resolution retina masks. CUDA defaults to gpu for "
+                        "all CUDA runs; an explicit cpu/gpu value is honored. --device cpu "
+                        "forces cpu and overrides any explicit value")
     p.add_argument("--model", required=True, type=str, help="Path to a single YOLO segmentation model")
     p.add_argument(
         "--channel_format",
@@ -334,8 +331,17 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--conf", default=0.15, type=float, help="Passed to YOLO predict")
     p.add_argument("--min_conf", default=0.30, type=float,
                    help="Remove prediction-set objects whose combined confidence is below this threshold. 0 disables the check")
-    p.add_argument("--half", action="store_true", help="Enable FP16 inference")
-    p.add_argument("--int8", action="store_true", help="Enable INT8 inference if supported")
+    p.add_argument(
+        "--quantize",
+        default=None,
+        type=_parse_quantize_arg,
+        metavar="{8,int8,w8a8,16,fp16,w16a16,32,fp32,w32a32,w8a16,w8a32}",
+        help=(
+            "Unified Ultralytics precision setting. 16/fp16/w16a16 requests FP16; "
+            "32/fp32/w32a32 or omission uses FP32. 8/int8/w8a8 and mixed schemes describe "
+            "exported quantized backends; quantization/calibration occurs during export"
+        ),
+    )
 
     p.add_argument("--angle", default="0,120,240", type=str,
                    help="Rotation angles in degrees for augmentation (comma or whitespace separated)")
@@ -373,8 +379,6 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--save_binary", nargs="?", const="__DEFAULT__", default=None, type=str,
                    help="Save final binary masks as a TIFF sequence plus an FFV1 MKV. Optional custom TIFF pattern, e.g. binary_masks/{Filename}_Binary_%%04d.tiff")
     p.add_argument("--save_nrrd", action="store_true", help="Save the decomposition as one single-layer 3D Slicer segmentation NRRD (.seg.nrrd, X,Y,t axes) per component layer in nrrd/, plus a manifest JSON. Each file imports into Slicer as a segmentation named after the file with a deterministic per-layer color. Layers are written during the intermediate pipeline steps")
-    p.add_argument("--save_nrrd_tight_crop", action="store_true",
-                   help="Store each --save_nrrd segmentation as a tight extent-offset raster instead of a full source-size zero-padded raster. The full reference geometry and crop offset are retained in Slicer metadata and the manifest")
     p.add_argument("--save_low_quality", action="store_true",
                    help="Save additional isotropically downsampled low-quality presentation videos (libx264, preset slow, yuv420p). When --save_nrrd is also enabled, the low-quality NRRD decomposition follows the full-quality format: one downbinned single-layer Slicer segmentation NRRD (.seg.nrrd) per component layer under low_quality/<token>/nrrd/, sharing the full-quality layer's segment name and color and written as each view completes")
     p.add_argument("--save_low_quality_downbin", nargs="+", default=None, type=str,
@@ -1082,64 +1086,46 @@ def default_worker_budget() -> int:
     return max(1, int(_cpu_count()) * 2)
 
 
-def multi_gpu_worker_share(gpu_device_count: int) -> int:
-    """Per-GPU-subprocess CPU share, mirroring the multi-GPU dispatch's per_worker_workers.
-
-    Each per-GPU inference subprocess sizes its render/postprocess pools to roughly
-    floor(visible_cpu / num_gpu) threads (with cv2 single-threaded). This helper computes the same
-    floor so the main-process budget can reserve the cores those subprocesses consume.
-    """
+def gpu_worker_cpu_share(gpu_device_count: int) -> int:
+    """Logical CPU share reserved for each CUDA inference worker process."""
     cpu = max(1, int(_cpu_count()))
     n = max(1, int(gpu_device_count))
     return max(1, cpu // n)
 
 
-def main_process_worker_budget(gpu_device_count: int, multi_gpu_active: bool) -> int:
-    """v13.1.0 (#2.1): GPU-count-aware main-process worker budget for the inference phase.
 
-    The whole-box oversubscription target is 2x visible CPUs (default_worker_budget()). In multi-GPU
-    runs, render + YOLO predict + retina-mask resolution + result union all happen INSIDE the per-GPU
-    inference subprocesses, which together consume ~num_gpu * floor(cpu/num_gpu) ~= cpu render threads
-    (the GPU-blocking pools). To keep the box at the intended ~2:1 overall instead of stacking another
-    flat 2x on top of the subprocesses (~8:1 at 4 GPUs), the GPU-non-blocking main-process pools
-    (cleanup/interpolation/output/backprojection) are sized to the remaining headroom,
-    2*cpu - num_gpu*floor(cpu/num_gpu).
-
-    In single-GPU (or CPU) runs, inference is in-process, so the GPU-blocking pools live in the main
-    process and the full 2x budget is correct -- this returns default_worker_budget() unchanged.
-    """
+def main_process_worker_budget(gpu_device_count: int, gpu_worker_process_active: bool) -> int:
+    """Main-process CPU budget while one-or-more CUDA worker processes are active."""
     total = int(default_worker_budget())
-    if not bool(multi_gpu_active):
+    if not bool(gpu_worker_process_active):
         return max(1, total)
     n = max(1, int(gpu_device_count))
-    reserved = int(multi_gpu_worker_share(n)) * n
+    reserved = int(gpu_worker_cpu_share(n)) * n
     return max(1, total - reserved)
 
 
-def tail_worker_budget_expansion_enabled() -> bool:
-    """v13.3.10 (G7): reclaim the per-GPU CPU reservation after inference drains.
 
-    The main-process ``worker_budget`` deliberately leaves room for live multi-GPU render /
-    inference subprocesses.  Once those processes and every inference/interpolation executor
-    have joined, the reservation is dead capacity and strictly tail-only stages may use the
-    whole-box budget again.  Set YOLO_TTA_TAIL_WORKER_BUDGET_EXPAND=0 to retain the v13.3.9
-    tail sizing.
+def tail_worker_budget_expansion_enabled() -> bool:
+    """Reclaim the per-GPU CPU reservation after every CUDA worker has drained.
+
+    Set YOLO_TTA_TAIL_WORKER_BUDGET_EXPAND=0 to retain the inference-phase main-process
+    worker budget during strictly tail-only stages.
     """
     return _env_flag('YOLO_TTA_TAIL_WORKER_BUDGET_EXPAND', True)
 
 
-def mgpu_direct_union_enabled() -> bool:
-    """v13.3.1 (R4): single-angle multi-GPU workers write straight into the per-view union.
-
-    With exactly one --angle, every (view, slice-window) task contributes exactly once and the
-    windows are disjoint, so the per-task result file + reopen + OR-union + unlink round trip is
-    a pure copy: workers open the shared, pre-zeroed per-view union memmap 'r+' and write their
-    window directly (same-host page-cache coherence). Multi-angle runs keep the legacy result
-    files (their windows overlap across angles). YOLO_TTA_MGPU_DIRECT_UNION=0 disables.
-    """
+def gpu_worker_direct_union_enabled() -> bool:
+    """Allow disjoint single-angle worker leases to write directly into the view union."""
+    if os.environ.get('YOLO_TTA_GPU_WORKER_DIRECT_UNION') is not None:
+        return _env_flag('YOLO_TTA_GPU_WORKER_DIRECT_UNION', True)
+    # Compatibility alias for existing submit scripts.
     return _env_flag('YOLO_TTA_MGPU_DIRECT_UNION', True)
 
 
+
+# CLEANUP(v15.0.4): these mgpu_* helper names and YOLO_TTA_MGPU_* tuning variables now
+# serve the process-per-GPU scheduler for one-or-more CUDA devices. Rename them only with
+# compatibility aliases for existing SLURM launch scripts.
 def mgpu_fullframe_task_ranges(
     n_slices: int,
     slice_chunk: int,
@@ -2018,14 +2004,10 @@ def set_interpolation_process_executor(executor: Optional[ProcessPoolExecutor], 
 
 
 # --------------------------
-# v13.3.4 (T4): GPU worker processes as auxiliary interpolation hosts
+# Idle CUDA workers as auxiliary interpolation hosts
 # --------------------------
-# The multi-GPU inference workers stay alive (idle in task_queue.get()) through the whole CPU
-# postprocess tail and are only shut down at the very end of main(). Each is a warm process
-# with the module loaded and its own GIL — exactly what the GIL-bound interpolation passes
-# queue for. Once the inference queue drains, interpolation passes submit here
-# opportunistically (non-blocking slot acquire) BEFORE falling back to the dedicated
-# interpolation process pool, adding up to gpu_count extra concurrent passes for free.
+# Workers remain alive after inference drains. Their separate interpreters provide additional
+# GILs for interpolation passes before the scheduler falls back to the dedicated process pool.
 
 
 def gpu_worker_aux_interpolation_enabled() -> bool:
@@ -2239,7 +2221,7 @@ def _interpolation_process_entry(
     except Exception:
         pass
 
-    mask_mm = _v13314_workspace_memmap(
+    mask_mm = np.memmap(
         Path(mask_path),
         dtype=np.dtype(mask_dtype),
         mode='r+',
@@ -5218,7 +5200,7 @@ class GpuPrefetchingYoloSource:
         self._sentinel = object()
         self._copy_stream: Optional[object] = None
         self._device_str = canonical_single_device(str(cfg.device))
-        self._dtype_name = 'float16' if bool(cfg.half) and str(self._device_str).startswith('cuda') else 'float32'
+        self._dtype_name = 'float16' if quantize_uses_fp16(cfg.quantize) and str(self._device_str).startswith('cuda') else 'float32'
         # v13.3.2 (R10): ring of reusable PINNED u8 BCHW staging buffers ([tensor, reuse_event]
         # pairs). The producer loop is single-threaded, so a small ring with per-buffer H2D
         # completion events is race-free.
@@ -5589,7 +5571,7 @@ def gpu_input_staging_preflight_reserve(source: object, cfg: 'PredictConfig', qu
                 free_bytes, _total_bytes = torch.cuda.mem_get_info()
         except Exception:
             free_bytes, _total_bytes = torch.cuda.mem_get_info()
-        dtype_bytes = 2 if bool(cfg.half) else 4
+        dtype_bytes = 2 if quantize_uses_fp16(cfg.quantize) else 4
         frame_slots = int(max(1, queue_batches)) * int(max(1, cfg.batch))
         channel_count = _source_prediction_channel_count(source, cfg)
         need_bytes = (
@@ -5643,7 +5625,7 @@ def maybe_wrap_source_with_gpu_input_staging(source: object, cfg: 'PredictConfig
             f'queue_batches={int(queue_batches)} ({int(queue_batches) * max(1, int(cfg.batch))} frame slots), '
             f'--batch={int(cfg.batch)}, device={canonical_single_device(str(cfg.device))}, '
             f'channels={int(_source_prediction_channel_count(source, cfg))}, '
-            f'dtype={"float16" if bool(cfg.half) else "float32"}'
+            f'dtype={"float16" if quantize_uses_fp16(cfg.quantize) else "float32"}'
         )
         return GpuPrefetchingYoloSource(
             source,
@@ -7127,17 +7109,10 @@ def _canonical_single_device_token(token: str) -> str:
 
 
 def parse_device_list(device: 'Sequence[str] | str | None') -> List[str]:
-    """v13.0.0 multi-GPU device parsing (v13.1.0 accepts space-separated values).
+    """Parse one-or-more CUDA devices, MPS, or CPU into canonical device strings.
 
-    --device accepts a single GPU index (``0``), multiple comma/whitespace separated GPU
-    indices (``0,1,2,3`` or ``0 1 2 3``) for multi-GPU scheduling, or ``cpu``.  GPU indices
-    and ``cpu`` cannot be mixed.  Returns a de-duplicated, order-preserving list of canonical
-    device strings such as ``['cuda:0', 'cuda:1']`` or ``['cpu']``.
-
-    v13.1.0: the argparser now uses ``nargs='+'`` for --device, so ``device`` may arrive as a
-    list of tokens (e.g. ``['0', '1', '2', '3']`` from ``--device 0 1 2 3``) as well as a single
-    string (e.g. ``'0,1,2,3'``). Both forms, and mixtures (``--device "0,1" 2 3``), are flattened
-    here on the same comma/whitespace split, matching the other multi-value flags.
+    Comma-separated, whitespace-separated, and ``argparse`` list forms are accepted. CPU
+    cannot be mixed with accelerators; duplicates are removed while preserving order.
     """
     if device is None:
         return ['cpu']
@@ -7179,23 +7154,16 @@ def is_cpu_device_list(devices: Sequence[str]) -> bool:
 
 
 def resolve_retina_mask_processor(explicit: Optional[str], devices: Sequence[str]) -> Tuple[str, str]:
-    """v13.0.0 resolve --retina_mask_processor against --device rules.
-
-    Returns (processor, reason) where processor is 'cpu' or 'gpu'.
-
-      1. --device cpu forces 'cpu' and overrides any explicit value.
-      2. Otherwise an explicit --retina_mask_processor is honored.
-      3. Otherwise more than one GPU implicitly switches to 'gpu'.
-      4. Otherwise the default is 'cpu' (single GPU).
-    """
+    """Resolve retina reconstruction placement for the selected inference devices."""
     explicit_norm = None if explicit is None else str(explicit).strip().lower()
     if is_cpu_device_list(devices):
         return 'cpu', '--device cpu forces CPU retina reconstruction'
     if explicit_norm in ('cpu', 'gpu'):
         return explicit_norm, f'explicit --retina_mask_processor {explicit_norm}'
-    if len([d for d in devices if str(d).startswith('cuda')]) > 1:
-        return 'gpu', 'more than one GPU enabled; retina masks resolved on GPU by default'
-    return 'cpu', 'single-GPU default CPU retina reconstruction'
+    if any(str(d).startswith('cuda') for d in devices):
+        return 'gpu', 'CUDA default uses GPU retina reconstruction'
+    return 'cpu', 'non-CUDA default uses CPU retina reconstruction'
+
 
 
 # v13.0.0: the active retina-mask processor resolved in main() from --retina_mask_processor and
@@ -7330,8 +7298,9 @@ def ensure_yolo_ready_for_predict(model: object, cfg: 'PredictConfig') -> None:
         return
 
     target = canonical_single_device(str(cfg.device))
-    wants_half = bool(cfg.half) and str(target).startswith('cuda')
-    state = (str(target), bool(wants_half))
+    quantize = resolve_quantize(cfg.quantize)
+    wants_fp16 = quantize_uses_fp16(quantize) and str(target).startswith('cuda')
+    state = (str(target), quantize)
     if getattr(model, '_tta_predict_state', None) == state:
         return
 
@@ -7360,7 +7329,13 @@ def ensure_yolo_ready_for_predict(model: object, cfg: 'PredictConfig') -> None:
             except Exception:
                 pass
 
-        precision_fn = getattr(candidate, 'half', None) if wants_half else getattr(candidate, 'float', None)
+        # Plain FP16/FP32 models may be placed eagerly. INT8 and mixed exported backends
+        # own their binding precision and must not be coerced through Module.float()/half().
+        precision_fn = None
+        if wants_fp16:
+            precision_fn = getattr(candidate, 'half', None)
+        elif quantize in (None, 32):
+            precision_fn = getattr(candidate, 'float', None)
         if callable(precision_fn):
             try:
                 precision_fn()
@@ -7376,6 +7351,7 @@ def ensure_yolo_ready_for_predict(model: object, cfg: 'PredictConfig') -> None:
         if args_obj is not None:
             try:
                 setattr(args_obj, 'device', target)
+                setattr(args_obj, 'quantize', quantize)
             except Exception:
                 pass
 
@@ -7599,8 +7575,7 @@ class PredictConfig:
     imgsz: int
     conf: float
     device: str
-    half: bool
-    int8: bool
+    quantize: int | str | None
     batch: int = 1
     input_channels: int = 1
     channel_token: str = 'gray'
@@ -7818,9 +7793,8 @@ def cpu_retina_masks_enabled() -> bool:
     used standalone), fall back to the YOLO_TTA_CPU_RETINA_MASKS env default.
 
     CPU reconstruction captures compact mask coefficients/protos and rebuilds bbox-local
-    masks in prediction-result workers, keeping large full-resolution GPU mask tensors off
-    the scheduler/model-stream thread. Resolving them on GPU frees the CPUs for view
-    creation/postprocessing, which is what multi-GPU runs need.
+    masks in prediction-result workers. GPU reconstruction keeps CPU cores available for
+    rendering, cleanup, interpolation, and output work.
     """
     if _RETINA_MASK_PROCESSOR_IS_CPU is not None:
         return bool(_RETINA_MASK_PROCESSOR_IS_CPU)
@@ -7978,8 +7952,8 @@ def ensure_channel_aware_yolo_preprocess_patch() -> bool:
     return True
 
 
-# LEGACY COMPATIBILITY ALIAS: retained for external imports; v15 runtime calls
-# ensure_channel_aware_yolo_preprocess_patch directly.
+# DEAD CODE / EXTERNAL COMPATIBILITY ALIAS (v15.0.4): no internal caller; retained for
+# consumers that still import the former single-channel patch name.
 def ensure_single_channel_yolo_preprocess_patch() -> bool:
     return ensure_channel_aware_yolo_preprocess_patch()
 
@@ -9020,12 +8994,10 @@ def gpu_device_hole_fill_enabled() -> bool:
 
 
 def gpu_union_flush_overlap_enabled() -> bool:
-    """Retire a worker task's device union on a background D2H/host-copy lane.
+    """Retire a CUDA-worker task union on a background D2H/host-copy lane.
 
-    The multi-GPU worker keeps at most one retiring accumulator while the main worker
-    thread starts inference for the next queued task with a fresh accumulator.  Result
-    publication remains ordered after the retiring flush completes.  Single-process
-    callers retain the synchronous path.
+    Each worker keeps at most one retiring accumulator while its main thread starts the next
+    task with a fresh accumulator. Result publication waits for retirement to complete.
     """
     return _env_flag('YOLO_TTA_GPU_UNION_FLUSH_OVERLAP', True)
 
@@ -10073,7 +10045,7 @@ def _ensure_predictor_for_direct_predict(model: object, cfg: 'PredictConfig') ->
     """Create/fetch the Ultralytics predictor + backend without running stream_inference.
 
     Model.predict(..., stream=True) constructs the predictor and calls setup_model
-    (AutoBackend load, device/half placement) eagerly but returns an UNITERATED generator,
+    (AutoBackend load and device/precision placement) eagerly but returns an UNITERATED generator,
     so no source setup, warmup, or inference runs. The predictor's (patched) preprocess and
     its AutoBackend are then driven directly by _direct_predict_stream.
     """
@@ -10091,8 +10063,7 @@ def _ensure_predictor_for_direct_predict(model: object, cfg: 'PredictConfig') ->
                 retina_masks=True,
                 batch=max(1, int(cfg.batch)),
                 device=cfg.device,
-                half=cfg.half,
-                int8=cfg.int8,
+                quantize=cfg.quantize,
                 verbose=False,
             )
             predictor = getattr(model, 'predictor', None)
@@ -10501,8 +10472,7 @@ def predict_source_and_accumulate(
                 retina_masks=not bool(use_custom_cpu_retina),
                 batch=max(1, int(cfg.batch)),
                 device=cfg.device,
-                half=cfg.half,
-                int8=cfg.int8,
+                quantize=cfg.quantize,
                 verbose=False,
             )
             validate_yolo_model_input_channels(
@@ -10711,11 +10681,9 @@ def predict_source_and_accumulate(
         # fill, pre flush) — a few hundred KB that saves whole CPU read passes downstream.
         slice_meta = device_union.compute_slice_metadata() if device_union is not None else None
 
-        # v13.3.14 (G8): a multi-GPU worker may retire this accumulator on its private
-        # copy/host-merge thread while the main worker starts the next task with a second
-        # accumulator. Seal all producer streams BEFORE submission; the retirement thread
-        # then skips its old device-wide sync so it cannot accidentally wait on next-task
-        # kernels. The worker withholds this task's result until the returned Future settles.
+        # A CUDA worker may retire this accumulator on its private copy/host-merge thread
+        # while its main thread starts the next task. Seal producer streams before submission
+        # so retirement cannot wait on kernels from the following task.
         device_union_flush_future: Optional[Future] = None
         if device_union is not None:
             if bool(defer_device_union_flush) and gpu_union_flush_overlap_enabled():
@@ -10840,8 +10808,7 @@ def predict_source_and_submit_accumulation(
                 retina_masks=not bool(use_custom_cpu_retina),
                 batch=max(1, int(cfg.batch)),
                 device=cfg.device,
-                half=cfg.half,
-                int8=cfg.int8,
+                quantize=cfg.quantize,
                 verbose=False,
             )
             validate_yolo_model_input_channels(
@@ -11477,15 +11444,11 @@ def cleanup_view_volume_after_prediction_inplace(
 
 
 # --------------------------
-# v13.0.0 process-per-GPU multi-GPU inference workers
+# Process-per-GPU CUDA inference workers
 # --------------------------
-# Thread-per-GPU inference does not scale in CPython: Ultralytics' per-batch Python work
-# (NMS, mask/Results construction, retina-mask handling) holds the GIL, so multiple GPU
-# threads serialize down to roughly single-GPU throughput. v13.0.0 therefore drives each GPU
-# from its own worker PROCESS (separate interpreter, no shared GIL, independent CUDA context).
-# Workers render + predict + accumulate one prediction volume at a time from a shared task
-# queue and write the per-volume native-space result to a file-backed memmap; the main process
-# unions those results into the per-view union and runs all postprocessing/interpolation/output.
+# Every CUDA device, including a lone GPU, runs in its own interpreter and CUDA context. This
+# keeps the worker-only resident rendering, TensorRT ring, grouped-tile, and device-union paths
+# available without sharing Ultralytics' Python-heavy inference loop through the main GIL.
 
 
 def open_existing_gray_memmap(path: object, shape: Sequence[int], dtype: object = np.uint8, mode: str = 'r') -> np.memmap:
@@ -11548,9 +11511,9 @@ def union_conf_volume_into_volume_inplace(
 
 
 # --------------------------
-# v13.3.0 (R1/R21) GPU-resident worker rendering
+# GPU-resident worker rendering
 # --------------------------
-# Each multi-GPU inference worker owns a _GpuWorkerRenderEngine. Two modes:
+# Each CUDA inference worker owns a _GpuWorkerRenderEngine. Two modes:
 #   resident — the uint8 source volume fits in VRAM (mem_get_info headroom check): every
 #              full-frame view family renders ON DEVICE and batches feed TensorRT directly
 #              through the existing _tta_gpu_tensor preprocess contract (no CPU render pool,
@@ -13142,7 +13105,7 @@ class _GpuWorkerRenderEngine:
         *,
         slice_offset: int,
         out_size: int,
-        half: bool,
+        fp16: bool,
         channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
     ) -> Tuple[object, object]:
         """Render a batch of flattened (frame, tile) indices as one normalized BCHW tensor.
@@ -13173,7 +13136,7 @@ class _GpuWorkerRenderEngine:
                 frames.append(planes[0].unsqueeze(0) if fmt.kind == 'gray' else torch.stack(planes, dim=0))
             batch = torch.stack(frames, dim=0)
             batch = batch.clamp_(0.0, 255.0).mul_(1.0 / 255.0)
-            if bool(half):
+            if bool(fp16):
                 batch = batch.to(torch.float16)
             ready_event = torch.cuda.Event()
             ready_event.record(self._stream)
@@ -13185,7 +13148,7 @@ class _GpuWorkerRenderEngine:
         job: AugJob,
         frame_indices: Sequence[int],
         out_size: int,
-        half: bool,
+        fp16: bool,
         channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
     ) -> Tuple[object, object]:
         """Render one normalized BCHW batch on the render stream; returns (tensor, ready event)."""
@@ -13219,7 +13182,7 @@ class _GpuWorkerRenderEngine:
                     ))
             batch = torch.stack(frames, dim=0)
             batch = batch.clamp_(0.0, 255.0).mul_(1.0 / 255.0)
-            if bool(half):
+            if bool(fp16):
                 batch = batch.to(torch.float16)
             ready_event = torch.cuda.Event()
             ready_event.record(self._stream)
@@ -13286,7 +13249,7 @@ class _GpuWorkerRenderEngine:
 class GpuRenderedYoloSource:
     """Ultralytics-compatible source whose batches are rendered AND normalized on the GPU.
 
-    v13.3.0 (R21): used by multi-GPU workers in resident mode. __next__ yields
+    Used by CUDA inference workers in resident mode. ``__next__`` yields
     (paths, GpuPrefetchedYoloBatch, info) exactly like GpuPrefetchingYoloSource — the batch
     carries a device-resident normalized BCHW tensor plus a render-stream event, and the
     patched BasePredictor.preprocess consumes it via the _tta_gpu_tensor contract. The
@@ -13303,7 +13266,7 @@ class GpuRenderedYoloSource:
         num_frames: int,
         batch_size: int,
         out_size: int,
-        half: bool,
+        fp16: bool,
         name: str,
         channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
     ) -> None:
@@ -13315,7 +13278,7 @@ class GpuRenderedYoloSource:
         self.channel_format = resolve_channel_format(channel_format)
         self.channel_count = int(self.channel_format.channel_count)
         self.out_size = int(out_size)
-        self.half = bool(half)
+        self.fp16 = bool(fp16)
         self.nf = max(0, int(num_frames))
         self.bs = max(1, int(batch_size))
         self.yield_nf = int(math.ceil(float(self.nf) / float(self.bs)) * self.bs) if self.nf > 0 else 0
@@ -13354,10 +13317,9 @@ class GpuRenderedYoloSource:
     def prepare_direct_ring(self, input_dtype: Optional[object] = None) -> List[_ResidentGpuPipelineSlot]:
         """Allocate the two-entry ring in the TensorRT ENGINE input binding dtype.
 
-        ``--half`` describes predictor policy, but stock Ultralytics FP16 TensorRT engines
-        commonly retain a float32 image binding.  The capability probe therefore resolves
-        that binding before calling here; using ``self.half`` is retained only for callers
-        outside the specialized TensorRT path.
+        Unified ``--quantize`` selects the predictor precision policy, but exported TensorRT
+        engines may expose an input binding whose dtype differs from that policy. The capability
+        probe resolves the actual binding first; ``self.fp16`` is only the generic fallback.
         """
         if (
             self.bs != 1
@@ -13371,7 +13333,7 @@ class GpuRenderedYoloSource:
         resolved_dtype = (
             input_dtype
             if input_dtype is not None
-            else (torch.float16 if bool(self.half) else torch.float32)
+            else (torch.float16 if bool(self.fp16) else torch.float32)
         )
         if resolved_dtype not in (torch.float16, torch.float32):
             raise RuntimeError(
@@ -13497,7 +13459,7 @@ class GpuRenderedYoloSource:
             self.job,
             abs_indices,
             int(self.out_size),
-            bool(self.half),
+            bool(self.fp16),
             channel_format=self.channel_format,
         )
         batch = GpuPrefetchedYoloBatch(
@@ -13529,7 +13491,7 @@ class GpuTiledRenderedYoloSource:
         num_frames: int,
         batch_size: int,
         out_size: int,
-        half: bool,
+        fp16: bool,
         name: str,
         channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
     ) -> None:
@@ -13542,7 +13504,7 @@ class GpuTiledRenderedYoloSource:
         self.channel_format = resolve_channel_format(channel_format)
         self.channel_count = int(self.channel_format.channel_count)
         self.out_size = int(out_size)
-        self.half = bool(half)
+        self.fp16 = bool(fp16)
         self.nf = max(0, int(num_frames))
         self.bs = max(1, int(batch_size))
         self.yield_nf = int(math.ceil(float(self.nf) / float(self.bs)) * self.bs) if self.nf > 0 else 0
@@ -13605,7 +13567,7 @@ class GpuTiledRenderedYoloSource:
             flat_indices,
             slice_offset=int(self.slice_offset),
             out_size=int(self.out_size),
-            half=bool(self.half),
+            fp16=bool(self.fp16),
             channel_format=self.channel_format,
         )
         batch = GpuPrefetchedYoloBatch(
@@ -13862,7 +13824,7 @@ class _DeferredGpuWorkerTaskResult:
 # per-configuration tile canvas. Tiles within one configuration OVERLAP by design (stride <
 # size), and two worker processes touching the same byte of a shared mapping is not atomic,
 # so a z-band lock class per canvas row range is the synchronization unit. Installed once
-# per worker process at spawn; None in the main process / single-GPU path (no sharing).
+# per CUDA worker process at spawn; None only outside the grouped worker path.
 _WORKER_CANVAS_ZBAND_LOCKS: Optional[Sequence[object]] = None
 
 
@@ -14111,7 +14073,7 @@ def run_prediction_volume_in_worker(
                         num_frames=num_frames,
                         batch_size=max(1, int(cfg.batch)),
                         out_size=out_size,
-                        half=bool(cfg.half),
+                        fp16=quantize_uses_fp16(cfg.quantize),
                         name=f"gpu-render-tilegroup-{view.name}-{task['job_id']}",
                         channel_format=channel_format,
                     )
@@ -14124,7 +14086,7 @@ def run_prediction_volume_in_worker(
                         num_frames=num_frames,
                         batch_size=max(1, int(cfg.batch)),
                         out_size=out_size,
-                        half=bool(cfg.half),
+                        fp16=quantize_uses_fp16(cfg.quantize),
                         name=f"gpu-render-{kind}-{view.name}-{task['job_id']}",
                         channel_format=channel_format,
                     )
@@ -14417,8 +14379,7 @@ def _gpu_inference_worker_main(
             imgsz=int(init_dict['imgsz']),
             conf=float(init_dict['conf']),
             device='cuda:0',
-            half=bool(init_dict['half']),
-            int8=bool(init_dict['int8']),
+            quantize=resolve_quantize(init_dict.get('quantize')),
             batch=max(1, int(init_dict['batch'])),
             input_channels=max(1, int(init_dict.get('input_channels', 1))),
             channel_token=str(init_dict.get('channel_token', 'gray')),
@@ -20191,7 +20152,7 @@ def assemble_current_view_union_volume(
     postprocessing runs in source voxels; None keeps the working geometry.
     """
     if len(view_volumes_by_model) != 1:
-        raise ValueError('v15.0.1_SLURM supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v15.0.4 supports exactly one --model; multiple-model inference has been removed')
 
     union_shape = (int(T), int(H), int(W)) if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
     model_name = next(iter(view_volumes_by_model.keys()))
@@ -22665,7 +22626,6 @@ def _v14_submit_sparse_audit_layer(
         # masks therefore stay full-quality only; downbinned result checkpoints
         # remain the valid low-quality representation of each pass.
         low_quality_recomposition_op='diagnostic_only' if is_removed_delta else 'none',
-        force_tight_crop=True,
         mirror_low_quality=False,
         segment_extent_ijk=extent,
         segment_extent_shape_tyx=tuple(int(v) for v in shape_tyx),
@@ -23055,7 +23015,7 @@ def apply_v14_centerline_filter_inplace(
         temp_dir=temp_dir, workers=int(workers), known_has_foreground=True,
         volume_is_immutable=False, keep_temp=bool(keep_temp),
         layer_role='checkpoint', recomposition_op='select',
-        low_quality_recomposition_op='select', force_tight_crop=True,
+        low_quality_recomposition_op='select',
     )
     if pass0_ref is not None:
         nrrd_layer_refs.append(pass0_ref)
@@ -23209,7 +23169,7 @@ def apply_v14_centerline_filter_inplace(
             temp_dir=temp_dir, workers=int(workers), known_has_foreground=True,
             volume_is_immutable=False, keep_temp=bool(keep_temp),
             layer_role='checkpoint', recomposition_op='select',
-            low_quality_recomposition_op='select', force_tight_crop=True,
+            low_quality_recomposition_op='select',
         )
         if result_ref is not None:
             nrrd_layer_refs.append(result_ref)
@@ -25785,7 +25745,6 @@ class NrrdLayerRef:
     layer_role: str = 'additive_component'
     recomposition_op: str = 'union'
     low_quality_recomposition_op: str = 'union'
-    force_tight_crop: bool = False
     mirror_low_quality: bool = True
     # Slicer SegmentN_Extent in this layer backing store's own (X,Y,t) index space.
     # Final NRRD packaging maps this extent into the requested output geometry without
@@ -25801,15 +25760,12 @@ class NrrdLayerRef:
 
 @dataclass(frozen=True)
 class NrrdRasterPlan:
-    """N21 mapping between a full reference raster and the bytes stored in one NRRD."""
+    """Full-reference raster plan for one single-layer NRRD."""
 
-    reference_shape_tyx: Tuple[int, int, int]
     stored_shape_tyx: Tuple[int, int, int]
-    crop_extent_xyt: NrrdSegmentExtent
-    reference_offset_ijk: Tuple[int, int, int]
     segment_extent_xyt: NrrdSegmentExtent
-    tight_cropped: bool
     empty_segment: bool
+
 
 
 @dataclass(frozen=True)
@@ -27473,7 +27429,6 @@ def materialize_nrrd_global_layer(
     layer_role: str = 'checkpoint',
     recomposition_op: str = 'select',
     low_quality_recomposition_op: str = 'select',
-    force_tight_crop: bool = False,
     mirror_low_quality: bool = True,
 ) -> Optional[NrrdLayerRef]:
     # v13.3.1 (R16): see materialize_nrrd_view_layer.
@@ -27537,7 +27492,6 @@ def materialize_nrrd_global_layer(
             layer_role=str(layer_role),
             recomposition_op=str(recomposition_op),
             low_quality_recomposition_op=str(low_quality_recomposition_op),
-            force_tight_crop=bool(force_tight_crop),
             mirror_low_quality=bool(mirror_low_quality),
             segment_extent_ijk=None,  # deferred: computed by the sink worker before the header
             segment_extent_shape_tyx=(int(shape[0]), int(shape[1]), int(shape[2])),
@@ -27620,7 +27574,6 @@ def materialize_nrrd_global_layer(
         layer_role=str(layer_role),
         recomposition_op=str(recomposition_op),
         low_quality_recomposition_op=str(low_quality_recomposition_op),
-        force_tight_crop=bool(force_tight_crop),
         mirror_low_quality=bool(mirror_low_quality),
         segment_extent_ijk=segment_extent,
         segment_extent_shape_tyx=(int(shape[0]), int(shape[1]), int(shape[2])),
@@ -30011,8 +29964,8 @@ def _nrrd_output_z_extent_for_source_extent(
 
     Temporal upscaling is endpoint-aligned nearest-neighbour, while downscaling ORs a
     floor/ceil coverage range. Ratio-only extent scaling is not equivalent (3 -> 100 with
-    source z=1 is the canonical counterexample), so N21 derives its crop from the same
-    mapping the payload writer uses.
+    source z=1 is the canonical counterexample), so extent metadata uses the same mapping
+    as the payload writer.
     """
     in_t_i = max(1, int(in_t))
     out_t_i = max(1, int(out_t))
@@ -30039,22 +29992,9 @@ def _nrrd_output_z_extent_for_source_extent(
 def _nrrd_raster_plan(
     ref: 'NrrdLayerRef',
     output_shape_tyx: Tuple[int, int, int],
-    *,
-    tight_crop: bool,
 ) -> NrrdRasterPlan:
-    """Create a Slicer-compatible crop plan after mapping into output geometry.
-
-    ``crop_extent_xyt`` and ``reference_offset_ijk`` use the full reference index frame.
-    ``segment_extent_xyt`` uses the stored raster's local frame, as required by Slicer's
-    SegmentN_Extent field. The writer shifts the NRRD world origin to the crop's first
-    voxel and records the full reference geometry separately in conversion metadata.
-    """
+    """Map a layer extent into an always-full output reference raster."""
     out_t, out_h, out_w = (int(v) for v in output_shape_tyx)
-    full_extent: NrrdSegmentExtent = (
-        0, max(0, int(out_w) - 1),
-        0, max(0, int(out_h) - 1),
-        0, max(0, int(out_t) - 1),
-    )
     raw_extent = _coerce_segment_extent(getattr(ref, 'segment_extent_ijk', None))
     empty = bool(
         raw_extent is not None
@@ -30064,93 +30004,17 @@ def _nrrd_raster_plan(
             or int(raw_extent[5]) < int(raw_extent[4])
         )
     )
-    if not bool(tight_crop):
-        segment_extent = (
-            _nrrd_empty_segment_extent()
-            if bool(empty)
-            else _slicer_segment_extent_for_output(ref, output_shape_tyx)
-        )
-        return NrrdRasterPlan(
-            reference_shape_tyx=(out_t, out_h, out_w),
-            stored_shape_tyx=(out_t, out_h, out_w),
-            crop_extent_xyt=full_extent,
-            reference_offset_ijk=(0, 0, 0),
-            segment_extent_xyt=segment_extent,
-            tight_cropped=False,
-            empty_segment=bool(empty),
-        )
-    if bool(empty):
-        return NrrdRasterPlan(
-            reference_shape_tyx=(out_t, out_h, out_w),
-            stored_shape_tyx=(1, 1, 1),
-            crop_extent_xyt=(0, 0, 0, 0, 0, 0),
-            reference_offset_ijk=(0, 0, 0),
-            segment_extent_xyt=_nrrd_empty_segment_extent(),
-            tight_cropped=True,
-            empty_segment=True,
-        )
-    if raw_extent is None:
-        # Unknown extents remain full-size; guessing a crop could discard foreground.
-        mapped = full_extent
-    else:
-        # Includes the exact temporal inverse of the payload restore map.
-        mapped = _slicer_segment_extent_for_output(ref, output_shape_tyx)
-    x0, x1, y0, y1, t0, t1 = (int(v) for v in mapped)
-    in_t, in_h, in_w = (int(v) for v in getattr(ref, 'segment_extent_shape_tyx', (0, 0, 0)))
-    # Outward mapping already encloses the scaled extent. A one-voxel halo on changed
-    # axes protects positive-support boundary rounding while keeping the raster compact.
-    if int(in_w) > 0 and int(in_w) != int(out_w):
-        x0, x1 = max(0, x0 - 1), min(int(out_w) - 1, x1 + 1)
-    if int(in_h) > 0 and int(in_h) != int(out_h):
-        y0, y1 = max(0, y0 - 1), min(int(out_h) - 1, y1 + 1)
-    if int(in_t) > 0 and int(in_t) != int(out_t):
-        t0, t1 = max(0, t0 - 1), min(int(out_t) - 1, t1 + 1)
-    stored_shape = (
-        max(1, int(t1 - t0 + 1)),
-        max(1, int(y1 - y0 + 1)),
-        max(1, int(x1 - x0 + 1)),
-    )
-    if stored_shape == (1, 1, 1):
-        # Slicer reserves a 1x1x1 image as the marker for "no image data". A genuinely
-        # non-empty singleton must therefore carry one zero padding voxel. Prefer padding
-        # within the reference extent; the degenerate 1x1x1 reference pads beyond +X and
-        # the payload writer emits that out-of-reference location as zero.
-        if int(out_w) > 1:
-            if int(x1) < int(out_w) - 1:
-                x1 += 1
-            else:
-                x0 -= 1
-        elif int(out_h) > 1:
-            if int(y1) < int(out_h) - 1:
-                y1 += 1
-            else:
-                y0 -= 1
-        elif int(out_t) > 1:
-            if int(t1) < int(out_t) - 1:
-                t1 += 1
-            else:
-                t0 -= 1
-        else:
-            x1 += 1
-        stored_shape = (
-            max(1, int(t1 - t0 + 1)),
-            max(1, int(y1 - y0 + 1)),
-            max(1, int(x1 - x0 + 1)),
-        )
-    local_segment_extent: NrrdSegmentExtent = (
-        int(mapped[0]) - int(x0), int(mapped[1]) - int(x0),
-        int(mapped[2]) - int(y0), int(mapped[3]) - int(y0),
-        int(mapped[4]) - int(t0), int(mapped[5]) - int(t0),
+    segment_extent = (
+        _nrrd_empty_segment_extent()
+        if bool(empty)
+        else _slicer_segment_extent_for_output(ref, output_shape_tyx)
     )
     return NrrdRasterPlan(
-        reference_shape_tyx=(out_t, out_h, out_w),
-        stored_shape_tyx=stored_shape,
-        crop_extent_xyt=(x0, x1, y0, y1, t0, t1),
-        reference_offset_ijk=(x0, y0, t0),
-        segment_extent_xyt=local_segment_extent,
-        tight_cropped=bool((t0, y0, x0) != (0, 0, 0) or stored_shape != (out_t, out_h, out_w)),
-        empty_segment=False,
+        stored_shape_tyx=(out_t, out_h, out_w),
+        segment_extent_xyt=segment_extent,
+        empty_segment=bool(empty),
     )
+
 
 
 def _nrrd_mapped_extent_preserve_empty(
@@ -30197,47 +30061,8 @@ def slicer_segmentation_header_fields(
     }
 
 
-def _apply_nrrd_tight_crop_geometry_header(
-    header: Dict[str, object],
-    plan: NrrdRasterPlan,
-) -> None:
-    """Apply the three geometry fields Slicer writes for a cropped labelmap.
 
-    NRRD index zero is the first stored voxel, so its world origin moves to the crop
-    offset. Slicer's custom offset restores the arbitrary reference IJK extent, while
-    the conversion parameter retains the complete uncropped reference bounds.
-    """
-    ref_t, ref_h, ref_w = (int(v) for v in plan.reference_shape_tyx)
-    reference_header = nrrd_slicer_header((ref_t, ref_h, ref_w))
-    directions = np.asarray(reference_header['space directions'], dtype=np.float64)
-    reference_origin = np.asarray(reference_header['space origin'], dtype=np.float64)
-    offset = np.asarray(plan.reference_offset_ijk, dtype=np.float64)
-    header['space origin'] = np.ascontiguousarray(
-        reference_origin + directions.T.dot(offset), dtype=np.float64,
-    )
-    header['Segmentation_ReferenceImageExtentOffset'] = ' '.join(
-        str(int(v)) for v in plan.reference_offset_ijk
-    )
 
-    ijk_to_space = np.eye(4, dtype=np.float64)
-    ijk_to_space[:3, :3] = directions.T
-    ijk_to_space[:3, 3] = reference_origin
-    # NRRD geometry above is LPS; Slicer's serialized reference-geometry converter
-    # parameter is an IJK-to-RAS matrix.
-    ras_from_lps = np.diag(np.asarray([-1.0, -1.0, 1.0, 1.0], dtype=np.float64))
-    ijk_to_slicer_ras = ras_from_lps.dot(ijk_to_space)
-    geometry_values: List[float | int] = [
-        float(v) for v in ijk_to_slicer_ras.reshape(-1).tolist()
-    ]
-    geometry_values.extend((0, ref_w - 1, 0, ref_h - 1, 0, ref_t - 1))
-    geometry = ';'.join(
-        str(int(v)) if isinstance(v, int) else f'{float(v):.17g}'
-        for v in geometry_values
-    ) + ';'
-    header['Segmentation_ConversionParameters'] = (
-        f'Reference image geometry|{geometry}|'
-        'Image geometry description string determining the complete reference labelmap.'
-    )
 
 
 def nrrd_gzip_compresslevel() -> int:
@@ -30956,7 +30781,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.6-Ultra_v15.0.1_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.6-Sol-Pro_v15.0.4_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -31245,7 +31070,6 @@ def write_single_layer_nrrd_from_ref(
     block_consumer: Optional[Callable[[int, np.ndarray], None]] = None,
     sparse_consumer: Optional[Callable[[int, int, int, np.ndarray], None]] = None,
     z_shards: Optional[int] = None,
-    tight_crop: bool = False,
 ) -> Path:
     """Write one component layer as its own single-layer 3D Slicer segmentation NRRD (X, Y, t).
 
@@ -31264,9 +31088,7 @@ def write_single_layer_nrrd_from_ref(
     # v13.3.6 (N3): live-volume layers defer the segment-extent scan to THIS (background
     # sink) worker instead of blocking the producing thread with a store-encode pass.
     ref = _resolve_live_ref_extent(ref)
-    raster_plan = _nrrd_raster_plan(
-        ref, (out_t, out_h, out_w), tight_crop=bool(tight_crop),
-    )
+    raster_plan = _nrrd_raster_plan(ref, (out_t, out_h, out_w))
     stored_t, stored_h, stored_w = (int(v) for v in raster_plan.stored_shape_tyx)
     header = nrrd_slicer_header((stored_t, stored_h, stored_w))
     header['content'] = (
@@ -31279,8 +31101,6 @@ def write_single_layer_nrrd_from_ref(
         color_rgb=seg_color,
         extent_xyt=raster_plan.segment_extent_xyt,
     ))
-    if bool(tight_crop):
-        _apply_nrrd_tight_crop_geometry_header(header, raster_plan)
     z_chunk = _nrrd_full_slice_z_chunk(1, stored_w, stored_h, stored_t)
     # N15: resolve auto-sharding only after this sink task starts executing. Queue
     # occupancy at submit time says nothing about the child-band capacity by the time a
@@ -31304,35 +31124,21 @@ def write_single_layer_nrrd_from_ref(
                 encoding='gzip',
             )
             with _open_nrrd_payload_writer(fh) as payload_writer:
-                if bool(raster_plan.tight_cropped):
-                    _write_tight_cropped_nrrd_layer_payload(
-                        ref,
-                        (out_t, out_h, out_w),
-                        raster_plan,
-                        payload_writer,
-                        z_chunk=int(z_chunk),
-                        sparse_consumer=sparse_consumer,
-                    )
-                else:
-                    _write_one_decomposed_nrrd_layer_payload(
-                        ref,
-                        (out_t, out_h, out_w),
-                        payload_writer,
-                        z_chunk=int(z_chunk),
-                        block_consumer=block_consumer,
-                        sparse_consumer=sparse_consumer,
-                    )
+                _write_one_decomposed_nrrd_layer_payload(
+                    ref,
+                    (out_t, out_h, out_w),
+                    payload_writer,
+                    z_chunk=int(z_chunk),
+                    block_consumer=block_consumer,
+                    sparse_consumer=sparse_consumer,
+                )
         return out_path
 
     # v13.3.16 (N19, inherited N18): each z band compresses into an independent unlinked spool.
     # A band holds ONE process-global permit only while it is actually compressing. This
     # lets two 8-band global files use a 12-lane budget concurrently and removes the
     # ordered bounded-queue backpressure that previously kept later compressors idle.
-    if bool(raster_plan.tight_cropped):
-        bands = _ffv1_contiguous_segments(int(stored_t), int(shard_count))
-        band_weights = None
-    else:
-        bands, band_weights = _nrrd_layer_zshard_bands(ref, int(out_t), int(shard_count))
+    bands, band_weights = _nrrd_layer_zshard_bands(ref, int(out_t), int(shard_count))
     token = f'{os.getpid()}.{threading.get_ident()}'
     final_tmp = out_path.with_name(f'.{out_path.name}.{token}.assembling')
     shard_z_chunk = max(1, int(z_chunk) // int(shard_count))
@@ -31365,30 +31171,17 @@ def write_single_layer_nrrd_from_ref(
             # artifacts are visible to rsync/watchers and no later cleanup scan is needed.
             spool = tempfile.TemporaryFile(mode='w+b', dir=str(spool_dir))
             with _open_nrrd_payload_writer(spool) as payload_writer:
-                if bool(raster_plan.tight_cropped):
-                    _write_tight_cropped_nrrd_layer_payload(
-                        ref,
-                        (out_t, out_h, out_w),
-                        raster_plan,
-                        payload_writer,
-                        z_chunk=shard_z_chunk,
-                        sparse_consumer=sparse_consumer,
-                        z_start=int(z0),
-                        z_stop=int(z1),
-                        fill_workers_override=shard_fill_workers,
-                    )
-                else:
-                    _write_one_decomposed_nrrd_layer_payload(
-                        ref,
-                        (out_t, out_h, out_w),
-                        payload_writer,
-                        z_chunk=shard_z_chunk,
-                        block_consumer=block_consumer,
-                        sparse_consumer=sparse_consumer,
-                        z_start=int(z0),
-                        z_stop=int(z1),
-                        fill_workers_override=shard_fill_workers,
-                    )
+                _write_one_decomposed_nrrd_layer_payload(
+                    ref,
+                    (out_t, out_h, out_w),
+                    payload_writer,
+                    z_chunk=shard_z_chunk,
+                    block_consumer=block_consumer,
+                    sparse_consumer=sparse_consumer,
+                    z_start=int(z0),
+                    z_stop=int(z1),
+                    fill_workers_override=shard_fill_workers,
+                )
             spool.flush()
             spool.seek(0, os.SEEK_END)
             compressed_size = int(spool.tell())
@@ -31661,7 +31454,6 @@ def write_layer_nrrd_with_low_quality_mirrors(
     segment_name: Optional[str] = None,
     segment_color: Optional[Tuple[float, float, float]] = None,
     z_shards: Optional[int] = None,
-    tight_crop: bool = False,
 ) -> Path:
     """v13.3.3 (S4): write the full-quality layer AND its low-quality mirrors in ONE pass.
 
@@ -31679,12 +31471,8 @@ def write_layer_nrrd_with_low_quality_mirrors(
     nrrd_parallel_mirror_encode_enabled.
     """
     out_t = int(output_shape[0])
-    # v13.3.6 (N3): resolve a live layer's deferred extent once, up front, so the
-    # full-quality header AND every mirror header see the same tight extent.
+    # Resolve a live layer's deferred extent once so full-quality and mirror headers agree.
     ref = _resolve_live_ref_extent(ref)
-    full_raster_plan = _nrrd_raster_plan(
-        ref, output_shape, tight_crop=bool(tight_crop),
-    )
     # N22 mirror payloads are composed in two geometry steps (backing -> full output ->
     # low quality). Compose the header extent through that same intermediate geometry;
     # mapping backing -> mirror directly can understate a positive-support boundary voxel.
@@ -31727,11 +31515,7 @@ def write_layer_nrrd_with_low_quality_mirrors(
     # crops is slower than the vectorized integral/gather resize, while uploading the old
     # dense 8.83 MiB plane would forfeit the bandwidth win. Other source types retain D2.
     sparse_mirror_tee = bool(
-        mirror_jobs
-        and (
-            _nrrd_layer_ref_is_raw_bbox_store(ref)
-            or bool(full_raster_plan.tight_cropped)
-        )
+        mirror_jobs and _nrrd_layer_ref_is_raw_bbox_store(ref)
     )
 
     # v13.3.6 (D2): derive the mirrors on a GPU when one is free — the per-slice resizes
@@ -31863,7 +31647,6 @@ def write_layer_nrrd_with_low_quality_mirrors(
         block_consumer=(_consume_block if mirror_jobs and not sparse_mirror_tee else None),
         sparse_consumer=(_tee_sparse if sparse_mirror_tee else None),
         z_shards=int(resolved_z_shards),
-        tight_crop=bool(tight_crop),
     )
 
     # v13.3.6 (D2): one small D2H per mirror replaces the per-block CPU resize/OR work.
@@ -31881,7 +31664,6 @@ def write_layer_nrrd_with_low_quality_mirrors(
             mirror_plan = _nrrd_raster_plan(
                 mirror_extent_ref,
                 (int(m_t), int(m_h), int(m_w)),
-                tight_crop=bool(tight_crop),
             )
             stored_t, stored_h, stored_w = (int(v) for v in mirror_plan.stored_shape_tyx)
             header = nrrd_slicer_header((stored_t, stored_h, stored_w))
@@ -31897,35 +31679,9 @@ def write_layer_nrrd_with_low_quality_mirrors(
                 color_rgb=seg_color,
                 extent_xyt=mirror_plan.segment_extent_xyt,
             ))
-            if bool(tight_crop):
-                _apply_nrrd_tight_crop_geometry_header(header, mirror_plan)
             vol: Optional[np.ndarray] = job.get('volume')  # type: ignore[assignment]
             if vol is None:
                 raise RuntimeError('mirror tee produced no host payload')
-            if vol is not None and bool(mirror_plan.tight_cropped):
-                cx0, cx1, cy0, cy1, ct0, ct1 = (int(v) for v in mirror_plan.crop_extent_xyt)
-                # A genuine nonempty 1x1x1 segment is padded beyond the reference
-                # because Slicer reserves a 1x1x1 raster for its empty sentinel.
-                # Ordinary NumPy slicing silently clips that padding and would emit
-                # fewer bytes than the declared header.  Materialize the declared
-                # stored shape, copying only the in-reference intersection.
-                cropped_vol = np.zeros((stored_t, stored_h, stored_w), dtype=np.uint8)
-                src_t0, src_t1 = max(0, ct0), min(int(m_t), int(ct1) + 1)
-                src_y0, src_y1 = max(0, cy0), min(int(m_h), int(cy1) + 1)
-                src_x0, src_x1 = max(0, cx0), min(int(m_w), int(cx1) + 1)
-                if src_t0 < src_t1 and src_y0 < src_y1 and src_x0 < src_x1:
-                    np.copyto(
-                        cropped_vol[
-                            int(src_t0 - ct0):int(src_t1 - ct0),
-                            int(src_y0 - cy0):int(src_y1 - cy0),
-                            int(src_x0 - cx0):int(src_x1 - cx0),
-                        ],
-                        np.asarray(
-                            vol[src_t0:src_t1, src_y0:src_y1, src_x0:src_x1],
-                            dtype=np.uint8,
-                        ),
-                    )
-                vol = cropped_vol
             step = max(1, int(_nrrd_full_slice_z_chunk(1, stored_w, stored_h, stored_t)))
             with open(m_path, 'wb') as fh:
                 _write_nrrd_ascii_header(
@@ -31944,7 +31700,6 @@ def write_layer_nrrd_with_low_quality_mirrors(
             write_single_layer_nrrd_from_ref(
                 ref, (int(m_t), int(m_h), int(m_w)), m_path,
                 segment_name=segment_name, segment_color=segment_color,
-                tight_crop=bool(tight_crop),
             )
         finally:
             job['volume'] = None
@@ -31995,7 +31750,6 @@ class NrrdLayerSink:
         max_workers: int,
         low_quality_specs: Optional[Sequence['LowQualityDownbinSpec']] = None,
         low_quality_root: Optional[Path] = None,
-        tight_crop: bool = False,
     ) -> None:
         self.nrrd_dir = Path(nrrd_dir)
         self.nrrd_dir.mkdir(parents=True, exist_ok=True)
@@ -32017,7 +31771,6 @@ class NrrdLayerSink:
         self.low_quality_specs: List['LowQualityDownbinSpec'] = list(low_quality_specs or [])
         self.low_quality_root = Path(low_quality_root) if low_quality_root is not None else None
         self._lq_manifests: Dict[str, List[Dict[str, object]]] = {}
-        self.tight_crop = bool(tight_crop)
         if self.low_quality_specs and self.low_quality_root is not None:
             for spec in self.low_quality_specs:
                 self._lq_nrrd_dir(spec).mkdir(parents=True, exist_ok=True)
@@ -32047,7 +31800,6 @@ class NrrdLayerSink:
     def submit_layer(self, ref: Optional['NrrdLayerRef'], suffix: str) -> Optional[Path]:
         if ref is None:
             return None
-        layer_tight_crop = bool(self.tight_crop or getattr(ref, 'force_tight_crop', False))
         layer_role = str(getattr(ref, 'layer_role', 'additive_component'))
         recomposition_op = str(getattr(ref, 'recomposition_op', 'union'))
         low_quality_recomposition_op = str(
@@ -32079,9 +31831,6 @@ class NrrdLayerSink:
                 'backing_shape_tyx': [int(v) for v in getattr(ref, 'shape', (0, 0, 0))],
                 'output_shape_tyx': [int(v) for v in self.output_shape],
                 'stored_shape_tyx': None,
-                'tight_cropped': bool(layer_tight_crop),
-                'crop_extent_xyt': None,
-                'reference_image_extent_offset_ijk': None,
                 'empty_segment': None,
                 'exported_axes': '(X, Y, t)',
                 'segment_name': segment_name,
@@ -32127,9 +31876,6 @@ class NrrdLayerSink:
                     'backing_shape_tyx': [int(v) for v in getattr(ref, 'shape', (0, 0, 0))],
                     'output_shape_tyx': [int(v) for v in lq_shape],
                     'stored_shape_tyx': None,
-                    'tight_cropped': bool(layer_tight_crop),
-                    'crop_extent_xyt': None,
-                    'reference_image_extent_offset_ijk': None,
                     'empty_segment': None,
                     'downbin_value': str(spec.raw_value),
                     'downbin_token': str(spec.token),
@@ -32145,20 +31891,13 @@ class NrrdLayerSink:
                 # time rather than submission-time queue occupancy. Record that exact value
                 # and pass it through to the mirror/full writer as one immutable decision.
                 resolved_ref = _resolve_live_ref_extent(ref)
-                full_plan = _nrrd_raster_plan(
-                    resolved_ref, self.output_shape, tight_crop=bool(layer_tight_crop),
-                )
+                full_plan = _nrrd_raster_plan(resolved_ref, self.output_shape)
                 executed_z_shards = int(_nrrd_layer_zshard_count(
                     resolved_ref, int(full_plan.stored_shape_tyx[0]),
                 ))
                 with self._lock:
                     manifest_entry['z_shards'] = int(executed_z_shards)
                     manifest_entry['stored_shape_tyx'] = [int(v) for v in full_plan.stored_shape_tyx]
-                    manifest_entry['tight_cropped'] = bool(full_plan.tight_cropped)
-                    manifest_entry['crop_extent_xyt'] = [int(v) for v in full_plan.crop_extent_xyt]
-                    manifest_entry['reference_image_extent_offset_ijk'] = [
-                        int(v) for v in full_plan.reference_offset_ijk
-                    ]
                     manifest_entry['empty_segment'] = bool(full_plan.empty_segment)
                     composed_mirror_ref = dataclasses_replace(
                         resolved_ref,
@@ -32169,15 +31908,8 @@ class NrrdLayerSink:
                         segment_extent_source='composed_full_output_extent_for_low_quality_mirror',
                     )
                     for lq_shape, lq_entry in lq_manifest_entries:
-                        lq_plan = _nrrd_raster_plan(
-                            composed_mirror_ref, lq_shape, tight_crop=bool(layer_tight_crop),
-                        )
+                        lq_plan = _nrrd_raster_plan(composed_mirror_ref, lq_shape)
                         lq_entry['stored_shape_tyx'] = [int(v) for v in lq_plan.stored_shape_tyx]
-                        lq_entry['tight_cropped'] = bool(lq_plan.tight_cropped)
-                        lq_entry['crop_extent_xyt'] = [int(v) for v in lq_plan.crop_extent_xyt]
-                        lq_entry['reference_image_extent_offset_ijk'] = [
-                            int(v) for v in lq_plan.reference_offset_ijk
-                        ]
                         lq_entry['empty_segment'] = bool(lq_plan.empty_segment)
                 if lq_mirror_args:
                     return write_layer_nrrd_with_low_quality_mirrors(
@@ -32185,14 +31917,12 @@ class NrrdLayerSink:
                         segment_name=segment_name,
                         segment_color=segment_color,
                         z_shards=int(executed_z_shards),
-                        tight_crop=bool(layer_tight_crop),
                     )
                 return write_single_layer_nrrd_from_ref(
                     resolved_ref, self.output_shape, out_path,
                     segment_name=segment_name,
                     segment_color=segment_color,
                     z_shards=int(executed_z_shards),
-                    tight_crop=bool(layer_tight_crop),
                 )
 
             fut = self.executor.submit(_execute_layer_write)
@@ -32265,8 +31995,6 @@ class NrrdLayerSink:
                     'exported_axes': '(X, Y, t)',
                     'output_shape_tyx': [int(v) for v in lq_shape],
                     'full_quality_output_shape_tyx': [int(v) for v in self.output_shape],
-                    'tight_crop_enabled': bool(any(bool(item.get('tight_cropped', False)) for item in entries)),
-                    'tight_crop_enabled_by_default': bool(self.tight_crop),
                     'layer_count': len(entries),
                     'layers': entries,
                     'notes': [
@@ -32276,7 +32004,6 @@ class NrrdLayerSink:
                         'v13.2.3: each file is a 3D Slicer segmentation (.seg.nrrd) sharing its full-quality layer\'s segment name and color.',
                         'Layer suffixes match the corresponding full-quality layers. Sparse subtractive and marker-only audit layers are intentionally not mirrored.',
                         'Use each layer\'s recomposition_op. Only union entries marked union; select entries are complete checkpoints.',
-                        'When a layer\'s tight_cropped field is true, stored_shape_tyx and reference_image_extent_offset_ijk reconstruct its raster in output_shape_tyx.',
                     ],
                 }, indent=2))
         if not manifest_layers:
@@ -32286,10 +32013,6 @@ class NrrdLayerSink:
             'layout': 'one_single_layer_nrrd_per_component',
             'exported_axes': '(X, Y, t)',
             'output_shape_tyx': [int(v) for v in self.output_shape],
-            'tight_crop_enabled': bool(any(
-                bool(item.get('tight_cropped', False)) for item in manifest_layers
-            )),
-            'tight_crop_enabled_by_default': bool(self.tight_crop),
             'layer_count': len(manifest_layers),
             'layers': manifest_layers,
             'notes': [
@@ -32299,7 +32022,6 @@ class NrrdLayerSink:
                 'YOLO layers are cleaned masks before interpolation bridges; bridge layers contain only voxels added by that pass.',
                 'Global checkpoints, including centerline pass00_input/result and Global_final_output, are complete alternatives and must never be unioned with component or audit layers.',
                 'The manifest lists only this run. In a reused output directory, similarly named files absent from this manifest are stale and must be ignored.',
-                'When a layer\'s tight_cropped field is true, stored_shape_tyx and reference_image_extent_offset_ijk reconstruct its raster in output_shape_tyx.',
             ],
         }
         manifest_path.write_text(json.dumps(manifest, indent=2))
@@ -32927,161 +32649,8 @@ def _nrrd_layer_zero_skip_window(
     return (int(lo), int(hi))
 
 
-def _write_tight_cropped_nrrd_layer_payload(
-    ref: NrrdLayerRef,
-    output_shape: Tuple[int, int, int],
-    plan: NrrdRasterPlan,
-    payload_writer: object,
-    *,
-    z_chunk: int,
-    sparse_consumer: Optional[Callable[[int, int, int, np.ndarray], None]] = None,
-    z_start: int = 0,
-    z_stop: Optional[int] = None,
-    fill_workers_override: Optional[int] = None,
-) -> None:
-    """Restore in full coordinates while emitting only the N21 stored crop."""
-    full_t, full_h, full_w = (int(v) for v in output_shape)
-    stored_t, stored_h, stored_w = (int(v) for v in plan.stored_shape_tyx)
-    crop_x0, _crop_x1, crop_y0, _crop_y1, crop_t0, _crop_t1 = (
-        int(v) for v in plan.crop_extent_xyt
-    )
-    local_begin = int(np.clip(int(z_start), 0, stored_t))
-    local_end = stored_t if z_stop is None else int(np.clip(int(z_stop), local_begin, stored_t))
-    if local_end <= local_begin:
-        return
-    src: Optional[object] = None
-    try:
-        src = _open_nrrd_layer_ref(ref)
-        _madvise_array_mmap(src, 'MADV_SEQUENTIAL')
-        in_t, in_h, in_w = _volume_shape_tuple(src)
 
-        def _scatter_crop(
-            dst: np.ndarray,
-            global_y0: int,
-            global_x0: int,
-            crop: np.ndarray,
-        ) -> None:
-            global_y1 = int(global_y0) + int(crop.shape[0])
-            global_x1 = int(global_x0) + int(crop.shape[1])
-            iy0 = max(int(crop_y0), int(global_y0))
-            iy1 = min(int(crop_y0) + int(stored_h), int(global_y1))
-            ix0 = max(int(crop_x0), int(global_x0))
-            ix1 = min(int(crop_x0) + int(stored_w), int(global_x1))
-            if iy0 >= iy1 or ix0 >= ix1:
-                return
-            src_view = np.asarray(crop)[
-                int(iy0 - global_y0):int(iy1 - global_y0),
-                int(ix0 - global_x0):int(ix1 - global_x0),
-            ]
-            dst_view = dst[
-                int(iy0 - crop_y0):int(iy1 - crop_y0),
-                int(ix0 - crop_x0):int(ix1 - crop_x0),
-            ]
-            np.bitwise_or(dst_view, np.asarray(src_view, dtype=np.uint8), out=dst_view)
 
-        def _fill_local_slice(local_z: int, dst: np.ndarray) -> None:
-            dst.fill(np.uint8(0))
-            if bool(plan.empty_segment):
-                return
-            global_z = int(crop_t0) + int(local_z)
-            if int(global_z) < 0 or int(global_z) >= int(full_t):
-                return
-            source_indices = _restore_source_indices_for_output_z(
-                int(in_t), int(full_t), int(global_z),
-            )
-            if isinstance(src, RawBBoxMaskStore):
-                for source_z in source_indices:
-                    decoded = src.decode_slice_crop(int(source_z), dtype=np.uint8)
-                    if decoded is None:
-                        continue
-                    sy0, sx0, sy1, sx1, source_crop = decoded
-                    if (int(in_h), int(in_w)) == (int(full_h), int(full_w)):
-                        _scatter_crop(dst, int(sy0), int(sx0), source_crop)
-                    else:
-                        restored = _resize_sparse_binary_crop_to_output_region(
-                            source_crop,
-                            source_shape=(int(in_h), int(in_w)),
-                            source_bbox=(int(sy0), int(sx0), int(sy1), int(sx1)),
-                            output_shape=(int(full_h), int(full_w)),
-                        )
-                        if restored is not None:
-                            ry0, rx0, _ry1, _rx1, restored_crop = restored
-                            _scatter_crop(dst, int(ry0), int(rx0), restored_crop)
-                return
-            if (int(in_t), int(in_h), int(in_w)) == (int(full_t), int(full_h), int(full_w)):
-                valid_y0 = max(0, int(crop_y0))
-                valid_y1 = min(int(full_h), int(crop_y0) + int(stored_h))
-                valid_x0 = max(0, int(crop_x0))
-                valid_x1 = min(int(full_w), int(crop_x0) + int(stored_w))
-                if valid_y0 < valid_y1 and valid_x0 < valid_x1:
-                    np.copyto(
-                        dst[
-                            int(valid_y0 - crop_y0):int(valid_y1 - crop_y0),
-                            int(valid_x0 - crop_x0):int(valid_x1 - crop_x0),
-                        ],
-                        np.asarray(
-                            src[int(global_z), valid_y0:valid_y1, valid_x0:valid_x1],
-                            dtype=np.uint8,
-                        ),
-                    )
-                return
-            full_plane = _read_layer_slice_in_output_shape(
-                src, (int(full_t), int(full_h), int(full_w)), int(global_z),
-            )
-            valid_y0 = max(0, int(crop_y0))
-            valid_y1 = min(int(full_h), int(crop_y0) + int(stored_h))
-            valid_x0 = max(0, int(crop_x0))
-            valid_x1 = min(int(full_w), int(crop_x0) + int(stored_w))
-            if valid_y0 < valid_y1 and valid_x0 < valid_x1:
-                np.copyto(
-                    dst[
-                        int(valid_y0 - crop_y0):int(valid_y1 - crop_y0),
-                        int(valid_x0 - crop_x0):int(valid_x1 - crop_x0),
-                    ],
-                    np.asarray(full_plane[valid_y0:valid_y1, valid_x0:valid_x1], dtype=np.uint8),
-                )
-
-        local_chunk = max(1, min(int(z_chunk), int(local_end - local_begin)))
-        fill_workers = (
-            int(nrrd_fill_workers())
-            if fill_workers_override is None
-            else max(1, int(fill_workers_override))
-        )
-        write_nonzero = getattr(payload_writer, 'write_owned_known_nonzero', None)
-        if not callable(write_nonzero):
-            write_nonzero = payload_writer.write
-        can_write_zeros = callable(getattr(payload_writer, 'write_zeros', None))
-        for local0 in range(int(local_begin), int(local_end), int(local_chunk)):
-            local1 = min(int(local_end), int(local0) + int(local_chunk))
-            count = int(local1 - local0)
-            block = np.zeros((count, stored_h, stored_w), dtype=np.uint8)
-
-            def _fill_one(i: int) -> None:
-                _fill_local_slice(int(local0) + int(i), block[int(i)])
-
-            _nrrd_parallel_fill_indices(
-                int(count), _fill_one,
-                requested_workers=min(int(fill_workers), int(count)),
-            )
-            if sparse_consumer is not None:
-                for i in range(int(count)):
-                    x, y, w, h = (int(v) for v in cv2.boundingRect(block[int(i)]))
-                    if w > 0 and h > 0:
-                        sparse_consumer(
-                            int(crop_t0) + int(local0) + int(i),
-                            int(crop_y0) + int(y),
-                            int(crop_x0) + int(x),
-                            np.ascontiguousarray(block[int(i), y:y + h, x:x + w]),
-                        )
-            if not bool(np.any(block)) and bool(can_write_zeros):
-                payload_writer.write_zeros(int(block.nbytes))
-            else:
-                write_nonzero(block)
-    finally:
-        if src is not None:
-            _madvise_array_mmap(src, 'MADV_DONTNEED')
-            _close_nrrd_layer_source(src)
-            _drop_nrrd_raw_store_chunks_ram_cache(src)
 
 
 def _write_one_decomposed_nrrd_layer_payload(
@@ -34407,7 +33976,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('v15.0.1_SLURM accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v15.0.4 accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -34443,23 +34012,22 @@ def main() -> None:
             'the filter pass, and make no automatic removals.'
         )
 
-    # P9: resolve process-local inference topology before considering a parent model load.
-    # Multi-GPU workers each deserialize their own engine; the parent needs only this path/name
-    # metadata and must not contend for engine file-cache, host memory, or CUDA resources.
+    # Resolve process-local inference topology before considering a parent model load.
+    # Every CUDA device is served by its own persistent worker process, including one-GPU runs.
     inference_devices = parse_device_list(args.device)
     configure_gpu_slice_labeling_devices(inference_devices)
     gpu_device_count = len([d for d in inference_devices if str(d).startswith('cuda')])
-    multi_gpu_active = bool(gpu_device_count > 1)
+    gpu_worker_process_active = bool(gpu_device_count > 0)
 
     model_load_executor: Optional[ThreadPoolExecutor] = None
     model_load_future: Optional[Future] = None
-    if (not multi_gpu_active) and background_model_load_enabled():
+    if (not gpu_worker_process_active) and background_model_load_enabled():
         print(f'Loading model in background while input volume is prepared: {model_name} ({model_paths[0]})')
         model_load_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='model-load')
         model_load_future = model_load_executor.submit(load_ultralytics_model, model_paths[0], 'segment')
-    elif multi_gpu_active:
+    elif gpu_worker_process_active:
         print(
-            f'Multi-GPU parent model load skipped: {gpu_device_count} worker processes will '
+            f'Parent model load skipped: {gpu_device_count} CUDA worker process(es) will '
             f'load {model_name} from {model_paths[0]} independently.'
         )
 
@@ -34480,9 +34048,7 @@ def main() -> None:
     # but are not separately exported. (--save_sagittal/--save_coronal were fully deprecated and removed.)
     requested_azimuth_angle = None if args.azimuth_angle is None else float(args.azimuth_angle)
 
-    # v13.0.0 multi-GPU scheduling + retina-mask-processor resolution.
-    # inference_devices/gpu_device_count/multi_gpu_active were resolved before the optional
-    # background model loader so multi-GPU mode cannot deserialize a redundant parent engine.
+    # Validate logical CUDA indices and resolve retina-mask placement before decode begins.
     # v13.2.2 bug #13 follow-up: --device uses torch LOGICAL indices into any inherited
     # CUDA_VISIBLE_DEVICES list. Validate BEFORE decode/model-load work so a submit script
     # still using the accidental v13.2.1 physical-id convention (e.g. --device 2,3 under
@@ -34528,7 +34094,8 @@ def main() -> None:
     )
     print(
         f'Inference devices: {inference_devices} '
-        f'(multi-GPU scheduling {"active" if multi_gpu_active else "inactive"}); '
+        f'(process-per-GPU scheduling {"active" if gpu_worker_process_active else "inactive"}); '
+        f'quantize={quantize_display(args.quantize)}; '
         f'retina mask processor: {retina_processor} ({retina_processor_reason}).'
     )
     if single_angle_gpu_fastpath_active:
@@ -34545,21 +34112,20 @@ def main() -> None:
             'v13.1.0 GPU retina flatten active: the (n,H,W) retina-mask stack is reduced to union + '
             'max-confidence planes and warped to view-native space on the GPU before the PCIe copy.'
         )
-    # v13.0.0: under multi-GPU each inference worker is its own process pinned (via
-    # CUDA_VISIBLE_DEVICES) to a single physical GPU exposed as cuda:0, so CUDA input staging is
-    # device-safe per worker and is left at its default. The main process performs no inference.
-    # v13.3.1 (R4): with exactly one --angle, worker slice windows are disjoint per view, so
+    # Each CUDA inference worker is pinned through CUDA_VISIBLE_DEVICES and sees its assigned
+    # device as cuda:0. With exactly one --angle, worker slice windows are disjoint per view, so
     # workers write results straight into the shared per-view union memmap (pre-created disk-
     # backed at task-build time) instead of per-task result files that the scheduler re-reads.
-    mgpu_direct_union_active = bool(
-        multi_gpu_active and len(angles) == 1 and mgpu_direct_union_enabled()
+    gpu_worker_direct_union_active = bool(
+        gpu_worker_process_active and len(angles) == 1 and gpu_worker_direct_union_enabled()
     )
-    if mgpu_direct_union_active:
+    if gpu_worker_direct_union_active:
         print(
-            'v13.3.1 (R4) multi-GPU direct union writes active: single-angle worker tasks write '
+            'GPU-worker direct union writes active: single-angle worker tasks write '
             'their disjoint slice windows straight into the disk-backed per-view union '
             '(no per-task result files, no scheduler-side OR pass). '
-            'Set YOLO_TTA_MGPU_DIRECT_UNION=0 to restore the legacy result-file path.'
+            'Set YOLO_TTA_GPU_WORKER_DIRECT_UNION=0 to restore the result-file path '
+            '(YOLO_TTA_MGPU_DIRECT_UNION remains a compatibility alias).'
         )
 
     if args.min_conf > 0 and args.min_conf < args.conf:
@@ -34610,8 +34176,6 @@ def main() -> None:
     nrrd_layers_needed = bool(args.save_nrrd)
     centerline_audit_nrrd_needed = bool(centerline_filter_enabled)
     nrrd_sink_needed = bool(nrrd_layers_needed or centerline_audit_nrrd_needed)
-    if bool(args.save_nrrd_tight_crop) and not bool(args.save_nrrd):
-        raise ValueError('--save_nrrd_tight_crop requires --save_nrrd')
     troubleshooting_outputs_enabled = bool(args.troubleshooting)
     # v12.2.0 --troubleshooting creates overlay MKVs only. Temporary scratch retention is a
     # separate hidden maintenance escape hatch so troubleshooting no longer changes cleanup semantics.
@@ -34669,17 +34233,13 @@ def main() -> None:
             max_workers=nrrd_layer_sink_workers(),
             low_quality_specs=sink_low_quality_specs,
             low_quality_root=(out_dir / 'low_quality'),
-            # Audit-only checkpoints default to recoverable tight rasters so enabling
-            # the safety stage does not multiply full-volume NRRD storage.
-            tight_crop=(bool(args.save_nrrd_tight_crop) if bool(args.save_nrrd) else True),
         ))
     else:
         set_nrrd_layer_sink(None)
 
     preprocess_streaming_active = bool(streaming_preprocess_enabled())
     vol_path = temp_dir / 'input_volume.gray8.dat'
-    # v13.3.1 (R12): the cube-resize decision only needs the ffprobe dimensions, so resolve it
-    # BEFORE decode. In multi-GPU runs the worker processes read the processing volume from a
+    # Resolve cube geometry before decode. CUDA worker processes read the processing volume from a
     # file, so whichever array becomes the processing volume (the cube-resize output, or the
     # decode output when no resize applies) is allocated DISK-BACKED from the start — the page
     # cache keeps it RAM-speed and _ensure_source_volume_file_backed reuses it directly instead
@@ -34688,12 +34248,12 @@ def main() -> None:
     legacy_cube_shape = compute_cube_resize_shape(input_T, input_H, input_W, tolerance=0.05)
     processing_mode = processing_volume_mode()
     cube_resize_will_apply = bool(should_resize_to_processing_cube(input_processing_shape, legacy_cube_shape))
-    # Multi-GPU workers open the shared source volume as a FILE. Without a cube resize that
+    # CUDA workers open the shared source volume as a file. Without a cube resize that
     # file is the decode target itself; v13.3.8 (E1) extends the same rule to cube runs so
     # workers can resident-upload the NATIVE decoded volume (t-resizing on device) without
     # a copy pass first.
     decode_prefer_memory = not (
-        bool(multi_gpu_active) and (not cube_resize_will_apply or gpu_cube_resize_enabled())
+        bool(gpu_worker_process_active) and (not cube_resize_will_apply or gpu_cube_resize_enabled())
     )
     if preprocess_streaming_active:
         print(
@@ -34739,12 +34299,12 @@ def main() -> None:
             f'input shape (t,Y,X)=({input_T},{input_H},{input_W}) -> '
             f'processing shape (t,Y,X)={processing_shape} (within 5% of the longest source axis).'
         )
-        # v13.3.17 C10: under the native-t resident multi-GPU path, workers only need
+        # The native-t resident CUDA path needs only the logical cube shape; workers upload
         # the logical cube shape. They upload the decoded native volume and compose the
         # t map on device, so constructing the 25+ GiB host cube eagerly is wasted work
         # unless residency/CPU/tile rendering actually falls back.
         lazy_cube_eligible = bool(
-            multi_gpu_active
+            gpu_worker_process_active
             and gpu_cube_resize_enabled()
             and tuple(int(v) for v in processing_shape[1:])
             == tuple(int(v) for v in input_processing_shape[1:])
@@ -34774,7 +34334,7 @@ def main() -> None:
                 processing_shape,
                 temp_dir / 'input_volume.v950_cube.gray8.dat',
                 workers=max(1, default_worker_budget()),
-                prefer_memory=not bool(multi_gpu_active),
+                prefer_memory=not bool(gpu_worker_process_active),
             )
         else:
             volume_rgb = resize_volume_to_processing_cube_gray8(
@@ -34782,7 +34342,7 @@ def main() -> None:
                 processing_shape,
                 temp_dir / 'input_volume.v950_cube.gray8.dat',
                 workers=max(1, default_worker_budget()),
-                prefer_memory=not bool(multi_gpu_active),
+                prefer_memory=not bool(gpu_worker_process_active),
             )
     else:
         processing_shape = input_processing_shape
@@ -34886,7 +34446,7 @@ def main() -> None:
             'construct_result (one plane upsampled per frame instead of an (n, imgsz, imgsz) retina stack; '
             'YOLO_TTA_GPU_PROTO_UNION=0 restores the native path); the GPU postprocess tail runs on '
             'per-thread side CUDA streams with pinned D2H staging (YOLO_TTA_GPU_POSTPROCESS_STREAM / '
-            'YOLO_TTA_GPU_POSTPROCESS_PINNED); and multi-GPU workers render full-frame views on their own '
+            'YOLO_TTA_GPU_POSTPROCESS_PINNED); CUDA workers render full-frame views on their own '
             'GPU when the source volume fits resident (YOLO_TTA_GPU_RENDER / YOLO_TTA_GPU_RENDER_RESIDENT '
             '/ YOLO_TTA_GPU_RENDER_RESERVE_GIB), with radial tasks GPU-prerendered from streamed t-blocks '
             'otherwise (YOLO_TTA_GPU_RENDER_TBLOCK_SLICES).'
@@ -34894,10 +34454,10 @@ def main() -> None:
     spec_notes.append(
         'v13.3.1 (R3/R4/R7b/R12/R16/R19/R24/R25): scratch memmap msync is opt-in (YOLO_TTA_MSYNC, '
         'default off — same-host page-cache coherence needs no synchronous flushes); single-angle '
-        'multi-GPU workers write result slice windows directly into the disk-backed per-view union '
-        '(YOLO_TTA_MGPU_DIRECT_UNION); NRRD payload writes stream bounded double-buffered blocks '
+        'CUDA workers write disjoint single-angle result windows directly into the disk-backed per-view union '
+        '(YOLO_TTA_GPU_WORKER_DIRECT_UNION; YOLO_TTA_MGPU_DIRECT_UNION is an alias); NRRD payload writes stream bounded double-buffered blocks '
         '(YOLO_TTA_NRRD_Z_CHUNK_SLICES) filled by a GIL-releasing pool (YOLO_TTA_NRRD_FILL_WORKERS) '
-        'that overlaps the selected gzip backend; multi-GPU runs allocate the processing volume disk-backed from the start '
+        'that overlaps the selected gzip backend; CUDA runs allocate the processing volume disk-backed from the start '
         '(no post-decode copy to scratch); foreground scans and the raw-bbox encoder no longer make '
         'full-slice cast copies, and interpolation bridge-delta layers reuse the pass added_voxels '
         'stat instead of rescanning; the interpolation merge visits only schedule-touched slices; '
@@ -34916,7 +34476,7 @@ def main() -> None:
     spec_notes.append(
         'v13.3.14 D6/D7/G8/P4: CUDA slice labeling emits exact adjacent-slice pair codes before '
         'releasing each device block and distributes blocks across the selected devices '
-        '(YOLO_TTA_GPU_SLICE_LABELING_PAIRS / YOLO_TTA_GPU_SLICE_LABELING_DEVICES); multi-GPU '
+        '(YOLO_TTA_GPU_SLICE_LABELING_PAIRS / YOLO_TTA_GPU_SLICE_LABELING_DEVICES); CUDA '
         'workers overlap one sealed device-union flush with the next task '
         '(YOLO_TTA_GPU_UNION_FLUSH_OVERLAP); and resident-ring Radial/Tilted frames can render '
         'directly from the uint8 source volume into the TensorRT binding '
@@ -34930,15 +34490,14 @@ def main() -> None:
         'to 32 items.'
     )
     spec_notes.append(
-        'v13.3.18 C11/C12/C13/C14/N21: the multi-GPU scheduler keeps only a bounded issued '
+        'v13.3.18 C11/C12/C13/C14/N21: the process-per-GPU scheduler keeps only a bounded issued '
         'window, prioritizes parent-unlocking work, and splits a full-frame lease only at the '
         'actual dispatch tail; deferred device unions publish '
         'as soon as their D2H Future retires; the single-angle Radial path pipelines projection '
         'and fuses YOLO+bridge layers; sparse topology unions are compiled in larger batches and '
         'G5 may use idle GPUs; FFV1 shards remain in scratch and videos enter publication only '
         'after an atomic replace; '
-        f'legacy component-layer tight cropping is {"enabled" if bool(args.save_nrrd_tight_crop) else "disabled"}; '
-        'v14 centerline audit/checkpoint layers always use compact recoverable rasters.'
+        'all single-layer NRRDs use full reference rasters; compact per-layer NRRD cropping is removed.'
     )
     spec_notes.append(
         'v13.3.2 (R5/R6/R10/R14/R15/R21): CPU tilted rendering hoists all frame-invariant shear '
@@ -34963,14 +34522,14 @@ def main() -> None:
         spec_notes.append(
             'v12.2.15 streaming preprocessing is disabled by YOLO_TTA_STREAMING_PREPROCESS=0; decode finishes before inference scheduling begins, and legacy cube resize runs only when explicitly requested.'
         )
-    if (not multi_gpu_active) and background_model_load_enabled():
+    if (not gpu_worker_process_active) and background_model_load_enabled():
         spec_notes.append(
             'v12.2.11 startup overlap is active: the YOLO model load is submitted before ffprobe/decode/native-volume preparation and joined only when the scheduler needs the model for prediction. Set YOLO_TTA_BACKGROUND_MODEL_LOAD=0 to restore synchronous model loading.'
         )
-    elif multi_gpu_active:
+    elif gpu_worker_process_active:
         spec_notes.append(
-            'v13.3.12 P9: multi-GPU parent model loading is skipped; only path/name metadata is retained, '
-            'and each per-GPU worker process loads its own inference engine.'
+            'CUDA parent model loading is skipped; only path/name metadata is retained, and each '
+            'per-GPU worker process loads its own inference engine.'
         )
     if bool(single_angle_streaming_cleanup_active):
         spec_notes.append(
@@ -35088,16 +34647,16 @@ def main() -> None:
     )
     spec_notes.append(
         f'v13.0.0 inference devices: {inference_devices} '
-        f'({"multi-GPU process-per-GPU scheduling" if multi_gpu_active else "single device"}). '
+        f'({"process-per-GPU CUDA scheduling" if gpu_worker_process_active else "in-process non-CUDA scheduling"}). '
         + (
-            'Multi-GPU runs one worker PROCESS per GPU (each pinned via CUDA_VISIBLE_DEVICES and loading its '
+            'CUDA runs use one worker process per GPU (each pinned via CUDA_VISIBLE_DEVICES and loading its '
             'own model replica), pulling inference-ready full-frame/tile prediction volumes from a shared queue '
             'so every GPU stays busy while work remains. Processes avoid the CPython GIL serialization that makes '
             'thread-per-GPU inference no faster than a single GPU. Each worker renders+predicts+accumulates one '
             'volume into a file-backed per-volume result memmap; the main process unions those results into the '
             'per-view union (max-confidence) and runs all postprocessing/interpolation/output.'
-            if multi_gpu_active else
-            'Single-device inference uses the in-process serial GPU dispatch path.'
+            if gpu_worker_process_active else
+            'CPU/MPS inference uses the in-process dispatch path.'
         )
     )
     if cpu_retina_masks_enabled():
@@ -35111,8 +34670,7 @@ def main() -> None:
     else:
         spec_notes.append(
             f'Retina mask processor: gpu ({retina_processor_reason}). Ultralytics native retina_masks=True resolves '
-            'full-resolution masks on the GPU, freeing CPU cores for view creation/postprocessing (preferred for '
-            'multi-GPU, CPU-bound configurations).'
+            'full-resolution masks on the GPU, freeing CPU cores for rendering and postprocessing.'
         )
     if bool(troubleshooting_outputs_enabled):
         spec_notes.append(
@@ -35163,7 +34721,7 @@ def main() -> None:
         print(note)
 
     yolo_model: Optional[object]
-    if multi_gpu_active:
+    if gpu_worker_process_active:
         yolo_model = None
     elif model_load_future is not None:
         print(f'Waiting for background model load to finish: {model_name} ({model_paths[0]})')
@@ -35174,30 +34732,28 @@ def main() -> None:
     else:
         print(f'Loading model: {model_name} ({model_paths[0]})')
         yolo_model = load_ultralytics_model(model_paths[0], task='segment')
-    # v12.2.0/v13.0.0 has no multiple-model inference. A single-item descriptor is retained
-    # for scheduling structures keyed by model stem. In multi-GPU mode its object is None:
-    # model path/name metadata is sufficient because all inference is process-local.
+    # Multiple-model inference is unsupported. CUDA worker mode retains only path/name metadata
+    # in the parent because each worker loads the single model locally.
     yolo_models: List[Tuple[str, Optional[object]]] = [(model_name, yolo_model)]
     yolo_by_model_name: Dict[str, object] = (
         {model_name: yolo_model} if yolo_model is not None else {}
     )
 
-    # pred_cfg describes the primary device used by the single-GPU/CPU in-process inference path.
+    # pred_cfg is used by the in-process non-CUDA route and mirrored into CUDA worker configs.
     pred_cfg = PredictConfig(
         imgsz=args.imgsz,
         conf=args.conf,
         device=str(inference_devices[0]),
-        half=bool(args.half),
-        int8=bool(args.int8),
+        quantize=resolve_quantize(args.quantize),
         batch=max(1, int(args.batch)),
         input_channels=int(channel_format.channel_count),
         channel_token=str(channel_format.token),
     )
 
-    if not multi_gpu_active:
-        # Single-GPU / CPU: inference runs in the main process. Pin the model to its device and
+    if not gpu_worker_process_active:
+        # CPU/MPS inference runs in the main process. Pin the model and apply patches once.
         # pre-apply the global Ultralytics monkeypatches once on the main thread.
-        if yolo_model is None:  # defensive invariant; multi-GPU is the only metadata-only mode
+        if yolo_model is None:  # defensive invariant; CUDA workers are metadata-only in the parent
             raise RuntimeError('Main-process YOLO model is unavailable for in-process inference')
         ensure_yolo_ready_for_predict(yolo_model, pred_cfg)
         validate_yolo_model_input_channels(
@@ -35213,21 +34769,20 @@ def main() -> None:
             except Exception as _patch_exc:  # pragma: no cover - patch is best-effort
                 print(f'Warning: CPU retina predictor patch could not be pre-applied ({_patch_exc}).')
     else:
-        # Multi-GPU: inference runs in one worker PROCESS per GPU (see _gpu_inference_worker_main).
+        # CUDA inference runs in one worker process per GPU (see _gpu_inference_worker_main).
         # Each worker loads its own model replica and applies the patches in its own interpreter;
         # the main process retains metadata only. This avoids redundant engine deserialization and
         # the CPython GIL serialization that makes thread-per-GPU inference no faster than one GPU.
         print(
-            f'Multi-GPU: inference will run in {gpu_device_count} per-GPU worker process(es) '
+            f'CUDA inference will run in {gpu_device_count} per-GPU worker process(es) '
             f'{inference_devices}; no main-process model was loaded.'
         )
 
 
-    # v13.1.0 (#2.1): size main-process pools GPU-count aware. In multi-GPU runs the per-GPU
+    # Size main-process pools around the CPU reservation held by live CUDA workers.
     # inference subprocesses already consume ~visible_cpu render threads (the GPU-blocking pools), so
     # the main-process GPU-non-blocking pools take only the remaining headroom of the 2x box target.
-    # Single-GPU keeps the full 2x budget (inference is in-process).
-    worker_budget = int(main_process_worker_budget(int(gpu_device_count), bool(multi_gpu_active)))
+    worker_budget = int(main_process_worker_budget(int(gpu_device_count), bool(gpu_worker_process_active)))
     whole_box_worker_budget = int(default_worker_budget())
     tail_budget_expansion_active = bool(tail_worker_budget_expansion_enabled())
     tail_worker_budget = int(whole_box_worker_budget if tail_budget_expansion_active else worker_budget)
@@ -35305,17 +34860,17 @@ def main() -> None:
         f'{int(tail_worker_budget)} '
         f'(YOLO_TTA_TAIL_WORKER_BUDGET_EXPAND={int(tail_budget_expansion_active)})'
     )
-    if bool(multi_gpu_active):
-        _gpu_share = int(multi_gpu_worker_share(int(gpu_device_count)))
+    if bool(gpu_worker_process_active):
+        _gpu_share = int(gpu_worker_cpu_share(int(gpu_device_count)))
         print(
             'Worker oversubscription is intentional (whole-box target = 2x visible CPUs = '
-            f'{whole_box_worker_budget}). Multi-GPU ({gpu_device_count} GPUs): each per-GPU inference '
+            f'{whole_box_worker_budget}). CUDA workers ({gpu_device_count} GPU(s)): each inference '
             f'subprocess uses ~{_gpu_share} render thread(s) ({_gpu_share * int(gpu_device_count)} total '
             'for GPU-blocking work), so the GPU-non-blocking main-process pools are sized to the '
             f'remaining {worker_budget} to keep the box near 2:1 instead of oversubscribing it.'
         )
     else:
-        print('Worker oversubscription is intentional (budget = 2x visible CPUs; inference is in-process).')
+        print('Worker oversubscription is intentional (budget = 2x visible CPUs; non-CUDA inference is in-process).')
     print(f'Augmentation workers: {augmentation_workers}')
     print(f'Slice-parallel postprocess workers: {slice_postprocess_workers}')
     print(f'Inference postprocess workers: {predict_postprocess_workers}')
@@ -35411,9 +34966,9 @@ def main() -> None:
     # GROUP tasks. A group renders each native plane once and shares it across all its tiles,
     # keeps only the tiles' parent-grid crops (T1), and ORs them straight into the shared
     # configuration canvas -- no per-tile result file, no scheduler-side re-read. Requires the
-    # multi-GPU worker path; the single-GPU in-process path keeps the per-tile flow.
+    # CUDA worker path; CPU/MPS retains the per-tile fallback flow.
     tile_group_dispatch_active = bool(
-        dense_tiling_active and multi_gpu_active and _env_flag('YOLO_TTA_TILE_GROUP_TASKS', True)
+        dense_tiling_active and gpu_worker_process_active and _env_flag('YOLO_TTA_TILE_GROUP_TASKS', True)
     )
     view_infos_by_name: Dict[str, ViewInfo] = {view.name: view for view in views}
     view_volumes_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
@@ -35974,7 +35529,7 @@ def main() -> None:
                 interpolation_process_backend_enabled()
                 and _view_uses_interpolation(view, int(args.interpolate))
             )
-            or mgpu_direct_union_active
+            or gpu_worker_direct_union_active
         )
         processing_shape = view_processing_volume_shape(view, int(args.imgsz))
         baseline_union_by_model_view[key] = allocate_workspace_array(
@@ -35992,7 +35547,7 @@ def main() -> None:
                 dtype=np.uint8,
                 path=confmap_path,
                 desc=f'{model_name}/{view.name} baseline confidence workspace',
-                prefer_memory=not mgpu_direct_union_active,
+                prefer_memory=not gpu_worker_direct_union_active,
             )
             baseline_confmap_paths[key] = confmap_path
         else:
@@ -36546,19 +36101,15 @@ def main() -> None:
         )
 
     # --------------------------------------------------------------
-    # --------------------------------------------------------------
-    # v13.0.0 multi-GPU inference: one worker PROCESS per GPU (active only when >1 GPU).
-    # CPython's GIL serializes Ultralytics' per-batch Python work across threads, so thread-per-GPU
-    # inference is no faster than a single GPU. Each GPU therefore gets its own process (separate
-    # interpreter + CUDA context). Workers render+predict+accumulate one prediction volume at a time
-    # from a shared task queue and write the per-volume native-space result to a file-backed memmap;
-    # the main process unions those results into the per-view union and runs all postprocessing.
+    # Process-per-GPU scheduler. This path is active for every CUDA run, including one GPU.
     # --------------------------------------------------------------
     gpu_worker_processes: List[object] = []
     gpu_task_queue: object = None
     gpu_result_queue: object = None
     mgpu_tasks_by_id: Dict[int, Dict[str, object]] = {}
     mgpu_results_collected = 0
+    # CLEANUP(v15.0.4): mgpu_* state names now cover one-or-more CUDA workers, including a
+    # single GPU. Rename them to gpu_worker_* in a separate mechanical refactor.
     mgpu_total_tasks = 0
     mgpu_dispatched_tasks = 0
     mgpu_next_dynamic_task_id = 0
@@ -36720,15 +36271,15 @@ def main() -> None:
         shared_path = temp_dir / 'mgpu_source_volume.gray8.dat'
         shared_mm = copy_workspace_array(
             np.asarray(volume_rgb), shared_path,
-            desc='Multi-GPU shared source volume', prefer_memory=False, workers=int(worker_budget),
+            desc='CUDA-worker shared source volume', prefer_memory=False, workers=int(worker_budget),
         )
         flush_array(shared_mm)
         return str(shared_path), shape, str(np.asarray(shared_mm).dtype)
 
-    if multi_gpu_active:
+    if gpu_worker_process_active:
         mgpu_result_dir.mkdir(parents=True, exist_ok=True)
-        # Each GPU worker gets an equal share of the CPU allocation. Crucially the worker drives all
-        # parallelism through its own render/postprocess THREAD POOLS, so OpenCV must run each call
+        # Each CUDA worker drives render/postprocess parallelism through its own thread pools,
+        # so OpenCV must run each call
         # single-threaded (cv2.setNumThreads(1)); otherwise OpenCV's per-process pool funnels every
         # warpAffine/resize through a handful of threads and the render pool starves the GPUs while
         # most cores sit idle. YOLO_TTA_MGPU_WORKER_CPU / YOLO_TTA_MGPU_WORKER_CV2_THREADS override.
@@ -36737,7 +36288,7 @@ def main() -> None:
         )
         worker_init = {
             'imgsz': int(args.imgsz), 'conf': float(args.conf),
-            'half': bool(args.half), 'int8': bool(args.int8), 'batch': max(1, int(args.batch)),
+            'quantize': resolve_quantize(args.quantize), 'batch': max(1, int(args.batch)),
             'channel_format': channel_format,
             'input_channels': int(channel_format.channel_count),
             'channel_token': str(channel_format.token),
@@ -36931,7 +36482,7 @@ def main() -> None:
                 key_fv = (str(model_name), str(view.name))
                 fullframe_subtasks_per_view[key_fv] = int(fullframe_subtasks_per_view.get(key_fv, 0)) + len(ranges)
                 prefix = f'{view.name}__{job_id}'
-                if mgpu_direct_union_active:
+                if gpu_worker_direct_union_active:
                     # v13.3.1 (R4): pre-create the shared per-view union (and confmap) so every
                     # worker task can open it 'r+' and write its disjoint slice window directly.
                     _ensure_baseline_workspaces(str(model_name), view)
@@ -36963,7 +36514,7 @@ def main() -> None:
                 # which returns the full machine CPU count and would have each of N workers spin up an
                 # N-times-too-large render pool). With cv2.setNumThreads(1) these are real render threads.
                 render_workers = max(1, min(int(per_worker_workers), int(count)))
-                if str(kind) == 'fullframe' and mgpu_direct_union_active:
+                if str(kind) == 'fullframe' and gpu_worker_direct_union_active:
                     # v13.3.1 (R4): the "result" paths are the shared per-view union files.
                     key_direct = (str(model_name), str(view.name))
                     rmask = baseline_union_paths[key_direct]
@@ -37423,7 +36974,7 @@ def main() -> None:
     # done-callbacks, so one event wait covers both wake sources. In push mode the drainer
     # thread OWNS the mp queue end (a second concurrent get() would race it).
     push_drain_active = bool(
-        multi_gpu_active and gpu_result_queue is not None and scheduler_push_drain_enabled()
+        gpu_worker_process_active and gpu_result_queue is not None and scheduler_push_drain_enabled()
     )
     scheduler_wake = threading.Event()
     push_drain_stop = threading.Event()
@@ -37492,7 +37043,7 @@ def main() -> None:
         # T9: deferred tile groups are inference work that has not been enqueued yet, so the
         # scheduler must not treat the queue draining as "inference finished".
         return bool(
-            multi_gpu_active
+            gpu_worker_process_active
             and (mgpu_results_collected < mgpu_total_tasks or bool(deferred_tile_jobs_by_parent))
         )
 
@@ -37579,7 +37130,7 @@ def main() -> None:
             _pump_prediction_volume_build_queue()
             _warmup_ready_prediction_sources()
 
-            if multi_gpu_active:
+            if gpu_worker_process_active:
                 # Inference runs in per-GPU worker processes; collect any completed results and union
                 # them into the per-view unions / submit tile postprocessing. No in-process dispatch.
                 _drain_process_inference_results()
@@ -37587,7 +37138,7 @@ def main() -> None:
                 # CPU-side postprocess futures are still pending, instead of only on the idle branch.
                 _check_gpu_workers_alive()
 
-            if (not multi_gpu_active) and ready_fullframe:
+            if (not gpu_worker_process_active) and ready_fullframe:
                 view, job, prediction_ref = ready_fullframe.popleft()
                 print(f"Inferencing full-frame in-memory volume: {view.name}/{job.aug_id}")
                 view_mask_shape = view_processing_volume_shape(view, int(args.imgsz))
@@ -37656,7 +37207,7 @@ def main() -> None:
                     _pump_prediction_volume_build_queue()
                 continue
 
-            if (not multi_gpu_active) and ready_tile_infer:
+            if (not gpu_worker_process_active) and ready_tile_infer:
                 model_name, view, tile_job, prediction_ref = ready_tile_infer.popleft()
                 ready_key = (str(model_name), str(view.name), str(tile_job.tile_id))
                 if ready_key in tile_inference_done:
@@ -37824,7 +37375,7 @@ def main() -> None:
                             str(stalled_model), view_infos_by_name[str(stalled_view)],
                         )
                     continue
-                if multi_gpu_active and _process_inference_outstanding():
+                if gpu_worker_process_active and _process_inference_outstanding():
                     # GPU worker processes are still inferencing but no CPU-side future is pending;
                     # block briefly on the process result queue so the loop wakes on the next result.
                     _wait_for_one_process_result(timeout=0.5)
@@ -37854,9 +37405,9 @@ def main() -> None:
                 scheduler_wake.wait(timeout=float(scheduler_push_drain_heartbeat_seconds()))
                 scheduler_wake.clear()
             else:
-                # Under multi-GPU, also poll the process result queue periodically while CPU-side futures
+                # Poll the CUDA-worker result queue while CPU-side futures run so completed results
                 # run, so completed inference results are unioned without waiting for a future to finish.
-                wait(waitables, timeout=(0.1 if multi_gpu_active else None), return_when=FIRST_COMPLETED)
+                wait(waitables, timeout=(0.1 if gpu_worker_process_active else None), return_when=FIRST_COMPLETED)
 
     finally:
         if sys.exc_info()[0] is not None:
@@ -37877,7 +37428,7 @@ def main() -> None:
                 close_prediction_volume_ref(ref, keep_temp=bool(keep_temp_artifacts))
             ready_tile_infer.clear()
         push_drain_stop.set()  # v13.3.8 (G1): the transport thread exits within one 0.5 s tick
-        if multi_gpu_active:
+        if gpu_worker_process_active:
             _shutdown_gpu_worker_processes()
         prediction_volume_executor.shutdown(wait=True)
         prediction_join_executor.shutdown(wait=True)
@@ -38419,8 +37970,8 @@ def main() -> None:
         spec_notes.append(
             f'v14.0.1 centerline audit NRRDs: pass 0 and, for each completed detection pass, '
             f'sparse removed-component/watershed-candidate layers plus a result checkpoint were written under '
-            f'{nrrd_dir}. Audit-only mode uses tight recoverable rasters and does not enable '
-            f'the legacy per-view decomposition. The manifest identifies explicit select/subtract/marker '
+            f'{nrrd_dir}. Audit-only mode uses the same full reference raster as every other NRRD '
+            f'and does not enable the legacy per-view decomposition. The manifest identifies explicit select/subtract/marker '
             f'roles for {int(nrrd_centerline_audit_files_written)} centerline audit file(s) and '
             f'{int(nrrd_layer_files_written)} total layer file(s) from this run.'
         )
@@ -38560,8 +38111,9 @@ def main() -> None:
 
 
 # >>> Late workspace/projection/telemetry compatibility layer >>>
-# This self-contained, late-bound block installs the remaining workspace,
-# projection, TensorRT, and telemetry adapters before the __main__ guard.
+# CLEANUP(v15.0.4): this inherited layer reimports stdlib/NumPy under v13314 aliases and
+# installs monkeypatches at module end. Fold live projection/telemetry hooks into the normal
+# imports and explicit initialization path in a dedicated refactor; do not expand this block.
 from collections import Counter as _V13314Counter, OrderedDict as _V13314OrderedDict
 from contextlib import contextmanager as _v13314_contextmanager
 import atexit as _v13314_atexit
@@ -38943,6 +38495,9 @@ def _v13314_mem_available():
         return None
 
 
+# DEAD CODE BLOCK (v15.0.4): _V13314MemfdPath, _V13314WorkspaceHandle,
+# _V13314MemfdRegistry, and their registry instance have no internal caller after removal of
+# the bit-packed workspace allocator. Retained intact until external imports are audited.
 class _V13314MemfdPath:
     """Pickle-safe path-like descriptor for a shared memfd.
 
@@ -39189,10 +38744,12 @@ class _V13314MemfdRegistry:
                 self._release_key(key)
 
 
+# DEAD CODE (v15.0.4): inert compatibility instance for the dead memfd block above.
 _V13314_MEMFD_REGISTRY = _V13314MemfdRegistry()
 _v13314_atexit.register(_V13314_MEMFD_REGISTRY.close_all)
 
 
+# DEAD CODE (v15.0.4): allocator-introspection helper retained for external compatibility.
 def _v13314_workspace_shape_dtype(local_vars):
     shape = None
     for key in ('shape', 'array_shape', 'workspace_shape', 'volume_shape', 'dims', 'size'):
@@ -39210,6 +38767,7 @@ def _v13314_workspace_shape_dtype(local_vars):
     return shape, dtype
 
 
+# DEAD CODE (v15.0.4): allocator return-role helper retained for external compatibility.
 def _v13314_role_value(role, arr, descriptor, handle):
     role_l = str(role).lower()
     if role_l in {'none', 'null'}:
@@ -39229,195 +38787,19 @@ def _v13314_role_value(role, arr, descriptor, handle):
 
 
 
-def _v13314_pack_binary_x(array):
-    """Exact little-endian one-bit packing along X, on CUDA when available."""
-    try:
-        import torch as _v13314_torch
-    except Exception:
-        _v13314_torch = None
-    if _v13314_torch is not None and isinstance(array, _v13314_torch.Tensor):
-        logical_x = int(array.shape[-1])
-        pad = (-logical_x) & 7
-        mask = array.to(dtype=_v13314_torch.uint8)
-        if pad:
-            mask = _v13314_torch.nn.functional.pad(mask, (0, pad))
-        shape = mask.shape[:-1] + (mask.shape[-1] // 8, 8)
-        bits = (1 << _v13314_torch.arange(8, device=mask.device, dtype=_v13314_torch.int16))
-        packed = (mask.reshape(shape).to(_v13314_torch.int16) * bits).sum(dim=-1).to(_v13314_torch.uint8)
-        return packed, logical_x
-    arr = _v13314_np.asarray(array, dtype=_v13314_np.uint8)
-    return _v13314_np.packbits(arr, axis=-1, bitorder='little'), int(arr.shape[-1])
-
-
-def _v13314_unpack_binary_x(packed, logical_x):
-    try:
-        import torch as _v13314_torch
-    except Exception:
-        _v13314_torch = None
-    if _v13314_torch is not None and isinstance(packed, _v13314_torch.Tensor):
-        shifts = _v13314_torch.arange(8, device=packed.device, dtype=_v13314_torch.uint8)
-        result = ((packed.unsqueeze(-1) >> shifts) & 1).reshape(packed.shape[:-1] + (packed.shape[-1] * 8,))
-        return result[..., :int(logical_x)]
-    result = _v13314_np.unpackbits(_v13314_np.asarray(packed, dtype=_v13314_np.uint8), axis=-1, bitorder='little')
-    return result[..., :int(logical_x)]
 
 
 
-class _V13314BitPackedPath:
-    __slots__ = ('base', 'logical_shape', 'physical_shape', 'logical_dtype', 'bitorder')
-    def __init__(self, base, logical_shape, logical_dtype='uint8', bitorder='little'):
-        self.base = base
-        self.logical_shape = tuple(int(v) for v in logical_shape)
-        self.physical_shape = self.logical_shape[:-1] + ((self.logical_shape[-1] + 7) // 8,)
-        self.logical_dtype = str(_v13314_np.dtype(logical_dtype))
-        self.bitorder = str(bitorder)
-    def __fspath__(self):
-        return _v13314_os.fspath(self.base)
-    def __str__(self):
-        return self.__fspath__()
-    @property
-    def fd(self):
-        return getattr(self.base, 'fd', -1)
-    @property
-    def nbytes(self):
-        return int(_v13314_math.prod(self.physical_shape))
-    def open(self, mode='r+'):
-        physical = _v13314_np.memmap(_v13314_os.fspath(self.base), dtype=_v13314_np.uint8,
-                                     mode=mode, shape=self.physical_shape, order='C')
-        return _V13314BitPackedArray(physical, self)
 
 
-class _V13314BitPackedArray:
-    """Logical binary ndarray backed by one-bit-per-voxel shared storage."""
-    __array_priority__ = 10000
-    def __init__(self, physical, descriptor):
-        self.physical = physical
-        self.descriptor = descriptor
-        self.shape = descriptor.logical_shape
-        self.dtype = _v13314_np.dtype(descriptor.logical_dtype)
-        self.ndim = len(self.shape)
-        self.size = int(_v13314_math.prod(self.shape))
-        self.nbytes = self.size * self.dtype.itemsize
-        self.filename = descriptor
-        self.mode = getattr(physical, 'mode', 'r+')
-    def __len__(self): return self.shape[0]
-    @staticmethod
-    def _split_key(key, ndim):
-        if not isinstance(key, tuple): key=(key,)
-        expanded=[]; used_ellipsis=False
-        for item in key:
-            if item is Ellipsis and not used_ellipsis:
-                missing=ndim-(len(key)-1)
-                expanded.extend([slice(None)]*missing); used_ellipsis=True
-            else: expanded.append(item)
-        expanded.extend([slice(None)]*(ndim-len(expanded)))
-        if len(expanded)!=ndim: raise IndexError('too many indices')
-        return tuple(expanded)
-    def __getitem__(self,key):
-        key=self._split_key(key,self.ndim)
-        prefix=key[:-1]
-        packed=self.physical[prefix+(slice(None),)]
-        logical=_v13314_unpack_binary_x(packed,self.shape[-1]).astype(self.dtype,copy=False)
-        return logical[(Ellipsis,key[-1])]
-    def __setitem__(self,key,value):
-        key=self._split_key(key,self.ndim)
-        xsel=key[-1]
-        full_x = xsel == slice(None)
-        if full_x:
-            packed,logical_x=_v13314_pack_binary_x(value)
-            if logical_x != self.shape[-1]:
-                raise ValueError(f'logical X mismatch: {logical_x} != {self.shape[-1]}')
-            try:
-                import torch as _v13314_torch
-            except Exception:
-                _v13314_torch=None
-            if _v13314_torch is not None and isinstance(packed,_v13314_torch.Tensor):
-                packed=packed.to(device='cpu',non_blocking=False).numpy()
-            self.physical[key[:-1]+(slice(None),)] = _v13314_np.asarray(packed,dtype=_v13314_np.uint8)
-            return
-        # Partial-X writes are uncommon; unpack only the selected leading block,
-        # modify it, and repack rather than materializing the whole workspace.
-        prefix=key[:-1]
-        current=_v13314_unpack_binary_x(self.physical[prefix+(slice(None),)],self.shape[-1])
-        current[(Ellipsis,xsel)] = value
-        packed,_=_v13314_pack_binary_x(current)
-        self.physical[prefix+(slice(None),)] = _v13314_np.asarray(packed,dtype=_v13314_np.uint8)
-    def flush(self): return self.physical.flush()
-    def close(self):
-        try: self.physical.flush()
-        except Exception: pass
-        mm=getattr(self.physical,'_mmap',None)
-        if mm is not None:
-            try: mm.close()
-            except Exception: pass
-    def __array__(self,dtype=None,copy=None):
-        arr=_v13314_unpack_binary_x(self.physical,self.shape[-1]).astype(dtype or self.dtype,copy=False)
-        if copy: arr=arr.copy()
-        return arr
-    def __getattr__(self,name):
-        if name in {'flags','strides'}:
-            return getattr(_v13314_np.asarray(self),name)
-        raise AttributeError(name)
 
 
-def _v13314_workspace_memmap(filename, *args, **kwargs):
-    if isinstance(filename, _V13314BitPackedPath):
-        mode=kwargs.get('mode', args[1] if len(args)>1 else 'r+')
-        return filename.open(mode=mode)
-    if isinstance(filename, _V13314MemfdPath):
-        filename=_v13314_os.fspath(filename)
-    return _V13314_ORIGINAL_NUMPY_MEMMAP(filename,*args,**kwargs)
 
 
-def _v13314_should_bitpack_workspace(local_vars, shape, dtype):
-    if not _v13314_env_bool('YOLO_TTA_BITPACK_WORKSPACES', False):
-        return False
-    dtype=_v13314_np.dtype(dtype)
-    if len(shape)<3 or dtype.kind not in {'b','u'} or dtype.itemsize != 1:
-        return False
-    if bool(local_vars.get('track_conf', local_vars.get('track_confidence', False))):
-        return False
-    explicit=local_vars.get('bitpack',local_vars.get('bitpacked'))
-    if explicit is not None:
-        return bool(explicit)
-    # Restrict automatic packing to the path-only baseline/direct-union pipeline.
-    frame=_v13314_inspect.currentframe()
-    names=[]
-    try:
-        for _ in range(5):
-            frame=frame.f_back if frame is not None else None
-            if frame is None: break
-            names.append(frame.f_code.co_name.lower())
-    finally:
-        del frame
-    joined=' '.join(names)
-    return ('baseline' in joined or ('direct' in joined and 'union' in joined) or 'interpol' in joined)
 
 
-def _v13314_allocate_bitpacked_workspace(shape, dtype, order, directory, prefix, return_roles):
-    physical_shape=tuple(shape[:-1])+((int(shape[-1])+7)//8,)
-    allocated=_V13314_MEMFD_REGISTRY.allocate(physical_shape,_v13314_np.uint8,order='C',
-                                               directory=directory,prefix=f'{prefix}-bitpack')
-    if allocated is None: return _V13314_NO_WORKSPACE
-    physical,base_descriptor,handle=allocated
-    descriptor=_V13314BitPackedPath(base_descriptor,shape,dtype)
-    logical=_V13314BitPackedArray(physical,descriptor)
-    values=[]
-    for role in return_roles:
-        role_l=str(role).lower()
-        if role_l in {'none','null'}: value=None
-        elif any(tok in role_l for tok in ('path','filename','file_name')): value=descriptor
-        elif role_l in {'fd','fileno'} or role_l.endswith('_fd'): value=descriptor.fd
-        elif any(tok in role_l for tok in ('handle','owner','cleanup','lease','resource')): value=handle
-        elif any(tok in role_l for tok in ('nbytes','byte_size','size_bytes')): value=descriptor.nbytes
-        elif any(tok in role_l for tok in ('array','arr','mmap','memmap','workspace','volume','mask','data','buffer','mm')): value=logical
-        else:
-            handle.close(); return _V13314_NO_WORKSPACE
-        values.append(value)
-    _V13314_TELEMETRY.add('workspace.bitpacked_allocations',1)
-    _V13314_TELEMETRY.add('workspace.bitpacked_logical_bytes',int(_v13314_math.prod(shape))*_v13314_np.dtype(dtype).itemsize)
-    _V13314_TELEMETRY.add('workspace.bitpacked_physical_bytes',descriptor.nbytes)
-    return values[0] if len(values)==1 else tuple(values)
+
+
 
 class _V13314ProjectionSparseUnsupported(RuntimeError):
     pass
@@ -40042,6 +39424,7 @@ class _V13314ProjectionTransaction:
         _V13314_TELEMETRY.fallback('projection.transaction', exc)
 
 
+# DEAD CODE (v15.0.4): NumPy allocator monkeypatch parsing is no longer installed.
 def _v13314_shape_dtype_from_allocator(args, kwargs, is_memmap):
     if is_memmap:
         filename = args[0] if args else kwargs.get('filename')
@@ -40056,7 +39439,7 @@ def _v13314_shape_dtype_from_allocator(args, kwargs, is_memmap):
     return None, shape, dtype, 'w+', order
 
 
-_V13314_ORIGINAL_NUMPY_MEMMAP = _v13314_np.memmap if _v13314_np is not None else None
+# DEAD CODE (v15.0.4): saved NumPy allocator aliases retained for external compatibility.
 _V13314_ORIGINAL_NUMPY_ZEROS = _v13314_np.zeros if _v13314_np is not None else None
 _V13314_ORIGINAL_NUMPY_EMPTY = _v13314_np.empty if _v13314_np is not None else None
 
@@ -40217,6 +39600,8 @@ def _v13314_install_materializer_wrapper():
     globals()['materialize_nrrd_view_layer'] = wrapped
     return True
 
+# DEAD CODE (v15.0.4): the native resident TensorRT cache owns persistence; this older
+# compatibility cache has no acquire/insert caller and is retained only for import stability.
 class _V13314PersistentExecutorCache:
     """Worker-process cache for resident TensorRT ring executors (P2)."""
 
@@ -40439,6 +39824,7 @@ class _V13314PersistentExecutorCache:
                     pass
 
 
+# DEAD CODE (v15.0.4): instantiated only for compatibility; the native resident-ring cache is live.
 _V13314_TRT_CACHE = _V13314PersistentExecutorCache()
 _v13314_atexit.register(_V13314_TRT_CACHE.close_all)
 
@@ -40541,7 +39927,8 @@ _V13314_TELEMETRY.gauge('features', {
     'n24_owned_member_transfer': bool(hasattr(globals().get('_MemberParallelGzipPayloadWriter', object), 'write_owned_known_nonzero')),
     'n2_projection_callback': _v13314_projection_callback_installed,
     'n2_materializer': _v13314_materializer_installed,
-    'p7_memfd': bool(hasattr(_v13314_os, 'memfd_create')),
+    'p7_memfd': False,
+    'p7_memfd_dead_compatibility_code_present': bool(hasattr(_v13314_os, 'memfd_create')),
     'p2_trt_persistence': _v13314_trt_installed,
 })
 # <<< End late compatibility layer <<<
