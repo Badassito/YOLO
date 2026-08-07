@@ -2,9 +2,10 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the GPT-5.6-Sol-Pro v15.0.4 SLURM maintenance release, copied from
-Opus-5_v15.0.3_SLURM.py. It keeps the v15 channel-aware inference pipeline while
-removing retired NRRD tight-crop and v13.3.14 bit-packed workspace paths.
+This is the GPT-5.6-Sol-Pro v15.0.5 SLURM maintenance release, copied from the
+confirmed-running GPT-5.6-Sol-Pro_v15.0.4_SLURM.py. It removes retired compatibility
+code, folds runtime observability into the core pipeline, and defaults model loading to
+overlap input decode/preparation.
 
 Current runtime behavior:
   - accepts gray/grey, RGB, or C{odd}S{stride} model-input channel layouts
@@ -16,7 +17,8 @@ Current runtime behavior:
   - uses Ultralytics' unified quantize setting for inference precision
   - stores temporary binary volumes as ordinary unpacked uint8 arrays or raw bbox stores
   - writes every single-layer Slicer segmentation NRRD in the complete output geometry
-  - overlaps inference, view cleanup/interpolation, backprojection, and output writing
+  - overlaps model loading with decode/preparation by default, then overlaps inference,
+    view cleanup/interpolation, backprojection, and output writing
 
 Dependencies:
   pip install opencv-python numpy scipy tifffile tqdm ultralytics
@@ -27,9 +29,12 @@ Dependencies:
 from __future__ import annotations
 
 import argparse
+import atexit
 import colorsys
 import contextlib
+import functools
 import gc
+import inspect
 import io
 import json
 import math
@@ -48,17 +53,17 @@ import threading
 import time
 import weakref
 import zlib
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field, replace as dataclasses_replace
 from functools import lru_cache
-
-GIB = 1024 ** 3
-NRRD_SPACE = "left-posterior-superior"
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+GIB = 1024 ** 3
+NRRD_SPACE = "left-posterior-superior"
 
 # --- third-party ---
 try:
@@ -566,6 +571,13 @@ def available_anon_work_bytes() -> int:
     return min(node_avail, int(cgroup_headroom))
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() not in ("", "0", "false", "no", "off")
+
+
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name, '').strip()
     if not raw:
@@ -584,6 +596,24 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except Exception:
         return int(default)
+
+
+def _env_flag_compat(primary: str, legacy: str, default: bool = False) -> bool:
+    """Resolve a renamed boolean environment setting while retaining one legacy alias."""
+    if os.environ.get(primary) is not None:
+        return _env_flag(primary, default)
+    return _env_flag(legacy, default)
+
+
+def _env_int_compat(primary: str, legacy: str, default: int) -> int:
+    """Resolve a renamed integer environment setting while retaining one legacy alias."""
+    if os.environ.get(primary) is not None:
+        return _env_int(primary, default)
+    return _env_int(legacy, default)
+
+
+def _env_any_set(*names: str) -> bool:
+    return any(bool(os.environ.get(name, '').strip()) for name in names)
 
 
 def _slurm_allocated_cpu_count() -> Optional[int]:
@@ -613,6 +643,425 @@ def _cpu_count() -> int:
         return max(1, int(slurm_cpus))
 
     return max(1, int(os.cpu_count() or 1))
+
+
+# --------------------------
+# Runtime observability
+# --------------------------
+# v15.0.5 folds the useful telemetry portion of the former late v13.3.14 compatibility
+# layer into normal imports and explicit process initialization. No functions/classes are
+# monkeypatched at module end, and importing this module no longer starts sampler threads.
+
+
+def _runtime_jsonable(value: object) -> object:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (tuple, list)):
+        return [_runtime_jsonable(v) for v in value[:32]]
+    if isinstance(value, dict):
+        return {str(k): _runtime_jsonable(v) for k, v in list(value.items())[:64]}
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.dtype):
+        return str(value)
+    return repr(value)[:512]
+
+
+class RuntimeTelemetry:
+    """Low-overhead process-local phase and throughput telemetry."""
+
+    def __init__(self) -> None:
+        self.enabled = _env_flag('YOLO_TTA_TELEMETRY', True)
+        self.detail = _env_flag('YOLO_TTA_TELEMETRY_DETAIL', False)
+        self.lock = threading.RLock()
+        self.started_ns = time.monotonic_ns()
+        self.phase_ns: Counter[str] = Counter()
+        self.phase_calls: Counter[str] = Counter()
+        self.counters: Counter[str] = Counter()
+        self.gauges: Dict[str, object] = {}
+        self.fallbacks: Counter[str] = Counter()
+        self._dirty = 0
+        self._last_flush = time.monotonic()
+        self.flush_seconds = max(2.0, _env_float('YOLO_TTA_TELEMETRY_FLUSH_SECONDS', 15.0))
+        requested = os.environ.get('YOLO_TTA_TELEMETRY_PATH', '').strip()
+        if requested:
+            self.path = Path(requested)
+        else:
+            base = os.environ.get('SLURM_JOB_ID') or str(os.getpid())
+            self.path = Path(tempfile.gettempdir()) / f'gpt56-sol-pro-v1505-telemetry-{base}-{os.getpid()}.jsonl'
+
+    @contextlib.contextmanager
+    def span(self, name: str, **fields: object) -> Iterator[None]:
+        if not self.enabled:
+            yield
+            return
+        start = time.monotonic_ns()
+        failed = False
+        try:
+            yield
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            elapsed = time.monotonic_ns() - start
+            with self.lock:
+                self.phase_ns[str(name)] += int(elapsed)
+                self.phase_calls[str(name)] += 1
+                if failed:
+                    self.counters[f'{name}.errors'] += 1
+                for key, value in fields.items():
+                    if isinstance(value, (int, float)):
+                        self.counters[f'{name}.{key}'] += value
+                self._dirty += 1
+            self.maybe_flush()
+
+    def add(self, name: str, value: object = 1) -> None:
+        if not self.enabled:
+            return
+        try:
+            amount: object = int(value)  # type: ignore[arg-type]
+        except Exception:
+            try:
+                amount = float(value)  # type: ignore[arg-type]
+            except Exception:
+                return
+        with self.lock:
+            self.counters[str(name)] += amount  # type: ignore[operator]
+            self._dirty += 1
+
+    def gauge(self, name: str, value: object) -> None:
+        if not self.enabled:
+            return
+        with self.lock:
+            self.gauges[str(name)] = _runtime_jsonable(value)
+            self._dirty += 1
+
+    def fallback(self, name: str, exc: Optional[BaseException] = None) -> None:
+        if not self.enabled:
+            return
+        with self.lock:
+            self.fallbacks[str(name)] += 1
+            if exc is not None:
+                self.gauges[f'fallback.{name}.last_error'] = f'{type(exc).__name__}: {exc}'[:512]
+            self._dirty += 1
+
+    def snapshot(self, *, final: bool = False) -> Dict[str, object]:
+        now_ns = time.monotonic_ns()
+        with self.lock:
+            phases: Dict[str, object] = {}
+            for name, total_ns in self.phase_ns.items():
+                calls = int(self.phase_calls.get(name, 0))
+                seconds = float(total_ns) / 1e9
+                phases[str(name)] = {
+                    'calls': calls,
+                    'seconds': seconds,
+                    'mean_ms': (seconds * 1000.0 / calls) if calls else 0.0,
+                }
+            payload: Dict[str, object] = {
+                'schema': 'gpt-5.6-sol-pro-v15.0.5.telemetry.v1',
+                'pid': os.getpid(),
+                'monotonic_seconds': (now_ns - self.started_ns) / 1e9,
+                'wall_time': time.time(),
+                'final': bool(final),
+                'phases': phases,
+                'counters': dict(self.counters),
+                'gauges': dict(self.gauges),
+                'fallbacks': dict(self.fallbacks),
+            }
+            self._dirty = 0
+        return payload
+
+    def maybe_flush(self) -> None:
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        with self.lock:
+            due = bool(self._dirty >= 256 or (self._dirty and now - self._last_flush >= self.flush_seconds))
+        if due:
+            self.flush()
+
+    def flush(self, *, final: bool = False) -> None:
+        if not self.enabled:
+            return
+        payload = self.snapshot(final=bool(final))
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open('a', encoding='utf-8') as handle:
+                handle.write(json.dumps(payload, sort_keys=True, separators=(',', ':')) + '\n')
+            with self.lock:
+                self._last_flush = time.monotonic()
+        except Exception as exc:
+            with self.lock:
+                self.enabled = False
+            try:
+                print(f'[runtime telemetry disabled] {exc}', file=sys.stderr)
+            except Exception:
+                pass
+
+
+class RuntimeSystemSampler:
+    def __init__(self, telemetry: RuntimeTelemetry) -> None:
+        self.telemetry = telemetry
+        self.interval = max(1.0, _env_float('YOLO_TTA_TELEMETRY_SAMPLE_SECONDS', 5.0))
+        self.stop_event = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+        self.last: Optional[Dict[str, object]] = None
+        self._nvml_ready = False
+
+    @staticmethod
+    def _read_cgroup_memory() -> Tuple[Optional[int], Optional[int]]:
+        candidates = (
+            (Path('/sys/fs/cgroup/memory.max'), Path('/sys/fs/cgroup/memory.current')),
+            (Path('/sys/fs/cgroup/memory/memory.limit_in_bytes'), Path('/sys/fs/cgroup/memory/memory.usage_in_bytes')),
+        )
+        for limit_path, current_path in candidates:
+            try:
+                raw = limit_path.read_text().strip()
+                limit = None if raw == 'max' else int(raw)
+                if limit is not None and int(limit) >= (1 << 60):
+                    limit = None
+                current = int(current_path.read_text().strip())
+                return limit, current
+            except Exception:
+                continue
+        return None, None
+
+    @classmethod
+    def _read_proc(cls) -> Dict[str, object]:
+        result: Dict[str, object] = {'time': time.monotonic()}
+        try:
+            fields = Path('/proc/self/stat').read_text().split()
+            result['cpu_ticks'] = int(fields[13]) + int(fields[14])
+            result['rss_pages'] = int(fields[23])
+        except Exception:
+            pass
+        try:
+            for line in Path('/proc/self/io').read_text().splitlines():
+                key, value = line.split(':', 1)
+                result[key.strip()] = int(value.strip())
+        except Exception:
+            pass
+        limit, current = cls._read_cgroup_memory()
+        if current is not None:
+            result['cgroup_memory_current'] = int(current)
+        if limit is not None:
+            result['cgroup_memory_limit'] = int(limit)
+        return result
+
+    def _sample_gpu(self) -> None:
+        try:
+            import pynvml  # type: ignore[import-not-found]
+            if not self._nvml_ready:
+                pynvml.nvmlInit()
+                self._nvml_ready = True
+            util = []
+            memory = []
+            for index in range(int(pynvml.nvmlDeviceGetCount())):
+                handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+                usage = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                util.append({'gpu': int(usage.gpu), 'memory': int(usage.memory)})
+                memory.append({'used': int(mem.used), 'total': int(mem.total)})
+            self.telemetry.gauge('system.gpu_utilization', util)
+            self.telemetry.gauge('system.gpu_memory', memory)
+        except Exception:
+            pass
+
+    def _run(self) -> None:
+        while not self.stop_event.wait(self.interval):
+            now = self._read_proc()
+            prior = self.last
+            self.last = now
+            try:
+                page_size = int(os.sysconf('SC_PAGE_SIZE'))
+            except Exception:
+                page_size = 4096
+            if 'rss_pages' in now:
+                self.telemetry.gauge('system.rss_bytes', int(now['rss_pages']) * page_size)
+            if 'cgroup_memory_current' in now:
+                self.telemetry.gauge('system.cgroup_memory_current', int(now['cgroup_memory_current']))
+            if prior is not None:
+                dt = max(1e-9, float(now['time']) - float(prior['time']))
+                try:
+                    ticks = float(os.sysconf('SC_CLK_TCK'))
+                except Exception:
+                    ticks = 100.0
+                if 'cpu_ticks' in now and 'cpu_ticks' in prior:
+                    self.telemetry.gauge(
+                        'system.process_cpu_cores',
+                        (int(now['cpu_ticks']) - int(prior['cpu_ticks'])) / ticks / dt,
+                    )
+                for key, metric in (
+                    ('read_bytes', 'system.disk_read_bytes_per_s'),
+                    ('write_bytes', 'system.disk_write_bytes_per_s'),
+                    ('rchar', 'system.logical_read_bytes_per_s'),
+                    ('wchar', 'system.logical_write_bytes_per_s'),
+                ):
+                    if key in now and key in prior:
+                        self.telemetry.gauge(metric, max(0, int(now[key]) - int(prior[key])) / dt)
+            self._sample_gpu()
+            self.telemetry.maybe_flush()
+
+    def start(self) -> None:
+        if not self.telemetry.enabled or not _env_flag('YOLO_TTA_TELEMETRY_SYSTEM_SAMPLER', True):
+            return
+        self.last = self._read_proc()
+        self.thread = threading.Thread(target=self._run, name='runtime-telemetry', daemon=True)
+        self.thread.start()
+
+    def close(self) -> None:
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=min(2.0, self.interval))
+        if self._nvml_ready:
+            try:
+                import pynvml  # type: ignore[import-not-found]
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+            self._nvml_ready = False
+
+
+class _TeeStream:
+    def __init__(self, original: object, file_handle: object) -> None:
+        self.original = original
+        self.file_handle = file_handle
+        self.lock = threading.Lock()
+
+    def write(self, data: str) -> object:
+        with self.lock:
+            result = self.original.write(data)  # type: ignore[attr-defined]
+            self.file_handle.write(data)  # type: ignore[attr-defined]
+            return result
+
+    def flush(self) -> None:
+        with self.lock:
+            self.original.flush()  # type: ignore[attr-defined]
+            self.file_handle.flush()  # type: ignore[attr-defined]
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.original, name)
+
+
+_RUNTIME_OBSERVABILITY_LOCK = threading.Lock()
+_RUNTIME_TELEMETRY: Optional[RuntimeTelemetry] = None
+_RUNTIME_SYSTEM_SAMPLER: Optional[RuntimeSystemSampler] = None
+_RUNTIME_STDIO_CAPTURE: Optional[object] = None
+_RUNTIME_OBSERVABILITY_ATEXIT_REGISTERED = False
+_RUNTIME_OBSERVABILITY_SHUTDOWN = False
+_RUNTIME_TELEMETRY_DECORATED_SYMBOLS: List[str] = []
+
+
+def _install_stdio_capture(telemetry: RuntimeTelemetry) -> Optional[object]:
+    path = os.environ.get('YOLO_TTA_CAPTURE_STDIO_PATH', '').strip()
+    if not path:
+        return None
+    try:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        handle = target.open('a', encoding='utf-8', buffering=1)
+        sys.stdout = _TeeStream(sys.stdout, handle)  # type: ignore[assignment]
+        sys.stderr = _TeeStream(sys.stderr, handle)  # type: ignore[assignment]
+        return handle
+    except Exception as exc:
+        telemetry.fallback('telemetry.stdio_capture', exc)
+        return None
+
+
+def _record_runtime_feature_gauges(telemetry: RuntimeTelemetry) -> None:
+    telemetry.gauge('telemetry.decorated_symbols', sorted(_RUNTIME_TELEMETRY_DECORATED_SYMBOLS))
+    telemetry.gauge('features', {
+        'raw_bbox_restored_sparse_members': bool(
+            hasattr(globals().get('RawBBoxMaskStore', object), 'iter_restored_sparse_members')
+        ),
+        'crop_aware_low_quality_mirror': bool(globals().get('_resize_sparse_binary_crop_to_output_region')),
+        'slice_aligned_sparse_members': True,
+        'owned_nrrd_member_transfer': bool(
+            hasattr(globals().get('_MemberParallelGzipPayloadWriter', object), 'write_owned_known_nonzero')
+        ),
+        'native_projection_callback': bool(globals().get('_emit_projection_block_callback')),
+        'native_projected_layer_materializer': bool(globals().get('materialize_nrrd_view_layer')),
+        'memfd_workspace_compatibility': False,
+        'native_persistent_trt_ring': bool(globals().get('_RESIDENT_TRT_PIPELINE_CACHE_NATIVE', False)),
+    })
+
+
+def initialize_runtime_observability() -> RuntimeTelemetry:
+    """Initialize process-local telemetry explicitly; safe to call repeatedly."""
+    global _RUNTIME_TELEMETRY, _RUNTIME_SYSTEM_SAMPLER, _RUNTIME_STDIO_CAPTURE
+    global _RUNTIME_OBSERVABILITY_ATEXIT_REGISTERED
+    telemetry = _RUNTIME_TELEMETRY
+    if telemetry is not None:
+        return telemetry
+    with _RUNTIME_OBSERVABILITY_LOCK:
+        telemetry = _RUNTIME_TELEMETRY
+        if telemetry is not None:
+            return telemetry
+        telemetry = RuntimeTelemetry()
+        _RUNTIME_TELEMETRY = telemetry
+        _RUNTIME_STDIO_CAPTURE = _install_stdio_capture(telemetry)
+        sampler = RuntimeSystemSampler(telemetry)
+        _RUNTIME_SYSTEM_SAMPLER = sampler
+        sampler.start()
+        _record_runtime_feature_gauges(telemetry)
+        if not _RUNTIME_OBSERVABILITY_ATEXIT_REGISTERED:
+            atexit.register(shutdown_runtime_observability)
+            _RUNTIME_OBSERVABILITY_ATEXIT_REGISTERED = True
+        return telemetry
+
+
+def shutdown_runtime_observability() -> None:
+    """Stop process-local sampling and emit one final telemetry snapshot exactly once."""
+    global _RUNTIME_OBSERVABILITY_SHUTDOWN
+    with _RUNTIME_OBSERVABILITY_LOCK:
+        if _RUNTIME_OBSERVABILITY_SHUTDOWN:
+            return
+        _RUNTIME_OBSERVABILITY_SHUTDOWN = True
+        sampler = _RUNTIME_SYSTEM_SAMPLER
+        telemetry = _RUNTIME_TELEMETRY
+        capture = _RUNTIME_STDIO_CAPTURE
+    if sampler is not None:
+        try:
+            sampler.close()
+        except Exception:
+            pass
+    if telemetry is not None:
+        try:
+            telemetry.flush(final=True)
+        except Exception:
+            pass
+    if capture is not None:
+        try:
+            capture.flush()
+        except Exception:
+            pass
+
+
+def runtime_telemetry() -> RuntimeTelemetry:
+    telemetry = _RUNTIME_TELEMETRY
+    return telemetry if telemetry is not None else initialize_runtime_observability()
+
+
+def runtime_telemetry_phase(phase: str) -> Callable[[Callable[..., object]], Callable[..., object]]:
+    """Decorate a core function directly instead of installing a late monkeypatch."""
+    def _decorate(original: Callable[..., object]) -> Callable[..., object]:
+        qualified = str(getattr(original, '__qualname__', getattr(original, '__name__', phase)))
+        _RUNTIME_TELEMETRY_DECORATED_SYMBOLS.append(f'{qualified}:{phase}')
+        if inspect.isgeneratorfunction(original):
+            @functools.wraps(original)
+            def _generator(*args: object, **kwargs: object) -> Iterator[object]:
+                with runtime_telemetry().span(str(phase)):
+                    yield from original(*args, **kwargs)  # type: ignore[misc]
+            return _generator
+
+        @functools.wraps(original)
+        def _wrapped(*args: object, **kwargs: object) -> object:
+            with runtime_telemetry().span(str(phase)):
+                return original(*args, **kwargs)
+        return _wrapped
+    return _decorate
 
 
 # --------------------------
@@ -1093,7 +1542,6 @@ def gpu_worker_cpu_share(gpu_device_count: int) -> int:
     return max(1, cpu // n)
 
 
-
 def main_process_worker_budget(gpu_device_count: int, gpu_worker_process_active: bool) -> int:
     """Main-process CPU budget while one-or-more CUDA worker processes are active."""
     total = int(default_worker_budget())
@@ -1102,7 +1550,6 @@ def main_process_worker_budget(gpu_device_count: int, gpu_worker_process_active:
     n = max(1, int(gpu_device_count))
     reserved = int(gpu_worker_cpu_share(n)) * n
     return max(1, total - reserved)
-
 
 
 def tail_worker_budget_expansion_enabled() -> bool:
@@ -1116,17 +1563,16 @@ def tail_worker_budget_expansion_enabled() -> bool:
 
 def gpu_worker_direct_union_enabled() -> bool:
     """Allow disjoint single-angle worker leases to write directly into the view union."""
-    if os.environ.get('YOLO_TTA_GPU_WORKER_DIRECT_UNION') is not None:
-        return _env_flag('YOLO_TTA_GPU_WORKER_DIRECT_UNION', True)
-    # Compatibility alias for existing submit scripts.
-    return _env_flag('YOLO_TTA_MGPU_DIRECT_UNION', True)
+    return _env_flag_compat(
+        'YOLO_TTA_GPU_WORKER_DIRECT_UNION',
+        'YOLO_TTA_MGPU_DIRECT_UNION',
+        True,
+    )
 
 
-
-# CLEANUP(v15.0.4): these mgpu_* helper names and YOLO_TTA_MGPU_* tuning variables now
-# serve the process-per-GPU scheduler for one-or-more CUDA devices. Rename them only with
-# compatibility aliases for existing SLURM launch scripts.
-def mgpu_fullframe_task_ranges(
+# Process-per-GPU scheduling helpers. New YOLO_TTA_GPU_WORKER_* settings take precedence;
+# YOLO_TTA_MGPU_* remains accepted as a compatibility alias for existing launch scripts.
+def gpu_worker_fullframe_task_ranges(
     n_slices: int,
     slice_chunk: int,
     gpu_count: int,
@@ -1141,18 +1587,26 @@ def mgpu_fullframe_task_ranges(
     ]
 
 
-def mgpu_tail_split_point(
+def gpu_worker_tail_split_point(
     slice_start: int,
     slice_count: int,
     inference_batch: int,
 ) -> Optional[int]:
     """C11 batch-aligned midpoint for a dispatch-time tail lease split."""
-    if not _env_flag('YOLO_TTA_MGPU_ADAPTIVE_TAIL_LEASES', True):
+    if not _env_flag_compat(
+        'YOLO_TTA_GPU_WORKER_ADAPTIVE_TAIL_LEASES',
+        'YOLO_TTA_MGPU_ADAPTIVE_TAIL_LEASES',
+        True,
+    ):
         return None
     tail0 = int(slice_start)
     tail1 = int(slice_start) + max(0, int(slice_count))
     align = max(1, int(inference_batch))
-    min_tail = max(align, _env_int('YOLO_TTA_MGPU_TAIL_MIN_SLICES', 128))
+    min_tail = max(align, _env_int_compat(
+        'YOLO_TTA_GPU_WORKER_TAIL_MIN_SLICES',
+        'YOLO_TTA_MGPU_TAIL_MIN_SLICES',
+        128,
+    ))
     midpoint = int(tail0) + ((int(tail1 - tail0) // 2) // int(align)) * int(align)
     if int(midpoint - tail0) >= int(min_tail) and int(tail1 - midpoint) >= int(min_tail):
         return int(midpoint)
@@ -1275,6 +1729,7 @@ def flush_array(arr: object, *, force: bool = False) -> None:
         pass
 
 
+@runtime_telemetry_phase('workspace.allocate')
 def allocate_workspace_array(
     shape: Sequence[int],
     dtype: np.dtype | str | type,
@@ -1973,6 +2428,7 @@ def interpolation_process_cv2_threads() -> int:
 
 def _interpolation_process_initializer() -> None:
     global _INTERPOLATION_PROCESS_WORKER
+    initialize_runtime_observability()
     _INTERPOLATION_PROCESS_WORKER = True
     try:
         cv2.setNumThreads(int(interpolation_process_cv2_threads()))
@@ -3370,7 +3826,6 @@ class LazyProcessingCube:
             close_memmap_array(arr)
 
 
-
 def restore_mask_volume_to_original_shape(
     mask_u8: np.ndarray,
     out_shape: Tuple[int, int, int],
@@ -4430,16 +4885,6 @@ def extract_radial_slice_frame(
     alpha = np.clip(rf - r0, 0.0, 1.0).astype(np.float32)[:, None]
     folded = proj[r0] * (np.float32(1.0) - alpha) + proj[r1] * alpha
     return np.clip(np.rint(folded), 0.0, 255.0).astype(np.uint8)
-
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return bool(default)
-    s = str(raw).strip().lower()
-    if s in ("", "0", "false", "no", "off"):
-        return False
-    return True
 
 
 def _cupy_external_stream(cp: object, torch_stream: object) -> object:
@@ -7053,10 +7498,6 @@ def get_view_frame_by_index(
 
 
 # --------------------------
-# Native mask accumulation
-# --------------------------
-
-# --------------------------
 # YOLO inference
 # --------------------------
 
@@ -7072,13 +7513,14 @@ def load_ultralytics_model(path: str, task: str = 'segment'):
 
 
 def background_model_load_enabled() -> bool:
-    """Return True when YOLO model loading should overlap CPU volume setup.
+    """Return True when main-process model loading overlaps decode/preparation.
 
-    Model construction is not expected to be the multi-minute startup bottleneck, so
-    the overlap thread is opt-in.  The important fast-start path is streaming CPU
-    resize/render work into the GPU consumer once the processing volume is available.
+    v15.0.5 enables the overlap by default. Set YOLO_TTA_BACKGROUND_MODEL_LOAD=0
+    only for debugging or backends whose constructor is not safe in a loader thread.
+    CUDA runs load inside their persistent GPU workers while the default streaming
+    decode producer is active.
     """
-    return _env_flag('YOLO_TTA_BACKGROUND_MODEL_LOAD', False)
+    return _env_flag('YOLO_TTA_BACKGROUND_MODEL_LOAD', True)
 
 
 def canonical_single_device(device: str) -> str:
@@ -7163,7 +7605,6 @@ def resolve_retina_mask_processor(explicit: Optional[str], devices: Sequence[str
     if any(str(d).startswith('cuda') for d in devices):
         return 'gpu', 'CUDA default uses GPU retina reconstruction'
     return 'cpu', 'non-CUDA default uses CPU retina reconstruction'
-
 
 
 # v13.0.0: the active retina-mask processor resolved in main() from --retina_mask_processor and
@@ -7751,9 +8192,6 @@ class DeferredCpuRetinaMaskPayload:
 
 
 _ULTRALYTICS_CPU_RETINA_PATCHED = False
-# DEAD STATE (v15 review): assigned when the patch installs but never read;
-# the live fallback uses the closure-local original_construct_result.
-_ULTRALYTICS_ORIGINAL_SEG_CONSTRUCT_RESULT: Optional[object] = None
 
 
 _DEFERRED_CLONE_FALLBACK_WARNED = False
@@ -7950,12 +8388,6 @@ def ensure_channel_aware_yolo_preprocess_patch() -> bool:
         'passed as BCHW tensors without BGR/RGB channel reversal.'
     )
     return True
-
-
-# DEAD CODE / EXTERNAL COMPATIBILITY ALIAS (v15.0.4): no internal caller; retained for
-# consumers that still import the former single-channel patch name.
-def ensure_single_channel_yolo_preprocess_patch() -> bool:
-    return ensure_channel_aware_yolo_preprocess_patch()
 
 
 def require_channel_aware_yolo_preprocess_patch(channel_token: str) -> None:
@@ -8236,7 +8668,7 @@ def _realize_deferred_cpu_retina_payload(payload: DeferredCpuRetinaMaskPayload) 
 
 def ensure_cpu_retina_mask_predictor_patch() -> bool:
     """Patch Ultralytics segmentation postprocess to return CPU-retina payloads, not GPU masks."""
-    global _ULTRALYTICS_CPU_RETINA_PATCHED, _ULTRALYTICS_ORIGINAL_SEG_CONSTRUCT_RESULT
+    global _ULTRALYTICS_CPU_RETINA_PATCHED
 
     if not cpu_retina_masks_enabled():
         return False
@@ -8251,7 +8683,6 @@ def ensure_cpu_retina_mask_predictor_patch() -> bool:
         return False
 
     original_construct_result = SegmentationPredictor.construct_result
-    _ULTRALYTICS_ORIGINAL_SEG_CONSTRUCT_RESULT = original_construct_result
 
     def _tta_cpu_retina_construct_result(self, pred, img, orig_img, img_path, proto):  # type: ignore[no-untyped-def]
         if not cpu_retina_masks_enabled():
@@ -8322,9 +8753,6 @@ def ensure_cpu_retina_mask_predictor_patch() -> bool:
 
 
 _ULTRALYTICS_GPU_PROTO_UNION_PATCHED = False
-# DEAD STATE (v15 review): same write-only original-function retention as the
-# CPU patch; the closure retains the callable actually used for fallback.
-_ULTRALYTICS_ORIGINAL_SEG_CONSTRUCT_RESULT_FOR_GPU: Optional[object] = None
 
 
 def _build_gpu_flattened_payload_from_proto(pred: object, img: object, proto: object) -> Optional['GpuFlattenedRetinaPayload']:
@@ -8455,7 +8883,7 @@ def ensure_gpu_retina_proto_union_predictor_patch() -> bool:
     instead of an (n, imgsz, imgsz) retina-mask stack. Any failure falls back per-frame to the
     original Ultralytics construct_result.
     """
-    global _ULTRALYTICS_GPU_PROTO_UNION_PATCHED, _ULTRALYTICS_ORIGINAL_SEG_CONSTRUCT_RESULT_FOR_GPU
+    global _ULTRALYTICS_GPU_PROTO_UNION_PATCHED
 
     if cpu_retina_masks_enabled() or not gpu_retina_proto_union_enabled():
         return False
@@ -8470,7 +8898,6 @@ def ensure_gpu_retina_proto_union_predictor_patch() -> bool:
         return False
 
     original_construct_result = SegmentationPredictor.construct_result
-    _ULTRALYTICS_ORIGINAL_SEG_CONSTRUCT_RESULT_FOR_GPU = original_construct_result
 
     def _tta_gpu_proto_union_construct_result(self, pred, img, orig_img, img_path, proto):  # type: ignore[no-untyped-def]
         if cpu_retina_masks_enabled() or not gpu_retina_proto_union_enabled():
@@ -8736,8 +9163,6 @@ def _min_radius_filter_ndimage(xp, ndi, mask_bool, min_radius: float):
     keep_lookup = xp.zeros((num_i + 1,), dtype=bool)
     keep_lookup[1:] = radii >= float(min_radius)
     return keep_lookup[labels2d]
-
-
 
 
 def _try_import_cupy_ndimage():
@@ -11177,8 +11602,6 @@ def _filter_connected_components_by_min_conf_scipy(
     if keep_ids.size <= 0:
         return np.zeros(mask_bool.shape, dtype=bool)
     return np.isin(labels2d, keep_ids)
-
-
 
 
 def _cleanup_prediction_slice_inplace(
@@ -14349,6 +14772,7 @@ def _gpu_inference_worker_main(
         # logical --device index is remapped through the inherited CUDA_VISIBLE_DEVICES list
         # (v13.2.2 bug #13).
         os.environ['CUDA_VISIBLE_DEVICES'] = _pin_cuda_visible_device_token(int(gpu_index))
+        initialize_runtime_observability()
         # v13.3.5 (N1): pin every thread of this worker to its GPU's NUMA node BEFORE any
         # CUDA/model work, so allocator arenas, pinned staging and TRT host scratch land
         # node-local. The parent computed the plan (None = stay unpinned).
@@ -14784,8 +15208,6 @@ def _adjacent_gid_pair_codes(
     if len(code_parts) == 1:
         return np.asarray(code_parts[0], dtype=np.uint64)
     return np.unique(np.concatenate(code_parts).astype(np.uint64, copy=False))
-
-
 
 
 def _mark_boundary_components_from_local_labels(
@@ -16924,6 +17346,7 @@ class _ResidentTensorRTRingExecutor:
     consumption and the caller retains the ordinary direct-predict path.
     """
 
+    @runtime_telemetry_phase('trt_ring.init')
     def __init__(
         self,
         backend: object,
@@ -17883,6 +18306,7 @@ def _abort_projection_block_callback(
             pass
 
 
+@runtime_telemetry_phase('projection.callback')
 def _emit_projection_block_callback(
     callback: Optional[Callable[[int, np.ndarray], None]],
     z0: int,
@@ -20152,7 +20576,7 @@ def assemble_current_view_union_volume(
     postprocessing runs in source voxels; None keeps the working geometry.
     """
     if len(view_volumes_by_model) != 1:
-        raise ValueError('GPT-5.6-Sol-Pro v15.0.4 supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v15.0.5 supports exactly one --model; multiple-model inference has been removed')
 
     union_shape = (int(T), int(H), int(W)) if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
     model_name = next(iter(view_volumes_by_model.keys()))
@@ -25767,7 +26191,6 @@ class NrrdRasterPlan:
     empty_segment: bool
 
 
-
 @dataclass(frozen=True)
 class TileGateResult:
     model_name: str
@@ -26334,6 +26757,7 @@ class RawBBoxMaskStore:
         self.fill_decoded_slice_into(idx_i, out)
         return out
 
+    @runtime_telemetry_phase('cvol.iter_native_sparse')
     def iter_native_sparse_members(
         self,
         z_start: int,
@@ -26403,6 +26827,7 @@ class RawBBoxMaskStore:
                     sparse_consumer(int(z), int(y0), int(x0), np.asarray(crop, dtype=np.uint8))
             yield int(ln), member
 
+    @runtime_telemetry_phase('cvol.iter_restored_sparse')
     def iter_restored_sparse_members(
         self,
         output_shape: Tuple[int, int, int],
@@ -27159,6 +27584,7 @@ def project_view_volume_to_orthogonal_volume(
     return out
 
 
+@runtime_telemetry_phase('projection.materialize')
 def materialize_nrrd_view_layer(
     view_volume_mm: np.ndarray,
     *,
@@ -29210,11 +29636,6 @@ def apply_gaussian_smoothing_inplace(
 # --------------------------
 
 
-# --------------------------
-# Final outputs
-# --------------------------
-
-
 # v13.3.8 (A5): _gray_to_rgb_frame (np.repeat per frame) is deleted — every writer now
 # expands through _gray_frame_into_rgb_buffer into a reused per-writer buffer.
 _OVERLAY_BLUE_U16 = np.array([0, 0, 255], dtype=np.uint16)  # RGB blue in the uint16 blend domain
@@ -30016,7 +30437,6 @@ def _nrrd_raster_plan(
     )
 
 
-
 def _nrrd_mapped_extent_preserve_empty(
     ref: 'NrrdLayerRef', output_shape_tyx: Tuple[int, int, int],
 ) -> NrrdSegmentExtent:
@@ -30059,10 +30479,6 @@ def slicer_segmentation_header_fields(
             '~SCT^85756007^Tissue~SCT^85756007^Tissue~^^~Anatomic codes - DICOM master list~^^~^^|'
         ),
     }
-
-
-
-
 
 
 def nrrd_gzip_compresslevel() -> int:
@@ -30781,7 +31197,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.6-Sol-Pro_v15.0.4_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.6-Sol-Pro_v15.0.5_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -31060,6 +31476,7 @@ class _OrderedNrrdShardSink:
             pass
 
 
+@runtime_telemetry_phase('nrrd.write_layer')
 def write_single_layer_nrrd_from_ref(
     ref: 'NrrdLayerRef',
     output_shape: Tuple[int, int, int],
@@ -32561,6 +32978,7 @@ def _resize_sparse_binary_crop_to_output_region(
     )
 
 
+@runtime_telemetry_phase('restore.read_slice')
 def _read_layer_slice_in_output_shape(
     src: object,
     output_shape: Tuple[int, int, int],
@@ -32647,10 +33065,6 @@ def _nrrd_layer_zero_skip_window(
     if hi <= lo:
         return (0, 0)
     return (int(lo), int(hi))
-
-
-
-
 
 
 def _write_one_decomposed_nrrd_layer_payload(
@@ -33959,6 +34373,7 @@ def write_summary_file(
 
 
 def main() -> None:
+    initialize_runtime_observability()
     args = build_argparser().parse_args()
     channel_format = resolve_channel_format(args.channel_format)
     print(
@@ -33976,7 +34391,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('GPT-5.6-Sol-Pro v15.0.4 accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v15.0.5 accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -34317,9 +34732,9 @@ def main() -> None:
                 processing_shape,
                 lazy_cube_path,
                 workers=max(1, default_worker_budget()),
-                request_path=temp_dir / 'mgpu_source_volume.cube_request.sentinel',
-                ready_path=temp_dir / 'mgpu_source_volume.cube_ready.sentinel',
-                failed_path=temp_dir / 'mgpu_source_volume.cube_failed.txt',
+                request_path=temp_dir / 'gpu_worker_source_volume.cube_request.sentinel',
+                ready_path=temp_dir / 'gpu_worker_source_volume.cube_ready.sentinel',
+                failed_path=temp_dir / 'gpu_worker_source_volume.cube_failed.txt',
                 streaming_backend=bool(preprocess_streaming_active),
             )
             volume_rgb.start_request_watcher()
@@ -34524,12 +34939,13 @@ def main() -> None:
         )
     if (not gpu_worker_process_active) and background_model_load_enabled():
         spec_notes.append(
-            'v12.2.11 startup overlap is active: the YOLO model load is submitted before ffprobe/decode/native-volume preparation and joined only when the scheduler needs the model for prediction. Set YOLO_TTA_BACKGROUND_MODEL_LOAD=0 to restore synchronous model loading.'
+            'v15.0.5 startup overlap is active by default: the YOLO model load is submitted before decode/native-volume preparation and joined only when prediction needs it. Set YOLO_TTA_BACKGROUND_MODEL_LOAD=0 to force synchronous loading.'
         )
     elif gpu_worker_process_active:
         spec_notes.append(
-            'CUDA parent model loading is skipped; only path/name metadata is retained, and each '
-            'per-GPU worker process loads its own inference engine.'
+            'CUDA parent model loading is skipped; each persistent per-GPU worker loads its own '
+            'inference engine while the default streaming decode producer is active. Setting '
+            'YOLO_TTA_STREAMING_PREPROCESS=0 makes decode synchronous and removes that overlap.'
         )
     if bool(single_angle_streaming_cleanup_active):
         spec_notes.append(
@@ -36106,17 +36522,15 @@ def main() -> None:
     gpu_worker_processes: List[object] = []
     gpu_task_queue: object = None
     gpu_result_queue: object = None
-    mgpu_tasks_by_id: Dict[int, Dict[str, object]] = {}
-    mgpu_results_collected = 0
-    # CLEANUP(v15.0.4): mgpu_* state names now cover one-or-more CUDA workers, including a
-    # single GPU. Rename them to gpu_worker_* in a separate mechanical refactor.
-    mgpu_total_tasks = 0
-    mgpu_dispatched_tasks = 0
-    mgpu_next_dynamic_task_id = 0
-    mgpu_pending_task_ids: deque = deque()
-    mgpu_result_dir = temp_dir / 'mgpu_results'
+    gpu_worker_tasks_by_id: Dict[int, Dict[str, object]] = {}
+    gpu_worker_results_collected = 0
+    gpu_worker_total_tasks = 0
+    gpu_worker_dispatched_tasks = 0
+    gpu_worker_next_dynamic_task_id = 0
+    gpu_worker_pending_task_ids: deque = deque()
+    gpu_worker_result_dir = temp_dir / 'gpu_worker_results'
 
-    def _mgpu_fullframe_parent_key(task: Dict[str, object]) -> Optional[Tuple[str, str]]:
+    def _gpu_worker_fullframe_parent_key(task: Dict[str, object]) -> Optional[Tuple[str, str]]:
         if str(task.get('kind', '')) != 'fullframe':
             return None
         view_obj = task.get('view')
@@ -36125,41 +36539,41 @@ def main() -> None:
             return None
         return (str(task.get('model_name', '')), str(view_name))
 
-    def _split_one_mgpu_dispatch_tail(
+    def _split_one_gpu_worker_dispatch_tail(
         issue_slots: int,
         preferred_parent: Optional[Tuple[str, str]] = None,
     ) -> bool:
         """Split one still-central full-frame lease only when issue reaches the tail."""
-        nonlocal mgpu_total_tasks, mgpu_next_dynamic_task_id
+        nonlocal gpu_worker_total_tasks, gpu_worker_next_dynamic_task_id
         if int(gpu_device_count) <= 1 or int(issue_slots) <= 0:
             return False
-        pending_ids = [int(v) for v in mgpu_pending_task_ids]
+        pending_ids = [int(v) for v in gpu_worker_pending_task_ids]
         # This is the actual central-queue tail, not a per-view construction-time guess:
         # every pending descriptor would otherwise be issued by this refill.
         if not pending_ids or len(pending_ids) > int(issue_slots):
             return False
         parent_pending_counts: Dict[Tuple[str, str], int] = {}
         for task_id in pending_ids:
-            parent_key = _mgpu_fullframe_parent_key(mgpu_tasks_by_id[int(task_id)])
+            parent_key = _gpu_worker_fullframe_parent_key(gpu_worker_tasks_by_id[int(task_id)])
             if parent_key is not None:
                 parent_pending_counts[parent_key] = int(parent_pending_counts.get(parent_key, 0)) + 1
         eligible: List[Tuple[int, int, int, int, int]] = []
         for position, task_id in enumerate(pending_ids):
-            task = mgpu_tasks_by_id[int(task_id)]
+            task = gpu_worker_tasks_by_id[int(task_id)]
             if str(task.get('kind', '')) != 'fullframe' or bool(task.get('tail_adapted', False)):
                 continue
-            midpoint = mgpu_tail_split_point(
+            midpoint = gpu_worker_tail_split_point(
                 int(task.get('slice_start', 0)),
                 int(task.get('slice_count', 0)),
                 int(args.batch),
             )
             if midpoint is None:
                 continue
-            parent_key = _mgpu_fullframe_parent_key(task)
+            parent_key = _gpu_worker_fullframe_parent_key(task)
             remaining = int(fullframe_remaining.get(parent_key, 2 ** 31 - 1)) if parent_key is not None else 2 ** 31 - 1
             # Preserve the lease most likely to unlock parent postprocessing.  In
             # particular, splitting preferred_parent here would turn its sole
-            # pending lease into two and make _pop_mgpu_pending_task_id skip it.
+            # pending lease into two and make _pop_gpu_worker_pending_task_id skip it.
             eligible.append((
                 1 if parent_key == preferred_parent else 0,
                 1 if parent_key is not None and int(parent_pending_counts.get(parent_key, 0)) == 1 else 0,
@@ -36169,11 +36583,11 @@ def main() -> None:
             return False
         _preferred, _sole_pending, _negative_remaining, position, midpoint = min(eligible)
         original_id = int(pending_ids[int(position)])
-        original = mgpu_tasks_by_id[original_id]
+        original = gpu_worker_tasks_by_id[original_id]
         original_start = int(original.get('slice_start', 0))
         original_stop = int(original_start) + int(original.get('slice_count', 0))
-        child_id = int(mgpu_next_dynamic_task_id)
-        mgpu_next_dynamic_task_id += 1
+        child_id = int(gpu_worker_next_dynamic_task_id)
+        gpu_worker_next_dynamic_task_id += 1
         child = dict(original)
         original['slice_count'] = int(midpoint - original_start)
         original['render_workers'] = max(
@@ -36197,12 +36611,12 @@ def main() -> None:
                     child[field_name] = str(path_obj.with_name(
                         f'{path_obj.name}.tail{int(child_id)}'
                     ))
-        mgpu_tasks_by_id[int(child_id)] = child
+        gpu_worker_tasks_by_id[int(child_id)] = child
         pending_ids.insert(int(position) + 1, int(child_id))
-        mgpu_pending_task_ids.clear()
-        mgpu_pending_task_ids.extend(pending_ids)
-        mgpu_total_tasks += 1
-        parent_key = _mgpu_fullframe_parent_key(original)
+        gpu_worker_pending_task_ids.clear()
+        gpu_worker_pending_task_ids.extend(pending_ids)
+        gpu_worker_total_tasks += 1
+        parent_key = _gpu_worker_fullframe_parent_key(original)
         if parent_key is not None:
             fullframe_remaining[parent_key] = int(fullframe_remaining.get(parent_key, 0)) + 1
         print(
@@ -36212,20 +36626,20 @@ def main() -> None:
         )
         return True
 
-    def _pop_mgpu_pending_task_id(
+    def _pop_gpu_worker_pending_task_id(
         preferred_parent: Optional[Tuple[str, str]] = None,
     ) -> int:
         """Prefer a last-unissued full-frame lease that can unlock its parent."""
-        pending_ids = [int(v) for v in mgpu_pending_task_ids]
+        pending_ids = [int(v) for v in gpu_worker_pending_task_ids]
         parent_pending_counts: Dict[Tuple[str, str], int] = {}
         for task_id in pending_ids:
-            parent_key = _mgpu_fullframe_parent_key(mgpu_tasks_by_id[int(task_id)])
+            parent_key = _gpu_worker_fullframe_parent_key(gpu_worker_tasks_by_id[int(task_id)])
             if parent_key is not None:
                 parent_pending_counts[parent_key] = int(parent_pending_counts.get(parent_key, 0)) + 1
         unlock_candidates: List[Tuple[int, int, int, int]] = []
         for position, task_id in enumerate(pending_ids):
-            task = mgpu_tasks_by_id[int(task_id)]
-            parent_key = _mgpu_fullframe_parent_key(task)
+            task = gpu_worker_tasks_by_id[int(task_id)]
+            parent_key = _gpu_worker_fullframe_parent_key(task)
             if parent_key is None or int(parent_pending_counts.get(parent_key, 0)) != 1:
                 continue
             unlock_candidates.append((
@@ -36235,27 +36649,31 @@ def main() -> None:
                 int(task_id),
             ))
         if not unlock_candidates:
-            return int(mgpu_pending_task_ids.popleft())
+            return int(gpu_worker_pending_task_ids.popleft())
         _preferred, _remaining, _position, selected_id = min(unlock_candidates)
-        mgpu_pending_task_ids.remove(int(selected_id))
+        gpu_worker_pending_task_ids.remove(int(selected_id))
         return int(selected_id)
 
-    def _dispatch_mgpu_inference_window(
+    def _dispatch_gpu_worker_inference_window(
         preferred_parent: Optional[Tuple[str, str]] = None,
     ) -> None:
         """C11: issue a bounded window, adapting only its actual inference tail."""
-        nonlocal mgpu_dispatched_tasks
+        nonlocal gpu_worker_dispatched_tasks
         if gpu_task_queue is None:
             return
-        per_gpu = max(1, _env_int('YOLO_TTA_MGPU_DISPATCH_WINDOW_PER_GPU', 2))
+        per_gpu = max(1, _env_int_compat(
+            'YOLO_TTA_GPU_WORKER_DISPATCH_WINDOW_PER_GPU',
+            'YOLO_TTA_MGPU_DISPATCH_WINDOW_PER_GPU',
+            2,
+        ))
         target = max(1, int(gpu_device_count) * int(per_gpu))
-        in_flight = max(0, int(mgpu_dispatched_tasks) - int(mgpu_results_collected))
-        while mgpu_pending_task_ids and int(in_flight) < int(target):
+        in_flight = max(0, int(gpu_worker_dispatched_tasks) - int(gpu_worker_results_collected))
+        while gpu_worker_pending_task_ids and int(in_flight) < int(target):
             issue_slots = int(target) - int(in_flight)
-            _split_one_mgpu_dispatch_tail(int(issue_slots), preferred_parent)
-            task_id = _pop_mgpu_pending_task_id(preferred_parent)
-            gpu_task_queue.put(mgpu_tasks_by_id[task_id])
-            mgpu_dispatched_tasks += 1
+            _split_one_gpu_worker_dispatch_tail(int(issue_slots), preferred_parent)
+            task_id = _pop_gpu_worker_pending_task_id(preferred_parent)
+            gpu_task_queue.put(gpu_worker_tasks_by_id[task_id])
+            gpu_worker_dispatched_tasks += 1
             in_flight += 1
 
     def _ensure_source_volume_file_backed() -> Tuple[str, Tuple[int, int, int], str]:
@@ -36268,7 +36686,7 @@ def main() -> None:
         # T10: both this copy and the decode target it usually replaces live under the scratch
         # root, so a memory-backed scratch dir puts the shared source volume in RAM with the
         # tile canvases — one set of physical pages mapped by all GPU workers, no filesystem.
-        shared_path = temp_dir / 'mgpu_source_volume.gray8.dat'
+        shared_path = temp_dir / 'gpu_worker_source_volume.gray8.dat'
         shared_mm = copy_workspace_array(
             np.asarray(volume_rgb), shared_path,
             desc='CUDA-worker shared source volume', prefer_memory=False, workers=int(worker_budget),
@@ -36277,14 +36695,19 @@ def main() -> None:
         return str(shared_path), shape, str(np.asarray(shared_mm).dtype)
 
     if gpu_worker_process_active:
-        mgpu_result_dir.mkdir(parents=True, exist_ok=True)
+        gpu_worker_result_dir.mkdir(parents=True, exist_ok=True)
         # Each CUDA worker drives render/postprocess parallelism through its own thread pools,
         # so OpenCV must run each call
         # single-threaded (cv2.setNumThreads(1)); otherwise OpenCV's per-process pool funnels every
         # warpAffine/resize through a handful of threads and the render pool starves the GPUs while
-        # most cores sit idle. YOLO_TTA_MGPU_WORKER_CPU / YOLO_TTA_MGPU_WORKER_CV2_THREADS override.
+        # most cores sit idle. YOLO_TTA_GPU_WORKER_CPU / _CV2_THREADS override; the old
+        # YOLO_TTA_MGPU_* names remain aliases.
         per_worker_workers = max(
-            1, _env_int('YOLO_TTA_MGPU_WORKER_CPU', max(1, int(_cpu_count()) // max(1, gpu_device_count)))
+            1, _env_int_compat(
+                'YOLO_TTA_GPU_WORKER_CPU',
+                'YOLO_TTA_MGPU_WORKER_CPU',
+                max(1, int(_cpu_count()) // max(1, gpu_device_count)),
+            )
         )
         worker_init = {
             'imgsz': int(args.imgsz), 'conf': float(args.conf),
@@ -36293,7 +36716,11 @@ def main() -> None:
             'input_channels': int(channel_format.channel_count),
             'channel_token': str(channel_format.token),
             'retina_processor': str(retina_processor),
-            'cv2_threads': max(1, _env_int('YOLO_TTA_MGPU_WORKER_CV2_THREADS', 1)),
+            'cv2_threads': max(1, _env_int_compat(
+                'YOLO_TTA_GPU_WORKER_CV2_THREADS',
+                'YOLO_TTA_MGPU_WORKER_CV2_THREADS',
+                1,
+            )),
             # v13.1.0 (#2.3): single-angle GPU fast-path (min_conf None when inactive) + min_radius.
             'single_angle_gpu_fastpath_min_conf': single_angle_gpu_fastpath_min_conf_value,
             'single_angle_gpu_fastpath_min_radius': single_angle_gpu_fastpath_min_radius_value,
@@ -36309,7 +36736,7 @@ def main() -> None:
         # stay unpinned). Computed from the PHYSICAL tokens before CUDA_VISIBLE_DEVICES is
         # narrowed inside the workers.
         worker_numa_plan = plan_gpu_worker_affinity(pinned_tokens)
-        explicit_worker_cpu = bool(os.environ.get('YOLO_TTA_MGPU_WORKER_CPU', '').strip())
+        explicit_worker_cpu = _env_any_set('YOLO_TTA_GPU_WORKER_CPU', 'YOLO_TTA_MGPU_WORKER_CPU')
         worker_cpu_budgets: List[int] = []
         for worker_pos, cpus in enumerate(worker_numa_plan):
             if explicit_worker_cpu or not cpus:
@@ -36356,9 +36783,14 @@ def main() -> None:
             )
             proc.start()
             gpu_worker_processes.append(proc)
+        startup_overlap_note = (
+            'model load/CUDA init overlaps streaming decode'
+            if bool(preprocess_streaming_active)
+            else 'decode was synchronous; worker model load starts after decode'
+        )
         print(
             f'Started {len(gpu_worker_processes)} GPU worker process(es) for logical devices {gpu_logical_indices} '
-            f'(pinned to CUDA_VISIBLE_DEVICES tokens {pinned_tokens}); model load/CUDA init overlaps decode; '
+            f'(pinned to CUDA_VISIBLE_DEVICES tokens {pinned_tokens}); {startup_overlap_note}; '
             f'per-worker CPU workers={worker_cpu_budgets}, cv2 threads=1. Tasks enqueue once the source volume is ready.'
         )
         # v13.3.4 (T4): the warm workers double as interpolation hosts once inference drains.
@@ -36397,7 +36829,7 @@ def main() -> None:
                 cube_ready_sentinel = (
                     lazy_cube.ready_path
                     if lazy_cube is not None
-                    else temp_dir / 'mgpu_source_volume.cube_ready.sentinel'
+                    else temp_dir / 'gpu_worker_source_volume.cube_ready.sentinel'
                 )
                 if lazy_cube is None:
                     # A reusable --temp_dir may contain a marker from an interrupted/keep-temp run.
@@ -36451,12 +36883,16 @@ def main() -> None:
         # whole volume leaving the other GPUs idle at the tail. The chunk is large relative to the
         # render prefetch window so per-chunk render ramp-up stays amortized. Tiles are gated/
         # consolidated as whole volumes, so they are never slice-split.
-        slice_chunk = max(64, _env_int('YOLO_TTA_MGPU_SLICE_CHUNK', 512))
+        slice_chunk = max(64, _env_int_compat(
+            'YOLO_TTA_GPU_WORKER_SLICE_CHUNK',
+            'YOLO_TTA_MGPU_SLICE_CHUNK',
+            512,
+        ))
         prefetch_frames = streaming_prediction_source_prefetch_frames(max(1, int(args.batch)))
         # v13.3.3 (S2): per-task device-side 2D hole fill is valid only when the spec steps that
         # precede hole fill (--min_conf, --min_radius) have no work, results stream through the
         # single-angle cleanup path, and the task writes a disjoint direct-union window.
-        mgpu_device_hole_fill = bool(
+        gpu_worker_device_hole_fill = bool(
             gpu_device_union_enabled()
             and gpu_device_hole_fill_enabled()
             and bool(single_angle_streaming_cleanup_active)
@@ -36476,7 +36912,7 @@ def main() -> None:
                 # C11 construction keeps every profiled steady-state lease untouched.
                 # A still-central lease may split later, only when dispatch reaches the
                 # actual global inference tail; tiles are never split.
-                ranges = mgpu_fullframe_task_ranges(
+                ranges = gpu_worker_fullframe_task_ranges(
                     int(n_slices), int(slice_chunk), int(gpu_device_count), int(args.batch),
                 )
                 key_fv = (str(model_name), str(view.name))
@@ -36521,8 +36957,8 @@ def main() -> None:
                     rconf = baseline_confmap_paths.get(key_direct)
                     result_mode = 'direct_union'
                 else:
-                    rmask = mgpu_result_dir / f'{prefix}__c{chunk_idx}.mask.u8.dat'
-                    rconf = (mgpu_result_dir / f'{prefix}__c{chunk_idx}.conf.u8.dat') if float(args.min_conf) > 0.0 else None
+                    rmask = gpu_worker_result_dir / f'{prefix}__c{chunk_idx}.mask.u8.dat'
+                    rconf = (gpu_worker_result_dir / f'{prefix}__c{chunk_idx}.conf.u8.dat') if float(args.min_conf) > 0.0 else None
                     result_mode = 'file'
                 task = {
                     'task_id': int(next_task_id), 'kind': str(kind), 'model_name': str(model_name),
@@ -36545,23 +36981,23 @@ def main() -> None:
                     'streaming_cleanup_min_conf': float(args.min_conf),
                     'streaming_cleanup_min_radius': float(processing_min_radius),
                     'device_hole_fill': bool(
-                        mgpu_device_hole_fill and str(kind) == 'fullframe' and str(result_mode) == 'direct_union'
+                        gpu_worker_device_hole_fill and str(kind) == 'fullframe' and str(result_mode) == 'direct_union'
                     ),
                 }
-                mgpu_tasks_by_id[int(next_task_id)] = task
+                gpu_worker_tasks_by_id[int(next_task_id)] = task
                 next_task_id += 1
-        mgpu_total_tasks = int(next_task_id)
-        mgpu_next_dynamic_task_id = int(next_task_id)
+        gpu_worker_total_tasks = int(next_task_id)
+        gpu_worker_next_dynamic_task_id = int(next_task_id)
         # A full-frame view is finalized only after every (angle x slice-chunk) result for it has been
         # unioned, so override fullframe_remaining with the per-view sub-task count.
         for key_fv, cnt in fullframe_subtasks_per_view.items():
             fullframe_remaining[key_fv] = int(cnt)
         pending_prediction_build_jobs.clear()
 
-        mgpu_pending_task_ids.extend(range(int(mgpu_total_tasks)))
-        _dispatch_mgpu_inference_window()
+        gpu_worker_pending_task_ids.extend(range(int(gpu_worker_total_tasks)))
+        _dispatch_gpu_worker_inference_window()
         print(
-            f'v13.3.18 (C11): {mgpu_total_tasks} inference task(s) retained in a bounded '
+            f'v13.3.18 (C11): {gpu_worker_total_tasks} inference task(s) retained in a bounded '
             f'central dispatch window (normal full-frame chunk={slice_chunk}; eligible '
             'still-central leases split only when dispatch reaches the global tail).'
         )
@@ -36607,7 +37043,7 @@ def main() -> None:
             configuration) and chunked along z so one task's unit volume stays inside the
             per-task budget on both the device and the host.
             """
-            nonlocal mgpu_total_tasks, mgpu_next_dynamic_task_id
+            nonlocal gpu_worker_total_tasks, gpu_worker_next_dynamic_task_id
             parent_key = (str(model_name_s), str(view.name))
             if parent_key in tile_groups_built_for_parent:
                 return 0
@@ -36709,7 +37145,7 @@ def main() -> None:
                     skipped_units += int(z1 - z0) * int(len(candidates) - len(chunk_tiles))
                     tile_ids = [str(tj.tile_id) for tj in chunk_tiles]
                     task = {
-                        'task_id': int(mgpu_next_dynamic_task_id), 'kind': 'tile_group',
+                        'task_id': int(gpu_worker_next_dynamic_task_id), 'kind': 'tile_group',
                         'model_name': str(model_name_s), 'view': view, 'job': None,
                         'job_id': f'{config_id}__{aug_id}__z{int(z0):06d}',
                         'out_size': int(args.imgsz),
@@ -36732,20 +37168,20 @@ def main() -> None:
                         # T7: tiles get the same device-side 2D hole fill as full frames. The
                         # device union holds one plane per (frame, tile), so filling it per
                         # index is exactly the per-tile per-slice CPU pass it replaces.
-                        'device_hole_fill': bool(mgpu_device_hole_fill),
+                        'device_hole_fill': bool(gpu_worker_device_hole_fill),
                         'result_mask_path': None, 'result_conf_path': None,
                         'result_mode': 'tile_group',
                     }
-                    mgpu_tasks_by_id[int(mgpu_next_dynamic_task_id)] = task
-                    tile_group_membership[int(mgpu_next_dynamic_task_id)] = (
+                    gpu_worker_tasks_by_id[int(gpu_worker_next_dynamic_task_id)] = task
+                    tile_group_membership[int(gpu_worker_next_dynamic_task_id)] = (
                         str(model_name_s), str(view.name), str(config_id), tile_ids,
                     )
                     for tile_id in tile_ids:
                         rk = (str(model_name_s), str(view.name), str(tile_id))
                         tile_group_tiles_remaining[rk] = int(tile_group_tiles_remaining.get(rk, 0)) + 1
-                    mgpu_pending_task_ids.append(int(mgpu_next_dynamic_task_id))
-                    mgpu_next_dynamic_task_id += 1
-                    mgpu_total_tasks += 1
+                    gpu_worker_pending_task_ids.append(int(gpu_worker_next_dynamic_task_id))
+                    gpu_worker_next_dynamic_task_id += 1
+                    gpu_worker_total_tasks += 1
                     emitted += 1
 
             if emitted or dropped_tiles:
@@ -36756,7 +37192,7 @@ def main() -> None:
                     'before inference (YOLO_TTA_TILE_SUPPORT_PREFILTER / '
                     'YOLO_TTA_TILE_CONTENT_PREFILTER = 0 to disable).'
                 )
-            _dispatch_mgpu_inference_window()
+            _dispatch_gpu_worker_inference_window()
             return int(emitted)
 
     def _finalize_fullframe_view_after_worker(model_name_s: str, view: ViewInfo) -> None:
@@ -36913,7 +37349,7 @@ def main() -> None:
             _mark_tile_staged(model_name_s, str(view.name), str(config_id), str(tile_id))
 
     def _process_one_worker_result(msg: Dict[str, object]) -> None:
-        nonlocal mgpu_results_collected
+        nonlocal gpu_worker_results_collected
         mtype = str(msg.get('type'))
         if mtype == 'ready':
             print(f"GPU worker ready: device cuda:{msg.get('gpu_index')} (pid {msg.get('pid')}).")
@@ -36936,18 +37372,18 @@ def main() -> None:
                     str(msg.get('error') or '') + ('\n' + str(msg.get('traceback')) if msg.get('traceback') else ''),
                 )
             return
-        mgpu_results_collected += 1
+        gpu_worker_results_collected += 1
         if not bool(msg.get('ok')):
             raise RuntimeError(
                 f"GPU worker task {msg.get('task_id')} failed on device {msg.get('gpu_index')}: "
                 f"{msg.get('error')}\n{msg.get('traceback')}"
             )
-        task = mgpu_tasks_by_id[int(msg['task_id'])]
+        task = gpu_worker_tasks_by_id[int(msg['task_id'])]
         stats = dict(msg.get('stats') or {})
         # Refill before scheduler-side memmap union/postprocess so a worker does not wait
         # behind CPU handling of the result that just freed its window slot. Prefer the
         # current parent when its last unissued lease can unlock postprocessing.
-        _dispatch_mgpu_inference_window(_mgpu_fullframe_parent_key(task))
+        _dispatch_gpu_worker_inference_window(_gpu_worker_fullframe_parent_key(task))
         if str(task['kind']) == 'fullframe':
             _handle_fullframe_worker_result(task, stats)
         elif str(task['kind']) == 'tile_group':
@@ -36959,8 +37395,8 @@ def main() -> None:
         # T9: tile groups are enqueued only as parent support lands, so "drained" also
         # requires that no parent still owes its tile groups.
         if (
-            int(mgpu_total_tasks) > 0
-            and int(mgpu_results_collected) >= int(mgpu_total_tasks)
+            int(gpu_worker_total_tasks) > 0
+            and int(gpu_worker_results_collected) >= int(gpu_worker_total_tasks)
             and not deferred_tile_jobs_by_parent
         ):
             aux_pool = gpu_worker_aux_interpolation_pool()
@@ -37044,7 +37480,7 @@ def main() -> None:
         # scheduler must not treat the queue draining as "inference finished".
         return bool(
             gpu_worker_process_active
-            and (mgpu_results_collected < mgpu_total_tasks or bool(deferred_tile_jobs_by_parent))
+            and (gpu_worker_results_collected < gpu_worker_total_tasks or bool(deferred_tile_jobs_by_parent))
         )
 
     def _check_gpu_workers_alive() -> None:
@@ -37058,7 +37494,7 @@ def main() -> None:
                 reason = (
                     f'GPU worker {getattr(proc, "name", "?")} exited unexpectedly '
                     f'(exitcode={getattr(proc, "exitcode", None)}) with '
-                    f'{max(0, int(mgpu_total_tasks - mgpu_results_collected))} inference result(s) and '
+                    f'{max(0, int(gpu_worker_total_tasks - gpu_worker_results_collected))} inference result(s) and '
                     f'{aux_outstanding} aux interpolation pass(es) still outstanding.'
                 )
                 if aux_pool is not None:
@@ -37363,7 +37799,7 @@ def main() -> None:
                     tile_group_dispatch_active
                     and deferred_tile_jobs_by_parent
                     and not view_processing_futures
-                    and int(mgpu_results_collected) >= int(mgpu_total_tasks)
+                    and int(gpu_worker_results_collected) >= int(gpu_worker_total_tasks)
                 ):
                     for stalled_key in list(deferred_tile_jobs_by_parent.keys()):
                         stalled_model, stalled_view = stalled_key
@@ -38107,1831 +38543,6 @@ def main() -> None:
     print(f'Scratch dir: {temp_dir}')
     print(f"Final overlay: {final_paths['overlay']}")
     print(f'Summary: {summary_path}')
-
-
-
-# >>> Late workspace/projection/telemetry compatibility layer >>>
-# CLEANUP(v15.0.4): this inherited layer reimports stdlib/NumPy under v13314 aliases and
-# installs monkeypatches at module end. Fold live projection/telemetry hooks into the normal
-# imports and explicit initialization path in a dedicated refactor; do not expand this block.
-from collections import Counter as _V13314Counter, OrderedDict as _V13314OrderedDict
-from contextlib import contextmanager as _v13314_contextmanager
-import atexit as _v13314_atexit
-import contextvars as _v13314_contextvars
-import errno as _v13314_errno
-import functools as _v13314_functools
-import inspect as _v13314_inspect
-import json as _v13314_json
-import math as _v13314_math
-import mmap as _v13314_mmap
-import os as _v13314_os
-import pathlib as _v13314_pathlib
-import shutil as _v13314_shutil
-import struct as _v13314_struct
-import tempfile as _v13314_tempfile
-import threading as _v13314_threading
-import time as _v13314_time
-import traceback as _v13314_traceback
-import types as _v13314_types
-import weakref as _v13314_weakref
-import zlib as _v13314_zlib
-
-try:
-    import numpy as _v13314_np
-except Exception:  # pragma: no cover - the parent program already requires NumPy
-    _v13314_np = None
-
-_V13314_GIB = 1024 ** 3
-_V13314_MIB = 1024 ** 2
-_V13314_NO_WORKSPACE = object()
-_V13314_PROJECTION_DISABLED = _v13314_contextvars.ContextVar('v13314_projection_disabled', default=False)
-_V13314_ACTIVE_PROJECTION = _v13314_contextvars.ContextVar('v13314_active_projection', default=None)
-
-
-def _v13314_env_bool(name, default=False):
-    value = _v13314_os.environ.get(name)
-    if value is None:
-        return bool(default)
-    return str(value).strip().lower() not in {'', '0', 'false', 'no', 'off', 'disabled'}
-
-
-def _v13314_env_int(name, default, minimum=None, maximum=None):
-    try:
-        value = int(str(_v13314_os.environ.get(name, default)).strip())
-    except Exception:
-        value = int(default)
-    if minimum is not None:
-        value = max(int(minimum), value)
-    if maximum is not None:
-        value = min(int(maximum), value)
-    return value
-
-
-def _v13314_jsonable(value):
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, _v13314_pathlib.Path):
-        return str(value)
-    if isinstance(value, (tuple, list)):
-        return [_v13314_jsonable(v) for v in value[:32]]
-    if isinstance(value, dict):
-        return {str(k): _v13314_jsonable(v) for k, v in list(value.items())[:64]}
-    if _v13314_np is not None:
-        if isinstance(value, _v13314_np.generic):
-            return value.item()
-        if isinstance(value, _v13314_np.dtype):
-            return str(value)
-    return repr(value)[:512]
-
-
-class _V13314PhaseTelemetry:
-    """Low-overhead process-local phase and throughput telemetry (M1).
-
-    Timings are aggregated under a lock and emitted as JSONL snapshots no more
-    often than YOLO_TTA_TELEMETRY_FLUSH_SECONDS.  The hot path performs no file
-    I/O.  Coarse counters are enabled by default; detailed tracing remains opt-in.
-    """
-
-    def __init__(self):
-        self.enabled = _v13314_env_bool('YOLO_TTA_TELEMETRY', True)
-        self.detail = _v13314_env_bool('YOLO_TTA_TELEMETRY_DETAIL', False)
-        self.lock = _v13314_threading.RLock()
-        self.started_ns = _v13314_time.monotonic_ns()
-        self.phase_ns = _V13314Counter()
-        self.phase_calls = _V13314Counter()
-        self.counters = _V13314Counter()
-        self.gauges = {}
-        self.fallbacks = _V13314Counter()
-        self._dirty = 0
-        self._last_flush = _v13314_time.monotonic()
-        self.flush_seconds = max(2.0, float(_v13314_os.environ.get('YOLO_TTA_TELEMETRY_FLUSH_SECONDS', '15')))
-        requested = _v13314_os.environ.get('YOLO_TTA_TELEMETRY_PATH', '').strip()
-        if requested:
-            self.path = _v13314_pathlib.Path(requested)
-        else:
-            base = _v13314_os.environ.get('SLURM_JOB_ID') or str(_v13314_os.getpid())
-            self.path = _v13314_pathlib.Path(_v13314_tempfile.gettempdir()) / f'gpt56-v13314-telemetry-{base}-{_v13314_os.getpid()}.jsonl'
-        self._local = _v13314_threading.local()
-
-    @_v13314_contextmanager
-    def span(self, name, **fields):
-        if not self.enabled:
-            yield
-            return
-        start = _v13314_time.monotonic_ns()
-        failed = False
-        try:
-            yield
-        except BaseException:
-            failed = True
-            raise
-        finally:
-            elapsed = _v13314_time.monotonic_ns() - start
-            with self.lock:
-                self.phase_ns[str(name)] += int(elapsed)
-                self.phase_calls[str(name)] += 1
-                if failed:
-                    self.counters[f'{name}.errors'] += 1
-                for key, value in fields.items():
-                    if isinstance(value, (int, float)):
-                        self.counters[f'{name}.{key}'] += value
-                self._dirty += 1
-            self.maybe_flush()
-
-    def add(self, name, value=1):
-        if not self.enabled:
-            return
-        try:
-            amount = int(value)
-        except Exception:
-            try:
-                amount = float(value)
-            except Exception:
-                return
-        with self.lock:
-            self.counters[str(name)] += amount
-            self._dirty += 1
-
-    def gauge(self, name, value):
-        if not self.enabled:
-            return
-        with self.lock:
-            self.gauges[str(name)] = _v13314_jsonable(value)
-            self._dirty += 1
-
-    def fallback(self, name, exc=None):
-        if not self.enabled:
-            return
-        with self.lock:
-            self.fallbacks[str(name)] += 1
-            if exc is not None:
-                self.gauges[f'fallback.{name}.last_error'] = f'{type(exc).__name__}: {exc}'[:512]
-            self._dirty += 1
-
-    def snapshot(self, final=False):
-        now_ns = _v13314_time.monotonic_ns()
-        with self.lock:
-            phases = {}
-            for name, total_ns in self.phase_ns.items():
-                calls = int(self.phase_calls.get(name, 0))
-                seconds = float(total_ns) / 1e9
-                phases[name] = {
-                    'calls': calls,
-                    'seconds': seconds,
-                    'mean_ms': (seconds * 1000.0 / calls) if calls else 0.0,
-                }
-            payload = {
-                'schema': 'gpt-5.6-ultra-v13.3.14.telemetry.v1',
-                'pid': _v13314_os.getpid(),
-                'monotonic_seconds': (now_ns - self.started_ns) / 1e9,
-                'wall_time': _v13314_time.time(),
-                'final': bool(final),
-                'phases': phases,
-                'counters': dict(self.counters),
-                'gauges': dict(self.gauges),
-                'fallbacks': dict(self.fallbacks),
-            }
-            self._dirty = 0
-        return payload
-
-    def maybe_flush(self):
-        if not self.enabled:
-            return
-        now = _v13314_time.monotonic()
-        with self.lock:
-            due = self._dirty >= 256 or (self._dirty and now - self._last_flush >= self.flush_seconds)
-        if due:
-            self.flush(False)
-
-    def flush(self, final=False):
-        if not self.enabled:
-            return
-        payload = self.snapshot(final=final)
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open('a', encoding='utf-8') as fh:
-                fh.write(_v13314_json.dumps(payload, sort_keys=True, separators=(',', ':')) + '\n')
-            with self.lock:
-                self._last_flush = _v13314_time.monotonic()
-        except Exception as exc:
-            # Telemetry must never fail the workload.
-            with self.lock:
-                self.enabled = False
-            try:
-                import sys as _v13314_sys
-                print(f'[v13.3.14 telemetry disabled] {exc}', file=_v13314_sys.stderr)
-            except Exception:
-                pass
-
-
-_V13314_TELEMETRY = _V13314PhaseTelemetry()
-_v13314_atexit.register(lambda: _V13314_TELEMETRY.flush(True))
-
-
-class _V13314SystemSampler:
-    def __init__(self, telemetry):
-        self.telemetry = telemetry
-        self.interval = max(1.0, float(_v13314_os.environ.get('YOLO_TTA_TELEMETRY_SAMPLE_SECONDS', '5')))
-        self.stop_event = _v13314_threading.Event()
-        self.thread = None
-        self.last = None
-
-    @staticmethod
-    def _read_proc():
-        result = {'time': _v13314_time.monotonic()}
-        try:
-            fields = _v13314_pathlib.Path('/proc/self/stat').read_text().split()
-            result['cpu_ticks'] = int(fields[13]) + int(fields[14])
-            result['rss_pages'] = int(fields[23])
-        except Exception:
-            pass
-        try:
-            for line in _v13314_pathlib.Path('/proc/self/io').read_text().splitlines():
-                key, value = line.split(':', 1)
-                result[key.strip()] = int(value.strip())
-        except Exception:
-            pass
-        memory_helper = globals().get('_v13314_cgroup_memory')
-        if callable(memory_helper):
-            limit, current = memory_helper()
-        else:
-            limit, current = (None, None)
-        if current is not None:
-            result['cgroup_memory_current'] = current
-        if limit is not None:
-            result['cgroup_memory_limit'] = limit
-        return result
-
-    def _sample_gpu(self):
-        try:
-            import pynvml as _v13314_nvml
-            if not getattr(self, '_nvml_ready', False):
-                _v13314_nvml.nvmlInit()
-                self._nvml_ready = True
-            count = _v13314_nvml.nvmlDeviceGetCount()
-            util = []
-            memory = []
-            for index in range(count):
-                handle = _v13314_nvml.nvmlDeviceGetHandleByIndex(index)
-                u = _v13314_nvml.nvmlDeviceGetUtilizationRates(handle)
-                m = _v13314_nvml.nvmlDeviceGetMemoryInfo(handle)
-                util.append({'gpu': int(u.gpu), 'memory': int(u.memory)})
-                memory.append({'used': int(m.used), 'total': int(m.total)})
-            self.telemetry.gauge('system.gpu_utilization', util)
-            self.telemetry.gauge('system.gpu_memory', memory)
-        except Exception:
-            pass
-
-    def _run(self):
-        while not self.stop_event.wait(self.interval):
-            now = self._read_proc()
-            prior = self.last
-            self.last = now
-            page_size = int(getattr(_v13314_os, 'sysconf', lambda x: 4096)('SC_PAGE_SIZE'))
-            if 'rss_pages' in now:
-                self.telemetry.gauge('system.rss_bytes', now['rss_pages'] * page_size)
-            if 'cgroup_memory_current' in now:
-                self.telemetry.gauge('system.cgroup_memory_current', now['cgroup_memory_current'])
-            if prior is not None:
-                dt = max(1e-9, now['time'] - prior['time'])
-                ticks = float(_v13314_os.sysconf('SC_CLK_TCK'))
-                if 'cpu_ticks' in now and 'cpu_ticks' in prior:
-                    self.telemetry.gauge('system.process_cpu_cores', (now['cpu_ticks'] - prior['cpu_ticks']) / ticks / dt)
-                for key, metric in (('read_bytes', 'system.disk_read_bytes_per_s'),
-                                    ('write_bytes', 'system.disk_write_bytes_per_s'),
-                                    ('rchar', 'system.logical_read_bytes_per_s'),
-                                    ('wchar', 'system.logical_write_bytes_per_s')):
-                    if key in now and key in prior:
-                        self.telemetry.gauge(metric, max(0, now[key] - prior[key]) / dt)
-            self._sample_gpu()
-            self.telemetry.maybe_flush()
-
-    def start(self):
-        if not self.telemetry.enabled or not _v13314_env_bool('YOLO_TTA_TELEMETRY_SYSTEM_SAMPLER', True):
-            return
-        self.last = self._read_proc()
-        self.thread = _v13314_threading.Thread(target=self._run, name='v13314-telemetry', daemon=True)
-        self.thread.start()
-
-    def close(self):
-        self.stop_event.set()
-        if self.thread is not None:
-            self.thread.join(timeout=min(2.0, self.interval))
-
-
-class _V13314Tee:
-    def __init__(self, original, file_handle):
-        self.original = original
-        self.file_handle = file_handle
-        self.lock = _v13314_threading.Lock()
-    def write(self, data):
-        with self.lock:
-            result = self.original.write(data)
-            self.file_handle.write(data)
-            return result
-    def flush(self):
-        with self.lock:
-            self.original.flush(); self.file_handle.flush()
-    def __getattr__(self, name):
-        return getattr(self.original, name)
-
-
-def _v13314_install_stdio_capture():
-    path = _v13314_os.environ.get('YOLO_TTA_CAPTURE_STDIO_PATH', '').strip()
-    if not path:
-        return None
-    try:
-        import sys as _v13314_sys
-        target = _v13314_pathlib.Path(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        fh = target.open('a', encoding='utf-8', buffering=1)
-        _v13314_sys.stdout = _V13314Tee(_v13314_sys.stdout, fh)
-        _v13314_sys.stderr = _V13314Tee(_v13314_sys.stderr, fh)
-        return fh
-    except Exception as exc:
-        _V13314_TELEMETRY.fallback('telemetry.stdio_capture', exc)
-        return None
-
-_V13314_SYSTEM_SAMPLER = _V13314SystemSampler(_V13314_TELEMETRY)
-_V13314_SYSTEM_SAMPLER.start()
-_v13314_atexit.register(_V13314_SYSTEM_SAMPLER.close)
-_V13314_STDIO_CAPTURE = _v13314_install_stdio_capture()
-
-
-def _v13314_cgroup_memory():
-    """Return (limit, current) for cgroup v2/v1, with None for unlimited."""
-    candidates = [
-        ('/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory.current'),
-        ('/sys/fs/cgroup/memory/memory.limit_in_bytes', '/sys/fs/cgroup/memory/memory.usage_in_bytes'),
-    ]
-    for limit_path, current_path in candidates:
-        try:
-            raw = _v13314_pathlib.Path(limit_path).read_text().strip()
-            if raw == 'max':
-                limit = None
-            else:
-                limit = int(raw)
-                if limit >= (1 << 60):
-                    limit = None
-            current = int(_v13314_pathlib.Path(current_path).read_text().strip())
-            return limit, current
-        except Exception:
-            continue
-    return None, None
-
-
-def _v13314_mem_available():
-    try:
-        for line in _v13314_pathlib.Path('/proc/meminfo').read_text().splitlines():
-            if line.startswith('MemAvailable:'):
-                return int(line.split()[1]) * 1024
-    except Exception:
-        pass
-    try:
-        pages = _v13314_os.sysconf('SC_AVPHYS_PAGES')
-        page_size = _v13314_os.sysconf('SC_PAGE_SIZE')
-        return int(pages) * int(page_size)
-    except Exception:
-        return None
-
-
-# DEAD CODE BLOCK (v15.0.4): _V13314MemfdPath, _V13314WorkspaceHandle,
-# _V13314MemfdRegistry, and their registry instance have no internal caller after removal of
-# the bit-packed workspace allocator. Retained intact until external imports are audited.
-class _V13314MemfdPath:
-    """Pickle-safe path-like descriptor for a shared memfd.
-
-    Under multiprocessing spawn, multiprocessing.reduction.DupFd transfers a
-    duplicate descriptor.  Existing code that only accepts a filesystem path
-    receives a symlink that can be reopened by np.memmap.
-    """
-
-    __slots__ = ('fd', 'owner_pid', 'shape', 'dtype', 'order', 'nbytes', 'path', '_dup')
-
-    def __init__(self, fd, shape, dtype, order, nbytes, path):
-        self.fd = int(fd)
-        self.owner_pid = _v13314_os.getpid()
-        self.shape = tuple(int(v) for v in shape)
-        self.dtype = str(_v13314_np.dtype(dtype)) if _v13314_np is not None else str(dtype)
-        self.order = str(order)
-        self.nbytes = int(nbytes)
-        self.path = str(path)
-        self._dup = None
-
-    def __fspath__(self):
-        detached = False
-        if self._dup is not None:
-            try:
-                self.fd = int(self._dup.detach())
-                self.owner_pid = _v13314_os.getpid()
-                self._dup = None
-                detached = True
-            except Exception:
-                pass
-        local = f'/proc/self/fd/{self.fd}'
-        # A spawned worker must prefer its duplicated descriptor; /proc may deny
-        # dereferencing the parent's FD symlink under ptrace restrictions.
-        if detached and _v13314_os.path.exists(local):
-            return local
-        # The owner prefers the disposable symlink so legacy cleanup can unlink it.
-        if self.path and _v13314_os.path.lexists(self.path):
-            return self.path
-        if _v13314_os.path.exists(local):
-            return local
-        return self.path
-
-    def __str__(self):
-        return self.__fspath__()
-
-    def __reduce__(self):
-        try:
-            from multiprocessing.reduction import DupFd
-            dup = DupFd(self.fd)
-            return (self._rebuild, (dup, self.shape, self.dtype, self.order, self.nbytes, self.path))
-        except Exception:
-            return (self._rebuild_path, (self.path, self.shape, self.dtype, self.order, self.nbytes))
-
-    @staticmethod
-    def _rebuild(dup, shape, dtype, order, nbytes, path):
-        obj = _V13314MemfdPath.__new__(_V13314MemfdPath)
-        obj.fd = -1
-        obj.owner_pid = _v13314_os.getpid()
-        obj.shape = tuple(shape)
-        obj.dtype = dtype
-        obj.order = order
-        obj.nbytes = int(nbytes)
-        obj.path = str(path)
-        obj._dup = dup
-        return obj
-
-    @staticmethod
-    def _rebuild_path(path, shape, dtype, order, nbytes):
-        obj = _V13314MemfdPath.__new__(_V13314MemfdPath)
-        obj.fd = -1
-        obj.owner_pid = _v13314_os.getpid()
-        obj.shape = tuple(shape)
-        obj.dtype = dtype
-        obj.order = order
-        obj.nbytes = int(nbytes)
-        obj.path = str(path)
-        obj._dup = None
-        return obj
-
-    def open(self, mode='r+'):
-        return _v13314_np.memmap(_v13314_os.fspath(self), dtype=_v13314_np.dtype(self.dtype), mode=mode,
-                                 shape=self.shape, order=self.order)
-
-
-class _V13314WorkspaceHandle:
-    __slots__ = ('descriptor', '_registry_ref')
-
-    def __init__(self, descriptor, registry):
-        self.descriptor = descriptor
-        self._registry_ref = _v13314_weakref.ref(registry)
-
-    @property
-    def path(self):
-        return self.descriptor
-
-    @property
-    def fd(self):
-        return self.descriptor.fd
-
-    def close(self):
-        registry = self._registry_ref()
-        if registry is not None:
-            registry.release(self.descriptor)
-
-    cleanup = close
-    unlink = close
-
-
-class _V13314MemfdRegistry:
-    def __init__(self):
-        self.lock = _v13314_threading.RLock()
-        self.entries = _V13314OrderedDict()
-        self.committed = 0
-        self.counter = 0
-
-    def _reserve_bytes(self):
-        reserve_gib = float(_v13314_os.environ.get('YOLO_TTA_MEMFD_RESERVE_GIB', '160'))
-        return max(0, int(reserve_gib * _V13314_GIB))
-
-    def headroom(self):
-        reserve = self._reserve_bytes()
-        limit, current = _v13314_cgroup_memory()
-        available = _v13314_mem_available()
-        candidates = []
-        if limit is not None and current is not None:
-            # On small allocations, scale the reserve so the feature remains usable
-            # without violating the requested 128-192 GiB reserve on large nodes.
-            effective_reserve = min(reserve, max(4 * _V13314_GIB, int(limit * 0.25)))
-            candidates.append(max(0, limit - current - effective_reserve))
-        if available is not None:
-            physical_reserve = min(reserve, max(4 * _V13314_GIB, int(available * 0.25)))
-            candidates.append(max(0, available - physical_reserve))
-        if not candidates:
-            return 0
-        return max(0, min(candidates) - self.committed)
-
-    def _reap(self):
-        dead = []
-        for key, entry in self.entries.items():
-            ref = entry.get('array_ref')
-            link = entry.get('link')
-            # A path-only workspace intentionally drops the parent ndarray while
-            # spawned workers still reopen the symlink. Reap only after legacy
-            # cleanup removed that path as well.
-            if ref is not None and ref() is None and (not link or not _v13314_os.path.lexists(link)):
-                dead.append(key)
-        for key in dead:
-            self._release_key(key)
-
-    def allocate(self, shape, dtype, order='C', directory=None, prefix='workspace'):
-        if _v13314_np is None or not hasattr(_v13314_os, 'memfd_create'):
-            return None
-        shape = tuple(int(v) for v in shape)
-        dtype = _v13314_np.dtype(dtype)
-        if any(v < 0 for v in shape):
-            return None
-        nbytes = int(_v13314_math.prod(shape)) * int(dtype.itemsize)
-        minimum = _v13314_env_int('YOLO_TTA_MEMFD_MIN_BYTES', 64 * _V13314_MIB, 0)
-        maximum = _v13314_env_int('YOLO_TTA_MEMFD_MAX_BYTES', 1024 * _V13314_GIB, 0)
-        if nbytes < minimum or nbytes > maximum:
-            return None
-        with self.lock:
-            self._reap()
-            if nbytes > self.headroom():
-                _V13314_TELEMETRY.add('workspace.memfd_spill_or_fallback', 1)
-                return None
-            self.committed += nbytes  # atomic reservation before ftruncate/mmap
-            self.counter += 1
-            serial = self.counter
-        fd = -1
-        link = None
-        try:
-            flags = int(getattr(_v13314_os, 'MFD_CLOEXEC', 0)) | int(getattr(_v13314_os, 'MFD_ALLOW_SEALING', 0))
-            fd = _v13314_os.memfd_create(f'gpt56-{prefix}-{serial}', flags)
-            _v13314_os.ftruncate(fd, nbytes)
-            base_dir = _v13314_pathlib.Path(directory or _v13314_tempfile.gettempdir())
-            base_dir.mkdir(parents=True, exist_ok=True)
-            link = base_dir / f'.gpt56-v13314-memfd-{_v13314_os.getpid()}-{serial}.mmap'
-            target = f'/proc/{_v13314_os.getpid()}/fd/{fd}'
-            try:
-                _v13314_os.symlink(target, link)
-                map_path = str(link)
-            except Exception:
-                map_path = f'/proc/self/fd/{fd}'
-            arr = _v13314_np.memmap(map_path, dtype=dtype, mode='r+', shape=shape, order=order)
-            descriptor = _V13314MemfdPath(fd, shape, dtype, order, nbytes, map_path)
-            key = (fd, serial)
-            with self.lock:
-                self.entries[key] = {
-                    'fd': fd,
-                    'link': str(link) if link is not None else None,
-                    'descriptor': descriptor,
-                    'array_ref': _v13314_weakref.ref(arr),
-                    'nbytes': nbytes,
-                    'last_access': _v13314_time.monotonic(),
-                }
-            _V13314_TELEMETRY.add('workspace.memfd_allocations', 1)
-            _V13314_TELEMETRY.add('workspace.memfd_bytes', nbytes)
-            return arr, descriptor, _V13314WorkspaceHandle(descriptor, self)
-        except Exception as exc:
-            with self.lock:
-                self.committed = max(0, self.committed - nbytes)
-            if fd >= 0:
-                try:
-                    _v13314_os.close(fd)
-                except Exception:
-                    pass
-            if link is not None:
-                try:
-                    _v13314_os.unlink(link)
-                except Exception:
-                    pass
-            _V13314_TELEMETRY.fallback('workspace.memfd_allocate', exc)
-            return None
-
-    def _release_key(self, key):
-        entry = self.entries.pop(key, None)
-        if entry is None:
-            return
-        self.committed = max(0, self.committed - int(entry.get('nbytes', 0)))
-        link = entry.get('link')
-        if link:
-            try:
-                _v13314_os.unlink(link)
-            except FileNotFoundError:
-                pass
-            except Exception:
-                pass
-        try:
-            _v13314_os.close(int(entry['fd']))
-        except Exception:
-            pass
-
-    def release(self, descriptor):
-        with self.lock:
-            for key, entry in list(self.entries.items()):
-                if entry.get('descriptor') is descriptor or entry.get('fd') == getattr(descriptor, 'fd', None):
-                    self._release_key(key)
-                    break
-
-    def close_all(self):
-        with self.lock:
-            for key in list(self.entries):
-                self._release_key(key)
-
-
-# DEAD CODE (v15.0.4): inert compatibility instance for the dead memfd block above.
-_V13314_MEMFD_REGISTRY = _V13314MemfdRegistry()
-_v13314_atexit.register(_V13314_MEMFD_REGISTRY.close_all)
-
-
-# DEAD CODE (v15.0.4): allocator-introspection helper retained for external compatibility.
-def _v13314_workspace_shape_dtype(local_vars):
-    shape = None
-    for key in ('shape', 'array_shape', 'workspace_shape', 'volume_shape', 'dims', 'size'):
-        value = local_vars.get(key)
-        if isinstance(value, (tuple, list)) and value and all(isinstance(v, (int, _v13314_np.integer if _v13314_np is not None else int)) for v in value):
-            shape = tuple(int(v) for v in value)
-            break
-    if shape is None:
-        return None
-    dtype = local_vars.get('dtype', local_vars.get('array_dtype', _v13314_np.uint8))
-    try:
-        dtype = _v13314_np.dtype(dtype)
-    except Exception:
-        return None
-    return shape, dtype
-
-
-# DEAD CODE (v15.0.4): allocator return-role helper retained for external compatibility.
-def _v13314_role_value(role, arr, descriptor, handle):
-    role_l = str(role).lower()
-    if role_l in {'none', 'null'}:
-        return None
-    if any(token in role_l for token in ('path', 'filename', 'file_name')):
-        return descriptor
-    if role_l in {'fd', 'fileno'} or role_l.endswith('_fd'):
-        return descriptor.fd
-    if any(token in role_l for token in ('handle', 'owner', 'cleanup', 'lease', 'resource')):
-        return handle
-    if any(token in role_l for token in ('nbytes', 'byte_size', 'size_bytes')):
-        return descriptor.nbytes
-    if any(token in role_l for token in ('array', 'arr', 'mmap', 'memmap', 'workspace', 'volume', 'mask', 'data', 'buffer', 'mm')):
-        return arr
-    return _V13314_NO_WORKSPACE
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-class _V13314ProjectionSparseUnsupported(RuntimeError):
-    pass
-
-
-class _V13314SparseProjectionStore:
-    """Append-only bbox store used as a virtual projected raster (N2).
-
-    Each z slice is represented by its tight (y, x) crop in an append-only file.
-    CUDA blocks are reduced on device and only their union crop crosses D2H.
-    Reads reconstruct only the requested z/y/x window.  A full ndarray is never
-    built unless an unsupported consumer explicitly requests __array__.
-    """
-
-    def __init__(self, shape, dtype, directory=None):
-        self.shape = tuple(int(v) for v in shape)
-        if len(self.shape) != 3:
-            raise ValueError('projection sparse store requires (t,y,x)')
-        self.dtype = _v13314_np.dtype(dtype)
-        self.lock = _v13314_threading.RLock()
-        self.file = _v13314_tempfile.NamedTemporaryFile(prefix='gpt56-projection-crop-', suffix='.cvol', dir=directory, delete=False)
-        self.path = self.file.name
-        self.entries = [None] * self.shape[0]
-        self.extent = None  # inclusive t,y,x min/max
-        self.closed = False
-        self.indexed_bbox_bytes = 0
-        self.logical_bytes = int(_v13314_math.prod(self.shape)) * self.dtype.itemsize
-        self._zero_cache = {}
-
-    def _torch_crop(self, block):
-        import torch as _v13314_torch
-        tensor = block.detach()
-        if tensor.ndim == 2:
-            tensor = tensor.unsqueeze(0)
-        nz = tensor != 0
-        if not bool(nz.any().item()):
-            return None, None
-        row_any = nz.any(dim=(0, 2))
-        col_any = nz.any(dim=(0, 1))
-        ys = _v13314_torch.nonzero(row_any, as_tuple=False).flatten()
-        xs = _v13314_torch.nonzero(col_any, as_tuple=False).flatten()
-        y0, y1 = int(ys[0].item()), int(ys[-1].item()) + 1
-        x0, x1 = int(xs[0].item()), int(xs[-1].item()) + 1
-        crop = tensor[:, y0:y1, x0:x1].contiguous()
-        # A completion event supplied by the producer is waited before this method.
-        host = crop.to(device='cpu', non_blocking=False).numpy()
-        return (y0, y1, x0, x1), host
-
-    def put_block(self, z_start, block, completion_event=None):
-        if completion_event is not None:
-            wait = getattr(completion_event, 'wait', None)
-            sync = getattr(completion_event, 'synchronize', None)
-            try:
-                if callable(wait):
-                    wait()
-                elif callable(sync):
-                    sync()
-            except Exception:
-                if callable(sync):
-                    sync()
-        z_start = int(z_start)
-        try:
-            import torch as _v13314_torch
-        except Exception:
-            _v13314_torch = None
-        if _v13314_torch is not None and isinstance(block, _v13314_torch.Tensor):
-            bbox, host = self._torch_crop(block)
-            depth = int(block.shape[0]) if block.ndim == 3 else 1
-            if bbox is None:
-                for zi in range(z_start, min(self.shape[0], z_start + depth)):
-                    self.entries[zi] = None
-                return
-            y0, y1, x0, x1 = bbox
-            arr = _v13314_np.asarray(host, dtype=self.dtype)
-        else:
-            arr = _v13314_np.asarray(block, dtype=self.dtype)
-            if arr.ndim == 2:
-                arr = arr[None, ...]
-            if arr.ndim != 3:
-                raise _V13314ProjectionSparseUnsupported(f'expected 2-D/3-D projection block, got {arr.shape!r}')
-            nz = arr != 0
-            if not bool(nz.any()):
-                for zi in range(z_start, min(self.shape[0], z_start + arr.shape[0])):
-                    self.entries[zi] = None
-                return
-            rows = nz.any(axis=(0, 2))
-            cols = nz.any(axis=(0, 1))
-            ys = _v13314_np.flatnonzero(rows)
-            xs = _v13314_np.flatnonzero(cols)
-            y0, y1 = int(ys[0]), int(ys[-1]) + 1
-            x0, x1 = int(xs[0]), int(xs[-1]) + 1
-            arr = _v13314_np.ascontiguousarray(arr[:, y0:y1, x0:x1])
-        with self.lock:
-            for local_z in range(arr.shape[0]):
-                zi = z_start + local_z
-                if zi < 0 or zi >= self.shape[0]:
-                    continue
-                plane = arr[local_z]
-                plane_nz = plane != 0
-                if not bool(plane_nz.any()):
-                    self.entries[zi] = None
-                    continue
-                py = _v13314_np.flatnonzero(plane_nz.any(axis=1))
-                px = _v13314_np.flatnonzero(plane_nz.any(axis=0))
-                sy0, sy1 = int(py[0]), int(py[-1]) + 1
-                sx0, sx1 = int(px[0]), int(px[-1]) + 1
-                crop = _v13314_np.ascontiguousarray(plane[sy0:sy1, sx0:sx1])
-                raw = memoryview(crop).cast('B')
-                compressed = _v13314_zlib.compress(raw, 1)
-                codec = 1 if len(compressed) + 16 < len(raw) else 0
-                payload = compressed if codec else raw
-                offset = self.file.tell()
-                self.file.write(payload)
-                gy0, gy1, gx0, gx1 = y0 + sy0, y0 + sy1, x0 + sx0, x0 + sx1
-                self.entries[zi] = (gy0, gy1, gx0, gx1, offset, len(payload), len(raw), codec)
-                self.indexed_bbox_bytes += len(raw)
-                if self.extent is None:
-                    self.extent = [zi, gy0, gx0, zi, gy1 - 1, gx1 - 1]
-                else:
-                    self.extent[0] = min(self.extent[0], zi)
-                    self.extent[1] = min(self.extent[1], gy0)
-                    self.extent[2] = min(self.extent[2], gx0)
-                    self.extent[3] = max(self.extent[3], zi)
-                    self.extent[4] = max(self.extent[4], gy1 - 1)
-                    self.extent[5] = max(self.extent[5], gx1 - 1)
-        _V13314_TELEMETRY.add('projection.logical_bytes', int(arr.shape[0]) * self.shape[1] * self.shape[2] * self.dtype.itemsize)
-        _V13314_TELEMETRY.add('projection.indexed_bbox_bytes', int(arr.nbytes))
-
-    def _read_entry(self, z):
-        entry = self.entries[int(z)]
-        if entry is None:
-            return None, None
-        y0, y1, x0, x1, offset, payload_len, raw_len, codec = entry
-        with self.lock:
-            self.file.flush()
-            with open(self.path, 'rb', buffering=0) as fh:
-                fh.seek(offset)
-                payload = fh.read(payload_len)
-        raw = _v13314_zlib.decompress(payload) if codec else payload
-        if len(raw) != raw_len:
-            raise IOError('projection sparse payload length mismatch')
-        crop = _v13314_np.frombuffer(raw, dtype=self.dtype).reshape((y1 - y0, x1 - x0))
-        return (y0, y1, x0, x1), crop
-
-    @staticmethod
-    def _normalize_selector(sel, length):
-        if isinstance(sel, int):
-            value = sel + length if sel < 0 else sel
-            if value < 0 or value >= length:
-                raise IndexError(value)
-            return [value], True
-        if sel is Ellipsis or sel is None:
-            sel = slice(None)
-        if not isinstance(sel, slice):
-            raise _V13314ProjectionSparseUnsupported(f'advanced indexing is not sparse-safe: {type(sel).__name__}')
-        start, stop, step = sel.indices(length)
-        if step != 1:
-            raise _V13314ProjectionSparseUnsupported('strided projection reads require dense fallback')
-        return list(range(start, stop)), False
-
-    def read(self, key):
-        if not isinstance(key, tuple):
-            key = (key, slice(None), slice(None))
-        key = key + (slice(None),) * (3 - len(key))
-        if len(key) != 3:
-            raise _V13314ProjectionSparseUnsupported('projection raster is exactly 3-D')
-        z_indices, z_scalar = self._normalize_selector(key[0], self.shape[0])
-        y_indices, y_scalar = self._normalize_selector(key[1], self.shape[1])
-        x_indices, x_scalar = self._normalize_selector(key[2], self.shape[2])
-        y0 = y_indices[0] if y_indices else 0
-        y1 = y_indices[-1] + 1 if y_indices else y0
-        x0 = x_indices[0] if x_indices else 0
-        x1 = x_indices[-1] + 1 if x_indices else x0
-        out = _v13314_np.zeros((len(z_indices), len(y_indices), len(x_indices)), dtype=self.dtype)
-        for oz, z in enumerate(z_indices):
-            bbox, crop = self._read_entry(z)
-            if bbox is None:
-                continue
-            by0, by1, bx0, bx1 = bbox
-            iy0, iy1 = max(y0, by0), min(y1, by1)
-            ix0, ix1 = max(x0, bx0), min(x1, bx1)
-            if iy0 < iy1 and ix0 < ix1:
-                out[oz, iy0 - y0:iy1 - y0, ix0 - x0:ix1 - x0] = crop[iy0 - by0:iy1 - by0, ix0 - bx0:ix1 - bx0]
-        if z_scalar:
-            out = out[0]
-        if y_scalar:
-            out = out[..., 0, :]
-        if x_scalar:
-            out = out[..., 0]
-        return out
-
-    def iter_bbox_slices(self, z_start=0, z_stop=None):
-        z_stop = self.shape[0] if z_stop is None else min(self.shape[0], int(z_stop))
-        for z in range(max(0, int(z_start)), z_stop):
-            bbox, crop = self._read_entry(z)
-            yield z, bbox, crop
-
-    def close(self, remove=True):
-        if self.closed:
-            return
-        self.closed = True
-        try:
-            self.file.close()
-        finally:
-            if remove:
-                try:
-                    _v13314_os.unlink(self.path)
-                except FileNotFoundError:
-                    pass
-
-
-class _V13314SparseProjectionMemmap:
-    __array_priority__ = 10000
-
-    def __init__(self, shape, dtype, filename, mode='w+', order='C', directory=None):
-        self.shape = tuple(int(v) for v in shape)
-        self.dtype = _v13314_np.dtype(dtype)
-        self.filename = _v13314_os.fspath(filename) if filename is not None else None
-        self.mode = mode
-        self.order = order
-        self.ndim = len(self.shape)
-        self.size = int(_v13314_math.prod(self.shape))
-        self.nbytes = self.size * self.dtype.itemsize
-        self.store = _V13314SparseProjectionStore(self.shape, self.dtype, directory=directory)
-        self._dense = None
-        self._transaction = _V13314_ACTIVE_PROJECTION.get()
-        if self._transaction is not None:
-            self._transaction.register_proxy(self)
-
-    def __len__(self):
-        return self.shape[0]
-
-    def __getitem__(self, key):
-        if self._dense is not None:
-            return self._dense[key]
-        return self.store.read(key)
-
-    def _key_z_start(self, key, depth):
-        zsel = key[0] if isinstance(key, tuple) else key
-        if isinstance(zsel, int):
-            return zsel + self.shape[0] if zsel < 0 else zsel
-        if zsel is Ellipsis:
-            zsel = slice(None)
-        if isinstance(zsel, slice):
-            start, stop, step = zsel.indices(self.shape[0])
-            if step != 1 or stop - start != depth:
-                raise _V13314ProjectionSparseUnsupported('non-contiguous projection write')
-            return start
-        raise _V13314ProjectionSparseUnsupported('advanced projection write')
-
-    def __setitem__(self, key, value):
-        if self._dense is not None:
-            self._dense[key] = value
-            return
-        if _v13314_np.isscalar(value):
-            if int(value) == 0:
-                # Fresh sparse stores are logically zero; full clear is a no-op.
-                full = key is Ellipsis or key == slice(None) or (isinstance(key, tuple) and all(k == slice(None) for k in key))
-                if full:
-                    return
-            raise _V13314ProjectionSparseUnsupported('scalar partial write requires dense projection fallback')
-        try:
-            import torch as _v13314_torch
-        except Exception:
-            _v13314_torch = None
-        depth = int(value.shape[0]) if getattr(value, 'ndim', 0) == 3 else 1
-        z_start = self._key_z_start(key, depth)
-        # X/Y partial writes are not emitted by the projection callbacks.  Detect
-        # them rather than silently translating coordinates incorrectly.
-        if isinstance(key, tuple):
-            for axis, selector in enumerate(key[1:3], start=1):
-                if selector not in (slice(None), Ellipsis):
-                    raise _V13314ProjectionSparseUnsupported(f'partial axis-{axis} projection write')
-        self.store.put_block(z_start, value)
-
-    def write_projection_block(self, z_start, block, completion_event=None):
-        self.store.put_block(z_start, block, completion_event=completion_event)
-
-    def flush(self):
-        if self._dense is not None:
-            self._dense.flush()
-        else:
-            self.store.file.flush()
-
-    def close(self):
-        if self._dense is not None:
-            try:
-                self._dense.flush()
-            except Exception:
-                pass
-        self.store.close(remove=True)
-
-    @property
-    def tight_extent(self):
-        return tuple(self.store.extent) if self.store.extent is not None else None
-
-    def _materialize_dense(self):
-        if self._dense is not None:
-            return self._dense
-        if self.filename is None:
-            fd, path = _v13314_tempfile.mkstemp(prefix='gpt56-projection-dense-', suffix='.mmap')
-            _v13314_os.close(fd)
-            self.filename = path
-        dense = _v13314_np.memmap(self.filename, dtype=self.dtype, mode='w+', shape=self.shape, order=self.order)
-        dense[:] = 0
-        for z, bbox, crop in self.store.iter_bbox_slices():
-            if bbox is not None:
-                y0, y1, x0, x1 = bbox
-                dense[z, y0:y1, x0:x1] = crop
-        dense.flush()
-        self._dense = dense
-        _V13314_TELEMETRY.fallback('projection.sparse_to_dense')
-        return dense
-
-    def __array__(self, dtype=None, copy=None):
-        dense = self._materialize_dense()
-        arr = _v13314_np.asarray(dense, dtype=dtype)
-        if copy:
-            arr = arr.copy()
-        return arr
-
-    def __getattr__(self, name):
-        if name in {'flags', 'strides', 'ctypes', 'base', 'T', 'real', 'imag'}:
-            return getattr(self._materialize_dense(), name)
-        raise AttributeError(name)
-
-
-class ProjectedLayerSink:
-    """Transactional sequence-aware projection fan-out (N2).
-
-    The sink accepts host or CUDA z blocks, stores tight bbox payloads, can feed a
-    full-quality sparse writer, derives exact max-pooled binary mirrors, and only
-    exposes the contributor to final union after every sequence and sink finalizes.
-    """
-
-    def __init__(self, shape_tyx, dtype=None, *, cvol_store=None,
-                 full_quality_writer=None, mirror_sinks=(), union_registrar=None,
-                 expected_sequences=None, max_reorder_blocks=16,
-                 output_path=None, temporary_path=None, exclusive=True):
-        self.shape = tuple(int(v) for v in shape_tyx)
-        self.dtype = _v13314_np.dtype(dtype or _v13314_np.uint8)
-        self.cvol_store = cvol_store
-        self.writer = full_quality_writer
-        self.mirror_sinks = tuple(mirror_sinks or ())
-        self.union_registrar = union_registrar
-        self.expected_sequences = None if expected_sequences is None else int(expected_sequences)
-        self.max_reorder_blocks = max(1, int(max_reorder_blocks))
-        self.output_path = _v13314_pathlib.Path(output_path) if output_path else None
-        self.temporary_path = _v13314_pathlib.Path(temporary_path) if temporary_path else None
-        self.exclusive = bool(exclusive)
-        self.store = _V13314SparseProjectionStore(self.shape, self.dtype,
-                                                   directory=str(self.temporary_path.parent) if self.temporary_path else None)
-        self.pending = {}
-        self.seen = set()
-        self.next_sequence = 0
-        self.closed = False
-        self.failed = False
-        self.lock = _v13314_threading.RLock()
-        self.stats = _V13314Counter()
-
-    def _normalize_cuda(self, block, event):
-        if event is not None:
-            wait = getattr(event, 'wait', None)
-            sync = getattr(event, 'synchronize', None)
-            if callable(wait):
-                wait()
-            elif callable(sync):
-                sync()
-        return block
-
-    def submit(self, block, *, z_start, sequence=None, completion_event=None, bbox=None):
-        if self.closed or self.failed:
-            raise RuntimeError('projected layer sink is not writable')
-        # Untagged producers are ordered by call order; out-of-order producers
-        # must supply an explicit sequence tag.  z_start is not a valid sequence
-        # because projection blocks usually advance by their depth.
-        sequence = (self.next_sequence + len(self.pending)) if sequence is None else int(sequence)
-        with self.lock:
-            if sequence in self.seen or sequence in self.pending:
-                raise RuntimeError(f'duplicate projection sequence {sequence}')
-            if len(self.pending) >= self.max_reorder_blocks and sequence != self.next_sequence:
-                raise RuntimeError('projection reorder window exceeded')
-            self.pending[sequence] = (int(z_start), block, completion_event, bbox)
-            self._drain_ordered()
-
-    def _dispatch_optional_store(self, z_start, block, bbox):
-        store = self.cvol_store
-        if store is None:
-            return
-        candidates = ('append_projection_block', 'append_bbox_block', 'write_bbox_block',
-                      'index_projection_block', 'add_block', 'write_block')
-        for name in candidates:
-            method = getattr(store, name, None)
-            if not callable(method):
-                continue
-            try:
-                method(z_start=z_start, block=block, bbox=bbox)
-            except TypeError:
-                try:
-                    method(z_start, block)
-                except TypeError:
-                    continue
-            return
-
-    @staticmethod
-    def _iter_dense_sparse_spans(block):
-        arr = _v13314_np.ascontiguousarray(_v13314_np.asarray(block, dtype=_v13314_np.uint8))
-        flat = memoryview(arr).cast('B')
-        data = bytes(flat)
-        cursor = 0
-        length = len(data)
-        while cursor < length:
-            zero = data[cursor] == 0
-            end = cursor + 1
-            while end < length and (data[end] == 0) == zero:
-                end += 1
-            yield zero, data[cursor:end]
-            cursor = end
-
-    def _dispatch_writer(self, z_start, block, bbox):
-        writer = self.writer
-        if writer is None:
-            return
-        for name in ('submit_projection_block', 'write_cuda_block', 'write_sparse_block'):
-            method = getattr(writer, name, None)
-            if callable(method):
-                try:
-                    method(block, z_start=z_start, bbox=bbox)
-                except TypeError:
-                    method(z_start, block)
-                return
-        # Generic write is safe only for a full-width ordered block.  Sparse-aware
-        # writers get logical spans; dense writers receive the existing path later.
-        sparse_method = getattr(writer, 'write_sparse_members', None)
-        if callable(sparse_method):
-            sparse_method(self._iter_dense_sparse_spans(block))
-
-    @staticmethod
-    def _downbin_binary(block, scale):
-        scale = int(scale)
-        if scale <= 1:
-            return block
-        try:
-            import torch as _v13314_torch
-        except Exception:
-            _v13314_torch = None
-        if _v13314_torch is not None and isinstance(block, _v13314_torch.Tensor):
-            tensor = block
-            if tensor.ndim == 3:
-                tensor = tensor.unsqueeze(1).to(dtype=_v13314_torch.float32)
-                pooled = _v13314_torch.nn.functional.max_pool2d(tensor, scale, scale, ceil_mode=True)
-                return (pooled[:, 0] != 0).to(dtype=block.dtype)
-        arr = _v13314_np.asarray(block)
-        z, y, x = arr.shape
-        py, px = (-y) % scale, (-x) % scale
-        if py or px:
-            arr = _v13314_np.pad(arr, ((0, 0), (0, py), (0, px)), mode='constant')
-        return arr.reshape(z, arr.shape[1] // scale, scale, arr.shape[2] // scale, scale).max(axis=(2, 4))
-
-    def _dispatch_mirrors(self, z_start, block):
-        for item in self.mirror_sinks:
-            if isinstance(item, tuple) and len(item) == 2:
-                scale, sink = item
-            else:
-                scale, sink = 2, item
-            derived = self._downbin_binary(block, scale)
-            submit = getattr(sink, 'submit', None) or getattr(sink, 'write_block', None)
-            if callable(submit):
-                try:
-                    submit(derived, z_start=z_start, sequence=z_start)
-                except TypeError:
-                    submit(z_start, derived)
-
-    def _drain_ordered(self):
-        while self.next_sequence in self.pending:
-            z_start, block, event, bbox = self.pending.pop(self.next_sequence)
-            try:
-                block = self._normalize_cuda(block, event)
-                self.store.put_block(z_start, block)
-                self._dispatch_optional_store(z_start, block, bbox)
-                self._dispatch_writer(z_start, block, bbox)
-                self._dispatch_mirrors(z_start, block)
-                self.seen.add(self.next_sequence)
-                self.stats['blocks'] += 1
-                self.stats['logical_bytes'] += int(getattr(block, 'numel', lambda: _v13314_np.asarray(block).size)()) if callable(getattr(block, 'numel', None)) else int(_v13314_np.asarray(block).size)
-                self.next_sequence += 1
-            except Exception:
-                self.failed = True
-                raise
-
-    def finalize(self):
-        with self.lock:
-            self._drain_ordered()
-            if self.pending:
-                raise RuntimeError(f'missing projection sequence {self.next_sequence}')
-            if self.expected_sequences is not None and len(self.seen) != self.expected_sequences:
-                raise RuntimeError(f'projection sequence count {len(self.seen)} != {self.expected_sequences}')
-            for sink in (self.writer,) + tuple(s[1] if isinstance(s, tuple) else s for s in self.mirror_sinks):
-                if sink is None:
-                    continue
-                finish = getattr(sink, 'finalize', None) or getattr(sink, 'close', None)
-                if callable(finish):
-                    finish()
-            if self.union_registrar is not None:
-                self.union_registrar(self.cvol_store or self.store)
-            if self.output_path is not None and self.temporary_path is not None:
-                self.output_path.parent.mkdir(parents=True, exist_ok=True)
-                _v13314_os.replace(self.temporary_path, self.output_path)
-            self.closed = True
-            _V13314_TELEMETRY.add('projection.sink_blocks', self.stats['blocks'])
-            _V13314_TELEMETRY.add('projection.sink_bbox_bytes', self.store.indexed_bbox_bytes)
-            return self.cvol_store or self.store
-
-    def abort(self):
-        self.failed = True
-        for sink in (self.writer,) + tuple(s[1] if isinstance(s, tuple) else s for s in self.mirror_sinks):
-            if sink is None:
-                continue
-            abort = getattr(sink, 'abort', None) or getattr(sink, 'cancel', None)
-            if callable(abort):
-                try:
-                    abort()
-                except Exception:
-                    pass
-        if self.temporary_path is not None:
-            try:
-                self.temporary_path.unlink()
-            except FileNotFoundError:
-                pass
-        self.store.close(remove=True)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        if exc_type is None:
-            self.finalize()
-        else:
-            self.abort()
-        return False
-
-
-class _V13314ProjectionTransaction:
-    def __init__(self, call_args, call_kwargs):
-        self.call_args = call_args
-        self.call_kwargs = call_kwargs
-        self.proxy = None
-        self.sink = None
-        self.created_paths = set()
-        self.failed = False
-        self.enabled = _v13314_env_bool('YOLO_TTA_STREAM_PROJECTED_LAYERS', True)
-        self._allocation_claimed = False
-        self.started = _v13314_time.monotonic()
-
-    def expected_shape(self):
-        for mapping in (self.call_kwargs,):
-            for key in ('shape_tyx', 'output_shape', 'source_shape', 'native_shape', 'shape'):
-                value = mapping.get(key)
-                if isinstance(value, (tuple, list)) and len(value) == 3:
-                    return tuple(int(v) for v in value)
-        for value in self.call_args:
-            shape = getattr(value, 'shape', None)
-            if isinstance(shape, tuple) and len(shape) == 3:
-                return tuple(int(v) for v in shape)
-        return None
-
-    def should_proxy(self, shape, dtype, filename=None):
-        if not self.enabled or self._allocation_claimed or _V13314_PROJECTION_DISABLED.get():
-            return False
-        try:
-            shape = tuple(int(v) for v in shape)
-            dtype = _v13314_np.dtype(dtype)
-        except Exception:
-            return False
-        if len(shape) != 3 or dtype.kind not in {'b', 'u', 'i'} or dtype.itemsize > 2:
-            return False
-        threshold = _v13314_env_int('YOLO_TTA_PROJECTED_PROXY_MIN_BYTES', 512 * _V13314_MIB, 0)
-        if int(_v13314_math.prod(shape)) * dtype.itemsize < threshold:
-            return False
-        expected = self.expected_shape()
-        if expected is not None and shape != expected:
-            # The source and projected geometries can differ in t.  Require y/x.
-            if shape[-2:] != expected[-2:]:
-                return False
-        if filename:
-            lower = str(filename).lower()
-            if any(token in lower for token in ('cvol', 'index', 'confidence', 'mirror', 'downbin')):
-                return False
-        self._allocation_claimed = True
-        return True
-
-    def register_proxy(self, proxy):
-        self.proxy = proxy
-        self.sink = ProjectedLayerSink(proxy.shape, proxy.dtype, expected_sequences=None, exclusive=True)
-        # Use the proxy's store as the canonical transaction store so downstream
-        # reads and final-union registration observe identical bytes.
-        self.sink.store.close(remove=True)
-        self.sink.store = proxy.store
-
-    def finish(self, result):
-        elapsed = _v13314_time.monotonic() - self.started
-        _V13314_TELEMETRY.add('projection.transactions', 1)
-        _V13314_TELEMETRY.gauge('projection.last_seconds', elapsed)
-        if self.proxy is not None:
-            _V13314_TELEMETRY.add('projection.virtual_rasters', 1)
-            _V13314_TELEMETRY.add('projection.virtual_logical_bytes', self.proxy.nbytes)
-            _V13314_TELEMETRY.add('projection.virtual_bbox_bytes', self.proxy.store.indexed_bbox_bytes)
-        return result
-
-    def abort(self, exc=None):
-        self.failed = True
-        if self.sink is not None:
-            try:
-                self.sink.abort()
-            except Exception:
-                pass
-        elif self.proxy is not None:
-            try:
-                self.proxy.close()
-            except Exception:
-                pass
-        _V13314_TELEMETRY.fallback('projection.transaction', exc)
-
-
-# DEAD CODE (v15.0.4): NumPy allocator monkeypatch parsing is no longer installed.
-def _v13314_shape_dtype_from_allocator(args, kwargs, is_memmap):
-    if is_memmap:
-        filename = args[0] if args else kwargs.get('filename')
-        dtype = kwargs.get('dtype', args[1] if len(args) > 1 else _v13314_np.uint8)
-        mode = kwargs.get('mode', args[2] if len(args) > 2 else 'r+')
-        shape = kwargs.get('shape', args[4] if len(args) > 4 else None)
-        order = kwargs.get('order', 'C')
-        return filename, shape, dtype, mode, order
-    shape = args[0] if args else kwargs.get('shape')
-    dtype = kwargs.get('dtype', _v13314_np.float64)
-    order = kwargs.get('order', 'C')
-    return None, shape, dtype, 'w+', order
-
-
-# DEAD CODE (v15.0.4): saved NumPy allocator aliases retained for external compatibility.
-_V13314_ORIGINAL_NUMPY_ZEROS = _v13314_np.zeros if _v13314_np is not None else None
-_V13314_ORIGINAL_NUMPY_EMPTY = _v13314_np.empty if _v13314_np is not None else None
-
-
-
-
-
-
-
-
-def _v13314_extract_projection_callback(bound, args, kwargs):
-    values = dict(bound.arguments) if bound is not None else dict(kwargs)
-    target = None
-    block = None
-    event = None
-    z_start = None
-    sequence = None
-    for key in ('target', 'out', 'output', 'dest', 'destination', 'volume', 'vol_mm', 'projected_volume'):
-        value = values.get(key)
-        if isinstance(value, _V13314SparseProjectionMemmap):
-            target = value
-            break
-    if target is None:
-        for value in args:
-            if isinstance(value, _V13314SparseProjectionMemmap):
-                target = value
-                break
-    for key in ('block', 'data', 'mask', 'projection_block', 'host_block', 'cuda_block', 'values'):
-        value = values.get(key)
-        if value is not None and hasattr(value, 'shape') and value is not target:
-            if len(getattr(value, 'shape', ())) in (2, 3):
-                block = value
-                break
-    if block is None:
-        for value in args:
-            if value is target or not hasattr(value, 'shape'):
-                continue
-            if len(getattr(value, 'shape', ())) in (2, 3):
-                block = value
-                break
-    for key in ('z_start', 'start_z', 'z0', 'output_z_start', 'slice_start', 'offset'):
-        value = values.get(key)
-        if isinstance(value, (int, _v13314_np.integer)):
-            z_start = int(value)
-            break
-    for key in ('sequence', 'seq', 'block_index', 'sequence_id'):
-        value = values.get(key)
-        if isinstance(value, (int, _v13314_np.integer)):
-            sequence = int(value)
-            break
-    for key in ('event', 'completion_event', 'ready_event', 'cuda_event'):
-        if values.get(key) is not None:
-            event = values[key]
-            break
-    if z_start is None:
-        ints = [int(v) for v in args if isinstance(v, (int, _v13314_np.integer))]
-        if ints:
-            z_start = ints[0]
-    return target, block, z_start, sequence, event
-
-
-
-def _v13314_install_projection_component_registration():
-    """Capture cvol components created while a materializer transaction is active."""
-    installed = []
-    for cls_name, kind in (('RawBBoxMaskStore', 'store'),):
-        cls = globals().get(cls_name)
-        original = getattr(cls, '__init__', None) if cls is not None else None
-        if not callable(original) or getattr(original, '_v13314_projection_registered', False):
-            continue
-        @_v13314_functools.wraps(original)
-        def wrapped(self, *args, __original=original, __kind=kind, **kwargs):
-            __original(self, *args, **kwargs)
-            tx = _V13314_ACTIVE_PROJECTION.get()
-            if tx is None or tx.sink is None:
-                return
-            if __kind == 'store' and tx.sink.cvol_store is None:
-                tx.sink.cvol_store = self
-                _V13314_TELEMETRY.add('projection.cvol_store_registered', 1)
-        wrapped._v13314_projection_registered = True
-        setattr(cls, '__init__', wrapped)
-        installed.append(cls_name)
-    return installed
-
-def _v13314_install_projection_callback_wrapper():
-    original = globals().get('_emit_projection_block_callback')
-    if not callable(original) or getattr(original, '_v13314_wrapped', False):
-        return False
-    try:
-        signature = _v13314_inspect.signature(original)
-    except Exception:
-        signature = None
-
-    @_v13314_functools.wraps(original)
-    def wrapped(*args, **kwargs):
-        bound = None
-        if signature is not None:
-            try:
-                bound = signature.bind_partial(*args, **kwargs)
-            except Exception:
-                pass
-        target, block, z_start, sequence, event = _v13314_extract_projection_callback(bound, args, kwargs)
-        tx = _V13314_ACTIVE_PROJECTION.get()
-        if target is not None and block is not None and z_start is not None:
-            with _V13314_TELEMETRY.span('projection.callback_sparse'):
-                target.write_projection_block(z_start, block, completion_event=event)
-                if tx is not None and tx.sink is not None:
-                    # The proxy store is already the sink store; mark sequence once
-                    # without writing the block a second time.
-                    seq = int(sequence if sequence is not None else z_start)
-                    tx.sink.seen.add(seq)
-                    tx.sink.stats['blocks'] += 1
-            return None
-        if tx is not None and tx.sink is not None and block is not None and z_start is not None:
-            # Preserve the existing dense callback while teeing into the transaction.
-            tx.sink.submit(block, z_start=z_start, sequence=sequence, completion_event=event)
-        return original(*args, **kwargs)
-
-    wrapped._v13314_wrapped = True
-    wrapped._v13314_original = original
-    globals()['_emit_projection_block_callback'] = wrapped
-    return True
-
-
-def _v13314_install_materializer_wrapper():
-    original = globals().get('materialize_nrrd_view_layer')
-    if not callable(original) or getattr(original, '_v13314_wrapped', False):
-        return False
-
-    @_v13314_functools.wraps(original)
-    def wrapped(*args, **kwargs):
-        if not _v13314_env_bool('YOLO_TTA_STREAM_PROJECTED_LAYERS', True) or _V13314_PROJECTION_DISABLED.get():
-            return original(*args, **kwargs)
-        tx = _V13314ProjectionTransaction(args, kwargs)
-        token = _V13314_ACTIVE_PROJECTION.set(tx)
-        try:
-            with _V13314_TELEMETRY.span('projection.materialize'):
-                result = original(*args, **kwargs)
-            return tx.finish(result)
-        except _V13314ProjectionSparseUnsupported as exc:
-            tx.abort(exc)
-            # Transactional fallback: discard the sparse temporary and rerun once
-            # through the unchanged dense path.
-            _V13314_TELEMETRY.fallback('projection.dense_rerun', exc)
-            disabled = _V13314_PROJECTION_DISABLED.set(True)
-            try:
-                return original(*args, **kwargs)
-            finally:
-                _V13314_PROJECTION_DISABLED.reset(disabled)
-        except Exception as exc:
-            tx.abort(exc)
-            raise
-        finally:
-            _V13314_ACTIVE_PROJECTION.reset(token)
-
-    wrapped._v13314_wrapped = True
-    wrapped._v13314_original = original
-    globals()['materialize_nrrd_view_layer'] = wrapped
-    return True
-
-# DEAD CODE (v15.0.4): the native resident TensorRT cache owns persistence; this older
-# compatibility cache has no acquire/insert caller and is retained only for import stability.
-class _V13314PersistentExecutorCache:
-    """Worker-process cache for resident TensorRT ring executors (P2)."""
-
-    def __init__(self):
-        self.lock = _v13314_threading.RLock()
-        self.entries = {}
-        self.by_executor = {}
-        self.enabled = _v13314_env_bool('YOLO_TTA_PERSISTENT_TRT_RING', True)
-
-    @staticmethod
-    def _freeze(value, depth=0):
-        if depth > 2:
-            return type(value).__name__
-        if value is None or isinstance(value, (str, int, float, bool)):
-            return value
-        if _v13314_np is not None and isinstance(value, _v13314_np.dtype):
-            return str(value)
-        if isinstance(value, (tuple, list)):
-            return tuple(_V13314PersistentExecutorCache._freeze(v, depth + 1) for v in value[:16])
-        shape = getattr(value, 'shape', None)
-        dtype = getattr(value, 'dtype', None)
-        device = getattr(value, 'device', None)
-        if shape is not None:
-            return (type(value).__name__, tuple(int(v) for v in shape), str(dtype), str(device))
-        for attr in ('engine_path', 'model_path', 'path', 'name'):
-            candidate = getattr(value, attr, None)
-            if isinstance(candidate, (str, _v13314_pathlib.Path)):
-                return (type(value).__name__, str(candidate))
-        return (type(value).__name__, id(value))
-
-    def key(self, source, bound):
-        static = []
-        # Engine/device/model identity from the worker/source.
-        for attr in ('engine', 'trt_engine', 'model', 'backend', 'engine_path', 'device', 'device_id',
-                     'input_shape', 'native_shape', 'dtype', 'track_conf'):
-            if hasattr(source, attr):
-                static.append((attr, self._freeze(getattr(source, attr))))
-        varying_tokens = ('offset', 'start', 'stop', 'task', 'chunk', 'slab', 'destination', 'output', 'z0', 'z1')
-        dynamic = {}
-        for name, value in (bound.arguments.items() if bound is not None else ()):
-            if name == 'self':
-                continue
-            if any(token in name.lower() for token in varying_tokens):
-                dynamic[name] = value
-            else:
-                static.append((name, self._freeze(value)))
-        shape_class = None
-        for attr in ('native_shape', 'input_shape', 'shape'):
-            value = getattr(source, attr, None)
-            if isinstance(value, (tuple, list)):
-                shape_class = tuple(int(v) for v in value)
-                break
-        return (_v13314_os.getpid(), tuple(static), shape_class), dynamic
-
-    def acquire(self, key, dynamic):
-        if not self.enabled:
-            return None
-        owner = (_v13314_os.getpid(), _v13314_threading.get_ident())
-        with self.lock:
-            entry = self.entries.get(key)
-            if entry is None or entry['invalid'] or entry['in_use']:
-                return None
-            executor = entry['executor']
-            entry['in_use'] = True
-            entry['owner'] = owner
-            entry['last_used'] = _v13314_time.monotonic()
-            self._rebind(executor, dynamic)
-            _V13314_TELEMETRY.add('trt_ring.cache_hits', 1)
-            return executor
-
-    @staticmethod
-    def _rebind(executor, dynamic):
-        for name, value in dynamic.items():
-            for candidate in (name, '_' + name):
-                if hasattr(executor, candidate):
-                    try:
-                        setattr(executor, candidate, value)
-                    except Exception:
-                        pass
-        rebind = getattr(executor, 'rebind_task', None) or getattr(executor, 'reset_task', None)
-        if callable(rebind):
-            try:
-                rebind(**dynamic)
-            except TypeError:
-                try:
-                    rebind(dynamic)
-                except Exception:
-                    pass
-
-    def insert(self, key, executor, dynamic):
-        if not self.enabled or executor is None:
-            return executor
-        owner = (_v13314_os.getpid(), _v13314_threading.get_ident())
-        with self.lock:
-            old = self.entries.get(key)
-            if old is not None and old['executor'] is not executor:
-                return executor  # a concurrent owner already populated this key
-            entry = {
-                'executor': executor,
-                'in_use': True,
-                'owner': owner,
-                'invalid': False,
-                'last_used': _v13314_time.monotonic(),
-                'dynamic': dynamic,
-            }
-            self.entries[key] = entry
-            self.by_executor[id(executor)] = key
-            try:
-                executor._v13314_persistent_cached = True
-            except Exception:
-                pass
-        self._ensure_capacity(executor)
-        self._autotune(executor)
-        _V13314_TELEMETRY.add('trt_ring.cache_misses', 1)
-        return executor
-
-    @staticmethod
-    def _autotune(executor):
-        if getattr(executor, '_v13314_schedule_tuned', False):
-            return
-        requested = _v13314_os.environ.get('YOLO_TTA_TRT_CONTEXT_SCHEDULE', 'auto').strip().lower()
-        result = None
-        if requested == 'auto':
-            for name in ('benchmark_context_concurrency', 'benchmark_context_schedules',
-                         'autotune_context_count', 'benchmark_schedule'):
-                method = getattr(executor, name, None)
-                if not callable(method):
-                    continue
-                try:
-                    result = method(context_counts=(1, 2), warmup=2, iterations=5)
-                except TypeError:
-                    try:
-                        result = method((1, 2))
-                    except Exception:
-                        continue
-                except Exception:
-                    continue
-                break
-        else:
-            try:
-                result = int(requested)
-            except Exception:
-                result = requested
-        if result is not None:
-            setter = getattr(executor, 'set_context_schedule', None) or getattr(executor, 'set_context_count', None)
-            if callable(setter):
-                try:
-                    setter(result)
-                except Exception:
-                    pass
-            try:
-                executor._v13314_context_schedule = result
-            except Exception:
-                pass
-            _V13314_TELEMETRY.gauge('trt_ring.context_schedule', result)
-        else:
-            _V13314_TELEMETRY.add('trt_ring.autotune_unavailable', 1)
-        try:
-            executor._v13314_schedule_tuned = True
-        except Exception:
-            pass
-
-    @staticmethod
-    def _ensure_capacity(executor):
-        maximum = _v13314_env_int('YOLO_TTA_TRT_RING_MAX_SLICES', 512, 1)
-        for name in ('ensure_capacity', 'reserve', 'reserve_slices', 'resize_ring'):
-            method = getattr(executor, name, None)
-            if callable(method):
-                try:
-                    method(maximum)
-                    break
-                except Exception:
-                    continue
-        try:
-            executor._v13314_max_task_slices = maximum
-        except Exception:
-            pass
-
-    def release(self, executor):
-        with self.lock:
-            key = self.by_executor.get(id(executor))
-            if key is None:
-                return False
-            entry = self.entries.get(key)
-            if entry is None or entry['executor'] is not executor or entry['invalid']:
-                return False
-            entry['in_use'] = False
-            entry['owner'] = None
-            entry['last_used'] = _v13314_time.monotonic()
-            _V13314_TELEMETRY.add('trt_ring.releases', 1)
-            return True
-
-    def invalidate(self, executor, exc=None):
-        hard_close = None
-        with self.lock:
-            key = self.by_executor.get(id(executor))
-            if key is not None:
-                entry = self.entries.pop(key, None)
-                if entry is not None:
-                    entry['invalid'] = True
-            hard_close = getattr(executor, '_v13314_hard_close', None)
-        _V13314_TELEMETRY.fallback('trt_ring.invalidate', exc)
-        if callable(hard_close):
-            try:
-                hard_close()
-            except Exception:
-                pass
-
-    def close_all(self):
-        with self.lock:
-            entries = list(self.entries.values())
-            self.entries.clear()
-            self.by_executor.clear()
-        for entry in entries:
-            close = getattr(entry['executor'], '_v13314_hard_close', None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    pass
-
-
-# DEAD CODE (v15.0.4): instantiated only for compatibility; the native resident-ring cache is live.
-_V13314_TRT_CACHE = _V13314PersistentExecutorCache()
-_v13314_atexit.register(_V13314_TRT_CACHE.close_all)
-
-
-def _v13314_install_trt_persistence():
-    """v13.3.15: core owns the actual executor cache; do not wrap slot preparation."""
-    return bool(globals().get('_RESIDENT_TRT_PIPELINE_CACHE_NATIVE', False))
-
-
-def _v13314_wrap_callable(owner, name, phase, byte_counter=None):
-    original = getattr(owner, name, None) if owner is not None else globals().get(name)
-    if not callable(original) or getattr(original, '_v13314_telemetry_wrapped', False):
-        return False
-    is_generator = _v13314_inspect.isgeneratorfunction(original)
-    if is_generator:
-        @_v13314_functools.wraps(original)
-        def wrapped(*args, **kwargs):
-            start = _v13314_time.monotonic_ns()
-            failed = False
-            try:
-                for item in original(*args, **kwargs):
-                    yield item
-            except BaseException:
-                failed = True
-                raise
-            finally:
-                elapsed = _v13314_time.monotonic_ns() - start
-                with _V13314_TELEMETRY.lock:
-                    _V13314_TELEMETRY.phase_ns[phase] += elapsed
-                    _V13314_TELEMETRY.phase_calls[phase] += 1
-                    if failed:
-                        _V13314_TELEMETRY.counters[f'{phase}.errors'] += 1
-    else:
-        @_v13314_functools.wraps(original)
-        def wrapped(*args, **kwargs):
-            if byte_counter is not None:
-                try:
-                    amount = byte_counter(args, kwargs)
-                    if amount:
-                        _V13314_TELEMETRY.add(f'{phase}.bytes', amount)
-                except Exception:
-                    pass
-            with _V13314_TELEMETRY.span(phase):
-                return original(*args, **kwargs)
-    wrapped._v13314_telemetry_wrapped = True
-    wrapped._v13314_original = original
-    if owner is None:
-        globals()[name] = wrapped
-    else:
-        setattr(owner, name, wrapped)
-    return True
-
-
-def _v13314_install_telemetry_wrappers():
-    installed = []
-    # Top-level phases named in M1. Missing symbols are harmless.
-    mapping = {
-        'write_single_layer_nrrd_from_ref': 'nrrd.write_layer',
-        '_read_layer_slice_in_output_shape': 'restore.read_slice',
-        '_emit_projection_block_callback': 'projection.callback',
-        'materialize_nrrd_view_layer': 'projection.materialize_outer',
-        '_ensure_baseline_workspaces': 'workspace.baseline',
-        'allocate_workspace_array': 'workspace.allocate',
-    }
-    for name, phase in mapping.items():
-        if _v13314_wrap_callable(None, name, phase):
-            installed.append(name)
-    classes = [
-        ('RawBBoxMaskStore', {
-            'iter_native_sparse_members': 'cvol.iter_native_sparse',
-            'iter_restored_sparse_members': 'cvol.iter_restored_sparse',
-        }),
-        ('_ResidentTensorRTRingExecutor', {
-            '__init__': 'trt_ring.init',
-        }),
-    ]
-    for cls_name, methods in classes:
-        cls = globals().get(cls_name)
-        if cls is None:
-            continue
-        for method_name, phase in methods.items():
-            if _v13314_wrap_callable(cls, method_name, phase):
-                installed.append(f'{cls_name}.{method_name}')
-    _V13314_TELEMETRY.gauge('telemetry.wrapped_symbols', installed)
-    return installed
-
-
-
-
-# Install projection adapters before their telemetry wrappers.
-_v13314_projection_components_installed = _v13314_install_projection_component_registration()
-_v13314_projection_callback_installed = _v13314_install_projection_callback_wrapper()
-_v13314_materializer_installed = _v13314_install_materializer_wrapper()
-_v13314_trt_installed = _v13314_install_trt_persistence()
-_v13314_telemetry_installed = _v13314_install_telemetry_wrappers()
-_V13314_TELEMETRY.gauge('features', {
-    'n7_restored_sparse_present': bool(hasattr(globals().get('RawBBoxMaskStore', object), 'iter_restored_sparse_members')),
-    'n22_crop_aware_mirror_tee': bool(globals().get('_resize_sparse_binary_crop_to_output_region')),
-    'n24_slice_aligned_sparse_members': True,
-    'n24_owned_member_transfer': bool(hasattr(globals().get('_MemberParallelGzipPayloadWriter', object), 'write_owned_known_nonzero')),
-    'n2_projection_callback': _v13314_projection_callback_installed,
-    'n2_materializer': _v13314_materializer_installed,
-    'p7_memfd': False,
-    'p7_memfd_dead_compatibility_code_present': bool(hasattr(_v13314_os, 'memfd_create')),
-    'p2_trt_persistence': _v13314_trt_installed,
-})
-# <<< End late compatibility layer <<<
 
 if __name__ == "__main__":
     try:
