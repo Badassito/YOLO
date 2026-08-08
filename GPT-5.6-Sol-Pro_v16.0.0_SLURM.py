@@ -2,10 +2,10 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the GPT-5.6-Sol-Pro v15.0.5 SLURM maintenance release, copied from the
-confirmed-running GPT-5.6-Sol-Pro_v15.0.4_SLURM.py. It removes retired compatibility
-code, folds runtime observability into the core pipeline, and defaults model loading to
-overlap input decode/preparation.
+This is the GPT-5.6-Sol-Pro v16.0.0 SLURM view-rework release, copied from the
+confirmed-running GPT-5.6-Sol-Pro_v15.0.5_SLURM.py. It consolidates Cartesian and Tilted
+view selection, generalizes Radial views across all Cartesian orientations and enabled
+Tilted variants, and supports per-Radial-view azimuth spacing.
 
 Current runtime behavior:
   - accepts gray/grey, RGB, or C{odd}S{stride} model-input channel layouts
@@ -137,8 +137,59 @@ def _parse_token_list(values: Sequence[str] | str | None) -> List[str]:
     return parts
 
 
+CARTESIAN_VIEW_TOKENS: Tuple[str, ...] = ('transverse', 'sagittal', 'coronal')
+RADIAL_VIEW_TOKENS: Tuple[str, ...] = (
+    'transverse', 'sagittal', 'coronal',
+    'tilted_transverse', 'tilted_sagittal', 'tilted_coronal',
+)
+
+
+def _parse_float_list(values: Sequence[str] | str | float | int | None) -> List[float]:
+    """Accept comma and/or whitespace separated floating-point lists."""
+    if values is None:
+        return []
+    if isinstance(values, (float, int)):
+        return [float(values)]
+    raw_values = [values] if isinstance(values, str) else [str(v) for v in values]
+    parts: List[str] = []
+    for raw in raw_values:
+        raw = str(raw).strip()
+        if not raw:
+            continue
+        parts.extend([p for p in re.split(r"[,\s]+", raw) if p])
+    return [float(p) for p in parts]
+
+
+def _resolve_unique_view_tokens(
+    values: Sequence[str] | str | None,
+    *,
+    valid: Sequence[str],
+    flag_name: str,
+) -> List[str]:
+    raw = [str(v).strip().lower() for v in _parse_token_list(values)]
+    valid_set = set(str(v) for v in valid)
+    out: List[str] = []
+    for token in raw:
+        if token not in valid_set:
+            expected = ', '.join(str(v) for v in valid)
+            raise ValueError(f'{flag_name} values must be one of: {expected}; got {token!r}')
+        if token in out:
+            raise ValueError(f'{flag_name} contains duplicate value {token!r}')
+        out.append(token)
+    return out
+
+
+def resolve_cartesian_views(values: Sequence[str] | str | None) -> List[str]:
+    """Resolve ``--enable_cartesian`` without adding any implicit view."""
+    return _resolve_unique_view_tokens(
+        values,
+        valid=CARTESIAN_VIEW_TOKENS,
+        flag_name='--enable_cartesian',
+    )
+
+
 def resolve_tilt_angles(values: Sequence[str] | str | None) -> List[float]:
-    raw = _parse_angles(' '.join(_parse_token_list(values)))
+    raw = _parse_float_list(values)
     out: List[float] = []
     seen: set[float] = set()
     for angle in raw:
@@ -164,31 +215,31 @@ def resolve_tilt_directions(values: Sequence[str] | str | None) -> List[str]:
                     out.append(expanded)
             continue
         if token not in ('vertical', 'horizontal'):
-            raise ValueError("--tilt_direction values must be vertical, horizontal, or both")
+            raise ValueError('--tilt_direction values must be vertical, horizontal, or both')
         if token not in out:
             out.append(token)
+    # v16.0.0 default: both directions whenever Tilted views are enabled.
     if not out:
-        out = ['vertical']
+        out = ['vertical', 'horizontal']
     return out
 
 
 def resolve_tilt_views(values: Sequence[str] | str | None) -> List[str]:
-    """Resolve v12 Tilted View base-view selections.
+    """Resolve ``--enable_tilted`` without adding any implicit Tilted base view."""
+    return _resolve_unique_view_tokens(
+        values,
+        valid=CARTESIAN_VIEW_TOKENS,
+        flag_name='--enable_tilted',
+    )
 
-    Tilted Views are derived from Cartesian base views only.  The selected base
-    view does not need to be enabled as an upright view; e.g. ``--tilt_view
-    sagittal`` is valid even without ``--enable_sagittal``.
-    """
-    raw = [str(v).strip().lower() for v in _parse_token_list(values)]
-    out: List[str] = []
-    for token in raw:
-        if token not in ('transverse', 'sagittal', 'coronal'):
-            raise ValueError("--tilt_view values must be transverse, sagittal, or coronal")
-        if token not in out:
-            out.append(token)
-    if not out:
-        out = ['transverse']
-    return out
+
+def resolve_radial_views(values: Sequence[str] | str | None) -> List[str]:
+    """Resolve the ordered ``--enable_radial`` transform targets."""
+    return _resolve_unique_view_tokens(
+        values,
+        valid=RADIAL_VIEW_TOKENS,
+        flag_name='--enable_radial',
+    )
 
 
 @dataclass(frozen=True)
@@ -357,21 +408,59 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--keep_objects", default=0, type=int,
                    help="Keep the top N largest final 3D objects by volume. 0 keeps all objects")
 
-    p.add_argument("--enable_sagittal", action="store_true",
-                   help="Enable Sagittal (X,t) Cartesian views in addition to the required Transverse view")
-    p.add_argument("--enable_coronal", action="store_true",
-                   help="Enable Coronal (Y,t) Cartesian views in addition to the required Transverse view")
-    p.add_argument("--disable_transverse", action="store_true",
-                   help="Skip standard Transverse full-frame and tiled inferencing only; Transverse output geometry remains available")
-    p.add_argument("--enable_radial", action="store_true", help="Enable Radial views")
-    p.add_argument("--azimuth_angle", default=None, type=float,
-                   help="Angular spacing in degrees for radial diameter slices over [0,180]. When --enable_radial is active and this is omitted, defaults to the largest angle that guarantees full ROI coverage. 0 disables radial views")
-    p.add_argument("--tilt_view", nargs="+", default=["transverse"], type=str,
-                   help="One or more Cartesian base views for v12 Tilted Views: transverse, sagittal, or coronal. A tilted base view does not need to be enabled as an upright view")
-    p.add_argument("--tilt_angle", nargs="+", default=["0"], type=str,
-                   help="One or more positive Tilted View angles in degrees. Each value creates both positive and negative variants. 0 disables all Tilted Views. Values must be greater than 0 and less than or equal to 45")
-    p.add_argument("--tilt_direction", nargs="+", default=["vertical"], type=str,
-                   help="One or more Tilted View directions: vertical, horizontal, or both")
+    p.add_argument(
+        "--enable_cartesian",
+        nargs="+",
+        default=None,
+        type=str,
+        metavar="VIEW",
+        help=(
+            "Enable one or more Cartesian views: transverse, sagittal, coronal. "
+            "Comma-separated, whitespace-separated, and mixed comma/whitespace forms are accepted. "
+            "No Cartesian view is enabled by default"
+        ),
+    )
+    p.add_argument(
+        "--enable_radial",
+        nargs="+",
+        default=None,
+        type=str,
+        metavar="VIEW",
+        help=(
+            "Enable one or more Radial transforms: transverse, sagittal, coronal, "
+            "tilted_transverse, tilted_sagittal, tilted_coronal. Cartesian Radial transforms "
+            "do not require the matching upright Cartesian view. A tilted_* target expands to "
+            "every enabled Tilted variant of that base; it is skipped with a log message when none exist"
+        ),
+    )
+    p.add_argument(
+        "--azimuth_angle",
+        nargs="+",
+        default=None,
+        type=str,
+        metavar="DEG",
+        help=(
+            "Radial angular spacing over [0,180). One value broadcasts to every --enable_radial "
+            "target; multiple values must match the ordered --enable_radial target count. Omission "
+            "uses the largest full-coverage angle independently for each target. Supplying this flag "
+            "alone does not enable Radial views; 0 disables its paired target"
+        ),
+    )
+    p.add_argument(
+        "--enable_tilted",
+        nargs="+",
+        default=None,
+        type=str,
+        metavar="VIEW",
+        help=(
+            "Enable one or more Tilted Cartesian bases: transverse, sagittal, coronal. "
+            "No Tilted view is enabled by default, and the base need not be enabled by --enable_cartesian"
+        ),
+    )
+    p.add_argument("--tilt_angle", nargs="+", default=["30"], type=str,
+                   help="One or more positive Tilted View angles in degrees. Each value creates both positive and negative variants. 0 disables all Tilted views even when --enable_tilted is set. Values must be greater than 0 and less than or equal to 45")
+    p.add_argument("--tilt_direction", nargs="+", default=["vertical", "horizontal"], type=str,
+                   help="One or more Tilted View directions: vertical, horizontal, or both. Defaults to vertical and horizontal")
 
     p.add_argument("--tile_size", nargs="+", default=["0"], type=str,
                    help="One or more square dense-tile side lengths in source pixels for all active views. 0 disables dense tiled predictions")
@@ -648,7 +737,7 @@ def _cpu_count() -> int:
 # --------------------------
 # Runtime observability
 # --------------------------
-# v15.0.5 folds the useful telemetry portion of the former late v13.3.14 compatibility
+# v16.0.0 retains the useful telemetry folded into the core pipeline by v15.0.5
 # layer into normal imports and explicit process initialization. No functions/classes are
 # monkeypatched at module end, and importing this module no longer starts sampler threads.
 
@@ -690,7 +779,7 @@ class RuntimeTelemetry:
             self.path = Path(requested)
         else:
             base = os.environ.get('SLURM_JOB_ID') or str(os.getpid())
-            self.path = Path(tempfile.gettempdir()) / f'gpt56-sol-pro-v1505-telemetry-{base}-{os.getpid()}.jsonl'
+            self.path = Path(tempfile.gettempdir()) / f'gpt56-sol-pro-v1600-telemetry-{base}-{os.getpid()}.jsonl'
 
     @contextlib.contextmanager
     def span(self, name: str, **fields: object) -> Iterator[None]:
@@ -760,7 +849,7 @@ class RuntimeTelemetry:
                     'mean_ms': (seconds * 1000.0 / calls) if calls else 0.0,
                 }
             payload: Dict[str, object] = {
-                'schema': 'gpt-5.6-sol-pro-v15.0.5.telemetry.v1',
+                'schema': 'gpt-5.6-sol-pro-v16.0.0.telemetry.v1',
                 'pid': os.getpid(),
                 'monotonic_seconds': (now_ns - self.started_ns) / 1e9,
                 'wall_time': time.time(),
@@ -3892,20 +3981,41 @@ def restore_mask_volume_to_original_shape(
     return out_mm
 
 
-def resolve_radial_azimuth_angle(
-    requested_angle: Optional[float],
+def resolve_radial_azimuth_angles(
+    requested_values: Sequence[str] | str | float | int | None,
     *,
-    enable_radial: bool,
-    diameter: int,
-) -> float:
-    """Resolve v12.2.0 radial activation and default full-coverage angle."""
-    if requested_angle is not None:
-        if float(requested_angle) <= 0.0:
-            return 0.0
-        return float(requested_angle)
-    if bool(enable_radial):
-        return radial_full_coverage_angle_deg(int(diameter))
-    return 0.0
+    radial_targets: Sequence[str],
+    diameters: Sequence[int],
+) -> List[float]:
+    """Resolve one ordered azimuth spacing per ``--enable_radial`` target.
+
+    A single explicit value broadcasts. Multiple explicit values must match the target count.
+    With no explicit value, each target receives its own largest full-coverage spacing from its
+    maximally inscribed circle diameter. Explicit ``--azimuth_angle`` without any Radial target
+    is validated but deliberately enables nothing.
+    """
+    targets = [str(v) for v in radial_targets]
+    if len(diameters) != len(targets):
+        raise ValueError(
+            f'internal radial diameter count mismatch: {len(diameters)} diameter(s) for '
+            f'{len(targets)} target(s)'
+        )
+    requested = _parse_float_list(requested_values)
+    for value in requested:
+        if float(value) < 0.0:
+            raise ValueError('--azimuth_angle values must be >= 0')
+    if not targets:
+        return []
+    if not requested:
+        return [radial_full_coverage_angle_deg(int(d)) for d in diameters]
+    if len(requested) == 1:
+        return [float(requested[0])] * len(targets)
+    if len(requested) != len(targets):
+        raise ValueError(
+            f'--azimuth_angle supplied {len(requested)} values for {len(targets)} '
+            '--enable_radial values; provide one value to broadcast or matching counts'
+        )
+    return [float(v) for v in requested]
 
 
 def ffmpeg_rawvideo_writer(
@@ -4414,6 +4524,7 @@ def view_processing_search_angle(
 # --------------------------
 
 TILTED_VIEW_FAMILY = 'tilted'
+RADIAL_VIEW_FAMILY = 'radial'
 
 
 @dataclass(frozen=True)
@@ -4442,17 +4553,49 @@ class ViewInfo:
     horizontal_axis: str = ''
     vertical_axis: str = ''
     stack_axis: str = ''
+    # v16.0.0 Radial orientation/source metadata. ``radial_base_view`` names the
+    # Cartesian coordinate system whose in-plane circle is transformed. A tilted
+    # Radial view carries the selected concrete Tilted variant in the remaining fields.
+    radial_base_view: str = ''
+    radial_tilted_source: bool = False
+    radial_source_view_name: str = ''
+    radial_request_token: str = ''
 
 
 def is_tilted_view(view: ViewInfo) -> bool:
-    """Return True for v12.2.0 generalized Tilted Views."""
+    """Return True for a concrete generalized Tilted Cartesian view."""
     return str(view.family) == TILTED_VIEW_FAMILY
+
+
+def is_radial_view(view: ViewInfo) -> bool:
+    return str(view.family) == RADIAL_VIEW_FAMILY
+
+
+def is_tilted_radial_view(view: ViewInfo) -> bool:
+    return bool(is_radial_view(view) and bool(view.radial_tilted_source))
 
 
 def tilted_base_view_name(view: ViewInfo) -> str:
     if str(view.tilt_base_view):
         return str(view.tilt_base_view)
     return str(view.name)
+
+
+def radial_base_view_name(view: ViewInfo) -> str:
+    if not is_radial_view(view):
+        raise ValueError(f'Radial base requested for non-radial view {view.name!r}')
+    base = str(view.radial_base_view or view.tilt_base_view or 'transverse').strip().lower()
+    if base not in CARTESIAN_VIEW_TOKENS:
+        raise ValueError(f'Unsupported Radial base view: {base!r}')
+    return base
+
+
+def radial_target_base_view(token: str) -> str:
+    target = str(token).strip().lower()
+    base = target[len('tilted_'):] if target.startswith('tilted_') else target
+    if base not in CARTESIAN_VIEW_TOKENS:
+        raise ValueError(f'Unsupported Radial target {token!r}')
+    return base
 
 
 def cartesian_view_axis_spec(base_view: str, T: int, H: int, W: int) -> Dict[str, object]:
@@ -4496,8 +4639,55 @@ def cartesian_view_axis_spec(base_view: str, T: int, H: int, W: int) -> Dict[str
     raise ValueError(f'Unsupported Cartesian base view: {base_view}')
 
 
+def radial_plane_shape(view: ViewInfo) -> Tuple[int, int]:
+    """Physical working-grid (plane_h, plane_w) containing this Radial circle."""
+    spec = cartesian_view_axis_spec(
+        radial_base_view_name(view), int(view.full_t), int(view.full_h), int(view.full_w),
+    )
+    return int(spec['src_h']), int(spec['src_w'])
+
+
+def radial_stack_length(view: ViewInfo) -> int:
+    spec = cartesian_view_axis_spec(
+        radial_base_view_name(view), int(view.full_t), int(view.full_h), int(view.full_w),
+    )
+    return int(spec['num_slices'])
+
+
+def radial_target_diameter(token: str, T: int, H: int, W: int) -> int:
+    base = radial_target_base_view(str(token))
+    spec = cartesian_view_axis_spec(base, int(T), int(H), int(W))
+    return int(min(int(spec['src_h']), int(spec['src_w'])))
+
+
+def radial_resident_gpu_render_supported(view: ViewInfo) -> bool:
+    """Reference Torch resident rendering supports every non-tilted Radial base."""
+    return bool(is_radial_view(view) and not is_tilted_radial_view(view))
+
+
+def radial_streaming_gpu_render_supported(view: ViewInfo) -> bool:
+    """The retained t-block streaming prerender is specific to the old transverse Radial layout."""
+    return bool(
+        is_radial_view(view)
+        and not is_tilted_radial_view(view)
+        and radial_base_view_name(view) == 'transverse'
+    )
+
+
+def radial_fused_render_supported(view: ViewInfo) -> bool:
+    """The P4 direct-to-binding kernel retains the exact old transverse Radial contract."""
+    return radial_streaming_gpu_render_supported(view)
+
+
+def radial_sink_only_projection_supported(view: ViewInfo) -> bool:
+    """Current block-fused cvol projection is t-major and therefore transverse-only."""
+    return radial_streaming_gpu_render_supported(view)
+
+
 def tilted_stack_axis_length(view: ViewInfo) -> int:
-    axis = str(view.stack_axis or cartesian_view_axis_spec(tilted_base_view_name(view), view.full_t, view.full_h, view.full_w)['stack_axis'])
+    axis = str(view.stack_axis or cartesian_view_axis_spec(
+        tilted_base_view_name(view), view.full_t, view.full_h, view.full_w,
+    )['stack_axis'])
     if axis == 't':
         return int(view.full_t)
     if axis == 'y':
@@ -4545,146 +4735,60 @@ def view_output_token(view: ViewInfo) -> str:
         base = str(tilted_base_view_name(view)).capitalize()
         direction = str(view.tilt_direction or 'vertical').capitalize()
         return f'Tilted{base}_{direction}_{_format_signed_angle_token(float(view.tilt_angle_deg))}'
+    if is_radial_view(view):
+        base = str(radial_base_view_name(view)).capitalize()
+        if is_tilted_radial_view(view):
+            direction = str(view.tilt_direction or 'vertical').capitalize()
+            return (
+                f'RadialTilted{base}_{direction}_'
+                f'{_format_signed_angle_token(float(view.tilt_angle_deg))}'
+            )
+        return 'Radial' if base == 'Transverse' else f'Radial{base}'
     return pretty_view_name(view).replace(' ', '_')
 
 
-def get_view_infos(
+def _build_cartesian_view(base_view: str, T: int, H: int, W: int) -> ViewInfo:
+    spec = cartesian_view_axis_spec(str(base_view), int(T), int(H), int(W))
+    return ViewInfo(
+        name=str(spec['name']),
+        num_slices=int(spec['num_slices']),
+        src_h=int(spec['src_h']),
+        src_w=int(spec['src_w']),
+        pad_mode='clamp',
+        family='orthogonal',
+        summary_family=str(spec['summary_family']),
+        display_name=str(spec['display_name']),
+        full_t=int(T),
+        full_h=int(H),
+        full_w=int(W),
+        tilt_base_view=str(base_view),
+        horizontal_axis=str(spec['horizontal_axis']),
+        vertical_axis=str(spec['vertical_axis']),
+        stack_axis=str(spec['stack_axis']),
+    )
+
+
+def _build_tilted_view_infos(
     T: int,
     H: int,
     W: int,
-    disable_multiplanar: Optional[bool] = None,
-    azimuth_angle: float = 0.0,
-    include_radial: bool = True,
-    tilt_views: Optional[Sequence[str]] = None,
-    tilt_angles: Optional[Sequence[float]] = None,
-    tilt_directions: Optional[Sequence[str]] = None,
-    enable_sagittal: bool = False,
-    enable_coronal: bool = False,
-    radial_native_raster: int = 0,
+    *,
+    tilt_views: Sequence[str],
+    tilt_angles: Sequence[float],
+    tilt_directions: Sequence[str],
 ) -> List[ViewInfo]:
-    # Backward-compatible alias for older command lines; v12.2.0 controls Sagittal and
-    # Coronal independently via --enable_sagittal and --enable_coronal.
-    if disable_multiplanar is not None:
-        enable_sagittal = bool(enable_sagittal or (not bool(disable_multiplanar)))
-        enable_coronal = bool(enable_coronal or (not bool(disable_multiplanar)))
-
-    transverse_spec = cartesian_view_axis_spec('transverse', T, H, W)
-    views = [
-        ViewInfo(
-            name=str(transverse_spec['name']),
-            num_slices=int(transverse_spec['num_slices']),
-            src_h=int(transverse_spec['src_h']),
-            src_w=int(transverse_spec['src_w']),
-            pad_mode='clamp',
-            family='orthogonal',
-            summary_family=str(transverse_spec['summary_family']),
-            display_name=str(transverse_spec['display_name']),
-            full_t=T,
-            full_h=H,
-            full_w=W,
-            tilt_base_view='transverse',
-            horizontal_axis=str(transverse_spec['horizontal_axis']),
-            vertical_axis=str(transverse_spec['vertical_axis']),
-            stack_axis=str(transverse_spec['stack_axis']),
-        ),
-    ]
-    if bool(enable_sagittal):
-        spec = cartesian_view_axis_spec('sagittal', T, H, W)
-        views.append(ViewInfo(
-            name=str(spec['name']),
-            num_slices=int(spec['num_slices']),
-            src_h=int(spec['src_h']),
-            src_w=int(spec['src_w']),
-            pad_mode='clamp',
-            family='orthogonal',
-            summary_family=str(spec['summary_family']),
-            display_name=str(spec['display_name']),
-            full_t=T,
-            full_h=H,
-            full_w=W,
-            tilt_base_view='sagittal',
-            horizontal_axis=str(spec['horizontal_axis']),
-            vertical_axis=str(spec['vertical_axis']),
-            stack_axis=str(spec['stack_axis']),
-        ))
-    if bool(enable_coronal):
-        spec = cartesian_view_axis_spec('coronal', T, H, W)
-        views.append(ViewInfo(
-            name=str(spec['name']),
-            num_slices=int(spec['num_slices']),
-            src_h=int(spec['src_h']),
-            src_w=int(spec['src_w']),
-            pad_mode='clamp',
-            family='orthogonal',
-            summary_family=str(spec['summary_family']),
-            display_name=str(spec['display_name']),
-            full_t=T,
-            full_h=H,
-            full_w=W,
-            tilt_base_view='coronal',
-            horizontal_axis=str(spec['horizontal_axis']),
-            vertical_axis=str(spec['vertical_axis']),
-            stack_axis=str(spec['stack_axis']),
-        ))
-
-    if include_radial and float(azimuth_angle) > 0.0:
-        azimuths = tuple(build_radial_azimuths(float(azimuth_angle)))
-        diameter = int(min(W, H))
-        roi_radius = float(max(0.0, (diameter - 1) / 2.0))
-        # v13.2.5 (speed #1): fold the --imgsz downscale into the radial sampling raster.
-        # When radial_native_raster (= --imgsz) is smaller than the native pitch, the radial
-        # view's native frame is sampled DIRECTLY at (raster t-rows x raster u-samples) —
-        # Lanczos-3 taps at the coarser u pitch plus a linear t-row lerp — instead of
-        # rendering the full (T x diameter) frame and warping it down to --imgsz afterwards.
-        # This removes one full interpolation pass per radial frame, makes the angle-0 model
-        # render an identity (speed #10), and shrinks every downstream radial-native volume.
-        # diameter/roi_radius/azimuth spacing stay in PHYSICAL working pixels.
-        raster = int(radial_native_raster)
-        radial_rows = int(min(T, raster)) if raster > 0 else int(T)
-        radial_u = int(min(diameter, raster)) if raster > 0 else int(diameter)
-        views.append(
-            ViewInfo(
-                name='radial',
-                num_slices=len(azimuths),
-                src_h=radial_rows,
-                src_w=radial_u,
-                pad_mode='pad',
-                family='radial',
-                summary_family='radial',
-                display_name='Radial',
-                full_t=T,
-                azimuths_deg=azimuths,
-                diameter=diameter,
-                center_x=float((W - 1) / 2.0),
-                center_y=float((H - 1) / 2.0),
-                roi_radius=roi_radius,
-                full_h=H,
-                full_w=W,
-                horizontal_axis='r',
-                vertical_axis='t',
-                stack_axis='azimuth',
-            )
-        )
-
-    # Scheduling order in v12.2.0 is Cartesian upright views, then Radial, then Tilted.
-    # Tilted variants themselves are deterministic: base view Transverse/Sagittal/Coronal,
-    # direction horizontal/vertical, signed angle positive/negative, angle value ascending.
-    tilt_angles_resolved = sorted({float(a) for a in (tilt_angles or []) if float(a) > 0.0})
-    requested_dirs = set(resolve_tilt_directions(tilt_directions if tilt_directions is not None else ['vertical']))
-    tilt_dirs_resolved = [d for d in ('horizontal', 'vertical') if d in requested_dirs]
-    tilt_views_requested = set(resolve_tilt_views(tilt_views if tilt_views is not None else ['transverse']))
-    tilt_views_resolved = [base for base in ('transverse', 'sagittal', 'coronal') if base in tilt_views_requested]
-    for base_view in tilt_views_resolved:
-        spec = cartesian_view_axis_spec(str(base_view), T, H, W)
-        for tilt_direction in tilt_dirs_resolved:
-            for tilt_angle in tilt_angles_resolved:
+    out: List[ViewInfo] = []
+    angles = [float(a) for a in tilt_angles if float(a) > 0.0]
+    for base_view in tilt_views:
+        spec = cartesian_view_axis_spec(str(base_view), int(T), int(H), int(W))
+        for tilt_direction in tilt_directions:
+            for tilt_angle in angles:
                 for sign in (+1.0, -1.0):
                     signed_angle = float(sign * tilt_angle)
                     token = _format_signed_angle_token(signed_angle)
-                    tilt_frame_start, tilt_frame_stop = 0, int(spec['num_slices']) - 1
                     base_label = str(spec['display_name'])
                     direction_label = str(tilt_direction).capitalize()
-                    views.append(ViewInfo(
+                    out.append(ViewInfo(
                         name=f'tilted_{base_view}_{tilt_direction}_{token}',
                         num_slices=int(spec['num_slices']),
                         src_h=int(spec['src_h']),
@@ -4692,21 +4796,203 @@ def get_view_infos(
                         pad_mode='clamp',
                         family=TILTED_VIEW_FAMILY,
                         summary_family=f'tilted_{base_view}_{tilt_direction}_{token}',
-                        display_name=f'Tilted {base_label} {direction_label} {_format_signed_angle_label(signed_angle)}',
-                        full_t=T,
-                        full_h=H,
-                        full_w=W,
+                        display_name=(
+                            f'Tilted {base_label} {direction_label} '
+                            f'{_format_signed_angle_label(signed_angle)}'
+                        ),
+                        full_t=int(T),
+                        full_h=int(H),
+                        full_w=int(W),
                         tilt_angle_deg=signed_angle,
                         tilt_direction=str(tilt_direction),
-                        tilt_frame_start=int(tilt_frame_start),
-                        tilt_frame_stop=int(tilt_frame_stop),
+                        tilt_frame_start=0,
+                        tilt_frame_stop=int(spec['num_slices']) - 1,
                         tilt_base_view=str(base_view),
                         horizontal_axis=str(spec['horizontal_axis']),
                         vertical_axis=str(spec['vertical_axis']),
                         stack_axis=str(spec['stack_axis']),
                     ))
+    return out
 
-    return views
+
+def _build_radial_view_info(
+    T: int,
+    H: int,
+    W: int,
+    *,
+    base_view: str,
+    azimuth_angle: float,
+    radial_native_raster: int,
+    request_token: str,
+    tilted_source: Optional[ViewInfo] = None,
+) -> ViewInfo:
+    spec = cartesian_view_axis_spec(str(base_view), int(T), int(H), int(W))
+    plane_h = int(spec['src_h'])
+    plane_w = int(spec['src_w'])
+    stack_len = int(spec['num_slices'])
+    diameter = int(min(plane_w, plane_h))
+    roi_radius = float(max(0.0, (diameter - 1) / 2.0))
+    raster = int(radial_native_raster)
+    radial_rows = int(min(stack_len, raster)) if raster > 0 else int(stack_len)
+    radial_u = int(min(diameter, raster)) if raster > 0 else int(diameter)
+    azimuths = tuple(build_radial_azimuths(float(azimuth_angle)))
+
+    if tilted_source is None:
+        name = 'radial' if str(base_view) == 'transverse' else f'radial_{base_view}'
+        display_name = 'Radial' if str(base_view) == 'transverse' else f'Radial {str(spec["display_name"])}'
+        tilt_angle = 0.0
+        tilt_direction = ''
+        source_name = ''
+        radial_tilted = False
+    else:
+        name = f'radial_{tilted_source.name}'
+        display_name = f'Radial {pretty_view_name(tilted_source)}'
+        tilt_angle = float(tilted_source.tilt_angle_deg)
+        tilt_direction = str(tilted_source.tilt_direction)
+        source_name = str(tilted_source.name)
+        radial_tilted = True
+
+    return ViewInfo(
+        name=name,
+        num_slices=len(azimuths),
+        src_h=int(radial_rows),
+        src_w=int(radial_u),
+        pad_mode='pad',
+        family=RADIAL_VIEW_FAMILY,
+        summary_family=name,
+        display_name=display_name,
+        full_t=int(T),
+        full_h=int(H),
+        full_w=int(W),
+        azimuths_deg=azimuths,
+        diameter=int(diameter),
+        center_x=float((plane_w - 1) / 2.0),
+        center_y=float((plane_h - 1) / 2.0),
+        roi_radius=float(roi_radius),
+        tilt_angle_deg=float(tilt_angle),
+        tilt_direction=str(tilt_direction),
+        tilt_frame_start=0,
+        tilt_frame_stop=int(stack_len) - 1,
+        tilt_base_view=str(base_view),
+        horizontal_axis='r',
+        vertical_axis=str(spec['stack_axis']),
+        stack_axis='azimuth',
+        radial_base_view=str(base_view),
+        radial_tilted_source=bool(radial_tilted),
+        radial_source_view_name=str(source_name),
+        radial_request_token=str(request_token),
+    )
+
+
+def radial_source_tilted_view(view: ViewInfo) -> ViewInfo:
+    """Reconstruct the concrete Tilted view underlying a tilted Radial transform."""
+    if not is_tilted_radial_view(view):
+        raise ValueError(f'{view.name!r} is not a tilted Radial view')
+    base = radial_base_view_name(view)
+    spec = cartesian_view_axis_spec(base, int(view.full_t), int(view.full_h), int(view.full_w))
+    token = _format_signed_angle_token(float(view.tilt_angle_deg))
+    name = str(view.radial_source_view_name or f'tilted_{base}_{view.tilt_direction}_{token}')
+    return ViewInfo(
+        name=name,
+        num_slices=int(spec['num_slices']),
+        src_h=int(spec['src_h']),
+        src_w=int(spec['src_w']),
+        pad_mode='clamp',
+        family=TILTED_VIEW_FAMILY,
+        summary_family=name,
+        display_name=(
+            f'Tilted {str(spec["display_name"])} {str(view.tilt_direction).capitalize()} '
+            f'{_format_signed_angle_label(float(view.tilt_angle_deg))}'
+        ),
+        full_t=int(view.full_t),
+        full_h=int(view.full_h),
+        full_w=int(view.full_w),
+        tilt_angle_deg=float(view.tilt_angle_deg),
+        tilt_direction=str(view.tilt_direction),
+        tilt_frame_start=int(view.tilt_frame_start),
+        tilt_frame_stop=int(view.tilt_frame_stop),
+        tilt_base_view=base,
+        horizontal_axis=str(spec['horizontal_axis']),
+        vertical_axis=str(spec['vertical_axis']),
+        stack_axis=str(spec['stack_axis']),
+    )
+
+
+def get_view_infos(
+    T: int,
+    H: int,
+    W: int,
+    *,
+    cartesian_views: Optional[Sequence[str]] = None,
+    radial_views: Optional[Sequence[str]] = None,
+    radial_azimuth_angles: Optional[Sequence[float]] = None,
+    tilt_views: Optional[Sequence[str]] = None,
+    tilt_angles: Optional[Sequence[float]] = None,
+    tilt_directions: Optional[Sequence[str]] = None,
+    radial_native_raster: int = 0,
+) -> List[ViewInfo]:
+    """Build the complete v16 view set without any implicit Cartesian/Tilted/Radial view."""
+    enabled_cartesian = resolve_cartesian_views(cartesian_views)
+    enabled_tilted = resolve_tilt_views(tilt_views)
+    enabled_radial = resolve_radial_views(radial_views)
+    resolved_tilt_angles = resolve_tilt_angles(tilt_angles)
+    resolved_tilt_directions = resolve_tilt_directions(tilt_directions)
+    azimuths = [float(v) for v in (radial_azimuth_angles or [])]
+    if len(azimuths) != len(enabled_radial):
+        raise ValueError(
+            f'get_view_infos received {len(azimuths)} radial azimuth value(s) for '
+            f'{len(enabled_radial)} Radial target(s)'
+        )
+
+    orthogonal = [
+        _build_cartesian_view(base, int(T), int(H), int(W))
+        for base in enabled_cartesian
+    ]
+    tilted = _build_tilted_view_infos(
+        int(T), int(H), int(W),
+        tilt_views=enabled_tilted,
+        tilt_angles=resolved_tilt_angles,
+        tilt_directions=resolved_tilt_directions,
+    )
+
+    radial_cartesian: List[ViewInfo] = []
+    radial_tilted: List[ViewInfo] = []
+    for target, angle in zip(enabled_radial, azimuths):
+        if float(angle) <= 0.0:
+            print(f'Radial target {target!r} skipped because its resolved --azimuth_angle is 0.')
+            continue
+        base = radial_target_base_view(target)
+        if not str(target).startswith('tilted_'):
+            radial_cartesian.append(_build_radial_view_info(
+                int(T), int(H), int(W),
+                base_view=base,
+                azimuth_angle=float(angle),
+                radial_native_raster=int(radial_native_raster),
+                request_token=str(target),
+                tilted_source=None,
+            ))
+            continue
+
+        matching = [v for v in tilted if tilted_base_view_name(v) == base]
+        if not matching:
+            print(
+                f'Radial target {target!r} skipped: no {base} Tilted variants are enabled. '
+                f'Add --enable_tilted {base} with a non-zero --tilt_angle to generate it.'
+            )
+            continue
+        for source_view in matching:
+            radial_tilted.append(_build_radial_view_info(
+                int(T), int(H), int(W),
+                base_view=base,
+                azimuth_angle=float(angle),
+                radial_native_raster=int(radial_native_raster),
+                request_token=str(target),
+                tilted_source=source_view,
+            ))
+
+    # Preserve the historical broad scheduling shape: upright Cartesian, Cartesian Radial,
+    # concrete Tilted variants, then Radial transforms of those Tilted variants.
+    return orthogonal + radial_cartesian + tilted + radial_tilted
 
 
 def orthogonal_views_only(views: Sequence[ViewInfo]) -> List[ViewInfo]:
@@ -4725,7 +5011,7 @@ class RadialSampler:
     nn_y: np.ndarray
 
 
-_RADIAL_SAMPLER_CACHE: Dict[Tuple[int, int, int, float], RadialSampler] = {}
+_RADIAL_SAMPLER_CACHE: Dict[Tuple[object, ...], RadialSampler] = {}
 
 RADIAL_LANCZOS_A = 3
 
@@ -4748,14 +5034,19 @@ def _lanczos_tap_count(a: int = RADIAL_LANCZOS_A) -> int:
 
 
 def get_radial_sampler(view: ViewInfo, angle_deg: float) -> RadialSampler:
-    if view.family != 'radial':
+    if not is_radial_view(view):
         raise ValueError('Radial sampler requested for a non-radial view')
 
-    # v13.2.5 (speed #1): the u sample count is the radial view's native raster width
-    # (view.src_w, which folds the --imgsz downscale in); view.diameter stays the physical
-    # working-pixel diameter that positions the taps along the full ROI diameter.
+    # v16.0.0: the circle lives in the selected Cartesian/Tilted projected plane,
+    # not unconditionally in global XY. ``center_x/center_y`` and the Lanczos taps
+    # therefore use that base plane's (horizontal, vertical) coordinate system.
+    plane_h, plane_w = radial_plane_shape(view)
     n_u = int(view.src_w) if int(view.src_w) > 0 else int(view.diameter)
-    key = (int(view.full_w), int(view.full_h), int(view.diameter), int(n_u), round(float(angle_deg), 6))
+    key = (
+        radial_base_view_name(view), int(plane_h), int(plane_w), int(view.diameter), int(n_u),
+        round(float(view.center_x), 6), round(float(view.center_y), 6),
+        round(float(view.roi_radius), 6), round(float(angle_deg), 6),
+    )
     cached = _RADIAL_SAMPLER_CACHE.get(key)
     if cached is not None:
         return cached
@@ -4776,23 +5067,18 @@ def get_radial_sampler(view: ViewInfo, angle_deg: float) -> RadialSampler:
     x_w = _lanczos_kernel(xs[:, None] - x_idx_raw, a=RADIAL_LANCZOS_A)
     y_w = _lanczos_kernel(ys[:, None] - y_idx_raw, a=RADIAL_LANCZOS_A)
 
-    x_valid = (x_idx_raw >= 0) & (x_idx_raw < int(view.full_w))
-    y_valid = (y_idx_raw >= 0) & (y_idx_raw < int(view.full_h))
+    x_valid = (x_idx_raw >= 0) & (x_idx_raw < int(plane_w))
+    y_valid = (y_idx_raw >= 0) & (y_idx_raw < int(plane_h))
     x_w *= x_valid.astype(np.float32, copy=False)
     y_w *= y_valid.astype(np.float32, copy=False)
 
-    # v13.2.4 (task #3): renormalize each sample's separable taps after out-of-bounds zeroing.
-    # The windowed-sinc taps do not sum exactly to 1 even fully in-bounds, and zeroing the
-    # out-of-bounds taps at the diameter endpoints (which land on the image edge for a centered
-    # ROI) previously left the boundary samples summing to < 1, darkening the first/last pixels
-    # of every radial line. Rows whose taps are all out-of-bounds stay zero (black fill).
     x_w_sum = np.sum(x_w, axis=1, keepdims=True)
     np.divide(x_w, x_w_sum, out=x_w, where=np.abs(x_w_sum) > 1e-6)
     y_w_sum = np.sum(y_w, axis=1, keepdims=True)
     np.divide(y_w, y_w_sum, out=y_w, where=np.abs(y_w_sum) > 1e-6)
 
-    x_idx = np.clip(x_idx_raw, 0, int(view.full_w) - 1).astype(np.int32, copy=False)
-    y_idx = np.clip(y_idx_raw, 0, int(view.full_h) - 1).astype(np.int32, copy=False)
+    x_idx = np.clip(x_idx_raw, 0, int(plane_w) - 1).astype(np.int32, copy=False)
+    y_idx = np.clip(y_idx_raw, 0, int(plane_h) - 1).astype(np.int32, copy=False)
 
     sampler = RadialSampler(
         angle_deg=float(angle_deg),
@@ -4801,8 +5087,8 @@ def get_radial_sampler(view: ViewInfo, angle_deg: float) -> RadialSampler:
         y_idx=y_idx,
         x_w=x_w.astype(np.float32, copy=False),
         y_w=y_w.astype(np.float32, copy=False),
-        nn_x=np.clip(np.rint(xs).astype(np.int32, copy=False), 0, int(view.full_w) - 1),
-        nn_y=np.clip(np.rint(ys).astype(np.int32, copy=False), 0, int(view.full_h) - 1),
+        nn_x=np.clip(np.rint(xs).astype(np.int32, copy=False), 0, int(plane_w) - 1),
+        nn_y=np.clip(np.rint(ys).astype(np.int32, copy=False), 0, int(plane_h) - 1),
     )
     _RADIAL_SAMPLER_CACHE[key] = sampler
     return sampler
@@ -4840,51 +5126,161 @@ def _radial_sampler_flat_taps(sampler: RadialSampler, image_w: int) -> Tuple[np.
     return flat_idx, w2d
 
 
+def radial_oriented_stack_view(volume_rgb: np.ndarray, view: ViewInfo) -> np.ndarray:
+    """Return a logical ``(stack, plane_v, plane_u)`` view for a Cartesian Radial base."""
+    arr = np.asarray(volume_rgb)
+    if arr.ndim != 3:
+        raise ValueError(f'Radial source volume must be 3D, got {arr.shape}')
+    base = radial_base_view_name(view)
+    if base == 'transverse':
+        return arr
+    if base == 'sagittal':
+        # stack Y; in-plane axes (t, X)
+        return np.transpose(arr, (1, 0, 2))
+    if base == 'coronal':
+        # stack X; in-plane axes (t, Y)
+        return np.transpose(arr, (2, 0, 1))
+    raise ValueError(f'Unsupported Radial base: {base}')
+
+
 def extract_radial_slice_frame(
     volume_rgb: np.ndarray,
     sampler: RadialSampler,
     out_rows: Optional[int] = None,
 ) -> np.ndarray:
-    """Extract one radial diameter frame.
-
-    v13.2.5 (speed #1/#2): the u axis is Lanczos-3 sampled at the sampler's raster pitch via a
-    single flat gather + einsum per t block; when ``out_rows`` folds the t axis (radial native
-    raster < native t), native rows are reduced to ``out_rows`` with the same center-aligned
-    linear interpolation cv2.warpAffine previously applied when scaling the frame to --imgsz.
-    """
-    t_dim = int(volume_rgb.shape[0])
+    """Extract one diameter frame from a logical ``(stack, plane_v, plane_u)`` volume."""
+    stack_dim = int(volume_rgb.shape[0])
     u_len = int(sampler.diameter)
-    rows = int(out_rows) if out_rows is not None and int(out_rows) > 0 else t_dim
-    fold_t = int(rows) != int(t_dim)
+    rows = int(out_rows) if out_rows is not None and int(out_rows) > 0 else stack_dim
+    fold_stack = int(rows) != int(stack_dim)
 
     image_w = int(volume_rgb.shape[2])
     flat_idx, w2d = _radial_sampler_flat_taps(sampler, image_w)
     block_frames = choose_radial_exact_block_frames(u_len)
 
     plane_len = int(volume_rgb.shape[1]) * image_w
-    proj = np.empty((t_dim, u_len), dtype=np.float32) if fold_t else None
-    out = None if fold_t else np.empty((t_dim, u_len), dtype=np.uint8)
+    proj = np.empty((stack_dim, u_len), dtype=np.float32) if fold_stack else None
+    out = None if fold_stack else np.empty((stack_dim, u_len), dtype=np.uint8)
 
-    for start in range(0, t_dim, block_frames):
-        stop = min(t_dim, start + block_frames)
-        block2d = np.asarray(volume_rgb[start:stop]).reshape(stop - start, plane_len)
+    for start_idx in range(0, stack_dim, block_frames):
+        stop_idx = min(stack_dim, start_idx + block_frames)
+        # Sagittal/Coronal orientation views are strided. Materialize only this bounded
+        # stack block contiguously so the 36-tap gather remains vectorized.
+        block2d = np.ascontiguousarray(volume_rgb[start_idx:stop_idx]).reshape(
+            stop_idx - start_idx, plane_len,
+        )
         samples = block2d[:, flat_idx].astype(np.float32, copy=False)
         acc = np.einsum('tuk,uk->tu', samples, w2d)
-        if fold_t:
-            proj[start:stop, :] = acc
+        if fold_stack:
+            proj[start_idx:stop_idx, :] = acc
         else:
-            out[start:stop, :] = np.clip(np.rint(acc), 0.0, 255.0).astype(np.uint8)
+            out[start_idx:stop_idx, :] = np.clip(np.rint(acc), 0.0, 255.0).astype(np.uint8)
 
-    if not fold_t:
+    if not fold_stack:
         return out
 
-    # Center-aligned linear t reduction (matches the former warpAffine INTER_LINEAR scale).
-    rf = (np.arange(rows, dtype=np.float64) + 0.5) * (float(t_dim) / float(rows)) - 0.5
-    r0 = np.clip(np.floor(rf).astype(np.int64), 0, t_dim - 1)
-    r1 = np.minimum(r0 + 1, t_dim - 1)
+    # Center-aligned linear reduction of the selected Radial base's stack axis.
+    rf = (np.arange(rows, dtype=np.float64) + 0.5) * (float(stack_dim) / float(rows)) - 0.5
+    r0 = np.clip(np.floor(rf).astype(np.int64), 0, stack_dim - 1)
+    r1 = np.minimum(r0 + 1, stack_dim - 1)
     alpha = np.clip(rf - r0, 0.0, 1.0).astype(np.float32)[:, None]
     folded = proj[r0] * (np.float32(1.0) - alpha) + proj[r1] * alpha
     return np.clip(np.rint(folded), 0.0, 255.0).astype(np.uint8)
+
+
+def _tilted_radial_row_centers(stack_len: int, rows: int) -> np.ndarray:
+    if int(rows) == int(stack_len):
+        return np.arange(int(stack_len), dtype=np.float32)
+    coords = (np.arange(int(rows), dtype=np.float64) + 0.5) * (
+        float(stack_len) / float(rows)
+    ) - 0.5
+    return np.clip(coords, 0.0, float(max(0, int(stack_len) - 1))).astype(np.float32)
+
+
+def extract_tilted_radial_slice_frame(
+    volume_rgb: np.ndarray,
+    view: ViewInfo,
+    sampler: RadialSampler,
+    out_rows: Optional[int] = None,
+) -> np.ndarray:
+    """Render one Radial transform of a concrete Tilted view directly from the volume.
+
+    The output is circular in the Tilted projected plane. For every diameter tap, the
+    same signed stacking-axis shear used by the underlying Tilted view is applied before
+    a two-tap stack interpolation. The 36 Lanczos-3 in-plane taps are accumulated without
+    materializing thousands of full Tilted frames.
+    """
+    if not is_tilted_radial_view(view):
+        raise ValueError('Tilted Radial renderer requires a tilted Radial view')
+    arr = np.asarray(volume_rgb)
+    if arr.ndim != 3:
+        raise ValueError(f'Tilted Radial source volume must be 3D, got {arr.shape}')
+
+    base = radial_base_view_name(view)
+    stack_len = int(radial_stack_length(view))
+    rows = int(out_rows) if out_rows is not None and int(out_rows) > 0 else stack_len
+    row_centers = _tilted_radial_row_centers(stack_len, rows)
+    u_len = int(sampler.diameter)
+    tap_count = int(sampler.x_idx.shape[1]) * int(sampler.y_idx.shape[1])
+
+    x_taps = np.broadcast_to(
+        sampler.x_idx[:, None, :],
+        (u_len, int(sampler.y_idx.shape[1]), int(sampler.x_idx.shape[1])),
+    ).reshape(u_len, tap_count)
+    y_taps = np.broadcast_to(
+        sampler.y_idx[:, :, None],
+        (u_len, int(sampler.y_idx.shape[1]), int(sampler.x_idx.shape[1])),
+    ).reshape(u_len, tap_count)
+    weights = (
+        sampler.y_w[:, :, None].astype(np.float32, copy=False)
+        * sampler.x_w[:, None, :].astype(np.float32, copy=False)
+    ).reshape(u_len, tap_count)
+
+    tan_alpha = np.float32(math.tan(math.radians(float(view.tilt_angle_deg))))
+    if str(view.tilt_direction) == 'vertical':
+        tap_offsets = y_taps.astype(np.float32, copy=False) - np.float32(view.center_y)
+    elif str(view.tilt_direction) == 'horizontal':
+        tap_offsets = x_taps.astype(np.float32, copy=False) - np.float32(view.center_x)
+    else:
+        raise ValueError(f'Unsupported Tilted Radial direction: {view.tilt_direction!r}')
+
+    out = np.empty((rows, u_len), dtype=np.uint8)
+    block_rows = max(1, _env_int('YOLO_TTA_TILTED_RADIAL_ROW_BLOCK', 16))
+    for row0 in range(0, rows, block_rows):
+        row1 = min(rows, row0 + block_rows)
+        centers = row_centers[row0:row1, None]
+        acc = np.zeros((row1 - row0, u_len), dtype=np.float32)
+        for tap_idx in range(tap_count):
+            weight = weights[:, tap_idx]
+            if not np.any(weight):
+                continue
+            px = x_taps[:, tap_idx]
+            py = y_taps[:, tap_idx]
+            stack_src = centers + tan_alpha * tap_offsets[:, tap_idx][None, :]
+            valid = (stack_src >= 0.0) & (stack_src <= float(stack_len - 1))
+            if not np.any(valid):
+                continue
+            s0 = np.clip(np.floor(stack_src).astype(np.int32), 0, stack_len - 1)
+            s1 = np.minimum(s0 + 1, stack_len - 1)
+            alpha = (stack_src - s0).astype(np.float32, copy=False)
+
+            if base == 'transverse':
+                f0 = arr[s0, py[None, :], px[None, :]].astype(np.float32, copy=False)
+                f1 = arr[s1, py[None, :], px[None, :]].astype(np.float32, copy=False)
+            elif base == 'sagittal':
+                f0 = arr[py[None, :], s0, px[None, :]].astype(np.float32, copy=False)
+                f1 = arr[py[None, :], s1, px[None, :]].astype(np.float32, copy=False)
+            elif base == 'coronal':
+                f0 = arr[py[None, :], px[None, :], s0].astype(np.float32, copy=False)
+                f1 = arr[py[None, :], px[None, :], s1].astype(np.float32, copy=False)
+            else:  # pragma: no cover
+                raise ValueError(f'Unsupported Tilted Radial base: {base}')
+
+            values = f0 + alpha * (f1 - f0)
+            values *= valid.astype(np.float32, copy=False)
+            acc += values * weight[None, :]
+        out[row0:row1] = np.clip(np.rint(acc), 0.0, 255.0).astype(np.uint8)
+    return out
 
 
 def _cupy_external_stream(cp: object, torch_stream: object) -> object:
@@ -4928,6 +5324,10 @@ def write_aug_job_meta(
                 'horizontal_axis': str(view.horizontal_axis),
                 'vertical_axis': str(view.vertical_axis),
                 'stack_axis': str(view.stack_axis),
+                'radial_base_view': str(view.radial_base_view),
+                'radial_tilted_source': bool(view.radial_tilted_source),
+                'radial_source_view_name': str(view.radial_source_view_name),
+                'radial_request_token': str(view.radial_request_token),
                 'tilt_frame_start': int(view.tilt_frame_start),
                 'tilt_frame_stop': int(view.tilt_frame_stop),
                 'out_size': int(job.aff.out_size),
@@ -7484,12 +7884,20 @@ def get_view_frame_by_index(
         if volume_rgb.ndim == 3 and bool(volume_rgb.flags['C_CONTIGUOUS']):
             return _coronal_frame_from_block_cache(volume_rgb, int(index))
         return np.ascontiguousarray(volume_rgb[:, :, int(index)])
-    if view.name == 'radial':
+    if is_radial_view(view):
         wait_for_volume_ready(volume_rgb)
         angle_deg = float(view.azimuths_deg[int(index)])
         sampler = get_radial_sampler(view, angle_deg)
-        # v13.2.5 (speed #1): sample directly at the (possibly imgsz-folded) native raster.
-        return np.ascontiguousarray(extract_radial_slice_frame(volume_rgb, sampler, out_rows=int(view.src_h)))
+        if is_tilted_radial_view(view):
+            return np.ascontiguousarray(
+                extract_tilted_radial_slice_frame(
+                    volume_rgb, view, sampler, out_rows=int(view.src_h),
+                )
+            )
+        oriented = radial_oriented_stack_view(volume_rgb, view)
+        return np.ascontiguousarray(
+            extract_radial_slice_frame(oriented, sampler, out_rows=int(view.src_h))
+        )
     if is_tilted_view(view):
         wait_for_volume_ready(volume_rgb)
         return render_tilted_native_frame(volume_rgb, view, int(index))
@@ -7515,7 +7923,7 @@ def load_ultralytics_model(path: str, task: str = 'segment'):
 def background_model_load_enabled() -> bool:
     """Return True when main-process model loading overlaps decode/preparation.
 
-    v15.0.5 enables the overlap by default. Set YOLO_TTA_BACKGROUND_MODEL_LOAD=0
+    v16.0.0 retains the v15.0.5 default overlap. Set YOLO_TTA_BACKGROUND_MODEL_LOAD=0
     only for debugging or backends whose constructor is not safe in a loader thread.
     CUDA runs load inside their persistent GPU workers while the default streaming
     decode producer is active.
@@ -12755,7 +13163,11 @@ class _GpuWorkerRenderEngine:
         stage_metadata: bool = True,
         disable_on_failure: bool = True,
     ) -> bool:
-        if not fused_radial_render_enabled() or 'radial' in self._fused_disabled_families:
+        if (
+            not fused_radial_render_enabled()
+            or 'radial' in self._fused_disabled_families
+            or not radial_fused_render_supported(view)
+        ):
             return False
         try:
             if str(view.family) != 'radial':
@@ -12970,7 +13382,8 @@ class _GpuWorkerRenderEngine:
         )
         if family == 'radial':
             family_geometry: Tuple[object, ...] = (
-                int(view.src_h), int(view.src_w), int(view.full_h), int(view.full_w),
+                radial_base_view_name(view), bool(is_tilted_radial_view(view)),
+                int(view.src_h), int(view.src_w), *radial_plane_shape(view),
                 round(float(view.center_x), 6), round(float(view.center_y), 6),
                 round(float(view.roi_radius), 6),
                 np.ascontiguousarray(np.asarray(view.azimuths_deg, dtype=np.float32)).tobytes(),
@@ -13131,11 +13544,10 @@ class _GpuWorkerRenderEngine:
     # ---- radial taps / fold (device) ----
 
     def _radial_taps_gpu(self, view: ViewInfo, angle_deg: float) -> Tuple[object, object]:
-        """Device port of get_radial_sampler + _radial_sampler_flat_taps for one azimuth."""
+        """Device port of the orientation-aware Radial sampler for one azimuth."""
         torch = self.torch
         dev = self.device
-        full_w = int(view.full_w)
-        full_h = int(view.full_h)
+        plane_h, plane_w = radial_plane_shape(view)
         n_u = int(view.src_w) if int(view.src_w) > 0 else int(view.diameter)
         a = int(RADIAL_LANCZOS_A)
         coords = torch.linspace(
@@ -13152,16 +13564,15 @@ class _GpuWorkerRenderEngine:
         zero = torch.zeros((), dtype=torch.float32, device=dev)
         x_w = torch.where(dx.abs() >= float(a), zero, torch.sinc(dx) * torch.sinc(dx / float(a)))
         y_w = torch.where(dy.abs() >= float(a), zero, torch.sinc(dy) * torch.sinc(dy / float(a)))
-        x_w = x_w * ((x_pos >= 0) & (x_pos < float(full_w))).to(torch.float32)
-        y_w = y_w * ((y_pos >= 0) & (y_pos < float(full_h))).to(torch.float32)
-        # v13.2.4 (task #3): renormalize each sample's separable taps after OOB zeroing.
+        x_w = x_w * ((x_pos >= 0) & (x_pos < float(plane_w))).to(torch.float32)
+        y_w = y_w * ((y_pos >= 0) & (y_pos < float(plane_h))).to(torch.float32)
         x_sum = x_w.sum(dim=1, keepdim=True)
         y_sum = y_w.sum(dim=1, keepdim=True)
         x_w = torch.where(x_sum.abs() > 1e-6, x_w / x_sum, x_w)
         y_w = torch.where(y_sum.abs() > 1e-6, y_w / y_sum, y_w)
-        x_idx = x_pos.clamp(0.0, float(full_w - 1)).to(torch.int64)
-        y_idx = y_pos.clamp(0.0, float(full_h - 1)).to(torch.int64)
-        flat_idx = (y_idx.unsqueeze(2) * int(full_w) + x_idx.unsqueeze(1)).reshape(n_u, -1)
+        x_idx = x_pos.clamp(0.0, float(plane_w - 1)).to(torch.int64)
+        y_idx = y_pos.clamp(0.0, float(plane_h - 1)).to(torch.int64)
+        flat_idx = (y_idx.unsqueeze(2) * int(plane_w) + x_idx.unsqueeze(1)).reshape(n_u, -1)
         w2d = (y_w.unsqueeze(2) * x_w.unsqueeze(1)).reshape(n_u, -1)
         return flat_idx, w2d
 
@@ -13198,21 +13609,52 @@ class _GpuWorkerRenderEngine:
         return (samples.to(self.torch.float32) * w2d.unsqueeze(0)).sum(dim=-1)
 
     def _render_radial_native_resident(self, view: ViewInfo, frame_idx: int) -> object:
+        """Render a non-tilted Radial base directly from the resident source volume."""
+        if not radial_resident_gpu_render_supported(view):
+            raise RuntimeError(
+                f'resident GPU Radial rendering does not support tilted source {view.name!r}'
+            )
         torch = self.torch
         vol = self._volume_gpu
-        t_dim = int(vol.shape[0])
+        base = radial_base_view_name(view)
         rows_out = int(view.src_h)
         u_len = int(view.src_w) if int(view.src_w) > 0 else int(view.diameter)
         flat_idx, w2d = self._radial_taps_gpu(view, float(view.azimuths_deg[int(frame_idx)]))
-        vol2d = vol.view(t_dim, -1)
-        proj = torch.empty((t_dim, u_len), dtype=torch.float32, device=self.device)
-        chunk = 512
-        for t0 in range(0, t_dim, chunk):
-            t1 = min(t_dim, t0 + chunk)
-            proj[t0:t1] = self._radial_project_blocks(view, vol2d[t0:t1], flat_idx, w2d)
-        if rows_out == t_dim:
+
+        if base == 'transverse':
+            native_t = int(vol.shape[0])
+            vol2d = vol.view(native_t, -1)
+            proj = torch.empty((native_t, u_len), dtype=torch.float32, device=self.device)
+            chunk = 512
+            for t0 in range(0, native_t, chunk):
+                t1 = min(native_t, t0 + chunk)
+                proj[t0:t1] = self._radial_project_blocks(view, vol2d[t0:t1], flat_idx, w2d)
+            if rows_out == native_t and int(self._logical_t) == native_t:
+                return proj
+            r0, r1, alpha = self._radial_fold_indices(
+                native_t, rows_out, logical_t=int(self._logical_t),
+            )
+            return proj[r0] * (1.0 - alpha) + proj[r1] * alpha
+
+        stack_len = int(radial_stack_length(view))
+        proj = torch.empty((stack_len, u_len), dtype=torch.float32, device=self.device)
+        block = max(1, _env_int('YOLO_TTA_GPU_RADIAL_STACK_BLOCK', 32))
+        for s0 in range(0, stack_len, block):
+            s1 = min(stack_len, s0 + block)
+            if base == 'sagittal':
+                # source (native_t, Yblock, X) -> logical (Yblock, t, X)
+                oriented = self._resample_native_t_axis(vol[:, s0:s1, :]).permute(1, 0, 2).contiguous()
+            elif base == 'coronal':
+                # source (native_t, Y, Xblock) -> logical (Xblock, t, Y)
+                oriented = self._resample_native_t_axis(vol[:, :, s0:s1]).permute(2, 0, 1).contiguous()
+            else:  # pragma: no cover
+                raise ValueError(f'Unsupported resident Radial base: {base}')
+            proj[s0:s1] = self._radial_project_blocks(
+                view, oriented.view(s1 - s0, -1), flat_idx, w2d,
+            )
+        if rows_out == stack_len:
             return proj
-        r0, r1, alpha = self._radial_fold_indices(t_dim, rows_out, logical_t=int(self._logical_t))
+        r0, r1, alpha = self._radial_fold_indices(stack_len, rows_out)
         return proj[r0] * (1.0 - alpha) + proj[r1] * alpha
 
     def prerender_radial_slab(
@@ -13229,6 +13671,10 @@ class _GpuWorkerRenderEngine:
         the globally clamped center/context indices actually required by the worker task, so
         a large channel stride does not render unused intervening azimuths.
         """
+        if not radial_streaming_gpu_render_supported(view):
+            raise RuntimeError(
+                f'non-resident GPU Radial prerender supports only transverse, got {view.name!r}'
+            )
         torch = self.torch
         t_dim, full_h, full_w = (int(x) for x in self._volume_mm.shape)
         rows_out = int(view.src_h)
@@ -14458,6 +14904,9 @@ def run_prediction_volume_in_worker(
         # never producing a GPU source, also cost tiles the resident TensorRT ring).
         if gpu_engine is not None and str(kind) in ('fullframe', 'tile_group'):
             try:
+                resident_view_supported = bool(
+                    not is_radial_view(view) or radial_resident_gpu_render_supported(view)
+                )
                 if native_resize is not None:
                     # Residency straight from the (smaller, hotter) native volume with the
                     # t-resize on device — no wait on the host cube at all.
@@ -14484,7 +14933,7 @@ def run_prediction_volume_in_worker(
                         tuple(int(x) for x in task['source_shape']),
                         str(task.get('source_dtype', 'uint8')),
                     )
-                if render_mode == 'resident' and tile_group is not None:
+                if render_mode == 'resident' and tile_group is not None and resident_view_supported:
                     request_affine_grid_cache_entries(2 * int(len(tile_group)) + 8)
                     if is_tilted_view(view):
                         gpu_engine.request_tilted_plan_cache_entries(int(len(tile_group)) + 4)
@@ -14500,7 +14949,7 @@ def run_prediction_volume_in_worker(
                         name=f"gpu-render-tilegroup-{view.name}-{task['job_id']}",
                         channel_format=channel_format,
                     )
-                elif render_mode == 'resident':
+                elif render_mode == 'resident' and resident_view_supported:
                     source = GpuRenderedYoloSource(
                         gpu_engine,
                         view,
@@ -14517,7 +14966,7 @@ def run_prediction_volume_in_worker(
                     # Non-resident tile groups fall through to the CPU renderer, which keeps
                     # the same per-frame native-plane reuse (just on the host).
                     source = None
-                elif str(getattr(view, 'family', '')) == 'radial':
+                elif is_radial_view(view) and radial_streaming_gpu_render_supported(view):
                     slab_indices = _radial_slab_context_indices(
                         view, slice_offset, num_frames, channel_format,
                     )
@@ -16939,7 +17388,7 @@ class DenseRadialBackprojectionMap:
     u_idx_map: np.ndarray
 
 
-_DENSE_RADIAL_BACKPROJECT_MAP_CACHE: Dict[Tuple[int, int, int, Tuple[Tuple[float, int, bool], ...]], DenseRadialBackprojectionMap] = {}
+_DENSE_RADIAL_BACKPROJECT_MAP_CACHE: Dict[Tuple[object, ...], DenseRadialBackprojectionMap] = {}
 
 
 def radial_full_coverage_angle_deg(diameter: int) -> float:
@@ -17037,24 +17486,16 @@ def build_dense_radial_backprojection_map(
     *,
     out_shape_hw: Optional[Tuple[int, int]] = None,
 ) -> DenseRadialBackprojectionMap:
-    """Map every Cartesian ROI pixel to its nearest dense radial source frame and radial coordinate.
+    """Map every selected-base-plane pixel to a Radial frame and diameter coordinate.
 
-    This is the dense v12.2.0 backprojection path: instead of painting only the pixels that lie on
-    a set of spokes, every pixel inside the circular ROI receives a sample from the Radial video's
-    own frame/raster coordinate system.  When the user-provided azimuth spacing is too coarse, the
-    supplied ``plan`` is already densified to the full-coverage angular spacing; pixels then select
-    the nearest dense plan angle and that angle's nearest completed source frame.
-
-    v13.2.4 (task #1, ruling A1): ``out_shape_hw`` builds the map directly on the FINAL SOURCE
-    raster instead of the working plane. Source pixel centers are mapped into the working plane
-    analytically with the same center-aligned convention cv2.resize uses, so backprojecting a
-    radial mask straight to source geometry stays a single resample (no intermediate
-    working-geometry volume). ``None`` keeps the historical working-plane map.
+    ``out_shape_hw`` is expressed in the selected Radial base plane: ``(Y,X)`` for
+    transverse, ``(t,X)`` for sagittal, and ``(t,Y)`` for coronal. Building the map
+    directly on the final plane is what turns the working-cube circle into the required
+    ellipse after the source t axis is restored.
     """
-    work_h = int(radial_view.full_h)
-    work_w = int(radial_view.full_w)
+    work_plane_h, work_plane_w = radial_plane_shape(radial_view)
     if out_shape_hw is None:
-        out_h, out_w = work_h, work_w
+        out_h, out_w = int(work_plane_h), int(work_plane_w)
     else:
         out_h, out_w = (int(out_shape_hw[0]), int(out_shape_hw[1]))
     if not plan:
@@ -17064,18 +17505,13 @@ def build_dense_radial_backprojection_map(
             u_idx_map=np.zeros((out_h, out_w), dtype=np.int32),
         )
 
-    # v13.2.5 (speed #1): the radial u raster may be imgsz-folded (view.src_w < diameter);
-    # u indices map the physical signed radius onto that raster, matching the sampler's
-    # linspace(-R, R, src_w) tap positions exactly.
     u_len = int(radial_view.src_w) if int(radial_view.src_w) > 0 else int(radial_view.diameter)
     key = (
-        int(out_h),
-        int(out_w),
-        int(work_h),
-        int(work_w),
-        int(radial_view.diameter),
-        int(u_len),
-        _radial_plan_signature(plan),
+        radial_base_view_name(radial_view), bool(is_tilted_radial_view(radial_view)),
+        int(out_h), int(out_w), int(work_plane_h), int(work_plane_w),
+        int(radial_view.diameter), int(u_len),
+        round(float(radial_view.center_x), 6), round(float(radial_view.center_y), 6),
+        round(float(radial_view.roi_radius), 6), _radial_plan_signature(plan),
     )
     cached = _DENSE_RADIAL_BACKPROJECT_MAP_CACHE.get(key)
     if cached is not None:
@@ -17084,7 +17520,7 @@ def build_dense_radial_backprojection_map(
     diameter = int(u_len)
     radius = float(radial_view.roi_radius)
     if radius <= 0.0:
-        radius = max(1.0, float(diameter - 1) / 2.0)
+        radius = max(1.0, float(radial_view.diameter - 1) / 2.0)
 
     plan_angles = np.asarray([float(s.angle_deg) % 180.0 for s in plan], dtype=np.float32)
     plan_sources = np.asarray([int(s.source_index) for s in plan], dtype=np.int32)
@@ -17102,10 +17538,9 @@ def build_dense_radial_backprojection_map(
     step = max(float(step), 1e-9)
 
     yy, xx = np.indices((out_h, out_w), dtype=np.float32)
-    if (out_h, out_w) != (work_h, work_w):
-        # Source pixel centers mapped into the working plane (cv2.resize center convention).
-        xx = (xx + np.float32(0.5)) * np.float32(float(work_w) / float(out_w)) - np.float32(0.5)
-        yy = (yy + np.float32(0.5)) * np.float32(float(work_h) / float(out_h)) - np.float32(0.5)
+    if (out_h, out_w) != (int(work_plane_h), int(work_plane_w)):
+        xx = (xx + np.float32(0.5)) * np.float32(float(work_plane_w) / float(out_w)) - np.float32(0.5)
+        yy = (yy + np.float32(0.5)) * np.float32(float(work_plane_h) / float(out_h)) - np.float32(0.5)
     dx = xx - float(radial_view.center_x)
     dy = yy - float(radial_view.center_y)
     rr = np.sqrt((dx * dx) + (dy * dy)).astype(np.float32, copy=False)
@@ -17138,11 +17573,9 @@ def build_dense_radial_backprojection_map(
 
 
 def _pick_gpu_compute_device(torch_mod: object) -> object:
-    """v13.3.3 (S1): pick the CUDA device with the most free VRAM for main-process GPU stages.
+    """Pick the CUDA device with the most free VRAM for main-process GPU stages.
 
-    The radial/tilted backprojections and other main-process GPU work previously hardcoded
-    cuda:0, piling every stage onto one device while the other GPUs idled.
-    YOLO_TTA_GPU_BACKPROJECT_DEVICE=<index> overrides the choice.
+    ``YOLO_TTA_GPU_BACKPROJECT_DEVICE=<index>`` overrides the automatic choice.
     """
     explicit = os.environ.get('YOLO_TTA_GPU_BACKPROJECT_DEVICE', '').strip()
     if explicit:
@@ -17170,16 +17603,10 @@ def _pick_gpu_compute_device(torch_mod: object) -> object:
 
 
 def _radial_row_occupancy(radial_mask_mm: np.ndarray, desc: str) -> np.ndarray:
-    """v13.3.3 (S1): per-v foreground bitmap over the azimuth-major radial stack, in ONE pass.
-
-    The chunk loop used to re-scan ``radial_mask_mm[:, v, :]`` per covering row — a strided
-    reduction touching every azimuth plane of the multi-GiB memmap per row, repeated across
-    ~250 chunks. This computes the same information once, azimuth-major (contiguous reads),
-    parallelized over azimuth ranges (the per-plane ``any`` reductions release the GIL).
-    """
-    n_az, work_t, _u_len = (int(x) for x in radial_mask_mm.shape)
-    row_any = np.zeros((work_t,), dtype=bool)
-    if n_az <= 0 or work_t <= 0:
+    """Compute a per-stack-row foreground bitmap over an azimuth-major Radial volume."""
+    n_az, work_rows, _u_len = (int(x) for x in radial_mask_mm.shape)
+    row_any = np.zeros((work_rows,), dtype=bool)
+    if n_az <= 0 or work_rows <= 0:
         return row_any
     lock = threading.Lock()
     scan_workers = max(1, min(16, _cpu_count(), n_az))
@@ -17188,9 +17615,9 @@ def _radial_row_occupancy(radial_mask_mm: np.ndarray, desc: str) -> np.ndarray:
     def _scan_range(range_idx: int) -> None:
         a0 = int(range_idx) * az_chunk
         a1 = min(n_az, a0 + az_chunk)
-        local = np.zeros((work_t,), dtype=bool)
+        local = np.zeros((work_rows,), dtype=bool)
         for a in range(a0, a1):
-            plane = np.asarray(radial_mask_mm[a])  # (work_t, u_len) contiguous
+            plane = np.asarray(radial_mask_mm[a])
             np.logical_or(local, plane.any(axis=1), out=local)
         with lock:
             np.logical_or(row_any, local, out=row_any)
@@ -19075,6 +19502,259 @@ def _radial_backproject_gpu_streaming(
     return True
 
 
+def _log_radial_backprojection_densification(
+    desc: str,
+    plan_stats: Dict[str, float],
+) -> None:
+    """Report when a coarse Radial source is densified for continuous backprojection."""
+    if not bool(plan_stats.get('densified', 0.0)):
+        return
+    print(
+        f"{desc}: densifying radial backprojection for continuity "
+        f"from {int(plan_stats['source_frames'])} source frame(s) at "
+        f"{float(plan_stats['provided_spacing_deg']):.6g}° spacing to "
+        f"{int(plan_stats['backprojection_angles'])} backprojection angle(s) at "
+        f"{float(plan_stats['effective_spacing_deg']):.6g}° spacing "
+        f"(full-coverage threshold {float(plan_stats['coverage_spacing_deg']):.6g}°)"
+    )
+
+
+def _radial_output_stack_and_plane_shape(
+    radial_view: ViewInfo,
+    out_shape_tyx: Tuple[int, int, int],
+) -> Tuple[int, Tuple[int, int]]:
+    out_t, out_h, out_w = (int(v) for v in out_shape_tyx)
+    base = radial_base_view_name(radial_view)
+    if base == 'transverse':
+        return int(out_t), (int(out_h), int(out_w))
+    if base == 'sagittal':
+        return int(out_h), (int(out_t), int(out_w))
+    if base == 'coronal':
+        return int(out_w), (int(out_t), int(out_h))
+    raise ValueError(f'Unsupported Radial base: {base}')
+
+
+def _radial_source_rows_for_output(
+    source_rows: int,
+    output_rows: int,
+    output_index: int,
+) -> range:
+    src = max(1, int(source_rows))
+    out = max(1, int(output_rows))
+    idx = int(output_index)
+    if src >= out:
+        start = int(math.floor(float(idx) * float(src) / float(out)))
+        stop = int(math.ceil(float(idx + 1) * float(src) / float(out)))
+        start = int(np.clip(start, 0, src - 1))
+        stop = int(np.clip(max(start + 1, stop), 1, src))
+        return range(start, stop)
+    coord = (float(idx) + 0.5) * (float(src) / float(out)) - 0.5
+    nearest = int(np.clip(int(round(coord)), 0, src - 1))
+    return range(nearest, nearest + 1)
+
+
+def _radial_backproject_plane(
+    radial_mask_mm: np.ndarray,
+    dense_map: DenseRadialBackprojectionMap,
+    source_rows: range,
+) -> np.ndarray:
+    src = np.asarray(radial_mask_mm)
+    rows = list(int(v) for v in source_rows)
+    if not rows:
+        return np.zeros(dense_map.valid_mask.shape, dtype=np.uint8)
+    if len(rows) == 1:
+        cross = np.asarray(src[:, rows[0], :], dtype=np.uint8)
+    else:
+        cross = np.bitwise_or.reduce(np.asarray(src[:, rows, :], dtype=np.uint8), axis=1)
+    valid = np.asarray(dense_map.valid_mask, dtype=bool)
+    out = np.zeros(valid.shape, dtype=np.uint8)
+    if not np.any(cross) or not np.any(valid):
+        return out
+    out[valid] = cross[
+        np.asarray(dense_map.source_idx_map, dtype=np.int32)[valid],
+        np.asarray(dense_map.u_idx_map, dtype=np.int32)[valid],
+    ]
+    return out
+
+
+def _backproject_radial_to_base_stack_volume(
+    radial_mask_mm: np.ndarray,
+    radial_view: ViewInfo,
+    out_path: Path,
+    desc: str,
+    *,
+    output_stack_len: int,
+    output_plane_shape: Tuple[int, int],
+    prefer_memory: bool,
+    reserve_bytes: int,
+    workers: int,
+) -> np.ndarray:
+    """Reconstruct a dense ``(base_stack, plane_v, plane_u)`` binary volume."""
+    plan, plan_stats = build_radial_backprojection_plan(radial_view)
+    _log_radial_backprojection_densification(desc, plan_stats)
+    plane_h, plane_w = (int(output_plane_shape[0]), int(output_plane_shape[1]))
+    out = allocate_workspace_array(
+        shape=(int(output_stack_len), plane_h, plane_w),
+        dtype=np.uint8,
+        path=out_path,
+        desc=f'{desc} base-stack workspace',
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
+    )
+    if not plan:
+        flush_array(out)
+        return out
+    dense_map = build_dense_radial_backprojection_map(
+        radial_view, plan, out_shape_hw=(plane_h, plane_w),
+    )
+    source_row_count = int(np.asarray(radial_mask_mm).shape[1])
+
+    def _build(stack_idx: int) -> None:
+        rows = _radial_source_rows_for_output(
+            source_row_count, int(output_stack_len), int(stack_idx),
+        )
+        out[int(stack_idx)] = _radial_backproject_plane(radial_mask_mm, dense_map, rows)
+
+    parallel_for_indices_chunked(
+        int(output_stack_len),
+        _build,
+        max_workers=choose_slice_parallel_workers(int(workers), int(output_stack_len)),
+        desc=desc,
+        show_progress=True,
+        target_chunks_per_worker=4,
+    )
+    flush_array(out)
+    return out
+
+
+def _backproject_cartesian_radial_generic(
+    radial_mask_mm: np.ndarray,
+    radial_view: ViewInfo,
+    out_path: Path,
+    desc: str,
+    *,
+    prefer_memory: bool,
+    reserve_bytes: int,
+    workers: int,
+    out_shape_tyx: Optional[Tuple[int, int, int]],
+    projection_block_callback: Optional[Callable[[int, np.ndarray], None]],
+    sink_only: bool,
+) -> np.ndarray:
+    """Orientation-aware CPU backprojection for Sagittal/Coronal Radial views."""
+    if bool(sink_only):
+        raise ValueError(f'{desc}: sink-only projection is currently transverse-Radial only')
+    target_shape = (
+        (int(radial_view.full_t), int(radial_view.full_h), int(radial_view.full_w))
+        if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
+    )
+    stack_len, plane_shape = _radial_output_stack_and_plane_shape(radial_view, target_shape)
+    plan, plan_stats = build_radial_backprojection_plan(radial_view)
+    _log_radial_backprojection_densification(desc, plan_stats)
+    out = allocate_workspace_array(
+        shape=target_shape,
+        dtype=np.uint8,
+        path=out_path,
+        desc=f'{desc} workspace',
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
+    )
+    if not plan:
+        flush_array(out)
+        return out
+    dense_map = build_dense_radial_backprojection_map(
+        radial_view, plan, out_shape_hw=plane_shape,
+    )
+    source_row_count = int(np.asarray(radial_mask_mm).shape[1])
+    base = radial_base_view_name(radial_view)
+
+    def _build(stack_idx: int) -> None:
+        rows = _radial_source_rows_for_output(source_row_count, int(stack_len), int(stack_idx))
+        plane = _radial_backproject_plane(radial_mask_mm, dense_map, rows)
+        if base == 'sagittal':
+            out[:, int(stack_idx), :] = plane
+        elif base == 'coronal':
+            out[:, :, int(stack_idx)] = plane
+        else:  # pragma: no cover
+            raise ValueError(f'Generic Cartesian Radial branch received base {base!r}')
+
+    parallel_for_indices_chunked(
+        int(stack_len),
+        _build,
+        max_workers=choose_slice_parallel_workers(int(workers), int(stack_len)),
+        desc=desc,
+        show_progress=True,
+        target_chunks_per_worker=4,
+    )
+    flush_array(out)
+    if projection_block_callback is not None:
+        block = max(1, _env_int('YOLO_TTA_PROJECTION_CALLBACK_BLOCK', 64))
+        for t0 in range(0, int(target_shape[0]), block):
+            t1 = min(int(target_shape[0]), t0 + block)
+            _emit_projection_block_callback(
+                projection_block_callback, int(t0), np.asarray(out[t0:t1]),
+                desc=desc, required=False,
+            )
+    return out
+
+
+def _backproject_tilted_radial_volume_to_volume(
+    radial_mask_mm: np.ndarray,
+    radial_view: ViewInfo,
+    out_path: Path,
+    desc: str,
+    *,
+    prefer_memory: bool,
+    reserve_bytes: int,
+    workers: int,
+    out_shape_tyx: Optional[Tuple[int, int, int]],
+    projection_block_callback: Optional[Callable[[int, np.ndarray], None]],
+    sink_only: bool,
+) -> np.ndarray:
+    """Radial -> concrete Tilted stack -> final orthogonal volume."""
+    if bool(sink_only):
+        raise ValueError(f'{desc}: sink-only projection is not available for tilted Radial views')
+    tilted_source = radial_source_tilted_view(radial_view)
+    plane_shape = (int(tilted_source.src_h), int(tilted_source.src_w))
+    intermediate_path = out_path.with_name(out_path.name + '.tilted_radial_base.u8.dat')
+    base_stack = _backproject_radial_to_base_stack_volume(
+        radial_mask_mm,
+        radial_view,
+        intermediate_path,
+        f'{desc}: reconstruct {tilted_source.name}',
+        output_stack_len=int(tilted_source.num_slices),
+        output_plane_shape=plane_shape,
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
+        workers=int(workers),
+    )
+    try:
+        projected = backproject_tilted_volume_to_volume(
+            tilted_mask_mm=base_stack,
+            tilted_view=tilted_source,
+            out_path=out_path,
+            desc=desc,
+            prefer_memory=bool(prefer_memory),
+            reserve_bytes=int(reserve_bytes),
+            workers=int(workers),
+            out_shape_tyx=out_shape_tyx,
+        )
+        if projection_block_callback is not None:
+            block = max(1, _env_int('YOLO_TTA_PROJECTION_CALLBACK_BLOCK', 64))
+            for t0 in range(0, int(projected.shape[0]), block):
+                t1 = min(int(projected.shape[0]), t0 + block)
+                _emit_projection_block_callback(
+                    projection_block_callback, int(t0), np.asarray(projected[t0:t1]),
+                    desc=desc, required=False,
+                )
+        return projected
+    finally:
+        close_memmap_array(base_stack)
+        try:
+            intermediate_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def backproject_radial_volume_to_volume(
     radial_mask_mm: np.ndarray,
     radial_view: ViewInfo,
@@ -19092,20 +19772,33 @@ def backproject_radial_volume_to_volume(
 ) -> np.ndarray | SinkOnlyProjectionResult:
     """Backproject a radial view-native mask stack into orthogonal (t, Y, X).
 
-    v13.2.4 (task #1, ruling A1): ``out_shape_tyx`` backprojects DIRECTLY into the final source
-    geometry in one resample — the dense map is built on the source XY raster and each source t
-    slice ORs the (working-t) radial rows it covers, mirroring the union-biased semantics of the
-    former tail restore without an intermediate working-geometry volume. ``None`` keeps the
-    historical working-geometry target. The cube resize only ever grows axes, so the working
-    geometry is never smaller than the source geometry.
+    ``out_shape_tyx`` backprojects directly into final source geometry. Transverse retains the
+    optimized t-major implementation; sagittal/coronal build the dense circle map on their final
+    ``(t,X)``/``(t,Y)`` planes, and tilted Radial views first reconstruct their concrete Tilted
+    stack before applying the existing shear backprojection. This single terminal geometry map is
+    what converts working-space circles into source-space ellipses when t was cube-resized.
 
-    v13.3.17 C2: ``sink_only=True`` suppresses the full ``(t,Y,X)`` allocation and makes
-    ``projection_block_callback`` the authoritative transactional destination. Success returns
-    :class:`SinkOnlyProjectionResult`; failures propagate so the caller can discard the partial
-    store and explicitly request the retained dense fallback.
+    ``sink_only=True`` remains available only for the optimized transverse Radial path, where
+    completed output-t blocks can be committed transactionally through
+    ``projection_block_callback`` without allocating the full ``(t,Y,X)`` volume.
     """
-    if radial_view.family != 'radial':
+    if not is_radial_view(radial_view):
         raise ValueError('backproject_radial_volume_to_volume expects a radial view')
+
+    if is_tilted_radial_view(radial_view):
+        return _backproject_tilted_radial_volume_to_volume(
+            radial_mask_mm, radial_view, out_path, desc,
+            prefer_memory=bool(prefer_memory), reserve_bytes=int(reserve_bytes),
+            workers=int(workers), out_shape_tyx=out_shape_tyx,
+            projection_block_callback=projection_block_callback, sink_only=bool(sink_only),
+        )
+    if radial_base_view_name(radial_view) != 'transverse':
+        return _backproject_cartesian_radial_generic(
+            radial_mask_mm, radial_view, out_path, desc,
+            prefer_memory=bool(prefer_memory), reserve_bytes=int(reserve_bytes),
+            workers=int(workers), out_shape_tyx=out_shape_tyx,
+            projection_block_callback=projection_block_callback, sink_only=bool(sink_only),
+        )
 
     work_t = int(radial_view.src_h)
     work_h = int(radial_view.full_h)
@@ -19610,11 +20303,12 @@ class ViewBackprojectionQueueJob:
 
 
 class HybridBackprojectionQueue:
-    """Sequential radial/tilted backprojection queue with a full CPU fallback budget.
+    """Sequential Radial/Tilted backprojection queue with a full CPU fallback budget.
 
-    Radial jobs try the current resident/streaming GPU implementations and fall
-    back to CPU. Tilted jobs use the CPU implementation. The historical class
-    name is retained to avoid scheduler call-site churn.
+    Transverse Radial retains the resident/streaming GPU implementations with CPU fallback.
+    Sagittal/coronal Radial and every tilted Radial variant use the orientation-aware CPU path;
+    ordinary Tilted jobs use the existing CPU shear backprojection. The historical class name is
+    retained to avoid scheduler call-site churn.
     """
 
     def __init__(self, *, cpu_workers: int = 1) -> None:
@@ -19652,7 +20346,15 @@ class HybridBackprojectionQueue:
     def run(self, jobs: Sequence[ViewBackprojectionQueueJob]) -> List[Tuple[str, str, np.ndarray]]:
         results: List[Tuple[str, str, np.ndarray]] = []
         for job in jobs:
-            backend_note = 'GPU-capable radial path (CPU fallback)' if job.view.family == 'radial' else 'CPU tilted path'
+            if is_radial_view(job.view):
+                if radial_streaming_gpu_render_supported(job.view):
+                    backend_note = 'transverse Radial GPU-capable path (CPU fallback)'
+                elif is_tilted_radial_view(job.view):
+                    backend_note = 'Radial-to-Tilted CPU path'
+                else:
+                    backend_note = f'{radial_base_view_name(job.view)} Radial CPU path'
+            else:
+                backend_note = 'CPU tilted path'
             print(f'Backprojection queue: running {job.model_name}/{job.view.name} via {backend_note}')
             results.append(self._run_job(job))
         return results
@@ -20576,7 +21278,7 @@ def assemble_current_view_union_volume(
     postprocessing runs in source voxels; None keeps the working geometry.
     """
     if len(view_volumes_by_model) != 1:
-        raise ValueError('GPT-5.6-Sol-Pro v15.0.5 supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.0.0 supports exactly one --model; multiple-model inference has been removed')
 
     union_shape = (int(T), int(H), int(W)) if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
     model_name = next(iter(view_volumes_by_model.keys()))
@@ -27431,8 +28133,9 @@ def project_view_volume_to_orthogonal_volume(
     transverse identity branch (no copy). Callers must check np.may_share_memory before closing
     or unlinking the result.
 
-    ``sink_only`` is currently defined only for radial projections, whose kernels naturally
-    complete disjoint output-z blocks. Other view families keep their established dense return.
+    ``sink_only`` is currently defined only for transverse Radial projection, whose optimized
+    kernels naturally complete disjoint output-z blocks. Other Radial orientations and view
+    families keep their established dense return.
     """
     source_shape = tuple(int(v) for v in np.asarray(view_mask_mm).shape)
     if len(source_shape) != 3:
@@ -27648,9 +28351,12 @@ def materialize_nrrd_view_layer(
         'nrrd_layer_key': key,
         'source_raw_path': str(raw_path),
         'source_raw_workspace': 'in_memory_when_available' if bool(transient_projection_in_memory) else 'disk_backed',
-        'projection_payload_fusion': 'radial_sink_only_v13.3.17',
+        'projection_payload_fusion': (
+            'transverse_radial_sink_only_v16.0.0'
+            if radial_sink_only_projection_supported(view) else 'dense_projection'
+        ),
     }
-    if bool(raw_bbox_nrrd_layers_enabled()) and str(view.family) == 'radial':
+    if bool(raw_bbox_nrrd_layers_enabled()) and radial_sink_only_projection_supported(view):
         expected_shape = (
             tuple(int(v) for v in projection_out_shape)
             if projection_out_shape is not None
@@ -31197,7 +31903,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.6-Sol-Pro_v15.0.5_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.6-Sol-Pro_v16.0.0_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -34391,12 +35097,78 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('GPT-5.6-Sol-Pro v15.0.5 accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.0.0 accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
     model_paths = [model_path_resolved]
     model_name = Path(model_paths[0]).stem
+
+    # Resolve the complete v16 view request before model loading or volume decode. With no
+    # implicit Cartesian/Tilted/Radial defaults, a missing or self-disabling view request must
+    # fail immediately rather than decode a multi-terabyte logical run and discover it later.
+    angles = _parse_angles(args.angle) or [0.0, 120.0, 240.0]
+    single_angle_streaming_cleanup_active = bool(
+        len(angles) == 1 and _env_flag('YOLO_TTA_SINGLE_ANGLE_STREAMING_CLEANUP', True)
+    )
+    if int(args.batch) < 1:
+        raise ValueError('--batch must be >= 1')
+    set_inference_batch_size(int(args.batch))
+    enabled_cartesian_views = resolve_cartesian_views(args.enable_cartesian)
+    tilt_views = resolve_tilt_views(args.enable_tilted)
+    tilt_angles = resolve_tilt_angles(args.tilt_angle)
+    for tilt_angle in tilt_angles:
+        if not (0.0 < float(tilt_angle) <= 45.0):
+            raise ValueError('--tilt_angle values must be greater than 0 and less than or equal to 45')
+    tilt_directions = resolve_tilt_directions(args.tilt_direction)
+    radial_targets = resolve_radial_views(args.enable_radial)
+    requested_azimuth_values = _parse_float_list(args.azimuth_angle)
+    if any(float(v) < 0.0 for v in requested_azimuth_values):
+        raise ValueError('--azimuth_angle values must be >= 0')
+    if radial_targets and len(requested_azimuth_values) not in (0, 1, len(radial_targets)):
+        raise ValueError(
+            f'--azimuth_angle supplied {len(requested_azimuth_values)} values for '
+            f'{len(radial_targets)} --enable_radial values; provide one value to broadcast '
+            'or matching counts'
+        )
+    if requested_azimuth_values and not radial_targets:
+        print(
+            '--azimuth_angle was supplied without --enable_radial; it is validated but '
+            'does not enable any Radial view.'
+        )
+    tile_configs = resolve_tile_configs(args.tile_size, args.tile_stride)
+
+    concrete_tilt_requested = bool(tilt_views and tilt_angles)
+    active_radial_request = False
+    for radial_index, radial_target in enumerate(radial_targets):
+        if not requested_azimuth_values:
+            azimuth_active = True  # omitted -> per-view full-coverage default after geometry resolves
+        elif len(requested_azimuth_values) == 1:
+            azimuth_active = float(requested_azimuth_values[0]) > 0.0
+        else:
+            azimuth_active = float(requested_azimuth_values[radial_index]) > 0.0
+        if not azimuth_active:
+            continue
+        if str(radial_target).startswith('tilted_'):
+            radial_base = radial_target_base_view(radial_target)
+            if not concrete_tilt_requested or radial_base not in tilt_views:
+                continue
+        active_radial_request = True
+        break
+    if not (enabled_cartesian_views or concrete_tilt_requested or active_radial_request):
+        for radial_target in radial_targets:
+            if str(radial_target).startswith('tilted_'):
+                radial_base = radial_target_base_view(radial_target)
+                if not concrete_tilt_requested or radial_base not in tilt_views:
+                    print(
+                        f'Radial target {radial_target!r} skipped: no {radial_base} Tilted '
+                        'variants are enabled.'
+                    )
+        raise ValueError(
+            'No inference views are active. Enable at least one view with --enable_cartesian, '
+            '--enable_tilted (with non-zero --tilt_angle), or --enable_radial. A tilted_* '
+            '--enable_radial target requires the matching --enable_tilted base.'
+        )
 
     # Resolve v14 post-union behavior before starting the background model loader.
     # Invalid settings therefore cannot leave a heavyweight loader thread running.
@@ -34445,23 +35217,6 @@ def main() -> None:
             f'Parent model load skipped: {gpu_device_count} CUDA worker process(es) will '
             f'load {model_name} from {model_paths[0]} independently.'
         )
-
-    angles = _parse_angles(args.angle) or [0.0, 120.0, 240.0]
-    single_angle_streaming_cleanup_active = bool(
-        len(angles) == 1 and _env_flag('YOLO_TTA_SINGLE_ANGLE_STREAMING_CLEANUP', True)
-    )
-    if int(args.batch) < 1:
-        raise ValueError('--batch must be >= 1')
-    set_inference_batch_size(int(args.batch))
-    tilt_views = resolve_tilt_views(args.tilt_view)
-    tilt_angles = resolve_tilt_angles(args.tilt_angle)
-    tilt_directions = resolve_tilt_directions(args.tilt_direction)
-    tile_configs = resolve_tile_configs(args.tile_size, args.tile_stride)
-    enable_sagittal = bool(args.enable_sagittal)
-    enable_coronal = bool(args.enable_coronal)
-    # Default outputs stay transverse-only; active non-transverse views contribute to inference/union
-    # but are not separately exported. (--save_sagittal/--save_coronal were fully deprecated and removed.)
-    requested_azimuth_angle = None if args.azimuth_angle is None else float(args.azimuth_angle)
 
     # Validate logical CUDA indices and resolve retina-mask placement before decode begins.
     # v13.2.2 bug #13 follow-up: --device uses torch LOGICAL indices into any inherited
@@ -34572,11 +35327,6 @@ def main() -> None:
         raise ValueError('--min_radius must be >= 0')
     if int(args.keep_objects) < 0:
         raise ValueError('--keep_objects must be >= 0')
-    if requested_azimuth_angle is not None and float(requested_azimuth_angle) < 0:
-        raise ValueError('--azimuth_angle must be >= 0')
-    for tilt_angle in tilt_angles:
-        if not (0.0 < float(tilt_angle) <= 45.0):
-            raise ValueError('--tilt_angle values must be greater than 0 and less than or equal to 45')
     if not (-90.0 < float(args.interpolation_search_angle) < 90.0):
         raise ValueError('--interpolation_search_angle must be greater than -90 and less than 90')
     low_quality_requested = bool(args.save_low_quality or args.save_low_quality_downbin is not None)
@@ -34772,13 +35522,23 @@ def main() -> None:
             )
 
     T, H, W = (int(processing_shape[0]), int(processing_shape[1]), int(processing_shape[2]))
-    resolved_azimuth_angle = resolve_radial_azimuth_angle(
-        requested_azimuth_angle,
-        enable_radial=bool(args.enable_radial),
-        diameter=min(W, H),
+    radial_diameters = [
+        radial_target_diameter(target, int(T), int(H), int(W))
+        for target in radial_targets
+    ]
+    resolved_azimuth_angles = resolve_radial_azimuth_angles(
+        requested_azimuth_values,
+        radial_targets=radial_targets,
+        diameters=radial_diameters,
     )
-    if bool(args.enable_radial) and resolved_azimuth_angle > 0.0 and requested_azimuth_angle is None:
-        print(f'Radial azimuth default: using full-coverage spacing {resolved_azimuth_angle:.8g}° for processing diameter {min(W, H)}')
+    if radial_targets and not requested_azimuth_values:
+        for target, diameter, spacing in zip(
+            radial_targets, radial_diameters, resolved_azimuth_angles,
+        ):
+            print(
+                f'Radial azimuth default [{target}]: using full-coverage spacing '
+                f'{float(spacing):.8g}° for projected-plane diameter {int(diameter)}'
+            )
 
     (temp_dir / 'processing_volume.meta.json').write_text(
         json.dumps({
@@ -34797,35 +35557,38 @@ def main() -> None:
             'model_channel_boundary_policy': 'edge_clamp',
             'model_prediction_slice_policy': 'center_N_only',
             'fps': fps,
-            'azimuth_angle_deg': resolved_azimuth_angle,
-            'enable_sagittal': bool(enable_sagittal),
-            'enable_coronal': bool(enable_coronal),
-            'tilt_views': list(tilt_views),
+            'enable_cartesian': list(enabled_cartesian_views),
+            'enable_tilted': list(tilt_views),
             'tilt_angles_deg': [float(v) for v in tilt_angles],
             'tilt_directions': list(tilt_directions),
+            'enable_radial': list(radial_targets),
+            'radial_diameters': [int(v) for v in radial_diameters],
+            'azimuth_angles_deg': [float(v) for v in resolved_azimuth_angles],
         }, indent=2)
     )
 
-    # v13.2.5 (speed #1): fold the --imgsz downscale into the radial native raster unless the
-    # legacy full-pitch render is explicitly requested via YOLO_TTA_RADIAL_FOLD_IMGSZ=0.
+    # Fold each Radial transformed stack/diameter to --imgsz unless explicitly disabled.
     radial_fold_raster = int(args.imgsz) if _env_flag('YOLO_TTA_RADIAL_FOLD_IMGSZ', True) else 0
     views = get_view_infos(
         T=T,
         H=H,
         W=W,
-        disable_multiplanar=None,
-        enable_sagittal=bool(enable_sagittal),
-        enable_coronal=bool(enable_coronal),
-        azimuth_angle=float(resolved_azimuth_angle),
-        include_radial=True,
+        cartesian_views=enabled_cartesian_views,
+        radial_views=radial_targets,
+        radial_azimuth_angles=resolved_azimuth_angles,
         tilt_views=tilt_views,
         tilt_angles=tilt_angles,
         tilt_directions=tilt_directions,
         radial_native_raster=int(radial_fold_raster),
     )
+    if not views:
+        raise ValueError(
+            'No inference views are active. Enable at least one view with --enable_cartesian, '
+            '--enable_tilted (with non-zero --tilt_angle), or --enable_radial. A tilted_* '
+            '--enable_radial target is skipped when its matching Tilted base is not enabled.'
+        )
     cartesian_views = orthogonal_views_only(views)
-    transverse_inference_disabled = bool(args.disable_transverse)
-    inference_views = [v for v in views if not (transverse_inference_disabled and v.name == 'transverse')]
+    inference_views = list(views)
     interpolating_views = [v for v in inference_views if _view_uses_interpolation(v, int(args.interpolate))]
     spec_notes: List[str] = []
     # v13.1.0 spec<->implementation conflict notes (see header docstring and suggested spec edits).
@@ -34939,7 +35702,7 @@ def main() -> None:
         )
     if (not gpu_worker_process_active) and background_model_load_enabled():
         spec_notes.append(
-            'v15.0.5 startup overlap is active by default: the YOLO model load is submitted before decode/native-volume preparation and joined only when prediction needs it. Set YOLO_TTA_BACKGROUND_MODEL_LOAD=0 to force synchronous loading.'
+            'v16.0.0 retains startup overlap by default: the YOLO model load is submitted before decode/native-volume preparation and joined only when prediction needs it. Set YOLO_TTA_BACKGROUND_MODEL_LOAD=0 to force synchronous loading.'
         )
     elif gpu_worker_process_active:
         spec_notes.append(
@@ -34995,30 +35758,46 @@ def main() -> None:
             'all execute at source dimensions. No tail restore resample occurs.'
         )
     spec_notes.append(
-        f'Sagittal enabled={bool(enable_sagittal)}, Coronal enabled={bool(enable_coronal)}; '
-        'their non-90 degree Cartesian augmentations use clamp-to-frame black fill rather than expanded padding.'
+        f'v16.0.0 Cartesian selection: --enable_cartesian={list(enabled_cartesian_views)}. '
+        'No Cartesian view is implicit; non-90 degree Cartesian augmentations use clamp-to-frame '
+        'black fill rather than expanded padding.'
     )
-    if tilt_angles:
-        active_tilt_labels = ', '.join(pretty_view_name(v) for v in views if is_tilted_view(v))
+    concrete_tilted = [v for v in views if is_tilted_view(v)]
+    if concrete_tilted:
+        active_tilt_labels = ', '.join(pretty_view_name(v) for v in concrete_tilted)
         spec_notes.append(
-            f'Generalized v12 Tilted Views active from --tilt_view={list(tilt_views)}, '
+            f'v16.0.0 Tilted Views active from --enable_tilted={list(tilt_views)}, '
             f'--tilt_direction={list(tilt_directions)}, --tilt_angle={[float(v) for v in tilt_angles]}. '
-            'Tilted base views do not need to be enabled as upright Cartesian views; each base/direction/signed-angle configuration remains independent until final union. '
-            f'Active tilted configurations: {active_tilt_labels}'
+            'No Tilted base is implicit; each base/direction/signed-angle configuration remains '
+            'independent until final union. Active tilted configurations: '
+            f'{active_tilt_labels}'
+        )
+    elif tilt_views and not tilt_angles:
+        spec_notes.append(
+            'Tilted Views disabled because --tilt_angle resolved to 0, regardless of --enable_tilted.'
         )
     else:
-        spec_notes.append('Tilted Views disabled because --tilt_angle resolved to 0/no non-zero angles.')
-    if float(resolved_azimuth_angle) > 0.0:
+        spec_notes.append('Tilted Views disabled because --enable_tilted was not supplied.')
+    concrete_radial = [v for v in views if is_radial_view(v)]
+    if concrete_radial:
+        radial_notes = ', '.join(
+            f'{v.radial_request_token}->{v.name}@{_radial_view_nominal_spacing_deg(v):.8g}° '
+            f'(diameter={int(v.diameter)})'
+            for v in concrete_radial
+        )
         spec_notes.append(
-            f'Radial enabled with azimuth spacing {float(resolved_azimuth_angle):.8g} degrees; '
-            'Lanczos-3 radial sampling, wraparound Radial interpolation, and dense final backprojection are active.'
+            'v16.0.0 Radial transforms active: ' + radial_notes + '. Cartesian Radial bases do '
+            'not require upright Cartesian views. Each tilted_* target expands across every matching '
+            'enabled signed-angle/direction Tilted variant. Circles are constructed in working projected '
+            'view space; source-geometry t restoration naturally produces sagittal/coronal and Tilted '
+            'ellipses. Lanczos-3 sampling, wraparound interpolation, and dense backprojection are active.'
         )
     if any((v.family == 'radial' or is_tilted_view(v)) for v in views):
         spec_notes.append(
-            'Current final backprojection: Radial jobs try the resident GPU path, then the '
-            'streaming GPU path, and fall back to CPU on capability/runtime failure; Tilted '
-            'jobs use CPU. The sequential queue preserves the full CPU slice-worker budget '
-            'for Tilted work and every Radial fallback.'
+            'Current final backprojection: transverse Radial jobs retain the resident/streaming '
+            'GPU paths with CPU fallback; sagittal/coronal Radial views use the orientation-aware '
+            'CPU dense map, and tilted Radial views reconstruct their concrete Tilted stack before '
+            'the Tilted shear backprojection. The sequential queue preserves the full CPU worker budget.'
         )
     spec_notes.append(
         'v13.2.0 NRRD export (--save_nrrd) writes one single-layer 3-axis NRRD (X,Y,t) per component layer to '
@@ -35126,16 +35905,6 @@ def main() -> None:
         f'Approximately-cubic target = {tuple(int(x) for x in legacy_cube_shape)}. Set YOLO_TTA_PROCESSING_VOLUME_MODE=native to opt back into v12.2.15 decoded-native geometry for regression. '
         f'Cube T-axis backend={_cube_t_axis_resize_backend()} (YOLO_TTA_CUBE_T_RESIZE_BACKEND=slice_exact restores the endpoint-aligned per-slice interpolation path).'
     )
-    if transverse_inference_disabled:
-        note = (
-            'v12.2.0 specification note: Section 2.1.1 says Transverse is enabled by default, while '
-            'View Flags item 1 adds --disable_transverse to skip Transverse inferencing. This implementation '
-            'keeps Transverse geometry/output paths available and removes only the standard Transverse full-frame '
-            'and tiled prediction jobs.'
-        )
-        spec_notes.append(note)
-        print(note)
-
     yolo_model: Optional[object]
     if gpu_worker_process_active:
         yolo_model = None
@@ -35404,22 +36173,12 @@ def main() -> None:
     aug_job_lookup_by_view: Dict[str, Dict[str, AugJob]] = {}
     tile_jobs_by_view_config: Dict[str, Dict[str, List[DenseTileJob]]] = {view.name: {} for view in views}
     tile_jobs_by_aug: Dict[Tuple[str, str], List[DenseTileJob]] = {}
-    view_prediction_stats: Dict[str, int] = {
-        'transverse': 0,
-        'sagittal': 0,
-        'coronal': 0,
-        'radial': 0,
-    }
-    view_prediction_labels: Dict[str, str] = {
-        'transverse': 'Transverse',
-        'sagittal': 'Sagittal',
-        'coronal': 'Coronal',
-        'radial': 'Radial',
-    }
+    view_prediction_stats: Dict[str, int] = {}
+    view_prediction_labels: Dict[str, str] = {}
     for _view_for_stats in views:
-        if is_tilted_view(_view_for_stats):
-            view_prediction_stats.setdefault(str(_view_for_stats.summary_family), 0)
-            view_prediction_labels[str(_view_for_stats.summary_family)] = pretty_view_name(_view_for_stats)
+        key = str(_view_for_stats.summary_family)
+        view_prediction_stats.setdefault(key, 0)
+        view_prediction_labels[key] = pretty_view_name(_view_for_stats)
     interpolation_stats: List[Dict[str, object]] = []
 
     inference_view_names = {v.name for v in inference_views}
