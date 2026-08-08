@@ -2,7 +2,7 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the GPT-5.6-Sol-Pro v16.0.0 SLURM view-rework release, copied from the
+This is the GPT-5.6-Sol-Pro v16.0.1 SLURM view-rework release, copied from the
 confirmed-running GPT-5.6-Sol-Pro_v15.0.5_SLURM.py. It consolidates Cartesian and Tilted
 view selection, generalizes Radial views across all Cartesian orientations and enabled
 Tilted variants, and supports per-Radial-view azimuth spacing.
@@ -218,7 +218,7 @@ def resolve_tilt_directions(values: Sequence[str] | str | None) -> List[str]:
             raise ValueError('--tilt_direction values must be vertical, horizontal, or both')
         if token not in out:
             out.append(token)
-    # v16.0.0 default: both directions whenever Tilted views are enabled.
+    # v16.0.1 default: both directions whenever Tilted views are enabled.
     if not out:
         out = ['vertical', 'horizontal']
     return out
@@ -357,6 +357,17 @@ def build_argparser() -> argparse.ArgumentParser:
 
     p.add_argument("--input", required=True, type=str, help="Input video path")
     p.add_argument("--output", default=None, type=str, help="Output directory (default ./{Filename}/)")
+    p.add_argument(
+        "--temp",
+        default=None,
+        type=str,
+        help=(
+            "Scratch/temp root location. The supplied root is created when needed and receives a "
+            "unique {Filename}_{PID}_temp run directory. Omission defaults to <output>/temp; "
+            "YOLO_TTA_SCRATCH_DIR and an explicit YOLO_TTA_SCRATCH_PREFER_SHM setting remain "
+            "compatibility overrides"
+        ),
+    )
     p.add_argument("--device", nargs="+", default=["0"], type=str,
                    help="Inference device(s). Accepts a single GPU index (0), multiple GPU indices separated by "
                         "commas or spaces (0,1,2,3 or 0 1 2 3) for process-per-GPU scheduling, or cpu. GPU indices and "
@@ -737,7 +748,7 @@ def _cpu_count() -> int:
 # --------------------------
 # Runtime observability
 # --------------------------
-# v16.0.0 retains the useful telemetry folded into the core pipeline by v15.0.5
+# v16.0.1 retains the useful telemetry folded into the core pipeline by v15.0.5
 # layer into normal imports and explicit process initialization. No functions/classes are
 # monkeypatched at module end, and importing this module no longer starts sampler threads.
 
@@ -849,7 +860,7 @@ class RuntimeTelemetry:
                     'mean_ms': (seconds * 1000.0 / calls) if calls else 0.0,
                 }
             payload: Dict[str, object] = {
-                'schema': 'gpt-5.6-sol-pro-v16.0.0.telemetry.v1',
+                'schema': 'gpt-5.6-sol-pro-v16.0.1.telemetry.v1',
                 'pid': os.getpid(),
                 'monotonic_seconds': (now_ns - self.started_ns) / 1e9,
                 'wall_time': time.time(),
@@ -2297,54 +2308,55 @@ def scratch_dir_is_memory_backed() -> bool:
 
 
 def choose_scratch_dir(preferred: Optional[str], out_dir: Path, stem: str) -> Path:
-    """Pick the bulk scratch root.
+    """Pick the bulk scratch directory.
 
-      - an explicit preference (argument, then YOLO_TTA_SCRATCH_DIR) always wins
-      - v15.0.3 (T10): a memory-backed mount is auto-selected when ``_auto_shm_scratch_candidate``
-        can prove it has room. This matters most for the tile path: since T4 the
-        per-configuration tile canvas is a real file that every GPU worker opens 'r+' to OR its
-        crops into, so on a shared filesystem it sits in the critical section, while on shm it
-        is RAM that all processes map to the same physical pages. The shared source volume
-        lands on the same mount because it is allocated under this scratch dir too.
-      - otherwise defaults to {output}/temp so large persistent memmaps stay off tmpfs
+      - ``--temp`` names a root and receives a unique ``{stem}_{pid}_temp`` child, preventing
+        one run from deleting or colliding with unrelated contents in the supplied location.
+      - ``YOLO_TTA_SCRATCH_DIR`` remains a compatibility root override and receives a unique
+        ``{stem}_{pid}_temp`` child, preserving its historical multi-run-safe behavior.
+      - an explicitly configured ``YOLO_TTA_SCRATCH_PREFER_SHM`` may still select a proven-roomy
+        memory-backed root and likewise receives a unique child.
+      - with no explicit CLI/environment override, the default is exactly ``{output}/temp``.
     """
     global _SCRATCH_DIR_IS_MEMORY_BACKED
-    candidates: List[Path] = []
-    seen: set[str] = set()
-
-    def _add_candidate(p: Path) -> None:
-        key = str(p)
-        if key in seen:
-            return
-        seen.add(key)
-        candidates.append(p)
 
     if preferred:
-        _add_candidate(Path(preferred).expanduser())
-    env_pref = os.environ.get('YOLO_TTA_SCRATCH_DIR', '').strip()
-    if env_pref:
-        _add_candidate(Path(env_pref).expanduser())
-    shm_candidate = _auto_shm_scratch_candidate()
-    if shm_candidate is not None:
-        _add_candidate(shm_candidate)
-    _add_candidate(out_dir)
-
-    chosen_root: Optional[Path] = None
-    for cand in candidates:
+        explicit_root = Path(preferred).expanduser()
         try:
-            cand = cand.resolve()
+            explicit_root = explicit_root.resolve()
         except Exception:
-            cand = cand
-        if cand.exists() and os.access(str(cand), os.W_OK):
-            chosen_root = cand
-            break
+            pass
+        try:
+            explicit_root.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            raise RuntimeError(f'Unable to create --temp root {explicit_root}: {exc}') from exc
+        if not explicit_root.is_dir() or not os.access(str(explicit_root), os.W_OK):
+            raise RuntimeError(f'--temp root is not a writable directory: {explicit_root}')
+        scratch_dir = explicit_root / f'{stem}_{os.getpid()}_temp'
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+        _SCRATCH_DIR_IS_MEMORY_BACKED = bool(path_is_memory_backed(scratch_dir))
+        return scratch_dir
+
+    env_pref = os.environ.get('YOLO_TTA_SCRATCH_DIR', '').strip()
+    chosen_root: Optional[Path] = None
+    if env_pref:
+        chosen_root = Path(env_pref).expanduser()
+    elif os.environ.get('YOLO_TTA_SCRATCH_PREFER_SHM', '').strip():
+        chosen_root = _auto_shm_scratch_candidate()
 
     if chosen_root is None:
-        chosen_root = out_dir
-
-    if chosen_root == out_dir:
-        scratch_dir = out_dir / 'temp'
+        scratch_dir = Path(out_dir) / 'temp'
     else:
+        try:
+            chosen_root = chosen_root.resolve()
+        except Exception:
+            pass
+        try:
+            chosen_root.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            raise RuntimeError(f'Unable to create scratch root {chosen_root}: {exc}') from exc
+        if not chosen_root.is_dir() or not os.access(str(chosen_root), os.W_OK):
+            raise RuntimeError(f'Scratch root is not a writable directory: {chosen_root}')
         scratch_dir = chosen_root / f'{stem}_{os.getpid()}_temp'
 
     scratch_dir.mkdir(parents=True, exist_ok=True)
@@ -4018,6 +4030,55 @@ def resolve_radial_azimuth_angles(
     return [float(v) for v in requested]
 
 
+
+def _open_memory_backed_encoded_chunk(name: str, *, require_fileno: bool = False) -> object:
+    """Return a seekable binary object whose encoded payload is retained in memory.
+
+    Linux memfd is preferred because it is anonymous, seekable, usable by copy_file_range,
+    and can be inherited by ffmpeg without creating a shard path on disk. BytesIO is a
+    portable in-process fallback for writers such as NRRD that do not need a child process.
+    """
+    safe_name = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(name)).strip('._') or 'encoded_chunk'
+    memfd_create = getattr(os, 'memfd_create', None)
+    if callable(memfd_create):
+        fd: Optional[int] = None
+        try:
+            flags = int(getattr(os, 'MFD_CLOEXEC', 0))
+            fd = int(memfd_create(safe_name[:240], flags=flags))
+            return os.fdopen(fd, mode='w+b', buffering=0)
+        except Exception:
+            if fd is not None:
+                try:
+                    os.close(int(fd))
+                except OSError:
+                    pass
+            if bool(require_fileno):
+                raise
+    if bool(require_fileno):
+        raise RuntimeError(
+            'Memory-backed FFV1 chunking requires Linux os.memfd_create; '
+            'no encoded shard will be written to disk as a fallback.'
+        )
+    return io.BytesIO()
+
+
+def _memory_backed_encoded_chunk_path(chunk: object) -> Path:
+    """Expose an inherited memfd to a child process without a persistent filesystem file."""
+    try:
+        fd = int(chunk.fileno())
+    except Exception as exc:
+        raise RuntimeError('Encoded child-process chunk does not expose a file descriptor') from exc
+    return Path(f'/proc/self/fd/{fd}')
+
+
+def _memory_backed_encoded_chunk_size(chunk: object) -> int:
+    """Return encoded size without changing the caller-visible stream position."""
+    position = int(chunk.tell())
+    chunk.seek(0, os.SEEK_END)
+    size = int(chunk.tell())
+    chunk.seek(position, os.SEEK_SET)
+    return int(size)
+
 def ffmpeg_rawvideo_writer(
     out_path: Path,
     width: int,
@@ -4030,7 +4091,13 @@ def ffmpeg_rawvideo_writer(
 ) -> subprocess.Popen:
     """Return a Popen with stdin open for writing raw frames."""
     _require_bin("ffmpeg")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path = Path(out_path)
+    memfd_match = re.fullmatch(r'/proc/self/fd/(\d+)', str(out_path))
+    inherited_fds: Tuple[int, ...] = ()
+    if memfd_match is None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        inherited_fds = (int(memfd_match.group(1)),)
     cmd = [
         "ffmpeg",
         "-y",
@@ -4057,8 +4124,17 @@ def ffmpeg_rawvideo_writer(
     if pix_fmt_out:
         cmd.extend(["-pix_fmt", str(pix_fmt_out)])
 
+    if inherited_fds:
+        # /proc/self/fd/<N> has no filename suffix, so select the intended container explicitly.
+        cmd.extend(["-f", "matroska"])
     cmd.append(str(out_path))
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        pass_fds=inherited_fds,
+    )
     assert proc.stdin is not None
     return proc
 
@@ -4553,7 +4629,7 @@ class ViewInfo:
     horizontal_axis: str = ''
     vertical_axis: str = ''
     stack_axis: str = ''
-    # v16.0.0 Radial orientation/source metadata. ``radial_base_view`` names the
+    # v16.0.1 Radial orientation/source metadata. ``radial_base_view`` names the
     # Cartesian coordinate system whose in-plane circle is transformed. A tilted
     # Radial view carries the selected concrete Tilted variant in the remaining fields.
     radial_base_view: str = ''
@@ -5037,7 +5113,7 @@ def get_radial_sampler(view: ViewInfo, angle_deg: float) -> RadialSampler:
     if not is_radial_view(view):
         raise ValueError('Radial sampler requested for a non-radial view')
 
-    # v16.0.0: the circle lives in the selected Cartesian/Tilted projected plane,
+    # v16.0.1: the circle lives in the selected Cartesian/Tilted projected plane,
     # not unconditionally in global XY. ``center_x/center_y`` and the Lanczos taps
     # therefore use that base plane's (horizontal, vertical) coordinate system.
     plane_h, plane_w = radial_plane_shape(view)
@@ -7923,7 +7999,7 @@ def load_ultralytics_model(path: str, task: str = 'segment'):
 def background_model_load_enabled() -> bool:
     """Return True when main-process model loading overlaps decode/preparation.
 
-    v16.0.0 retains the v15.0.5 default overlap. Set YOLO_TTA_BACKGROUND_MODEL_LOAD=0
+    v16.0.1 retains the v15.0.5 default overlap. Set YOLO_TTA_BACKGROUND_MODEL_LOAD=0
     only for debugging or backends whose constructor is not safe in a loader thread.
     CUDA runs load inside their persistent GPU workers while the default streaming
     decode producer is active.
@@ -21278,7 +21354,7 @@ def assemble_current_view_union_volume(
     postprocessing runs in source voxels; None keeps the working geometry.
     """
     if len(view_volumes_by_model) != 1:
-        raise ValueError('GPT-5.6-Sol-Pro v16.0.0 supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.0.1 supports exactly one --model; multiple-model inference has been removed')
 
     union_shape = (int(T), int(H), int(W)) if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
     model_name = next(iter(view_volumes_by_model.keys()))
@@ -23748,11 +23824,11 @@ def _v14_submit_sparse_audit_layer(
         pass_index=int(pass_index), stage='', description=str(description),
         layer_role='subtractive_delta' if is_removed_delta else 'marker_only',
         recomposition_op='subtract_from_previous_checkpoint' if is_removed_delta else 'none',
-        # Max-pool downbinning does not commute with subtraction.  Sparse audit
-        # masks therefore stay full-quality only; downbinned result checkpoints
-        # remain the valid low-quality representation of each pass.
+        # Max-pool downbinning does not commute with subtraction, so these mirrors are
+        # diagnostic-only at low quality. They are nevertheless emitted so every requested
+        # downbin contains matching removed-components and watershed-candidate audit layers.
         low_quality_recomposition_op='diagnostic_only' if is_removed_delta else 'none',
-        mirror_low_quality=False,
+        mirror_low_quality=True,
         segment_extent_ijk=extent,
         segment_extent_shape_tyx=tuple(int(v) for v in shape_tyx),
         segment_extent_source='incremental_centerline_audit_cvol_index',
@@ -28352,7 +28428,7 @@ def materialize_nrrd_view_layer(
         'source_raw_path': str(raw_path),
         'source_raw_workspace': 'in_memory_when_available' if bool(transient_projection_in_memory) else 'disk_backed',
         'projection_payload_fusion': (
-            'transverse_radial_sink_only_v16.0.0'
+            'transverse_radial_sink_only_v16.0.1'
             if radial_sink_only_projection_supported(view) else 'dense_projection'
         ),
     }
@@ -30467,12 +30543,15 @@ def _run_sharded_ffv1_encode(
     scratch_dir: Optional[Path] = None,
     publication_root: Optional[Path] = None,
 ) -> None:
-    """Encode contiguous FFV1 shards concurrently, then stream-copy concat atomically.
+    """Encode contiguous FFV1 shards into memory, then stream-concat atomically to disk.
 
-    The range callback owns one ffmpeg producer/process.  On the first shard failure all
-    registered encoders are terminated, every worker is reaped, the temporary directory is
-    removed, and the previous destination (if any) is left untouched.
+    Each range callback owns one ffmpeg producer/process whose Matroska output is an anonymous
+    memfd. On the first shard failure all registered encoders are terminated and every worker
+    is reaped. The only filesystem write is the ordered concat stream into a same-filesystem
+    atomic publication stage, so the previous destination remains untouched on failure.
+    ``scratch_dir`` remains in the public call contract but is no longer used for encoded shards.
     """
+    _ = scratch_dir
     total = int(total_frames)
     segments = int(ffv1_segment_count(total))
     cancel_event = threading.Event()
@@ -30502,8 +30581,6 @@ def _run_sharded_ffv1_encode(
                 proc.terminate()
             except Exception:
                 pass
-        # Bound abnormal shutdown: a wedged ffmpeg must not keep executor.shutdown(wait=True)
-        # alive indefinitely after another shard has already failed.
         deadline = time.monotonic() + 5.0
         for proc in processes:
             try:
@@ -30521,33 +30598,21 @@ def _run_sharded_ffv1_encode(
     def _progress_one() -> None:
         progress.update(1)
 
-    temp_root: Optional[Path] = None
-    scratch_root: Optional[Path] = None
     joined_path: Optional[Path] = None
     publication_stage_dir: Optional[Path] = None
     executor: Optional[ThreadPoolExecutor] = None
     futures: List[Future] = []
+    shard_files: List[object] = []
     first_error: Optional[BaseException] = None
     try:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-        scratch_root = (
-            Path(scratch_dir)
-            if scratch_dir is not None
-            else Path(tempfile.gettempdir())
-        ) / 'ffv1'
-        if (
-            publication_root is not None
-            and _path_is_relative_to(scratch_root, Path(publication_root))
-        ):
-            root = Path(publication_root)
-            scratch_root = root.parent / f'.{root.name}.ffv1-temp'
-        scratch_root.mkdir(parents=True, exist_ok=True)
-        temp_root = Path(tempfile.mkdtemp(
-            prefix=f'.{Path(out_path).stem}.ffv1-segments-',
-            dir=str(scratch_root),
-        ))
         ranges = _ffv1_contiguous_segments(total, segments)
-        shard_paths = [temp_root / f'segment_{idx:04d}.mkv' for idx in range(len(ranges))]
+        for idx in range(len(ranges)):
+            shard_files.append(_open_memory_backed_encoded_chunk(
+                f'{Path(out_path).stem}.ffv1.segment_{idx:04d}.mkv',
+                require_fileno=True,
+            ))
+        shard_paths = [_memory_backed_encoded_chunk_path(chunk) for chunk in shard_files]
         executor = ThreadPoolExecutor(max_workers=len(ranges), thread_name_prefix='ffv1-segment')
         futures = [
             executor.submit(
@@ -30572,36 +30637,53 @@ def _run_sharded_ffv1_encode(
         if first_error is not None:
             raise RuntimeError(f'FFV1 segmented encode failed for {Path(out_path).name}') from first_error
 
-        missing = [path for path in shard_paths if not path.is_file() or path.stat().st_size <= 0]
-        if missing:
-            raise RuntimeError(f'FFV1 encoder did not produce {len(missing)} shard(s): {missing[:3]}')
+        missing_indices: List[int] = []
+        for idx, chunk in enumerate(shard_files):
+            chunk.flush()
+            if _memory_backed_encoded_chunk_size(chunk) <= 0:
+                missing_indices.append(int(idx))
+        if missing_indices:
+            raise RuntimeError(
+                f'FFV1 encoder did not produce {len(missing_indices)} in-memory shard(s): '
+                f'{missing_indices[:3]}'
+            )
 
-        # C14: shards/list and the growing concat inode all stay outside publication.
-        # The staging directory is a sibling of the run output root on the same filesystem.
         joined_path, publication_stage_dir = _atomic_publication_stage_path(
             Path(out_path), publication_root=publication_root,
         )
-        if len(shard_paths) == 1:
-            with open(shard_paths[0], 'rb', buffering=0) as src_fh, open(joined_path, 'wb', buffering=0) as dst_fh:
-                shutil.copyfileobj(src_fh, dst_fh, length=16 * 1024 * 1024)
+        if len(shard_files) == 1:
+            shard_files[0].seek(0)
+            with open(joined_path, 'wb', buffering=0) as dst_fh:
+                shutil.copyfileobj(shard_files[0], dst_fh, length=16 * 1024 * 1024)
                 dst_fh.flush()
                 os.fsync(dst_fh.fileno())
         else:
-            # Fixed safe filenames avoid concat-demuxer quoting ambiguity. All paths are
-            # relative to the list inside the private scratch directory.
-            concat_list = temp_root / 'segments.ffconcat'
-            concat_list.write_text(
-                'ffconcat version 1.0\n' + ''.join(f"file '{path.name}'\n" for path in shard_paths),
-                encoding='utf-8',
+            for chunk in shard_files:
+                chunk.seek(0)
+            concat_text = 'ffconcat version 1.0\n' + ''.join(
+                f"file 'file:/proc/self/fd/{int(chunk.fileno())}'\n"
+                for chunk in shard_files
             )
             cmd = [
                 'ffmpeg', '-y', '-v', 'error',
-                '-f', 'concat', '-safe', '0', '-i', str(concat_list),
+                '-f', 'concat', '-safe', '0',
+                '-protocol_whitelist', 'file,pipe', '-i', 'pipe:0',
                 '-map', '0:v:0', '-c', 'copy', '-f', 'matroska', str(joined_path),
             ]
-            completed = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            completed = subprocess.run(
+                cmd,
+                input=concat_text.encode('utf-8'),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                pass_fds=tuple(int(chunk.fileno()) for chunk in shard_files),
+            )
             if int(completed.returncode) != 0:
-                stderr = completed.stderr.decode('utf-8', errors='ignore') if isinstance(completed.stderr, (bytes, bytearray)) else str(completed.stderr)
+                stderr = (
+                    completed.stderr.decode('utf-8', errors='ignore')
+                    if isinstance(completed.stderr, (bytes, bytearray))
+                    else str(completed.stderr)
+                )
                 raise RuntimeError(f'FFV1 lossless concat failed for {Path(out_path).name}: {stderr}')
             with open(joined_path, 'rb') as joined_fh:
                 os.fsync(joined_fh.fileno())
@@ -30617,22 +30699,21 @@ def _run_sharded_ffv1_encode(
             except TypeError:  # Python < 3.9 compatibility
                 executor.shutdown(wait=True)
         progress.close()
+        for chunk in shard_files:
+            try:
+                chunk.close()
+            except Exception:
+                pass
         if joined_path is not None:
             try:
                 joined_path.unlink(missing_ok=True)
             except Exception:
                 pass
-        if temp_root is not None:
-            shutil.rmtree(temp_root, ignore_errors=True)
-        # ``scratch_root`` is a shared container.  Removing it here races another
-        # writer between that writer's mkdir() and mkdtemp(); only the uniquely
-        # owned ``temp_root`` is eligible for per-writer cleanup.
         if publication_stage_dir is not None:
             try:
                 publication_stage_dir.rmdir()
             except OSError:
                 pass
-
 
 def write_overlay_video(
     volume_rgb: np.memmap,  # (T,H,W) gray/luma
@@ -31903,7 +31984,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.6-Sol-Pro_v16.0.0_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.6-Sol-Pro_v16.0.1_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -32257,7 +32338,7 @@ def write_single_layer_nrrd_from_ref(
                 )
         return out_path
 
-    # v13.3.16 (N19, inherited N18): each z band compresses into an independent unlinked spool.
+    # v16.0.1: each z band compresses into an independent anonymous memory-backed chunk.
     # A band holds ONE process-global permit only while it is actually compressing. This
     # lets two 8-band global files use a 12-lane budget concurrently and removes the
     # ordered bounded-queue backpressure that previously kept later compressors idle.
@@ -32273,14 +32354,11 @@ def write_single_layer_nrrd_from_ref(
             f'{max(band_weights) / (1024 ** 2):.1f} MiB/shard'
         )
     print(
-        f'v13.3.16 (N19): {out_path.name} -> {shard_count} independent compressed z spools '
+        f'v16.0.1: {out_path.name} -> {shard_count} in-memory compressed z chunks '
         f'(min_slices={nrrd_layer_zshard_min_slices()}, z_chunk={shard_z_chunk}'
         f'{weight_note}; one global permit per active band).'
     )
     zshard_permits = _nrrd_zshard_semaphore()
-    spool_dir_raw = os.environ.get('YOLO_TTA_NRRD_SHARD_SPOOL_DIR', '').strip()
-    spool_dir = Path(spool_dir_raw).expanduser() if spool_dir_raw else out_path.parent
-    spool_dir.mkdir(parents=True, exist_ok=True)
     n19_started = time.perf_counter()
     n19_band_metrics: List[Optional[Tuple[float, int, int, int]]] = [None] * int(shard_count)
 
@@ -32290,9 +32368,11 @@ def write_single_layer_nrrd_from_ref(
         spool = None
         band_started = time.perf_counter()
         try:
-            # TemporaryFile is unlinked immediately on POSIX, so no partially-compressed
-            # artifacts are visible to rsync/watchers and no later cleanup scan is needed.
-            spool = tempfile.TemporaryFile(mode='w+b', dir=str(spool_dir))
+            # Keep the complete compressed band in an anonymous memory-backed file. No encoded
+            # shard is written to the output or scratch filesystem before ordered assembly.
+            spool = _open_memory_backed_encoded_chunk(
+                f'{out_path.stem}.nrrd.z{int(z0):06d}-{int(z1):06d}.gz',
+            )
             with _open_nrrd_payload_writer(spool) as payload_writer:
                 _write_one_decomposed_nrrd_layer_payload(
                     ref,
@@ -32356,7 +32436,7 @@ def write_single_layer_nrrd_from_ref(
                     if step is None:
                         step = len(view) - written
                     if int(step) <= 0:
-                        raise OSError('NRRD shard spool copy made no forward progress')
+                        raise OSError('NRRD in-memory chunk copy made no forward progress')
                     written += int(step)
                 total += int(written)
             return int(total)
@@ -32375,8 +32455,8 @@ def write_single_layer_nrrd_from_ref(
                 data_type='unsigned char',
                 encoding='gzip',
             )
-            # Wait/copy in z order. Later bands continue compressing independently while
-            # an earlier completed spool is copied as already-compressed bytes.
+            # Wait/copy in z order. Later bands continue compressing independently in memory
+            # while an earlier completed chunk streams as already-compressed bytes to disk.
             for i, fut in enumerate(futures):
                 spool = fut.result()
                 spools.append(spool)
@@ -32394,7 +32474,7 @@ def write_single_layer_nrrd_from_ref(
                 f'{float(slowest[0]):.2f}s/{int(slowest[1]) / (1024 ** 2):.1f} MiB'
             )
         print(
-            f'v13.3.16 (N19): {out_path.name} completed in '
+            f'v16.0.1: {out_path.name} completed in '
             f'{time.perf_counter() - n19_started:.2f}s; compressed='
             f'{compressed_total / GIB:.2f} GiB{slowest_note}.'
         )
@@ -33125,7 +33205,7 @@ class NrrdLayerSink:
                         'full-quality nrrd/ folder, isotropically downbinned to this spec.',
                         'Each NRRD is one uint8 binary mask in source output geometry (X, Y, t), downbinned.',
                         'v13.2.3: each file is a 3D Slicer segmentation (.seg.nrrd) sharing its full-quality layer\'s segment name and color.',
-                        'Layer suffixes match the corresponding full-quality layers. Sparse subtractive and marker-only audit layers are intentionally not mirrored.',
+                        'Layer suffixes match the corresponding full-quality layers. Centerline removed-component and watershed-candidate audit layers are mirrored as non-recomposable downbins (diagnostic_only and none, respectively).',
                         'Use each layer\'s recomposition_op. Only union entries marked union; select entries are complete checkpoints.',
                     ],
                 }, indent=2))
@@ -35097,7 +35177,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('GPT-5.6-Sol-Pro v16.0.0 accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.0.1 accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -35349,7 +35429,7 @@ def main() -> None:
     out_dir = Path(args.output).expanduser().resolve() if args.output else (Path.cwd() / input_path.stem)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    temp_dir = choose_scratch_dir(None, out_dir, input_path.stem)
+    temp_dir = choose_scratch_dir(args.temp, out_dir, input_path.stem)
     expose_scratch_in_output(out_dir, temp_dir)
     # T10: say which kind of scratch this is. Memory-backed scratch is what takes the shared
     # tile canvas (and the shared source volume, which is allocated under the same root) off
@@ -35702,7 +35782,7 @@ def main() -> None:
         )
     if (not gpu_worker_process_active) and background_model_load_enabled():
         spec_notes.append(
-            'v16.0.0 retains startup overlap by default: the YOLO model load is submitted before decode/native-volume preparation and joined only when prediction needs it. Set YOLO_TTA_BACKGROUND_MODEL_LOAD=0 to force synchronous loading.'
+            'v16.0.1 retains startup overlap by default: the YOLO model load is submitted before decode/native-volume preparation and joined only when prediction needs it. Set YOLO_TTA_BACKGROUND_MODEL_LOAD=0 to force synchronous loading.'
         )
     elif gpu_worker_process_active:
         spec_notes.append(
@@ -35758,7 +35838,7 @@ def main() -> None:
             'all execute at source dimensions. No tail restore resample occurs.'
         )
     spec_notes.append(
-        f'v16.0.0 Cartesian selection: --enable_cartesian={list(enabled_cartesian_views)}. '
+        f'v16.0.1 Cartesian selection: --enable_cartesian={list(enabled_cartesian_views)}. '
         'No Cartesian view is implicit; non-90 degree Cartesian augmentations use clamp-to-frame '
         'black fill rather than expanded padding.'
     )
@@ -35766,7 +35846,7 @@ def main() -> None:
     if concrete_tilted:
         active_tilt_labels = ', '.join(pretty_view_name(v) for v in concrete_tilted)
         spec_notes.append(
-            f'v16.0.0 Tilted Views active from --enable_tilted={list(tilt_views)}, '
+            f'v16.0.1 Tilted Views active from --enable_tilted={list(tilt_views)}, '
             f'--tilt_direction={list(tilt_directions)}, --tilt_angle={[float(v) for v in tilt_angles]}. '
             'No Tilted base is implicit; each base/direction/signed-angle configuration remains '
             'independent until final union. Active tilted configurations: '
@@ -35786,7 +35866,7 @@ def main() -> None:
             for v in concrete_radial
         )
         spec_notes.append(
-            'v16.0.0 Radial transforms active: ' + radial_notes + '. Cartesian Radial bases do '
+            'v16.0.1 Radial transforms active: ' + radial_notes + '. Cartesian Radial bases do '
             'not require upright Cartesian views. Each tilted_* target expands across every matching '
             'enabled signed-angle/direction Tilted variant. Circles are constructed in working projected '
             'view space; source-geometry t restoration naturally produces sagittal/coronal and Tilted '
@@ -36100,9 +36180,10 @@ def main() -> None:
         f'v12.2.11 keeps waiting tiles and tile-set/category accumulators in RAM by default (YOLO_TTA_SPILL_WAITING_TILES={int(waiting_tile_spill_enabled())}, YOLO_TTA_TILE_ACCUMULATORS_IN_RAM={int(tile_intermediate_accumulators_prefer_memory())}); disk ctile spill is now opt-in. '
         f'v15.0.3 (T10) sizes the tile-accumulator RAM reserve against the cgroup-corrected available anonymous memory '
         f'(now {tile_intermediate_accumulator_reserve_bytes() / GIB:.1f} GiB; YOLO_TTA_TILE_ACCUMULATOR_RESERVE_GIB pins it, '
-        f'YOLO_TTA_TILE_ACCUMULATOR_RESERVE_FRACTION/_MIN_GIB/_MAX_GIB shape it) and auto-selects a memory-backed scratch mount '
-        f'when one has provable room (scratch is memory-backed={int(scratch_dir_is_memory_backed())}; '
-        f'YOLO_TTA_SCRATCH_PREFER_SHM=0 disables, =1 forces, YOLO_TTA_SCRATCH_SHM_MIN_FREE_GIB sets the bar).'
+        f'YOLO_TTA_TILE_ACCUMULATOR_RESERVE_FRACTION/_MIN_GIB/_MAX_GIB shape it). v16.0.1 defaults scratch to <output>/temp; '
+        f'--temp or YOLO_TTA_SCRATCH_DIR selects an explicit root, while an explicitly configured YOLO_TTA_SCRATCH_PREFER_SHM '
+        f'may select a proven-roomy memory-backed root (scratch is memory-backed={int(scratch_dir_is_memory_backed())}; '
+        f'=0 disables, =1 forces, YOLO_TTA_SCRATCH_SHM_MIN_FREE_GIB sets the bar).'
     )
     spec_notes.append(
         'Postprocessed tiles waiting for parent support stay in RAM by default and use ctile-mask-v2-raw only when YOLO_TTA_SPILL_WAITING_TILES=1; decomposed NRRD/support layers use cvol-mask-v2-raw where enabled: empty slices are elided, '
@@ -39167,8 +39248,11 @@ def main() -> None:
             f'sparse removed-component/watershed-candidate layers plus a result checkpoint were written under '
             f'{nrrd_dir}. Audit-only mode uses the same full reference raster as every other NRRD '
             f'and does not enable the legacy per-view decomposition. The manifest identifies explicit select/subtract/marker '
-            f'roles for {int(nrrd_centerline_audit_files_written)} centerline audit file(s) and '
-            f'{int(nrrd_layer_files_written)} total layer file(s) from this run.'
+            f'roles for {int(nrrd_centerline_audit_files_written)} full-quality centerline audit file(s), '
+            f'{int(nrrd_low_quality_centerline_audit_files_written)} matching low-quality audit mirror file(s), and '
+            f'{int(nrrd_layer_files_written)} total full-quality layer file(s) from this run. Removed-component '
+            'downbins use diagnostic_only and watershed-candidate downbins use none; neither participates in '
+            'low-quality recomposition because max-pool downbinning does not commute with subtraction.'
         )
 
     summary_path = write_summary_file(
