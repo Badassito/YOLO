@@ -2,10 +2,10 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the GPT-5.6-Sol-Pro v16.0.1 SLURM view-rework release, copied from the
-confirmed-running GPT-5.6-Sol-Pro_v15.0.5_SLURM.py. It consolidates Cartesian and Tilted
-view selection, generalizes Radial views across all Cartesian orientations and enabled
-Tilted variants, and supports per-Radial-view azimuth spacing.
+This is the GPT-5.6-Sol-Pro v16.0.2 SLURM performance release, built from
+GPT-5.6-Sol-Pro_v16.0.1_SLURM.py. It consolidates Cartesian and Tilted view selection,
+generalizes Radial views across all Cartesian orientations and enabled Tilted variants,
+and supports per-Radial-view azimuth spacing.
 
 Current runtime behavior:
   - accepts gray/grey, RGB, or C{odd}S{stride} model-input channel layouts
@@ -19,6 +19,10 @@ Current runtime behavior:
   - writes every single-layer Slicer segmentation NRRD in the complete output geometry
   - overlaps model loading with decode/preparation by default, then overlaps inference,
     view cleanup/interpolation, backprojection, and output writing
+  - admits multiple independent parent-view preparation tasks even when interpolation is off
+  - restores/unions final geometry through pinned, multi-stream, multi-GPU bands when admitted
+  - resolves keep_objects topology through parallel 3D slabs and boundary-only global merges
+  - leaves centerline audit/filter passes disabled unless explicitly requested
 
 Dependencies:
   pip install opencv-python numpy scipy tifffile tqdm ultralytics
@@ -491,7 +495,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--voxel_volume", action="store_true", help="Count white voxels in the final binary output after restoration to native input geometry and save the value to the summary text file")
     p.add_argument("--enable_3d_void_fill", action="store_true",
                    help="Apply one final 3D enclosed-void fill after the global union. Disabled by default")
-    p.add_argument("--centerline_filter_passes", default=2, type=int,
+    p.add_argument("--centerline_filter_passes", default=0, type=int,
                    help="Maximum v14 centerline-guided post-union passes. Pass 0 is always the untouched audit checkpoint; 0 disables both filtering and its audit NRRDs")
     p.add_argument("--centerline_filter_backend", default="embedded", choices=["embedded", "auto", "vmtk", "off"],
                    help="Centerline backend. embedded (default) uses the in-script SciPy EDT medial-ridge tracker and requires no VMTK; auto prefers VMTK when available then falls back to embedded; vmtk explicitly requires VTK/VMTK and safely passes through if unavailable; off disables filtering")
@@ -860,7 +864,7 @@ class RuntimeTelemetry:
                     'mean_ms': (seconds * 1000.0 / calls) if calls else 0.0,
                 }
             payload: Dict[str, object] = {
-                'schema': 'gpt-5.6-sol-pro-v16.0.1.telemetry.v1',
+                'schema': 'gpt-5.6-sol-pro-v16.0.2.telemetry.v1',
                 'pid': os.getpid(),
                 'monotonic_seconds': (now_ns - self.started_ns) / 1e9,
                 'wall_time': time.time(),
@@ -1721,28 +1725,92 @@ def gpu_worker_tail_split_point(
 INTERPOLATION_PROCESS_WORKER_DEFAULT_CAP = 6
 
 
+def _estimate_parent_view_postprocess_bytes(
+    view: 'ViewInfo',
+    *,
+    nrrd_layers_enabled: bool,
+    interpolation_enabled: bool,
+) -> int:
+    """Conservative live working-set estimate for one outer parent-view task.
+
+    The baseline union already exists before admission, so this estimate covers the transient
+    cleanup/projection/cvol buffers and the bounded slice bands used by the task.  Interpolation
+    has separate workspace admission, but reserving several GiB here prevents the outer pool
+    from opening too many large view preparations while child passes are live.
+    """
+    plane_bytes = max(1, int(getattr(view, 'src_h', 1))) * max(1, int(getattr(view, 'src_w', 1)))
+    slices = max(1, int(getattr(view, 'num_slices', 1)))
+    live_slices = min(slices, 64 if bool(nrrd_layers_enabled) else 32)
+    multiplier = 4 if bool(nrrd_layers_enabled) else 2
+    estimate = int(plane_bytes) * int(live_slices) * int(multiplier)
+    if bool(interpolation_enabled):
+        estimate = max(int(estimate), 4 * GIB)
+    return max(512 * 1024 * 1024, min(16 * GIB, int(estimate)))
+
+
+def resolve_parent_postprocess_worker_allocation(
+    worker_budget: int,
+    views: Sequence['ViewInfo'],
+    *,
+    nrrd_layers_enabled: bool,
+    interpolation_enabled: bool,
+) -> Tuple[int, int, int, int, int]:
+    """Resolve independent outer-view and per-view slice concurrency.
+
+    v16.0.2 removes the accidental dependency on ``interpolation_workers``.  Defaults admit
+    two to four independent views when CPU and anonymous-memory headroom allow it, then divide
+    the main-process worker budget across those views so nested slice pools do not multiply the
+    machine-wide thread count.  Explicit environment overrides remain available.
+
+    Returns ``(outer_workers, slice_workers_per_view, estimated_bytes_per_view,
+    memory_limited_outer_workers, default_outer_workers)``.
+    """
+    budget = max(1, int(worker_budget))
+    view_list = list(views)
+    view_count = max(1, len(view_list))
+    per_view_bytes = max(
+        [_estimate_parent_view_postprocess_bytes(
+            view,
+            nrrd_layers_enabled=bool(nrrd_layers_enabled),
+            interpolation_enabled=bool(interpolation_enabled),
+        ) for view in view_list]
+        or [512 * 1024 * 1024]
+    )
+    reserve = int(max(0.0, _env_float('YOLO_TTA_PARENT_POSTPROCESS_RESERVE_GIB', 16.0)) * GIB)
+    usable = max(0, int(available_anon_work_bytes()) - int(reserve))
+    memory_cap = max(1, min(int(view_count), int(usable // max(1, int(per_view_bytes)))))
+    cpu_cap = max(1, min(4, int(view_count), max(1, int(budget) // 16)))
+    default_outer = max(1, min(int(view_count), int(cpu_cap), int(memory_cap)))
+    requested_outer = max(1, _env_int('YOLO_TTA_PARENT_POSTPROCESS_WORKERS', int(default_outer)))
+    outer_workers = max(1, min(int(view_count), int(budget), int(requested_outer)))
+    default_slice_workers = max(1, int(budget) // max(1, int(outer_workers)))
+    slice_workers = max(
+        1,
+        min(
+            int(budget),
+            _env_int('YOLO_TTA_PARENT_SLICE_WORKERS', int(default_slice_workers)),
+        ),
+    )
+    return (
+        int(outer_workers),
+        int(slice_workers),
+        int(per_view_bytes),
+        int(memory_cap),
+        int(default_outer),
+    )
+
+
 def resolve_parent_interpolation_worker_allocation(
     worker_budget: int,
     parent_postprocess_workers: int,
+    *,
+    interpolation_process_backend_active: bool,
 ) -> Tuple[int, int, int]:
-    """Resolve per-parent interpolation workers from expected live overlap.
+    """Resolve per-parent interpolation workers from actual live overlap.
 
-    Parent full-frame interpolation used to divide the global worker budget by the total
-    number of parent postprocess workers, which also tracked the number of active views.
-    Current scheduling normally completes a view's interpolation before the next parent
-    begins and rarely has more than two parent views interpolating at once.  The default
-    therefore partitions the global worker budget by expected live overlap instead of by
-    total active view count.
-
-    Returns ``(expected_overlap, default_per_parent_workers, resolved_per_parent_workers)``.
-    ``YOLO_TTA_INTERPOLATION_CONCURRENT_PARENTS`` changes the overlap estimate and
-    ``YOLO_TTA_INTERPOLATION_TASK_WORKERS`` still overrides the final per-parent worker count.
-
-    v13.3.3: with the interpolation process backend active (the default), up to
-    INTERPOLATION_PROCESS_WORKER_DEFAULT_CAP passes really do run concurrently, so the default
-    overlap matches that cap instead of assuming a single live parent — otherwise each of the
-    concurrent passes spawns a full-budget thread pool and the box oversubscribes ~Nx during
-    the postprocess tail.
+    The process-backend state is supplied explicitly for the current command.  Merely having
+    the backend installed/configured no longer divides worker budgets when ``--interpolate 0``
+    leaves no interpolation task capable of running.
     """
     budget = max(1, int(worker_budget))
     parent_workers = max(1, int(parent_postprocess_workers))
@@ -1750,7 +1818,8 @@ def resolve_parent_interpolation_worker_allocation(
         1,
         min(
             parent_workers,
-            INTERPOLATION_PROCESS_WORKER_DEFAULT_CAP if interpolation_process_backend_enabled() else 1,
+            INTERPOLATION_PROCESS_WORKER_DEFAULT_CAP
+            if bool(interpolation_process_backend_active) else 1,
         ),
     )
     overlap = max(
@@ -15618,7 +15687,7 @@ class _UnionFind:
         b_ids = (codes_arr & np.uint64(0xFFFFFFFF)).astype(np.int64, copy=False)
         if (
             _numba_union_find_batch_kernel is not None
-            and compiled_interpolation_kernels_enabled()
+            and compiled_topology_kernels_enabled()
             and not _NUMBA_UNION_FIND_KERNEL_RUNTIME_DISABLED
         ):
             try:
@@ -16203,6 +16272,45 @@ def gpu_slice_labeling_pairs_enabled() -> bool:
     return _env_flag('YOLO_TTA_GPU_SLICE_LABELING_PAIRS', True)
 
 
+def topology_slab_slices() -> int:
+    """v16.0.2 z-depth of independently resolved 3D topology slabs."""
+    return max(4, _env_int('YOLO_TTA_TOPOLOGY_SLAB_SLICES', 64))
+
+
+def topology_slab_ranges(z_dim: int) -> List[Tuple[int, int]]:
+    depth = max(1, int(topology_slab_slices()))
+    return [
+        (int(z0), min(int(z_dim), int(z0) + int(depth)))
+        for z0 in range(0, max(0, int(z_dim)), int(depth))
+    ]
+
+
+def topology_slab_workers(requested_workers: int, slab_count: int) -> int:
+    """Bound concurrent local union-find slabs; Numba releases the GIL for pair batches."""
+    default_workers = min(8, max(1, int(requested_workers)), max(1, int(slab_count)))
+    resolved = max(1, _env_int('YOLO_TTA_TOPOLOGY_SLAB_WORKERS', int(default_workers)))
+    if _numba_union_find_batch_kernel is None or not compiled_topology_kernels_enabled():
+        # Python union-find is GIL-bound; several slab threads would only add memory pressure.
+        return 1
+    return max(1, min(int(resolved), max(1, int(slab_count))))
+
+
+def _round_robin_topology_gpu_blocks(
+    z_dim: int,
+    block_slices: int,
+    device_indices: Sequence[int],
+) -> List[Tuple[int, int, int]]:
+    """Assign deterministic contiguous slab/block ranges across all admitted GPUs."""
+    devices = tuple(dict.fromkeys(int(v) for v in device_indices))
+    if int(z_dim) <= 0 or not devices:
+        return []
+    depth = max(1, int(block_slices))
+    return [
+        (int(z0), min(int(z_dim), int(z0) + int(depth)), int(devices[idx % len(devices)]))
+        for idx, z0 in enumerate(range(0, int(z_dim), int(depth)))
+    ]
+
+
 _GPU_SLICE_LABELING_CONFIGURED_DEVICES: Optional[Tuple[int, ...]] = None
 
 
@@ -16305,6 +16413,7 @@ def _try_label_slices_stage_a_gpu(
     slice_bboxes: np.ndarray,
     slice_areas: Optional[List[Optional[np.ndarray]]],
     known_slice_any: Optional[np.ndarray] = None,
+    preferred_block_slices: Optional[int] = None,
 ) -> Tuple[bool, Optional[List[Optional[np.ndarray]]]]:
     """D3/D6/D7 GPU drop-in for per-slice labeling and adjacent-pair extraction.
 
@@ -16395,7 +16504,7 @@ def _try_label_slices_stage_a_gpu(
         plane = int(h) * int(w)
         # Adaptive z-block: u8 mask + int32 labels + int32 relabel + label() workspace,
         # ~17 B/voxel, plus ~1 GiB headroom for the coordinate transients.
-        requested_block = max(4, _env_int('YOLO_TTA_GPU_SLICE_LABELING_BLOCK', 64))
+        requested_block = max(4, _env_int('YOLO_TTA_GPU_SLICE_LABELING_BLOCK', int(preferred_block_slices or topology_slab_slices())))
         device_free: List[Tuple[int, int]] = []
         for dev_idx in candidate_indices:
             try:
@@ -16428,11 +16537,11 @@ def _try_label_slices_stage_a_gpu(
         # Fixed block boundaries make round-robin dispatch and the retained-plane boundary
         # contract deterministic. Use the smallest admitted block across selected devices.
         block = min(int(item[1]) for item in admitted)
-        block_specs = [
-            (int(z0), min(int(z_dim), int(z0) + int(block)))
-            for z0 in range(0, int(z_dim), int(block))
-        ]
-        device_indices = device_indices[:max(1, min(len(device_indices), len(block_specs)))]
+        provisional_block_count = int(math.ceil(float(z_dim) / float(max(1, int(block)))))
+        device_indices = device_indices[:max(1, min(len(device_indices), int(provisional_block_count)))]
+        block_assignments = _round_robin_topology_gpu_blocks(
+            int(z_dim), int(block), device_indices,
+        )
         pairs_on_device = bool(gpu_slice_labeling_pairs_enabled())
 
         global _GPU_SLICE_LABELING_ANNOUNCED
@@ -16441,7 +16550,7 @@ def _try_label_slices_stage_a_gpu(
             print(
                 f'GPU per-slice labeling active on '
                 f'{", ".join(f"cuda:{idx}" for idx in device_indices)} '
-                f'(v13.3.14 D3/D7, block={int(block)}, device-pairs={pairs_on_device}; '
+                f'(v16.0.2 slab-aligned D3/D7, block={int(block)}, blocks={len(block_assignments)}, device-pairs={pairs_on_device}; '
                 'YOLO_TTA_GPU_SLICE_LABELING=0 disables, '
                 'YOLO_TTA_GPU_SLICE_LABELING_DEVICES=1 forces one device).'
             )
@@ -16663,12 +16772,11 @@ def _try_label_slices_stage_a_gpu(
         previous_result: Optional[_GpuSliceLabelBlockResult] = None
         with ThreadPoolExecutor(max_workers=lane_count, thread_name_prefix='slice-label-gpu') as executor:
             pending: Dict[int, Future] = {}
-            for block_idx in range(min(lane_count, len(block_specs))):
-                z0, z1 = block_specs[block_idx]
-                dev_idx = device_indices[block_idx % lane_count]
+            for block_idx in range(min(lane_count, len(block_assignments))):
+                z0, z1, dev_idx = block_assignments[block_idx]
                 pending[block_idx] = executor.submit(_label_block, z0, z1, dev_idx)
 
-            for block_idx in range(len(block_specs)):
+            for block_idx in range(len(block_assignments)):
                 result = pending.pop(block_idx).result()
                 if precomputed_pairs is not None:
                     for z, codes in result.internal_pair_codes.items():
@@ -16739,9 +16847,8 @@ def _try_label_slices_stage_a_gpu(
                 previous_result = result
 
                 next_idx = int(block_idx + lane_count)
-                if next_idx < len(block_specs):
-                    z0, z1 = block_specs[next_idx]
-                    dev_idx = device_indices[next_idx % lane_count]
+                if next_idx < len(block_assignments):
+                    z0, z1, dev_idx = block_assignments[next_idx]
                     pending[next_idx] = executor.submit(_label_block, z0, z1, dev_idx)
 
         _free_admitted_device_pools()
@@ -16789,14 +16896,14 @@ def label_foreground_volume_streaming(
     known_slice_bboxes: Optional[np.ndarray] = None,
     sparse_local_labels: bool = False,
 ) -> Tuple[object, int, List[Path]]:
-    """Label a 3D foreground volume using parallel 2D slice labeling plus serial union-find.
+    """Label a 3D foreground volume through parallel 2D labeling and slab-local topology.
 
-      - the expensive per-slice 2D connected-component labeling runs concurrently across slices
-      - local slice labels are promoted to global provisional ids with a parallel pass
-      - adjacent-slice pair extraction can also run concurrently; only the final union-find merges
-        remain serial to preserve deterministic 26-connected object identities
-      - the compact relabel pass is slice-parallel (v13.3.2 R6b: bbox-restricted, and a single
-        numba prange(nogil) kernel replaces the thread pool when numba is available)
+      - per-slice 2D connected-component labeling runs concurrently and, when CUDA is available,
+        slab-aligned z blocks are distributed round-robin across the selected GPUs
+      - each multi-slice slab resolves its internal 26-connected topology independently
+      - only slab-boundary component pairs enter the much smaller global union-find
+      - the existing sparse per-slice local-label store is preserved; no dense uint32 cube is built
+      - the compact relabel pass remains bbox-restricted and slice-parallel/Numba-compiled
       - when wrap_axis is true, the first and last slices are treated as adjacent. This is used
         for Radial view-native interpolation over the [0°, 180°) diameter-frame domain.
 
@@ -16962,6 +17069,7 @@ def label_foreground_volume_streaming(
 
     # v13.3.6 (D3): one z-disconnected cupy label pass per block on the GPU replaces the
     # per-slice cv2 stage when CUDA is available in this process; CPU threads otherwise.
+    label_phase_started = time.perf_counter()
     gpu_stage_a_done, gpu_stage_a_pair_codes = _try_label_slices_stage_a_gpu(
         mask_mm,
         labels_store,
@@ -16969,6 +17077,7 @@ def label_foreground_volume_streaming(
         slice_bboxes,
         slice_areas if collect_stats else None,
         known_slice_any=known_slice_any,
+        preferred_block_slices=int(topology_slab_slices()),
     )
     if not gpu_stage_a_done:
         parallel_for_indices_chunked(
@@ -16979,6 +17088,7 @@ def label_foreground_volume_streaming(
             show_progress=True,
             target_chunks_per_worker=2,
         )
+    label_phase_seconds = time.perf_counter() - label_phase_started
 
     if sparse_enabled:
         labels_store.finalize()  # type: ignore[union-attr]
@@ -17005,9 +17115,6 @@ def label_foreground_volume_streaming(
     if int(z_dim) > 1:
         slice_offsets[1:] = cumsum[:-1].astype(np.uint32, copy=False)
 
-    uf = _UnionFind()
-    uf.new_ids(total_components)
-
     def _pair_codes_for_z(z: int) -> np.ndarray:
         if gpu_stage_a_pair_codes is not None:
             local_codes = gpu_stage_a_pair_codes[int(z)]
@@ -17015,8 +17122,6 @@ def label_foreground_volume_streaming(
                 local_codes_u64 = np.asarray(local_codes, dtype=np.uint64)
                 if local_codes_u64.size <= 0:
                     return np.zeros((0,), dtype=np.uint64)
-                # D6 emitted local ids before the all-slice component prefix existed.
-                # Promote both packed words now; no label-store page is touched.
                 prev_ids = (local_codes_u64 >> np.uint64(32)) + np.uint64(
                     int(slice_offsets[int(z) - 1])
                 )
@@ -17027,11 +17132,6 @@ def label_foreground_volume_streaming(
                     (prev_ids << np.uint64(32)) | curr_ids,
                     dtype=np.uint64,
                 )
-        # v13.2.5 (speed #11): the per-slice component counts already say whether a slice has any
-        # foreground (no full-slice np.any scans), and the pair extraction is restricted to the
-        # 1-pixel-expanded intersection of the two slices' foreground bboxes — every 26-connected
-        # cross-slice pair lies inside that window, and cropping both slices to the SAME window
-        # preserves the shift alignment _adjacent_gid_pair_codes relies on.
         if int(component_counts[int(z) - 1]) == 0 or int(component_counts[int(z)]) == 0:
             return np.zeros((0,), dtype=np.uint64)
         py0, py1, px0, px1 = (int(v) for v in slice_bboxes[int(z) - 1])
@@ -17042,8 +17142,16 @@ def label_foreground_volume_streaming(
         rx1 = min(int(w), min(px1, cx1) + 1)
         if ry0 >= ry1 or rx0 >= rx1:
             return np.zeros((0,), dtype=np.uint64)
-        prev_local_slice = np.asarray(labels_store[int(z) - 1, ry0:ry1, rx0:rx1])
-        curr_local_slice = np.asarray(labels_store[int(z), ry0:ry1, rx0:rx1])
+        if isinstance(labels_store, SparseSliceLabelStore):
+            prev_local_slice = labels_store.read_window(
+                int(z) - 1, int(ry0), int(ry1), int(rx0), int(rx1),
+            )
+            curr_local_slice = labels_store.read_window(
+                int(z), int(ry0), int(ry1), int(rx0), int(rx1),
+            )
+        else:
+            prev_local_slice = np.asarray(labels_store[int(z) - 1, ry0:ry1, rx0:rx1])
+            curr_local_slice = np.asarray(labels_store[int(z), ry0:ry1, rx0:rx1])
         return _adjacent_gid_pair_codes(
             prev_local_slice,
             curr_local_slice,
@@ -17051,119 +17159,254 @@ def label_foreground_volume_streaming(
             curr_offset=int(slice_offsets[int(z)]),
         )
 
-    if int(z_dim) > 1:
-        # D6 arrays are already compact and host-resident; a large CPU read pool would add
-        # scheduling overhead without any label-store I/O left to overlap.
-        if pair_workers <= 1 or gpu_stage_a_pair_codes is not None:
-            pair_iter: Iterable[np.ndarray] = (_pair_codes_for_z(int(z)) for z in range(1, int(z_dim)))
-        else:
-            pair_iter = parallel_map_in_order(
-                _pair_codes_for_z,
-                range(1, int(z_dim)),
-                max_workers=pair_workers,
-                max_pending=max(pair_workers, pair_workers * 2),
+    topology_started = time.perf_counter()
+    slab_ranges = topology_slab_ranges(int(z_dim))
+    slab_worker_count = topology_slab_workers(
+        max(int(workers), int(pair_workers)), len(slab_ranges),
+    )
+    union_code_cap = max(1, _env_int(
+        'YOLO_TTA_TOPOLOGY_UNION_BATCH_CODES', 1_048_576,
+    ))
+
+    def _resolve_topology_slab(slab_idx: int) -> Tuple[int, int, int, int, np.ndarray, int, float, float]:
+        z0, z1 = slab_ranges[int(slab_idx)]
+        gid_base = int(slice_offsets[int(z0)])
+        gid_count = int(np.sum(component_counts[int(z0):int(z1)], dtype=np.uint64))
+        if gid_count <= 0:
+            return (
+                int(slab_idx), int(z0), int(z1), int(gid_base),
+                np.zeros((1,), dtype=np.uint32), 0, 0.0, 0.0,
             )
-        compiled_union_batching = bool(
-            _numba_union_find_batch_kernel is not None
-            and compiled_interpolation_kernels_enabled()
-            and not _NUMBA_UNION_FIND_KERNEL_RUNTIME_DISABLED
-        )
-        if not compiled_union_batching:
-            # The Python fallback loops over every pair inside union_pair_codes. Joining
-            # adjacent arrays would add allocation/copy cost without reducing that work.
-            for codes in tqdm(
-                pair_iter,
-                total=max(0, int(z_dim) - 1),
-                desc='Interpolation: cross-slice unions',
-            ):
-                uf.union_pair_codes(np.asarray(codes, dtype=np.uint64))
-        else:
-            # C13: retain pair order but amortize the Python/Numba boundary across adjacent
-            # slice pairs. The cap bounds the temporary (default 8 MiB of uint64 codes), and
-            # oversized single-pair arrays are streamed through the same compiled kernel.
-            union_code_cap = max(1, _env_int(
-                'YOLO_TTA_TOPOLOGY_UNION_BATCH_CODES', 1_048_576,
-            ))
-            pending_codes: List[np.ndarray] = []
-            pending_code_count = 0
 
-            def _flush_topology_codes() -> None:
-                nonlocal pending_code_count
-                if pending_code_count <= 0:
-                    return
-                joined = (
-                    pending_codes[0]
-                    if len(pending_codes) == 1
-                    else np.concatenate(pending_codes).astype(np.uint64, copy=False)
-                )
-                uf.union_pair_codes(np.ascontiguousarray(joined, dtype=np.uint64))
-                pending_codes.clear()
-                pending_code_count = 0
+        local_uf = _UnionFind()
+        local_uf.new_ids(int(gid_count))
+        pending: List[np.ndarray] = []
+        pending_count = 0
+        pair_seconds = 0.0
+        union_seconds = 0.0
 
-            for codes in tqdm(
-                pair_iter,
-                total=max(0, int(z_dim) - 1),
-                desc='Interpolation: cross-slice unions',
-            ):
-                codes_u64 = np.asarray(codes, dtype=np.uint64)
-                if codes_u64.size <= 0:
-                    continue
-                if (
-                    int(pending_code_count) > 0
-                    and int(pending_code_count) + int(codes_u64.size) > int(union_code_cap)
-                ):
-                    _flush_topology_codes()
-                if int(codes_u64.size) >= int(union_code_cap):
-                    for code0 in range(0, int(codes_u64.size), int(union_code_cap)):
-                        uf.union_pair_codes(np.ascontiguousarray(
-                            codes_u64[int(code0):int(code0) + int(union_code_cap)],
-                            dtype=np.uint64,
-                        ))
-                else:
-                    pending_codes.append(codes_u64)
-                    pending_code_count += int(codes_u64.size)
-            _flush_topology_codes()
+        def _flush_local() -> None:
+            nonlocal pending_count, union_seconds
+            if pending_count <= 0:
+                return
+            joined = pending[0] if len(pending) == 1 else np.concatenate(pending)
+            t_union = time.perf_counter()
+            local_uf.union_pair_codes(np.ascontiguousarray(joined, dtype=np.uint64))
+            union_seconds += time.perf_counter() - t_union
+            pending.clear()
+            pending_count = 0
 
-    if bool(wrap_axis) and int(z_dim) > 1:
-        if int(component_counts[0]) > 0 and int(component_counts[int(z_dim) - 1]) > 0:
-            # v13.2.2 bug #2: the radial angular domain is [0°, 180°) over full-diameter
-            # frames, so the plane that continues the last frame (one Δ short of 180°) is
-            # frame 0 with the u axis REVERSED (u -> D-1-u) — exactly the reverse_u
-            # relation the radial backprojection uses. Comparing at identical (t, u)
-            # instead unioned mirror images through the rotation axis and missed the
-            # true angular continuation.
-            if isinstance(labels_store, SparseSliceLabelStore):
-                ly0, ly1, lx0, lx1 = (
-                    int(v) for v in slice_bboxes[int(z_dim) - 1]
-                )
-                fy0, fy1, fx0, fx1 = (int(v) for v in slice_bboxes[0])
-                mfx0, mfx1 = int(w - fx1), int(w - fx0)
-                ry0 = max(0, max(ly0, fy0) - 1)
-                ry1 = min(int(h), min(ly1, fy1) + 1)
-                rx0 = max(0, max(lx0, mfx0) - 1)
-                rx1 = min(int(w), min(lx1, mfx1) + 1)
-                if ry0 < ry1 and rx0 < rx1:
-                    last_gid_slice = labels_store.read_window(
-                        int(z_dim) - 1, ry0, ry1, rx0, rx1,
-                    )
-                    first_gid_slice = labels_store.read_window(
-                        0, ry0, ry1, int(w - rx1), int(w - rx0),
-                    )[:, ::-1]
-                else:
-                    last_gid_slice = np.empty((0, 0), dtype=label_dtype)
-                    first_gid_slice = np.empty((0, 0), dtype=label_dtype)
+        for z in range(int(z0) + 1, int(z1)):
+            t_pair = time.perf_counter()
+            global_codes = np.asarray(_pair_codes_for_z(int(z)), dtype=np.uint64)
+            pair_seconds += time.perf_counter() - t_pair
+            if global_codes.size <= 0:
+                continue
+            a_local = (global_codes >> np.uint64(32)) - np.uint64(int(gid_base))
+            b_local = (global_codes & np.uint64(0xFFFFFFFF)) - np.uint64(int(gid_base))
+            local_codes = np.ascontiguousarray(
+                (a_local << np.uint64(32)) | b_local, dtype=np.uint64,
+            )
+            if pending_count > 0 and pending_count + int(local_codes.size) > int(union_code_cap):
+                _flush_local()
+            if int(local_codes.size) >= int(union_code_cap):
+                for code0 in range(0, int(local_codes.size), int(union_code_cap)):
+                    t_union = time.perf_counter()
+                    local_uf.union_pair_codes(np.ascontiguousarray(
+                        local_codes[int(code0):int(code0) + int(union_code_cap)],
+                        dtype=np.uint64,
+                    ))
+                    union_seconds += time.perf_counter() - t_union
             else:
-                first_gid_slice = np.asarray(labels_store[0])  # type: ignore[index]
-                last_gid_slice = np.asarray(labels_store[int(z_dim) - 1])  # type: ignore[index]
-                first_gid_slice = first_gid_slice[:, ::-1]
-            uf.union_pair_codes(_adjacent_gid_pair_codes(
-                last_gid_slice,
-                first_gid_slice,
-                prev_offset=int(slice_offsets[int(z_dim) - 1]),
-                curr_offset=int(slice_offsets[0]),
-            ))
+                pending.append(local_codes)
+                pending_count += int(local_codes.size)
+        _flush_local()
 
-    root_map = uf.root_map()
+        local_root_map = local_uf.root_map()
+        unique_local_roots = np.unique(local_root_map[1:])
+        unique_local_roots = unique_local_roots[unique_local_roots > 0]
+        root_to_slab_component = np.zeros(local_root_map.shape, dtype=np.uint32)
+        root_to_slab_component[unique_local_roots] = np.arange(
+            1, int(unique_local_roots.size) + 1, dtype=np.uint32,
+        )
+        gid_local_to_slab_component = np.ascontiguousarray(
+            root_to_slab_component[local_root_map], dtype=np.uint32,
+        )
+        return (
+            int(slab_idx), int(z0), int(z1), int(gid_base),
+            gid_local_to_slab_component, int(unique_local_roots.size),
+            float(pair_seconds), float(union_seconds),
+        )
+
+    slab_results: List[Optional[Tuple[int, int, int, int, np.ndarray, int, float, float]]] = [
+        None
+    ] * len(slab_ranges)
+    if slab_worker_count <= 1:
+        for slab_idx in tqdm(
+            range(len(slab_ranges)), desc='Topology: local 3D slab unions',
+        ):
+            result = _resolve_topology_slab(int(slab_idx))
+            slab_results[int(result[0])] = result
+    else:
+        for result_obj in tqdm(
+            parallel_map_unordered(
+                _resolve_topology_slab,
+                range(len(slab_ranges)),
+                max_workers=int(slab_worker_count),
+                max_pending=max(int(slab_worker_count), int(slab_worker_count) * 2),
+            ),
+            total=len(slab_ranges),
+            desc='Topology: local 3D slab unions',
+        ):
+            result = result_obj  # type: ignore[assignment]
+            slab_results[int(result[0])] = result
+
+    gid_to_slab_component = np.zeros((int(total_components) + 1,), dtype=np.uint32)
+    slab_component_count = 0
+    slab_pair_seconds = 0.0
+    slab_union_seconds = 0.0
+    for result_opt in slab_results:
+        if result_opt is None:
+            raise RuntimeError('Topology slab worker returned no result')
+        (
+            _slab_idx, _z0, _z1, gid_base, local_map, local_component_count,
+            pair_seconds, union_seconds,
+        ) = result_opt
+        slab_pair_seconds += float(pair_seconds)
+        slab_union_seconds += float(union_seconds)
+        gid_count = int(local_map.size) - 1
+        if gid_count > 0:
+            mapped = local_map[1:].astype(np.uint64, copy=False) + np.uint64(
+                int(slab_component_count)
+            )
+            gid_to_slab_component[
+                int(gid_base) + 1:int(gid_base) + int(gid_count) + 1
+            ] = mapped.astype(np.uint32, copy=False)
+        slab_component_count += int(local_component_count)
+
+    if slab_component_count <= 0:
+        root_map = np.zeros((int(total_components) + 1,), dtype=np.uint32)
+        topology_boundary_seconds = 0.0
+        topology_root_seconds = 0.0
+    else:
+        global_uf = _UnionFind()
+        global_uf.new_ids(int(slab_component_count))
+        boundary_pending: List[np.ndarray] = []
+        boundary_pending_count = 0
+        topology_boundary_pair_seconds = 0.0
+        topology_boundary_union_seconds = 0.0
+
+        def _flush_boundaries() -> None:
+            nonlocal boundary_pending_count, topology_boundary_union_seconds
+            if boundary_pending_count <= 0:
+                return
+            joined = boundary_pending[0] if len(boundary_pending) == 1 else np.concatenate(boundary_pending)
+            t_union = time.perf_counter()
+            global_uf.union_pair_codes(np.ascontiguousarray(joined, dtype=np.uint64))
+            topology_boundary_union_seconds += time.perf_counter() - t_union
+            boundary_pending.clear()
+            boundary_pending_count = 0
+
+        def _submit_original_boundary_codes(original_codes: np.ndarray) -> None:
+            nonlocal boundary_pending_count
+            codes = np.asarray(original_codes, dtype=np.uint64)
+            if codes.size <= 0:
+                return
+            a_gid = (codes >> np.uint64(32)).astype(np.int64, copy=False)
+            b_gid = (codes & np.uint64(0xFFFFFFFF)).astype(np.int64, copy=False)
+            a_nodes = gid_to_slab_component[a_gid].astype(np.uint64, copy=False)
+            b_nodes = gid_to_slab_component[b_gid].astype(np.uint64, copy=False)
+            valid = (a_nodes > 0) & (b_nodes > 0) & (a_nodes != b_nodes)
+            if not bool(np.any(valid)):
+                return
+            mapped_codes = np.unique(
+                (a_nodes[valid] << np.uint64(32)) | b_nodes[valid]
+            ).astype(np.uint64, copy=False)
+            if boundary_pending_count > 0 and boundary_pending_count + int(mapped_codes.size) > int(union_code_cap):
+                _flush_boundaries()
+            if int(mapped_codes.size) >= int(union_code_cap):
+                for code0 in range(0, int(mapped_codes.size), int(union_code_cap)):
+                    t_union = time.perf_counter()
+                    global_uf.union_pair_codes(np.ascontiguousarray(
+                        mapped_codes[int(code0):int(code0) + int(union_code_cap)],
+                        dtype=np.uint64,
+                    ))
+                    topology_boundary_union_seconds += time.perf_counter() - t_union
+            else:
+                boundary_pending.append(np.ascontiguousarray(mapped_codes, dtype=np.uint64))
+                boundary_pending_count += int(mapped_codes.size)
+
+        for slab_idx in range(1, len(slab_ranges)):
+            boundary_z = int(slab_ranges[int(slab_idx)][0])
+            t_pair = time.perf_counter()
+            boundary_codes = _pair_codes_for_z(int(boundary_z))
+            topology_boundary_pair_seconds += time.perf_counter() - t_pair
+            _submit_original_boundary_codes(boundary_codes)
+
+        if bool(wrap_axis) and int(z_dim) > 1:
+            if int(component_counts[0]) > 0 and int(component_counts[int(z_dim) - 1]) > 0:
+                t_pair = time.perf_counter()
+                if isinstance(labels_store, SparseSliceLabelStore):
+                    ly0, ly1, lx0, lx1 = (int(v) for v in slice_bboxes[int(z_dim) - 1])
+                    fy0, fy1, fx0, fx1 = (int(v) for v in slice_bboxes[0])
+                    mfx0, mfx1 = int(w - fx1), int(w - fx0)
+                    ry0 = max(0, max(ly0, fy0) - 1)
+                    ry1 = min(int(h), min(ly1, fy1) + 1)
+                    rx0 = max(0, max(lx0, mfx0) - 1)
+                    rx1 = min(int(w), min(lx1, mfx1) + 1)
+                    if ry0 < ry1 and rx0 < rx1:
+                        last_gid_slice = labels_store.read_window(
+                            int(z_dim) - 1, ry0, ry1, rx0, rx1,
+                        )
+                        first_gid_slice = labels_store.read_window(
+                            0, ry0, ry1, int(w - rx1), int(w - rx0),
+                        )[:, ::-1]
+                    else:
+                        last_gid_slice = np.empty((0, 0), dtype=label_dtype)
+                        first_gid_slice = np.empty((0, 0), dtype=label_dtype)
+                else:
+                    first_gid_slice = np.asarray(labels_store[0])  # type: ignore[index]
+                    last_gid_slice = np.asarray(labels_store[int(z_dim) - 1])  # type: ignore[index]
+                    first_gid_slice = first_gid_slice[:, ::-1]
+                wrap_codes = _adjacent_gid_pair_codes(
+                    last_gid_slice,
+                    first_gid_slice,
+                    prev_offset=int(slice_offsets[int(z_dim) - 1]),
+                    curr_offset=int(slice_offsets[0]),
+                )
+                topology_boundary_pair_seconds += time.perf_counter() - t_pair
+                _submit_original_boundary_codes(wrap_codes)
+        _flush_boundaries()
+        topology_boundary_seconds = float(
+            topology_boundary_pair_seconds + topology_boundary_union_seconds
+        )
+
+        t_root = time.perf_counter()
+        slab_node_root_map = global_uf.root_map()
+        root_map = np.ascontiguousarray(
+            slab_node_root_map[gid_to_slab_component], dtype=np.uint32,
+        )
+        root_map[0] = np.uint32(0)
+        topology_root_seconds = time.perf_counter() - t_root
+
+    topology_total_seconds = time.perf_counter() - topology_started
+    topology_phase_seconds = {
+        'slice_label': float(label_phase_seconds),
+        'internal_pair_extraction': float(slab_pair_seconds),
+        'local_slab_union': float(slab_union_seconds),
+        'boundary_merge': float(topology_boundary_seconds),
+        'root_expansion': float(topology_root_seconds),
+        'topology_total': float(topology_total_seconds),
+    }
+    print(
+        'v16.0.2 topology slabs: '
+        f'{len(slab_ranges)} slab(s) x {int(topology_slab_slices())} slices, '
+        f'{int(slab_worker_count)} concurrent local union worker(s), '
+        f'{int(total_components)} slice component(s) -> {int(slab_component_count)} slab component(s); '
+        f'label={label_phase_seconds:.3f}s, internal_pairs={slab_pair_seconds:.3f}s, '
+        f'local_union={slab_union_seconds:.3f}s, boundary/root='
+        f'{float(topology_boundary_seconds) + float(topology_root_seconds):.3f}s.'
+    )
     if root_map.shape[0] <= 1:
         flush_array(labels_store)
         return labels_store, 0, label_paths
@@ -17181,6 +17424,7 @@ def label_foreground_volume_streaming(
     # v13.3.6 (A1): the same table is now ALSO exported through component_stats_out
     # ('slice_local_luts') so callers can consume per-slice local ids directly and skip the
     # full-volume relabel pass entirely.
+    lut_started = time.perf_counter()
     lut_sizes = component_counts.astype(np.int64, copy=False) + 1
     lut_offsets = np.zeros((int(z_dim),), dtype=np.int64)
     if int(z_dim) > 1:
@@ -17192,8 +17436,10 @@ def label_foreground_volume_streaming(
             offset = int(slice_offsets[int(z)])
             lo = int(lut_offsets[int(z)])
             lut_flat[lo + 1:lo + count + 1] = gid_to_compact[offset + 1:offset + count + 1]
+    topology_phase_seconds['lut_build'] = float(time.perf_counter() - lut_started)
 
     if collect_stats:
+        area_started = time.perf_counter()
         # v13.3.2 (R6c): per-gid areas -> per-root areas (bincount is one vectorized pass; voxel
         # counts stay far below 2^53 so the float64 accumulation is exact).
         gid_areas = np.zeros((int(total_components) + 1,), dtype=np.int64)
@@ -17208,6 +17454,7 @@ def label_foreground_volume_streaming(
             weights=gid_areas.astype(np.float64, copy=False),
             minlength=int(total_components) + 1,
         ).astype(np.int64)
+        topology_phase_seconds['area_reduction'] = float(time.perf_counter() - area_started)
         component_stats_out.update({
             'component_counts': component_counts,
             'slice_offsets': slice_offsets,
@@ -17216,6 +17463,10 @@ def label_foreground_volume_streaming(
             'unique_roots': unique_roots,
             'root_areas': root_areas,
             'total_components': int(total_components),
+            'topology_phase_seconds': dict(topology_phase_seconds),
+            'topology_slab_count': int(len(slab_ranges)),
+            'topology_slab_workers': int(slab_worker_count),
+            'topology_slab_components': int(slab_component_count),
             'slice_local_luts': SliceLocalLabelLUTs(
                 lut_flat=lut_flat,
                 lut_offsets=lut_offsets,
@@ -17230,7 +17481,7 @@ def label_foreground_volume_streaming(
         return labels_store, int(unique_roots.size), label_paths
 
     kernel_done = False
-    if compiled_interpolation_kernels_enabled() and _numba_compact_relabel_kernel is not None:
+    if compiled_topology_kernels_enabled() and _numba_compact_relabel_kernel is not None:
         try:
             print('Interpolation: compact relabel via numba nogil kernel')
             _numba_compact_relabel_kernel(
@@ -20563,16 +20814,31 @@ def fused_final_restore_geometry_groups_enabled() -> bool:
 
 
 def fused_final_gpu_enabled() -> bool:
-    """C13: optionally move grouped final restore/OR work onto idle inference GPUs.
+    """v16.0.2: move grouped final restore/OR work onto idle inference GPUs by default.
 
-    Sparse cvol decoding and stack formation are still host-side, so the CUDA path is
-    intentionally opt-in until its pageable H2D traffic is profiled on the target node.
+    Admission remains VRAM-aware and every failure rewrites the complete result through the
+    established CPU G5 path. Set ``YOLO_TTA_FUSED_FINAL_GPU=0`` for a CPU-only comparison.
     """
-    return _env_flag('YOLO_TTA_FUSED_FINAL_GPU', False)
+    return _env_flag('YOLO_TTA_FUSED_FINAL_GPU', True)
 
 
 def fused_final_gpu_batch_slices() -> int:
     return max(1, _env_int('YOLO_TTA_FUSED_FINAL_GPU_BATCH_SLICES', 8))
+
+
+def fused_final_gpu_pipeline_slots() -> int:
+    """Reusable pinned-host/device batches per GPU lane (2 overlaps decode with CUDA work)."""
+    return max(1, min(3, _env_int('YOLO_TTA_FUSED_FINAL_GPU_PIPELINE_SLOTS', 2)))
+
+
+def fused_final_gpu_min_group_bytes() -> int:
+    """Reduced geometry groups below this work size stay on the CPU."""
+    return max(0, int(max(0.0, _env_float('YOLO_TTA_FUSED_FINAL_GPU_MIN_GROUP_MIB', 4.0)) * 1024 * 1024))
+
+
+def fused_final_gpu_sparse_ratio() -> float:
+    """Very sparse groups below this extent ratio may stay on the CPU."""
+    return max(0.0, min(1.0, _env_float('YOLO_TTA_FUSED_FINAL_GPU_SPARSE_RATIO', 0.005)))
 
 
 def _resize_union_plane_to_out_xy(plane: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
@@ -20942,12 +21208,14 @@ def assemble_view_volumes_and_projected_layers_fused(
             np.bitwise_or(dst, np.asarray(src[int(src_z)], dtype=np.uint8), out=dst)
 
         def _try_gpu_final_fusion() -> bool:
-            """C13 fast path: assign disjoint output-z bands to idle CUDA devices.
+            """v16.0.2 GPU G5 path with pinned double buffering and geometry streams.
 
-            Source cvol decoding remains on the host because it is sparse/file-backed;
-            positive-support restores and the final contributor OR stay on each GPU until
-            one completed band is copied back. A failure may leave partial bands, but the
-            caller then executes the established CPU path, which assigns every output slice.
+            Independent output-z bands are assigned to every admitted CUDA device.  Each lane
+            decodes the next host batch while the previous batch is asynchronously copied,
+            restored, OR-reduced, and copied back.  Reduced geometry groups receive independent
+            CUDA streams; a merge stream waits on their events before the single final D2H.
+            Source-native sparse stores and very small reduced groups remain on the CPU and are
+            folded into one pinned native contributor, where H2D setup would dominate.
             """
             if not bool(group_restores) or not fused_final_gpu_enabled():
                 return False
@@ -20964,9 +21232,14 @@ def assemble_view_volumes_and_projected_layers_fused(
             raw_devices = os.environ.get('YOLO_TTA_FUSED_FINAL_GPU_DEVICES', '').strip()
             if raw_devices:
                 try:
-                    devices = [int(tok.strip()) for tok in raw_devices.split(',') if tok.strip()]
+                    devices = [
+                        int(tok) for tok in re.split(r'[,\s]+', raw_devices) if str(tok).strip()
+                    ]
                 except Exception as exc:
-                    print(f'Warning: invalid YOLO_TTA_FUSED_FINAL_GPU_DEVICES ({exc}); using configured devices.')
+                    print(
+                        f'Warning: invalid YOLO_TTA_FUSED_FINAL_GPU_DEVICES ({exc}); '
+                        'using configured devices.'
+                    )
                     devices = []
             if not devices and configured:
                 devices = [int(v) for v in configured]
@@ -20977,28 +21250,105 @@ def assemble_view_volumes_and_projected_layers_fused(
             if not devices:
                 return False
 
+            min_group_bytes = int(fused_final_gpu_min_group_bytes())
+            sparse_ratio_limit = float(fused_final_gpu_sparse_ratio())
+
+            def _group_extent_ratio(
+                geometry: Tuple[int, int, int],
+                group: Sequence[Tuple['NrrdLayerRef', object]],
+            ) -> float:
+                in_t, in_h, in_w = (int(v) for v in geometry)
+                full_per_layer = max(1, int(in_t) * int(in_h) * int(in_w))
+                active = 0
+                for ref, _src in group:
+                    extent = getattr(ref, 'segment_extent_ijk', None)
+                    if extent is None or len(extent) != 6:
+                        active += int(full_per_layer)
+                        continue
+                    try:
+                        x0, x1, y0, y1, z0, z1 = (int(v) for v in extent)
+                        ex = max(0, min(int(in_w) - 1, x1) - max(0, x0) + 1)
+                        ey = max(0, min(int(in_h) - 1, y1) - max(0, y0) + 1)
+                        ez = max(0, min(int(in_t) - 1, z1) - max(0, z0) + 1)
+                        active += int(ex) * int(ey) * int(ez)
+                    except Exception:
+                        active += int(full_per_layer)
+                denom = max(1, int(full_per_layer) * max(1, len(group)))
+                return max(0.0, min(1.0, float(active) / float(denom)))
+
+            gpu_restore_groups: 'OrderedDict[Tuple[int, int, int], List[Tuple[NrrdLayerRef, object]]]' = OrderedDict()
+            cpu_restore_groups: 'OrderedDict[Tuple[int, int, int], List[Tuple[NrrdLayerRef, object]]]' = OrderedDict()
+            for geometry, group in restore_groups.items():
+                _in_t, in_h, in_w = (int(v) for v in geometry)
+                plane_work = int(in_h) * int(in_w) * max(1, len(group))
+                extent_ratio = _group_extent_ratio(geometry, group)
+                tiny = int(plane_work) < int(min_group_bytes)
+                sparse_and_small = bool(
+                    extent_ratio < float(sparse_ratio_limit)
+                    and int(plane_work) < max(int(min_group_bytes), 1) * 4
+                )
+                if tiny or sparse_and_small:
+                    cpu_restore_groups[geometry] = list(group)
+                else:
+                    gpu_restore_groups[geometry] = list(group)
+
+            batch_slices = int(fused_final_gpu_batch_slices())
+            pipeline_slots = int(fused_final_gpu_pipeline_slots())
+            contributor_input_planes = 0
+            contributor_count = 0
+            if transverse is not None:
+                contributor_input_planes += int(transverse.shape[1]) * int(transverse.shape[2])
+                contributor_count += 1
+            if sagittal is not None:
+                contributor_input_planes += int(sagittal.shape[0]) * int(sagittal.shape[2])
+                contributor_count += 1
+            if coronal is not None:
+                contributor_input_planes += int(coronal.shape[2]) * int(coronal.shape[0])
+                contributor_count += 1
+            needs_native_contributor = bool(native_views or native_projected or cpu_restore_groups)
+            if needs_native_contributor:
+                contributor_input_planes += int(out_h) * int(out_w)
+                contributor_count += 1
+            for geometry in gpu_restore_groups:
+                contributor_input_planes += int(geometry[1]) * int(geometry[2])
+                contributor_count += 1
+            if contributor_count <= 0:
+                return False
+
             reserve = int(max(0.0, _env_float(
                 'YOLO_TTA_FUSED_FINAL_GPU_RESERVE_GIB', 2.0,
             )) * GIB)
+            out_plane = int(out_h) * int(out_w)
+            # Per slot: uint8 device inputs, float interpolation workspace/restored outputs,
+            # one uint8 accumulator/output, plus allocator slack. Host-pinned memory is not
+            # charged here; the anonymous/cgroup allocator remains the authority for it.
+            estimate_per_slot = int(batch_slices) * (
+                int(contributor_input_planes)
+                + max(1, int(contributor_count)) * 6 * int(out_plane)
+                + 3 * int(out_plane)
+            )
+            estimate = int(pipeline_slots) * int(estimate_per_slot)
             admitted: List[int] = []
             for device_idx in devices:
                 try:
                     free_bytes, _total_bytes = torch.cuda.mem_get_info(int(device_idx))
-                    # Float resize workspace + uint8 input/output. Groups are processed
-                    # sequentially, so admission depends on the largest plane only.
-                    max_plane = max(
-                        [int(out_h) * int(out_w)]
-                        + [int(g[1]) * int(g[2]) for g in restore_groups.keys()]
-                    )
-                    estimate = int(fused_final_gpu_batch_slices()) * (
-                        6 * int(max_plane) + 3 * int(out_h) * int(out_w)
-                    )
                     if int(free_bytes) >= int(estimate) + int(reserve):
                         admitted.append(int(device_idx))
                 except Exception:
                     continue
             if not admitted:
+                print(
+                    'v16.0.2 GPU final fusion skipped: no selected device satisfied the '
+                    f'{estimate / GIB:.2f} GiB lane estimate + {reserve / GIB:.2f} GiB reserve.'
+                )
                 return False
+
+            print(
+                f'v16.0.2 GPU final fusion admitted {len(admitted)} device(s) '
+                f'{[f"cuda:{d}" for d in admitted]}; batch={batch_slices}, '
+                f'pipeline_slots={pipeline_slots}, GPU_restore_groups={len(gpu_restore_groups)}, '
+                f'CPU_tiny_groups={len(cpu_restore_groups)}, lane_estimate={estimate / GIB:.2f} GiB.'
+            )
 
             def _indices(count: int, out_z: int) -> range:
                 count_i = max(1, int(count))
@@ -21016,112 +21366,236 @@ def assemble_view_volumes_and_projected_layers_fused(
 
             def _lane(device_idx: int, z0_lane: int, z1_lane: int) -> None:
                 device = torch.device(f'cuda:{int(device_idx)}')
-                batch_slices = int(fused_final_gpu_batch_slices())
                 with torch.cuda.device(device):
-                    stream = torch.cuda.Stream(device=device)
-                    with torch.cuda.stream(stream):
-                        for batch0 in range(int(z0_lane), int(z1_lane), int(batch_slices)):
-                            batch1 = min(int(z1_lane), int(batch0) + int(batch_slices))
-                            count = int(batch1 - batch0)
-                            acc = torch.zeros(
-                                (count, int(out_h), int(out_w)),
-                                dtype=torch.uint8,
-                                device=device,
-                            )
+                    host_shapes: 'OrderedDict[object, Tuple[int, int, int]]' = OrderedDict()
+                    if transverse is not None:
+                        host_shapes['transverse'] = (
+                            int(batch_slices), int(transverse.shape[1]), int(transverse.shape[2]),
+                        )
+                    if sagittal is not None:
+                        host_shapes['sagittal'] = (
+                            int(batch_slices), int(sagittal.shape[0]), int(sagittal.shape[2]),
+                        )
+                    if coronal is not None:
+                        host_shapes['coronal'] = (
+                            int(batch_slices), int(coronal.shape[2]), int(coronal.shape[0]),
+                        )
+                    if needs_native_contributor:
+                        host_shapes['native'] = (
+                            int(batch_slices), int(out_h), int(out_w),
+                        )
+                    for geometry in gpu_restore_groups:
+                        host_shapes[('restore', geometry)] = (
+                            int(batch_slices), int(geometry[1]), int(geometry[2]),
+                        )
 
-                            def _or_host_stack(
-                                host_stack: np.ndarray,
-                                acc_dev: object = acc,
-                            ) -> None:
-                                host_u8 = np.ascontiguousarray(host_stack, dtype=np.uint8)
-                                src_dev = torch.from_numpy(host_u8).to(device, non_blocking=False)
-                                in_h = int(host_u8.shape[1])
-                                in_w = int(host_u8.shape[2])
+                    pin_warning_printed = False
+
+                    def _alloc_host(shape: Tuple[int, int, int]) -> object:
+                        nonlocal pin_warning_printed
+                        try:
+                            return torch.empty(shape, dtype=torch.uint8, pin_memory=True)
+                        except Exception as exc:
+                            if not pin_warning_printed:
+                                pin_warning_printed = True
+                                print(
+                                    f'Warning: cuda:{int(device_idx)} pinned final-fusion staging '
+                                    f'unavailable ({exc}); using pageable fallback.'
+                                )
+                            return torch.empty(shape, dtype=torch.uint8)
+
+                    streams = {
+                        key: torch.cuda.Stream(device=device)
+                        for key in host_shapes
+                    }
+                    merge_stream = torch.cuda.Stream(device=device)
+                    slots: List[Dict[str, object]] = []
+                    for _slot_idx in range(int(pipeline_slots)):
+                        host_tensors = {key: _alloc_host(shape) for key, shape in host_shapes.items()}
+                        host_arrays = {key: tensor.numpy() for key, tensor in host_tensors.items()}
+                        device_tensors = {
+                            key: torch.empty(shape, dtype=torch.uint8, device=device)
+                            for key, shape in host_shapes.items()
+                        }
+                        output_host = _alloc_host((int(batch_slices), int(out_h), int(out_w)))
+                        slots.append({
+                            'host_tensors': host_tensors,
+                            'host_arrays': host_arrays,
+                            'device_tensors': device_tensors,
+                            'output_host': output_host,
+                            'done_event': None,
+                            'range': None,
+                            'refs': [],
+                        })
+
+                    cpu_reduced = {
+                        geometry: np.zeros((int(geometry[1]), int(geometry[2])), dtype=np.uint8)
+                        for geometry in cpu_restore_groups
+                    }
+
+                    def _finish_slot(slot: Dict[str, object]) -> None:
+                        done_event = slot.get('done_event')
+                        batch_range = slot.get('range')
+                        if done_event is None or batch_range is None:
+                            return
+                        done_event.synchronize()
+                        batch0_done, batch1_done = (int(v) for v in batch_range)
+                        count_done = int(batch1_done - batch0_done)
+                        output_host = slot['output_host']
+                        np.copyto(
+                            np.asarray(final_union_mm[int(batch0_done):int(batch1_done)]),
+                            output_host[:count_done].numpy(),
+                        )
+                        refs = slot.get('refs')
+                        if isinstance(refs, list):
+                            refs.clear()
+                        slot['done_event'] = None
+                        slot['range'] = None
+
+                    def _fill_slot(
+                        slot: Dict[str, object],
+                        batch0: int,
+                        batch1: int,
+                    ) -> int:
+                        count = int(batch1 - batch0)
+                        host_arrays = slot['host_arrays']
+                        for arr in host_arrays.values():
+                            arr[:count].fill(np.uint8(0))
+
+                        if transverse is not None:
+                            arr = host_arrays['transverse']
+                            for local_z, out_z in enumerate(range(int(batch0), int(batch1))):
+                                for src_z in _indices(int(transverse.shape[0]), int(out_z)):
+                                    arr[local_z] |= np.asarray(transverse[int(src_z)], dtype=np.uint8)
+                        if sagittal is not None:
+                            arr = host_arrays['sagittal']
+                            for local_z, out_z in enumerate(range(int(batch0), int(batch1))):
+                                for src_z in _indices(int(sagittal.shape[1]), int(out_z)):
+                                    arr[local_z] |= np.asarray(
+                                        sagittal[:, int(src_z), :], dtype=np.uint8,
+                                    )
+                        if coronal is not None:
+                            arr = host_arrays['coronal']
+                            for local_z, out_z in enumerate(range(int(batch0), int(batch1))):
+                                for src_z in _indices(int(coronal.shape[1]), int(out_z)):
+                                    arr[local_z] |= np.ascontiguousarray(
+                                        coronal[:, int(src_z), :].T, dtype=np.uint8,
+                                    )
+
+                        if needs_native_contributor:
+                            native_arr = host_arrays['native']
+                            for local_z, out_z in enumerate(range(int(batch0), int(batch1))):
+                                dst = native_arr[local_z]
+                                for _view_name, vol in native_views:
+                                    dst |= np.asarray(vol[int(out_z)], dtype=np.uint8)
+                                for _ref, src in native_projected:
+                                    _or_native_source_slice(dst, src, int(out_z))
+                                for geometry, group in cpu_restore_groups.items():
+                                    in_t, _in_h, _in_w = (int(v) for v in geometry)
+                                    reduced = cpu_reduced[geometry]
+                                    reduced.fill(np.uint8(0))
+                                    for src_z in _restore_source_indices_for_output_z(
+                                        int(in_t), int(out_t), int(out_z),
+                                    ):
+                                        for _ref, src in group:
+                                            _or_native_source_slice(reduced, src, int(src_z))
+                                    dst |= _resize_union_plane_to_out_xy(
+                                        reduced, int(out_h), int(out_w),
+                                    )
+
+                        for geometry, group in gpu_restore_groups.items():
+                            arr = host_arrays[('restore', geometry)]
+                            in_t = int(geometry[0])
+                            for local_z, out_z in enumerate(range(int(batch0), int(batch1))):
+                                dst = arr[local_z]
+                                for src_z in _restore_source_indices_for_output_z(
+                                    int(in_t), int(out_t), int(out_z),
+                                ):
+                                    for _ref, src in group:
+                                        _or_native_source_slice(dst, src, int(src_z))
+                        return int(count)
+
+                    def _submit_slot(
+                        slot: Dict[str, object],
+                        batch0: int,
+                        batch1: int,
+                        count: int,
+                    ) -> None:
+                        host_tensors = slot['host_tensors']
+                        device_tensors = slot['device_tensors']
+                        contributor_outputs: List[Tuple[object, object]] = []
+                        refs: List[object] = []
+                        for key, host_tensor in host_tensors.items():
+                            stream = streams[key]
+                            dev_tensor = device_tensors[key]
+                            with torch.cuda.stream(stream):
+                                src_dev = dev_tensor[:count]
+                                src_host = host_tensor[:count]
+                                src_dev.copy_(
+                                    src_host,
+                                    non_blocking=bool(getattr(src_host, 'is_pinned', lambda: False)()),
+                                )
+                                in_h = int(src_dev.shape[1])
+                                in_w = int(src_dev.shape[2])
                                 if (in_h, in_w) == (int(out_h), int(out_w)):
-                                    restored = (src_dev > 0).to(torch.uint8)
+                                    restored = src_dev
                                 else:
                                     src_f = src_dev.to(torch.float32).unsqueeze(1)
                                     if in_h >= int(out_h) and in_w >= int(out_w):
                                         scaled = F.interpolate(
                                             src_f, size=(int(out_h), int(out_w)), mode='area',
                                         )
-                                        # cv2's uint8 INTER_AREA rounds 255*fraction; >= 0.5
-                                        # therefore matches the legacy >0 test at 1/510.
-                                        restored = (scaled.squeeze(1) >= (1.0 / 510.0)).to(torch.uint8)
+                                        restored = (
+                                            scaled.squeeze(1) >= (1.0 / 510.0)
+                                        ).to(torch.uint8)
                                     else:
                                         scaled = F.interpolate(
                                             src_f, size=(int(out_h), int(out_w)), mode='nearest',
                                         )
                                         restored = (scaled.squeeze(1) > 0).to(torch.uint8)
-                                torch.bitwise_or(acc_dev, restored, out=acc_dev)
+                                    refs.extend([src_f, scaled])
+                                event = torch.cuda.Event(blocking=False, enable_timing=False)
+                                event.record(stream)
+                                contributor_outputs.append((restored, event))
+                                refs.append(restored)
 
-                            # Keep Cartesian planes in their reduced working geometry;
-                            # their one terminal positive-support restore runs on-device.
-                            if transverse is not None:
-                                transverse_host = np.zeros(
-                                    (count, int(transverse.shape[1]), int(transverse.shape[2])),
-                                    dtype=np.uint8,
-                                )
-                                for local_z, out_z in enumerate(range(int(batch0), int(batch1))):
-                                    for src_z in _indices(int(transverse.shape[0]), int(out_z)):
-                                        transverse_host[local_z] |= np.asarray(
-                                            transverse[int(src_z)], dtype=np.uint8,
-                                        )
-                                _or_host_stack(transverse_host)
-                            if sagittal is not None:
-                                sagittal_host = np.zeros(
-                                    (count, int(sagittal.shape[0]), int(sagittal.shape[2])),
-                                    dtype=np.uint8,
-                                )
-                                for local_z, out_z in enumerate(range(int(batch0), int(batch1))):
-                                    for src_z in _indices(int(sagittal.shape[1]), int(out_z)):
-                                        sagittal_host[local_z] |= np.asarray(
-                                            sagittal[:, int(src_z), :], dtype=np.uint8,
-                                        )
-                                _or_host_stack(sagittal_host)
-                            if coronal is not None:
-                                coronal_host = np.zeros(
-                                    (count, int(coronal.shape[2]), int(coronal.shape[0])),
-                                    dtype=np.uint8,
-                                )
-                                for local_z, out_z in enumerate(range(int(batch0), int(batch1))):
-                                    for src_z in _indices(int(coronal.shape[1]), int(out_z)):
-                                        coronal_host[local_z] |= np.ascontiguousarray(
-                                            coronal[:, int(src_z), :].T,
-                                            dtype=np.uint8,
-                                        )
-                                _or_host_stack(coronal_host)
+                        done_event = torch.cuda.Event(blocking=False, enable_timing=False)
+                        output_host = slot['output_host']
+                        with torch.cuda.stream(merge_stream):
+                            acc = torch.zeros(
+                                (int(count), int(out_h), int(out_w)),
+                                dtype=torch.uint8,
+                                device=device,
+                            )
+                            for restored, event in contributor_outputs:
+                                merge_stream.wait_event(event)
+                                torch.bitwise_or(acc, restored, out=acc)
+                            output_view = output_host[:count]
+                            output_view.copy_(
+                                acc,
+                                non_blocking=bool(
+                                    getattr(output_view, 'is_pinned', lambda: False)()
+                                ),
+                            )
+                            done_event.record(merge_stream)
+                            refs.extend([acc, contributor_outputs])
+                        slot['refs'] = refs
+                        slot['done_event'] = done_event
+                        slot['range'] = (int(batch0), int(batch1))
 
-                            if native_views or native_projected:
-                                native_host = np.zeros(
-                                    (count, int(out_h), int(out_w)), dtype=np.uint8,
-                                )
-                                for local_z, out_z in enumerate(range(int(batch0), int(batch1))):
-                                    for _view_name, vol in native_views:
-                                        native_host[local_z] |= np.asarray(vol[int(out_z)], dtype=np.uint8)
-                                    for _ref, src in native_projected:
-                                        _or_native_source_slice(native_host[local_z], src, int(out_z))
-                                _or_host_stack(native_host)
-
-                            for geometry, group in restore_groups.items():
-                                in_t, in_h, in_w = (int(v) for v in geometry)
-                                reduced_host = np.zeros(
-                                    (count, int(in_h), int(in_w)), dtype=np.uint8,
-                                )
-                                for local_z, out_z in enumerate(range(int(batch0), int(batch1))):
-                                    source_zs = _restore_source_indices_for_output_z(
-                                        int(in_t), int(out_t), int(out_z),
-                                    )
-                                    for _ref, src in group:
-                                        for src_z in source_zs:
-                                            _or_native_source_slice(
-                                                reduced_host[local_z], src, int(src_z),
-                                            )
-                                _or_host_stack(reduced_host)
-
-                            final_union_mm[int(batch0):int(batch1)] = acc.cpu().numpy()
-                            del acc
-                    stream.synchronize()
+                    batch_index = 0
+                    for batch0 in range(int(z0_lane), int(z1_lane), int(batch_slices)):
+                        batch1 = min(int(z1_lane), int(batch0) + int(batch_slices))
+                        slot = slots[int(batch_index) % len(slots)]
+                        _finish_slot(slot)
+                        count = _fill_slot(slot, int(batch0), int(batch1))
+                        _submit_slot(slot, int(batch0), int(batch1), int(count))
+                        batch_index += 1
+                    for slot in slots:
+                        _finish_slot(slot)
+                    merge_stream.synchronize()
+                    for stream in streams.values():
+                        stream.synchronize()
 
             bands = _ffv1_contiguous_segments(int(out_t), len(admitted))
             lane_pool: Optional[ThreadPoolExecutor] = None
@@ -21151,8 +21625,6 @@ def assemble_view_volumes_and_projected_layers_fused(
                 except Exception as exc:
                     if first_error is None:
                         first_error = exc
-                # Futures retain exception tracebacks (and therefore tensor locals). Drop
-                # those references before releasing allocator caches for later NRRD/output work.
                 lane_futures.clear()
                 try:
                     del lane_future
@@ -21165,19 +21637,16 @@ def assemble_view_volumes_and_projected_layers_fused(
                             torch.cuda.empty_cache()
                     except Exception:
                         pass
-            error_text = (
-                f'{type(first_error).__name__}: {first_error}'
-                if first_error is not None else ''
-            )
-            if error_text:
+            if first_error is not None:
+                error_text = f'{type(first_error).__name__}: {first_error}'
                 print(
-                    f'Warning: v13.3.18 C13 GPU final fusion failed ({error_text}); '
+                    f'Warning: v16.0.2 GPU final fusion failed ({error_text}); '
                     'rewriting the complete result with the CPU G5 path.'
                 )
                 return False
             print(
-                f'v13.3.18 (C13): final grouped restore/OR used {len(admitted)} GPU lane(s), '
-                f'{int(fused_final_gpu_batch_slices())} output slice(s) per batch.'
+                f'v16.0.2: final grouped restore/OR completed on {len(admitted)} GPU lane(s) '
+                f'with pinned {pipeline_slots}-slot streaming.'
             )
             return True
 
@@ -21354,7 +21823,7 @@ def assemble_current_view_union_volume(
     postprocessing runs in source voxels; None keeps the working geometry.
     """
     if len(view_volumes_by_model) != 1:
-        raise ValueError('GPT-5.6-Sol-Pro v16.0.1 supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.0.2 supports exactly one --model; multiple-model inference has been removed')
 
     union_shape = (int(T), int(H), int(W)) if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
     model_name = next(iter(view_volumes_by_model.keys()))
@@ -21457,12 +21926,13 @@ def apply_keep_largest_objects_inplace(
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
-) -> Dict[str, int]:
+) -> Dict[str, int | float]:
     """Keep only the largest N connected foreground components in the final 3D volume."""
     keep_n = int(keep_objects)
     if keep_n <= 0:
         return {'enabled': 0, 'num_objects': 0, 'kept_objects': 0, 'removed_objects': 0, 'removed_voxels': 0}
 
+    keep_started = time.perf_counter()
     work_dir = temp_dir / 'keep_objects'
     work_dir.mkdir(parents=True, exist_ok=True)
     # v13.3.2 (R6c): label with LOCAL per-slice ids only (no compact relabel write pass) and
@@ -21486,6 +21956,13 @@ def apply_keep_largest_objects_inplace(
     )
 
     if int(num_objects) <= keep_n:
+        total_seconds = float(time.perf_counter() - keep_started)
+        topology_times = dict(comp_stats.get('topology_phase_seconds', {}))
+        print(
+            f'v16.0.2 keep_objects phases: no removal required; '
+            f'topology={float(topology_times.get("topology_total", 0.0)):.3f}s, '
+            f'total={total_seconds:.3f}s.'
+        )
         close_memmap_array(labels_mm)
         if not bool(keep_temp):
             for lp in label_paths:
@@ -21499,6 +21976,19 @@ def apply_keep_largest_objects_inplace(
             'kept_objects': int(num_objects),
             'removed_objects': 0,
             'removed_voxels': 0,
+            'topology_slab_count': int(comp_stats.get('topology_slab_count', 0)),
+            'topology_slab_workers': int(comp_stats.get('topology_slab_workers', 0)),
+            'label_seconds': float(topology_times.get('slice_label', 0.0)),
+            'pair_extraction_seconds': float(topology_times.get('internal_pair_extraction', 0.0)),
+            'local_union_seconds': float(topology_times.get('local_slab_union', 0.0)),
+            'boundary_merge_seconds': float(topology_times.get('boundary_merge', 0.0)),
+            'root_expansion_seconds': float(topology_times.get('root_expansion', 0.0)),
+            'area_reduction_seconds': float(topology_times.get('area_reduction', 0.0)),
+            'topology_seconds': float(topology_times.get('topology_total', 0.0)),
+            'decision_seconds': 0.0,
+            'lut_seconds': 0.0,
+            'apply_seconds': 0.0,
+            'total_seconds': float(total_seconds),
         }
 
     z_dim = int(mask_mm.shape[0])
@@ -21510,6 +22000,7 @@ def apply_keep_largest_objects_inplace(
     root_areas = np.asarray(comp_stats['root_areas'])
     total_components = int(comp_stats['total_components'])
 
+    decision_started = time.perf_counter()
     order = np.argsort(root_areas[unique_roots])[::-1]
     keep_roots = unique_roots[order[:keep_n]]
     keep_root_flag = np.zeros((int(total_components) + 1,), dtype=bool)
@@ -21518,10 +22009,12 @@ def apply_keep_largest_objects_inplace(
     gid_keep[0] = False
     # removed_voxels falls out of the root area table — no per-slice count pass.
     removed_voxels = int(root_areas[unique_roots].sum() - root_areas[keep_roots].sum())
+    decision_seconds = float(time.perf_counter() - decision_started)
 
     # Per-slice local->keep LUTs in one concatenated uint8 table; only slices that actually
     # contain a dropped component are rewritten (the mask is 0/1 everywhere in this pipeline,
     # so untouched slices are already in their final state).
+    keep_lut_started = time.perf_counter()
     lut_sizes = component_counts.astype(np.int64, copy=False) + 1
     lut_offsets = np.zeros((z_dim,), dtype=np.int64)
     if z_dim > 1:
@@ -21538,11 +22031,13 @@ def apply_keep_largest_objects_inplace(
         keep_flat[lo + 1:lo + count + 1] = lut
         if not bool(lut.all()):
             apply_slice[int(z)] = np.uint8(1)
+    keep_lut_seconds = float(time.perf_counter() - keep_lut_started)
 
+    apply_started = time.perf_counter()
     kernel_done = False
     if (
         isinstance(labels_mm, SparseSliceLabelStore)
-        and compiled_interpolation_kernels_enabled()
+        and compiled_topology_kernels_enabled()
         and _numba_sparse_keep_lut_apply_kernel is not None
     ):
         try:
@@ -21559,7 +22054,7 @@ def apply_keep_largest_objects_inplace(
             kernel_done = True
         except Exception as exc:
             print(f'keep_objects: sparse numba apply unavailable ({exc}); using the thread pool.')
-    elif compiled_interpolation_kernels_enabled() and _numba_keep_lut_apply_kernel is not None:
+    elif compiled_topology_kernels_enabled() and _numba_keep_lut_apply_kernel is not None:
         try:
             print(f'keep_objects: applying keep-largest-{keep_n} via numba nogil kernel')
             _numba_keep_lut_apply_kernel(
@@ -21593,6 +22088,7 @@ def apply_keep_largest_objects_inplace(
             show_progress=True,
         )
     flush_array(mask_mm)
+    apply_seconds = float(time.perf_counter() - apply_started)
 
     close_memmap_array(labels_mm)
     if not bool(keep_temp):
@@ -21602,12 +22098,37 @@ def apply_keep_largest_objects_inplace(
             except Exception:
                 pass
 
+    topology_times = dict(comp_stats.get('topology_phase_seconds', {}))
+    total_seconds = float(time.perf_counter() - keep_started)
+    print(
+        'v16.0.2 keep_objects phases: '
+        f'label={float(topology_times.get("slice_label", 0.0)):.3f}s, '
+        f'pairs={float(topology_times.get("internal_pair_extraction", 0.0)):.3f}s, '
+        f'local_union={float(topology_times.get("local_slab_union", 0.0)):.3f}s, '
+        f'boundary/root={float(topology_times.get("boundary_merge", 0.0)) + float(topology_times.get("root_expansion", 0.0)):.3f}s, '
+        f'area={float(topology_times.get("area_reduction", 0.0)):.3f}s, '
+        f'decision={decision_seconds:.3f}s, keep_lut={keep_lut_seconds:.3f}s, '
+        f'apply={apply_seconds:.3f}s, total={total_seconds:.3f}s.'
+    )
     return {
         'enabled': 1,
         'num_objects': int(num_objects),
         'kept_objects': int(min(keep_n, int(num_objects))),
         'removed_objects': int(max(0, int(num_objects) - keep_n)),
         'removed_voxels': int(removed_voxels),
+        'topology_slab_count': int(comp_stats.get('topology_slab_count', 0)),
+        'topology_slab_workers': int(comp_stats.get('topology_slab_workers', 0)),
+        'label_seconds': float(topology_times.get('slice_label', 0.0)),
+        'pair_extraction_seconds': float(topology_times.get('internal_pair_extraction', 0.0)),
+        'local_union_seconds': float(topology_times.get('local_slab_union', 0.0)),
+        'boundary_merge_seconds': float(topology_times.get('boundary_merge', 0.0)),
+        'root_expansion_seconds': float(topology_times.get('root_expansion', 0.0)),
+        'area_reduction_seconds': float(topology_times.get('area_reduction', 0.0)),
+        'topology_seconds': float(topology_times.get('topology_total', 0.0)),
+        'decision_seconds': float(decision_seconds),
+        'lut_seconds': float(keep_lut_seconds),
+        'apply_seconds': float(apply_seconds),
+        'total_seconds': float(total_seconds),
     }
 
 
@@ -25185,6 +25706,11 @@ _NUMBA_PROJECTION_KERNEL_RUNTIME_DISABLED = False
 _NUMBA_PLANNING_KERNELS_RUNTIME_DISABLED = False
 
 
+def compiled_topology_kernels_enabled() -> bool:
+    """Generic 3D topology/keep_objects kernels, independent of interpolation settings."""
+    return bool(_numba is not None and _env_flag('YOLO_TTA_TOPOLOGY_COMPILED_KERNELS', True))
+
+
 def compiled_interpolation_kernels_enabled() -> bool:
     return bool(_numba is not None and _env_flag('YOLO_TTA_INTERPOLATION_COMPILED_KERNELS', True))
 
@@ -28428,7 +28954,7 @@ def materialize_nrrd_view_layer(
         'source_raw_path': str(raw_path),
         'source_raw_workspace': 'in_memory_when_available' if bool(transient_projection_in_memory) else 'disk_backed',
         'projection_payload_fusion': (
-            'transverse_radial_sink_only_v16.0.1'
+            'transverse_radial_sink_only_v16.0.2'
             if radial_sink_only_projection_supported(view) else 'dense_projection'
         ),
     }
@@ -31984,7 +32510,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.6-Sol-Pro_v16.0.1_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.6-Sol-Pro_v16.0.2_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -32354,7 +32880,7 @@ def write_single_layer_nrrd_from_ref(
             f'{max(band_weights) / (1024 ** 2):.1f} MiB/shard'
         )
     print(
-        f'v16.0.1: {out_path.name} -> {shard_count} in-memory compressed z chunks '
+        f'v16.0.2: {out_path.name} -> {shard_count} in-memory compressed z chunks '
         f'(min_slices={nrrd_layer_zshard_min_slices()}, z_chunk={shard_z_chunk}'
         f'{weight_note}; one global permit per active band).'
     )
@@ -32474,7 +33000,7 @@ def write_single_layer_nrrd_from_ref(
                 f'{float(slowest[0]):.2f}s/{int(slowest[1]) / (1024 ** 2):.1f} MiB'
             )
         print(
-            f'v16.0.1: {out_path.name} completed in '
+            f'v16.0.2: {out_path.name} completed in '
             f'{time.perf_counter() - n19_started:.2f}s; compressed='
             f'{compressed_total / GIB:.2f} GiB{slowest_note}.'
         )
@@ -35027,7 +35553,7 @@ def write_summary_file(
     interpolation_stats: List[Dict[str, object]],
     enable_3d_void_fill: bool,
     gaussian_smoothing_stats: Optional[Dict[str, int | float]],
-    keep_objects_stats: Optional[Dict[str, int]],
+    keep_objects_stats: Optional[Dict[str, int | float]],
     voxel_volume: Optional[int],
     final_paths: Dict[str, Path],
     augmentation_workers: int,
@@ -35133,7 +35659,22 @@ def write_summary_file(
             f"enabled, objects={int(keep_objects_stats.get('num_objects', 0))}, "
             f"kept={int(keep_objects_stats.get('kept_objects', 0))}, "
             f"removed_objects={int(keep_objects_stats.get('removed_objects', 0))}, "
-            f"removed_voxels={int(keep_objects_stats.get('removed_voxels', 0))}"
+            f"removed_voxels={int(keep_objects_stats.get('removed_voxels', 0))}, "
+            f"topology_slabs={int(keep_objects_stats.get('topology_slab_count', 0))}, "
+            f"slab_workers={int(keep_objects_stats.get('topology_slab_workers', 0))}"
+        )
+        lines.append(
+            '  phase_seconds: '
+            f"label={float(keep_objects_stats.get('label_seconds', 0.0)):.3f}, "
+            f"pair_extraction={float(keep_objects_stats.get('pair_extraction_seconds', 0.0)):.3f}, "
+            f"local_union={float(keep_objects_stats.get('local_union_seconds', 0.0)):.3f}, "
+            f"boundary_merge={float(keep_objects_stats.get('boundary_merge_seconds', 0.0)):.3f}, "
+            f"root_expansion={float(keep_objects_stats.get('root_expansion_seconds', 0.0)):.3f}, "
+            f"area_reduction={float(keep_objects_stats.get('area_reduction_seconds', 0.0)):.3f}, "
+            f"decision={float(keep_objects_stats.get('decision_seconds', 0.0)):.3f}, "
+            f"lut={float(keep_objects_stats.get('lut_seconds', 0.0)):.3f}, "
+            f"apply={float(keep_objects_stats.get('apply_seconds', 0.0)):.3f}, "
+            f"total={float(keep_objects_stats.get('total_seconds', 0.0)):.3f}"
         )
     else:
         lines.append('')
@@ -35177,7 +35718,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('GPT-5.6-Sol-Pro v16.0.1 accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.0.2 accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -35782,7 +36323,7 @@ def main() -> None:
         )
     if (not gpu_worker_process_active) and background_model_load_enabled():
         spec_notes.append(
-            'v16.0.1 retains startup overlap by default: the YOLO model load is submitted before decode/native-volume preparation and joined only when prediction needs it. Set YOLO_TTA_BACKGROUND_MODEL_LOAD=0 to force synchronous loading.'
+            'v16.0.2 retains startup overlap by default: the YOLO model load is submitted before decode/native-volume preparation and joined only when prediction needs it. Set YOLO_TTA_BACKGROUND_MODEL_LOAD=0 to force synchronous loading.'
         )
     elif gpu_worker_process_active:
         spec_notes.append(
@@ -35838,7 +36379,7 @@ def main() -> None:
             'all execute at source dimensions. No tail restore resample occurs.'
         )
     spec_notes.append(
-        f'v16.0.1 Cartesian selection: --enable_cartesian={list(enabled_cartesian_views)}. '
+        f'v16.0.2 Cartesian selection: --enable_cartesian={list(enabled_cartesian_views)}. '
         'No Cartesian view is implicit; non-90 degree Cartesian augmentations use clamp-to-frame '
         'black fill rather than expanded padding.'
     )
@@ -35846,7 +36387,7 @@ def main() -> None:
     if concrete_tilted:
         active_tilt_labels = ', '.join(pretty_view_name(v) for v in concrete_tilted)
         spec_notes.append(
-            f'v16.0.1 Tilted Views active from --enable_tilted={list(tilt_views)}, '
+            f'v16.0.2 Tilted Views active from --enable_tilted={list(tilt_views)}, '
             f'--tilt_direction={list(tilt_directions)}, --tilt_angle={[float(v) for v in tilt_angles]}. '
             'No Tilted base is implicit; each base/direction/signed-angle configuration remains '
             'independent until final union. Active tilted configurations: '
@@ -35866,7 +36407,7 @@ def main() -> None:
             for v in concrete_radial
         )
         spec_notes.append(
-            'v16.0.1 Radial transforms active: ' + radial_notes + '. Cartesian Radial bases do '
+            'v16.0.2 Radial transforms active: ' + radial_notes + '. Cartesian Radial bases do '
             'not require upright Cartesian views. Each tilted_* target expands across every matching '
             'enabled signed-angle/direction Tilted variant. Circles are constructed in working projected '
             'view space; source-geometry t restoration naturally produces sagittal/coronal and Tilted '
@@ -36079,7 +36620,21 @@ def main() -> None:
         ),
     )
 
-    parent_postprocess_workers = max(1, min(int(interpolation_workers), max(1, len(yolo_models) * max(1, len(inference_views)))))
+    interpolation_process_backend_active = bool(
+        interpolation_process_backend_enabled() and len(interpolating_views) > 0
+    )
+    (
+        parent_postprocess_workers,
+        parent_slice_postprocess_workers,
+        parent_postprocess_estimated_bytes,
+        parent_postprocess_memory_cap,
+        parent_postprocess_default_workers,
+    ) = resolve_parent_postprocess_worker_allocation(
+        worker_budget=int(worker_budget),
+        views=inference_views,
+        nrrd_layers_enabled=bool(nrrd_layers_needed),
+        interpolation_enabled=bool(len(interpolating_views) > 0),
+    )
     (
         parent_interpolation_overlap,
         parent_interpolation_task_workers_default,
@@ -36087,6 +36642,7 @@ def main() -> None:
     ) = resolve_parent_interpolation_worker_allocation(
         worker_budget=int(worker_budget),
         parent_postprocess_workers=int(parent_postprocess_workers),
+        interpolation_process_backend_active=bool(interpolation_process_backend_active),
     )
 
     tile_postprocess_workers_default = int(worker_budget)
@@ -36102,7 +36658,6 @@ def main() -> None:
         _env_int('YOLO_TTA_TILE_INTERPOLATION_TASK_WORKERS', tile_interpolation_task_workers_default),
     )
 
-    interpolation_process_backend_active = bool(interpolation_process_backend_enabled() and int(args.interpolate) > 0)
     # v13.3.3: default raised from min(2, ...) — 11 views queued behind 2 process GILs was the
     # dominant wall-clock tail. Each child allocates its own pass workspace (memory-gated with a
     # disk-backed fallback), so the cap trades RAM headroom for parallel interpolation GILs.
@@ -36141,8 +36696,10 @@ def main() -> None:
     print(f'Inference postprocess workers: {predict_postprocess_workers}')
     print(
         'Parent full-frame postprocess workers: '
-        f'{parent_postprocess_workers} (expected interpolation overlap: {parent_interpolation_overlap}, '
-        f'per-parent interpolation workers: {parent_interpolation_task_workers})'
+        f'{parent_postprocess_workers} (independent of interpolation; default={parent_postprocess_default_workers}, '
+        f'memory_cap={parent_postprocess_memory_cap}, estimated_live_view={parent_postprocess_estimated_bytes / GIB:.2f} GiB, '
+        f'slice_workers/view={parent_slice_postprocess_workers}; expected interpolation overlap: '
+        f'{parent_interpolation_overlap}, per-parent interpolation workers: {parent_interpolation_task_workers})'
     )
     print(
         'Tile postprocess workers: '
@@ -36156,7 +36713,8 @@ def main() -> None:
             f'child cv2_threads={interpolation_process_cv2_threads()}, compiled kernels: {interpolation_compiled_kernels_status()})'
         )
     else:
-        print('Interpolation process backend: disabled (legacy in-process interpolation path).')
+        reason = 'no interpolation-enabled views' if len(interpolating_views) <= 0 else 'backend disabled'
+        print(f'Interpolation process backend: inactive for this command ({reason}).')
     print(f'Background output workers: {output_workers} (frame workers per labels/TIFF task: {output_frame_workers})')
     max_predict_video_frames = max(1, max((int(v.num_slices) for v in inference_views), default=1))
     example_cpu_mask_workers = max(1, min(int(predict_postprocess_workers), int(max_predict_video_frames)))
@@ -36180,7 +36738,7 @@ def main() -> None:
         f'v12.2.11 keeps waiting tiles and tile-set/category accumulators in RAM by default (YOLO_TTA_SPILL_WAITING_TILES={int(waiting_tile_spill_enabled())}, YOLO_TTA_TILE_ACCUMULATORS_IN_RAM={int(tile_intermediate_accumulators_prefer_memory())}); disk ctile spill is now opt-in. '
         f'v15.0.3 (T10) sizes the tile-accumulator RAM reserve against the cgroup-corrected available anonymous memory '
         f'(now {tile_intermediate_accumulator_reserve_bytes() / GIB:.1f} GiB; YOLO_TTA_TILE_ACCUMULATOR_RESERVE_GIB pins it, '
-        f'YOLO_TTA_TILE_ACCUMULATOR_RESERVE_FRACTION/_MIN_GIB/_MAX_GIB shape it). v16.0.1 defaults scratch to <output>/temp; '
+        f'YOLO_TTA_TILE_ACCUMULATOR_RESERVE_FRACTION/_MIN_GIB/_MAX_GIB shape it). v16.0.2 defaults scratch to <output>/temp; '
         f'--temp or YOLO_TTA_SCRATCH_DIR selects an explicit root, while an explicitly configured YOLO_TTA_SCRATCH_PREFER_SHM '
         f'may select a proven-roomy memory-backed root (scratch is memory-backed={int(scratch_dir_is_memory_backed())}; '
         f'=0 disables, =1 forces, YOLO_TTA_SCRATCH_SHM_MIN_FREE_GIB sets the bar).'
@@ -36849,7 +37407,7 @@ def main() -> None:
             interpolate_min_radius=float(args.interpolate_min_radius),
             interpolation_search_angle=float(args.interpolation_search_angle),
             keep_temp=bool(keep_temp_artifacts),
-            slice_workers=int(slice_postprocess_workers),
+            slice_workers=int(parent_slice_postprocess_workers),
             interpolation_task_workers=int(parent_interpolation_task_workers),
             nrrd_layers_enabled=bool(nrrd_layers_needed),
             precleaned_slice_cleanup=bool(single_angle_streaming_cleanup_active),
@@ -39035,7 +39593,7 @@ def main() -> None:
             nrrd_model_name=str(model_name),
         )
 
-    keep_objects_stats: Optional[Dict[str, int]] = None
+    keep_objects_stats: Optional[Dict[str, int | float]] = None
     if int(args.keep_objects) > 0:
         print(f'\n=== Keeping largest {int(args.keep_objects)} final object(s) ===')
         keep_objects_stats = apply_keep_largest_objects_inplace(
