@@ -2,8 +2,8 @@
 """
 YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
-This is the GPT-5.6-Sol-Pro v16.0.2 SLURM performance release, built from
-GPT-5.6-Sol-Pro_v16.0.1_SLURM.py. It consolidates Cartesian and Tilted view selection,
+This is the GPT-5.6-Sol-Pro v16.0.3 SLURM regression-fix release, built from
+GPT-5.6-Sol-Pro_v16.0.2_SLURM.py. It consolidates Cartesian and Tilted view selection,
 generalizes Radial views across all Cartesian orientations and enabled Tilted variants,
 and supports per-Radial-view azimuth spacing.
 
@@ -12,8 +12,8 @@ Current runtime behavior:
   - streams full-frame and tiled inputs, with optional GPU-resident rendering
   - uses process-per-GPU scheduling for every CUDA run, including one-GPU runs
   - supports GPU device-union accumulation, overlapped D2H retirement, grouped tiles,
-    parent-aware tile dispatch, native-t resident rendering, and the persistent
-    batch-1 TensorRT ring whenever their capability checks pass
+    parent-aware tile dispatch, native-t resident rendering (including tilted-Radial
+    transforms), and the persistent batch-1 TensorRT ring whenever their capability checks pass
   - uses Ultralytics' unified quantize setting for inference precision
   - stores temporary binary volumes as ordinary unpacked uint8 arrays or raw bbox stores
   - writes every single-layer Slicer segmentation NRRD in the complete output geometry
@@ -864,7 +864,7 @@ class RuntimeTelemetry:
                     'mean_ms': (seconds * 1000.0 / calls) if calls else 0.0,
                 }
             payload: Dict[str, object] = {
-                'schema': 'gpt-5.6-sol-pro-v16.0.2.telemetry.v1',
+                'schema': 'gpt-5.6-sol-pro-v16.0.3.telemetry.v1',
                 'pid': os.getpid(),
                 'monotonic_seconds': (now_ns - self.started_ns) / 1e9,
                 'wall_time': time.time(),
@@ -4805,9 +4805,25 @@ def radial_target_diameter(token: str, T: int, H: int, W: int) -> int:
     return int(min(int(spec['src_h']), int(spec['src_w'])))
 
 
+def tilted_radial_resident_gpu_render_enabled() -> bool:
+    """v16.0.3: render tilted-Radial frames from the resident source volume on CUDA.
+
+    v16.0.2 generalized the view graph but left every tilted-Radial transform outside the
+    resident renderer.  Those tasks silently requested the deferred host cube and generated
+    each 36-tap/sheared frame on the CPU while TensorRT waited, which can turn a multi-GPU
+    run into an effectively serial memory-bandwidth workload.  The escape hatch is retained
+    for regression comparisons and CUDA-toolchain troubleshooting.
+    """
+    return _env_flag('YOLO_TTA_GPU_TILTED_RADIAL_RENDER', True)
+
+
 def radial_resident_gpu_render_supported(view: ViewInfo) -> bool:
-    """Reference Torch resident rendering supports every non-tilted Radial base."""
-    return bool(is_radial_view(view) and not is_tilted_radial_view(view))
+    """Resident rendering supports upright Radial plus v16.0.3 tilted-Radial transforms."""
+    if not is_radial_view(view):
+        return False
+    if not is_tilted_radial_view(view):
+        return True
+    return bool(tilted_radial_resident_gpu_render_enabled())
 
 
 def radial_streaming_gpu_render_supported(view: ViewInfo) -> bool:
@@ -4820,8 +4836,14 @@ def radial_streaming_gpu_render_supported(view: ViewInfo) -> bool:
 
 
 def radial_fused_render_supported(view: ViewInfo) -> bool:
-    """The P4 direct-to-binding kernel retains the exact old transverse Radial contract."""
-    return radial_streaming_gpu_render_supported(view)
+    """Direct-to-binding support: upright transverse and v16.0.3 tilted-Radial views."""
+    return bool(
+        radial_streaming_gpu_render_supported(view)
+        or (
+            is_tilted_radial_view(view)
+            and tilted_radial_resident_gpu_render_enabled()
+        )
+    )
 
 
 def radial_sink_only_projection_supported(view: ViewInfo) -> bool:
@@ -12775,6 +12797,169 @@ def _fused_direct_render_kernels() -> Optional[object]:
       return clamp_f(round_nearest_f(a + alpha * (b - a)), 0.0f, 255.0f);
     }
 
+    __device__ __forceinline__ float tilted_radial_stack_sample(
+        const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
+        int base_id, int py, int px, int stack_idx) {
+      long long ps = (long long)full_h * (long long)full_w;
+      if (base_id == 0) {
+        long long spatial = (long long)py * (long long)full_w + (long long)px;
+        if (native_t == logical_t) {
+          return (float)volume[(long long)stack_idx * ps + spatial];
+        }
+        int t0, t1; float ta;
+        logical_t_taps(stack_idx, native_t, logical_t, &t0, &t1, &ta);
+        return rounded_t_lerp(volume, ps, spatial, t0, t1, ta);
+      }
+
+      int t0, t1; float ta;
+      logical_t_taps(py, native_t, logical_t, &t0, &t1, &ta);
+      long long spatial = base_id == 1
+          ? (long long)stack_idx * (long long)full_w + (long long)px
+          : (long long)px * (long long)full_w + (long long)stack_idx;
+      if (native_t == logical_t) {
+        return (float)volume[(long long)py * ps + spatial];
+      }
+      return rounded_t_lerp(volume, ps, spatial, t0, t1, ta);
+    }
+
+    __device__ __forceinline__ float tilted_radial_native_value(
+        const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
+        int rows, int n_u, int stack_len, int base_id, int direction_id,
+        int angle_idx, int row, int u, float tan_tilt, float center_x, float center_y,
+        const int* x_idx, const int* y_idx, const float* x_w, const float* y_w) {
+      if (row < 0 || row >= rows || u < 0 || u >= n_u) return 0.0f;
+      float center = rows == stack_len
+          ? (float)row
+          : clamp_f(((float)row + 0.5f) * ((float)stack_len / (float)rows) - 0.5f,
+                    0.0f, (float)(stack_len - 1));
+      int tap = (angle_idx * n_u + u) * 6;
+      float acc = 0.0f;
+      #pragma unroll
+      for (int ky = 0; ky < 6; ++ky) {
+        int py = y_idx[tap + ky];
+        float wy = y_w[tap + ky];
+        #pragma unroll
+        for (int kx = 0; kx < 6; ++kx) {
+          int px = x_idx[tap + kx];
+          float weight = wy * x_w[tap + kx];
+          if (weight == 0.0f) continue;
+          float axis_offset = direction_id == 0
+              ? (float)py - center_y
+              : (float)px - center_x;
+          float stack = center + tan_tilt * axis_offset;
+          if (stack < 0.0f || stack > (float)(stack_len - 1)) continue;
+          int s0 = clamp_i(floor_i(stack), 0, stack_len - 1);
+          int s1 = s0 + 1 < stack_len ? s0 + 1 : stack_len - 1;
+          float sa = stack - (float)s0;
+          float v0 = tilted_radial_stack_sample(
+              volume, native_t, full_h, full_w, logical_t, base_id, py, px, s0);
+          float v1 = tilted_radial_stack_sample(
+              volume, native_t, full_h, full_w, logical_t, base_id, py, px, s1);
+          acc += weight * (v0 + sa * (v1 - v0));
+        }
+      }
+      return acc;
+    }
+
+    __device__ __forceinline__ float tilted_radial_bilinear_value(
+        const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
+        int rows, int n_u, int stack_len, int base_id, int direction_id,
+        int angle_idx, float sy, float sx, float tan_tilt, float center_x, float center_y,
+        const int* x_idx, const int* y_idx, const float* x_w, const float* y_w) {
+      int x0 = floor_i(sx), y0 = floor_i(sy);
+      int x1 = x0 + 1, y1 = y0 + 1;
+      float fx = sx - (float)x0, fy = sy - (float)y0;
+      float v00 = tilted_radial_native_value(
+          volume, native_t, full_h, full_w, logical_t, rows, n_u, stack_len,
+          base_id, direction_id, angle_idx, y0, x0, tan_tilt, center_x, center_y,
+          x_idx, y_idx, x_w, y_w);
+      if (fx == 0.0f && fy == 0.0f) return v00;
+      float v01 = tilted_radial_native_value(
+          volume, native_t, full_h, full_w, logical_t, rows, n_u, stack_len,
+          base_id, direction_id, angle_idx, y0, x1, tan_tilt, center_x, center_y,
+          x_idx, y_idx, x_w, y_w);
+      float v10 = tilted_radial_native_value(
+          volume, native_t, full_h, full_w, logical_t, rows, n_u, stack_len,
+          base_id, direction_id, angle_idx, y1, x0, tan_tilt, center_x, center_y,
+          x_idx, y_idx, x_w, y_w);
+      float v11 = tilted_radial_native_value(
+          volume, native_t, full_h, full_w, logical_t, rows, n_u, stack_len,
+          base_id, direction_id, angle_idx, y1, x1, tan_tilt, center_x, center_y,
+          x_idx, y_idx, x_w, y_w);
+      float a = v00 + fx * (v01 - v00);
+      float b = v10 + fx * (v11 - v10);
+      return a + fy * (b - a);
+    }
+
+    extern "C" __global__ void tilted_radial_native_f32(
+        const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
+        int rows, int n_u, int stack_len, int base_id, int direction_id, int angle_idx,
+        float tan_tilt, float center_x, float center_y,
+        const int* x_idx, const int* y_idx, const float* x_w, const float* y_w,
+        float* out) {
+      int q = (int)(blockDim.x * blockIdx.x + threadIdx.x);
+      if (q >= rows * n_u) return;
+      int row = q / n_u;
+      int u = q - row * n_u;
+      out[q] = tilted_radial_native_value(
+          volume, native_t, full_h, full_w, logical_t, rows, n_u, stack_len,
+          base_id, direction_id, angle_idx, row, u, tan_tilt, center_x, center_y,
+          x_idx, y_idx, x_w, y_w);
+    }
+
+    __device__ __forceinline__ float tilted_radial_direct_value(
+        const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
+        int rows, int n_u, int stack_len, int base_id, int direction_id,
+        const int* render_meta, float tan_tilt, float center_x, float center_y,
+        int oh, int ow,
+        float m00, float m01, float m02, float m10, float m11, float m12,
+        const int* x_idx, const int* y_idx, const float* x_w, const float* y_w,
+        int q) {
+      int angle_idx = render_meta[0];
+      int oy = q / ow, ox = q - oy * ow;
+      float sx = __fadd_rn(__fadd_rn(__fmul_rn(m00, (float)ox), __fmul_rn(m01, (float)oy)), m02);
+      float sy = __fadd_rn(__fadd_rn(__fmul_rn(m10, (float)ox), __fmul_rn(m11, (float)oy)), m12);
+      return tilted_radial_bilinear_value(
+          volume, native_t, full_h, full_w, logical_t, rows, n_u, stack_len,
+          base_id, direction_id, angle_idx, sy, sx, tan_tilt, center_x, center_y,
+          x_idx, y_idx, x_w, y_w);
+    }
+
+    extern "C" __global__ void tilted_radial_direct_f32(
+        const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
+        int rows, int n_u, int stack_len, int base_id, int direction_id,
+        const int* render_meta, float tan_tilt, float center_x, float center_y,
+        int oh, int ow,
+        float m00, float m01, float m02, float m10, float m11, float m12,
+        const int* x_idx, const int* y_idx, const float* x_w, const float* y_w,
+        float* out) {
+      int q = (int)(blockDim.x * blockIdx.x + threadIdx.x);
+      if (q >= oh * ow) return;
+      out[q] = norm_u8(tilted_radial_direct_value(
+          volume, native_t, full_h, full_w, logical_t, rows, n_u, stack_len,
+          base_id, direction_id, render_meta, tan_tilt, center_x, center_y,
+          oh, ow, m00, m01, m02, m10, m11, m12,
+          x_idx, y_idx, x_w, y_w, q));
+    }
+
+    extern "C" __global__ void tilted_radial_direct_f16(
+        const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
+        int rows, int n_u, int stack_len, int base_id, int direction_id,
+        const int* render_meta, float tan_tilt, float center_x, float center_y,
+        int oh, int ow,
+        float m00, float m01, float m02, float m10, float m11, float m12,
+        const int* x_idx, const int* y_idx, const float* x_w, const float* y_w,
+        __half* out) {
+      int q = (int)(blockDim.x * blockIdx.x + threadIdx.x);
+      if (q >= oh * ow) return;
+      float value = norm_u8(tilted_radial_direct_value(
+          volume, native_t, full_h, full_w, logical_t, rows, n_u, stack_len,
+          base_id, direction_id, render_meta, tan_tilt, center_x, center_y,
+          oh, ow, m00, m01, m02, m10, m11, m12,
+          x_idx, y_idx, x_w, y_w, q));
+      out[q] = __float2half_rn(value);
+    }
+
     __device__ __forceinline__ float tilted_direct_value(
         const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
         int src_h, int src_w, int stack_len, int base_id, int direction_id,
@@ -12860,6 +13045,7 @@ def _fused_direct_render_kernels() -> Optional[object]:
         import cupy as cp  # type: ignore
         names = (
             'set_render_meta', 'precompute_radial_taps', 'radial_direct_f32', 'radial_direct_f16',
+            'tilted_radial_native_f32', 'tilted_radial_direct_f32', 'tilted_radial_direct_f16',
             'tilted_direct_f32', 'tilted_direct_f16',
         )
         module = cp.RawModule(code=src, options=('--std=c++14',))
@@ -13075,7 +13261,8 @@ class _GpuWorkerRenderEngine:
                     print(
                         f'GPU render: source volume NOT resident ({nbytes / GIB:.1f} GiB needed + '
                         f'{gpu_render_reserve_bytes() / GIB:.1f} GiB reserve > {free_bytes / GIB:.1f} GiB free); '
-                        'radial tasks use streamed GPU prerendering, other views use CPU rendering. '
+                        'only upright transverse-Radial tasks retain streamed GPU prerendering. '
+                        'Tilted-Radial, Cartesian, and other unsupported nonresident views use CPU rendering. '
                         'A TensorRT engine rebuilt at max batch 1 frees enough VRAM for residency.'
                     )
             except Exception as exc:
@@ -13178,10 +13365,15 @@ class _GpuWorkerRenderEngine:
         self._fused_disabled_families.add(family_s)
         if family_s not in self._fused_warned_families:
             self._fused_warned_families.add(family_s)
-            gate = (
-                'YOLO_TTA_FUSED_RADIAL_RENDER=0'
-                if family_s == 'radial' else 'YOLO_TTA_FUSED_TILTED_RENDER=0'
-            )
+            if family_s == 'tilted_radial':
+                gate = (
+                    'YOLO_TTA_FUSED_RADIAL_RENDER=0 disables only the direct kernel; '
+                    'YOLO_TTA_GPU_TILTED_RADIAL_RENDER=0 restores the v16.0.2 CPU path'
+                )
+            elif family_s == 'radial':
+                gate = 'YOLO_TTA_FUSED_RADIAL_RENDER=0'
+            else:
+                gate = 'YOLO_TTA_FUSED_TILTED_RENDER=0'
             print(
                 f'P4 fused {family_s} renderer unavailable ({exc}); using the reference '
                 f'Torch renderer for this worker. {gate} disables the capability probe.'
@@ -13236,8 +13428,12 @@ class _GpuWorkerRenderEngine:
         n_u = int(view.src_w) if int(view.src_w) > 0 else int(view.diameter)
         if n_angles <= 0 or n_u <= 0:
             raise RuntimeError('fused Radial descriptor geometry is empty')
+        plane_h, plane_w = radial_plane_shape(view)
+        # The descriptor contains only projected-plane coordinates.  Sagittal and Coronal
+        # may therefore share it when their plane geometry/azimuth table are identical; putting
+        # the semantic base name in the key needlessly rebuilt ~1.3 GiB tables between views.
         key = (
-            int(view.full_h), int(view.full_w), int(n_u),
+            int(plane_h), int(plane_w), int(n_u),
             round(float(view.center_x), 5), round(float(view.center_y), 5),
             round(float(view.roi_radius), 5), angles_np.tobytes(),
         )
@@ -13276,7 +13472,8 @@ class _GpuWorkerRenderEngine:
             angles=angles, x_idx=x_idx, y_idx=y_idx, x_w=x_w, y_w=y_w,
             cp_angles=cp.asarray(angles), cp_x_idx=cp.asarray(x_idx),
             cp_y_idx=cp.asarray(y_idx), cp_x_w=cp.asarray(x_w), cp_y_w=cp.asarray(y_w),
-            n_angles=n_angles, n_u=n_u, nbytes=descriptor_bytes,
+            n_angles=n_angles, n_u=n_u, plane_h=int(plane_h), plane_w=int(plane_w),
+            nbytes=descriptor_bytes,
         )
         external = _cupy_external_stream(cp, self._stream)
         total = int(n_angles) * int(n_u)
@@ -13284,7 +13481,7 @@ class _GpuWorkerRenderEngine:
             ((total + 255) // 256,), (256,),
             (
                 refs.cp_angles, np.int32(n_angles), np.int32(n_u),
-                np.int32(view.full_h), np.int32(view.full_w),
+                np.int32(plane_h), np.int32(plane_w),
                 np.float32(view.center_x), np.float32(view.center_y), np.float32(view.roi_radius),
                 refs.cp_x_idx, refs.cp_y_idx, refs.cp_x_w, refs.cp_y_w,
             ),
@@ -13293,6 +13490,7 @@ class _GpuWorkerRenderEngine:
         self._fused_radial_taps[key] = refs
         print(
             f'P4 Radial tap cache allocated on {self.device}: {n_angles} azimuths x {n_u} samples '
+            f'on {int(plane_h)}x{int(plane_w)} projected planes '
             f'({descriptor_bytes / GIB:.2f} GiB, separable Lanczos-3 descriptors).'
         )
         return refs
@@ -13308,9 +13506,12 @@ class _GpuWorkerRenderEngine:
         stage_metadata: bool = True,
         disable_on_failure: bool = True,
     ) -> bool:
+        tilted_radial = bool(is_tilted_radial_view(view))
+        render_family = 'tilted_radial' if tilted_radial else 'radial'
         if (
             not fused_radial_render_enabled()
             or 'radial' in self._fused_disabled_families
+            or render_family in self._fused_disabled_families
             or not radial_fused_render_supported(view)
         ):
             return False
@@ -13321,52 +13522,105 @@ class _GpuWorkerRenderEngine:
                 raise RuntimeError('resident uint8 source volume is unavailable or non-contiguous')
             if self._volume_gpu.dtype != self.torch.uint8:
                 raise RuntimeError(f'expected uint8 source volume, got {self._volume_gpu.dtype}')
-            if int(view.full_h) != int(self._volume_gpu.shape[1]) or int(view.full_w) != int(self._volume_gpu.shape[2]):
+            native_t, full_h, full_w = (int(v) for v in self._volume_gpu.shape)
+            if int(view.full_h) != full_h or int(view.full_w) != full_w:
                 raise RuntimeError('Radial view/source-volume XY geometry mismatch')
             if int(frame_index) < 0 or int(frame_index) >= len(view.azimuths_deg):
                 raise RuntimeError(f'Radial frame index {frame_index} is outside its azimuth table')
             kernels = _fused_direct_render_kernels()
             if kernels is None:
-                raise RuntimeError('CuPy/NVRTC direct renderer kernels are unavailable: ' + str(_FUSED_DIRECT_RENDER_KERNELS_ERROR or 'no diagnostic'))
+                raise RuntimeError(
+                    'CuPy/NVRTC direct renderer kernels are unavailable: '
+                    + str(_FUSED_DIRECT_RENDER_KERNELS_ERROR or 'no diagnostic')
+                )
             taps = self._ensure_fused_radial_taps(view, kernels)
             matrix = np.asarray(aff.M_out_to_src, dtype=np.float32).reshape(2, 3)
             if not bool(np.all(np.isfinite(matrix))):
                 raise RuntimeError('Radial output-to-source affine is non-finite')
-            cp = kernels.cp
-            external = _cupy_external_stream(cp, self._stream)
-            kernel = (
-                kernels.radial_direct_f16
-                if slot.input.dtype == self.torch.float16 else kernels.radial_direct_f32
-            )
             if slot.input.dtype not in (self.torch.float16, self.torch.float32):
                 raise RuntimeError(f'unsupported binding dtype {slot.input.dtype}')
-            pixels = int(out_size) * int(out_size)
-            kernel(
-                ((pixels + 255) // 256,), (256,),
-                (
-                    self._fused_cupy_volume(kernels),
-                    np.int32(self._volume_gpu.shape[0]), np.int32(self._volume_gpu.shape[1]),
-                    np.int32(self._volume_gpu.shape[2]), np.int32(view.src_h), np.int32(taps.n_u),
-                    self._fused_slot_metadata(
-                        slot, kernels, int(frame_index) if bool(stage_metadata) else None,
-                    ),
-                    np.int32(out_size), np.int32(out_size),
-                    *(np.float32(v) for v in matrix.reshape(-1)),
-                    taps.cp_x_idx, taps.cp_y_idx, taps.cp_x_w, taps.cp_y_w,
-                    self._fused_slot_output(slot, kernels),
-                ),
-                stream=external,
+            external = _cupy_external_stream(kernels.cp, self._stream)
+            metadata = self._fused_slot_metadata(
+                slot, kernels, int(frame_index) if bool(stage_metadata) else None,
             )
-            if 'radial' not in self._fused_announced_families:
-                self._fused_announced_families.add('radial')
-                print('P4 fused Radial renderer active: uint8 volume -> Lanczos/t-lerp -> TensorRT binding.')
+            output_ref = self._fused_slot_output(slot, kernels)
+            pixels = int(out_size) * int(out_size)
+
+            if tilted_radial:
+                base = str(radial_base_view_name(view))
+                base_ids = {'transverse': 0, 'sagittal': 1, 'coronal': 2}
+                if base not in base_ids:
+                    raise RuntimeError(f'unsupported tilted-Radial base {base!r}')
+                direction = str(view.tilt_direction)
+                if direction not in ('vertical', 'horizontal'):
+                    raise RuntimeError(f'unsupported tilted-Radial direction {direction!r}')
+                plane_h, plane_w = radial_plane_shape(view)
+                if int(taps.plane_h) != int(plane_h) or int(taps.plane_w) != int(plane_w):
+                    raise RuntimeError('tilted-Radial tap table/projected-plane geometry mismatch')
+                stack_len = int(radial_stack_length(view))
+                if stack_len <= 0:
+                    raise RuntimeError('tilted-Radial stack geometry is empty')
+                kernel = (
+                    kernels.tilted_radial_direct_f16
+                    if slot.input.dtype == self.torch.float16
+                    else kernels.tilted_radial_direct_f32
+                )
+                kernel(
+                    ((pixels + 255) // 256,), (256,),
+                    (
+                        self._fused_cupy_volume(kernels),
+                        np.int32(native_t), np.int32(full_h), np.int32(full_w),
+                        np.int32(self._logical_t), np.int32(view.src_h), np.int32(taps.n_u),
+                        np.int32(stack_len), np.int32(base_ids[base]),
+                        np.int32(0 if direction == 'vertical' else 1),
+                        metadata,
+                        np.float32(math.tan(math.radians(float(view.tilt_angle_deg)))),
+                        np.float32(view.center_x), np.float32(view.center_y),
+                        np.int32(out_size), np.int32(out_size),
+                        *(np.float32(v) for v in matrix.reshape(-1)),
+                        taps.cp_x_idx, taps.cp_y_idx, taps.cp_x_w, taps.cp_y_w,
+                        output_ref,
+                    ),
+                    stream=external,
+                )
+                if render_family not in self._fused_announced_families:
+                    self._fused_announced_families.add(render_family)
+                    print(
+                        'v16.0.3 fused tilted-Radial renderer active: resident uint8 volume '
+                        '-> shear + Lanczos-3 + stack lerp -> TensorRT binding.'
+                    )
+            else:
+                kernel = (
+                    kernels.radial_direct_f16
+                    if slot.input.dtype == self.torch.float16 else kernels.radial_direct_f32
+                )
+                kernel(
+                    ((pixels + 255) // 256,), (256,),
+                    (
+                        self._fused_cupy_volume(kernels),
+                        np.int32(native_t), np.int32(full_h), np.int32(full_w),
+                        np.int32(view.src_h), np.int32(taps.n_u), metadata,
+                        np.int32(out_size), np.int32(out_size),
+                        *(np.float32(v) for v in matrix.reshape(-1)),
+                        taps.cp_x_idx, taps.cp_y_idx, taps.cp_x_w, taps.cp_y_w,
+                        output_ref,
+                    ),
+                    stream=external,
+                )
+                if render_family not in self._fused_announced_families:
+                    self._fused_announced_families.add(render_family)
+                    print(
+                        'P4 fused Radial renderer active: uint8 volume -> Lanczos/t-lerp '
+                        '-> TensorRT binding.'
+                    )
             return True
         except Exception as exc:
             if not bool(disable_on_failure):
                 raise
             self._fused_radial_taps.clear()
-            self._fused_render_fallback('radial', exc)
+            self._fused_render_fallback(render_family, exc)
             return False
+
 
     def _try_fused_tilted_into_slot(
         self,
@@ -13754,11 +14008,11 @@ class _GpuWorkerRenderEngine:
         return (samples.to(self.torch.float32) * w2d.unsqueeze(0)).sum(dim=-1)
 
     def _render_radial_native_resident(self, view: ViewInfo, frame_idx: int) -> object:
-        """Render a non-tilted Radial base directly from the resident source volume."""
+        """Render an upright or tilted Radial frame directly from the resident source volume."""
         if not radial_resident_gpu_render_supported(view):
-            raise RuntimeError(
-                f'resident GPU Radial rendering does not support tilted source {view.name!r}'
-            )
+            raise RuntimeError(f'resident GPU Radial rendering is disabled for {view.name!r}')
+        if is_tilted_radial_view(view):
+            return self._render_tilted_radial_native_resident(view, int(frame_idx))
         torch = self.torch
         vol = self._volume_gpu
         base = radial_base_view_name(view)
@@ -13801,6 +14055,183 @@ class _GpuWorkerRenderEngine:
             return proj
         r0, r1, alpha = self._radial_fold_indices(stack_len, rows_out)
         return proj[r0] * (1.0 - alpha) + proj[r1] * alpha
+
+    def _render_tilted_radial_native_resident_torch(self, view: ViewInfo, frame_idx: int) -> object:
+        """Reference CUDA/Torch implementation matching ``extract_tilted_radial_slice_frame``.
+
+        This path is retained when the allocation-free NVRTC kernel is unavailable or explicitly
+        disabled.  It keeps every gather and interpolation on the resident GPU and therefore never
+        requests the deferred host cube.  Row blocking bounds temporary int64 gather tensors.
+        """
+        torch = self.torch
+        vol = self._volume_gpu
+        native_t, full_h, full_w = (int(v) for v in vol.shape)
+        logical_t = int(self._logical_t)
+        base = str(radial_base_view_name(view))
+        stack_len = int(radial_stack_length(view))
+        rows = int(view.src_h)
+        u_len = int(view.src_w) if int(view.src_w) > 0 else int(view.diameter)
+        plane_h, plane_w = radial_plane_shape(view)
+        flat_idx, w2d = self._radial_taps_gpu(
+            view, float(view.azimuths_deg[int(frame_idx)]),
+        )
+        px = torch.remainder(flat_idx, int(plane_w)).to(torch.int64)
+        py = torch.div(flat_idx, int(plane_w), rounding_mode='floor').to(torch.int64)
+        weights = w2d.to(torch.float32)
+        tan_tilt = float(math.tan(math.radians(float(view.tilt_angle_deg))))
+        if str(view.tilt_direction) == 'vertical':
+            tap_offsets = py.to(torch.float32) - float(view.center_y)
+        elif str(view.tilt_direction) == 'horizontal':
+            tap_offsets = px.to(torch.float32) - float(view.center_x)
+        else:
+            raise ValueError(f'Unsupported tilted-Radial direction: {view.tilt_direction!r}')
+
+        if rows == stack_len:
+            row_centers = torch.arange(rows, dtype=torch.float32, device=self.device)
+        else:
+            row_centers = (
+                (torch.arange(rows, dtype=torch.float32, device=self.device) + 0.5)
+                * (float(stack_len) / float(rows))
+                - 0.5
+            ).clamp_(0.0, float(max(0, stack_len - 1)))
+
+        out = torch.empty((rows, u_len), dtype=torch.float32, device=self.device)
+        row_block = max(
+            1,
+            min(256, _env_int('YOLO_TTA_GPU_TILTED_RADIAL_ROW_BLOCK', 32)),
+        )
+        plane_stride = int(full_h) * int(full_w)
+        volume_flat = self._volume_flat
+        zero = torch.zeros((), dtype=torch.float32, device=self.device)
+        native_r0: Optional[object] = None
+        native_r1: Optional[object] = None
+        native_alpha: Optional[object] = None
+        if native_t != logical_t:
+            native_r0, native_r1, native_alpha = self._native_t_indices(logical_t)
+
+        for row0 in range(0, rows, row_block):
+            row1 = min(rows, row0 + row_block)
+            centers = row_centers[row0:row1].view(-1, 1, 1)
+            stack_src = centers + float(tan_tilt) * tap_offsets.unsqueeze(0)
+            valid = (stack_src >= 0.0) & (stack_src <= float(stack_len - 1))
+            s0f = stack_src.floor().clamp_(0.0, float(stack_len - 1))
+            s1f = (s0f + 1.0).clamp_(max=float(stack_len - 1))
+            s0 = s0f.to(torch.int64)
+            s1 = s1f.to(torch.int64)
+            stack_alpha = stack_src - s0f
+
+            if base == 'transverse':
+                spatial = py * int(full_w) + px
+                if native_t == logical_t:
+                    v0 = torch.take(
+                        volume_flat, spatial.unsqueeze(0) + s0 * int(plane_stride),
+                    ).to(torch.float32)
+                    v1 = torch.take(
+                        volume_flat, spatial.unsqueeze(0) + s1 * int(plane_stride),
+                    ).to(torch.float32)
+                else:
+                    n00 = native_r0[s0]; n01 = native_r1[s0]; a0 = native_alpha[s0]
+                    n10 = native_r0[s1]; n11 = native_r1[s1]; a1 = native_alpha[s1]
+                    f00 = torch.take(volume_flat, spatial.unsqueeze(0) + n00 * int(plane_stride)).to(torch.float32)
+                    f01 = torch.take(volume_flat, spatial.unsqueeze(0) + n01 * int(plane_stride)).to(torch.float32)
+                    f10 = torch.take(volume_flat, spatial.unsqueeze(0) + n10 * int(plane_stride)).to(torch.float32)
+                    f11 = torch.take(volume_flat, spatial.unsqueeze(0) + n11 * int(plane_stride)).to(torch.float32)
+                    v0 = (f00 + a0 * (f01 - f00)).round_().clamp_(0.0, 255.0)
+                    v1 = (f10 + a1 * (f11 - f10)).round_().clamp_(0.0, 255.0)
+            elif base in ('sagittal', 'coronal'):
+                if base == 'sagittal':
+                    spatial0 = s0 * int(full_w) + px.unsqueeze(0)
+                    spatial1 = s1 * int(full_w) + px.unsqueeze(0)
+                else:
+                    spatial0 = px.unsqueeze(0) * int(full_w) + s0
+                    spatial1 = px.unsqueeze(0) * int(full_w) + s1
+                if native_t == logical_t:
+                    t_base = py.unsqueeze(0) * int(plane_stride)
+                    v0 = torch.take(volume_flat, t_base + spatial0).to(torch.float32)
+                    v1 = torch.take(volume_flat, t_base + spatial1).to(torch.float32)
+                else:
+                    t0 = native_r0[py].unsqueeze(0)
+                    t1 = native_r1[py].unsqueeze(0)
+                    ta = native_alpha[py].unsqueeze(0)
+                    f00 = torch.take(volume_flat, t0 * int(plane_stride) + spatial0).to(torch.float32)
+                    f01 = torch.take(volume_flat, t1 * int(plane_stride) + spatial0).to(torch.float32)
+                    f10 = torch.take(volume_flat, t0 * int(plane_stride) + spatial1).to(torch.float32)
+                    f11 = torch.take(volume_flat, t1 * int(plane_stride) + spatial1).to(torch.float32)
+                    v0 = (f00 + ta * (f01 - f00)).round_().clamp_(0.0, 255.0)
+                    v1 = (f10 + ta * (f11 - f10)).round_().clamp_(0.0, 255.0)
+            else:  # pragma: no cover
+                raise ValueError(f'Unsupported tilted-Radial base: {base!r}')
+
+            values = v0 + stack_alpha * (v1 - v0)
+            values = torch.where(valid, values, zero)
+            out[row0:row1] = (values * weights.unsqueeze(0)).sum(dim=-1)
+        return out
+
+    def _render_tilted_radial_native_resident(self, view: ViewInfo, frame_idx: int) -> object:
+        """Render one tilted-Radial native plane on the resident GPU.
+
+        Prefer the one-launch NVRTC kernel used by the direct TensorRT path.  A mathematically
+        equivalent Torch gather implementation remains available as a capability fallback.
+        """
+        if not is_tilted_radial_view(view):
+            raise ValueError(f'{view.name!r} is not a tilted-Radial view')
+        native_kernel_enabled = _env_flag('YOLO_TTA_GPU_TILTED_RADIAL_NATIVE_KERNEL', True)
+        if native_kernel_enabled:
+            try:
+                kernels = _fused_direct_render_kernels()
+                if kernels is None:
+                    raise RuntimeError(
+                        'CuPy/NVRTC kernels unavailable: '
+                        + str(_FUSED_DIRECT_RENDER_KERNELS_ERROR or 'no diagnostic')
+                    )
+                taps = self._ensure_fused_radial_taps(view, kernels)
+                base = str(radial_base_view_name(view))
+                base_ids = {'transverse': 0, 'sagittal': 1, 'coronal': 2}
+                direction = str(view.tilt_direction)
+                if base not in base_ids or direction not in ('vertical', 'horizontal'):
+                    raise RuntimeError(
+                        f'unsupported tilted-Radial geometry base={base!r}, direction={direction!r}'
+                    )
+                rows = int(view.src_h)
+                n_u = int(taps.n_u)
+                stack_len = int(radial_stack_length(view))
+                out = self.torch.empty(
+                    (rows, n_u), dtype=self.torch.float32, device=self.device,
+                )
+                cp_out = kernels.cp.asarray(out)
+                pixels = int(rows) * int(n_u)
+                kernels.tilted_radial_native_f32(
+                    ((pixels + 255) // 256,), (256,),
+                    (
+                        self._fused_cupy_volume(kernels),
+                        np.int32(self._volume_gpu.shape[0]), np.int32(self._volume_gpu.shape[1]),
+                        np.int32(self._volume_gpu.shape[2]), np.int32(self._logical_t),
+                        np.int32(rows), np.int32(n_u), np.int32(stack_len),
+                        np.int32(base_ids[base]), np.int32(0 if direction == 'vertical' else 1),
+                        np.int32(frame_idx),
+                        np.float32(math.tan(math.radians(float(view.tilt_angle_deg)))),
+                        np.float32(view.center_x), np.float32(view.center_y),
+                        taps.cp_x_idx, taps.cp_y_idx, taps.cp_x_w, taps.cp_y_w,
+                        cp_out,
+                    ),
+                    stream=_cupy_external_stream(kernels.cp, self._stream),
+                )
+                if 'tilted_radial_native' not in self._fused_announced_families:
+                    self._fused_announced_families.add('tilted_radial_native')
+                    print(
+                        'v16.0.3 resident tilted-Radial native-plane CUDA kernel active '
+                        '(YOLO_TTA_GPU_TILTED_RADIAL_NATIVE_KERNEL=0 selects Torch gathers).'
+                    )
+                return out
+            except Exception as exc:
+                if 'tilted_radial_native' not in self._fused_warned_families:
+                    self._fused_warned_families.add('tilted_radial_native')
+                    print(
+                        f'Warning: tilted-Radial native-plane kernel unavailable ({exc}); '
+                        'using the resident Torch gather renderer without requesting the host cube.'
+                    )
+        return self._render_tilted_radial_native_resident_torch(view, int(frame_idx))
+
 
     def prerender_radial_slab(
         self,
@@ -14666,6 +15097,7 @@ def _tile_group_cpu_renderer(
 
 
 _WORKER_GPU_RENDER_ENGINE: Optional[_GpuWorkerRenderEngine] = None
+_WORKER_TILTED_RADIAL_CPU_WARNED: set[str] = set()
 
 
 def _worker_gpu_render_engine() -> Optional[_GpuWorkerRenderEngine]:
@@ -15143,6 +15575,17 @@ def run_prediction_volume_in_worker(
                 source = None
 
         if source is None:
+            if (
+                is_tilted_radial_view(view)
+                and str(view.name) not in _WORKER_TILTED_RADIAL_CPU_WARNED
+            ):
+                _WORKER_TILTED_RADIAL_CPU_WARNED.add(str(view.name))
+                print(
+                    'PERFORMANCE WARNING: tilted-Radial view '
+                    f'{view.name!r} is entering the completed-cube CPU renderer. '
+                    'This is the v16.0.2 pathological path and can dominate wall time. '
+                    'Look earlier for a resident-upload or CUDA-renderer failure.'
+                )
             source_mm, source = _open_cpu_render_source()
 
         # T3: a tile group carries one affine PER TILE (selected per unit below), so there is
@@ -21823,7 +22266,7 @@ def assemble_current_view_union_volume(
     postprocessing runs in source voxels; None keeps the working geometry.
     """
     if len(view_volumes_by_model) != 1:
-        raise ValueError('GPT-5.6-Sol-Pro v16.0.2 supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.0.3 supports exactly one --model; multiple-model inference has been removed')
 
     union_shape = (int(T), int(H), int(W)) if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
     model_name = next(iter(view_volumes_by_model.keys()))
@@ -32510,7 +32953,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.6-Sol-Pro_v16.0.2_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.6-Sol-Pro_v16.0.3_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -35718,7 +36161,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('GPT-5.6-Sol-Pro v16.0.2 accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.0.3 accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -35980,6 +36423,18 @@ def main() -> None:
         f"[{'MEMORY-backed (' + str(_mount_fstype_for_path(temp_dir) or 'tmpfs') + ')' if scratch_dir_is_memory_backed() else 'disk-backed'}, "
         f"free={_filesystem_free_bytes(temp_dir) / GIB:.1f} GiB]"
     )
+    output_memory_backed = bool(path_is_memory_backed(out_dir))
+    print(
+        f"Final output dir: {out_dir} "
+        f"[{'MEMORY-backed (' + str(_mount_fstype_for_path(out_dir) or 'tmpfs') + ')' if output_memory_backed else 'disk/network-backed'}, "
+        f"free={_filesystem_free_bytes(out_dir) / GIB:.1f} GiB]"
+    )
+    if bool(args.temp) and scratch_dir_is_memory_backed() and not output_memory_backed:
+        print(
+            'Important: --temp redirects scratch work only. Final MKV/NRRD/manifest files are '
+            f'written to --output ({out_dir}); benchmark runs must use the same --output filesystem '
+            'to compare output-stage wall time fairly.'
+        )
 
     info = ffprobe_info(input_path)
     input_W = int(info['width'])
@@ -36211,7 +36666,53 @@ def main() -> None:
     cartesian_views = orthogonal_views_only(views)
     inference_views = list(views)
     interpolating_views = [v for v in inference_views if _view_uses_interpolation(v, int(args.interpolate))]
+
+    # v16.0.3 regression observability: a tilted_* Radial token expands to every concrete
+    # signed/directional Tilted variant of that base.  Print the concrete work instead of
+    # leaving a six-token CLI looking like six similarly sized views.
+    radial_concrete_views = [v for v in inference_views if is_radial_view(v)]
+    tilted_radial_concrete_views = [v for v in radial_concrete_views if is_tilted_radial_view(v)]
+    upright_radial_concrete_views = [v for v in radial_concrete_views if not is_tilted_radial_view(v)]
+    upright_tilted_views = [v for v in inference_views if is_tilted_view(v)]
+    source_frames_per_angle = int(sum(int(v.num_slices) for v in inference_views))
+    radial_frames_per_angle = int(sum(int(v.num_slices) for v in radial_concrete_views))
+    tilted_radial_frames_per_angle = int(sum(int(v.num_slices) for v in tilted_radial_concrete_views))
+    radial_expansion_counts = Counter(
+        str(v.radial_request_token or radial_base_view_name(v))
+        for v in radial_concrete_views
+    )
+    radial_expansion_note = ', '.join(
+        f'{token}=>{int(count)} concrete view(s)'
+        for token, count in radial_expansion_counts.items()
+    ) or 'none'
+    print(
+        'v16.0.3 concrete view workload: '
+        f'{len(inference_views)} view(s) = {len(cartesian_views)} Cartesian + '
+        f'{len(upright_tilted_views)} Tilted + {len(upright_radial_concrete_views)} upright Radial + '
+        f'{len(tilted_radial_concrete_views)} tilted-Radial; '
+        f'{source_frames_per_angle} source frame(s)/--angle, '
+        f'{source_frames_per_angle * max(1, len(angles))} model frame(s) across {max(1, len(angles))} angle(s).'
+    )
+    if radial_concrete_views:
+        print(
+            'Radial concrete expansion: '
+            f'{radial_expansion_note}; radial={radial_frames_per_angle} frame(s)/angle, '
+            f'tilted-Radial={tilted_radial_frames_per_angle} frame(s)/angle.'
+        )
+    if tilted_radial_concrete_views:
+        print(
+            'v16.0.3 tilted-Radial resident CUDA rendering is enabled '
+            '(YOLO_TTA_GPU_TILTED_RADIAL_RENDER=0 restores the v16.0.2 CPU fallback). '
+            'A worker that cannot admit the source volume to VRAM will still use the completed-cube CPU path.'
+        )
     spec_notes: List[str] = []
+    if tilted_radial_concrete_views:
+        spec_notes.append(
+            'v16.0.3 regression fix: concrete tilted-Radial views use the resident CUDA source '
+            'renderer and persistent batch-1 TensorRT ring instead of silently materializing the '
+            'deferred host cube and running the 36-tap/sheared frame renderer on the CPU. '
+            'YOLO_TTA_GPU_TILTED_RADIAL_RENDER=0 restores the v16.0.2 compatibility path.'
+        )
     # v13.1.0 spec<->implementation conflict notes (see header docstring and suggested spec edits).
     spec_notes.append(
         'CONFLICT NOTE 1 (--min_radius): the task says --min_radius is now applied per view in each '
