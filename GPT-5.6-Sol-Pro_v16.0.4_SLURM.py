@@ -1,34 +1,20 @@
 #!/usr/bin/env python3
-"""
-YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
-
-This is the GPT-5.6-Sol-Pro v16.0.3 SLURM regression-fix release, built from
-GPT-5.6-Sol-Pro_v16.0.2_SLURM.py. It consolidates Cartesian and Tilted view selection,
-generalizes Radial views across all Cartesian orientations and enabled Tilted variants,
-and supports per-Radial-view azimuth spacing.
+"""YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
 Current runtime behavior:
-  - accepts gray/grey, RGB, or C{odd}S{stride} model-input channel layouts
-  - streams full-frame and tiled inputs, with optional GPU-resident rendering
-  - uses process-per-GPU scheduling for every CUDA run, including one-GPU runs
-  - supports GPU device-union accumulation, overlapped D2H retirement, grouped tiles,
-    parent-aware tile dispatch, native-t resident rendering (including tilted-Radial
-    transforms), and the persistent batch-1 TensorRT ring whenever their capability checks pass
-  - uses Ultralytics' unified quantize setting for inference precision
-  - stores temporary binary volumes as ordinary unpacked uint8 arrays or raw bbox stores
-  - writes every single-layer Slicer segmentation NRRD in the complete output geometry
-  - overlaps model loading with decode/preparation by default, then overlaps inference,
-    view cleanup/interpolation, backprojection, and output writing
-  - admits multiple independent parent-view preparation tasks even when interpolation is off
-  - restores/unions final geometry through pinned, multi-stream, multi-GPU bands when admitted
-  - resolves keep_objects topology through parallel 3D slabs and boundary-only global merges
-  - leaves centerline audit/filter passes disabled unless explicitly requested
+ - accepts gray/grey, RGB, or C{odd}S{stride} model-input channel layouts
+ - streams full-frame and tiled inputs, with optional GPU-resident rendering
+ - uses one persistent worker process per CUDA device, including one-GPU runs
+ - overlaps decode, rendering, inference, cleanup/interpolation, backprojection, and output writing
+ - supports Cartesian, Tilted, and Radial view families with dense tiles and source-geometry fusion
+ - uses Ultralytics' unified quantize setting for inference precision
+ - writes optional Slicer segmentation NRRDs as independent source-geometry component layers
+ - uses the self-contained EDT medial-ridge centerline backend when explicitly enabled
 
 Dependencies:
-  pip install opencv-python numpy scipy tifffile tqdm ultralytics
-  Optional: numba, cupy-cuda12x, deflate, isal, VTK/VMTK.
-  System: ffmpeg and ffprobe on PATH.
-"""
+ pip install opencv-python numpy scipy tifffile tqdm ultralytics
+ Optional: numba, cupy-cuda12x, deflate, isal, nvidia-ml-py.
+ System: ffmpeg and ffprobe on PATH."""
 
 from __future__ import annotations
 
@@ -39,6 +25,7 @@ import contextlib
 import functools
 import gc
 import inspect
+import importlib.metadata as importlib_metadata
 import io
 import json
 import math
@@ -69,7 +56,7 @@ import numpy as np
 GIB = 1024 ** 3
 NRRD_SPACE = "left-posterior-superior"
 
-# --- third-party ---
+# third-party ---
 try:
     import cv2  # type: ignore
 except Exception as e:  # pragma: no cover
@@ -96,9 +83,33 @@ except Exception as _numba_exc:  # pragma: no cover - optional acceleration
 else:
     _NUMBA_IMPORT_ERROR = None
 
-# --------------------------
+
+_NVIDIA_ML_PY_MODULE: Optional[object] = None
+_NVIDIA_ML_PY_IMPORT_ERROR: Optional[BaseException] = None
+
+
+def _load_nvidia_ml_py() -> object:
+    """Load NVML bindings from the NVIDIA-maintained ``nvidia-ml-py`` distribution."""
+    global _NVIDIA_ML_PY_MODULE, _NVIDIA_ML_PY_IMPORT_ERROR
+    if _NVIDIA_ML_PY_MODULE is not None:
+        return _NVIDIA_ML_PY_MODULE
+    if _NVIDIA_ML_PY_IMPORT_ERROR is not None:
+        raise ImportError('nvidia-ml-py is unavailable') from _NVIDIA_ML_PY_IMPORT_ERROR
+    try:
+        importlib_metadata.version('nvidia-ml-py')
+        # The maintained distribution intentionally exports the ``pynvml`` import namespace.
+        module = __import__('pynvml')
+    except Exception as exc:
+        _NVIDIA_ML_PY_IMPORT_ERROR = exc
+        raise ImportError(
+            'Install the NVIDIA-maintained NVML bindings with: pip install nvidia-ml-py'
+        ) from exc
+    _NVIDIA_ML_PY_MODULE = module
+    return module
+
+#
 # CLI / args
-# --------------------------
+#
 
 def _parse_angles(s: str) -> List[float]:
     """Accepts comma or whitespace separated angles."""
@@ -222,7 +233,7 @@ def resolve_tilt_directions(values: Sequence[str] | str | None) -> List[str]:
             raise ValueError('--tilt_direction values must be vertical, horizontal, or both')
         if token not in out:
             out.append(token)
-    # v16.0.1 default: both directions whenever Tilted views are enabled.
+    # default: both directions whenever Tilted views are enabled.
     if not out:
         out = ['vertical', 'horizontal']
     return out
@@ -378,7 +389,7 @@ def build_argparser() -> argparse.ArgumentParser:
                         "cpu cannot be mixed. Indices are torch LOGICAL indices: when SLURM (or the shell) "
                         "exports CUDA_VISIBLE_DEVICES, index N means the (N+1)-th device of that list, not the "
                         "physical GPU id — e.g. under CUDA_VISIBLE_DEVICES=2,3 use --device 0,1 to run on "
-                        "physical GPUs 2 and 3 (v13.2.2)")
+                        "physical GPUs 2 and 3")
     p.add_argument("--retina_mask_processor", default=None, choices=["cpu", "gpu"], type=str,
                    help="Device that resolves full-resolution retina masks. CUDA defaults to gpu for "
                         "all CUDA runs; an explicit cpu/gpu value is honored. --device cpu "
@@ -480,7 +491,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--tile_size", nargs="+", default=["0"], type=str,
                    help="One or more square dense-tile side lengths in source pixels for all active views. 0 disables dense tiled predictions")
     p.add_argument("--tile_stride", nargs="+", default=["0"], type=str,
-                   help="One or more dense-tile strides in source pixels. v13.2.5 (ruling A2): index-paired with --tile_size (a single stride broadcasts); each stride must be <= its paired tile size")
+                   help="One or more dense-tile strides in source pixels. Values are index-paired with --tile_size; one stride broadcasts to every tile size. Each stride must be <= its paired tile size")
 
     p.add_argument("--save_images", action="store_true", help="Save unlabeled image sequences for all active views")
     p.add_argument("--save_labels", nargs="?", const="__DEFAULT__", default=None, type=str,
@@ -496,21 +507,21 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--enable_3d_void_fill", action="store_true",
                    help="Apply one final 3D enclosed-void fill after the global union. Disabled by default")
     p.add_argument("--centerline_filter_passes", default=0, type=int,
-                   help="Maximum v14 centerline-guided post-union passes. Pass 0 is always the untouched audit checkpoint; 0 disables both filtering and its audit NRRDs")
-    p.add_argument("--centerline_filter_backend", default="embedded", choices=["embedded", "auto", "vmtk", "off"],
-                   help="Centerline backend. embedded (default) uses the in-script SciPy EDT medial-ridge tracker and requires no VMTK; auto prefers VMTK when available then falls back to embedded; vmtk explicitly requires VTK/VMTK and safely passes through if unavailable; off disables filtering")
+                   help="Maximum centerline-guided post-union passes. Pass 0 is the untouched audit checkpoint; 0 disables filtering and its audit NRRDs")
+    p.add_argument("--centerline_filter_backend", default="embedded", choices=["embedded", "off"],
+                   help="Centerline backend. embedded uses the in-script SciPy EDT medial-ridge tracker; off disables filtering")
     p.add_argument("--centerline_auto_remove", action="store_true",
                    help="Opt in to removing whole unprotected 2D components that satisfy every centerline, temporal, and backend-reliability guard. Protected connected anatomy remains marker-only; this flag never subtracts a watershed partition")
     p.add_argument("--centerline_radius_factor", default=2.5, type=float, metavar="X",
-                   help="Flag foreground that reaches the circle of radius X times the local radius in the strict tangent-normal 2D plane. Embedded radii are EDT medial-ridge estimates; optional VMTK radii are maximum-inscribed-sphere radii")
+                   help="Flag foreground that reaches the circle of radius X times the local EDT medial-ridge radius in the strict tangent-normal 2D plane")
     p.add_argument("--centerline_temporal_context", default=8, type=int,
                    help="Clean source slices required on each side before an unprotected 2D component may be removed. Centerline anomaly runs themselves have no duration cap")
     p.add_argument("--centerline_surface_max_dim", default=512, type=int,
                    help="Maximum axis of the block-max-pooled foreground crop supplied to the centerline backend; bounds extraction without striding away thin branches")
     p.add_argument("--centerline_surface_points", default=5000, type=int,
-                   help="Centerline complexity budget. The embedded backend permits up to approximately 4x this many raw ridge samples before its global safety cap; the optional VMTK backend uses it as its surface-point target")
-    p.add_argument("--centerline_vmtk_timeout", default=900.0, type=float,
-                   help="Seconds allowed for each isolated centerline-backend attempt before preserving the current union and using safe pass-through behavior (legacy flag name retained for CLI compatibility)")
+                   help="Centerline complexity budget. The embedded backend permits up to approximately 4x this many raw ridge samples before its global safety cap")
+    p.add_argument("--centerline_timeout", default=900.0, type=float,
+                   help="Seconds allowed for each isolated embedded-centerline attempt before preserving the current union and using safe pass-through behavior")
     p.add_argument("--gaussian_smoothing", nargs="?", const=3.0, default=None, type=float, metavar="SIGMA",
                    help="Final 3D Gaussian smoothing sigma in voxel units. Unset uses default 3.0 when smoothing is activated by either Gaussian flag; explicitly set 0 to disable")
     p.add_argument("--gaussian_smoothing_passes", default=None, type=int,
@@ -534,9 +545,9 @@ def build_argparser() -> argparse.ArgumentParser:
     return p
 
 
-# --------------------------
+#
 # Scratch / temp layout
-# --------------------------
+#
 
 
 def _read_meminfo_bytes() -> Dict[str, int]:
@@ -565,31 +576,14 @@ def _cgroup_read_int(path: Path) -> Optional[int]:
         value = int(raw)
     except Exception:
         return None
-    # cgroup v1 reports "unlimited" as a huge page-rounded sentinel (~2^63).
+    # cgroup reports "unlimited" as a huge page-rounded sentinel (~2^63).
     if value <= 0 or value >= (1 << 60):
         return None
     return value
 
 
 def _cgroup_reclaimable_file_bytes(node: Path, *, v2: bool) -> int:
-    """Reclaimable file-cache bytes charged to this cgroup subtree (0 when unreadable).
-
-    memory.current/usage_in_bytes charge the job's OWN page cache, and this pipeline
-    streams hundreds of GiB through file-backed memmaps and ffmpeg decode, so the raw
-    counter sits at the limit as a steady state while the kernel would happily reclaim
-    those clean file pages before OOM-killing. Subtract inactive_file (v2) /
-    total_inactive_file (v1) to approximate the kernel's own MemAvailable-style
-    working-set view — otherwise every workspace silently flips to disk mid-run.
-
-    v15.0.3 fix: inactive_file also counts DIRTY and under-writeback pages, which the
-    kernel cannot hand back until they reach the backing store. This pipeline writes
-    hundreds of GiB through file-backed memmaps and deliberately skips msync (v13.2.5
-    speed #6 / v13.3.1 R3), so at steady state a large slice of inactive_file is dirty.
-    Counting it as headroom over-reports what may still be allocated, and the resulting
-    anonymous workspace decision (should_use_in_memory_workspace) overshoots into an
-    uncatchable cgroup OOM SIGKILL. Net out file_dirty + file_writeback so only genuinely
-    reclaimable clean page cache is credited.
-    """
+    """Return clean inactive file-cache bytes reclaimable by this cgroup."""
     if v2:
         keys = ('inactive_file', 'file_dirty', 'file_writeback')
     else:
@@ -613,14 +607,9 @@ def _cgroup_reclaimable_file_bytes(node: Path, *, v2: bool) -> int:
 
 
 def _cgroup_memory_headroom_bytes() -> Optional[int]:
-    """Tightest (limit - working-set usage) across this process's cgroup ancestry, or None if unlimited.
+    """Return the tightest cgroup memory headroom across the process ancestry.
 
-    SLURM's ConstrainRAMSpace enforces --mem through the job cgroup, so /proc/meminfo wildly
-    overstates what THIS job may still allocate on a shared node, and exceeding the cgroup limit
-    is an uncatchable OOM SIGKILL rather than a MemoryError (v13.2.2 bug #1). The limit may sit on
-    any ancestor (job / step / task cgroup), so walk from the leaf to the mount root and keep the
-    smallest headroom seen. Usage is corrected for reclaimable file cache (see
-    _cgroup_reclaimable_file_bytes).
+    Usage excludes reclaimable clean file cache; ``None`` means no finite cgroup limit.
     """
     try:
         cgroup_text = Path('/proc/self/cgroup').read_text()
@@ -633,12 +622,12 @@ def _cgroup_memory_headroom_bytes() -> Optional[int]:
             continue
         hierarchy_id, controllers, cg_path = parts
         if hierarchy_id == '0' and not controllers:
-            # cgroup v2 unified hierarchy.
+            # cgroup unified hierarchy.
             is_v2 = True
             base = Path('/sys/fs/cgroup')
             limit_name, usage_name = 'memory.max', 'memory.current'
         elif 'memory' in controllers.split(','):
-            # cgroup v1 memory controller.
+            # cgroup memory controller.
             is_v2 = False
             base = Path('/sys/fs/cgroup/memory')
             limit_name, usage_name = 'memory.limit_in_bytes', 'memory.usage_in_bytes'
@@ -752,9 +741,7 @@ def _cpu_count() -> int:
 # --------------------------
 # Runtime observability
 # --------------------------
-# v16.0.1 retains the useful telemetry folded into the core pipeline by v15.0.5
-# layer into normal imports and explicit process initialization. No functions/classes are
-# monkeypatched at module end, and importing this module no longer starts sampler threads.
+# Telemetry is initialized explicitly per process; importing the module starts no sampler.
 
 
 def _runtime_jsonable(value: object) -> object:
@@ -794,7 +781,7 @@ class RuntimeTelemetry:
             self.path = Path(requested)
         else:
             base = os.environ.get('SLURM_JOB_ID') or str(os.getpid())
-            self.path = Path(tempfile.gettempdir()) / f'gpt56-sol-pro-v1600-telemetry-{base}-{os.getpid()}.jsonl'
+            self.path = Path(tempfile.gettempdir()) / f'gpt56-sol-pro-v1604-telemetry-{base}-{os.getpid()}.jsonl'
 
     @contextlib.contextmanager
     def span(self, name: str, **fields: object) -> Iterator[None]:
@@ -864,7 +851,7 @@ class RuntimeTelemetry:
                     'mean_ms': (seconds * 1000.0 / calls) if calls else 0.0,
                 }
             payload: Dict[str, object] = {
-                'schema': 'gpt-5.6-sol-pro-v16.0.3.telemetry.v1',
+                'schema': 'gpt-5.6-sol-pro-v16.0.4.telemetry.v1',
                 'pid': os.getpid(),
                 'monotonic_seconds': (now_ns - self.started_ns) / 1e9,
                 'wall_time': time.time(),
@@ -956,16 +943,16 @@ class RuntimeSystemSampler:
 
     def _sample_gpu(self) -> None:
         try:
-            import pynvml  # type: ignore[import-not-found]
+            nvml = _load_nvidia_ml_py()
             if not self._nvml_ready:
-                pynvml.nvmlInit()
+                nvml.nvmlInit()
                 self._nvml_ready = True
             util = []
             memory = []
-            for index in range(int(pynvml.nvmlDeviceGetCount())):
-                handle = pynvml.nvmlDeviceGetHandleByIndex(index)
-                usage = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            for index in range(int(nvml.nvmlDeviceGetCount())):
+                handle = nvml.nvmlDeviceGetHandleByIndex(index)
+                usage = nvml.nvmlDeviceGetUtilizationRates(handle)
+                mem = nvml.nvmlDeviceGetMemoryInfo(handle)
                 util.append({'gpu': int(usage.gpu), 'memory': int(usage.memory)})
                 memory.append({'used': int(mem.used), 'total': int(mem.total)})
             self.telemetry.gauge('system.gpu_utilization', util)
@@ -1021,8 +1008,7 @@ class RuntimeSystemSampler:
             self.thread.join(timeout=min(2.0, self.interval))
         if self._nvml_ready:
             try:
-                import pynvml  # type: ignore[import-not-found]
-                pynvml.nvmlShutdown()
+                _load_nvidia_ml_py().nvmlShutdown()
             except Exception:
                 pass
             self._nvml_ready = False
@@ -1168,28 +1154,26 @@ def runtime_telemetry_phase(phase: str) -> Callable[[Callable[..., object]], Cal
     return _decorate
 
 
-# --------------------------
-# v13.3.5 (N1/N2): NUMA-aware handling — topology discovery, GPU-worker pinning, page interleave
-# --------------------------
-# Implements 1.E of SPEED_OPTIMIZATIONS_Fable-5_v13.3.2_SLURM.md. Everything here is
-# best-effort and Linux-only: a non-Linux box, hidden sysfs topology, an unexpected kernel, or
-# a failing syscall degrades to the previous behavior (no pinning, first-touch placement)
-# instead of failing the run. No root and no external packages are required (pynvml is used as
-# an optional fallback for GPU->node mapping when the driver procfs is unavailable).
+#
+# NUMA-aware handling — topology discovery, GPU-worker pinning, page interleave
+#
+# Best-effort Linux topology discovery pins GPU workers to local CPUs and interleaves large
+# shared allocations. Missing topology or failed syscalls leave affinity and first-touch
+# placement unchanged; nvidia-ml-py is an optional GPU-to-NUMA mapping fallback.
 
 
 def numa_enabled() -> bool:
-    """Master switch for all v13.3.5 NUMA handling (YOLO_TTA_NUMA=0 disables)."""
+    """Master switch for all NUMA handling (YOLO_TTA_NUMA=0 disables)."""
     return sys.platform.startswith('linux') and _env_flag('YOLO_TTA_NUMA', True)
 
 
 def numa_worker_pin_enabled() -> bool:
-    """v13.3.5 (N1): pin each GPU worker's threads to its GPU's NUMA node (=0 disables)."""
+    """Pin each GPU worker's threads to its GPU's NUMA node (=0 disables)."""
     return _env_flag('YOLO_TTA_NUMA_WORKER_PIN', True)
 
 
 def numa_interleave_enabled() -> bool:
-    """v13.3.5 (N2): mbind big shared allocations MPOL_INTERLEAVE (=0 disables)."""
+    """Mbind big shared allocations MPOL_INTERLEAVE (=0 disables)."""
     return _env_flag('YOLO_TTA_NUMA_INTERLEAVE', True)
 
 
@@ -1215,12 +1199,11 @@ _NUMA_TOPOLOGY_LOCK = threading.Lock()
 def numa_topology() -> Optional[Dict[str, object]]:
     """Allocation-aware NUMA topology, or None when undiscoverable.
 
-    Returns {'node_cpus': {node_id: set(ALLOCATED cpus on that node)},  # only non-empty nodes
-             'cpu_to_node': {allocated cpu: node_id},
-             'allowed_mems': set(node ids from Mems_allowed_list)}.
-    Everything is intersected with this process's cpuset, so lopsided SLURM allocations are
-    represented as-is. Cached per process (spawn children re-derive their own view).
-    """
+ Returns {'node_cpus': {node_id: set(ALLOCATED cpus on that node)}, # only non-empty nodes
+ 'cpu_to_node': {allocated cpu: node_id},
+ 'allowed_mems': set(node ids from Mems_allowed_list)}.
+ Everything is intersected with this process's cpuset, so lopsided SLURM allocations are
+ represented as-is. Cached per process (spawn children re-derive their own view)."""
     global _NUMA_TOPOLOGY_CACHE
     cached = _NUMA_TOPOLOGY_CACHE
     if cached is not None:
@@ -1324,11 +1307,10 @@ def _numa_node_of_pci_device(bdf: str, topo: Dict[str, object]) -> Optional[int]
 def _resolve_gpu_numa_node(cvd_token: str, topo: Dict[str, object]) -> Optional[int]:
     """Map one CUDA_VISIBLE_DEVICES token (minor index or GPU UUID) to its NUMA node.
 
-    Tokens come from the inherited CUDA_VISIBLE_DEVICES (SLURM sets minor indices or GPU
-    UUIDs), i.e. the NVML/driver device domain — NOT torch's logical order — so they match
-    the driver procfs 'Device Minor' / 'GPU UUID' fields directly. MIG instance tokens are
-    not listed there; those resolve to None (worker stays unpinned).
-    """
+ Tokens come from the inherited CUDA_VISIBLE_DEVICES (SLURM sets minor indices or GPU
+ UUIDs), i.e. the NVML/driver device domain — NOT torch's logical order — so they match
+ the driver procfs 'Device Minor' / 'GPU UUID' fields directly. MIG instance tokens are
+ not listed there; those resolve to None (worker stays unpinned)."""
     tok = str(cvd_token).strip()
     if not tok or tok.upper().startswith('MIG-'):
         return None
@@ -1356,24 +1338,24 @@ def _resolve_gpu_numa_node(cvd_token: str, topo: Dict[str, object]) -> Optional[
         node = _numa_node_of_pci_device(str(match['bdf']), topo)
         if node is not None:
             return node
-    # Optional fallback: pynvml (pip package), for boxes without the driver procfs.
+    # Fall back to NVML when driver procfs lacks the GPU mapping.
     try:
-        import pynvml  # type: ignore[import-not-found]
-        pynvml.nvmlInit()
+        nvml = _load_nvidia_ml_py()
+        nvml.nvmlInit()
         try:
             if tok.upper().startswith('GPU-'):
-                handle = pynvml.nvmlDeviceGetHandleByUUID(tok.encode('ascii'))
+                handle = nvml.nvmlDeviceGetHandleByUUID(tok.encode('ascii'))
             else:
-                handle = pynvml.nvmlDeviceGetHandleByIndex(int(tok))
-            pci = pynvml.nvmlDeviceGetPciInfo(handle)
+                handle = nvml.nvmlDeviceGetHandleByIndex(int(tok))
+            pci = nvml.nvmlDeviceGetPciInfo(handle)
             bus_id = pci.busId.decode('ascii', 'replace') if isinstance(pci.busId, bytes) else str(pci.busId)
             bdf = bus_id.strip().strip('\x00').lower()
             if len(bdf.split(':', 1)[0]) == 8:
-                bdf = bdf[4:]  # NVML uses a 32-bit domain; sysfs uses 4 hex digits
+                bdf = bdf[4:]
             return _numa_node_of_pci_device(bdf, topo)
         finally:
             try:
-                pynvml.nvmlShutdown()
+                nvml.nvmlShutdown()
             except Exception:
                 pass
     except Exception:
@@ -1383,10 +1365,9 @@ def _resolve_gpu_numa_node(cvd_token: str, topo: Dict[str, object]) -> Optional[
 def _physical_core_cpu_groups(cpus: Sequence[int]) -> Optional[List[List[int]]]:
     """Group allocated logical CPUs by Linux ``thread_siblings_list``.
 
-    Each returned group is one physical core (restricted to ``cpus``).  Within a group the
-    representative hardware thread is first. Missing or asymmetric topology returns None so
-    the node stays unpinned; guessing singleton cores could split two SMT siblings across GPUs.
-    """
+ Each returned group is one physical core (restricted to ``cpus``). Within a group the
+ representative hardware thread is first. Missing or asymmetric topology returns None so
+ the node stays unpinned; guessing singleton cores could split two SMT siblings across GPUs."""
     allowed = {int(c) for c in cpus}
     if not allowed:
         return []
@@ -1429,15 +1410,14 @@ def _flatten_physical_core_groups(core_groups: Sequence[Sequence[int]]) -> List[
 
 
 def plan_gpu_worker_affinity(worker_tokens: Sequence[str]) -> List[Optional[List[int]]]:
-    """v13.3.5 (N1): per-worker CPU pin sets; None entries stay unpinned.
+    """Per-worker CPU pin sets; None entries stay unpinned.
 
-    Discovery-driven — no GPU<->socket balance is assumed. GPUs and allocated cpus are each
-    bucketed by measured NUMA node and every node's PHYSICAL cores are split evenly among ITS
-    OWN workers (the first remainder workers receive one extra core), so SMT siblings are never assigned to
-    different workers. Representatives are listed before their SMT siblings. A node whose
-    per-worker PHYSICAL-core share is below YOLO_TTA_NUMA_WORKER_MIN_CORES gives each of its
-    workers the whole (overlapping) node instead of a starved slice.
-    """
+ Discovery-driven — no GPU<->socket balance is assumed. GPUs and allocated cpus are each
+ bucketed by measured NUMA node and every node's PHYSICAL cores are split evenly among ITS
+ OWN workers (the first remainder workers receive one extra core), so SMT siblings are never assigned to
+ different workers. Representatives are listed before their SMT siblings. A node whose
+ per-worker PHYSICAL-core share is below YOLO_TTA_NUMA_WORKER_MIN_CORES gives each of its
+ workers the whole (overlapping) node instead of a starved slice."""
     n = len(worker_tokens)
     plan: List[Optional[List[int]]] = [None] * n
     if n == 0 or not (numa_enabled() and numa_worker_pin_enabled()):
@@ -1494,7 +1474,7 @@ def plan_gpu_worker_affinity(worker_tokens: Sequence[str]) -> List[Optional[List
 
 def _sched_setaffinity_all_threads(cpus: Sequence[int]) -> bool:
     """Apply a CPU mask to EVERY thread of this process (Linux affinity is per-thread;
-    os.sched_setaffinity(0, ...) alone would only move the calling thread)."""
+ os.sched_setaffinity(0,...) alone would only move the calling thread)."""
     if not hasattr(os, 'sched_setaffinity'):
         return False
     cpu_set = {int(c) for c in cpus}
@@ -1522,7 +1502,7 @@ _NUMA_MBIND_STATE = {'failed': False, 'announced': False}
 
 
 def _numa_interleave_range(addr: int, nbytes: int, mems: Sequence[int]) -> bool:
-    """mbind(start, len, MPOL_INTERLEAVE, nodemask, maxnode, 0) via the raw syscall (no libnuma)."""
+    """Mbind(start, len, MPOL_INTERLEAVE, nodemask, maxnode, 0) via the raw syscall (no libnuma)."""
     if _NUMA_MBIND_STATE['failed']:
         return False
     try:
@@ -1544,8 +1524,8 @@ def _numa_interleave_range(addr: int, nbytes: int, mems: Sequence[int]) -> bool:
         page = int(mmap.PAGESIZE)
         start = int(addr) & ~(page - 1)
         length = int(nbytes) + (int(addr) - start)
-        # Linux's user ABI names this argument maxnode, but get_nodes() decrements it before
-        # copying the bitmap.  Therefore highest node id N needs syscall maxnode=N+2.  Size
+        # Linux's user ABI names this argument maxnode, but get_nodes decrements it before
+        # copying the bitmap. Therefore highest node id N needs syscall maxnode=N+2. Size
         # the userspace object from that exact argument: maxnode=65 needs two 64-bit words,
         # never the single c_ulong used by the old code.
         bits_per_word = int(ctypes.sizeof(ctypes.c_ulong) * 8)
@@ -1579,17 +1559,16 @@ def _numa_interleave_range(addr: int, nbytes: int, mems: Sequence[int]) -> bool:
 
 
 def numa_interleave_memory(arr: object, desc: str = '') -> bool:
-    """v13.3.5 (N2): round-robin a big shared buffer's pages across the allowed NUMA nodes.
+    """Round-robin a big shared buffer's pages across the allowed NUMA nodes.
 
-    Called by the ALLOCATION paths right after creating a buffer and before first touch — the
-    only moment placement can still be chosen (unprivileged MPOL_MF_MOVE cannot migrate shared
-    multi-process pages later). Keyed on how the buffer was allocated, never on a mount point:
-    anonymous RAM and tmpfs/shm mappings both take the policy; regular on-disk file mappings
-    are silently unaffected. No-ops (returning False) when: NUMA handling is off, topology is
-    unknown, only one memory node is allowed, the buffer is below
-    YOLO_TTA_NUMA_INTERLEAVE_MIN_MIB, or this process's current affinity sits inside a single
-    node (a pinned GPU worker's first-touch is already the better, local placement).
-    """
+ Called by the ALLOCATION paths right after creating a buffer and before first touch — the
+ only moment placement can still be chosen (unprivileged MPOL_MF_MOVE cannot migrate shared
+ multi-process pages later). Keyed on how the buffer was allocated, never on a mount point:
+ anonymous RAM and tmpfs/shm mappings both take the policy; regular on-disk file mappings
+ are silently unaffected. No-ops (returning False) when: NUMA handling is off, topology is
+ unknown, only one memory node is allowed, the buffer is below
+ YOLO_TTA_NUMA_INTERLEAVE_MIN_MIB, or this process's current affinity sits inside a single
+ node (a pinned GPU worker's first-touch is already the better, local placement)."""
     if arr is None or not (numa_enabled() and numa_interleave_enabled()):
         return False
     topo = numa_topology()
@@ -1625,16 +1604,9 @@ def numa_interleave_memory(arr: object, desc: str = '') -> bool:
 
 
 def default_worker_budget() -> int:
-    """Intentional CPU oversubscription for mixed GPU/IO/CPU workloads.
+    """Return the whole-job CPU concurrency target for mixed CPU/GPU/IO work.
 
-    The v12.2.0 SLURM target has enough CPU headroom that running roughly 2x the visible CPU count
-    helps keep in-memory view-volume construction, interpolation planning, and output writers busy while the GPU
-    is inferencing or waiting on a different stage.
-
-    This is the WHOLE-BOX oversubscription target (2x visible CPUs). For the inference phase, the
-    main process must share that target with the per-GPU inference subprocesses; use
-    main_process_worker_budget() to size main-process pools in a GPU-count-aware way. Pre-inference
-    stages (decode, cube resize) that run while no GPU is inferencing keep using this full budget.
+    The main process subtracts per-GPU worker reservations while CUDA workers are active.
     """
     return max(1, int(_cpu_count()) * 2)
 
@@ -1659,9 +1631,8 @@ def main_process_worker_budget(gpu_device_count: int, gpu_worker_process_active:
 def tail_worker_budget_expansion_enabled() -> bool:
     """Reclaim the per-GPU CPU reservation after every CUDA worker has drained.
 
-    Set YOLO_TTA_TAIL_WORKER_BUDGET_EXPAND=0 to retain the inference-phase main-process
-    worker budget during strictly tail-only stages.
-    """
+ Set YOLO_TTA_TAIL_WORKER_BUDGET_EXPAND=0 to retain the inference-phase main-process
+ worker budget during strictly tail-only stages."""
     return _env_flag('YOLO_TTA_TAIL_WORKER_BUDGET_EXPAND', True)
 
 
@@ -1683,6 +1654,7 @@ def gpu_worker_fullframe_task_ranges(
     inference_batch: int,
 ) -> List[Tuple[int, int]]:
     """Return the profiled steady-state full-frame leases without tail adaptation."""
+    # DEAD PARAMETER: gpu_count and inference_batch are retained for scheduler API stability.
     total = max(1, int(n_slices))
     chunk = max(1, int(slice_chunk))
     return [
@@ -1696,7 +1668,7 @@ def gpu_worker_tail_split_point(
     slice_count: int,
     inference_batch: int,
 ) -> Optional[int]:
-    """C11 batch-aligned midpoint for a dispatch-time tail lease split."""
+    """Batch-aligned midpoint for a dispatch-time tail lease split."""
     if not _env_flag_compat(
         'YOLO_TTA_GPU_WORKER_ADAPTIVE_TAIL_LEASES',
         'YOLO_TTA_MGPU_ADAPTIVE_TAIL_LEASES',
@@ -1717,11 +1689,9 @@ def gpu_worker_tail_split_point(
     return None
 
 
-# v13.3.3: default cap for interpolation process-pool workers (was hard-capped at 2). The
-# interpolation pass is GIL-bound python inside each child, so extra children are extra usable
-# GILs; RAM is the practical bound (each pass workspace can reach ~O(100 GiB) on large volumes,
-# but workspace allocation is itself memory-gated with a disk-backed fallback). Also used as the
-# default expected parent-interpolation overlap so per-parent thread pools divide accordingly.
+# Default interpolation process cap. Python-heavy planning gains independent GILs, while
+# workspace admission and disk fallback keep RAM, rather than a fixed two-process limit, as
+# the practical bound. The same cap estimates concurrent parent interpolation overlap.
 INTERPOLATION_PROCESS_WORKER_DEFAULT_CAP = 6
 
 
@@ -1733,11 +1703,10 @@ def _estimate_parent_view_postprocess_bytes(
 ) -> int:
     """Conservative live working-set estimate for one outer parent-view task.
 
-    The baseline union already exists before admission, so this estimate covers the transient
-    cleanup/projection/cvol buffers and the bounded slice bands used by the task.  Interpolation
-    has separate workspace admission, but reserving several GiB here prevents the outer pool
-    from opening too many large view preparations while child passes are live.
-    """
+ The baseline union already exists before admission, so this estimate covers the transient
+ cleanup/projection/cvol buffers and the bounded slice bands used by the task. Interpolation
+ has separate workspace admission, but reserving several GiB here prevents the outer pool
+ from opening too many large view preparations while child passes are live."""
     plane_bytes = max(1, int(getattr(view, 'src_h', 1))) * max(1, int(getattr(view, 'src_w', 1)))
     slices = max(1, int(getattr(view, 'num_slices', 1)))
     live_slices = min(slices, 64 if bool(nrrd_layers_enabled) else 32)
@@ -1755,15 +1724,11 @@ def resolve_parent_postprocess_worker_allocation(
     nrrd_layers_enabled: bool,
     interpolation_enabled: bool,
 ) -> Tuple[int, int, int, int, int]:
-    """Resolve independent outer-view and per-view slice concurrency.
+    """Resolve independent parent-view and per-view slice concurrency.
 
-    v16.0.2 removes the accidental dependency on ``interpolation_workers``.  Defaults admit
-    two to four independent views when CPU and anonymous-memory headroom allow it, then divide
-    the main-process worker budget across those views so nested slice pools do not multiply the
-    machine-wide thread count.  Explicit environment overrides remain available.
-
-    Returns ``(outer_workers, slice_workers_per_view, estimated_bytes_per_view,
-    memory_limited_outer_workers, default_outer_workers)``.
+    Defaults admit up to four views within CPU and anonymous-memory limits, then divide
+    the worker budget across their nested slice pools. Interpolation enablement affects
+    only the per-view memory estimate.
     """
     budget = max(1, int(worker_budget))
     view_list = list(views)
@@ -1808,10 +1773,9 @@ def resolve_parent_interpolation_worker_allocation(
 ) -> Tuple[int, int, int]:
     """Resolve per-parent interpolation workers from actual live overlap.
 
-    The process-backend state is supplied explicitly for the current command.  Merely having
-    the backend installed/configured no longer divides worker budgets when ``--interpolate 0``
-    leaves no interpolation task capable of running.
-    """
+ The process-backend state is supplied explicitly for the current command. Merely having
+ the backend installed/configured no longer divides worker budgets when ``--interpolate 0``
+ leaves no interpolation task capable of running."""
     budget = max(1, int(worker_budget))
     parent_workers = max(1, int(parent_postprocess_workers))
     default_overlap = max(
@@ -1856,21 +1820,14 @@ def array_nbytes(shape: Sequence[int], dtype: np.dtype | str | type) -> int:
 
 
 def memmap_msync_enabled() -> bool:
-    """v13.3.1 (R3): synchronous scratch-memmap msync is opt-in.
-
-    Every flush_array call in this pipeline targets same-host scratch memmaps, where the
-    unified page cache already makes writes visible to sibling threads/processes without
-    msync (the v13.2.5 speed #6 rationale), and kernel writeback persists kept artifacts.
-    The old behavior — a blocking msync of multi-GB mappings at the end of every stage,
-    every worker-task close, and every per-chunk union — is restored with YOLO_TTA_MSYNC=1.
-    """
+    """Return whether scratch memmaps should force synchronous ``msync``."""
     return _env_flag('YOLO_TTA_MSYNC', False)
 
 
 def flush_array(arr: object, *, force: bool = False) -> None:
     if arr is None:
         return
-    # v13.3.1 (R3): no-op unless synchronous msync is explicitly requested (or forced by a
+    # no-op unless synchronous msync is explicitly requested (or forced by a
     # caller with a genuine durability boundary).
     if not force and not memmap_msync_enabled():
         return
@@ -1924,7 +1881,7 @@ def allocate_workspace_array(
                 if bool(initialize_zero)
                 else np.empty(shape_tuple, dtype=dtype_obj)
             )
-            # v13.3.5 (N2): big allocations are still untouched here (>32 MiB glibc allocations
+            # big allocations are still untouched here (>32 MiB glibc allocations
             # are fresh private mmaps, and np.zeros defers to lazily-faulted zero pages), so the
             # interleave policy lands before first touch.
             numa_interleave_memory(arr, desc=desc)
@@ -1939,14 +1896,14 @@ def allocate_workspace_array(
     if reuse_existing and path.exists():
         print(f"{desc}: disk-backed reuse ({budget}) -> {path}")
         mm = np.memmap(path, dtype=dtype_obj, mode='r+', shape=tuple(int(x) for x in shape))
-        numa_interleave_memory(mm, desc=desc)  # v13.3.5 (N2): best-effort (existing pages stay put)
+        numa_interleave_memory(mm, desc=desc)  # best-effort (existing pages stay put)
         return mm
 
     if path.exists():
         path.unlink()
     print(f"{desc}: disk-backed ({budget}) -> {path}")
     mm = np.memmap(path, dtype=dtype_obj, mode='w+', shape=tuple(int(x) for x in shape))
-    numa_interleave_memory(mm, desc=desc)  # v13.3.5 (N2)
+    numa_interleave_memory(mm, desc=desc)  #
     return mm
 
 
@@ -1992,16 +1949,10 @@ def copy_workspace_array(
 
 
 # --------------------------
-# v13.3.4 (T5): process-wide ThreadPoolExecutor checkout cache
+# Process-wide ThreadPoolExecutor checkout cache
 # --------------------------
-# The parallel_* helpers below (and a few hot per-call executors elsewhere) used to construct
-# and tear down a ThreadPoolExecutor per call — thousands of pool builds per run (every
-# labeling pass, every NRRD store, every resize, every prediction task). Pools are now checked
-# out of a per-size cache and returned after the call: semantics are unchanged (each call still
-# gets a DEDICATED pool bounded at its own max_workers, so nested calls cannot deadlock), but
-# sequential calls stop paying thread create/join and OS threads keep their identity (which
-# also preserves any future NUMA pinning). Idle cached threads are bounded by
-# YOLO_TTA_PARALLEL_POOL_CACHE_MAX_THREADS (excess pools are shut down on release).
+# Each call receives a dedicated pool of the requested size. Idle pools are reused up to
+# YOLO_TTA_PARALLEL_POOL_CACHE_MAX_THREADS; excess pools are shut down on release.
 
 _PARALLEL_POOL_CACHE: Dict[int, List[ThreadPoolExecutor]] = {}
 _PARALLEL_POOL_CACHE_LOCK = threading.Lock()
@@ -2033,9 +1984,8 @@ def _release_parallel_pool(workers: int, pool: ThreadPoolExecutor) -> None:
 def _settle_parallel_futures(futures: Iterable[Future]) -> None:
     """Cancel-or-wait every future so a pool can safely return to the cache.
 
-    Called on abandoned generators / error paths: pending futures either cancel (never ran)
-    or finish; nothing of this call is left running when the pool is released.
-    """
+ Called on abandoned generators / error paths: pending futures either cancel (never ran)
+ or finish; nothing of this call is left running when the pool is released."""
     remaining = [f for f in futures if f is not None]
     for fut in remaining:
         try:
@@ -2088,11 +2038,10 @@ def parallel_map_unordered(
 ) -> Iterator[object]:
     """Bounded parallel map that yields results as soon as tasks complete.
 
-    This is intended for variable-cost tasks whose output order does not affect the
-    final binary result, such as interpolation endpoint seed planning.  Unlike
-    ``parallel_map_in_order``, one slow early item cannot block result consumption
-    or prevent later items from being submitted once the pending bound is reached.
-    """
+ This is intended for variable-cost tasks whose output order does not affect the
+ final binary result, such as interpolation endpoint seed planning. Unlike
+ ``parallel_map_in_order``, one slow early item cannot block result consumption
+ or prevent later items from being submitted once the pending bound is reached."""
     workers = max(1, int(max_workers))
     if workers <= 1:
         for item in items:
@@ -2238,9 +2187,8 @@ def parallel_for_indices_chunked(
 def workspace_anon_cap_bytes() -> int:
     """Return the optional anonymous-workspace cap.
 
-    Task overrides remove the previous conservative default fractional cap. Anonymous workspaces are
-    only capped when the user explicitly sets YOLO_TTA_MAX_ANON_WORKSPACE_GIB.
-    """
+ Task overrides remove the previous conservative default fractional cap. Anonymous workspaces are
+ only capped when the user explicitly sets YOLO_TTA_MAX_ANON_WORKSPACE_GIB."""
     hard_cap_gib = max(0.0, _env_float('YOLO_TTA_MAX_ANON_WORKSPACE_GIB', 0.0))
     if hard_cap_gib <= 0.0:
         return 0
@@ -2299,7 +2247,7 @@ def _mount_fstype_for_path(path: Path) -> Optional[str]:
         if len(parts) < 3:
             continue
         try:
-            # /proc/mounts octal-escapes spaces and friends in the mount point.
+            # proc/mounts octal-escapes spaces and friends in the mount point.
             mount_point = Path(parts[1].replace('\\040', ' '))
         except Exception:
             continue
@@ -2331,15 +2279,7 @@ def scratch_shm_required_free_bytes() -> int:
 
 
 def _auto_shm_scratch_candidate() -> Optional[Path]:
-    """v15.0.3 (T10): a memory-backed scratch root, but only when it is demonstrably roomy.
-
-    The bar is deliberately high. A tmpfs that fills mid-run SIGBUSes the writing process
-    instead of returning ENOSPC — that is why whole-pipeline shm auto-selection was removed —
-    and tmpfs pages are charged to this job's cgroup exactly like anonymous memory, so a roomy
-    mount on a node whose SLURM allocation is nearly spent is still the wrong place (an
-    overrun there is an uncatchable OOM kill, not a MemoryError the disk fallback can catch).
-    Both the mount's free space and the cgroup headroom must therefore clear the requirement.
-    """
+    """Return a writable memory-backed scratch root with sufficient mount and cgroup headroom."""
     mode = os.environ.get('YOLO_TTA_SCRATCH_PREFER_SHM', '').strip().lower()
     if mode in ('0', 'false', 'no', 'off', 'never'):
         return None
@@ -2379,14 +2319,13 @@ def scratch_dir_is_memory_backed() -> bool:
 def choose_scratch_dir(preferred: Optional[str], out_dir: Path, stem: str) -> Path:
     """Pick the bulk scratch directory.
 
-      - ``--temp`` names a root and receives a unique ``{stem}_{pid}_temp`` child, preventing
-        one run from deleting or colliding with unrelated contents in the supplied location.
-      - ``YOLO_TTA_SCRATCH_DIR`` remains a compatibility root override and receives a unique
-        ``{stem}_{pid}_temp`` child, preserving its historical multi-run-safe behavior.
-      - an explicitly configured ``YOLO_TTA_SCRATCH_PREFER_SHM`` may still select a proven-roomy
-        memory-backed root and likewise receives a unique child.
-      - with no explicit CLI/environment override, the default is exactly ``{output}/temp``.
-    """
+ - ``--temp`` names a root and receives a unique ``{stem}_{pid}_temp`` child, preventing
+ one run from deleting or colliding with unrelated contents in the supplied location.
+ - ``YOLO_TTA_SCRATCH_DIR`` remains a compatibility root override and receives a unique
+ ``{stem}_{pid}_temp`` child, preserving its historical multi-run-safe behavior.
+ - an explicitly configured ``YOLO_TTA_SCRATCH_PREFER_SHM`` may still select a proven-roomy
+ memory-backed root and likewise receives a unique child.
+ - with no explicit CLI/environment override, the default is exactly ``{output}/temp``."""
     global _SCRATCH_DIR_IS_MEMORY_BACKED
 
     if preferred:
@@ -2438,12 +2377,9 @@ def estimate_voidfill_workspace_bytes(
     *,
     dtype: np.dtype | str | type = np.uint32,
 ) -> int:
-    """Bytes for one full-volume label/id workspace.
-
-    The true 3D void-fill path keeps the uint32 default.  v13.3.9 (D5) passes
-    uint16 explicitly for the per-slice-local interpolation/keep-objects label
-    store, where ids never leave the slice-local 1..k domain.
-    """
+    """Return bytes required for one full-volume label workspace.
+    
+    The global 3D void-fill path uses uint32; slice-local topology callers may request uint16 explicitly."""
     z_dim, h, w = shape
     return int(z_dim) * int(h) * int(w) * np.dtype(dtype).itemsize
 
@@ -2549,9 +2485,9 @@ def prediction_hot_path_flush_enabled() -> bool:
     return _env_flag('YOLO_TTA_PREDICT_FLUSH_EACH_VOLUME', False)
 
 
-# --------------------------
+#
 # Interpolation process isolation
-# --------------------------
+#
 
 _INTERPOLATION_PROCESS_EXECUTOR: Optional[ProcessPoolExecutor] = None
 _INTERPOLATION_PROCESS_MAX_WORKERS = 0
@@ -2564,13 +2500,11 @@ def _sanitize_filesystem_token(value: object) -> str:
 
 
 def interpolation_process_backend_enabled() -> bool:
-    """Return True when interpolation passes should run in process workers.
+    """Return whether interpolation passes use isolated process workers.
 
-    The default is enabled for v12.2.7 because interpolation seed planning contains
-    Python-heavy control flow.  Running the pass in a separate process prevents that
-    GIL-bound work from starving prediction-volume builder threads in the main
-    process.  Set YOLO_TTA_INTERPOLATION_PROCESS_BACKEND=0 to recover the legacy
-    in-process thread-pool path.
+    Process isolation gives Python-heavy seed planning independent GILs and prevents it
+    from starving main-process render threads. Set
+    ``YOLO_TTA_INTERPOLATION_PROCESS_BACKEND=0`` to use the in-process path.
     """
     return _env_flag('YOLO_TTA_INTERPOLATION_PROCESS_BACKEND', True)
 
@@ -2578,10 +2512,9 @@ def interpolation_process_backend_enabled() -> bool:
 def interpolation_process_fallback_enabled() -> bool:
     """Allow an in-process fallback if a process interpolation task fails.
 
-    The default is fail-fast so accidental reintroduction of the GIL bottleneck is
-    visible.  Set YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK=1 when completing a run is
-    preferred over failing on a worker-process exception.
-    """
+ The default is fail-fast so accidental reintroduction of the GIL bottleneck is
+ visible. Set YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK=1 when completing a run is
+ preferred over failing on a worker-process exception."""
     return _env_flag('YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK', False)
 
 
@@ -2629,9 +2562,9 @@ def set_interpolation_process_executor(executor: Optional[ProcessPoolExecutor], 
     _INTERPOLATION_PROCESS_MAX_WORKERS = max(0, int(max_workers))
 
 
-# --------------------------
+#
 # Idle CUDA workers as auxiliary interpolation hosts
-# --------------------------
+#
 # Workers remain alive after inference drains. Their separate interpreters provide additional
 # GILs for interpolation passes before the scheduler falls back to the dedicated process pool.
 
@@ -2641,13 +2574,9 @@ def gpu_worker_aux_interpolation_enabled() -> bool:
 
 
 class _GpuWorkerAuxInterpolationPool:
-    """Submission/result bridge between interpolation callers and the GPU worker task queue.
-
-    try_submit is non-blocking (None when the pool is closed, failed, or all worker slots are
-    busy); the caller then uses the regular interpolation process executor. Results flow back
-    through the workers' shared result queue: the main scheduler thread routes
-    'aux_result' messages to complete(), which wakes the waiting submitter thread.
-    """
+    """Route interpolation passes to idle GPU worker processes.
+    
+    Submission is non-blocking; unavailable slots fall back to the dedicated interpolation process pool."""
 
     def __init__(self, task_queue: object, worker_count: int) -> None:
         self._task_queue = task_queue
@@ -2764,7 +2693,7 @@ def _interpolation_array_backing_path(arr: object) -> Optional[Path]:
             # `offset` attribute verbatim (NOT adjusted for the slice), so offset==0
             # alone cannot prove the array starts at byte 0 of the file. Only the
             # root mapping has the raw mmap.mmap buffer as its `base`; views chain
-            # to the parent ndarray instead (v13.2.2 bug #5).
+            # to the parent ndarray instead.
             and isinstance(getattr(arr, 'base', None), mmap.mmap)
             and bool(arr_np.flags['C_CONTIGUOUS'])
             and int(getattr(arr, 'offset', 0) or 0) == 0
@@ -2780,7 +2709,7 @@ def _interpolation_array_backing_path(arr: object) -> Optional[Path]:
             return path
     except Exception:
         pass
-    # Deliberately do not reuse a base memmap for ndarray views here.  A child
+    # Deliberately do not reuse a base memmap for ndarray views here. A child
     # process would need the view's byte offset and strides to reopen it exactly;
     # interpolation volumes are expected to be full C-contiguous arrays, so views
     # are copied into a dedicated process memmap instead.
@@ -2903,14 +2832,9 @@ def interpolate_view_volume_pass_maybe_process(
     known_slice_any: Optional[np.ndarray] = None,
     known_slice_bboxes: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, Dict[str, object]]:
-    """Run one interpolation pass, using a child process when configured.
-
-    The returned array may be a new memmap when the input was an anonymous ndarray.
-    Callers must keep using the returned volume for later passes and downstream work.
-    v13.3.6 (D1): known_slice_any/known_slice_bboxes carry the device-union foreground
-    metadata (valid for the FIRST pass only — bridges invalidate them) so the labeling
-    stage skips empty slices without reading them and crops CC calls to known bboxes.
-    """
+    """Run one interpolation pass in a child process when configured.
+    
+    The returned array may be a new process-shareable memmap. First-pass foreground metadata skips empty slices and bounds connected-component work."""
     executor = _INTERPOLATION_PROCESS_EXECUTOR
     if (
         _INTERPOLATION_PROCESS_WORKER
@@ -2965,12 +2889,12 @@ def interpolate_view_volume_pass_maybe_process(
         workers=int(workers),
         wrap_axis=bool(wrap_axis),
         bridge_delta_path=str(bridge_delta_path) if bridge_delta_path is not None else None,
-        # v13.3.6 (D1): small per-slice metadata arrays pickle across the process boundary.
+        # small per-slice metadata arrays pickle across the process boundary.
         known_slice_any=known_slice_any,
         known_slice_bboxes=known_slice_bboxes,
     )
 
-    # v13.3.4 (T4): once inference has drained, the warm GPU worker processes serve
+    # once inference has drained, the warm GPU worker processes serve
     # interpolation passes too — try them first (non-blocking), then the dedicated pool.
     aux_pool = gpu_worker_aux_interpolation_pool()
     if aux_pool is not None:
@@ -3054,9 +2978,9 @@ def interpolate_view_volume_pass_maybe_process(
     return process_mm, stats
 
 
-# --------------------------
+#
 # ffmpeg helpers
-# --------------------------
+#
 
 def _require_bin(name: str) -> None:
     if shutil.which(name) is None:
@@ -3066,12 +2990,11 @@ def _require_bin(name: str) -> None:
 def ffmpeg_decode_threads() -> int:
     """Return the decoder thread count for input-volume materialization.
 
-    The earlier decode path left FFmpeg to choose its own threading.  On large
-    FFV1/Matroska inputs this can silently become a single-decoder bottleneck
-    before the first prediction volume is even scheduled.  Default to the full
-    visible CPU allocation; set ``YOLO_TTA_FFMPEG_DECODE_THREADS`` to pin a
-    smaller value for codecs or filesystems that prefer less parallel decode.
-    """
+ The earlier decode path left FFmpeg to choose its own threading. On large
+ FFV1/Matroska inputs this can silently become a single-decoder bottleneck
+ before the first prediction volume is even scheduled. Default to the full
+ visible CPU allocation; set ``YOLO_TTA_FFMPEG_DECODE_THREADS`` to pin a
+ smaller value for codecs or filesystems that prefer less parallel decode."""
     return max(1, _env_int('YOLO_TTA_FFMPEG_DECODE_THREADS', max(1, _cpu_count())))
 
 
@@ -3141,12 +3064,11 @@ class VolumeReadiness:
         self._raise_if_failed()
 
     def fail_if_incomplete(self, exc: BaseException) -> bool:
-        """mark_failed() unless the volume already completed or failed; True if failed here.
+        """Mark_failed unless the volume already completed or failed; True if failed here.
 
-        Check and mark happen under one lock hold, so a producer completing concurrently
-        cannot be marked failed after the fact, and an already-recorded root-cause
-        exception is never replaced by the generic abort error.
-        """
+ Check and mark happen under one lock hold, so a producer completing concurrently
+ cannot be marked failed after the fact, and an already-recorded root-cause
+ exception is never replaced by the generic abort error."""
         with self._lock:
             if self._all_event.is_set():
                 return False
@@ -3156,11 +3078,11 @@ class VolumeReadiness:
 
 _VOLUME_READINESS_BY_ARRAY_ID: Dict[int, VolumeReadiness] = {}
 
-# v13.2.2 bug #7: the streaming decode/resize producers were non-daemon threads with no
+# the streaming decode/resize producers were non-daemon threads with no
 # cancellation path, so any fatal main-thread error left threading._shutdown joining a
 # multi-hour decode of a volume nobody would consume. Producers poll this event per
-# chunk/slice and run as daemon threads; abort_streaming_producers() additionally fails
-# every incomplete VolumeReadiness so consumers blocked on wait_for_slice()/wait_all()
+# chunk/slice and run as daemon threads; abort_streaming_producers additionally fails
+# every incomplete VolumeReadiness so consumers blocked on wait_for_slice/wait_all
 # wake with an error instead of hanging.
 _STREAMING_PRODUCER_ABORT = threading.Event()
 
@@ -3199,7 +3121,7 @@ def wait_for_volume_slice_ready(arr: object, idx: int) -> None:
 
 
 def wait_for_volume_ready(arr: object) -> None:
-    # v13.3.17 C10: normal consumers that explicitly wait on a lazy processing cube
+    # normal consumers that explicitly wait on a lazy processing cube
     # necessarily need its bytes. The inference-tail completion check special-cases an
     # unused proxy and waits only for its decoded source, preserving true laziness.
     lazy_wait = getattr(arr, '_materialize_for_wait', None)
@@ -3278,12 +3200,7 @@ def decode_video_to_memmap_gray8(
     prefer_memory: bool = True,
     reserve_bytes: int = 32 * GIB,
 ) -> np.ndarray:
-    """Decode input video to a (T,H,W) uint8 gray/luma workspace.
-
-    ffmpeg's ``gray`` pixel format accepts RGB, YUV, and already single-channel inputs and
-    normalizes them to one luma channel. This keeps the source volume and all view-rendering
-    intermediates single-channel; color expansion is deferred to optional presentation outputs.
-    """
+    """Decode the input video to a contiguous ``(T, H, W)`` uint8 luma workspace."""
     _require_bin("ffmpeg")
 
     shape = (int(num_frames), int(height), int(width))
@@ -3418,8 +3335,8 @@ def decode_video_to_memmap_gray8_streaming(
             readiness.mark_all_ready()
         except BaseException as exc:
             readiness.mark_failed(exc)
-            # Unblock the finally's communicate(): a decode we are abandoning must not be
-            # waited on while it still streams the remainder of the input (v13.2.2 bug #7).
+            # Unblock the finally's communicate: a decode we are abandoning must not be
+            # waited on while it still streams the remainder of the input.
             try:
                 if proc.poll() is None:
                     proc.kill()
@@ -3434,7 +3351,7 @@ def decode_video_to_memmap_gray8_streaming(
                 msg = err.decode("utf-8", errors="ignore") if isinstance(err, (bytes, bytearray)) else str(err)
                 readiness.mark_failed(RuntimeError(f"ffmpeg decode failed: {msg}"))
 
-    # daemon=True (v13.2.2 bug #7): if main dies without reaching abort_streaming_producers(),
+    # daemon=True: if main dies without reaching abort_streaming_producers,
     # interpreter shutdown must not join a producer that may have hours of decode left.
     threading.Thread(target=_decode_worker, name='streaming-gray8-decode', daemon=True).start()
     return arr
@@ -3446,12 +3363,9 @@ def compute_cube_resize_shape(
     w_dim: int,
     tolerance: float = 0.05,
 ) -> Tuple[int, int, int]:
-    """Return the minimal processing shape whose dimensions are within tolerance of the longest axis.
+    """Return the smallest processing shape within tolerance of the longest source axis.
 
-    v12.2.0 requires the orthogonal working volume to be approximately cubic.  The implementation
-    preserves any axis that is already within the tolerated band and upsamples shorter axes only
-    enough to reach ``(1 - tolerance) * longest``.  This avoids unnecessary XY resampling for the
-    common 3072x3072x1930 case while still satisfying the 5% cube constraint.
+    Axes already inside the tolerated band are preserved; only shorter axes are upsampled.
     """
     t_i = max(1, int(t_dim))
     h_i = max(1, int(h_dim))
@@ -3466,16 +3380,11 @@ def compute_cube_resize_shape(
 
 
 def processing_volume_mode() -> str:
-    """Return the v13.0.0 processing geometry mode.
+    """Return ``cube`` or ``native`` processing geometry.
 
-    v13.0.0 (bug fix) defaults to the approximately-cubic working geometry required by spec
-    item 2: the virtual working dimensions (X', Y', t') must be within 5% of the longest source
-    axis before views are derived.  v12.2.15 had defaulted to ``native`` decoded geometry, which
-    left the Transverse stacking axis (t) ~37% short of the longest axis for the common
-    3072x3072x1930 case and violated the 5% band.  The literal cubic volume is materialized here
-    as the simplest implementation of the virtual working geometry; the decoded->view reslice
-    still scales to --imgsz in a single pass.  Set ``YOLO_TTA_PROCESSING_VOLUME_MODE=native`` to
-    opt back into the v12.2.15 decoded-native geometry for strict regression/comparison only.
+    ``cube`` is the default and keeps all logical working dimensions within 5% of the
+    longest source axis. The host cube may remain lazy when resident GPU renderers can
+    map native source geometry directly. ``native`` is an explicit compatibility mode.
     """
     if _env_flag('YOLO_TTA_FORCE_PROCESSING_CUBE', False):
         return 'cube'
@@ -3539,12 +3448,11 @@ def _resize_gray_slice_nearest_or_linear(
 def _cube_t_axis_resize_backend() -> str:
     """Backend used when cubic resizing only changes the slice axis.
 
-    ``slab`` is the default because the common 3072x3072x1930 -> approximately
-    cubic case does not need XY resampling.  It processes row slabs through
-    OpenCV's native vertical resize and fans the slabs out across Python worker
-    threads.  ``slice_exact`` preserves the older endpoint-aligned per-output-slice
-    interpolation path for regression testing.
-    """
+ ``slab`` is the default because the common 3072x3072x1930 -> approximately
+ cubic case does not need XY resampling. It processes row slabs through
+ OpenCV's native vertical resize and fans the slabs out across Python worker
+ threads. ``slice_exact`` preserves the older endpoint-aligned per-output-slice
+ interpolation path for regression testing."""
     backend = os.environ.get('YOLO_TTA_CUBE_T_RESIZE_BACKEND', 'slab').strip().lower()
     if backend not in {'slab', 'slice_exact'}:
         backend = 'slab'
@@ -3553,6 +3461,7 @@ def _cube_t_axis_resize_backend() -> str:
 
 def _cube_t_axis_slab_rows(in_w: int, in_t: int, out_t: int, workers: int) -> int:
     """Choose a bounded row-slab height for T-axis-only cubic resizing."""
+    # DEAD PARAMETER: in_t and out_t are retained for tuning API stability.
     del in_t, out_t
     env_rows = _env_int('YOLO_TTA_CUBE_T_RESIZE_SLAB_ROWS', 0)
     if env_rows > 0:
@@ -3580,11 +3489,10 @@ def resize_volume_t_axis_only_gray8_slab(
 ) -> np.ndarray:
     """Resize only the first/T axis by processing independent row slabs.
 
-    This is optimized for the dominant SLURM input geometry where X/Y are already
-    at the target size and only the shorter frame axis is upsampled to satisfy the
-    approximate-cube requirement.  Each task views a ``(T, rows*X)`` slab as a 2D
-    OpenCV image and resizes only its height to ``out_t``.
-    """
+ This is optimized for the dominant SLURM input geometry where X/Y are already
+ at the target size and only the shorter frame axis is upsampled to satisfy the
+ approximate-cube requirement. Each task views a ``(T, rows*X)`` slab as a 2D
+ OpenCV image and resizes only its height to ``out_t``."""
     in_t, in_h, in_w = (int(volume_gray.shape[0]), int(volume_gray.shape[1]), int(volume_gray.shape[2]))
     out_t_i = int(out_t)
     if int(in_t) == out_t_i:
@@ -3662,7 +3570,7 @@ def resize_volume_to_processing_cube_gray8(
     prefer_memory: bool = True,
     reserve_bytes: int = 32 * GIB,
 ) -> np.ndarray:
-    """Resample a gray8 (t,Y,X) volume to the v12.2.0 approximately-cubic processing shape."""
+    """Resample a gray8 (t,Y,X) volume to the approximately-cubic processing shape."""
     in_t, in_h, in_w = (int(volume_gray.shape[0]), int(volume_gray.shape[1]), int(volume_gray.shape[2]))
     out_t, out_h, out_w = (int(out_shape[0]), int(out_shape[1]), int(out_shape[2]))
     if (in_t, in_h, in_w) == (out_t, out_h, out_w):
@@ -3785,22 +3693,17 @@ def resize_volume_to_processing_cube_gray8_streaming(
             readiness.mark_failed(exc)
             raise
 
-    # daemon=True (v13.2.2 bug #7): see the streaming decode producer.
+    # daemon=True: see the streaming decode producer.
     threading.Thread(target=_resize_worker, name='streaming-cubic-resize', daemon=True).start()
     return out_mm
 
 
 class LazyProcessingCube:
-    """Demand-materialized shared processing cube (v13.3.17 C10).
+    """Publish processing-cube geometry while deferring host materialization.
 
-    Multi-GPU native-t residency needs the *geometry* of the approximately-cubic volume,
-    but its successful renderer reads the smaller decoded volume and composes the t map on
-    device.  This proxy therefore publishes shape/path metadata immediately and performs the
-    25+ GiB CPU resize only after a real CPU/streaming/tile fallback requests the path.
-
-    Worker processes request materialization through a tiny filesystem marker; a daemon in
-    the owning process performs exactly one resize and publishes the existing ready sentinel.
-    Local ndarray consumers materialize synchronously through ``__array__``/``__getitem__``.
+    CUDA renderers can consume the decoded source and map the logical cube on device for
+    either one or multiple GPUs. CPU and fallback consumers request one shared resize through
+    filesystem markers; local array access materializes synchronously.
     """
 
     _is_lazy_processing_cube = True
@@ -3898,7 +3801,7 @@ class LazyProcessingCube:
                     'v13.3.17 C10: materializing deferred processing cube for '
                     f'{reason}; shape={self.shape}, bytes={self.nbytes / GIB:.2f} GiB.'
                 )
-                # Deferring the cube also defers its dependency on decode completion.  The
+                # Deferring the cube also defers its dependency on decode completion. The
                 # fallback is cold and correctness-sensitive, so complete decode first and
                 # use the established exact slab/slice backend once.
                 wait_for_volume_ready(self.source)
@@ -4070,11 +3973,10 @@ def resolve_radial_azimuth_angles(
 ) -> List[float]:
     """Resolve one ordered azimuth spacing per ``--enable_radial`` target.
 
-    A single explicit value broadcasts. Multiple explicit values must match the target count.
-    With no explicit value, each target receives its own largest full-coverage spacing from its
-    maximally inscribed circle diameter. Explicit ``--azimuth_angle`` without any Radial target
-    is validated but deliberately enables nothing.
-    """
+ A single explicit value broadcasts. Multiple explicit values must match the target count.
+ With no explicit value, each target receives its own largest full-coverage spacing from its
+ maximally inscribed circle diameter. Explicit ``--azimuth_angle`` without any Radial target
+ is validated but deliberately enables nothing."""
     targets = [str(v) for v in radial_targets]
     if len(diameters) != len(targets):
         raise ValueError(
@@ -4103,10 +4005,9 @@ def resolve_radial_azimuth_angles(
 def _open_memory_backed_encoded_chunk(name: str, *, require_fileno: bool = False) -> object:
     """Return a seekable binary object whose encoded payload is retained in memory.
 
-    Linux memfd is preferred because it is anonymous, seekable, usable by copy_file_range,
-    and can be inherited by ffmpeg without creating a shard path on disk. BytesIO is a
-    portable in-process fallback for writers such as NRRD that do not need a child process.
-    """
+ Linux memfd is preferred because it is anonymous, seekable, usable by copy_file_range,
+ and can be inherited by ffmpeg without creating a shard path on disk. BytesIO is a
+ portable in-process fallback for writers such as NRRD that do not need a child process."""
     safe_name = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(name)).strip('._') or 'encoded_chunk'
     memfd_create = getattr(os, 'memfd_create', None)
     if callable(memfd_create):
@@ -4180,8 +4081,8 @@ def ffmpeg_rawvideo_writer(
     ]
 
     if str(codec) == 'ffv1':
-        # v13.3.9: match the 30 FFV1 slices with 30 threads by default (env override
-        # retained). v13.2.5 had raised the earlier four-thread cap to sixteen.
+        # Match the 30 FFV1 slices with 30 encoder threads by default; the environment
+        # override remains authoritative.
         ffv1_threads = max(1, _env_int('YOLO_TTA_FFV1_THREADS', 30))
         cmd.extend(["-c:v", "ffv1", "-level", "3", "-slices", "30", "-threads", str(int(ffv1_threads))])
     else:
@@ -4194,7 +4095,7 @@ def ffmpeg_rawvideo_writer(
         cmd.extend(["-pix_fmt", str(pix_fmt_out)])
 
     if inherited_fds:
-        # /proc/self/fd/<N> has no filename suffix, so select the intended container explicitly.
+        # proc/self/fd/<N> has no filename suffix, so select the intended container explicitly.
         cmd.extend(["-f", "matroska"])
     cmd.append(str(out_path))
     proc = subprocess.Popen(
@@ -4247,21 +4148,20 @@ def ffmpeg_ffv1_rgb_writer(
 def close_ffmpeg_writer(proc: subprocess.Popen) -> None:
     """Close an ffmpeg writer Popen safely (Python 3.12+ compatible).
 
-    IMPORTANT:
-      Calling proc.stdin.close() and then proc.communicate() triggers
-      'ValueError: flush of closed file' on Python 3.12, because communicate()
-      tries to flush stdin even if it is already closed. We therefore:
-        1) close stdin (if open)
-        2) set proc.stdin = None
-        3) call communicate() to drain stdout/stderr
-    """
+ IMPORTANT:
+ Calling proc.stdin.close and then proc.communicate triggers
+ 'ValueError: flush of closed file' on Python 3.12, because communicate
+ tries to flush stdin even if it is already closed. We therefore:
+ 1) close stdin (if open)
+ 2) set proc.stdin = None
+ 3) call communicate to drain stdout/stderr"""
     if proc.stdin is not None and not proc.stdin.closed:
         try:
             proc.stdin.close()
         except Exception:
             pass
 
-    # Prevent subprocess.communicate() from flushing a closed stdin (Py3.12 behavior)
+    # Prevent subprocess.communicate from flushing a closed stdin (Py3.12 behavior)
     proc.stdin = None  # type: ignore[attr-defined]
 
     _, err = proc.communicate()
@@ -4287,10 +4187,9 @@ def purge_temporary_mkv(
 ) -> bool:
     """Delete one temporary MKV once its last pipeline consumer has finished.
 
-    The guard is intentionally narrow: only ``*.mkv`` files below the active scratch/temp
-    directory are eligible. Final output MKVs live in the output directory and are never
-    removed through this helper.
-    """
+ The guard is intentionally narrow: only ``*.mkv`` files below the active scratch/temp
+ directory are eligible. Final output MKVs live in the output directory and are never
+ removed through this helper."""
     if bool(keep_temp) or video_path is None:
         return False
 
@@ -4327,9 +4226,9 @@ def purge_remaining_temporary_mkvs(temp_dir: Path, *, keep_temp: bool) -> int:
     return int(purged)
 
 
-# --------------------------
+#
 # Affine transforms
-# --------------------------
+#
 
 @dataclass(frozen=True)
 class AffineSpec:
@@ -4387,17 +4286,9 @@ def build_affine(
     angle_deg: float,
     pad_mode: str,
 ) -> AffineSpec:
-    """
-    Build a single affine transform that performs, in one pass:
-
-      source(native view) -> optional black-padding canvas -> rotation around canvas center
-      -> scale to out_size x out_size
-
-    Cartesian views (Transverse, Sagittal, Coronal, and Tilted View in-plane rotation) use
-    pad_mode='clamp', which rotates directly on the source-sized canvas so non-90° content that
-    leaves the source frame is discarded. Radial uses pad_mode='pad' so non-90° radial rotations are
-    black-padded before scaling.
-    """
+    """Build one source-to-model affine for padding, rotation, and scaling.
+    
+    Cartesian and Tilted views clamp to their source canvas; Radial views expand onto a black-padded canvas."""
     if pad_mode not in ("clamp", "pad"):
         raise ValueError("pad_mode must be 'clamp' or 'pad'")
 
@@ -4460,18 +4351,17 @@ def build_affine(
     )
 
 
-# v13.3.12 (D6): non-radial prediction masks stay on a canonical inference-resolution
+# non-radial prediction masks stay on a canonical inference-resolution
 # grid until view-local cleanup, component analysis, and temporal interpolation have
-# completed.  The canonical grid is the angle-0 YOLO raster for the view, so an angle-0
-# full-frame result needs no post-inference scale/warp at all.  Other augmentations and
+# completed. The canonical grid is the angle-0 YOLO raster for the view, so an angle-0
+# full-frame result needs no post-inference scale/warp at all. Other augmentations and
 # dense tiles compose their output->native affine with native->canonical once; all of
 # their contributions therefore still meet in one common view coordinate system.
 def delayed_native_expansion_enabled() -> bool:
     """Keep non-radial masks at inference resolution until final projection.
 
-    ``YOLO_TTA_DELAY_NATIVE_EXPANSION=0`` restores the v13.3.11 behavior in which every
-    prediction is expanded to ``view.src_h x view.src_w`` before accumulation.
-    """
+ ``YOLO_TTA_DELAY_NATIVE_EXPANSION=0`` restores the behavior in which every
+ prediction is expanded to ``view.src_h x view.src_w`` before accumulation."""
     return _env_flag('YOLO_TTA_DELAY_NATIVE_EXPANSION', True)
 
 
@@ -4503,10 +4393,8 @@ def output_to_view_processing_affine(
 ) -> np.ndarray:
     """Map one YOLO output raster into the view's accumulation grid.
 
-    The historical affine maps YOLO output pixels to native-view pixels.  For a delayed
-    non-radial view we append the angle-0 native->YOLO transform, producing an output-to-
-    canonical affine.  At angle 0 this reduces to identity (within float tolerance), which
-    is the resident-ring fast specialization.  Radial retains its existing native mapping.
+    Delayed non-Radial views compose output-to-native with native-to-canonical; angle zero
+    reduces to identity within tolerance. Radial views retain native-grid accumulation.
     """
     M_native = np.asarray(M_out_to_native, dtype=np.float64).reshape(2, 3)
     if not view_uses_inference_processing_grid(view, int(out_size)):
@@ -4529,7 +4417,7 @@ def output_to_view_processing_affine(
 
 
 def tile_crop_border_pixels() -> int:
-    """Safety ring added around every computed dense-tile crop window (T1)."""
+    """Safety ring added around every computed dense-tile crop window."""
     return max(0, _env_int('YOLO_TTA_TILE_CROP_BORDER', 2))
 
 
@@ -4543,22 +4431,21 @@ def tile_parent_crop_window(
 ) -> Tuple[Tuple[int, int, int, int], np.ndarray]:
     """Return ``((py0, py1, px0, px1), M_out_to_crop)`` for one dense-tile output raster.
 
-    A dense tile's ``M_out_to_src`` is frame-invariant, so the region of the parent
-    processing grid the tile can ever write is a fixed rectangle: the axis-aligned hull of
-    the four output-raster corners pushed through ``output_to_view_processing_affine``.
-    Everything downstream of the warp (device union, D2H, cleanup, hole fill, staging OR)
-    only has to cover that rectangle -- outside it the warp writes zeros by construction
-    (``BORDER_CONSTANT`` / ``padding_mode='zeros'``).
+ A dense tile's ``M_out_to_src`` is frame-invariant, so the region of the parent
+ processing grid the tile can ever write is a fixed rectangle: the axis-aligned hull of
+ the four output-raster corners pushed through ``output_to_view_processing_affine``.
+ Everything downstream of the warp (device union, D2H, cleanup, hole fill, staging OR)
+ only has to cover that rectangle -- outside it the warp writes zeros by construction
+ (``BORDER_CONSTANT`` / ``padding_mode='zeros'``).
 
-    ``M_out_to_crop`` is the same affine expressed in crop-local pixel coordinates, so
-    ``cv2.warpAffine(plane, M_out_to_crop, dsize=(px1 - px0, py1 - py0))`` produces exactly
-    the sub-rectangle ``warp_to_full_grid()[py0:py1, px0:px1]`` would have produced.
+ ``M_out_to_crop`` is the same affine expressed in crop-local pixel coordinates, so
+ ``cv2.warpAffine(plane, M_out_to_crop, dsize=(px1 - px0, py1 - py0))`` produces exactly
+ the sub-rectangle ``warp_to_full_grid[py0:py1, px0:px1]`` would have produced.
 
-    ``force_shape`` pins the window to a common (h, w) -- tiles clamped at a canvas edge
-    would otherwise yield slightly smaller rectangles, and a uniform shape lets every tile
-    of one configuration share a single result volume. The window is slid (never shrunk)
-    to stay inside the grid, so the tile's true footprint is always covered.
-    """
+ ``force_shape`` pins the window to a common (h, w) -- tiles clamped at a canvas edge
+ would otherwise yield slightly smaller rectangles, and a uniform shape lets every tile
+ of one configuration share a single result volume. The window is slid (never shrunk)
+ to stay inside the grid, so the tile's true footprint is always covered."""
     ph, pw = view_processing_plane_shape(view, int(out_size))
     M_proc = np.asarray(
         output_to_view_processing_affine(view, np.asarray(M_out_to_src, dtype=np.float32), int(out_size)),
@@ -4624,10 +4511,9 @@ def view_processing_min_radius(
 ) -> float:
     """Convert a native-view radius threshold to the current processing raster.
 
-    The canonical square can scale the two native axes differently.  A native circular
-    component becomes an ellipse whose EDT radius is governed by the smaller axis scale,
-    so the minimum scale preserves the former keep/drop boundary most closely.
-    """
+ The canonical square can scale the two native axes differently. A native circular
+ component becomes an ellipse whose EDT radius is governed by the smaller axis scale,
+ so the minimum scale preserves the former keep/drop boundary most closely."""
     radius = float(min_radius)
     if radius <= 0.0 or str(getattr(view, 'family', '')) == 'radial':
         return max(0.0, radius)
@@ -4664,9 +4550,9 @@ def view_processing_search_angle(
     return math.degrees(math.atan(math.tan(math.radians(angle)) * float(scale)))
 
 
-# --------------------------
+#
 # View slicing
-# --------------------------
+#
 
 TILTED_VIEW_FAMILY = 'tilted'
 RADIAL_VIEW_FAMILY = 'radial'
@@ -4698,7 +4584,7 @@ class ViewInfo:
     horizontal_axis: str = ''
     vertical_axis: str = ''
     stack_axis: str = ''
-    # v16.0.1 Radial orientation/source metadata. ``radial_base_view`` names the
+    # Radial orientation/source metadata. ``radial_base_view`` names the
     # Cartesian coordinate system whose in-plane circle is transformed. A tilted
     # Radial view carries the selected concrete Tilted variant in the remaining fields.
     radial_base_view: str = ''
@@ -4806,19 +4692,12 @@ def radial_target_diameter(token: str, T: int, H: int, W: int) -> int:
 
 
 def tilted_radial_resident_gpu_render_enabled() -> bool:
-    """v16.0.3: render tilted-Radial frames from the resident source volume on CUDA.
-
-    v16.0.2 generalized the view graph but left every tilted-Radial transform outside the
-    resident renderer.  Those tasks silently requested the deferred host cube and generated
-    each 36-tap/sheared frame on the CPU while TensorRT waited, which can turn a multi-GPU
-    run into an effectively serial memory-bandwidth workload.  The escape hatch is retained
-    for regression comparisons and CUDA-toolchain troubleshooting.
-    """
+    """Render tilted-Radial frames directly from a resident CUDA source volume."""
     return _env_flag('YOLO_TTA_GPU_TILTED_RADIAL_RENDER', True)
 
 
 def radial_resident_gpu_render_supported(view: ViewInfo) -> bool:
-    """Resident rendering supports upright Radial plus v16.0.3 tilted-Radial transforms."""
+    """Resident rendering supports upright Radial plus tilted-Radial transforms."""
     if not is_radial_view(view):
         return False
     if not is_tilted_radial_view(view):
@@ -4827,7 +4706,7 @@ def radial_resident_gpu_render_supported(view: ViewInfo) -> bool:
 
 
 def radial_streaming_gpu_render_supported(view: ViewInfo) -> bool:
-    """The retained t-block streaming prerender is specific to the old transverse Radial layout."""
+    """Return whether the t-major streaming prerender supports this upright Radial view."""
     return bool(
         is_radial_view(view)
         and not is_tilted_radial_view(view)
@@ -4836,7 +4715,7 @@ def radial_streaming_gpu_render_supported(view: ViewInfo) -> bool:
 
 
 def radial_fused_render_supported(view: ViewInfo) -> bool:
-    """Direct-to-binding support: upright transverse and v16.0.3 tilted-Radial views."""
+    """Direct-to-binding support: upright transverse and tilted-Radial views."""
     return bool(
         radial_streaming_gpu_render_supported(view)
         or (
@@ -5098,7 +4977,7 @@ def get_view_infos(
     tilt_directions: Optional[Sequence[str]] = None,
     radial_native_raster: int = 0,
 ) -> List[ViewInfo]:
-    """Build the complete v16 view set without any implicit Cartesian/Tilted/Radial view."""
+    """Build the complete view set without any implicit Cartesian/Tilted/Radial view."""
     enabled_cartesian = resolve_cartesian_views(cartesian_views)
     enabled_tilted = resolve_tilt_views(tilt_views)
     enabled_radial = resolve_radial_views(radial_views)
@@ -5157,8 +5036,8 @@ def get_view_infos(
                 tilted_source=source_view,
             ))
 
-    # Preserve the historical broad scheduling shape: upright Cartesian, Cartesian Radial,
-    # concrete Tilted variants, then Radial transforms of those Tilted variants.
+    # Schedule upright Cartesian, Cartesian Radial, concrete Tilted variants, then Radial
+    # transforms of those Tilted variants.
     return orthogonal + radial_cartesian + tilted + radial_tilted
 
 
@@ -5204,7 +5083,7 @@ def get_radial_sampler(view: ViewInfo, angle_deg: float) -> RadialSampler:
     if not is_radial_view(view):
         raise ValueError('Radial sampler requested for a non-radial view')
 
-    # v16.0.1: the circle lives in the selected Cartesian/Tilted projected plane,
+    # the circle lives in the selected Cartesian/Tilted projected plane,
     # not unconditionally in global XY. ``center_x/center_y`` and the Lanczos taps
     # therefore use that base plane's (horizontal, vertical) coordinate system.
     plane_h, plane_w = radial_plane_shape(view)
@@ -5275,12 +5154,7 @@ def choose_radial_exact_block_frames(diameter: int, target_bytes: int = 256 * 10
 
 
 def _radial_sampler_flat_taps(sampler: RadialSampler, image_w: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Per-sample flattened 36-tap indices and combined separable weights.
-
-    v13.2.5 (speed #2): one fancy gather over flat (row-major) indices with precombined
-    y*x weights replaces six separate 3D gathers plus per-tap float temps. Rebuilt per call
-    (sub-millisecond for a 2048-sample line) so the per-angle sampler cache stays small.
-    """
+    """Return flattened Lanczos tap indices and combined separable weights for one Radial line."""
     u_len = int(sampler.diameter)
     flat_idx = (
         sampler.y_idx.astype(np.int64)[:, :, None] * int(image_w)
@@ -5372,11 +5246,10 @@ def extract_tilted_radial_slice_frame(
 ) -> np.ndarray:
     """Render one Radial transform of a concrete Tilted view directly from the volume.
 
-    The output is circular in the Tilted projected plane. For every diameter tap, the
-    same signed stacking-axis shear used by the underlying Tilted view is applied before
-    a two-tap stack interpolation. The 36 Lanczos-3 in-plane taps are accumulated without
-    materializing thousands of full Tilted frames.
-    """
+ The output is circular in the Tilted projected plane. For every diameter tap, the
+ same signed stacking-axis shear used by the underlying Tilted view is applied before
+ a two-tap stack interpolation. The 36 Lanczos-3 in-plane taps are accumulated without
+ materializing thousands of full Tilted frames."""
     if not is_tilted_radial_view(view):
         raise ValueError('Tilted Radial renderer requires a tilted Radial view')
     arr = np.asarray(volume_rgb)
@@ -5453,10 +5326,9 @@ def extract_tilted_radial_slice_frame(
 def _cupy_external_stream(cp: object, torch_stream: object) -> object:
     """Bridge a Torch CUDA stream into CuPy without the CuPy 14 ExternalStream warning.
 
-    CuPy 14 prefers ``Stream.from_external`` and Torch streams implement the CUDA stream
-    protocol in current builds. Older CuPy/Torch combinations retain the pointer-based
-    ExternalStream fallback so this compatibility cleanup cannot disable an acceleration path.
-    """
+ CuPy 14 prefers ``Stream.from_external`` and Torch streams implement the CUDA stream
+ protocol in current builds. Older CuPy/Torch combinations retain the pointer-based
+ ExternalStream fallback so this compatibility cleanup cannot disable an acceleration path."""
     stream_cls = getattr(getattr(cp, 'cuda', None), 'Stream', None)
     factory = getattr(stream_cls, 'from_external', None)
     if callable(factory):
@@ -5554,12 +5426,11 @@ def iter_aug_jobs_round_robin(
 ) -> Iterator[Tuple[ViewInfo, AugJob]]:
     """Yield augmentation jobs one round per view so later view families start earlier.
 
-    The prior FIFO submission order rendered every augmentation for early views before later
-    views even entered the render queue. That could leave later families, notably tilted
-    transverse variants, sitting behind a long tail of earlier canvas/tile work even while the GPU
-    had no ready inference job. Round-robin submission starts one job per active view first, then
-    the second job per view, and so on.
-    """
+ The prior FIFO submission order rendered every augmentation for early views before later
+ views even entered the render queue. That could leave later families, notably tilted
+ transverse variants, sitting behind a long tail of earlier canvas/tile work even while the GPU
+ had no ready inference job. Round-robin submission starts one job per active view first, then
+ the second job per view, and so on."""
     queues: Dict[str, deque[AugJob]] = {
         str(view.name): deque(aug_jobs_by_view.get(view.name, ()))
         for view in views
@@ -5584,14 +5455,9 @@ class TileConfig:
 
 
 def resolve_tile_configs(tile_sizes_raw: Sequence[str] | str | int | None, tile_strides_raw: Sequence[str] | str | int | None) -> List[TileConfig]:
-    """Resolve v12 dense tile configurations as PAIRED size/stride entries.
-
-    v13.2.5 (ruling A2): ``--tile_size`` and ``--tile_stride`` are index-paired, not a
-    Cartesian product. ``--tile_size 1536,2048 --tile_stride 256,512`` creates exactly two
-    tile configurations (1536/256 and 2048/512). A single stride value is broadcast across
-    every tile size; otherwise the counts must match. Each stride is validated against its
-    OWN paired size only.
-    """
+    """Pair tile sizes and strides, broadcasting one stride when requested.
+    
+    Each pair is validated independently and duplicate configurations are rejected."""
     tile_sizes = _parse_int_list(tile_sizes_raw)
     tile_strides = _parse_int_list(tile_strides_raw)
 
@@ -5616,7 +5482,7 @@ def resolve_tile_configs(tile_sizes_raw: Sequence[str] | str | int | None, tile_
         tile_strides = [int(tile_strides[0])] * len(tile_sizes)
     if len(tile_strides) != len(tile_sizes):
         raise ValueError(
-            f'--tile_size and --tile_stride are paired (ruling A2): got {len(tile_sizes)} size value(s) '
+            f'--tile_size and --tile_stride are index-paired: got {len(tile_sizes)} size value(s) '
             f'and {len(tile_strides)} stride value(s); provide matching counts or a single stride'
         )
 
@@ -5651,7 +5517,7 @@ class DenseTileJob:
     meta_path: Path
     M_out_to_src: np.ndarray
     M_src_to_out: np.ndarray
-    # T1: the tile's fixed footprint in the parent processing grid, as (py0, py1, px0, px1),
+    # the tile's fixed footprint in the parent processing grid, as (py0, py1, px0, px1),
     # plus the same output->parent affine rebased into crop-local pixels. Every per-tile
     # artifact is sized to this window instead of the whole parent grid. Populated by
     # build_dense_tile_jobs_for_aug; the zero default only survives in synthetic jobs.
@@ -5667,10 +5533,9 @@ def edge_clamped_view_slice_index(view: ViewInfo, index: int) -> int:
 class ChannelFormattedFrameRenderer:
     """Build one model input from independently rendered view planes.
 
-    The bounded single-flight cache reuses transformed neighboring planes across
-    overlapping 2.5D centers without materializing a complete channel-formatted
-    volume. It also deduplicates repeated edge-clamped indices within one frame.
-    """
+ The bounded single-flight cache reuses transformed neighboring planes across
+ overlapping 2.5D centers without materializing a complete channel-formatted
+ volume. It also deduplicates repeated edge-clamped indices within one frame."""
 
     def __init__(
         self,
@@ -5730,7 +5595,7 @@ class ChannelFormattedFrameRenderer:
         plane = future.result()
         with self._lock:
             # A different center can evict this completed entry after
-            # future.result() wakes us but before this lock is reacquired.
+            # future.result wakes us but before this lock is reacquired.
             # The local plane remains valid even when the LRU no longer owns it.
             if self._cache.get(idx) is future:
                 self._cache.move_to_end(idx, last=True)
@@ -5772,11 +5637,8 @@ class ChannelFormattedFrameRenderer:
 @dataclass
 class PredictionVolumeRef:
     """One active YOLO input job.
-
-    ``array`` is used by the legacy dense-materialization path.  v12.2.12 normally
-    uses ``source``: an Ultralytics-compatible streaming source that renders a
-    bounded prefetch window of slices and lets YOLO start on the first ready batch.
-    """
+    
+    ``array`` holds a dense materialized volume; ``source`` holds the default bounded streaming renderer."""
 
     array: Optional[np.ndarray]
     path: Optional[Path]
@@ -5825,14 +5687,13 @@ class ChannelFormattedYoloBatch(list):
 class InMemoryYoloVolumeSource:
     """Ultralytics-compatible in-memory source that streams model-input batches.
 
-    Ultralytics' public Python API accepts in-memory numpy inputs, but its built-in
-    ``LoadPilAndNumpy`` loader treats a list of arrays as one large batch.  This
-    loader lets the predictor consume a 3-D gray volume or 4-D H×W×C volume
-    incrementally with ``stream=True`` and the requested ``--batch``. The final
-    batch repeats the final complete channel-formatted center frame so fixed-batch
-    engines always receive the same batch size. Downstream accumulation discards
-    synthetic padded results.
-    """
+ Ultralytics' public Python API accepts in-memory numpy inputs, but its built-in
+ ``LoadPilAndNumpy`` loader treats a list of arrays as one large batch. This
+ loader lets the predictor consume a 3-D gray volume or 4-D H×W×C volume
+ incrementally with ``stream=True`` and the requested ``--batch``. The final
+ batch repeats the final complete channel-formatted center frame so fixed-batch
+ engines always receive the same batch size. Downstream accumulation discards
+ synthetic padded results."""
 
     def __init__(
         self,
@@ -5930,12 +5791,11 @@ class InMemoryYoloVolumeSource:
 class StreamingYoloVolumeSource:
     """Ultralytics-compatible source that renders prediction centers just ahead of YOLO.
 
-    The legacy v12 path first materialized a complete ``(N,imgsz,imgsz)`` uint8
-    array for every full-frame/tile job.  This source keeps only a bounded window
-    of rendered futures alive: the first batch can enter YOLO as soon as those
-    frames are ready, while CPU workers continue rendering later slices behind the
-    GPU stream.
-    """
+ The legacy path first materialized a complete ``(N,imgsz,imgsz)`` uint8
+ array for every full-frame/tile job. This source keeps only a bounded window
+ of rendered futures alive: the first batch can enter YOLO as soon as those
+ frames are ready, while CPU workers continue rendering later slices behind the
+ GPU stream."""
 
     def __init__(
         self,
@@ -6079,7 +5939,7 @@ class StreamingYoloVolumeSource:
         with self._lock:
             fut = self._futures.get(idx_i)
         if fut is None:
-            # Should only happen if close() raced with iteration; render synchronously so the
+            # Should only happen if close raced with iteration; render synchronously so the
             # YOLO stream can still finish deterministically.
             return self._render_one(idx_i)
         frame = fut.result()
@@ -6120,12 +5980,11 @@ class StreamingYoloVolumeSource:
 class GpuPrefetchedYoloBatch(list):
     """List-like orig-image batch whose YOLO tensor is already staged in GPU VRAM.
 
-    Ultralytics still receives a list of H×W×C uint8 images for result-shape bookkeeping,
-    while the patched preprocess path consumes ``_tta_gpu_tensor`` directly.  The tensor is
-    BCHW, normalized to [0,1], and already on the requested CUDA device.  A CUDA event is
-    attached when staging used a non-default copy stream so the predictor stream can wait
-    without forcing a CPU synchronization.
-    """
+ Ultralytics still receives a list of H×W×C uint8 images for result-shape bookkeeping,
+ while the patched preprocess path consumes ``_tta_gpu_tensor`` directly. The tensor is
+ BCHW, normalized to [0,1], and already on the requested CUDA device. A CUDA event is
+ attached when staging used a non-default copy stream so the predictor stream can wait
+ without forcing a CPU synchronization."""
 
     def __init__(
         self,
@@ -6168,10 +6027,9 @@ class GpuPrefetchedYoloBatch(list):
 class GpuPrefetchingYoloSource:
     """Wrap a YOLO source and keep a bounded queue of preprocessed CUDA input batches.
 
-    This queue is intentionally separate from Ultralytics' ``--batch``.  ``--batch`` remains the
-    number of slices in each inference call; ``queue_batches`` controls how many complete batches
-    are staged in VRAM ahead of the predictor loop.
-    """
+ This queue is intentionally separate from Ultralytics' ``--batch``. ``--batch`` remains the
+ number of slices in each inference call; ``queue_batches`` controls how many complete batches
+ are staged in VRAM ahead of the predictor loop."""
 
     def __init__(
         self,
@@ -6213,13 +6071,13 @@ class GpuPrefetchingYoloSource:
         self._copy_stream: Optional[object] = None
         self._device_str = canonical_single_device(str(cfg.device))
         self._dtype_name = 'float16' if quantize_uses_fp16(cfg.quantize) and str(self._device_str).startswith('cuda') else 'float32'
-        # v13.3.2 (R10): ring of reusable PINNED u8 BCHW staging buffers ([tensor, reuse_event]
+        # ring of reusable PINNED u8 BCHW staging buffers ([tensor, reuse_event]
         # pairs). The producer loop is single-threaded, so a small ring with per-buffer H2D
         # completion events is race-free.
         self._pinned_ring: Optional[List[List[object]]] = None
         self._pinned_ring_next = 0
-        # v13.2.2 bug #8: VRAM admitted for this source by gpu_input_staging_preflight_reserve;
-        # handed back to the ledger as staged batches materialize, remainder released on close().
+        # VRAM admitted for this source by gpu_input_staging_preflight_reserve;
+        # handed back to the ledger as staged batches materialize, remainder released on close.
         self._staging_reservation_remaining = max(0, int(staging_reservation_bytes))
 
     def _consume_staging_reservation(self, staged_bytes: int) -> None:
@@ -6279,7 +6137,7 @@ class GpuPrefetchingYoloSource:
                 thread.join(timeout=2.0)
             except Exception:
                 pass
-        # v13.2.2 bug #3: drop staged batches that were still queued when iteration
+        # drop staged batches that were still queued when iteration
         # stopped; abandoned GpuPrefetchedYoloBatch items otherwise keep their CUDA
         # tensors (and pinned CPU tensors) alive for the life of the process.
         try:
@@ -6287,7 +6145,7 @@ class GpuPrefetchingYoloSource:
                 self._queue.get_nowait()
         except queue.Empty:
             pass
-        # v13.2.2 bug #8: release any admission reservation this source never materialized.
+        # release any admission reservation this source never materialized.
         try:
             self._consume_staging_reservation(int(self._staging_reservation_remaining))
         except Exception:
@@ -6329,7 +6187,7 @@ class GpuPrefetchingYoloSource:
         h: int,
         w: int,
     ) -> List[object]:
-        """v13.3.2 (R10): next pinned-u8 ring entry; waits for the buffer's prior H2D to finish."""
+        """Return the next reusable pinned-u8 entry after its prior H2D completes."""
         want = (max(int(self.bs), int(b)), int(c), int(h), int(w))
         ring = self._pinned_ring
         if ring is None or tuple(int(x) for x in ring[0][0].shape) != want:
@@ -6366,10 +6224,10 @@ class GpuPrefetchingYoloSource:
 
         if bool(self.pin_memory):
             try:
-                # v13.3.2 (R10): frames go straight into a pooled PINNED u8 BCHW buffer (the
-                # np.stack + pin_memory() double copy is gone), the wire carries uint8 (half
+                # frames go straight into a pooled PINNED u8 BCHW buffer (the
+                # np.stack + pin_memory double copy is gone), the wire carries uint8 (half
                 # the bytes of fp16), and the dtype cast + /255 normalization run ON DEVICE on
-                # the copy stream. The old mixed .to(device, dtype) materialized the cast on
+                # the copy stream. The old mixed.to(device, dtype) materialized the cast on
                 # the CPU into an UNPINNED temp — which also degraded non_blocking to a
                 # pageable, producer-blocking copy.
                 b = len(frames)
@@ -6396,7 +6254,7 @@ class GpuPrefetchingYoloSource:
 
         if gpu_tensor is None:
             # Fallback (pinning unavailable or the pooled path failed): legacy stack + mixed
-            # .to(); still removes the RAM->GPU copy from the predictor hot path.
+            # .to; still removes the RAM->GPU copy from the predictor hot path.
             cpu_tensor, cpu_frames = self._stack_model_channel_cpu_tensor(
                 list(imgs), int(self.channel_count)
             )
@@ -6427,7 +6285,7 @@ class GpuPrefetchingYoloSource:
             cpu_tensor_ref=cpu_tensor_ref,
         )
         # This batch's VRAM is now visible to mem_get_info; stop double-counting it in
-        # the admission ledger (v13.2.2 bug #8).
+        # the admission ledger.
         try:
             self._consume_staging_reservation(int(gpu_tensor.numel()) * int(gpu_tensor.element_size()))
         except Exception:
@@ -6541,13 +6399,13 @@ def _source_prediction_channel_count(source: object, cfg: Optional['PredictConfi
     return 1
 
 
-# v13.2.2 bug #8: the staging preflight used to compare a one-shot torch.cuda.mem_get_info()
+# the staging preflight used to compare a one-shot torch.cuda.mem_get_info
 # snapshot against a single source's need. Eager staging wraps several queued sources within
 # milliseconds, so multiple preflights passed against the same stale free value (TOCTOU) and
 # their producers then cumulatively staged past the reserve. Admission now debits a per-device
 # reservation ledger under a lock; the ledger entry is credited back as the wrapper actually
 # materializes staged batches (at which point the usage is visible to mem_get_info) and any
-# remainder is released by GpuPrefetchingYoloSource.close().
+# remainder is released by GpuPrefetchingYoloSource.close.
 _GPU_STAGING_RESERVATION_LOCK = threading.Lock()
 _GPU_STAGING_RESERVED_BYTES: Dict[str, int] = {}
 
@@ -6568,9 +6426,8 @@ def _release_gpu_staging_reservation(device_str: str, release_bytes: int) -> Non
 def gpu_input_staging_preflight_reserve(source: object, cfg: 'PredictConfig', queue_batches: int, source_label: str) -> Optional[int]:
     """Admit one source into CUDA input staging, reserving its VRAM need in the ledger.
 
-    Returns the reserved byte count (0 when the need cannot be estimated) or None when
-    staging must be skipped for this source.
-    """
+ Returns the reserved byte count (0 when the need cannot be estimated) or None when
+ staging must be skipped for this source."""
     out_size = _source_prediction_out_size(source)
     if out_size is None or int(out_size) <= 0:
         return 0
@@ -6618,7 +6475,7 @@ def gpu_input_staging_preflight_reserve(source: object, cfg: 'PredictConfig', qu
 def maybe_wrap_source_with_gpu_input_staging(source: object, cfg: 'PredictConfig', source_label: str) -> object:
     if isinstance(source, GpuPrefetchingYoloSource):
         return source
-    # v13.3.0 (R21): GPU-rendered sources already produce device-resident normalized batches;
+    # GPU-rendered sources already produce device-resident normalized batches;
     # CPU-side staging would be a pointless host round trip.
     if isinstance(source, (GpuRenderedYoloSource, GpuTiledRenderedYoloSource)):
         return source
@@ -6655,14 +6512,9 @@ def maybe_wrap_source_with_gpu_input_staging(source: object, cfg: 'PredictConfig
 
 
 def gpu_input_staging_ahead_sources(default_queue_slots: int) -> int:
-    """Number of queued prediction sources allowed to pre-stage CUDA batches.
-
-    This is intentionally separate from YOLO_TTA_GPU_INPUT_STAGING_BATCHES, which
-    is the number of batches inside each source.  v13 removes the old fixed four-source
-    default: queued-source CUDA staging now scales with the visible CPU allocation and
-    the resolved source queue, while per-source VRAM preflight still skips staging when
-    the device does not have enough free memory.
-    """
+    """Resolve how many queued prediction sources may pre-stage CUDA batches.
+    
+    This source count is independent of the per-source batch queue and is still bounded by VRAM admission."""
     raw = os.environ.get('YOLO_TTA_GPU_INPUT_STAGING_AHEAD_SOURCES', '').strip()
     if not raw and os.environ.get('YOLO_TTA_GPU_PREFETCH_AHEAD_SOURCES') is not None:
         raw = os.environ.get('YOLO_TTA_GPU_PREFETCH_AHEAD_SOURCES', '').strip()
@@ -6682,10 +6534,9 @@ def _prediction_ref_has_gpu_input_staging(ref: PredictionVolumeRef) -> bool:
 def maybe_eager_stage_prediction_ref_on_gpu(prediction_ref: PredictionVolumeRef, cfg: 'PredictConfig') -> PredictionVolumeRef:
     """Wrap and start one queued prediction source's CUDA input staging queue.
 
-    The ordinary predict path also wraps sources, but only after they become the
-    active source.  Eager staging lets queued sources render and copy their first
-    batches into VRAM while the GPU is still inferencing the previous source.
-    """
+ The ordinary predict path also wraps sources, but only after they become the
+ active source. Eager staging lets queued sources render and copy their first
+ batches into VRAM while the GPU is still inferencing the previous source."""
     if _prediction_ref_has_gpu_input_staging(prediction_ref):
         source = prediction_ref.source
     else:
@@ -6722,13 +6573,9 @@ def streaming_prediction_sources_enabled() -> bool:
 
 
 def streaming_prediction_source_autostart_enabled() -> bool:
-    """Return True to let every constructed streaming source immediately pre-render.
-
-    v13 source creation is unbounded by default, so the default autostart policy is now
-    scheduler-controlled CPU warmup rather than every queued source starting its prefetch
-    window at construction time.  Set YOLO_TTA_STREAMING_SOURCE_AUTOSTART=1 to restore
-    eager autostart for every source.
-    """
+    """Return whether each new streaming source starts prefetch immediately.
+    
+    The default leaves queued-source warmup under scheduler control."""
     if os.environ.get('YOLO_TTA_STREAMING_SOURCE_AUTOSTART') is not None:
         return _env_flag('YOLO_TTA_STREAMING_SOURCE_AUTOSTART', True)
     if os.environ.get('YOLO_TTA_STREAM_RENDER_AUTOSTART') is not None:
@@ -6739,10 +6586,9 @@ def streaming_prediction_source_autostart_enabled() -> bool:
 def queued_streaming_source_cpu_warmup_slots(default_queue_slots: int) -> int:
     """Resolve how many ready queued streaming sources may pre-render on CPU.
 
-    This keeps v13 source creation unbounded without allowing every future tile/view to enqueue
-    a full prefetch window at once.  The active source can still use the full shared render pool;
-    a bounded number of upcoming sources are kept warm to overlap CPU rendering with inference.
-    """
+ This keeps source creation unbounded without allowing every future tile/view to enqueue
+ a full prefetch window at once. The active source can still use the full shared render pool;
+ a bounded number of upcoming sources are kept warm to overlap CPU rendering with inference."""
     raw = os.environ.get('YOLO_TTA_STREAMING_SOURCE_WARMUP_SOURCES', '').strip()
     if not raw and os.environ.get('YOLO_TTA_STREAM_RENDER_WARMUP_SOURCES') is not None:
         raw = os.environ.get('YOLO_TTA_STREAM_RENDER_WARMUP_SOURCES', '').strip()
@@ -6767,12 +6613,7 @@ def streaming_prediction_source_prefetch_frames(batch_size: int) -> int:
 
 
 def streaming_prediction_source_workers(default_workers: int, num_frames: int) -> int:
-    """Resolve the render-worker budget visible to one streaming source.
-
-    v13 gives an active source/view the full CPU allocation by default.  When sources
-    are attached to the shared streaming render pool, this value documents the per-source
-    budget and keeps legacy per-source executors full-budget if the shared pool is disabled.
-    """
+    """Resolve the render-worker budget for one streaming source, capped by its frame count."""
     full_cpu_default = max(1, _env_int('YOLO_TTA_STREAMING_SOURCE_DEFAULT_WORKERS', max(1, _cpu_count())))
     min_workers = max(1, _env_int('YOLO_TTA_STREAMING_SOURCE_MIN_WORKERS', full_cpu_default))
     default_resolved = max(1, int(default_workers), int(min_workers), int(full_cpu_default))
@@ -6796,15 +6637,9 @@ def resolve_prediction_render_workers(default_workers: int, max_frames: int) -> 
 
 
 def resolve_prediction_source_queue_slots(total_tasks: int, *, streaming_sources: bool = True) -> int:
-    """Resolve how many future YOLO sources may be created.
-
-    v13 makes streaming source creation unbounded by default because a streaming ref is
-    lightweight and the expensive CPU work is separately governed by the shared render
-    executor and per-source prefetch windows.  Legacy dense prediction-volume materialization
-    keeps the older CPU-count-scaled default to avoid materializing every source in RAM.
-    Explicitly set YOLO_TTA_PREDICTION_VOLUME_QUEUE_SLOTS to a positive value to cap it,
-    or to 0 to queue every remaining source in either mode.
-    """
+    """Resolve how many future prediction sources may be constructed.
+    
+    Streaming refs default to all tasks; dense materialization uses a CPU-scaled cap unless explicitly overridden."""
     total = max(1, int(total_tasks))
     raw = os.environ.get('YOLO_TTA_PREDICTION_VOLUME_QUEUE_SLOTS', '').strip()
     if raw:
@@ -6822,7 +6657,7 @@ def resolve_prediction_source_queue_slots(total_tasks: int, *, streaming_sources
 
 
 def ensure_ultralytics_accepts_in_memory_volume_source() -> None:
-    """Register the v12 in-memory volume loader with Ultralytics' source checker."""
+    """Register the in-memory volume loader with Ultralytics' source checker."""
     try:
         import ultralytics.data.build as ultralytics_build  # type: ignore
     except Exception as exc:  # pragma: no cover - ultralytics is imported lazily on SLURM
@@ -6925,7 +6760,7 @@ def build_dense_tile_jobs_for_aug(
     out_size: int,
     temp_dir: Path,
 ) -> List[DenseTileJob]:
-    # T11: one consolidated diagnostic sidecar per (view, configuration) instead of one
+    # one consolidated diagnostic sidecar per (view, configuration) instead of one
     # indented JSON file per tile. See write_dense_tile_job_meta.
     tile_meta_path = temp_dir / 'tiles' / view.name / tile_cfg.config_id / 'tiles.jsonl'
     xs = dense_tile_positions(int(aug_job.aff.canvas_w), int(tile_cfg.tile_size), int(tile_cfg.tile_stride))
@@ -6957,7 +6792,7 @@ def build_dense_tile_jobs_for_aug(
     if not tile_specs:
         return []
 
-    # T11: one batched inversion over the whole (N, 3, 3) stack rather than a np.linalg.inv
+    # one batched inversion over the whole (N, 3, 3) stack rather than a np.linalg.inv
     # call per tile.
     M_src_to_out_stack = np.stack(forward_mats, axis=0)
     M_out_to_src_stack = np.linalg.inv(M_src_to_out_stack)
@@ -6980,7 +6815,7 @@ def build_dense_tile_jobs_for_aug(
         for i, (tile_id, tile_x, tile_y) in enumerate(tile_specs)
     ]
 
-    # T1: resolve every tile's parent-grid crop window against one shared (h, w), so a whole
+    # resolve every tile's parent-grid crop window against one shared (h, w), so a whole
     # configuration can share a single uniformly shaped result volume.
     if jobs:
         crop_h, crop_w = tile_group_uniform_crop_shape(view, jobs, int(out_size))
@@ -7002,19 +6837,9 @@ def write_dense_tile_job_meta(
     job: DenseTileJob,
     channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
 ) -> None:
-    """Append one tile's geometry to the consolidated per-(view, configuration) tiles.jsonl.
-
-    v15.0.3 (T11): this used to be one ``mkdir`` plus one indented JSON file per tile. On a
-    shared parallel filesystem, hundreds of small-file creates per view is a metadata-op storm
-    that shows up as multi-second stalls in the enqueue phase, and these files are purely
-    diagnostic sidecars — nothing downstream reads or globs them. Now each configuration
-    creates one directory and one file, and every tile is one appended line.
-
-    Several call sites may touch the same tile (the streaming ref builder and the tile-group
-    builder both do). Overwriting a per-tile file made that idempotent for free; with an
-    append-mode stream it has to be explicit, so repeat tiles are dropped — which also makes
-    the repeat calls cheaper than the writes they replace.
-    """
+    """Append one unique tile record to the per-view/configuration JSONL sidecar.
+    
+    A process-local lock and tile-id set make repeated call sites idempotent."""
     fmt = resolve_channel_format(channel_format)
     path = Path(job.meta_path)
     key = str(path)
@@ -7068,7 +6893,7 @@ class TiltedRenderPlan:
     y_idx: np.ndarray
     valid_xy: np.ndarray
     axis_offset: np.ndarray
-    # v13.3.2 (R5): frame-invariant hoists. The tilted frame center is always an integer, so
+    # frame-invariant hoists. The tilted frame center is always an integer, so
     # floor/frac of the sheared stack coordinate, the flat in-plane gather index, and each
     # pixel's valid frame-center interval [c_lo, c_hi] are all constant across frames — only a
     # scalar integer offset varies per frame. row_* fields describe the separable fast path
@@ -7091,11 +6916,8 @@ class TiltedRenderPlan:
     c_hi2d: Optional[np.ndarray] = None        # int32 (H,W)
 
 
-# v13.2.2 bugs #9/#10: the tilted plan cache was an unbounded plain dict with a lock-free
-# check-then-act. Every render-pool thread that started a tilted view simultaneously missed the
-# cache together and each rebuilt the same ~100+ MB plan (a transient multi-GiB spike), and every
-# (view, grid, matrix) key ever built stayed resident for the rest of the run. The cache is now
-# LRU-bounded by bytes and per-key single-flight: one thread builds while the others wait.
+# Tilted render plans use a byte-bounded LRU and per-key single-flight construction so
+# concurrent render threads neither duplicate large plans nor retain an unbounded key set.
 _TILTED_RENDER_PLAN_CACHE: 'OrderedDict[Tuple[str, int, int, Tuple[float, ...]], TiltedRenderPlan]' = OrderedDict()
 _TILTED_RENDER_PLAN_CACHE_BYTES = 0
 _TILTED_RENDER_PLAN_CACHE_LOCK = threading.Lock()
@@ -7108,7 +6930,7 @@ def tilted_render_plan_cache_max_bytes() -> int:
 
 def _tilted_render_plan_nbytes(plan: TiltedRenderPlan) -> int:
     total = int(plan.x_idx.nbytes) + int(plan.y_idx.nbytes) + int(plan.valid_xy.nbytes) + int(plan.axis_offset.nbytes)
-    # v13.3.2 (R5): the hoisted frame-invariant arrays count against the LRU byte budget too.
+    # the hoisted frame-invariant arrays count against the LRU byte budget too.
     for extra in (
         plan.row_c_lo, plan.row_c_hi, plan.row_sb0, plan.row_alpha, plan.row_v,
         plan.row_u0, plan.row_u1, plan.row_su0,
@@ -7206,10 +7028,10 @@ def _build_tilted_render_plan(
     valid_xy = valid_xy.astype(bool, copy=False)
     axis_offset = np.asarray(axis_offset, dtype=np.float32)
 
-    # v13.3.2 (R5): hoist every frame-invariant term. The frame center c is an integer
+    # hoist every frame-invariant term. The frame center c is an integer
     # (tilted_frame_center), so with b = tan(tilt)*axis_offset (fp32):
-    #   stack coordinate = c + b, floor = c + floor(b), frac = b - floor(b),
-    #   valid  <=>  c >= -floor(b)  and  c <= (stack_len-1) - floor(b) - [frac > 0].
+    # stack coordinate = c + b, floor = c + floor(b), frac = b - floor(b),
+    # valid <=> c >= -floor(b) and c <= (stack_len-1) - floor(b) - [frac > 0].
     base_view = tilted_base_view_name(view)
     stack_len = int(tilted_stack_axis_length(view))
     full_h = int(view.full_h)
@@ -7299,7 +7121,7 @@ _TILTED_RENDER_TLS = threading.local()
 
 
 def _tilted_tls_buffer(name: str, count: int, dtype: object) -> np.ndarray:
-    """v13.3.2 (R5): reusable per-render-thread flat scratch buffer (grow-only)."""
+    """Reusable per-render-thread flat scratch buffer (grow-only)."""
     bufs = getattr(_TILTED_RENDER_TLS, 'bufs', None)
     if bufs is None:
         bufs = {}
@@ -7323,21 +7145,9 @@ def _render_tilted_array_on_grid(
     mask_mode: bool,
     block_rows: int = 256,
 ) -> np.ndarray:
-    """Render one generalized v12 Tilted View frame.
-
-    ``M_grid_to_src`` maps output/grid pixels into the selected Cartesian base view's
-    native raster coordinates.  The two in-plane axes are rounded to their native
-    grid, while the base view's stacking coordinate is linearly interpolated after
-    applying the signed shear.  This covers Tilted Transverse, Tilted Sagittal, and
-    Tilted Coronal without expanding the output canvas.
-
-    v13.3.2 (R5): all frame-invariant math lives in the cached TiltedRenderPlan; per frame only
-    an integer offset remains. Rows whose stack coordinate is constant and whose in-plane reads
-    are contiguous render via row slices + a scalar lerp (GIL-free); everything else uses ONE
-    clipped flat gather per lerp end restricted to the valid row band, with thread-local
-    reusable buffers and a multiply merge instead of a masked scatter. The legacy per-block
-    double fancy gather survives as the reference/fallback path.
-    """
+    """Render one Tilted frame on an arbitrary output grid.
+    
+    A cached plan hoists frame-invariant geometry; row-contiguous and flattened-gather paths avoid repeated setup."""
     if not is_tilted_view(view):
         raise ValueError('Tilted rendering requested for a non-tilted view')
 
@@ -7471,7 +7281,7 @@ def _render_tilted_array_on_grid_reference(
     mask_mode: bool,
     block_rows: int = 256,
 ) -> np.ndarray:
-    """Legacy exact tilted render (per-block double fancy gather); v13.3.2 fallback/reference."""
+    """Legacy exact tilted render (per-block double fancy gather); fallback/reference."""
     plan = get_tilted_render_plan(view, M_grid_to_src, int(grid_h), int(grid_w))
     tan_alpha = float(math.tan(math.radians(float(view.tilt_angle_deg))))
     stack_len = int(tilted_stack_axis_length(view))
@@ -7608,7 +7418,7 @@ def render_fullframe_frame_for_job(
         )
 
     native_frame = np.ascontiguousarray(get_view_frame_by_index(volume_rgb, view, int(frame_idx), view_frames=view_frames))
-    # v13.2.5 (speed #10): identity fast path — a rotation-free job whose native frame already
+    # identity fast path — a rotation-free job whose native frame already
     # matches the model raster (e.g. every imgsz-folded radial frame at --angle 0) needs no warp.
     aff = job.aff
     if (
@@ -7639,13 +7449,12 @@ def render_dense_tile_frame_for_job(
 ) -> np.ndarray:
     """Render one dense-tile inference range directly from the native view volume.
 
-    This replaces the legacy canvas-video -> crop -> scale FFmpeg path with the
-    same transform collapsed into one in-memory reslice.  ``tile_job.M_src_to_out``
-    maps native view coordinates directly to the tile's ``--imgsz`` inference
-    raster; for Tilted Views the inverse grid-to-native transform is passed into
-    the tilted sampler so the stacking-axis shear, in-plane augmentation, crop,
-    and scale are sampled in one pass.
-    """
+ This replaces the legacy canvas-video -> crop -> scale FFmpeg path with the
+ same transform collapsed into one in-memory reslice. ``tile_job.M_src_to_out``
+ maps native view coordinates directly to the tile's ``--imgsz`` inference
+ raster; for Tilted Views the inverse grid-to-native transform is passed into
+ the tilted sampler so the stacking-axis shear, in-plane augmentation, crop,
+ and scale are sampled in one pass."""
     if is_tilted_view(view):
         return render_tilted_frame_on_grid(
             volume_rgb=volume_rgb,
@@ -7735,14 +7544,9 @@ def _materialize_prediction_volume_from_renderer(
     kind: str = 'fullframe',
     channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
 ) -> PredictionVolumeRef:
-    """Return a YOLO-ready prediction input for one rendered view job.
-
-    v12.2.12 defaults to a lazy render-backed source instead of building a
-    complete ``(slice,--imgsz,--imgsz)`` volume before inference. YOLO can
-    consume the first ready batch while CPU workers continue resizing/warping
-    later slices. Set ``YOLO_TTA_STREAMING_PREDICTION_SOURCES=0`` to recover
-    the legacy whole-volume materialization path for regression testing.
-    """
+    """Return a streaming render-backed prediction source by default.
+    
+    Disabling streaming materializes the complete model-sized volume in a workspace array."""
     fmt = resolve_channel_format(channel_format)
     stream_name = str(desc).replace('Materializing in-memory ', 'Streaming render-backed ')
     if streaming_prediction_sources_enabled():
@@ -7901,11 +7705,9 @@ def materialize_dense_tile_prediction_volume_for_job(
 
 
 def should_cache_view_frames(view: ViewInfo, dense_tiling_active: bool) -> bool:
-    """Return True when precomputing native single-channel frames is worthwhile for this view.
+    """Return whether an opt-in dense-tile Radial frame cache should be prebuilt.
 
-    Radial frame caches can be useful for dense-tile throughput, but building the entire
-    radial cache before inference creates a large time-to-first-prediction barrier.  v12.2.12
-    therefore keeps this prebuild opt-in; streaming sources render only the slices they need.
+    Streaming remains the default to avoid a full-view time-to-first-prediction barrier.
     """
     return bool(_env_flag('YOLO_TTA_PREBUILD_VIEW_FRAME_CACHES', False)) and bool(dense_tiling_active) and view.family == 'radial'
 
@@ -7922,9 +7724,8 @@ def build_view_frame_cache(
 ) -> np.ndarray:
     """Materialize native single-channel frames for a view into a reusable cache volume.
 
-    This is used primarily for the radial view when dense tiling is enabled so later tile video
-    generation no longer recomputes the same radial slices for every tile location.
-    """
+ This is used primarily for the radial view when dense tiling is enabled so later tile video
+ generation no longer recomputes the same radial slices for every tile location."""
     cache_mm = allocate_workspace_array(
         shape=(int(view.num_slices), int(view.src_h), int(view.src_w)),
         dtype=np.uint8,
@@ -7957,11 +7758,11 @@ def build_view_frame_cache(
     return cache_mm
 
 
-# v13.3.2 (R14): coronal frames are stride-W column gathers of the (t, Y, X) volume — every
+# coronal frames are stride-W column gathers of the (t, Y, X) volume — every
 # useful byte drags a whole cache line (~64x DRAM traffic amplification over 3072 frames).
-# Extract K-column transposed blocks once (per-t 2D tile transposes stay inside L2) and serve
+# Extract K-column transposed blocks once (per-t 2D tile transposes stay inside ) and serve
 # frames as contiguous (T, H) views of the cached block. Single-flight per block; tiny LRU.
-# Sagittal frames need none of this: volume[:, y, :] rows are contiguous in x (full cache-line
+# Sagittal frames need none of this: volume[:, y,:] rows are contiguous in x (full cache-line
 # use in both read and write directions).
 _CORONAL_BLOCK_CACHE: 'OrderedDict[Tuple[int, Tuple[int, int, int], int], np.ndarray]' = OrderedDict()
 _CORONAL_BLOCK_CACHE_LOCK = threading.Lock()
@@ -7969,12 +7770,12 @@ _CORONAL_BLOCK_BUILDS_IN_FLIGHT: Dict[Tuple[int, Tuple[int, int, int], int], thr
 
 
 def coronal_block_cols() -> int:
-    """v13.3.2 (R14): columns per cached coronal block (64 x 1 B = one full cache line)."""
+    """Columns per cached coronal block (64 x 1 B = one full cache line)."""
     return max(8, _env_int('YOLO_TTA_CORONAL_BLOCK_COLS', 64))
 
 
 def coronal_block_cache_blocks() -> int:
-    """v13.3.2 (R14): coronal block LRU capacity, in blocks (each K*T*H bytes)."""
+    """Coronal block LRU capacity, in blocks (each K*T*H bytes)."""
     return max(1, _env_int('YOLO_TTA_CORONAL_BLOCK_CACHE', 2))
 
 
@@ -8047,7 +7848,7 @@ def get_view_frame_by_index(
         return np.ascontiguousarray(volume_rgb[:, int(index), :])
     if view.name == 'coronal':
         wait_for_volume_ready(volume_rgb)
-        # v13.3.2 (R14): serve from K-column transposed blocks instead of a strided gather.
+        # serve from K-column transposed blocks instead of a strided gather.
         if volume_rgb.ndim == 3 and bool(volume_rgb.flags['C_CONTIGUOUS']):
             return _coronal_frame_from_block_cache(volume_rgb, int(index))
         return np.ascontiguousarray(volume_rgb[:, :, int(index)])
@@ -8072,9 +7873,9 @@ def get_view_frame_by_index(
     raise ValueError(f'Unknown view: {view.name}')
 
 
-# --------------------------
+#
 # YOLO inference
-# --------------------------
+#
 
 def load_ultralytics_model(path: str, task: str = 'segment'):
     try:
@@ -8088,12 +7889,9 @@ def load_ultralytics_model(path: str, task: str = 'segment'):
 
 
 def background_model_load_enabled() -> bool:
-    """Return True when main-process model loading overlaps decode/preparation.
+    """Return whether model loading overlaps decode and view preparation.
 
-    v16.0.1 retains the v15.0.5 default overlap. Set YOLO_TTA_BACKGROUND_MODEL_LOAD=0
-    only for debugging or backends whose constructor is not safe in a loader thread.
-    CUDA runs load inside their persistent GPU workers while the default streaming
-    decode producer is active.
+    CUDA models load inside persistent GPU workers; CPU models use a loader thread.
     """
     return _env_flag('YOLO_TTA_BACKGROUND_MODEL_LOAD', True)
 
@@ -8128,9 +7926,8 @@ def _canonical_single_device_token(token: str) -> str:
 def parse_device_list(device: 'Sequence[str] | str | None') -> List[str]:
     """Parse one-or-more CUDA devices, MPS, or CPU into canonical device strings.
 
-    Comma-separated, whitespace-separated, and ``argparse`` list forms are accepted. CPU
-    cannot be mixed with accelerators; duplicates are removed while preserving order.
-    """
+ Comma-separated, whitespace-separated, and ``argparse`` list forms are accepted. CPU
+ cannot be mixed with accelerators; duplicates are removed while preserving order."""
     if device is None:
         return ['cpu']
     if isinstance(device, str):
@@ -8182,8 +7979,8 @@ def resolve_retina_mask_processor(explicit: Optional[str], devices: Sequence[str
     return 'cpu', 'non-CUDA default uses CPU retina reconstruction'
 
 
-# v13.0.0: the active retina-mask processor resolved in main() from --retina_mask_processor and
-# --device. None means "fall back to the YOLO_TTA_CPU_RETINA_MASKS env default" (back-compat).
+# the active retina-mask processor resolved in main from --retina_mask_processor and
+# device. None means "fall back to the YOLO_TTA_CPU_RETINA_MASKS env default" (back-compat).
 _RETINA_MASK_PROCESSOR_IS_CPU: Optional[bool] = None
 
 
@@ -8193,7 +7990,7 @@ def set_retina_mask_processor(processor: str) -> None:
     _RETINA_MASK_PROCESSOR_IS_CPU = bool(str(processor).strip().lower() == 'cpu')
 
 
-# v13.1.0 (#2.3), current behavior: when set, the single-angle + gpu-retina
+# current behavior: when set, the single-angle + gpu-retina
 # fast path applies min_conf before union/flatten and can apply min_radius with
 # CuPy after the GPU warp. The old per-frame retina hole fill is not part of
 # this path; hole filling runs once on a completed view, or at task end for an
@@ -8202,92 +7999,78 @@ _SINGLE_ANGLE_GPU_FASTPATH: Optional[Tuple[float, float]] = None
 
 
 def gpu_retina_flatten_enabled() -> bool:
-    """v13.1.0 (#2.2): flatten GPU retina masks (n,H,W) -> union + max-conf planes before PCIe copy.
+    """Flatten GPU retina masks (n,H,W) -> union + max-conf planes before PCIe copy.
 
-    Active only when retina masks are resolved on the GPU (not cpu_retina_masks_enabled()). The env
-    flag YOLO_TTA_GPU_RETINA_FLATTEN (default on) allows forcing the legacy whole-stack copy for
-    regression comparison.
-    """
+ Active only when retina masks are resolved on the GPU (not cpu_retina_masks_enabled). The env
+ flag YOLO_TTA_GPU_RETINA_FLATTEN (default on) allows forcing the legacy whole-stack copy for
+ regression comparison."""
     return _env_flag('YOLO_TTA_GPU_RETINA_FLATTEN', True)
 
 
 def gpu_retina_warp_enabled() -> bool:
-    """v13.1.0 (#2.2): perform the flattened-plane affine warp to view-native space on the GPU.
+    """Perform the flattened-plane affine warp to view-native space on the GPU.
 
-    When enabled, the union and max-confidence planes are warped to view-native space on the GPU
-    (torch grid_sample) before the host copy, so neither affine warp runs on the CPU and only the
-    view-native planes cross PCIe. YOLO_TTA_GPU_RETINA_WARP=0 keeps the warps on the CPU (the
-    flattened out-size planes are copied down and cv2.warpAffine'd) for regression comparison.
-    """
+ When enabled, the union and max-confidence planes are warped to view-native space on the GPU
+ (torch grid_sample) before the host copy, so neither affine warp runs on the CPU and only the
+ view-native planes cross PCIe. YOLO_TTA_GPU_RETINA_WARP=0 keeps the warps on the CPU (the
+ flattened out-size planes are copied down and cv2.warpAffine'd) for regression comparison."""
     return _env_flag('YOLO_TTA_GPU_RETINA_WARP', True)
 
 
 def gpu_retina_eager_flatten_enabled() -> bool:
-    """v13.1.0 (#2.2): run the cheap GPU union/max-conf reduction on the model-stream thread.
+    """Run the cheap GPU union/max-conf reduction on the model-stream thread.
 
-    When on the GPU-flatten path, reducing each (n,Hr,Wr) stack to 2 small planes as results stream
-    (rather than deferring the reduction to a postprocess worker) lets the full native-resolution
-    retina-mask stack be released immediately, so at most ~the bounded pending count of small planes
-    (not full stacks) stay resident on the GPU. YOLO_TTA_GPU_RETINA_EAGER_FLATTEN=0 defers it.
-    """
+ When on the GPU-flatten path, reducing each (n,Hr,Wr) stack to 2 small planes as results stream
+ (rather than deferring the reduction to a postprocess worker) lets the full native-resolution
+ retina-mask stack be released immediately, so at most ~the bounded pending count of small planes
+ (not full stacks) stay resident on the GPU. YOLO_TTA_GPU_RETINA_EAGER_FLATTEN=0 defers it."""
     return _env_flag('YOLO_TTA_GPU_RETINA_EAGER_FLATTEN', True)
 
 
 def gpu_retina_flatten_pending_limit(worker_count: int) -> int:
-    """v13.1.0 (#2.2): bound on queued GPU-resident flattened frames, to cap GPU memory.
+    """Bound on queued GPU-resident flattened frames, to cap GPU memory.
 
-    The CPU-RAM-oriented cpu_mask_postprocess_pending_limit defaults to ~num_frames, which is unsafe
-    for GPU-resident intermediates: queuing a whole view's worth of flattened planes (or, worse,
-    un-reduced stacks) can OOM the device. This caps the in-flight count so GPU residency stays
-    bounded while leaving enough work to keep the postprocess workers busy.
-    YOLO_TTA_GPU_RETINA_PENDING_FRAMES overrides it.
-    """
+ The CPU-RAM-oriented cpu_mask_postprocess_pending_limit defaults to ~num_frames, which is unsafe
+ for GPU-resident intermediates: queuing a whole view's worth of flattened planes (or, worse,
+ un-reduced stacks) can OOM the device. This caps the in-flight count so GPU residency stays
+ bounded while leaving enough work to keep the postprocess workers busy.
+ YOLO_TTA_GPU_RETINA_PENDING_FRAMES overrides it."""
     wc = max(1, int(worker_count))
     return max(8, _env_int('YOLO_TTA_GPU_RETINA_PENDING_FRAMES', min(4 * wc, 256)))
 
 
 def gpu_retina_cleanup_enabled() -> bool:
-    """v13.1.0 (#2.3): run --min_radius on the GPU for the single-angle fast path.
-
-    Requires cupy/cupyx. YOLO_TTA_GPU_RETINA_CLEANUP=0 forces the connected-component cleanup back
-    onto the CPU (the per-slice streaming cleanup) even when the fast path is otherwise active.
-    v13.3.0 (R8): the per-frame retina GPU 2D hole fill is removed (a completed-view
-    or eligible task-end device-union pass performs it once in spec order), so this
-    gate now covers only --min_radius and is a no-op when --min_radius is 0.
-    """
+    """Return whether positive ``--min_radius`` cleanup may run through CuPy.
+    
+    Hole filling remains a completed-view or task-end operation so cleanup order is preserved."""
     return _env_flag('YOLO_TTA_GPU_RETINA_CLEANUP', True)
 
 
 def gpu_retina_proto_union_enabled() -> bool:
-    """v13.3.0 (R9): compute the GPU retina union at PROTO resolution inside construct_result.
+    """Compute the GPU retina union at PROTO resolution inside construct_result.
 
-    Active only in GPU retina mask mode. Instead of Ultralytics materializing an
-    (n, imgsz, imgsz) float retina stack per image (a batch-scaled VRAM transient of
-    batch x n x 16 MB that this pipeline immediately reduces to one plane), the patched
-    construct_result box-crops the per-instance mask logits at proto scale, reduces them to a
-    single max-logit plane, and bilinearly upsamples ONE plane to the network raster. Box-edge
-    differences are sub-voxel scale. YOLO_TTA_GPU_PROTO_UNION=0 restores the native retina
-    stack + flatten path.
-    """
+ Active only in GPU retina mask mode. Instead of Ultralytics materializing an
+ (n, imgsz, imgsz) float retina stack per image (a batch-scaled VRAM transient of
+ batch x n x 16 MB that this pipeline immediately reduces to one plane), the patched
+ construct_result box-crops the per-instance mask logits at proto scale, reduces them to a
+ single max-logit plane, and bilinearly upsamples ONE plane to the network raster. Box-edge
+ differences are sub-voxel scale. YOLO_TTA_GPU_PROTO_UNION=0 restores the native retina
+ stack + flatten path."""
     return _env_flag('YOLO_TTA_GPU_PROTO_UNION', True)
 
 
 def gpu_postprocess_side_stream_enabled() -> bool:
-    """v13.3.0 (R18): run the GPU postprocess tail on a per-thread side CUDA stream."""
+    """Run the GPU postprocess tail on a per-thread side CUDA stream."""
     return _env_flag('YOLO_TTA_GPU_POSTPROCESS_STREAM', True)
 
 
 def gpu_postprocess_pinned_d2h_enabled() -> bool:
-    """v13.3.0 (R18): stage device->host postprocess copies through per-thread pinned buffers."""
+    """Stage device->host postprocess copies through per-thread pinned buffers."""
     return _env_flag('YOLO_TTA_GPU_POSTPROCESS_PINNED', True)
 
 
 def set_single_angle_gpu_fastpath(min_conf: Optional[float], min_radius: float = 0.0) -> None:
-    """Enable/disable the v13.1.0 (#2.3) single-angle + gpu-retina fast path.
-
-    min_conf None disables the fast path. A float (incl. 0.0) enables it; min_radius is the radius
-    used for the on-GPU connected-component filter.
-    """
+    """Set or clear the process-wide single-angle GPU cleanup configuration."""
     global _SINGLE_ANGLE_GPU_FASTPATH
     if min_conf is None:
         _SINGLE_ANGLE_GPU_FASTPATH = None
@@ -8303,11 +8086,10 @@ def single_angle_gpu_fastpath() -> Optional[Tuple[float, float]]:
 def ensure_yolo_ready_for_predict(model: object, cfg: 'PredictConfig') -> None:
     """Keep the active YOLO backend resident on the requested device.
 
-    The scheduling contract wants the GPU to stay hot until work is exhausted. Offloading the model
-    between videos can leave Ultralytics with CUDA inputs but CPU weights on the next predict() call.
-    This helper lazily restores the requested device/dtype when needed and is a cheap no-op while the
-    model already matches the active predict configuration.
-    """
+ The scheduling contract wants the GPU to stay hot until work is exhausted. Offloading the model
+ between videos can leave Ultralytics with CUDA inputs but CPU weights on the next predict call.
+ This helper lazily restores the requested device/dtype when needed and is a cheap no-op while the
+ model already matches the active predict configuration."""
     try:
         import torch  # type: ignore
     except Exception:
@@ -8346,7 +8128,7 @@ def ensure_yolo_ready_for_predict(model: object, cfg: 'PredictConfig') -> None:
                 pass
 
         # Plain FP16/FP32 models may be placed eagerly. INT8 and mixed exported backends
-        # own their binding precision and must not be coerced through Module.float()/half().
+        # own their binding precision and must not be coerced through Module.float/half.
         precision_fn = None
         if wants_fp16:
             precision_fn = getattr(candidate, 'half', None)
@@ -8491,7 +8273,7 @@ def validate_yolo_model_input_channels(
     channel_token: str,
     context: str,
 ) -> Optional[int]:
-    """Fail clearly when a discoverable model binding disagrees with v15 input C."""
+    """Fail clearly when a discoverable model binding disagrees with input C."""
     required = max(1, int(required_channels))
     actual, source = infer_yolo_model_input_channels(model)
     if actual is None:
@@ -8609,11 +8391,10 @@ def async_predict_join_workers(default_value: int) -> int:
 def async_predict_pending_frame_limit(num_frames: int) -> int:
     """Optional cap for queued async result-worker futures per source.
 
-    The default 0 means source-sized buffering: the GPU-facing iterator will not
-    intentionally wait for CPU result workers while a prediction volume streams.
-    Set YOLO_TTA_ASYNC_PREDICT_PENDING_FRAMES to a positive value to reduce
-    transient CPU/GPU result memory at the cost of some continuity.
-    """
+ The default 0 means source-sized buffering: the GPU-facing iterator will not
+ intentionally wait for CPU result workers while a prediction volume streams.
+ Set YOLO_TTA_ASYNC_PREDICT_PENDING_FRAMES to a positive value to reduce
+ transient CPU/GPU result memory at the cost of some continuity."""
     requested = _env_int('YOLO_TTA_ASYNC_PREDICT_PENDING_FRAMES', 0)
     if int(requested) <= 0:
         return 0
@@ -8663,12 +8444,7 @@ def resolve_gaussian_smoothing_settings(
     gaussian_smoothing_arg: Optional[float],
     gaussian_smoothing_passes_arg: Optional[int],
 ) -> Tuple[bool, float, int]:
-    """Resolve Gaussian smoothing enablement from the v12.2.0 CLI contract.
-
-    Gaussian smoothing is active iff at least one Gaussian flag is explicitly set
-    and neither explicitly supplied value is 0. Unset values use the defaults
-    from the specification: sigma=3.0 and passes=1.
-    """
+    """Resolve smoothing enablement, sigma, and pass count from the two Gaussian flags."""
     sigma_explicit = gaussian_smoothing_arg is not None
     passes_explicit = gaussian_smoothing_passes_arg is not None
     sigma_f = (
@@ -8715,28 +8491,14 @@ class CpuRetinaMaskPayload:
 
 @dataclass
 class GpuFlattenedRetinaPayload:
-    """v13.1.0 (#2.2/#2.3): one retina-mask frame flattened on the GPU, kept on the GPU.
-
-    Ultralytics produces a native-resolution (n, Hr, Wr) retina-mask stack on the GPU. Instead of
-    copying the whole stack down and OR/resizing it in a single-threaded per-instance CPU loop, the
-    stack is reduced on the GPU to a per-pixel union plane and a per-pixel max-confidence plane. The
-    GPU tensors are retained (not copied to the CPU here) so the affine warp to view-native space
-    and, for the single-angle fast path, --min_radius can also run on the GPU; only the finished
-    view-native plane(s) then cross PCIe (#2.2: O(2*H*W); #2.3: one cleaned plane).
-
-    union_gpu is a torch tensor (Hr, Wr) of 0/1 (float or bool). conf_gpu is a torch tensor (Hr, Wr)
-    of per-pixel max confidence in [0,1] (pre-quantization), or None when no boxes.conf was present.
-    instance_count is the number of (kept) instances (prediction-count stats only). min_conf_applied
-    records whether the on-GPU instance-level --min_conf drop ran. run_gpu_cleanup requests the on-GPU
-    --min_radius component filter (#2.3); gpu_min_radius is the radius for it. cleanup_done_on_gpu is set by
-    the frame processor once the GPU connected-component cleanup actually completed, so the per-slice
-    CPU streaming cleanup can be skipped for that slice.
-    """
+    """GPU-resident per-frame union and optional confidence payload.
+    
+    The payload records device-side counts, cleanup state, readiness events, and references needed to keep asynchronous tensors alive."""
 
     union_gpu: object
     conf_gpu: Optional[object]
     instance_count: int = 0
-    # v13.3.12 (C3): generic direct-backend compaction retains its scalar count on device.
+    # generic direct-backend compaction retains its scalar count on device.
     # The device-union path records it into a per-frame task tensor and reads totals once at
     # task end; host-output fallbacks stage it alongside their unavoidable mask D2H.
     instance_count_device: Optional[object] = None
@@ -8744,10 +8506,10 @@ class GpuFlattenedRetinaPayload:
     run_gpu_cleanup: bool = False
     gpu_min_radius: float = 0.0
     cleanup_done_on_gpu: bool = False
-    # v13.3.0 (R18): CUDA event recorded on the producing stream after union/conf were computed,
+    # CUDA event recorded on the producing stream after union/conf were computed,
     # so the postprocess side stream can order against the producer without a host sync.
     ready_event: Optional[object] = None
-    # v13.3.2 (R21): set by the frame processor when this frame's native plane was written into
+    # set by the frame processor when this frame's native plane was written into
     # the per-task device union accumulator (no host write happened; the task-end flush merges).
     accumulated_on_device: bool = False
     # Keep raw head/proto and compaction workspaces alive until ready_event has ordered every
@@ -8775,18 +8537,17 @@ _DEFERRED_CLONE_FALLBACK_WARNED = False
 def _detach_clone_tensor_if_torch(value: object) -> object:
     """Detach+clone a torch tensor so a deferred payload owns its storage.
 
-    Buffer-reusing inference backends (e.g. TensorRT engines through AutoBackend) hand
-    construct_result views of output bindings that the NEXT batch's execute overwrites in
-    place. A payload whose realization is deferred to a worker thread must never alias
-    those bindings, or it reads a later frame's protos (v13.2.2 bug #11). The clone is a
-    device-side copy queued on the current stream — it does not synchronize the host, so
-    the deferral still keeps the GPU->CPU copy off the model-stream thread.
+ Buffer-reusing inference backends (e.g. TensorRT engines through AutoBackend) hand
+ construct_result views of output bindings that the NEXT batch's execute overwrites in
+ place. A payload whose realization is deferred to a worker thread must never alias
+ those bindings, or it reads a later frame's protos. The clone is a
+ device-side copy queued on the current stream — it does not synchronize the host, so
+ the deferral still keeps the GPU->CPU copy off the model-stream thread.
 
-    Non-tensor values pass through unchanged. Clone failures (e.g. a transient CUDA OOM)
-    PROPAGATE: silently returning the aliased binding would reinstate exactly the
-    corruption this exists to prevent — the caller falls back to synchronous
-    realization instead.
-    """
+ Non-tensor values pass through unchanged. Clone failures (e.g. a transient CUDA OOM)
+ PROPAGATE: silently returning the aliased binding would reinstate exactly the
+ corruption this exists to prevent — the caller falls back to synchronous
+ realization instead."""
     detach = getattr(value, 'detach', None)
     if not callable(detach):
         return value
@@ -8798,17 +8559,9 @@ def _detach_clone_tensor_if_torch(value: object) -> object:
 
 
 def cpu_retina_masks_enabled() -> bool:
-    """Return True when retina masks are reconstructed on the CPU.
-
-    v13.0.0: when main() has resolved --retina_mask_processor (against the --device rules),
-    that decision wins: 'cpu' -> deferred CPU retina reconstruction (retina_masks=False to
-    YOLO); 'gpu' -> Ultralytics native retina_masks=True on the GPU. When unset (e.g. helper
-    used standalone), fall back to the YOLO_TTA_CPU_RETINA_MASKS env default.
-
-    CPU reconstruction captures compact mask coefficients/protos and rebuilds bbox-local
-    masks in prediction-result workers. GPU reconstruction keeps CPU cores available for
-    rendering, cleanup, interpolation, and output work.
-    """
+    """Resolve CPU versus GPU retina-mask reconstruction.
+    
+    The CLI-resolved processor wins; standalone callers fall back to the environment setting."""
     if _RETINA_MASK_PROCESSOR_IS_CPU is not None:
         return bool(_RETINA_MASK_PROCESSOR_IS_CPU)
     return _env_flag('YOLO_TTA_CPU_RETINA_MASKS', True)
@@ -8834,11 +8587,10 @@ def cpu_retina_deferred_payload_enabled() -> bool:
 def cpu_mask_postprocess_pending_limit(worker_count: int, num_frames: int) -> int:
     """Bound queued CPU mask-reconstruction frames while allowing RAM-backed buffering.
 
-    Setting YOLO_TTA_CPU_MASK_PENDING_FRAMES=0 removes the frame-count cap for sites that
-    intentionally want to absorb the entire CPU backlog in RAM. The default is deliberately much
-    larger than the worker count so GPU inference is not throttled by CPU retina reconstruction under
-    normal SLURM allocations.
-    """
+ Setting YOLO_TTA_CPU_MASK_PENDING_FRAMES=0 removes the frame-count cap for sites that
+ intentionally want to absorb the entire CPU backlog in RAM. The default is deliberately much
+ larger than the worker count so GPU inference is not throttled by CPU retina reconstruction under
+ normal SLURM allocations."""
     workers = max(1, int(worker_count))
     frames = max(1, int(num_frames))
     requested = _env_int('YOLO_TTA_CPU_MASK_PENDING_FRAMES', 0)
@@ -8851,14 +8603,13 @@ _ULTRALYTICS_CHANNEL_AWARE_PREPROCESS_PATCHED = False
 
 
 def ensure_channel_aware_yolo_preprocess_patch() -> bool:
-    """Preserve v15 H×W×C in-memory input order when constructing BCHW tensors.
+    """Preserve H×W×C in-memory input order when constructing BCHW tensors.
 
-    Stock Ultralytics' ordinary NumPy-image path assumes BGR-like three-channel
-    images and reverses the trailing axis. That would reverse a C...S... neighbor
-    stack. Marked v15 batches therefore bypass the color conversion and perform
-    an explicit BHWC->BCHW move without changing channel order. Unrelated stock
-    image/video sources remain on the original preprocessing path.
-    """
+ Stock Ultralytics' ordinary NumPy-image path assumes BGR-like three-channel
+ images and reverses the trailing axis. That would reverse a C...S... neighbor
+ stack. Marked batches therefore bypass the color conversion and perform
+ an explicit BHWC->BCHW move without changing channel order. Unrelated stock
+ image/video sources remain on the original preprocessing path."""
     global _ULTRALYTICS_CHANNEL_AWARE_PREPROCESS_PATCHED
 
     if _ULTRALYTICS_CHANNEL_AWARE_PREPROCESS_PATCHED:
@@ -9088,10 +8839,9 @@ def _resize_lowres_logits_roi(
 ) -> np.ndarray:
     """Upsample only the requested high-resolution ROI using align-corners=False geometry.
 
-    This avoids allocating an N x H x W tensor for hundreds of detections. It is equivalent in
-    coordinate mapping to resizing the low-resolution retina logits to the prediction-video frame and
-    then cropping the bbox ROI, while doing the expensive interpolation only inside the bbox.
-    """
+ This avoids allocating an N x H x W tensor for hundreds of detections. It is equivalent in
+ coordinate mapping to resizing the low-resolution retina logits to the prediction-video frame and
+ then cropping the bbox ROI, while doing the expensive interpolation only inside the bbox."""
     y1, y2, x1, x2 = (int(v) for v in roi)
     target_h, target_w = int(target_shape[0]), int(target_shape[1])
     low = np.asarray(low_logits, dtype=np.float32)
@@ -9284,7 +9034,7 @@ def ensure_cpu_retina_mask_predictor_patch() -> bool:
                     frame_path=str(img_path),
                 )
             except Exception as clone_exc:
-                # v13.2.2 bug #11: a failed clone (e.g. transient CUDA OOM) must NOT fall
+                # a failed clone (e.g. transient CUDA OOM) must NOT fall
                 # back to aliasing the backend's reusable output bindings — that silently
                 # reinstates the corruption. Realize this frame synchronously below (the
                 # CPU copy completes before the next batch executes).
@@ -9331,17 +9081,16 @@ _ULTRALYTICS_GPU_PROTO_UNION_PATCHED = False
 
 
 def _build_gpu_flattened_payload_from_proto(pred: object, img: object, proto: object) -> Optional['GpuFlattenedRetinaPayload']:
-    """v13.3.0 (R9): build the flattened union payload at PROTO resolution.
+    """Build the flattened union payload at PROTO resolution.
 
-    Instead of letting Ultralytics materialize the (n, imgsz, imgsz) float retina stack that the
-    pipeline immediately reduces to one plane, the per-instance mask logits are combined from
-    the protos, box-cropped at proto scale, reduced with a single max-logit plane, and ONE plane
-    is bilinearly upsampled to the network raster and thresholded at 0 (union(bilinear(l_i)>0)
-    becomes bilinear(max_i l_i)>0 — identical away from instance box edges, sub-voxel there).
-    Instance-level --min_conf (single-angle fast path) and the optional per-pixel max-confidence
-    plane are applied at proto resolution. Returns None on any unexpected condition so the
-    caller falls back to the unpatched Ultralytics path.
-    """
+ Instead of letting Ultralytics materialize the (n, imgsz, imgsz) float retina stack that the
+ pipeline immediately reduces to one plane, the per-instance mask logits are combined from
+ the protos, box-cropped at proto scale, reduced with a single max-logit plane, and ONE plane
+ is bilinearly upsampled to the network raster and thresholded at 0 (union(bilinear(l_i)>0)
+ becomes bilinear(max_i l_i)>0 — identical away from instance box edges, sub-voxel there).
+ Instance-level --min_conf (single-angle fast path) and the optional per-pixel max-confidence
+ plane are applied at proto resolution. Returns None on any unexpected condition so the
+ caller falls back to the unpatched Ultralytics path."""
     try:
         import torch  # type: ignore
         import torch.nn.functional as F  # type: ignore
@@ -9451,13 +9200,12 @@ def _build_gpu_flattened_payload_from_proto(pred: object, img: object, proto: ob
 
 
 def ensure_gpu_retina_proto_union_predictor_patch() -> bool:
-    """v13.3.0 (R9): patch Ultralytics segmentation postprocess for GPU retina mode.
+    """Patch Ultralytics segmentation postprocess for GPU retina mode.
 
-    Mirrors ensure_cpu_retina_mask_predictor_patch: construct_result returns a lightweight
-    Results carrying a prebuilt GpuFlattenedRetinaPayload (union computed at proto resolution)
-    instead of an (n, imgsz, imgsz) retina-mask stack. Any failure falls back per-frame to the
-    original Ultralytics construct_result.
-    """
+ Mirrors ensure_cpu_retina_mask_predictor_patch: construct_result returns a lightweight
+ Results carrying a prebuilt GpuFlattenedRetinaPayload (union computed at proto resolution)
+ instead of an (n, imgsz, imgsz) retina-mask stack. Any failure falls back per-frame to the
+ original Ultralytics construct_result."""
     global _ULTRALYTICS_GPU_PROTO_UNION_PATCHED
 
     if cpu_retina_masks_enabled() or not gpu_retina_proto_union_enabled():
@@ -9496,16 +9244,7 @@ def ensure_gpu_retina_proto_union_predictor_patch() -> bool:
 def _affine_theta_for_grid_sample(
     M_out_to_native: np.ndarray, out_size: int, native_h: int, native_w: int,
 ) -> np.ndarray:
-    """Convert a cv2 pixel-space affine into a torch affine_grid theta (align_corners=False).
-
-    cv2.warpAffine(src(out_size,out_size), M_out_to_native, dsize=(native_w, native_h)) maps each
-    native output pixel back to a source (out-size) pixel using the inverse of M_out_to_native, then
-    samples (nearest). torch.nn.functional.affine_grid expects theta to map normalized OUTPUT coords
-    to normalized INPUT coords. theta = N_in @ Minv_pix @ P_out, where:
-      P_out : normalized native output -> native output pixel
-      Minv_pix : native output pixel -> source (out-size) pixel (inverse of M_out_to_native)
-      N_in : source pixel -> normalized source coords
-    """
+    """Convert a pixel-space output-to-native affine into an ``affine_grid`` theta matrix using ``align_corners=False`` conventions."""
     M = np.asarray(M_out_to_native, dtype=np.float64).reshape(2, 3)
     M3 = np.vstack([M, [0.0, 0.0, 1.0]])
     Minv = np.linalg.inv(M3)  # native pixel -> out-size source pixel (3x3)
@@ -9531,13 +9270,12 @@ def _affine_theta_for_grid_sample(
 def _affine_theta_from_dst_to_src(
     M_dst_to_src: np.ndarray, src_h: int, src_w: int, dst_h: int, dst_w: int,
 ) -> np.ndarray:
-    """v13.3.0: theta for grid_sample given the dst-pixel -> src-pixel affine directly.
+    """Theta for grid_sample given the dst-pixel -> src-pixel affine directly.
 
-    Generalizes _affine_theta_for_grid_sample to non-square sources (used by the GPU render
-    engine, whose AffineSpec already stores M_out_to_src — no inversion needed). Matches
-    cv2.warpAffine(src, inv(M_dst_to_src), dsize=(dst_w, dst_h)) pixel-center conventions with
-    align_corners=False.
-    """
+ Generalizes _affine_theta_for_grid_sample to non-square sources (used by the GPU render
+ engine, whose AffineSpec already stores M_out_to_src — no inversion needed). Matches
+ cv2.warpAffine(src, inv(M_dst_to_src), dsize=(dst_w, dst_h)) pixel-center conventions with
+ align_corners=False."""
     M3 = np.vstack([np.asarray(M_dst_to_src, dtype=np.float64).reshape(2, 3), [0.0, 0.0, 1.0]])
     dh = float(dst_h)
     dw = float(dst_w)
@@ -9558,7 +9296,7 @@ def _affine_theta_from_dst_to_src(
 
 
 def _warp_matrix_is_identity(M: np.ndarray, atol: float = 1e-5) -> bool:
-    """v13.3.0 (R8): True when a cv2-style 2x3 affine is the identity within tolerance."""
+    """True when a cv2-style 2x3 affine is the identity within tolerance."""
     try:
         m = np.asarray(M, dtype=np.float64).reshape(2, 3)
     except Exception:
@@ -9570,13 +9308,13 @@ def _warp_matrix_is_identity(M: np.ndarray, atol: float = 1e-5) -> bool:
     )
 
 
-# v13.3.0 (R8): affine grids are constant per (matrix, geometry, device) — one small LRU
+# affine grids are constant per (matrix, geometry, device) — one small LRU
 # replaces a fresh full-resolution affine_grid allocation per frame.
 _AFFINE_GRID_CACHE: 'OrderedDict[Tuple[object, ...], object]' = OrderedDict()
 _AFFINE_GRID_CACHE_LOCK = threading.Lock()
 
 
-# T3: a tile-group task cycles through one grid per tile (plus one per tile for the
+# a tile-group task cycles through one grid per tile (plus one per tile for the
 # mask warp back to crop space), so the default 12-entry LRU would thrash. The tile path
 # raises this floor once, from the task's own tile count.
 _AFFINE_GRID_CACHE_MIN_ENTRIES = 0
@@ -9626,7 +9364,7 @@ def _get_cached_affine_grid(theta_np: np.ndarray, dst_h: int, dst_w: int, device
     return grid
 
 
-# v13.3.0 (R18): per-thread side stream + pinned staging buffers for the GPU postprocess tail.
+# per-thread side stream + pinned staging buffers for the GPU postprocess tail.
 _GPU_POSTPROCESS_TLS = threading.local()
 
 
@@ -9654,9 +9392,8 @@ def _gpu_postprocess_side_stream(torch_mod: object, device: object) -> Optional[
 def _tensor_to_host_numpy(torch_mod: object, tensor: object, stream: Optional[object]) -> np.ndarray:
     """Copy a small device tensor to host, via this thread's pinned staging buffer when enabled.
 
-    The returned array aliases a per-thread reusable pinned buffer (one per dtype); callers must
-    consume it before requesting another transfer of the same dtype on the same thread.
-    """
+ The returned array aliases a per-thread reusable pinned buffer (one per dtype); callers must
+ consume it before requesting another transfer of the same dtype on the same thread."""
     t = tensor.contiguous()
     if not gpu_postprocess_pinned_d2h_enabled():
         return t.cpu().numpy()
@@ -9685,17 +9422,9 @@ def _tensor_to_host_numpy(torch_mod: object, tensor: object, stream: Optional[ob
 def _torch_warp_planes_to_native(
     planes: 'Sequence[object]', M_out_to_native: np.ndarray, out_size: int, native_h: int, native_w: int,
 ) -> 'List[object]':
-    """v13.1.0 (#2.2): nearest affine warp of one or more co-located planes to view-native space.
-
-    Each plane is a torch tensor (Hr, Wr) on the same device/shape; planes are resized to
-    (out_size, out_size) with nearest sampling if needed, stacked on the channel axis, and warped to
-    (native_h, native_w) with a SINGLE grid_sample (nearest, zero-padded). Matches
-    cv2.warpAffine(..., INTER_NEAREST, BORDER_CONSTANT, 0) up to half-pixel rounding ties.
-    v13.3.0 (R8): identity warps (native == out and M == I, e.g. every imgsz-folded radial frame
-    at --angle 0) skip the sample entirely, and non-identity warps reuse one cached grid per
-    (matrix, geometry) instead of rebuilding a full-resolution affine_grid per frame. Returns a
-    list of float32 (native_h, native_w) tensors on the device.
-    """
+    """Warp one or more co-located CUDA planes into view-native space.
+    
+    Identity transforms return the prepared planes directly; other transforms share a cached nearest-sampling grid."""
     import torch  # type: ignore
     import torch.nn.functional as F  # type: ignore
     prepared = []
@@ -9722,9 +9451,8 @@ def _torch_warp_planes_to_native(
 def _min_radius_filter_ndimage(xp, ndi, mask_bool, min_radius: float):
     """Backend-agnostic --min_radius filter mirroring _filter_connected_components_by_min_radius_scipy.
 
-    Works with (numpy, scipy.ndimage) on the CPU or (cupy, cupyx.scipy.ndimage) on the GPU. Keeps
-    connected components whose maximum distance-transform value (radius) is >= min_radius.
-    """
+ Works with (numpy, scipy.ndimage) on the CPU or (cupy, cupyx.scipy.ndimage) on the GPU. Keeps
+ connected components whose maximum distance-transform value (radius) is >= min_radius."""
     if float(min_radius) <= 0.0:
         return mask_bool
     structure = xp.ones((3, 3), dtype=bool)
@@ -9756,15 +9484,9 @@ def _try_import_cupy_ndimage():
 
 
 def _try_flatten_gpu_retina_result(r, masks_data: object) -> Optional[GpuFlattenedRetinaPayload]:
-    """v13.1.0 (#2.2/#2.3): reduce a GPU retina-mask stack to GPU-resident union + max-conf planes.
-
-    masks_data is r.masks.data, expected to be a torch tensor of shape (n, Hr, Wr). The union (OR)
-    and per-pixel max confidence are computed on the GPU and KEPT on the GPU so the affine warp to
-    view-native space (and, for the single-angle fast path, --min_radius) can also run on
-    the GPU. When the single-angle fast path is active (#2.3), instances below --min_conf are dropped
-    on the GPU before the reduction so the union is already confidence-filtered. Returns None on any
-    unexpected condition so the caller falls back to the legacy whole-stack copy.
-    """
+    """Reduce a GPU retina-mask stack to a device-resident union and optional confidence plane.
+    
+    Returns ``None`` on unsupported layouts so the caller can use the ordinary result path."""
     try:
         import torch  # type: ignore
     except Exception:
@@ -9782,7 +9504,7 @@ def _try_flatten_gpu_retina_result(r, masks_data: object) -> Optional[GpuFlatten
         fastpath = single_angle_gpu_fastpath()
         fastpath_min_conf = None if fastpath is None else float(fastpath[0])
         fastpath_min_radius = 0.0 if fastpath is None else float(fastpath[1])
-        # v13.3.0 (R8): the per-frame retina GPU hole fill is gone; a completed-view
+        # the per-frame retina GPU hole fill is gone; a completed-view
         # pass or eligible task-end device-union pass fills once in spec order.
         # This frame cleanup therefore has work only for positive --min_radius.
         run_gpu_cleanup = bool(
@@ -9805,7 +9527,7 @@ def _try_flatten_gpu_retina_result(r, masks_data: object) -> Optional[GpuFlatten
 
         masks_bool = masks > 0
 
-        # #2.3 single-angle fast path: drop low-confidence instances on the GPU (exact --min_conf at
+        # single-angle fast path: drop low-confidence instances on the GPU (exact --min_conf at
         # instance granularity) before the union/flatten.
         min_conf_applied = False
         if (
@@ -9821,7 +9543,7 @@ def _try_flatten_gpu_retina_result(r, masks_data: object) -> Optional[GpuFlatten
             min_conf_applied = True
 
         if n <= 0:
-            # v13.2.5 (speed #7): an empty frame needs no zero planes, no warp, no GPU cleanup,
+            # an empty frame needs no zero planes, no warp, no GPU cleanup,
             # and no D2H — union_gpu=None short-circuits the frame processor immediately.
             return GpuFlattenedRetinaPayload(
                 union_gpu=None, conf_gpu=None, instance_count=0,
@@ -9830,10 +9552,10 @@ def _try_flatten_gpu_retina_result(r, masks_data: object) -> Optional[GpuFlatten
             )
 
         union_gpu = masks_bool.any(dim=0).to(torch.float32)  # (h, w) 0/1
-        # v13.2.5 (speed #7): with --min_conf 0 no confidence volume exists anywhere downstream,
+        # with --min_conf 0 no confidence volume exists anywhere downstream,
         # so skip the per-frame (n,H,W) float transient + amax reduction entirely.
         if confs_t is not None and gpu_flatten_conf_tracking_enabled():
-            # Out-of-place clamp: confs_t may be a view onto r.boxes.conf (detach()/to()/reshape()
+            # Out-of-place clamp: confs_t may be a view onto r.boxes.conf (detach/to/reshape
             # can share storage), so never mutate it in place.
             cf = confs_t.clamp(0.0, 1.0)
             # Per-pixel max confidence among covering instances (pre-quantization, in [0,1]). quantize
@@ -9842,7 +9564,7 @@ def _try_flatten_gpu_retina_result(r, masks_data: object) -> Optional[GpuFlatten
             conf_gpu = (cf.view(-1, 1, 1) * masks_bool).amax(dim=0)
         else:
             conf_gpu = None
-        # v13.3.0 (R18): record readiness on the producing stream so the postprocess side
+        # record readiness on the producing stream so the postprocess side
         # stream can wait on the event instead of the whole default stream.
         ready_event = None
         try:
@@ -9863,7 +9585,7 @@ def _try_flatten_gpu_retina_result(r, masks_data: object) -> Optional[GpuFlatten
 
 def _extract_result_masks_and_confs(r) -> Tuple[Optional[object], Optional[np.ndarray]]:
     """Detach one streamed YOLO result into CPU-owned data for asynchronous postprocess."""
-    # v13.3.0 (R9): the GPU proto-union construct_result patch attaches a prebuilt flattened
+    # the GPU proto-union construct_result patch attaches a prebuilt flattened
     # payload (union already reduced at proto resolution); nothing remains to extract.
     prebuilt_payload = getattr(r, '_tta_gpu_flattened_payload', None)
     if isinstance(prebuilt_payload, GpuFlattenedRetinaPayload):
@@ -9883,7 +9605,7 @@ def _extract_result_masks_and_confs(r) -> Tuple[Optional[object], Optional[np.nd
 
     masks_data = r.masks.data  # (n,h,w)
 
-    # v13.1.0 (#2.2/#2.3): in GPU retina mode, flatten (n,H,W) -> union + max-conf on the GPU and copy
+    # in GPU retina mode, flatten (n,H,W) -> union + max-conf on the GPU and copy
     # only those 2 planes. The flattened payload carries its own confidence plane, so the second
     # return value is None. Falls back to the legacy whole-stack copy below on any failure.
     if gpu_retina_flatten_enabled() and not cpu_retina_masks_enabled():
@@ -9979,39 +9701,37 @@ def _process_cpu_retina_prediction_frame(
 
 
 def gpu_device_union_enabled() -> bool:
-    """v13.3.2 (R21): accumulate per-task native unions on device; one chunked D2H per task."""
+    """Accumulate per-task native unions on device; one chunked D2H per task."""
     return _env_flag('YOLO_TTA_GPU_DEVICE_UNION', True)
 
 
 def gpu_device_hole_fill_enabled() -> bool:
-    """v13.3.3 (S2): 2D-hole-fill the per-task device union on the GPU before the flush.
+    """2D-hole-fill the per-task device union on the GPU before the flush.
 
-    Valid only when --min_conf and --min_radius have no work (spec order is conf -> radius ->
-    hole fill) and every frame of the task accumulated on device; the scheduler additionally
-    skips the CPU per-view hole-fill pass only when EVERY slice of the view was device-filled.
-    """
+ Valid only when --min_conf and --min_radius have no work (spec order is conf -> radius ->
+ hole fill) and every frame of the task accumulated on device; the scheduler additionally
+ skips the CPU per-view hole-fill pass only when EVERY slice of the view was device-filled."""
     return _env_flag('YOLO_TTA_GPU_HOLE_FILL', True)
 
 
 def gpu_union_flush_overlap_enabled() -> bool:
     """Retire a CUDA-worker task union on a background D2H/host-copy lane.
 
-    Each worker keeps at most one retiring accumulator while its main thread starts the next
-    task with a fresh accumulator. Result publication waits for retirement to complete.
-    """
+ Each worker keeps at most one retiring accumulator while its main thread starts the next
+ task with a fresh accumulator. Result publication waits for retirement to complete."""
     return _env_flag('YOLO_TTA_GPU_UNION_FLUSH_OVERLAP', True)
 
 
-# v15.0.3 fix: process-wide mutual exclusion between CUDA graph capture and every other
+# process-wide mutual exclusion between CUDA graph capture and every other
 # CUDA-touching thread in this process.
 #
-# torch.cuda.graph() defaults to capture_error_mode='global'. Under that mode ANY thread
+# torch.cuda.graph defaults to capture_error_mode='global'. Under that mode ANY thread
 # that issues a capture-unsafe call (cudaEventSynchronize, cudaStreamSynchronize,
-# cudaStreamCreate, cudaEventCreate, cudaHostAlloc, ...) while a capture is live fails with
+# cudaStreamCreate, cudaEventCreate, cudaHostAlloc,...) while a capture is live fails with
 # cudaErrorStreamCaptureUnsupported — and the error surfaces in the innocent thread, not the
 # capturing one. The device-union flush executor does exactly that: _DeviceUnionAccumulator
 # .flush_into allocates a pinned buffer, creates a stream and two events, and calls
-# Event.synchronize() per chunk. Whenever a flush overlapped a resident-ring or fused-render
+# Event.synchronize per chunk. Whenever a flush overlapped a resident-ring or fused-render
 # capture the flush thread raised and the task was reported as a worker failure.
 #
 # Hold this lock for the duration of every capture and around the flush path's CUDA section
@@ -10051,7 +9771,7 @@ def _shutdown_gpu_union_flush_executor() -> None:
             executor.shutdown(wait=True)
 
 
-# v13.3.3 (S2): reusable pinned staging buffers for device-union flushes. The old path did one
+# reusable pinned staging buffers for device-union flushes. The old path did one
 # ~chunk-sized cudaHostAlloc + free per task (~70 tasks x ~0.6 GB); this keeps a small pool per
 # process (workers flush one task at a time, so the pool normally holds a single buffer).
 _PINNED_U8_BUFFER_POOL: List[object] = []
@@ -10080,21 +9800,9 @@ def _release_pinned_u8_buffer(buf: object) -> None:
 
 
 class _DeviceUnionAccumulator:
-    """v13.3.2 (R21): per-task on-device native-space union (+confmap) accumulation.
-
-    Postprocess side-stream threads write each frame's warped native plane into a
-    device-resident uint8 volume slice instead of a per-frame pinned D2H + host ``|=``; the task
-    then performs ONE chunked pinned D2H into the host result windows. Each slice index is
-    written at most once per task (single-angle contract; padded synthetic frames repeat a real
-    slice with identical content), so plain assignment is race-free across threads.
-
-    v13.3.3 (S2): per-slice ``written`` tracking makes the flush precise — device-written slices
-    are plain-copied (their destination rows started zeroed and nothing else wrote them),
-    slices that fell back to host processing are skipped (their device rows are zero, and the
-    host write already happened) — and the flush ping-pongs two halves of a pooled pinned
-    buffer so the D2H of chunk i+1 overlaps the host merge of chunk i. ``fill_holes_2d`` can
-    hole-fill the accumulated union on device before the flush (see gpu_device_hole_fill_enabled).
-    """
+    """Accumulate one task's native mask and confidence slices on the GPU.
+    
+    Written slices flush through bounded pinned chunks; any host fallback disables device-only hole-fill assumptions."""
 
     def __init__(self, torch_mod: object, device: object, num_frames: int, native_h: int, native_w: int, want_conf: bool) -> None:
         self.torch = torch_mod
@@ -10106,7 +9814,7 @@ class _DeviceUnionAccumulator:
             torch_mod.zeros((int(num_frames), int(native_h), int(native_w)), dtype=torch_mod.uint8, device=device)
             if bool(want_conf) else None
         )
-        # C3 device-compacted generic payloads write one scalar per slice. Static/legacy
+        # device-compacted generic payloads write one scalar per slice. Static/legacy
         # payloads leave zero here and continue returning their host-known stats normally.
         self.prediction_counts_dev = torch_mod.zeros(
             (int(num_frames),), dtype=torch_mod.int32, device=device,
@@ -10139,7 +9847,7 @@ class _DeviceUnionAccumulator:
         self.written[int(idx)] = True
 
     def take_device_prediction_stats(self) -> Tuple[int, int]:
-        """Read C3 prediction/frame totals once after every side-stream frame has settled."""
+        """Read prediction/frame totals once after every side-stream frame has settled."""
         if self.prediction_counts_dev is None:
             return 0, 0
         try:
@@ -10154,15 +9862,14 @@ class _DeviceUnionAccumulator:
             return 0, 0
 
     def fill_holes_2d(self) -> int:
-        """v13.3.3 (S2): fill enclosed 2D background per accumulated slice, ON DEVICE, in place.
+        """Fill enclosed 2D background per accumulated slice, ON DEVICE, in place.
 
-        One cupy ``label`` call per sub-block with a z-disconnected structure (3x3x3 with only
-        the in-plane 4-neighbourhood set) labels every slice's background independently in a
-        single kernel pass; labels touching a slice border are background, the rest are holes.
-        Matches the CPU path's scipy/cv2 4-connected background semantics. Returns the number
-        of frames now hole-filled (== num_frames), or 0 when skipped or failed (any host-side
-        frame, cupy unavailable, VRAM pressure, or any error -> the CPU per-view pass runs).
-        """
+ One cupy ``label`` call per sub-block with a z-disconnected structure (3x3x3 with only
+ the in-plane 4-neighbourhood set) labels every slice's background independently in a
+ single kernel pass; labels touching a slice border are background, the rest are holes.
+ Matches the CPU path's scipy/cv2 4-connected background semantics. Returns the number
+ of frames now hole-filled (== num_frames), or 0 when skipped or failed (any host-side
+ frame, cupy unavailable, VRAM pressure, or any error -> the CPU per-view pass runs)."""
         torch = self.torch
         if self.union_dev is None:
             return 0
@@ -10223,16 +9930,10 @@ class _DeviceUnionAccumulator:
                 pass
 
     def compute_slice_metadata(self) -> Optional[Dict[str, np.ndarray]]:
-        """v13.3.6 (D1): per-slice foreground metadata from the device union, pre-flush.
+        """Return compact per-slice foreground metadata from the device union.
 
-        Two device reductions over the resident union yield per-slice any flags, bboxes
-        (y0,y1,x0,x1; exclusive stops) and per-(slice,row) occupancy bits — a few hundred
-        KB D2H that lets downstream CPU stages (labeling, foreground gates, the radial
-        backprojection occupancy scan) skip whole read passes over the union memmaps.
-        Frames that fell back to host writes make the device rows unrepresentative, so any
-        host_written task returns None (consumers fall back to scanning). Call AFTER
-        fill_holes_2d (holes are enclosed, so the metadata is identical either way, but
-        the ordering keeps the contract obvious).
+        Host-written fallback frames return ``None`` because their device rows are
+        incomplete. Call after device hole filling and before the task flush.
         """
         torch = self.torch
         if self.union_dev is None or bool(self.host_written):
@@ -10278,7 +9979,7 @@ class _DeviceUnionAccumulator:
         synchronize_device: bool = True,
     ) -> None:
         torch = self.torch
-        # The synchronous path orders every side stream here. G8 seals on the worker thread
+        # The synchronous path orders every side stream here. seals on the worker thread
         # before submitting this method, so the retirement thread must not device-sync and
         # accidentally wait on kernels from the NEXT task.
         if bool(synchronize_device):
@@ -10287,8 +9988,8 @@ class _DeviceUnionAccumulator:
         chunk = max(1, min(int(chunk_slices), n))
         plane = int(h) * int(w)
         written = self.written
-        # v15.0.3 fix: every CUDA call below — the pinned cudaHostAlloc, the stream and event
-        # creations, and the per-chunk Event.synchronize() — is capture-unsafe. Under
+        # every CUDA call below — the pinned cudaHostAlloc, the stream and event
+        # creations, and the per-chunk Event.synchronize — is capture-unsafe. Under
         # capture_error_mode='global' any of them raises cudaErrorStreamCaptureUnsupported if a
         # graph capture is live on ANOTHER thread. Serialize against capture for the whole
         # section rather than the synchronize alone: an unguarded gap between chunks would let a
@@ -10348,7 +10049,7 @@ class _DeviceUnionAccumulator:
 def _try_create_device_union_accumulator(
     device_str: str, num_frames: int, native_h: int, native_w: int, *, want_conf: bool,
 ) -> Optional[_DeviceUnionAccumulator]:
-    """v13.3.2 (R21): build the per-task device union when VRAM allows; None -> per-frame D2H."""
+    """Build the per-task device union when VRAM allows; None -> per-frame D2H."""
     if not gpu_device_union_enabled():
         return None
     try:
@@ -10377,19 +10078,9 @@ def _process_gpu_flattened_prediction_frame(
     slice_lock: Optional[threading.Lock] = None,
     device_union: Optional[_DeviceUnionAccumulator] = None,
 ) -> Tuple[int, int]:
-    """v13.1.0 (#2.2/#2.3): accumulate a GPU-flattened retina frame, warping (and optionally cleaning) on the GPU.
-
-    The (n,Hr,Wr) stack was already reduced on the GPU to a union plane and a max-confidence plane.
-    Here both planes are warped to view-native space ON THE GPU (#2.2: no CPU warp, no per-instance
-    loop; v13.3.0 R8: identity warps skipped, grids cached) and, for the single-angle fast path
-    (#2.3), a positive --min_radius runs on the GPU (cupy) on the native union before the host
-    copy; in that case cleanup_done_on_gpu is set so the per-slice CPU streaming cleanup is
-    skipped. v13.3.0 (R8): the per-frame retina GPU 2D hole fill is removed; a completed-view
-    pass, or the eligible task-end device-union pass, performs it once in spec order.
-    v13.3.0 (R18): all of this runs on a
-    per-thread side CUDA stream with pinned D2H staging. Falls back to a CPU warp (and CPU
-    cleanup) if the GPU warp path raises, so results are always produced.
-    """
+    """Accumulate one GPU-flattened retina result into native view space.
+    
+    Union and confidence planes stay on a side CUDA stream through warp and optional radius cleanup. Eligible tasks write directly into the device union; host fallback preserves output on any GPU-path failure. Hole filling remains a completed-view or task-end operation."""
     instance_count = max(0, int(payload.instance_count))
     union_gpu = payload.union_gpu
     if union_gpu is None:
@@ -10405,7 +10096,7 @@ def _process_gpu_flattened_prediction_frame(
         if not gpu_retina_warp_enabled():
             raise RuntimeError('gpu retina warp disabled')
 
-        # v13.3.0 (R18): the whole postprocess tail runs on this thread's side CUDA stream,
+        # the whole postprocess tail runs on this thread's side CUDA stream,
         # ordered against the producer via the payload's recorded event, so warp/quantize/D2H
         # no longer serialize with TensorRT kernel issue on the default stream.
         device = getattr(union_gpu, 'device', None)
@@ -10435,7 +10126,7 @@ def _process_gpu_flattened_prediction_frame(
 
             # Warp union (and conf) to view-native space on the GPU (nearest, zero-padded). Both
             # planes share one grid_sample; identity warps skip it entirely and non-identity
-            # warps reuse a cached grid (v13.3.0 R8).
+            # warps reuse a cached grid.
             warp_conf = bool(track_conf and payload.conf_gpu is not None)
             warped = _torch_warp_planes_to_native(
                 [union_gpu, payload.conf_gpu] if warp_conf else [union_gpu],
@@ -10454,7 +10145,7 @@ def _process_gpu_flattened_prediction_frame(
                     torch.zeros((), dtype=native_conf_f.dtype, device=native_conf_f.device),
                 ).clamp(0.0, 255.0).to(torch.uint8)
 
-            # v13.3.2 (R21): with a per-task device union, the warped plane stays ON DEVICE —
+            # with a per-task device union, the warped plane stays ON DEVICE —
             # no per-frame D2H, no host |=; the task-end flush does one chunked transfer.
             # Frames that still need the cupy --min_radius cleanup (which lands on host) fall
             # through to the legacy path; the flush's OR/max merge keeps both consistent.
@@ -10474,7 +10165,7 @@ def _process_gpu_flattened_prediction_frame(
                     return 0, 0  # task-end device reduction supplies both stats
                 return int(instance_count), (1 if int(instance_count) > 0 else 0)
 
-            # #2.3 / v13.3.0 (R8): connected-component --min_radius on the GPU (cupy), in native
+            # connected-component --min_radius on the GPU (cupy), in native
             # space, only when a positive radius is set. The old per-frame retina 2D
             # hole fill (cupyx binary_fill_holes, an iterative-dilation kernel/sync
             # storm) is removed: the completed-view or eligible task-end device-union
@@ -10503,7 +10194,7 @@ def _process_gpu_flattened_prediction_frame(
                         native_union_np = None  # fall back to torch->cpu union, CPU cleanup downstream
 
             if native_union_np is None:
-                # v13.3.0 (R18): D2H through this thread's pinned staging buffer (non-blocking
+                # D2H through this thread's pinned staging buffer (non-blocking
                 # copy + stream sync); copy out immediately since the buffer is reused per frame.
                 native_union_np = np.ascontiguousarray(
                     _tensor_to_host_numpy(torch, native_union_bool_t, side_stream)
@@ -10563,7 +10254,7 @@ def _process_gpu_flattened_prediction_frame(
             conf_slice = view_confmap_mm[int(idx)]
             np.maximum(conf_slice, native_conf_np, out=conf_slice)
 
-    # v13.3.3 (S2): this frame bypassed the device union (cupy cleanup or CPU fallback) and
+    # this frame bypassed the device union (cupy cleanup or CPU fallback) and
     # writes the host window directly — the device-side hole fill must stand down for this task.
     if device_union is not None:
         device_union.mark_host_write()
@@ -10606,7 +10297,7 @@ def _process_prediction_frame(
         )
 
     if isinstance(masks_np, CpuRetinaMaskPayload):
-        # v13.3.3 (S2): host-side accumulation path — device hole fill stands down for the task.
+        # host-side accumulation path — device hole fill stands down for the task.
         if device_union is not None:
             device_union.mark_host_write()
         return _process_cpu_retina_prediction_frame(
@@ -10626,7 +10317,7 @@ def _process_prediction_frame(
     masks_arr = np.asarray(masks_np)
     if masks_arr.ndim != 3 or int(masks_arr.shape[0]) <= 0:
         return 0, 0
-    # v13.3.3 (S2): raw retina-stack frames accumulate host-side below.
+    # raw retina-stack frames accumulate host-side below.
     if device_union is not None:
         device_union.mark_host_write()
 
@@ -10690,9 +10381,9 @@ def _process_prediction_frame(
     return int(num_inst), 1
 
 
-# --------------------------
-# v13.3.6 (C2): direct backend execution loop (no Ultralytics stream_inference)
-# --------------------------
+#
+# direct backend execution loop (no Ultralytics stream_inference)
+#
 # On the GPU proto-union fast path, model.predict(stream=True) contributes only per-batch
 # generator plumbing (source bookkeeping, callbacks, and Profile stage timers that call
 # torch.cuda.synchronize on CUDA), ops.non_max_suppression at iou=1.0 (which can never
@@ -10732,11 +10423,7 @@ def resident_trt_native_warp_enabled() -> bool:
 
 
 def _cuda_stream_priority(torch_mod: object, *, high: bool) -> int:
-    """Return a supported CUDA stream priority, tolerating older torch builds.
-
-    torch reports ``(least_priority, greatest_priority)``; CUDA uses smaller numeric
-    values for higher priority.  A zero priority is universally valid.
-    """
+    """Return a supported CUDA stream priority, using zero when the runtime does not expose a priority range."""
     try:
         least, greatest = torch_mod.cuda.get_stream_priority_range()
         return int(greatest if bool(high) else least)
@@ -10772,16 +10459,16 @@ class _ResidentGpuPipelineSlot:
             dtype=input_dtype,
             device=device,
         )
-        # Stable metadata address for P4 renderer launches. A one-thread setter kernel
+        # Stable metadata address for renderer launches. A one-thread setter kernel
         # updates its value on the render stream without a reusable-host-buffer race.
         self.render_meta = torch_mod.empty((2,), dtype=torch_mod.int32, device=device)
         # Distinct high-priority streams allow the two TensorRT execution contexts to
-        # overlap.  Mask decode/quantize/union uses a third, ordinary-priority stream.
+        # overlap. Mask decode/quantize/union uses a third, ordinary-priority stream.
         high_priority = _cuda_stream_priority(torch_mod, high=True)
         low_priority = _cuda_stream_priority(torch_mod, high=False)
         self.infer_stream = torch_mod.cuda.Stream(device=device, priority=high_priority)
         self.post_stream = torch_mod.cuda.Stream(device=device, priority=low_priority)
-        # Events are allocated once and re-recorded.  render_done protects input reads,
+        # Events are allocated once and re-recorded. render_done protects input reads,
         # infer_done protects input reuse, and post_done protects output-binding reuse.
         self.render_done = torch_mod.cuda.Event(enable_timing=False, blocking=False)
         self.infer_done = torch_mod.cuda.Event(enable_timing=False, blocking=False)
@@ -10810,7 +10497,7 @@ class _ResidentGpuPipelineSlot:
         self.render_expected_key = None
         # Keep zero-copy cupy array views alive for the lifetime of captured graphs.
         self._cupy_refs: Dict[str, object] = {}
-        # P4 renderer views are separate from postprocess graph views: the latter mapping
+        # renderer views are separate from postprocess graph views: the latter mapping
         # is rebuilt by _ResidentTensorRTRingExecutor after the slots are allocated.
         self._render_cupy_refs: Dict[str, object] = {}
 
@@ -10822,11 +10509,10 @@ _RESIDENT_MASK_KERNELS_FAILED = False
 def _resident_mask_kernels() -> Optional[object]:
     """Compile the small device compaction/proto-union kernels once with NVRTC.
 
-    The compaction count remains in device memory.  The following proto kernel reads
-    that count directly, so there is no per-frame ``nonzero()``, ``tolist()`` or count
-    readback.  CuPy is already an optional dependency of the GPU cleanup path; failure
-    to import/compile it simply disables this stricter fast path.
-    """
+ The compaction count remains in device memory. The following proto kernel reads
+ that count directly, so there is no per-frame ``nonzero``, ``tolist`` or count
+ readback. CuPy is already an optional dependency of the GPU cleanup path; failure
+ to import/compile it simply disables this stricter fast path."""
     global _RESIDENT_MASK_KERNELS, _RESIDENT_MASK_KERNELS_FAILED
     if _RESIDENT_MASK_KERNELS is not None:
         return _RESIDENT_MASK_KERNELS
@@ -11012,10 +10698,9 @@ def _resident_mask_kernels() -> Optional[object]:
 class _DirectPredictResult:
     """Minimal per-frame result for the direct loop.
 
-    Duck-typed for _extract_result_masks_and_confs: it only carries the prebuilt
-    GpuFlattenedRetinaPayload; no Ultralytics Results object, boxes, paths, or orig
-    images are constructed.
-    """
+ Duck-typed for _extract_result_masks_and_confs: it only carries the prebuilt
+ GpuFlattenedRetinaPayload; no Ultralytics Results object, boxes, paths, or orig
+ images are constructed."""
 
     __slots__ = ('_tta_gpu_flattened_payload',)
 
@@ -11044,11 +10729,10 @@ def _direct_predict_applicable(cfg: 'PredictConfig') -> bool:
 def _ensure_predictor_for_direct_predict(model: object, cfg: 'PredictConfig') -> Optional[object]:
     """Create/fetch the Ultralytics predictor + backend without running stream_inference.
 
-    Model.predict(..., stream=True) constructs the predictor and calls setup_model
-    (AutoBackend load and device/precision placement) eagerly but returns an UNITERATED generator,
-    so no source setup, warmup, or inference runs. The predictor's (patched) preprocess and
-    its AutoBackend are then driven directly by _direct_predict_stream.
-    """
+ Model.predict(..., stream=True) constructs the predictor and calls setup_model
+ (AutoBackend load and device/precision placement) eagerly but returns an UNITERATED generator,
+ so no source setup, warmup, or inference runs. The predictor's (patched) preprocess and
+ its AutoBackend are then driven directly by _direct_predict_stream."""
     try:
         predictor = getattr(model, 'predictor', None)
         if predictor is None or getattr(predictor, 'model', None) is None:
@@ -11087,11 +10771,10 @@ def _ensure_predictor_for_direct_predict(model: object, cfg: 'PredictConfig') ->
 def _split_segmentation_backend_outputs(preds: object) -> Optional[Tuple[object, object]]:
     """Return (head, protos) from a raw segmentation forward.
 
-    Mirrors SegmentationPredictor.postprocess's output handling: preds[0] is the
-    (B, 4+nc+nm, A) detection head, preds[1] the (B, nm, mh, mw) prototype tensor (torch
-    .pt backends nest it as the last element of a tuple). None when the structure does not
-    match, so the caller can fail fast instead of mis-decoding.
-    """
+ Mirrors SegmentationPredictor.postprocess's output handling: preds[0] is the
+ (B, 4+nc+nm, A) detection head, preds[1] the (B, nm, mh, mw) prototype tensor (torch
+.pt backends nest it as the last element of a tuple). None when the structure does not
+ match, so the caller can fail fast instead of mis-decoding."""
     try:
         if not isinstance(preds, (list, tuple)) or len(preds) < 2:
             return None
@@ -11124,10 +10807,9 @@ def _build_direct_device_compacted_payload(
 ) -> Optional[GpuFlattenedRetinaPayload]:
     """Build one flattened mask using the resident kernels on the current CUDA stream.
 
-    Unlike the legacy direct path this never evaluates a data-dependent tensor shape on the
-    host. ``compact_count`` is consumed by the proto kernel in device memory and travels with
-    the payload for task-end accounting.
-    """
+ Unlike the legacy direct path this never evaluates a data-dependent tensor shape on the
+ host. ``compact_count`` is consumed by the proto kernel in device memory and travels with
+ the payload for task-end accounting."""
     if not direct_device_compaction_enabled():
         return None
     try:
@@ -11242,15 +10924,9 @@ def _direct_predict_stream(
     cfg: 'PredictConfig',
     source_label: str,
 ) -> Iterator[_DirectPredictResult]:
-    """v13.3.6 (C2): preprocess -> backend forward -> conf gate -> proto-union payload.
-
-    Yields one payload-carrying result per frame in stream order (synthetic padded frames
-    included, exactly like model.predict's per-frame Results). v13.3.12 C3 compacts the
-    confidence gate and consumes its count entirely on device; the old nonzero/bincount
-    readbacks remain only as an automatic capability fallback.
-    Instances are decoded to the post-NMS (n, 6+nm) layout the payload builder already
-    consumes: xyxy, conf, cls, mask coefficients — box-only, at network scale.
-    """
+    """Run the direct preprocess, backend-forward, confidence-gate, and proto-union loop.
+    
+    The loop preserves padded-frame accounting while avoiding per-frame Results and avoidable host count reads."""
     import torch  # type: ignore
 
     backend = getattr(predictor, 'model', None)
@@ -11339,9 +11015,9 @@ def _direct_predict_stream(
             else:
                 conf_all, cls_all = scores.max(dim=1)
             keep_mask = conf_all >= conf_thres  # (B, A)
-            nz = keep_mask.nonzero()  # host sync #1; row-major => grouped by image
+            nz = keep_mask.nonzero()  # host sync; row-major => grouped by image
             if int(nz.shape[0]) > 0:
-                counts = torch.bincount(nz[:, 0], minlength=bsz).tolist()  # host sync #2 (tiny)
+                counts = torch.bincount(nz[:, 0], minlength=bsz).tolist()  # host sync (tiny)
             else:
                 counts = [0] * bsz
             offset = 0
@@ -11396,15 +11072,14 @@ def predict_source_and_accumulate(
 ) -> Dict[str, object]:
     """Run YOLO predict(stream=True) on an in-memory source and accumulate native masks.
 
-    The predictor consumes ``InMemoryYoloVolumeSource`` instances in the v12 path,
-    so the GPU no longer reads augmented FFV1 videos from scratch.  CPU-side result
-    handling remains bounded by ``cpu_mask_postprocess_pending_limit`` and runs
-    behind the streamed GPU inference.  When the v12.2.8 single-angle cleanup
-    path is enabled, slice-local filtering is appended to the same streamed
-    postprocess unit so a completed prediction slice is already cleaned before
-    the full view volume has finished inferencing.
-    """
-    # v13.2.5 (speed #7): only compute the GPU flatten's max-conf plane when a confidence
+ The predictor consumes ``InMemoryYoloVolumeSource`` instances in the path,
+ so the GPU no longer reads augmented FFV1 videos from scratch. CPU-side result
+ handling remains bounded by ``cpu_mask_postprocess_pending_limit`` and runs
+ behind the streamed GPU inference. When the single-angle cleanup
+ path is enabled, slice-local filtering is appended to the same streamed
+ postprocess unit so a completed prediction slice is already cleaned before
+ the full view volume has finished inferencing."""
+    # only compute the GPU flatten's max-conf plane when a confidence
     # volume actually exists downstream.
     set_gpu_flatten_conf_tracking(view_confmap_mm is not None)
     ensure_yolo_ready_for_predict(model, cfg)
@@ -11422,7 +11097,7 @@ def predict_source_and_accumulate(
     )
     unwrapped_source = source
     source = maybe_wrap_source_with_gpu_input_staging(source, cfg, source_label)
-    # v13.2.2 bug #3: the call above may create a GpuPrefetchingYoloSource that nothing
+    # the call above may create a GpuPrefetchingYoloSource that nothing
     # else owns. If iteration is abandoned by an exception (model.predict setup, a
     # mid-stream CUDA error, a postprocess future failure), its producer thread and
     # VRAM-staged queue leaked for the life of the process. Close the wrapper created
@@ -11445,14 +11120,14 @@ def predict_source_and_accumulate(
             if not use_custom_cpu_retina:
                 print('Warning: CPU retina predictor patch unavailable; using Ultralytics native retina_masks=True for this source.')
         else:
-            # v13.3.0 (R9): GPU retina mode — reduce unions at proto resolution inside
+            # GPU retina mode — reduce unions at proto resolution inside
             # construct_result instead of materializing (n, imgsz, imgsz) retina stacks.
             ensure_gpu_retina_proto_union_predictor_patch()
 
         prediction_count = 0
         frames_with_predictions = 0
 
-        # v13.3.6 (C2): drive the backend directly on the proto-union fast path; fall back
+        # drive the backend directly on the proto-union fast path; fall back
         # to Ultralytics stream_inference when the direct loop's preconditions do not hold.
         results = None
         predictor_direct = None
@@ -11491,7 +11166,7 @@ def predict_source_and_accumulate(
         stream_min_radius = float(streaming_cleanup_min_radius)
         stream_min_conf_u8 = int(min_conf_to_u8_threshold(stream_min_conf)) if stream_min_conf > 0.0 else 0
 
-        # v13.3.2 (R21)/v13.3.12: per-task device union accumulation. A positive min_conf is
+        # per-task device union accumulation. A positive min_conf is
         # allowed because the single-angle proto/ring compactor applies it before union; a
         # positive min_radius still requires component cleanup and therefore retains the
         # per-frame fallback. VRAM-gated; None keeps the pinned-D2H path.
@@ -11524,8 +11199,8 @@ def predict_source_and_accumulate(
         # It consumes no Results objects and dispatches no per-frame Futures. Capability
         # rejection happens before source consumption and leaves ``results`` untouched.
         specialized_stats: Optional[Dict[str, int]] = None
-        # T3: the resident ring assumes one affine for the whole task, so a per-unit
-        # tile-group source is never eligible (it also declines on the source type).
+        # Tile groups share the resident source volume but carry one affine per tile;
+        # the fixed-affine resident TensorRT ring therefore remains ineligible.
         if predictor_direct is not None and M_out_to_native_by_unit is None:
             specialized_stats = _try_resident_trt_ring_accumulate(
                 predictor_direct, source, cfg,
@@ -11541,7 +11216,7 @@ def predict_source_and_accumulate(
                 prediction_count = int(specialized_stats['prediction_count'])
                 frames_with_predictions = int(specialized_stats['frames_with_predictions'])
 
-        # T3: a tile-group source flattens (frame, tile) into one index space, so the
+        # a tile-group source flattens (frame, tile) into one index space, so the
         # output->destination affine is per UNIT, not per source. unit_affine_count is the
         # tile count; index % count selects the tile that produced this unit.
         unit_affine_count = 0 if M_out_to_native_by_unit is None else int(len(M_out_to_native_by_unit))
@@ -11555,9 +11230,8 @@ def predict_source_and_accumulate(
                 if unit_affine_count > 0 else M_out_to_native
             )
             if isinstance(masks_obj, GpuFlattenedRetinaPayload):
-                # The payload builder only sees the process-global/native CLI radius. D6's
-                # destination may be a smaller canonical grid, so override it with this
-                # prediction source's already-scaled radius before GPU component cleanup.
+                # The payload builder sees only the process-global/native radius. Override it
+                # with this source's scaled processing-grid radius before GPU cleanup.
                 masks_obj.gpu_min_radius = float(stream_min_radius)
                 masks_obj.run_gpu_cleanup = bool(
                     single_angle_gpu_fastpath() is not None
@@ -11577,10 +11251,10 @@ def predict_source_and_accumulate(
                 slice_lock=slice_lock,
                 device_union=device_union,
             )
-            # v13.1.0 (#2.3): skip the per-slice CPU streaming cleanup when the GPU fast path already ran
-            # --min_conf + --min_radius + hole fill on this slice (cleanup_done_on_gpu is set by the frame
+            # skip the per-slice CPU streaming cleanup when the GPU fast path already ran
+            # min_conf + --min_radius + hole fill on this slice (cleanup_done_on_gpu is set by the frame
             # processor only when the on-GPU connected-component cleanup actually completed).
-            # v13.3.2 (R21): also skip it for device-accumulated frames — their host slice is
+            # also skip it for device-accumulated frames — their host slice is
             # written by the task-end flush, and this cleanup was gated to scan-only work anyway.
             if (
                 stream_cleanup
@@ -11608,7 +11282,7 @@ def predict_source_and_accumulate(
                 pass
             return _process_prediction_unit(int(idx_i), masks_np, confs_np)
 
-        # v13.1.0 (#2.2): on the GPU-flatten path, eagerly reduce each (n,Hr,Wr) GPU stack to 2 small
+        # on the GPU-flatten path, eagerly reduce each (n,Hr,Wr) GPU stack to 2 small
         # planes on this (stream) thread so the full stack is released immediately, and bound the queue so
         # only a capped number of GPU-resident flattened frames stay alive (avoids device OOM).
         gpu_flatten_eager = bool(
@@ -11633,7 +11307,7 @@ def predict_source_and_accumulate(
                 frames_with_predictions += int(frame_inc)
         else:
             pending: List[Future] = []
-            # v13.3.4 (T5): checkout-cached pool — one build per worker process, not per task.
+            # checkout-cached pool — one build per worker process, not per task.
             executor = _acquire_parallel_pool(worker_count)
             try:
                 for idx, r in enumerate(results):
@@ -11670,14 +11344,14 @@ def predict_source_and_accumulate(
             prediction_count += int(compacted_predictions)
             frames_with_predictions += int(compacted_frames)
 
-        # v13.3.3 (S2): when requested (single-angle, no min_conf/min_radius work), hole-fill the
+        # when requested (single-angle, no min_conf/min_radius work), hole-fill the
         # accumulated device union per slice ON DEVICE before the flush; the scheduler then skips
         # the CPU per-view "2D hole fill" pass once every slice of the view reports device-filled.
         device_hole_filled_frames = 0
         if device_union is not None and bool(device_hole_fill) and gpu_device_hole_fill_enabled():
             device_hole_filled_frames = int(device_union.fill_holes_2d())
 
-        # v13.3.6 (D1): per-slice foreground metadata from the resident union (post hole
+        # per-slice foreground metadata from the resident union (post hole
         # fill, pre flush) — a few hundred KB that saves whole CPU read passes downstream.
         slice_meta = device_union.compute_slice_metadata() if device_union is not None else None
 
@@ -11745,7 +11419,7 @@ def predict_source_and_submit_accumulation(
     slice_locks: Optional[Sequence[threading.Lock]] = None,
 ) -> PredictionAccumulationHandle:
     """Run YOLO streaming inference and enqueue result accumulation without draining it."""
-    # v13.2.5 (speed #7): only compute the GPU flatten's max-conf plane when a confidence
+    # only compute the GPU flatten's max-conf plane when a confidence
     # volume actually exists downstream.
     set_gpu_flatten_conf_tracking(view_confmap_mm is not None)
     ensure_yolo_ready_for_predict(model, cfg)
@@ -11763,7 +11437,7 @@ def predict_source_and_submit_accumulation(
     )
     unwrapped_source = source
     source = maybe_wrap_source_with_gpu_input_staging(source, cfg, source_label)
-    # v13.2.2 bug #3: the call above may create a GpuPrefetchingYoloSource that nothing
+    # the call above may create a GpuPrefetchingYoloSource that nothing
     # else owns. If iteration is abandoned by an exception (model.predict setup, a
     # mid-stream CUDA error, a postprocess future failure), its producer thread and
     # VRAM-staged queue leaked for the life of the process. Close the wrapper created
@@ -11786,11 +11460,11 @@ def predict_source_and_submit_accumulation(
             if not use_custom_cpu_retina:
                 print('Warning: CPU retina predictor patch unavailable; using Ultralytics native retina_masks=True for this source.')
         else:
-            # v13.3.0 (R9): GPU retina mode — reduce unions at proto resolution inside
+            # GPU retina mode — reduce unions at proto resolution inside
             # construct_result instead of materializing (n, imgsz, imgsz) retina stacks.
             ensure_gpu_retina_proto_union_predictor_patch()
 
-        # v13.3.6 (C2): same direct-loop preference as predict_source_and_accumulate.
+        # same direct-loop preference as predict_source_and_accumulate.
         results = None
         if not use_custom_cpu_retina and _direct_predict_applicable(cfg):
             predictor_direct = _ensure_predictor_for_direct_predict(model, cfg)
@@ -11848,8 +11522,8 @@ def predict_source_and_submit_accumulation(
                 native_w=native_w,
                 slice_lock=slice_lock,
             )
-            # v13.1.0 (#2.3): skip the per-slice CPU streaming cleanup when the GPU fast path already ran
-            # --min_conf + --min_radius + hole fill on this slice (cleanup_done_on_gpu is set by the frame
+            # skip the per-slice CPU streaming cleanup when the GPU fast path already ran
+            # min_conf + --min_radius + hole fill on this slice (cleanup_done_on_gpu is set by the frame
             # processor only when the on-GPU connected-component cleanup actually completed).
             if stream_cleanup and not bool(getattr(masks_obj, 'cleanup_done_on_gpu', False)):
                 cleaned_has_foreground = _cleanup_prediction_slice_inplace(
@@ -11880,7 +11554,7 @@ def predict_source_and_submit_accumulation(
         precompleted_frames_with_predictions = 0
         pending_limit = async_predict_pending_frame_limit(int(num_frames))
 
-        # v13.1.0 (#2.2): eagerly reduce GPU stacks to 2 small planes on this thread and bound the queue
+        # eagerly reduce GPU stacks to 2 small planes on this thread and bound the queue
         # so GPU-resident flattened frames stay capped (see predict_source_and_accumulate).
         gpu_flatten_eager = bool(
             gpu_retina_flatten_enabled() and not cpu_retina_masks_enabled() and gpu_retina_eager_flatten_enabled()
@@ -12021,18 +11695,17 @@ def predict_in_memory_volume_and_accumulate(
     )
 
 
-# --------------------------
+#
 # Per-view postprocessing
-# --------------------------
+#
 
 
 def cleanup_backend() -> str:
     """Return the per-slice cleanup backend.
 
-    OpenCV is the default because the hot operations used here release the GIL and scale better
-    under Python thread pools. Set YOLO_TTA_CLEANUP_BACKEND=scipy to recover the older scipy.ndimage
-    cleanup path for debugging or strict regression comparison.
-    """
+ OpenCV is the default because the hot operations used here release the GIL and scale better
+ under Python thread pools. Set YOLO_TTA_CLEANUP_BACKEND=scipy to recover the older scipy.ndimage
+ cleanup path for debugging or strict regression comparison."""
     backend = os.environ.get('YOLO_TTA_CLEANUP_BACKEND', 'opencv').strip().lower()
     if backend not in {'opencv', 'scipy'}:
         backend = 'opencv'
@@ -12054,9 +11727,8 @@ def _fill_holes_2d_scipy(mask_bool: np.ndarray) -> np.ndarray:
 def _fill_holes_2d_opencv(mask_bool: np.ndarray) -> np.ndarray:
     """Fill 2D holes using background connected components.
 
-    This matches scipy.ndimage.binary_fill_holes' default 2D background connectivity (4-connected)
-    while avoiding the slower Python-visible scipy path for thousands of large slices.
-    """
+ This matches scipy.ndimage.binary_fill_holes' default 2D background connectivity (4-connected)
+ while avoiding the slower Python-visible scipy path for thousands of large slices."""
     mask_u8 = np.ascontiguousarray(np.asarray(mask_bool, dtype=np.uint8))
     if mask_u8.size == 0 or not np.any(mask_u8):
         return np.zeros(mask_u8.shape, dtype=bool)
@@ -12082,12 +11754,7 @@ def _fill_holes_2d_opencv(mask_bool: np.ndarray) -> np.ndarray:
 
 
 def _fill_holes_2d_opencv_u8_inplace(arr_u8: np.ndarray) -> None:
-    """v13.3.3 (S3): ``_fill_holes_2d_opencv`` without the bool->u8->bool->u8 churn.
-
-    Labels the background of the (contiguous) uint8 slice directly (4-connected, matching
-    scipy.ndimage.binary_fill_holes' default) and writes ONLY the enclosed-hole pixels back,
-    instead of materializing bool/u8 copies and rewriting the full plane.
-    """
+    """Fill 4-connected enclosed background directly in a contiguous uint8 slice."""
     bg = arr_u8 == 0
     if not bg.any():
         return
@@ -12190,24 +11857,12 @@ def _cleanup_prediction_slice_inplace(
     structure2: Optional[np.ndarray] = None,
     min_conf_u8: Optional[int] = None,
 ) -> bool:
-    """Clean one accumulated native-view prediction slice in place.
-
-    This is the unit used by the v12.2.8 single-angle streaming path and by the
-    older whole-volume cleanup pass. v13.0.0 applies the spec-ordered slice-local
-    semantics: confidence gating (--min_conf) followed by view-native 2D min-radius
-    filtering (--min_radius). 2D hole filling is NOT performed here; per spec items
-    5-6 it runs as a final per-view volume pass after radius filtering, so it is
-    handled by cleanup_view_volume_after_prediction_inplace(). v13.1.0 (spec): the full
-    --min_radius is valid on every view's own native slice plane, so there is no longer
-    any deferred transposed/transverse-plane radius pass for Sagittal/Coronal (or any
-    post-backprojection radius pass for Radial/Tilted); this per-slice unit is the only
-    radius stage.
-    """
+    """Apply slice-local cleanup in specification order: confidence gating, radius filtering, then hole filling."""
     idx_i = int(idx)
     if confmap_mm is None and float(min_conf) <= 0.0 and float(min_radius) <= 0.0:
-        # v13.2.5 (speed #7): nothing to filter and no confidence map to zero — skip the full
+        # nothing to filter and no confidence map to zero — skip the full
         # slice bool-cast + unconditional write-back (a pure read+rewrite no-op at
-        # --min_conf 0 --min_radius 0) and report foreground from a read-only scan.
+        # min_conf 0 --min_radius 0) and report foreground from a read-only scan.
         return bool(np.any(np.asarray(mask_mm[idx_i])))
     backend_norm = cleanup_backend() if backend is None else str(backend)
     structure = np.ones((3, 3), dtype=bool) if structure2 is None else structure2
@@ -12235,10 +11890,10 @@ def _cleanup_prediction_slice_inplace(
                 structure,
             )
 
-    # v13.0.0 (bug fix): apply --min_radius BEFORE hole filling. Spec items 5-6 require the order
-    # --min_conf -> --min_radius -> hole fill, with hole filling applied to the FINAL per-view
+    # apply --min_radius BEFORE hole filling. Spec items 5-6 require the order
+    # min_conf -> --min_radius -> hole fill, with hole filling applied to the FINAL per-view
     # volume. Hole filling is therefore performed as a separate volume-level 2D pass in
-    # cleanup_view_volume_after_prediction_inplace() after the (v13.1.0: native per-view) radius
+    # cleanup_view_volume_after_prediction_inplace after the (: native per-view) radius
     # filter completes, rather than here in the per-slice unit (which previously hole-filled before radius).
     if np.any(mask_slice) and float(min_radius) > 0.0:
         if backend_norm == 'opencv':
@@ -12266,7 +11921,7 @@ def _cleanup_prediction_slice_inplace(
 
 _INFERENCE_BATCH_SIZE = 1
 
-# v13.2.5 (speed #7): whether the GPU retina flatten should compute the per-frame max-confidence
+# whether the GPU retina flatten should compute the per-frame max-confidence
 # plane. Set by the predict entry points from whether a confidence volume actually exists
 # (--min_conf > 0); with it disabled the flatten skips one (n,H,W) float transient per frame.
 _GPU_FLATTEN_TRACK_CONF = True
@@ -12301,14 +11956,13 @@ def fused_slice_cleanup_inplace(
 ) -> None:
     """Slice-parallel cleanup with chunked worker fan-out.
 
-    The old path delegated one future per slice and, when ``--min_radius`` was active, performed a
-    Python loop plus one EDT per connected component. On large sparse slices that makes the stage
-    look effectively single-threaded even though it nominally uses a thread pool. The updated path
-    keeps the same semantics but:
-      - submits chunked slice ranges so worker threads stay busy with lower dispatch overhead
-      - computes connected-component radii with one EDT + one reduce per slice instead of one EDT
-        per component
-    """
+ The old path delegated one future per slice and, when ``--min_radius`` was active, performed a
+ Python loop plus one EDT per connected component. On large sparse slices that makes the stage
+ look effectively single-threaded even though it nominally uses a thread pool. The updated path
+ keeps the same semantics but:
+ - submits chunked slice ranges so worker threads stay busy with lower dispatch overhead
+ - computes connected-component radii with one EDT + one reduce per slice instead of one EDT
+ per component"""
     num_slices = int(mask_mm.shape[0])
     structure2 = np.ones((3, 3), dtype=bool)
     min_conf_u8 = int(min_conf_to_u8_threshold(float(min_conf))) if float(min_conf) > 0.0 else 0
@@ -12346,13 +12000,9 @@ def fill_view_volume_holes_2d_inplace(
     workers: int = 1,
     desc: str = '2D hole fill (per-view volume)',
 ) -> None:
-    """v13.0.0: fill 2D enclosed holes per slice across a completed per-view mask volume.
-
-    Spec item 6 applies hole filling to each final per-view volume AFTER --min_conf and
-    --min_radius. Holes appear because unioned overlapping masks can enclose a background
-    region in 2D. This runs slice-parallel; each slice sets to foreground any background
-    connected component fully enclosed by foreground. Empty slices are skipped.
-    """
+    """Fill enclosed 2D background components in every completed view slice.
+    
+    This runs after confidence and radius cleanup; empty slices are skipped and slices are processed in parallel."""
     num_slices = int(mask_mm.shape[0])
     if num_slices <= 0:
         return
@@ -12362,7 +12012,7 @@ def fill_view_volume_holes_2d_inplace(
 
     def _process(i: int) -> None:
         idx_i = int(i)
-        # v13.3.3 (S3): stay uint8 end-to-end and write back only the enclosed-hole pixels —
+        # stay uint8 end-to-end and write back only the enclosed-hole pixels —
         # the old path cast to bool, filled into a fresh plane, and rewrote the whole slice.
         arr = np.asarray(mask_mm[idx_i])
         if not arr.any():
@@ -12396,7 +12046,7 @@ def cleanup_view_volume_after_prediction_inplace(
     precleaned_slice_cleanup: bool = False,
     skip_hole_fill: bool = False,
 ) -> None:
-    # v13.3.12 (D6): non-radial masks can still be on the canonical inference grid here.
+    # non-radial masks can still be on the canonical inference grid here.
     # Convert the native-view radius once and perform every component operation on that smaller
     # raster. Radial already owns a deliberately folded native raster and keeps its historical
     # threshold unchanged.
@@ -12405,7 +12055,7 @@ def cleanup_view_volume_after_prediction_inplace(
     )
 
     if bool(precleaned_slice_cleanup):
-        # v12.2.8 single-angle inference has already applied per-slice --min_conf and the full
+        # single-angle inference has already applied per-slice --min_conf and the full
         # view-native --min_radius as results streamed in (streaming_cleanup_min_radius now equals
         # the full radius for every view), so nothing radius-related remains before the final
         # hole-fill pass.
@@ -12422,10 +12072,10 @@ def cleanup_view_volume_after_prediction_inplace(
             desc=f'Fused cleanup ({view.name})',
         )
 
-    # v13.0.0 (bug fix): 2D hole filling is the FINAL per-view step (spec item 6), applied after
-    # --min_conf and the view-native --min_radius filter. The previous order hole-filled before
-    # --min_radius inside the per-slice unit.
-    # v13.3.3 (S2): skipped when every slice of this view was already hole-filled on device by
+    # 2D hole filling is the FINAL per-view step, applied after
+    # min_conf and the view-native --min_radius filter. The previous order hole-filled before
+    # min_radius inside the per-slice unit.
+    # skipped when every slice of this view was already hole-filled on device by
     # the GPU workers (identical per-slice semantics; the CPU pass would be pure recompute).
     if bool(skip_hole_fill):
         print(f'2D hole fill ({view.name}): done on device during accumulation (v13.3.3 S2); CPU pass skipped.')
@@ -12441,9 +12091,9 @@ def cleanup_view_volume_after_prediction_inplace(
         flush_array(confmap_mm)
 
 
-# --------------------------
+#
 # Process-per-GPU CUDA inference workers
-# --------------------------
+#
 # Every CUDA device, including a lone GPU, runs in its own interpreter and CUDA context. This
 # keeps the worker-only resident rendering, TensorRT ring, grouped-tile, and device-union paths
 # available without sharing Ultralytics' Python-heavy inference loop through the main GIL.
@@ -12464,10 +12114,9 @@ def union_conf_volume_into_volume_inplace(
 ) -> None:
     """Union one prediction-volume result into the per-view union.
 
-    When confidence maps are present (``--min_conf`` > 0) this performs a per-pixel
-    maximum-confidence union (the surviving pixel keeps the higher confidence), matching the
-    in-thread accumulation semantics. Otherwise it is a plain binary OR.
-    """
+ When confidence maps are present (``--min_conf`` > 0) this performs a per-pixel
+ maximum-confidence union (the surviving pixel keeps the higher confidence), matching the
+ in-thread accumulation semantics. Otherwise it is a plain binary OR."""
     num_slices = int(dst_mask_mm.shape[0]) if int(dst_mask_mm.ndim) > 0 else 0
     if num_slices <= 0:
         return
@@ -12508,28 +12157,28 @@ def union_conf_volume_into_volume_inplace(
         flush_array(dst_conf_mm)
 
 
-# --------------------------
+#
 # GPU-resident worker rendering
-# --------------------------
+#
 # Each CUDA inference worker owns a _GpuWorkerRenderEngine. Two modes:
-#   resident — the uint8 source volume fits in VRAM (mem_get_info headroom check): every
-#              full-frame view family renders ON DEVICE and batches feed TensorRT directly
-#              through the existing _tta_gpu_tensor preprocess contract (no CPU render pool,
-#              no host staging round trip).
-#   stream   — the volume does not fit: radial full-frame tasks still render on the GPU by
-#              streaming transient source t-blocks through an azimuth-chunked gather and
-#              assembling the task's frames into a HOST slab that feeds the unchanged
-#              StreamingYoloVolumeSource/CUDA-staging path (the ~1e12-op GIL-held CPU radial
-#              extraction disappears in both modes); other views use the existing CPU path.
+# resident — the uint8 source volume fits in VRAM (mem_get_info headroom check): every
+# full-frame view family renders ON DEVICE and batches feed TensorRT directly
+# through the existing _tta_gpu_tensor preprocess contract (no CPU render pool,
+# no host staging round trip).
+# stream — the volume does not fit: radial full-frame tasks still render on the GPU by
+# streaming transient source t-blocks through an azimuth-chunked gather and
+# assembling the task's frames into a HOST slab that feeds the unchanged
+# StreamingYoloVolumeSource/CUDA-staging path (the ~1e12-op GIL-held CPU radial
+# extraction disappears in both modes); other views use the existing CPU path.
 
 
 def gpu_worker_render_enabled() -> bool:
-    """v13.3.0 (R1/R21): render full-frame views on the worker's GPU. YOLO_TTA_GPU_RENDER=0 disables."""
+    """Render eligible full-frame views on the worker GPU."""
     return _env_flag('YOLO_TTA_GPU_RENDER', True)
 
 
 def gpu_worker_render_resident_enabled() -> bool:
-    """v13.3.0 (R21): allow uploading the whole source volume to the device when it fits."""
+    """Allow a full source-volume upload when VRAM admission succeeds."""
     return _env_flag('YOLO_TTA_GPU_RENDER_RESIDENT', True)
 
 
@@ -12544,12 +12193,9 @@ def gpu_render_tblock_slices() -> int:
 
 
 def gpu_cube_resize_enabled() -> bool:
-    """v13.3.9 (E3): retain native t and fold cube-t scaling into GPU renderers.
+    """Fold eligible T-axis cube scaling into resident GPU renderers.
 
-    Each worker uploads the smaller NATIVE decoded volume and applies the two-tap
-    center-aligned t map inside each renderer. v13.3.17 C10 constructs the host cube only
-    when a CPU/tile/nonresident fallback requests its sentinel. Only T-only slab resizing
-    is eligible. YOLO_TTA_GPU_CUBE_RESIZE=0 restores cube-gated enqueue/residency.
+    The host cube stays deferred until a CPU, tile, or nonresident fallback requests it.
     """
     return _env_flag('YOLO_TTA_GPU_CUBE_RESIZE', True)
 
@@ -12560,17 +12206,17 @@ def fused_direct_render_enabled() -> bool:
 
 
 def fused_radial_render_enabled() -> bool:
-    """P4 Radial direct-to-binding kernel; zero selects the retained Torch renderer."""
+    """Use the Radial direct-to-binding kernel when enabled."""
     return fused_direct_render_enabled() and _env_flag('YOLO_TTA_FUSED_RADIAL_RENDER', True)
 
 
 def fused_tilted_render_enabled() -> bool:
-    """P4 Tilted direct-to-binding kernel; zero selects the retained Torch renderer."""
+    """Use the Tilted direct-to-binding kernel when enabled."""
     return fused_direct_render_enabled() and _env_flag('YOLO_TTA_FUSED_TILTED_RENDER', True)
 
 
 def fused_render_cuda_graphs_enabled() -> bool:
-    """Capture the stable P4 render kernel; metadata remains a dynamic device-side input."""
+    """Capture the stable render kernel; metadata remains a dynamic device-side input."""
     return (
         fused_direct_render_enabled()
         and resident_trt_cuda_graphs_enabled()
@@ -12590,14 +12236,9 @@ _FUSED_DIRECT_RENDER_KERNELS_WARNED = False
 
 
 def _fused_direct_render_kernels() -> Optional[object]:
-    """Compile P4's allocation-free resident Radial/Tilted render kernels once.
-
-    v13.3.15 removes the templated device writers/macros used by v13.3.14. Several
-    NVRTC/CuPy combinations accepted the source object but failed when the first named
-    kernel was materialized, disabling both render families. The replacement exports
-    explicit fp32/fp16 kernels, eagerly compiles the module, and preserves the full
-    compiler diagnostic so a future CUDA-toolchain mismatch is actionable.
-    """
+    """Compile the allocation-free resident Radial and Tilted render kernels once.
+    
+    Explicit fp32/fp16 entry points are materialized eagerly so toolchain failures retain a complete diagnostic."""
     global _FUSED_DIRECT_RENDER_KERNELS, _FUSED_DIRECT_RENDER_KERNELS_FAILED
     global _FUSED_DIRECT_RENDER_KERNELS_ERROR, _FUSED_DIRECT_RENDER_KERNELS_WARNED
     if _FUSED_DIRECT_RENDER_KERNELS is not None:
@@ -13100,17 +12741,12 @@ def _wait_for_cube_ready_sentinel(
     failed_path: Optional[str] = None,
     poll_seconds: float = 0.5,
 ) -> None:
-    """v13.3.8 (E1): block until main signals the shared cube volume file is complete.
-
-    Reached only on fallbacks (failed residency, tile tasks, CPU renders) while the host
-    cube is still being produced. Scheduler teardown terminates workers parked here if the
-    producer dies (the sentinel is only ever written after wait_for_volume_ready + flush).
-    """
+    """Wait for the deferred host cube to publish its ready or failure sentinel."""
     sentinel = Path(str(sentinel_path))
     request = Path(str(request_path)) if request_path else None
     failed = Path(str(failed_path)) if failed_path else None
     if request is not None:
-        # v13.3.17 C10: this is the first proven need for the host cube. A tiny atomic
+        # this is the first proven need for the host cube. A tiny atomic
         # marker wakes the main-process materializer; all workers share the same result.
         request.parent.mkdir(parents=True, exist_ok=True)
         request.touch(exist_ok=True)
@@ -13121,7 +12757,7 @@ def _wait_for_cube_ready_sentinel(
     )
     deadline = time.monotonic() + float(timeout_seconds)
     while True:
-        # Failure wins if both records somehow exist; C10 publishes them transactionally,
+        # Failure wins if both records somehow exist; publishes them transactionally,
         # but this also makes stale/corrupt shared state fail closed.
         if failed is not None and failed.exists():
             try:
@@ -13146,7 +12782,7 @@ def _wait_for_cube_ready_sentinel(
 
 
 class _GpuWorkerRenderEngine:
-    """Per-worker-process GPU renderer for full-frame prediction sources (v13.3.0 R1/R21)."""
+    """Per-worker-process GPU renderer for full-frame prediction sources."""
 
     def __init__(self, device_str: str = 'cuda:0') -> None:
         import torch  # type: ignore
@@ -13169,14 +12805,14 @@ class _GpuWorkerRenderEngine:
         self._volume_mm: Optional[np.ndarray] = None
         self._volume_gpu: Optional[object] = None
         self._volume_flat: Optional[object] = None
-        # v13.3.9 (E3): _volume_gpu keeps NATIVE t while _logical_t is the
+        # _volume_gpu keeps NATIVE t while _logical_t is the
         # approximately-cubic working t seen by ViewInfo/render coordinates.
         self._logical_t = 0
         self._native_t_map_cache: Dict[Tuple[int, int], Tuple[object, object, object]] = {}
         self._mode = 'unresolved'
         self._tilted_plans: 'OrderedDict[Tuple[str, int, int, Tuple[float, ...]], Dict[str, object]]' = OrderedDict()
         self._fold_cache: Dict[Tuple[int, int, int], Tuple[object, object, object]] = {}
-        # P4 keeps one all-azimuth separable tap table per resident Radial geometry.
+        # keeps one all-azimuth separable tap table per resident Radial geometry.
         # It is generated by one CUDA launch and remains device-resident across task windows.
         self._fused_radial_taps: 'OrderedDict[object, object]' = OrderedDict()
         self._fused_volume_ref: Optional[object] = None
@@ -13189,11 +12825,11 @@ class _GpuWorkerRenderEngine:
         self._fused_validated_keys: set = set()
         self._warned_fallback = False
         self._resident_runtime_disabled = False
-        # T3: native planes shared across every tile of one frame (tile-group path only).
+        # native planes shared across every tile of one frame (tile-group path only).
         self._native_plane_cache: 'OrderedDict[Tuple[str, int], object]' = OrderedDict()
         self._tilted_plan_cache_floor = 0
 
-    # ---- volume residency ----
+    # volume residency ----
 
     def ensure_volume(
         self,
@@ -13203,14 +12839,9 @@ class _GpuWorkerRenderEngine:
         *,
         resize_to_t: Optional[int] = None,
     ) -> str:
-        """Resolve source-volume residency while retaining a native-t device buffer.
-
-        v13.3.9 (E3): with ``resize_to_t`` set, ``path`` is the NATIVE decoded
-        volume and only that smaller volume is uploaded.  Renderers compose the
-        center-aligned native->working t map at use time instead of materializing a
-        cube-t uint8 copy. Residency failure still returns ``stream`` with native
-        state reset, because streaming/CPU fallbacks require the completed cube file.
-        """
+        """Resolve resident or streaming GPU source-volume mode.
+        
+        Eligible runs retain native T and defer host-cube construction until a CPU, tile, or nonresident fallback requests it."""
         torch = self.torch
         shape_t = tuple(int(x) for x in shape)
         if len(shape_t) != 3:
@@ -13238,7 +12869,7 @@ class _GpuWorkerRenderEngine:
         self._fused_graph_rejected_keys.clear()
         self._fused_validated_keys.clear()
         self._mode = 'stream'
-        # E3's admission test is based on the NATIVE buffer, not the inflated cube t.
+        # Residency admission uses the native buffer, not the inflated logical cube.
         nbytes = int(in_t) * int(in_h) * int(in_w)
         if gpu_worker_render_resident_enabled() and not self._resident_runtime_disabled:
             try:
@@ -13271,7 +12902,7 @@ class _GpuWorkerRenderEngine:
                 self._mode = 'stream'
                 print(f'GPU render: resident upload failed ({exc}); falling back to streaming mode.')
         if resize_active and self._mode != 'resident':
-            # v13.3.8 (E1): never leave a native-geometry memmap where streaming-mode
+            # never leave a native-geometry memmap where streaming-mode
             # consumers (radial slab prerender, shape probes) expect the cube.
             self._volume_key = None
             self._volume_mm = None
@@ -13291,12 +12922,11 @@ class _GpuWorkerRenderEngine:
         return self._mode
 
     def disable_resident_after_runtime_failure(self) -> None:
-        """Release E3 residency and keep this worker on completed-cube fallbacks.
+        """Release residency and keep this worker on completed-cube fallbacks.
 
-        Rendering is lazy, so a gather-plan error or late OOM can occur after prediction has
-        started. Releasing the large resident tensor gives a clean CPU-render retry enough VRAM
-        for inference and avoids repeating the same failing resident path on later tasks.
-        """
+ Rendering is lazy, so a gather-plan error or late OOM can occur after prediction has
+ started. Releasing the large resident tensor gives a clean CPU-render retry enough VRAM
+ for inference and avoids repeating the same failing resident path on later tasks."""
         self._resident_runtime_disabled = True
         try:
             self._stream.synchronize()
@@ -13343,7 +12973,7 @@ class _GpuWorkerRenderEngine:
         return mapped
 
     def _resample_native_t_axis(self, values: object) -> object:
-        """Map a native-t-leading tensor to logical t with E1-compatible u8 rounding."""
+        """Map a native-t-leading tensor to logical t with endpoint-aligned u8 rounding."""
         torch = self.torch
         native_t = int(values.shape[0])
         logical_t = int(self._logical_t)
@@ -13354,10 +12984,10 @@ class _GpuWorkerRenderEngine:
         a = alpha.view(*alpha_shape)
         f0 = values.index_select(0, r0).to(torch.float32)
         f1 = values.index_select(0, r1).to(torch.float32)
-        # The old E1 resident cube stored uint8 after cv2-compatible lerp.
+        # The old resident cube stored uint8 after cv2-compatible lerp.
         return torch.lerp(f0, f1, a).round_().clamp_(0.0, 255.0)
 
-    # ---- P4 fused resident-ring renderers ----
+    # fused resident-ring renderers ----
 
     def _fused_render_fallback(self, family: str, exc: object) -> None:
         """Disable one optional fused family after a synchronous capability failure."""
@@ -13417,10 +13047,9 @@ class _GpuWorkerRenderEngine:
     def _ensure_fused_radial_taps(self, view: ViewInfo, kernels: object) -> object:
         """Generate/cache separable 6+6 tap descriptors for every configured azimuth.
 
-        Storing separable x/y taps costs one third of a flattened 36-tap table while the
-        direct renderer still performs the identical outer-product accumulation.  The table
-        is built in one launch on the render stream, not reconstructed for every frame.
-        """
+ Storing separable x/y taps costs one third of a flattened 36-tap table while the
+ direct renderer still performs the identical outer-product accumulation. The table
+ is built in one launch on the render stream, not reconstructed for every frame."""
         if int(RADIAL_LANCZOS_A) != 3 or int(_lanczos_tap_count(RADIAL_LANCZOS_A)) != 6:
             raise RuntimeError('fused Radial renderer currently requires Lanczos-3 (six taps per axis)')
         angles_np = np.ascontiguousarray(np.asarray(view.azimuths_deg, dtype=np.float32))
@@ -13429,7 +13058,7 @@ class _GpuWorkerRenderEngine:
         if n_angles <= 0 or n_u <= 0:
             raise RuntimeError('fused Radial descriptor geometry is empty')
         plane_h, plane_w = radial_plane_shape(view)
-        # The descriptor contains only projected-plane coordinates.  Sagittal and Coronal
+        # The descriptor contains only projected-plane coordinates. Sagittal and Coronal
         # may therefore share it when their plane geometry/azimuth table are identical; putting
         # the semantic base name in the key needlessly rebuilt ~1.3 GiB tables between views.
         key = (
@@ -13586,7 +13215,7 @@ class _GpuWorkerRenderEngine:
                 if render_family not in self._fused_announced_families:
                     self._fused_announced_families.add(render_family)
                     print(
-                        'v16.0.3 fused tilted-Radial renderer active: resident uint8 volume '
+                        'v16.0.4 fused tilted-Radial renderer active: resident uint8 volume '
                         '-> shear + Lanczos-3 + stack lerp -> TensorRT binding.'
                     )
             else:
@@ -13713,11 +13342,7 @@ class _GpuWorkerRenderEngine:
         allow_graph_replay: bool = True,
         disable_on_failure: bool = True,
     ) -> bool:
-        """Attempt P4 only for resident-ring Radial/Tilted frames.
-
-        Generic batches deliberately retain the reference Torch renderer: only the ring owns
-        a persistent destination binding whose address and dtype have already been validated.
-        """
+        """Render an eligible resident-ring Radial or Tilted frame into its fixed binding."""
         family = 'radial' if str(view.family) == 'radial' else ('tilted' if is_tilted_view(view) else '')
         if not family:
             return False
@@ -13809,15 +13434,14 @@ class _GpuWorkerRenderEngine:
         frame_index: int,
         out_size: int,
     ) -> None:
-        """Synchronously prove a P4 launch before the resident source is consumed.
+        """Synchronously prove a launch before the resident source is consumed.
 
-        NVRTC compilation and argument/configuration failures are normally synchronous, but
-        descriptor or render memory faults surface only at a stream boundary.  One probe per
-        volume/view/dtype/affine makes the default-on path a real capability test.  A failed
-        synchronization is fatal rather than a Torch fallback because CUDA execution faults
-        can poison the worker context; the parent already treats this exception as a worker-
-        fatal result.  Successful keys do not add a synchronization to later task windows.
-        """
+ NVRTC compilation and argument/configuration failures are normally synchronous, but
+ descriptor or render memory faults surface only at a stream boundary. One probe per
+ volume/view/dtype/affine makes the default-on path a real capability test. A failed
+ synchronization is fatal rather than a Torch fallback because CUDA execution faults
+ can poison the worker context; the parent already treats this exception as a worker-
+ fatal result. Successful keys do not add a synchronization to later task windows."""
         family = 'radial' if str(view.family) == 'radial' else ('tilted' if is_tilted_view(view) else '')
         if not family:
             return
@@ -13858,13 +13482,12 @@ class _GpuWorkerRenderEngine:
         frame_index: int,
         out_size: int,
     ) -> None:
-        """Capture and validate one slot's stable P4 render kernel opportunistically.
+        """Capture and validate one slot's stable render kernel opportunistically.
 
-        The one-thread metadata setter intentionally remains outside the graph. Therefore a
-        replay has fixed volume/descriptor/output addresses but reads the just-staged frame
-        index or Tilted center from ``slot.render_meta``. Capture failures with a healthy
-        stream retain the uncaptured fused launch; failed recovery is worker-fatal.
-        """
+ The one-thread metadata setter intentionally remains outside the graph. Therefore a
+ replay has fixed volume/descriptor/output addresses but reads the just-staged frame
+ index or Tilted center from ``slot.render_meta``. Capture failures with a healthy
+ stream retain the uncaptured fused launch; failed recovery is worker-fatal."""
         if not fused_render_cuda_graphs_enabled():
             return
         family = 'radial' if str(view.family) == 'radial' else ('tilted' if is_tilted_view(view) else '')
@@ -13898,7 +13521,7 @@ class _GpuWorkerRenderEngine:
         graph = None
         try:
             graph = self.torch.cuda.CUDAGraph()
-            # v15.0.3 fix: exclude every other CUDA-touching thread (notably the device-union
+            # exclude every other CUDA-touching thread (notably the device-union
             # flush executor) for the capture window. See _CUDA_GRAPH_CAPTURE_LOCK.
             with _CUDA_GRAPH_CAPTURE_LOCK:
                 with self.torch.cuda.graph(graph, stream=self._stream):
@@ -13940,7 +13563,7 @@ class _GpuWorkerRenderEngine:
             self._fused_graph_announced_families.add(family)
             print(f'P4 fused {family} renderer CUDA Graph active (dynamic device metadata).')
 
-    # ---- radial taps / fold (device) ----
+    # radial taps / fold (device) ----
 
     def _radial_taps_gpu(self, view: ViewInfo, angle_deg: float) -> Tuple[object, object]:
         """Device port of the orientation-aware Radial sampler for one azimuth."""
@@ -14004,6 +13627,7 @@ class _GpuWorkerRenderEngine:
 
     def _radial_project_blocks(self, view: ViewInfo, block2d: object, flat_idx: object, w2d: object) -> object:
         """(rows, H*W) u8 block -> (rows, u) float32 Lanczos projection."""
+        # DEAD PARAMETER: view is retained for renderer-method API consistency.
         samples = block2d[:, flat_idx]
         return (samples.to(self.torch.float32) * w2d.unsqueeze(0)).sum(dim=-1)
 
@@ -14059,10 +13683,9 @@ class _GpuWorkerRenderEngine:
     def _render_tilted_radial_native_resident_torch(self, view: ViewInfo, frame_idx: int) -> object:
         """Reference CUDA/Torch implementation matching ``extract_tilted_radial_slice_frame``.
 
-        This path is retained when the allocation-free NVRTC kernel is unavailable or explicitly
-        disabled.  It keeps every gather and interpolation on the resident GPU and therefore never
-        requests the deferred host cube.  Row blocking bounds temporary int64 gather tensors.
-        """
+ This path is retained when the allocation-free NVRTC kernel is unavailable or explicitly
+ disabled. It keeps every gather and interpolation on the resident GPU and therefore never
+ requests the deferred host cube. Row blocking bounds temporary int64 gather tensors."""
         torch = self.torch
         vol = self._volume_gpu
         native_t, full_h, full_w = (int(v) for v in vol.shape)
@@ -14170,9 +13793,8 @@ class _GpuWorkerRenderEngine:
     def _render_tilted_radial_native_resident(self, view: ViewInfo, frame_idx: int) -> object:
         """Render one tilted-Radial native plane on the resident GPU.
 
-        Prefer the one-launch NVRTC kernel used by the direct TensorRT path.  A mathematically
-        equivalent Torch gather implementation remains available as a capability fallback.
-        """
+ Prefer the one-launch NVRTC kernel used by the direct TensorRT path. A mathematically
+ equivalent Torch gather implementation remains available as a capability fallback."""
         if not is_tilted_radial_view(view):
             raise ValueError(f'{view.name!r} is not a tilted-Radial view')
         native_kernel_enabled = _env_flag('YOLO_TTA_GPU_TILTED_RADIAL_NATIVE_KERNEL', True)
@@ -14219,7 +13841,7 @@ class _GpuWorkerRenderEngine:
                 if 'tilted_radial_native' not in self._fused_announced_families:
                     self._fused_announced_families.add('tilted_radial_native')
                     print(
-                        'v16.0.3 resident tilted-Radial native-plane CUDA kernel active '
+                        'v16.0.4 resident tilted-Radial native-plane CUDA kernel active '
                         '(YOLO_TTA_GPU_TILTED_RADIAL_NATIVE_KERNEL=0 selects Torch gathers).'
                     )
                 return out
@@ -14240,13 +13862,12 @@ class _GpuWorkerRenderEngine:
     ) -> np.ndarray:
         """GPU-render a sparse bank of radial view planes into a host slab.
 
-        Streams transient source t-blocks to the device and evaluates an adaptive azimuth chunk
-        per block (per-azimuth fp16 t-projections stay device-resident between blocks), then
-        folds/quantizes each frame and copies it into a host uint8 slab. VRAM working set is
-        bounded by the t-block plus the azimuth-chunk projections. ``frame_indices`` contains
-        the globally clamped center/context indices actually required by the worker task, so
-        a large channel stride does not render unused intervening azimuths.
-        """
+ Streams transient source t-blocks to the device and evaluates an adaptive azimuth chunk
+ per block (per-azimuth fp16 t-projections stay device-resident between blocks), then
+ folds/quantizes each frame and copies it into a host uint8 slab. VRAM working set is
+ bounded by the t-block plus the azimuth-chunk projections. ``frame_indices`` contains
+ the globally clamped center/context indices actually required by the worker task, so
+ a large channel stride does not render unused intervening azimuths."""
         if not radial_streaming_gpu_render_supported(view):
             raise RuntimeError(
                 f'non-resident GPU Radial prerender supports only transverse, got {view.name!r}'
@@ -14308,7 +13929,7 @@ class _GpuWorkerRenderEngine:
                 del proj, taps
         return slab
 
-    # ---- tilted (device) ----
+    # tilted (device) ----
 
     def _tilted_plan_gpu(self, view: ViewInfo, M_grid_to_src: np.ndarray, grid_h: int, grid_w: int) -> Dict[str, object]:
         torch = self.torch
@@ -14324,7 +13945,7 @@ class _GpuWorkerRenderEngine:
         x64 = plan.x_idx.astype(np.int64)
         y64 = plan.y_idx.astype(np.int64)
         if base == 'transverse':
-            # X/Y are native and working-identical on the E3 admission path; t is
+            # X/Y are native and working-identical on the admission path; t is
             # the fractional STACK coordinate and is composed in _render_tilted_frame.
             inplane0 = y64 * full_w + x64
             inplane1 = inplane0
@@ -14366,7 +13987,7 @@ class _GpuWorkerRenderEngine:
         }
         self._tilted_plans[key] = info
         self._tilted_plans.move_to_end(key)
-        # T3: a tilted tile group cycles through one plan PER TILE within every frame, so the
+        # a tilted tile group cycles through one plan PER TILE within every frame, so the
         # historical 10-entry cap would rebuild every plan on every frame. The tile path raises
         # this floor once from its own tile count.
         while len(self._tilted_plans) > max(10, int(self._tilted_plan_cache_floor)):
@@ -14393,7 +14014,7 @@ class _GpuWorkerRenderEngine:
         if str(info['base']) == 'transverse':
             # Reconstruct the two working-t stack taps from native t (including
             # the former cube-u8 rounding), then apply the existing stack lerp.
-            # This is exact to E1 without materializing the full cube volume.
+            # This is exact to without materializing the full cube volume.
             inplane = info['inplane0']
             if bool(info['t_identity']):
                 f0 = torch.take(
@@ -14438,7 +14059,7 @@ class _GpuWorkerRenderEngine:
             vals = v0 + alpha * (v1 - v0)
         return torch.where(valid, vals, torch.zeros((), dtype=torch.float32, device=self.device))
 
-    # ---- cartesian / dispatch ----
+    # cartesian / dispatch ----
 
     @staticmethod
     def _affine_is_identity_render(aff: AffineSpec) -> bool:
@@ -14451,17 +14072,16 @@ class _GpuWorkerRenderEngine:
         )
 
     def _native_plane_cache_entries(self) -> int:
-        """T3: LRU depth for the shared native-plane cache used by tile-group rendering."""
+        """LRU depth for the shared native-plane cache used by tile-group rendering."""
         return max(2, _env_int('YOLO_TTA_GPU_NATIVE_PLANE_CACHE', 8))
 
     def _render_native_plane_cached(self, view: ViewInfo, frame_idx: int) -> object:
-        """T3: one native plane per (view, frame), reused by every tile of that frame.
+        """One native plane per (view, frame), reused by every tile of that frame.
 
-        Tile-group tasks walk the flattened (z, tile) index space z-major, so a handful of
-        entries is enough for every tile of a frame -- and for the contextual neighbours a
-        2.5D channel format pulls in -- to hit. Only the tile path uses this; full-frame
-        rendering keeps its original allocate-per-call behaviour and VRAM profile.
-        """
+ Tile-group tasks walk the flattened (z, tile) index space z-major, so a handful of
+ entries is enough for every tile of a frame -- and for the contextual neighbours a
+ 2.5D channel format pulls in -- to hit. Only the tile path uses this; full-frame
+ rendering keeps its original allocate-per-call behaviour and VRAM profile."""
         key = (str(view.name), int(frame_idx))
         cache = self._native_plane_cache
         plane = cache.get(key)
@@ -14520,13 +14140,12 @@ class _GpuWorkerRenderEngine:
         frame_idx: int,
         out_size: int,
     ) -> object:
-        """T2/T3: one dense-tile inference raster, reusing the frame's cached native plane.
+        """One dense-tile inference raster, reusing the frame's cached native plane.
 
-        A tile is just another output->native affine, so this is ``_render_fullframe_frame``
-        with two differences: the native plane comes from the shared per-frame cache (every
-        tile of a frame samples the SAME plane), and there is no angle-0 identity shortcut
-        because a tile is always a crop+scale of its parent canvas.
-        """
+ A tile is just another output->native affine, so this is ``_render_fullframe_frame``
+ with two differences: the native plane comes from the shared per-frame cache (every
+ tile of a frame samples the SAME plane), and there is no angle-0 identity shortcut
+ because a tile is always a crop+scale of its parent canvas."""
         if is_tilted_view(view):
             return self._render_tilted_frame(
                 view, np.asarray(M_out_to_src, dtype=np.float32), int(out_size), int(out_size), int(frame_idx),
@@ -14555,10 +14174,9 @@ class _GpuWorkerRenderEngine:
     ) -> Tuple[object, object]:
         """Render a batch of flattened (frame, tile) indices as one normalized BCHW tensor.
 
-        ``flat_indices`` are ``z_local * len(tile_affines) + tile_index``. The order is
-        z-major, so a batch spans one or two frames and every tile in it shares the same
-        cached native plane -- the whole point of T3. Returns (tensor, ready event).
-        """
+ ``flat_indices`` are ``z_local * len(tile_affines) + tile_index``. The order is
+ z-major, so a batch spans one or two frames and every tile in it shares the same
+ cached native plane -- the whole point of. Returns (tensor, ready event)."""
         torch = self.torch
         fmt = resolve_channel_format(channel_format)
         tiles_per_frame = max(1, int(len(tile_affines)))
@@ -14694,12 +14312,11 @@ class _GpuWorkerRenderEngine:
 class GpuRenderedYoloSource:
     """Ultralytics-compatible source whose batches are rendered AND normalized on the GPU.
 
-    Used by CUDA inference workers in resident mode. ``__next__`` yields
-    (paths, GpuPrefetchedYoloBatch, info) exactly like GpuPrefetchingYoloSource — the batch
-    carries a device-resident normalized BCHW tensor plus a render-stream event, and the
-    patched BasePredictor.preprocess consumes it via the _tta_gpu_tensor contract. The
-    orig-image entries are zero-strided placeholder frames (only their shape is read).
-    """
+ Used by CUDA inference workers in resident mode. ``__next__`` yields
+ (paths, GpuPrefetchedYoloBatch, info) exactly like GpuPrefetchingYoloSource — the batch
+ carries a device-resident normalized BCHW tensor plus a render-stream event, and the
+ patched BasePredictor.preprocess consumes it via the _tta_gpu_tensor contract. The
+ orig-image entries are zero-strided placeholder frames (only their shape is read)."""
 
     def __init__(
         self,
@@ -14762,10 +14379,9 @@ class GpuRenderedYoloSource:
     def prepare_direct_ring(self, input_dtype: Optional[object] = None) -> List[_ResidentGpuPipelineSlot]:
         """Allocate the two-entry ring in the TensorRT ENGINE input binding dtype.
 
-        Unified ``--quantize`` selects the predictor precision policy, but exported TensorRT
-        engines may expose an input binding whose dtype differs from that policy. The capability
-        probe resolves the actual binding first; ``self.fp16`` is only the generic fallback.
-        """
+ Unified ``--quantize`` selects the predictor precision policy, but exported TensorRT
+ engines may expose an input binding whose dtype differs from that policy. The capability
+ probe resolves the actual binding first; ``self.fp16`` is only the generic fallback."""
         if (
             self.bs != 1
             or self.nf <= 0
@@ -14819,7 +14435,7 @@ class GpuRenderedYoloSource:
                 if slot.render_graph is not None and slot.render_graph_key != expected_key:
                     slot.render_graph = None
                     slot.render_graph_key = None
-            # P4's first async descriptor/render launch is synchronized here, before
+            # Synchronize the first async descriptor/render launch before
             # _try_resident_trt_ring_accumulate consumes a frame or borrows TRT bindings.
             self.engine.validate_fused_ring_renderer(
                 self._direct_ring[0], self.view, self.job,
@@ -14859,9 +14475,8 @@ class GpuRenderedYoloSource:
     def next_direct_slot(self) -> Optional[Tuple[int, _ResidentGpuPipelineSlot]]:
         """Queue one render without constructing paths/info/source tuples.
 
-        This entry point belongs exclusively to the specialized accumulator.  Generic
-        Ultralytics/direct iterators continue to use ``__next__`` unchanged.
-        """
+ This entry point belongs exclusively to the specialized accumulator. Generic
+ Ultralytics/direct iterators continue to use ``__next__`` unchanged."""
         if self._direct_ring is None:
             raise RuntimeError('direct resident ring has not been prepared')
         if int(self._direct_count) >= int(self.nf):
@@ -14917,14 +14532,13 @@ class GpuRenderedYoloSource:
 
 
 class GpuTiledRenderedYoloSource:
-    """T3: GPU-rendered source over the flattened (frame, tile) index space of one tile group.
+    """GPU-rendered source over the flattened (frame, tile) index space of one tile group.
 
-    Index ``j`` means ``(z_local, tile) = divmod(j, tiles_per_frame)``, walked z-major so
-    every tile of a frame is emitted consecutively and shares one cached native plane.
-    Yields the same ``(paths, GpuPrefetchedYoloBatch, info)`` contract as
-    ``GpuRenderedYoloSource``, so the predictor, the patched preprocess and the whole
-    accumulation path are unchanged.
-    """
+ Index ``j`` means ``(z_local, tile) = divmod(j, tiles_per_frame)``, walked z-major so
+ every tile of a frame is emitted consecutively and shares one cached native plane.
+ Yields the same ``(paths, GpuPrefetchedYoloBatch, info)`` contract as
+ ``GpuRenderedYoloSource``, so the predictor, the patched preprocess and the whole
+ accumulation path are unchanged."""
 
     def __init__(
         self,
@@ -15032,12 +14646,11 @@ def _tile_group_cpu_renderer(
     slice_offset: int,
     channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
 ) -> Callable[[int], np.ndarray]:
-    """CPU fallback renderer over the same flattened (frame, tile) index space as T3.
+    """CPU fallback renderer over the grouped source's flattened (frame, tile) index space.
 
-    Mirrors ``GpuTiledRenderedYoloSource``'s indexing and keeps a small native-frame LRU so
-    the ``get_view_frame_by_index`` extraction is still paid once per frame rather than once
-    per (frame, tile) -- the redundancy that made the old CPU tile path the critical path.
-    """
+ Mirrors ``GpuTiledRenderedYoloSource``'s indexing and keeps a small native-frame LRU so
+ the ``get_view_frame_by_index`` extraction is still paid once per frame rather than once
+ per (frame, tile) -- the redundancy that made the old CPU tile path the critical path."""
     fmt = resolve_channel_format(channel_format)
     tiles_per_frame = max(1, int(len(tile_jobs)))
     offsets = (0,) if fmt.kind == 'gray' else tuple(int(v) for v in fmt.offsets)
@@ -15266,7 +14879,7 @@ class _DeferredGpuWorkerTaskResult:
                         pass
 
 
-# T4: shared z-band locks that serialize concurrent read-modify-write ORs into a
+# shared z-band locks that serialize concurrent read-modify-write ORs into a
 # per-configuration tile canvas. Tiles within one configuration OVERLAP by design (stride <
 # size), and two worker processes touching the same byte of a shared mapping is not atomic,
 # so a z-band lock class per canvas row range is the synchronization unit. Installed once
@@ -15304,11 +14917,10 @@ def _union_tile_group_into_canvas(
 ) -> int:
     """OR one tile group's crop-sized unit volume into the shared configuration canvas.
 
-    ``unit_mask`` is ``(slice_count * tile_count, crop_h, crop_w)`` in flattened (frame,
-    tile) order, so tile ``k``'s slab over a z band is the strided view
-    ``unit_mask[a * K + k : b * K + k : K]`` -- no copy. Each band is written under its own
-    lock, and OR is commutative, so band ordering across workers is irrelevant.
-    """
+ ``unit_mask`` is ``(slice_count * tile_count, crop_h, crop_w)`` in flattened (frame,
+ tile) order, so tile ``k``'s slab over a z band is the strided view
+ ``unit_mask[a * K + k: b * K + k: K]`` -- no copy. Each band is written under its own
+ lock, and OR is commutative, so band ordering across workers is irrelevant."""
     total = int(np.count_nonzero(unit_mask))
     if total <= 0:
         return 0
@@ -15340,12 +14952,9 @@ def run_prediction_volume_in_worker(
     cfg: 'PredictConfig',
     task: Dict[str, object],
 ) -> Dict[str, object] | _DeferredGpuWorkerTaskResult:
-    """Render + predict + accumulate one prediction volume in a GPU worker process.
-
-    Writes the per-volume processing-grid mask (and confidence map, if --min_conf > 0) to the
-    file-backed result memmaps named in the task, then returns small inference stats. D6 uses
-    the canonical inference grid for non-radial views and the native raster for Radial.
-    """
+    """Run one worker prediction task and write its result windows.
+    
+    Non-Radial views use the canonical processing grid; Radial views retain their native raster."""
     view: ViewInfo = task['view']  # type: ignore[assignment]
     job = task['job']
     kind = str(task['kind'])
@@ -15362,9 +14971,9 @@ def run_prediction_volume_in_worker(
             f'{channel_format.token} has C={int(channel_format.channel_count)}, but '
             f'worker PredictConfig requires C={int(cfg.input_channels)}'
         )
-    # T3: a tile-group task owns every tile of one (view, angle, tile configuration) over a
+    # a tile-group task owns every tile of one (view, angle, tile configuration) over a
     # slice window. Its unit index space is flattened (frame, tile), so num_frames counts
-    # UNITS and every per-unit artifact is the tile's parent-grid crop (T1), not the full grid.
+    # UNITS and every per-unit artifact is the tile's parent-grid crop, not the full grid.
     tile_group: Optional[List[DenseTileJob]] = None
     if kind == 'tile_group':
         tile_group = list(task['tiles'])  # type: ignore[arg-type]
@@ -15434,7 +15043,7 @@ def run_prediction_volume_in_worker(
 
     try:
         if tile_group is not None:
-            # T4: a tile group never materializes a per-tile result FILE. Its units are the
+            # a tile group never materializes a per-tile result FILE. Its units are the
             # tile crops, so the whole task's output is a small anonymous host buffer that is
             # OR-ed straight into the shared per-configuration canvas below. Sizing is bounded
             # by the scheduler's slice chunking (tile_group_slice_chunk).
@@ -15442,7 +15051,7 @@ def run_prediction_volume_in_worker(
             if task.get('want_confmap'):
                 result_conf = np.zeros(result_shape, dtype=np.uint8)
         elif str(task.get('result_mode', 'file')) == 'direct_union':
-            # v13.3.1 (R4): single-angle tasks accumulate straight into the shared per-view
+            # single-angle tasks accumulate straight into the shared per-view
             # union memmap, which the scheduler created zeroed BEFORE enqueueing tasks. Slice
             # windows are disjoint per task, and same-host page-cache coherence makes the writes
             # visible to the main process without msync. 'r+' is required — 'w+' would truncate
@@ -15460,25 +15069,25 @@ def run_prediction_volume_in_worker(
                 )
                 result_conf = result_conf_full[slice_offset:slice_offset + slice_count]
         else:
-            # v13.2.5 (speed #6): mode 'w+' truncates and re-extends the file, so fresh result
+            # mode 'w+' truncates and re-extends the file, so fresh result
             # memmaps are already zero-filled — the old explicit [:] = 0 dirtied ~GBs of pages
             # per chunk for nothing.
             result_mask = np.memmap(Path(str(task['result_mask_path'])), dtype=np.uint8, mode='w+', shape=result_shape)
             if task.get('result_conf_path'):
                 result_conf = np.memmap(Path(str(task['result_conf_path'])), dtype=np.uint8, mode='w+', shape=result_shape)
 
-        # v13.3.0 (R1/R21): render full-frame sources on this worker's GPU when possible —
+        # render full-frame sources on this worker's GPU when possible —
         # resident mode feeds device tensors straight to the predictor; streaming mode still
         # GPU-prerenders radial tasks into a host slab. Any engine failure falls back to the
         # unchanged CPU render path for this task.
         gpu_engine = _worker_gpu_render_engine()
-        # v13.3.8 (E1): when main enqueued before the host cube finished, the task carries
+        # when main enqueued before the host cube finished, the task carries
         # the native decoded volume + a cube-ready sentinel for every file-backed fallback.
         native_resize = task.get('native_resize') if isinstance(task.get('native_resize'), dict) else None
-        # T2: tile groups render on the GPU through exactly the same residency machinery as
-        # full frames -- a tile is only a different output->native affine. The old
-        # kind == 'fullframe' gate is what forced every tile onto the CPU renderer (and, by
-        # never producing a GPU source, also cost tiles the resident TensorRT ring).
+        # Tile groups use the same resident source and per-frame render machinery as full frames.
+        # Each group carries one affine per tile, so predict_source_and_accumulate keeps the fixed-
+        # affine resident TensorRT ring disabled even when GPU-resident tile rendering is active.
+        # The grouped source still avoids repeated native-frame extraction for each tile.
         if gpu_engine is not None and str(kind) in ('fullframe', 'tile_group'):
             try:
                 resident_view_supported = bool(
@@ -15588,7 +15197,7 @@ def run_prediction_volume_in_worker(
                 )
             source_mm, source = _open_cpu_render_source()
 
-        # T3: a tile group carries one affine PER TILE (selected per unit below), so there is
+        # a tile group carries one affine PER TILE (selected per unit below), so there is
         # no single task-wide matrix; the first tile's crop affine is only a placeholder for
         # the parameter that the per-unit list overrides.
         if tile_group is not None:
@@ -15625,7 +15234,7 @@ def run_prediction_volume_in_worker(
                 defer_device_union_flush=bool(
                     gpu_union_flush_overlap_enabled() and tile_group is None
                 ),
-                # T1/T3: one affine per tile, selected by unit index % tile count.
+                # one affine per tile, selected by unit index % tile count.
                 M_out_to_native_by_unit=(
                     None if tile_group is None
                     else [np.asarray(tj.M_out_to_crop, dtype=np.float32) for tj in tile_group]
@@ -15675,12 +15284,12 @@ def run_prediction_volume_in_worker(
             stats = _predict(source)
 
         if tile_group is not None:
-            # T7/T8/T4: finish the tile group entirely inside this worker.
-            #   1. --min_conf / --min_radius, then the 2D hole fill, in spec order, on the
-            #      small crop-sized unit volume (skipped when the device already did them).
-            #   2. OR each tile's units into the shared per-configuration canvas at that
-            #      tile's parent-grid offset, under a z-band lock so overlapping tiles from
-            #      other workers cannot lose a byte in a read-modify-write race.
+            # finish the tile group entirely inside this worker.
+            # 1. --min_conf / --min_radius, then the 2D hole fill, in spec order, on the
+            # small crop-sized unit volume (skipped when the device already did them).
+            # 2. OR each tile's units into the shared per-configuration canvas at that
+            # tile's parent-grid offset, under a z-band lock so overlapping tiles from
+            # other workers cannot lose a byte in a read-modify-write race.
             # The old path wrote a full parent-grid file per tile and made the scheduler
             # re-read it for a CPU hole fill, a foreground scan and a lock-serialized OR.
             tile_count = int(len(tile_group))
@@ -15721,16 +15330,16 @@ def run_prediction_volume_in_worker(
             stats = dict(stats)
             stats['staged_voxels'] = int(staged)
 
-        # v13.2.5 (speed #6): no msync here — the main process reopens the result file on the
+        # no msync here — the main process reopens the result file on the
         # same host, where page-cache coherence makes the data visible without a blocking
         # multi-GiB writeback per task (msync was crash-durability only).
         public_stats: Dict[str, object] = {
             'prediction_count': int(stats.get('prediction_count', 0)),
             'frames_with_predictions': int(stats.get('frames_with_predictions', 0)),
             'device_hole_filled_frames': int(stats.get('device_hole_filled_frames', 0)),
-            # v13.3.6 (D1): per-slice foreground metadata (or None) rides the result queue.
+            # per-slice foreground metadata (or None) rides the result queue.
             'slice_meta': (None if tile_group is not None else stats.get('slice_meta')),
-            # T4: tile groups report what they OR-ed into the shared canvas themselves.
+            # tile groups report what they OR-ed into the shared canvas themselves.
             'staged_voxels': int(stats.get('staged_voxels', 0)),
         }
         flush_future = stats.get('_device_union_flush_future')
@@ -15738,7 +15347,7 @@ def run_prediction_volume_in_worker(
             # Keep the result mappings alive until the copy thread has finished its final
             # np.copyto. The main worker may now start the next task with a fresh device
             # accumulator; `_gpu_inference_worker_main` publishes these stats only after
-            # `finish()` succeeds.
+            # `finish` succeeds.
             deferred_result = _DeferredGpuWorkerTaskResult(
                 stats=public_stats,
                 flush_future=flush_future,
@@ -15767,16 +15376,7 @@ def run_prediction_volume_in_worker(
 
 
 def _pin_cuda_visible_device_token(logical_index: int) -> str:
-    """Resolve a torch logical CUDA index to the CUDA_VISIBLE_DEVICES token that pins it.
-
-    torch's cuda:N indexes into the CUDA_VISIBLE_DEVICES list inherited from the
-    environment (SLURM commonly exports e.g. '2,3' for an allocation). Overwriting the
-    variable with the raw logical index would escape the allocation onto foreign
-    physical GPUs on nodes without cgroup device isolation (v13.2.2 bug #13); index
-    into the inherited list instead. Tokens pass through verbatim so GPU UUIDs and MIG
-    ids keep working. Without an inherited list, logical == physical and the raw index
-    is correct.
-    """
+    """Restrict a worker process to one inherited ``CUDA_VISIBLE_DEVICES`` token before importing CUDA libraries."""
     idx = int(logical_index)
     raw = os.environ.get('CUDA_VISIBLE_DEVICES')
     if raw is None:
@@ -15800,17 +15400,17 @@ def _gpu_inference_worker_main(
 ) -> None:
     """Persistent GPU worker process: pin to one physical GPU, load the model once, serve tasks."""
     global _GPU_WORKER_NUMA_PIN, _GPU_WORKER_NUMA_FULL
-    # T4: inherited multiprocessing locks (passed positionally so spawn can transfer them)
+    # inherited multiprocessing locks (passed positionally so spawn can transfer them)
     # guard concurrent ORs into the shared per-configuration tile canvases.
     set_worker_canvas_zband_locks(canvas_zband_locks)
     try:
         # Pin the process to its physical GPU before any CUDA context is created, so the model and
         # all tensors live on that device and never contend with the other workers' GPUs. The
         # logical --device index is remapped through the inherited CUDA_VISIBLE_DEVICES list
-        # (v13.2.2 bug #13).
+        # .
         os.environ['CUDA_VISIBLE_DEVICES'] = _pin_cuda_visible_device_token(int(gpu_index))
         initialize_runtime_observability()
-        # v13.3.5 (N1): pin every thread of this worker to its GPU's NUMA node BEFORE any
+        # pin every thread of this worker to its GPU's NUMA node BEFORE any
         # CUDA/model work, so allocator arenas, pinned staging and TRT host scratch land
         # node-local. The parent computed the plan (None = stay unpinned).
         _numa_pin_cpus = init_dict.get('numa_affinity_cpus', None)
@@ -15828,7 +15428,7 @@ def _gpu_inference_worker_main(
         except Exception:
             pass
         set_retina_mask_processor(str(init_dict.get('retina_processor', 'cpu')))
-        # v13.1.0 (#2.3): propagate the single-angle GPU fast-path (min_conf, min_radius) into this
+        # propagate the single-angle GPU fast-path (min_conf, min_radius) into this
         # worker process (globals do not cross the spawn boundary). None disables the fast path.
         _fastpath_min_conf = init_dict.get('single_angle_gpu_fastpath_min_conf', None)
         _fastpath_min_radius = init_dict.get('single_angle_gpu_fastpath_min_radius', 0.0)
@@ -15860,12 +15460,12 @@ def _gpu_inference_worker_main(
             except Exception:
                 pass
         else:
-            # v13.3.0 (R9): GPU retina mode — reduce per-frame unions at proto resolution.
+            # GPU retina mode — reduce per-frame unions at proto resolution.
             try:
                 ensure_gpu_retina_proto_union_predictor_patch()
             except Exception:
                 pass
-        # v13.3.0 (R1/R21): per-worker GPU render engine (volume residency resolves lazily on
+        # per-worker GPU render engine (volume residency resolves lazily on
         # the first task, once the shared source volume exists and VRAM headroom is known).
         try:
             _init_worker_gpu_render_engine('cuda:0')
@@ -15910,7 +15510,7 @@ def _gpu_inference_worker_main(
                     _publish_deferred(item)
                 except BaseException as exc:
                     # A closed/broken result transport must not kill the publisher while
-                    # leaving queue.join() permanently blocked during worker teardown.
+                    # leaving queue.join permanently blocked during worker teardown.
                     print(f'Warning: GPU retirement publication transport failed ({exc}).')
             finally:
                 if item is not None:
@@ -15934,10 +15534,10 @@ def _gpu_inference_worker_main(
             # Auxiliary work is submitted only after inference drains. Defensively wait
             # for the prompt publisher before widening affinity or reusing CUDA state.
             publication_queue.join()
-            # v13.3.4 (T4): after the inference queue drains, this warm worker process doubles
+            # after the inference queue drains, this warm worker process doubles
             # as an interpolation host — same memmap-path protocol as the dedicated
             # interpolation process pool, one pass at a time per worker.
-            # v13.3.5 (N1): the pass's planner pools are sized for the whole allocation, so
+            # the pass's planner pools are sized for the whole allocation, so
             # widen every thread back to the full cpuset for the pass, then re-pin. (Inference
             # has drained by the time aux tasks arrive, so the wide window contends with
             # nothing GPU-side.)
@@ -15971,7 +15571,7 @@ def _gpu_inference_worker_main(
             task_local['postprocess_workers'] = int(local_cpu_workers)
             completed = run_prediction_volume_in_worker(model, cfg, task_local)
             if isinstance(completed, _DeferredGpuWorkerTaskResult):
-                # C11: publication is tied to the D2H future itself, not to completion of
+                # publication is tied to the D2H future itself, not to completion of
                 # the next inference task. The gate admits one retiring accumulator per
                 # worker; a slow retirement blocks only the handoff of the next completed
                 # task and cannot grow an unbounded queue of live device/host mappings.
@@ -15991,7 +15591,7 @@ def _gpu_inference_worker_main(
                 })
         except _ResidentTensorRTRingFatalError as exc:  # pragma: no cover - unsafe TRT state
             # A failed post/infer-stream drain or binding-address restore means this process's
-            # TensorRT contexts can no longer be reused safely.  Surface a worker-fatal result
+            # TensorRT contexts can no longer be reused safely. Surface a worker-fatal result
             # and exit instead of dequeuing another view on the compromised backend.
             import traceback
             result_queue.put({
@@ -16013,9 +15613,9 @@ def _gpu_inference_worker_main(
         _shutdown_gpu_union_flush_executor()
 
 
-# --------------------------
+#
 # 3D assembly + postprocessing
-# --------------------------
+#
 
 
 if _numba is not None:
@@ -16055,14 +15655,7 @@ _NUMBA_UNION_FIND_KERNEL_RUNTIME_DISABLED = False
 
 
 class _UnionFind:
-    """Dynamic union-find for slice-streamed 3D connected-components.
-
-    v13.3.4 (T2): numpy-array-backed (was python lists). Batched pair merges run through one
-    numba nogil kernel call per batch (``union_pair_codes``; python loop fallback preserves
-    the exact algorithm), and ``root_map`` resolves every id by vectorized pointer jumping
-    instead of a per-id python find loop. Same union-by-rank + path-halving as before, so
-    root representatives are identical for the same union order.
-    """
+    """Array-backed disjoint-set structure with batched pair merges and path compression."""
 
     def __init__(self) -> None:
         cap = 1024
@@ -16149,7 +15742,7 @@ class _UnionFind:
         self.touches_boundary[self.find(int(x))] = True
 
     def root_map(self) -> np.ndarray:
-        # v13.3.4 (T2): vectorized pointer jumping — every id follows its parent chain in
+        # vectorized pointer jumping — every id follows its parent chain in
         # O(log depth) whole-array passes (depth is tiny thanks to path halving during unions).
         n = int(self._size)
         p = self.parent[:n].copy()
@@ -16166,11 +15759,10 @@ class _UnionFind:
 def _adjacent_xy_offsets_for_3d_connectivity(connectivity: int) -> Tuple[Tuple[int, int], ...]:
     """Return XY offsets that connect components across adjacent z-slices.
 
-    Connectivity is interpreted in the standard cubic-neighborhood sense:
-      - 6-connected: only face adjacency across z, so the same (y, x) position
-      - 18-connected: face/edge adjacency, so same position plus cardinal XY offsets
-      - 26-connected: face/edge/corner adjacency, so the full 3x3 XY neighborhood
-    """
+ Connectivity is interpreted in the standard cubic-neighborhood sense:
+ - 6-connected: only face adjacency across z, so the same (y, x) position
+ - 18-connected: face/edge adjacency, so same position plus cardinal XY offsets
+ - 26-connected: face/edge/corner adjacency, so the full 3x3 XY neighborhood"""
     connectivity_i = int(connectivity)
     if connectivity_i == 6:
         return ((0, 0),)
@@ -16199,12 +15791,11 @@ def _adjacent_gid_pair_codes(
 ) -> np.ndarray:
     """Return unique touching component-id pairs encoded as uint64 values.
 
-    The upper 32 bits contain the previous-slice gid and the lower 32 bits contain the
-    current-slice gid. ``prev_offset`` and ``curr_offset`` allow callers to pass per-slice
-    local labels and encode global provisional ids without first rewriting the whole volume.
-    Pair extraction is independent for each adjacent slice pair, so callers can run this
-    function concurrently and then apply union-find merges serially.
-    """
+ The upper 32 bits contain the previous-slice gid and the lower 32 bits contain the
+ current-slice gid. ``prev_offset`` and ``curr_offset`` allow callers to pass per-slice
+ local labels and encode global provisional ids without first rewriting the whole volume.
+ Pair extraction is independent for each adjacent slice pair, so callers can run this
+ function concurrently and then apply union-find merges serially."""
     h, w = prev_gid.shape
     offsets = tuple(xy_offsets) if xy_offsets is not None else _adjacent_xy_offsets_for_3d_connectivity(26)
     code_parts: List[np.ndarray] = []
@@ -16280,20 +15871,9 @@ def fill_3d_voids_inplace_streaming(
     reserve_bytes: int = 16 * GIB,
     connectivity: int = 6,
 ) -> None:
-    """Fill enclosed 3D voids by labeling background connected components once.
-
-    v12.2.0 allows 3D void fill only as an optional final global-union step. This
-    function performs that operation by labeling the background volume, marking any
-    background component connected to the volume boundary, and converting all other
-    background components to foreground. The default 6-connected background matches
-    the usual enclosed-void interpretation used by binary hole filling; set
-    ``YOLO_TTA_VOIDFILL_CONNECTIVITY`` or pass ``connectivity`` explicitly to use 18
-    or 26 connectivity.
-
-      - prefers anonymous RAM/swap-backed arrays for the 3D background-ID workspace
-      - falls back to a disk-backed memmap only when the estimated working set would be too large
-      - avoids tmpfs-backed bulk scratch files that could previously SIGBUS when /dev/shm filled
-    """
+    """Fill enclosed 3D background components with configurable 6, 18, or 26 connectivity.
+    
+    The label workspace prefers anonymous memory and falls back to a memmap when admission requires it."""
     env_conn = os.environ.get('YOLO_TTA_VOIDFILL_CONNECTIVITY', '').strip()
     if env_conn:
         try:
@@ -16323,7 +15903,7 @@ def fill_3d_voids_inplace_streaming(
         bg_gid_path = work_prefix.with_suffix('.bg_gid.u32.dat')
         bg_gid_path.parent.mkdir(parents=True, exist_ok=True)
         bg_gid_store = np.memmap(bg_gid_path, dtype=np.uint32, mode='w+', shape=(z_dim, h, w))
-    numa_interleave_memory(bg_gid_store, desc='3D void fill gid store')  # v13.3.5 (N2)
+    numa_interleave_memory(bg_gid_store, desc='3D void fill gid store')  #
 
     uf = _UnionFind()
     prev_gid_slice: Optional[np.ndarray] = None
@@ -16369,7 +15949,7 @@ def fill_3d_voids_inplace_streaming(
             pass
 
 
-# v13.3.2 (R6b/R6c): no-GIL LUT-apply kernels. Both walk only each slice's recorded foreground
+# no-GIL LUT-apply kernels. Both walk only each slice's recorded foreground
 # bbox and read the slice's LUT window from one concatenated table (slice z's local id v maps
 # through lut_flat[lut_offsets[z] + v]).
 if _numba is not None:
@@ -16412,7 +15992,7 @@ if _numba is not None:
     def _numba_sparse_keep_lut_apply_kernel(  # pragma: no cover - jit
         labels_flat, label_offsets, keep_flat, lut_offsets, bboxes, apply_slice, mask_out,
     ):
-        """C4 keep-largest apply directly from the packed per-slice label arena."""
+        """Keep-largest apply directly from the packed per-slice label arena."""
         z_dim = apply_slice.shape[0]
         for z in _numba.prange(z_dim):
             if apply_slice[z] == 0:
@@ -16437,14 +16017,13 @@ else:
 
 @dataclass(frozen=True)
 class SliceLocalLabelLUTs:
-    """v13.3.6 (A1): per-slice local-id -> canonical-compact-id lookup tables.
+    """Per-slice local-id -> canonical-compact-id lookup tables.
 
-    Exported by label_foreground_volume_streaming when the compact relabel pass is
-    skipped: slice z's local label v canonicalizes through
-    ``lut_flat[lut_offsets[z] + v]``. Consumers (component tables, projection-candidate
-    kernels) resolve ids through these tables instead of the full-volume relabel
-    rewriting the full-volume compact/global-id store.
-    """
+ Exported by label_foreground_volume_streaming when the compact relabel pass is
+ skipped: slice z's local label v canonicalizes through
+ ``lut_flat[lut_offsets[z] + v]``. Consumers (component tables, projection-candidate
+ kernels) resolve ids through these tables instead of the full-volume relabel
+ rewriting the full-volume compact/global-id store."""
 
     lut_flat: np.ndarray       # uint32, concatenated per-slice tables (index 0 of each = 0)
     lut_offsets: np.ndarray    # int64, one entry per slice
@@ -16456,25 +16035,19 @@ class SliceLocalLabelLUTs:
 
 
 def interpolation_sparse_labels_enabled() -> bool:
-    """v13.3.17 (C4): retain only each slice's local-label bbox crop.
+    """Retain only each slice's local-label bbox crop.
 
-    The dense uint16 local-id raster was 22.7--37.1 GiB for the prioritized
-    views even though every consumer already knew the per-slice foreground
-    bbox. Sparse labels are default-on whenever compact relabel is skipped;
-    YOLO_TTA_INTERPOLATION_SPARSE_LABELS=0 restores the dense store.
-    """
+ The dense uint16 local-id raster was 22.7--37.1 GiB for the prioritized
+ views even though every consumer already knew the per-slice foreground
+ bbox. Sparse labels are default-on whenever compact relabel is skipped;
+ YOLO_TTA_INTERPOLATION_SPARSE_LABELS=0 restores the dense store."""
     return _env_flag('YOLO_TTA_INTERPOLATION_SPARSE_LABELS', True)
 
 
 class SparseSliceLabelStore:
-    """Ragged per-slice local-label arena with dense-window compatibility.
-
-    Stage A writes one tight crop per slice. finalize packs those crops into
-    one contiguous typed arena plus offsets/bboxes, so compiled candidate search
-    can address a global (z,y,x) without a dense volume. Compatibility reads
-    materialize only the requested window; a full plane is produced only for a
-    legacy fallback, not the normal component-table/planner path.
-    """
+    """Sparse slice-local label storage with one bbox crop per nonempty slice.
+    
+    Finalization packs crops into a contiguous typed arena with offsets and bboxes for compiled downstream access."""
 
     def __init__(self, shape: Sequence[int], dtype: np.dtype | str | type) -> None:
         self.shape = tuple(int(v) for v in shape)
@@ -16655,23 +16228,21 @@ class SparseSliceLabelStore:
 
 
 def interpolation_skip_compact_relabel_enabled() -> bool:
-    """v13.3.6 (A1): interpolation consumes per-slice local ids through LUTs by default.
+    """Interpolation consumes per-slice local ids through LUTs by default.
 
-    The compact relabel was a full read+write pass over the label store whose only product
-    was canonical ids in the raster; component tables and
-    the candidate kernels now canonicalize at read time. Set
-    YOLO_TTA_INTERPOLATION_SKIP_COMPACT_RELABEL=0 to restore the relabel pass.
-    """
+ The compact relabel was a full read+write pass over the label store whose only product
+ was canonical ids in the raster; component tables and
+ the candidate kernels now canonicalize at read time. Set
+ YOLO_TTA_INTERPOLATION_SKIP_COMPACT_RELABEL=0 to restore the relabel pass."""
     return _env_flag('YOLO_TTA_INTERPOLATION_SKIP_COMPACT_RELABEL', True)
 
 
 def interpolation_local_label_uint16_enabled() -> bool:
-    """v13.3.9 (D5): use uint16 for stores that contain only slice-local ids.
+    """Use uint16 for stores that contain only slice-local ids.
 
-    Compact relabeling still requires uint32 because canonical/global component ids
-    can exceed 65535.  Set YOLO_TTA_INTERPOLATION_LOCAL_LABEL_UINT16=0 to restore
-    the previous uint32 local-label store.
-    """
+ Compact relabeling still requires uint32 because canonical/global component ids
+ can exceed 65535. Set YOLO_TTA_INTERPOLATION_LOCAL_LABEL_UINT16=0 to restore
+ the previous uint32 local-label store."""
     return _env_flag('YOLO_TTA_INTERPOLATION_LOCAL_LABEL_UINT16', True)
 
 
@@ -16682,7 +16253,7 @@ def _local_label_store_dtype(compact_relabel: bool) -> np.dtype:
 
 
 class _LocalLabelCapacityError(RuntimeError):
-    """D5's deliberate pre-narrowing stop; never reinterpret it as a GPU failure."""
+    """Signal local-label dtype exhaustion so the caller can retry with a wider or CPU path."""
 
 
 def _check_local_label_store_capacity(count: int, dtype: np.dtype, *, z: int) -> None:
@@ -16695,28 +16266,27 @@ def _check_local_label_store_capacity(count: int, dtype: np.dtype, *, z: int) ->
 
 
 def gpu_slice_labeling_enabled() -> bool:
-    """v13.3.6 (D3): run per-slice 2D component labeling on the GPU where CUDA is available."""
+    """Run per-slice 2D component labeling on the GPU where CUDA is available."""
     return _env_flag('YOLO_TTA_GPU_SLICE_LABELING', True)
 
 
 def gpu_slice_labeling_in_children_enabled() -> bool:
-    """v13.3.6 (D3): allow GPU labeling inside dedicated interpolation child processes.
+    """Allow GPU labeling inside dedicated interpolation child processes.
 
-    Off by default: each child would have to create its own CUDA context (init latency +
-    VRAM per child, times up to 6 children) just for labeling. The aux GPU-worker
-    interpolation hosts (v13.3.4 T4) already own a warm context and take the GPU path
-    automatically; the main process (keep_objects) does too.
-    """
+ Off by default: each child would have to create its own CUDA context (init latency +
+ VRAM per child, times up to 6 children) just for labeling. The aux GPU-worker
+ interpolation hosts already own a warm context and take the GPU path
+ automatically; the main process (keep_objects) does too."""
     return _env_flag('YOLO_TTA_GPU_SLICE_LABELING_IN_CHILDREN', False)
 
 
 def gpu_slice_labeling_pairs_enabled() -> bool:
-    """v13.3.14 (D6): emit adjacent-slice local-id pair codes while labels are on CUDA."""
+    """Emit adjacent-slice local-id pair codes while labels are on CUDA."""
     return _env_flag('YOLO_TTA_GPU_SLICE_LABELING_PAIRS', True)
 
 
 def topology_slab_slices() -> int:
-    """v16.0.2 z-depth of independently resolved 3D topology slabs."""
+    """Z-depth of independently resolved 3D topology slabs."""
     return max(4, _env_int('YOLO_TTA_TOPOLOGY_SLAB_SLICES', 64))
 
 
@@ -16758,13 +16328,12 @@ _GPU_SLICE_LABELING_CONFIGURED_DEVICES: Optional[Tuple[int, ...]] = None
 
 
 def configure_gpu_slice_labeling_devices(devices: Sequence[str]) -> None:
-    """Remember the CUDA subset selected by ``--device`` for main-process D7 work.
+    """Remember the CUDA subset selected by ``--device`` for main-process work.
 
-    CUDA worker processes are pinned to one visible device before importing/initializing
-    torch, so their logical device count remains authoritative.  This hint is primarily for
-    the unpinned parent, where every SLURM-visible GPU may otherwise be discoverable even when
-    the command selected a smaller subset.
-    """
+ CUDA worker processes are pinned to one visible device before importing/initializing
+ torch, so their logical device count remains authoritative. This hint is primarily for
+ the unpinned parent, where every SLURM-visible GPU may otherwise be discoverable even when
+ the command selected a smaller subset."""
     configured: List[int] = []
     for device in devices:
         token = str(device).strip().lower()
@@ -16799,13 +16368,12 @@ def _gpu_adjacent_local_pair_codes_device(
     h: int,
     w: int,
 ) -> object:
-    """D6 device equivalent of ``_adjacent_gid_pair_codes`` for local ids.
+    """Device equivalent of ``_adjacent_gid_pair_codes`` for local ids.
 
-    The same one-pixel-expanded bbox-intersection window and the same nine XY shifts are
-    used as the CPU stage-C path.  Local ids are packed into uint64 (previous in the high
-    word, current in the low word); global slice offsets are deliberately applied only after
-    all blocks finish and the complete component-count prefix sum is known.
-    """
+ The same one-pixel-expanded bbox-intersection window and the same nine XY shifts are
+ used as the CPU stage-C path. Local ids are packed into uint64 (previous in the high
+ word, current in the low word); global slice offsets are deliberately applied only after
+ all blocks finish and the complete component-count prefix sum is known."""
     py0, py1, px0, px1 = (int(v) for v in prev_bbox)
     cy0, cy1, cx0, cx1 = (int(v) for v in curr_bbox)
     ry0 = max(0, max(py0, cy0) - 1)
@@ -16841,7 +16409,7 @@ def _gpu_adjacent_local_pair_codes_device(
         code_parts.append((a_vals << cp.uint64(32)) | b_vals)
     if not code_parts:
         return cp.empty((0,), dtype=cp.uint64)
-    # Exactly one unique reduction per adjacent slice pair.  The caller concatenates every
+    # Exactly one unique reduction per adjacent slice pair. The caller concatenates every
     # pair result in the block for one small D2H transfer rather than one transfer per z.
     return cp.unique(cp.concatenate(code_parts))
 
@@ -16858,27 +16426,9 @@ def _try_label_slices_stage_a_gpu(
     known_slice_any: Optional[np.ndarray] = None,
     preferred_block_slices: Optional[int] = None,
 ) -> Tuple[bool, Optional[List[Optional[np.ndarray]]]]:
-    """D3/D6/D7 GPU drop-in for per-slice labeling and adjacent-pair extraction.
-
-    One cupy ``label`` call per z-block with a z-DISCONNECTED structure (full 3x3 in-plane
-    neighbourhood, nothing across z — the same trick as the S2 device hole fill) labels
-    every slice of the block independently and 8-connected in one kernel pass. Component
-    slice/area/bbox stats come from torch scatter reductions over the block's foreground
-    coordinates, components are renumbered to per-slice-contiguous LOCAL ids (the CPU cv2
-    stage's contract: ids 1..k per slice, order arbitrary), and the relabeled block is
-    written back into the selected local-label store restricted to each slice's bbox.
-    v13.3.9 (D5) makes that store uint16 on the default no-compact-relabel path;
-    the device-to-host relabel result remains int32 and is narrowed during the
-    bbox-restricted host copy.
-
-    v13.3.14 D7 assigns independent blocks round-robin to a bounded one-lane-per-device
-    thread pool. D6 extracts local-id adjacency codes before each relabeled device block is
-    released, including block boundaries from retained edge planes. Stage C applies global
-    prefix offsets and feeds the unchanged union-find. The second return value contains one
-    optional local-code array per z pair; ``None`` means stage C must use its CPU reader.
-    ANY GPU failure re-zeroes the store and returns ``(False, None)`` for the complete CPU
-    fallback.
-    """
+    """Label independent slice blocks on the selected GPUs.
+    
+    Produces slice-local labels, area/bbox metadata, and optional adjacent-slice pair codes without a duplicate CPU pass."""
     if not gpu_slice_labeling_enabled():
         return False, None
     try:
@@ -16892,7 +16442,7 @@ def _try_label_slices_stage_a_gpu(
         ):
             # Dedicated interpolation children refuse to CREATE a CUDA context just for
             # labeling (init latency + VRAM, times up to 6 children). The aux GPU-worker
-            # hosts (v13.3.4 T4) enter through the same entry point but already own a live
+            # hosts enter through the same entry point but already own a live
             # context from inference — they proceed.
             return False, None
         cp_mod = _try_import_cupy_ndimage()
@@ -16906,7 +16456,7 @@ def _try_label_slices_stage_a_gpu(
     if z_dim <= 0 or h < 2 or w < 2:
         return False, None
 
-    # Filled once D7 admission succeeds.  Keeping this outside the guarded body lets
+    # Filled once admission succeeds. Keeping this outside the guarded body lets
     # every exit path release cached allocations on *all* participating devices rather
     # than whichever CUDA device happens to be current in the coordinator thread.
     device_indices: List[int] = []
@@ -16920,7 +16470,7 @@ def _try_label_slices_stage_a_gpu(
                 except Exception:
                     pass
             return
-        # No D7 device was admitted, so preserve the former best-effort cleanup for
+        # No device was admitted, so preserve the former best-effort cleanup for
         # failures that occur before the selected-device list is finalized.
         try:
             cp.get_default_memory_pool().free_all_blocks()
@@ -16945,7 +16495,7 @@ def _try_label_slices_stage_a_gpu(
         )
         requested_device_cap = min(int(requested_device_cap), len(candidate_indices))
         plane = int(h) * int(w)
-        # Adaptive z-block: u8 mask + int32 labels + int32 relabel + label() workspace,
+        # Adaptive z-block: u8 mask + int32 labels + int32 relabel + label workspace,
         # ~17 B/voxel, plus ~1 GiB headroom for the coordinate transients.
         requested_block = max(4, _env_int('YOLO_TTA_GPU_SLICE_LABELING_BLOCK', int(preferred_block_slices or topology_slab_slices())))
         device_free: List[Tuple[int, int]] = []
@@ -16959,7 +16509,7 @@ def _try_label_slices_stage_a_gpu(
         if not device_free:
             return False, None
         if requested_device_cap == 1:
-            # Preserve D3's least-contentious single-device behavior when explicitly forced.
+            # When explicitly restricted to one device, use the freest candidate.
             selected_free = [max(device_free, key=lambda item: int(item[1]))]
         else:
             # Use the freest configured devices, then restore logical-index order so block
@@ -17145,9 +16695,9 @@ def _try_label_slices_stage_a_gpu(
                     relabeled_cp[-1].copy()
                     if pairs_on_device and int(counts_np[-1]) > 0 else None
                 )
-                # Existing D3 transfer: labels must remain in the local-id store for later
+                # Existing transfer: labels must remain in the local-id store for later
                 # component-table/SDF consumers. Pair codes above add only one tiny D2H block.
-                # v13.3.17 C4 packs the tight device crops (already narrowed to the store
+                # packs the tight device crops (already narrowed to the store
                 # dtype) and transfers them once. The normal sparse path therefore never
                 # creates the former dense int32 host block (~1 GiB at 64x2048^2).
                 if isinstance(labels_store, SparseSliceLabelStore):
@@ -17236,7 +16786,7 @@ def _try_label_slices_stage_a_gpu(
                                 raise RuntimeError(
                                     f'missing retained GPU label plane for block boundary z={boundary_z}'
                                 )
-                            # D6 boundary pair: use the retained previous-block device edge
+                            # boundary pair: use the retained previous-block device edge
                             # and current device edge, never re-read either label slice from
                             # the host store. Peer-copy the one previous plane when round-robin
                             # placed the blocks on different GPUs; only non-P2P systems use a
@@ -17339,38 +16889,13 @@ def label_foreground_volume_streaming(
     known_slice_bboxes: Optional[np.ndarray] = None,
     sparse_local_labels: bool = False,
 ) -> Tuple[object, int, List[Path]]:
-    """Label a 3D foreground volume through parallel 2D labeling and slab-local topology.
-
-      - per-slice 2D connected-component labeling runs concurrently and, when CUDA is available,
-        slab-aligned z blocks are distributed round-robin across the selected GPUs
-      - each multi-slice slab resolves its internal 26-connected topology independently
-      - only slab-boundary component pairs enter the much smaller global union-find
-      - the existing sparse per-slice local-label store is preserved; no dense uint32 cube is built
-      - the compact relabel pass remains bbox-restricted and slice-parallel/Numba-compiled
-      - when wrap_axis is true, the first and last slices are treated as adjacent. This is used
-        for Radial view-native interpolation over the [0°, 180°) diameter-frame domain.
-
-    v13.3.2 (R6c): ``compact_relabel=False`` leaves the label volume in per-slice LOCAL ids and
-    skips the full-volume relabel write pass entirely; ``component_stats_out`` (a dict) then
-    receives component_counts / slice_offsets / slice_bboxes / root_map / unique_roots /
-    root_areas / total_components so callers (keep_objects) can apply decisions through
-    per-slice local->root LUTs. Per-component areas are harvested during 2D labeling
-    (cv2.connectedComponentsWithStats) only when stats are requested.
-
-    v13.3.6 (A1): ``component_stats_out`` additionally receives 'slice_local_luts' (a
-    SliceLocalLabelLUTs) — the same per-slice local->canonical-compact table the relabel
-    pass would have applied — so interpolation consumes local ids directly.
-    v13.3.6 (D1): ``known_slice_any``/``known_slice_bboxes`` (device-union metadata) let the
-    labeling stage skip empty slices without reading them and crop CC calls + store writes
-    to the known bboxes. v13.3.6 (D3): where CUDA is live in this process, stage A runs as
-    one z-disconnected cupy label per z-block instead of per-slice cv2 calls.
-    v13.3.17 (C4): ``sparse_local_labels`` stores only tight per-slice bbox crops in one
-    packed arena. It is valid only for the local-id/no-compact-relabel path and avoids the
-    prioritized interpolation passes' 22.7--37.1 GiB dense uint16 host raster.
-    """
+    """Resolve 3D foreground topology from parallel per-slice labels and slab-local unions.
+    
+    The caller may request compact global labels or retain slice-local ids with lookup tables for sparse downstream work."""
+    # DEAD PARAMETER: keep_temp is retained for labeling API compatibility.
     z_dim, h, w = mask_mm.shape
-    # v13.3.9 (D5): when compact relabel is skipped, this raster never holds
-    # canonical/global ids — only per-slice local ids 1..k.  Halve the dominant
+    # when compact relabel is skipped, this raster never holds
+    # canonical/global ids — only per-slice local ids 1..k. Halve the dominant
     # workspace with uint16 while retaining uint32 for the compact/global path.
     label_dtype = _local_label_store_dtype(bool(compact_relabel))
     estimated_bytes = estimate_voidfill_workspace_bytes((z_dim, h, w), dtype=label_dtype)
@@ -17409,7 +16934,7 @@ def label_foreground_volume_streaming(
         labels_store = np.memmap(provisional_path, dtype=label_dtype, mode='w+', shape=(z_dim, h, w))
         label_paths = [provisional_path]
     if not sparse_enabled:
-        numa_interleave_memory(labels_store, desc='Interpolation label store')  # v13.3.5 (N2)
+        numa_interleave_memory(labels_store, desc='Interpolation label store')  #
 
     if int(z_dim) <= 0:
         flush_array(labels_store)
@@ -17430,7 +16955,7 @@ def label_foreground_volume_streaming(
     )
 
     component_counts = np.zeros((int(z_dim),), dtype=np.uint32)
-    # v13.2.5 (speed #11): per-slice foreground bboxes (y0, y1, x0, x1; exclusive stops) captured
+    # per-slice foreground bboxes (y0, y1, x0, x1; exclusive stops) captured
     # during labeling so cross-slice pair extraction only reads the overlapping bbox windows.
     slice_bboxes = np.zeros((int(z_dim), 4), dtype=np.int64)
     collect_stats = component_stats_out is not None
@@ -17438,7 +16963,7 @@ def label_foreground_volume_streaming(
 
     def _label_slice_local(z: int) -> None:
         z_i = int(z)
-        # v13.3.6 (D1): device-union metadata skips empty slices without touching their
+        # device-union metadata skips empty slices without touching their
         # pages and restricts the CC call (and the store write) to the known bbox window.
         if known_slice_any is not None and not bool(known_slice_any[z_i]):
             component_counts[z_i] = np.uint32(0)
@@ -17452,7 +16977,7 @@ def label_foreground_volume_streaming(
             src = np.asarray(mask_mm[z_i, ky0:ky1, kx0:kx1])
         else:
             src = np.asarray(mask_mm[z_i])
-        # v13.3.6 (A4): OpenCV treats ANY nonzero pixel as foreground, so the raw uint8
+        # OpenCV treats ANY nonzero pixel as foreground, so the raw uint8
         # slice labels identically to the old (mask>0) cast — the full-slice compare+copy
         # per slice is deleted (contiguity copy only for bbox crops).
         fg = np.ascontiguousarray(src)
@@ -17461,7 +16986,7 @@ def label_foreground_volume_streaming(
             return
 
         if collect_stats:
-            # v13.3.2 (R6c): per-component areas (and the slice bbox) fall out of the stats —
+            # per-component areas (and the slice bbox) fall out of the stats —
             # this deletes the caller's full-volume bincount pass.
             num_labels, labels2d, cc_stats, _cents = cv2.connectedComponentsWithStats(
                 fg, connectivity=8, ltype=cv2.CV_32S,
@@ -17510,7 +17035,7 @@ def label_foreground_volume_streaming(
             labels_store[z_i, :, :] = np.asarray(labels2d, dtype=label_dtype)  # type: ignore[index]
         component_counts[z_i] = np.uint32(local_count)
 
-    # v13.3.6 (D3): one z-disconnected cupy label pass per block on the GPU replaces the
+    # one z-disconnected cupy label pass per block on the GPU replaces the
     # per-slice cv2 stage when CUDA is available in this process; CPU threads otherwise.
     label_phase_started = time.perf_counter()
     gpu_stage_a_done, gpu_stage_a_pair_codes = _try_label_slices_stage_a_gpu(
@@ -17551,7 +17076,7 @@ def label_foreground_volume_streaming(
         raise RuntimeError('3D component id space exceeded uint32 capacity')
 
     # Slice z's provisional global id range is
-    # [slice_offsets[z] + 1, slice_offsets[z] + component_counts[z]].  The label volume remains
+    # [slice_offsets[z] + 1, slice_offsets[z] + component_counts[z]]. The label volume remains
     # in local per-slice ids until compact relabel so we avoid a full-volume promotion write pass.
     cumsum = np.cumsum(component_counts.astype(np.uint64, copy=False), dtype=np.uint64)
     slice_offsets = np.zeros((int(z_dim),), dtype=np.uint32)
@@ -17861,10 +17386,10 @@ def label_foreground_volume_streaming(
     compact_root_ids[unique_roots] = np.arange(1, unique_roots.size + 1, dtype=np.uint32)
     gid_to_compact = compact_root_ids[root_map]
 
-    # v13.3.2 (R6b): per-slice local->compact LUTs live in one concatenated table (slice z's
+    # per-slice local->compact LUTs live in one concatenated table (slice z's
     # local id v maps through lut_flat[lut_offsets[z] + v]), and the relabel touches only each
     # slice's recorded foreground bbox — labels outside it are guaranteed zero.
-    # v13.3.6 (A1): the same table is now ALSO exported through component_stats_out
+    # the same table is now ALSO exported through component_stats_out
     # ('slice_local_luts') so callers can consume per-slice local ids directly and skip the
     # full-volume relabel pass entirely.
     lut_started = time.perf_counter()
@@ -17883,7 +17408,7 @@ def label_foreground_volume_streaming(
 
     if collect_stats:
         area_started = time.perf_counter()
-        # v13.3.2 (R6c): per-gid areas -> per-root areas (bincount is one vectorized pass; voxel
+        # per-gid areas -> per-root areas (bincount is one vectorized pass; voxel
         # counts stay far below 2^53 so the float64 accumulation is exact).
         gid_areas = np.zeros((int(total_components) + 1,), dtype=np.int64)
         for z in range(int(z_dim)):
@@ -17918,7 +17443,7 @@ def label_foreground_volume_streaming(
         })
 
     if not compact_relabel:
-        # v13.3.2 (R6c): the caller consumes per-slice LOCAL ids through root LUTs — skip the
+        # the caller consumes per-slice LOCAL ids through root LUTs — skip the
         # full-volume relabel write pass entirely.
         flush_array(labels_store)
         return labels_store, int(unique_roots.size), label_paths
@@ -17955,7 +17480,7 @@ def label_foreground_volume_streaming(
             block = np.asarray(labels_store[int(z), int(y0):int(y1), int(x0):int(x1)])
             if np.any(block):
                 labels_store[int(z), int(y0):int(y1), int(x0):int(x1)] = local_to_compact[block]
-            # v13.2.5 (speed #11): an all-zero block is already zero in the store; the old
+            # an all-zero block is already zero in the store; the old
             # else-branch fill(0) rewrote it needlessly (dirtying pages on memmap-backed stores).
             return int(y1) - int(y0)
 
@@ -17990,16 +17515,15 @@ def build_slice_endpoint_seeds_from_label_volume(
 ) -> Tuple[List[SliceEndpointSeed], int]:
     """Fast slice-graph endpoint scan for slice-direction interpolation.
 
-    This avoids per-object 3D voxel skeletonization on large relabeled volumes, which can become
-    prohibitively slow when an object's bounding box spans a large fraction of the volume. Endpoints
-    are identified from connected components in each slice that do not continue into the previous or
-    next slice of the same relabeled object. When wrap_axis is true, slice 0 and the
-    final slice are also considered adjacent for Radial interpolation.
+ This avoids per-object 3D voxel skeletonization on large relabeled volumes, which can become
+ prohibitively slow when an object's bounding box spans a large fraction of the volume. Endpoints
+ are identified from connected components in each slice that do not continue into the previous or
+ next slice of the same relabeled object. When wrap_axis is true, slice 0 and the
+ final slice are also considered adjacent for Radial interpolation.
 
-    When a component cache is supplied, the scan reuses cached per-slice component tables and tests
-    continuation only inside each component's crop. This makes endpoint discovery and later seed
-    planning share the same component records instead of relabeling slices again per seed/bridge.
-    """
+ When a component cache is supplied, the scan reuses cached per-slice component tables and tests
+ continuation only inside each component's crop. This makes endpoint discovery and later seed
+ planning share the same component records instead of relabeling slices again per seed/bridge."""
     z_dim = int(labels_real.shape[0])
     if z_dim <= 0:
         return [], 0
@@ -18019,7 +17543,7 @@ def build_slice_endpoint_seeds_from_label_volume(
         if bool(wrap_axis) and z_dim > 1:
             prev_table = component_cache.get((z_i - 1) % z_dim)
             next_table = component_cache.get((z_i + 1) % z_dim)
-            # v13.2.2 bug #12: continuation across the radial 0°/180° wrap happens at
+            # continuation across the radial 0°/180° wrap happens at
             # u -> width-1-u, not at the same u (see _component_record_mirrored_u).
             prev_wrapped = z_i == 0
             next_wrapped = z_i == (z_dim - 1)
@@ -18064,7 +17588,7 @@ def build_slice_endpoint_seeds_from_label_volume(
             return []
 
         if bool(wrap_axis) and z_dim > 1:
-            # v13.2.2 bug #12: the wrap-adjacent frame continues at u -> width-1-u, so
+            # the wrap-adjacent frame continues at u -> width-1-u, so
             # mirror the neighbor slice when the adjacency crosses the 0°/180° boundary.
             prev_slice = np.asarray(labels_real[(int(z) - 1) % z_dim])
             if int(z) == 0:
@@ -18099,7 +17623,7 @@ def build_slice_endpoint_seeds_from_label_volume(
                 if anchor is None:
                     continue
 
-                # v12.2.0 endpoint continuation is defined by direct footprint overlap in
+                # endpoint continuation is defined by direct footprint overlap in
                 # the adjacent slice; do not dilate/skeletonize the component for endpoint discovery.
                 has_prev = bool(prev_same is not None and np.any(comp & prev_same))
                 has_next = bool(next_same is not None and np.any(comp & next_same))
@@ -18162,7 +17686,7 @@ _DENSE_RADIAL_BACKPROJECT_MAP_CACHE: Dict[Tuple[object, ...], DenseRadialBackpro
 
 
 def radial_full_coverage_angle_deg(diameter: int) -> float:
-    """Return the v12.2.0 radial spacing that gives approximately 1x ROI edge coverage."""
+    """Return the radial spacing that gives approximately 1x ROI edge coverage."""
     diameter_i = max(1, int(diameter))
     return float(360.0 / (math.pi * float(diameter_i)))
 
@@ -18180,9 +17704,8 @@ def _nearest_radial_source_for_backprojection(
 ) -> Tuple[int, bool]:
     """Nearest source plane over the unoriented [0, 180) radial diameter domain.
 
-    When the nearest match crosses the 0/180 boundary, the same diameter plane is reused with
-    the radial coordinate reversed so source raster coordinates still map to the target plane.
-    """
+ When the nearest match crosses the 0/180 boundary, the same diameter plane is reused with
+ the radial coordinate reversed so source raster coordinates still map to the target plane."""
     if source_angles_deg.size <= 0:
         raise ValueError('No radial source angles are available for backprojection')
 
@@ -18196,11 +17719,10 @@ def _nearest_radial_source_for_backprojection(
 def build_radial_backprojection_plan(radial_view: ViewInfo) -> Tuple[List[RadialBackprojectionSample], Dict[str, float]]:
     """Build the angular plan used to backproject a radial view into Cartesian space.
 
-    If the user-requested radial spacing is coarser than the v12.2.0 full-coverage spacing,
-    backprojection is densified to the full-coverage spacing and each dense angle samples the
-    nearest completed radial prediction frame. This keeps Radial masks view-native through
-    postprocessing/interpolation while preventing sparse spoke-like Cartesian backprojections.
-    """
+ If the user-requested radial spacing is coarser than the full-coverage spacing,
+ backprojection is densified to the full-coverage spacing and each dense angle samples the
+ nearest completed radial prediction frame. This keeps Radial masks view-native through
+ postprocessing/interpolation while preventing sparse spoke-like Cartesian backprojections."""
     source_angles = np.asarray([float(a) for a in radial_view.azimuths_deg], dtype=np.float64)
     if source_angles.size <= 0:
         return [], {
@@ -18214,7 +17736,7 @@ def build_radial_backprojection_plan(radial_view: ViewInfo) -> Tuple[List[Radial
 
     provided_spacing = _radial_view_nominal_spacing_deg(radial_view)
     coverage_spacing = radial_full_coverage_angle_deg(int(radial_view.diameter))
-    # The specification's guarantee formula is a maximum safe angular spacing.  A smaller
+    # The specification's guarantee formula is a maximum safe angular spacing. A smaller
     # user spacing is already dense enough; a larger spacing is densified during backprojection.
     effective_spacing = min(float(provided_spacing), float(coverage_spacing))
 
@@ -18258,11 +17780,10 @@ def build_dense_radial_backprojection_map(
 ) -> DenseRadialBackprojectionMap:
     """Map every selected-base-plane pixel to a Radial frame and diameter coordinate.
 
-    ``out_shape_hw`` is expressed in the selected Radial base plane: ``(Y,X)`` for
-    transverse, ``(t,X)`` for sagittal, and ``(t,Y)`` for coronal. Building the map
-    directly on the final plane is what turns the working-cube circle into the required
-    ellipse after the source t axis is restored.
-    """
+ ``out_shape_hw`` is expressed in the selected Radial base plane: ``(Y,X)`` for
+ transverse, ``(t,X)`` for sagittal, and ``(t,Y)`` for coronal. Building the map
+ directly on the final plane is what turns the working-cube circle into the required
+ ellipse after the source t axis is restored."""
     work_plane_h, work_plane_w = radial_plane_shape(radial_view)
     if out_shape_hw is None:
         out_h, out_w = int(work_plane_h), int(work_plane_w)
@@ -18345,8 +17866,7 @@ def build_dense_radial_backprojection_map(
 def _pick_gpu_compute_device(torch_mod: object) -> object:
     """Pick the CUDA device with the most free VRAM for main-process GPU stages.
 
-    ``YOLO_TTA_GPU_BACKPROJECT_DEVICE=<index>`` overrides the automatic choice.
-    """
+ ``YOLO_TTA_GPU_BACKPROJECT_DEVICE=<index>`` overrides the automatic choice."""
     explicit = os.environ.get('YOLO_TTA_GPU_BACKPROJECT_DEVICE', '').strip()
     if explicit:
         try:
@@ -18404,7 +17924,7 @@ def _radial_row_occupancy(radial_mask_mm: np.ndarray, desc: str) -> np.ndarray:
 
 
 def gpu_backproject_enabled() -> bool:
-    """v13.3.2 (R6a): stream radial backprojection through the GPU when torch + CUDA exist."""
+    """Stream radial backprojection through the GPU when torch + CUDA exist."""
     return _env_flag('YOLO_TTA_GPU_BACKPROJECT', True)
 
 
@@ -18483,9 +18003,8 @@ def _trt_binding_layout_for_backend(
 ) -> Tuple[List[str], str, List[str], Dict[str, int]]:
     """Resolve TensorRT I/O names without allocating a resident execution context.
 
-    The ring input dtype must be known before its static-address slots are allocated, so
-    layout discovery cannot live solely in ``_ResidentTensorRTRingExecutor.__init__``.
-    """
+ The ring input dtype must be known before its static-address slots are allocated, so
+ layout discovery cannot live solely in ``_ResidentTensorRTRingExecutor.__init__``."""
     names: List[str] = []
     indices: Dict[str, int] = {}
     if callable(getattr(engine, 'get_tensor_name', None)):
@@ -18537,11 +18056,10 @@ class _ResidentTensorRTRingFatalError(RuntimeError):
 class _ResidentTensorRTRingExecutor:
     """Two independent TensorRT contexts with static input/output addresses.
 
-    This adapter intentionally uses TensorRT's public execution-context API instead of
-    swapping ``AutoBackend.context`` in place.  If the engine, binding metadata, async
-    API, or fixed shapes cannot be proved safe, construction fails before source
-    consumption and the caller retains the ordinary direct-predict path.
-    """
+ This adapter intentionally uses TensorRT's public execution-context API instead of
+ swapping ``AutoBackend.context`` in place. If the engine, binding metadata, async
+ API, or fixed shapes cannot be proved safe, construction fails before source
+ consumption and the caller retains the ordinary direct-predict path."""
 
     @runtime_telemetry_phase('trt_ring.init')
     def __init__(
@@ -18602,7 +18120,7 @@ class _ResidentTensorRTRingExecutor:
             and self.native_w == self.out_size
             and _warp_matrix_is_identity(out_to_native)
         )
-        # Six scalar graph arguments, constant for the whole task.  This is the exact
+        # Six scalar graph arguments, constant for the whole task. This is the exact
         # native-pixel -> network-pixel inverse used by _affine_theta_for_grid_sample,
         # without allocating a per-frame/full-resolution grid tensor.
         self.native_to_out = tuple(
@@ -18629,7 +18147,7 @@ class _ResidentTensorRTRingExecutor:
             )
 
         # AutoBackend already owns one context. Borrow it plus ONE new context so the
-        # worker has two total (not three profile-sized context allocations).  v3 tensor
+        # worker has two total (not three profile-sized context allocations). tensor
         # addresses are restored before returning control to AutoBackend.
         original_context = getattr(backend, 'context', None)
         if original_context is None:
@@ -18908,7 +18426,7 @@ class _ResidentTensorRTRingExecutor:
             if bool(capture_graphs):
                 try:
                     graph = torch.cuda.CUDAGraph()
-                    # v15.0.3 fix: see _CUDA_GRAPH_CAPTURE_LOCK.
+                    # see _CUDA_GRAPH_CAPTURE_LOCK.
                     with _CUDA_GRAPH_CAPTURE_LOCK:
                         with torch.cuda.graph(graph, stream=slot.infer_stream):
                             self._execute_context(slot)
@@ -18935,7 +18453,7 @@ class _ResidentTensorRTRingExecutor:
             if bool(capture_graphs):
                 try:
                     graph = torch.cuda.CUDAGraph()
-                    # v15.0.3 fix: see _CUDA_GRAPH_CAPTURE_LOCK.
+                    # see _CUDA_GRAPH_CAPTURE_LOCK.
                     with _CUDA_GRAPH_CAPTURE_LOCK:
                         with torch.cuda.graph(graph, stream=slot.post_stream):
                             self._launch_post(slot)
@@ -18958,7 +18476,7 @@ class _ResidentTensorRTRingExecutor:
             slot.infer_stream.wait_event(slot.render_done)
             if bool(slot.post_valid):
                 # The preceding frame's mask kernel still reads this context's static
-                # output buffers.  Do not let the next enqueue overwrite them early.
+                # output buffers. Do not let the next enqueue overwrite them early.
                 slot.infer_stream.wait_event(slot.post_done)
             if slot.infer_graph is not None:
                 slot.infer_graph.replay()
@@ -18983,7 +18501,7 @@ class _ResidentTensorRTRingExecutor:
             else:
                 self._launch_post(slot)
             # The static slot output is copied into the task-resident destination before
-            # the slot is released.  No payload/result object or per-frame Future exists.
+            # the slot is released. No payload/result object or per-frame Future exists.
             device_union.union_dev[int(frame_index)].copy_(slot.native_union, non_blocking=True)
             if device_union.conf_dev is not None and slot.native_conf is not None:
                 device_union.conf_dev[int(frame_index)].copy_(slot.native_conf, non_blocking=True)
@@ -19012,10 +18530,9 @@ class _ResidentTensorRTRingExecutor:
     def close(self) -> None:
         """Drain ring streams, then restore borrowed AutoBackend binding addresses.
 
-        A failed drain or partial address restore is fatal: generic fallback must never run
-        while a context can still write ring buffers or the borrowed backend points at storage
-        this method is about to release.
-        """
+ A failed drain or partial address restore is fatal: generic fallback must never run
+ while a context can still write ring buffers or the borrowed backend points at storage
+ this method is about to release."""
         if bool(getattr(self, '_closed', False)):
             return
         self._closed = True
@@ -19139,7 +18656,7 @@ def _resident_trt_pipeline_acquire(
     track_conf: bool,
     confidence_threshold: float,
 ) -> Tuple['_ResidentTensorRTRingExecutor', bool]:
-    """Acquire the actual executor, not merely its two render slots (v13.3.15 P1)."""
+    """Acquire the actual executor, not merely its two render slots."""
     persist = bool(resident_trt_pipeline_persistence_enabled())
     if not persist:
         _resident_trt_pipeline_decline(backend)
@@ -19253,6 +18770,7 @@ def _try_resident_trt_ring_accumulate(
     device_union: Optional['_DeviceUnionAccumulator'],
 ) -> Optional[Dict[str, int]]:
     """Run the fixed batch-1 resident task through a worker-lifetime TensorRT executor."""
+    # DEAD PARAMETER: source_label is retained for the specialized predictor API.
     global _RESIDENT_TRT_RING_ANNOUNCED, _RESIDENT_TRT_RING_FALLBACK_WARNED
     global _RESIDENT_TRT_RING_CACHE_HIT_ANNOUNCED
     backend = getattr(predictor, 'model', None)
@@ -19441,12 +18959,11 @@ def _stage_radial_t_major_block(
     stage_pool: Optional[ThreadPoolExecutor] = None,
     stage_workers: int = 1,
 ) -> np.ndarray:
-    """Stage one contiguous radial row block as ``(t, azimuth, u)``.
+    """Stage one contiguous Radial row interval as ``(t, azimuth, u)``.
 
-    The legacy projection repeatedly gathered ``source[:, t, :]``, which is the slow axis of
-    the azimuth-major interpolation volume.  Dense sources are transposed one block at a time;
-    sparse bridge deltas use their interpolation-carried bboxes and copy only intersecting crop
-    rows.  The returned view always has exactly ``v1-v0`` rows.
+    Dense sources are transposed one bounded block at a time. Sparse bridge deltas use
+    interpolation-carried bboxes and copy only intersecting crop rows. The returned view
+    contains exactly ``max(0, v1 - v0)`` clipped rows.
     """
     n_az, work_t, u_len = (int(v) for v in radial_mask_mm.shape)
     lo = int(np.clip(int(v0), 0, work_t))
@@ -19512,14 +19029,9 @@ def _emit_projection_block_callback(
     desc: str,
     required: bool = False,
 ) -> None:
-    """Deliver a completed projection block.
-
-    Dense projections retain the historical best-effort tee: if the incremental store
-    rejects a block, the complete dense raster is still authoritative.  v13.3.17 C2 adds
-    ``required`` for sink-only projections.  With no redundant dense raster to recover
-    from, callback failure aborts the transaction and propagates immediately so the
-    materializer can discard the partial store and rerun through the dense fallback.
-    """
+    """Deliver one completed projection block to an incremental sink.
+    
+    Dense projections treat sink failure as best effort; sink-only projections require success and abort transactionally on failure."""
     if callback is None:
         if bool(required):
             raise RuntimeError(f'{desc}: sink-only projection requires a block consumer')
@@ -19572,7 +19084,7 @@ def _emit_projection_empty_range(
                     pass
             return
     # Compatibility callbacks that predate consume_empty_range still receive a normal
-    # block.  This allocation is bounded by one projection chunk, never the full raster.
+    # block. This allocation is bounded by one projection chunk, never the full raster.
     _emit_projection_block_callback(
         callback,
         int(z0),
@@ -19599,7 +19111,7 @@ def gpu_resident_radial_backproject_enabled() -> bool:
 
 
 def fused_single_angle_radial_component_layer_enabled() -> bool:
-    """C12: project one post-interpolation Radial union in the single-angle fast path."""
+    """Project one post-interpolation Radial union in the single-angle fast path."""
     return _env_flag('YOLO_TTA_FUSED_SINGLE_ANGLE_RADIAL_LAYER', True)
 
 
@@ -19733,16 +19245,9 @@ def _radial_backproject_gpu_resident(
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
     sink_only: bool = False,
 ) -> bool:
-    """Project a fully resident radial source with staged upload/commit overlap.
-
-    v13.3.16 R24 keeps R23's one-time source upload but fixes the two serial sections
-    visible in run 126080: two pinned source slots overlap host reads with H2D, and two
-    output slots let the next CUDA chunk run while the previous dense block is copied to
-    the destination and encoded into the incremental cvol. When VRAM permits, one device
-    transpose changes the source from (azimuth,t,u) to (t,azimuth,u), reducing the dominant
-    per-warp azimuth stride from work_t*u bytes to u bytes. Every stage retains an automatic
-    fallback to the v13.3.15 azimuth-major/single-slot behavior.
-    """
+    """Backproject a fully resident Radial volume with overlapped upload, CUDA work, and host commit.
+    
+    An optional transposed device layout improves azimuth locality while preserving a bounded fallback."""
     if not gpu_resident_radial_backproject_enabled():
         return False
     kernels = _radial_resident_backproject_kernel()
@@ -19916,7 +19421,7 @@ def _radial_backproject_gpu_resident(
                 transpose_seconds = time.perf_counter() - transpose_t0
 
             cp_radial = cp.asarray(compute_tensor)
-            # C12: allocate output device and pinned-host slots as pairs. A slot is not
+            # allocate output device and pinned-host slots as pairs. A slot is not
             # reused until its D2H event and CPU sink commit have both completed; another
             # slot can therefore run the next projection while copy/packing proceeds.
             for _ in range(int(requested_pipeline_slots)):
@@ -20041,7 +19546,7 @@ def _radial_backproject_gpu_resident(
     finally:
         active_exception = sys.exc_info()[0] is not None
         cleanup_error: Optional[BaseException] = None
-        # C12 exception safety: a callback failure can leave later D2Hs queued while their
+        # exception safety: a callback failure can leave later D2Hs queued while their
         # commit futures have not started. Quiesce both CUDA streams before any future can
         # be cancelled and before device/pinned slot references are released.
         for owned_stream in (compute_stream, copy_stream):
@@ -20094,19 +19599,7 @@ def _radial_backproject_gpu_streaming(
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
     sink_only: bool = False,
 ) -> bool:
-    """v13.3.2 (R6a): radial backprojection with a <1 GiB streaming GPU working set.
-
-    The gather maps upload once; per t-chunk only the covering NONEMPTY radial cross-sections
-    are copied into pinned memory (strided host copies release the GIL), gathered/scattered on
-    device, and the finished output planes come back through one pinned D2H per chunk. Chunks
-    whose cross-sections are all empty are skipped entirely (the output is pre-zeroed).
-    Returns False when torch/CUDA/VRAM are unavailable so the caller runs the CPU path.
-
-    v13.3.3 (S1): row emptiness comes from one up-front threaded sequential occupancy pass
-    instead of per-chunk strided rescans of the whole azimuth-major memmap; the nonempty row
-    staging into pinned memory is thread-parallel; the device is picked by free VRAM instead
-    of hardcoded cuda:0.
-    """
+    """Backproject a Radial volume through a bounded streaming GPU working set."""
     try:
         import torch  # type: ignore
     except Exception:
@@ -20119,7 +19612,7 @@ def _radial_backproject_gpu_streaming(
     dev = _pick_gpu_compute_device(torch)
     n_az, work_t, u_len = (int(x) for x in radial_mask_mm.shape)
     plane_px = int(out_h) * int(out_w)
-    # v13.3.11: 128 output planes is the default projection quantum (256 is also supported
+    # 128 output planes is the default projection quantum (256 is also supported
     # through the existing environment override). This amortizes map gathers and lets the
     # source be transposed into t-major order once per block instead of once per row.
     t_chunk = max(1, _env_int('YOLO_TTA_GPU_BACKPROJECT_T_CHUNK', 128))
@@ -20152,8 +19645,8 @@ def _radial_backproject_gpu_streaming(
         )
         return False
 
-    # v13.3.3 (S1): one sequential occupancy pass replaces ~O(chunks x rows) strided rescans.
-    # v13.3.6 (D1): the device union already produced this bitmap; skip even that one pass.
+    # one sequential occupancy pass replaces ~O(chunks x rows) strided rescans.
+    # the device union already produced this bitmap; skip even that one pass.
     if known_row_occupancy is not None and int(np.asarray(known_row_occupancy).shape[0]) == int(work_t):
         row_any = np.asarray(known_row_occupancy, dtype=bool)
     else:
@@ -20162,7 +19655,7 @@ def _radial_backproject_gpu_streaming(
         known_slice_bboxes, int(n_az), int(work_t), int(u_len),
     )
     stage_workers = max(1, min(8, _cpu_count()))
-    stage_pool = _acquire_parallel_pool(stage_workers)  # v13.3.4 (T5): checkout-cached
+    stage_pool = _acquire_parallel_pool(stage_workers)  # checkout-cached
 
     try:
         stream = torch.cuda.Stream(device=dev)
@@ -20542,16 +20035,15 @@ def backproject_radial_volume_to_volume(
 ) -> np.ndarray | SinkOnlyProjectionResult:
     """Backproject a radial view-native mask stack into orthogonal (t, Y, X).
 
-    ``out_shape_tyx`` backprojects directly into final source geometry. Transverse retains the
-    optimized t-major implementation; sagittal/coronal build the dense circle map on their final
-    ``(t,X)``/``(t,Y)`` planes, and tilted Radial views first reconstruct their concrete Tilted
-    stack before applying the existing shear backprojection. This single terminal geometry map is
-    what converts working-space circles into source-space ellipses when t was cube-resized.
+ ``out_shape_tyx`` backprojects directly into final source geometry. Transverse retains the
+ optimized t-major implementation; sagittal/coronal build the dense circle map on their final
+ ``(t,X)``/``(t,Y)`` planes, and tilted Radial views first reconstruct their concrete Tilted
+ stack before applying the existing shear backprojection. This single terminal geometry map is
+ what converts working-space circles into source-space ellipses when t was cube-resized.
 
-    ``sink_only=True`` remains available only for the optimized transverse Radial path, where
-    completed output-t blocks can be committed transactionally through
-    ``projection_block_callback`` without allocating the full ``(t,Y,X)`` volume.
-    """
+ ``sink_only=True`` remains available only for the optimized transverse Radial path, where
+ completed output-t blocks can be committed transactionally through
+ ``projection_block_callback`` without allocating the full ``(t,Y,X)`` volume."""
     if not is_radial_view(radial_view):
         raise ValueError('backproject_radial_volume_to_volume expects a radial view')
 
@@ -20631,7 +20123,7 @@ def backproject_radial_volume_to_volume(
     worker_count = choose_slice_parallel_workers(int(workers), int(t_dim))
     same_t_axis = int(work_t) == int(t_dim)
 
-    # v13.3.2 (R6a): flatten the dense gather once. valid_pos holds the flat output positions
+    # flatten the dense gather once. valid_pos holds the flat output positions
     # of in-ROI pixels; flat_src holds each one's flat (source_frame, u) index into a radial
     # cross-section. Per slice this turns the 2-array fancy gather + two masked passes into one
     # take + one indexed store, and empty radial cross-sections are skipped outright (the
@@ -20646,14 +20138,14 @@ def backproject_radial_volume_to_volume(
     def _v_range_for_t(t_idx: int) -> Tuple[int, int]:
         if same_t_axis:
             return int(t_idx), int(t_idx) + 1
-        # v13.2.4 (A1): source t slice ORs every working-t radial row it covers (working t >= source t).
+        # source t slice ORs every working-t radial row it covers (working t >= source t).
         v_start = int(math.floor(float(t_idx) * float(work_t) / float(t_dim)))
         v_stop = int(math.ceil(float(t_idx + 1) * float(work_t) / float(t_dim)))
         v_start = int(np.clip(v_start, 0, work_t - 1))
         v_stop = int(np.clip(max(v_start + 1, v_stop), 1, work_t))
         return v_start, v_stop
 
-    # v13.3.6 (D1): device-union row occupancy (valid for the pre-interpolation layer only,
+    # device-union row occupancy (valid for the pre-interpolation layer only,
     # per the caller's contract) replaces both the GPU path's occupancy scan and the CPU
     # path's per-row strided np.any reads.
     row_occ = None
@@ -20807,28 +20299,9 @@ def backproject_tilted_volume_to_volume(
     workers: int = 1,
     out_shape_tyx: Optional[Tuple[int, int, int]] = None,
 ) -> np.ndarray:
-    """Backproject a v12 Tilted View-native mask stack into native (t, Y, X).
-
-    The input stack remains in the generated Tilted View's own frame order and
-    base-view raster coordinates through cleanup and interpolation.  Only after
-    all per-view operations are complete do we map each foreground pixel by
-    applying the same stacking-axis shear used during rendering:
-
-      * Tilted Transverse: base axes (X, Y), stacking axis t
-      * Tilted Sagittal:  base axes (X, t), stacking axis Y
-      * Tilted Coronal:   base axes (Y, t), stacking axis X
-
-    v13.2.4 (task #1, ruling A1): ``out_shape_tyx`` scatters DIRECTLY into the final source
-    geometry in one step — working-grid coordinates are mapped to source indices with
-    union-biased floor scaling (every working foreground voxel lands in the source voxel whose
-    footprint contains it), so no intermediate working-geometry volume or second resample
-    exists. ``None`` keeps the historical working-geometry target.
-
-    v13.3.12 (D6): a delayed non-radial source may be ``(frames,imgsz,imgsz)``. Component
-    work and interpolation stay on that raster. Both direct final output and NRRD component
-    materialization shear into the same reduced orthogonal grid; only then does one terminal
-    restore map it to source geometry. Sparse stores are never constructed at working size.
-    """
+    """Backproject a Tilted volume into the requested source geometry.
+    
+    Supports reduced processing rasters and direct output-geometry scattering without an intermediate full native view."""
     if not is_tilted_view(tilted_view):
         raise ValueError('backproject_tilted_volume_to_volume expects a Tilted View')
 
@@ -20857,7 +20330,7 @@ def backproject_tilted_volume_to_volume(
 
     if reduced_processing and out_shape_tyx is not None:
         # Use the exact same terminal definition with and without --save_nrrd:
-        # reduced-view shear -> reduced orthogonal grid -> one orthogonal restore.  Shear and
+        # reduced-view shear -> reduced orthogonal grid -> one orthogonal restore. Shear and
         # native-plane expansion do not commute at rounded stack boundaries, so expanding each
         # tilted frame first would make final masks depend on whether component NRRDs were saved.
         reduced_path = out_path.with_name(out_path.stem + '.d6_reduced_orthogonal.u8.dat')
@@ -20953,14 +20426,14 @@ def backproject_tilted_volume_to_volume(
     worker_count = choose_slice_parallel_workers(int(workers), int(tilted_view.num_slices))
 
     def _map_axis_to_out(idx_arr: np.ndarray, in_len: int, out_len: int) -> np.ndarray:
-        # v13.2.4 (A1): union-biased floor scaling from working-grid indices to source indices
+        # union-biased floor scaling from working-grid indices to source indices
         # (in_len >= out_len; the cube resize only grows axes). Identity when the axis is unscaled.
         if int(in_len) == int(out_len):
             return idx_arr
         mapped = (idx_arr.astype(np.int64, copy=False) * int(out_len)) // int(in_len)
         return np.minimum(mapped, int(out_len) - 1).astype(np.int32, copy=False)
 
-    # v13.3.2 (R6d): per-frame invariants hoisted; the frame's emptiness test and nonzero run on
+    # per-frame invariants hoisted; the frame's emptiness test and nonzero run on
     # the raw uint8 plane (the old dtype=bool asarray made a full-plane cast COPY per frame);
     # the three mapped coordinate arrays collapse into ONE flat scatter index (built with
     # GIL-releasing int64 ufuncs) so the GIL-held portion is a single 1-array store.
@@ -20969,7 +20442,7 @@ def backproject_tilted_volume_to_volume(
     plane_stride = np.int64(int(out_h) * int(out_w))
     reduced_out_to_native: Optional[np.ndarray] = None
     if reduced_processing and out_shape_tyx is None:
-        # Frame-invariant canonical-grid -> native-view transform.  Building/inverting this
+        # Frame-invariant canonical-grid -> native-view transform. Building/inverting this
         # affine inside every one of ~3k frames per Tilted stack would serialize the otherwise
         # parallel projection on OpenCV/NumPy setup work.
         canonical = build_affine(
@@ -21013,7 +20486,7 @@ def backproject_tilted_volume_to_volume(
         vv_v = vv[valid]
         uu_v = uu[valid]
         if reduced_processing and out_shape_tyx is None:
-            # Reduced orthogonal projection.  The stacking axis keeps working-grid pitch;
+            # Reduced orthogonal projection. The stacking axis keeps working-grid pitch;
             # the two axes represented by the model plane retain inference pitch.
             if base_view == 'transverse':
                 ti, yi, xi = ss_v, vv_v, uu_v
@@ -21067,7 +20540,7 @@ class ViewBackprojectionQueueJob:
     desc: str
     min_radius: float = 0.0
     workers: int = 1
-    # v13.2.4 (task #1, ruling A1): final source geometry to backproject directly into
+    # final source geometry to backproject directly into
     # (single resample). None keeps the historical working-geometry target.
     out_shape_tyx: Optional[Tuple[int, int, int]] = None
 
@@ -21075,11 +20548,10 @@ class ViewBackprojectionQueueJob:
 class HybridBackprojectionQueue:
     """Sequential Radial/Tilted backprojection queue with a full CPU fallback budget.
 
-    Transverse Radial retains the resident/streaming GPU implementations with CPU fallback.
-    Sagittal/coronal Radial and every tilted Radial variant use the orientation-aware CPU path;
-    ordinary Tilted jobs use the existing CPU shear backprojection. The historical class name is
-    retained to avoid scheduler call-site churn.
-    """
+ Transverse Radial retains the resident/streaming GPU implementations with CPU fallback.
+ Sagittal/coronal Radial and every tilted Radial variant use the orientation-aware CPU path;
+ ordinary Tilted jobs use the existing CPU shear backprojection. The historical class name is
+ retained to avoid scheduler call-site churn."""
 
     def __init__(self, *, cpu_workers: int = 1) -> None:
         self.cpu_workers = max(1, int(cpu_workers))
@@ -21109,7 +20581,7 @@ class HybridBackprojectionQueue:
         else:  # pragma: no cover
             raise ValueError(f'Unsupported queued backprojection view family: {view_local.family}')
 
-        # --min_radius is applied per view in each view's OWN native 2D slice plane BEFORE
+        # min_radius is applied per view in each view's OWN native 2D slice plane BEFORE
         # backprojection, so it is NOT re-applied here; job.min_radius is not consumed.
         return str(job.model_name), str(view_local.name), projected
 
@@ -21136,11 +20608,9 @@ def _union_projected_layer_ref_into_volume(
     workers: int = 1,
     desc: str = 'Layer union',
 ) -> None:
-    """OR one orthogonal NRRD component layer into ``vol_mm``.
-
-    v13.3.12 D6 accepts reduced orthogonal stores and restores each output slice directly
-    into the destination.  No dense native intermediate is reconstructed.
-    """
+    """Restore one projected component layer into the destination union.
+    
+    Reduced orthogonal stores and already-native stores share the same output-z traversal."""
     vol_shape = tuple(int(v) for v in vol_mm.shape)
     z_dim, h_dim, w_dim = vol_shape
     src = _open_nrrd_layer_ref(ref)
@@ -21206,62 +20676,53 @@ def _union_projected_layer_ref_into_volume(
 
 
 def scheduler_push_drain_enabled() -> bool:
-    """v13.3.8 (G1): push-drain the GPU-worker result queue instead of timeout polling.
+    """Push-drain the GPU-worker result queue instead of timeout polling.
 
-    A transport-only daemon thread blocks on the process result queue and hands messages
-    to the main thread through a local deque + wake event; completed scheduler futures set
-    the same event through one-time done-callbacks. Results are processed the instant they
-    arrive instead of after the 0.1 s futures-poll / 0.5 s queue-poll, and handlers still
-    run ONLY on the main thread. YOLO_TTA_SCHEDULER_PUSH_DRAIN=0 restores polling.
-    """
+ A transport-only daemon thread blocks on the process result queue and hands messages
+ to the main thread through a local deque + wake event; completed scheduler futures set
+ the same event through one-time done-callbacks. Results are processed the instant they
+ arrive instead of after the 0.1 s futures-poll / 0.5 s queue-poll, and handlers still
+ run ONLY on the main thread. YOLO_TTA_SCHEDULER_PUSH_DRAIN=0 restores polling."""
     return _env_flag('YOLO_TTA_SCHEDULER_PUSH_DRAIN', True)
 
 
 def scheduler_push_drain_heartbeat_seconds() -> float:
-    """v13.3.8 (G1): upper bound on one push-drain sleep (worker-liveness re-check cadence)."""
+    """Upper bound on one push-drain sleep (worker-liveness re-check cadence)."""
     return max(0.05, _env_float('YOLO_TTA_SCHEDULER_PUSH_DRAIN_HEARTBEAT', 1.0))
 
 
 def assemble_views_concurrency() -> int:
-    """v13.3.8 (G4): concurrent assemble-from-projected-layers views.
+    """Concurrent assemble-from-projected-layers views.
 
-    The per-view assemblies are independent unions of already-projected layer stores
-    (I/O + memcpy bound), but were run strictly one view at a time. Two concurrent views
-    roughly halve that tail segment on the reference 8-tilted + 1-radial run; the
-    per-view worker budget is split across active assemblies so the total thread count
-    is unchanged. YOLO_TTA_ASSEMBLE_VIEWS_CONCURRENCY=1 restores serial assembly.
-    """
+ The per-view assemblies are independent unions of already-projected layer stores
+ (I/O + memcpy bound), but were run strictly one view at a time. Two concurrent views
+ roughly halve that tail segment on the reference 8-tilted + 1-radial run; the
+ per-view worker budget is split across active assemblies so the total thread count
+ is unchanged. YOLO_TTA_ASSEMBLE_VIEWS_CONCURRENCY=1 restores serial assembly."""
     return max(1, _env_int('YOLO_TTA_ASSEMBLE_VIEWS_CONCURRENCY', 2))
 
 
 def fused_final_view_union_enabled() -> bool:
-    """v13.3.9 (G5): one output-z pass for Cartesian + projected-layer union.
-
-    The fused path is deliberately limited by its caller to working!=output geometry;
-    YOLO_TTA_FUSED_FINAL_VIEW_UNION=0 restores G4's per-view intermediates and the
-    separate final-union sweeps.
-    """
+    """Return whether Cartesian and projected-layer restoration may share one output-z pass."""
     return _env_flag('YOLO_TTA_FUSED_FINAL_VIEW_UNION', True)
 
 
 def fused_final_restore_geometry_groups_enabled() -> bool:
-    """v13.3.17 (C1): union equal-geometry projected layers before one restore.
+    """Union equal-geometry projected layers before one restore.
 
-    Reduced Tilted component layers share an orthogonal backing geometry.  Binary
-    union commutes with the positive-support INTER_AREA/NEAREST restore, so G5 can
-    decode/OR every layer in one geometry group on its reduced grid and resize the
-    group once.  The escape hatch retains the v13.3.16 per-layer restore for direct
-    regression comparisons.
-    """
+ Reduced Tilted component layers share an orthogonal backing geometry. Binary
+ union commutes with the positive-support INTER_AREA/NEAREST restore, so can
+ decode/OR every layer in one geometry group on its reduced grid and resize the
+ group once. The escape hatch retains the per-layer restore for direct
+ regression comparisons."""
     return _env_flag('YOLO_TTA_FUSED_FINAL_RESTORE_GEOMETRY_GROUPS', True)
 
 
 def fused_final_gpu_enabled() -> bool:
-    """v16.0.2: move grouped final restore/OR work onto idle inference GPUs by default.
+    """Move grouped final restore/OR work onto idle inference GPUs by default.
 
-    Admission remains VRAM-aware and every failure rewrites the complete result through the
-    established CPU G5 path. Set ``YOLO_TTA_FUSED_FINAL_GPU=0`` for a CPU-only comparison.
-    """
+ Admission remains VRAM-aware and every failure rewrites the complete result through the
+ established CPU path. Set ``YOLO_TTA_FUSED_FINAL_GPU=0`` for a CPU-only comparison."""
     return _env_flag('YOLO_TTA_FUSED_FINAL_GPU', True)
 
 
@@ -21285,7 +20746,7 @@ def fused_final_gpu_sparse_ratio() -> float:
 
 
 def _resize_union_plane_to_out_xy(plane: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
-    """Exact Cartesian final-union binary-plane restore used by legacy and G5 paths."""
+    """Restore one Cartesian binary plane to the requested output geometry."""
     plane_u8 = (np.asarray(plane, dtype=np.uint8) > 0).astype(np.uint8, copy=False)
     if int(plane_u8.shape[0]) == int(out_h) and int(plane_u8.shape[1]) == int(out_w):
         return plane_u8
@@ -21312,14 +20773,13 @@ def assemble_view_volume_from_projected_layers(
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
 ) -> np.ndarray:
-    """v13.2.4 (task #2): rebuild a radial/tilted view's final projected volume from its layers.
+    """Rebuild a radial/tilted view's final projected volume from its layers.
 
-    The dense radial gather and the tilted shear scatter both commute exactly with union, and the
-    view's final native volume is by construction the union of its component layers (cleaned
-    full-frame YOLO mask, one bridge delta per interpolation pass, and any accepted-tile / tile
-    bridge layers). OR-ing the ALREADY-projected --save_nrrd component layers therefore
-    reproduces the projected final volume bit-for-bit without a second full backprojection.
-    """
+ The dense radial gather and the tilted shear scatter both commute exactly with union, and the
+ view's final native volume is by construction the union of its component layers (cleaned
+ full-frame YOLO mask, one bridge delta per interpolation pass, and any accepted-tile / tile
+ bridge layers). OR-ing the ALREADY-projected --save_nrrd component layers therefore
+ reproduces the projected final volume bit-for-bit without a second full backprojection."""
     out_shape = tuple(int(v) for v in out_shape_tyx)
     vol_mm = allocate_workspace_array(
         shape=out_shape,
@@ -21353,14 +20813,14 @@ def assemble_view_volumes_into_native_union(
 ) -> None:
     """OR all per-view prediction volumes from the single active model into the final union.
 
-    Already-backprojected Tilted/Radial volumes arrive at the union's own (out) geometry and are
-    merged slice-wise. Transverse, Sagittal, and Coronal retain their native working-geometry view
-    stacks; v13.2.4 (task #1, ruling A1) restores each of them working->source with ONE resample
-    while merging (union-biased: a source slice ORs every working slice it covers and XY planes
-    are resized with the same >0-threshold INTER_AREA/NEAREST semantics as the former tail
-    restore). When ``out_shape_tyx`` is None or equals the working geometry, the historical
-    zero-resample axis-permutation merges are used.
-    """
+ Already-backprojected Tilted/Radial volumes arrive at the union's own (out) geometry and are
+ merged slice-wise. Transverse, Sagittal, and Coronal retain their native working-geometry view
+ stacks; restores each of them working->source with ONE resample
+ while merging (union-biased: a source slice ORs every working slice it covers and XY planes
+ are resized with the same >0-threshold INTER_AREA/NEAREST semantics as the former tail
+ restore). When ``out_shape_tyx`` is None or equals the working geometry, the historical
+ zero-resample axis-permutation merges are used."""
+    # DEAD PARAMETER: disable_multiplanar is retained for callers; active views define the merge.
     out_t, out_h, out_w = (int(T), int(H), int(W)) if out_shape_tyx is None else (
         int(out_shape_tyx[0]), int(out_shape_tyx[1]), int(out_shape_tyx[2]))
     working_equals_out = (out_t, out_h, out_w) == (int(T), int(H), int(W))
@@ -21438,10 +20898,10 @@ def assemble_view_volumes_into_native_union(
         consumed.add("sagittal")
 
         if working_equals_out and tuple(int(v) for v in sagittal.shape) == (int(H), int(T), int(W)):
-            # v13.3.8 (A3): the per-y merge (final_union[:, y, :] |= sagittal[y]) swept the
+            # the per-y merge (final_union[:, y,:] |= sagittal[y]) swept the
             # ENTIRE destination volume once per y (T rows of W bytes at stride H*W) — full
             # cache lines, but H passes of page/TLB traffic. Merge K rows per block instead:
-            # for each t the destination window [t, y0:y1, :] is one contiguous K*W run, so
+            # for each t the destination window [t, y0:y1,:] is one contiguous K*W run, so
             # every destination page is visited once per block (H/K fewer volume sweeps).
             blk_rows = int(coronal_block_cols())
             n_blocks = (int(H) + blk_rows - 1) // blk_rows
@@ -21462,7 +20922,7 @@ def assemble_view_volumes_into_native_union(
                 target_chunks_per_worker=2,
             )
         else:
-            # D6 reduced stack: axis 1 is the inference-pitch t axis; axis 0 remains the
+            # reduced stack: axis 1 is the inference-pitch t axis; axis 0 remains the
             # sagittal stack/y axis. The final resize restores both Y and X in one pass.
             _or_restore_working_planes_into_union(
                 lambda v: sagittal[:, int(v), :], "sagittal", int(sagittal.shape[1]),
@@ -21475,9 +20935,9 @@ def assemble_view_volumes_into_native_union(
         consumed.add("coronal")
 
         if working_equals_out and tuple(int(v) for v in coronal.shape) == (int(W), int(T), int(H)):
-            # v13.3.8 (A3): the per-x merge (final_union[:, :, x] |= coronal[x]) wrote one
+            # the per-x merge (final_union[:,:, x] |= coronal[x]) wrote one
             # byte per cache line across the whole (t, Y) extent — the same ~64x write
-            # amplification v13.3.2 (R14) fixed for the projection copy. Same cure: permute
+            # amplification fixed for the projection copy. Same cure: permute
             # K columns at a time through per-t (K, H) -> (H, K) tile transposes (tiles stay
             # cache-resident) and OR K contiguous bytes per destination row.
             blk_cols = int(coronal_block_cols())
@@ -21499,7 +20959,7 @@ def assemble_view_volumes_into_native_union(
                 target_chunks_per_worker=2,
             )
         else:
-            # D6 reduced stack: axis 1 is inference-pitch t; transpose stack/x and plane/y.
+            # reduced stack: axis 1 is inference-pitch t; transpose stack/x and plane/y.
             _or_restore_working_planes_into_union(
                 lambda v: np.ascontiguousarray(np.asarray(coronal[:, int(v), :]).T),
                 "coronal",
@@ -21539,19 +20999,9 @@ def assemble_view_volumes_and_projected_layers_fused(
     out_shape_tyx: Tuple[int, int, int],
     workers: int = 1,
 ) -> None:
-    """v13.3.9 (G5): assemble every contributor with one disjoint output-z pass.
-
-    Cartesian stacks are restored with the legacy floor/ceil t coverage and exact
-    binary XY resize. Source-geometry radial/tilted component stores are read
-    directly, so their former full-volume per-view intermediates never exist. Each
-    worker builds one private output plane and assigns its final slice once.
-
-    v13.3.17 C1 groups reduced projected stores by their identical orthogonal restore
-    geometry.  All source slices/layers in a group are ORed on that reduced grid and
-    the group is resized once; source-native Radial stores retain the direct indexed
-    crop path.  This removes 14 of the 16 per-output-slice Tilted resizes in the
-    reference 8-view/2-layer run without constructing any dense volume intermediate.
-    """
+    """Assemble every view and projected layer in one output-z traversal.
+    
+    Contributors with equal restore geometry are grouped before resizing and OR accumulation."""
     out_t, out_h, out_w = (int(v) for v in out_shape_tyx)
     if (out_t, out_h, out_w) == (int(T), int(H), int(W)):
         raise ValueError('G5 fused restore is scoped to working geometry != output geometry')
@@ -21581,7 +21031,7 @@ def assemble_view_volumes_and_projected_layers_fused(
     opened: List[Tuple['NrrdLayerRef', object]] = []
     try:
         for ref in projected_layer_refs:
-            # Do not pin every projected chunks.bin simultaneously: G5 may open ~90
+            # Do not pin every projected chunks.bin simultaneously: may open ~90
             # component stores, and the explicit NRRD RAM cache would erase the peak-RAM
             # win from deleting the per-view intermediates. The OS page cache still gives
             # reclaimable reads; a read-only mmap also avoids per-slice file open/seek churn.
@@ -21601,7 +21051,7 @@ def assemble_view_volumes_and_projected_layers_fused(
                 _madvise_array_mmap(src, 'MADV_SEQUENTIAL')
             opened.append((ref, src))
 
-        # v13.3.17 C1: shape fully defines the restore transform here because every
+        # shape fully defines the restore transform here because every
         # projected layer is already in canonical orthogonal (t,Y,X) coordinates.
         # Grouping is intentionally limited to non-native layers. Native Radial stores
         # continue to contribute bbox crops directly to the output accumulator.
@@ -21651,15 +21101,14 @@ def assemble_view_volumes_and_projected_layers_fused(
             np.bitwise_or(dst, np.asarray(src[int(src_z)], dtype=np.uint8), out=dst)
 
         def _try_gpu_final_fusion() -> bool:
-            """v16.0.2 GPU G5 path with pinned double buffering and geometry streams.
+            """GPU path with pinned double buffering and geometry streams.
 
-            Independent output-z bands are assigned to every admitted CUDA device.  Each lane
-            decodes the next host batch while the previous batch is asynchronously copied,
-            restored, OR-reduced, and copied back.  Reduced geometry groups receive independent
-            CUDA streams; a merge stream waits on their events before the single final D2H.
-            Source-native sparse stores and very small reduced groups remain on the CPU and are
-            folded into one pinned native contributor, where H2D setup would dominate.
-            """
+ Independent output-z bands are assigned to every admitted CUDA device. Each lane
+ decodes the next host batch while the previous batch is asynchronously copied,
+ restored, OR-reduced, and copied back. Reduced geometry groups receive independent
+ CUDA streams; a merge stream waits on their events before the single final D2H.
+ Source-native sparse stores and very small reduced groups remain on the CPU and are
+ folded into one pinned native contributor, where H2D setup would dominate."""
             if not bool(group_restores) or not fused_final_gpu_enabled():
                 return False
             try:
@@ -22149,7 +21598,7 @@ def assemble_view_volumes_and_projected_layers_fused(
 
             if group_restores:
                 # Native projected layers (the two Radial refs in the reference run)
-                # retain the exact C1-independent sparse direct path.
+                # retain the exact -independent sparse direct path.
                 for _ref, src in native_projected:
                     _or_native_source_slice(acc, src, int(out_z))
 
@@ -22169,9 +21618,8 @@ def assemble_view_volumes_and_projected_layers_fused(
                     source_zs = _restore_source_indices_for_output_z(
                         int(in_t), int(out_t), int(out_z),
                     )
-                    # Keep each store's adjacent source-z reads together. This retains
-                    # G9's sequential mmap/readahead locality while changing only where
-                    # the group-wide binary restore occurs.
+                    # Keep adjacent source-z reads together to preserve sequential
+                    # mmap/readahead locality during the group-wide restore.
                     for _ref, src in group:
                         for src_z in source_zs:
                             _or_native_source_slice(reduced, src, int(src_z))
@@ -22181,7 +21629,7 @@ def assemble_view_volumes_and_projected_layers_fused(
                         out=acc,
                     )
             else:
-                # Exact v13.3.16 fallback: restore every reduced component layer
+                # Exact fallback: restore every reduced component layer
                 # independently. Useful for byte-equivalence/performance A/B checks.
                 for _ref, src in opened:
                     ref_native = tuple(int(v) for v in _ref.shape) == (out_t, out_h, out_w)
@@ -22200,7 +21648,7 @@ def assemble_view_volumes_and_projected_layers_fused(
             # guarantees exactly one full-plane destination write for this z.
             final_union_mm[int(out_z), :, :] = acc
 
-        # v13.3.16 G9: submitting all z chunks to 320 workers made the first
+        # submitting all z chunks to 320 workers made the first
         # frontier touch roughly z=0..1280 across every projected store simultaneously.
         # The log's 40 s cold start and second 12 s stall at z=1280 line up exactly with
         # that frontier. Process bounded sequential z bands so mmap readahead/page-table
@@ -22257,16 +21705,11 @@ def assemble_current_view_union_volume(
     workers: int = 1,
     projected_layer_refs: Optional[Sequence['NrrdLayerRef']] = None,
 ) -> np.ndarray:
-    """Build the single-model final view union.
-
-    The mapping is kept keyed by model name because earlier pipeline stages store temporary
-    workspaces under the model stem. v12.2.0 rejects multiple model entries and never
-    combines outputs from more than one model. v13.2.4 (task #1, ruling A1): the union is
-    allocated in the FINAL SOURCE geometry (``out_shape_tyx``) so all downstream global
-    postprocessing runs in source voxels; None keeps the working geometry.
-    """
+    """Assemble the single model's current view union.
+    
+    Multiple model entries are rejected; the destination uses source geometry when requested."""
     if len(view_volumes_by_model) != 1:
-        raise ValueError('GPT-5.6-Sol-Pro v16.0.3 supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.0.4 supports exactly one --model; multiple-model inference has been removed')
 
     union_shape = (int(T), int(H), int(W)) if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
     model_name = next(iter(view_volumes_by_model.keys()))
@@ -22308,8 +21751,8 @@ def assemble_current_view_union_volume(
             workers=int(workers),
         )
         # Defensive mixed-mode support. The normal tail only supplies direct refs when
-        # G5 is eligible; if a caller supplies them under equal geometry, preserve the
-        # A3 Cartesian path and merge refs without omitting any contribution.
+        # is eligible; if a caller supplies them under equal geometry, preserve the
+        # Cartesian path and merge refs without omitting any contribution.
         for ref in direct_refs:
             _union_projected_layer_ref_into_volume(
                 ref, final_union_mm, workers=int(workers), desc=f'Fallback final union: OR {ref.key}',
@@ -22327,14 +21770,7 @@ def union_volume_into_volume(
     slice_locks: Optional[Sequence[threading.Lock]] = None,
     count_voxels: bool = False,
 ) -> int:
-    """OR ``src_mm`` into ``dst_mm`` slice-parallel; returns the source voxel count or 0.
-
-    T8: ``slice_locks`` moves mutual exclusion from "one lock around the whole volume" to
-    one lock per slice class, so several producers can OR into the same destination
-    concurrently. A slice index always maps to the same lock, which is what makes the
-    byte-level read-modify-write safe. ``count_voxels`` folds the staged-voxel tally into
-    the pass that is already reading every slice, replacing separate full-volume scans.
-    """
+    """OR one volume into another, optionally restoring geometry and using per-slice locks."""
     num_slices = int(dst_mm.shape[0]) if int(dst_mm.ndim) > 0 else 0
     lock_count = int(len(slice_locks)) if slice_locks else 0
     counts = np.zeros((num_slices,), dtype=np.int64) if bool(count_voxels) else None
@@ -22378,7 +21814,7 @@ def apply_keep_largest_objects_inplace(
     keep_started = time.perf_counter()
     work_dir = temp_dir / 'keep_objects'
     work_dir.mkdir(parents=True, exist_ok=True)
-    # v13.3.2 (R6c): label with LOCAL per-slice ids only (no compact relabel write pass) and
+    # label with LOCAL per-slice ids only (no compact relabel write pass) and
     # harvest per-component areas during 2D labeling — the old flow ran a full-volume compact
     # relabel, then a full-volume GIL-held bincount, then rewrote every slice. The keep decision
     # is applied through per-slice local->keep LUTs restricted to each slice's foreground bbox,
@@ -22393,7 +21829,7 @@ def apply_keep_largest_objects_inplace(
         workers=int(workers),
         compact_relabel=False,
         component_stats_out=comp_stats,
-        # C4 also covers the prioritized --keep_objects 1 tail: the same local-label
+        # also covers the prioritized --keep_objects 1 tail: the same local-label
         # arena and direct packed-LUT apply avoid rebuilding a second dense host cube.
         sparse_local_labels=True,
     )
@@ -22623,20 +22059,14 @@ def assemble_final_union_after_view_union(
     return final_union_mm
 
 
-# --------------------------
-# v14 centerline-guided final-union filtering
-# --------------------------
+#
+# centerline-guided final-union filtering
+#
 
 
 @dataclass(frozen=True)
 class V14CenterlineSamples:
-    """Centerline samples in source ``(t,Y,X)`` voxel coordinates.
-
-    ``branch_ids`` identify ordered backend paths. The optional VMTK backend may
-    repeat a common trunk in several root-to-target cells; the embedded backend
-    emits deduplicated medial-ridge tracks. Each occurrence carries one local
-    tangent for the strict 2D plane.
-    """
+    """Ordered embedded medial-ridge samples in source ``(t,Y,X)`` coordinates."""
 
     points_tyx: np.ndarray
     tangents_tyx: np.ndarray
@@ -22676,333 +22106,6 @@ class V14CenterlineEvent:
     @property
     def clean_flanks(self) -> bool:
         return bool(self.clean_left and self.clean_right)
-
-
-def _v14_vmtk_modules_available() -> bool:
-    """Cheap preflight that does not import VTK into the long-lived parent."""
-    try:
-        import importlib.util
-        vtk_ok = importlib.util.find_spec('vtk') is not None
-        vmtk_ok = (
-            importlib.util.find_spec('vmtk') is not None
-            or (
-                importlib.util.find_spec('vtkvmtkComputationalGeometryPython') is not None
-                and importlib.util.find_spec('vtkvmtkMiscPython') is not None
-            )
-        )
-        return bool(vtk_ok and vmtk_ok)
-    except Exception:
-        return False
-
-
-def _v14_import_vmtk_modules() -> Tuple[object, object]:
-    """Load either the PyPI/conda VMTK layout or Slicer's split-module layout."""
-    import vtk  # type: ignore
-    try:
-        from vmtk import vtkvmtk  # type: ignore
-        return vtk, vtkvmtk
-    except (ImportError, OSError):
-        import vtkvmtkComputationalGeometryPython as computational  # type: ignore
-        import vtkvmtkMiscPython as misc  # type: ignore
-
-        class _V14VmtkNamespace:
-            pass
-
-        combined = _V14VmtkNamespace()
-        for module in (computational, misc):
-            for name in dir(module):
-                if str(name).startswith('vtkvmtk'):
-                    setattr(combined, name, getattr(module, name))
-        return vtk, combined
-
-
-def _v14_open_surface_one_triangle(vtk: object, surface: object, position_xyz: Sequence[float]) -> None:
-    locator = vtk.vtkPointLocator()
-    locator.SetDataSet(surface)
-    locator.BuildLocator()
-    point_id = int(locator.FindClosestPoint(tuple(float(v) for v in position_xyz)))
-    if point_id < 0:
-        raise RuntimeError('VMTK endpoint network cannot open an empty surface')
-    surface.BuildLinks()
-    cell_ids = vtk.vtkIdList()
-    surface.GetPointCells(int(point_id), cell_ids)
-    if int(cell_ids.GetNumberOfIds()) <= 0:
-        raise RuntimeError('VMTK endpoint network surface point has no incident triangle')
-    # This matches SlicerVMTK ExtractCenterline: the network extractor needs one
-    # opening, and deleting one incident cell makes the smallest useful hole.
-    surface.DeleteCell(int(cell_ids.GetId(0)))
-    surface.RemoveDeletedCells()
-
-
-def _v14_vmtk_surface_from_coarse_mask(
-    mask_tyx: np.ndarray,
-    *,
-    spacing_tyx: Sequence[float],
-    origin_tyx: Sequence[float],
-    target_points: int,
-) -> Tuple[object, object, object, int]:
-    vtk, vtkvmtk = _v14_import_vmtk_modules()
-    from vtk.util.numpy_support import numpy_to_vtk  # type: ignore
-
-    binary = np.ascontiguousarray(np.asarray(mask_tyx) != 0, dtype=np.uint8)
-    t_dim, h_dim, w_dim = (int(binary.shape[0]), int(binary.shape[1]), int(binary.shape[2]))
-    image = vtk.vtkImageData()
-    image.SetDimensions(int(w_dim), int(h_dim), int(t_dim))
-    image.SetSpacing(
-        float(spacing_tyx[2]), float(spacing_tyx[1]), float(spacing_tyx[0]),
-    )
-    image.SetOrigin(
-        float(origin_tyx[2]), float(origin_tyx[1]), float(origin_tyx[0]),
-    )
-    scalars = numpy_to_vtk(
-        binary.reshape(-1), deep=True, array_type=vtk.VTK_UNSIGNED_CHAR,
-    )
-    image.GetPointData().SetScalars(scalars)
-
-    contour_cls = getattr(vtk, 'vtkFlyingEdges3D', None) or vtk.vtkMarchingCubes
-    contour = contour_cls()
-    contour.SetInputData(image)
-    contour.SetValue(0, 0.5)
-    if hasattr(contour, 'ComputeNormalsOff'):
-        contour.ComputeNormalsOff()
-    if hasattr(contour, 'ComputeGradientsOff'):
-        contour.ComputeGradientsOff()
-    contour.Update()
-
-    cleaner = vtk.vtkCleanPolyData()
-    cleaner.SetInputConnection(contour.GetOutputPort())
-    triangles = vtk.vtkTriangleFilter()
-    triangles.SetInputConnection(cleaner.GetOutputPort())
-    triangles.PassLinesOff()
-    triangles.PassVertsOff()
-    triangles.Update()
-
-    region_counter = vtk.vtkPolyDataConnectivityFilter()
-    region_counter.SetInputConnection(triangles.GetOutputPort())
-    region_counter.SetExtractionModeToAllRegions()
-    region_counter.ColorRegionsOn()
-    region_counter.Update()
-    surface_component_count = int(region_counter.GetNumberOfExtractedRegions())
-
-    # Exact VMTK Delaunay processing is not reliable on disconnected surfaces.
-    # Analyze the largest connected foreground object, but report the full surface
-    # component count so automatic removal can be disabled when centerline coverage
-    # is necessarily incomplete.
-    connectivity = vtk.vtkPolyDataConnectivityFilter()
-    connectivity.SetInputConnection(triangles.GetOutputPort())
-    connectivity.SetExtractionModeToLargestRegion()
-    connectivity.Update()
-    connected = connectivity.GetOutput()
-    if int(connected.GetNumberOfPoints()) < 4 or int(connected.GetNumberOfCells()) < 4:
-        raise RuntimeError('foreground surface is too small for VMTK centerlines')
-
-    surface_input = connected
-    target = max(1000, int(target_points))
-    if int(connected.GetNumberOfPoints()) > int(target * 1.20):
-        decimator = vtk.vtkDecimatePro()
-        decimator.SetInputData(connected)
-        decimator.SetTargetReduction(
-            min(0.995, max(0.0, 1.0 - float(target) / float(connected.GetNumberOfPoints())))
-        )
-        decimator.PreserveTopologyOn()
-        decimator.BoundaryVertexDeletionOff()
-        if hasattr(decimator, 'SplittingOff'):
-            decimator.SplittingOff()
-        decimator.Update()
-        surface_input = decimator.GetOutput()
-
-    final_clean = vtk.vtkCleanPolyData()
-    final_clean.SetInputData(surface_input)
-    final_triangles = vtk.vtkTriangleFilter()
-    final_triangles.SetInputConnection(final_clean.GetOutputPort())
-    normals = vtk.vtkPolyDataNormals()
-    normals.SetInputConnection(final_triangles.GetOutputPort())
-    normals.AutoOrientNormalsOn()
-    normals.ConsistencyOn()
-    normals.SplittingOff()
-    normals.Update()
-    surface = vtk.vtkPolyData()
-    surface.DeepCopy(normals.GetOutput())
-    if int(surface.GetNumberOfPoints()) < 4:
-        raise RuntimeError('VMTK preprocessing produced an empty surface')
-    return vtk, vtkvmtk, surface, int(surface_component_count)
-
-
-def _v14_vmtk_auto_endpoint_positions(vtk: object, vtkvmtk: object, surface: object) -> List[Tuple[float, float, float]]:
-    network_surface = vtk.vtkPolyData()
-    network_surface.DeepCopy(surface)
-    bounds = network_surface.GetBounds()
-    _v14_open_surface_one_triangle(
-        vtk, network_surface, (float(bounds[0]), float(bounds[2]), float(bounds[4])),
-    )
-    network_filter = vtkvmtk.vtkvmtkPolyDataNetworkExtraction()
-    network_filter.SetInputData(network_surface)
-    network_filter.SetAdvancementRatio(1.05)
-    network_filter.SetRadiusArrayName('Radius')
-    network_filter.SetTopologyArrayName('Topology')
-    network_filter.SetMarksArrayName('Marks')
-    network_filter.Update()
-
-    cleaner = vtk.vtkCleanPolyData()
-    cleaner.SetInputConnection(network_filter.GetOutputPort())
-    cleaner.Update()
-    network = cleaner.GetOutput()
-    if int(network.GetNumberOfPoints()) <= 0:
-        raise RuntimeError('VMTK network endpoint detection returned no points')
-    radius_array = network.GetPointData().GetArray('Radius')
-    if radius_array is None:
-        raise RuntimeError('VMTK endpoint network has no Radius array')
-    network.BuildCells()
-    network.BuildLinks(0)
-    endpoint_ids = vtk.vtkIdList()
-    for cell_index in range(int(network.GetNumberOfCells())):
-        cell = network.GetCell(int(cell_index))
-        count = int(cell.GetNumberOfPoints())
-        if count < 2:
-            continue
-        for local_index in (0, count - 1):
-            point_id = int(cell.GetPointId(int(local_index)))
-            incident = vtk.vtkIdList()
-            network.GetPointCells(int(point_id), incident)
-            if int(incident.GetNumberOfIds()) == 1:
-                endpoint_ids.InsertUniqueId(int(point_id))
-    ids = [int(endpoint_ids.GetId(i)) for i in range(int(endpoint_ids.GetNumberOfIds()))]
-    if len(ids) < 2:
-        raise RuntimeError(f'VMTK endpoint network found only {len(ids)} endpoint(s)')
-    root_id = max(ids, key=lambda idx: float(radius_array.GetTuple1(int(idx))))
-    ordered = [int(root_id)] + [idx for idx in ids if int(idx) != int(root_id)]
-    return [tuple(float(v) for v in network.GetPoint(int(idx))) for idx in ordered]
-
-
-def _v14_vmtk_exact_centerline_arrays(
-    vtk: object,
-    vtkvmtk: object,
-    surface: object,
-    endpoint_positions: Sequence[Sequence[float]],
-) -> Dict[str, np.ndarray]:
-    capper = vtkvmtk.vtkvmtkCapPolyData()
-    capper.SetInputData(surface)
-    capper.SetDisplacement(0.0)
-    capper.SetInPlaneDisplacement(0.0)
-    capper.Update()
-    capped = capper.GetOutput()
-
-    locator = vtk.vtkPointLocator()
-    locator.SetDataSet(capped)
-    locator.BuildLocator()
-    seed_ids: List[int] = []
-    for position in endpoint_positions:
-        point_id = int(locator.FindClosestPoint(tuple(float(v) for v in position)))
-        if point_id >= 0 and point_id not in seed_ids:
-            seed_ids.append(int(point_id))
-    if len(seed_ids) < 2:
-        raise RuntimeError('VMTK auto endpoints collapsed to fewer than two exact surface seeds')
-
-    source_ids = vtk.vtkIdList()
-    source_ids.InsertNextId(int(seed_ids[0]))
-    target_ids = vtk.vtkIdList()
-    for point_id in seed_ids[1:]:
-        target_ids.InsertNextId(int(point_id))
-
-    centerline_filter = vtkvmtk.vtkvmtkPolyDataCenterlines()
-    centerline_filter.SetInputData(capped)
-    centerline_filter.SetSourceSeedIds(source_ids)
-    centerline_filter.SetTargetSeedIds(target_ids)
-    centerline_filter.SetRadiusArrayName('MaximumInscribedSphereRadius')
-    centerline_filter.SetCostFunction('1/R')
-    centerline_filter.SetFlipNormals(False)
-    centerline_filter.SetAppendEndPointsToCenterlines(0)
-    # VTK9-compatible SlicerVMTK setting; Voronoi simplification has known
-    # connectivity failures in that combination.
-    centerline_filter.SetSimplifyVoronoi(0)
-    centerline_filter.SetCenterlineResampling(0)
-    centerline_filter.SetResamplingStepLength(1.0)
-    centerline_filter.Update()
-    centerline = centerline_filter.GetOutput()
-    if centerline is None or int(centerline.GetNumberOfPoints()) <= 0:
-        raise RuntimeError('accurate VMTK centerline extraction returned no points')
-    radius_array = centerline.GetPointData().GetArray('MaximumInscribedSphereRadius')
-    if radius_array is None:
-        raise RuntimeError('accurate VMTK centerline has no maximum-inscribed-sphere radius')
-
-    points: List[np.ndarray] = []
-    tangents: List[np.ndarray] = []
-    radii: List[float] = []
-    branches: List[int] = []
-    arcs: List[int] = []
-    for cell_index in range(int(centerline.GetNumberOfCells())):
-        cell = centerline.GetCell(int(cell_index))
-        count = int(cell.GetNumberOfPoints())
-        if count < 2:
-            continue
-        ids = [int(cell.GetPointId(i)) for i in range(count)]
-        for local_index, point_id in enumerate(ids):
-            left = np.asarray(centerline.GetPoint(ids[max(0, local_index - 1)]), dtype=np.float64)
-            right = np.asarray(centerline.GetPoint(ids[min(count - 1, local_index + 1)]), dtype=np.float64)
-            tangent_xyz = right - left
-            norm = float(np.linalg.norm(tangent_xyz))
-            if not np.isfinite(norm) or norm <= 1.0e-8:
-                continue
-            point_xyz = np.asarray(centerline.GetPoint(int(point_id)), dtype=np.float64)
-            radius = float(radius_array.GetTuple1(int(point_id)))
-            if not np.all(np.isfinite(point_xyz)) or not np.isfinite(radius) or radius <= 0.0:
-                continue
-            points.append(point_xyz[[2, 1, 0]])
-            tangents.append((tangent_xyz / norm)[[2, 1, 0]])
-            radii.append(float(radius))
-            branches.append(int(cell_index))
-            arcs.append(int(local_index))
-    if not points:
-        raise RuntimeError('accurate VMTK centerline contained no finite tangent/radius samples')
-    return {
-        'points_tyx': np.asarray(points, dtype=np.float64),
-        'tangents_tyx': np.asarray(tangents, dtype=np.float64),
-        'radii': np.asarray(radii, dtype=np.float64),
-        'branch_ids': np.asarray(branches, dtype=np.int32),
-        'arc_indices': np.asarray(arcs, dtype=np.int32),
-        'endpoint_count': np.asarray([len(seed_ids)], dtype=np.int32),
-    }
-
-
-def _v14_vmtk_worker(
-    coarse_npy: str,
-    spacing_tyx: Tuple[float, float, float],
-    origin_tyx: Tuple[float, float, float],
-    target_points: int,
-    result_npz: str,
-    status_json: str,
-) -> None:
-    """Isolated native VMTK worker; a segfault cannot kill the inference parent."""
-    try:
-        coarse = np.load(str(coarse_npy), mmap_mode='r')
-        vtk, vtkvmtk, surface, surface_component_count = _v14_vmtk_surface_from_coarse_mask(
-            coarse,
-            spacing_tyx=spacing_tyx,
-            origin_tyx=origin_tyx,
-            target_points=int(target_points),
-        )
-        endpoints = _v14_vmtk_auto_endpoint_positions(vtk, vtkvmtk, surface)
-        arrays = _v14_vmtk_exact_centerline_arrays(vtk, vtkvmtk, surface, endpoints)
-        arrays['surface_component_count'] = np.asarray(
-            [int(surface_component_count)], dtype=np.int32,
-        )
-        np.savez_compressed(str(result_npz), **arrays)
-        Path(status_json).write_text(json.dumps({
-            'ok': True,
-            'surface_points': int(surface.GetNumberOfPoints()),
-            'surface_cells': int(surface.GetNumberOfCells()),
-            'surface_component_count': int(surface_component_count),
-            'endpoint_count': int(arrays['endpoint_count'][0]),
-            'sample_count': int(arrays['points_tyx'].shape[0]),
-        }, indent=2) + '\n')
-    except BaseException as exc:
-        import traceback as _traceback
-        Path(status_json).write_text(json.dumps({
-            'ok': False,
-            'error': f'{type(exc).__name__}: {exc}',
-            'traceback': _traceback.format_exc(),
-        }, indent=2) + '\n')
-        raise
 
 
 def _v1401_axis_plane(array: np.ndarray, axis: int, index: int) -> np.ndarray:
@@ -23047,10 +22150,9 @@ def _v1401_embedded_plane_ridges(
 ) -> Tuple[List[Tuple[int, int, float]], bool, bool]:
     """Extract radius-adaptively separated medial-ridge points from one plane.
 
-    Equality with a 3x3 maximum is intentionally retained along flat medial
-    plateaus.  A second deterministic non-maximum-suppression step samples long
-    plateaus instead of collapsing an in-plane airway branch to one point.
-    """
+ Equality with a 3x3 maximum is intentionally retained along flat medial
+ plateaus. A second deterministic non-maximum-suppression step samples long
+ plateaus instead of collapsing an in-plane airway branch to one point."""
     foreground = np.asarray(mask_2d) != 0
     if not bool(np.any(foreground)):
         return [], False, False
@@ -23114,6 +22216,7 @@ def _v1401_track_axis_ridges(
     raw_sample_budget: int,
 ) -> Tuple[List[List[Tuple[np.ndarray, float]]], Dict[str, object]]:
     """Join planar ridge samples into ordered, one-to-one centerline tracks."""
+    # DEAD PARAMETER: raw_sample_budget is retained for centerline API compatibility.
     axis_i = int(axis)
     plane_count = int(ridge_mask.shape[axis_i])
     inplane_dims = tuple(dim for dim in range(3) if int(dim) != axis_i)
@@ -23121,7 +22224,7 @@ def _v1401_track_axis_ridges(
         float(spacing_tyx[int(inplane_dims[0])]),
         float(spacing_tyx[int(inplane_dims[1])]),
     )
-    # The radius-resolved ridge mask is already globally bounded.  A low
+    # The radius-resolved ridge mask is already globally bounded. A low
     # per-plane cap can nevertheless truncate a real sheet/slab exactly where it
     # is most informative, so retain up to 512 separated peaks on every plane.
     peaks_per_plane = 512
@@ -23259,20 +22362,12 @@ def _v1401_embedded_centerline_arrays(
     origin_tyx: Tuple[float, float, float],
     target_points: int,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, object]]:
-    """Pure NumPy/SciPy centerlines based on exact EDT medial ridges.
-
-    This does not vendor VMTK's compiled Voronoi/Delaunay implementation.  It
-    supplies the same downstream contract—ordered points, tangents, and local
-    EDT medial-ridge radius estimates—without a new runtime dependency.
-    """
+    """Compute ordered exact-EDT medial-ridge centerlines with NumPy/SciPy."""
     coarse = np.ascontiguousarray(np.asarray(mask_tyx) != 0, dtype=np.uint8)
     if not bool(np.any(coarse)):
         raise RuntimeError('embedded centerline received an empty foreground raster')
-    # The compositional union intentionally still contains small disconnected
-    # detections here (``--keep_objects`` runs later).  Centerlining every speck
-    # creates thousands of meaningless medial tracks and exhausts the safety
-    # budget.  Match the VMTK preprocessing intent by extracting the largest
-    # 26-connected coarse object for analysis.  This never edits ``mask_tyx``:
+    # Analyze only the largest 26-connected coarse object so disconnected specks
+    # cannot exhaust the track budget. This never edits ``mask_tyx``:
     # unanalysed objects remain byte-identical in the union and cannot be selected
     # for removal because they receive no centerline evidence.
     labels = np.empty(coarse.shape, dtype=np.int32)
@@ -23301,9 +22396,8 @@ def _v1401_embedded_centerline_arrays(
         coarse,
         sampling=tuple(float(v) for v in spacing_tyx),
     )
-    # EDT measures center-to-center distance to the nearest background voxel.
-    # The binary object's 0.5 isosurface lies half a coarse cell closer, matching
-    # the surface convention used by the former marching-cubes/VMTK backend.
+    # Shift center-to-center EDT radii by half a coarse cell to approximate the
+    # binary object's 0.5 isosurface.
     half_cell = 0.5 * min(float(v) for v in spacing_tyx)
     foreground = coarse != 0
     distance[foreground] = np.maximum(0.5, distance[foreground] - float(half_cell))
@@ -23317,9 +22411,9 @@ def _v1401_embedded_centerline_arrays(
             cval=0.0,
             output=np.float32,
         )
-        # ``local_maximum`` is float32 to halve peak scratch memory.  Its ULP
+        # ``local_maximum`` is float32 to halve peak scratch memory. Its ULP
         # grows with the EDT value, so a fixed epsilon can reject a true float64
-        # maximum after rounding.  Use a small scale-aware comparison tolerance.
+        # maximum after rounding. Use a small scale-aware comparison tolerance.
         comparison_floor = np.asarray(local_maximum) * np.float32(1.0 - 2.0e-7) - np.float32(1.0e-6)
         ridge_votes += np.asarray(
             foreground & (distance >= comparison_floor),
@@ -23331,7 +22425,7 @@ def _v1401_embedded_centerline_arrays(
     # *surface* of a capped cylinder and creates false transverse centerlines;
     # three-way agreement retains its 1D axis while still following oblique tubes.
     # One-coarse-voxel sheets are also medial plateaus, but they are surface-like
-    # rather than usable lumen centerlines.  Prefer a radius-resolved core and
+    # rather than usable lumen centerlines. Prefer a radius-resolved core and
     # relax only when that would otherwise make a genuinely thin object empty.
     ridge_consensus = foreground & (ridge_votes == 3)
     preferred_ridge_radius = 1.25 * min(float(v) for v in spacing_tyx)
@@ -23367,9 +22461,9 @@ def _v1401_embedded_centerline_arrays(
     del ridge_mask
 
     # A plane sweep perpendicular to a clean tube also traces a short path across
-    # its diameter.  That is not a lumen centerline.  Require tube-like
+    # its diameter. That is not a lumen centerline. Require tube-like
     # longitudinal persistence (path length >= 3 local radii), then suppress
-    # near-duplicate paths emitted by the three orthogonal sweeps.  Missed paths
+    # near-duplicate paths emitted by the three orthogonal sweeps. Missed paths
     # are conservative: without centerline evidence they cannot trigger removal.
     longitudinal_tracks: List[Tuple[List[Tuple[np.ndarray, float]], float, float]] = []
     rejected_short_tracks = 0
@@ -23526,7 +22620,7 @@ def _v1401_embedded_worker(
     result_npz: str,
     status_json: str,
 ) -> None:
-    """Isolated bounded-memory worker for the v14.0.1 default backend."""
+    """Isolated bounded-memory worker for the default backend."""
     try:
         coarse = np.load(str(coarse_npy), mmap_mode='r')
         arrays, details = _v1401_embedded_centerline_arrays(
@@ -23629,11 +22723,10 @@ def _v14_fallback_centerline_samples(
 ) -> V14CenterlineSamples:
     """Last-resort marker-only ridge used when the selected backend fails.
 
-    This is deliberately not authorized to remove voxels. It finds the deepest
-    point in the largest 2D component on ordered source slices, forming a bounded
-    approximate ridge so audit markers can still be generated and synthetic tests
-    can exercise the full plane/component machinery.
-    """
+ This is deliberately not authorized to remove voxels. It finds the deepest
+ point in the largest 2D component on ordered source slices, forming a bounded
+ approximate ridge so audit markers can still be generated and synthetic tests
+ can exercise the full plane/component machinery."""
     x0, x1, y0, y1, t0, t1 = (int(v) for v in extent_xyt)
     if x1 < x0 or y1 < y0 or t1 < t0:
         return V14CenterlineSamples(
@@ -23759,22 +22852,8 @@ def _v14_extract_centerline_samples(
     keep_temp: bool,
 ) -> V14CenterlineSamples:
     requested = str(backend).strip().lower()
-    if requested not in {'embedded', 'auto', 'vmtk'}:
+    if requested != 'embedded':
         raise ValueError(f'unsupported centerline backend {backend!r}')
-    modules_available = _v14_vmtk_modules_available()
-    missing_vmtk = 'VTK/VMTK Python modules are not installed'
-    if requested == 'vmtk' and not bool(modules_available):
-        extent = compute_segment_extent_zyx(mask_mm, workers=int(workers))
-        print(
-            f'Warning: explicit VMTK extraction unavailable ({missing_vmtk}); '
-            'preserving the current pre-pass union and skipping this filter pass.'
-        )
-        return V14CenterlineSamples(
-            np.empty((0, 3), dtype=np.float64), np.empty((0, 3), dtype=np.float64),
-            np.empty((0,), dtype=np.float64), np.empty((0,), dtype=np.int32),
-            np.empty((0,), dtype=np.int32), 'vmtk_unavailable_pass_through', 0, False,
-            {'extent_xyt': [int(v) for v in extent], 'error': missing_vmtk},
-        )
 
     coarse_path, raster_info = _v14_build_coarse_centerline_raster(
         mask_mm,
@@ -23894,10 +22973,7 @@ def _v14_extract_centerline_samples(
                 samples = _load_contract(
                     result_path,
                     status_path,
-                    backend_name=(
-                        'vmtk_centerlines' if str(name) == 'vmtk'
-                        else 'embedded_edt_medial_ridges'
-                    ),
+                    backend_name='embedded_edt_medial_ridges',
                     automatic_removal_allowed=automatic_removal_allowed,
                 )
             except Exception as exc:
@@ -23912,46 +22988,6 @@ def _v14_extract_centerline_samples(
             errors[str(name)] = str(error or 'unknown backend failure')
         return samples
 
-    # Explicit VMTK preserves v14.0.0 semantics. Auto remains useful for A/B
-    # environments but always falls back to the dependency-free implementation.
-    if requested in {'auto', 'vmtk'} and bool(modules_available):
-        samples = _attempt_backend(
-            'vmtk', _v14_vmtk_worker,
-            automatic_removal_allowed=False,
-        )
-        if samples is not None:
-            # The old worker reports surface component count. Keep its conservative
-            # largest-surface safety rule only for the explicit legacy backend.
-            surface_count = int(samples.details.get('surface_component_count', 1))
-            samples = dataclasses_replace(
-                samples,
-                automatic_removal_allowed=bool(surface_count == 1),
-            )
-            samples.details['automatic_removal_allowed'] = bool(surface_count == 1)
-            if not bool(keep_temp):
-                Path(coarse_path).unlink(missing_ok=True)
-            print(
-                f'v14.0.1 centerline pass {int(pass_index)}: VMTK centerlines, '
-                f'samples={int(samples.points_tyx.shape[0])}, endpoints={int(samples.endpoint_count)}.'
-            )
-            return samples
-        if requested == 'vmtk':
-            if not bool(keep_temp):
-                Path(coarse_path).unlink(missing_ok=True)
-            error = str(errors.get('vmtk', 'unknown VMTK failure'))
-            print(
-                f'Warning: explicit VMTK extraction failed ({error}); preserving the '
-                'current pre-pass union and skipping this filter pass.'
-            )
-            return V14CenterlineSamples(
-                np.empty((0, 3), dtype=np.float64), np.empty((0, 3), dtype=np.float64),
-                np.empty((0,), dtype=np.float64), np.empty((0,), dtype=np.int32),
-                np.empty((0,), dtype=np.int32), 'vmtk_unavailable_pass_through', 0, False,
-                {**dict(raster_info), 'error': str(error)},
-            )
-    elif requested == 'auto':
-        errors['vmtk'] = str(missing_vmtk)
-
     samples = _attempt_backend(
         'embedded', _v1401_embedded_worker,
         automatic_removal_allowed=None,
@@ -23959,13 +22995,11 @@ def _v14_extract_centerline_samples(
     if samples is not None:
         try:
             samples = _v1401_refine_fullres_center_samples(mask_mm, samples)
-            if errors.get('vmtk'):
-                samples.details['fallback_reason'] = str(errors['vmtk'])
         finally:
             if not bool(keep_temp):
                 Path(coarse_path).unlink(missing_ok=True)
         print(
-            f'v14.0.1 centerline pass {int(pass_index)}: embedded exact-EDT medial ridges, '
+            f'Centerline pass {int(pass_index)}: embedded exact-EDT medial ridges, '
             f'samples={int(samples.points_tyx.shape[0])}, tracks='
             f"{int(samples.details.get('tracks', 0))}, "
             f'automatic_removal_allowed={bool(samples.automatic_removal_allowed)}.'
@@ -23976,7 +23010,7 @@ def _v14_extract_centerline_samples(
         Path(coarse_path).unlink(missing_ok=True)
     error = str(errors.get('embedded', 'unknown embedded-centerline failure'))
     print(
-        f'Warning: v14.0.1 embedded centerline failed ({error}); using the bounded '
+        f'Warning: embedded centerline failed ({error}); using the bounded '
         'marker-only fallback. Automatic removal remains disabled.'
     )
     fallback = _v14_fallback_centerline_samples(
@@ -23991,12 +23025,11 @@ def _v14_extract_centerline_samples(
 def _v14_subsample_centerline_samples(samples: V14CenterlineSamples) -> V14CenterlineSamples:
     """Densify ordered cells so anomaly spans cover every crossed source slice.
 
-    The historical name is retained to avoid disturbing callers.  Radius-adaptive
-    spacing still bounds in-plane work, but the t increment is never greater than
-    0.75 source voxels.  Thus a 100-slice web is inspected on all crossed source
-    slices instead of only at sparse backend vertices. If the global safety cap is
-    reached, deletion is disabled and the retained samples remain marker-only.
-    """
+ The historical name is retained to avoid disturbing callers. Radius-adaptive
+ spacing still bounds in-plane work, but the t increment is never greater than
+ 0.75 source voxels. Thus a 100-slice web is inspected on all crossed source
+ slices instead of only at sparse backend vertices. If the global safety cap is
+ reached, deletion is disabled and the retained samples remain marker-only."""
     input_count = int(samples.points_tyx.shape[0])
     if input_count <= 1:
         return samples
@@ -24121,7 +23154,7 @@ def _v14_snap_center_to_foreground(
     rounded, valid, values = _v14_round_and_sample_mask(mask_mm, point.reshape(1, 3))
     if bool(valid[0]) and bool(values[0]):
         return np.asarray(rounded[0], dtype=np.float64)
-    # v14.0.1: a block-max center can be several source voxels from the thin
+    # a block-max center can be several source voxels from the thin
     # foreground voxel that admitted its coarse block (factor 6--8 is common).
     # The search runs only when the rounded center already missed foreground.
     reach = max(1, min(16, int(math.ceil(max(0.5, float(radius)) + 1.0))))
@@ -24149,9 +23182,8 @@ def _v1401_refine_fullres_center_samples(
 ) -> V14CenterlineSamples:
     """Snap coarse block centers to full-resolution foreground before detection.
 
-    A bounded failed-center count is a deletion safety gate, not a fatal error:
-    marker-only analysis can still use the section detector's per-sample snap.
-    """
+ A bounded failed-center count is a deletion safety gate, not a fatal error:
+ marker-only analysis can still use the section detector's per-sample snap."""
     count = int(samples.points_tyx.shape[0])
     if count <= 0:
         return samples
@@ -24240,10 +23272,9 @@ def _v14_sample_one_normal_section(
 ) -> Tuple[str, Optional[V14SectionEvidence]]:
     """Return ``(state, evidence)`` where state is anomaly, clean, or unknown.
 
-    Unknown is deliberately distinct from a tested clean section: an invalid
-    tangent, clipped plane, failed center snap, or safety cap may never serve as
-    a clean longitudinal flank that authorizes deletion.
-    """
+ Unknown is deliberately distinct from a tested clean section: an invalid
+ tangent, clipped plane, failed center snap, or safety cap may never serve as
+ a clean longitudinal flank that authorizes deletion."""
     idx = int(sample_index)
     radius = float(samples.radii[idx])
     if not np.isfinite(radius) or radius < 0.5:
@@ -24625,11 +23656,10 @@ def _v14_dense_centerline_seeds_by_slice(
     def _add_protection_seeds(point_tyx: np.ndarray, radius: float) -> None:
         """Rasterize a bounded swept tube used only as a do-not-delete guard.
 
-        Anomaly evidence is still obtained exclusively from the tangent-normal
-        2D circle/path test. This small 3D neighborhood is deliberately allowed
-        only to make protection more conservative for oblique centerlines whose
-        central voxel falls on a neighboring source slice.
-        """
+ Anomaly evidence is still obtained exclusively from the tangent-normal
+ 2D circle/path test. This small 3D neighborhood is deliberately allowed
+ only to make protection more conservative for oblique centerlines whose
+ central voxel falls on a neighboring source slice."""
         point = np.asarray(point_tyx, dtype=np.float64).reshape(3)
         protect_radius = max(1.0, float(radius))
         t_reach = min(8, int(math.ceil(protect_radius)))
@@ -24829,7 +23859,7 @@ def _v14_component_flank_is_clear(
         return False
     component = np.asarray(component_crop) != 0
     area = max(1, int(np.count_nonzero(component)))
-    # Permit modest source-slice motion while testing continuity.  Dilating the
+    # Permit modest source-slice motion while testing continuity. Dilating the
     # candidate support makes the guard conservative: nearby anatomy in *any* of
     # the requested clean slices prevents deletion.
     default_motion = max(2, min(8, int(math.ceil(math.sqrt(float(context))))))
@@ -25175,7 +24205,7 @@ def apply_v14_centerline_filter_inplace(
         model_name=str(model_name), source='centerline_filter', mask_kind='pass00_input',
         pass_index=0, stage='',
         description=(
-            'Untouched final source-geometry union before v14 centerline filtering. '
+            'Untouched final source-geometry union before centerline filtering. '
             'This is the exact pass-0 recovery checkpoint.'
         ),
         temp_dir=temp_dir, workers=int(workers), known_has_foreground=True,
@@ -25185,18 +24215,6 @@ def apply_v14_centerline_filter_inplace(
     )
     if pass0_ref is not None:
         nrrd_layer_refs.append(pass0_ref)
-
-    if str(backend).strip().lower() == 'vmtk' and not _v14_vmtk_modules_available():
-        stats['passes_completed'] = 0
-        stats['stop_reason'] = 'backend_unavailable_pass_through'
-        stats['total_removed_components'] = 0
-        stats['total_removed_voxels'] = 0
-        stats['total_watershed_voxels'] = 0
-        print(
-            'v14 centerline filter: VTK/VMTK is unavailable; pass 0 is preserved '
-            'and no duplicate pass/result volumes will be generated.'
-        )
-        return stats
 
     pass_records: List[Dict[str, object]] = []
     stop_reason = 'pass_limit_exhausted'
@@ -25385,13 +24403,13 @@ def apply_v14_centerline_filter_inplace(
     return stats
 
 
-# --------------------------
-# Scan-based interpolation helpers (v13.0.0 removed optional skeletonization)
-# --------------------------
+#
+# Scan-based interpolation helpers
+#
 
 
 def _keep_center_component_2d(mask2d: np.ndarray) -> np.ndarray:
-    # v13.2.5 (speed #9): cv2 connectedComponents + the cv2 hole fill replace scipy.ndimage,
+    # cv2 connectedComponents + the cv2 hole fill replace scipy.ndimage,
     # whose label/fill_holes hold the GIL and serialize the interpolation planner/render
     # thread pools. Semantics are unchanged (8-connected components, 4-connected hole fill).
     mask2d = np.asarray(mask2d, dtype=bool)
@@ -25400,7 +24418,7 @@ def _keep_center_component_2d(mask2d: np.ndarray) -> np.ndarray:
 
     if _planning_kernels_active():
         try:
-            # v13.3.4 (T3): fused keep-center + hole fill in one nogil kernel (two flood
+            # fused keep-center + hole fill in one nogil kernel (two flood
             # fills on the small canvas) instead of cv2 label + per-edge uniques + fill.
             return _numba_keep_center_fill_kernel(np.ascontiguousarray(mask2d))
         except Exception as exc:
@@ -25427,7 +24445,7 @@ def _keep_center_component_2d(mask2d: np.ndarray) -> np.ndarray:
 
 
 def _signed_distance_2d(mask2d: np.ndarray) -> np.ndarray:
-    # v13.2.5 (speed #9): cv2.distanceTransform with DIST_MASK_PRECISE is the exact euclidean
+    # cv2.distanceTransform with DIST_MASK_PRECISE is the exact euclidean
     # transform (Felzenszwalb), matching scipy.ndimage.distance_transform_edt while releasing
     # the GIL so SDF construction parallelizes across planner threads.
     mask_u8 = np.ascontiguousarray(np.asarray(mask2d, dtype=np.uint8))
@@ -25529,15 +24547,14 @@ class SliceComponentTable:
 class SliceComponentTableCache:
     """Lazy per-slice component table and local projection-SDF cache for interpolation.
 
-    Tables are keyed by slice and store cropped masks/bboxes for each 2D component of
-    each 3D object label.  Projection candidate search then operates only on the source
-    component's bbox expanded by the maximum possible search-angle growth, avoiding
-    full-slice SDFs and full-slice boolean projection scans per seed.
-    """
+ Tables are keyed by slice and store cropped masks/bboxes for each 2D component of
+ each 3D object label. Projection candidate search then operates only on the source
+ component's bbox expanded by the maximum possible search-angle growth, avoiding
+ full-slice SDFs and full-slice boolean projection scans per seed."""
 
     def __init__(self, labels_real: object, slice_luts: Optional['SliceLocalLabelLUTs'] = None) -> None:
         self.labels_real = labels_real
-        # v13.3.6 (A1): when the label volume holds per-slice LOCAL ids (compact relabel
+        # when the label volume holds per-slice LOCAL ids (compact relabel
         # skipped), tables canonicalize each component's id through the per-slice LUT at
         # build time, so every record.label / by_label key is a canonical 3D object id
         # exactly as if the full-volume relabel had run.
@@ -25623,7 +24640,7 @@ class SliceComponentTableCache:
             round(float(search_angle_deg), 6),
             int(pad),
         )
-        # v13.3.4 (T3): lock-free read fast path — CPython dict reads are atomic, and 160
+        # lock-free read fast path — CPython dict reads are atomic, and 160
         # planner threads were serializing on this lock for cache HITS; only inserts lock.
         cached = self._projection_sdfs.get(key)
         if cached is not None:
@@ -25685,7 +24702,7 @@ def _component_record_dilated_overlap_count(prev_record: SliceComponentRecord, c
 
     if _planning_kernels_active():
         try:
-            # v13.3.4 (T3): direct 3x3 neighborhood test — no pad, no cv2.dilate materialization.
+            # direct 3x3 neighborhood test — no pad, no cv2.dilate materialization.
             return int(_numba_dilated_overlap_count_kernel(
                 prev_record.mask_crop, int(py0), int(px0),
                 candidate_record.mask_crop, int(cy0), int(cx0),
@@ -25714,7 +24731,7 @@ def _component_records_directly_overlap(a: SliceComponentRecord, b: SliceCompone
         return False
     if _planning_kernels_active():
         try:
-            # v13.3.4 (T3): early-exit scan — no temporary AND plane per test.
+            # early-exit scan — no temporary AND plane per test.
             return bool(_numba_blocks_overlap_any_kernel(
                 a.mask_crop, int(ay0), int(ax0),
                 b.mask_crop, int(by0), int(bx0),
@@ -25730,11 +24747,10 @@ def _component_records_directly_overlap(a: SliceComponentRecord, b: SliceCompone
 def _component_record_mirrored_u(record: SliceComponentRecord, width: int) -> SliceComponentRecord:
     """Mirror a component record along the u (x) axis of its full slice.
 
-    v13.2.2 bug #2/#12: the radial angular domain is [0°, 180°) over full-diameter
-    frames, so the frame that continues across the 0°/180° wrap is the neighbor frame
-    with u REVERSED (u -> width-1-u). Wrap-crossing comparisons mirror one side through
-    this helper so overlap/continuation tests run in a common coordinate frame.
-    """
+ /: the radial angular domain is [0°, 180°) over full-diameter
+ frames, so the frame that continues across the 0°/180° wrap is the neighbor frame
+ with u REVERSED (u -> width-1-u). Wrap-crossing comparisons mirror one side through
+ this helper so overlap/continuation tests run in a common coordinate frame."""
     w = int(width)
     y0, x0, y1, x1 = record.bbox
     return SliceComponentRecord(
@@ -25755,18 +24771,9 @@ def _build_slice_component_table(
     origin_yx: Tuple[int, int] = (0, 0),
     full_shape_yx: Optional[Tuple[int, int]] = None,
 ) -> SliceComponentTable:
-    """Build the per-slice component records for interpolation planning.
-
-    v13.3.4 (T1): ONE cv2.connectedComponentsWithStats call over the slice's foreground bbox
-    replaces the old per-3D-label scheme (full-slice foreground argsort + one CC call per label
-    on its own bbox crop). In-plane labeling is always 8-connected
-    (label_foreground_volume_streaming), so two different 3D labels can never be 8-adjacent
-    within a slice — every whole-slice 8-connected component therefore lies wholly inside one
-    3D label, and the per-label grouping is recovered by reading the label at any pixel of the
-    component. Records carry identical bboxes/areas/anchors; only the LIST order (whole-slice
-    scan order instead of ascending-label order) and the arbitrary component_index values
-    differ, neither of which affects planning decisions beyond exact ties.
-    """
+    """Build interpolation component records with one bbox-limited 8-connected pass per slice.
+    
+    Each 2D component is associated with its 3D label through an anchor pixel."""
     labels_arr = np.asarray(labels2d)
     h, w = (int(labels_arr.shape[0]), int(labels_arr.shape[1]))
     origin_y, origin_x = (int(origin_yx[0]), int(origin_yx[1]))
@@ -25814,7 +24821,7 @@ def _build_slice_component_table(
         if label_i <= 0:
             continue
         if local_to_canonical is not None:
-            # v13.3.6 (A1): per-slice LOCAL id -> canonical 3D object id (no relabel pass).
+            # per-slice LOCAL id -> canonical 3D object id (no relabel pass).
             label_i = int(local_to_canonical[label_i])
             if label_i <= 0:
                 continue
@@ -25908,7 +24915,7 @@ def _local_half_width_for_component_records(
 class SliceEndpointSeed:
     label: int
     point: Tuple[int, int, int]  # (slice, row, col)
-    direction_sign: int          # -1 or +1 along the slice axis
+    direction_sign: int          # 1 or +1 along the slice axis
 
 
 @dataclass(frozen=True)
@@ -25975,7 +24982,7 @@ def _component_centroid_anchor(mask2d: np.ndarray) -> Optional[Tuple[int, int]]:
 
 
 def _component_max_radius(mask2d: np.ndarray) -> float:
-    # v13.2.5 (speed #9): exact cv2 distance transform (GIL-releasing) replaces scipy EDT.
+    # exact cv2 distance transform (GIL-releasing) replaces scipy EDT.
     mask_u8 = np.ascontiguousarray(np.asarray(mask2d, dtype=np.uint8))
     if not np.any(mask_u8):
         return 0.0
@@ -26056,13 +25063,7 @@ def _paste_local_mask_onto_slice(
     *,
     dst_bbox_union: Optional[List[int]] = None,
 ) -> int:
-    """OR a centered local mask into a slice and optionally accumulate its clipped dst bbox.
-
-    ``dst_bbox_union`` is a mutable ``[y0, x0, y1, x1]`` initialized by the caller to
-    ``[H, W, 0, 0]``. v13.3.10 T7 uses it while rendering so the later bridge merge and
-    optional delta capture touch only the union of regions that a paste could have changed.
-    The return value and paste arithmetic remain unchanged.
-    """
+    """OR a local mask into one destination slice and update the caller-provided touched bbox."""
     if not np.any(local_mask):
         return 0
 
@@ -26103,7 +25104,7 @@ def _paste_local_mask_onto_slice(
 
     if _planning_kernels_active():
         try:
-            # v13.3.4 (T3): one nogil pass counts+writes only newly-set pixels (bridge slices
+            # one nogil pass counts+writes only newly-set pixels (bridge slices
             # hold 0/1) instead of two bool temporaries + a count + an OR store per paste.
             return int(_numba_paste_masked_or_kernel(
                 np.asarray(dest_slice), np.asarray(local_mask, dtype=bool),
@@ -26158,9 +25159,9 @@ def compiled_interpolation_kernels_enabled() -> bool:
     return bool(_numba is not None and _env_flag('YOLO_TTA_INTERPOLATION_COMPILED_KERNELS', True))
 
 
-# --------------------------
-# v13.3.4 (T3): numba nogil kernels for the seed-planning inner loop
-# --------------------------
+#
+# numba nogil kernels for the seed-planning inner loop
+#
 # Seed planning ran at ~20-100 seeds/s with 160 planner threads: the per-seed work is dozens of
 # tiny numpy/python steps (nonzero + argmin nearest-point searches, local-canvas scatters,
 # extent reductions, cv2 dilate/label calls on small crops) whose python glue serializes on the
@@ -26495,14 +25496,14 @@ if _numba is not None:
         sdf_h = sdf.shape[0]
         sdf_w = sdf.shape[1]
         overflow = 0
-        # v13.3.6 (A1): when the label volume holds per-slice LOCAL ids (compact relabel
+        # when the label volume holds per-slice LOCAL ids (compact relabel
         # skipped), lut_offsets has one entry per slice and reads canonicalize through the
         # concatenated local->canonical table; a shorter array means canonical ids in-raster.
         use_lut = lut_offsets.shape[0] == num_slices
 
         for step in range(1, max_steps + 1):
             s = s0 + direction_sign * step
-            # v13.2.2 bug #2: a projection step that crosses the radial 0°/180° wrap lands
+            # a projection step that crosses the radial 0°/180° wrap lands
             # in a frame whose u axis is REVERSED relative to the projection cone, so read
             # (and report) the mirrored column there. max_steps <= num_slices-1 caps the
             # walk at a single crossing.
@@ -26661,7 +25662,7 @@ def _find_slice_projection_candidates_numba(
     slope = math.tan(math.radians(float(search_angle_deg)))
     max_tracked = max(int(max_candidates), int(interpolation_projection_numba_max_tracked()))
 
-    # v13.3.6 (A1): pass the per-slice local->canonical LUTs when the label volume holds
+    # pass the per-slice local->canonical LUTs when the label volume holds
     # local ids; a 1-entry offsets sentinel tells the kernel the raster is already canonical.
     if slice_luts is not None:
         lut_flat_arg = slice_luts.lut_flat
@@ -26799,7 +25800,7 @@ def _find_slice_projection_candidates_python(
         mirrored = False
         if bool(wrap_axis):
             s = int(s_raw % int(num_slices))
-            # v13.2.2 bug #2: a step across the radial 0°/180° wrap lands in a frame whose
+            # a step across the radial 0°/180° wrap lands in a frame whose
             # u axis is REVERSED relative to the projection cone. max_steps <= num_slices-1
             # caps the walk at a single crossing.
             mirrored = bool(s_raw < 0 or s_raw >= int(num_slices))
@@ -26816,7 +25817,7 @@ def _find_slice_projection_candidates_python(
             continue
 
         if isinstance(labels_real, SparseSliceLabelStore):
-            # C4: materialize only the SDF window. A wrap-crossing projection requests
+            # materialize only the SDF window. A wrap-crossing projection requests
             # the corresponding actual-u window and reverses that small crop back into
             # unrolled projection coordinates.
             if mirrored:
@@ -26835,7 +25836,7 @@ def _find_slice_projection_candidates_python(
                 slice_view = slice_view[:, ::-1]
             labels_crop = slice_view[crop_y0:crop_y1, crop_x0:crop_x1]
         if slice_luts is not None:
-            # v13.3.6 (A1): local-id raster — canonicalize just the SDF crop (small gather)
+            # local-id raster — canonicalize just the SDF crop (small gather)
             # instead of relying on a full-volume compact relabel pass.
             labels_crop = slice_luts.lut_for(int(s))[labels_crop]
         overlap = projection & (labels_crop > 0) & (labels_crop != int(seed.label))
@@ -26949,7 +25950,7 @@ def _collect_walkback_source_points(
             cmp_record = current_record
             cmp_anchor = current_anchor
             if wrap_crossed:
-                # v13.2.2 bug #2: continuation across the radial 0°/180° wrap matches at
+                # continuation across the radial 0°/180° wrap matches at
                 # u -> width-1-u; mirror the near side into the far frame's coordinates.
                 cmp_record = _component_record_mirrored_u(current_record, slice_w)
                 cmp_anchor = (int(current_anchor[0]), int(slice_w - 1 - int(current_anchor[1])))
@@ -26997,7 +25998,7 @@ def _collect_walkback_source_points(
         cmp_component = current_component
         cmp_anchor = current_anchor
         if wrap_crossed:
-            # v13.2.2 bug #2: match across the radial 0°/180° wrap at u -> width-1-u.
+            # match across the radial 0°/180° wrap at u -> width-1-u.
             cmp_component = current_component[:, ::-1]
             cmp_anchor = (int(current_anchor[0]), int(slice_w - 1 - int(current_anchor[1])))
         next_component, next_anchor = _follow_branch_component(next_slice_mask, cmp_component, cmp_anchor)
@@ -27014,18 +26015,16 @@ def _collect_walkback_source_points(
 
 
 def interpolation_cache_bridge_sections_enabled() -> bool:
-    """Reuse accepted min-radius scan sections during painting (v13.3.10 T6).
+    """Reuse accepted min-radius scan sections during painting.
 
-    ``YOLO_TTA_INTERPOLATION_CACHE_BRIDGE_SECTIONS=0`` restores recomputation.
-    """
+ ``YOLO_TTA_INTERPOLATION_CACHE_BRIDGE_SECTIONS=0`` restores recomputation."""
     return _env_flag('YOLO_TTA_INTERPOLATION_CACHE_BRIDGE_SECTIONS', True)
 
 
 def interpolation_fused_bridge_merge_enabled() -> bool:
-    """Restrict bridge merge/delta capture to rendered paste bboxes (v13.3.10 T7).
+    """Restrict bridge merge/delta capture to rendered paste bboxes.
 
-    ``YOLO_TTA_INTERPOLATION_FUSED_BRIDGE_MERGE=0`` restores full-slice sweeps.
-    """
+ ``YOLO_TTA_INTERPOLATION_FUSED_BRIDGE_MERGE=0`` restores full-slice sweeps."""
     return _env_flag('YOLO_TTA_INTERPOLATION_FUSED_BRIDGE_MERGE', True)
 
 
@@ -27036,7 +26035,7 @@ class SliceBridgeRenderPlan:
     source_point: Tuple[int, int, int]
     target_point: Tuple[int, int, int]
     source_anchor: Tuple[int, int]
-    # v13.2.2 bug #2: for a bridge crossing the radial 0°/180° wrap, target_anchor and
+    # for a bridge crossing the radial 0°/180° wrap, target_anchor and
     # sdf1 are stored in source-side "unrolled" coordinates (u mirrored relative to the
     # target slice's own frame); the painter maps wrapped intermediate slices back.
     target_anchor: Tuple[int, int]
@@ -27045,7 +26044,7 @@ class SliceBridgeRenderPlan:
     num_slices: int
     sdf0: np.ndarray
     sdf1: np.ndarray
-    # v13.3.10 (T6): the min-radius acceptance scan already constructs every
+    # the min-radius acceptance scan already constructs every
     # intermediate bool section. Accepted plans retain those exact post-component-filter
     # arrays by step index so painting does not repeat SDF lerp/threshold/component work.
     cached_sections: List[Optional[np.ndarray]] = field(default_factory=list, compare=False, repr=False)
@@ -27068,14 +26067,14 @@ def _build_slice_endpoint_seeds(
     wrap_axis: bool = False,
     component_cache: Optional['SliceComponentTableCache'] = None,
 ) -> Tuple[List[SliceEndpointSeed], int]:
-    """Build interpolation endpoint seeds with the v12.2.0 per-slice component scan.
+    """Build interpolation endpoint seeds with the per-slice component scan.
 
-    Interpolation no longer uses skeletonization. Each labeled 3D object is scanned slice by
-    slice; every 2D connected component is evaluated independently for overlap continuation
-    into the previous and next slice. Components without continuation become endpoint seeds in
-    the corresponding direction. Radial interpolation can wrap the slice/frame axis so frame 0
-    and the final radial frame are considered adjacent.
-    """
+ Interpolation no longer uses skeletonization. Each labeled 3D object is scanned slice by
+ slice; every 2D connected component is evaluated independently for overlap continuation
+ into the previous and next slice. Components without continuation become endpoint seeds in
+ the corresponding direction. Radial interpolation can wrap the slice/frame axis so frame 0
+ and the final radial frame are considered adjacent."""
+    # DEAD PARAMETER: extension_slices is retained for callers; scan endpoints do not use it.
     del extension_slices  # retained for call-site compatibility; scan endpoints do not need it.
     return build_slice_endpoint_seeds_from_label_volume(
         labels_real,
@@ -27114,7 +26113,7 @@ def _build_linear_slice_bridge_plan(
     if steps <= 0:
         return None
 
-    # v13.2.2 bug #2: does the raw source->target walk cross the 0°/180° wrap? If so, the
+    # does the raw source->target walk cross the 0°/180° wrap? If so, the
     # target slice's u axis is REVERSED relative to the source side; build the morph in
     # source-side "unrolled" coordinates by mirroring the target component and anchor.
     raw_end = int(s0) + int(sign) * int(steps)
@@ -27174,15 +26173,7 @@ def _estimate_linear_slice_bridge_min_radius_from_plan(
     reject_at_or_below: float = 0.0,
     cache_sections: bool = False,
 ) -> float:
-    """Thinnest inscribed radius along the bridge (endpoints + every intermediate section).
-
-    v13.2.5 (speed #9): the endpoint radii come directly from the plan's own signed distance
-    fields (max(sdf) IS the max inscribed radius — no extra distance transforms), and when
-    ``reject_at_or_below`` is set the per-step scan returns as soon as the running minimum can
-    no longer exceed the rejection threshold (the caller rejects on <=, so no later section
-    can change the outcome). v13.3.10 T6 optionally retains each post-filter intermediate
-    section on the plan; every accepted plan necessarily completes this scan.
-    """
+    """Estimate the minimum accepted bridge radius from the plan's cached endpoint distance fields."""
     source_local = np.asarray(plan.sdf0 >= 0.0, dtype=bool)
     target_local = np.asarray(plan.sdf1 >= 0.0, dtype=bool)
     if not np.any(source_local) or not np.any(target_local):
@@ -27232,7 +26223,7 @@ def _paint_linear_slice_bridge_plan_onto_slice(
         section = _keep_center_component_2d(section)
     center_y = (1.0 - alpha) * float(plan.source_anchor[0]) + alpha * float(plan.target_anchor[0])
     center_x = (1.0 - alpha) * float(plan.source_anchor[1]) + alpha * float(plan.target_anchor[1])
-    # v13.2.2 bug #2: the morph runs in source-side "unrolled" coordinates. Intermediate
+    # the morph runs in source-side "unrolled" coordinates. Intermediate
     # slices beyond the radial 0°/180° boundary store the u-mirrored frame, so flip the
     # section (the local canvas is centered, so a column flip mirrors it about its
     # center) and mirror the center's u there. Non-wrap plans never leave [0, num_slices).
@@ -27361,25 +26352,9 @@ def interpolate_view_volume_pass_inplace(
     known_slice_any: Optional[np.ndarray] = None,
     known_slice_bboxes: Optional[np.ndarray] = None,
 ) -> Dict[str, object]:
-    """Apply one interpolation pass directly to a view-volume stack.
-
-    The pass keeps bridge creation simultaneous by searching against a frozen label snapshot and
-    merging all newly created bridge voxels only after planning is complete. Endpoint discovery,
-    candidate search, bridge planning and slice rendering are parallelized across independent
-    objects / seeds / slices to reduce the long single-threaded stretch after compact relabel.
-    For Radial views, wrap_axis lets endpoint search and bridge rendering wrap between the
-    final and first azimuth frames.
-
-    v13.2.5 (speed #3): ``bridge_delta_path`` writes the pass's exact added-voxel volume
-    (bridge AND NOT pre-merge mask) to a disk memmap during the merge step, replacing the old
-    full-volume before-copy + subtract the --save_nrrd bridge layers used to require. The stat
-    key 'bridge_delta_path' is set when the file was produced; the CALLER owns its cleanup.
-
-    v13.3.10 T6 reuses accepted min-radius scan sections during painting. T7 records the
-    union of clipped paste bboxes for each rendered slice and restricts the simultaneous
-    bridge merge plus optional delta capture to that region. Both optimizations are default-on
-    behind their ``YOLO_TTA_INTERPOLATION_*`` gates and retain the legacy path as fallback.
-    """
+    """Run one interpolation pass in place.
+    
+    Optional outputs capture exact added voxels and sparse label metadata; accepted bridge sections are reused during painting."""
     if int(max_slice_distance) <= 0:
         return {
             'num_objects': 0,
@@ -27397,9 +26372,8 @@ def interpolate_view_volume_pass_inplace(
         }
 
     work_dir.mkdir(parents=True, exist_ok=True)
-    # v13.3.6 (A1): keep per-slice LOCAL ids in the label store and consume them through
-    # the exported LUTs. v13.3.9 (D5): size the admission estimate with the actual local
-    # label dtype so a uint16-capable pass is not needlessly forced to disk.
+    # Keep per-slice local ids in the label store and consume them through exported LUTs.
+    # Size admission with the actual local dtype so a uint16-capable pass is not forced to disk.
     skip_relabel = interpolation_skip_compact_relabel_enabled()
     estimated_label_dtype = _local_label_store_dtype(compact_relabel=not skip_relabel)
     estimated_bytes = estimate_interpolation_workspace_bytes(
@@ -27498,7 +26472,7 @@ def interpolate_view_volume_pass_inplace(
     else:
         bridge_path = work_dir / f'{pass_tag}_bridges.u8.dat'
         bridge_mm = np.memmap(bridge_path, dtype=np.uint8, mode='w+', shape=mask_mm.shape)
-    numa_interleave_memory(bridge_mm, desc='Interpolation bridge canvas')  # v13.3.5 (N2)
+    numa_interleave_memory(bridge_mm, desc='Interpolation bridge canvas')  #
 
     candidate_connections = 0
     accepted_connections = 0
@@ -27507,7 +26481,7 @@ def interpolate_view_volume_pass_inplace(
     skipped_by_min_radius = 0
     added_voxels = 0
     bridge_delta_written = False
-    # v13.3.11: interpolation already visits every bridge-delta crop while it is hot.
+    # interpolation already visits every bridge-delta crop while it is hot.
     # Preserve the exact per-azimuth bounds and per-t row occupancy here so radial
     # backprojection does not rediscover them by strided scans over the dense delta file.
     bridge_delta_slice_bboxes: Optional[np.ndarray] = None
@@ -27550,7 +26524,7 @@ def interpolate_view_volume_pass_inplace(
             skipped_by_min_radius += int(seed_result.skipped_by_min_radius)
             if seed_result.plans:
                 plans.extend(seed_result.plans)
-        # The loop variable otherwise retains the final seed result (and its T6 section
+        # The loop variable otherwise retains the final seed result (and its section
         # caches) independently of the flattened plan list.
         del seed_result
 
@@ -27592,24 +26566,24 @@ def interpolate_view_volume_pass_inplace(
                 desc='Interpolation: render bridges',
             )
             added_voxels = int(np.sum(added_counts, dtype=np.int64))
-            # v13.3.1 (R19): bridge voxels can only exist on slices the render schedule touched;
+            # bridge voxels can only exist on slices the render schedule touched;
             # merge (and delta-capture) only those instead of np.any-scanning every slice of the
             # full bridge volume (a mostly-empty ~volume-sized read per pass per view).
             scheduled_slices = [int(z) for z in range(int(mask_mm.shape[0])) if schedule[int(z)]]
             del schedule
             del added_counts
-            # Painting is the sole cache consumer. Drop plans (SDFs + T6 bool sections)
+            # Painting is the sole cache consumer. Drop plans (SDFs + bool sections)
             # before allocating the optional volume-sized delta workspace.
             plans.clear()
 
             delta_mm: Optional[np.ndarray] = None
             if bridge_delta_path is not None:
-                # v13.2.5 (speed #3): the delta is exactly bridge AND NOT pre-merge mask,
+                # the delta is exactly bridge AND NOT pre-merge mask,
                 # captured in the same read the merge already performs (no before-copy,
                 # no post-pass subtract). 'w+' memmaps start zero-filled.
                 Path(bridge_delta_path).parent.mkdir(parents=True, exist_ok=True)
                 delta_mm = np.memmap(Path(bridge_delta_path), dtype=np.uint8, mode='w+', shape=mask_mm.shape)
-                numa_interleave_memory(delta_mm, desc='Interpolation bridge delta')  # v13.3.5 (N2)
+                numa_interleave_memory(delta_mm, desc='Interpolation bridge delta')  #
                 bridge_delta_slice_bboxes = np.zeros((int(mask_mm.shape[0]), 4), dtype=np.int64)
                 bridge_delta_rows_by_slice = np.zeros(
                     (int(mask_mm.shape[0]), int(mask_mm.shape[1])), dtype=bool,
@@ -27713,7 +26687,7 @@ def interpolate_view_volume_pass_inplace(
         'wrap_axis': bool(wrap_axis),
         'endpoint_method': 'slice_component_scan',
         'planning_backend': interpolation_planning_backend_name(),
-        'compact_relabel_skipped': bool(skip_relabel),  # v13.3.6 (A1)
+        'compact_relabel_skipped': bool(skip_relabel),  #
     }
     if bool(bridge_delta_written) and bridge_delta_path is not None:
         result_stats['bridge_delta_path'] = str(bridge_delta_path)
@@ -27778,12 +26752,12 @@ CTILE_FORMAT = 'ctile-mask-v2-raw'
 CVOL_FORMAT = 'cvol-mask-v2-raw'
 MASK_STORE_FORMATS = {CTILE_FORMAT, CVOL_FORMAT}
 # Shared read-only mappings for raw bbox-store chunks.bin payloads during NRRD streaming.
-# v13.2.2 bug #15: the full-quality writer and the per-downbin low-quality writers for
+# the full-quality writer and the per-downbin low-quality writers for
 # the SAME layer run concurrently on the NrrdLayerSink pool. The cache was a plain dict
 # with an unsynchronized get->read->set (N+1 simultaneous RAM copies of a multi-GiB
 # chunks.bin) and each writer's finally evicted the entry while sibling futures still
-# needed it (re-reading the whole file from disk once per output). v13.3.11 replaces the
-# remaining Path.read_bytes() copy with one refcounted MAP_SHARED/ACCESS_READ mapping. The
+# needed it (re-reading the whole file from disk once per output). replaces the
+# remaining Path.read_bytes copy with one refcounted MAP_SHARED/ACCESS_READ mapping. The
 # kernel page cache is therefore shared by all full/low-quality readers and remains
 # reclaimable; the Python heap no longer holds a second multi-GiB copy.
 _NRRD_RAW_STORE_CHUNKS_RAM_CACHE: Dict[Path, Tuple[object, int]] = {}
@@ -27886,14 +26860,9 @@ NrrdSegmentExtent = Tuple[int, int, int, int, int, int]
 
 @dataclass(frozen=True)
 class NrrdLayerRef:
-    """One orthogonal-space layer for the single-layer NRRD decomposition.
-
-    The layer is a binary mask in the pipeline's orthogonal ``(t, Y, X)``
-    processing geometry. The backing path may be a raw uint8 memmap or a
-    v12.2 raw bbox cvol/ctile store. v13.2.0 writes one single-layer 3-axis NRRD
-    (X, Y, t) per component layer, restoring each layer to the final output
-    geometry while streaming from this backing store.
-    """
+    """Reference one component-layer backing store and its geometry metadata.
+    
+    The sink restores the store to output geometry and writes one independent single-layer NRRD."""
 
     key: str
     name: str
@@ -27910,7 +26879,7 @@ class NrrdLayerRef:
     tile_acceptance: str = ''  # parent_mask, parent_bridge, consolidated, or blank
     stage: str = ''
     description: str = ''
-    # v14: make recomposition semantics explicit.  Legacy view contributors are
+    # make recomposition semantics explicit. Legacy view contributors are
     # additive by default; global checkpoints and centerline audit deltas override
     # these values at construction time.
     layer_role: str = 'additive_component'
@@ -27923,7 +26892,7 @@ class NrrdLayerRef:
     segment_extent_ijk: Optional[NrrdSegmentExtent] = None
     segment_extent_shape_tyx: Tuple[int, int, int] = (0, 0, 0)
     segment_extent_source: str = ''
-    # v13.3.6 (N3): an IMMUTABLE in-process live volume the sink streams directly (no store
+    # an IMMUTABLE in-process live volume the sink streams directly (no store
     # encode, no read-back). Only valid within the producing process; ``path`` is then a
     # never-created placeholder. compare=False keeps the frozen dataclass hashless-safe.
     live_array: Optional[np.ndarray] = field(default=None, compare=False, repr=False)
@@ -27953,7 +26922,7 @@ class TileConsolidationResult:
     view_name: str
     interpolation_stats: List[Dict[str, object]]
     nrrd_layers: List[NrrdLayerRef] = field(default_factory=list)
-    # v13.2.2 bug #14: the interpolation process backend may rebind the consolidated
+    # the interpolation process backend may rebind the consolidated
     # accumulator to a fresh disk memmap; the scheduler must re-point its registry at the
     # volume that actually received the interpolation bridges.
     final_accumulator_mm: Optional[np.ndarray] = None
@@ -28008,8 +26977,7 @@ def _segment_extent_to_json(extent: Sequence[int]) -> List[int]:
 class RawBBoxSlicePayload:
     """One slice payload for the raw bbox mask store.
 
-    Payloads are raw uint8 crop bytes in v12.2.0, not bitpacked or LZ4-compressed.
-    """
+ Payloads are raw uint8 crop bytes in, not bitpacked or LZ4-compressed."""
 
     idx: int
     is_empty: bool
@@ -28025,12 +26993,11 @@ class RawBBoxSlicePayload:
 class IncrementalRawBBoxMaskStoreWriter:
     """Thread-safe raw-bbox writer fed by completed projection blocks.
 
-    Blocks may arrive in any order. Each nonempty slice reserves an append offset, then
-    writes its normalized crop in bounded row slabs with ``pwrite``; neither block-sized nor
-    whole-crop payload objects are retained. Finalization is allowed only after every output
-    slice has been delivered exactly once, so its index, foreground count, and segment extent
-    have the same semantics as :func:`write_raw_bbox_mask_store`.
-    """
+ Blocks may arrive in any order. Each nonempty slice reserves an append offset, then
+ writes its normalized crop in bounded row slabs with ``pwrite``; neither block-sized nor
+ whole-crop payload objects are retained. Finalization is allowed only after every output
+ slice has been delivered exactly once, so its index, foreground count, and segment extent
+ have the same semantics as:func:`write_raw_bbox_mask_store`."""
 
     def __init__(
         self,
@@ -28134,7 +27101,7 @@ class IncrementalRawBBoxMaskStoreWriter:
     def _consume_slice(self, z: int, plane: np.ndarray) -> None:
         z_i = int(z)
         plane_arr = np.ascontiguousarray(np.asarray(plane, dtype=np.uint8))
-        # C12: OpenCV performs one compiled scan for both emptiness and the tight bbox.
+        # OpenCV performs one compiled scan for both emptiness and the tight bbox.
         # The previous two NumPy reductions read the entire plane twice and created two
         # temporary boolean vectors before the sink normalized/copied the crop.
         x0, y0, bbox_w, bbox_h = (int(v) for v in cv2.boundingRect(plane_arr))
@@ -28332,12 +27299,11 @@ class IncrementalRawBBoxMaskStoreWriter:
 
 
 class RawBBoxMaskStore:
-    """Read adapter for v12.2.0 raw slice-bbox binary mask volumes.
+    """Read adapter for raw slice-bbox binary mask volumes.
 
-    The payload format is uncompressed: empty slices are elided, nonempty slices are cropped to their
-    nonzero bbox, and the crop is written as raw uint8 bytes. No NumPy packbits and
-    no LZ4 are used for waiting tiles or cvol NRRD/support layers.
-    """
+ The payload format is uncompressed: empty slices are elided, nonempty slices are cropped to their
+ nonzero bbox, and the crop is written as raw uint8 bytes. No NumPy packbits and
+ no LZ4 are used for waiting tiles or cvol NRRD/support layers."""
 
     def __init__(
         self,
@@ -28352,11 +27318,11 @@ class RawBBoxMaskStore:
         self.meta = dict(meta)
         self.index = np.asarray(index, dtype=CTILE_INDEX_DTYPE)
         self.chunks_path = self.root / 'chunks.bin'
-        # ``chunks_bytes`` is retained as a compatibility keyword, but v13.3.11 passes
+        # ``chunks_bytes`` is retained as a compatibility keyword, but passes
         # the process-shared read-only mmap instead of a heap-owned bytes copy.
         self._chunks_bytes: Optional[object] = chunks_bytes
         self._chunks_mmap: Optional[mmap.mmap] = None
-        # True when open() holds a reference on the shared RAM cache entry for this
+        # True when open holds a reference on the shared RAM cache entry for this
         # store's chunks.bin (released via _drop_nrrd_raw_store_chunks_ram_cache).
         self._ram_cache_ref_held = False
         shape = self.meta.get('shape')
@@ -28366,7 +27332,7 @@ class RawBBoxMaskStore:
         if int(self.index.shape[0]) != int(self.shape[0]):
             raise ValueError(f'{self.root}: index slice count {int(self.index.shape[0])} != shape[0] {int(self.shape[0])}')
         if bool(mmap_payload) and self._chunks_bytes is None and self.chunks_path.stat().st_size > 0:
-            # G5 opens many stores at once. A read-only mapping keeps pages reclaimable by
+            # opens many stores at once. A read-only mapping keeps pages reclaimable by
             # the kernel while avoiding one open/seek/read/close cycle per (layer,z).
             try:
                 with self.chunks_path.open('rb') as fh:
@@ -28513,19 +27479,9 @@ class RawBBoxMaskStore:
         member_bytes: int,
         sparse_consumer: Optional[Callable[[int, int, int, np.ndarray], None]] = None,
     ) -> Iterator[Tuple[int, Optional[np.ndarray]]]:
-        """Yield slice-aligned native-order payload members directly from the cvol index.
-
-        ``None`` means that no indexed bbox overlaps the member and lets the payload
-        writer emit its cached compressed-zero member. Intersecting members alone get a
-        zeroed member allocation; each bbox is copied with one native rectangular NumPy
-        assignment straight from ``chunks.bin``.  Unlike the pre-v13.3.17 implementation,
-        member boundaries are always whole slices.  For the production 3064x3022 geometry
-        this is one 8.83 MiB slice per gzip member, removing the partial-row Python loop.
-
-        ``sparse_consumer`` receives each crop in output coordinates while it is already in
-        cache.  N22's low-quality mirror tee uses that hook instead of making a second dense
-        compatibility pass through the store.
-        """
+        """Yield whole-slice gzip-member buffers assembled only from overlapping bbox chunks.
+        
+        An optional sparse consumer receives each output-coordinate crop while it is already cache-resident."""
         z_dim, h, w = (int(v) for v in self.shape)
         z0 = int(np.clip(int(z_start), 0, z_dim))
         z1 = int(np.clip(int(z_stop), z0, z_dim))
@@ -28551,7 +27507,7 @@ class RawBBoxMaskStore:
                 yield int(ln), None
                 continue
 
-            # N24: one owned, slice-aligned buffer is handed to the member writer.  All
+            # one owned, slice-aligned buffer is handed to the member writer. All
             # large zero-fill/copy operations below are NumPy native loops (no Python row
             # assembly), and the default member writer can retain this allocation directly.
             member = np.zeros(
@@ -28586,13 +27542,12 @@ class RawBBoxMaskStore:
     ) -> Iterator[Tuple[int, Optional[np.ndarray]]]:
         """Yield restored cvol payload without constructing intermediate dense planes.
 
-        Temporal restore is resolved from the index and every contributing source bbox is
-        OR-scattered directly into its destination member plane.  XY restore operates on
-        the bbox plus its mathematically required global-coordinate influence halo; it
-        never decodes or resizes an ``in_h x in_w`` zero background.  Members contain an
-        integral number of output slices so gzip, sparse assembly, and mirror tee all share
-        one stable unit of work.
-        """
+ Temporal restore is resolved from the index and every contributing source bbox is
+ OR-scattered directly into its destination member plane. XY restore operates on
+ the bbox plus its mathematically required global-coordinate influence halo; it
+ never decodes or resizes an ``in_h x in_w`` zero background. Members contain an
+ integral number of output slices so gzip, sparse assembly, and mirror tee all share
+ one stable unit of work."""
         in_t, in_h, in_w = (int(v) for v in self.shape)
         out_t, out_h, out_w = (int(v) for v in output_shape)
         z0 = int(np.clip(int(z_start), 0, out_t))
@@ -28684,7 +27639,7 @@ class RawBBoxMaskStore:
 
 
 def _encode_bool_mask_slice_payload(idx: int, mask_bool: np.ndarray) -> RawBBoxSlicePayload:
-    # v13.3.1 (R16): scan the slice as handed in (uint8 or bool — any nonzero is foreground)
+    # scan the slice as handed in (uint8 or bool — any nonzero is foreground)
     # instead of casting the whole slice to bool first (a full-slice copy per encoded slice
     # across >200 G voxels per run). The row reduction doubles as the emptiness test, and the
     # binarizing compare+copy happens only inside the nonzero bbox crop.
@@ -28716,7 +27671,7 @@ def _encode_bool_mask_slice_payload(idx: int, mask_bool: np.ndarray) -> RawBBoxS
 
 
 def _encode_ctile_slice(idx: int, tile_mask_mm: np.ndarray) -> RawBBoxSlicePayload:
-    # v13.3.1 (R16): the encoder handles raw uint8 slices directly; the old `>0` here was
+    # the encoder handles raw uint8 slices directly; the old `>0` here was
     # another full-slice compare+copy per slice.
     return _encode_bool_mask_slice_payload(int(idx), tile_mask_mm[int(idx)])
 
@@ -28733,8 +27688,7 @@ def _write_raw_bbox_payload_store(
 ) -> Dict[str, object]:
     """Write a slice-chunked raw bbox binary mask store.
 
-    Write raw uint8 bbox payloads; this stage no longer bitpacks or LZ4-compresses payloads.
-    """
+ Write raw uint8 bbox payloads; this stage no longer bitpacks or LZ4-compresses payloads."""
     fmt = str(format_name)
     if fmt not in MASK_STORE_FORMATS:
         raise ValueError(f'Unsupported raw bbox mask format: {fmt}')
@@ -28859,7 +27813,7 @@ def write_raw_bbox_mask_store(
     workers: int = 1,
     extra_meta: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
-    """Write a v12.2.0 raw bbox mask store."""
+    """Write a raw bbox mask store."""
     arr = np.asarray(mask_volume)
     if arr.ndim != 3:
         raise ValueError(f'{desc}: expected 3D mask volume, got shape {arr.shape}')
@@ -28973,17 +27927,7 @@ def tile_intermediate_accumulators_prefer_memory() -> bool:
 
 
 def tile_intermediate_accumulator_reserve_bytes() -> int:
-    """Headroom the tile accumulators leave free when they ask for anonymous RAM.
-
-    v15.0.3 (T10): the reserve is now sized against ``available_anon_work_bytes`` — which is
-    already corrected for the SLURM cgroup limit, unlike raw MemFree — instead of a flat
-    64 GiB that was simultaneously too big and too small. Too big on a 128 GiB allocation:
-    a 2 GiB canvas would need 66 GiB free, so every accumulator silently demoted to disk and
-    the tile path was starved by whatever the parent workspaces happened to be holding. Too
-    small on a 1 TiB node, where 64 GiB is noise. An explicit
-    ``YOLO_TTA_TILE_ACCUMULATOR_RESERVE_GIB`` still wins outright, and the proportional form
-    is bounded by ``..._RESERVE_MIN_GIB`` / ``..._RESERVE_MAX_GIB``.
-    """
+    """Return the anonymous-memory reserve used when admitting tile accumulators."""
     if os.environ.get('YOLO_TTA_TILE_ACCUMULATOR_RESERVE_GIB', '').strip():
         return int(max(0.0, _env_float('YOLO_TTA_TILE_ACCUMULATOR_RESERVE_GIB', 64.0)) * GIB)
     fraction = min(0.9, max(0.0, _env_float('YOLO_TTA_TILE_ACCUMULATOR_RESERVE_FRACTION', 0.15)))
@@ -28994,24 +27938,19 @@ def tile_intermediate_accumulator_reserve_bytes() -> int:
 
 
 def waiting_tile_spill_enabled() -> bool:
-    """Return True to recover legacy waiting-tile ctile spill behavior.
-
-    v12.2.11 keeps postprocessed tiles in RAM while they wait for parent support
-    unless this opt-in escape hatch is enabled.  That avoids the disk write/read
-    cycle for the common SLURM case where the allocation has hundreds of GiB of
-    anonymous memory available.
-    """
+    """Return whether postprocessed tiles waiting for parent support spill to raw bbox stores.
+    
+    The default keeps them in RAM when admission permits."""
     return _env_flag('YOLO_TTA_SPILL_WAITING_TILES', False)
 
 
 def nrrd_cache_raw_bbox_layers_in_ram_enabled() -> bool:
     """Share cvol/ctile payloads through a read-only mmap during NRRD streaming.
 
-    The NRRD writer uses the same layer backing files for both ``NRRD streaming:
-    segment extents`` and ``NRRD streaming: decomposed layers``.  When those
-    backing files are raw bbox stores, their ``chunks.bin`` payloads use one
-    refcounted mapping. The legacy environment name is retained for compatibility.
-    """
+ The NRRD writer uses the same layer backing files for both ``NRRD streaming:
+ segment extents`` and ``NRRD streaming: decomposed layers``. When those
+ backing files are raw bbox stores, their ``chunks.bin`` payloads use one
+ refcounted mapping. The legacy environment name is retained for compatibility."""
     return _env_flag('YOLO_TTA_NRRD_CACHE_RAW_BBOX_LAYERS_IN_RAM', True)
 
 
@@ -29068,7 +28007,7 @@ def close_raw_store_or_memmap_volume(volume: object, *, keep_temp: bool = True) 
 
 
 def _volume_has_foreground(mask_mm: np.ndarray) -> bool:
-    # v13.3.1 (R16): np.any tests the raw uint8 slice directly — the old dtype=bool asarray
+    # np.any tests the raw uint8 slice directly — the old dtype=bool asarray
     # made a full-slice cast COPY per slice (~25 GB of alloc+copy for a near-empty volume).
     for idx in range(int(mask_mm.shape[0])):
         if np.any(np.asarray(mask_mm[int(idx)])):
@@ -29137,7 +28076,7 @@ def _nrrd_layer_name(
     return ' / '.join(pieces)
 
 
-# v13.2.4 (task #1, ruling A1): the final source output geometry (t,Y,X) of the run, set once by
+# the final source output geometry (t,Y,X) of the run, set once by
 # run_pipeline. Radial/Tilted NRRD layer projections and the final backprojection queue target it
 # directly so radial/tilted masks are resampled exactly once on their way to source space.
 _FINAL_SOURCE_OUTPUT_SHAPE_TYX: Optional[Tuple[int, int, int]] = None
@@ -29168,20 +28107,9 @@ def project_view_volume_to_orthogonal_volume(
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
     sink_only: bool = False,
 ) -> np.ndarray | SinkOnlyProjectionResult:
-    """Project a view-native binary volume into orthogonal (t,Y,X) geometry.
-
-    v13.2.4 (A1): ``out_shape_tyx`` is honored for radial/tilted views (single direct resample to
-    the final source geometry). Cartesian views are pure axis permutations of the working volume
-    (no resample) and must not receive a differing target shape.
-
-    v13.3.2 (R15): ``allow_transverse_passthrough`` returns the source volume itself for the
-    transverse identity branch (no copy). Callers must check np.may_share_memory before closing
-    or unlinking the result.
-
-    ``sink_only`` is currently defined only for transverse Radial projection, whose optimized
-    kernels naturally complete disjoint output-z blocks. Other Radial orientations and view
-    families keep their established dense return.
-    """
+    """Project a Radial or Tilted view into orthogonal geometry.
+    
+    Eligible transverse inputs may pass through without an extra copy."""
     source_shape = tuple(int(v) for v in np.asarray(view_mask_mm).shape)
     if len(source_shape) != 3:
         raise ValueError(f'{desc}: view layer must be 3D, got {source_shape}')
@@ -29192,7 +28120,7 @@ def project_view_volume_to_orthogonal_volume(
         and (int(plane_h), int(plane_w)) != (int(view.src_h), int(view.src_w))
     )
 
-    # D6 reduced Cartesian stacks are axis-permuted without expansion.  Their resulting
+    # reduced Cartesian stacks are axis-permuted without expansion. Their resulting
     # orthogonal grid is smaller on exactly the two axes represented by the YOLO plane;
     # the NRRD streamer/final union performs the sole restore to output geometry.
     if reduced_processing and not is_tilted_view(view):
@@ -29250,7 +28178,7 @@ def project_view_volume_to_orthogonal_volume(
         if tuple(int(x) for x in np.asarray(view_mask_mm).shape) != (t_dim, h_dim, w_dim):
             raise ValueError(f'{desc}: transverse layer shape {tuple(view_mask_mm.shape)} != {(t_dim, h_dim, w_dim)}')
         if bool(allow_transverse_passthrough):
-            # v13.3.2 (R15): the transverse projection is an identity copy. When the caller
+            # the transverse projection is an identity copy. When the caller
             # only reads the result synchronously (raw-bbox layer encode), hand back the source
             # volume itself and skip the full-volume copy + teardown. The caller detects the
             # passthrough via np.may_share_memory and must not close/unlink it.
@@ -29277,9 +28205,9 @@ def project_view_volume_to_orthogonal_volume(
         src = np.asarray(view_mask_mm)
         if tuple(int(x) for x in src.shape) != (h_dim, t_dim, w_dim):
             raise ValueError(f'{desc}: sagittal layer shape {tuple(src.shape)} != {(h_dim, t_dim, w_dim)}')
-        # v13.3.8 (A3): the per-y scatter (out[:, y, :] = src[y]) swept every destination
+        # the per-y scatter (out[:, y,:] = src[y]) swept every destination
         # page once per y (T rows of W bytes at stride H*W). Copy K rows per block so each
-        # t-slice window [t, y0:y1, :] is one contiguous K*W write and destination pages
+        # t-slice window [t, y0:y1,:] is one contiguous K*W write and destination pages
         # are visited once per block instead of once per y.
         blk_rows = int(coronal_block_cols())
         n_row_blocks = (int(h_dim) + blk_rows - 1) // blk_rows
@@ -29303,7 +28231,7 @@ def project_view_volume_to_orthogonal_volume(
         src = np.asarray(view_mask_mm)
         if tuple(int(x) for x in src.shape) != (w_dim, t_dim, h_dim):
             raise ValueError(f'{desc}: coronal layer shape {tuple(src.shape)} != {(w_dim, t_dim, h_dim)}')
-        # v13.3.2 (R14): the old per-x scatter (out[:, :, x] = src[x]) wrote one byte per cache
+        # the old per-x scatter (out[:,:, x] = src[x]) wrote one byte per cache
         # line across the whole (t, Y) extent, ~64x write amplification. Permute K columns at a
         # time through per-t (K, H) -> (H, K) tile transposes: tiles stay cache-resident and
         # both the source reads and destination writes use full cache lines.
@@ -29351,7 +28279,7 @@ def materialize_nrrd_view_layer(
     known_slice_bboxes: Optional[np.ndarray] = None,
 ) -> Optional[NrrdLayerRef]:
     """Persist a view-derived layer in orthogonal processing geometry for the NRRD writer."""
-    # v13.3.1 (R16): callers that already know whether the volume has foreground (e.g. the
+    # callers that already know whether the volume has foreground (e.g. the
     # interpolation pass's added_voxels stat for bridge deltas) skip the per-slice scan.
     if known_has_foreground is not None:
         if not bool(known_has_foreground):
@@ -29377,7 +28305,7 @@ def materialize_nrrd_view_layer(
         out_path = raw_path
 
     transient_projection_in_memory = bool(raw_bbox_nrrd_layers_enabled())
-    # v13.2.4 projected radial/tilted layers directly into source geometry. v13.3.12 D6 keeps
+    # projected radial/tilted layers directly into source geometry. keeps
     # non-radial layers reduced: Cartesian layers are reduced axis permutations and Tilted
     # layers are reduced sheared orthogonal grids. Their sparse stores are therefore built at
     # inference pitch and the NRRD/final-union reader performs the one terminal restore.
@@ -29438,10 +28366,10 @@ def materialize_nrrd_view_layer(
             prefer_memory=bool(transient_projection_in_memory),
             reserve_bytes=32 * GIB,
             out_shape_tyx=projection_out_shape,
-            # v13.3.2 (R15): transverse layers headed for a raw-bbox store are encoded straight
+            # transverse layers headed for a raw-bbox store are encoded straight
             # from the source volume (identity projection, synchronous encode) — no copy.
             allow_transverse_passthrough=bool(raw_bbox_nrrd_layers_enabled()),
-            # v13.3.6 (D1): device-union row occupancy (radial views only; valid for the
+            # device-union row occupancy (radial views only; valid for the
             # pre-interpolation layer, which is the only caller that supplies it).
             known_row_occupancy=known_row_occupancy,
             known_slice_bboxes=known_slice_bboxes,
@@ -29456,7 +28384,7 @@ def materialize_nrrd_view_layer(
         )
     except Exception as exc:
         # A projection failure can leave a callback store incomplete. Discard it and retry
-        # once without fusion. C2 sink-only delivery is transactional: its callback failures
+        # once without fusion. sink-only delivery is transactional: its callback failures
         # propagate here because no complete dense projected volume exists to recover from.
         if incremental_writer is None:
             raise
@@ -29608,7 +28536,7 @@ def materialize_nrrd_global_layer(
     low_quality_recomposition_op: str = 'select',
     mirror_low_quality: bool = True,
 ) -> Optional[NrrdLayerRef]:
-    # v13.3.1 (R16): see materialize_nrrd_view_layer.
+    # see materialize_nrrd_view_layer.
     if known_has_foreground is not None:
         if not bool(known_has_foreground):
             return None
@@ -29631,7 +28559,7 @@ def materialize_nrrd_global_layer(
         raw_path = layer_dir / f'{key}.orthogonal.u8.dat'
         out_path = raw_path
 
-    # v13.3.6 (N3): IMMUTABLE global layers (the final output — nothing mutates the volume
+    # IMMUTABLE global layers (the final output — nothing mutates the volume
     # after it) skip the store entirely: the sink streams the live in-RAM volume in ONE
     # pass (segment extent computed on the sink worker), deleting the synchronous
     # encode-to-store pass on this thread AND the store read-back pass in the writer.
@@ -29692,7 +28620,7 @@ def materialize_nrrd_global_layer(
         return layer_ref
 
     if raw_bbox_nrrd_layers_enabled():
-        # v13.3.2 (R15): encode the raw-bbox store straight from the source volume. The old
+        # encode the raw-bbox store straight from the source volume. The old
         # copy_workspace_array staged a full copy (~36 GB of traffic per global layer on the
         # serial tail) purely as encoder input; write_raw_bbox_mask_store completes before this
         # function returns, and no caller mutates the volume during the synchronous call.
@@ -29810,7 +28738,7 @@ def prepare_view_volume_after_fullframe(
         and not bool(dense_tiling_active)
     )
 
-    # v13.3.6 (D1): device-union slice metadata (aggregated per view by the scheduler).
+    # device-union slice metadata (aggregated per view by the scheduler).
     # Valid only while the volume matches the flush state: the (skipped) cleanup and the
     # device hole fill do not change any/bbox/row-occupancy, but interpolation bridges do —
     # so it feeds only the pre-interpolation consumers and interpolation pass 1's labeling.
@@ -29867,7 +28795,7 @@ def prepare_view_volume_after_fullframe(
                 description='Cleaned full-frame YOLO mask before interpolation bridges.',
                 temp_dir=temp_dir,
                 workers=int(slice_workers),
-                # v13.3.6 (D1): the device union already answered the foreground question and
+                # the device union already answered the foreground question and
                 # (for radial views) the per-row occupancy the backprojection would rescan.
                 known_has_foreground=(bool(meta_slice_any.any()) if meta_valid and meta_slice_any is not None else None),
                 known_row_occupancy=(
@@ -29906,7 +28834,7 @@ def prepare_view_volume_after_fullframe(
     if _view_uses_interpolation(view, int(interpolate)):
         total_passes = int(interpolate_passes)
         for pass_idx in range(1, total_passes + 1):
-            # v13.2.5 (speed #3): the pass itself writes the exact added-voxel delta
+            # the pass itself writes the exact added-voxel delta
             # (bridge AND NOT pre-merge mask) to this path during its merge step, replacing
             # the old full-volume before-copy + subtract bookkeeping.
             pass_delta_path: Optional[Path] = None
@@ -29927,7 +28855,7 @@ def prepare_view_volume_after_fullframe(
                 workers=int(interpolation_task_workers),
                 wrap_axis=bool(view.family == 'radial'),
                 bridge_delta_path=pass_delta_path,
-                # v13.3.6 (D1): pass 1 labels exactly the flushed volume; later passes see
+                # pass 1 labels exactly the flushed volume; later passes see
                 # bridge-mutated content, so the metadata is only forwarded for pass 1.
                 known_slice_any=(meta_slice_any if (meta_valid and int(pass_idx) == 1) else None),
                 known_slice_bboxes=(meta_slice_bboxes if (meta_valid and int(pass_idx) == 1) else None),
@@ -29967,9 +28895,9 @@ def prepare_view_volume_after_fullframe(
                         description='Voxels added by this full-frame interpolation pass only.',
                         temp_dir=temp_dir,
                         workers=int(slice_workers),
-                        # v13.3.1 (R16): the pass already counted its added voxels.
+                        # the pass already counted its added voxels.
                         known_has_foreground=int(stats_local.get('added_voxels', 0)) > 0,
-                        # v13.3.11: interpolation computed these while forming the exact
+                        # interpolation computed these while forming the exact
                         # delta. Radial projection consumes them without a strided rescan.
                         known_row_occupancy=(
                             np.asarray(stats_local.get('bridge_delta_row_occupancy'), dtype=bool)
@@ -30018,7 +28946,7 @@ def prepare_view_volume_after_fullframe(
                     pass
 
     if bool(fused_radial_components):
-        # C12: projection and positive-support restore distribute over binary OR, so the
+        # projection and positive-support restore distribute over binary OR, so the
         # cleaned YOLO mask and every accepted bridge can be kept in the already-mutated
         # baseline and projected once. This removes one source-store write and one complete
         # Radial backprojection per bridge pass on the prioritized single-angle path.
@@ -30124,26 +29052,24 @@ def prepare_view_volume_after_fullframe(
     )
 
 def tile_support_prefilter_enabled() -> bool:
-    """T9(b): skip tile work where the frozen parent support can never accept it.
+    """(b): skip tile work where the frozen parent support can never accept it.
 
-    Every tile component is ultimately kept only if it intersects parent support on the
-    same slice (see ``gate_tile_volume_against_parent_inplace``). Testing that BEFORE
-    inference instead of after it removes whole tiles and whole slice ranges from the run.
-    Not bit-identical: gating runs on the consolidated canvas, so an unsupported tile could
-    in principle have contributed pixels to a component another, overlapping tile got
-    accepted for. The candidate window is dilated by a full tile stride specifically so any
-    tile overlapping a supported tile is retained, which makes that case vanishingly rare.
-    """
+ Every tile component is ultimately kept only if it intersects parent support on the
+ same slice (see ``gate_tile_volume_against_parent_inplace``). Testing that BEFORE
+ inference instead of after it removes whole tiles and whole slice ranges from the run.
+ Not bit-identical: gating runs on the consolidated canvas, so an unsupported tile could
+ in principle have contributed pixels to a component another, overlapping tile got
+ accepted for. The candidate window is dilated by a full tile stride specifically so any
+ tile overlapping a supported tile is retained, which makes that case vanishingly rare."""
     return _env_flag('YOLO_TTA_TILE_SUPPORT_PREFILTER', True)
 
 
 def tile_content_prefilter_enabled() -> bool:
-    """T9(a): skip tiles whose source rectangle is entirely background.
+    """(a): skip tiles whose source rectangle is entirely background.
 
-    Applies to the Cartesian views, where a tile's native-view rectangle maps to an
-    axis-aligned box of the source volume exactly. Radial/Tilted rectangles map to rotated
-    or sheared slabs, so they are conservatively always kept.
-    """
+ Applies to the Cartesian views, where a tile's native-view rectangle maps to an
+ axis-aligned box of the source volume exactly. Radial/Tilted rectangles map to rotated
+ or sheared slabs, so they are conservatively always kept."""
     return _env_flag('YOLO_TTA_TILE_CONTENT_PREFILTER', True)
 
 
@@ -30155,9 +29081,8 @@ def tile_prefilter_block() -> int:
 def _coarse_block_max_3d(volume: np.ndarray, block: Tuple[int, int, int], *, workers: int = 1) -> np.ndarray:
     """Boolean block-max of a uint8 volume; ``True`` where any voxel in the block is nonzero.
 
-    Over-approximates every query (a block is set if ANY voxel in it is set), so a prefilter
-    built on it can never drop a tile that had real content.
-    """
+ Over-approximates every query (a block is set if ANY voxel in it is set), so a prefilter
+ built on it can never drop a tile that had real content."""
     src = np.asarray(volume)
     bt, by, bx = (max(1, int(v)) for v in block)
     t_dim, y_dim, x_dim = (int(v) for v in src.shape)
@@ -30245,10 +29170,9 @@ def tile_content_candidate_slices(
 ) -> np.ndarray:
     """Per-slice boolean: does this tile's source rectangle contain any nonzero voxel?
 
-    ``source_coarse`` is a block-max over the (t, y, x) source volume. The mapping from a
-    native-view rectangle to volume axes is exact for the Cartesian views; every other view
-    family conservatively returns all-True.
-    """
+ ``source_coarse`` is a block-max over the (t, y, x) source volume. The mapping from a
+ native-view rectangle to volume axes is exact for the Cartesian views; every other view
+ family conservatively returns all-True."""
     keep_all = np.ones((int(num_slices),), dtype=bool)
     if source_coarse is None:
         return keep_all
@@ -30268,13 +29192,13 @@ def tile_content_candidate_slices(
         per_block = _coarse_any(source_coarse, (ys, xs))  # (ct,)
         axis_len, axis_blocks = int(num_slices), per_block
     elif name == 'sagittal':
-        # native frame == volume[:, i, :]; rows -> T, cols -> X, one frame per Y.
+        # native frame == volume[:, i,:]; rows -> T, cols -> X, one frame per Y.
         ts, xs = _rng(ny0, ny1, ct), _rng(nx0, nx1, cx)
         sub = np.asarray(source_coarse[ts[0]:ts[1], :, xs[0]:xs[1]])
         per_block = sub.any(axis=(0, 2)) if sub.size else np.zeros((cy,), dtype=bool)
         axis_len, axis_blocks = int(num_slices), per_block
     else:
-        # coronal: native frame == volume[:, :, i]; rows -> T, cols -> Y, one frame per X.
+        # coronal: native frame == volume[:,:, i]; rows -> T, cols -> Y, one frame per X.
         ts, ys = _rng(ny0, ny1, ct), _rng(nx0, nx1, cy)
         sub = np.asarray(source_coarse[ts[0]:ts[1], ys[0]:ys[1], :])
         per_block = sub.any(axis=(0, 1)) if sub.size else np.zeros((cx,), dtype=bool)
@@ -30300,25 +29224,9 @@ def gate_tile_volume_against_parent_inplace(
     workers: int = 1,
     desc: str = 'Tile gated OR',
 ) -> Dict[str, int]:
-    """Keep tile components that intersect the frozen parent support on the same slice.
-
-    When parent YOLO-mask and parent-bridge supports are supplied, accepted components are
-    also split into two mutually exclusive categories for the decomposed NRRD export.  If a
-    component intersects both parent supports, it is assigned to ``parent_mask`` first so the
-    category layers can be toggled without double-counting the same tile component.
-
-    v15.0.3 (T5): the per-component Python loop is gone.  One ``connectedComponentsWithStats``
-    pass supplies the label image and every component's area, three ``np.bincount`` reductions
-    over the label image answer "does component *l* intersect this support?" for all *l* at
-    once, and the two output masks are LUT gathers over the labels.  Cost per slice drops from
-    ``O(K · H · W)`` with three full-plane temporaries *per component* to a handful of full-plane
-    passes independent of the component count ``K``.
-
-    v15.0.3 (T14): with ``category_accumulate`` the category masks are OR-ed straight into
-    persistent destination accumulators under ``*_locks`` (z-sharded exactly like
-    ``union_volume_into_volume(..., slice_locks=)``), so no caller needs to allocate a
-    parent-sized intermediate per gate just to OR it in afterwards.
-    """
+    """Keep tile components that intersect frozen parent support on the same slice.
+    
+    Optional category accumulators receive parent-YOLO and parent-bridge accepted voxels directly."""
     num_slices = int(tile_mask_mm.shape[0])
     accepted_components = np.zeros((num_slices,), dtype=np.int64)
     rejected_components = np.zeros((num_slices,), dtype=np.int64)
@@ -30339,7 +29247,7 @@ def gate_tile_volume_against_parent_inplace(
         idx: int,
         plane_u8: Optional[np.ndarray],
     ) -> None:
-        """Emit one category slice, either as an overwrite or as a locked OR (T14)."""
+        """Emit one category slice, either as an overwrite or as a locked OR."""
         if dst_mm is None:
             return
         if not bool(category_accumulate):
@@ -30376,7 +29284,7 @@ def gate_tile_volume_against_parent_inplace(
             if parent_bridge_support_mm is not None else None
         )
 
-        # T5: ``WithStats`` costs the same as plain ``connectedComponents`` here and hands back
+        # ``WithStats`` costs the same as plain ``connectedComponents`` here and hands back
         # every component's area, which removes the fourth bincount over the label image.
         num_labels, labels2d, stats, _centroids = cv2.connectedComponentsWithStats(
             np.asarray(tile_slice, dtype=np.uint8),
@@ -30488,13 +29396,12 @@ def ensure_tile_mask_volume_matches_parent_shape(
 ) -> np.ndarray:
     """Return a tile mask volume whose shape exactly matches its parent view canvas.
 
-    Prediction-time tile masks should already be inverse-mapped into parent view-native
-    coordinates by ``DenseTileJob.M_out_to_src``.  This guard makes the v12.2.0 tile
-    waiting-store rule explicit: before a tile can be spilled to the raw waiting store, its volume
-    shape must be ``(parent_frames, parent_height, parent_width)``.  If a future code path
-    produces a different raster size, the binary slices are nearest-neighbor resized to
-    the parent shape before compression/staging.
-    """
+ Prediction-time tile masks should already be inverse-mapped into parent view-native
+ coordinates by ``DenseTileJob.M_out_to_src``. This guard makes the tile
+ waiting-store rule explicit: before a tile can be spilled to the raw waiting store, its volume
+ shape must be ``(parent_frames, parent_height, parent_width)``. If a future code path
+ produces a different raster size, the binary slices are nearest-neighbor resized to
+ the parent shape before compression/staging."""
     src = np.asarray(tile_mask_mm)
     expected = (int(expected_parent_shape[0]), int(expected_parent_shape[1]), int(expected_parent_shape[2]))
     if tuple(int(x) for x in src.shape) == expected:
@@ -30564,7 +29471,7 @@ def postprocess_tile_volume_after_inference(
 
     tile_mask_mm = task.tile_mask_mm
     tile_mask_path = task.tile_mask_path
-    # D6 parent support and every tile contribution share the same canonical processing grid.
+    # parent support and every tile contribution share the same canonical processing grid.
     expected_parent_shape = (
         tuple(int(v) for v in task.processing_shape)
         if task.processing_shape is not None
@@ -30617,13 +29524,12 @@ def spill_waiting_tile_result_to_raw_store(
     keep_original: bool = False,
     expected_parent_shape: Optional[Tuple[int, int, int]] = None,
 ) -> DeferredTilePostprocessResult:
-    """Spill a postprocessed waiting tile into the v12.2.0 raw bbox ctile store.
+    """Spill a postprocessed waiting tile into the raw bbox ctile store.
 
-    The function name is retained for stable scheduler call sites. The stored tile
-    payload is no longer bitpacked or LZ4-compressed: empty slices are elided,
-    nonempty slices are cropped to their nonzero bbox, and the crop is written as
-    raw uint8 bytes.
-    """
+ The function name is retained for stable scheduler call sites. The stored tile
+ payload is no longer bitpacked or LZ4-compressed: empty slices are elided,
+ nonempty slices are cropped to their nonzero bbox, and the crop is written as
+ raw uint8 bytes."""
     if result.tile_mask_mm is None:
         raise ValueError('Cannot spill a tile result without a dense tile_mask_mm')
 
@@ -30724,19 +29630,7 @@ def stage_tile_result_into_config_canvas(
     keep_temp: bool,
     slice_workers: int,
 ) -> Dict[str, int]:
-    """Union one cleaned tile into its tile-size/stride canvas before parent gating.
-
-    This implements the v12.2.0 tile-set staging rule: all positions and angle variants for the
-    same --tile_size/--tile_stride configuration are first reassembled into one parent-view canvas.
-    The consolidated canvas is gated later at the connected-component level after every tile in
-    that configuration has either staged or completed empty.
-
-    T8: ``tile_set_accumulator_lock`` may be a SEQUENCE of locks, one per slice class. The old
-    single lock was held across a full parent-volume OR plus up to two whole-volume
-    ``count_nonzero`` scans, which serialized the entire tile-postprocess pool onto one core.
-    Per-slice locking lets independent tiles stage concurrently, and the voxel tally now rides
-    the merge pass that is already reading every slice.
-    """
+    """OR one cleaned tile into its configuration canvas, using per-slice locks when supplied."""
     slice_locks: Optional[Sequence[threading.Lock]]
     if isinstance(tile_set_accumulator_lock, (list, tuple)):
         slice_locks = list(tile_set_accumulator_lock)
@@ -30813,22 +29707,7 @@ def gate_tile_volume_into_consolidated_parent(
     tile_parent_mask_accumulator_locks: Optional[Sequence[threading.Lock]] = None,
     tile_parent_bridge_accumulator_locks: Optional[Sequence[threading.Lock]] = None,
 ) -> TileGateResult:
-    """Gate one consolidated tile-set canvas, then OR accepted components into parent accumulators.
-
-    The input is the already reassembled canvas for one --tile_size/--tile_stride configuration
-    across all positions and angle variants of its parent view.  Gating therefore happens at the
-    canvas connected-component level, so objects split across tile seams can be accepted as one
-    component when any part intersects parent support.  Optional category accumulators are
-    populated only for decomposed NRRD export and split accepted tile components into
-    parent-YOLO-supported and parent-bridge-supported layers.
-
-    v15.0.3 (T14): the two parent-sized category intermediates this used to allocate (and
-    zero-fill, and OR in a second full-volume pass, and delete) per gate invocation are gone.
-    The gate writes its per-slice category LUT gathers straight into the persistent per-parent
-    accumulators under the z-sharded slice locks T8 introduced, which is safe because the
-    category of a component is decided before either write, so the two layers stay mutually
-    exclusive.  The tile canvas itself is still OR-ed under the whole-volume parent lock.
-    """
+    """Gate one consolidated tile-set canvas against parent support and OR accepted components into parent accumulators."""
     if task.tile_mask_mm is None:
         raise ValueError('Tile-set gate requires a dense staged tile_mask_mm canvas')
 
@@ -30894,12 +29773,11 @@ def finalize_consolidated_tile_volume_for_parent(
 ) -> TileConsolidationResult:
     """Interpolate the consolidated gated-tile volume once for the parent view, then union it.
 
-    The input accumulator already contains the OR of every accepted tile mask for this parent view.
-    Interpolation is now performed once on that consolidated volume instead of once per tile.  When
-    NRRD decomposition is enabled, the accepted YOLO tile support is written separately for tiles
-    accepted by parent YOLO masks and by parent interpolation bridges; tile interpolation bridges are
-    then exported per pass as consolidated tile-bridge layers.
-    """
+ The input accumulator already contains the OR of every accepted tile mask for this parent view.
+ Interpolation is now performed once on that consolidated volume instead of once per tile. When
+ NRRD decomposition is enabled, the accepted YOLO tile support is written separately for tiles
+ accepted by parent YOLO masks and by parent interpolation bridges; tile interpolation bridges are
+ then exported per pass as consolidated tile-bridge layers."""
     interpolation_stats: List[Dict[str, object]] = []
     nrrd_layers: List[NrrdLayerRef] = []
     tile_plane_shape = tuple(int(v) for v in np.asarray(tile_accumulator_mm).shape[-2:])
@@ -30976,7 +29854,7 @@ def finalize_consolidated_tile_volume_for_parent(
     if _view_uses_interpolation(view, int(interpolate)):
         total_passes = int(interpolate_passes)
         for pass_idx in range(1, total_passes + 1):
-            # v13.2.5 (speed #3): the pass writes the exact added-voxel delta itself,
+            # the pass writes the exact added-voxel delta itself,
             # replacing the old full-volume before-copy + subtract bookkeeping.
             pass_delta_path: Optional[Path] = None
             if bool(nrrd_layers_enabled):
@@ -31033,7 +29911,7 @@ def finalize_consolidated_tile_volume_for_parent(
                         description='Voxels added by this consolidated tile interpolation pass. Bridges are generated after accepted tile masks are consolidated, so they are not attributed back to parent-mask vs parent-bridge acceptance categories.',
                         temp_dir=temp_dir,
                         workers=int(slice_workers),
-                        # v13.3.1 (R16): the pass already counted its added voxels.
+                        # the pass already counted its added voxels.
                         known_has_foreground=int(stats_local.get('added_voxels', 0)) > 0,
                         known_row_occupancy=(
                             np.asarray(stats_local.get('bridge_delta_row_occupancy'), dtype=bool)
@@ -31080,9 +29958,9 @@ def finalize_consolidated_tile_volume_for_parent(
     )
 
 
-# --------------------------
+#
 # Final Gaussian smoothing
-# --------------------------
+#
 
 
 def gaussian_smoothing_gpu_enabled() -> bool:
@@ -31129,11 +30007,10 @@ def _try_apply_gaussian_smoothing_gpu_chunked_inplace(
 ) -> Optional[Dict[str, object]]:
     """Apply Gaussian smoothing with a CuPy/cupyx chunk+halo implementation.
 
-    Chunks are split along the t/slice axis and include a halo of ceil(truncate*sigma)
-    slices on both sides.  Each GPU result writes only its core region back to the
-    CPU-backed volume, which makes the chunked result match a whole-volume filter for
-    the unchunked Y/X axes and removes seams along the chunked axis.
-    """
+ Chunks are split along the t/slice axis and include a halo of ceil(truncate*sigma)
+ slices on both sides. Each GPU result writes only its core region back to the
+ CPU-backed volume, which makes the chunked result match a whole-volume filter for
+ the unchunked Y/X axes and removes seams along the chunked axis."""
     if not gaussian_smoothing_gpu_enabled():
         return None
     backend = _try_get_gpu_gaussian_backend()
@@ -31253,12 +30130,10 @@ def apply_gaussian_smoothing_inplace(
     nrrd_layers: Optional[List[NrrdLayerRef]] = None,
     nrrd_model_name: str = 'global',
 ) -> Dict[str, object]:
-    """Smooth the final binary 3D volume with a Gaussian kernel and re-threshold at 0.5.
+    """Smooth the source-geometry final union and re-threshold at 0.5.
 
-    The v12.2.0_SLURM smoothing stage is applied after the final view/tile union and optional
-    3D void fill, but before --keep_objects and before resizing back to the source geometry.
-    A single float32 workspace is reused for every pass to avoid retaining multiple dense
-    floating-point copies of the volume.
+    Smoothing runs after optional 3D void fill and centerline filtering, before
+    ``--keep_objects``. One float32 workspace is reused across passes.
     """
     sigma_f = float(sigma)
     passes_i = int(passes)
@@ -31382,23 +30257,22 @@ def apply_gaussian_smoothing_inplace(
 
     return stats
 
-# --------------------------
+#
 # Final outputs
-# --------------------------
+#
 
 
-# v13.3.8 (A5): _gray_to_rgb_frame (np.repeat per frame) is deleted — every writer now
+# _gray_to_rgb_frame (np.repeat per frame) is deleted — every writer now
 # expands through _gray_frame_into_rgb_buffer into a reused per-writer buffer.
 _OVERLAY_BLUE_U16 = np.array([0, 0, 255], dtype=np.uint16)  # RGB blue in the uint16 blend domain
 
 
 def _overlay_blend_blue_inplace(frame_rgb: np.ndarray, mask2d: np.ndarray) -> None:
-    """v13.3.8 (A5): 50% blue blend on mask pixels, restricted to the mask's bbox, in place.
+    """50% blue blend on mask pixels, restricted to the mask's bbox, in place.
 
-    Byte-identical to the legacy full-frame masked path ((frame + blue) // 2 in uint16 on
-    mask pixels, untouched elsewhere) but allocates only bbox-sized temps: no full-frame
-    bool cast, no masked gather/scatter over the whole frame.
-    """
+ Byte-identical to the legacy full-frame masked path ((frame + blue) // 2 in uint16 on
+ mask pixels, untouched elsewhere) but allocates only bbox-sized temps: no full-frame
+ bool cast, no masked gather/scatter over the whole frame."""
     m = np.asarray(mask2d)
     ys = np.flatnonzero(m.any(axis=1))
     if ys.size == 0:
@@ -31413,11 +30287,10 @@ def _overlay_blend_blue_inplace(frame_rgb: np.ndarray, mask2d: np.ndarray) -> No
 
 
 def _gray_frame_into_rgb_buffer(frame_gray: np.ndarray, frame_buf: np.ndarray) -> np.ndarray:
-    """v13.3.8 (A5): expand a gray frame into the reused (H, W, 3) buffer, no per-frame alloc.
+    """Expand a gray frame into the reused (H, W, 3) buffer, no per-frame alloc.
 
-    Returns the buffer actually written (cv2 falls back to allocating only if dst were
-    incompatible, which the caller's preallocated buffer never is).
-    """
+ Returns the buffer actually written (cv2 falls back to allocating only if dst were
+ incompatible, which the caller's preallocated buffer never is)."""
     gray = np.ascontiguousarray(np.asarray(frame_gray, dtype=np.uint8))
     return cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB, dst=frame_buf)
 
@@ -31425,11 +30298,10 @@ def _gray_frame_into_rgb_buffer(frame_gray: np.ndarray, frame_buf: np.ndarray) -
 def ffv1_segment_count(total_frames: int) -> int:
     """Number of concurrent contiguous FFV1 encode shards for a final video.
 
-    Each shard has identical codec parameters and contains whole, independently decodable
-    FFV1 frames.  ``YOLO_TTA_FFV1_SEGMENTS=1`` preserves the original single-pipe path.
-    Explicit values are bounded only by the number of frames; the automatic default targets
-    one 30-thread FFV1 encoder per roughly 32 allocated CPUs, capped at six encoders.
-    """
+ Each shard has identical codec parameters and contains whole, independently decodable
+ FFV1 frames. ``YOLO_TTA_FFV1_SEGMENTS=1`` preserves the original single-pipe path.
+ Explicit values are bounded only by the number of frames; the automatic default targets
+ one 30-thread FFV1 encoder per roughly 32 allocated CPUs, capped at six encoders."""
     total = max(0, int(total_frames))
     automatic = min(6, max(1, int(math.ceil(float(_cpu_count()) / 32.0))))
     requested = max(1, _env_int('YOLO_TTA_FFV1_SEGMENTS', int(automatic)))
@@ -31457,15 +30329,14 @@ def _atomic_publication_stage_path(
 ) -> Tuple[Path, Path]:
     """Return a same-filesystem staging path outside the publication tree.
 
-    The staging directory is a sibling of the run's publication root. Recursive rsync or
-    watchers rooted at ``publication_root`` therefore see neither shards nor a growing
-    ``.assembling`` inode; only the final atomic rename enters that tree.
-    """
+ The staging directory is a sibling of the run's publication root. Recursive rsync or
+ watchers rooted at ``publication_root`` therefore see neither shards nor a growing
+ ``.assembling`` inode; only the final atomic rename enters that tree."""
     final_path = Path(out_path)
     root = Path(publication_root) if publication_root is not None else final_path.parent
     final_path.parent.mkdir(parents=True, exist_ok=True)
     root.parent.mkdir(parents=True, exist_ok=True)
-    # Every publisher owns its directory.  A shared empty staging directory can be
+    # Every publisher owns its directory. A shared empty staging directory can be
     # removed by one concurrent writer after another has selected (but not yet
     # created) its stage file.
     stage_dir = Path(tempfile.mkdtemp(
@@ -31514,12 +30385,11 @@ def _run_sharded_ffv1_encode(
 ) -> None:
     """Encode contiguous FFV1 shards into memory, then stream-concat atomically to disk.
 
-    Each range callback owns one ffmpeg producer/process whose Matroska output is an anonymous
-    memfd. On the first shard failure all registered encoders are terminated and every worker
-    is reaped. The only filesystem write is the ordered concat stream into a same-filesystem
-    atomic publication stage, so the previous destination remains untouched on failure.
-    ``scratch_dir`` remains in the public call contract but is no longer used for encoded shards.
-    """
+ Each range callback owns one ffmpeg producer/process whose Matroska output is an anonymous
+ memfd. On the first shard failure all registered encoders are terminated and every worker
+ is reaped. The only filesystem write is the ordered concat stream into a same-filesystem
+ atomic publication stage, so the previous destination remains untouched on failure.
+ ``scratch_dir`` remains in the public call contract but is no longer used for encoded shards."""
     _ = scratch_dir
     total = int(total_frames)
     segments = int(ffv1_segment_count(total))
@@ -31693,18 +30563,7 @@ def write_overlay_video(
     scratch_dir: Optional[Path] = None,
     publication_root: Optional[Path] = None,
 ) -> None:
-    """Overlay blue masks (50% alpha) on transverse frames.
-
-    The working source volume is single-channel; frames are expanded to RGB only for this
-    presentation video so the segmentation can remain blue.
-
-    v13.3.8 (A5): one reused RGB buffer per writer (cvtColor dst=), bbox-restricted blend,
-    and memoryview pipe writes — the three full H*W*3 temps per frame (np.repeat, masked
-    scatter, tobytes) are gone. The blocking pipe write copies before returning, so the
-    buffer is immediately reusable. v13.3.12 shards the t axis across independently encoded
-    FFV1 segments and losslessly concatenates them; YOLO_TTA_FFV1_SEGMENTS=1 restores this
-    writer's original single-encoder path.
-    """
+    """Encode a source/mask overlay, using sharded FFV1 and memory-backed concatenation when admitted."""
     T, H, W = volume_rgb.shape
     assert mask_u8.shape == (T, H, W)
 
@@ -31847,11 +30706,7 @@ def _write_label_file_from_mask(mask2d: np.ndarray, out_path: Path) -> None:
 
 
 def _write_binary_tiff_frame(mask2d: np.ndarray, out_path: Path) -> None:
-    """Write one true bilevel binary TIFF frame with DEFLATE compression.
-
-    tifffile stores bool arrays as 1 bit/sample.  This satisfies the required monob
-    TIFF sequence while keeping mask semantics unambiguous: False = black, True = white.
-    """
+    """Write one true bilevel binary TIFF frame with DEFLATE compression."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     mask_bool = np.asarray(mask2d, dtype=bool)
     tifffile.imwrite(
@@ -31973,12 +30828,7 @@ def write_binary_video_from_mask_volume(
 
 
 def _nrrd_ascii_header_text(value: object) -> str:
-    """Return ASCII-safe text for pynrrd header fields.
-
-    pynrrd writes headers as ASCII.  View names can contain characters such as the
-    degree sign, so normalize those before they reach the header.  The sidecar JSON
-    manifest keeps the full Unicode names.
-    """
+    """Return an ASCII-safe representation for pynrrd header fields."""
     text = str(value)
     replacements = {
         '°': 'deg',
@@ -32002,11 +30852,10 @@ def _nrrd_space_directions_matrix(
 ) -> np.ndarray:
     """Return a NRRD ``space directions`` matrix with optional non-spatial list axis.
 
-    Non-spatial axes are represented by a row of NaNs, which serializes as
-    ``none``.  ``list_axis_position='last'`` is used by decomposed segmentation
-    NRRDs so the on-disk byte stream is one complete ``(t,Y,X)`` layer block
-    followed by the next layer.
-    """
+ Non-spatial axes are represented by a row of NaNs, which serializes as
+ ``none``. ``list_axis_position='last'`` is used by decomposed segmentation
+ NRRDs so the on-disk byte stream is one complete ``(t,Y,X)`` layer block
+ followed by the next layer."""
     spatial_axes_i = max(1, int(spatial_axes))
     if bool(list_axis):
         position = str(list_axis_position).strip().lower()
@@ -32032,7 +30881,7 @@ def nrrd_slicer_header(mask_shape_zyx: Tuple[int, int, int]) -> Dict[str, object
     }
 
 
-# v13.2.3: 3D Slicer segmentation tagging for the single-layer NRRD exports. Each component
+# 3D Slicer segmentation tagging for the single-layer NRRD exports. Each component
 # layer is written as {Filestem}_{suffix}.seg.nrrd carrying the Slicer segmentation custom
 # header fields, so Slicer imports it as a Segmentation node named after the file with a
 # stable per-layer color instead of a scalar volume that renders every layer the same green.
@@ -32063,9 +30912,8 @@ _SLICER_SEGMENT_COLOR_PALETTE: Tuple[Tuple[float, float, float], ...] = (
 def _stable_layer_color_index(token: str) -> int:
     """Deterministic FNV-1a hash of a layer token.
 
-    Python's builtin hash() is salted per process, which would shuffle segment colors
-    between runs; the palette pick must be reproducible for the same layer suffix.
-    """
+ Python's builtin hash is salted per process, which would shuffle segment colors
+ between runs; the palette pick must be reproducible for the same layer suffix."""
     h = 0x811C9DC5
     for b in str(token).encode('utf-8', errors='ignore'):
         h = ((h ^ int(b)) * 0x01000193) & 0xFFFFFFFF
@@ -32092,11 +30940,10 @@ def _slicer_segment_extent_for_output(
 ) -> NrrdSegmentExtent:
     """Map the layer's backing-store segment extent into the output geometry.
 
-    Returns the inclusive Slicer (minX maxX minY maxY minT maxT) extent in the exported
-    (X,Y,t) axis order. Extents are expanded outward when the output geometry is scaled
-    (e.g. low-quality downbins) and fall back to the full output extent when the backing
-    extent is unknown or empty, so the header never understates where mask voxels live.
-    """
+ Returns the inclusive Slicer (minX maxX minY maxY minT maxT) extent in the exported
+ (X,Y,t) axis order. Extents are expanded outward when the output geometry is scaled
+ (e.g. low-quality downbins) and fall back to the full output extent when the backing
+ extent is unknown or empty, so the header never understates where mask voxels live."""
     out_t, out_h, out_w = (int(output_shape_tyx[0]), int(output_shape_tyx[1]), int(output_shape_tyx[2]))
     full: NrrdSegmentExtent = (0, max(0, out_w - 1), 0, max(0, out_h - 1), 0, max(0, out_t - 1))
     extent = _coerce_segment_extent(getattr(ref, 'segment_extent_ijk', None))
@@ -32119,7 +30966,7 @@ def _slicer_segment_extent_for_output(
     x_lo, x_hi = _axis(x0, x1, in_w, out_w)
     y_lo, y_hi = _axis(y0, y1, in_h, out_h)
     # The payload restore is endpoint-aligned nearest-neighbour when temporal
-    # upscaling and interval-OR when downscaling.  A ratio-only extent transform
+    # upscaling and interval-OR when downscaling. A ratio-only extent transform
     # understates support (for example, source 1 in 3 -> 100 maps to 25..74,
     # not 33..66), and Slicer may discard payload outside Segment0_Extent.
     exact_t = _nrrd_output_z_extent_for_source_extent(
@@ -32139,11 +30986,10 @@ def _nrrd_output_z_extent_for_source_extent(
 ) -> Optional[Tuple[int, int]]:
     """Invert the exact payload restore map for a non-empty source-z interval.
 
-    Temporal upscaling is endpoint-aligned nearest-neighbour, while downscaling ORs a
-    floor/ceil coverage range. Ratio-only extent scaling is not equivalent (3 -> 100 with
-    source z=1 is the canonical counterexample), so extent metadata uses the same mapping
-    as the payload writer.
-    """
+ Temporal upscaling is endpoint-aligned nearest-neighbour, while downscaling ORs a
+ floor/ceil coverage range. Ratio-only extent scaling is not equivalent (3 -> 100 with
+ source z=1 is the canonical counterexample), so extent metadata uses the same mapping
+ as the payload writer."""
     in_t_i = max(1, int(in_t))
     out_t_i = max(1, int(out_t))
     source_lo = max(0, min(int(source_z0), in_t_i - 1))
@@ -32212,11 +31058,10 @@ def slicer_segmentation_header_fields(
     color_rgb: Tuple[float, float, float],
     extent_xyt: NrrdSegmentExtent,
 ) -> Dict[str, object]:
-    """3D Slicer .seg.nrrd custom header fields for one single-segment binary labelmap.
+    """3D Slicer.seg.nrrd custom header fields for one single-segment binary labelmap.
 
-    All keys are non-standard NRRD fields, so _write_nrrd_ascii_header emits them with the
-    key:=value separator Slicer expects. Segment0_LabelValue matches the uint8 mask value 1.
-    """
+ All keys are non-standard NRRD fields, so _write_nrrd_ascii_header emits them with the
+ key:=value separator Slicer expects. Segment0_LabelValue matches the uint8 mask value 1."""
     r, g, b = (float(color_rgb[0]), float(color_rgb[1]), float(color_rgb[2]))
     return {
         'Segmentation_ContainedRepresentationNames': 'Binary labelmap|',
@@ -32240,10 +31085,9 @@ def slicer_segmentation_header_fields(
 def nrrd_gzip_compresslevel() -> int:
     """NRRD member-gzip compression level.
 
-    ISA-L maps the 0..9 value to its native 0..3 range. The neutral GZIP name
-    takes precedence; the former environment name remains a compatibility alias
-    for existing job specifications and does not select an external process.
-    """
+ ISA-L maps the 0..9 value to its native 0..3 range. The neutral GZIP name
+ takes precedence; the former environment name remains a compatibility alias
+ for existing job specifications and does not select an external process."""
     setting = (
         'YOLO_TTA_NRRD_GZIP_LEVEL'
         if 'YOLO_TTA_NRRD_GZIP_LEVEL' in os.environ
@@ -32253,28 +31097,25 @@ def nrrd_gzip_compresslevel() -> int:
 
 
 def nrrd_z_chunk_cap() -> int:
-    """v13.3.1 (R7b): cap on one NRRD payload block, in output t-slices.
+    """Cap on one NRRD payload block, in output t-slices.
 
-    The RAM-scaled buffer previously resolved to the WHOLE payload on large-RAM nodes, so the
-    writer filled an ~payload-sized block before compression began. Bounded
-    blocks pipeline parallel fill with the selected gzip backend; two blocks
-    per in-flight write are resident (double buffering).
-    """
+ The RAM-scaled buffer previously resolved to the WHOLE payload on large-RAM nodes, so the
+ writer filled an ~payload-sized block before compression began. Bounded
+ blocks pipeline parallel fill with the selected gzip backend; two blocks
+ per in-flight write are resident (double buffering)."""
     return max(1, _env_int('YOLO_TTA_NRRD_Z_CHUNK_SLICES', 128))
 
 
 def nrrd_fill_workers() -> int:
-    """v13.3.1 (R7b): threads filling one NRRD payload block.
+    """Return the process-wide worker count used to fill NRRD payload blocks.
 
-    The per-slice fill work (raw-bbox store decode memcpys, cv2 restore resizes) releases the
-    GIL, so a small pool per write scales; the sink runs up to nrrd_layer_sink_workers() writes
-    concurrently. v13.3.3: default cores//8 -> min(32, cores//4) — fill threads are only live
-    while a block is being decoded, and the write tail runs on an otherwise idle box.
+    Raw-bbox decoding and OpenCV restores release the GIL. The bounded shared pool prevents
+    concurrent layer writers from multiplying memory-scanning threads.
     """
     return max(2, _env_int('YOLO_TTA_NRRD_FILL_WORKERS', max(2, min(32, _cpu_count() // 4))))
 
 
-# v13.3.11: one process-wide fill executor. Previously every one of up to twelve sink
+# one process-wide fill executor. Previously every one of up to twelve sink
 # workers checked out its own 32-thread pool, so simultaneous sparse-store reads could
 # launch hundreds of memory-scanning threads. Per-writer jobs below submit a bounded set
 # of ranges to this singleton; the executor itself is the hard global concurrency cap.
@@ -32330,14 +31171,9 @@ def _nrrd_parallel_fill_indices(
 
 
 def nrrd_stream_buffer_bytes(required_bytes: Optional[int] = None) -> int:
-    """Return the RAM budget for one NRRD streaming payload slab.
-
-    v12.2.1 intentionally avoided materializing the full decomposed NRRD payload.
-    v12.2.2 keeps that safety property but uses the hundreds of GiB that are normally
-    free under the SLURM allocation to make the streaming slabs much larger.  An
-    explicit YOLO_TTA_NRRD_STREAM_BUFFER_MIB still wins; otherwise the buffer is a
-    bounded fraction of currently available anonymous memory after a reserve.
-    """
+    """Resolve the RAM budget for one NRRD payload slab.
+    
+    An explicit environment limit wins; otherwise the budget is a bounded fraction of current anonymous-memory headroom."""
     explicit = os.environ.get('YOLO_TTA_NRRD_STREAM_BUFFER_MIB', '').strip()
     if explicit:
         mib = max(1, _env_int('YOLO_TTA_NRRD_STREAM_BUFFER_MIB', 4096))
@@ -32361,23 +31197,23 @@ def _nrrd_full_slice_z_chunk(layer_count: int, width: int, height: int, depth: i
     target = nrrd_stream_buffer_bytes(full_payload_bytes)
     if target < full_slice_bytes:
         return 1
-    # v13.3.1 (R7b), current behavior: bound the block so parallel
+    # current behavior: bound the block so parallel
     # fill and the selected gzip backend pipeline instead of materializing the
     # entire payload before compression starts.
     return max(1, min(int(depth), int(target // full_slice_bytes), int(nrrd_z_chunk_cap())))
 
 
 def nrrd_madvise_dontneed_interval() -> int:
-    # v13.3.16 G9: projected cvol pages are reread by the final G5 union. Run 126080
+    # projected cvol pages are reread by the final union. Run 126080
     # spent ~40 s on its first completion frontier and stalled again at z≈1280 after
     # concurrent NRRD readers had discarded those pages. Keep them warm by default;
     # memory-constrained jobs can restore the former interval with an explicit value.
     return max(0, _env_int('YOLO_TTA_NRRD_MADVISE_DONTNEED_INTERVAL', 0))
 
 
-# --------------------------
+#
 # CPU member-parallel gzip infrastructure
-# --------------------------
+#
 # Every NRRD payload is emitted as independently framed, KAT-validated gzip
 # members. The process-wide executor is shared by concurrent layer writers.
 
@@ -32436,9 +31272,9 @@ def _zero_gzip_member(length: int) -> bytes:
     return member
 
 
-# --------------------------
+#
 # Member-parallel gzip payloads
-# --------------------------
+#
 # Each chunk is a complete gzip member. Independent members pipeline through the
 # shared executor while a sequence-indexed completion map preserves exact payload
 # order. ``auto`` probes libdeflate, ISA-L, then stdlib zlib; every candidate must
@@ -32449,7 +31285,7 @@ _NRRD_MEMBER_CODEC_SETTING_WARNED = False
 
 
 def nrrd_member_codec_requested() -> str:
-    """N17 complete-member CPU codec policy: auto, libdeflate, isal, or zlib."""
+    """Complete-member CPU codec policy: auto, libdeflate, isal, or zlib."""
     global _NRRD_MEMBER_CODEC_SETTING_WARNED
     raw = os.environ.get('YOLO_TTA_NRRD_MEMBER_CODEC', 'auto').strip().lower()
     if raw in {'auto', 'libdeflate', 'isal', 'zlib'}:
@@ -32464,13 +31300,9 @@ def nrrd_member_codec_requested() -> str:
 
 
 def nrrd_libdeflate_level() -> int:
-    """Compression level for python-deflate/libdeflate complete gzip members.
-
-    libdeflate accepts levels through 12.  The ordinary NRRD level remains the default,
-    while an explicit override permits trading some of N17's throughput margin for ratio.
-    A configured level zero is deliberately left as zero: wheels which reject it fail the
-    codec self-test and fall through to a backend that preserves store-mode semantics.
-    """
+    """Resolve the libdeflate complete-member compression level.
+    
+    Level zero remains valid input to codec self-test so unsupported store mode can fall through safely."""
     return int(np.clip(
         _env_int('YOLO_TTA_NRRD_LIBDEFLATE_LEVEL', int(nrrd_gzip_compresslevel())),
         0,
@@ -32539,11 +31371,10 @@ def nrrd_member_gzip_window_bytes() -> int:
 class _MemberParallelGzipPayloadWriter:
     """File-like gzip encoder emitting one independent gzip member per chunk, pipelined.
 
-    ``write(data)`` detaches chunks before deferring them, so callers may immediately reuse
-    their buffers. Completion is unordered, but a sequence-indexed ready map drains the
-    longest available ordered prefix. This prevents a slow early member from hiding later
-    completed work while preserving byte-exact payload order.
-    """
+ ``write(data)`` detaches chunks before deferring them, so callers may immediately reuse
+ their buffers. Completion is unordered, but a sequence-indexed ready map drains the
+ longest available ordered prefix. This prevents a slow early member from hiding later
+ completed work while preserving byte-exact payload order."""
 
     def __init__(
         self,
@@ -32571,10 +31402,10 @@ class _MemberParallelGzipPayloadWriter:
     def _compress_member(self, payload: object, known_nonzero: bool) -> Tuple[bytes, int]:
         """Encode in one native gzip pass; CRC is produced by ISA-L/zlib itself.
 
-        Known zeros enter through ``write_zeros`` from extent/cvol metadata. Unknown data is
-        deliberately not pre-scanned: native DEFLATE handles an unexpected zero member more
-        cheaply than adding a full memory pass to every nonzero member.
-        """
+ Known zeros enter through ``write_zeros`` from extent/cvol metadata. Unknown data is
+ deliberately not pre-scanned: native DEFLATE handles an unexpected zero member more
+ cheaply than adding a full memory pass to every nonzero member."""
+        # DEAD PARAMETER: known_nonzero is retained by the sparse-writer API.
         del known_nonzero  # retained for the explicit sparse-writer API and future telemetry
         mv = payload if isinstance(payload, memoryview) else memoryview(payload)  # type: ignore[arg-type]
         mv = mv.cast('B')
@@ -32589,6 +31420,7 @@ class _MemberParallelGzipPayloadWriter:
             return bytes(self.member_compress(bytes(mv))), int(ln)
 
     def _enqueue_completed(self, member: bytes, ln: int) -> None:
+        # DEAD PARAMETER: ln is retained by the detached-payload callback API.
         seq = int(self._next_sequence)
         self._next_sequence += 1
         del ln  # cached members never consume the in-flight detached-payload budget
@@ -32608,10 +31440,9 @@ class _MemberParallelGzipPayloadWriter:
     def _enqueue_owned_chunk(self, owner: object, *, known_nonzero: bool) -> None:
         """Transfer one caller-owned contiguous allocation to a compressor worker.
 
-        The Future retains ``mv`` (and therefore its NumPy exporter) until native DEFLATE
-        finishes.  This removes the former 8--16 MiB ``bytes()`` detachment copy for every
-        sparse cvol member while preserving the ordinary write() buffer-reuse contract.
-        """
+ The Future retains ``mv`` (and therefore its NumPy exporter) until native DEFLATE
+ finishes. This removes the former 8--16 MiB ``bytes`` detachment copy for every
+ sparse cvol member while preserving the ordinary write buffer-reuse contract."""
         mv = owner if isinstance(owner, memoryview) else memoryview(owner)  # type: ignore[arg-type]
         mv = mv.cast('B')
         seq = int(self._next_sequence)
@@ -32677,7 +31508,7 @@ class _MemberParallelGzipPayloadWriter:
         return self._write_impl(data, known_nonzero=True)
 
     def write_owned_known_nonzero(self, data: object) -> int:
-        """N24 ownership-transfer fast path for one already slice-aligned member."""
+        """Ownership-transfer fast path for one already slice-aligned member."""
         if self.closed:
             raise RuntimeError('Cannot write to a closed gzip payload stream')
         mv = data if isinstance(data, memoryview) else memoryview(data)  # type: ignore[arg-type]
@@ -32700,7 +31531,7 @@ class _MemberParallelGzipPayloadWriter:
         return int(ln)
 
     def write_zeros(self, nbytes: int) -> int:
-        """v13.3.7 (B5/N4): emit cached all-zero members without materializing the zeros."""
+        """Emit cached all-zero members without materializing the zeros."""
         if self.closed:
             raise RuntimeError('Cannot write to a closed gzip payload stream')
         remaining = int(nbytes)
@@ -32827,10 +31658,9 @@ def _select_nrrd_member_codec() -> Optional[Tuple[str, int, Callable[[bytes], by
 def _open_nrrd_payload_writer(fh: object) -> _MemberParallelGzipPayloadWriter:
     """Open the first KAT-validated complete-member CPU gzip codec.
 
-    Automatic selection tries libdeflate, ISA-L, and stdlib zlib in that order.
-    If every configured codec fails validation, output stops with a specific
-    error rather than switching to an unvalidated framing implementation.
-    """
+ Automatic selection tries libdeflate, ISA-L, and stdlib zlib in that order.
+ If every configured codec fails validation, output stops with a specific
+ error rather than switching to an unvalidated framing implementation."""
     member_codec = _select_nrrd_member_codec()
     if member_codec is None:
         requested = nrrd_member_codec_requested()
@@ -32953,7 +31783,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.6-Sol-Pro_v16.0.3_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.6-Sol-Pro_v16.0.4_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -32988,11 +31818,10 @@ def nrrd_layer_output_suffix(
     tile_acceptance: str = '',
     stage: str = '',
 ) -> str:
-    """Return the v13.2.0 single-layer NRRD filename suffix for one component layer.
+    """Return the single-layer NRRD filename suffix for one component layer.
 
-    The decomposition is now one single-layer NRRD per component layer (spec 7), named
-    ``{Filestem}_{suffix}.seg.nrrd`` with the model name dropped (a model-ensemble holdover).
-    """
+ The decomposition is now one single-layer NRRD per component layer, named
+ ``{Filestem}_{suffix}.seg.nrrd`` with the model name dropped (a model-ensemble holdover)."""
     source_l = str(source).strip().lower()
     mask_kind_l = str(mask_kind).strip().lower()
     stage_l = str(stage).strip().lower()
@@ -33034,17 +31863,14 @@ _NRRD_ZSHARD_SEMAPHORES: Dict[int, object] = {}
 
 
 def _nrrd_zshard_capacity() -> int:
-    """Process-wide concurrent N7 band capacity (also the semaphore capacity)."""
+    """Process-wide concurrent band capacity (also the semaphore capacity)."""
     return max(1, int(nrrd_layer_sink_workers()))
 
 
 class _WeightedNrrdZShardSemaphore:
-    """Weighted process-wide budget for concurrently compressing NRRD z bands.
-
-    v13.3.15 N18 uses weight one per independent spool. The weighted API remains because
-    older callers and regression paths may reserve a larger group, while the default path
-    can now share the capacity fairly across multiple global files without queue deadlock.
-    """
+    """Bound concurrent NRRD z-band compression with weighted process-wide permits.
+    
+    Ordinary independent spools consume one permit each."""
 
     def __init__(self, capacity: int) -> None:
         self.capacity = max(1, int(capacity))
@@ -33072,7 +31898,7 @@ class _WeightedNrrdZShardSemaphore:
 
 
 def _nrrd_zshard_semaphore() -> _WeightedNrrdZShardSemaphore:
-    """Return the atomic weighted N7 band budget for the configured sink capacity."""
+    """Return the atomic weighted band budget for the configured sink capacity."""
     capacity = int(_nrrd_zshard_capacity())
     with _NRRD_ZSHARD_SEMAPHORE_LOCK:
         sem = _NRRD_ZSHARD_SEMAPHORES.get(int(capacity))
@@ -33087,7 +31913,7 @@ def _nrrd_layer_zshard_count(
     out_t: int,
     capacity: Optional[int] = None,
 ) -> int:
-    """N7 shard count resolved by the executing writer, never sink queue occupancy."""
+    """Shard count resolved by the executing writer, never sink queue occupancy."""
     if str(getattr(ref, 'source', '')).strip().lower() != 'global':
         return 1
     min_slices = int(nrrd_layer_zshard_min_slices())
@@ -33107,9 +31933,8 @@ def _nrrd_layer_zshard_bands(
 ) -> Tuple[List[Tuple[int, int]], Optional[List[int]]]:
     """Partition native cvol layers by indexed sparse payload bytes.
 
-    Equal slice bands remain the conservative fallback for resampled/non-cvol layers.
-    The optional second result reports each band's indexed payload weight for logging.
-    """
+ Equal slice bands remain the conservative fallback for resampled/non-cvol layers.
+ The optional second result reports each band's indexed payload weight for logging."""
     depth = max(0, int(out_t))
     count = max(1, min(int(shard_count), max(1, depth)))
     equal = [
@@ -33150,17 +31975,17 @@ def _nrrd_layer_zshard_bands(
         return equal, None
 
 
+# DEAD CODE BEGIN: no active NRRD writer constructs this ordered queue implementation.
 class _OrderedNrrdShardDestination:
     """Bounded ordered fan-in that writes shard bytes straight to the final payload.
 
-    Each compressor writes to its own small queue. The coordinator drains queues
-    in z-band order, preserving payload order.
-    """
+ Each compressor writes to its own small queue. The coordinator drains queues
+ in z-band order, preserving payload order."""
 
     def __init__(self, fh: object, shard_count: int) -> None:
         self.fh = fh
         self.abort = threading.Event()
-        # N15: 32 complete members permits each payload-weighted band to remain ahead of
+        # 32 complete members permits each payload-weighted band to remain ahead of
         # ordered fan-in without the 8-item queue serializing later bands behind band zero.
         depth = max(2, _env_int('YOLO_TTA_NRRD_SHARD_QUEUE_DEPTH', 32))
         self.queues: List[queue.Queue] = [queue.Queue(maxsize=int(depth)) for _ in range(int(shard_count))]
@@ -33230,6 +32055,7 @@ class _OrderedNrrdShardSink:
             self.owner._put(self.shard, ('error', exc))
         except Exception:
             pass
+# DEAD CODE END: _OrderedNrrdShardDestination and _OrderedNrrdShardSink.
 
 
 @runtime_telemetry_phase('nrrd.write_layer')
@@ -33246,19 +32072,18 @@ def write_single_layer_nrrd_from_ref(
 ) -> Path:
     """Write one component layer as its own single-layer 3D Slicer segmentation NRRD (X, Y, t).
 
-    The layer is restored from its backing-store geometry directly to the final output
-    geometry while streaming, reusing the same per-layer restore/stream path as the legacy
-    decomposed writer. Each file holds one uint8 binary mask and is compressed
-    as KAT-validated complete gzip members using libdeflate, ISA-L, or stdlib
-    zlib. The Slicer segmentation fields make the file import as a Segmentation
-    node; segment_name defaults to the output filename stem and segment_color to
-    the deterministic palette pick for that name.
-    """
+ The layer is restored from its backing-store geometry directly to the final output
+ geometry while streaming, reusing the same per-layer restore/stream path as the legacy
+ decomposed writer. Each file holds one uint8 binary mask and is compressed
+ as KAT-validated complete gzip members using libdeflate, ISA-L, or stdlib
+ zlib. The Slicer segmentation fields make the file import as a Segmentation
+ node; segment_name defaults to the output filename stem and segment_color to
+ the deterministic palette pick for that name."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
     seg_name = str(segment_name) if segment_name else _slicer_segment_name_for_out_path(out_path)
     seg_color = segment_color if segment_color is not None else slicer_segment_palette_color(seg_name)
-    # v13.3.6 (N3): live-volume layers defer the segment-extent scan to THIS (background
+    # live-volume layers defer the segment-extent scan to THIS (background
     # sink) worker instead of blocking the producing thread with a store-encode pass.
     ref = _resolve_live_ref_extent(ref)
     raster_plan = _nrrd_raster_plan(ref, (out_t, out_h, out_w))
@@ -33275,7 +32100,7 @@ def write_single_layer_nrrd_from_ref(
         extent_xyt=raster_plan.segment_extent_xyt,
     ))
     z_chunk = _nrrd_full_slice_z_chunk(1, stored_w, stored_h, stored_t)
-    # N15: resolve auto-sharding only after this sink task starts executing. Queue
+    # resolve auto-sharding only after this sink task starts executing. Queue
     # occupancy at submit time says nothing about the child-band capacity by the time a
     # late global layer reaches the head of the sink pool. The shared semaphore remains
     # the hard cross-layer over-sharding guard.
@@ -33307,7 +32132,7 @@ def write_single_layer_nrrd_from_ref(
                 )
         return out_path
 
-    # v16.0.1: each z band compresses into an independent anonymous memory-backed chunk.
+    # each z band compresses into an independent anonymous memory-backed chunk.
     # A band holds ONE process-global permit only while it is actually compressing. This
     # lets two 8-band global files use a 12-lane budget concurrently and removes the
     # ordered bounded-queue backpressure that previously kept later compressors idle.
@@ -33481,31 +32306,29 @@ _NRRD_SPARSE_MIRROR_TEE_ANNOUNCED = False
 
 
 def nrrd_gpu_mirror_tee_enabled() -> bool:
-    """v13.3.6 (D2): derive low-quality NRRD mirror volumes on the GPU."""
+    """Derive low-quality NRRD mirror volumes on the GPU."""
     return _env_flag('YOLO_TTA_NRRD_GPU_MIRROR_TEE', True)
 
 
 def nrrd_parallel_mirror_encode_enabled() -> bool:
-    """v13.3.7 (N5): gzip-encode a layer's low-quality mirror files concurrently.
+    """Gzip-encode a layer's low-quality mirror files concurrently.
 
-    The mirrors of one layer were encoded one after another at the tail of the layer task;
-    they are independent files with separate handles and payload writers sharing
-    the thread-safe member pool and zero-member cache, so they encode side by side.
-    YOLO_TTA_NRRD_PARALLEL_MIRROR_ENCODE=0 restores serial encodes.
-    """
+ The mirrors of one layer were encoded one after another at the tail of the layer task;
+ they are independent files with separate handles and payload writers sharing
+ the thread-safe member pool and zero-member cache, so they encode side by side.
+ YOLO_TTA_NRRD_PARALLEL_MIRROR_ENCODE=0 restores serial encodes."""
     return _env_flag('YOLO_TTA_NRRD_PARALLEL_MIRROR_ENCODE', True)
 
 
 class _GpuMirrorTee:
-    """v13.3.6 (D2): GPU tee deriving downbinned mirror volumes from payload blocks.
+    """GPU tee deriving downbinned mirror volumes from payload blocks.
 
-    Each streamed full-quality block is uploaded once; every mirror spec is produced by an
-    adaptive max-pool on device (any foreground in the covering window -> 1, matching the
-    CPU tee's (INTER_AREA>0) semantics up to window-boundary voxels) and max-merged into a
-    device-resident mirror volume through the same source->mirror t-mapping. The small
-    mirror volumes come back to host once, after the layer finishes. Any failure marks the
-    tee failed and the caller falls back to re-encoding mirrors from the layer store.
-    """
+ Each streamed full-quality block is uploaded once; every mirror spec is produced by an
+ adaptive max-pool on device (any foreground in the covering window -> 1, matching the
+ CPU tee's (INTER_AREA>0) semantics up to window-boundary voxels) and max-merged into a
+ device-resident mirror volume through the same source->mirror t-mapping. The small
+ mirror volumes come back to host once, after the layer finishes. Any failure marks the
+ tee failed and the caller falls back to re-encoding mirrors from the layer store."""
 
     def __init__(
         self,
@@ -33627,25 +32450,13 @@ def write_layer_nrrd_with_low_quality_mirrors(
     segment_color: Optional[Tuple[float, float, float]] = None,
     z_shards: Optional[int] = None,
 ) -> Path:
-    """v13.3.3 (S4): write the full-quality layer AND its low-quality mirrors in ONE pass.
-
-    Each low-quality mirror used to be an independent write that re-decoded the full-resolution
-    layer store per output slice (3-4 full-res decodes + INTER_AREA resizes per slice, per
-    downbin spec). Here the full-quality write streams exactly as before, and every payload
-    block is additionally folded into small in-RAM mirror volumes (one resize per full-res
-    slice per spec, OR'd into the covering mirror slices — the same resize helper and union
-    semantics as the legacy per-mirror reader, composed through the output geometry, so bin-edge
-    voxels may differ sub-slice from the legacy double-resample). The mirror files are then
-    gzip-encoded straight from RAM. Any tee failure falls back to the legacy per-mirror writer
-    so the full-quality file is never at risk.
-
-    v13.3.7 (N5): the mirror files encode concurrently instead of one after another; see
-    nrrd_parallel_mirror_encode_enabled.
-    """
+    """Write a full-quality layer and all low-quality mirrors in one source pass.
+    
+    Independent mirror encoders may run concurrently while sharing the streamed layer data."""
     out_t = int(output_shape[0])
     # Resolve a live layer's deferred extent once so full-quality and mirror headers agree.
     ref = _resolve_live_ref_extent(ref)
-    # N22 mirror payloads are composed in two geometry steps (backing -> full output ->
+    # mirror payloads are composed in two geometry steps (backing -> full output ->
     # low quality). Compose the header extent through that same intermediate geometry;
     # mapping backing -> mirror directly can understate a positive-support boundary voxel.
     mirror_extent_ref = dataclasses_replace(
@@ -33654,7 +32465,7 @@ def write_layer_nrrd_with_low_quality_mirrors(
         segment_extent_shape_tyx=tuple(int(v) for v in output_shape),
         segment_extent_source='composed_full_output_extent_for_low_quality_mirror',
     )
-    # N15: this function itself is the queued sink task, so this is execution-time—not
+    # this function itself is the queued sink task, so this is execution-time—not
     # submission-time—resolution. Reuse the result for tee scheduling and the full writer.
     if z_shards is None or int(z_shards) <= 0:
         resolved_z_shards = _nrrd_layer_zshard_count(ref, int(out_t))
@@ -33676,21 +32487,21 @@ def write_layer_nrrd_with_low_quality_mirrors(
         mirror_jobs.append({
             'shape': (m_t, m_h, m_w),
             'path': Path(m_path),
-            'volume': None,  # v13.3.6 (D2): allocated below only when the CPU tee runs
+            'volume': None,  # allocated below only when the CPU tee runs
             'src_to_m': [tuple(v) for v in tmp],
             'locks': [threading.Lock() for _ in range(16)],
             'failed': False,
         })
 
-    # v13.3.17 N22: raw bbox stores expose their restored output crops during the same
-    # sparse member pass.  Keep this tee sparse on the CPU: uploading thousands of tiny
+    # raw bbox stores expose their restored output crops during the same
+    # sparse member pass. Keep this tee sparse on the CPU: uploading thousands of tiny
     # crops is slower than the vectorized integral/gather resize, while uploading the old
-    # dense 8.83 MiB plane would forfeit the bandwidth win. Other source types retain D2.
+    # dense 8.83 MiB plane would forfeit the bandwidth win. Other source types retain.
     sparse_mirror_tee = bool(
         mirror_jobs and _nrrd_layer_ref_is_raw_bbox_store(ref)
     )
 
-    # v13.3.6 (D2): derive the mirrors on a GPU when one is free — the per-slice resizes
+    # derive the mirrors on a GPU when one is free — the per-slice resizes
     # and striped-lock ORs leave the CPU tee entirely; mirror volumes come back in one
     # small D2H after the layer streams. CPU tee (below) remains the fallback.
     gpu_tee = None if bool(sparse_mirror_tee) else _try_create_gpu_mirror_tee(mirror_jobs, out_t)
@@ -33715,7 +32526,7 @@ def write_layer_nrrd_with_low_quality_mirrors(
                     'native/restored cvol layers no longer make a second dense store pass.'
                 )
 
-    # N7 already supplies z-band concurrency. Avoid nesting another up-to-16-way CPU pool
+    # already supplies z-band concurrency. Avoid nesting another up-to-16-way CPU pool
     # inside every shard; the unsharded path retains the original slice fan-out.
     tee_workers = 1 if int(resolved_z_shards) > 1 else max(1, min(int(nrrd_fill_workers()), 16))
 
@@ -33793,7 +32604,7 @@ def write_layer_nrrd_with_low_quality_mirrors(
             except Exception:
                 job['failed'] = True
 
-    # N19 shard consumers can arrive concurrently. CPU mirror updates use
+    # shard consumers can arrive concurrently. CPU mirror updates use
     # per-output-z stripe locks; the GPU tee owns one stream and tensor set, so
     # serialize only its tee calls while member compression remains parallel.
     gpu_tee_call_lock = threading.Lock() if gpu_tee is not None else None
@@ -33821,7 +32632,7 @@ def write_layer_nrrd_with_low_quality_mirrors(
         z_shards=int(resolved_z_shards),
     )
 
-    # v13.3.6 (D2): one small D2H per mirror replaces the per-block CPU resize/OR work.
+    # one small D2H per mirror replaces the per-block CPU resize/OR work.
     if gpu_tee is not None and not gpu_tee.finalize_into_jobs():
         for job in mirror_jobs:
             job['failed'] = True
@@ -33876,7 +32687,7 @@ def write_layer_nrrd_with_low_quality_mirrors(
         finally:
             job['volume'] = None
 
-    # v13.3.7 (N5): the mirror files of one layer are independent — encode them side by
+    # the mirror files of one layer are independent — encode them side by
     # side instead of one after another at the tail of the layer task. Every task runs to
     # completion (a failing mirror re-encodes from the store, matching the serial per-mirror
     # fallback) and the first error is re-raised after all mirrors settle.
@@ -33903,15 +32714,7 @@ def write_layer_nrrd_with_low_quality_mirrors(
 
 
 class NrrdLayerSink:
-    """Writes one single-layer NRRD per component layer as the layers are produced.
-
-    v13.2.0 reworks ``--save_nrrd`` from one mega 4D decomposed NRRD assembled at the very
-    end into a set of small single-layer NRRDs created during the intermediate pipeline
-    steps (e.g. the Transverse layer NRRD is compressed while Tiled Transverse is still being
-    inferenced).  Layers are submitted from whichever background postprocess/interpolation
-    thread produced them, written on a small dedicated pool so the writes overlap inference
-    and each other, and recorded in one sidecar manifest.
-    """
+    """Write each component layer as its own NRRD as soon as the layer becomes available."""
 
     def __init__(
         self,
@@ -33933,12 +32736,12 @@ class NrrdLayerSink:
         self._futures: List[Future] = []
         self._manifest: List[Dict[str, object]] = []
         self._suffix_counts: Dict[str, int] = {}
-        # v13.2.3: Slicer segment colors already assigned in this run, so two layers whose
+        # Slicer segment colors already assigned in this run, so two layers whose
         # suffix hashes collide still render distinctly (deterministic forward probing).
         self._segment_colors_in_use: set = set()
-        # v13.2.1: low-quality NRRDs now mirror the full-quality decomposition instead of being one
-        # combined volume written at the tail.  Each downbin spec gets its own
-        # one-single-layer-NRRD-per-component decomposition under low_quality/<token>/nrrd/, restored
+        # low-quality NRRDs now mirror the full-quality decomposition instead of being one
+        # combined volume written at the tail. Each downbin spec gets its own
+        # one-single-layer-NRRD-per-component decomposition under low_quality/<token>/nrrd/ restored
         # from the same NrrdLayerRef and submitted here as each view completes (identical scheduling).
         self.low_quality_specs: List['LowQualityDownbinSpec'] = list(low_quality_specs or [])
         self.low_quality_root = Path(low_quality_root) if low_quality_root is not None else None
@@ -33982,7 +32785,7 @@ class NrrdLayerSink:
             seen = int(self._suffix_counts.get(str(suffix), 0))
             self._suffix_counts[str(suffix)] = seen + 1
             unique_suffix = str(suffix) if seen == 0 else f'{suffix}_{seen + 1:02d}'
-            # v13.2.3: .seg.nrrd + Slicer segmentation header fields; the segment is named
+            # .seg.nrrd + Slicer segmentation header fields; the segment is named
             # after the file and colored from the deterministic per-suffix palette.
             out_path = self.nrrd_dir / f'{self.stem}_{unique_suffix}.seg.nrrd'
             segment_name = f'{self.stem}_{unique_suffix}'
@@ -34007,16 +32810,16 @@ class NrrdLayerSink:
                 'exported_axes': '(X, Y, t)',
                 'segment_name': segment_name,
                 'segment_color_rgb': [round(float(c), 6) for c in segment_color],
-                # N15 resolves the actual count inside the executing writer. Keeping the
+                # resolves the actual count inside the executing writer. Keeping the
                 # policy explicit avoids recording the stale submit-time pool occupancy.
                 'z_shards': None,
                 'z_shards_policy': 'execution_time',
             }
             self._manifest.append(manifest_entry)
-            # v13.2.1: mirror this component layer into each low-quality downbin decomposition,
+            # mirror this component layer into each low-quality downbin decomposition,
             # scheduled now (as the view completes) exactly like the full-quality layer and sharing
             # the same unique suffix so a low-quality layer maps 1:1 to its full-quality layer.
-            # v13.3.3 (S4): the mirrors are derived from the full-quality payload blocks inside ONE
+            # the mirrors are derived from the full-quality payload blocks inside ONE
             # combined write task (write_layer_nrrd_with_low_quality_mirrors) instead of each
             # re-decoding the full-resolution layer store as an independent task.
             lq_mirror_args: List[Tuple[Tuple[int, int, int], Path]] = []
@@ -34145,7 +32948,7 @@ class NrrdLayerSink:
         with self._lock:
             manifest_layers = list(self._manifest)
             lq_manifests = {token: list(entries) for token, entries in self._lq_manifests.items()}
-        # v13.2.1: one manifest per low-quality downbin decomposition, mirroring the full-quality
+        # one manifest per low-quality downbin decomposition, mirroring the full-quality
         # sidecar so each low-quality nrrd/ folder is self-describing and recomposable on its own.
         if self.low_quality_root is not None:
             for spec in self.low_quality_specs:
@@ -34213,7 +33016,7 @@ def nrrd_layer_sink() -> Optional[NrrdLayerSink]:
 
 
 def nrrd_layer_sink_workers() -> int:
-    # v13.3.3: default cap 4 -> 12. With ~72 queued files (layers x low-quality mirrors) the
+    # default cap 4 -> 12. With ~72 queued files (layers x low-quality mirrors) the
     # 4-slot pool left the box near-idle through the whole write tail; most of the write volume
     # lands after inference has drained, so a wider pool is safe.
     cores = max(1, _cpu_count())
@@ -34226,12 +33029,11 @@ def _nrrd_layer_ref_is_raw_bbox_store(ref: NrrdLayerRef) -> bool:
 
 
 class _LiveArrayLayerSource:
-    """v13.3.6 (N3): read adapter over an in-process live layer volume.
+    """Read adapter over an in-process live layer volume.
 
-    Duck-typed for the payload streamer (shape + slicing); NOT a RawBBoxMaskStore, so the
-    zero-copy direct-native branch applies when shapes match. The wrapped array is owned by
-    the caller (e.g. the final union volume) and must never be closed by the sink.
-    """
+ Duck-typed for the payload streamer (shape + slicing); NOT a RawBBoxMaskStore, so the
+ zero-copy direct-native branch applies when shapes match. The wrapped array is owned by
+ the caller (e.g. the final union volume) and must never be closed by the sink."""
 
     def __init__(self, arr: np.ndarray) -> None:
         self.array = np.asarray(arr)
@@ -34242,23 +33044,21 @@ class _LiveArrayLayerSource:
 
 
 def nrrd_live_global_layer_enabled() -> bool:
-    """v13.3.6 (N3): stream IMMUTABLE global layers straight from the live volume.
+    """Stream IMMUTABLE global layers straight from the live volume.
 
-    The store-encode pass + store read-back that the final/global layers paid purely to
-    hand the sink a path are skipped; the sink reads the caller's in-RAM volume directly
-    (one streaming pass) and the segment extent is computed on the sink worker thread.
-    YOLO_TTA_NRRD_LIVE_GLOBAL_LAYERS=0 restores the raw-bbox store path.
-    """
+ The store-encode pass + store read-back that the final/global layers paid purely to
+ hand the sink a path are skipped; the sink reads the caller's in-RAM volume directly
+ (one streaming pass) and the segment extent is computed on the sink worker thread.
+ YOLO_TTA_NRRD_LIVE_GLOBAL_LAYERS=0 restores the raw-bbox store path."""
     return _env_flag('YOLO_TTA_NRRD_LIVE_GLOBAL_LAYERS', True)
 
 
 def _resolve_live_ref_extent(ref: NrrdLayerRef) -> NrrdLayerRef:
-    """v13.3.6 (N3): compute a live-volume layer's deferred segment extent (idempotent).
+    """Compute a live-volume layer's deferred segment extent (idempotent).
 
-    Live refs carry segment_extent_ijk=None so the producing thread never pays the scan;
-    the first sink worker that needs the header resolves it here (one GIL-releasing
-    reduction pass over the live volume) and downstream uses the returned ref.
-    """
+ Live refs carry segment_extent_ijk=None so the producing thread never pays the scan;
+ the first sink worker that needs the header resolves it here (one GIL-releasing
+ reduction pass over the live volume) and downstream uses the returned ref."""
     if (
         getattr(ref, 'live_array', None) is None
         or _coerce_segment_extent(getattr(ref, 'segment_extent_ijk', None)) is not None
@@ -34276,7 +33076,7 @@ def _resolve_live_ref_extent(ref: NrrdLayerRef) -> NrrdLayerRef:
 def _open_nrrd_layer_ref(ref: NrrdLayerRef) -> object:
     live = getattr(ref, 'live_array', None)
     if live is not None:
-        return _LiveArrayLayerSource(live)  # v13.3.6 (N3)
+        return _LiveArrayLayerSource(live)  #
     if _nrrd_layer_ref_is_raw_bbox_store(ref):
         return RawBBoxMaskStore.open(
             ref.path,
@@ -34292,7 +33092,7 @@ def _open_nrrd_layer_ref(ref: NrrdLayerRef) -> object:
 
 def _close_nrrd_layer_source(src: object) -> None:
     if isinstance(src, _LiveArrayLayerSource):
-        return  # v13.3.6 (N3): the live volume belongs to the caller; never close it here
+        return  # the live volume belongs to the caller; never close it here
     if isinstance(src, RawBBoxMaskStore):
         src.close()
         return
@@ -34302,7 +33102,7 @@ def _close_nrrd_layer_source(src: object) -> None:
 def _drop_nrrd_raw_store_chunks_ram_cache(src: object) -> None:
     if not isinstance(src, RawBBoxMaskStore):
         return
-    # v13.2.2 bug #15: release (refcount) rather than evict — sibling full-quality /
+    # release (refcount) rather than evict — sibling full-quality /
     # low-quality writers for the same layer may still hold the entry.
     if not bool(getattr(src, '_ram_cache_ref_held', False)):
         return
@@ -34311,12 +33111,12 @@ def _drop_nrrd_raw_store_chunks_ram_cache(src: object) -> None:
 
 
 def nrrd_parallel_extent_scan_enabled() -> bool:
-    """v13.3.10 (N10): parallelize exact per-slice SegmentN_Extent reductions."""
+    """Parallelize exact per-slice SegmentN_Extent reductions."""
     return _env_flag('YOLO_TTA_NRRD_PARALLEL_EXTENT_SCAN', True)
 
 
 def _compute_segment_extent_zyx_serial(src: np.ndarray) -> Tuple[int, int, int, int, int, int]:
-    """The v13.3.9 extent scan, retained verbatim as N10's regression fallback."""
+    """Return the exact Slicer segment extent through the serial fallback scan."""
     t_dim, h_dim, w_dim = (int(src.shape[0]), int(src.shape[1]), int(src.shape[2]))
     min_t, max_t = t_dim, -1
     min_y, max_y = h_dim, -1
@@ -34349,16 +33149,7 @@ def compute_segment_extent_zyx(
     *,
     workers: Optional[int] = None,
 ) -> Tuple[int, int, int, int, int, int]:
-    """Return Slicer SegmentN_Extent as ``minI maxI minJ maxJ minK maxK``.
-
-    The pipeline layer is ``(t,Y,X)``.  The NRRD payload stores that as spatial
-    ``(X,Y,t)``, so Slicer I/J/K map to X/Y/t respectively.
-
-    v13.3.10 (N10) scans independent t-slices concurrently, records one exact y/x
-    extent per slice, then performs a deterministic scalar min/max reduction.  No
-    extent is widened: this metadata also gates payload zero skipping.  Set
-    YOLO_TTA_NRRD_PARALLEL_EXTENT_SCAN=0 for the byte-for-byte v13.3.9 control flow.
-    """
+    """Return the exact Slicer segment extent through parallel per-slice reductions."""
     src = np.asarray(mask_zyx)
     if src.ndim != 3:
         raise ValueError(f'compute_segment_extent_zyx expects a 3D (t,Y,X) layer, got {src.shape}')
@@ -34457,10 +33248,9 @@ def _nrrd_sparse_resize_axis_map(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Cached global-coordinate source support for every output coordinate.
 
-    The returned inclusive-start/exclusive-stop arrays reproduce OpenCV nearest-neighbor
-    sampling or the positive-support footprint of INTER_AREA.  Keeping this map global is
-    what lets N22 resize a bbox independently without shifting its phase to the crop origin.
-    """
+ The returned inclusive-start/exclusive-stop arrays reproduce OpenCV nearest-neighbor
+ sampling or the positive-support footprint of INTER_AREA. Keeping this map global is
+ what lets resize a bbox independently without shifting its phase to the crop origin."""
     in_n = max(1, int(in_count))
     out_n = max(1, int(out_count))
     coords = np.arange(int(out_n), dtype=np.int64)
@@ -34574,12 +33364,11 @@ def _resize_sparse_binary_crop_to_output_region(
 ) -> Optional[Tuple[int, int, int, int, np.ndarray]]:
     """Resize one binary source bbox in the *full frame's* coordinate system.
 
-    Returns ``(out_y0, out_x0, out_y1, out_x1, crop)``.  The output region includes every
-    output pixel whose global sampling footprint can see the source bbox, including the
-    one-pixel influence halo that an area downscale can create.  Work is proportional to
-    the affected region: OpenCV's C integral-image kernel plus vectorized native gathers
-    replace a full zero-plane resize and all Python row loops.
-    """
+ Returns ``(out_y0, out_x0, out_y1, out_x1, crop)``. The output region includes every
+ output pixel whose global sampling footprint can see the source bbox, including the
+ one-pixel influence halo that an area downscale can create. Work is proportional to
+ the affected region: OpenCV's C integral-image kernel plus vectorized native gathers
+ replace a full zero-plane resize and all Python row loops."""
     global _NRRD_SPARSE_AREA_NUMBA_FAILED, _NRRD_SPARSE_AREA_NUMBA_ANNOUNCED
     in_h, in_w = (max(1, int(v)) for v in source_shape)
     out_h, out_w = (max(1, int(v)) for v in output_shape)
@@ -34628,9 +33417,9 @@ def _resize_sparse_binary_crop_to_output_region(
         restored = crop_u8[src_y[:, None], src_x[None, :]]
     else:
         # Reproduce INTER_AREA's global phase and uint8 rounding threshold without padding
-        # a full source plane.  cv2.integral is a compiled, GIL-releasing prefix pass over
+        # a full source plane. cv2.integral is a compiled, GIL-releasing prefix pass over
         # the bbox; evaluating its continuous piecewise-constant integral accounts for
-        # fractional first/last source pixels (a plain any() would over-include tiny slivers).
+        # fractional first/last source pixels (a plain any would over-include tiny slivers).
         integral = cv2.integral(crop_u8, sdepth=cv2.CV_32S)
         crop_h, crop_w = (int(v) for v in crop_u8.shape)
         restored = np.empty(
@@ -34763,9 +33552,9 @@ def _read_layer_slice_in_output_shape(
 
 
 def nrrd_extent_zero_skip_enabled() -> bool:
-    """v13.3.7 (B5/N4): payload z-ranges outside the layer's recorded segment extent are
-    emitted as cached zero members/chunks without reading (or even faulting in) the source
-    pages. YOLO_TTA_NRRD_EXTENT_ZERO_SKIP=0 restores full-volume streaming."""
+    """Payload z-ranges outside the layer's recorded segment extent are
+ emitted as cached zero members/chunks without reading (or even faulting in) the source
+ pages. YOLO_TTA_NRRD_EXTENT_ZERO_SKIP=0 restores full-volume streaming."""
     return _env_flag('YOLO_TTA_NRRD_EXTENT_ZERO_SKIP', True)
 
 
@@ -34775,22 +33564,21 @@ def _nrrd_layer_zero_skip_window(
 ) -> Optional[Tuple[int, int]]:
     """Output-space t-window ``[lo, hi)`` that MAY contain foreground, from the layer extent.
 
-    Returns None when no extent is recorded (nothing can be skipped) and ``(0, 0)`` when
-    the recorded extent is the scanned-empty sentinel — every extent source
-    (raw_bbox_cvol_index / raw_layer_materialization_scan / live_volume_sink_scan) records
-    genuinely scanned data, so empty means the whole payload is zeros. Note the contrast
-    with _slicer_segment_extent_for_output, which maps empty to FULL because Slicer needs
-    a valid display extent; for zero-skipping the empty sentinel is trustworthy as-is.
+ Returns None when no extent is recorded (nothing can be skipped) and ``(0, 0)`` when
+ the recorded extent is the scanned-empty sentinel — every extent source
+ (raw_bbox_cvol_index / raw_layer_materialization_scan / live_volume_sink_scan) records
+ genuinely scanned data, so empty means the whole payload is zeros. Note the contrast
+ with _slicer_segment_extent_for_output, which maps empty to FULL because Slicer needs
+ a valid display extent; for zero-skipping the empty sentinel is trustworthy as-is.
 
-    The t-axis window inverts the ACTUAL restore mappings rather than reusing the header's
-    outward display scaling: for in_t >= out_t each output z reads sources
-    [floor(z*in/out), ceil((z+1)*in/out)) — the floor/ceil bounds below are exact for that;
-    for in_t < out_t each output z reads round(z*(in-1)/(out-1)) (endpoint-aligned
-    _linear_source_index, whose slope exceeds out/in — the display scaling would UNDERSHOOT
-    it), so the window inverts that line at t0-0.5 / t1+0.5. One slice of padding per side
-    absorbs any residual rounding-rule differences; skipping must never reclassify a
-    foreground slice as zero.
-    """
+ The t-axis window inverts the ACTUAL restore mappings rather than reusing the header's
+ outward display scaling: for in_t >= out_t each output z reads sources
+ [floor(z*in/out), ceil((z+1)*in/out)) — the floor/ceil bounds below are exact for that;
+ for in_t < out_t each output z reads round(z*(in-1)/(out-1)) (endpoint-aligned
+ _linear_source_index, whose slope exceeds out/in — the display scaling would UNDERSHOOT
+ it), so the window inverts that line at t0-0.5 / t1+0.5. One slice of padding per side
+ absorbs any residual rounding-rule differences; skipping must never reclassify a
+ foreground slice as zero."""
     if not nrrd_extent_zero_skip_enabled():
         return None
     extent = _coerce_segment_extent(getattr(ref, 'segment_extent_ijk', None))
@@ -34836,28 +33624,9 @@ def _write_one_decomposed_nrrd_layer_payload(
     z_stop: Optional[int] = None,
     fill_workers_override: Optional[int] = None,
 ) -> None:
-    """Write exactly one decomposed NRRD layer payload in native layer order.
-
-    The caller decides whether this layer is appended into an already-open gzip
-    stream or into its own gzip member.  In either case the uncompressed bytes for
-    one layer are written as native ``(t,Y,X)`` C-order, which matches the NRRD
-    attached payload order for sizes ``(X,Y,t,layer)`` when the list axis is last.
-
-    v13.3.3 (S4): ``block_consumer(z0, block)`` (if given) observes every output-geometry
-    payload block right after it is materialized — the low-quality mirror tee derives its
-    downbinned volumes from these blocks instead of re-decoding the layer store per mirror.
-    The consumer must treat the block as read-only and return before reuse; in the
-    double-buffered path it runs on the caller thread while the block's compression proceeds
-    on the writer thread (both only read).
-
-    v13.3.7 (B5/N4): z-blocks fully outside the layer's recorded segment extent are never
-    filled, teed, or read — the payload writer emits cached zero members/chunks for them
-    (``write_zeros``). Zero blocks are invisible to ``block_consumer``; they contribute
-    nothing to a mirror union. v13.3.7 (N2): the direct-native branch (final/global layers)
-    now runs its compression on a one-thread writer pool with the mirror tee overlapping on
-    the calling thread, matching the double-buffered branches instead of serializing
-    tee -> compress -> next block.
-    """
+    """Stream one restored NRRD layer in bounded output-z blocks.
+    
+    Optional consumers observe each block, and known-zero ranges bypass source reads."""
     out_t, out_h, out_w = (int(output_shape[0]), int(output_shape[1]), int(output_shape[2]))
     z_begin = int(np.clip(int(z_start), 0, out_t))
     z_end = out_t if z_stop is None else int(np.clip(int(z_stop), z_begin, out_t))
@@ -34879,8 +33648,8 @@ def _write_one_decomposed_nrrd_layer_payload(
             raw_store_stream
             and (int(in_t), int(in_h), int(in_w)) == (int(out_t), int(out_h), int(out_w))
         )
-        # v13.3.7 (B5/N4): z-blocks fully outside this window are emitted as cached zero
-        # members/chunks through write_zeros() — no fill, no tee, no source page reads.
+        # z-blocks fully outside this window are emitted as cached zero
+        # members/chunks through write_zeros — no fill, no tee, no source page reads.
         zero_window = _nrrd_layer_zero_skip_window(ref, (out_t, out_h, out_w))
         can_write_zeros = callable(getattr(payload_writer, 'write_zeros', None))
 
@@ -34892,10 +33661,10 @@ def _write_one_decomposed_nrrd_layer_payload(
             )
 
         if bool(raw_store_stream):
-            # v13.3.17 (N22/N24): native AND restored cvol sources share one sparse path.
+            # native AND restored cvol sources share one sparse path.
             # Members end only at output-slice boundaries, large assembly is vectorized
             # in native libraries, and an owned member can transfer directly to the async
-            # compressor.  The sparse mirror consumer observes crops during this same pass.
+            # compressor. The sparse mirror consumer observes crops during this same pass.
             member_bytes = int(np.clip(
                 int(nrrd_gzip_chunk_bytes()),
                 8 * 1024 * 1024,
@@ -34946,11 +33715,9 @@ def _write_one_decomposed_nrrd_layer_payload(
 
         if bool(direct_native_stream):
             # The memmap/live volume is already a native (t,Y,X) C-order layer: chunks are
-            # views written directly — no transpose, no Fortran conversion, no layer
-            # interleave. v13.3.7 (N2): the compression call runs on a one-thread writer
-            # pool while THIS thread runs the mirror tee on the same block (both only read
-            # it), so tee and deflate overlap instead of serializing — this branch carries
-            # the final/global layers, previously the one path still fully serial per block.
+            # views written directly — no transpose, Fortran conversion, or layer interleave.
+            # Compression runs on a one-thread writer pool while this thread feeds the mirror
+            # tee from the same read-only block, overlapping tee and deflate.
             slice_bytes = int(out_h) * int(out_w)
             writer_pool = _acquire_parallel_pool(1)
             pending: Optional[Future] = None
@@ -34991,7 +33758,7 @@ def _write_one_decomposed_nrrd_layer_payload(
                 _release_parallel_pool(1, writer_pool)
             return
 
-        # v13.3.1 (R7b): shared bounded-block streamer — each block is filled by a small
+        # shared bounded-block streamer — each block is filled by a small
         # GIL-releasing thread pool (store decode memcpys / cv2 restores) and handed to a
         # one-thread writer with double buffering, so decode/restore overlaps the
         # selected validated gzip backend instead of filling the whole payload first.
@@ -35018,11 +33785,11 @@ def _write_one_decomposed_nrrd_layer_payload(
                 local_z_chunk = 1
                 buffers = [np.empty((1, int(out_h), int(out_w)), dtype=np.uint8, order='C')]
 
-            # v13.3.4 (T5): checkout-cached single-thread writer pool (was one build per layer).
+            # checkout-cached single-thread writer pool (was one build per layer).
             writer_pool = _acquire_parallel_pool(1)
             pending: Optional[Future] = None
-            # v13.3.7 (B5/N4): buffers only cycle for blocks that are actually filled;
-            # known-zero blocks go through write_zeros() with no buffer at all. The counter
+            # buffers only cycle for blocks that are actually filled;
+            # known-zero blocks go through write_zeros with no buffer at all. The counter
             # (not the z index) keeps the double-buffer alternation valid across skips:
             # at most one write is outstanding, so the buffer being refilled always
             # finished its own previous write before the intervening submit happened.
@@ -35062,9 +33829,9 @@ def _write_one_decomposed_nrrd_layer_payload(
                     if pending is not None:
                         pending.result()
                     pending = writer_pool.submit(payload_writer.write, memoryview(block).cast('B'))
-                    # v13.3.3 (S4): the mirror tee reads the block on this thread while the
+                    # the mirror tee reads the block on this thread while the
                     # writer thread compresses it — both are read-only; the next refill of this
-                    # buffer is still gated on pending.result() two iterations out.
+                    # buffer is still gated on pending.result two iterations out.
                     if block_consumer is not None:
                         block_consumer(int(z0), block)
                     if pbar is not None:
@@ -35102,13 +33869,9 @@ def write_native_view_overlay_video(
     *,
     show_progress: bool = True,
 ) -> Path:
-    """Write a v12.2.0 troubleshooting overlay in a view's own slice space.
-
-    Source frames are resliced from the single-channel orthogonal processing volume only
-    for the presentation overlay. v13.3.12 D6 accepts a non-radial mask on its reduced
-    inference grid and performs the presentation-only resize one frame at a time; this does
-    not materialize an expanded mask volume.
-    """
+    """Write a troubleshooting overlay in the view's own slice space.
+    
+    Non-Radial reduced-grid masks are resized only for this presentation output."""
     mask_arr = np.asarray(native_mask_u8)
     if int(mask_arr.ndim) != 3 or int(mask_arr.shape[0]) != int(view.num_slices):
         raise ValueError(
@@ -35122,7 +33885,7 @@ def write_native_view_overlay_video(
         height=int(view.src_h),
         fps=float(fps),
     )
-    # v13.3.8 (A5): reused RGB buffer + bbox-restricted blend + memoryview pipe writes.
+    # reused RGB buffer + bbox-restricted blend + memoryview pipe writes.
     frame_buf = np.empty((int(view.src_h), int(view.src_w), 3), dtype=np.uint8)
     try:
         assert proc.stdin is not None
@@ -35159,7 +33922,7 @@ def collect_troubleshooting_overlay_futures(
     fps: float,
     show_progress: bool = False,
 ) -> Tuple[Dict[str, Path], List[Future]]:
-    """Schedule simplified v12.2.0 troubleshooting overlay MKVs."""
+    """Schedule simplified troubleshooting overlay MKVs."""
     result_paths: Dict[str, Path] = {}
     futures: List[Future] = []
     troubleshooting_dir = Path(out_dir) / 'troubleshooting'
@@ -35238,7 +34001,7 @@ def resolve_low_quality_downbin_specs(
     low_quality_requested: bool,
     source_shape_t_y_x: Tuple[int, int, int],
 ) -> Tuple[List[LowQualityDownbinSpec], List[str]]:
-    """Resolve v12.2.1 isotropic low-quality downbins in native input geometry."""
+    """Resolve isotropic low-quality downbins in native input geometry."""
     if downbin_values is None and not bool(low_quality_requested):
         return [], []
 
@@ -35301,13 +34064,13 @@ def resolve_low_quality_downbin_specs(
     return specs, warnings
 
 
-# --------------------------
-# v13.3.8 (E2): low-quality volume downbins on device
-# --------------------------
+#
+# low-quality volume downbins on device
+#
 # The two full-volume cv2 resize passes per downbin spec run at the tail while the GPUs sit
 # idle. XY downbinning is area averaging (gray) / any-coverage (mask) — adaptive average /
 # max pooling on device (identical to cv2.INTER_AREA at integer ratios, a windowed
-# mean/any at fractional ratios — the same window-boundary tolerance as the D2 mirror tee),
+# mean/any at fractional ratios — the same window-boundary tolerance as the mirror tee),
 # with the CPU path's endpoint-aligned two-slice t-lerp (gray, float32, single final round)
 # and source-range OR (mask) reproduced exactly. Chunked uploads bound VRAM; any failure
 # falls back to the unchanged CPU per-slice path (which rewrites every slice, so a partial
@@ -35326,7 +34089,7 @@ _LQ_GPU_DOWNBIN_ANNOUNCED = False
 
 
 def _try_gpu_downbin_volume(src_vol: np.ndarray, out_mm: np.ndarray, mode: str) -> bool:
-    """v13.3.8 (E2): fill ``out_mm`` from ``src_vol`` on a GPU; False -> caller's CPU path."""
+    """Fill ``out_mm`` from ``src_vol`` on a GPU; False -> caller's CPU path."""
     if not low_quality_gpu_downbin_enabled():
         return False
     in_t, in_h, in_w = (int(src_vol.shape[0]), int(src_vol.shape[1]), int(src_vol.shape[2]))
@@ -35436,7 +34199,7 @@ def resize_gray_volume_to_shape(
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
     )
-    # v13.3.8 (E2): downbin on an idle GPU when possible; the per-slice CPU path below is
+    # downbin on an idle GPU when possible; the per-slice CPU path below is
     # the unchanged fallback (it rewrites every slice, so a failed GPU pass cannot leak).
     if _try_gpu_downbin_volume(volume_gray, out_mm, 'gray'):
         flush_array(out_mm)
@@ -35498,7 +34261,7 @@ def resize_binary_mask_volume_to_shape(
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
     )
-    # v13.3.8 (E2): downbin on an idle GPU when possible; CPU fallback below is unchanged.
+    # downbin on an idle GPU when possible; CPU fallback below is unchanged.
     if _try_gpu_downbin_volume(mask_u8, out_mm, 'mask'):
         flush_array(out_mm)
         return out_mm
@@ -35547,11 +34310,7 @@ def resize_binary_mask_volume_to_shape(
 
 
 def x264_preset() -> str:
-    """v13.3.1 (R25): x264 preset for the low-quality MP4 writers.
-
-    'slow' cost 2-4x the encode CPU of 'medium' for marginal size gain on these
-    distribution-quality copies, competing with the NRRD tail for cores.
-    """
+    """Return the low-quality MP4 x264 preset; the default balances size and CPU cost."""
     preset = os.environ.get('YOLO_TTA_X264_PRESET', '').strip().lower()
     return preset or 'medium'
 
@@ -35597,7 +34356,7 @@ def write_low_quality_overlay_video(
     )
     try:
         proc = ffmpeg_h264_rgb_writer(stage_path, int(w_dim), int(h_dim), float(fps))
-        # v13.3.8 (A5): reused RGB buffer + bbox-restricted blend + memoryview pipe writes.
+        # reused RGB buffer + bbox-restricted blend + memoryview pipe writes.
         frame_buf = np.empty((int(h_dim), int(w_dim), 3), dtype=np.uint8)
         try:
             assert proc.stdin is not None
@@ -35633,7 +34392,7 @@ def write_low_quality_binary_video(
     )
     try:
         proc = ffmpeg_h264_gray_writer(stage_path, int(w_dim), int(h_dim), float(fps))
-        # v13.3.8 (A5): reused frame buffer + memoryview pipe writes; the mask volumes are
+        # reused frame buffer + memoryview pipe writes; the mask volumes are
         # 0/1, so multiply-by-255 into the buffer replaces compare+cast temporaries.
         frame_buf = np.empty((int(h_dim), int(w_dim)), dtype=np.uint8)
         try:
@@ -35675,14 +34434,12 @@ def save_single_low_quality_output(
     workers: int = 1,
     show_progress: bool = True,
 ) -> Dict[str, Path]:
-    """Write one low-quality downbin's overlay and binary videos, overlapped.
+    """Write one low-quality downbin's overlay and binary videos concurrently.
 
-    v13.2.1: the low-quality NRRD is no longer written here as one combined volume.  When
-    ``--save_nrrd`` is active the low-quality decomposition now follows the full-quality format and
-    schedule -- one single-layer NRRD per component layer, downbinned and written by the
-    NrrdLayerSink as each view completes (see NrrdLayerSink.submit_layer).  ``save_nrrd`` is retained
-    for call-site compatibility but no longer drives any NRRD write in this function.
+    NRRD layers are emitted separately by ``NrrdLayerSink``; ``save_nrrd`` is a
+    compatibility-only parameter.
     """
+    # DEAD PARAMETER: save_nrrd is retained for call-site compatibility; NRRDs use NrrdLayerSink.
     low_root = Path(out_dir) / 'low_quality'
     low_root.mkdir(parents=True, exist_ok=True)
     source_t = max(1, int(mask_u8.shape[0]))
@@ -35735,7 +34492,7 @@ def save_single_low_quality_output(
                 publication_root=out_dir,
             )
 
-        # v13.2.1: the low-quality NRRD decomposition is produced per component layer by the
+        # the low-quality NRRD decomposition is produced per component layer by the
         # NrrdLayerSink as views complete, not here. Only the distribution videos are written below.
         writer_thunks = [_write_lq_overlay, _write_lq_binary]
 
@@ -35805,15 +34562,12 @@ def planned_low_quality_output_paths(
     downbin_specs: Sequence[LowQualityDownbinSpec],
     save_nrrd: bool = False,
 ) -> Dict[str, Path]:
-    """Return the paths that the per-bin low-quality writers (save_single_low_quality_output) will create.
+    """Return paths for per-bin low-quality video writers.
 
-    This lets the background output manager launch the low-quality distribution videos at the
-    same time as the full-size outputs instead of waiting for the full-size output group to finish.
-
-    v13.2.1: low-quality NRRDs are no longer planned here; they are emitted per component layer by
-    the NrrdLayerSink under low_quality/<token>/nrrd/ on the view-completion schedule. ``save_nrrd``
-    is retained for call-site compatibility.
+    NRRD paths are managed by ``NrrdLayerSink``; ``save_nrrd`` is a
+    compatibility-only parameter.
     """
+    # DEAD PARAMETER: save_nrrd is retained for the shared low-quality output API.
     low_root = out_dir / 'low_quality'
     result_paths: Dict[str, Path] = {'low_quality_dir': low_root}
     for spec in downbin_specs:
@@ -35883,6 +34637,7 @@ class BackgroundOutputManager:
 
 
 def collect_pipeline_output_futures(
+    # DEAD PARAMETER: save_nrrd_flag, nrrd_layer_refs, and nrrd_workers are retained for call-site compatibility.
     executor: ThreadPoolExecutor,
     *,
     volume_rgb: np.memmap,
@@ -35942,11 +34697,10 @@ def collect_pipeline_output_futures(
         result_paths["binary_tiff_dir"] = binary_pattern.parent
         result_paths["binary_video"] = binary_video_path
 
-    # v13.2.0: --save_nrrd no longer assembles one mega 4D decomposed NRRD here. Each component
-    # layer is written as its own single-layer NRRD by the NrrdLayerSink during the intermediate
-    # pipeline steps (and the Global_final_output layer is materialized in the tail), so this
-    # background output group has no NRRD work. The unused save_nrrd_flag / nrrd_* parameters are
-    # retained for call-site stability.
+    # DEAD COMMENT BEGIN: retained to document the compatibility-only NRRD parameters.
+    # NRRD layers are owned by NrrdLayerSink, so this background output group has no NRRD work.
+    # ``save_nrrd_flag`` and the ``nrrd_*`` arguments remain only for call-site stability.
+    # DEAD COMMENT END
 
     return result_paths, futures
 
@@ -36137,9 +34891,9 @@ def write_summary_file(
     return out_path
 
 
-# --------------------------
+#
 # Main
-# --------------------------
+#
 
 
 def main() -> None:
@@ -36161,14 +34915,14 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('GPT-5.6-Sol-Pro v16.0.3 accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.0.4 accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
     model_paths = [model_path_resolved]
     model_name = Path(model_paths[0]).stem
 
-    # Resolve the complete v16 view request before model loading or volume decode. With no
+    # Resolve the complete view request before model loading or volume decode. With no
     # implicit Cartesian/Tilted/Radial defaults, a missing or self-disabling view request must
     # fail immediately rather than decode a multi-terabyte logical run and discover it later.
     angles = _parse_angles(args.angle) or [0.0, 120.0, 240.0]
@@ -36234,7 +34988,7 @@ def main() -> None:
             '--enable_radial target requires the matching --enable_tilted base.'
         )
 
-    # Resolve v14 post-union behavior before starting the background model loader.
+    # Resolve post-union behavior before starting the background model loader.
     # Invalid settings therefore cannot leave a heavyweight loader thread running.
     if int(args.centerline_filter_passes) < 0:
         raise ValueError('--centerline_filter_passes must be >= 0; use 0 to disable')
@@ -36246,23 +35000,12 @@ def main() -> None:
         raise ValueError('--centerline_surface_max_dim must be >= 64')
     if int(args.centerline_surface_points) < 1000:
         raise ValueError('--centerline_surface_points must be >= 1000')
-    if float(args.centerline_vmtk_timeout) <= 0.0:
-        raise ValueError('--centerline_vmtk_timeout must be > 0')
+    if float(args.centerline_timeout) <= 0.0:
+        raise ValueError('--centerline_timeout must be > 0')
     centerline_filter_enabled = bool(
         int(args.centerline_filter_passes) > 0
         and str(args.centerline_filter_backend).strip().lower() != 'off'
     )
-    if (
-        centerline_filter_enabled
-        and str(args.centerline_filter_backend).strip().lower() == 'vmtk'
-        and not _v14_vmtk_modules_available()
-    ):
-        print(
-            'Warning: --centerline_filter_backend vmtk was requested but VTK/VMTK '
-            'is not importable. The pipeline will still run, preserve pass 0, skip '
-            'the filter pass, and make no automatic removals.'
-        )
-
     # Resolve process-local inference topology before considering a parent model load.
     # Every CUDA device is served by its own persistent worker process, including one-GPU runs.
     inference_devices = parse_device_list(args.device)
@@ -36283,9 +35026,9 @@ def main() -> None:
         )
 
     # Validate logical CUDA indices and resolve retina-mask placement before decode begins.
-    # v13.2.2 bug #13 follow-up: --device uses torch LOGICAL indices into any inherited
+    # device uses torch LOGICAL indices into any inherited
     # CUDA_VISIBLE_DEVICES list. Validate BEFORE decode/model-load work so a submit script
-    # still using the accidental v13.2.1 physical-id convention (e.g. --device 2,3 under
+    # still using the accidental physical-id convention (e.g. --device 2,3 under
     # CUDA_VISIBLE_DEVICES=2,3) fails immediately with the correction instead of hours in.
     _inherited_cvd = os.environ.get('CUDA_VISIBLE_DEVICES')
     if _inherited_cvd is not None and gpu_device_count > 0:
@@ -36306,14 +35049,14 @@ def main() -> None:
         args.retina_mask_processor, inference_devices
     )
     set_retina_mask_processor(retina_processor)
-    # v13.1.0 (#2.3): single-angle + gpu-retina fast path. When exactly one --angle is used and retina
+    # single-angle + gpu-retina fast path. When exactly one --angle is used and retina
     # masks are resolved on the GPU, the per-frame radius cleanup runs on the GPU: instances below
-    # --min_conf are dropped before the union/flatten, the union+confidence planes are warped to
+    # min_conf are dropped before the union/flatten, the union+confidence planes are warped to
     # view-native space on the GPU, and positive --min_radius runs with CuPy. Hole filling is a
     # completed-view or eligible task-end operation. Only the finished view-native plane crosses
     # PCIe. None disables the fast path (e.g. multi-angle, where the
     # full union and cross-angle max-confidence must be preserved before --min_conf is applied at the
-    # volume level); multi-angle gpu runs still get the on-GPU flatten + warp (#2.2).
+    # volume level); multi-angle gpu runs still get the on-GPU flatten + warp.
     single_angle_gpu_fastpath_active = bool(
         single_angle_streaming_cleanup_active and str(retina_processor).strip().lower() == 'gpu'
     )
@@ -36394,19 +35137,19 @@ def main() -> None:
     if not (-90.0 < float(args.interpolation_search_angle) < 90.0):
         raise ValueError('--interpolation_search_angle must be greater than -90 and less than 90')
     low_quality_requested = bool(args.save_low_quality or args.save_low_quality_downbin is not None)
-    # v13.2.0 (#2.6): NRRD component layers are produced only for --save_nrrd, so requesting only
+    # NRRD component layers are produced only for --save_nrrd, so requesting only
     # low-quality outputs writes the low-quality videos but no NRRD output.
-    # v13.2.1 (bug #2): when both --save_nrrd and a low-quality request are active, the low-quality
+    # when both --save_nrrd and a low-quality request are active, the low-quality
     # NRRD decomposition mirrors the full-quality layers (one downbinned single-layer NRRD per
     # component layer) on the same view-completion schedule, rather than one combined tail volume.
     # Keep these booleans separate. ``nrrd_layers_needed`` controls the established,
-    # expensive per-view decomposition and G5 projected-layer behavior. v14 audit-only
+    # expensive per-view decomposition and projected-layer behavior. audit-only
     # runs need a sink but must not broaden any of those paths.
     nrrd_layers_needed = bool(args.save_nrrd)
     centerline_audit_nrrd_needed = bool(centerline_filter_enabled)
     nrrd_sink_needed = bool(nrrd_layers_needed or centerline_audit_nrrd_needed)
     troubleshooting_outputs_enabled = bool(args.troubleshooting)
-    # v12.2.0 --troubleshooting creates overlay MKVs only. Temporary scratch retention is a
+    # troubleshooting creates overlay MKVs only. Temporary scratch retention is a
     # separate hidden maintenance escape hatch so troubleshooting no longer changes cleanup semantics.
     keep_temp_artifacts = bool(_env_flag('YOLO_TTA_KEEP_TEMP', False))
 
@@ -36415,7 +35158,7 @@ def main() -> None:
 
     temp_dir = choose_scratch_dir(args.temp, out_dir, input_path.stem)
     expose_scratch_in_output(out_dir, temp_dir)
-    # T10: say which kind of scratch this is. Memory-backed scratch is what takes the shared
+    # say which kind of scratch this is. Memory-backed scratch is what takes the shared
     # tile canvas (and the shared source volume, which is allocated under the same root) off
     # the filesystem entirely; disk-backed scratch is the safe default.
     print(
@@ -36448,15 +35191,15 @@ def main() -> None:
         (input_T, input_H, input_W),
     )
 
-    # v13.2.0: --save_nrrd writes one single-layer NRRD per component layer (in source output
+    # --save_nrrd writes one single-layer NRRD per component layer (in source output
     # geometry X,Y,t) as the layers are produced during the intermediate pipeline steps. The sink
     # is configured here (output geometry is now known) and torn down in the tail after the final
     # global layers are materialized.
-    # v13.2.1: when --save_low_quality is also active, the sink mirrors every component layer into
-    # one downbinned single-layer NRRD per spec under low_quality/<token>/nrrd/, on the same
+    # when --save_low_quality is also active, the sink mirrors every component layer into
+    # one downbinned single-layer NRRD per spec under low_quality/<token>/nrrd/ on the same
     # view-completion schedule as the full-quality layers (the tail no longer writes a combined
     # low-quality NRRD).
-    # v13.2.4 (task #1, ruling A1): record the final source output geometry so radial/tilted
+    # record the final source output geometry so radial/tilted
     # NRRD layer projections and the final backprojection queue target it directly (one resample).
     set_final_source_output_shape((input_T, input_H, input_W))
 
@@ -36490,7 +35233,7 @@ def main() -> None:
     processing_mode = processing_volume_mode()
     cube_resize_will_apply = bool(should_resize_to_processing_cube(input_processing_shape, legacy_cube_shape))
     # CUDA workers open the shared source volume as a file. Without a cube resize that
-    # file is the decode target itself; v13.3.8 (E1) extends the same rule to cube runs so
+    # file is the decode target itself; extends the same rule to cube runs so
     # workers can resident-upload the NATIVE decoded volume (t-resizing on device) without
     # a copy pass first.
     decode_prefer_memory = not (
@@ -36667,8 +35410,8 @@ def main() -> None:
     inference_views = list(views)
     interpolating_views = [v for v in inference_views if _view_uses_interpolation(v, int(args.interpolate))]
 
-    # v16.0.3 regression observability: a tilted_* Radial token expands to every concrete
-    # signed/directional Tilted variant of that base.  Print the concrete work instead of
+    # regression observability: a tilted_* Radial token expands to every concrete
+    # signed/directional Tilted variant of that base. Print the concrete work instead of
     # leaving a six-token CLI looking like six similarly sized views.
     radial_concrete_views = [v for v in inference_views if is_radial_view(v)]
     tilted_radial_concrete_views = [v for v in radial_concrete_views if is_tilted_radial_view(v)]
@@ -36686,7 +35429,7 @@ def main() -> None:
         for token, count in radial_expansion_counts.items()
     ) or 'none'
     print(
-        'v16.0.3 concrete view workload: '
+        'v16.0.4 concrete view workload: '
         f'{len(inference_views)} view(s) = {len(cartesian_views)} Cartesian + '
         f'{len(upright_tilted_views)} Tilted + {len(upright_radial_concrete_views)} upright Radial + '
         f'{len(tilted_radial_concrete_views)} tilted-Radial; '
@@ -36701,19 +35444,19 @@ def main() -> None:
         )
     if tilted_radial_concrete_views:
         print(
-            'v16.0.3 tilted-Radial resident CUDA rendering is enabled '
+            'v16.0.4 tilted-Radial resident CUDA rendering is enabled '
             '(YOLO_TTA_GPU_TILTED_RADIAL_RENDER=0 restores the v16.0.2 CPU fallback). '
             'A worker that cannot admit the source volume to VRAM will still use the completed-cube CPU path.'
         )
     spec_notes: List[str] = []
     if tilted_radial_concrete_views:
         spec_notes.append(
-            'v16.0.3 regression fix: concrete tilted-Radial views use the resident CUDA source '
+            'v16.0.4 regression fix: concrete tilted-Radial views use the resident CUDA source '
             'renderer and persistent batch-1 TensorRT ring instead of silently materializing the '
             'deferred host cube and running the 36-tap/sheared frame renderer on the CPU. '
             'YOLO_TTA_GPU_TILTED_RADIAL_RENDER=0 restores the v16.0.2 compatibility path.'
         )
-    # v13.1.0 spec<->implementation conflict notes (see header docstring and suggested spec edits).
+    # spec<->implementation conflict notes (see header docstring and suggested spec edits).
     spec_notes.append(
         'CONFLICT NOTE 1 (--min_radius): the task says --min_radius is now applied per view in each '
         'prediction set\'s own native 2D slice plane before backprojection. Spec flag #8 and item 5 '
@@ -36927,7 +35670,7 @@ def main() -> None:
         'with the 3D Slicer segmentation header fields — segment named after the file, deterministic per-layer '
         'palette color). Layer families: full-frame '
         'YOLO masks, full-frame interpolation bridges per pass, tiled masks accepted by parent YOLO masks, tiled '
-        'masks accepted by parent bridges, consolidated tile bridges per pass, Global_union_presmoothing, '
+        'masks accepted by parent bridges, consolidated tile bridges per pass, optional Global_union_presmoothing, '
         'Global_smoothing_pass<N>, and Global_final_output. Each layer is restored to source output geometry while '
         'streaming, gzip-compressed by the selected validated backend, and written by a background sink as the layer is produced '
         'during the intermediate pipeline steps (so the Transverse layer compresses while Tiled Transverse is still '
@@ -37159,9 +35902,9 @@ def main() -> None:
         _env_int('YOLO_TTA_TILE_INTERPOLATION_TASK_WORKERS', tile_interpolation_task_workers_default),
     )
 
-    # v13.3.3: default raised from min(2, ...) — 11 views queued behind 2 process GILs was the
-    # dominant wall-clock tail. Each child allocates its own pass workspace (memory-gated with a
-    # disk-backed fallback), so the cap trades RAM headroom for parallel interpolation GILs.
+    # Interpolation workers provide independent Python interpreters for GIL-heavy planning.
+    # Each child has a separately admitted pass workspace, so the cap balances CPU parallelism
+    # against anonymous-memory headroom and the disk-backed fallback.
     interpolation_process_workers_default = max(
         1,
         min(
@@ -37287,9 +36030,9 @@ def main() -> None:
         set_interpolation_process_executor(None, 0)
 
     dense_tiling_active = len(tile_configs) > 0
-    # T3/T4/T9: fuse every tile of one (view, angle, tile configuration) into slice-chunked
+    # fuse every tile of one (view, angle, tile configuration) into slice-chunked
     # GROUP tasks. A group renders each native plane once and shares it across all its tiles,
-    # keeps only the tiles' parent-grid crops (T1), and ORs them straight into the shared
+    # keeps only the tiles' parent-grid crops, and ORs them straight into the shared
     # configuration canvas -- no per-tile result file, no scheduler-side re-read. Requires the
     # CUDA worker path; CPU/MPS retains the per-tile fallback flow.
     tile_group_dispatch_active = bool(
@@ -37405,19 +36148,19 @@ def main() -> None:
     baseline_confmap_paths: Dict[Tuple[str, str], Optional[Path]] = {}
     baseline_slice_locks_by_model_view: Dict[Tuple[str, str], List[threading.Lock]] = {}
     fullframe_remaining: Dict[Tuple[str, str], int] = {}
-    # v13.3.3 (S2): slices per (model, view) hole-filled on device by the GPU workers; when the
+    # slices per (model, view) hole-filled on device by the GPU workers; when the
     # sum reaches the view's slice count, the CPU per-view "2D hole fill" pass is skipped.
     view_device_hole_filled_slices: Dict[Tuple[str, str], int] = {}
-    # v13.3.6 (D1): per-(model, view) aggregation of the workers' device-union slice metadata
+    # per-(model, view) aggregation of the workers' device-union slice metadata
     # (any flags / bboxes / bit-packed row occupancy). A single task without metadata marks the
     # whole view invalid, and every downstream consumer falls back to scanning.
     view_slice_meta: Dict[Tuple[str, str], Dict[str, object]] = {}
 
     for view in inference_views:
         for model_name, _ in yolo_models:
-            # v12.2.11 lazy allocation: do not zero every full-view accumulator before the
-            # first prediction.  On 20+ view runs those eager zeros can touch hundreds of GiB
-            # and dominate time-to-first-prediction.  Allocate a view's union/confidence
+            # lazy allocation: do not zero every full-view accumulator before the
+            # first prediction. On 20+ view runs those eager zeros can touch hundreds of GiB
+            # and dominate time-to-first-prediction. Allocate a view's union/confidence
             # workspaces only when its first full-frame prediction is about to run.
             fullframe_remaining[(model_name, view.name)] = int(len(aug_jobs_by_view[view.name]))
 
@@ -37475,8 +36218,8 @@ def main() -> None:
     per_prediction_volume_workers = int(prediction_render_workers) if bool(streaming_sources_active) else int(legacy_per_prediction_volume_workers)
     async_prediction_accumulation_active = bool(async_predict_postprocess_enabled())
     async_prediction_multiview_locking_active = bool(len(angles) > 1 and async_prediction_accumulation_active)
-    # Queue slots are unbounded by default in v13, so do not size the lightweight join
-    # executor from the total source count.  The join tasks mostly wait on result futures;
+    # Queue slots are unbounded by default in, so do not size the lightweight join
+    # executor from the total source count. The join tasks mostly wait on result futures;
     # a CPU-count-sized pool is enough to overlap drains without spawning thousands of threads.
     async_prediction_join_worker_count = async_predict_join_workers(max(2, min(max(1, _cpu_count()), int(worker_budget))))
     default_async_result_workers = max(1, int(predict_postprocess_workers))
@@ -37552,7 +36295,7 @@ def main() -> None:
     prediction_volume_futures: Dict[Future, Tuple[str, ViewInfo, object]] = {}
     pending_prediction_volume_futures: set[Future] = set()
     ready_fullframe: deque[Tuple[ViewInfo, AugJob, PredictionVolumeRef]] = deque()
-    # T11: the ref is Optional because with several models only the first entry for a tile
+    # the ref is Optional because with several models only the first entry for a tile
     # carries the source that was already built; the rest build their own at pop time.
     ready_tile_infer: deque[Tuple[str, ViewInfo, DenseTileJob, Optional[PredictionVolumeRef]]] = deque()
     tile_inference_done: set[Tuple[str, str, str]] = set()
@@ -37568,10 +36311,10 @@ def main() -> None:
     tile_consolidation_futures: Dict[Future, Tuple[str, str]] = {}
     tile_config_accumulator_by_key: Dict[Tuple[str, str, str], np.ndarray] = {}
     tile_config_accumulator_paths: Dict[Tuple[str, str, str], Path] = {}
-    # T8: one lock per slice class instead of one lock per canvas, so independent tiles can
+    # one lock per slice class instead of one lock per canvas, so independent tiles can
     # stage into the same configuration canvas concurrently.
     tile_config_accumulator_locks: Dict[Tuple[str, str, str], List[threading.Lock]] = {}
-    # T3/T4/T9: tile jobs deferred until their parent view's support exists, the tile-group
+    # tile jobs deferred until their parent view's support exists, the tile-group
     # tasks built from them, and the per-(model, view) build bookkeeping.
     deferred_tile_jobs_by_parent: Dict[Tuple[str, str], List[DenseTileJob]] = {}
     tile_groups_built_for_parent: set[Tuple[str, str]] = set()
@@ -37583,7 +36326,7 @@ def main() -> None:
     tile_accumulator_paths: Dict[Tuple[str, str], Path] = {}
     tile_parent_mask_accumulator_by_parent: Dict[Tuple[str, str], np.ndarray] = {}
     tile_parent_bridge_accumulator_by_parent: Dict[Tuple[str, str], np.ndarray] = {}
-    # T14: gates now OR their category masks straight into these accumulators, so each one
+    # gates now OR their category masks straight into these accumulators, so each one
     # needs the same z-band lock sharding the config canvases use.
     tile_category_accumulator_locks: Dict[Tuple[str, str, str], List[threading.Lock]] = {}
     tile_completed_by_parent_config: Dict[Tuple[str, str, str], set[str]] = {}
@@ -37724,7 +36467,7 @@ def main() -> None:
                 seen.add(rid)
                 count += 1
         for _model_name, _view, _tile_job, ref in list(ready_tile_infer):
-            if ref is None:  # T11: a queued tile whose source is not built yet
+            if ref is None:  # a queued tile whose source is not built yet
                 continue
             rid = id(ref)
             if rid not in seen and _prediction_ref_has_gpu_input_staging(ref):
@@ -37752,7 +36495,7 @@ def main() -> None:
                 seen.add(rid)
                 count += 1
         for _model_name, _view, _tile_job, ref in list(ready_tile_infer):
-            if ref is None:  # T11: a queued tile whose source is not built yet
+            if ref is None:  # a queued tile whose source is not built yet
                 continue
             rid = id(ref)
             if rid in seen:
@@ -37790,7 +36533,7 @@ def main() -> None:
             if _queued_cpu_warmup_ref_count() >= int(queued_streaming_cpu_warmup_sources):
                 return
         for _model_name, _view, _tile_job, ref in list(ready_tile_infer):
-            if ref is None:  # T11: a queued tile whose source is not built yet
+            if ref is None:  # a queued tile whose source is not built yet
                 continue
             _maybe_start_cpu_warmup_prediction_ref(ref)
             if _queued_cpu_warmup_ref_count() >= int(queued_streaming_cpu_warmup_sources):
@@ -37808,8 +36551,8 @@ def main() -> None:
                 ready_fullframe.append((view, job_obj, pred_ref))
             else:
                 assert isinstance(job_obj, DenseTileJob)
-                # T11: StreamingYoloVolumeSource is single-use — __next__ close()s it on
-                # exhaustion and start() then raises — and the in-process tile path also
+                # StreamingYoloVolumeSource is single-use — __next__ closes it on
+                # exhaustion and start then raises — and the in-process tile path also
                 # closes the ref in its finally. Queueing the SAME ref once per model
                 # therefore handed every model after the first a closed source. Each model
                 # now gets its own, built lazily at pop time so N models do not spin up N
@@ -37832,13 +36575,13 @@ def main() -> None:
         confmap_path = temp_dir / 'union' / str(model_name) / f'{view.name}.confmap.u8.dat'
         union_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # v13.2.5 (speed #4): views that will be interpolated allocate their baseline union
+        # views that will be interpolated allocate their baseline union
         # DIRECTLY as a disk memmap at union_path. The interpolation process backend can then
         # reopen the volume by path with ZERO copy (_ensure_process_backed_interpolation_volume
         # detects the backing file), eliminating the old full-volume RAM->disk handoff copy per
         # view per pass; page cache keeps reads/writes at RAM speed. Non-interpolating views
         # keep the anonymous-RAM preference.
-        # v13.3.1 (R4): direct union writes require file-backed workspaces the workers can open.
+        # direct union writes require file-backed workspaces the workers can open.
         union_prefer_memory = not (
             (
                 interpolation_process_backend_enabled()
@@ -37879,12 +36622,12 @@ def main() -> None:
         union_path = baseline_union_paths.pop(key)
         confmap_path = baseline_confmap_paths.pop(key)
         baseline_slice_locks_by_model_view.pop(key, None)
-        # v13.3.3 (S2): every slice of this view already hole-filled on device by the GPU
+        # every slice of this view already hole-filled on device by the GPU
         # workers -> the CPU "2D hole fill (<view>)" pass is a no-op recompute; skip it.
         hole_fill_done_on_device = bool(
             int(view_device_hole_filled_slices.get(key, 0)) >= int(view.num_slices)
         )
-        # v13.3.6 (D1): hand the aggregated device-union slice metadata to the view prepare
+        # hand the aggregated device-union slice metadata to the view prepare
         # (None when any task lacked it — consumers fall back to scanning).
         slice_meta_holder = view_slice_meta.pop(key, None)
         if slice_meta_holder is not None and not bool(slice_meta_holder.get('valid', False)):
@@ -37952,7 +36695,7 @@ def main() -> None:
             dtype=np.uint8,
             path=acc_path,
             desc=f'{model_name}/{view_name} tile configuration {config_id} raw canvas',
-            # T4: tile groups OR straight into this canvas from the GPU worker processes, so
+            # tile groups OR straight into this canvas from the GPU worker processes, so
             # it must be a file mapping they can open 'r+'. (Point YOLO_TTA_SCRATCH_DIR at a
             # shm/tmpfs mount to keep it in RAM; flush_array is a no-op by default, so the
             # page cache already makes worker writes visible to this process.)
@@ -38297,7 +37040,7 @@ def main() -> None:
                     tilted_native_output_by_model[result.model_name][result.view_name] = result.final_view_volume_mm
                 else:
                     view_volumes_by_model[result.model_name][result.view_name] = result.final_view_volume_mm
-            # T9: this view's support is now frozen, so its deferred tiles can be filtered
+            # this view's support is now frozen, so its deferred tiles can be filtered
             # against it and dispatched. Must run BEFORE the config-gate check below, or a
             # configuration whose tiles are all dropped would gate against an empty canvas
             # before its (still unbuilt) tiles were accounted for.
@@ -38342,7 +37085,7 @@ def main() -> None:
             interpolation_stats.extend(result.interpolation_stats)
             nrrd_layer_refs.extend(result.nrrd_layers)
 
-            # v13.2.2 bug #14: the interpolation process backend may have rebound the
+            # the interpolation process backend may have rebound the
             # consolidated accumulator to a fresh disk memmap that received the
             # interpolation bridge voxels. Re-point the registry (used below for
             # keep_temp archiving and later for troubleshooting overlays) at that final
@@ -38415,9 +37158,9 @@ def main() -> None:
             f'ready_fullframe={len(ready_fullframe)}, ready_tiles={len(ready_tile_infer)}'
         )
 
-    # --------------------------------------------------------------
+    #
     # Process-per-GPU scheduler. This path is active for every CUDA run, including one GPU.
-    # --------------------------------------------------------------
+    #
     gpu_worker_processes: List[object] = []
     gpu_task_queue: object = None
     gpu_result_queue: object = None
@@ -38470,7 +37213,7 @@ def main() -> None:
                 continue
             parent_key = _gpu_worker_fullframe_parent_key(task)
             remaining = int(fullframe_remaining.get(parent_key, 2 ** 31 - 1)) if parent_key is not None else 2 ** 31 - 1
-            # Preserve the lease most likely to unlock parent postprocessing.  In
+            # Preserve the lease most likely to unlock parent postprocessing. In
             # particular, splitting preferred_parent here would turn its sole
             # pending lease into two and make _pop_gpu_worker_pending_task_id skip it.
             eligible.append((
@@ -38556,7 +37299,7 @@ def main() -> None:
     def _dispatch_gpu_worker_inference_window(
         preferred_parent: Optional[Tuple[str, str]] = None,
     ) -> None:
-        """C11: issue a bounded window, adapting only its actual inference tail."""
+        """Issue a bounded window, adapting only its actual inference tail."""
         nonlocal gpu_worker_dispatched_tasks
         if gpu_task_queue is None:
             return
@@ -38582,7 +37325,7 @@ def main() -> None:
         if backing is not None:
             flush_array(volume_rgb)
             return str(backing), shape, str(np.asarray(volume_rgb).dtype)
-        # T10: both this copy and the decode target it usually replaces live under the scratch
+        # both this copy and the decode target it usually replaces live under the scratch
         # root, so a memory-backed scratch dir puts the shared source volume in RAM with the
         # tile canvases — one set of physical pages mapped by all GPU workers, no filesystem.
         shared_path = temp_dir / 'gpu_worker_source_volume.gray8.dat'
@@ -38620,18 +37363,18 @@ def main() -> None:
                 'YOLO_TTA_MGPU_WORKER_CV2_THREADS',
                 1,
             )),
-            # v13.1.0 (#2.3): single-angle GPU fast-path (min_conf None when inactive) + min_radius.
+            # single-angle GPU fast-path (min_conf None when inactive) + min_radius.
             'single_angle_gpu_fastpath_min_conf': single_angle_gpu_fastpath_min_conf_value,
             'single_angle_gpu_fastpath_min_radius': single_angle_gpu_fastpath_min_radius_value,
         }
         # Torch LOGICAL indices (positions within any inherited CUDA_VISIBLE_DEVICES list);
-        # validated against the inherited list early in main(), and each worker resolves
+        # validated against the inherited list early in main, and each worker resolves
         # its physical pin via _pin_cuda_visible_device_token.
         gpu_logical_indices = [int(str(d).split(':')[-1]) for d in inference_devices]
         pinned_tokens = [
             _pin_cuda_visible_device_token(int(idx)) for idx in gpu_logical_indices
         ]
-        # v13.3.5 (N1): discovery-driven GPU-worker -> NUMA-node CPU pin plan (None entries
+        # discovery-driven GPU-worker -> NUMA-node CPU pin plan (None entries
         # stay unpinned). Computed from the PHYSICAL tokens before CUDA_VISIBLE_DEVICES is
         # narrowed inside the workers.
         worker_numa_plan = plan_gpu_worker_affinity(pinned_tokens)
@@ -38654,14 +37397,14 @@ def main() -> None:
             rank = overlap_positions.index(int(worker_pos))
             worker_cpu_budgets.append(max(1, int(q) + (1 if int(rank) < int(r) else 0)))
 
-        # v13.2.5 (speed #8): spawn the worker processes BEFORE blocking on decode/cube-resize
-        # completion — workers idle in task_queue.get() while their CUDA context + model load
+        # spawn the worker processes BEFORE blocking on decode/cube-resize
+        # completion — workers idle in task_queue.get while their CUDA context + model load
         # (~30-90 s each) overlaps the decode instead of running strictly after it. Tasks are
         # enqueued below once the shared source volume is ready.
         mp_ctx = mp.get_context('spawn')
         gpu_task_queue = mp_ctx.Queue()
         gpu_result_queue = mp_ctx.Queue()
-        # T4: tiles within one configuration overlap, so two workers can OR the same canvas
+        # tiles within one configuration overlap, so two workers can OR the same canvas
         # byte concurrently. These inherited locks give each canvas z band a mutual-exclusion
         # class; a given z always maps to the same lock in every process.
         canvas_zband_locks = (
@@ -38692,13 +37435,13 @@ def main() -> None:
             f'(pinned to CUDA_VISIBLE_DEVICES tokens {pinned_tokens}); {startup_overlap_note}; '
             f'per-worker CPU workers={worker_cpu_budgets}, cv2 threads=1. Tasks enqueue once the source volume is ready.'
         )
-        # v13.3.4 (T4): the warm workers double as interpolation hosts once inference drains.
+        # the warm workers double as interpolation hosts once inference drains.
         if gpu_worker_aux_interpolation_enabled() and bool(interpolation_process_backend_active):
             set_gpu_worker_aux_interpolation_pool(
                 _GpuWorkerAuxInterpolationPool(gpu_task_queue, len(gpu_worker_processes))
             )
 
-        # v13.3.8 (E1): when the cube resize applies and both volumes are file-backed,
+        # when the cube resize applies and both volumes are file-backed,
         # enqueue against the cube PATH without waiting for its content — workers go
         # resident straight from the NATIVE decoded volume (device t-resize), and a
         # sentinel written after wait_for_volume_ready+flush gates the file-backed
@@ -38707,7 +37450,7 @@ def main() -> None:
         native_resize_task_spec: Optional[Dict[str, object]] = None
         source_volume_ready_async = False
         native_shape_now = tuple(int(x) for x in np.asarray(input_volume_rgb).shape)
-        # C10 metadata access must not invoke LazyProcessingCube.__array__.
+        # metadata access must not invoke LazyProcessingCube.__array__.
         working_shape_now = tuple(int(x) for x in volume_rgb.shape)
         native_t_only_resize = bool(
             native_shape_now[1:] == working_shape_now[1:]
@@ -38788,7 +37531,7 @@ def main() -> None:
             512,
         ))
         prefetch_frames = streaming_prediction_source_prefetch_frames(max(1, int(args.batch)))
-        # v13.3.3 (S2): per-task device-side 2D hole fill is valid only when the spec steps that
+        # per-task device-side 2D hole fill is valid only when the spec steps that
         # precede hole fill (--min_conf, --min_radius) have no work, results stream through the
         # single-angle cleanup path, and the task writes a disjoint direct-union window.
         gpu_worker_device_hole_fill = bool(
@@ -38808,7 +37551,7 @@ def main() -> None:
                 m_out = np.asarray(aug_job.aff.M_out_to_src, dtype=np.float32)
                 out_size = int(aug_job.aff.out_size)
                 job_id = str(aug_job.aug_id)
-                # C11 construction keeps every profiled steady-state lease untouched.
+                # construction keeps every profiled steady-state lease untouched.
                 # A still-central lease may split later, only when dispatch reaches the
                 # actual global inference tail; tiles are never split.
                 ranges = gpu_worker_fullframe_task_ranges(
@@ -38818,11 +37561,11 @@ def main() -> None:
                 fullframe_subtasks_per_view[key_fv] = int(fullframe_subtasks_per_view.get(key_fv, 0)) + len(ranges)
                 prefix = f'{view.name}__{job_id}'
                 if gpu_worker_direct_union_active:
-                    # v13.3.1 (R4): pre-create the shared per-view union (and confmap) so every
+                    # pre-create the shared per-view union (and confmap) so every
                     # worker task can open it 'r+' and write its disjoint slice window directly.
                     _ensure_baseline_workspaces(str(model_name), view)
             elif tile_group_dispatch_active:
-                # T9: defer this tile until its parent view's support exists. Full frames are
+                # defer this tile until its parent view's support exists. Full frames are
                 # dispatched first, and the completed parent support then decides which tiles
                 # (and which slice ranges of them) can contribute at all. Enqueueing tiles here
                 # would commit the run to inferencing every tile over every slice up front.
@@ -38850,7 +37593,7 @@ def main() -> None:
                 # N-times-too-large render pool). With cv2.setNumThreads(1) these are real render threads.
                 render_workers = max(1, min(int(per_worker_workers), int(count)))
                 if str(kind) == 'fullframe' and gpu_worker_direct_union_active:
-                    # v13.3.1 (R4): the "result" paths are the shared per-view union files.
+                    # the "result" paths are the shared per-view union files.
                     key_direct = (str(model_name), str(view.name))
                     rmask = baseline_union_paths[key_direct]
                     rconf = baseline_confmap_paths.get(key_direct)
@@ -38869,7 +37612,7 @@ def main() -> None:
                     'slice_start': int(s0), 'slice_count': int(count),
                     'source_volume_path': source_volume_path, 'source_shape': list(source_volume_shape),
                     'source_dtype': source_volume_dtype,
-                    # v13.3.8 (E1): native-volume residency spec + cube-ready sentinel
+                    # native-volume residency spec + cube-ready sentinel
                     # (None when the cube gated enqueue synchronously, as before).
                     'native_resize': native_resize_task_spec,
                     'result_mask_path': str(rmask), 'result_conf_path': (str(rconf) if rconf is not None else None),
@@ -38911,7 +37654,7 @@ def main() -> None:
             )
 
         def _source_content_coarse_map() -> Optional[np.ndarray]:
-            """T9(a): lazily built block-max of the source volume, shared by every view."""
+            """(a): lazily built block-max of the source volume, shared by every view."""
             if not tile_content_prefilter_enabled():
                 return None
             if tile_prefilter_source_coarse:
@@ -38935,13 +37678,12 @@ def main() -> None:
                 return None
 
         def _build_tile_group_tasks_for_view(model_name_s: str, view: ViewInfo) -> int:
-            """Emit slice-chunked tile-GROUP tasks for one parent view (T1/T3/T4/T7/T9).
+            """Emit slice-chunked tile-GROUP tasks for one parent view.
 
-            Called once the view's parent support exists. Tiles that no parent support can
-            ever accept are dropped outright; surviving tiles are grouped per (angle, tile
-            configuration) and chunked along z so one task's unit volume stays inside the
-            per-task budget on both the device and the host.
-            """
+ Called once the view's parent support exists. Tiles that no parent support can
+ ever accept are dropped outright; surviving tiles are grouped per (angle, tile
+ configuration) and chunked along z so one task's unit volume stays inside the
+ per-task budget on both the device and the host."""
             nonlocal gpu_worker_total_tasks, gpu_worker_next_dynamic_task_id
             parent_key = (str(model_name_s), str(view.name))
             if parent_key in tile_groups_built_for_parent:
@@ -39064,7 +37806,7 @@ def main() -> None:
                         'streaming_cleanup_enabled': bool(single_angle_streaming_cleanup_active),
                         'streaming_cleanup_min_conf': float(args.min_conf),
                         'streaming_cleanup_min_radius': float(processing_min_radius),
-                        # T7: tiles get the same device-side 2D hole fill as full frames. The
+                        # tiles get the same device-side 2D hole fill as full frames. The
                         # device union holds one plane per (frame, tile), so filling it per
                         # index is exactly the per-tile per-slice CPU pass it replaces.
                         'device_hole_fill': bool(gpu_worker_device_hole_fill),
@@ -39104,12 +37846,12 @@ def main() -> None:
         view = task['view']
         model_name_s = str(task['model_name'])
         view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(stats.get('prediction_count', 0))
-        # v13.3.3 (S2): accumulate device-side hole-filled slice counts toward the per-view skip.
+        # accumulate device-side hole-filled slice counts toward the per-view skip.
         _filled = int(stats.get('device_hole_filled_frames', 0))
         if _filled > 0:
             key_fill = (model_name_s, str(view.name))
             view_device_hole_filled_slices[key_fill] = int(view_device_hole_filled_slices.get(key_fill, 0)) + _filled
-        # v13.3.6 (D1): aggregate the task window's device-union slice metadata per view.
+        # aggregate the task window's device-union slice metadata per view.
         meta_key = (model_name_s, str(view.name))
         holder = view_slice_meta.get(meta_key)
         if holder is None:
@@ -39143,7 +37885,7 @@ def main() -> None:
             except Exception:
                 holder['valid'] = False
         if str(task.get('result_mode', 'file')) == 'direct_union':
-            # v13.3.1 (R4): the worker already wrote its disjoint slice window straight into the
+            # the worker already wrote its disjoint slice window straight into the
             # shared per-view union memmap — nothing to reopen, OR, flush, or unlink here, and
             # the scheduler thread is free to drain the next GPU result immediately.
             _finalize_fullframe_view_after_worker(model_name_s, view)
@@ -39222,13 +37964,12 @@ def main() -> None:
         tile_cleanup_futures[fut] = (model_name_s, str(view.name), str(tile_job.config_id), str(tile_job.tile_id))
 
     def _handle_tile_group_worker_result(task: Dict[str, object], stats: Dict[str, int]) -> None:
-        """T3/T4: the worker already cleaned, hole-filled and OR-ed this group into the canvas.
+        """The worker already cleaned, hole-filled and OR-ed this group into the canvas.
 
-        Nothing is left to read back here -- the scheduler only has to retire the group's
-        tiles so the configuration gate can fire once every tile of the configuration has
-        landed. This replaces the whole per-tile reopen -> CPU hole fill -> foreground scan ->
-        lock-serialized staging chain.
-        """
+ Nothing is left to read back here -- the scheduler only has to retire the group's
+ tiles so the configuration gate can fire once every tile of the configuration has
+ landed. This replaces the whole per-tile reopen -> CPU hole fill -> foreground scan ->
+ lock-serialized staging chain."""
         view = task['view']
         model_name_s = str(task['model_name'])
         config_id = str(task['config_id'])
@@ -39259,7 +38000,7 @@ def main() -> None:
                 f"{msg.get('error')}\n{msg.get('traceback')}"
             )
         if mtype == 'aux_result':
-            # v13.3.4 (T4): auxiliary interpolation-pass result — route to the waiting
+            # auxiliary interpolation-pass result — route to the waiting
             # submitter thread; failures are ITS to handle (fallback/raise), not the
             # scheduler's, mirroring the interpolation ProcessPoolExecutor semantics.
             aux_pool = gpu_worker_aux_interpolation_pool()
@@ -39289,9 +38030,9 @@ def main() -> None:
             _handle_tile_group_worker_result(task, stats)
         else:
             _handle_tile_worker_result(task, stats)
-        # v13.3.4 (T4): every inference task is accounted for -> the workers are idle from here
+        # every inference task is accounted for -> the workers are idle from here
         # on; open the aux interpolation pool so postprocess passes can use their GILs.
-        # T9: tile groups are enqueued only as parent support lands, so "drained" also
+        # tile groups are enqueued only as parent support lands, so "drained" also
         # requires that no parent still owes its tile groups.
         if (
             int(gpu_worker_total_tasks) > 0
@@ -39302,12 +38043,12 @@ def main() -> None:
             if aux_pool is not None:
                 aux_pool.enable()
 
-    # v13.3.8 (G1): push drain — a transport-only daemon thread blocks on the process
+    # push drain — a transport-only daemon thread blocks on the process
     # result queue and hands messages to the main thread through a local deque + wake
     # event. Handlers still run ONLY on the main thread (they mutate scheduler state and
     # raise scheduler-fatal errors); completed futures set the same event through one-time
     # done-callbacks, so one event wait covers both wake sources. In push mode the drainer
-    # thread OWNS the mp queue end (a second concurrent get() would race it).
+    # thread OWNS the mp queue end (a second concurrent get would race it).
     push_drain_active = bool(
         gpu_worker_process_active and gpu_result_queue is not None and scheduler_push_drain_enabled()
     )
@@ -39375,7 +38116,7 @@ def main() -> None:
         _process_one_worker_result(msg)
 
     def _process_inference_outstanding() -> bool:
-        # T9: deferred tile groups are inference work that has not been enqueued yet, so the
+        # deferred tile groups are inference work that has not been enqueued yet, so the
         # scheduler must not treat the queue draining as "inference finished".
         return bool(
             gpu_worker_process_active
@@ -39397,7 +38138,7 @@ def main() -> None:
                     f'{aux_outstanding} aux interpolation pass(es) still outstanding.'
                 )
                 if aux_pool is not None:
-                    # v13.3.4 (T4): unblock any parent-postprocess threads waiting on aux passes
+                    # unblock any parent-postprocess threads waiting on aux passes
                     # before raising, so shutdown does not deadlock on their futures.
                     aux_pool.mark_failed(reason)
                 raise RuntimeError(reason)
@@ -39405,7 +38146,7 @@ def main() -> None:
     def _shutdown_gpu_worker_processes() -> None:
         if not gpu_worker_processes:
             return
-        # v13.3.4 (T4): on the normal path every aux interpolation pass has completed before
+        # on the normal path every aux interpolation pass has completed before
         # main reaches this finally (a no-op close); on abnormal paths this unblocks any
         # still-waiting or mid-submit threads so parent_postprocess_executor.shutdown(wait=True)
         # below cannot deadlock. mark_failed also refuses any racing late submission.
@@ -39428,7 +38169,7 @@ def main() -> None:
                     proc.terminate()
                 except Exception:
                     pass
-                # v13.3.10 (G7): the post-inference budget must not expand until every
+                # the post-inference budget must not expand until every
                 # GPU worker has actually exited. Reap a terminated worker, escalating to
                 # SIGKILL only if it ignores the graceful termination window.
                 try:
@@ -39438,7 +38179,7 @@ def main() -> None:
                 if proc.is_alive() and hasattr(proc, 'kill'):
                     try:
                         proc.kill()
-                        # v15.0.3 fix: never join unbounded after SIGKILL. A worker wedged in
+                        # never join unbounded after SIGKILL. A worker wedged in
                         # uninterruptible sleep (GPU context teardown after an aborted capture,
                         # mmap writeback, OOM reclaim) is not reaped by SIGKILL, so an unbounded
                         # join blocks this process forever. SLURM then cannot clean the step,
@@ -39549,7 +38290,7 @@ def main() -> None:
                     close_prediction_volume_ref(prediction_ref, keep_temp=bool(keep_temp_artifacts))
                     continue
                 if prediction_ref is None:
-                    # T11: this model's own single-use source for the tile (see the drain).
+                    # this model's own single-use source for the tile (see the drain).
                     prediction_ref = _maybe_eager_stage_prediction_ref(
                         _make_streaming_tile_ref(view, tile_job)
                     )
@@ -39691,7 +38432,7 @@ def main() -> None:
             if not waitables:
                 _flush_ready_postprocessed_tiles()
                 _pump_prediction_volume_build_queue()
-                # T9 safety valve: nothing is pending that could ever deliver parent support,
+                # safety valve: nothing is pending that could ever deliver parent support,
                 # yet tiles are still deferred. Emit their groups unfiltered rather than
                 # spinning on a result queue that has no work left to produce.
                 if (
@@ -39733,7 +38474,7 @@ def main() -> None:
                 continue
             _log_scheduler_wait_state()
             if push_drain_active:
-                # v13.3.8 (G1): sleep on the shared wake event — worker results and future
+                # sleep on the shared wake event — worker results and future
                 # completions both set it, so the loop wakes the instant either happens.
                 # The heartbeat only bounds the worker-liveness re-check cadence.
                 _hook_scheduler_wake(waitables)
@@ -39746,13 +38487,13 @@ def main() -> None:
 
     finally:
         if sys.exc_info()[0] is not None:
-            # v13.2.2 bug #7 (completion): the wait=True shutdowns below block on render
-            # tasks parked in wait_for_volume_ready() for still-running streaming
+            # (completion): the wait=True shutdowns below block on render
+            # tasks parked in wait_for_volume_ready for still-running streaming
             # producers. Abort the producers FIRST on the error path, or a failure during
             # the decode-overlap window stalls teardown for the remaining multi-hour
             # decode before the exception can even propagate to __main__.
             abort_streaming_producers('scheduler error teardown')
-            # v13.2.2 bug #3 (completion): queued eagerly pre-staged prediction sources
+            # (completion): queued eagerly pre-staged prediction sources
             # were never handed to a predict call, so nothing else closes them — their
             # producer threads would otherwise keep VRAM-staged batches and ledger
             # reservations alive (and spin) for the whole teardown.
@@ -39762,7 +38503,7 @@ def main() -> None:
             for _model_name, _view, _tile_job, ref in list(ready_tile_infer):
                 close_prediction_volume_ref(ref, keep_temp=bool(keep_temp_artifacts))
             ready_tile_infer.clear()
-        push_drain_stop.set()  # v13.3.8 (G1): the transport thread exits within one 0.5 s tick
+        push_drain_stop.set()  # the transport thread exits within one 0.5 s tick
         if gpu_worker_process_active:
             _shutdown_gpu_worker_processes()
         prediction_volume_executor.shutdown(wait=True)
@@ -39786,9 +38527,9 @@ def main() -> None:
     _drain_completed_prediction_accumulation_futures()
     _drain_completed_background_futures()
 
-    # v13.3.10 (G7): the scheduler's finally block above has joined every GPU worker and
-    # inference/interpolation executor.  Only now may CPU-only tail stages reclaim the CPU
-    # reservation that main_process_worker_budget() held for live GPU subprocesses.  Keep
+    # the scheduler's finally block above has joined every GPU worker and
+    # inference/interpolation executor. Only now may CPU-only tail stages reclaim the CPU
+    # reservation that main_process_worker_budget held for live GPU subprocesses. Keep
     # separate aliases so disabling the gate preserves explicit legacy per-stage overrides.
     tail_slice_workers = int(
         tail_worker_budget if tail_budget_expansion_active else slice_postprocess_workers
@@ -39811,7 +38552,7 @@ def main() -> None:
         else output_frame_workers
     )
     if tail_budget_expansion_active and int(output_manager.max_workers) != int(tail_output_workers):
-        # BackgroundOutputManager owns a fixed-size executor.  Settle any earlier submissions
+        # BackgroundOutputManager owns a fixed-size executor. Settle any earlier submissions
         # before replacing it; in the current schedule none are submitted before this boundary,
         # but waiting here keeps the transition correct if an earlier output is added later.
         output_manager.wait()
@@ -39835,7 +38576,7 @@ def main() -> None:
 
     if preprocess_streaming_active:
         if isinstance(volume_rgb, LazyProcessingCube) and not volume_rgb.materialized:
-            # v13.3.17 C10: this barrier exists to settle active producers. An untouched
+            # this barrier exists to settle active producers. An untouched
             # lazy cube has no producer and final source-geometry output reads the decoded
             # volume, so wait only for decode and preserve the no-cube fast path.
             print(
@@ -39869,12 +38610,12 @@ def main() -> None:
     else:
         spec_notes.append('YOLO_TTA_KEEP_TEMP retained scratch artifacts; the v12.2.0 in-memory inference path itself does not create prediction MKVs.')
 
-    # v13.2.4 (task #1, ruling A1): radial/tilted results are backprojected DIRECTLY into the
+    # radial/tilted results are backprojected DIRECTLY into the
     # original source geometry (single resample) instead of the working geometry.
     source_output_shape_tyx = (int(input_T), int(input_H), int(input_W))
     final_backprojection_jobs: List[ViewBackprojectionQueueJob] = []
-    view_assemble_jobs: List[Tuple[str, ViewInfo, List[NrrdLayerRef]]] = []  # v13.3.8 (G4)
-    fused_projected_layer_refs: List[NrrdLayerRef] = []  # v13.3.9 (G5)
+    view_assemble_jobs: List[Tuple[str, ViewInfo, List[NrrdLayerRef]]] = []  #
+    fused_projected_layer_refs: List[NrrdLayerRef] = []  #
     g5_tail_eligible = bool(
         fused_final_view_union_enabled()
         and tuple(int(v) for v in source_output_shape_tyx) != (int(T), int(H), int(W))
@@ -39893,7 +38634,7 @@ def main() -> None:
                 native_source = native_view_support_by_model[model_name].get(view.name)
             if native_source is None:
                 continue
-            # v13.2.4 (task #2): with --save_nrrd, this view's component layers were already
+            # with --save_nrrd, this view's component layers were already
             # projected into source geometry at materialization time (fullframe YOLO + per-pass
             # bridge deltas + any tile layers), and projection commutes exactly with union — so
             # the final projected volume is their OR, skipping a second full backprojection.
@@ -39909,7 +38650,7 @@ def main() -> None:
                         f'output geometry (v13.3.12 D6; no native intermediate).'
                     )
                     if g5_tail_eligible:
-                        # v13.3.9 (G5): retain source-geometry stores as direct final-union
+                        # retain source-geometry stores as direct final-union
                         # contributors. No radial/tilted full-volume intermediate is allocated.
                         fused_projected_layer_refs.extend(view_projected_layer_refs)
                         print(
@@ -39917,7 +38658,7 @@ def main() -> None:
                             f'layers directly to the fused final-union pass.'
                         )
                     else:
-                        # v13.3.8 (G4) fallback: collect the assembly instead of running it inline;
+                        # fallback: collect the assembly instead of running it inline;
                         # the independent per-view assemblies run concurrently below.
                         view_assemble_jobs.append((str(model_name), view, list(view_projected_layer_refs)))
                     continue
@@ -39927,7 +38668,7 @@ def main() -> None:
                 native_source=native_source,
                 out_path=temp_dir / 'view_volumes' / str(model_name) / f'{view.name}.u8.dat',
                 desc=f'Backprojecting final {model_name}/{view.name}',
-                # v13.1.0 (spec): --min_radius is already applied in the view-native plane before
+                # --min_radius is already applied in the view-native plane before
                 # backprojection, so the queue no longer re-filters after backprojection.
                 min_radius=0.0,
                 workers=1,
@@ -39935,8 +38676,8 @@ def main() -> None:
             ))
 
     if view_assemble_jobs:
-        # v13.3.8 (G4): the per-view assemblies are independent unions of already-projected
-        # layer stores (I/O + memcpy bound). Run up to assemble_views_concurrency() of them
+        # the per-view assemblies are independent unions of already-projected
+        # layer stores (I/O + memcpy bound). Run up to assemble_views_concurrency of them
         # side by side, splitting the slice-worker budget so total thread count is unchanged.
         assemble_concurrency = max(1, min(int(assemble_views_concurrency()), len(view_assemble_jobs)))
         per_view_workers = max(1, int(tail_slice_workers) // int(assemble_concurrency))
@@ -40003,7 +38744,7 @@ def main() -> None:
     output_manager.reap_completed()
 
     print('\n=== Building final single-model view union after the global view union ===')
-    # v13.2.4 (task #1, ruling A1): the union is assembled at ORIGINAL SOURCE dimensions.
+    # the union is assembled at ORIGINAL SOURCE dimensions.
     # Cartesian working stacks are restored working->source with one resample while merging;
     # radial/tilted volumes arrive already backprojected to source geometry. Void fill,
     # Gaussian smoothing (sigma in SOURCE voxels), and --keep_objects all run at source dims.
@@ -40033,7 +38774,7 @@ def main() -> None:
         automatic_removal_enabled=bool(args.centerline_auto_remove),
         surface_max_dim=int(args.centerline_surface_max_dim),
         surface_points=int(args.centerline_surface_points),
-        timeout_seconds=float(args.centerline_vmtk_timeout),
+        timeout_seconds=float(args.centerline_timeout),
         workers=int(tail_slice_workers), keep_temp=bool(keep_temp_artifacts),
         nrrd_layer_refs=nrrd_layer_refs,
     )
@@ -40053,10 +38794,9 @@ def main() -> None:
             for record in centerline_filter_stats.get('passes', [])
         ]
         spec_notes.append(
-            'v14.0.1 centerline post-union filter: pass 0 preserves the untouched union; '
+            'Centerline post-union filter: pass 0 preserves the untouched union; '
             f'requested backend={str(args.centerline_filter_backend)}; the default embedded backend '
-            'uses an exact 3D EDT on the block-max raster plus three-axis medial-ridge tracking '
-            'and requires no VMTK; '
+            'uses exact 3D EDT on the block-max raster plus three-axis medial-ridge tracking; '
             f'X={float(args.centerline_radius_factor):g}; anomaly duration is uncapped; '
             f'automatic component removal requested={bool(args.centerline_auto_remove)}; '
             'protected or otherwise unsafe 2D components are marker-only; '
@@ -40064,7 +38804,7 @@ def main() -> None:
             + ('; '.join(pass_summaries) if pass_summaries else 'No filter pass completed.')
         )
 
-    if bool(nrrd_layers_needed):
+    if bool(nrrd_layers_needed and gaussian_smoothing_enabled):
         pre_smoothing_ref = materialize_nrrd_global_layer(
             final_union_mm,
             model_name=str(model_name),
@@ -40072,7 +38812,7 @@ def main() -> None:
             mask_kind='union',
             pass_index=0,
             stage='pre_smoothing',
-            description='Global union after all active view/tile layers, optional 3D void fill, and v14 centerline filtering; before Gaussian smoothing and keep_objects.',
+            description='Global union after all active view/tile layers, optional 3D void fill, and centerline filtering; input to Gaussian smoothing.',
             temp_dir=temp_dir,
             workers=int(tail_slice_workers),
         )
@@ -40109,7 +38849,7 @@ def main() -> None:
     final_output_mask_mm = final_union_mm
     output_volume_rgb = input_volume_rgb
     output_T, output_H, output_W = int(input_T), int(input_H), int(input_W)
-    # v13.2.4 (task #1, ruling A1): the final union is already assembled at source dimensions,
+    # the final union is already assembled at source dimensions,
     # so this tail restore is an identity no-op kept purely as a shape safety net.
     if tuple(int(v) for v in final_union_mm.shape) != (output_T, output_H, output_W):
         print('\n=== Restoring final mask to original input geometry for default outputs ===')
@@ -40121,9 +38861,9 @@ def main() -> None:
             prefer_memory=True,
         )
     if bool(nrrd_layers_needed):
-        # v13.2.0: the Global_final_output single-layer NRRD is materialized here (it was previously
-        # appended inside the now-removed mega decomposed writer) and the sink writes it in the
-        # background while the rest of the default outputs are produced.
+        # Materialize the final single-layer NRRD here; the sink writes it in the background
+        # while the remaining default outputs are produced. This checkpoint is not a
+        # recomposition layer.
         final_output_ref = materialize_nrrd_global_layer(
             final_output_mask_mm,
             model_name=str(model_name),
@@ -40134,8 +38874,8 @@ def main() -> None:
             description='Final binary output after view/tile union, optional smoothing, optional keep_objects, and geometry restoration. Not intended for recomposition.',
             temp_dir=temp_dir,
             workers=int(tail_slice_workers),
-            # v13.3.6 (N3): nothing mutates the final volume after this point (overlay/video
-            # writers only read it), and it stays open until after layer_sink.wait() — the
+            # nothing mutates the final volume after this point (overlay/video
+            # writers only read it), and it stays open until after layer_sink.wait — the
             # sink streams it directly instead of a store encode + read-back.
             volume_is_immutable=True,
             keep_temp=bool(keep_temp_artifacts),
@@ -40284,7 +39024,7 @@ def main() -> None:
             '{Filestem}_{ViewToken|Global}_{layer}.seg.nrrd with the model name dropped, tagged as a 3D Slicer '
             'segmentation (v13.2.3: segment named after the file, deterministic per-layer color). Each layer is created during '
             'the intermediate pipeline steps (e.g. the Transverse layer compresses while Tiled Transverse is still '
-            'inferencing) and the Global_union_presmoothing layer is written while smoothing runs; a single '
+            'inferencing) and, when Gaussian smoothing is enabled, Global_union_presmoothing is written while smoothing runs; a single '
             f'{input_path.stem}_nrrd_manifest.json sidecar lists every written layer. The previous mega 4D '
             'decomposed NRRD (one file with a trailing list axis) has been removed.'
         )
@@ -40450,7 +39190,7 @@ if __name__ == "__main__":
     try:
         main()
     except BaseException:
-        # v13.2.2 bug #7: cancel background streaming producers so a failing run exits
+        # cancel background streaming producers so a failing run exits
         # promptly instead of blocking interpreter shutdown behind a multi-hour decode.
         abort_streaming_producers('fatal error in main()')
         # Settle queued NRRD writes before propagating the original exception.
