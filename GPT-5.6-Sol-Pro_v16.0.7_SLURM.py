@@ -781,7 +781,7 @@ class RuntimeTelemetry:
             self.path = Path(requested)
         else:
             base = os.environ.get('SLURM_JOB_ID') or str(os.getpid())
-            self.path = Path(tempfile.gettempdir()) / f'gpt56-sol-pro-v1606-telemetry-{base}-{os.getpid()}.jsonl'
+            self.path = Path(tempfile.gettempdir()) / f'gpt56-sol-pro-v1607-telemetry-{base}-{os.getpid()}.jsonl'
 
     @contextlib.contextmanager
     def span(self, name: str, **fields: object) -> Iterator[None]:
@@ -851,7 +851,7 @@ class RuntimeTelemetry:
                     'mean_ms': (seconds * 1000.0 / calls) if calls else 0.0,
                 }
             payload: Dict[str, object] = {
-                'schema': 'gpt-5.6-sol-pro-v16.0.6.telemetry.v1',
+                'schema': 'gpt-5.6-sol-pro-v16.0.7.telemetry.v1',
                 'pid': os.getpid(),
                 'monotonic_seconds': (now_ns - self.started_ns) / 1e9,
                 'wall_time': time.time(),
@@ -9775,12 +9775,19 @@ def gpu_device_union_enabled() -> bool:
 
 
 def gpu_device_hole_fill_enabled() -> bool:
-    """2D-hole-fill the per-task device union on the GPU before the flush.
-
- Valid only when --min_conf and --min_radius have no work (spec order is conf -> radius ->
- hole fill) and every frame of the task accumulated on device; the scheduler additionally
- skips the CPU per-view hole-fill pass only when EVERY slice of the view was device-filled."""
+    """2D-hole-fill eligible device unions before they are committed."""
     return _env_flag('YOLO_TTA_GPU_HOLE_FILL', True)
+
+
+def gpu_worker_chunk_hole_fill_enabled() -> bool:
+    """Allow split full-frame leases to run a whole-chunk GPU hole fill before handoff.
+
+    Disabled by default because the CuPy connected-component pass and allocator trim are
+    task-boundary barriers. Split views instead receive one parallel CPU hole-fill pass after
+    their last inference lease, preserving the same per-slice result while keeping workers hot.
+    Single-lease views and grouped tiles retain their existing device-fill behavior.
+    """
+    return _env_flag('YOLO_TTA_GPU_WORKER_CHUNK_HOLE_FILL', False)
 
 
 def gpu_union_flush_overlap_enabled() -> bool:
@@ -9915,12 +9922,13 @@ class _DeviceUnionAccumulator:
             )
         self.written[int(idx)] = True
 
-    def take_device_prediction_stats(self) -> Tuple[int, int]:
+    def take_device_prediction_stats(self, *, synchronize_device: bool = True) -> Tuple[int, int]:
         """Read prediction/frame totals once after every side-stream frame has settled."""
         if self.prediction_counts_dev is None:
             return 0, 0
         try:
-            self.torch.cuda.synchronize(self.device)
+            if bool(synchronize_device):
+                self.torch.cuda.synchronize(self.device)
             counts = self.prediction_counts_dev
             stats = self.torch.stack([
                 counts.to(self.torch.int64).sum(),
@@ -10046,23 +10054,53 @@ class _DeviceUnionAccumulator:
         chunk_slices: int = 64,
         *,
         synchronize_device: bool = True,
-    ) -> None:
+        collect_slice_metadata: bool = False,
+    ) -> Optional[Dict[str, np.ndarray]]:
+        """Commit the task union and optionally derive metadata from the unavoidable D2H stream.
+
+        Metadata used to trigger a separate full-volume GPU reduction before each task could
+        retire. Computing row/column occupancy from the pinned host chunk already crossing PCIe
+        removes that handoff barrier and runs on the retirement lane behind the next inference.
+        """
         torch = self.torch
-        # The synchronous path orders every side stream here. seals on the worker thread
-        # before submitting this method, so the retirement thread must not device-sync and
-        # accidentally wait on kernels from the NEXT task.
         if bool(synchronize_device):
             torch.cuda.synchronize(self.device)
         n, h, w = (int(x) for x in self.union_dev.shape)
         chunk = max(1, min(int(chunk_slices), n))
         plane = int(h) * int(w)
         written = self.written
-        # every CUDA call below — the pinned cudaHostAlloc, the stream and event
-        # creations, and the per-chunk Event.synchronize — is capture-unsafe. Under
-        # capture_error_mode='global' any of them raises cudaErrorStreamCaptureUnsupported if a
-        # graph capture is live on ANOTHER thread. Serialize against capture for the whole
-        # section rather than the synchronize alone: an unguarded gap between chunks would let a
-        # capture start while this stream still has async copies in flight.
+        metadata_enabled = bool(collect_slice_metadata and not self.host_written)
+        slice_any = np.zeros((n,), dtype=bool) if metadata_enabled else None
+        slice_bboxes = np.zeros((n, 4), dtype=np.int64) if metadata_enabled else None
+        slice_row_any = (
+            np.zeros((n, int((h + 7) // 8)), dtype=np.uint8)
+            if metadata_enabled else None
+        )
+
+        def _collect_metadata(z0: int, z1: int, host: np.ndarray) -> None:
+            if not metadata_enabled:
+                return
+            rows = np.any(host, axis=2)
+            cols = np.any(host, axis=1)
+            wr = np.asarray(written[int(z0):int(z1)], dtype=bool)
+            if not bool(wr.all()):
+                rows[~wr] = False
+                cols[~wr] = False
+            any_local = np.any(rows, axis=1)
+            slice_any[int(z0):int(z1)] = any_local
+            slice_row_any[int(z0):int(z1)] = np.packbits(rows, axis=1)
+            if not bool(any_local.any()):
+                return
+            y0 = np.argmax(rows, axis=1).astype(np.int64, copy=False)
+            y1 = int(h) - np.argmax(rows[:, ::-1], axis=1).astype(np.int64, copy=False)
+            x0 = np.argmax(cols, axis=1).astype(np.int64, copy=False)
+            x1 = int(w) - np.argmax(cols[:, ::-1], axis=1).astype(np.int64, copy=False)
+            local_bbox = np.stack([y0, y1, x0, x1], axis=1)
+            local_bbox[~any_local] = 0
+            slice_bboxes[int(z0):int(z1)] = local_bbox
+
+        # Every CUDA call below is capture-unsafe. Serialize against graph capture for the
+        # complete double-buffered copy interval, while host metadata work overlaps the next copy.
         with _CUDA_GRAPH_CAPTURE_LOCK:
             pin_buf = _acquire_pinned_u8_buffer(torch, 2 * chunk * plane)
             pin_views = (
@@ -10073,9 +10111,7 @@ class _DeviceUnionAccumulator:
             copy_stream = torch.cuda.Stream(device=self.device)
             events = (torch.cuda.Event(), torch.cuda.Event())
             try:
-                def _drain(src_dev: object, dst_mm: np.ndarray) -> None:
-                    # Chunks with no device-written slice carry only zeros: skip them outright
-                    # (host-side fallback writes for those slices already happened).
+                def _drain(src_dev: object, dst_mm: np.ndarray, *, collect_metadata: bool = False) -> None:
                     chunks = [
                         (z0, min(n, z0 + chunk))
                         for z0 in range(0, n, chunk)
@@ -10088,15 +10124,19 @@ class _DeviceUnionAccumulator:
                         z0_i, z1_i = chunks[ci]
                         buf = ci % 2
                         with torch.cuda.stream(copy_stream):
-                            pin_views[buf][: z1_i - z0_i].copy_(src_dev[z0_i:z1_i], non_blocking=True)
+                            pin_views[buf][: z1_i - z0_i].copy_(
+                                src_dev[z0_i:z1_i], non_blocking=True,
+                            )
                             events[buf].record(copy_stream)
 
                     _issue(0)
                     for ci, (z0, z1) in enumerate(chunks):
                         if ci + 1 < len(chunks):
-                            _issue(ci + 1)  # overlaps the host merge below
+                            _issue(ci + 1)
                         events[ci % 2].synchronize()
                         host = pin_np[ci % 2][: z1 - z0]
+                        if bool(collect_metadata):
+                            _collect_metadata(int(z0), int(z1), host)
                         wr = written[z0:z1]
                         if bool(wr.all()):
                             np.copyto(np.asarray(dst_mm[z0:z1]), host)
@@ -10105,14 +10145,26 @@ class _DeviceUnionAccumulator:
                                 if wr[zi]:
                                     np.copyto(np.asarray(dst_mm[z0 + zi]), host[zi])
 
-                _drain(self.union_dev, view_union_mm)
+                _drain(
+                    self.union_dev, view_union_mm,
+                    collect_metadata=bool(metadata_enabled),
+                )
                 if self.conf_dev is not None and view_confmap_mm is not None:
-                    _drain(self.conf_dev, view_confmap_mm)
+                    _drain(self.conf_dev, view_confmap_mm, collect_metadata=False)
             finally:
                 _release_pinned_u8_buffer(pin_buf)
         self.union_dev = None
         self.conf_dev = None
         self.prediction_counts_dev = None
+        if not metadata_enabled:
+            return None
+        return {
+            'slice_any': np.ascontiguousarray(slice_any),
+            'slice_bboxes': np.ascontiguousarray(slice_bboxes),
+            'slice_row_any': np.ascontiguousarray(slice_row_any),
+            'slice_row_count': np.asarray([int(h)], dtype=np.int64),
+        }
+
 
 
 def _try_create_device_union_accumulator(
@@ -11422,44 +11474,66 @@ def predict_source_and_accumulate(
                 _settle_parallel_futures(pending)
                 _release_parallel_pool(worker_count, executor)
 
-        if device_union is not None and specialized_stats is None:
-            compacted_predictions, compacted_frames = device_union.take_device_prediction_stats()
-            prediction_count += int(compacted_predictions)
-            frames_with_predictions += int(compacted_frames)
-
-        # when requested (single-angle, no min_conf/min_radius work), hole-fill the
-        # accumulated device union per slice ON DEVICE before the flush; the scheduler then skips
-        # the CPU per-view "2D hole fill" pass once every slice of the view reports device-filled.
+        # Keep the inference handoff to one producer-stream seal. Device counts and slice
+        # metadata are consumed on the retirement lane from the same D2H chunks that commit
+        # the union, instead of two whole-device synchronizations/reductions before return.
         device_hole_filled_frames = 0
         if device_union is not None and bool(device_hole_fill) and gpu_device_hole_fill_enabled():
             device_hole_filled_frames = int(device_union.fill_holes_2d())
 
-        # per-slice foreground metadata from the resident union (post hole
-        # fill, pre flush) — a few hundred KB that saves whole CPU read passes downstream.
-        slice_meta = device_union.compute_slice_metadata() if device_union is not None else None
-
-        # A CUDA worker may retire this accumulator on its private copy/host-merge thread
-        # while its main thread starts the next task. Seal producer streams before submission
-        # so retirement cannot wait on kernels from the following task.
         device_union_flush_future: Optional[Future] = None
+        slice_meta: Optional[Dict[str, np.ndarray]] = None
         if device_union is not None:
             if bool(defer_device_union_flush) and gpu_union_flush_overlap_enabled():
                 device_union.synchronize_for_retirement()
+                base_prediction_count = int(prediction_count)
+                base_frames_with_predictions = int(frames_with_predictions)
+                count_device_predictions = bool(specialized_stats is None)
+                filled_frames_for_result = int(device_hole_filled_frames)
 
-                def _retire_device_union() -> None:
-                    device_union.flush_into(
-                        view_union_mm, view_confmap_mm, synchronize_device=False,
-                    )
+                def _retire_device_union() -> Dict[str, object]:
+                    compacted_predictions = 0
+                    compacted_frames = 0
+                    # Count readback, stream/event creation and pinned D2H are all unsafe
+                    # during global CUDA-graph capture on the next task. One re-entrant guard
+                    # covers the complete retirement transaction.
+                    with _CUDA_GRAPH_CAPTURE_LOCK:
+                        if count_device_predictions:
+                            compacted_predictions, compacted_frames = (
+                                device_union.take_device_prediction_stats(synchronize_device=False)
+                            )
+                        retired_meta = device_union.flush_into(
+                            view_union_mm,
+                            view_confmap_mm,
+                            synchronize_device=False,
+                            collect_slice_metadata=True,
+                        )
                     if prediction_hot_path_flush_enabled():
                         if view_confmap_mm is not None:
                             flush_array(view_confmap_mm)
                         flush_array(view_union_mm)
+                    return {
+                        'prediction_count': int(base_prediction_count + compacted_predictions),
+                        'frames_with_predictions': int(base_frames_with_predictions + compacted_frames),
+                        'device_hole_filled_frames': int(filled_frames_for_result),
+                        'slice_meta': retired_meta,
+                    }
 
                 device_union_flush_future = _gpu_union_flush_executor().submit(
                     _retire_device_union,
                 )
             else:
-                device_union.flush_into(view_union_mm, view_confmap_mm)
+                if specialized_stats is None:
+                    compacted_predictions, compacted_frames = (
+                        device_union.take_device_prediction_stats()
+                    )
+                    prediction_count += int(compacted_predictions)
+                    frames_with_predictions += int(compacted_frames)
+                slice_meta = device_union.flush_into(
+                    view_union_mm,
+                    view_confmap_mm,
+                    collect_slice_metadata=True,
+                )
 
         if prediction_hot_path_flush_enabled() and device_union_flush_future is None:
             if view_confmap_mm is not None:
@@ -15125,7 +15199,9 @@ class _DeferredGpuWorkerTaskResult:
 
     def finish(self) -> Dict[str, object]:
         try:
-            self.flush_future.result()
+            retired = self.flush_future.result()
+            if isinstance(retired, dict):
+                self.stats.update(retired)
             return self.stats
         finally:
             for mm in self.memmaps:
@@ -16548,7 +16624,7 @@ def gpu_slice_labeling_pairs_enabled() -> bool:
 
 def topology_slab_slices() -> int:
     """Z-depth of independently resolved 3D topology slabs."""
-    return max(4, _env_int('YOLO_TTA_TOPOLOGY_SLAB_SLICES', 64))
+    return max(4, _env_int('YOLO_TTA_TOPOLOGY_SLAB_SLICES', 32))
 
 
 def topology_slab_ranges(z_dim: int) -> List[Tuple[int, int]]:
@@ -16561,7 +16637,15 @@ def topology_slab_ranges(z_dim: int) -> List[Tuple[int, int]]:
 
 def topology_slab_workers(requested_workers: int, slab_count: int) -> int:
     """Bound concurrent local union-find slabs; Numba releases the GIL for pair batches."""
-    default_workers = min(8, max(1, int(requested_workers)), max(1, int(slab_count)))
+    # The former fixed cap of eight consumed only ~5% of a 160-vCPU allocation during the
+    # post-inference keep_objects tail. Use up to half the visible logical CPUs (64 max) while
+    # retaining an explicit environment override and one worker per available slab.
+    default_workers = min(
+        64,
+        max(1, int(_cpu_count()) // 2),
+        max(1, int(requested_workers)),
+        max(1, int(slab_count)),
+    )
     resolved = max(1, _env_int('YOLO_TTA_TOPOLOGY_SLAB_WORKERS', int(default_workers)))
     if _numba_union_find_batch_kernel is None or not compiled_topology_kernels_enabled():
         # Python union-find is GIL-bound; several slab threads would only add memory pressure.
@@ -17335,6 +17419,12 @@ def label_foreground_volume_streaming(
 
     # one z-disconnected cupy label pass per block on the GPU replaces the
     # per-slice cv2 stage when CUDA is available in this process; CPU threads otherwise.
+    print(
+        '3D topology slice-label phase: '
+        f'shape={int(z_dim)}x{int(h)}x{int(w)}, CPU fallback workers={int(label_workers)}, '
+        f'GPU labeling requested={bool(gpu_slice_labeling_enabled())}.'
+    )
+    runtime_telemetry().gauge('pipeline.phase', '3d_topology_slice_label')
     label_phase_started = time.perf_counter()
     gpu_stage_a_done, gpu_stage_a_pair_codes = _try_label_slices_stage_a_gpu(
         mask_mm,
@@ -17433,6 +17523,14 @@ def label_foreground_volume_streaming(
     union_code_cap = max(1, _env_int(
         'YOLO_TTA_TOPOLOGY_UNION_BATCH_CODES', 1_048_576,
     ))
+    print(
+        '3D topology local-union plan (v16.0.7): '
+        f'{len(slab_ranges)} slab(s) x {int(topology_slab_slices())} slices, '
+        f'{int(slab_worker_count)} concurrent worker(s), '
+        f'compiled_nogil={bool(_numba_union_find_batch_kernel is not None and compiled_topology_kernels_enabled())}.'
+    )
+    runtime_telemetry().gauge('pipeline.phase', '3d_topology_local_union')
+    runtime_telemetry().gauge('topology.slab_workers', int(slab_worker_count))
 
     def _resolve_topology_slab(slab_idx: int) -> Tuple[int, int, int, int, np.ndarray, int, float, float]:
         z0, z1 = slab_ranges[int(slab_idx)]
@@ -18316,6 +18414,16 @@ def main_process_gpu_stage_inference_overlap_enabled() -> bool:
     return _env_flag('YOLO_TTA_MAIN_GPU_STAGE_INFERENCE_OVERLAP', False)
 
 
+def main_process_gpu_stage_inference_priority_enabled() -> bool:
+    """Reserve worker GPUs for inference until the global inference queue is permanently drained.
+
+    The old coordinator blocked an output stage only while a task was already queued or running
+    on that exact device. A long NRRD mirror/backprojection stage could therefore win the small
+    result-publication/refill race and strand that GPU while inference work still existed.
+    """
+    return _env_flag('YOLO_TTA_MAIN_GPU_STAGE_INFERENCE_PRIORITY', True)
+
+
 class _MainProcessGpuStageLease:
     """Exclusive main-process lease for one logical CUDA device."""
 
@@ -18360,6 +18468,7 @@ class _MainProcessGpuStageCoordinator:
         self._worker_devices: set[int] = set()
         self._inference_inflight: Counter[int] = Counter()
         self._stage_leases: Dict[int, str] = {}
+        self._inference_priority_active = False
         self._wake_callback: Optional[Callable[[], None]] = None
 
     def configure_workers(self, worker_devices: Sequence[int]) -> None:
@@ -18367,6 +18476,29 @@ class _MainProcessGpuStageCoordinator:
             self._worker_devices = {int(v) for v in worker_devices}
             self._inference_inflight.clear()
             self._stage_leases.clear()
+            self._inference_priority_active = bool(
+                self._worker_devices and main_process_gpu_stage_inference_priority_enabled()
+            )
+
+    def set_inference_priority_active(self, active: bool) -> None:
+        callback: Optional[Callable[[], None]] = None
+        with self._lock:
+            self._inference_priority_active = bool(
+                active and self._worker_devices and main_process_gpu_stage_inference_priority_enabled()
+            )
+            callback = self._wake_callback
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                pass
+
+    def _priority_blocks_stage_locked(self, device_index: int) -> bool:
+        return bool(
+            self._inference_priority_active
+            and not main_process_gpu_stage_inference_overlap_enabled()
+            and int(device_index) in self._worker_devices
+        )
 
     def set_wake_callback(self, callback: Optional[Callable[[], None]]) -> None:
         with self._lock:
@@ -18377,6 +18509,7 @@ class _MainProcessGpuStageCoordinator:
             self._worker_devices.clear()
             self._inference_inflight.clear()
             self._stage_leases.clear()
+            self._inference_priority_active = False
             self._wake_callback = None
 
     def can_dispatch_inference(self, device_index: int) -> bool:
@@ -18422,6 +18555,8 @@ class _MainProcessGpuStageCoordinator:
             overlap = bool(main_process_gpu_stage_inference_overlap_enabled())
             if device in self._stage_leases:
                 return None
+            if self._priority_blocks_stage_locked(device):
+                return None
             if not overlap and int(self._inference_inflight.get(device, 0)) > 0:
                 return None
             aux_pool = gpu_worker_aux_interpolation_pool()
@@ -18459,6 +18594,7 @@ class _MainProcessGpuStageCoordinator:
             available = [
                 idx for idx in candidates
                 if idx not in self._stage_leases
+                and not self._priority_blocks_stage_locked(idx)
                 and (overlap or int(self._inference_inflight.get(idx, 0)) == 0)
             ]
             if not available:
@@ -18510,6 +18646,7 @@ class _MainProcessGpuStageCoordinator:
                 'worker_devices': sorted(self._worker_devices),
                 'inference_inflight': dict(self._inference_inflight),
                 'stage_leases': dict(self._stage_leases),
+                'inference_priority_active': bool(self._inference_priority_active),
             }
 
 
@@ -18524,6 +18661,10 @@ def _configure_main_process_gpu_stage_workers(worker_devices: Sequence[int]) -> 
 
 def _reset_main_process_gpu_stage_coordinator() -> None:
     _MAIN_PROCESS_GPU_STAGE_COORDINATOR.reset()
+
+
+def _set_main_process_gpu_inference_priority_active(active: bool) -> None:
+    _MAIN_PROCESS_GPU_STAGE_COORDINATOR.set_inference_priority_active(bool(active))
 
 
 def _set_main_process_gpu_stage_wake_callback(callback: Optional[Callable[[], None]]) -> None:
@@ -22813,7 +22954,7 @@ def assemble_current_view_union_volume(
     
     Multiple model entries are rejected; the destination uses source geometry when requested."""
     if len(view_volumes_by_model) != 1:
-        raise ValueError('GPT-5.6-Sol-Pro v16.0.6 supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.0.7 supports exactly one --model; multiple-model inference has been removed')
 
     union_shape = (int(T), int(H), int(W)) if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
     model_name = next(iter(view_volumes_by_model.keys()))
@@ -22899,6 +23040,7 @@ def union_volume_into_volume(
     return int(np.sum(counts, dtype=np.int64)) if counts is not None else 0
 
 
+@runtime_telemetry_phase('post.keep_objects')
 def apply_keep_largest_objects_inplace(
     mask_mm: np.ndarray,
     keep_objects: int,
@@ -22915,6 +23057,13 @@ def apply_keep_largest_objects_inplace(
         return {'enabled': 0, 'num_objects': 0, 'kept_objects': 0, 'removed_objects': 0, 'removed_voxels': 0}
 
     keep_started = time.perf_counter()
+    runtime_telemetry().gauge('pipeline.phase', 'keep_objects_3d_connected_components')
+    shape_tyx = tuple(int(v) for v in np.asarray(mask_mm).shape)
+    print(
+        f'keep_objects: resolving 3D connected components for shape={shape_tyx}, '
+        f'keep={int(keep_n)}, worker_budget={int(workers)}, '
+        f'topology_slab_slices={int(topology_slab_slices())}.'
+    )
     work_dir = temp_dir / 'keep_objects'
     work_dir.mkdir(parents=True, exist_ok=True)
     # label with LOCAL per-slice ids only (no compact relabel write pass) and
@@ -29828,10 +29977,10 @@ def prepare_view_volume_after_fullframe(
         and not bool(dense_tiling_active)
     )
 
-    # device-union slice metadata (aggregated per view by the scheduler).
-    # Valid only while the volume matches the flush state: the (skipped) cleanup and the
-    # device hole fill do not change any/bbox/row-occupancy, but interpolation bridges do —
-    # so it feeds only the pre-interpolation consumers and interpolation pass 1's labeling.
+    # Device-union slice metadata is aggregated per view by the scheduler.
+    # It remains valid through skipped cleanup and per-slice hole filling, which do not change
+    # foreground presence/bounds/row occupancy; interpolation bridges invalidate it. It feeds
+    # only pre-interpolation consumers and the first interpolation pass's labeling.
     meta_valid = bool(slice_meta) and bool(slice_meta.get('valid', False))
     meta_slice_any: Optional[np.ndarray] = None
     meta_slice_bboxes: Optional[np.ndarray] = None
@@ -30017,23 +30166,35 @@ def prepare_view_volume_after_fullframe(
             if int(stats_local.get('added_voxels', 0)) <= 0:
                 break
     else:
-        # When interpolation is disabled, drain the view-native volume to disk so it can wait
-        # cheaply until final backprojection / final union.
-        drained_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.noninterpolated_native.u8.dat'
+        # Direct-union CUDA workers already wrote this completed view into a root file-backed
+        # memmap. Re-copying it to a second *.noninterpolated_native file read and rewrote the
+        # entire multi-GiB view after inference, often as a low-CPU disk/page-cache tail. Retain
+        # the existing backing in place; only anonymous/fallback arrays need a drain copy.
         old_volume = baseline_native_volume
-        baseline_native_volume = _drain_volume_to_mmap(
-            old_volume,
-            drained_path,
-            desc=f'{model_name}/{view.name} non-interpolated native drain',
-            workers=int(slice_workers),
-        )
-        if old_volume is not baseline_native_volume:
-            close_memmap_array(old_volume)
-            if not keep_temp:
-                try:
-                    union_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
+        existing_backing = _interpolation_array_backing_path(old_volume)
+        if existing_backing is not None:
+            print(
+                f'{model_name}/{view.name} non-interpolated native retention (v16.0.7): '
+                f'reusing {existing_backing}; no full-volume drain copy.'
+            )
+        else:
+            drained_path = (
+                temp_dir / 'view_volumes' / model_name
+                / f'{view.name}.noninterpolated_native.u8.dat'
+            )
+            baseline_native_volume = _drain_volume_to_mmap(
+                old_volume,
+                drained_path,
+                desc=f'{model_name}/{view.name} non-interpolated native drain',
+                workers=int(slice_workers),
+            )
+            if old_volume is not baseline_native_volume:
+                close_memmap_array(old_volume)
+                if not keep_temp:
+                    try:
+                        union_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
     if bool(fused_radial_components):
         # projection and positive-support restore distribute over binary OR, so the
@@ -32869,7 +33030,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.6-Sol-Pro_v16.0.6_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.6-Sol-Pro_v16.0.7_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -33990,16 +34151,58 @@ class NrrdLayerSink:
                 if str(entry.get('source', '')) == 'centerline_filter'
             ))
 
+    def progress_counts(self) -> Tuple[int, int]:
+        """Return completed and submitted write-task counts without waiting."""
+        with self._lock:
+            futures = list(self._futures)
+        return int(sum(1 for fut in futures if fut.done())), int(len(futures))
+
     def wait(self) -> None:
         with self._lock:
             futures = list(self._futures)
+        total = int(len(futures))
+        if total <= 0:
+            return
+        pending: set[Future] = set()
         first_error: Optional[BaseException] = None
+        completed = 0
         for fut in futures:
+            if not fut.done():
+                pending.add(fut)
+                continue
+            completed += 1
             try:
                 fut.result()
             except BaseException as exc:  # pragma: no cover - surfaced to main
                 if first_error is None:
                     first_error = exc
+        status_seconds = max(5.0, _env_float('YOLO_TTA_NRRD_WAIT_STATUS_SECONDS', 30.0))
+        last_status = time.monotonic()
+        print(
+            f'Single-layer NRRD write status: {int(completed)}/{total} complete, '
+            f'{len(pending)} pending.'
+        )
+        while pending:
+            done, pending_remainder = wait(
+                pending,
+                timeout=float(status_seconds),
+                return_when=FIRST_COMPLETED,
+            )
+            pending = set(pending_remainder)
+            for fut in done:
+                completed += 1
+                try:
+                    fut.result()
+                except BaseException as exc:  # pragma: no cover - surfaced to main
+                    if first_error is None:
+                        first_error = exc
+            now = time.monotonic()
+            if done or now - float(last_status) >= float(status_seconds):
+                print(
+                    f'Single-layer NRRD write status: {int(completed)}/{total} complete, '
+                    f'{len(pending)} pending.'
+                )
+                last_status = float(now)
         if first_error is not None:
             raise RuntimeError('Single-layer NRRD writing failed') from first_error
 
@@ -35999,7 +36202,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('GPT-5.6-Sol-Pro v16.0.6 accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.0.7 accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -38231,8 +38434,12 @@ def main() -> None:
             return
         last_scheduler_wait_log = float(now)
         waiting_tiles = sum(len(v) for v in postprocessed_tiles_waiting_by_parent.values())
+        gpu_stage_state = _MAIN_PROCESS_GPU_STAGE_COORDINATOR.snapshot()
         print(
             'Scheduler wait: no inference-ready in-memory volume; '
+            f'gpu_inference_inflight={gpu_stage_state.get("inference_inflight", {})}, '
+            f'gpu_stage_leases={gpu_stage_state.get("stage_leases", {})}, '
+            f'inference_priority={bool(gpu_stage_state.get("inference_priority_active", False))}, '
             f'pending_volume_builds={len(pending_prediction_volume_futures)}, '
             f'queued_build_jobs={len(pending_prediction_build_jobs)}, '
             f'prediction_accumulation={len(prediction_accumulation_futures)}, '
@@ -38262,6 +38469,8 @@ def main() -> None:
     gpu_worker_next_dynamic_task_id = 0
     gpu_worker_pending_task_ids: deque = deque()
     gpu_worker_result_dir = temp_dir / 'gpu_worker_results'
+    gpu_inference_drained_at: Optional[float] = None
+    gpu_inference_drain_announced = False
 
     def _gpu_worker_fullframe_parent_key(task: Dict[str, object]) -> Optional[Tuple[str, str]]:
         if str(task.get('kind', '')) != 'fullframe':
@@ -38540,6 +38749,13 @@ def main() -> None:
         # its physical pin via _pin_cuda_visible_device_token.
         gpu_logical_indices = [int(str(d).split(':')[-1]) for d in inference_devices]
         _configure_main_process_gpu_stage_workers(gpu_logical_indices)
+        if main_process_gpu_stage_inference_priority_enabled():
+            print(
+                'Inference-first GPU ownership active (v16.0.7): main-process NRRD, '
+                'backprojection, downbin, and topology stages cannot seize worker GPUs until '
+                'the global inference queue is permanently drained. '
+                'YOLO_TTA_MAIN_GPU_STAGE_INFERENCE_PRIORITY=0 restores opportunistic leasing.'
+            )
         pinned_tokens = [
             _pin_cuda_visible_device_token(int(idx)) for idx in gpu_logical_indices
         ]
@@ -38714,6 +38930,14 @@ def main() -> None:
             and float(args.min_conf) <= 0.0
             and float(args.min_radius) <= 0.0
         )
+        chunk_hole_fill_enabled = bool(gpu_worker_chunk_hole_fill_enabled())
+        if gpu_worker_device_hole_fill and not chunk_hole_fill_enabled:
+            print(
+                'Split-view hole fill moved off the inference handoff (v16.0.7): multi-chunk '
+                'full-frame views run one completed-view CPU pass instead of a CuPy label/fill '
+                'barrier after every GPU lease. YOLO_TTA_GPU_WORKER_CHUNK_HOLE_FILL=1 restores '
+                'the per-chunk device pass.'
+            )
         fullframe_subtasks_per_view: Dict[Tuple[str, str], int] = {}
         next_task_id = 0
         for kind, view, job_obj in list(pending_prediction_build_jobs):
@@ -38796,7 +39020,10 @@ def main() -> None:
                     'streaming_cleanup_min_conf': float(args.min_conf),
                     'streaming_cleanup_min_radius': float(processing_min_radius),
                     'device_hole_fill': bool(
-                        gpu_worker_device_hole_fill and str(kind) == 'fullframe' and str(result_mode) == 'direct_union'
+                        gpu_worker_device_hole_fill
+                        and str(kind) == 'fullframe'
+                        and str(result_mode) == 'direct_union'
+                        and (len(ranges) <= 1 or chunk_hole_fill_enabled)
                     ),
                 }
                 gpu_worker_tasks_by_id[int(next_task_id)] = task
@@ -39163,6 +39390,7 @@ def main() -> None:
 
     def _process_one_worker_result(msg: Dict[str, object]) -> None:
         nonlocal gpu_worker_results_collected
+        nonlocal gpu_inference_drained_at, gpu_inference_drain_announced
         mtype = str(msg.get('type'))
         if mtype == 'ready':
             print(f"GPU worker ready: device cuda:{msg.get('gpu_index')} (pid {msg.get('pid')}).")
@@ -39209,6 +39437,34 @@ def main() -> None:
             _handle_tile_group_worker_result(task, stats)
         else:
             _handle_tile_worker_result(task, stats)
+        if (
+            int(gpu_worker_results_collected) >= int(gpu_worker_total_tasks)
+            and not deferred_tile_jobs_by_parent
+        ):
+            _set_main_process_gpu_inference_priority_active(False)
+            if not bool(gpu_inference_drain_announced):
+                gpu_inference_drain_announced = True
+                gpu_inference_drained_at = time.perf_counter()
+                runtime_telemetry().gauge('pipeline.phase', 'gpu_inference_drained_scheduler_tail')
+                sink_now = nrrd_layer_sink()
+                if sink_now is not None:
+                    nrrd_done_now, nrrd_total_now = sink_now.progress_counts()
+                else:
+                    nrrd_done_now, nrrd_total_now = 0, 0
+                waiting_tiles_now = sum(
+                    len(value) for value in postprocessed_tiles_waiting_by_parent.values()
+                )
+                print('\n=== GPU inference queue drained; scheduler postprocessing continues ===')
+                print(
+                    f'Inference tasks completed={int(gpu_worker_results_collected)}/'
+                    f'{int(gpu_worker_total_tasks)}; parent_postprocess={len(view_processing_futures)}, '
+                    f'tile_cleanup={len(tile_cleanup_futures)}, tile_finalize={len(tile_finalize_futures)}, '
+                    f'tile_config_gate={len(tile_config_gate_futures)}, '
+                    f'tile_consolidation={len(tile_consolidation_futures)}, '
+                    f'waiting_tiles_for_parent={int(waiting_tiles_now)}, '
+                    f'NRRD writes={int(nrrd_done_now)}/{int(nrrd_total_now)}. '
+                    'Worker GPUs are now released for eligible output/backprojection stages.'
+                )
         _refresh_gpu_aux_interpolation_leases()
 
     # push drain — a transport-only daemon thread blocks on the process
@@ -39673,6 +39929,7 @@ def main() -> None:
                 close_prediction_volume_ref(ref, keep_temp=bool(keep_temp_artifacts))
             ready_tile_infer.clear()
         push_drain_stop.set()  # the transport thread exits within one 0.5 s tick
+        _set_main_process_gpu_inference_priority_active(False)
         if gpu_worker_process_active:
             _shutdown_gpu_worker_processes()
         prediction_volume_executor.shutdown(wait=True)
@@ -39698,6 +39955,24 @@ def main() -> None:
     _drain_completed_prediction_volume_futures()
     _drain_completed_prediction_accumulation_futures()
     _drain_completed_background_futures()
+
+    post_inference_tail_started = (
+        float(gpu_inference_drained_at)
+        if gpu_inference_drained_at is not None
+        else time.perf_counter()
+    )
+    runtime_telemetry().gauge('pipeline.phase', 'post_inference_final_assembly')
+    active_layer_sink = nrrd_layer_sink()
+    if active_layer_sink is not None:
+        nrrd_done_at_boundary, nrrd_total_at_boundary = active_layer_sink.progress_counts()
+    else:
+        nrrd_done_at_boundary, nrrd_total_at_boundary = 0, 0
+    print('\n=== Scheduler postprocessing drained; entering final assembly/output tail ===')
+    print(
+        f'Inference tasks completed={int(gpu_worker_results_collected)}/{int(gpu_worker_total_tasks)}; '
+        f'queued NRRD writes completed={int(nrrd_done_at_boundary)}/{int(nrrd_total_at_boundary)}. '
+        'Subsequent phase banners and telemetry identify every remaining tail stage.'
+    )
 
     # the scheduler's finally block above has joined every GPU worker and
     # inference/interpolation executor. Only now may CPU-only tail stages reclaim the CPU
@@ -40143,6 +40418,8 @@ def main() -> None:
         )
         voxel_volume = int(np.sum(voxel_counts, dtype=np.int64))
 
+    runtime_telemetry().gauge('pipeline.phase', 'post_output_wait')
+    print('\n=== Waiting for background video/label output tasks ===')
     output_manager.wait()
 
     nrrd_manifest_path: Optional[Path] = None
@@ -40152,6 +40429,7 @@ def main() -> None:
     nrrd_low_quality_centerline_audit_files_written = 0
     layer_sink = nrrd_layer_sink()
     if layer_sink is not None:
+        runtime_telemetry().gauge('pipeline.phase', 'post_nrrd_wait')
         print('\n=== Finishing single-layer NRRD writes ===')
         layer_sink.wait()
         nrrd_layer_files_written = int(layer_sink.layer_count())
@@ -40346,6 +40624,10 @@ def main() -> None:
         except Exception:
             pass
 
+    post_inference_tail_seconds = float(time.perf_counter() - post_inference_tail_started)
+    runtime_telemetry().gauge('post_inference_tail.seconds', post_inference_tail_seconds)
+    runtime_telemetry().gauge('pipeline.phase', 'complete')
+    print(f'\nPost-inference final assembly/output tail: {post_inference_tail_seconds:.1f}s.')
     print('\nDone.')
     print(f'Output dir: {out_dir}')
     print(f'Scratch dir: {temp_dir}')
