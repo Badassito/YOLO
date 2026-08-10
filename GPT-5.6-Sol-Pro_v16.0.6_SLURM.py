@@ -781,7 +781,7 @@ class RuntimeTelemetry:
             self.path = Path(requested)
         else:
             base = os.environ.get('SLURM_JOB_ID') or str(os.getpid())
-            self.path = Path(tempfile.gettempdir()) / f'gpt56-sol-pro-v1605-telemetry-{base}-{os.getpid()}.jsonl'
+            self.path = Path(tempfile.gettempdir()) / f'gpt56-sol-pro-v1606-telemetry-{base}-{os.getpid()}.jsonl'
 
     @contextlib.contextmanager
     def span(self, name: str, **fields: object) -> Iterator[None]:
@@ -851,7 +851,7 @@ class RuntimeTelemetry:
                     'mean_ms': (seconds * 1000.0 / calls) if calls else 0.0,
                 }
             payload: Dict[str, object] = {
-                'schema': 'gpt-5.6-sol-pro-v16.0.5.telemetry.v1',
+                'schema': 'gpt-5.6-sol-pro-v16.0.6.telemetry.v1',
                 'pid': os.getpid(),
                 'monotonic_seconds': (now_ns - self.started_ns) / 1e9,
                 'wall_time': time.time(),
@@ -9931,22 +9931,14 @@ class _DeviceUnionAccumulator:
             return 0, 0
 
     def fill_holes_2d(self) -> int:
-        """Fill enclosed 2D background per accumulated slice, ON DEVICE, in place.
+        """Fill enclosed per-slice 2D background on the device.
 
- One cupy ``label`` call per sub-block with a z-disconnected structure (3x3x3 with only
- the in-plane 4-neighbourhood set) labels every slice's background independently in a
- single kernel pass; labels touching a slice border are background, the rest are holes.
- Matches the CPU path's scipy/cv2 4-connected background semantics. Returns the number
- of frames now hole-filled (== num_frames), or 0 when skipped or failed (any host-side
- frame, cupy unavailable, VRAM pressure, or any error -> the CPU per-view pass runs)."""
+        Each block runs in a nested scope so its CuPy labels and Boolean temporaries lose
+        their final references before the CuPy pool is trimmed. Returns the filled frame
+        count, or zero so the caller performs the CPU pass when the device path is unsafe.
+        """
         torch = self.torch
-        if self.union_dev is None:
-            return 0
-        if bool(self.host_written):
-            # Some frame bypassed the device union and wrote the host window directly; its
-            # device slice is zero, so a device fill would miss it. Report 0 so the CPU
-            # per-view pass covers the whole view. Frames that are merely EMPTY (no payload,
-            # no write anywhere) are fine: filling an empty slice is a no-op on both paths.
+        if self.union_dev is None or bool(self.host_written):
             return 0
         cp_mod = _try_import_cupy_ndimage()
         if cp_mod is None:
@@ -9955,14 +9947,15 @@ class _DeviceUnionAccumulator:
         n, h, w = (int(x) for x in self.union_dev.shape)
         if n <= 0 or h < 3 or w < 3:
             return 0
+        dev_idx = int(getattr(self.device, 'index', 0) or 0)
+        structure = None
+        filled = 0
         try:
-            # Order every postprocess side-stream's writes before the cupy reads.
             torch.cuda.synchronize(self.device)
-            dev_idx = int(getattr(self.device, 'index', 0) or 0)
             block = max(1, _env_int('YOLO_TTA_GPU_HOLE_FILL_BLOCK', 64))
             with cp.cuda.Device(dev_idx):
                 while block > 1:
-                    need = int(block) * h * w * 6 + 512 * 1024 * 1024  # int32 labels + 2x bool
+                    need = int(block) * h * w * 6 + 512 * 1024 * 1024
                     free_bytes, _total = torch.cuda.mem_get_info(self.device)
                     if int(free_bytes) >= int(need):
                         break
@@ -9973,13 +9966,13 @@ class _DeviceUnionAccumulator:
                 structure[1, 2, 1] = True
                 structure[1, 1, 0] = True
                 structure[1, 1, 2] = True
-                for z0 in range(0, n, int(block)):
-                    z1 = min(n, z0 + int(block))
-                    blk = cp.asarray(self.union_dev[z0:z1])  # zero-copy CUDA-array-interface view
+
+                def _fill_block(z0: int, z1: int) -> None:
+                    blk = cp.asarray(self.union_dev[int(z0):int(z1)])
                     bg = blk == 0
                     labels, num = cpx_ndi.label(bg, structure=structure)
                     if int(num) <= 0:
-                        continue
+                        return
                     touches = cp.zeros((int(num) + 1,), dtype=cp.bool_)
                     touches[cp.unique(labels[:, 0, :])] = True
                     touches[cp.unique(labels[:, -1, :])] = True
@@ -9987,16 +9980,23 @@ class _DeviceUnionAccumulator:
                     touches[cp.unique(labels[:, :, -1])] = True
                     enclosed = bg & ~touches[labels]
                     if bool(enclosed.any()):
-                        blk[enclosed] = cp.uint8(1)  # writes through to union_dev
+                        blk[enclosed] = cp.uint8(1)
+
+                for z0 in range(0, n, int(block)):
+                    _fill_block(int(z0), min(n, int(z0) + int(block)))
                 cp.cuda.get_current_stream().synchronize()
-            return int(n)
+                filled = int(n)
         except Exception:
-            return 0
+            filled = 0
         finally:
+            structure = None
+            gc.collect()
             try:
-                cp.get_default_memory_pool().free_all_blocks()
+                with cp.cuda.Device(dev_idx):
+                    cp.get_default_memory_pool().free_all_blocks()
             except Exception:
                 pass
+        return int(filled)
 
     def compute_slice_metadata(self) -> Optional[Dict[str, np.ndarray]]:
         """Return compact per-slice foreground metadata from the device union.
@@ -16717,26 +16717,35 @@ def _try_label_slices_stage_a_gpu(
     if z_dim <= 0 or h < 2 or w < 2:
         return False, None
 
-    # Filled once admission succeeds. Keeping this outside the guarded body lets
-    # every exit path release cached allocations on *all* participating devices rather
-    # than whichever CUDA device happens to be current in the coordinator thread.
+    # Device leases cover admission, execution, reference teardown and allocator trimming.
+    # Returned edge planes and completed futures can retain CuPy blocks after the kernels
+    # finish, so those references are explicitly dropped before either allocator is trimmed.
     device_indices: List[int] = []
+    stage_leases: Dict[int, _MainProcessGpuStageLease] = {}
+    pending: Dict[int, Future] = {}
+    previous_result = result = None
+    prev_cp = curr_cp = copied_prev = boundary_dev = None
 
     def _free_admitted_device_pools() -> None:
-        if device_indices:
-            for cleanup_dev_idx in device_indices:
-                try:
-                    with cp.cuda.Device(int(cleanup_dev_idx)):
-                        cp.get_default_memory_pool().free_all_blocks()
-                except Exception:
-                    pass
-            return
-        # No device was admitted, so preserve the former best-effort cleanup for
-        # failures that occur before the selected-device list is finalized.
-        try:
-            cp.get_default_memory_pool().free_all_blocks()
-        except Exception:
-            pass
+        cleanup_indices = sorted({int(v) for v in device_indices} or {int(v) for v in stage_leases})
+        for cleanup_dev_idx in cleanup_indices:
+            try:
+                _trim_main_process_cuda_device(
+                    torch,
+                    torch.device(f'cuda:{int(cleanup_dev_idx)}'),
+                    cupy_module=cp,
+                    desc='GPU per-slice labeling cleanup',
+                )
+            except Exception:
+                pass
+
+    def _release_stage_leases() -> None:
+        for cleanup_dev_idx, lease in list(stage_leases.items()):
+            try:
+                lease.release()
+            except Exception:
+                pass
+            stage_leases.pop(int(cleanup_dev_idx), None)
 
     try:
         visible_count = max(0, int(torch.cuda.device_count()))
@@ -16749,6 +16758,24 @@ def _try_label_slices_stage_a_gpu(
         ]
         if not candidate_indices:
             candidate_indices = list(range(visible_count))
+
+        leased_candidates: List[int] = []
+        for dev_idx in candidate_indices:
+            lease = _try_acquire_specific_main_process_gpu_stage(
+                torch, int(dev_idx), 'GPU per-slice labeling',
+            )
+            if lease is None:
+                continue
+            stage_leases[int(dev_idx)] = lease
+            leased_candidates.append(int(dev_idx))
+        candidate_indices = leased_candidates
+        if not candidate_indices:
+            _announce_main_gpu_stage_skip_once(
+                'gpu-slice-labeling-inference-busy',
+                'GPU per-slice labeling skipped while all configured GPUs have active/queued '
+                'inference or another output-stage lease; using CPU slice labeling.',
+            )
+            return False, None
 
         requested_device_cap = max(
             1,
@@ -16793,6 +16820,12 @@ def _try_label_slices_stage_a_gpu(
         block = min(int(item[1]) for item in admitted)
         provisional_block_count = int(math.ceil(float(z_dim) / float(max(1, int(block)))))
         device_indices = device_indices[:max(1, min(len(device_indices), int(provisional_block_count)))]
+        selected_set = {int(v) for v in device_indices}
+        for unused_idx, unused_lease in list(stage_leases.items()):
+            if int(unused_idx) in selected_set:
+                continue
+            unused_lease.release()
+            stage_leases.pop(int(unused_idx), None)
         block_assignments = _round_robin_topology_gpu_blocks(
             int(z_dim), int(block), device_indices,
         )
@@ -17023,9 +17056,9 @@ def _try_label_slices_stage_a_gpu(
         # i%N, so independent z blocks are genuinely round-robin without concurrent calls
         # fighting over one device's allocator/default stream.
         lane_count = max(1, len(device_indices))
-        previous_result: Optional[_GpuSliceLabelBlockResult] = None
+        previous_result = None
         with ThreadPoolExecutor(max_workers=lane_count, thread_name_prefix='slice-label-gpu') as executor:
-            pending: Dict[int, Future] = {}
+            pending = {}
             for block_idx in range(min(lane_count, len(block_assignments))):
                 z0, z1, dev_idx = block_assignments[block_idx]
                 pending[block_idx] = executor.submit(_label_block, z0, z1, dev_idx)
@@ -17105,16 +17138,13 @@ def _try_label_slices_stage_a_gpu(
                     z0, z1, dev_idx = block_assignments[next_idx]
                     pending[next_idx] = executor.submit(_label_block, z0, z1, dev_idx)
 
-        _free_admitted_device_pools()
         return True, precomputed_pairs
     except _LocalLabelCapacityError:
         # The result is data-dependent, not a GPU backend failure. Re-raise before the
         # generic fallback's full-store zero sweep and duplicate CPU labeling pass.
-        _free_admitted_device_pools()
         raise
     except Exception as exc:
         print(f'Warning: GPU per-slice labeling failed ({exc}); falling back to the CPU labeling stage.')
-        _free_admitted_device_pools()
         # Zero everything the GPU pass may have written so the CPU stage starts from a
         # clean store (the CPU fallback only rewrites each nonempty slice's bbox window).
         for z in range(0, int(z_dim)):
@@ -17134,6 +17164,15 @@ def _try_label_slices_stage_a_gpu(
             for z in range(len(slice_areas)):
                 slice_areas[z] = None
         return False, None
+    finally:
+        # Futures and block-boundary results own the retained device edge planes. Clear
+        # them before freeing CuPy/Torch pools so the blocks become driver-reclaimable now.
+        pending.clear()
+        previous_result = result = None
+        prev_cp = curr_cp = copied_prev = boundary_dev = None
+        gc.collect()
+        _free_admitted_device_pools()
+        _release_stage_leases()
 
 
 def label_foreground_volume_streaming(
@@ -18272,34 +18311,338 @@ def build_dense_radial_backprojection_map(
     return dense_map
 
 
-def _pick_gpu_compute_device(torch_mod: object) -> object:
-    """Pick the CUDA device with the most free VRAM for main-process GPU stages.
+def main_process_gpu_stage_inference_overlap_enabled() -> bool:
+    """Allow main-process GPU output stages to overlap worker inference on one device."""
+    return _env_flag('YOLO_TTA_MAIN_GPU_STAGE_INFERENCE_OVERLAP', False)
 
- ``YOLO_TTA_GPU_BACKPROJECT_DEVICE=<index>`` overrides the automatic choice."""
-    explicit = os.environ.get('YOLO_TTA_GPU_BACKPROJECT_DEVICE', '').strip()
-    if explicit:
+
+class _MainProcessGpuStageLease:
+    """Exclusive main-process lease for one logical CUDA device."""
+
+    def __init__(self, coordinator: '_MainProcessGpuStageCoordinator', device_index: int, purpose: str) -> None:
+        self._coordinator = coordinator
+        self.device_index = int(device_index)
+        self.purpose = str(purpose)
+        self._released = False
+
+    def torch_device(self, torch_mod: object) -> object:
+        return torch_mod.device(f'cuda:{int(self.device_index)}')
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._coordinator.release_stage(self.device_index, self.purpose)
+
+    def __enter__(self) -> '_MainProcessGpuStageLease':
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.release()
+
+    def __del__(self) -> None:  # pragma: no cover - final safety net
         try:
-            return torch_mod.device(f'cuda:{int(explicit)}')
+            self.release()
+        except Exception:
+            pass
+
+
+class _MainProcessGpuStageCoordinator:
+    """Coordinate device ownership across independent CUDA allocator processes.
+
+    A main-process output stage and an inference worker cannot safely admit against the
+    same free-memory snapshot: either process may allocate immediately after the other
+    samples it. Dispatch accounting therefore includes both queued and running worker tasks.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._worker_devices: set[int] = set()
+        self._inference_inflight: Counter[int] = Counter()
+        self._stage_leases: Dict[int, str] = {}
+        self._wake_callback: Optional[Callable[[], None]] = None
+
+    def configure_workers(self, worker_devices: Sequence[int]) -> None:
+        with self._lock:
+            self._worker_devices = {int(v) for v in worker_devices}
+            self._inference_inflight.clear()
+            self._stage_leases.clear()
+
+    def set_wake_callback(self, callback: Optional[Callable[[], None]]) -> None:
+        with self._lock:
+            self._wake_callback = callback
+
+    def reset(self) -> None:
+        with self._lock:
+            self._worker_devices.clear()
+            self._inference_inflight.clear()
+            self._stage_leases.clear()
+            self._wake_callback = None
+
+    def can_dispatch_inference(self, device_index: int) -> bool:
+        if main_process_gpu_stage_inference_overlap_enabled():
+            return True
+        with self._lock:
+            return int(device_index) not in self._stage_leases
+
+    def begin_inference(self, device_index: int) -> bool:
+        device = int(device_index)
+        with self._lock:
+            if (
+                not main_process_gpu_stage_inference_overlap_enabled()
+                and device in self._stage_leases
+            ):
+                return False
+            self._inference_inflight[device] += 1
+            return True
+
+    def finish_inference(self, device_index: int) -> None:
+        device = int(device_index)
+        with self._lock:
+            remaining = int(self._inference_inflight.get(device, 0)) - 1
+            if remaining > 0:
+                self._inference_inflight[device] = remaining
+            else:
+                self._inference_inflight.pop(device, None)
+
+    def try_acquire_specific_stage(
+        self,
+        torch_mod: object,
+        device_index: int,
+        purpose: str,
+    ) -> Optional[_MainProcessGpuStageLease]:
+        device = int(device_index)
+        try:
+            count = int(torch_mod.cuda.device_count())
+        except Exception:
+            return None
+        if device < 0 or device >= count:
+            return None
+        with self._lock:
+            overlap = bool(main_process_gpu_stage_inference_overlap_enabled())
+            if device in self._stage_leases:
+                return None
+            if not overlap and int(self._inference_inflight.get(device, 0)) > 0:
+                return None
+            aux_pool = gpu_worker_aux_interpolation_pool()
+            if aux_pool is not None and not bool(aux_pool.revoke_worker(device)):
+                return None
+            self._stage_leases[device] = str(purpose)
+            return _MainProcessGpuStageLease(self, device, str(purpose))
+
+    def try_acquire_stage(self, torch_mod: object, purpose: str) -> Optional[_MainProcessGpuStageLease]:
+        try:
+            count = int(torch_mod.cuda.device_count())
+        except Exception:
+            return None
+        if count <= 0:
+            return None
+        with self._lock:
+            configured = sorted(
+                int(idx) for idx in self._worker_devices
+                if 0 <= int(idx) < int(count)
+            )
+            eligible_devices = configured if configured else list(range(count))
+            explicit = os.environ.get('YOLO_TTA_GPU_BACKPROJECT_DEVICE', '').strip()
+            if explicit:
+                try:
+                    requested = int(explicit)
+                except Exception:
+                    return None
+                candidates = [requested] if requested in eligible_devices else []
+            else:
+                candidates = list(eligible_devices)
+            if not candidates:
+                return None
+
+            overlap = bool(main_process_gpu_stage_inference_overlap_enabled())
+            available = [
+                idx for idx in candidates
+                if idx not in self._stage_leases
+                and (overlap or int(self._inference_inflight.get(idx, 0)) == 0)
+            ]
+            if not available:
+                return None
+            # An idle worker may have been offered to the auxiliary interpolation pool.
+            # Revoke that offer before assigning its physical GPU to a main-process stage;
+            # a running auxiliary pass remains authoritative and makes the device ineligible.
+            aux_pool = gpu_worker_aux_interpolation_pool()
+            if aux_pool is not None:
+                available = [
+                    idx for idx in available
+                    if bool(aux_pool.revoke_worker(int(idx)))
+                ]
+            if not available:
+                return None
+            best_index: Optional[int] = None
+            best_free = -1
+            for idx in available:
+                try:
+                    free_bytes, _total = torch_mod.cuda.mem_get_info(
+                        torch_mod.device(f'cuda:{int(idx)}')
+                    )
+                except Exception:
+                    continue
+                if int(free_bytes) > int(best_free):
+                    best_free = int(free_bytes)
+                    best_index = int(idx)
+            if best_index is None:
+                return None
+            self._stage_leases[int(best_index)] = str(purpose)
+            return _MainProcessGpuStageLease(self, int(best_index), str(purpose))
+
+    def release_stage(self, device_index: int, purpose: str) -> None:
+        callback: Optional[Callable[[], None]] = None
+        with self._lock:
+            current = self._stage_leases.get(int(device_index))
+            if current == str(purpose):
+                self._stage_leases.pop(int(device_index), None)
+            callback = self._wake_callback
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                pass
+
+    def snapshot(self) -> Dict[str, object]:
+        with self._lock:
+            return {
+                'worker_devices': sorted(self._worker_devices),
+                'inference_inflight': dict(self._inference_inflight),
+                'stage_leases': dict(self._stage_leases),
+            }
+
+
+_MAIN_PROCESS_GPU_STAGE_COORDINATOR = _MainProcessGpuStageCoordinator()
+_MAIN_GPU_STAGE_SKIP_WARNED: set[str] = set()
+_MAIN_GPU_STAGE_SKIP_WARNED_LOCK = threading.Lock()
+
+
+def _configure_main_process_gpu_stage_workers(worker_devices: Sequence[int]) -> None:
+    _MAIN_PROCESS_GPU_STAGE_COORDINATOR.configure_workers(worker_devices)
+
+
+def _reset_main_process_gpu_stage_coordinator() -> None:
+    _MAIN_PROCESS_GPU_STAGE_COORDINATOR.reset()
+
+
+def _set_main_process_gpu_stage_wake_callback(callback: Optional[Callable[[], None]]) -> None:
+    _MAIN_PROCESS_GPU_STAGE_COORDINATOR.set_wake_callback(callback)
+
+
+def _main_process_gpu_stage_can_dispatch_inference(device_index: int) -> bool:
+    return _MAIN_PROCESS_GPU_STAGE_COORDINATOR.can_dispatch_inference(int(device_index))
+
+
+def _main_process_gpu_stage_begin_inference(device_index: int) -> bool:
+    return _MAIN_PROCESS_GPU_STAGE_COORDINATOR.begin_inference(int(device_index))
+
+
+def _main_process_gpu_stage_finish_inference(device_index: int) -> None:
+    _MAIN_PROCESS_GPU_STAGE_COORDINATOR.finish_inference(int(device_index))
+
+
+def _try_acquire_main_process_gpu_stage(
+    torch_mod: object,
+    purpose: str,
+) -> Optional[_MainProcessGpuStageLease]:
+    return _MAIN_PROCESS_GPU_STAGE_COORDINATOR.try_acquire_stage(torch_mod, str(purpose))
+
+
+def _try_acquire_specific_main_process_gpu_stage(
+    torch_mod: object,
+    device_index: int,
+    purpose: str,
+) -> Optional[_MainProcessGpuStageLease]:
+    return _MAIN_PROCESS_GPU_STAGE_COORDINATOR.try_acquire_specific_stage(
+        torch_mod, int(device_index), str(purpose),
+    )
+
+
+def _announce_main_gpu_stage_skip_once(key: str, message: str) -> None:
+    with _MAIN_GPU_STAGE_SKIP_WARNED_LOCK:
+        if str(key) in _MAIN_GPU_STAGE_SKIP_WARNED:
+            return
+        _MAIN_GPU_STAGE_SKIP_WARNED.add(str(key))
+    print(str(message))
+
+
+def _trim_main_process_cuda_device(
+    torch_mod: object,
+    device: object,
+    *,
+    cupy_module: Optional[object] = None,
+    desc: str = 'main-process GPU stage',
+) -> None:
+    """Return completed stage allocations to the driver for worker-process reuse."""
+    before_reserved: Optional[int] = None
+    before_free: Optional[int] = None
+    after_reserved: Optional[int] = None
+    after_free: Optional[int] = None
+    try:
+        before_reserved = int(torch_mod.cuda.memory_reserved(device))
+    except Exception:
+        pass
+    try:
+        before_free = int(torch_mod.cuda.mem_get_info(device)[0])
+    except Exception:
+        pass
+    try:
+        torch_mod.cuda.synchronize(device)
+    except Exception:
+        pass
+    gc.collect()
+    if cupy_module is not None:
+        try:
+            dev_index = getattr(device, 'index', None)
+            if dev_index is None:
+                dev_index = int(torch_mod.cuda.current_device())
+            with cupy_module.cuda.Device(int(dev_index)):
+                cupy_module.get_default_memory_pool().free_all_blocks()
+                cupy_module.get_default_pinned_memory_pool().free_all_blocks()
         except Exception:
             pass
     try:
-        count = int(torch_mod.cuda.device_count())
+        with torch_mod.cuda.device(device):
+            torch_mod.cuda.empty_cache()
     except Exception:
-        count = 1
-    if count <= 1:
-        return torch_mod.device('cuda:0')
-    best_idx = 0
-    best_free = -1
-    for idx in range(count):
-        try:
-            free_bytes, _total = torch_mod.cuda.mem_get_info(torch_mod.device(f'cuda:{idx}'))
-        except Exception:
-            continue
-        if int(free_bytes) > int(best_free):
-            best_free = int(free_bytes)
-            best_idx = int(idx)
-    return torch_mod.device(f'cuda:{best_idx}')
-
+        pass
+    gc.collect()
+    try:
+        after_reserved = int(torch_mod.cuda.memory_reserved(device))
+    except Exception:
+        pass
+    try:
+        after_free = int(torch_mod.cuda.mem_get_info(device)[0])
+    except Exception:
+        pass
+    released = (
+        max(0, int(before_reserved) - int(after_reserved))
+        if before_reserved is not None and after_reserved is not None else 0
+    )
+    free_gain = (
+        max(0, int(after_free) - int(before_free))
+        if before_free is not None and after_free is not None else 0
+    )
+    if (
+        released >= 256 * 1024 * 1024
+        or free_gain >= 256 * 1024 * 1024
+        or _env_flag('YOLO_TTA_GPU_MEMORY_RELEASE_LOG', False)
+    ):
+        dev_index = getattr(device, 'index', None)
+        dev_label = f'cuda:{int(dev_index)}' if dev_index is not None else str(device)
+        reserved_text = (
+            f'{before_reserved / GIB:.2f}->{after_reserved / GIB:.2f} GiB'
+            if before_reserved is not None and after_reserved is not None else 'unavailable'
+        )
+        free_text = (
+            f'{before_free / GIB:.2f}->{after_free / GIB:.2f} GiB'
+            if before_free is not None and after_free is not None else 'unavailable'
+        )
+        print(
+            f'{desc}: released main-process CUDA cache on {dev_label}; '
+            f'reserved={reserved_text}, driver_free={free_text}.'
+        )
 
 def _radial_row_occupancy(radial_mask_mm: np.ndarray, desc: str) -> np.ndarray:
     """Compute a per-stack-row foreground bitmap over an azimuth-major Radial volume."""
@@ -18489,6 +18832,7 @@ class _ResidentTensorRTRingExecutor:
         self.torch = torch
         self._closed = False
         self.backend = backend
+        self.device = slots[0].input.device if slots else torch.device('cuda:0')
         self.engine = _trt_engine_from_autobackend(backend)
         if self.engine is None:
             raise RuntimeError('AutoBackend does not expose a TensorRT ICudaEngine')
@@ -19038,6 +19382,36 @@ class _ResidentTensorRTRingExecutor:
             slot.native_to_out = tuple()
             slot._cupy_refs.clear()
             slot._render_cupy_refs.clear()
+            slot.input = None
+            slot.render_meta = None
+            slot.render_done = None
+            slot.infer_done = None
+            slot.post_done = None
+            slot.infer_stream = None
+            slot.post_stream = None
+        # The replacement TensorRT context is allocated outside PyTorch's caching
+        # allocator. Return the now-unowned ring storage to the driver before that
+        # context is created instead of merely leaving it reusable by PyTorch.
+        try:
+            self.slots.clear()
+        except Exception:
+            pass
+        self._borrowed_context = None
+        self._restore_tensor_addresses = {}
+        gc.collect()
+        try:
+            cp = getattr(getattr(self, 'kernels', None), 'cp', None)
+            if cp is not None:
+                dev_idx = int(getattr(self.device, 'index', 0) or 0)
+                with cp.cuda.Device(dev_idx):
+                    cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+        try:
+            with self.torch.cuda.device(self.device):
+                self.torch.cuda.empty_cache()
+        except Exception:
+            pass
         if restore_error is not None:
             raise _ResidentTensorRTRingFatalError(
                 'failed to restore every AutoBackend TensorRT binding address; fallback is unsafe'
@@ -19752,13 +20126,8 @@ def _radial_backproject_gpu_resident(
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
     sink_only: bool = False,
 ) -> bool:
-    """Backproject a fully resident Radial volume with overlapped upload, CUDA work, and host commit.
-    
-    An optional transposed device layout improves azimuth locality while preserving a bounded fallback."""
+    """Run full-resident Radial backprojection under an inference-exclusive GPU lease."""
     if not gpu_resident_radial_backproject_enabled():
-        return False
-    kernels = _radial_resident_backproject_kernel()
-    if kernels is None:
         return False
     try:
         import torch  # type: ignore
@@ -19766,7 +20135,66 @@ def _radial_backproject_gpu_resident(
             return False
     except Exception:
         return False
-    dev = _pick_gpu_compute_device(torch)
+    lease = _try_acquire_main_process_gpu_stage(
+        torch, f'{desc} full-resident Radial backprojection',
+    )
+    if lease is None:
+        _announce_main_gpu_stage_skip_once(
+            'radial-resident-inference-busy',
+            f'{desc}: full-resident GPU backprojection skipped because every eligible GPU '
+            'has active/queued inference or another main-process GPU stage; trying the bounded fallback.',
+        )
+        return False
+    try:
+        dev = lease.torch_device(torch)
+        # NVRTC/module initialization is itself a CUDA allocation. Keep it inside the
+        # same exclusive interval as the large source upload.
+        with torch.cuda.device(dev):
+            kernels = _radial_resident_backproject_kernel()
+        if kernels is None:
+            return False
+        return _radial_backproject_gpu_resident_on_device(
+            radial_mask_mm,
+            vol_mm,
+            valid_mask,
+            source_idx_map,
+            u_idx_map,
+            v_range_for_t,
+            int(t_dim),
+            int(out_h),
+            int(out_w),
+            str(desc),
+            known_row_occupancy=known_row_occupancy,
+            projection_block_callback=projection_block_callback,
+            sink_only=bool(sink_only),
+            kernels=kernels,
+            torch=torch,
+            dev=dev,
+        )
+    finally:
+        lease.release()
+
+
+def _radial_backproject_gpu_resident_on_device(
+    radial_mask_mm: np.ndarray,
+    vol_mm: Optional[np.ndarray],
+    valid_mask: np.ndarray,
+    source_idx_map: np.ndarray,
+    u_idx_map: np.ndarray,
+    v_range_for_t: Callable[[int], Tuple[int, int]],
+    t_dim: int,
+    out_h: int,
+    out_w: int,
+    desc: str,
+    known_row_occupancy: Optional[np.ndarray] = None,
+    projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
+    sink_only: bool = False,
+    *,
+    kernels: object,
+    torch: object,
+    dev: object,
+) -> bool:
+    """Backproject a fully resident Radial volume with overlapped upload and host commit."""
     n_az, work_t, u_len = (int(v) for v in radial_mask_mm.shape)
     plane_px = int(out_h) * int(out_w)
     t_chunk = max(1, _env_int('YOLO_TTA_GPU_BACKPROJECT_RESIDENT_T_CHUNK', 64))
@@ -19824,20 +20252,30 @@ def _radial_backproject_gpu_resident(
             dev_index = int(torch.cuda.current_device())
         except Exception:
             dev_index = 0
-    compute_stream = torch.cuda.Stream(device=dev)
-    copy_stream = torch.cuda.Stream(device=dev)
+    compute_stream = None
+    copy_stream = None
     phase_start = time.perf_counter()
     upload_seconds = 0.0
     transpose_seconds = 0.0
     projection_seconds = 0.0
     commit_cpu_seconds = 0.0
     radial_dev = tmajor_dev = source_dev = u_dev = None
+    compute_tensor = compute_kernel = external = None
+    cp_source = cp_u = cp_azmajor = cp_tmajor = cp_radial = None
+    compute_done = copy_done = event = prior = block = None
     out_dev_slots: List[object] = []
     pin_src_slots: List[object] = []
     pin_out_slots: List[object] = []
+    cp_out_slots: List[object] = []
+    pin_src_arrays: List[np.ndarray] = []
+    pin_out_arrays: List[np.ndarray] = []
+    upload_events: List[Optional[object]] = []
     commit_pool: Optional[ThreadPoolExecutor] = None
     commit_futures: List[Optional[Future]] = []
+    layout = 'azimuth-major'
     try:
+        compute_stream = torch.cuda.Stream(device=dev)
+        copy_stream = torch.cuda.Stream(device=dev)
         # Torch and CuPy keep independent current-device state. Pin both explicitly so
         # the late-tail scheduler may choose any visible GPU, not only cuda:0.
         with torch.cuda.device(dev), cp.cuda.Device(int(dev_index)), torch.cuda.stream(compute_stream):
@@ -19858,7 +20296,7 @@ def _radial_backproject_gpu_resident(
                     (az_chunk, work_t, u_len), dtype=torch.uint8, pin_memory=True,
                 ))
             pin_src_arrays = [slot.numpy() for slot in pin_src_slots]
-            upload_events: List[Optional[object]] = [None] * len(pin_src_slots)
+            upload_events = [None] * len(pin_src_slots)
             upload_t0 = time.perf_counter()
             for chunk_idx, a0 in enumerate(tqdm(
                 range(0, n_az, az_chunk), desc=f'{desc} [resident H2D]',
@@ -20053,18 +20491,15 @@ def _radial_backproject_gpu_resident(
     finally:
         active_exception = sys.exc_info()[0] is not None
         cleanup_error: Optional[BaseException] = None
-        # exception safety: a callback failure can leave later D2Hs queued while their
-        # commit futures have not started. Quiesce both CUDA streams before any future can
-        # be cancelled and before device/pinned slot references are released.
         for owned_stream in (compute_stream, copy_stream):
+            if owned_stream is None:
+                continue
             try:
                 owned_stream.synchronize()
             except BaseException as exc:
                 if cleanup_error is None:
                     cleanup_error = exc
         if commit_pool is not None:
-            # Never cancel these event-wait futures: every submitted callback either commits
-            # or reports its own failure after the associated D2H becomes quiescent.
             for fut in commit_futures:
                 if fut is None:
                     continue
@@ -20078,16 +20513,32 @@ def _radial_backproject_gpu_resident(
             except BaseException as exc:
                 if cleanup_error is None:
                     cleanup_error = exc
-        try:
-            del radial_dev, tmajor_dev, source_dev, u_dev
-            del out_dev_slots, pin_src_slots, pin_out_slots
-        except Exception:
-            pass
-        try:
-            with torch.cuda.device(dev):
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
+        # Drop every Torch owner, CuPy zero-copy alias, event, stream and NumPy view first.
+        # Trimming either allocator while one of these references is live leaves the large
+        # source/output blocks reserved until a later allocation fails.
+        commit_futures.clear()
+        upload_events.clear()
+        cp_out_slots.clear()
+        pin_src_arrays.clear()
+        pin_out_arrays.clear()
+        out_dev_slots.clear()
+        pin_src_slots.clear()
+        pin_out_slots.clear()
+        cp_radial = cp_azmajor = cp_tmajor = cp_source = cp_u = None
+        compute_tensor = compute_kernel = external = None
+        compute_done = copy_done = event = prior = block = None
+        radial_dev = tmajor_dev = source_dev = u_dev = None
+        commit_pool = None
+        fut = owned_stream = None
+        compute_stream = copy_stream = None
+        gc.collect()
+
+        _trim_main_process_cuda_device(
+            torch,
+            dev,
+            cupy_module=cp,
+            desc=f'{desc} full-resident backprojection cleanup',
+        )
         if cleanup_error is not None and not bool(active_exception):
             raise cleanup_error
 
@@ -20106,22 +20557,67 @@ def _radial_backproject_gpu_streaming(
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
     sink_only: bool = False,
 ) -> bool:
-    """Backproject a Radial volume through a bounded streaming GPU working set."""
+    """Run bounded Radial backprojection under an inference-exclusive GPU lease."""
     try:
         import torch  # type: ignore
-    except Exception:
-        return False
-    try:
         if not bool(torch.cuda.is_available()):
             return False
     except Exception:
         return False
-    dev = _pick_gpu_compute_device(torch)
+    lease = _try_acquire_main_process_gpu_stage(
+        torch, f'{desc} streaming Radial backprojection',
+    )
+    if lease is None:
+        _announce_main_gpu_stage_skip_once(
+            'radial-streaming-inference-busy',
+            f'{desc}: streaming GPU backprojection skipped because every eligible GPU '
+            'has active/queued inference or another main-process GPU stage; using the CPU path.',
+        )
+        return False
+    try:
+        return _radial_backproject_gpu_streaming_on_device(
+            radial_mask_mm,
+            vol_mm,
+            valid_pos,
+            flat_src,
+            v_range_for_t,
+            int(t_dim),
+            int(out_h),
+            int(out_w),
+            str(desc),
+            known_row_occupancy=known_row_occupancy,
+            known_slice_bboxes=known_slice_bboxes,
+            projection_block_callback=projection_block_callback,
+            sink_only=bool(sink_only),
+            torch=torch,
+            dev=lease.torch_device(torch),
+        )
+    finally:
+        lease.release()
+
+
+def _radial_backproject_gpu_streaming_on_device(
+    radial_mask_mm: np.ndarray,
+    vol_mm: Optional[np.ndarray],
+    valid_pos: np.ndarray,
+    flat_src: np.ndarray,
+    v_range_for_t: Callable[[int], Tuple[int, int]],
+    t_dim: int,
+    out_h: int,
+    out_w: int,
+    desc: str,
+    known_row_occupancy: Optional[np.ndarray] = None,
+    known_slice_bboxes: Optional[np.ndarray] = None,
+    projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
+    sink_only: bool = False,
+    *,
+    torch: object,
+    dev: object,
+) -> bool:
+    """Backproject a Radial volume through a bounded streaming GPU working set."""
     n_az, work_t, u_len = (int(x) for x in radial_mask_mm.shape)
     plane_px = int(out_h) * int(out_w)
-    # 128 output planes is the default projection quantum (256 is also supported
-    # through the existing environment override). This amortizes map gathers and lets the
-    # source be transposed into t-major order once per block instead of once per row.
+    # A larger projection quantum amortizes map gathers and the t-major staging transpose.
     t_chunk = max(1, _env_int('YOLO_TTA_GPU_BACKPROJECT_T_CHUNK', 128))
     cross_bytes = int(n_az) * int(u_len)
     try:
@@ -20133,10 +20629,10 @@ def _radial_backproject_gpu_streaming(
         rows = int(math.ceil(float(chunk_planes) * float(work_t) / float(max(1, t_dim)))) + 2
         need_bytes = (
             int(valid_pos.nbytes) + int(flat_src.nbytes)
-            + rows * cross_bytes                         # t-major source rows
-            + rows * int(flat_src.shape[0])              # gathered (rows, valid P)
-            + int(chunk_planes) * int(flat_src.shape[0]) # vectorized per-t reduction
-            + 2 * int(chunk_planes) * plane_px           # device + pinned output planes
+            + rows * cross_bytes
+            + rows * int(flat_src.shape[0])
+            + int(chunk_planes) * int(flat_src.shape[0])
+            + 2 * int(chunk_planes) * plane_px
             + 512 * 1024 * 1024
         )
         return int(rows), int(need_bytes)
@@ -20152,8 +20648,6 @@ def _radial_backproject_gpu_streaming(
         )
         return False
 
-    # one sequential occupancy pass replaces ~O(chunks x rows) strided rescans.
-    # the device union already produced this bitmap; skip even that one pass.
     if known_row_occupancy is not None and int(np.asarray(known_row_occupancy).shape[0]) == int(work_t):
         row_any = np.asarray(known_row_occupancy, dtype=bool)
     else:
@@ -20162,8 +20656,17 @@ def _radial_backproject_gpu_streaming(
         known_slice_bboxes, int(n_az), int(work_t), int(u_len),
     )
     stage_workers = max(1, min(8, _cpu_count()))
-    stage_pool = _acquire_parallel_pool(stage_workers)  # checkout-cached
+    stage_pool = _acquire_parallel_pool(stage_workers)
 
+    stream = None
+    valid_pos_t = flat_src_t = None
+    pin_rows = pin_out = None
+    pin_rows_np = pin_out_np = None
+    out_dev = reduced_dev = None
+    rows_dev = gathered = None
+    pair_row_t = pair_out_t = pair_values = reduced = sub = None
+    cleanup_error: Optional[BaseException] = None
+    active_exception = False
     try:
         stream = torch.cuda.Stream(device=dev)
         with torch.cuda.stream(stream):
@@ -20179,6 +20682,8 @@ def _radial_backproject_gpu_streaming(
             )
             scatter_reduce_supported = True
             for t0 in tqdm(range(0, int(t_dim), t_chunk), desc=f'{desc} [gpu]'):
+                rows_dev = gathered = None
+                pair_row_t = pair_out_t = pair_values = reduced = sub = None
                 t1 = min(int(t_dim), t0 + t_chunk)
                 v0 = v_range_for_t(int(t0))[0]
                 v1 = v_range_for_t(int(t1 - 1))[1]
@@ -20192,7 +20697,7 @@ def _radial_backproject_gpu_streaming(
                         desc=desc,
                         required=bool(sink_only),
                     )
-                    continue  # dense output (when present) is pre-zeroed
+                    continue
                 if int(v_count) > int(pin_rows.shape[0]):  # pragma: no cover - conservative bound
                     raise RuntimeError(f'{desc}: covering rows {v_count} exceed staging bound {pin_rows.shape[0]}')
 
@@ -20206,7 +20711,7 @@ def _radial_backproject_gpu_streaming(
                     stage_workers=stage_workers,
                 )
                 rows_dev = pin_rows[:v_count].to(dev, non_blocking=True)
-                gathered = rows_dev.reshape(v_count, -1)[:, flat_src_t]  # (rows, valid P) u8
+                gathered = rows_dev.reshape(v_count, -1)[:, flat_src_t]
                 out_dev.zero_()
                 t_count = int(t1 - t0)
                 if int(work_t) == int(t_dim):
@@ -20235,7 +20740,6 @@ def _radial_backproject_gpu_streaming(
                             )
                             out_dev[:t_count].index_copy_(1, valid_pos_t, reduced)
                         except (AttributeError, RuntimeError, TypeError):
-                            # Compatibility fallback for older torch/CUDA combinations.
                             scatter_reduce_supported = False
                     if pair_row and not scatter_reduce_supported:
                         for local_t in range(t_count):
@@ -20252,9 +20756,6 @@ def _radial_backproject_gpu_streaming(
                         np.asarray(vol_mm[t0:t1]).reshape(t1 - t0, -1),
                         pin_out_np[: t1 - t0],
                     )
-                # Feed the just-completed pinned D2H block straight to the cvol indexer.
-                # The full projected volume remains available only as a failure fallback;
-                # the successful path never scans it again to create the raw-bbox store.
                 _emit_projection_block_callback(
                     projection_block_callback,
                     int(t0),
@@ -20263,14 +20764,36 @@ def _radial_backproject_gpu_streaming(
                     required=bool(sink_only),
                 )
             stream.synchronize()
+    except BaseException:
+        active_exception = True
+        raise
     finally:
+        try:
+            if stream is not None:
+                stream.synchronize()
+        except BaseException as exc:
+            cleanup_error = exc
         _release_parallel_pool(stage_workers, stage_pool)
+        # Numpy views keep their pinned Torch owners alive; clear them before the tensors.
+        pin_rows_np = pin_out_np = None
+        rows_dev = gathered = None
+        pair_row_t = pair_out_t = pair_values = reduced = sub = None
+        valid_pos_t = flat_src_t = None
+        out_dev = reduced_dev = None
+        pin_rows = pin_out = None
+        stream = None
+        _trim_main_process_cuda_device(
+            torch,
+            dev,
+            desc=f'{desc} streaming backprojection cleanup',
+        )
+        if cleanup_error is not None and not bool(active_exception):
+            raise cleanup_error
     print(
         f'{desc}: GPU streaming backprojection complete ({t_dim} output slices; '
         f'output={"sink-only" if bool(sink_only) else "dense+sink"}).'
     )
     return True
-
 
 def _log_radial_backprojection_densification(
     desc: str,
@@ -22290,7 +22813,7 @@ def assemble_current_view_union_volume(
     
     Multiple model entries are rejected; the destination uses source geometry when requested."""
     if len(view_volumes_by_model) != 1:
-        raise ValueError('GPT-5.6-Sol-Pro v16.0.5 supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.0.6 supports exactly one --model; multiple-model inference has been removed')
 
     union_shape = (int(T), int(H), int(W)) if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
     model_name = next(iter(view_volumes_by_model.keys()))
@@ -32346,7 +32869,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.6-Sol-Pro_v16.0.5_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.6-Sol-Pro_v16.0.6_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -32803,14 +33326,7 @@ def nrrd_parallel_mirror_encode_enabled() -> bool:
 
 
 class _GpuMirrorTee:
-    """GPU tee deriving downbinned mirror volumes from payload blocks.
-
- Each streamed full-quality block is uploaded once; every mirror spec is produced by an
- adaptive max-pool on device (any foreground in the covering window -> 1, matching the
- CPU tee's (INTER_AREA>0) semantics up to window-boundary voxels) and max-merged into a
- device-resident mirror volume through the same source->mirror t-mapping. The small
- mirror volumes come back to host once, after the layer finishes. Any failure marks the
- tee failed and the caller falls back to re-encoding mirrors from the layer store."""
+    """Derive downbinned mirror volumes on an exclusively leased CUDA device."""
 
     def __init__(
         self,
@@ -32818,6 +33334,7 @@ class _GpuMirrorTee:
         device: object,
         mirror_jobs: List[Dict[str, object]],
         out_t: int,
+        gpu_lease: _MainProcessGpuStageLease,
     ) -> None:
         self.torch = torch_mod
         self.device = device
@@ -32825,24 +33342,57 @@ class _GpuMirrorTee:
         self.failed = False
         self.sub_batch = max(1, _env_int('YOLO_TTA_NRRD_GPU_MIRROR_TEE_SUBBATCH', 32))
         self.specs: List[Dict[str, object]] = []
-        with torch_mod.cuda.device(device):
-            self.stream = torch_mod.cuda.Stream(device=device)
-            with torch_mod.cuda.stream(self.stream):
-                for job in mirror_jobs:
-                    m_t, m_h, m_w = (int(v) for v in job['shape'])  # type: ignore[misc]
-                    self.specs.append({
-                        'job': job,
-                        'vol': torch_mod.zeros((m_t, m_h, m_w), dtype=torch_mod.uint8, device=device),
-                        'src_to_m': job['src_to_m'],
-                        'm_h': int(m_h),
-                        'm_w': int(m_w),
-                    })
-            self.stream.synchronize()
+        self.stream: Optional[object] = None
+        self._gpu_lease: Optional[_MainProcessGpuStageLease] = gpu_lease
+        self._closed = False
+        try:
+            with torch_mod.cuda.device(device):
+                self.stream = torch_mod.cuda.Stream(device=device)
+                with torch_mod.cuda.stream(self.stream):
+                    for job in mirror_jobs:
+                        m_t, m_h, m_w = (int(v) for v in job['shape'])  # type: ignore[misc]
+                        self.specs.append({
+                            'job': job,
+                            'vol': torch_mod.zeros(
+                                (m_t, m_h, m_w), dtype=torch_mod.uint8, device=device,
+                            ),
+                            'src_to_m': job['src_to_m'],
+                            'm_h': int(m_h),
+                            'm_w': int(m_w),
+                        })
+                self.stream.synchronize()
+        except BaseException:
+            self._release_resources()
+            raise
+
+    def _release_resources(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if self.stream is not None:
+                self.stream.synchronize()
+        except Exception:
+            pass
+        for spec in self.specs:
+            spec['vol'] = None
+        self.specs.clear()
+        self.stream = None
+        _trim_main_process_cuda_device(
+            self.torch,
+            self.device,
+            desc='NRRD GPU mirror tee cleanup',
+        )
+        lease = self._gpu_lease
+        self._gpu_lease = None
+        if lease is not None:
+            lease.release()
 
     def tee(self, z0: int, block: np.ndarray) -> None:
-        if self.failed:
+        if self.failed or self._closed:
             return
         torch = self.torch
+        blk = blk_f = pooled = pooled_u8 = vol = None
         try:
             import torch.nn.functional as F  # type: ignore
             with torch.cuda.device(self.device):
@@ -32851,9 +33401,11 @@ class _GpuMirrorTee:
                     for b0 in range(0, z_count, int(self.sub_batch)):
                         b1 = min(z_count, b0 + int(self.sub_batch))
                         blk = torch.from_numpy(np.ascontiguousarray(block[b0:b1])).to(self.device)
-                        blk_f = blk.to(torch.float16).unsqueeze(1)  # (bs, 1, H, W)
+                        blk_f = blk.to(torch.float16).unsqueeze(1)
                         for spec in self.specs:
-                            pooled = F.adaptive_max_pool2d(blk_f, (int(spec['m_h']), int(spec['m_w'])))
+                            pooled = F.adaptive_max_pool2d(
+                                blk_f, (int(spec['m_h']), int(spec['m_w'])),
+                            )
                             pooled_u8 = (pooled.squeeze(1) > 0).to(torch.uint8)
                             vol = spec['vol']
                             src_to_m = spec['src_to_m']
@@ -32863,64 +33415,92 @@ class _GpuMirrorTee:
                                     break
                                 for mz in src_to_m[full_z]:  # type: ignore[index]
                                     torch.maximum(vol[int(mz)], pooled_u8[int(bi)], out=vol[int(mz)])
-                        del blk, blk_f
+                        blk = blk_f = pooled = pooled_u8 = vol = None
         except Exception as exc:
             self.failed = True
-            print(f'Warning: GPU mirror tee failed mid-stream ({exc}); mirrors re-encode from the layer store.')
+            # Clear partially constructed per-block tensors before trimming the allocator.
+            blk = blk_f = pooled = pooled_u8 = vol = None
+            gc.collect()
+            print(
+                f'Warning: GPU mirror tee failed mid-stream ({exc}); '
+                'mirrors re-encode from the layer store.'
+            )
+            self._release_resources()
 
     def discard(self) -> None:
-        """Release all mirror tensors after any failed GPU tee attempt."""
-        try:
-            self.stream.synchronize()
-        except Exception:
-            pass
-        for spec in self.specs:
-            spec['vol'] = None
-        self.specs.clear()
-        try:
-            with self.torch.cuda.device(self.device):
-                self.torch.cuda.empty_cache()
-        except Exception:
-            pass
+        self._release_resources()
 
     def finalize_into_jobs(self) -> bool:
-        if self.failed:
-            self.discard()
+        if self.failed or self._closed:
+            self._release_resources()
             return False
         try:
-            # Every shard call enqueues onto this one owned stream under the caller's mutex,
-            # so its order is independent of shard-thread current-stream state.
             self.stream.synchronize()
             for spec in self.specs:
-                # One final D2H per mirror preserves the GPU downbin/union speedup.
-                # Compression then remains on the validated CPU member path.
                 spec['job']['volume'] = spec['vol'].cpu().numpy()  # type: ignore[index]
                 spec['vol'] = None
-            self.specs.clear()
             return True
         except Exception as exc:
-            print(f'Warning: GPU mirror tee finalize failed ({exc}); mirrors re-encode from the layer store.')
+            print(
+                f'Warning: GPU mirror tee finalize failed ({exc}); '
+                'mirrors re-encode from the layer store.'
+            )
             self.failed = True
-            self.discard()
             return False
+        finally:
+            self._release_resources()
+
+    def __del__(self) -> None:  # pragma: no cover - final safety net
+        try:
+            self._release_resources()
+        except Exception:
+            pass
 
 
-def _try_create_gpu_mirror_tee(mirror_jobs: List[Dict[str, object]], out_t: int) -> Optional['_GpuMirrorTee']:
+def _try_create_gpu_mirror_tee(
+    mirror_jobs: List[Dict[str, object]],
+    out_t: int,
+) -> Optional['_GpuMirrorTee']:
     if not nrrd_gpu_mirror_tee_enabled() or not mirror_jobs:
         return None
+    lease: Optional[_MainProcessGpuStageLease] = None
     try:
         import torch  # type: ignore
         if not bool(torch.cuda.is_available()):
             return None
-        device = _pick_gpu_compute_device(torch)
-        need = sum(int(np.prod([int(v) for v in job['shape']])) for job in mirror_jobs)  # type: ignore[misc]
+        lease = _try_acquire_main_process_gpu_stage(torch, 'NRRD low-quality GPU mirror tee')
+        if lease is None:
+            _announce_main_gpu_stage_skip_once(
+                'nrrd-mirror-tee-inference-busy',
+                'NRRD GPU mirror tee skipped while all eligible GPUs have active/queued '
+                'inference or another output-stage lease; using the CPU mirror tee.',
+            )
+            return None
+        device = lease.torch_device(torch)
+        need = sum(
+            int(np.prod([int(v) for v in job['shape']]))
+            for job in mirror_jobs
+        )  # type: ignore[misc]
         free_bytes, _total = torch.cuda.mem_get_info(device)
         if int(free_bytes) < int(need) + 2 * GIB:
+            lease.release()
+            lease = None
             return None
-        return _GpuMirrorTee(torch, device, mirror_jobs, int(out_t))
-    except Exception:
+        tee = _GpuMirrorTee(torch, device, mirror_jobs, int(out_t), lease)
+        lease = None  # ownership transferred to the tee
+        return tee
+    except Exception as exc:
+        if lease is not None:
+            try:
+                device = lease.torch_device(torch)  # type: ignore[name-defined]
+                _trim_main_process_cuda_device(
+                    torch, device, desc='failed NRRD GPU mirror tee construction',  # type: ignore[name-defined]
+                )
+            except Exception:
+                pass
+            lease.release()
+        print(f'Warning: NRRD GPU mirror tee setup failed ({exc}); using the CPU mirror tee.')
         return None
-
 
 def write_layer_nrrd_with_low_quality_mirrors(
     ref: 'NrrdLayerRef',
@@ -34571,39 +35151,81 @@ _LQ_GPU_DOWNBIN_ANNOUNCED = False
 
 
 def _try_gpu_downbin_volume(src_vol: np.ndarray, out_mm: np.ndarray, mode: str) -> bool:
-    """Fill ``out_mm`` from ``src_vol`` on a GPU; False -> caller's CPU path."""
+    """Fill ``out_mm`` on an exclusively leased GPU; False selects the CPU path."""
     if not low_quality_gpu_downbin_enabled():
         return False
     in_t, in_h, in_w = (int(src_vol.shape[0]), int(src_vol.shape[1]), int(src_vol.shape[2]))
     out_t, out_h, out_w = (int(out_mm.shape[0]), int(out_mm.shape[1]), int(out_mm.shape[2]))
     if out_h > in_h or out_w > in_w:
-        return False  # upscale specs keep the cv2 INTER_LINEAR/NEAREST semantics
+        return False
     try:
         import torch  # type: ignore
         import torch.nn.functional as F  # type: ignore
         if not bool(torch.cuda.is_available()):
             return False
-        device = _pick_gpu_compute_device(torch)
-        chunk = int(low_quality_gpu_downbin_chunk_slices())
-        # Worst-case source slices one output chunk can pull in (t-downbin gathers
-        # ratio*chunk source slices; t-upscale and the gray lerp need at most chunk+2).
-        src_per_chunk = int(math.ceil(float(in_t) / float(max(1, out_t)) * float(chunk))) + 2
-        fp_bytes = 4 if mode == 'gray' else 2
-        need = (
-            src_per_chunk * in_h * in_w * (1 + fp_bytes)
-            + (chunk + 2) * out_h * out_w * (fp_bytes + 1)
-            + GIB
+    except Exception:
+        return False
+    lease = _try_acquire_main_process_gpu_stage(torch, f'low-quality {mode} GPU downbin')
+    if lease is None:
+        _announce_main_gpu_stage_skip_once(
+            'low-quality-downbin-inference-busy',
+            'GPU low-quality downbin skipped while all eligible GPUs have active/queued '
+            'inference or another output-stage lease; using the CPU resize path.',
         )
+        return False
+    try:
+        return _try_gpu_downbin_volume_on_device(
+            src_vol,
+            out_mm,
+            str(mode),
+            torch=torch,
+            F=F,
+            device=lease.torch_device(torch),
+        )
+    finally:
+        lease.release()
+
+
+def _try_gpu_downbin_volume_on_device(
+    src_vol: np.ndarray,
+    out_mm: np.ndarray,
+    mode: str,
+    *,
+    torch: object,
+    F: object,
+    device: object,
+) -> bool:
+    in_t, in_h, in_w = (int(src_vol.shape[0]), int(src_vol.shape[1]), int(src_vol.shape[2]))
+    out_t, out_h, out_w = (int(out_mm.shape[0]), int(out_mm.shape[1]), int(out_mm.shape[2]))
+    chunk = int(low_quality_gpu_downbin_chunk_slices())
+    src_per_chunk = int(math.ceil(float(in_t) / float(max(1, out_t)) * float(chunk))) + 2
+    fp_bytes = 4 if mode == 'gray' else 2
+    need = (
+        src_per_chunk * in_h * in_w * (1 + fp_bytes)
+        + (chunk + 2) * out_h * out_w * (fp_bytes + 1)
+        + GIB
+    )
+    try:
         free_bytes, _total = torch.cuda.mem_get_info(device)
-        if int(free_bytes) < int(need):
-            return False
+    except Exception:
+        return False
+    if int(free_bytes) < int(need):
+        return False
+
+    blk = pooled = out_chunk = window = None
+    rows: List[object] = []
+    try:
         with torch.inference_mode():
             with torch.cuda.device(device):
                 for o0 in range(0, out_t, chunk):
+                    blk = pooled = out_chunk = window = None
+                    rows = []
                     o1 = min(out_t, int(o0) + chunk)
                     if mode == 'gray':
-                        # Same two-slice endpoint-aligned lerp as _render_target_slice.
-                        src_pos = [_linear_source_index(int(oz), int(out_t), int(in_t)) for oz in range(o0, o1)]
+                        src_pos = [
+                            _linear_source_index(int(oz), int(out_t), int(in_t))
+                            for oz in range(o0, o1)
+                        ]
                         z0s = [int(math.floor(p)) for p in src_pos]
                         z1s = [min(in_t - 1, int(z) + 1) for z in z0s]
                         lo, hi = min(z0s), max(z1s) + 1
@@ -34611,7 +35233,6 @@ def _try_gpu_downbin_volume(src_vol: np.ndarray, out_mm: np.ndarray, mode: str) 
                         pooled = F.adaptive_avg_pool2d(
                             blk.to(torch.float32).unsqueeze(1), (int(out_h), int(out_w)),
                         ).squeeze(1)
-                        rows = []
                         for i in range(int(o1 - o0)):
                             alpha = float(src_pos[i] - float(z0s[i]))
                             f0 = pooled[int(z0s[i] - lo)]
@@ -34621,7 +35242,6 @@ def _try_gpu_downbin_volume(src_vol: np.ndarray, out_mm: np.ndarray, mode: str) 
                                 rows.append(torch.lerp(f0, pooled[int(z1s[i] - lo)], alpha))
                         out_chunk = torch.stack(rows).round_().clamp_(0, 255).to(torch.uint8)
                     elif mode == 'mask':
-                        # Same source t-range OR as _restore_slice; XY any-coverage max-pool.
                         starts: List[int] = []
                         stops: List[int] = []
                         for oz in range(o0, o1):
@@ -34636,7 +35256,6 @@ def _try_gpu_downbin_volume(src_vol: np.ndarray, out_mm: np.ndarray, mode: str) 
                         pooled = F.adaptive_max_pool2d(
                             blk.to(torch.float16).unsqueeze(1), (int(out_h), int(out_w)),
                         ).squeeze(1)
-                        rows = []
                         for i in range(int(o1 - o0)):
                             window = pooled[int(starts[i] - lo):int(stops[i] - lo)]
                             rows.append(window.amax(dim=0) if int(window.shape[0]) > 1 else window[0])
@@ -34644,19 +35263,25 @@ def _try_gpu_downbin_volume(src_vol: np.ndarray, out_mm: np.ndarray, mode: str) 
                     else:
                         return False
                     out_mm[int(o0):int(o1)] = out_chunk.cpu().numpy()
-                    del blk, pooled, rows, out_chunk
         global _LQ_GPU_DOWNBIN_ANNOUNCED
         if not _LQ_GPU_DOWNBIN_ANNOUNCED:
             _LQ_GPU_DOWNBIN_ANNOUNCED = True
             print(
-                f'GPU low-quality downbin active on {device} (v13.3.8 E2; '
-                'YOLO_TTA_LOW_QUALITY_GPU_DOWNBIN=0 disables).'
+                f'GPU low-quality downbin active on {device} '
+                '(YOLO_TTA_LOW_QUALITY_GPU_DOWNBIN=0 disables).'
             )
         return True
     except Exception as exc:
         print(f'Warning: GPU low-quality downbin failed ({exc}); using the CPU resize path.')
         return False
-
+    finally:
+        rows.clear()
+        blk = pooled = out_chunk = window = None
+        _trim_main_process_cuda_device(
+            torch,
+            device,
+            desc=f'low-quality {mode} GPU downbin cleanup',
+        )
 
 def resize_gray_volume_to_shape(
     volume_gray: np.ndarray,
@@ -35374,7 +35999,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('GPT-5.6-Sol-Pro v16.0.5 accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.0.6 accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -37624,6 +38249,7 @@ def main() -> None:
     # Process-per-GPU scheduler. This path is active for every CUDA run, including one GPU.
     #
     gpu_worker_processes: List[object] = []
+    _reset_main_process_gpu_stage_coordinator()
     gpu_task_queues: Dict[int, object] = {}
     gpu_result_queue: object = None
     gpu_worker_tasks_by_id: Dict[int, Dict[str, object]] = {}
@@ -37782,7 +38408,10 @@ def main() -> None:
         )
         if len(worker_ids) == 1:
             worker_id = int(worker_ids[0])
-            if inference_tail_drained:
+            if (
+                inference_tail_drained
+                and _main_process_gpu_stage_can_dispatch_inference(worker_id)
+            ):
                 aux_pool.enable_worker(worker_id, allow_full_cpu_affinity=True)
             else:
                 aux_pool.revoke_worker(worker_id)
@@ -37797,6 +38426,7 @@ def main() -> None:
                 int(gpu_worker_dispatched_tasks) > 0
                 and no_imminent_task
                 and _gpu_worker_inflight(worker_id) == 0
+                and _main_process_gpu_stage_can_dispatch_inference(worker_id)
             ):
                 aux_pool.enable_worker(worker_id, allow_full_cpu_affinity=False)
             else:
@@ -37821,9 +38451,11 @@ def main() -> None:
             for worker_id in worker_ids:
                 if _gpu_worker_inflight(worker_id) >= int(per_gpu):
                     continue
+                if not _main_process_gpu_stage_can_dispatch_inference(worker_id):
+                    continue
                 if aux_pool is not None and not aux_pool.revoke_worker(worker_id):
                     # An already-running interpolation pass owns this worker until its result
-                    # returns.  Other workers may continue taking inference leases meanwhile.
+                    # returns. Other workers may continue taking inference leases meanwhile.
                     continue
                 candidates.append(int(worker_id))
             if not candidates:
@@ -37837,8 +38469,17 @@ def main() -> None:
             position = {worker_id: (worker_ids.index(worker_id) - start_rank) % len(worker_ids) for worker_id in candidates}
             worker_id = min(candidates, key=lambda value: (_gpu_worker_inflight(value), position[value]))
             gpu_worker_dispatch_cursor = (worker_ids.index(worker_id) + 1) % len(worker_ids)
+            # Count both queued and running tasks as inference ownership: the worker can
+            # allocate for its next task immediately after queue.put returns.
+            if not _main_process_gpu_stage_begin_inference(worker_id):
+                continue
             task_id = _pop_gpu_worker_pending_task_id(preferred_parent)
-            gpu_task_queues[int(worker_id)].put(gpu_worker_tasks_by_id[task_id])
+            try:
+                gpu_task_queues[int(worker_id)].put(gpu_worker_tasks_by_id[task_id])
+            except BaseException:
+                gpu_worker_pending_task_ids.appendleft(int(task_id))
+                _main_process_gpu_stage_finish_inference(worker_id)
+                raise
             gpu_worker_dispatched_tasks += 1
             gpu_worker_dispatched_by_id[int(worker_id)] = int(
                 gpu_worker_dispatched_by_id.get(int(worker_id), 0)
@@ -37898,6 +38539,7 @@ def main() -> None:
         # validated against the inherited list early in main, and each worker resolves
         # its physical pin via _pin_cuda_visible_device_token.
         gpu_logical_indices = [int(str(d).split(':')[-1]) for d in inference_devices]
+        _configure_main_process_gpu_stage_workers(gpu_logical_indices)
         pinned_tokens = [
             _pin_cuda_visible_device_token(int(idx)) for idx in gpu_logical_indices
         ]
@@ -38547,6 +39189,7 @@ def main() -> None:
             _refresh_gpu_aux_interpolation_leases()
             return
         worker_id = int(msg.get('gpu_index', -1))
+        _main_process_gpu_stage_finish_inference(worker_id)
         gpu_worker_results_collected += 1
         gpu_worker_results_by_id[worker_id] = int(gpu_worker_results_by_id.get(worker_id, 0)) + 1
         if not bool(msg.get('ok')):
@@ -38578,6 +39221,7 @@ def main() -> None:
         gpu_worker_process_active and gpu_result_queue is not None and scheduler_push_drain_enabled()
     )
     scheduler_wake = threading.Event()
+    _set_main_process_gpu_stage_wake_callback(scheduler_wake.set)
     push_drain_stop = threading.Event()
     pushed_worker_results: deque = deque()
     _wake_hooked_futures: 'weakref.WeakSet' = weakref.WeakSet()
@@ -39047,6 +39691,9 @@ def main() -> None:
                 interpolation_process_executor.shutdown(wait=True, cancel_futures=False)
             except TypeError:
                 interpolation_process_executor.shutdown(wait=True)
+
+        _set_main_process_gpu_stage_wake_callback(None)
+        _reset_main_process_gpu_stage_coordinator()
 
     _drain_completed_prediction_volume_futures()
     _drain_completed_prediction_accumulation_futures()
