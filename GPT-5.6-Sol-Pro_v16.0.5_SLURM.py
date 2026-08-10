@@ -781,7 +781,7 @@ class RuntimeTelemetry:
             self.path = Path(requested)
         else:
             base = os.environ.get('SLURM_JOB_ID') or str(os.getpid())
-            self.path = Path(tempfile.gettempdir()) / f'gpt56-sol-pro-v1604-telemetry-{base}-{os.getpid()}.jsonl'
+            self.path = Path(tempfile.gettempdir()) / f'gpt56-sol-pro-v1605-telemetry-{base}-{os.getpid()}.jsonl'
 
     @contextlib.contextmanager
     def span(self, name: str, **fields: object) -> Iterator[None]:
@@ -851,7 +851,7 @@ class RuntimeTelemetry:
                     'mean_ms': (seconds * 1000.0 / calls) if calls else 0.0,
                 }
             payload: Dict[str, object] = {
-                'schema': 'gpt-5.6-sol-pro-v16.0.4.telemetry.v1',
+                'schema': 'gpt-5.6-sol-pro-v16.0.5.telemetry.v1',
                 'pid': os.getpid(),
                 'monotonic_seconds': (now_ns - self.started_ns) / 1e9,
                 'wall_time': time.time(),
@@ -1650,11 +1650,8 @@ def gpu_worker_direct_union_enabled() -> bool:
 def gpu_worker_fullframe_task_ranges(
     n_slices: int,
     slice_chunk: int,
-    gpu_count: int,
-    inference_batch: int,
 ) -> List[Tuple[int, int]]:
     """Return the profiled steady-state full-frame leases without tail adaptation."""
-    # DEAD PARAMETER: gpu_count and inference_batch are retained for scheduler API stability.
     total = max(1, int(n_slices))
     chunk = max(1, int(slice_chunk))
     return [
@@ -2565,8 +2562,8 @@ def set_interpolation_process_executor(executor: Optional[ProcessPoolExecutor], 
 #
 # Idle CUDA workers as auxiliary interpolation hosts
 #
-# Workers remain alive after inference drains. Their separate interpreters provide additional
-# GILs for interpolation passes before the scheduler falls back to the dedicated process pool.
+# Workers remain alive as their inference leases drain. Individually idle interpreters provide
+# additional GILs for interpolation before the scheduler falls back to the dedicated process pool.
 
 
 def gpu_worker_aux_interpolation_enabled() -> bool:
@@ -2574,35 +2571,76 @@ def gpu_worker_aux_interpolation_enabled() -> bool:
 
 
 class _GpuWorkerAuxInterpolationPool:
-    """Route interpolation passes to idle GPU worker processes.
-    
-    Submission is non-blocking; unavailable slots fall back to the dedicated interpolation process pool."""
+    """Route interpolation passes to explicitly leased idle GPU workers.
 
-    def __init__(self, task_queue: object, worker_count: int) -> None:
-        self._task_queue = task_queue
-        self._capacity = max(1, int(worker_count))
-        self._slots = threading.Semaphore(self._capacity)
+    Each worker owns a targeted task queue.  The scheduler leases only workers with no
+    assigned inference task, and revokes that lease before dispatching new inference.
+    Submission is non-blocking; when every lease is busy or revoked the caller uses the
+    dedicated interpolation process pool instead.
+    """
+
+    def __init__(self, task_queues: Dict[int, object]) -> None:
+        queues = {int(worker_id): task_queue for worker_id, task_queue in task_queues.items()}
+        if not queues:
+            raise ValueError('GPU-worker aux interpolation requires at least one task queue')
+        self._task_queues = queues
+        self._worker_ids = tuple(sorted(queues))
+        self._capacity = len(self._worker_ids)
         self._lock = threading.Lock()
         self._pending: Dict[int, Dict[str, object]] = {}
-        self._next_task_id = 2_000_000_000  # disjoint from inference task ids
-        self._enabled = threading.Event()
+        self._leased: Dict[int, bool] = {}
+        self._busy_workers: set[int] = set()
+        self._next_task_id = 2_000_000_000
+        self._cursor = 0
         self._failed_reason: Optional[str] = None
+        self._announced = False
 
     @property
     def capacity(self) -> int:
         return int(self._capacity)
 
-    def enable(self) -> None:
-        if not self._enabled.is_set():
-            self._enabled.set()
+    def enable_worker(self, worker_id: int, *, allow_full_cpu_affinity: bool = False) -> bool:
+        worker = int(worker_id)
+        with self._lock:
+            if self._failed_reason is not None or worker not in self._task_queues:
+                return False
+            changed = worker not in self._leased or bool(self._leased[worker]) != bool(allow_full_cpu_affinity)
+            self._leased[worker] = bool(allow_full_cpu_affinity)
+            announce = changed and not self._announced
+            if announce:
+                self._announced = True
+        if announce:
             print(
-                f'GPU worker aux interpolation pool open (v13.3.4 T4): up to {self._capacity} '
-                'interpolation pass(es) run on the now-idle GPU worker processes.'
+                'GPU-worker auxiliary interpolation leases active: individually idle CUDA '
+                'workers may run interpolation until their inference lease is revoked.'
             )
+        return True
+
+    def enable(self) -> None:
+        """Lease every worker after the complete inference tail drains.
+
+        A single-worker run may temporarily widen back to the full allocation because no
+        other GPU worker remains to contend with it.  Multi-worker runs retain each worker's
+        NUMA-local CPU partition.
+        """
+        widen = bool(self._capacity == 1)
+        for worker_id in self._worker_ids:
+            self.enable_worker(worker_id, allow_full_cpu_affinity=widen)
+
+    def revoke_worker(self, worker_id: int) -> bool:
+        """Revoke an idle lease; False means an auxiliary pass is still running there."""
+        worker = int(worker_id)
+        with self._lock:
+            self._leased.pop(worker, None)
+            return worker not in self._busy_workers
 
     def outstanding(self) -> int:
         with self._lock:
             return int(len(self._pending))
+
+    def worker_outstanding(self, worker_id: int) -> bool:
+        with self._lock:
+            return int(worker_id) in self._busy_workers
 
     def mark_failed(self, reason: str) -> None:
         with self._lock:
@@ -2610,48 +2648,68 @@ class _GpuWorkerAuxInterpolationPool:
                 self._failed_reason = str(reason)
             entries = list(self._pending.values())
             self._pending.clear()
+            self._leased.clear()
+            self._busy_workers.clear()
         for entry in entries:
             if not entry.get('error'):
                 entry['error'] = str(reason)
             entry['event'].set()  # type: ignore[union-attr]
 
     def try_submit(self, aux_kwargs: Dict[str, object]) -> Optional[Dict[str, object]]:
-        if not self._enabled.is_set():
-            return None
         with self._lock:
             if self._failed_reason is not None:
                 return None
-        if not self._slots.acquire(blocking=False):
-            return None
-        handle: Dict[str, object] = {'event': threading.Event(), 'stats': None, 'error': None}
-        with self._lock:
+            candidates = [
+                worker_id for worker_id in self._worker_ids
+                if worker_id in self._leased and worker_id not in self._busy_workers
+            ]
+            if not candidates:
+                return None
+            start = int(self._cursor) % len(self._worker_ids)
+            rank = {worker_id: (self._worker_ids.index(worker_id) - start) % len(self._worker_ids) for worker_id in candidates}
+            worker_id = min(candidates, key=lambda value: rank[value])
+            self._cursor = (self._worker_ids.index(worker_id) + 1) % len(self._worker_ids)
             task_id = int(self._next_task_id)
             self._next_task_id += 1
-            handle['task_id'] = task_id
+            handle: Dict[str, object] = {
+                'event': threading.Event(), 'stats': None, 'error': None,
+                'task_id': task_id, 'worker_id': int(worker_id),
+            }
             self._pending[task_id] = handle
+            self._busy_workers.add(int(worker_id))
+            allow_full_cpu_affinity = bool(self._leased.get(int(worker_id), False))
+            task_queue = self._task_queues[int(worker_id)]
         try:
-            self._task_queue.put({
+            task_queue.put({
                 'task_id': int(task_id),
                 'task_type': 'interpolation_pass',
                 'aux_kwargs': dict(aux_kwargs),
+                'allow_full_cpu_affinity': bool(allow_full_cpu_affinity),
             })
         except Exception:
             with self._lock:
                 self._pending.pop(task_id, None)
-            self._slots.release()
+                self._busy_workers.discard(int(worker_id))
             return None
         return handle
 
-    def complete(self, task_id: int, ok: bool, stats: Optional[Dict[str, object]], error: Optional[str]) -> None:
+    def complete(
+        self,
+        task_id: int,
+        worker_id: int,
+        ok: bool,
+        stats: Optional[Dict[str, object]],
+        error: Optional[str],
+    ) -> None:
         with self._lock:
             handle = self._pending.pop(int(task_id), None)
+            self._busy_workers.discard(int(worker_id))
         if handle is None:
             return
         if bool(ok):
             handle['stats'] = dict(stats or {})
         else:
             handle['error'] = str(error or 'unknown GPU-worker aux interpolation failure')
-        self._slots.release()
         handle['event'].set()  # type: ignore[union-attr]
 
     def wait(self, handle: Dict[str, object], poll_seconds: float = 5.0) -> Dict[str, object]:
@@ -3459,10 +3517,8 @@ def _cube_t_axis_resize_backend() -> str:
     return backend
 
 
-def _cube_t_axis_slab_rows(in_w: int, in_t: int, out_t: int, workers: int) -> int:
+def _cube_t_axis_slab_rows(in_w: int, workers: int) -> int:
     """Choose a bounded row-slab height for T-axis-only cubic resizing."""
-    # DEAD PARAMETER: in_t and out_t are retained for tuning API stability.
-    del in_t, out_t
     env_rows = _env_int('YOLO_TTA_CUBE_T_RESIZE_SLAB_ROWS', 0)
     if env_rows > 0:
         return max(1, int(env_rows))
@@ -3509,7 +3565,7 @@ def resize_volume_t_axis_only_gray8_slab(
     )
 
     worker_count = choose_slice_parallel_workers(int(workers), int(in_h))
-    rows_per_slab = _cube_t_axis_slab_rows(int(in_w), int(in_t), int(out_t_i), worker_count)
+    rows_per_slab = _cube_t_axis_slab_rows(int(in_w), worker_count)
     ranges = [(int(y0), int(min(in_h, y0 + rows_per_slab))) for y0 in range(0, int(in_h), int(rows_per_slab))]
     cv_threads = max(1, _env_int('YOLO_TTA_CUBE_T_RESIZE_CV2_THREADS', 1))
 
@@ -4351,14 +4407,14 @@ def build_affine(
     )
 
 
-# non-radial prediction masks stay on a canonical inference-resolution
+# Prediction masks stay on a canonical inference-resolution
 # grid until view-local cleanup, component analysis, and temporal interpolation have
 # completed. The canonical grid is the angle-0 YOLO raster for the view, so an angle-0
 # full-frame result needs no post-inference scale/warp at all. Other augmentations and
 # dense tiles compose their output->native affine with native->canonical once; all of
 # their contributions therefore still meet in one common view coordinate system.
 def delayed_native_expansion_enabled() -> bool:
-    """Keep non-radial masks at inference resolution until final projection.
+    """Keep capable view masks at inference resolution until final projection.
 
  ``YOLO_TTA_DELAY_NATIVE_EXPANSION=0`` restores the behavior in which every
  prediction is expanded to ``view.src_h x view.src_w`` before accumulation."""
@@ -4366,13 +4422,17 @@ def delayed_native_expansion_enabled() -> bool:
 
 
 def view_uses_inference_processing_grid(view: 'ViewInfo', out_size: int) -> bool:
-    return bool(
-        delayed_native_expansion_enabled()
-        and str(getattr(view, 'family', '')) != 'radial'
-        and int(out_size) > 0
-        # Never turn the optimization into an expansion for an unusually small view.
-        and int(out_size) * int(out_size) < int(view.src_h) * int(view.src_w)
-    )
+    size = int(out_size)
+    if not delayed_native_expansion_enabled() or size <= 0:
+        return False
+    if size * size >= int(view.src_h) * int(view.src_w):
+        return False
+    if is_radial_view(view) and (size > int(view.src_h) or size > int(view.src_w)):
+        # Radial terminal projection consumes compact monotone row/diameter lookups.  Do
+        # not turn either axis into an expansion, which could introduce unmapped processing
+        # rows between adjacent native coordinates and invalidate bounded row-range staging.
+        return False
+    return True
 
 
 def view_processing_plane_shape(view: 'ViewInfo', out_size: int) -> Tuple[int, int]:
@@ -4393,8 +4453,9 @@ def output_to_view_processing_affine(
 ) -> np.ndarray:
     """Map one YOLO output raster into the view's accumulation grid.
 
-    Delayed non-Radial views compose output-to-native with native-to-canonical; angle zero
-    reduces to identity within tolerance. Radial views retain native-grid accumulation.
+    Delayed views compose output-to-native with native-to-canonical; angle zero reduces
+    to identity within tolerance. Radial interpolation remains in this canonical raster,
+    and terminal backprojection maps native radial row/diameter coordinates into it.
     """
     M_native = np.asarray(M_out_to_native, dtype=np.float64).reshape(2, 3)
     if not view_uses_inference_processing_grid(view, int(out_size)):
@@ -4515,7 +4576,7 @@ def view_processing_min_radius(
  component becomes an ellipse whose EDT radius is governed by the smaller axis scale,
  so the minimum scale preserves the former keep/drop boundary most closely."""
     radius = float(min_radius)
-    if radius <= 0.0 or str(getattr(view, 'family', '')) == 'radial':
+    if radius <= 0.0:
         return max(0.0, radius)
     try:
         ph, pw = int(plane_shape[-2]), int(plane_shape[-1])
@@ -4535,7 +4596,7 @@ def view_processing_search_angle(
 ) -> float:
     """Approximate the same interpolation search cone on a reduced in-plane raster."""
     angle = float(angle_deg)
-    if angle == 0.0 or str(getattr(view, 'family', '')) == 'radial':
+    if angle == 0.0:
         return angle
     try:
         ph, pw = int(plane_shape[-2]), int(plane_shape[-1])
@@ -4706,18 +4767,22 @@ def radial_resident_gpu_render_supported(view: ViewInfo) -> bool:
 
 
 def radial_streaming_gpu_render_supported(view: ViewInfo) -> bool:
-    """Return whether the t-major streaming prerender supports this upright Radial view."""
+    """Return whether logical-stack streaming prerender supports this upright Radial view."""
     return bool(
         is_radial_view(view)
         and not is_tilted_radial_view(view)
-        and radial_base_view_name(view) == 'transverse'
+        and radial_base_view_name(view) in CARTESIAN_VIEW_TOKENS
     )
 
 
 def radial_fused_render_supported(view: ViewInfo) -> bool:
-    """Direct-to-binding support: upright transverse and tilted-Radial views."""
+    """Direct-to-binding support for every upright and enabled tilted-Radial base."""
     return bool(
-        radial_streaming_gpu_render_supported(view)
+        (
+            is_radial_view(view)
+            and not is_tilted_radial_view(view)
+            and radial_base_view_name(view) in CARTESIAN_VIEW_TOKENS
+        )
         or (
             is_tilted_radial_view(view)
             and tilted_radial_resident_gpu_render_enabled()
@@ -4726,8 +4791,12 @@ def radial_fused_render_supported(view: ViewInfo) -> bool:
 
 
 def radial_sink_only_projection_supported(view: ViewInfo) -> bool:
-    """Current block-fused cvol projection is t-major and therefore transverse-only."""
-    return radial_streaming_gpu_render_supported(view)
+    """Sink-only backprojection supports every upright Cartesian Radial orientation."""
+    return bool(
+        is_radial_view(view)
+        and not is_tilted_radial_view(view)
+        and radial_base_view_name(view) in CARTESIAN_VIEW_TOKENS
+    )
 
 
 def tilted_stack_axis_length(view: ViewInfo) -> int:
@@ -10431,6 +10500,17 @@ def _cuda_stream_priority(torch_mod: object, *, high: bool) -> int:
         return -1 if bool(high) else 0
 
 
+@dataclass(frozen=True)
+class ResidentRingUnitDescriptor:
+    """Per-unit post-warp geometry and task-union destination for a ring slot."""
+
+    unit_index: int
+    destination_index: int
+    native_h: int
+    native_w: int
+    M_out_to_native: np.ndarray
+
+
 class _ResidentGpuPipelineSlot:
     """One static-address input/output/event slot in the resident two-entry ring."""
 
@@ -10488,6 +10568,9 @@ class _ResidentGpuPipelineSlot:
         self.conf_proto = None
         self.native_union = None
         self.native_conf = None
+        self.unit_descriptor: Optional[ResidentRingUnitDescriptor] = None
+        self.identity_native_warp = False
+        self.native_to_out: Tuple[np.float32, ...] = tuple()
         self.infer_graph = None
         self.post_graph = None
         self.render_graph = None
@@ -11166,23 +11249,25 @@ def predict_source_and_accumulate(
         stream_min_radius = float(streaming_cleanup_min_radius)
         stream_min_conf_u8 = int(min_conf_to_u8_threshold(stream_min_conf)) if stream_min_conf > 0.0 else 0
 
-        # per-task device union accumulation. A positive min_conf is
-        # allowed because the single-angle proto/ring compactor applies it before union; a
-        # positive min_radius still requires component cleanup and therefore retains the
-        # per-frame fallback. VRAM-gated; None keeps the pinned-D2H path.
+        # Admit raw device-union accumulation whenever no host-only cleanup must run before
+        # union. Ordinary and multi-angle tasks therefore retain their masks on device; only
+        # positive per-slice radius cleanup, unsupported confidence cleanup, CPU retina masks,
+        # or insufficient VRAM force the per-frame host path.
         device_union: Optional[_DeviceUnionAccumulator] = None
-        fastpath_confidence_on_device = bool(single_angle_gpu_fastpath() is not None)
-        if (
-            not cpu_retina_masks_enabled()
-            and single_angle_gpu_fastpath() is not None
-            and not (
-                stream_cleanup
-                and (
-                    (stream_min_conf > 0.0 and not fastpath_confidence_on_device)
-                    or stream_min_radius > 0.0
-                )
+        fastpath = single_angle_gpu_fastpath()
+        preunion_min_conf = (
+            float(stream_min_conf)
+            if stream_cleanup and fastpath is not None and stream_min_conf > 0.0
+            else None
+        )
+        host_cleanup_required = bool(
+            stream_cleanup
+            and (
+                (stream_min_conf > 0.0 and preunion_min_conf is None)
+                or stream_min_radius > 0.0
             )
-        ):
+        )
+        if not cpu_retina_masks_enabled() and not host_cleanup_required:
             device_union = _try_create_device_union_accumulator(
                 canonical_single_device(str(cfg.device)),
                 int(num_frames), int(native_h), int(native_w),
@@ -11191,26 +11276,24 @@ def predict_source_and_accumulate(
             if device_union is not None:
                 print(
                     f'Device union accumulation active for {source_label}: '
-                    f'{int(num_frames)}x{int(native_h)}x{int(native_w)} u8 on device (v13.3.2 R21).'
+                    f'{int(num_frames)}x{int(native_h)}x{int(native_w)} u8 on device.'
                 )
 
-        # Fixed batch-1, angle-0, resident-render path: run render -> TensorRT ->
-        # confidence compaction/proto union -> native task union as one device pipeline.
-        # It consumes no Results objects and dispatches no per-frame Futures. Capability
-        # rejection happens before source consumption and leaves ``results`` untouched.
+        # A capable resident batch-1 TensorRT source runs render, inference, confidence
+        # compaction, proto union, and destination warping as one device pipeline. Grouped
+        # tiles pass their per-unit affine cycle through slot descriptors.
         specialized_stats: Optional[Dict[str, int]] = None
-        # Tile groups share the resident source volume but carry one affine per tile;
-        # the fixed-affine resident TensorRT ring therefore remains ineligible.
-        if predictor_direct is not None and M_out_to_native_by_unit is None:
+        if predictor_direct is not None:
             specialized_stats = _try_resident_trt_ring_accumulate(
                 predictor_direct, source, cfg,
-                source_label=source_label,
                 num_frames=int(num_frames),
                 out_size=int(out_size),
                 M_out_to_native=M_out_to_native,
                 native_h=int(native_h),
                 native_w=int(native_w),
                 device_union=device_union,
+                M_out_to_native_by_unit=M_out_to_native_by_unit,
+                preunion_min_conf=preunion_min_conf,
             )
             if specialized_stats is not None:
                 prediction_count = int(specialized_stats['prediction_count'])
@@ -12165,8 +12248,8 @@ def union_conf_volume_into_volume_inplace(
 # full-frame view family renders ON DEVICE and batches feed TensorRT directly
 # through the existing _tta_gpu_tensor preprocess contract (no CPU render pool,
 # no host staging round trip).
-# stream — the volume does not fit: radial full-frame tasks still render on the GPU by
-# streaming transient source t-blocks through an azimuth-chunked gather and
+# stream — the volume does not fit: upright radial full-frame tasks still render on the GPU by
+# streaming transient orientation-aware logical-stack blocks through an azimuth-chunked gather and
 # assembling the task's frames into a HOST slab that feeds the unchanged
 # StreamingYoloVolumeSource/CUDA-staging path (the ~1e12-op GIL-held CPU radial
 # extraction disappears in both modes); other views use the existing CPU path.
@@ -13175,20 +13258,21 @@ class _GpuWorkerRenderEngine:
             output_ref = self._fused_slot_output(slot, kernels)
             pixels = int(out_size) * int(out_size)
 
-            if tilted_radial:
-                base = str(radial_base_view_name(view))
-                base_ids = {'transverse': 0, 'sagittal': 1, 'coronal': 2}
+            base = str(radial_base_view_name(view))
+            base_ids = {'transverse': 0, 'sagittal': 1, 'coronal': 2}
+            base_aware_kernel = bool(tilted_radial or base != 'transverse')
+            if base_aware_kernel:
                 if base not in base_ids:
-                    raise RuntimeError(f'unsupported tilted-Radial base {base!r}')
-                direction = str(view.tilt_direction)
+                    raise RuntimeError(f'unsupported Radial base {base!r}')
+                direction = str(view.tilt_direction) if tilted_radial else 'vertical'
                 if direction not in ('vertical', 'horizontal'):
                     raise RuntimeError(f'unsupported tilted-Radial direction {direction!r}')
                 plane_h, plane_w = radial_plane_shape(view)
                 if int(taps.plane_h) != int(plane_h) or int(taps.plane_w) != int(plane_w):
-                    raise RuntimeError('tilted-Radial tap table/projected-plane geometry mismatch')
+                    raise RuntimeError('Radial tap table/projected-plane geometry mismatch')
                 stack_len = int(radial_stack_length(view))
                 if stack_len <= 0:
-                    raise RuntimeError('tilted-Radial stack geometry is empty')
+                    raise RuntimeError('Radial stack geometry is empty')
                 kernel = (
                     kernels.tilted_radial_direct_f16
                     if slot.input.dtype == self.torch.float16
@@ -13203,7 +13287,10 @@ class _GpuWorkerRenderEngine:
                         np.int32(stack_len), np.int32(base_ids[base]),
                         np.int32(0 if direction == 'vertical' else 1),
                         metadata,
-                        np.float32(math.tan(math.radians(float(view.tilt_angle_deg)))),
+                        np.float32(
+                            math.tan(math.radians(float(view.tilt_angle_deg)))
+                            if tilted_radial else 0.0
+                        ),
                         np.float32(view.center_x), np.float32(view.center_y),
                         np.int32(out_size), np.int32(out_size),
                         *(np.float32(v) for v in matrix.reshape(-1)),
@@ -13214,10 +13301,16 @@ class _GpuWorkerRenderEngine:
                 )
                 if render_family not in self._fused_announced_families:
                     self._fused_announced_families.add(render_family)
-                    print(
-                        'v16.0.4 fused tilted-Radial renderer active: resident uint8 volume '
-                        '-> shear + Lanczos-3 + stack lerp -> TensorRT binding.'
-                    )
+                    if tilted_radial:
+                        print(
+                            'Fused tilted-Radial renderer active: resident uint8 volume '
+                            '-> shear + Lanczos-3 + stack lerp -> TensorRT binding.'
+                        )
+                    else:
+                        print(
+                            f'Fused upright {base} Radial renderer active: resident uint8 volume '
+                            '-> base-aware Lanczos-3 + stack fold -> TensorRT binding.'
+                        )
             else:
                 kernel = (
                     kernels.radial_direct_f16
@@ -13625,9 +13718,8 @@ class _GpuWorkerRenderEngine:
         self._fold_cache[key] = out
         return out
 
-    def _radial_project_blocks(self, view: ViewInfo, block2d: object, flat_idx: object, w2d: object) -> object:
+    def _radial_project_blocks(self, block2d: object, flat_idx: object, w2d: object) -> object:
         """(rows, H*W) u8 block -> (rows, u) float32 Lanczos projection."""
-        # DEAD PARAMETER: view is retained for renderer-method API consistency.
         samples = block2d[:, flat_idx]
         return (samples.to(self.torch.float32) * w2d.unsqueeze(0)).sum(dim=-1)
 
@@ -13651,7 +13743,7 @@ class _GpuWorkerRenderEngine:
             chunk = 512
             for t0 in range(0, native_t, chunk):
                 t1 = min(native_t, t0 + chunk)
-                proj[t0:t1] = self._radial_project_blocks(view, vol2d[t0:t1], flat_idx, w2d)
+                proj[t0:t1] = self._radial_project_blocks(vol2d[t0:t1], flat_idx, w2d)
             if rows_out == native_t and int(self._logical_t) == native_t:
                 return proj
             r0, r1, alpha = self._radial_fold_indices(
@@ -13673,7 +13765,7 @@ class _GpuWorkerRenderEngine:
             else:  # pragma: no cover
                 raise ValueError(f'Unsupported resident Radial base: {base}')
             proj[s0:s1] = self._radial_project_blocks(
-                view, oriented.view(s1 - s0, -1), flat_idx, w2d,
+                oriented.view(s1 - s0, -1), flat_idx, w2d,
             )
         if rows_out == stack_len:
             return proj
@@ -13841,7 +13933,7 @@ class _GpuWorkerRenderEngine:
                 if 'tilted_radial_native' not in self._fused_announced_families:
                     self._fused_announced_families.add('tilted_radial_native')
                     print(
-                        'v16.0.4 resident tilted-Radial native-plane CUDA kernel active '
+                        'Resident tilted-Radial native-plane CUDA kernel active '
                         '(YOLO_TTA_GPU_TILTED_RADIAL_NATIVE_KERNEL=0 selects Torch gathers).'
                     )
                 return out
@@ -13860,20 +13952,25 @@ class _GpuWorkerRenderEngine:
         view: ViewInfo,
         frame_indices: Sequence[int],
     ) -> np.ndarray:
-        """GPU-render a sparse bank of radial view planes into a host slab.
+        """GPU-render selected upright Radial frames from logical stack-axis slabs.
 
- Streams transient source t-blocks to the device and evaluates an adaptive azimuth chunk
- per block (per-azimuth fp16 t-projections stay device-resident between blocks), then
- folds/quantizes each frame and copies it into a host uint8 slab. VRAM working set is
- bounded by the t-block plus the azimuth-chunk projections. ``frame_indices`` contains
- the globally clamped center/context indices actually required by the worker task, so
- a large channel stride does not render unused intervening azimuths."""
+        Transverse streams t slabs, sagittal streams y slabs arranged as ``(y,t,x)``,
+        and coronal streams x slabs arranged as ``(x,t,y)``.  Each bounded slab is
+        contiguous before H2D transfer, so the existing Lanczos projection contract is
+        shared by all three Cartesian Radial bases without materializing a full oriented
+        volume on either host or device.
+        """
         if not radial_streaming_gpu_render_supported(view):
             raise RuntimeError(
-                f'non-resident GPU Radial prerender supports only transverse, got {view.name!r}'
+                f'non-resident GPU Radial prerender does not support {view.name!r}'
             )
+        if self._volume_mm is None:
+            raise RuntimeError('non-resident GPU Radial prerender has no source memmap')
         torch = self.torch
-        t_dim, full_h, full_w = (int(x) for x in self._volume_mm.shape)
+        native_t, full_h, full_w = (int(x) for x in self._volume_mm.shape)
+        base = radial_base_view_name(view)
+        stack_len = int(radial_stack_length(view))
+        plane_h, plane_w = radial_plane_shape(view)
         rows_out = int(view.src_h)
         u_len = int(view.src_w) if int(view.src_w) > 0 else int(view.diameter)
         indices = tuple(int(value) for value in frame_indices)
@@ -13885,47 +13982,83 @@ class _GpuWorkerRenderEngine:
             raise RuntimeError(
                 f'streamed radial prerender indices are outside [0,{int(view.num_slices)})'
             )
+        expected_plane = {
+            'transverse': (full_h, full_w),
+            'sagittal': (native_t, full_w),
+            'coronal': (native_t, full_h),
+        }[base]
+        expected_stack = {'transverse': native_t, 'sagittal': full_h, 'coronal': full_w}[base]
+        if (int(plane_h), int(plane_w), int(stack_len)) != (
+            int(expected_plane[0]), int(expected_plane[1]), int(expected_stack)
+        ):
+            raise RuntimeError(
+                f'{base} Radial logical geometry mismatch: plane={plane_h}x{plane_w}, '
+                f'stack={stack_len}; expected {expected_plane[0]}x{expected_plane[1]}, '
+                f'stack={expected_stack}'
+            )
+
         count = len(indices)
         slab = np.empty((count, rows_out, u_len), dtype=np.uint8)
-        tblock = int(gpu_render_tblock_slices())
-        per_az_bytes = t_dim * u_len * 2 + u_len * RADIAL_LANCZOS_A * RADIAL_LANCZOS_A * 4 * 12 * 2
+        stack_block = max(1, min(int(gpu_render_tblock_slices()), int(stack_len)))
+        tap_count = (RADIAL_LANCZOS_A * 2) ** 2
+        per_az_bytes = (
+            int(stack_len) * int(u_len) * np.dtype(np.float16).itemsize
+            + int(u_len) * int(tap_count) * (
+                np.dtype(np.int64).itemsize + np.dtype(np.float32).itemsize
+            )
+        )
+
+        def _logical_stack_block(s0: int, s1: int) -> np.ndarray:
+            if base == 'transverse':
+                return np.ascontiguousarray(self._volume_mm[int(s0):int(s1), :, :])
+            if base == 'sagittal':
+                return np.ascontiguousarray(
+                    np.transpose(self._volume_mm[:, int(s0):int(s1), :], (1, 0, 2))
+                )
+            return np.ascontiguousarray(
+                np.transpose(self._volume_mm[:, :, int(s0):int(s1)], (2, 0, 1))
+            )
+
         with torch.cuda.stream(self._stream):
             try:
                 free_bytes, _total = torch.cuda.mem_get_info(self.device)
             except Exception:
                 free_bytes = 8 * GIB
-            gather_temp = tblock * u_len * (RADIAL_LANCZOS_A * 2) ** 2 * 4
-            budget = max(0, int(free_bytes) - tblock * full_h * full_w - gather_temp - 2 * GIB)
+            source_block_bytes = int(stack_block) * int(plane_h) * int(plane_w)
+            gather_temp = int(stack_block) * int(u_len) * int(tap_count) * np.dtype(np.float32).itemsize
+            budget = max(0, int(free_bytes) - source_block_bytes - gather_temp - 2 * GIB)
             az_chunk = int(np.clip(budget // max(1, per_az_bytes), 1, count))
-            # Each azimuth chunk re-streams the whole source volume; a tiny chunk would multiply
-            # that H2D traffic pathologically — hand the task back to the CPU render path instead.
             if az_chunk < min(8, count):
                 raise RuntimeError(
-                    f'insufficient free VRAM for streamed radial prerender '
+                    f'insufficient free VRAM for streamed {base} Radial prerender '
                     f'(az_chunk={az_chunk}, free={free_bytes / GIB:.1f} GiB)'
                 )
-            fold = rows_out != t_dim
+            fold = rows_out != stack_len
             if fold:
-                r0, r1, alpha = self._radial_fold_indices(t_dim, rows_out)
+                r0, r1, alpha = self._radial_fold_indices(stack_len, rows_out)
             for a0 in range(0, count, az_chunk):
                 a1 = min(count, a0 + az_chunk)
-                proj = torch.zeros((a1 - a0, t_dim, u_len), dtype=torch.float16, device=self.device)
+                proj = torch.zeros(
+                    (a1 - a0, stack_len, u_len), dtype=torch.float16, device=self.device,
+                )
                 taps = [
                     self._radial_taps_gpu(view, float(view.azimuths_deg[indices[i]]))
                     for i in range(a0, a1)
                 ]
-                for t0 in range(0, t_dim, tblock):
-                    t1 = min(t_dim, t0 + tblock)
-                    block = torch.from_numpy(np.ascontiguousarray(self._volume_mm[t0:t1])).to(self.device)
-                    block2d = block.view(t1 - t0, -1)
+                for s0 in range(0, stack_len, stack_block):
+                    s1 = min(stack_len, s0 + stack_block)
+                    block_np = _logical_stack_block(s0, s1)
+                    block = torch.from_numpy(block_np).to(self.device)
+                    block2d = block.view(s1 - s0, -1)
                     for j, (flat_idx, w2d) in enumerate(taps):
-                        proj[j, t0:t1] = self._radial_project_blocks(view, block2d, flat_idx, w2d).to(torch.float16)
-                    del block, block2d
+                        proj[j, s0:s1] = self._radial_project_blocks(
+                            block2d, flat_idx, w2d,
+                        ).to(torch.float16)
+                    del block, block2d, block_np
                 for j in range(a1 - a0):
                     pj = proj[j].to(torch.float32)
                     folded = (pj[r0] * (1.0 - alpha) + pj[r1] * alpha) if fold else pj
-                    frame_u8 = folded.round().clamp_(0.0, 255.0).to(torch.uint8)
-                    slab[a0 + j] = frame_u8.cpu().numpy()
+                    slab[a0 + j] = folded.round().clamp_(0.0, 255.0).to(torch.uint8).cpu().numpy()
                 del proj, taps
         return slab
 
@@ -14309,6 +14442,53 @@ class _GpuWorkerRenderEngine:
             slot.render_done.record(self._stream)
 
 
+    def render_tile_into_ring_slot(
+        self,
+        slot: _ResidentGpuPipelineSlot,
+        view: ViewInfo,
+        tile_affines: Sequence[np.ndarray],
+        flat_unit_index: int,
+        *,
+        slice_offset: int,
+        out_size: int,
+        channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
+    ) -> None:
+        """Render one flattened ``(frame,tile)`` unit into a persistent ring slot."""
+        torch = self.torch
+        fmt = resolve_channel_format(channel_format)
+        tile_count = max(1, int(len(tile_affines)))
+        local_frame, tile_index = divmod(int(flat_unit_index), tile_count)
+        absolute_frame = int(slice_offset) + int(local_frame)
+        expected_shape = (1, int(fmt.channel_count), int(out_size), int(out_size))
+        if tuple(int(x) for x in slot.input.shape) != expected_shape:
+            raise RuntimeError(
+                f'resident tile-ring input shape {tuple(slot.input.shape)} != {expected_shape}'
+            )
+        matrix = np.asarray(tile_affines[int(tile_index)], dtype=np.float32)
+        with torch.cuda.stream(self._stream):
+            if bool(slot.infer_valid):
+                self._stream.wait_event(slot.infer_done)
+            contextual = tuple(
+                edge_clamped_view_slice_index(view, absolute_frame + int(offset))
+                for offset in fmt.offsets
+            )
+            first_channel_by_source: Dict[int, int] = {}
+            for channel_index, source_index in enumerate(contextual):
+                first_channel = first_channel_by_source.get(int(source_index))
+                if first_channel is not None:
+                    slot.input[0, int(channel_index)].copy_(
+                        slot.input[0, int(first_channel)], non_blocking=True,
+                    )
+                    continue
+                plane = self._render_tile_plane(
+                    view, matrix, int(source_index), int(out_size),
+                )
+                plane.clamp_(0.0, 255.0).mul_(1.0 / 255.0)
+                slot.input[0, int(channel_index)].copy_(plane, non_blocking=True)
+                first_channel_by_source[int(source_index)] = int(channel_index)
+            slot.render_done.record(self._stream)
+
+
 class GpuRenderedYoloSource:
     """Ultralytics-compatible source whose batches are rendered AND normalized on the GPU.
 
@@ -14570,6 +14750,8 @@ class GpuTiledRenderedYoloSource:
         self.synthetic_count = max(0, int(self.yield_nf) - int(self.nf))
         self.mode = 'image'
         self.count = 0
+        self._direct_count = 0
+        self._direct_ring: Optional[List[_ResidentGpuPipelineSlot]] = None
         self._fake_frame = np.broadcast_to(
             np.zeros((1, 1, int(self.channel_count)), dtype=np.uint8),
             (self.out_size, self.out_size, int(self.channel_count)),
@@ -14586,6 +14768,7 @@ class GpuTiledRenderedYoloSource:
 
     def __iter__(self) -> 'GpuTiledRenderedYoloSource':
         self.count = 0
+        self._direct_count = 0
         return self
 
     def start(self) -> None:
@@ -14596,6 +14779,80 @@ class GpuTiledRenderedYoloSource:
             self.engine.clear_native_plane_cache()
         except Exception:
             pass
+
+    def prepare_direct_ring(self, input_dtype: Optional[object] = None) -> List[_ResidentGpuPipelineSlot]:
+        """Allocate and validate the two static TensorRT input slots for grouped tiles."""
+        if (
+            self.bs != 1
+            or self.nf <= 0
+            or str(getattr(self.engine, '_mode', '')) != 'resident'
+            or not self.tile_affines
+        ):
+            raise RuntimeError(
+                'direct tile ring requires a nonempty batch-1 resident tile-group source'
+            )
+        torch = self.engine.torch
+        resolved_dtype = (
+            input_dtype
+            if input_dtype is not None
+            else (torch.float16 if bool(self.fp16) else torch.float32)
+        )
+        if resolved_dtype not in (torch.float16, torch.float32):
+            raise RuntimeError(
+                f'resident tile ring cannot render into TensorRT dtype {resolved_dtype}'
+            )
+        expected_shape = (1, int(self.channel_count), int(self.out_size), int(self.out_size))
+        if (
+            self._direct_ring is None
+            or any(
+                slot.input.dtype != resolved_dtype
+                or tuple(int(x) for x in slot.input.shape) != expected_shape
+                for slot in self._direct_ring
+            )
+        ):
+            self._direct_ring = [
+                _ResidentGpuPipelineSlot(
+                    torch, self.engine.device, int(self.out_size), int(self.channel_count),
+                    resolved_dtype, slot_id=i,
+                )
+                for i in range(2)
+            ]
+        for slot in self._direct_ring:
+            slot.render_graph = None
+            slot.render_graph_key = None
+            slot.render_expected_key = None
+        self.engine.render_tile_into_ring_slot(
+            self._direct_ring[0], self.view, self.tile_affines, 0,
+            slice_offset=int(self.slice_offset), out_size=int(self.out_size),
+            channel_format=self.channel_format,
+        )
+        self.engine._stream.synchronize()
+        self._direct_count = 0
+        self.count = 0
+        return self._direct_ring
+
+    def reset_direct_ring(self) -> None:
+        self._direct_count = 0
+        self.count = 0
+        self._direct_ring = None
+
+    def next_direct_slot(self) -> Optional[Tuple[int, _ResidentGpuPipelineSlot]]:
+        if self._direct_ring is None:
+            raise RuntimeError('direct resident tile ring has not been prepared')
+        if int(self._direct_count) >= int(self.nf):
+            return None
+        unit_index = int(self._direct_count)
+        slot = self._direct_ring[unit_index & 1]
+        slot.frame_index = int(unit_index)
+        slot.absolute_index = int(unit_index)
+        slot.synthetic = False
+        self.engine.render_tile_into_ring_slot(
+            slot, self.view, self.tile_affines, int(unit_index),
+            slice_offset=int(self.slice_offset), out_size=int(self.out_size),
+            channel_format=self.channel_format,
+        )
+        self._direct_count += 1
+        return int(unit_index), slot
 
     def __next__(self) -> Tuple[List[str], object, List[str]]:
         if self.count >= self.yield_nf or self.nf <= 0:
@@ -14953,8 +15210,9 @@ def run_prediction_volume_in_worker(
     task: Dict[str, object],
 ) -> Dict[str, object] | _DeferredGpuWorkerTaskResult:
     """Run one worker prediction task and write its result windows.
-    
-    Non-Radial views use the canonical processing grid; Radial views retain their native raster."""
+
+    Every capable view accumulates on the canonical processing grid; Radial layers carry
+    their row/diameter transform through interpolation and terminal backprojection."""
     view: ViewInfo = task['view']  # type: ignore[assignment]
     job = task['job']
     kind = str(task['kind'])
@@ -15085,9 +15343,8 @@ def run_prediction_volume_in_worker(
         # the native decoded volume + a cube-ready sentinel for every file-backed fallback.
         native_resize = task.get('native_resize') if isinstance(task.get('native_resize'), dict) else None
         # Tile groups use the same resident source and per-frame render machinery as full frames.
-        # Each group carries one affine per tile, so predict_source_and_accumulate keeps the fixed-
-        # affine resident TensorRT ring disabled even when GPU-resident tile rendering is active.
-        # The grouped source still avoids repeated native-frame extraction for each tile.
+        # Ring slots carry the current tile's affine and destination descriptor, so one static
+        # TensorRT input binding can cycle through the flattened (frame, tile) unit stream.
         if gpu_engine is not None and str(kind) in ('fullframe', 'tile_group'):
             try:
                 resident_view_supported = bool(
@@ -15192,7 +15449,7 @@ def run_prediction_volume_in_worker(
                 print(
                     'PERFORMANCE WARNING: tilted-Radial view '
                     f'{view.name!r} is entering the completed-cube CPU renderer. '
-                    'This is the v16.0.2 pathological path and can dominate wall time. '
+                    'This CPU fallback can dominate wall time. '
                     'Look earlier for a resident-upload or CUDA-renderer failure.'
                 )
             source_mm, source = _open_cpu_render_source()
@@ -15531,21 +15788,25 @@ def _gpu_inference_worker_main(
             break
         task_id = int(task['task_id'])
         if str(task.get('task_type', 'inference')) == 'interpolation_pass':
-            # Auxiliary work is submitted only after inference drains. Defensively wait
-            # for the prompt publisher before widening affinity or reusing CUDA state.
+            # The scheduler targets auxiliary work only to a worker with no assigned inference
+            # lease.  Finish any asynchronous task retirement before reusing its interpreter.
             publication_queue.join()
-            # after the inference queue drains, this warm worker process doubles
-            # as an interpolation host — same memmap-path protocol as the dedicated
-            # interpolation process pool, one pass at a time per worker.
-            # the pass's planner pools are sized for the whole allocation, so
-            # widen every thread back to the full cpuset for the pass, then re-pin. (Inference
-            # has drained by the time aux tasks arrive, so the wide window contends with
-            # nothing GPU-side.)
-            _numa_widened = False
-            if _GPU_WORKER_NUMA_PIN is not None and _GPU_WORKER_NUMA_FULL:
-                _numa_widened = _sched_setaffinity_all_threads(sorted(_GPU_WORKER_NUMA_FULL))
+            allow_full_cpu_affinity = bool(task.get('allow_full_cpu_affinity', False))
+            aux_kwargs = dict(task['aux_kwargs'])
+            local_cpu_workers = max(1, int(init_dict.get('cpu_workers', 1)))
+            if not allow_full_cpu_affinity:
+                aux_kwargs['workers'] = max(
+                    1, min(int(aux_kwargs.get('workers', local_cpu_workers)), local_cpu_workers),
+                )
+            numa_widened = False
+            if (
+                allow_full_cpu_affinity
+                and _GPU_WORKER_NUMA_PIN is not None
+                and _GPU_WORKER_NUMA_FULL
+            ):
+                numa_widened = _sched_setaffinity_all_threads(sorted(_GPU_WORKER_NUMA_FULL))
             try:
-                aux_stats = _interpolation_process_entry(**dict(task['aux_kwargs']))  # type: ignore[arg-type]
+                aux_stats = _interpolation_process_entry(**aux_kwargs)  # type: ignore[arg-type]
                 result_queue.put({
                     'type': 'aux_result', 'task_id': task_id, 'gpu_index': int(gpu_index),
                     'ok': True, 'stats': dict(aux_stats),
@@ -15557,7 +15818,7 @@ def _gpu_inference_worker_main(
                     'error': repr(exc), 'traceback': traceback.format_exc(),
                 })
             finally:
-                if _numa_widened and _GPU_WORKER_NUMA_PIN is not None:
+                if numa_widened and _GPU_WORKER_NUMA_PIN is not None:
                     _sched_setaffinity_all_threads(sorted(_GPU_WORKER_NUMA_PIN))
             continue
         try:
@@ -16878,7 +17139,6 @@ def _try_label_slices_stage_a_gpu(
 def label_foreground_volume_streaming(
     mask_mm: np.ndarray,
     work_prefix: Path,
-    keep_temp: bool = False,
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
     wrap_axis: bool = False,
@@ -16892,7 +17152,6 @@ def label_foreground_volume_streaming(
     """Resolve 3D foreground topology from parallel per-slice labels and slab-local unions.
     
     The caller may request compact global labels or retain slice-local ids with lookup tables for sparse downstream work."""
-    # DEAD PARAMETER: keep_temp is retained for labeling API compatibility.
     z_dim, h, w = mask_mm.shape
     # when compact relabel is skipped, this raster never holds
     # canonical/global ids — only per-slice local ids 1..k. Halve the dominant
@@ -17682,6 +17941,156 @@ class DenseRadialBackprojectionMap:
     u_idx_map: np.ndarray
 
 
+@dataclass(frozen=True)
+class RadialProcessingGrid:
+    """Map native Radial row/diameter coordinates into the stored processing raster."""
+
+    processing_h: int
+    processing_w: int
+    native_h: int
+    native_w: int
+    native_row_to_processing: np.ndarray
+    native_u_to_processing: np.ndarray
+    reduced: bool = False
+
+
+def resolve_radial_processing_grid(
+    radial_mask_mm: np.ndarray,
+    radial_view: ViewInfo,
+) -> RadialProcessingGrid:
+    """Resolve the exact angle-zero native-to-processing mapping for one Radial layer.
+
+    Radial angle/frame order is unchanged.  Only the per-frame ``(row, diameter)`` raster
+    may be canonicalized to ``imgsz``.  The angle-zero affine is axis aligned, so compact
+    one-dimensional row and diameter lookup tables carry the transform through wraparound
+    interpolation and terminal Cartesian backprojection without expanding a native Radial
+    volume first.
+    """
+    src = np.asarray(radial_mask_mm)
+    if src.ndim != 3:
+        raise ValueError(f'Radial processing grid expects a 3D layer, got {src.shape}')
+    processing_h, processing_w = int(src.shape[1]), int(src.shape[2])
+    native_h, native_w = int(radial_view.src_h), int(radial_view.src_w)
+    if min(processing_h, processing_w, native_h, native_w) <= 0:
+        raise ValueError(
+            f'Radial processing grid has invalid processing/native geometry '
+            f'{processing_h}x{processing_w} / {native_h}x{native_w}'
+        )
+    if (processing_h, processing_w) == (native_h, native_w):
+        return RadialProcessingGrid(
+            processing_h=processing_h,
+            processing_w=processing_w,
+            native_h=native_h,
+            native_w=native_w,
+            native_row_to_processing=np.arange(native_h, dtype=np.int32),
+            native_u_to_processing=np.arange(native_w, dtype=np.int32),
+            reduced=False,
+        )
+    if processing_h != processing_w:
+        raise ValueError(
+            f'Reduced Radial processing raster must be square, got '
+            f'{processing_h}x{processing_w}'
+        )
+    if not view_uses_inference_processing_grid(radial_view, processing_w):
+        raise ValueError(
+            f'Radial layer {src.shape} differs from native '
+            f'({native_h},{native_w}) without delayed-expansion capability'
+        )
+    expected = view_processing_plane_shape(radial_view, processing_w)
+    if tuple(int(v) for v in expected) != (processing_h, processing_w):
+        raise ValueError(
+            f'Radial processing raster {processing_h}x{processing_w} does not match '
+            f'canonical geometry {expected}'
+        )
+    canonical = build_affine(
+        view=str(radial_view.name),
+        src_w=native_w,
+        src_h=native_h,
+        out_size=processing_w,
+        angle_deg=0.0,
+        pad_mode=str(radial_view.pad_mode),
+    )
+    matrix = np.asarray(canonical.M_src_to_out, dtype=np.float64).reshape(2, 3)
+    if not bool(np.isfinite(matrix).all()) or abs(float(matrix[0, 1])) > 1e-6 or abs(float(matrix[1, 0])) > 1e-6:
+        raise ValueError('Radial canonical affine is non-finite or not axis aligned')
+    # Ask OpenCV to transform one-dimensional coordinate ramps with the same affine
+    # and nearest-neighbour implementation used by native expansion.  Re-implementing the
+    # rounding algebra is not exact at fixed-point half-pixel boundaries.
+    out_to_native = np.asarray(canonical.M_out_to_src, dtype=np.float32).reshape(2, 3)
+    row_source = np.arange(processing_h, dtype=np.float32).reshape(processing_h, 1)
+    row_affine = np.array(
+        [[1.0, 0.0, 0.0], [0.0, out_to_native[1, 1], out_to_native[1, 2]]],
+        dtype=np.float32,
+    )
+    row_values = cv2.warpAffine(
+        row_source,
+        row_affine,
+        dsize=(1, native_h),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=-1.0,
+    ).reshape(-1)
+    u_source = np.arange(processing_w, dtype=np.float32).reshape(1, processing_w)
+    u_affine = np.array(
+        [[out_to_native[0, 0], 0.0, out_to_native[0, 2]], [0.0, 1.0, 0.0]],
+        dtype=np.float32,
+    )
+    u_values = cv2.warpAffine(
+        u_source,
+        u_affine,
+        dsize=(native_w, 1),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=-1.0,
+    ).reshape(-1)
+    if (
+        not bool(np.isfinite(row_values).all())
+        or not bool(np.isfinite(u_values).all())
+        or bool(np.any(row_values < 0.0))
+        or bool(np.any(row_values >= float(processing_h)))
+        or bool(np.any(u_values < 0.0))
+        or bool(np.any(u_values >= float(processing_w)))
+    ):
+        raise ValueError('Radial canonical affine maps native content outside the processing raster')
+    row_map = np.ascontiguousarray(row_values.astype(np.int32, copy=False))
+    u_map = np.ascontiguousarray(u_values.astype(np.int32, copy=False))
+    return RadialProcessingGrid(
+        processing_h=processing_h,
+        processing_w=processing_w,
+        native_h=native_h,
+        native_w=native_w,
+        native_row_to_processing=np.ascontiguousarray(row_map),
+        native_u_to_processing=np.ascontiguousarray(u_map),
+        reduced=True,
+    )
+
+
+def _radial_processing_rows_for_output(
+    grid: RadialProcessingGrid,
+    output_rows: int,
+    output_index: int,
+) -> np.ndarray:
+    native_rows = _radial_source_rows_for_output(
+        int(grid.native_h), int(output_rows), int(output_index),
+    )
+    mapped = grid.native_row_to_processing[np.fromiter(native_rows, dtype=np.int32)]
+    return np.unique(np.asarray(mapped, dtype=np.int32))
+
+
+def _radial_dense_map_for_processing(
+    dense_map: DenseRadialBackprojectionMap,
+    grid: RadialProcessingGrid,
+) -> DenseRadialBackprojectionMap:
+    native_u = np.asarray(dense_map.u_idx_map, dtype=np.int32)
+    if native_u.size and (int(native_u.min()) < 0 or int(native_u.max()) >= int(grid.native_w)):
+        raise ValueError('Radial backprojection diameter map exceeds native Radial width')
+    return DenseRadialBackprojectionMap(
+        valid_mask=np.asarray(dense_map.valid_mask, dtype=bool),
+        source_idx_map=np.asarray(dense_map.source_idx_map, dtype=np.int32),
+        u_idx_map=np.ascontiguousarray(grid.native_u_to_processing[native_u]),
+    )
+
+
 _DENSE_RADIAL_BACKPROJECT_MAP_CACHE: Dict[Tuple[object, ...], DenseRadialBackprojectionMap] = {}
 
 
@@ -18074,6 +18483,7 @@ class _ResidentTensorRTRingExecutor:
         M_out_to_native: np.ndarray,
         track_conf: bool,
         confidence_threshold: float,
+        dynamic_unit_descriptors: bool = False,
     ) -> None:
         import torch  # type: ignore
         self.torch = torch
@@ -18089,6 +18499,7 @@ class _ResidentTensorRTRingExecutor:
         self.out_size = int(out_size)
         self.native_h = int(native_h)
         self.native_w = int(native_w)
+        self.dynamic_unit_descriptors = bool(dynamic_unit_descriptors)
         if (
             self.input_channels <= 0 or self.out_size <= 0
             or self.native_h <= 0 or self.native_w <= 0
@@ -18108,23 +18519,15 @@ class _ResidentTensorRTRingExecutor:
                 f'resident ring slot shapes {slot_shapes} do not match '
                 f'expected TensorRT input {expected_input_shape}'
             )
-        try:
-            out_to_native = np.asarray(M_out_to_native, dtype=np.float64).reshape(2, 3)
-            native_to_out3 = np.linalg.inv(_affine2x3_to_3x3(out_to_native))
-        except Exception as exc:
-            raise RuntimeError('resident ring native affine is singular or malformed') from exc
-        if not bool(np.isfinite(native_to_out3).all()):
-            raise RuntimeError('resident ring native affine contains non-finite values')
-        self.identity_native_warp = bool(
-            self.native_h == self.out_size
-            and self.native_w == self.out_size
-            and _warp_matrix_is_identity(out_to_native)
+        self.default_descriptor = ResidentRingUnitDescriptor(
+            unit_index=0,
+            destination_index=0,
+            native_h=int(self.native_h),
+            native_w=int(self.native_w),
+            M_out_to_native=np.asarray(M_out_to_native, dtype=np.float32).reshape(2, 3),
         )
-        # Six scalar graph arguments, constant for the whole task. This is the exact
-        # native-pixel -> network-pixel inverse used by _affine_theta_for_grid_sample,
-        # without allocating a per-frame/full-resolution grid tensor.
-        self.native_to_out = tuple(
-            np.float32(x) for x in native_to_out3[:2, :3].reshape(-1)
+        self.identity_native_warp, self.native_to_out = self._descriptor_warp(
+            self.default_descriptor,
         )
         self.track_conf = bool(track_conf)
         self.confidence_threshold = float(confidence_threshold)
@@ -18196,6 +18599,7 @@ class _ResidentTensorRTRingExecutor:
                         f'resident ring kernels do not support TensorRT proto dtype {slot.proto.dtype}'
                     )
                 self._allocate_post_buffers(slot)
+                self._set_slot_unit_descriptor(slot, self.default_descriptor)
 
             # Shape/layout invariants for the user's single-class segmentation engines.
             for slot in self.slots:
@@ -18228,6 +18632,54 @@ class _ResidentTensorRTRingExecutor:
 
     def _binding_layout(self) -> Tuple[List[str], str, List[str], Dict[str, int]]:
         return _trt_binding_layout_for_backend(self.backend, self.engine)
+
+    def _descriptor_warp(
+        self,
+        descriptor: ResidentRingUnitDescriptor,
+    ) -> Tuple[bool, Tuple[np.float32, ...]]:
+        if (
+            int(descriptor.native_h) != int(self.native_h)
+            or int(descriptor.native_w) != int(self.native_w)
+        ):
+            raise RuntimeError(
+                f'resident ring unit {int(descriptor.unit_index)} destination geometry '
+                f'{int(descriptor.native_h)}x{int(descriptor.native_w)} does not match '
+                f'static slot geometry {int(self.native_h)}x{int(self.native_w)}'
+            )
+        try:
+            out_to_native = np.asarray(
+                descriptor.M_out_to_native, dtype=np.float64,
+            ).reshape(2, 3)
+            native_to_out3 = np.linalg.inv(_affine2x3_to_3x3(out_to_native))
+        except Exception as exc:
+            raise RuntimeError(
+                f'resident ring unit {int(descriptor.unit_index)} affine is singular or malformed'
+            ) from exc
+        if not bool(np.isfinite(native_to_out3).all()):
+            raise RuntimeError(
+                f'resident ring unit {int(descriptor.unit_index)} affine is non-finite'
+            )
+        identity = bool(
+            self.native_h == self.out_size
+            and self.native_w == self.out_size
+            and _warp_matrix_is_identity(out_to_native)
+        )
+        inverse = tuple(np.float32(x) for x in native_to_out3[:2, :3].reshape(-1))
+        return identity, inverse
+
+    def _set_slot_unit_descriptor(
+        self,
+        slot: _ResidentGpuPipelineSlot,
+        descriptor: ResidentRingUnitDescriptor,
+    ) -> None:
+        identity, inverse = self._descriptor_warp(descriptor)
+        slot.unit_descriptor = descriptor
+        slot.identity_native_warp = bool(identity)
+        slot.native_to_out = inverse
+        if self.dynamic_unit_descriptors:
+            # Post graph scalar arguments are captured by value.  Dynamic tile/unit affines
+            # retain the static TensorRT graphs but launch the compact post kernel normally.
+            slot.post_graph = None
 
     def _set_input_shape(self, context: object, slot: _ResidentGpuPipelineSlot) -> None:
         shape = tuple(int(x) for x in slot.input.shape)
@@ -18362,8 +18814,10 @@ class _ResidentTensorRTRingExecutor:
             ),
             stream=external,
         )
+        if slot.unit_descriptor is None:
+            raise RuntimeError(f'resident ring slot {slot.slot_id} has no unit descriptor')
         out_pixels = self.native_h * self.native_w
-        if self.identity_native_warp:
+        if slot.identity_native_warp:
             # Preserve the original radial/identity specialization byte-for-byte: proto
             # bilinear upsample to out_size, threshold, and nearest confidence sampling.
             self.kernels.upsample_quantize(
@@ -18382,7 +18836,7 @@ class _ResidentTensorRTRingExecutor:
                     refs['max_logit'], conf_proto_arg, np.int32(ph), np.int32(pw),
                     np.int32(self.out_size), np.int32(self.out_size),
                     np.int32(self.native_h), np.int32(self.native_w),
-                    *self.native_to_out,
+                    *slot.native_to_out,
                     refs['native_union'], refs.get('native_conf', np.uintp(0)),
                 ),
                 stream=external,
@@ -18450,7 +18904,7 @@ class _ResidentTensorRTRingExecutor:
                 raise RuntimeError(
                     f'resident TensorRT post-kernel warmup failed for ring slot {slot.slot_id}'
                 ) from exc
-            if bool(capture_graphs):
+            if bool(capture_graphs) and not self.dynamic_unit_descriptors:
                 try:
                     graph = torch.cuda.CUDAGraph()
                     # see _CUDA_GRAPH_CAPTURE_LOCK.
@@ -18489,10 +18943,13 @@ class _ResidentTensorRTRingExecutor:
         self,
         slot: _ResidentGpuPipelineSlot,
         *,
-        frame_index: int,
+        descriptor: ResidentRingUnitDescriptor,
         device_union: '_DeviceUnionAccumulator',
         frame_counts_dev: object,
     ) -> None:
+        self._set_slot_unit_descriptor(slot, descriptor)
+        unit_index = int(descriptor.unit_index)
+        destination_index = int(descriptor.destination_index)
         torch = self.torch
         with torch.cuda.stream(slot.post_stream):
             slot.post_stream.wait_event(slot.infer_done)
@@ -18502,12 +18959,12 @@ class _ResidentTensorRTRingExecutor:
                 self._launch_post(slot)
             # The static slot output is copied into the task-resident destination before
             # the slot is released. No payload/result object or per-frame Future exists.
-            device_union.union_dev[int(frame_index)].copy_(slot.native_union, non_blocking=True)
+            device_union.union_dev[destination_index].copy_(slot.native_union, non_blocking=True)
             if device_union.conf_dev is not None and slot.native_conf is not None:
-                device_union.conf_dev[int(frame_index)].copy_(slot.native_conf, non_blocking=True)
-            frame_counts_dev[int(frame_index)].copy_(slot.compact_count[0], non_blocking=True)
+                device_union.conf_dev[destination_index].copy_(slot.native_conf, non_blocking=True)
+            frame_counts_dev[unit_index].copy_(slot.compact_count[0], non_blocking=True)
             slot.post_done.record(slot.post_stream)
-        device_union.written[int(frame_index)] = True
+        device_union.written[destination_index] = True
         slot.post_valid = True
 
     def synchronize(self) -> None:
@@ -18526,6 +18983,7 @@ class _ResidentTensorRTRingExecutor:
             slot.frame_index = -1
             slot.absolute_index = -1
             slot.synthetic = False
+            self._set_slot_unit_descriptor(slot, self.default_descriptor)
 
     def close(self) -> None:
         """Drain ring streams, then restore borrowed AutoBackend binding addresses.
@@ -18576,6 +19034,8 @@ class _ResidentTensorRTRingExecutor:
             slot.conf_proto = None
             slot.native_union = None
             slot.native_conf = None
+            slot.unit_descriptor = None
+            slot.native_to_out = tuple()
             slot._cupy_refs.clear()
             slot._render_cupy_refs.clear()
         if restore_error is not None:
@@ -18609,13 +19069,18 @@ def _resident_trt_pipeline_signature(
     M_out_to_native: np.ndarray,
     track_conf: bool,
     confidence_threshold: float,
+    dynamic_unit_descriptors: bool,
 ) -> Tuple[object, ...]:
     engine = _trt_engine_from_autobackend(backend)
-    matrix = tuple(float(x) for x in np.asarray(M_out_to_native, dtype=np.float32).reshape(-1))
+    matrix: Tuple[object, ...] = (
+        ('dynamic-unit-affine',)
+        if bool(dynamic_unit_descriptors)
+        else tuple(float(x) for x in np.asarray(M_out_to_native, dtype=np.float32).reshape(-1))
+    )
     return (
         id(engine), str(input_dtype), int(input_channels), int(out_size),
         int(native_h), int(native_w),
-        matrix, bool(track_conf), float(confidence_threshold),
+        matrix, bool(track_conf), float(confidence_threshold), bool(dynamic_unit_descriptors),
     )
 
 
@@ -18645,7 +19110,7 @@ def _resident_trt_pipeline_decline(backend: Optional[object]) -> None:
 
 def _resident_trt_pipeline_acquire(
     backend: object,
-    source: 'GpuRenderedYoloSource',
+    source: object,
     *,
     input_dtype: object,
     input_channels: int,
@@ -18655,6 +19120,7 @@ def _resident_trt_pipeline_acquire(
     M_out_to_native: np.ndarray,
     track_conf: bool,
     confidence_threshold: float,
+    dynamic_unit_descriptors: bool,
 ) -> Tuple['_ResidentTensorRTRingExecutor', bool]:
     """Acquire the actual executor, not merely its two render slots."""
     persist = bool(resident_trt_pipeline_persistence_enabled())
@@ -18666,6 +19132,7 @@ def _resident_trt_pipeline_acquire(
         native_h=int(native_h), native_w=int(native_w),
         M_out_to_native=M_out_to_native, track_conf=bool(track_conf),
         confidence_threshold=float(confidence_threshold),
+        dynamic_unit_descriptors=bool(dynamic_unit_descriptors),
     )
     stale: Optional[Dict[str, object]] = None
     with _RESIDENT_TRT_PIPELINE_CACHE_LOCK:
@@ -18706,6 +19173,7 @@ def _resident_trt_pipeline_acquire(
         native_h=int(native_h), native_w=int(native_w),
         M_out_to_native=np.asarray(M_out_to_native, dtype=np.float32),
         track_conf=bool(track_conf), confidence_threshold=float(confidence_threshold),
+        dynamic_unit_descriptors=bool(dynamic_unit_descriptors),
     )
     if persist:
         with _RESIDENT_TRT_PIPELINE_CACHE_LOCK:
@@ -18721,7 +19189,7 @@ def _resident_trt_pipeline_acquire(
 def _resident_trt_pipeline_release(
     backend: object,
     executor: '_ResidentTensorRTRingExecutor',
-    source: Optional['GpuRenderedYoloSource'] = None,
+    source: Optional[object] = None,
 ) -> None:
     try:
         executor.reset_for_task()
@@ -18761,16 +19229,21 @@ def _try_resident_trt_ring_accumulate(
     source: object,
     cfg: 'PredictConfig',
     *,
-    source_label: str,
     num_frames: int,
     out_size: int,
     M_out_to_native: np.ndarray,
     native_h: int,
     native_w: int,
     device_union: Optional['_DeviceUnionAccumulator'],
+    M_out_to_native_by_unit: Optional[Sequence[np.ndarray]] = None,
+    preunion_min_conf: Optional[float] = None,
 ) -> Optional[Dict[str, int]]:
-    """Run the fixed batch-1 resident task through a worker-lifetime TensorRT executor."""
-    # DEAD PARAMETER: source_label is retained for the specialized predictor API.
+    """Run a batch-1 resident source through the persistent two-context TensorRT ring.
+
+    Full-frame sources use one task-wide post affine.  Grouped tile sources provide one
+    affine per tile; each ring slot receives a per-unit descriptor that selects both the
+    affine and the task-union destination before its post kernel is launched.
+    """
     global _RESIDENT_TRT_RING_ANNOUNCED, _RESIDENT_TRT_RING_FALLBACK_WARNED
     global _RESIDENT_TRT_RING_CACHE_HIT_ANNOUNCED
     backend = getattr(predictor, 'model', None)
@@ -18781,7 +19254,7 @@ def _try_resident_trt_ring_accumulate(
 
     if not resident_trt_ring_enabled() or device_union is None:
         return _decline()
-    if not isinstance(source, GpuRenderedYoloSource):
+    if not isinstance(source, (GpuRenderedYoloSource, GpuTiledRenderedYoloSource)):
         return _decline()
     source_channels = int(getattr(source, 'channel_count', 1))
     if source_channels != int(cfg.input_channels):
@@ -18793,30 +19266,58 @@ def _try_resident_trt_ring_accumulate(
             f'Resident TensorRT source has C={source_channels}, but '
             f'--channel_format {cfg.channel_token} requires C={int(cfg.input_channels)}'
         )
+
+    matrix_cycle = (
+        [np.asarray(M_out_to_native, dtype=np.float32).reshape(2, 3)]
+        if M_out_to_native_by_unit is None
+        else [np.asarray(m, dtype=np.float32).reshape(2, 3) for m in M_out_to_native_by_unit]
+    )
+    if not matrix_cycle:
+        return _decline()
+    descriptors: List[ResidentRingUnitDescriptor] = []
+    matrix_keys: set[Tuple[float, ...]] = set()
+    all_identity = True
+    for unit_index in range(int(num_frames)):
+        matrix = matrix_cycle[int(unit_index) % len(matrix_cycle)]
+        if not bool(np.isfinite(matrix).all()):
+            return _decline()
+        matrix_keys.add(tuple(float(v) for v in matrix.reshape(-1)))
+        identity = bool(
+            int(native_h) == int(out_size)
+            and int(native_w) == int(out_size)
+            and _warp_matrix_is_identity(matrix)
+        )
+        all_identity = bool(all_identity and identity)
+        descriptors.append(ResidentRingUnitDescriptor(
+            unit_index=int(unit_index),
+            destination_index=int(unit_index),
+            native_h=int(native_h),
+            native_w=int(native_w),
+            M_out_to_native=matrix,
+        ))
+    dynamic_descriptors = bool(len(matrix_keys) > 1)
+
     try:
         union_shape = tuple(int(x) for x in device_union.union_dev.shape)
         expected_shape = (int(num_frames), int(native_h), int(native_w))
         if union_shape != expected_shape:
             return _decline()
-        if device_union.conf_dev is not None and tuple(int(x) for x in device_union.conf_dev.shape) != expected_shape:
+        if (
+            device_union.conf_dev is not None
+            and tuple(int(x) for x in device_union.conf_dev.shape) != expected_shape
+        ):
             return _decline()
         if str(device_union.union_dev.device) != str(source.engine.device):
             return _decline()
     except Exception:
         return _decline()
-    fastpath = single_angle_gpu_fastpath()
-    identity_native_warp = bool(
-        int(native_h) == int(out_size)
-        and int(native_w) == int(out_size)
-        and _warp_matrix_is_identity(M_out_to_native)
-    )
+
     if (
-        int(cfg.batch) != 1 or int(getattr(source, 'bs', 0)) != 1
+        int(cfg.batch) != 1
+        or int(getattr(source, 'bs', 0)) != 1
         or int(getattr(source, 'nf', -1)) != int(num_frames)
-        or abs(float(getattr(getattr(source, 'job', None), 'angle_deg', 999.0))) > 1e-7
         or str(getattr(getattr(source, 'engine', None), '_mode', '')) != 'resident'
-        or fastpath is None or float(fastpath[1]) > 0.0
-        or (not identity_native_warp and not resident_trt_native_warp_enabled())
+        or (not all_identity and not resident_trt_native_warp_enabled())
     ):
         return _decline()
     trt_engine = None if backend is None else _trt_engine_from_autobackend(backend)
@@ -18834,37 +19335,37 @@ def _try_resident_trt_ring_accumulate(
         _names, input_name, _outputs, _indices = _trt_binding_layout_for_backend(backend, trt_engine)
         input_dtype = _torch_dtype_for_trt_binding(backend, trt_engine, input_name, torch)
         if input_dtype not in (torch.float16, torch.float32):
-            raise RuntimeError(f'resident ring cannot allocate unsupported TensorRT input dtype {input_dtype}')
+            raise RuntimeError(
+                f'resident ring cannot allocate unsupported TensorRT input dtype {input_dtype}'
+            )
         binding_shape = tuple(int(value) for value in (
             trt_engine.get_tensor_shape(str(input_name))
             if callable(getattr(trt_engine, 'get_tensor_shape', None))
             else trt_engine.get_binding_shape(int(_indices[input_name]))
         ))
-        if len(binding_shape) != 4:
-            raise RuntimeError(
-                f'resident TensorRT input {input_name!r} has non-BCHW shape {binding_shape}'
-            )
-        if int(binding_shape[1]) != int(source_channels):
-            raise ModelInputChannelMismatchError(
-                f'TensorRT input {input_name!r} expects C={int(binding_shape[1])}, but '
-                f'--channel_format {cfg.channel_token} supplies C={int(source_channels)}'
-            )
-        expected_binding_shape = (
-            1, int(source_channels), int(out_size), int(out_size),
-        )
-        if binding_shape != expected_binding_shape:
+        expected_binding_shape = (1, int(source_channels), int(out_size), int(out_size))
+        if len(binding_shape) != 4 or binding_shape != expected_binding_shape:
             raise RuntimeError(
                 f'resident TensorRT ring requires fixed input {expected_binding_shape}, '
                 f'but {input_name!r} is {binding_shape}'
             )
-        threshold = max(float(cfg.conf), float(fastpath[0]))
+        threshold = (
+            float(cfg.conf)
+            if preunion_min_conf is None
+            else max(float(cfg.conf), float(preunion_min_conf))
+        )
         executor, cache_hit = _resident_trt_pipeline_acquire(
-            backend, source, input_dtype=input_dtype,
-            input_channels=int(source_channels), out_size=int(out_size),
-            native_h=int(native_h), native_w=int(native_w),
-            M_out_to_native=np.asarray(M_out_to_native, dtype=np.float32),
+            backend,
+            source,
+            input_dtype=input_dtype,
+            input_channels=int(source_channels),
+            out_size=int(out_size),
+            native_h=int(native_h),
+            native_w=int(native_w),
+            M_out_to_native=np.asarray(matrix_cycle[0], dtype=np.float32),
             track_conf=device_union.conf_dev is not None,
             confidence_threshold=float(threshold),
+            dynamic_unit_descriptors=bool(dynamic_descriptors),
         )
     except _ResidentTensorRTRingFatalError:
         raise
@@ -18883,7 +19384,7 @@ def _try_resident_trt_ring_accumulate(
         if not _RESIDENT_TRT_RING_FALLBACK_WARNED:
             _RESIDENT_TRT_RING_FALLBACK_WARNED = True
             print(
-                f'Resident TensorRT ring unavailable ({exc}); using the existing direct predict loop. '
+                f'Resident TensorRT ring unavailable ({exc}); using the direct predict loop. '
                 'YOLO_TTA_RESIDENT_TRT_RING=0 suppresses this capability probe.'
             )
         return None
@@ -18897,25 +19398,27 @@ def _try_resident_trt_ring_accumulate(
             item = next_slot()
             if item is None:
                 break
-            frame_idx, slot = item
+            unit_index, slot = item
             executor.enqueue_inference(slot)
-            pending.append((int(frame_idx), slot))
+            pending.append((int(unit_index), slot))
         submitted = len(pending)
         while pending:
-            frame_idx, slot = pending.popleft()
+            unit_index, slot = pending.popleft()
             executor.enqueue_postprocess(
-                slot, frame_index=int(frame_idx), device_union=device_union,
+                slot,
+                descriptor=descriptors[int(unit_index)],
+                device_union=device_union,
                 frame_counts_dev=frame_counts_dev,
             )
             if submitted < int(num_frames):
                 item = next_slot()
                 if item is None:
                     raise RuntimeError(
-                        f'resident TensorRT ring source ended at {submitted}/{int(num_frames)} frames'
+                        f'resident TensorRT ring source ended at {submitted}/{int(num_frames)} units'
                     )
-                next_idx, next_pipeline_slot = item
+                next_index, next_pipeline_slot = item
                 executor.enqueue_inference(next_pipeline_slot)
-                pending.append((int(next_idx), next_pipeline_slot))
+                pending.append((int(next_index), next_pipeline_slot))
                 submitted += 1
         executor.synchronize()
         prediction_count = int(frame_counts_dev.sum(dtype=torch.int64).item())
@@ -18930,24 +19433,28 @@ def _try_resident_trt_ring_accumulate(
     if cache_hit and not _RESIDENT_TRT_RING_CACHE_HIT_ANNOUNCED:
         _RESIDENT_TRT_RING_CACHE_HIT_ANNOUNCED = True
         print(
-            'Resident TensorRT executor persistence active (v13.3.15 P1): contexts, '
-            'bindings, output buffers, streams, and CUDA graphs are reused across worker tasks.'
+            'Resident TensorRT executor persistence active: contexts, bindings, output '
+            'buffers, streams, and compatible CUDA graphs are reused across worker tasks.'
         )
     if not _RESIDENT_TRT_RING_ANNOUNCED:
         _RESIDENT_TRT_RING_ANNOUNCED = True
+        post_mode = (
+            f'per-unit-affine({len(matrix_cycle)} descriptors)'
+            if dynamic_descriptors
+            else ('identity' if executor.identity_native_warp else 'fused-native-affine')
+        )
         print(
             'Resident TensorRT batch-1 ring active: two independent execution contexts, '
             f'two static C={int(source_channels)} input/output slots, low-priority render, '
-            'high-priority inference, '
-            f'separate mask/union streams, post-warp='
-            f'{"identity" if executor.identity_native_warp else "fused-native-affine"}; '
-            f'CUDA graphs captured infer={executor.infer_graph_count}/2 '
+            'high-priority inference, separate mask/union streams, '
+            f'post-warp={post_mode}; CUDA graphs captured infer={executor.infer_graph_count}/2 '
             f'post={executor.post_graph_count}/2.'
         )
     return {
         'prediction_count': int(prediction_count),
         'frames_with_predictions': int(frames_with_predictions),
     }
+
 
 def _stage_radial_t_major_block(
     radial_mask_mm: np.ndarray,
@@ -19819,23 +20326,28 @@ def _radial_source_rows_for_output(
 def _radial_backproject_plane(
     radial_mask_mm: np.ndarray,
     dense_map: DenseRadialBackprojectionMap,
-    source_rows: range,
+    source_rows: Sequence[int],
+    *,
+    plane_row_slice: Optional[slice] = None,
 ) -> np.ndarray:
     src = np.asarray(radial_mask_mm)
     rows = list(int(v) for v in source_rows)
+    row_sel = slice(None) if plane_row_slice is None else plane_row_slice
+    valid = np.asarray(dense_map.valid_mask, dtype=bool)[row_sel]
     if not rows:
-        return np.zeros(dense_map.valid_mask.shape, dtype=np.uint8)
+        return np.zeros(valid.shape, dtype=np.uint8)
     if len(rows) == 1:
         cross = np.asarray(src[:, rows[0], :], dtype=np.uint8)
     else:
         cross = np.bitwise_or.reduce(np.asarray(src[:, rows, :], dtype=np.uint8), axis=1)
-    valid = np.asarray(dense_map.valid_mask, dtype=bool)
     out = np.zeros(valid.shape, dtype=np.uint8)
     if not np.any(cross) or not np.any(valid):
         return out
+    source_idx = np.asarray(dense_map.source_idx_map, dtype=np.int32)[row_sel]
+    u_idx = np.asarray(dense_map.u_idx_map, dtype=np.int32)[row_sel]
     out[valid] = cross[
-        np.asarray(dense_map.source_idx_map, dtype=np.int32)[valid],
-        np.asarray(dense_map.u_idx_map, dtype=np.int32)[valid],
+        source_idx[valid],
+        u_idx[valid],
     ]
     return out
 
@@ -19867,14 +20379,14 @@ def _backproject_radial_to_base_stack_volume(
     if not plan:
         flush_array(out)
         return out
-    dense_map = build_dense_radial_backprojection_map(
+    grid = resolve_radial_processing_grid(radial_mask_mm, radial_view)
+    dense_map = _radial_dense_map_for_processing(build_dense_radial_backprojection_map(
         radial_view, plan, out_shape_hw=(plane_h, plane_w),
-    )
-    source_row_count = int(np.asarray(radial_mask_mm).shape[1])
+    ), grid)
 
     def _build(stack_idx: int) -> None:
-        rows = _radial_source_rows_for_output(
-            source_row_count, int(output_stack_len), int(stack_idx),
+        rows = _radial_processing_rows_for_output(
+            grid, int(output_stack_len), int(stack_idx),
         )
         out[int(stack_idx)] = _radial_backproject_plane(radial_mask_mm, dense_map, rows)
 
@@ -19902,62 +20414,126 @@ def _backproject_cartesian_radial_generic(
     out_shape_tyx: Optional[Tuple[int, int, int]],
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]],
     sink_only: bool,
-) -> np.ndarray:
-    """Orientation-aware CPU backprojection for Sagittal/Coronal Radial views."""
-    if bool(sink_only):
-        raise ValueError(f'{desc}: sink-only projection is currently transverse-Radial only')
+) -> np.ndarray | SinkOnlyProjectionResult:
+    """Orientation-aware dense or sink-only backprojection for upright Radial views."""
     target_shape = (
         (int(radial_view.full_t), int(radial_view.full_h), int(radial_view.full_w))
         if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
     )
+    if bool(sink_only) and projection_block_callback is None:
+        raise ValueError(f'{desc}: sink_only=True requires projection_block_callback')
     stack_len, plane_shape = _radial_output_stack_and_plane_shape(radial_view, target_shape)
     plan, plan_stats = build_radial_backprojection_plan(radial_view)
     _log_radial_backprojection_densification(desc, plan_stats)
-    out = allocate_workspace_array(
-        shape=target_shape,
-        dtype=np.uint8,
-        path=out_path,
-        desc=f'{desc} workspace',
-        prefer_memory=bool(prefer_memory),
-        reserve_bytes=int(reserve_bytes),
-    )
-    if not plan:
-        flush_array(out)
-        return out
-    dense_map = build_dense_radial_backprojection_map(
-        radial_view, plan, out_shape_hw=plane_shape,
-    )
-    source_row_count = int(np.asarray(radial_mask_mm).shape[1])
     base = radial_base_view_name(radial_view)
+    if base not in ('sagittal', 'coronal'):
+        raise ValueError(f'Generic Cartesian Radial branch received base {base!r}')
 
-    def _build(stack_idx: int) -> None:
-        rows = _radial_source_rows_for_output(source_row_count, int(stack_len), int(stack_idx))
-        plane = _radial_backproject_plane(radial_mask_mm, dense_map, rows)
-        if base == 'sagittal':
-            out[:, int(stack_idx), :] = plane
-        elif base == 'coronal':
-            out[:, :, int(stack_idx)] = plane
-        else:  # pragma: no cover
-            raise ValueError(f'Generic Cartesian Radial branch received base {base!r}')
+    out: Optional[np.ndarray] = None
+    if not bool(sink_only):
+        out = allocate_workspace_array(
+            shape=target_shape,
+            dtype=np.uint8,
+            path=out_path,
+            desc=f'{desc} workspace',
+            prefer_memory=bool(prefer_memory),
+            reserve_bytes=int(reserve_bytes),
+        )
+    else:
+        print(
+            f'{desc}: orientation-aware sink-only Radial projection active; skipping '
+            f'{array_nbytes(target_shape, np.uint8) / GIB:.2f} GiB dense workspace.'
+        )
 
-    parallel_for_indices_chunked(
-        int(stack_len),
-        _build,
-        max_workers=choose_slice_parallel_workers(int(workers), int(stack_len)),
-        desc=desc,
-        show_progress=True,
-        target_chunks_per_worker=4,
-    )
-    flush_array(out)
-    if projection_block_callback is not None:
-        block = max(1, _env_int('YOLO_TTA_PROJECTION_CALLBACK_BLOCK', 64))
-        for t0 in range(0, int(target_shape[0]), block):
-            t1 = min(int(target_shape[0]), t0 + block)
-            _emit_projection_block_callback(
-                projection_block_callback, int(t0), np.asarray(out[t0:t1]),
-                desc=desc, required=False,
+    if not plan:
+        _emit_projection_empty_range(
+            projection_block_callback,
+            0,
+            int(target_shape[0]),
+            (int(target_shape[1]), int(target_shape[2])),
+            desc=desc,
+            required=bool(sink_only),
+        )
+        if out is not None:
+            flush_array(out)
+            return out
+        return SinkOnlyProjectionResult(tuple(int(v) for v in target_shape))
+
+    grid = resolve_radial_processing_grid(radial_mask_mm, radial_view)
+    dense_map = _radial_dense_map_for_processing(build_dense_radial_backprojection_map(
+        radial_view, plan, out_shape_hw=plane_shape,
+    ), grid)
+    worker_count = choose_slice_parallel_workers(int(workers), int(stack_len))
+
+    def _rows(stack_idx: int) -> np.ndarray:
+        return _radial_processing_rows_for_output(grid, int(stack_len), int(stack_idx))
+
+    if out is not None:
+        def _build(stack_idx: int) -> None:
+            plane = _radial_backproject_plane(
+                radial_mask_mm, dense_map, _rows(int(stack_idx)),
             )
-    return out
+            if base == 'sagittal':
+                out[:, int(stack_idx), :] = plane
+            else:
+                out[:, :, int(stack_idx)] = plane
+
+        parallel_for_indices_chunked(
+            int(stack_len),
+            _build,
+            max_workers=worker_count,
+            desc=desc,
+            show_progress=True,
+            target_chunks_per_worker=4,
+        )
+        flush_array(out)
+        if projection_block_callback is not None:
+            block = max(1, _env_int('YOLO_TTA_PROJECTION_CALLBACK_BLOCK', 64))
+            for t0 in range(0, int(target_shape[0]), block):
+                t1 = min(int(target_shape[0]), t0 + block)
+                _emit_projection_block_callback(
+                    projection_block_callback, int(t0), np.asarray(out[t0:t1]),
+                    desc=desc, required=False,
+                )
+        return out
+
+    # The sink owns t-major bands.  Slice the orientation-specific dense circle map by
+    # output-t band and scatter each stack plane directly into that band.  No full projected
+    # volume, transposed copy, or second source-space scan is created.
+    t_dim, out_h, out_w = (int(v) for v in target_shape)
+    t_block = max(1, _env_int('YOLO_TTA_PROJECTION_CALLBACK_BLOCK', 64))
+    for t0 in range(0, t_dim, t_block):
+        t1 = min(t_dim, t0 + t_block)
+        block_out = np.zeros((t1 - t0, out_h, out_w), dtype=np.uint8)
+
+        def _fill_stack(stack_idx: int) -> None:
+            plane_band = _radial_backproject_plane(
+                radial_mask_mm,
+                dense_map,
+                _rows(int(stack_idx)),
+                plane_row_slice=slice(int(t0), int(t1)),
+            )
+            if base == 'sagittal':
+                block_out[:, int(stack_idx), :] = plane_band
+            else:
+                block_out[:, :, int(stack_idx)] = plane_band
+
+        parallel_for_indices_chunked(
+            int(stack_len),
+            _fill_stack,
+            max_workers=worker_count,
+            desc=f'{desc} [t={t0}:{t1}]',
+            show_progress=False,
+            target_chunks_per_worker=4,
+        )
+        _emit_projection_block_callback(
+            projection_block_callback,
+            int(t0),
+            block_out,
+            desc=desc,
+            required=True,
+        )
+    return SinkOnlyProjectionResult((t_dim, out_h, out_w))
 
 
 def _backproject_tilted_radial_volume_to_volume(
@@ -20041,9 +20617,8 @@ def backproject_radial_volume_to_volume(
  stack before applying the existing shear backprojection. This single terminal geometry map is
  what converts working-space circles into source-space ellipses when t was cube-resized.
 
- ``sink_only=True`` remains available only for the optimized transverse Radial path, where
- completed output-t blocks can be committed transactionally through
- ``projection_block_callback`` without allocating the full ``(t,Y,X)`` volume."""
+ ``sink_only=True`` commits completed output-t blocks transactionally for every upright
+ Cartesian Radial base without allocating the full ``(t,Y,X)`` volume."""
     if not is_radial_view(radial_view):
         raise ValueError('backproject_radial_volume_to_volume expects a radial view')
 
@@ -20062,11 +20637,13 @@ def backproject_radial_volume_to_volume(
             projection_block_callback=projection_block_callback, sink_only=bool(sink_only),
         )
 
-    work_t = int(radial_view.src_h)
+    processing_grid = resolve_radial_processing_grid(radial_mask_mm, radial_view)
+    native_work_t = int(radial_view.src_h)
+    work_t = int(processing_grid.processing_h)
     work_h = int(radial_view.full_h)
     work_w = int(radial_view.full_w)
     if out_shape_tyx is None:
-        t_dim, out_h, out_w = work_t, work_h, work_w
+        t_dim, out_h, out_w = native_work_t, work_h, work_w
     else:
         t_dim, out_h, out_w = (int(v) for v in out_shape_tyx)
 
@@ -20113,15 +20690,19 @@ def backproject_radial_volume_to_volume(
             return vol_mm
         return SinkOnlyProjectionResult((int(t_dim), int(out_h), int(out_w)))
 
-    dense_map = build_dense_radial_backprojection_map(
+    dense_map = _radial_dense_map_for_processing(build_dense_radial_backprojection_map(
         radial_view, plan, out_shape_hw=None if out_shape_tyx is None else (out_h, out_w)
-    )
+    ), processing_grid)
     valid = np.asarray(dense_map.valid_mask, dtype=bool)
     source_idx_map = np.asarray(dense_map.source_idx_map, dtype=np.int32)
     u_idx_map = np.asarray(dense_map.u_idx_map, dtype=np.int32)
 
     worker_count = choose_slice_parallel_workers(int(workers), int(t_dim))
-    same_t_axis = int(work_t) == int(t_dim)
+    same_t_axis = bool(
+        not processing_grid.reduced
+        and int(native_work_t) == int(t_dim)
+        and int(work_t) == int(t_dim)
+    )
 
     # flatten the dense gather once. valid_pos holds the flat output positions
     # of in-ROI pixels; flat_src holds each one's flat (source_frame, u) index into a radial
@@ -20138,12 +20719,12 @@ def backproject_radial_volume_to_volume(
     def _v_range_for_t(t_idx: int) -> Tuple[int, int]:
         if same_t_axis:
             return int(t_idx), int(t_idx) + 1
-        # source t slice ORs every working-t radial row it covers (working t >= source t).
-        v_start = int(math.floor(float(t_idx) * float(work_t) / float(t_dim)))
-        v_stop = int(math.ceil(float(t_idx + 1) * float(work_t) / float(t_dim)))
-        v_start = int(np.clip(v_start, 0, work_t - 1))
-        v_stop = int(np.clip(max(v_start + 1, v_stop), 1, work_t))
-        return v_start, v_stop
+        mapped = _radial_processing_rows_for_output(
+            processing_grid, int(t_dim), int(t_idx),
+        )
+        if mapped.size <= 0:
+            return 0, 0
+        return int(mapped[0]), int(mapped[-1]) + 1
 
     # device-union row occupancy (valid for the pre-interpolation layer only,
     # per the caller's contract) replaces both the GPU path's occupancy scan and the CPU
@@ -20163,13 +20744,14 @@ def backproject_radial_volume_to_volume(
     gpu_done = False
     if gpu_backproject_enabled():
         try:
-            gpu_done = _radial_backproject_gpu_resident(
-                radial_mask_mm, vol_mm, valid, source_idx_map, u_idx_map, _v_range_for_t,
-                int(t_dim), int(out_h), int(out_w), desc,
-                known_row_occupancy=row_occ,
-                projection_block_callback=projection_block_callback,
-                sink_only=bool(sink_only),
-            )
+            if not processing_grid.reduced:
+                gpu_done = _radial_backproject_gpu_resident(
+                    radial_mask_mm, vol_mm, valid, source_idx_map, u_idx_map, _v_range_for_t,
+                    int(t_dim), int(out_h), int(out_w), desc,
+                    known_row_occupancy=row_occ,
+                    projection_block_callback=projection_block_callback,
+                    sink_only=bool(sink_only),
+                )
             if not gpu_done:
                 gpu_done = _radial_backproject_gpu_streaming(
                     radial_mask_mm, vol_mm, valid_pos, flat_src, _v_range_for_t,
@@ -20548,10 +21130,9 @@ class ViewBackprojectionQueueJob:
 class HybridBackprojectionQueue:
     """Sequential Radial/Tilted backprojection queue with a full CPU fallback budget.
 
- Transverse Radial retains the resident/streaming GPU implementations with CPU fallback.
- Sagittal/coronal Radial and every tilted Radial variant use the orientation-aware CPU path;
- ordinary Tilted jobs use the existing CPU shear backprojection. The historical class name is
- retained to avoid scheduler call-site churn."""
+ Upright Radial views use orientation-aware dense or sink-only projection; transverse may also
+ use the resident GPU backprojector. Tilted Radial and ordinary Tilted jobs use the generalized
+ CPU shear path. The historical class name is retained to avoid scheduler call-site churn."""
 
     def __init__(self, *, cpu_workers: int = 1) -> None:
         self.cpu_workers = max(1, int(cpu_workers))
@@ -20589,12 +21170,15 @@ class HybridBackprojectionQueue:
         results: List[Tuple[str, str, np.ndarray]] = []
         for job in jobs:
             if is_radial_view(job.view):
-                if radial_streaming_gpu_render_supported(job.view):
-                    backend_note = 'transverse Radial GPU-capable path (CPU fallback)'
-                elif is_tilted_radial_view(job.view):
+                if is_tilted_radial_view(job.view):
                     backend_note = 'Radial-to-Tilted CPU path'
+                elif radial_base_view_name(job.view) == 'transverse':
+                    backend_note = 'transverse Radial GPU backprojection path (CPU fallback)'
                 else:
-                    backend_note = f'{radial_base_view_name(job.view)} Radial CPU path'
+                    backend_note = (
+                        f'{radial_base_view_name(job.view)} Radial orientation-aware '
+                        'dense/sink-only CPU path'
+                    )
             else:
                 backend_note = 'CPU tilted path'
             print(f'Backprojection queue: running {job.model_name}/{job.view.name} via {backend_note}')
@@ -20806,7 +21390,6 @@ def assemble_view_volumes_into_native_union(
     T: int,
     H: int,
     W: int,
-    disable_multiplanar: bool,
     *,
     out_shape_tyx: Optional[Tuple[int, int, int]] = None,
     workers: int = 1,
@@ -20820,7 +21403,6 @@ def assemble_view_volumes_into_native_union(
  are resized with the same >0-threshold INTER_AREA/NEAREST semantics as the former tail
  restore). When ``out_shape_tyx`` is None or equals the working geometry, the historical
  zero-resample axis-permutation merges are used."""
-    # DEAD PARAMETER: disable_multiplanar is retained for callers; active views define the merge.
     out_t, out_h, out_w = (int(T), int(H), int(W)) if out_shape_tyx is None else (
         int(out_shape_tyx[0]), int(out_shape_tyx[1]), int(out_shape_tyx[2]))
     working_equals_out = (out_t, out_h, out_w) == (int(T), int(H), int(W))
@@ -21696,7 +22278,6 @@ def assemble_current_view_union_volume(
     T: int,
     H: int,
     W: int,
-    disable_multiplanar: bool,
     out_path: Path,
     *,
     out_shape_tyx: Optional[Tuple[int, int, int]] = None,
@@ -21709,7 +22290,7 @@ def assemble_current_view_union_volume(
     
     Multiple model entries are rejected; the destination uses source geometry when requested."""
     if len(view_volumes_by_model) != 1:
-        raise ValueError('GPT-5.6-Sol-Pro v16.0.4 supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.0.5 supports exactly one --model; multiple-model inference has been removed')
 
     union_shape = (int(T), int(H), int(W)) if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
     model_name = next(iter(view_volumes_by_model.keys()))
@@ -21746,7 +22327,6 @@ def assemble_current_view_union_volume(
             T=T,
             H=H,
             W=W,
-            disable_multiplanar=disable_multiplanar,
             out_shape_tyx=out_shape_tyx,
             workers=int(workers),
         )
@@ -21823,7 +22403,6 @@ def apply_keep_largest_objects_inplace(
     labels_mm, num_objects, label_paths = label_foreground_volume_streaming(
         mask_mm,
         work_dir / 'final_keep_objects',
-        keep_temp=True,
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
         workers=int(workers),
@@ -22016,7 +22595,6 @@ def assemble_final_union_after_view_union(
     T: int,
     H: int,
     W: int,
-    disable_multiplanar: bool,
     out_path: Path,
     temp_dir: Path,
     *,
@@ -22034,7 +22612,6 @@ def assemble_final_union_after_view_union(
         T=T,
         H=H,
         W=W,
-        disable_multiplanar=disable_multiplanar,
         out_path=out_path,
         out_shape_tyx=out_shape_tyx,
         prefer_memory=bool(prefer_memory),
@@ -22213,10 +22790,8 @@ def _v1401_track_axis_ridges(
     axis: int,
     spacing_tyx: Tuple[float, float, float],
     origin_tyx: Tuple[float, float, float],
-    raw_sample_budget: int,
 ) -> Tuple[List[List[Tuple[np.ndarray, float]]], Dict[str, object]]:
     """Join planar ridge samples into ordered, one-to-one centerline tracks."""
-    # DEAD PARAMETER: raw_sample_budget is retained for centerline API compatibility.
     axis_i = int(axis)
     plane_count = int(ridge_mask.shape[axis_i])
     inplane_dims = tuple(dim for dim in range(3) if int(dim) != axis_i)
@@ -22453,7 +23028,6 @@ def _v1401_embedded_centerline_arrays(
             axis=int(axis),
             spacing_tyx=tuple(float(v) for v in spacing_tyx),
             origin_tyx=tuple(float(v) for v in origin_tyx),
-            raw_sample_budget=int(raw_sample_budget),
         )
         axis_stats.append(stats)
         all_tracks.extend(tracks)
@@ -26062,7 +26636,6 @@ class SliceSeedBridgePlanResult:
 
 def _build_slice_endpoint_seeds(
     labels_real: np.ndarray,
-    extension_slices: int,
     workers: int = 1,
     wrap_axis: bool = False,
     component_cache: Optional['SliceComponentTableCache'] = None,
@@ -26074,8 +26647,6 @@ def _build_slice_endpoint_seeds(
  into the previous and next slice. Components without continuation become endpoint seeds in
  the corresponding direction. Radial interpolation can wrap the slice/frame axis so frame 0
  and the final radial frame are considered adjacent."""
-    # DEAD PARAMETER: extension_slices is retained for callers; scan endpoints do not use it.
-    del extension_slices  # retained for call-site compatibility; scan endpoints do not need it.
     return build_slice_endpoint_seeds_from_label_volume(
         labels_real,
         workers=int(workers),
@@ -26391,7 +26962,6 @@ def interpolate_view_volume_pass_inplace(
     labels_mm, num_objects, label_paths = label_foreground_volume_streaming(
         mask_mm,
         work_dir / f'{pass_tag}_labels',
-        keep_temp=True,
         prefer_memory=use_in_memory,
         reserve_bytes=reserve_bytes,
         wrap_axis=bool(wrap_axis),
@@ -26438,7 +27008,6 @@ def interpolate_view_volume_pass_inplace(
     worker_count = choose_slice_parallel_workers(int(workers), int(labels_mm.shape[0]))
     seeds, num_endpoints = _build_slice_endpoint_seeds(
         labels_mm,
-        extension_slices=int(max_slice_distance),
         workers=worker_count,
         wrap_axis=bool(wrap_axis),
         component_cache=component_cache,
@@ -28116,14 +28685,13 @@ def project_view_volume_to_orthogonal_volume(
     plane_h, plane_w = int(source_shape[1]), int(source_shape[2])
     reduced_processing = bool(
         delayed_native_expansion_enabled()
-        and str(view.family) != 'radial'
         and (int(plane_h), int(plane_w)) != (int(view.src_h), int(view.src_w))
     )
 
     # reduced Cartesian stacks are axis-permuted without expansion. Their resulting
     # orthogonal grid is smaller on exactly the two axes represented by the YOLO plane;
     # the NRRD streamer/final union performs the sole restore to output geometry.
-    if reduced_processing and not is_tilted_view(view):
+    if reduced_processing and view.family != 'radial' and not is_tilted_view(view):
         if view.name == 'transverse':
             t_dim, h_dim, w_dim = int(source_shape[0]), int(plane_h), int(plane_w)
         elif view.name == 'sagittal':
@@ -28312,7 +28880,6 @@ def materialize_nrrd_view_layer(
     projection_out_shape: Optional[Tuple[int, int, int]] = None
     reduced_view_layer = bool(
         delayed_native_expansion_enabled()
-        and str(view.family) != 'radial'
         and tuple(int(v) for v in np.asarray(view_volume_mm).shape[-2:])
         != (int(view.src_h), int(view.src_w))
     )
@@ -28325,7 +28892,7 @@ def materialize_nrrd_view_layer(
         'source_raw_path': str(raw_path),
         'source_raw_workspace': 'in_memory_when_available' if bool(transient_projection_in_memory) else 'disk_backed',
         'projection_payload_fusion': (
-            'transverse_radial_sink_only_v16.0.2'
+            f'{radial_base_view_name(view)}_radial_sink_only'
             if radial_sink_only_projection_supported(view) else 'dense_projection'
         ),
     }
@@ -29024,8 +29591,8 @@ def prepare_view_volume_after_fullframe(
         else:
             final_view_volume = baseline_native_volume
     elif view.family == 'radial':
-        # Keep Radial masks view-native here. The sequential final queue later
-        # tries resident/streaming GPU backprojection with a complete CPU fallback.
+        # Keep Radial masks view-native here. Final projection is orientation-aware and may
+        # stream directly into destination bands; transverse also has a GPU backprojection path.
         final_view_volume = baseline_native_volume
     elif is_tilted_view(view):
         # Keep Tilted masks view-native here for the final CPU backprojection.
@@ -31399,14 +31966,12 @@ class _MemberParallelGzipPayloadWriter:
         self._completed: Dict[int, Tuple[bytes, int]] = {}
         self._inflight_bytes = 0
 
-    def _compress_member(self, payload: object, known_nonzero: bool) -> Tuple[bytes, int]:
+    def _compress_member(self, payload: object) -> Tuple[bytes, int]:
         """Encode in one native gzip pass; CRC is produced by ISA-L/zlib itself.
 
  Known zeros enter through ``write_zeros`` from extent/cvol metadata. Unknown data is
  deliberately not pre-scanned: native DEFLATE handles an unexpected zero member more
  cheaply than adding a full memory pass to every nonzero member."""
-        # DEAD PARAMETER: known_nonzero is retained by the sparse-writer API.
-        del known_nonzero  # retained for the explicit sparse-writer API and future telemetry
         mv = payload if isinstance(payload, memoryview) else memoryview(payload)  # type: ignore[arg-type]
         mv = mv.cast('B')
         ln = int(len(mv))
@@ -31419,25 +31984,23 @@ class _MemberParallelGzipPayloadWriter:
             # its one required copy inside the worker, never on the sparse assembly thread.
             return bytes(self.member_compress(bytes(mv))), int(ln)
 
-    def _enqueue_completed(self, member: bytes, ln: int) -> None:
-        # DEAD PARAMETER: ln is retained by the detached-payload callback API.
+    def _enqueue_completed(self, member: bytes) -> None:
         seq = int(self._next_sequence)
         self._next_sequence += 1
-        del ln  # cached members never consume the in-flight detached-payload budget
         self._completed[seq] = (member, 0)
 
-    def _enqueue_chunk(self, chunk_mv: memoryview, *, known_nonzero: bool) -> None:
+    def _enqueue_chunk(self, chunk_mv: memoryview) -> None:
         seq = int(self._next_sequence)
         self._next_sequence += 1
         payload = bytes(chunk_mv)  # detach once; classification no longer adds a NumPy scan
         ln = int(len(payload))
         fut = _nrrd_gzip_executor().submit(
-            self._compress_member, payload, bool(known_nonzero),
+            self._compress_member, payload,
         )
         self._pending[fut] = (int(seq), int(ln))
         self._inflight_bytes += int(ln)
 
-    def _enqueue_owned_chunk(self, owner: object, *, known_nonzero: bool) -> None:
+    def _enqueue_owned_chunk(self, owner: object) -> None:
         """Transfer one caller-owned contiguous allocation to a compressor worker.
 
  The Future retains ``mv`` (and therefore its NumPy exporter) until native DEFLATE
@@ -31449,7 +32012,7 @@ class _MemberParallelGzipPayloadWriter:
         self._next_sequence += 1
         ln = int(len(mv))
         fut = _nrrd_gzip_executor().submit(
-            self._compress_member, mv, bool(known_nonzero),
+            self._compress_member, mv,
         )
         self._pending[fut] = (int(seq), int(ln))
         self._inflight_bytes += int(ln)
@@ -31488,7 +32051,7 @@ class _MemberParallelGzipPayloadWriter:
         if bool(block):
             self._write_ready_prefix()
 
-    def _write_impl(self, data: bytes | bytearray | memoryview, *, known_nonzero: bool) -> int:
+    def _write_impl(self, data: bytes | bytearray | memoryview) -> int:
         if self.closed:
             raise RuntimeError('Cannot write to a closed gzip payload stream')
         mv = data if isinstance(data, memoryview) else memoryview(data)
@@ -31496,16 +32059,16 @@ class _MemberParallelGzipPayloadWriter:
         total = len(mv)
         for off in range(0, total, self.chunk_bytes):
             ln = min(self.chunk_bytes, total - off)
-            self._enqueue_chunk(mv[off:off + ln], known_nonzero=bool(known_nonzero))
+            self._enqueue_chunk(mv[off:off + ln])
             self._drain(block=False)
         return int(total)
 
     def write(self, data: bytes | bytearray | memoryview) -> int:
-        return self._write_impl(data, known_nonzero=False)
+        return self._write_impl(data)
 
     def write_known_nonzero(self, data: bytes | bytearray | memoryview) -> int:
         """Encode cvol-index-classified bytes without a redundant all-zero scan."""
-        return self._write_impl(data, known_nonzero=True)
+        return self._write_impl(data)
 
     def write_owned_known_nonzero(self, data: object) -> int:
         """Ownership-transfer fast path for one already slice-aligned member."""
@@ -31515,7 +32078,7 @@ class _MemberParallelGzipPayloadWriter:
         mv = mv.cast('B')
         if len(mv) <= 0:
             return 0
-        self._enqueue_owned_chunk(mv, known_nonzero=True)
+        self._enqueue_owned_chunk(mv)
         self._drain(block=False)
         return int(len(mv))
 
@@ -31526,7 +32089,7 @@ class _MemberParallelGzipPayloadWriter:
         ln = int(nbytes)
         if ln <= 0:
             return 0
-        self._enqueue_completed(_zero_gzip_member(int(ln)), int(ln))
+        self._enqueue_completed(_zero_gzip_member(int(ln)))
         self._drain(block=False)
         return int(ln)
 
@@ -31537,7 +32100,7 @@ class _MemberParallelGzipPayloadWriter:
         remaining = int(nbytes)
         while remaining > 0:
             ln = min(self.chunk_bytes, remaining)
-            self._enqueue_completed(_zero_gzip_member(int(ln)), int(ln))
+            self._enqueue_completed(_zero_gzip_member(int(ln)))
             remaining -= int(ln)
             self._drain(block=False)
         return int(nbytes)
@@ -31783,7 +32346,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.6-Sol-Pro_v16.0.4_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.6-Sol-Pro_v16.0.5_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -31975,87 +32538,6 @@ def _nrrd_layer_zshard_bands(
         return equal, None
 
 
-# DEAD CODE BEGIN: no active NRRD writer constructs this ordered queue implementation.
-class _OrderedNrrdShardDestination:
-    """Bounded ordered fan-in that writes shard bytes straight to the final payload.
-
- Each compressor writes to its own small queue. The coordinator drains queues
- in z-band order, preserving payload order."""
-
-    def __init__(self, fh: object, shard_count: int) -> None:
-        self.fh = fh
-        self.abort = threading.Event()
-        # 32 complete members permits each payload-weighted band to remain ahead of
-        # ordered fan-in without the 8-item queue serializing later bands behind band zero.
-        depth = max(2, _env_int('YOLO_TTA_NRRD_SHARD_QUEUE_DEPTH', 32))
-        self.queues: List[queue.Queue] = [queue.Queue(maxsize=int(depth)) for _ in range(int(shard_count))]
-
-    def _put(self, shard: int, item: Tuple[str, object]) -> None:
-        q = self.queues[int(shard)]
-        while True:
-            if self.abort.is_set():
-                raise RuntimeError('ordered NRRD shard destination aborted')
-            try:
-                q.put(item, timeout=0.2)
-                return
-            except queue.Full:
-                continue
-
-    def sink(self, shard: int) -> '_OrderedNrrdShardSink':
-        return _OrderedNrrdShardSink(self, int(shard))
-
-    def drain(self) -> None:
-        try:
-            for shard, q in enumerate(self.queues):
-                while True:
-                    kind, value = q.get()
-                    if kind == 'data':
-                        self.fh.write(value)
-                    elif kind == 'done':
-                        break
-                    elif kind == 'error':
-                        if isinstance(value, BaseException):
-                            raise value
-                        raise RuntimeError(f'NRRD z shard {int(shard)} failed: {value}')
-                    else:
-                        raise RuntimeError(f'NRRD z shard {int(shard)} sent invalid item {kind!r}')
-        except BaseException:
-            self.abort.set()
-            raise
-
-
-class _OrderedNrrdShardSink:
-    def __init__(self, owner: _OrderedNrrdShardDestination, shard: int) -> None:
-        self.owner = owner
-        self.shard = int(shard)
-        self.closed = False
-
-    def write(self, data: bytes | bytearray | memoryview) -> int:
-        if self.closed:
-            raise RuntimeError('write to closed ordered NRRD shard sink')
-        payload = bytes(data)
-        if payload:
-            self.owner._put(self.shard, ('data', payload))
-        return int(len(payload))
-
-    def flush(self) -> None:
-        return None
-
-    def close(self) -> None:
-        if self.closed:
-            return
-        self.closed = True
-        self.owner._put(self.shard, ('done', None))
-
-    def fail(self, exc: BaseException) -> None:
-        if self.closed:
-            return
-        self.closed = True
-        try:
-            self.owner._put(self.shard, ('error', exc))
-        except Exception:
-            pass
-# DEAD CODE END: _OrderedNrrdShardDestination and _OrderedNrrdShardSink.
 
 
 @runtime_telemetry_phase('nrrd.write_layer')
@@ -34430,16 +34912,10 @@ def save_single_low_quality_output(
     stem: str,
     fps: float,
     temp_dir: Path,
-    save_nrrd: bool = False,
     workers: int = 1,
     show_progress: bool = True,
 ) -> Dict[str, Path]:
-    """Write one low-quality downbin's overlay and binary videos concurrently.
-
-    NRRD layers are emitted separately by ``NrrdLayerSink``; ``save_nrrd`` is a
-    compatibility-only parameter.
-    """
-    # DEAD PARAMETER: save_nrrd is retained for call-site compatibility; NRRDs use NrrdLayerSink.
+    """Write one low-quality downbin's overlay and binary videos concurrently."""
     low_root = Path(out_dir) / 'low_quality'
     low_root.mkdir(parents=True, exist_ok=True)
     source_t = max(1, int(mask_u8.shape[0]))
@@ -34526,7 +35002,6 @@ def collect_low_quality_output_futures(
     fps: float,
     downbin_specs: Sequence[LowQualityDownbinSpec],
     temp_dir: Path,
-    save_nrrd: bool = False,
     workers: int = 1,
     show_progress: bool = True,
 ) -> Tuple[Dict[str, Path], List[Future]]:
@@ -34535,7 +35010,6 @@ def collect_low_quality_output_futures(
         out_dir=out_dir,
         stem=stem,
         downbin_specs=downbin_specs,
-        save_nrrd=save_nrrd,
     )
     futures: List[Future] = []
     for spec in list(downbin_specs):
@@ -34548,8 +35022,7 @@ def collect_low_quality_output_futures(
             fps=float(fps),
             spec=spec,
             temp_dir=temp_dir,
-            save_nrrd=save_nrrd,
-            workers=int(workers),
+                workers=int(workers),
             show_progress=show_progress,
         ))
     return result_paths, futures
@@ -34560,14 +35033,8 @@ def planned_low_quality_output_paths(
     out_dir: Path,
     stem: str,
     downbin_specs: Sequence[LowQualityDownbinSpec],
-    save_nrrd: bool = False,
 ) -> Dict[str, Path]:
-    """Return paths for per-bin low-quality video writers.
-
-    NRRD paths are managed by ``NrrdLayerSink``; ``save_nrrd`` is a
-    compatibility-only parameter.
-    """
-    # DEAD PARAMETER: save_nrrd is retained for the shared low-quality output API.
+    """Return paths for per-bin low-quality video writers."""
     low_root = out_dir / 'low_quality'
     result_paths: Dict[str, Path] = {'low_quality_dir': low_root}
     for spec in downbin_specs:
@@ -34637,7 +35104,6 @@ class BackgroundOutputManager:
 
 
 def collect_pipeline_output_futures(
-    # DEAD PARAMETER: save_nrrd_flag, nrrd_layer_refs, and nrrd_workers are retained for call-site compatibility.
     executor: ThreadPoolExecutor,
     *,
     volume_rgb: np.memmap,
@@ -34647,13 +35113,10 @@ def collect_pipeline_output_futures(
     fps: float,
     save_binary_pattern_value: Optional[str],
     save_labels_pattern_value: Optional[str],
-    save_nrrd_flag: bool,
     tag: Optional[str] = None,
     frame_workers: int = 1,
     show_progress: bool = False,
-    nrrd_layer_refs: Optional[Sequence[NrrdLayerRef]] = None,
     nrrd_temp_dir: Optional[Path] = None,
-    nrrd_workers: int = 1,
 ) -> Tuple[Dict[str, Path], List[Future]]:
     futures: List[Future] = []
     result_paths: Dict[str, Path] = {}
@@ -34697,10 +35160,6 @@ def collect_pipeline_output_futures(
         result_paths["binary_tiff_dir"] = binary_pattern.parent
         result_paths["binary_video"] = binary_video_path
 
-    # DEAD COMMENT BEGIN: retained to document the compatibility-only NRRD parameters.
-    # NRRD layers are owned by NrrdLayerSink, so this background output group has no NRRD work.
-    # ``save_nrrd_flag`` and the ``nrrd_*`` arguments remain only for call-site stability.
-    # DEAD COMMENT END
 
     return result_paths, futures
 
@@ -34915,7 +35374,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('GPT-5.6-Sol-Pro v16.0.4 accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.0.5 accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -35410,9 +35869,8 @@ def main() -> None:
     inference_views = list(views)
     interpolating_views = [v for v in inference_views if _view_uses_interpolation(v, int(args.interpolate))]
 
-    # regression observability: a tilted_* Radial token expands to every concrete
-    # signed/directional Tilted variant of that base. Print the concrete work instead of
-    # leaving a six-token CLI looking like six similarly sized views.
+    # A tilted_* Radial token expands to every concrete signed/directional Tilted variant.
+    # Print the expanded workload rather than only the compact CLI token set.
     radial_concrete_views = [v for v in inference_views if is_radial_view(v)]
     tilted_radial_concrete_views = [v for v in radial_concrete_views if is_tilted_radial_view(v)]
     upright_radial_concrete_views = [v for v in radial_concrete_views if not is_tilted_radial_view(v)]
@@ -35429,7 +35887,7 @@ def main() -> None:
         for token, count in radial_expansion_counts.items()
     ) or 'none'
     print(
-        'v16.0.4 concrete view workload: '
+        'Concrete view workload: '
         f'{len(inference_views)} view(s) = {len(cartesian_views)} Cartesian + '
         f'{len(upright_tilted_views)} Tilted + {len(upright_radial_concrete_views)} upright Radial + '
         f'{len(tilted_radial_concrete_views)} tilted-Radial; '
@@ -35444,17 +35902,17 @@ def main() -> None:
         )
     if tilted_radial_concrete_views:
         print(
-            'v16.0.4 tilted-Radial resident CUDA rendering is enabled '
-            '(YOLO_TTA_GPU_TILTED_RADIAL_RENDER=0 restores the v16.0.2 CPU fallback). '
+            'Tilted-Radial resident CUDA rendering is enabled '
+            '(YOLO_TTA_GPU_TILTED_RADIAL_RENDER=0 selects the CPU fallback). '
             'A worker that cannot admit the source volume to VRAM will still use the completed-cube CPU path.'
         )
     spec_notes: List[str] = []
     if tilted_radial_concrete_views:
         spec_notes.append(
-            'v16.0.4 regression fix: concrete tilted-Radial views use the resident CUDA source '
+            'Concrete tilted-Radial views use the resident CUDA source '
             'renderer and persistent batch-1 TensorRT ring instead of silently materializing the '
             'deferred host cube and running the 36-tap/sheared frame renderer on the CPU. '
-            'YOLO_TTA_GPU_TILTED_RADIAL_RENDER=0 restores the v16.0.2 compatibility path.'
+            'YOLO_TTA_GPU_TILTED_RADIAL_RENDER=0 selects the compatibility CPU path.'
         )
     # spec<->implementation conflict notes (see header docstring and suggested spec edits).
     spec_notes.append(
@@ -35491,7 +35949,8 @@ def main() -> None:
             'per-thread side CUDA streams with pinned D2H staging (YOLO_TTA_GPU_POSTPROCESS_STREAM / '
             'YOLO_TTA_GPU_POSTPROCESS_PINNED); CUDA workers render full-frame views on their own '
             'GPU when the source volume fits resident (YOLO_TTA_GPU_RENDER / YOLO_TTA_GPU_RENDER_RESIDENT '
-            '/ YOLO_TTA_GPU_RENDER_RESERVE_GIB), with radial tasks GPU-prerendered from streamed t-blocks '
+            '/ YOLO_TTA_GPU_RENDER_RESERVE_GIB), with upright radial tasks GPU-prerendered from '
+            'orientation-aware logical-stack blocks '
             'otherwise (YOLO_TTA_GPU_RENDER_TBLOCK_SLICES).'
         )
     spec_notes.append(
@@ -35509,9 +35968,9 @@ def main() -> None:
         'preset medium (YOLO_TTA_X264_PRESET).'
     )
     spec_notes.append(
-        'v13.3.12 D6: non-radial masks remain on the canonical angle-0 inference raster through '
+        'Capable views remain on the canonical angle-0 inference raster through '
         'union, component labeling, interpolation/SDF work, tile gating, and sparse-layer encoding; '
-        'Cartesian and Tilted contributors receive one terminal orthogonal restore to source geometry. '
+        'Cartesian, Tilted, and Radial contributors receive one terminal mapped restore to source geometry. '
         'Radius and interpolation-cone thresholds are scaled by the smaller in-plane axis factor; '
         'intermediate added/accepted voxel counters are therefore processing-grid pixel units. '
         'YOLO_TTA_DELAY_NATIVE_EXPANSION=0 restores native-view accumulation.'
@@ -35553,9 +36012,10 @@ def main() -> None:
         '(staging now ships pinned uint8 and normalizes on device); coronal frame reads and '
         'projection writes go through K-column transposed blocks (YOLO_TTA_CORONAL_BLOCK_COLS / '
         'YOLO_TTA_CORONAL_BLOCK_CACHE); global/transverse NRRD layers encode straight from the '
-        'source volume (no pre-encode copy); and single-angle fast-path tasks accumulate their '
-        'unions in an on-device volume with one chunked pinned D2H per task '
-        '(YOLO_TTA_GPU_DEVICE_UNION) when VRAM allows.'
+        'source volume (no pre-encode copy); and compatible GPU-retina tasks accumulate raw '
+        'task-local unions in an on-device volume with one chunked pinned D2H per task '
+        '(YOLO_TTA_GPU_DEVICE_UNION) when VRAM allows. Single-angle confidence/radius cleanup '
+        'remains a separate ordering capability; multi-angle tasks retain view-level cleanup.'
     )
     if preprocess_streaming_active:
         spec_notes.append(
@@ -35651,18 +36111,20 @@ def main() -> None:
             for v in concrete_radial
         )
         spec_notes.append(
-            'v16.0.2 Radial transforms active: ' + radial_notes + '. Cartesian Radial bases do '
+            'Radial transforms active: ' + radial_notes + '. Cartesian Radial bases do '
             'not require upright Cartesian views. Each tilted_* target expands across every matching '
             'enabled signed-angle/direction Tilted variant. Circles are constructed in working projected '
             'view space; source-geometry t restoration naturally produces sagittal/coronal and Tilted '
-            'ellipses. Lanczos-3 sampling, wraparound interpolation, and dense backprojection are active.'
+            'ellipses. Lanczos-3 sampling and wraparound interpolation are retained. Upright bases can '
+            'use fused resident rendering, orientation-aware streamed GPU prerender, and reduced-grid '
+            'processing when admitted.'
         )
     if any((v.family == 'radial' or is_tilted_view(v)) for v in views):
         spec_notes.append(
-            'Current final backprojection: transverse Radial jobs retain the resident/streaming '
-            'GPU paths with CPU fallback; sagittal/coronal Radial views use the orientation-aware '
-            'CPU dense map, and tilted Radial views reconstruct their concrete Tilted stack before '
-            'the Tilted shear backprojection. The sequential queue preserves the full CPU worker budget.'
+            'Current final backprojection: upright Radial bases use orientation-aware dense or '
+            'sink-only mapping into source-space bands; transverse can additionally use the GPU '
+            'backprojector. Tilted Radial views reconstruct their concrete Tilted stack before the '
+            'Tilted shear backprojection. The sequential queue preserves the full CPU worker budget.'
         )
     spec_notes.append(
         'v13.2.0 NRRD export (--save_nrrd) writes one single-layer 3-axis NRRD (X,Y,t) per component layer to '
@@ -37162,12 +37624,15 @@ def main() -> None:
     # Process-per-GPU scheduler. This path is active for every CUDA run, including one GPU.
     #
     gpu_worker_processes: List[object] = []
-    gpu_task_queue: object = None
+    gpu_task_queues: Dict[int, object] = {}
     gpu_result_queue: object = None
     gpu_worker_tasks_by_id: Dict[int, Dict[str, object]] = {}
     gpu_worker_results_collected = 0
     gpu_worker_total_tasks = 0
     gpu_worker_dispatched_tasks = 0
+    gpu_worker_dispatched_by_id: Dict[int, int] = {}
+    gpu_worker_results_by_id: Dict[int, int] = {}
+    gpu_worker_dispatch_cursor = 0
     gpu_worker_next_dynamic_task_id = 0
     gpu_worker_pending_task_ids: deque = deque()
     gpu_worker_result_dir = temp_dir / 'gpu_worker_results'
@@ -37296,27 +37761,89 @@ def main() -> None:
         gpu_worker_pending_task_ids.remove(int(selected_id))
         return int(selected_id)
 
+    def _gpu_worker_inflight(worker_id: int) -> int:
+        worker = int(worker_id)
+        return max(
+            0,
+            int(gpu_worker_dispatched_by_id.get(worker, 0))
+            - int(gpu_worker_results_by_id.get(worker, 0)),
+        )
+
+    def _refresh_gpu_aux_interpolation_leases() -> None:
+        """Lease only workers that currently have no assigned or imminent inference work."""
+        aux_pool = gpu_worker_aux_interpolation_pool()
+        worker_ids = sorted(int(worker_id) for worker_id in gpu_task_queues)
+        if aux_pool is None or not worker_ids:
+            return
+        inference_tail_drained = bool(
+            int(gpu_worker_total_tasks) > 0
+            and int(gpu_worker_results_collected) >= int(gpu_worker_total_tasks)
+            and not deferred_tile_jobs_by_parent
+        )
+        if len(worker_ids) == 1:
+            worker_id = int(worker_ids[0])
+            if inference_tail_drained:
+                aux_pool.enable_worker(worker_id, allow_full_cpu_affinity=True)
+            else:
+                aux_pool.revoke_worker(worker_id)
+            return
+
+        # Multi-GPU workers can become useful interpolation hosts independently after their
+        # targeted queue drains, even while another GPU is finishing a long lease.  A newly
+        # ready inference task revokes the lease in the dispatcher before queueing that task.
+        no_imminent_task = not gpu_worker_pending_task_ids
+        for worker_id in worker_ids:
+            if (
+                int(gpu_worker_dispatched_tasks) > 0
+                and no_imminent_task
+                and _gpu_worker_inflight(worker_id) == 0
+            ):
+                aux_pool.enable_worker(worker_id, allow_full_cpu_affinity=False)
+            else:
+                aux_pool.revoke_worker(worker_id)
+
     def _dispatch_gpu_worker_inference_window(
         preferred_parent: Optional[Tuple[str, str]] = None,
     ) -> None:
-        """Issue a bounded window, adapting only its actual inference tail."""
-        nonlocal gpu_worker_dispatched_tasks
-        if gpu_task_queue is None:
+        """Issue bounded, targeted worker leases and adapt only the actual inference tail."""
+        nonlocal gpu_worker_dispatched_tasks, gpu_worker_dispatch_cursor
+        worker_ids = sorted(int(worker_id) for worker_id in gpu_task_queues)
+        if not worker_ids:
             return
         per_gpu = max(1, _env_int_compat(
             'YOLO_TTA_GPU_WORKER_DISPATCH_WINDOW_PER_GPU',
             'YOLO_TTA_MGPU_DISPATCH_WINDOW_PER_GPU',
             2,
         ))
-        target = max(1, int(gpu_device_count) * int(per_gpu))
-        in_flight = max(0, int(gpu_worker_dispatched_tasks) - int(gpu_worker_results_collected))
-        while gpu_worker_pending_task_ids and int(in_flight) < int(target):
-            issue_slots = int(target) - int(in_flight)
+        aux_pool = gpu_worker_aux_interpolation_pool()
+        while gpu_worker_pending_task_ids:
+            candidates: List[int] = []
+            for worker_id in worker_ids:
+                if _gpu_worker_inflight(worker_id) >= int(per_gpu):
+                    continue
+                if aux_pool is not None and not aux_pool.revoke_worker(worker_id):
+                    # An already-running interpolation pass owns this worker until its result
+                    # returns.  Other workers may continue taking inference leases meanwhile.
+                    continue
+                candidates.append(int(worker_id))
+            if not candidates:
+                break
+            issue_slots = sum(
+                max(0, int(per_gpu) - _gpu_worker_inflight(worker_id))
+                for worker_id in candidates
+            )
             _split_one_gpu_worker_dispatch_tail(int(issue_slots), preferred_parent)
+            start_rank = int(gpu_worker_dispatch_cursor) % len(worker_ids)
+            position = {worker_id: (worker_ids.index(worker_id) - start_rank) % len(worker_ids) for worker_id in candidates}
+            worker_id = min(candidates, key=lambda value: (_gpu_worker_inflight(value), position[value]))
+            gpu_worker_dispatch_cursor = (worker_ids.index(worker_id) + 1) % len(worker_ids)
             task_id = _pop_gpu_worker_pending_task_id(preferred_parent)
-            gpu_task_queue.put(gpu_worker_tasks_by_id[task_id])
+            gpu_task_queues[int(worker_id)].put(gpu_worker_tasks_by_id[task_id])
             gpu_worker_dispatched_tasks += 1
-            in_flight += 1
+            gpu_worker_dispatched_by_id[int(worker_id)] = int(
+                gpu_worker_dispatched_by_id.get(int(worker_id), 0)
+            ) + 1
+        _refresh_gpu_aux_interpolation_leases()
 
     def _ensure_source_volume_file_backed() -> Tuple[str, Tuple[int, int, int], str]:
         wait_for_volume_ready(volume_rgb)
@@ -37402,7 +37929,6 @@ def main() -> None:
         # (~30-90 s each) overlaps the decode instead of running strictly after it. Tasks are
         # enqueued below once the shared source volume is ready.
         mp_ctx = mp.get_context('spawn')
-        gpu_task_queue = mp_ctx.Queue()
         gpu_result_queue = mp_ctx.Queue()
         # tiles within one configuration overlap, so two workers can OR the same canvas
         # byte concurrently. These inherited locks give each canvas z band a mutual-exclusion
@@ -37412,14 +37938,19 @@ def main() -> None:
             if tile_group_dispatch_active else None
         )
         for worker_pos, gpu_index in enumerate(gpu_logical_indices):
+            worker_id = int(gpu_index)
+            worker_queue = mp_ctx.Queue()
+            gpu_task_queues[worker_id] = worker_queue
+            gpu_worker_dispatched_by_id[worker_id] = 0
+            gpu_worker_results_by_id[worker_id] = 0
             worker_init_i = dict(worker_init)
             worker_init_i['numa_affinity_cpus'] = worker_numa_plan[int(worker_pos)]
             worker_init_i['cpu_workers'] = int(worker_cpu_budgets[int(worker_pos)])
             proc = mp_ctx.Process(
                 target=_gpu_inference_worker_main,
                 args=(
-                    int(gpu_index), str(model_paths[0]), worker_init_i,
-                    gpu_task_queue, gpu_result_queue, canvas_zband_locks,
+                    worker_id, str(model_paths[0]), worker_init_i,
+                    worker_queue, gpu_result_queue, canvas_zband_locks,
                 ),
                 name=f'gpu-worker-{gpu_index}', daemon=True,
             )
@@ -37435,10 +37966,10 @@ def main() -> None:
             f'(pinned to CUDA_VISIBLE_DEVICES tokens {pinned_tokens}); {startup_overlap_note}; '
             f'per-worker CPU workers={worker_cpu_budgets}, cv2 threads=1. Tasks enqueue once the source volume is ready.'
         )
-        # the warm workers double as interpolation hosts once inference drains.
+        # Warm workers double as interpolation hosts whenever their targeted inference queue is idle.
         if gpu_worker_aux_interpolation_enabled() and bool(interpolation_process_backend_active):
             set_gpu_worker_aux_interpolation_pool(
-                _GpuWorkerAuxInterpolationPool(gpu_task_queue, len(gpu_worker_processes))
+                _GpuWorkerAuxInterpolationPool(gpu_task_queues)
             )
 
         # when the cube resize applies and both volumes are file-backed,
@@ -37555,7 +38086,7 @@ def main() -> None:
                 # A still-central lease may split later, only when dispatch reaches the
                 # actual global inference tail; tiles are never split.
                 ranges = gpu_worker_fullframe_task_ranges(
-                    int(n_slices), int(slice_chunk), int(gpu_device_count), int(args.batch),
+                    int(n_slices), int(slice_chunk),
                 )
                 key_fv = (str(model_name), str(view.name))
                 fullframe_subtasks_per_view[key_fv] = int(fullframe_subtasks_per_view.get(key_fv, 0)) + len(ranges)
@@ -38000,19 +38531,24 @@ def main() -> None:
                 f"{msg.get('error')}\n{msg.get('traceback')}"
             )
         if mtype == 'aux_result':
-            # auxiliary interpolation-pass result — route to the waiting
-            # submitter thread; failures are ITS to handle (fallback/raise), not the
-            # scheduler's, mirroring the interpolation ProcessPoolExecutor semantics.
+            # Route the targeted worker result to its waiting interpolation caller.  Once the
+            # lease is free, newly ready inference can immediately revoke it and dispatch.
+            worker_id = int(msg.get('gpu_index', -1))
             aux_pool = gpu_worker_aux_interpolation_pool()
             if aux_pool is not None:
                 aux_pool.complete(
                     int(msg.get('task_id', -1)),
+                    worker_id,
                     bool(msg.get('ok')),
                     msg.get('stats') if isinstance(msg.get('stats'), dict) else None,
                     str(msg.get('error') or '') + ('\n' + str(msg.get('traceback')) if msg.get('traceback') else ''),
                 )
+            _dispatch_gpu_worker_inference_window()
+            _refresh_gpu_aux_interpolation_leases()
             return
+        worker_id = int(msg.get('gpu_index', -1))
         gpu_worker_results_collected += 1
+        gpu_worker_results_by_id[worker_id] = int(gpu_worker_results_by_id.get(worker_id, 0)) + 1
         if not bool(msg.get('ok')):
             raise RuntimeError(
                 f"GPU worker task {msg.get('task_id')} failed on device {msg.get('gpu_index')}: "
@@ -38030,18 +38566,7 @@ def main() -> None:
             _handle_tile_group_worker_result(task, stats)
         else:
             _handle_tile_worker_result(task, stats)
-        # every inference task is accounted for -> the workers are idle from here
-        # on; open the aux interpolation pool so postprocess passes can use their GILs.
-        # tile groups are enqueued only as parent support lands, so "drained" also
-        # requires that no parent still owes its tile groups.
-        if (
-            int(gpu_worker_total_tasks) > 0
-            and int(gpu_worker_results_collected) >= int(gpu_worker_total_tasks)
-            and not deferred_tile_jobs_by_parent
-        ):
-            aux_pool = gpu_worker_aux_interpolation_pool()
-            if aux_pool is not None:
-                aux_pool.enable()
+        _refresh_gpu_aux_interpolation_leases()
 
     # push drain — a transport-only daemon thread blocks on the process
     # result queue and hands messages to the main thread through a local deque + wake
@@ -38155,8 +38680,8 @@ def main() -> None:
             aux_pool.mark_failed('GPU worker processes are shutting down')
             set_gpu_worker_aux_interpolation_pool(None)
         try:
-            for _ in gpu_worker_processes:
-                gpu_task_queue.put(None)
+            for task_queue in gpu_task_queues.values():
+                task_queue.put(None)
         except Exception:
             pass
         for proc in gpu_worker_processes:
@@ -38714,9 +39239,8 @@ def main() -> None:
                 _release_parallel_pool(int(assemble_concurrency), assemble_pool)
 
     if final_backprojection_jobs:
-        # Run one set at a time with the full CPU fallback budget. Radial jobs
-        # may complete through their resident/streaming GPU implementation;
-        # Tilted jobs and failed Radial GPU attempts use these workers.
+        # Run one set at a time with the full CPU fallback budget. Transverse Radial may use
+        # GPU backprojection; all upright bases can use orientation-aware sink-only projection.
         per_backproject_workers = max(1, int(tail_slice_workers))
         final_backprojection_jobs = [
             ViewBackprojectionQueueJob(
@@ -38753,7 +39277,6 @@ def main() -> None:
         T=T,
         H=H,
         W=W,
-        disable_multiplanar=None,
         out_path=temp_dir / 'final_union_volume.u8.dat',
         temp_dir=temp_dir,
         out_shape_tyx=source_output_shape_tyx,
@@ -38923,13 +39446,10 @@ def main() -> None:
         fps=fps,
         save_binary_pattern_value=args.save_binary,
         save_labels_pattern_value=args.save_labels,
-        save_nrrd_flag=bool(args.save_nrrd),
         tag=None,
         frame_workers=tail_output_frame_workers,
         show_progress=False,
-        nrrd_layer_refs=nrrd_layer_refs if bool(args.save_nrrd) else None,
         nrrd_temp_dir=temp_dir,
-        nrrd_workers=tail_output_frame_workers,
     )
     final_paths.update(final_output_paths)
     output_manager.submit(BackgroundOutputSubmission(
@@ -38950,7 +39470,6 @@ def main() -> None:
             fps=fps,
             downbin_specs=low_quality_downbin_specs,
             temp_dir=temp_dir,
-            save_nrrd=bool(args.save_nrrd),
             workers=tail_output_workers,
             show_progress=False,
         )
