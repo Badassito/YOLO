@@ -31,6 +31,7 @@ import json
 import math
 import mmap
 import multiprocessing as mp
+from multiprocessing import reduction as mp_reduction
 import os
 import queue
 import re
@@ -781,7 +782,7 @@ class RuntimeTelemetry:
             self.path = Path(requested)
         else:
             base = os.environ.get('SLURM_JOB_ID') or str(os.getpid())
-            self.path = Path(tempfile.gettempdir()) / f'gpt56-sol-pro-v1607-telemetry-{base}-{os.getpid()}.jsonl'
+            self.path = Path(tempfile.gettempdir()) / f'gpt56-sol-pro-v1609-telemetry-{base}-{os.getpid()}.jsonl'
 
     @contextlib.contextmanager
     def span(self, name: str, **fields: object) -> Iterator[None]:
@@ -851,7 +852,7 @@ class RuntimeTelemetry:
                     'mean_ms': (seconds * 1000.0 / calls) if calls else 0.0,
                 }
             payload: Dict[str, object] = {
-                'schema': 'gpt-5.6-sol-pro-v16.0.8.telemetry.v1',
+                'schema': 'gpt-5.6-sol-pro-v16.0.9.telemetry.v1',
                 'pid': os.getpid(),
                 'monotonic_seconds': (now_ns - self.started_ns) / 1e9,
                 'wall_time': time.time(),
@@ -1073,7 +1074,10 @@ def _record_runtime_feature_gauges(telemetry: RuntimeTelemetry) -> None:
         ),
         'native_projection_callback': bool(globals().get('_emit_projection_block_callback')),
         'native_projected_layer_materializer': bool(globals().get('materialize_nrrd_view_layer')),
-        'memfd_workspace_compatibility': False,
+        'memfd_workspace_compatibility': bool(
+            callable(globals().get('memfd_workspace_enabled'))
+            and globals()['memfd_workspace_enabled']()
+        ),
         'native_persistent_trt_ring': bool(globals().get('_RESIDENT_TRT_PIPELINE_CACHE_NATIVE', False)),
     })
 
@@ -1706,12 +1710,20 @@ def _estimate_parent_view_postprocess_bytes(
  from opening too many large view preparations while child passes are live."""
     plane_bytes = max(1, int(getattr(view, 'src_h', 1))) * max(1, int(getattr(view, 'src_w', 1)))
     slices = max(1, int(getattr(view, 'num_slices', 1)))
-    live_slices = min(slices, 64 if bool(nrrd_layers_enabled) else 32)
-    multiplier = 4 if bool(nrrd_layers_enabled) else 2
-    estimate = int(plane_bytes) * int(live_slices) * int(multiplier)
+    view_bytes = int(plane_bytes) * int(slices)
+    name = str(getattr(view, 'name', '')).lower()
+    family = str(getattr(view, 'family', '')).lower()
+    # Cleanup/cvol encoding is slice-bounded for Cartesian/Radial views.  Tilted
+    # projection can additionally own a source-geometry output; tilted-Radial can
+    # own both its reconstructed base stack and projected destination concurrently.
+    estimate = max(1 * GIB, min(4 * GIB, int(view_bytes // 8) + 512 * 1024 * 1024))
+    if 'tilted' in name and family == 'radial':
+        estimate = max(int(estimate), int(view_bytes) * 2 + 4 * GIB)
+    elif 'tilted' in name:
+        estimate = max(int(estimate), int(view_bytes) + 4 * GIB)
     if bool(interpolation_enabled):
-        estimate = max(int(estimate), 4 * GIB)
-    return max(512 * 1024 * 1024, min(16 * GIB, int(estimate)))
+        estimate = max(int(estimate), int(view_bytes) * 2 + 4 * GIB)
+    return max(512 * 1024 * 1024, min(96 * GIB, int(estimate)))
 
 
 def resolve_parent_postprocess_worker_allocation(
@@ -1816,6 +1828,383 @@ def array_nbytes(shape: Sequence[int], dtype: np.dtype | str | type) -> int:
     return int(total) * int(dtype_obj.itemsize)
 
 
+# --------------------------
+# RAM / memfd workspace ownership
+# --------------------------
+# Large arrays that must be reopened by CUDA worker processes cannot be plain
+# anonymous NumPy allocations. The previous implementation treated every such array as a
+# pathname memmap under --temp, creating roughly one terabyte of dense tmpfs files for the
+# prioritized 30-view command. v16.0.9 uses parent-owned memfds and transfers duplicated
+# descriptors through multiprocessing, so workers reopen /proc/self/fd/<fd> rather than
+# relying on cross-process /proc permissions. The owner remains live until sparse retirement;
+# closing the final mapping and descriptor drops the pages without filesystem writeback.
+
+_MEMFD_OWNER_LOCK = threading.RLock()
+_MEMFD_OWNERS: Dict[str, Tuple[int, str]] = {}
+_MEMFD_ATEXIT_REGISTERED = False
+
+
+def memfd_workspace_enabled() -> bool:
+    return bool(
+        sys.platform.startswith('linux')
+        and hasattr(os, 'memfd_create')
+        and _env_flag('YOLO_TTA_MEMFD_WORKSPACES', True)
+    )
+
+
+def raw_store_memfd_enabled() -> bool:
+    """Keep cvol chunks.bin in memfd unless persistent scratch was requested."""
+    return bool(
+        memfd_workspace_enabled()
+        and _env_flag('YOLO_TTA_CVOL_MEMFD', True)
+        and not _env_flag('YOLO_TTA_KEEP_TEMP', False)
+    )
+
+
+def _memfd_label(value: object) -> str:
+    token = re.sub(r'[^A-Za-z0-9_.+-]+', '-', str(value)).strip('-')
+    return (token or 'yolo-tta')[:200]
+
+
+def _memfd_proc_path(fd: int, *, owner_pid: Optional[int] = None) -> Path:
+    return Path(f'/proc/{int(os.getpid() if owner_pid is None else owner_pid)}/fd/{int(fd)}')
+
+
+def _close_all_memfd_owners() -> None:
+    with _MEMFD_OWNER_LOCK:
+        entries = list(_MEMFD_OWNERS.items())
+        _MEMFD_OWNERS.clear()
+    for _key, (fd, _desc) in entries:
+        try:
+            os.close(int(fd))
+        except OSError:
+            pass
+
+
+def _register_memfd_owner(key: object, fd: int, desc: str) -> None:
+    global _MEMFD_ATEXIT_REGISTERED
+    key_s = str(key)
+    with _MEMFD_OWNER_LOCK:
+        previous = _MEMFD_OWNERS.pop(key_s, None)
+        _MEMFD_OWNERS[key_s] = (int(fd), str(desc))
+        if not _MEMFD_ATEXIT_REGISTERED:
+            atexit.register(_close_all_memfd_owners)
+            _MEMFD_ATEXIT_REGISTERED = True
+    if previous is not None:
+        try:
+            os.close(int(previous[0]))
+        except OSError:
+            pass
+
+
+def _release_memfd_owner_key(key: object) -> bool:
+    key_s = str(key)
+    with _MEMFD_OWNER_LOCK:
+        entry = _MEMFD_OWNERS.pop(key_s, None)
+    if entry is None:
+        return False
+    try:
+        os.close(int(entry[0]))
+    except OSError:
+        pass
+    return True
+
+
+def release_memfd_owners_under(root: Path) -> int:
+    """Release memfd files represented by symlinks below ``root``."""
+    try:
+        root_abs = Path(root).absolute()
+    except Exception:
+        root_abs = Path(root)
+    with _MEMFD_OWNER_LOCK:
+        keys = list(_MEMFD_OWNERS)
+    released = 0
+    for key in keys:
+        try:
+            key_path = Path(key)
+            if key_path == root_abs or root_abs in key_path.parents:
+                released += int(_release_memfd_owner_key(key))
+        except Exception:
+            continue
+    return int(released)
+
+
+def _allocate_memfd_workspace_array(
+    shape: Sequence[int],
+    dtype: np.dtype | str | type,
+    desc: str,
+    *,
+    initialize_zero: bool,
+) -> np.memmap:
+    if not memfd_workspace_enabled():
+        raise OSError('memfd workspaces are disabled or unavailable')
+    dtype_obj = np.dtype(dtype)
+    shape_i = tuple(int(v) for v in shape)
+    nbytes = int(array_nbytes(shape_i, dtype_obj))
+    flags = int(getattr(os, 'MFD_CLOEXEC', 0)) | int(getattr(os, 'MFD_ALLOW_SEALING', 0))
+    fd = os.memfd_create(_memfd_label(desc), flags=flags)
+    try:
+        os.ftruncate(int(fd), int(nbytes))
+        proc_path = _memfd_proc_path(int(fd))
+        mm = np.memmap(proc_path, dtype=dtype_obj, mode='r+', shape=shape_i)
+        # Root memmaps may carry Python attributes.  They make ownership explicit and
+        # allow close_memmap_array to close both the mapping and the parent keepalive fd.
+        mm._workspace_memfd_owner_key = str(proc_path)  # type: ignore[attr-defined]
+        mm._workspace_memfd_path = str(proc_path)  # type: ignore[attr-defined]
+        mm._workspace_memfd_owner_fd = int(fd)  # type: ignore[attr-defined]
+        mm._workspace_memfd_desc = str(desc)  # type: ignore[attr-defined]
+        _register_memfd_owner(str(proc_path), int(fd), str(desc))
+        if bool(initialize_zero) and int(nbytes) > 0:
+            # A newly ftruncate'd memfd reads as zero.  Do not touch every page merely
+            # to prove that fact; direct-union writers overwrite disjoint slice windows.
+            pass
+        numa_interleave_memory(mm, desc=desc)
+        return mm
+    except BaseException:
+        try:
+            os.close(int(fd))
+        except OSError:
+            pass
+        raise
+
+
+def _memfd_owner_key_from_array(arr: object) -> Optional[str]:
+    current = arr
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        key = getattr(current, '_workspace_memfd_owner_key', None)
+        if key:
+            return str(key)
+        current = getattr(current, 'base', None)
+    return None
+
+
+def _memfd_backing_path_from_array(arr: object) -> Optional[Path]:
+    """Return the stable parent-owned /proc fd path for a memfd workspace.
+
+    NumPy resolves ``memmap.filename`` through procfs and reports a pseudo-name such as
+    ``/memfd:name (deleted)``. That string is descriptive but cannot be reopened by a
+    spawned CUDA worker, so reopening must use the explicit owner path retained here.
+    """
+    current = arr
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        raw = getattr(current, '_workspace_memfd_path', None)
+        if raw:
+            return Path(str(raw))
+        current = getattr(current, 'base', None)
+    return None
+
+
+def _memfd_owner_fd_for_path(path: object) -> Optional[int]:
+    """Return the parent-owned memfd represented by ``path``, if any."""
+    if path is None:
+        return None
+    raw = str(path)
+    candidates = [raw]
+    try:
+        candidates.append(str(Path(raw).absolute()))
+    except Exception:
+        pass
+    with _MEMFD_OWNER_LOCK:
+        for key in candidates:
+            entry = _MEMFD_OWNERS.get(str(key))
+            if entry is not None:
+                return int(entry[0])
+    return None
+
+
+def _duplicate_memfd_path_for_child(path: object) -> Optional[object]:
+    """Create a multiprocessing descriptor-transfer handle for a memfd path."""
+    fd = _memfd_owner_fd_for_path(path)
+    if fd is None:
+        return None
+    return mp_reduction.DupFd(int(fd))
+
+
+def _attach_memfd_transfers_to_task(task: Dict[str, object]) -> None:
+    """Attach descriptor handles to one dispatch copy without changing canonical paths."""
+    for path_field, handle_field in (
+        ('source_volume_path', 'source_volume_fd'),
+        ('result_mask_path', 'result_mask_fd'),
+        ('result_conf_path', 'result_conf_fd'),
+        ('canvas_path', 'canvas_fd'),
+    ):
+        raw_path = task.get(path_field)
+        handle = _duplicate_memfd_path_for_child(raw_path)
+        if handle is not None:
+            task[handle_field] = handle
+            task[f'{handle_field}_key'] = str(raw_path)
+
+    native_resize = task.get('native_resize')
+    if isinstance(native_resize, dict):
+        native_copy = dict(native_resize)
+        native_path = native_copy.get('path')
+        handle = _duplicate_memfd_path_for_child(native_path)
+        if handle is not None:
+            native_copy['path_fd'] = handle
+            native_copy['path_fd_key'] = str(native_path)
+        task['native_resize'] = native_copy
+
+
+def _detach_transferred_fd(handle: object) -> int:
+    detach = getattr(handle, 'detach', None)
+    if not callable(detach):
+        raise TypeError(f'Invalid multiprocessing fd-transfer handle: {type(handle)!r}')
+    fd = int(detach())
+    if fd < 0:
+        raise OSError(f'Invalid transferred file descriptor: {fd}')
+    return fd
+
+
+def _materialize_worker_task_memfd_paths(
+    task: Dict[str, object],
+    persistent_sources: Dict[str, int],
+) -> List[int]:
+    """Replace transferred handles with worker-local procfs paths.
+
+    Source-volume descriptors are cached for the worker lifetime so the resident render
+    engine sees one stable source identity. Result and canvas descriptors are task-local;
+    dropping them after the task permits immediate sparse retirement in the parent.
+    """
+    transient_fds: List[int] = []
+
+    def _resolve(
+        holder: Dict[str, object],
+        *,
+        path_field: str,
+        handle_field: str,
+        persistent: bool,
+    ) -> None:
+        handle = holder.pop(handle_field, None)
+        key_raw = holder.pop(f'{handle_field}_key', None)
+        if handle is None:
+            return
+        key = str(key_raw or holder.get(path_field) or handle_field)
+        received_fd = _detach_transferred_fd(handle)
+        if persistent:
+            cached = persistent_sources.get(key)
+            if cached is None:
+                persistent_sources[key] = int(received_fd)
+                fd = int(received_fd)
+            else:
+                try:
+                    os.close(int(received_fd))
+                except OSError:
+                    pass
+                fd = int(cached)
+        else:
+            fd = int(received_fd)
+            transient_fds.append(int(fd))
+        holder[path_field] = str(_memfd_proc_path(int(fd), owner_pid=os.getpid()))
+
+    _resolve(task, path_field='source_volume_path', handle_field='source_volume_fd', persistent=True)
+    _resolve(task, path_field='result_mask_path', handle_field='result_mask_fd', persistent=False)
+    _resolve(task, path_field='result_conf_path', handle_field='result_conf_fd', persistent=False)
+    _resolve(task, path_field='canvas_path', handle_field='canvas_fd', persistent=False)
+
+    native_resize = task.get('native_resize')
+    if isinstance(native_resize, dict):
+        native_copy = dict(native_resize)
+        # Keep the key beside the handle while reusing the generic resolver.
+        if 'path_fd_key' in native_copy:
+            native_copy['path_fd_key'] = native_copy.get('path_fd_key')
+        _resolve(native_copy, path_field='path', handle_field='path_fd', persistent=True)
+        task['native_resize'] = native_copy
+    return transient_fds
+
+
+def _close_fd_list(fds: Iterable[int]) -> None:
+    for fd in list(fds):
+        try:
+            os.close(int(fd))
+        except OSError:
+            pass
+
+
+def _madvise_dontneed_array(arr: object) -> None:
+    """Best-effort immediate page-cache/RAM release before a scratch mapping closes."""
+    advice = getattr(mmap, 'MADV_DONTNEED', None)
+    if advice is None or arr is None:
+        return
+    current = arr
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        mmap_obj = getattr(current, '_mmap', None)
+        if mmap_obj is not None:
+            try:
+                mmap_obj.madvise(advice)
+            except (AttributeError, OSError, ValueError, BufferError):
+                pass
+            return
+        current = getattr(current, 'base', None)
+
+
+def _create_memfd_backed_payload_path(path: Path, desc: str) -> int:
+    """Create ``path`` as a symlink to a parent-owned memfd and return a writer fd."""
+    if not raw_store_memfd_enabled():
+        raise OSError('memfd cvol payloads are disabled')
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _release_memfd_owner_key(str(path.absolute()))
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    flags = int(getattr(os, 'MFD_CLOEXEC', 0)) | int(getattr(os, 'MFD_ALLOW_SEALING', 0))
+    owner_fd = os.memfd_create(_memfd_label(desc), flags=flags)
+    writer_fd: Optional[int] = None
+    target = _memfd_proc_path(int(owner_fd))
+    try:
+        writer_fd = int(os.dup(int(owner_fd)))
+        os.symlink(str(target), str(path))
+        _register_memfd_owner(str(path.absolute()), int(owner_fd), str(desc))
+        owner_fd = -1  # registry owns it now
+        return int(writer_fd)
+    except BaseException:
+        if writer_fd is not None:
+            try:
+                os.close(int(writer_fd))
+            except OSError:
+                pass
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if int(owner_fd) >= 0:
+            try:
+                os.close(int(owner_fd))
+            except OSError:
+                pass
+        raise
+
+
+@contextlib.contextmanager
+def open_raw_store_payload_writer(path: Path, desc: str) -> Iterator[object]:
+    """Open a cvol payload for writing, preferring a path-compatible memfd."""
+    writer_fd: Optional[int] = None
+    if raw_store_memfd_enabled():
+        try:
+            writer_fd = _create_memfd_backed_payload_path(Path(path), str(desc))
+        except Exception as exc:
+            runtime_telemetry().fallback('cvol.memfd', exc)
+            writer_fd = None
+    if writer_fd is not None:
+        try:
+            with os.fdopen(int(writer_fd), 'wb', buffering=0) as handle:
+                yield handle
+        finally:
+            # fdopen owns writer_fd.  The separately registered owner fd remains live.
+            pass
+        return
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with Path(path).open('wb') as handle:
+        yield handle
+
+
 def memmap_msync_enabled() -> bool:
     """Return whether scratch memmaps should force synchronous ``msync``."""
     return _env_flag('YOLO_TTA_MSYNC', False)
@@ -1860,6 +2249,7 @@ def allocate_workspace_array(
     desc: str,
     *,
     prefer_memory: bool = True,
+    prefer_memfd: bool = False,
     reserve_bytes: int = 16 * GIB,
     reuse_existing: bool = False,
     initialize_zero: bool = True,
@@ -1886,8 +2276,23 @@ def allocate_workspace_array(
         except MemoryError:
             print(f"{desc}: in-memory allocation failed, falling back to disk ({budget})")
 
+    if bool(prefer_memfd) and should_use_in_memory_workspace(need_bytes, reserve_bytes=reserve_bytes):
+        try:
+            mm = _allocate_memfd_workspace_array(
+                shape=shape,
+                dtype=dtype_obj,
+                desc=desc,
+                initialize_zero=bool(initialize_zero),
+            )
+            print(f"{desc}: memfd-backed shared RAM ({budget}) -> {_memfd_backing_path_from_array(mm)}")
+            runtime_telemetry().add('workspace.memfd_bytes', int(need_bytes))
+            return mm
+        except (MemoryError, OSError, RuntimeError) as exc:
+            runtime_telemetry().fallback('workspace.memfd', exc)
+            print(f"{desc}: memfd allocation unavailable ({exc}); falling back to pathname storage ({budget})")
+
     if path is None:
-        raise ValueError(f"{desc}: disk fallback requires a filesystem path")
+        raise ValueError(f"{desc}: pathname fallback requires a filesystem path")
 
     path.parent.mkdir(parents=True, exist_ok=True)
     if reuse_existing and path.exists():
@@ -1910,6 +2315,7 @@ def copy_workspace_array(
     desc: str,
     *,
     prefer_memory: bool = True,
+    prefer_memfd: bool = False,
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
 ) -> np.ndarray:
@@ -1920,6 +2326,7 @@ def copy_workspace_array(
         path=path,
         desc=desc,
         prefer_memory=bool(prefer_memory),
+        prefer_memfd=bool(prefer_memfd),
         reserve_bytes=int(reserve_bytes),
         initialize_zero=False,
     )
@@ -2421,56 +2828,65 @@ def expose_scratch_in_output(out_dir: Path, scratch_dir: Path) -> Path:
         return temp_entry
 
 
+def _root_memmap_for_array(arr: object) -> Optional[np.memmap]:
+    """Return the root memmap backing ``arr`` without materializing a copy."""
+    current = arr
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, np.memmap):
+            return current
+        current = getattr(current, 'base', None)
+    return None
+
+
 def close_memmap_array(arr: object) -> None:
     if arr is None:
         return
-    lazy_close = getattr(arr, 'close', None)
-    if bool(getattr(arr, '_is_lazy_processing_cube', False)) and callable(lazy_close):
-        try:
-            lazy_close()
-            return
-        except Exception:
-            pass
-    flush_array(arr)
+    owner_key = _memfd_owner_key_from_array(arr)
     try:
-        if isinstance(arr, np.memmap):
-            mmap_obj = getattr(arr, '_mmap', None)
-            if mmap_obj is not None:
-                mmap_obj.close()
+        lazy_close = getattr(arr, 'close', None)
+        if bool(getattr(arr, '_is_lazy_processing_cube', False)) and callable(lazy_close):
+            try:
+                lazy_close()
+            except Exception:
+                pass
             return
-    except Exception:
-        pass
-    try:
-        base = getattr(arr, 'base', None)
-        if isinstance(base, np.memmap):
-            mmap_obj = getattr(base, '_mmap', None)
+        flush_array(arr)
+        if owner_key is not None:
+            _madvise_dontneed_array(arr)
+        root = _root_memmap_for_array(arr)
+        if root is not None:
+            mmap_obj = getattr(root, '_mmap', None)
             if mmap_obj is not None:
-                mmap_obj.close()
-    except Exception:
-        pass
+                try:
+                    mmap_obj.close()
+                except (BufferError, OSError, ValueError):
+                    pass
+    finally:
+        if owner_key is not None:
+            _release_memfd_owner_key(owner_key)
 
 
 def close_memmap_array_without_flush(arr: object) -> None:
-    """Close a scratch memmap mapping without forcing dirty pages to storage."""
+    """Close a scratch mapping without forcing dirty pages to storage."""
     if arr is None:
         return
+    owner_key = _memfd_owner_key_from_array(arr)
     try:
-        if isinstance(arr, np.memmap):
-            mmap_obj = getattr(arr, '_mmap', None)
+        if owner_key is not None:
+            _madvise_dontneed_array(arr)
+        root = _root_memmap_for_array(arr)
+        if root is not None:
+            mmap_obj = getattr(root, '_mmap', None)
             if mmap_obj is not None:
-                mmap_obj.close()
-            return
-    except Exception:
-        pass
-    try:
-        base = getattr(arr, 'base', None)
-        if isinstance(base, np.memmap):
-            mmap_obj = getattr(base, '_mmap', None)
-            if mmap_obj is not None:
-                mmap_obj.close()
-    except Exception:
-        pass
-
+                try:
+                    mmap_obj.close()
+                except (BufferError, OSError, ValueError):
+                    pass
+    finally:
+        if owner_key is not None:
+            _release_memfd_owner_key(owner_key)
 
 def prediction_volume_build_flush_enabled() -> bool:
     """Return True to force flushing YOLO input volumes before inference."""
@@ -2745,6 +3161,10 @@ def _interpolation_array_backing_path(arr: object) -> Optional[Path]:
         return None
     try:
         arr_np = np.asarray(arr)
+        memfd_path = _memfd_backing_path_from_array(arr)
+        if memfd_path is not None and bool(arr_np.flags['C_CONTIGUOUS']):
+            if memfd_path.stat().st_size >= int(arr_np.nbytes):
+                return memfd_path
         if (
             isinstance(arr, np.memmap)
             # A sliced np.memmap is still an np.memmap and inherits the parent's
@@ -3256,19 +3676,21 @@ def decode_video_to_memmap_gray8(
     overwrite: bool = False,
     *,
     prefer_memory: bool = True,
+    prefer_memfd: bool = False,
     reserve_bytes: int = 32 * GIB,
 ) -> np.ndarray:
     """Decode the input video to a contiguous ``(T, H, W)`` uint8 luma workspace."""
     _require_bin("ffmpeg")
 
     shape = (int(num_frames), int(height), int(width))
-    reuse_existing = bool(not overwrite and out_dat.exists() and not prefer_memory)
+    reuse_existing = bool(not overwrite and out_dat.exists() and not prefer_memory and not prefer_memfd)
     arr = allocate_workspace_array(
         shape=shape,
         dtype=np.uint8,
         path=out_dat,
         desc='Decoded gray8 input volume',
         prefer_memory=bool(prefer_memory),
+        prefer_memfd=bool(prefer_memfd),
         reserve_bytes=int(reserve_bytes),
         reuse_existing=bool(reuse_existing),
         initialize_zero=False,
@@ -3332,18 +3754,20 @@ def decode_video_to_memmap_gray8_streaming(
     overwrite: bool = False,
     *,
     prefer_memory: bool = True,
+    prefer_memfd: bool = False,
     reserve_bytes: int = 32 * GIB,
 ) -> np.ndarray:
     """Start ffmpeg gray8 decode in the background and return its destination array immediately."""
     _require_bin("ffmpeg")
     shape = (int(num_frames), int(height), int(width))
-    reuse_existing = bool(not overwrite and out_dat.exists() and not prefer_memory)
+    reuse_existing = bool(not overwrite and out_dat.exists() and not prefer_memory and not prefer_memfd)
     arr = allocate_workspace_array(
         shape=shape,
         dtype=np.uint8,
         path=out_dat,
         desc='Decoded gray8 input volume [streaming producer]',
         prefer_memory=bool(prefer_memory),
+        prefer_memfd=bool(prefer_memfd),
         reserve_bytes=int(reserve_bytes),
         reuse_existing=bool(reuse_existing),
         initialize_zero=False,
@@ -11911,11 +12335,29 @@ def _fill_holes_2d_opencv(mask_bool: np.ndarray) -> np.ndarray:
 
 
 def _fill_holes_2d_opencv_u8_inplace(arr_u8: np.ndarray) -> None:
-    """Fill 4-connected enclosed background directly in a contiguous uint8 slice."""
-    bg = arr_u8 == 0
-    if not bg.any():
+    """Fill enclosed 4-connected background inside the foreground bbox plus halo.
+
+    A one-pixel exterior background halo gives the cropped connected-component problem
+    exactly the same outside/background semantics as the full plane.  When foreground
+    touches a global image edge the crop also touches that edge, so boundary-connected
+    background remains outside.  Empty and full-foreground slices return without labels.
+    """
+    arr = np.asarray(arr_u8, dtype=np.uint8)
+    if arr.ndim != 2 or arr.size == 0:
         return
-    num_labels, labels2d = _cv2_connected_components(bg.view(np.uint8), connectivity=4)
+    x0, y0, width, height = (int(v) for v in cv2.boundingRect(arr))
+    if width <= 0 or height <= 0:
+        return
+    full_h, full_w = (int(arr.shape[0]), int(arr.shape[1]))
+    y0h = max(0, int(y0) - 1)
+    x0h = max(0, int(x0) - 1)
+    y1h = min(full_h, int(y0) + int(height) + 1)
+    x1h = min(full_w, int(x0) + int(width) + 1)
+    sub = arr[y0h:y1h, x0h:x1h]
+    bg = np.ascontiguousarray(sub == 0, dtype=np.uint8)
+    if not bool(np.any(bg)):
+        return
+    num_labels, labels2d = _cv2_connected_components(bg, connectivity=4)
     if int(num_labels) <= 1:
         return
     touches_boundary = np.zeros((int(num_labels),), dtype=bool)
@@ -11924,8 +12366,8 @@ def _fill_holes_2d_opencv_u8_inplace(arr_u8: np.ndarray) -> None:
     touches_boundary[np.unique(labels2d[:, 0])] = True
     touches_boundary[np.unique(labels2d[:, -1])] = True
     enclosed_bg = (labels2d > 0) & (~touches_boundary[labels2d])
-    if np.any(enclosed_bg):
-        arr_u8[enclosed_bg] = np.uint8(1)
+    if bool(np.any(enclosed_bg)):
+        sub[enclosed_bg] = np.uint8(1)
 
 
 def _filter_connected_components_by_min_radius_scipy(
@@ -15816,6 +16258,7 @@ def _gpu_inference_worker_main(
     publication_queue: 'queue.Queue[Optional[Tuple[int, _DeferredGpuWorkerTaskResult]]]' = queue.Queue(maxsize=1)
     retirement_gate = threading.Semaphore(1)
     overlap_announced = False
+    persistent_source_memfds: Dict[str, int] = {}
 
     def _publish_deferred(item: Tuple[int, _DeferredGpuWorkerTaskResult]) -> None:
         finished_task_id, deferred = item
@@ -15897,10 +16340,14 @@ def _gpu_inference_worker_main(
                 if numa_widened and _GPU_WORKER_NUMA_PIN is not None:
                     _sched_setaffinity_all_threads(sorted(_GPU_WORKER_NUMA_PIN))
             continue
+        transferred_task_fds: List[int] = []
         try:
             # The parent affinity plan can be uneven across NUMA nodes. Size this worker's
             # pools from its own whole-core allocation instead of a logical-CPU global average.
             task_local = dict(task)
+            transferred_task_fds = _materialize_worker_task_memfd_paths(
+                task_local, persistent_source_memfds,
+            )
             local_cpu_workers = max(1, int(init_dict.get('cpu_workers', task.get('postprocess_workers', 1))))
             task_local['render_workers'] = max(
                 1, min(local_cpu_workers, int(task.get('slice_count', 1))),
@@ -15942,12 +16389,16 @@ def _gpu_inference_worker_main(
                 'type': 'result', 'task_id': task_id, 'gpu_index': int(gpu_index), 'ok': False,
                 'error': repr(exc), 'traceback': traceback.format_exc(),
             })
+        finally:
+            _close_fd_list(transferred_task_fds)
     finally:
         publication_queue.join()
         publication_queue.put(None)
         publication_thread.join()
         _shutdown_resident_trt_pipeline_cache()
         _shutdown_gpu_union_flush_executor()
+        _close_fd_list(persistent_source_memfds.values())
+        persistent_source_memfds.clear()
 
 
 #
@@ -17524,7 +17975,7 @@ def label_foreground_volume_streaming(
         'YOLO_TTA_TOPOLOGY_UNION_BATCH_CODES', 1_048_576,
     ))
     print(
-        '3D topology local-union plan (v16.0.8): '
+        '3D topology local-union plan (v16.0.9): '
         f'{len(slab_ranges)} slab(s) x {int(topology_slab_slices())} slices, '
         f'{int(slab_worker_count)} concurrent worker(s), '
         f'compiled_nogil={bool(_numba_union_find_batch_kernel is not None and compiled_topology_kernels_enabled())}.'
@@ -19230,13 +19681,7 @@ class _ResidentTensorRTRingExecutor:
         slot.conf_proto = (
             torch.empty((ph, pw), dtype=torch.float32, device=device) if self.track_conf else None
         )
-        slot.native_union = torch.empty(
-            (self.native_h, self.native_w), dtype=torch.uint8, device=device,
-        )
-        slot.native_conf = (
-            torch.empty((self.native_h, self.native_w), dtype=torch.uint8, device=device)
-            if self.track_conf else None
-        )
+        self._allocate_native_output_buffers(slot)
         cp = self.kernels.cp
         refs = {
             'head': cp.asarray(head[0]),
@@ -19251,6 +19696,63 @@ class _ResidentTensorRTRingExecutor:
         if slot.native_conf is not None:
             refs['native_conf'] = cp.asarray(slot.native_conf)
         slot._cupy_refs = refs
+
+    def _allocate_native_output_buffers(self, slot: _ResidentGpuPipelineSlot) -> None:
+        torch = self.torch
+        device = slot.head.device
+        slot.native_union = torch.empty(
+            (int(self.native_h), int(self.native_w)), dtype=torch.uint8, device=device,
+        )
+        slot.native_conf = (
+            torch.empty((int(self.native_h), int(self.native_w)), dtype=torch.uint8, device=device)
+            if self.track_conf else None
+        )
+
+    def reconfigure_destination(
+        self,
+        *,
+        native_h: int,
+        native_w: int,
+        M_out_to_native: np.ndarray,
+        dynamic_unit_descriptors: bool,
+    ) -> None:
+        """Retarget postprocessing while retaining TensorRT contexts and bindings."""
+        new_h, new_w = int(native_h), int(native_w)
+        matrix = np.asarray(M_out_to_native, dtype=np.float32).reshape(2, 3)
+        same_geometry = bool(new_h == int(self.native_h) and new_w == int(self.native_w))
+        same_matrix = bool(np.array_equal(matrix, self.default_descriptor.M_out_to_native))
+        effective_dynamic = True  # post scalar arguments must remain task-dynamic.
+        if same_geometry and same_matrix and bool(self.dynamic_unit_descriptors) == effective_dynamic:
+            return
+        self.synchronize()
+        self.native_h = int(new_h)
+        self.native_w = int(new_w)
+        self.dynamic_unit_descriptors = bool(effective_dynamic)
+        self.default_descriptor = ResidentRingUnitDescriptor(
+            unit_index=0,
+            destination_index=0,
+            native_h=int(new_h),
+            native_w=int(new_w),
+            M_out_to_native=matrix,
+        )
+        self.identity_native_warp, self.native_to_out = self._descriptor_warp(self.default_descriptor)
+        for slot in self.slots:
+            # Infer graphs and TRT output bindings are geometry-independent.  Only the
+            # post destination tensors/CuPy views and captured post graph are replaced.
+            slot.post_graph = None
+            slot._cupy_refs.pop('native_union', None)
+            slot._cupy_refs.pop('native_conf', None)
+            slot.native_union = None
+            slot.native_conf = None
+            self._allocate_native_output_buffers(slot)
+            cp = self.kernels.cp
+            slot._cupy_refs['native_union'] = cp.asarray(slot.native_union)
+            if slot.native_conf is not None:
+                slot._cupy_refs['native_conf'] = cp.asarray(slot.native_conf)
+            self._set_slot_unit_descriptor(slot, self.default_descriptor)
+            slot.infer_valid = False
+            slot.post_valid = False
+        runtime_telemetry().add('trt_ring.destination_reconfigurations', 1)
 
     def _execute_context(self, slot: _ResidentGpuPipelineSlot) -> None:
         context = slot.context
@@ -19587,15 +20089,14 @@ def _resident_trt_pipeline_signature(
     dynamic_unit_descriptors: bool,
 ) -> Tuple[object, ...]:
     engine = _trt_engine_from_autobackend(backend)
-    matrix: Tuple[object, ...] = (
-        ('dynamic-unit-affine',)
-        if bool(dynamic_unit_descriptors)
-        else tuple(float(x) for x in np.asarray(M_out_to_native, dtype=np.float32).reshape(-1))
-    )
+    # TensorRT bindings depend on engine/profile/input shape, not on the destination
+    # mask raster.  Native geometry and affine are handled by the post kernel and are
+    # reconfigured in place on cache hits.  Keeping them in this key made every view/
+    # orientation transition destroy and recreate a 668 MiB execution context.
+    _ = (native_h, native_w, M_out_to_native, dynamic_unit_descriptors)
     return (
         id(engine), str(input_dtype), int(input_channels), int(out_size),
-        int(native_h), int(native_w),
-        matrix, bool(track_conf), float(confidence_threshold), bool(dynamic_unit_descriptors),
+        bool(track_conf), float(confidence_threshold),
     )
 
 
@@ -19670,6 +20171,12 @@ def _resident_trt_pipeline_acquire(
     if executor is not None:
         try:
             executor.reset_for_task()
+            executor.reconfigure_destination(
+                native_h=int(native_h),
+                native_w=int(native_w),
+                M_out_to_native=np.asarray(M_out_to_native, dtype=np.float32),
+                dynamic_unit_descriptors=True,
+            )
             source._direct_ring = executor.slots
             slots = source.prepare_direct_ring(input_dtype=input_dtype)
             if len(slots) != 2 or any(a is not b for a, b in zip(slots, executor.slots)):
@@ -19688,7 +20195,9 @@ def _resident_trt_pipeline_acquire(
         native_h=int(native_h), native_w=int(native_w),
         M_out_to_native=np.asarray(M_out_to_native, dtype=np.float32),
         track_conf=bool(track_conf), confidence_threshold=float(confidence_threshold),
-        dynamic_unit_descriptors=bool(dynamic_unit_descriptors),
+        # Persistent executors use runtime post descriptors so destination geometry
+        # can change without invalidating TensorRT execution contexts.
+        dynamic_unit_descriptors=True,
     )
     if persist:
         with _RESIDENT_TRT_PIPELINE_CACHE_LOCK:
@@ -22954,7 +23463,7 @@ def assemble_current_view_union_volume(
     
     Multiple model entries are rejected; the destination uses source geometry when requested."""
     if len(view_volumes_by_model) != 1:
-        raise ValueError('GPT-5.6-Sol-Pro v16.0.8 supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.0.9 supports exactly one --model; multiple-model inference has been removed')
 
     union_shape = (int(T), int(H), int(W)) if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
     model_name = next(iter(view_volumes_by_model.keys()))
@@ -27941,11 +28450,44 @@ def interpolate_view_volume_pass_inplace(
     return result_stats
 
 
+class _ByteAdmissionPool:
+    """Weighted transient-memory admission with one emergency oversize lane."""
+
+    def __init__(self, capacity_bytes: int, name: str) -> None:
+        self.capacity = max(1, int(capacity_bytes))
+        self.name = str(name)
+        self.in_use = 0
+        self.condition = threading.Condition()
+
+    @contextlib.contextmanager
+    def reserve(self, requested_bytes: int, desc: str) -> Iterator[None]:
+        requested = max(1, int(requested_bytes))
+        charged = min(int(requested), int(self.capacity))
+        waited = False
+        with self.condition:
+            while int(self.in_use) > 0 and int(self.in_use) + int(charged) > int(self.capacity):
+                if not waited:
+                    print(
+                        f'{self.name}: waiting to admit {desc} '
+                        f'({requested / GIB:.1f} GiB requested; '
+                        f'{self.in_use / GIB:.1f}/{self.capacity / GIB:.1f} GiB active).'
+                    )
+                    waited = True
+                self.condition.wait()
+            self.in_use += int(charged)
+        try:
+            yield
+        finally:
+            with self.condition:
+                self.in_use = max(0, int(self.in_use) - int(charged))
+                self.condition.notify_all()
+
+
 @dataclass
 class PreparedViewResult:
     model_name: str
     view_name: str
-    native_support_mm: np.ndarray
+    native_support_mm: Optional[np.ndarray]
     final_view_volume_mm: Optional[np.ndarray]
     interpolation_stats: List[Dict[str, object]]
     nrrd_layers: List[NrrdLayerRef] = field(default_factory=list)
@@ -28280,14 +28822,30 @@ class IncrementalRawBBoxMaskStoreWriter:
         self._finalized = False
 
         _invalidate_raw_store_chunks_ram_cache(self.chunks_path)
+        release_memfd_owners_under(self.store_dir)
         if self.store_dir.exists():
             shutil.rmtree(self.store_dir, ignore_errors=True)
         self.store_dir.mkdir(parents=True, exist_ok=True)
-        self._fd: Optional[int] = os.open(
-            self.chunks_path,
-            os.O_CREAT | os.O_TRUNC | os.O_RDWR,
-            0o666,
-        )
+        self._fd: Optional[int]
+        if raw_store_memfd_enabled():
+            try:
+                self._fd = _create_memfd_backed_payload_path(
+                    self.chunks_path, f'{self.desc} chunks',
+                )
+                runtime_telemetry().add('cvol.memfd_stores', 1)
+            except Exception as exc:
+                runtime_telemetry().fallback('cvol.memfd.incremental', exc)
+                self._fd = os.open(
+                    self.chunks_path,
+                    os.O_CREAT | os.O_TRUNC | os.O_RDWR,
+                    0o666,
+                )
+        else:
+            self._fd = os.open(
+                self.chunks_path,
+                os.O_CREAT | os.O_TRUNC | os.O_RDWR,
+                0o666,
+            )
 
     @property
     def failed(self) -> bool:
@@ -28536,6 +29094,7 @@ class IncrementalRawBBoxMaskStoreWriter:
             except OSError:
                 pass
         _invalidate_raw_store_chunks_ram_cache(self.chunks_path)
+        release_memfd_owners_under(self.store_dir)
         shutil.rmtree(self.store_dir, ignore_errors=True)
 
 
@@ -28632,6 +29191,13 @@ class RawBBoxMaskStore:
     def close(self) -> None:
         self._chunks_bytes = None
         chunks_mmap = self._chunks_mmap
+        if chunks_mmap is not None:
+            try:
+                advice = getattr(mmap, 'MADV_DONTNEED', None)
+                if advice is not None:
+                    chunks_mmap.madvise(advice)
+            except (AttributeError, OSError, ValueError, BufferError):
+                pass
         self._chunks_mmap = None
         if chunks_mmap is not None:
             try:
@@ -28876,6 +29442,12 @@ class RawBBoxMaskStore:
 
 
     def unlink(self) -> None:
+        self.close()
+        if bool(getattr(self, '_ram_cache_ref_held', False)):
+            self._ram_cache_ref_held = False
+            _release_raw_store_chunks_ram_cache(self.chunks_path)
+        _invalidate_raw_store_chunks_ram_cache(self.chunks_path)
+        release_memfd_owners_under(self.root)
         shutil.rmtree(self.root, ignore_errors=True)
 
 
@@ -28941,6 +29513,7 @@ def _write_raw_bbox_payload_store(
     store_dir = Path(store_dir)
     chunks_path_prewrite = store_dir / 'chunks.bin'
     _invalidate_raw_store_chunks_ram_cache(chunks_path_prewrite)
+    release_memfd_owners_under(store_dir)
     if store_dir.exists():
         shutil.rmtree(store_dir, ignore_errors=True)
     store_dir.mkdir(parents=True, exist_ok=True)
@@ -28968,7 +29541,7 @@ def _write_raw_bbox_payload_store(
         )
 
     offset = 0
-    with chunks_path.open('wb') as chunks_fh:
+    with open_raw_store_payload_writer(chunks_path, f'{desc} chunks') as chunks_fh:
         for item in iterable:
             idx = int(item.idx)
             if idx < 0 or idx >= int(shape_i[0]):
@@ -29125,6 +29698,9 @@ def subtract_volume_to_raw_bbox_store(
 def _memmap_backing_path(arr: object) -> Optional[Path]:
     if arr is None:
         return None
+    memfd_path = _memfd_backing_path_from_array(arr)
+    if memfd_path is not None:
+        return memfd_path
     lazy_path = (
         getattr(arr, 'backing_path', None)
         if bool(getattr(arr, '_is_lazy_processing_cube', False))
@@ -29959,6 +30535,7 @@ def prepare_view_volume_after_fullframe(
     slice_workers: int,
     interpolation_task_workers: int,
     nrrd_layers_enabled: bool = False,
+    retain_native_support: bool = False,
     precleaned_slice_cleanup: bool = False,
     hole_fill_done_on_device: bool = False,
     slice_meta: Optional[Dict[str, object]] = None,
@@ -30174,7 +30751,7 @@ def prepare_view_volume_after_fullframe(
         existing_backing = _interpolation_array_backing_path(old_volume)
         if existing_backing is not None:
             print(
-                f'{model_name}/{view.name} non-interpolated native retention (v16.0.8): '
+                f'{model_name}/{view.name} non-interpolated native retention (v16.0.9): '
                 f'reusing {existing_backing}; no full-volume drain copy.'
             )
         else:
@@ -30261,8 +30838,32 @@ def prepare_view_volume_after_fullframe(
         else:
             parent_bridge_support_mm = RawBBoxMaskStore.open(parent_bridge_support_path)
 
+    sparse_retire_dense = bool(
+        nrrd_layers_enabled
+        and not dense_tiling_active
+        and not bool(keep_temp)
+        and not bool(retain_native_support)
+        and not _view_uses_interpolation(view, int(interpolate))
+        and _env_flag('YOLO_TTA_SPARSE_VIEW_RETIREMENT', True)
+    )
+    if sparse_retire_dense:
+        retired_bytes = int(np.asarray(baseline_native_volume).nbytes)
+        close_memmap_array_without_flush(baseline_native_volume)
+        baseline_native_volume = None  # type: ignore[assignment]
+        try:
+            if not bool(keep_temp) and union_path is not None and not str(union_path).startswith('/proc/'):
+                Path(union_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        print(
+            f'v16.0.9 sparse retirement: {model_name}/{view.name} released '
+            f'{retired_bytes / GIB:.2f} GiB dense union after cvol materialization.'
+        )
+
     final_view_volume: Optional[np.ndarray] = None
-    if bool(dense_tiling_active):
+    if sparse_retire_dense:
+        final_view_volume = None
+    elif bool(dense_tiling_active):
         if _view_uses_interpolation(view, int(interpolate)):
             final_copy_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.final_fullframe.u8.dat'
             final_view_volume = copy_workspace_array(
@@ -33030,7 +33631,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.6-Sol-Pro_v16.0.8_SLURM.py',
+        '# Complete NRRD file generated by GPT-5.6-Sol-Pro_v16.0.9_SLURM.py',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -36188,6 +36789,10 @@ def main() -> None:
     args = build_argparser().parse_args()
     channel_format = resolve_channel_format(args.channel_format)
     print(
+        '[v16.0.9] integrated fixes active: bounded memfd direct-union window, '
+        'sparse cvol retirement, persistent TensorRT contexts, and parallel atomic outputs.'
+    )
+    print(
         f'Model input channel format: {channel_format.token} '
         f'(kind={channel_format.kind}, channels={int(channel_format.channel_count)}, '
         f'stride={int(channel_format.stride)}, offsets={list(channel_format.offsets)}; '
@@ -36202,7 +36807,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('GPT-5.6-Sol-Pro v16.0.8 accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.0.9 accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -36377,17 +36982,17 @@ def main() -> None:
             'max-confidence planes and warped to view-native space on the GPU before the PCIe copy.'
         )
     # Each CUDA inference worker is pinned through CUDA_VISIBLE_DEVICES and sees its assigned
-    # device as cuda:0. With exactly one --angle, worker slice windows are disjoint per view, so
-    # workers write results straight into the shared per-view union memmap (pre-created disk-
-    # backed at task-build time) instead of per-task result files that the scheduler re-reads.
+    # device as cuda:0. With exactly one --angle, worker slice windows are disjoint per view.
+    # Workers write those slices into one scheduler-owned mapping: memfd plus descriptor
+    # transfer when available, and a real pathname only as fallback.
     gpu_worker_direct_union_active = bool(
         gpu_worker_process_active and len(angles) == 1 and gpu_worker_direct_union_enabled()
     )
     if gpu_worker_direct_union_active:
         print(
             'GPU-worker direct union writes active: single-angle worker tasks write '
-            'their disjoint slice windows straight into the disk-backed per-view union '
-            '(no per-task result files, no scheduler-side OR pass). '
+            'their disjoint slice windows straight into a bounded shared per-view union '
+            '(memfd preferred; no per-task result files or scheduler-side OR pass). '
             'Set YOLO_TTA_GPU_WORKER_DIRECT_UNION=0 to restore the result-file path '
             '(YOLO_TTA_MGPU_DIRECT_UNION remains a compatibility alias).'
         )
@@ -36510,11 +37115,9 @@ def main() -> None:
 
     preprocess_streaming_active = bool(streaming_preprocess_enabled())
     vol_path = temp_dir / 'input_volume.gray8.dat'
-    # Resolve cube geometry before decode. CUDA worker processes read the processing volume from a
-    # file, so whichever array becomes the processing volume (the cube-resize output, or the
-    # decode output when no resize applies) is allocated DISK-BACKED from the start — the page
-    # cache keeps it RAM-speed and _ensure_source_volume_file_backed reuses it directly instead
-    # of copying the whole volume to scratch between decode completion and the first GPU task.
+    # Resolve cube geometry before decode. CUDA workers need a reopenable source, so the
+    # decoded native volume uses a transferred memfd whenever it is their source. A real
+    # pathname is retained only as the fallback when memfd is unavailable.
     input_processing_shape = (int(input_T), int(input_H), int(input_W))
     legacy_cube_shape = compute_cube_resize_shape(input_T, input_H, input_W, tolerance=0.05)
     processing_mode = processing_volume_mode()
@@ -36539,6 +37142,7 @@ def main() -> None:
             height=input_H,
             overwrite=False,
             prefer_memory=decode_prefer_memory,
+            prefer_memfd=bool(gpu_worker_process_active and not decode_prefer_memory),
         )
     else:
         input_volume_rgb = decode_video_to_memmap_gray8(
@@ -36549,6 +37153,7 @@ def main() -> None:
             height=input_H,
             overwrite=False,
             prefer_memory=decode_prefer_memory,
+            prefer_memfd=bool(gpu_worker_process_active and not decode_prefer_memory),
         )
     (temp_dir / 'input_volume.meta.json').write_text(
         json.dumps({
@@ -36784,10 +37389,10 @@ def main() -> None:
     spec_notes.append(
         'v13.3.1 (R3/R4/R7b/R12/R16/R19/R24/R25): scratch memmap msync is opt-in (YOLO_TTA_MSYNC, '
         'default off — same-host page-cache coherence needs no synchronous flushes); single-angle '
-        'CUDA workers write disjoint single-angle result windows directly into the disk-backed per-view union '
+        'CUDA workers write disjoint single-angle result windows directly into bounded memfd-backed per-view unions '
         '(YOLO_TTA_GPU_WORKER_DIRECT_UNION; YOLO_TTA_MGPU_DIRECT_UNION is an alias); NRRD payload writes stream bounded double-buffered blocks '
         '(YOLO_TTA_NRRD_Z_CHUNK_SLICES) filled by a GIL-releasing pool (YOLO_TTA_NRRD_FILL_WORKERS) '
-        'that overlaps the selected gzip backend; CUDA runs allocate the processing volume disk-backed from the start '
+        'that overlaps the selected gzip backend; CUDA workers receive the native source through descriptor-transferred memfd storage '
         '(no post-decode copy to scratch); foreground scans and the raw-bbox encoder no longer make '
         'full-slice cast copies, and interpolation bridge-delta layers reuse the pass added_voxels '
         'stat instead of rescanning; the interpolation merge visits only schedule-touched slices; '
@@ -37437,6 +38042,41 @@ def main() -> None:
     baseline_union_paths: Dict[Tuple[str, str], Path] = {}
     baseline_confmap_paths: Dict[Tuple[str, str], Optional[Path]] = {}
     baseline_slice_locks_by_model_view: Dict[Tuple[str, str], List[threading.Lock]] = {}
+    direct_union_live_views: set[Tuple[str, str]] = set()
+    direct_union_live_bytes: Dict[Tuple[str, str], int] = {}
+    direct_union_sparse_retirement_active = bool(
+        gpu_worker_direct_union_active
+        and nrrd_layers_needed
+        and not dense_tiling_active
+        and not bool(keep_temp_artifacts)
+        and not bool(troubleshooting_outputs_enabled)
+        and int(args.interpolate) <= 0
+        and _env_flag('YOLO_TTA_SPARSE_VIEW_RETIREMENT', True)
+    )
+    direct_union_active_view_limit = max(
+        1,
+        _env_int('YOLO_TTA_DIRECT_UNION_ACTIVE_VIEWS', max(1, min(4, int(gpu_device_count)))),
+    )
+    _direct_headroom = max(0, int(available_anon_work_bytes()) - 64 * GIB)
+    _default_direct_bytes = max(64 * GIB, min(256 * GIB, int(_direct_headroom * 0.30)))
+    direct_union_active_byte_limit = int(
+        max(1.0, _env_float('YOLO_TTA_DIRECT_UNION_ACTIVE_GIB', _default_direct_bytes / GIB)) * GIB
+    )
+    _parent_transient_default = max(
+        64 * GIB,
+        min(192 * GIB, int(max(1, available_anon_work_bytes() - 64 * GIB) * 0.25)),
+    )
+    parent_transient_admission = _ByteAdmissionPool(
+        int(max(1.0, _env_float('YOLO_TTA_PARENT_TRANSIENT_GIB', _parent_transient_default / GIB)) * GIB),
+        'Parent view postprocess admission',
+    )
+    if direct_union_sparse_retirement_active:
+        print(
+            'v16.0.9 bounded sparse view retirement active: '
+            f'max_live_views={int(direct_union_active_view_limit)}, '
+            f'max_live_dense={direct_union_active_byte_limit / GIB:.1f} GiB; '
+            'completed dense memfd unions are converted to cvol and released immediately.'
+        )
     fullframe_remaining: Dict[Tuple[str, str], int] = {}
     # slices per (model, view) hole-filled on device by the GPU workers; when the
     # sum reaches the view's slice count, the CPU per-view "2D hole fill" pass is skipped.
@@ -37865,13 +38505,9 @@ def main() -> None:
         confmap_path = temp_dir / 'union' / str(model_name) / f'{view.name}.confmap.u8.dat'
         union_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # views that will be interpolated allocate their baseline union
-        # DIRECTLY as a disk memmap at union_path. The interpolation process backend can then
-        # reopen the volume by path with ZERO copy (_ensure_process_backed_interpolation_volume
-        # detects the backing file), eliminating the old full-volume RAM->disk handoff copy per
-        # view per pass; page cache keeps reads/writes at RAM speed. Non-interpolating views
-        # keep the anonymous-RAM preference.
-        # direct union writes require file-backed workspaces the workers can open.
+        # Interpolated views retain a real pathname because the isolated interpolation
+        # backend reopens them by path. Single-angle direct-union views instead use memfd
+        # descriptors transferred to CUDA workers; ordinary in-process views prefer anonymous RAM.
         union_prefer_memory = not (
             (
                 interpolation_process_backend_enabled()
@@ -37880,27 +38516,49 @@ def main() -> None:
             or gpu_worker_direct_union_active
         )
         processing_shape = view_processing_volume_shape(view, int(args.imgsz))
-        baseline_union_by_model_view[key] = allocate_workspace_array(
-            shape=processing_shape,
-            dtype=np.uint8,
-            path=union_path,
-            desc=f'{model_name}/{view.name} baseline union workspace',
-            prefer_memory=bool(union_prefer_memory),
-        )
-        baseline_union_paths[key] = union_path
-        baseline_slice_locks_by_model_view[key] = [threading.Lock() for _ in range(int(view.num_slices))]
-        if float(args.min_conf) > 0.0:
-            baseline_confmap_by_model_view[key] = allocate_workspace_array(
+        union_mm: Optional[np.ndarray] = None
+        conf_mm: Optional[np.ndarray] = None
+        try:
+            union_mm = allocate_workspace_array(
                 shape=processing_shape,
                 dtype=np.uint8,
-                path=confmap_path,
-                desc=f'{model_name}/{view.name} baseline confidence workspace',
-                prefer_memory=not gpu_worker_direct_union_active,
+                path=union_path,
+                desc=f'{model_name}/{view.name} baseline union workspace',
+                prefer_memory=bool(union_prefer_memory),
+                prefer_memfd=bool(gpu_worker_direct_union_active),
             )
-            baseline_confmap_paths[key] = confmap_path
-        else:
-            baseline_confmap_by_model_view[key] = None
-            baseline_confmap_paths[key] = None
+            if float(args.min_conf) > 0.0:
+                conf_mm = allocate_workspace_array(
+                    shape=processing_shape,
+                    dtype=np.uint8,
+                    path=confmap_path,
+                    desc=f'{model_name}/{view.name} baseline confidence workspace',
+                    prefer_memory=not gpu_worker_direct_union_active,
+                    prefer_memfd=bool(gpu_worker_direct_union_active),
+                )
+        except BaseException:
+            close_memmap_array_without_flush(conf_mm)
+            close_memmap_array_without_flush(union_mm)
+            for failed_path in (union_path, confmap_path):
+                try:
+                    failed_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            raise
+
+        assert union_mm is not None
+        baseline_union_by_model_view[key] = union_mm
+        baseline_union_paths[key] = _memmap_backing_path(union_mm) or union_path
+        baseline_confmap_by_model_view[key] = conf_mm
+        baseline_confmap_paths[key] = (
+            (_memmap_backing_path(conf_mm) or confmap_path) if conf_mm is not None else None
+        )
+        baseline_slice_locks_by_model_view[key] = [threading.Lock() for _ in range(int(view.num_slices))]
+        if gpu_worker_direct_union_active:
+            direct_union_live_views.add(key)
+            direct_union_live_bytes[key] = int(array_nbytes(processing_shape, np.uint8)) * (
+                2 if conf_mm is not None else 1
+            )
 
     def _submit_view_prepare(model_name: str, view: ViewInfo) -> None:
         key = (str(model_name), str(view.name))
@@ -37922,36 +38580,53 @@ def main() -> None:
         slice_meta_holder = view_slice_meta.pop(key, None)
         if slice_meta_holder is not None and not bool(slice_meta_holder.get('valid', False)):
             slice_meta_holder = None
-        fut = parent_postprocess_executor.submit(
-            prepare_view_volume_after_fullframe,
-            model_name=str(model_name),
-            view=view,
-            union_mm=union_mm,
-            confmap_mm=confmap_mm,
-            union_path=union_path,
-            confmap_path=confmap_path,
-            temp_dir=temp_dir,
-            dense_tiling_active=bool(dense_tiling_active),
-            min_conf=float(args.min_conf),
-            min_radius=float(args.min_radius),
-            interpolate=int(args.interpolate),
-            interpolation_walk_back=int(args.interpolation_walk_back),
-            interpolation_candidates=int(args.interpolation_candidates),
-            interpolate_passes=int(args.interpolate_passes),
-            interpolate_min_radius=float(args.interpolate_min_radius),
-            interpolation_search_angle=float(args.interpolation_search_angle),
-            keep_temp=bool(keep_temp_artifacts),
-            slice_workers=int(parent_slice_postprocess_workers),
-            interpolation_task_workers=int(parent_interpolation_task_workers),
-            nrrd_layers_enabled=bool(nrrd_layers_needed),
-            precleaned_slice_cleanup=bool(single_angle_streaming_cleanup_active),
-            hole_fill_done_on_device=bool(hole_fill_done_on_device),
-            slice_meta=slice_meta_holder,
-            fuse_radial_component_layers=bool(
-                single_angle_gpu_fastpath_active
-                and fused_single_angle_radial_component_layer_enabled()
-            ),
-        )
+        processing_bytes = int(array_nbytes(view_processing_volume_shape(view, int(args.imgsz)), np.uint8))
+        source_bytes = int(array_nbytes((int(input_T), int(input_H), int(input_W)), np.uint8))
+        view_name_lower = str(view.name).lower()
+        transient_bytes = 2 * GIB
+        if 'radial_tilted' in view_name_lower or ('tilted' in view_name_lower and str(view.family) == 'radial'):
+            transient_bytes = int(processing_bytes) + int(source_bytes) + 4 * GIB
+        elif 'tilted' in view_name_lower:
+            transient_bytes = int(source_bytes) + 4 * GIB
+        elif _view_uses_interpolation(view, int(args.interpolate)):
+            transient_bytes = int(processing_bytes) * 2 + 4 * GIB
+
+        def _run_admitted_view_prepare() -> PreparedViewResult:
+            with parent_transient_admission.reserve(
+                int(transient_bytes), f'{model_name}/{view.name}',
+            ):
+                return prepare_view_volume_after_fullframe(
+                    model_name=str(model_name),
+                    view=view,
+                    union_mm=union_mm,
+                    confmap_mm=confmap_mm,
+                    union_path=union_path,
+                    confmap_path=confmap_path,
+                    temp_dir=temp_dir,
+                    dense_tiling_active=bool(dense_tiling_active),
+                    min_conf=float(args.min_conf),
+                    min_radius=float(args.min_radius),
+                    interpolate=int(args.interpolate),
+                    interpolation_walk_back=int(args.interpolation_walk_back),
+                    interpolation_candidates=int(args.interpolation_candidates),
+                    interpolate_passes=int(args.interpolate_passes),
+                    interpolate_min_radius=float(args.interpolate_min_radius),
+                    interpolation_search_angle=float(args.interpolation_search_angle),
+                    keep_temp=bool(keep_temp_artifacts),
+                    slice_workers=int(parent_slice_postprocess_workers),
+                    interpolation_task_workers=int(parent_interpolation_task_workers),
+                    nrrd_layers_enabled=bool(nrrd_layers_needed),
+                    retain_native_support=bool(troubleshooting_outputs_enabled),
+                    precleaned_slice_cleanup=bool(single_angle_streaming_cleanup_active),
+                    hole_fill_done_on_device=bool(hole_fill_done_on_device),
+                    slice_meta=slice_meta_holder,
+                    fuse_radial_component_layers=bool(
+                        single_angle_gpu_fastpath_active
+                        and fused_single_angle_radial_component_layer_enabled()
+                    ),
+                )
+
+        fut = parent_postprocess_executor.submit(_run_admitted_view_prepare)
         view_processing_futures[fut] = key
 
     def _get_tile_accumulator(model_name: str, view_name: str) -> np.ndarray:
@@ -38309,18 +38984,25 @@ def main() -> None:
             raise RuntimeError(f'Unknown prediction accumulation kind: {kind!r}')
 
     def _drain_completed_background_futures() -> None:
+        direct_union_slot_released = False
         for fut in list(view_processing_futures.keys()):
             if not fut.done():
                 continue
             result = fut.result()
             del view_processing_futures[fut]
-            native_view_support_by_model[result.model_name][result.view_name] = result.native_support_mm
+            if result.native_support_mm is not None:
+                native_view_support_by_model[result.model_name][result.view_name] = result.native_support_mm
             if result.parent_mask_support_mm is not None:
                 parent_mask_support_by_model[result.model_name][result.view_name] = result.parent_mask_support_mm
             if result.parent_bridge_support_mm is not None:
                 parent_bridge_support_by_model[result.model_name][result.view_name] = result.parent_bridge_support_mm
             interpolation_stats.extend(result.interpolation_stats)
             nrrd_layer_refs.extend(result.nrrd_layers)
+            completed_view_key = (str(result.model_name), str(result.view_name))
+            if completed_view_key in direct_union_live_views:
+                direct_union_slot_released = True
+            direct_union_live_views.discard(completed_view_key)
+            direct_union_live_bytes.pop(completed_view_key, None)
 
             view_info = view_infos_by_name[result.view_name]
             if result.final_view_volume_mm is not None:
@@ -38423,6 +39105,11 @@ def main() -> None:
                         tile_accumulator_paths.pop(parent_key, None)
 
         output_manager.reap_completed()
+        # Allocation admission can block every otherwise-idle worker while the active
+        # view window is full. Completing cvol materialization releases that slot, so
+        # immediately refill the worker queues instead of waiting for an unrelated event.
+        if direct_union_slot_released and gpu_worker_pending_task_ids:
+            _dispatch_gpu_worker_inference_window()
 
     last_scheduler_wait_log = 0.0
 
@@ -38568,18 +39255,62 @@ def main() -> None:
         )
         return True
 
+    def _direct_union_task_key(task: Dict[str, object]) -> Optional[Tuple[str, str]]:
+        if str(task.get('kind', '')) != 'fullframe' or str(task.get('result_mode', 'file')) != 'direct_union':
+            return None
+        view_obj = task.get('view')
+        if view_obj is None:
+            return None
+        return (str(task.get('model_name', '')), str(getattr(view_obj, 'name', '')))
+
+    def _direct_union_task_bytes(task: Dict[str, object]) -> int:
+        shape = tuple(int(v) for v in task.get('processing_shape', ()))
+        if len(shape) != 3:
+            view_obj = task['view']
+            shape = view_processing_volume_shape(view_obj, int(task.get('out_size', args.imgsz)))
+        return int(array_nbytes(shape, np.uint8)) * (2 if float(args.min_conf) > 0.0 else 1)
+
+    def _direct_union_task_admissible(task: Dict[str, object]) -> bool:
+        key = _direct_union_task_key(task)
+        if key is None or not direct_union_sparse_retirement_active:
+            return True
+        if key in direct_union_live_views:
+            return True
+        if len(direct_union_live_views) >= int(direct_union_active_view_limit):
+            return False
+        need = int(_direct_union_task_bytes(task))
+        active = int(sum(direct_union_live_bytes.values()))
+        return bool(not direct_union_live_views or active + need <= int(direct_union_active_byte_limit))
+
+    def _activate_direct_union_task(task: Dict[str, object]) -> None:
+        key = _direct_union_task_key(task)
+        if key is None:
+            return
+        view_obj = task['view']
+        _ensure_baseline_workspaces(str(key[0]), view_obj)
+        task['result_mask_path'] = str(baseline_union_paths[key])
+        conf_path = baseline_confmap_paths.get(key)
+        task['result_conf_path'] = str(conf_path) if conf_path is not None else None
+
     def _pop_gpu_worker_pending_task_id(
         preferred_parent: Optional[Tuple[str, str]] = None,
-    ) -> int:
-        """Prefer a last-unissued full-frame lease that can unlock its parent."""
+    ) -> Optional[int]:
+        """Pick an inference task without exceeding the bounded live-view window."""
         pending_ids = [int(v) for v in gpu_worker_pending_task_ids]
+        eligible = [
+            (position, task_id)
+            for position, task_id in enumerate(pending_ids)
+            if _direct_union_task_admissible(gpu_worker_tasks_by_id[int(task_id)])
+        ]
+        if not eligible:
+            return None
         parent_pending_counts: Dict[Tuple[str, str], int] = {}
-        for task_id in pending_ids:
+        for _position, task_id in eligible:
             parent_key = _gpu_worker_fullframe_parent_key(gpu_worker_tasks_by_id[int(task_id)])
             if parent_key is not None:
                 parent_pending_counts[parent_key] = int(parent_pending_counts.get(parent_key, 0)) + 1
         unlock_candidates: List[Tuple[int, int, int, int]] = []
-        for position, task_id in enumerate(pending_ids):
+        for position, task_id in eligible:
             task = gpu_worker_tasks_by_id[int(task_id)]
             parent_key = _gpu_worker_fullframe_parent_key(task)
             if parent_key is None or int(parent_pending_counts.get(parent_key, 0)) != 1:
@@ -38590,9 +39321,18 @@ def main() -> None:
                 int(position),
                 int(task_id),
             ))
-        if not unlock_candidates:
-            return int(gpu_worker_pending_task_ids.popleft())
-        _preferred, _remaining, _position, selected_id = min(unlock_candidates)
+        if unlock_candidates:
+            _preferred, _remaining, _position, selected_id = min(unlock_candidates)
+        else:
+            # Prefer already-admitted views so their final chunk unlocks retirement before
+            # opening another view, then preserve central queue order.
+            selected_id = min(
+                eligible,
+                key=lambda pair: (
+                    0 if (_direct_union_task_key(gpu_worker_tasks_by_id[int(pair[1])]) in direct_union_live_views) else 1,
+                    int(pair[0]),
+                ),
+            )[1]
         gpu_worker_pending_task_ids.remove(int(selected_id))
         return int(selected_id)
 
@@ -38683,8 +39423,15 @@ def main() -> None:
             if not _main_process_gpu_stage_begin_inference(worker_id):
                 continue
             task_id = _pop_gpu_worker_pending_task_id(preferred_parent)
+            if task_id is None:
+                _main_process_gpu_stage_finish_inference(worker_id)
+                break
+            task_to_dispatch = gpu_worker_tasks_by_id[int(task_id)]
             try:
-                gpu_task_queues[int(worker_id)].put(gpu_worker_tasks_by_id[task_id])
+                _activate_direct_union_task(task_to_dispatch)
+                dispatch_task = dict(task_to_dispatch)
+                _attach_memfd_transfers_to_task(dispatch_task)
+                gpu_task_queues[int(worker_id)].put(dispatch_task)
             except BaseException:
                 gpu_worker_pending_task_ids.appendleft(int(task_id))
                 _main_process_gpu_stage_finish_inference(worker_id)
@@ -38708,10 +39455,14 @@ def main() -> None:
         shared_path = temp_dir / 'gpu_worker_source_volume.gray8.dat'
         shared_mm = copy_workspace_array(
             np.asarray(volume_rgb), shared_path,
-            desc='CUDA-worker shared source volume', prefer_memory=False, workers=int(worker_budget),
+            desc='CUDA-worker shared source volume', prefer_memory=False, prefer_memfd=True,
+            workers=int(worker_budget),
         )
         flush_array(shared_mm)
-        return str(shared_path), shape, str(np.asarray(shared_mm).dtype)
+        shared_backing = _memmap_backing_path(shared_mm)
+        if shared_backing is None:
+            raise RuntimeError('CUDA-worker shared source volume has no reopenable backing path')
+        return str(shared_backing), shape, str(np.asarray(shared_mm).dtype)
 
     if gpu_worker_process_active:
         gpu_worker_result_dir.mkdir(parents=True, exist_ok=True)
@@ -38751,7 +39502,7 @@ def main() -> None:
         _configure_main_process_gpu_stage_workers(gpu_logical_indices)
         if main_process_gpu_stage_inference_priority_enabled():
             print(
-                'Inference-first GPU ownership active (v16.0.8): main-process NRRD, '
+                'Inference-first GPU ownership active (v16.0.9): main-process NRRD, '
                 'backprojection, downbin, and topology stages cannot seize worker GPUs until '
                 'the global inference queue is permanently drained. '
                 'YOLO_TTA_MAIN_GPU_STAGE_INFERENCE_PRIORITY=0 restores opportunistic leasing.'
@@ -38933,7 +39684,7 @@ def main() -> None:
         chunk_hole_fill_enabled = bool(gpu_worker_chunk_hole_fill_enabled())
         if gpu_worker_device_hole_fill and not chunk_hole_fill_enabled:
             print(
-                'Split-view hole fill moved off the inference handoff (v16.0.8): multi-chunk '
+                'Split-view hole fill moved off the inference handoff (v16.0.9): multi-chunk '
                 'full-frame views run one completed-view CPU pass instead of a CuPy label/fill '
                 'barrier after every GPU lease. YOLO_TTA_GPU_WORKER_CHUNK_HOLE_FILL=1 restores '
                 'the per-chunk device pass.'
@@ -38957,10 +39708,9 @@ def main() -> None:
                 key_fv = (str(model_name), str(view.name))
                 fullframe_subtasks_per_view[key_fv] = int(fullframe_subtasks_per_view.get(key_fv, 0)) + len(ranges)
                 prefix = f'{view.name}__{job_id}'
-                if gpu_worker_direct_union_active:
-                    # pre-create the shared per-view union (and confmap) so every
-                    # worker task can open it 'r+' and write its disjoint slice window directly.
-                    _ensure_baseline_workspaces(str(model_name), view)
+                # v16.0.9 allocates the shared direct-union workspace only when the
+                # first task for this view is actually dispatched.  This prevents all 30
+                # logical 25-39 GiB unions from being created/touched at startup.
             elif tile_group_dispatch_active:
                 # defer this tile until its parent view's support exists. Full frames are
                 # dispatched first, and the completed parent support then decides which tiles
@@ -38990,10 +39740,10 @@ def main() -> None:
                 # N-times-too-large render pool). With cv2.setNumThreads(1) these are real render threads.
                 render_workers = max(1, min(int(per_worker_workers), int(count)))
                 if str(kind) == 'fullframe' and gpu_worker_direct_union_active:
-                    # the "result" paths are the shared per-view union files.
-                    key_direct = (str(model_name), str(view.name))
-                    rmask = baseline_union_paths[key_direct]
-                    rconf = baseline_confmap_paths.get(key_direct)
+                    # The scheduler attaches transferred memfd descriptors for the shared
+                    # per-view union; a real result pathname is only the fallback.
+                    rmask = None
+                    rconf = None
                     result_mode = 'direct_union'
                 else:
                     rmask = gpu_worker_result_dir / f'{prefix}__c{chunk_idx}.mask.u8.dat'
@@ -39012,7 +39762,8 @@ def main() -> None:
                     # native-volume residency spec + cube-ready sentinel
                     # (None when the cube gated enqueue synchronously, as before).
                     'native_resize': native_resize_task_spec,
-                    'result_mask_path': str(rmask), 'result_conf_path': (str(rconf) if rconf is not None else None),
+                    'result_mask_path': (str(rmask) if rmask is not None else None),
+                    'result_conf_path': (str(rconf) if rconf is not None else None),
                     'result_mode': str(result_mode), 'union_num_slices': int(n_slices),
                     'render_workers': int(render_workers), 'prefetch_frames': int(prefetch_frames),
                     'postprocess_workers': int(per_worker_workers),
@@ -39285,8 +40036,8 @@ def main() -> None:
             except Exception:
                 holder['valid'] = False
         if str(task.get('result_mode', 'file')) == 'direct_union':
-            # the worker already wrote its disjoint slice window straight into the
-            # shared per-view union memmap — nothing to reopen, OR, flush, or unlink here, and
+            # The worker already wrote its disjoint slice window straight into the
+            # shared per-view union mapping; nothing to reopen, OR, flush, or unlink here, and
             # the scheduler thread is free to drain the next GPU result immediately.
             _finalize_fullframe_view_after_worker(model_name_s, view)
             return
@@ -40068,10 +40819,30 @@ def main() -> None:
         and tuple(int(v) for v in source_output_shape_tyx) != (int(T), int(H), int(W))
     )
     for view in views:
-        if (view.family != 'radial' and not is_tilted_view(view)):
-            continue
         for model_name, _ in yolo_models:
             if view.name in view_volumes_by_model[model_name]:
+                continue
+            view_projected_layer_refs = [
+                ref for ref in nrrd_layer_refs
+                if str(getattr(ref, 'view_name', '')) == str(view.name)
+            ] if bool(nrrd_layers_needed) else []
+            if view_projected_layer_refs and all(len(tuple(ref.shape)) == 3 for ref in view_projected_layer_refs):
+                print(
+                    f'Final {model_name}/{view.name}: restoring/assembling the union of '
+                    f'{len(view_projected_layer_refs)} orthogonal NRRD layer(s) directly into '
+                    f'output geometry (v16.0.9 sparse-retirement path).'
+                )
+                if g5_tail_eligible:
+                    fused_projected_layer_refs.extend(view_projected_layer_refs)
+                    print(
+                        f'v13.3.9 (G5): {model_name}/{view.name} contributes its projected '
+                        f'layers directly to the fused final-union pass.'
+                    )
+                else:
+                    view_assemble_jobs.append((str(model_name), view, list(view_projected_layer_refs)))
+                continue
+
+            if (view.family != 'radial' and not is_tilted_view(view)):
                 continue
             if view.family == 'radial':
                 native_source = radial_native_output_by_model[model_name].get(view.name)
@@ -40081,42 +40852,12 @@ def main() -> None:
                 native_source = native_view_support_by_model[model_name].get(view.name)
             if native_source is None:
                 continue
-            # with --save_nrrd, this view's component layers were already
-            # projected into source geometry at materialization time (fullframe YOLO + per-pass
-            # bridge deltas + any tile layers), and projection commutes exactly with union — so
-            # the final projected volume is their OR, skipping a second full backprojection.
-            if bool(nrrd_layers_needed):
-                view_projected_layer_refs = [
-                    ref for ref in nrrd_layer_refs
-                    if str(getattr(ref, 'view_name', '')) == str(view.name)
-                ]
-                if view_projected_layer_refs and all(len(tuple(ref.shape)) == 3 for ref in view_projected_layer_refs):
-                    print(
-                        f'Final {model_name}/{view.name}: restoring/assembling the union of '
-                        f'{len(view_projected_layer_refs)} orthogonal NRRD layer(s) directly into '
-                        f'output geometry (v13.3.12 D6; no native intermediate).'
-                    )
-                    if g5_tail_eligible:
-                        # retain source-geometry stores as direct final-union
-                        # contributors. No radial/tilted full-volume intermediate is allocated.
-                        fused_projected_layer_refs.extend(view_projected_layer_refs)
-                        print(
-                            f'v13.3.9 (G5): {model_name}/{view.name} contributes its projected '
-                            f'layers directly to the fused final-union pass.'
-                        )
-                    else:
-                        # fallback: collect the assembly instead of running it inline;
-                        # the independent per-view assemblies run concurrently below.
-                        view_assemble_jobs.append((str(model_name), view, list(view_projected_layer_refs)))
-                    continue
             final_backprojection_jobs.append(ViewBackprojectionQueueJob(
                 model_name=str(model_name),
                 view=view,
                 native_source=native_source,
                 out_path=temp_dir / 'view_volumes' / str(model_name) / f'{view.name}.u8.dat',
                 desc=f'Backprojecting final {model_name}/{view.name}',
-                # --min_radius is already applied in the view-native plane before
-                # backprojection, so the queue no longer re-filters after backprojection.
                 min_radius=0.0,
                 workers=1,
                 out_shape_tyx=source_output_shape_tyx,
@@ -40604,6 +41345,9 @@ def main() -> None:
     gc.collect()
 
     if not keep_temp_artifacts:
+        released_memfd_files = release_memfd_owners_under(temp_dir)
+        if int(released_memfd_files) > 0:
+            print(f'Released {int(released_memfd_files)} memfd-backed scratch payload(s).')
         try:
             for child in list(temp_dir.iterdir()):
                 try:
@@ -40637,1486 +41381,9 @@ def main() -> None:
 
 
 
-# =============================================================================
-# v16.0.8 command-wide sparse/GPU/RAM/output fast paths
-# =============================================================================
-# The facilities in this section intentionally replace per-view ownership with
-# command-wide resources.  They are enabled by default and can be disabled for
-# diagnosis with YOLO_TTA_V1608_OPTIMIZATIONS=0.  No new hard dependency is
-# required.  python-isal is detected opportunistically for faster lossless
-# chunk compression and may be installed without root (`pip install --user
-# isal`).
-
-import atexit as _v1608_atexit
-import contextlib as _v1608_contextlib
-import concurrent.futures as _v1608_futures
-import functools as _v1608_functools
-import inspect as _v1608_inspect
-import io as _v1608_io
-import math as _v1608_math
-import os as _v1608_os
-import pathlib as _v1608_pathlib
-import queue as _v1608_queue
-import re as _v1608_re
-import subprocess as _v1608_subprocess_stdlib
-import tempfile as _v1608_tempfile_stdlib
-import threading as _v1608_threading
-import time as _v1608_time
-import types as _v1608_types
-import weakref as _v1608_weakref
-import zlib as _v1608_zlib
-from collections import OrderedDict as _V1608OrderedDict
-
-_V1608_IMPLEMENTED_ITEMS = ("A1", "A2", "A3", "C1", "C2", "I1", "I2", "J1", "J2")
-_V1608_TARGETS = {"A1": ["_estimate_parent_view_postprocess_bytes", "resolve_parent_postprocess_worker_allocation", "allocate_workspace_array", "prepare_view_volume_after_fullframe", "_backproject_tilted_radial_volume_to_volume", "assemble_view_volumes_and_projected_layers", "assemble_view_volumes_and_projected_layers_fused", "assemble_completed_views", "finalize_view_union"], "A2": ["_ensure_baseline_workspaces", "_dispatch_gpu_worker_inference_window", "_submit_view_prepare", "assemble_view_volumes_and_projected_layers_fused", "reconstruct_tilted_radial", "project_tilted_radial", "project_radial_layer"], "A3": ["_DeviceUnionAccumulator.flush_into", "_ensure_baseline_workspaces", "prepare_view_volume_after_fullframe", "_write_raw_bbox_payload_store", "IncrementalRawBBoxMaskStoreWriter", "RawBBoxMaskStore", "PreparedViewResult", "NrrdLayerRef", "fill_holes_2d", "binary_fill_holes", "fill_completed_view_holes", "postprocess_view_union"], "C1": ["_ResidentTensorRTRingExecutor", "_resident_trt_pipeline_signature", "_resident_trt_pipeline_acquire", "_try_resident_trt_ring_accumulate", "native_h", "native_w", "run_inference", "infer_batch", "predict_batch", "PersistentTRTRing"], "C2": ["predict_source_and_accumulate", "_ResidentTensorRTRingExecutor", "_gpu_inference_worker_main", "LoadPilAndNumpy", "model.predict", "run_inference", "infer_batch", "predict_batch", "gpu_inference_worker"], "I1": ["allocate_workspace_array", "copy_workspace_array", "choose_scratch_dir", "_open_memory_backed_encoded_chunk", "memfd_create", "mmap", "spawn", "create_cvol_store", "create_temp_store", "allocate_view_store", "assemble_view_volumes_and_projected_layers_fused"], "I2": ["RawBBoxMaskStore", "close_memmap_array", "nrrd_madvise_dontneed_interval", "local_3d_slab_unions", "assemble_topology_slabs", "topology_keep_objects", "assemble_view_volumes_and_projected_layers_fused"], "J1": ["_overlay_blend_blue_inplace", "_gray_frame_into_rgb_buffer", "write_overlay_video", "ffmpeg_rawvideo_writer", "_run_sharded_ffv1_encode", "format", "color", "blend", "write_nrrd", "save_nrrd", "write_nrrd_layers", "write_outputs"], "J2": ["_run_sharded_ffv1_encode", "write_mkv", "encode_mkv", "save_low_quality", "write_outputs"]}
-_V1608_ENABLED = _v1608_os.environ.get("YOLO_TTA_V1608_OPTIMIZATIONS", "1").strip().lower() not in {
-    "0", "false", "no", "off"
-}
-_V1608_LOG_LOCK = _v1608_threading.Lock()
-_V1608_LOGGED = set()
-
-
-def _v1608_log_once(key, message):
-    if not _V1608_ENABLED:
-        return
-    with _V1608_LOG_LOCK:
-        if key in _V1608_LOGGED:
-            return
-        _V1608_LOGGED.add(key)
-    try:
-        print(f"[v16.0.8] {message}", flush=True)
-    except Exception:
-        pass
-
-
-def _v1608_env_int(name, default, minimum=1, maximum=None):
-    try:
-        value = int(_v1608_os.environ.get(name, default))
-    except Exception:
-        value = int(default)
-    value = max(int(minimum), value)
-    if maximum is not None:
-        value = min(int(maximum), value)
-    return value
-
-
-def _v1608_parse_cpu_list(value):
-    cpus = []
-    for token in str(value).strip().split(','):
-        token = token.strip()
-        if not token:
-            continue
-        if '-' in token:
-            first, last = token.split('-', 1)
-            try:
-                cpus.extend(range(int(first), int(last) + 1))
-            except Exception:
-                continue
-        else:
-            try:
-                cpus.append(int(token))
-            except Exception:
-                continue
-    return tuple(sorted(set(cpus)))
-
-
-def _v1608_numa_cpu_sets():
-    result = []
-    root = _v1608_pathlib.Path('/sys/devices/system/node')
-    try:
-        for node in sorted(root.glob('node[0-9]*'), key=lambda p: int(p.name[4:])):
-            cpulist = node / 'cpulist'
-            if cpulist.exists():
-                cpus = _v1608_parse_cpu_list(cpulist.read_text().strip())
-                if cpus:
-                    result.append(cpus)
-    except Exception:
-        result = []
-    if not result:
-        try:
-            result = [tuple(sorted(_v1608_os.sched_getaffinity(0)))]
-        except Exception:
-            count = _v1608_os.cpu_count() or 1
-            result = [tuple(range(count))]
-    return tuple(result)
-
-
-_V1608_NUMA_CPUS = _v1608_numa_cpu_sets()
-_V1608_WORKER_INDEX = 0
-_V1608_WORKER_INDEX_LOCK = _v1608_threading.Lock()
-
-
-def _v1608_pin_worker():
-    global _V1608_WORKER_INDEX
-    with _V1608_WORKER_INDEX_LOCK:
-        index = _V1608_WORKER_INDEX
-        _V1608_WORKER_INDEX += 1
-    cpus = _V1608_NUMA_CPUS[index % len(_V1608_NUMA_CPUS)] if _V1608_NUMA_CPUS else ()
-    if cpus:
-        # Give each worker a compact subset while retaining enough cores for C
-        # compression code to scale internally.
-        stride = max(1, len(cpus) // max(1, _v1608_env_int('YOLO_TTA_OUTPUT_WORKERS', min(4, len(cpus)))))
-        start = (index * stride) % len(cpus)
-        chosen = cpus[start:start + stride] or (cpus[index % len(cpus)],)
-        try:
-            _v1608_os.sched_setaffinity(0, set(chosen))
-        except Exception:
-            pass
-
-
-# -----------------------------------------------------------------------------
-# I1/I2: RAM first, memfd for path-only consumers, --temp only as a last resort
-# -----------------------------------------------------------------------------
-
-_V1608_MEMFD_KEEPERS = {}
-_V1608_MEMFD_LOCK = _v1608_threading.Lock()
-
-
-def _v1608_cli_temp_dir():
-    argv = list(getattr(__import__('sys'), 'argv', ()))
-    for idx, token in enumerate(argv):
-        if token == '--temp' and idx + 1 < len(argv):
-            return argv[idx + 1]
-        if token.startswith('--temp='):
-            return token.split('=', 1)[1]
-    return None
-
-
-def _v1608_memfd_available():
-    return hasattr(_v1608_os, 'memfd_create') and _v1608_os.name == 'posix'
-
-
-def _v1608_memfd(name='yolo-tta', initial_size=0):
-    if not _v1608_memfd_available():
-        raise OSError('memfd_create is not available')
-    flags = int(getattr(_v1608_os, 'MFD_ALLOW_SEALING', 0))
-    fd = _v1608_os.memfd_create(str(name), flags=flags)
-    if initial_size:
-        _v1608_os.ftruncate(fd, int(initial_size))
-    path = f'/proc/{_v1608_os.getpid()}/fd/{fd}'
-    return fd, path
-
-
-def _v1608_ram_directory():
-    override = _v1608_os.environ.get('YOLO_TTA_RAM_TEMP')
-    candidates = [override, '/dev/shm']
-    for value in candidates:
-        if not value:
-            continue
-        try:
-            path = _v1608_pathlib.Path(value)
-            if path.is_dir() and _v1608_os.access(str(path), _v1608_os.W_OK | _v1608_os.X_OK):
-                return str(path)
-        except Exception:
-            pass
-    return None
-
-
-class _V1608MemfdNamedFile:
-    def __init__(self, mode='w+b', buffering=-1, encoding=None, errors=None,
-                 newline=None, suffix=None, prefix=None, delete=True,
-                 delete_on_close=True, **_ignored):
-        self._delete = bool(delete)
-        self._closed = False
-        label = (prefix or 'yolo-tta-') + (suffix or '')
-        self._fd, self.name = _v1608_memfd(label)
-        dup = _v1608_os.dup(self._fd)
-        open_kwargs = {'buffering': buffering}
-        if 'b' not in mode:
-            open_kwargs.update(encoding=encoding, errors=errors, newline=newline)
-        self._file = _v1608_os.fdopen(dup, mode, **open_kwargs)
-
-    @property
-    def closed(self):
-        return self._closed or self._file.closed
-
-    def fileno(self):
-        return self._file.fileno()
-
-    def close(self):
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            self._file.close()
-        finally:
-            try:
-                _v1608_os.close(self._fd)
-            except OSError:
-                pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        self.close()
-        return False
-
-    def __iter__(self):
-        return iter(self._file)
-
-    def __getattr__(self, name):
-        return getattr(self._file, name)
-
-
-def _v1608_named_temporary_file(*args, **kwargs):
-    if _V1608_ENABLED and _v1608_memfd_available() and kwargs.get('dir') in (None, _v1608_cli_temp_dir()):
-        try:
-            return _V1608MemfdNamedFile(*args, **kwargs)
-        except Exception:
-            pass
-    ram_dir = _v1608_ram_directory()
-    if ram_dir and kwargs.get('dir') is None:
-        kwargs = dict(kwargs)
-        kwargs['dir'] = ram_dir
-    elif kwargs.get('dir') is None and _v1608_cli_temp_dir():
-        kwargs = dict(kwargs)
-        kwargs['dir'] = _v1608_cli_temp_dir()
-    return _v1608_tempfile_stdlib.NamedTemporaryFile(*args, **kwargs)
-
-
-def _v1608_temporary_file(*args, **kwargs):
-    if _V1608_ENABLED and _v1608_memfd_available():
-        mode = kwargs.pop('mode', args[0] if args else 'w+b')
-        return _V1608MemfdNamedFile(mode=mode, **kwargs)
-    ram_dir = _v1608_ram_directory()
-    if ram_dir and kwargs.get('dir') is None:
-        kwargs = dict(kwargs)
-        kwargs['dir'] = ram_dir
-    return _v1608_tempfile_stdlib.TemporaryFile(*args, **kwargs)
-
-
-def _v1608_mkstemp(*args, **kwargs):
-    # mkstemp users commonly unlink/rename the path.  A tmpfs pathname retains
-    # those semantics; memfd is reserved for consumers that merely need a path.
-    ram_dir = _v1608_ram_directory()
-    if ram_dir and kwargs.get('dir') is None:
-        kwargs = dict(kwargs)
-        kwargs['dir'] = ram_dir
-    elif kwargs.get('dir') is None and _v1608_cli_temp_dir():
-        kwargs = dict(kwargs)
-        kwargs['dir'] = _v1608_cli_temp_dir()
-    return _v1608_tempfile_stdlib.mkstemp(*args, **kwargs)
-
-
-def _v1608_mkdtemp(*args, **kwargs):
-    ram_dir = _v1608_ram_directory()
-    if ram_dir and kwargs.get('dir') is None:
-        kwargs = dict(kwargs)
-        kwargs['dir'] = ram_dir
-    elif kwargs.get('dir') is None and _v1608_cli_temp_dir():
-        kwargs = dict(kwargs)
-        kwargs['dir'] = _v1608_cli_temp_dir()
-    return _v1608_tempfile_stdlib.mkdtemp(*args, **kwargs)
-
-
-class _V1608TemporaryDirectory(_v1608_tempfile_stdlib.TemporaryDirectory):
-    def __init__(self, suffix=None, prefix=None, dir=None, *, ignore_cleanup_errors=False, delete=True):
-        if dir is None:
-            dir = _v1608_ram_directory() or _v1608_cli_temp_dir()
-        super().__init__(suffix=suffix, prefix=prefix, dir=dir,
-                         ignore_cleanup_errors=ignore_cleanup_errors, delete=delete)
-
-
-class _V1608TempfileProxy:
-    def __init__(self, module):
-        self._module = module
-
-    NamedTemporaryFile = staticmethod(_v1608_named_temporary_file)
-    TemporaryFile = staticmethod(_v1608_temporary_file)
-    mkstemp = staticmethod(_v1608_mkstemp)
-    mkdtemp = staticmethod(_v1608_mkdtemp)
-    TemporaryDirectory = _V1608TemporaryDirectory
-
-    def __getattr__(self, name):
-        return getattr(self._module, name)
-
-
-# -----------------------------------------------------------------------------
-# A1/A2: sparse out-of-order retirement and sink-only GPU projection
-# -----------------------------------------------------------------------------
-
-try:
-    import isal.igzip as _v1608_igzip
-except Exception:
-    _v1608_igzip = None
-
-
-def _v1608_compress(data, level=1):
-    payload = memoryview(data)
-    if _v1608_igzip is not None:
-        try:
-            return _v1608_igzip.compress(payload, compresslevel=max(0, min(3, int(level))))
-        except Exception:
-            pass
-    return _v1608_zlib.compress(payload, max(1, min(9, int(level))))
-
-
-def _v1608_decompress(data):
-    if _v1608_igzip is not None:
-        try:
-            return _v1608_igzip.decompress(data)
-        except Exception:
-            pass
-    return _v1608_zlib.decompress(data)
-
-
-class _V1608PinnedTransferPool:
-    def __init__(self):
-        workers = _v1608_env_int('YOLO_TTA_RETIRE_WORKERS', max(2, min(8, (_v1608_os.cpu_count() or 8) // 16)), 1, 32)
-        self._executor = _v1608_futures.ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix='v1608-retire', initializer=_v1608_pin_worker
-        )
-        self._futures = set()
-        self._lock = _v1608_threading.Lock()
-
-    def submit(self, fn, *args, **kwargs):
-        future = self._executor.submit(fn, *args, **kwargs)
-        with self._lock:
-            self._futures.add(future)
-        future.add_done_callback(self._discard)
-        return future
-
-    def _discard(self, future):
-        with self._lock:
-            self._futures.discard(future)
-
-    def barrier(self):
-        while True:
-            with self._lock:
-                pending = tuple(self._futures)
-            if not pending:
-                return
-            for future in pending:
-                future.result()
-
-    def shutdown(self):
-        self.barrier()
-        self._executor.shutdown(wait=True, cancel_futures=False)
-
-
-_V1608_RETIRE_POOL = _V1608PinnedTransferPool()
-
-
-class _V1608SparseCVolStore:
-    """Chunk-addressable sparse uint8/bool volume kept in RAM.
-
-    Chunks are accepted out of order.  All-zero chunks consume only a dictionary
-    entry deletion.  Nonzero chunks are compressed after each retirement, so a
-    completed view never requires a dense volume.  GPU tensors are copied through
-    pinned host buffers on the producing stream and compressed on NUMA-pinned CPU
-    workers, allowing the GPU to proceed immediately to the next inference unit.
-    """
-
-    def __init__(self, shape, dtype='uint8', chunk_axis=0, chunk_depth=None,
-                 compression_level=1, name='cvol'):
-        import numpy as _np
-        self.shape = tuple(int(v) for v in shape)
-        self.dtype = _np.dtype(dtype)
-        self.ndim = len(self.shape)
-        if self.ndim < 1:
-            raise ValueError('shape must have at least one dimension')
-        self.chunk_axis = int(chunk_axis) % self.ndim
-        other = max(1, int(_np.prod([v for i, v in enumerate(self.shape) if i != self.chunk_axis], dtype=_np.int64)))
-        target_bytes = _v1608_env_int('YOLO_TTA_CVOL_CHUNK_MIB', 32, 1, 512) * 1024 * 1024
-        inferred = max(1, target_bytes // max(1, other * self.dtype.itemsize))
-        self.chunk_depth = int(chunk_depth or inferred)
-        self.chunk_depth = max(1, min(self.shape[self.chunk_axis], self.chunk_depth))
-        self.compression_level = int(compression_level)
-        self.name = str(name)
-        self._chunks = {}
-        self._chunk_shapes = {}
-        self._locks = {}
-        self._locks_guard = _v1608_threading.Lock()
-        self._pending = []
-        self._pending_guard = _v1608_threading.Lock()
-        self._closed = False
-        self._nonzero_voxels = 0
-
-    @property
-    def nbytes(self):
-        return int(_v1608_math.prod(self.shape) * self.dtype.itemsize)
-
-    @property
-    def stored_bytes(self):
-        return sum(len(v) for v in self._chunks.values())
-
-    def _lock_for(self, index):
-        with self._locks_guard:
-            lock = self._locks.get(index)
-            if lock is None:
-                lock = _v1608_threading.Lock()
-                self._locks[index] = lock
-            return lock
-
-    def _chunk_bounds(self, index):
-        first = int(index) * self.chunk_depth
-        last = min(self.shape[self.chunk_axis], first + self.chunk_depth)
-        if first < 0 or first >= last:
-            raise IndexError(index)
-        return first, last
-
-    def _chunk_shape(self, index):
-        first, last = self._chunk_bounds(index)
-        shape = list(self.shape)
-        shape[self.chunk_axis] = last - first
-        return tuple(shape)
-
-    def _decode(self, index):
-        import numpy as _np
-        payload = self._chunks.get(int(index))
-        shape = self._chunk_shape(index)
-        if payload is None:
-            return _np.zeros(shape, dtype=self.dtype)
-        raw = _v1608_decompress(payload)
-        return _np.frombuffer(raw, dtype=self.dtype).reshape(shape).copy()
-
-    def _encode_replace(self, index, array):
-        import numpy as _np
-        arr = _np.ascontiguousarray(array, dtype=self.dtype)
-        if not _np.any(arr):
-            self._chunks.pop(int(index), None)
-            self._chunk_shapes.pop(int(index), None)
-            return
-        self._chunks[int(index)] = _v1608_compress(memoryview(arr).cast('B'), self.compression_level)
-        self._chunk_shapes[int(index)] = tuple(arr.shape)
-
-    def union_chunk_cpu(self, index, array):
-        import numpy as _np
-        index = int(index)
-        arr = _np.asarray(array, dtype=self.dtype)
-        expected = self._chunk_shape(index)
-        if tuple(arr.shape) != expected:
-            try:
-                arr = _np.broadcast_to(arr, expected)
-            except Exception as exc:
-                raise ValueError(f'chunk {index} shape {arr.shape} != {expected}') from exc
-        if not _np.any(arr):
-            return
-        lock = self._lock_for(index)
-        with lock:
-            if index in self._chunks:
-                current = self._decode(index)
-                _np.maximum(current, arr, out=current)
-                self._encode_replace(index, current)
-            else:
-                self._encode_replace(index, arr)
-
-    def union_chunk(self, index, array, stream=None):
-        if self._closed:
-            raise RuntimeError('store is closed')
-        try:
-            import torch as _torch
-        except Exception:
-            _torch = None
-        if _torch is not None and _torch.is_tensor(array):
-            tensor = array.detach()
-            if tensor.device.type == 'cuda':
-                # The copy is enqueued on the producer stream.  A CUDA event lets
-                # the CPU worker wait without synchronizing the device globally.
-                producer = stream or _torch.cuda.current_stream(tensor.device)
-                host = _torch.empty(tuple(tensor.shape), dtype=tensor.dtype,
-                                    device='cpu', pin_memory=True)
-                event = _torch.cuda.Event(blocking=False, interprocess=False)
-                with _torch.cuda.stream(producer):
-                    host.copy_(tensor, non_blocking=True)
-                    event.record(producer)
-
-                def retire():
-                    event.synchronize()
-                    self.union_chunk_cpu(index, host.numpy())
-
-                future = _V1608_RETIRE_POOL.submit(retire)
-            else:
-                future = _V1608_RETIRE_POOL.submit(self.union_chunk_cpu, index, tensor.cpu().numpy())
-        else:
-            future = _V1608_RETIRE_POOL.submit(self.union_chunk_cpu, index, array)
-        with self._pending_guard:
-            self._pending.append(future)
-        return future
-
-    def barrier(self):
-        with self._pending_guard:
-            pending, self._pending = self._pending, []
-        for future in pending:
-            future.result()
-        return self
-
-    def iter_chunks(self, include_empty=False):
-        self.barrier()
-        count = (self.shape[self.chunk_axis] + self.chunk_depth - 1) // self.chunk_depth
-        for index in range(count):
-            if include_empty or index in self._chunks:
-                yield index, self._decode(index)
-
-    def materialize(self, out=None):
-        import numpy as _np
-        self.barrier()
-        if out is None:
-            out = _np.zeros(self.shape, dtype=self.dtype)
-        for index, chunk in self.iter_chunks(include_empty=False):
-            first, last = self._chunk_bounds(index)
-            selection = [slice(None)] * self.ndim
-            selection[self.chunk_axis] = slice(first, last)
-            target = out[tuple(selection)]
-            _np.maximum(target, chunk, out=target)
-        return out
-
-    def close(self):
-        if self._closed:
-            return
-        self.barrier()
-        self._closed = True
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        self.close()
-        return False
-
-
-def _v1608_chunk_index_and_slice(shape, axis, depth):
-    count = (shape[axis] + depth - 1) // depth
-    for index in range(count):
-        first = index * depth
-        last = min(shape[axis], first + depth)
-        selection = [slice(None)] * len(shape)
-        selection[axis] = slice(first, last)
-        yield index, tuple(selection)
-
-
-def _v1608_project_chunk_to_source(data, *, grid=None, inverse_map=None,
-                                    source_slice=None, sink=None, mode='nearest',
-                                    threshold=0.0, stream=None):
-    """Project one resident chunk and retire it without a tilted base stack."""
-    try:
-        import torch as _torch
-        import torch.nn.functional as _F
-    except Exception:
-        _torch = None
-        _F = None
-    projected = data
-    if inverse_map is not None:
-        projected = inverse_map(data)
-    elif grid is not None and _torch is not None and _torch.is_tensor(data):
-        tensor = data
-        squeeze = 0
-        while tensor.ndim < 4:
-            tensor = tensor.unsqueeze(0)
-            squeeze += 1
-        if tensor.ndim == 4 and grid.ndim == 4:
-            projected = _F.grid_sample(tensor.float(), grid, mode=mode,
-                                       padding_mode='zeros', align_corners=False)
-        elif tensor.ndim == 5 and grid.ndim == 5:
-            projected = _F.grid_sample(tensor.float(), grid, mode=mode,
-                                       padding_mode='zeros', align_corners=False)
-        else:
-            raise ValueError(f'incompatible tensor/grid ranks: {tensor.ndim}/{grid.ndim}')
-        for _ in range(squeeze):
-            projected = projected.squeeze(0)
-        if threshold is not None:
-            projected = projected > float(threshold)
-    if sink is None:
-        return projected
-    if source_slice is None:
-        if hasattr(sink, 'union_chunk'):
-            sink.union_chunk(0, projected, stream=stream)
-        elif callable(sink):
-            sink(projected)
-        return None
-    if isinstance(source_slice, int):
-        sink.union_chunk(source_slice, projected, stream=stream)
-    elif hasattr(sink, 'union_region'):
-        sink.union_region(source_slice, projected, stream=stream)
-    elif callable(sink):
-        sink(source_slice, projected)
-    else:
-        # Convert a source-axis-aligned slice to the store's chunk index when it
-        # exactly spans one retirement chunk.
-        axis = getattr(sink, 'chunk_axis', 0)
-        part = source_slice[axis] if isinstance(source_slice, tuple) else source_slice
-        if isinstance(part, slice) and part.start is not None:
-            sink.union_chunk(int(part.start) // int(sink.chunk_depth), projected, stream=stream)
-        else:
-            raise TypeError('sink cannot accept source_slice')
-    return None
-
-
-def _v1608_iter_units(value):
-    if value is None:
-        return
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if isinstance(item, dict):
-                unit = dict(item)
-                unit.setdefault('name', key)
-                yield unit
-            else:
-                yield {'name': key, 'data': item}
-        return
-    if isinstance(value, (list, tuple)):
-        for index, item in enumerate(value):
-            if isinstance(item, dict):
-                yield item
-            elif isinstance(item, tuple) and len(item) == 2:
-                yield {'source_slice': item[0], 'data': item[1]}
-            else:
-                yield {'index': index, 'data': item}
-        return
-    try:
-        iterator = iter(value)
-    except TypeError:
-        yield {'data': value}
-        return
-    for index, item in enumerate(iterator):
-        if isinstance(item, dict):
-            yield item
-        elif isinstance(item, tuple) and len(item) == 2:
-            yield {'source_slice': item[0], 'data': item[1]}
-        else:
-            yield {'index': index, 'data': item}
-
-
-def assemble_view_volumes_and_projected_layers_fused(
-        view_volumes=None, projected_layers=None, source_shape=None, *,
-        dtype='uint8', chunk_axis=0, chunk_depth=None, output_sink=None,
-        materialize=True, projector=None, device_ids=None, **_kwargs):
-    """Fuse completed view retirement, projection, and final union.
-
-    Source-aligned chunks bypass the GPU restore lanes entirely.  Chunks that
-    still require geometric restoration remain on their producing GPU, are
-    projected once, and are copied to pinned RAM only after union.  This removes
-    dense per-view unions and the full tilted-radial base-stack intermediate.
-    """
-    if source_shape is None:
-        for collection in (view_volumes, projected_layers):
-            for unit in _v1608_iter_units(collection):
-                data = unit.get('data')
-                shape = getattr(data, 'shape', None)
-                if shape is not None:
-                    source_shape = tuple(int(v) for v in shape)
-                    break
-            if source_shape is not None:
-                break
-    if source_shape is None:
-        raise ValueError('source_shape is required when no unit exposes a shape')
-    sink = output_sink or _V1608SparseCVolStore(
-        source_shape, dtype=dtype, chunk_axis=chunk_axis, chunk_depth=chunk_depth,
-        name='fused-final-union'
-    )
-    for collection in (view_volumes, projected_layers):
-        for unit in _v1608_iter_units(collection):
-            data = unit.get('data')
-            if data is None:
-                continue
-            unit_projector = unit.get('inverse_map') or unit.get('projector') or projector
-            grid = unit.get('grid')
-            source_slice = unit.get('source_slice')
-            if unit_projector is not None or grid is not None:
-                _v1608_project_chunk_to_source(
-                    data, grid=grid, inverse_map=unit_projector,
-                    source_slice=source_slice, sink=sink,
-                    mode=unit.get('mode', 'nearest'),
-                    threshold=unit.get('threshold', 0.0),
-                    stream=unit.get('stream')
-                )
-            elif source_slice is not None:
-                axis = getattr(sink, 'chunk_axis', chunk_axis)
-                part = source_slice[axis] if isinstance(source_slice, tuple) else source_slice
-                if isinstance(part, slice) and part.start is not None:
-                    index = int(part.start) // int(getattr(sink, 'chunk_depth', 1))
-                elif isinstance(part, int):
-                    index = int(part)
-                else:
-                    index = int(unit.get('index', 0))
-                sink.union_chunk(index, data, stream=unit.get('stream'))
-            else:
-                shape = tuple(int(v) for v in getattr(data, 'shape', ()))
-                if shape == tuple(source_shape):
-                    # Split a source-sized result immediately instead of retaining
-                    # another complete dense view.
-                    for index, selection in _v1608_chunk_index_and_slice(
-                            source_shape, sink.chunk_axis, sink.chunk_depth):
-                        sink.union_chunk(index, data[selection], stream=unit.get('stream'))
-                else:
-                    sink.union_chunk(int(unit.get('index', 0)), data, stream=unit.get('stream'))
-    sink.barrier()
-    _v1608_log_once('fused-union', 'enabled sparse fused view retirement and sink-only projection')
-    if materialize:
-        return sink.materialize()
-    return sink
-
-
-# -----------------------------------------------------------------------------
-# A3: foreground-bounded 2-D hole filling
-# -----------------------------------------------------------------------------
-
-
-def _v1608_bbox_2d(array):
-    import numpy as _np
-    arr = _np.asarray(array)
-    if arr.ndim != 2 or not _np.any(arr):
-        return None
-    rows = _np.flatnonzero(_np.any(arr, axis=1))
-    cols = _np.flatnonzero(_np.any(arr, axis=0))
-    if rows.size == 0 or cols.size == 0:
-        return None
-    return int(rows[0]), int(rows[-1]) + 1, int(cols[0]), int(cols[-1]) + 1
-
-
-def _v1608_binary_fill_holes(input, structure=None, output=None, origin=0, *, _original=None):
-    import numpy as _np
-    if _original is None:
-        try:
-            import scipy.ndimage as _ndi
-            _original = _ndi._morphology.binary_fill_holes
-        except Exception:
-            import scipy.ndimage as _ndi
-            _original = getattr(_ndi, '__v1608_original_binary_fill_holes', None)
-            if _original is None:
-                raise
-    arr = _np.asarray(input)
-    if arr.ndim == 2:
-        bbox = _v1608_bbox_2d(arr)
-        if bbox is None:
-            result = arr.astype(bool, copy=True)
-        else:
-            r0, r1, c0, c1 = bbox
-            # Pad one explicit background pixel even when foreground touches the
-            # image edge.  This preserves whole-plane exterior connectivity.
-            crop = _np.pad(arr[r0:r1, c0:c1].astype(bool, copy=False), 1,
-                           mode='constant', constant_values=False)
-            filled = _original(crop, structure=structure, output=None, origin=origin)
-            result = arr.astype(bool, copy=True)
-            result[r0:r1, c0:c1] = filled[1:-1, 1:-1]
-    elif arr.ndim == 3 and _v1608_os.environ.get('YOLO_TTA_HOLE_FILL_3D', '0') != '1':
-        # Completed-view hole fill is plane-local in the prioritized command.
-        # Keep one plane live per worker rather than scanning every 3072^2 plane
-        # through a full-volume temporary.
-        result = arr.astype(bool, copy=True)
-        active = _np.flatnonzero(_np.any(arr.reshape(arr.shape[0], -1), axis=1))
-        workers = _v1608_env_int('YOLO_TTA_HOLE_FILL_WORKERS', min(8, max(1, (_v1608_os.cpu_count() or 1) // 16)), 1, 32)
-        def one(index):
-            return int(index), _v1608_binary_fill_holes(arr[int(index)], structure=structure,
-                                                        output=None, origin=origin,
-                                                        _original=_original)
-        if workers > 1 and len(active) > 1:
-            with _v1608_futures.ThreadPoolExecutor(max_workers=workers,
-                                                    thread_name_prefix='v1608-hole',
-                                                    initializer=_v1608_pin_worker) as pool:
-                for index, plane in pool.map(one, active):
-                    result[index] = plane
-        else:
-            for index in active:
-                result[int(index)] = one(index)[1]
-    else:
-        result = _original(arr, structure=structure, output=None, origin=origin)
-    if output is not None:
-        output[...] = result
-        return None
-    return result
-
-
-class _V1608NDImageProxy:
-    def __init__(self, module):
-        self._module = module
-        self._original = module.binary_fill_holes
-
-    def binary_fill_holes(self, input, structure=None, output=None, origin=0):
-        return _v1608_binary_fill_holes(input, structure=structure, output=output,
-                                        origin=origin, _original=self._original)
-
-    def __getattr__(self, name):
-        return getattr(self._module, name)
-
-
-# -----------------------------------------------------------------------------
-# C1/C2: one persistent predictor/context per engine profile and direct tensors
-# -----------------------------------------------------------------------------
-
-_V1608_PREDICTOR_CACHE = {}
-_V1608_PREDICTOR_LOCKS = {}
-_V1608_PREDICTOR_GUARD = _v1608_threading.RLock()
-
-
-def _v1608_normalize_device(value, source=None):
-    if value is None:
-        try:
-            if hasattr(source, 'device'):
-                return str(source.device)
-        except Exception:
-            pass
-        return 'auto'
-    if isinstance(value, (list, tuple)):
-        return ','.join(map(str, value))
-    return str(value).replace('cuda:', '')
-
-
-def _v1608_model_identity(model):
-    for attr in ('ckpt_path', 'model_name', 'model_path'):
-        value = getattr(model, attr, None)
-        if value:
-            return str(value)
-    overrides = getattr(model, 'overrides', None)
-    if isinstance(overrides, dict) and overrides.get('model'):
-        return str(overrides['model'])
-    inner = getattr(model, 'model', None)
-    return str(getattr(inner, 'engine_path', None) or getattr(inner, 'pt_path', None) or type(model).__name__)
-
-
-def _v1608_predictor_key(model, source, kwargs):
-    imgsz = kwargs.get('imgsz') or kwargs.get('img_size')
-    if isinstance(imgsz, list):
-        imgsz = tuple(imgsz)
-    return (
-        _v1608_model_identity(model),
-        _v1608_normalize_device(kwargs.get('device'), source),
-        str(kwargs.get('task') or getattr(model, 'task', 'segment')),
-        str(imgsz),
-        int(kwargs.get('batch', 1) or 1),
-        bool(kwargs.get('half', False)),
-        bool(kwargs.get('retina_masks', False)),
-    )
-
-
-def _v1608_predictor_lock(key):
-    with _V1608_PREDICTOR_GUARD:
-        lock = _V1608_PREDICTOR_LOCKS.get(key)
-        if lock is None:
-            lock = _v1608_threading.RLock()
-            _V1608_PREDICTOR_LOCKS[key] = lock
-        return lock
-
-
-def _v1608_update_predictor_args(predictor, kwargs):
-    args = getattr(predictor, 'args', None)
-    if args is None:
-        return
-    for key, value in kwargs.items():
-        if value is None:
-            continue
-        if hasattr(args, key):
-            try:
-                setattr(args, key, value)
-            except Exception:
-                pass
-
-
-def _v1608_direct_stream_inference(predictor, source, stream):
-    method = getattr(predictor, 'stream_inference', None)
-    if method is None:
-        raise AttributeError('predictor has no stream_inference')
-    signature = _v1608_inspect.signature(method)
-    call = {}
-    if 'source' in signature.parameters:
-        call['source'] = source
-    if 'model' in signature.parameters:
-        call['model'] = None
-    generator = method(**call)
-    return generator if stream else list(generator)
-
-
-def _v1608_install_ultralytics_predict_cache():
-    try:
-        from ultralytics.engine.model import Model as _UltralyticsModel
-    except Exception:
-        return
-    if getattr(_UltralyticsModel.predict, '__v1608_persistent__', False):
-        return
-    original = _UltralyticsModel.predict
-
-    @_v1608_functools.wraps(original)
-    def persistent_predict(self, source=None, stream=False, predictor=None, **kwargs):
-        if not _V1608_ENABLED or predictor is not None:
-            return original(self, source=source, stream=stream, predictor=predictor, **kwargs)
-        key = _v1608_predictor_key(self, source, kwargs)
-        lock = _v1608_predictor_lock(key)
-        with lock:
-            cached = _V1608_PREDICTOR_CACHE.get(key)
-            previous = getattr(self, 'predictor', None)
-            if cached is not None:
-                try:
-                    self.predictor = cached
-                except Exception:
-                    cached = None
-            # Once initialized, a CUDA tensor can enter the persistent predictor
-            # directly.  This skips Model.predict configuration/source setup and
-            # keeps the render tensor on-device through TensorRT and mask decode.
-            if cached is not None:
-                try:
-                    import torch as _torch
-                    is_cuda_tensor = _torch.is_tensor(source) and source.device.type == 'cuda'
-                except Exception:
-                    is_cuda_tensor = False
-                if is_cuda_tensor:
-                    try:
-                        _v1608_update_predictor_args(cached, kwargs)
-                        result = _v1608_direct_stream_inference(cached, source, stream)
-                        _v1608_log_once('direct-tensor', 'enabled direct CUDA tensor -> persistent Ultralytics/TensorRT inference')
-                        return result
-                    except Exception:
-                        # Compatibility fallback is deliberately local to this
-                        # call; the predictor/context remains cached.
-                        pass
-            result = original(self, source=source, stream=stream, predictor=predictor, **kwargs)
-            current = getattr(self, 'predictor', None)
-            if current is not None:
-                _V1608_PREDICTOR_CACHE[key] = current
-                _v1608_log_once('trt-cache', 'enabled one persistent predictor/TensorRT context per device/profile')
-            if previous is not None and previous is not current:
-                # Do not retain a predictor for the wrong profile on this wrapper;
-                # the command-wide cache owns both instances.
-                try:
-                    self.predictor = previous
-                except Exception:
-                    pass
-            return result
-
-    persistent_predict.__v1608_persistent__ = True
-    persistent_predict.__v1608_original__ = original
-    _UltralyticsModel.predict = persistent_predict
-
-
-# -----------------------------------------------------------------------------
-# J1: concurrent lossless NRRD production with a command-level output barrier
-# -----------------------------------------------------------------------------
-
-class _V1608OutputCoordinator:
-    def __init__(self):
-        default_workers = max(1, min(4, len(_V1608_NUMA_CPUS) * 2))
-        workers = _v1608_env_int('YOLO_TTA_NRRD_WORKERS', default_workers, 1, 16)
-        self.executor = _v1608_futures.ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix='v1608-output', initializer=_v1608_pin_worker
-        )
-        self._futures = {}
-        self._lock = _v1608_threading.RLock()
-        self._closed = False
-
-    def submit_path(self, path, fn, *args, **kwargs):
-        final = _v1608_os.path.abspath(_v1608_os.fspath(path))
-        with self._lock:
-            previous = self._futures.get(final)
-        def job():
-            if previous is not None:
-                previous.result()
-            directory = _v1608_os.path.dirname(final) or '.'
-            _v1608_os.makedirs(directory, exist_ok=True)
-            suffix = _v1608_os.path.splitext(final)[1]
-            fd, staging = _v1608_tempfile_stdlib.mkstemp(
-                prefix='.v1608-', suffix=suffix, dir=directory
-            )
-            _v1608_os.close(fd)
-            try:
-                result = fn(staging, *args, **kwargs)
-                _v1608_os.replace(staging, final)
-                return result
-            except BaseException:
-                try:
-                    _v1608_os.unlink(staging)
-                except OSError:
-                    pass
-                raise
-        future = self.executor.submit(job)
-        with self._lock:
-            self._futures[final] = future
-        return future
-
-    def wait_path(self, path):
-        final = _v1608_os.path.abspath(_v1608_os.fspath(path))
-        with self._lock:
-            future = self._futures.get(final)
-        if future is not None:
-            return future.result()
-        return None
-
-    def barrier(self):
-        with self._lock:
-            futures = tuple(self._futures.values())
-        for future in futures:
-            future.result()
-
-    def shutdown(self):
-        if self._closed:
-            return
-        self._closed = True
-        self.barrier()
-        self.executor.shutdown(wait=True, cancel_futures=False)
-
-
-_V1608_OUTPUTS = _V1608OutputCoordinator()
-
-
-class _V1608NRRDProxy:
-    def __init__(self, module):
-        self._module = module
-        self._write = module.write
-        self._read = getattr(module, 'read', None)
-
-    def write(self, filename, data, *args, **kwargs):
-        async_enabled = _v1608_os.environ.get('YOLO_TTA_ASYNC_NRRD', '1').strip().lower() not in {
-            '0', 'false', 'no', 'off'
-        }
-        if not (_V1608_ENABLED and async_enabled and isinstance(filename, (_v1608_os.PathLike, str, bytes))):
-            return self._write(filename, data, *args, **kwargs)
-        # Hold the immutable array/tensor by reference.  Output happens while the
-        # next NRRD is prepared; no duplicate 25-50 GiB staging copy is made.
-        future = _V1608_OUTPUTS.submit_path(filename, self._write, data, *args, **kwargs)
-        _v1608_log_once('async-nrrd', 'enabled concurrent lossless NRRD writers with atomic publication')
-        return future
-
-    def read(self, filename, *args, **kwargs):
-        _V1608_OUTPUTS.wait_path(filename)
-        if self._read is None:
-            raise AttributeError('NRRD module has no read')
-        return self._read(filename, *args, **kwargs)
-
-    def __getattr__(self, name):
-        return getattr(self._module, name)
-
-
-def _v1608_nrrd_write(original, filename, data, *args, **kwargs):
-    proxy = _V1608NRRDProxy(_v1608_types.SimpleNamespace(write=original))
-    return proxy.write(filename, data, *args, **kwargs)
-
-
-# -----------------------------------------------------------------------------
-# J2/I1: FFmpeg concat/filtergraph inputs through memfd, never --temp manifests
-# -----------------------------------------------------------------------------
-
-class _V1608PopenLease:
-    def __init__(self, process, leases):
-        self._process = process
-        self._leases = list(leases)
-        if leases:
-            watcher = _v1608_threading.Thread(target=self._watch, daemon=True,
-                                              name='v1608-ffmpeg-memfd')
-            watcher.start()
-
-    def _release(self):
-        leases, self._leases = self._leases, []
-        for fd in leases:
-            try:
-                _v1608_os.close(fd)
-            except OSError:
-                pass
-
-    def _watch(self):
-        try:
-            self._process.wait()
-        finally:
-            self._release()
-
-    def wait(self, *args, **kwargs):
-        try:
-            return self._process.wait(*args, **kwargs)
-        finally:
-            self._release()
-
-    def communicate(self, *args, **kwargs):
-        try:
-            return self._process.communicate(*args, **kwargs)
-        finally:
-            self._release()
-
-    def __enter__(self):
-        self._process.__enter__()
-        return self
-
-    def __exit__(self, *args):
-        try:
-            return self._process.__exit__(*args)
-        finally:
-            self._release()
-
-    def __getattr__(self, name):
-        return getattr(self._process, name)
-
-
-def _v1608_prepare_ffmpeg_args(args):
-    if not isinstance(args, (list, tuple)) or not args:
-        return args, []
-    executable = _v1608_os.path.basename(_v1608_os.fspath(args[0])).lower()
-    if 'ffmpeg' not in executable and 'ffprobe' not in executable:
-        return args, []
-    command = list(args)
-    leases = []
-    if '-nostdin' not in command and 'ffmpeg' in executable:
-        command.insert(1, '-nostdin')
-    # A concat manifest is tiny but historically forced a real --temp file and a
-    # filesystem round trip.  Copy it once to memfd and let FFmpeg open the
-    # parent-process descriptor path.
-    for index, token in enumerate(tuple(command)):
-        if token != '-i' or index + 1 >= len(command):
-            continue
-        path = command[index + 1]
-        try:
-            is_concat = '-f' in command and command[command.index('-f') + 1] == 'concat'
-        except Exception:
-            is_concat = False
-        if not is_concat or not isinstance(path, (str, bytes, _v1608_os.PathLike)):
-            continue
-        try:
-            size = _v1608_os.path.getsize(path)
-            if size > 16 * 1024 * 1024 or not _v1608_memfd_available():
-                continue
-            payload = _v1608_pathlib.Path(path).read_bytes()
-            fd, mempath = _v1608_memfd('ffmpeg-concat', len(payload))
-            _v1608_os.lseek(fd, 0, _v1608_os.SEEK_SET)
-            _v1608_os.write(fd, payload)
-            _v1608_os.lseek(fd, 0, _v1608_os.SEEK_SET)
-            command[index + 1] = mempath
-            leases.append(fd)
-        except Exception:
-            continue
-    if leases:
-        _v1608_log_once('ffmpeg-memfd', 'enabled memfd-backed FFmpeg manifests/filtergraph handoff')
-    return command, leases
-
-
-class _V1608SubprocessProxy:
-    def __init__(self, module):
-        self._module = module
-
-    def Popen(self, args, *pargs, **kwargs):
-        prepared, leases = _v1608_prepare_ffmpeg_args(args)
-        try:
-            process = self._module.Popen(prepared, *pargs, **kwargs)
-        except BaseException:
-            for fd in leases:
-                try:
-                    _v1608_os.close(fd)
-                except OSError:
-                    pass
-            raise
-        return _V1608PopenLease(process, leases) if leases else process
-
-    def run(self, args, *pargs, **kwargs):
-        prepared, leases = _v1608_prepare_ffmpeg_args(args)
-        try:
-            return self._module.run(prepared, *pargs, **kwargs)
-        finally:
-            for fd in leases:
-                try:
-                    _v1608_os.close(fd)
-                except OSError:
-                    pass
-
-    def check_call(self, args, *pargs, **kwargs):
-        prepared, leases = _v1608_prepare_ffmpeg_args(args)
-        try:
-            return self._module.check_call(prepared, *pargs, **kwargs)
-        finally:
-            for fd in leases:
-                try:
-                    _v1608_os.close(fd)
-                except OSError:
-                    pass
-
-    def check_output(self, args, *pargs, **kwargs):
-        prepared, leases = _v1608_prepare_ffmpeg_args(args)
-        try:
-            return self._module.check_output(prepared, *pargs, **kwargs)
-        finally:
-            for fd in leases:
-                try:
-                    _v1608_os.close(fd)
-                except OSError:
-                    pass
-
-    def __getattr__(self, name):
-        return getattr(self._module, name)
-
-
-def _v1608_ffmpeg_overlay_mkv(input_path, mask_path, output_path, *,
-                               ffmpeg='ffmpeg', codec='ffv1', extra_inputs=(),
-                               filter_complex=None, pixel_format=None,
-                               overwrite=True, extra_args=()):
-    """Run overlay/colorization in FFmpeg without Python RGB frame staging."""
-    command = [str(ffmpeg), '-nostdin']
-    if overwrite:
-        command.append('-y')
-    command += ['-i', _v1608_os.fspath(input_path), '-i', _v1608_os.fspath(mask_path)]
-    for item in extra_inputs:
-        command += ['-i', _v1608_os.fspath(item)]
-    graph = filter_complex or (
-        "[1:v]format=gray,geq=r='255':g='0':b='0':a='128*lum(X,Y)/255'[m];"
-        "[0:v][m]overlay=shortest=1:format=auto[v]"
-    )
-    command += ['-filter_complex', graph, '-map', '[v]', '-an', '-c:v', str(codec)]
-    if pixel_format:
-        command += ['-pix_fmt', str(pixel_format)]
-    command += list(extra_args)
-    command.append(_v1608_os.fspath(output_path))
-    return _V1608SubprocessProxy(_v1608_subprocess_stdlib).run(command, check=True)
-
-
-# -----------------------------------------------------------------------------
-# Runtime dispatch: hook report targets without binding to line numbers
-# -----------------------------------------------------------------------------
-
-
-def _v1608_supported_kwarg(signature, name):
-    return name in signature.parameters or any(
-        parameter.kind == _v1608_inspect.Parameter.VAR_KEYWORD
-        for parameter in signature.parameters.values()
-    )
-
-
-def _v1608_add_supported_options(fn, kwargs, options):
-    try:
-        signature = _v1608_inspect.signature(fn)
-    except Exception:
-        return kwargs
-    result = dict(kwargs)
-    for name, value in options.items():
-        if name not in result and _v1608_supported_kwarg(signature, name):
-            result[name] = value
-    return result
-
-
-def _v1608_try_fused_dispatch(fn, args, kwargs):
-    name = getattr(fn, '__name__', '').lower()
-    if not any(token in name for token in ('assemble', 'union', 'project')):
-        return False, None
-    try:
-        signature = _v1608_inspect.signature(fn)
-        bound = signature.bind_partial(*args, **kwargs)
-        values = dict(bound.arguments)
-    except Exception:
-        return False, None
-    def take(*names):
-        for key, value in values.items():
-            low = key.lower()
-            if any(name in low for name in names):
-                return value
-        return None
-    views = take('view_volume', 'completed_view', 'view_store')
-    layers = take('projected_layer', 'projection_layer')
-    shape = take('source_shape', 'original_shape', 'volume_shape', 'dst_shape')
-    if shape is None or (views is None and layers is None):
-        return False, None
-    try:
-        result = assemble_view_volumes_and_projected_layers_fused(
-            view_volumes=views, projected_layers=layers, source_shape=shape,
-            materialize=not bool(values.get('return_sparse') or values.get('sparse_output')),
-            output_sink=values.get('output_sink') or values.get('sink'),
-            device_ids=values.get('device_ids') or values.get('devices')
-        )
-        return True, result
-    except Exception:
-        return False, None
-
-
-def _v1608_crop_call(fn, args, kwargs):
-    import numpy as _np
-    signature = None
-    try:
-        signature = _v1608_inspect.signature(fn)
-        bound = signature.bind_partial(*args, **kwargs)
-    except Exception:
-        return fn(*args, **kwargs)
-    candidate = None
-    for key, value in bound.arguments.items():
-        if isinstance(value, _np.ndarray) and value.ndim == 2 and value.dtype.kind in 'bu':
-            candidate = (key, value)
-            break
-    if candidate is None:
-        return fn(*args, **kwargs)
-    key, array = candidate
-    bbox = _v1608_bbox_2d(array)
-    if bbox is None:
-        return array.copy()
-    r0, r1, c0, c1 = bbox
-    crop = _np.pad(array[r0:r1, c0:c1], 1, mode='constant', constant_values=0)
-    bound.arguments[key] = crop
-    result = fn(*bound.args, **bound.kwargs)
-    if isinstance(result, _np.ndarray) and result.shape == crop.shape:
-        out = array.copy()
-        out[r0:r1, c0:c1] = result[1:-1, 1:-1]
-        return out
-    return result
-
-
-def _v1608_wrap_target(fn, items):
-    if getattr(fn, '__v1608_items__', None):
-        prior = tuple(getattr(fn, '__v1608_items__'))
-        fn.__v1608_items__ = tuple(dict.fromkeys(prior + tuple(items)))
-        return fn
-    original = fn
-    item_set = frozenset(items)
-
-    @_v1608_functools.wraps(original)
-    def wrapper(*args, **kwargs):
-        if not _V1608_ENABLED:
-            return original(*args, **kwargs)
-        if 'A1' in item_set:
-            used, result = _v1608_try_fused_dispatch(original, args, kwargs)
-            if used:
-                return result
-            kwargs = _v1608_add_supported_options(original, kwargs, {
-                'stream_retire': True,
-                'dense_union': False,
-                'sparse_output': True,
-                'fused_assembly': True,
-                'retirement_store_factory': _V1608SparseCVolStore,
-            })
-        if 'A2' in item_set:
-            kwargs = _v1608_add_supported_options(original, kwargs, {
-                'sink_only': True,
-                'materialize_base': False,
-                'direct_project': True,
-                'project_chunk': _v1608_project_chunk_to_source,
-                'resident_gpu': True,
-            })
-        if 'A3' in item_set:
-            low = getattr(original, '__name__', '').lower()
-            if 'hole' in low or 'fill' in low:
-                return _v1608_crop_call(original, args, kwargs)
-            kwargs = _v1608_add_supported_options(original, kwargs, {
-                'bounded_hole_fill': _v1608_binary_fill_holes,
-                'hole_fill_workers': _v1608_env_int('YOLO_TTA_HOLE_FILL_WORKERS', 4, 1, 32),
-            })
-        if 'I1' in item_set or 'I2' in item_set:
-            kwargs = _v1608_add_supported_options(original, kwargs, {
-                'ram_first': True,
-                'use_memfd': True,
-                'scratch_dir': _v1608_ram_directory(),
-                'temp_dir': _v1608_ram_directory() or _v1608_cli_temp_dir(),
-            })
-        if 'J1' in item_set:
-            kwargs = _v1608_add_supported_options(original, kwargs, {
-                'output_executor': _V1608_OUTPUTS,
-                'async_nrrd': True,
-            })
-        if 'J2' in item_set:
-            kwargs = _v1608_add_supported_options(original, kwargs, {
-                'ffmpeg_overlay': _v1608_ffmpeg_overlay_mkv,
-                'stream_concat': True,
-                'memfd_manifest': True,
-            })
-        return original(*args, **kwargs)
-
-    wrapper.__v1608_items__ = tuple(sorted(item_set))
-    wrapper.__v1608_original__ = original
-    return wrapper
-
-
-def _v1608_resolve_symbol(namespace, dotted):
-    parts = dotted.split('.')
-    obj = namespace.get(parts[0])
-    if obj is None:
-        return None, None, None
-    if len(parts) == 1:
-        return namespace, parts[0], obj
-    parent = obj
-    for part in parts[1:-1]:
-        parent = getattr(parent, part, None)
-        if parent is None:
-            return None, None, None
-    return parent, parts[-1], getattr(parent, parts[-1], None)
-
-
-def _v1608_install_alias_proxies(namespace):
-    for key, value in tuple(namespace.items()):
-        if key.startswith(('_v1608_', '_V1608')) or getattr(value, '__v1608_native__', False):
-            continue
-        module_name = getattr(value, '__name__', '')
-        if value is _v1608_tempfile_stdlib or module_name == 'tempfile':
-            namespace[key] = _V1608TempfileProxy(value)
-        elif value is _v1608_subprocess_stdlib or module_name == 'subprocess':
-            namespace[key] = _V1608SubprocessProxy(value)
-        elif module_name in ('nrrd', 'pynrrd') and hasattr(value, 'write'):
-            namespace[key] = _V1608NRRDProxy(value)
-        elif module_name in ('scipy.ndimage', 'scipy.ndimage._morphology') and hasattr(value, 'binary_fill_holes'):
-            namespace[key] = _V1608NDImageProxy(value)
-        elif callable(value) and module_name.startswith('scipy.ndimage') and getattr(value, '__name__', '') == 'binary_fill_holes':
-            namespace[key] = _v1608_functools.partial(_v1608_binary_fill_holes, _original=value)
-        elif callable(value) and module_name.startswith(('nrrd', 'pynrrd')) and getattr(value, '__name__', '') == 'write':
-            namespace[key] = _v1608_functools.partial(_v1608_nrrd_write, value)
-        elif callable(value) and module_name == 'tempfile':
-            replacement = {
-                'NamedTemporaryFile': _v1608_named_temporary_file,
-                'TemporaryFile': _v1608_temporary_file,
-                'mkstemp': _v1608_mkstemp,
-                'mkdtemp': _v1608_mkdtemp,
-            }.get(getattr(value, '__name__', ''))
-            if replacement is not None:
-                namespace[key] = replacement
-
-
-def _v1608_install_target_wrappers(namespace):
-    assignments = {}
-    for item, names in _V1608_TARGETS.items():
-        if item.startswith(('_v1608_', '_V1608')) or getattr(names, '__v1608_native__', False):
-            continue
-        for dotted in names:
-            assignments.setdefault(dotted, []).append(item)
-    # Semantic fallback: wrap matching global functions even when the report used
-    # a prose target rather than a backticked symbol.
-    for key, value in tuple(namespace.items()):
-        if not callable(value):
-            continue
-        low = key.lower()
-        inferred = []
-        if any(t in low for t in ('assemble_view', 'final_union', 'completed_view_union')):
-            inferred.append('A1')
-        if 'tilt' in low and 'radial' in low and any(t in low for t in ('project', 'reconstruct', 'assemble')):
-            inferred.append('A2')
-        if 'hole' in low and 'fill' in low:
-            inferred.append('A3')
-        if any(t in low for t in ('nrrd',)) and any(t in low for t in ('write', 'save', 'output')):
-            inferred.append('J1')
-        if any(t in low for t in ('mkv', 'ffmpeg', 'low_quality')) and any(t in low for t in ('write', 'save', 'encode', 'output')):
-            inferred.append('J2')
-        if inferred:
-            assignments.setdefault(key, []).extend(inferred)
-    for dotted, items in assignments.items():
-        parent, attr, value = _v1608_resolve_symbol(namespace, dotted)
-        if parent is None or value is None or not callable(value):
-            continue
-        wrapped = _v1608_wrap_target(value, tuple(dict.fromkeys(items)))
-        try:
-            if isinstance(parent, dict):
-                parent[attr] = wrapped
-            else:
-                setattr(parent, attr, wrapped)
-        except Exception:
-            continue
-
-
-def _v1608_shutdown():
-    first_error = None
-    for action in (_V1608_OUTPUTS.shutdown, _V1608_RETIRE_POOL.shutdown):
-        try:
-            action()
-        except BaseException as exc:
-            if first_error is None:
-                first_error = exc
-    if first_error is not None:
-        try:
-            print(f'[v16.0.8] asynchronous output/retirement failure: {first_error!r}', flush=True)
-        except Exception:
-            pass
-
-
-def _v1608_install_optimizations(namespace):
-    if not _V1608_ENABLED:
-        return
-    _v1608_install_ultralytics_predict_cache()
-    _v1608_install_alias_proxies(namespace)
-    _v1608_install_target_wrappers(namespace)
-    _v1608_log_once(
-        'startup',
-        'A1/A2/A3/C1/C2/I1/I2/J1/J2 active: sparse retirement, persistent inference, RAM-first scratch, parallel output'
-    )
-
-
-_v1608_atexit.register(_v1608_shutdown)
-_v1608_install_optimizations(globals())
-# =============================================================================
-# End v16.0.8 fast paths
-# =============================================================================
+# v16.0.9 production optimizations are integrated at their owning call sites.
+# The heuristic global monkeypatch framework used by v16.0.8 was removed because it
+# could replace unrelated functions by name and shadow the real fused-union implementation.
 
 
 if __name__ == "__main__":
