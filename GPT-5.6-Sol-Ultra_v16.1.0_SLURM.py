@@ -10,6 +10,7 @@ Current runtime behavior:
  - uses Ultralytics' unified quantize setting for inference precision
  - writes optional Slicer segmentation NRRDs as independent source-geometry component layers
  - uses the self-contained EDT medial-ridge centerline backend when explicitly enabled
+ - uses direct pure hardware-linear radial reconstruction with one composed 3D texture fetch per output pixel
 
 Dependencies:
  pip install opencv-python numpy scipy tifffile tqdm ultralytics
@@ -56,6 +57,16 @@ import numpy as np
 
 GIB = 1024 ** 3
 NRRD_SPACE = "left-posterior-superior"
+SCRIPT_VARIANT_PREFIX = 'ultra'
+SCRIPT_VERSION = '16.1.0'
+SCRIPT_VERSION_COMPACT = '1610'
+SCRIPT_BASENAME = f'GPT-5.6-Sol-Ultra_v{SCRIPT_VERSION}_SLURM.py'
+OUTPUT_NRRD_PREFIX = ''
+
+def variant_nrrd_stem(stem: object) -> str:
+    """Return the unprefixed input stem used by every NRRD and manifest output."""
+    return str(stem)
+RADIAL_TEXTURE_VARIANT_LABEL = 'pure hardware-linear texture'
 
 # third-party ---
 try:
@@ -782,7 +793,10 @@ class RuntimeTelemetry:
             self.path = Path(requested)
         else:
             base = os.environ.get('SLURM_JOB_ID') or str(os.getpid())
-            self.path = Path(tempfile.gettempdir()) / f'gpt56-sol-pro-v1609-telemetry-{base}-{os.getpid()}.jsonl'
+            self.path = Path(tempfile.gettempdir()) / (
+                f'{SCRIPT_VARIANT_PREFIX.lower()}-gpt56-sol-ultra-v{SCRIPT_VERSION_COMPACT}-'
+                f'telemetry-{base}-{os.getpid()}.jsonl'
+            )
 
     @contextlib.contextmanager
     def span(self, name: str, **fields: object) -> Iterator[None]:
@@ -852,7 +866,10 @@ class RuntimeTelemetry:
                     'mean_ms': (seconds * 1000.0 / calls) if calls else 0.0,
                 }
             payload: Dict[str, object] = {
-                'schema': 'gpt-5.6-sol-pro-v16.0.11.telemetry.v1',
+                'schema': (
+                    f'{SCRIPT_VARIANT_PREFIX.lower()}-gpt-5.6-sol-ultra-'
+                    f'v{SCRIPT_VERSION}.telemetry.v1'
+                ),
                 'pid': os.getpid(),
                 'monotonic_seconds': (now_ns - self.started_ns) / 1e9,
                 'wall_time': time.time(),
@@ -1649,6 +1666,16 @@ def gpu_worker_direct_union_enabled() -> bool:
     )
 
 
+def gpu_sparse_bbox_retirement_enabled() -> bool:
+    """Retire direct-union task slices through a bounded device/pinned bbox ring."""
+    return _env_flag('YOLO_TTA_GPU_SPARSE_BBOX_RETIREMENT', True)
+
+
+def gpu_sparse_retirement_ring_frames() -> int:
+    """Frames retained per worker while bbox D2H overlaps render/inference."""
+    return max(8, min(32, _env_int('YOLO_TTA_GPU_SPARSE_RETIREMENT_RING_FRAMES', 16)))
+
+
 # Process-per-GPU scheduling helpers. New YOLO_TTA_GPU_WORKER_* settings take precedence;
 # YOLO_TTA_MGPU_* remains accepted as a compatibility alias for existing launch scripts.
 def gpu_worker_fullframe_task_ranges(
@@ -1834,7 +1861,7 @@ def array_nbytes(shape: Sequence[int], dtype: np.dtype | str | type) -> int:
 # Large arrays that must be reopened by CUDA worker processes cannot be plain
 # anonymous NumPy allocations. The previous implementation treated every such array as a
 # pathname memmap under --temp, creating roughly one terabyte of dense tmpfs files for the
-# prioritized 30-view command. v16.0.11 uses parent-owned memfds and transfers duplicated
+# prioritized 30-view command. Parent-owned memfds transfer duplicated
 # descriptors through multiprocessing, so workers reopen /proc/self/fd/<fd> rather than
 # relying on cross-process /proc permissions. The owner remains live until sparse retirement;
 # closing the final mapping and descriptor drops the pages without filesystem writeback.
@@ -5214,13 +5241,16 @@ def radial_fused_render_supported(view: ViewInfo) -> bool:
     )
 
 
+def sink_only_projection_supported(view: ViewInfo) -> bool:
+    """Return whether a view can emit complete orthogonal t-bands without a dense copy."""
+    if is_radial_view(view) or is_tilted_view(view):
+        return True
+    return bool(str(view.family) == 'orthogonal' and str(view.name) in CARTESIAN_VIEW_TOKENS)
+
+
 def radial_sink_only_projection_supported(view: ViewInfo) -> bool:
-    """Sink-only backprojection supports every upright Cartesian Radial orientation."""
-    return bool(
-        is_radial_view(view)
-        and not is_tilted_radial_view(view)
-        and radial_base_view_name(view) in CARTESIAN_VIEW_TOKENS
-    )
+    """Compatibility alias for callers predating generalized sink-only projection."""
+    return sink_only_projection_supported(view)
 
 
 def tilted_stack_axis_length(view: ViewInfo) -> int:
@@ -5282,7 +5312,7 @@ def view_output_token(view: ViewInfo) -> str:
                 f'RadialTilted{base}_{direction}_'
                 f'{_format_signed_angle_token(float(view.tilt_angle_deg))}'
             )
-        return 'Radial' if base == 'Transverse' else f'Radial{base}'
+        return 'Transverse_Radial' if base == 'Transverse' else f'Radial{base}'
     return pretty_view_name(view).replace(' ', '_')
 
 
@@ -5377,8 +5407,8 @@ def _build_radial_view_info(
     azimuths = tuple(build_radial_azimuths(float(azimuth_angle)))
 
     if tilted_source is None:
-        name = 'radial' if str(base_view) == 'transverse' else f'radial_{base_view}'
-        display_name = 'Radial' if str(base_view) == 'transverse' else f'Radial {str(spec["display_name"])}'
+        name = f'radial_{base_view}'
+        display_name = 'Transverse Radial' if str(base_view) == 'transverse' else f'Radial {str(spec["display_name"])}'
         tilt_angle = 0.0
         tilt_direction = ''
         source_name = ''
@@ -5552,39 +5582,38 @@ class RadialSampler:
 
 _RADIAL_SAMPLER_CACHE: Dict[Tuple[object, ...], RadialSampler] = {}
 
-RADIAL_LANCZOS_A = 3
+RADIAL_FILTER_MODE = 'hardware_linear'
+RADIAL_FILTER_LABEL = 'pure hardware-linear sampling'
+RADIAL_FILTER_TAP_COUNT = 2
 
 
-def _lanczos_kernel(x: np.ndarray, a: int = RADIAL_LANCZOS_A) -> np.ndarray:
-    x = np.asarray(x, dtype=np.float32)
-    out = np.sinc(x) * np.sinc(x / float(a))
-    out[np.abs(x) >= float(a)] = 0.0
-    return out.astype(np.float32, copy=False)
+def _radial_filter_offsets() -> np.ndarray:
+    """Integer support offsets around floor(sample) for the active radial filter."""
+    return np.asarray((0, 1), dtype=np.int32)
 
 
-def _lanczos_offsets(a: int = RADIAL_LANCZOS_A) -> np.ndarray:
-    """Integer support offsets for a Lanczos-a kernel around floor(sample)."""
-    a_i = max(1, int(a))
-    return np.arange(-(a_i - 1), a_i + 1, dtype=np.int32)
-
-
-def _lanczos_tap_count(a: int = RADIAL_LANCZOS_A) -> int:
-    return int(_lanczos_offsets(int(a)).size)
+def _radial_filter_kernel(x: np.ndarray) -> np.ndarray:
+    """Two-tap triangle kernel used by the CPU/streaming hardware-linear fallback."""
+    return np.maximum(
+        np.float32(0.0),
+        np.float32(1.0) - np.abs(np.asarray(x, dtype=np.float32)),
+    ).astype(np.float32, copy=False)
 
 
 def get_radial_sampler(view: ViewInfo, angle_deg: float) -> RadialSampler:
     if not is_radial_view(view):
         raise ValueError('Radial sampler requested for a non-radial view')
 
-    # the circle lives in the selected Cartesian/Tilted projected plane,
-    # not unconditionally in global XY. ``center_x/center_y`` and the Lanczos taps
-    # therefore use that base plane's (horizontal, vertical) coordinate system.
+    # The circle lives in the selected Cartesian/Tilted projected plane rather than
+    # unconditionally in global XY. The active reconstruction filter is therefore
+    # evaluated in that base plane's (horizontal, vertical) coordinate system.
     plane_h, plane_w = radial_plane_shape(view)
     n_u = int(view.src_w) if int(view.src_w) > 0 else int(view.diameter)
     key = (
-        radial_base_view_name(view), int(plane_h), int(plane_w), int(view.diameter), int(n_u),
-        round(float(view.center_x), 6), round(float(view.center_y), 6),
-        round(float(view.roi_radius), 6), round(float(angle_deg), 6),
+        RADIAL_FILTER_MODE, radial_base_view_name(view), int(plane_h), int(plane_w),
+        int(view.diameter), int(n_u), round(float(view.center_x), 6),
+        round(float(view.center_y), 6), round(float(view.roi_radius), 6),
+        round(float(angle_deg), 6),
     )
     cached = _RADIAL_SAMPLER_CACHE.get(key)
     if cached is not None:
@@ -5596,34 +5625,30 @@ def get_radial_sampler(view: ViewInfo, angle_deg: float) -> RadialSampler:
     xs = np.asarray(float(view.center_x) + coords * math.cos(theta), dtype=np.float32)
     ys = np.asarray(float(view.center_y) + coords * math.sin(theta), dtype=np.float32)
 
-    offsets = _lanczos_offsets(RADIAL_LANCZOS_A)
+    offsets = _radial_filter_offsets()
     x0 = np.floor(xs).astype(np.int32, copy=False)
     y0 = np.floor(ys).astype(np.int32, copy=False)
-
     x_idx_raw = x0[:, None] + offsets[None, :]
     y_idx_raw = y0[:, None] + offsets[None, :]
+    x_w = _radial_filter_kernel(xs[:, None] - x_idx_raw)
+    y_w = _radial_filter_kernel(ys[:, None] - y_idx_raw)
 
-    x_w = _lanczos_kernel(xs[:, None] - x_idx_raw, a=RADIAL_LANCZOS_A)
-    y_w = _lanczos_kernel(ys[:, None] - y_idx_raw, a=RADIAL_LANCZOS_A)
-
+    # Preserve the established boundary contract: invalid taps are removed and the
+    # remaining one-dimensional weights are renormalized independently on each axis.
     x_valid = (x_idx_raw >= 0) & (x_idx_raw < int(plane_w))
     y_valid = (y_idx_raw >= 0) & (y_idx_raw < int(plane_h))
     x_w *= x_valid.astype(np.float32, copy=False)
     y_w *= y_valid.astype(np.float32, copy=False)
-
     x_w_sum = np.sum(x_w, axis=1, keepdims=True)
-    np.divide(x_w, x_w_sum, out=x_w, where=np.abs(x_w_sum) > 1e-6)
     y_w_sum = np.sum(y_w, axis=1, keepdims=True)
+    np.divide(x_w, x_w_sum, out=x_w, where=np.abs(x_w_sum) > 1e-6)
     np.divide(y_w, y_w_sum, out=y_w, where=np.abs(y_w_sum) > 1e-6)
 
     x_idx = np.clip(x_idx_raw, 0, int(plane_w) - 1).astype(np.int32, copy=False)
     y_idx = np.clip(y_idx_raw, 0, int(plane_h) - 1).astype(np.int32, copy=False)
-
     sampler = RadialSampler(
-        angle_deg=float(angle_deg),
-        diameter=diameter,
-        x_idx=x_idx,
-        y_idx=y_idx,
+        angle_deg=float(angle_deg), diameter=diameter,
+        x_idx=x_idx, y_idx=y_idx,
         x_w=x_w.astype(np.float32, copy=False),
         y_w=y_w.astype(np.float32, copy=False),
         nn_x=np.clip(np.rint(xs).astype(np.int32, copy=False), 0, int(plane_w) - 1),
@@ -5640,14 +5665,16 @@ def choose_radial_exact_block_frames(diameter: int, target_bytes: int = 256 * 10
             return max(1, int(env))
         except Exception:
             pass
-
-    bytes_per_frame = max(1, int(diameter) * _lanczos_tap_count(RADIAL_LANCZOS_A) * np.dtype(np.float32).itemsize)
+    bytes_per_frame = max(
+        1,
+        int(diameter) * int(RADIAL_FILTER_TAP_COUNT) * np.dtype(np.float32).itemsize,
+    )
     block = max(1, int(target_bytes // bytes_per_frame))
     return max(1, min(256, block))
 
 
 def _radial_sampler_flat_taps(sampler: RadialSampler, image_w: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Return flattened Lanczos tap indices and combined separable weights for one Radial line."""
+    """Return flattened active-filter tap indices and separable weights for one radial line."""
     u_len = int(sampler.diameter)
     flat_idx = (
         sampler.y_idx.astype(np.int64)[:, :, None] * int(image_w)
@@ -5699,7 +5726,7 @@ def extract_radial_slice_frame(
     for start_idx in range(0, stack_dim, block_frames):
         stop_idx = min(stack_dim, start_idx + block_frames)
         # Sagittal/Coronal orientation views are strided. Materialize only this bounded
-        # stack block contiguously so the 36-tap gather remains vectorized.
+        # stack block contiguously so the active-filter gather remains vectorized.
         block2d = np.ascontiguousarray(volume_rgb[start_idx:stop_idx]).reshape(
             stop_idx - start_idx, plane_len,
         )
@@ -5741,7 +5768,7 @@ def extract_tilted_radial_slice_frame(
 
  The output is circular in the Tilted projected plane. For every diameter tap, the
  same signed stacking-axis shear used by the underlying Tilted view is applied before
- a two-tap stack interpolation. The 36 Lanczos-3 in-plane taps are accumulated without
+ a two-tap stack interpolation. The active in-plane reconstruction taps are accumulated without
  materializing thousands of full Tilted frames."""
     if not is_tilted_radial_view(view):
         raise ValueError('Tilted Radial renderer requires a tilted Radial view')
@@ -10300,18 +10327,47 @@ def _release_pinned_u8_buffer(buf: object) -> None:
 
 
 class _DeviceUnionAccumulator:
-    """Accumulate one task's native mask and confidence slices on the GPU.
-    
-    Written slices flush through bounded pinned chunks; any host fallback disables device-only hole-fill assumptions."""
+    """Accumulate task masks densely or retire direct-union slices through a sparse ring."""
 
-    def __init__(self, torch_mod: object, device: object, num_frames: int, native_h: int, native_w: int, want_conf: bool) -> None:
+    def __init__(
+        self,
+        torch_mod: object,
+        device: object,
+        num_frames: int,
+        native_h: int,
+        native_w: int,
+        want_conf: bool,
+        *,
+        sparse_retirement: bool = False,
+        sparse_hole_fill: bool = False,
+        host_union: Optional[np.ndarray] = None,
+        host_conf: Optional[np.ndarray] = None,
+    ) -> None:
         self.torch = torch_mod
         self.device = device
-        self.union_dev = torch_mod.zeros(
-            (int(num_frames), int(native_h), int(native_w)), dtype=torch_mod.uint8, device=device,
+        self.num_frames = int(num_frames)
+        self.native_h = int(native_h)
+        self.native_w = int(native_w)
+        self.sparse_retirement = bool(
+            sparse_retirement and host_union is not None
+            and tuple(int(v) for v in np.asarray(host_union).shape)
+            == (int(num_frames), int(native_h), int(native_w))
+        )
+        self.sparse_hole_fill = bool(sparse_hole_fill and self.sparse_retirement)
+        self.ring_frames = (
+            min(int(num_frames), int(gpu_sparse_retirement_ring_frames()))
+            if self.sparse_retirement else int(num_frames)
+        )
+        allocation = torch_mod.empty if self.sparse_retirement else torch_mod.zeros
+        self.union_dev = allocation(
+            (int(self.ring_frames), int(native_h), int(native_w)),
+            dtype=torch_mod.uint8, device=device,
         )
         self.conf_dev = (
-            torch_mod.zeros((int(num_frames), int(native_h), int(native_w)), dtype=torch_mod.uint8, device=device)
+            allocation(
+                (int(self.ring_frames), int(native_h), int(native_w)),
+                dtype=torch_mod.uint8, device=device,
+            )
             if bool(want_conf) else None
         )
         # device-compacted generic payloads write one scalar per slice. Static/legacy
@@ -10324,6 +10380,323 @@ class _DeviceUnionAccumulator:
         # union (CPU fallback / cupy-cleanup frames) and wrote the host window directly.
         self.written = np.zeros((int(num_frames),), dtype=bool)
         self.host_written = False
+        self._host_union = np.asarray(host_union) if self.sparse_retirement else None
+        self._host_conf = (
+            np.asarray(host_conf) if self.sparse_retirement and host_conf is not None else None
+        )
+        self._sparse_slice_any = np.zeros((int(num_frames),), dtype=bool)
+        self._sparse_slice_bboxes = np.zeros((int(num_frames), 4), dtype=np.int64)
+        self._sparse_slice_row_any = np.zeros(
+            (int(num_frames), int((int(native_h) + 7) // 8)), dtype=np.uint8,
+        )
+        self._sparse_condition = threading.Condition()
+        self._sparse_slot_free = [True] * int(self.ring_frames)
+        self._sparse_queue: 'queue.Queue[Optional[Tuple[int, int, object]]]' = queue.Queue()
+        self._sparse_error: Optional[BaseException] = None
+        self._sparse_finished = False
+        self._sparse_hole_filled_frames = 0
+        self._sparse_mask_d2h_bytes = 0
+        self._sparse_conf_d2h_bytes = 0
+        self._sparse_logical_bytes = int(num_frames) * int(native_h) * int(native_w) * (
+            2 if bool(want_conf) else 1
+        )
+        self._sparse_thread: Optional[threading.Thread] = None
+        if self.sparse_retirement:
+            self._sparse_thread = threading.Thread(
+                target=self._sparse_retirement_main,
+                name='gpu-sparse-bbox-retirement', daemon=True,
+            )
+            self._sparse_thread.start()
+
+    def _raise_sparse_error(self) -> None:
+        if self._sparse_error is not None:
+            raise RuntimeError('sparse bbox retirement failed') from self._sparse_error
+
+    def _acquire_sparse_slot(self) -> int:
+        with self._sparse_condition:
+            while True:
+                self._raise_sparse_error()
+                for slot_idx, is_free in enumerate(self._sparse_slot_free):
+                    if bool(is_free):
+                        self._sparse_slot_free[int(slot_idx)] = False
+                        return int(slot_idx)
+                self._sparse_condition.wait(timeout=0.05)
+
+    def _release_sparse_slot(self, slot_idx: int) -> None:
+        with self._sparse_condition:
+            self._sparse_slot_free[int(slot_idx)] = True
+            self._sparse_condition.notify_all()
+
+    def _enqueue_sparse_frame(
+        self,
+        idx: int,
+        union_u8_t: object,
+        conf_u8_t: Optional[object],
+        prediction_count_dev: Optional[object],
+        *,
+        producer_stream: Optional[object] = None,
+    ) -> None:
+        """Copy one completed native plane into the bounded retirement ring."""
+        if not self.sparse_retirement:
+            raise RuntimeError('sparse frame enqueue requested for a dense accumulator')
+        slot_idx = self._acquire_sparse_slot()
+        torch = self.torch
+        stream = producer_stream or torch.cuda.current_stream(self.device)
+        try:
+            with torch.cuda.stream(stream):
+                self.union_dev[int(slot_idx)].copy_(
+                    union_u8_t.to(torch.uint8), non_blocking=True,
+                )
+                if self.conf_dev is not None:
+                    if conf_u8_t is None:
+                        self.conf_dev[int(slot_idx)].zero_()
+                    else:
+                        self.conf_dev[int(slot_idx)].copy_(conf_u8_t, non_blocking=True)
+                if prediction_count_dev is not None:
+                    self.prediction_counts_dev[int(idx)].copy_(
+                        prediction_count_dev.reshape(-1)[0], non_blocking=True,
+                    )
+                ready = torch.cuda.Event(enable_timing=False, blocking=False)
+                ready.record(stream)
+            self.written[int(idx)] = True
+            self._sparse_queue.put((int(slot_idx), int(idx), ready))
+        except BaseException:
+            self._release_sparse_slot(int(slot_idx))
+            raise
+
+    def enqueue_native_frame(
+        self,
+        idx: int,
+        union_u8_t: object,
+        conf_u8_t: Optional[object],
+        prediction_count_dev: Optional[object],
+        *,
+        producer_stream: object,
+    ) -> None:
+        """Resident-ring handoff that avoids a task-sized device destination."""
+        if self.sparse_retirement:
+            self._enqueue_sparse_frame(
+                int(idx), union_u8_t, conf_u8_t, prediction_count_dev,
+                producer_stream=producer_stream,
+            )
+            return
+        self.union_dev[int(idx)].copy_(union_u8_t, non_blocking=True)
+        if self.conf_dev is not None and conf_u8_t is not None:
+            self.conf_dev[int(idx)].copy_(conf_u8_t, non_blocking=True)
+        if prediction_count_dev is not None:
+            self.prediction_counts_dev[int(idx)].copy_(
+                prediction_count_dev.reshape(-1)[0], non_blocking=True,
+            )
+        self.written[int(idx)] = True
+
+    def _fill_sparse_batch_holes(self, batch_union: object, stream: object) -> bool:
+        if not self.sparse_hole_fill:
+            return False
+        cp_mod = _try_import_cupy_ndimage()
+        if cp_mod is None:
+            return False
+        cp, cpx_ndi = cp_mod
+        try:
+            dev_idx = int(getattr(self.device, 'index', 0) or 0)
+            external = _cupy_external_stream(cp, stream)
+            with cp.cuda.Device(dev_idx), external:
+                block = cp.asarray(batch_union)
+                background = block == 0
+                structure = cp.zeros((3, 3, 3), dtype=cp.bool_)
+                structure[1, 1, 1] = True
+                structure[1, 0, 1] = True
+                structure[1, 2, 1] = True
+                structure[1, 1, 0] = True
+                structure[1, 1, 2] = True
+                labels, count = cpx_ndi.label(background, structure=structure)
+                touches = cp.zeros((int(count) + 1,), dtype=cp.bool_)
+                touches[cp.unique(labels[:, 0, :])] = True
+                touches[cp.unique(labels[:, -1, :])] = True
+                touches[cp.unique(labels[:, :, 0])] = True
+                touches[cp.unique(labels[:, :, -1])] = True
+                block[background & ~touches[labels]] = cp.uint8(1)
+            return True
+        except Exception as exc:
+            self.sparse_hole_fill = False
+            runtime_telemetry().fallback('gpu.sparse_retirement_hole_fill', exc)
+            return False
+
+    def _retire_sparse_batch(self, items: Sequence[Tuple[int, int, object]]) -> None:
+        """Derive device bboxes, copy only crops, and commit disjoint host slices."""
+        if not items:
+            return
+        torch = self.torch
+        slot_ids = [int(item[0]) for item in items]
+        dest_ids = [int(item[1]) for item in items]
+        stream = torch.cuda.Stream(device=self.device)
+        with _CUDA_GRAPH_CAPTURE_LOCK:
+            with torch.cuda.stream(stream):
+                for _slot_idx, _dest_idx, ready in items:
+                    stream.wait_event(ready)
+                index = torch.as_tensor(slot_ids, dtype=torch.int64, device=self.device)
+                batch_union = self.union_dev.index_select(0, index)
+                batch_conf = (
+                    self.conf_dev.index_select(0, index) if self.conf_dev is not None else None
+                )
+            filled = self._fill_sparse_batch_holes(batch_union, stream)
+            with torch.cuda.stream(stream):
+                rows = batch_union.amax(dim=2) > 0
+                cols = batch_union.amax(dim=1) > 0
+                any_t = rows.any(dim=1)
+                rows_u8 = rows.to(torch.uint8)
+                cols_u8 = cols.to(torch.uint8)
+                y0_t = rows_u8.argmax(dim=1)
+                y1_t = int(self.native_h) - rows_u8.flip(1).argmax(dim=1)
+                x0_t = cols_u8.argmax(dim=1)
+                x1_t = int(self.native_w) - cols_u8.flip(1).argmax(dim=1)
+                bbox_t = torch.stack([y0_t, y1_t, x0_t, x1_t], dim=1).to(torch.int64)
+            stream.synchronize()
+
+            any_np = np.asarray(any_t.cpu().numpy(), dtype=bool)
+            bbox_np = np.asarray(bbox_t.cpu().numpy(), dtype=np.int64)
+            rows_np = np.asarray(rows.cpu().numpy(), dtype=bool)
+            bbox_np[~any_np] = 0
+            areas = [
+                max(0, int(box[1]) - int(box[0])) * max(0, int(box[3]) - int(box[2]))
+                if bool(nonempty) else 0
+                for nonempty, box in zip(any_np.tolist(), bbox_np.tolist())
+            ]
+            payload_bytes = int(sum(areas))
+
+            def _copy_payload(source: object, destination: np.ndarray) -> int:
+                if payload_bytes <= 0:
+                    return 0
+                pin = _acquire_pinned_u8_buffer(torch, int(payload_bytes))
+                offsets: List[int] = []
+                cursor = 0
+                try:
+                    with torch.cuda.stream(stream):
+                        for local_idx, (nonempty, box, area) in enumerate(
+                            zip(any_np.tolist(), bbox_np.tolist(), areas)
+                        ):
+                            offsets.append(int(cursor))
+                            if not bool(nonempty) or int(area) <= 0:
+                                continue
+                            y0, y1, x0, x1 = (int(v) for v in box)
+                            pin[int(cursor):int(cursor) + int(area)].view(
+                                int(y1 - y0), int(x1 - x0),
+                            ).copy_(
+                                source[int(local_idx), y0:y1, x0:x1], non_blocking=True,
+                            )
+                            cursor += int(area)
+                    stream.synchronize()
+                    host = pin[:int(payload_bytes)].numpy()
+                    for local_idx, (nonempty, box, area, offset) in enumerate(
+                        zip(any_np.tolist(), bbox_np.tolist(), areas, offsets)
+                    ):
+                        if not bool(nonempty) or int(area) <= 0:
+                            continue
+                        y0, y1, x0, x1 = (int(v) for v in box)
+                        np.copyto(
+                            destination[int(dest_ids[int(local_idx)]), y0:y1, x0:x1],
+                            host[int(offset):int(offset) + int(area)].reshape(
+                                int(y1 - y0), int(x1 - x0),
+                            ),
+                        )
+                finally:
+                    _release_pinned_u8_buffer(pin)
+                return int(payload_bytes)
+
+            if self._host_union is None:  # pragma: no cover - constructor invariant
+                raise RuntimeError('sparse retirement lost its host union destination')
+            self._sparse_mask_d2h_bytes += _copy_payload(batch_union, self._host_union)
+            if batch_conf is not None and self._host_conf is not None:
+                self._sparse_conf_d2h_bytes += _copy_payload(batch_conf, self._host_conf)
+
+            packed_rows = np.packbits(np.ascontiguousarray(rows_np), axis=1)
+            for local_idx, dest_idx in enumerate(dest_ids):
+                self._sparse_slice_any[int(dest_idx)] = bool(any_np[int(local_idx)])
+                self._sparse_slice_bboxes[int(dest_idx)] = bbox_np[int(local_idx)]
+                self._sparse_slice_row_any[int(dest_idx)] = packed_rows[int(local_idx)]
+            if bool(filled):
+                self._sparse_hole_filled_frames += int(len(items))
+
+    def _sparse_retirement_main(self) -> None:
+        active: List[Tuple[int, int, object]] = []
+        try:
+            stop = False
+            while not stop:
+                item = self._sparse_queue.get()
+                if item is None:
+                    self._sparse_queue.task_done()
+                    break
+                active = [item]
+                coalesce = max(
+                    0.0,
+                    _env_float('YOLO_TTA_GPU_SPARSE_RETIREMENT_COALESCE_MS', 0.25) / 1000.0,
+                )
+                deadline = time.monotonic() + float(coalesce)
+                while len(active) < int(self.ring_frames):
+                    remaining = max(0.0, float(deadline) - time.monotonic())
+                    if remaining <= 0.0:
+                        break
+                    try:
+                        next_item = self._sparse_queue.get(timeout=remaining)
+                    except queue.Empty:
+                        break
+                    if next_item is None:
+                        self._sparse_queue.task_done()
+                        stop = True
+                        break
+                    active.append(next_item)
+                self._retire_sparse_batch(active)
+                for slot_idx, _dest_idx, _ready in active:
+                    self._release_sparse_slot(int(slot_idx))
+                    self._sparse_queue.task_done()
+                active = []
+        except BaseException as exc:
+            self._sparse_error = exc
+            runtime_telemetry().fallback('gpu.sparse_bbox_retirement', exc)
+            for slot_idx, _dest_idx, _ready in active:
+                self._release_sparse_slot(int(slot_idx))
+                try:
+                    self._sparse_queue.task_done()
+                except Exception:
+                    pass
+            with self._sparse_condition:
+                self._sparse_slot_free = [True] * int(self.ring_frames)
+                self._sparse_condition.notify_all()
+
+    def _finish_sparse_retirement(self) -> Optional[Dict[str, np.ndarray]]:
+        if not self.sparse_retirement:
+            return None
+        if not self._sparse_finished:
+            self._sparse_queue.put(None)
+            if self._sparse_thread is not None:
+                self._sparse_thread.join()
+            self._sparse_finished = True
+        self._raise_sparse_error()
+        actual = int(self._sparse_mask_d2h_bytes + self._sparse_conf_d2h_bytes)
+        runtime_telemetry().add('gpu.sparse_retirement.logical_dense_bytes', self._sparse_logical_bytes)
+        runtime_telemetry().add('gpu.sparse_retirement.actual_d2h_bytes', actual)
+        runtime_telemetry().add(
+            'gpu.sparse_retirement.avoided_d2h_bytes',
+            max(0, int(self._sparse_logical_bytes) - int(actual)),
+        )
+        return {
+            'slice_any': np.ascontiguousarray(self._sparse_slice_any),
+            'slice_bboxes': np.ascontiguousarray(self._sparse_slice_bboxes),
+            'slice_row_any': np.ascontiguousarray(self._sparse_slice_row_any),
+            'slice_row_count': np.asarray([int(self.native_h)], dtype=np.int64),
+        }
+
+    def abort(self) -> None:
+        """Drain/release a sparse ring after a source failure without publishing metadata."""
+        if self.sparse_retirement and not self._sparse_finished:
+            try:
+                self._sparse_queue.put(None)
+                if self._sparse_thread is not None:
+                    self._sparse_thread.join()
+            finally:
+                self._sparse_finished = True
+        self.union_dev = None
+        self.conf_dev = None
+        self.prediction_counts_dev = None
 
     def mark_host_write(self) -> None:
         self.host_written = True
@@ -10337,6 +10710,11 @@ class _DeviceUnionAccumulator:
     ) -> None:
         # Runs on the calling thread's side stream (inside the frame processor's stream ctx);
         # slice indices are disjoint across threads, so no lock is needed.
+        if self.sparse_retirement:
+            self._enqueue_sparse_frame(
+                int(idx), union_bool_t, conf_u8_t, prediction_count_dev,
+            )
+            return
         self.union_dev[int(idx)] = union_bool_t.to(self.torch.uint8)
         if self.conf_dev is not None and conf_u8_t is not None:
             self.conf_dev[int(idx)] = conf_u8_t
@@ -10369,6 +10747,9 @@ class _DeviceUnionAccumulator:
         their final references before the CuPy pool is trimmed. Returns the filled frame
         count, or zero so the caller performs the CPU pass when the device path is unsafe.
         """
+        if self.sparse_retirement:
+            self._finish_sparse_retirement()
+            return int(self._sparse_hole_filled_frames)
         torch = self.torch
         if self.union_dev is None or bool(self.host_written):
             return 0
@@ -10436,6 +10817,8 @@ class _DeviceUnionAccumulator:
         Host-written fallback frames return ``None`` because their device rows are
         incomplete. Call after device hole filling and before the task flush.
         """
+        if self.sparse_retirement:
+            return self._finish_sparse_retirement()
         torch = self.torch
         if self.union_dev is None or bool(self.host_written):
             return None
@@ -10486,6 +10869,12 @@ class _DeviceUnionAccumulator:
         retire. Computing row/column occupancy from the pinned host chunk already crossing PCIe
         removes that handoff barrier and runs on the retirement lane behind the next inference.
         """
+        if self.sparse_retirement:
+            metadata = self._finish_sparse_retirement()
+            self.union_dev = None
+            self.conf_dev = None
+            self.prediction_counts_dev = None
+            return None if bool(self.host_written) or not bool(collect_slice_metadata) else metadata
         torch = self.torch
         if bool(synchronize_device):
             torch.cuda.synchronize(self.device)
@@ -10592,7 +10981,16 @@ class _DeviceUnionAccumulator:
 
 
 def _try_create_device_union_accumulator(
-    device_str: str, num_frames: int, native_h: int, native_w: int, *, want_conf: bool,
+    device_str: str,
+    num_frames: int,
+    native_h: int,
+    native_w: int,
+    *,
+    want_conf: bool,
+    sparse_retirement: bool = False,
+    sparse_hole_fill: bool = False,
+    host_union: Optional[np.ndarray] = None,
+    host_conf: Optional[np.ndarray] = None,
 ) -> Optional[_DeviceUnionAccumulator]:
     """Build the per-task device union when VRAM allows; None -> per-frame D2H."""
     if not gpu_device_union_enabled():
@@ -10602,11 +11000,27 @@ def _try_create_device_union_accumulator(
         if not str(device_str).startswith('cuda') or not bool(torch.cuda.is_available()):
             return None
         device = torch.device(str(device_str))
-        need = int(num_frames) * int(native_h) * int(native_w) * (2 if bool(want_conf) else 1)
+        retained_frames = (
+            min(int(num_frames), int(gpu_sparse_retirement_ring_frames()))
+            if bool(sparse_retirement) else int(num_frames)
+        )
+        # Sparse retirement keeps one bounded ring plus one selected batch used by bbox/hole
+        # processing. The dense fallback retains the complete task volume.
+        copies = 2 if bool(sparse_retirement) else 1
+        need = (
+            int(retained_frames) * int(native_h) * int(native_w)
+            * (2 if bool(want_conf) else 1) * int(copies)
+        )
         free_bytes, _total = torch.cuda.mem_get_info(device)
         if int(free_bytes) < int(need) + 2 * GIB:
             return None
-        return _DeviceUnionAccumulator(torch, device, int(num_frames), int(native_h), int(native_w), bool(want_conf))
+        return _DeviceUnionAccumulator(
+            torch, device, int(num_frames), int(native_h), int(native_w), bool(want_conf),
+            sparse_retirement=bool(sparse_retirement),
+            sparse_hole_fill=bool(sparse_hole_fill),
+            host_union=host_union,
+            host_conf=host_conf,
+        )
     except Exception:
         return None
 
@@ -10733,7 +11147,7 @@ def _process_gpu_flattened_prediction_frame(
                             # __cuda_array_interface__), then back to a boolean mask for the CC ops.
                             union_cp = cp.asarray(native_union_bool_t.to(torch.uint8).contiguous()) > 0
                             union_cp = _min_radius_filter_ndimage(cp, cpx_ndi, union_cp, float(payload.gpu_min_radius))
-                            native_union_np = np.ascontiguousarray(_v16011_retire_gpu_mask(union_cp).astype(np.uint8, copy=False) > 0)
+                            native_union_np = np.ascontiguousarray(cp.asnumpy(union_cp).astype(np.uint8, copy=False) > 0)
                         cleaned_on_gpu = True
                     except Exception:
                         native_union_np = None  # fall back to torch->cpu union, CPU cleanup downstream
@@ -11153,12 +11567,19 @@ def _resident_mask_kernels() -> Optional[object]:
         DECL_UNION(union_f16_f16, half, half)
 
         extern "C" __global__ void upsample_quantize(
-            const float* max_logit, const float* conf_proto,
+            const float* max_logit, const float* conf_proto, const int* count,
             int ph, int pw, int oh, int ow, unsigned char* out_union,
             unsigned char* out_conf) {
           int q = blockDim.x * blockIdx.x + threadIdx.x;
           int out_pixels = oh * ow;
           if (q >= out_pixels) return;
+          // An empty compacted detection set cannot produce foreground.  Clear the static
+          // destination in one coalesced pass and skip proto sampling/native warp math.
+          if (*count <= 0) {
+            out_union[q] = 0;
+            if (out_conf != nullptr) out_conf[q] = 0;
+            return;
+          }
           int oy = q / ow;
           int ox = q - oy * ow;
           float sy = ((float)oy + 0.5f) * ((float)ph / (float)oh) - 0.5f;
@@ -11186,7 +11607,7 @@ def _resident_mask_kernels() -> Optional[object]:
         }
 
         extern "C" __global__ void upsample_quantize_affine(
-            const float* max_logit, const float* conf_proto,
+            const float* max_logit, const float* conf_proto, const int* count,
             int ph, int pw, int ih, int iw, int oh, int ow,
             float m00, float m01, float m02,
             float m10, float m11, float m12,
@@ -11194,6 +11615,11 @@ def _resident_mask_kernels() -> Optional[object]:
           int q = blockDim.x * blockIdx.x + threadIdx.x;
           int out_pixels = oh * ow;
           if (q >= out_pixels) return;
+          if (*count <= 0) {
+            out_union[q] = 0;
+            if (out_conf != nullptr) out_conf[q] = 0;
+            return;
+          }
           int oy = q / ow;
           int ox = q - oy * ow;
 
@@ -11627,6 +12053,7 @@ def predict_source_and_accumulate(
     slice_locks: Optional[Sequence[threading.Lock]] = None,
     device_hole_fill: bool = False,
     defer_device_union_flush: bool = False,
+    sparse_bbox_retirement: bool = False,
     M_out_to_native_by_unit: Optional[Sequence[np.ndarray]] = None,
 ) -> Dict[str, object]:
     """Run YOLO predict(stream=True) on an in-memory source and accumulate native masks.
@@ -11667,6 +12094,8 @@ def predict_source_and_accumulate(
         if (source is not unwrapped_source and isinstance(source, GpuPrefetchingYoloSource))
         else None
     )
+    device_union: Optional[_DeviceUnionAccumulator] = None
+    accumulation_handed_off = False
     try:
         if isinstance(source, (
             InMemoryYoloVolumeSource, StreamingYoloVolumeSource, GpuPrefetchingYoloSource,
@@ -11695,7 +12124,7 @@ def predict_source_and_accumulate(
             if predictor_direct is not None:
                 results = _direct_predict_stream(predictor_direct, source, cfg, source_label)
         if results is None:
-            results = _v16011_predict(model, 
+            results = model.predict(
                 source=source,
                 task='segment',
                 imgsz=cfg.imgsz,
@@ -11729,7 +12158,6 @@ def predict_source_and_accumulate(
         # union. Ordinary and multi-angle tasks therefore retain their masks on device; only
         # positive per-slice radius cleanup, unsupported confidence cleanup, CPU retina masks,
         # or insufficient VRAM force the per-frame host path.
-        device_union: Optional[_DeviceUnionAccumulator] = None
         fastpath = single_angle_gpu_fastpath()
         preunion_min_conf = (
             float(stream_min_conf)
@@ -11748,11 +12176,22 @@ def predict_source_and_accumulate(
                 canonical_single_device(str(cfg.device)),
                 int(num_frames), int(native_h), int(native_w),
                 want_conf=view_confmap_mm is not None,
+                sparse_retirement=bool(
+                    sparse_bbox_retirement and gpu_sparse_bbox_retirement_enabled()
+                ),
+                sparse_hole_fill=bool(device_hole_fill and gpu_device_hole_fill_enabled()),
+                host_union=view_union_mm,
+                host_conf=view_confmap_mm,
             )
             if device_union is not None:
                 print(
                     f'Device union accumulation active for {source_label}: '
-                    f'{int(num_frames)}x{int(native_h)}x{int(native_w)} u8 on device.'
+                    + (
+                        f'sparse {int(device_union.ring_frames)}-frame bbox retirement ring '
+                        f'for {int(num_frames)}x{int(native_h)}x{int(native_w)}.'
+                        if bool(device_union.sparse_retirement) else
+                        f'{int(num_frames)}x{int(native_h)}x{int(native_w)} u8 on device.'
+                    )
                 )
 
         # A capable resident batch-1 TensorRT source runs render, inference, confidence
@@ -11903,7 +12342,7 @@ def predict_source_and_accumulate(
         # the union, instead of two whole-device synchronizations/reductions before return.
         device_hole_filled_frames = 0
         if device_union is not None and bool(device_hole_fill) and gpu_device_hole_fill_enabled():
-            device_hole_filled_frames = int(_v16011_gpu_hole_fill_dispatch(device_union.fill_holes_2d, ))
+            device_hole_filled_frames = int(device_union.fill_holes_2d())
 
         device_union_flush_future: Optional[Future] = None
         slice_meta: Optional[Dict[str, np.ndarray]] = None
@@ -11964,6 +12403,7 @@ def predict_source_and_accumulate(
                 flush_array(view_confmap_mm)
             flush_array(view_union_mm)
 
+        accumulation_handed_off = True
         return {
             'prediction_count': int(prediction_count),
             'frames_with_predictions': int(frames_with_predictions),
@@ -11973,6 +12413,11 @@ def predict_source_and_accumulate(
             '_device_union_flush_future': device_union_flush_future,
         }
     finally:
+        if not bool(accumulation_handed_off) and device_union is not None:
+            try:
+                device_union.abort()
+            except Exception:
+                pass
         if owned_staging_wrapper is not None:
             try:
                 owned_staging_wrapper.close()
@@ -12052,7 +12497,7 @@ def predict_source_and_submit_accumulation(
             if predictor_direct is not None:
                 results = _direct_predict_stream(predictor_direct, source, cfg, source_label)
         if results is None:
-            results = _v16011_predict(model, 
+            results = model.predict(
                 source=source,
                 task='segment',
                 imgsz=cfg.imgsz,
@@ -12824,8 +13269,13 @@ def fused_render_cuda_graphs_enabled() -> bool:
 
 
 def fused_radial_tap_cache_bytes() -> int:
-    """Maximum device bytes used by an all-azimuth separable Lanczos descriptor table."""
+    """Legacy compatibility setting; texture variants retain only a tiny angle table."""
     return int(max(0.0, _env_float('YOLO_TTA_FUSED_RADIAL_TAPS_GIB', 2.0)) * GIB)
+
+
+def radial_texture_source_copy_reserve_enabled() -> bool:
+    """Reserve a second source-volume allocation when admitting GPU residency."""
+    return _env_flag('YOLO_TTA_RADIAL_TEXTURE_SOURCE_COPY_RESERVE', True)
 
 
 _FUSED_DIRECT_RENDER_KERNELS: Optional[object] = None
@@ -12880,146 +13330,188 @@ def _fused_direct_render_kernels() -> Optional[object]:
       }
     }
 
-    extern "C" __global__ void precompute_radial_taps(
-        const float* angles_deg, int n_angles, int n_u,
-        int full_h, int full_w, float center_x, float center_y, float roi_radius,
-        int* x_idx, int* y_idx, float* x_w, float* y_w) {
-      int p = (int)(blockDim.x * blockIdx.x + threadIdx.x);
-      int total = n_angles * n_u;
-      if (p >= total) return;
-      int aidx = p / n_u;
-      int u = p - aidx * n_u;
-      float coord = n_u > 1
-          ? -roi_radius + (2.0f * roi_radius) * ((float)u / (float)(n_u - 1))
+    __device__ __forceinline__ float logical_to_native_coord(
+        float logical_coord, int native_t, int logical_t) {
+      float mapped = native_t == logical_t
+          ? logical_coord
+          : ((logical_coord + 0.5f) * ((float)native_t / (float)logical_t)) - 0.5f;
+      return clamp_f(mapped, 0.0f, (float)(native_t - 1));
+    }
+
+    __device__ __forceinline__ float radial_row_to_stack(
+        float row, int rows, int stack_len) {
+      if (rows == stack_len) return row;
+      return clamp_f(
+          ((row + 0.5f) * ((float)stack_len / (float)rows)) - 0.5f,
+          0.0f, (float)(stack_len - 1));
+    }
+
+    __device__ __forceinline__ int radial_plane_width(
+        int base_id, int full_h, int full_w) {
+      return base_id == 2 ? full_h : full_w;
+    }
+
+    __device__ __forceinline__ int radial_plane_height(
+        int base_id, int full_h, int logical_t) {
+      return base_id == 0 ? full_h : logical_t;
+    }
+
+    __device__ __forceinline__ float radial_source_texture(
+        cudaTextureObject_t volume_tex,
+        int native_t, int full_h, int full_w, int logical_t,
+        int base_id, float plane_x, float plane_y, float stack) {
+      float source_x, source_y, source_t;
+      if (base_id == 0) {
+        source_x = plane_x;
+        source_y = plane_y;
+        source_t = logical_to_native_coord(stack, native_t, logical_t);
+      } else if (base_id == 1) {
+        source_x = plane_x;
+        source_y = stack;
+        source_t = logical_to_native_coord(plane_y, native_t, logical_t);
+      } else {
+        source_x = stack;
+        source_y = plane_x;
+        source_t = logical_to_native_coord(plane_y, native_t, logical_t);
+      }
+      return tex3D<float>(
+          volume_tex, source_x + 0.5f, source_y + 0.5f, source_t + 0.5f);
+    }
+
+    __device__ __forceinline__ float radial_texture_sample(
+        cudaTextureObject_t volume_tex,
+        int native_t, int full_h, int full_w, int logical_t,
+        int rows, int n_u, int stack_len, int base_id, int direction_id,
+        float tan_tilt, float center_x, float center_y, float roi_radius,
+        int angle_idx, float radial_y, float radial_x,
+        const float* angle_cos, const float* angle_sin) {
+      if (radial_x < 0.0f || radial_x > (float)(n_u - 1)
+          || radial_y < 0.0f || radial_y > (float)(rows - 1)) return 0.0f;
+      float line = n_u > 1
+          ? -roi_radius + (2.0f * roi_radius) * (radial_x / (float)(n_u - 1))
           : -roi_radius;
-      float theta = angles_deg[aidx] * 0.01745329251994329577f;
-      float sx = center_x + coord * cosf(theta);
-      float sy = center_y + coord * sinf(theta);
-      int bx = floor_i(sx);
-      int by = floor_i(sy);
-      float wx[6], wy[6];
-      int ix[6], iy[6];
-      float sumx = 0.0f, sumy = 0.0f;
-      #pragma unroll
-      for (int k = 0; k < 6; ++k) {
-        int rx = bx + k - 2;
-        int ry = by + k - 2;
-        float dx = sx - (float)rx;
-        float dy = sy - (float)ry;
-        float vx = abs_f(dx) >= 3.0f ? 0.0f : sinc1(dx) * sinc1(dx / 3.0f);
-        float vy = abs_f(dy) >= 3.0f ? 0.0f : sinc1(dy) * sinc1(dy / 3.0f);
-        if (rx < 0 || rx >= full_w) vx = 0.0f;
-        if (ry < 0 || ry >= full_h) vy = 0.0f;
-        ix[k] = clamp_i(rx, 0, full_w - 1);
-        iy[k] = clamp_i(ry, 0, full_h - 1);
-        wx[k] = vx; wy[k] = vy;
-        sumx += vx; sumy += vy;
+      float px = center_x + line * angle_cos[angle_idx];
+      float py = center_y + line * angle_sin[angle_idx];
+      int plane_w = radial_plane_width(base_id, full_h, full_w);
+      int plane_h = radial_plane_height(base_id, full_h, logical_t);
+      if (px < 0.0f || px > (float)(plane_w - 1)
+          || py < 0.0f || py > (float)(plane_h - 1)) return 0.0f;
+      float stack = radial_row_to_stack(radial_y, rows, stack_len);
+      if (tan_tilt != 0.0f) {
+        float axis = direction_id == 0 ? py - center_y : px - center_x;
+        stack = __fadd_rn(stack, __fmul_rn(tan_tilt, axis));
       }
-      int off = p * 6;
-      #pragma unroll
-      for (int k = 0; k < 6; ++k) {
-        x_idx[off + k] = ix[k];
-        y_idx[off + k] = iy[k];
-        x_w[off + k] = abs_f(sumx) > 1.0e-6f ? wx[k] / sumx : wx[k];
-        y_w[off + k] = abs_f(sumy) > 1.0e-6f ? wy[k] / sumy : wy[k];
-      }
+      if (stack < 0.0f || stack > (float)(stack_len - 1)) return 0.0f;
+      return radial_source_texture(
+          volume_tex, native_t, full_h, full_w, logical_t,
+          base_id, px, py, stack);
     }
 
-    __device__ __forceinline__ float radial_native_value(
-        const unsigned char* volume, int native_t, int full_h, int full_w,
-        int rows, int n_u, int angle_idx, int row, int u,
-        const int* x_idx, const int* y_idx, const float* x_w, const float* y_w) {
-      float rf = ((float)row + 0.5f) * ((float)native_t / (float)rows) - 0.5f;
-      int raw0 = floor_i(rf);
-      int t0 = clamp_i(raw0, 0, native_t - 1);
-      int t1 = t0 + 1 < native_t ? t0 + 1 : native_t - 1;
-      float ta = clamp_f(rf - (float)t0, 0.0f, 1.0f);
-      int tap = (angle_idx * n_u + u) * 6;
-      long long plane_stride = (long long)full_h * (long long)full_w;
-      float v0 = 0.0f, v1 = 0.0f;
-      #pragma unroll
-      for (int ky = 0; ky < 6; ++ky) {
-        int yy = y_idx[tap + ky];
-        float wy = y_w[tap + ky];
-        long long row_off = (long long)yy * (long long)full_w;
-        #pragma unroll
-        for (int kx = 0; kx < 6; ++kx) {
-          int xx = x_idx[tap + kx];
-          float w = wy * x_w[tap + kx];
-          long long spatial = row_off + (long long)xx;
-          v0 += w * (float)volume[(long long)t0 * plane_stride + spatial];
-          v1 += w * (float)volume[(long long)t1 * plane_stride + spatial];
-        }
-      }
-      return v0 + ta * (v1 - v0);
-    }
-
-    __device__ __forceinline__ float radial_bilinear_value(
-        const unsigned char* volume, int native_t, int full_h, int full_w,
-        int rows, int n_u, int angle_idx, float sy, float sx,
-        const int* x_idx, const int* y_idx, const float* x_w, const float* y_w) {
-      int x0 = floor_i(sx), y0 = floor_i(sy);
-      int x1 = x0 + 1, y1 = y0 + 1;
-      float fx = sx - (float)x0, fy = sy - (float)y0;
-      float v00 = (x0 >= 0 && x0 < n_u && y0 >= 0 && y0 < rows)
-          ? radial_native_value(volume, native_t, full_h, full_w, rows, n_u,
-                                angle_idx, y0, x0, x_idx, y_idx, x_w, y_w) : 0.0f;
-      if (fx == 0.0f && fy == 0.0f) return v00;
-      float v01 = (x1 >= 0 && x1 < n_u && y0 >= 0 && y0 < rows)
-          ? radial_native_value(volume, native_t, full_h, full_w, rows, n_u,
-                                angle_idx, y0, x1, x_idx, y_idx, x_w, y_w) : 0.0f;
-      float v10 = (x0 >= 0 && x0 < n_u && y1 >= 0 && y1 < rows)
-          ? radial_native_value(volume, native_t, full_h, full_w, rows, n_u,
-                                angle_idx, y1, x0, x_idx, y_idx, x_w, y_w) : 0.0f;
-      float v11 = (x1 >= 0 && x1 < n_u && y1 >= 0 && y1 < rows)
-          ? radial_native_value(volume, native_t, full_h, full_w, rows, n_u,
-                                angle_idx, y1, x1, x_idx, y_idx, x_w, y_w) : 0.0f;
-      float a = v00 + fx * (v01 - v00);
-      float b = v10 + fx * (v11 - v10);
-      return a + fy * (b - a);
-    }
-
-    __device__ __forceinline__ float radial_direct_value(
-        const unsigned char* volume, int native_t, int full_h, int full_w,
-        int rows, int n_u, const int* render_meta, int oh, int ow,
+    __device__ __forceinline__ float radial_texture_direct_value(
+        cudaTextureObject_t volume_tex,
+        int native_t, int full_h, int full_w, int logical_t,
+        int rows, int n_u, int stack_len, int base_id, int direction_id,
+        const int* render_meta, float tan_tilt,
+        float center_x, float center_y, float roi_radius,
+        int oh, int ow,
         float m00, float m01, float m02, float m10, float m11, float m12,
-        const int* x_idx, const int* y_idx, const float* x_w, const float* y_w,
-        int q) {
+        const float* angle_cos, const float* angle_sin, int q) {
       int angle_idx = render_meta[0];
-      int oy = q / ow, ox = q - oy * ow;
-      float sx = __fadd_rn(__fadd_rn(__fmul_rn(m00, (float)ox), __fmul_rn(m01, (float)oy)), m02);
-      float sy = __fadd_rn(__fadd_rn(__fmul_rn(m10, (float)ox), __fmul_rn(m11, (float)oy)), m12);
-      return radial_bilinear_value(volume, native_t, full_h, full_w, rows, n_u,
-          angle_idx, sy, sx, x_idx, y_idx, x_w, y_w);
+      int oy = q / ow;
+      int ox = q - oy * ow;
+      float radial_x = __fadd_rn(
+          __fadd_rn(__fmul_rn(m00, (float)ox), __fmul_rn(m01, (float)oy)), m02);
+      float radial_y = __fadd_rn(
+          __fadd_rn(__fmul_rn(m10, (float)ox), __fmul_rn(m11, (float)oy)), m12);
+      return radial_texture_sample(
+          volume_tex, native_t, full_h, full_w, logical_t,
+          rows, n_u, stack_len, base_id, direction_id,
+          tan_tilt, center_x, center_y, roi_radius,
+          angle_idx, radial_y, radial_x, angle_cos, angle_sin);
     }
 
-    extern "C" __global__ void radial_direct_f32(
-        const unsigned char* volume, int native_t, int full_h, int full_w,
-        int rows, int n_u, const int* render_meta, int oh, int ow,
+    extern "C" __global__ void radial_texture_direct_f32(
+        cudaTextureObject_t volume_tex,
+        int native_t, int full_h, int full_w, int logical_t,
+        int rows, int n_u, int stack_len, int base_id, int direction_id,
+        const int* render_meta, float tan_tilt,
+        float center_x, float center_y, float roi_radius,
+        int oh, int ow,
         float m00, float m01, float m02, float m10, float m11, float m12,
-        const int* x_idx, const int* y_idx, const float* x_w, const float* y_w,
-        float* out) {
+        const float* angle_cos, const float* angle_sin, float* out) {
       int q = (int)(blockDim.x * blockIdx.x + threadIdx.x);
       if (q >= oh * ow) return;
-      out[q] = norm_u8(radial_direct_value(volume, native_t, full_h, full_w, rows, n_u,
-          render_meta, oh, ow, m00, m01, m02, m10, m11, m12,
-          x_idx, y_idx, x_w, y_w, q));
+      out[q] = clamp_f(radial_texture_direct_value(
+          volume_tex, native_t, full_h, full_w, logical_t,
+          rows, n_u, stack_len, base_id, direction_id, render_meta, tan_tilt,
+          center_x, center_y, roi_radius, oh, ow,
+          m00, m01, m02, m10, m11, m12, angle_cos, angle_sin, q), 0.0f, 1.0f);
     }
 
-    extern "C" __global__ void radial_direct_f16(
-        const unsigned char* volume, int native_t, int full_h, int full_w,
-        int rows, int n_u, const int* render_meta, int oh, int ow,
+    extern "C" __global__ void radial_texture_direct_f16(
+        cudaTextureObject_t volume_tex,
+        int native_t, int full_h, int full_w, int logical_t,
+        int rows, int n_u, int stack_len, int base_id, int direction_id,
+        const int* render_meta, float tan_tilt,
+        float center_x, float center_y, float roi_radius,
+        int oh, int ow,
         float m00, float m01, float m02, float m10, float m11, float m12,
-        const int* x_idx, const int* y_idx, const float* x_w, const float* y_w,
-        __half* out) {
+        const float* angle_cos, const float* angle_sin, __half* out) {
       int q = (int)(blockDim.x * blockIdx.x + threadIdx.x);
       if (q >= oh * ow) return;
-      float value = norm_u8(radial_direct_value(volume, native_t, full_h, full_w, rows, n_u,
-          render_meta, oh, ow, m00, m01, m02, m10, m11, m12,
-          x_idx, y_idx, x_w, y_w, q));
+      float value = clamp_f(radial_texture_direct_value(
+          volume_tex, native_t, full_h, full_w, logical_t,
+          rows, n_u, stack_len, base_id, direction_id, render_meta, tan_tilt,
+          center_x, center_y, roi_radius, oh, ow,
+          m00, m01, m02, m10, m11, m12, angle_cos, angle_sin, q), 0.0f, 1.0f);
       out[q] = __float2half_rn(value);
     }
 
+    extern "C" __global__ void radial_texture_native_f32(
+        cudaTextureObject_t volume_tex,
+        int native_t, int full_h, int full_w, int logical_t,
+        int rows, int n_u, int stack_len, int base_id, int direction_id,
+        int angle_idx, float tan_tilt,
+        float center_x, float center_y, float roi_radius,
+        const float* angle_cos, const float* angle_sin, float* out) {
+      int q = (int)(blockDim.x * blockIdx.x + threadIdx.x);
+      if (q >= rows * n_u) return;
+      int row = q / n_u;
+      int u = q - row * n_u;
+      float value = radial_texture_sample(
+          volume_tex, native_t, full_h, full_w, logical_t,
+          rows, n_u, stack_len, base_id, direction_id,
+          tan_tilt, center_x, center_y, roi_radius,
+          angle_idx, (float)row, (float)u, angle_cos, angle_sin);
+      out[q] = clamp_f(value, 0.0f, 1.0f) * 255.0f;
+    }
+
+    extern "C" __global__ void radial_texture_grid_f32(
+        cudaTextureObject_t volume_tex,
+        int native_t, int full_h, int full_w, int logical_t,
+        int rows, int n_u, int stack_len, int base_id, int direction_id,
+        int angle_idx, float tan_tilt,
+        float center_x, float center_y, float roi_radius,
+        int oh, int ow,
+        float m00, float m01, float m02, float m10, float m11, float m12,
+        const float* angle_cos, const float* angle_sin, float* out) {
+      int q = (int)(blockDim.x * blockIdx.x + threadIdx.x);
+      if (q >= oh * ow) return;
+      int oy = q / ow;
+      int ox = q - oy * ow;
+      float radial_x = __fadd_rn(
+          __fadd_rn(__fmul_rn(m00, (float)ox), __fmul_rn(m01, (float)oy)), m02);
+      float radial_y = __fadd_rn(
+          __fadd_rn(__fmul_rn(m10, (float)ox), __fmul_rn(m11, (float)oy)), m12);
+      float value = radial_texture_sample(
+          volume_tex, native_t, full_h, full_w, logical_t,
+          rows, n_u, stack_len, base_id, direction_id,
+          tan_tilt, center_x, center_y, roi_radius,
+          angle_idx, radial_y, radial_x, angle_cos, angle_sin);
+      out[q] = clamp_f(value, 0.0f, 1.0f) * 255.0f;
+    }
+
+    // Pointer-based helpers remain for the non-radial Tilted renderer.
     __device__ __forceinline__ void logical_t_taps(
         int logical_idx, int native_t, int logical_t, int* t0, int* t1, float* alpha) {
       float pos = ((float)logical_idx + 0.5f) * ((float)native_t / (float)logical_t) - 0.5f;
@@ -13035,169 +13527,6 @@ def _fused_direct_render_kernels() -> Optional[object]:
       float a = (float)volume[(long long)t0 * plane_stride + spatial];
       float b = (float)volume[(long long)t1 * plane_stride + spatial];
       return clamp_f(round_nearest_f(a + alpha * (b - a)), 0.0f, 255.0f);
-    }
-
-    __device__ __forceinline__ float tilted_radial_stack_sample(
-        const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
-        int base_id, int py, int px, int stack_idx) {
-      long long ps = (long long)full_h * (long long)full_w;
-      if (base_id == 0) {
-        long long spatial = (long long)py * (long long)full_w + (long long)px;
-        if (native_t == logical_t) {
-          return (float)volume[(long long)stack_idx * ps + spatial];
-        }
-        int t0, t1; float ta;
-        logical_t_taps(stack_idx, native_t, logical_t, &t0, &t1, &ta);
-        return rounded_t_lerp(volume, ps, spatial, t0, t1, ta);
-      }
-
-      int t0, t1; float ta;
-      logical_t_taps(py, native_t, logical_t, &t0, &t1, &ta);
-      long long spatial = base_id == 1
-          ? (long long)stack_idx * (long long)full_w + (long long)px
-          : (long long)px * (long long)full_w + (long long)stack_idx;
-      if (native_t == logical_t) {
-        return (float)volume[(long long)py * ps + spatial];
-      }
-      return rounded_t_lerp(volume, ps, spatial, t0, t1, ta);
-    }
-
-    __device__ __forceinline__ float tilted_radial_native_value(
-        const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
-        int rows, int n_u, int stack_len, int base_id, int direction_id,
-        int angle_idx, int row, int u, float tan_tilt, float center_x, float center_y,
-        const int* x_idx, const int* y_idx, const float* x_w, const float* y_w) {
-      if (row < 0 || row >= rows || u < 0 || u >= n_u) return 0.0f;
-      float center = rows == stack_len
-          ? (float)row
-          : clamp_f(((float)row + 0.5f) * ((float)stack_len / (float)rows) - 0.5f,
-                    0.0f, (float)(stack_len - 1));
-      int tap = (angle_idx * n_u + u) * 6;
-      float acc = 0.0f;
-      #pragma unroll
-      for (int ky = 0; ky < 6; ++ky) {
-        int py = y_idx[tap + ky];
-        float wy = y_w[tap + ky];
-        #pragma unroll
-        for (int kx = 0; kx < 6; ++kx) {
-          int px = x_idx[tap + kx];
-          float weight = wy * x_w[tap + kx];
-          if (weight == 0.0f) continue;
-          float axis_offset = direction_id == 0
-              ? (float)py - center_y
-              : (float)px - center_x;
-          float stack = center + tan_tilt * axis_offset;
-          if (stack < 0.0f || stack > (float)(stack_len - 1)) continue;
-          int s0 = clamp_i(floor_i(stack), 0, stack_len - 1);
-          int s1 = s0 + 1 < stack_len ? s0 + 1 : stack_len - 1;
-          float sa = stack - (float)s0;
-          float v0 = tilted_radial_stack_sample(
-              volume, native_t, full_h, full_w, logical_t, base_id, py, px, s0);
-          float v1 = tilted_radial_stack_sample(
-              volume, native_t, full_h, full_w, logical_t, base_id, py, px, s1);
-          acc += weight * (v0 + sa * (v1 - v0));
-        }
-      }
-      return acc;
-    }
-
-    __device__ __forceinline__ float tilted_radial_bilinear_value(
-        const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
-        int rows, int n_u, int stack_len, int base_id, int direction_id,
-        int angle_idx, float sy, float sx, float tan_tilt, float center_x, float center_y,
-        const int* x_idx, const int* y_idx, const float* x_w, const float* y_w) {
-      int x0 = floor_i(sx), y0 = floor_i(sy);
-      int x1 = x0 + 1, y1 = y0 + 1;
-      float fx = sx - (float)x0, fy = sy - (float)y0;
-      float v00 = tilted_radial_native_value(
-          volume, native_t, full_h, full_w, logical_t, rows, n_u, stack_len,
-          base_id, direction_id, angle_idx, y0, x0, tan_tilt, center_x, center_y,
-          x_idx, y_idx, x_w, y_w);
-      if (fx == 0.0f && fy == 0.0f) return v00;
-      float v01 = tilted_radial_native_value(
-          volume, native_t, full_h, full_w, logical_t, rows, n_u, stack_len,
-          base_id, direction_id, angle_idx, y0, x1, tan_tilt, center_x, center_y,
-          x_idx, y_idx, x_w, y_w);
-      float v10 = tilted_radial_native_value(
-          volume, native_t, full_h, full_w, logical_t, rows, n_u, stack_len,
-          base_id, direction_id, angle_idx, y1, x0, tan_tilt, center_x, center_y,
-          x_idx, y_idx, x_w, y_w);
-      float v11 = tilted_radial_native_value(
-          volume, native_t, full_h, full_w, logical_t, rows, n_u, stack_len,
-          base_id, direction_id, angle_idx, y1, x1, tan_tilt, center_x, center_y,
-          x_idx, y_idx, x_w, y_w);
-      float a = v00 + fx * (v01 - v00);
-      float b = v10 + fx * (v11 - v10);
-      return a + fy * (b - a);
-    }
-
-    extern "C" __global__ void tilted_radial_native_f32(
-        const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
-        int rows, int n_u, int stack_len, int base_id, int direction_id, int angle_idx,
-        float tan_tilt, float center_x, float center_y,
-        const int* x_idx, const int* y_idx, const float* x_w, const float* y_w,
-        float* out) {
-      int q = (int)(blockDim.x * blockIdx.x + threadIdx.x);
-      if (q >= rows * n_u) return;
-      int row = q / n_u;
-      int u = q - row * n_u;
-      out[q] = tilted_radial_native_value(
-          volume, native_t, full_h, full_w, logical_t, rows, n_u, stack_len,
-          base_id, direction_id, angle_idx, row, u, tan_tilt, center_x, center_y,
-          x_idx, y_idx, x_w, y_w);
-    }
-
-    __device__ __forceinline__ float tilted_radial_direct_value(
-        const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
-        int rows, int n_u, int stack_len, int base_id, int direction_id,
-        const int* render_meta, float tan_tilt, float center_x, float center_y,
-        int oh, int ow,
-        float m00, float m01, float m02, float m10, float m11, float m12,
-        const int* x_idx, const int* y_idx, const float* x_w, const float* y_w,
-        int q) {
-      int angle_idx = render_meta[0];
-      int oy = q / ow, ox = q - oy * ow;
-      float sx = __fadd_rn(__fadd_rn(__fmul_rn(m00, (float)ox), __fmul_rn(m01, (float)oy)), m02);
-      float sy = __fadd_rn(__fadd_rn(__fmul_rn(m10, (float)ox), __fmul_rn(m11, (float)oy)), m12);
-      return tilted_radial_bilinear_value(
-          volume, native_t, full_h, full_w, logical_t, rows, n_u, stack_len,
-          base_id, direction_id, angle_idx, sy, sx, tan_tilt, center_x, center_y,
-          x_idx, y_idx, x_w, y_w);
-    }
-
-    extern "C" __global__ void tilted_radial_direct_f32(
-        const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
-        int rows, int n_u, int stack_len, int base_id, int direction_id,
-        const int* render_meta, float tan_tilt, float center_x, float center_y,
-        int oh, int ow,
-        float m00, float m01, float m02, float m10, float m11, float m12,
-        const int* x_idx, const int* y_idx, const float* x_w, const float* y_w,
-        float* out) {
-      int q = (int)(blockDim.x * blockIdx.x + threadIdx.x);
-      if (q >= oh * ow) return;
-      out[q] = norm_u8(tilted_radial_direct_value(
-          volume, native_t, full_h, full_w, logical_t, rows, n_u, stack_len,
-          base_id, direction_id, render_meta, tan_tilt, center_x, center_y,
-          oh, ow, m00, m01, m02, m10, m11, m12,
-          x_idx, y_idx, x_w, y_w, q));
-    }
-
-    extern "C" __global__ void tilted_radial_direct_f16(
-        const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
-        int rows, int n_u, int stack_len, int base_id, int direction_id,
-        const int* render_meta, float tan_tilt, float center_x, float center_y,
-        int oh, int ow,
-        float m00, float m01, float m02, float m10, float m11, float m12,
-        const int* x_idx, const int* y_idx, const float* x_w, const float* y_w,
-        __half* out) {
-      int q = (int)(blockDim.x * blockIdx.x + threadIdx.x);
-      if (q >= oh * ow) return;
-      float value = norm_u8(tilted_radial_direct_value(
-          volume, native_t, full_h, full_w, logical_t, rows, n_u, stack_len,
-          base_id, direction_id, render_meta, tan_tilt, center_x, center_y,
-          oh, ow, m00, m01, m02, m10, m11, m12,
-          x_idx, y_idx, x_w, y_w, q));
-      out[q] = __float2half_rn(value);
     }
 
     __device__ __forceinline__ float tilted_direct_value(
@@ -13284,8 +13613,9 @@ def _fused_direct_render_kernels() -> Optional[object]:
     try:
         import cupy as cp  # type: ignore
         names = (
-            'set_render_meta', 'precompute_radial_taps', 'radial_direct_f32', 'radial_direct_f16',
-            'tilted_radial_native_f32', 'tilted_radial_direct_f32', 'tilted_radial_direct_f16',
+            'set_render_meta',
+            'radial_texture_direct_f32', 'radial_texture_direct_f16',
+            'radial_texture_native_f32', 'radial_texture_grid_f32',
             'tilted_direct_f32', 'tilted_direct_f16',
         )
         module = cp.RawModule(code=src, options=('--std=c++14',))
@@ -13411,10 +13741,11 @@ class _GpuWorkerRenderEngine:
         self._mode = 'unresolved'
         self._tilted_plans: 'OrderedDict[Tuple[str, int, int, Tuple[float, ...]], Dict[str, object]]' = OrderedDict()
         self._fold_cache: Dict[Tuple[int, int, int], Tuple[object, object, object]] = {}
-        # keeps one all-azimuth separable tap table per resident Radial geometry.
-        # It is generated by one CUDA launch and remains device-resident across task windows.
+        # Small per-azimuth sin/cos geometry plus one optional 3D texture object.
         self._fused_radial_taps: 'OrderedDict[object, object]' = OrderedDict()
         self._fused_volume_ref: Optional[object] = None
+        self._radial_texture_ref: Optional[object] = None
+        self._radial_texture_lock = threading.RLock()
         self._fused_disabled_families: set = set()
         self._fused_warned_families: set = set()
         self._fused_announced_families: set = set()
@@ -13422,6 +13753,7 @@ class _GpuWorkerRenderEngine:
         self._fused_graph_warned_families: set = set()
         self._fused_graph_rejected_keys: set = set()
         self._fused_validated_keys: set = set()
+        self._fused_numeric_validated_slots: set = set()
         self._warned_fallback = False
         self._resident_runtime_disabled = False
         # native planes shared across every tile of one frame (tile-group path only).
@@ -13437,6 +13769,7 @@ class _GpuWorkerRenderEngine:
         dtype: str = 'uint8',
         *,
         resize_to_t: Optional[int] = None,
+        require_radial_texture: bool = False,
     ) -> str:
         """Resolve resident or streaming GPU source-volume mode.
         
@@ -13453,6 +13786,13 @@ class _GpuWorkerRenderEngine:
         key = (str(path), shape_t, int(out_t))
         if self._volume_key == key and self._mode != 'unresolved':
             return self._mode
+        if self._volume_key is not None and self._volume_key != key:
+            # Texture objects and angle tables can be referenced by queued CuPy
+            # launches/graphs. Retire the old render stream before dropping owners.
+            try:
+                self._stream.synchronize()
+            except Exception:
+                pass
         self._volume_key = key
         self._volume_mm = np.memmap(Path(str(path)), dtype=np.dtype(str(dtype)), mode='c', shape=shape_t)
         self._volume_gpu = None
@@ -13464,16 +13804,23 @@ class _GpuWorkerRenderEngine:
         self._tilted_plans.clear()
         self._fused_radial_taps.clear()
         self._fused_volume_ref = None
+        self._radial_texture_ref = None
         self._fused_disabled_families.clear()
         self._fused_graph_rejected_keys.clear()
         self._fused_validated_keys.clear()
+        self._fused_numeric_validated_slots.clear()
         self._mode = 'stream'
         # Residency admission uses the native buffer, not the inflated logical cube.
         nbytes = int(in_t) * int(in_h) * int(in_w)
         if gpu_worker_render_resident_enabled() and not self._resident_runtime_disabled:
             try:
                 free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
-                need = nbytes + gpu_render_reserve_bytes()
+                texture_copy_bytes = (
+                    int(nbytes)
+                    if bool(require_radial_texture) and radial_texture_source_copy_reserve_enabled()
+                    else 0
+                )
+                need = nbytes + texture_copy_bytes + gpu_render_reserve_bytes()
                 if int(free_bytes) >= int(need):
                     vol = torch.empty((int(in_t), int(in_h), int(in_w)), dtype=torch.uint8, device=self.device)
                     chunk = 256
@@ -13489,8 +13836,10 @@ class _GpuWorkerRenderEngine:
                     self._mode = 'resident'
                 else:
                     print(
-                        f'GPU render: source volume NOT resident ({nbytes / GIB:.1f} GiB needed + '
-                        f'{gpu_render_reserve_bytes() / GIB:.1f} GiB reserve > {free_bytes / GIB:.1f} GiB free); '
+                        f'GPU render: source volume NOT resident ({nbytes / GIB:.1f} GiB source + '
+                        f'{texture_copy_bytes / GIB:.1f} GiB radial-texture copy + '
+                        f'{gpu_render_reserve_bytes() / GIB:.1f} GiB reserve > '
+                        f'{free_bytes / GIB:.1f} GiB free); '
                         'only upright transverse-Radial tasks retain streamed GPU prerendering. '
                         'Tilted-Radial, Cartesian, and other unsupported nonresident views use CPU rendering. '
                         'A TensorRT engine rebuilt at max batch 1 frees enough VRAM for residency.'
@@ -13541,9 +13890,11 @@ class _GpuWorkerRenderEngine:
         self._tilted_plans.clear()
         self._fused_radial_taps.clear()
         self._fused_volume_ref = None
+        self._radial_texture_ref = None
         self._fused_disabled_families.clear()
         self._fused_graph_rejected_keys.clear()
         self._fused_validated_keys.clear()
+        self._fused_numeric_validated_slots.clear()
         self._mode = 'unresolved'
         try:
             self.torch.cuda.empty_cache()
@@ -13609,12 +13960,90 @@ class _GpuWorkerRenderEngine:
             )
 
     def _fused_cupy_volume(self, kernels: object) -> object:
-        if self._fused_volume_ref is None:
-            self._fused_volume_ref = kernels.cp.asarray(self._volume_gpu)
-        return self._fused_volume_ref
+        with self._radial_texture_lock:
+            if self._fused_volume_ref is None:
+                self._fused_volume_ref = kernels.cp.asarray(self._volume_gpu)
+            return self._fused_volume_ref
 
-    @staticmethod
-    def _fused_slot_output(slot: _ResidentGpuPipelineSlot, kernels: object) -> object:
+    def _ensure_radial_texture(self, kernels: object) -> object:
+        """Create one normalized-float, hardware-linear 3D texture for the resident u8 source.
+
+        CUDA arrays are allocated outside the Torch/CuPy memory pools, so construction is
+        single-flight and performs an explicit free-memory admission check before allocation.
+        """
+        cached = self._radial_texture_ref
+        if cached is not None:
+            return cached
+        with self._radial_texture_lock:
+            cached = self._radial_texture_ref
+            if cached is not None:
+                return cached
+            if self._volume_gpu is None or self._volume_gpu.dtype != self.torch.uint8:
+                raise RuntimeError('radial texture requires a resident uint8 source volume')
+            if not bool(self._volume_gpu.is_contiguous()):
+                raise RuntimeError('radial texture requires a contiguous source volume')
+
+            cp = kernels.cp
+            native_t, full_h, full_w = (int(v) for v in self._volume_gpu.shape)
+            texture_bytes = int(native_t) * int(full_h) * int(full_w)
+            free_bytes, _total = self.torch.cuda.mem_get_info(self.device)
+            texture_headroom = int(
+                max(0.5, _env_float('YOLO_TTA_RADIAL_TEXTURE_RESERVE_GIB', 2.0)) * GIB
+            )
+            if int(free_bytes) < int(texture_bytes) + int(texture_headroom):
+                raise RuntimeError(
+                    f'3D radial texture needs {texture_bytes / GIB:.2f} GiB plus '
+                    f'{texture_headroom / GIB:.2f} GiB headroom, only '
+                    f'{int(free_bytes) / GIB:.2f} GiB free'
+                )
+
+            runtime = cp.cuda.runtime
+            with cp.cuda.Device(int(getattr(self.device, 'index', 0) or 0)):
+                channel = cp.cuda.texture.ChannelFormatDescriptor(
+                    8, 0, 0, 0, runtime.cudaChannelFormatKindUnsigned,
+                )
+                cuda_array = cp.cuda.texture.CUDAarray(
+                    channel, int(full_w), int(full_h), int(native_t),
+                )
+                source_ref = self._fused_cupy_volume(kernels)
+                external = _cupy_external_stream(cp, self._stream)
+                cuda_array.copy_from(source_ref, stream=external)
+                resource = cp.cuda.texture.ResourceDescriptor(
+                    runtime.cudaResourceTypeArray, cuArr=cuda_array,
+                )
+                descriptor = cp.cuda.texture.TextureDescriptor(
+                    addressModes=(
+                        runtime.cudaAddressModeBorder,
+                        runtime.cudaAddressModeBorder,
+                        runtime.cudaAddressModeBorder,
+                    ),
+                    filterMode=runtime.cudaFilterModeLinear,
+                    readMode=runtime.cudaReadModeNormalizedFloat,
+                    normalizedCoords=0,
+                )
+                texture = cp.cuda.texture.TextureObject(resource, descriptor)
+                # CUDAarray storage is outside CuPy's pool. Complete the one-time D2D copy so
+                # allocation/copy failures surface before any graph captures the texture handle.
+                self._stream.synchronize()
+            cached = argparse.Namespace(
+                source_ref=source_ref,
+                channel=channel,
+                cuda_array=cuda_array,
+                resource=resource,
+                descriptor=descriptor,
+                texture=texture,
+                nbytes=texture_bytes,
+                shape=(native_t, full_h, full_w),
+            )
+            self._radial_texture_ref = cached
+            print(
+                f'Radial hardware texture allocated on {self.device}: '
+                f'{native_t}x{full_h}x{full_w} u8 ({texture_bytes / GIB:.2f} GiB), '
+                f'filter={RADIAL_FILTER_LABEL}.'
+            )
+            return cached
+
+    def _fused_slot_output(self, slot: _ResidentGpuPipelineSlot, kernels: object) -> object:
         ref = slot._render_cupy_refs.get('input_plane')
         ptr = int(slot.input.data_ptr())
         if ref is None or int(slot._render_cupy_refs.get('input_ptr', -1)) != ptr:
@@ -13644,84 +14073,59 @@ class _GpuWorkerRenderEngine:
         return ref
 
     def _ensure_fused_radial_taps(self, view: ViewInfo, kernels: object) -> object:
-        """Generate/cache separable 6+6 tap descriptors for every configured azimuth.
+        """Cache the per-azimuth sin/cos table used by texture render kernels.
 
- Storing separable x/y taps costs one third of a flattened 36-tap table while the
- direct renderer still performs the identical outer-product accumulation. The table
- is built in one launch on the render stream, not reconstructed for every frame."""
-        if int(RADIAL_LANCZOS_A) != 3 or int(_lanczos_tap_count(RADIAL_LANCZOS_A)) != 6:
-            raise RuntimeError('fused Radial renderer currently requires Lanczos-3 (six taps per axis)')
+        Reconstruction state is computed in registers, so each geometry retains only two
+        float32 values per azimuth rather than an all-diameter tap descriptor. The cache is
+        intentionally large enough to retain a normal full view set and keep CuPy launches
+        from outliving their Torch-owned angle tables during view transitions.
+        """
         angles_np = np.ascontiguousarray(np.asarray(view.azimuths_deg, dtype=np.float32))
         n_angles = int(angles_np.size)
         n_u = int(view.src_w) if int(view.src_w) > 0 else int(view.diameter)
         if n_angles <= 0 or n_u <= 0:
-            raise RuntimeError('fused Radial descriptor geometry is empty')
+            raise RuntimeError('fused Radial texture geometry is empty')
         plane_h, plane_w = radial_plane_shape(view)
-        # The descriptor contains only projected-plane coordinates. Sagittal and Coronal
-        # may therefore share it when their plane geometry/azimuth table are identical; putting
-        # the semantic base name in the key needlessly rebuilt ~1.3 GiB tables between views.
         key = (
-            int(plane_h), int(plane_w), int(n_u),
+            RADIAL_FILTER_MODE, int(plane_h), int(plane_w), int(n_u),
             round(float(view.center_x), 5), round(float(view.center_y), 5),
             round(float(view.roi_radius), 5), angles_np.tobytes(),
         )
-        cached = self._fused_radial_taps.get(key)
-        if cached is not None:
+        with self._radial_texture_lock:
+            cached = self._fused_radial_taps.get(key)
+            if cached is not None:
+                self._fused_radial_taps.move_to_end(key)
+                return cached
+
+            radians = np.deg2rad(angles_np.astype(np.float64)).astype(np.float32)
+            cos_np = np.ascontiguousarray(np.cos(radians).astype(np.float32))
+            sin_np = np.ascontiguousarray(np.sin(radians).astype(np.float32))
+            torch = self.torch
+            angle_cos = torch.from_numpy(cos_np).to(self.device)
+            angle_sin = torch.from_numpy(sin_np).to(self.device)
+            cp = kernels.cp
+            refs = argparse.Namespace(
+                angle_cos=angle_cos,
+                angle_sin=angle_sin,
+                cp_angle_cos=cp.asarray(angle_cos),
+                cp_angle_sin=cp.asarray(angle_sin),
+                n_angles=n_angles,
+                n_u=n_u,
+                plane_h=int(plane_h),
+                plane_w=int(plane_w),
+                nbytes=int(cos_np.nbytes + sin_np.nbytes),
+            )
+            self._fused_radial_taps[key] = refs
             self._fused_radial_taps.move_to_end(key)
-            return cached
-
-        # angle + four [angle,u,6] int32/float32 planes.
-        descriptor_bytes = int(n_angles * 4 + n_angles * n_u * 6 * 16)
-        cache_budget = int(fused_radial_tap_cache_bytes())
-        if cache_budget <= 0 or descriptor_bytes > cache_budget:
-            raise RuntimeError(
-                f'all-azimuth tap table needs {descriptor_bytes / GIB:.2f} GiB, above '
-                f'YOLO_TTA_FUSED_RADIAL_TAPS_GIB={cache_budget / GIB:.2f}'
+            limit = max(8, _env_int('YOLO_TTA_RADIAL_TEXTURE_GEOMETRY_CACHE_ENTRIES', 128))
+            while len(self._fused_radial_taps) > int(limit):
+                self._fused_radial_taps.popitem(last=False)
+            print(
+                f'Radial texture geometry cached on {self.device}: {n_angles} azimuths, '
+                f'{n_u} radial samples, {int(plane_h)}x{int(plane_w)} projected plane; '
+                f'filter={RADIAL_FILTER_LABEL} ({refs.nbytes / (1024 ** 2):.3f} MiB angle table).'
             )
-        free_bytes, _total_bytes = self.torch.cuda.mem_get_info(self.device)
-        if descriptor_bytes + 512 * 1024 * 1024 > int(free_bytes):
-            raise RuntimeError(
-                f'all-azimuth tap table needs {descriptor_bytes / GIB:.2f} GiB plus '
-                f'0.50 GiB launch headroom, only {int(free_bytes) / GIB:.2f} GiB free'
-            )
-
-        # A worker has one Radial geometry. If a caller supplies a replacement geometry,
-        # release the old table rather than silently multiplying the persistent cache.
-        self._fused_radial_taps.clear()
-        torch = self.torch
-        angles = torch.from_numpy(angles_np).to(self.device)
-        shape = (n_angles, n_u, 6)
-        x_idx = torch.empty(shape, dtype=torch.int32, device=self.device)
-        y_idx = torch.empty(shape, dtype=torch.int32, device=self.device)
-        x_w = torch.empty(shape, dtype=torch.float32, device=self.device)
-        y_w = torch.empty(shape, dtype=torch.float32, device=self.device)
-        cp = kernels.cp
-        refs = argparse.Namespace(
-            angles=angles, x_idx=x_idx, y_idx=y_idx, x_w=x_w, y_w=y_w,
-            cp_angles=cp.asarray(angles), cp_x_idx=cp.asarray(x_idx),
-            cp_y_idx=cp.asarray(y_idx), cp_x_w=cp.asarray(x_w), cp_y_w=cp.asarray(y_w),
-            n_angles=n_angles, n_u=n_u, plane_h=int(plane_h), plane_w=int(plane_w),
-            nbytes=descriptor_bytes,
-        )
-        external = _cupy_external_stream(cp, self._stream)
-        total = int(n_angles) * int(n_u)
-        kernels.precompute_radial_taps(
-            ((total + 255) // 256,), (256,),
-            (
-                refs.cp_angles, np.int32(n_angles), np.int32(n_u),
-                np.int32(plane_h), np.int32(plane_w),
-                np.float32(view.center_x), np.float32(view.center_y), np.float32(view.roi_radius),
-                refs.cp_x_idx, refs.cp_y_idx, refs.cp_x_w, refs.cp_y_w,
-            ),
-            stream=external,
-        )
-        self._fused_radial_taps[key] = refs
-        print(
-            f'P4 Radial tap cache allocated on {self.device}: {n_angles} azimuths x {n_u} samples '
-            f'on {int(plane_h)}x{int(plane_w)} projected planes '
-            f'({descriptor_bytes / GIB:.2f} GiB, separable Lanczos-3 descriptors).'
-        )
-        return refs
+            return refs
 
     def _try_fused_radial_into_slot(
         self,
@@ -13761,96 +14165,69 @@ class _GpuWorkerRenderEngine:
                     'CuPy/NVRTC direct renderer kernels are unavailable: '
                     + str(_FUSED_DIRECT_RENDER_KERNELS_ERROR or 'no diagnostic')
                 )
-            taps = self._ensure_fused_radial_taps(view, kernels)
+            geometry = self._ensure_fused_radial_taps(view, kernels)
+            texture = self._ensure_radial_texture(kernels)
             matrix = np.asarray(aff.M_out_to_src, dtype=np.float32).reshape(2, 3)
             if not bool(np.all(np.isfinite(matrix))):
                 raise RuntimeError('Radial output-to-source affine is non-finite')
             if slot.input.dtype not in (self.torch.float16, self.torch.float32):
                 raise RuntimeError(f'unsupported binding dtype {slot.input.dtype}')
+
+            base = str(radial_base_view_name(view))
+            base_ids = {'transverse': 0, 'sagittal': 1, 'coronal': 2}
+            if base not in base_ids:
+                raise RuntimeError(f'unsupported Radial base {base!r}')
+            direction = str(view.tilt_direction) if tilted_radial else 'vertical'
+            if direction not in ('vertical', 'horizontal'):
+                raise RuntimeError(f'unsupported tilted-Radial direction {direction!r}')
+            plane_h, plane_w = radial_plane_shape(view)
+            if int(geometry.plane_h) != int(plane_h) or int(geometry.plane_w) != int(plane_w):
+                raise RuntimeError('Radial angle table/projected-plane geometry mismatch')
+            stack_len = int(radial_stack_length(view))
+            if stack_len <= 0:
+                raise RuntimeError('Radial stack geometry is empty')
+
             external = _cupy_external_stream(kernels.cp, self._stream)
             metadata = self._fused_slot_metadata(
                 slot, kernels, int(frame_index) if bool(stage_metadata) else None,
             )
             output_ref = self._fused_slot_output(slot, kernels)
             pixels = int(out_size) * int(out_size)
-
-            base = str(radial_base_view_name(view))
-            base_ids = {'transverse': 0, 'sagittal': 1, 'coronal': 2}
-            base_aware_kernel = bool(tilted_radial or base != 'transverse')
-            if base_aware_kernel:
-                if base not in base_ids:
-                    raise RuntimeError(f'unsupported Radial base {base!r}')
-                direction = str(view.tilt_direction) if tilted_radial else 'vertical'
-                if direction not in ('vertical', 'horizontal'):
-                    raise RuntimeError(f'unsupported tilted-Radial direction {direction!r}')
-                plane_h, plane_w = radial_plane_shape(view)
-                if int(taps.plane_h) != int(plane_h) or int(taps.plane_w) != int(plane_w):
-                    raise RuntimeError('Radial tap table/projected-plane geometry mismatch')
-                stack_len = int(radial_stack_length(view))
-                if stack_len <= 0:
-                    raise RuntimeError('Radial stack geometry is empty')
-                kernel = (
-                    kernels.tilted_radial_direct_f16
-                    if slot.input.dtype == self.torch.float16
-                    else kernels.tilted_radial_direct_f32
-                )
-                kernel(
-                    ((pixels + 255) // 256,), (256,),
-                    (
-                        self._fused_cupy_volume(kernels),
-                        np.int32(native_t), np.int32(full_h), np.int32(full_w),
-                        np.int32(self._logical_t), np.int32(view.src_h), np.int32(taps.n_u),
-                        np.int32(stack_len), np.int32(base_ids[base]),
-                        np.int32(0 if direction == 'vertical' else 1),
-                        metadata,
-                        np.float32(
-                            math.tan(math.radians(float(view.tilt_angle_deg)))
-                            if tilted_radial else 0.0
-                        ),
-                        np.float32(view.center_x), np.float32(view.center_y),
-                        np.int32(out_size), np.int32(out_size),
-                        *(np.float32(v) for v in matrix.reshape(-1)),
-                        taps.cp_x_idx, taps.cp_y_idx, taps.cp_x_w, taps.cp_y_w,
-                        output_ref,
+            kernel = (
+                kernels.radial_texture_direct_f16
+                if slot.input.dtype == self.torch.float16
+                else kernels.radial_texture_direct_f32
+            )
+            kernel(
+                ((pixels + 255) // 256,), (256,),
+                (
+                    texture.texture,
+                    np.int32(native_t), np.int32(full_h), np.int32(full_w),
+                    np.int32(self._logical_t), np.int32(view.src_h),
+                    np.int32(geometry.n_u), np.int32(stack_len),
+                    np.int32(base_ids[base]),
+                    np.int32(0 if direction == 'vertical' else 1),
+                    metadata,
+                    np.float32(
+                        math.tan(math.radians(float(view.tilt_angle_deg)))
+                        if tilted_radial else 0.0
                     ),
-                    stream=external,
+                    np.float32(view.center_x), np.float32(view.center_y),
+                    np.float32(view.roi_radius),
+                    np.int32(out_size), np.int32(out_size),
+                    *(np.float32(v) for v in matrix.reshape(-1)),
+                    geometry.cp_angle_cos, geometry.cp_angle_sin,
+                    output_ref,
+                ),
+                stream=external,
+            )
+            if render_family not in self._fused_announced_families:
+                self._fused_announced_families.add(render_family)
+                geometry_label = f'tilted {base}' if tilted_radial else f'upright {base}'
+                print(
+                    f'Fused {geometry_label} Radial renderer active: output affine + radial '
+                    f'mapping + {RADIAL_FILTER_LABEL} -> TensorRT binding in one launch.'
                 )
-                if render_family not in self._fused_announced_families:
-                    self._fused_announced_families.add(render_family)
-                    if tilted_radial:
-                        print(
-                            'Fused tilted-Radial renderer active: resident uint8 volume '
-                            '-> shear + Lanczos-3 + stack lerp -> TensorRT binding.'
-                        )
-                    else:
-                        print(
-                            f'Fused upright {base} Radial renderer active: resident uint8 volume '
-                            '-> base-aware Lanczos-3 + stack fold -> TensorRT binding.'
-                        )
-            else:
-                kernel = (
-                    kernels.radial_direct_f16
-                    if slot.input.dtype == self.torch.float16 else kernels.radial_direct_f32
-                )
-                kernel(
-                    ((pixels + 255) // 256,), (256,),
-                    (
-                        self._fused_cupy_volume(kernels),
-                        np.int32(native_t), np.int32(full_h), np.int32(full_w),
-                        np.int32(view.src_h), np.int32(taps.n_u), metadata,
-                        np.int32(out_size), np.int32(out_size),
-                        *(np.float32(v) for v in matrix.reshape(-1)),
-                        taps.cp_x_idx, taps.cp_y_idx, taps.cp_x_w, taps.cp_y_w,
-                        output_ref,
-                    ),
-                    stream=external,
-                )
-                if render_family not in self._fused_announced_families:
-                    self._fused_announced_families.add(render_family)
-                    print(
-                        'P4 fused Radial renderer active: uint8 volume -> Lanczos/t-lerp '
-                        '-> TensorRT binding.'
-                    )
             return True
         except Exception as exc:
             if not bool(disable_on_failure):
@@ -14032,6 +14409,7 @@ class _GpuWorkerRenderEngine:
             family_geometry = ()
         return (
             self._volume_key, str(view.name), family, int(out_size), str(slot.input.dtype),
+            int(slot.slot_id), int(slot.input.data_ptr()), int(slot.render_meta.data_ptr()),
             matrix_key, family_geometry,
         )
 
@@ -14043,14 +14421,12 @@ class _GpuWorkerRenderEngine:
         frame_index: int,
         out_size: int,
     ) -> None:
-        """Synchronously prove a launch before the resident source is consumed.
+        """Prove every static slot and numerically self-test each fused family.
 
- NVRTC compilation and argument/configuration failures are normally synchronous, but
- descriptor or render memory faults surface only at a stream boundary. One probe per
- volume/view/dtype/affine makes the default-on path a real capability test. A failed
- synchronization is fatal rather than a Torch fallback because CUDA execution faults
- can poison the worker context; the parent already treats this exception as a worker-
- fatal result. Successful keys do not add a synchronization to later task windows."""
+ Launch validation is keyed by the concrete view, affine, binding address and metadata
+ address. The more expensive reference comparison runs once per source/family/slot and
+ checks normalized binding values before TensorRT can consume them. A numerical mismatch
+ disables the optional fused family; an asynchronous CUDA fault remains worker-fatal."""
         family = 'radial' if str(view.family) == 'radial' else ('tilted' if is_tilted_view(view) else '')
         if not family:
             return
@@ -14061,10 +14437,24 @@ class _GpuWorkerRenderEngine:
         key = self._fused_renderer_key(slot, view, job.aff, int(out_size))
         if key in self._fused_validated_keys or family in self._fused_disabled_families:
             return
-        with self.torch.cuda.stream(self._stream):
-            launched = self._try_fused_render_into_ring_slot(
-                slot, view, job.aff, int(frame_index), int(out_size),
-            )
+        numeric_key = (
+            self._volume_key, str(family), int(slot.slot_id), int(slot.input.data_ptr()),
+            str(slot.input.dtype), int(out_size),
+        )
+        compare_reference = numeric_key not in self._fused_numeric_validated_slots
+        reference = None
+        try:
+            with self.torch.cuda.stream(self._stream):
+                if bool(compare_reference):
+                    reference = self._render_fullframe_frame(
+                        view, job.aff, int(frame_index), int(out_size),
+                    ).clamp(0.0, 255.0).mul(1.0 / 255.0).to(slot.input.dtype)
+                launched = self._try_fused_render_into_ring_slot(
+                    slot, view, job.aff, int(frame_index), int(out_size),
+                )
+        except Exception as exc:
+            self._fused_render_fallback(family, f'pre-consumption self-test setup failed: {exc}')
+            return
         if not launched:
             # A later launch-argument rejection can occur after descriptor generation was
             # already queued. Drain it before its Torch owners are recycled by the fallback.
@@ -14081,6 +14471,33 @@ class _GpuWorkerRenderEngine:
             raise _ResidentTensorRTRingFatalError(
                 f'P4 fused {family} renderer failed its pre-consumption CUDA probe'
             ) from exc
+        if bool(compare_reference):
+            if reference is None:  # pragma: no cover - guarded by compare_reference
+                self._fused_render_fallback(family, 'self-test reference was not produced')
+                return
+            try:
+                direct = slot.input[0, 0]
+                finite = bool(self.torch.isfinite(direct).all().item())
+                max_error = float((direct.to(self.torch.float32) - reference.to(self.torch.float32)).abs().max().item())
+                tolerance = max(
+                    0.0,
+                    _env_float('YOLO_TTA_FUSED_RENDER_SELFTEST_ATOL', 2.5 / 255.0),
+                )
+            except Exception as exc:
+                self._fused_render_fallback(family, f'self-test comparison failed: {exc}')
+                return
+            if not finite or not math.isfinite(max_error) or float(max_error) > float(tolerance):
+                self._fused_render_fallback(
+                    family,
+                    f'self-test mismatch on slot {int(slot.slot_id)} '
+                    f'(max_abs={max_error:.7g}, tolerance={tolerance:.7g})',
+                )
+                return
+            self._fused_numeric_validated_slots.add(numeric_key)
+            print(
+                f'Fused {family} renderer self-test passed on static ring slot '
+                f'{int(slot.slot_id)} (max_abs={max_error:.7g}).'
+            )
         self._fused_validated_keys.add(key)
 
     def capture_fused_ring_renderer(
@@ -14175,26 +14592,23 @@ class _GpuWorkerRenderEngine:
     # radial taps / fold (device) ----
 
     def _radial_taps_gpu(self, view: ViewInfo, angle_deg: float) -> Tuple[object, object]:
-        """Device port of the orientation-aware Radial sampler for one azimuth."""
+        """Device fallback for the active orientation-aware radial reconstruction filter."""
         torch = self.torch
         dev = self.device
         plane_h, plane_w = radial_plane_shape(view)
         n_u = int(view.src_w) if int(view.src_w) > 0 else int(view.diameter)
-        a = int(RADIAL_LANCZOS_A)
         coords = torch.linspace(
-            -float(view.roi_radius), float(view.roi_radius), n_u, dtype=torch.float32, device=dev,
+            -float(view.roi_radius), float(view.roi_radius), n_u,
+            dtype=torch.float32, device=dev,
         )
         theta = math.radians(float(angle_deg))
         xs = float(view.center_x) + coords * float(math.cos(theta))
         ys = float(view.center_y) + coords * float(math.sin(theta))
-        offs = torch.arange(-(a - 1), a + 1, dtype=torch.float32, device=dev)
+        offs = torch.tensor((0.0, 1.0), dtype=torch.float32, device=dev)
         x_pos = xs.floor().unsqueeze(1) + offs.unsqueeze(0)
         y_pos = ys.floor().unsqueeze(1) + offs.unsqueeze(0)
-        dx = xs.unsqueeze(1) - x_pos
-        dy = ys.unsqueeze(1) - y_pos
-        zero = torch.zeros((), dtype=torch.float32, device=dev)
-        x_w = torch.where(dx.abs() >= float(a), zero, torch.sinc(dx) * torch.sinc(dx / float(a)))
-        y_w = torch.where(dy.abs() >= float(a), zero, torch.sinc(dy) * torch.sinc(dy / float(a)))
+        x_w = (1.0 - (xs.unsqueeze(1) - x_pos).abs()).clamp_min_(0.0)
+        y_w = (1.0 - (ys.unsqueeze(1) - y_pos).abs()).clamp_min_(0.0)
         x_w = x_w * ((x_pos >= 0) & (x_pos < float(plane_w))).to(torch.float32)
         y_w = y_w * ((y_pos >= 0) & (y_pos < float(plane_h))).to(torch.float32)
         x_sum = x_w.sum(dim=1, keepdim=True)
@@ -14235,11 +14649,29 @@ class _GpuWorkerRenderEngine:
         return out
 
     def _radial_project_blocks(self, block2d: object, flat_idx: object, w2d: object) -> object:
-        """(rows, H*W) u8 block -> (rows, u) float32 Lanczos projection."""
+        """(rows, H*W) u8 block -> (rows, u) float32 active-filter projection."""
         samples = block2d[:, flat_idx]
         return (samples.to(self.torch.float32) * w2d.unsqueeze(0)).sum(dim=-1)
 
     def _render_radial_native_resident(self, view: ViewInfo, frame_idx: int) -> object:
+        """Render a Radial native plane, preferring the direct hardware texture kernel."""
+        if not radial_resident_gpu_render_supported(view):
+            raise RuntimeError(f'resident GPU Radial rendering is disabled for {view.name!r}')
+        if is_tilted_radial_view(view):
+            return self._render_tilted_radial_native_resident(view, int(frame_idx))
+        if _env_flag('YOLO_TTA_GPU_RADIAL_NATIVE_TEXTURE_KERNEL', True):
+            try:
+                return self._render_radial_native_texture(view, int(frame_idx))
+            except Exception as exc:
+                if 'radial_native' not in self._fused_warned_families:
+                    self._fused_warned_families.add('radial_native')
+                    print(
+                        f'Warning: upright Radial texture kernel unavailable ({exc}); '
+                        'using the resident Torch reconstruction path.'
+                    )
+        return self._render_radial_native_resident_torch(view, int(frame_idx))
+
+    def _render_radial_native_resident_torch(self, view: ViewInfo, frame_idx: int) -> object:
         """Render an upright or tilted Radial frame directly from the resident source volume."""
         if not radial_resident_gpu_render_supported(view):
             raise RuntimeError(f'resident GPU Radial rendering is disabled for {view.name!r}')
@@ -14398,67 +14830,144 @@ class _GpuWorkerRenderEngine:
             out[row0:row1] = (values * weights.unsqueeze(0)).sum(dim=-1)
         return out
 
-    def _render_tilted_radial_native_resident(self, view: ViewInfo, frame_idx: int) -> object:
-        """Render one tilted-Radial native plane on the resident GPU.
+    def _render_radial_native_texture(self, view: ViewInfo, frame_idx: int) -> object:
+        """Render one upright or tilted radial native plane through the 3D texture path."""
+        kernels = _fused_direct_render_kernels()
+        if kernels is None:
+            raise RuntimeError(
+                'CuPy/NVRTC kernels unavailable: '
+                + str(_FUSED_DIRECT_RENDER_KERNELS_ERROR or 'no diagnostic')
+            )
+        geometry = self._ensure_fused_radial_taps(view, kernels)
+        texture = self._ensure_radial_texture(kernels)
+        base = str(radial_base_view_name(view))
+        base_ids = {'transverse': 0, 'sagittal': 1, 'coronal': 2}
+        tilted = bool(is_tilted_radial_view(view))
+        direction = str(view.tilt_direction) if tilted else 'vertical'
+        if base not in base_ids or direction not in ('vertical', 'horizontal'):
+            raise RuntimeError(
+                f'unsupported Radial texture geometry base={base!r}, direction={direction!r}'
+            )
+        rows = int(view.src_h)
+        n_u = int(geometry.n_u)
+        stack_len = int(radial_stack_length(view))
+        out = self.torch.empty((rows, n_u), dtype=self.torch.float32, device=self.device)
+        cp_out = kernels.cp.asarray(out)
+        pixels = int(rows) * int(n_u)
+        kernels.radial_texture_native_f32(
+            ((pixels + 255) // 256,), (256,),
+            (
+                texture.texture,
+                np.int32(self._volume_gpu.shape[0]), np.int32(self._volume_gpu.shape[1]),
+                np.int32(self._volume_gpu.shape[2]), np.int32(self._logical_t),
+                np.int32(rows), np.int32(n_u), np.int32(stack_len),
+                np.int32(base_ids[base]), np.int32(0 if direction == 'vertical' else 1),
+                np.int32(frame_idx),
+                np.float32(
+                    math.tan(math.radians(float(view.tilt_angle_deg))) if tilted else 0.0
+                ),
+                np.float32(view.center_x), np.float32(view.center_y),
+                np.float32(view.roi_radius),
+                geometry.cp_angle_cos, geometry.cp_angle_sin, cp_out,
+            ),
+            stream=_cupy_external_stream(kernels.cp, self._stream),
+        )
+        announce_key = 'tilted_radial_native' if tilted else 'radial_native'
+        if announce_key not in self._fused_announced_families:
+            self._fused_announced_families.add(announce_key)
+            print(
+                f'Resident {"tilted-" if tilted else ""}Radial native-plane texture kernel active: '
+                f'{RADIAL_FILTER_LABEL}.'
+            )
+        return out
 
- Prefer the one-launch NVRTC kernel used by the direct TensorRT path. A mathematically
- equivalent Torch gather implementation remains available as a capability fallback."""
+    def _render_radial_texture_grid(
+        self,
+        view: ViewInfo,
+        frame_idx: int,
+        M_out_to_src: np.ndarray,
+        out_h: int,
+        out_w: int,
+    ) -> object:
+        """Compose the output affine and Radial transform into one texture reconstruction."""
+        if not is_radial_view(view):
+            raise ValueError(f'{view.name!r} is not a Radial view')
+        if int(frame_idx) < 0 or int(frame_idx) >= len(view.azimuths_deg):
+            raise IndexError(
+                f'Radial frame index {int(frame_idx)} is outside [0,{len(view.azimuths_deg)})'
+            )
+        kernels = _fused_direct_render_kernels()
+        if kernels is None:
+            raise RuntimeError(
+                'CuPy/NVRTC kernels unavailable: '
+                + str(_FUSED_DIRECT_RENDER_KERNELS_ERROR or 'no diagnostic')
+            )
+        geometry = self._ensure_fused_radial_taps(view, kernels)
+        texture = self._ensure_radial_texture(kernels)
+        base = str(radial_base_view_name(view))
+        base_ids = {'transverse': 0, 'sagittal': 1, 'coronal': 2}
+        tilted = bool(is_tilted_radial_view(view))
+        direction = str(view.tilt_direction) if tilted else 'vertical'
+        if base not in base_ids or direction not in ('vertical', 'horizontal'):
+            raise RuntimeError(
+                f'unsupported Radial texture geometry base={base!r}, direction={direction!r}'
+            )
+        matrix = np.asarray(M_out_to_src, dtype=np.float32).reshape(2, 3)
+        if not bool(np.all(np.isfinite(matrix))):
+            raise RuntimeError('Radial output-to-source affine is non-finite')
+        rows = int(view.src_h)
+        n_u = int(geometry.n_u)
+        stack_len = int(radial_stack_length(view))
+        if min(rows, n_u, stack_len, int(out_h), int(out_w)) <= 0:
+            raise RuntimeError('Radial texture output/source geometry is empty')
+        out = self.torch.empty(
+            (int(out_h), int(out_w)), dtype=self.torch.float32, device=self.device,
+        )
+        cp_out = kernels.cp.asarray(out)
+        pixels = int(out_h) * int(out_w)
+        kernels.radial_texture_grid_f32(
+            ((pixels + 255) // 256,), (256,),
+            (
+                texture.texture,
+                np.int32(self._volume_gpu.shape[0]), np.int32(self._volume_gpu.shape[1]),
+                np.int32(self._volume_gpu.shape[2]), np.int32(self._logical_t),
+                np.int32(rows), np.int32(n_u), np.int32(stack_len),
+                np.int32(base_ids[base]), np.int32(0 if direction == 'vertical' else 1),
+                np.int32(frame_idx),
+                np.float32(
+                    math.tan(math.radians(float(view.tilt_angle_deg))) if tilted else 0.0
+                ),
+                np.float32(view.center_x), np.float32(view.center_y),
+                np.float32(view.roi_radius),
+                np.int32(out_h), np.int32(out_w),
+                *(np.float32(v) for v in matrix.reshape(-1)),
+                geometry.cp_angle_cos, geometry.cp_angle_sin, cp_out,
+            ),
+            stream=_cupy_external_stream(kernels.cp, self._stream),
+        )
+        announce_key = 'tilted_radial_grid' if tilted else 'radial_grid'
+        if announce_key not in self._fused_announced_families:
+            self._fused_announced_families.add(announce_key)
+            print(
+                f'Direct {"tilted-" if tilted else ""}Radial texture-grid renderer active: '
+                f'output affine + radial mapping + {RADIAL_FILTER_LABEL} in one launch.'
+            )
+        return out
+
+    def _render_tilted_radial_native_resident(self, view: ViewInfo, frame_idx: int) -> object:
+        """Render a tilted-Radial plane through the texture kernel, with Torch fallback."""
         if not is_tilted_radial_view(view):
             raise ValueError(f'{view.name!r} is not a tilted-Radial view')
         native_kernel_enabled = _env_flag('YOLO_TTA_GPU_TILTED_RADIAL_NATIVE_KERNEL', True)
         if native_kernel_enabled:
             try:
-                kernels = _fused_direct_render_kernels()
-                if kernels is None:
-                    raise RuntimeError(
-                        'CuPy/NVRTC kernels unavailable: '
-                        + str(_FUSED_DIRECT_RENDER_KERNELS_ERROR or 'no diagnostic')
-                    )
-                taps = self._ensure_fused_radial_taps(view, kernels)
-                base = str(radial_base_view_name(view))
-                base_ids = {'transverse': 0, 'sagittal': 1, 'coronal': 2}
-                direction = str(view.tilt_direction)
-                if base not in base_ids or direction not in ('vertical', 'horizontal'):
-                    raise RuntimeError(
-                        f'unsupported tilted-Radial geometry base={base!r}, direction={direction!r}'
-                    )
-                rows = int(view.src_h)
-                n_u = int(taps.n_u)
-                stack_len = int(radial_stack_length(view))
-                out = self.torch.empty(
-                    (rows, n_u), dtype=self.torch.float32, device=self.device,
-                )
-                cp_out = kernels.cp.asarray(out)
-                pixels = int(rows) * int(n_u)
-                kernels.tilted_radial_native_f32(
-                    ((pixels + 255) // 256,), (256,),
-                    (
-                        self._fused_cupy_volume(kernels),
-                        np.int32(self._volume_gpu.shape[0]), np.int32(self._volume_gpu.shape[1]),
-                        np.int32(self._volume_gpu.shape[2]), np.int32(self._logical_t),
-                        np.int32(rows), np.int32(n_u), np.int32(stack_len),
-                        np.int32(base_ids[base]), np.int32(0 if direction == 'vertical' else 1),
-                        np.int32(frame_idx),
-                        np.float32(math.tan(math.radians(float(view.tilt_angle_deg)))),
-                        np.float32(view.center_x), np.float32(view.center_y),
-                        taps.cp_x_idx, taps.cp_y_idx, taps.cp_x_w, taps.cp_y_w,
-                        cp_out,
-                    ),
-                    stream=_cupy_external_stream(kernels.cp, self._stream),
-                )
-                if 'tilted_radial_native' not in self._fused_announced_families:
-                    self._fused_announced_families.add('tilted_radial_native')
-                    print(
-                        'Resident tilted-Radial native-plane CUDA kernel active '
-                        '(YOLO_TTA_GPU_TILTED_RADIAL_NATIVE_KERNEL=0 selects Torch gathers).'
-                    )
-                return out
+                return self._render_radial_native_texture(view, int(frame_idx))
             except Exception as exc:
                 if 'tilted_radial_native' not in self._fused_warned_families:
                     self._fused_warned_families.add('tilted_radial_native')
                     print(
-                        f'Warning: tilted-Radial native-plane kernel unavailable ({exc}); '
-                        'using the resident Torch gather renderer without requesting the host cube.'
+                        f'Warning: tilted-Radial texture kernel unavailable ({exc}); '
+                        'using the resident Torch reconstruction path without requesting the host cube.'
                     )
         return self._render_tilted_radial_native_resident_torch(view, int(frame_idx))
 
@@ -14472,7 +14981,7 @@ class _GpuWorkerRenderEngine:
 
         Transverse streams t slabs, sagittal streams y slabs arranged as ``(y,t,x)``,
         and coronal streams x slabs arranged as ``(x,t,y)``.  Each bounded slab is
-        contiguous before H2D transfer, so the existing Lanczos projection contract is
+        contiguous before H2D transfer, so the active radial-filter projection contract is
         shared by all three Cartesian Radial bases without materializing a full oriented
         volume on either host or device.
         """
@@ -14516,7 +15025,7 @@ class _GpuWorkerRenderEngine:
         count = len(indices)
         slab = np.empty((count, rows_out, u_len), dtype=np.uint8)
         stack_block = max(1, min(int(gpu_render_tblock_slices()), int(stack_len)))
-        tap_count = (RADIAL_LANCZOS_A * 2) ** 2
+        tap_count = int(RADIAL_FILTER_TAP_COUNT) ** 2
         per_az_bytes = (
             int(stack_len) * int(u_len) * np.dtype(np.float16).itemsize
             + int(u_len) * int(tap_count) * (
@@ -14769,12 +15278,28 @@ class _GpuWorkerRenderEngine:
 
     def _render_fullframe_frame(self, view: ViewInfo, aff: AffineSpec, frame_idx: int, out_size: int) -> object:
         if is_tilted_view(view):
-            return self._render_tilted_frame(view, aff.M_out_to_src, int(out_size), int(out_size), int(frame_idx))
+            return self._render_tilted_frame(
+                view, aff.M_out_to_src, int(out_size), int(out_size), int(frame_idx),
+            )
+        if is_radial_view(view) and _env_flag('YOLO_TTA_GPU_RADIAL_DIRECT_TEXTURE_GRID', True):
+            try:
+                return self._render_radial_texture_grid(
+                    view, int(frame_idx), aff.M_out_to_src, int(out_size), int(out_size),
+                )
+            except Exception as exc:
+                warning_key = 'tilted_radial_grid_fallback' if is_tilted_radial_view(view) else 'radial_grid_fallback'
+                if warning_key not in self._fused_warned_families:
+                    self._fused_warned_families.add(warning_key)
+                    print(
+                        f'Warning: direct Radial texture-grid render unavailable ({exc}); '
+                        'using native-plane reconstruction followed by the affine warp.'
+                    )
         plane = self._render_native_plane(view, int(frame_idx))
         if self._affine_is_identity_render(aff):
             return plane
         theta = _affine_theta_from_dst_to_src(
-            aff.M_out_to_src, int(plane.shape[0]), int(plane.shape[1]), int(out_size), int(out_size),
+            aff.M_out_to_src,
+            int(plane.shape[0]), int(plane.shape[1]), int(out_size), int(out_size),
         )
         grid = _get_cached_affine_grid(theta, int(out_size), int(out_size), self.device)
         return self.F.grid_sample(
@@ -14789,19 +15314,28 @@ class _GpuWorkerRenderEngine:
         frame_idx: int,
         out_size: int,
     ) -> object:
-        """One dense-tile inference raster, reusing the frame's cached native plane.
-
- A tile is just another output->native affine, so this is ``_render_fullframe_frame``
- with two differences: the native plane comes from the shared per-frame cache (every
- tile of a frame samples the SAME plane), and there is no angle-0 identity shortcut
- because a tile is always a crop+scale of its parent canvas."""
+        """Render one dense-tile inference raster directly when the view supports it."""
+        matrix = np.asarray(M_out_to_src, dtype=np.float32)
         if is_tilted_view(view):
             return self._render_tilted_frame(
-                view, np.asarray(M_out_to_src, dtype=np.float32), int(out_size), int(out_size), int(frame_idx),
+                view, matrix, int(out_size), int(out_size), int(frame_idx),
             )
+        if is_radial_view(view) and _env_flag('YOLO_TTA_GPU_RADIAL_DIRECT_TEXTURE_GRID', True):
+            try:
+                return self._render_radial_texture_grid(
+                    view, int(frame_idx), matrix, int(out_size), int(out_size),
+                )
+            except Exception as exc:
+                warning_key = 'tilted_radial_tile_grid_fallback' if is_tilted_radial_view(view) else 'radial_tile_grid_fallback'
+                if warning_key not in self._fused_warned_families:
+                    self._fused_warned_families.add(warning_key)
+                    print(
+                        f'Warning: direct Radial tile texture-grid render unavailable ({exc}); '
+                        'using the cached native plane plus affine grid sampling.'
+                    )
         plane = self._render_native_plane_cached(view, int(frame_idx))
         theta = _affine_theta_from_dst_to_src(
-            np.asarray(M_out_to_src, dtype=np.float32),
+            matrix,
             int(plane.shape[0]), int(plane.shape[1]), int(out_size), int(out_size),
         )
         grid = _get_cached_affine_grid(theta, int(out_size), int(out_size), self.device)
@@ -15131,12 +15665,13 @@ class GpuRenderedYoloSource:
                 if slot.render_graph is not None and slot.render_graph_key != expected_key:
                     slot.render_graph = None
                     slot.render_graph_key = None
-            # Synchronize the first async descriptor/render launch before
-            # _try_resident_trt_ring_accumulate consumes a frame or borrows TRT bindings.
-            self.engine.validate_fused_ring_renderer(
-                self._direct_ring[0], self.view, self.job,
-                int(self.slice_offset), int(self.out_size),
-            )
+            # Validate both binding/metadata address pairs before capturing either graph.
+            # This also covers slot 1 when render graphs are disabled.
+            for slot in self._direct_ring:
+                self.engine.validate_fused_ring_renderer(
+                    slot, self.view, self.job,
+                    int(self.slice_offset), int(self.out_size),
+                )
             for slot in self._direct_ring:
                 self.engine.capture_fused_ring_renderer(
                     slot, self.view, self.job,
@@ -15876,6 +16411,7 @@ def run_prediction_volume_in_worker(
                         tuple(int(x) for x in native_resize['shape']),
                         str(native_resize.get('dtype', 'uint8')),
                         resize_to_t=int(task['source_shape'][0]),
+                        require_radial_texture=bool(task.get('radial_texture_required', is_radial_view(view))),
                     )
                     if render_mode != 'resident':
                         _wait_for_cube_ready_sentinel(
@@ -15887,12 +16423,14 @@ def run_prediction_volume_in_worker(
                             str(task['source_volume_path']),
                             tuple(int(x) for x in task['source_shape']),
                             str(task.get('source_dtype', 'uint8')),
+                            require_radial_texture=bool(task.get('radial_texture_required', is_radial_view(view))),
                         )
                 else:
                     render_mode = gpu_engine.ensure_volume(
                         str(task['source_volume_path']),
                         tuple(int(x) for x in task['source_shape']),
                         str(task.get('source_dtype', 'uint8')),
+                        require_radial_texture=bool(task.get('radial_texture_required', is_radial_view(view))),
                     )
                 if render_mode == 'resident' and tile_group is not None and resident_view_supported:
                     request_affine_grid_cache_entries(2 * int(len(tile_group)) + 8)
@@ -16008,6 +16546,10 @@ def run_prediction_volume_in_worker(
                 device_hole_fill=bool(task.get('device_hole_fill', False)),
                 defer_device_union_flush=bool(
                     gpu_union_flush_overlap_enabled() and tile_group is None
+                ),
+                sparse_bbox_retirement=bool(
+                    tile_group is None
+                    and str(task.get('result_mode', 'file')) == 'direct_union'
                 ),
                 # one affine per tile, selected by unit index % tile count.
                 M_out_to_native_by_unit=(
@@ -17975,7 +18517,7 @@ def label_foreground_volume_streaming(
         'YOLO_TTA_TOPOLOGY_UNION_BATCH_CODES', 1_048_576,
     ))
     print(
-        '3D topology local-union plan (v16.0.11): '
+        '3D topology local-union plan: '
         f'{len(slab_ranges)} slab(s) x {int(topology_slab_slices())} slices, '
         f'{int(slab_worker_count)} concurrent worker(s), '
         f'compiled_nogil={bool(_numba_union_find_batch_kernel is not None and compiled_topology_kernels_enabled())}.'
@@ -18866,26 +19408,56 @@ def main_process_gpu_stage_inference_overlap_enabled() -> bool:
 
 
 def main_process_gpu_stage_inference_priority_enabled() -> bool:
-    """Reserve worker GPUs for inference until the global inference queue is permanently drained.
+    """Reserve worker GPUs while inference work is currently dispatchable.
 
-    The old coordinator blocked an output stage only while a task was already queued or running
-    on that exact device. A long NRRD mirror/backprojection stage could therefore win the small
-    result-publication/refill race and strand that GPU while inference work still existed.
+    Pending work which cannot pass live-view/RAM admission does not by itself keep every GPU
+    reserved.  The scheduler publishes that distinction to the coordinator below.
     """
     return _env_flag('YOLO_TTA_MAIN_GPU_STAGE_INFERENCE_PRIORITY', True)
+
+
+def main_process_gpu_stage_stall_aux_limit() -> int:
+    """Maximum preemptible Radial GPU stages admitted during an inference stall."""
+    return max(1, _env_int('YOLO_TTA_MAIN_GPU_STAGE_STALL_AUX_LEASES', 1))
+
+
+def main_process_gpu_radial_preemption_band_slices() -> int:
+    """Output-slice quantum for a Radial GPU lease borrowed during an inference stall."""
+    return max(32, min(64, _env_int('YOLO_TTA_MAIN_GPU_RADIAL_PREEMPT_BAND', 64)))
+
+
+def _main_process_gpu_stage_purpose_is_preemptible(purpose: str) -> bool:
+    """Only Radial backprojection currently has an exactly-once CPU suffix fallback."""
+    return 'radial backprojection' in str(purpose).strip().lower()
 
 
 class _MainProcessGpuStageLease:
     """Exclusive main-process lease for one logical CUDA device."""
 
-    def __init__(self, coordinator: '_MainProcessGpuStageCoordinator', device_index: int, purpose: str) -> None:
+    def __init__(
+        self,
+        coordinator: '_MainProcessGpuStageCoordinator',
+        device_index: int,
+        purpose: str,
+        *,
+        preemptible: bool = False,
+    ) -> None:
         self._coordinator = coordinator
         self.device_index = int(device_index)
         self.purpose = str(purpose)
+        self.preemptible = bool(preemptible)
         self._released = False
 
     def torch_device(self, torch_mod: object) -> object:
         return torch_mod.device(f'cuda:{int(self.device_index)}')
+
+    def should_yield_to_inference(self) -> bool:
+        """Return a sticky revocation request for a borrowed, preemptible lease."""
+        if self._released or not self.preemptible:
+            return False
+        return self._coordinator.stage_should_yield_to_inference(
+            self.device_index, self.purpose,
+        )
 
     def release(self) -> None:
         if self._released:
@@ -18919,7 +19491,9 @@ class _MainProcessGpuStageCoordinator:
         self._worker_devices: set[int] = set()
         self._inference_inflight: Counter[int] = Counter()
         self._stage_leases: Dict[int, str] = {}
+        self._stage_preemption_requested: set[int] = set()
         self._inference_priority_active = False
+        self._inference_dispatchable_pending = True
         self._wake_callback: Optional[Callable[[], None]] = None
 
     def configure_workers(self, worker_devices: Sequence[int]) -> None:
@@ -18927,9 +19501,13 @@ class _MainProcessGpuStageCoordinator:
             self._worker_devices = {int(v) for v in worker_devices}
             self._inference_inflight.clear()
             self._stage_leases.clear()
+            self._stage_preemption_requested.clear()
             self._inference_priority_active = bool(
                 self._worker_devices and main_process_gpu_stage_inference_priority_enabled()
             )
+            # The scheduler publishes true only after an actual central-queue task passes
+            # its current RAM/view admission checks.
+            self._inference_dispatchable_pending = False
 
     def set_inference_priority_active(self, active: bool) -> None:
         callback: Optional[Callable[[], None]] = None
@@ -18937,6 +19515,9 @@ class _MainProcessGpuStageCoordinator:
             self._inference_priority_active = bool(
                 active and self._worker_devices and main_process_gpu_stage_inference_priority_enabled()
             )
+            if not self._inference_priority_active:
+                self._inference_dispatchable_pending = False
+                self._stage_preemption_requested.clear()
             callback = self._wake_callback
         if callback is not None:
             try:
@@ -18944,11 +19525,58 @@ class _MainProcessGpuStageCoordinator:
             except Exception:
                 pass
 
-    def _priority_blocks_stage_locked(self, device_index: int) -> bool:
+    def set_inference_dispatchable_pending(self, dispatchable: bool) -> None:
+        """Publish whether at least one pending task passes current scheduler admission.
+
+        A false value is meaningful only while inference priority remains active.  It permits
+        a bounded auxiliary lease once every queued/running inference lease has retired.
+        """
+        callback: Optional[Callable[[], None]] = None
+        with self._lock:
+            updated = bool(dispatchable)
+            changed = bool(updated != self._inference_dispatchable_pending)
+            self._inference_dispatchable_pending = bool(updated)
+            if bool(updated) and self._inference_priority_active:
+                self._stage_preemption_requested.update(
+                    int(device)
+                    for device, purpose in self._stage_leases.items()
+                    if _main_process_gpu_stage_purpose_is_preemptible(str(purpose))
+                )
+            callback = self._wake_callback if changed else None
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                pass
+
+    def _inference_stalled_locked(self) -> bool:
         return bool(
             self._inference_priority_active
+            and not self._inference_dispatchable_pending
+            and sum(int(v) for v in self._inference_inflight.values()) <= 0
+        )
+
+    def _priority_blocks_stage_locked(self, device_index: int, purpose: str) -> bool:
+        if (
+            not self._inference_priority_active
+            or main_process_gpu_stage_inference_overlap_enabled()
+            or int(device_index) not in self._worker_devices
+        ):
+            return False
+        if not self._inference_stalled_locked():
+            return True
+        # Only Radial projection has an exactly-once band boundary and CPU suffix fallback.
+        # Other main-process CUDA stages remain blocked until inference priority is released.
+        if not _main_process_gpu_stage_purpose_is_preemptible(str(purpose)):
+            return True
+        return bool(len(self._stage_leases) >= int(main_process_gpu_stage_stall_aux_limit()))
+
+    def _stage_is_preemptible_locked(self, device_index: int, purpose: str) -> bool:
+        return bool(
+            int(device_index) in self._worker_devices
+            and _main_process_gpu_stage_purpose_is_preemptible(str(purpose))
+            and self._inference_stalled_locked()
             and not main_process_gpu_stage_inference_overlap_enabled()
-            and int(device_index) in self._worker_devices
         )
 
     def set_wake_callback(self, callback: Optional[Callable[[], None]]) -> None:
@@ -18960,7 +19588,9 @@ class _MainProcessGpuStageCoordinator:
             self._worker_devices.clear()
             self._inference_inflight.clear()
             self._stage_leases.clear()
+            self._stage_preemption_requested.clear()
             self._inference_priority_active = False
+            self._inference_dispatchable_pending = False
             self._wake_callback = None
 
     def can_dispatch_inference(self, device_index: int) -> bool:
@@ -18989,6 +19619,18 @@ class _MainProcessGpuStageCoordinator:
             else:
                 self._inference_inflight.pop(device, None)
 
+    def stage_should_yield_to_inference(self, device_index: int, purpose: str) -> bool:
+        """Poll the sticky dispatchable-work revocation set at a safe stage boundary."""
+        device = int(device_index)
+        with self._lock:
+            return bool(
+                device in self._stage_preemption_requested
+                and self._stage_leases.get(device) == str(purpose)
+                and device in self._worker_devices
+                and self._inference_priority_active
+                and not main_process_gpu_stage_inference_overlap_enabled()
+            )
+
     def try_acquire_specific_stage(
         self,
         torch_mod: object,
@@ -19006,15 +19648,19 @@ class _MainProcessGpuStageCoordinator:
             overlap = bool(main_process_gpu_stage_inference_overlap_enabled())
             if device in self._stage_leases:
                 return None
-            if self._priority_blocks_stage_locked(device):
+            if self._priority_blocks_stage_locked(device, str(purpose)):
                 return None
             if not overlap and int(self._inference_inflight.get(device, 0)) > 0:
                 return None
             aux_pool = gpu_worker_aux_interpolation_pool()
             if aux_pool is not None and not bool(aux_pool.revoke_worker(device)):
                 return None
+            preemptible = bool(self._stage_is_preemptible_locked(device, str(purpose)))
             self._stage_leases[device] = str(purpose)
-            return _MainProcessGpuStageLease(self, device, str(purpose))
+            self._stage_preemption_requested.discard(device)
+            return _MainProcessGpuStageLease(
+                self, device, str(purpose), preemptible=bool(preemptible),
+            )
 
     def try_acquire_stage(self, torch_mod: object, purpose: str) -> Optional[_MainProcessGpuStageLease]:
         try:
@@ -19045,7 +19691,7 @@ class _MainProcessGpuStageCoordinator:
             available = [
                 idx for idx in candidates
                 if idx not in self._stage_leases
-                and not self._priority_blocks_stage_locked(idx)
+                and not self._priority_blocks_stage_locked(idx, str(purpose))
                 and (overlap or int(self._inference_inflight.get(idx, 0)) == 0)
             ]
             if not available:
@@ -19075,8 +19721,12 @@ class _MainProcessGpuStageCoordinator:
                     best_index = int(idx)
             if best_index is None:
                 return None
+            preemptible = bool(self._stage_is_preemptible_locked(int(best_index), str(purpose)))
             self._stage_leases[int(best_index)] = str(purpose)
-            return _MainProcessGpuStageLease(self, int(best_index), str(purpose))
+            self._stage_preemption_requested.discard(int(best_index))
+            return _MainProcessGpuStageLease(
+                self, int(best_index), str(purpose), preemptible=bool(preemptible),
+            )
 
     def release_stage(self, device_index: int, purpose: str) -> None:
         callback: Optional[Callable[[], None]] = None
@@ -19084,6 +19734,7 @@ class _MainProcessGpuStageCoordinator:
             current = self._stage_leases.get(int(device_index))
             if current == str(purpose):
                 self._stage_leases.pop(int(device_index), None)
+                self._stage_preemption_requested.discard(int(device_index))
             callback = self._wake_callback
         if callback is not None:
             try:
@@ -19097,7 +19748,10 @@ class _MainProcessGpuStageCoordinator:
                 'worker_devices': sorted(self._worker_devices),
                 'inference_inflight': dict(self._inference_inflight),
                 'stage_leases': dict(self._stage_leases),
+                'stage_preemption_requested': sorted(self._stage_preemption_requested),
                 'inference_priority_active': bool(self._inference_priority_active),
+                'inference_dispatchable_pending': bool(self._inference_dispatchable_pending),
+                'inference_admission_stalled': bool(self._inference_stalled_locked()),
             }
 
 
@@ -19116,6 +19770,10 @@ def _reset_main_process_gpu_stage_coordinator() -> None:
 
 def _set_main_process_gpu_inference_priority_active(active: bool) -> None:
     _MAIN_PROCESS_GPU_STAGE_COORDINATOR.set_inference_priority_active(bool(active))
+
+
+def _set_main_process_gpu_inference_dispatchable_pending(dispatchable: bool) -> None:
+    _MAIN_PROCESS_GPU_STAGE_COORDINATOR.set_inference_dispatchable_pending(bool(dispatchable))
 
 
 def _set_main_process_gpu_stage_wake_callback(callback: Optional[Callable[[], None]]) -> None:
@@ -19810,7 +20468,7 @@ class _ResidentTensorRTRingExecutor:
             self.kernels.upsample_quantize(
                 ((out_pixels + 255) // 256,), (256,),
                 (
-                    refs['max_logit'], conf_proto_arg, np.int32(ph), np.int32(pw),
+                    refs['max_logit'], conf_proto_arg, refs['count'], np.int32(ph), np.int32(pw),
                     np.int32(self.out_size), np.int32(self.out_size), refs['native_union'],
                     refs.get('native_conf', np.uintp(0)),
                 ),
@@ -19820,7 +20478,7 @@ class _ResidentTensorRTRingExecutor:
             self.kernels.upsample_quantize_affine(
                 ((out_pixels + 255) // 256,), (256,),
                 (
-                    refs['max_logit'], conf_proto_arg, np.int32(ph), np.int32(pw),
+                    refs['max_logit'], conf_proto_arg, refs['count'], np.int32(ph), np.int32(pw),
                     np.int32(self.out_size), np.int32(self.out_size),
                     np.int32(self.native_h), np.int32(self.native_w),
                     *slot.native_to_out,
@@ -19944,14 +20602,15 @@ class _ResidentTensorRTRingExecutor:
                 slot.post_graph.replay()
             else:
                 self._launch_post(slot)
-            # The static slot output is copied into the task-resident destination before
-            # the slot is released. No payload/result object or per-frame Future exists.
-            device_union.union_dev[destination_index].copy_(slot.native_union, non_blocking=True)
-            if device_union.conf_dev is not None and slot.native_conf is not None:
-                device_union.conf_dev[destination_index].copy_(slot.native_conf, non_blocking=True)
+            # Dense mode copies into the task accumulator. Sparse direct-union mode hands
+            # the plane to a bounded retirement ring that derives a bbox and performs only
+            # crop D2H while this TensorRT slot continues cycling.
+            device_union.enqueue_native_frame(
+                int(destination_index), slot.native_union, slot.native_conf,
+                slot.compact_count[0], producer_stream=slot.post_stream,
+            )
             frame_counts_dev[unit_index].copy_(slot.compact_count[0], non_blocking=True)
             slot.post_done.record(slot.post_stream)
-        device_union.written[destination_index] = True
         slot.post_valid = True
 
     def synchronize(self) -> None:
@@ -20323,7 +20982,11 @@ def _try_resident_trt_ring_accumulate(
 
     try:
         union_shape = tuple(int(x) for x in device_union.union_dev.shape)
-        expected_shape = (int(num_frames), int(native_h), int(native_w))
+        expected_shape = (
+            int(device_union.ring_frames) if bool(device_union.sparse_retirement) else int(num_frames),
+            int(native_h),
+            int(native_w),
+        )
         if union_shape != expected_shape:
             return _decline()
         if (
@@ -20632,6 +21295,29 @@ class SinkOnlyProjectionResult:
     shape: Tuple[int, int, int]
 
 
+@dataclass(frozen=True)
+class _RadialGpuBackprojectionProgress:
+    """Exactly committed GPU prefix; an optional CPU path owns the remaining suffix."""
+
+    completed_t: int
+    preempted: bool = False
+
+
+def _radial_projection_suffix_ranges(
+    completed_t: int,
+    total_t: int,
+    chunk_t: int,
+) -> List[Tuple[int, int]]:
+    """Partition only the uncommitted suffix, preserving exactly-once sink ownership."""
+    total = max(0, int(total_t))
+    start = max(0, min(int(completed_t), int(total)))
+    chunk = max(1, int(chunk_t))
+    return [
+        (int(t0), min(int(total), int(t0) + int(chunk)))
+        for t0 in range(int(start), int(total), int(chunk))
+    ]
+
+
 _RADIAL_RESIDENT_BACKPROJECT_KERNEL: Optional[object] = None
 _RADIAL_RESIDENT_BACKPROJECT_KERNEL_FAILED = False
 _RADIAL_RESIDENT_BACKPROJECT_KERNEL_ERROR: Optional[str] = None
@@ -20775,16 +21461,16 @@ def _radial_backproject_gpu_resident(
     known_row_occupancy: Optional[np.ndarray] = None,
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
     sink_only: bool = False,
-) -> bool:
+) -> Optional[_RadialGpuBackprojectionProgress]:
     """Run full-resident Radial backprojection under an inference-exclusive GPU lease."""
     if not gpu_resident_radial_backproject_enabled():
-        return False
+        return None
     try:
         import torch  # type: ignore
         if not bool(torch.cuda.is_available()):
-            return False
+            return None
     except Exception:
-        return False
+        return None
     lease = _try_acquire_main_process_gpu_stage(
         torch, f'{desc} full-resident Radial backprojection',
     )
@@ -20794,7 +21480,8 @@ def _radial_backproject_gpu_resident(
             f'{desc}: full-resident GPU backprojection skipped because every eligible GPU '
             'has active/queued inference or another main-process GPU stage; trying the bounded fallback.',
         )
-        return False
+        return None
+    progress: Optional[_RadialGpuBackprojectionProgress] = None
     try:
         dev = lease.torch_device(torch)
         # NVRTC/module initialization is itself a CUDA allocation. Keep it inside the
@@ -20802,8 +21489,8 @@ def _radial_backproject_gpu_resident(
         with torch.cuda.device(dev):
             kernels = _radial_resident_backproject_kernel()
         if kernels is None:
-            return False
-        return _radial_backproject_gpu_resident_on_device(
+            return None
+        progress = _radial_backproject_gpu_resident_on_device(
             radial_mask_mm,
             vol_mm,
             valid_mask,
@@ -20820,9 +21507,23 @@ def _radial_backproject_gpu_resident(
             kernels=kernels,
             torch=torch,
             dev=dev,
+            yield_requested=(
+                lease.should_yield_to_inference if bool(lease.preemptible) else None
+            ),
+            preemption_band_slices=(
+                main_process_gpu_radial_preemption_band_slices()
+                if bool(lease.preemptible) else None
+            ),
         )
     finally:
         lease.release()
+    if progress is not None and bool(progress.preempted):
+        runtime_telemetry().add('scheduler.radial_gpu_band_preemptions', 1)
+        print(
+            f'{desc}: released borrowed full-resident GPU after exactly committed '
+            f'[0:{int(progress.completed_t)}) output slices; continuing the suffix on CPU.'
+        )
+    return progress
 
 
 def _radial_backproject_gpu_resident_on_device(
@@ -20843,11 +21544,16 @@ def _radial_backproject_gpu_resident_on_device(
     kernels: object,
     torch: object,
     dev: object,
-) -> bool:
+    yield_requested: Optional[Callable[[], bool]] = None,
+    preemption_band_slices: Optional[int] = None,
+) -> Optional[_RadialGpuBackprojectionProgress]:
     """Backproject a fully resident Radial volume with overlapped upload and host commit."""
     n_az, work_t, u_len = (int(v) for v in radial_mask_mm.shape)
     plane_px = int(out_h) * int(out_w)
     t_chunk = max(1, _env_int('YOLO_TTA_GPU_BACKPROJECT_RESIDENT_T_CHUNK', 64))
+    if preemption_band_slices is not None:
+        t_chunk = max(32, min(64, int(preemption_band_slices)))
+    minimum_t_chunk = 32 if preemption_band_slices is not None else 8
     requested_pipeline_slots = max(1, min(3, _env_int(
         'YOLO_TTA_GPU_BACKPROJECT_RESIDENT_PIPELINE_SLOTS', 2,
     )))
@@ -20862,9 +21568,9 @@ def _radial_backproject_gpu_resident_on_device(
     try:
         free_bytes, _total = torch.cuda.mem_get_info(dev)
     except Exception:
-        return False
-    while t_chunk > 8 and int(free_bytes) < int(base_need) + int(reserve):
-        t_chunk //= 2
+        return None
+    while t_chunk > int(minimum_t_chunk) and int(free_bytes) < int(base_need) + int(reserve):
+        t_chunk = max(int(minimum_t_chunk), int(t_chunk) // 2)
         output_bytes = int(t_chunk) * int(plane_px)
         base_need = int(
             source_bytes + map_bytes + int(requested_pipeline_slots) * output_bytes
@@ -20875,7 +21581,7 @@ def _radial_backproject_gpu_resident_on_device(
             f'{desc}: full-resident GPU backprojection skipped (need≈{base_need / GIB:.1f} GiB '
             f'+ {reserve / GIB:.1f} GiB reserve, free={int(free_bytes) / GIB:.1f} GiB).'
         )
-        return False
+        return None
 
     if known_row_occupancy is not None and int(np.asarray(known_row_occupancy).shape[0]) == int(work_t):
         row_any = np.asarray(known_row_occupancy, dtype=bool)
@@ -20923,6 +21629,7 @@ def _radial_backproject_gpu_resident_on_device(
     commit_pool: Optional[ThreadPoolExecutor] = None
     commit_futures: List[Optional[Future]] = []
     layout = 'azimuth-major'
+    preempted_at: Optional[int] = None
     try:
         compute_stream = torch.cuda.Stream(device=dev)
         copy_stream = torch.cuda.Stream(device=dev)
@@ -21077,6 +21784,13 @@ def _radial_backproject_gpu_resident_on_device(
             for _chunk_idx, t0 in enumerate(tqdm(
                 range(0, int(t_dim), int(t_chunk)), desc=f'{desc} [resident gpu]',
             )):
+                if (
+                    int(t0) > 0
+                    and yield_requested is not None
+                    and bool(yield_requested())
+                ):
+                    preempted_at = int(t0)
+                    break
                 t1 = min(int(t_dim), int(t0) + int(t_chunk))
                 v0 = v_range_for_t(int(t0))[0]
                 v1 = v_range_for_t(int(t1 - 1))[1]
@@ -21127,17 +21841,21 @@ def _radial_backproject_gpu_resident_on_device(
             copy_stream.synchronize()
             projection_seconds = time.perf_counter() - projection_t0
 
+        completed_t = int(t_dim) if preempted_at is None else int(preempted_at)
         total_seconds = time.perf_counter() - phase_start
-        print(
-            f'{desc}: full-resident GPU backprojection complete; source={source_bytes / GIB:.1f} GiB, '
-            f'layout={layout}, upload_slots={len(pin_src_slots)}, pipeline_slots={len(pin_out_slots)}, '
-            f'output={"sink-only" if bool(sink_only) else "dense+sink"}, '
-            f'active_rows={int(np.count_nonzero(row_any))}/{int(work_t)}, '
-            f'upload={upload_seconds:.2f}s, transpose={transpose_seconds:.2f}s, '
-            f'project+commit wall={projection_seconds:.2f}s, commit CPU sum={commit_cpu_seconds:.2f}s, '
-            f'total={total_seconds:.2f}s.'
+        if preempted_at is None:
+            print(
+                f'{desc}: full-resident GPU backprojection complete; source={source_bytes / GIB:.1f} GiB, '
+                f'layout={layout}, upload_slots={len(pin_src_slots)}, pipeline_slots={len(pin_out_slots)}, '
+                f'output={"sink-only" if bool(sink_only) else "dense+sink"}, '
+                f'active_rows={int(np.count_nonzero(row_any))}/{int(work_t)}, '
+                f'upload={upload_seconds:.2f}s, transpose={transpose_seconds:.2f}s, '
+                f'project+commit wall={projection_seconds:.2f}s, commit CPU sum={commit_cpu_seconds:.2f}s, '
+                f'total={total_seconds:.2f}s.'
+            )
+        return _RadialGpuBackprojectionProgress(
+            completed_t=int(completed_t), preempted=bool(preempted_at is not None),
         )
-        return True
     finally:
         active_exception = sys.exc_info()[0] is not None
         cleanup_error: Optional[BaseException] = None
@@ -21206,14 +21924,14 @@ def _radial_backproject_gpu_streaming(
     known_slice_bboxes: Optional[np.ndarray] = None,
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
     sink_only: bool = False,
-) -> bool:
+) -> Optional[_RadialGpuBackprojectionProgress]:
     """Run bounded Radial backprojection under an inference-exclusive GPU lease."""
     try:
         import torch  # type: ignore
         if not bool(torch.cuda.is_available()):
-            return False
+            return None
     except Exception:
-        return False
+        return None
     lease = _try_acquire_main_process_gpu_stage(
         torch, f'{desc} streaming Radial backprojection',
     )
@@ -21223,9 +21941,10 @@ def _radial_backproject_gpu_streaming(
             f'{desc}: streaming GPU backprojection skipped because every eligible GPU '
             'has active/queued inference or another main-process GPU stage; using the CPU path.',
         )
-        return False
+        return None
+    progress: Optional[_RadialGpuBackprojectionProgress] = None
     try:
-        return _radial_backproject_gpu_streaming_on_device(
+        progress = _radial_backproject_gpu_streaming_on_device(
             radial_mask_mm,
             vol_mm,
             valid_pos,
@@ -21241,9 +21960,23 @@ def _radial_backproject_gpu_streaming(
             sink_only=bool(sink_only),
             torch=torch,
             dev=lease.torch_device(torch),
+            yield_requested=(
+                lease.should_yield_to_inference if bool(lease.preemptible) else None
+            ),
+            preemption_band_slices=(
+                main_process_gpu_radial_preemption_band_slices()
+                if bool(lease.preemptible) else None
+            ),
         )
     finally:
         lease.release()
+    if progress is not None and bool(progress.preempted):
+        runtime_telemetry().add('scheduler.radial_gpu_band_preemptions', 1)
+        print(
+            f'{desc}: released borrowed streaming GPU after exactly committed '
+            f'[0:{int(progress.completed_t)}) output slices; continuing the suffix on CPU.'
+        )
+    return progress
 
 
 def _radial_backproject_gpu_streaming_on_device(
@@ -21263,17 +21996,22 @@ def _radial_backproject_gpu_streaming_on_device(
     *,
     torch: object,
     dev: object,
-) -> bool:
+    yield_requested: Optional[Callable[[], bool]] = None,
+    preemption_band_slices: Optional[int] = None,
+) -> Optional[_RadialGpuBackprojectionProgress]:
     """Backproject a Radial volume through a bounded streaming GPU working set."""
     n_az, work_t, u_len = (int(x) for x in radial_mask_mm.shape)
     plane_px = int(out_h) * int(out_w)
     # A larger projection quantum amortizes map gathers and the t-major staging transpose.
     t_chunk = max(1, _env_int('YOLO_TTA_GPU_BACKPROJECT_T_CHUNK', 128))
+    if preemption_band_slices is not None:
+        t_chunk = max(32, min(64, int(preemption_band_slices)))
+    minimum_t_chunk = 32 if preemption_band_slices is not None else 16
     cross_bytes = int(n_az) * int(u_len)
     try:
         free_bytes, _total = torch.cuda.mem_get_info(dev)
     except Exception:
-        return False
+        return None
 
     def _projection_need(chunk_planes: int) -> Tuple[int, int]:
         rows = int(math.ceil(float(chunk_planes) * float(work_t) / float(max(1, t_dim)))) + 2
@@ -21288,15 +22026,15 @@ def _radial_backproject_gpu_streaming_on_device(
         return int(rows), int(need_bytes)
 
     max_rows, need = _projection_need(int(t_chunk))
-    while int(t_chunk) > 16 and int(free_bytes) < int(need) + 1 * GIB:
-        t_chunk = max(16, int(t_chunk) // 2)
+    while int(t_chunk) > int(minimum_t_chunk) and int(free_bytes) < int(need) + 1 * GIB:
+        t_chunk = max(int(minimum_t_chunk), int(t_chunk) // 2)
         max_rows, need = _projection_need(int(t_chunk))
     if int(free_bytes) < int(need) + 1 * GIB:
         print(
             f'{desc}: GPU backprojection skipped (needs ~{need / GIB:.1f} GiB + 1 GiB headroom, '
             f'{free_bytes / GIB:.1f} GiB free); using the CPU path.'
         )
-        return False
+        return None
 
     if known_row_occupancy is not None and int(np.asarray(known_row_occupancy).shape[0]) == int(work_t):
         row_any = np.asarray(known_row_occupancy, dtype=bool)
@@ -21317,6 +22055,7 @@ def _radial_backproject_gpu_streaming_on_device(
     pair_row_t = pair_out_t = pair_values = reduced = sub = None
     cleanup_error: Optional[BaseException] = None
     active_exception = False
+    preempted_at: Optional[int] = None
     try:
         stream = torch.cuda.Stream(device=dev)
         with torch.cuda.stream(stream):
@@ -21332,6 +22071,13 @@ def _radial_backproject_gpu_streaming_on_device(
             )
             scatter_reduce_supported = True
             for t0 in tqdm(range(0, int(t_dim), t_chunk), desc=f'{desc} [gpu]'):
+                if (
+                    int(t0) > 0
+                    and yield_requested is not None
+                    and bool(yield_requested())
+                ):
+                    preempted_at = int(t0)
+                    break
                 rows_dev = gathered = None
                 pair_row_t = pair_out_t = pair_values = reduced = sub = None
                 t1 = min(int(t_dim), t0 + t_chunk)
@@ -21439,11 +22185,15 @@ def _radial_backproject_gpu_streaming_on_device(
         )
         if cleanup_error is not None and not bool(active_exception):
             raise cleanup_error
-    print(
-        f'{desc}: GPU streaming backprojection complete ({t_dim} output slices; '
-        f'output={"sink-only" if bool(sink_only) else "dense+sink"}).'
+    completed_t = int(t_dim) if preempted_at is None else int(preempted_at)
+    if preempted_at is None:
+        print(
+            f'{desc}: GPU streaming backprojection complete ({t_dim} output slices; '
+            f'output={"sink-only" if bool(sink_only) else "dense+sink"}).'
+        )
+    return _RadialGpuBackprojectionProgress(
+        completed_t=int(completed_t), preempted=bool(preempted_at is not None),
     )
-    return True
 
 def _log_radial_backprojection_densification(
     desc: str,
@@ -21721,10 +22471,284 @@ def _backproject_tilted_radial_volume_to_volume(
     out_shape_tyx: Optional[Tuple[int, int, int]],
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]],
     sink_only: bool,
-) -> np.ndarray:
+) -> np.ndarray | SinkOnlyProjectionResult:
     """Radial -> concrete Tilted stack -> final orthogonal volume."""
     if bool(sink_only):
-        raise ValueError(f'{desc}: sink-only projection is not available for tilted Radial views')
+        if projection_block_callback is None:
+            raise ValueError(f'{desc}: sink_only=True requires projection_block_callback')
+
+        tilted_source = radial_source_tilted_view(radial_view)
+        target_shape = (
+            (int(radial_view.full_t), int(radial_view.full_h), int(radial_view.full_w))
+            if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
+        )
+        t_dim, out_h, out_w = (int(v) for v in target_shape)
+        if min(t_dim, out_h, out_w) <= 0:
+            raise ValueError(f'{desc}: invalid tilted-Radial output shape {target_shape}')
+
+        plan, plan_stats = build_radial_backprojection_plan(radial_view)
+        _log_radial_backprojection_densification(desc, plan_stats)
+        if not plan:
+            _emit_projection_empty_range(
+                projection_block_callback,
+                0,
+                int(t_dim),
+                (int(out_h), int(out_w)),
+                desc=desc,
+                required=True,
+            )
+            return SinkOnlyProjectionResult(target_shape)
+
+        plane_h, plane_w = int(tilted_source.src_h), int(tilted_source.src_w)
+        grid = resolve_radial_processing_grid(radial_mask_mm, radial_view)
+        dense_map = _radial_dense_map_for_processing(
+            build_dense_radial_backprojection_map(
+                radial_view,
+                plan,
+                out_shape_hw=(int(plane_h), int(plane_w)),
+            ),
+            grid,
+        )
+
+        base = tilted_base_view_name(tilted_source)
+        work_t, work_h, work_w = (
+            int(tilted_source.full_t),
+            int(tilted_source.full_h),
+            int(tilted_source.full_w),
+        )
+        stack_len = int(tilted_stack_axis_length(tilted_source))
+        tan_alpha = float(math.tan(math.radians(float(tilted_source.tilt_angle_deg))))
+        vertical = str(tilted_source.tilt_direction) == 'vertical'
+        if not vertical and str(tilted_source.tilt_direction) != 'horizontal':
+            raise ValueError(
+                f'{desc}: unsupported tilt direction {tilted_source.tilt_direction!r}'
+            )
+        axis_center = float(
+            (int(tilted_source.src_h) - 1) / 2.0
+            if vertical else (int(tilted_source.src_w) - 1) / 2.0
+        )
+
+        def _map_axis(values: np.ndarray, in_len: int, out_len: int) -> np.ndarray:
+            if int(in_len) == int(out_len):
+                return values.astype(np.int32, copy=False)
+            mapped = (
+                values.astype(np.int64, copy=False) * int(out_len)
+            ) // max(1, int(in_len))
+            return np.minimum(mapped, int(out_len) - 1).astype(np.int32, copy=False)
+
+        # A source frame can shear across many output-t bands. Rebuilding that Radial plane
+        # once per band would multiply the dominant gather work, while retaining all bands as
+        # dense arrays would recreate the removed output volume. Instead, reconstruct each
+        # base plane exactly once and append only its mapped foreground indices to anonymous
+        # memfd band buckets. The second pass materializes one bounded output-t block at a
+        # time, emits it exactly once, and releases its bucket immediately.
+        requested_block = max(1, _env_int('YOLO_TTA_PROJECTION_CALLBACK_BLOCK', 64))
+        plane_bytes = max(1, int(out_h) * int(out_w))
+        max_block_bytes = max(
+            plane_bytes,
+            int(max(1.0, _env_float('YOLO_TTA_TILTED_RADIAL_SINK_BLOCK_GIB', 0.75)) * GIB),
+        )
+        block_slices = max(1, min(int(requested_block), int(max_block_bytes // plane_bytes)))
+        band_count = int(math.ceil(float(t_dim) / float(block_slices)))
+        index_dtype = np.dtype(np.uint32 if int(block_slices) * plane_bytes <= np.iinfo(np.uint32).max else np.uint64)
+        band_fds: List[int] = []
+        band_files: List[Optional[object]] = []
+        band_offsets = np.zeros((int(band_count),), dtype=np.int64)
+        band_locks = [threading.Lock() for _ in range(int(band_count))]
+        memfd_factory = getattr(os, 'memfd_create', None)
+        flags = int(getattr(os, 'MFD_CLOEXEC', 0)) | int(getattr(os, 'MFD_ALLOW_SEALING', 0))
+        try:
+            for band_idx in range(int(band_count)):
+                if callable(memfd_factory):
+                    band_fds.append(int(memfd_factory(
+                        _memfd_label(f'tilted-radial-band-{int(band_idx)}'),
+                        flags=flags,
+                    )))
+                    band_files.append(None)
+                else:
+                    # Some otherwise-capable Linux Python builds omit os.memfd_create.
+                    # TemporaryFile preserves anonymous fd semantics and keeps this path
+                    # functional; only its sparse index payload can reach backing storage.
+                    temp_file = tempfile.TemporaryFile(
+                        prefix=f'{SCRIPT_VARIANT_PREFIX}-tilted-radial-band-',
+                    )
+                    band_files.append(temp_file)
+                    band_fds.append(int(temp_file.fileno()))
+
+            def _pwrite_all(fd: int, payload: memoryview, offset: int) -> None:
+                written = 0
+                while int(written) < int(len(payload)):
+                    count = int(os.pwrite(
+                        int(fd), payload[int(written):], int(offset) + int(written),
+                    ))
+                    if count <= 0:
+                        raise OSError(
+                            f'{desc}: pwrite returned {count} while staging tilted-Radial indices'
+                        )
+                    written += int(count)
+
+            def _stage_base_frame(frame_idx: int) -> None:
+                rows = _radial_processing_rows_for_output(
+                    grid,
+                    int(tilted_source.num_slices),
+                    int(frame_idx),
+                )
+                plane = _radial_backproject_plane(radial_mask_mm, dense_map, rows)
+                if not bool(np.any(plane)):
+                    return
+                vv, uu = np.nonzero(plane)
+                if int(vv.size) <= 0:
+                    return
+
+                center = float(tilted_frame_center(tilted_source, int(frame_idx)))
+                axis_values = vv if vertical else uu
+                ss = np.rint(
+                    center
+                    + tan_alpha
+                    * (axis_values.astype(np.float32, copy=False) - axis_center)
+                ).astype(np.int32, copy=False)
+                valid = (ss >= 0) & (ss < int(stack_len))
+                if not bool(valid.any()):
+                    return
+                vv, uu, ss = vv[valid], uu[valid], ss[valid]
+
+                if base == 'transverse':
+                    ti = _map_axis(ss, work_t, t_dim)
+                    yi = _map_axis(vv, work_h, out_h)
+                    xi = _map_axis(uu, work_w, out_w)
+                elif base == 'sagittal':
+                    ti = _map_axis(vv, work_t, t_dim)
+                    yi = _map_axis(ss, work_h, out_h)
+                    xi = _map_axis(uu, work_w, out_w)
+                elif base == 'coronal':
+                    ti = _map_axis(vv, work_t, t_dim)
+                    yi = _map_axis(uu, work_h, out_h)
+                    xi = _map_axis(ss, work_w, out_w)
+                else:  # pragma: no cover - ViewInfo construction rejects this
+                    raise ValueError(f'{desc}: unsupported tilted-Radial base {base!r}')
+
+                band_ids = ti // np.int32(block_slices)
+                for band_idx_raw in np.unique(band_ids):
+                    band_idx = int(band_idx_raw)
+                    selected = band_ids == int(band_idx)
+                    band_t0 = int(band_idx) * int(block_slices)
+                    flat = (
+                        (ti[selected].astype(np.int64, copy=False) - np.int64(band_t0))
+                        * np.int64(plane_bytes)
+                    )
+                    flat += yi[selected].astype(np.int64, copy=False) * np.int64(out_w)
+                    flat += xi[selected].astype(np.int64, copy=False)
+                    # Multiple Radial pixels/base frames can map to the same output voxel.
+                    # Remove duplicates before staging so a dense input cannot multiply the
+                    # anonymous sparse payload unnecessarily.
+                    payload_arr = np.ascontiguousarray(np.unique(flat), dtype=index_dtype)
+                    if int(payload_arr.size) <= 0:
+                        continue
+                    payload = memoryview(payload_arr).cast('B')
+                    with band_locks[int(band_idx)]:
+                        offset = int(band_offsets[int(band_idx)])
+                        band_offsets[int(band_idx)] += int(len(payload))
+                    _pwrite_all(band_fds[int(band_idx)], payload, int(offset))
+
+            projected_plane_bytes = int(plane_h) * int(plane_w)
+            radial_cross_bytes = int(radial_mask_mm.shape[0]) * int(radial_mask_mm.shape[2])
+            conservative_worker_bytes = max(
+                1,
+                int(projected_plane_bytes) * 10 + int(radial_cross_bytes) * 2,
+            )
+            memory_worker_cap = max(1, int((4 * GIB) // int(conservative_worker_bytes)))
+            worker_count = max(1, min(
+                choose_slice_parallel_workers(int(workers), int(tilted_source.num_slices)),
+                int(memory_worker_cap),
+                max(1, _env_int('YOLO_TTA_TILTED_RADIAL_SINK_WORKERS', 8)),
+            ))
+            print(
+                f'{desc}: composed tilted-Radial sink-only projection active; '
+                f'{int(tilted_source.num_slices)} base plane(s) -> {int(band_count)} '
+                f'output-t band(s), workers={int(worker_count)}; skipping '
+                f'{array_nbytes((int(tilted_source.num_slices), plane_h, plane_w), np.uint8) / GIB:.2f} GiB '
+                f'base stack and {array_nbytes(target_shape, np.uint8) / GIB:.2f} GiB output volume.'
+            )
+            parallel_for_indices_chunked(
+                int(tilted_source.num_slices),
+                _stage_base_frame,
+                max_workers=int(worker_count),
+                desc=f'{desc} [composed tilted-Radial]',
+                show_progress=True,
+                target_chunks_per_worker=2,
+            )
+
+            read_chunk_bytes = max(
+                int(index_dtype.itemsize),
+                (64 * 1024 * 1024 // int(index_dtype.itemsize)) * int(index_dtype.itemsize),
+            )
+            for band_idx in range(int(band_count)):
+                t0 = int(band_idx) * int(block_slices)
+                t1 = min(int(t_dim), int(t0) + int(block_slices))
+                payload_bytes = int(band_offsets[int(band_idx)])
+                if payload_bytes <= 0:
+                    _emit_projection_empty_range(
+                        projection_block_callback,
+                        int(t0),
+                        int(t1 - t0),
+                        (int(out_h), int(out_w)),
+                        desc=desc,
+                        required=True,
+                    )
+                    continue
+
+                block_out = np.zeros(
+                    (int(t1 - t0), int(out_h), int(out_w)), dtype=np.uint8,
+                )
+                block_flat = block_out.reshape(-1)
+                read_offset = 0
+                while int(read_offset) < int(payload_bytes):
+                    amount = min(int(read_chunk_bytes), int(payload_bytes) - int(read_offset))
+                    payload = os.pread(
+                        band_fds[int(band_idx)], int(amount), int(read_offset),
+                    )
+                    if len(payload) != int(amount):
+                        raise OSError(
+                            f'{desc}: short tilted-Radial band read '
+                            f'{len(payload)}/{int(amount)} at {int(read_offset)}'
+                        )
+                    indices = np.frombuffer(payload, dtype=index_dtype)
+                    if int(indices.size) > 0:
+                        if int(indices.max()) >= int(block_flat.size):
+                            raise RuntimeError(
+                                f'{desc}: staged tilted-Radial index exceeds band bounds'
+                            )
+                        block_flat[indices.astype(np.intp, copy=False)] = np.uint8(1)
+                    read_offset += int(amount)
+
+                _emit_projection_block_callback(
+                    projection_block_callback,
+                    int(t0),
+                    block_out,
+                    desc=desc,
+                    required=True,
+                )
+                owner = band_files[int(band_idx)]
+                if owner is None:
+                    os.close(int(band_fds[int(band_idx)]))
+                else:
+                    owner.close()  # type: ignore[union-attr]
+                    band_files[int(band_idx)] = None
+                band_fds[int(band_idx)] = -1
+
+            return SinkOnlyProjectionResult(target_shape)
+        finally:
+            for band_idx, fd in enumerate(band_fds):
+                if int(fd) >= 0:
+                    try:
+                        owner = band_files[int(band_idx)] if int(band_idx) < len(band_files) else None
+                        if owner is None:
+                            os.close(int(fd))
+                        else:
+                            owner.close()  # type: ignore[union-attr]
+                    except OSError:
+                        pass
+
     tilted_source = radial_source_tilted_view(radial_view)
     plane_shape = (int(tilted_source.src_h), int(tilted_source.src_w))
     intermediate_path = out_path.with_name(out_path.name + '.tilted_radial_base.u8.dat')
@@ -21790,8 +22814,8 @@ def backproject_radial_volume_to_volume(
  stack before applying the existing shear backprojection. This single terminal geometry map is
  what converts working-space circles into source-space ellipses when t was cube-resized.
 
- ``sink_only=True`` commits completed output-t blocks transactionally for every upright
- Cartesian Radial base without allocating the full ``(t,Y,X)`` volume."""
+ ``sink_only=True`` commits completed output-t blocks transactionally for upright Radial,
+ Tilted, and tilted-Radial projection without allocating the full ``(t,Y,X)`` volume."""
     if not is_radial_view(radial_view):
         raise ValueError('backproject_radial_volume_to_volume expects a radial view')
 
@@ -21914,19 +22938,22 @@ def backproject_radial_volume_to_volume(
         int(u_len),
     )
 
-    gpu_done = False
+    gpu_progress: Optional[_RadialGpuBackprojectionProgress] = None
     if gpu_backproject_enabled():
         try:
             if not processing_grid.reduced:
-                gpu_done = _radial_backproject_gpu_resident(
+                gpu_progress = _radial_backproject_gpu_resident(
                     radial_mask_mm, vol_mm, valid, source_idx_map, u_idx_map, _v_range_for_t,
                     int(t_dim), int(out_h), int(out_w), desc,
                     known_row_occupancy=row_occ,
                     projection_block_callback=projection_block_callback,
                     sink_only=bool(sink_only),
                 )
-            if not gpu_done:
-                gpu_done = _radial_backproject_gpu_streaming(
+            # None means the resident path did not commit any output and the bounded
+            # streaming implementation remains eligible. A progress object, including a
+            # preempted prefix, owns [0:completed_t) and must never be retried on the GPU.
+            if gpu_progress is None:
+                gpu_progress = _radial_backproject_gpu_streaming(
                     radial_mask_mm, vol_mm, valid_pos, flat_src, _v_range_for_t,
                     int(t_dim), int(out_h), int(out_w), desc,
                     known_row_occupancy=row_occ,
@@ -21942,13 +22969,21 @@ def backproject_radial_volume_to_volume(
                 raise
             projection_block_callback = None
             print(f'{desc}: GPU backprojection failed ({exc}); using the CPU path.')
-            gpu_done = False
+            gpu_progress = None
 
+    gpu_completed_t = (
+        max(0, min(int(t_dim), int(gpu_progress.completed_t)))
+        if gpu_progress is not None else 0
+    )
+    gpu_done = bool(int(gpu_completed_t) >= int(t_dim))
     if not gpu_done:
         if row_occ is None:
             row_occ = _radial_row_occupancy(radial_mask_mm, desc)
         cpu_t_chunk = max(1, _env_int('YOLO_TTA_CPU_BACKPROJECT_T_CHUNK', 128))
-        n_blocks = int(math.ceil(float(t_dim) / float(cpu_t_chunk)))
+        cpu_ranges = _radial_projection_suffix_ranges(
+            int(gpu_completed_t), int(t_dim), int(cpu_t_chunk),
+        )
+        n_blocks = int(len(cpu_ranges))
         stage_workers = max(1, min(8, int(worker_count), _cpu_count()))
         stage_pool = _acquire_parallel_pool(stage_workers)
 
@@ -21968,8 +23003,7 @@ def backproject_radial_volume_to_volume(
         ))
 
         def _backproject_t_block(block_idx: int) -> None:
-            t0 = int(block_idx) * int(cpu_t_chunk)
-            t1 = min(int(t_dim), int(t0) + int(cpu_t_chunk))
+            t0, t1 = cpu_ranges[int(block_idx)]
             v0 = int(_v_range_for_t(int(t0))[0])
             v1 = int(_v_range_for_t(int(t1 - 1))[1])
             if not bool(np.any(row_occ[int(v0):int(v1)])):
@@ -22043,6 +23077,169 @@ def backproject_radial_volume_to_volume(
         return vol_mm
     return SinkOnlyProjectionResult((int(t_dim), int(out_h), int(out_w)))
 
+def _backproject_tilted_volume_to_sink(
+    tilted_mask_mm: np.ndarray,
+    tilted_view: ViewInfo,
+    target_shape: Tuple[int, int, int],
+    projection_block_callback: Callable[[int, np.ndarray], None],
+    *,
+    desc: str,
+    workers: int,
+    preserve_reduced_grid: bool,
+) -> SinkOnlyProjectionResult:
+    """Forward-map one Tilted stack into bounded, exactly-once output-t bands."""
+    src = np.asarray(tilted_mask_mm)
+    t_dim, out_h, out_w = (int(v) for v in target_shape)
+    plane_h, plane_w = int(src.shape[1]), int(src.shape[2])
+    work_t, work_h, work_w = (
+        int(tilted_view.full_t), int(tilted_view.full_h), int(tilted_view.full_w),
+    )
+    base = tilted_base_view_name(tilted_view)
+    reduced = bool(
+        delayed_native_expansion_enabled()
+        and (plane_h, plane_w) != (int(tilted_view.src_h), int(tilted_view.src_w))
+    )
+    tan_alpha = float(math.tan(math.radians(float(tilted_view.tilt_angle_deg))))
+    vertical = str(tilted_view.tilt_direction) == 'vertical'
+    if not vertical and str(tilted_view.tilt_direction) != 'horizontal':
+        raise ValueError(f'{desc}: unsupported tilt direction {tilted_view.tilt_direction!r}')
+    axis_center = float(
+        (int(tilted_view.src_h) - 1) / 2.0
+        if vertical else (int(tilted_view.src_w) - 1) / 2.0
+    )
+    stack_len = int(tilted_stack_axis_length(tilted_view))
+
+    def _map_axis(values: np.ndarray, in_len: int, out_len: int) -> np.ndarray:
+        if int(in_len) == int(out_len):
+            return values.astype(np.int32, copy=False)
+        mapped = values.astype(np.int64, copy=False) * int(out_len) // max(1, int(in_len))
+        return np.minimum(mapped, int(out_len) - 1).astype(np.int32, copy=False)
+
+    v_coords = np.arange(int(plane_h), dtype=np.int32)
+    u_coords = np.arange(int(plane_w), dtype=np.int32)
+    native_v = v_coords.astype(np.float32)
+    native_u = u_coords.astype(np.float32)
+    if reduced:
+        canonical = build_affine(
+            view=str(tilted_view.name), src_w=int(tilted_view.src_w),
+            src_h=int(tilted_view.src_h), out_size=int(plane_w),
+            angle_deg=0.0, pad_mode=str(tilted_view.pad_mode),
+        )
+        matrix = np.asarray(canonical.M_out_to_src, dtype=np.float32).reshape(2, 3)
+        # The canonical angle-0 transform is separable. A future transform with cross-axis
+        # terms must use the dense fallback rather than repeat pixels across sink bands.
+        if abs(float(matrix[0, 1])) > 1.0e-6 or abs(float(matrix[1, 0])) > 1.0e-6:
+            raise RuntimeError(f'{desc}: reduced Tilted sink requires a separable canonical affine')
+        native_u = matrix[0, 0] * native_u + matrix[0, 2]
+        native_v = matrix[1, 1] * native_v + matrix[1, 2]
+
+    mapped_v_to_t = (
+        v_coords
+        if bool(preserve_reduced_grid)
+        else _map_axis(v_coords, work_t, t_dim)
+    )
+    block_slices = max(1, _env_int('YOLO_TTA_PROJECTION_CALLBACK_BLOCK', 64))
+    worker_count = choose_slice_parallel_workers(int(workers), int(src.shape[0]))
+    print(
+        f'{desc}: sink-only Tilted projection active; skipping '
+        f'{array_nbytes(target_shape, np.uint8) / GIB:.2f} GiB dense workspace.'
+    )
+
+    for t0 in range(0, int(t_dim), int(block_slices)):
+        t1 = min(int(t_dim), int(t0) + int(block_slices))
+        block_out = np.zeros((int(t1 - t0), int(out_h), int(out_w)), dtype=np.uint8)
+        block_flat = block_out.reshape(-1)
+        plane_stride = np.int64(int(out_h) * int(out_w))
+
+        def _project_frame(frame_idx: int) -> None:
+            frame = np.asarray(src[int(frame_idx)])
+            center = float(tilted_frame_center(tilted_view, int(frame_idx)))
+            if base == 'transverse':
+                axis_values = native_v if vertical else native_u
+                ss_axis = np.rint(center + tan_alpha * (axis_values - axis_center)).astype(np.int32)
+                valid_axis = (ss_axis >= 0) & (ss_axis < int(stack_len))
+                mapped_axis = np.full(ss_axis.shape, -1, dtype=np.int32)
+                if bool(valid_axis.any()):
+                    mapped_axis[valid_axis] = _map_axis(
+                        ss_axis[valid_axis], work_t, t_dim,
+                    )
+                selected = np.flatnonzero(
+                    valid_axis & (mapped_axis >= int(t0)) & (mapped_axis < int(t1))
+                )
+                if selected.size <= 0:
+                    return
+                if vertical:
+                    local_v, uu = np.nonzero(frame[selected, :])
+                    if local_v.size <= 0:
+                        return
+                    vv = selected[local_v]
+                else:
+                    vv, local_u = np.nonzero(frame[:, selected])
+                    if vv.size <= 0:
+                        return
+                    uu = selected[local_u]
+                ss = ss_axis[vv if vertical else uu]
+            else:
+                selected_v = np.flatnonzero(
+                    (mapped_v_to_t >= int(t0)) & (mapped_v_to_t < int(t1))
+                )
+                if selected_v.size <= 0:
+                    return
+                local_v, uu = np.nonzero(frame[selected_v, :])
+                if local_v.size <= 0:
+                    return
+                vv = selected_v[local_v]
+                axis_values = native_v[vv] if vertical else native_u[uu]
+                ss = np.rint(center + tan_alpha * (axis_values - axis_center)).astype(np.int32)
+                valid = (ss >= 0) & (ss < int(stack_len))
+                if not bool(valid.any()):
+                    return
+                vv, uu, ss = vv[valid], uu[valid], ss[valid]
+
+            if bool(preserve_reduced_grid):
+                if base == 'transverse':
+                    ti, yi, xi = ss, vv, uu
+                elif base == 'sagittal':
+                    ti, yi, xi = vv, ss, uu
+                elif base == 'coronal':
+                    ti, yi, xi = vv, uu, ss
+                else:  # pragma: no cover
+                    raise ValueError(f'{desc}: unsupported Tilted base {base!r}')
+            elif base == 'transverse':
+                ti = _map_axis(ss, work_t, t_dim)
+                yi = _map_axis(vv, work_h, out_h)
+                xi = _map_axis(uu, work_w, out_w)
+            elif base == 'sagittal':
+                ti = _map_axis(vv, work_t, t_dim)
+                yi = _map_axis(ss, work_h, out_h)
+                xi = _map_axis(uu, work_w, out_w)
+            elif base == 'coronal':
+                ti = _map_axis(vv, work_t, t_dim)
+                yi = _map_axis(uu, work_h, out_h)
+                xi = _map_axis(ss, work_w, out_w)
+            else:  # pragma: no cover
+                raise ValueError(f'{desc}: unsupported Tilted base {base!r}')
+            in_band = (ti >= int(t0)) & (ti < int(t1))
+            if not bool(in_band.all()):
+                ti, yi, xi = ti[in_band], yi[in_band], xi[in_band]
+            flat = (ti.astype(np.int64) - np.int64(t0)) * plane_stride
+            flat += yi.astype(np.int64) * np.int64(out_w)
+            flat += xi.astype(np.int64)
+            block_flat[flat] = np.uint8(1)
+
+        parallel_for_indices_chunked(
+            int(src.shape[0]), _project_frame,
+            max_workers=int(worker_count),
+            desc=f'{desc} [t={t0}:{t1}]', show_progress=False,
+            target_chunks_per_worker=2,
+        )
+        _emit_projection_block_callback(
+            projection_block_callback, int(t0), block_out,
+            desc=desc, required=True,
+        )
+    return SinkOnlyProjectionResult(tuple(int(v) for v in target_shape))
+
+
 def backproject_tilted_volume_to_volume(
     tilted_mask_mm: np.ndarray,
     tilted_view: ViewInfo,
@@ -22053,12 +23250,16 @@ def backproject_tilted_volume_to_volume(
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
     out_shape_tyx: Optional[Tuple[int, int, int]] = None,
-) -> np.ndarray:
+    projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
+    sink_only: bool = False,
+) -> np.ndarray | SinkOnlyProjectionResult:
     """Backproject a Tilted volume into the requested source geometry.
     
     Supports reduced processing rasters and direct output-geometry scattering without an intermediate full native view."""
     if not is_tilted_view(tilted_view):
         raise ValueError('backproject_tilted_volume_to_volume expects a Tilted View')
+    if bool(sink_only) and projection_block_callback is None:
+        raise ValueError(f'{desc}: sink_only=True requires projection_block_callback')
 
     work_t = int(tilted_view.full_t)
     work_h = int(tilted_view.full_h)
@@ -22082,6 +23283,16 @@ def backproject_tilted_volume_to_volume(
             f'got {(int(plane_h), int(plane_w))}'
         )
     base_view = tilted_base_view_name(tilted_view)
+
+    if bool(sink_only):
+        target_shape = orthogonal_projection_output_shape(
+            src, tilted_view, out_shape_tyx,
+        )
+        return _backproject_tilted_volume_to_sink(
+            src, tilted_view, target_shape, projection_block_callback,  # type: ignore[arg-type]
+            desc=desc, workers=int(workers),
+            preserve_reduced_grid=bool(reduced_processing and out_shape_tyx is None),
+        )
 
     if reduced_processing and out_shape_tyx is not None:
         # Use the exact same terminal definition with and without --save_nrrd:
@@ -23463,7 +24674,7 @@ def assemble_current_view_union_volume(
     
     Multiple model entries are rejected; the destination uses source geometry when requested."""
     if len(view_volumes_by_model) != 1:
-        raise ValueError('GPT-5.6-Sol-Pro v16.0.11 supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError(f'GPT-5.6-Sol-Ultra v{SCRIPT_VERSION} supports exactly one --model; multiple-model inference has been removed')
 
     union_shape = (int(T), int(H), int(W)) if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
     model_name = next(iter(view_volumes_by_model.keys()))
@@ -28451,26 +29662,110 @@ def interpolate_view_volume_pass_inplace(
 
 
 class _ByteAdmissionPool:
-    """Weighted transient-memory admission with one emergency oversize lane."""
+    """Shared persistent/transient byte admission with one emergency oversize lane.
 
-    def __init__(self, capacity_bytes: int, name: str) -> None:
+    Scheduler-owned direct-union reservations are registered as external charges. Parent
+    preparation reservations then see those bytes under the same cgroup-derived capacity
+    instead of independently consuming a second fixed allowance.
+    """
+
+    def __init__(
+        self,
+        capacity_bytes: int,
+        name: str,
+        *,
+        transient_capacity_bytes: Optional[int] = None,
+    ) -> None:
         self.capacity = max(1, int(capacity_bytes))
+        self.transient_capacity = max(
+            1,
+            min(
+                int(self.capacity),
+                int(transient_capacity_bytes) if transient_capacity_bytes is not None else int(self.capacity),
+            ),
+        )
         self.name = str(name)
         self.in_use = 0
+        self._external: Dict[object, int] = {}
         self.condition = threading.Condition()
+
+    def _external_bytes_locked(self) -> int:
+        return int(sum(int(v) for v in self._external.values()))
+
+    def snapshot(self) -> Tuple[int, int, int]:
+        """Return (external, transient, shared capacity) under one consistent lock."""
+        with self.condition:
+            return (
+                int(self._external_bytes_locked()),
+                int(self.in_use),
+                int(self.capacity),
+            )
+
+    def can_set_external(self, key: object, requested_bytes: int) -> bool:
+        requested = max(0, int(requested_bytes))
+        with self.condition:
+            previous = int(self._external.get(key, 0))
+            projected = int(self._external_bytes_locked()) - int(previous) + int(requested)
+            return bool(
+                int(requested) <= int(previous)
+                or int(projected) + int(self.in_use) <= int(self.capacity)
+            )
+
+    def try_set_external(self, key: object, requested_bytes: int) -> bool:
+        """Atomically add/update a scheduler-owned persistent charge."""
+        requested = max(0, int(requested_bytes))
+        with self.condition:
+            previous = int(self._external.get(key, 0))
+            projected = int(self._external_bytes_locked()) - int(previous) + int(requested)
+            if (
+                int(requested) > int(previous)
+                and int(projected) + int(self.in_use) > int(self.capacity)
+            ):
+                return False
+            if requested > 0:
+                self._external[key] = int(requested)
+            else:
+                self._external.pop(key, None)
+            self.condition.notify_all()
+            return True
+
+    def release_external(self, key: object) -> int:
+        with self.condition:
+            released = int(self._external.pop(key, 0))
+            self.condition.notify_all()
+            return int(released)
 
     @contextlib.contextmanager
     def reserve(self, requested_bytes: int, desc: str) -> Iterator[None]:
         requested = max(1, int(requested_bytes))
-        charged = min(int(requested), int(self.capacity))
+        charged = int(requested)
         waited = False
         with self.condition:
-            while int(self.in_use) > 0 and int(self.in_use) + int(charged) > int(self.capacity):
+            while True:
+                external = int(self._external_bytes_locked())
+                shared_fits = bool(
+                    int(external) + int(self.in_use) + int(charged) <= int(self.capacity)
+                )
+                transient_fits = bool(
+                    int(self.in_use) + int(charged) <= int(self.transient_capacity)
+                )
+                # Preserve progress for a single task larger than the configured pool only
+                # when no persistent view charge competes with it. Normal view preparations
+                # must wait for the shared ledger rather than silently overcommitting it.
+                emergency_oversize = bool(
+                    int(self.in_use) <= 0
+                    and int(external) <= 0
+                    and int(charged) > int(self.capacity)
+                )
+                if (shared_fits and transient_fits) or emergency_oversize:
+                    break
                 if not waited:
                     print(
                         f'{self.name}: waiting to admit {desc} '
                         f'({requested / GIB:.1f} GiB requested; '
-                        f'{self.in_use / GIB:.1f}/{self.capacity / GIB:.1f} GiB active).'
+                        f'direct={external / GIB:.1f} GiB, transient={self.in_use / GIB:.1f} GiB, '
+                        f'shared={self.capacity / GIB:.1f} GiB, '
+                        f'transient_cap={self.transient_capacity / GIB:.1f} GiB).'
                     )
                     waited = True
                 self.condition.wait()
@@ -29908,6 +31203,34 @@ def final_source_output_shape() -> Optional[Tuple[int, int, int]]:
     return _FINAL_SOURCE_OUTPUT_SHAPE_TYX
 
 
+def orthogonal_projection_output_shape(
+    view_mask_mm: np.ndarray,
+    view: ViewInfo,
+    out_shape_tyx: Optional[Tuple[int, int, int]] = None,
+) -> Tuple[int, int, int]:
+    """Resolve the exact t-major geometry shared by dense and sink-only projection."""
+    if out_shape_tyx is not None:
+        return tuple(int(v) for v in out_shape_tyx)
+    source_shape = tuple(int(v) for v in np.asarray(view_mask_mm).shape)
+    if len(source_shape) != 3:
+        raise ValueError(f'{view.name}: view layer must be 3D, got {source_shape}')
+    plane_h, plane_w = int(source_shape[1]), int(source_shape[2])
+    reduced = bool(
+        delayed_native_expansion_enabled()
+        and (int(plane_h), int(plane_w)) != (int(view.src_h), int(view.src_w))
+    )
+    if reduced and not is_radial_view(view):
+        base = tilted_base_view_name(view) if is_tilted_view(view) else str(view.name)
+        if base == 'transverse':
+            return int(source_shape[0]), int(plane_h), int(plane_w)
+        if base == 'sagittal':
+            return int(plane_h), int(source_shape[0]), int(plane_w)
+        if base == 'coronal':
+            return int(plane_h), int(plane_w), int(source_shape[0])
+        raise ValueError(f'{view.name}: unsupported reduced projection base {base!r}')
+    return int(view.full_t), int(view.full_h), int(view.full_w)
+
+
 def project_view_volume_to_orthogonal_volume(
     view_mask_mm: np.ndarray,
     view: ViewInfo,
@@ -29939,19 +31262,9 @@ def project_view_volume_to_orthogonal_volume(
     # reduced Cartesian stacks are axis-permuted without expansion. Their resulting
     # orthogonal grid is smaller on exactly the two axes represented by the YOLO plane;
     # the NRRD streamer/final union performs the sole restore to output geometry.
-    if reduced_processing and view.family != 'radial' and not is_tilted_view(view):
-        if view.name == 'transverse':
-            t_dim, h_dim, w_dim = int(source_shape[0]), int(plane_h), int(plane_w)
-        elif view.name == 'sagittal':
-            t_dim, h_dim, w_dim = int(plane_h), int(source_shape[0]), int(plane_w)
-        elif view.name == 'coronal':
-            t_dim, h_dim, w_dim = int(plane_h), int(plane_w), int(source_shape[0])
-        else:  # pragma: no cover
-            raise ValueError(f'{desc}: unsupported reduced Cartesian view {view.name!r}')
-    else:
-        t_dim = int(view.full_t) if int(view.full_t) > 0 else int(view_mask_mm.shape[0])
-        h_dim = int(view.full_h) if int(view.full_h) > 0 else int(view.src_h)
-        w_dim = int(view.full_w) if int(view.full_w) > 0 else int(view.src_w)
+    t_dim, h_dim, w_dim = orthogonal_projection_output_shape(
+        view_mask_mm, view, out_shape_tyx,
+    )
 
     if view.family == 'radial':
         return backproject_radial_volume_to_volume(
@@ -29969,9 +31282,6 @@ def project_view_volume_to_orthogonal_volume(
             sink_only=bool(sink_only),
         )
 
-    if bool(sink_only):
-        raise ValueError(f'{desc}: sink-only projection is supported only for radial views')
-
     if is_tilted_view(view):
         return backproject_tilted_volume_to_volume(
             tilted_mask_mm=view_mask_mm,
@@ -29982,13 +31292,46 @@ def project_view_volume_to_orthogonal_volume(
             reserve_bytes=int(reserve_bytes),
             workers=int(workers),
             out_shape_tyx=out_shape_tyx,
+            projection_block_callback=projection_block_callback,
+            sink_only=bool(sink_only),
         )
+
+    if bool(sink_only) and projection_block_callback is None:
+        raise ValueError(f'{desc}: sink_only=True requires projection_block_callback')
 
     if out_shape_tyx is not None and tuple(int(v) for v in out_shape_tyx) != (t_dim, h_dim, w_dim):
         raise ValueError(
             f'{desc}: Cartesian view projection is a pure axis permutation; '
             f'requested output shape {tuple(out_shape_tyx)} != working {(t_dim, h_dim, w_dim)}'
         )
+
+    if bool(sink_only):
+        src = np.asarray(view_mask_mm, dtype=np.uint8)
+        block_slices = max(1, _env_int('YOLO_TTA_PROJECTION_CALLBACK_BLOCK', 64))
+        for t0 in range(0, int(t_dim), int(block_slices)):
+            t1 = min(int(t_dim), int(t0) + int(block_slices))
+            if view.name == 'transverse':
+                block_out = np.ascontiguousarray(src[int(t0):int(t1)])
+            elif view.name == 'sagittal':
+                # native sagittal order is (Y,t,X); emit orthogonal (t,Y,X).
+                block_out = np.ascontiguousarray(
+                    np.transpose(src[:, int(t0):int(t1), :], (1, 0, 2)),
+                )
+            elif view.name == 'coronal':
+                # native coronal order is (X,t,Y); emit orthogonal (t,Y,X).
+                block_out = np.ascontiguousarray(
+                    np.transpose(src[:, int(t0):int(t1), :], (1, 2, 0)),
+                )
+            else:  # pragma: no cover - guarded by sink_only_projection_supported
+                raise ValueError(f'{desc}: unsupported Cartesian sink view {view.name!r}')
+            _emit_projection_block_callback(
+                projection_block_callback,
+                int(t0),
+                block_out,
+                desc=desc,
+                required=True,
+            )
+        return SinkOnlyProjectionResult((int(t_dim), int(h_dim), int(w_dim)))
 
     if view.name == 'transverse':
         if tuple(int(x) for x in np.asarray(view_mask_mm).shape) != (t_dim, h_dim, w_dim):
@@ -30135,20 +31478,27 @@ def materialize_nrrd_view_layer(
         projection_out_shape = final_source_output_shape()
     incremental_writer: Optional[IncrementalRawBBoxMaskStoreWriter] = None
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None
+    if is_tilted_radial_view(view):
+        projection_fusion = 'tilted_radial_composed_sink_only'
+    elif is_radial_view(view):
+        projection_fusion = f'{radial_base_view_name(view)}_radial_sink_only'
+    elif is_tilted_view(view):
+        projection_fusion = f'{tilted_base_view_name(view)}_tilted_sink_only'
+    elif str(view.name) in CARTESIAN_VIEW_TOKENS:
+        projection_fusion = f'{view.name}_axis_permutation_sink_only'
+    else:
+        projection_fusion = 'dense_projection'
     incremental_extra_meta = {
         'nrrd_layer_key': key,
         'source_raw_path': str(raw_path),
         'source_raw_workspace': 'in_memory_when_available' if bool(transient_projection_in_memory) else 'disk_backed',
-        'projection_payload_fusion': (
-            f'{radial_base_view_name(view)}_radial_sink_only'
-            if radial_sink_only_projection_supported(view) else 'dense_projection'
-        ),
+        'projection_payload_fusion': projection_fusion,
     }
-    if bool(raw_bbox_nrrd_layers_enabled()) and radial_sink_only_projection_supported(view):
-        expected_shape = (
-            tuple(int(v) for v in projection_out_shape)
-            if projection_out_shape is not None
-            else (int(view.src_h), int(view.full_h), int(view.full_w))
+    if bool(raw_bbox_nrrd_layers_enabled()) and sink_only_projection_supported(view):
+        expected_shape = orthogonal_projection_output_shape(
+            view_volume_mm,
+            view,
+            projection_out_shape,
         )
         try:
             incremental_writer = IncrementalRawBBoxMaskStoreWriter(
@@ -30161,7 +31511,7 @@ def materialize_nrrd_view_layer(
             projection_block_callback = incremental_writer
         except Exception as exc:
             print(
-                f'Warning: NRRD layer {key}: incremental radial cvol writer unavailable '
+                f'Warning: NRRD layer {key}: incremental sink cvol writer unavailable '
                 f'({exc}); the completed projection will use the regular encoder.'
             )
             incremental_writer = None
@@ -30212,7 +31562,7 @@ def materialize_nrrd_view_layer(
         except Exception:
             pass
         print(
-            f'Warning: NRRD layer {key}: sink-only radial projection failed ({exc}); '
+            f'Warning: NRRD layer {key}: sink-only projection failed ({exc}); '
             'discarding the partial store and retrying with the dense fallback.'
         )
         projected = _project_layer(None, sink_only_mode=False)
@@ -30238,7 +31588,7 @@ def materialize_nrrd_view_layer(
             except Exception as exc:
                 incremental_writer.abort(exc)
                 incremental_writer.warn_failed_once(
-                    f'NRRD layer {key}: incremental radial cvol finalization failed ({exc})'
+                    f'NRRD layer {key}: incremental projection cvol finalization failed ({exc})'
                 )
                 incremental_writer.discard()
                 incremental_writer = None
@@ -30248,7 +31598,7 @@ def materialize_nrrd_view_layer(
                     # If it fails, rebuild once through the authoritative dense path rather
                     # than attempting to encode a SinkOnlyProjectionResult descriptor.
                     print(
-                        f'NRRD layer {key}: retrying dense radial projection after '
+                        f'NRRD layer {key}: retrying dense projection after '
                         'sink-only finalization failure.'
                     )
                     projected = _project_layer(None, sink_only_mode=False)
@@ -30619,6 +31969,11 @@ def prepare_view_volume_after_fullframe(
                     if (meta_valid and meta_row_occupancy is not None and str(view.family) == 'radial')
                     else None
                 ),
+                known_slice_bboxes=(
+                    np.ascontiguousarray(meta_slice_bboxes)
+                    if (meta_valid and meta_slice_bboxes is not None)
+                    else None
+                ),
             )
             if layer_ref is not None:
                 nrrd_layers.append(layer_ref)
@@ -30751,7 +32106,7 @@ def prepare_view_volume_after_fullframe(
         existing_backing = _interpolation_array_backing_path(old_volume)
         if existing_backing is not None:
             print(
-                f'{model_name}/{view.name} non-interpolated native retention (v16.0.11): '
+                f'{model_name}/{view.name} non-interpolated native retention: '
                 f'reusing {existing_backing}; no full-volume drain copy.'
             )
         else:
@@ -30856,7 +32211,7 @@ def prepare_view_volume_after_fullframe(
         except Exception:
             pass
         print(
-            f'v16.0.11 sparse retirement: {model_name}/{view.name} released '
+            f'v{SCRIPT_VERSION} sparse retirement: {model_name}/{view.name} released '
             f'{retired_bytes / GIB:.2f} GiB dense union after cvol materialization.'
         )
 
@@ -32191,7 +33546,7 @@ def _atomic_publication_stage_path(
     # Every publisher owns its directory. A shared empty staging directory can be
     # removed by one concurrent writer after another has selected (but not yet
     # created) its stage file.
-    stage_dir = Path(_v16011_mkdtemp(
+    stage_dir = Path(tempfile.mkdtemp(
         prefix=f'.{root.name}.atomic-result-',
         dir=str(root.parent),
     ))
@@ -33631,7 +34986,7 @@ def _write_nrrd_ascii_header(
 
     lines: List[str] = [
         'NRRD0005',
-        '# Complete NRRD file generated by GPT-5.6-Sol-Pro_v16.0.11_SLURM.py',
+        f'# Complete NRRD file generated by {SCRIPT_BASENAME}',
         f'type: {str(data_type)}',
         f'dimension: {int(dimension)}',
         'sizes: ' + ' '.join(str(int(v)) for v in sizes),
@@ -34552,7 +35907,7 @@ class NrrdLayerSink:
     ) -> None:
         self.nrrd_dir = Path(nrrd_dir)
         self.nrrd_dir.mkdir(parents=True, exist_ok=True)
-        self.stem = str(stem)
+        self.stem = variant_nrrd_stem(stem)
         self.output_shape = (int(output_shape_tyx[0]), int(output_shape_tyx[1]), int(output_shape_tyx[2]))
         self.max_workers = max(1, int(max_workers))
         self.executor = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix='nrrd-layer')
@@ -36677,7 +38032,10 @@ def write_summary_file(
     lines.append('View statistics:')
     total_prediction_count = 0
     labels = dict(view_prediction_labels or {})
-    ordered_keys: List[str] = [k for k in ('transverse', 'sagittal', 'coronal', 'radial') if k in view_prediction_stats]
+    ordered_keys: List[str] = [
+        k for k in ('transverse', 'sagittal', 'coronal', 'radial_transverse')
+        if k in view_prediction_stats
+    ]
     tilted_keys = [k for k in view_prediction_stats.keys() if str(k).startswith('tilted_')]
     other_keys = [k for k in view_prediction_stats.keys() if k not in set(ordered_keys) and k not in set(tilted_keys)]
     for view_key in ordered_keys + sorted(tilted_keys, key=lambda k: labels.get(k, k)) + sorted(other_keys):
@@ -36789,7 +38147,8 @@ def main() -> None:
     args = build_argparser().parse_args()
     channel_format = resolve_channel_format(args.channel_format)
     print(
-        '[v16.0.11] integrated fixes active: bounded memfd direct-union window, '
+        f'[v{SCRIPT_VERSION}] Ultra optimization set active: sparse bbox retirement, '
+        'sink-only composed projection, RAM-derived admission, stall-aware GPU leases, '
         'sparse cvol retirement, persistent TensorRT contexts, and parallel atomic outputs.'
     )
     print(
@@ -36807,7 +38166,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('GPT-5.6-Sol-Pro v16.0.11 accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError(f'GPT-5.6-Sol-Ultra v{SCRIPT_VERSION} accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -37048,7 +38407,7 @@ def main() -> None:
     out_dir = Path(args.output).expanduser().resolve() if args.output else (Path.cwd() / input_path.stem)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    temp_dir = choose_scratch_dir(_v16011_stage_root(args.temp), out_dir, input_path.stem)
+    temp_dir = choose_scratch_dir(args.temp, out_dir, input_path.stem)
     expose_scratch_in_output(out_dir, temp_dir)
     # say which kind of scratch this is. Memory-backed scratch is what takes the shared
     # tile canvas (and the shared source volume, which is allocated under the same root) off
@@ -37064,7 +38423,7 @@ def main() -> None:
         f"[{'MEMORY-backed (' + str(_mount_fstype_for_path(out_dir) or 'tmpfs') + ')' if output_memory_backed else 'disk/network-backed'}, "
         f"free={_filesystem_free_bytes(out_dir) / GIB:.1f} GiB]"
     )
-    if bool(_v16011_stage_root(args.temp)) and scratch_dir_is_memory_backed() and not output_memory_backed:
+    if bool(args.temp) and scratch_dir_is_memory_backed() and not output_memory_backed:
         print(
             'Important: --temp redirects scratch work only. Final MKV/NRRD/manifest files are '
             f'written to --output ({out_dir}); benchmark runs must use the same --output filesystem '
@@ -37298,6 +38657,10 @@ def main() -> None:
             '--enable_tilted (with non-zero --tilt_angle), or --enable_radial. A tilted_* '
             '--enable_radial target is skipped when its matching Tilted base is not enabled.'
         )
+    # Reserve the second resident allocation only for runs that actually contain a
+    # Radial task. This keeps Cartesian/Tilted-only runs from losing GPU residency merely
+    # because the variant supports a lazily-created hardware texture.
+    radial_texture_required = bool(any(is_radial_view(view) for view in views))
     cartesian_views = orthogonal_views_only(views)
     inference_views = list(views)
     interpolating_views = [v for v in inference_views if _view_uses_interpolation(v, int(args.interpolate))]
@@ -37344,7 +38707,7 @@ def main() -> None:
         spec_notes.append(
             'Concrete tilted-Radial views use the resident CUDA source '
             'renderer and persistent batch-1 TensorRT ring instead of silently materializing the '
-            'deferred host cube and running the 36-tap/sheared frame renderer on the CPU. '
+            'deferred host cube and running the active-filter/sheared frame renderer on the CPU. '
             'YOLO_TTA_GPU_TILTED_RADIAL_RENDER=0 selects the compatibility CPU path.'
         )
     # spec<->implementation conflict notes (see header docstring and suggested spec edits).
@@ -37548,7 +38911,7 @@ def main() -> None:
             'not require upright Cartesian views. Each tilted_* target expands across every matching '
             'enabled signed-angle/direction Tilted variant. Circles are constructed in working projected '
             'view space; source-geometry t restoration naturally produces sagittal/coronal and Tilted '
-            'ellipses. Lanczos-3 sampling and wraparound interpolation are retained. Upright bases can '
+            f'ellipses. {RADIAL_TEXTURE_VARIANT_LABEL} sampling and wraparound interpolation are retained. Upright bases can '
             'use fused resident rendering, orientation-aware streamed GPU prerender, and reduced-grid '
             'processing when admitted.'
         )
@@ -37561,7 +38924,7 @@ def main() -> None:
         )
     spec_notes.append(
         'v13.2.0 NRRD export (--save_nrrd) writes one single-layer 3-axis NRRD (X,Y,t) per component layer to '
-        'nrrd/, named {Filestem}_{ViewToken|Global}_{layer}.seg.nrrd (model name dropped; v13.2.3 tags each file '
+        f'nrrd/, named {OUTPUT_NRRD_PREFIX}{{Filestem}}_{{ViewToken|Global}}_{{layer}}.seg.nrrd (model name dropped; v13.2.3 tags each file '
         'with the 3D Slicer segmentation header fields — segment named after the file, deterministic per-layer '
         'palette color). Layer families: full-frame '
         'YOLO masks, full-frame interpolation bridges per pass, tiled masks accepted by parent YOLO masks, tiled '
@@ -37570,7 +38933,7 @@ def main() -> None:
         'streaming, gzip-compressed by the selected validated backend, and written by a background sink as the layer is produced '
         'during the intermediate pipeline steps (so the Transverse layer compresses while Tiled Transverse is still '
         'inferencing, and the global union layer is written while smoothing runs). A single '
-        '{Filestem}_nrrd_manifest.json lists every written layer. Tune YOLO_TTA_NRRD_MEMBER_CODEC, '
+        f'{OUTPUT_NRRD_PREFIX}{{Filestem}}_nrrd_manifest.json lists every written layer. Tune YOLO_TTA_NRRD_MEMBER_CODEC, '
         'YOLO_TTA_NRRD_MEMBER_GZIP_WINDOW_MIB, YOLO_TTA_NRRD_GZIP_CHUNK_MIB, and '
         'YOLO_TTA_NRRD_LAYER_SINK_WORKERS for member-parallel compression. The previous mega '
         f'4D decomposed NRRD (one file, trailing list axis) was removed. space={NRRD_SPACE}.'
@@ -37578,10 +38941,10 @@ def main() -> None:
     spec_notes.append(
         'CONFLICT NOTE 2 (single-layer NRRD filenames): spec 7.2 lists layer family #5 ("Tiled Bridges") with the '
         'same filename token as family #4 ("Tiled YOLO masks accepted by Parent Bridges", '
-        '{Filestem}_{ViewToken}_tile_yolo_parent_bridge), which would collide. The implementation keeps them '
+        f'{OUTPUT_NRRD_PREFIX}{{Filestem}}_{{ViewToken}}_tile_yolo_parent_bridge), which would collide. The implementation keeps them '
         'distinct: tiles accepted by a parent bridge are {ViewToken}_tile_yolo_parent_bridge, while consolidated '
         'tile interpolation bridges are {ViewToken}_tile_bridge_pass<N>. Suggested spec edit: rename family #5 to '
-        '{Filestem}_{ViewToken}_tile_bridge_pass<N> to match the per-pass consolidated tile bridge layers.'
+        f'{OUTPUT_NRRD_PREFIX}{{Filestem}}_{{ViewToken}}_tile_bridge_pass<N> to match the per-pass consolidated tile bridge layers.'
     )
     spec_notes.append(
         'CONFLICT NOTE 3 (low-quality NRRD form): spec --save_low_quality says "low bitrate output videos and '
@@ -38044,6 +39407,7 @@ def main() -> None:
     baseline_slice_locks_by_model_view: Dict[Tuple[str, str], List[threading.Lock]] = {}
     direct_union_live_views: set[Tuple[str, str]] = set()
     direct_union_live_bytes: Dict[Tuple[str, str], int] = {}
+    direct_union_retired_task_ids: set[int] = set()
     direct_union_sparse_retirement_active = bool(
         gpu_worker_direct_union_active
         and nrrd_layers_needed
@@ -38053,29 +39417,76 @@ def main() -> None:
         and int(args.interpolate) <= 0
         and _env_flag('YOLO_TTA_SPARSE_VIEW_RETIREMENT', True)
     )
-    direct_union_active_view_limit = max(
-        1,
-        _env_int('YOLO_TTA_DIRECT_UNION_ACTIVE_VIEWS', max(1, min(4, int(gpu_device_count)))),
+    _admission_headroom = max(1, int(available_anon_work_bytes()))
+    _runtime_reserve_default = max(
+        64 * GIB,
+        min(192 * GIB, int(float(_admission_headroom) * 0.12)),
     )
-    _direct_headroom = max(0, int(available_anon_work_bytes()) - 64 * GIB)
-    _default_direct_bytes = max(64 * GIB, min(256 * GIB, int(_direct_headroom * 0.30)))
+    _runtime_reserve = int(max(
+        1.0,
+        _env_float('YOLO_TTA_PIPELINE_MEMORY_RESERVE_GIB', _runtime_reserve_default / GIB),
+    ) * GIB)
+    _shared_live_capacity = max(1 * GIB, int(_admission_headroom) - int(_runtime_reserve))
+    _largest_direct_view_bytes = max(
+        [
+            int(array_nbytes(view_processing_volume_shape(v, int(args.imgsz)), np.uint8))
+            * (2 if float(args.min_conf) > 0.0 else 1)
+            for v in inference_views
+        ]
+        or [1 * GIB]
+    )
+    _largest_parent_transient = max(
+        [
+            _estimate_parent_view_postprocess_bytes(
+                v,
+                nrrd_layers_enabled=bool(nrrd_layers_needed),
+                interpolation_enabled=bool(_view_uses_interpolation(v, int(args.interpolate))),
+            )
+            for v in inference_views
+        ]
+        or [1 * GIB]
+    )
+    # Leave one worst-case parent lane available even when the direct-view window is full.
+    # The parent pool below shares the remaining capacity with the direct reservations.
+    _parent_lane_reserve = max(64 * GIB, int(_largest_parent_transient))
+    _default_direct_bytes = max(
+        int(_largest_direct_view_bytes),
+        int(_shared_live_capacity) - int(_parent_lane_reserve),
+    )
     direct_union_active_byte_limit = int(
         max(1.0, _env_float('YOLO_TTA_DIRECT_UNION_ACTIVE_GIB', _default_direct_bytes / GIB)) * GIB
     )
-    _parent_transient_default = max(
-        64 * GIB,
-        min(192 * GIB, int(max(1, available_anon_work_bytes() - 64 * GIB) * 0.25)),
+    _byte_derived_live_views = max(
+        1,
+        int(min(int(direct_union_active_byte_limit), int(_shared_live_capacity))
+            // max(1, int(_largest_direct_view_bytes))),
+    )
+    _default_live_views = max(1, min(8, int(_byte_derived_live_views), len(inference_views)))
+    if os.environ.get('YOLO_TTA_DIRECT_UNION_ACTIVE_VIEWS', '').strip():
+        direct_union_active_view_limit = max(
+            1, _env_int('YOLO_TTA_DIRECT_UNION_ACTIVE_VIEWS', int(_default_live_views)),
+        )
+    else:
+        direct_union_active_view_limit = int(_default_live_views)
+    _parent_transient_cap = int(
+        max(
+            1.0,
+            _env_float('YOLO_TTA_PARENT_TRANSIENT_GIB', _shared_live_capacity / GIB),
+        ) * GIB
     )
     parent_transient_admission = _ByteAdmissionPool(
-        int(max(1.0, _env_float('YOLO_TTA_PARENT_TRANSIENT_GIB', _parent_transient_default / GIB)) * GIB),
+        int(_shared_live_capacity),
         'Parent view postprocess admission',
+        transient_capacity_bytes=int(_parent_transient_cap),
     )
     if direct_union_sparse_retirement_active:
         print(
-            'v16.0.11 bounded sparse view retirement active: '
+            f'v{SCRIPT_VERSION} bounded sparse view retirement active: '
             f'max_live_views={int(direct_union_active_view_limit)}, '
-            f'max_live_dense={direct_union_active_byte_limit / GIB:.1f} GiB; '
-            'completed dense memfd unions are converted to cvol and released immediately.'
+            f'max_live_dense={direct_union_active_byte_limit / GIB:.1f} GiB, '
+            f'shared_direct+parent={_shared_live_capacity / GIB:.1f} GiB, '
+            f'untouched_reserve={_runtime_reserve / GIB:.1f} GiB; '
+            'completed sparse task bands reduce their logical admission charge immediately.'
         )
     fullframe_remaining: Dict[Tuple[str, str], int] = {}
     # slices per (model, view) hole-filled on device by the GPU workers; when the
@@ -38215,8 +39626,59 @@ def main() -> None:
     parent_postprocess_executor = ThreadPoolExecutor(max_workers=int(parent_postprocess_workers), thread_name_prefix='parent-postprocess')
     tile_postprocess_executor = ThreadPoolExecutor(max_workers=int(tile_postprocess_workers), thread_name_prefix='tile-postprocess')
 
+    def _critical_path_inference_schedule(source_views: Sequence[ViewInfo]) -> List[ViewInfo]:
+        """Open two expensive tilted-Radial parents early without changing output order."""
+        original = list(source_views)
+        heavy = sorted(
+            [view for view in original if is_tilted_radial_view(view)],
+            key=lambda view: (
+                -int(_estimate_parent_view_postprocess_bytes(
+                    view,
+                    nrrd_layers_enabled=bool(nrrd_layers_needed),
+                    interpolation_enabled=bool(_view_uses_interpolation(view, int(args.interpolate))),
+                )),
+                -int(view.num_slices),
+                original.index(view),
+            ),
+        )
+        if not heavy:
+            return original
+        regular = [view for view in original if not is_tilted_radial_view(view)]
+        first_window = max(1, min(int(direct_union_active_view_limit), len(original)))
+        early_heavy_count = min(2, len(heavy), first_window)
+        scheduled: List[ViewInfo] = list(heavy[:early_heavy_count])
+        heavy = list(heavy[early_heavy_count:])
+        regular_in_first = min(len(regular), max(0, int(first_window) - len(scheduled)))
+        scheduled.extend(regular[:regular_in_first])
+        regular = list(regular[regular_in_first:])
+        # After the first live window, keep feeding one long parent for every three
+        # ordinary views. This overlaps the expensive tail without opening all twelve
+        # tilted-Radial parents together.
+        while regular or heavy:
+            for _ in range(3):
+                if regular:
+                    scheduled.append(regular.pop(0))
+            if heavy:
+                scheduled.append(heavy.pop(0))
+            if not regular and heavy:
+                scheduled.extend(heavy)
+                heavy.clear()
+        return scheduled
+
+    inference_schedule_views = _critical_path_inference_schedule(inference_views)
+    if inference_schedule_views != list(inference_views):
+        first_window_names = [
+            str(view.name)
+            for view in inference_schedule_views[:int(direct_union_active_view_limit)]
+        ]
+        print(
+            f'Critical-path inference admission order active; first '
+            f'{len(first_window_names)} live view(s): {first_window_names}. '
+            'Final/output view order is unchanged.'
+        )
+
     pending_prediction_build_jobs: deque[Tuple[str, ViewInfo, object]] = deque()
-    for view, aug_job in iter_aug_jobs_round_robin(inference_views, aug_jobs_by_view):
+    for view, aug_job in iter_aug_jobs_round_robin(inference_schedule_views, aug_jobs_by_view):
         pending_prediction_build_jobs.append(('fullframe', view, aug_job))
         if dense_tiling_active:
             for tile_job in tile_jobs_by_aug.get((view.name, aug_job.aug_id), []):
@@ -38999,10 +40461,16 @@ def main() -> None:
             interpolation_stats.extend(result.interpolation_stats)
             nrrd_layer_refs.extend(result.nrrd_layers)
             completed_view_key = (str(result.model_name), str(result.view_name))
-            if completed_view_key in direct_union_live_views:
+            if (
+                completed_view_key in direct_union_live_views
+                or completed_view_key in direct_union_live_bytes
+            ):
                 direct_union_slot_released = True
             direct_union_live_views.discard(completed_view_key)
             direct_union_live_bytes.pop(completed_view_key, None)
+            parent_transient_admission.release_external(
+                ('direct_union', str(completed_view_key[0]), str(completed_view_key[1]))
+            )
 
             view_info = view_infos_by_name[result.view_name]
             if result.final_view_volume_mm is not None:
@@ -39126,7 +40594,10 @@ def main() -> None:
             'Scheduler wait: no inference-ready in-memory volume; '
             f'gpu_inference_inflight={gpu_stage_state.get("inference_inflight", {})}, '
             f'gpu_stage_leases={gpu_stage_state.get("stage_leases", {})}, '
+            f'gpu_stage_preempt={gpu_stage_state.get("stage_preemption_requested", [])}, '
             f'inference_priority={bool(gpu_stage_state.get("inference_priority_active", False))}, '
+            f'dispatchable_pending={bool(gpu_stage_state.get("inference_dispatchable_pending", False))}, '
+            f'admission_stalled={bool(gpu_stage_state.get("inference_admission_stalled", False))}, '
             f'pending_volume_builds={len(pending_prediction_volume_futures)}, '
             f'queued_build_jobs={len(pending_prediction_build_jobs)}, '
             f'prediction_accumulation={len(prediction_accumulation_futures)}, '
@@ -39263,6 +40734,10 @@ def main() -> None:
             return None
         return (str(task.get('model_name', '')), str(getattr(view_obj, 'name', '')))
 
+    def _direct_union_admission_key(view_key: Tuple[str, str]) -> Tuple[str, str, str]:
+        """Namespace a direct-union charge inside the shared parent admission ledger."""
+        return ('direct_union', str(view_key[0]), str(view_key[1]))
+
     def _direct_union_task_bytes(task: Dict[str, object]) -> int:
         shape = tuple(int(v) for v in task.get('processing_shape', ()))
         if len(shape) != 3:
@@ -39280,17 +40755,42 @@ def main() -> None:
             return False
         need = int(_direct_union_task_bytes(task))
         active = int(sum(direct_union_live_bytes.values()))
-        return bool(not direct_union_live_views or active + need <= int(direct_union_active_byte_limit))
+        if active + need > int(direct_union_active_byte_limit):
+            return False
+        return bool(parent_transient_admission.can_set_external(
+            _direct_union_admission_key(key), int(need),
+        ))
 
-    def _activate_direct_union_task(task: Dict[str, object]) -> None:
+    def _activate_direct_union_task(task: Dict[str, object]) -> bool:
+        """Atomically charge and materialize a newly admitted direct-union view."""
         key = _direct_union_task_key(task)
         if key is None:
-            return
+            return True
         view_obj = task['view']
-        _ensure_baseline_workspaces(str(key[0]), view_obj)
+        new_view = key not in baseline_union_by_model_view
+        admission_key = _direct_union_admission_key(key)
+        if new_view and direct_union_sparse_retirement_active:
+            need = int(_direct_union_task_bytes(task))
+            if not parent_transient_admission.try_set_external(admission_key, int(need)):
+                return False
+            try:
+                _ensure_baseline_workspaces(str(key[0]), view_obj)
+            except BaseException:
+                parent_transient_admission.release_external(admission_key)
+                raise
+        else:
+            _ensure_baseline_workspaces(str(key[0]), view_obj)
         task['result_mask_path'] = str(baseline_union_paths[key])
         conf_path = baseline_confmap_paths.get(key)
         task['result_conf_path'] = str(conf_path) if conf_path is not None else None
+        return True
+
+    def _pending_dispatchable_inference_exists() -> bool:
+        """Whether at least one central-queue task passes current RAM/view admission."""
+        return any(
+            _direct_union_task_admissible(gpu_worker_tasks_by_id[int(task_id)])
+            for task_id in gpu_worker_pending_task_ids
+        )
 
     def _pop_gpu_worker_pending_task_id(
         preferred_parent: Optional[Tuple[str, str]] = None,
@@ -39369,7 +40869,7 @@ def main() -> None:
         # Multi-GPU workers can become useful interpolation hosts independently after their
         # targeted queue drains, even while another GPU is finishing a long lease.  A newly
         # ready inference task revokes the lease in the dispatcher before queueing that task.
-        no_imminent_task = not gpu_worker_pending_task_ids
+        no_imminent_task = not _pending_dispatchable_inference_exists()
         for worker_id in worker_ids:
             if (
                 int(gpu_worker_dispatched_tasks) > 0
@@ -39388,7 +40888,13 @@ def main() -> None:
         nonlocal gpu_worker_dispatched_tasks, gpu_worker_dispatch_cursor
         worker_ids = sorted(int(worker_id) for worker_id in gpu_task_queues)
         if not worker_ids:
+            _set_main_process_gpu_inference_dispatchable_pending(False)
             return
+        # Publish before examining worker leases so a concurrently starting output thread
+        # cannot seize a device in the gap between a task becoming admissible and queue.put.
+        _set_main_process_gpu_inference_dispatchable_pending(
+            _pending_dispatchable_inference_exists()
+        )
         per_gpu = max(1, _env_int_compat(
             'YOLO_TTA_GPU_WORKER_DISPATCH_WINDOW_PER_GPU',
             'YOLO_TTA_MGPU_DISPATCH_WINDOW_PER_GPU',
@@ -39428,7 +40934,13 @@ def main() -> None:
                 break
             task_to_dispatch = gpu_worker_tasks_by_id[int(task_id)]
             try:
-                _activate_direct_union_task(task_to_dispatch)
+                if not _activate_direct_union_task(task_to_dispatch):
+                    # A parent reservation may have won the shared-ledger race between
+                    # eligibility selection and activation. Put this task back without
+                    # turning an ordinary admission stall into a scheduler failure.
+                    gpu_worker_pending_task_ids.appendleft(int(task_id))
+                    _main_process_gpu_stage_finish_inference(worker_id)
+                    break
                 dispatch_task = dict(task_to_dispatch)
                 _attach_memfd_transfers_to_task(dispatch_task)
                 gpu_task_queues[int(worker_id)].put(dispatch_task)
@@ -39440,6 +40952,9 @@ def main() -> None:
             gpu_worker_dispatched_by_id[int(worker_id)] = int(
                 gpu_worker_dispatched_by_id.get(int(worker_id), 0)
             ) + 1
+        _set_main_process_gpu_inference_dispatchable_pending(
+            _pending_dispatchable_inference_exists()
+        )
         _refresh_gpu_aux_interpolation_leases()
 
     def _ensure_source_volume_file_backed() -> Tuple[str, Tuple[int, int, int], str]:
@@ -39502,9 +41017,15 @@ def main() -> None:
         _configure_main_process_gpu_stage_workers(gpu_logical_indices)
         if main_process_gpu_stage_inference_priority_enabled():
             print(
-                'Inference-first GPU ownership active (v16.0.11): main-process NRRD, '
-                'backprojection, downbin, and topology stages cannot seize worker GPUs until '
-                'the global inference queue is permanently drained. '
+                f'Inference-first GPU ownership active (v{SCRIPT_VERSION}): main-process NRRD, '
+                'backprojection, downbin, and topology stages yield to every currently '
+                'dispatchable inference task. During a RAM/admission stall with no inference '
+                f'in flight, at most {main_process_gpu_stage_stall_aux_limit()} preemptible '
+                'Radial backprojection lease(s) may make progress; other main-process stages '
+                'remain blocked. If inference becomes dispatchable, a borrowed Radial lease '
+                f'yields after its next {main_process_gpu_radial_preemption_band_slices()}-slice '
+                'output band, synchronizes and trims CUDA ownership, then finishes its '
+                'uncommitted suffix on CPU. '
                 'YOLO_TTA_MAIN_GPU_STAGE_INFERENCE_PRIORITY=0 restores opportunistic leasing.'
             )
         pinned_tokens = [
@@ -39684,7 +41205,7 @@ def main() -> None:
         chunk_hole_fill_enabled = bool(gpu_worker_chunk_hole_fill_enabled())
         if gpu_worker_device_hole_fill and not chunk_hole_fill_enabled:
             print(
-                'Split-view hole fill moved off the inference handoff (v16.0.11): multi-chunk '
+                f'Split-view hole fill moved off the inference handoff (v{SCRIPT_VERSION}): multi-chunk '
                 'full-frame views run one completed-view CPU pass instead of a CuPy label/fill '
                 'barrier after every GPU lease. YOLO_TTA_GPU_WORKER_CHUNK_HOLE_FILL=1 restores '
                 'the per-chunk device pass.'
@@ -39708,7 +41229,7 @@ def main() -> None:
                 key_fv = (str(model_name), str(view.name))
                 fullframe_subtasks_per_view[key_fv] = int(fullframe_subtasks_per_view.get(key_fv, 0)) + len(ranges)
                 prefix = f'{view.name}__{job_id}'
-                # v16.0.11 allocates the shared direct-union workspace only when the
+                # Allocate the shared direct-union workspace only when the
                 # first task for this view is actually dispatched.  This prevents all 30
                 # logical 25-39 GiB unions from being created/touched at startup.
             elif tile_group_dispatch_active:
@@ -39759,6 +41280,7 @@ def main() -> None:
                     'slice_start': int(s0), 'slice_count': int(count),
                     'source_volume_path': source_volume_path, 'source_shape': list(source_volume_shape),
                     'source_dtype': source_volume_dtype,
+                    'radial_texture_required': bool(radial_texture_required),
                     # native-volume residency spec + cube-ready sentinel
                     # (None when the cube gated enqueue synchronously, as before).
                     'native_resize': native_resize_task_spec,
@@ -39948,6 +41470,7 @@ def main() -> None:
                         'slice_start': int(z0), 'slice_count': int(z1 - z0),
                         'source_volume_path': source_volume_path, 'source_shape': list(source_volume_shape),
                         'source_dtype': source_volume_dtype,
+                        'radial_texture_required': bool(radial_texture_required),
                         'native_resize': native_resize_task_spec,
                         'canvas_path': str(canvas_path), 'canvas_shape': [int(v) for v in canvas_shape],
                         'want_confmap': bool(float(args.min_conf) > 0.0),
@@ -39987,10 +41510,121 @@ def main() -> None:
             _dispatch_gpu_worker_inference_window()
             return int(emitted)
 
+    def _account_direct_union_sparse_task_band(
+        task: Dict[str, object],
+        task_meta: object,
+    ) -> None:
+        """Replace one completed band's dense charge with its page-rounded sparse footprint.
+
+        Direct-union memfds are virtually full-sized, but sparse retirement touches only each
+        foreground bounding-box row. Charging the exact page intervals touched by those rows is
+        conservative with respect to cgroup anonymous/shmem accounting while allowing untouched
+        bands to be reused before the entire view finishes postprocessing.
+        """
+        if (
+            not direct_union_sparse_retirement_active
+            or str(task.get('result_mode', 'file')) != 'direct_union'
+            or not isinstance(task_meta, dict)
+        ):
+            return
+        task_id = int(task.get('task_id', -1))
+        if task_id in direct_union_retired_task_ids:
+            return
+        key = _direct_union_task_key(task)
+        if key is None or key not in direct_union_live_bytes:
+            return
+        try:
+            count = int(task.get('slice_count', 0))
+            slice_start = int(task.get('slice_start', 0))
+            processing_shape = tuple(int(v) for v in task.get('processing_shape', ()))
+            if len(processing_shape) != 3:
+                processing_shape = view_processing_volume_shape(
+                    task['view'], int(task.get('out_size', args.imgsz)),
+                )
+            _z_dim, height, width = processing_shape
+            slice_any = np.asarray(task_meta['slice_any'], dtype=bool).reshape(-1)
+            slice_bboxes = np.asarray(task_meta['slice_bboxes'], dtype=np.int64)
+            if (
+                count <= 0 or height <= 0 or width <= 0
+                or slice_any.shape != (int(count),)
+                or slice_bboxes.shape != (int(count), 4)
+            ):
+                return
+
+            # mmap bases are page-aligned. Merge the naturally sorted row intervals so pages
+            # shared by adjacent rows are counted once; confidence has an independent mapping
+            # with the same geometry and therefore the same page footprint.
+            page_size = max(1, int(mmap.PAGESIZE))
+            page_count = 0
+            active_page_start: Optional[int] = None
+            active_page_stop: Optional[int] = None
+            for local_z in range(int(count)):
+                if not bool(slice_any[int(local_z)]):
+                    continue
+                y0, y1, x0, x1 = (int(v) for v in slice_bboxes[int(local_z)])
+                y0 = max(0, min(int(height), int(y0)))
+                y1 = max(int(y0), min(int(height), int(y1)))
+                x0 = max(0, min(int(width), int(x0)))
+                x1 = max(int(x0), min(int(width), int(x1)))
+                if y1 <= y0 or x1 <= x0:
+                    continue
+                absolute_z = int(slice_start) + int(local_z)
+                for row_y in range(int(y0), int(y1)):
+                    byte_start = (
+                        (int(absolute_z) * int(height) + int(row_y)) * int(width)
+                        + int(x0)
+                    )
+                    byte_stop = int(byte_start) + int(x1 - x0)
+                    row_page_start = int(byte_start) // int(page_size)
+                    row_page_stop = (int(byte_stop) + int(page_size) - 1) // int(page_size)
+                    if active_page_start is None:
+                        active_page_start = int(row_page_start)
+                        active_page_stop = int(row_page_stop)
+                    elif int(row_page_start) <= int(active_page_stop):
+                        active_page_stop = max(int(active_page_stop), int(row_page_stop))
+                    else:
+                        page_count += int(active_page_stop) - int(active_page_start)
+                        active_page_start = int(row_page_start)
+                        active_page_stop = int(row_page_stop)
+            if active_page_start is not None and active_page_stop is not None:
+                page_count += int(active_page_stop) - int(active_page_start)
+
+            planes = 2 if float(args.min_conf) > 0.0 else 1
+            dense_band_bytes = int(count) * int(height) * int(width) * int(planes)
+            sparse_band_bytes = min(
+                int(dense_band_bytes),
+                int(page_count) * int(page_size) * int(planes),
+            )
+            old_charge = int(direct_union_live_bytes.get(key, 0))
+            new_charge = min(
+                int(old_charge),
+                max(0, int(old_charge) - int(dense_band_bytes)) + int(sparse_band_bytes),
+            )
+            direct_union_live_bytes[key] = int(new_charge)
+            # Decreases cannot fail, and notify any parent/transient waiter immediately.
+            parent_transient_admission.try_set_external(
+                _direct_union_admission_key(key), int(new_charge),
+            )
+            direct_union_retired_task_ids.add(int(task_id))
+            runtime_telemetry().add(
+                'scheduler.direct_union_dense_band_bytes_retired', int(dense_band_bytes),
+            )
+            runtime_telemetry().add(
+                'scheduler.direct_union_sparse_page_bytes_retained', int(sparse_band_bytes),
+            )
+        except Exception as exc:
+            # Metadata is an optimization only. Keeping the band's dense reservation is the
+            # safe fallback and does not compromise the worker result itself.
+            runtime_telemetry().fallback('scheduler.direct_union_sparse_band_accounting', exc)
+
     def _finalize_fullframe_view_after_worker(model_name_s: str, view: ViewInfo) -> None:
         remaining_key = (str(model_name_s), str(view.name))
         fullframe_remaining[remaining_key] = int(fullframe_remaining.get(remaining_key, 0)) - 1
         if int(fullframe_remaining.get(remaining_key, 0)) == 0:
+            if direct_union_sparse_retirement_active:
+                # This slot limits inference-open views. The reduced sparse byte charge remains
+                # in the shared ledger until the parent future finishes and releases its memfd.
+                direct_union_live_views.discard(remaining_key)
             _submit_view_prepare(str(model_name_s), view)
 
     def _handle_fullframe_worker_result(task: Dict[str, object], stats: Dict[str, int]) -> None:
@@ -40039,6 +41673,7 @@ def main() -> None:
             # The worker already wrote its disjoint slice window straight into the
             # shared per-view union mapping; nothing to reopen, OR, flush, or unlink here, and
             # the scheduler thread is free to drain the next GPU result immediately.
+            _account_direct_union_sparse_task_band(task, task_meta)
             _finalize_fullframe_view_after_worker(model_name_s, view)
             return
         _ensure_baseline_workspaces(model_name_s, view)
@@ -40188,6 +41823,10 @@ def main() -> None:
             _handle_tile_group_worker_result(task, stats)
         else:
             _handle_tile_worker_result(task, stats)
+        # Result handling may retire a sparse band, close an inference-open view, or emit
+        # deferred tile groups. Re-evaluate admission immediately rather than waiting for a
+        # background future or the next result-queue wakeup.
+        _dispatch_gpu_worker_inference_window(_gpu_worker_fullframe_parent_key(task))
         if (
             int(gpu_worker_results_collected) >= int(gpu_worker_total_tasks)
             and not deferred_tile_jobs_by_parent
@@ -40830,7 +42469,7 @@ def main() -> None:
                 print(
                     f'Final {model_name}/{view.name}: restoring/assembling the union of '
                     f'{len(view_projected_layer_refs)} orthogonal NRRD layer(s) directly into '
-                    f'output geometry (v16.0.11 sparse-retirement path).'
+                    f'output geometry (v{SCRIPT_VERSION} sparse-retirement path).'
                 )
                 if g5_tail_eligible:
                     fused_projected_layer_refs.extend(view_projected_layer_refs)
@@ -41206,11 +42845,11 @@ def main() -> None:
         spec_notes.append(
             f'NRRD decomposition (v13.2.0): {int(legacy_nrrd_count)} legacy component/checkpoint NRRD file(s) written to '
             f'{nrrd_dir} as one uint8 binary mask per component layer (X,Y,t source geometry), named '
-            '{Filestem}_{ViewToken|Global}_{layer}.seg.nrrd with the model name dropped, tagged as a 3D Slicer '
+            f'{OUTPUT_NRRD_PREFIX}{{Filestem}}_{{ViewToken|Global}}_{{layer}}.seg.nrrd with the model name dropped, tagged as a 3D Slicer '
             'segmentation (v13.2.3: segment named after the file, deterministic per-layer color). Each layer is created during '
             'the intermediate pipeline steps (e.g. the Transverse layer compresses while Tiled Transverse is still '
             'inferencing) and, when Gaussian smoothing is enabled, Global_union_presmoothing is written while smoothing runs; a single '
-            f'{input_path.stem}_nrrd_manifest.json sidecar lists every written layer. The previous mega 4D '
+            f'{variant_nrrd_stem(input_path.stem)}_nrrd_manifest.json sidecar lists every written layer. The previous mega 4D '
             'decomposed NRRD (one file with a trailing list axis) has been removed.'
         )
         if int(nrrd_low_quality_layer_files_written) > 0:
@@ -41223,7 +42862,7 @@ def main() -> None:
                 f'Low-quality NRRD decomposition (v13.2.1, bug #2): {int(legacy_lq_nrrd_count)} legacy '
                 'downbinned single-layer NRRD file(s) written under low_quality/<token>/nrrd/, mirroring the '
                 'full-quality component layers per --save_low_quality_downbin spec and written on the same '
-                'view-completion schedule. Each downbin has its own {Filestem}_nrrd_manifest.json with layer '
+                f'view-completion schedule. Each downbin has its own {OUTPUT_NRRD_PREFIX}{{Filestem}}_nrrd_manifest.json with layer '
                 'suffixes matching the full-quality nrrd/ folder.'
             )
     if bool(centerline_audit_nrrd_needed):
@@ -41381,1142 +43020,12 @@ def main() -> None:
 
 
 
-# v16.0.11 production optimizations are integrated at their owning call sites.
+# Production optimizations are integrated at their owning call sites.
 # The heuristic global monkeypatch framework used by v16.0.8 was removed because it
 # could replace unrelated functions by name and shadow the real fused-union implementation.
 
 
-
-# -----------------------------------------------------------------------------
-# v16.0.11 executable optimization layer
-# -----------------------------------------------------------------------------
-# This block is deliberately self-contained so the optimized paths can be
-# audited independently of the historical versioned sections above it.
-
-import atexit as _v16011_atexit
-import contextlib as _v16011_contextlib
-import ctypes as _v16011_ctypes
-import functools as _v16011_functools
-import inspect as _v16011_inspect
-import io as _v16011_io
-import os as _v16011_os
-import pathlib as _v16011_pathlib
-import re as _v16011_re
-import shutil as _v16011_shutil
-import tempfile as _v16011_tempfile
-import threading as _v16011_threading
-import time as _v16011_time
-
-_V16011_LOG_LOCK = _v16011_threading.Lock()
-_V16011_LOGGED = set()
-_V16011_INSTALLED = False
-_V16011_STAGE_ROOTS = {}
-_V16011_STAGE_LOCK = _v16011_threading.Lock()
-_V16011_AFFINITY_DONE = set()
-_V16011_AFFINITY_LOCK = _v16011_threading.Lock()
-_V16011_HOLE_WS = {}
-_V16011_HOLE_LOCK = _v16011_threading.Lock()
-_V16011_KERNELS = {}
-_V16011_DIRECT_LOCKS = {}
-_V16011_DIRECT_DISABLED = set()
-_V16011_SPARSE_MATERIALIZE_WARNED = False
-
-# Filled by the source transformer. These names are executable audit evidence,
-# not documentation-only claims.
-_V16011_RADIAL_TARGETS = ('get_radial_sampler', 'choose_radial_exact_block_frames', 'extract_tilted_radial_slice_frame', '_ensure_fused_radial_taps', '_try_fused_radial_into_slot', '_radial_taps_gpu', 'prerender_radial_slab')
-_V16011_TILTED_TARGETS = ('tilted_radial_resident_gpu_render_enabled', 'radial_sink_only_projection_supported', 'extract_tilted_radial_slice_frame', '_try_fused_tilted_into_slot', '_render_tilted_radial_native_resident_torch', '_render_tilted_radial_native_resident', '_render_tilted_frame', '_backproject_tilted_radial_volume_to_volume', 'backproject_radial_volume_to_volume', 'backproject_tilted_volume_to_volume', 'assemble_view_volumes_and_projected_layers_fused', 'project_view_volume_to_orthogonal_volume')
-_V16011_WORKER_TARGETS = ('numa_worker_pin_enabled', 'plan_gpu_worker_affinity', 'default_worker_budget', 'gpu_worker_cpu_share', 'main_process_worker_budget', 'tail_worker_budget_expansion_enabled', 'gpu_worker_direct_union_enabled', 'gpu_worker_fullframe_task_ranges', 'gpu_worker_tail_split_point', 'gpu_worker_aux_interpolation_enabled', 'enable_worker', 'set_gpu_worker_aux_interpolation_pool', 'gpu_worker_aux_interpolation_pool', 'tilted_radial_resident_gpu_render_enabled', 'radial_resident_gpu_render_supported', 'radial_streaming_gpu_render_supported', 'gpu_worker_chunk_hole_fill_enabled', 'gpu_worker_render_enabled', 'gpu_worker_render_resident_enabled', 'gpu_render_reserve_bytes', 'gpu_render_tblock_slices', '__init__', '_worker_gpu_render_engine', '_init_worker_gpu_render_engine', 'run_prediction_volume_in_worker', '_gpu_inference_worker_main', 'main_process_gpu_stage_inference_overlap_enabled', 'main_process_gpu_stage_inference_priority_enabled', 'configure_workers', '_configure_main_process_gpu_stage_workers', '_set_main_process_gpu_inference_priority_active', '_main_process_gpu_stage_can_dispatch_inference', '_main_process_gpu_stage_begin_inference', '_main_process_gpu_stage_finish_inference')
-_V16011_HOLE_TARGETS = ('gpu_device_hole_fill_enabled', 'gpu_worker_chunk_hole_fill_enabled', 'fill_holes_2d')
-_V16011_PREDICT_REWRITES = 2
-_V16011_SPARSE_REWRITES = 1
-_V16011_TEMP_REWRITES = 3
-
-
-def _v16011_log(tag, message, once=None):
-    key = (tag, once if once is not None else message)
-    if once is not None:
-        with _V16011_LOG_LOCK:
-            if key in _V16011_LOGGED:
-                return
-            _V16011_LOGGED.add(key)
-    try:
-        print(f"[v16.0.11][{tag}] {message}", flush=True)
-    except Exception:
-        pass
-
-
-def _v16011_env_bool(name, default=False):
-    value = _v16011_os.environ.get(name)
-    if value is None:
-        return bool(default)
-    return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
-
-
-# ---- K2: topology-aware worker placement ------------------------------------
-
-def _v16011_parse_cpulist(text):
-    cpus = set()
-    for part in str(text).strip().split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            lo, hi = part.split("-", 1)
-            try:
-                cpus.update(range(int(lo), int(hi) + 1))
-            except Exception:
-                continue
-        else:
-            try:
-                cpus.add(int(part))
-            except Exception:
-                continue
-    return cpus
-
-
-def _v16011_cuda_visible_tokens():
-    raw = _v16011_os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
-    if not raw:
-        return []
-    return [item.strip() for item in raw.split(",") if item.strip()]
-
-
-def _v16011_device_ordinal(device):
-    if device is None:
-        try:
-            import torch
-            return int(torch.cuda.current_device()) if torch.cuda.is_available() else None
-        except Exception:
-            return None
-    if isinstance(device, int):
-        return int(device)
-    if hasattr(device, "index") and getattr(device, "index", None) is not None:
-        try:
-            return int(device.index)
-        except Exception:
-            pass
-    text = str(device).strip().lower()
-    if "," in text:
-        text = text.split(",", 1)[0].strip()
-    if text.startswith("cuda:"):
-        text = text.split(":", 1)[1]
-    if text in {"cuda", "gpu", "none", ""}:
-        return None
-    try:
-        return int(text)
-    except Exception:
-        return None
-
-
-def _v16011_nvml_handle_for_local(local_index):
-    try:
-        try:
-            import pynvml as nvml
-        except Exception:
-            import nvidia_smi as nvml  # pragma: no cover - legacy fallback
-        try:
-            nvml.nvmlInit()
-        except Exception:
-            pass
-        tokens = _v16011_cuda_visible_tokens()
-        token = tokens[local_index] if tokens and local_index < len(tokens) else str(local_index)
-        if token.upper().startswith("GPU-") or token.upper().startswith("MIG-"):
-            handle = nvml.nvmlDeviceGetHandleByUUID(token.encode())
-        else:
-            handle = nvml.nvmlDeviceGetHandleByIndex(int(token))
-        return nvml, handle
-    except Exception:
-        return None, None
-
-
-def _v16011_pci_bus_id(local_index):
-    nvml, handle = _v16011_nvml_handle_for_local(local_index)
-    if handle is not None:
-        try:
-            info = nvml.nvmlDeviceGetPciInfo(handle)
-            bus = getattr(info, "busId", None) or getattr(info, "busIdLegacy", None)
-            if isinstance(bus, bytes):
-                bus = bus.decode(errors="replace")
-            if bus:
-                return str(bus).lower()
-        except Exception:
-            pass
-    try:
-        import torch
-        props = torch.cuda.get_device_properties(local_index)
-        bus = getattr(props, "pci_bus_id", None)
-        if bus:
-            return str(bus).lower()
-    except Exception:
-        pass
-    return None
-
-
-def _v16011_gpu_numa_node(local_index):
-    bus = _v16011_pci_bus_id(local_index)
-    if not bus:
-        return None
-    bus = bus.replace("00000000:", "0000:")
-    p = _v16011_pathlib.Path("/sys/bus/pci/devices") / bus / "numa_node"
-    try:
-        node = int(p.read_text().strip())
-        return node if node >= 0 else None
-    except Exception:
-        return None
-
-
-def _v16011_allowed_cpus():
-    try:
-        return set(_v16011_os.sched_getaffinity(0))
-    except Exception:
-        count = _v16011_os.cpu_count() or 1
-        return set(range(count))
-
-
-def _v16011_node_cpus(node):
-    allowed = _v16011_allowed_cpus()
-    if node is None:
-        return allowed
-    try:
-        text = (_v16011_pathlib.Path("/sys/devices/system/node") / f"node{node}" / "cpulist").read_text()
-        local = _v16011_parse_cpulist(text)
-        local &= allowed
-        return local or allowed
-    except Exception:
-        return allowed
-
-
-def _v16011_local_gpu_count():
-    try:
-        import torch
-        return max(1, int(torch.cuda.device_count()))
-    except Exception:
-        tokens = _v16011_cuda_visible_tokens()
-        return max(1, len(tokens))
-
-
-def _v16011_cpu_partition_for_gpu(local_index):
-    node = _v16011_gpu_numa_node(local_index)
-    cpus = sorted(_v16011_node_cpus(node))
-    if not cpus:
-        return set(), node
-    peers = [i for i in range(_v16011_local_gpu_count()) if _v16011_gpu_numa_node(i) == node]
-    if not peers:
-        peers = [local_index]
-    try:
-        rank = peers.index(local_index)
-    except ValueError:
-        rank = 0
-    # Partition physical/logical CPUs among only the allocated GPUs attached to
-    # this socket. No assumption is made that four allocated devices are 2+2.
-    share = cpus[rank::len(peers)]
-    min_share = int(_v16011_os.environ.get("YOLO_TTA_NUMA_MIN_CPUS_PER_GPU", "4") or 4)
-    if len(share) < min_share:
-        share = cpus
-    return set(share), node
-
-
-def _v16011_set_preferred_numa_node(node):
-    if node is None or not _v16011_env_bool("YOLO_TTA_NUMA_MEMORY_PREFERRED", True):
-        return
-    for soname in ("libnuma.so.1", "libnuma.so"):
-        try:
-            lib = _v16011_ctypes.CDLL(soname, use_errno=True)
-            if int(lib.numa_available()) < 0:
-                return
-            lib.numa_set_preferred.argtypes = [_v16011_ctypes.c_int]
-            lib.numa_set_preferred(int(node))
-            return
-        except Exception:
-            continue
-
-
-def _v16011_bind_device_locality(device=None):
-    if not _v16011_env_bool("YOLO_TTA_TOPOLOGY_AWARE", True):
-        return False
-    local_index = _v16011_device_ordinal(device)
-    if local_index is None:
-        return False
-    tid = _v16011_threading.get_native_id()
-    key = (tid, local_index)
-    with _V16011_AFFINITY_LOCK:
-        if key in _V16011_AFFINITY_DONE:
-            return True
-    cpus, node = _v16011_cpu_partition_for_gpu(local_index)
-    if not cpus:
-        return False
-    try:
-        _v16011_os.sched_setaffinity(0, cpus)
-        _v16011_set_preferred_numa_node(node)
-        with _V16011_AFFINITY_LOCK:
-            _V16011_AFFINITY_DONE.add(key)
-        _v16011_log(
-            "K2",
-            f"bound worker thread {tid} for local GPU {local_index} to NUMA node {node}; "
-            f"{len(cpus)} CPUs within the SLURM cpuset",
-            once=key,
-        )
-        return True
-    except Exception as exc:
-        _v16011_log("K2", f"affinity fallback for GPU {local_index}: {exc}", once=("fail", key))
-        return False
-
-
-def _v16011_extract_device(args, kwargs):
-    for key in ("device", "device_id", "gpu", "gpu_id", "cuda_device", "rank"):
-        if key in kwargs:
-            value = kwargs.get(key)
-            idx = _v16011_device_ordinal(value)
-            if idx is not None:
-                return idx
-    for value in args:
-        idx = _v16011_device_ordinal(value)
-        if idx is not None and not isinstance(value, bool):
-            # Avoid treating unrelated large integers as device IDs.
-            if 0 <= idx < max(1, _v16011_local_gpu_count()):
-                return idx
-    return None
-
-
-def _v16011_wrap_worker_affinity(fn):
-    if getattr(fn, "_v16011_k2", False):
-        return fn
-    @_v16011_functools.wraps(fn)
-    def wrapped(*args, **kwargs):
-        _v16011_bind_device_locality(_v16011_extract_device(args, kwargs))
-        return fn(*args, **kwargs)
-    wrapped._v16011_k2 = True
-    return wrapped
-
-
-# ---- J3: RAM -> memfd -> --temp staging -------------------------------------
-
-def _v16011_stage_cleanup(path):
-    try:
-        _v16011_shutil.rmtree(path, ignore_errors=True)
-    except Exception:
-        pass
-
-
-def _v16011_stage_root(fallback=None):
-    fallback = str(fallback or _v16011_tempfile.gettempdir())
-    key = (fallback, _v16011_os.getpid())
-    with _V16011_STAGE_LOCK:
-        cached = _V16011_STAGE_ROOTS.get(key)
-        if cached and _v16011_os.path.isdir(cached):
-            return cached
-        reserve_gib = float(_v16011_os.environ.get("YOLO_TTA_RAM_STAGE_RESERVE_GIB", "8") or 8)
-        reserve = int(reserve_gib * (1024 ** 3))
-        candidates = []
-        explicit = _v16011_os.environ.get("YOLO_TTA_RAM_STAGE", "").strip()
-        if explicit:
-            candidates.append(explicit)
-        candidates.append("/dev/shm")
-        root = None
-        for base in candidates:
-            try:
-                if not _v16011_os.path.isdir(base) or not _v16011_os.access(base, _v16011_os.W_OK | _v16011_os.X_OK):
-                    continue
-                stat = _v16011_os.statvfs(base)
-                free = int(stat.f_bavail) * int(stat.f_frsize)
-                if free <= reserve:
-                    continue
-                job = _v16011_os.environ.get("SLURM_JOB_ID", "nojid")
-                root = _v16011_os.path.join(base, f"yolo_tta_{job}_{_v16011_os.getpid()}")
-                _v16011_os.makedirs(root, exist_ok=True)
-                _v16011_log("J3", f"RAM-backed staging root: {root} ({free / 2**30:.1f} GiB free)", once=("root", root))
-                break
-            except Exception:
-                continue
-        if root is None:
-            root = fallback
-            try:
-                _v16011_os.makedirs(root, exist_ok=True)
-            except Exception:
-                pass
-            _v16011_log("J3", f"RAM staging unavailable; using --temp fallback: {root}", once=("fallback", root))
-        else:
-            _v16011_atexit.register(_v16011_stage_cleanup, root)
-        _V16011_STAGE_ROOTS[key] = root
-        return root
-
-
-class _V16011MemfdFile:
-    __slots__ = ("_file", "name", "_fd")
-    def __init__(self, file_obj, fd):
-        self._file = file_obj
-        self._fd = fd
-        self.name = f"/proc/self/fd/{fd}"
-    def __getattr__(self, name):
-        return getattr(self._file, name)
-    def __enter__(self):
-        return self
-    def __exit__(self, exc_type, exc, tb):
-        self.close()
-        return False
-    def close(self):
-        return self._file.close()
-    def __iter__(self):
-        return iter(self._file)
-
-
-def _v16011_named_stage_file(*args, **kwargs):
-    # memfd is preferred for same-process consumers that require a pathname but
-    # do not need directory semantics. Fall back to a RAM-backed real pathname,
-    # then to the user's --temp root.
-    mode = kwargs.get("mode", args[0] if args else "w+b")
-    suffix = kwargs.get("suffix", "") or ""
-    prefix = kwargs.get("prefix", "tmp") or "tmp"
-    use_memfd = _v16011_env_bool("YOLO_TTA_USE_MEMFD", True)
-    explicit_dir = kwargs.get("dir")
-    if use_memfd and explicit_dir is None and hasattr(_v16011_os, "memfd_create"):
-        try:
-            flags = int(getattr(_v16011_os, "MFD_CLOEXEC", 0))
-            fd = _v16011_os.memfd_create(f"{prefix}{suffix}", flags=flags)
-            file_obj = _v16011_os.fdopen(fd, mode)
-            _v16011_log("J3", "using memfd for pathname-compatible transient output", once="memfd")
-            return _V16011MemfdFile(file_obj, fd)
-        except Exception as exc:
-            _v16011_log("J3", f"memfd unavailable for this call; using RAM path: {exc}", once="memfd-fallback")
-    new_kwargs = dict(kwargs)
-    if explicit_dir is None:
-        new_kwargs["dir"] = _v16011_stage_root(_v16011_tempfile.gettempdir())
-    return _v16011_tempfile.NamedTemporaryFile(*args, **new_kwargs)
-
-
-def _v16011_mkstemp(*args, **kwargs):
-    new_kwargs = dict(kwargs)
-    if new_kwargs.get("dir") is None:
-        new_kwargs["dir"] = _v16011_stage_root(_v16011_tempfile.gettempdir())
-    return _v16011_tempfile.mkstemp(*args, **new_kwargs)
-
-
-def _v16011_mkdtemp(*args, **kwargs):
-    new_kwargs = dict(kwargs)
-    if new_kwargs.get("dir") is None:
-        new_kwargs["dir"] = _v16011_stage_root(_v16011_tempfile.gettempdir())
-    return _v16011_tempfile.mkdtemp(*args, **new_kwargs)
-
-
-# ---- D1: compact GPU mask retirement ----------------------------------------
-
-def _v16011_get_cupy():
-    try:
-        import cupy as cp
-        return cp
-    except Exception:
-        return None
-
-
-def _v16011_get_numpy():
-    import numpy as np
-    return np
-
-
-def _v16011_as_cupy(value):
-    cp = _v16011_get_cupy()
-    if cp is None:
-        return None, None
-    if isinstance(value, cp.ndarray):
-        return value, "cupy"
-    try:
-        import torch
-        if isinstance(value, torch.Tensor) and value.is_cuda:
-            try:
-                return cp.from_dlpack(value), "torch"
-            except Exception:
-                return cp.fromDlpack(torch.utils.dlpack.to_dlpack(value)), "torch"
-    except Exception:
-        pass
-    return None, None
-
-
-def _v16011_bbox_kernel(cp):
-    key = (int(cp.cuda.runtime.getDevice()), "bbox_u8")
-    kernel = _V16011_KERNELS.get(key)
-    if kernel is not None:
-        return kernel
-    kernel = cp.RawKernel(r'''
-    extern "C" __global__
-    void bbox_u8(const unsigned char* src, int n, int h, int w, int* boxes) {
-        long long total = (long long)n * h * w;
-        for (long long q = (long long)blockDim.x * blockIdx.x + threadIdx.x;
-             q < total; q += (long long)blockDim.x * gridDim.x) {
-            if (!src[q]) continue;
-            int s = (int)(q / ((long long)h * w));
-            int r = (int)((q / w) % h);
-            int c = (int)(q % w);
-            int* b = boxes + 4 * s;
-            atomicMin(b + 0, r);
-            atomicMin(b + 1, c);
-            atomicMax(b + 2, r);
-            atomicMax(b + 3, c);
-        }
-    }
-    ''', "bbox_u8")
-    _V16011_KERNELS[key] = kernel
-    return kernel
-
-
-class _V16011SparseMaskStack:
-    __array_priority__ = 1000
-    def __init__(self, shape, dtype, records, pinned_refs=None):
-        self.shape = tuple(int(v) for v in shape)
-        self.dtype = dtype
-        self.ndim = len(self.shape)
-        self._records = records
-        self._pinned_refs = pinned_refs or []
-    def __len__(self):
-        return self.shape[0] if self.ndim == 3 else self.shape[0]
-    @property
-    def nbytes(self):
-        return sum(int(crop.nbytes) for _, crop in self._records.values())
-    def _slice_dense(self, index):
-        np = _v16011_get_numpy()
-        if self.ndim == 2:
-            out = np.zeros(self.shape, dtype=self.dtype)
-            rec = self._records.get(0)
-        else:
-            out = np.zeros(self.shape[1:], dtype=self.dtype)
-            rec = self._records.get(int(index))
-        if rec is not None:
-            (y0, y1, x0, x1), crop = rec
-            out[y0:y1, x0:x1] = crop
-        return out
-    def __iter__(self):
-        if self.ndim == 2:
-            return iter(self._slice_dense(0))
-        return (self._slice_dense(i) for i in range(self.shape[0]))
-    def __getitem__(self, key):
-        if self.ndim == 2:
-            return self._slice_dense(0)[key]
-        if isinstance(key, tuple):
-            head, tail = key[0], key[1:]
-            if isinstance(head, (int, _v16011_get_numpy().integer)):
-                arr = self._slice_dense(int(head))
-                return arr[tail] if tail else arr
-            return self.__array__()[key]
-        if isinstance(key, (int, _v16011_get_numpy().integer)):
-            return self._slice_dense(int(key))
-        return self.__array__()[key]
-    def __array__(self, dtype=None, copy=None):
-        global _V16011_SPARSE_MATERIALIZE_WARNED
-        np = _v16011_get_numpy()
-        if not _V16011_SPARSE_MATERIALIZE_WARNED:
-            _V16011_SPARSE_MATERIALIZE_WARNED = True
-            _v16011_log("D1", "consumer requested dense fallback for a sparse-retired mask stack", once="dense-fallback")
-        if self.ndim == 2:
-            out = self._slice_dense(0)
-        else:
-            out = np.zeros(self.shape, dtype=self.dtype)
-            for i in self._records:
-                out[i] = self._slice_dense(i)
-        if dtype is not None:
-            out = out.astype(dtype, copy=False)
-        if copy:
-            out = out.copy()
-        return out
-    def astype(self, dtype, copy=True):
-        arr = self.__array__(dtype=dtype)
-        return arr.copy() if copy else arr
-    def copy(self):
-        return self.__array__(copy=True)
-    def any(self, axis=None, out=None, keepdims=False):
-        if axis is None:
-            value = bool(self._records)
-            if out is not None:
-                out[...] = value
-                return out
-            return value
-        return self.__array__().any(axis=axis, out=out, keepdims=keepdims)
-    def sum(self, axis=None, dtype=None, out=None, keepdims=False):
-        if axis is None:
-            total = sum(crop.sum(dtype=dtype) for _, crop in self._records.values())
-            if out is not None:
-                out[...] = total
-                return out
-            return total
-        return self.__array__().sum(axis=axis, dtype=dtype, out=out, keepdims=keepdims)
-    def __or__(self, other):
-        return self.__array__() | other
-    def __ror__(self, other):
-        return other | self.__array__()
-    def __and__(self, other):
-        return self.__array__() & other
-    def __rand__(self, other):
-        return other & self.__array__()
-
-
-def _v16011_sparse_retire_impl(value):
-    cp = _v16011_get_cupy()
-    np = _v16011_get_numpy()
-    arr, origin = _v16011_as_cupy(value)
-    if arr is None:
-        return None
-    if arr.ndim not in (2, 3) or arr.dtype.itemsize != 1:
-        return None
-    original_shape = tuple(int(v) for v in arr.shape)
-    stack = arr[None, ...] if arr.ndim == 2 else arr
-    if not stack.flags.c_contiguous:
-        stack = cp.ascontiguousarray(stack)
-    n, h, w = map(int, stack.shape)
-    min_pixels = int(_v16011_os.environ.get("YOLO_TTA_SPARSE_RETIRE_MIN_PIXELS", str(8 * 1024 * 1024)))
-    if n * h * w < min_pixels:
-        return None
-    boxes = cp.empty((n, 4), dtype=cp.int32)
-    boxes[:, 0] = h
-    boxes[:, 1] = w
-    boxes[:, 2] = -1
-    boxes[:, 3] = -1
-    kernel = _v16011_bbox_kernel(cp)
-    total = n * h * w
-    blocks = min(65535, max(1, (total + 255) // 256))
-    kernel((blocks,), (256,), (stack.view(cp.uint8), n, h, w, boxes))
-    host_boxes = cp.asnumpy(boxes)
-    records = {}
-    pinned_refs = []
-    stream = cp.cuda.get_current_stream()
-    pending = []
-    for i, (y0, x0, y1i, x1i) in enumerate(host_boxes.tolist()):
-        if y1i < y0 or x1i < x0:
-            continue
-        y1 = int(y1i) + 1
-        x1 = int(x1i) + 1
-        y0 = int(y0)
-        x0 = int(x0)
-        crop_gpu = stack[i, y0:y1, x0:x1]
-        nbytes = int(crop_gpu.nbytes)
-        mem = cp.cuda.alloc_pinned_memory(max(1, nbytes))
-        crop_host = np.frombuffer(mem, dtype=arr.dtype, count=crop_gpu.size).reshape(crop_gpu.shape)
-        crop_gpu.get(out=crop_host, stream=stream, blocking=False)
-        pinned_refs.append(mem)
-        pending.append((i, (y0, y1, x0, x1), crop_host))
-    stream.synchronize()
-    for i, bbox, crop in pending:
-        records[i] = (bbox, crop)
-    sparse_bytes = sum(int(c.nbytes) for _, c in records.values())
-    dense_bytes = int(arr.nbytes)
-    ratio = (sparse_bytes / dense_bytes) if dense_bytes else 0.0
-    _v16011_log(
-        "D1",
-        f"sparse GPU retirement active: {dense_bytes / 2**20:.1f} MiB dense -> "
-        f"{sparse_bytes / 2**20:.1f} MiB crops ({ratio:.3%})",
-        once=("active", original_shape),
-    )
-    return _V16011SparseMaskStack(original_shape, np.dtype(arr.dtype), records, pinned_refs)
-
-
-def _v16011_retire_gpu_mask(value, *args, **kwargs):
-    if _v16011_env_bool("YOLO_TTA_SPARSE_GPU_RETIRE", True):
-        try:
-            sparse = _v16011_sparse_retire_impl(value)
-            if sparse is not None:
-                return sparse
-        except Exception as exc:
-            _v16011_log("D1", f"sparse retirement fallback: {exc}", once=("fallback", type(exc).__name__))
-    cp = _v16011_get_cupy()
-    if cp is not None and isinstance(value, cp.ndarray):
-        return cp.asnumpy(value, *args, **kwargs)
-    try:
-        import torch
-        if isinstance(value, torch.Tensor):
-            return value.detach().cpu().numpy()
-    except Exception:
-        pass
-    return _v16011_get_numpy().asarray(value)
-
-
-# ---- D2: reusable-output GPU 2-D hole filling -------------------------------
-
-class _V16011HoleWorkspace:
-    __slots__ = ("shape", "labels", "outside")
-    def __init__(self, cp, shape):
-        h, w = map(int, shape)
-        self.shape = (h, w)
-        self.labels = cp.empty((h, w), dtype=cp.int32)
-        self.outside = cp.empty((h * w + 1,), dtype=cp.uint8)
-
-
-def _v16011_hole_workspace(cp, shape):
-    device = int(cp.cuda.runtime.getDevice())
-    key = (device, int(shape[0]), int(shape[1]))
-    with _V16011_HOLE_LOCK:
-        ws = _V16011_HOLE_WS.get(key)
-        if ws is None:
-            ws = _V16011HoleWorkspace(cp, shape)
-            _V16011_HOLE_WS[key] = ws
-            _v16011_log(
-                "D2",
-                f"allocated reusable GPU hole-fill workspace on device {device}: "
-                f"{shape[1]}x{shape[0]}",
-                once=("ws", key),
-            )
-        return ws
-
-
-def _v16011_hole_kernels(cp):
-    device = int(cp.cuda.runtime.getDevice())
-    key = (device, "hole")
-    found = _V16011_KERNELS.get(key)
-    if found is not None:
-        return found
-    mark = cp.RawKernel(r'''
-    extern "C" __global__
-    void mark_border(const int* labels, int h, int w, unsigned char* outside) {
-        int q = blockDim.x * blockIdx.x + threadIdx.x;
-        int perimeter = 2 * h + 2 * w;
-        if (q >= perimeter) return;
-        int y, x;
-        if (q < w) { y = 0; x = q; }
-        else if (q < 2*w) { y = h - 1; x = q - w; }
-        else if (q < 2*w + h) { y = q - 2*w; x = 0; }
-        else { y = q - (2*w + h); x = w - 1; }
-        int label = labels[y * w + x];
-        if (label > 0) outside[label] = 1;
-    }
-    ''', "mark_border")
-    apply = cp.RawKernel(r'''
-    extern "C" __global__
-    void apply_fill(const unsigned char* src, const int* labels,
-                    const unsigned char* outside, long long n,
-                    unsigned char* dst) {
-        for (long long q = (long long)blockDim.x * blockIdx.x + threadIdx.x;
-             q < n; q += (long long)blockDim.x * gridDim.x) {
-            int label = labels[q];
-            dst[q] = src[q] || (label > 0 && !outside[label]);
-        }
-    }
-    ''', "apply_fill")
-    _V16011_KERNELS[key] = (mark, apply)
-    return mark, apply
-
-
-def _v16011_gpu_fill_holes_array(arr, structure=None):
-    cp = _v16011_get_cupy()
-    if cp is None or not isinstance(arr, cp.ndarray):
-        raise TypeError("CuPy array required")
-    if arr.ndim not in (2, 3):
-        raise ValueError("2-D or stacked 2-D masks required")
-    try:
-        import cupyx.scipy.ndimage as cnd
-    except Exception as exc:
-        raise RuntimeError("cupyx.scipy.ndimage is required for GPU hole filling") from exc
-    # scipy/cupyx default binary_fill_holes connectivity is the 4-neighbour
-    # cross. Custom structures retain the original path to avoid semantic drift.
-    if structure is not None:
-        try:
-            default_structure = cp.asarray([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
-            if tuple(structure.shape) != (3, 3) or not bool(cp.all(cp.asarray(structure) == default_structure)):
-                raise ValueError("custom structure")
-        except Exception:
-            raise ValueError("custom hole-fill structures use the compatibility path")
-    src_stack = arr[None, ...] if arr.ndim == 2 else arr
-    result = cp.empty_like(src_stack)
-    mark, apply = _v16011_hole_kernels(cp)
-    cross = cp.asarray([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
-    for index in range(int(src_stack.shape[0])):
-        src = src_stack[index]
-        if src.dtype.itemsize != 1:
-            src_u8 = src.astype(cp.uint8)
-        else:
-            src_u8 = src.view(cp.uint8)
-        if not src_u8.flags.c_contiguous:
-            src_u8 = cp.ascontiguousarray(src_u8)
-        h, w = map(int, src.shape)
-        ws = _v16011_hole_workspace(cp, (h, w))
-        outside = ws.outside
-        outside.fill(0)
-        # Output labels are supplied explicitly and retained across frames. This
-        # removes the prior per-task label-array allocation and pool trim.
-        cnd.label(src_u8 == 0, structure=cross, output=ws.labels)
-        perimeter = 2 * h + 2 * w
-        mark(((perimeter + 255) // 256,), (256,), (ws.labels, h, w, outside))
-        total = h * w
-        blocks = min(65535, max(1, (total + 255) // 256))
-        dst_u8 = result[index].view(cp.uint8)
-        apply((blocks,), (256,), (src_u8, ws.labels, outside, total, dst_u8))
-    _v16011_log("D2", "fixed-workspace GPU 2-D hole filling active", once="active")
-    result = result[0] if arr.ndim == 2 else result
-    if arr.dtype == cp.bool_:
-        return result.astype(cp.bool_, copy=False)
-    return result.astype(arr.dtype, copy=False)
-
-
-def _v16011_gpu_hole_fill_dispatch(original, *args, **kwargs):
-    if not _v16011_env_bool("YOLO_TTA_FIXED_GPU_HOLE_FILL", True):
-        return original(*args, **kwargs)
-    structure = kwargs.get("structure")
-    for value in list(args) + list(kwargs.values()):
-        arr, origin = _v16011_as_cupy(value)
-        if arr is None:
-            continue
-        try:
-            filled = _v16011_gpu_fill_holes_array(arr, structure=structure)
-            if origin == "torch":
-                try:
-                    import torch
-                    return torch.utils.dlpack.from_dlpack(filled.toDlpack())
-                except Exception:
-                    return value
-            return filled
-        except Exception as exc:
-            _v16011_log("D2", f"GPU hole-fill compatibility fallback: {exc}", once=("fallback", type(exc).__name__, str(exc)))
-            break
-    return original(*args, **kwargs)
-
-
-def _v16011_wrap_hole_function(fn):
-    if getattr(fn, "_v16011_d2", False):
-        return fn
-    source = ""
-    try:
-        source = _v16011_inspect.getsource(fn).lower()
-    except Exception:
-        pass
-    returns_value = any(line.lstrip().startswith("return ") for line in source.splitlines())
-    @_v16011_functools.wraps(fn)
-    def wrapped(*args, **kwargs):
-        cp = _v16011_get_cupy()
-        candidate = None
-        if cp is not None:
-            for value in list(args) + list(kwargs.values()):
-                arr, _ = _v16011_as_cupy(value)
-                if arr is not None and arr.ndim in (2, 3):
-                    candidate = (value, arr)
-                    break
-        if candidate is None:
-            return fn(*args, **kwargs)
-        original_value, arr = candidate
-        try:
-            filled = _v16011_gpu_fill_holes_array(arr)
-            if not returns_value:
-                arr[...] = filled
-                return None
-            return filled
-        except Exception as exc:
-            _v16011_log("D2", f"wrapped hole-fill fallback in {fn.__name__}: {exc}", once=(fn.__name__, type(exc).__name__))
-            return fn(*args, **kwargs)
-    wrapped._v16011_d2 = True
-    return wrapped
-
-
-# ---- C1: direct predictor/backend tensor handoff ----------------------------
-
-def _v16011_source_from_predict_args(args, kwargs):
-    if args:
-        return args[0]
-    return kwargs.get("source")
-
-
-def _v16011_is_direct_tensor_candidate(model, source, kwargs):
-    try:
-        import torch
-        if not isinstance(source, torch.Tensor) or not source.is_cuda or source.ndim != 4:
-            return False
-        if int(source.shape[0]) != 1:
-            return False
-        if kwargs.get("augment") or kwargs.get("embed"):
-            return False
-        if kwargs.get("save") not in (None, False):
-            return False
-        predictor = getattr(model, "predictor", None)
-        if predictor is None or getattr(predictor, "model", None) is None:
-            return False
-        backend = predictor.model
-        is_engine = bool(getattr(backend, "engine", False) or getattr(backend, "triton", False))
-        if not is_engine:
-            path = str(getattr(model, "ckpt_path", "") or getattr(model, "model_name", ""))
-            is_engine = path.lower().endswith(".engine")
-        return is_engine
-    except Exception:
-        return False
-
-
-def _v16011_direct_predict_once(model, source, kwargs):
-    predictor = model.predictor
-    backend = predictor.model
-    # The renderer/ring already produced BCHW CUDA data. Bypass YOLO.predict's
-    # source loader and preprocess path and submit that allocation directly to
-    # the persistent AutoBackend/TensorRT context.
-    batch = int(source.shape[0])
-    predictor.batch = (["tensor"] * batch, [None] * batch, [""] * batch)
-    infer_kwargs = {}
-    for name in ("augment", "visualize", "embed"):
-        if name in kwargs:
-            infer_kwargs[name] = kwargs[name]
-    preds = predictor.inference(source, **infer_kwargs)
-    results = predictor.postprocess(preds, source, source)
-    try:
-        predictor.run_callbacks("on_predict_postprocess_end")
-    except Exception:
-        pass
-    return results
-
-
-def _v16011_predict(model, *args, **kwargs):
-    source = _v16011_source_from_predict_args(args, kwargs)
-    key = id(model)
-    if (
-        _v16011_env_bool("YOLO_TTA_DIRECT_TENSOR_INFER", True)
-        and key not in _V16011_DIRECT_DISABLED
-        and _v16011_is_direct_tensor_candidate(model, source, kwargs)
-    ):
-        lock = _V16011_DIRECT_LOCKS.setdefault(key, _v16011_threading.Lock())
-        try:
-            with lock:
-                results = _v16011_direct_predict_once(model, source, kwargs)
-            _v16011_log("C1", "direct BCHW CUDA tensor -> TensorRT backend handoff active", once=("active", key))
-            return iter(results) if kwargs.get("stream", False) else results
-        except Exception as exc:
-            _V16011_DIRECT_DISABLED.add(key)
-            _v16011_log(
-                "C1",
-                f"direct backend path disabled for this predictor after compatibility failure: {exc}",
-                once=("fallback", key),
-            )
-    return model.predict(*args, **kwargs)
-
-
-# ---- E1: one continuous-coordinate Lanczos evaluation -----------------------
-
-def _v16011_array_namespace(value):
-    cp = _v16011_get_cupy()
-    if cp is not None and isinstance(value, cp.ndarray):
-        return cp
-    return _v16011_get_numpy()
-
-
-def _v16011_continuous_lanczos3(source, map_x, map_y, border_value=0):
-    xp = _v16011_array_namespace(source)
-    src = source
-    x = xp.asarray(map_x, dtype=xp.float32)
-    y = xp.asarray(map_y, dtype=xp.float32)
-    if x.shape != y.shape or getattr(src, "ndim", 0) < 2:
-        raise ValueError("coordinate maps must match and source must be at least 2-D")
-    h, w = int(src.shape[-2]), int(src.shape[-1])
-    xbase = xp.floor(x).astype(xp.int32)
-    ybase = xp.floor(y).astype(xp.int32)
-    acc = xp.zeros(src.shape[:-2] + x.shape, dtype=xp.float32)
-    wsum = xp.zeros(x.shape, dtype=xp.float32)
-    for oy in (-2, -1, 0, 1, 2, 3):
-        yi = ybase + oy
-        dy = y - yi.astype(xp.float32)
-        wy = xp.sinc(dy) * xp.sinc(dy / 3.0)
-        valid_y = (yi >= 0) & (yi < h)
-        yclip = xp.clip(yi, 0, h - 1)
-        for ox in (-2, -1, 0, 1, 2, 3):
-            xi = xbase + ox
-            dx = x - xi.astype(xp.float32)
-            wx = xp.sinc(dx) * xp.sinc(dx / 3.0)
-            valid = valid_y & (xi >= 0) & (xi < w)
-            weight = wy * wx * valid
-            xclip = xp.clip(xi, 0, w - 1)
-            sample = src[..., yclip, xclip].astype(xp.float32, copy=False)
-            acc += sample * weight
-            wsum += weight
-    safe = xp.where(wsum != 0, wsum, 1.0)
-    out = acc / safe
-    if border_value:
-        out = xp.where(wsum != 0, out, border_value)
-    dtype = src.dtype
-    if getattr(dtype, "kind", "") in "ui":
-        info = xp.iinfo(dtype)
-        out = xp.clip(xp.rint(out), info.min, info.max).astype(dtype)
-    else:
-        out = out.astype(dtype, copy=False)
-    return out
-
-
-def _v16011_find_bound_array(bound, names, min_ndim=1):
-    for name in names:
-        value = bound.arguments.get(name)
-        if value is not None and hasattr(value, "shape") and getattr(value, "ndim", 0) >= min_ndim:
-            return value
-    return None
-
-
-def _v16011_wrap_radial_continuous(fn):
-    if getattr(fn, "_v16011_e1", False):
-        return fn
-    try:
-        sig = _v16011_inspect.signature(fn)
-    except Exception:
-        return fn
-    @_v16011_functools.wraps(fn)
-    def wrapped(*args, **kwargs):
-        if not _v16011_env_bool("YOLO_TTA_RADIAL_CONTINUOUS_LANCZOS", True):
-            return fn(*args, **kwargs)
-        try:
-            bound = sig.bind_partial(*args, **kwargs)
-            source = _v16011_find_bound_array(bound, ("source", "src", "image", "img", "plane", "volume", "input_array"), 2)
-            map_x = _v16011_find_bound_array(bound, ("map_x", "x_map", "sample_x", "src_x", "x", "u"), 1)
-            map_y = _v16011_find_bound_array(bound, ("map_y", "y_map", "sample_y", "src_y", "y", "v"), 1)
-            if map_x is None:
-                x0 = _v16011_find_bound_array(bound, ("x0", "ix", "base_x"), 1)
-                fx = _v16011_find_bound_array(bound, ("fx", "frac_x", "alpha_x", "wx"), 1)
-                if x0 is not None and fx is not None:
-                    map_x = x0 + fx
-            if map_y is None:
-                y0 = _v16011_find_bound_array(bound, ("y0", "iy", "base_y"), 1)
-                fy = _v16011_find_bound_array(bound, ("fy", "frac_y", "alpha_y", "wy"), 1)
-                if y0 is not None and fy is not None:
-                    map_y = y0 + fy
-            if source is not None and map_x is not None and map_y is not None and tuple(map_x.shape) == tuple(map_y.shape):
-                out = _v16011_continuous_lanczos3(source, map_x, map_y)
-                expected = bound.arguments.get("out")
-                if expected is None:
-                    expected = bound.arguments.get("output")
-                if expected is not None and hasattr(expected, "shape") and tuple(expected.shape) == tuple(out.shape):
-                    expected[...] = out
-                    out = expected
-                _v16011_log("E1", f"continuous-coordinate Lanczos active in {fn.__name__}", once=("active", fn.__name__))
-                return out
-        except Exception as exc:
-            _v16011_log("E1", f"compatibility fallback in {fn.__name__}: {exc}", once=("fallback", fn.__name__, type(exc).__name__))
-        return fn(*args, **kwargs)
-    wrapped._v16011_e1 = True
-    return wrapped
-
-
-# ---- A1: force existing slab/sink contracts instead of dense Tilted returns -
-
-def _v16011_contains_tilted(bound):
-    for name, value in bound.arguments.items():
-        if "tilt" in name.lower():
-            if value is None or value is False:
-                continue
-            if isinstance(value, str) and not value:
-                continue
-            if isinstance(value, (tuple, list, dict, set)) and len(value) == 0:
-                continue
-            return True
-        if isinstance(value, str) and "tilted" in value.lower():
-            return True
-    return False
-
-
-def _v16011_has_sink(bound):
-    for name, value in bound.arguments.items():
-        low = name.lower()
-        if any(token in low for token in ("sink", "writer", "consumer", "emit", "callback")) and value is not None:
-            return True
-    return False
-
-
-def _v16011_wrap_tilted_sink(fn):
-    if getattr(fn, "_v16011_a1", False):
-        return fn
-    try:
-        sig = _v16011_inspect.signature(fn)
-    except Exception:
-        return fn
-    params = sig.parameters
-    @_v16011_functools.wraps(fn)
-    def wrapped(*args, **kwargs):
-        if not _v16011_env_bool("YOLO_TTA_TILTED_SINK_ONLY", True):
-            return fn(*args, **kwargs)
-        try:
-            bound = sig.bind_partial(*args, **kwargs)
-            eligible = _v16011_contains_tilted(bound) or "tilt" in fn.__name__.lower()
-            has_sink = _v16011_has_sink(bound) or any(
-                key in params for key in ("sink", "slab_sink", "output_sink", "consumer", "writer")
-            )
-            changed = []
-            if eligible and has_sink:
-                policy = {
-                    "sink_only": True,
-                    "stream_to_sink": True,
-                    "materialize": False,
-                    "materialize_volume": False,
-                    "return_volume": False,
-                    "collect": False,
-                    "keep_projected": False,
-                    "restore_gpu": False,
-                    "keep_gpu_resident": False,
-                }
-                for key, value in policy.items():
-                    if key in params and key not in kwargs:
-                        kwargs[key] = value
-                        changed.append(key)
-                for key in ("slab_depth", "chunk_depth", "sink_slab_depth"):
-                    if key in params and key not in kwargs:
-                        kwargs[key] = int(_v16011_os.environ.get("YOLO_TTA_TILTED_SINK_SLAB_DEPTH", "8") or 8)
-                        changed.append(key)
-                        break
-            if changed:
-                _v16011_log(
-                    "A1",
-                    f"sink-only Tilted contract active in {fn.__name__}: {', '.join(changed)}",
-                    once=("active", fn.__name__),
-                )
-        except Exception as exc:
-            _v16011_log("A1", f"sink-contract inspection fallback in {fn.__name__}: {exc}", once=("fallback", fn.__name__))
-        return fn(*args, **kwargs)
-    wrapped._v16011_a1 = True
-    return wrapped
-
-
-# ---- Installer and activation audit -----------------------------------------
-
-def _v16011_install_runtime_optimizations(namespace):
-    global _V16011_INSTALLED
-    if _V16011_INSTALLED:
-        return
-    _V16011_INSTALLED = True
-
-    # Defaults are explicit and can be individually disabled for bisecting.
-    defaults = {
-        "YOLO_TTA_TILTED_SINK_ONLY": "1",
-        "YOLO_TTA_DIRECT_TENSOR_INFER": "1",
-        "YOLO_TTA_SPARSE_GPU_RETIRE": "1",
-        "YOLO_TTA_FIXED_GPU_HOLE_FILL": "1",
-        "YOLO_TTA_RADIAL_CONTINUOUS_LANCZOS": "1",
-        "YOLO_TTA_RAM_FIRST_STAGE": "1",
-        "YOLO_TTA_TOPOLOGY_AWARE": "1",
-        # The old split-view gate defaulted off, which forced completed-view CPU
-        # filling even with --retina_mask_processor gpu.
-        "YOLO_TTA_GPU_WORKER_CHUNK_HOLE_FILL": "1",
-    }
-    for key, value in defaults.items():
-        _v16011_os.environ.setdefault(key, value)
-
-    wrapped = {"A1": [], "D2": [], "E1": [], "K2": []}
-    for name in _V16011_WORKER_TARGETS:
-        fn = namespace.get(name)
-        if callable(fn):
-            namespace[name] = _v16011_wrap_worker_affinity(fn)
-            wrapped["K2"].append(name)
-    for name in _V16011_HOLE_TARGETS:
-        fn = namespace.get(name)
-        if callable(fn):
-            namespace[name] = _v16011_wrap_hole_function(fn)
-            wrapped["D2"].append(name)
-    for name in _V16011_RADIAL_TARGETS:
-        fn = namespace.get(name)
-        if callable(fn):
-            namespace[name] = _v16011_wrap_radial_continuous(fn)
-            wrapped["E1"].append(name)
-    for name in _V16011_TILTED_TARGETS:
-        fn = namespace.get(name)
-        if callable(fn):
-            namespace[name] = _v16011_wrap_tilted_sink(fn)
-            wrapped["A1"].append(name)
-
-    _v16011_stage_root(_v16011_tempfile.gettempdir())
-    _v16011_log(
-        "AUDIT",
-        "installed executable paths: "
-        f"A1={len(wrapped['A1'])} wrapped, C1={_V16011_PREDICT_REWRITES} call sites, "
-        f"D1={_V16011_SPARSE_REWRITES} retire sites, D2={len(wrapped['D2'])} wrapped, "
-        f"E1={len(wrapped['E1'])} wrapped, J3={_V16011_TEMP_REWRITES} stage sites, "
-        f"K2={len(wrapped['K2'])} workers",
-        once="install",
-    )
-
-
-
 if __name__ == "__main__":
-    _v16011_install_runtime_optimizations(globals())
     try:
         main()
     except BaseException:
