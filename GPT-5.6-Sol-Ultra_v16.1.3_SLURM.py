@@ -58,8 +58,8 @@ import numpy as np
 GIB = 1024 ** 3
 NRRD_SPACE = "left-posterior-superior"
 SCRIPT_VARIANT_PREFIX = 'ultra'
-SCRIPT_VERSION = '16.1.2'
-SCRIPT_VERSION_COMPACT = '1612'
+SCRIPT_VERSION = '16.1.3'
+SCRIPT_VERSION_COMPACT = '1613'
 SCRIPT_BASENAME = f'GPT-5.6-Sol-Ultra_v{SCRIPT_VERSION}_SLURM.py'
 OUTPUT_NRRD_PREFIX = ''
 
@@ -11202,7 +11202,7 @@ def _try_create_device_union_accumulator(
             min(int(num_frames), int(gpu_sparse_retirement_ring_frames()))
             if bool(sparse_retirement) else int(num_frames)
         )
-        # Sparse v16.1.2 retirement reduces ring-slot views directly and never allocates the
+        # Sparse retirement reduces ring-slot views directly and never allocates the
         # v16.1.1 full-plane ``index_select``/CuPy CCL batch. Admit exactly the bounded ring;
         # dense fallback retains the complete task volume.
         need = (
@@ -19774,12 +19774,14 @@ class _MainProcessGpuStageCoordinator:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        self._worker_release_condition = threading.Condition(self._lock)
         self._worker_devices: set[int] = set()
         self._inference_inflight: Counter[int] = Counter()
         self._stage_leases: Dict[int, str] = {}
         self._stage_preemption_requested: set[int] = set()
         self._inference_priority_active = False
         self._inference_dispatchable_pending = True
+        self._worker_release_in_progress = False
         self._wake_callback: Optional[Callable[[], None]] = None
 
     def configure_workers(self, worker_devices: Sequence[int]) -> None:
@@ -19788,12 +19790,14 @@ class _MainProcessGpuStageCoordinator:
             self._inference_inflight.clear()
             self._stage_leases.clear()
             self._stage_preemption_requested.clear()
+            self._worker_release_in_progress = False
             self._inference_priority_active = bool(
                 self._worker_devices and main_process_gpu_stage_inference_priority_enabled()
             )
             # The scheduler publishes true only after an actual central-queue task passes
             # its current RAM/view admission checks.
             self._inference_dispatchable_pending = False
+            self._worker_release_condition.notify_all()
 
     def set_inference_priority_active(self, active: bool) -> None:
         callback: Optional[Callable[[], None]] = None
@@ -19835,6 +19839,30 @@ class _MainProcessGpuStageCoordinator:
             except Exception:
                 pass
 
+    def set_worker_release_in_progress(self, active: bool) -> None:
+        """Block new main-process CUDA stages while worker contexts are retiring."""
+        callback: Optional[Callable[[], None]] = None
+        with self._lock:
+            self._worker_release_in_progress = bool(active)
+            self._worker_release_condition.notify_all()
+            callback = self._wake_callback
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                pass
+
+    def wait_for_worker_release(self, timeout_seconds: float) -> bool:
+        """Wait until inference-worker CUDA teardown no longer blocks stage admission."""
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        with self._worker_release_condition:
+            while self._worker_release_in_progress:
+                remaining = float(deadline - time.monotonic())
+                if remaining <= 0.0:
+                    return False
+                self._worker_release_condition.wait(timeout=float(remaining))
+            return True
+
     def _inference_stalled_locked(self) -> bool:
         return bool(
             self._inference_priority_active
@@ -19843,6 +19871,11 @@ class _MainProcessGpuStageCoordinator:
         )
 
     def _priority_blocks_stage_locked(self, device_index: int, purpose: str) -> bool:
+        if (
+            self._worker_release_in_progress
+            and int(device_index) in self._worker_devices
+        ):
+            return True
         if (
             not self._inference_priority_active
             or main_process_gpu_stage_inference_overlap_enabled()
@@ -19877,7 +19910,9 @@ class _MainProcessGpuStageCoordinator:
             self._stage_preemption_requested.clear()
             self._inference_priority_active = False
             self._inference_dispatchable_pending = False
+            self._worker_release_in_progress = False
             self._wake_callback = None
+            self._worker_release_condition.notify_all()
 
     def can_dispatch_inference(self, device_index: int) -> bool:
         if main_process_gpu_stage_inference_overlap_enabled():
@@ -20037,6 +20072,7 @@ class _MainProcessGpuStageCoordinator:
                 'stage_preemption_requested': sorted(self._stage_preemption_requested),
                 'inference_priority_active': bool(self._inference_priority_active),
                 'inference_dispatchable_pending': bool(self._inference_dispatchable_pending),
+                'worker_release_in_progress': bool(self._worker_release_in_progress),
                 'inference_admission_stalled': bool(self._inference_stalled_locked()),
             }
 
@@ -20060,6 +20096,16 @@ def _set_main_process_gpu_inference_priority_active(active: bool) -> None:
 
 def _set_main_process_gpu_inference_dispatchable_pending(dispatchable: bool) -> None:
     _MAIN_PROCESS_GPU_STAGE_COORDINATOR.set_inference_dispatchable_pending(bool(dispatchable))
+
+
+def _set_main_process_gpu_worker_release_in_progress(active: bool) -> None:
+    _MAIN_PROCESS_GPU_STAGE_COORDINATOR.set_worker_release_in_progress(bool(active))
+
+
+def _wait_main_process_gpu_worker_release(timeout_seconds: float) -> bool:
+    return _MAIN_PROCESS_GPU_STAGE_COORDINATOR.wait_for_worker_release(
+        float(timeout_seconds),
+    )
 
 
 def _set_main_process_gpu_stage_wake_callback(callback: Optional[Callable[[], None]]) -> None:
@@ -20214,6 +20260,14 @@ def _radial_row_occupancy(radial_mask_mm: np.ndarray, desc: str) -> np.ndarray:
 def gpu_backproject_enabled() -> bool:
     """Stream radial backprojection through the GPU when torch + CUDA exist."""
     return _env_flag('YOLO_TTA_GPU_BACKPROJECT', True)
+
+
+def gpu_tilted_radial_backproject_enabled() -> bool:
+    """Use bounded GPU gathers to reconstruct composed tilted-Radial base planes."""
+    return bool(
+        gpu_backproject_enabled()
+        and _env_flag('YOLO_TTA_GPU_TILTED_RADIAL_BACKPROJECT', True)
+    )
 
 
 def _validated_radial_slice_bboxes(
@@ -22221,6 +22275,24 @@ def _radial_backproject_gpu_streaming(
     lease = _try_acquire_main_process_gpu_stage(
         torch, f'{desc} streaming Radial backprojection',
     )
+    if (
+        lease is None
+        and bool(_MAIN_PROCESS_GPU_STAGE_COORDINATOR.snapshot().get(
+            'worker_release_in_progress', False,
+        ))
+    ):
+        wait_seconds = max(
+            0.0, _env_float('YOLO_TTA_GPU_WORKER_RELEASE_WAIT_SEC', 45.0),
+        )
+        if wait_seconds > 0.0:
+            print(
+                f'{desc}: waiting up to {wait_seconds:.1f}s for inference-worker CUDA '
+                'contexts to retire before GPU backprojection admission.'
+            )
+            if _wait_main_process_gpu_worker_release(float(wait_seconds)):
+                lease = _try_acquire_main_process_gpu_stage(
+                    torch, f'{desc} streaming Radial backprojection',
+                )
     if lease is None:
         _announce_main_gpu_stage_skip_once(
             'radial-streaming-inference-busy',
@@ -22538,6 +22610,8 @@ def _radial_backproject_plane(
     source_rows: Sequence[int],
     *,
     plane_row_slice: Optional[slice] = None,
+    source_slice_bboxes: Optional[np.ndarray] = None,
+    known_source_nonempty: bool = False,
 ) -> np.ndarray:
     src = np.asarray(radial_mask_mm)
     rows = list(int(v) for v in source_rows)
@@ -22545,18 +22619,42 @@ def _radial_backproject_plane(
     valid = np.asarray(dense_map.valid_mask, dtype=bool)[row_sel]
     if not rows:
         return np.zeros(valid.shape, dtype=np.uint8)
-    if len(rows) == 1:
-        cross = np.asarray(src[:, rows[0], :], dtype=np.uint8)
-    else:
-        cross = np.bitwise_or.reduce(np.asarray(src[:, rows, :], dtype=np.uint8), axis=1)
     out = np.zeros(valid.shape, dtype=np.uint8)
-    if not np.any(cross) or not np.any(valid):
+    if not np.any(valid):
         return out
     source_idx = np.asarray(dense_map.source_idx_map, dtype=np.int32)[row_sel]
     u_idx = np.asarray(dense_map.u_idx_map, dtype=np.int32)[row_sel]
-    out[valid] = cross[
-        source_idx[valid],
-        u_idx[valid],
+    u0, u1 = 0, int(src.shape[2])
+    if source_slice_bboxes is not None:
+        bboxes = np.asarray(source_slice_bboxes, dtype=np.int64)
+        row_lo = int(min(rows))
+        row_hi = int(max(rows)) + 1
+        active = (
+            (bboxes[:, 0] < int(row_hi))
+            & (bboxes[:, 1] > int(row_lo))
+            & (bboxes[:, 2] < bboxes[:, 3])
+        )
+        if not bool(np.any(active)):
+            return out
+        u0 = int(np.min(bboxes[active, 2]))
+        u1 = int(np.max(bboxes[active, 3]))
+        if int(u0) >= int(u1):
+            return out
+
+    if len(rows) == 1:
+        cross = np.asarray(src[:, rows[0], int(u0):int(u1)], dtype=np.uint8)
+    else:
+        cross = np.bitwise_or.reduce(
+            np.asarray(src[:, rows, int(u0):int(u1)], dtype=np.uint8), axis=1,
+        )
+    if not bool(known_source_nonempty) and not np.any(cross):
+        return out
+    gather_valid = valid & (u_idx >= int(u0)) & (u_idx < int(u1))
+    if not bool(np.any(gather_valid)):
+        return out
+    out[gather_valid] = cross[
+        source_idx[gather_valid],
+        u_idx[gather_valid] - np.int32(u0),
     ]
     return out
 
@@ -22747,6 +22845,12 @@ def _backproject_cartesian_radial_generic(
 
 _TILTED_RADIAL_RAM_SCATTER_RESERVATION_LOCK = threading.Lock()
 _TILTED_RADIAL_RAM_SCATTER_RESERVED_BYTES = 0
+_TILTED_RADIAL_CPU_PROJECTION_CONCURRENCY = max(
+    1, _env_int('YOLO_TTA_TILTED_RADIAL_CPU_CONCURRENCY', 2)
+)
+_TILTED_RADIAL_CPU_PROJECTION_SLOTS = threading.BoundedSemaphore(
+    int(_TILTED_RADIAL_CPU_PROJECTION_CONCURRENCY)
+)
 
 
 def _try_reserve_tilted_radial_ram_scatter(
@@ -22803,10 +22907,12 @@ def _backproject_tilted_radial_volume_to_volume(
     reserve_bytes: int,
     workers: int,
     out_shape_tyx: Optional[Tuple[int, int, int]],
+    known_row_occupancy: Optional[np.ndarray],
+    known_slice_bboxes: Optional[np.ndarray],
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]],
     sink_only: bool,
 ) -> np.ndarray | SinkOnlyProjectionResult:
-    """Radial -> concrete Tilted stack -> final orthogonal volume."""
+    """Compose Radial reconstruction and concrete Tilted projection."""
     if bool(sink_only):
         if projection_block_callback is None:
             raise ValueError(f'{desc}: sink_only=True requires projection_block_callback')
@@ -22953,17 +23059,90 @@ def _backproject_tilted_radial_volume_to_volume(
                         )
                     written += int(count)
 
-            def _stage_base_frame(frame_idx: int) -> None:
-                rows = _radial_processing_rows_for_output(
-                    grid,
-                    int(tilted_source.num_slices),
-                    int(frame_idx),
-                )
-                plane = _radial_backproject_plane(radial_mask_mm, dense_map, rows)
-                # np.nonzero is the required foreground scan; a preceding np.any read every
-                # 3072-square plane a second time and did not change the empty decision.
-                vv, uu = np.nonzero(plane)
+            projected_plane_bytes = int(plane_h) * int(plane_w)
+            radial_cross_bytes = int(radial_mask_mm.shape[0]) * int(radial_mask_mm.shape[2])
+            # A dense foreground plane retains two intp coordinate arrays, validity/
+            # shear arrays, mapped coordinates and band ids. RAM-scatter additionally
+            # builds an int64 flat index; index-spool may sort/deduplicate an equally
+            # large run. Charge the larger patch-release-safe bound instead of treating
+            # only the reconstructed uint8 plane as the per-worker temporary.
+            conservative_worker_bytes = max(
+                1,
+                int(projected_plane_bytes) * (80 if dense_sink is not None else 96)
+                + int(radial_cross_bytes) * 2,
+            )
+            memory_worker_cap = max(1, int((4 * GIB) // int(conservative_worker_bytes)))
+            default_worker_cap = max(32, min(64, max(1, int(_cpu_count()))))
+            requested_worker_count = choose_slice_parallel_workers(
+                int(workers), int(tilted_source.num_slices),
+            )
+            environment_worker_cap = max(
+                1, _env_int('YOLO_TTA_TILTED_RADIAL_SINK_WORKERS', default_worker_cap),
+            )
+            worker_count = max(1, min(
+                int(requested_worker_count),
+                int(memory_worker_cap),
+                int(environment_worker_cap),
+            ))
+            chunk_frames = max(
+                4,
+                min(8, _env_int('YOLO_TTA_TILTED_RADIAL_SINK_CHUNK_FRAMES', 6)),
+            )
+
+            exact_row_occupancy: Optional[np.ndarray] = None
+            if known_row_occupancy is not None:
+                try:
+                    candidate_row_occupancy = np.asarray(
+                        known_row_occupancy, dtype=bool,
+                    )
+                    if (
+                        int(candidate_row_occupancy.ndim) == 1
+                        and int(candidate_row_occupancy.shape[0]) == int(grid.processing_h)
+                    ):
+                        exact_row_occupancy = np.ascontiguousarray(candidate_row_occupancy)
+                except Exception:
+                    exact_row_occupancy = None
+            radial_slice_bboxes = _validated_radial_slice_bboxes(
+                known_slice_bboxes,
+                int(radial_mask_mm.shape[0]),
+                int(grid.processing_h),
+                int(grid.processing_w),
+            )
+            row_maybe_occupied = exact_row_occupancy
+            row_occupancy_source = 'device-union'
+            if row_maybe_occupied is None and radial_slice_bboxes is not None:
+                row_delta = np.zeros((int(grid.processing_h) + 1,), dtype=np.int32)
+                for bbox in radial_slice_bboxes:
+                    by0, by1, bx0, bx1 = (int(v) for v in bbox)
+                    if int(by1) <= int(by0) or int(bx1) <= int(bx0):
+                        continue
+                    row_delta[int(by0)] += np.int32(1)
+                    row_delta[int(by1)] -= np.int32(1)
+                row_maybe_occupied = np.cumsum(row_delta[:-1], dtype=np.int32) > 0
+                row_occupancy_source = 'conservative-slice-bboxes'
+            elif row_maybe_occupied is None:
+                row_occupancy_source = 'runtime-scan'
+
+            frame_count = int(tilted_source.num_slices)
+            reconstruct_ns = np.zeros((frame_count,), dtype=np.int64)
+            map_group_ns = np.zeros((frame_count,), dtype=np.int64)
+            lock_wait_ns = np.zeros((frame_count,), dtype=np.int64)
+            scatter_write_ns = np.zeros((frame_count,), dtype=np.int64)
+            skipped_frames = np.zeros((frame_count,), dtype=np.uint8)
+
+            def _scatter_reconstructed_frame(frame_idx: int, plane: np.ndarray) -> None:
+                map_started_ns = time.perf_counter_ns()
+                # Every output-t band becomes one contiguous run when enumeration follows
+                # the coordinate controlling the tilt. Transverse-horizontal is the sole
+                # case where that coordinate is u rather than v.
+                if base == 'transverse' and not vertical:
+                    uu, vv = np.nonzero(np.asarray(plane).T)
+                else:
+                    vv, uu = np.nonzero(plane)
                 if int(vv.size) <= 0:
+                    map_group_ns[int(frame_idx)] += np.int64(
+                        time.perf_counter_ns() - int(map_started_ns)
+                    )
                     return
 
                 center = float(tilted_frame_center(tilted_source, int(frame_idx)))
@@ -22975,6 +23154,9 @@ def _backproject_tilted_radial_volume_to_volume(
                 ).astype(np.int32, copy=False)
                 valid = (ss >= 0) & (ss < int(stack_len))
                 if not bool(valid.any()):
+                    map_group_ns[int(frame_idx)] += np.int64(
+                        time.perf_counter_ns() - int(map_started_ns)
+                    )
                     return
                 vv, uu, ss = vv[valid], uu[valid], ss[valid]
 
@@ -22994,67 +23176,119 @@ def _backproject_tilted_radial_volume_to_volume(
                     raise ValueError(f'{desc}: unsupported tilted-Radial base {base!r}')
 
                 band_ids = ti // np.int32(block_slices)
+                run_starts = np.empty(
+                    (int(np.count_nonzero(band_ids[1:] != band_ids[:-1])) + 1,),
+                    dtype=np.intp,
+                )
+                run_starts[0] = 0
+                if int(run_starts.size) > 1:
+                    run_starts[1:] = np.flatnonzero(
+                        band_ids[1:] != band_ids[:-1]
+                    ) + 1
+                run_stops = np.empty_like(run_starts)
+                if int(run_starts.size) > 1:
+                    run_stops[:-1] = run_starts[1:]
+                run_stops[-1] = int(band_ids.size)
+                # Phase shifting stops a batch of source-frame workers from arriving at
+                # band 0, then band 1, in lockstep. A lock remains authoritative for NumPy
+                # assignment correctness, but normally only one or two workers meet there.
+                run_phase = int(frame_idx) % int(run_starts.size)
+
+                flat_global: Optional[np.ndarray] = None
                 if dense_sink_flat is not None:
                     flat_global = ti.astype(np.int64, copy=False) * np.int64(plane_bytes)
                     flat_global += yi.astype(np.int64, copy=False) * np.int64(out_w)
                     flat_global += xi.astype(np.int64, copy=False)
-                    # NumPy does not specify concurrent advanced assignment even when every
-                    # writer stores the same byte. Serialize only colliding output-t bands;
-                    # disjoint bands remain independently writable.
-                    for band_idx_raw in np.unique(band_ids):
-                        band_idx = int(band_idx_raw)
-                        selected = band_ids == int(band_idx)
-                        with band_locks[int(band_idx)]:
-                            dense_sink_flat[
-                                flat_global[selected].astype(np.intp, copy=False)
-                            ] = np.uint8(1)
-                    return
+                map_group_ns[int(frame_idx)] += np.int64(
+                    time.perf_counter_ns() - int(map_started_ns)
+                )
 
-                for band_idx_raw in np.unique(band_ids):
-                    band_idx = int(band_idx_raw)
-                    selected = band_ids == int(band_idx)
+                for run_offset in range(int(run_starts.size)):
+                    run_idx = (int(run_phase) + int(run_offset)) % int(run_starts.size)
+                    start = int(run_starts[int(run_idx)])
+                    stop = int(run_stops[int(run_idx)])
+                    band_idx = int(band_ids[int(start)])
+                    if flat_global is not None:
+                        wait_started_ns = time.perf_counter_ns()
+                        with band_locks[int(band_idx)]:
+                            acquired_ns = time.perf_counter_ns()
+                            dense_sink_flat[
+                                flat_global[int(start):int(stop)].astype(np.intp, copy=False)
+                            ] = np.uint8(1)
+                            released_ns = time.perf_counter_ns()
+                        lock_wait_ns[int(frame_idx)] += np.int64(
+                            int(acquired_ns) - int(wait_started_ns)
+                        )
+                        scatter_write_ns[int(frame_idx)] += np.int64(
+                            int(released_ns) - int(acquired_ns)
+                        )
+                        continue
+
                     band_t0 = int(band_idx) * int(block_slices)
                     flat = (
-                        (ti[selected].astype(np.int64, copy=False) - np.int64(band_t0))
+                        (ti[int(start):int(stop)].astype(np.int64, copy=False) - np.int64(band_t0))
                         * np.int64(plane_bytes)
                     )
-                    flat += yi[selected].astype(np.int64, copy=False) * np.int64(out_w)
-                    flat += xi[selected].astype(np.int64, copy=False)
+                    flat += yi[int(start):int(stop)].astype(np.int64, copy=False) * np.int64(out_w)
+                    flat += xi[int(start):int(stop)].astype(np.int64, copy=False)
                     # Multiple Radial pixels/base frames can map to the same output voxel.
-                    # Remove duplicates before staging so a dense input cannot multiply the
-                    # anonymous sparse payload unnecessarily.
+                    # Per-run deduplication bounds the anonymous spool without re-sorting
+                    # every frame by output band.
                     payload_arr = np.ascontiguousarray(np.unique(flat), dtype=index_dtype)
                     if int(payload_arr.size) <= 0:
                         continue
                     payload = memoryview(payload_arr).cast('B')
+                    wait_started_ns = time.perf_counter_ns()
                     with band_locks[int(band_idx)]:
+                        acquired_ns = time.perf_counter_ns()
                         offset = int(band_offsets[int(band_idx)])
                         band_offsets[int(band_idx)] += int(len(payload))
                         band_write_calls[int(band_idx)] += np.int64(1)
+                    lock_wait_ns[int(frame_idx)] += np.int64(
+                        int(acquired_ns) - int(wait_started_ns)
+                    )
+                    write_started_ns = time.perf_counter_ns()
                     _pwrite_all(band_fds[int(band_idx)], payload, int(offset))
+                    scatter_write_ns[int(frame_idx)] += np.int64(
+                        time.perf_counter_ns() - int(write_started_ns)
+                    )
 
-            projected_plane_bytes = int(plane_h) * int(plane_w)
-            radial_cross_bytes = int(radial_mask_mm.shape[0]) * int(radial_mask_mm.shape[2])
-            conservative_worker_bytes = max(
-                1,
-                int(projected_plane_bytes) * 10 + int(radial_cross_bytes) * 2,
-            )
-            memory_worker_cap = max(1, int((4 * GIB) // int(conservative_worker_bytes)))
-            default_worker_cap = max(32, min(64, max(1, int(_cpu_count()))))
-            worker_count = max(1, min(
-                choose_slice_parallel_workers(int(workers), int(tilted_source.num_slices)),
-                int(memory_worker_cap),
-                max(1, _env_int('YOLO_TTA_TILTED_RADIAL_SINK_WORKERS', default_worker_cap)),
-            ))
-            chunk_frames = max(
-                4,
-                min(8, _env_int('YOLO_TTA_TILTED_RADIAL_SINK_CHUNK_FRAMES', 6)),
-            )
+            def _reconstruct_and_scatter_frame(frame_idx: int) -> None:
+                rows = _radial_processing_rows_for_output(
+                    grid,
+                    int(tilted_source.num_slices),
+                    int(frame_idx),
+                )
+                rows_have_foreground = bool(
+                    row_maybe_occupied is None
+                    or (int(rows.size) > 0 and bool(np.any(row_maybe_occupied[rows])))
+                )
+                if not rows_have_foreground:
+                    skipped_frames[int(frame_idx)] = np.uint8(1)
+                    return
+                reconstruct_started_ns = time.perf_counter_ns()
+                plane = _radial_backproject_plane(
+                    radial_mask_mm,
+                    dense_map,
+                    rows,
+                    source_slice_bboxes=radial_slice_bboxes,
+                    known_source_nonempty=bool(exact_row_occupancy is not None),
+                )
+                reconstruct_ns[int(frame_idx)] += np.int64(
+                    time.perf_counter_ns() - int(reconstruct_started_ns)
+                )
+                _scatter_reconstructed_frame(int(frame_idx), plane)
+
             mode_name = 'RAM-scatter' if dense_sink is not None else 'low-memory index-spool'
             print(
                 f'{desc}: composed tilted-Radial {mode_name} projection active; '
                 f'{int(tilted_source.num_slices)} base plane(s) -> {int(band_count)} '
-                f'output-t band(s), workers={int(worker_count)}, chunk={int(chunk_frames)} frame(s); skipping '
+                f'output-t band(s), workers={int(worker_count)} '
+                f'(requested={int(requested_worker_count)}, temp-cap={int(memory_worker_cap)}, '
+                f'env-cap={int(environment_worker_cap)}), '
+                f'cpu-concurrency-cap={int(_TILTED_RADIAL_CPU_PROJECTION_CONCURRENCY)}, '
+                f'chunk={int(chunk_frames)} frame(s), '
+                f'occupancy={row_occupancy_source}; skipping '
                 f'{array_nbytes((int(tilted_source.num_slices), plane_h, plane_w), np.uint8) / GIB:.2f} GiB '
                 + (
                     f'base stack; admitted one lazily-faulted {dense_sink_bytes / GIB:.2f} GiB RAM bitmap.'
@@ -23063,15 +23297,237 @@ def _backproject_tilted_radial_volume_to_volume(
                 )
             )
             map_started = time.perf_counter()
-            parallel_for_indices_chunked(
-                int(tilted_source.num_slices),
-                _stage_base_frame,
-                max_workers=int(worker_count),
-                desc=f'{desc} [composed tilted-Radial]',
-                show_progress=True,
-                chunk_size=int(chunk_frames),
+            gpu_base_seconds = 0.0
+            cpu_base_seconds = 0.0
+            cpu_frame_start = 0
+
+            valid_mask = np.asarray(dense_map.valid_mask, dtype=bool)
+            valid_pos = np.flatnonzero(valid_mask.reshape(-1))
+            flat_src = (
+                np.asarray(dense_map.source_idx_map, dtype=np.int32).reshape(-1)[valid_pos].astype(np.int64)
+                * np.int64(radial_mask_mm.shape[2])
+                + np.asarray(dense_map.u_idx_map, dtype=np.int32).reshape(-1)[valid_pos]
             )
+
+            gpu_frame_source_ranges: List[Tuple[int, int]] = []
+            gpu_row_mapping_exact = True
+            for frame_idx in range(int(frame_count)):
+                mapped_rows = _radial_processing_rows_for_output(
+                    grid, int(frame_count), int(frame_idx),
+                )
+                if int(mapped_rows.size) <= 0:
+                    gpu_frame_source_ranges.append((0, 0))
+                    continue
+                row0 = int(mapped_rows[0])
+                row1 = int(mapped_rows[-1]) + 1
+                if not np.array_equal(
+                    mapped_rows,
+                    np.arange(int(row0), int(row1), dtype=np.int32),
+                ):
+                    gpu_row_mapping_exact = False
+                gpu_frame_source_ranges.append((int(row0), int(row1)))
+            nonempty_gpu_ranges = [
+                (int(row0), int(row1))
+                for row0, row1 in gpu_frame_source_ranges
+                if int(row1) > int(row0)
+            ]
+            if any(
+                int(row0) < int(prev_row0) or int(row1) < int(prev_row1)
+                for (prev_row0, prev_row1), (row0, row1) in zip(
+                    nonempty_gpu_ranges, nonempty_gpu_ranges[1:],
+                )
+            ):
+                gpu_row_mapping_exact = False
+            # The shared streaming kernel has an identity-row fast path whenever its
+            # stored row count equals output frames. A width-only reduced grid can meet
+            # that size test without having identity row coordinates, so require the
+            # actual mapping as well instead of relying on shape coincidence.
+            if int(grid.processing_h) == int(frame_count):
+                gpu_row_mapping_exact = bool(
+                    gpu_row_mapping_exact
+                    and all(
+                        (int(row0), int(row1)) == (int(idx), int(idx) + 1)
+                        for idx, (row0, row1) in enumerate(gpu_frame_source_ranges)
+                    )
+                )
+
+            def _base_frame_source_range(frame_idx: int) -> Tuple[int, int]:
+                return gpu_frame_source_ranges[int(frame_idx)]
+
+            class _TiltedRadialScatterFailure(RuntimeError):
+                """A destination/spool write failed; GPU-prefix replay is unsafe."""
+
+            class _TiltedRadialBasePlaneSink:
+                """Synchronously scatter reusable pinned GPU base-plane blocks."""
+
+                def __init__(self, pool: ThreadPoolExecutor) -> None:
+                    self.pool = pool
+                    self.completed_t = 0
+                    self.frames_scattered = 0
+
+                def _require_next(self, z0: int) -> None:
+                    if int(z0) != int(self.completed_t):
+                        raise _TiltedRadialScatterFailure(
+                            f'{desc}: GPU base-plane callback received [{int(z0)}] after '
+                            f'completed prefix [0:{int(self.completed_t)})'
+                        )
+
+                def __call__(self, z0: int, block: np.ndarray) -> None:
+                    try:
+                        block_arr = np.asarray(block, dtype=np.uint8)
+                        self._require_next(int(z0))
+                        futures: List[Future] = []
+                        first_error: Optional[Exception] = None
+                        try:
+                            for local_idx in range(int(block_arr.shape[0])):
+                                futures.append(self.pool.submit(
+                                    _scatter_reconstructed_frame,
+                                    int(z0) + int(local_idx),
+                                    np.asarray(block_arr[int(local_idx)]),
+                                ))
+                        except Exception as exc:
+                            first_error = exc
+                        # Settle every accepted scatter before allowing any fallback or
+                        # transactional abort; otherwise it could mutate the sink later.
+                        for future in futures:
+                            try:
+                                future.result()
+                            except Exception as exc:
+                                if first_error is None:
+                                    first_error = exc
+                        if first_error is not None:
+                            raise first_error
+                        self.completed_t = int(z0) + int(block_arr.shape[0])
+                        self.frames_scattered += int(block_arr.shape[0])
+                    except _TiltedRadialScatterFailure:
+                        raise
+                    except Exception as exc:
+                        # In spool mode the failing writer may already have reserved an
+                        # offset or written a payload prefix. Replaying from completed_t
+                        # would interpret sparse-hole zeros as voxel index 0. Escalate so
+                        # the outer cvol transaction is discarded and retried cleanly.
+                        raise _TiltedRadialScatterFailure(
+                            f'{desc}: tilted-Radial destination scatter failed'
+                        ) from exc
+
+                def consume_empty_range(self, z0: int, count: int) -> None:
+                    self._require_next(int(z0))
+                    self.completed_t = int(z0) + int(count)
+
+            if (
+                bool(gpu_tilted_radial_backproject_enabled())
+                and bool(gpu_row_mapping_exact)
+                and int(valid_pos.size) > 0
+            ):
+                gpu_started = time.perf_counter()
+                scatter_pool = _acquire_parallel_pool(int(worker_count))
+                base_sink = _TiltedRadialBasePlaneSink(scatter_pool)
+                gpu_progress: Optional[_RadialGpuBackprojectionProgress] = None
+                try:
+                    gpu_progress = _radial_backproject_gpu_streaming(
+                        radial_mask_mm,
+                        None,
+                        valid_pos,
+                        np.ascontiguousarray(flat_src, dtype=np.int64),
+                        _base_frame_source_range,
+                        int(tilted_source.num_slices),
+                        int(plane_h),
+                        int(plane_w),
+                        f'{desc} [tilted-Radial base planes]',
+                        known_row_occupancy=row_maybe_occupied,
+                        known_slice_bboxes=radial_slice_bboxes,
+                        projection_block_callback=base_sink,
+                        sink_only=True,
+                    )
+                except _TiltedRadialScatterFailure:
+                    raise
+                except (RuntimeError, MemoryError) as exc:
+                    runtime_telemetry().fallback(
+                        'projection.tilted_radial.gpu_base_planes', exc,
+                    )
+                    print(
+                        f'{desc}: bounded GPU base-plane reconstruction stopped after '
+                        f'{int(base_sink.completed_t)}/{int(tilted_source.num_slices)} frame(s) '
+                        f'({exc}); continuing the exact suffix on CPU.'
+                    )
+                finally:
+                    _release_parallel_pool(int(worker_count), scatter_pool)
+                if gpu_progress is not None:
+                    if int(gpu_progress.completed_t) != int(base_sink.completed_t):
+                        raise RuntimeError(
+                            f'{desc}: GPU progress prefix {int(gpu_progress.completed_t)} '
+                            f'does not match committed scatter prefix {int(base_sink.completed_t)}'
+                        )
+                cpu_frame_start = int(base_sink.completed_t)
+                gpu_base_seconds = float(time.perf_counter() - gpu_started)
+                runtime_telemetry().add(
+                    'projection.tilted_radial.gpu_base_frames',
+                    int(base_sink.frames_scattered),
+                )
+            elif bool(gpu_tilted_radial_backproject_enabled()) and not bool(gpu_row_mapping_exact):
+                print(
+                    f'{desc}: tilted-Radial GPU assist skipped because the processing-row '
+                    'mapping is non-contiguous/non-identity; using the exact CPU path.'
+                )
+
+            cpu_frame_start = max(0, min(int(frame_count), int(cpu_frame_start)))
+            cpu_slot_wait_seconds = 0.0
+            if int(cpu_frame_start) < int(frame_count):
+                cpu_slot_wait_started = time.perf_counter()
+                _TILTED_RADIAL_CPU_PROJECTION_SLOTS.acquire()
+                cpu_slot_wait_seconds = float(
+                    time.perf_counter() - cpu_slot_wait_started
+                )
+                cpu_started = time.perf_counter()
+
+                def _run_cpu_suffix(local_idx: int) -> None:
+                    _reconstruct_and_scatter_frame(int(cpu_frame_start) + int(local_idx))
+
+                try:
+                    parallel_for_indices_chunked(
+                        int(frame_count) - int(cpu_frame_start),
+                        _run_cpu_suffix,
+                        max_workers=int(worker_count),
+                        desc=f'{desc} [composed tilted-Radial CPU suffix]',
+                        show_progress=True,
+                        chunk_size=int(chunk_frames),
+                    )
+                    cpu_base_seconds = float(time.perf_counter() - cpu_started)
+                finally:
+                    _TILTED_RADIAL_CPU_PROJECTION_SLOTS.release()
             map_seconds = float(time.perf_counter() - map_started)
+            reconstruct_seconds = float(np.sum(reconstruct_ns, dtype=np.int64)) / 1.0e9
+            map_group_seconds = float(np.sum(map_group_ns, dtype=np.int64)) / 1.0e9
+            lock_wait_seconds = float(np.sum(lock_wait_ns, dtype=np.int64)) / 1.0e9
+            scatter_write_seconds = float(np.sum(scatter_write_ns, dtype=np.int64)) / 1.0e9
+            skipped_frame_count = int(np.count_nonzero(skipped_frames))
+            runtime_telemetry().add(
+                'projection.tilted_radial.cpu_reconstruct_us',
+                int(reconstruct_seconds * 1_000_000.0),
+            )
+            runtime_telemetry().add(
+                'projection.tilted_radial.map_group_us',
+                int(map_group_seconds * 1_000_000.0),
+            )
+            runtime_telemetry().add(
+                'projection.tilted_radial.band_lock_wait_us',
+                int(lock_wait_seconds * 1_000_000.0),
+            )
+            runtime_telemetry().add(
+                'projection.tilted_radial.scatter_write_us',
+                int(scatter_write_seconds * 1_000_000.0),
+            )
+            runtime_telemetry().add(
+                'projection.tilted_radial.metadata_skipped_frames',
+                int(skipped_frame_count),
+            )
+            print(
+                f'{desc}: composed tilted-Radial work: gpu-base-wall={gpu_base_seconds:.3f}s, '
+                f'cpu-slot-wait={cpu_slot_wait_seconds:.3f}s, '
+                f'cpu-suffix-wall={cpu_base_seconds:.3f}s, cpu-reconstruct-sum={reconstruct_seconds:.3f}s, '
+                f'map/group-sum={map_group_seconds:.3f}s, band-lock-wait-sum={lock_wait_seconds:.3f}s, '
+                f'scatter/write-sum={scatter_write_seconds:.3f}s, metadata-skipped={skipped_frame_count} frame(s).'
+            )
 
             emit_started = time.perf_counter()
             if dense_sink is not None:
@@ -23258,9 +23714,9 @@ def backproject_radial_volume_to_volume(
 
  ``out_shape_tyx`` backprojects directly into final source geometry. Transverse retains the
  optimized t-major implementation; sagittal/coronal build the dense circle map on their final
- ``(t,X)``/``(t,Y)`` planes, and tilted Radial views first reconstruct their concrete Tilted
- stack before applying the existing shear backprojection. This single terminal geometry map is
- what converts working-space circles into source-space ellipses when t was cube-resized.
+ ``(t,X)``/``(t,Y)`` planes, and tilted Radial views reconstruct bounded concrete Tilted base
+ planes and scatter them directly without a full intermediate stack. This single terminal
+ geometry map converts working-space circles into source-space ellipses when t was cube-resized.
 
  ``sink_only=True`` commits completed output-t blocks transactionally for upright Radial,
  Tilted, and tilted-Radial projection without allocating the full ``(t,Y,X)`` volume."""
@@ -23272,6 +23728,8 @@ def backproject_radial_volume_to_volume(
             radial_mask_mm, radial_view, out_path, desc,
             prefer_memory=bool(prefer_memory), reserve_bytes=int(reserve_bytes),
             workers=int(workers), out_shape_tyx=out_shape_tyx,
+            known_row_occupancy=known_row_occupancy,
+            known_slice_bboxes=known_slice_bboxes,
             projection_block_callback=projection_block_callback, sink_only=bool(sink_only),
         )
     if radial_base_view_name(radial_view) != 'transverse':
@@ -32641,6 +33099,13 @@ def prepare_view_volume_after_fullframe(
                     and not _view_uses_interpolation(view, int(interpolate))
                 ) else None
             ),
+            known_slice_bboxes=(
+                np.ascontiguousarray(meta_slice_bboxes)
+                if (
+                    meta_valid and meta_slice_bboxes is not None
+                    and not _view_uses_interpolation(view, int(interpolate))
+                ) else None
+            ),
         )
         if layer_ref is not None:
             nrrd_layers.append(layer_ref)
@@ -38625,7 +39090,8 @@ def main() -> None:
     channel_format = resolve_channel_format(args.channel_format)
     print(
         f'[v{SCRIPT_VERSION}] Ultra optimization set active: sparse bbox retirement, '
-        'sink-only composed projection, RAM-derived admission, stall-aware GPU leases, '
+        'GPU-assisted tilted-Radial projection, lock-staggered sink-only composition, '
+        'RAM-derived admission, stall-aware GPU leases, '
         'sparse cvol retirement, persistent TensorRT contexts, and parallel atomic outputs.'
     )
     print(
@@ -39186,6 +39652,15 @@ def main() -> None:
             'renderer and persistent batch-1 TensorRT ring instead of silently materializing the '
             'deferred host cube and running the active-filter/sheared frame renderer on the CPU. '
             'YOLO_TTA_GPU_TILTED_RADIAL_RENDER=0 selects the compatibility CPU path.'
+        )
+        spec_notes.append(
+            'Composed tilted-Radial NRRD projection reconstructs bounded base-plane blocks '
+            'with an idle main-process GPU when VRAM admission permits, then performs the '
+            'tilted scatter on the CPU without materializing a base stack or GPU destination. '
+            'The CPU fallback consumes foreground metadata, groups monotone output-t runs '
+            'without repeated full-array scans, staggers band-lock acquisition, and limits '
+            'simultaneous memory-bound fallbacks. YOLO_TTA_GPU_TILTED_RADIAL_BACKPROJECT=0 '
+            'selects CPU-only composition.'
         )
     # spec<->implementation conflict notes (see header docstring and suggested spec edits).
     spec_notes.append(
@@ -41207,6 +41682,7 @@ def main() -> None:
             f'gpu_stage_preempt={gpu_stage_state.get("stage_preemption_requested", [])}, '
             f'inference_priority={bool(gpu_stage_state.get("inference_priority_active", False))}, '
             f'dispatchable_pending={bool(gpu_stage_state.get("inference_dispatchable_pending", False))}, '
+            f'worker_release_in_progress={bool(gpu_stage_state.get("worker_release_in_progress", False))}, '
             f'admission_stalled={bool(gpu_stage_state.get("inference_admission_stalled", False))}, '
             f'pending_volume_builds={len(pending_prediction_volume_futures)}, '
             f'queued_build_jobs={len(pending_prediction_build_jobs)}, '
@@ -41977,9 +42453,25 @@ def main() -> None:
             parent_key = (str(model_name_s), str(view.name))
             if parent_key in tile_groups_built_for_parent:
                 return 0
+            # If completed inference is waiting only on this last deferred parent, close
+            # main-process GPU admission before removing the map entry. A fully filtered
+            # group emits no worker result, so this transition itself may be the drain edge.
+            worker_release_gate_armed = bool(
+                gpu_worker_process_active
+                and not interpolation_process_backend_active
+                and _env_flag('YOLO_TTA_RELEASE_GPU_WORKERS_ON_DRAIN', True)
+                and int(gpu_worker_results_collected) >= int(gpu_worker_total_tasks)
+                and parent_key in deferred_tile_jobs_by_parent
+                and len(deferred_tile_jobs_by_parent) == 1
+            )
+            if worker_release_gate_armed:
+                _set_main_process_gpu_worker_release_in_progress(True)
             tile_jobs = deferred_tile_jobs_by_parent.pop(parent_key, [])
             tile_groups_built_for_parent.add(parent_key)
             if not tile_jobs:
+                _maybe_finalize_gpu_inference_drain(
+                    worker_release_gate_armed=bool(worker_release_gate_armed),
+                )
                 return 0
 
             n_slices = int(view.num_slices)
@@ -42124,6 +42616,9 @@ def main() -> None:
                     'YOLO_TTA_TILE_CONTENT_PREFILTER = 0 to disable).'
                 )
             _dispatch_gpu_worker_inference_window()
+            _maybe_finalize_gpu_inference_drain(
+                worker_release_gate_armed=bool(worker_release_gate_armed),
+            )
             return int(emitted)
 
     def _account_direct_union_sparse_task_band(
@@ -42520,9 +43015,87 @@ def main() -> None:
             tile_inference_done.add((model_name_s, str(view.name), str(tile_id)))
             _mark_tile_staged(model_name_s, str(view.name), str(config_id), str(tile_id))
 
+    def _maybe_finalize_gpu_inference_drain(
+        *,
+        worker_release_gate_armed: bool = False,
+    ) -> bool:
+        """Publish one authoritative drain transition after any task-map mutation."""
+        nonlocal gpu_inference_drained_at, gpu_inference_drain_announced
+        inference_drained_now = bool(
+            int(gpu_worker_results_collected) >= int(gpu_worker_total_tasks)
+            and not deferred_tile_jobs_by_parent
+        )
+        if not inference_drained_now:
+            if worker_release_gate_armed:
+                _set_main_process_gpu_worker_release_in_progress(False)
+            return False
+
+        release_worker_contexts = bool(
+            gpu_worker_process_active
+            and not interpolation_process_backend_active
+            and _env_flag('YOLO_TTA_RELEASE_GPU_WORKERS_ON_DRAIN', True)
+        )
+        if release_worker_contexts and not worker_release_gate_armed:
+            # Callers arm before the final-result/deferred-map transition whenever they
+            # can predict it. This fallback still closes admission before teardown if an
+            # unusual zero-task path reaches the already-drained state directly.
+            _set_main_process_gpu_worker_release_in_progress(True)
+            worker_release_gate_armed = True
+        _set_main_process_gpu_inference_priority_active(False)
+        if not bool(gpu_inference_drain_announced):
+            gpu_inference_drain_announced = True
+            gpu_inference_drained_at = time.perf_counter()
+            runtime_telemetry().gauge('pipeline.phase', 'gpu_inference_drained_scheduler_tail')
+            sink_now = nrrd_layer_sink()
+            if sink_now is not None:
+                nrrd_done_now, nrrd_total_now = sink_now.progress_counts()
+            else:
+                nrrd_done_now, nrrd_total_now = 0, 0
+            waiting_tiles_now = sum(
+                len(value) for value in postprocessed_tiles_waiting_by_parent.values()
+            )
+            print('\n=== GPU inference queue drained; scheduler postprocessing continues ===')
+            if release_worker_contexts:
+                print(
+                    'No interpolation pass can reuse the CUDA inference workers; '
+                    'releasing their model/render contexts for composed backprojection.'
+                )
+                _shutdown_gpu_worker_processes()
+                runtime_telemetry().gauge(
+                    'scheduler.gpu_workers_released_on_drain',
+                    not bool(gpu_worker_processes),
+                )
+            worker_release_text = (
+                'Inference worker processes and CUDA contexts were released.'
+                if release_worker_contexts and not gpu_worker_processes
+                else (
+                    f'WARNING: {len(gpu_worker_processes)} inference worker process(es) '
+                    'survived teardown; their GPUs remain gated and composed projection '
+                    'will use the bounded CPU fallback.'
+                    if release_worker_contexts else
+                    'Worker GPUs are now leaseable for eligible output/backprojection stages.'
+                )
+            )
+            print(
+                f'Inference tasks completed={int(gpu_worker_results_collected)}/'
+                f'{int(gpu_worker_total_tasks)}; '
+                f'early_view_cleanup={len(view_early_cleanup_futures)}, '
+                f'parent_postprocess={len(view_processing_futures)}, '
+                f'tile_cleanup={len(tile_cleanup_futures)}, tile_finalize={len(tile_finalize_futures)}, '
+                f'tile_config_gate={len(tile_config_gate_futures)}, '
+                f'tile_consolidation={len(tile_consolidation_futures)}, '
+                f'waiting_tiles_for_parent={int(waiting_tiles_now)}, '
+                f'NRRD writes={int(nrrd_done_now)}/{int(nrrd_total_now)}. '
+                f'{worker_release_text}'
+            )
+        if worker_release_gate_armed and (
+            not release_worker_contexts or not gpu_worker_processes
+        ):
+            _set_main_process_gpu_worker_release_in_progress(False)
+        return True
+
     def _process_one_worker_result(msg: Dict[str, object]) -> None:
         nonlocal gpu_worker_results_collected
-        nonlocal gpu_inference_drained_at, gpu_inference_drain_announced
         mtype = str(msg.get('type'))
         if mtype == 'ready':
             print(f"GPU worker ready: device cuda:{msg.get('gpu_index')} (pid {msg.get('pid')}).")
@@ -42549,6 +43122,19 @@ def main() -> None:
             _refresh_gpu_aux_interpolation_leases()
             return
         worker_id = int(msg.get('gpu_index', -1))
+        # The final worker result releases the inference-priority barrier. Arm a separate
+        # admission gate *before* publishing that completion so parent GPU stages cannot
+        # race CUDA context teardown using a stale free-memory snapshot. Result handling
+        # may enqueue deferred dynamic work; in that case the gate is disarmed below.
+        worker_release_gate_armed = bool(
+            gpu_worker_process_active
+            and not interpolation_process_backend_active
+            and _env_flag('YOLO_TTA_RELEASE_GPU_WORKERS_ON_DRAIN', True)
+            and (int(gpu_worker_results_collected) + 1) >= int(gpu_worker_total_tasks)
+            and not deferred_tile_jobs_by_parent
+        )
+        if worker_release_gate_armed:
+            _set_main_process_gpu_worker_release_in_progress(True)
         _main_process_gpu_stage_finish_inference(worker_id)
         gpu_worker_results_collected += 1
         gpu_worker_results_by_id[worker_id] = int(gpu_worker_results_by_id.get(worker_id, 0)) + 1
@@ -42573,36 +43159,9 @@ def main() -> None:
         # deferred tile groups. Re-evaluate admission immediately rather than waiting for a
         # background future or the next result-queue wakeup.
         _dispatch_gpu_worker_inference_window(_gpu_worker_fullframe_parent_key(task))
-        if (
-            int(gpu_worker_results_collected) >= int(gpu_worker_total_tasks)
-            and not deferred_tile_jobs_by_parent
-        ):
-            _set_main_process_gpu_inference_priority_active(False)
-            if not bool(gpu_inference_drain_announced):
-                gpu_inference_drain_announced = True
-                gpu_inference_drained_at = time.perf_counter()
-                runtime_telemetry().gauge('pipeline.phase', 'gpu_inference_drained_scheduler_tail')
-                sink_now = nrrd_layer_sink()
-                if sink_now is not None:
-                    nrrd_done_now, nrrd_total_now = sink_now.progress_counts()
-                else:
-                    nrrd_done_now, nrrd_total_now = 0, 0
-                waiting_tiles_now = sum(
-                    len(value) for value in postprocessed_tiles_waiting_by_parent.values()
-                )
-                print('\n=== GPU inference queue drained; scheduler postprocessing continues ===')
-                print(
-                    f'Inference tasks completed={int(gpu_worker_results_collected)}/'
-                    f'{int(gpu_worker_total_tasks)}; '
-                    f'early_view_cleanup={len(view_early_cleanup_futures)}, '
-                    f'parent_postprocess={len(view_processing_futures)}, '
-                    f'tile_cleanup={len(tile_cleanup_futures)}, tile_finalize={len(tile_finalize_futures)}, '
-                    f'tile_config_gate={len(tile_config_gate_futures)}, '
-                    f'tile_consolidation={len(tile_consolidation_futures)}, '
-                    f'waiting_tiles_for_parent={int(waiting_tiles_now)}, '
-                    f'NRRD writes={int(nrrd_done_now)}/{int(nrrd_total_now)}. '
-                    'Worker GPUs are now released for eligible output/backprojection stages.'
-                )
+        _maybe_finalize_gpu_inference_drain(
+            worker_release_gate_armed=bool(worker_release_gate_armed),
+        )
         _refresh_gpu_aux_interpolation_leases()
 
     # push drain — a transport-only daemon thread blocks on the process
@@ -42759,6 +43318,12 @@ def main() -> None:
                             f'accepts another job.',
                             flush=True,
                         )
+        # Make normal drain shutdown idempotent. A D-state survivor remains tracked so
+        # teardown can retry it and GPU memory admission still observes its allocations.
+        survivors = [proc for proc in gpu_worker_processes if proc.is_alive()]
+        gpu_worker_processes[:] = survivors
+        if not survivors:
+            gpu_task_queues.clear()
 
     try:
         _pump_prediction_volume_build_queue()
@@ -43070,6 +43635,8 @@ def main() -> None:
                 close_prediction_volume_ref(ref, keep_temp=bool(keep_temp_artifacts))
             ready_tile_infer.clear()
         push_drain_stop.set()  # the transport thread exits within one 0.5 s tick
+        if gpu_worker_process_active and gpu_worker_processes:
+            _set_main_process_gpu_worker_release_in_progress(True)
         _set_main_process_gpu_inference_priority_active(False)
         if gpu_worker_process_active:
             _shutdown_gpu_worker_processes()
