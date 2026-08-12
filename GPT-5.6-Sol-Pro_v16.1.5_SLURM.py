@@ -59,8 +59,8 @@ import numpy as np
 
 GIB = 1024 ** 3
 NRRD_SPACE = "left-posterior-superior"
-SCRIPT_VERSION = '16.1.4'
-SCRIPT_VERSION_COMPACT = '1614'
+SCRIPT_VERSION = '16.1.5'
+SCRIPT_VERSION_COMPACT = '1615'
 SCRIPT_BASENAME = f'GPT-5.6-Sol-Pro_v{SCRIPT_VERSION}_SLURM.py'
 OUTPUT_NRRD_PREFIX = ''
 LEGACY_OUTPUT_NRRD_PREFIX = 'HW_'
@@ -17321,6 +17321,12 @@ def _gpu_inference_worker_main(
             input_channels=max(1, int(init_dict.get('input_channels', 1))),
             channel_token=str(init_dict.get('channel_token', 'gray')),
         )
+        if d1_owner_pipeline_enabled():
+            _d1_backproject_kernels()
+            print(
+                f'v16.1.5 D1 backprojection NVRTC preflight passed on cuda:{int(gpu_index)}: '
+                'header-free source-geometry atomic-OR kernel compiled before TensorRT load.'
+            )
         model = load_ultralytics_model(str(model_path), task='segment')
         ensure_yolo_ready_for_predict(model, cfg)
         validate_yolo_model_input_channels(
@@ -24933,7 +24939,7 @@ def assemble_current_view_union_volume(
     
     Multiple model entries are rejected; the destination uses source geometry when requested."""
     if len(view_volumes_by_model) != 1:
-        raise ValueError('GPT-5.6-Sol-Pro v16.1.4 supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.1.5 supports exactly one --model; multiple-model inference has been removed')
 
     union_shape = (int(T), int(H), int(W)) if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
     model_name = next(iter(view_volumes_by_model.keys()))
@@ -31276,16 +31282,15 @@ def _d1_backproject_kernels() -> object:
             'D1 backprojection kernels are unavailable: '
             + str(_D1_BACKPROJECT_KERNELS_ERROR or 'unknown NVRTC failure')
         )
+    # This NVRTC unit is deliberately header-free. Rootless cluster CUDA installs can
+    # expose libnvrtc without the host libc/C++ include tree, so including stdint.h or
+    # math.h can fail even though this kernel needs only CUDA intrinsics and primitive types.
     source = r'''
-    #include <stdint.h>
-    #include <math.h>
-
-    __device__ __forceinline__ float d1_clampf(float v, float lo, float hi) {
-      return fminf(hi, fmaxf(lo, v));
-    }
     __device__ __forceinline__ int d1_round_index(float value, int count) {
       int idx = __float2int_rn(value);
-      return max(0, min(count - 1, idx));
+      if (idx < 0) return 0;
+      if (idx >= count) return count - 1;
+      return idx;
     }
     __device__ __forceinline__ float d1_scale_center(
         float value, int in_count, int out_count) {
@@ -31394,7 +31399,7 @@ def _d1_backproject_kernels() -> object:
         _D1_BACKPROJECT_KERNELS_FAILED = True
         _D1_BACKPROJECT_KERNELS_ERROR = f'{type(exc).__name__}: {exc}'
         raise RuntimeError(
-            'D1 backprojection NVRTC compilation failed: '
+            'D1 backprojection header-free NVRTC compilation failed: '
             + str(_D1_BACKPROJECT_KERNELS_ERROR)
         ) from exc
 
@@ -39166,9 +39171,9 @@ def main() -> None:
     args = build_argparser().parse_args()
     channel_format = resolve_channel_format(args.channel_format)
     print(
-        '[v16.1.4] integrated fixes active: geometry-safe fast-bundle initialization, '
-        'bounded memfd direct-union window, sparse cvol retirement, persistent TensorRT '
-        'contexts, and parallel atomic outputs.'
+        '[v16.1.5] integrated fixes active: header-free D1 NVRTC preflight, '
+        'geometry-safe fast-bundle initialization, bounded memfd direct-union window, '
+        'sparse cvol retirement, persistent TensorRT contexts, and parallel atomic outputs.'
     )
     print(
         f'Model input channel format: {channel_format.token} '
@@ -39185,7 +39190,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('GPT-5.6-Sol-Pro v16.1.4 accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.1.5 accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -39663,7 +39668,7 @@ def main() -> None:
         # D1 supersedes the 25-39 GiB host direct-union workspace entirely.
         gpu_worker_direct_union_active = False
         print(
-            'v16.1.4 fast bundle active: A3 canonical Radial source sampling, B1 sparse '
+            'v16.1.5 fast bundle active: A3 canonical Radial source sampling, B1 sparse '
             'slice metadata, D3 resident-proto closing, C1 runtime-sized leases, C2 '
             'compute/publication credit separation, C3 predicted-cost scheduling, and D1 '
             'project -> infer -> proto-close -> immediate owner-GPU backprojection -> '
@@ -39672,13 +39677,13 @@ def main() -> None:
         )
     elif v1613_bundle_active:
         print(
-            'v16.1.4 fast bundle active with D1 disabled by '
+            'v16.1.5 fast bundle active with D1 disabled by '
             'YOLO_TTA_V1613_D1_OWNER_PIPELINE=0 or YOLO_TTA_V1613_D1_PIPELINE=0: '
             'A3/B1/D3 and C1-C3 remain active; the dense direct-union compatibility path is retained.'
         )
     elif v1613_fast_bundle_requested():
         print(
-            'v16.1.4 fast bundle not eligible for this command; compatibility paths retained: '
+            'v16.1.5 fast bundle not eligible for this command; compatibility paths retained: '
             + '; '.join(v1613_bundle_reasons)
         )
     if gpu_worker_direct_union_active:
@@ -44325,7 +44330,7 @@ def main() -> None:
 
 
 
-# v16.1.4 retains the v16.1.3 production bundle with the startup eligibility-order fix.
+# v16.1.5 retains the v16.1.3 production bundle with geometry-order and header-free D1 NVRTC fixes.
 # The heuristic global monkeypatch framework used by v16.0.8 was removed because it
 # could replace unrelated functions by name and shadow the real fused-union implementation.
 
