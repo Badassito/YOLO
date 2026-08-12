@@ -58,8 +58,8 @@ import numpy as np
 GIB = 1024 ** 3
 NRRD_SPACE = "left-posterior-superior"
 SCRIPT_VARIANT_PREFIX = 'ultra'
-SCRIPT_VERSION = '16.1.0'
-SCRIPT_VERSION_COMPACT = '1610'
+SCRIPT_VERSION = '16.1.1'
+SCRIPT_VERSION_COMPACT = '1611'
 SCRIPT_BASENAME = f'GPT-5.6-Sol-Ultra_v{SCRIPT_VERSION}_SLURM.py'
 OUTPUT_NRRD_PREFIX = ''
 
@@ -10233,12 +10233,11 @@ def gpu_device_hole_fill_enabled() -> bool:
 def gpu_worker_chunk_hole_fill_enabled() -> bool:
     """Allow split full-frame leases to run a whole-chunk GPU hole fill before handoff.
 
-    Disabled by default because the CuPy connected-component pass and allocator trim are
-    task-boundary barriers. Split views instead receive one parallel CPU hole-fill pass after
-    their last inference lease, preserving the same per-slice result while keeping workers hot.
-    Single-lease views and grouped tiles retain their existing device-fill behavior.
+    Enabled by default so eligible split views finish each disjoint slice window on its owning
+    GPU and never accumulate a completed-view CPU hole-fill tail. Set the environment variable
+    to zero to restore the completed-view CPU fallback.
     """
-    return _env_flag('YOLO_TTA_GPU_WORKER_CHUNK_HOLE_FILL', False)
+    return _env_flag('YOLO_TTA_GPU_WORKER_CHUNK_HOLE_FILL', True)
 
 
 def gpu_union_flush_overlap_enabled() -> bool:
@@ -10528,8 +10527,10 @@ class _DeviceUnionAccumulator:
         torch = self.torch
         slot_ids = [int(item[0]) for item in items]
         dest_ids = [int(item[1]) for item in items]
-        stream = torch.cuda.Stream(device=self.device)
         with _CUDA_GRAPH_CAPTURE_LOCK:
+            # Stream creation is capture-unsafe under global graph-capture mode. Create it
+            # only after entering the same process-wide barrier used by graph capture.
+            stream = torch.cuda.Stream(device=self.device)
             with torch.cuda.stream(stream):
                 for _slot_idx, _dest_idx, ready in items:
                     stream.wait_event(ready)
@@ -12357,20 +12358,32 @@ def predict_source_and_accumulate(
                 def _retire_device_union() -> Dict[str, object]:
                     compacted_predictions = 0
                     compacted_frames = 0
-                    # Count readback, stream/event creation and pinned D2H are all unsafe
-                    # during global CUDA-graph capture on the next task. One re-entrant guard
-                    # covers the complete retirement transaction.
+                    # Read compact statistics under the capture barrier, but never wait for
+                    # the sparse-retirement thread while holding it: that worker uses the same
+                    # barrier for its stream/event/D2H transaction. v16.1.0 wrapped flush_into
+                    # in this lock and deadlocked after every worker's first completed chunk.
                     with _CUDA_GRAPH_CAPTURE_LOCK:
                         if count_device_predictions:
                             compacted_predictions, compacted_frames = (
                                 device_union.take_device_prediction_stats(synchronize_device=False)
                             )
+                    if bool(device_union.sparse_retirement):
                         retired_meta = device_union.flush_into(
                             view_union_mm,
                             view_confmap_mm,
                             synchronize_device=False,
                             collect_slice_metadata=True,
                         )
+                    else:
+                        # Dense retirement performs CUDA stream/event work itself and has no
+                        # helper thread to join, so retaining the barrier is safe and required.
+                        with _CUDA_GRAPH_CAPTURE_LOCK:
+                            retired_meta = device_union.flush_into(
+                                view_union_mm,
+                                view_confmap_mm,
+                                synchronize_device=False,
+                                collect_slice_metadata=True,
+                            )
                     if prediction_hot_path_flush_enabled():
                         if view_confmap_mm is not None:
                             flush_array(view_confmap_mm)
@@ -22660,7 +22673,13 @@ def _backproject_tilted_radial_volume_to_volume(
             worker_count = max(1, min(
                 choose_slice_parallel_workers(int(workers), int(tilted_source.num_slices)),
                 int(memory_worker_cap),
-                max(1, _env_int('YOLO_TTA_TILTED_RADIAL_SINK_WORKERS', 8)),
+                # There are normally 31 independent destination bands on the target
+                # geometry. The old default of eight left ~95% of a 160-core allocation
+                # idle during this long post-inference projection stage.
+                max(1, _env_int(
+                    'YOLO_TTA_TILTED_RADIAL_SINK_WORKERS',
+                    min(32, max(1, int(_cpu_count()))),
+                )),
             ))
             print(
                 f'{desc}: composed tilted-Radial sink-only projection active; '
@@ -41205,10 +41224,15 @@ def main() -> None:
         chunk_hole_fill_enabled = bool(gpu_worker_chunk_hole_fill_enabled())
         if gpu_worker_device_hole_fill and not chunk_hole_fill_enabled:
             print(
-                f'Split-view hole fill moved off the inference handoff (v{SCRIPT_VERSION}): multi-chunk '
-                'full-frame views run one completed-view CPU pass instead of a CuPy label/fill '
-                'barrier after every GPU lease. YOLO_TTA_GPU_WORKER_CHUNK_HOLE_FILL=1 restores '
-                'the per-chunk device pass.'
+                f'Split-view GPU hole fill disabled (v{SCRIPT_VERSION}): multi-chunk full-frame '
+                'views will run one completed-view CPU pass. Remove '
+                'YOLO_TTA_GPU_WORKER_CHUNK_HOLE_FILL=0 to restore the default per-chunk device pass.'
+            )
+        elif gpu_worker_device_hole_fill:
+            print(
+                f'Split-view GPU hole fill active (v{SCRIPT_VERSION}): each disjoint inference '
+                'chunk is finalized during sparse GPU retirement; completed views skip the late '
+                'CPU hole-fill pass.'
             )
         fullframe_subtasks_per_view: Dict[Tuple[str, str], int] = {}
         next_task_id = 0

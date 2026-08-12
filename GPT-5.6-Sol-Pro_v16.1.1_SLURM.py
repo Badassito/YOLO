@@ -10,7 +10,7 @@ Current runtime behavior:
  - uses Ultralytics' unified quantize setting for inference precision
  - writes optional Slicer segmentation NRRDs as independent source-geometry component layers
  - uses the self-contained EDT medial-ridge centerline backend when explicitly enabled
- - HW variant: direct pure hardware-linear radial reconstruction with one composed 3D texture fetch per output pixel
+ - uses direct pure hardware-linear radial reconstruction with one composed 3D texture fetch per output pixel
 
 Dependencies:
  pip install opencv-python numpy scipy tifffile tqdm ultralytics
@@ -58,19 +58,16 @@ import numpy as np
 
 GIB = 1024 ** 3
 NRRD_SPACE = "left-posterior-superior"
-SCRIPT_VARIANT_PREFIX = 'HW'
-SCRIPT_VERSION = '16.1.0'
-SCRIPT_VERSION_COMPACT = '1610'
-SCRIPT_BASENAME = (
-    f'{SCRIPT_VARIANT_PREFIX}_GPT-5.6-Sol-Pro_v{SCRIPT_VERSION}_SLURM.py'
-)
+SCRIPT_VERSION = '16.1.1'
+SCRIPT_VERSION_COMPACT = '1611'
+SCRIPT_BASENAME = f'GPT-5.6-Sol-Pro_v{SCRIPT_VERSION}_SLURM.py'
 OUTPUT_NRRD_PREFIX = ''
 LEGACY_OUTPUT_NRRD_PREFIX = 'HW_'
 
 def variant_nrrd_stem(stem: object) -> str:
     """Return an unprefixed NRRD/manifest stem.
 
-    v16.1.0 removes the HW_ output namespace. Repeated legacy prefixes are stripped so
+    v16.1.1 removes the HW_ output namespace. Repeated legacy prefixes are stripped so
     caller-supplied stems and resumed metadata cannot recreate the retired prefix.
     """
     raw = str(stem)
@@ -805,7 +802,7 @@ class RuntimeTelemetry:
         else:
             base = os.environ.get('SLURM_JOB_ID') or str(os.getpid())
             self.path = Path(tempfile.gettempdir()) / (
-                f'{SCRIPT_VARIANT_PREFIX.lower()}-gpt56-sol-pro-v{SCRIPT_VERSION_COMPACT}-'
+                f'gpt56-sol-pro-v{SCRIPT_VERSION_COMPACT}-'
                 f'telemetry-{base}-{os.getpid()}.jsonl'
             )
 
@@ -877,10 +874,7 @@ class RuntimeTelemetry:
                     'mean_ms': (seconds * 1000.0 / calls) if calls else 0.0,
                 }
             payload: Dict[str, object] = {
-                'schema': (
-                    f'{SCRIPT_VARIANT_PREFIX.lower()}-gpt-5.6-sol-pro-'
-                    f'v{SCRIPT_VERSION}.telemetry.v1'
-                ),
+                'schema': f'gpt-5.6-sol-pro-v{SCRIPT_VERSION}.telemetry.v1',
                 'pid': os.getpid(),
                 'monotonic_seconds': (now_ns - self.started_ns) / 1e9,
                 'wall_time': time.time(),
@@ -1862,7 +1856,7 @@ def array_nbytes(shape: Sequence[int], dtype: np.dtype | str | type) -> int:
 # Large arrays that must be reopened by CUDA worker processes cannot be plain
 # anonymous NumPy allocations. The previous implementation treated every such array as a
 # pathname memmap under --temp, creating roughly one terabyte of dense tmpfs files for the
-# prioritized 30-view command. v16.1.0 uses parent-owned memfds and transfers duplicated
+# prioritized 30-view command. v16.1.1 uses parent-owned memfds and transfers duplicated
 # descriptors through multiprocessing, so workers reopen /proc/self/fd/<fd> rather than
 # relying on cross-process /proc permissions. The owner remains live until sparse retirement;
 # closing the final mapping and descriptor drops the pages without filesystem writeback.
@@ -10426,7 +10420,7 @@ def _init_gpu_union_retirement_manager(device_str: str, max_plane_side: int) -> 
         )
         _GPU_UNION_RETIREMENT_MANAGER = manager
         print(
-            f'v16.1.0 event-driven GPU union retirement initialized: '
+            f'v16.1.1 event-driven GPU union retirement initialized: '
             f'{manager.capacity} persistent lane(s), '
             f'{gpu_union_retirement_chunk_slices()} slice(s)/D2H chunk, '
             f'{gpu_union_retirement_event_capacity()} producer event(s)/lane.'
@@ -13101,6 +13095,12 @@ def _fused_direct_render_kernels() -> Optional[object]:
     }
     __device__ __forceinline__ float clamp_f(float v, float lo, float hi) {
       return v < lo ? lo : (v > hi ? hi : v);
+    }
+    __device__ __forceinline__ int floor_i(float v) {
+      return __float2int_rd(v);
+    }
+    __device__ __forceinline__ float round_nearest_f(float v) {
+      return (float)__float2int_rn(v);
     }
     // Header-free device math: run 126080 showed NVRTC 13.0 could not locate
     // the host system math.h. CUDA device math functions need no host header path.
@@ -16830,7 +16830,7 @@ def _gpu_inference_worker_main(
                     manager = _gpu_union_retirement_manager()
                     lane_count = int(manager.capacity) if manager is not None else 2
                     print(
-                        f'v16.1.0 multi-lane GPU retirement active: {lane_count} independent '
+                        f'v16.1.1 multi-lane GPU retirement active: {lane_count} independent '
                         'event-fenced D2H/publication record(s) per worker; '
                         'YOLO_TTA_GPU_UNION_FLUSH_OVERLAP=0 restores synchronous retirement.'
                     )
@@ -18439,7 +18439,7 @@ def label_foreground_volume_streaming(
         'YOLO_TTA_TOPOLOGY_UNION_BATCH_CODES', 1_048_576,
     ))
     print(
-        '3D topology local-union plan (v16.1.0): '
+        '3D topology local-union plan (v16.1.1): '
         f'{len(slab_ranges)} slab(s) x {int(topology_slab_slices())} slices, '
         f'{int(slab_worker_count)} concurrent worker(s), '
         f'compiled_nogil={bool(_numba_union_find_batch_kernel is not None and compiled_topology_kernels_enabled())}.'
@@ -22364,7 +22364,7 @@ def _backproject_tilted_radial_volume_to_volume(
             reserve_bytes=int(reserve_bytes),
         )
         print(
-            f'{desc}: v16.1.0 direct tilted-Radial composition active; no '
+            f'{desc}: v16.1.1 direct tilted-Radial composition active; no '
             f'{avoided_base_bytes / GIB:.2f} GiB tilted base-stack intermediate is allocated.'
         )
         destination_flat = np.asarray(destination).reshape(-1)
@@ -22425,7 +22425,7 @@ def _backproject_tilted_radial_volume_to_volume(
             reserve_bytes=int(reserve_bytes),
         )
         print(
-            f'{desc}: v16.1.0 direct tilted-Radial packed sink active; no '
+            f'{desc}: v16.1.1 direct tilted-Radial packed sink active; no '
             f'{avoided_base_bytes / GIB:.2f} GiB tilted base stack and no '
             f'{array_nbytes(target_shape, np.uint8) / GIB:.2f} GiB uint8 source destination. '
             f'Packed source union={array_nbytes((t_dim, out_h, packed_w), np.uint8) / GIB:.2f} GiB.'
@@ -24194,7 +24194,7 @@ def assemble_current_view_union_volume(
     
     Multiple model entries are rejected; the destination uses source geometry when requested."""
     if len(view_volumes_by_model) != 1:
-        raise ValueError('GPT-5.6-Sol-Pro v16.1.0 supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.1.1 supports exactly one --model; multiple-model inference has been removed')
 
     union_shape = (int(T), int(H), int(W)) if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
     model_name = next(iter(view_volumes_by_model.keys()))
@@ -31518,7 +31518,7 @@ def prepare_view_volume_after_fullframe(
         existing_backing = _interpolation_array_backing_path(old_volume)
         if existing_backing is not None:
             print(
-                f'{model_name}/{view.name} non-interpolated native retention (v16.1.0): '
+                f'{model_name}/{view.name} non-interpolated native retention (v16.1.1): '
                 f'reusing {existing_backing}; no full-volume drain copy.'
             )
         else:
@@ -31623,7 +31623,7 @@ def prepare_view_volume_after_fullframe(
         except Exception:
             pass
         print(
-            f'v16.1.0 sparse retirement: {model_name}/{view.name} released '
+            f'v16.1.1 sparse retirement: {model_name}/{view.name} released '
             f'{retired_bytes / GIB:.2f} GiB dense union after cvol materialization.'
         )
 
@@ -37556,7 +37556,7 @@ def main() -> None:
     args = build_argparser().parse_args()
     channel_format = resolve_channel_format(args.channel_format)
     print(
-        '[v16.1.0] integrated fixes active: bounded memfd direct-union window, '
+        '[v16.1.1] integrated fixes active: bounded memfd direct-union window, '
         'sparse cvol retirement, persistent TensorRT contexts, and parallel atomic outputs.'
     )
     print(
@@ -37574,7 +37574,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('GPT-5.6-Sol-Pro v16.1.0 accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.1.1 accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -38874,7 +38874,7 @@ def main() -> None:
     )
     if direct_union_sparse_retirement_active:
         print(
-            'v16.1.0 split direct-union leases active: '
+            'v16.1.1 split direct-union leases active: '
             f'inference_views={int(direct_union_inference_view_limit)}, '
             f'inference_dense={direct_union_inference_byte_limit / GIB:.1f} GiB, '
             f'total_inference+postprocess_dense={direct_union_total_dense_byte_limit / GIB:.1f} GiB. '
@@ -39400,7 +39400,7 @@ def main() -> None:
         view_name_lower = str(view.name).lower()
         transient_bytes = 2 * GIB
         if 'radial_tilted' in view_name_lower or ('tilted' in view_name_lower and str(view.family) == 'radial'):
-            # v16.1.0 D2 writes the final source destination directly and no longer owns a
+            # v16.1.1 D2 writes the final source destination directly and no longer owns a
             # processing-sized tilted base stack in addition to that destination.
             transient_bytes = int(source_bytes) + 4 * GIB
         elif 'tilted' in view_name_lower:
@@ -40383,7 +40383,7 @@ def main() -> None:
                 })
             if fused_preflight_specs:
                 print(
-                    'v16.1.0 fused-render fail-fast preflight armed for: '
+                    'v16.1.1 fused-render fail-fast preflight armed for: '
                     + ', '.join(_fused_preflight_family(spec['view']) for spec in fused_preflight_specs)
                 )
 
@@ -40411,7 +40411,7 @@ def main() -> None:
         _configure_main_process_gpu_stage_workers(gpu_logical_indices)
         if main_process_gpu_stage_inference_priority_enabled():
             print(
-                'Inference-first GPU ownership active (v16.1.0): main-process NRRD, '
+                'Inference-first GPU ownership active (v16.1.1): main-process NRRD, '
                 'backprojection, downbin, and topology stages cannot seize worker GPUs until '
                 'the global inference queue is permanently drained. '
                 'YOLO_TTA_MAIN_GPU_STAGE_INFERENCE_PRIORITY=0 restores opportunistic leasing.'
@@ -40593,7 +40593,7 @@ def main() -> None:
         chunk_hole_fill_enabled = bool(gpu_worker_chunk_hole_fill_enabled())
         if gpu_worker_device_hole_fill and not chunk_hole_fill_enabled:
             print(
-                'Split-view hole fill moved off the inference handoff (v16.1.0): multi-chunk '
+                'Split-view hole fill moved off the inference handoff (v16.1.1): multi-chunk '
                 'full-frame views run one completed-view CPU pass instead of a CuPy label/fill '
                 'barrier after every GPU lease. YOLO_TTA_GPU_WORKER_CHUNK_HOLE_FILL=1 restores '
                 'the per-chunk device pass.'
@@ -40617,7 +40617,7 @@ def main() -> None:
                 key_fv = (str(model_name), str(view.name))
                 fullframe_subtasks_per_view[key_fv] = int(fullframe_subtasks_per_view.get(key_fv, 0)) + len(ranges)
                 prefix = f'{view.name}__{job_id}'
-                # v16.1.0 allocates the shared direct-union workspace only when the
+                # v16.1.1 allocates the shared direct-union workspace only when the
                 # first task for this view is actually dispatched.  This prevents all 30
                 # logical 25-39 GiB unions from being created/touched at startup.
             elif tile_group_dispatch_active:
@@ -41741,7 +41741,7 @@ def main() -> None:
                 print(
                     f'Final {model_name}/{view.name}: restoring/assembling the union of '
                     f'{len(view_projected_layer_refs)} orthogonal NRRD layer(s) directly into '
-                    f'output geometry (v16.1.0 sparse-retirement path).'
+                    f'output geometry (v16.1.1 sparse-retirement path).'
                 )
                 if g5_tail_eligible:
                     fused_projected_layer_refs.extend(view_projected_layer_refs)
@@ -42292,7 +42292,7 @@ def main() -> None:
 
 
 
-# v16.1.0 production optimizations are integrated at their owning call sites.
+# v16.1.1 production optimizations are integrated at their owning call sites.
 # The heuristic global monkeypatch framework used by v16.0.8 was removed because it
 # could replace unrelated functions by name and shadow the real fused-union implementation.
 
