@@ -59,8 +59,8 @@ import numpy as np
 
 GIB = 1024 ** 3
 NRRD_SPACE = "left-posterior-superior"
-SCRIPT_VERSION = '16.1.5'
-SCRIPT_VERSION_COMPACT = '1615'
+SCRIPT_VERSION = '16.1.6'
+SCRIPT_VERSION_COMPACT = '1616'
 SCRIPT_BASENAME = f'GPT-5.6-Sol-Pro_v{SCRIPT_VERSION}_SLURM.py'
 OUTPUT_NRRD_PREFIX = ''
 LEGACY_OUTPUT_NRRD_PREFIX = 'HW_'
@@ -17324,7 +17324,7 @@ def _gpu_inference_worker_main(
         if d1_owner_pipeline_enabled():
             _d1_backproject_kernels()
             print(
-                f'v16.1.5 D1 backprojection NVRTC preflight passed on cuda:{int(gpu_index)}: '
+                f'v16.1.6 D1 backprojection NVRTC preflight passed on cuda:{int(gpu_index)}: '
                 'header-free source-geometry atomic-OR kernel compiled before TensorRT load.'
             )
         model = load_ultralytics_model(str(model_path), task='segment')
@@ -23968,6 +23968,49 @@ def fused_final_gpu_pipeline_slots() -> int:
     return max(1, min(3, _env_int('YOLO_TTA_FUSED_FINAL_GPU_PIPELINE_SLOTS', 2)))
 
 
+def fused_final_native_sparse_cpu_enabled() -> bool:
+    """Bypass GPU staging when every final contributor is already in output geometry.
+
+    D1 source-space cvols require no resampling. Sending their host-assembled union through
+    one lane thread per GPU only adds H2D/D2H traffic and caps sparse decode concurrency at
+    the GPU count. The source-z-parallel CPU path is byte-identical and keeps the sparse
+    crops in host memory. Set YOLO_TTA_FUSED_FINAL_NATIVE_SPARSE_CPU=0 to restore the
+    v16.1.5 GPU-lane behavior for comparison.
+    """
+    return _env_flag('YOLO_TTA_FUSED_FINAL_NATIVE_SPARSE_CPU', True)
+
+
+def fused_final_native_sparse_cpu_workers(requested_workers: int, out_t: int) -> int:
+    """Worker count for native source-space sparse final union."""
+    default = max(
+        1,
+        min(
+            int(max(1, out_t)),
+            int(max(1, requested_workers)),
+            int(max(1, _cpu_count())),
+        ),
+    )
+    return max(
+        1,
+        min(
+            int(max(1, out_t)),
+            _env_int('YOLO_TTA_FUSED_FINAL_NATIVE_SPARSE_WORKERS', int(default)),
+        ),
+    )
+
+
+def fused_final_native_sparse_band_slices(worker_count: int, out_t: int) -> int:
+    """Bound the active source-z frontier while retaining several chunks per worker."""
+    default = max(256, int(max(1, worker_count)) * 4)
+    return max(
+        1,
+        min(
+            int(max(1, out_t)),
+            _env_int('YOLO_TTA_FUSED_FINAL_NATIVE_SPARSE_BAND_SLICES', int(default)),
+        ),
+    )
+
+
 def fused_final_gpu_min_group_bytes() -> int:
     """Reduced geometry groups below this work size stay on the CPU."""
     return max(0, int(max(0.0, _env_float('YOLO_TTA_FUSED_FINAL_GPU_MIN_GROUP_MIB', 4.0)) * 1024 * 1024))
@@ -24330,6 +24373,136 @@ def assemble_view_volumes_and_projected_layers_fused(
                 dst[int(y0):int(y1), int(x0):int(x1)] |= crop
                 return
             np.bitwise_or(dst, np.asarray(src[int(src_z)], dtype=np.uint8), out=dst)
+
+        def _try_native_sparse_cpu_final_fusion() -> bool:
+            """Directly OR output-native contributors with source-z CPU parallelism.
+
+            This is the D1 fast-bundle terminal case: every cvol is already in final
+            source geometry, so there is no restore kernel for a GPU to accelerate. The
+            destination was freshly zero-initialized by assemble_current_view_union_volume;
+            one worker owns each z slice and writes only the foreground bbox crops.
+            """
+            if not fused_final_native_sparse_cpu_enabled():
+                return False
+            if transverse is not None or sagittal is not None or coronal is not None:
+                return False
+            if not native_views and not opened:
+                return False
+
+            output_shape = (int(out_t), int(out_h), int(out_w))
+            direct_projected: List[Tuple['NrrdLayerRef', object]] = []
+            for ref, src in opened:
+                if tuple(int(v) for v in _volume_shape_tuple(src)) != output_shape:
+                    return False
+                direct_projected.append((ref, src))
+
+            raw_sources: List[Tuple['NrrdLayerRef', RawBBoxMaskStore]] = []
+            generic_sources: List[Tuple['NrrdLayerRef', object]] = []
+            active_source_ids_by_z: List[List[int]] = [
+                [] for _ in range(int(out_t))
+            ]
+            payload_bytes = 0
+            nonempty_layer_slices = 0
+            for ref, src in direct_projected:
+                if not isinstance(src, RawBBoxMaskStore):
+                    generic_sources.append((ref, src))
+                    continue
+                source_id = int(len(raw_sources))
+                raw_sources.append((ref, src))
+                kinds = np.asarray(src.index['kind'], dtype=np.uint8)
+                invalid = np.flatnonzero((kinds != np.uint8(0)) & (kinds != np.uint8(1)))
+                if int(invalid.size) > 0:
+                    raise ValueError(
+                        f'{src.root}: invalid raw-mask marker {int(kinds[int(invalid[0])])} '
+                        f'at slice {int(invalid[0])}'
+                    )
+                active_zs = np.flatnonzero(kinds == np.uint8(1))
+                nonempty_layer_slices += int(active_zs.size)
+                payload_bytes += int(np.sum(
+                    np.asarray(src.index['payload_size'], dtype=np.uint64),
+                    dtype=np.uint64,
+                ))
+                for z_idx in active_zs:
+                    active_source_ids_by_z[int(z_idx)].append(int(source_id))
+
+            active_source_ids = [tuple(ids) for ids in active_source_ids_by_z]
+            worker_count = fused_final_native_sparse_cpu_workers(int(workers), int(out_t))
+            band_slices = fused_final_native_sparse_band_slices(
+                int(worker_count), int(out_t),
+            )
+            logical_bytes = int(out_t) * int(out_h) * int(out_w)
+            print(
+                'v16.1.6 native sparse final union selected: '
+                f'{len(direct_projected)} source-space layer(s) '
+                f'({len(raw_sources)} raw-bbox, {len(generic_sources)} generic), '
+                f'{len(native_views)} dense native view(s), workers={int(worker_count)}, '
+                f'z_band={int(band_slices)}, payload={int(payload_bytes) / GIB:.2f} GiB. '
+                'The GPU lane path is bypassed because there is no restore/resample work.',
+                flush=True,
+            )
+            telemetry = runtime_telemetry()
+            telemetry.gauge('final_union.native_sparse_cpu.layers', int(len(direct_projected)))
+            telemetry.gauge('final_union.native_sparse_cpu.raw_bbox_layers', int(len(raw_sources)))
+            telemetry.gauge('final_union.native_sparse_cpu.payload_bytes', int(payload_bytes))
+            telemetry.gauge('final_union.native_sparse_cpu.workers', int(worker_count))
+
+            def _merge_source_z(z_idx: int) -> None:
+                z_i = int(z_idx)
+                dst = np.asarray(final_union_mm[z_i])
+                # Dense native contributors are uncommon in D1 mode, but retaining them
+                # makes this specialization exact for mixed output-native callers too.
+                for _view_name, volume in native_views:
+                    np.bitwise_or(
+                        dst, np.asarray(volume[z_i], dtype=np.uint8), out=dst,
+                    )
+                for source_id in active_source_ids[z_i]:
+                    _ref, src = raw_sources[int(source_id)]
+                    decoded = src.decode_slice_crop(z_i, dtype=np.uint8)
+                    if decoded is None:
+                        continue
+                    y0, x0, y1, x1, crop = decoded
+                    dst_window = dst[int(y0):int(y1), int(x0):int(x1)]
+                    np.bitwise_or(dst_window, crop, out=dst_window)
+                for _ref, src in generic_sources:
+                    _or_native_source_slice(dst, src, z_i)
+
+            started = time.perf_counter()
+            with telemetry.span(
+                'final_union.native_sparse_cpu',
+                layers=int(len(direct_projected)),
+                payload_bytes=int(payload_bytes),
+            ):
+                with tqdm(
+                    total=int(out_t),
+                    desc='v16.1.6 native sparse final union',
+                ) as pbar:
+                    for band0 in range(0, int(out_t), int(band_slices)):
+                        band1 = min(int(out_t), int(band0) + int(band_slices))
+                        band_count = int(band1 - band0)
+
+                        def _merge_band_z(local_z: int, _band0: int = int(band0)) -> None:
+                            _merge_source_z(int(_band0) + int(local_z))
+
+                        parallel_for_indices_chunked(
+                            int(band_count),
+                            _merge_band_z,
+                            max_workers=min(int(worker_count), int(band_count)),
+                            desc='v16.1.6 native sparse final union band',
+                            show_progress=False,
+                            target_chunks_per_worker=2,
+                        )
+                        pbar.update(int(band_count))
+            elapsed = max(1e-9, time.perf_counter() - started)
+            print(
+                'v16.1.6 native sparse final union completed in '
+                f'{elapsed:.3f}s; sparse payload={int(payload_bytes) / GIB:.2f} GiB, '
+                f'logical destination={int(logical_bytes) / GIB:.2f} GiB, '
+                f'payload throughput={int(payload_bytes) / GIB / elapsed:.2f} GiB/s, '
+                f'nonempty layer-slices={int(nonempty_layer_slices)}.',
+                flush=True,
+            )
+            telemetry.gauge('final_union.native_sparse_cpu.seconds', float(elapsed))
+            return True
 
         def _try_gpu_final_fusion() -> bool:
             """GPU path with pinned double buffering and geometry streams.
@@ -24773,6 +24946,10 @@ def assemble_view_volumes_and_projected_layers_fused(
             )
             return True
 
+        if _try_native_sparse_cpu_final_fusion():
+            flush_array(final_union_mm)
+            return
+
         if _try_gpu_final_fusion():
             flush_array(final_union_mm)
             return
@@ -24939,7 +25116,7 @@ def assemble_current_view_union_volume(
     
     Multiple model entries are rejected; the destination uses source geometry when requested."""
     if len(view_volumes_by_model) != 1:
-        raise ValueError('GPT-5.6-Sol-Pro v16.1.5 supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.1.6 supports exactly one --model; multiple-model inference has been removed')
 
     union_shape = (int(T), int(H), int(W)) if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
     model_name = next(iter(view_volumes_by_model.keys()))
@@ -39171,9 +39348,10 @@ def main() -> None:
     args = build_argparser().parse_args()
     channel_format = resolve_channel_format(args.channel_format)
     print(
-        '[v16.1.5] integrated fixes active: header-free D1 NVRTC preflight, '
-        'geometry-safe fast-bundle initialization, bounded memfd direct-union window, '
-        'sparse cvol retirement, persistent TensorRT contexts, and parallel atomic outputs.'
+        '[v16.1.6] integrated fixes active: native source-space sparse final union, '
+        'header-free D1 NVRTC preflight, geometry-safe fast-bundle initialization, '
+        'bounded memfd direct-union window, sparse cvol retirement, persistent TensorRT '
+        'contexts, and parallel atomic outputs.'
     )
     print(
         f'Model input channel format: {channel_format.token} '
@@ -39190,7 +39368,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('GPT-5.6-Sol-Pro v16.1.5 accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.1.6 accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -39668,7 +39846,7 @@ def main() -> None:
         # D1 supersedes the 25-39 GiB host direct-union workspace entirely.
         gpu_worker_direct_union_active = False
         print(
-            'v16.1.5 fast bundle active: A3 canonical Radial source sampling, B1 sparse '
+            'v16.1.6 fast bundle active: A3 canonical Radial source sampling, B1 sparse '
             'slice metadata, D3 resident-proto closing, C1 runtime-sized leases, C2 '
             'compute/publication credit separation, C3 predicted-cost scheduling, and D1 '
             'project -> infer -> proto-close -> immediate owner-GPU backprojection -> '
@@ -39677,13 +39855,13 @@ def main() -> None:
         )
     elif v1613_bundle_active:
         print(
-            'v16.1.5 fast bundle active with D1 disabled by '
+            'v16.1.6 fast bundle active with D1 disabled by '
             'YOLO_TTA_V1613_D1_OWNER_PIPELINE=0 or YOLO_TTA_V1613_D1_PIPELINE=0: '
             'A3/B1/D3 and C1-C3 remain active; the dense direct-union compatibility path is retained.'
         )
     elif v1613_fast_bundle_requested():
         print(
-            'v16.1.5 fast bundle not eligible for this command; compatibility paths retained: '
+            'v16.1.6 fast bundle not eligible for this command; compatibility paths retained: '
             + '; '.join(v1613_bundle_reasons)
         )
     if gpu_worker_direct_union_active:
@@ -44330,7 +44508,7 @@ def main() -> None:
 
 
 
-# v16.1.5 retains the v16.1.3 production bundle with geometry-order and header-free D1 NVRTC fixes.
+# v16.1.6 retains the v16.1.3 production bundle and bypasses degenerate GPU staging for output-native sparse final unions.
 # The heuristic global monkeypatch framework used by v16.0.8 was removed because it
 # could replace unrelated functions by name and shadow the real fused-union implementation.
 
