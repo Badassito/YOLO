@@ -59,8 +59,8 @@ import numpy as np
 
 GIB = 1024 ** 3
 NRRD_SPACE = "left-posterior-superior"
-SCRIPT_VERSION = '16.1.6'
-SCRIPT_VERSION_COMPACT = '1616'
+SCRIPT_VERSION = '16.1.7'
+SCRIPT_VERSION_COMPACT = '1617'
 SCRIPT_BASENAME = f'GPT-5.6-Sol-Pro_v{SCRIPT_VERSION}_SLURM.py'
 OUTPUT_NRRD_PREFIX = ''
 LEGACY_OUTPUT_NRRD_PREFIX = 'HW_'
@@ -17324,7 +17324,7 @@ def _gpu_inference_worker_main(
         if d1_owner_pipeline_enabled():
             _d1_backproject_kernels()
             print(
-                f'v16.1.6 D1 backprojection NVRTC preflight passed on cuda:{int(gpu_index)}: '
+                f'v16.1.7 D1 backprojection NVRTC preflight passed on cuda:{int(gpu_index)}: '
                 'header-free source-geometry atomic-OR kernel compiled before TensorRT load.'
             )
         model = load_ultralytics_model(str(model_path), task='segment')
@@ -18188,6 +18188,195 @@ def _check_local_label_store_capacity(count: int, dtype: np.dtype, *, z: int) ->
         )
 
 
+@dataclass(frozen=True)
+class BinaryVolumeSliceMetadata:
+    """Known per-z foreground support for one live binary volume.
+
+    ``slice_bboxes`` stores ``(y0, y1, x0, x1)`` with exclusive stops. A bbox may be
+    an exact foreground bbox or a conservative union of contributor bboxes; either is
+    sufficient to restrict connected-component labeling without changing its result.
+    """
+
+    slice_any: np.ndarray
+    slice_bboxes: np.ndarray
+    source: str
+    exact: bool = False
+
+
+_BINARY_VOLUME_SLICE_METADATA_LOCK = threading.RLock()
+_BINARY_VOLUME_SLICE_METADATA: Dict[
+    int, Tuple[weakref.ReferenceType[object], BinaryVolumeSliceMetadata]
+] = {}
+
+
+def _validate_binary_slice_metadata(
+    volume: object,
+    slice_any: np.ndarray,
+    slice_bboxes: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    shape = tuple(int(v) for v in np.asarray(volume).shape)
+    if len(shape) != 3:
+        raise ValueError(f'binary slice metadata requires a 3D volume, got shape={shape}')
+    z_dim, h, w = shape
+    any_arr = np.ascontiguousarray(np.asarray(slice_any, dtype=bool).reshape(-1))
+    bbox_arr = np.ascontiguousarray(np.asarray(slice_bboxes, dtype=np.int64))
+    if tuple(int(v) for v in any_arr.shape) != (int(z_dim),):
+        raise ValueError(
+            f'binary slice metadata slice_any shape {tuple(any_arr.shape)} != {(int(z_dim),)}'
+        )
+    if tuple(int(v) for v in bbox_arr.shape) != (int(z_dim), 4):
+        raise ValueError(
+            f'binary slice metadata slice_bboxes shape {tuple(bbox_arr.shape)} '
+            f'!= {(int(z_dim), 4)}'
+        )
+    # Empty slices must carry an empty bbox. Nonempty bboxes are clipped only after
+    # validating their ordering; silently accepting inverted metadata could drop anatomy.
+    for z in range(int(z_dim)):
+        y0, y1, x0, x1 = (int(v) for v in bbox_arr[int(z)])
+        if not bool(any_arr[int(z)]):
+            bbox_arr[int(z)] = np.int64(0)
+            continue
+        if not (0 <= y0 < y1 <= int(h) and 0 <= x0 < x1 <= int(w)):
+            raise ValueError(
+                f'invalid nonempty binary slice bbox at z={int(z)}: '
+                f'{(y0, y1, x0, x1)} for plane {(int(h), int(w))}'
+            )
+    return any_arr, bbox_arr
+
+
+def register_binary_volume_slice_metadata(
+    volume: object,
+    slice_any: np.ndarray,
+    slice_bboxes: np.ndarray,
+    *,
+    source: str,
+    exact: bool = False,
+) -> BinaryVolumeSliceMetadata:
+    """Attach validated foreground-support metadata to a live ndarray by identity."""
+    any_arr, bbox_arr = _validate_binary_slice_metadata(volume, slice_any, slice_bboxes)
+    metadata = BinaryVolumeSliceMetadata(
+        slice_any=any_arr,
+        slice_bboxes=bbox_arr,
+        source=str(source),
+        exact=bool(exact),
+    )
+    key = int(id(volume))
+
+    def _drop(_ref: weakref.ReferenceType[object], *, _key: int = int(key)) -> None:
+        with _BINARY_VOLUME_SLICE_METADATA_LOCK:
+            entry = _BINARY_VOLUME_SLICE_METADATA.get(int(_key))
+            if entry is not None and entry[0] is _ref:
+                _BINARY_VOLUME_SLICE_METADATA.pop(int(_key), None)
+
+    try:
+        ref: weakref.ReferenceType[object] = weakref.ref(volume, _drop)
+    except TypeError:
+        # NumPy arrays and memmaps are weak-referenceable in supported environments.
+        # Keep the optimization optional rather than retaining an unbounded strong ref.
+        return metadata
+    with _BINARY_VOLUME_SLICE_METADATA_LOCK:
+        _BINARY_VOLUME_SLICE_METADATA[int(key)] = (ref, metadata)
+    return metadata
+
+
+def binary_volume_slice_metadata(volume: object) -> Optional[BinaryVolumeSliceMetadata]:
+    """Return live metadata only when the registry entry still names this exact object."""
+    key = int(id(volume))
+    with _BINARY_VOLUME_SLICE_METADATA_LOCK:
+        entry = _BINARY_VOLUME_SLICE_METADATA.get(int(key))
+        if entry is None:
+            return None
+        target = entry[0]()
+        if target is not volume:
+            _BINARY_VOLUME_SLICE_METADATA.pop(int(key), None)
+            return None
+        return entry[1]
+
+
+def discard_binary_volume_slice_metadata(volume: object) -> None:
+    """Invalidate cached support before or after any in-place topology-changing pass."""
+    key = int(id(volume))
+    with _BINARY_VOLUME_SLICE_METADATA_LOCK:
+        entry = _BINARY_VOLUME_SLICE_METADATA.get(int(key))
+        if entry is not None and entry[0]() is volume:
+            _BINARY_VOLUME_SLICE_METADATA.pop(int(key), None)
+
+
+def binary_slice_bbox_coverage(
+    shape_tyx: Sequence[int],
+    slice_any: np.ndarray,
+    slice_bboxes: np.ndarray,
+) -> Tuple[int, int, float]:
+    """Return ``(nonempty_slices, bbox_pixels, bbox_fraction_of_full_volume)``."""
+    z_dim, h, w = (int(v) for v in shape_tyx)
+    any_arr = np.asarray(slice_any, dtype=bool).reshape((int(z_dim),))
+    boxes = np.asarray(slice_bboxes, dtype=np.int64).reshape((int(z_dim), 4))
+    heights = np.maximum(np.int64(0), boxes[:, 1] - boxes[:, 0])
+    widths = np.maximum(np.int64(0), boxes[:, 3] - boxes[:, 2])
+    bbox_pixels = int(np.sum((heights * widths)[any_arr], dtype=np.int64))
+    logical_pixels = max(1, int(z_dim) * int(h) * int(w))
+    return int(np.count_nonzero(any_arr)), int(bbox_pixels), float(bbox_pixels) / float(logical_pixels)
+
+
+@runtime_telemetry_phase('topology.slice_metadata_scan')
+def scan_binary_volume_slice_metadata(
+    volume: np.ndarray,
+    *,
+    workers: int,
+    source: str,
+) -> BinaryVolumeSliceMetadata:
+    """Compute exact per-slice support as a correctness-preserving metadata fallback."""
+    arr = np.asarray(volume)
+    if int(arr.ndim) != 3:
+        raise ValueError(f'binary slice metadata scan requires 3D input, got {arr.shape}')
+    z_dim, _h, _w = (int(v) for v in arr.shape)
+    slice_any = np.zeros((int(z_dim),), dtype=bool)
+    slice_bboxes = np.zeros((int(z_dim), 4), dtype=np.int64)
+    scan_workers = choose_slice_parallel_workers(
+        min(max(1, int(workers)), max(1, int(_cpu_count()))), int(z_dim),
+    )
+
+    def _scan_z(z: int) -> None:
+        z_i = int(z)
+        plane = np.ascontiguousarray(np.asarray(arr[z_i], dtype=np.uint8))
+        x0, y0, bw, bh = (int(v) for v in cv2.boundingRect(plane))
+        if int(bw) <= 0 or int(bh) <= 0:
+            return
+        slice_any[z_i] = True
+        slice_bboxes[z_i] = np.asarray(
+            (int(y0), int(y0 + bh), int(x0), int(x0 + bw)), dtype=np.int64,
+        )
+
+    parallel_for_indices_chunked(
+        int(z_dim),
+        _scan_z,
+        max_workers=int(scan_workers),
+        desc='v16.1.7 topology slice-metadata scan',
+        show_progress=False,
+        target_chunks_per_worker=2,
+    )
+    return register_binary_volume_slice_metadata(
+        volume,
+        slice_any,
+        slice_bboxes,
+        source=str(source),
+        exact=True,
+    )
+
+
+def topology_sparse_cpu_labeling_enabled() -> bool:
+    """Prefer crop-bounded CPU CCL over a dense parent-process CUDA first use."""
+    return _env_flag('YOLO_TTA_TOPOLOGY_SPARSE_CPU_LABELING', True)
+
+
+def topology_sparse_cpu_max_coverage() -> float:
+    """Maximum bbox coverage at which crop-bounded CPU labeling is selected."""
+    return max(
+        0.0,
+        min(1.0, _env_float('YOLO_TTA_TOPOLOGY_SPARSE_CPU_MAX_COVERAGE', 0.50)),
+    )
+
+
 def gpu_slice_labeling_enabled() -> bool:
     """Run per-slice 2D component labeling on the GPU where CUDA is available."""
     return _env_flag('YOLO_TTA_GPU_SLICE_LABELING', True)
@@ -18857,11 +19046,21 @@ def label_foreground_volume_streaming(
     known_slice_any: Optional[np.ndarray] = None,
     known_slice_bboxes: Optional[np.ndarray] = None,
     sparse_local_labels: bool = False,
+    prefer_crop_bounded_cpu_labeling: bool = False,
 ) -> Tuple[object, int, List[Path]]:
     """Resolve 3D foreground topology from parallel per-slice labels and slab-local unions.
     
     The caller may request compact global labels or retain slice-local ids with lookup tables for sparse downstream work."""
-    z_dim, h, w = mask_mm.shape
+    z_dim, h, w = (int(v) for v in mask_mm.shape)
+    if (known_slice_any is None) != (known_slice_bboxes is None):
+        raise ValueError('known_slice_any and known_slice_bboxes must be supplied together')
+    if known_slice_any is not None and known_slice_bboxes is not None:
+        known_slice_any = np.ascontiguousarray(
+            np.asarray(known_slice_any, dtype=bool).reshape((int(z_dim),)),
+        )
+        known_slice_bboxes = np.ascontiguousarray(
+            np.asarray(known_slice_bboxes, dtype=np.int64).reshape((int(z_dim), 4)),
+        )
     # when compact relabel is skipped, this raster never holds
     # canonical/global ids — only per-slice local ids 1..k. Halve the dominant
     # workspace with uint16 while retaining uint32 for the compact/global path.
@@ -18949,7 +19148,12 @@ def label_foreground_volume_streaming(
         # slice labels identically to the old (mask>0) cast — the full-slice compare+copy
         # per slice is deleted (contiguity copy only for bbox crops).
         fg = np.ascontiguousarray(src)
-        if fg.size == 0 or not np.any(fg):
+        metadata_guarantees_nonempty = bool(
+            known_slice_any is not None and bool(known_slice_any[z_i])
+        )
+        if fg.size == 0 or (
+            not bool(metadata_guarantees_nonempty) and not bool(np.any(fg))
+        ):
             component_counts[z_i] = np.uint32(0)
             return
 
@@ -19003,24 +19207,71 @@ def label_foreground_volume_streaming(
             labels_store[z_i, :, :] = np.asarray(labels2d, dtype=label_dtype)  # type: ignore[index]
         component_counts[z_i] = np.uint32(local_count)
 
-    # one z-disconnected cupy label pass per block on the GPU replaces the
-    # per-slice cv2 stage when CUDA is available in this process; CPU threads otherwise.
+    # A source-space D1 union already carries conservative per-z bboxes. For sparse
+    # final topology, bounded CPU CCL avoids initializing the parent CuPy context and
+    # transferring/scanning the full dense 16+ GiB volume merely to recover the same
+    # slice-local labels. Dense or metadata-free callers retain the established GPU path.
+    sparse_cpu_selected = False
+    support_nonempty = 0
+    support_bbox_pixels = 0
+    support_bbox_fraction = 1.0
+    sparse_cpu_threshold = float(topology_sparse_cpu_max_coverage())
+    if (
+        bool(prefer_crop_bounded_cpu_labeling)
+        and bool(topology_sparse_cpu_labeling_enabled())
+        and known_slice_any is not None
+        and known_slice_bboxes is not None
+    ):
+        support_nonempty, support_bbox_pixels, support_bbox_fraction = binary_slice_bbox_coverage(
+            (int(z_dim), int(h), int(w)),
+            known_slice_any,
+            known_slice_bboxes,
+        )
+        sparse_cpu_selected = bool(float(support_bbox_fraction) <= float(sparse_cpu_threshold))
+        if bool(sparse_cpu_selected):
+            label_workers = choose_slice_parallel_workers(
+                min(int(label_workers), max(1, int(_cpu_count()))), int(z_dim),
+            )
+            print(
+                'v16.1.7 crop-bounded CPU slice labeling selected: '
+                f'nonempty_z={int(support_nonempty)}/{int(z_dim)}, '
+                f'bbox_coverage={100.0 * float(support_bbox_fraction):.2f}% '
+                f'({int(support_bbox_pixels) / GIB:.2f} GiPixels), '
+                f'workers={int(label_workers)}. Parent CUDA/CuPy startup and the '
+                f'{array_nbytes((int(z_dim), int(h), int(w)), np.uint8) / GIB:.2f} GiB '
+                'dense H2D scan are bypassed. '
+                'YOLO_TTA_TOPOLOGY_SPARSE_CPU_LABELING=0 restores GPU labeling.',
+                flush=True,
+            )
+        else:
+            print(
+                'v16.1.7 crop-bounded CPU slice labeling not selected: '
+                f'bbox_coverage={100.0 * float(support_bbox_fraction):.2f}% exceeds '
+                f'{100.0 * float(sparse_cpu_threshold):.2f}%; retaining the GPU path.',
+                flush=True,
+            )
+    gpu_labeling_requested = bool(gpu_slice_labeling_enabled() and not sparse_cpu_selected)
     print(
         '3D topology slice-label phase: '
         f'shape={int(z_dim)}x{int(h)}x{int(w)}, CPU fallback workers={int(label_workers)}, '
-        f'GPU labeling requested={bool(gpu_slice_labeling_enabled())}.'
+        f'GPU labeling requested={bool(gpu_labeling_requested)}.'
     )
     runtime_telemetry().gauge('pipeline.phase', '3d_topology_slice_label')
+    runtime_telemetry().gauge('topology.slice_label.crop_cpu_selected', bool(sparse_cpu_selected))
+    runtime_telemetry().gauge('topology.slice_label.support_bbox_fraction', float(support_bbox_fraction))
     label_phase_started = time.perf_counter()
-    gpu_stage_a_done, gpu_stage_a_pair_codes = _try_label_slices_stage_a_gpu(
-        mask_mm,
-        labels_store,
-        component_counts,
-        slice_bboxes,
-        slice_areas if collect_stats else None,
-        known_slice_any=known_slice_any,
-        preferred_block_slices=int(topology_slab_slices()),
-    )
+    if bool(gpu_labeling_requested):
+        gpu_stage_a_done, gpu_stage_a_pair_codes = _try_label_slices_stage_a_gpu(
+            mask_mm,
+            labels_store,
+            component_counts,
+            slice_bboxes,
+            slice_areas if collect_stats else None,
+            known_slice_any=known_slice_any,
+            preferred_block_slices=int(topology_slab_slices()),
+        )
+    else:
+        gpu_stage_a_done, gpu_stage_a_pair_codes = False, None
     if not gpu_stage_a_done:
         parallel_for_indices_chunked(
             int(z_dim),
@@ -23980,6 +24231,20 @@ def fused_final_native_sparse_cpu_enabled() -> bool:
     return _env_flag('YOLO_TTA_FUSED_FINAL_NATIVE_SPARSE_CPU', True)
 
 
+def fused_final_native_sparse_dense_pretouch_enabled() -> bool:
+    """Materialize every dense destination page while the sparse final union is built.
+
+    ``np.zeros`` leaves untouched anonymous pages mapped to the shared kernel zero page.
+    A sparse bbox-only union otherwise defers most of the 16+ GiB page-fault/NUMA placement
+    cost to the next dense CUDA consumer (notably keep_objects slice labeling), where
+    pageable H2D staging turns it into long idle gaps. First-touching each owned output-z
+    plane here preserves the same zero value, distributes placement across the union pool,
+    and makes later dense scans DMA-ready. Set
+    YOLO_TTA_FUSED_FINAL_NATIVE_SPARSE_DENSE_PRETOUCH=0 only for regression comparison.
+    """
+    return _env_flag('YOLO_TTA_FUSED_FINAL_NATIVE_SPARSE_DENSE_PRETOUCH', True)
+
+
 def fused_final_native_sparse_cpu_workers(requested_workers: int, out_t: int) -> int:
     """Worker count for native source-space sparse final union."""
     default = max(
@@ -24378,9 +24643,10 @@ def assemble_view_volumes_and_projected_layers_fused(
             """Directly OR output-native contributors with source-z CPU parallelism.
 
             This is the D1 fast-bundle terminal case: every cvol is already in final
-            source geometry, so there is no restore kernel for a GPU to accelerate. The
-            destination was freshly zero-initialized by assemble_current_view_union_volume;
-            one worker owns each z slice and writes only the foreground bbox crops.
+            source geometry, so there is no restore kernel for a GPU to accelerate. One
+            worker owns each z slice, explicitly first-touches its dense zero plane, then
+            writes only the foreground bbox crops. The dense first-touch prevents the next
+            CUDA consumer from inheriting millions of anonymous zero-page faults.
             """
             if not fused_final_native_sparse_cpu_enabled():
                 return False
@@ -24401,6 +24667,8 @@ def assemble_view_volumes_and_projected_layers_fused(
             active_source_ids_by_z: List[List[int]] = [
                 [] for _ in range(int(out_t))
             ]
+            union_slice_any = np.zeros((int(out_t),), dtype=bool)
+            union_slice_bboxes = np.zeros((int(out_t), 4), dtype=np.int64)
             payload_bytes = 0
             nonempty_layer_slices = 0
             for ref, src in direct_projected:
@@ -24423,20 +24691,45 @@ def assemble_view_volumes_and_projected_layers_fused(
                     dtype=np.uint64,
                 ))
                 for z_idx in active_zs:
-                    active_source_ids_by_z[int(z_idx)].append(int(source_id))
+                    z_i = int(z_idx)
+                    active_source_ids_by_z[z_i].append(int(source_id))
+                    rec = src.index[z_i]
+                    y0 = int(rec['y0']); y1 = int(rec['y1'])
+                    x0 = int(rec['x0']); x1 = int(rec['x1'])
+                    if not bool(union_slice_any[z_i]):
+                        union_slice_any[z_i] = True
+                        union_slice_bboxes[z_i] = np.asarray(
+                            (int(y0), int(y1), int(x0), int(x1)), dtype=np.int64,
+                        )
+                    else:
+                        union_slice_bboxes[z_i, 0] = min(
+                            int(union_slice_bboxes[z_i, 0]), int(y0),
+                        )
+                        union_slice_bboxes[z_i, 1] = max(
+                            int(union_slice_bboxes[z_i, 1]), int(y1),
+                        )
+                        union_slice_bboxes[z_i, 2] = min(
+                            int(union_slice_bboxes[z_i, 2]), int(x0),
+                        )
+                        union_slice_bboxes[z_i, 3] = max(
+                            int(union_slice_bboxes[z_i, 3]), int(x1),
+                        )
 
             active_source_ids = [tuple(ids) for ids in active_source_ids_by_z]
+            metadata_requires_exact_scan = bool(native_views or generic_sources)
             worker_count = fused_final_native_sparse_cpu_workers(int(workers), int(out_t))
             band_slices = fused_final_native_sparse_band_slices(
                 int(worker_count), int(out_t),
             )
             logical_bytes = int(out_t) * int(out_h) * int(out_w)
+            dense_pretouch = bool(fused_final_native_sparse_dense_pretouch_enabled())
             print(
-                'v16.1.6 native sparse final union selected: '
+                'v16.1.7 native sparse final union selected: '
                 f'{len(direct_projected)} source-space layer(s) '
                 f'({len(raw_sources)} raw-bbox, {len(generic_sources)} generic), '
                 f'{len(native_views)} dense native view(s), workers={int(worker_count)}, '
-                f'z_band={int(band_slices)}, payload={int(payload_bytes) / GIB:.2f} GiB. '
+                f'z_band={int(band_slices)}, payload={int(payload_bytes) / GIB:.2f} GiB, '
+                f'dense_pretouch={"on" if dense_pretouch else "off"}. '
                 'The GPU lane path is bypassed because there is no restore/resample work.',
                 flush=True,
             )
@@ -24445,10 +24738,21 @@ def assemble_view_volumes_and_projected_layers_fused(
             telemetry.gauge('final_union.native_sparse_cpu.raw_bbox_layers', int(len(raw_sources)))
             telemetry.gauge('final_union.native_sparse_cpu.payload_bytes', int(payload_bytes))
             telemetry.gauge('final_union.native_sparse_cpu.workers', int(worker_count))
+            telemetry.gauge('final_union.native_sparse_cpu.dense_pretouch', bool(dense_pretouch))
+            telemetry.gauge(
+                'final_union.native_sparse_cpu.dense_pretouch_bytes',
+                int(logical_bytes) if bool(dense_pretouch) else 0,
+            )
 
             def _merge_source_z(z_idx: int) -> None:
                 z_i = int(z_idx)
                 dst = np.asarray(final_union_mm[z_i])
+                if bool(dense_pretouch):
+                    # The destination is newly allocated and this z plane has exactly one
+                    # owner. Writing the logical zeros now commits/places every page in one
+                    # parallel pass instead of making CUDA pageable-copy staging fault them
+                    # serially during keep_objects or final output generation.
+                    dst.fill(np.uint8(0))
                 # Dense native contributors are uncommon in D1 mode, but retaining them
                 # makes this specialization exact for mixed output-native callers too.
                 for _view_name, volume in native_views:
@@ -24465,6 +24769,20 @@ def assemble_view_volumes_and_projected_layers_fused(
                     np.bitwise_or(dst_window, crop, out=dst_window)
                 for _ref, src in generic_sources:
                     _or_native_source_slice(dst, src, z_i)
+                if bool(metadata_requires_exact_scan):
+                    # Dense/generic contributors do not expose trustworthy per-z bboxes.
+                    # The destination is already hot in this worker, so capture its exact
+                    # support now rather than forcing keep_objects to rescan the full volume.
+                    x0, y0, bw, bh = (int(v) for v in cv2.boundingRect(dst))
+                    if int(bw) <= 0 or int(bh) <= 0:
+                        union_slice_any[z_i] = False
+                        union_slice_bboxes[z_i] = np.int64(0)
+                    else:
+                        union_slice_any[z_i] = True
+                        union_slice_bboxes[z_i] = np.asarray(
+                            (int(y0), int(y0 + bh), int(x0), int(x0 + bw)),
+                            dtype=np.int64,
+                        )
 
             started = time.perf_counter()
             with telemetry.span(
@@ -24474,7 +24792,7 @@ def assemble_view_volumes_and_projected_layers_fused(
             ):
                 with tqdm(
                     total=int(out_t),
-                    desc='v16.1.6 native sparse final union',
+                    desc='v16.1.7 native sparse final union',
                 ) as pbar:
                     for band0 in range(0, int(out_t), int(band_slices)):
                         band1 = min(int(out_t), int(band0) + int(band_slices))
@@ -24487,21 +24805,45 @@ def assemble_view_volumes_and_projected_layers_fused(
                             int(band_count),
                             _merge_band_z,
                             max_workers=min(int(worker_count), int(band_count)),
-                            desc='v16.1.6 native sparse final union band',
+                            desc='v16.1.7 native sparse final union band',
                             show_progress=False,
                             target_chunks_per_worker=2,
                         )
                         pbar.update(int(band_count))
             elapsed = max(1e-9, time.perf_counter() - started)
+            metadata = register_binary_volume_slice_metadata(
+                final_union_mm,
+                union_slice_any,
+                union_slice_bboxes,
+                source=(
+                    'v16.1.7 native sparse final union exact destination scan'
+                    if bool(metadata_requires_exact_scan)
+                    else 'v16.1.7 native sparse cvol index union'
+                ),
+                exact=bool(metadata_requires_exact_scan),
+            )
+            nonempty_slices, bbox_pixels, bbox_fraction = binary_slice_bbox_coverage(
+                output_shape,
+                metadata.slice_any,
+                metadata.slice_bboxes,
+            )
             print(
-                'v16.1.6 native sparse final union completed in '
+                'v16.1.7 native sparse final union completed in '
                 f'{elapsed:.3f}s; sparse payload={int(payload_bytes) / GIB:.2f} GiB, '
                 f'logical destination={int(logical_bytes) / GIB:.2f} GiB, '
                 f'payload throughput={int(payload_bytes) / GIB / elapsed:.2f} GiB/s, '
-                f'nonempty layer-slices={int(nonempty_layer_slices)}.',
+                f'nonempty layer-slices={int(nonempty_layer_slices)}, '
+                f'union support={int(nonempty_slices)}/{int(out_t)} z slice(s), '
+                f'bbox coverage={100.0 * float(bbox_fraction):.2f}% '
+                f'({int(bbox_pixels) / GIB:.2f} Gpixel-equivalent), '
+                f'dense_pretouch={"on" if dense_pretouch else "off"} '
+                f'({int(logical_bytes) / GIB:.2f} GiB committed in the same z pass).',
                 flush=True,
             )
             telemetry.gauge('final_union.native_sparse_cpu.seconds', float(elapsed))
+            telemetry.gauge('final_union.native_sparse_cpu.support_nonempty_slices', int(nonempty_slices))
+            telemetry.gauge('final_union.native_sparse_cpu.support_bbox_pixels', int(bbox_pixels))
+            telemetry.gauge('final_union.native_sparse_cpu.support_bbox_fraction', float(bbox_fraction))
             return True
 
         def _try_gpu_final_fusion() -> bool:
@@ -25116,7 +25458,7 @@ def assemble_current_view_union_volume(
     
     Multiple model entries are rejected; the destination uses source geometry when requested."""
     if len(view_volumes_by_model) != 1:
-        raise ValueError('GPT-5.6-Sol-Pro v16.1.6 supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.1.7 supports exactly one --model; multiple-model inference has been removed')
 
     union_shape = (int(T), int(H), int(W)) if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
     model_name = next(iter(view_volumes_by_model.keys()))
@@ -25234,18 +25576,48 @@ def apply_keep_largest_objects_inplace(
     # is applied through per-slice local->keep LUTs restricted to each slice's foreground bbox,
     # and slices whose components are all kept are never touched.
     comp_stats: Dict[str, object] = {}
-    labels_mm, num_objects, label_paths = label_foreground_volume_streaming(
-        mask_mm,
-        work_dir / 'final_keep_objects',
-        prefer_memory=bool(prefer_memory),
-        reserve_bytes=int(reserve_bytes),
-        workers=int(workers),
-        compact_relabel=False,
-        component_stats_out=comp_stats,
-        # also covers the prioritized --keep_objects 1 tail: the same local-label
-        # arena and direct packed-LUT apply avoid rebuilding a second dense host cube.
-        sparse_local_labels=True,
-    )
+    with nrrd_foreground_topology_priority('keep_objects slice labeling'):
+        metadata_started = time.perf_counter()
+        support_metadata = binary_volume_slice_metadata(mask_mm)
+        if support_metadata is None:
+            support_metadata = scan_binary_volume_slice_metadata(
+                mask_mm,
+                workers=min(max(1, int(workers)), max(1, int(_cpu_count()))),
+                source='v16.1.7 keep_objects exact fallback scan',
+            )
+        metadata_seconds = float(time.perf_counter() - metadata_started)
+        support_nonempty, support_bbox_pixels, support_bbox_fraction = binary_slice_bbox_coverage(
+            shape_tyx,
+            support_metadata.slice_any,
+            support_metadata.slice_bboxes,
+        )
+        print(
+            'v16.1.7 keep_objects slice metadata: '
+            f'source={support_metadata.source}, exact={bool(support_metadata.exact)}, '
+            f'nonempty_z={int(support_nonempty)}/{int(shape_tyx[0])}, '
+            f'bbox_coverage={100.0 * float(support_bbox_fraction):.2f}% '
+            f'({int(support_bbox_pixels) / GIB:.2f} GiPixels), '
+            f'prepare={float(metadata_seconds):.3f}s.',
+            flush=True,
+        )
+        labels_mm, num_objects, label_paths = label_foreground_volume_streaming(
+            mask_mm,
+            work_dir / 'final_keep_objects',
+            prefer_memory=bool(prefer_memory),
+            reserve_bytes=int(reserve_bytes),
+            workers=int(workers),
+            compact_relabel=False,
+            component_stats_out=comp_stats,
+            known_slice_any=support_metadata.slice_any,
+            known_slice_bboxes=support_metadata.slice_bboxes,
+            # also covers the prioritized --keep_objects 1 tail: the same local-label
+            # arena and direct packed-LUT apply avoid rebuilding a second dense host cube.
+            sparse_local_labels=True,
+            prefer_crop_bounded_cpu_labeling=True,
+        )
+    # The keep pass may mutate foreground below; do not let any later consumer reuse the
+    # pre-keep support description. This is harmless when no removal is required.
+    discard_binary_volume_slice_metadata(mask_mm)
 
     if int(num_objects) <= keep_n:
         total_seconds = float(time.perf_counter() - keep_started)
@@ -25277,6 +25649,7 @@ def apply_keep_largest_objects_inplace(
             'root_expansion_seconds': float(topology_times.get('root_expansion', 0.0)),
             'area_reduction_seconds': float(topology_times.get('area_reduction', 0.0)),
             'topology_seconds': float(topology_times.get('topology_total', 0.0)),
+            'metadata_seconds': float(metadata_seconds),
             'decision_seconds': 0.0,
             'lut_seconds': 0.0,
             'apply_seconds': 0.0,
@@ -25417,6 +25790,7 @@ def apply_keep_largest_objects_inplace(
         'root_expansion_seconds': float(topology_times.get('root_expansion', 0.0)),
         'area_reduction_seconds': float(topology_times.get('area_reduction', 0.0)),
         'topology_seconds': float(topology_times.get('topology_total', 0.0)),
+        'metadata_seconds': float(metadata_seconds),
         'decision_seconds': float(decision_seconds),
         'lut_seconds': float(keep_lut_seconds),
         'apply_seconds': float(apply_seconds),
@@ -25456,6 +25830,7 @@ def assemble_final_union_after_view_union(
 
     if bool(enable_3d_void_fill):
         print('\n=== Optional 3D void fill after final global union ===')
+        discard_binary_volume_slice_metadata(final_union_mm)
         final_void_dir = temp_dir / 'final_global_void_fill'
         final_void_dir.mkdir(parents=True, exist_ok=True)
         fill_3d_voids_inplace_streaming(
@@ -31057,6 +31432,7 @@ class RawBBoxMaskStore:
         slices_per_member = max(1, int(member_bytes) // max(1, int(slice_bytes)))
 
         for first_z in range(int(z0), int(z1), int(slices_per_member)):
+            _nrrd_background_nonzero_checkpoint()
             last_z_exclusive = min(int(z1), int(first_z) + int(slices_per_member))
             ln = int(last_z_exclusive - first_z) * int(slice_bytes)
             candidates: List[int] = []
@@ -31124,6 +31500,7 @@ class RawBBoxMaskStore:
         slices_per_member = max(1, int(member_bytes) // max(1, int(slice_bytes)))
 
         for first_z in range(int(z0), int(z1), int(slices_per_member)):
+            _nrrd_background_nonzero_checkpoint()
             last_z_exclusive = min(int(z1), int(first_z) + int(slices_per_member))
             raw_len = int(last_z_exclusive - first_z) * int(slice_bytes)
             source_lists: List[Tuple[int, List[int]]] = []
@@ -35779,6 +36156,81 @@ def nrrd_member_gzip_window_bytes() -> int:
     return max(64, _env_int('YOLO_TTA_NRRD_MEMBER_GZIP_WINDOW_MIB', 512)) * 1024 * 1024
 
 
+_NRRD_BACKGROUND_NONZERO_RUN_EVENT = threading.Event()
+_NRRD_BACKGROUND_NONZERO_RUN_EVENT.set()
+_NRRD_FOREGROUND_PRIORITY_LOCK = threading.Lock()
+_NRRD_FOREGROUND_PRIORITY_DEPTH = 0
+
+
+def nrrd_yield_to_topology_enabled() -> bool:
+    """Let final topology briefly preempt new component-NRRD decode/deflate work."""
+    return _env_flag('YOLO_TTA_NRRD_YIELD_TO_TOPOLOGY', True)
+
+
+def _nrrd_background_nonzero_checkpoint() -> None:
+    """Block new nonzero NRRD members while a foreground topology phase owns priority."""
+    if not nrrd_yield_to_topology_enabled():
+        return
+    _NRRD_BACKGROUND_NONZERO_RUN_EVENT.wait()
+
+
+@contextlib.contextmanager
+def nrrd_foreground_topology_priority(label: str) -> Iterator[None]:
+    """Quiesce new component-NRRD nonzero members around a latency-critical topology scan.
+
+    Already submitted native compressor calls and ordered file writes are allowed to drain;
+    active layer writers stop at their next slice-aligned member boundary. This avoids the
+    v16.1.6 state where twelve multi-GiB cvol readers/deflaters made the four-GPU
+    keep_objects label phase last as long as the remaining NRRD queue. The pause is nested,
+    exception-safe, and skipped when no layer write is pending.
+    """
+    global _NRRD_FOREGROUND_PRIORITY_DEPTH
+    if not nrrd_yield_to_topology_enabled():
+        yield
+        return
+
+    pending = 0
+    sink = globals().get('_NRRD_LAYER_SINK')
+    if sink is not None:
+        try:
+            completed, total = sink.progress_counts()
+            pending = max(0, int(total) - int(completed))
+        except Exception:
+            pending = 0
+    if int(pending) <= 0:
+        yield
+        return
+
+    announce = False
+    with _NRRD_FOREGROUND_PRIORITY_LOCK:
+        _NRRD_FOREGROUND_PRIORITY_DEPTH += 1
+        if int(_NRRD_FOREGROUND_PRIORITY_DEPTH) == 1:
+            _NRRD_BACKGROUND_NONZERO_RUN_EVENT.clear()
+            announce = True
+    if announce:
+        print(
+            f'v16.1.7 foreground topology priority: pausing new nonzero component-NRRD '
+            f'members at slice boundaries during {label} ({int(pending)} write(s) pending; '
+            'YOLO_TTA_NRRD_YIELD_TO_TOPOLOGY=0 disables).',
+            flush=True,
+        )
+    try:
+        yield
+    finally:
+        release = False
+        with _NRRD_FOREGROUND_PRIORITY_LOCK:
+            _NRRD_FOREGROUND_PRIORITY_DEPTH = max(0, int(_NRRD_FOREGROUND_PRIORITY_DEPTH) - 1)
+            if int(_NRRD_FOREGROUND_PRIORITY_DEPTH) == 0:
+                _NRRD_BACKGROUND_NONZERO_RUN_EVENT.set()
+                release = True
+        if release:
+            print(
+                f'v16.1.7 foreground topology priority released after {label}; '
+                'component-NRRD streaming resumed.',
+                flush=True,
+            )
+
+
 class _MemberParallelGzipPayloadWriter:
     """File-like gzip encoder emitting one independent gzip member per chunk, pipelined.
 
@@ -35834,6 +36286,7 @@ class _MemberParallelGzipPayloadWriter:
         self._completed[seq] = (member, 0)
 
     def _enqueue_chunk(self, chunk_mv: memoryview) -> None:
+        _nrrd_background_nonzero_checkpoint()
         seq = int(self._next_sequence)
         self._next_sequence += 1
         payload = bytes(chunk_mv)  # detach once; classification no longer adds a NumPy scan
@@ -35850,6 +36303,7 @@ class _MemberParallelGzipPayloadWriter:
  The Future retains ``mv`` (and therefore its NumPy exporter) until native DEFLATE
  finishes. This removes the former 8--16 MiB ``bytes`` detachment copy for every
  sparse cvol member while preserving the ordinary write buffer-reuse contract."""
+        _nrrd_background_nonzero_checkpoint()
         mv = owner if isinstance(owner, memoryview) else memoryview(owner)  # type: ignore[arg-type]
         mv = mv.cast('B')
         seq = int(self._next_sequence)
@@ -39348,10 +39802,10 @@ def main() -> None:
     args = build_argparser().parse_args()
     channel_format = resolve_channel_format(args.channel_format)
     print(
-        '[v16.1.6] integrated fixes active: native source-space sparse final union, '
-        'header-free D1 NVRTC preflight, geometry-safe fast-bundle initialization, '
-        'bounded memfd direct-union window, sparse cvol retirement, persistent TensorRT '
-        'contexts, and parallel atomic outputs.'
+        '[v16.1.7] integrated fixes active: dense-prefaulted native sparse final union, '
+        'foreground-topology NRRD priority, header-free D1 NVRTC preflight, geometry-safe '
+        'fast-bundle initialization, bounded memfd direct-union window, sparse cvol '
+        'retirement, persistent TensorRT contexts, and parallel atomic outputs.'
     )
     print(
         f'Model input channel format: {channel_format.token} '
@@ -39368,7 +39822,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('GPT-5.6-Sol-Pro v16.1.6 accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.1.7 accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -39846,7 +40300,7 @@ def main() -> None:
         # D1 supersedes the 25-39 GiB host direct-union workspace entirely.
         gpu_worker_direct_union_active = False
         print(
-            'v16.1.6 fast bundle active: A3 canonical Radial source sampling, B1 sparse '
+            'v16.1.7 fast bundle active: A3 canonical Radial source sampling, B1 sparse '
             'slice metadata, D3 resident-proto closing, C1 runtime-sized leases, C2 '
             'compute/publication credit separation, C3 predicted-cost scheduling, and D1 '
             'project -> infer -> proto-close -> immediate owner-GPU backprojection -> '
@@ -39855,13 +40309,13 @@ def main() -> None:
         )
     elif v1613_bundle_active:
         print(
-            'v16.1.6 fast bundle active with D1 disabled by '
+            'v16.1.7 fast bundle active with D1 disabled by '
             'YOLO_TTA_V1613_D1_OWNER_PIPELINE=0 or YOLO_TTA_V1613_D1_PIPELINE=0: '
             'A3/B1/D3 and C1-C3 remain active; the dense direct-union compatibility path is retained.'
         )
     elif v1613_fast_bundle_requested():
         print(
-            'v16.1.6 fast bundle not eligible for this command; compatibility paths retained: '
+            'v16.1.7 fast bundle not eligible for this command; compatibility paths retained: '
             + '; '.join(v1613_bundle_reasons)
         )
     if gpu_worker_direct_union_active:
@@ -44077,6 +44531,8 @@ def main() -> None:
         projected_layer_refs=fused_projected_layer_refs,
     )
 
+    if int(args.centerline_filter_passes) > 0:
+        discard_binary_volume_slice_metadata(final_union_mm)
     centerline_filter_stats: Dict[str, object] = apply_v14_centerline_filter_inplace(
         final_union_mm,
         model_name=str(model_name), temp_dir=temp_dir,
@@ -44135,6 +44591,7 @@ def main() -> None:
     gaussian_smoothing_stats: Optional[Dict[str, object]] = None
     if bool(gaussian_smoothing_enabled):
         print('\n=== Applying Gaussian smoothing ===')
+        discard_binary_volume_slice_metadata(final_union_mm)
         gaussian_smoothing_stats = apply_gaussian_smoothing_inplace(
             final_union_mm,
             sigma=float(gaussian_smoothing_sigma),
@@ -44508,7 +44965,7 @@ def main() -> None:
 
 
 
-# v16.1.6 retains the v16.1.3 production bundle and bypasses degenerate GPU staging for output-native sparse final unions.
+# v16.1.7 retains the production bundle, materializes sparse-union destination pages in parallel, and gives final topology brief priority over background NRRD producers.
 # The heuristic global monkeypatch framework used by v16.0.8 was removed because it
 # could replace unrelated functions by name and shadow the real fused-union implementation.
 
