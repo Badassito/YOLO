@@ -61,8 +61,8 @@ import numpy as np
 
 GIB = 1024 ** 3
 NRRD_SPACE = "left-posterior-superior"
-SCRIPT_VERSION = '16.1.8'
-SCRIPT_VERSION_COMPACT = '1618'
+SCRIPT_VERSION = '16.2.0'
+SCRIPT_VERSION_COMPACT = '1620'
 SCRIPT_BASENAME = f'GPT-5.6-Sol-Pro_v{SCRIPT_VERSION}_SLURM.py'
 OUTPUT_NRRD_PREFIX = ''
 LEGACY_OUTPUT_NRRD_PREFIX = 'HW_'
@@ -174,6 +174,34 @@ def _parse_token_list(values: Sequence[str] | str | None) -> List[str]:
             continue
         parts.extend([p for p in re.split(r"[,\s]+", raw) if p])
     return parts
+
+
+SAVE_OPTION_TOKENS: Tuple[str, ...] = (
+    'images',
+    'labels',
+    'binary',
+    'low_quality',
+    'nrrd',
+    'voxel_volume',
+    'high_quality',
+    'summary',
+)
+
+
+def resolve_save_options(values: Sequence[str] | str | None) -> List[str]:
+    """Validate and canonicalize the unified ``--save`` output selection."""
+    valid = set(SAVE_OPTION_TOKENS)
+    resolved: List[str] = []
+    for raw in _parse_token_list(values):
+        token = str(raw).strip().lower()
+        if token not in valid:
+            expected = ', '.join(SAVE_OPTION_TOKENS)
+            raise ValueError(
+                f'--save values must be one or more of: {expected}; got {raw!r}'
+            )
+        if token not in resolved:
+            resolved.append(token)
+    return resolved
 
 
 CARTESIAN_VIEW_TOKENS: Tuple[str, ...] = ('transverse', 'sagittal', 'coronal')
@@ -517,17 +545,34 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--tile_stride", nargs="+", default=["0"], type=str,
                    help="One or more dense-tile strides in source pixels. Values are index-paired with --tile_size; one stride broadcasts to every tile size. Each stride must be <= its paired tile size")
 
-    p.add_argument("--save_images", action="store_true", help="Save unlabeled image sequences for all active views")
-    p.add_argument("--save_labels", nargs="?", const="__DEFAULT__", default=None, type=str,
-                   help="Save final YOLO segmentation labels per frame. Optional custom pattern, e.g. labels/{Filename}_%%04d.txt")
-    p.add_argument("--save_binary", nargs="?", const="__DEFAULT__", default=None, type=str,
-                   help="Save final binary masks as a TIFF sequence plus an FFV1 MKV. Optional custom TIFF pattern, e.g. binary_masks/{Filename}_Binary_%%04d.tiff")
-    p.add_argument("--save_nrrd", action="store_true", help="Save the decomposition as one single-layer 3D Slicer segmentation NRRD (.seg.nrrd, X,Y,t axes) per component layer in nrrd/, plus a manifest JSON. Each file imports into Slicer as a segmentation named after the file with a deterministic per-layer color. Layers are written during the intermediate pipeline steps")
-    p.add_argument("--save_low_quality", action="store_true",
-                   help="Save additional isotropically downsampled low-quality presentation videos (libx264, preset slow, yuv420p). When --save_nrrd is also enabled, the low-quality NRRD decomposition follows the full-quality format: one downbinned single-layer Slicer segmentation NRRD (.seg.nrrd) per component layer under low_quality/<token>/nrrd/, sharing the full-quality layer's segment name and color and written as each view completes")
-    p.add_argument("--save_low_quality_downbin", nargs="+", default=None, type=str,
-                   help="One or more isotropic low-quality downbins. Floats scale each X/Y/t dimension, e.g. 0.5. Integers scale the largest dimension to that value. Providing this flag implies --save_low_quality")
-    p.add_argument("--voxel_volume", action="store_true", help="Count white voxels in the final binary output after restoration to native input geometry and save the value to the summary text file")
+    p.add_argument(
+        "--save",
+        nargs="+",
+        default=None,
+        type=str,
+        metavar="OUTPUT",
+        help=(
+            "Save one or more output groups: images (active-view PNG sequences), labels "
+            "(final YOLO segmentation labels), binary (final TIFF sequence plus FFV1 MKV), "
+            "low_quality (isotropically downsampled overlay and binary videos), nrrd "
+            "(single-layer Slicer decomposition plus manifest), voxel_volume (native-space "
+            "white-voxel count for the summary), high_quality (native-resolution final overlay), "
+            "and summary (summary text file). Comma-separated, whitespace-separated, and mixed "
+            "forms are accepted. No output group is selected by default; existing output paths "
+            "and filenames are retained"
+        ),
+    )
+    p.add_argument(
+        "--low_quality_downbin",
+        nargs="+",
+        default=None,
+        type=str,
+        help=(
+            "One or more isotropic low-quality downbins. Floats scale each X/Y/t dimension, "
+            "e.g. 0.5. Integers scale the largest dimension to that value. Providing this flag "
+            "retains the prior behavior and implies --save low_quality"
+        ),
+    )
     p.add_argument("--enable_3d_void_fill", action="store_true",
                    help="Apply one final 3D enclosed-void fill after the global union. Disabled by default")
     p.add_argument("--centerline_filter_passes", default=0, type=int,
@@ -23989,7 +24034,7 @@ def backproject_tilted_volume_to_volume(
     base_view = tilted_base_view_name(tilted_view)
 
     if reduced_processing and out_shape_tyx is not None:
-        # Use the exact same terminal definition with and without --save_nrrd:
+        # Use the exact same terminal definition with and without --save nrrd:
         # reduced-view shear -> reduced orthogonal grid -> one orthogonal restore. Shear and
         # native-plane expansion do not commute at rounded stack boundaries, so expanding each
         # tilted frame first would make final masks depend on whether component NRRDs were saved.
@@ -24498,7 +24543,7 @@ def assemble_view_volume_from_projected_layers(
  The dense radial gather and the tilted shear scatter both commute exactly with union, and the
  view's final native volume is by construction the union of its component layers (cleaned
  full-frame YOLO mask, one bridge delta per interpolation pass, and any accepted-tile / tile
- bridge layers). OR-ing the ALREADY-projected --save_nrrd component layers therefore
+ bridge layers). OR-ing the ALREADY-projected --save nrrd component layers therefore
  reproduces the projected final volume bit-for-bit without a second full backprojection."""
     out_shape = tuple(int(v) for v in out_shape_tyx)
     vol_mm = allocate_workspace_array(
@@ -25637,7 +25682,7 @@ def assemble_current_view_union_volume(
     
     Multiple model entries are rejected; the destination uses source geometry when requested."""
     if len(view_volumes_by_model) != 1:
-        raise ValueError('GPT-5.6-Sol-Pro v16.1.8 supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError(f'GPT-5.6-Sol-Pro v{SCRIPT_VERSION} supports exactly one --model; multiple-model inference has been removed')
 
     union_shape = (int(T), int(H), int(W)) if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
     model_name = next(iter(view_volumes_by_model.keys()))
@@ -39083,9 +39128,9 @@ def resolve_low_quality_downbin_specs(
         try:
             value = float(raw_s)
         except Exception as exc:
-            raise ValueError(f'--save_low_quality_downbin value is not numeric: {raw_s!r}') from exc
+            raise ValueError(f'--low_quality_downbin value is not numeric: {raw_s!r}') from exc
         if not math.isfinite(value) or value <= 0.0:
-            raise ValueError('--save_low_quality_downbin values must be positive finite numbers')
+            raise ValueError('--low_quality_downbin values must be positive finite numbers')
 
         warning = ''
         raw_lower = raw_s.lower()
@@ -39095,13 +39140,13 @@ def resolve_low_quality_downbin_specs(
         else:
             nearest_int = int(round(value))
             if abs(float(value) - float(nearest_int)) > 1e-6:
-                raise ValueError('Integer --save_low_quality_downbin values >= 1 must be whole numbers; use a fraction such as 0.5 for scale factors')
+                raise ValueError('Integer --low_quality_downbin values >= 1 must be whole numbers; use a fraction such as 0.5 for scale factors')
             if nearest_int <= 0:
-                raise ValueError('--save_low_quality_downbin integer targets must be positive')
+                raise ValueError('--low_quality_downbin integer targets must be positive')
             rounded_target = _nearest_multiple_of_four(float(nearest_int))
             if int(rounded_target) != int(nearest_int):
                 warning = (
-                    f'--save_low_quality_downbin {int(nearest_int)} is not a multiple of 4; '
+                    f'--low_quality_downbin {int(nearest_int)} is not a multiple of 4; '
                     f'rounded to {int(rounded_target)} for isotropic low-quality output.'
                 )
                 warnings.append(warning)
@@ -39735,6 +39780,7 @@ def collect_pipeline_output_futures(
     out_dir: Path,
     stem: str,
     fps: float,
+    save_high_quality: bool,
     save_binary_pattern_value: Optional[str],
     save_labels_pattern_value: Optional[str],
     tag: Optional[str] = None,
@@ -39746,18 +39792,19 @@ def collect_pipeline_output_futures(
     result_paths: Dict[str, Path] = {}
     tag_suffix = f"_{tag}" if tag else ""
 
-    overlay_path = out_dir / f"{stem}_Overlay{tag_suffix}.mkv"
-    futures.append(executor.submit(
-        write_overlay_video,
-        volume_rgb,
-        mask_u8,
-        overlay_path,
-        fps,
-        show_progress=show_progress,
-        scratch_dir=nrrd_temp_dir,
-        publication_root=out_dir,
-    ))
-    result_paths["overlay"] = overlay_path
+    if bool(save_high_quality):
+        overlay_path = out_dir / f"{stem}_Overlay{tag_suffix}.mkv"
+        futures.append(executor.submit(
+            write_overlay_video,
+            volume_rgb,
+            mask_u8,
+            overlay_path,
+            fps,
+            show_progress=show_progress,
+            scratch_dir=nrrd_temp_dir,
+            publication_root=out_dir,
+        ))
+        result_paths["overlay"] = overlay_path
 
     labels_pattern = _resolve_output_pattern(save_labels_pattern_value, DEFAULT_LABEL_PATTERN, out_dir, stem)
     if labels_pattern is not None:
@@ -39981,10 +40028,27 @@ def write_summary_file(
 
 def main() -> None:
     initialize_runtime_observability()
-    args = build_argparser().parse_args()
+    parser = build_argparser()
+    args = parser.parse_args()
+    try:
+        save_options = resolve_save_options(args.save)
+    except ValueError as exc:
+        parser.error(str(exc))
+    save_option_set = set(save_options)
+    save_images_enabled = 'images' in save_option_set
+    save_labels_enabled = 'labels' in save_option_set
+    save_binary_enabled = 'binary' in save_option_set
+    save_low_quality_enabled = 'low_quality' in save_option_set
+    save_nrrd_enabled = 'nrrd' in save_option_set
+    save_voxel_volume_enabled = 'voxel_volume' in save_option_set
+    save_high_quality_enabled = 'high_quality' in save_option_set
+    save_summary_enabled = 'summary' in save_option_set
     channel_format = resolve_channel_format(args.channel_format)
     print(
-        '[v16.1.8] integrated fixes active: hardware-linear Radial texture sampling by '
+        '[v16.2.0] unified save selection active: --save accepts images, labels, binary, '
+        'low_quality, nrrd, voxel_volume, high_quality, and summary; '
+        '--low_quality_downbin replaces the legacy downbin flag. The retained v16.1.8 '
+        'runtime set includes hardware-linear Radial texture sampling by '
         'default, bilinear in-plane Tilted forward inputs (exact nearest mask '
         'backprojection retained), retried/loud-failing ffmpeg launches, plus the v16.1.7 '
         'set: dense-prefaulted native sparse final union, foreground-topology NRRD '
@@ -39999,6 +40063,12 @@ def main() -> None:
         'boundary=edge-clamp; result=center slice N only).'
     )
 
+    print(
+        'Save outputs: '
+        + (', '.join(save_options) if save_options else '<none>')
+        + ('; --low_quality_downbin implies low_quality' if args.low_quality_downbin is not None and not save_low_quality_enabled else '')
+    )
+
     input_path = Path(args.input).expanduser().resolve()
     if not input_path.exists():
         raise FileNotFoundError(input_path)
@@ -40007,7 +40077,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('GPT-5.6-Sol-Pro v16.1.8 accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.2.0 accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -40213,8 +40283,8 @@ def main() -> None:
         v1613_bundle_reasons.append('dense tiles are not yet eligible')
     if str(channel_format.kind) != 'gray' or int(channel_format.channel_count) != 1:
         v1613_bundle_reasons.append('requires one-channel gray input')
-    if not bool(args.save_nrrd):
-        v1613_bundle_reasons.append('requires --save_nrrd for per-view source-space layers')
+    if not bool(save_nrrd_enabled):
+        v1613_bundle_reasons.append('requires --save nrrd for per-view source-space layers')
     if not raw_bbox_nrrd_layers_enabled():
         v1613_bundle_reasons.append('requires raw-bbox/cvol NRRD layers')
     if not gpu_device_union_enabled():
@@ -40254,16 +40324,16 @@ def main() -> None:
         raise ValueError('--keep_objects must be >= 0')
     if not (-90.0 < float(args.interpolation_search_angle) < 90.0):
         raise ValueError('--interpolation_search_angle must be greater than -90 and less than 90')
-    low_quality_requested = bool(args.save_low_quality or args.save_low_quality_downbin is not None)
-    # NRRD component layers are produced only for --save_nrrd, so requesting only
+    low_quality_requested = bool(save_low_quality_enabled or args.low_quality_downbin is not None)
+    # NRRD component layers are produced only for --save nrrd, so requesting only
     # low-quality outputs writes the low-quality videos but no NRRD output.
-    # when both --save_nrrd and a low-quality request are active, the low-quality
+    # when both --save nrrd and a low-quality request are active, the low-quality
     # NRRD decomposition mirrors the full-quality layers (one downbinned single-layer NRRD per
     # component layer) on the same view-completion schedule, rather than one combined tail volume.
     # Keep these booleans separate. ``nrrd_layers_needed`` controls the established,
     # expensive per-view decomposition and projected-layer behavior. audit-only
     # runs need a sink but must not broaden any of those paths.
-    nrrd_layers_needed = bool(args.save_nrrd)
+    nrrd_layers_needed = bool(save_nrrd_enabled)
     centerline_audit_nrrd_needed = bool(centerline_filter_enabled)
     nrrd_sink_needed = bool(nrrd_layers_needed or centerline_audit_nrrd_needed)
     troubleshooting_outputs_enabled = bool(args.troubleshooting)
@@ -40304,16 +40374,16 @@ def main() -> None:
     fps = float(info['fps'])
 
     low_quality_downbin_specs, low_quality_downbin_warnings = resolve_low_quality_downbin_specs(
-        args.save_low_quality_downbin,
+        args.low_quality_downbin,
         bool(low_quality_requested),
         (input_T, input_H, input_W),
     )
 
-    # --save_nrrd writes one single-layer NRRD per component layer (in source output
+    # --save nrrd writes one single-layer NRRD per component layer (in source output
     # geometry X,Y,t) as the layers are produced during the intermediate pipeline steps. The sink
     # is configured here (output geometry is now known) and torn down in the tail after the final
     # global layers are materialized.
-    # when --save_low_quality is also active, the sink mirrors every component layer into
+    # when --save low_quality is also active, the sink mirrors every component layer into
     # one downbinned single-layer NRRD per spec under low_quality/<token>/nrrd/ on the same
     # view-completion schedule as the full-quality layers (the tail no longer writes a combined
     # low-quality NRRD).
@@ -40325,7 +40395,7 @@ def main() -> None:
     if bool(nrrd_sink_needed):
         sink_low_quality_specs = (
             list(low_quality_downbin_specs)
-            if bool(args.save_nrrd) and bool(low_quality_requested)
+            if bool(save_nrrd_enabled) and bool(low_quality_requested)
             else []
         )
         set_nrrd_layer_sink(NrrdLayerSink(
@@ -40630,6 +40700,16 @@ def main() -> None:
             'A worker that cannot admit the source volume to VRAM will still use the completed-cube CPU path.'
         )
     spec_notes: List[str] = []
+    effective_save_options = list(save_options)
+    if bool(low_quality_requested) and 'low_quality' not in effective_save_options:
+        effective_save_options.append('low_quality (implied by --low_quality_downbin)')
+    spec_notes.append(
+        'v16.2.0 unified output selection: --save=' + (
+            ', '.join(effective_save_options) if effective_save_options else '<none>'
+        ) + '. high_quality controls the native-resolution final overlay; summary controls the '
+        'summary text file; labels, binary, images, low_quality, and nrrd remain independently '
+        'selectable with their established paths and filenames.'
+    )
     if tilted_radial_concrete_views:
         spec_notes.append(
             'Concrete tilted-Radial views use the resident CUDA source '
@@ -40789,7 +40869,7 @@ def main() -> None:
         )
         spec_notes.append(
             'v13.2.1 (bug #2): each low-quality downbin is submitted as an independent background job whose '
-            'overlay and binary videos always run. When --save_nrrd is also enabled, the low-quality NRRD now '
+            'overlay and binary videos always run. When --save nrrd is also enabled, the low-quality NRRD now '
             'follows the full-quality format and schedule: one downbinned single-layer NRRD per component layer '
             'under low_quality/<token>/nrrd/, written by the NrrdLayerSink as each view completes (sharing the '
             'full-quality layer suffixes and a per-downbin manifest), replacing the single combined tail volume. '
@@ -40850,7 +40930,7 @@ def main() -> None:
             'Tilted shear backprojection. The sequential queue preserves the full CPU worker budget.'
         )
     spec_notes.append(
-        'v13.2.0 NRRD export (--save_nrrd) writes one single-layer 3-axis NRRD (X,Y,t) per component layer to '
+        'v13.2.0 NRRD export (--save nrrd) writes one single-layer 3-axis NRRD (X,Y,t) per component layer to '
         f'nrrd/, named {OUTPUT_NRRD_PREFIX}{{Filestem}}_{{ViewToken|Global}}_{{layer}}.seg.nrrd (model name dropped; v13.2.3 tags each file '
         'with the 3D Slicer segmentation header fields — segment named after the file, deterministic per-layer '
         'palette color). Layer families: full-frame '
@@ -40874,14 +40954,14 @@ def main() -> None:
         f'{OUTPUT_NRRD_PREFIX}{{Filestem}}_{{ViewToken}}_tile_bridge_pass<N> to match the per-pass consolidated tile bridge layers.'
     )
     spec_notes.append(
-        'CONFLICT NOTE 3 (low-quality NRRD form): spec --save_low_quality says "low bitrate output videos and '
+        'CONFLICT NOTE 3 (low-quality NRRD form): spec --save low_quality says "low bitrate output videos and '
         'NRRDs". v13.2.1 (bug #2) makes the low-quality NRRD follow the full-quality NRRD format and scheduling: '
         'one downbinned single-layer NRRD per component layer under low_quality/<token>/nrrd/, restored from the '
         'same NrrdLayerRef and written as each view completes, with a per-downbin manifest whose layer suffixes '
         'match the full-quality nrrd/ folder. This supersedes the v13.2.0 single combined volume. It remains gated '
-        'behind --save_nrrd (the decomposition is only meaningful when --save_nrrd is set). Suggested spec edit: '
+        'behind --save nrrd (the decomposition is only meaningful when --save nrrd is set). Suggested spec edit: '
         'state that low-quality NRRDs are emitted as one single-layer NRRD per component layer (downbinned) per '
-        '--save_low_quality_downbin spec, only when --save_nrrd is enabled.'
+        '--low_quality_downbin spec, only when --save nrrd is enabled.'
     )
     spec_notes.append(
         'Task #2.5 review (single-angle fast path / tqdm): YOLO -> flatten -> --min_conf -> warp -> --min_radius -> '
@@ -40922,12 +41002,19 @@ def main() -> None:
             '--troubleshooting active: writing FFV1 MKV overlays for each active full-frame native view and each available consolidated tiled prediction set; '
             'temporary scratch retention is not implied.'
         )
-    spec_notes.append(
-        f'v13.3.12 final FFV1 encode sharding: segments={int(ffv1_segment_count(int(input_T)))} '
-        '(YOLO_TTA_FFV1_SEGMENTS; automatic default min(6, ceil(allocated_cpus/32))). '
-        'Final overlay and requested binary MKVs encode contiguous t segments concurrently and '
-        'losslessly concat their FFV1 packets; value 1 restores one encoder.'
-    )
+    native_ffv1_outputs = []
+    if bool(save_high_quality_enabled):
+        native_ffv1_outputs.append('overlay')
+    if bool(save_binary_enabled):
+        native_ffv1_outputs.append('binary')
+    if native_ffv1_outputs:
+        spec_notes.append(
+            f'v13.3.12 final FFV1 encode sharding: segments={int(ffv1_segment_count(int(input_T)))} '
+            '(YOLO_TTA_FFV1_SEGMENTS; automatic default min(6, ceil(allocated_cpus/32))). '
+            f'Selected native-resolution {" and ".join(native_ffv1_outputs)} MKV output(s) encode '
+            'contiguous t segments concurrently and losslessly concat their FFV1 packets; value 1 '
+            'restores one encoder.'
+        )
     if bool(keep_temp_artifacts):
         spec_notes.append('YOLO_TTA_KEEP_TEMP=1 active: temporary scratch artifacts are retained independently of --troubleshooting.')
     if bool(gaussian_smoothing_enabled):
@@ -44872,28 +44959,33 @@ def main() -> None:
             resources=[],
         ))
 
-    print('\n=== Scheduling final outputs in background ===')
-    final_output_paths, final_futures = collect_pipeline_output_futures(
-        output_manager.executor,
-        volume_rgb=output_volume_rgb,
-        mask_u8=final_output_mask_mm,
-        out_dir=out_dir,
-        stem=input_path.stem,
-        fps=fps,
-        save_binary_pattern_value=args.save_binary,
-        save_labels_pattern_value=args.save_labels,
-        tag=None,
-        frame_workers=tail_output_frame_workers,
-        show_progress=False,
-        nrrd_temp_dir=temp_dir,
+    native_final_outputs_requested = bool(
+        save_high_quality_enabled or save_binary_enabled or save_labels_enabled
     )
-    final_paths.update(final_output_paths)
-    output_manager.submit(BackgroundOutputSubmission(
-        label='final outputs',
-        result_paths=final_output_paths,
-        futures=final_futures,
-        resources=[],
-    ))
+    if native_final_outputs_requested:
+        print('\n=== Scheduling selected native-resolution outputs in background ===')
+        final_output_paths, final_futures = collect_pipeline_output_futures(
+            output_manager.executor,
+            volume_rgb=output_volume_rgb,
+            mask_u8=final_output_mask_mm,
+            out_dir=out_dir,
+            stem=input_path.stem,
+            fps=fps,
+            save_high_quality=bool(save_high_quality_enabled),
+            save_binary_pattern_value='__DEFAULT__' if save_binary_enabled else None,
+            save_labels_pattern_value='__DEFAULT__' if save_labels_enabled else None,
+            tag=None,
+            frame_workers=tail_output_frame_workers,
+            show_progress=False,
+            nrrd_temp_dir=temp_dir,
+        )
+        final_paths.update(final_output_paths)
+        output_manager.submit(BackgroundOutputSubmission(
+            label='selected native-resolution outputs',
+            result_paths=final_output_paths,
+            futures=final_futures,
+            resources=[],
+        ))
 
     if bool(low_quality_requested):
         print('\n=== Scheduling low-quality isotropic outputs in background ===')
@@ -44918,7 +45010,7 @@ def main() -> None:
         ))
 
     voxel_volume = None
-    if bool(args.voxel_volume):
+    if bool(save_voxel_volume_enabled):
         voxel_counts = np.zeros((int(final_output_mask_mm.shape[0]),), dtype=np.int64)
 
         def _count_voxels(z: int) -> None:
@@ -44959,7 +45051,7 @@ def main() -> None:
         if nrrd_manifest_path is not None:
             final_paths['nrrd_manifest'] = nrrd_manifest_path
 
-    if bool(args.save_images):
+    if bool(save_images_enabled):
         print('\n=== Saving active-view image sequences ===')
         for view in views:
             image_dir = write_view_images(
@@ -44995,7 +45087,7 @@ def main() -> None:
             spec_notes.append(
                 f'Low-quality NRRD decomposition (v13.2.1, bug #2): {int(legacy_lq_nrrd_count)} legacy '
                 'downbinned single-layer NRRD file(s) written under low_quality/<token>/nrrd/, mirroring the '
-                'full-quality component layers per --save_low_quality_downbin spec and written on the same '
+                'full-quality component layers per --low_quality_downbin spec and written on the same '
                 f'view-completion schedule. Each downbin has its own {OUTPUT_NRRD_PREFIX}{{Filestem}}_nrrd_manifest.json with layer '
                 'suffixes matching the full-quality nrrd/ folder.'
             )
@@ -45012,38 +45104,41 @@ def main() -> None:
             'low-quality recomposition because max-pool downbinning does not commute with subtraction.'
         )
 
-    summary_path = write_summary_file(
-        out_dir / f'{input_path.stem}_Summary.txt',
-        command=shlex.join([str(x) for x in sys.argv]),
-        input_path=input_path,
-        out_dir=out_dir,
-        scratch_dir=temp_dir,
-        source_shape_x_y_t=(input_W, input_H, input_T),
-        volume_shape=(T, H, W),
-        fps=fps,
-        model_paths=model_paths,
-        view_names=[
-            (
-                f'{v.name} ({int(v.num_slices)} frames; centers {int(v.tilt_frame_start)}..{int(v.tilt_frame_stop)})'
-                if is_tilted_view(v)
-                else f'{v.name} ({int(v.num_slices)} frames)'
-            )
-            for v in views
-        ],
-        view_prediction_stats=view_prediction_stats,
-        interpolation_stats=interpolation_stats,
-        view_prediction_labels=view_prediction_labels,
-        enable_3d_void_fill=bool(args.enable_3d_void_fill),
-        gaussian_smoothing_stats=gaussian_smoothing_stats,
-        keep_objects_stats=keep_objects_stats,
-        voxel_volume=voxel_volume,
-        final_paths=final_paths,
-        augmentation_workers=augmentation_workers,
-        slice_postprocess_workers=slice_postprocess_workers,
-        interpolation_workers=interpolation_workers,
-        output_workers=tail_output_workers,
-        spec_notes=spec_notes,
-    )
+    summary_path: Optional[Path] = None
+    if bool(save_summary_enabled):
+        summary_path = write_summary_file(
+            out_dir / f'{input_path.stem}_Summary.txt',
+            command=shlex.join([str(x) for x in sys.argv]),
+            input_path=input_path,
+            out_dir=out_dir,
+            scratch_dir=temp_dir,
+            source_shape_x_y_t=(input_W, input_H, input_T),
+            volume_shape=(T, H, W),
+            fps=fps,
+            model_paths=model_paths,
+            view_names=[
+                (
+                    f'{v.name} ({int(v.num_slices)} frames; centers {int(v.tilt_frame_start)}..{int(v.tilt_frame_stop)})'
+                    if is_tilted_view(v)
+                    else f'{v.name} ({int(v.num_slices)} frames)'
+                )
+                for v in views
+            ],
+            view_prediction_stats=view_prediction_stats,
+            interpolation_stats=interpolation_stats,
+            view_prediction_labels=view_prediction_labels,
+            enable_3d_void_fill=bool(args.enable_3d_void_fill),
+            gaussian_smoothing_stats=gaussian_smoothing_stats,
+            keep_objects_stats=keep_objects_stats,
+            voxel_volume=voxel_volume,
+            final_paths=final_paths,
+            augmentation_workers=augmentation_workers,
+            slice_postprocess_workers=slice_postprocess_workers,
+            interpolation_workers=interpolation_workers,
+            output_workers=tail_output_workers,
+            spec_notes=spec_notes,
+        )
+
 
     if final_output_mask_mm is not final_union_mm:
         close_memmap_array(final_output_mask_mm)
@@ -45148,14 +45243,17 @@ def main() -> None:
     print('\nDone.')
     print(f'Output dir: {out_dir}')
     print(f'Scratch dir: {temp_dir}')
-    print(f"Final overlay: {final_paths['overlay']}")
-    print(f'Summary: {summary_path}')
+    if 'overlay' in final_paths:
+        print(f"Final overlay: {final_paths['overlay']}")
+    if summary_path is not None:
+        print(f'Summary: {summary_path}')
 
 
 
 
 # v16.1.7 retains the production bundle, materializes sparse-union destination pages in parallel, and gives final topology brief priority over background NRRD producers.
 # v16.1.8 defaults Radial sampling to the hardware-linear texture, adds bilinear in-plane Tilted forward inputs (mask backprojection stays nearest/exact), and retries transient ffmpeg launch failures before failing the pipeline loudly.
+# v16.2.0 unifies output selection under --save, makes native-resolution overlay and summary explicit, and renames --low_quality_downbin without changing output paths or filenames.
 # The heuristic global monkeypatch framework used by v16.0.8 was removed because it
 # could replace unrelated functions by name and shadow the real fused-union implementation.
 
