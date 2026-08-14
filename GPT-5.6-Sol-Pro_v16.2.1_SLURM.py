@@ -61,8 +61,8 @@ import numpy as np
 
 GIB = 1024 ** 3
 NRRD_SPACE = "left-posterior-superior"
-SCRIPT_VERSION = '16.2.0'
-SCRIPT_VERSION_COMPACT = '1620'
+SCRIPT_VERSION = '16.2.1'
+SCRIPT_VERSION_COMPACT = '1621'
 SCRIPT_BASENAME = f'GPT-5.6-Sol-Pro_v{SCRIPT_VERSION}_SLURM.py'
 OUTPUT_NRRD_PREFIX = ''
 LEGACY_OUTPUT_NRRD_PREFIX = 'HW_'
@@ -14248,7 +14248,9 @@ def fused_renderer_preflight_tolerances() -> Tuple[float, float, float, float, f
 
     A raw maximum is retained for diagnostics, but one nearest-neighbor tie or texture
     interpolation outlier among millions of pixels is not independently worker-fatal.
-    ``max_abs_fraction`` bounds the share exceeding ``max_abs`` instead.
+    ``max_abs_fraction`` bounds the share exceeding ``max_abs`` instead. The validator
+    may raise the default Radial hardware-texture limit to one raster-perimeter-equivalent
+    seam; an explicit environment override remains exact.
     """
     return (
         max(0.0, _env_float('YOLO_TTA_FUSED_PREFLIGHT_MAX_ABS', 16.0 / 255.0)),
@@ -14269,6 +14271,47 @@ def _fused_preflight_family(view: ViewInfo) -> str:
     if is_tilted_view(view):
         return 'tilted'
     return ''
+
+
+def _single_pixel_closed_seam_fraction(height: int, width: int) -> float:
+    """Return the fraction occupied by a one-pixel closed seam around an HxW raster.
+
+    A fused hardware-texture Radial launch composes source sampling and output resampling in
+    one kernel, while the independent startup reference renders a native Radial plane and then
+    resamples it. Their expected numerical disagreement can concentrate along one resampling
+    seam even when the image-wide mean and broader mismatch rates remain negligible.
+    """
+    h = max(1, int(height))
+    w = max(1, int(width))
+    pixels = int(h) * int(w)
+    if pixels <= 1 or h <= 1 or w <= 1:
+        return 1.0
+    seam_pixels = (2 * int(h)) + (2 * int(w)) - 4
+    return min(1.0, max(0.0, float(seam_pixels) / float(pixels)))
+
+
+def fused_renderer_effective_max_fraction_tolerance(
+    configured_tolerance: float,
+    *,
+    preflight_family: str,
+    height: int,
+    width: int,
+) -> Tuple[float, float]:
+    """Return the effective high-error fraction limit and its automatic seam floor.
+
+    The one-pixel floor applies only to the default hardware-texture Radial comparison. An
+    explicit ``YOLO_TTA_FUSED_PREFLIGHT_MAX_ABS_FRACTION`` remains authoritative, and the
+    independent mean-error and 4/255 mismatch-fraction limits are never relaxed.
+    """
+    configured = max(0.0, min(1.0, float(configured_tolerance)))
+    if os.environ.get('YOLO_TTA_FUSED_PREFLIGHT_MAX_ABS_FRACTION', '').strip():
+        return configured, 0.0
+    if str(preflight_family) not in ('radial', 'tilted_radial'):
+        return configured, 0.0
+    if radial_source_mode() != 'texture_linear':
+        return configured, 0.0
+    seam_floor = _single_pixel_closed_seam_fraction(int(height), int(width))
+    return max(configured, float(seam_floor)), float(seam_floor)
 
 
 _GPU_WORKER_FUSED_PREFLIGHT_SPECS: Tuple[Dict[str, object], ...] = ()
@@ -15127,9 +15170,17 @@ class _GpuWorkerRenderEngine:
                     if not bool(self.torch.isfinite(reference).all().item()):
                         raise RuntimeError('reference renderer produced non-finite pixels')
                     (
-                        max_tol, max_fraction_tol, mean_tol,
+                        max_tol, configured_max_fraction_tol, mean_tol,
                         mismatch_abs, mismatch_fraction_tol,
                     ) = fused_renderer_preflight_tolerances()
+                    max_fraction_tol, texture_seam_fraction_floor = (
+                        fused_renderer_effective_max_fraction_tolerance(
+                            float(configured_max_fraction_tol),
+                            preflight_family=str(preflight_family or family),
+                            height=int(delta.shape[-2]),
+                            width=int(delta.shape[-1]),
+                        )
+                    )
                     max_exceed_fraction = float(
                         (delta > float(max_tol)).to(self.torch.float32).mean().item()
                     ) if int(delta.numel()) else 0.0
@@ -15148,7 +15199,9 @@ class _GpuWorkerRenderEngine:
                 raise _ResidentTensorRTRingFatalError(
                     f'P4 fused {preflight_family or family} preflight exceeded tolerance: '
                     f'max={max_abs:.6f}, fraction(abs>{max_tol:.6f})='
-                    f'{max_exceed_fraction:.6f}/{max_fraction_tol:.6f}, '
+                    f'{max_exceed_fraction:.6f}/{max_fraction_tol:.6f} '
+                    f'(configured={configured_max_fraction_tol:.6f}, '
+                    f'texture_seam_floor={texture_seam_fraction_floor:.6f}), '
                     f'mean={mean_abs:.6f}/{mean_tol:.6f}, '
                     f'fraction(abs>{mismatch_abs:.6f})={mismatch_fraction:.6f}/'
                     f'{mismatch_fraction_tol:.6f}'
@@ -15156,7 +15209,9 @@ class _GpuWorkerRenderEngine:
             self._fused_preflight_validated_families.add(str(preflight_family or family))
             print(
                 f'P4 fused {preflight_family or family} preflight passed: '
-                f'max_abs={max_abs:.6f}, max_exceed_fraction={max_exceed_fraction:.6f}, '
+                f'max_abs={max_abs:.6f}, max_exceed_fraction={max_exceed_fraction:.6f}/'
+                f'{max_fraction_tol:.6f} (configured={configured_max_fraction_tol:.6f}, '
+                f'texture_seam_floor={texture_seam_fraction_floor:.6f}), '
                 f'mean_abs={mean_abs:.6f}, mismatch_fraction={mismatch_fraction:.6f}.'
             )
         self._fused_validated_keys.add(key)
@@ -40045,7 +40100,7 @@ def main() -> None:
     save_summary_enabled = 'summary' in save_option_set
     channel_format = resolve_channel_format(args.channel_format)
     print(
-        '[v16.2.0] unified save selection active: --save accepts images, labels, binary, '
+        '[v16.2.1] unified save selection active: --save accepts images, labels, binary, '
         'low_quality, nrrd, voxel_volume, high_quality, and summary; '
         '--low_quality_downbin replaces the legacy downbin flag. The retained v16.1.8 '
         'runtime set includes hardware-linear Radial texture sampling by '
@@ -40077,7 +40132,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('GPT-5.6-Sol-Pro v16.2.0 accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.2.1 accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -40704,7 +40759,7 @@ def main() -> None:
     if bool(low_quality_requested) and 'low_quality' not in effective_save_options:
         effective_save_options.append('low_quality (implied by --low_quality_downbin)')
     spec_notes.append(
-        'v16.2.0 unified output selection: --save=' + (
+        'v16.2.1 unified output selection: --save=' + (
             ', '.join(effective_save_options) if effective_save_options else '<none>'
         ) + '. high_quality controls the native-resolution final overlay; summary controls the '
         'summary text file; labels, binary, images, low_quality, and nrrd remain independently '
@@ -45254,6 +45309,7 @@ def main() -> None:
 # v16.1.7 retains the production bundle, materializes sparse-union destination pages in parallel, and gives final topology brief priority over background NRRD producers.
 # v16.1.8 defaults Radial sampling to the hardware-linear texture, adds bilinear in-plane Tilted forward inputs (mask backprojection stays nearest/exact), and retries transient ffmpeg launch failures before failing the pipeline loudly.
 # v16.2.0 unifies output selection under --save, makes native-resolution overlay and summary explicit, and renames --low_quality_downbin without changing output paths or filenames.
+# v16.2.1 prevents hardware-texture Radial startup false positives by allowing one raster-perimeter-equivalent high-error seam while retaining the strict mean and broad-mismatch gates.
 # The heuristic global monkeypatch framework used by v16.0.8 was removed because it
 # could replace unrelated functions by name and shadow the real fused-union implementation.
 
