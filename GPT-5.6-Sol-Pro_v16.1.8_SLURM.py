@@ -11,7 +11,9 @@ Current runtime behavior:
  - writes optional Slicer segmentation NRRDs as independent source-geometry component layers
  - uses the self-contained EDT medial-ridge centerline backend when explicitly enabled
  - uses a command-gated project/infer/proto-close/source-space backprojection pipeline
- - uses one canonical resident source for fast Radial sampling; hardware-linear texture mode remains available
+ - samples Radial views through the hardware-linear 3D texture by default; the canonical-pointer mode remains available
+ - interpolates Tilted forward-pass inputs in-plane (bilinear); mask backprojection keeps the exact nearest shear scatter
+ - retries transient ffmpeg/ffprobe launch failures and fails the pipeline loudly when a producer cannot start
 
 Dependencies:
  pip install opencv-python numpy scipy tifffile tqdm ultralytics
@@ -59,8 +61,8 @@ import numpy as np
 
 GIB = 1024 ** 3
 NRRD_SPACE = "left-posterior-superior"
-SCRIPT_VERSION = '16.1.7'
-SCRIPT_VERSION_COMPACT = '1617'
+SCRIPT_VERSION = '16.1.8'
+SCRIPT_VERSION_COMPACT = '1618'
 SCRIPT_BASENAME = f'GPT-5.6-Sol-Pro_v{SCRIPT_VERSION}_SLURM.py'
 OUTPUT_NRRD_PREFIX = ''
 LEGACY_OUTPUT_NRRD_PREFIX = 'HW_'
@@ -768,10 +770,13 @@ def proto_hole_treatment_radius() -> int:
 def radial_source_mode() -> str:
     """Source sampling used by resident Radial kernels.
 
-    ``nearest_xy_linear_t`` reads the canonical resident uint8 tensor directly and avoids
-    the second full-volume CUDA texture allocation. ``texture_linear`` retains v16.1.2.
+    ``texture_linear`` (default, v16.1.8) samples through the hardware-linear 3D texture:
+    measured as fast as the pointer path on the standard command while interpolating all
+    three spatial axes. ``nearest_xy_linear_t`` reads the canonical resident uint8 tensor
+    directly, avoiding the second full-volume CUDA texture allocation, at the cost of
+    nearest-neighbor in-plane (and sagittal/coronal stack-axis) sampling.
     """
-    default = 'nearest_xy_linear_t' if v1613_fast_bundle_active() else 'texture_linear'
+    default = 'texture_linear'
     raw = os.environ.get('YOLO_TTA_RADIAL_SOURCE_MODE', default).strip().lower().replace('-', '_')
     aliases = {
         'texture': 'texture_linear', 'texture_linear': 'texture_linear',
@@ -780,6 +785,31 @@ def radial_source_mode() -> str:
         'nearest_xy': 'nearest_xy_linear_t', 'nearest_xy_linear_t': 'nearest_xy_linear_t',
     }
     return aliases.get(raw, default)
+
+
+def tilted_inplane_linear_enabled() -> bool:
+    """Bilinear in-plane sampling for Tilted FORWARD-pass inputs (v16.1.8 default).
+
+    Every model-input Tilted renderer (fused CUDA kernel, resident Torch fallback, CPU
+    grid renderer) samples the native tilted raster bilinearly when the composed output
+    affine is not the identity, exactly as if the native frame were rendered and then
+    warped with the Cartesian views' align_corners=False zero-padded bilinear warp. Each
+    integer tap keeps its own sheared stack coordinate, so the native raster definition
+    is unchanged. Mask backprojection keeps the exact nearest shear scatter, preserving
+    the bit-for-bit layer-OR reconstruction contract. Set
+    YOLO_TTA_TILTED_INPLANE_LINEAR=0 to restore v16.1.7 nearest-XY forward sampling."""
+    return _env_flag('YOLO_TTA_TILTED_INPLANE_LINEAR', True)
+
+
+_TILTED_IDENTITY_M = np.asarray([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+
+
+def _tilted_grid_is_identity(M_grid_to_src: np.ndarray, grid_h: int, grid_w: int, view: object) -> bool:
+    """True when the output grid IS the native tilted raster (no in-plane resample)."""
+    if int(grid_h) != int(view.src_h) or int(grid_w) != int(view.src_w):
+        return False
+    matrix = np.asarray(M_grid_to_src, dtype=np.float32).reshape(2, 3)
+    return bool(np.allclose(matrix, _TILTED_IDENTITY_M, atol=1e-6))
 
 
 def _env_flag_compat(primary: str, legacy: str, default: bool = False) -> bool:
@@ -3619,6 +3649,38 @@ def _require_bin(name: str) -> None:
         raise RuntimeError(f"Required executable not found on PATH: {name}")
 
 
+def _spawn_subprocess_with_retry(spawn: Callable[[], object], desc: str) -> object:
+    """Launch one subprocess, retrying transient OS-level spawn failures.
+
+ Under SLURM memory pressure, fork/exec of this large process intermittently fails with
+ OSError even though the binary is on PATH (observed as [Errno 14] Bad address: 'ffmpeg').
+ Retry the launch up to two more times with a short wait; if it still fails, raise so the
+ caller (and any VolumeReadiness consumers) fail loudly instead of continuing without
+ their producer."""
+    attempts = max(1, _env_int('YOLO_TTA_SUBPROCESS_SPAWN_ATTEMPTS', 3))
+    wait_seconds = max(0.0, _env_float('YOLO_TTA_SUBPROCESS_SPAWN_RETRY_SECONDS', 1.0))
+    last_exc: Optional[OSError] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return spawn()
+        except OSError as exc:
+            # OSError covers the transient EFAULT/ENOMEM class and FileNotFoundError; a
+            # process that launched but exited nonzero raises CalledProcessError instead
+            # and is never retried here.
+            last_exc = exc
+            if attempt >= attempts:
+                break
+            print(
+                f'Warning: {desc} failed to launch (attempt {attempt}/{attempts}: {exc}); '
+                f'retrying in {wait_seconds:g}s.'
+            )
+            time.sleep(wait_seconds)
+    raise RuntimeError(
+        f'{desc} could not be launched after {attempts} attempts; aborting instead of '
+        f'continuing without it: {last_exc}'
+    ) from last_exc
+
+
 def ffmpeg_decode_threads() -> int:
     """Return the decoder thread count for input-volume materialization.
 
@@ -3776,7 +3838,10 @@ def ffprobe_info(video_path: Path) -> Dict[str, object]:
         "-of", "json",
         str(video_path),
     ]
-    p = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    p = _spawn_subprocess_with_retry(
+        lambda: subprocess.run(cmd, capture_output=True, text=True, check=True),
+        'ffprobe stream metadata probe',
+    )
     info = json.loads(p.stdout)
     if "streams" not in info or not info["streams"]:
         raise RuntimeError(f"ffprobe: no video stream found in {video_path}")
@@ -3810,7 +3875,10 @@ def ffprobe_info(video_path: Path) -> Dict[str, object]:
             "-of", "json",
             str(video_path),
         ]
-        p2 = subprocess.run(fallback_cmd, capture_output=True, text=True, check=True)
+        p2 = _spawn_subprocess_with_retry(
+            lambda: subprocess.run(fallback_cmd, capture_output=True, text=True, check=True),
+            'ffprobe packet-count probe',
+        )
         info2 = json.loads(p2.stdout)
         nf = info2["streams"][0].get("nb_read_packets", None)
     if nf is None or str(nf).strip() == "" or str(nf) == "N/A":
@@ -3871,7 +3939,10 @@ def decode_video_to_memmap_gray8(
         "-",
     ]
     print(f'FFmpeg gray8 decode threads: {ffmpeg_decode_threads()}')
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = _spawn_subprocess_with_retry(
+        lambda: subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
+        'ffmpeg gray8 decode',
+    )
     assert proc.stdout is not None
 
     try:
@@ -3947,9 +4018,16 @@ def decode_video_to_memmap_gray8_streaming(
             "-i", str(input_video), "-f", "rawvideo", "-pix_fmt", "gray", "-vsync", "0", "-",
         ]
         print(f'FFmpeg gray8 streaming decode threads: {ffmpeg_decode_threads()}')
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        assert proc.stdout is not None
+        # The launch itself must sit inside the failure path: a spawn OSError that escaped
+        # this thread used to leave the VolumeReadiness unmarked, so every consumer of the
+        # decoded volume blocked forever on wait_for_slice while the pipeline "continued".
+        proc: Optional[subprocess.Popen] = None
         try:
+            proc = _spawn_subprocess_with_retry(
+                lambda: subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
+                'ffmpeg streaming gray8 decode',
+            )
+            assert proc.stdout is not None
             with tqdm(total=num_frames, desc='Streaming decode input volume (gray8)') as pbar:
                 for start in range(0, int(num_frames), int(chunk_frames)):
                     if streaming_producers_aborted():
@@ -3970,22 +4048,26 @@ def decode_video_to_memmap_gray8_streaming(
             flush_array(arr)
             readiness.mark_all_ready()
         except BaseException as exc:
+            # Loud failure: waking every waiter with the root cause is what turns a silent
+            # consumer hang into an immediate pipeline abort.
             readiness.mark_failed(exc)
+            print(f'ERROR: streaming gray8 decode failed; failing all volume consumers: {exc}')
             # Unblock the finally's communicate: a decode we are abandoning must not be
             # waited on while it still streams the remainder of the input.
             try:
-                if proc.poll() is None:
+                if proc is not None and proc.poll() is None:
                     proc.kill()
             except Exception:
                 pass
             raise
         finally:
-            if proc.stdout:
-                proc.stdout.close()
-            _out, err = proc.communicate()
-            if proc.returncode not in (0, None):
-                msg = err.decode("utf-8", errors="ignore") if isinstance(err, (bytes, bytearray)) else str(err)
-                readiness.mark_failed(RuntimeError(f"ffmpeg decode failed: {msg}"))
+            if proc is not None:
+                if proc.stdout:
+                    proc.stdout.close()
+                _out, err = proc.communicate()
+                if proc.returncode not in (0, None):
+                    msg = err.decode("utf-8", errors="ignore") if isinstance(err, (bytes, bytearray)) else str(err)
+                    readiness.mark_failed(RuntimeError(f"ffmpeg decode failed: {msg}"))
 
     # daemon=True: if main dies without reaching abort_streaming_producers,
     # interpreter shutdown must not join a producer that may have hours of decode left.
@@ -4732,12 +4814,15 @@ def ffmpeg_rawvideo_writer(
         # proc/self/fd/<N> has no filename suffix, so select the intended container explicitly.
         cmd.extend(["-f", "matroska"])
     cmd.append(str(out_path))
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        pass_fds=inherited_fds,
+    proc = _spawn_subprocess_with_retry(
+        lambda: subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            pass_fds=inherited_fds,
+        ),
+        f'ffmpeg {codec} writer ({Path(out_path).name})',
     )
     assert proc.stdin is not None
     return proc
@@ -7793,10 +7878,32 @@ def _render_tilted_array_on_grid(
     block_rows: int = 256,
 ) -> np.ndarray:
     """Render one Tilted frame on an arbitrary output grid.
-    
+
     A cached plan hoists frame-invariant geometry; row-contiguous and flattened-gather paths avoid repeated setup."""
     if not is_tilted_view(view):
         raise ValueError('Tilted rendering requested for a non-tilted view')
+
+    if (
+        not bool(mask_mode)
+        and tilted_inplane_linear_enabled()
+        and not _tilted_grid_is_identity(M_grid_to_src, int(grid_h), int(grid_w), view)
+    ):
+        # v16.1.8 forward-pass in-plane interpolation: render the exact integer-grid
+        # native frame, then apply the requested grid->src affine bilinearly (the same
+        # warp Cartesian views use). Mask projections keep the nearest plan path.
+        native = _render_tilted_array_on_grid(
+            volume_arr, view, int(frame_idx), _TILTED_IDENTITY_M,
+            int(view.src_h), int(view.src_w),
+            mask_mode=False, block_rows=int(block_rows),
+        )
+        return cv2.warpAffine(
+            native,
+            np.asarray(M_grid_to_src, dtype=np.float32).reshape(2, 3),
+            (int(grid_w), int(grid_h)),
+            flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
 
     # A tilted output frame can sample a sheared range of the base stack. Wait for
     # the streaming preprocessing producer to finish before using these views.
@@ -13853,21 +13960,19 @@ def _fused_direct_render_kernels() -> Optional[object]:
       return clamp_f(round_nearest_f(a + alpha * (b - a)), 0.0f, 255.0f);
     }
 
-    __device__ __forceinline__ float tilted_direct_value(
+    // Native tilted raster value at one integer in-plane tap. ``axis_coord`` is the
+    // coordinate along the tilt axis used for the shear: the legacy nearest path passes
+    // the CONTINUOUS affine coordinate (preserving v16.1.7 output exactly), while the
+    // bilinear path passes each tap's own integer coordinate, which makes the 4-tap
+    // blend identical to rendering the native frame and warping it bilinearly.
+    __device__ __forceinline__ float tilted_native_value(
         const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
         int src_h, int src_w, int stack_len, int base_id, int direction_id,
-        const int* render_meta, float tan_tilt, int oh, int ow,
-        float m00, float m01, float m02, float m10, float m11, float m12, int q) {
-      int frame_center = render_meta[0];
-      int oy = q / ow, ox = q - oy * ow;
-      float sx = __fadd_rn(__fadd_rn(__fmul_rn(m00, (float)ox), __fmul_rn(m01, (float)oy)), m02);
-      float sy = __fadd_rn(__fadd_rn(__fmul_rn(m10, (float)ox), __fmul_rn(m11, (float)oy)), m12);
-      int x = __float2int_rn(sx);
-      int y = __float2int_rn(sy);
+        int frame_center, float tan_tilt, int x, int y, float axis_coord) {
       if (x < 0 || x >= src_w || y < 0 || y >= src_h) return 0.0f;
       float axis = direction_id == 0
-          ? sy - 0.5f * (float)(src_h - 1)
-          : sx - 0.5f * (float)(src_w - 1);
+          ? axis_coord - 0.5f * (float)(src_h - 1)
+          : axis_coord - 0.5f * (float)(src_w - 1);
       float stack = __fadd_rn((float)frame_center, __fmul_rn(tan_tilt, axis));
       if (stack < 0.0f || stack > (float)(stack_len - 1)) return 0.0f;
       int s0 = clamp_i(floor_i(stack), 0, stack_len - 1);
@@ -13909,28 +14014,75 @@ def _fused_direct_render_kernels() -> Optional[object]:
       return v0 + sa * (v1 - v0);
     }
 
+    __device__ __forceinline__ float tilted_direct_value(
+        const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
+        int src_h, int src_w, int stack_len, int base_id, int direction_id,
+        const int* render_meta, float tan_tilt, int inplane_linear, int oh, int ow,
+        float m00, float m01, float m02, float m10, float m11, float m12, int q) {
+      int frame_center = render_meta[0];
+      int oy = q / ow, ox = q - oy * ow;
+      float sx = __fadd_rn(__fadd_rn(__fmul_rn(m00, (float)ox), __fmul_rn(m01, (float)oy)), m02);
+      float sy = __fadd_rn(__fadd_rn(__fmul_rn(m10, (float)ox), __fmul_rn(m11, (float)oy)), m12);
+      if (!inplane_linear) {
+        int x = __float2int_rn(sx);
+        int y = __float2int_rn(sy);
+        return tilted_native_value(volume, native_t, full_h, full_w, logical_t,
+            src_h, src_w, stack_len, base_id, direction_id, frame_center, tan_tilt,
+            x, y, direction_id == 0 ? sy : sx);
+      }
+      // v16.1.8 forward-pass bilinear: match align_corners=False zero-padded warp
+      // semantics on the native tilted raster (the same contract the Cartesian
+      // grid_sample warp and the radial kernels' edge handling use).
+      float cx, cy;
+      float border_x = zero_padded_linear_coord(sx, src_w, &cx);
+      float border_y = zero_padded_linear_coord(sy, src_h, &cy);
+      float border = border_x * border_y;
+      if (border <= 0.0f) return 0.0f;
+      int x0 = floor_i(cx);
+      int y0 = floor_i(cy);
+      int x1 = x0 + 1 < src_w ? x0 + 1 : src_w - 1;
+      int y1 = y0 + 1 < src_h ? y0 + 1 : src_h - 1;
+      float fx = cx - (float)x0;
+      float fy = cy - (float)y0;
+      float v00 = tilted_native_value(volume, native_t, full_h, full_w, logical_t,
+          src_h, src_w, stack_len, base_id, direction_id, frame_center, tan_tilt,
+          x0, y0, direction_id == 0 ? (float)y0 : (float)x0);
+      float v01 = tilted_native_value(volume, native_t, full_h, full_w, logical_t,
+          src_h, src_w, stack_len, base_id, direction_id, frame_center, tan_tilt,
+          x1, y0, direction_id == 0 ? (float)y0 : (float)x1);
+      float v10 = tilted_native_value(volume, native_t, full_h, full_w, logical_t,
+          src_h, src_w, stack_len, base_id, direction_id, frame_center, tan_tilt,
+          x0, y1, direction_id == 0 ? (float)y1 : (float)x0);
+      float v11 = tilted_native_value(volume, native_t, full_h, full_w, logical_t,
+          src_h, src_w, stack_len, base_id, direction_id, frame_center, tan_tilt,
+          x1, y1, direction_id == 0 ? (float)y1 : (float)x1);
+      float v_top = v00 + fx * (v01 - v00);
+      float v_bottom = v10 + fx * (v11 - v10);
+      return border * (v_top + fy * (v_bottom - v_top));
+    }
+
     extern "C" __global__ void tilted_direct_f32(
         const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
         int src_h, int src_w, int stack_len, int base_id, int direction_id,
-        const int* render_meta, float tan_tilt, int oh, int ow,
+        const int* render_meta, float tan_tilt, int inplane_linear, int oh, int ow,
         float m00, float m01, float m02, float m10, float m11, float m12, float* out) {
       int q = (int)(blockDim.x * blockIdx.x + threadIdx.x);
       if (q >= oh * ow) return;
       out[q] = norm_u8(tilted_direct_value(volume, native_t, full_h, full_w, logical_t,
           src_h, src_w, stack_len, base_id, direction_id, render_meta, tan_tilt,
-          oh, ow, m00, m01, m02, m10, m11, m12, q));
+          inplane_linear, oh, ow, m00, m01, m02, m10, m11, m12, q));
     }
 
     extern "C" __global__ void tilted_direct_f16(
         const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
         int src_h, int src_w, int stack_len, int base_id, int direction_id,
-        const int* render_meta, float tan_tilt, int oh, int ow,
+        const int* render_meta, float tan_tilt, int inplane_linear, int oh, int ow,
         float m00, float m01, float m02, float m10, float m11, float m12, __half* out) {
       int q = (int)(blockDim.x * blockIdx.x + threadIdx.x);
       if (q >= oh * ow) return;
       float value = norm_u8(tilted_direct_value(volume, native_t, full_h, full_w, logical_t,
           src_h, src_w, stack_len, base_id, direction_id, render_meta, tan_tilt,
-          oh, ow, m00, m01, m02, m10, m11, m12, q));
+          inplane_linear, oh, ow, m00, m01, m02, m10, m11, m12, q));
       out[q] = __float2half_rn(value);
     }
     '''
@@ -14687,6 +14839,7 @@ class _GpuWorkerRenderEngine:
                         slot, kernels, int(center) if bool(stage_metadata) else None,
                     ),
                     np.float32(math.tan(math.radians(float(view.tilt_angle_deg)))),
+                    np.int32(1 if tilted_inplane_linear_enabled() else 0),
                     np.int32(out_size), np.int32(out_size),
                     *(np.float32(v) for v in matrix.reshape(-1)),
                     self._fused_slot_output(slot, kernels),
@@ -14695,7 +14848,11 @@ class _GpuWorkerRenderEngine:
             )
             if 'tilted' not in self._fused_announced_families:
                 self._fused_announced_families.add('tilted')
-                print('P4 fused Tilted renderer active: affine/shear/gathers/lerps -> TensorRT binding.')
+                inplane_label = 'bilinear' if tilted_inplane_linear_enabled() else 'nearest'
+                print(
+                    'P4 fused Tilted renderer active: affine/shear/gathers/lerps -> '
+                    f'TensorRT binding (in-plane={inplane_label}).'
+                )
             return True
         except Exception as exc:
             if not bool(disable_on_failure):
@@ -15680,6 +15837,28 @@ class _GpuWorkerRenderEngine:
 
     def _render_tilted_frame(self, view: ViewInfo, M_grid_to_src: np.ndarray, grid_h: int, grid_w: int, frame_idx: int) -> object:
         torch = self.torch
+        if (
+            tilted_inplane_linear_enabled()
+            and not _tilted_grid_is_identity(M_grid_to_src, int(grid_h), int(grid_w), view)
+        ):
+            # v16.1.8 forward-pass in-plane interpolation: build the exact integer-grid
+            # native frame (the identity branch below), then warp it with the same
+            # align_corners=False zero-padded bilinear grid_sample the Cartesian views
+            # use. This is also the preflight reference for the fused tilted kernel's
+            # bilinear branch, so both stages share one definition.
+            src_h, src_w = int(view.src_h), int(view.src_w)
+            plane = self._render_tilted_frame(
+                view, _TILTED_IDENTITY_M, src_h, src_w, int(frame_idx),
+            )
+            theta = _affine_theta_from_dst_to_src(
+                np.asarray(M_grid_to_src, dtype=np.float32),
+                src_h, src_w, int(grid_h), int(grid_w),
+            )
+            grid = _get_cached_affine_grid(theta, int(grid_h), int(grid_w), self.device)
+            return self.F.grid_sample(
+                plane.reshape(1, 1, src_h, src_w),
+                grid, mode='bilinear', padding_mode='zeros', align_corners=False,
+            ).reshape(int(grid_h), int(grid_w))
         info = self._tilted_plan_gpu(view, M_grid_to_src, int(grid_h), int(grid_w))
         stack_len = int(info['stack_len'])
         center = float(tilted_frame_center(view, int(frame_idx)))
@@ -25458,7 +25637,7 @@ def assemble_current_view_union_volume(
     
     Multiple model entries are rejected; the destination uses source geometry when requested."""
     if len(view_volumes_by_model) != 1:
-        raise ValueError('GPT-5.6-Sol-Pro v16.1.7 supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.1.8 supports exactly one --model; multiple-model inference has been removed')
 
     union_shape = (int(T), int(H), int(W)) if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
     model_name = next(iter(view_volumes_by_model.keys()))
@@ -35297,13 +35476,16 @@ def _run_sharded_ffv1_encode(
                 '-protocol_whitelist', 'file,pipe', '-i', 'pipe:0',
                 '-map', '0:v:0', '-c', 'copy', '-f', 'matroska', str(joined_path),
             ]
-            completed = subprocess.run(
-                cmd,
-                input=concat_text.encode('utf-8'),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-                pass_fds=tuple(int(chunk.fileno()) for chunk in shard_files),
+            completed = _spawn_subprocess_with_retry(
+                lambda: subprocess.run(
+                    cmd,
+                    input=concat_text.encode('utf-8'),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    pass_fds=tuple(int(chunk.fileno()) for chunk in shard_files),
+                ),
+                f'ffmpeg FFV1 concat ({Path(out_path).name})',
             )
             if int(completed.returncode) != 0:
                 stderr = (
@@ -39802,10 +39984,13 @@ def main() -> None:
     args = build_argparser().parse_args()
     channel_format = resolve_channel_format(args.channel_format)
     print(
-        '[v16.1.7] integrated fixes active: dense-prefaulted native sparse final union, '
-        'foreground-topology NRRD priority, header-free D1 NVRTC preflight, geometry-safe '
-        'fast-bundle initialization, bounded memfd direct-union window, sparse cvol '
-        'retirement, persistent TensorRT contexts, and parallel atomic outputs.'
+        '[v16.1.8] integrated fixes active: hardware-linear Radial texture sampling by '
+        'default, bilinear in-plane Tilted forward inputs (exact nearest mask '
+        'backprojection retained), retried/loud-failing ffmpeg launches, plus the v16.1.7 '
+        'set: dense-prefaulted native sparse final union, foreground-topology NRRD '
+        'priority, header-free D1 NVRTC preflight, geometry-safe fast-bundle '
+        'initialization, bounded memfd direct-union window, sparse cvol retirement, '
+        'persistent TensorRT contexts, and parallel atomic outputs.'
     )
     print(
         f'Model input channel format: {channel_format.token} '
@@ -39822,7 +40007,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('GPT-5.6-Sol-Pro v16.1.7 accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.1.8 accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -40288,7 +40473,10 @@ def main() -> None:
     # Clear an inherited value before resolving the request aliases for this run.
     os.environ.pop('YOLO_TTA_V1613_D1_PIPELINE_ACTIVE', None)
     if v1613_bundle_active:
-        os.environ.setdefault('YOLO_TTA_RADIAL_SOURCE_MODE', 'nearest_xy_linear_t')
+        # v16.1.8: the fast bundle keeps hardware-linear texture sampling. The pointer
+        # mode (nearest_xy_linear_t) benchmarked no faster on the standard command, so it
+        # is opt-in for VRAM-constrained volumes rather than the bundle default.
+        os.environ.setdefault('YOLO_TTA_RADIAL_SOURCE_MODE', 'texture_linear')
         os.environ.setdefault('YOLO_TTA_PROTO_HOLE_TREATMENT', 'close')
         os.environ.setdefault('YOLO_TTA_PROTO_HOLE_RADIUS', '2')
         os.environ.setdefault('YOLO_TTA_GPU_UNION_RETIREMENT_LANES', '3')
@@ -40300,7 +40488,7 @@ def main() -> None:
         # D1 supersedes the 25-39 GiB host direct-union workspace entirely.
         gpu_worker_direct_union_active = False
         print(
-            'v16.1.7 fast bundle active: A3 canonical Radial source sampling, B1 sparse '
+            'v16.1.8 fast bundle active: hardware-linear Radial texture sampling, B1 sparse '
             'slice metadata, D3 resident-proto closing, C1 runtime-sized leases, C2 '
             'compute/publication credit separation, C3 predicted-cost scheduling, and D1 '
             'project -> infer -> proto-close -> immediate owner-GPU backprojection -> '
@@ -40309,13 +40497,14 @@ def main() -> None:
         )
     elif v1613_bundle_active:
         print(
-            'v16.1.7 fast bundle active with D1 disabled by '
+            'v16.1.8 fast bundle active with D1 disabled by '
             'YOLO_TTA_V1613_D1_OWNER_PIPELINE=0 or YOLO_TTA_V1613_D1_PIPELINE=0: '
-            'A3/B1/D3 and C1-C3 remain active; the dense direct-union compatibility path is retained.'
+            'hardware-linear Radial texture sampling, B1/D3, and C1-C3 remain active; the '
+            'dense direct-union compatibility path is retained.'
         )
     elif v1613_fast_bundle_requested():
         print(
-            'v16.1.7 fast bundle not eligible for this command; compatibility paths retained: '
+            'v16.1.8 fast bundle not eligible for this command; compatibility paths retained: '
             + '; '.join(v1613_bundle_reasons)
         )
     if gpu_worker_direct_union_active:
@@ -44966,6 +45155,7 @@ def main() -> None:
 
 
 # v16.1.7 retains the production bundle, materializes sparse-union destination pages in parallel, and gives final topology brief priority over background NRRD producers.
+# v16.1.8 defaults Radial sampling to the hardware-linear texture, adds bilinear in-plane Tilted forward inputs (mask backprojection stays nearest/exact), and retries transient ffmpeg launch failures before failing the pipeline loudly.
 # The heuristic global monkeypatch framework used by v16.0.8 was removed because it
 # could replace unrelated functions by name and shadow the real fused-union implementation.
 
