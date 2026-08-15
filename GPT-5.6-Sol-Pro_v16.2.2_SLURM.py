@@ -2,13 +2,15 @@
 """YOLO segmentation test-time augmentation (TTA) for large cylindrical video volumes.
 
 Current runtime behavior:
- - accepts gray/grey, RGB, or C{odd}S{stride} model-input channel layouts
+ - accepts gray/grey, RGB, or C{odd}S{stride} model-input channel layouts; contextual
+   slices wrap for Radial/Tilted Radial views and clamp for Cartesian/Tilted Cartesian views
  - streams full-frame and tiled inputs, with optional GPU-resident rendering
  - uses one persistent worker process per CUDA device, including one-GPU runs
  - overlaps decode, rendering, inference, cleanup/interpolation, backprojection, and output writing
  - supports Cartesian, Tilted, and Radial view families with dense tiles and source-geometry fusion
  - uses Ultralytics' unified quantize setting for inference precision
- - writes optional Slicer segmentation NRRDs as independent source-geometry component layers
+ - writes optional active-view PNG/multi-page TIFF inputs and Slicer segmentation NRRDs
+   as independent source-geometry component layers
  - uses the self-contained EDT medial-ridge centerline backend when explicitly enabled
  - uses a command-gated project/infer/proto-close/source-space backprojection pipeline
  - samples Radial views through the hardware-linear 3D texture by default; the canonical-pointer mode remains available
@@ -61,8 +63,8 @@ import numpy as np
 
 GIB = 1024 ** 3
 NRRD_SPACE = "left-posterior-superior"
-SCRIPT_VERSION = '16.2.1'
-SCRIPT_VERSION_COMPACT = '1621'
+SCRIPT_VERSION = '16.2.2'
+SCRIPT_VERSION_COMPACT = '1622'
 SCRIPT_BASENAME = f'GPT-5.6-Sol-Pro_v{SCRIPT_VERSION}_SLURM.py'
 OUTPUT_NRRD_PREFIX = ''
 LEGACY_OUTPUT_NRRD_PREFIX = 'HW_'
@@ -431,8 +433,7 @@ def build_argparser() -> argparse.ArgumentParser:
         help=(
             "Scratch/temp root location. The supplied root is created when needed and receives a "
             "unique {Filename}_{PID}_temp run directory. Omission defaults to <output>/temp; "
-            "YOLO_TTA_SCRATCH_DIR and an explicit YOLO_TTA_SCRATCH_PREFER_SHM setting remain "
-            "compatibility overrides"
+            "an explicit YOLO_TTA_SCRATCH_PREFER_SHM setting may select a roomy memory-backed root"
         ),
     )
     p.add_argument("--device", nargs="+", default=["0"], type=str,
@@ -455,7 +456,8 @@ def build_argparser() -> argparse.ArgumentParser:
         help=(
             "Model-input channel layout. gray/grey uses center slice N as one channel; "
             "RGB triplicates N into three channels; C{odd}S{stride>=1}, e.g. C5S1, "
-            "uses edge-clamped neighboring view slices in ascending offset order. "
+            "uses neighboring view slices in ascending offset order. Radial and Tilted "
+            "Radial indices wrap; Cartesian and Tilted Cartesian indices edge-clamp. "
             "Only one value is accepted and every prediction remains assigned to N"
         ),
     )
@@ -552,7 +554,8 @@ def build_argparser() -> argparse.ArgumentParser:
         type=str,
         metavar="OUTPUT",
         help=(
-            "Save one or more output groups: images (active-view PNG sequences), labels "
+            "Save one or more output groups: images (active-view image sequences; channel "
+            "formats with at least five channels use one grayscale page per channel in multi-page TIFF), labels "
             "(final YOLO segmentation labels), binary (final TIFF sequence plus FFV1 MKV), "
             "low_quality (isotropically downsampled overlay and binary videos), nrrd "
             "(single-layer Slicer decomposition plus manifest), voxel_volume (native-space "
@@ -596,8 +599,6 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--gaussian_smoothing_passes", default=None, type=int,
                    help="Number of Gaussian smoothing passes. Unset uses default 1 when smoothing is activated by either Gaussian flag; explicitly set 0 to disable")
 
-    p.add_argument("--troubleshooting", action="store_true",
-                   help="Save FFV1 MKV troubleshooting overlays for each active full-frame view and consolidated tiled prediction set")
     p.add_argument("--interpolate", default=15, type=int,
                    help="Maximum view-native slice/frame distance used to search for interpolation candidates. Radial interpolation wraps around frame order. 0 disables interpolation")
     p.add_argument("--interpolation_walk_back", default=3, type=int,
@@ -772,19 +773,16 @@ def v1613_fast_bundle_active() -> bool:
 
 def v1613_d1_pipeline_active() -> bool:
     """Project, infer, treat 2D topology, and backproject inside each eligible GPU lease."""
-    # ``main`` publishes the resolved run state before spawning CUDA workers. Honor that
-    # authoritative value when present so request aliases cannot disagree inside children.
+    # ``main`` publishes the resolved state before spawning CUDA workers.
     if os.environ.get('YOLO_TTA_V1613_D1_PIPELINE_ACTIVE') is not None:
         return bool(
             v1613_fast_bundle_active()
             and _env_flag('YOLO_TTA_V1613_D1_PIPELINE_ACTIVE', False)
         )
-    enabled = (
-        _env_flag('YOLO_TTA_V1613_D1_OWNER_PIPELINE', True)
-        if os.environ.get('YOLO_TTA_V1613_D1_OWNER_PIPELINE') is not None
-        else _env_flag('YOLO_TTA_V1613_D1_PIPELINE', True)
+    return bool(
+        v1613_fast_bundle_active()
+        and _env_flag('YOLO_TTA_V1613_D1_OWNER_PIPELINE', True)
     )
-    return bool(v1613_fast_bundle_active() and enabled)
 
 def v1613_d1_backprojection_overlap_enabled() -> bool:
     """Allow fallback completed-view backprojection to borrow an idle worker GPU."""
@@ -855,24 +853,6 @@ def _tilted_grid_is_identity(M_grid_to_src: np.ndarray, grid_h: int, grid_w: int
         return False
     matrix = np.asarray(M_grid_to_src, dtype=np.float32).reshape(2, 3)
     return bool(np.allclose(matrix, _TILTED_IDENTITY_M, atol=1e-6))
-
-
-def _env_flag_compat(primary: str, legacy: str, default: bool = False) -> bool:
-    """Resolve a renamed boolean environment setting while retaining one legacy alias."""
-    if os.environ.get(primary) is not None:
-        return _env_flag(primary, default)
-    return _env_flag(legacy, default)
-
-
-def _env_int_compat(primary: str, legacy: str, default: int) -> int:
-    """Resolve a renamed integer environment setting while retaining one legacy alias."""
-    if os.environ.get(primary) is not None:
-        return _env_int(primary, default)
-    return _env_int(legacy, default)
-
-
-def _env_any_set(*names: str) -> bool:
-    return any(bool(os.environ.get(name, '').strip()) for name in names)
 
 
 def _slurm_allocated_cpu_count() -> Optional[int]:
@@ -1810,15 +1790,10 @@ def tail_worker_budget_expansion_enabled() -> bool:
 
 def gpu_worker_direct_union_enabled() -> bool:
     """Allow disjoint single-angle worker leases to write directly into the view union."""
-    return _env_flag_compat(
-        'YOLO_TTA_GPU_WORKER_DIRECT_UNION',
-        'YOLO_TTA_MGPU_DIRECT_UNION',
-        True,
-    )
+    return _env_flag('YOLO_TTA_GPU_WORKER_DIRECT_UNION', True)
 
 
-# Process-per-GPU scheduling helpers. New YOLO_TTA_GPU_WORKER_* settings take precedence;
-# YOLO_TTA_MGPU_* remains accepted as a compatibility alias for existing launch scripts.
+# Process-per-GPU scheduling helpers.
 def gpu_worker_fullframe_task_ranges(
     n_slices: int,
     slice_chunk: int,
@@ -1838,20 +1813,12 @@ def gpu_worker_tail_split_point(
     inference_batch: int,
 ) -> Optional[int]:
     """Batch-aligned midpoint for a dispatch-time tail lease split."""
-    if not _env_flag_compat(
-        'YOLO_TTA_GPU_WORKER_ADAPTIVE_TAIL_LEASES',
-        'YOLO_TTA_MGPU_ADAPTIVE_TAIL_LEASES',
-        True,
-    ):
+    if not _env_flag('YOLO_TTA_GPU_WORKER_ADAPTIVE_TAIL_LEASES', True):
         return None
     tail0 = int(slice_start)
     tail1 = int(slice_start) + max(0, int(slice_count))
     align = max(1, int(inference_batch))
-    min_tail = max(align, _env_int_compat(
-        'YOLO_TTA_GPU_WORKER_TAIL_MIN_SLICES',
-        'YOLO_TTA_MGPU_TAIL_MIN_SLICES',
-        128,
-    ))
+    min_tail = max(align, _env_int('YOLO_TTA_GPU_WORKER_TAIL_MIN_SLICES', 128))
     midpoint = int(tail0) + ((int(tail1 - tail0) // 2) // int(align)) * int(align)
     if int(midpoint - tail0) >= int(min_tail) and int(tail1 - midpoint) >= int(min_tail):
         return int(midpoint)
@@ -1860,13 +1827,7 @@ def gpu_worker_tail_split_point(
 
 def gpu_worker_target_lease_seconds() -> float:
     """Target render+TensorRT+resident-post duration for one full-frame lease."""
-    primary = 'YOLO_TTA_GPU_WORKER_LEASE_TARGET_SECONDS'
-    legacy = 'YOLO_TTA_GPU_WORKER_TARGET_LEASE_SECONDS'
-    value = (
-        _env_float(primary, 2.0)
-        if os.environ.get(primary) is not None
-        else _env_float(legacy, 2.0)
-    )
+    value = _env_float('YOLO_TTA_GPU_WORKER_LEASE_TARGET_SECONDS', 2.0)
     return max(0.25, min(30.0, float(value)))
 
 
@@ -2952,13 +2913,10 @@ def scratch_dir_is_memory_backed() -> bool:
 def choose_scratch_dir(preferred: Optional[str], out_dir: Path, stem: str) -> Path:
     """Pick the bulk scratch directory.
 
- - ``--temp`` names a root and receives a unique ``{stem}_{pid}_temp`` child, preventing
- one run from deleting or colliding with unrelated contents in the supplied location.
- - ``YOLO_TTA_SCRATCH_DIR`` remains a compatibility root override and receives a unique
- ``{stem}_{pid}_temp`` child, preserving its historical multi-run-safe behavior.
- - an explicitly configured ``YOLO_TTA_SCRATCH_PREFER_SHM`` may still select a proven-roomy
- memory-backed root and likewise receives a unique child.
- - with no explicit CLI/environment override, the default is exactly ``{output}/temp``."""
+ - ``--temp`` names a root and receives a unique ``{stem}_{pid}_temp`` child.
+ - an explicitly configured ``YOLO_TTA_SCRATCH_PREFER_SHM`` may select a proven-roomy
+   memory-backed root and likewise receives a unique child.
+ - otherwise the default is exactly ``{output}/temp``."""
     global _SCRATCH_DIR_IS_MEMORY_BACKED
 
     if preferred:
@@ -2978,11 +2936,8 @@ def choose_scratch_dir(preferred: Optional[str], out_dir: Path, stem: str) -> Pa
         _SCRATCH_DIR_IS_MEMORY_BACKED = bool(path_is_memory_backed(scratch_dir))
         return scratch_dir
 
-    env_pref = os.environ.get('YOLO_TTA_SCRATCH_DIR', '').strip()
     chosen_root: Optional[Path] = None
-    if env_pref:
-        chosen_root = Path(env_pref).expanduser()
-    elif os.environ.get('YOLO_TTA_SCRATCH_PREFER_SHM', '').strip():
+    if os.environ.get('YOLO_TTA_SCRATCH_PREFER_SHM', '').strip():
         chosen_root = _auto_shm_scratch_candidate()
 
     if chosen_root is None:
@@ -3261,17 +3216,6 @@ class _GpuWorkerAuxInterpolationPool:
             )
         return True
 
-    def enable(self) -> None:
-        """Lease every worker after the complete inference tail drains.
-
-        A single-worker run may temporarily widen back to the full allocation because no
-        other GPU worker remains to contend with it.  Multi-worker runs retain each worker's
-        NUMA-local CPU partition.
-        """
-        widen = bool(self._capacity == 1)
-        for worker_id in self._worker_ids:
-            self.enable_worker(worker_id, allow_full_cpu_affinity=widen)
-
     def revoke_worker(self, worker_id: int) -> bool:
         """Revoke an idle lease; False means an auxiliary pass is still running there."""
         worker = int(worker_id)
@@ -3282,10 +3226,6 @@ class _GpuWorkerAuxInterpolationPool:
     def outstanding(self) -> int:
         with self._lock:
             return int(len(self._pending))
-
-    def worker_outstanding(self, worker_id: int) -> bool:
-        with self._lock:
-            return int(worker_id) in self._busy_workers
 
     def mark_failed(self, reason: str) -> None:
         with self._lock:
@@ -4143,40 +4083,17 @@ def compute_cube_resize_shape(
 
 
 def processing_volume_mode() -> str:
-    """Return ``cube`` or ``native`` processing geometry.
-
-    ``cube`` is the default and keeps all logical working dimensions within 5% of the
-    longest source axis. The host cube may remain lazy when resident GPU renderers can
-    map native source geometry directly. ``native`` is an explicit compatibility mode.
-    """
-    if _env_flag('YOLO_TTA_FORCE_PROCESSING_CUBE', False):
-        return 'cube'
+    """Return the canonical ``cube`` or ``native`` processing geometry."""
     raw = os.environ.get('YOLO_TTA_PROCESSING_VOLUME_MODE', '').strip().lower()
-    if not raw:
-        raw = os.environ.get('YOLO_TTA_PROCESSING_GEOMETRY', '').strip().lower()
-    aliases = {
-        '': 'cube',
-        'native': 'native',
-        'decoded': 'native',
-        'input': 'native',
-        'none': 'native',
-        'no_resize': 'native',
-        'no-resize': 'native',
-        'cube': 'cube',
-        'cubic': 'cube',
-        'legacy': 'cube',
-        'legacy_cube': 'cube',
-        'v12': 'cube',
-        'v12.2.0': 'cube',
-        'v950': 'cube',
-        'v13': 'cube',
-        'v13.0.0': 'cube',
-    }
-    mode = aliases.get(raw)
-    if mode is None:
-        print(f"Warning: unsupported YOLO_TTA_PROCESSING_VOLUME_MODE={raw!r}; using approximately-cubic working geometry.")
+    if raw in ('', 'cube'):
         return 'cube'
-    return str(mode)
+    if raw == 'native':
+        return 'native'
+    print(
+        f"Warning: unsupported YOLO_TTA_PROCESSING_VOLUME_MODE={raw!r}; "
+        "expected 'cube' or 'native'; using 'cube'."
+    )
+    return 'cube'
 
 
 def should_resize_to_processing_cube(input_shape: Tuple[int, int, int], cube_shape: Tuple[int, int, int]) -> bool:
@@ -6159,7 +6076,7 @@ def write_aug_job_meta(
                 'model_input_channels': int(fmt.channel_count),
                 'channel_stride': int(fmt.stride),
                 'channel_offsets': [int(v) for v in fmt.offsets],
-                'channel_boundary_policy': 'edge_clamp',
+                'channel_boundary_policy': 'radial_wrap_cartesian_edge_clamp',
                 'prediction_slice_policy': 'center_N_only',
             },
             indent=2,
@@ -6302,9 +6219,12 @@ class DenseTileJob:
     M_out_to_crop: Optional[np.ndarray] = None
 
 
-def edge_clamped_view_slice_index(view: ViewInfo, index: int) -> int:
-    """Clamp a contextual channel index to the active view's valid slice range."""
-    return max(0, min(max(0, int(view.num_slices) - 1), int(index)))
+def channel_view_slice_index(view: ViewInfo, index: int) -> int:
+    """Resolve one contextual channel index under the view family's boundary policy."""
+    count = max(1, int(view.num_slices))
+    if is_radial_view(view):
+        return int(index) % int(count)
+    return max(0, min(int(count) - 1, int(index)))
 
 
 class ChannelFormattedFrameRenderer:
@@ -6312,7 +6232,7 @@ class ChannelFormattedFrameRenderer:
 
  The bounded single-flight cache reuses transformed neighboring planes across
  overlapping 2.5D centers without materializing a complete channel-formatted
- volume. It also deduplicates repeated edge-clamped indices within one frame."""
+ volume. It also deduplicates repeated boundary-resolved indices within one frame."""
 
     def __init__(
         self,
@@ -6391,18 +6311,18 @@ class ChannelFormattedFrameRenderer:
         fmt = self.channel_format
         center = int(center_idx)
         if fmt.kind == 'gray':
-            return self._get_plane(edge_clamped_view_slice_index(self.view, center))
+            return self._get_plane(channel_view_slice_index(self.view, center))
 
         if fmt.kind == 'rgb':
-            plane = self._get_plane(edge_clamped_view_slice_index(self.view, center))
+            plane = self._get_plane(channel_view_slice_index(self.view, center))
             return np.ascontiguousarray(np.repeat(plane[:, :, None], 3, axis=2))
 
-        # Deduplicate clamped endpoint indices inside this stack even when the
+        # Deduplicate repeated boundary-resolved indices inside this stack even when the
         # shared cache is disabled.
         local_planes: Dict[int, np.ndarray] = {}
         ordered_planes: List[np.ndarray] = []
         for offset in fmt.offsets:
-            source_idx = edge_clamped_view_slice_index(self.view, center + int(offset))
+            source_idx = channel_view_slice_index(self.view, center + int(offset))
             plane = local_planes.get(source_idx)
             if plane is None:
                 plane = self._get_plane(source_idx)
@@ -7109,11 +7029,7 @@ class GpuPrefetchingYoloSource:
 
 def gpu_input_staging_enabled(cfg: 'PredictConfig') -> bool:
     """Return True when a small queue of YOLO input batches should be staged in VRAM."""
-    if os.environ.get('YOLO_TTA_GPU_INPUT_STAGING') is not None:
-        requested = _env_flag('YOLO_TTA_GPU_INPUT_STAGING', True)
-    else:
-        requested = _env_flag('YOLO_TTA_GPU_PREFETCH', True)
-    if not bool(requested):
+    if not _env_flag('YOLO_TTA_GPU_INPUT_STAGING', True):
         return False
     target = canonical_single_device(str(cfg.device))
     if not str(target).startswith('cuda'):
@@ -7126,9 +7042,7 @@ def gpu_input_staging_enabled(cfg: 'PredictConfig') -> bool:
 
 
 def gpu_input_staging_queue_batches() -> int:
-    if os.environ.get('YOLO_TTA_GPU_INPUT_STAGING_BATCHES') is not None:
-        return max(0, _env_int('YOLO_TTA_GPU_INPUT_STAGING_BATCHES', 8))
-    return max(0, _env_int('YOLO_TTA_GPU_PREFETCH_BATCHES', 8))
+    return max(0, _env_int('YOLO_TTA_GPU_INPUT_STAGING_BATCHES', 8))
 
 
 def gpu_input_staging_pin_memory_enabled() -> bool:
@@ -7293,8 +7207,6 @@ def gpu_input_staging_ahead_sources(default_queue_slots: int) -> int:
     
     This source count is independent of the per-source batch queue and is still bounded by VRAM admission."""
     raw = os.environ.get('YOLO_TTA_GPU_INPUT_STAGING_AHEAD_SOURCES', '').strip()
-    if not raw and os.environ.get('YOLO_TTA_GPU_PREFETCH_AHEAD_SOURCES') is not None:
-        raw = os.environ.get('YOLO_TTA_GPU_PREFETCH_AHEAD_SOURCES', '').strip()
     if raw:
         try:
             return max(0, int(raw))
@@ -7342,22 +7254,12 @@ def maybe_eager_stage_prediction_ref_on_gpu(prediction_ref: PredictionVolumeRef,
 
 def streaming_prediction_sources_enabled() -> bool:
     """Return True when YOLO input slices should be rendered lazily instead of prebuilt."""
-    if os.environ.get('YOLO_TTA_STREAMING_PREDICTION_SOURCES') is not None:
-        return _env_flag('YOLO_TTA_STREAMING_PREDICTION_SOURCES', True)
-    if os.environ.get('YOLO_TTA_STREAM_RENDERED_PREDICTION_SOURCES') is not None:
-        return _env_flag('YOLO_TTA_STREAM_RENDERED_PREDICTION_SOURCES', True)
-    return _env_flag('YOLO_TTA_STREAM_RENDERED_PREDICTION', True)
+    return _env_flag('YOLO_TTA_STREAMING_PREDICTION_SOURCES', True)
 
 
 def streaming_prediction_source_autostart_enabled() -> bool:
-    """Return whether each new streaming source starts prefetch immediately.
-    
-    The default leaves queued-source warmup under scheduler control."""
-    if os.environ.get('YOLO_TTA_STREAMING_SOURCE_AUTOSTART') is not None:
-        return _env_flag('YOLO_TTA_STREAMING_SOURCE_AUTOSTART', True)
-    if os.environ.get('YOLO_TTA_STREAM_RENDER_AUTOSTART') is not None:
-        return _env_flag('YOLO_TTA_STREAM_RENDER_AUTOSTART', True)
-    return False
+    """Return whether each new streaming source starts prefetch immediately."""
+    return _env_flag('YOLO_TTA_STREAMING_SOURCE_AUTOSTART', False)
 
 
 def queued_streaming_source_cpu_warmup_slots(default_queue_slots: int) -> int:
@@ -7367,8 +7269,6 @@ def queued_streaming_source_cpu_warmup_slots(default_queue_slots: int) -> int:
  a full prefetch window at once. The active source can still use the full shared render pool;
  a bounded number of upcoming sources are kept warm to overlap CPU rendering with inference."""
     raw = os.environ.get('YOLO_TTA_STREAMING_SOURCE_WARMUP_SOURCES', '').strip()
-    if not raw and os.environ.get('YOLO_TTA_STREAM_RENDER_WARMUP_SOURCES') is not None:
-        raw = os.environ.get('YOLO_TTA_STREAM_RENDER_WARMUP_SOURCES', '').strip()
     if raw:
         try:
             return max(0, int(raw))
@@ -7380,12 +7280,10 @@ def queued_streaming_source_cpu_warmup_slots(default_queue_slots: int) -> int:
 
 def streaming_prediction_source_prefetch_frames(batch_size: int) -> int:
     explicit = _env_int('YOLO_TTA_STREAMING_SOURCE_PREFETCH_FRAMES', 0)
-    if explicit <= 0 and os.environ.get('YOLO_TTA_STREAM_RENDER_PREFETCH_FRAMES') is not None:
-        explicit = _env_int('YOLO_TTA_STREAM_RENDER_PREFETCH_FRAMES', 0)
     if explicit > 0:
         return max(1, int(explicit))
-    batches = max(1, _env_int('YOLO_TTA_STREAMING_SOURCE_PREFETCH_BATCHES', _env_int('YOLO_TTA_STREAM_RENDER_PREFETCH_BATCHES', 32)))
-    max_frames = max(1, _env_int('YOLO_TTA_STREAMING_SOURCE_PREFETCH_MAX_FRAMES', _env_int('YOLO_TTA_STREAM_RENDER_PREFETCH_MAX_FRAMES', 2048)))
+    batches = max(1, _env_int('YOLO_TTA_STREAMING_SOURCE_PREFETCH_BATCHES', 32))
+    max_frames = max(1, _env_int('YOLO_TTA_STREAMING_SOURCE_PREFETCH_MAX_FRAMES', 2048))
     return max(1, min(int(max_frames), max(int(batch_size), int(batch_size) * int(batches))))
 
 
@@ -7394,22 +7292,17 @@ def streaming_prediction_source_workers(default_workers: int, num_frames: int) -
     full_cpu_default = max(1, _env_int('YOLO_TTA_STREAMING_SOURCE_DEFAULT_WORKERS', max(1, _cpu_count())))
     min_workers = max(1, _env_int('YOLO_TTA_STREAMING_SOURCE_MIN_WORKERS', full_cpu_default))
     default_resolved = max(1, int(default_workers), int(min_workers), int(full_cpu_default))
-    requested = _env_int('YOLO_TTA_STREAMING_SOURCE_WORKERS', _env_int('YOLO_TTA_STREAM_RENDER_WORKERS', int(default_resolved)))
+    requested = _env_int('YOLO_TTA_STREAMING_SOURCE_WORKERS', int(default_resolved))
     return choose_slice_parallel_workers(max(1, int(requested)), max(1, int(num_frames)))
 
 
 def shared_streaming_render_pool_enabled() -> bool:
     """Return True when all streaming YOLO sources should share one CPU render pool."""
-    if os.environ.get('YOLO_TTA_SHARED_STREAMING_RENDER_POOL') is not None:
-        return _env_flag('YOLO_TTA_SHARED_STREAMING_RENDER_POOL', True)
-    return _env_flag('YOLO_TTA_SHARED_RENDER_POOL', True)
+    return _env_flag('YOLO_TTA_SHARED_STREAMING_RENDER_POOL', True)
 
 
 def resolve_prediction_render_workers(default_workers: int, max_frames: int) -> int:
-    requested = _env_int(
-        'YOLO_TTA_PREDICTION_RENDER_WORKERS',
-        _env_int('YOLO_TTA_STREAMING_RENDER_WORKERS', int(default_workers)),
-    )
+    requested = _env_int('YOLO_TTA_PREDICTION_RENDER_WORKERS', int(default_workers))
     return choose_slice_parallel_workers(max(1, int(requested)), max(1, int(max_frames)))
 
 
@@ -7637,7 +7530,7 @@ def write_dense_tile_job_meta(
             'model_input_channels': int(fmt.channel_count),
             'channel_stride': int(fmt.stride),
             'channel_offsets': [int(v) for v in fmt.offsets],
-            'channel_boundary_policy': 'edge_clamp',
+            'channel_boundary_policy': 'radial_wrap_cartesian_edge_clamp',
             'prediction_slice_policy': 'center_N_only',
         },
         separators=(',', ':'),
@@ -9378,9 +9271,7 @@ def cpu_retina_block_detections() -> int:
 
 def cpu_retina_deferred_payload_enabled() -> bool:
     """Defer compact pred/proto CPU copies from Ultralytics construct_result to result workers."""
-    if os.environ.get('YOLO_TTA_CPU_RETINA_DEFER_GPU_COPY') is not None:
-        return _env_flag('YOLO_TTA_CPU_RETINA_DEFER_GPU_COPY', True)
-    return _env_flag('YOLO_TTA_CPU_RETINA_DEFERRED_PAYLOAD', True)
+    return _env_flag('YOLO_TTA_CPU_RETINA_DEFER_GPU_COPY', True)
 
 
 def cpu_mask_postprocess_pending_limit(worker_count: int, num_frames: int) -> int:
@@ -16173,7 +16064,7 @@ class _GpuWorkerRenderEngine:
                     self._render_tile_plane(
                         view,
                         M_out_to_src,
-                        edge_clamped_view_slice_index(view, center + int(offset)),
+                        channel_view_slice_index(view, center + int(offset)),
                         int(out_size),
                     )
                     for offset in offsets
@@ -16206,7 +16097,7 @@ class _GpuWorkerRenderEngine:
                 center = int(frame_idx)
                 offsets = (0,) if fmt.kind == 'gray' else tuple(int(v) for v in fmt.offsets)
                 contextual = tuple(
-                    edge_clamped_view_slice_index(view, center + int(offset))
+                    channel_view_slice_index(view, center + int(offset))
                     for offset in offsets
                 )
                 requested_indices.append(contextual)
@@ -16271,7 +16162,7 @@ class _GpuWorkerRenderEngine:
                 return
 
             contextual = tuple(
-                edge_clamped_view_slice_index(view, int(frame_index) + int(offset))
+                channel_view_slice_index(view, int(frame_index) + int(offset))
                 for offset in fmt.offsets
             )
             first_channel_by_source: Dict[int, int] = {}
@@ -16318,7 +16209,7 @@ class _GpuWorkerRenderEngine:
             if bool(slot.infer_valid):
                 self._stream.wait_event(slot.infer_done)
             contextual = tuple(
-                edge_clamped_view_slice_index(view, absolute_frame + int(offset))
+                channel_view_slice_index(view, absolute_frame + int(offset))
                 for offset in fmt.offsets
             )
             first_channel_by_source: Dict[int, int] = {}
@@ -16785,7 +16676,7 @@ def _tile_group_cpu_renderer(
         center = int(slice_offset) + int(z_local)
         planes: List[np.ndarray] = []
         for offset in offsets:
-            source_idx = edge_clamped_view_slice_index(view, center + int(offset))
+            source_idx = channel_view_slice_index(view, center + int(offset))
             if is_tilted_view(view):
                 plane = render_tilted_frame_on_grid(
                     volume_rgb=volume_rgb,
@@ -16851,7 +16742,7 @@ def _radial_slab_context_indices(
     """Return the sparse global plane bank required by one radial task window."""
     fmt = resolve_channel_format(channel_format)
     required = {
-        edge_clamped_view_slice_index(view, center + int(offset))
+        channel_view_slice_index(view, center + int(offset))
         for center in range(int(center_start), int(center_start) + int(center_count))
         for offset in fmt.offsets
     }
@@ -17008,9 +16899,6 @@ def tile_canvas_zband_lock_count() -> int:
     return max(1, _env_int('YOLO_TTA_TILE_CANVAS_ZBAND_LOCKS', 64))
 
 
-def d1_source_zband_lock_count() -> int:
-    """Lock shards for concurrent sparse ORs into a shared source-space D1 bitset."""
-    return max(1, _env_int('YOLO_TTA_D1_SOURCE_ZBAND_LOCKS', 128))
 
 
 def tile_canvas_zband_size(canvas_slices: int, lock_count: int) -> int:
@@ -25862,7 +25750,7 @@ def apply_keep_largest_objects_inplace(
             support_metadata = scan_binary_volume_slice_metadata(
                 mask_mm,
                 workers=min(max(1, int(workers)), max(1, int(_cpu_count()))),
-                source='v16.1.7 keep_objects exact fallback scan',
+                source='keep_objects exact fallback scan',
             )
         metadata_seconds = float(time.perf_counter() - metadata_started)
         support_nonempty, support_bbox_pixels, support_bbox_fraction = binary_slice_bbox_coverage(
@@ -25871,7 +25759,7 @@ def apply_keep_largest_objects_inplace(
             support_metadata.slice_bboxes,
         )
         print(
-            'v16.1.7 keep_objects slice metadata: '
+            'keep_objects slice metadata: '
             f'source={support_metadata.source}, exact={bool(support_metadata.exact)}, '
             f'nonempty_z={int(support_nonempty)}/{int(shape_tyx[0])}, '
             f'bbox_coverage={100.0 * float(support_bbox_fraction):.2f}% '
@@ -31193,11 +31081,6 @@ class IncrementalRawBBoxMaskStoreWriter:
         with self._lock:
             return self._failed_reason is not None
 
-    @property
-    def failed_reason(self) -> Optional[BaseException]:
-        with self._lock:
-            return self._failed_reason
-
     def warn_failed_once(self, message: str) -> None:
         with self._lock:
             if self._warned_failed:
@@ -31310,80 +31193,6 @@ class IncrementalRawBBoxMaskStoreWriter:
             self._max_y = max(int(self._max_y), int(y1) - 1)
             self._min_x = min(int(self._min_x), x0)
             self._max_x = max(int(self._max_x), int(x1) - 1)
-
-    def consume_bbox_slice(
-        self,
-        z: int,
-        crop: np.ndarray,
-        *,
-        y0: int,
-        x0: int,
-    ) -> None:
-        """Commit a known nonempty uint8 crop without rescanning a full output plane."""
-        z_i = int(z)
-        y0_i = int(y0)
-        x0_i = int(x0)
-        crop_u8 = np.ascontiguousarray(np.asarray(crop, dtype=np.uint8) != 0, dtype=np.uint8)
-        if crop_u8.ndim != 2:
-            raise ValueError(f'{self.desc}: known-bbox crop must be 2D, got {crop_u8.shape}')
-        crop_h, crop_w = (int(crop_u8.shape[0]), int(crop_u8.shape[1]))
-        if z_i < 0 or z_i >= int(self.shape[0]):
-            raise IndexError(f'{self.desc}: slice {z_i} is outside {self.shape[0]} slices')
-        if crop_h <= 0 or crop_w <= 0 or not bool(np.any(crop_u8)):
-            self.consume_empty_range(z_i, 1)
-            return
-        y1_i = int(y0_i) + int(crop_h)
-        x1_i = int(x0_i) + int(crop_w)
-        if y0_i < 0 or x0_i < 0 or y1_i > int(self.shape[1]) or x1_i > int(self.shape[2]):
-            raise ValueError(
-                f'{self.desc}: known bbox {(y0_i, y1_i, x0_i, x1_i)} is outside '
-                f'plane shape {self.shape[1:]}'
-            )
-        payload_nbytes = int(crop_h) * int(crop_w)
-        with self._lock:
-            if self._failed_reason is not None:
-                return
-            if self._finalized:
-                raise RuntimeError(f'{self.desc}: known-bbox slice arrived after finalization')
-            if int(self._slice_state[z_i]) != 0:
-                raise ValueError(f'{self.desc}: projected slice {z_i} was delivered more than once')
-            if self._fd is None:
-                raise RuntimeError(f'{self.desc}: chunks payload is already closed')
-            fd = int(self._fd)
-            offset = int(self._next_offset)
-            self._next_offset += int(payload_nbytes)
-            self._slice_state[z_i] = np.uint8(1)
-            self._active_callbacks += 1
-        try:
-            foreground_voxels = int(np.count_nonzero(crop_u8))
-            self._pwrite_all(fd, memoryview(crop_u8).cast('B'), int(offset))
-            with self._lock:
-                if self._failed_reason is not None:
-                    return
-                rec = self.index[z_i]
-                rec['kind'] = np.uint8(1)
-                rec['offset'] = np.uint64(offset)
-                rec['payload_size'] = np.uint64(payload_nbytes)
-                rec['y0'] = np.uint32(y0_i)
-                rec['x0'] = np.uint32(x0_i)
-                rec['y1'] = np.uint32(y1_i)
-                rec['x1'] = np.uint32(x1_i)
-                rec['payload_nbytes'] = np.uint64(payload_nbytes)
-                self._slice_state[z_i] = np.uint8(2)
-                self._nonempty_slices += 1
-                self._foreground_voxels += int(foreground_voxels)
-                self._min_t = min(int(self._min_t), z_i)
-                self._max_t = max(int(self._max_t), z_i)
-                self._min_y = min(int(self._min_y), y0_i)
-                self._max_y = max(int(self._max_y), y1_i - 1)
-                self._min_x = min(int(self._min_x), x0_i)
-                self._max_x = max(int(self._max_x), x1_i - 1)
-        except Exception as exc:
-            self.abort(exc)
-            raise
-        finally:
-            with self._lock:
-                self._active_callbacks -= 1
 
     def consume(self, z0: int, block: np.ndarray) -> None:
         block_arr = np.asarray(block)
@@ -32073,7 +31882,7 @@ def write_raw_bbox_mask_store(
 
 
 def d1_owner_pipeline_enabled() -> bool:
-    """Return the run-admitted D1 mode, honoring both current and legacy overrides."""
+    """Return the D1 mode admitted and published by the current run."""
     return bool(v1613_d1_pipeline_active())
 
 
@@ -32788,10 +32597,7 @@ def temp_binary_archive_enabled() -> bool:
 
 
 def raw_bbox_nrrd_layers_enabled() -> bool:
-    raw_env = os.environ.get('YOLO_TTA_RAW_BBOX_NRRD_LAYERS')
-    if raw_env is not None:
-        return _env_flag('YOLO_TTA_RAW_BBOX_NRRD_LAYERS', True)
-    return _env_flag('YOLO_TTA_COMPRESS_NRRD_LAYERS', True)  # backward-compatible alias; payloads are raw bbox stores, not compressed
+    return _env_flag('YOLO_TTA_RAW_BBOX_NRRD_LAYERS', True)
 
 
 def tile_intermediate_accumulators_prefer_memory() -> bool:
@@ -32815,16 +32621,6 @@ def waiting_tile_spill_enabled() -> bool:
     
     The default keeps them in RAM when admission permits."""
     return _env_flag('YOLO_TTA_SPILL_WAITING_TILES', False)
-
-
-def nrrd_cache_raw_bbox_layers_in_ram_enabled() -> bool:
-    """Share cvol/ctile payloads through a read-only mmap during NRRD streaming.
-
- The NRRD writer uses the same layer backing files for both ``NRRD streaming:
- segment extents`` and ``NRRD streaming: decomposed layers``. When those
- backing files are raw bbox stores, their ``chunks.bin`` payloads use one
- refcounted mapping. The legacy environment name is retained for compatibility."""
-    return _env_flag('YOLO_TTA_NRRD_CACHE_RAW_BBOX_LAYERS_IN_RAM', True)
 
 
 def archive_or_delete_binary_volume_storage(
@@ -33392,149 +33188,6 @@ def materialize_nrrd_view_layer(
         )
     return layer_ref
 
-@runtime_telemetry_phase('projection.d1_packed_materialize')
-def materialize_d1_packed_bitset_layer(
-    packed_mm: np.ndarray,
-    *,
-    model_name: str,
-    view: ViewInfo,
-    output_shape_tyx: Tuple[int, int, int],
-    temp_dir: Path,
-    workers: int = 1,
-    keep_temp: bool = False,
-) -> PreparedViewResult:
-    """Convert a source-space packed D1 union directly to one sparse cvol layer."""
-    out_t, out_h, out_w = (int(v) for v in output_shape_tyx)
-    packed_w = int((out_w + 31) // 32)
-    packed_shape = tuple(int(v) for v in np.asarray(packed_mm).shape)
-    expected = (int(out_t), int(out_h), int(packed_w))
-    if packed_shape != expected or np.asarray(packed_mm).dtype != np.dtype(np.uint32):
-        raise ValueError(
-            f'D1 packed layer {model_name}/{view.name}: expected uint32 {expected}, '
-            f'got {np.asarray(packed_mm).dtype} {packed_shape}'
-        )
-
-    key = _nrrd_layer_key(
-        view_name=str(view.name), source='fullframe', mask_kind='yolo',
-        pass_index=0, stage='pre_interpolation',
-    )
-    out_path = Path(temp_dir) / 'nrrd_layers' / str(view.name) / f'{key}.orthogonal.cvol'
-    writer = IncrementalRawBBoxMaskStoreWriter(
-        shape=(out_t, out_h, out_w),
-        store_dir=out_path,
-        format_name=CVOL_FORMAT,
-        desc=f'NRRD layer {key} [D1 packed source union]',
-        extra_meta={
-            'nrrd_layer_key': key,
-            'projection_payload_fusion': 'gpu_lease_sparse_source_backprojection',
-            'source_raw_workspace': 'shared_packed_uint32_bitset',
-            'packed_word_bits': 32,
-            'packed_bit_order': 'little',
-        },
-    )
-    packed_backing = _memmap_backing_path(packed_mm)
-    stats: Optional[Dict[str, object]] = None
-    try:
-        def _encode_slice(z_idx: int) -> None:
-            words = np.asarray(packed_mm[int(z_idx)], dtype=np.uint32)
-            row_any = np.any(words != np.uint32(0), axis=1)
-            if not bool(np.any(row_any)):
-                writer.consume_empty_range(int(z_idx), 1)
-                return
-            row_ids = np.flatnonzero(row_any)
-            y0 = int(row_ids[0])
-            y1 = int(row_ids[-1]) + 1
-            rows = np.asarray(words[y0:y1])
-            word_any = np.any(rows != np.uint32(0), axis=0)
-            word_ids = np.flatnonzero(word_any)
-            if int(word_ids.size) <= 0:
-                writer.consume_empty_range(int(z_idx), 1)
-                return
-            word0 = int(word_ids[0])
-            word1 = int(word_ids[-1]) + 1
-            word_crop = np.ascontiguousarray(rows[:, word0:word1], dtype='<u4')
-            byte_crop = word_crop.view(np.uint8).reshape(int(y1 - y0), int(word1 - word0) * 4)
-            bits = np.unpackbits(byte_crop, axis=1, bitorder='little')
-            x_base = int(word0) * 32
-            max_width = min(int(bits.shape[1]), int(out_w) - int(x_base))
-            bits = np.ascontiguousarray(bits[:, :max_width], dtype=np.uint8)
-            col_any = np.any(bits != 0, axis=0)
-            col_ids = np.flatnonzero(col_any)
-            if int(col_ids.size) <= 0:
-                writer.consume_empty_range(int(z_idx), 1)
-                return
-            cx0 = int(col_ids[0])
-            cx1 = int(col_ids[-1]) + 1
-            writer.consume_bbox_slice(
-                int(z_idx), bits[:, cx0:cx1], y0=int(y0), x0=int(x_base + cx0),
-            )
-
-        parallel_for_indices_chunked(
-            int(out_t), _encode_slice,
-            max_workers=choose_slice_parallel_workers(int(workers), int(out_t)),
-            desc=f'D1 packed cvol {model_name}/{view.name}',
-            show_progress=True,
-            target_chunks_per_worker=4,
-        )
-        stats = writer.finalize()
-    except BaseException as exc:
-        writer.abort(exc)
-        writer.discard()
-        raise
-    finally:
-        close_memmap_array_without_flush(packed_mm)
-        if packed_backing is not None and not bool(keep_temp):
-            try:
-                backing_path = Path(packed_backing)
-                if _path_is_relative_to(backing_path, Path(temp_dir)):
-                    backing_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-    if stats is None or int(stats.get('nonempty_slices', 0)) <= 0:
-        if not bool(keep_temp):
-            release_memfd_owners_under(out_path)
-            shutil.rmtree(out_path, ignore_errors=True)
-        return PreparedViewResult(
-            model_name=str(model_name), view_name=str(view.name),
-            native_support_mm=None, final_view_volume_mm=None,
-            interpolation_stats=[], nrrd_layers=[],
-        )
-
-    extent = _coerce_segment_extent(stats.get('segment_extent_ijk')) or _nrrd_empty_segment_extent()
-    layer_ref = NrrdLayerRef(
-        key=key,
-        name=_nrrd_layer_name(
-            view=view, source='fullframe', mask_kind='yolo',
-            pass_index=0, stage='pre_interpolation',
-        ),
-        path=out_path,
-        shape=(out_t, out_h, out_w),
-        dtype='uint8', storage_format=CVOL_FORMAT,
-        model_name=str(model_name), view_name=str(view.name),
-        view_family=str(view.family), source='fullframe', mask_kind='yolo',
-        pass_index=0, stage='pre_interpolation',
-        description=(
-            'YOLO full-frame D1 source-space union after resident proto topology treatment'
-        ),
-        segment_extent_ijk=extent,
-        segment_extent_shape_tyx=(out_t, out_h, out_w),
-        segment_extent_source='d1_packed_source_bitset',
-    )
-    sink = nrrd_layer_sink()
-    if sink is not None:
-        sink.submit_layer(
-            layer_ref,
-            nrrd_layer_output_suffix(
-                view_token=view_output_token(view), source='fullframe', mask_kind='yolo',
-                pass_index=0, stage='pre_interpolation',
-            ),
-        )
-    return PreparedViewResult(
-        model_name=str(model_name), view_name=str(view.name),
-        native_support_mm=None, final_view_volume_mm=None,
-        interpolation_stats=[], nrrd_layers=[layer_ref],
-    )
 
 
 def materialize_nrrd_global_layer(
@@ -33740,7 +33393,6 @@ def prepare_view_volume_after_fullframe(
     slice_workers: int,
     interpolation_task_workers: int,
     nrrd_layers_enabled: bool = False,
-    retain_native_support: bool = False,
     precleaned_slice_cleanup: bool = False,
     hole_fill_done_on_device: bool = False,
     slice_meta: Optional[Dict[str, object]] = None,
@@ -34057,7 +33709,6 @@ def prepare_view_volume_after_fullframe(
         nrrd_layers_enabled
         and not dense_tiling_active
         and not bool(keep_temp)
-        and not bool(retain_native_support)
         and not _view_uses_interpolation(view, int(interpolate))
         and _env_flag('YOLO_TTA_SPARSE_VIEW_RETIREMENT', True)
     )
@@ -36153,17 +35804,11 @@ def slicer_segmentation_header_fields(
 
 
 def nrrd_gzip_compresslevel() -> int:
-    """NRRD member-gzip compression level.
+    """Return the NRRD member-gzip compression level.
 
- ISA-L maps the 0..9 value to its native 0..3 range. The neutral GZIP name
- takes precedence; the former environment name remains a compatibility alias
- for existing job specifications and does not select an external process."""
-    setting = (
-        'YOLO_TTA_NRRD_GZIP_LEVEL'
-        if 'YOLO_TTA_NRRD_GZIP_LEVEL' in os.environ
-        else 'YOLO_TTA_NRRD_PIGZ_LEVEL'
-    )
-    return int(np.clip(_env_int(setting, 3), 0, 9))
+    ISA-L maps the configured 0..9 value to its native 0..3 range.
+    """
+    return int(np.clip(_env_int('YOLO_TTA_NRRD_GZIP_LEVEL', 3), 0, 9))
 
 
 def nrrd_z_chunk_cap() -> int:
@@ -36458,13 +36103,12 @@ def _nrrd_background_nonzero_checkpoint() -> None:
 
 @contextlib.contextmanager
 def nrrd_foreground_topology_priority(label: str) -> Iterator[None]:
-    """Quiesce new component-NRRD nonzero members around a latency-critical topology scan.
+    """Give latency-critical topology work priority over new component-NRRD members.
 
-    Already submitted native compressor calls and ordered file writes are allowed to drain;
-    active layer writers stop at their next slice-aligned member boundary. This avoids the
-    v16.1.6 state where twelve multi-GiB cvol readers/deflaters made the four-GPU
-    keep_objects label phase last as long as the remaining NRRD queue. The pause is nested,
-    exception-safe, and skipped when no layer write is pending.
+    Submitted compressor calls and ordered writes may drain; active writers stop at the next
+    slice-aligned member boundary. The nested, exception-safe pause is skipped when no layer
+    write is pending and prevents background cvol read/deflate work from extending topology
+    scans such as ``keep_objects``.
     """
     global _NRRD_FOREGROUND_PRIORITY_DEPTH
     if not nrrd_yield_to_topology_enabled():
@@ -36491,7 +36135,7 @@ def nrrd_foreground_topology_priority(label: str) -> Iterator[None]:
             announce = True
     if announce:
         print(
-            f'v16.1.7 foreground topology priority: pausing new nonzero component-NRRD '
+            f'Foreground topology priority: pausing new nonzero component-NRRD '
             f'members at slice boundaries during {label} ({int(pending)} write(s) pending; '
             'YOLO_TTA_NRRD_YIELD_TO_TOPOLOGY=0 disables).',
             flush=True,
@@ -36507,7 +36151,7 @@ def nrrd_foreground_topology_priority(label: str) -> Iterator[None]:
                 release = True
         if release:
             print(
-                f'v16.1.7 foreground topology priority released after {label}; '
+                f'Foreground topology priority released after {label}; '
                 'component-NRRD streaming resumed.',
                 flush=True,
             )
@@ -38241,7 +37885,7 @@ def _open_nrrd_layer_ref(ref: NrrdLayerRef) -> object:
     if _nrrd_layer_ref_is_raw_bbox_store(ref):
         return RawBBoxMaskStore.open(
             ref.path,
-            cache_payload_in_ram=bool(nrrd_cache_raw_bbox_layers_in_ram_enabled()),
+            cache_payload_in_ram=True,
         )
     return np.memmap(
         ref.path,
@@ -39021,112 +38665,6 @@ def _write_one_decomposed_nrrd_layer_payload(
             _drop_nrrd_raw_store_chunks_ram_cache(src)
 
 
-def write_native_view_overlay_video(
-    volume_rgb: np.ndarray,
-    native_mask_u8: np.ndarray,
-    view: ViewInfo,
-    out_path: Path,
-    fps: float,
-    *,
-    show_progress: bool = True,
-) -> Path:
-    """Write a troubleshooting overlay in the view's own slice space.
-    
-    Non-Radial reduced-grid masks are resized only for this presentation output."""
-    mask_arr = np.asarray(native_mask_u8)
-    if int(mask_arr.ndim) != 3 or int(mask_arr.shape[0]) != int(view.num_slices):
-        raise ValueError(
-            f'Troubleshooting overlay for {view.name} expected {int(view.num_slices)} mask frames, '
-            f'got {tuple(mask_arr.shape)}'
-        )
-
-    proc = ffmpeg_ffv1_rgb_writer(
-        out_path,
-        width=int(view.src_w),
-        height=int(view.src_h),
-        fps=float(fps),
-    )
-    # reused RGB buffer + bbox-restricted blend + memoryview pipe writes.
-    frame_buf = np.empty((int(view.src_h), int(view.src_w), 3), dtype=np.uint8)
-    try:
-        assert proc.stdin is not None
-        for idx in tqdm(
-            range(int(view.num_slices)),
-            total=int(view.num_slices),
-            desc=f'Writing troubleshooting overlay {view.name} ({out_path.name})',
-            disable=not bool(show_progress),
-        ):
-            frame_gray = get_view_frame_by_index(volume_rgb, view, int(idx))
-            frame = _gray_frame_into_rgb_buffer(frame_gray, frame_buf)
-            mask_frame = np.asarray(mask_arr[int(idx)], dtype=np.uint8)
-            if tuple(int(v) for v in mask_frame.shape) != (int(view.src_h), int(view.src_w)):
-                mask_frame = _resize_union_plane_to_out_xy(
-                    mask_frame, int(view.src_h), int(view.src_w),
-                )
-            _overlay_blend_blue_inplace(frame, mask_frame)
-            proc.stdin.write(memoryview(frame).cast('B'))
-    finally:
-        close_ffmpeg_writer(proc)
-    return out_path
-
-
-def collect_troubleshooting_overlay_futures(
-    executor: ThreadPoolExecutor,
-    *,
-    volume_rgb: np.ndarray,
-    model_name: str,
-    views: Sequence[ViewInfo],
-    native_view_support: Dict[str, np.ndarray],
-    consolidated_tile_masks: Dict[str, np.ndarray],
-    out_dir: Path,
-    stem: str,
-    fps: float,
-    show_progress: bool = False,
-) -> Tuple[Dict[str, Path], List[Future]]:
-    """Schedule simplified troubleshooting overlay MKVs."""
-    result_paths: Dict[str, Path] = {}
-    futures: List[Future] = []
-    troubleshooting_dir = Path(out_dir) / 'troubleshooting'
-    troubleshooting_dir.mkdir(parents=True, exist_ok=True)
-
-    for view in views:
-        view_token = view_output_token(view)
-        full_mask = native_view_support.get(str(view.name))
-        if full_mask is not None:
-            overlay_path = troubleshooting_dir / f'{stem}_Troubleshooting_{view_token}_FullFrame_Overlay.mkv'
-            futures.append(executor.submit(
-                write_native_view_overlay_video,
-                volume_rgb,
-                full_mask,
-                view,
-                overlay_path,
-                fps,
-                show_progress=show_progress,
-            ))
-            result_paths[f'troubleshooting_{view.name}_fullframe_overlay'] = overlay_path
-
-        tile_mask = consolidated_tile_masks.get(str(view.name))
-        if tile_mask is not None:
-            overlay_path = troubleshooting_dir / f'{stem}_Troubleshooting_{view_token}_Tiles_Overlay.mkv'
-            futures.append(executor.submit(
-                write_native_view_overlay_video,
-                volume_rgb,
-                tile_mask,
-                view,
-                overlay_path,
-                fps,
-                show_progress=show_progress,
-            ))
-            result_paths[f'troubleshooting_{view.name}_tiles_overlay'] = overlay_path
-
-    if not futures:
-        note_path = troubleshooting_dir / f'{stem}_Troubleshooting_NoActiveMasks.txt'
-        note_path.write_text(
-            f'No full-frame or consolidated tiled native-view masks were available for model {model_name}.\n'
-        )
-        result_paths['troubleshooting_note'] = note_path
-
-    return result_paths, futures
 
 
 @dataclass(frozen=True)
@@ -39890,22 +39428,59 @@ def collect_pipeline_output_futures(
     return result_paths, futures
 
 
+def _write_multichannel_tiff(path: Path, frame_hwc: np.ndarray, channel_count: int) -> None:
+    """Write one uint8 grayscale TIFF page per model-input channel."""
+    writer = getattr(cv2, 'imwritemulti', None)
+    if not callable(writer):
+        raise RuntimeError(
+            'Saving channel-formatted images with five or more channels requires an '
+            'OpenCV build that provides cv2.imwritemulti(); upgrade opencv-python.'
+        )
+    frame = np.ascontiguousarray(np.asarray(frame_hwc), dtype=np.uint8)
+    expected_channels = int(channel_count)
+    if frame.ndim != 3 or int(frame.shape[2]) != expected_channels:
+        raise ValueError(
+            f'Multi-page TIFF output expected HxWx{expected_channels}, got {tuple(frame.shape)}'
+        )
+    pages = [
+        np.ascontiguousarray(frame[:, :, channel_index])
+        for channel_index in range(expected_channels)
+    ]
+    if not bool(writer(str(path), pages)):
+        raise RuntimeError(f'Failed to write multi-page TIFF: {path}')
+
+
 def write_view_images(
     volume_rgb: np.ndarray,
     view: ViewInfo,
     out_dir: Path,
     stem: str,
     *,
+    channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
     workers: int = 1,
     show_progress: bool = True,
 ) -> Path:
+    """Save the same channel-formatted center inputs supplied to inference."""
+    fmt = resolve_channel_format(channel_format)
     view_dir = out_dir / 'images' / view.name
     view_dir.mkdir(parents=True, exist_ok=True)
     total = int(view.num_slices)
+    multipage_tiff = int(fmt.channel_count) >= 5
+    suffix = '.tif' if multipage_tiff else '.png'
+    renderer = ChannelFormattedFrameRenderer(
+        lambda source_idx: get_view_frame_by_index(volume_rgb, view, int(source_idx)),
+        view,
+        fmt,
+    )
 
     def _write_frame(idx: int) -> None:
-        frame = np.ascontiguousarray(get_view_frame_by_index(volume_rgb, view, int(idx)))
-        out_path = view_dir / f'{stem}_{view.name}_{int(idx) + 1:04d}.png'
+        frame = np.ascontiguousarray(renderer(int(idx)), dtype=np.uint8)
+        out_path = view_dir / f'{stem}_{view.name}_{int(idx) + 1:04d}{suffix}'
+        if multipage_tiff:
+            _write_multichannel_tiff(out_path, frame, int(fmt.channel_count))
+            return
+        if frame.ndim == 3 and int(frame.shape[2]) == 1:
+            frame = np.ascontiguousarray(frame[:, :, 0])
         if not cv2.imwrite(str(out_path), frame):
             raise RuntimeError(f'Failed to write image: {out_path}')
 
@@ -39913,7 +39488,7 @@ def write_view_images(
         total,
         _write_frame,
         max_workers=choose_slice_parallel_workers(int(workers), total),
-        desc=f'Writing {view.name} image sequence',
+        desc=f'Writing {view.name} {fmt.token} image sequence',
         show_progress=show_progress,
     )
     return view_dir
@@ -40100,9 +39675,10 @@ def main() -> None:
     save_summary_enabled = 'summary' in save_option_set
     channel_format = resolve_channel_format(args.channel_format)
     print(
-        '[v16.2.1] unified save selection active: --save accepts images, labels, binary, '
-        'low_quality, nrrd, voxel_volume, high_quality, and summary; '
-        '--low_quality_downbin replaces the legacy downbin flag. The retained v16.1.8 '
+        '[v16.2.2] radial channel stacks wrap across the angular seam, C>=5 saved view inputs '
+        'use multi-page TIFF, --troubleshooting is removed, and legacy environment aliases are '
+        'no longer accepted. Unified --save selection remains active for images, labels, binary, '
+        'low_quality, nrrd, voxel_volume, high_quality, and summary. The retained v16.1.8 '
         'runtime set includes hardware-linear Radial texture sampling by '
         'default, bilinear in-plane Tilted forward inputs (exact nearest mask '
         'backprojection retained), retried/loud-failing ffmpeg launches, plus the v16.1.7 '
@@ -40115,7 +39691,7 @@ def main() -> None:
         f'Model input channel format: {channel_format.token} '
         f'(kind={channel_format.kind}, channels={int(channel_format.channel_count)}, '
         f'stride={int(channel_format.stride)}, offsets={list(channel_format.offsets)}; '
-        'boundary=edge-clamp; result=center slice N only).'
+        'boundary=radial-wrap/cartesian-clamp; result=center slice N only).'
     )
 
     print(
@@ -40132,7 +39708,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('GPT-5.6-Sol-Pro v16.2.1 accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.2.2 accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -40344,8 +39920,6 @@ def main() -> None:
         v1613_bundle_reasons.append('requires raw-bbox/cvol NRRD layers')
     if not gpu_device_union_enabled():
         v1613_bundle_reasons.append('requires task-local GPU device unions')
-    if bool(args.troubleshooting):
-        v1613_bundle_reasons.append('--troubleshooting requires dense per-view masks')
 
 
     if args.min_conf > 0 and args.min_conf < args.conf:
@@ -40391,9 +39965,6 @@ def main() -> None:
     nrrd_layers_needed = bool(save_nrrd_enabled)
     centerline_audit_nrrd_needed = bool(centerline_filter_enabled)
     nrrd_sink_needed = bool(nrrd_layers_needed or centerline_audit_nrrd_needed)
-    troubleshooting_outputs_enabled = bool(args.troubleshooting)
-    # troubleshooting creates overlay MKVs only. Temporary scratch retention is a
-    # separate hidden maintenance escape hatch so troubleshooting no longer changes cleanup semantics.
     keep_temp_artifacts = bool(_env_flag('YOLO_TTA_KEEP_TEMP', False))
 
     out_dir = Path(args.output).expanduser().resolve() if args.output else (Path.cwd() / input_path.stem)
@@ -40595,7 +40166,7 @@ def main() -> None:
     v1613_bundle_active = bool(not v1613_bundle_reasons)
     os.environ['YOLO_TTA_V1613_BUNDLE_ACTIVE'] = '1' if v1613_bundle_active else '0'
     # This variable is a parent-to-worker resolved-state publication, not a user input.
-    # Clear an inherited value before resolving the request aliases for this run.
+    # Clear inherited worker state before resolving this run's canonical request.
     os.environ.pop('YOLO_TTA_V1613_D1_PIPELINE_ACTIVE', None)
     if v1613_bundle_active:
         # v16.1.8: the fast bundle keeps hardware-linear texture sampling. The pointer
@@ -40623,7 +40194,7 @@ def main() -> None:
     elif v1613_bundle_active:
         print(
             'v16.1.8 fast bundle active with D1 disabled by '
-            'YOLO_TTA_V1613_D1_OWNER_PIPELINE=0 or YOLO_TTA_V1613_D1_PIPELINE=0: '
+            'YOLO_TTA_V1613_D1_OWNER_PIPELINE=0: '
             'hardware-linear Radial texture sampling, B1/D3, and C1-C3 remain active; the '
             'dense direct-union compatibility path is retained.'
         )
@@ -40638,7 +40209,7 @@ def main() -> None:
             'their disjoint slice windows straight into a bounded shared per-view union '
             '(memfd preferred; no per-task result files or scheduler-side OR pass). '
             'Set YOLO_TTA_GPU_WORKER_DIRECT_UNION=0 to restore the result-file path '
-            '(YOLO_TTA_MGPU_DIRECT_UNION remains a compatibility alias).'
+            '.'
         )
 
     radial_diameters = [
@@ -40673,7 +40244,7 @@ def main() -> None:
             'model_input_channels': int(channel_format.channel_count),
             'model_channel_stride': int(channel_format.stride),
             'model_channel_offsets': [int(v) for v in channel_format.offsets],
-            'model_channel_boundary_policy': 'edge_clamp',
+            'model_channel_boundary_policy': 'radial_wrap_cartesian_edge_clamp',
             'model_prediction_slice_policy': 'center_N_only',
             'fps': fps,
             'enable_cartesian': list(enabled_cartesian_views),
@@ -40759,11 +40330,18 @@ def main() -> None:
     if bool(low_quality_requested) and 'low_quality' not in effective_save_options:
         effective_save_options.append('low_quality (implied by --low_quality_downbin)')
     spec_notes.append(
-        'v16.2.1 unified output selection: --save=' + (
+        'v16.2.0 unified output selection: --save=' + (
             ', '.join(effective_save_options) if effective_save_options else '<none>'
         ) + '. high_quality controls the native-resolution final overlay; summary controls the '
         'summary text file; labels, binary, images, low_quality, and nrrd remain independently '
         'selectable with their established paths and filenames.'
+    )
+    spec_notes.append(
+        'v16.2.2 channel/output maintenance: Radial and Tilted Radial channel offsets wrap '
+        'modulo their angular frame count, while Cartesian and Tilted Cartesian offsets clamp '
+        'at the stack ends. With --save images, C>=5 channel inputs are written as multi-page '
+        'TIFFs containing one uint8 grayscale page per channel in model-input order. The retired '
+        '--troubleshooting CLI and legacy environment-variable aliases are removed.'
     )
     if tilted_radial_concrete_views:
         spec_notes.append(
@@ -40815,14 +40393,14 @@ def main() -> None:
         'v13.3.1 (R3/R4/R7b/R12/R16/R19/R24/R25): scratch memmap msync is opt-in (YOLO_TTA_MSYNC, '
         'default off — same-host page-cache coherence needs no synchronous flushes); single-angle '
         'CUDA workers write disjoint single-angle result windows directly into bounded memfd-backed per-view unions '
-        '(YOLO_TTA_GPU_WORKER_DIRECT_UNION; YOLO_TTA_MGPU_DIRECT_UNION is an alias); NRRD payload writes stream bounded double-buffered blocks '
+        '(YOLO_TTA_GPU_WORKER_DIRECT_UNION); NRRD payload writes stream bounded double-buffered blocks '
         '(YOLO_TTA_NRRD_Z_CHUNK_SLICES) filled by a GIL-releasing pool (YOLO_TTA_NRRD_FILL_WORKERS) '
         'that overlaps the selected gzip backend; CUDA workers receive the native source through descriptor-transferred memfd storage '
         '(no post-decode copy to scratch); foreground scans and the raw-bbox encoder no longer make '
         'full-slice cast copies, and interpolation bridge-delta layers reuse the pass added_voxels '
         'stat instead of rescanning; the interpolation merge visits only schedule-touched slices; '
-        'the NRRD member-gzip level defaults to 3 (YOLO_TTA_NRRD_GZIP_LEVEL; the former '
-        'environment name remains an alias), and low-quality MP4s use x264 '
+        'the NRRD member-gzip level defaults to 3 (YOLO_TTA_NRRD_GZIP_LEVEL), and low-quality '
+        'MP4s use x264 '
         'preset medium (YOLO_TTA_X264_PRESET).'
     )
     spec_notes.append(
@@ -40905,9 +40483,19 @@ def main() -> None:
         'v15 input-channel handling: RGB/YUV video is flattened to one gray/luma source volume; '
         f'--channel_format {channel_format.token} then constructs H×W×{int(channel_format.channel_count)} '
         f'model inputs with offsets {list(channel_format.offsets)} in each active view. '
-        'Out-of-range neighbors are edge-clamped, channel order is preserved, and each result '
-        'is assigned only to center slice N. No reverse-order inference set is generated.'
+        'Radial and Tilted Radial neighbors wrap modulo the view slice count; Cartesian and '
+        'Tilted Cartesian neighbors edge-clamp. Channel order is preserved, each result is assigned '
+        'only to center slice N, and no reverse-order inference set is generated.'
     )
+    if bool(save_images_enabled):
+        spec_notes.append(
+            f'Active-view image saving uses the inference channel layout {channel_format.token}: '
+            + (
+                'one multi-page TIFF per center, with one grayscale page per channel in input order.'
+                if int(channel_format.channel_count) >= 5 else
+                'PNG output for each center.'
+            )
+        )
     spec_notes.append('Voxel-volume reporting, when enabled, counts the final binary mask after restoration to native input geometry, not imgsz or cubic working geometry.')
     spec_notes.append('v12.2.0 tilt-angle validation follows the specification: values must be greater than 0 and less than or equal to 45 degrees.')
     if low_quality_downbin_warnings:
@@ -41052,11 +40640,6 @@ def main() -> None:
             f'Retina mask processor: gpu ({retina_processor_reason}). Ultralytics native retina_masks=True resolves '
             'full-resolution masks on the GPU, freeing CPU cores for rendering and postprocessing.'
         )
-    if bool(troubleshooting_outputs_enabled):
-        spec_notes.append(
-            '--troubleshooting active: writing FFV1 MKV overlays for each active full-frame native view and each available consolidated tiled prediction set; '
-            'temporary scratch retention is not implied.'
-        )
     native_ffv1_outputs = []
     if bool(save_high_quality_enabled):
         native_ffv1_outputs.append('overlay')
@@ -41071,7 +40654,7 @@ def main() -> None:
             'restores one encoder.'
         )
     if bool(keep_temp_artifacts):
-        spec_notes.append('YOLO_TTA_KEEP_TEMP=1 active: temporary scratch artifacts are retained independently of --troubleshooting.')
+        spec_notes.append('YOLO_TTA_KEEP_TEMP=1 active: temporary scratch artifacts are retained.')
     if bool(gaussian_smoothing_enabled):
         spec_notes.append(
             f'Gaussian smoothing active by v12.2.0 explicit-flag rule: sigma={float(gaussian_smoothing_sigma):g} voxel(s), '
@@ -41300,7 +40883,7 @@ def main() -> None:
         f'example worker_count={int(example_cpu_mask_workers)}, pending_limit={int(example_cpu_mask_pending)}.'
     )
     spec_notes.append(
-        f'Batched inference active with --batch={int(args.batch)}. StreamingYoloVolumeSource is used by default for full-frame/tile sources: it renders a bounded CPU prefetch window of H×W×{int(channel_format.channel_count)} center inputs and pads the final batch by repeating the last complete channel stack; CUDA input staging can additionally queue YOLO_TTA_GPU_INPUT_STAGING_BATCHES/GPU_PREFETCH_BATCHES complete BCHW batches in VRAM ahead of inference; set YOLO_TTA_STREAMING_PREDICTION_SOURCES=0 to restore dense in-memory prediction-volume materialization.'
+        f'Batched inference active with --batch={int(args.batch)}. StreamingYoloVolumeSource is used by default for full-frame/tile sources: it renders a bounded CPU prefetch window of H×W×{int(channel_format.channel_count)} center inputs and pads the final batch by repeating the last complete channel stack; CUDA input staging can additionally queue YOLO_TTA_GPU_INPUT_STAGING_BATCHES complete BCHW batches in VRAM ahead of inference; set YOLO_TTA_STREAMING_PREDICTION_SOURCES=0 to restore dense in-memory prediction-volume materialization.'
     )
     spec_notes.append(
         'Tiled masks are staged into one consolidated parent-view canvas per --tile_size/--tile_stride configuration before gating; '
@@ -41310,7 +40893,7 @@ def main() -> None:
         f'v15.0.3 (T10) sizes the tile-accumulator RAM reserve against the cgroup-corrected available anonymous memory '
         f'(now {tile_intermediate_accumulator_reserve_bytes() / GIB:.1f} GiB; YOLO_TTA_TILE_ACCUMULATOR_RESERVE_GIB pins it, '
         f'YOLO_TTA_TILE_ACCUMULATOR_RESERVE_FRACTION/_MIN_GIB/_MAX_GIB shape it). v16.0.2 defaults scratch to <output>/temp; '
-        f'--temp or YOLO_TTA_SCRATCH_DIR selects an explicit root, while an explicitly configured YOLO_TTA_SCRATCH_PREFER_SHM '
+        f'--temp selects an explicit root, while an explicitly configured YOLO_TTA_SCRATCH_PREFER_SHM '
         f'may select a proven-roomy memory-backed root (scratch is memory-backed={int(scratch_dir_is_memory_backed())}; '
         f'=0 disables, =1 forces, YOLO_TTA_SCRATCH_SHM_MIN_FREE_GIB sets the bar).'
     )
@@ -41484,7 +41067,6 @@ def main() -> None:
         and nrrd_layers_needed
         and not dense_tiling_active
         and not bool(keep_temp_artifacts)
-        and not bool(troubleshooting_outputs_enabled)
         and int(args.interpolate) <= 0
         and _env_flag('YOLO_TTA_SPARSE_VIEW_RETIREMENT', True)
     )
@@ -41492,11 +41074,7 @@ def main() -> None:
     _default_inference_view_limit = max(4, min(12, 2 * max(1, int(gpu_device_count))))
     direct_union_inference_view_limit = max(
         1,
-        _env_int_compat(
-            'YOLO_TTA_DIRECT_UNION_INFERENCE_VIEWS',
-            'YOLO_TTA_DIRECT_UNION_ACTIVE_VIEWS',
-            int(_default_inference_view_limit),
-        ),
+        _env_int('YOLO_TTA_DIRECT_UNION_INFERENCE_VIEWS', int(_default_inference_view_limit)),
     )
     _default_inference_bytes = max(
         128 * GIB, min(512 * GIB, int(max(1, _direct_headroom) * 0.55)),
@@ -41506,10 +41084,7 @@ def main() -> None:
             1.0,
             _env_float(
                 'YOLO_TTA_DIRECT_UNION_INFERENCE_GIB',
-                _env_float(
-                    'YOLO_TTA_DIRECT_UNION_ACTIVE_GIB',
-                    _default_inference_bytes / GIB,
-                ),
+                _default_inference_bytes / GIB,
             ),
         ) * GIB
     )
@@ -42094,7 +41669,6 @@ def main() -> None:
                     slice_workers=int(parent_slice_postprocess_workers),
                     interpolation_task_workers=int(parent_interpolation_task_workers),
                     nrrd_layers_enabled=bool(nrrd_layers_needed),
-                    retain_native_support=bool(troubleshooting_outputs_enabled),
                     precleaned_slice_cleanup=bool(single_angle_streaming_cleanup_active),
                     hole_fill_done_on_device=bool(hole_fill_done_on_device),
                     slice_meta=slice_meta_holder,
@@ -42175,8 +41749,8 @@ def main() -> None:
             path=acc_path,
             desc=f'{model_name}/{view_name} tile configuration {config_id} raw canvas',
             # tile groups OR straight into this canvas from the GPU worker processes, so
-            # it must be a file mapping they can open 'r+'. (Point YOLO_TTA_SCRATCH_DIR at a
-            # shm/tmpfs mount to keep it in RAM; flush_array is a no-op by default, so the
+            # it must be a file mapping they can open 'r+'. Use --temp with a shm/tmpfs root
+            # to keep it in RAM; flush_array is a no-op by default, so the
             # page cache already makes worker writes visible to this process.)
             prefer_memory=(
                 tile_intermediate_accumulators_prefer_memory() and not tile_group_dispatch_active
@@ -42577,11 +42151,9 @@ def main() -> None:
             interpolation_stats.extend(result.interpolation_stats)
             nrrd_layer_refs.extend(result.nrrd_layers)
 
-            # the interpolation process backend may have rebound the
-            # consolidated accumulator to a fresh disk memmap that received the
-            # interpolation bridge voxels. Re-point the registry (used below for
-            # keep_temp archiving and later for troubleshooting overlays) at that final
-            # volume and release the superseded pre-interpolation array.
+            # The interpolation backend may rebind the consolidated accumulator to a
+            # fresh memmap containing bridge voxels. Re-point the registry used for
+            # keep-temp archiving, then release the superseded pre-interpolation array.
             final_acc = result.final_accumulator_mm
             stale_acc = tile_accumulator_by_parent.get(parent_key)
             if final_acc is not None and stale_acc is not None and stale_acc is not final_acc:
@@ -42602,17 +42174,13 @@ def main() -> None:
                     except Exception:
                         pass
 
-            # Once the consolidated tile volume has been unioned into its parent destination and
-            # any NRRD layers have been materialized, category accumulators are no longer needed.
-            # The main consolidated tile accumulator is retained until troubleshooting overlays are
-            # scheduled when --troubleshooting is active; final cleanup archives/deletes any survivor.
+            # Once the consolidated tile volume has entered its parent destination and any
+            # NRRD layers have been materialized, all tile accumulators can retire.
             for label, store in (
                 ('consolidated gated tiles', tile_accumulator_by_parent),
                 ('tile components accepted by parent mask', tile_parent_mask_accumulator_by_parent),
                 ('tile components accepted by parent bridge', tile_parent_bridge_accumulator_by_parent),
             ):
-                if bool(troubleshooting_outputs_enabled) and label == 'consolidated gated tiles':
-                    continue
                 acc = store.pop(parent_key, None)
                 if acc is not None:
                     archive_or_delete_binary_volume_storage(
@@ -43138,11 +42706,9 @@ def main() -> None:
         _publish_gpu_worker_admissible_backlog()
         per_gpu = (
             max(1, min(4, _env_int('YOLO_TTA_V1613_D1_DISPATCH_WINDOW_PER_GPU', 2)))
-            if bool(v1613_d1_owner_active) else max(1, _env_int_compat(
-                'YOLO_TTA_GPU_WORKER_DISPATCH_WINDOW_PER_GPU',
-                'YOLO_TTA_MGPU_DISPATCH_WINDOW_PER_GPU',
-                2,
-            ))
+            if bool(v1613_d1_owner_active) else max(
+                1, _env_int('YOLO_TTA_GPU_WORKER_DISPATCH_WINDOW_PER_GPU', 2),
+            )
         )
         aux_pool = gpu_worker_aux_interpolation_pool()
         while gpu_worker_pending_task_ids:
@@ -43245,14 +42811,13 @@ def main() -> None:
         # so OpenCV must run each call
         # single-threaded (cv2.setNumThreads(1)); otherwise OpenCV's per-process pool funnels every
         # warpAffine/resize through a handful of threads and the render pool starves the GPUs while
-        # most cores sit idle. YOLO_TTA_GPU_WORKER_CPU / _CV2_THREADS override; the old
-        # YOLO_TTA_MGPU_* names remain aliases.
+        # most cores sit idle. YOLO_TTA_GPU_WORKER_CPU and YOLO_TTA_GPU_WORKER_CV2_THREADS override.
         per_worker_workers = max(
-            1, _env_int_compat(
+            1,
+            _env_int(
                 'YOLO_TTA_GPU_WORKER_CPU',
-                'YOLO_TTA_MGPU_WORKER_CPU',
                 max(1, int(_cpu_count()) // max(1, gpu_device_count)),
-            )
+            ),
         )
         fused_preflight_specs: List[Dict[str, object]] = []
         if fused_renderer_preflight_enabled():
@@ -43289,11 +42854,7 @@ def main() -> None:
             'input_channels': int(channel_format.channel_count),
             'channel_token': str(channel_format.token),
             'retina_processor': str(retina_processor),
-            'cv2_threads': max(1, _env_int_compat(
-                'YOLO_TTA_GPU_WORKER_CV2_THREADS',
-                'YOLO_TTA_MGPU_WORKER_CV2_THREADS',
-                1,
-            )),
+            'cv2_threads': max(1, _env_int('YOLO_TTA_GPU_WORKER_CV2_THREADS', 1)),
             # single-angle GPU fast-path (min_conf None when inactive) + min_radius.
             'single_angle_gpu_fastpath_min_conf': single_angle_gpu_fastpath_min_conf_value,
             'single_angle_gpu_fastpath_min_radius': single_angle_gpu_fastpath_min_radius_value,
@@ -43331,7 +42892,7 @@ def main() -> None:
         # stay unpinned). Computed from the PHYSICAL tokens before CUDA_VISIBLE_DEVICES is
         # narrowed inside the workers.
         worker_numa_plan = plan_gpu_worker_affinity(pinned_tokens)
-        explicit_worker_cpu = _env_any_set('YOLO_TTA_GPU_WORKER_CPU', 'YOLO_TTA_MGPU_WORKER_CPU')
+        explicit_worker_cpu = bool(os.environ.get('YOLO_TTA_GPU_WORKER_CPU', '').strip())
         worker_cpu_budgets: List[int] = []
         for worker_pos, cpus in enumerate(worker_numa_plan):
             if explicit_worker_cpu or not cpus:
@@ -43482,11 +43043,10 @@ def main() -> None:
         # whole volume leaving the other GPUs idle at the tail. The chunk is large relative to the
         # render prefetch window so per-chunk render ramp-up stays amortized. Tiles are gated/
         # consolidated as whole volumes, so they are never slice-split.
-        slice_chunk = max(gpu_worker_min_lease_slices(), _env_int_compat(
-            'YOLO_TTA_GPU_WORKER_SLICE_CHUNK',
-            'YOLO_TTA_MGPU_SLICE_CHUNK',
-            gpu_worker_max_lease_slices(),
-        ))
+        slice_chunk = max(
+            gpu_worker_min_lease_slices(),
+            _env_int('YOLO_TTA_GPU_WORKER_SLICE_CHUNK', gpu_worker_max_lease_slices()),
+        )
         prefetch_frames = streaming_prediction_source_prefetch_frames(max(1, int(args.batch)))
         # per-task device-side 2D hole fill is valid only when the spec steps that
         # precede hole fill (--min_conf, --min_radius) have no work, results stream through the
@@ -44640,7 +44200,7 @@ def main() -> None:
     # the scheduler's finally block above has joined every GPU worker and
     # inference/interpolation executor. Only now may CPU-only tail stages reclaim the CPU
     # reservation that main_process_worker_budget held for live GPU subprocesses. Keep
-    # separate aliases so disabling the gate preserves explicit legacy per-stage overrides.
+    # Separate budgets preserve the configured per-stage sizes when expansion is disabled.
     tail_slice_workers = int(
         tail_worker_budget if tail_budget_expansion_active else slice_postprocess_workers
     )
@@ -44987,32 +44547,6 @@ def main() -> None:
     final_output_volume_for_low_quality = output_volume_rgb
     final_paths: Dict[str, Path] = {}
 
-    if bool(troubleshooting_outputs_enabled):
-        print('\n=== Scheduling v12.2.0 troubleshooting overlays ===')
-        consolidated_tile_masks_for_model = {
-            str(view_name): mask
-            for (tile_model, view_name), mask in tile_accumulator_by_parent.items()
-            if str(tile_model) == str(model_name)
-        }
-        troubleshooting_paths, troubleshooting_futures = collect_troubleshooting_overlay_futures(
-            output_manager.executor,
-            volume_rgb=volume_rgb,
-            model_name=str(model_name),
-            views=inference_views,
-            native_view_support=native_view_support_by_model.get(str(model_name), {}),
-            consolidated_tile_masks=consolidated_tile_masks_for_model,
-            out_dir=out_dir,
-            stem=input_path.stem,
-            fps=fps,
-            show_progress=False,
-        )
-        final_paths.update(troubleshooting_paths)
-        output_manager.submit(BackgroundOutputSubmission(
-            label='troubleshooting overlays',
-            result_paths=troubleshooting_paths,
-            futures=troubleshooting_futures,
-            resources=[],
-        ))
 
     native_final_outputs_requested = bool(
         save_high_quality_enabled or save_binary_enabled or save_labels_enabled
@@ -45114,6 +44648,7 @@ def main() -> None:
                 view=view,
                 out_dir=out_dir,
                 stem=input_path.stem,
+                channel_format=channel_format,
                 workers=tail_output_frame_workers,
                 show_progress=False,
             )
@@ -45310,6 +44845,7 @@ def main() -> None:
 # v16.1.8 defaults Radial sampling to the hardware-linear texture, adds bilinear in-plane Tilted forward inputs (mask backprojection stays nearest/exact), and retries transient ffmpeg launch failures before failing the pipeline loudly.
 # v16.2.0 unifies output selection under --save, makes native-resolution overlay and summary explicit, and renames --low_quality_downbin without changing output paths or filenames.
 # v16.2.1 prevents hardware-texture Radial startup false positives by allowing one raster-perimeter-equivalent high-error seam while retaining the strict mean and broad-mismatch gates.
+# v16.2.2 wraps radial channel context, saves C>=5 view inputs as multi-page TIFFs, removes --troubleshooting, and drops legacy environment-variable aliases.
 # The heuristic global monkeypatch framework used by v16.0.8 was removed because it
 # could replace unrelated functions by name and shadow the real fused-union implementation.
 
