@@ -63,8 +63,8 @@ import numpy as np
 
 GIB = 1024 ** 3
 NRRD_SPACE = "left-posterior-superior"
-SCRIPT_VERSION = '16.2.2'
-SCRIPT_VERSION_COMPACT = '1622'
+SCRIPT_VERSION = '16.3.0'
+SCRIPT_VERSION_COMPACT = '1630'
 SCRIPT_BASENAME = f'GPT-5.6-Sol-Pro_v{SCRIPT_VERSION}_SLURM.py'
 OUTPUT_NRRD_PREFIX = ''
 LEGACY_OUTPUT_NRRD_PREFIX = 'HW_'
@@ -137,31 +137,11 @@ def _load_nvidia_ml_py() -> object:
 # CLI / args
 #
 
-def _parse_angles(s: str) -> List[float]:
-    """Accepts comma or whitespace separated angles."""
-    if s is None:
-        return []
-    s = s.strip()
-    if not s:
-        return []
-    parts = re.split(r"[,\s]+", s)
-    return [float(p) for p in parts if p != ""]
-
-
-def _parse_int_list(values: Sequence[str] | str | int | None) -> List[int]:
-    """Accept comma and/or whitespace separated integer lists."""
-    if values is None:
-        return []
-    if isinstance(values, int):
-        return [int(values)]
-    raw_values = [values] if isinstance(values, str) else [str(v) for v in values]
-    parts: List[str] = []
-    for raw in raw_values:
-        raw = str(raw).strip()
-        if not raw:
-            continue
-        parts.extend([p for p in re.split(r"[,\s]+", raw) if p])
-    return [int(p) for p in parts]
+def _parse_angles(
+    values: Sequence[str] | str | float | int | None,
+) -> List[float]:
+    """Accept comma-separated, whitespace-separated, or mixed angle values."""
+    return _parse_float_list(values)
 
 
 def _parse_token_list(values: Sequence[str] | str | None) -> List[str]:
@@ -211,6 +191,25 @@ RADIAL_VIEW_TOKENS: Tuple[str, ...] = (
     'transverse', 'sagittal', 'coronal',
     'tilted_transverse', 'tilted_sagittal', 'tilted_coronal',
 )
+TILT_DIRECTION_TOKENS: Tuple[str, ...] = ('vertical', 'horizontal', 'both')
+
+
+@dataclass(frozen=True)
+class RadialViewRequest:
+    """One Radial target paired with an explicit spacing or the per-view auto default."""
+
+    view: str
+    azimuth_angle: Optional[float] = None  # None means auto/full coverage.
+
+
+@dataclass(frozen=True)
+class TiltedViewGroup:
+    """One structured ``--enable_tilted`` group before signed variants are expanded."""
+
+    views: Tuple[str, ...]
+    tilt_angles: Tuple[float, ...]
+    tilt_directions: Tuple[str, ...]  # Canonicalized to vertical/horizontal.
+
 
 
 def _parse_float_list(values: Sequence[str] | str | float | int | None) -> List[float]:
@@ -227,6 +226,7 @@ def _parse_float_list(values: Sequence[str] | str | float | int | None) -> List[
             continue
         parts.extend([p for p in re.split(r"[,\s]+", raw) if p])
     return [float(p) for p in parts]
+
 
 
 def _resolve_unique_view_tokens(
@@ -248,8 +248,9 @@ def _resolve_unique_view_tokens(
     return out
 
 
+
 def resolve_cartesian_views(values: Sequence[str] | str | None) -> List[str]:
-    """Resolve ``--enable_cartesian`` without adding any implicit view."""
+    """Resolve flat ``--enable_cartesian`` values without adding an implicit view."""
     return _resolve_unique_view_tokens(
         values,
         valid=CARTESIAN_VIEW_TOKENS,
@@ -257,58 +258,191 @@ def resolve_cartesian_views(values: Sequence[str] | str | None) -> List[str]:
     )
 
 
-def resolve_tilt_angles(values: Sequence[str] | str | None) -> List[float]:
-    raw = _parse_float_list(values)
+
+def _structured_group_values(
+    values: Sequence[str] | str | None,
+    *,
+    flag_name: str,
+) -> List[str]:
+    if values is None:
+        return []
+    raw_values = [values] if isinstance(values, str) else [str(v) for v in values]
+    groups: List[str] = []
+    for raw in raw_values:
+        token = str(raw).strip()
+        if not token:
+            raise ValueError(f'{flag_name} contains an empty structured group')
+        groups.append(token)
+    return groups
+
+
+
+def _split_structured_group(
+    raw_group: str,
+    *,
+    slot_count: int,
+    flag_name: str,
+) -> List[str]:
+    slots = [part.strip() for part in str(raw_group).split(':')]
+    if len(slots) > int(slot_count):
+        raise ValueError(
+            f'{flag_name} group {raw_group!r} has {len(slots)} slots; '
+            f'expected at most {int(slot_count)}'
+        )
+    slots.extend([''] * (int(slot_count) - len(slots)))
+    return slots
+
+
+
+def _parse_comma_slot(slot: str) -> List[str]:
+    return [part.strip() for part in str(slot).split(',') if part.strip()]
+
+
+
+def _resolve_tilt_direction_slot(slot: str, *, group: str) -> Tuple[str, ...]:
+    tokens = [token.lower() for token in _parse_comma_slot(slot)] if str(slot).strip() else ['both']
+    out: List[str] = []
+    for token in tokens:
+        if token not in TILT_DIRECTION_TOKENS:
+            expected = ', '.join(TILT_DIRECTION_TOKENS)
+            raise ValueError(
+                f'--enable_tilted group {group!r} has invalid TILT_DIRECTION {token!r}; '
+                f'expected one or more of: {expected}'
+            )
+        expanded = ('vertical', 'horizontal') if token == 'both' else (token,)
+        for direction in expanded:
+            if direction not in out:
+                out.append(direction)
+    return tuple(out)
+
+
+
+def _resolve_tilt_angle_slot(slot: str, *, group: str) -> Tuple[float, ...]:
+    raw_values = _parse_comma_slot(slot) if str(slot).strip() else ['30']
     out: List[float] = []
     seen: set[float] = set()
-    for angle in raw:
-        angle_f = float(angle)
-        if angle_f == 0.0:
-            continue
-        if angle_f < 0.0:
-            raise ValueError('--tilt_angle values must be positive; each non-zero value creates both signed tilt variants')
-        if angle_f in seen:
-            continue
-        seen.add(angle_f)
-        out.append(angle_f)
-    return out
+    for raw in raw_values:
+        try:
+            angle = float(raw)
+        except Exception as exc:
+            raise ValueError(
+                f'--enable_tilted group {group!r} has invalid TILT_ANGLE {raw!r}'
+            ) from exc
+        if not math.isfinite(angle) or not (0.0 < float(angle) <= 45.0):
+            raise ValueError(
+                f'--enable_tilted group {group!r} requires every TILT_ANGLE to be '
+                f'greater than 0 and less than or equal to 45; got {raw!r}'
+            )
+        if float(angle) not in seen:
+            seen.add(float(angle))
+            out.append(float(angle))
+    return tuple(out)
 
 
-def resolve_tilt_directions(values: Sequence[str] | str | None) -> List[str]:
-    raw = [str(v).strip().lower() for v in _parse_token_list(values)]
+
+def resolve_tilted_view_groups(
+    values: Sequence[str] | str | None,
+) -> List[TiltedViewGroup]:
+    """Resolve ``VIEW:TILT_ANGLE:TILT_DIRECTION`` groups.
+
+    Spaces separate groups; commas select multiple values inside a slot. Empty angle and
+    direction slots default to 30 degrees and both directions, respectively.
+    """
+    groups: List[TiltedViewGroup] = []
+    seen_groups: set[Tuple[Tuple[str, ...], Tuple[float, ...], Tuple[str, ...]]] = set()
+    for raw_group in _structured_group_values(values, flag_name='--enable_tilted'):
+        view_slot, angle_slot, direction_slot = _split_structured_group(
+            raw_group,
+            slot_count=3,
+            flag_name='--enable_tilted',
+        )
+        views = tuple(_resolve_unique_view_tokens(
+            _parse_comma_slot(view_slot),
+            valid=CARTESIAN_VIEW_TOKENS,
+            flag_name=f'--enable_tilted group {raw_group!r} VIEW',
+        ))
+        if not views:
+            raise ValueError(
+                f'--enable_tilted group {raw_group!r} must specify at least one VIEW'
+            )
+        angles = _resolve_tilt_angle_slot(angle_slot, group=raw_group)
+        directions = _resolve_tilt_direction_slot(direction_slot, group=raw_group)
+        key = (views, angles, directions)
+        if key in seen_groups:
+            continue
+        seen_groups.add(key)
+        groups.append(TiltedViewGroup(
+            views=views,
+            tilt_angles=angles,
+            tilt_directions=directions,
+        ))
+    return groups
+
+
+
+def tilted_group_base_views(groups: Sequence[TiltedViewGroup]) -> List[str]:
+    """Return unique Tilted base views in first-request order."""
     out: List[str] = []
-    for token in raw:
-        if token == 'both':
-            for expanded in ('vertical', 'horizontal'):
-                if expanded not in out:
-                    out.append(expanded)
-            continue
-        if token not in ('vertical', 'horizontal'):
-            raise ValueError('--tilt_direction values must be vertical, horizontal, or both')
-        if token not in out:
-            out.append(token)
-    # default: both directions whenever Tilted views are enabled.
-    if not out:
-        out = ['vertical', 'horizontal']
+    for group in groups:
+        for view in group.views:
+            if view not in out:
+                out.append(str(view))
     return out
 
 
-def resolve_tilt_views(values: Sequence[str] | str | None) -> List[str]:
-    """Resolve ``--enable_tilted`` without adding any implicit Tilted base view."""
-    return _resolve_unique_view_tokens(
-        values,
-        valid=CARTESIAN_VIEW_TOKENS,
-        flag_name='--enable_tilted',
-    )
 
-
-def resolve_radial_views(values: Sequence[str] | str | None) -> List[str]:
-    """Resolve the ordered ``--enable_radial`` transform targets."""
-    return _resolve_unique_view_tokens(
-        values,
-        valid=RADIAL_VIEW_TOKENS,
-        flag_name='--enable_radial',
-    )
+def resolve_radial_view_requests(
+    values: Sequence[str] | str | None,
+) -> List[RadialViewRequest]:
+    """Resolve ``VIEWS:AZIMUTH_ANGLE`` groups into one unambiguous request per view."""
+    out: List[RadialViewRequest] = []
+    seen: set[str] = set()
+    for raw_group in _structured_group_values(values, flag_name='--enable_radial'):
+        view_slot, angle_slot = _split_structured_group(
+            raw_group,
+            slot_count=2,
+            flag_name='--enable_radial',
+        )
+        views = _resolve_unique_view_tokens(
+            _parse_comma_slot(view_slot),
+            valid=RADIAL_VIEW_TOKENS,
+            flag_name=f'--enable_radial group {raw_group!r} VIEWS',
+        )
+        if not views:
+            raise ValueError(
+                f'--enable_radial group {raw_group!r} must specify at least one VIEW'
+            )
+        angle: Optional[float]
+        angle_token = str(angle_slot).strip().lower()
+        if angle_token in {'', 'auto'}:
+            angle = None
+        else:
+            if len(_parse_comma_slot(angle_slot)) != 1:
+                raise ValueError(
+                    f'--enable_radial group {raw_group!r} accepts one AZIMUTH_ANGLE '
+                    'shared by every VIEW in that group'
+                )
+            try:
+                angle = float(angle_slot)
+            except Exception as exc:
+                raise ValueError(
+                    f'--enable_radial group {raw_group!r} has invalid AZIMUTH_ANGLE '
+                    f'{angle_slot!r}'
+                ) from exc
+            if not math.isfinite(float(angle)) or float(angle) <= 0.0:
+                raise ValueError(
+                    f'--enable_radial group {raw_group!r} requires AZIMUTH_ANGLE '
+                    f'to be greater than 0 or omitted/auto; got {angle_slot!r}'
+                )
+        for view in views:
+            if view in seen:
+                raise ValueError(
+                    f'--enable_radial assigns {view!r} more than once; each Radial VIEW '
+                    'must have exactly one paired AZIMUTH_ANGLE'
+                )
+            seen.add(view)
+            out.append(RadialViewRequest(view=str(view), azimuth_angle=angle))
+    return out
 
 
 @dataclass(frozen=True)
@@ -479,8 +613,17 @@ def build_argparser() -> argparse.ArgumentParser:
         ),
     )
 
-    p.add_argument("--angle", default="0,120,240", type=str,
-                   help="Rotation angles in degrees for augmentation (comma or whitespace separated)")
+    p.add_argument(
+        "--angle",
+        nargs="+",
+        default=["0,120,240"],
+        type=str,
+        metavar="DEG",
+        help=(
+            "Rotation angles in degrees for augmentation. Comma-separated, whitespace-separated, "
+            "and mixed forms are accepted"
+        ),
+    )
     p.add_argument("--min_radius", default=0.0, type=float,
                    help="Remove objects whose radius is smaller than this value, measured on the YOLO output masks "
                         "in each prediction set's own native 2D slice plane, before backprojection, independently "
@@ -496,8 +639,8 @@ def build_argparser() -> argparse.ArgumentParser:
         metavar="VIEW",
         help=(
             "Enable one or more Cartesian views: transverse, sagittal, coronal. "
-            "Comma-separated, whitespace-separated, and mixed comma/whitespace forms are accepted. "
-            "No Cartesian view is enabled by default"
+            "This is a flat multivalue flag, so comma-separated, whitespace-separated, "
+            "and mixed forms are accepted. No Cartesian view is enabled by default"
         ),
     )
     p.add_argument(
@@ -505,25 +648,15 @@ def build_argparser() -> argparse.ArgumentParser:
         nargs="+",
         default=None,
         type=str,
-        metavar="VIEW",
+        metavar="VIEWS[:AZIMUTH_ANGLE]",
         help=(
-            "Enable one or more Radial transforms: transverse, sagittal, coronal, "
-            "tilted_transverse, tilted_sagittal, tilted_coronal. Cartesian Radial transforms "
-            "do not require the matching upright Cartesian view. A tilted_* target expands to "
-            "every enabled Tilted variant of that base; it is skipped with a log message when none exist"
-        ),
-    )
-    p.add_argument(
-        "--azimuth_angle",
-        nargs="+",
-        default=None,
-        type=str,
-        metavar="DEG",
-        help=(
-            "Radial angular spacing over [0,180). One value broadcasts to every --enable_radial "
-            "target; multiple values must match the ordered --enable_radial target count. Omission "
-            "uses the largest full-coverage angle independently for each target. Supplying this flag "
-            "alone does not enable Radial views; 0 disables its paired target"
+            "Enable one or more structured Radial groups. VIEWS accepts comma-separated "
+            "transverse, sagittal, coronal, tilted_transverse, tilted_sagittal, and "
+            "tilted_coronal values. AZIMUTH_ANGLE is one positive degree spacing shared by "
+            "every view in its group; omission or 'auto' selects the largest per-view "
+            "full-coverage spacing. Spaces separate groups. Upright Radial targets do not "
+            "require their Cartesian base, while tilted_* targets expand across every enabled "
+            "Tilted variant of that base and are skipped with a log when none exist"
         ),
     )
     p.add_argument(
@@ -531,21 +664,30 @@ def build_argparser() -> argparse.ArgumentParser:
         nargs="+",
         default=None,
         type=str,
-        metavar="VIEW",
+        metavar="VIEW[:TILT_ANGLE[:TILT_DIRECTION]]",
         help=(
-            "Enable one or more Tilted Cartesian bases: transverse, sagittal, coronal. "
-            "No Tilted view is enabled by default, and the base need not be enabled by --enable_cartesian"
+            "Enable one or more structured Tilted groups. VIEW accepts comma-separated "
+            "transverse, sagittal, and coronal values. TILT_ANGLE accepts comma-separated "
+            "positive values <=45 and defaults to 30; each creates positive and negative "
+            "variants. TILT_DIRECTION accepts vertical, horizontal, both, or a comma-separated "
+            "combination and defaults to both. Spaces separate groups. A Cartesian base need "
+            "not be enabled"
         ),
     )
-    p.add_argument("--tilt_angle", nargs="+", default=["30"], type=str,
-                   help="One or more positive Tilted View angles in degrees. Each value creates both positive and negative variants. 0 disables all Tilted views even when --enable_tilted is set. Values must be greater than 0 and less than or equal to 45")
-    p.add_argument("--tilt_direction", nargs="+", default=["vertical", "horizontal"], type=str,
-                   help="One or more Tilted View directions: vertical, horizontal, or both. Defaults to vertical and horizontal")
-
-    p.add_argument("--tile_size", nargs="+", default=["0"], type=str,
-                   help="One or more square dense-tile side lengths in source pixels for all active views. 0 disables dense tiled predictions")
-    p.add_argument("--tile_stride", nargs="+", default=["0"], type=str,
-                   help="One or more dense-tile strides in source pixels. Values are index-paired with --tile_size; one stride broadcasts to every tile size. Each stride must be <= its paired tile size")
+    p.add_argument(
+        "--enable_tile",
+        nargs="+",
+        default=None,
+        type=str,
+        metavar="TILE_SIZE:TILE_STRIDE",
+        help=(
+            "Enable one or more structured dense-tile groups. TILE_SIZE is the side length in "
+            "parent-view source pixels represented by one (--imgsz,--imgsz) inference range; "
+            "smaller values increase magnification. TILE_STRIDE is the positive parent-view "
+            "source-pixel step between adjacent tiles and must be <= TILE_SIZE; smaller values "
+            "increase overlap and recall. Both slots are required and spaces separate groups"
+        ),
+    )
 
     p.add_argument(
         "--save",
@@ -599,15 +741,15 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--gaussian_smoothing_passes", default=None, type=int,
                    help="Number of Gaussian smoothing passes. Unset uses default 1 when smoothing is activated by either Gaussian flag; explicitly set 0 to disable")
 
-    p.add_argument("--interpolate", default=15, type=int,
+    p.add_argument("--interpolation_distance", default=15, type=int,
                    help="Maximum view-native slice/frame distance used to search for interpolation candidates. Radial interpolation wraps around frame order. 0 disables interpolation")
     p.add_argument("--interpolation_walk_back", default=3, type=int,
                    help="Additional source slices to bridge before the endpoint slice. 0 disables walk-back bridges")
     p.add_argument("--interpolation_candidates", default=1, type=int,
                    help="Accept up to the Nth nearest interpolation candidate per endpoint projection")
-    p.add_argument("--interpolate_passes", default=1, type=int,
+    p.add_argument("--interpolation_passes", default=1, type=int,
                    help="Run the interpolation process this many passes, treating the previous pass as real")
-    p.add_argument("--interpolate_min_radius", default=3, type=float,
+    p.add_argument("--interpolation_min_radius", default=3, type=float,
                    help="Reject a candidate connection if the bridge radius is equal to, or smaller than, this value. 0 disables the check")
     p.add_argument("--interpolation_search_angle", default=15.0, type=float,
                    help="Projection growth angle in degrees. Must be greater than -90 and less than 90")
@@ -911,7 +1053,6 @@ class RuntimeTelemetry:
 
     def __init__(self) -> None:
         self.enabled = _env_flag('YOLO_TTA_TELEMETRY', True)
-        self.detail = _env_flag('YOLO_TTA_TELEMETRY_DETAIL', False)
         self.lock = threading.RLock()
         self.started_ns = time.monotonic_ns()
         self.phase_ns: Counter[str] = Counter()
@@ -1971,7 +2112,7 @@ def resolve_parent_interpolation_worker_allocation(
     """Resolve per-parent interpolation workers from actual live overlap.
 
  The process-backend state is supplied explicitly for the current command. Merely having
- the backend installed/configured no longer divides worker budgets when ``--interpolate 0``
+ the backend installed/configured no longer divides worker budgets when ``--interpolation_distance 0``
  leaves no interpolation task capable of running."""
     budget = max(1, int(worker_budget))
     parent_workers = max(1, int(parent_postprocess_workers))
@@ -2395,40 +2536,14 @@ def open_raw_store_payload_writer(path: Path, desc: str) -> Iterator[object]:
         yield handle
 
 
-def memmap_msync_enabled() -> bool:
-    """Return whether scratch memmaps should force synchronous ``msync``."""
-    return _env_flag('YOLO_TTA_MSYNC', False)
-
-
 def flush_array(arr: object, *, force: bool = False) -> None:
-    if arr is None:
-        return
-    # no-op unless synchronous msync is explicitly requested (or forced by a
-    # caller with a genuine durability boundary).
-    if not force and not memmap_msync_enabled():
-        return
+    """Compatibility no-op for ephemeral scratch mappings.
 
-    lazy_flush = getattr(arr, 'flush', None)
-    if bool(getattr(arr, '_is_lazy_processing_cube', False)) and callable(lazy_flush):
-        try:
-            lazy_flush()
-            return
-        except Exception:
-            pass
-
-    try:
-        if isinstance(arr, np.memmap):
-            arr.flush()
-            return
-    except Exception:
-        pass
-
-    base = getattr(arr, 'base', None)
-    try:
-        if isinstance(base, np.memmap):
-            base.flush()
-    except Exception:
-        pass
+    NumPy memmaps use shared mappings, so same-host readers observe dirty pages without
+    synchronous ``msync``. Scratch files are retired rather than used as durability records;
+    forcing writeback only adds I/O before cleanup.
+    """
+    return
 
 
 @runtime_telemetry_phase('workspace.allocate')
@@ -4644,39 +4759,24 @@ def restore_mask_volume_to_original_shape(
 
 
 def resolve_radial_azimuth_angles(
-    requested_values: Sequence[str] | str | float | int | None,
+    requests: Sequence[RadialViewRequest],
     *,
-    radial_targets: Sequence[str],
     diameters: Sequence[int],
 ) -> List[float]:
-    """Resolve one ordered azimuth spacing per ``--enable_radial`` target.
-
- A single explicit value broadcasts. Multiple explicit values must match the target count.
- With no explicit value, each target receives its own largest full-coverage spacing from its
- maximally inscribed circle diameter. Explicit ``--azimuth_angle`` without any Radial target
- is validated but deliberately enables nothing."""
-    targets = [str(v) for v in radial_targets]
-    if len(diameters) != len(targets):
+    """Resolve each Radial request's paired spacing after its diameter is known."""
+    request_list = list(requests)
+    if len(diameters) != len(request_list):
         raise ValueError(
             f'internal radial diameter count mismatch: {len(diameters)} diameter(s) for '
-            f'{len(targets)} target(s)'
+            f'{len(request_list)} request(s)'
         )
-    requested = _parse_float_list(requested_values)
-    for value in requested:
-        if float(value) < 0.0:
-            raise ValueError('--azimuth_angle values must be >= 0')
-    if not targets:
-        return []
-    if not requested:
-        return [radial_full_coverage_angle_deg(int(d)) for d in diameters]
-    if len(requested) == 1:
-        return [float(requested[0])] * len(targets)
-    if len(requested) != len(targets):
-        raise ValueError(
-            f'--azimuth_angle supplied {len(requested)} values for {len(targets)} '
-            '--enable_radial values; provide one value to broadcast or matching counts'
-        )
-    return [float(v) for v in requested]
+    resolved: List[float] = []
+    for request, diameter in zip(request_list, diameters):
+        if request.azimuth_angle is None:
+            resolved.append(radial_full_coverage_angle_deg(int(diameter)))
+        else:
+            resolved.append(float(request.azimuth_angle))
+    return resolved
 
 
 
@@ -5554,6 +5654,33 @@ def _build_tilted_view_infos(
     return out
 
 
+def _build_tilted_view_infos_from_groups(
+    T: int,
+    H: int,
+    W: int,
+    *,
+    tilt_groups: Sequence[TiltedViewGroup],
+) -> List[ViewInfo]:
+    """Expand structured requests through the unchanged Tilted geometry builder."""
+    out: List[ViewInfo] = []
+    seen_names: set[str] = set()
+    for group in tilt_groups:
+        built = _build_tilted_view_infos(
+            int(T),
+            int(H),
+            int(W),
+            tilt_views=group.views,
+            tilt_angles=group.tilt_angles,
+            tilt_directions=group.tilt_directions,
+        )
+        for view in built:
+            if str(view.name) in seen_names:
+                continue
+            seen_names.add(str(view.name))
+            out.append(view)
+    return out
+
+
 def _build_radial_view_info(
     T: int,
     H: int,
@@ -5669,41 +5796,40 @@ def get_view_infos(
     cartesian_views: Optional[Sequence[str]] = None,
     radial_views: Optional[Sequence[str]] = None,
     radial_azimuth_angles: Optional[Sequence[float]] = None,
-    tilt_views: Optional[Sequence[str]] = None,
-    tilt_angles: Optional[Sequence[float]] = None,
-    tilt_directions: Optional[Sequence[str]] = None,
+    tilt_groups: Optional[Sequence[TiltedViewGroup]] = None,
     radial_native_raster: int = 0,
 ) -> List[ViewInfo]:
-    """Build the complete view set without any implicit Cartesian/Tilted/Radial view."""
+    """Build the complete view set without changing any view-family geometry."""
     enabled_cartesian = resolve_cartesian_views(cartesian_views)
-    enabled_tilted = resolve_tilt_views(tilt_views)
-    enabled_radial = resolve_radial_views(radial_views)
-    resolved_tilt_angles = resolve_tilt_angles(tilt_angles)
-    resolved_tilt_directions = resolve_tilt_directions(tilt_directions)
+    enabled_radial = _resolve_unique_view_tokens(
+        radial_views,
+        valid=RADIAL_VIEW_TOKENS,
+        flag_name='Radial view assembly',
+    )
+    resolved_tilt_groups = list(tilt_groups or ())
     azimuths = [float(v) for v in (radial_azimuth_angles or [])]
     if len(azimuths) != len(enabled_radial):
         raise ValueError(
             f'get_view_infos received {len(azimuths)} radial azimuth value(s) for '
             f'{len(enabled_radial)} Radial target(s)'
         )
+    if any((not math.isfinite(float(value))) or float(value) <= 0.0 for value in azimuths):
+        raise ValueError('get_view_infos requires one finite positive azimuth spacing per Radial target')
 
     orthogonal = [
         _build_cartesian_view(base, int(T), int(H), int(W))
         for base in enabled_cartesian
     ]
-    tilted = _build_tilted_view_infos(
-        int(T), int(H), int(W),
-        tilt_views=enabled_tilted,
-        tilt_angles=resolved_tilt_angles,
-        tilt_directions=resolved_tilt_directions,
+    tilted = _build_tilted_view_infos_from_groups(
+        int(T),
+        int(H),
+        int(W),
+        tilt_groups=resolved_tilt_groups,
     )
 
     radial_cartesian: List[ViewInfo] = []
     radial_tilted: List[ViewInfo] = []
     for target, angle in zip(enabled_radial, azimuths):
-        if float(angle) <= 0.0:
-            print(f'Radial target {target!r} skipped because its resolved --azimuth_angle is 0.')
-            continue
         base = radial_target_base_view(target)
         if not str(target).startswith('tilted_'):
             radial_cartesian.append(_build_radial_view_info(
@@ -5720,7 +5846,7 @@ def get_view_infos(
         if not matching:
             print(
                 f'Radial target {target!r} skipped: no {base} Tilted variants are enabled. '
-                f'Add --enable_tilted {base} with a non-zero --tilt_angle to generate it.'
+                f'Add --enable_tilted {base}:30:both (or another valid group) to generate it.'
             )
             continue
         for source_view in matching:
@@ -5733,8 +5859,8 @@ def get_view_infos(
                 tilted_source=source_view,
             ))
 
-    # Schedule upright Cartesian, Cartesian Radial, concrete Tilted variants, then Radial
-    # transforms of those Tilted variants.
+    # Scheduling order is unchanged: upright Cartesian, upright Radial, concrete Tilted,
+    # then Radial transforms of concrete Tilted variants.
     return orthogonal + radial_cartesian + tilted + radial_tilted
 
 
@@ -6148,52 +6274,59 @@ class TileConfig:
     config_id: str
 
 
-def resolve_tile_configs(tile_sizes_raw: Sequence[str] | str | int | None, tile_strides_raw: Sequence[str] | str | int | None) -> List[TileConfig]:
-    """Pair tile sizes and strides, broadcasting one stride when requested.
-    
-    Each pair is validated independently and duplicate configurations are rejected."""
-    tile_sizes = _parse_int_list(tile_sizes_raw)
-    tile_strides = _parse_int_list(tile_strides_raw)
-
-    if not tile_sizes:
-        tile_sizes = [0]
-    if not tile_strides:
-        tile_strides = [0]
-
-    if any(int(v) == 0 for v in tile_sizes):
-        if len(tile_sizes) == 1 and int(tile_sizes[0]) == 0:
-            if any(int(v) != 0 for v in tile_strides):
-                raise ValueError('--tile_stride must be 0 when --tile_size disables tiled predictions')
-            return []
-        raise ValueError('--tile_size 0 cannot be mixed with active tile sizes')
-
-    if any(int(v) <= 0 for v in tile_sizes):
-        raise ValueError('--tile_size values must be > 0 when dense tiling is active')
-    if any(int(v) <= 0 for v in tile_strides):
-        raise ValueError('--tile_stride values must be > 0 when dense tiling is active')
-
-    if len(tile_strides) == 1 and len(tile_sizes) > 1:
-        tile_strides = [int(tile_strides[0])] * len(tile_sizes)
-    if len(tile_strides) != len(tile_sizes):
-        raise ValueError(
-            f'--tile_size and --tile_stride are index-paired: got {len(tile_sizes)} size value(s) '
-            f'and {len(tile_strides)} stride value(s); provide matching counts or a single stride'
-        )
-
+def resolve_tile_configs(
+    values: Sequence[str] | str | None,
+) -> List[TileConfig]:
+    """Resolve structured ``TILE_SIZE:TILE_STRIDE`` groups."""
     configs: List[TileConfig] = []
     seen: set[str] = set()
-    for tile_size, tile_stride in zip(tile_sizes, tile_strides):
+    for raw_group in _structured_group_values(values, flag_name='--enable_tile'):
+        size_slot, stride_slot = _split_structured_group(
+            raw_group,
+            slot_count=2,
+            flag_name='--enable_tile',
+        )
+        if not size_slot or not stride_slot:
+            raise ValueError(
+                f'--enable_tile group {raw_group!r} requires both '
+                'TILE_SIZE and TILE_STRIDE'
+            )
+        if len(_parse_comma_slot(size_slot)) != 1 or len(_parse_comma_slot(stride_slot)) != 1:
+            raise ValueError(
+                f'--enable_tile group {raw_group!r} accepts one TILE_SIZE and one '
+                'TILE_STRIDE; use spaces to separate additional groups'
+            )
+        try:
+            tile_size = int(size_slot)
+            tile_stride = int(stride_slot)
+        except Exception as exc:
+            raise ValueError(
+                f'--enable_tile group {raw_group!r} requires integer '
+                'TILE_SIZE:TILE_STRIDE values'
+            ) from exc
+        if int(tile_size) <= 0:
+            raise ValueError(
+                f'--enable_tile group {raw_group!r} requires TILE_SIZE > 0'
+            )
+        if int(tile_stride) <= 0:
+            raise ValueError(
+                f'--enable_tile group {raw_group!r} requires TILE_STRIDE > 0'
+            )
         if int(tile_stride) > int(tile_size):
             raise ValueError(
-                f'--tile_stride {int(tile_stride)} must be less than or equal to its paired '
-                f'--tile_size {int(tile_size)}'
+                f'--enable_tile group {raw_group!r} requires TILE_STRIDE <= TILE_SIZE'
             )
         config_id = f's{int(tile_size)}_st{int(tile_stride)}'
         if config_id in seen:
-            raise ValueError(f'Duplicate dense tile configuration: tile_size={int(tile_size)}, tile_stride={int(tile_stride)}')
+            raise ValueError(
+                f'--enable_tile contains duplicate group {int(tile_size)}:{int(tile_stride)}'
+            )
         seen.add(config_id)
-        configs.append(TileConfig(tile_size=int(tile_size), tile_stride=int(tile_stride), config_id=config_id))
-
+        configs.append(TileConfig(
+            tile_size=int(tile_size),
+            tile_stride=int(tile_stride),
+            config_id=config_id,
+        ))
     return configs
 
 
@@ -8671,8 +8804,9 @@ def resolve_retina_mask_processor(explicit: Optional[str], devices: Sequence[str
     return 'cpu', 'non-CUDA default uses CPU retina reconstruction'
 
 
-# the active retina-mask processor resolved in main from --retina_mask_processor and
-# device. None means "fall back to the YOLO_TTA_CPU_RETINA_MASKS env default" (back-compat).
+# The active retina-mask processor is resolved from --retina_mask_processor and device
+# selection in main, then published independently inside each CUDA worker. Standalone callers
+# that run before resolution retain the conservative CPU default.
 _RETINA_MASK_PROCESSOR_IS_CPU: Optional[bool] = None
 
 
@@ -9251,12 +9385,14 @@ def _detach_clone_tensor_if_torch(value: object) -> object:
 
 
 def cpu_retina_masks_enabled() -> bool:
-    """Resolve CPU versus GPU retina-mask reconstruction.
-    
-    The CLI-resolved processor wins; standalone callers fall back to the environment setting."""
+    """Return the CLI/device-resolved retina-mask placement.
+
+    Main and CUDA-worker initialization always publish the resolved setting. CPU remains the
+    safe default only for isolated helper calls made before that initialization.
+    """
     if _RETINA_MASK_PROCESSOR_IS_CPU is not None:
         return bool(_RETINA_MASK_PROCESSOR_IS_CPU)
-    return _env_flag('YOLO_TTA_CPU_RETINA_MASKS', True)
+    return True
 
 
 def cpu_retina_roi_only_enabled() -> bool:
@@ -25743,45 +25879,44 @@ def apply_keep_largest_objects_inplace(
     # is applied through per-slice local->keep LUTs restricted to each slice's foreground bbox,
     # and slices whose components are all kept are never touched.
     comp_stats: Dict[str, object] = {}
-    with nrrd_foreground_topology_priority('keep_objects slice labeling'):
-        metadata_started = time.perf_counter()
-        support_metadata = binary_volume_slice_metadata(mask_mm)
-        if support_metadata is None:
-            support_metadata = scan_binary_volume_slice_metadata(
-                mask_mm,
-                workers=min(max(1, int(workers)), max(1, int(_cpu_count()))),
-                source='keep_objects exact fallback scan',
-            )
-        metadata_seconds = float(time.perf_counter() - metadata_started)
-        support_nonempty, support_bbox_pixels, support_bbox_fraction = binary_slice_bbox_coverage(
-            shape_tyx,
-            support_metadata.slice_any,
-            support_metadata.slice_bboxes,
-        )
-        print(
-            'keep_objects slice metadata: '
-            f'source={support_metadata.source}, exact={bool(support_metadata.exact)}, '
-            f'nonempty_z={int(support_nonempty)}/{int(shape_tyx[0])}, '
-            f'bbox_coverage={100.0 * float(support_bbox_fraction):.2f}% '
-            f'({int(support_bbox_pixels) / GIB:.2f} GiPixels), '
-            f'prepare={float(metadata_seconds):.3f}s.',
-            flush=True,
-        )
-        labels_mm, num_objects, label_paths = label_foreground_volume_streaming(
+    metadata_started = time.perf_counter()
+    support_metadata = binary_volume_slice_metadata(mask_mm)
+    if support_metadata is None:
+        support_metadata = scan_binary_volume_slice_metadata(
             mask_mm,
-            work_dir / 'final_keep_objects',
-            prefer_memory=bool(prefer_memory),
-            reserve_bytes=int(reserve_bytes),
-            workers=int(workers),
-            compact_relabel=False,
-            component_stats_out=comp_stats,
-            known_slice_any=support_metadata.slice_any,
-            known_slice_bboxes=support_metadata.slice_bboxes,
-            # also covers the prioritized --keep_objects 1 tail: the same local-label
-            # arena and direct packed-LUT apply avoid rebuilding a second dense host cube.
-            sparse_local_labels=True,
-            prefer_crop_bounded_cpu_labeling=True,
+            workers=min(max(1, int(workers)), max(1, int(_cpu_count()))),
+            source='keep_objects exact fallback scan',
         )
+    metadata_seconds = float(time.perf_counter() - metadata_started)
+    support_nonempty, support_bbox_pixels, support_bbox_fraction = binary_slice_bbox_coverage(
+        shape_tyx,
+        support_metadata.slice_any,
+        support_metadata.slice_bboxes,
+    )
+    print(
+        'keep_objects slice metadata: '
+        f'source={support_metadata.source}, exact={bool(support_metadata.exact)}, '
+        f'nonempty_z={int(support_nonempty)}/{int(shape_tyx[0])}, '
+        f'bbox_coverage={100.0 * float(support_bbox_fraction):.2f}% '
+        f'({int(support_bbox_pixels) / GIB:.2f} GiPixels), '
+        f'prepare={float(metadata_seconds):.3f}s.',
+        flush=True,
+    )
+    labels_mm, num_objects, label_paths = label_foreground_volume_streaming(
+        mask_mm,
+        work_dir / 'final_keep_objects',
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
+        workers=int(workers),
+        compact_relabel=False,
+        component_stats_out=comp_stats,
+        known_slice_any=support_metadata.slice_any,
+        known_slice_bboxes=support_metadata.slice_bboxes,
+        # also covers the common --keep_objects 1 tail: the same local-label
+        # arena and direct packed-LUT apply avoid rebuilding a second dense host cube.
+        sparse_local_labels=True,
+        prefer_crop_bounded_cpu_labeling=True,
+    )
     # The keep pass may mutate foreground below; do not let any later consumer reuse the
     # pre-keep support description. This is harmless when no removal is required.
     discard_binary_volume_slice_metadata(mask_mm)
@@ -31520,7 +31655,6 @@ class RawBBoxMaskStore:
         slices_per_member = max(1, int(member_bytes) // max(1, int(slice_bytes)))
 
         for first_z in range(int(z0), int(z1), int(slices_per_member)):
-            _nrrd_background_nonzero_checkpoint()
             last_z_exclusive = min(int(z1), int(first_z) + int(slices_per_member))
             ln = int(last_z_exclusive - first_z) * int(slice_bytes)
             candidates: List[int] = []
@@ -31588,7 +31722,6 @@ class RawBBoxMaskStore:
         slices_per_member = max(1, int(member_bytes) // max(1, int(slice_bytes)))
 
         for first_z in range(int(z0), int(z1), int(slices_per_member)):
-            _nrrd_background_nonzero_checkpoint()
             last_z_exclusive = min(int(z1), int(first_z) + int(slices_per_member))
             raw_len = int(last_z_exclusive - first_z) * int(slice_bytes)
             source_lists: List[Tuple[int, List[int]]] = []
@@ -36083,80 +36216,6 @@ def nrrd_member_gzip_window_bytes() -> int:
     return max(64, _env_int('YOLO_TTA_NRRD_MEMBER_GZIP_WINDOW_MIB', 512)) * 1024 * 1024
 
 
-_NRRD_BACKGROUND_NONZERO_RUN_EVENT = threading.Event()
-_NRRD_BACKGROUND_NONZERO_RUN_EVENT.set()
-_NRRD_FOREGROUND_PRIORITY_LOCK = threading.Lock()
-_NRRD_FOREGROUND_PRIORITY_DEPTH = 0
-
-
-def nrrd_yield_to_topology_enabled() -> bool:
-    """Let final topology briefly preempt new component-NRRD decode/deflate work."""
-    return _env_flag('YOLO_TTA_NRRD_YIELD_TO_TOPOLOGY', True)
-
-
-def _nrrd_background_nonzero_checkpoint() -> None:
-    """Block new nonzero NRRD members while a foreground topology phase owns priority."""
-    if not nrrd_yield_to_topology_enabled():
-        return
-    _NRRD_BACKGROUND_NONZERO_RUN_EVENT.wait()
-
-
-@contextlib.contextmanager
-def nrrd_foreground_topology_priority(label: str) -> Iterator[None]:
-    """Give latency-critical topology work priority over new component-NRRD members.
-
-    Submitted compressor calls and ordered writes may drain; active writers stop at the next
-    slice-aligned member boundary. The nested, exception-safe pause is skipped when no layer
-    write is pending and prevents background cvol read/deflate work from extending topology
-    scans such as ``keep_objects``.
-    """
-    global _NRRD_FOREGROUND_PRIORITY_DEPTH
-    if not nrrd_yield_to_topology_enabled():
-        yield
-        return
-
-    pending = 0
-    sink = globals().get('_NRRD_LAYER_SINK')
-    if sink is not None:
-        try:
-            completed, total = sink.progress_counts()
-            pending = max(0, int(total) - int(completed))
-        except Exception:
-            pending = 0
-    if int(pending) <= 0:
-        yield
-        return
-
-    announce = False
-    with _NRRD_FOREGROUND_PRIORITY_LOCK:
-        _NRRD_FOREGROUND_PRIORITY_DEPTH += 1
-        if int(_NRRD_FOREGROUND_PRIORITY_DEPTH) == 1:
-            _NRRD_BACKGROUND_NONZERO_RUN_EVENT.clear()
-            announce = True
-    if announce:
-        print(
-            f'Foreground topology priority: pausing new nonzero component-NRRD '
-            f'members at slice boundaries during {label} ({int(pending)} write(s) pending; '
-            'YOLO_TTA_NRRD_YIELD_TO_TOPOLOGY=0 disables).',
-            flush=True,
-        )
-    try:
-        yield
-    finally:
-        release = False
-        with _NRRD_FOREGROUND_PRIORITY_LOCK:
-            _NRRD_FOREGROUND_PRIORITY_DEPTH = max(0, int(_NRRD_FOREGROUND_PRIORITY_DEPTH) - 1)
-            if int(_NRRD_FOREGROUND_PRIORITY_DEPTH) == 0:
-                _NRRD_BACKGROUND_NONZERO_RUN_EVENT.set()
-                release = True
-        if release:
-            print(
-                f'Foreground topology priority released after {label}; '
-                'component-NRRD streaming resumed.',
-                flush=True,
-            )
-
-
 class _MemberParallelGzipPayloadWriter:
     """File-like gzip encoder emitting one independent gzip member per chunk, pipelined.
 
@@ -36212,7 +36271,6 @@ class _MemberParallelGzipPayloadWriter:
         self._completed[seq] = (member, 0)
 
     def _enqueue_chunk(self, chunk_mv: memoryview) -> None:
-        _nrrd_background_nonzero_checkpoint()
         seq = int(self._next_sequence)
         self._next_sequence += 1
         payload = bytes(chunk_mv)  # detach once; classification no longer adds a NumPy scan
@@ -36229,7 +36287,6 @@ class _MemberParallelGzipPayloadWriter:
  The Future retains ``mv`` (and therefore its NumPy exporter) until native DEFLATE
  finishes. This removes the former 8--16 MiB ``bytes`` detachment copy for every
  sparse cvol member while preserving the ordinary write buffer-reuse contract."""
-        _nrrd_background_nonzero_checkpoint()
         mv = owner if isinstance(owner, memoryview) else memoryview(owner)  # type: ignore[arg-type]
         mv = mv.cast('B')
         seq = int(self._next_sequence)
@@ -39577,7 +39634,7 @@ def write_summary_file(
                 f'  Pass {pass_idx}: objects={total_objects}, endpoints={total_endpoints}, '
                 f'candidate_connections={total_candidates}, accepted_connections={total_accepted}, '
                 f'default_bridges={total_default_bridges}, walk_back_bridges={total_walk_back}, '
-                f'bridges_skipped_by_--interpolate_min_radius={total_skipped}, added_voxels={total_added_voxels}'
+                f'bridges_skipped_by_--interpolation_min_radius={total_skipped}, added_voxels={total_added_voxels}'
             )
             for s in sorted(stats_this_pass, key=lambda d: (str(d.get('model', '')), str(d.get('view', '')))):
                 lines.append(
@@ -39588,7 +39645,7 @@ def write_summary_file(
                     f"accepted_connections={int(s.get('accepted_connections', 0))}, "
                     f"default_bridges={int(s.get('default_bridges', 0))}, "
                     f"walk_back_bridges={int(s.get('walk_back_bridges', 0))}, "
-                    f"bridges_skipped_by_--interpolate_min_radius={int(s.get('skipped_by_min_radius', 0))}, "
+                    f"bridges_skipped_by_--interpolation_min_radius={int(s.get('skipped_by_min_radius', 0))}, "
                     f"added_voxels={int(s.get('added_voxels', 0))}, "
                     f"skipped={bool(s.get('skipped', False))}"
                 )
@@ -39675,17 +39732,19 @@ def main() -> None:
     save_summary_enabled = 'summary' in save_option_set
     channel_format = resolve_channel_format(args.channel_format)
     print(
-        '[v16.2.2] radial channel stacks wrap across the angular seam, C>=5 saved view inputs '
-        'use multi-page TIFF, --troubleshooting is removed, and legacy environment aliases are '
-        'no longer accepted. Unified --save selection remains active for images, labels, binary, '
-        'low_quality, nrrd, voxel_volume, high_quality, and summary. The retained v16.1.8 '
-        'runtime set includes hardware-linear Radial texture sampling by '
-        'default, bilinear in-plane Tilted forward inputs (exact nearest mask '
-        'backprojection retained), retried/loud-failing ffmpeg launches, plus the v16.1.7 '
-        'set: dense-prefaulted native sparse final union, foreground-topology NRRD '
-        'priority, header-free D1 NVRTC preflight, geometry-safe fast-bundle '
-        'initialization, bounded memfd direct-union window, sparse cvol retirement, '
-        'persistent TensorRT contexts, and parallel atomic outputs.'
+        '[v16.3.0] view selection uses structured Radial, Tilted, and Tile groups; '
+        'interpolation flags use the interpolation_* names; component-NRRD streaming no '
+        'longer pauses for topology; and dead telemetry-detail, CPU-retina override, NRRD-yield, '
+        'and scratch-msync environment controls are removed. Existing Cartesian, Tilted, and '
+        'Radial geometry builders are retained unchanged. The v16.2.2 channel/output behavior '
+        'also remains active: Radial channel stacks wrap across the angular seam, C>=5 saved '
+        'view inputs use multi-page TIFF, and unified --save selection controls images, labels, '
+        'binary, low_quality, nrrd, voxel_volume, high_quality, and summary. The retained '
+        'runtime set includes hardware-linear Radial texture sampling, bilinear in-plane Tilted '
+        'forward inputs with exact nearest mask backprojection, retried/loud-failing ffmpeg '
+        'launches, dense-prefaulted native sparse final union, header-free D1 NVRTC preflight, '
+        'geometry-safe fast-bundle initialization, bounded memfd direct-union windows, sparse '
+        'cvol retirement, persistent TensorRT contexts, and parallel atomic outputs.'
     )
     print(
         f'Model input channel format: {channel_format.token} '
@@ -39708,7 +39767,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('GPT-5.6-Sol-Pro v16.2.2 accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.3.0 accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -39725,60 +39784,39 @@ def main() -> None:
     if int(args.batch) < 1:
         raise ValueError('--batch must be >= 1')
     set_inference_batch_size(int(args.batch))
-    enabled_cartesian_views = resolve_cartesian_views(args.enable_cartesian)
-    tilt_views = resolve_tilt_views(args.enable_tilted)
-    tilt_angles = resolve_tilt_angles(args.tilt_angle)
-    for tilt_angle in tilt_angles:
-        if not (0.0 < float(tilt_angle) <= 45.0):
-            raise ValueError('--tilt_angle values must be greater than 0 and less than or equal to 45')
-    tilt_directions = resolve_tilt_directions(args.tilt_direction)
-    radial_targets = resolve_radial_views(args.enable_radial)
-    requested_azimuth_values = _parse_float_list(args.azimuth_angle)
-    if any(float(v) < 0.0 for v in requested_azimuth_values):
-        raise ValueError('--azimuth_angle values must be >= 0')
-    if radial_targets and len(requested_azimuth_values) not in (0, 1, len(radial_targets)):
-        raise ValueError(
-            f'--azimuth_angle supplied {len(requested_azimuth_values)} values for '
-            f'{len(radial_targets)} --enable_radial values; provide one value to broadcast '
-            'or matching counts'
-        )
-    if requested_azimuth_values and not radial_targets:
-        print(
-            '--azimuth_angle was supplied without --enable_radial; it is validated but '
-            'does not enable any Radial view.'
-        )
-    tile_configs = resolve_tile_configs(args.tile_size, args.tile_stride)
+    try:
+        enabled_cartesian_views = resolve_cartesian_views(args.enable_cartesian)
+        tilt_groups = resolve_tilted_view_groups(args.enable_tilted)
+        radial_requests = resolve_radial_view_requests(args.enable_radial)
+        tile_configs = resolve_tile_configs(args.enable_tile)
+    except ValueError as exc:
+        parser.error(str(exc))
 
-    concrete_tilt_requested = bool(tilt_views and tilt_angles)
-    active_radial_request = False
-    for radial_index, radial_target in enumerate(radial_targets):
-        if not requested_azimuth_values:
-            azimuth_active = True  # omitted -> per-view full-coverage default after geometry resolves
-        elif len(requested_azimuth_values) == 1:
-            azimuth_active = float(requested_azimuth_values[0]) > 0.0
-        else:
-            azimuth_active = float(requested_azimuth_values[radial_index]) > 0.0
-        if not azimuth_active:
-            continue
-        if str(radial_target).startswith('tilted_'):
-            radial_base = radial_target_base_view(radial_target)
-            if not concrete_tilt_requested or radial_base not in tilt_views:
-                continue
-        active_radial_request = True
-        break
+    # Concrete Tilted assembly uses the group associations directly so unrelated slots never
+    # form an accidental cross-product. The flattened base list is only for Radial eligibility.
+    tilt_views = tilted_group_base_views(tilt_groups)
+    radial_targets = [request.view for request in radial_requests]
+
+    concrete_tilt_requested = bool(tilt_groups)
+    active_radial_request = any(
+        (not str(radial_target).startswith('tilted_'))
+        or radial_target_base_view(radial_target) in tilt_views
+        for radial_target in radial_targets
+    )
     if not (enabled_cartesian_views or concrete_tilt_requested or active_radial_request):
         for radial_target in radial_targets:
             if str(radial_target).startswith('tilted_'):
                 radial_base = radial_target_base_view(radial_target)
-                if not concrete_tilt_requested or radial_base not in tilt_views:
+                if radial_base not in tilt_views:
                     print(
                         f'Radial target {radial_target!r} skipped: no {radial_base} Tilted '
                         'variants are enabled.'
                     )
         raise ValueError(
             'No inference views are active. Enable at least one view with --enable_cartesian, '
-            '--enable_tilted (with non-zero --tilt_angle), or --enable_radial. A tilted_* '
-            '--enable_radial target requires the matching --enable_tilted base.'
+            '--enable_tilted VIEW[:TILT_ANGLE[:TILT_DIRECTION]], or '
+            '--enable_radial VIEWS[:AZIMUTH_ANGLE]. A tilted_* Radial target requires '
+            'a matching --enable_tilted base.'
         )
 
     # Resolve post-union behavior before starting the background model loader.
@@ -39900,8 +39938,8 @@ def main() -> None:
         v1613_bundle_reasons.append('CUDA worker processes inactive')
     if len(angles) != 1 or abs(float(angles[0]) % 360.0) > 1e-7:
         v1613_bundle_reasons.append('requires exactly --angle 0')
-    if int(args.interpolate) != 0:
-        v1613_bundle_reasons.append('requires --interpolate 0')
+    if int(args.interpolation_distance) != 0:
+        v1613_bundle_reasons.append('requires --interpolation_distance 0')
     if float(args.min_conf) > 0.0:
         v1613_bundle_reasons.append('requires --min_conf 0')
     if float(args.min_radius) > 0.0:
@@ -39924,14 +39962,14 @@ def main() -> None:
 
     if args.min_conf > 0 and args.min_conf < args.conf:
         raise ValueError('--min_conf must be equal to or greater than --conf')
-    if int(args.interpolate) < 0:
-        raise ValueError('--interpolate must be >= 0')
+    if int(args.interpolation_distance) < 0:
+        raise ValueError('--interpolation_distance must be >= 0')
     if int(args.interpolation_walk_back) < 0:
         raise ValueError('--interpolation_walk_back must be >= 0')
     if int(args.interpolation_candidates) < 1:
         raise ValueError('--interpolation_candidates must be >= 1')
-    if int(args.interpolate_passes) < 1:
-        raise ValueError('--interpolate_passes must be >= 1')
+    if int(args.interpolation_passes) < 1:
+        raise ValueError('--interpolation_passes must be >= 1')
     if args.gaussian_smoothing is not None and float(args.gaussian_smoothing) < 0.0:
         raise ValueError('--gaussian_smoothing must be >= 0; use 0 to disable smoothing')
     if args.gaussian_smoothing_passes is not None and int(args.gaussian_smoothing_passes) < 0:
@@ -39945,8 +39983,8 @@ def main() -> None:
         args.gaussian_smoothing,
         args.gaussian_smoothing_passes,
     )
-    if float(args.interpolate_min_radius) < 0:
-        raise ValueError('--interpolate_min_radius must be >= 0')
+    if float(args.interpolation_min_radius) < 0:
+        raise ValueError('--interpolation_min_radius must be >= 0')
     if float(args.min_radius) < 0:
         raise ValueError('--min_radius must be >= 0')
     if int(args.keep_objects) < 0:
@@ -40217,16 +40255,15 @@ def main() -> None:
         for target in radial_targets
     ]
     resolved_azimuth_angles = resolve_radial_azimuth_angles(
-        requested_azimuth_values,
-        radial_targets=radial_targets,
+        radial_requests,
         diameters=radial_diameters,
     )
-    if radial_targets and not requested_azimuth_values:
-        for target, diameter, spacing in zip(
-            radial_targets, radial_diameters, resolved_azimuth_angles,
-        ):
+    for request, diameter, spacing in zip(
+        radial_requests, radial_diameters, resolved_azimuth_angles,
+    ):
+        if request.azimuth_angle is None:
             print(
-                f'Radial azimuth default [{target}]: using full-coverage spacing '
+                f'Radial azimuth default [{request.view}]: using full-coverage spacing '
                 f'{float(spacing):.8g}° for projected-plane diameter {int(diameter)}'
             )
 
@@ -40248,12 +40285,50 @@ def main() -> None:
             'model_prediction_slice_policy': 'center_N_only',
             'fps': fps,
             'enable_cartesian': list(enabled_cartesian_views),
+            # Retain the prior flattened metadata keys for readers that only need summaries;
+            # the structured group records below are authoritative for associations.
             'enable_tilted': list(tilt_views),
-            'tilt_angles_deg': [float(v) for v in tilt_angles],
-            'tilt_directions': list(tilt_directions),
+            'tilt_angles_deg': list(dict.fromkeys(
+                float(angle)
+                for group in tilt_groups
+                for angle in group.tilt_angles
+            )),
+            'tilt_directions': list(dict.fromkeys(
+                str(direction)
+                for group in tilt_groups
+                for direction in group.tilt_directions
+            )),
+            'enable_tilted_groups': [
+                {
+                    'views': list(group.views),
+                    'tilt_angles_deg': [float(v) for v in group.tilt_angles],
+                    'tilt_directions': list(group.tilt_directions),
+                }
+                for group in tilt_groups
+            ],
             'enable_radial': list(radial_targets),
             'radial_diameters': [int(v) for v in radial_diameters],
             'azimuth_angles_deg': [float(v) for v in resolved_azimuth_angles],
+            'enable_radial_groups': [
+                {
+                    'view': request.view,
+                    'requested_azimuth_angle_deg': (
+                        'auto' if request.azimuth_angle is None else float(request.azimuth_angle)
+                    ),
+                    'diameter': int(diameter),
+                    'resolved_azimuth_angle_deg': float(spacing),
+                }
+                for request, diameter, spacing in zip(
+                    radial_requests, radial_diameters, resolved_azimuth_angles,
+                )
+            ],
+            'enable_tile': [
+                {
+                    'tile_size': int(config.tile_size),
+                    'tile_stride': int(config.tile_stride),
+                }
+                for config in tile_configs
+            ],
         }, indent=2)
     )
 
@@ -40266,16 +40341,15 @@ def main() -> None:
         cartesian_views=enabled_cartesian_views,
         radial_views=radial_targets,
         radial_azimuth_angles=resolved_azimuth_angles,
-        tilt_views=tilt_views,
-        tilt_angles=tilt_angles,
-        tilt_directions=tilt_directions,
+        tilt_groups=tilt_groups,
         radial_native_raster=int(radial_fold_raster),
     )
     if not views:
         raise ValueError(
             'No inference views are active. Enable at least one view with --enable_cartesian, '
-            '--enable_tilted (with non-zero --tilt_angle), or --enable_radial. A tilted_* '
-            '--enable_radial target is skipped when its matching Tilted base is not enabled.'
+            '--enable_tilted VIEW[:TILT_ANGLE[:TILT_DIRECTION]], or '
+            '--enable_radial VIEWS[:AZIMUTH_ANGLE]. A tilted_* Radial target is skipped '
+            'when its matching Tilted base is not enabled.'
         )
     # Reserve the second resident allocation only for runs that actually contain a
     # Radial task. This keeps Cartesian/Tilted-only runs from losing GPU residency merely
@@ -40286,7 +40360,7 @@ def main() -> None:
     )
     cartesian_views = orthogonal_views_only(views)
     inference_views = list(views)
-    interpolating_views = [v for v in inference_views if _view_uses_interpolation(v, int(args.interpolate))]
+    interpolating_views = [v for v in inference_views if _view_uses_interpolation(v, int(args.interpolation_distance))]
 
     # A tilted_* Radial token expands to every concrete signed/directional Tilted variant.
     # Print the expanded workload rather than only the compact CLI token set.
@@ -40343,6 +40417,15 @@ def main() -> None:
         'TIFFs containing one uint8 grayscale page per channel in model-input order. The retired '
         '--troubleshooting CLI and legacy environment-variable aliases are removed.'
     )
+    spec_notes.append(
+        'v16.3.0 CLI maintenance: --enable_radial uses VIEWS:AZIMUTH_ANGLE groups, '
+        '--enable_tilted uses VIEW:TILT_ANGLE:TILT_DIRECTION groups, and --enable_tile uses '
+        'TILE_SIZE:TILE_STRIDE groups. Spaces separate groups and commas select multiple values '
+        'inside a slot. The interpolation flags are --interpolation_distance, '
+        '--interpolation_passes, and --interpolation_min_radius. Component-NRRD decode/deflate '
+        'continues during topology instead of pausing at member boundaries. Dead telemetry-detail, '
+        'CPU-retina override, NRRD-yield, and synchronous scratch-msync environment controls are removed.'
+    )
     if tilted_radial_concrete_views:
         spec_notes.append(
             'Concrete tilted-Radial views use the resident CUDA source '
@@ -40390,8 +40473,9 @@ def main() -> None:
             'otherwise (YOLO_TTA_GPU_RENDER_TBLOCK_SLICES).'
         )
     spec_notes.append(
-        'v13.3.1 (R3/R4/R7b/R12/R16/R19/R24/R25): scratch memmap msync is opt-in (YOLO_TTA_MSYNC, '
-        'default off — same-host page-cache coherence needs no synchronous flushes); single-angle '
+        'v13.3.1 (R3/R4/R7b/R12/R16/R19/R24/R25): same-host shared-mapping coherence needs '
+        'no synchronous scratch flushes; v16.3.0 removes the obsolete opt-in msync path because '
+        'ephemeral mappings are retired rather than treated as durability records. Single-angle '
         'CUDA workers write disjoint single-angle result windows directly into bounded memfd-backed per-view unions '
         '(YOLO_TTA_GPU_WORKER_DIRECT_UNION); NRRD payload writes stream bounded double-buffered blocks '
         '(YOLO_TTA_NRRD_Z_CHUNK_SLICES) filled by a GIL-releasing pool (YOLO_TTA_NRRD_FILL_WORKERS) '
@@ -40536,16 +40620,18 @@ def main() -> None:
     concrete_tilted = [v for v in views if is_tilted_view(v)]
     if concrete_tilted:
         active_tilt_labels = ', '.join(pretty_view_name(v) for v in concrete_tilted)
-        spec_notes.append(
-            f'v16.0.2 Tilted Views active from --enable_tilted={list(tilt_views)}, '
-            f'--tilt_direction={list(tilt_directions)}, --tilt_angle={[float(v) for v in tilt_angles]}. '
-            'No Tilted base is implicit; each base/direction/signed-angle configuration remains '
-            'independent until final union. Active tilted configurations: '
-            f'{active_tilt_labels}'
+        requested_tilt_groups = ' '.join(
+            f'{",".join(group.views)}:'
+            f'{",".join(f"{float(angle):g}" for angle in group.tilt_angles)}:'
+            f'{",".join(group.tilt_directions)}'
+            for group in tilt_groups
         )
-    elif tilt_views and not tilt_angles:
         spec_notes.append(
-            'Tilted Views disabled because --tilt_angle resolved to 0, regardless of --enable_tilted.'
+            f'v16.3.0 Tilted Views active from --enable_tilted {requested_tilt_groups}. '
+            'No Tilted base is implicit; each group preserves its own view/angle/direction '
+            'associations, and every positive angle expands to independent positive and negative '
+            'variants before final union. Active tilted configurations: '
+            f'{active_tilt_labels}'
         )
     else:
         spec_notes.append('Tilted Views disabled because --enable_tilted was not supplied.')
@@ -40886,7 +40972,7 @@ def main() -> None:
         f'Batched inference active with --batch={int(args.batch)}. StreamingYoloVolumeSource is used by default for full-frame/tile sources: it renders a bounded CPU prefetch window of H×W×{int(channel_format.channel_count)} center inputs and pads the final batch by repeating the last complete channel stack; CUDA input staging can additionally queue YOLO_TTA_GPU_INPUT_STAGING_BATCHES complete BCHW batches in VRAM ahead of inference; set YOLO_TTA_STREAMING_PREDICTION_SOURCES=0 to restore dense in-memory prediction-volume materialization.'
     )
     spec_notes.append(
-        'Tiled masks are staged into one consolidated parent-view canvas per --tile_size/--tile_stride configuration before gating; '
+        'Tiled masks are staged into one consolidated parent-view canvas per --enable_tile TILE_SIZE:TILE_STRIDE group before gating; '
         'the canvas gate is slice-local and connected-component based, so seam-split tile objects are reassembled before support testing. '
         'A tile mask shape guard validates/resizes every postprocessed tile to its parent view-native shape. '
         f'v12.2.11 keeps waiting tiles and tile-set/category accumulators in RAM by default (YOLO_TTA_SPILL_WAITING_TILES={int(waiting_tile_spill_enabled())}, YOLO_TTA_TILE_ACCUMULATORS_IN_RAM={int(tile_intermediate_accumulators_prefer_memory())}); disk ctile spill is now opt-in. '
@@ -41067,7 +41153,7 @@ def main() -> None:
         and nrrd_layers_needed
         and not dense_tiling_active
         and not bool(keep_temp_artifacts)
-        and int(args.interpolate) <= 0
+        and int(args.interpolation_distance) <= 0
         and _env_flag('YOLO_TTA_SPARSE_VIEW_RETIREMENT', True)
     )
     _direct_headroom = max(0, int(available_anon_work_bytes()) - 64 * GIB)
@@ -41552,7 +41638,7 @@ def main() -> None:
         union_prefer_memory = not (
             (
                 interpolation_process_backend_enabled()
-                and _view_uses_interpolation(view, int(args.interpolate))
+                and _view_uses_interpolation(view, int(args.interpolation_distance))
             )
             or gpu_worker_direct_union_active
         )
@@ -41641,7 +41727,7 @@ def main() -> None:
             transient_bytes = int(source_bytes) + 4 * GIB
         elif 'tilted' in view_name_lower:
             transient_bytes = int(source_bytes) + 4 * GIB
-        elif _view_uses_interpolation(view, int(args.interpolate)):
+        elif _view_uses_interpolation(view, int(args.interpolation_distance)):
             transient_bytes = int(processing_bytes) * 2 + 4 * GIB
 
         def _run_admitted_view_prepare() -> PreparedViewResult:
@@ -41659,11 +41745,11 @@ def main() -> None:
                     dense_tiling_active=bool(dense_tiling_active),
                     min_conf=float(args.min_conf),
                     min_radius=float(args.min_radius),
-                    interpolate=int(args.interpolate),
+                    interpolate=int(args.interpolation_distance),
                     interpolation_walk_back=int(args.interpolation_walk_back),
                     interpolation_candidates=int(args.interpolation_candidates),
-                    interpolate_passes=int(args.interpolate_passes),
-                    interpolate_min_radius=float(args.interpolate_min_radius),
+                    interpolate_passes=int(args.interpolation_passes),
+                    interpolate_min_radius=float(args.interpolation_min_radius),
                     interpolation_search_angle=float(args.interpolation_search_angle),
                     keep_temp=bool(keep_temp_artifacts),
                     slice_workers=int(parent_slice_postprocess_workers),
@@ -41837,11 +41923,11 @@ def main() -> None:
             destination_mm=_parent_destination_volume(str(model_name), str(view_name)),
             destination_lock=view_volume_locks[(str(model_name), str(view_name))],
             temp_dir=temp_dir,
-            interpolate=int(args.interpolate),
+            interpolate=int(args.interpolation_distance),
             interpolation_walk_back=int(args.interpolation_walk_back),
             interpolation_candidates=int(args.interpolation_candidates),
-            interpolate_passes=int(args.interpolate_passes),
-            interpolate_min_radius=float(args.interpolate_min_radius),
+            interpolate_passes=int(args.interpolation_passes),
+            interpolate_min_radius=float(args.interpolation_min_radius),
             interpolation_search_angle=float(args.interpolation_search_angle),
             keep_temp=bool(keep_temp_artifacts),
             slice_workers=int(tile_slice_postprocess_workers),
@@ -44841,11 +44927,12 @@ def main() -> None:
 
 
 
-# v16.1.7 retains the production bundle, materializes sparse-union destination pages in parallel, and gives final topology brief priority over background NRRD producers.
+# v16.1.7 retains the production bundle and materializes sparse-union destination pages in parallel.
 # v16.1.8 defaults Radial sampling to the hardware-linear texture, adds bilinear in-plane Tilted forward inputs (mask backprojection stays nearest/exact), and retries transient ffmpeg launch failures before failing the pipeline loudly.
 # v16.2.0 unifies output selection under --save, makes native-resolution overlay and summary explicit, and renames --low_quality_downbin without changing output paths or filenames.
 # v16.2.1 prevents hardware-texture Radial startup false positives by allowing one raster-perimeter-equivalent high-error seam while retaining the strict mean and broad-mismatch gates.
 # v16.2.2 wraps radial channel context, saves C>=5 view inputs as multi-page TIFFs, removes --troubleshooting, and drops legacy environment-variable aliases.
+# v16.3.0 adds structured Radial/Tilted/Tile view flags, renames interpolation flags, keeps component-NRRD streaming continuous through topology, and removes dead environment controls.
 # The heuristic global monkeypatch framework used by v16.0.8 was removed because it
 # could replace unrelated functions by name and shadow the real fused-union implementation.
 
