@@ -8,6 +8,9 @@ Current runtime behavior:
  - uses one persistent worker process per CUDA device, including one-GPU runs
  - overlaps decode, rendering, inference, cleanup/interpolation, backprojection, and output writing
  - supports Cartesian, Tilted, and Radial view families with dense tiles and source-geometry fusion
+ - treats every --angle value as an independent view variant through cleanup, interpolation,
+   per-tile parent/bridge gating, NRRD decomposition, and the final binary union
+ - always wraps Radial and Tilted-Radial interpolation across the angular seam
  - uses Ultralytics' unified quantize setting for inference precision
  - writes optional active-view PNG/multi-page TIFF inputs and Slicer segmentation NRRDs
    as independent source-geometry component layers
@@ -63,8 +66,8 @@ import numpy as np
 
 GIB = 1024 ** 3
 NRRD_SPACE = "left-posterior-superior"
-SCRIPT_VERSION = '16.3.0'
-SCRIPT_VERSION_COMPACT = '1630'
+SCRIPT_VERSION = '16.4.0'
+SCRIPT_VERSION_COMPACT = '1640'
 SCRIPT_BASENAME = f'GPT-5.6-Sol-Pro_v{SCRIPT_VERSION}_SLURM.py'
 OUTPUT_NRRD_PREFIX = ''
 LEGACY_OUTPUT_NRRD_PREFIX = 'HW_'
@@ -144,6 +147,39 @@ def _parse_angles(
     return _parse_float_list(values)
 
 
+def resolve_tta_angles(
+    values: Sequence[str] | str | float | int | None,
+) -> List[float]:
+    """Return finite, modulo-360, unique TTA angles in request order.
+
+    v16.4.0 treats each returned value as a separate view variant. Equivalent rotations
+    such as 0, 360, and -360 are rejected instead of scheduling duplicate work whose
+    binary union cannot carry weighting semantics.
+    """
+    raw_angles = _parse_angles(values) or [0.0, 120.0, 240.0]
+    resolved: List[float] = []
+    seen: Dict[int, float] = {}
+    for raw in raw_angles:
+        angle = float(raw)
+        if not math.isfinite(angle):
+            raise ValueError(f'--angle values must be finite; got {raw!r}')
+        normalized = float(angle % 360.0)
+        if math.isclose(normalized, 360.0, rel_tol=0.0, abs_tol=1e-9) or math.isclose(
+            normalized, 0.0, rel_tol=0.0, abs_tol=1e-9
+        ):
+            normalized = 0.0
+        # Quantize only for duplicate detection; retain the normalized float itself.
+        duplicate_key = int(round(normalized * 1_000_000_000.0))
+        if duplicate_key in seen:
+            raise ValueError(
+                f'--angle contains equivalent rotations {seen[duplicate_key]:g} and {angle:g}; '
+                'each TTA view variant must be geometrically unique modulo 360 degrees'
+            )
+        seen[duplicate_key] = angle
+        resolved.append(normalized)
+    return resolved
+
+
 def _parse_token_list(values: Sequence[str] | str | None) -> List[str]:
     """Accept comma and/or whitespace separated string tokens."""
     if values is None:
@@ -170,20 +206,186 @@ SAVE_OPTION_TOKENS: Tuple[str, ...] = (
 )
 
 
-def resolve_save_options(values: Sequence[str] | str | None) -> List[str]:
-    """Validate and canonicalize the unified ``--save`` output selection."""
+@dataclass(frozen=True)
+class SaveRequest:
+    """Canonical ``--save`` selection plus embedded low-quality downbins."""
+
+    options: Tuple[str, ...]
+    low_quality_downbins: Tuple[str, ...] = ()
+
+
+def resolve_save_request(values: Sequence[str] | str | None) -> SaveRequest:
+    """Validate ``--save`` and parse ``low_quality[:DOWNBIN[,DOWNBIN...]]``.
+
+    Commas normally separate output tokens.  Once a ``low_quality:`` token starts,
+    following numeric comma/whitespace fields remain part of its downbin list until the
+    next recognized output token.  This permits, for example, ``--save
+    images,low_quality:0.5,1024 nrrd`` without reintroducing a second low-quality flag.
+    """
+    if values is None:
+        return SaveRequest(())
+
+    raw_values = [values] if isinstance(values, str) else [str(v) for v in values]
+    pieces: List[str] = []
+    for raw_value in raw_values:
+        for whitespace_group in re.split(r"\s+", str(raw_value).strip()):
+            if not whitespace_group:
+                continue
+            pieces.extend(part.strip() for part in whitespace_group.split(',') if part.strip())
+
     valid = set(SAVE_OPTION_TOKENS)
     resolved: List[str] = []
+    low_quality_downbins: List[str] = []
+    collecting_low_quality = False
+
+    for raw in pieces:
+        lowered = str(raw).strip().lower()
+        if lowered.startswith('low_quality:'):
+            option, payload = lowered.split(':', 1)
+            if option != 'low_quality' or not payload:
+                raise ValueError(
+                    '--save low_quality uses low_quality[:LOW_QUALITY_DOWNBIN]; '
+                    f'got {raw!r}'
+                )
+            if 'low_quality' not in resolved:
+                resolved.append('low_quality')
+            low_quality_downbins.append(payload)
+            collecting_low_quality = True
+            continue
+
+        if lowered in valid:
+            collecting_low_quality = False
+            if lowered not in resolved:
+                resolved.append(lowered)
+            continue
+
+        if collecting_low_quality:
+            # Numeric validation and canonical rounding happen after source geometry is
+            # known in ``resolve_low_quality_downbin_specs``.  Reject obviously nonnumeric
+            # fields here so a misspelled output token cannot silently become a downbin.
+            try:
+                float(lowered)
+            except Exception as exc:
+                expected = ', '.join(SAVE_OPTION_TOKENS)
+                raise ValueError(
+                    f'--save values must be one or more of: {expected}; '
+                    f'got {raw!r}'
+                ) from exc
+            low_quality_downbins.append(lowered)
+            continue
+
+        expected = ', '.join(SAVE_OPTION_TOKENS)
+        raise ValueError(
+            f'--save values must be one or more of: {expected}; got {raw!r}'
+        )
+
+    return SaveRequest(
+        options=tuple(resolved),
+        low_quality_downbins=tuple(low_quality_downbins),
+    )
+
+
+def resolve_save_options(values: Sequence[str] | str | None) -> List[str]:
+    """Compatibility helper returning only canonical output option names."""
+    return list(resolve_save_request(values).options)
+
+
+@dataclass(frozen=True)
+class PostprocessingRequest:
+    """Resolved user-facing final-volume postprocessing selection."""
+
+    keep_objects: int = 0
+    enable_3d_void_fill: bool = False
+    gaussian_smoothing_enabled: bool = False
+    gaussian_sigma: float = 3.0
+    gaussian_passes: int = 1
+
+
+def resolve_postprocessing_options(
+    values: Sequence[str] | str | None,
+) -> PostprocessingRequest:
+    """Resolve ``--postprocessing`` structured tokens without legacy flag aliases."""
+    keep_objects = 0
+    enable_3d_void_fill = False
+    gaussian_enabled = False
+    gaussian_sigma = 3.0
+    gaussian_passes = 1
+    seen: set[str] = set()
+
     for raw in _parse_token_list(values):
-        token = str(raw).strip().lower()
-        if token not in valid:
-            expected = ', '.join(SAVE_OPTION_TOKENS)
+        slots = [part.strip() for part in str(raw).split(':')]
+        token = slots[0].lower()
+        if token not in {'keep_objects', '3d_void_fill', 'gaussian_smoothing'}:
             raise ValueError(
-                f'--save values must be one or more of: {expected}; got {raw!r}'
+                '--postprocessing accepts keep_objects[:NUMBER_OF_OBJECTS], '
+                '3d_void_fill, and gaussian_smoothing[:STANDARD_DEVIATION]'
+                '[:SMOOTHING_PASSES]; '
+                f'got {raw!r}'
             )
-        if token not in resolved:
-            resolved.append(token)
-    return resolved
+        if token in seen:
+            raise ValueError(f'--postprocessing contains duplicate option {token!r}')
+        seen.add(token)
+
+        if token == 'keep_objects':
+            if len(slots) > 2 or (len(slots) == 2 and not slots[1]):
+                raise ValueError(
+                    f'--postprocessing {raw!r} must use keep_objects[:NUMBER_OF_OBJECTS]'
+                )
+            try:
+                keep_objects = int(slots[1]) if len(slots) == 2 else 1
+            except Exception as exc:
+                raise ValueError(
+                    f'--postprocessing {raw!r} has a non-integer NUMBER_OF_OBJECTS'
+                ) from exc
+            if keep_objects < 1:
+                raise ValueError(
+                    '--postprocessing keep_objects requires NUMBER_OF_OBJECTS >= 1'
+                )
+            continue
+
+        if token == '3d_void_fill':
+            if len(slots) != 1:
+                raise ValueError(
+                    '--postprocessing 3d_void_fill does not accept parameters'
+                )
+            enable_3d_void_fill = True
+            continue
+
+        if len(slots) > 3:
+            raise ValueError(
+                f'--postprocessing {raw!r} must use '
+                'gaussian_smoothing[:STANDARD_DEVIATION][:SMOOTHING_PASSES]'
+            )
+        # Empty optional slots retain their documented defaults, so
+        # ``gaussian_smoothing::2`` requests two passes at sigma 3.
+        try:
+            gaussian_sigma = (
+                float(slots[1]) if len(slots) >= 2 and slots[1] else 3.0
+            )
+            gaussian_passes = (
+                int(slots[2]) if len(slots) >= 3 and slots[2] else 1
+            )
+        except Exception as exc:
+            raise ValueError(
+                f'--postprocessing {raw!r} has an invalid Gaussian parameter'
+            ) from exc
+        if not math.isfinite(gaussian_sigma) or gaussian_sigma <= 0.0:
+            raise ValueError(
+                '--postprocessing gaussian_smoothing requires STANDARD_DEVIATION > 0'
+            )
+        if gaussian_passes < 1:
+            raise ValueError(
+                '--postprocessing gaussian_smoothing requires SMOOTHING_PASSES >= 1'
+            )
+        gaussian_enabled = True
+
+    return PostprocessingRequest(
+        keep_objects=int(keep_objects),
+        enable_3d_void_fill=bool(enable_3d_void_fill),
+        gaussian_smoothing_enabled=bool(gaussian_enabled),
+        gaussian_sigma=float(gaussian_sigma),
+        gaussian_passes=int(gaussian_passes),
+    )
 
 
 CARTESIAN_VIEW_TOKENS: Tuple[str, ...] = ('transverse', 'sagittal', 'coronal')
@@ -628,9 +830,6 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Remove objects whose radius is smaller than this value, measured on the YOLO output masks "
                         "in each prediction set's own native 2D slice plane, before backprojection, independently "
                         "per active view. 0 disables the check")
-    p.add_argument("--keep_objects", default=0, type=int,
-                   help="Keep the top N largest final 3D objects by volume. 0 keeps all objects")
-
     p.add_argument(
         "--enable_cartesian",
         nargs="+",
@@ -699,7 +898,8 @@ def build_argparser() -> argparse.ArgumentParser:
             "Save one or more output groups: images (active-view image sequences; channel "
             "formats with at least five channels use one grayscale page per channel in multi-page TIFF), labels "
             "(final YOLO segmentation labels), binary (final TIFF sequence plus FFV1 MKV), "
-            "low_quality (isotropically downsampled overlay and binary videos), nrrd "
+            "low_quality[:LOW_QUALITY_DOWNBIN] (one or more isotropic presentation resolutions; "
+            "for example low_quality:0.5,1024), nrrd "
             "(single-layer Slicer decomposition plus manifest), voxel_volume (native-space "
             "white-voxel count for the summary), high_quality (native-resolution final overlay), "
             "and summary (summary text file). Comma-separated, whitespace-separated, and mixed "
@@ -708,18 +908,18 @@ def build_argparser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
-        "--low_quality_downbin",
+        "--postprocessing",
         nargs="+",
         default=None,
         type=str,
+        metavar="OPERATION[:PARAMETERS]",
         help=(
-            "One or more isotropic low-quality downbins. Floats scale each X/Y/t dimension, "
-            "e.g. 0.5. Integers scale the largest dimension to that value. Providing this flag "
-            "retains the prior behavior and implies --save low_quality"
+            "Enable one or more final-volume operations: keep_objects[:NUMBER_OF_OBJECTS] "
+            "(default N=1), 3d_void_fill, and "
+            "gaussian_smoothing[:STANDARD_DEVIATION][:SMOOTHING_PASSES] "
+            "(defaults sigma=3 and passes=1). No postprocessing operation is enabled by default"
         ),
     )
-    p.add_argument("--enable_3d_void_fill", action="store_true",
-                   help="Apply one final 3D enclosed-void fill after the global union. Disabled by default")
     p.add_argument("--centerline_filter_passes", default=0, type=int,
                    help="Maximum centerline-guided post-union passes. Pass 0 is the untouched audit checkpoint; 0 disables filtering and its audit NRRDs")
     p.add_argument("--centerline_filter_backend", default="embedded", choices=["embedded", "off"],
@@ -736,11 +936,6 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Centerline complexity budget. The embedded backend permits up to approximately 4x this many raw ridge samples before its global safety cap")
     p.add_argument("--centerline_timeout", default=900.0, type=float,
                    help="Seconds allowed for each isolated embedded-centerline attempt before preserving the current union and using safe pass-through behavior")
-    p.add_argument("--gaussian_smoothing", nargs="?", const=3.0, default=None, type=float, metavar="SIGMA",
-                   help="Final 3D Gaussian smoothing sigma in voxel units. Unset uses default 3.0 when smoothing is activated by either Gaussian flag; explicitly set 0 to disable")
-    p.add_argument("--gaussian_smoothing_passes", default=None, type=int,
-                   help="Number of Gaussian smoothing passes. Unset uses default 1 when smoothing is activated by either Gaussian flag; explicitly set 0 to disable")
-
     p.add_argument("--interpolation_distance", default=15, type=int,
                    help="Maximum view-native slice/frame distance used to search for interpolation candidates. Radial interpolation wraps around frame order. 0 disables interpolation")
     p.add_argument("--interpolation_walk_back", default=3, type=int,
@@ -1930,7 +2125,7 @@ def tail_worker_budget_expansion_enabled() -> bool:
 
 
 def gpu_worker_direct_union_enabled() -> bool:
-    """Allow disjoint single-angle worker leases to write directly into the view union."""
+    """Allow disjoint angle-variant worker leases to write directly into that variant union."""
     return _env_flag('YOLO_TTA_GPU_WORKER_DIRECT_UNION', True)
 
 
@@ -3578,6 +3773,7 @@ def _interpolation_process_entry(
 
 def interpolate_view_volume_pass_maybe_process(
     mask_mm: np.ndarray,
+    view: 'ViewInfo',
     work_dir: Path,
     pass_tag: str,
     max_slice_distance: int,
@@ -3589,14 +3785,17 @@ def interpolate_view_volume_pass_maybe_process(
     prefer_memory: bool = True,
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
-    wrap_axis: bool = False,
     bridge_delta_path: Optional[Path] = None,
     known_slice_any: Optional[np.ndarray] = None,
     known_slice_bboxes: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, Dict[str, object]]:
-    """Run one interpolation pass in a child process when configured.
-    
-    The returned array may be a new process-shareable memmap. First-pass foreground metadata skips empty slices and bounds connected-component work."""
+    """Run one interpolation pass with mandatory family-defined boundary semantics.
+
+    Radial and Tilted Radial views always wrap across their angular slice seam. Cartesian
+    and Tilted Cartesian views never wrap. This is derived from ``view`` and has no CLI or
+    environment override. The returned array may be a new process-shareable memmap.
+    """
+    wrap_axis = view_interpolation_wrap_axis(view)
     executor = _INTERPOLATION_PROCESS_EXECUTOR
     if (
         _INTERPOLATION_PROCESS_WORKER
@@ -5274,7 +5473,7 @@ def tile_parent_crop_window(
     return (int(py0), int(py1), int(px0), int(px1)), M_crop.astype(np.float32)
 
 
-def tile_group_uniform_crop_shape(
+def tile_jobs_uniform_crop_shape(
     view: 'ViewInfo',
     tile_jobs: 'Sequence[DenseTileJob]',
     out_size: int,
@@ -5377,6 +5576,52 @@ class ViewInfo:
     radial_tilted_source: bool = False
     radial_source_view_name: str = ''
     radial_request_token: str = ''
+    # v16.4.0 TTA identity. ``name`` is the unique runtime variant name;
+    # ``physical_view_name`` retains the underlying projection geometry name.
+    physical_view_name: str = ''
+    tta_aug_id: str = ''
+    tta_angle_deg: float = 0.0
+
+
+def physical_view_name(view: ViewInfo) -> str:
+    return str(view.physical_view_name or view.name)
+
+
+def is_tta_view_variant(view: ViewInfo) -> bool:
+    return bool(str(view.tta_aug_id))
+
+
+def tta_view_variant_name(view_name: str, aug_id: str) -> str:
+    return f'{str(view_name)}__tta_{_sanitize_filesystem_token(aug_id)}'
+
+
+def expand_views_into_tta_variants(
+    views: Sequence[ViewInfo],
+    angles: Sequence[float],
+) -> List[ViewInfo]:
+    """Create one independent runtime ``ViewInfo`` per physical-view/TTA-angle pair."""
+    variants: List[ViewInfo] = []
+    seen_names: set[str] = set()
+    for physical in views:
+        base_name = physical_view_name(physical)
+        for angle in angles:
+            aug_id = _format_angle_aug_id(float(angle))
+            variant_name = tta_view_variant_name(base_name, aug_id)
+            if variant_name in seen_names:
+                raise ValueError(f'duplicate TTA view variant name: {variant_name}')
+            seen_names.add(variant_name)
+            variants.append(dataclasses_replace(
+                physical,
+                name=str(variant_name),
+                summary_family=(
+                    f'{str(physical.summary_family)}__tta_{_sanitize_filesystem_token(aug_id)}'
+                ),
+                display_name=f'{str(physical.display_name)} / TTA {float(angle):g}°',
+                physical_view_name=str(base_name),
+                tta_aug_id=str(aug_id),
+                tta_angle_deg=float(angle),
+            ))
+    return variants
 
 
 def is_tilted_view(view: ViewInfo) -> bool:
@@ -5573,17 +5818,22 @@ def view_output_token(view: ViewInfo) -> str:
     if is_tilted_view(view):
         base = str(tilted_base_view_name(view)).capitalize()
         direction = str(view.tilt_direction or 'vertical').capitalize()
-        return f'Tilted{base}_{direction}_{_format_signed_angle_token(float(view.tilt_angle_deg))}'
-    if is_radial_view(view):
+        token = f'Tilted{base}_{direction}_{_format_signed_angle_token(float(view.tilt_angle_deg))}'
+    elif is_radial_view(view):
         base = str(radial_base_view_name(view)).capitalize()
         if is_tilted_radial_view(view):
             direction = str(view.tilt_direction or 'vertical').capitalize()
-            return (
+            token = (
                 f'RadialTilted{base}_{direction}_'
                 f'{_format_signed_angle_token(float(view.tilt_angle_deg))}'
             )
-        return 'Transverse_Radial' if base == 'Transverse' else f'Radial{base}'
-    return pretty_view_name(view).replace(' ', '_')
+        else:
+            token = 'Transverse_Radial' if base == 'Transverse' else f'Radial{base}'
+    else:
+        token = str(view.display_name).split(' / TTA ', 1)[0].replace(' ', '_')
+    if is_tta_view_variant(view):
+        token = f'{token}_TTA_{_sanitize_filesystem_token(view.tta_aug_id)}'
+    return token
 
 
 def _build_cartesian_view(base_view: str, T: int, H: int, W: int) -> ViewInfo:
@@ -6171,6 +6421,7 @@ def write_aug_job_meta(
         json.dumps(
             {
                 'view': view.name,
+                'physical_view': physical_view_name(view),
                 'family': view.family,
                 'num_slices': int(view.num_slices),
                 'full_t': int(view.full_t),
@@ -6210,34 +6461,39 @@ def write_aug_job_meta(
     )
 
 
-def build_aug_jobs_for_view(
+def build_aug_job_for_variant(
     view: ViewInfo,
-    angles: Sequence[float],
     out_size: int,
     temp_dir: Path,
-) -> List[AugJob]:
+) -> AugJob:
+    """Build the sole augmentation owned by one v16.4.0 TTA view variant."""
+    if not is_tta_view_variant(view):
+        raise ValueError(
+            f'v16.4.0 augmentation construction requires a TTA view variant; got {view.name!r}'
+        )
+    angle = float(view.tta_angle_deg)
+    aug_id = str(view.tta_aug_id)
+    expected_aug_id = _format_angle_aug_id(angle)
+    if aug_id != expected_aug_id:
+        raise ValueError(
+            f'TTA variant {view.name!r} has aug_id={aug_id!r}, expected {expected_aug_id!r} '
+            f'for angle {angle:g}'
+        )
     aug_dir = temp_dir / 'aug' / view.name
-    jobs: List[AugJob] = []
-
-    for angle in angles:
-        aug_id = _format_angle_aug_id(float(angle))
-        aff = build_affine(
-            view=view.name,
-            src_w=view.src_w,
-            src_h=view.src_h,
-            out_size=out_size,
-            angle_deg=float(angle),
-            pad_mode=view.pad_mode,
-        )
-        jobs.append(
-            AugJob(
-                aug_id=aug_id,
-                angle_deg=float(angle),
-                meta_path=aug_dir / f'{view.name}_{aug_id}.meta.json',
-                aff=aff,
-            )
-        )
-    return jobs
+    aff = build_affine(
+        view=view.name,
+        src_w=view.src_w,
+        src_h=view.src_h,
+        out_size=out_size,
+        angle_deg=angle,
+        pad_mode=view.pad_mode,
+    )
+    return AugJob(
+        aug_id=aug_id,
+        angle_deg=angle,
+        meta_path=aug_dir / f'{view.name}_{aug_id}.meta.json',
+        aff=aff,
+    )
 
 
 def iter_aug_jobs_round_robin(
@@ -7301,7 +7557,7 @@ def maybe_wrap_source_with_gpu_input_staging(source: object, cfg: 'PredictConfig
         return source
     # GPU-rendered sources already produce device-resident normalized batches;
     # CPU-side staging would be a pointless host round trip.
-    if isinstance(source, (GpuRenderedYoloSource, GpuTiledRenderedYoloSource)):
+    if isinstance(source, (GpuRenderedYoloSource, GpuTileRenderedYoloSource)):
         return source
     if not gpu_input_staging_enabled(cfg):
         return source
@@ -7474,7 +7730,7 @@ def ensure_ultralytics_accepts_in_memory_volume_source() -> None:
     additions: List[object] = []
     for loader_cls in (
         InMemoryYoloVolumeSource, StreamingYoloVolumeSource, GpuPrefetchingYoloSource,
-        GpuRenderedYoloSource, GpuTiledRenderedYoloSource,
+        GpuRenderedYoloSource, GpuTileRenderedYoloSource,
     ):
         if loader_cls not in loaders_tuple:
             additions.append(loader_cls)
@@ -7618,14 +7874,14 @@ def build_dense_tile_jobs_for_aug(
         for i, (tile_id, tile_x, tile_y) in enumerate(tile_specs)
     ]
 
-    # resolve every tile's parent-grid crop window against one shared (h, w), so a whole
-    # configuration can share a single uniformly shaped result volume.
+    # v16.4.0 gates every tile independently, so each tile keeps only its own minimal
+    # parent-grid footprint. The retired grouped/configuration-canvas path required a
+    # configuration-wide uniform crop and no longer exists.
     if jobs:
-        crop_h, crop_w = tile_group_uniform_crop_shape(view, jobs, int(out_size))
         resolved: List[DenseTileJob] = []
         for job in jobs:
             window, M_out_to_crop = tile_parent_crop_window(
-                view, job.M_out_to_src, int(out_size), force_shape=(int(crop_h), int(crop_w)),
+                view, job.M_out_to_src, int(out_size),
             )
             resolved.append(dataclasses_replace(job, parent_crop=window, M_out_to_crop=M_out_to_crop))
         jobs = resolved
@@ -7649,6 +7905,7 @@ def write_dense_tile_job_meta(
     record = json.dumps(
         {
             'view': job.view,
+            'physical_view': str(job.view).split('__tta_', 1)[0],
             'aug_id': job.aug_id,
             'config_id': job.config_id,
             'tile_id': job.tile_id,
@@ -8665,13 +8922,13 @@ def get_view_frame_by_index(
 
     T, H, W = volume_rgb.shape
 
-    if view.name == 'transverse':
+    if physical_view_name(view) == 'transverse':
         wait_for_volume_slice_ready(volume_rgb, int(index))
         return np.asarray(volume_rgb[int(index)])
-    if view.name == 'sagittal':
+    if physical_view_name(view) == 'sagittal':
         wait_for_volume_ready(volume_rgb)
         return np.ascontiguousarray(volume_rgb[:, int(index), :])
-    if view.name == 'coronal':
+    if physical_view_name(view) == 'coronal':
         wait_for_volume_ready(volume_rgb)
         # serve from K-column transposed blocks instead of a strided gather.
         if volume_rgb.ndim == 3 and bool(volume_rgb.flags['C_CONTIGUOUS']):
@@ -8816,12 +9073,12 @@ def set_retina_mask_processor(processor: str) -> None:
     _RETINA_MASK_PROCESSOR_IS_CPU = bool(str(processor).strip().lower() == 'cpu')
 
 
-# current behavior: when set, the single-angle + gpu-retina
+# current behavior: when set, the angle-variant + gpu-retina
 # fast path applies min_conf before union/flatten and can apply min_radius with
 # CuPy after the GPU warp. The old per-frame retina hole fill is not part of
 # this path; hole filling runs once on a completed view, or at task end for an
 # eligible device-union task. None disables the fast path.
-_SINGLE_ANGLE_GPU_FASTPATH: Optional[Tuple[float, float]] = None
+_ANGLE_VARIANT_GPU_FASTPATH: Optional[Tuple[float, float]] = None
 
 
 def gpu_retina_flatten_enabled() -> bool:
@@ -8895,18 +9152,18 @@ def gpu_postprocess_pinned_d2h_enabled() -> bool:
     return _env_flag('YOLO_TTA_GPU_POSTPROCESS_PINNED', True)
 
 
-def set_single_angle_gpu_fastpath(min_conf: Optional[float], min_radius: float = 0.0) -> None:
-    """Set or clear the process-wide single-angle GPU cleanup configuration."""
-    global _SINGLE_ANGLE_GPU_FASTPATH
+def set_angle_variant_gpu_fastpath(min_conf: Optional[float], min_radius: float = 0.0) -> None:
+    """Set or clear the process-wide angle-variant GPU cleanup configuration."""
+    global _ANGLE_VARIANT_GPU_FASTPATH
     if min_conf is None:
-        _SINGLE_ANGLE_GPU_FASTPATH = None
+        _ANGLE_VARIANT_GPU_FASTPATH = None
     else:
-        _SINGLE_ANGLE_GPU_FASTPATH = (float(min_conf), float(min_radius))
+        _ANGLE_VARIANT_GPU_FASTPATH = (float(min_conf), float(min_radius))
 
 
-def single_angle_gpu_fastpath() -> Optional[Tuple[float, float]]:
+def angle_variant_gpu_fastpath() -> Optional[Tuple[float, float]]:
     """Return the active (min_conf, min_radius) fast-path config, or None when the fast path is off."""
-    return _SINGLE_ANGLE_GPU_FASTPATH
+    return _ANGLE_VARIANT_GPU_FASTPATH
 
 
 def ensure_yolo_ready_for_predict(model: object, cfg: 'PredictConfig') -> None:
@@ -9206,7 +9463,7 @@ class PredictConfig:
 
 
 def async_predict_postprocess_enabled() -> bool:
-    """Return True when single-angle prediction CPU tails may run behind the GPU."""
+    """Return True when angle-variant prediction CPU tails may run behind the GPU."""
     return _env_flag('YOLO_TTA_ASYNC_PREDICT_POSTPROCESS', True)
 
 
@@ -9914,7 +10171,7 @@ def _build_gpu_flattened_payload_from_proto(pred: object, img: object, proto: ob
  the protos, box-cropped at proto scale, reduced with a single max-logit plane, and ONE plane
  is bilinearly upsampled to the network raster and thresholded at 0 (union(bilinear(l_i)>0)
  becomes bilinear(max_i l_i)>0 — identical away from instance box edges, sub-voxel there).
- Instance-level --min_conf (single-angle fast path) and the optional per-pixel max-confidence
+ Instance-level --min_conf (angle-variant fast path) and the optional per-pixel max-confidence
  plane are applied at proto resolution. Returns None on any unexpected condition so the
  caller falls back to the unpatched Ultralytics path."""
     try:
@@ -9938,7 +10195,7 @@ def _build_gpu_flattened_payload_from_proto(pred: object, img: object, proto: ob
         if c <= 0 or mh <= 0 or mw <= 0 or int(pred.shape[1]) < 6 + c:
             return None
 
-        fastpath = single_angle_gpu_fastpath()
+        fastpath = angle_variant_gpu_fastpath()
         fastpath_min_conf = None if fastpath is None else float(fastpath[0])
         fastpath_min_radius = 0.0 if fastpath is None else float(fastpath[1])
         run_gpu_cleanup = bool(
@@ -9949,7 +10206,7 @@ def _build_gpu_flattened_payload_from_proto(pred: object, img: object, proto: ob
         n = int(pred_t.shape[0])
         confs_t = pred_t[:, 4].to(torch.float32).reshape(-1) if n > 0 else None
 
-        # Single-angle fast path: drop low-confidence instances before the union (exact
+        # Angle-variant fast path: drop low-confidence instances before the union (exact
         # instance-level --min_conf, mirroring _try_flatten_gpu_retina_result).
         min_conf_applied = False
         if (
@@ -10140,9 +10397,9 @@ _AFFINE_GRID_CACHE: 'OrderedDict[Tuple[object, ...], object]' = OrderedDict()
 _AFFINE_GRID_CACHE_LOCK = threading.Lock()
 
 
-# a tile-group task cycles through one grid per tile (plus one per tile for the
-# mask warp back to crop space), so the default 12-entry LRU would thrash. The tile path
-# raises this floor once, from the task's own tile count.
+# Tile and full-frame tasks revisit the same static affine grid for every slice. The
+# cache floor prevents those per-variant grids from being rebuilt while bounded task overlap
+# is active; no grouped/configuration-canvas tile execution remains.
 _AFFINE_GRID_CACHE_MIN_ENTRIES = 0
 
 
@@ -10327,7 +10584,7 @@ def _try_flatten_gpu_retina_result(r, masks_data: object) -> Optional[GpuFlatten
         w = int(masks.shape[2])
         n = int(masks.shape[0])
 
-        fastpath = single_angle_gpu_fastpath()
+        fastpath = angle_variant_gpu_fastpath()
         fastpath_min_conf = None if fastpath is None else float(fastpath[0])
         fastpath_min_radius = 0.0 if fastpath is None else float(fastpath[1])
         # the per-frame retina GPU hole fill is gone; a completed-view
@@ -10353,7 +10610,7 @@ def _try_flatten_gpu_retina_result(r, masks_data: object) -> Optional[GpuFlatten
 
         masks_bool = masks > 0
 
-        # single-angle fast path: drop low-confidence instances on the GPU (exact --min_conf at
+        # angle-variant fast path: drop low-confidence instances on the GPU (exact --min_conf at
         # instance granularity) before the union/flatten.
         min_conf_applied = False
         if (
@@ -10542,7 +10799,7 @@ def gpu_worker_chunk_hole_fill_enabled() -> bool:
     Disabled by default because the CuPy connected-component pass and allocator trim are
     task-boundary barriers. Split views instead receive one parallel CPU hole-fill pass after
     their last inference lease, preserving the same per-slice result while keeping workers hot.
-    Single-lease views and grouped tiles retain their existing device-fill behavior.
+    Single-lease views and independent tile tasks retain their existing device-fill behavior.
     """
     return _env_flag('YOLO_TTA_GPU_WORKER_CHUNK_HOLE_FILL', False)
 
@@ -12027,7 +12284,7 @@ def _build_direct_device_compacted_payload(
 
         ready_event = torch.cuda.Event()
         ready_event.record(stream)
-        fastpath = single_angle_gpu_fastpath()
+        fastpath = angle_variant_gpu_fastpath()
         fastpath_radius = 0.0 if fastpath is None else float(fastpath[1])
         payload = GpuFlattenedRetinaPayload(
             union_gpu=union_gpu,
@@ -12106,7 +12363,7 @@ def _direct_predict_stream(
                     'set YOLO_TTA_DIRECT_PREDICT=0 to use model.predict'
                 )
             if nc == 1 and device_compaction_active:
-                _direct_fastpath = single_angle_gpu_fastpath()
+                _direct_fastpath = angle_variant_gpu_fastpath()
                 _direct_effective_threshold = max(
                     float(conf_thres),
                     float(_direct_fastpath[0]) if _direct_fastpath is not None else float(conf_thres),
@@ -12200,7 +12457,6 @@ def predict_source_and_accumulate(
     slice_locks: Optional[Sequence[threading.Lock]] = None,
     device_hole_fill: bool = False,
     defer_device_union_flush: bool = False,
-    M_out_to_native_by_unit: Optional[Sequence[np.ndarray]] = None,
     device_union_consumer: Optional[Callable[['_DeviceUnionAccumulator'], Dict[str, object]]] = None,
     require_device_union: bool = False,
     require_proto_hole_treatment: bool = False,
@@ -12210,7 +12466,7 @@ def predict_source_and_accumulate(
  The predictor consumes ``InMemoryYoloVolumeSource`` instances in the path,
  so the GPU no longer reads augmented FFV1 videos from scratch. CPU-side result
  handling remains bounded by ``cpu_mask_postprocess_pending_limit`` and runs
- behind the streamed GPU inference. When the single-angle cleanup
+ behind the streamed GPU inference. When the angle-variant cleanup
  path is enabled, slice-local filtering is appended to the same streamed
  postprocess unit so a completed prediction slice is already cleaned before
  the full view volume has finished inferencing."""
@@ -12246,7 +12502,7 @@ def predict_source_and_accumulate(
     try:
         if isinstance(source, (
             InMemoryYoloVolumeSource, StreamingYoloVolumeSource, GpuPrefetchingYoloSource,
-            GpuRenderedYoloSource, GpuTiledRenderedYoloSource,
+            GpuRenderedYoloSource, GpuTileRenderedYoloSource,
         )):
             require_channel_aware_yolo_preprocess_patch(str(cfg.channel_token))
         use_custom_cpu_retina = False
@@ -12302,11 +12558,11 @@ def predict_source_and_accumulate(
         stream_min_conf_u8 = int(min_conf_to_u8_threshold(stream_min_conf)) if stream_min_conf > 0.0 else 0
 
         # Admit raw device-union accumulation whenever no host-only cleanup must run before
-        # union. Ordinary and multi-angle tasks therefore retain their masks on device; only
+        # union. Every angle-variant task therefore retains its masks on device; only
         # positive per-slice radius cleanup, unsupported confidence cleanup, CPU retina masks,
         # or insufficient VRAM force the per-frame host path.
         device_union: Optional[_DeviceUnionAccumulator] = None
-        fastpath = single_angle_gpu_fastpath()
+        fastpath = angle_variant_gpu_fastpath()
         preunion_min_conf = (
             float(stream_min_conf)
             if stream_cleanup and fastpath is not None and stream_min_conf > 0.0
@@ -12337,8 +12593,8 @@ def predict_source_and_accumulate(
             )
 
         # A capable resident batch-1 TensorRT source runs render, inference, confidence
-        # compaction, proto union, and destination warping as one device pipeline. Grouped
-        # tiles pass their per-unit affine cycle through slot descriptors.
+        # compaction, proto union, and destination warping as one device pipeline. Every
+        # full-frame or tile task owns one immutable output-to-destination affine.
         specialized_stats: Optional[Dict[str, int]] = None
         if predictor_direct is not None:
             specialized_stats = _try_resident_trt_ring_accumulate(
@@ -12349,32 +12605,22 @@ def predict_source_and_accumulate(
                 native_h=int(native_h),
                 native_w=int(native_w),
                 device_union=device_union,
-                M_out_to_native_by_unit=M_out_to_native_by_unit,
                 preunion_min_conf=preunion_min_conf,
             )
             if specialized_stats is not None:
                 prediction_count = int(specialized_stats['prediction_count'])
                 frames_with_predictions = int(specialized_stats['frames_with_predictions'])
 
-        # a tile-group source flattens (frame, tile) into one index space, so the
-        # output->destination affine is per UNIT, not per source. unit_affine_count is the
-        # tile count; index % count selects the tile that produced this unit.
-        unit_affine_count = 0 if M_out_to_native_by_unit is None else int(len(M_out_to_native_by_unit))
-
         def _process_prediction_unit(idx_i: int, masks_obj: Optional[object], confs_arr: Optional[np.ndarray]) -> Tuple[int, int]:
             slice_lock = None
             if slice_locks is not None and len(slice_locks) > 0:
                 slice_lock = slice_locks[int(idx_i) % len(slice_locks)]
-            unit_affine = (
-                M_out_to_native_by_unit[int(idx_i) % int(unit_affine_count)]
-                if unit_affine_count > 0 else M_out_to_native
-            )
             if isinstance(masks_obj, GpuFlattenedRetinaPayload):
                 # The payload builder sees only the process-global/native radius. Override it
                 # with this source's scaled processing-grid radius before GPU cleanup.
                 masks_obj.gpu_min_radius = float(stream_min_radius)
                 masks_obj.run_gpu_cleanup = bool(
-                    single_angle_gpu_fastpath() is not None
+                    angle_variant_gpu_fastpath() is not None
                     and gpu_retina_cleanup_enabled()
                     and float(stream_min_radius) > 0.0
                 )
@@ -12385,7 +12631,7 @@ def predict_source_and_accumulate(
                 out_size=out_size,
                 view_union_mm=view_union_mm,
                 view_confmap_mm=view_confmap_mm,
-                M_out_to_native=unit_affine,
+                M_out_to_native=M_out_to_native,
                 native_h=native_h,
                 native_w=native_w,
                 slice_lock=slice_lock,
@@ -12693,7 +12939,7 @@ def predict_source_and_submit_accumulation(
     try:
         if isinstance(source, (
             InMemoryYoloVolumeSource, StreamingYoloVolumeSource, GpuPrefetchingYoloSource,
-            GpuRenderedYoloSource, GpuTiledRenderedYoloSource,
+            GpuRenderedYoloSource, GpuTileRenderedYoloSource,
         )):
             require_channel_aware_yolo_preprocess_patch(str(cfg.channel_token))
         use_custom_cpu_retina = False
@@ -12748,7 +12994,7 @@ def predict_source_and_submit_accumulation(
             if isinstance(masks_obj, GpuFlattenedRetinaPayload):
                 masks_obj.gpu_min_radius = float(stream_min_radius)
                 masks_obj.run_gpu_cleanup = bool(
-                    single_angle_gpu_fastpath() is not None
+                    angle_variant_gpu_fastpath() is not None
                     and gpu_retina_cleanup_enabled()
                     and float(stream_min_radius) > 0.0
                 )
@@ -13383,17 +13629,23 @@ def cleanup_view_volume_after_prediction_inplace(
     skip_hole_fill: bool = False,
     known_slice_any: Optional[np.ndarray] = None,
     known_slice_bboxes: Optional[np.ndarray] = None,
+    threshold_plane_shape: Optional[Tuple[int, int]] = None,
 ) -> None:
     # non-radial masks can still be on the canonical inference grid here.
     # Convert the native-view radius once and perform every component operation on that smaller
     # raster. Radial already owns a deliberately folded native raster and keeps its historical
     # threshold unchanged.
+    threshold_shape = (
+        tuple(int(v) for v in threshold_plane_shape)
+        if threshold_plane_shape is not None
+        else tuple(int(v) for v in np.asarray(mask_mm).shape[-2:])
+    )
     native_min_radius = view_processing_min_radius(
-        view, float(min_radius), np.asarray(mask_mm).shape[-2:],
+        view, float(min_radius), threshold_shape,
     )
 
     if bool(precleaned_slice_cleanup):
-        # single-angle inference has already applied per-slice --min_conf and the full
+        # angle-variant inference has already applied per-slice --min_conf and the full
         # view-native --min_radius as results streamed in (streaming_cleanup_min_radius now equals
         # the full radius for every view), so nothing radius-related remains before the final
         # hole-fill pass.
@@ -13435,7 +13687,7 @@ def cleanup_view_volume_after_prediction_inplace(
 # Process-per-GPU CUDA inference workers
 #
 # Every CUDA device, including a lone GPU, runs in its own interpreter and CUDA context. This
-# keeps the worker-only resident rendering, TensorRT ring, grouped-tile, and device-union paths
+# keeps the worker-only resident rendering, TensorRT ring, independent-tile, and device-union paths
 # available without sharing Ultralytics' Python-heavy inference loop through the main GIL.
 
 
@@ -14396,7 +14648,8 @@ class _GpuWorkerRenderEngine:
         self._fused_preflight_volume_key: Optional[Tuple[str, Tuple[int, int, int], int]] = None
         self._warned_fallback = False
         self._resident_runtime_disabled = False
-        # native planes shared across every tile of one frame (tile-group path only).
+        # Native planes reused within one angle-local tile source across batches and
+        # contextual channel indices; no cross-tile canvas is retained.
         self._native_plane_cache: 'OrderedDict[Tuple[str, int], object]' = OrderedDict()
         self._tilted_plan_cache_floor = 0
 
@@ -15949,9 +16202,9 @@ class _GpuWorkerRenderEngine:
         }
         self._tilted_plans[key] = info
         self._tilted_plans.move_to_end(key)
-        # a tilted tile group cycles through one plan PER TILE within every frame, so the
-        # historical 10-entry cap would rebuild every plan on every frame. The tile path raises
-        # this floor once from its own tile count.
+        # A sequence of angle-local tile tasks may revisit several static Tilted plans.
+        # Keep a bounded floor so those plans survive task overlap without recreating any
+        # independent tile crop.
         while len(self._tilted_plans) > max(10, int(self._tilted_plan_cache_floor)):
             self._tilted_plans.popitem(last=False)
         return info
@@ -16056,16 +16309,15 @@ class _GpuWorkerRenderEngine:
         )
 
     def _native_plane_cache_entries(self) -> int:
-        """LRU depth for the shared native-plane cache used by tile-group rendering."""
+        """LRU depth for native planes reused inside one angle-local tile source."""
         return max(2, _env_int('YOLO_TTA_GPU_NATIVE_PLANE_CACHE', 8))
 
     def _render_native_plane_cached(self, view: ViewInfo, frame_idx: int) -> object:
-        """One native plane per (view, frame), reused by every tile of that frame.
+        """Cache native planes for repeated reads inside one tile's inference stream.
 
- Tile-group tasks walk the flattened (z, tile) index space z-major, so a handful of
- entries is enough for every tile of a frame -- and for the contextual neighbours a
- 2.5D channel format pulls in -- to hit. Only the tile path uses this; full-frame
- rendering keeps its original allocate-per-call behaviour and VRAM profile."""
+ Batches and 2.5D channel formats can request the same center or neighbouring plane more
+ than once. This bounded cache serves those reads without introducing cross-tile union or
+ per-tile crop state. Full-frame rendering keeps its existing allocation behavior."""
         key = (str(view.name), int(frame_idx))
         cache = self._native_plane_cache
         plane = cache.get(key)
@@ -16084,7 +16336,7 @@ class _GpuWorkerRenderEngine:
 
     def _render_native_plane(self, view: ViewInfo, frame_idx: int) -> object:
         vol = self._volume_gpu
-        name = str(view.name)
+        name = physical_view_name(view)
         if name == 'transverse':
             if int(vol.shape[0]) == int(self._logical_t):
                 return vol[int(frame_idx)].to(self.torch.float32)
@@ -16170,42 +16422,49 @@ class _GpuWorkerRenderEngine:
             grid, mode='bilinear', padding_mode='zeros', align_corners=False,
         ).reshape(int(out_size), int(out_size))
 
-    def render_tile_group_batch(
+    def render_tile_batch(
         self,
         view: ViewInfo,
-        tile_affines: Sequence[np.ndarray],
-        flat_indices: Sequence[int],
+        tile_affine: np.ndarray,
+        frame_indices: Sequence[int],
         *,
-        slice_offset: int,
         out_size: int,
         fp16: bool,
         channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
     ) -> Tuple[object, object]:
-        """Render a batch of flattened (frame, tile) indices as one normalized BCHW tensor.
+        """Render one tile's center frames as a normalized BCHW tensor on the GPU.
 
- ``flat_indices`` are ``z_local * len(tile_affines) + tile_index``. The order is
- z-major, so a batch spans one or two frames and every tile in it shares the same
- cached native plane -- the whole point of. Returns (tensor, ready event)."""
+        The source/native view plane remains resident in the worker. Every contextual plane
+        is cropped, warped, and resized directly into the tile inference raster; no grouped
+        tile canvas or cross-tile accumulation exists in v16.4.0.
+        """
         torch = self.torch
         fmt = resolve_channel_format(channel_format)
-        tiles_per_frame = max(1, int(len(tile_affines)))
         offsets = (0,) if fmt.kind == 'gray' else tuple(int(v) for v in fmt.offsets)
+        matrix = np.asarray(tile_affine, dtype=np.float32)
         with torch.cuda.stream(self._stream):
-            frames: List[object] = []
-            for flat in flat_indices:
-                z_local, tile_index = divmod(int(flat), int(tiles_per_frame))
-                M_out_to_src = tile_affines[int(tile_index)]
-                center = int(slice_offset) + int(z_local)
-                planes = [
-                    self._render_tile_plane(
-                        view,
-                        M_out_to_src,
-                        channel_view_slice_index(view, center + int(offset)),
-                        int(out_size),
-                    )
+            requested_indices: List[Tuple[int, ...]] = []
+            unique_indices: Dict[int, object] = {}
+            for frame_idx in frame_indices:
+                contextual = tuple(
+                    channel_view_slice_index(view, int(frame_idx) + int(offset))
                     for offset in offsets
-                ]
-                frames.append(planes[0].unsqueeze(0) if fmt.kind == 'gray' else torch.stack(planes, dim=0))
+                )
+                requested_indices.append(contextual)
+                for source_idx in contextual:
+                    if int(source_idx) not in unique_indices:
+                        unique_indices[int(source_idx)] = self._render_tile_plane(
+                            view, matrix, int(source_idx), int(out_size),
+                        )
+
+            frames: List[object] = []
+            for contextual in requested_indices:
+                if fmt.kind == 'gray':
+                    frames.append(unique_indices[int(contextual[0])].unsqueeze(0))
+                else:
+                    frames.append(torch.stack(
+                        [unique_indices[int(source_idx)] for source_idx in contextual], dim=0,
+                    ))
             batch = torch.stack(frames, dim=0)
             batch = batch.clamp_(0.0, 255.0).mul_(1.0 / 255.0)
             if bool(fp16):
@@ -16322,30 +16581,26 @@ class _GpuWorkerRenderEngine:
         self,
         slot: _ResidentGpuPipelineSlot,
         view: ViewInfo,
-        tile_affines: Sequence[np.ndarray],
-        flat_unit_index: int,
+        tile_affine: np.ndarray,
+        frame_index: int,
         *,
-        slice_offset: int,
         out_size: int,
         channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
     ) -> None:
-        """Render one flattened ``(frame,tile)`` unit into a persistent ring slot."""
+        """Render one tile center stack into a persistent TensorRT input slot."""
         torch = self.torch
         fmt = resolve_channel_format(channel_format)
-        tile_count = max(1, int(len(tile_affines)))
-        local_frame, tile_index = divmod(int(flat_unit_index), tile_count)
-        absolute_frame = int(slice_offset) + int(local_frame)
         expected_shape = (1, int(fmt.channel_count), int(out_size), int(out_size))
         if tuple(int(x) for x in slot.input.shape) != expected_shape:
             raise RuntimeError(
                 f'resident tile-ring input shape {tuple(slot.input.shape)} != {expected_shape}'
             )
-        matrix = np.asarray(tile_affines[int(tile_index)], dtype=np.float32)
+        matrix = np.asarray(tile_affine, dtype=np.float32)
         with torch.cuda.stream(self._stream):
             if bool(slot.infer_valid):
                 self._stream.wait_event(slot.infer_done)
             contextual = tuple(
-                channel_view_slice_index(view, absolute_frame + int(offset))
+                channel_view_slice_index(view, int(frame_index) + int(offset))
                 for offset in fmt.offsets
             )
             first_channel_by_source: Dict[int, int] = {}
@@ -16587,20 +16842,18 @@ class GpuRenderedYoloSource:
         return paths, batch, info
 
 
-class GpuTiledRenderedYoloSource:
-    """GPU-rendered source over the flattened (frame, tile) index space of one tile group.
+class GpuTileRenderedYoloSource:
+    """GPU-rendered source for exactly one dense tile.
 
- Index ``j`` means ``(z_local, tile) = divmod(j, tiles_per_frame)``, walked z-major so
- every tile of a frame is emitted consecutively and shares one cached native plane.
- Yields the same ``(paths, GpuPrefetchedYoloBatch, info)`` contract as
- ``GpuRenderedYoloSource``, so the predictor, the patched preprocess and the whole
- accumulation path are unchanged."""
+    Each task retains its own tile identity and affine from render through inference and
+    postprocessing. The source never flattens or unions several tiles into one stream.
+    """
 
     def __init__(
         self,
         engine: _GpuWorkerRenderEngine,
         view: ViewInfo,
-        tile_affines: Sequence[np.ndarray],
+        tile_job: DenseTileJob,
         *,
         slice_offset: int,
         num_frames: int,
@@ -16612,10 +16865,10 @@ class GpuTiledRenderedYoloSource:
     ) -> None:
         self.engine = engine
         self.view = view
-        self.tile_affines = [np.asarray(m, dtype=np.float32) for m in tile_affines]
-        self.tiles_per_frame = max(1, int(len(self.tile_affines)))
+        self.tile_job = tile_job
+        self.tile_affine = np.asarray(tile_job.M_out_to_src, dtype=np.float32)
         self.slice_offset = int(slice_offset)
-        self.name = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(name)).strip('_') or 'gpu_tiled_volume'
+        self.name = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(name)).strip('_') or 'gpu_tile_volume'
         self.channel_format = resolve_channel_format(channel_format)
         self.channel_count = int(self.channel_format.channel_count)
         self.out_size = int(out_size)
@@ -16642,7 +16895,7 @@ class GpuTiledRenderedYoloSource:
     def __len__(self) -> int:
         return int(math.ceil(float(self.nf) / float(self.bs))) if self.nf > 0 else 0
 
-    def __iter__(self) -> 'GpuTiledRenderedYoloSource':
+    def __iter__(self) -> 'GpuTileRenderedYoloSource':
         self.count = 0
         self._direct_count = 0
         return self
@@ -16657,26 +16910,13 @@ class GpuTiledRenderedYoloSource:
             pass
 
     def prepare_direct_ring(self, input_dtype: Optional[object] = None) -> List[_ResidentGpuPipelineSlot]:
-        """Allocate and validate the two static TensorRT input slots for grouped tiles."""
-        if (
-            self.bs != 1
-            or self.nf <= 0
-            or str(getattr(self.engine, '_mode', '')) != 'resident'
-            or not self.tile_affines
-        ):
-            raise RuntimeError(
-                'direct tile ring requires a nonempty batch-1 resident tile-group source'
-            )
+        """Allocate and validate two static TensorRT input slots for this tile."""
+        if self.bs != 1 or self.nf <= 0 or str(getattr(self.engine, '_mode', '')) != 'resident':
+            raise RuntimeError('direct tile ring requires a nonempty batch-1 resident tile source')
         torch = self.engine.torch
-        resolved_dtype = (
-            input_dtype
-            if input_dtype is not None
-            else (torch.float16 if bool(self.fp16) else torch.float32)
-        )
+        resolved_dtype = input_dtype if input_dtype is not None else (torch.float16 if self.fp16 else torch.float32)
         if resolved_dtype not in (torch.float16, torch.float32):
-            raise RuntimeError(
-                f'resident tile ring cannot render into TensorRT dtype {resolved_dtype}'
-            )
+            raise RuntimeError(f'resident tile ring cannot render into TensorRT dtype {resolved_dtype}')
         expected_shape = (1, int(self.channel_count), int(self.out_size), int(self.out_size))
         if (
             self._direct_ring is None
@@ -16698,9 +16938,8 @@ class GpuTiledRenderedYoloSource:
             slot.render_graph_key = None
             slot.render_expected_key = None
         self.engine.render_tile_into_ring_slot(
-            self._direct_ring[0], self.view, self.tile_affines, 0,
-            slice_offset=int(self.slice_offset), out_size=int(self.out_size),
-            channel_format=self.channel_format,
+            self._direct_ring[0], self.view, self.tile_affine, int(self.slice_offset),
+            out_size=int(self.out_size), channel_format=self.channel_format,
         )
         self.engine._stream.synchronize()
         self._direct_count = 0
@@ -16717,18 +16956,18 @@ class GpuTiledRenderedYoloSource:
             raise RuntimeError('direct resident tile ring has not been prepared')
         if int(self._direct_count) >= int(self.nf):
             return None
-        unit_index = int(self._direct_count)
-        slot = self._direct_ring[unit_index & 1]
-        slot.frame_index = int(unit_index)
-        slot.absolute_index = int(unit_index)
+        local_index = int(self._direct_count)
+        absolute_index = int(self.slice_offset) + int(local_index)
+        slot = self._direct_ring[local_index & 1]
+        slot.frame_index = int(local_index)
+        slot.absolute_index = int(absolute_index)
         slot.synthetic = False
         self.engine.render_tile_into_ring_slot(
-            slot, self.view, self.tile_affines, int(unit_index),
-            slice_offset=int(self.slice_offset), out_size=int(self.out_size),
-            channel_format=self.channel_format,
+            slot, self.view, self.tile_affine, int(absolute_index),
+            out_size=int(self.out_size), channel_format=self.channel_format,
         )
         self._direct_count += 1
-        return int(unit_index), slot
+        return int(local_index), slot
 
     def __next__(self) -> Tuple[List[str], object, List[str]]:
         if self.count >= self.yield_nf or self.nf <= 0:
@@ -16738,108 +16977,31 @@ class GpuTiledRenderedYoloSource:
         self.count = int(stop)
         paths: List[str] = []
         info: List[str] = []
-        flat_indices: List[int] = []
+        absolute_indices: List[int] = []
         last_real_idx = max(0, int(self.nf) - 1)
         for idx in range(start, stop):
             real_idx = int(idx) if int(idx) < int(self.nf) else int(last_real_idx)
             synthetic = int(idx) >= int(self.nf)
             suffix = '_synthetic' if synthetic else ''
-            flat_indices.append(int(real_idx))
+            absolute_indices.append(int(self.slice_offset) + int(real_idx))
             paths.append(f'{self.name}_{idx + 1:06d}{suffix}.png')
             if synthetic:
                 info.append(
-                    f'gpu-tiled {self.name} synthetic padded unit {idx + 1}/{self.yield_nf} '
-                    f'repeats real unit {real_idx + 1}/{self.nf}: '
+                    f'gpu-tile {self.name} synthetic padded slice {idx + 1}/{self.yield_nf} '
+                    f'repeats real slice {real_idx + 1}/{self.nf}: '
                 )
             else:
-                info.append(f'gpu-tiled {self.name} unit {idx + 1}/{self.nf}: ')
-        gpu_tensor, ready_event = self.engine.render_tile_group_batch(
-            self.view,
-            self.tile_affines,
-            flat_indices,
-            slice_offset=int(self.slice_offset),
-            out_size=int(self.out_size),
-            fp16=bool(self.fp16),
+                info.append(f'gpu-tile {self.name} slice {idx + 1}/{self.nf}: ')
+        gpu_tensor, ready_event = self.engine.render_tile_batch(
+            self.view, self.tile_affine, absolute_indices,
+            out_size=int(self.out_size), fp16=bool(self.fp16),
             channel_format=self.channel_format,
         )
         batch = GpuPrefetchedYoloBatch(
-            [self._fake_frame] * len(flat_indices),
-            gpu_tensor=gpu_tensor,
-            ready_event=ready_event,
-            source_label=self.name,
+            [self._fake_frame] * len(absolute_indices),
+            gpu_tensor=gpu_tensor, ready_event=ready_event, source_label=self.name,
         )
         return paths, batch, info
-
-
-def _tile_group_cpu_renderer(
-    volume_rgb: np.ndarray,
-    view: ViewInfo,
-    tile_jobs: Sequence[DenseTileJob],
-    *,
-    slice_offset: int,
-    channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
-) -> Callable[[int], np.ndarray]:
-    """CPU fallback renderer over the grouped source's flattened (frame, tile) index space.
-
- Mirrors ``GpuTiledRenderedYoloSource``'s indexing and keeps a small native-frame LRU so
- the ``get_view_frame_by_index`` extraction is still paid once per frame rather than once
- per (frame, tile) -- the redundancy that made the old CPU tile path the critical path."""
-    fmt = resolve_channel_format(channel_format)
-    tiles_per_frame = max(1, int(len(tile_jobs)))
-    offsets = (0,) if fmt.kind == 'gray' else tuple(int(v) for v in fmt.offsets)
-    cache_entries = max(2, _env_int('YOLO_TTA_TILE_CPU_NATIVE_FRAME_CACHE', 8))
-    cache: 'OrderedDict[int, np.ndarray]' = OrderedDict()
-    cache_lock = threading.Lock()
-
-    def _native(source_idx: int) -> np.ndarray:
-        key = int(source_idx)
-        with cache_lock:
-            hit = cache.get(key)
-            if hit is not None:
-                cache.move_to_end(key)
-                return hit
-        frame = np.ascontiguousarray(get_view_frame_by_index(volume_rgb, view, key))
-        with cache_lock:
-            cache[key] = frame
-            cache.move_to_end(key)
-            while len(cache) > int(cache_entries):
-                cache.popitem(last=False)
-        return frame
-
-    def _render(flat_idx: int) -> np.ndarray:
-        z_local, tile_index = divmod(int(flat_idx), int(tiles_per_frame))
-        tile_job = tile_jobs[int(tile_index)]
-        center = int(slice_offset) + int(z_local)
-        planes: List[np.ndarray] = []
-        for offset in offsets:
-            source_idx = channel_view_slice_index(view, center + int(offset))
-            if is_tilted_view(view):
-                plane = render_tilted_frame_on_grid(
-                    volume_rgb=volume_rgb,
-                    view=view,
-                    frame_idx=int(source_idx),
-                    M_grid_to_src=tile_job.M_out_to_src,
-                    grid_h=int(tile_job.out_size),
-                    grid_w=int(tile_job.out_size),
-                )
-            else:
-                plane = cv2.warpAffine(
-                    _native(int(source_idx)),
-                    tile_job.M_src_to_out,
-                    dsize=(int(tile_job.out_size), int(tile_job.out_size)),
-                    flags=cv2.INTER_LINEAR,
-                    borderMode=cv2.BORDER_CONSTANT,
-                    borderValue=0,
-                )
-            plane = np.asarray(plane, dtype=np.uint8)
-            if plane.ndim == 3 and int(plane.shape[2]) == 1:
-                plane = plane[:, :, 0]
-            planes.append(plane)
-        if fmt.kind == 'gray':
-            return planes[0]
-        return np.ascontiguousarray(np.stack(planes, axis=-1))
-
-    return _render
 
 
 _WORKER_GPU_RENDER_ENGINE: Optional[_GpuWorkerRenderEngine] = None
@@ -17014,88 +17176,27 @@ class _DeferredGpuWorkerTaskResult:
                         pass
 
 
-# shared z-band locks that serialize concurrent read-modify-write ORs into a
-# per-configuration tile canvas. Tiles within one configuration OVERLAP by design (stride <
-# size), and two worker processes touching the same byte of a shared mapping is not atomic,
-# so a z-band lock class per canvas row range is the synchronization unit. Installed once
-# per CUDA worker process at spawn; None only outside the grouped worker path.
-_WORKER_CANVAS_ZBAND_LOCKS: Optional[Sequence[object]] = None
-
-
-def set_worker_canvas_zband_locks(locks: Optional[Sequence[object]]) -> None:
-    global _WORKER_CANVAS_ZBAND_LOCKS
-    _WORKER_CANVAS_ZBAND_LOCKS = locks
-
-
-def _worker_canvas_zband_locks() -> Optional[Sequence[object]]:
-    return _WORKER_CANVAS_ZBAND_LOCKS
-
-
-def tile_canvas_zband_lock_count() -> int:
-    return max(1, _env_int('YOLO_TTA_TILE_CANVAS_ZBAND_LOCKS', 64))
-
-
-
-
-def tile_canvas_zband_size(canvas_slices: int, lock_count: int) -> int:
-    """Rows per lock class. Fixed per canvas depth so every worker maps z the same way."""
-    return max(1, int(math.ceil(float(max(1, int(canvas_slices))) / float(max(1, int(lock_count))))))
-
-
-def _union_tile_group_into_canvas(
-    canvas_mm: np.ndarray,
-    unit_mask: np.ndarray,
-    tile_jobs: Sequence['DenseTileJob'],
-    *,
-    slice_start: int,
-    slice_count: int,
-    tile_count: int,
-    zband_locks: Optional[Sequence[object]] = None,
-) -> int:
-    """OR one tile group's crop-sized unit volume into the shared configuration canvas.
-
- ``unit_mask`` is ``(slice_count * tile_count, crop_h, crop_w)`` in flattened (frame,
- tile) order, so tile ``k``'s slab over a z band is the strided view
- ``unit_mask[a * K + k: b * K + k: K]`` -- no copy. Each band is written under its own
- lock, and OR is commutative, so band ordering across workers is irrelevant."""
-    total = int(np.count_nonzero(unit_mask))
-    if total <= 0:
-        return 0
-    K = max(1, int(tile_count))
-    canvas_slices = int(np.asarray(canvas_mm).shape[0])
-    lock_count = max(1, int(len(zband_locks))) if zband_locks else 1
-    band_rows = tile_canvas_zband_size(canvas_slices, lock_count)
-
-    z = int(slice_start)
-    z_end = int(slice_start) + int(slice_count)
-    while z < z_end:
-        band_stop = min(int(z_end), ((int(z) // int(band_rows)) + 1) * int(band_rows))
-        a = int(z) - int(slice_start)
-        b = int(band_stop) - int(slice_start)
-        lock = zband_locks[(int(z) // int(band_rows)) % int(lock_count)] if zband_locks else None
-        ctx = lock if lock is not None else contextlib.nullcontext()
-        with ctx:
-            for k, tile_job in enumerate(tile_jobs):
-                py0, py1, px0, px1 = (int(v) for v in tile_job.parent_crop)
-                src = unit_mask[a * K + int(k): b * K + int(k): K]
-                dst = canvas_mm[int(z):int(band_stop), py0:py1, px0:px1]
-                np.bitwise_or(dst, src, out=dst)
-        z = int(band_stop)
-    return int(total)
-
-
 def run_prediction_volume_in_worker(
     model: object,
     cfg: 'PredictConfig',
     task: Dict[str, object],
 ) -> Dict[str, object] | _DeferredGpuWorkerTaskResult:
-    """Run one worker prediction task and write its result windows.
+    """Run one independent full-frame or tile task and write its result window.
 
-    Every capable view accumulates on the canonical processing grid; Radial layers carry
-    their row/diameter transform through interpolation and terminal backprojection."""
+    v16.4.0 has no grouped-tile/configuration-canvas worker path. Each tile keeps one
+    immutable affine and one result volume from resident rendering through inference,
+    postprocessing, and the later two-stage parent/bridge gate.
+    """
     view: ViewInfo = task['view']  # type: ignore[assignment]
     job = task['job']
     kind = str(task['kind'])
+    if kind not in {'fullframe', 'tile'}:
+        raise ValueError(f'Unsupported v16.4.0 worker task kind: {kind!r}')
+    if kind == 'fullframe' and not isinstance(job, AugJob):
+        raise TypeError(f'Full-frame worker task requires AugJob, got {type(job)!r}')
+    if kind == 'tile' and not isinstance(job, DenseTileJob):
+        raise TypeError(f'Tile worker task requires DenseTileJob, got {type(job)!r}')
+
     slice_offset = int(task.get('slice_start', 0))
     slice_count = int(task.get('slice_count', int(view.num_slices)))
     num_frames = int(slice_count)
@@ -17109,22 +17210,18 @@ def run_prediction_volume_in_worker(
             f'{channel_format.token} has C={int(channel_format.channel_count)}, but '
             f'worker PredictConfig requires C={int(cfg.input_channels)}'
         )
-    # a tile-group task owns every tile of one (view, angle, tile configuration) over a
-    # slice window. Its unit index space is flattened (frame, tile), so num_frames counts
-    # UNITS and every per-unit artifact is the tile's parent-grid crop, not the full grid.
-    tile_group: Optional[List[DenseTileJob]] = None
-    if kind == 'tile_group':
-        tile_group = list(task['tiles'])  # type: ignore[arg-type]
-        if not tile_group:
-            raise ValueError(f'Worker task {task.get("task_id", "?")} is an empty tile group')
-        num_frames = int(slice_count) * int(len(tile_group))
-    # The result memmap covers only this task's contiguous slice window [slice_start, slice_start+count).
-    _full_processing_shape = view_processing_volume_shape(view, int(out_size))
-    processing_h, processing_w = int(_full_processing_shape[1]), int(_full_processing_shape[2])
-    if tile_group is not None:
-        crop = tuple(int(v) for v in tile_group[0].parent_crop)
-        processing_h, processing_w = int(crop[1]) - int(crop[0]), int(crop[3]) - int(crop[2])
+
+    full_processing_shape = view_processing_volume_shape(view, int(out_size))
+    declared_processing_shape = tuple(int(v) for v in task.get('processing_shape', full_processing_shape))
+    if len(declared_processing_shape) != 3 or int(declared_processing_shape[0]) != int(view.num_slices):
+        raise ValueError(
+            f'Worker task {task.get("task_id", "?")} has invalid processing shape '
+            f'{declared_processing_shape} for {view.name} ({int(view.num_slices)} slices)'
+        )
+    processing_h = int(declared_processing_shape[1])
+    processing_w = int(declared_processing_shape[2])
     result_shape = (int(num_frames), int(processing_h), int(processing_w))
+    native_resize = task.get('native_resize') if isinstance(task.get('native_resize'), dict) else None
 
     source_mm: Optional[np.memmap] = None
     result_mask: Optional[np.ndarray] = None
@@ -17145,23 +17242,14 @@ def run_prediction_volume_in_worker(
             task['source_volume_path'], task['source_shape'], task.get('source_dtype', 'uint8'), mode='r',
         )
         try:
-            if tile_group is not None:
-                render_callable = _tile_group_cpu_renderer(
-                    mm,
-                    view,
-                    tile_group,
-                    slice_offset=slice_offset,
-                    channel_format=channel_format,
-                )
-            else:
-                render_callable = _worker_render_callable(
-                    mm,
-                    view,
-                    job,
-                    kind,
-                    slice_offset=slice_offset,
-                    channel_format=channel_format,
-                )
+            render_callable = _worker_render_callable(
+                mm,
+                view,
+                job,
+                kind,
+                slice_offset=slice_offset,
+                channel_format=channel_format,
+            )
             cpu_source = StreamingYoloVolumeSource(
                 render_callable,
                 num_frames=num_frames,
@@ -17180,26 +17268,14 @@ def run_prediction_volume_in_worker(
         return mm, cpu_source
 
     try:
-        if tile_group is not None:
-            # a tile group never materializes a per-tile result FILE. Its units are the
-            # tile crops, so the whole task's output is a small anonymous host buffer that is
-            # OR-ed straight into the shared per-configuration canvas below. Sizing is bounded
-            # by the scheduler's slice chunking (tile_group_slice_chunk).
-            result_mask = np.zeros(result_shape, dtype=np.uint8)
-            if task.get('want_confmap'):
-                result_conf = np.zeros(result_shape, dtype=np.uint8)
-        elif str(task.get('result_mode', 'file')) == 'd1_owner':
-            # D1 never creates a host-dense task/view union. This tiny sentinel exists only
-            # to satisfy the generic prediction API; any host fallback is rejected explicitly
-            # before it can write here.
+        if str(task.get('result_mode', 'file')) == 'd1_owner':
+            # D1 never creates a host-dense task/view union. This sentinel exists only to
+            # satisfy the generic prediction API; any host fallback is rejected explicitly.
             result_mask = np.zeros((1, 1, 1), dtype=np.uint8)
             result_conf = None
         elif str(task.get('result_mode', 'file')) == 'direct_union':
-            # single-angle tasks accumulate straight into the shared per-view
-            # union memmap, which the scheduler created zeroed BEFORE enqueueing tasks. Slice
-            # windows are disjoint per task, and same-host page-cache coherence makes the writes
-            # visible to the main process without msync. 'r+' is required — 'w+' would truncate
-            # the shared file under the other workers.
+            # Every angle variant owns a disjoint per-view accumulator. Full-frame slice
+            # leases write non-overlapping z windows directly into that variant's shared union.
             union_shape = (
                 int(task.get('union_num_slices', slice_count)), int(processing_h), int(processing_w),
             )
@@ -17213,32 +17289,24 @@ def run_prediction_volume_in_worker(
                 )
                 result_conf = result_conf_full[slice_offset:slice_offset + slice_count]
         else:
-            # mode 'w+' truncates and re-extends the file, so fresh result
-            # memmaps are already zero-filled — the old explicit [:] = 0 dirtied ~GBs of pages
-            # per chunk for nothing.
-            result_mask = np.memmap(Path(str(task['result_mask_path'])), dtype=np.uint8, mode='w+', shape=result_shape)
+            result_mask = np.memmap(
+                Path(str(task['result_mask_path'])), dtype=np.uint8, mode='w+', shape=result_shape,
+            )
             if task.get('result_conf_path'):
-                result_conf = np.memmap(Path(str(task['result_conf_path'])), dtype=np.uint8, mode='w+', shape=result_shape)
+                result_conf = np.memmap(
+                    Path(str(task['result_conf_path'])), dtype=np.uint8, mode='w+', shape=result_shape,
+                )
 
-        # render full-frame sources on this worker's GPU when possible —
-        # resident mode feeds device tensors straight to the predictor; streaming mode still
-        # GPU-prerenders radial tasks into a host slab. Any engine failure falls back to the
-        # unchanged CPU render path for this task.
+        # Keep the source/native view plane resident whenever the worker has VRAM headroom.
+        # Full-frame and tile tasks use separate source classes but the same cached native
+        # planes; a tile is cropped/warped/resized directly on device before inference.
         gpu_engine = _worker_gpu_render_engine()
-        # when main enqueued before the host cube finished, the task carries
-        # the native decoded volume + a cube-ready sentinel for every file-backed fallback.
-        native_resize = task.get('native_resize') if isinstance(task.get('native_resize'), dict) else None
-        # Tile groups use the same resident source and per-frame render machinery as full frames.
-        # Ring slots carry the current tile's affine and destination descriptor, so one static
-        # TensorRT input binding can cycle through the flattened (frame, tile) unit stream.
-        if gpu_engine is not None and str(kind) in ('fullframe', 'tile_group'):
+        if gpu_engine is not None:
             try:
                 resident_view_supported = bool(
                     not is_radial_view(view) or radial_resident_gpu_render_supported(view)
                 )
                 if native_resize is not None:
-                    # Residency straight from the (smaller, hotter) native volume with the
-                    # t-resize on device — no wait on the host cube at all.
                     render_mode = gpu_engine.ensure_volume(
                         str(native_resize['path']),
                         tuple(int(x) for x in native_resize['shape']),
@@ -17265,46 +17333,48 @@ def run_prediction_volume_in_worker(
                         str(task.get('source_dtype', 'uint8')),
                         require_radial_texture=bool(task.get('radial_texture_required', is_radial_view(view))),
                     )
+
                 if render_mode == 'resident':
                     gpu_engine.run_startup_fused_preflight(
                         _GPU_WORKER_FUSED_PREFLIGHT_SPECS,
                         out_size=int(out_size),
                         fp16=quantize_uses_fp16(cfg.quantize),
                     )
-                if render_mode == 'resident' and tile_group is not None and resident_view_supported:
-                    request_affine_grid_cache_entries(2 * int(len(tile_group)) + 8)
+
+                if render_mode == 'resident' and resident_view_supported and kind == 'tile':
+                    request_affine_grid_cache_entries(10)
                     if is_tilted_view(view):
-                        gpu_engine.request_tilted_plan_cache_entries(int(len(tile_group)) + 4)
-                    source = GpuTiledRenderedYoloSource(
+                        gpu_engine.request_tilted_plan_cache_entries(5)
+                    source = GpuTileRenderedYoloSource(
                         gpu_engine,
                         view,
-                        [tj.M_out_to_src for tj in tile_group],
+                        job,  # type: ignore[arg-type]
                         slice_offset=slice_offset,
                         num_frames=num_frames,
                         batch_size=max(1, int(cfg.batch)),
                         out_size=out_size,
                         fp16=quantize_uses_fp16(cfg.quantize),
-                        name=f"gpu-render-tilegroup-{view.name}-{task['job_id']}",
+                        name=f"gpu-render-tile-{view.name}-{task['job_id']}",
                         channel_format=channel_format,
                     )
                 elif render_mode == 'resident' and resident_view_supported:
                     source = GpuRenderedYoloSource(
                         gpu_engine,
                         view,
-                        job,
+                        job,  # type: ignore[arg-type]
                         slice_offset=slice_offset,
                         num_frames=num_frames,
                         batch_size=max(1, int(cfg.batch)),
                         out_size=out_size,
                         fp16=quantize_uses_fp16(cfg.quantize),
-                        name=f"gpu-render-{kind}-{view.name}-{task['job_id']}",
+                        name=f"gpu-render-fullframe-{view.name}-{task['job_id']}",
                         channel_format=channel_format,
                     )
-                elif tile_group is not None:
-                    # Non-resident tile groups fall through to the CPU renderer, which keeps
-                    # the same per-frame native-plane reuse (just on the host).
-                    source = None
-                elif is_radial_view(view) and radial_streaming_gpu_render_supported(view):
+                elif (
+                    kind == 'fullframe'
+                    and is_radial_view(view)
+                    and radial_streaming_gpu_render_supported(view)
+                ):
                     slab_indices = _radial_slab_context_indices(
                         view, slice_offset, num_frames, channel_format,
                     )
@@ -17333,7 +17403,7 @@ def run_prediction_volume_in_worker(
             except Exception as exc:
                 print(
                     f"Warning: GPU render path failed for {view.name}/{task['job_id']} ({exc}); "
-                    'using the CPU render path for this task.'
+                    'using the CPU render path for this independent task.'
                 )
                 source = None
 
@@ -17351,12 +17421,7 @@ def run_prediction_volume_in_worker(
                 )
             source_mm, source = _open_cpu_render_source()
 
-        # a tile group carries one affine PER TILE (selected per unit below), so there is
-        # no single task-wide matrix; the first tile's crop affine is only a placeholder for
-        # the parameter that the per-unit list overrides.
-        if tile_group is not None:
-            task_affine = np.asarray(tile_group[0].M_out_to_crop, dtype=np.float32)
-        elif task.get('M_out_to_processing') is not None:
+        if task.get('M_out_to_processing') is not None:
             task_affine = np.asarray(task['M_out_to_processing'], dtype=np.float32)
         else:
             task_affine = np.asarray(
@@ -17385,14 +17450,7 @@ def run_prediction_volume_in_worker(
                 streaming_cleanup_min_radius=float(task.get('streaming_cleanup_min_radius', 0.0)),
                 slice_locks=None,
                 device_hole_fill=bool(task.get('device_hole_fill', False)),
-                defer_device_union_flush=bool(
-                    gpu_union_flush_overlap_enabled() and tile_group is None
-                ),
-                # one affine per tile, selected by unit index % tile count.
-                M_out_to_native_by_unit=(
-                    None if tile_group is None
-                    else [np.asarray(tj.M_out_to_crop, dtype=np.float32) for tj in tile_group]
-                ),
+                defer_device_union_flush=bool(gpu_union_flush_overlap_enabled()),
                 device_union_consumer=(
                     (lambda accumulator: _d1_consume_device_union(task, accumulator))
                     if str(task.get('result_mode', 'file')) == 'd1_owner' else None
@@ -17407,19 +17465,12 @@ def run_prediction_volume_in_worker(
         try:
             stats = _predict(source)
         except _ResidentTensorRTRingFatalError:
-            # Teardown could not prove the borrowed TensorRT backend safe. Retrying with a
-            # CPU renderer would still reuse that same backend/context in this worker.
             raise
         except Exception as exc:
             if str(task.get('result_mode', 'file')) == 'd1_owner':
-                # D1's state/coverage transaction cannot be replayed through a host renderer.
-                # Fail closed and let the user disable the bundle for compatibility behavior.
                 raise
-            if not isinstance(source, (GpuRenderedYoloSource, GpuTiledRenderedYoloSource)):
+            if not isinstance(source, (GpuRenderedYoloSource, GpuTileRenderedYoloSource)):
                 raise
-            # GpuRenderedYoloSource renders lazily in __next__, so construction-time fallback
-            # cannot catch a late gather-plan failure/OOM. This task owns a disjoint output-z
-            # window; clear any partial monotonic accumulation and retry from the completed cube.
             print(
                 f"Warning: lazy GPU render failed for {view.name}/{task['job_id']} ({exc}); "
                 'restarting this task with the completed-cube CPU renderer.'
@@ -17438,8 +17489,6 @@ def run_prediction_volume_in_worker(
             retry_with_cpu_render = True
 
         if retry_with_cpu_render:
-            # Run outside the except suite: Python clears the active exception/traceback here,
-            # releasing failed-batch GPU tensors before CPU-rendered inference starts again.
             gc.collect()
             if gpu_engine is not None:
                 try:
@@ -17449,65 +17498,14 @@ def run_prediction_volume_in_worker(
             source_mm, source = _open_cpu_render_source()
             stats = _predict(source)
 
-        if tile_group is not None:
-            # finish the tile group entirely inside this worker.
-            # 1. --min_conf / --min_radius, then the 2D hole fill, in spec order, on the
-            # small crop-sized unit volume (skipped when the device already did them).
-            # 2. OR each tile's units into the shared per-configuration canvas at that
-            # tile's parent-grid offset, under a z-band lock so overlapping tiles from
-            # other workers cannot lose a byte in a read-modify-write race.
-            # The old path wrote a full parent-grid file per tile and made the scheduler
-            # re-read it for a CPU hole fill, a foreground scan and a lock-serialized OR.
-            tile_count = int(len(tile_group))
-            device_filled = int(stats.get('device_hole_filled_frames', 0))
-            if not bool(task.get('streaming_cleanup_enabled', False)):
-                fused_slice_cleanup_inplace(
-                    result_mask,
-                    result_conf if float(task.get('streaming_cleanup_min_conf', 0.0)) > 0.0 else None,
-                    min_conf=float(task.get('streaming_cleanup_min_conf', 0.0)),
-                    # Already expressed on the parent processing raster by the scheduler; the
-                    # crop is a sub-rectangle of that raster, not a resample, so it carries over.
-                    min_radius=float(task.get('streaming_cleanup_min_radius', 0.0)),
-                    workers=int(task.get('postprocess_workers', 1)),
-                    desc=f"Tile-group cleanup ({view.name}/{task['job_id']})",
-                )
-            if int(device_filled) < int(num_frames):
-                fill_view_volume_holes_2d_inplace(
-                    result_mask,
-                    workers=int(task.get('postprocess_workers', 1)),
-                    desc=f"Tile-group 2D hole fill ({view.name}/{task['job_id']})",
-                )
-            canvas = np.memmap(
-                Path(str(task['canvas_path'])), dtype=np.uint8, mode='r+',
-                shape=tuple(int(v) for v in task['canvas_shape']),
-            )
-            try:
-                staged = _union_tile_group_into_canvas(
-                    canvas,
-                    result_mask,
-                    tile_group,
-                    slice_start=int(slice_offset),
-                    slice_count=int(slice_count),
-                    tile_count=int(tile_count),
-                    zband_locks=_worker_canvas_zband_locks(),
-                )
-            finally:
-                close_memmap_array(canvas)
-            stats = dict(stats)
-            stats['staged_voxels'] = int(staged)
-
-        # no msync here — the main process reopens the result file on the
-        # same host, where page-cache coherence makes the data visible without a blocking
-        # multi-GiB writeback per task (msync was crash-durability only).
         public_stats: Dict[str, object] = {
             'prediction_count': int(stats.get('prediction_count', 0)),
             'frames_with_predictions': int(stats.get('frames_with_predictions', 0)),
             'device_hole_filled_frames': int(stats.get('device_hole_filled_frames', 0)),
-            'proto_hole_treated_frames': int(stats.get('proto_hole_treated_frames', stats.get('device_hole_filled_frames', 0))),
-            # per-slice foreground metadata (or None) rides the result queue.
-            'slice_meta': (None if tile_group is not None else stats.get('slice_meta')),
-            # tile groups report what they OR-ed into the shared canvas themselves.
-            'staged_voxels': int(stats.get('staged_voxels', 0)),
+            'proto_hole_treated_frames': int(
+                stats.get('proto_hole_treated_frames', stats.get('device_hole_filled_frames', 0))
+            ),
+            'slice_meta': stats.get('slice_meta'),
         }
         for d1_key in (
             'd1_view_complete', 'd1_covered_slices', 'd1_total_slices',
@@ -17520,10 +17518,6 @@ def run_prediction_volume_in_worker(
                 public_stats[d1_key] = stats[d1_key]
         flush_future = stats.get('_device_union_flush_future')
         if isinstance(flush_future, Future):
-            # Keep the result mappings alive until the copy thread has finished its final
-            # np.copyto. The main worker may now start the next task with a fresh device
-            # accumulator; `_gpu_inference_worker_main` publishes these stats only after
-            # `finish` succeeds.
             deferred_result = _DeferredGpuWorkerTaskResult(
                 stats=public_stats,
                 flush_future=flush_future,
@@ -17536,17 +17530,15 @@ def run_prediction_volume_in_worker(
             return deferred_result
         return public_stats
     finally:
-        # Always release the source render threads first, then close every memmap, even when
-        # predict_source_and_accumulate raised, so a persistent worker never leaks fds/mmaps.
         if source is not None:
             try:
                 source.close()
             except Exception:
                 pass
-        for _mm in (result_mask, result_conf, result_mask_full, result_conf_full, source_mm):
-            if _mm is not None:
+        for mm in (result_mask, result_conf, result_mask_full, result_conf_full, source_mm):
+            if mm is not None:
                 try:
-                    close_memmap_array(_mm)
+                    close_memmap_array(mm)
                 except Exception:
                     pass
 
@@ -17572,13 +17564,9 @@ def _gpu_inference_worker_main(
     init_dict: Dict[str, object],
     task_queue: object,
     result_queue: object,
-    canvas_zband_locks: Optional[Sequence[object]] = None,
 ) -> None:
     """Persistent GPU worker process: pin to one physical GPU, load the model once, serve tasks."""
     global _GPU_WORKER_NUMA_PIN, _GPU_WORKER_NUMA_FULL
-    # inherited multiprocessing locks (passed positionally so spawn can transfer them)
-    # guard concurrent ORs into the shared per-configuration tile canvases.
-    set_worker_canvas_zband_locks(canvas_zband_locks)
     try:
         # Pin the process to its physical GPU before any CUDA context is created, so the model and
         # all tensors live on that device and never contend with the other workers' GPUs. The
@@ -17607,11 +17595,11 @@ def _gpu_inference_worker_main(
         set_gpu_worker_fused_preflight_specs(
             init_dict.get('fused_preflight_specs')  # type: ignore[arg-type]
         )
-        # propagate the single-angle GPU fast-path (min_conf, min_radius) into this
+        # propagate the angle-variant GPU fast-path (min_conf, min_radius) into this
         # worker process (globals do not cross the spawn boundary). None disables the fast path.
-        _fastpath_min_conf = init_dict.get('single_angle_gpu_fastpath_min_conf', None)
-        _fastpath_min_radius = init_dict.get('single_angle_gpu_fastpath_min_radius', 0.0)
-        set_single_angle_gpu_fastpath(
+        _fastpath_min_conf = init_dict.get('angle_variant_gpu_fastpath_min_conf', None)
+        _fastpath_min_radius = init_dict.get('angle_variant_gpu_fastpath_min_radius', 0.0)
+        set_angle_variant_gpu_fastpath(
             None if _fastpath_min_conf is None else float(_fastpath_min_conf),
             float(_fastpath_min_radius or 0.0),
         )
@@ -22014,14 +22002,12 @@ def _try_resident_trt_ring_accumulate(
     native_h: int,
     native_w: int,
     device_union: Optional['_DeviceUnionAccumulator'],
-    M_out_to_native_by_unit: Optional[Sequence[np.ndarray]] = None,
     preunion_min_conf: Optional[float] = None,
 ) -> Optional[Dict[str, int]]:
     """Run a batch-1 resident source through the persistent two-context TensorRT ring.
 
-    Full-frame sources use one task-wide post affine.  Grouped tile sources provide one
-    affine per tile; each ring slot receives a per-unit descriptor that selects both the
-    affine and the task-union destination before its post kernel is launched.
+    Every v16.4.0 source owns one task-wide post affine. Full-frame and tile tasks
+    therefore share the same static destination geometry across all ring slots.
     """
     global _RESIDENT_TRT_RING_ANNOUNCED, _RESIDENT_TRT_RING_FALLBACK_WARNED
     global _RESIDENT_TRT_RING_CACHE_HIT_ANNOUNCED
@@ -22033,7 +22019,7 @@ def _try_resident_trt_ring_accumulate(
 
     if not resident_trt_ring_enabled() or device_union is None:
         return _decline()
-    if not isinstance(source, (GpuRenderedYoloSource, GpuTiledRenderedYoloSource)):
+    if not isinstance(source, (GpuRenderedYoloSource, GpuTileRenderedYoloSource)):
         return _decline()
     source_channels = int(getattr(source, 'channel_count', 1))
     if source_channels != int(cfg.input_channels):
@@ -22046,35 +22032,25 @@ def _try_resident_trt_ring_accumulate(
             f'--channel_format {cfg.channel_token} requires C={int(cfg.input_channels)}'
         )
 
-    matrix_cycle = (
-        [np.asarray(M_out_to_native, dtype=np.float32).reshape(2, 3)]
-        if M_out_to_native_by_unit is None
-        else [np.asarray(m, dtype=np.float32).reshape(2, 3) for m in M_out_to_native_by_unit]
-    )
-    if not matrix_cycle:
+    matrix = np.asarray(M_out_to_native, dtype=np.float32).reshape(2, 3)
+    if not bool(np.isfinite(matrix).all()):
         return _decline()
-    descriptors: List[ResidentRingUnitDescriptor] = []
-    matrix_keys: set[Tuple[float, ...]] = set()
-    all_identity = True
-    for unit_index in range(int(num_frames)):
-        matrix = matrix_cycle[int(unit_index) % len(matrix_cycle)]
-        if not bool(np.isfinite(matrix).all()):
-            return _decline()
-        matrix_keys.add(tuple(float(v) for v in matrix.reshape(-1)))
-        identity = bool(
-            int(native_h) == int(out_size)
-            and int(native_w) == int(out_size)
-            and _warp_matrix_is_identity(matrix)
-        )
-        all_identity = bool(all_identity and identity)
-        descriptors.append(ResidentRingUnitDescriptor(
+    identity = bool(
+        int(native_h) == int(out_size)
+        and int(native_w) == int(out_size)
+        and _warp_matrix_is_identity(matrix)
+    )
+    descriptors = [
+        ResidentRingUnitDescriptor(
             unit_index=int(unit_index),
             destination_index=int(unit_index),
             native_h=int(native_h),
             native_w=int(native_w),
             M_out_to_native=matrix,
-        ))
-    dynamic_descriptors = bool(len(matrix_keys) > 1)
+        )
+        for unit_index in range(int(num_frames))
+    ]
+    dynamic_descriptors = False
 
     try:
         union_shape = tuple(int(x) for x in device_union.union_dev.shape)
@@ -22141,7 +22117,7 @@ def _try_resident_trt_ring_accumulate(
             out_size=int(out_size),
             native_h=int(native_h),
             native_w=int(native_w),
-            M_out_to_native=np.asarray(matrix_cycle[0], dtype=np.float32),
+            M_out_to_native=matrix,
             track_conf=device_union.conf_dev is not None,
             confidence_threshold=float(threshold),
             dynamic_unit_descriptors=bool(dynamic_descriptors),
@@ -22218,9 +22194,7 @@ def _try_resident_trt_ring_accumulate(
     if not _RESIDENT_TRT_RING_ANNOUNCED:
         _RESIDENT_TRT_RING_ANNOUNCED = True
         post_mode = (
-            f'per-unit-affine({len(matrix_cycle)} descriptors)'
-            if dynamic_descriptors
-            else ('identity' if executor.identity_native_warp else 'fused-native-affine')
+            'identity' if executor.identity_native_warp else 'fused-native-affine'
         )
         print(
             'Resident TensorRT batch-1 ring active: two independent execution contexts, '
@@ -22401,9 +22375,9 @@ def gpu_resident_radial_backproject_enabled() -> bool:
     return _env_flag('YOLO_TTA_GPU_BACKPROJECT_RESIDENT', True)
 
 
-def fused_single_angle_radial_component_layer_enabled() -> bool:
-    """Project one post-interpolation Radial union in the single-angle fast path."""
-    return _env_flag('YOLO_TTA_FUSED_SINGLE_ANGLE_RADIAL_LAYER', True)
+def fused_angle_variant_radial_component_layer_enabled() -> bool:
+    """Project one post-interpolation Radial union in the angle-variant fast path."""
+    return _env_flag('YOLO_TTA_FUSED_ANGLE_VARIANT_RADIAL_LAYER', True)
 
 
 def _radial_resident_backproject_kernel() -> Optional[object]:
@@ -24644,6 +24618,101 @@ def assemble_view_volume_from_projected_layers(
     return vol_mm
 
 
+
+def collapse_tta_variant_volumes_to_physical_views(
+    view_volumes_by_model: Dict[str, Dict[str, np.ndarray]],
+    views: Sequence[ViewInfo],
+    *,
+    workers: int = 1,
+    retired_volume_ids: Optional[set[int]] = None,
+) -> Dict[str, Dict[str, np.ndarray]]:
+    """Union completed angle variants only at physical-view finalization.
+
+    Every runtime ``ViewInfo.name`` is angle-specific in v16.4.0. Cartesian working stacks
+    must therefore recover their physical names before the terminal axis-aware assembler;
+    otherwise a Sagittal/Coronal variant can be mistaken for an already-source-native volume.
+    The first completed variant becomes the in-place physical accumulator. Later variants of
+    the same physical view are ORed into it and retired immediately. Projected component refs
+    are intentionally not materialized here; their independent angle layers remain direct
+    contributors to the final source-space union.
+    """
+    view_by_runtime_name = {str(view.name): view for view in views}
+    collapsed_by_model: Dict[str, Dict[str, np.ndarray]] = {}
+
+    for model_name, runtime_volumes in view_volumes_by_model.items():
+        physical_volumes: Dict[str, np.ndarray] = {}
+        physical_owner_names: Dict[str, str] = {}
+        for runtime_name, volume in list(runtime_volumes.items()):
+            runtime_key = str(runtime_name)
+            view = view_by_runtime_name.get(runtime_key)
+            if view is None:
+                if '__tta_' in runtime_key:
+                    raise KeyError(
+                        f'Cannot collapse unknown TTA runtime view {runtime_key!r}; '
+                        'its physical geometry is unavailable.'
+                    )
+                physical_name = runtime_key
+            else:
+                physical_name = physical_view_name(view)
+
+            existing = physical_volumes.get(str(physical_name))
+            if existing is None:
+                physical_volumes[str(physical_name)] = volume
+                physical_owner_names[str(physical_name)] = runtime_key
+                continue
+            if existing is volume:
+                continue
+            existing_shape = tuple(int(v) for v in np.asarray(existing).shape)
+            incoming_shape = tuple(int(v) for v in np.asarray(volume).shape)
+            if existing_shape != incoming_shape:
+                raise ValueError(
+                    f'Cannot collapse TTA variants for {model_name}/{physical_name}: '
+                    f'{physical_owner_names[physical_name]} has shape {existing_shape}, '
+                    f'but {runtime_key} has shape {incoming_shape}.'
+                )
+            union_volume_into_volume(
+                existing,
+                volume,
+                workers=int(workers),
+                desc=(
+                    f'Collapsing final TTA angle variant {model_name}/{runtime_key} '
+                    f'into physical view {physical_name}'
+                ),
+            )
+            close_memmap_array(volume)
+            if retired_volume_ids is not None:
+                retired_volume_ids.add(id(volume))
+
+        runtime_volumes.clear()
+        collapsed_by_model[str(model_name)] = physical_volumes
+
+    return collapsed_by_model
+
+
+def release_unretained_volume_maps(
+    volume_maps: Sequence[Dict[str, Dict[str, np.ndarray]]],
+    retained_volumes_by_model: Dict[str, Dict[str, np.ndarray]],
+    *,
+    already_retired_ids: Optional[set[int]] = None,
+) -> None:
+    """Retire auxiliary per-angle dense volumes that the collapsed map no longer owns."""
+    retained_ids = {
+        id(volume)
+        for model_volumes in retained_volumes_by_model.values()
+        for volume in model_volumes.values()
+    }
+    closed_ids: set[int] = set(already_retired_ids or ())
+    for outer_map in volume_maps:
+        for model_volumes in outer_map.values():
+            for volume in model_volumes.values():
+                volume_id = id(volume)
+                if volume_id in retained_ids or volume_id in closed_ids:
+                    continue
+                close_memmap_array(volume)
+                closed_ids.add(volume_id)
+            model_volumes.clear()
+
+
 def assemble_view_volumes_into_native_union(
     final_union_mm: np.ndarray,
     view_volume_mms: Dict[str, np.ndarray],
@@ -25912,7 +25981,7 @@ def apply_keep_largest_objects_inplace(
         component_stats_out=comp_stats,
         known_slice_any=support_metadata.slice_any,
         known_slice_bboxes=support_metadata.slice_bboxes,
-        # also covers the common --keep_objects 1 tail: the same local-label
+        # also covers the common postprocessing keep_objects:1 tail: the same local-label
         # arena and direct packed-LUT apply avoid rebuilding a second dense host cube.
         sparse_local_labels=True,
         prefer_crop_bounded_cpu_labeling=True,
@@ -26143,7 +26212,7 @@ def assemble_final_union_after_view_union(
             reserve_bytes=int(reserve_bytes),
         )
     else:
-        print('\n=== Optional 3D void fill disabled (--enable_3d_void_fill not set) ===')
+        print('\n=== Optional 3D void fill disabled (--postprocessing 3d_void_fill not selected) ===')
     return final_union_mm
 
 
@@ -30849,6 +30918,8 @@ class _DirectUnionBackingLease:
 class PreparedViewResult:
     model_name: str
     view_name: str
+    aug_id: str
+    angle_deg: float
     native_support_mm: Optional[np.ndarray]
     final_view_volume_mm: Optional[np.ndarray]
     interpolation_stats: List[Dict[str, object]]
@@ -30861,22 +30932,33 @@ class PreparedViewResult:
 class TilePostprocessTask:
     model_name: str
     view_name: str
+    aug_id: str
+    angle_deg: float
     config_id: str
     tile_id: str
+    # Fixed parent-processing-grid footprint (py0, py1, px0, px1). The tile mask
+    # itself is crop-local and is never expanded into a parent-sized raw canvas.
+    parent_crop: Tuple[int, int, int, int]
     tile_mask_mm: np.ndarray
     tile_confmap_mm: Optional[np.ndarray]
     tile_mask_path: Path
     tile_confmap_path: Optional[Path]
     precleaned_slice_cleanup: bool = False
+    # Actual crop-local output shape. Tile masks never expand into a parent-sized canvas.
     processing_shape: Optional[Tuple[int, int, int]] = None
+    # Full parent processing-plane geometry used only to scale native-space thresholds.
+    threshold_plane_shape: Optional[Tuple[int, int]] = None
 
 
 @dataclass
 class TilePostprocessResult:
     model_name: str
     view_name: str
+    aug_id: str
+    angle_deg: float
     config_id: str
     tile_id: str
+    parent_crop: Tuple[int, int, int, int]
     tile_mask_mm: Optional[np.ndarray] = None
     tile_mask_path: Optional[Path] = None
     tile_mask_store: Optional['RawBBoxMaskStore'] = None
@@ -30886,8 +30968,11 @@ class TilePostprocessResult:
 class DeferredTilePostprocessResult:
     model_name: str
     view_name: str
+    aug_id: str
+    angle_deg: float
     config_id: str
     tile_id: str
+    parent_crop: Tuple[int, int, int, int]
     tile_mask_path: Path
     tile_shape: Tuple[int, int, int]
     storage_format: str = 'ctile-mask-v2-raw'
@@ -31017,6 +31102,9 @@ class NrrdLayerRef:
     storage_format: str = 'raw_u8'
     model_name: str = ''
     view_name: str = ''
+    physical_view_name: str = ''
+    aug_id: str = ''
+    angle_deg: float = 0.0
     view_family: str = ''
     source: str = ''  # fullframe, tile, or global
     mask_kind: str = ''  # yolo, bridge, union, smoothing_result
@@ -31053,9 +31141,25 @@ class NrrdRasterPlan:
 
 
 @dataclass(frozen=True)
+class TileParentGateResult:
+    model_name: str
+    view_name: str
+    aug_id: str
+    angle_deg: float
+    config_id: str
+    tile_id: str
+    gate_stats: Dict[str, int]
+    # Entire original components that failed parent-YOLO support. They remain tile-local
+    # and angle-local until the immutable parent bridge support is published.
+    residual_result: Optional[TilePostprocessResult] = field(default=None, compare=False)
+
+
+@dataclass(frozen=True)
 class TileGateResult:
     model_name: str
     view_name: str
+    aug_id: str
+    angle_deg: float
     config_id: str
     tile_id: str
     gate_stats: Dict[str, int]
@@ -31065,6 +31169,8 @@ class TileGateResult:
 class TileConsolidationResult:
     model_name: str
     view_name: str
+    aug_id: str
+    angle_deg: float
     interpolation_stats: List[Dict[str, object]]
     nrrd_layers: List[NrrdLayerRef] = field(default_factory=list)
     # the interpolation process backend may rebind the consolidated
@@ -32008,7 +32114,7 @@ def write_raw_bbox_mask_store(
 # --------------------------
 # v16.1.3 D1 owner-GPU pipeline
 # --------------------------
-# Eligible single-angle/no-interpolation views never materialize a dense host view union.
+# Eligible angle-variant/no-interpolation views never materialize a dense host view union.
 # Each view is pinned to one worker GPU, task-local native masks are backprojected immediately
 # into a persistent source-geometry bitset, and the completed bitset is copied once before a
 # CPU publication worker emits the sparse cvol consumed by the NRRD/final-union stages.
@@ -32256,7 +32362,7 @@ def _d1_view_family_ids(view: ViewInfo) -> Tuple[int, int, int, float, int, floa
         center_y = float((int(view.src_h) - 1) * 0.5)
     else:
         family_id = 0
-        base = str(view.name)
+        base = physical_view_name(view)
         direction = 'vertical'
         tan_tilt = 0.0
         stack_len = int(view.num_slices)
@@ -32453,13 +32559,16 @@ def _d1_finalize_bitset_layer(
         storage_format=CVOL_FORMAT,
         model_name=str(model_name),
         view_name=str(view.name),
+        physical_view_name=physical_view_name(view),
+        aug_id=str(view.tta_aug_id),
+        angle_deg=float(view.tta_angle_deg),
         view_family=str(view.family),
         source='fullframe',
         mask_kind='yolo',
         pass_index=0,
         stage='pre_interpolation',
         description=(
-            'Single-angle YOLO mask with resident proto closing and immediate '
+            'Angle-variant YOLO mask with resident proto closing and immediate '
             'owner-GPU backprojection into source geometry.'
         ),
         segment_extent_ijk=extent,
@@ -32925,11 +33034,11 @@ def project_view_volume_to_orthogonal_volume(
     # orthogonal grid is smaller on exactly the two axes represented by the YOLO plane;
     # the NRRD streamer/final union performs the sole restore to output geometry.
     if reduced_processing and view.family != 'radial' and not is_tilted_view(view):
-        if view.name == 'transverse':
+        if physical_view_name(view) == 'transverse':
             t_dim, h_dim, w_dim = int(source_shape[0]), int(plane_h), int(plane_w)
-        elif view.name == 'sagittal':
+        elif physical_view_name(view) == 'sagittal':
             t_dim, h_dim, w_dim = int(plane_h), int(source_shape[0]), int(plane_w)
-        elif view.name == 'coronal':
+        elif physical_view_name(view) == 'coronal':
             t_dim, h_dim, w_dim = int(plane_h), int(plane_w), int(source_shape[0])
         else:  # pragma: no cover
             raise ValueError(f'{desc}: unsupported reduced Cartesian view {view.name!r}')
@@ -32975,7 +33084,7 @@ def project_view_volume_to_orthogonal_volume(
             f'requested output shape {tuple(out_shape_tyx)} != working {(t_dim, h_dim, w_dim)}'
         )
 
-    if view.name == 'transverse':
+    if physical_view_name(view) == 'transverse':
         if tuple(int(x) for x in np.asarray(view_mask_mm).shape) != (t_dim, h_dim, w_dim):
             raise ValueError(f'{desc}: transverse layer shape {tuple(view_mask_mm.shape)} != {(t_dim, h_dim, w_dim)}')
         if bool(allow_transverse_passthrough):
@@ -33002,7 +33111,7 @@ def project_view_volume_to_orthogonal_volume(
         reserve_bytes=int(reserve_bytes),
     )
 
-    if view.name == 'sagittal':
+    if physical_view_name(view) == 'sagittal':
         src = np.asarray(view_mask_mm)
         if tuple(int(x) for x in src.shape) != (h_dim, t_dim, w_dim):
             raise ValueError(f'{desc}: sagittal layer shape {tuple(src.shape)} != {(h_dim, t_dim, w_dim)}')
@@ -33028,7 +33137,7 @@ def project_view_volume_to_orthogonal_volume(
             show_progress=False,
             target_chunks_per_worker=2,
         )
-    elif view.name == 'coronal':
+    elif physical_view_name(view) == 'coronal':
         src = np.asarray(view_mask_mm)
         if tuple(int(x) for x in src.shape) != (w_dim, t_dim, h_dim):
             raise ValueError(f'{desc}: coronal layer shape {tuple(src.shape)} != {(w_dim, t_dim, h_dim)}')
@@ -33295,6 +33404,9 @@ def materialize_nrrd_view_layer(
         storage_format=storage_format,
         model_name=str(model_name),
         view_name=str(view.name),
+        physical_view_name=physical_view_name(view),
+        aug_id=str(view.tta_aug_id),
+        angle_deg=float(view.tta_angle_deg),
         view_family=str(view.family),
         source=str(source),
         mask_kind=str(mask_kind),
@@ -33504,6 +33616,16 @@ def materialize_nrrd_global_layer(
         )
     return layer_ref
 
+def view_interpolation_wrap_axis(view: ViewInfo) -> bool:
+    """Return the fixed interpolation boundary policy for one view family.
+
+    Radial and Tilted-Radial frame order is circular and always wraps. Cartesian and
+    Tilted-Cartesian stacks are linear and never wrap. v16.4.0 intentionally exposes no
+    environment variable or CLI switch capable of changing this geometry contract.
+    """
+    return bool(is_radial_view(view))
+
+
 def prepare_view_volume_after_fullframe(
     *,
     model_name: str,
@@ -33530,6 +33652,7 @@ def prepare_view_volume_after_fullframe(
     hole_fill_done_on_device: bool = False,
     slice_meta: Optional[Dict[str, object]] = None,
     fuse_radial_component_layers: bool = False,
+    parent_mask_ready_callback: Optional[Callable[[str, str, object], None]] = None,
 ) -> PreparedViewResult:
     baseline_native_volume = union_mm
     nrrd_layers: List[NrrdLayerRef] = []
@@ -33623,20 +33746,29 @@ def prepare_view_volume_after_fullframe(
             if layer_ref is not None:
                 nrrd_layers.append(layer_ref)
 
-        # Only dense tiled NRRD category gating needs a persistent parent-YOLO support copy.
-        # Store it as a slice-chunked cvol instead of a raw uint8 memmap to avoid one
-        # full-volume duplicate per active view.
-        if bool(dense_tiling_active):
-            parent_mask_support_path = temp_dir / 'nrrd_support' / view.name / 'fullframe_yolo_support.cvol'
-            write_raw_bbox_mask_store(
-                baseline_native_volume,
-                parent_mask_support_path,
-                format_name=CVOL_FORMAT,
-                desc=f'NRRD support fullframe YOLO {model_name}/{view.name}',
-                workers=int(slice_workers),
-                extra_meta={'support_kind': 'fullframe_yolo_pre_interpolation'},
-            )
-            parent_mask_support_mm = RawBBoxMaskStore.open(parent_mask_support_path)
+    # Per-tile gating always needs the immutable same-angle parent YOLO support, even
+    # when NRRD output is disabled. Keep it as a sparse slice-chunked cvol so the new
+    # two-stage gate can classify each original tile component before any cross-tile OR.
+    if bool(dense_tiling_active):
+        parent_mask_support_path = temp_dir / 'tile_support' / model_name / view.name / 'fullframe_yolo_support.cvol'
+        write_raw_bbox_mask_store(
+            baseline_native_volume,
+            parent_mask_support_path,
+            format_name=CVOL_FORMAT,
+            desc=f'Tile support fullframe YOLO {model_name}/{view.name}',
+            workers=int(slice_workers),
+            extra_meta={
+                'support_kind': 'fullframe_yolo_pre_interpolation',
+                'physical_view': physical_view_name(view),
+                'tta_aug_id': str(view.tta_aug_id),
+                'tta_angle_deg': float(view.tta_angle_deg),
+            },
+        )
+        parent_mask_support_mm = RawBBoxMaskStore.open(parent_mask_support_path, mmap_payload=True)
+        # Publish immutable P immediately after cleanup, before any parent interpolation.
+        # Tile components may now perform their first gate while the parent bridge planner runs.
+        if parent_mask_ready_callback is not None:
+            parent_mask_ready_callback(str(model_name), str(view.name), parent_mask_support_mm)
 
 
     interpolation_stats: List[Dict[str, object]] = []
@@ -33659,6 +33791,7 @@ def prepare_view_volume_after_fullframe(
 
             baseline_native_volume, stats_local = interpolate_view_volume_pass_maybe_process(
                 mask_mm=baseline_native_volume,
+                view=view,
                 work_dir=temp_dir / 'interpolation' / model_name / view.name,
                 pass_tag=f'pass{pass_idx}',
                 max_slice_distance=int(interpolate),
@@ -33669,7 +33802,6 @@ def prepare_view_volume_after_fullframe(
                 keep_temp=bool(keep_temp),
                 prefer_memory=True,
                 workers=int(interpolation_task_workers),
-                wrap_axis=bool(view.family == 'radial'),
                 bridge_delta_path=pass_delta_path,
                 # pass 1 labels exactly the flushed volume; later passes see
                 # bridge-mutated content, so the metadata is only forwarded for pass 1.
@@ -33777,7 +33909,7 @@ def prepare_view_volume_after_fullframe(
         # projection and positive-support restore distribute over binary OR, so the
         # cleaned YOLO mask and every accepted bridge can be kept in the already-mutated
         # baseline and projected once. This removes one source-store write and one complete
-        # Radial backprojection per bridge pass on the prioritized single-angle path.
+        # Radial backprojection per bridge pass on the prioritized angle-variant path.
         fused_added_voxels = sum(
             max(0, int(item.get('added_voxels', 0) or 0))
             for item in interpolation_stats
@@ -33818,8 +33950,8 @@ def prepare_view_volume_after_fullframe(
                 f'projection pass ({int(fused_added_voxels)} bridge voxel(s)).'
             )
 
-    if bool(nrrd_layers_enabled) and parent_mask_support_mm is not None:
-        parent_bridge_support_path = temp_dir / 'nrrd_support' / view.name / 'fullframe_bridge_support.cvol'
+    if bool(dense_tiling_active) and parent_mask_support_mm is not None:
+        parent_bridge_support_path = temp_dir / 'tile_support' / model_name / view.name / 'fullframe_bridge_support.cvol'
         bridge_stats = subtract_volume_to_raw_bbox_store(
             baseline_native_volume,
             parent_mask_support_mm,
@@ -33836,15 +33968,13 @@ def prepare_view_volume_after_fullframe(
                 except Exception:
                     pass
         else:
-            parent_bridge_support_mm = RawBBoxMaskStore.open(parent_bridge_support_path)
+            parent_bridge_support_mm = RawBBoxMaskStore.open(parent_bridge_support_path, mmap_payload=True)
 
-    sparse_retire_dense = bool(
-        nrrd_layers_enabled
-        and not dense_tiling_active
-        and not bool(keep_temp)
-        and not _view_uses_interpolation(view, int(interpolate))
-        and _env_flag('YOLO_TTA_SPARSE_VIEW_RETIREMENT', True)
-    )
+    # Angle variants remain dense until physical-view finalization immediately before
+    # the final global binary union in v16.4.0.
+    # Their component NRRDs and tile categories remain independently addressable meanwhile.
+    sparse_retire_dense = False
+
     if sparse_retire_dense:
         retired_bytes = int(np.asarray(baseline_native_volume).nbytes)
         close_memmap_array_without_flush(baseline_native_volume)
@@ -33863,17 +33993,10 @@ def prepare_view_volume_after_fullframe(
     if sparse_retire_dense:
         final_view_volume = None
     elif bool(dense_tiling_active):
-        if _view_uses_interpolation(view, int(interpolate)):
-            final_copy_path = temp_dir / 'view_volumes' / model_name / f'{view.name}.final_fullframe.u8.dat'
-            final_view_volume = copy_workspace_array(
-                baseline_native_volume,
-                final_copy_path,
-                desc=f'{model_name}/{view.name} frozen full-frame support copy',
-                prefer_memory=True,
-                workers=int(slice_workers),
-            )
-        else:
-            final_view_volume = baseline_native_volume
+        # The immutable parent-YOLO mask P and parent-bridge mask B now live in separate
+        # sparse support stores. Tile gates never read this dense array, so accepted tile
+        # masks can be ORed into it after both supports are frozen without a full-volume copy.
+        final_view_volume = baseline_native_volume
     elif view.family == 'radial':
         # Keep Radial masks view-native here. Final projection is orientation-aware and may
         # stream directly into destination bands; transverse also has a GPU backprojection path.
@@ -33884,8 +34007,8 @@ def prepare_view_volume_after_fullframe(
     else:
         final_view_volume = baseline_native_volume
 
-    returned_parent_mask_support = parent_mask_support_mm if (bool(nrrd_layers_enabled) and bool(dense_tiling_active)) else None
-    returned_parent_bridge_support = parent_bridge_support_mm if (bool(nrrd_layers_enabled) and bool(dense_tiling_active)) else None
+    returned_parent_mask_support = parent_mask_support_mm if bool(dense_tiling_active) else None
+    returned_parent_bridge_support = parent_bridge_support_mm if bool(dense_tiling_active) else None
     if parent_mask_support_mm is not None and returned_parent_mask_support is None:
         close_raw_store_or_memmap_volume(parent_mask_support_mm, keep_temp=bool(keep_temp))
     if parent_bridge_support_mm is not None and returned_parent_bridge_support is None:
@@ -33894,6 +34017,8 @@ def prepare_view_volume_after_fullframe(
     return PreparedViewResult(
         model_name=str(model_name),
         view_name=str(view.name),
+        aug_id=str(view.tta_aug_id),
+        angle_deg=float(view.tta_angle_deg),
         native_support_mm=baseline_native_volume,
         final_view_volume_mm=final_view_volume,
         interpolation_stats=interpolation_stats,
@@ -33902,396 +34027,140 @@ def prepare_view_volume_after_fullframe(
         parent_bridge_support_mm=returned_parent_bridge_support,
     )
 
-def tile_support_prefilter_enabled() -> bool:
-    """(b): skip tile work where the frozen parent support can never accept it.
-
- Every tile component is ultimately kept only if it intersects parent support on the
- same slice (see ``gate_tile_volume_against_parent_inplace``). Testing that BEFORE
- inference instead of after it removes whole tiles and whole slice ranges from the run.
- Not bit-identical: gating runs on the consolidated canvas, so an unsupported tile could
- in principle have contributed pixels to a component another, overlapping tile got
- accepted for. The candidate window is dilated by a full tile stride specifically so any
- tile overlapping a supported tile is retained, which makes that case vanishingly rare."""
-    return _env_flag('YOLO_TTA_TILE_SUPPORT_PREFILTER', True)
-
-
-def tile_content_prefilter_enabled() -> bool:
-    """(a): skip tiles whose source rectangle is entirely background.
-
- Applies to the Cartesian views, where a tile's native-view rectangle maps to an
- axis-aligned box of the source volume exactly. Radial/Tilted rectangles map to rotated
- or sheared slabs, so they are conservatively always kept."""
-    return _env_flag('YOLO_TTA_TILE_CONTENT_PREFILTER', True)
-
-
-def tile_prefilter_block() -> int:
-    """Edge length of the coarse max-pool blocks backing both tile prefilters."""
-    return max(1, _env_int('YOLO_TTA_TILE_PREFILTER_BLOCK', 16))
-
-
-def _coarse_block_max_3d(volume: np.ndarray, block: Tuple[int, int, int], *, workers: int = 1) -> np.ndarray:
-    """Boolean block-max of a uint8 volume; ``True`` where any voxel in the block is nonzero.
-
- Over-approximates every query (a block is set if ANY voxel in it is set), so a prefilter
- built on it can never drop a tile that had real content."""
-    src = np.asarray(volume)
-    bt, by, bx = (max(1, int(v)) for v in block)
-    t_dim, y_dim, x_dim = (int(v) for v in src.shape)
-    out_t = int(math.ceil(t_dim / bt))
-    out_y = int(math.ceil(y_dim / by))
-    out_x = int(math.ceil(x_dim / bx))
-    out = np.zeros((out_t, out_y, out_x), dtype=bool)
-
-    def _reduce(out_z: int) -> None:
-        z0 = int(out_z) * bt
-        z1 = min(t_dim, z0 + bt)
-        acc = np.zeros((out_y, out_x), dtype=bool)
-        for z in range(z0, z1):
-            plane = np.asarray(src[int(z)]) != 0
-            pad_y = out_y * by - y_dim
-            pad_x = out_x * bx - x_dim
-            if pad_y or pad_x:
-                plane = np.pad(plane, ((0, pad_y), (0, pad_x)), mode='constant', constant_values=False)
-            acc |= plane.reshape(out_y, by, out_x, bx).any(axis=(1, 3))
-        out[int(out_z)] = acc
-
-    parallel_for_indices_chunked(
-        int(out_t), _reduce,
-        max_workers=choose_slice_parallel_workers(int(workers), int(out_t)),
-        desc='Tile prefilter coarse map', show_progress=False,
-    )
-    return out
-
-
-def _coarse_any(coarse: np.ndarray, axis_slices: Sequence[Tuple[int, int]]) -> np.ndarray:
-    """Reduce a coarse map over the two trailing query ranges, keeping the first axis."""
-    (a0, a1), (b0, b1) = axis_slices
-    if a1 <= a0 or b1 <= b0:
-        return np.zeros((int(coarse.shape[0]),), dtype=bool)
-    return np.asarray(coarse[:, a0:a1, b0:b1]).any(axis=(1, 2))
-
-
-def tile_support_candidate_slices(
-    tile_job: 'DenseTileJob',
-    support_coarse: np.ndarray,
-    *,
-    block: int,
-    plane_shape: Tuple[int, int],
-    dilate_px: int,
-) -> np.ndarray:
-    """Per-slice boolean: can this tile's footprint intersect parent support on that slice?"""
-    py0, py1, px0, px1 = (int(v) for v in tile_job.parent_crop)
-    ph, pw = (int(v) for v in plane_shape)
-    d = max(0, int(dilate_px))
-    y0 = max(0, int(py0) - d) // int(block)
-    y1 = int(math.ceil(min(int(ph), int(py1) + d) / float(block)))
-    x0 = max(0, int(px0) - d) // int(block)
-    x1 = int(math.ceil(min(int(pw), int(px1) + d) / float(block)))
-    return _coarse_any(support_coarse, ((y0, y1), (x0, x1)))
-
-
-def tile_native_rect(tile_job: 'DenseTileJob') -> Tuple[int, int, int, int]:
-    """Axis-aligned hull of a tile's output raster in native view pixels: (y0, y1, x0, x1)."""
-    M = np.asarray(tile_job.M_out_to_src, dtype=np.float64).reshape(2, 3)
-    n = float(int(tile_job.out_size))
-    corners = np.array(
-        [
-            [-0.5, n - 0.5, -0.5, n - 0.5],
-            [-0.5, -0.5, n - 0.5, n - 0.5],
-            [1.0, 1.0, 1.0, 1.0],
-        ],
-        dtype=np.float64,
-    )
-    dst = M @ corners
-    return (
-        int(math.floor(float(np.min(dst[1])))),
-        int(math.ceil(float(np.max(dst[1])))) + 1,
-        int(math.floor(float(np.min(dst[0])))),
-        int(math.ceil(float(np.max(dst[0])))) + 1,
-    )
-
-
-def tile_content_candidate_slices(
-    tile_job: 'DenseTileJob',
-    view: ViewInfo,
-    source_coarse: Optional[np.ndarray],
-    *,
-    block: int,
-    num_slices: int,
-) -> np.ndarray:
-    """Per-slice boolean: does this tile's source rectangle contain any nonzero voxel?
-
- ``source_coarse`` is a block-max over the (t, y, x) source volume. The mapping from a
- native-view rectangle to volume axes is exact for the Cartesian views; every other view
- family conservatively returns all-True."""
-    keep_all = np.ones((int(num_slices),), dtype=bool)
-    if source_coarse is None:
-        return keep_all
-    name = str(view.name)
-    if name not in ('transverse', 'sagittal', 'coronal'):
-        return keep_all
-    ny0, ny1, nx0, nx1 = tile_native_rect(tile_job)
-    b = max(1, int(block))
-    ct, cy, cx = (int(v) for v in source_coarse.shape)
-
-    def _rng(lo: int, hi: int, limit: int) -> Tuple[int, int]:
-        return max(0, int(lo) // b), min(int(limit), int(math.ceil(max(0, int(hi)) / float(b))))
-
-    if name == 'transverse':
-        # native frame == volume[t]; rows -> Y, cols -> X, one frame per t.
-        ys, xs = _rng(ny0, ny1, cy), _rng(nx0, nx1, cx)
-        per_block = _coarse_any(source_coarse, (ys, xs))  # (ct,)
-        axis_len, axis_blocks = int(num_slices), per_block
-    elif name == 'sagittal':
-        # native frame == volume[:, i,:]; rows -> T, cols -> X, one frame per Y.
-        ts, xs = _rng(ny0, ny1, ct), _rng(nx0, nx1, cx)
-        sub = np.asarray(source_coarse[ts[0]:ts[1], :, xs[0]:xs[1]])
-        per_block = sub.any(axis=(0, 2)) if sub.size else np.zeros((cy,), dtype=bool)
-        axis_len, axis_blocks = int(num_slices), per_block
-    else:
-        # coronal: native frame == volume[:,:, i]; rows -> T, cols -> Y, one frame per X.
-        ts, ys = _rng(ny0, ny1, ct), _rng(nx0, nx1, cy)
-        sub = np.asarray(source_coarse[ts[0]:ts[1], ys[0]:ys[1], :])
-        per_block = sub.any(axis=(0, 1)) if sub.size else np.zeros((cx,), dtype=bool)
-        axis_len, axis_blocks = int(num_slices), per_block
-
-    if int(axis_blocks.size) <= 0:
-        return np.zeros((int(num_slices),), dtype=bool)
-    idx = np.minimum(np.arange(int(axis_len)) // b, int(axis_blocks.size) - 1)
-    return np.asarray(axis_blocks)[idx]
-
-
-def gate_tile_volume_against_parent_inplace(
+def gate_tile_components_against_support_inplace(
     tile_mask_mm: np.ndarray,
-    parent_support_mm: np.ndarray,
+    support_mm: object,
     *,
-    parent_mask_support_mm: Optional[object] = None,
-    parent_bridge_support_mm: Optional[object] = None,
-    accepted_by_parent_mask_mm: Optional[np.ndarray] = None,
-    accepted_by_parent_bridge_mm: Optional[np.ndarray] = None,
-    accepted_by_parent_mask_locks: Optional[Sequence[threading.Lock]] = None,
-    accepted_by_parent_bridge_locks: Optional[Sequence[threading.Lock]] = None,
-    category_accumulate: bool = False,
+    parent_crop: Tuple[int, int, int, int],
+    accepted_total_mm: np.ndarray,
+    accepted_total_locks: Optional[Sequence[threading.Lock]] = None,
+    accepted_category_mm: Optional[np.ndarray] = None,
+    accepted_category_locks: Optional[Sequence[threading.Lock]] = None,
+    retain_rejected_components: bool,
     workers: int = 1,
-    desc: str = 'Tile gated OR',
+    desc: str = 'Tile component support gate',
 ) -> Dict[str, int]:
-    """Keep tile components that intersect frozen parent support on the same slice.
-    
-    Optional category accumulators receive parent-YOLO and parent-bridge accepted voxels directly."""
-    num_slices = int(tile_mask_mm.shape[0])
-    accepted_components = np.zeros((num_slices,), dtype=np.int64)
-    rejected_components = np.zeros((num_slices,), dtype=np.int64)
-    accepted_by_parent_mask_components = np.zeros((num_slices,), dtype=np.int64)
-    accepted_by_parent_bridge_components = np.zeros((num_slices,), dtype=np.int64)
-    kept_voxels = np.zeros((num_slices,), dtype=np.int64)
-    accepted_by_parent_mask_voxels = np.zeros((num_slices,), dtype=np.int64)
-    accepted_by_parent_bridge_voxels = np.zeros((num_slices,), dtype=np.int64)
-    worker_count = choose_slice_parallel_workers(int(workers), num_slices)
-    chunk_size = choose_parallel_chunk_size(num_slices, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
-    mask_lock_count = int(len(accepted_by_parent_mask_locks)) if accepted_by_parent_mask_locks else 0
-    bridge_lock_count = int(len(accepted_by_parent_bridge_locks)) if accepted_by_parent_bridge_locks else 0
+    """Gate every 2-D component from one original tile against one immutable support.
 
-    def _write_category(
+    The tile volume is crop-local. Accepted components are ORed into the matching crop of
+    the full variant accumulator. With ``retain_rejected_components=True`` the input is
+    replaced by whole rejected components for a later bridge-support gate; otherwise it is
+    replaced by the accepted mask only. Components from different tiles are never merged
+    before either decision.
+    """
+    tile = np.asarray(tile_mask_mm)
+    if tile.ndim != 3:
+        raise ValueError(f'{desc}: expected a 3-D tile mask, got {tile.shape}')
+    py0, py1, px0, px1 = (int(v) for v in parent_crop)
+    if not (0 <= py0 < py1 <= int(accepted_total_mm.shape[1]) and 0 <= px0 < px1 <= int(accepted_total_mm.shape[2])):
+        raise ValueError(
+            f'{desc}: parent crop {(py0, py1, px0, px1)} is outside '
+            f'accumulator shape {tuple(int(v) for v in accepted_total_mm.shape)}'
+        )
+    expected_local = (int(py1 - py0), int(px1 - px0))
+    if tuple(int(v) for v in tile.shape[1:]) != expected_local:
+        raise ValueError(
+            f'{desc}: crop-local tile plane {tuple(int(v) for v in tile.shape[1:])} '
+            f'does not match parent crop {expected_local}'
+        )
+    support_shape = _volume_shape_tuple(support_mm)
+    if int(tile.shape[0]) != int(support_shape[0]):
+        raise ValueError(
+            f'{desc}: tile/support slice mismatch {int(tile.shape[0])} != {int(support_shape[0])}'
+        )
+    if tuple(int(v) for v in accepted_total_mm.shape) != tuple(int(v) for v in support_shape):
+        raise ValueError(
+            f'{desc}: support/accumulator shape mismatch {support_shape} != '
+            f'{tuple(int(v) for v in accepted_total_mm.shape)}'
+        )
+    if accepted_category_mm is not None and tuple(int(v) for v in accepted_category_mm.shape) != tuple(int(v) for v in support_shape):
+        raise ValueError(f'{desc}: category accumulator shape mismatch')
+
+    total_lock_count = int(len(accepted_total_locks)) if accepted_total_locks else 0
+    category_lock_count = int(len(accepted_category_locks)) if accepted_category_locks else 0
+
+    def _or_crop(
         dst_mm: Optional[np.ndarray],
         locks: Optional[Sequence[threading.Lock]],
         lock_count: int,
         idx: int,
-        plane_u8: Optional[np.ndarray],
+        plane_u8: np.ndarray,
     ) -> None:
-        """Emit one category slice, either as an overwrite or as a locked OR."""
-        if dst_mm is None:
+        if dst_mm is None or not bool(np.any(plane_u8)):
             return
-        if not bool(category_accumulate):
-            dst_mm[int(idx), :, :] = np.uint8(0) if plane_u8 is None else plane_u8
-            return
-        # Accumulating into a shared destination: an all-zero plane is a no-op, so skip the
-        # lock and the read-modify-write entirely rather than OR-ing zeros in.
-        if plane_u8 is None:
-            return
-        if lock_count > 0 and locks is not None:
-            with locks[int(idx) % int(lock_count)]:
-                dst_mm[int(idx), :, :] |= plane_u8
-        else:
-            dst_mm[int(idx), :, :] |= plane_u8
+        lock = locks[int(idx) % int(lock_count)] if locks is not None and lock_count > 0 else None
+        ctx = lock if lock is not None else contextlib.nullcontext()
+        with ctx:
+            dst_view = dst_mm[int(idx), py0:py1, px0:px1]
+            np.bitwise_or(dst_view, plane_u8, out=dst_view)
 
-    def _emit_empty_slice(idx: int) -> None:
-        tile_mask_mm[int(idx), :, :] = np.uint8(0)
-        _write_category(accepted_by_parent_mask_mm, accepted_by_parent_mask_locks, mask_lock_count, int(idx), None)
-        _write_category(accepted_by_parent_bridge_mm, accepted_by_parent_bridge_locks, bridge_lock_count, int(idx), None)
+    def _process(idx: int) -> Tuple[int, int, int, int]:
+        tile_slice = np.asarray(tile[int(idx)], dtype=np.uint8) > 0
+        if not bool(np.any(tile_slice)):
+            tile[int(idx)] = np.uint8(0)
+            return (0, 0, 0, 0)
 
-    def _process(idx: int) -> None:
-        tile_slice = np.asarray(tile_mask_mm[int(idx)], dtype=bool)
-        if not np.any(tile_slice):
-            _emit_empty_slice(int(idx))
-            return
-
-        support_slice = _read_binary_volume_slice_bool(parent_support_mm, int(idx))
-        parent_mask_slice = (
-            _read_binary_volume_slice_bool(parent_mask_support_mm, int(idx))
-            if parent_mask_support_mm is not None else None
-        )
-        parent_bridge_slice = (
-            _read_binary_volume_slice_bool(parent_bridge_support_mm, int(idx))
-            if parent_bridge_support_mm is not None else None
-        )
-
-        # ``WithStats`` costs the same as plain ``connectedComponents`` here and hands back
-        # every component's area, which removes the fourth bincount over the label image.
         num_labels, labels2d, stats, _centroids = cv2.connectedComponentsWithStats(
-            np.asarray(tile_slice, dtype=np.uint8),
+            np.ascontiguousarray(tile_slice, dtype=np.uint8),
             connectivity=8,
             ltype=cv2.CV_32S,
         )
         num_labels = int(num_labels)
         if num_labels <= 1:
-            _emit_empty_slice(int(idx))
-            return
+            tile[int(idx)] = np.uint8(0)
+            return (0, 0, 0, 0)
 
-        sizes = np.asarray(stats[:, cv2.CC_STAT_AREA], dtype=np.int64)[:num_labels]
+        sizes = np.asarray(stats[:num_labels, cv2.CC_STAT_AREA], dtype=np.int64)
         present = sizes > 0
-        present[0] = False  # label 0 is background and never participates
-
-        # "Does component l intersect this support?" for every l at once. Indexing the label
-        # image by a boolean support mask yields the labels under that support; their bincount
-        # is the per-component intersection count.
-        supported = present & (np.bincount(labels2d[support_slice], minlength=num_labels)[:num_labels] > 0)
-
-        if not bool(np.any(supported)):
-            _emit_empty_slice(int(idx))
-            rejected_components[int(idx)] = np.int64(int(np.count_nonzero(present)))
-            return
-
-        supported_by_mask = (
-            np.bincount(labels2d[parent_mask_slice], minlength=num_labels)[:num_labels] > 0
-            if parent_mask_slice is not None
-            else np.zeros((num_labels,), dtype=bool)
-        )
-        supported_by_bridge = (
-            np.bincount(labels2d[parent_bridge_slice], minlength=num_labels)[:num_labels] > 0
-            if parent_bridge_slice is not None
-            else np.zeros((num_labels,), dtype=bool)
-        )
-
-        # Mutually exclusive category assignment. Parent mask wins if both supports intersect,
-        # and an accepted component supported by neither category still falls back to parent
-        # mask (the pathological case where the category supports do not union to
-        # parent_support_mm) — both rules collapse to "bridge only when bridge alone".
-        to_bridge = supported & (~supported_by_mask) & supported_by_bridge
-        to_mask = supported & (~to_bridge)
-
-        tile_mask_mm[int(idx), :, :] = supported.astype(np.uint8, copy=False)[labels2d]
-        if accepted_by_parent_mask_mm is not None:
-            _write_category(
-                accepted_by_parent_mask_mm, accepted_by_parent_mask_locks, mask_lock_count, int(idx),
-                to_mask.astype(np.uint8, copy=False)[labels2d] if bool(np.any(to_mask)) else None,
+        present[0] = False
+        support_slice = _read_binary_volume_slice_bool(support_mm, int(idx))[py0:py1, px0:px1]
+        if tuple(int(v) for v in support_slice.shape) != expected_local:
+            raise ValueError(
+                f'{desc}: support crop shape {tuple(int(v) for v in support_slice.shape)} '
+                f'does not match tile plane {expected_local}'
             )
-        if accepted_by_parent_bridge_mm is not None:
-            _write_category(
-                accepted_by_parent_bridge_mm, accepted_by_parent_bridge_locks, bridge_lock_count, int(idx),
-                to_bridge.astype(np.uint8, copy=False)[labels2d] if bool(np.any(to_bridge)) else None,
-            )
+        hits = np.bincount(labels2d[support_slice], minlength=num_labels)[:num_labels] > 0
+        accepted_labels = present & hits
+        rejected_labels = present & (~accepted_labels)
+        accepted_plane = accepted_labels[labels2d].astype(np.uint8, copy=False)
+        rejected_plane = rejected_labels[labels2d].astype(np.uint8, copy=False)
 
-        accepted_components[int(idx)] = np.int64(int(np.count_nonzero(supported)))
-        rejected_components[int(idx)] = np.int64(int(np.count_nonzero(present & (~supported))))
-        accepted_by_parent_mask_components[int(idx)] = np.int64(int(np.count_nonzero(to_mask)))
-        accepted_by_parent_bridge_components[int(idx)] = np.int64(int(np.count_nonzero(to_bridge)))
-        kept_voxels[int(idx)] = np.int64(int(sizes[supported].sum()))
-        accepted_by_parent_mask_voxels[int(idx)] = np.int64(int(sizes[to_mask].sum()))
-        accepted_by_parent_bridge_voxels[int(idx)] = np.int64(int(sizes[to_bridge].sum()))
+        _or_crop(accepted_total_mm, accepted_total_locks, total_lock_count, int(idx), accepted_plane)
+        _or_crop(accepted_category_mm, accepted_category_locks, category_lock_count, int(idx), accepted_plane)
+        tile[int(idx)] = rejected_plane if bool(retain_rejected_components) else accepted_plane
 
-    parallel_for_indices_chunked(
-        num_slices,
-        _process,
-        max_workers=worker_count,
-        desc=desc,
-        show_progress=False,
-        chunk_size=chunk_size,
-    )
-    flush_array(tile_mask_mm)
-    if accepted_by_parent_mask_mm is not None:
-        flush_array(accepted_by_parent_mask_mm)
-    if accepted_by_parent_bridge_mm is not None:
-        flush_array(accepted_by_parent_bridge_mm)
+        return (
+            int(np.count_nonzero(accepted_labels)),
+            int(np.count_nonzero(rejected_labels)),
+            int(sizes[accepted_labels].sum()) if bool(np.any(accepted_labels)) else 0,
+            int(sizes[rejected_labels].sum()) if bool(np.any(rejected_labels)) else 0,
+        )
+
+    totals = np.zeros((4,), dtype=np.int64)
+    worker_count = choose_slice_parallel_workers(int(workers), max(1, int(tile.shape[0])))
+    if worker_count <= 1:
+        for idx in range(int(tile.shape[0])):
+            totals += np.asarray(_process(int(idx)), dtype=np.int64)
+    else:
+        for values in parallel_map_in_order(
+            _process,
+            range(int(tile.shape[0])),
+            max_workers=int(worker_count),
+            max_pending=max(int(worker_count), int(worker_count) * 2),
+        ):
+            totals += np.asarray(values, dtype=np.int64)
 
     return {
-        'accepted_components': int(np.sum(accepted_components, dtype=np.int64)),
-        'rejected_components': int(np.sum(rejected_components, dtype=np.int64)),
-        'accepted_by_parent_mask_components': int(np.sum(accepted_by_parent_mask_components, dtype=np.int64)),
-        'accepted_by_parent_bridge_components': int(np.sum(accepted_by_parent_bridge_components, dtype=np.int64)),
-        'kept_voxels': int(np.sum(kept_voxels, dtype=np.int64)),
-        'accepted_by_parent_mask_voxels': int(np.sum(accepted_by_parent_mask_voxels, dtype=np.int64)),
-        'accepted_by_parent_bridge_voxels': int(np.sum(accepted_by_parent_bridge_voxels, dtype=np.int64)),
+        'accepted_components': int(totals[0]),
+        'rejected_components': int(totals[1]),
+        'accepted_voxels': int(totals[2]),
+        'rejected_voxels': int(totals[3]),
     }
 
 
-def _resize_binary_mask_frame_to_exact_shape_for_tile(frame: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
-    frame_u8 = (np.asarray(frame, dtype=np.uint8) > 0).astype(np.uint8, copy=False)
-    if int(frame_u8.shape[0]) == int(out_h) and int(frame_u8.shape[1]) == int(out_w):
-        return np.ascontiguousarray(frame_u8)
-    scaled = cv2.resize(
-        np.ascontiguousarray(frame_u8),
-        (int(out_w), int(out_h)),
-        interpolation=cv2.INTER_NEAREST,
-    )
-    return (scaled > 0).astype(np.uint8, copy=False)
 
 
-def ensure_tile_mask_volume_matches_parent_shape(
-    tile_mask_mm: np.ndarray,
-    expected_parent_shape: Tuple[int, int, int],
-    out_path: Path,
-    *,
-    desc: str,
-    workers: int = 1,
-    prefer_memory: bool = True,
-) -> np.ndarray:
-    """Return a tile mask volume whose shape exactly matches its parent view canvas.
 
- Prediction-time tile masks should already be inverse-mapped into parent view-native
- coordinates by ``DenseTileJob.M_out_to_src``. This guard makes the tile
- waiting-store rule explicit: before a tile can be spilled to the raw waiting store, its volume
- shape must be ``(parent_frames, parent_height, parent_width)``. If a future code path
- produces a different raster size, the binary slices are nearest-neighbor resized to
- the parent shape before compression/staging."""
-    src = np.asarray(tile_mask_mm)
-    expected = (int(expected_parent_shape[0]), int(expected_parent_shape[1]), int(expected_parent_shape[2]))
-    if tuple(int(x) for x in src.shape) == expected:
-        return tile_mask_mm
-    if src.ndim != 3:
-        raise ValueError(f'{desc}: expected a 3D tile mask volume, got shape {src.shape}')
-
-    print(f'{desc}: resizing tile mask volume to parent shape before raw-store spill: {tuple(src.shape)} -> {expected}')
-    out = allocate_workspace_array(
-        shape=expected,
-        dtype=np.uint8,
-        path=Path(out_path),
-        desc=f'{desc} parent-sized tile mask',
-        prefer_memory=bool(prefer_memory),
-    )
-
-    in_t = int(src.shape[0])
-    out_t, out_h, out_w = expected
-    worker_count = choose_slice_parallel_workers(int(workers), max(1, int(out_t)))
-
-    def _resize_out_slice(out_z: int) -> None:
-        if int(in_t) == int(out_t):
-            restored = _resize_binary_mask_frame_to_exact_shape_for_tile(src[int(out_z)], int(out_h), int(out_w))
-        else:
-            restored = np.zeros((int(out_h), int(out_w)), dtype=np.uint8)
-            for src_z in _restore_source_indices_for_output_z(int(in_t), int(out_t), int(out_z)):
-                restored |= _resize_binary_mask_frame_to_exact_shape_for_tile(src[int(src_z)], int(out_h), int(out_w))
-        out[int(out_z), :, :] = restored
-
-    parallel_for_indices_chunked(
-        int(out_t),
-        _resize_out_slice,
-        max_workers=worker_count,
-        desc=f'{desc}: resize tile mask to parent before compression',
-        show_progress=False,
-        target_chunks_per_worker=2,
-    )
-    flush_array(out)
-    return out
 
 
 def postprocess_tile_volume_after_inference(
@@ -34303,6 +34172,24 @@ def postprocess_tile_volume_after_inference(
     keep_temp: bool,
     slice_workers: int,
 ) -> Optional[TilePostprocessResult]:
+    py0, py1, px0, px1 = (int(v) for v in task.parent_crop)
+    expected_shape = (
+        int(view.num_slices),
+        int(py1 - py0),
+        int(px1 - px0),
+    )
+    actual_shape = tuple(int(v) for v in np.asarray(task.tile_mask_mm).shape)
+    if actual_shape != expected_shape:
+        raise ValueError(
+            f'{task.model_name}/{task.view_name}/{task.tile_id}: crop-local tile mask '
+            f'shape {actual_shape} does not match parent crop {task.parent_crop} -> {expected_shape}'
+        )
+    if task.processing_shape is not None and tuple(int(v) for v in task.processing_shape) != expected_shape:
+        raise ValueError(
+            f'{task.model_name}/{task.view_name}/{task.tile_id}: declared tile processing '
+            f'shape {task.processing_shape} does not match {expected_shape}'
+        )
+
     cleanup_view_volume_after_prediction_inplace(
         task.tile_mask_mm,
         task.tile_confmap_mm,
@@ -34311,6 +34198,7 @@ def postprocess_tile_volume_after_inference(
         float(min_radius),
         workers=int(slice_workers),
         precleaned_slice_cleanup=bool(task.precleaned_slice_cleanup),
+        threshold_plane_shape=task.threshold_plane_shape,
     )
 
     close_memmap_array(task.tile_confmap_mm)
@@ -34320,39 +34208,11 @@ def postprocess_tile_volume_after_inference(
         except Exception:
             pass
 
-    tile_mask_mm = task.tile_mask_mm
-    tile_mask_path = task.tile_mask_path
-    # parent support and every tile contribution share the same canonical processing grid.
-    expected_parent_shape = (
-        tuple(int(v) for v in task.processing_shape)
-        if task.processing_shape is not None
-        else tuple(int(v) for v in np.asarray(task.tile_mask_mm).shape)
-    )
-    parent_sized_path = tile_mask_path.with_name(tile_mask_path.stem + '.parent_sized.u8.dat')
-    parent_sized_mm = ensure_tile_mask_volume_matches_parent_shape(
-        tile_mask_mm,
-        expected_parent_shape,
-        parent_sized_path,
-        desc=f'{task.model_name}/{task.view_name}/{task.tile_id}',
-        workers=int(slice_workers),
-        prefer_memory=True,
-    )
-    if parent_sized_mm is not tile_mask_mm:
-        old_mask_path = tile_mask_path
-        close_memmap_array(tile_mask_mm)
+    if not _volume_has_foreground(task.tile_mask_mm):
+        close_memmap_array(task.tile_mask_mm)
         if not keep_temp:
             try:
-                old_mask_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-        tile_mask_mm = parent_sized_mm
-        tile_mask_path = parent_sized_path
-
-    if not _volume_has_foreground(tile_mask_mm):
-        close_memmap_array(tile_mask_mm)
-        if not keep_temp:
-            try:
-                tile_mask_path.unlink(missing_ok=True)
+                task.tile_mask_path.unlink(missing_ok=True)
             except Exception:
                 pass
         return None
@@ -34360,11 +34220,16 @@ def postprocess_tile_volume_after_inference(
     return TilePostprocessResult(
         model_name=str(task.model_name),
         view_name=str(task.view_name),
+        aug_id=str(task.aug_id),
+        angle_deg=float(task.angle_deg),
         config_id=str(task.config_id),
         tile_id=str(task.tile_id),
-        tile_mask_mm=tile_mask_mm,
-        tile_mask_path=tile_mask_path,
+        parent_crop=tuple(int(v) for v in task.parent_crop),
+        tile_mask_mm=task.tile_mask_mm,
+        tile_mask_path=task.tile_mask_path,
     )
+
+
 
 
 def spill_waiting_tile_result_to_raw_store(
@@ -34373,233 +34238,273 @@ def spill_waiting_tile_result_to_raw_store(
     *,
     workers: int = 1,
     keep_original: bool = False,
-    expected_parent_shape: Optional[Tuple[int, int, int]] = None,
 ) -> DeferredTilePostprocessResult:
-    """Spill a postprocessed waiting tile into the raw bbox ctile store.
-
- The function name is retained for stable scheduler call sites. The stored tile
- payload is no longer bitpacked or LZ4-compressed: empty slices are elided,
- nonempty slices are cropped to their nonzero bbox, and the crop is written as
- raw uint8 bytes."""
+    """Spill one crop-local tile or residual without expanding it to the parent canvas."""
     if result.tile_mask_mm is None:
         raise ValueError('Cannot spill a tile result without a dense tile_mask_mm')
-
-    mask_to_spill = result.tile_mask_mm
-    mask_to_spill_path = result.tile_mask_path
-    if expected_parent_shape is not None:
-        expected = (int(expected_parent_shape[0]), int(expected_parent_shape[1]), int(expected_parent_shape[2]))
-        parent_sized_path = temp_dir / 'waiting_tiles_parent_sized' / result.model_name / result.view_name / result.config_id / f'{result.tile_id}.parent_sized.u8.dat'
-        parent_sized_mm = ensure_tile_mask_volume_matches_parent_shape(
-            mask_to_spill,
-            expected,
-            parent_sized_path,
-            desc=f'Waiting tile spill {result.model_name}/{result.view_name}/{result.tile_id}',
-            workers=int(workers),
-            prefer_memory=True,
-        )
-        if parent_sized_mm is not mask_to_spill:
-            old_path = mask_to_spill_path
-            close_memmap_array(mask_to_spill)
-            if not bool(keep_original) and old_path is not None:
-                try:
-                    Path(old_path).unlink(missing_ok=True)
-                except Exception:
-                    pass
-            mask_to_spill = parent_sized_mm
-            mask_to_spill_path = parent_sized_path
-
-    tile_arr = np.asarray(mask_to_spill)
+    tile_arr = np.asarray(result.tile_mask_mm)
     if tile_arr.ndim != 3:
-        raise ValueError(f'Waiting tile spill expects a 3D mask volume, got shape {tile_arr.shape}')
-    tile_shape = tuple(int(x) for x in tile_arr.shape)
-    if expected_parent_shape is not None and tile_shape != tuple(int(x) for x in expected_parent_shape):
-        raise ValueError(f'Waiting tile spill parent-shape guard failed: tile_shape={tile_shape}, expected={tuple(int(x) for x in expected_parent_shape)}')
+        raise ValueError(f'Waiting tile spill expects a 3-D mask volume, got {tile_arr.shape}')
+    py0, py1, px0, px1 = (int(v) for v in result.parent_crop)
+    expected_plane = (int(py1 - py0), int(px1 - px0))
+    if tuple(int(v) for v in tile_arr.shape[1:]) != expected_plane:
+        raise ValueError(
+            f'Waiting tile {result.tile_id}: crop-local shape {tuple(tile_arr.shape[1:])} '
+            f'does not match parent crop {result.parent_crop}'
+        )
 
-    store_dir = temp_dir / 'waiting_tiles' / result.model_name / result.view_name / result.config_id / f'{result.tile_id}.ctile'
+    store_dir = (
+        temp_dir / 'waiting_tiles' / result.model_name / result.view_name /
+        result.config_id / f'{result.tile_id}.ctile'
+    )
     write_raw_bbox_mask_store(
         tile_arr,
         store_dir,
         format_name=CTILE_FORMAT,
-        desc=f'Waiting tile raw bbox store {result.model_name}/{result.view_name}/{result.config_id}/{result.tile_id}',
+        desc=(
+            f'Waiting crop-local tile raw bbox store '
+            f'{result.model_name}/{result.view_name}/{result.config_id}/{result.tile_id}'
+        ),
         workers=int(workers),
-        extra_meta={'waiting_tile_id': str(result.tile_id)},
+        extra_meta={
+            'waiting_tile_id': str(result.tile_id),
+            'parent_crop': [int(py0), int(py1), int(px0), int(px1)],
+            'tta_aug_id': str(result.aug_id),
+            'tta_angle_deg': float(result.angle_deg),
+        },
     )
 
-    flush_array(mask_to_spill)
-    close_memmap_array(mask_to_spill)
-    if not bool(keep_original) and mask_to_spill_path is not None:
+    tile_shape = tuple(int(x) for x in tile_arr.shape)
+    close_memmap_array(result.tile_mask_mm)
+    if not bool(keep_original) and result.tile_mask_path is not None:
         try:
-            Path(mask_to_spill_path).unlink(missing_ok=True)
+            Path(result.tile_mask_path).unlink(missing_ok=True)
         except Exception:
             pass
 
     return DeferredTilePostprocessResult(
         model_name=str(result.model_name),
         view_name=str(result.view_name),
+        aug_id=str(result.aug_id),
+        angle_deg=float(result.angle_deg),
         config_id=str(result.config_id),
         tile_id=str(result.tile_id),
+        parent_crop=tuple(int(v) for v in result.parent_crop),
         tile_mask_path=store_dir,
         tile_shape=(int(tile_shape[0]), int(tile_shape[1]), int(tile_shape[2])),
         storage_format=CTILE_FORMAT,
     )
 
+
+
 def load_waiting_tile_result_from_raw_store(waiting: DeferredTilePostprocessResult) -> TilePostprocessResult:
     if str(waiting.storage_format) != CTILE_FORMAT:
         raise ValueError(f'Unsupported waiting tile storage format: {waiting.storage_format}')
-    store = RawBBoxMaskStore.open(waiting.tile_mask_path)
+    store = RawBBoxMaskStore.open(waiting.tile_mask_path, mmap_payload=True)
     if tuple(int(x) for x in store.shape) != tuple(int(x) for x in waiting.tile_shape):
+        store.close()
         raise ValueError(f'Raw tile store shape mismatch: store={store.shape}, expected={waiting.tile_shape}')
     return TilePostprocessResult(
         model_name=str(waiting.model_name),
         view_name=str(waiting.view_name),
+        aug_id=str(waiting.aug_id),
+        angle_deg=float(waiting.angle_deg),
         config_id=str(waiting.config_id),
         tile_id=str(waiting.tile_id),
+        parent_crop=tuple(int(v) for v in waiting.parent_crop),
         tile_mask_mm=None,
         tile_mask_path=waiting.tile_mask_path,
         tile_mask_store=store,
     )
 
 
+
+
 def _delete_tile_result_storage(result: TilePostprocessResult, *, keep_temp: bool) -> None:
-    if bool(keep_temp):
-        return
     if result.tile_mask_store is not None:
-        result.tile_mask_store.unlink()
+        try:
+            result.tile_mask_store.close()
+        finally:
+            if not bool(keep_temp):
+                result.tile_mask_store.unlink()
         return
-    if result.tile_mask_path is not None:
+    if not bool(keep_temp) and result.tile_mask_path is not None:
         try:
             Path(result.tile_mask_path).unlink(missing_ok=True)
         except Exception:
             pass
 
 
-def stage_tile_result_into_config_canvas(
+
+
+def gate_tile_result_against_parent_mask(
     result: TilePostprocessResult,
     *,
-    tile_set_accumulator_mm: np.ndarray,
-    tile_set_accumulator_lock: 'threading.Lock | Sequence[threading.Lock]',
-    keep_temp: bool,
-    slice_workers: int,
-) -> Dict[str, int]:
-    """OR one cleaned tile into its configuration canvas, using per-slice locks when supplied."""
-    slice_locks: Optional[Sequence[threading.Lock]]
-    if isinstance(tile_set_accumulator_lock, (list, tuple)):
-        slice_locks = list(tile_set_accumulator_lock)
-    else:
-        slice_locks = [tile_set_accumulator_lock] if tile_set_accumulator_lock is not None else None
-    lock_count = int(len(slice_locks)) if slice_locks else 0
-    staged_voxels = 0
-    try:
-        if result.tile_mask_store is not None:
-            store = result.tile_mask_store
-            if tuple(int(x) for x in store.shape) != tuple(int(x) for x in np.asarray(tile_set_accumulator_mm).shape):
-                raise ValueError(
-                    f'Raw tile store shape {store.shape} does not match tile-set accumulator '
-                    f'{tuple(int(x) for x in np.asarray(tile_set_accumulator_mm).shape)}'
-                )
-            z_dim = int(store.shape[0])
-            worker_count = choose_slice_parallel_workers(int(slice_workers), z_dim)
-
-            def _decode_and_union(idx: int) -> int:
-                tile_slice = store.decode_slice(int(idx), dtype=np.uint8)
-                if tile_slice.size == 0 or not np.any(tile_slice):
-                    return 0
-                count = int(np.count_nonzero(tile_slice))
-                lock = slice_locks[int(idx) % lock_count] if lock_count > 0 else None
-                ctx = lock if lock is not None else contextlib.nullcontext()
-                with ctx:
-                    acc_slice = tile_set_accumulator_mm[int(idx)]
-                    acc_slice |= tile_slice.astype(np.uint8, copy=False)
-                return count
-
-            if worker_count <= 1:
-                for idx in range(z_dim):
-                    staged_voxels += int(_decode_and_union(int(idx)))
-            else:
-                for count in parallel_map_in_order(
-                    _decode_and_union,
-                    range(z_dim),
-                    max_workers=worker_count,
-                    max_pending=max(worker_count, worker_count * 2),
-                ):
-                    staged_voxels += int(count)
-            flush_array(tile_set_accumulator_mm)
-            return {'staged_voxels': int(staged_voxels), 'source': 'ctile'}
-
-        if result.tile_mask_mm is None:
-            return {'staged_voxels': 0, 'source': 'empty'}
-
-        staged_voxels = union_volume_into_volume(
-            tile_set_accumulator_mm,
-            result.tile_mask_mm,
-            workers=int(slice_workers),
-            desc=f'Stage tile into config canvas {result.model_name}/{result.view_name}/{result.config_id}/{result.tile_id}',
-            slice_locks=slice_locks,
-            count_voxels=True,
-        )
-        return {'staged_voxels': int(max(0, staged_voxels)), 'source': 'dense'}
-    finally:
-        close_memmap_array(result.tile_mask_mm)
-        _delete_tile_result_storage(result, keep_temp=bool(keep_temp))
-
-
-def gate_tile_volume_into_consolidated_parent(
-    task: TilePostprocessResult,
-    *,
-    parent_support_mm: np.ndarray,
+    parent_mask_support_mm: object,
     tile_accumulator_mm: np.ndarray,
-    tile_accumulator_lock: threading.Lock,
+    tile_accumulator_locks: Optional[Sequence[threading.Lock]],
+    work_dir: Path,
     keep_temp: bool,
     slice_workers: int,
-    parent_mask_support_mm: Optional[object] = None,
-    parent_bridge_support_mm: Optional[object] = None,
     tile_parent_mask_accumulator_mm: Optional[np.ndarray] = None,
-    tile_parent_bridge_accumulator_mm: Optional[np.ndarray] = None,
     tile_parent_mask_accumulator_locks: Optional[Sequence[threading.Lock]] = None,
+) -> TileParentGateResult:
+    """Accept parent-supported components and retain every failed component as a residual."""
+    dense_tile = result.tile_mask_mm
+    decoded_path: Optional[Path] = None
+    original_store = result.tile_mask_store
+    if dense_tile is None:
+        if original_store is None:
+            raise ValueError('Parent tile gate requires a dense mask or raw tile store')
+        decoded_path = (
+            Path(work_dir) / result.model_name / result.view_name / result.config_id /
+            f'{result.tile_id}.parent_residual.u8.dat'
+        )
+        dense_tile = allocate_workspace_array(
+            shape=tuple(int(v) for v in original_store.shape),
+            dtype=np.uint8,
+            path=decoded_path,
+            desc=(
+                f'Decode crop-local waiting tile for parent gate '
+                f'{result.model_name}/{result.view_name}/{result.tile_id}'
+            ),
+            prefer_memory=True,
+            reserve_bytes=tile_intermediate_accumulator_reserve_bytes(),
+        )
+        for idx in range(int(original_store.shape[0])):
+            dense_tile[int(idx)] = original_store.decode_slice(int(idx), dtype=np.uint8)
+        original_store.close()
+        if not bool(keep_temp):
+            original_store.unlink()
+
+    gate_stats = gate_tile_components_against_support_inplace(
+        dense_tile,
+        parent_mask_support_mm,
+        parent_crop=tuple(int(v) for v in result.parent_crop),
+        accepted_total_mm=tile_accumulator_mm,
+        accepted_total_locks=tile_accumulator_locks,
+        accepted_category_mm=tile_parent_mask_accumulator_mm,
+        accepted_category_locks=tile_parent_mask_accumulator_locks,
+        retain_rejected_components=True,
+        workers=int(slice_workers),
+        desc=f'Parent-YOLO tile gate {result.model_name}/{result.view_name}/{result.tile_id}',
+    )
+
+    residual_result: Optional[TilePostprocessResult]
+    if int(gate_stats.get('rejected_voxels', 0)) > 0:
+        residual_result = TilePostprocessResult(
+            model_name=str(result.model_name),
+            view_name=str(result.view_name),
+            aug_id=str(result.aug_id),
+            angle_deg=float(result.angle_deg),
+            config_id=str(result.config_id),
+            tile_id=str(result.tile_id),
+            parent_crop=tuple(int(v) for v in result.parent_crop),
+            tile_mask_mm=dense_tile,
+            tile_mask_path=(decoded_path if decoded_path is not None else result.tile_mask_path),
+            tile_mask_store=None,
+        )
+    else:
+        close_memmap_array(dense_tile)
+        if decoded_path is not None and not bool(keep_temp):
+            try:
+                decoded_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        elif result.tile_mask_path is not None and result.tile_mask_mm is not None and not bool(keep_temp):
+            try:
+                Path(result.tile_mask_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        residual_result = None
+
+    return TileParentGateResult(
+        model_name=str(result.model_name),
+        view_name=str(result.view_name),
+        aug_id=str(result.aug_id),
+        angle_deg=float(result.angle_deg),
+        config_id=str(result.config_id),
+        tile_id=str(result.tile_id),
+        gate_stats={k: int(v) for k, v in gate_stats.items()},
+        residual_result=residual_result,
+    )
+
+
+
+def gate_tile_residual_against_parent_bridge(
+    result: TilePostprocessResult,
+    *,
+    parent_bridge_support_mm: object,
+    tile_accumulator_mm: np.ndarray,
+    tile_accumulator_locks: Optional[Sequence[threading.Lock]],
+    work_dir: Path,
+    keep_temp: bool,
+    slice_workers: int,
+    tile_parent_bridge_accumulator_mm: Optional[np.ndarray] = None,
     tile_parent_bridge_accumulator_locks: Optional[Sequence[threading.Lock]] = None,
 ) -> TileGateResult:
-    """Gate one consolidated tile-set canvas against parent support and OR accepted components into parent accumulators."""
-    if task.tile_mask_mm is None:
-        raise ValueError('Tile-set gate requires a dense staged tile_mask_mm canvas')
-
+    """Re-gate only parent-failed components against immutable parent bridge support."""
+    dense_tile = result.tile_mask_mm
+    decoded_path: Optional[Path] = None
+    original_store = result.tile_mask_store
     try:
-        gate_stats = gate_tile_volume_against_parent_inplace(
-            task.tile_mask_mm,
-            parent_support_mm,
-            parent_mask_support_mm=parent_mask_support_mm,
-            parent_bridge_support_mm=parent_bridge_support_mm,
-            accepted_by_parent_mask_mm=tile_parent_mask_accumulator_mm,
-            accepted_by_parent_bridge_mm=tile_parent_bridge_accumulator_mm,
-            accepted_by_parent_mask_locks=tile_parent_mask_accumulator_locks,
-            accepted_by_parent_bridge_locks=tile_parent_bridge_accumulator_locks,
-            category_accumulate=True,
+        if dense_tile is None:
+            if original_store is None:
+                raise ValueError('Bridge tile gate requires a dense residual or raw tile store')
+            decoded_path = (
+                Path(work_dir) / result.model_name / result.view_name / result.config_id /
+                f'{result.tile_id}.bridge_residual.u8.dat'
+            )
+            dense_tile = allocate_workspace_array(
+                shape=tuple(int(v) for v in original_store.shape),
+                dtype=np.uint8,
+                path=decoded_path,
+                desc=(
+                    f'Decode crop-local residual for bridge gate '
+                    f'{result.model_name}/{result.view_name}/{result.tile_id}'
+                ),
+                prefer_memory=True,
+                reserve_bytes=tile_intermediate_accumulator_reserve_bytes(),
+            )
+            for idx in range(int(original_store.shape[0])):
+                dense_tile[int(idx)] = original_store.decode_slice(int(idx), dtype=np.uint8)
+            original_store.close()
+            if not bool(keep_temp):
+                original_store.unlink()
+
+        gate_stats = gate_tile_components_against_support_inplace(
+            dense_tile,
+            parent_bridge_support_mm,
+            parent_crop=tuple(int(v) for v in result.parent_crop),
+            accepted_total_mm=tile_accumulator_mm,
+            accepted_total_locks=tile_accumulator_locks,
+            accepted_category_mm=tile_parent_bridge_accumulator_mm,
+            accepted_category_locks=tile_parent_bridge_accumulator_locks,
+            retain_rejected_components=False,
             workers=int(slice_workers),
-            desc=f'Gated OR ({task.model_name}/{task.view_name}/{task.tile_id})',
+            desc=f'Parent-bridge tile gate {result.model_name}/{result.view_name}/{result.tile_id}',
         )
-
-        if int(gate_stats.get('accepted_components', 0)) > 0 and int(gate_stats.get('kept_voxels', 0)) > 0:
-            with tile_accumulator_lock:
-                union_volume_into_volume(
-                    tile_accumulator_mm,
-                    task.tile_mask_mm,
-                    workers=int(slice_workers),
-                    desc=f'Consolidate accepted tile {task.model_name}/{task.view_name}/{task.tile_id}',
-                )
-
         return TileGateResult(
-            model_name=str(task.model_name),
-            view_name=str(task.view_name),
-            config_id=str(task.config_id),
-            tile_id=str(task.tile_id),
+            model_name=str(result.model_name),
+            view_name=str(result.view_name),
+            aug_id=str(result.aug_id),
+            angle_deg=float(result.angle_deg),
+            config_id=str(result.config_id),
+            tile_id=str(result.tile_id),
             gate_stats={k: int(v) for k, v in gate_stats.items()},
         )
     finally:
-        archive_or_delete_binary_volume_storage(
-            task.tile_mask_mm,
-            keep_temp=bool(keep_temp),
-            workers=int(slice_workers),
-            desc=f'Gated tile-set canvas {task.model_name}/{task.view_name}/{task.tile_id}',
-        )
+        close_memmap_array(dense_tile)
+        if decoded_path is not None and not bool(keep_temp):
+            try:
+                decoded_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        elif result.tile_mask_path is not None and result.tile_mask_mm is not None and not bool(keep_temp):
+            try:
+                Path(result.tile_mask_path).unlink(missing_ok=True)
+            except Exception:
+                pass
 
 def finalize_consolidated_tile_volume_for_parent(
     *,
@@ -34643,6 +34548,8 @@ def finalize_consolidated_tile_volume_for_parent(
         return TileConsolidationResult(
             model_name=str(model_name),
             view_name=str(view.name),
+            aug_id=str(view.tta_aug_id),
+            angle_deg=float(view.tta_angle_deg),
             interpolation_stats=interpolation_stats,
             nrrd_layers=nrrd_layers,
             final_accumulator_mm=tile_accumulator_mm,
@@ -34713,6 +34620,7 @@ def finalize_consolidated_tile_volume_for_parent(
 
             tile_accumulator_mm, stats_local = interpolate_view_volume_pass_maybe_process(
                 mask_mm=tile_accumulator_mm,
+                view=view,
                 work_dir=temp_dir / 'tile_interpolation' / str(model_name) / view.name / 'consolidated',
                 pass_tag=f'pass{pass_idx}',
                 max_slice_distance=int(interpolate),
@@ -34723,7 +34631,6 @@ def finalize_consolidated_tile_volume_for_parent(
                 keep_temp=bool(keep_temp),
                 prefer_memory=True,
                 workers=int(interpolation_task_workers),
-                wrap_axis=bool(view.family == 'radial'),
                 bridge_delta_path=pass_delta_path,
             )
             stats_local = dict(stats_local)
@@ -34803,6 +34710,8 @@ def finalize_consolidated_tile_volume_for_parent(
     return TileConsolidationResult(
         model_name=str(model_name),
         view_name=str(view.name),
+        aug_id=str(view.tta_aug_id),
+        angle_deg=float(view.tta_angle_deg),
         interpolation_stats=interpolation_stats,
         nrrd_layers=nrrd_layers,
         final_accumulator_mm=tile_accumulator_mm,
@@ -34984,7 +34893,7 @@ def apply_gaussian_smoothing_inplace(
     """Smooth the source-geometry final union and re-threshold at 0.5.
 
     Smoothing runs after optional 3D void fill and centerline filtering, before
-    ``--keep_objects``. One float32 workspace is reused across passes.
+    postprocessing ``keep_objects``. One float32 workspace is reused across passes.
     """
     sigma_f = float(sigma)
     passes_i = int(passes)
@@ -37614,6 +37523,9 @@ class NrrdLayerSink:
                 'filename': out_path.name,
                 'suffix': unique_suffix,
                 'view_name': getattr(ref, 'view_name', ''),
+                'physical_view_name': getattr(ref, 'physical_view_name', ''),
+                'tta_aug_id': getattr(ref, 'aug_id', ''),
+                'tta_angle_deg': float(getattr(ref, 'angle_deg', 0.0)),
                 'view_family': getattr(ref, 'view_family', ''),
                 'source': getattr(ref, 'source', ''),
                 'mask_kind': getattr(ref, 'mask_kind', ''),
@@ -37658,6 +37570,9 @@ class NrrdLayerSink:
                     'filename': lq_path.name,
                     'suffix': unique_suffix,
                     'view_name': getattr(ref, 'view_name', ''),
+                    'physical_view_name': getattr(ref, 'physical_view_name', ''),
+                    'tta_aug_id': getattr(ref, 'aug_id', ''),
+                    'tta_angle_deg': float(getattr(ref, 'angle_deg', 0.0)),
                     'view_family': getattr(ref, 'view_family', ''),
                     'source': getattr(ref, 'source', ''),
                     'mask_kind': getattr(ref, 'mask_kind', ''),
@@ -38738,12 +38653,8 @@ def _nearest_multiple_of_four(value: float) -> int:
 
 
 def _round_low_quality_dimension(value: float) -> int:
-    # Large SLURM volumes should round to multiples of 4 per spec. For tiny synthetic
-    # tests, avoid changing a sub-4 dimension to 4 unless the scaled value warrants it.
-    value_f = max(1.0, float(value))
-    if value_f < 4.0:
-        return max(1, int(round(value_f)))
-    return _nearest_multiple_of_four(value_f)
+    """Round one isotropically scaled dimension to the nearest positive multiple of four."""
+    return _nearest_multiple_of_four(max(1.0, float(value)))
 
 
 def _low_quality_token(raw: str, shape_t_y_x: Tuple[int, int, int]) -> str:
@@ -38778,25 +38689,30 @@ def resolve_low_quality_downbin_specs(
         try:
             value = float(raw_s)
         except Exception as exc:
-            raise ValueError(f'--low_quality_downbin value is not numeric: {raw_s!r}') from exc
+            raise ValueError(f'--save low_quality downbin is not numeric: {raw_s!r}') from exc
         if not math.isfinite(value) or value <= 0.0:
-            raise ValueError('--low_quality_downbin values must be positive finite numbers')
+            raise ValueError('--save low_quality downbins must be positive finite numbers')
 
         warning = ''
         raw_lower = raw_s.lower()
         looks_float = ('.' in raw_s) or ('e' in raw_lower)
-        if looks_float and value <= 1.0:
+        if looks_float:
+            if not (0.0 < float(value) < 1.0):
+                raise ValueError(
+                    '--save low_quality floating-point downbins must be less than 1.0; '
+                    f'got {raw_s!r}'
+                )
             scale = float(value)
         else:
             nearest_int = int(round(value))
             if abs(float(value) - float(nearest_int)) > 1e-6:
-                raise ValueError('Integer --low_quality_downbin values >= 1 must be whole numbers; use a fraction such as 0.5 for scale factors')
+                raise ValueError('--save low_quality integer downbins must be whole numbers; use a fraction such as 0.5 for scale factors')
             if nearest_int <= 0:
-                raise ValueError('--low_quality_downbin integer targets must be positive')
+                raise ValueError('--save low_quality integer targets must be positive')
             rounded_target = _nearest_multiple_of_four(float(nearest_int))
             if int(rounded_target) != int(nearest_int):
                 warning = (
-                    f'--low_quality_downbin {int(nearest_int)} is not a multiple of 4; '
+                    f'--save low_quality:{int(nearest_int)} is not a multiple of 4; '
                     f'rounded to {int(rounded_target)} for isotropic low-quality output.'
                 )
                 warnings.append(warning)
@@ -39111,9 +39027,8 @@ def resize_binary_mask_volume_to_shape(
 
 
 def x264_preset() -> str:
-    """Return the low-quality MP4 x264 preset; the default balances size and CPU cost."""
-    preset = os.environ.get('YOLO_TTA_X264_PRESET', '').strip().lower()
-    return preset or 'medium'
+    """The low-quality distribution contract always uses libx264 preset slow."""
+    return 'slow'
 
 
 def ffmpeg_h264_rgb_writer(out_path: Path, width: int, height: int, fps: float) -> subprocess.Popen:
@@ -39718,9 +39633,28 @@ def main() -> None:
     parser = build_argparser()
     args = parser.parse_args()
     try:
-        save_options = resolve_save_options(args.save)
+        save_request = resolve_save_request(args.save)
+        postprocessing_request = resolve_postprocessing_options(args.postprocessing)
     except ValueError as exc:
         parser.error(str(exc))
+    save_options = list(save_request.options)
+    low_quality_downbin_values: Optional[List[str]] = (
+        list(save_request.low_quality_downbins)
+        if save_request.low_quality_downbins else None
+    )
+    # Internal compatibility attributes keep the established post-union implementation
+    # unchanged.  The retired individual CLI flags are not registered with argparse and
+    # therefore cannot be selected or used as a rollback path.
+    args.keep_objects = int(postprocessing_request.keep_objects)
+    args.enable_3d_void_fill = bool(postprocessing_request.enable_3d_void_fill)
+    args.gaussian_smoothing = (
+        float(postprocessing_request.gaussian_sigma)
+        if postprocessing_request.gaussian_smoothing_enabled else None
+    )
+    args.gaussian_smoothing_passes = (
+        int(postprocessing_request.gaussian_passes)
+        if postprocessing_request.gaussian_smoothing_enabled else None
+    )
     save_option_set = set(save_options)
     save_images_enabled = 'images' in save_option_set
     save_labels_enabled = 'labels' in save_option_set
@@ -39732,14 +39666,21 @@ def main() -> None:
     save_summary_enabled = 'summary' in save_option_set
     channel_format = resolve_channel_format(args.channel_format)
     print(
-        '[v16.3.0] view selection uses structured Radial, Tilted, and Tile groups; '
+        '[v16.4.0] every --angle value is an independent view variant through cleanup, '
+        'interpolation, tile gating, NRRD decomposition, and final per-view union. Tile '
+        'components are gated individually against their same-angle parent YOLO mask, then '
+        'only the residual components are re-gated against same-angle parent bridges. The '
+        'retired unified-angle and configuration-canvas tile paths are not present. Radial '
+        'interpolation wrapping is mandatory. '
+        'View selection uses structured Radial, Tilted, and Tile groups; '
         'interpolation flags use the interpolation_* names; component-NRRD streaming no '
         'longer pauses for topology; and dead telemetry-detail, CPU-retina override, NRRD-yield, '
         'and scratch-msync environment controls are removed. Existing Cartesian, Tilted, and '
         'Radial geometry builders are retained unchanged. The v16.2.2 channel/output behavior '
         'also remains active: Radial channel stacks wrap across the angular seam, C>=5 saved '
         'view inputs use multi-page TIFF, and unified --save selection controls images, labels, '
-        'binary, low_quality, nrrd, voxel_volume, high_quality, and summary. The retained '
+        'binary, low_quality[:DOWNBIN], nrrd, voxel_volume, high_quality, and summary, while '
+        '--postprocessing selects keep_objects, 3d_void_fill, and gaussian_smoothing. The retained '
         'runtime set includes hardware-linear Radial texture sampling, bilinear in-plane Tilted '
         'forward inputs with exact nearest mask backprojection, retried/loud-failing ffmpeg '
         'launches, dense-prefaulted native sparse final union, header-free D1 NVRTC preflight, '
@@ -39756,7 +39697,10 @@ def main() -> None:
     print(
         'Save outputs: '
         + (', '.join(save_options) if save_options else '<none>')
-        + ('; --low_quality_downbin implies low_quality' if args.low_quality_downbin is not None and not save_low_quality_enabled else '')
+        + (
+            '; low_quality downbins=' + ','.join(low_quality_downbin_values)
+            if save_low_quality_enabled and low_quality_downbin_values else ''
+        )
     )
 
     input_path = Path(args.input).expanduser().resolve()
@@ -39767,7 +39711,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('GPT-5.6-Sol-Pro v16.3.0 accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError('GPT-5.6-Sol-Pro v16.4.0 accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -39777,10 +39721,8 @@ def main() -> None:
     # Resolve the complete view request before model loading or volume decode. With no
     # implicit Cartesian/Tilted/Radial defaults, a missing or self-disabling view request must
     # fail immediately rather than decode a multi-terabyte logical run and discover it later.
-    angles = _parse_angles(args.angle) or [0.0, 120.0, 240.0]
-    single_angle_streaming_cleanup_active = bool(
-        len(angles) == 1 and _env_flag('YOLO_TTA_SINGLE_ANGLE_STREAMING_CLEANUP', True)
-    )
+    angles = resolve_tta_angles(args.angle)
+    angle_variant_streaming_cleanup_active = True
     if int(args.batch) < 1:
         raise ValueError('--batch must be >= 1')
     set_inference_batch_size(int(args.batch))
@@ -39880,25 +39822,24 @@ def main() -> None:
         args.retina_mask_processor, inference_devices
     )
     set_retina_mask_processor(retina_processor)
-    # single-angle + gpu-retina fast path. When exactly one --angle is used and retina
-    # masks are resolved on the GPU, the per-frame radius cleanup runs on the GPU: instances below
+    # Angle-variant + GPU-retina fast path. Every requested angle is now a separate
+    # accumulator, so the per-frame radius cleanup is eligible for every variant: instances below
     # min_conf are dropped before the union/flatten, the union+confidence planes are warped to
     # view-native space on the GPU, and positive --min_radius runs with CuPy. Hole filling is a
     # completed-view or eligible task-end operation. Only the finished view-native plane crosses
-    # PCIe. None disables the fast path (e.g. multi-angle, where the
-    # full union and cross-angle max-confidence must be preserved before --min_conf is applied at the
-    # volume level); multi-angle gpu runs still get the on-GPU flatten + warp.
-    single_angle_gpu_fastpath_active = bool(
-        single_angle_streaming_cleanup_active and str(retina_processor).strip().lower() == 'gpu'
+    # PCIe. Every TTA angle is an independent variant, so the confidence/radius ordering
+    # is variant-local regardless of how many --angle values were requested.
+    angle_variant_gpu_fastpath_active = bool(
+        angle_variant_streaming_cleanup_active and str(retina_processor).strip().lower() == 'gpu'
     )
-    single_angle_gpu_fastpath_min_conf_value = (
-        float(args.min_conf) if single_angle_gpu_fastpath_active else None
+    angle_variant_gpu_fastpath_min_conf_value = (
+        float(args.min_conf) if angle_variant_gpu_fastpath_active else None
     )
-    single_angle_gpu_fastpath_min_radius_value = (
-        float(args.min_radius) if single_angle_gpu_fastpath_active else 0.0
+    angle_variant_gpu_fastpath_min_radius_value = (
+        float(args.min_radius) if angle_variant_gpu_fastpath_active else 0.0
     )
-    set_single_angle_gpu_fastpath(
-        single_angle_gpu_fastpath_min_conf_value, single_angle_gpu_fastpath_min_radius_value
+    set_angle_variant_gpu_fastpath(
+        angle_variant_gpu_fastpath_min_conf_value, angle_variant_gpu_fastpath_min_radius_value
     )
     print(
         f'Inference devices: {inference_devices} '
@@ -39906,9 +39847,9 @@ def main() -> None:
         f'quantize={quantize_display(args.quantize)}; '
         f'retina mask processor: {retina_processor} ({retina_processor_reason}).'
     )
-    if single_angle_gpu_fastpath_active:
+    if angle_variant_gpu_fastpath_active:
         print(
-            'v13.1.0 single-angle GPU retina fast path active: retina masks are flattened, '
+            'v13.1.0 angle-variant GPU retina fast path active: retina masks are flattened, '
             f'confidence-filtered (--min_conf={float(args.min_conf):.3f}), warped to view-native space '
             f'(v13.3.0 R8: identity warps skipped, grids cached), and --min_radius={float(args.min_radius):g} '
             'is applied on the GPU before the PCIe copy when positive (cupy required; CPU fallback '
@@ -39921,11 +39862,11 @@ def main() -> None:
             'max-confidence planes and warped to view-native space on the GPU before the PCIe copy.'
         )
     # Each CUDA inference worker is pinned through CUDA_VISIBLE_DEVICES and sees its assigned
-    # device as cuda:0. With exactly one --angle, worker slice windows are disjoint per view.
-    # Workers write those slices into one scheduler-owned mapping: memfd plus descriptor
+    # device as cuda:0. Worker slice windows are disjoint within each angle variant. Workers
+    # write those slices into one variant-owned scheduler mapping: memfd plus descriptor
     # transfer when available, and a real pathname only as fallback.
     gpu_worker_direct_union_active = bool(
-        gpu_worker_process_active and len(angles) == 1 and gpu_worker_direct_union_enabled()
+        gpu_worker_process_active and gpu_worker_direct_union_enabled()
     )
     # Collect geometry-independent eligibility conditions for the v16.1.3 fast bundle.
     # Source and processing geometry are not known until ffprobe and processing-shape
@@ -39936,8 +39877,6 @@ def main() -> None:
         v1613_bundle_reasons.append('YOLO_TTA_V1613_FAST_BUNDLE=0')
     if not gpu_worker_process_active:
         v1613_bundle_reasons.append('CUDA worker processes inactive')
-    if len(angles) != 1 or abs(float(angles[0]) % 360.0) > 1e-7:
-        v1613_bundle_reasons.append('requires exactly --angle 0')
     if int(args.interpolation_distance) != 0:
         v1613_bundle_reasons.append('requires --interpolation_distance 0')
     if float(args.min_conf) > 0.0:
@@ -39970,15 +39909,8 @@ def main() -> None:
         raise ValueError('--interpolation_candidates must be >= 1')
     if int(args.interpolation_passes) < 1:
         raise ValueError('--interpolation_passes must be >= 1')
-    if args.gaussian_smoothing is not None and float(args.gaussian_smoothing) < 0.0:
-        raise ValueError('--gaussian_smoothing must be >= 0; use 0 to disable smoothing')
-    if args.gaussian_smoothing_passes is not None and int(args.gaussian_smoothing_passes) < 0:
-        raise ValueError('--gaussian_smoothing_passes must be >= 0; use 0 to disable smoothing')
     gaussian_smoothing_cli_requested = bool(args.gaussian_smoothing is not None or args.gaussian_smoothing_passes is not None)
-    gaussian_smoothing_disabled_by_zero = bool(
-        (args.gaussian_smoothing is not None and float(args.gaussian_smoothing) == 0.0)
-        or (args.gaussian_smoothing_passes is not None and int(args.gaussian_smoothing_passes) == 0)
-    )
+    gaussian_smoothing_disabled_by_zero = False
     gaussian_smoothing_enabled, gaussian_smoothing_sigma, gaussian_smoothing_passes = resolve_gaussian_smoothing_settings(
         args.gaussian_smoothing,
         args.gaussian_smoothing_passes,
@@ -39987,11 +39919,9 @@ def main() -> None:
         raise ValueError('--interpolation_min_radius must be >= 0')
     if float(args.min_radius) < 0:
         raise ValueError('--min_radius must be >= 0')
-    if int(args.keep_objects) < 0:
-        raise ValueError('--keep_objects must be >= 0')
     if not (-90.0 < float(args.interpolation_search_angle) < 90.0):
         raise ValueError('--interpolation_search_angle must be greater than -90 and less than 90')
-    low_quality_requested = bool(save_low_quality_enabled or args.low_quality_downbin is not None)
+    low_quality_requested = bool(save_low_quality_enabled)
     # NRRD component layers are produced only for --save nrrd, so requesting only
     # low-quality outputs writes the low-quality videos but no NRRD output.
     # when both --save nrrd and a low-quality request are active, the low-quality
@@ -40010,9 +39940,9 @@ def main() -> None:
 
     temp_dir = choose_scratch_dir(args.temp, out_dir, input_path.stem)
     expose_scratch_in_output(out_dir, temp_dir)
-    # say which kind of scratch this is. Memory-backed scratch is what takes the shared
-    # tile canvas (and the shared source volume, which is allocated under the same root) off
-    # the filesystem entirely; disk-backed scratch is the safe default.
+    # Say which kind of scratch this is. Memory-backed scratch keeps tile residuals,
+    # per-angle accumulators, and the shared source volume off persistent storage; disk-backed
+    # scratch remains the safe default.
     print(
         f"Bulk scratch dir: {temp_dir} "
         f"[{'MEMORY-backed (' + str(_mount_fstype_for_path(temp_dir) or 'tmpfs') + ')' if scratch_dir_is_memory_backed() else 'disk-backed'}, "
@@ -40038,7 +39968,7 @@ def main() -> None:
     fps = float(info['fps'])
 
     low_quality_downbin_specs, low_quality_downbin_warnings = resolve_low_quality_downbin_specs(
-        args.low_quality_downbin,
+        low_quality_downbin_values,
         bool(low_quality_requested),
         (input_T, input_H, input_W),
     )
@@ -40243,11 +40173,10 @@ def main() -> None:
         )
     if gpu_worker_direct_union_active:
         print(
-            'GPU-worker direct union writes active: single-angle worker tasks write '
-            'their disjoint slice windows straight into a bounded shared per-view union '
+            'GPU-worker direct union writes active: angle-variant worker tasks write '
+            'their disjoint slice windows straight into a bounded variant-owned union '
             '(memfd preferred; no per-task result files or scheduler-side OR pass). '
-            'Set YOLO_TTA_GPU_WORKER_DIRECT_UNION=0 to restore the result-file path '
-            '.'
+            'Set YOLO_TTA_GPU_WORKER_DIRECT_UNION=0 to select per-task result files.'
         )
 
     radial_diameters = [
@@ -40334,7 +40263,7 @@ def main() -> None:
 
     # Fold each Radial transformed stack/diameter to --imgsz unless explicitly disabled.
     radial_fold_raster = int(args.imgsz) if _env_flag('YOLO_TTA_RADIAL_FOLD_IMGSZ', True) else 0
-    views = get_view_infos(
+    physical_views = get_view_infos(
         T=T,
         H=H,
         W=W,
@@ -40344,31 +40273,37 @@ def main() -> None:
         tilt_groups=tilt_groups,
         radial_native_raster=int(radial_fold_raster),
     )
-    if not views:
+    if not physical_views:
         raise ValueError(
             'No inference views are active. Enable at least one view with --enable_cartesian, '
             '--enable_tilted VIEW[:TILT_ANGLE[:TILT_DIRECTION]], or '
             '--enable_radial VIEWS[:AZIMUTH_ANGLE]. A tilted_* Radial target is skipped '
             'when its matching Tilted base is not enabled.'
         )
+
+    # v16.4.0: TTA rotations are first-class view variants. Every runtime view owns exactly
+    # one augmentation, one full-frame accumulator, one tile gate graph, one interpolation
+    # graph, and its own NRRD namespace. The physical view list is retained only for the final
+    # post-variant OR/backprojection stage.
+    views = expand_views_into_tta_variants(physical_views, angles)
     # Reserve the second resident allocation only for runs that actually contain a
     # Radial task. This keeps Cartesian/Tilted-only runs from losing GPU residency merely
     # because the variant supports a lazily-created hardware texture.
     radial_texture_required = bool(
         radial_source_mode() == 'texture_linear'
-        and any(is_radial_view(view) for view in views)
+        and any(is_radial_view(view) for view in physical_views)
     )
-    cartesian_views = orthogonal_views_only(views)
+    cartesian_views = orthogonal_views_only(physical_views)
     inference_views = list(views)
     interpolating_views = [v for v in inference_views if _view_uses_interpolation(v, int(args.interpolation_distance))]
 
     # A tilted_* Radial token expands to every concrete signed/directional Tilted variant.
-    # Print the expanded workload rather than only the compact CLI token set.
-    radial_concrete_views = [v for v in inference_views if is_radial_view(v)]
+    # Print the physical workload and the expanded TTA-variant workload separately.
+    radial_concrete_views = [v for v in physical_views if is_radial_view(v)]
     tilted_radial_concrete_views = [v for v in radial_concrete_views if is_tilted_radial_view(v)]
     upright_radial_concrete_views = [v for v in radial_concrete_views if not is_tilted_radial_view(v)]
-    upright_tilted_views = [v for v in inference_views if is_tilted_view(v)]
-    source_frames_per_angle = int(sum(int(v.num_slices) for v in inference_views))
+    upright_tilted_views = [v for v in physical_views if is_tilted_view(v)]
+    source_frames_per_angle = int(sum(int(v.num_slices) for v in physical_views))
     radial_frames_per_angle = int(sum(int(v.num_slices) for v in radial_concrete_views))
     tilted_radial_frames_per_angle = int(sum(int(v.num_slices) for v in tilted_radial_concrete_views))
     radial_expansion_counts = Counter(
@@ -40381,11 +40316,13 @@ def main() -> None:
     ) or 'none'
     print(
         'Concrete view workload: '
-        f'{len(inference_views)} view(s) = {len(cartesian_views)} Cartesian + '
+        f'{len(physical_views)} physical view(s) = {len(cartesian_views)} Cartesian + '
         f'{len(upright_tilted_views)} Tilted + {len(upright_radial_concrete_views)} upright Radial + '
         f'{len(tilted_radial_concrete_views)} tilted-Radial; '
         f'{source_frames_per_angle} source frame(s)/--angle, '
-        f'{source_frames_per_angle * max(1, len(angles))} model frame(s) across {max(1, len(angles))} angle(s).'
+        f'{len(inference_views)} independent view-angle variant(s), and '
+        f'{source_frames_per_angle * max(1, len(angles))} total model frame(s) across '
+        f'{max(1, len(angles))} TTA angle(s).'
     )
     if radial_concrete_views:
         print(
@@ -40402,7 +40339,7 @@ def main() -> None:
     spec_notes: List[str] = []
     effective_save_options = list(save_options)
     if bool(low_quality_requested) and 'low_quality' not in effective_save_options:
-        effective_save_options.append('low_quality (implied by --low_quality_downbin)')
+        effective_save_options.append('low_quality')
     spec_notes.append(
         'v16.2.0 unified output selection: --save=' + (
             ', '.join(effective_save_options) if effective_save_options else '<none>'
@@ -40452,9 +40389,9 @@ def main() -> None:
             'on the GPU (torch grid_sample), so only those reduced planes cross PCIe (O(2*H*W)); no '
             'affine warp and no per-instance loop run on the CPU.'
         )
-    if single_angle_gpu_fastpath_active:
+    if angle_variant_gpu_fastpath_active:
         spec_notes.append(
-            'v13.1.0 (#2.3) + v13.3.0 (R8): single-angle GPU fast path. YOLO -> proto-resolution union '
+            'v13.1.0 (#2.3) + v13.3.0 (R8): angle-variant GPU fast path. YOLO -> proto-resolution union '
             '(R9) -> --min_conf -> warp (identity-skipped/grid-cached) -> --min_radius (cupy, only when '
             'positive) run on the GPU, then one finished view-native plane is sent to the CPU. The '
             'per-frame retina GPU 2D hole fill is removed: a completed-view pass or eligible task-end '
@@ -40475,8 +40412,8 @@ def main() -> None:
     spec_notes.append(
         'v13.3.1 (R3/R4/R7b/R12/R16/R19/R24/R25): same-host shared-mapping coherence needs '
         'no synchronous scratch flushes; v16.3.0 removes the obsolete opt-in msync path because '
-        'ephemeral mappings are retired rather than treated as durability records. Single-angle '
-        'CUDA workers write disjoint single-angle result windows directly into bounded memfd-backed per-view unions '
+        'ephemeral mappings are retired rather than treated as durability records. Angle-variant '
+        'CUDA workers write disjoint angle-variant result windows directly into bounded memfd-backed variant unions '
         '(YOLO_TTA_GPU_WORKER_DIRECT_UNION); NRRD payload writes stream bounded double-buffered blocks '
         '(YOLO_TTA_NRRD_Z_CHUNK_SLICES) filled by a GIL-releasing pool (YOLO_TTA_NRRD_FILL_WORKERS) '
         'that overlaps the selected gzip backend; CUDA workers receive the native source through descriptor-transferred memfd storage '
@@ -40485,7 +40422,7 @@ def main() -> None:
         'stat instead of rescanning; the interpolation merge visits only schedule-touched slices; '
         'the NRRD member-gzip level defaults to 3 (YOLO_TTA_NRRD_GZIP_LEVEL), and low-quality '
         'MP4s use x264 '
-        'preset medium (YOLO_TTA_X264_PRESET).'
+        'preset slow.'
     )
     spec_notes.append(
         'Capable views remain on the canonical angle-0 inference raster through '
@@ -40515,7 +40452,7 @@ def main() -> None:
         'v13.3.18 C11/C12/C13/C14/N21: the process-per-GPU scheduler keeps only a bounded issued '
         'window, prioritizes parent-unlocking work, and splits a full-frame lease only at the '
         'actual dispatch tail; deferred device unions publish '
-        'as soon as their D2H Future retires; the single-angle Radial path pipelines projection '
+        'as soon as their D2H Future retires; the angle-variant Radial path pipelines projection '
         'and fuses YOLO+bridge layers; sparse topology unions are compiled in larger batches and '
         'G5 may use idle GPUs; FFV1 shards remain in scratch and videos enter publication only '
         'after an atomic replace; '
@@ -40534,8 +40471,8 @@ def main() -> None:
         'YOLO_TTA_CORONAL_BLOCK_CACHE); global/transverse NRRD layers encode straight from the '
         'source volume (no pre-encode copy); and compatible GPU-retina tasks accumulate raw '
         'task-local unions in an on-device volume with one chunked pinned D2H per task '
-        '(YOLO_TTA_GPU_DEVICE_UNION) when VRAM allows. Single-angle confidence/radius cleanup '
-        'remains a separate ordering capability; multi-angle tasks retain view-level cleanup.'
+        '(YOLO_TTA_GPU_DEVICE_UNION) when VRAM allows. Angle-variant confidence/radius cleanup '
+        'is variant-local; every angle is cleaned before physical-view union.'
     )
     if preprocess_streaming_active:
         spec_notes.append(
@@ -40555,14 +40492,12 @@ def main() -> None:
             'inference engine while the default streaming decode producer is active. Setting '
             'YOLO_TTA_STREAMING_PREPROCESS=0 makes decode synchronous and removes that overlap.'
         )
-    if bool(single_angle_streaming_cleanup_active):
-        spec_notes.append(
-            'v12.2.8 single-angle streaming cleanup is active: exactly one --angle value was supplied, so YOLO result slices are confidence-filtered and analysis-grid min_radius-filtered as they stream in. D6 scales the threshold when the analysis grid is the reduced canonical raster. 2D hole filling runs as a final per-view volume pass (after --min_conf and --min_radius) before interpolation.'
-        )
-    else:
-        spec_notes.append(
-            'v12.2.8 single-angle streaming cleanup is inactive because multiple --angle values are being accumulated or YOLO_TTA_SINGLE_ANGLE_STREAMING_CLEANUP=0; view cleanup therefore runs after all angle volumes for a view have accumulated.'
-        )
+    spec_notes.append(
+        'v16.4.0 angle-variant streaming cleanup is mandatory: every --angle variant is '
+        'confidence-filtered and analysis-grid min_radius-filtered as it streams. D6 scales '
+        'the threshold on a reduced canonical raster, and 2D hole filling runs after '
+        '--min_conf and --min_radius before that variant is interpolated.'
+    )
     spec_notes.append(
         'v15 input-channel handling: RGB/YUV video is flattened to one gray/luma source volume; '
         f'--channel_format {channel_format.token} then constructs H×W×{int(channel_format.channel_count)} '
@@ -40609,7 +40544,7 @@ def main() -> None:
             f'original source geometry (t,Y,X)=({int(input_T)},{int(input_H)},{int(input_W)}) — '
             'Radial/Tilted results are backprojected directly to source dimensions in a single resample, '
             'Cartesian view stacks are restored with one resample during union assembly, and the global '
-            'union / optional 3D void fill / Gaussian smoothing (sigma in source voxels) / --keep_objects '
+            'union / optional 3D void fill / Gaussian smoothing (sigma in source voxels) / postprocessing keep_objects '
             'all execute at source dimensions. No tail restore resample occurs.'
         )
     spec_notes.append(
@@ -40690,10 +40625,10 @@ def main() -> None:
         'match the full-quality nrrd/ folder. This supersedes the v13.2.0 single combined volume. It remains gated '
         'behind --save nrrd (the decomposition is only meaningful when --save nrrd is set). Suggested spec edit: '
         'state that low-quality NRRDs are emitted as one single-layer NRRD per component layer (downbinned) per '
-        '--low_quality_downbin spec, only when --save nrrd is enabled.'
+        '--save low_quality[:LOW_QUALITY_DOWNBIN] specification, only when --save nrrd is enabled.'
     )
     spec_notes.append(
-        'Task #2.5 review (single-angle fast path / tqdm): YOLO -> flatten -> --min_conf -> warp -> --min_radius -> '
+        'Task #2.5 review (angle-variant fast path / tqdm): YOLO -> flatten -> --min_conf -> warp -> --min_radius -> '
         '2D hole fill all run on the GPU (cupy) and only the finished view-native plane crosses PCIe; the per-slice '
         'CPU cleanup is skipped via cleanup_done_on_gpu. No tqdm bar wraps the inference stream, so any tqdm the '
         'user sees that does not line up with GPU work is a separate post-inference progress bar (a purely visual '
@@ -40744,7 +40679,7 @@ def main() -> None:
     if bool(gaussian_smoothing_enabled):
         spec_notes.append(
             f'Gaussian smoothing active by v12.2.0 explicit-flag rule: sigma={float(gaussian_smoothing_sigma):g} voxel(s), '
-            f'passes={int(gaussian_smoothing_passes)}; applied after final union/optional 3D void fill and before --keep_objects. '
+            f'passes={int(gaussian_smoothing_passes)}; applied after final union/optional 3D void fill and before postprocessing keep_objects. '
             'The default smoothing backend attempts chunked GPU execution through CuPy/cupyx.scipy.ndimage with halo/core writes, then falls back to scipy.ndimage on CPU if the GPU backend is unavailable.'
         )
     else:
@@ -41026,15 +40961,9 @@ def main() -> None:
         set_interpolation_process_executor(None, 0)
 
     dense_tiling_active = len(tile_configs) > 0
-    # fuse every tile of one (view, angle, tile configuration) into slice-chunked
-    # GROUP tasks. A group renders each native plane once and shares it across all its tiles,
-    # keeps only the tiles' parent-grid crops, and ORs them straight into the shared
-    # configuration canvas -- no per-tile result file, no scheduler-side re-read. Requires the
-    # CUDA worker path; CPU/MPS retains the per-tile fallback flow.
-    tile_group_dispatch_active = bool(
-        dense_tiling_active and gpu_worker_process_active and _env_flag('YOLO_TTA_TILE_GROUP_TASKS', True)
-    )
+
     view_infos_by_name: Dict[str, ViewInfo] = {view.name: view for view in views}
+    view_infos_by_name.update({view.name: view for view in physical_views})
     view_volumes_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
     native_view_support_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
     parent_mask_support_by_model: Dict[str, Dict[str, object]] = {model_name: {} for model_name, _ in yolo_models}
@@ -41062,12 +40991,11 @@ def main() -> None:
 
     inference_view_names = {v.name for v in inference_views}
     for view in views:
-        jobs = build_aug_jobs_for_view(
+        jobs = [build_aug_job_for_variant(
             view=view,
-            angles=angles,
             out_size=args.imgsz,
             temp_dir=temp_dir,
-        )
+        )]
         aug_jobs_by_view[view.name] = jobs
         aug_job_lookup_by_view[view.name] = {job.aug_id: job for job in jobs}
         if dense_tiling_active and view.name in inference_view_names:
@@ -41089,25 +41017,15 @@ def main() -> None:
             if jobs_by_config:
                 tile_jobs_by_view_config[view.name] = jobs_by_config
 
-    tile_expected_by_parent_config: Dict[Tuple[str, str, str], int] = {}
-    tile_config_expected_by_parent: Dict[Tuple[str, str], int] = {}
+    tile_expected_by_parent: Dict[Tuple[str, str], int] = {}
     if dense_tiling_active:
         for view in inference_views:
             jobs_by_config = tile_jobs_by_view_config.get(view.name, {})
-            if not jobs_by_config:
-                continue
-            expected_for_view = sum(len(jobs) for jobs in jobs_by_config.values())
-            if expected_for_view <= 0:
+            expected_for_variant = int(sum(len(jobs) for jobs in jobs_by_config.values()))
+            if expected_for_variant <= 0:
                 continue
             for model_name, _ in yolo_models:
-                parent_key = (str(model_name), str(view.name))
-                active_config_count = 0
-                for config_id, cfg_jobs in jobs_by_config.items():
-                    if not cfg_jobs:
-                        continue
-                    tile_expected_by_parent_config[(str(model_name), str(view.name), str(config_id))] = int(len(cfg_jobs))
-                    active_config_count += 1
-                tile_config_expected_by_parent[parent_key] = int(active_config_count)
+                tile_expected_by_parent[(str(model_name), str(view.name))] = int(expected_for_variant)
 
     view_frame_caches: Dict[str, np.ndarray] = {}
     view_frame_cache_paths: Dict[str, Path] = {}
@@ -41116,15 +41034,16 @@ def main() -> None:
     def _get_view_frame_cache(view: ViewInfo) -> Optional[np.ndarray]:
         if not should_cache_view_frames(view, dense_tiling_active):
             return None
-        cached = view_frame_caches.get(view.name)
+        cache_key = physical_view_name(view)
+        cached = view_frame_caches.get(cache_key)
         if cached is not None:
             return cached
         with view_frame_cache_lock:
-            cached = view_frame_caches.get(view.name)
+            cached = view_frame_caches.get(cache_key)
             if cached is not None:
                 return cached
             wait_for_volume_ready(volume_rgb)
-            cache_path = temp_dir / 'view_frames' / f'{view.name}.gray8.dat'
+            cache_path = temp_dir / 'view_frames' / f'{cache_key}.gray8.dat'
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             cache_mm = build_view_frame_cache(
                 volume_rgb=volume_rgb,
@@ -41134,8 +41053,8 @@ def main() -> None:
                 prefer_memory=True,
                 workers=max(1, int(augmentation_workers)),
             )
-            view_frame_caches[view.name] = cache_mm
-            view_frame_cache_paths[view.name] = cache_path
+            view_frame_caches[cache_key] = cache_mm
+            view_frame_cache_paths[cache_key] = cache_path
             return cache_mm
 
     baseline_union_by_model_view: Dict[Tuple[str, str], np.ndarray] = {}
@@ -41148,14 +41067,11 @@ def main() -> None:
     direct_union_inference_bytes: Dict[Tuple[str, str], int] = {}
     direct_union_postprocess_bytes: Dict[Tuple[str, str], int] = {}
     direct_union_backing_leases: Dict[Tuple[str, str], _DirectUnionBackingLease] = {}
-    direct_union_sparse_retirement_active = bool(
-        gpu_worker_direct_union_active
-        and nrrd_layers_needed
-        and not dense_tiling_active
-        and not bool(keep_temp_artifacts)
-        and int(args.interpolation_distance) <= 0
-        and _env_flag('YOLO_TTA_SPARSE_VIEW_RETIREMENT', True)
-    )
+    # v16.4.0 keeps every completed angle variant dense until the physical-view OR.
+    # Sparse retirement before that OR would erase the independent contributor needed to
+    # reconstruct the physical view, so there is no compatibility/environment rollback.
+    direct_union_sparse_retirement_active = False
+
     _direct_headroom = max(0, int(available_anon_work_bytes()) - 64 * GIB)
     _default_inference_view_limit = max(4, min(12, 2 * max(1, int(gpu_device_count))))
     direct_union_inference_view_limit = max(
@@ -41274,7 +41190,6 @@ def main() -> None:
     # see the full render pool instead of a divided-by-builder slice of the CPU allocation.
     per_prediction_volume_workers = int(prediction_render_workers) if bool(streaming_sources_active) else int(legacy_per_prediction_volume_workers)
     async_prediction_accumulation_active = bool(async_predict_postprocess_enabled())
-    async_prediction_multiview_locking_active = bool(len(angles) > 1 and async_prediction_accumulation_active)
     # Queue slots are unbounded by default in, so do not size the lightweight join
     # executor from the total source count. The join tasks mostly wait on result futures;
     # a CPU-count-sized pool is enough to overlap drains without spawning thousands of threads.
@@ -41292,12 +41207,10 @@ def main() -> None:
             'Async prediction accumulation: enabled '
             f'(angles={len(angles)}, result workers={int(async_prediction_result_worker_count)}, '
             f'join workers={int(async_prediction_join_worker_count)}, '
-            f'per-slice locks for multi-angle full-frame writes={bool(async_prediction_multiview_locking_active)})'
+            'each angle variant owns an independent full-frame accumulator)'
         )
         spec_notes.append(
-            'v12.2.12 async prediction accumulation is active for all angle counts by default. '
-            'YOLO result detach/copy, native inverse-mapping, and optional streaming cleanup are queued to a shared prediction-result executor; '
-            'for multi-angle full-frame accumulation, per-slice locks protect shared union/confidence slices so the scheduler can start the next source while CPU result work drains.'
+            'v16.4.0 async prediction accumulation queues YOLO result detach/copy, native inverse-mapping, and variant-local streaming cleanup to a shared prediction-result executor. Each angle variant owns its union/confidence accumulator, so no cross-angle writer locks or unified-angle drain barrier exists.'
         )
     else:
         print('Async prediction accumulation: disabled by YOLO_TTA_ASYNC_PREDICT_POSTPROCESS=0; prediction sources are drained synchronously.')
@@ -41362,34 +41275,24 @@ def main() -> None:
     view_processing_futures: Dict[Future, Tuple[str, str]] = {}
     view_processing_submitted: set[Tuple[str, str]] = set()
     tile_cleanup_futures: Dict[Future, Tuple[str, str, str, str]] = {}
+    # P (cleaned parent YOLO) is published before parent interpolation through this queue.
+    # B (parent-only interpolation delta) becomes ready when the parent future completes.
+    parent_mask_ready_events = queue.SimpleQueue()
+    parent_bridge_ready: set[Tuple[str, str]] = set()
     postprocessed_tiles_waiting_by_parent: Dict[Tuple[str, str], Dict[str, object]] = {}
-    tile_finalize_futures: Dict[Future, Tuple[str, str, str, str]] = {}
-    tile_config_gate_futures: Dict[Future, Tuple[str, str, str]] = {}
+    residual_tiles_waiting_by_parent: Dict[Tuple[str, str], Dict[str, object]] = {}
+    tile_parent_gate_futures: Dict[Future, Tuple[str, str, str, str]] = {}
+    tile_bridge_gate_futures: Dict[Future, Tuple[str, str, str, str]] = {}
     tile_consolidation_futures: Dict[Future, Tuple[str, str]] = {}
-    tile_config_accumulator_by_key: Dict[Tuple[str, str, str], np.ndarray] = {}
-    tile_config_accumulator_paths: Dict[Tuple[str, str, str], Path] = {}
-    # one lock per slice class instead of one lock per canvas, so independent tiles can
-    # stage into the same configuration canvas concurrently.
-    tile_config_accumulator_locks: Dict[Tuple[str, str, str], List[threading.Lock]] = {}
-    # tile jobs deferred until their parent view's support exists, the tile-group
-    # tasks built from them, and the per-(model, view) build bookkeeping.
-    deferred_tile_jobs_by_parent: Dict[Tuple[str, str], List[DenseTileJob]] = {}
-    tile_groups_built_for_parent: set[Tuple[str, str]] = set()
-    tile_group_tiles_remaining: Dict[Tuple[str, str, str], int] = {}
-    tile_group_membership: Dict[int, Tuple[str, str, str, List[str]]] = {}
-    # Single-element holder so the lazily built coarse source map is shared across views.
-    tile_prefilter_source_coarse: List[Optional[np.ndarray]] = []
     tile_accumulator_by_parent: Dict[Tuple[str, str], np.ndarray] = {}
     tile_accumulator_paths: Dict[Tuple[str, str], Path] = {}
+    tile_accumulator_locks_by_parent: Dict[Tuple[str, str], List[threading.Lock]] = {}
     tile_parent_mask_accumulator_by_parent: Dict[Tuple[str, str], np.ndarray] = {}
     tile_parent_bridge_accumulator_by_parent: Dict[Tuple[str, str], np.ndarray] = {}
-    # gates now OR their category masks straight into these accumulators, so each one
-    # needs the same z-band lock sharding the config canvases use.
     tile_category_accumulator_locks: Dict[Tuple[str, str, str], List[threading.Lock]] = {}
-    tile_completed_by_parent_config: Dict[Tuple[str, str, str], set[str]] = {}
-    tile_config_gated_by_parent: Dict[Tuple[str, str], set[str]] = {}
-    tile_config_gate_submitted: set[Tuple[str, str, str]] = set()
+    tile_completed_by_parent: Dict[Tuple[str, str], set[str]] = {}
     tile_consolidation_submitted: set[Tuple[str, str]] = set()
+
 
     def _prediction_volume_queue_depth() -> int:
         return int(len(pending_prediction_volume_futures) + len(ready_fullframe) + len(ready_tile_infer))
@@ -41633,7 +41536,7 @@ def main() -> None:
         union_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Interpolated views retain a real pathname because the isolated interpolation
-        # backend reopens them by path. Single-angle direct-union views instead use memfd
+        # backend reopens them by path. Angle-variant direct-union views instead use memfd
         # descriptors transferred to CUDA workers; ordinary in-process views prefer anonymous RAM.
         union_prefer_memory = not (
             (
@@ -41697,6 +41600,16 @@ def main() -> None:
             direct_union_inference_views.add(key)
             direct_union_inference_bytes[key] = int(backing_bytes)
 
+    def _publish_parent_mask_ready(model_name: str, view_name: str, support_mm: object) -> None:
+        parent_mask_ready_events.put((str(model_name), str(view_name), support_mm))
+        # In push-drain mode the scheduler may be sleeping on a shared event while the
+        # parent future remains incomplete. Wake it as soon as P is publishable.
+        try:
+            scheduler_wake.set()
+        except (NameError, UnboundLocalError):
+            pass
+
+
     def _submit_view_prepare(model_name: str, view: ViewInfo) -> None:
         key = (str(model_name), str(view.name))
         if key in view_processing_submitted:
@@ -41755,12 +41668,15 @@ def main() -> None:
                     slice_workers=int(parent_slice_postprocess_workers),
                     interpolation_task_workers=int(parent_interpolation_task_workers),
                     nrrd_layers_enabled=bool(nrrd_layers_needed),
-                    precleaned_slice_cleanup=bool(single_angle_streaming_cleanup_active),
+                    precleaned_slice_cleanup=bool(angle_variant_streaming_cleanup_active),
                     hole_fill_done_on_device=bool(hole_fill_done_on_device),
                     slice_meta=slice_meta_holder,
                     fuse_radial_component_layers=bool(
-                        single_angle_gpu_fastpath_active
-                        and fused_single_angle_radial_component_layer_enabled()
+                        angle_variant_gpu_fastpath_active
+                        and fused_angle_variant_radial_component_layer_enabled()
+                    ),
+                    parent_mask_ready_callback=(
+                        _publish_parent_mask_ready if bool(dense_tiling_active) else None
                     ),
                 )
 
@@ -41803,6 +41719,10 @@ def main() -> None:
         if transitioned and gpu_worker_pending_task_ids:
             _dispatch_gpu_worker_inference_window()
 
+    def _tile_gate_lock_shards(view_name: str) -> int:
+        view = view_infos_by_name[str(view_name)]
+        return max(1, min(64, int(view.num_slices)))
+
     def _get_tile_accumulator(model_name: str, view_name: str) -> np.ndarray:
         key = (str(model_name), str(view_name))
         acc = tile_accumulator_by_parent.get(key)
@@ -41814,42 +41734,16 @@ def main() -> None:
             shape=view_processing_volume_shape(view, int(args.imgsz)),
             dtype=np.uint8,
             path=acc_path,
-            desc=f'{model_name}/{view_name} consolidated gated-tile accumulator',
+            desc=f'{model_name}/{view_name} consolidated two-stage gated-tile accumulator',
             prefer_memory=tile_intermediate_accumulators_prefer_memory(),
             reserve_bytes=tile_intermediate_accumulator_reserve_bytes(),
         )
         tile_accumulator_by_parent[key] = acc
         tile_accumulator_paths[key] = acc_path
+        tile_accumulator_locks_by_parent[key] = [
+            threading.Lock() for _ in range(_tile_gate_lock_shards(str(view_name)))
+        ]
         return acc
-
-    def _get_tile_config_accumulator(model_name: str, view_name: str, config_id: str) -> np.ndarray:
-        key = (str(model_name), str(view_name), str(config_id))
-        acc = tile_config_accumulator_by_key.get(key)
-        if acc is not None:
-            return acc
-        view = view_infos_by_name[str(view_name)]
-        acc_path = temp_dir / 'tile_consolidated_by_config' / str(model_name) / str(view_name) / str(config_id) / 'raw_canvas.u8.dat'
-        acc = allocate_workspace_array(
-            shape=view_processing_volume_shape(view, int(args.imgsz)),
-            dtype=np.uint8,
-            path=acc_path,
-            desc=f'{model_name}/{view_name} tile configuration {config_id} raw canvas',
-            # tile groups OR straight into this canvas from the GPU worker processes, so
-            # it must be a file mapping they can open 'r+'. Use --temp with a shm/tmpfs root
-            # to keep it in RAM; flush_array is a no-op by default, so the
-            # page cache already makes worker writes visible to this process.)
-            prefer_memory=(
-                tile_intermediate_accumulators_prefer_memory() and not tile_group_dispatch_active
-            ),
-            reserve_bytes=tile_intermediate_accumulator_reserve_bytes(),
-        )
-        tile_config_accumulator_by_key[key] = acc
-        tile_config_accumulator_paths[key] = acc_path
-        tile_config_accumulator_locks.setdefault(
-            key, [threading.Lock() for _ in range(int(tile_canvas_zband_lock_count()))],
-        )
-        return acc
-
 
     def _get_tile_category_accumulator(model_name: str, view_name: str, category: str) -> np.ndarray:
         key = (str(model_name), str(view_name))
@@ -41861,7 +41755,7 @@ def main() -> None:
         )
         tile_category_accumulator_locks.setdefault(
             (key[0], key[1], category_norm),
-            [threading.Lock() for _ in range(int(tile_canvas_zband_lock_count()))],
+            [threading.Lock() for _ in range(_tile_gate_lock_shards(str(view_name)))],
         )
         acc = store.get(key)
         if acc is not None:
@@ -41900,10 +41794,10 @@ def main() -> None:
         parent_key = (str(model_name), str(view_name))
         if parent_key in tile_consolidation_submitted:
             return
-        expected_configs = int(tile_config_expected_by_parent.get(parent_key, 0))
-        if expected_configs <= 0:
+        expected_tiles = int(tile_expected_by_parent.get(parent_key, 0))
+        if expected_tiles <= 0:
             return
-        if len(tile_config_gated_by_parent.get(parent_key, set())) < expected_configs:
+        if len(tile_completed_by_parent.get(parent_key, set())) < expected_tiles:
             return
         if not _parent_destination_ready(str(model_name), str(view_name)):
             return
@@ -41911,7 +41805,7 @@ def main() -> None:
         tile_consolidation_submitted.add(parent_key)
         acc = tile_accumulator_by_parent.get(parent_key)
         if acc is None:
-            # All tile-set canvases completed but none had parent-supported components.
+            # Every original tile was empty after cleanup; nothing can be interpolated.
             return
 
         view = view_infos_by_name[str(view_name)]
@@ -41938,125 +41832,137 @@ def main() -> None:
         )
         tile_consolidation_futures[fut] = parent_key
 
-    def _mark_tile_config_gated(model_name: str, view_name: str, config_id: str) -> None:
+    def _mark_tile_complete(model_name: str, view_name: str, tile_id: str) -> None:
         parent_key = (str(model_name), str(view_name))
-        gated = tile_config_gated_by_parent.setdefault(parent_key, set())
-        gated.add(str(config_id))
+        if parent_key not in tile_expected_by_parent:
+            return
+        completed = tile_completed_by_parent.setdefault(parent_key, set())
+        completed.add(str(tile_id))
         _maybe_submit_tile_consolidation(str(model_name), str(view_name))
 
-    def _maybe_submit_tile_config_gate(model_name: str, view_name: str, config_id: str) -> None:
-        key = (str(model_name), str(view_name), str(config_id))
-        if key in tile_config_gate_submitted:
-            return
-        expected = int(tile_expected_by_parent_config.get(key, 0))
-        if expected <= 0:
-            return
-        if len(tile_completed_by_parent_config.get(key, set())) < expected:
-            return
-        support_by_view = native_view_support_by_model.get(str(model_name), {})
-        if str(view_name) not in support_by_view:
-            return
+    def _retire_tile_result(result: TilePostprocessResult) -> None:
+        if result.tile_mask_mm is not None:
+            close_memmap_array(result.tile_mask_mm)
+        _delete_tile_result_storage(result, keep_temp=bool(keep_temp_artifacts))
 
-        tile_config_gate_submitted.add(key)
-        config_acc = tile_config_accumulator_by_key.pop(key, None)
-        config_acc_path = tile_config_accumulator_paths.pop(key, None)
-        if config_acc is None:
-            # Every tile in this size/stride configuration was empty or rejected before staging.
-            _mark_tile_config_gated(str(model_name), str(view_name), str(config_id))
-            return
 
-        parent_key = (str(model_name), str(view_name))
-        tile_accumulator_mm = _get_tile_accumulator(str(model_name), str(view_name))
-        parent_mask_support_mm = None
-        parent_bridge_support_mm = None
-        tile_parent_mask_accumulator_mm = None
-        tile_parent_bridge_accumulator_mm = None
-        if bool(nrrd_layers_needed):
-            parent_mask_support_mm = parent_mask_support_by_model.get(str(model_name), {}).get(str(view_name))
-            parent_bridge_support_mm = parent_bridge_support_by_model.get(str(model_name), {}).get(str(view_name))
-            tile_parent_mask_accumulator_mm = _get_tile_category_accumulator(str(model_name), str(view_name), 'parent_mask')
-            if parent_bridge_support_mm is not None:
-                tile_parent_bridge_accumulator_mm = _get_tile_category_accumulator(str(model_name), str(view_name), 'parent_bridge')
-
-        config_result = TilePostprocessResult(
-            model_name=str(model_name),
-            view_name=str(view_name),
-            config_id=str(config_id),
-            tile_id=str(config_id),
-            tile_mask_mm=config_acc,
-            tile_mask_path=config_acc_path,
-        )
-        fut = tile_postprocess_executor.submit(
-            gate_tile_volume_into_consolidated_parent,
-            config_result,
-            parent_support_mm=support_by_view[str(view_name)],
-            tile_accumulator_mm=tile_accumulator_mm,
-            tile_accumulator_lock=view_volume_locks[(str(model_name), str(view_name))],
-            keep_temp=bool(keep_temp_artifacts),
-            slice_workers=int(tile_slice_postprocess_workers),
-            parent_mask_support_mm=parent_mask_support_mm,
-            parent_bridge_support_mm=parent_bridge_support_mm,
-            tile_parent_mask_accumulator_mm=tile_parent_mask_accumulator_mm,
-            tile_parent_bridge_accumulator_mm=tile_parent_bridge_accumulator_mm,
-            tile_parent_mask_accumulator_locks=tile_category_accumulator_locks.get((str(model_name), str(view_name), 'parent_mask')),
-            tile_parent_bridge_accumulator_locks=tile_category_accumulator_locks.get((str(model_name), str(view_name), 'parent_bridge')),
-        )
-        tile_config_gate_futures[fut] = key
-
-    def _mark_tile_staged(model_name: str, view_name: str, config_id: str, tile_id: str) -> None:
-        key = (str(model_name), str(view_name), str(config_id))
-        if key not in tile_expected_by_parent_config:
-            return
-        completed = tile_completed_by_parent_config.setdefault(key, set())
-        completed.add(str(tile_id))
-        _maybe_submit_tile_config_gate(str(model_name), str(view_name), str(config_id))
-
-    def _submit_tile_finalize(result: TilePostprocessResult) -> None:
+    def _submit_tile_parent_gate(result: TilePostprocessResult) -> None:
+        """Gate one original tile against immutable same-angle parent YOLO support P."""
         parent_key = (str(result.model_name), str(result.view_name))
-        support_by_view = native_view_support_by_model.get(result.model_name, {})
-        if result.view_name not in support_by_view:
+        parent_mask_support = parent_mask_support_by_model.get(
+            str(result.model_name), {}
+        ).get(str(result.view_name))
+        if parent_mask_support is None:
             waiting = postprocessed_tiles_waiting_by_parent.setdefault(parent_key, {})
-            parent_view = view_infos_by_name[str(result.view_name)]
             if waiting_tile_spill_enabled():
                 waiting[str(result.tile_id)] = spill_waiting_tile_result_to_raw_store(
                     result,
                     temp_dir,
                     workers=int(tile_slice_postprocess_workers),
                     keep_original=bool(keep_temp_artifacts),
-                    expected_parent_shape=view_processing_volume_shape(parent_view, int(args.imgsz)),
                 )
             else:
-                # Keep the already-parent-sized postprocessed tile volume resident instead of
-                # round-tripping through a raw ctile store while waiting for parent support.
                 waiting[str(result.tile_id)] = result
             return
 
-        waiting = postprocessed_tiles_waiting_by_parent.get(parent_key)
-        if waiting is not None:
-            waiting.pop(str(result.tile_id), None)
-            if not waiting:
-                postprocessed_tiles_waiting_by_parent.pop(parent_key, None)
-
-        config_accumulator_mm = _get_tile_config_accumulator(result.model_name, result.view_name, result.config_id)
-        config_lock = tile_config_accumulator_locks.setdefault(
-            (str(result.model_name), str(result.view_name), str(result.config_id)),
-            [threading.Lock() for _ in range(int(tile_canvas_zband_lock_count()))],
+        tile_accumulator_mm = _get_tile_accumulator(
+            str(result.model_name), str(result.view_name),
         )
+        tile_parent_mask_accumulator_mm = None
+        if bool(nrrd_layers_needed):
+            tile_parent_mask_accumulator_mm = _get_tile_category_accumulator(
+                str(result.model_name), str(result.view_name), 'parent_mask',
+            )
+
         fut = tile_postprocess_executor.submit(
-            stage_tile_result_into_config_canvas,
+            gate_tile_result_against_parent_mask,
             result,
-            tile_set_accumulator_mm=config_accumulator_mm,
-            tile_set_accumulator_lock=config_lock,
+            parent_mask_support_mm=parent_mask_support,
+            tile_accumulator_mm=tile_accumulator_mm,
+            tile_accumulator_locks=tile_accumulator_locks_by_parent.get(parent_key),
+            work_dir=temp_dir / 'tile_parent_gate_residuals',
             keep_temp=bool(keep_temp_artifacts),
             slice_workers=int(tile_slice_postprocess_workers),
+            tile_parent_mask_accumulator_mm=tile_parent_mask_accumulator_mm,
+            tile_parent_mask_accumulator_locks=tile_category_accumulator_locks.get(
+                (str(result.model_name), str(result.view_name), 'parent_mask')
+            ),
         )
-        tile_finalize_futures[fut] = (str(result.model_name), str(result.view_name), str(result.config_id), str(result.tile_id))
+        tile_parent_gate_futures[fut] = (
+            str(result.model_name), str(result.view_name),
+            str(result.config_id), str(result.tile_id),
+        )
+
+
+    def _submit_tile_bridge_gate(result: TilePostprocessResult) -> None:
+        """Re-gate only P-failed components against immutable same-angle parent bridge B."""
+        parent_key = (str(result.model_name), str(result.view_name))
+        if int(args.interpolation_distance) <= 0:
+            # Without parent interpolation there can never be bridge support. Parent-gate
+            # residuals are final rejections and should retire immediately instead of waiting
+            # for the parent postprocess future to publish an empty bridge milestone.
+            _retire_tile_result(result)
+            _mark_tile_complete(
+                str(result.model_name), str(result.view_name), str(result.tile_id)
+            )
+            return
+        if parent_key not in parent_bridge_ready:
+            waiting = residual_tiles_waiting_by_parent.setdefault(parent_key, {})
+            if waiting_tile_spill_enabled():
+                waiting[str(result.tile_id)] = spill_waiting_tile_result_to_raw_store(
+                    result,
+                    temp_dir,
+                    workers=int(tile_slice_postprocess_workers),
+                    keep_original=bool(keep_temp_artifacts),
+                )
+            else:
+                waiting[str(result.tile_id)] = result
+            return
+
+        parent_bridge_support = parent_bridge_support_by_model.get(
+            str(result.model_name), {}
+        ).get(str(result.view_name))
+        if parent_bridge_support is None:
+            # Parent interpolation produced no bridge voxels (or was disabled), so every
+            # remaining whole component is definitively rejected.
+            _retire_tile_result(result)
+            _mark_tile_complete(str(result.model_name), str(result.view_name), str(result.tile_id))
+            return
+
+        tile_accumulator_mm = _get_tile_accumulator(
+            str(result.model_name), str(result.view_name),
+        )
+        tile_parent_bridge_accumulator_mm = None
+        if bool(nrrd_layers_needed):
+            tile_parent_bridge_accumulator_mm = _get_tile_category_accumulator(
+                str(result.model_name), str(result.view_name), 'parent_bridge',
+            )
+
+        fut = tile_postprocess_executor.submit(
+            gate_tile_residual_against_parent_bridge,
+            result,
+            parent_bridge_support_mm=parent_bridge_support,
+            tile_accumulator_mm=tile_accumulator_mm,
+            tile_accumulator_locks=tile_accumulator_locks_by_parent.get(parent_key),
+            work_dir=temp_dir / 'tile_bridge_gate_residuals',
+            keep_temp=bool(keep_temp_artifacts),
+            slice_workers=int(tile_slice_postprocess_workers),
+            tile_parent_bridge_accumulator_mm=tile_parent_bridge_accumulator_mm,
+            tile_parent_bridge_accumulator_locks=tile_category_accumulator_locks.get(
+                (str(result.model_name), str(result.view_name), 'parent_bridge')
+            ),
+        )
+        tile_bridge_gate_futures[fut] = (
+            str(result.model_name), str(result.view_name),
+            str(result.config_id), str(result.tile_id),
+        )
+
 
     def _flush_ready_postprocessed_tiles() -> None:
         ready_results: List[TilePostprocessResult] = []
         for parent_key, waiting in list(postprocessed_tiles_waiting_by_parent.items()):
             model_name, view_name = parent_key
-            if view_name not in native_view_support_by_model.get(model_name, {}):
+            if view_name not in parent_mask_support_by_model.get(model_name, {}):
                 continue
             for wait_result in waiting.values():
                 if isinstance(wait_result, DeferredTilePostprocessResult):
@@ -42068,7 +41974,43 @@ def main() -> None:
             del postprocessed_tiles_waiting_by_parent[parent_key]
 
         for result in ready_results:
-            _submit_tile_finalize(result)
+            _submit_tile_parent_gate(result)
+
+
+    def _flush_ready_residual_tiles() -> None:
+        ready_results: List[TilePostprocessResult] = []
+        for parent_key, waiting in list(residual_tiles_waiting_by_parent.items()):
+            if parent_key not in parent_bridge_ready:
+                continue
+            for wait_result in waiting.values():
+                if isinstance(wait_result, DeferredTilePostprocessResult):
+                    ready_results.append(load_waiting_tile_result_from_raw_store(wait_result))
+                elif isinstance(wait_result, TilePostprocessResult):
+                    ready_results.append(wait_result)
+                else:
+                    raise TypeError(f'Unsupported residual tile result type: {type(wait_result)!r}')
+            del residual_tiles_waiting_by_parent[parent_key]
+
+        for result in ready_results:
+            _submit_tile_bridge_gate(result)
+
+
+    def _drain_parent_mask_ready_events() -> None:
+        published = False
+        while True:
+            try:
+                model_name, view_name, support_mm = parent_mask_ready_events.get_nowait()
+            except queue.Empty:
+                break
+            existing = parent_mask_support_by_model[str(model_name)].get(str(view_name))
+            if existing is not None and existing is not support_mm:
+                raise RuntimeError(
+                    f'Parent mask support {model_name}/{view_name} was published more than once'
+                )
+            parent_mask_support_by_model[str(model_name)][str(view_name)] = support_mm
+            published = True
+        if published:
+            _flush_ready_postprocessed_tiles()
 
 
     def _submit_prediction_accumulation_join(handle: PredictionAccumulationHandle, context: Dict[str, object]) -> None:
@@ -42128,20 +42070,24 @@ def main() -> None:
                                 tile_conf_path.unlink(missing_ok=True)
                             except Exception:
                                 pass
-                    _mark_tile_staged(str(model_name), str(view.name), str(tile_job.config_id), str(tile_job.tile_id))
+                    _mark_tile_complete(str(model_name), str(view.name), str(tile_job.tile_id))
                     continue
 
                 task = TilePostprocessTask(
                     model_name=str(model_name),
                     view_name=str(view.name),
+                    aug_id=str(view.tta_aug_id),
+                    angle_deg=float(view.tta_angle_deg),
                     config_id=str(tile_job.config_id),
                     tile_id=str(tile_job.tile_id),
+                    parent_crop=tuple(int(v) for v in tile_job.parent_crop),
                     tile_mask_mm=tile_mask_mm,
                     tile_confmap_mm=tile_conf_mm,
                     tile_mask_path=tile_mask_path,
                     tile_confmap_path=tile_conf_path,
-                    precleaned_slice_cleanup=bool(single_angle_streaming_cleanup_active),
+                    precleaned_slice_cleanup=bool(angle_variant_streaming_cleanup_active),
                     processing_shape=tuple(int(v) for v in np.asarray(tile_mask_mm).shape),
+                    threshold_plane_shape=tuple(int(v) for v in context['threshold_plane_shape']),
                 )
                 tile_fut = tile_postprocess_executor.submit(
                     postprocess_tile_volume_after_inference,
@@ -42159,6 +42105,7 @@ def main() -> None:
 
     def _drain_completed_background_futures() -> None:
         direct_union_capacity_released = False
+        _drain_parent_mask_ready_events()
         for fut in list(view_processing_futures.keys()):
             if not fut.done():
                 continue
@@ -42167,9 +42114,17 @@ def main() -> None:
             if result.native_support_mm is not None:
                 native_view_support_by_model[result.model_name][result.view_name] = result.native_support_mm
             if result.parent_mask_support_mm is not None:
-                parent_mask_support_by_model[result.model_name][result.view_name] = result.parent_mask_support_mm
+                existing_parent_mask = parent_mask_support_by_model[result.model_name].get(result.view_name)
+                if existing_parent_mask is None:
+                    parent_mask_support_by_model[result.model_name][result.view_name] = result.parent_mask_support_mm
+                elif existing_parent_mask is not result.parent_mask_support_mm:
+                    raise RuntimeError(
+                        f'Parent mask support identity changed for {result.model_name}/{result.view_name}'
+                    )
             if result.parent_bridge_support_mm is not None:
                 parent_bridge_support_by_model[result.model_name][result.view_name] = result.parent_bridge_support_mm
+            parent_bridge_ready.add((str(result.model_name), str(result.view_name)))
+            _flush_ready_residual_tiles()
             interpolation_stats.extend(result.interpolation_stats)
             nrrd_layer_refs.extend(result.nrrd_layers)
             completed_view_key = (str(result.model_name), str(result.view_name))
@@ -42192,16 +42147,10 @@ def main() -> None:
                     tilted_native_output_by_model[result.model_name][result.view_name] = result.final_view_volume_mm
                 else:
                     view_volumes_by_model[result.model_name][result.view_name] = result.final_view_volume_mm
-            # this view's support is now frozen, so its deferred tiles can be filtered
-            # against it and dispatched. Must run BEFORE the config-gate check below, or a
-            # configuration whose tiles are all dropped would gate against an empty canvas
-            # before its (still unbuilt) tiles were accounted for.
-            if tile_group_dispatch_active:
-                _build_tile_group_tasks_for_view(str(result.model_name), view_info)
-            for config_key in list(tile_expected_by_parent_config.keys()):
-                cfg_model, cfg_view, cfg_id = config_key
-                if cfg_model == result.model_name and cfg_view == result.view_name:
-                    _maybe_submit_tile_config_gate(cfg_model, cfg_view, cfg_id)
+            # Parent YOLO and bridge supports are now immutable and same-angle. Release
+            # any cleaned tiles that finished inference first, then check whether all original
+            # tiles have completed their two-stage component gates.
+            _maybe_submit_tile_consolidation(str(result.model_name), str(result.view_name))
 
         for fut in list(tile_cleanup_futures.keys()):
             if not fut.done():
@@ -42209,25 +42158,30 @@ def main() -> None:
             ready_key = tile_cleanup_futures.pop(fut)
             result = fut.result()
             if result is None:
-                _mark_tile_staged(str(ready_key[0]), str(ready_key[1]), str(ready_key[2]), str(ready_key[3]))
+                _mark_tile_complete(str(ready_key[0]), str(ready_key[1]), str(ready_key[3]))
                 continue
-            _submit_tile_finalize(result)
+            _submit_tile_parent_gate(result)
 
         _flush_ready_postprocessed_tiles()
 
-        for fut in list(tile_finalize_futures.keys()):
+        for fut in list(tile_parent_gate_futures.keys()):
             if not fut.done():
                 continue
-            model_name, view_name, config_id, tile_id = tile_finalize_futures.pop(fut)
-            fut.result()
-            _mark_tile_staged(str(model_name), str(view_name), str(config_id), str(tile_id))
+            model_name, view_name, config_id, tile_id = tile_parent_gate_futures.pop(fut)
+            parent_gate_result = fut.result()
+            if parent_gate_result.residual_result is None:
+                _mark_tile_complete(str(model_name), str(view_name), str(tile_id))
+            else:
+                _submit_tile_bridge_gate(parent_gate_result.residual_result)
 
-        for fut in list(tile_config_gate_futures.keys()):
+        _flush_ready_residual_tiles()
+
+        for fut in list(tile_bridge_gate_futures.keys()):
             if not fut.done():
                 continue
-            model_name, view_name, config_id = tile_config_gate_futures.pop(fut)
+            model_name, view_name, config_id, tile_id = tile_bridge_gate_futures.pop(fut)
             fut.result()
-            _mark_tile_config_gated(str(model_name), str(view_name), str(config_id))
+            _mark_tile_complete(str(model_name), str(view_name), str(tile_id))
 
         for fut in list(tile_consolidation_futures.keys()):
             if not fut.done():
@@ -42294,7 +42248,8 @@ def main() -> None:
         if not bool(force) and (now - float(last_scheduler_wait_log)) < float(interval):
             return
         last_scheduler_wait_log = float(now)
-        waiting_tiles = sum(len(v) for v in postprocessed_tiles_waiting_by_parent.values())
+        waiting_parent_tiles = sum(len(v) for v in postprocessed_tiles_waiting_by_parent.values())
+        waiting_bridge_tiles = sum(len(v) for v in residual_tiles_waiting_by_parent.values())
         gpu_stage_state = _MAIN_PROCESS_GPU_STAGE_COORDINATOR.snapshot()
         print(
             'Scheduler wait: no inference-ready in-memory volume; '
@@ -42310,10 +42265,11 @@ def main() -> None:
             f'direct_union_postprocess={len(direct_union_postprocess_views)}/'
             f'{sum(direct_union_postprocess_bytes.values()) / GIB:.1f}GiB, '
             f'tile_cleanup={len(tile_cleanup_futures)}, '
-            f'tile_finalize={len(tile_finalize_futures)}, '
-            f'tile_config_gate={len(tile_config_gate_futures)}, '
+            f'tile_parent_gate={len(tile_parent_gate_futures)}, '
+            f'tile_bridge_gate={len(tile_bridge_gate_futures)}, '
             f'tile_consolidation={len(tile_consolidation_futures)}, '
-            f'waiting_tiles_for_parent={waiting_tiles}, '
+            f'waiting_tiles_for_parent={waiting_parent_tiles}, '
+            f'waiting_residuals_for_bridge={waiting_bridge_tiles}, '
             f'ready_fullframe={len(ready_fullframe)}, ready_tiles={len(ready_tile_infer)}'
         )
 
@@ -42361,14 +42317,12 @@ def main() -> None:
                 gpu_worker_default_seconds_per_frame(view_obj)
                 if isinstance(view_obj, ViewInfo) else 0.05
             )
-        units_per_slice = len(task.get('tiles', ())) if str(task.get('kind', '')) == 'tile_group' else 1
-        return max(1e-4, float(sec_per_frame) * float(count) * float(max(1, units_per_slice)))
+        return max(1e-4, float(sec_per_frame) * float(count))
 
     def _update_gpu_worker_cost(task: Dict[str, object], stats: Dict[str, object]) -> None:
         elapsed = float(stats.get('worker_compute_seconds', 0.0) or 0.0)
         count = max(1, int(task.get('slice_count', 1)))
-        units_per_slice = len(task.get('tiles', ())) if str(task.get('kind', '')) == 'tile_group' else 1
-        units = max(1, int(count) * max(1, int(units_per_slice)))
+        units = max(1, int(count))
         if elapsed <= 0.0:
             return
         observed = max(1e-5, float(elapsed) / float(units))
@@ -42752,7 +42706,6 @@ def main() -> None:
         inference_tail_drained = bool(
             int(gpu_worker_total_tasks) > 0
             and int(gpu_worker_results_collected) >= int(gpu_worker_total_tasks)
-            and not deferred_tile_jobs_by_parent
         )
         if len(worker_ids) == 1:
             worker_id = int(worker_ids[0])
@@ -42941,9 +42894,9 @@ def main() -> None:
             'channel_token': str(channel_format.token),
             'retina_processor': str(retina_processor),
             'cv2_threads': max(1, _env_int('YOLO_TTA_GPU_WORKER_CV2_THREADS', 1)),
-            # single-angle GPU fast-path (min_conf None when inactive) + min_radius.
-            'single_angle_gpu_fastpath_min_conf': single_angle_gpu_fastpath_min_conf_value,
-            'single_angle_gpu_fastpath_min_radius': single_angle_gpu_fastpath_min_radius_value,
+            # angle-variant GPU fast-path (min_conf None when inactive) + min_radius.
+            'angle_variant_gpu_fastpath_min_conf': angle_variant_gpu_fastpath_min_conf_value,
+            'angle_variant_gpu_fastpath_min_radius': angle_variant_gpu_fastpath_min_radius_value,
             'fused_preflight_specs': tuple(fused_preflight_specs),
         }
         # Torch LOGICAL indices (positions within any inherited CUDA_VISIBLE_DEVICES list);
@@ -43003,13 +42956,6 @@ def main() -> None:
         # enqueued below once the shared source volume is ready.
         mp_ctx = mp.get_context('spawn')
         gpu_result_queue = mp_ctx.Queue()
-        # tiles within one configuration overlap, so two workers can OR the same canvas
-        # byte concurrently. These inherited locks give each canvas z band a mutual-exclusion
-        # class; a given z always maps to the same lock in every process.
-        canvas_zband_locks = (
-            [mp_ctx.Lock() for _ in range(int(tile_canvas_zband_lock_count()))]
-            if tile_group_dispatch_active else None
-        )
         for worker_pos, gpu_index in enumerate(gpu_logical_indices):
             worker_id = int(gpu_index)
             worker_queue = mp_ctx.Queue()
@@ -43023,7 +42969,7 @@ def main() -> None:
                 target=_gpu_inference_worker_main,
                 args=(
                     worker_id, str(model_paths[0]), worker_init_i,
-                    worker_queue, gpu_result_queue, canvas_zband_locks,
+                    worker_queue, gpu_result_queue,
                 ),
                 name=f'gpu-worker-{gpu_index}', daemon=True,
             )
@@ -43136,11 +43082,11 @@ def main() -> None:
         prefetch_frames = streaming_prediction_source_prefetch_frames(max(1, int(args.batch)))
         # per-task device-side 2D hole fill is valid only when the spec steps that
         # precede hole fill (--min_conf, --min_radius) have no work, results stream through the
-        # single-angle cleanup path, and the task writes a disjoint direct-union window.
+        # angle-variant cleanup path, and the task writes a disjoint direct-union window.
         gpu_worker_device_hole_fill = bool(
             gpu_device_union_enabled()
             and gpu_device_hole_fill_enabled()
-            and bool(single_angle_streaming_cleanup_active)
+            and bool(angle_variant_streaming_cleanup_active)
             and float(args.min_conf) <= 0.0
             and float(args.min_radius) <= 0.0
         )
@@ -43177,15 +43123,6 @@ def main() -> None:
                 # v16.1.3 allocates the shared direct-union workspace only when the
                 # first task for this view is actually dispatched.  This prevents all 30
                 # logical 25-39 GiB unions from being created/touched at startup.
-            elif tile_group_dispatch_active:
-                # defer this tile until its parent view's support exists. Full frames are
-                # dispatched first, and the completed parent support then decides which tiles
-                # (and which slice ranges of them) can contribute at all. Enqueueing tiles here
-                # would commit the run to inferencing every tile over every slice up front.
-                deferred_tile_jobs_by_parent.setdefault(
-                    (str(model_name), str(view.name)), [],
-                ).append(job_obj)  # type: ignore[arg-type]
-                continue
             else:
                 tile_job = job_obj
                 write_dense_tile_job_meta(tile_job, channel_format)
@@ -43194,10 +43131,20 @@ def main() -> None:
                 job_id = str(tile_job.tile_id)
                 ranges = [(0, int(n_slices))]
                 prefix = f'tile__{view.name}__{job_id}'
-            task_processing_shape = view_processing_volume_shape(view, int(out_size))
-            m_out_processing = output_to_view_processing_affine(view, m_out, int(out_size))
+            full_parent_processing_shape = view_processing_volume_shape(view, int(out_size))
+            if str(kind) == 'tile':
+                py0, py1, px0, px1 = (int(v) for v in tile_job.parent_crop)
+                task_processing_shape = (
+                    int(n_slices), int(py1 - py0), int(px1 - px0),
+                )
+                m_out_processing = np.asarray(tile_job.M_out_to_crop, dtype=np.float32)
+                threshold_plane_shape = tuple(int(v) for v in full_parent_processing_shape[-2:])
+            else:
+                task_processing_shape = full_parent_processing_shape
+                m_out_processing = output_to_view_processing_affine(view, m_out, int(out_size))
+                threshold_plane_shape = tuple(int(v) for v in task_processing_shape[-2:])
             processing_min_radius = view_processing_min_radius(
-                view, float(args.min_radius), task_processing_shape[-2:],
+                view, float(args.min_radius), threshold_plane_shape,
             )
             for chunk_idx, (s0, s1) in enumerate(ranges):
                 count = int(s1) - int(s0)
@@ -43228,6 +43175,11 @@ def main() -> None:
                     'M_out_to_src': m_out,
                     'M_out_to_processing': m_out_processing,
                     'processing_shape': task_processing_shape,
+                    'threshold_plane_shape': threshold_plane_shape,
+                    'parent_crop': (
+                        tuple(int(v) for v in tile_job.parent_crop)
+                        if str(kind) == 'tile' else None
+                    ),
                     'slice_start': int(s0), 'slice_count': int(count),
                     'source_volume_path': source_volume_path, 'source_shape': list(source_volume_shape),
                     'source_dtype': source_volume_dtype,
@@ -43240,7 +43192,7 @@ def main() -> None:
                     'result_mode': str(result_mode), 'union_num_slices': int(n_slices),
                     'render_workers': int(render_workers), 'prefetch_frames': int(prefetch_frames),
                     'postprocess_workers': int(per_worker_workers),
-                    'streaming_cleanup_enabled': bool(single_angle_streaming_cleanup_active),
+                    'streaming_cleanup_enabled': bool(angle_variant_streaming_cleanup_active),
                     'streaming_cleanup_min_conf': float(args.min_conf),
                     'streaming_cleanup_min_radius': float(processing_min_radius),
                     'device_hole_fill': bool(
@@ -43279,200 +43231,6 @@ def main() -> None:
             f'min/max={gpu_worker_min_lease_slices()}/{gpu_worker_max_lease_slices()} slices; '
             'runtime EWMA splitting and predicted-load placement active).'
         )
-        if tile_group_dispatch_active:
-            deferred_tiles_total = sum(len(v) for v in deferred_tile_jobs_by_parent.values())
-            print(
-                f'T3/T9 tile groups active: {deferred_tiles_total} tile(s) held back until their '
-                'parent view support is available; each parent then emits slice-chunked GROUP '
-                'tasks that render one native plane per frame for all of their tiles, keep only '
-                'each tile\'s parent-grid crop, and OR straight into the shared configuration '
-                'canvas (YOLO_TTA_TILE_GROUP_TASKS=0 restores per-tile whole-volume tasks).'
-            )
-
-        def _source_content_coarse_map() -> Optional[np.ndarray]:
-            """(a): lazily built block-max of the source volume, shared by every view."""
-            if not tile_content_prefilter_enabled():
-                return None
-            if tile_prefilter_source_coarse:
-                return tile_prefilter_source_coarse[0]
-            try:
-                wait_for_volume_ready(volume_rgb)
-                block = int(tile_prefilter_block())
-                t0 = time.time()
-                coarse = _coarse_block_max_3d(
-                    np.asarray(volume_rgb), (block, block, block), workers=int(worker_budget),
-                )
-                print(
-                    f'T9 content prefilter: source coarse map {tuple(int(v) for v in coarse.shape)} '
-                    f'built in {time.time() - t0:.1f}s (block={block}).'
-                )
-                tile_prefilter_source_coarse.append(coarse)
-                return coarse
-            except Exception as exc:
-                print(f'Warning: tile content prefilter unavailable ({exc}); keeping every tile.')
-                tile_prefilter_source_coarse.append(None)
-                return None
-
-        def _build_tile_group_tasks_for_view(model_name_s: str, view: ViewInfo) -> int:
-            """Emit slice-chunked tile-GROUP tasks for one parent view.
-
- Called once the view's parent support exists. Tiles that no parent support can
- ever accept are dropped outright; surviving tiles are grouped per (angle, tile
- configuration) and chunked along z so one task's unit volume stays inside the
- per-task budget on both the device and the host."""
-            nonlocal gpu_worker_total_tasks, gpu_worker_next_dynamic_task_id
-            parent_key = (str(model_name_s), str(view.name))
-            if parent_key in tile_groups_built_for_parent:
-                return 0
-            tile_jobs = deferred_tile_jobs_by_parent.pop(parent_key, [])
-            tile_groups_built_for_parent.add(parent_key)
-            if not tile_jobs:
-                return 0
-
-            n_slices = int(view.num_slices)
-            plane_shape = view_processing_plane_shape(view, int(args.imgsz))
-            support_mm = native_view_support_by_model.get(str(model_name_s), {}).get(str(view.name))
-            block = int(tile_prefilter_block())
-
-            support_coarse: Optional[np.ndarray] = None
-            if support_mm is not None and tile_support_prefilter_enabled():
-                try:
-                    t0 = time.time()
-                    support_coarse = _coarse_block_max_3d(
-                        np.asarray(support_mm), (1, block, block), workers=int(worker_budget),
-                    )
-                    print(
-                        f'T9 support prefilter ({view.name}): coarse support map '
-                        f'{tuple(int(v) for v in support_coarse.shape)} built in {time.time() - t0:.1f}s.'
-                    )
-                except Exception as exc:
-                    print(f'Warning: tile support prefilter unavailable for {view.name} ({exc}); keeping every tile.')
-                    support_coarse = None
-            source_coarse = _source_content_coarse_map()
-
-            # Group by (angle, configuration): the crop window shape is uniform only within
-            # one such group, and a shared shape is what lets a group use one unit volume.
-            grouped: Dict[Tuple[str, str], List[DenseTileJob]] = {}
-            for tile_job in tile_jobs:
-                grouped.setdefault((str(tile_job.aug_id), str(tile_job.config_id)), []).append(tile_job)
-
-            emitted = 0
-            dropped_tiles = 0
-            kept_tiles = 0
-            skipped_units = 0
-            total_units = 0
-            for (aug_id, config_id), jobs_in_group in sorted(grouped.items()):
-                crop = tuple(int(v) for v in jobs_in_group[0].parent_crop)
-                crop_h, crop_w = int(crop[1]) - int(crop[0]), int(crop[3]) - int(crop[2])
-                dilate_px = int(math.ceil(
-                    float(jobs_in_group[0].tile_stride)
-                    * float(crop_w) / float(max(1, int(jobs_in_group[0].tile_size)))
-                ))
-
-                candidates: List[Tuple[DenseTileJob, np.ndarray]] = []
-                for tile_job in jobs_in_group:
-                    cand = np.ones((n_slices,), dtype=bool)
-                    if support_coarse is not None:
-                        cand &= tile_support_candidate_slices(
-                            tile_job, support_coarse, block=block,
-                            plane_shape=(int(plane_shape[0]), int(plane_shape[1])),
-                            dilate_px=int(dilate_px),
-                        )
-                    if source_coarse is not None:
-                        cand &= tile_content_candidate_slices(
-                            tile_job, view, source_coarse, block=block, num_slices=int(n_slices),
-                        )
-                    total_units += int(n_slices)
-                    if not bool(cand.any()):
-                        # Nothing this tile could produce can survive the parent gate.
-                        dropped_tiles += 1
-                        skipped_units += int(n_slices)
-                        _mark_tile_staged(str(model_name_s), str(view.name), str(config_id), str(tile_job.tile_id))
-                        continue
-                    kept_tiles += 1
-                    candidates.append((tile_job, cand))
-
-                if not candidates:
-                    continue
-
-                # The canvas must exist (and be file-backed) before any worker opens it 'r+'.
-                canvas = _get_tile_config_accumulator(str(model_name_s), str(view.name), str(config_id))
-                canvas_path = tile_config_accumulator_paths[(str(model_name_s), str(view.name), str(config_id))]
-                canvas_shape = tuple(int(v) for v in np.asarray(canvas).shape)
-
-                unit_bytes = max(1, int(crop_h) * int(crop_w))
-                budget = int(max(0.25, _env_float('YOLO_TTA_TILE_GROUP_UNIT_BUDGET_GIB', 1.5)) * GIB)
-                max_units = max(1, int(budget) // int(unit_bytes))
-                z_chunk = max(1, int(max_units) // max(1, len(candidates)))
-                z_chunk = min(int(z_chunk), int(n_slices))
-
-                processing_min_radius = view_processing_min_radius(
-                    view, float(args.min_radius), (int(plane_shape[0]), int(plane_shape[1])),
-                )
-                for tile_job, _cand in candidates:
-                    write_dense_tile_job_meta(tile_job, channel_format)
-
-                for z0 in range(0, int(n_slices), int(z_chunk)):
-                    z1 = min(int(n_slices), int(z0) + int(z_chunk))
-                    # Per chunk, keep only the tiles that can contribute in THIS slice range.
-                    chunk_tiles = [tj for tj, cand in candidates if bool(cand[int(z0):int(z1)].any())]
-                    if not chunk_tiles:
-                        skipped_units += int(z1 - z0) * int(len(candidates))
-                        continue
-                    skipped_units += int(z1 - z0) * int(len(candidates) - len(chunk_tiles))
-                    tile_ids = [str(tj.tile_id) for tj in chunk_tiles]
-                    task = {
-                        'task_id': int(gpu_worker_next_dynamic_task_id), 'kind': 'tile_group',
-                        'model_name': str(model_name_s), 'view': view, 'job': None,
-                        'job_id': f'{config_id}__{aug_id}__z{int(z0):06d}',
-                        'out_size': int(args.imgsz),
-                        'channel_format': channel_format,
-                        'tiles': list(chunk_tiles),
-                        'config_id': str(config_id), 'aug_id': str(aug_id),
-                        'tile_ids': tile_ids,
-                        'slice_start': int(z0), 'slice_count': int(z1 - z0),
-                        'source_volume_path': source_volume_path, 'source_shape': list(source_volume_shape),
-                        'source_dtype': source_volume_dtype,
-                        'radial_texture_required': bool(radial_texture_required),
-                        'native_resize': native_resize_task_spec,
-                        'canvas_path': str(canvas_path), 'canvas_shape': [int(v) for v in canvas_shape],
-                        'want_confmap': bool(float(args.min_conf) > 0.0),
-                        'render_workers': max(1, min(int(per_worker_workers), int(z1 - z0) * len(chunk_tiles))),
-                        'prefetch_frames': int(prefetch_frames),
-                        'postprocess_workers': int(per_worker_workers),
-                        'streaming_cleanup_enabled': bool(single_angle_streaming_cleanup_active),
-                        'streaming_cleanup_min_conf': float(args.min_conf),
-                        'streaming_cleanup_min_radius': float(processing_min_radius),
-                        # tiles get the same device-side 2D hole fill as full frames. The
-                        # device union holds one plane per (frame, tile), so filling it per
-                        # index is exactly the per-tile per-slice CPU pass it replaces.
-                        'device_hole_fill': bool(gpu_worker_device_hole_fill),
-                        'result_mask_path': None, 'result_conf_path': None,
-                        'result_mode': 'tile_group',
-                    }
-                    gpu_worker_tasks_by_id[int(gpu_worker_next_dynamic_task_id)] = task
-                    tile_group_membership[int(gpu_worker_next_dynamic_task_id)] = (
-                        str(model_name_s), str(view.name), str(config_id), tile_ids,
-                    )
-                    for tile_id in tile_ids:
-                        rk = (str(model_name_s), str(view.name), str(tile_id))
-                        tile_group_tiles_remaining[rk] = int(tile_group_tiles_remaining.get(rk, 0)) + 1
-                    gpu_worker_pending_task_ids.append(int(gpu_worker_next_dynamic_task_id))
-                    gpu_worker_next_dynamic_task_id += 1
-                    gpu_worker_total_tasks += 1
-                    emitted += 1
-
-            if emitted or dropped_tiles:
-                pct = (100.0 * float(skipped_units) / float(max(1, total_units)))
-                print(
-                    f'T9 ({model_name_s}/{view.name}): {kept_tiles} tile(s) kept, {dropped_tiles} dropped '
-                    f'outright; {emitted} tile-group task(s) emitted; {pct:.1f}% of tile-slices skipped '
-                    'before inference (YOLO_TTA_TILE_SUPPORT_PREFILTER / '
-                    'YOLO_TTA_TILE_CONTENT_PREFILTER = 0 to disable).'
-                )
-            _dispatch_gpu_worker_inference_window()
-            return int(emitted)
-
     def _finalize_fullframe_view_after_worker(model_name_s: str, view: ViewInfo) -> None:
         remaining_key = (str(model_name_s), str(view.name))
         fullframe_remaining[remaining_key] = int(fullframe_remaining.get(remaining_key, 0)) - 1
@@ -43606,7 +43364,7 @@ def main() -> None:
                             Path(str(pth)).unlink(missing_ok=True)
                         except Exception:
                             pass
-            _mark_tile_staged(model_name_s, str(view.name), str(tile_job.config_id), str(tile_job.tile_id))
+            _mark_tile_complete(model_name_s, str(view.name), str(tile_job.tile_id))
             return
         result_shape = tuple(int(v) for v in task.get(
             'processing_shape', view_processing_volume_shape(view, int(task.get('out_size', args.imgsz))),
@@ -43619,11 +43377,16 @@ def main() -> None:
             tile_conf_mm = open_existing_gray_memmap(tile_conf_path, result_shape, 'uint8', mode='r+')
         ptask = TilePostprocessTask(
             model_name=model_name_s, view_name=str(view.name),
+            aug_id=str(view.tta_aug_id), angle_deg=float(view.tta_angle_deg),
             config_id=str(tile_job.config_id), tile_id=str(tile_job.tile_id),
+            parent_crop=tuple(int(v) for v in tile_job.parent_crop),
             tile_mask_mm=tile_mask_mm, tile_confmap_mm=tile_conf_mm,
             tile_mask_path=tile_mask_path, tile_confmap_path=tile_conf_path,
-            precleaned_slice_cleanup=bool(single_angle_streaming_cleanup_active),
+            precleaned_slice_cleanup=bool(angle_variant_streaming_cleanup_active),
             processing_shape=result_shape,
+            threshold_plane_shape=tuple(int(v) for v in task.get(
+                'threshold_plane_shape', view_processing_volume_shape(view, int(task.get('out_size', args.imgsz)))[-2:]
+            )),
         )
         fut = tile_postprocess_executor.submit(
             postprocess_tile_volume_after_inference, ptask,
@@ -43631,31 +43394,6 @@ def main() -> None:
             keep_temp=bool(keep_temp_artifacts), slice_workers=int(tile_slice_postprocess_workers),
         )
         tile_cleanup_futures[fut] = (model_name_s, str(view.name), str(tile_job.config_id), str(tile_job.tile_id))
-
-    def _handle_tile_group_worker_result(task: Dict[str, object], stats: Dict[str, int]) -> None:
-        """The worker already cleaned, hole-filled and OR-ed this group into the canvas.
-
- Nothing is left to read back here -- the scheduler only has to retire the group's
- tiles so the configuration gate can fire once every tile of the configuration has
- landed. This replaces the whole per-tile reopen -> CPU hole fill -> foreground scan ->
- lock-serialized staging chain."""
-        view = task['view']
-        model_name_s = str(task['model_name'])
-        config_id = str(task['config_id'])
-        view_prediction_stats[str(view.summary_family)] = (
-            int(view_prediction_stats.get(str(view.summary_family), 0))
-            + int(stats.get('prediction_count', 0))
-        )
-        tile_group_membership.pop(int(task['task_id']), None)
-        for tile_id in [str(v) for v in task.get('tile_ids', [])]:
-            rk = (model_name_s, str(view.name), str(tile_id))
-            remaining = int(tile_group_tiles_remaining.get(rk, 1)) - 1
-            if remaining > 0:
-                tile_group_tiles_remaining[rk] = int(remaining)
-                continue
-            tile_group_tiles_remaining.pop(rk, None)
-            tile_inference_done.add((model_name_s, str(view.name), str(tile_id)))
-            _mark_tile_staged(model_name_s, str(view.name), str(config_id), str(tile_id))
 
     def _process_one_worker_result(msg: Dict[str, object]) -> None:
         nonlocal gpu_worker_results_collected
@@ -43741,14 +43479,9 @@ def main() -> None:
         _dispatch_gpu_worker_inference_window(_gpu_worker_fullframe_parent_key(task))
         if str(task['kind']) == 'fullframe':
             _handle_fullframe_worker_result(task, stats)
-        elif str(task['kind']) == 'tile_group':
-            _handle_tile_group_worker_result(task, stats)
         else:
             _handle_tile_worker_result(task, stats)
-        if (
-            int(gpu_worker_results_collected) >= int(gpu_worker_total_tasks)
-            and not deferred_tile_jobs_by_parent
-        ):
+        if int(gpu_worker_results_collected) >= int(gpu_worker_total_tasks):
             _set_main_process_gpu_inference_priority_active(False)
             if not bool(gpu_inference_drain_announced):
                 gpu_inference_drain_announced = True
@@ -43759,17 +43492,22 @@ def main() -> None:
                     nrrd_done_now, nrrd_total_now = sink_now.progress_counts()
                 else:
                     nrrd_done_now, nrrd_total_now = 0, 0
-                waiting_tiles_now = sum(
+                waiting_parent_tiles_now = sum(
                     len(value) for value in postprocessed_tiles_waiting_by_parent.values()
+                )
+                waiting_bridge_tiles_now = sum(
+                    len(value) for value in residual_tiles_waiting_by_parent.values()
                 )
                 print('\n=== GPU inference queue drained; scheduler postprocessing continues ===')
                 print(
                     f'Inference tasks completed={int(gpu_worker_results_collected)}/'
                     f'{int(gpu_worker_total_tasks)}; parent_postprocess={len(view_processing_futures)}, '
-                    f'tile_cleanup={len(tile_cleanup_futures)}, tile_finalize={len(tile_finalize_futures)}, '
-                    f'tile_config_gate={len(tile_config_gate_futures)}, '
+                    f'tile_cleanup={len(tile_cleanup_futures)}, '
+                    f'tile_parent_gate={len(tile_parent_gate_futures)}, '
+                    f'tile_bridge_gate={len(tile_bridge_gate_futures)}, '
                     f'tile_consolidation={len(tile_consolidation_futures)}, '
-                    f'waiting_tiles_for_parent={int(waiting_tiles_now)}, '
+                    f'waiting_tiles_for_parent={int(waiting_parent_tiles_now)}, '
+                    f'waiting_residuals_for_bridge={int(waiting_bridge_tiles_now)}, '
                     f'NRRD writes={int(nrrd_done_now)}/{int(nrrd_total_now)}. '
                     'Worker GPUs are now released for eligible output/backprojection stages.'
                 )
@@ -43849,11 +43587,9 @@ def main() -> None:
         _process_one_worker_result(msg)
 
     def _process_inference_outstanding() -> bool:
-        # deferred tile groups are inference work that has not been enqueued yet, so the
-        # scheduler must not treat the queue draining as "inference finished".
         return bool(
             gpu_worker_process_active
-            and (gpu_worker_results_collected < gpu_worker_total_tasks or bool(deferred_tile_jobs_by_parent))
+            and gpu_worker_results_collected < gpu_worker_total_tasks
         )
 
     def _check_gpu_workers_alive() -> None:
@@ -43973,7 +43709,7 @@ def main() -> None:
                                 native_h=int(view_mask_shape[1]),
                                 native_w=int(view_mask_shape[2]),
                                 postprocess_executor=prediction_result_executor,
-                                streaming_cleanup_enabled=bool(single_angle_streaming_cleanup_active),
+                                streaming_cleanup_enabled=bool(angle_variant_streaming_cleanup_active),
                                 streaming_cleanup_min_conf=float(args.min_conf),
                                 streaming_cleanup_min_radius=float(processing_min_radius),
                                 slice_locks=baseline_slice_locks_by_model_view.get((str(model_name), str(view.name))),
@@ -43998,7 +43734,7 @@ def main() -> None:
                                 native_h=int(view_mask_shape[1]),
                                 native_w=int(view_mask_shape[2]),
                                 postprocess_workers=predict_postprocess_workers,
-                                streaming_cleanup_enabled=bool(single_angle_streaming_cleanup_active),
+                                streaming_cleanup_enabled=bool(angle_variant_streaming_cleanup_active),
                                 streaming_cleanup_min_conf=float(args.min_conf),
                                 streaming_cleanup_min_radius=float(processing_min_radius),
                                 slice_locks=baseline_slice_locks_by_model_view.get((str(model_name), str(view.name))),
@@ -44029,12 +43765,13 @@ def main() -> None:
                     )
 
                 print(f"Inferencing tile in-memory volume: {model_name}/{view.name}/{tile_job.tile_id}")
-                tile_shape = view_processing_volume_shape(view, int(args.imgsz))
-                tile_processing_affine = output_to_view_processing_affine(
-                    view, tile_job.M_out_to_src, int(args.imgsz),
-                )
+                parent_processing_shape = view_processing_volume_shape(view, int(args.imgsz))
+                py0, py1, px0, px1 = (int(v) for v in tile_job.parent_crop)
+                tile_shape = (int(view.num_slices), int(py1 - py0), int(px1 - px0))
+                tile_processing_affine = np.asarray(tile_job.M_out_to_crop, dtype=np.float32)
+                tile_threshold_plane_shape = tuple(int(v) for v in parent_processing_shape[-2:])
                 tile_processing_min_radius = view_processing_min_radius(
-                    view, float(args.min_radius), tile_shape[-2:],
+                    view, float(args.min_radius), tile_threshold_plane_shape,
                 )
                 tile_mask_path = temp_dir / 'tile_volumes' / model_name / view.name / f'{tile_job.tile_id}.u8.dat'
                 tile_conf_path = temp_dir / 'tile_volumes' / model_name / view.name / f'{tile_job.tile_id}.confmap.u8.dat'
@@ -44075,7 +43812,7 @@ def main() -> None:
                             native_h=int(tile_shape[1]),
                             native_w=int(tile_shape[2]),
                             postprocess_executor=prediction_result_executor,
-                            streaming_cleanup_enabled=bool(single_angle_streaming_cleanup_active),
+                            streaming_cleanup_enabled=bool(angle_variant_streaming_cleanup_active),
                             streaming_cleanup_min_conf=float(args.min_conf),
                             streaming_cleanup_min_radius=float(tile_processing_min_radius),
                         )
@@ -44088,6 +43825,7 @@ def main() -> None:
                             'tile_conf_mm': tile_conf_mm,
                             'tile_mask_path': tile_mask_path,
                             'tile_conf_path': tile_conf_store_path,
+                            'threshold_plane_shape': tile_threshold_plane_shape,
                             'yolo': yolo,
                         })
                     else:
@@ -44103,7 +43841,7 @@ def main() -> None:
                             native_h=int(tile_shape[1]),
                             native_w=int(tile_shape[2]),
                             postprocess_workers=predict_postprocess_workers,
-                            streaming_cleanup_enabled=bool(single_angle_streaming_cleanup_active),
+                            streaming_cleanup_enabled=bool(angle_variant_streaming_cleanup_active),
                             streaming_cleanup_min_conf=float(args.min_conf),
                             streaming_cleanup_min_radius=float(tile_processing_min_radius),
                         )
@@ -44125,20 +43863,24 @@ def main() -> None:
                                         tile_conf_path.unlink(missing_ok=True)
                                     except Exception:
                                         pass
-                            _mark_tile_staged(str(model_name), str(view.name), str(tile_job.config_id), str(tile_job.tile_id))
+                            _mark_tile_complete(str(model_name), str(view.name), str(tile_job.tile_id))
                             continue
 
                         task = TilePostprocessTask(
                             model_name=str(model_name),
                             view_name=str(view.name),
+                            aug_id=str(view.tta_aug_id),
+                            angle_deg=float(view.tta_angle_deg),
                             config_id=str(tile_job.config_id),
                             tile_id=str(tile_job.tile_id),
+                            parent_crop=tuple(int(v) for v in tile_job.parent_crop),
                             tile_mask_mm=tile_mask_mm,
                             tile_confmap_mm=tile_conf_mm,
                             tile_mask_path=tile_mask_path,
                             tile_confmap_path=tile_conf_store_path,
-                            precleaned_slice_cleanup=bool(single_angle_streaming_cleanup_active),
+                            precleaned_slice_cleanup=bool(angle_variant_streaming_cleanup_active),
                             processing_shape=tile_shape,
+                            threshold_plane_shape=tile_threshold_plane_shape,
                         )
                         fut = tile_postprocess_executor.submit(
                             postprocess_tile_volume_after_inference,
@@ -44159,50 +43901,59 @@ def main() -> None:
             waitables.extend(list(prediction_accumulation_futures.keys()))
             waitables.extend(list(view_processing_futures.keys()))
             waitables.extend(list(tile_cleanup_futures.keys()))
-            waitables.extend(list(tile_finalize_futures.keys()))
-            waitables.extend(list(tile_config_gate_futures.keys()))
+            waitables.extend(list(tile_parent_gate_futures.keys()))
+            waitables.extend(list(tile_bridge_gate_futures.keys()))
             waitables.extend(list(tile_consolidation_futures.keys()))
             if not waitables:
+                _drain_parent_mask_ready_events()
                 _flush_ready_postprocessed_tiles()
+                _flush_ready_residual_tiles()
                 _pump_prediction_volume_build_queue()
-                # safety valve: nothing is pending that could ever deliver parent support,
-                # yet tiles are still deferred. Emit their groups unfiltered rather than
-                # spinning on a result queue that has no work left to produce.
-                if (
-                    tile_group_dispatch_active
-                    and deferred_tile_jobs_by_parent
-                    and not view_processing_futures
-                    and int(gpu_worker_results_collected) >= int(gpu_worker_total_tasks)
-                ):
-                    for stalled_key in list(deferred_tile_jobs_by_parent.keys()):
-                        stalled_model, stalled_view = stalled_key
-                        print(
-                            f'Tile groups for {stalled_model}/{stalled_view} were still deferred with no '
-                            'pending parent work; dispatching them without the support prefilter.'
-                        )
-                        _build_tile_group_tasks_for_view(
-                            str(stalled_model), view_infos_by_name[str(stalled_view)],
-                        )
-                    continue
                 if gpu_worker_process_active and _process_inference_outstanding():
                     # GPU worker processes are still inferencing but no CPU-side future is pending;
                     # block briefly on the process result queue so the loop wakes on the next result.
                     _wait_for_one_process_result(timeout=0.5)
                     _check_gpu_workers_alive()
                     continue
-                if (
+                scheduler_quiescent = bool(
                     not pending_prediction_build_jobs and
                     not pending_prediction_volume_futures and
                     not prediction_accumulation_futures and
                     not _process_inference_outstanding() and
                     not ready_fullframe and
                     not ready_tile_infer and
-                    not tile_finalize_futures and
-                    not tile_config_gate_futures and
+                    not tile_parent_gate_futures and
+                    not tile_bridge_gate_futures and
                     not tile_cleanup_futures and
                     not tile_consolidation_futures and
                     not view_processing_futures
-                ):
+                )
+                if scheduler_quiescent:
+                    waiting_parent = {
+                        key: sorted(waiting)
+                        for key, waiting in postprocessed_tiles_waiting_by_parent.items()
+                        if waiting
+                    }
+                    waiting_bridge = {
+                        key: sorted(waiting)
+                        for key, waiting in residual_tiles_waiting_by_parent.items()
+                        if waiting
+                    }
+                    incomplete_tiles = {
+                        key: {
+                            'completed': len(tile_completed_by_parent.get(key, set())),
+                            'expected': int(expected),
+                        }
+                        for key, expected in tile_expected_by_parent.items()
+                        if len(tile_completed_by_parent.get(key, set())) < int(expected)
+                    }
+                    if waiting_parent or waiting_bridge or incomplete_tiles:
+                        raise RuntimeError(
+                            'Tile scheduler became quiescent with unresolved two-stage gate '
+                            f'dependencies: waiting_for_parent={waiting_parent}, '
+                            f'waiting_for_bridge={waiting_bridge}, '
+                            f'incomplete_tiles={incomplete_tiles}'
+                        )
                     break
                 continue
             _log_scheduler_wait_state()
@@ -44488,11 +44239,38 @@ def main() -> None:
 
     output_manager.reap_completed()
 
-    print('\n=== Building final single-model view union after the global view union ===')
+    # v16.4.0 keeps every TTA angle independent through cleanup, interpolation, tiling,
+    # and NRRD emission. Collapse dense angle variants exactly once here, immediately before
+    # the physical-view/global union. This restores the physical Cartesian keys required by
+    # the terminal axis-aware assembler and retires redundant per-angle dense workspaces.
+    retired_tta_volume_ids: set[int] = set()
+    view_volumes_by_model = collapse_tta_variant_volumes_to_physical_views(
+        view_volumes_by_model,
+        views,
+        workers=int(tail_slice_workers),
+        retired_volume_ids=retired_tta_volume_ids,
+    )
+    release_unretained_volume_maps(
+        (
+            native_view_support_by_model,
+            radial_native_output_by_model,
+            tilted_native_output_by_model,
+        ),
+        view_volumes_by_model,
+        already_retired_ids=retired_tta_volume_ids,
+    )
+    spec_notes.append(
+        'v16.4.0 TTA-angle finalization: every --angle variant remained independent through '
+        'cleanup, interpolation, per-tile parent/bridge gating, and component-layer output; '
+        'dense variants were OR-collapsed only at physical-view finalization immediately before '
+        'the global view union. The retired unified-angle path is unavailable.'
+    )
+
+    print('\n=== Building final single-model view union after physical-view TTA collapse ===')
     # the union is assembled at ORIGINAL SOURCE dimensions.
     # Cartesian working stacks are restored working->source with one resample while merging;
     # radial/tilted volumes arrive already backprojected to source geometry. Void fill,
-    # Gaussian smoothing (sigma in SOURCE voxels), and --keep_objects all run at source dims.
+    # Gaussian smoothing (sigma in SOURCE voxels) and postprocessing keep_objects run at source dimensions.
     final_union_mm = assemble_final_union_after_view_union(
         view_volumes_by_model=view_volumes_by_model,
         T=T,
@@ -44763,7 +44541,7 @@ def main() -> None:
             spec_notes.append(
                 f'Low-quality NRRD decomposition (v13.2.1, bug #2): {int(legacy_lq_nrrd_count)} legacy '
                 'downbinned single-layer NRRD file(s) written under low_quality/<token>/nrrd/, mirroring the '
-                'full-quality component layers per --low_quality_downbin spec and written on the same '
+                'full-quality component layers per --save low_quality[:LOW_QUALITY_DOWNBIN] spec and written on the same '
                 f'view-completion schedule. Each downbin has its own {OUTPUT_NRRD_PREFIX}{{Filestem}}_nrrd_manifest.json with layer '
                 'suffixes matching the full-quality nrrd/ folder.'
             )
@@ -44843,14 +44621,6 @@ def main() -> None:
         for mm in model_support.values():
             close_raw_store_or_memmap_volume(mm, keep_temp=bool(keep_temp_artifacts))
         model_support.clear()
-    for mm in tile_config_accumulator_by_key.values():
-        archive_or_delete_binary_volume_storage(
-            mm,
-            keep_temp=bool(keep_temp_artifacts),
-            workers=int(tail_tile_slice_workers),
-            desc='remaining tile config accumulator',
-        )
-    tile_config_accumulator_by_key.clear()
     for mm in tile_accumulator_by_parent.values():
         archive_or_delete_binary_volume_storage(
             mm,
@@ -44929,7 +44699,7 @@ def main() -> None:
 
 # v16.1.7 retains the production bundle and materializes sparse-union destination pages in parallel.
 # v16.1.8 defaults Radial sampling to the hardware-linear texture, adds bilinear in-plane Tilted forward inputs (mask backprojection stays nearest/exact), and retries transient ffmpeg launch failures before failing the pipeline loudly.
-# v16.2.0 unifies output selection under --save, makes native-resolution overlay and summary explicit, and renames --low_quality_downbin without changing output paths or filenames.
+# v16.4.0 embeds low-quality downbins in --save and consolidates final-volume operations under --postprocessing.
 # v16.2.1 prevents hardware-texture Radial startup false positives by allowing one raster-perimeter-equivalent high-error seam while retaining the strict mean and broad-mismatch gates.
 # v16.2.2 wraps radial channel context, saves C>=5 view inputs as multi-page TIFFs, removes --troubleshooting, and drops legacy environment-variable aliases.
 # v16.3.0 adds structured Radial/Tilted/Tile view flags, renames interpolation flags, keeps component-NRRD streaming continuous through topology, and removes dead environment controls.
