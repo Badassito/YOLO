@@ -66,8 +66,8 @@ import numpy as np
 
 GIB = 1024 ** 3
 NRRD_SPACE = "left-posterior-superior"
-SCRIPT_VERSION = '16.4.0'
-SCRIPT_VERSION_COMPACT = '1640'
+SCRIPT_VERSION = '16.4.1'
+SCRIPT_VERSION_COMPACT = '1641'
 SCRIPT_BASENAME = f'GPT-5.6-Sol-Pro_v{SCRIPT_VERSION}_SLURM.py'
 OUTPUT_NRRD_PREFIX = ''
 LEGACY_OUTPUT_NRRD_PREFIX = 'HW_'
@@ -22072,7 +22072,7 @@ def _try_resident_trt_ring_accumulate(
         or int(getattr(source, 'bs', 0)) != 1
         or int(getattr(source, 'nf', -1)) != int(num_frames)
         or str(getattr(getattr(source, 'engine', None), '_mode', '')) != 'resident'
-        or (not all_identity and not resident_trt_native_warp_enabled())
+        or (not identity and not resident_trt_native_warp_enabled())
     ):
         return _decline()
     trt_engine = None if backend is None else _trt_engine_from_autobackend(backend)
@@ -39666,7 +39666,7 @@ def main() -> None:
     save_summary_enabled = 'summary' in save_option_set
     channel_format = resolve_channel_format(args.channel_format)
     print(
-        '[v16.4.0] every --angle value is an independent view variant through cleanup, '
+        f'[v{SCRIPT_VERSION}] every --angle value is an independent view variant through cleanup, '
         'interpolation, tile gating, NRRD decomposition, and final per-view union. Tile '
         'components are gated individually against their same-angle parent YOLO mask, then '
         'only the residual components are re-gated against same-angle parent bridges. The '
@@ -39711,7 +39711,7 @@ def main() -> None:
     if not model_path:
         raise ValueError('--model must specify one YOLO segmentation model path')
     if ',' in model_path:
-        raise ValueError('GPT-5.6-Sol-Pro v16.4.0 accepts a single --model path; multiple-model inference has been removed')
+        raise ValueError(f'GPT-5.6-Sol-Pro v{SCRIPT_VERSION} accepts a single --model path; multiple-model inference has been removed')
     model_path_resolved = str(Path(model_path).expanduser().resolve())
     if not Path(model_path_resolved).exists():
         raise FileNotFoundError(model_path_resolved)
@@ -44700,6 +44700,7 @@ def main() -> None:
 # v16.1.7 retains the production bundle and materializes sparse-union destination pages in parallel.
 # v16.1.8 defaults Radial sampling to the hardware-linear texture, adds bilinear in-plane Tilted forward inputs (mask backprojection stays nearest/exact), and retries transient ffmpeg launch failures before failing the pipeline loudly.
 # v16.4.0 embeds low-quality downbins in --save and consolidates final-volume operations under --postprocessing.
+# v16.4.1 fixes the resident TensorRT ring static-affine gate after grouped-source removal: the task-local identity result now replaces the retired all_identity aggregate.
 # v16.2.1 prevents hardware-texture Radial startup false positives by allowing one raster-perimeter-equivalent high-error seam while retaining the strict mean and broad-mismatch gates.
 # v16.2.2 wraps radial channel context, saves C>=5 view inputs as multi-page TIFFs, removes --troubleshooting, and drops legacy environment-variable aliases.
 # v16.3.0 adds structured Radial/Tilted/Tile view flags, renames interpolation flags, keeps component-NRRD streaming continuous through topology, and removes dead environment controls.
