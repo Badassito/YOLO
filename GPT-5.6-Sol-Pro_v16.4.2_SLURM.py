@@ -66,8 +66,8 @@ import numpy as np
 
 GIB = 1024 ** 3
 NRRD_SPACE = "left-posterior-superior"
-SCRIPT_VERSION = '16.4.1'
-SCRIPT_VERSION_COMPACT = '1641'
+SCRIPT_VERSION = '16.4.2'
+SCRIPT_VERSION_COMPACT = '1642'
 SCRIPT_BASENAME = f'GPT-5.6-Sol-Pro_v{SCRIPT_VERSION}_SLURM.py'
 OUTPUT_NRRD_PREFIX = ''
 LEGACY_OUTPUT_NRRD_PREFIX = 'HW_'
@@ -17289,12 +17289,21 @@ def run_prediction_volume_in_worker(
                 )
                 result_conf = result_conf_full[slice_offset:slice_offset + slice_count]
         else:
+            result_open_mode = (
+                'r+' if bool(task.get('result_workspace_preallocated', False)) else 'w+'
+            )
             result_mask = np.memmap(
-                Path(str(task['result_mask_path'])), dtype=np.uint8, mode='w+', shape=result_shape,
+                Path(str(task['result_mask_path'])),
+                dtype=np.uint8,
+                mode=result_open_mode,
+                shape=result_shape,
             )
             if task.get('result_conf_path'):
                 result_conf = np.memmap(
-                    Path(str(task['result_conf_path'])), dtype=np.uint8, mode='w+', shape=result_shape,
+                    Path(str(task['result_conf_path'])),
+                    dtype=np.uint8,
+                    mode=result_open_mode,
+                    shape=result_shape,
                 )
 
         # Keep the source/native view plane resident whenever the worker has VRAM headroom.
@@ -32772,6 +32781,56 @@ def _read_binary_volume_slice_bool(volume: object, idx: int) -> np.ndarray:
     return np.asarray(_read_binary_volume_slice_u8(volume, int(idx)), dtype=np.uint8) > 0
 
 
+def _read_binary_volume_slice_crop_bool(
+    volume: object,
+    idx: int,
+    y0: int,
+    y1: int,
+    x0: int,
+    x1: int,
+) -> np.ndarray:
+    """Read only one requested support crop, preserving sparse raw-bbox storage."""
+    shape = _volume_shape_tuple(volume)
+    z = int(idx)
+    y0_i, y1_i, x0_i, x1_i = int(y0), int(y1), int(x0), int(x1)
+    if not (
+        0 <= z < int(shape[0])
+        and 0 <= y0_i <= y1_i <= int(shape[1])
+        and 0 <= x0_i <= x1_i <= int(shape[2])
+    ):
+        raise IndexError(
+            f'binary-volume crop {(z, y0_i, y1_i, x0_i, x1_i)} outside {shape}'
+        )
+    out = np.zeros((int(y1_i - y0_i), int(x1_i - x0_i)), dtype=bool)
+    if out.size <= 0:
+        return out
+    if isinstance(volume, RawBBoxMaskStore):
+        decoded = volume.decode_slice_crop(int(z), dtype=np.uint8)
+        if decoded is None:
+            return out
+        sy0, sx0, sy1, sx1, crop = decoded
+        iy0 = max(int(y0_i), int(sy0))
+        iy1 = min(int(y1_i), int(sy1))
+        ix0 = max(int(x0_i), int(sx0))
+        ix1 = min(int(x1_i), int(sx1))
+        if int(iy1) <= int(iy0) or int(ix1) <= int(ix0):
+            return out
+        out[
+            int(iy0 - y0_i):int(iy1 - y0_i),
+            int(ix0 - x0_i):int(ix1 - x0_i),
+        ] = np.asarray(crop)[
+            int(iy0 - sy0):int(iy1 - sy0),
+            int(ix0 - sx0):int(ix1 - sx0),
+        ] > 0
+        return out
+    return np.asarray(
+        _read_binary_volume_slice_u8(volume, int(z))[
+            int(y0_i):int(y1_i), int(x0_i):int(x1_i)
+        ],
+        dtype=np.uint8,
+    ) > 0
+
+
 def subtract_volume_to_raw_bbox_store(
     after_mm: np.ndarray,
     before_volume: object,
@@ -32858,11 +32917,20 @@ def tile_intermediate_accumulator_reserve_bytes() -> int:
     return int(min(max(floor_bytes, proportional), max(floor_bytes, cap_bytes)))
 
 
-def waiting_tile_spill_enabled() -> bool:
-    """Return whether postprocessed tiles waiting for parent support spill to raw bbox stores.
-    
-    The default keeps them in RAM when admission permits."""
-    return _env_flag('YOLO_TTA_SPILL_WAITING_TILES', False)
+def tile_dense_worker_result_limit_bytes() -> int:
+    """Bound live dense per-tile GPU-worker result files before sparse retirement.
+
+    The limit is a hard scheduling backpressure budget, not a storage target. A single tile
+    larger than the budget is still admitted when no other dense tile result is live, so valid
+    geometries cannot deadlock. Waiting parent/bridge masks are always converted to crop-local
+    raw-bbox stores; there is no dense-waiting compatibility path in v16.4.2.
+    """
+    return int(max(1.0, _env_float('YOLO_TTA_TILE_DENSE_RESULT_MAX_GIB', 96.0)) * GIB)
+
+
+def tile_dense_worker_result_limit_tasks() -> int:
+    """Bound live dense tile mappings/fds even when each crop is individually small."""
+    return max(1, _env_int('YOLO_TTA_TILE_DENSE_RESULT_MAX_TASKS', 64))
 
 
 def archive_or_delete_binary_volume_storage(
@@ -34113,7 +34181,9 @@ def gate_tile_components_against_support_inplace(
         sizes = np.asarray(stats[:num_labels, cv2.CC_STAT_AREA], dtype=np.int64)
         present = sizes > 0
         present[0] = False
-        support_slice = _read_binary_volume_slice_bool(support_mm, int(idx))[py0:py1, px0:px1]
+        support_slice = _read_binary_volume_slice_crop_bool(
+            support_mm, int(idx), int(py0), int(py1), int(px0), int(px1),
+        )
         if tuple(int(v) for v in support_slice.shape) != expected_local:
             raise ValueError(
                 f'{desc}: support crop shape {tuple(int(v) for v in support_slice.shape)} '
@@ -34160,7 +34230,318 @@ def gate_tile_components_against_support_inplace(
 
 
 
+def _partition_tile_components_2d(
+    tile_plane: np.ndarray,
+    support_plane: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int, int, int]]:
+    """Partition one tile-local slice into whole accepted and rejected components."""
+    tile_bool = np.asarray(tile_plane, dtype=np.uint8) > 0
+    support_bool = np.asarray(support_plane, dtype=np.uint8) > 0
+    if tuple(int(v) for v in tile_bool.shape) != tuple(int(v) for v in support_bool.shape):
+        raise ValueError(
+            f'tile/support plane mismatch {tuple(tile_bool.shape)} != {tuple(support_bool.shape)}'
+        )
+    if not bool(np.any(tile_bool)):
+        zeros = np.zeros(tile_bool.shape, dtype=np.uint8)
+        return zeros, zeros.copy(), (0, 0, 0, 0)
 
+    num_labels, labels2d, stats, _centroids = cv2.connectedComponentsWithStats(
+        np.ascontiguousarray(tile_bool, dtype=np.uint8),
+        connectivity=8,
+        ltype=cv2.CV_32S,
+    )
+    num_labels = int(num_labels)
+    if num_labels <= 1:
+        zeros = np.zeros(tile_bool.shape, dtype=np.uint8)
+        return zeros, zeros.copy(), (0, 0, 0, 0)
+
+    sizes = np.asarray(stats[:num_labels, cv2.CC_STAT_AREA], dtype=np.int64)
+    present = sizes > 0
+    present[0] = False
+    hits = np.bincount(labels2d[support_bool], minlength=num_labels)[:num_labels] > 0
+    accepted_labels = present & hits
+    rejected_labels = present & (~accepted_labels)
+    accepted = accepted_labels[labels2d].astype(np.uint8, copy=False)
+    rejected = rejected_labels[labels2d].astype(np.uint8, copy=False)
+    return accepted, rejected, (
+        int(np.count_nonzero(accepted_labels)),
+        int(np.count_nonzero(rejected_labels)),
+        int(sizes[accepted_labels].sum()) if bool(np.any(accepted_labels)) else 0,
+        int(sizes[rejected_labels].sum()) if bool(np.any(rejected_labels)) else 0,
+    )
+
+
+def _or_sparse_tile_crop_into_parent(
+    dst_mm: Optional[np.ndarray],
+    locks: Optional[Sequence[threading.Lock]],
+    *,
+    idx: int,
+    y0: int,
+    y1: int,
+    x0: int,
+    x1: int,
+    crop_u8: np.ndarray,
+) -> None:
+    if dst_mm is None or not bool(np.any(crop_u8)):
+        return
+    lock_count = int(len(locks)) if locks else 0
+    lock = locks[int(idx) % int(lock_count)] if locks is not None and lock_count > 0 else None
+    ctx = lock if lock is not None else contextlib.nullcontext()
+    with ctx:
+        dst = dst_mm[int(idx), int(y0):int(y1), int(x0):int(x1)]
+        if tuple(int(v) for v in dst.shape) != tuple(int(v) for v in crop_u8.shape):
+            raise ValueError(
+                f'sparse tile OR destination {tuple(dst.shape)} != crop {tuple(crop_u8.shape)}'
+            )
+        np.bitwise_or(dst, np.asarray(crop_u8, dtype=np.uint8), out=dst)
+
+
+def gate_raw_bbox_tile_store_against_parent_mask(
+    result: TilePostprocessResult,
+    *,
+    parent_mask_support_mm: object,
+    tile_accumulator_mm: np.ndarray,
+    tile_accumulator_locks: Optional[Sequence[threading.Lock]],
+    work_dir: Path,
+    keep_temp: bool,
+    slice_workers: int,
+    tile_parent_mask_accumulator_mm: Optional[np.ndarray] = None,
+    tile_parent_mask_accumulator_locks: Optional[Sequence[threading.Lock]] = None,
+) -> TileParentGateResult:
+    """Parent-gate a waiting CTILE directly, emitting only a sparse residual CTILE."""
+    store = result.tile_mask_store
+    if store is None:
+        raise ValueError('Sparse parent tile gate requires tile_mask_store')
+    py0, py1, px0, px1 = (int(v) for v in result.parent_crop)
+    support_shape = _volume_shape_tuple(parent_mask_support_mm)
+    if tuple(int(v) for v in tile_accumulator_mm.shape) != support_shape:
+        raise ValueError(
+            f'Sparse parent tile gate support/accumulator mismatch '
+            f'{support_shape} != {tuple(int(v) for v in tile_accumulator_mm.shape)}'
+        )
+    expected_shape = (int(support_shape[0]), int(py1 - py0), int(px1 - px0))
+    if tuple(int(v) for v in store.shape) != expected_shape:
+        raise ValueError(
+            f'Sparse parent tile gate store shape {store.shape} != {expected_shape}'
+        )
+    if tile_parent_mask_accumulator_mm is not None and (
+        tuple(int(v) for v in tile_parent_mask_accumulator_mm.shape) != support_shape
+    ):
+        raise ValueError('Sparse parent tile category accumulator shape mismatch')
+
+    residual_dir = (
+        Path(work_dir) / result.model_name / result.view_name / result.config_id /
+        f'{result.tile_id}.parent_residual.ctile'
+    )
+    per_slice = np.zeros((int(store.shape[0]), 4), dtype=np.int64)
+
+    def _encode_residual(idx: int) -> RawBBoxSlicePayload:
+        decoded = store.decode_slice_crop(int(idx), dtype=np.uint8)
+        if decoded is None:
+            return RawBBoxSlicePayload(idx=int(idx), is_empty=True)
+        local_y0, local_x0, local_y1, local_x1, tile_crop = decoded
+        global_y0 = int(py0) + int(local_y0)
+        global_y1 = int(py0) + int(local_y1)
+        global_x0 = int(px0) + int(local_x0)
+        global_x1 = int(px0) + int(local_x1)
+        support_slice = _read_binary_volume_slice_crop_bool(
+            parent_mask_support_mm, int(idx),
+            int(global_y0), int(global_y1), int(global_x0), int(global_x1),
+        )
+        accepted, rejected, stats = _partition_tile_components_2d(tile_crop, support_slice)
+        per_slice[int(idx)] = np.asarray(stats, dtype=np.int64)
+        _or_sparse_tile_crop_into_parent(
+            tile_accumulator_mm,
+            tile_accumulator_locks,
+            idx=int(idx),
+            y0=int(global_y0), y1=int(global_y1),
+            x0=int(global_x0), x1=int(global_x1),
+            crop_u8=accepted,
+        )
+        _or_sparse_tile_crop_into_parent(
+            tile_parent_mask_accumulator_mm,
+            tile_parent_mask_accumulator_locks,
+            idx=int(idx),
+            y0=int(global_y0), y1=int(global_y1),
+            x0=int(global_x0), x1=int(global_x1),
+            crop_u8=accepted,
+        )
+        payload = _encode_bool_mask_slice_payload(int(idx), rejected)
+        if bool(payload.is_empty):
+            return payload
+        return dataclasses_replace(
+            payload,
+            y0=int(payload.y0) + int(local_y0),
+            y1=int(payload.y1) + int(local_y0),
+            x0=int(payload.x0) + int(local_x0),
+            x1=int(payload.x1) + int(local_x0),
+        )
+
+    try:
+        residual_stats = _write_raw_bbox_payload_store(
+            shape=tuple(int(v) for v in store.shape),
+            store_dir=residual_dir,
+            encode_slice=_encode_residual,
+            format_name=CTILE_FORMAT,
+            desc=(
+                f'Parent-failed tile residual {result.model_name}/'
+                f'{result.view_name}/{result.tile_id}'
+            ),
+            workers=int(slice_workers),
+            extra_meta={
+                'parent_crop': [int(py0), int(py1), int(px0), int(px1)],
+                'tta_aug_id': str(result.aug_id),
+                'tta_angle_deg': float(result.angle_deg),
+                'source_tile_store': str(store.root),
+                'gate': 'parent_mask',
+            },
+        )
+    finally:
+        if bool(keep_temp):
+            store.close()
+        else:
+            store.unlink()
+
+    totals = np.sum(per_slice, axis=0, dtype=np.int64)
+    gate_stats = {
+        'accepted_components': int(totals[0]),
+        'rejected_components': int(totals[1]),
+        'accepted_voxels': int(totals[2]),
+        'rejected_voxels': int(totals[3]),
+    }
+    residual_result: Optional[TilePostprocessResult] = None
+    if int(gate_stats['rejected_voxels']) > 0:
+        residual_store = RawBBoxMaskStore.open(residual_dir, mmap_payload=True)
+        residual_result = TilePostprocessResult(
+            model_name=str(result.model_name),
+            view_name=str(result.view_name),
+            aug_id=str(result.aug_id),
+            angle_deg=float(result.angle_deg),
+            config_id=str(result.config_id),
+            tile_id=str(result.tile_id),
+            parent_crop=tuple(int(v) for v in result.parent_crop),
+            tile_mask_mm=None,
+            tile_mask_path=residual_dir,
+            tile_mask_store=residual_store,
+        )
+        runtime_telemetry().add(
+            'tile.parent_residual_ctile_payload_bytes',
+            int(residual_stats.get('raw_payload_bytes', 0)),
+        )
+    else:
+        release_memfd_owners_under(residual_dir)
+        shutil.rmtree(residual_dir, ignore_errors=True)
+
+    return TileParentGateResult(
+        model_name=str(result.model_name),
+        view_name=str(result.view_name),
+        aug_id=str(result.aug_id),
+        angle_deg=float(result.angle_deg),
+        config_id=str(result.config_id),
+        tile_id=str(result.tile_id),
+        gate_stats=gate_stats,
+        residual_result=residual_result,
+    )
+
+
+def gate_raw_bbox_tile_store_against_parent_bridge(
+    result: TilePostprocessResult,
+    *,
+    parent_bridge_support_mm: object,
+    tile_accumulator_mm: np.ndarray,
+    tile_accumulator_locks: Optional[Sequence[threading.Lock]],
+    keep_temp: bool,
+    slice_workers: int,
+    tile_parent_bridge_accumulator_mm: Optional[np.ndarray] = None,
+    tile_parent_bridge_accumulator_locks: Optional[Sequence[threading.Lock]] = None,
+) -> TileGateResult:
+    """Bridge-gate a sparse parent residual without reconstructing a dense volume."""
+    store = result.tile_mask_store
+    if store is None:
+        raise ValueError('Sparse bridge tile gate requires tile_mask_store')
+    py0, py1, px0, px1 = (int(v) for v in result.parent_crop)
+    support_shape = _volume_shape_tuple(parent_bridge_support_mm)
+    if tuple(int(v) for v in tile_accumulator_mm.shape) != support_shape:
+        raise ValueError('Sparse bridge tile gate support/accumulator shape mismatch')
+    expected_shape = (int(support_shape[0]), int(py1 - py0), int(px1 - px0))
+    if tuple(int(v) for v in store.shape) != expected_shape:
+        raise ValueError(
+            f'Sparse bridge tile gate store shape {store.shape} != {expected_shape}'
+        )
+    if tile_parent_bridge_accumulator_mm is not None and (
+        tuple(int(v) for v in tile_parent_bridge_accumulator_mm.shape) != support_shape
+    ):
+        raise ValueError('Sparse bridge tile category accumulator shape mismatch')
+
+    per_slice = np.zeros((int(store.shape[0]), 4), dtype=np.int64)
+
+    def _process(idx: int) -> None:
+        decoded = store.decode_slice_crop(int(idx), dtype=np.uint8)
+        if decoded is None:
+            return
+        local_y0, local_x0, local_y1, local_x1, tile_crop = decoded
+        global_y0 = int(py0) + int(local_y0)
+        global_y1 = int(py0) + int(local_y1)
+        global_x0 = int(px0) + int(local_x0)
+        global_x1 = int(px0) + int(local_x1)
+        support_slice = _read_binary_volume_slice_crop_bool(
+            parent_bridge_support_mm, int(idx),
+            int(global_y0), int(global_y1), int(global_x0), int(global_x1),
+        )
+        accepted, _rejected, stats = _partition_tile_components_2d(tile_crop, support_slice)
+        per_slice[int(idx)] = np.asarray(stats, dtype=np.int64)
+        _or_sparse_tile_crop_into_parent(
+            tile_accumulator_mm,
+            tile_accumulator_locks,
+            idx=int(idx),
+            y0=int(global_y0), y1=int(global_y1),
+            x0=int(global_x0), x1=int(global_x1),
+            crop_u8=accepted,
+        )
+        _or_sparse_tile_crop_into_parent(
+            tile_parent_bridge_accumulator_mm,
+            tile_parent_bridge_accumulator_locks,
+            idx=int(idx),
+            y0=int(global_y0), y1=int(global_y1),
+            x0=int(global_x0), x1=int(global_x1),
+            crop_u8=accepted,
+        )
+
+    try:
+        parallel_for_indices_chunked(
+            int(store.shape[0]),
+            _process,
+            max_workers=choose_slice_parallel_workers(
+                int(slice_workers), max(1, int(store.shape[0])),
+            ),
+            desc=(
+                f'Sparse parent-bridge tile gate '
+                f'{result.model_name}/{result.view_name}/{result.tile_id}'
+            ),
+            show_progress=False,
+            target_chunks_per_worker=2,
+        )
+    finally:
+        if bool(keep_temp):
+            store.close()
+        else:
+            store.unlink()
+
+    totals = np.sum(per_slice, axis=0, dtype=np.int64)
+    return TileGateResult(
+        model_name=str(result.model_name),
+        view_name=str(result.view_name),
+        aug_id=str(result.aug_id),
+        angle_deg=float(result.angle_deg),
+        config_id=str(result.config_id),
+        tile_id=str(result.tile_id),
+        gate_stats={
+            'accepted_components': int(totals[0]),
+            'rejected_components': int(totals[1]),
+            'accepted_voxels': int(totals[2]),
+            'rejected_voxels': int(totals[3]),
+        },
+    )
 
 
 def postprocess_tile_volume_after_inference(
@@ -34257,7 +34638,7 @@ def spill_waiting_tile_result_to_raw_store(
         temp_dir / 'waiting_tiles' / result.model_name / result.view_name /
         result.config_id / f'{result.tile_id}.ctile'
     )
-    write_raw_bbox_mask_store(
+    store_stats = write_raw_bbox_mask_store(
         tile_arr,
         store_dir,
         format_name=CTILE_FORMAT,
@@ -34272,6 +34653,13 @@ def spill_waiting_tile_result_to_raw_store(
             'tta_aug_id': str(result.aug_id),
             'tta_angle_deg': float(result.angle_deg),
         },
+    )
+    runtime_telemetry().add(
+        'tile.ctile_logical_dense_bytes_retired',
+        int(store_stats.get('logical_raw_uint8_bytes', int(tile_arr.nbytes))),
+    )
+    runtime_telemetry().add(
+        'tile.ctile_payload_bytes', int(store_stats.get('raw_payload_bytes', 0)),
     )
 
     tile_shape = tuple(int(x) for x in tile_arr.shape)
@@ -34322,11 +34710,10 @@ def load_waiting_tile_result_from_raw_store(waiting: DeferredTilePostprocessResu
 
 def _delete_tile_result_storage(result: TilePostprocessResult, *, keep_temp: bool) -> None:
     if result.tile_mask_store is not None:
-        try:
+        if bool(keep_temp):
             result.tile_mask_store.close()
-        finally:
-            if not bool(keep_temp):
-                result.tile_mask_store.unlink()
+        else:
+            result.tile_mask_store.unlink()
         return
     if not bool(keep_temp) and result.tile_mask_path is not None:
         try:
@@ -34349,33 +34736,27 @@ def gate_tile_result_against_parent_mask(
     tile_parent_mask_accumulator_mm: Optional[np.ndarray] = None,
     tile_parent_mask_accumulator_locks: Optional[Sequence[threading.Lock]] = None,
 ) -> TileParentGateResult:
-    """Accept parent-supported components and retain every failed component as a residual."""
+    """Accept parent-supported components and retain failed components as one residual.
+
+    Waiting CTILE inputs remain sparse throughout the gate. Fresh worker results may still
+    take the dense crop-local path, but no sparse tile is reconstructed into a full
+    ``(slices, crop_h, crop_w)`` uint8 workspace merely to classify its components.
+    """
     dense_tile = result.tile_mask_mm
-    decoded_path: Optional[Path] = None
-    original_store = result.tile_mask_store
     if dense_tile is None:
-        if original_store is None:
+        if result.tile_mask_store is None:
             raise ValueError('Parent tile gate requires a dense mask or raw tile store')
-        decoded_path = (
-            Path(work_dir) / result.model_name / result.view_name / result.config_id /
-            f'{result.tile_id}.parent_residual.u8.dat'
+        return gate_raw_bbox_tile_store_against_parent_mask(
+            result,
+            parent_mask_support_mm=parent_mask_support_mm,
+            tile_accumulator_mm=tile_accumulator_mm,
+            tile_accumulator_locks=tile_accumulator_locks,
+            work_dir=Path(work_dir),
+            keep_temp=bool(keep_temp),
+            slice_workers=int(slice_workers),
+            tile_parent_mask_accumulator_mm=tile_parent_mask_accumulator_mm,
+            tile_parent_mask_accumulator_locks=tile_parent_mask_accumulator_locks,
         )
-        dense_tile = allocate_workspace_array(
-            shape=tuple(int(v) for v in original_store.shape),
-            dtype=np.uint8,
-            path=decoded_path,
-            desc=(
-                f'Decode crop-local waiting tile for parent gate '
-                f'{result.model_name}/{result.view_name}/{result.tile_id}'
-            ),
-            prefer_memory=True,
-            reserve_bytes=tile_intermediate_accumulator_reserve_bytes(),
-        )
-        for idx in range(int(original_store.shape[0])):
-            dense_tile[int(idx)] = original_store.decode_slice(int(idx), dtype=np.uint8)
-        original_store.close()
-        if not bool(keep_temp):
-            original_store.unlink()
 
     gate_stats = gate_tile_components_against_support_inplace(
         dense_tile,
@@ -34401,17 +34782,12 @@ def gate_tile_result_against_parent_mask(
             tile_id=str(result.tile_id),
             parent_crop=tuple(int(v) for v in result.parent_crop),
             tile_mask_mm=dense_tile,
-            tile_mask_path=(decoded_path if decoded_path is not None else result.tile_mask_path),
+            tile_mask_path=result.tile_mask_path,
             tile_mask_store=None,
         )
     else:
         close_memmap_array(dense_tile)
-        if decoded_path is not None and not bool(keep_temp):
-            try:
-                decoded_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-        elif result.tile_mask_path is not None and result.tile_mask_mm is not None and not bool(keep_temp):
+        if result.tile_mask_path is not None and not bool(keep_temp):
             try:
                 Path(result.tile_mask_path).unlink(missing_ok=True)
             except Exception:
@@ -34430,7 +34806,6 @@ def gate_tile_result_against_parent_mask(
     )
 
 
-
 def gate_tile_residual_against_parent_bridge(
     result: TilePostprocessResult,
     *,
@@ -34443,35 +34818,28 @@ def gate_tile_residual_against_parent_bridge(
     tile_parent_bridge_accumulator_mm: Optional[np.ndarray] = None,
     tile_parent_bridge_accumulator_locks: Optional[Sequence[threading.Lock]] = None,
 ) -> TileGateResult:
-    """Re-gate only parent-failed components against immutable parent bridge support."""
-    dense_tile = result.tile_mask_mm
-    decoded_path: Optional[Path] = None
-    original_store = result.tile_mask_store
-    try:
-        if dense_tile is None:
-            if original_store is None:
-                raise ValueError('Bridge tile gate requires a dense residual or raw tile store')
-            decoded_path = (
-                Path(work_dir) / result.model_name / result.view_name / result.config_id /
-                f'{result.tile_id}.bridge_residual.u8.dat'
-            )
-            dense_tile = allocate_workspace_array(
-                shape=tuple(int(v) for v in original_store.shape),
-                dtype=np.uint8,
-                path=decoded_path,
-                desc=(
-                    f'Decode crop-local residual for bridge gate '
-                    f'{result.model_name}/{result.view_name}/{result.tile_id}'
-                ),
-                prefer_memory=True,
-                reserve_bytes=tile_intermediate_accumulator_reserve_bytes(),
-            )
-            for idx in range(int(original_store.shape[0])):
-                dense_tile[int(idx)] = original_store.decode_slice(int(idx), dtype=np.uint8)
-            original_store.close()
-            if not bool(keep_temp):
-                original_store.unlink()
+    """Re-gate only parent-failed components against immutable parent bridge support.
 
+    A sparse residual CTILE is consumed slice-by-slice and retired directly; it is never
+    expanded back into a dense crop-local volume. ``work_dir`` remains in the signature so
+    the scheduler call contract stays uniform with the parent gate.
+    """
+    dense_tile = result.tile_mask_mm
+    if dense_tile is None:
+        if result.tile_mask_store is None:
+            raise ValueError('Bridge tile gate requires a dense residual or raw tile store')
+        return gate_raw_bbox_tile_store_against_parent_bridge(
+            result,
+            parent_bridge_support_mm=parent_bridge_support_mm,
+            tile_accumulator_mm=tile_accumulator_mm,
+            tile_accumulator_locks=tile_accumulator_locks,
+            keep_temp=bool(keep_temp),
+            slice_workers=int(slice_workers),
+            tile_parent_bridge_accumulator_mm=tile_parent_bridge_accumulator_mm,
+            tile_parent_bridge_accumulator_locks=tile_parent_bridge_accumulator_locks,
+        )
+
+    try:
         gate_stats = gate_tile_components_against_support_inplace(
             dense_tile,
             parent_bridge_support_mm,
@@ -34495,16 +34863,12 @@ def gate_tile_residual_against_parent_bridge(
         )
     finally:
         close_memmap_array(dense_tile)
-        if decoded_path is not None and not bool(keep_temp):
-            try:
-                decoded_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-        elif result.tile_mask_path is not None and result.tile_mask_mm is not None and not bool(keep_temp):
+        if result.tile_mask_path is not None and not bool(keep_temp):
             try:
                 Path(result.tile_mask_path).unlink(missing_ok=True)
             except Exception:
                 pass
+
 
 def finalize_consolidated_tile_volume_for_parent(
     *,
@@ -40907,21 +41271,26 @@ def main() -> None:
         f'Batched inference active with --batch={int(args.batch)}. StreamingYoloVolumeSource is used by default for full-frame/tile sources: it renders a bounded CPU prefetch window of H×W×{int(channel_format.channel_count)} center inputs and pads the final batch by repeating the last complete channel stack; CUDA input staging can additionally queue YOLO_TTA_GPU_INPUT_STAGING_BATCHES complete BCHW batches in VRAM ahead of inference; set YOLO_TTA_STREAMING_PREDICTION_SOURCES=0 to restore dense in-memory prediction-volume materialization.'
     )
     spec_notes.append(
-        'Tiled masks are staged into one consolidated parent-view canvas per --enable_tile TILE_SIZE:TILE_STRIDE group before gating; '
-        'the canvas gate is slice-local and connected-component based, so seam-split tile objects are reassembled before support testing. '
-        'A tile mask shape guard validates/resizes every postprocessed tile to its parent view-native shape. '
-        f'v12.2.11 keeps waiting tiles and tile-set/category accumulators in RAM by default (YOLO_TTA_SPILL_WAITING_TILES={int(waiting_tile_spill_enabled())}, YOLO_TTA_TILE_ACCUMULATORS_IN_RAM={int(tile_intermediate_accumulators_prefer_memory())}); disk ctile spill is now opt-in. '
-        f'v15.0.3 (T10) sizes the tile-accumulator RAM reserve against the cgroup-corrected available anonymous memory '
-        f'(now {tile_intermediate_accumulator_reserve_bytes() / GIB:.1f} GiB; YOLO_TTA_TILE_ACCUMULATOR_RESERVE_GIB pins it, '
-        f'YOLO_TTA_TILE_ACCUMULATOR_RESERVE_FRACTION/_MIN_GIB/_MAX_GIB shape it). v16.0.2 defaults scratch to <output>/temp; '
-        f'--temp selects an explicit root, while an explicitly configured YOLO_TTA_SCRATCH_PREFER_SHM '
-        f'may select a proven-roomy memory-backed root (scratch is memory-backed={int(scratch_dir_is_memory_backed())}; '
-        f'=0 disables, =1 forces, YOLO_TTA_SCRATCH_SHM_MIN_FREE_GIB sets the bar).'
-    )
-    spec_notes.append(
-        'Postprocessed tiles waiting for parent support stay in RAM by default and use ctile-mask-v2-raw only when YOLO_TTA_SPILL_WAITING_TILES=1; decomposed NRRD/support layers use cvol-mask-v2-raw where enabled: empty slices are elided, '
-        'nonempty slices are cropped to their nonzero bbox and written as raw uint8 payload bytes; bitpacking and LZ4 are not used. '
-        'Storage review: dense gray8 source/processing volumes stay raw; uint8 confidence maps are allocated only when --min_conf > 0 and stay raw because they are not sparse binary masks; FFV1/MKV/TIFF outputs remain codec-compressed; labels/summary JSON are negligible; retained sparse binary scratch/tile accumulators can be archived as raw bbox cvol when YOLO_TTA_KEEP_TEMP and YOLO_TTA_ARCHIVE_TEMP_BINARY_VOLUMES are enabled.'
+        'v16.4 per-tile semantics remain active: every original tile stays crop-local and is '
+        'component-gated independently against its same-angle parent mask, then only its failed '
+        'components are re-gated against the same-angle parent interpolation bridge. No raw '
+        'configuration-wide tile canvas or cross-tile component authorization path exists. '
+        f'v16.4.2 bounds live dense tile-result workspaces to approximately '
+        f'{tile_dense_worker_result_limit_bytes() / GIB:.1f} GiB and '
+        f'{tile_dense_worker_result_limit_tasks()} task(s) '
+        '(YOLO_TTA_TILE_DENSE_RESULT_MAX_GIB / _MAX_TASKS) when YOLO_TTA_KEEP_TEMP is disabled, '
+        'preferring parent-owned memfd shared RAM and using gpu_worker_results pathnames only '
+        'when anonymous-memory admission cannot preserve the configured reserve; stale '
+        'gpu_worker_results from interrupted older runs are purged before dispatch. '
+        'Full-frame parent tasks and tiles whose same-angle parent mask P is already published are '
+        'scheduled ahead of P-not-ready tiles. A cleaned tile waiting for parent support, and a '
+        'parent-failed residual waiting for bridge support, are unconditionally converted to '
+        'crop-local ctile-mask-v2-raw and their dense uint8 worker-result files are retired immediately. '
+        f'Tile-set/category accumulators prefer anonymous RAM={int(tile_intermediate_accumulators_prefer_memory())}; '
+        f'the cgroup-corrected accumulator reserve is {tile_intermediate_accumulator_reserve_bytes() / GIB:.1f} GiB. '
+        'CTILE/CVOL stores elide empty slices and write only each nonempty slice bbox as raw uint8; '
+        'bitpacking and LZ4 are not used. YOLO_TTA_KEEP_TEMP=1 intentionally retains the original '
+        'dense artifacts for diagnostics and therefore disables the live-result storage guarantee.'
     )
     spec_notes.append(
         f'Fused cleanup backend={cleanup_backend()}; set YOLO_TTA_CLEANUP_BACKEND=scipy to use the previous scipy.ndimage cleanup path.'
@@ -41844,6 +42213,10 @@ def main() -> None:
         if result.tile_mask_mm is not None:
             close_memmap_array(result.tile_mask_mm)
         _delete_tile_result_storage(result, keep_temp=bool(keep_temp_artifacts))
+        _release_tile_dense_result_for_key(
+            str(result.model_name), str(result.view_name), str(result.tile_id),
+            reason='tile result storage retired',
+        )
 
 
     def _submit_tile_parent_gate(result: TilePostprocessResult) -> None:
@@ -41854,15 +42227,16 @@ def main() -> None:
         ).get(str(result.view_name))
         if parent_mask_support is None:
             waiting = postprocessed_tiles_waiting_by_parent.setdefault(parent_key, {})
-            if waiting_tile_spill_enabled():
-                waiting[str(result.tile_id)] = spill_waiting_tile_result_to_raw_store(
-                    result,
-                    temp_dir,
-                    workers=int(tile_slice_postprocess_workers),
-                    keep_original=bool(keep_temp_artifacts),
-                )
-            else:
-                waiting[str(result.tile_id)] = result
+            waiting[str(result.tile_id)] = spill_waiting_tile_result_to_raw_store(
+                result,
+                temp_dir,
+                workers=int(tile_slice_postprocess_workers),
+                keep_original=bool(keep_temp_artifacts),
+            )
+            _release_tile_dense_result_for_key(
+                str(result.model_name), str(result.view_name), str(result.tile_id),
+                reason='sparse retirement while waiting for parent mask',
+            )
             return
 
         tile_accumulator_mm = _get_tile_accumulator(
@@ -41908,15 +42282,37 @@ def main() -> None:
             return
         if parent_key not in parent_bridge_ready:
             waiting = residual_tiles_waiting_by_parent.setdefault(parent_key, {})
-            if waiting_tile_spill_enabled():
+            if result.tile_mask_store is not None:
+                # The parent gate already emitted this residual as a crop-local CTILE. Drop
+                # its mmap while B is still pending and retain only a lightweight descriptor;
+                # thousands of waiting tiles must not consume thousands of live mappings.
+                store = result.tile_mask_store
+                tile_shape = tuple(int(v) for v in store.shape)
+                store.close()
+                result.tile_mask_store = None
+                waiting[str(result.tile_id)] = DeferredTilePostprocessResult(
+                    model_name=str(result.model_name),
+                    view_name=str(result.view_name),
+                    aug_id=str(result.aug_id),
+                    angle_deg=float(result.angle_deg),
+                    config_id=str(result.config_id),
+                    tile_id=str(result.tile_id),
+                    parent_crop=tuple(int(v) for v in result.parent_crop),
+                    tile_mask_path=Path(result.tile_mask_path),
+                    tile_shape=(int(tile_shape[0]), int(tile_shape[1]), int(tile_shape[2])),
+                    storage_format=CTILE_FORMAT,
+                )
+            else:
                 waiting[str(result.tile_id)] = spill_waiting_tile_result_to_raw_store(
                     result,
                     temp_dir,
                     workers=int(tile_slice_postprocess_workers),
                     keep_original=bool(keep_temp_artifacts),
                 )
-            else:
-                waiting[str(result.tile_id)] = result
+                _release_tile_dense_result_for_key(
+                    str(result.model_name), str(result.view_name), str(result.tile_id),
+                    reason='sparse retirement while waiting for parent bridge',
+                )
             return
 
         parent_bridge_support = parent_bridge_support_by_model.get(
@@ -42011,6 +42407,11 @@ def main() -> None:
             published = True
         if published:
             _flush_ready_postprocessed_tiles()
+            # Parent-ready publication changes tile dispatch priority immediately. Refill
+            # idle worker queues now rather than waiting for the much later B/final-parent
+            # completion event.
+            if gpu_worker_pending_task_ids:
+                _dispatch_gpu_worker_inference_window()
 
 
     def _submit_prediction_accumulation_join(handle: PredictionAccumulationHandle, context: Dict[str, object]) -> None:
@@ -42158,6 +42559,10 @@ def main() -> None:
             ready_key = tile_cleanup_futures.pop(fut)
             result = fut.result()
             if result is None:
+                _release_tile_dense_result_for_key(
+                    str(ready_key[0]), str(ready_key[1]), str(ready_key[3]),
+                    reason='tile empty after cleanup',
+                )
                 _mark_tile_complete(str(ready_key[0]), str(ready_key[1]), str(ready_key[3]))
                 continue
             _submit_tile_parent_gate(result)
@@ -42170,6 +42575,10 @@ def main() -> None:
             model_name, view_name, config_id, tile_id = tile_parent_gate_futures.pop(fut)
             parent_gate_result = fut.result()
             if parent_gate_result.residual_result is None:
+                _release_tile_dense_result_for_key(
+                    str(model_name), str(view_name), str(tile_id),
+                    reason='parent gate consumed dense tile result',
+                )
                 _mark_tile_complete(str(model_name), str(view_name), str(tile_id))
             else:
                 _submit_tile_bridge_gate(parent_gate_result.residual_result)
@@ -42181,6 +42590,10 @@ def main() -> None:
                 continue
             model_name, view_name, config_id, tile_id = tile_bridge_gate_futures.pop(fut)
             fut.result()
+            _release_tile_dense_result_for_key(
+                str(model_name), str(view_name), str(tile_id),
+                reason='bridge gate consumed dense tile residual',
+            )
             _mark_tile_complete(str(model_name), str(view_name), str(tile_id))
 
         for fut in list(tile_consolidation_futures.keys()):
@@ -42264,6 +42677,10 @@ def main() -> None:
             f'{sum(direct_union_inference_bytes.values()) / GIB:.1f}GiB, '
             f'direct_union_postprocess={len(direct_union_postprocess_views)}/'
             f'{sum(direct_union_postprocess_bytes.values()) / GIB:.1f}GiB, '
+            f'tile_dense_results={len(gpu_worker_tile_dense_result_reservations)}/'
+            f'{gpu_worker_tile_dense_result_task_limit} task(s), '
+            f'{gpu_worker_tile_dense_result_bytes_reserved / GIB:.1f}/'
+            f'{gpu_worker_tile_dense_result_limit / GIB:.1f}GiB, '
             f'tile_cleanup={len(tile_cleanup_futures)}, '
             f'tile_parent_gate={len(tile_parent_gate_futures)}, '
             f'tile_bridge_gate={len(tile_bridge_gate_futures)}, '
@@ -42298,6 +42715,48 @@ def main() -> None:
     gpu_worker_next_dynamic_task_id = 0
     gpu_worker_pending_task_ids: deque = deque()
     gpu_worker_result_dir = temp_dir / 'gpu_worker_results'
+    if not bool(keep_temp_artifacts) and gpu_worker_result_dir.exists():
+        # Worker-result files are never resumable inputs. Remove leftovers from an interrupted
+        # older run before admission starts, otherwise stale v16.4.0/16.4.1 tile files can make
+        # a correctly bounded v16.4.2 run appear to retain terabytes it did not create.
+        release_memfd_owners_under(gpu_worker_result_dir)
+        shutil.rmtree(gpu_worker_result_dir, ignore_errors=True)
+        if gpu_worker_result_dir.exists():
+            print(
+                f'Warning: stale GPU-worker result scratch could not be fully removed: '
+                f'{gpu_worker_result_dir}'
+            )
+        else:
+            print(f'Purged stale GPU-worker result scratch before this run: {gpu_worker_result_dir}')
+    # v16.4.2: every tile needs one independent dense crop while its worker task is live,
+    # but those files must not form an unbounded producer/consumer queue behind parent
+    # postprocessing. Reserve their logical uint8 bytes at dispatch and release the credit
+    # only after the dense file is deleted or converted to a crop-local CTILE store.
+    gpu_worker_tile_dense_result_limit = int(tile_dense_worker_result_limit_bytes())
+    gpu_worker_tile_dense_result_task_limit = int(tile_dense_worker_result_limit_tasks())
+    gpu_worker_tile_dense_result_memory_safe_limit: Optional[int] = None
+    if scratch_dir_is_memory_backed():
+        # A pathname fallback on tmpfs consumes the same cgroup/anonymous-memory budget as
+        # memfd. Keep the live dense cap below current headroom after a fixed safety reserve;
+        # unlike the old max(1 GiB, ...) floor, zero headroom must reject every positive tile
+        # before dispatch instead of knowingly risking an uncatchable cgroup OOM kill.
+        safe_headroom = max(0, int(available_anon_work_bytes()) - 16 * GIB)
+        explicit_anon_cap = int(workspace_anon_cap_bytes())
+        if int(explicit_anon_cap) > 0:
+            safe_headroom = min(int(safe_headroom), int(explicit_anon_cap))
+        gpu_worker_tile_dense_result_memory_safe_limit = int(safe_headroom)
+        gpu_worker_tile_dense_result_limit = min(
+            int(gpu_worker_tile_dense_result_limit),
+            int(gpu_worker_tile_dense_result_memory_safe_limit),
+        )
+    gpu_worker_tile_dense_result_bytes_reserved = 0
+    gpu_worker_tile_dense_result_memfd_bytes_reserved = 0
+    gpu_worker_tile_dense_result_reservations: Dict[int, int] = {}
+    gpu_worker_tile_dense_result_memfd_reservations: Dict[int, int] = {}
+    gpu_worker_tile_dense_result_workspaces: Dict[
+        int, Tuple[Optional[np.ndarray], Optional[np.ndarray]]
+    ] = {}
+    gpu_worker_tile_task_id_by_key: Dict[Tuple[str, str, str], int] = {}
     gpu_inference_drained_at: Optional[float] = None
     gpu_inference_drain_announced = False
     # D1 source-space bitsets are deliberately view-owned. One worker may own exactly one
@@ -42306,6 +42765,264 @@ def main() -> None:
     d1_owner_by_parent: Dict[Tuple[str, str], int] = {}
     d1_active_parent_by_worker: Dict[int, Tuple[str, str]] = {}
     d1_layer_ref_by_parent: Dict[Tuple[str, str], NrrdLayerRef] = {}
+
+    def _tile_dense_result_task_bytes(task: Dict[str, object]) -> int:
+        if str(task.get('kind', '')) != 'tile':
+            return 0
+        shape = tuple(int(v) for v in task.get('processing_shape', ()))
+        if len(shape) != 3:
+            return 0
+        planes = 2 if task.get('result_conf_path') else 1
+        return int(array_nbytes(shape, np.uint8)) * int(planes)
+
+    def _tile_dense_result_task_admissible(task: Dict[str, object]) -> bool:
+        if bool(keep_temp_artifacts) or str(task.get('kind', '')) != 'tile':
+            return True
+        task_id = int(task.get('task_id', -1))
+        if task_id in gpu_worker_tile_dense_result_reservations:
+            return True
+        need = int(_tile_dense_result_task_bytes(task))
+        if need <= 0:
+            return True
+        # Always admit one oversized tile when the live set is empty; otherwise a valid
+        # geometry whose crop exceeds the configured budget could deadlock forever.
+        if not gpu_worker_tile_dense_result_reservations:
+            return True
+        if len(gpu_worker_tile_dense_result_reservations) >= int(
+            gpu_worker_tile_dense_result_task_limit
+        ):
+            return False
+        return bool(
+            int(gpu_worker_tile_dense_result_bytes_reserved) + int(need)
+            <= int(gpu_worker_tile_dense_result_limit)
+        )
+
+    def _tile_parent_mask_ready_for_task(task: Dict[str, object]) -> bool:
+        if str(task.get('kind', '')) != 'tile':
+            return False
+        view_obj = task.get('view')
+        view_name = getattr(view_obj, 'name', None)
+        if view_name is None:
+            return False
+        return str(view_name) in parent_mask_support_by_model.get(
+            str(task.get('model_name', '')), {}
+        )
+
+    def _inference_storage_priority_rank(task: Dict[str, object]) -> int:
+        """Prefer parent work, then immediately gateable tiles, then early tiles."""
+        if str(task.get('kind', '')) != 'tile':
+            return 0
+        return 1 if _tile_parent_mask_ready_for_task(task) else 2
+
+    def _reserve_tile_dense_result_task(task: Dict[str, object]) -> bool:
+        nonlocal gpu_worker_tile_dense_result_bytes_reserved
+        if bool(keep_temp_artifacts) or str(task.get('kind', '')) != 'tile':
+            return False
+        task_id = int(task.get('task_id', -1))
+        if task_id < 0 or task_id in gpu_worker_tile_dense_result_reservations:
+            return False
+        if not _tile_dense_result_task_admissible(task):
+            raise RuntimeError(
+                f'tile dense-result admission raced its {gpu_worker_tile_dense_result_limit / GIB:.1f} GiB budget'
+            )
+        need = int(_tile_dense_result_task_bytes(task))
+        gpu_worker_tile_dense_result_reservations[task_id] = int(need)
+        gpu_worker_tile_dense_result_bytes_reserved += int(need)
+        runtime_telemetry().gauge(
+            'tile.dense_worker_result_bytes_reserved',
+            int(gpu_worker_tile_dense_result_bytes_reserved),
+        )
+        runtime_telemetry().gauge(
+            'tile.dense_worker_result_tasks_reserved',
+            int(len(gpu_worker_tile_dense_result_reservations)),
+        )
+        return True
+
+    def _prepare_tile_dense_result_workspaces(task: Dict[str, object]) -> None:
+        """Allocate one task's dense tile result in shared RAM when possible.
+
+        The parent owns each mapping and transfers duplicate memfd descriptors to the selected
+        CUDA worker. Pathname files remain a bounded fallback when cgroup/RAM headroom is too
+        small. A logical memfd reservation ledger covers not-yet-faulted pages, preventing a
+        burst of dispatches from all passing the same stale memory-headroom snapshot. Holding
+        the parent mapping until sparse retirement also prevents asynchronous D2H publication
+        from outliving its backing object.
+        """
+        nonlocal gpu_worker_tile_dense_result_memfd_bytes_reserved
+        if bool(keep_temp_artifacts) or str(task.get('kind', '')) != 'tile':
+            return
+        task_id = int(task.get('task_id', -1))
+        if task_id < 0:
+            raise ValueError('tile result workspace requires a nonnegative task_id')
+        if task_id in gpu_worker_tile_dense_result_workspaces:
+            return
+        shape = tuple(int(v) for v in task.get('processing_shape', ()))
+        if len(shape) != 3:
+            raise ValueError(f'tile task {task_id} has invalid processing_shape={shape}')
+        task.setdefault('result_mask_fallback_path', str(task['result_mask_path']))
+        task.setdefault('result_conf_fallback_path', task.get('result_conf_path'))
+        original_mask_path = Path(str(task['result_mask_fallback_path']))
+        original_conf_path = (
+            Path(str(task['result_conf_fallback_path']))
+            if task.get('result_conf_fallback_path') else None
+        )
+        mask_mm: Optional[np.ndarray] = None
+        conf_mm: Optional[np.ndarray] = None
+        total_need = int(_tile_dense_result_task_bytes(task))
+        anon_cap = int(workspace_anon_cap_bytes())
+        projected_memfd = int(gpu_worker_tile_dense_result_memfd_bytes_reserved) + int(total_need)
+        prefer_shared_memfd = bool(
+            memfd_workspace_enabled()
+            and int(available_anon_work_bytes()) >= int(projected_memfd) + 16 * GIB
+            and (int(anon_cap) <= 0 or int(projected_memfd) <= int(anon_cap))
+        )
+        try:
+            mask_mm = allocate_workspace_array(
+                shape=shape,
+                dtype=np.uint8,
+                path=original_mask_path,
+                desc=f'GPU-worker tile result mask task {task_id}',
+                prefer_memory=False,
+                prefer_memfd=bool(prefer_shared_memfd),
+                reserve_bytes=16 * GIB,
+                initialize_zero=True,
+            )
+            mask_backing = _memmap_backing_path(mask_mm)
+            if mask_backing is None:
+                raise RuntimeError(f'tile task {task_id} mask workspace has no reopenable backing')
+            task['result_mask_path'] = str(mask_backing)
+
+            if original_conf_path is not None:
+                conf_mm = allocate_workspace_array(
+                    shape=shape,
+                    dtype=np.uint8,
+                    path=original_conf_path,
+                    desc=f'GPU-worker tile result confidence task {task_id}',
+                    prefer_memory=False,
+                    prefer_memfd=bool(prefer_shared_memfd),
+                    reserve_bytes=16 * GIB,
+                    initialize_zero=True,
+                )
+                conf_backing = _memmap_backing_path(conf_mm)
+                if conf_backing is None:
+                    raise RuntimeError(
+                        f'tile task {task_id} confidence workspace has no reopenable backing'
+                    )
+                task['result_conf_path'] = str(conf_backing)
+
+            task['result_workspace_preallocated'] = True
+            gpu_worker_tile_dense_result_workspaces[task_id] = (mask_mm, conf_mm)
+            actual_memfd_bytes = sum(
+                int(np.asarray(mm).nbytes)
+                for mm in (mask_mm, conf_mm)
+                if mm is not None and _memfd_owner_key_from_array(mm) is not None
+            )
+            if int(actual_memfd_bytes) > 0:
+                gpu_worker_tile_dense_result_memfd_reservations[task_id] = int(actual_memfd_bytes)
+                gpu_worker_tile_dense_result_memfd_bytes_reserved += int(actual_memfd_bytes)
+                runtime_telemetry().add(
+                    'tile.dense_worker_result_memfd_bytes', int(actual_memfd_bytes),
+                )
+                runtime_telemetry().gauge(
+                    'tile.dense_worker_result_memfd_bytes_reserved',
+                    int(gpu_worker_tile_dense_result_memfd_bytes_reserved),
+                )
+            path_bytes = max(0, int(total_need) - int(actual_memfd_bytes))
+            if int(path_bytes) > 0:
+                runtime_telemetry().add(
+                    'tile.dense_worker_result_path_fallback_bytes', int(path_bytes),
+                )
+        except BaseException:
+            task['result_mask_path'] = str(original_mask_path)
+            task['result_conf_path'] = (
+                str(original_conf_path) if original_conf_path is not None else None
+            )
+            task.pop('result_workspace_preallocated', None)
+            for mm in (conf_mm, mask_mm):
+                if mm is None:
+                    continue
+                backing = _memmap_backing_path(mm)
+                is_memfd = _memfd_owner_key_from_array(mm) is not None
+                try:
+                    close_memmap_array_without_flush(mm)
+                except Exception:
+                    pass
+                if not is_memfd and backing is not None:
+                    try:
+                        Path(backing).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            raise
+
+    def _release_tile_dense_result_task_id(
+        task_id: int, *, reason: str = '', refill: bool = True,
+    ) -> bool:
+        nonlocal gpu_worker_tile_dense_result_bytes_reserved
+        nonlocal gpu_worker_tile_dense_result_memfd_bytes_reserved
+        task_id_i = int(task_id)
+        released = gpu_worker_tile_dense_result_reservations.pop(task_id_i, None)
+        released_memfd = gpu_worker_tile_dense_result_memfd_reservations.pop(task_id_i, None)
+        workspaces = gpu_worker_tile_dense_result_workspaces.pop(task_id_i, None)
+        task_obj = gpu_worker_tasks_by_id.get(task_id_i)
+        if workspaces is not None:
+            for mm in workspaces:
+                if mm is None:
+                    continue
+                backing = _memmap_backing_path(mm)
+                is_memfd = _memfd_owner_key_from_array(mm) is not None
+                try:
+                    close_memmap_array_without_flush(mm)
+                except Exception:
+                    pass
+                if not is_memfd and not bool(keep_temp_artifacts) and backing is not None:
+                    try:
+                        Path(backing).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+        if isinstance(task_obj, dict):
+            if task_obj.get('result_mask_fallback_path') is not None:
+                task_obj['result_mask_path'] = task_obj.get('result_mask_fallback_path')
+            task_obj['result_conf_path'] = task_obj.get('result_conf_fallback_path')
+            task_obj.pop('result_workspace_preallocated', None)
+        if released_memfd is not None:
+            gpu_worker_tile_dense_result_memfd_bytes_reserved = max(
+                0,
+                int(gpu_worker_tile_dense_result_memfd_bytes_reserved) - int(released_memfd),
+            )
+            runtime_telemetry().gauge(
+                'tile.dense_worker_result_memfd_bytes_reserved',
+                int(gpu_worker_tile_dense_result_memfd_bytes_reserved),
+            )
+        if released is None and released_memfd is None and workspaces is None:
+            return False
+        if released is not None:
+            gpu_worker_tile_dense_result_bytes_reserved = max(
+                0, int(gpu_worker_tile_dense_result_bytes_reserved) - int(released),
+            )
+            runtime_telemetry().add('tile.dense_worker_result_bytes_retired', int(released))
+            runtime_telemetry().gauge(
+                'tile.dense_worker_result_bytes_reserved',
+                int(gpu_worker_tile_dense_result_bytes_reserved),
+            )
+            runtime_telemetry().gauge(
+                'tile.dense_worker_result_tasks_reserved',
+                int(len(gpu_worker_tile_dense_result_reservations)),
+            )
+        if bool(refill) and gpu_worker_pending_task_ids:
+            _dispatch_gpu_worker_inference_window()
+        return True
+
+    def _release_tile_dense_result_for_key(
+        model_name_s: str, view_name_s: str, tile_id_s: str, *, reason: str = '',
+    ) -> bool:
+        task_id = gpu_worker_tile_task_id_by_key.get(
+            (str(model_name_s), str(view_name_s), str(tile_id_s))
+        )
+        if task_id is None:
+            return False
+        return _release_tile_dense_result_task_id(
+            int(task_id), reason=str(reason), refill=True,
+        )
 
     def _gpu_worker_task_seconds(task: Dict[str, object]) -> float:
         view_obj = task.get('view')
@@ -42632,6 +43349,8 @@ def main() -> None:
             task = gpu_worker_tasks_by_id[int(task_id)]
             if not _direct_union_task_admissible(task):
                 continue
+            if not _tile_dense_result_task_admissible(task):
+                continue
             feasible = _d1_feasible_workers(task, candidates)
             if not feasible:
                 continue
@@ -42670,6 +43389,7 @@ def main() -> None:
                     # Continue an already-owned D1 view before opening another owner bitset.
                     0 if _d1_task_parent_key(gpu_worker_tasks_by_id[int(pair[1])]) in d1_owner_by_parent else 1,
                     0 if (_direct_union_task_key(gpu_worker_tasks_by_id[int(pair[1])]) in direct_union_inference_views) else 1,
+                    _inference_storage_priority_rank(gpu_worker_tasks_by_id[int(pair[1])]),
                     -float(parent_seconds.get(_gpu_worker_fullframe_parent_key(gpu_worker_tasks_by_id[int(pair[1])]), 0.0)),
                     -float(_gpu_worker_task_seconds(gpu_worker_tasks_by_id[int(pair[1])])),
                     int(pair[0]),
@@ -42682,8 +43402,10 @@ def main() -> None:
         """Keep D1 from winning a device while dispatchable inference remains central."""
         admissible = False
         for pending_task_id in list(gpu_worker_pending_task_ids):
-            if _direct_union_task_admissible(
-                gpu_worker_tasks_by_id[int(pending_task_id)]
+            pending_task = gpu_worker_tasks_by_id[int(pending_task_id)]
+            if (
+                _direct_union_task_admissible(pending_task)
+                and _tile_dense_result_task_admissible(pending_task)
             ):
                 admissible = True
                 break
@@ -42721,7 +43443,11 @@ def main() -> None:
         # Multi-GPU workers can become useful interpolation hosts independently after their
         # targeted queue drains, even while another GPU is finishing a long lease.  A newly
         # ready inference task revokes the lease in the dispatcher before queueing that task.
-        no_imminent_task = not gpu_worker_pending_task_ids
+        no_imminent_task = not any(
+            _direct_union_task_admissible(gpu_worker_tasks_by_id[int(task_id)])
+            and _tile_dense_result_task_admissible(gpu_worker_tasks_by_id[int(task_id)])
+            for task_id in list(gpu_worker_pending_task_ids)
+        )
         for worker_id in worker_ids:
             if (
                 int(gpu_worker_dispatched_tasks) > 0
@@ -42796,13 +43522,21 @@ def main() -> None:
                 gpu_worker_pending_task_ids.appendleft(int(task_id))
                 continue
             owner_claimed = False
+            tile_storage_reserved = False
             try:
                 owner_claimed = _claim_d1_owner(task_to_dispatch, int(worker_id))
                 _activate_direct_union_task(task_to_dispatch)
+                tile_storage_reserved = _reserve_tile_dense_result_task(task_to_dispatch)
+                if tile_storage_reserved:
+                    _prepare_tile_dense_result_workspaces(task_to_dispatch)
                 dispatch_task = dict(task_to_dispatch)
                 _attach_memfd_transfers_to_task(dispatch_task)
                 gpu_task_queues[int(worker_id)].put(dispatch_task)
             except BaseException:
+                if tile_storage_reserved:
+                    _release_tile_dense_result_task_id(
+                        int(task_id), reason='dispatch failure', refill=False,
+                    )
                 if owner_claimed:
                     parent = _d1_task_parent_key(task_to_dispatch)
                     if parent is not None:
@@ -43213,6 +43947,11 @@ def main() -> None:
                         / f'{d1_key}.orthogonal.cvol'
                     )
                 gpu_worker_tasks_by_id[int(next_task_id)] = task
+                if str(kind) == 'tile':
+                    tile_key = (str(model_name), str(view.name), str(job_id))
+                    if tile_key in gpu_worker_tile_task_id_by_key:
+                        raise RuntimeError(f'duplicate tile worker task key: {tile_key}')
+                    gpu_worker_tile_task_id_by_key[tile_key] = int(next_task_id)
                 next_task_id += 1
         gpu_worker_total_tasks = int(next_task_id)
         gpu_worker_next_dynamic_task_id = int(next_task_id)
@@ -43221,6 +43960,45 @@ def main() -> None:
         for key_fv, cnt in fullframe_subtasks_per_view.items():
             fullframe_remaining[key_fv] = int(cnt)
         pending_prediction_build_jobs.clear()
+
+        tile_result_sizes = [
+            int(_tile_dense_result_task_bytes(task_obj))
+            for task_obj in gpu_worker_tasks_by_id.values()
+            if str(task_obj.get('kind', '')) == 'tile'
+        ]
+        if tile_result_sizes:
+            largest_tile_result = int(max(tile_result_sizes))
+            if bool(keep_temp_artifacts):
+                print(
+                    'Warning: YOLO_TTA_KEEP_TEMP=1 retains every dense tile worker result for '
+                    'diagnostics; v16.4.2 tile-result backpressure and immediate dense-file '
+                    f'retirement are intentionally disabled (largest result={largest_tile_result / GIB:.2f} GiB).'
+                )
+            else:
+                if (
+                    gpu_worker_tile_dense_result_memory_safe_limit is not None
+                    and int(largest_tile_result) > int(gpu_worker_tile_dense_result_memory_safe_limit)
+                ):
+                    raise RuntimeError(
+                        'One dense crop-local tile result requires '
+                        f'{largest_tile_result / GIB:.2f} GiB, but the memory-backed scratch '
+                        'root has only '
+                        f'{gpu_worker_tile_dense_result_memory_safe_limit / GIB:.2f} GiB of '
+                        'safe live-result headroom after reserve. Use a disk-backed --temp root, '
+                        'reduce the tile footprint, or disable the confidence result by setting '
+                        '--min_conf 0.'
+                    )
+                print(
+                    'v16.4.2 bounded tile-result storage active: '
+                    f'live dense result budget={gpu_worker_tile_dense_result_limit / GIB:.1f} GiB / '
+                    f'{gpu_worker_tile_dense_result_task_limit} task(s), '
+                    f'largest tile result={largest_tile_result / GIB:.2f} GiB; '
+                    'shared memfd RAM is preferred so gpu_worker_results is a bounded pathname fallback. '
+                    'Stale worker-result scratch was purged before dispatch; full-frame parents and '
+                    'P-ready tiles are scheduled ahead of P-not-ready tiles. '
+                    'waiting parent/bridge masks retire unconditionally to crop-local CTILE stores. '
+                    'YOLO_TTA_TILE_DENSE_RESULT_MAX_GIB and _MAX_TASKS adjust the scheduling budget.'
+                )
 
         gpu_worker_pending_task_ids.extend(range(int(gpu_worker_total_tasks)))
         _dispatch_gpu_worker_inference_window()
@@ -43364,6 +44142,11 @@ def main() -> None:
                             Path(str(pth)).unlink(missing_ok=True)
                         except Exception:
                             pass
+            _release_tile_dense_result_task_id(
+                int(task.get('task_id', -1)),
+                reason='GPU worker reported an empty tile result',
+                refill=True,
+            )
             _mark_tile_complete(model_name_s, str(view.name), str(tile_job.tile_id))
             return
         result_shape = tuple(int(v) for v in task.get(
@@ -43502,6 +44285,10 @@ def main() -> None:
                 print(
                     f'Inference tasks completed={int(gpu_worker_results_collected)}/'
                     f'{int(gpu_worker_total_tasks)}; parent_postprocess={len(view_processing_futures)}, '
+                    f'tile_dense_results={len(gpu_worker_tile_dense_result_reservations)}/'
+                    f'{gpu_worker_tile_dense_result_task_limit} task(s), '
+                    f'{gpu_worker_tile_dense_result_bytes_reserved / GIB:.1f}/'
+                    f'{gpu_worker_tile_dense_result_limit / GIB:.1f}GiB, '
                     f'tile_cleanup={len(tile_cleanup_futures)}, '
                     f'tile_parent_gate={len(tile_parent_gate_futures)}, '
                     f'tile_bridge_gate={len(tile_bridge_gate_futures)}, '
@@ -43996,6 +44783,17 @@ def main() -> None:
         prediction_result_executor.shutdown(wait=True)
         parent_postprocess_executor.shutdown(wait=True)
         tile_postprocess_executor.shutdown(wait=True)
+        # Error teardown can bypass the normal tile-result lifecycle. Every worker and
+        # tile-postprocess future is quiescent now, so release any parent-owned memfd/disk
+        # mappings that never reached sparse retirement without racing an active consumer.
+        for tile_task_id in list(
+            set(gpu_worker_tile_dense_result_reservations)
+            | set(gpu_worker_tile_dense_result_memfd_reservations)
+            | set(gpu_worker_tile_dense_result_workspaces)
+        ):
+            _release_tile_dense_result_task_id(
+                int(tile_task_id), reason='scheduler teardown', refill=False,
+            )
         if prediction_render_executor is not None:
             try:
                 prediction_render_executor.shutdown(wait=True, cancel_futures=True)
@@ -44701,6 +45499,7 @@ def main() -> None:
 # v16.1.8 defaults Radial sampling to the hardware-linear texture, adds bilinear in-plane Tilted forward inputs (mask backprojection stays nearest/exact), and retries transient ffmpeg launch failures before failing the pipeline loudly.
 # v16.4.0 embeds low-quality downbins in --save and consolidates final-volume operations under --postprocessing.
 # v16.4.1 fixes the resident TensorRT ring static-affine gate after grouped-source removal: the task-local identity result now replaces the retired all_identity aggregate.
+# v16.4.2 makes per-tile storage bounded: parent-owned memfd results are preferred, waiting tile/residual masks always retire to crop-local CTILE stores, and scheduler backpressure caps live dense tile workspaces.
 # v16.2.1 prevents hardware-texture Radial startup false positives by allowing one raster-perimeter-equivalent high-error seam while retaining the strict mean and broad-mismatch gates.
 # v16.2.2 wraps radial channel context, saves C>=5 view inputs as multi-page TIFFs, removes --troubleshooting, and drops legacy environment-variable aliases.
 # v16.3.0 adds structured Radial/Tilted/Tile view flags, renames interpolation flags, keeps component-NRRD streaming continuous through topology, and removes dead environment controls.
