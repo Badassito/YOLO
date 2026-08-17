@@ -14,6 +14,10 @@ Current runtime behavior:
    so parent interpolation and component gates never retain GPU-worker uint8 result files
  - always wraps Radial and Tilted-Radial interpolation across the angular seam
  - supports paired TensorRT GPU and OpenVINO CPU inference with automatic hybrid work stealing
+ - seeds hybrid full-frame work at the larger backend lease size, then splits only at claim time
+ - lets OpenVINO open at most one shared-union view while CUDA retains D1 for other eligible views
+ - begins bounded GPU stealback from CPU-owned or still-unclaimed views when live ETA requires it
+ - keeps CUDA helper affinity topology-local while allowing low-duty hybrid CPU overlap by default
  - compiles one socket-local OpenVINO model per CPU instance and uses asynchronous infer requests
  - routes Cartesian work to CPU first, then Tilted Cartesian; Radial families remain GPU-only
  - resolves model, device, precision, and batch independently for gpu:/cpu: backends
@@ -72,8 +76,8 @@ import numpy as np
 
 GIB = 1024 ** 3
 NRRD_SPACE = "left-posterior-superior"
-SCRIPT_VERSION = '17.0.1'
-SCRIPT_VERSION_COMPACT = '1701'
+SCRIPT_VERSION = '17.0.2'
+SCRIPT_VERSION_COMPACT = '1702'
 SCRIPT_BASENAME = f'GPT-5.6-Sol-Pro_v{SCRIPT_VERSION}_SLURM.py'
 OUTPUT_NRRD_PREFIX = ''
 LEGACY_OUTPUT_NRRD_PREFIX = 'HW_'
@@ -2156,7 +2160,7 @@ def plan_gpu_worker_affinity(
 ) -> List[Optional[List[int]]]:
     """Per-worker CPU pin sets; None entries stay unpinned.
 
- Discovery-driven — no GPU<->socket balance is assumed. GPUs and allocated cpus are each
+ Discovery-driven — no GPU<->socket balance or fixed NUMA node is assumed. GPUs and allocated cpus are each
  bucketed by measured NUMA node and every node's PHYSICAL cores are split evenly among ITS
  OWN workers (the first remainder workers receive one extra core), so SMT siblings are never assigned to
  different workers. Representatives are listed before their SMT siblings. A node whose
@@ -2599,6 +2603,7 @@ def gpu_worker_task_cost_key(task: Dict[str, object]) -> Tuple[object, ...]:
         return (str(task.get('kind', 'unknown')),)
     return (
         str(task.get('kind', 'unknown')),
+        str(task.get('result_mode', 'file')),
         str(view.family),
         str(radial_base_view_name(view) if is_radial_view(view) else tilted_base_view_name(view)),
         int(task.get('out_size', 0)),
@@ -2634,7 +2639,11 @@ def cpu_inference_task_priority(task: Dict[str, object]) -> int:
 
 
 def cpu_worker_target_lease_seconds() -> float:
-    return max(0.5, min(30.0, _env_float('YOLO_TTA_CPU_WORKER_LEASE_TARGET_SECONDS', 2.0)))
+    # v17.0.2: the measured 10-second lease experiment cut the bounded task window
+    # from 8,083 to 3,447 and improved wall time from 19:31 to 17:51. Use that
+    # demonstrated target by default; claim-time splitting still prevents a backend
+    # from being forced to consume an arbitrarily oversized seed range.
+    return max(0.5, min(30.0, _env_float('YOLO_TTA_CPU_WORKER_LEASE_TARGET_SECONDS', 10.0)))
 
 
 def cpu_worker_min_lease_slices() -> int:
@@ -2642,7 +2651,7 @@ def cpu_worker_min_lease_slices() -> int:
 
 
 def cpu_worker_max_lease_slices() -> int:
-    return max(cpu_worker_min_lease_slices(), _env_int('YOLO_TTA_CPU_WORKER_MAX_LEASE_SLICES', 32))
+    return max(cpu_worker_min_lease_slices(), _env_int('YOLO_TTA_CPU_WORKER_MAX_LEASE_SLICES', 64))
 
 
 def cpu_worker_default_seconds_per_frame(view: 'ViewInfo') -> float:
@@ -2661,6 +2670,42 @@ def cpu_worker_initial_lease_slices(view: 'ViewInfo', batch: int = 1) -> int:
     estimate = max(cpu_worker_min_lease_slices(), min(cpu_worker_max_lease_slices(), estimate))
     estimate = max(align, int(math.ceil(float(estimate) / float(align))) * align)
     return int(estimate)
+
+
+HYBRID_DEFERRED_RESULT_MODE = 'hybrid_unclaimed'
+
+
+def hybrid_gpu_stealback_enabled() -> bool:
+    """Allow CUDA to claim CPU-owned or unclaimed views before GPU-only work reaches zero."""
+    return _env_flag('YOLO_TTA_HYBRID_GPU_STEALBACK', True)
+
+
+def hybrid_gpu_stealback_eta_ratio() -> float:
+    """CPU ETA must exceed this multiple of GPU-only ETA before early stealback."""
+    return max(0.25, min(4.0, _env_float('YOLO_TTA_HYBRID_GPU_STEALBACK_ETA_RATIO', 1.0)))
+
+
+def hybrid_gpu_stealback_min_lead_seconds() -> float:
+    """Absolute CPU-over-GPU ETA lead required before early stealback."""
+    return max(0.0, min(300.0, _env_float('YOLO_TTA_HYBRID_GPU_STEALBACK_MIN_LEAD_SECONDS', 5.0)))
+
+
+def hybrid_gpu_stealback_max_fraction() -> float:
+    """Maximum fraction of the live CUDA dispatch window borrowed for CPU-eligible work."""
+    return max(0.0, min(1.0, _env_float('YOLO_TTA_HYBRID_GPU_STEALBACK_MAX_FRACTION', 0.75)))
+
+
+def hybrid_cpu_affinity_overlap_enabled() -> bool:
+    """Share OpenVINO CPU masks with low-duty parent/CUDA helper threads in hybrid runs.
+
+    GPU-only profiling for the target workload showed roughly five percent aggregate CPU duty.
+    The v17.0.1 exclusive-mask policy nevertheless reduced each CUDA worker from roughly twenty
+    helper threads to one and the parent pools from 160 workers to 16.  Keeping OpenVINO pinned
+    socket-locally while allowing helper overlap preserves locality without assuming any GPU is
+    attached to a particular NUMA node.  Set YOLO_TTA_HYBRID_CPU_AFFINITY_OVERLAP=0 to restore
+    exclusive parent/GPU-helper masks.
+    """
+    return _env_flag('YOLO_TTA_HYBRID_CPU_AFFINITY_OVERLAP', True)
 
 
 # Default interpolation process cap. Python-heavy planning gains independent GILs, while
@@ -18329,7 +18374,10 @@ def run_prediction_volume_in_openvino_worker(
         )
     if kind not in {'fullframe', 'tile'}:
         raise ValueError(f'Unsupported OpenVINO task kind {kind!r}')
-    if str(task.get('result_mode', 'file')) == 'd1_owner':
+    result_mode = str(task.get('result_mode', 'file'))
+    if result_mode == HYBRID_DEFERRED_RESULT_MODE:
+        raise ValueError('OpenVINO received an unresolved hybrid full-frame task')
+    if result_mode == 'd1_owner':
         raise ValueError('OpenVINO CPU workers cannot consume GPU D1 owner tasks')
 
     slice_offset = int(task.get('slice_start', 0))
@@ -18602,6 +18650,8 @@ def run_prediction_volume_in_worker(
     view: ViewInfo = task['view']  # type: ignore[assignment]
     job = task['job']
     kind = str(task['kind'])
+    if str(task.get('result_mode', 'file')) == HYBRID_DEFERRED_RESULT_MODE:
+        raise ValueError('CUDA worker received an unresolved hybrid full-frame task')
     if kind not in {'fullframe', 'tile'}:
         raise ValueError(f'Unsupported v16.4.0 worker task kind: {kind!r}')
     if kind == 'fullframe' and not isinstance(job, AugJob):
@@ -41621,7 +41671,19 @@ def main() -> None:
         _allowed_main_cpus = {int(cpu) for cpu in os.sched_getaffinity(0)}
     except Exception:
         _allowed_main_cpus = set(range(max(1, int(_cpu_count()))))
-    main_process_reserved_cpus = sorted(_allowed_main_cpus - cpu_inference_reserved_cpus)
+    hybrid_cpu_affinity_overlap_active = bool(
+        gpu_worker_process_active
+        and cpu_worker_process_active
+        and hybrid_cpu_affinity_overlap_enabled()
+    )
+    # OpenVINO remains pinned to its socket-local masks. In hybrid mode the parent and
+    # topology-local CUDA helper pools may share those logical CPUs because the measured
+    # non-inference workload is low-duty; exclusive isolation remains an opt-out mode.
+    main_process_reserved_cpus = sorted(
+        _allowed_main_cpus
+        if hybrid_cpu_affinity_overlap_active else
+        (_allowed_main_cpus - cpu_inference_reserved_cpus)
+    )
     main_process_affinity_restricted = False
     parent_affinity_monitor_stop = threading.Event()
     parent_affinity_monitor_thread: Optional[threading.Thread] = None
@@ -41661,11 +41723,20 @@ def main() -> None:
                 f'physical_cores={plan.physical_cores}, logical_threads={plan.inference_threads}, '
                 f'cpu_mask={list(plan.cpus)}'
             )
-        print(
-            f'[intel] OpenVINO reserves {len(cpu_inference_reserved_cpus)} logical CPU(s); '
-            f'{len(main_process_reserved_cpus)} logical CPU(s) remain outside those masks for '
-            'decode, GPU feeding, interpolation, scheduling, and output.'
-        )
+        if hybrid_cpu_affinity_overlap_active:
+            print(
+                f'[intel] Hybrid CPU-affinity overlap active: OpenVINO remains socket-local on '
+                f'{len(cpu_inference_reserved_cpus)} logical CPU(s), while parent/CUDA helper '
+                f'threads may share the full {len(_allowed_main_cpus)}-CPU allocation. GPU helper '
+                "masks are still derived from each device's discovered NUMA node; no fixed node "
+                'is assumed. YOLO_TTA_HYBRID_CPU_AFFINITY_OVERLAP=0 restores exclusive masks.'
+            )
+        else:
+            print(
+                f'[intel] OpenVINO reserves {len(cpu_inference_reserved_cpus)} logical CPU(s); '
+                f'{len(main_process_reserved_cpus)} logical CPU(s) remain outside those masks for '
+                'decode, GPU feeding, interpolation, scheduling, and output.'
+            )
 
     args.gpu_model = gpu_model_path
     args.cpu_model = cpu_model_path
@@ -42156,14 +42227,16 @@ def main() -> None:
         )
     # D1 may disable dense GPU unions after the initial backend resolution. Recompute the
     # common process-worker requirement so GPU-only D1 runs stay owner-only while hybrid
-    # runs retain a shareable direct union for every CPU-eligible view.
+    # runs can allocate a shareable direct union only for a view actually claimed by OpenVINO.
     worker_direct_union_active = bool(
         gpu_worker_direct_union_active or cpu_worker_process_active
     )
     if cpu_worker_process_active and not gpu_worker_direct_union_active:
         print(
-            '[intel] OpenVINO direct-union handoff uses process-shareable backing for '
-            'CPU-eligible Cartesian/Tilted views while GPU-only D1 views remain owner-local.'
+            '[intel] v17.0.2 hybrid ownership: OpenVINO may open one process-shareable '
+            'Cartesian/Tilted direct union at a time; CUDA-claimed eligible views retain '
+            'owner-local D1. ETA-driven stealback can assist the CPU view or claim unopened '
+            'eligible views before Radial work drains.'
         )
     if gpu_worker_direct_union_active:
         print(
@@ -42332,12 +42405,21 @@ def main() -> None:
         )
     spec_notes: List[str] = []
     spec_notes.append(
-        'v17.0.0 Intel inference update: --model accepts gpu:/PATH and cpu:/PATH; '
+        'v17.0.2 hybrid scheduler patch: CPU lease target defaults to 10 seconds; seed ranges '
+        'use the larger eligible backend target; each CPU-eligible full-frame view is committed '
+        'on first claim to shared direct union or CUDA D1; bounded ETA-driven stealback may '
+        'assist the active CPU view or claim an unopened view before GPU-only work drains. '
+        'OpenVINO remains socket-local, while low-duty parent/CUDA helper overlap is enabled by '
+        'default and GPU affinity remains per-device topology-discovered.'
+    )
+    spec_notes.append(
+        'v17.0.2 Intel inference update: --model accepts gpu:/PATH and cpu:/PATH; '
         '--device selects GPU indexes, cpu, or GPU_INDEXES:cpu; --quantize and --batch '
         'accept backend-qualified gpu:/cpu: values. OpenVINO runs in persistent socket-local '
         'processes, automatically claims Cartesian work before Tilted Cartesian work, and '
-        'never claims Radial/Tilted-Radial work. CUDA workers always prioritize GPU-only work '
-        'and then non-preemptively steal unclaimed CPU-eligible leases. Mask/proto processing '
+        'never claims Radial/Tilted-Radial work. CUDA workers use live backend ETAs to balance '
+        'GPU-only work against CPU-owned and still-unclaimed eligible views; already-running '
+        'OpenVINO requests are never preempted. Mask/proto processing '
         'follows the inference backend automatically; --retina_mask_processor and manual '
         'CPU-offload/GPU-steal switches do not exist. Hybrid model identity is warning-only, '
         'and BF16 output quality is accepted as a v17 specification assumption.'
@@ -42488,7 +42570,7 @@ def main() -> None:
             'v12.2.15 streaming preprocessing is disabled by YOLO_TTA_STREAMING_PREPROCESS=0; decode finishes before inference scheduling begins, and legacy cube resize runs only when explicitly requested.'
         )
     spec_notes.append(
-        'v17.0.0 process-local model startup: the parent loads no inference model. Each persistent '
+        'v17.0.2 process-local model startup: the parent loads no inference model. Each persistent '
         'CUDA worker deserializes its GPU engine, and each socket-local CPU worker compiles its '
         'OpenVINO model only after applying its CPU affinity. Startup overlaps the default streaming '
         'decode producer; YOLO_TTA_STREAMING_PREPROCESS=0 makes decode synchronous.'
@@ -42630,11 +42712,12 @@ def main() -> None:
     )
     spec_notes.append(
         'v17 backend-local result processing: CUDA tasks retain the proto-union/flatten, warp, '
-        '--min_conf, and positive --min_radius GPU path before their reduced view-local result '
-        'is published. OpenVINO tasks keep raw head/prototype outputs on the CPU, reconstruct '
-        'bbox-local masks, and publish into the same disjoint view-union windows. Progress bars '
-        'outside inference therefore describe independent render/postprocess/output stages rather '
-        'than cross-device mask migration.'
+        '--min_conf, and positive --min_radius GPU path before their reduced result is published. '
+        'OpenVINO tasks keep raw head/prototype outputs on the CPU and reconstruct bbox-local masks. '
+        'Within an OpenVINO-committed direct-union view, CPU and assisting CUDA tasks publish '
+        'disjoint view-union windows; CUDA-committed views instead retain the D1 source-space sparse '
+        'contract. Progress bars outside inference therefore describe independent '
+        'render/postprocess/output stages rather than cross-device mask migration.'
     )
     inference_backend_details: List[str] = []
     if gpu_worker_process_active:
@@ -42649,8 +42732,9 @@ def main() -> None:
         )
     if gpu_worker_process_active and cpu_worker_process_active:
         inference_routing_note = (
-            'GPU-only Radial work is selected before GPUs steal remaining unclaimed '
-            'Cartesian/Tilted work; already-running OpenVINO requests are never preempted.'
+            'OpenVINO opens at most one shared-union view at a time. CUDA uses live backend '
+            'ETAs to assist that view or claim unopened Cartesian/Tilted views as D1 before '
+            'GPU-only Radial work drains; already-running OpenVINO requests are never preempted.'
         )
     elif gpu_worker_process_active:
         inference_routing_note = (
@@ -42663,16 +42747,17 @@ def main() -> None:
             'requests were removed before scheduling.'
         )
     spec_notes.append(
-        f'v17.0.0 inference backends: {inference_devices}; ' + '; '.join(inference_backend_details) + '. '
-        'All backends claim atomically from one central queue and write disjoint task ranges into '
-        f'the same result contract. {inference_routing_note}'
+        f'v17.0.2 inference backends: {inference_devices}; ' + '; '.join(inference_backend_details) + '. '
+        'All backends claim atomically from one central queue; each full-frame view is committed '
+        f'to exactly one result contract before its first task leaves that queue. {inference_routing_note}'
     )
     if gpu_worker_process_active and cpu_worker_process_active:
         spec_notes.append(
             'Mask/prototype processing is backend-local in hybrid mode: CUDA tasks reduce and '
             'warp their proto/mask unions on the GPU, while OpenVINO tasks reconstruct '
-            'bbox-ROI retina-quality masks on the CPU from raw head/prototype outputs. Both '
-            'publish the same view-local binary/confidence contract; there is no global '
+            'bbox-ROI retina-quality masks on the CPU from raw head/prototype outputs. CPU-owned '
+            'views use one shared direct-union binary/confidence contract for both backends; '
+            'CUDA-owned eligible views use D1 and are no longer CPU-claimable. There is no global '
             '--retina_mask_processor selection.'
         )
     elif cpu_worker_process_active:
@@ -42759,9 +42844,9 @@ def main() -> None:
     # inference subprocesses already consume ~visible_cpu render threads (the GPU-blocking pools), so
     # the main-process GPU-non-blocking pools take only the remaining headroom of the 2x box target.
     worker_budget = int(main_process_worker_budget(int(gpu_device_count), bool(gpu_worker_process_active)))
-    if cpu_worker_process_active:
-        # OpenVINO owns almost all socket-local cores. Bound parent pools to the CPUs left
-        # outside those masks so legacy 2x oversubscription cannot fight AMX inference.
+    if cpu_worker_process_active and not hybrid_cpu_affinity_overlap_active:
+        # Exclusive mode bounds parent pools to CPUs outside OpenVINO masks. Hybrid overlap
+        # mode intentionally preserves the ordinary CUDA-side worker budget instead.
         parent_logical = max(1, int(len(main_process_reserved_cpus)))
         worker_budget = max(1, min(int(worker_budget), 2 * int(parent_logical)))
     whole_box_worker_budget = int(default_worker_budget())
@@ -42886,13 +42971,22 @@ def main() -> None:
     )
     if bool(gpu_worker_process_active):
         _gpu_share = int(gpu_worker_cpu_share(int(gpu_device_count)))
-        print(
-            'Worker oversubscription is intentional (whole-box target = 2x visible CPUs = '
-            f'{whole_box_worker_budget}). CUDA workers ({gpu_device_count} GPU(s)): each inference '
-            f'subprocess uses ~{_gpu_share} render thread(s) ({_gpu_share * int(gpu_device_count)} total '
-            'for GPU-blocking work), so the GPU-non-blocking main-process pools are sized to the '
-            f'remaining {worker_budget} to keep the box near 2:1 instead of oversubscribing it.'
-        )
+        if hybrid_cpu_affinity_overlap_active:
+            print(
+                'Hybrid helper overlap is intentional: CUDA workers retain topology-local helper '
+                f'pools (~{_gpu_share} thread(s)/GPU before the measured NUMA split) and the main '
+                f'process retains {worker_budget} workers while OpenVINO stays pinned to its '
+                'socket-local masks. The helper pools are low-duty in the measured GPU-only run; '
+                'YOLO_TTA_HYBRID_CPU_AFFINITY_OVERLAP=0 restores exclusive accounting.'
+            )
+        else:
+            print(
+                'Worker oversubscription is intentional (whole-box target = 2x visible CPUs = '
+                f'{whole_box_worker_budget}). CUDA workers ({gpu_device_count} GPU(s)): each inference '
+                f'subprocess uses ~{_gpu_share} render thread(s) ({_gpu_share * int(gpu_device_count)} total '
+                'for GPU-blocking work), so the GPU-non-blocking main-process pools are sized to the '
+                f'remaining {worker_budget} to keep the box near 2:1 instead of oversubscribing it.'
+            )
     else:
         print('Inference-phase worker pools are bounded against live GPU/OpenVINO process reservations; tail-only pools may expand after inference drains.')
     print(f'Augmentation workers: {augmentation_workers}')
@@ -43589,7 +43683,7 @@ def main() -> None:
         # Interpolated views retain a real pathname because the isolated interpolation
         # backend reopens them by path. Every process-worker direct-union view (CUDA and/or
         # OpenVINO) must instead have reopenable shared backing; ordinary in-process views
-        # may prefer anonymous RAM. v17.0.1 fixes hybrid D1 runs where GPU direct union is
+        # may prefer anonymous RAM. v17.0.1 fixed hybrid D1 runs where GPU direct union was
         # disabled for GPU-only views but CPU-eligible views still write a common direct union.
         process_worker_direct_union = bool(worker_direct_union_active)
         union_prefer_memory = not (
@@ -44485,6 +44579,17 @@ def main() -> None:
     d1_owner_by_parent: Dict[Tuple[str, str], int] = {}
     d1_active_parent_by_worker: Dict[int, Tuple[str, str]] = {}
     d1_layer_ref_by_parent: Dict[Tuple[str, str], NrrdLayerRef] = {}
+    # Hybrid full-frame views are deliberately committed as a whole. A CPU first claim
+    # selects the existing process-shareable direct-union contract; a CUDA first claim
+    # selects D1 and removes every remaining lease of that view from CPU eligibility.
+    # The ETA gate can dispatch either the active CPU-owned view or a still-unclaimed view.
+    hybrid_view_mode_by_parent: Dict[Tuple[str, str], str] = {}
+    fullframe_task_ids_by_parent: Dict[Tuple[str, str], List[int]] = {}
+    gpu_worker_hybrid_steal_inflight_task_ids: set[int] = set()
+    gpu_worker_hybrid_steal_completed_task_ids: set[int] = set()
+    hybrid_gpu_claim_started = False
+    hybrid_stealback_announced = False
+    gpu_worker_seed_task_count = 0
 
     def _tile_dense_result_task_bytes(task: Dict[str, object]) -> int:
         if str(task.get('kind', '')) != 'tile':
@@ -44895,6 +45000,7 @@ def main() -> None:
             parent_key = _gpu_worker_fullframe_parent_key(task)
             if parent_key is not None:
                 fullframe_remaining[parent_key] = int(fullframe_remaining.get(parent_key, 0)) + 1
+                fullframe_task_ids_by_parent.setdefault(parent_key, []).append(int(child_id))
             runtime_telemetry().add('scheduler.runtime_lease_splits', 1)
             # The selected front lease is now target-sized; leave the remainder central so
             # C3 can place it on the least-loaded eligible worker/owner.
@@ -44909,6 +45015,159 @@ def main() -> None:
         if view_name is None:
             return None
         return (str(task.get('model_name', '')), str(view_name))
+
+    def _hybrid_task_parent_key(
+        task: Dict[str, object],
+    ) -> Optional[Tuple[str, str]]:
+        if not bool(task.get('hybrid_cpu_eligible_origin', False)):
+            return None
+        return _gpu_worker_fullframe_parent_key(task)
+
+    def _hybrid_parent_state(parent: Optional[Tuple[str, str]]) -> str:
+        if parent is None:
+            return 'not_hybrid'
+        return str(hybrid_view_mode_by_parent.get(parent, 'unclaimed'))
+
+    def _active_cpu_shared_parent() -> Optional[Tuple[str, str]]:
+        active = [
+            parent for parent, mode in hybrid_view_mode_by_parent.items()
+            if str(mode) == 'direct_union'
+            and int(fullframe_remaining.get(parent, 0)) > 0
+        ]
+        if len(active) > 1:
+            raise RuntimeError(
+                f'hybrid scheduler opened more than one CPU direct-union view: {active}'
+            )
+        return active[0] if active else None
+
+    def _commit_hybrid_fullframe_mode(
+        task: Dict[str, object], requested_mode: str, *, backend_label: str,
+    ) -> str:
+        """Commit every lease of one CPU-eligible view to one result contract."""
+        requested = str(requested_mode)
+        if requested not in {'d1_owner', 'direct_union'}:
+            raise ValueError(f'invalid hybrid result mode {requested!r}')
+        parent = _hybrid_task_parent_key(task)
+        if parent is None:
+            return str(task.get('result_mode', 'file'))
+        existing = hybrid_view_mode_by_parent.get(parent)
+        if existing is not None:
+            if str(existing) != requested:
+                raise RuntimeError(
+                    f'hybrid view {parent} was already committed to {existing}, '
+                    f'cannot recommit it to {requested}'
+                )
+            return str(existing)
+        if str(task.get('result_mode', 'file')) != HYBRID_DEFERRED_RESULT_MODE:
+            raise RuntimeError(
+                f'hybrid view {parent} reached first claim with result_mode='
+                f'{task.get("result_mode")!r}'
+            )
+        task_ids = list(fullframe_task_ids_by_parent.get(parent, ()))
+        if not task_ids:
+            raise RuntimeError(f'hybrid view {parent} has no indexed full-frame tasks')
+        hybrid_view_mode_by_parent[parent] = requested
+        changed = 0
+        for indexed_task_id in task_ids:
+            candidate = gpu_worker_tasks_by_id[int(indexed_task_id)]
+            candidate_mode = str(candidate.get('result_mode', 'file'))
+            if candidate_mode == HYBRID_DEFERRED_RESULT_MODE:
+                candidate['result_mode'] = requested
+                candidate['hybrid_committed_backend'] = str(backend_label)
+                candidate['device_hole_fill'] = False
+                if requested == 'd1_owner':
+                    candidate['cpu_eligible'] = False
+                changed += 1
+            elif candidate_mode != requested:
+                raise RuntimeError(
+                    f'hybrid view {parent} contains mixed result contracts: '
+                    f'{candidate_mode} vs {requested}'
+                )
+        runtime_telemetry().add(f'hybrid.view_commits.{requested}', 1)
+        print(
+            f'[hybrid] first claim committed {parent[0]}/{parent[1]} to {requested} '
+            f'via {backend_label}; {changed} lease descriptor(s) updated.'
+        )
+        return requested
+
+    def _hybrid_gpu_selection_rank(task: Dict[str, object]) -> int:
+        parent = _hybrid_task_parent_key(task)
+        mode = str(task.get('result_mode', 'file'))
+        if parent is not None and mode == 'direct_union':
+            return 0
+        if mode == 'd1_owner' and _d1_task_parent_key(task) in d1_owner_by_parent:
+            return 1
+        if parent is None:
+            return 2
+        if mode == 'd1_owner':
+            return 3
+        if mode == HYBRID_DEFERRED_RESULT_MODE:
+            return 4
+        return 5
+
+    def _hybrid_gpu_stealback_quota(
+        gpu_only_pairs: Sequence[Tuple[int, int]],
+        cpu_eligible_pairs: Sequence[Tuple[int, int]],
+    ) -> int:
+        """Return how many live CUDA slots may serve CPU-owned or unclaimed work."""
+        nonlocal hybrid_stealback_announced
+        if (
+            not hybrid_gpu_stealback_enabled()
+            or not gpu_only_pairs
+            or not cpu_eligible_pairs
+            or not cpu_task_queues
+            or not gpu_task_queues
+        ):
+            return 0
+        gpu_workers = max(1, len(gpu_task_queues))
+        cpu_workers = max(1, len(cpu_task_queues))
+        gpu_committed = float(sum(gpu_worker_predicted_load_by_id.values()))
+        cpu_committed = float(sum(cpu_worker_predicted_load_by_id.values()))
+        gpu_pending = float(sum(
+            _gpu_worker_task_seconds(gpu_worker_tasks_by_id[int(task_id)])
+            for _position, task_id in gpu_only_pairs
+        ))
+        cpu_pending = float(sum(
+            _cpu_worker_task_seconds(gpu_worker_tasks_by_id[int(task_id)])
+            for _position, task_id in cpu_eligible_pairs
+        ))
+        gpu_only_eta = (gpu_committed + gpu_pending) / float(gpu_workers)
+        cpu_eta = (cpu_committed + cpu_pending) / float(cpu_workers)
+        threshold = (
+            float(gpu_only_eta) * float(hybrid_gpu_stealback_eta_ratio())
+            + float(hybrid_gpu_stealback_min_lead_seconds())
+        )
+        runtime_telemetry().gauge('hybrid.cpu_eligible_eta_seconds', float(cpu_eta))
+        runtime_telemetry().gauge('hybrid.gpu_only_eta_seconds', float(gpu_only_eta))
+        if cpu_eta <= threshold:
+            return 0
+        per_gpu_window = (
+            max(1, min(4, _env_int('YOLO_TTA_V1613_D1_DISPATCH_WINDOW_PER_GPU', 2)))
+            if bool(v1613_d1_owner_active) else
+            max(1, _env_int('YOLO_TTA_GPU_WORKER_DISPATCH_WINDOW_PER_GPU', 2))
+        )
+        total_slots = max(1, int(gpu_workers) * int(per_gpu_window))
+        max_fraction = float(hybrid_gpu_stealback_max_fraction())
+        if max_fraction <= 0.0:
+            return 0
+        urgency = max(
+            0.0,
+            min(1.0, (float(cpu_eta) - float(threshold)) / max(float(cpu_eta), 1e-9)),
+        )
+        fraction = max(
+            1.0 / float(total_slots),
+            min(float(max_fraction), float(urgency)),
+        )
+        quota = max(1, min(int(total_slots), int(math.ceil(float(total_slots) * fraction))))
+        runtime_telemetry().gauge('hybrid.gpu_stealback_slot_quota', int(quota))
+        if not hybrid_stealback_announced:
+            hybrid_stealback_announced = True
+            print(
+                'v17.0.2 ETA-driven GPU stealback active: '
+                f'CPU-eligible ETA={cpu_eta:.1f}s, GPU-only ETA={gpu_only_eta:.1f}s, '
+                f'CUDA CPU-eligible slot quota={quota}/{total_slots}.'
+            )
+        return int(quota)
 
     def _d1_task_parent_key(task: Dict[str, object]) -> Optional[Tuple[str, str]]:
         if not bool(v1613_d1_owner_active):
@@ -45065,6 +45324,7 @@ def main() -> None:
         parent_key = _gpu_worker_fullframe_parent_key(original)
         if parent_key is not None:
             fullframe_remaining[parent_key] = int(fullframe_remaining.get(parent_key, 0)) + 1
+            fullframe_task_ids_by_parent.setdefault(parent_key, []).append(int(child_id))
         print(
             f'v13.3.18 (C11): dispatch tail split task {original_id} '
             f'[{original_start}:{original_stop}] -> [{original_start}:{midpoint}] + '
@@ -45150,33 +45410,54 @@ def main() -> None:
             eligible.append((int(position), int(task_id)))
         if not eligible:
             return None
-        # GPUs always drain work that CPU cannot execute (Radial/Tilted-Radial/D1) before
-        # stealing any still-unclaimed Cartesian or Tilted Cartesian lease.
+
         gpu_only = [
             pair for pair in eligible
             if not bool(gpu_worker_tasks_by_id[int(pair[1])].get('cpu_eligible', False))
         ]
+        cpu_eligible = [
+            pair for pair in eligible
+            if bool(gpu_worker_tasks_by_id[int(pair[1])].get('hybrid_cpu_eligible_origin', False))
+            and str(gpu_worker_tasks_by_id[int(pair[1])].get('result_mode', 'file'))
+            in {'direct_union', HYBRID_DEFERRED_RESULT_MODE}
+        ]
+        early_steal_ids: set[int] = set()
         if gpu_only:
-            eligible = gpu_only
+            quota = _hybrid_gpu_stealback_quota(gpu_only, cpu_eligible)
+            steal_slots_open = max(
+                0,
+                int(quota) - int(len(gpu_worker_hybrid_steal_inflight_task_ids)),
+            )
+            if steal_slots_open > 0 and cpu_eligible:
+                # An open ETA quota must select CPU-eligible work, not merely append it
+                # behind GPU-only D1 work. The v17.0.1-style family ranking otherwise
+                # makes every unopened hybrid view lose to Radial until the GPU-only
+                # queue reaches zero, so "stealback" never actually starts early.
+                eligible = list(cpu_eligible)
+                early_steal_ids = {int(task_id) for _position, task_id in cpu_eligible}
+            else:
+                eligible = list(gpu_only)
+
         parent_pending_counts: Dict[Tuple[str, str], int] = {}
         for _position, task_id in eligible:
             parent_key = _gpu_worker_fullframe_parent_key(gpu_worker_tasks_by_id[int(task_id)])
             if parent_key is not None:
                 parent_pending_counts[parent_key] = int(parent_pending_counts.get(parent_key, 0)) + 1
-        unlock_candidates: List[Tuple[int, int, int, int]] = []
+        unlock_candidates: List[Tuple[int, int, int, int, int]] = []
         for position, task_id in eligible:
             task = gpu_worker_tasks_by_id[int(task_id)]
             parent_key = _gpu_worker_fullframe_parent_key(task)
             if parent_key is None or int(parent_pending_counts.get(parent_key, 0)) != 1:
                 continue
             unlock_candidates.append((
+                _hybrid_gpu_selection_rank(task),
                 0 if parent_key == preferred_parent else 1,
                 int(fullframe_remaining.get(parent_key, 2 ** 31 - 1)),
                 int(position),
                 int(task_id),
             ))
         if unlock_candidates:
-            _preferred, _remaining, _position, selected_id = min(unlock_candidates)
+            _hybrid_rank, _preferred, _remaining, _position, selected_id = min(unlock_candidates)
         else:
             parent_seconds: Dict[Optional[Tuple[str, str]], float] = {}
             for _position_i, task_id_i in eligible:
@@ -45186,6 +45467,7 @@ def main() -> None:
             selected_id = min(
                 eligible,
                 key=lambda pair: (
+                    _hybrid_gpu_selection_rank(gpu_worker_tasks_by_id[int(pair[1])]),
                     # Continue an already-owned D1 view before opening another owner bitset.
                     0 if _d1_task_parent_key(gpu_worker_tasks_by_id[int(pair[1])]) in d1_owner_by_parent else 1,
                     0 if (_direct_union_task_key(gpu_worker_tasks_by_id[int(pair[1])]) in direct_union_inference_views) else 1,
@@ -45195,6 +45477,10 @@ def main() -> None:
                     int(pair[0]),
                 ),
             )[1]
+        selected_task = gpu_worker_tasks_by_id[int(selected_id)]
+        selected_task['hybrid_gpu_steal_dispatch'] = bool(
+            int(selected_id) in early_steal_ids
+        )
         gpu_worker_pending_task_ids.remove(int(selected_id))
         return int(selected_id), list(feasible_by_id[int(selected_id)])
 
@@ -45264,6 +45550,7 @@ def main() -> None:
     ) -> None:
         """Issue bounded, targeted worker leases with D1 owner affinity."""
         nonlocal gpu_worker_dispatched_tasks, gpu_worker_dispatch_cursor
+        nonlocal hybrid_gpu_claim_started
         worker_ids = sorted(int(worker_id) for worker_id in gpu_task_queues)
         if not worker_ids:
             _set_main_process_gpu_pending_inference(False)
@@ -45296,10 +45583,24 @@ def main() -> None:
             selected = _pop_gpu_worker_pending_task_id(preferred_parent, candidates)
             if selected is None:
                 break
-            task_id, feasible_workers = selected
+            task_id, _precommit_feasible_workers = selected
+            task_to_dispatch = gpu_worker_tasks_by_id[int(task_id)]
+            early_steal_dispatch = bool(
+                task_to_dispatch.get('hybrid_gpu_steal_dispatch', False)
+            )
+            if (
+                bool(task_to_dispatch.get('hybrid_cpu_eligible_origin', False))
+                and str(task_to_dispatch.get('result_mode', 'file')) == HYBRID_DEFERRED_RESULT_MODE
+            ):
+                _commit_hybrid_fullframe_mode(
+                    task_to_dispatch, 'd1_owner', backend_label='CUDA',
+                )
+                hybrid_gpu_claim_started = True
             task_id = _split_gpu_worker_task_to_runtime_target(int(task_id))
             task_to_dispatch = gpu_worker_tasks_by_id[int(task_id)]
-            feasible_workers = _d1_feasible_workers(task_to_dispatch, feasible_workers)
+            if str(task_to_dispatch.get('result_mode', 'file')) == HYBRID_DEFERRED_RESULT_MODE:
+                raise RuntimeError('GPU dispatch retained an unresolved hybrid result contract')
+            feasible_workers = _d1_feasible_workers(task_to_dispatch, candidates)
             if not feasible_workers:
                 gpu_worker_pending_task_ids.appendleft(int(task_id))
                 break
@@ -45330,6 +45631,7 @@ def main() -> None:
                 if tile_storage_reserved:
                     _prepare_tile_dense_result_workspaces(task_to_dispatch)
                 dispatch_task = dict(task_to_dispatch)
+                dispatch_task.pop('hybrid_gpu_steal_dispatch', None)
                 _attach_memfd_transfers_to_task(dispatch_task)
                 gpu_task_queues[int(worker_id)].put(dispatch_task)
             except BaseException:
@@ -45345,6 +45647,20 @@ def main() -> None:
                 gpu_worker_pending_task_ids.appendleft(int(task_id))
                 _main_process_gpu_stage_finish_inference(worker_id)
                 raise
+            task_to_dispatch.pop('hybrid_gpu_steal_dispatch', None)
+            if early_steal_dispatch:
+                task_to_dispatch['hybrid_gpu_steal_dispatched'] = True
+                gpu_worker_hybrid_steal_inflight_task_ids.add(int(task_id))
+                hybrid_gpu_claim_started = True
+                steal_mode = str(task_to_dispatch.get('result_mode', 'file'))
+                runtime_telemetry().add('hybrid.gpu_steal_tasks_dispatched', 1)
+                runtime_telemetry().add(
+                    'hybrid.gpu_steal_frames_dispatched',
+                    int(task_to_dispatch.get('slice_count', 0)),
+                )
+                runtime_telemetry().add(
+                    f'hybrid.gpu_steal_mode.{_sanitize_filesystem_token(steal_mode)}', 1,
+                )
             gpu_worker_dispatched_tasks += 1
             gpu_worker_dispatched_by_id[int(worker_id)] = int(
                 gpu_worker_dispatched_by_id.get(int(worker_id), 0)
@@ -45381,6 +45697,77 @@ def main() -> None:
             observed if prior is None else (1.0 - alpha) * float(prior) + alpha * observed
         )
 
+    def _split_cpu_worker_task_to_runtime_target(task_id: int) -> int:
+        """Split an oversized seed only when OpenVINO actually claims it."""
+        nonlocal gpu_worker_total_tasks, gpu_worker_next_dynamic_task_id
+        current_id = int(task_id)
+        task = gpu_worker_tasks_by_id[current_id]
+        if str(task.get('kind', '')) != 'fullframe' or bool(task.get('disable_runtime_split', False)):
+            return current_id
+        count = int(task.get('slice_count', 0))
+        if count <= 1:
+            return current_id
+        view_obj = task.get('view')
+        key = ('cpu',) + tuple(gpu_worker_task_cost_key(task))
+        sec_per_frame = cpu_worker_seconds_per_frame_ewma.get(key)
+        if sec_per_frame is None:
+            sec_per_frame = (
+                cpu_worker_default_seconds_per_frame(view_obj)
+                if isinstance(view_obj, ViewInfo) else 0.25
+            )
+        align = max(1, int(args.cpu_batch))
+        target_count = int(round(cpu_worker_target_lease_seconds() / max(1e-5, float(sec_per_frame))))
+        target_count = max(
+            cpu_worker_min_lease_slices(),
+            min(cpu_worker_max_lease_slices(), int(target_count)),
+        )
+        target_count = max(align, int(math.ceil(float(target_count) / float(align))) * align)
+        if count <= target_count:
+            return current_id
+        remainder = int(count - target_count)
+        # Do not manufacture a tiny tail merely to hit the target exactly. The supplied
+        # workload's 57- and 44-frame GPU seeds therefore remain intact for OpenVINO,
+        # filling its 18/20 asynchronous request pools without recreating 7/10-slice tasks.
+        min_useful_remainder = max(
+            cpu_worker_min_lease_slices(),
+            int(math.ceil(float(target_count) * 0.50)),
+        )
+        if remainder < int(min_useful_remainder):
+            return current_id
+        start = int(task.get('slice_start', 0))
+        stop = int(start + count)
+        split_at = int(start + target_count)
+        child_id = int(gpu_worker_next_dynamic_task_id)
+        gpu_worker_next_dynamic_task_id += 1
+        child = dict(task)
+        task['slice_count'] = int(split_at - start)
+        task['render_workers'] = max(
+            1, min(int(task.get('render_workers', 1)), int(split_at - start)),
+        )
+        child['task_id'] = int(child_id)
+        child['slice_start'] = int(split_at)
+        child['slice_count'] = int(stop - split_at)
+        child['render_workers'] = max(
+            1, min(int(child.get('render_workers', 1)), int(stop - split_at)),
+        )
+        child['cpu_runtime_split_parent_task_id'] = int(current_id)
+        task['cpu_runtime_split_child_task_id'] = int(child_id)
+        if str(child.get('result_mode', 'file')) != 'direct_union':
+            for field_name in ('result_mask_path', 'result_conf_path'):
+                raw_path = child.get(field_name)
+                if raw_path:
+                    path_obj = Path(str(raw_path))
+                    child[field_name] = str(path_obj.with_name(f'{path_obj.name}.cpu{child_id}'))
+        gpu_worker_tasks_by_id[int(child_id)] = child
+        gpu_worker_pending_task_ids.append(int(child_id))
+        gpu_worker_total_tasks += 1
+        parent_key = _gpu_worker_fullframe_parent_key(task)
+        if parent_key is not None:
+            fullframe_remaining[parent_key] = int(fullframe_remaining.get(parent_key, 0)) + 1
+            fullframe_task_ids_by_parent.setdefault(parent_key, []).append(int(child_id))
+        runtime_telemetry().add('scheduler.cpu_claim_lease_splits', 1)
+        return current_id
+
     def _cpu_worker_inflight(worker_id: int) -> int:
         worker = int(worker_id)
         return max(
@@ -45392,6 +45779,7 @@ def main() -> None:
     def _pop_cpu_worker_pending_task_id(
         preferred_parent: Optional[Tuple[str, str]] = None,
     ) -> Optional[int]:
+        active_cpu_parent = _active_cpu_shared_parent()
         eligible: List[Tuple[int, int]] = []
         for position, task_id in enumerate(list(gpu_worker_pending_task_ids)):
             task = gpu_worker_tasks_by_id[int(task_id)]
@@ -45399,6 +45787,22 @@ def main() -> None:
                 continue
             if str(task.get('result_mode', 'file')) == 'd1_owner':
                 continue
+            hybrid_parent = _hybrid_task_parent_key(task)
+            hybrid_state = _hybrid_parent_state(hybrid_parent)
+            if hybrid_parent is not None:
+                if hybrid_state == 'd1_owner':
+                    continue
+                if hybrid_state == 'unclaimed':
+                    # OpenVINO may open one shared view. Once CUDA has begun taking
+                    # CPU-eligible work, do not create another dense view merely because
+                    # the first view's current leases are all in flight.
+                    if active_cpu_parent is not None or hybrid_gpu_claim_started:
+                        continue
+                elif hybrid_state == 'direct_union':
+                    if active_cpu_parent is not None and hybrid_parent != active_cpu_parent:
+                        continue
+                else:
+                    continue
             if not _direct_union_task_admissible(task):
                 continue
             if not _tile_dense_result_task_admissible(task):
@@ -45409,6 +45813,9 @@ def main() -> None:
         selected = min(
             eligible,
             key=lambda pair: (
+                0 if _hybrid_parent_state(_hybrid_task_parent_key(
+                    gpu_worker_tasks_by_id[int(pair[1])]
+                )) == 'direct_union' else 1,
                 0 if _gpu_worker_fullframe_parent_key(
                     gpu_worker_tasks_by_id[int(pair[1])]
                 ) == preferred_parent else 1,
@@ -45417,6 +45824,7 @@ def main() -> None:
                     gpu_worker_tasks_by_id[int(pair[1])]
                 ) in direct_union_inference_views else 1,
                 _inference_storage_priority_rank(gpu_worker_tasks_by_id[int(pair[1])]),
+                -int(gpu_worker_tasks_by_id[int(pair[1])].get('slice_count', 0)),
                 int(pair[0]),
             ),
         )[1]
@@ -45426,7 +45834,7 @@ def main() -> None:
     def _dispatch_cpu_worker_inference_window(
         preferred_parent: Optional[Tuple[str, str]] = None,
     ) -> None:
-        """Issue one shallow lease per socket so GPUs can steal every unclaimed remainder."""
+        """Issue one claim-time-sized range per socket from the CPU-opened view."""
         nonlocal cpu_worker_dispatch_cursor
         worker_ids = sorted(int(worker_id) for worker_id in cpu_task_queues)
         if not worker_ids:
@@ -45441,6 +45849,21 @@ def main() -> None:
             task_id = _pop_cpu_worker_pending_task_id(preferred_parent)
             if task_id is None:
                 break
+            task = gpu_worker_tasks_by_id[int(task_id)]
+            if (
+                bool(task.get('hybrid_cpu_eligible_origin', False))
+                and str(task.get('result_mode', 'file')) == HYBRID_DEFERRED_RESULT_MODE
+            ):
+                _commit_hybrid_fullframe_mode(
+                    task, 'direct_union', backend_label='OpenVINO',
+                )
+            task = gpu_worker_tasks_by_id[int(task_id)]
+            if str(task.get('result_mode', 'file')) == HYBRID_DEFERRED_RESULT_MODE:
+                raise RuntimeError('CPU dispatch retained an unresolved hybrid result contract')
+            if not _direct_union_task_admissible(task):
+                gpu_worker_pending_task_ids.appendleft(int(task_id))
+                break
+            task_id = _split_cpu_worker_task_to_runtime_target(int(task_id))
             task = gpu_worker_tasks_by_id[int(task_id)]
             start_rank = int(cpu_worker_dispatch_cursor) % len(worker_ids)
             position = {
@@ -45484,10 +45907,11 @@ def main() -> None:
     def _dispatch_inference_windows(
         preferred_parent: Optional[Tuple[str, str]] = None,
     ) -> None:
-        # Give each idle socket-local OpenVINO worker one short Cartesian/Tilted lease first.
-        # CUDA selection then fills every available GPU slot, internally preferring GPU-only
-        # Radial/D1 work before stealing any still-unclaimed CPU-eligible lease. All claims run
-        # in this main-thread function, so every task leaves the central deque exactly once.
+        # Give each idle socket-local OpenVINO worker one claim-time-sized range from the
+        # single CPU-opened shared view. CUDA then fills every GPU slot, using live ETA to
+        # decide when to assist that view or claim an unopened eligible view as D1 before
+        # GPU-only Radial/D1 work reaches zero.
+        # All ownership transitions and range claims run on this main thread.
         _dispatch_cpu_worker_inference_window(preferred_parent)
         _dispatch_gpu_worker_inference_window(preferred_parent)
 
@@ -45604,7 +46028,12 @@ def main() -> None:
         # discovery-driven GPU-worker -> NUMA-node CPU pin plan (None entries
         # stay unpinned). Computed from the PHYSICAL tokens before CUDA_VISIBLE_DEVICES is
         # narrowed inside the workers.
-        worker_numa_plan = plan_gpu_worker_affinity(pinned_tokens, excluded_cpus=cpu_inference_reserved_cpus)
+        worker_numa_plan = plan_gpu_worker_affinity(
+            pinned_tokens,
+            excluded_cpus=(
+                () if hybrid_cpu_affinity_overlap_active else cpu_inference_reserved_cpus
+            ),
+        )
         explicit_worker_cpu = bool(os.environ.get('YOLO_TTA_GPU_WORKER_CPU', '').strip())
         worker_cpu_budgets: List[int] = []
         for worker_pos, cpus in enumerate(worker_numa_plan):
@@ -45842,7 +46271,10 @@ def main() -> None:
                     )
                 if not initial_lease_candidates:
                     raise RuntimeError(f'No inference backend is eligible for {view.name}')
-                initial_chunk = min(int(slice_chunk), *initial_lease_candidates)
+                # v17.0.2 seeds at the LARGEST eligible backend target. The previous
+                # minimum permanently fragmented every GPU steal into 7/10-slice CPU
+                # leases. A backend may split an oversized seed only when it claims it.
+                initial_chunk = min(int(slice_chunk), max(initial_lease_candidates))
                 ranges = gpu_worker_fullframe_task_ranges(
                     int(n_slices), int(initial_chunk),
                 )
@@ -45885,7 +46317,21 @@ def main() -> None:
                     cpu_worker_process_active and cpu_inference_supports_view(view)
                 )
                 gpu_eligible = bool(gpu_worker_process_active)
-                if str(kind) == 'fullframe' and v1613_d1_owner_active and not cpu_eligible:
+                hybrid_deferred = bool(
+                    str(kind) == 'fullframe'
+                    and v1613_d1_owner_active
+                    and worker_direct_union_active
+                    and cpu_eligible
+                    and gpu_eligible
+                )
+                if hybrid_deferred:
+                    # First claim resolves the whole view: OpenVINO -> shared direct union;
+                    # CUDA -> D1. This prevents mere CPU eligibility from disabling D1 for
+                    # every Cartesian/Tilted view before either backend performs work.
+                    rmask = None
+                    rconf = None
+                    result_mode = HYBRID_DEFERRED_RESULT_MODE
+                elif str(kind) == 'fullframe' and v1613_d1_owner_active and not cpu_eligible:
                     # D1 retains only a task-local device union and one persistent source-space
                     # bitset on the owner GPU. No host result path or dense per-view workspace exists.
                     rmask = None
@@ -45924,6 +46370,7 @@ def main() -> None:
                     'result_mask_path': (str(rmask) if rmask is not None else None),
                     'result_conf_path': (str(rconf) if rconf is not None else None),
                     'result_mode': str(result_mode), 'union_num_slices': int(n_slices),
+                    'hybrid_cpu_eligible_origin': bool(hybrid_deferred),
                     'render_workers': int(render_workers), 'prefetch_frames': int(prefetch_frames),
                     'postprocess_workers': int(per_worker_workers),
                     'streaming_cleanup_enabled': bool(angle_variant_streaming_cleanup_active),
@@ -45936,7 +46383,7 @@ def main() -> None:
                         and (len(ranges) <= 1 or chunk_hole_fill_enabled)
                     ),
                 }
-                if str(result_mode) == 'd1_owner':
+                if str(result_mode) in {'d1_owner', HYBRID_DEFERRED_RESULT_MODE}:
                     d1_key = _nrrd_layer_key(
                         view_name=str(view.name), source='fullframe', mask_kind='yolo',
                         pass_index=0, stage='pre_interpolation',
@@ -45947,6 +46394,9 @@ def main() -> None:
                         / f'{d1_key}.orthogonal.cvol'
                     )
                 gpu_worker_tasks_by_id[int(next_task_id)] = task
+                if str(kind) == 'fullframe':
+                    parent_key = (str(model_name), str(view.name))
+                    fullframe_task_ids_by_parent.setdefault(parent_key, []).append(int(next_task_id))
                 if str(kind) == 'tile':
                     tile_key = (str(model_name), str(view.name), str(job_id))
                     if tile_key in gpu_worker_tile_task_id_by_key:
@@ -45954,6 +46404,7 @@ def main() -> None:
                     gpu_worker_tile_task_id_by_key[tile_key] = int(next_task_id)
                 next_task_id += 1
         gpu_worker_total_tasks = int(next_task_id)
+        gpu_worker_seed_task_count = int(next_task_id)
         gpu_worker_next_dynamic_task_id = int(next_task_id)
         # A full-frame view is finalized only after every (angle x slice-chunk) result for it has been
         # unioned, so override fullframe_remaining with the per-view sub-task count.
@@ -46011,6 +46462,7 @@ def main() -> None:
         # A monitor applies strict parent/OpenVINO core isolation immediately after publication.
         defer_parent_affinity_until_cube = bool(
             cpu_worker_process_active
+            and not hybrid_cpu_affinity_overlap_active
             and source_volume_ready_async
             and isinstance(native_resize_task_spec, dict)
             and native_resize_task_spec.get('sentinel')
@@ -46051,13 +46503,16 @@ def main() -> None:
         if cpu_worker_process_active:
             lease_details.append(f'CPU target={cpu_worker_target_lease_seconds():.2f}s')
         hybrid_policy = (
-            ' GPU-only work is selected first; GPUs automatically steal remaining '
-            'unclaimed Cartesian/Tilted leases.'
+            ' Hybrid full-frame views use first-claim ownership; OpenVINO opens at most one '
+            'shared direct-union view at a time, while CUDA uses live ETA to assist that view '
+            'or claim unopened eligible views as D1 before GPU-only work drains.'
             if gpu_worker_process_active and cpu_worker_process_active else ''
         )
+        dynamic_splits = max(0, int(gpu_worker_total_tasks) - int(gpu_worker_seed_task_count))
         print(
-            f'v17 process-local leases: {gpu_worker_total_tasks} inference task(s) retained '
-            f'in one bounded central dispatch window (max initial full-frame chunk={slice_chunk}; '
+            f'v17 process-local leases: {gpu_worker_seed_task_count} seed inference task(s) retained '
+            f'in one bounded central dispatch window; {gpu_worker_total_tasks} task(s) currently '
+            f'tracked after {dynamic_splits} claim-time split(s) (hard full-frame chunk cap={slice_chunk}; '
             f'{", ".join(lease_details)}).{hybrid_policy}'
         )
     def _finalize_fullframe_view_after_worker(model_name_s: str, view: ViewInfo) -> None:
@@ -46255,6 +46710,31 @@ def main() -> None:
         )
         gpu_done = int(sum(gpu_worker_results_by_id.values()))
         cpu_done = int(sum(cpu_worker_results_by_id.values()))
+        hybrid_gpu_done = int(len(gpu_worker_hybrid_steal_completed_task_ids))
+        hybrid_gpu_frames = int(sum(
+            int(gpu_worker_tasks_by_id[task_id].get('slice_count', 0))
+            for task_id in gpu_worker_hybrid_steal_completed_task_ids
+            if task_id in gpu_worker_tasks_by_id
+        ))
+        hybrid_parents = {
+            parent
+            for task_obj in gpu_worker_tasks_by_id.values()
+            if bool(task_obj.get('hybrid_cpu_eligible_origin', False))
+            for parent in [_gpu_worker_fullframe_parent_key(task_obj)]
+            if parent is not None
+        }
+        unresolved_hybrid_parents = sorted(
+            parent for parent in hybrid_parents
+            if parent not in hybrid_view_mode_by_parent
+        )
+        if unresolved_hybrid_parents:
+            raise RuntimeError(
+                'inference drained with unresolved hybrid full-frame contracts: '
+                f'{unresolved_hybrid_parents}'
+            )
+        hybrid_contract_counts = Counter(
+            str(hybrid_view_mode_by_parent[parent]) for parent in hybrid_parents
+        )
         print('\n=== Process-local inference queue drained; scheduler postprocessing continues ===')
         drained_backend_notes: List[str] = []
         if gpu_worker_process_active:
@@ -46265,7 +46745,10 @@ def main() -> None:
             drained_backend_notes.append('OpenVINO workers are idle until shutdown')
         print(
             f'Inference tasks completed={int(gpu_worker_results_collected)}/'
-            f'{int(gpu_worker_total_tasks)} (GPU={gpu_done}, CPU={cpu_done}); '
+            f'{int(gpu_worker_total_tasks)} (GPU={gpu_done}, CPU={cpu_done}; '
+            f'GPU early stealback={hybrid_gpu_done} task(s)/{hybrid_gpu_frames} frame(s); '
+            f'hybrid contracts D1={int(hybrid_contract_counts.get("d1_owner", 0))}, '
+            f'direct_union={int(hybrid_contract_counts.get("direct_union", 0))}); '
             f'parent_postprocess={len(view_processing_futures)}, '
             f'tile_dense_results={len(gpu_worker_tile_dense_result_reservations)}/'
             f'{gpu_worker_tile_dense_result_task_limit} task(s), '
@@ -46393,6 +46876,7 @@ def main() -> None:
                     release_stats = dict(msg.get('stats') or {})
                     _update_gpu_worker_cost(task_for_cost, release_stats)
                     _release_d1_owner_if_complete(task_for_cost, worker_id, release_stats)
+            gpu_worker_hybrid_steal_inflight_task_ids.discard(int(task_id))
             # Refill immediately; final result publication may still be copying several
             # GiB over PCIe or committing metadata on a retirement lane.
             task = gpu_worker_tasks_by_id.get(task_id)
@@ -46431,6 +46915,7 @@ def main() -> None:
             task_for_cost = gpu_worker_tasks_by_id.get(task_id)
             if isinstance(task_for_cost, dict):
                 _update_gpu_worker_cost(task_for_cost, dict(msg.get('stats') or {}))
+        gpu_worker_hybrid_steal_inflight_task_ids.discard(int(task_id))
         gpu_worker_results_collected += 1
         gpu_worker_results_by_id[worker_id] = int(gpu_worker_results_by_id.get(worker_id, 0)) + 1
         if not bool(msg.get('ok')):
@@ -46440,6 +46925,12 @@ def main() -> None:
             )
         task = gpu_worker_tasks_by_id[int(task_id)]
         stats = dict(msg.get('stats') or {})
+        if bool(task.get('hybrid_gpu_steal_dispatched', False)):
+            gpu_worker_hybrid_steal_completed_task_ids.add(int(task_id))
+            runtime_telemetry().add('hybrid.gpu_steal_tasks_completed', 1)
+            runtime_telemetry().add(
+                'hybrid.gpu_steal_frames_completed', int(task.get('slice_count', 0)),
+            )
         _release_d1_owner_if_complete(task, worker_id, stats)
         # Refill before scheduler-side memmap union/postprocess so a worker does not wait
         # behind CPU handling of the result that just freed its window slot. Prefer the
