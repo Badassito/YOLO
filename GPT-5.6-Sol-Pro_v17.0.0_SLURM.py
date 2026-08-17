@@ -5,7 +5,7 @@ Current runtime behavior:
  - accepts gray/grey, RGB, or C{odd}S{stride} model-input channel layouts; contextual
    slices wrap for Radial/Tilted Radial views and clamp for Cartesian/Tilted Cartesian views
  - streams full-frame and tiled inputs, with optional GPU-resident rendering
- - uses one persistent worker process per CUDA device, including one-GPU runs
+ - uses one persistent worker process per CUDA device and one socket-local OpenVINO process per CPU instance
  - overlaps decode, rendering, inference, cleanup/interpolation, backprojection, and output writing
  - supports Cartesian, Tilted, and Radial view families with dense tiles and source-geometry fusion
  - treats every --angle value as an independent view variant through cleanup, interpolation,
@@ -13,7 +13,10 @@ Current runtime behavior:
  - retires each cleaned dense tile result immediately into a crop-local sparse CTILE store,
    so parent interpolation and component gates never retain GPU-worker uint8 result files
  - always wraps Radial and Tilted-Radial interpolation across the angular seam
- - uses Ultralytics' unified quantize setting for inference precision
+ - supports paired TensorRT GPU and OpenVINO CPU inference with automatic hybrid work stealing
+ - compiles one socket-local OpenVINO model per CPU instance and uses asynchronous infer requests
+ - routes Cartesian work to CPU first, then Tilted Cartesian; Radial families remain GPU-only
+ - resolves model, device, precision, and batch independently for gpu:/cpu: backends
  - writes optional active-view PNG/multi-page TIFF inputs and Slicer segmentation NRRDs
    as independent source-geometry component layers
  - uses the self-contained EDT medial-ridge centerline backend when explicitly enabled
@@ -24,6 +27,7 @@ Current runtime behavior:
 
 Dependencies:
  pip install opencv-python numpy scipy tifffile tqdm ultralytics
+ CPU inference additionally requires a current OpenVINO runtime (pip install openvino).
  Default fused CUDA Tilted/Radial path: cupy-cuda12x (or set YOLO_TTA_FUSED_DIRECT_RENDER=0).
  Optional: numba, deflate, isal, nvidia-ml-py.
  System: ffmpeg and ffprobe on PATH."""
@@ -68,8 +72,8 @@ import numpy as np
 
 GIB = 1024 ** 3
 NRRD_SPACE = "left-posterior-superior"
-SCRIPT_VERSION = '16.4.3'
-SCRIPT_VERSION_COMPACT = '1643'
+SCRIPT_VERSION = '17.0.0'
+SCRIPT_VERSION_COMPACT = '1700'
 SCRIPT_BASENAME = f'GPT-5.6-Sol-Pro_v{SCRIPT_VERSION}_SLURM.py'
 OUTPUT_NRRD_PREFIX = ''
 LEGACY_OUTPUT_NRRD_PREFIX = 'HW_'
@@ -753,7 +757,229 @@ def quantize_uses_fp16(value: object) -> bool:
 
 def quantize_display(value: object) -> str:
     resolved = resolve_quantize(value)
-    return 'default/fp32' if resolved is None else str(resolved)
+    return 'auto' if resolved is None else str(resolved)
+
+
+@dataclass(frozen=True)
+class BackendModelSelection:
+    """Tagged GPU/CPU model artifacts supplied through ``--model``."""
+
+    gpu: Optional[str] = None
+    cpu: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class BackendDeviceSelection:
+    """Logical CUDA devices plus the optional OpenVINO CPU backend."""
+
+    gpu_devices: Tuple[str, ...] = ()
+    cpu: bool = False
+
+
+@dataclass(frozen=True)
+class BackendPrecisionSelection:
+    """Resolved runtime precision for each selected inference backend."""
+
+    gpu: int | str | None = None
+    cpu: str = 'auto'
+
+
+@dataclass(frozen=True)
+class BackendBatchSelection:
+    """Static model batch requested independently for GPU and CPU."""
+
+    gpu: int = 1
+    cpu: int = 1
+
+
+def _cli_value_tokens(values: Sequence[str] | str | None) -> List[str]:
+    """Return argparse values without splitting a quoted model path containing spaces."""
+    if values is None:
+        return []
+    if isinstance(values, str):
+        try:
+            return [str(token) for token in shlex.split(values) if str(token).strip()]
+        except Exception:
+            return [token for token in str(values).split() if token]
+    return [str(value).strip() for value in values if str(value).strip()]
+
+
+def resolve_backend_models(values: Sequence[str] | str | None) -> BackendModelSelection:
+    """Resolve order-independent ``gpu:PATH`` and ``cpu:PATH`` model entries."""
+    resolved: Dict[str, str] = {}
+    for raw in _cli_value_tokens(values):
+        backend, sep, payload = str(raw).partition(':')
+        backend = backend.strip().lower()
+        if not sep or backend not in {'gpu', 'cpu'} or not payload.strip():
+            raise ValueError(
+                '--model requires one or both tagged entries: gpu:/path/to/model '
+                'cpu:/path/to/openvino'
+            )
+        if backend in resolved:
+            raise ValueError(f'--model contains duplicate {backend}: entries')
+        resolved[backend] = payload.strip()
+    if not resolved:
+        raise ValueError(
+            '--model requires one or both tagged entries: gpu:/path/to/model '
+            'cpu:/path/to/openvino'
+        )
+    return BackendModelSelection(gpu=resolved.get('gpu'), cpu=resolved.get('cpu'))
+
+
+def _append_gpu_device_tokens(raw: str, output: List[str]) -> None:
+    for token in re.split(r'[,\s]+', str(raw).strip().strip(',')):
+        token = token.strip().strip(',')
+        if not token:
+            continue
+        low = token.lower()
+        if low.startswith('gpu:'):
+            token = token.split(':', 1)[1]
+            low = token.lower()
+        if low.startswith('cuda:'):
+            index = low.split(':', 1)[1]
+        else:
+            index = low
+        if not index.isdigit():
+            raise ValueError(
+                f'--device GPU indexes must be non-negative integers; got {token!r}'
+            )
+        canonical = f'cuda:{int(index)}'
+        if canonical not in output:
+            output.append(canonical)
+
+
+def resolve_backend_devices(values: Sequence[str] | str | None) -> BackendDeviceSelection:
+    """Resolve ``GPU_INDEXES[:cpu]`` with both portions absent by default."""
+    gpu_devices: List[str] = []
+    cpu_enabled = False
+    for raw_token in _cli_value_tokens(values):
+        token = str(raw_token).strip()
+        low = token.lower()
+        if low in {'cpu', ':cpu'}:
+            cpu_enabled = True
+            continue
+        if low.endswith(':cpu'):
+            cpu_enabled = True
+            token = token[:-4].rstrip(':,')
+            if not token:
+                continue
+        _append_gpu_device_tokens(token, gpu_devices)
+    if not gpu_devices and not cpu_enabled:
+        raise ValueError(
+            '--device must select at least one backend: GPU indexes (for example 0,1,2,3), '
+            'cpu, or a hybrid value such as 0,1,2,3:cpu'
+        )
+    return BackendDeviceSelection(gpu_devices=tuple(gpu_devices), cpu=bool(cpu_enabled))
+
+
+_CPU_PRECISION_ALIASES: Dict[str, str] = {
+    'auto': 'auto', 'default': 'auto',
+    'bf16': 'bf16', 'bfloat16': 'bf16',
+    'fp32': 'fp32', 'f32': 'fp32', '32': 'fp32',
+    'fp16': 'fp16', 'f16': 'fp16', '16': 'fp16',
+    'int8': 'int8', 'i8': 'int8', '8': 'int8',
+}
+
+
+def _resolve_cpu_precision(value: object) -> str:
+    token = str(value).strip().lower()
+    resolved = _CPU_PRECISION_ALIASES.get(token)
+    if resolved is None:
+        expected = ', '.join(sorted(set(_CPU_PRECISION_ALIASES.values())))
+        raise ValueError(f'unsupported CPU precision {value!r}; expected one of: {expected}')
+    return resolved
+
+
+def resolve_backend_precisions(
+    values: Sequence[str] | str | None,
+    devices: BackendDeviceSelection,
+) -> BackendPrecisionSelection:
+    """Resolve tagged ``gpu:... cpu:...`` precision values and one-backend shorthand."""
+    tokens = _cli_value_tokens(values)
+    tagged: Dict[str, str] = {}
+    untagged: List[str] = []
+    for raw in tokens:
+        backend, sep, payload = str(raw).partition(':')
+        if sep and backend.lower() in {'gpu', 'cpu'}:
+            key = backend.lower()
+            if key in tagged:
+                raise ValueError(f'--quantize contains duplicate {key}: entries')
+            if not payload.strip():
+                raise ValueError(f'--quantize {key}: requires a precision value')
+            tagged[key] = payload.strip()
+        else:
+            untagged.append(str(raw).strip())
+    if tagged and untagged:
+        raise ValueError('--quantize cannot mix tagged and untagged values')
+    if untagged:
+        if len(untagged) != 1:
+            raise ValueError('--quantize accepts one shorthand value or tagged gpu:/cpu: values')
+        if devices.gpu_devices and devices.cpu:
+            raise ValueError(
+                'Hybrid --quantize values must be tagged, for example '
+                '--quantize gpu:fp16 cpu:bf16'
+            )
+        tagged['gpu' if devices.gpu_devices else 'cpu'] = untagged[0]
+    gpu_value: int | str | None = None
+    if 'gpu' in tagged:
+        gpu_token = tagged['gpu'].strip().lower()
+        gpu_value = None if gpu_token in {'auto', 'default', 'none'} else resolve_quantize(gpu_token)
+    cpu_value = _resolve_cpu_precision(tagged.get('cpu', 'auto'))
+    return BackendPrecisionSelection(gpu=gpu_value, cpu=cpu_value)
+
+
+def resolve_backend_batches(
+    values: Sequence[str] | str | None,
+    devices: BackendDeviceSelection,
+) -> BackendBatchSelection:
+    """Resolve tagged ``gpu:N cpu:N`` batch sizes and one-backend shorthand."""
+    tokens = _cli_value_tokens(values)
+    tagged: Dict[str, str] = {}
+    untagged: List[str] = []
+    for raw in tokens:
+        backend, sep, payload = str(raw).partition(':')
+        if sep and backend.lower() in {'gpu', 'cpu'}:
+            key = backend.lower()
+            if key in tagged:
+                raise ValueError(f'--batch contains duplicate {key}: entries')
+            tagged[key] = payload.strip()
+        else:
+            untagged.append(str(raw).strip())
+    if tagged and untagged:
+        raise ValueError('--batch cannot mix tagged and untagged values')
+    if untagged:
+        if len(untagged) != 1:
+            raise ValueError('--batch accepts one shorthand value or tagged gpu:/cpu: values')
+        if devices.gpu_devices and devices.cpu:
+            raise ValueError(
+                'Hybrid --batch values must be tagged, for example --batch gpu:1 cpu:1'
+            )
+        tagged['gpu' if devices.gpu_devices else 'cpu'] = untagged[0]
+
+    def _one(key: str) -> int:
+        raw = tagged.get(key, '1')
+        try:
+            value = int(raw)
+        except Exception as exc:
+            raise ValueError(f'--batch {key}:{raw} is not a positive integer') from exc
+        if value < 1:
+            raise ValueError(f'--batch {key}:{raw} must be >= 1')
+        return int(value)
+
+    return BackendBatchSelection(gpu=_one('gpu'), cpu=_one('cpu'))
+
+
+def resolve_auto_positive_int(value: object, *, flag_name: str) -> Optional[int]:
+    token = str(value).strip().lower()
+    if token in {'', 'auto', 'default', 'none'}:
+        return None
+    try:
+        resolved = int(token)
+    except Exception as exc:
+        raise ValueError(f'{flag_name} must be auto or a positive integer; got {value!r}') from exc
+    if resolved < 1:
+        raise ValueError(f'{flag_name} must be >= 1; got {resolved}')
+    return int(resolved)
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -774,18 +1000,23 @@ def build_argparser() -> argparse.ArgumentParser:
             "an explicit YOLO_TTA_SCRATCH_PREFER_SHM setting may select a roomy memory-backed root"
         ),
     )
-    p.add_argument("--device", nargs="+", default=["0"], type=str,
-                   help="Inference device(s). Accepts a single GPU index (0), multiple GPU indices separated by "
-                        "commas or spaces (0,1,2,3 or 0 1 2 3) for process-per-GPU scheduling, or cpu. GPU indices and "
-                        "cpu cannot be mixed. Indices are torch LOGICAL indices: when SLURM (or the shell) "
-                        "exports CUDA_VISIBLE_DEVICES, index N means the (N+1)-th device of that list, not the "
-                        "physical GPU id — e.g. under CUDA_VISIBLE_DEVICES=2,3 use --device 0,1 to run on "
-                        "physical GPUs 2 and 3")
-    p.add_argument("--retina_mask_processor", default=None, choices=["cpu", "gpu"], type=str,
-                   help="Device that resolves full-resolution retina masks. CUDA defaults to gpu for "
-                        "all CUDA runs; an explicit cpu/gpu value is honored. --device cpu "
-                        "forces cpu and overrides any explicit value")
-    p.add_argument("--model", required=True, type=str, help="Path to a single YOLO segmentation model")
+    p.add_argument(
+        "--device", nargs="+", default=None, type=str, metavar="GPU_INDEXES[:cpu]",
+        help=(
+            "Inference backends. GPU indexes and cpu both default to absent. Use 0,1,2,3 "
+            "for GPU-only, cpu for CPU-only, or 0,1,2,3:cpu for hybrid inference. GPU "
+            "indexes are torch logical indexes into CUDA_VISIBLE_DEVICES"
+        ),
+    )
+    p.add_argument(
+        "--model", required=True, nargs="+", type=str, metavar="{gpu,cpu}:PATH",
+        help=(
+            "Tagged model artifacts. Supply gpu:/path/to/engine, cpu:/path/to/openvino, "
+            "or both. The CPU artifact must be an ordinary raw-head OpenVINO segmentation "
+            "IR, not an end-to-end/NMS-embedded export. Hybrid inference requires both "
+            "entries; CPU and GPU artifacts are not verified to originate from identical weights"
+        ),
+    )
     p.add_argument(
         "--channel_format",
         default="gray",
@@ -800,21 +1031,41 @@ def build_argparser() -> argparse.ArgumentParser:
         ),
     )
 
-    p.add_argument("--imgsz", default=2048, type=int, help="Square input size used for YOLO predict")
-    p.add_argument("--batch", default=1, type=int, help="Batch size passed to YOLO predict. The in-memory source pads the final batch by repeating the last real slice and discards synthetic results, which supports fixed-batch engines such as TensorRT builds without dynamic=True")
+    p.add_argument("--imgsz", default=2048, type=int, help="Square input size used for inference")
+    p.add_argument(
+        "--batch", nargs="+", default=None, type=str, metavar="[{gpu,cpu}:]N",
+        help=(
+            "Backend-specific static model batch. Use gpu:1 cpu:1 in hybrid mode; a "
+            "single untagged value is accepted for a single-backend run. Each source pads "
+            "its final batch by repeating the last real slice and discards synthetic results"
+        ),
+    )
     p.add_argument("--conf", default=0.15, type=float, help="Passed to YOLO predict")
     p.add_argument("--min_conf", default=0.30, type=float,
                    help="Remove prediction-set objects whose combined confidence is below this threshold. 0 disables the check")
     p.add_argument(
-        "--quantize",
-        default=None,
-        type=_parse_quantize_arg,
-        metavar="{8,int8,w8a8,16,fp16,w16a16,32,fp32,w32a32,w8a16,w8a32}",
+        "--quantize", nargs="+", default=None, type=str, metavar="[{gpu,cpu}:]PRECISION",
         help=(
-            "Unified Ultralytics precision setting. 16/fp16/w16a16 requests FP16; "
-            "32/fp32/w32a32 or omission uses FP32. 8/int8/w8a8 and mixed schemes describe "
-            "exported quantized backends; quantization/calibration occurs during export"
+            "Backend-specific execution precision. GPU accepts auto/fp16/fp32 and exported "
+            "quantized schemes; CPU accepts auto/bf16/fp32/fp16/int8. Hybrid values must be "
+            "tagged, for example gpu:fp16 cpu:bf16"
         ),
+    )
+    p.add_argument(
+        "--cpu_instances", default="auto", type=str, metavar="auto|N",
+        help="Persistent OpenVINO model processes; auto creates one process per populated socket",
+    )
+    p.add_argument(
+        "--cpu_threads", default="auto", type=str, metavar="auto|N",
+        help="Whole-job OpenVINO inference thread budget, divided across CPU instances",
+    )
+    p.add_argument(
+        "--cpu_streams", default="auto", type=str, metavar="auto|N",
+        help="OpenVINO execution streams per socket-local CPU instance",
+    )
+    p.add_argument(
+        "--cpu_infer_requests", default="auto", type=str, metavar="auto|N",
+        help="Concurrent asynchronous OpenVINO infer requests per CPU instance",
     )
 
     p.add_argument(
@@ -1899,7 +2150,10 @@ def _flatten_physical_core_groups(core_groups: Sequence[Sequence[int]]) -> List[
     return representatives + smt_siblings
 
 
-def plan_gpu_worker_affinity(worker_tokens: Sequence[str]) -> List[Optional[List[int]]]:
+def plan_gpu_worker_affinity(
+    worker_tokens: Sequence[str],
+    excluded_cpus: Optional[Sequence[int]] = None,
+) -> List[Optional[List[int]]]:
     """Per-worker CPU pin sets; None entries stay unpinned.
 
  Discovery-driven — no GPU<->socket balance is assumed. GPUs and allocated cpus are each
@@ -1916,7 +2170,12 @@ def plan_gpu_worker_affinity(worker_tokens: Sequence[str]) -> List[Optional[List
     if topo is None:
         print('[numa] worker pinning inactive: NUMA topology not discoverable')
         return plan
-    node_cpus: Dict[int, set] = topo['node_cpus']  # type: ignore[assignment]
+    excluded = {int(cpu) for cpu in (excluded_cpus or ())}
+    node_cpus_raw: Dict[int, set] = topo['node_cpus']  # type: ignore[assignment]
+    node_cpus: Dict[int, set] = {
+        int(node): {int(cpu) for cpu in cpus if int(cpu) not in excluded}
+        for node, cpus in node_cpus_raw.items()
+    }
     node_of: List[Optional[int]] = []
     physical_cores_in_plan: List[Optional[int]] = [None] * n
     by_node: Dict[int, List[int]] = {}
@@ -1960,6 +2219,138 @@ def plan_gpu_worker_affinity(worker_tokens: Sequence[str]) -> List[Optional[List
             reason = 'gpu node unresolved' if node_of[i] is None else f'node {node_of[i]} holds no allocated cpus'
             print(f'[numa] gpu-worker {i} (token {tok}): unpinned ({reason})')
     return plan
+
+
+@dataclass(frozen=True)
+class CpuInferenceInstancePlan:
+    """One socket-local OpenVINO process and its complete logical CPU mask."""
+
+    instance_id: int
+    numa_nodes: Tuple[int, ...]
+    cpus: Tuple[int, ...]
+    physical_cores: int
+    inference_threads: int
+
+
+def _distribute_integer_budget(total: int, capacities: Sequence[int]) -> List[int]:
+    caps = [max(0, int(value)) for value in capacities]
+    if not caps or int(total) <= 0:
+        return [0 for _ in caps]
+    target = min(int(total), int(sum(caps)))
+    allocated = [0 for _ in caps]
+    positive = [index for index, cap in enumerate(caps) if cap > 0]
+    for index in positive:
+        if target <= 0:
+            break
+        allocated[index] = 1
+        target -= 1
+    while target > 0:
+        candidates = [
+            index for index, cap in enumerate(caps)
+            if allocated[index] < cap
+        ]
+        if not candidates:
+            break
+        index = max(
+            candidates,
+            key=lambda item: (
+                float(caps[item]) / float(max(1, allocated[item])),
+                caps[item] - allocated[item],
+                -item,
+            ),
+        )
+        allocated[index] += 1
+        target -= 1
+    return allocated
+
+
+def plan_openvino_cpu_instances(
+    requested_instances: Optional[int],
+    requested_threads: Optional[int],
+) -> List[CpuInferenceInstancePlan]:
+    """Build socket-local CPU process masks for a non-SNC topology.
+
+    ``auto`` reserves two physical cores per populated socket for the parent, GPU feeders,
+    decode, and output. An explicit --cpu_threads value is a whole-job logical-thread budget
+    and may consume that reserve.
+    """
+    try:
+        allowed_cpus = sorted(int(cpu) for cpu in os.sched_getaffinity(0))
+    except Exception:
+        allowed_cpus = list(range(max(1, int(_cpu_count()))))
+    topo = numa_topology()
+    node_entries: List[Tuple[int, List[List[int]]]] = []
+    if topo is not None:
+        node_map: Dict[int, set] = topo['node_cpus']  # type: ignore[assignment]
+        for node, cpus in sorted(node_map.items()):
+            groups = _physical_core_cpu_groups(sorted(int(cpu) for cpu in cpus))
+            if groups:
+                node_entries.append((int(node), groups))
+    if not node_entries:
+        groups = _physical_core_cpu_groups(allowed_cpus)
+        if not groups:
+            groups = [[int(cpu)] for cpu in allowed_cpus]
+        node_entries = [(-1, groups)]
+
+    instance_count = int(requested_instances or len(node_entries))
+    instance_count = max(1, min(instance_count, sum(len(groups) for _node, groups in node_entries)))
+    grouped_instances: List[Tuple[Tuple[int, ...], List[List[int]]]] = []
+    if instance_count == 1:
+        grouped_instances = [(
+            tuple(int(node) for node, _groups in node_entries),
+            [list(group) for _node, groups in node_entries for group in groups],
+        )]
+    elif instance_count == len(node_entries):
+        grouped_instances = [
+            ((int(node),), [list(group) for group in groups])
+            for node, groups in node_entries
+        ]
+    else:
+        all_groups: List[Tuple[int, List[int]]] = [
+            (int(node), list(group))
+            for node, groups in node_entries
+            for group in groups
+        ]
+        q, r = divmod(len(all_groups), int(instance_count))
+        position = 0
+        for instance_id in range(int(instance_count)):
+            count = int(q + (1 if instance_id < r else 0))
+            subset = all_groups[position:position + count]
+            position += count
+            grouped_instances.append((
+                tuple(dict.fromkeys(int(node) for node, _group in subset)),
+                [list(group) for _node, group in subset],
+            ))
+
+    reserve_physical = max(0, _env_int('YOLO_TTA_CPU_SOCKET_RESERVE_CORES', 2))
+    eligible_groups: List[Tuple[Tuple[int, ...], List[List[int]]]] = []
+    for nodes, groups in grouped_instances:
+        kept = list(groups)
+        if requested_threads is None and len(kept) > reserve_physical:
+            kept = kept[:len(kept) - reserve_physical]
+        if not kept:
+            kept = list(groups[:1])
+        eligible_groups.append((nodes, kept))
+
+    capacities = [len(_flatten_physical_core_groups(groups)) for _nodes, groups in eligible_groups]
+    if requested_threads is None:
+        quotas = list(capacities)
+    else:
+        quotas = _distribute_integer_budget(int(requested_threads), capacities)
+    plans: List[CpuInferenceInstancePlan] = []
+    for instance_id, ((nodes, groups), quota) in enumerate(zip(eligible_groups, quotas)):
+        ordered = _flatten_physical_core_groups(groups)
+        selected = ordered[:max(1, min(len(ordered), int(quota or 1)))]
+        selected_set = set(selected)
+        physical_count = sum(1 for group in groups if selected_set.intersection(group))
+        plans.append(CpuInferenceInstancePlan(
+            instance_id=int(instance_id),
+            numa_nodes=tuple(int(node) for node in nodes),
+            cpus=tuple(int(cpu) for cpu in selected),
+            physical_cores=int(physical_count),
+            inference_threads=int(len(selected)),
+        ))
+    return plans
 
 
 def _sched_setaffinity_all_threads(cpus: Sequence[int]) -> bool:
@@ -2214,6 +2605,62 @@ def gpu_worker_task_cost_key(task: Dict[str, object]) -> Tuple[object, ...]:
         int(getattr(view, 'src_h', 0)),
         int(getattr(view, 'src_w', 0)),
     )
+
+
+def cpu_inference_supports_view(view: object) -> bool:
+    """OpenVINO owns Cartesian and Tilted Cartesian work, never Radial work."""
+    return bool(
+        isinstance(view, ViewInfo)
+        and not is_radial_view(view)
+        and str(view.family) in {'orthogonal', TILTED_VIEW_FAMILY}
+    )
+
+
+def cpu_inference_task_priority(task: Dict[str, object]) -> int:
+    """Cartesian first (right-angle TTA first), then Tilted Cartesian."""
+    view = task.get('view')
+    if not cpu_inference_supports_view(view):
+        return 100
+    assert isinstance(view, ViewInfo)
+    tile_penalty = 1 if str(task.get('kind', '')) == 'tile' else 0
+    if str(view.family) == 'orthogonal':
+        angle = float(getattr(view, 'tta_angle_deg', 0.0)) % 90.0
+        right_angle = bool(
+            math.isclose(angle, 0.0, rel_tol=0.0, abs_tol=1e-7)
+            or math.isclose(angle, 90.0, rel_tol=0.0, abs_tol=1e-7)
+        )
+        return int((0 if right_angle else 2) + tile_penalty)
+    return int(4 + tile_penalty)
+
+
+def cpu_worker_target_lease_seconds() -> float:
+    return max(0.5, min(30.0, _env_float('YOLO_TTA_CPU_WORKER_LEASE_TARGET_SECONDS', 2.0)))
+
+
+def cpu_worker_min_lease_slices() -> int:
+    return max(1, _env_int('YOLO_TTA_CPU_WORKER_MIN_LEASE_SLICES', 4))
+
+
+def cpu_worker_max_lease_slices() -> int:
+    return max(cpu_worker_min_lease_slices(), _env_int('YOLO_TTA_CPU_WORKER_MAX_LEASE_SLICES', 32))
+
+
+def cpu_worker_default_seconds_per_frame(view: 'ViewInfo') -> float:
+    default = 0.20 if str(view.family) == 'orthogonal' else 0.30
+    env = (
+        'YOLO_TTA_CPU_WORKER_DEFAULT_SEC_PER_FRAME_CARTESIAN'
+        if str(view.family) == 'orthogonal' else
+        'YOLO_TTA_CPU_WORKER_DEFAULT_SEC_PER_FRAME_TILTED'
+    )
+    return max(1e-4, _env_float(env, default))
+
+
+def cpu_worker_initial_lease_slices(view: 'ViewInfo', batch: int = 1) -> int:
+    align = max(1, int(batch))
+    estimate = int(round(cpu_worker_target_lease_seconds() / cpu_worker_default_seconds_per_frame(view)))
+    estimate = max(cpu_worker_min_lease_slices(), min(cpu_worker_max_lease_slices(), estimate))
+    estimate = max(align, int(math.ceil(float(estimate) / float(align))) * align)
+    return int(estimate)
 
 
 # Default interpolation process cap. Python-heavy planning gains independent GILs, while
@@ -9063,8 +9510,8 @@ def resolve_retina_mask_processor(explicit: Optional[str], devices: Sequence[str
     return 'cpu', 'non-CUDA default uses CPU retina reconstruction'
 
 
-# The active retina-mask processor is resolved from --retina_mask_processor and device
-# selection in main, then published independently inside each CUDA worker. Standalone callers
+# The active retina-mask processor follows the process-local inference backend: CUDA workers
+# select GPU processing and OpenVINO workers select CPU processing. Standalone callers
 # that run before resolution retain the conservative CPU default.
 _RETINA_MASK_PROCESSOR_IS_CPU: Optional[bool] = None
 
@@ -13527,7 +13974,7 @@ def fill_view_volume_holes_2d_inplace(
 ) -> None:
     """Fill enclosed 2D background components in completed view slices.
 
-    When the GPU retirement path supplied valid per-slice foreground metadata, only
+    When an inference worker supplied valid per-slice foreground metadata, only
     known-nonempty slices are submitted and their half-open ``(y0,y1,x0,x1)`` bbox is
     passed directly to the topology primitive. Missing or malformed metadata falls back
     to the authoritative full-slice scan.
@@ -13563,7 +14010,7 @@ def fill_view_volume_holes_2d_inplace(
     active_count = int(active_indices.size)
     if metadata_ok:
         print(
-            f'{desc}: GPU foreground metadata scheduled {active_count}/{num_slices} '
+            f'{desc}: inference-worker foreground metadata scheduled {active_count}/{num_slices} '
             'slice(s); empty full-plane scans skipped.'
         )
     if active_count <= 0:
@@ -17153,6 +17600,969 @@ def _worker_render_callable(
         return formatted(off + int(local_idx))
 
     return _render_center
+
+
+# --------------------------
+# v17 OpenVINO CPU inference
+# --------------------------
+
+
+def _linux_cpu_feature_flags() -> set[str]:
+    """Return the Linux CPU feature flags visible inside the current allocation."""
+    flags: set[str] = set()
+    try:
+        for line in Path('/proc/cpuinfo').read_text(errors='replace').splitlines():
+            key, sep, value = line.partition(':')
+            if sep and key.strip().lower() in {'flags', 'features'}:
+                flags.update(token.strip().lower() for token in value.split() if token.strip())
+    except Exception:
+        pass
+    return flags
+
+
+def _resolve_openvino_model_xml_path(model_path: str | Path) -> Path:
+    """Resolve an OpenVINO IR directory/XML/BIN path without invoking Ultralytics."""
+    path = Path(model_path).expanduser().resolve()
+    if path.is_file():
+        if path.suffix.lower() == '.xml':
+            return path
+        if path.suffix.lower() == '.bin' and path.with_suffix('.xml').is_file():
+            return path.with_suffix('.xml')
+        raise ValueError(
+            f'OpenVINO CPU model must be an IR .xml file or an export directory; got {path}'
+        )
+    if not path.is_dir():
+        raise FileNotFoundError(path)
+    preferred = path / f'{path.name}.xml'
+    if preferred.is_file():
+        return preferred
+    xml_files = sorted(candidate for candidate in path.glob('*.xml') if candidate.is_file())
+    if len(xml_files) == 1:
+        return xml_files[0]
+    if not xml_files:
+        raise FileNotFoundError(f'No OpenVINO IR .xml file exists under {path}')
+    raise ValueError(
+        f'OpenVINO export directory {path} contains multiple .xml files; pass one explicitly: '
+        + ', '.join(str(candidate.name) for candidate in xml_files)
+    )
+
+
+def _openvino_partial_shape_values(port: object) -> Tuple[Optional[int], ...]:
+    """Return static dimension values and ``None`` for dynamic dimensions."""
+    partial_shape = getattr(port, 'partial_shape', None)
+    if partial_shape is None:
+        get_partial_shape = getattr(port, 'get_partial_shape', None)
+        partial_shape = get_partial_shape() if callable(get_partial_shape) else None
+    if partial_shape is None:
+        try:
+            return tuple(int(value) for value in getattr(port, 'shape'))
+        except Exception:
+            return ()
+    values: List[Optional[int]] = []
+    try:
+        dimensions = list(partial_shape)
+    except Exception:
+        dimensions = []
+    for dimension in dimensions:
+        try:
+            is_static = bool(getattr(dimension, 'is_static'))
+        except Exception:
+            is_static = False
+        if is_static:
+            try:
+                values.append(int(dimension.get_length()))
+                continue
+            except Exception:
+                try:
+                    values.append(int(dimension))
+                    continue
+                except Exception:
+                    pass
+        values.append(None)
+    return tuple(values)
+
+
+def _openvino_port_name(port: object, fallback: str) -> str:
+    for accessor in ('get_any_name',):
+        fn = getattr(port, accessor, None)
+        if callable(fn):
+            try:
+                name = str(fn())
+                if name:
+                    return name
+            except Exception:
+                pass
+    try:
+        name = str(getattr(port, 'any_name'))
+        if name:
+            return name
+    except Exception:
+        pass
+    return str(fallback)
+
+
+def _openvino_element_type_name(port: object) -> str:
+    """Return a stable lower-case OpenVINO element-type token for one port."""
+    element_type = None
+    getter = getattr(port, 'get_element_type', None)
+    if callable(getter):
+        try:
+            element_type = getter()
+        except Exception:
+            element_type = None
+    if element_type is None:
+        try:
+            element_type = getattr(port, 'element_type')
+        except Exception:
+            element_type = None
+    if element_type is None:
+        return 'dynamic'
+    type_name = getattr(element_type, 'get_type_name', None)
+    if callable(type_name):
+        try:
+            token = str(type_name()).strip().lower()
+            if token:
+                return token
+        except Exception:
+            pass
+    raw = str(element_type).strip().lower()
+    match = re.search(r"['\"]([^'\"]+)['\"]", raw)
+    return str(match.group(1) if match else raw).strip().lower()
+
+
+def _openvino_export_class_count(model_xml: Path) -> Optional[int]:
+    """Read Ultralytics export metadata when present; absence is not an error."""
+    root = Path(model_xml).parent
+    candidates = (
+        root / 'metadata.yaml', root / 'metadata.yml', root / 'metadata.json',
+    )
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        try:
+            if candidate.suffix.lower() == '.json':
+                metadata = json.loads(candidate.read_text())
+            else:
+                try:
+                    import yaml  # type: ignore
+                except Exception:
+                    continue
+                metadata = yaml.safe_load(candidate.read_text())
+            names = metadata.get('names') if isinstance(metadata, dict) else None
+            if isinstance(names, (dict, list, tuple)) and len(names) > 0:
+                return int(len(names))
+        except Exception:
+            continue
+    return None
+
+
+def _openvino_model_has_int8_quantization(model: object, model_xml: Optional[Path] = None) -> bool:
+    """Return True only when the supplied IR carries explicit INT8 quantization.
+
+    OpenVINO's CPU capability list says what the processor/plugin *can* execute; it does
+    not prove that a particular model was quantized. Ultralytics/NNCF INT8 IRs normally
+    retain FakeQuantize (or explicit QuantizeLinear/DequantizeLinear) operations. Scan the
+    graph first and use the XML only as a conservative compatibility fallback.
+    """
+    get_ops = getattr(model, 'get_ops', None)
+    if callable(get_ops):
+        try:
+            for operation in get_ops():
+                getter = getattr(operation, 'get_type_name', None)
+                if callable(getter):
+                    raw_name = getter()
+                else:
+                    raw_name = type(operation).__name__
+                token = re.sub(r'[^a-z0-9]+', '', str(raw_name).lower())
+                if token in {'fakequantize', 'quantizelinear', 'dequantizelinear'}:
+                    return True
+        except Exception:
+            pass
+    if model_xml is not None:
+        try:
+            # IR XML files are small relative to the weights and this check runs once per
+            # socket worker. Match operation types, not incidental layer names.
+            xml_text = Path(model_xml).read_text(encoding='utf-8', errors='ignore')
+            if re.search(
+                r"type\s*=\s*['\"](?:FakeQuantize|QuantizeLinear|DequantizeLinear)['\"]",
+                xml_text, flags=re.IGNORECASE,
+            ):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _normalize_openvino_segmentation_outputs(
+    outputs: Sequence[np.ndarray],
+    *,
+    batch_size: int,
+    expected_class_count: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Return ``(head[B,C,A], proto[B,M,H,W], class_count)`` for a YOLO segment IR.
+
+    Layout selection is solved jointly: a 4-D tensor is considered in BCHW and BHWC
+    form, and a 3-D tensor in BCA and BAC form. The winning pair must satisfy the YOLO
+    attribute identity ``C = 4 + classes + mask_channels``. This avoids mistaking a
+    small spatial axis for the prototype-channel axis.
+    """
+    arrays = [np.asarray(value) for value in outputs]
+    proto_options: List[np.ndarray] = []
+    head_options: List[np.ndarray] = []
+    for value in arrays:
+        if int(value.shape[0]) != int(batch_size):
+            continue
+        if value.ndim == 4:
+            if 1 <= int(value.shape[1]) <= 512:
+                proto_options.append(value)
+            if 1 <= int(value.shape[3]) <= 512:
+                proto_options.append(np.moveaxis(value, -1, 1))
+        elif value.ndim == 3:
+            head_options.extend((value, np.swapaxes(value, 1, 2)))
+
+    combinations: List[Tuple[Tuple[int, ...], np.ndarray, np.ndarray, int]] = []
+    for proto_candidate in proto_options:
+        mask_channels = int(proto_candidate.shape[1])
+        proto_h = int(proto_candidate.shape[2])
+        proto_w = int(proto_candidate.shape[3])
+        if proto_h <= 1 or proto_w <= 1:
+            continue
+        for head_candidate in head_options:
+            channels = int(head_candidate.shape[1])
+            anchors = int(head_candidate.shape[2])
+            class_count = int(channels) - 4 - int(mask_channels)
+            if class_count < 1 or anchors < 1 or channels > anchors:
+                continue
+            if (
+                expected_class_count is not None
+                and int(class_count) != int(expected_class_count)
+            ):
+                continue
+            # Prefer a known class count, then the smallest plausible class count and
+            # prototype channel count, then the largest anchor/spatial domains.
+            score = (
+                0 if expected_class_count is not None else 1,
+                int(class_count),
+                0 if int(mask_channels) <= 256 else 1,
+                int(mask_channels),
+                -int(anchors),
+                -int(proto_h * proto_w),
+            )
+            combinations.append((score, head_candidate, proto_candidate, int(class_count)))
+
+    if not combinations:
+        raise RuntimeError(
+            'OpenVINO segmentation outputs do not contain a compatible raw YOLO head and '
+            'mask-prototype pair; '
+            f'expected_class_count={expected_class_count}, output shapes='
+            f'{[tuple(int(v) for v in value.shape) for value in arrays]}. '
+            'Ultralytics end-to-end/NMS-embedded OpenVINO exports are not supported by the '
+            'v17 raw-head adapter; export the ordinary segmentation IR.'
+        )
+    _score, head, proto, class_count = min(combinations, key=lambda item: item[0])
+    return (
+        np.ascontiguousarray(head, dtype=np.float32),
+        np.ascontiguousarray(proto, dtype=np.float32),
+        int(class_count),
+    )
+
+def _openvino_cpu_payloads_from_outputs(
+    outputs: Sequence[np.ndarray],
+    *,
+    batch_size: int,
+    conf_threshold: float,
+    out_size: int,
+    expected_class_count: Optional[int] = None,
+) -> List[CpuRetinaMaskPayload]:
+    """Convert one raw OpenVINO YOLO-seg batch into CPU-retina payloads."""
+    head, protos, class_count = _normalize_openvino_segmentation_outputs(
+        outputs, batch_size=int(batch_size),
+        expected_class_count=expected_class_count,
+    )
+    payloads: List[CpuRetinaMaskPayload] = []
+    threshold = float(conf_threshold)
+    mask_channels = int(protos.shape[1])
+    for batch_index in range(int(batch_size)):
+        head_i = np.asarray(head[int(batch_index)], dtype=np.float32)
+        scores = head_i[4:4 + int(class_count), :]
+        if int(class_count) == 1:
+            confs_all = scores[0]
+        else:
+            confs_all = np.max(scores, axis=0)
+        keep = np.flatnonzero(confs_all >= float(threshold))
+        if keep.size <= 0:
+            payloads.append(CpuRetinaMaskPayload(
+                proto=np.ascontiguousarray(protos[int(batch_index)], dtype=np.float32),
+                coeffs=np.zeros((0, mask_channels), dtype=np.float32),
+                boxes_xyxy=np.zeros((0, 4), dtype=np.float32),
+                confs=np.zeros((0,), dtype=np.float32),
+                orig_shape=(int(out_size), int(out_size)),
+                img_shape=(int(out_size), int(out_size)),
+                frame_path='',
+            ))
+            continue
+        selected = np.ascontiguousarray(head_i[:, keep], dtype=np.float32)
+        xy = selected[0:2, :].T
+        half_wh = selected[2:4, :].T * np.float32(0.5)
+        boxes = np.concatenate((xy - half_wh, xy + half_wh), axis=1).astype(np.float32, copy=False)
+        _clip_boxes_np(boxes, (int(out_size), int(out_size)))
+        coeffs = selected[4 + int(class_count):4 + int(class_count) + mask_channels, :].T
+        payloads.append(CpuRetinaMaskPayload(
+            proto=np.ascontiguousarray(protos[int(batch_index)], dtype=np.float32),
+            coeffs=np.ascontiguousarray(coeffs, dtype=np.float32),
+            boxes_xyxy=np.ascontiguousarray(boxes, dtype=np.float32),
+            confs=np.ascontiguousarray(confs_all[keep], dtype=np.float32),
+            orig_shape=(int(out_size), int(out_size)),
+            img_shape=(int(out_size), int(out_size)),
+            frame_path='',
+        ))
+    return payloads
+
+
+def _binary_slice_metadata_from_array(mask_volume: np.ndarray) -> Dict[str, np.ndarray]:
+    """Compute exact compact slice metadata for one task-local binary result window."""
+    volume = np.asarray(mask_volume)
+    if volume.ndim != 3:
+        raise ValueError(f'binary metadata requires a 3-D array, got {volume.shape}')
+    z_dim, plane_h, plane_w = (int(value) for value in volume.shape)
+    slice_any = np.zeros((z_dim,), dtype=bool)
+    slice_bboxes = np.zeros((z_dim, 4), dtype=np.int64)
+    packed_rows = np.zeros((z_dim, int((plane_h + 7) // 8)), dtype=np.uint8)
+    for z in range(z_dim):
+        plane = np.asarray(volume[int(z)], dtype=bool)
+        rows = np.any(plane, axis=1)
+        packed_rows[int(z)] = np.packbits(rows)
+        if not bool(np.any(rows)):
+            continue
+        cols = np.any(plane, axis=0)
+        y_ids = np.flatnonzero(rows)
+        x_ids = np.flatnonzero(cols)
+        slice_any[int(z)] = True
+        slice_bboxes[int(z)] = (
+            int(y_ids[0]), int(y_ids[-1]) + 1,
+            int(x_ids[0]), int(x_ids[-1]) + 1,
+        )
+    return {
+        'slice_any': slice_any,
+        'slice_bboxes': slice_bboxes,
+        'slice_row_any': packed_rows,
+        'slice_row_count': np.asarray([int(plane_h)], dtype=np.int64),
+    }
+
+
+class _OpenVinoCpuSegmenter:
+    """One socket-local OpenVINO compiled model with a shallow async request pool."""
+
+    def __init__(
+        self,
+        model_path: str,
+        *,
+        imgsz: int,
+        batch: int,
+        input_channels: int,
+        requested_precision: str,
+        inference_threads: int,
+        physical_cores: int,
+        streams: Optional[int],
+        infer_requests: Optional[int],
+    ) -> None:
+        try:
+            import openvino as ov  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                'OpenVINO CPU inference requires the openvino Python package. '
+                'Install a current OpenVINO runtime in the SLURM environment.'
+            ) from exc
+        self.ov = ov
+        self.model_xml = _resolve_openvino_model_xml_path(model_path)
+        self.imgsz = int(imgsz)
+        self.batch = max(1, int(batch))
+        self.input_channels = max(1, int(input_channels))
+        self.inference_threads = max(1, int(inference_threads))
+        self.physical_cores = max(1, int(physical_cores))
+        self.requested_precision = _resolve_cpu_precision(requested_precision)
+        self.core = ov.Core()
+        capabilities_raw: Optional[object] = None
+        # Prefer the typed property on current OpenVINO, then retain the established
+        # string key for older runtimes. Capability discovery is deliberately strict:
+        # cpu:auto falls back to FP32 when OpenVINO cannot prove BF16 support, while an
+        # explicit cpu:bf16 request fails instead of silently trusting CPU flags alone.
+        try:
+            device_properties = getattr(getattr(ov, 'properties', None), 'device', None)
+            capability_property = getattr(device_properties, 'capabilities', None)
+            if capability_property is not None:
+                capabilities_raw = self.core.get_property('CPU', capability_property)
+        except Exception:
+            capabilities_raw = None
+        if capabilities_raw is None:
+            try:
+                capabilities_raw = self.core.get_property('CPU', 'OPTIMIZATION_CAPABILITIES')
+            except Exception:
+                capabilities_raw = None
+        if isinstance(capabilities_raw, str):
+            capability_values = [capabilities_raw]
+        else:
+            try:
+                capability_values = list(capabilities_raw) if capabilities_raw is not None else []
+            except Exception:
+                capability_values = []
+        self.capabilities = {str(value).upper() for value in capability_values}
+        cpu_flags = _linux_cpu_feature_flags()
+        self.cpu_flags = frozenset(str(value) for value in cpu_flags)
+        self.amx_tile_available = 'amx_tile' in cpu_flags
+        self.amx_bf16_available = bool(
+            self.amx_tile_available
+            and 'amx_bf16' in cpu_flags
+            and 'BF16' in self.capabilities
+        )
+        self.amx_int8_available = bool(
+            self.amx_tile_available
+            and 'amx_int8' in cpu_flags
+            and 'INT8' in self.capabilities
+        )
+
+        model = self.core.read_model(str(self.model_xml))
+        self.model_int8_quantized = bool(
+            _openvino_model_has_int8_quantization(model, self.model_xml)
+        )
+        if self.requested_precision == 'auto':
+            # A quantized export remains quantized regardless of the execution hint. For
+            # ordinary floating-point IRs, prefer AMX BF16 and otherwise retain FP32.
+            self.resolved_precision = (
+                'int8'
+                if self.model_int8_quantized
+                else ('bf16' if self.amx_bf16_available else 'fp32')
+            )
+        else:
+            self.resolved_precision = str(self.requested_precision)
+
+        if self.model_int8_quantized and self.resolved_precision != 'int8':
+            raise RuntimeError(
+                f'cpu:{self.resolved_precision} was requested, but the supplied OpenVINO IR '
+                'contains explicit INT8 quantization operations. A runtime precision hint cannot '
+                'restore pre-quantization quality; use cpu:int8/auto or supply a floating-point IR.'
+            )
+        if self.resolved_precision == 'int8' and not self.model_int8_quantized:
+            raise RuntimeError(
+                'cpu:int8 was requested, but the supplied OpenVINO IR does not contain explicit '
+                'INT8 quantization operations. INT8 is an export-time property; export a genuinely '
+                'quantized OpenVINO model instead of asking the runtime to quantize an FP model.'
+            )
+        if self.resolved_precision == 'bf16' and not self.amx_bf16_available:
+            raise RuntimeError(
+                'cpu:bf16 was requested, but AMX_TILE + AMX_BF16 and OpenVINO BF16 capability '
+                f'were not all visible (flags contain amx_tile={"amx_tile" in cpu_flags}, '
+                f'amx_bf16={"amx_bf16" in cpu_flags}, capabilities={sorted(self.capabilities)}).'
+            )
+        if self.resolved_precision == 'fp16' and 'FP16' not in self.capabilities:
+            raise RuntimeError(
+                f'cpu:fp16 was requested, but OpenVINO CPU capabilities are {sorted(self.capabilities)}'
+            )
+        if self.resolved_precision == 'int8' and 'INT8' not in self.capabilities:
+            raise RuntimeError(
+                f'cpu:int8 was requested, but OpenVINO CPU capabilities are {sorted(self.capabilities)}'
+            )
+        if len(model.inputs) != 1:
+            raise RuntimeError(
+                f'OpenVINO CPU model must expose exactly one image input; got {len(model.inputs)}'
+            )
+        model_input = model.input(0)
+        self.input_element_type = _openvino_element_type_name(model_input)
+        self.expected_class_count = _openvino_export_class_count(self.model_xml)
+        if self.input_element_type in {'i8', 'int8'}:
+            raise RuntimeError(
+                'The OpenVINO IR exposes an int8 image input, but its input zero-point/scale '
+                'contract is not discoverable from the generic adapter. Use an Ultralytics '
+                'OpenVINO export with a float or embedded-preprocessing uint8 input.'
+            )
+        original_shape = _openvino_partial_shape_values(model_input)
+        if original_shape and len(original_shape) != 4:
+            raise RuntimeError(
+                f'OpenVINO CPU model input must be rank 4; got {original_shape}'
+            )
+        layout = 'NCHW'
+        if len(original_shape) == 4:
+            second = original_shape[1]
+            last = original_shape[3]
+            if second == self.input_channels:
+                layout = 'NCHW'
+            elif last == self.input_channels:
+                layout = 'NHWC'
+            elif second is not None and last is not None:
+                raise ModelInputChannelMismatchError(
+                    f'OpenVINO CPU model input shape {original_shape} does not match '
+                    f'--channel_format C={self.input_channels}'
+                )
+        self.input_layout = layout
+        target_shape = (
+            (self.batch, self.input_channels, self.imgsz, self.imgsz)
+            if layout == 'NCHW'
+            else (self.batch, self.imgsz, self.imgsz, self.input_channels)
+        )
+        reshape_needed = not original_shape or any(value is None for value in original_shape)
+        if original_shape and not reshape_needed:
+            for actual, expected in zip(original_shape, target_shape):
+                if int(actual) != int(expected):
+                    raise RuntimeError(
+                        f'OpenVINO CPU model has static input shape {original_shape}, but v17 requested '
+                        f'batch={self.batch}, C={self.input_channels}, imgsz={self.imgsz} ({target_shape}).'
+                    )
+        elif reshape_needed:
+            try:
+                model.reshape({model_input: list(target_shape)})
+            except Exception as exc:
+                raise RuntimeError(
+                    f'Unable to reshape dynamic OpenVINO input {original_shape} to {target_shape}'
+                ) from exc
+
+        config: Dict[str, object] = {
+            'PERFORMANCE_HINT': 'THROUGHPUT',
+            'INFERENCE_NUM_THREADS': int(self.inference_threads),
+            'ENABLE_CPU_PINNING': True,
+            'ENABLE_HYPER_THREADING': bool(self.inference_threads > self.physical_cores),
+        }
+        if streams is not None:
+            config['NUM_STREAMS'] = int(streams)
+        if infer_requests is not None:
+            config['PERFORMANCE_HINT_NUM_REQUESTS'] = int(infer_requests)
+        if self.resolved_precision in {'bf16', 'fp16', 'fp32'}:
+            type_value = {
+                'bf16': ov.Type.bf16,
+                'fp16': ov.Type.f16,
+                'fp32': ov.Type.f32,
+            }[self.resolved_precision]
+            config['INFERENCE_PRECISION_HINT'] = type_value
+        # INT8 is an export-time property. Do not ask OpenVINO to quantize an FP model here.
+        self.compile_config = dict(config)
+        try:
+            self.compiled_model = self.core.compile_model(model, 'CPU', config)
+        except Exception as exc:
+            raise RuntimeError(
+                f'OpenVINO CPU compile failed for {self.model_xml} with config {config}: {exc}'
+            ) from exc
+        self.input_port = self.compiled_model.input(0)
+        self.input_name = _openvino_port_name(self.input_port, 'images')
+        self.output_ports = tuple(self.compiled_model.outputs)
+        if not self.output_ports:
+            raise RuntimeError('OpenVINO CPU model exposes no outputs')
+        if infer_requests is None:
+            try:
+                request_count = int(
+                    self.compiled_model.get_property('OPTIMAL_NUMBER_OF_INFER_REQUESTS')
+                )
+            except Exception:
+                request_count = int(streams or 1)
+        else:
+            request_count = int(infer_requests)
+        self.request_count = max(1, int(request_count))
+        self.infer_queue = ov.AsyncInferQueue(self.compiled_model, int(self.request_count))
+
+    def _prepare_input(self, images: Sequence[np.ndarray]) -> np.ndarray:
+        frames = [
+            InMemoryYoloVolumeSource._frame_to_model_channels(
+                np.asarray(image), int(self.input_channels),
+            )
+            for image in images
+        ]
+        if len(frames) != int(self.batch):
+            raise RuntimeError(
+                f'OpenVINO CPU source produced batch {len(frames)}, but model batch is {self.batch}'
+            )
+        batch_hwc = np.stack(frames, axis=0)
+        if self.input_layout == 'NCHW':
+            batch_value = np.moveaxis(batch_hwc, -1, 1)
+        else:
+            batch_value = batch_hwc
+        # Ordinary Ultralytics IRs expose normalized floating-point input. Exports with
+        # embedded preprocessing may expose uint8 and must receive the original 0..255 bytes.
+        input_type = str(self.input_element_type).lower()
+        if input_type in {'u8', 'uint8'}:
+            return np.ascontiguousarray(batch_value, dtype=np.uint8)
+        if input_type in {'f16', 'float16'}:
+            return (
+                np.ascontiguousarray(batch_value, dtype=np.float16)
+                / np.float16(255.0)
+            )
+        # BF16 has no native NumPy storage type. start_async safely converts this contiguous
+        # FP32 input into a BF16 input tensor when the IR itself exposes BF16.
+        return np.ascontiguousarray(batch_value, dtype=np.float32) / np.float32(255.0)
+
+    def infer_source_to_union(
+        self,
+        source: object,
+        *,
+        num_frames: int,
+        out_size: int,
+        conf_threshold: float,
+        view_union_mm: np.ndarray,
+        view_confmap_mm: Optional[np.ndarray],
+        M_out_to_native: np.ndarray,
+        native_h: int,
+        native_w: int,
+        min_conf: float,
+        min_radius: float,
+    ) -> Dict[str, object]:
+        """Run a bounded asynchronous request queue and consume results in frame order."""
+        output_queue: 'queue.Queue[object]' = queue.Queue(maxsize=max(2, int(self.request_count)))
+        sentinel = object()
+        consumer_errors: List[BaseException] = []
+        stats = {'prediction_count': 0, 'frames_with_predictions': 0}
+        submitted_real = 0
+
+        def _callback(request: object, userdata: object) -> None:
+            try:
+                copied = [
+                    np.array(request.get_output_tensor(index).data, copy=True)
+                    for index in range(len(self.output_ports))
+                ]
+                output_queue.put(('result', userdata, copied))
+            except BaseException as exc:
+                output_queue.put(('error', userdata, exc))
+
+        self.infer_queue.set_callback(_callback)
+
+        def _consume() -> None:
+            nonlocal stats
+            while True:
+                item = output_queue.get()
+                if item is sentinel:
+                    return
+                kind, userdata, payload = item  # type: ignore[misc]
+                if kind == 'error':
+                    consumer_errors.append(payload)
+                    continue
+                if consumer_errors:
+                    continue
+                start_index, real_count, submitted_batch = (
+                    int(value) for value in userdata
+                )
+                try:
+                    payloads = _openvino_cpu_payloads_from_outputs(
+                        payload,
+                        batch_size=int(submitted_batch),
+                        # CUDA's direct proto-union path applies positive --min_conf at
+                        # instance selection time. Match that contract before CPU mask
+                        # reconstruction so a low-confidence mask cannot survive merely by
+                        # touching a high-confidence component in a hybrid view.
+                        conf_threshold=max(float(conf_threshold), float(min_conf)),
+                        out_size=int(out_size),
+                        expected_class_count=self.expected_class_count,
+                    )
+                    for local_index in range(int(real_count)):
+                        frame_index = int(start_index) + int(local_index)
+                        instance_count, frame_count = _process_cpu_retina_prediction_frame(
+                            frame_index,
+                            payloads[int(local_index)],
+                            int(out_size),
+                            view_union_mm,
+                            view_confmap_mm,
+                            np.asarray(M_out_to_native, dtype=np.float32),
+                            int(native_h),
+                            int(native_w),
+                            slice_lock=None,
+                        )
+                        has_foreground = _cleanup_prediction_slice_inplace(
+                            view_union_mm,
+                            view_confmap_mm,
+                            int(frame_index),
+                            min_conf=float(min_conf),
+                            min_radius=float(min_radius),
+                        )
+                        stats['prediction_count'] = int(stats['prediction_count']) + int(instance_count)
+                        if bool(frame_count) and bool(has_foreground):
+                            stats['frames_with_predictions'] = int(stats['frames_with_predictions']) + 1
+                except BaseException as exc:
+                    consumer_errors.append(exc)
+
+        consumer = threading.Thread(
+            target=_consume,
+            name='openvino-output-consumer',
+            daemon=True,
+        )
+        consumer.start()
+        try:
+            for _paths, images, _info in source:  # type: ignore[operator]
+                if submitted_real >= int(num_frames):
+                    break
+                real_count = min(len(images), int(num_frames) - int(submitted_real))
+                input_value = self._prepare_input(images)
+                userdata = (int(submitted_real), int(real_count), int(input_value.shape[0]))
+                self.infer_queue.start_async({self.input_name: input_value}, userdata=userdata)
+                submitted_real += int(real_count)
+            self.infer_queue.wait_all()
+        finally:
+            output_queue.put(sentinel)
+            consumer.join()
+        if consumer_errors:
+            raise RuntimeError(
+                f'OpenVINO CPU inference/postprocess failed: {consumer_errors[0]}'
+            ) from consumer_errors[0]
+        if int(submitted_real) != int(num_frames):
+            raise RuntimeError(
+                f'OpenVINO CPU source produced {submitted_real}/{int(num_frames)} real frames'
+            )
+        stats['slice_meta'] = _binary_slice_metadata_from_array(view_union_mm)
+        stats['device_hole_filled_frames'] = 0
+        stats['proto_hole_treated_frames'] = 0
+        stats['openvino_request_count'] = int(self.request_count)
+        stats['openvino_precision'] = str(self.resolved_precision)
+        stats['openvino_input_element_type'] = str(self.input_element_type)
+        stats['openvino_model_int8_quantized'] = int(bool(self.model_int8_quantized))
+        stats['openvino_class_count'] = (
+            int(self.expected_class_count) if self.expected_class_count is not None else -1
+        )
+        return stats
+
+
+def run_prediction_volume_in_openvino_worker(
+    runner: _OpenVinoCpuSegmenter,
+    cfg: PredictConfig,
+    task: Dict[str, object],
+) -> Dict[str, object]:
+    """Run one CPU-eligible Cartesian/Tilted task into the shared result contract."""
+    view: ViewInfo = task['view']  # type: ignore[assignment]
+    job = task['job']
+    kind = str(task['kind'])
+    if not cpu_inference_supports_view(view):
+        raise ValueError(
+            f'OpenVINO CPU workers support Cartesian and Tilted Cartesian only; got {view.name}'
+        )
+    if kind not in {'fullframe', 'tile'}:
+        raise ValueError(f'Unsupported OpenVINO task kind {kind!r}')
+    if str(task.get('result_mode', 'file')) == 'd1_owner':
+        raise ValueError('OpenVINO CPU workers cannot consume GPU D1 owner tasks')
+
+    slice_offset = int(task.get('slice_start', 0))
+    slice_count = int(task.get('slice_count', int(view.num_slices)))
+    out_size = int(task['out_size'])
+    channel_format = resolve_channel_format(
+        task.get('channel_format', DEFAULT_CHANNEL_FORMAT)  # type: ignore[arg-type]
+    )
+    if int(channel_format.channel_count) != int(cfg.input_channels):
+        raise ValueError(
+            f'OpenVINO task C={channel_format.channel_count}, worker C={cfg.input_channels}'
+        )
+    full_processing_shape = view_processing_volume_shape(view, int(out_size))
+    declared_processing_shape = tuple(
+        int(value) for value in task.get('processing_shape', full_processing_shape)
+    )
+    processing_h = int(declared_processing_shape[1])
+    processing_w = int(declared_processing_shape[2])
+    result_shape = (int(slice_count), int(processing_h), int(processing_w))
+    native_resize = task.get('native_resize') if isinstance(task.get('native_resize'), dict) else None
+
+    source_mm: Optional[np.memmap] = None
+    result_mask: Optional[np.ndarray] = None
+    result_conf: Optional[np.ndarray] = None
+    result_mask_full: Optional[np.memmap] = None
+    result_conf_full: Optional[np.memmap] = None
+    source: Optional[object] = None
+    try:
+        result_mode = str(task.get('result_mode', 'file'))
+        if result_mode == 'direct_union':
+            union_shape = (
+                int(task.get('union_num_slices', slice_count)),
+                int(processing_h), int(processing_w),
+            )
+            result_mask_full = np.memmap(
+                Path(str(task['result_mask_path'])), dtype=np.uint8, mode='r+', shape=union_shape,
+            )
+            result_mask = result_mask_full[slice_offset:slice_offset + slice_count]
+            if task.get('result_conf_path'):
+                result_conf_full = np.memmap(
+                    Path(str(task['result_conf_path'])), dtype=np.uint8, mode='r+', shape=union_shape,
+                )
+                result_conf = result_conf_full[slice_offset:slice_offset + slice_count]
+        else:
+            open_mode = 'r+' if bool(task.get('result_workspace_preallocated', False)) else 'w+'
+            result_mask = np.memmap(
+                Path(str(task['result_mask_path'])), dtype=np.uint8, mode=open_mode, shape=result_shape,
+            )
+            if task.get('result_conf_path'):
+                result_conf = np.memmap(
+                    Path(str(task['result_conf_path'])), dtype=np.uint8, mode=open_mode, shape=result_shape,
+                )
+        if native_resize is not None:
+            _wait_for_cube_ready_sentinel(
+                str(native_resize['sentinel']),
+                request_path=(str(native_resize['request']) if native_resize.get('request') else None),
+                failed_path=(str(native_resize['failed']) if native_resize.get('failed') else None),
+            )
+        source_mm = open_existing_gray_memmap(
+            task['source_volume_path'], task['source_shape'], task.get('source_dtype', 'uint8'), mode='r',
+        )
+        render_callable = _worker_render_callable(
+            source_mm,
+            view,
+            job,
+            kind,
+            slice_offset=int(slice_offset),
+            channel_format=channel_format,
+        )
+        source = StreamingYoloVolumeSource(
+            render_callable,
+            num_frames=int(slice_count),
+            name=f'openvino-{kind}-{view.name}-{task["job_id"]}',
+            batch_size=max(1, int(cfg.batch)),
+            out_size=int(out_size),
+            render_workers=max(1, int(task.get('render_workers', 1))),
+            prefetch_frames=max(1, int(task.get('prefetch_frames', cfg.batch))),
+            autostart=True,
+            shared_executor=None,
+            channel_format=channel_format,
+        )
+        task_affine = np.asarray(
+            task.get('M_out_to_processing')
+            if task.get('M_out_to_processing') is not None
+            else output_to_view_processing_affine(
+                view, np.asarray(task['M_out_to_src'], dtype=np.float32), int(out_size),
+            ),
+            dtype=np.float32,
+        )
+        return runner.infer_source_to_union(
+            source,
+            num_frames=int(slice_count),
+            out_size=int(out_size),
+            conf_threshold=float(cfg.conf),
+            view_union_mm=result_mask,
+            view_confmap_mm=result_conf,
+            M_out_to_native=task_affine,
+            native_h=int(processing_h),
+            native_w=int(processing_w),
+            min_conf=float(task.get('streaming_cleanup_min_conf', 0.0)),
+            min_radius=float(task.get('streaming_cleanup_min_radius', 0.0)),
+        )
+    finally:
+        if source is not None:
+            try:
+                source.close()
+            except Exception:
+                pass
+        for mm in (result_mask, result_conf, result_mask_full, result_conf_full, source_mm):
+            if mm is not None:
+                try:
+                    close_memmap_array(mm)
+                except Exception:
+                    pass
+
+
+def _cpu_inference_worker_main(
+    instance_id: int,
+    model_path: str,
+    init_dict: Dict[str, object],
+    task_queue: object,
+    result_queue: object,
+) -> None:
+    """Persistent socket-local OpenVINO worker process."""
+    initialize_runtime_observability()
+    persistent_source_memfds: Dict[str, int] = {}
+    cpus = [int(value) for value in init_dict.get('numa_affinity_cpus', ())]
+    try:
+        if cpus and not _sched_setaffinity_all_threads(cpus):
+            raise RuntimeError(
+                f'OpenVINO CPU worker {instance_id} could not apply affinity {cpus}'
+            )
+        try:
+            cv2.setNumThreads(max(1, int(init_dict.get('cv2_threads', 1))))
+        except Exception:
+            pass
+        set_retina_mask_processor('cpu')
+        cfg = PredictConfig(
+            imgsz=int(init_dict['imgsz']),
+            conf=float(init_dict['conf']),
+            device='cpu',
+            quantize=None,
+            batch=max(1, int(init_dict.get('batch', 1))),
+            input_channels=max(1, int(init_dict.get('input_channels', 1))),
+            channel_token=str(init_dict.get('channel_token', 'gray')),
+        )
+        runner = _OpenVinoCpuSegmenter(
+            str(model_path),
+            imgsz=int(cfg.imgsz),
+            batch=int(cfg.batch),
+            input_channels=int(cfg.input_channels),
+            requested_precision=str(init_dict.get('precision', 'auto')),
+            inference_threads=max(1, int(init_dict.get('inference_threads', len(cpus) or 1))),
+            physical_cores=max(1, int(init_dict.get('physical_cores', len(cpus) or 1))),
+            streams=(
+                int(init_dict['streams']) if init_dict.get('streams') is not None else None
+            ),
+            infer_requests=(
+                int(init_dict['infer_requests'])
+                if init_dict.get('infer_requests') is not None else None
+            ),
+        )
+        result_queue.put({
+            'type': 'ready', 'worker_kind': 'cpu', 'cpu_index': int(instance_id),
+            'pid': int(os.getpid()), 'precision': str(runner.resolved_precision),
+            'requests': int(runner.request_count), 'model_xml': str(runner.model_xml),
+            'threads': int(runner.inference_threads),
+            'input_element_type': str(runner.input_element_type),
+            'model_int8_quantized': bool(runner.model_int8_quantized),
+            'amx_tile': bool(runner.amx_tile_available),
+            'amx_bf16': bool('amx_bf16' in runner.cpu_flags),
+            'amx_int8': bool('amx_int8' in runner.cpu_flags),
+            'openvino_capabilities': sorted(runner.capabilities),
+            'class_count': (
+                int(runner.expected_class_count)
+                if runner.expected_class_count is not None else None
+            ),
+        })
+    except Exception as exc:
+        import traceback
+        try:
+            result_queue.put({
+                'type': 'fatal', 'worker_kind': 'cpu', 'cpu_index': int(instance_id),
+                'error': repr(exc), 'traceback': traceback.format_exc(),
+            })
+        except Exception:
+            pass
+        return
+
+    try:
+        while True:
+            task = task_queue.get()
+            if task is None:
+                break
+            task_id = int(task['task_id'])
+            transferred_task_fds: List[int] = []
+            try:
+                task_local = dict(task)
+                transferred_task_fds = _materialize_worker_task_memfd_paths(
+                    task_local, persistent_source_memfds,
+                )
+                render_workers = max(
+                    1,
+                    min(
+                        int(init_dict.get('render_workers', 1)),
+                        int(task_local.get('slice_count', 1)),
+                    ),
+                )
+                task_local['render_workers'] = int(render_workers)
+                task_local['postprocess_workers'] = 1
+                started = time.perf_counter()
+                stats = run_prediction_volume_in_openvino_worker(runner, cfg, task_local)
+                stats = dict(stats)
+                stats['worker_compute_seconds'] = max(0.0, time.perf_counter() - started)
+                stats['backend'] = 'cpu'
+                stats['cpu_instance'] = int(instance_id)
+                result_queue.put({
+                    'type': 'result', 'worker_kind': 'cpu',
+                    'cpu_index': int(instance_id), 'task_id': int(task_id),
+                    'ok': True, 'stats': stats,
+                })
+            except Exception as exc:
+                import traceback
+                result_queue.put({
+                    'type': 'result', 'worker_kind': 'cpu',
+                    'cpu_index': int(instance_id), 'task_id': int(task_id),
+                    'ok': False, 'error': repr(exc), 'traceback': traceback.format_exc(),
+                })
+            finally:
+                _close_fd_list(transferred_task_fds)
+    finally:
+        _close_fd_list(persistent_source_memfds.values())
+        persistent_source_memfds.clear()
 
 
 @dataclass
@@ -25837,11 +27247,15 @@ def assemble_current_view_union_volume(
     workers: int = 1,
     projected_layer_refs: Optional[Sequence['NrrdLayerRef']] = None,
 ) -> np.ndarray:
-    """Assemble the single model's current view union.
-    
-    Multiple model entries are rejected; the destination uses source geometry when requested."""
+    """Assemble the single logical GPU/CPU model pair's current view union.
+
+    GPU and CPU artifacts share one logical segmentation namespace in v17; the destination
+    uses source geometry when requested."""
     if len(view_volumes_by_model) != 1:
-        raise ValueError(f'GPT-5.6-Sol-Pro v{SCRIPT_VERSION} supports exactly one --model; multiple-model inference has been removed')
+        raise ValueError(
+            f'GPT-5.6-Sol-Pro v{SCRIPT_VERSION} expected one logical GPU/CPU model pair; '
+            f'found {len(view_volumes_by_model)} result namespaces'
+        )
 
     union_shape = (int(T), int(H), int(W)) if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
     model_name = next(iter(view_volumes_by_model.keys()))
@@ -39933,8 +41347,13 @@ def write_summary_file(
     lines.append(f'Slice-parallel postprocess workers: {int(slice_postprocess_workers)}')
     lines.append(f'Interpolation workers: {int(interpolation_workers)}')
     lines.append(f'Output workers: {int(output_workers)}')
-    lines.append('Worker oversubscription: intentional; the default worker budget targets 2x the visible CPU allocation to overlap GPU waits, ffmpeg IO, and slice-parallel CPU work.')
-    lines.append(f'Model: {str(Path(model_paths[0])) if model_paths else "<none>"}')
+    lines.append('Worker oversubscription: inference-phase pools are bounded against process-local GPU/OpenVINO reservations; tail-only CPU pools may expand after every inference worker exits.')
+    if model_paths:
+        lines.append('Models:')
+        for model_path in model_paths:
+            lines.append(f'  {str(model_path)}')
+    else:
+        lines.append('Models: <none>')
     lines.append(f'Views: {", ".join(view_names)}')
     if spec_notes:
         lines.append('')
@@ -40132,24 +41551,143 @@ def main() -> None:
     if not input_path.exists():
         raise FileNotFoundError(input_path)
 
-    model_path = str(args.model).strip()
-    if not model_path:
-        raise ValueError('--model must specify one YOLO segmentation model path')
-    if ',' in model_path:
-        raise ValueError(f'GPT-5.6-Sol-Pro v{SCRIPT_VERSION} accepts a single --model path; multiple-model inference has been removed')
-    model_path_resolved = str(Path(model_path).expanduser().resolve())
-    if not Path(model_path_resolved).exists():
-        raise FileNotFoundError(model_path_resolved)
-    model_paths = [model_path_resolved]
-    model_name = Path(model_paths[0]).stem
+    try:
+        backend_models = resolve_backend_models(args.model)
+        backend_devices = resolve_backend_devices(args.device)
+        backend_precisions = resolve_backend_precisions(args.quantize, backend_devices)
+        backend_batches = resolve_backend_batches(args.batch, backend_devices)
+        cpu_instances_requested = resolve_auto_positive_int(
+            args.cpu_instances, flag_name='--cpu_instances',
+        )
+        cpu_threads_requested = resolve_auto_positive_int(
+            args.cpu_threads, flag_name='--cpu_threads',
+        )
+        cpu_streams_requested = resolve_auto_positive_int(
+            args.cpu_streams, flag_name='--cpu_streams',
+        )
+        cpu_infer_requests_requested = resolve_auto_positive_int(
+            args.cpu_infer_requests, flag_name='--cpu_infer_requests',
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    gpu_model_path: Optional[str] = None
+    cpu_model_path: Optional[str] = None
+    for backend_name, requested_path in (
+        ('gpu', backend_models.gpu), ('cpu', backend_models.cpu),
+    ):
+        if requested_path is None:
+            continue
+        resolved_path = str(Path(requested_path).expanduser().resolve())
+        if not Path(resolved_path).exists():
+            raise FileNotFoundError(resolved_path)
+        if backend_name == 'gpu':
+            gpu_model_path = resolved_path
+        else:
+            cpu_model_path = resolved_path
+
+    gpu_inference_enabled = bool(backend_devices.gpu_devices)
+    cpu_inference_enabled = bool(backend_devices.cpu)
+    if gpu_inference_enabled and gpu_model_path is None:
+        parser.error('--device selected GPU inference, but --model has no gpu: entry')
+    if cpu_inference_enabled and cpu_model_path is None:
+        parser.error('--device selected CPU inference, but --model has no cpu: entry')
+    if gpu_model_path is not None and not gpu_inference_enabled:
+        print(f'GPU model supplied but no GPU backend selected; it will not be loaded: {gpu_model_path}')
+    if cpu_model_path is not None and not cpu_inference_enabled:
+        print(f'CPU model supplied but cpu was not selected in --device; it will not be loaded: {cpu_model_path}')
+    if gpu_inference_enabled and cpu_inference_enabled:
+        print(
+            'Warning: hybrid inference does not verify that the supplied GPU and CPU artifacts '
+            'were exported from identical weights. Their predictions are treated as one logical '
+            f'segmentation model. GPU={gpu_model_path}; CPU={cpu_model_path}'
+        )
+
+    inference_devices = list(backend_devices.gpu_devices)
+    if cpu_inference_enabled:
+        inference_devices.append('cpu')
+    gpu_device_count = len(backend_devices.gpu_devices)
+    gpu_worker_process_active = bool(gpu_inference_enabled)
+    cpu_worker_process_active = bool(cpu_inference_enabled)
+    inference_worker_process_active = bool(gpu_worker_process_active or cpu_worker_process_active)
+    cpu_instance_plans: List[CpuInferenceInstancePlan] = (
+        plan_openvino_cpu_instances(cpu_instances_requested, cpu_threads_requested)
+        if cpu_worker_process_active else []
+    )
+    cpu_inference_reserved_cpus = {
+        int(cpu) for plan in cpu_instance_plans for cpu in plan.cpus
+    }
+    try:
+        _allowed_main_cpus = {int(cpu) for cpu in os.sched_getaffinity(0)}
+    except Exception:
+        _allowed_main_cpus = set(range(max(1, int(_cpu_count()))))
+    main_process_reserved_cpus = sorted(_allowed_main_cpus - cpu_inference_reserved_cpus)
+    main_process_affinity_restricted = False
+    parent_affinity_monitor_stop = threading.Event()
+    parent_affinity_monitor_thread: Optional[threading.Thread] = None
+    parent_affinity_monitor_errors: List[BaseException] = []
+
+    def _apply_parent_inference_affinity(*, fail_fast: bool) -> bool:
+        nonlocal main_process_affinity_restricted
+        if main_process_affinity_restricted:
+            return True
+        if (
+            not cpu_worker_process_active
+            or not main_process_reserved_cpus
+            or set(int(cpu) for cpu in main_process_reserved_cpus) == set(_allowed_main_cpus)
+        ):
+            return False
+        if not _sched_setaffinity_all_threads(main_process_reserved_cpus):
+            exc = RuntimeError(
+                'v17 could not isolate parent-process scheduler/render/output threads from '
+                f'OpenVINO CPU masks; requested parent mask={main_process_reserved_cpus}'
+            )
+            if fail_fast:
+                raise exc
+            parent_affinity_monitor_errors.append(exc)
+            return False
+        main_process_affinity_restricted = True
+        print(
+            '[intel] Parent scheduler/render/output threads restricted to '
+            f'{len(main_process_reserved_cpus)} logical CPU(s) outside OpenVINO masks for '
+            'the inference phase.'
+        )
+        return True
+
+    if cpu_worker_process_active:
+        for plan in cpu_instance_plans:
+            print(
+                f'[intel] CPU inference instance {plan.instance_id}: nodes={list(plan.numa_nodes)}, '
+                f'physical_cores={plan.physical_cores}, logical_threads={plan.inference_threads}, '
+                f'cpu_mask={list(plan.cpus)}'
+            )
+        print(
+            f'[intel] OpenVINO reserves {len(cpu_inference_reserved_cpus)} logical CPU(s); '
+            f'{len(main_process_reserved_cpus)} logical CPU(s) remain outside those masks for '
+            'decode, GPU feeding, interpolation, scheduling, and output.'
+        )
+
+    args.gpu_model = gpu_model_path
+    args.cpu_model = cpu_model_path
+    args.gpu_batch = int(backend_batches.gpu)
+    args.cpu_batch = int(backend_batches.cpu)
+    args.gpu_quantize = backend_precisions.gpu
+    args.cpu_precision = str(backend_precisions.cpu)
+    # Compatibility values used by the established CUDA path and shared task builders.
+    args.batch = int(args.gpu_batch if gpu_inference_enabled else args.cpu_batch)
+    args.quantize = args.gpu_quantize
+    model_paths: List[str] = []
+    if gpu_model_path is not None:
+        model_paths.append(f'gpu:{gpu_model_path}')
+    if cpu_model_path is not None:
+        model_paths.append(f'cpu:{cpu_model_path}')
+    model_name = Path(str(gpu_model_path or cpu_model_path)).stem
 
     # Resolve the complete view request before model loading or volume decode. With no
     # implicit Cartesian/Tilted/Radial defaults, a missing or self-disabling view request must
     # fail immediately rather than decode a multi-terabyte logical run and discover it later.
     angles = resolve_tta_angles(args.angle)
     angle_variant_streaming_cleanup_active = True
-    if int(args.batch) < 1:
-        raise ValueError('--batch must be >= 1')
     set_inference_batch_size(int(args.batch))
     try:
         enabled_cartesian_views = resolve_cartesian_views(args.enable_cartesian)
@@ -40163,6 +41701,19 @@ def main() -> None:
     # form an accidental cross-product. The flattened base list is only for Radial eligibility.
     tilt_views = tilted_group_base_views(tilt_groups)
     radial_targets = [request.view for request in radial_requests]
+    if radial_requests and cpu_inference_enabled and not gpu_inference_enabled:
+        skipped_targets = ', '.join(radial_targets)
+        print(
+            'Warning: CPU-only inference does not support Radial or Tilted-Radial views; '
+            f'the following requests will be skipped: {skipped_targets}'
+        )
+        radial_requests = []
+        radial_targets = []
+    elif radial_requests and cpu_inference_enabled and gpu_inference_enabled:
+        print(
+            'Warning: OpenVINO CPU workers do not process Radial or Tilted-Radial views. '
+            'Those enabled views remain active and will be processed exclusively by GPU workers.'
+        )
 
     concrete_tilt_requested = bool(tilt_groups)
     active_radial_request = any(
@@ -40204,23 +41755,20 @@ def main() -> None:
         int(args.centerline_filter_passes) > 0
         and str(args.centerline_filter_backend).strip().lower() != 'off'
     )
-    # Resolve process-local inference topology before considering a parent model load.
-    # Every CUDA device is served by its own persistent worker process, including one-GPU runs.
-    inference_devices = parse_device_list(args.device)
-    configure_gpu_slice_labeling_devices(inference_devices)
-    gpu_device_count = len([d for d in inference_devices if str(d).startswith('cuda')])
-    gpu_worker_process_active = bool(gpu_device_count > 0)
-
+    # Backends are process-local. Every CUDA device and every populated CPU socket owns
+    # one persistent model process; the parent retains only path and scheduling metadata.
+    configure_gpu_slice_labeling_devices(list(backend_devices.gpu_devices))
     model_load_executor: Optional[ThreadPoolExecutor] = None
     model_load_future: Optional[Future] = None
-    if (not gpu_worker_process_active) and background_model_load_enabled():
-        print(f'Loading model in background while input volume is prepared: {model_name} ({model_paths[0]})')
-        model_load_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='model-load')
-        model_load_future = model_load_executor.submit(load_ultralytics_model, model_paths[0], 'segment')
-    elif gpu_worker_process_active:
+    if gpu_worker_process_active:
         print(
-            f'Parent model load skipped: {gpu_device_count} CUDA worker process(es) will '
-            f'load {model_name} from {model_paths[0]} independently.'
+            f'Parent GPU model load skipped: {gpu_device_count} CUDA worker process(es) will '
+            f'load {model_name} from {gpu_model_path} independently.'
+        )
+    if cpu_worker_process_active:
+        print(
+            'Parent CPU model load skipped: socket-local OpenVINO worker process(es) will '
+            f'compile {cpu_model_path} after applying their CPU affinity.'
         )
 
     # Validate logical CUDA indices and resolve retina-mask placement before decode begins.
@@ -40243,8 +41791,13 @@ def main() -> None:
                 f'CUDA_VISIBLE_DEVICES={_inherited_cvd!r} ({len(_visible_tokens)} visible device(s)). '
                 f'--device uses torch LOGICAL indices into that list (v13.2.2): {hint}.'
             )
-    retina_processor, retina_processor_reason = resolve_retina_mask_processor(
-        args.retina_mask_processor, inference_devices
+    # Mask/proto postprocessing follows the inference backend automatically. The parent
+    # selects GPU semantics when CUDA is active; each OpenVINO worker explicitly selects CPU.
+    retina_processor = 'gpu' if gpu_worker_process_active else 'cpu'
+    retina_processor_reason = (
+        'automatic: GPU inference owns GPU proto/mask processing'
+        if gpu_worker_process_active else
+        'automatic: OpenVINO inference owns CPU proto/mask processing'
     )
     set_retina_mask_processor(retina_processor)
     # Angle-variant + GPU-retina fast path. Every requested angle is now a separate
@@ -40267,10 +41820,12 @@ def main() -> None:
         angle_variant_gpu_fastpath_min_conf_value, angle_variant_gpu_fastpath_min_radius_value
     )
     print(
-        f'Inference devices: {inference_devices} '
-        f'(process-per-GPU scheduling {"active" if gpu_worker_process_active else "inactive"}); '
-        f'quantize={quantize_display(args.quantize)}; '
-        f'retina mask processor: {retina_processor} ({retina_processor_reason}).'
+        f'Inference devices: {inference_devices}; '
+        f'GPU precision={quantize_display(args.gpu_quantize) if gpu_worker_process_active else "disabled"}, '
+        f'CPU precision={args.cpu_precision if cpu_worker_process_active else "disabled"}; '
+        f'GPU batch={args.gpu_batch if gpu_worker_process_active else "disabled"}, '
+        f'CPU batch={args.cpu_batch if cpu_worker_process_active else "disabled"}; '
+        f'mask/proto processing follows each inference backend automatically.'
     )
     if angle_variant_gpu_fastpath_active:
         print(
@@ -40292,6 +41847,11 @@ def main() -> None:
     # transfer when available, and a real pathname only as fallback.
     gpu_worker_direct_union_active = bool(
         gpu_worker_process_active and gpu_worker_direct_union_enabled()
+    )
+    # Any full-frame task that CPU workers may claim must use the common view-local union
+    # boundary. GPU-only views may retain the D1 owner pipeline.
+    worker_direct_union_active = bool(
+        gpu_worker_direct_union_active or cpu_worker_process_active
     )
     # Collect geometry-independent eligibility conditions for the v16.1.3 fast bundle.
     # Source and processing geometry are not known until ffprobe and processing-shape
@@ -40430,20 +41990,18 @@ def main() -> None:
 
     preprocess_streaming_active = bool(streaming_preprocess_enabled())
     vol_path = temp_dir / 'input_volume.gray8.dat'
-    # Resolve cube geometry before decode. CUDA workers need a reopenable source, so the
+    # Resolve cube geometry before decode. Inference worker processes need a reopenable source, so the
     # decoded native volume uses a transferred memfd whenever it is their source. A real
     # pathname is retained only as the fallback when memfd is unavailable.
     input_processing_shape = (int(input_T), int(input_H), int(input_W))
     legacy_cube_shape = compute_cube_resize_shape(input_T, input_H, input_W, tolerance=0.05)
     processing_mode = processing_volume_mode()
     cube_resize_will_apply = bool(should_resize_to_processing_cube(input_processing_shape, legacy_cube_shape))
-    # CUDA workers open the shared source volume as a file. Without a cube resize that
+    # Inference workers open the shared source volume as a file. Without a cube resize that
     # file is the decode target itself; extends the same rule to cube runs so
     # workers can resident-upload the NATIVE decoded volume (t-resizing on device) without
     # a copy pass first.
-    decode_prefer_memory = not (
-        bool(gpu_worker_process_active) and (not cube_resize_will_apply or gpu_cube_resize_enabled())
-    )
+    decode_prefer_memory = not bool(inference_worker_process_active)
     if preprocess_streaming_active:
         print(
             'v12.2.15 streaming preprocessing active: ffmpeg decode returns its destination array immediately; '
@@ -40457,7 +42015,7 @@ def main() -> None:
             height=input_H,
             overwrite=False,
             prefer_memory=decode_prefer_memory,
-            prefer_memfd=bool(gpu_worker_process_active and not decode_prefer_memory),
+            prefer_memfd=bool(inference_worker_process_active and not decode_prefer_memory),
         )
     else:
         input_volume_rgb = decode_video_to_memmap_gray8(
@@ -40468,7 +42026,7 @@ def main() -> None:
             height=input_H,
             overwrite=False,
             prefer_memory=decode_prefer_memory,
-            prefer_memfd=bool(gpu_worker_process_active and not decode_prefer_memory),
+            prefer_memfd=bool(inference_worker_process_active and not decode_prefer_memory),
         )
     (temp_dir / 'input_volume.meta.json').write_text(
         json.dumps({
@@ -40525,7 +42083,7 @@ def main() -> None:
                 processing_shape,
                 temp_dir / 'input_volume.v950_cube.gray8.dat',
                 workers=max(1, default_worker_budget()),
-                prefer_memory=not bool(gpu_worker_process_active),
+                prefer_memory=not bool(inference_worker_process_active),
             )
         else:
             volume_rgb = resize_volume_to_processing_cube_gray8(
@@ -40533,7 +42091,7 @@ def main() -> None:
                 processing_shape,
                 temp_dir / 'input_volume.v950_cube.gray8.dat',
                 workers=max(1, default_worker_budget()),
-                prefer_memory=not bool(gpu_worker_process_active),
+                prefer_memory=not bool(inference_worker_process_active),
             )
     else:
         processing_shape = input_processing_shape
@@ -40762,6 +42320,17 @@ def main() -> None:
             'A worker that cannot admit the source volume to VRAM will still use the completed-cube CPU path.'
         )
     spec_notes: List[str] = []
+    spec_notes.append(
+        'v17.0.0 Intel inference update: --model accepts gpu:/PATH and cpu:/PATH; '
+        '--device selects GPU indexes, cpu, or GPU_INDEXES:cpu; --quantize and --batch '
+        'accept backend-qualified gpu:/cpu: values. OpenVINO runs in persistent socket-local '
+        'processes, automatically claims Cartesian work before Tilted Cartesian work, and '
+        'never claims Radial/Tilted-Radial work. CUDA workers always prioritize GPU-only work '
+        'and then non-preemptively steal unclaimed CPU-eligible leases. Mask/proto processing '
+        'follows the inference backend automatically; --retina_mask_processor and manual '
+        'CPU-offload/GPU-steal switches do not exist. Hybrid model identity is warning-only, '
+        'and BF16 output quality is accepted as a v17 specification assumption.'
+    )
     effective_save_options = list(save_options)
     if bool(low_quality_requested) and 'low_quality' not in effective_save_options:
         effective_save_options.append('low_quality')
@@ -40809,14 +42378,14 @@ def main() -> None:
     )
     if str(retina_processor).strip().lower() == 'gpu':
         spec_notes.append(
-            'v13.1.0 (#2.2): GPU retina-mask flatten + warp. The (n,H,W) retina-mask stack is reduced on '
+            'CUDA-task path (v13.1.0 #2.2): GPU retina-mask flatten + warp. The (n,H,W) retina-mask stack is reduced on '
             'the GPU to a union plane and a max-confidence plane, and both are warped to the view analysis grid '
             'on the GPU (torch grid_sample), so only those reduced planes cross PCIe (O(2*H*W)); no '
             'affine warp and no per-instance loop run on the CPU.'
         )
     if angle_variant_gpu_fastpath_active:
         spec_notes.append(
-            'v13.1.0 (#2.3) + v13.3.0 (R8): angle-variant GPU fast path. YOLO -> proto-resolution union '
+            'CUDA-task path (v13.1.0 #2.3 + v13.3.0 R8): angle-variant GPU fast path. YOLO -> proto-resolution union '
             '(R9) -> --min_conf -> warp (identity-skipped/grid-cached) -> --min_radius (cupy, only when '
             'positive) run on the GPU, then one finished view-native plane is sent to the CPU. The '
             'per-frame retina GPU 2D hole fill is removed: a completed-view pass or eligible task-end '
@@ -40824,7 +42393,7 @@ def main() -> None:
         )
     if str(retina_processor).strip().lower() == 'gpu':
         spec_notes.append(
-            'v13.3.0 (R9/R18/R1/R21): GPU retina unions are reduced at PROTO resolution inside a patched '
+            'CUDA-task path (v13.3.0 R9/R18/R1/R21): GPU retina unions are reduced at PROTO resolution inside a patched '
             'construct_result (one plane upsampled per frame instead of an (n, imgsz, imgsz) retina stack; '
             'YOLO_TTA_GPU_PROTO_UNION=0 restores the native path); the GPU postprocess tail runs on '
             'per-thread side CUDA streams with pinned D2H staging (YOLO_TTA_GPU_POSTPROCESS_STREAM / '
@@ -40907,16 +42476,12 @@ def main() -> None:
         spec_notes.append(
             'v12.2.15 streaming preprocessing is disabled by YOLO_TTA_STREAMING_PREPROCESS=0; decode finishes before inference scheduling begins, and legacy cube resize runs only when explicitly requested.'
         )
-    if (not gpu_worker_process_active) and background_model_load_enabled():
-        spec_notes.append(
-            'v16.0.2 retains startup overlap by default: the YOLO model load is submitted before decode/native-volume preparation and joined only when prediction needs it. Set YOLO_TTA_BACKGROUND_MODEL_LOAD=0 to force synchronous loading.'
-        )
-    elif gpu_worker_process_active:
-        spec_notes.append(
-            'CUDA parent model loading is skipped; each persistent per-GPU worker loads its own '
-            'inference engine while the default streaming decode producer is active. Setting '
-            'YOLO_TTA_STREAMING_PREPROCESS=0 makes decode synchronous and removes that overlap.'
-        )
+    spec_notes.append(
+        'v17.0.0 process-local model startup: the parent loads no inference model. Each persistent '
+        'CUDA worker deserializes its GPU engine, and each socket-local CPU worker compiles its '
+        'OpenVINO model only after applying its CPU affinity. Startup overlaps the default streaming '
+        'decode producer; YOLO_TTA_STREAMING_PREPROCESS=0 makes decode synchronous.'
+    )
     spec_notes.append(
         'v16.4.0 angle-variant streaming cleanup is mandatory: every --angle variant is '
         'confidence-filtered and analysis-grid min_radius-filtered as it streams. D6 scales '
@@ -41053,38 +42618,63 @@ def main() -> None:
         '--save low_quality[:LOW_QUALITY_DOWNBIN] specification, only when --save nrrd is enabled.'
     )
     spec_notes.append(
-        'Task #2.5 review (angle-variant fast path / tqdm): YOLO -> flatten -> --min_conf -> warp -> --min_radius -> '
-        '2D hole fill all run on the GPU (cupy) and only the finished view-native plane crosses PCIe; the per-slice '
-        'CPU cleanup is skipped via cleanup_done_on_gpu. No tqdm bar wraps the inference stream, so any tqdm the '
-        'user sees that does not line up with GPU work is a separate post-inference progress bar (a purely visual '
-        'artifact), not masks being shuttled CPU<->GPU. The fast path was left unchanged, as instructed.'
+        'v17 backend-local result processing: CUDA tasks retain the proto-union/flatten, warp, '
+        '--min_conf, and positive --min_radius GPU path before their reduced view-local result '
+        'is published. OpenVINO tasks keep raw head/prototype outputs on the CPU, reconstruct '
+        'bbox-local masks, and publish into the same disjoint view-union windows. Progress bars '
+        'outside inference therefore describe independent render/postprocess/output stages rather '
+        'than cross-device mask migration.'
     )
-    spec_notes.append(
-        f'v13.0.0 inference devices: {inference_devices} '
-        f'({"process-per-GPU CUDA scheduling" if gpu_worker_process_active else "in-process non-CUDA scheduling"}). '
-        + (
-            'CUDA runs use one worker process per GPU (each pinned via CUDA_VISIBLE_DEVICES and loading its '
-            'own model replica), pulling inference-ready full-frame/tile prediction volumes from a shared queue '
-            'so every GPU stays busy while work remains. Processes avoid the CPython GIL serialization that makes '
-            'thread-per-GPU inference no faster than a single GPU. Each worker renders+predicts+accumulates one '
-            'volume into a file-backed per-volume result memmap; the main process unions those results into the '
-            'per-view union (max-confidence) and runs all postprocessing/interpolation/output.'
-            if gpu_worker_process_active else
-            'CPU/MPS inference uses the in-process dispatch path.'
+    inference_backend_details: List[str] = []
+    if gpu_worker_process_active:
+        inference_backend_details.append(
+            f'{gpu_device_count} CUDA worker process(es), one per logical GPU, with '
+            'persistent model/context ownership and central short-lease dispatch'
         )
+    if cpu_worker_process_active:
+        inference_backend_details.append(
+            f'{len(cpu_instance_plans)} socket-local OpenVINO worker process(es), each with '
+            'one compiled model and a shallow asynchronous infer-request pool'
+        )
+    if gpu_worker_process_active and cpu_worker_process_active:
+        inference_routing_note = (
+            'GPU-only Radial work is selected before GPUs steal remaining unclaimed '
+            'Cartesian/Tilted work; already-running OpenVINO requests are never preempted.'
+        )
+    elif gpu_worker_process_active:
+        inference_routing_note = (
+            'CUDA workers own every selected view and prioritize Radial/Tilted-Radial work '
+            'within the central short-lease scheduler.'
+        )
+    else:
+        inference_routing_note = (
+            'OpenVINO workers own Cartesian/Tilted-Cartesian work; unsupported Radial '
+            'requests were removed before scheduling.'
+        )
+    spec_notes.append(
+        f'v17.0.0 inference backends: {inference_devices}; ' + '; '.join(inference_backend_details) + '. '
+        'All backends claim atomically from one central queue and write disjoint task ranges into '
+        f'the same result contract. {inference_routing_note}'
     )
-    if cpu_retina_masks_enabled():
+    if gpu_worker_process_active and cpu_worker_process_active:
         spec_notes.append(
-            f'Retina mask processor: cpu ({retina_processor_reason}). Deferred CPU retina-mask reconstruction active: '
-            'retina_masks=False is passed to YOLO; compact mask protos/coefficients/boxes/scores are moved to CPU and '
-            'bbox-ROI retina-quality masks are reconstructed on the CPU by bilinear-upsampling mask logits within each '
-            'detection ROI, thresholding at zero, and dropping empty masks, so the scheduler/model-stream thread does '
-            'not perform per-slice full-mask GPU copies.'
+            'Mask/prototype processing is backend-local in hybrid mode: CUDA tasks reduce and '
+            'warp their proto/mask unions on the GPU, while OpenVINO tasks reconstruct '
+            'bbox-ROI retina-quality masks on the CPU from raw head/prototype outputs. Both '
+            'publish the same view-local binary/confidence contract; there is no global '
+            '--retina_mask_processor selection.'
+        )
+    elif cpu_worker_process_active:
+        spec_notes.append(
+            'Mask/prototype processing follows the OpenVINO CPU backend: raw segmentation head '
+            'and prototype outputs are converted to compact CPU payloads, and bbox-ROI masks are '
+            'bilinearly reconstructed and thresholded on the CPU before view-union publication.'
         )
     else:
         spec_notes.append(
-            f'Retina mask processor: gpu ({retina_processor_reason}). Ultralytics native retina_masks=True resolves '
-            'full-resolution masks on the GPU, freeing CPU cores for rendering and postprocessing.'
+            'Mask/prototype processing follows the CUDA backend: proto-resolution unions, '
+            'confidence handling, affine warp, and eligible radius cleanup remain GPU-local '
+            'before reduced result publication.'
         )
     native_ffv1_outputs = []
     if bool(save_high_quality_enabled):
@@ -41126,69 +42716,43 @@ def main() -> None:
         f'Approximately-cubic target = {tuple(int(x) for x in legacy_cube_shape)}. Set YOLO_TTA_PROCESSING_VOLUME_MODE=native to opt back into v12.2.15 decoded-native geometry for regression. '
         f'Cube T-axis backend={_cube_t_axis_resize_backend()} (YOLO_TTA_CUBE_T_RESIZE_BACKEND=slice_exact restores the endpoint-aligned per-slice interpolation path).'
     )
-    yolo_model: Optional[object]
-    if gpu_worker_process_active:
-        yolo_model = None
-    elif model_load_future is not None:
-        print(f'Waiting for background model load to finish: {model_name} ({model_paths[0]})')
-        yolo_model = model_load_future.result()
-        if model_load_executor is not None:
-            model_load_executor.shutdown(wait=True)
-            model_load_executor = None
-    else:
-        print(f'Loading model: {model_name} ({model_paths[0]})')
-        yolo_model = load_ultralytics_model(model_paths[0], task='segment')
-    # Multiple-model inference is unsupported. CUDA worker mode retains only path/name metadata
-    # in the parent because each worker loads the single model locally.
+    yolo_model: Optional[object] = None
+    if not inference_worker_process_active:
+        raise RuntimeError('v17 requires at least one process-local GPU or OpenVINO CPU backend')
+    # The parent retains scheduling metadata only. CUDA workers deserialize TensorRT locally;
+    # socket-local CPU workers compile the OpenVINO IR after applying affinity.
     yolo_models: List[Tuple[str, Optional[object]]] = [(model_name, yolo_model)]
     yolo_by_model_name: Dict[str, object] = (
         {model_name: yolo_model} if yolo_model is not None else {}
     )
 
-    # pred_cfg is used by the in-process non-CUDA route and mirrored into CUDA worker configs.
+    # Metadata-only compatibility config. Each worker receives its backend-specific batch and
+    # precision below; no model is loaded in the parent.
     pred_cfg = PredictConfig(
         imgsz=args.imgsz,
         conf=args.conf,
-        device=str(inference_devices[0]),
-        quantize=resolve_quantize(args.quantize),
-        batch=max(1, int(args.batch)),
+        device=(str(backend_devices.gpu_devices[0]) if gpu_worker_process_active else 'cpu'),
+        quantize=(resolve_quantize(args.gpu_quantize) if gpu_worker_process_active else None),
+        batch=max(1, int(args.gpu_batch if gpu_worker_process_active else args.cpu_batch)),
         input_channels=int(channel_format.channel_count),
         channel_token=str(channel_format.token),
     )
-
-    if not gpu_worker_process_active:
-        # CPU/MPS inference runs in the main process. Pin the model and apply patches once.
-        # pre-apply the global Ultralytics monkeypatches once on the main thread.
-        if yolo_model is None:  # defensive invariant; CUDA workers are metadata-only in the parent
-            raise RuntimeError('Main-process YOLO model is unavailable for in-process inference')
-        ensure_yolo_ready_for_predict(yolo_model, pred_cfg)
-        validate_yolo_model_input_channels(
-            yolo_model,
-            int(channel_format.channel_count),
-            channel_token=str(channel_format.token),
-            context='main-process model load',
-        )
-        require_channel_aware_yolo_preprocess_patch(str(channel_format.token))
-        if cpu_retina_masks_enabled():
-            try:
-                ensure_cpu_retina_mask_predictor_patch()
-            except Exception as _patch_exc:  # pragma: no cover - patch is best-effort
-                print(f'Warning: CPU retina predictor patch could not be pre-applied ({_patch_exc}).')
-    else:
-        # CUDA inference runs in one worker process per GPU (see _gpu_inference_worker_main).
-        # Each worker loads its own model replica and applies the patches in its own interpreter;
-        # the main process retains metadata only. This avoids redundant engine deserialization and
-        # the CPython GIL serialization that makes thread-per-GPU inference no faster than one GPU.
-        print(
-            f'CUDA inference will run in {gpu_device_count} per-GPU worker process(es) '
-            f'{inference_devices}; no main-process model was loaded.'
-        )
+    print(
+        'v17 process-local inference: '
+        f'{gpu_device_count} CUDA worker(s), {len(cpu_instance_plans)} OpenVINO CPU worker(s); '
+        'the parent loaded no inference model.'
+    )
 
 
-    # Size main-process pools around the CPU reservation held by live CUDA workers.
+    # Size main-process pools around live inference subprocess reservations.
     # inference subprocesses already consume ~visible_cpu render threads (the GPU-blocking pools), so
     # the main-process GPU-non-blocking pools take only the remaining headroom of the 2x box target.
     worker_budget = int(main_process_worker_budget(int(gpu_device_count), bool(gpu_worker_process_active)))
+    if cpu_worker_process_active:
+        # OpenVINO owns almost all socket-local cores. Bound parent pools to the CPUs left
+        # outside those masks so legacy 2x oversubscription cannot fight AMX inference.
+        parent_logical = max(1, int(len(main_process_reserved_cpus)))
+        worker_budget = max(1, min(int(worker_budget), 2 * int(parent_logical)))
     whole_box_worker_budget = int(default_worker_budget())
     tail_budget_expansion_active = bool(tail_worker_budget_expansion_enabled())
     tail_worker_budget = int(whole_box_worker_budget if tail_budget_expansion_active else worker_budget)
@@ -41319,7 +42883,7 @@ def main() -> None:
             f'remaining {worker_budget} to keep the box near 2:1 instead of oversubscribing it.'
         )
     else:
-        print('Worker oversubscription is intentional (budget = 2x visible CPUs; non-CUDA inference is in-process).')
+        print('Inference-phase worker pools are bounded against live GPU/OpenVINO process reservations; tail-only pools may expand after inference drains.')
     print(f'Augmentation workers: {augmentation_workers}')
     print(f'Slice-parallel postprocess workers: {slice_postprocess_workers}')
     print(f'Inference postprocess workers: {predict_postprocess_workers}')
@@ -41361,7 +42925,11 @@ def main() -> None:
         f'example worker_count={int(example_cpu_mask_workers)}, pending_limit={int(example_cpu_mask_pending)}.'
     )
     spec_notes.append(
-        f'Batched inference active with --batch={int(args.batch)}. StreamingYoloVolumeSource is used by default for full-frame/tile sources: it renders a bounded CPU prefetch window of H×W×{int(channel_format.channel_count)} center inputs and pads the final batch by repeating the last complete channel stack; CUDA input staging can additionally queue YOLO_TTA_GPU_INPUT_STAGING_BATCHES complete BCHW batches in VRAM ahead of inference; set YOLO_TTA_STREAMING_PREDICTION_SOURCES=0 to restore dense in-memory prediction-volume materialization.'
+        f'Backend-specific batching: GPU batch={int(args.gpu_batch) if gpu_worker_process_active else "disabled"}, '
+        f'CPU batch={int(args.cpu_batch) if cpu_worker_process_active else "disabled"}. Each backend '
+        f'independently pads its final source batch by repeating the last complete H×W×{int(channel_format.channel_count)} '
+        'channel stack and discards synthetic results. StreamingYoloVolumeSource remains the bounded '
+        'render/prefetch source; CUDA tasks may additionally stage complete BCHW batches in VRAM.'
     )
     spec_notes.append(
         'v16.4 per-tile semantics remain active: every original tile stays crop-local and is '
@@ -41770,7 +43338,9 @@ def main() -> None:
     def _make_streaming_fullframe_ref(view: ViewInfo, aug_job: AugJob) -> PredictionVolumeRef:
         write_aug_job_meta(aug_job, view, channel_format)
         render_workers = streaming_prediction_source_workers(int(per_prediction_volume_workers), int(view.num_slices))
-        prefetch_frames = streaming_prediction_source_prefetch_frames(max(1, int(args.batch)))
+        prefetch_frames = streaming_prediction_source_prefetch_frames(
+            max(1, int(max(args.gpu_batch if gpu_worker_process_active else 1, args.cpu_batch if cpu_worker_process_active else 1)))
+        )
 
         renderer = make_fullframe_channel_renderer(
             volume_rgb,
@@ -42187,7 +43757,7 @@ def main() -> None:
         # postprocess closure. Refill worker queues immediately instead of waiting for cvol/NRRD
         # completion to release a GPU-admission slot.
         if transitioned and gpu_worker_pending_task_ids:
-            _dispatch_gpu_worker_inference_window()
+            _dispatch_inference_windows()
 
     def _tile_gate_lock_shards(view_name: str) -> int:
         view = view_infos_by_name[str(view_name)]
@@ -42507,7 +44077,7 @@ def main() -> None:
             # idle worker queues now rather than waiting for the much later B/final-parent
             # completion event.
             if gpu_worker_pending_task_ids:
-                _dispatch_gpu_worker_inference_window()
+                _dispatch_inference_windows()
 
 
     def _submit_prediction_accumulation_join(handle: PredictionAccumulationHandle, context: Dict[str, object]) -> None:
@@ -42755,7 +44325,7 @@ def main() -> None:
         # view window is full. Completing cvol materialization releases that slot, so
         # immediately refill the worker queues instead of waiting for an unrelated event.
         if direct_union_capacity_released and gpu_worker_pending_task_ids:
-            _dispatch_gpu_worker_inference_window()
+            _dispatch_inference_windows()
 
     last_scheduler_wait_log = 0.0
 
@@ -42799,8 +44369,17 @@ def main() -> None:
     # Process-per-GPU scheduler. This path is active for every CUDA run, including one GPU.
     #
     gpu_worker_processes: List[object] = []
+    cpu_worker_processes: List[object] = []
     _reset_main_process_gpu_stage_coordinator()
     gpu_task_queues: Dict[int, object] = {}
+    cpu_task_queues: Dict[int, object] = {}
+    cpu_worker_dispatched_by_id: Dict[int, int] = {}
+    cpu_worker_results_by_id: Dict[int, int] = {}
+    cpu_worker_seconds_per_frame_ewma: Dict[Tuple[object, ...], float] = {}
+    cpu_worker_predicted_load_by_id: Dict[int, float] = {}
+    cpu_worker_task_predicted_seconds_by_id: Dict[int, float] = {}
+    cpu_worker_ready_details_by_id: Dict[int, Dict[str, object]] = {}
+    cpu_worker_dispatch_cursor = 0
     gpu_result_queue: object = None
     gpu_worker_tasks_by_id: Dict[int, Dict[str, object]] = {}
     gpu_worker_results_collected = 0
@@ -42828,11 +44407,11 @@ def main() -> None:
         shutil.rmtree(gpu_worker_result_dir, ignore_errors=True)
         if gpu_worker_result_dir.exists():
             print(
-                f'Warning: stale GPU-worker result scratch could not be fully removed: '
+                f'Warning: stale inference-worker result scratch could not be fully removed: '
                 f'{gpu_worker_result_dir}'
             )
         else:
-            print(f'Purged stale GPU-worker result scratch before this run: {gpu_worker_result_dir}')
+            print(f'Purged stale inference-worker result scratch before this run: {gpu_worker_result_dir}')
     # v16.4.3: every tile needs one independent dense crop only through GPU publication and
     # cleanup. Those files must not form a producer/consumer queue behind interpolation or
     # component gates. Reserve their logical uint8 bytes at dispatch and release the credit
@@ -43184,7 +44763,7 @@ def main() -> None:
                 int(len(gpu_worker_tile_dense_result_reservations)),
             )
         if bool(refill) and gpu_worker_pending_task_ids:
-            _dispatch_gpu_worker_inference_window()
+            _dispatch_inference_windows()
         return True
 
     def _release_tile_dense_result_for_key(
@@ -43235,7 +44814,7 @@ def main() -> None:
         if str(task.get('kind', '')) != 'fullframe' or bool(task.get('disable_runtime_split', False)):
             return current_id
         min_slices = max(1, int(gpu_worker_min_lease_slices()))
-        align = max(1, int(args.batch))
+        align = max(1, int(args.gpu_batch))
         while True:
             count = int(task.get('slice_count', 0))
             if count < 2 * min_slices:
@@ -43398,7 +44977,7 @@ def main() -> None:
             midpoint = gpu_worker_tail_split_point(
                 int(task.get('slice_start', 0)),
                 int(task.get('slice_count', 0)),
-                int(args.batch),
+                int(args.gpu_batch),
             )
             if midpoint is None:
                 continue
@@ -43524,6 +45103,8 @@ def main() -> None:
         eligible: List[Tuple[int, int]] = []
         for position, task_id in enumerate(pending_ids):
             task = gpu_worker_tasks_by_id[int(task_id)]
+            if not bool(task.get('gpu_eligible', gpu_worker_process_active)):
+                continue
             if not _direct_union_task_admissible(task):
                 continue
             if not _tile_dense_result_task_admissible(task):
@@ -43535,6 +45116,14 @@ def main() -> None:
             eligible.append((int(position), int(task_id)))
         if not eligible:
             return None
+        # GPUs always drain work that CPU cannot execute (Radial/Tilted-Radial/D1) before
+        # stealing any still-unclaimed Cartesian or Tilted Cartesian lease.
+        gpu_only = [
+            pair for pair in eligible
+            if not bool(gpu_worker_tasks_by_id[int(pair[1])].get('cpu_eligible', False))
+        ]
+        if gpu_only:
+            eligible = gpu_only
         parent_pending_counts: Dict[Tuple[str, str], int] = {}
         for _position, task_id in eligible:
             parent_key = _gpu_worker_fullframe_parent_key(gpu_worker_tasks_by_id[int(task_id)])
@@ -43733,6 +45322,141 @@ def main() -> None:
         _publish_gpu_worker_admissible_backlog()
         _refresh_gpu_aux_interpolation_leases()
 
+    def _cpu_worker_task_seconds(task: Dict[str, object]) -> float:
+        view_obj = task.get('view')
+        count = max(1, int(task.get('slice_count', 1)))
+        key = ('cpu',) + tuple(gpu_worker_task_cost_key(task))
+        sec_per_frame = cpu_worker_seconds_per_frame_ewma.get(key)
+        if sec_per_frame is None:
+            sec_per_frame = (
+                cpu_worker_default_seconds_per_frame(view_obj)
+                if isinstance(view_obj, ViewInfo) else 0.25
+            )
+        return max(1e-4, float(sec_per_frame) * float(count))
+
+    def _update_cpu_worker_cost(task: Dict[str, object], stats: Dict[str, object]) -> None:
+        elapsed = float(stats.get('worker_compute_seconds', 0.0) or 0.0)
+        count = max(1, int(task.get('slice_count', 1)))
+        if elapsed <= 0.0:
+            return
+        observed = max(1e-5, float(elapsed) / float(count))
+        key = ('cpu',) + tuple(gpu_worker_task_cost_key(task))
+        prior = cpu_worker_seconds_per_frame_ewma.get(key)
+        alpha = min(0.8, max(0.05, _env_float('YOLO_TTA_CPU_WORKER_COST_EWMA_ALPHA', 0.30)))
+        cpu_worker_seconds_per_frame_ewma[key] = (
+            observed if prior is None else (1.0 - alpha) * float(prior) + alpha * observed
+        )
+
+    def _cpu_worker_inflight(worker_id: int) -> int:
+        worker = int(worker_id)
+        return max(
+            0,
+            int(cpu_worker_dispatched_by_id.get(worker, 0))
+            - int(cpu_worker_results_by_id.get(worker, 0)),
+        )
+
+    def _pop_cpu_worker_pending_task_id(
+        preferred_parent: Optional[Tuple[str, str]] = None,
+    ) -> Optional[int]:
+        eligible: List[Tuple[int, int]] = []
+        for position, task_id in enumerate(list(gpu_worker_pending_task_ids)):
+            task = gpu_worker_tasks_by_id[int(task_id)]
+            if not bool(task.get('cpu_eligible', False)):
+                continue
+            if str(task.get('result_mode', 'file')) == 'd1_owner':
+                continue
+            if not _direct_union_task_admissible(task):
+                continue
+            if not _tile_dense_result_task_admissible(task):
+                continue
+            eligible.append((int(position), int(task_id)))
+        if not eligible:
+            return None
+        selected = min(
+            eligible,
+            key=lambda pair: (
+                0 if _gpu_worker_fullframe_parent_key(
+                    gpu_worker_tasks_by_id[int(pair[1])]
+                ) == preferred_parent else 1,
+                cpu_inference_task_priority(gpu_worker_tasks_by_id[int(pair[1])]),
+                0 if _direct_union_task_key(
+                    gpu_worker_tasks_by_id[int(pair[1])]
+                ) in direct_union_inference_views else 1,
+                _inference_storage_priority_rank(gpu_worker_tasks_by_id[int(pair[1])]),
+                int(pair[0]),
+            ),
+        )[1]
+        gpu_worker_pending_task_ids.remove(int(selected))
+        return int(selected)
+
+    def _dispatch_cpu_worker_inference_window(
+        preferred_parent: Optional[Tuple[str, str]] = None,
+    ) -> None:
+        """Issue one shallow lease per socket so GPUs can steal every unclaimed remainder."""
+        nonlocal cpu_worker_dispatch_cursor
+        worker_ids = sorted(int(worker_id) for worker_id in cpu_task_queues)
+        if not worker_ids:
+            return
+        while gpu_worker_pending_task_ids:
+            available = [
+                worker_id for worker_id in worker_ids
+                if _cpu_worker_inflight(worker_id) < 1
+            ]
+            if not available:
+                break
+            task_id = _pop_cpu_worker_pending_task_id(preferred_parent)
+            if task_id is None:
+                break
+            task = gpu_worker_tasks_by_id[int(task_id)]
+            start_rank = int(cpu_worker_dispatch_cursor) % len(worker_ids)
+            position = {
+                worker_id: (worker_ids.index(worker_id) - start_rank) % len(worker_ids)
+                for worker_id in available
+            }
+            predicted_seconds = float(_cpu_worker_task_seconds(task))
+            worker_id = min(
+                available,
+                key=lambda value: (
+                    float(cpu_worker_predicted_load_by_id.get(int(value), 0.0))
+                    + predicted_seconds,
+                    position[value],
+                ),
+            )
+            cpu_worker_dispatch_cursor = (worker_ids.index(worker_id) + 1) % len(worker_ids)
+            tile_storage_reserved = False
+            try:
+                _activate_direct_union_task(task)
+                tile_storage_reserved = _reserve_tile_dense_result_task(task)
+                if tile_storage_reserved:
+                    _prepare_tile_dense_result_workspaces(task)
+                dispatch_task = dict(task)
+                _attach_memfd_transfers_to_task(dispatch_task)
+                cpu_task_queues[int(worker_id)].put(dispatch_task)
+            except BaseException:
+                if tile_storage_reserved:
+                    _release_tile_dense_result_task_id(
+                        int(task_id), reason='CPU dispatch failure', refill=False,
+                    )
+                gpu_worker_pending_task_ids.appendleft(int(task_id))
+                raise
+            cpu_worker_dispatched_by_id[int(worker_id)] = int(
+                cpu_worker_dispatched_by_id.get(int(worker_id), 0)
+            ) + 1
+            cpu_worker_task_predicted_seconds_by_id[int(task_id)] = float(predicted_seconds)
+            cpu_worker_predicted_load_by_id[int(worker_id)] = float(
+                cpu_worker_predicted_load_by_id.get(int(worker_id), 0.0)
+            ) + float(predicted_seconds)
+
+    def _dispatch_inference_windows(
+        preferred_parent: Optional[Tuple[str, str]] = None,
+    ) -> None:
+        # Give each idle socket-local OpenVINO worker one short Cartesian/Tilted lease first.
+        # CUDA selection then fills every available GPU slot, internally preferring GPU-only
+        # Radial/D1 work before stealing any still-unclaimed CPU-eligible lease. All claims run
+        # in this main-thread function, so every task leaves the central deque exactly once.
+        _dispatch_cpu_worker_inference_window(preferred_parent)
+        _dispatch_gpu_worker_inference_window(preferred_parent)
+
     def _ensure_source_volume_file_backed() -> Tuple[str, Tuple[int, int, int], str]:
         wait_for_volume_ready(volume_rgb)
         shape = (int(volume_rgb.shape[0]), int(volume_rgb.shape[1]), int(volume_rgb.shape[2]))
@@ -43746,31 +45470,34 @@ def main() -> None:
         shared_path = temp_dir / 'gpu_worker_source_volume.gray8.dat'
         shared_mm = copy_workspace_array(
             np.asarray(volume_rgb), shared_path,
-            desc='CUDA-worker shared source volume', prefer_memory=False, prefer_memfd=True,
+            desc='inference-worker shared source volume', prefer_memory=False, prefer_memfd=True,
             workers=int(worker_budget),
         )
         flush_array(shared_mm)
         shared_backing = _memmap_backing_path(shared_mm)
         if shared_backing is None:
-            raise RuntimeError('CUDA-worker shared source volume has no reopenable backing path')
+            raise RuntimeError('inference-worker shared source volume has no reopenable backing path')
         return str(shared_backing), shape, str(np.asarray(shared_mm).dtype)
 
-    if gpu_worker_process_active:
+    if inference_worker_process_active:
         gpu_worker_result_dir.mkdir(parents=True, exist_ok=True)
-        # Each CUDA worker drives render/postprocess parallelism through its own thread pools,
+        # CUDA workers drive render/postprocess parallelism through their own thread pools.
         # so OpenCV must run each call
         # single-threaded (cv2.setNumThreads(1)); otherwise OpenCV's per-process pool funnels every
         # warpAffine/resize through a handful of threads and the render pool starves the GPUs while
         # most cores sit idle. YOLO_TTA_GPU_WORKER_CPU and YOLO_TTA_GPU_WORKER_CV2_THREADS override.
-        per_worker_workers = max(
-            1,
-            _env_int(
-                'YOLO_TTA_GPU_WORKER_CPU',
-                max(1, int(_cpu_count()) // max(1, gpu_device_count)),
-            ),
+        per_worker_workers = (
+            max(
+                1,
+                _env_int(
+                    'YOLO_TTA_GPU_WORKER_CPU',
+                    max(1, int(_cpu_count()) // max(1, gpu_device_count)),
+                ),
+            )
+            if gpu_worker_process_active else 1
         )
         fused_preflight_specs: List[Dict[str, object]] = []
-        if fused_renderer_preflight_enabled():
+        if gpu_worker_process_active and fused_renderer_preflight_enabled():
             for requested_family in ('radial', 'tilted', 'tilted_radial'):
                 selected_view: Optional[ViewInfo] = None
                 for candidate in inference_views:
@@ -43799,7 +45526,7 @@ def main() -> None:
 
         worker_init = {
             'imgsz': int(args.imgsz), 'conf': float(args.conf),
-            'quantize': resolve_quantize(args.quantize), 'batch': max(1, int(args.batch)),
+            'quantize': resolve_quantize(args.gpu_quantize), 'batch': max(1, int(args.gpu_batch)),
             'channel_format': channel_format,
             'input_channels': int(channel_format.channel_count),
             'channel_token': str(channel_format.token),
@@ -43813,9 +45540,11 @@ def main() -> None:
         # Torch LOGICAL indices (positions within any inherited CUDA_VISIBLE_DEVICES list);
         # validated against the inherited list early in main, and each worker resolves
         # its physical pin via _pin_cuda_visible_device_token.
-        gpu_logical_indices = [int(str(d).split(':')[-1]) for d in inference_devices]
+        gpu_logical_indices = [
+            int(str(device).split(':')[-1]) for device in backend_devices.gpu_devices
+        ]
         _configure_main_process_gpu_stage_workers(gpu_logical_indices)
-        if main_process_gpu_stage_inference_priority_enabled():
+        if gpu_worker_process_active and main_process_gpu_stage_inference_priority_enabled():
             if v1613_d1_owner_active:
                 print(
                     'v16.1.3 D1 owner pipeline active inside the persistent CUDA workers: '
@@ -43841,7 +45570,7 @@ def main() -> None:
         # discovery-driven GPU-worker -> NUMA-node CPU pin plan (None entries
         # stay unpinned). Computed from the PHYSICAL tokens before CUDA_VISIBLE_DEVICES is
         # narrowed inside the workers.
-        worker_numa_plan = plan_gpu_worker_affinity(pinned_tokens)
+        worker_numa_plan = plan_gpu_worker_affinity(pinned_tokens, excluded_cpus=cpu_inference_reserved_cpus)
         explicit_worker_cpu = bool(os.environ.get('YOLO_TTA_GPU_WORKER_CPU', '').strip())
         worker_cpu_budgets: List[int] = []
         for worker_pos, cpus in enumerate(worker_numa_plan):
@@ -43879,7 +45608,7 @@ def main() -> None:
             proc = mp_ctx.Process(
                 target=_gpu_inference_worker_main,
                 args=(
-                    worker_id, str(model_paths[0]), worker_init_i,
+                    worker_id, str(gpu_model_path), worker_init_i,
                     worker_queue, gpu_result_queue,
                 ),
                 name=f'gpu-worker-{gpu_index}', daemon=True,
@@ -43891,13 +45620,57 @@ def main() -> None:
             if bool(preprocess_streaming_active)
             else 'decode was synchronous; worker model load starts after decode'
         )
-        print(
-            f'Started {len(gpu_worker_processes)} GPU worker process(es) for logical devices {gpu_logical_indices} '
-            f'(pinned to CUDA_VISIBLE_DEVICES tokens {pinned_tokens}); {startup_overlap_note}; '
-            f'per-worker CPU workers={worker_cpu_budgets}, cv2 threads=1. Tasks enqueue once the source volume is ready.'
-        )
-        # Warm workers double as interpolation hosts whenever their targeted inference queue is idle.
-        if gpu_worker_aux_interpolation_enabled() and bool(interpolation_process_backend_active):
+        if gpu_worker_process_active:
+            print(
+                f'Started {len(gpu_worker_processes)} GPU worker process(es) for logical devices {gpu_logical_indices} '
+                f'(pinned to CUDA_VISIBLE_DEVICES tokens {pinned_tokens}); {startup_overlap_note}; '
+                f'per-worker CPU workers={worker_cpu_budgets}, cv2 threads=1. Tasks enqueue once the source volume is ready.'
+            )
+
+        if cpu_worker_process_active:
+            cpu_render_workers = max(1, _env_int('YOLO_TTA_CPU_RENDER_WORKERS', 2))
+            for plan in cpu_instance_plans:
+                instance_id = int(plan.instance_id)
+                worker_queue = mp_ctx.Queue()
+                cpu_task_queues[instance_id] = worker_queue
+                cpu_worker_dispatched_by_id[instance_id] = 0
+                cpu_worker_results_by_id[instance_id] = 0
+                cpu_init = {
+                    'imgsz': int(args.imgsz),
+                    'conf': float(args.conf),
+                    'batch': max(1, int(args.cpu_batch)),
+                    'input_channels': int(channel_format.channel_count),
+                    'channel_token': str(channel_format.token),
+                    'precision': str(args.cpu_precision),
+                    'numa_affinity_cpus': tuple(int(cpu) for cpu in plan.cpus),
+                    'inference_threads': int(plan.inference_threads),
+                    'physical_cores': int(plan.physical_cores),
+                    'streams': cpu_streams_requested,
+                    'infer_requests': cpu_infer_requests_requested,
+                    'render_workers': int(cpu_render_workers),
+                    'cv2_threads': 1,
+                }
+                proc = mp_ctx.Process(
+                    target=_cpu_inference_worker_main,
+                    args=(
+                        instance_id, str(cpu_model_path), cpu_init,
+                        worker_queue, gpu_result_queue,
+                    ),
+                    name=f'openvino-worker-{instance_id}', daemon=True,
+                )
+                proc.start()
+                cpu_worker_processes.append(proc)
+            print(
+                f'Started {len(cpu_worker_processes)} socket-local OpenVINO worker process(es); '
+                f'precision={args.cpu_precision}, batch={args.cpu_batch}, '
+                f'streams={cpu_streams_requested or "auto"}, '
+                f'infer_requests={cpu_infer_requests_requested or "auto"}, '
+                f'render_workers/instance={cpu_render_workers}. '
+                'Cartesian work is preferred, Tilted Cartesian follows, and Radial work is never claimed.'
+            )
+
+        # Warm GPU workers double as interpolation hosts whenever their targeted inference queue is idle.
+        if gpu_worker_process_active and gpu_worker_aux_interpolation_enabled() and bool(interpolation_process_backend_active):
             set_gpu_worker_aux_interpolation_pool(
                 _GpuWorkerAuxInterpolationPool(gpu_task_queues)
             )
@@ -43918,7 +45691,8 @@ def main() -> None:
             and _cube_t_axis_resize_backend() == 'slab'
         )
         if (
-            gpu_cube_resize_enabled()
+            gpu_worker_process_active
+            and gpu_cube_resize_enabled()
             and bool(cube_resize_will_apply)
             and (volume_rgb is not input_volume_rgb)
             and native_t_only_resize
@@ -43973,7 +45747,7 @@ def main() -> None:
                     f'({"v13.3.17 C10 host cube is demand-only; " if lazy_cube is not None else ""}'
                     'YOLO_TTA_GPU_CUBE_RESIZE=0 restores cube-gated enqueue).'
                 )
-        elif gpu_cube_resize_enabled() and bool(cube_resize_will_apply) and (volume_rgb is not input_volume_rgb):
+        elif gpu_worker_process_active and gpu_cube_resize_enabled() and bool(cube_resize_will_apply) and (volume_rgb is not input_volume_rgb):
             print(
                 'v13.3.9 (E3): native-t residency bypassed because the cube resize changes X/Y '
                 'or uses YOLO_TTA_CUBE_T_RESIZE_BACKEND=slice_exact; waiting for the exact cube '
@@ -43995,7 +45769,8 @@ def main() -> None:
         # precede hole fill (--min_conf, --min_radius) have no work, results stream through the
         # angle-variant cleanup path, and the task writes a disjoint direct-union window.
         gpu_worker_device_hole_fill = bool(
-            gpu_device_union_enabled()
+            gpu_worker_process_active
+            and gpu_device_union_enabled()
             and gpu_device_hole_fill_enabled()
             and bool(angle_variant_streaming_cleanup_active)
             and float(args.min_conf) <= 0.0
@@ -44022,9 +45797,18 @@ def main() -> None:
                 # construction keeps every profiled steady-state lease untouched.
                 # A still-central lease may split later, only when dispatch reaches the
                 # actual global inference tail; tiles are never split.
-                initial_chunk = min(
-                    int(slice_chunk), int(gpu_worker_initial_lease_slices(view, int(args.batch))),
-                )
+                initial_lease_candidates: List[int] = []
+                if gpu_worker_process_active:
+                    initial_lease_candidates.append(
+                        int(gpu_worker_initial_lease_slices(view, int(args.gpu_batch)))
+                    )
+                if cpu_worker_process_active and cpu_inference_supports_view(view):
+                    initial_lease_candidates.append(
+                        int(cpu_worker_initial_lease_slices(view, int(args.cpu_batch)))
+                    )
+                if not initial_lease_candidates:
+                    raise RuntimeError(f'No inference backend is eligible for {view.name}')
+                initial_chunk = min(int(slice_chunk), *initial_lease_candidates)
                 ranges = gpu_worker_fullframe_task_ranges(
                     int(n_slices), int(initial_chunk),
                 )
@@ -44063,13 +45847,17 @@ def main() -> None:
                 # which returns the full machine CPU count and would have each of N workers spin up an
                 # N-times-too-large render pool). With cv2.setNumThreads(1) these are real render threads.
                 render_workers = max(1, min(int(per_worker_workers), int(count)))
-                if str(kind) == 'fullframe' and v1613_d1_owner_active:
+                cpu_eligible = bool(
+                    cpu_worker_process_active and cpu_inference_supports_view(view)
+                )
+                gpu_eligible = bool(gpu_worker_process_active)
+                if str(kind) == 'fullframe' and v1613_d1_owner_active and not cpu_eligible:
                     # D1 retains only a task-local device union and one persistent source-space
                     # bitset on the owner GPU. No host result path or dense per-view workspace exists.
                     rmask = None
                     rconf = None
                     result_mode = 'd1_owner'
-                elif str(kind) == 'fullframe' and gpu_worker_direct_union_active:
+                elif str(kind) == 'fullframe' and worker_direct_union_active:
                     # The scheduler attaches transferred memfd descriptors for the shared
                     # per-view union; a real result pathname is only the fallback.
                     rmask = None
@@ -44081,6 +45869,7 @@ def main() -> None:
                     result_mode = 'file'
                 task = {
                     'task_id': int(next_task_id), 'kind': str(kind), 'model_name': str(model_name),
+                    'cpu_eligible': bool(cpu_eligible), 'gpu_eligible': bool(gpu_eligible),
                     'view': view, 'job': job_obj, 'job_id': job_id, 'out_size': int(out_size),
                     'channel_format': channel_format,
                     'M_out_to_src': m_out,
@@ -44181,13 +45970,61 @@ def main() -> None:
                 )
 
         gpu_worker_pending_task_ids.extend(range(int(gpu_worker_total_tasks)))
-        _dispatch_gpu_worker_inference_window()
+        # Hybrid native-t GPU residency can defer the 25+ GiB host processing cube until a
+        # CPU worker asks for it. Let that one-time resize use the full allocation while the
+        # OpenVINO workers are still waiting on the cube sentinel; restricting the parent to
+        # only its small housekeeping reserve first would turn the resize into a long barrier.
+        # A monitor applies strict parent/OpenVINO core isolation immediately after publication.
+        defer_parent_affinity_until_cube = bool(
+            cpu_worker_process_active
+            and source_volume_ready_async
+            and isinstance(native_resize_task_spec, dict)
+            and native_resize_task_spec.get('sentinel')
+            and not Path(str(native_resize_task_spec['sentinel'])).exists()
+        )
+        if defer_parent_affinity_until_cube:
+            sentinel_path = Path(str(native_resize_task_spec['sentinel']))
+            failed_path = (
+                Path(str(native_resize_task_spec['failed']))
+                if native_resize_task_spec.get('failed') else None
+            )
+
+            def _restrict_parent_after_cube_ready() -> None:
+                while not parent_affinity_monitor_stop.wait(0.10):
+                    if failed_path is not None and failed_path.exists():
+                        return
+                    if not sentinel_path.exists():
+                        continue
+                    _apply_parent_inference_affinity(fail_fast=False)
+                    return
+
+            parent_affinity_monitor_thread = threading.Thread(
+                target=_restrict_parent_after_cube_ready,
+                name='v17-parent-affinity-after-cube',
+                daemon=True,
+            )
+            parent_affinity_monitor_thread.start()
+            print(
+                '[intel] Parent/OpenVINO core isolation deferred until the shared processing '
+                'cube is materialized; the one-time cube resize may use the full CPU allocation.'
+            )
+        else:
+            _apply_parent_inference_affinity(fail_fast=True)
+        _dispatch_inference_windows()
+        lease_details: List[str] = []
+        if gpu_worker_process_active:
+            lease_details.append(f'GPU target={gpu_worker_target_lease_seconds():.2f}s')
+        if cpu_worker_process_active:
+            lease_details.append(f'CPU target={cpu_worker_target_lease_seconds():.2f}s')
+        hybrid_policy = (
+            ' GPU-only work is selected first; GPUs automatically steal remaining '
+            'unclaimed Cartesian/Tilted leases.'
+            if gpu_worker_process_active and cpu_worker_process_active else ''
+        )
         print(
-            f'v16.1.3 C1/C3: {gpu_worker_total_tasks} inference task(s) retained in a bounded '
-            f'central dispatch window (max initial full-frame chunk={slice_chunk}; '
-            f'target lease={gpu_worker_target_lease_seconds():.2f}s, '
-            f'min/max={gpu_worker_min_lease_slices()}/{gpu_worker_max_lease_slices()} slices; '
-            'runtime EWMA splitting and predicted-load placement active).'
+            f'v17 process-local leases: {gpu_worker_total_tasks} inference task(s) retained '
+            f'in one bounded central dispatch window (max initial full-frame chunk={slice_chunk}; '
+            f'{", ".join(lease_details)}).{hybrid_policy}'
         )
     def _finalize_fullframe_view_after_worker(model_name_s: str, view: ViewInfo) -> None:
         remaining_key = (str(model_name_s), str(view.name))
@@ -44324,7 +46161,7 @@ def main() -> None:
                             pass
             _release_tile_dense_result_task_id(
                 int(task.get('task_id', -1)),
-                reason='GPU worker reported an empty tile result',
+                reason='inference worker reported an empty tile result',
                 refill=True,
             )
             _mark_tile_complete(model_name_s, str(view.name), str(tile_job.tile_id))
@@ -44360,18 +46197,150 @@ def main() -> None:
         )
         tile_cleanup_futures[fut] = (model_name_s, str(view.name), str(tile_job.config_id), str(tile_job.tile_id))
 
+    def _announce_process_inference_drain_if_complete() -> None:
+        nonlocal gpu_inference_drained_at, gpu_inference_drain_announced
+        if int(gpu_worker_results_collected) < int(gpu_worker_total_tasks):
+            return
+        if gpu_worker_process_active:
+            _set_main_process_gpu_inference_priority_active(False)
+        if bool(gpu_inference_drain_announced):
+            return
+        gpu_inference_drain_announced = True
+        gpu_inference_drained_at = time.perf_counter()
+        runtime_telemetry().gauge('pipeline.phase', 'inference_drained_scheduler_tail')
+        sink_now = nrrd_layer_sink()
+        if sink_now is not None:
+            nrrd_done_now, nrrd_total_now = sink_now.progress_counts()
+        else:
+            nrrd_done_now, nrrd_total_now = 0, 0
+        waiting_parent_tiles_now = sum(
+            len(value) for value in postprocessed_tiles_waiting_by_parent.values()
+        )
+        waiting_bridge_tiles_now = sum(
+            len(value) for value in residual_tiles_waiting_by_parent.values()
+        )
+        gpu_done = int(sum(gpu_worker_results_by_id.values()))
+        cpu_done = int(sum(cpu_worker_results_by_id.values()))
+        print('\n=== Process-local inference queue drained; scheduler postprocessing continues ===')
+        drained_backend_notes: List[str] = []
+        if gpu_worker_process_active:
+            drained_backend_notes.append(
+                'CUDA devices are released for eligible output/backprojection stages'
+            )
+        if cpu_worker_process_active:
+            drained_backend_notes.append('OpenVINO workers are idle until shutdown')
+        print(
+            f'Inference tasks completed={int(gpu_worker_results_collected)}/'
+            f'{int(gpu_worker_total_tasks)} (GPU={gpu_done}, CPU={cpu_done}); '
+            f'parent_postprocess={len(view_processing_futures)}, '
+            f'tile_dense_results={len(gpu_worker_tile_dense_result_reservations)}/'
+            f'{gpu_worker_tile_dense_result_task_limit} task(s), '
+            f'{gpu_worker_tile_dense_result_bytes_reserved / GIB:.1f}/'
+            f'{gpu_worker_tile_dense_result_limit / GIB:.1f}GiB, '
+            f'tile_cleanup={len(tile_cleanup_futures)}, '
+            f'tile_parent_gate={len(tile_parent_gate_futures)}, '
+            f'tile_bridge_gate={len(tile_bridge_gate_futures)}, '
+            f'tile_consolidation={len(tile_consolidation_futures)}, '
+            f'waiting_tiles_for_parent={int(waiting_parent_tiles_now)}, '
+            f'waiting_residuals_for_bridge={int(waiting_bridge_tiles_now)}, '
+            f'NRRD writes={int(nrrd_done_now)}/{int(nrrd_total_now)}. '
+            + '; '.join(drained_backend_notes) + '.'
+        )
+
     def _process_one_worker_result(msg: Dict[str, object]) -> None:
         nonlocal gpu_worker_results_collected
         nonlocal gpu_inference_drained_at, gpu_inference_drain_announced
         mtype = str(msg.get('type'))
+        worker_kind = str(msg.get('worker_kind', 'gpu')).strip().lower()
         if mtype == 'ready':
-            print(f"GPU worker ready: device cuda:{msg.get('gpu_index')} (pid {msg.get('pid')}).")
+            if worker_kind == 'cpu':
+                ready_cpu_index = int(msg.get('cpu_index', -1))
+                if ready_cpu_index not in cpu_worker_ready_details_by_id:
+                    ready_details = {
+                        'precision': str(msg.get('precision')),
+                        'requests': int(msg.get('requests', 0) or 0),
+                        'threads': int(msg.get('threads', 0) or 0),
+                        'input_element_type': str(msg.get('input_element_type')),
+                        'model_int8_quantized': bool(msg.get('model_int8_quantized')),
+                        'class_count': msg.get('class_count'),
+                        'amx_tile': bool(msg.get('amx_tile')),
+                        'amx_bf16': bool(msg.get('amx_bf16')),
+                        'amx_int8': bool(msg.get('amx_int8')),
+                        'openvino_capabilities': list(msg.get('openvino_capabilities') or ()),
+                        'model_xml': str(msg.get('model_xml')),
+                    }
+                    cpu_worker_ready_details_by_id[ready_cpu_index] = ready_details
+                    spec_notes.append(
+                        f'v17 OpenVINO CPU instance {ready_cpu_index}: resolved precision='
+                        f'{ready_details["precision"]}, requests={ready_details["requests"]}, '
+                        f'threads={ready_details["threads"]}, input={ready_details["input_element_type"]}, '
+                        f'INT8-export={ready_details["model_int8_quantized"]}, '
+                        f'classes={ready_details["class_count"]}, '
+                        f'AMX(tile/bf16/int8)={ready_details["amx_tile"]}/'
+                        f'{ready_details["amx_bf16"]}/{ready_details["amx_int8"]}, '
+                        f'capabilities={ready_details["openvino_capabilities"]}, '
+                        f'model={ready_details["model_xml"]}.'
+                    )
+                    runtime_telemetry().gauge(
+                        f'inference.cpu_instance.{ready_cpu_index}.ready', ready_details,
+                    )
+                print(
+                    f"OpenVINO worker ready: instance {msg.get('cpu_index')} "
+                    f"(pid {msg.get('pid')}, precision={msg.get('precision')}, "
+                    f"requests={msg.get('requests')}, threads={msg.get('threads')}, "
+                    f"input={msg.get('input_element_type')}, INT8-export={msg.get('model_int8_quantized')}, "
+                    f"classes={msg.get('class_count')}, "
+                    f"AMX(tile/bf16/int8)={msg.get('amx_tile')}/{msg.get('amx_bf16')}/{msg.get('amx_int8')}, "
+                    f"OpenVINO capabilities={msg.get('openvino_capabilities')}, "
+                    f"model={msg.get('model_xml')})."
+                )
+            else:
+                print(f"GPU worker ready: device cuda:{msg.get('gpu_index')} (pid {msg.get('pid')}).")
             return
         if mtype == 'fatal':
+            backend_label = (
+                f"OpenVINO CPU instance {msg.get('cpu_index')}"
+                if worker_kind == 'cpu' else f"GPU device {msg.get('gpu_index')}"
+            )
             raise RuntimeError(
-                f"GPU worker on device {msg.get('gpu_index')} failed to initialize: "
+                f"{backend_label} failed to initialize: "
                 f"{msg.get('error')}\n{msg.get('traceback')}"
             )
+        if worker_kind == 'cpu':
+            worker_id = int(msg.get('cpu_index', -1))
+            task_id = int(msg.get('task_id', -1))
+            predicted = float(cpu_worker_task_predicted_seconds_by_id.pop(task_id, 0.0))
+            cpu_worker_predicted_load_by_id[worker_id] = max(
+                0.0,
+                float(cpu_worker_predicted_load_by_id.get(worker_id, 0.0)) - predicted,
+            )
+            cpu_worker_results_by_id[worker_id] = int(
+                cpu_worker_results_by_id.get(worker_id, 0)
+            ) + 1
+            gpu_worker_results_collected += 1
+            if not bool(msg.get('ok')):
+                raise RuntimeError(
+                    f"OpenVINO worker task {task_id} failed on CPU instance {worker_id}: "
+                    f"{msg.get('error')}\n{msg.get('traceback')}"
+                )
+            task = gpu_worker_tasks_by_id[int(task_id)]
+            stats = dict(msg.get('stats') or {})
+            _update_cpu_worker_cost(task, stats)
+            runtime_telemetry().add('inference.cpu_tasks_completed', 1)
+            runtime_telemetry().add(
+                'inference.cpu_frames_completed', int(task.get('slice_count', 0)),
+            )
+            # This worker has no private backlog: refill from the central deque before the
+            # scheduler handles its result. GPU workers may simultaneously steal the same
+            # class of still-unclaimed work through _dispatch_inference_windows.
+            _dispatch_inference_windows(_gpu_worker_fullframe_parent_key(task))
+            if str(task['kind']) == 'fullframe':
+                _handle_fullframe_worker_result(task, stats)
+            else:
+                _handle_tile_worker_result(task, stats)
+            _announce_process_inference_drain_if_complete()
+            return
+
         if mtype == 'compute_released':
             worker_id = int(msg.get('gpu_index', -1))
             task_id = int(msg.get('task_id', -1))
@@ -44394,7 +46363,7 @@ def main() -> None:
             # GiB over PCIe or committing metadata on a retirement lane.
             task = gpu_worker_tasks_by_id.get(task_id)
             preferred = _gpu_worker_fullframe_parent_key(task) if isinstance(task, dict) else None
-            _dispatch_gpu_worker_inference_window(preferred)
+            _dispatch_inference_windows(preferred)
             _refresh_gpu_aux_interpolation_leases()
             return
         if mtype == 'aux_result':
@@ -44410,7 +46379,7 @@ def main() -> None:
                     msg.get('stats') if isinstance(msg.get('stats'), dict) else None,
                     str(msg.get('error') or '') + ('\n' + str(msg.get('traceback')) if msg.get('traceback') else ''),
                 )
-            _dispatch_gpu_worker_inference_window()
+            _dispatch_inference_windows()
             _refresh_gpu_aux_interpolation_leases()
             return
         worker_id = int(msg.get('gpu_index', -1))
@@ -44441,45 +46410,12 @@ def main() -> None:
         # Refill before scheduler-side memmap union/postprocess so a worker does not wait
         # behind CPU handling of the result that just freed its window slot. Prefer the
         # current parent when its last unissued lease can unlock postprocessing.
-        _dispatch_gpu_worker_inference_window(_gpu_worker_fullframe_parent_key(task))
+        _dispatch_inference_windows(_gpu_worker_fullframe_parent_key(task))
         if str(task['kind']) == 'fullframe':
             _handle_fullframe_worker_result(task, stats)
         else:
             _handle_tile_worker_result(task, stats)
-        if int(gpu_worker_results_collected) >= int(gpu_worker_total_tasks):
-            _set_main_process_gpu_inference_priority_active(False)
-            if not bool(gpu_inference_drain_announced):
-                gpu_inference_drain_announced = True
-                gpu_inference_drained_at = time.perf_counter()
-                runtime_telemetry().gauge('pipeline.phase', 'gpu_inference_drained_scheduler_tail')
-                sink_now = nrrd_layer_sink()
-                if sink_now is not None:
-                    nrrd_done_now, nrrd_total_now = sink_now.progress_counts()
-                else:
-                    nrrd_done_now, nrrd_total_now = 0, 0
-                waiting_parent_tiles_now = sum(
-                    len(value) for value in postprocessed_tiles_waiting_by_parent.values()
-                )
-                waiting_bridge_tiles_now = sum(
-                    len(value) for value in residual_tiles_waiting_by_parent.values()
-                )
-                print('\n=== GPU inference queue drained; scheduler postprocessing continues ===')
-                print(
-                    f'Inference tasks completed={int(gpu_worker_results_collected)}/'
-                    f'{int(gpu_worker_total_tasks)}; parent_postprocess={len(view_processing_futures)}, '
-                    f'tile_dense_results={len(gpu_worker_tile_dense_result_reservations)}/'
-                    f'{gpu_worker_tile_dense_result_task_limit} task(s), '
-                    f'{gpu_worker_tile_dense_result_bytes_reserved / GIB:.1f}/'
-                    f'{gpu_worker_tile_dense_result_limit / GIB:.1f}GiB, '
-                    f'tile_cleanup={len(tile_cleanup_futures)}, '
-                    f'tile_parent_gate={len(tile_parent_gate_futures)}, '
-                    f'tile_bridge_gate={len(tile_bridge_gate_futures)}, '
-                    f'tile_consolidation={len(tile_consolidation_futures)}, '
-                    f'waiting_tiles_for_parent={int(waiting_parent_tiles_now)}, '
-                    f'waiting_residuals_for_bridge={int(waiting_bridge_tiles_now)}, '
-                    f'NRRD writes={int(nrrd_done_now)}/{int(nrrd_total_now)}. '
-                    'Worker GPUs are now released for eligible output/backprojection stages.'
-                )
+        _announce_process_inference_drain_if_complete()
         _refresh_gpu_aux_interpolation_leases()
 
     # push drain — a transport-only daemon thread blocks on the process
@@ -44489,7 +46425,7 @@ def main() -> None:
     # done-callbacks, so one event wait covers both wake sources. In push mode the drainer
     # thread OWNS the mp queue end (a second concurrent get would race it).
     push_drain_active = bool(
-        gpu_worker_process_active and gpu_result_queue is not None and scheduler_push_drain_enabled()
+        inference_worker_process_active and gpu_result_queue is not None and scheduler_push_drain_enabled()
     )
     scheduler_wake = threading.Event()
     _set_main_process_gpu_stage_wake_callback(scheduler_wake.set)
@@ -44520,7 +46456,7 @@ def main() -> None:
             scheduler_wake.set()
 
     if push_drain_active:
-        threading.Thread(target=_push_drain_pump, name='gpu-result-push-drain', daemon=True).start()
+        threading.Thread(target=_push_drain_pump, name='inference-result-push-drain', daemon=True).start()
         print(
             'Scheduler push drain active (v13.3.8 G1; results handled the instant they '
             'arrive; YOLO_TTA_SCHEDULER_PUSH_DRAIN=0 restores polling).'
@@ -44557,83 +46493,93 @@ def main() -> None:
 
     def _process_inference_outstanding() -> bool:
         return bool(
-            gpu_worker_process_active
+            inference_worker_process_active
             and gpu_worker_results_collected < gpu_worker_total_tasks
         )
 
-    def _check_gpu_workers_alive() -> None:
-        # Fail fast (rather than hang) if a worker process died mid-task, e.g. CUDA OOM or a kill.
+    def _check_inference_workers_alive() -> None:
+        """Fail fast when any selected backend process exits before global drain."""
+        if parent_affinity_monitor_errors:
+            raise RuntimeError(
+                f'Parent/OpenVINO CPU-affinity isolation failed: {parent_affinity_monitor_errors[0]}'
+            ) from parent_affinity_monitor_errors[0]
         aux_pool = gpu_worker_aux_interpolation_pool()
         aux_outstanding = int(aux_pool.outstanding()) if aux_pool is not None else 0
         if not _process_inference_outstanding() and aux_outstanding <= 0:
             return
-        for proc in gpu_worker_processes:
-            if not proc.is_alive():
+
+        remaining = max(0, int(gpu_worker_total_tasks - gpu_worker_results_collected))
+        for backend_label, processes in (
+            ('GPU', gpu_worker_processes),
+            ('OpenVINO CPU', cpu_worker_processes),
+        ):
+            for proc in processes:
+                if proc.is_alive():
+                    continue
                 reason = (
-                    f'GPU worker {getattr(proc, "name", "?")} exited unexpectedly '
+                    f'{backend_label} worker {getattr(proc, "name", "?")} exited unexpectedly '
                     f'(exitcode={getattr(proc, "exitcode", None)}) with '
-                    f'{max(0, int(gpu_worker_total_tasks - gpu_worker_results_collected))} inference result(s) and '
-                    f'{aux_outstanding} aux interpolation pass(es) still outstanding.'
+                    f'{remaining} inference result(s) and '
+                    f'{aux_outstanding} GPU-worker auxiliary interpolation pass(es) still outstanding.'
                 )
                 if aux_pool is not None:
-                    # unblock any parent-postprocess threads waiting on aux passes
-                    # before raising, so shutdown does not deadlock on their futures.
+                    # Unblock parent-postprocess threads waiting on a GPU auxiliary pass
+                    # before raising, so shutdown cannot deadlock on their futures.
                     aux_pool.mark_failed(reason)
                 raise RuntimeError(reason)
 
-    def _shutdown_gpu_worker_processes() -> None:
-        if not gpu_worker_processes:
-            return
-        # on the normal path every aux interpolation pass has completed before
-        # main reaches this finally (a no-op close); on abnormal paths this unblocks any
-        # still-waiting or mid-submit threads so parent_postprocess_executor.shutdown(wait=True)
-        # below cannot deadlock. mark_failed also refuses any racing late submission.
-        aux_pool = gpu_worker_aux_interpolation_pool()
-        if aux_pool is not None:
-            aux_pool.mark_failed('GPU worker processes are shutting down')
-            set_gpu_worker_aux_interpolation_pool(None)
+    def _reap_inference_worker_process(proc: object, backend_label: str) -> None:
         try:
-            for task_queue in gpu_task_queues.values():
-                task_queue.put(None)
+            proc.join(timeout=30)
         except Exception:
             pass
-        for proc in gpu_worker_processes:
+        if not proc.is_alive():
+            return
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            proc.join(timeout=10)
+        except Exception:
+            pass
+        if not proc.is_alive() or not hasattr(proc, 'kill'):
+            return
+        try:
+            proc.kill()
+            # Never join unbounded after SIGKILL. A worker wedged in uninterruptible
+            # kernel sleep may not be reaped, and an unbounded join can escalate a job
+            # failure into a drained SLURM node.
+            proc.join(timeout=30)
+        except Exception:
+            pass
+        if proc.is_alive():
+            print(
+                f'WARNING: {backend_label} worker pid={getattr(proc, "pid", "?")} survived '
+                f'SIGKILL after 30s and is being abandoned. It is most likely stuck in '
+                f'D state; this node may need manual cleanup before it accepts another job.',
+                flush=True,
+            )
+
+    def _shutdown_inference_worker_processes() -> None:
+        processes = list(gpu_worker_processes) + list(cpu_worker_processes)
+        if not processes:
+            return
+        # On abnormal paths, fail any GPU-worker auxiliary interpolation waiters before
+        # stopping the backend processes. mark_failed also rejects racing submissions.
+        aux_pool = gpu_worker_aux_interpolation_pool()
+        if aux_pool is not None:
+            aux_pool.mark_failed('Inference worker processes are shutting down')
+            set_gpu_worker_aux_interpolation_pool(None)
+        for task_queue in list(gpu_task_queues.values()) + list(cpu_task_queues.values()):
             try:
-                proc.join(timeout=30)
+                task_queue.put(None)
             except Exception:
                 pass
-            if proc.is_alive():
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-                # the post-inference budget must not expand until every
-                # GPU worker has actually exited. Reap a terminated worker, escalating to
-                # SIGKILL only if it ignores the graceful termination window.
-                try:
-                    proc.join(timeout=10)
-                except Exception:
-                    pass
-                if proc.is_alive() and hasattr(proc, 'kill'):
-                    try:
-                        proc.kill()
-                        # never join unbounded after SIGKILL. A worker wedged in
-                        # uninterruptible sleep (GPU context teardown after an aborted capture,
-                        # mmap writeback, OOM reclaim) is not reaped by SIGKILL, so an unbounded
-                        # join blocks this process forever. SLURM then cannot clean the step,
-                        # UnkillableStepTimeout expires, and the node is drained and marked
-                        # down — a job-level bug escalated into a node-level outage.
-                        proc.join(timeout=30)
-                    except Exception:
-                        pass
-                    if proc.is_alive():
-                        print(
-                            f'WARNING: GPU worker pid={getattr(proc, "pid", "?")} survived '
-                            f'SIGKILL after 30s and is being abandoned. It is most likely '
-                            f'stuck in D state; this node may need manual cleanup before it '
-                            f'accepts another job.',
-                            flush=True,
-                        )
+        for proc in gpu_worker_processes:
+            _reap_inference_worker_process(proc, 'GPU')
+        for proc in cpu_worker_processes:
+            _reap_inference_worker_process(proc, 'OpenVINO CPU')
 
     try:
         _pump_prediction_volume_build_queue()
@@ -44644,15 +46590,13 @@ def main() -> None:
             _pump_prediction_volume_build_queue()
             _warmup_ready_prediction_sources()
 
-            if gpu_worker_process_active:
-                # Inference runs in per-GPU worker processes; collect any completed results and union
-                # them into the per-view unions / submit tile postprocessing. No in-process dispatch.
+            if inference_worker_process_active:
+                # Both backends publish one common result contract. Drain it before CPU-side
+                # postprocessing and fail fast if either a CUDA or OpenVINO process disappeared.
                 _drain_process_inference_results()
-                # Detect a hard worker death (CUDA OOM kill, segfault) within one iteration even while
-                # CPU-side postprocess futures are still pending, instead of only on the idle branch.
-                _check_gpu_workers_alive()
+                _check_inference_workers_alive()
 
-            if (not gpu_worker_process_active) and ready_fullframe:
+            if (not inference_worker_process_active) and ready_fullframe:
                 view, job, prediction_ref = ready_fullframe.popleft()
                 print(f"Inferencing full-frame in-memory volume: {view.name}/{job.aug_id}")
                 view_mask_shape = view_processing_volume_shape(view, int(args.imgsz))
@@ -44721,7 +46665,7 @@ def main() -> None:
                     _pump_prediction_volume_build_queue()
                 continue
 
-            if (not gpu_worker_process_active) and ready_tile_infer:
+            if (not inference_worker_process_active) and ready_tile_infer:
                 model_name, view, tile_job, prediction_ref = ready_tile_infer.popleft()
                 ready_key = (str(model_name), str(view.name), str(tile_job.tile_id))
                 if ready_key in tile_inference_done:
@@ -44879,11 +46823,11 @@ def main() -> None:
                 _flush_ready_postprocessed_tiles()
                 _flush_ready_residual_tiles()
                 _pump_prediction_volume_build_queue()
-                if gpu_worker_process_active and _process_inference_outstanding():
-                    # GPU worker processes are still inferencing but no CPU-side future is pending;
-                    # block briefly on the process result queue so the loop wakes on the next result.
+                if inference_worker_process_active and _process_inference_outstanding():
+                    # Backend processes are still inferencing but no CPU-side future is pending;
+                    # block briefly on the common result queue so the loop wakes on the next result.
                     _wait_for_one_process_result(timeout=0.5)
-                    _check_gpu_workers_alive()
+                    _check_inference_workers_alive()
                     continue
                 scheduler_quiescent = bool(
                     not pending_prediction_build_jobs and
@@ -44935,9 +46879,9 @@ def main() -> None:
                 scheduler_wake.wait(timeout=float(scheduler_push_drain_heartbeat_seconds()))
                 scheduler_wake.clear()
             else:
-                # Poll the CUDA-worker result queue while CPU-side futures run so completed results
-                # run, so completed inference results are unioned without waiting for a future to finish.
-                wait(waitables, timeout=(0.1 if gpu_worker_process_active else None), return_when=FIRST_COMPLETED)
+                # Poll the inference-worker result queue while CPU-side futures run, so completed
+                # inference results are unioned without waiting for a future to finish.
+                wait(waitables, timeout=(0.1 if inference_worker_process_active else None), return_when=FIRST_COMPLETED)
 
     finally:
         if sys.exc_info()[0] is not None:
@@ -44959,8 +46903,8 @@ def main() -> None:
             ready_tile_infer.clear()
         push_drain_stop.set()  # the transport thread exits within one 0.5 s tick
         _set_main_process_gpu_inference_priority_active(False)
-        if gpu_worker_process_active:
-            _shutdown_gpu_worker_processes()
+        if inference_worker_process_active:
+            _shutdown_inference_worker_processes()
         prediction_volume_executor.shutdown(wait=True)
         prediction_join_executor.shutdown(wait=True)
         prediction_result_executor.shutdown(wait=True)
@@ -44987,7 +46931,7 @@ def main() -> None:
             shutil.rmtree(gpu_worker_result_dir, ignore_errors=True)
             if gpu_worker_result_dir.exists():
                 print(
-                    f'Warning: final GPU-worker result scratch sweep could not remove '
+                    f'Warning: final inference-worker result scratch sweep could not remove '
                     f'{gpu_worker_result_dir}'
                 )
         if prediction_render_executor is not None:
@@ -45001,6 +46945,23 @@ def main() -> None:
                 interpolation_process_executor.shutdown(wait=True, cancel_futures=False)
             except TypeError:
                 interpolation_process_executor.shutdown(wait=True)
+
+        parent_affinity_monitor_stop.set()
+        if parent_affinity_monitor_thread is not None:
+            parent_affinity_monitor_thread.join(timeout=2.0)
+
+        if main_process_affinity_restricted:
+            if not _sched_setaffinity_all_threads(sorted(_allowed_main_cpus)):
+                print(
+                    'Warning: could not restore the parent process to the full allocated CPU '
+                    f'mask after inference; requested mask={sorted(_allowed_main_cpus)}'
+                )
+            else:
+                print(
+                    f'[intel] Parent CPU affinity restored to all {len(_allowed_main_cpus)} '
+                    'allocated logical CPU(s) for the post-inference tail.'
+                )
+            main_process_affinity_restricted = False
 
         _set_main_process_gpu_pending_inference(False)
         _set_main_process_gpu_stage_wake_callback(None)
@@ -45028,9 +46989,9 @@ def main() -> None:
         'Subsequent phase banners and telemetry identify every remaining tail stage.'
     )
 
-    # the scheduler's finally block above has joined every GPU worker and
-    # inference/interpolation executor. Only now may CPU-only tail stages reclaim the CPU
-    # reservation that main_process_worker_budget held for live GPU subprocesses. Keep
+    # The scheduler's finally block above has joined every GPU/OpenVINO inference worker and
+    # interpolation executor. Only now may CPU-only tail stages reclaim the CPU reservations
+    # held for live inference subprocesses. Keep
     # Separate budgets preserve the configured per-stage sizes when expansion is disabled.
     tail_slice_workers = int(
         tail_worker_budget if tail_budget_expansion_active else slice_postprocess_workers
@@ -45065,7 +47026,7 @@ def main() -> None:
     )
     if tail_budget_expansion_active:
         spec_notes.append(
-            'v13.3.10 G7 tail CPU expansion: after GPU workers and all inference/interpolation '
+            'v13.3.10 G7 tail CPU expansion: after all GPU/OpenVINO inference workers and interpolation '
             f'executors joined, strictly post-inference stages used worker_budget={int(tail_worker_budget)}; '
             'YOLO_TTA_TAIL_WORKER_BUDGET_EXPAND=0 restores inference-phase tail sizing.'
         )
