@@ -72,8 +72,8 @@ import numpy as np
 
 GIB = 1024 ** 3
 NRRD_SPACE = "left-posterior-superior"
-SCRIPT_VERSION = '17.0.0'
-SCRIPT_VERSION_COMPACT = '1700'
+SCRIPT_VERSION = '17.0.1'
+SCRIPT_VERSION_COMPACT = '1701'
 SCRIPT_BASENAME = f'GPT-5.6-Sol-Pro_v{SCRIPT_VERSION}_SLURM.py'
 OUTPUT_NRRD_PREFIX = ''
 LEGACY_OUTPUT_NRRD_PREFIX = 'HW_'
@@ -42154,6 +42154,17 @@ def main() -> None:
             'v16.1.8 fast bundle not eligible for this command; compatibility paths retained: '
             + '; '.join(v1613_bundle_reasons)
         )
+    # D1 may disable dense GPU unions after the initial backend resolution. Recompute the
+    # common process-worker requirement so GPU-only D1 runs stay owner-only while hybrid
+    # runs retain a shareable direct union for every CPU-eligible view.
+    worker_direct_union_active = bool(
+        gpu_worker_direct_union_active or cpu_worker_process_active
+    )
+    if cpu_worker_process_active and not gpu_worker_direct_union_active:
+        print(
+            '[intel] OpenVINO direct-union handoff uses process-shareable backing for '
+            'CPU-eligible Cartesian/Tilted views while GPU-only D1 views remain owner-local.'
+        )
     if gpu_worker_direct_union_active:
         print(
             'GPU-worker direct union writes active: angle-variant worker tasks write '
@@ -43576,14 +43587,17 @@ def main() -> None:
         union_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Interpolated views retain a real pathname because the isolated interpolation
-        # backend reopens them by path. Angle-variant direct-union views instead use memfd
-        # descriptors transferred to CUDA workers; ordinary in-process views prefer anonymous RAM.
+        # backend reopens them by path. Every process-worker direct-union view (CUDA and/or
+        # OpenVINO) must instead have reopenable shared backing; ordinary in-process views
+        # may prefer anonymous RAM. v17.0.1 fixes hybrid D1 runs where GPU direct union is
+        # disabled for GPU-only views but CPU-eligible views still write a common direct union.
+        process_worker_direct_union = bool(worker_direct_union_active)
         union_prefer_memory = not (
             (
                 interpolation_process_backend_enabled()
                 and _view_uses_interpolation(view, int(args.interpolation_distance))
             )
-            or gpu_worker_direct_union_active
+            or process_worker_direct_union
         )
         processing_shape = view_processing_volume_shape(view, int(args.imgsz))
         union_mm: Optional[np.ndarray] = None
@@ -43595,7 +43609,7 @@ def main() -> None:
                 path=union_path,
                 desc=f'{model_name}/{view.name} baseline union workspace',
                 prefer_memory=bool(union_prefer_memory),
-                prefer_memfd=bool(gpu_worker_direct_union_active),
+                prefer_memfd=bool(process_worker_direct_union),
             )
             if float(args.min_conf) > 0.0:
                 conf_mm = allocate_workspace_array(
@@ -43603,8 +43617,8 @@ def main() -> None:
                     dtype=np.uint8,
                     path=confmap_path,
                     desc=f'{model_name}/{view.name} baseline confidence workspace',
-                    prefer_memory=not gpu_worker_direct_union_active,
-                    prefer_memfd=bool(gpu_worker_direct_union_active),
+                    prefer_memory=not process_worker_direct_union,
+                    prefer_memfd=bool(process_worker_direct_union),
                 )
         except BaseException:
             close_memmap_array_without_flush(conf_mm)
@@ -43617,14 +43631,34 @@ def main() -> None:
             raise
 
         assert union_mm is not None
+        union_backing = _memmap_backing_path(union_mm)
+        conf_backing = _memmap_backing_path(conf_mm) if conf_mm is not None else None
+        backing_error: Optional[str] = None
+        if process_worker_direct_union and union_backing is None:
+            backing_error = (
+                f'{model_name}/{view.name} direct-union workspace is not process-shareable'
+            )
+        elif process_worker_direct_union and conf_mm is not None and conf_backing is None:
+            backing_error = (
+                f'{model_name}/{view.name} direct-union confidence workspace is not process-shareable'
+            )
+        if backing_error is not None:
+            close_memmap_array_without_flush(conf_mm)
+            close_memmap_array_without_flush(union_mm)
+            for failed_path in (union_path, confmap_path):
+                try:
+                    failed_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            raise RuntimeError(backing_error)
         baseline_union_by_model_view[key] = union_mm
-        baseline_union_paths[key] = _memmap_backing_path(union_mm) or union_path
+        baseline_union_paths[key] = union_backing or union_path
         baseline_confmap_by_model_view[key] = conf_mm
         baseline_confmap_paths[key] = (
-            (_memmap_backing_path(conf_mm) or confmap_path) if conf_mm is not None else None
+            (conf_backing or confmap_path) if conf_mm is not None else None
         )
         baseline_slice_locks_by_model_view[key] = [threading.Lock() for _ in range(int(view.num_slices))]
-        if gpu_worker_direct_union_active:
+        if process_worker_direct_union:
             if (
                 key in direct_union_backing_leases
                 or key in direct_union_inference_views
