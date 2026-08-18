@@ -56,6 +56,7 @@ from multiprocessing import reduction as mp_reduction
 import os
 import queue
 import re
+import signal
 import shlex
 import shutil
 import struct
@@ -77,8 +78,8 @@ import numpy as np
 
 GIB = 1024 ** 3
 NRRD_SPACE = "left-posterior-superior"
-SCRIPT_VERSION = '17.0.3'
-SCRIPT_VERSION_COMPACT = '1703'
+SCRIPT_VERSION = '17.0.4'
+SCRIPT_VERSION_COMPACT = '1704'
 SCRIPT_BASENAME = f'GPT-5.6-Sol-Pro_v{SCRIPT_VERSION}_SLURM.py'
 OUTPUT_NRRD_PREFIX = ''
 LEGACY_OUTPUT_NRRD_PREFIX = 'HW_'
@@ -2728,10 +2729,13 @@ def hybrid_cpu_affinity_overlap_enabled() -> bool:
     return _env_flag('YOLO_TTA_HYBRID_CPU_AFFINITY_OVERLAP', True)
 
 
-# Default interpolation process cap. Python-heavy planning gains independent GILs, while
-# workspace admission and disk fallback keep RAM, rather than a fixed two-process limit, as
-# the practical bound. The same cap estimates concurrent parent interpolation overlap.
-INTERPOLATION_PROCESS_WORKER_DEFAULT_CAP = 6
+# Interpolation planning owns a large topology-dependent Python heap in addition to the
+# dense label/bridge workspaces covered by its byte estimate.  Disk fallback only moves the
+# dense arrays; it cannot bound the component/SDF/plan heap.  Keep one pass live by default
+# across full-frame, consolidated-tile, dedicated-process, and auxiliary-GPU-worker routes.
+# An explicit global-pass override remains available for machines whose measured live set can
+# safely support overlap.
+INTERPOLATION_PROCESS_WORKER_DEFAULT_CAP = 1
 
 
 def _estimate_parent_view_postprocess_bytes(
@@ -2891,10 +2895,15 @@ def memfd_workspace_enabled() -> bool:
 
 
 def raw_store_memfd_enabled() -> bool:
-    """Keep cvol chunks.bin in memfd unless persistent scratch was requested."""
+    """Opt in to keeping cvol/ctile payloads in unbudgeted memfd RAM.
+
+    Raw stores can accumulate behind interpolation/tile barriers and are not covered by
+    anonymous-workspace admission. Pathname storage is therefore the safe default; explicit
+    YOLO_TTA_CVOL_MEMFD=1 restores the prior RAM-first behavior.
+    """
     return bool(
         memfd_workspace_enabled()
-        and _env_flag('YOLO_TTA_CVOL_MEMFD', True)
+        and _env_flag('YOLO_TTA_CVOL_MEMFD', False)
         and not _env_flag('YOLO_TTA_KEEP_TEMP', False)
     )
 
@@ -3223,10 +3232,15 @@ def _create_memfd_backed_payload_path(path: Path, desc: str) -> int:
 
 
 @contextlib.contextmanager
-def open_raw_store_payload_writer(path: Path, desc: str) -> Iterator[object]:
-    """Open a cvol payload for writing, preferring a path-compatible memfd."""
+def open_raw_store_payload_writer(
+    path: Path,
+    desc: str,
+    *,
+    force_path_backed: bool = False,
+) -> Iterator[object]:
+    """Open a cvol payload, using a path-compatible memfd only when explicitly enabled."""
     writer_fd: Optional[int] = None
-    if raw_store_memfd_enabled():
+    if raw_store_memfd_enabled() and not bool(force_path_backed):
         try:
             writer_fd = _create_memfd_backed_payload_path(Path(path), str(desc))
         except Exception as exc:
@@ -3646,6 +3660,111 @@ def choose_slice_parallel_workers(requested_workers: int, num_items: int) -> int
 
 _MEMORY_BACKED_FSTYPES = ('tmpfs', 'ramfs', 'hugetlbfs')
 _SCRATCH_DIR_IS_MEMORY_BACKED = False
+_RUN_SCRATCH_CLEANUP_LOCK = threading.Lock()
+_RUN_SCRATCH_CLEANUP_PATH: Optional[Path] = None
+_RUN_SCRATCH_CLEANUP_KEEP = True
+_RUN_SCRATCH_CLEANUP_REGISTERED = False
+_RUN_TERMINATION_REQUESTED = threading.Event()
+_RUN_TERMINATION_WATCHDOG_STARTED = False
+_RUN_TERMINATION_SIGNAL = int(getattr(signal, 'SIGTERM', 15))
+
+
+def _cleanup_registered_unique_run_scratch() -> None:
+    """Remove this process's unique scratch tree on normal/handled termination.
+
+    Only ``{stem}_{pid}_temp`` directories are eligible.  The conservative ownership
+    check prevents an exit hook from recursively removing a caller-supplied scratch root
+    or the shared default output directory.  SIGKILL remains inherently uncatchable.
+    """
+    global _RUN_SCRATCH_CLEANUP_PATH
+    with _RUN_SCRATCH_CLEANUP_LOCK:
+        path = _RUN_SCRATCH_CLEANUP_PATH
+        if path is None or bool(_RUN_SCRATCH_CLEANUP_KEEP):
+            return
+        owned_suffix = f'_{int(os.getpid())}_temp'
+        if not str(Path(path).name).endswith(owned_suffix):
+            return
+        _RUN_SCRATCH_CLEANUP_PATH = None
+    try:
+        release_memfd_owners_under(Path(path))
+    except Exception:
+        pass
+    try:
+        shutil.rmtree(Path(path), ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _force_termination_watchdog() -> None:
+    """Bound graceful teardown so SLURM KillWait cannot strand PID scratch.
+
+    Executor shutdown normally waits for active interpolation.  A pass can run for hours, so
+    SIGTERM needs a finite grace period before terminating children, removing this run's
+    conservatively-owned scratch tree, and exiting without Python's thread-join atexit phase.
+    """
+    _RUN_TERMINATION_REQUESTED.wait()
+    signum = int(_RUN_TERMINATION_SIGNAL)
+    grace_seconds = max(
+        1.0, _env_float('YOLO_TTA_TERMINATION_GRACE_SECONDS', 20.0),
+    )
+    deadline = time.monotonic() + float(grace_seconds)
+    while time.monotonic() < deadline:
+        time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+    try:
+        children = list(mp.active_children())
+    except Exception:
+        children = []
+    for child in children:
+        try:
+            child.terminate()
+        except Exception:
+            pass
+    for child in children:
+        try:
+            child.join(timeout=0.5)
+            if child.is_alive() and hasattr(child, 'kill'):
+                child.kill()
+        except Exception:
+            pass
+    _cleanup_registered_unique_run_scratch()
+    os._exit(128 + int(signum))
+
+
+def _run_scratch_sigterm_handler(signum: int, _frame: object) -> None:
+    global _RUN_TERMINATION_SIGNAL
+    _RUN_TERMINATION_SIGNAL = int(signum)
+    _RUN_TERMINATION_REQUESTED.set()
+    raise KeyboardInterrupt(f'received signal {int(signum)}')
+
+
+def register_unique_run_scratch_cleanup(path: Path, *, keep_temp: bool) -> None:
+    """Register conservative atexit/SIGTERM cleanup for one PID-owned scratch tree."""
+    global _RUN_SCRATCH_CLEANUP_PATH, _RUN_SCRATCH_CLEANUP_KEEP, _RUN_SCRATCH_CLEANUP_REGISTERED
+    global _RUN_TERMINATION_WATCHDOG_STARTED
+    path_obj = Path(path)
+    with _RUN_SCRATCH_CLEANUP_LOCK:
+        _RUN_SCRATCH_CLEANUP_PATH = path_obj
+        _RUN_SCRATCH_CLEANUP_KEEP = bool(keep_temp)
+        if not _RUN_SCRATCH_CLEANUP_REGISTERED:
+            atexit.register(_cleanup_registered_unique_run_scratch)
+            _RUN_SCRATCH_CLEANUP_REGISTERED = True
+
+    # SLURM normally sends SIGTERM before a forced SIGKILL. Convert that catchable signal
+    # into Python unwinding so executor/sink finalizers and the atexit scratch cleanup run.
+    if not bool(keep_temp) and str(path_obj.name).endswith(f'_{int(os.getpid())}_temp'):
+        try:
+            if not _RUN_TERMINATION_WATCHDOG_STARTED:
+                watchdog = threading.Thread(
+                    target=_force_termination_watchdog,
+                    name='termination-watchdog',
+                    daemon=True,
+                )
+                watchdog.start()
+                _RUN_TERMINATION_WATCHDOG_STARTED = True
+            signal.signal(signal.SIGTERM, _run_scratch_sigterm_handler)
+            signal.signal(signal.SIGINT, _run_scratch_sigterm_handler)
+        except (ValueError, OSError, AttributeError):
+            pass
 
 
 def _mount_fstype_for_path(path: Path) -> Optional[str]:
@@ -3913,6 +4032,109 @@ def prediction_hot_path_flush_enabled() -> bool:
 _INTERPOLATION_PROCESS_EXECUTOR: Optional[ProcessPoolExecutor] = None
 _INTERPOLATION_PROCESS_MAX_WORKERS = 0
 _INTERPOLATION_PROCESS_WORKER = False
+
+
+class _InterpolationPassAdmission:
+    """Process-wide admission for every parent-scheduled interpolation pass.
+
+    The lease surrounds process-backing conversion, auxiliary/dedicated submission, and the
+    pass itself.  Consequently a queued tile pass cannot allocate its full-volume process
+    input while another full-frame/auxiliary pass is still holding its planning heap.
+    """
+
+    def __init__(self, max_concurrent: int = 1) -> None:
+        self.max_concurrent = max(1, int(max_concurrent))
+        self.active = 0
+        self.active_estimated_bytes = 0
+        self.condition = threading.Condition()
+
+    @contextlib.contextmanager
+    def reserve(self, desc: str, estimated_bytes: int) -> Iterator[float]:
+        estimate = max(1, int(estimated_bytes))
+        started_waiting = time.monotonic()
+        announced = False
+        with self.condition:
+            while int(self.active) >= int(self.max_concurrent):
+                if not announced:
+                    print(
+                        'Global interpolation admission: waiting for '
+                        f'{desc} ({estimate / GIB:.1f} GiB structural estimate; '
+                        f'{self.active}/{self.max_concurrent} pass slot(s) active, '
+                        f'{self.active_estimated_bytes / GIB:.1f} GiB estimated active).'
+                    )
+                    announced = True
+                self.condition.wait()
+            waited_seconds = max(0.0, time.monotonic() - started_waiting)
+            self.active += 1
+            self.active_estimated_bytes += int(estimate)
+        try:
+            yield float(waited_seconds)
+        finally:
+            with self.condition:
+                self.active = max(0, int(self.active) - 1)
+                self.active_estimated_bytes = max(
+                    0, int(self.active_estimated_bytes) - int(estimate)
+                )
+                self.condition.notify_all()
+
+
+_INTERPOLATION_PASS_ADMISSION = _InterpolationPassAdmission(1)
+
+
+def configure_interpolation_pass_admission(max_concurrent: int) -> None:
+    """Configure global interpolation overlap before any parent pass is submitted."""
+    global _INTERPOLATION_PASS_ADMISSION
+    _INTERPOLATION_PASS_ADMISSION = _InterpolationPassAdmission(max(1, int(max_concurrent)))
+
+
+def _globally_admitted_interpolation_pass(func: Callable[..., object]) -> Callable[..., object]:
+    """Decorate the public interpolation entry point with one shared parent-side lease."""
+    @functools.wraps(func)
+    def admitted(mask_mm: np.ndarray, *args: object, **kwargs: object) -> object:
+        # Process workers enter interpolate_view_volume_pass_inplace directly.  Every such
+        # task already remains covered by the parent caller's lease while it waits for the
+        # result, so a second process-local lease would provide no cross-process protection.
+        if bool(_INTERPOLATION_PROCESS_WORKER):
+            return func(mask_mm, *args, **kwargs)
+
+        pass_tag = kwargs.get('pass_tag')
+        if pass_tag is None and len(args) >= 3:
+            pass_tag = args[2]
+        view = kwargs.get('view')
+        if view is None and len(args) >= 1:
+            view = args[0]
+        view_name = str(getattr(view, 'name', 'unknown-view'))
+        desc = f'{view_name}/{pass_tag or "pass"}'
+
+        # Five volume-equivalents cover the dense label-packing peak plus bridge canvas.
+        # The topology-dependent planner heap is deliberately not presented as a byte bound;
+        # default single-pass serialization is what prevents that unbounded term multiplying.
+        volume_bytes = int(np.asarray(mask_mm).nbytes)
+        structural_estimate = 5 * int(volume_bytes)
+        if kwargs.get('bridge_delta_path') is not None:
+            structural_estimate += int(volume_bytes)
+
+        with _INTERPOLATION_PASS_ADMISSION.reserve(
+            str(desc), int(structural_estimate),
+        ) as waited_seconds:
+            result = func(mask_mm, *args, **kwargs)
+
+        if (
+            isinstance(result, tuple)
+            and len(result) == 2
+            and isinstance(result[1], dict)
+        ):
+            result[1].setdefault('global_admission_wait_seconds', float(waited_seconds))
+            result[1].setdefault(
+                'global_admission_structural_estimate_bytes', int(structural_estimate)
+            )
+            result[1].setdefault(
+                'global_admission_pass_limit',
+                int(_INTERPOLATION_PASS_ADMISSION.max_concurrent),
+            )
+        return result
+
+    return admitted
 
 
 def _sanitize_filesystem_token(value: object) -> str:
@@ -4285,6 +4507,7 @@ def _interpolation_process_entry(
         close_memmap_array(mask_mm)
 
 
+@_globally_admitted_interpolation_pass
 def interpolate_view_volume_pass_maybe_process(
     mask_mm: np.ndarray,
     view: 'ViewInfo',
@@ -19826,14 +20049,32 @@ class SparseSliceLabelStore:
                 sizes[int(z)] = np.int64(item[4].size)
         if sizes.size:
             self.offsets[1:] = np.cumsum(sizes, dtype=np.int64)
+        pending_bytes = int(np.sum(sizes, dtype=np.int64)) * int(self.dtype.itemsize)
         self.flat = np.empty((int(self.offsets[-1]),), dtype=self.dtype)
         for z, item in enumerate(pending):
             if item is None:
                 continue
             lo, hi = int(self.offsets[int(z)]), int(self.offsets[int(z) + 1])
-            self.flat[lo:hi] = item[4].reshape(-1)
+            # v17.0.4: release each source crop as soon as it has been copied.  ``flat`` is
+            # a lazily-faulted anonymous mapping, so destination pages become resident while
+            # the corresponding pending crop is dropped instead of retaining both complete
+            # arenas through the entire pack.  The old implementation held roughly 2P live
+            # bytes at the end of this loop for a packed payload of P bytes.
+            crop = item[4]
+            pending[int(z)] = None
+            self.flat[lo:hi] = crop.reshape(-1)
+            del crop
         self._pending = None
         self._finalized = True
+        packed_bytes = int(self.flat.nbytes)
+        runtime_telemetry().add('interpolation.sparse_labels.packed_bytes', packed_bytes)
+        runtime_telemetry().add(
+            'interpolation.sparse_labels.pending_bytes_released_during_pack',
+            int(pending_bytes),
+        )
+        runtime_telemetry().gauge(
+            'interpolation.sparse_labels.last_packed_bytes', packed_bytes,
+        )
 
     def crop_with_origin(self, z: int) -> Tuple[int, int, np.ndarray]:
         if not self._finalized:
@@ -21551,34 +21792,73 @@ def build_slice_endpoint_seeds_from_label_volume(
         if not table.components:
             return []
 
-        prev_table: Optional[SliceComponentTable] = None
-        next_table: Optional[SliceComponentTable] = None
+        prev_z: Optional[int] = None
+        next_z: Optional[int] = None
         prev_wrapped = False
         next_wrapped = False
         if bool(wrap_axis) and z_dim > 1:
-            prev_table = component_cache.get((z_i - 1) % z_dim)
-            next_table = component_cache.get((z_i + 1) % z_dim)
+            prev_z = int((z_i - 1) % z_dim)
+            next_z = int((z_i + 1) % z_dim)
             # continuation across the radial 0°/180° wrap happens at
-            # u -> width-1-u, not at the same u (see _component_record_mirrored_u).
+            # u -> width-1-u, not at the same u.
             prev_wrapped = z_i == 0
             next_wrapped = z_i == (z_dim - 1)
         else:
             if z_i > 0:
-                prev_table = component_cache.get(z_i - 1)
+                prev_z = int(z_i - 1)
             if (z_i + 1) < z_dim:
-                next_table = component_cache.get(z_i + 1)
+                next_z = int(z_i + 1)
 
         slice_w = int(table.shape[1])
+
+        def _record_continues_in_neighbor(
+            record: SliceComponentRecord,
+            neighbor_z: Optional[int],
+            *,
+            mirrored: bool,
+        ) -> bool:
+            """Test exact adjacent-slice footprint overlap in one bbox read.
+
+            The previous implementation compared a component against every same-label
+            component in the adjacent slice.  A tiled label fragmented into K components
+            therefore paid O(K²) Python calls per slice.  Direct overlap has a simpler
+            equivalent definition: at any pixel in this component, the adjacent canonical
+            label equals ``record.label``.  Reading only this component's bbox preserves that
+            definition, including local-label LUTs and radial wrap mirroring, without building
+            or scanning the neighbor's component list.
+            """
+            if neighbor_z is None:
+                return False
+            y0, x0, y1, x1 = (int(v) for v in record.bbox)
+            read_x0, read_x1 = int(x0), int(x1)
+            if bool(mirrored):
+                read_x0, read_x1 = int(slice_w - x1), int(slice_w - x0)
+
+            labels_store = component_cache.labels_real
+            if isinstance(labels_store, SparseSliceLabelStore):
+                neighbor = labels_store.read_window(
+                    int(neighbor_z), int(y0), int(y1), int(read_x0), int(read_x1),
+                )
+            else:
+                neighbor = np.asarray(
+                    labels_store[
+                        int(neighbor_z), int(y0):int(y1), int(read_x0):int(read_x1)
+                    ]
+                )
+            if bool(mirrored):
+                neighbor = neighbor[:, ::-1]
+            if component_cache.slice_luts is not None:
+                neighbor = component_cache.slice_luts.lut_for(int(neighbor_z))[neighbor]
+            return bool(np.any(record.mask_crop & (neighbor == int(record.label))))
+
         seeds_local: List[SliceEndpointSeed] = []
         for record in table.components:
-            prev_records = prev_table.by_label.get(int(record.label), []) if prev_table is not None else []
-            next_records = next_table.by_label.get(int(record.label), []) if next_table is not None else []
-            if prev_wrapped:
-                prev_records = [_component_record_mirrored_u(other, slice_w) for other in prev_records]
-            if next_wrapped:
-                next_records = [_component_record_mirrored_u(other, slice_w) for other in next_records]
-            has_prev = any(_component_records_directly_overlap(record, other) for other in prev_records)
-            has_next = any(_component_records_directly_overlap(record, other) for other in next_records)
+            has_prev = _record_continues_in_neighbor(
+                record, prev_z, mirrored=bool(prev_wrapped),
+            )
+            has_next = _record_continues_in_neighbor(
+                record, next_z, mirrored=bool(next_wrapped),
+            )
 
             if not has_prev:
                 seeds_local.append(SliceEndpointSeed(
@@ -30211,9 +30491,84 @@ class SliceComponentTableCache:
         self.z_dim = int(labels_real.shape[0])
         self.shape_yx = (int(labels_real.shape[1]), int(labels_real.shape[2]))
         self._tables: Dict[int, SliceComponentTable] = {}
+        self._table_order: deque[int] = deque()
+        self._table_cache_lock = threading.Lock()
+        table_budget_mib = _env_int('YOLO_TTA_INTERPOLATION_COMPONENT_TABLE_CACHE_MIB', 2048)
+        self._table_budget_bytes = (
+            -1 if int(table_budget_mib) < 0 else int(table_budget_mib) * (1024 ** 2)
+        )
+        self._table_live_payload_bytes = 0
+        self._table_live_charge_bytes = 0
+        self._table_peak_payload_bytes = 0
+        self._table_peak_charge_bytes = 0
+        self._table_builds = 0
+        self._table_evictions = 0
         self._projection_sdfs: Dict[Tuple[int, int, int, int, float, int], CroppedProjectionSDF] = {}
+        self._projection_sdf_order: deque[Tuple[int, int, int, int, float, int]] = deque()
+        sdf_budget_mib = _env_int('YOLO_TTA_INTERPOLATION_SDF_CACHE_MIB', 512)
+        self._projection_sdf_budget_bytes = (
+            -1 if int(sdf_budget_mib) < 0 else int(sdf_budget_mib) * (1024 ** 2)
+        )
+        self._projection_sdf_live_bytes = 0
+        self._projection_sdf_live_charge_bytes = 0
+        self._projection_sdf_peak_bytes = 0
+        self._projection_sdf_peak_charge_bytes = 0
+        self._projection_sdf_computations = 0
+        self._projection_sdf_evictions = 0
         self._table_locks = [threading.Lock() for _ in range(max(1, self.z_dim))]
         self._sdf_lock = threading.Lock()
+
+    @staticmethod
+    def _table_payload_and_charge_bytes(table: SliceComponentTable) -> Tuple[int, int]:
+        """Return exact ndarray payload and a conservative cache charge.
+
+        NumPy owns the dominant component-mask payload. The charge additionally reserves
+        1 KiB per Python component record and 128 bytes per label bucket so the byte cap
+        does not pretend the dataclass/list/dict graph is free.
+        """
+        payload = int(sum(int(record.mask_crop.nbytes) for record in table.components))
+        charge = int(payload) + int(len(table.components)) * 1024 + int(len(table.by_label)) * 128 + 256
+        return int(payload), int(charge)
+
+    def _insert_table(self, z: int, table: SliceComponentTable) -> SliceComponentTable:
+        payload_bytes, charge_bytes = self._table_payload_and_charge_bytes(table)
+        with self._table_cache_lock:
+            self._table_builds += 1
+            existing = self._tables.get(int(z))
+            if existing is not None:
+                return existing
+            # A zero budget intentionally disables retention. The caller still owns the
+            # newly built table for the duration of its operation.
+            if int(self._table_budget_bytes) == 0:
+                return table
+            self._tables[int(z)] = table
+            self._table_order.append(int(z))
+            self._table_live_payload_bytes += int(payload_bytes)
+            self._table_live_charge_bytes += int(charge_bytes)
+            self._table_peak_payload_bytes = max(
+                int(self._table_peak_payload_bytes), int(self._table_live_payload_bytes)
+            )
+            self._table_peak_charge_bytes = max(
+                int(self._table_peak_charge_bytes), int(self._table_live_charge_bytes)
+            )
+            while (
+                int(self._table_budget_bytes) > 0
+                and int(self._table_live_charge_bytes) > int(self._table_budget_bytes)
+                and self._table_order
+            ):
+                victim_z = int(self._table_order.popleft())
+                victim = self._tables.pop(victim_z, None)
+                if victim is None:
+                    continue
+                victim_payload, victim_charge = self._table_payload_and_charge_bytes(victim)
+                self._table_live_payload_bytes = max(
+                    0, int(self._table_live_payload_bytes) - int(victim_payload)
+                )
+                self._table_live_charge_bytes = max(
+                    0, int(self._table_live_charge_bytes) - int(victim_charge)
+                )
+                self._table_evictions += 1
+            return table
 
     def get(self, z: int) -> SliceComponentTable:
         z_i = int(z)
@@ -30239,12 +30594,17 @@ class SliceComponentTableCache:
                     origin_yx=(int(origin_y), int(origin_x)),
                     full_shape_yx=self.shape_yx,
                 )
-                self._tables[z_i] = cached
+                cached = self._insert_table(z_i, cached)
             return cached
 
     def prebuild(self, *, workers: int = 1, desc: str = 'Interpolation: per-slice component tables') -> None:
         total = int(self.z_dim)
         if total <= 0:
+            return
+        # Eagerly building every slice defeats a byte-bounded cache and immediately
+        # evicts the early slices before endpoint scanning consumes them. Bounded mode
+        # therefore builds lazily in the scan's naturally local z order.
+        if int(self._table_budget_bytes) >= 0:
             return
         worker_count = choose_slice_parallel_workers(int(workers), total)
 
@@ -30311,8 +30671,82 @@ class SliceComponentTableCache:
             sdf=np.ascontiguousarray(_signed_distance_2d(source_crop)),
         )
         with self._sdf_lock:
-            existing = self._projection_sdfs.setdefault(key, cropped)
-        return existing
+            self._projection_sdf_computations += 1
+            existing = self._projection_sdfs.get(key)
+            if existing is not None:
+                return existing
+            if int(self._projection_sdf_budget_bytes) == 0:
+                return cropped
+            self._projection_sdfs[key] = cropped
+            self._projection_sdf_order.append(key)
+            self._projection_sdf_live_bytes += int(cropped.sdf.nbytes)
+            self._projection_sdf_live_charge_bytes += int(cropped.sdf.nbytes) + 512
+            self._projection_sdf_peak_bytes = max(
+                int(self._projection_sdf_peak_bytes), int(self._projection_sdf_live_bytes)
+            )
+            self._projection_sdf_peak_charge_bytes = max(
+                int(self._projection_sdf_peak_charge_bytes),
+                int(self._projection_sdf_live_charge_bytes),
+            )
+            while (
+                int(self._projection_sdf_budget_bytes) > 0
+                and int(self._projection_sdf_live_charge_bytes) > int(self._projection_sdf_budget_bytes)
+                and self._projection_sdf_order
+            ):
+                victim_key = self._projection_sdf_order.popleft()
+                victim = self._projection_sdfs.pop(victim_key, None)
+                if victim is None:
+                    continue
+                self._projection_sdf_live_bytes = max(
+                    0, int(self._projection_sdf_live_bytes) - int(victim.sdf.nbytes)
+                )
+                self._projection_sdf_live_charge_bytes = max(
+                    0,
+                    int(self._projection_sdf_live_charge_bytes)
+                    - int(victim.sdf.nbytes) - 512,
+                )
+                self._projection_sdf_evictions += 1
+            return cropped
+
+    def telemetry(self) -> Dict[str, int]:
+        """Snapshot exact cache counts and tracked ndarray payload bytes."""
+        with self._table_cache_lock:
+            table_stats = {
+                'component_table_cache_budget_bytes': int(self._table_budget_bytes),
+                'component_table_cache_entries': int(len(self._tables)),
+                'component_table_cache_live_payload_bytes': int(self._table_live_payload_bytes),
+                'component_table_cache_live_charge_bytes': int(self._table_live_charge_bytes),
+                'component_table_cache_peak_payload_bytes': int(self._table_peak_payload_bytes),
+                'component_table_cache_peak_charge_bytes': int(self._table_peak_charge_bytes),
+                'component_table_builds': int(self._table_builds),
+                'component_table_evictions': int(self._table_evictions),
+            }
+        with self._sdf_lock:
+            sdf_stats = {
+                'projection_sdf_cache_budget_bytes': int(self._projection_sdf_budget_bytes),
+                'projection_sdf_cache_entries': int(len(self._projection_sdfs)),
+                'projection_sdf_cache_live_bytes': int(self._projection_sdf_live_bytes),
+                'projection_sdf_cache_live_charge_bytes': int(self._projection_sdf_live_charge_bytes),
+                'projection_sdf_cache_peak_bytes': int(self._projection_sdf_peak_bytes),
+                'projection_sdf_cache_peak_charge_bytes': int(self._projection_sdf_peak_charge_bytes),
+                'projection_sdf_computations': int(self._projection_sdf_computations),
+                'projection_sdf_evictions': int(self._projection_sdf_evictions),
+            }
+        table_stats.update(sdf_stats)
+        return table_stats
+
+    def clear(self) -> None:
+        """Release every cached table/SDF after the final seed batch is rendered."""
+        with self._table_cache_lock:
+            self._tables.clear()
+            self._table_order.clear()
+            self._table_live_payload_bytes = 0
+            self._table_live_charge_bytes = 0
+        with self._sdf_lock:
+            self._projection_sdfs.clear()
+            self._projection_sdf_order.clear()
+            self._projection_sdf_live_bytes = 0
+            self._projection_sdf_live_charge_bytes = 0
 
 
 def _nearest_point_in_component_record(record: SliceComponentRecord, ref_yx: Tuple[int, int]) -> Optional[Tuple[int, int]]:
@@ -31076,7 +31510,12 @@ def _disable_planning_kernels(exc: BaseException) -> None:
 
 
 def interpolation_projection_numba_max_tracked() -> int:
-    return max(8, _env_int('YOLO_TTA_INTERPOLATION_NUMBA_MAX_TRACKED_CANDIDATES', 64))
+    # Tiled masks can place hundreds of distinct canonical labels inside one local
+    # projection window.  The former 64-entry scratch array silently discarded the compiled
+    # result and reran the entire seed in Python whenever that happened.  A 1024-entry
+    # workspace is only ~80 KiB across the ten int64 arrays and keeps the common fragmented
+    # case on the no-GIL kernel; the overflow path remains exact for unusually dense windows.
+    return max(8, _env_int('YOLO_TTA_INTERPOLATION_NUMBA_MAX_TRACKED_CANDIDATES', 1024))
 
 
 def interpolation_compiled_kernels_status() -> str:
@@ -31677,6 +32116,19 @@ def interpolation_fused_bridge_merge_enabled() -> bool:
     return _env_flag('YOLO_TTA_INTERPOLATION_FUSED_BRIDGE_MERGE', True)
 
 
+def interpolation_plan_batch_budget_bytes() -> int:
+    """Maximum charged bytes retained in the accepted-plan render batch.
+
+    ``YOLO_TTA_INTERPOLATION_PLAN_BATCH_MIB`` defaults to 512 MiB. Values below
+    one MiB still retain one complete plan at a time, because a plan cannot be
+    subdivided without changing the min-radius acceptance calculation.
+    """
+    return max(
+        1024 ** 2,
+        _env_int('YOLO_TTA_INTERPOLATION_PLAN_BATCH_MIB', 512) * (1024 ** 2),
+    )
+
+
 @dataclass(frozen=True)
 class SliceBridgeRenderPlan:
     source_label: int
@@ -31707,6 +32159,19 @@ class SliceSeedBridgePlanResult:
     walk_back_bridges: int = 0
     skipped_by_min_radius: int = 0
     plans: List[SliceBridgeRenderPlan] = field(default_factory=list)
+
+
+def _slice_bridge_plan_payload_bytes(plan: SliceBridgeRenderPlan) -> int:
+    """Exact retained NumPy payload bytes owned by one accepted render plan."""
+    total = int(plan.sdf0.nbytes) + int(plan.sdf1.nbytes)
+    total += int(sum(int(section.nbytes) for section in plan.cached_sections if section is not None))
+    return int(total)
+
+
+def _slice_bridge_plan_charge_bytes(plan: SliceBridgeRenderPlan) -> int:
+    """Payload plus conservative Python-plan/render-schedule overhead."""
+    schedule_entries = max(0, int(plan.steps) - 1)
+    return int(_slice_bridge_plan_payload_bytes(plan)) + 512 + int(schedule_entries) * 96
 
 
 def _build_slice_endpoint_seeds(
@@ -32130,10 +32595,101 @@ def interpolate_view_volume_pass_inplace(
     # backprojection does not rediscover them by strided scans over the dense delta file.
     bridge_delta_slice_bboxes: Optional[np.ndarray] = None
     bridge_delta_rows_by_slice: Optional[np.ndarray] = None
-    plans: List[SliceBridgeRenderPlan] = []
+    plan_batch: List[SliceBridgeRenderPlan] = []
+    plan_batch_payload_bytes = 0
+    plan_batch_charge_bytes = 0
+    plan_batch_budget_bytes = int(interpolation_plan_batch_budget_bytes())
+    plan_batch_peak_payload_bytes = 0
+    plan_batch_peak_charge_bytes = 0
+    plan_batch_peak_plans = 0
+    plan_batches_rendered = 0
+    planned_plan_count = 0
+    cache_telemetry: Dict[str, int] = {}
+    render_workers = choose_slice_parallel_workers(int(workers), int(mask_mm.shape[0]))
+    fused_bridge_merge = bool(interpolation_fused_bridge_merge_enabled())
+    rendered_paste_bboxes = (
+        np.zeros((int(mask_mm.shape[0]), 4), dtype=np.int64)
+        if fused_bridge_merge else None
+    )
+    scheduled_slice_flags = np.zeros((int(mask_mm.shape[0]),), dtype=bool)
 
     try:
+        # Endpoint discovery returns label-major order. Planning is independent per seed
+        # and the renderer only ORs sections, so consume the same seeds slice-major to
+        # keep bounded component tables hot instead of repeatedly rebuilding distant z.
+        seeds.sort(key=lambda seed: (
+            int(seed.point[0]), int(seed.direction_sign), int(seed.label),
+            int(seed.point[1]), int(seed.point[2]),
+        ))
         plan_workers = choose_slice_parallel_workers(int(workers), len(seeds))
+
+        def _render_plan_batch() -> None:
+            nonlocal added_voxels
+            nonlocal plan_batch_payload_bytes, plan_batch_charge_bytes
+            nonlocal plan_batch_peak_payload_bytes, plan_batch_peak_charge_bytes
+            nonlocal plan_batch_peak_plans, plan_batches_rendered
+            if not plan_batch:
+                return
+
+            plan_batch_peak_payload_bytes = max(
+                int(plan_batch_peak_payload_bytes), int(plan_batch_payload_bytes)
+            )
+            plan_batch_peak_charge_bytes = max(
+                int(plan_batch_peak_charge_bytes), int(plan_batch_charge_bytes)
+            )
+            plan_batch_peak_plans = max(int(plan_batch_peak_plans), int(len(plan_batch)))
+
+            schedule = _build_slice_bridge_render_schedule(
+                plan_batch, int(mask_mm.shape[0]), wrap_axis=bool(wrap_axis),
+            )
+            batch_slices = [
+                int(z) for z in range(int(mask_mm.shape[0])) if schedule[int(z)]
+            ]
+            if batch_slices:
+                scheduled_slice_flags[np.asarray(batch_slices, dtype=np.int64)] = True
+            batch_added_counts = np.zeros((len(batch_slices),), dtype=np.int64)
+
+            def _render_batch_slice(list_idx: int) -> None:
+                z = int(batch_slices[int(list_idx)])
+                bridge_slice = bridge_mm[int(z)]
+                bbox_union: Optional[List[int]] = None
+                if rendered_paste_bboxes is not None:
+                    old_y0, old_x0, old_y1, old_x1 = (
+                        int(v) for v in rendered_paste_bboxes[int(z)]
+                    )
+                    if old_y0 < old_y1 and old_x0 < old_x1:
+                        bbox_union = [old_y0, old_x0, old_y1, old_x1]
+                    else:
+                        bbox_union = [
+                            int(bridge_slice.shape[0]), int(bridge_slice.shape[1]), 0, 0,
+                        ]
+                local_added = 0
+                for plan_idx, step_idx in schedule[int(z)]:
+                    local_added += _paint_linear_slice_bridge_plan_onto_slice(
+                        bridge_slice,
+                        plan_batch[int(plan_idx)],
+                        int(step_idx),
+                        dst_bbox_union=bbox_union,
+                    )
+                batch_added_counts[int(list_idx)] = np.int64(local_added)
+                if rendered_paste_bboxes is not None and bbox_union is not None:
+                    rendered_paste_bboxes[int(z)] = np.asarray(bbox_union, dtype=np.int64)
+
+            parallel_for_indices(
+                len(batch_slices),
+                _render_batch_slice,
+                max_workers=choose_slice_parallel_workers(
+                    int(render_workers), max(1, len(batch_slices)),
+                ),
+                desc='Interpolation: render bounded plan batch',
+                show_progress=False,
+            )
+            added_voxels += int(np.sum(batch_added_counts, dtype=np.int64))
+            plan_batches_rendered += 1
+            schedule.clear()
+            plan_batch.clear()
+            plan_batch_payload_bytes = 0
+            plan_batch_charge_bytes = 0
 
         def _plan_seed(idx: int) -> SliceSeedBridgePlanResult:
             return _plan_slice_seed_bridges(
@@ -32149,7 +32705,10 @@ def interpolate_view_volume_pass_inplace(
                 slice_luts=slice_luts,
             )
 
-        pending = max(plan_workers, plan_workers * 2)
+        # A completed future owns its plan arrays until the consumer accepts it.
+        # Keep at most one result slot per planner worker instead of retaining a second
+        # whole wave behind the explicit byte-capped render batch.
+        pending = max(1, plan_workers)
         if plan_workers <= 1:
             iterable = (_plan_seed(int(idx)) for idx in range(len(seeds)))
         else:
@@ -32167,58 +32726,50 @@ def interpolate_view_volume_pass_inplace(
             walk_back_bridges += int(seed_result.walk_back_bridges)
             skipped_by_min_radius += int(seed_result.skipped_by_min_radius)
             if seed_result.plans:
-                plans.extend(seed_result.plans)
+                seed_plans = seed_result.plans
+                seed_result.plans = []
+                for plan in seed_plans:
+                    payload_bytes = int(_slice_bridge_plan_payload_bytes(plan))
+                    charge_bytes = int(_slice_bridge_plan_charge_bytes(plan))
+                    if (
+                        plan_batch
+                        and int(plan_batch_charge_bytes) + int(charge_bytes)
+                        > int(plan_batch_budget_bytes)
+                    ):
+                        _render_plan_batch()
+                    plan_batch.append(plan)
+                    plan_batch_payload_bytes += int(payload_bytes)
+                    plan_batch_charge_bytes += int(charge_bytes)
+                    planned_plan_count += 1
+                    if int(plan_batch_charge_bytes) >= int(plan_batch_budget_bytes):
+                        _render_plan_batch()
+                del plan
+                seed_plans.clear()
         # The loop variable otherwise retains the final seed result (and its section
-        # caches) independently of the flattened plan list.
+        # caches) independently of the bounded plan batch.
         del seed_result
+        del iterable
+        _render_plan_batch()
+        seeds.clear()
 
-        if plans:
-            schedule = _build_slice_bridge_render_schedule(plans, int(mask_mm.shape[0]), wrap_axis=bool(wrap_axis))
-            added_counts = np.zeros((int(mask_mm.shape[0]),), dtype=np.int64)
-            render_workers = choose_slice_parallel_workers(int(workers), int(mask_mm.shape[0]))
-            fused_bridge_merge = bool(interpolation_fused_bridge_merge_enabled())
-            rendered_paste_bboxes = (
-                np.zeros((int(mask_mm.shape[0]), 4), dtype=np.int64)
-                if fused_bridge_merge else None
-            )
+        cache_telemetry = component_cache.telemetry()
+        component_cache.clear()
+        print(
+            f'Interpolation planner ({pass_tag}): {planned_plan_count:,} plan(s) in '
+            f'{plan_batches_rendered:,} bounded batch(es); plan payload peak '
+            f'{plan_batch_peak_payload_bytes / GIB:.2f} GiB '
+            f'({plan_batch_peak_plans:,} plans, {plan_batch_peak_charge_bytes / GIB:.2f} GiB charged); '
+            f'component-table payload peak '
+            f'{cache_telemetry.get("component_table_cache_peak_payload_bytes", 0) / GIB:.2f} GiB; '
+            f'projection-SDF peak '
+            f'{cache_telemetry.get("projection_sdf_cache_peak_bytes", 0) / GIB:.2f} GiB.'
+        )
 
-            def _render_slice(z: int) -> None:
-                contribs = schedule[int(z)]
-                if not contribs:
-                    return
-                bridge_slice = bridge_mm[int(z)]
-                local_added = 0
-                bbox_union = (
-                    [int(bridge_slice.shape[0]), int(bridge_slice.shape[1]), 0, 0]
-                    if rendered_paste_bboxes is not None else None
-                )
-                for plan_idx, step_idx in contribs:
-                    local_added += _paint_linear_slice_bridge_plan_onto_slice(
-                        bridge_slice,
-                        plans[int(plan_idx)],
-                        int(step_idx),
-                        dst_bbox_union=bbox_union,
-                    )
-                added_counts[int(z)] = np.int64(local_added)
-                if rendered_paste_bboxes is not None and bbox_union is not None:
-                    rendered_paste_bboxes[int(z)] = np.asarray(bbox_union, dtype=np.int64)
-
-            parallel_for_indices(
-                int(mask_mm.shape[0]),
-                _render_slice,
-                max_workers=render_workers,
-                desc='Interpolation: render bridges',
-            )
-            added_voxels = int(np.sum(added_counts, dtype=np.int64))
+        if planned_plan_count > 0:
             # bridge voxels can only exist on slices the render schedule touched;
             # merge (and delta-capture) only those instead of np.any-scanning every slice of the
             # full bridge volume (a mostly-empty ~volume-sized read per pass per view).
-            scheduled_slices = [int(z) for z in range(int(mask_mm.shape[0])) if schedule[int(z)]]
-            del schedule
-            del added_counts
-            # Painting is the sole cache consumer. Drop plans (SDFs + bool sections)
-            # before allocating the optional volume-sized delta workspace.
-            plans.clear()
+            scheduled_slices = np.flatnonzero(scheduled_slice_flags).astype(np.int64).tolist()
 
             delta_mm: Optional[np.ndarray] = None
             if bridge_delta_path is not None:
@@ -32332,7 +32883,14 @@ def interpolate_view_volume_pass_inplace(
         'endpoint_method': 'slice_component_scan',
         'planning_backend': interpolation_planning_backend_name(),
         'compact_relabel_skipped': bool(skip_relabel),  #
+        'planner_plan_count': int(planned_plan_count),
+        'planner_plan_batches': int(plan_batches_rendered),
+        'planner_plan_batch_budget_bytes': int(plan_batch_budget_bytes),
+        'planner_plan_batch_peak_payload_bytes': int(plan_batch_peak_payload_bytes),
+        'planner_plan_batch_peak_charge_bytes': int(plan_batch_peak_charge_bytes),
+        'planner_plan_batch_peak_plans': int(plan_batch_peak_plans),
     }
+    result_stats.update(cache_telemetry)
     if bool(bridge_delta_written) and bridge_delta_path is not None:
         result_stats['bridge_delta_path'] = str(bridge_delta_path)
         if bridge_delta_slice_bboxes is not None:
@@ -32475,7 +33033,29 @@ class DeferredTilePostprocessResult:
 
 CTILE_FORMAT = 'ctile-mask-v2-raw'
 CVOL_FORMAT = 'cvol-mask-v2-raw'
-MASK_STORE_FORMATS = {CTILE_FORMAT, CVOL_FORMAT}
+# Private terminal-union retention uses a row-wise bit-packed bbox payload.  It is
+# deliberately a distinct, internal-only format: CTILE and requested NRRD component
+# stores retain their established raw uint8 wire format.
+INTERNAL_PACKED_CVOL_FORMAT = 'cvol-mask-v3-packbits-internal'
+MASK_STORE_FORMATS = {CTILE_FORMAT, CVOL_FORMAT, INTERNAL_PACKED_CVOL_FORMAT}
+
+
+def _merge_raw_bbox_extra_meta(
+    meta: Dict[str, object], extra_meta: Optional[Dict[str, object]],
+) -> None:
+    """Merge annotations without allowing callers to rewrite the wire schema."""
+    if not extra_meta:
+        return
+    annotations = dict(extra_meta)
+    conflicts = sorted(set(annotations).intersection(meta))
+    if conflicts:
+        raise ValueError(
+            'Raw bbox extra metadata cannot override reserved field(s): '
+            + ', '.join(str(key) for key in conflicts)
+        )
+    meta.update(annotations)
+
+
 # Shared read-only mappings for raw bbox-store chunks.bin payloads during NRRD streaming.
 # the full-quality writer and the per-downbin low-quality writers for
 # the SAME layer run concurrently on the NrrdLayerSink pool. The cache was a plain dict
@@ -32568,7 +33148,7 @@ def _invalidate_raw_store_chunks_ram_cache(chunks_path: Path) -> None:
     if entry is not None:
         _close_raw_store_chunks_mapping(entry[0])
 CTILE_INDEX_DTYPE = np.dtype([
-    ('kind', 'u1'),              # 0 = empty/zero slice, 1 = raw uint8 bbox payload
+    ('kind', 'u1'),              # 0 = empty/zero slice, 1 = bbox payload (meta names precodec)
     ('reserved', 'u1', (7,)),
     ('offset', '<u8'),
     ('payload_size', '<u8'),
@@ -32721,9 +33301,10 @@ def _segment_extent_to_json(extent: Sequence[int]) -> List[int]:
 
 @dataclass(frozen=True)
 class RawBBoxSlicePayload:
-    """One slice payload for the raw bbox mask store.
+    """One slice payload for a bbox mask store.
 
- Payloads are raw uint8 crop bytes in, not bitpacked or LZ4-compressed."""
+ External stores carry raw uint8 crop bytes. Private terminal retention may carry
+ row-wise packbits while ``payload_nbytes`` records the decoded logical size."""
 
     idx: int
     is_empty: bool
@@ -32765,6 +33346,7 @@ class IncrementalRawBBoxMaskStoreWriter:
         self.shape = (int(shape_i[0]), int(shape_i[1]), int(shape_i[2]))
         self.store_dir = Path(store_dir)
         self.format_name = fmt
+        self._packbits_payload = bool(fmt == INTERNAL_PACKED_CVOL_FORMAT)
         self.desc = str(desc)
         self.extra_meta = dict(extra_meta or {})
         self.force_path_backed = bool(force_path_backed)
@@ -32877,6 +33459,12 @@ class IncrementalRawBBoxMaskStoreWriter:
         x1 = int(x0) + int(bbox_w)
         y1 = int(y0) + int(bbox_h)
         payload_nbytes = int(y1 - y0) * int(x1 - x0)
+        encoded_row_width = (
+            int((int(x1 - x0) + 7) // 8)
+            if bool(self._packbits_payload)
+            else int(x1 - x0)
+        )
+        payload_size = int(y1 - y0) * int(encoded_row_width)
 
         with self._lock:
             if self._failed_reason is not None:
@@ -32887,7 +33475,7 @@ class IncrementalRawBBoxMaskStoreWriter:
                 raise RuntimeError(f'{self.desc}: chunks payload is already closed')
             fd = int(self._fd)
             offset = int(self._next_offset)
-            self._next_offset += int(payload_nbytes)
+            self._next_offset += int(payload_size)
             self._slice_state[z_i] = np.uint8(1)
 
         foreground_voxels = 0
@@ -32902,10 +33490,15 @@ class IncrementalRawBBoxMaskStoreWriter:
                 dtype=np.uint8,
             )
             foreground_voxels += int(np.count_nonzero(slab_u8))
+            encoded_slab = (
+                np.packbits(slab_u8, axis=1, bitorder='little')
+                if bool(self._packbits_payload)
+                else slab_u8
+            )
             self._pwrite_all(
                 fd,
-                memoryview(slab_u8).cast('B'),
-                int(offset) + int(slab_y0 - y0) * int(row_width),
+                memoryview(np.ascontiguousarray(encoded_slab)).cast('B'),
+                int(offset) + int(slab_y0 - y0) * int(encoded_row_width),
             )
 
         with self._lock:
@@ -32914,7 +33507,7 @@ class IncrementalRawBBoxMaskStoreWriter:
             rec = self.index[z_i]
             rec['kind'] = np.uint8(1)
             rec['offset'] = np.uint64(offset)
-            rec['payload_size'] = np.uint64(payload_nbytes)
+            rec['payload_size'] = np.uint64(payload_size)
             rec['y0'] = np.uint32(y0)
             rec['x0'] = np.uint32(x0)
             rec['y1'] = np.uint32(y1)
@@ -33017,13 +33610,21 @@ class IncrementalRawBBoxMaskStoreWriter:
             'dtype': 'bool',
             'logical_dtype_in_pipeline': 'uint8_0_or_1',
             'chunking': 'slice',
-            'precodec': 'none',
+            'precodec': (
+                'numpy_packbits_axis_x_little'
+                if bool(self._packbits_payload)
+                else 'none'
+            ),
             'compressor': 'none',
             'bbox_per_chunk': True,
             'zero_chunk_elision': True,
             'index_dtype': 'ctile-index-v2-raw',
             'index_record_bytes': int(CTILE_INDEX_DTYPE.itemsize),
-            'payload_shape_encoding': 'raw_uint8_bbox_shape_from_index',
+            'payload_shape_encoding': (
+                'packbits_rows_ceil_width_div_8_bbox_shape_from_index'
+                if bool(self._packbits_payload)
+                else 'raw_uint8_bbox_shape_from_index'
+            ),
             'description': self.desc,
             'segment_extent_ijk': _segment_extent_to_json(extent),
             'segment_extent_axis_order': (
@@ -33033,7 +33634,7 @@ class IncrementalRawBBoxMaskStoreWriter:
             'segment_extent_shape_tyx': [int(v) for v in self.shape],
             'stats': stats,
         }
-        meta.update(self.extra_meta)
+        _merge_raw_bbox_extra_meta(meta, self.extra_meta)
         self.meta_path.write_text(json.dumps(meta, indent=2) + '\n')
         print(
             f'{self.desc}: incremental raw bbox mask store {self.store_dir} '
@@ -33059,11 +33660,11 @@ class IncrementalRawBBoxMaskStoreWriter:
 
 
 class RawBBoxMaskStore:
-    """Read adapter for raw slice-bbox binary mask volumes.
+    """Read adapter for slice-bbox binary mask volumes.
 
- The payload format is uncompressed: empty slices are elided, nonempty slices are cropped to their
- nonzero bbox, and the crop is written as raw uint8 bytes. No NumPy packbits and
- no LZ4 are used for waiting tiles or cvol NRRD/support layers."""
+ Empty slices are elided and nonempty slices are cropped to their nonzero bbox. External
+ waiting-tile, NRRD, and support stores retain raw uint8 payloads; private final-view retention
+ may use the internal row-wise packbits precodec. Neither form uses LZ4."""
 
     def __init__(
         self,
@@ -33077,6 +33678,21 @@ class RawBBoxMaskStore:
         self.root = Path(root)
         self.meta = dict(meta)
         self.index = np.asarray(index, dtype=CTILE_INDEX_DTYPE)
+        format_name = str(self.meta.get('format', ''))
+        if format_name not in MASK_STORE_FORMATS:
+            raise ValueError(f'{self.root}: unsupported raw mask format {format_name!r}')
+        self._packbits_payload = bool(format_name == INTERNAL_PACKED_CVOL_FORMAT)
+        precodec = str(self.meta.get('precodec', 'none'))
+        expected_precodec = (
+            'numpy_packbits_axis_x_little'
+            if bool(self._packbits_payload)
+            else 'none'
+        )
+        if precodec != expected_precodec:
+            raise ValueError(
+                f'{self.root}: format {format_name!r} requires precodec '
+                f'{expected_precodec!r}, got {precodec!r}'
+            )
         self.chunks_path = self.root / 'chunks.bin'
         # ``chunks_bytes`` is retained as a compatibility keyword, but passes
         # the process-shared read-only mmap instead of a heap-owned bytes copy.
@@ -33199,14 +33815,39 @@ class RawBBoxMaskStore:
             with self.chunks_path.open('rb') as fh:
                 fh.seek(start)
                 payload = fh.read(int(payload_size))
-        if len(payload) != payload_size or len(payload) != payload_nbytes:  # type: ignore[arg-type]
+        if len(payload) != payload_size:  # type: ignore[arg-type]
             raise IOError(f'{self.root}: short read for slice {idx_i}: {len(payload)} != {payload_size}')  # type: ignore[arg-type]
         crop_h = int(y1 - y0)
         crop_w = int(x1 - x0)
         expected = int(crop_h * crop_w)
         if int(payload_nbytes) != expected:
-            raise ValueError(f'{self.root}: raw payload byte count mismatch at slice {idx_i}: {payload_nbytes} != {expected}')
-        crop = np.frombuffer(payload, dtype=np.uint8, count=expected).reshape((crop_h, crop_w))
+            raise ValueError(
+                f'{self.root}: logical bbox byte count mismatch at slice {idx_i}: '
+                f'{payload_nbytes} != {expected}'
+            )
+        if bool(self._packbits_payload):
+            packed_w = int((crop_w + 7) // 8)
+            encoded_expected = int(crop_h * packed_w)
+            if int(payload_size) != int(encoded_expected):
+                raise ValueError(
+                    f'{self.root}: packed payload byte count mismatch at slice {idx_i}: '
+                    f'{payload_size} != {encoded_expected}'
+                )
+            packed = np.frombuffer(
+                payload, dtype=np.uint8, count=int(encoded_expected),
+            ).reshape((crop_h, packed_w))
+            crop = np.unpackbits(
+                packed, axis=1, count=int(crop_w), bitorder='little',
+            )
+        else:
+            if int(payload_size) != int(expected):
+                raise ValueError(
+                    f'{self.root}: raw payload byte count mismatch at slice {idx_i}: '
+                    f'{payload_size} != {expected}'
+                )
+            crop = np.frombuffer(
+                payload, dtype=np.uint8, count=expected,
+            ).reshape((crop_h, crop_w))
         target_dtype = np.dtype(dtype)
         if crop.dtype != target_dtype:
             crop = crop.astype(target_dtype, copy=False)
@@ -33411,7 +34052,12 @@ class RawBBoxMaskStore:
         shutil.rmtree(self.root, ignore_errors=True)
 
 
-def _encode_bool_mask_slice_payload(idx: int, mask_bool: np.ndarray) -> RawBBoxSlicePayload:
+def _encode_bool_mask_slice_payload(
+    idx: int,
+    mask_bool: np.ndarray,
+    *,
+    packbits_payload: bool = False,
+) -> RawBBoxSlicePayload:
     # scan the slice as handed in (uint8 or bool — any nonzero is foreground)
     # instead of casting the whole slice to bool first (a full-slice copy per encoded slice
     # across >200 G voxels per run). The row reduction doubles as the emptiness test, and the
@@ -33429,7 +34075,12 @@ def _encode_bool_mask_slice_payload(idx: int, mask_bool: np.ndarray) -> RawBBoxS
     x0 = int(np.argmax(cols))
     x1 = int(cols.size - np.argmax(cols[::-1]))
     crop = np.ascontiguousarray(np.asarray(mask_arr[y0:y1, x0:x1]) > 0, dtype=np.uint8)
-    payload = crop.tobytes(order='C')
+    encoded = (
+        np.packbits(crop, axis=1, bitorder='little')
+        if bool(packbits_payload)
+        else crop
+    )
+    payload = np.ascontiguousarray(encoded).tobytes(order='C')
     return RawBBoxSlicePayload(
         idx=int(idx),
         is_empty=False,
@@ -33437,7 +34088,9 @@ def _encode_bool_mask_slice_payload(idx: int, mask_bool: np.ndarray) -> RawBBoxS
         x0=int(x0),
         y1=int(y1),
         x1=int(x1),
-        payload_nbytes=int(len(payload)),
+        # payload_nbytes remains the logical decoded bbox size; payload_size in the
+        # index records the physical encoded byte count.
+        payload_nbytes=int(crop.size),
         payload=payload,
         foreground_voxels=int(np.count_nonzero(crop)),
     )
@@ -33458,10 +34111,12 @@ def _write_raw_bbox_payload_store(
     desc: str,
     workers: int = 1,
     extra_meta: Optional[Dict[str, object]] = None,
+    force_path_backed: bool = False,
 ) -> Dict[str, object]:
-    """Write a slice-chunked raw bbox binary mask store.
+    """Write a slice-chunked bbox binary mask store.
 
- Write raw uint8 bbox payloads; this stage no longer bitpacks or LZ4-compresses payloads."""
+ External CTILE/CVOL formats use raw uint8 bbox payloads. The distinct private
+ ``INTERNAL_PACKED_CVOL_FORMAT`` uses row-wise packbits for terminal retention."""
     fmt = str(format_name)
     if fmt not in MASK_STORE_FORMATS:
         raise ValueError(f'Unsupported raw bbox mask format: {fmt}')
@@ -33501,7 +34156,11 @@ def _write_raw_bbox_payload_store(
         )
 
     offset = 0
-    with open_raw_store_payload_writer(chunks_path, f'{desc} chunks') as chunks_fh:
+    with open_raw_store_payload_writer(
+        chunks_path,
+        f'{desc} chunks',
+        force_path_backed=bool(force_path_backed),
+    ) as chunks_fh:
         for item in iterable:
             idx = int(item.idx)
             if idx < 0 or idx >= int(shape_i[0]):
@@ -33554,21 +34213,28 @@ def _write_raw_bbox_payload_store(
         'dtype': 'bool',
         'logical_dtype_in_pipeline': 'uint8_0_or_1',
         'chunking': 'slice',
-        'precodec': 'none',
+        'precodec': (
+            'numpy_packbits_axis_x_little'
+            if fmt == INTERNAL_PACKED_CVOL_FORMAT
+            else 'none'
+        ),
         'compressor': 'none',
         'bbox_per_chunk': True,
         'zero_chunk_elision': True,
         'index_dtype': 'ctile-index-v2-raw',
         'index_record_bytes': int(CTILE_INDEX_DTYPE.itemsize),
-        'payload_shape_encoding': 'raw_uint8_bbox_shape_from_index',
+        'payload_shape_encoding': (
+            'packbits_rows_ceil_width_div_8_bbox_shape_from_index'
+            if fmt == INTERNAL_PACKED_CVOL_FORMAT
+            else 'raw_uint8_bbox_shape_from_index'
+        ),
         'description': str(desc),
         'segment_extent_ijk': _segment_extent_to_json(segment_extent_ijk),
         'segment_extent_axis_order': 'Slicer IJK inclusive extent: minX maxX minY maxY minT maxT for internal layer order (t,Y,X)',
         'segment_extent_shape_tyx': [int(shape_i[0]), int(shape_i[1]), int(shape_i[2])],
         'stats': stats,
     }
-    if extra_meta:
-        meta.update(dict(extra_meta))
+    _merge_raw_bbox_extra_meta(meta, extra_meta)
     meta_path.write_text(json.dumps(meta, indent=2) + '\n')
     print(
         f'{desc}: raw bbox mask store {store_dir} '
@@ -33586,6 +34252,7 @@ def write_raw_bbox_mask_store(
     desc: str = 'Raw bbox mask store',
     workers: int = 1,
     extra_meta: Optional[Dict[str, object]] = None,
+    force_path_backed: bool = False,
 ) -> Dict[str, object]:
     """Write a raw bbox mask store."""
     arr = np.asarray(mask_volume)
@@ -33594,6 +34261,10 @@ def write_raw_bbox_mask_store(
     shape = (int(arr.shape[0]), int(arr.shape[1]), int(arr.shape[2]))
 
     def _encode(idx: int) -> RawBBoxSlicePayload:
+        if str(format_name) == INTERNAL_PACKED_CVOL_FORMAT:
+            return _encode_bool_mask_slice_payload(
+                int(idx), arr[int(idx)], packbits_payload=True,
+            )
         return _encode_ctile_slice(int(idx), arr)
 
     return _write_raw_bbox_payload_store(
@@ -33604,6 +34275,7 @@ def write_raw_bbox_mask_store(
         desc=str(desc),
         workers=int(workers),
         extra_meta=extra_meta,
+        force_path_backed=bool(force_path_backed),
     )
 
 # --------------------------
@@ -34388,7 +35060,7 @@ def raw_bbox_nrrd_layers_enabled() -> bool:
 
 
 def tile_intermediate_accumulators_prefer_memory() -> bool:
-    """Keep tile staging/consolidation canvases in anonymous RAM by default."""
+    """Keep tile staging/consolidation canvases in process-reopenable RAM by default."""
     return _env_flag('YOLO_TTA_TILE_ACCUMULATORS_IN_RAM', True)
 
 
@@ -34746,8 +35418,13 @@ def materialize_nrrd_view_layer(
     known_has_foreground: Optional[bool] = None,
     known_row_occupancy: Optional[np.ndarray] = None,
     known_slice_bboxes: Optional[np.ndarray] = None,
+    submit_to_sink: bool = True,
+    force_path_backed_store: bool = False,
+    internal_packbits_store: bool = False,
 ) -> Optional[NrrdLayerRef]:
     """Persist a view-derived layer in orthogonal processing geometry for the NRRD writer."""
+    if bool(internal_packbits_store) and bool(submit_to_sink):
+        raise ValueError('The internal packbits cvol format must not be submitted as NRRD output')
     # callers that already know whether the volume has foreground (e.g. the
     # interpolation pass's added_voxels stat for bridge deltas) skip the per-slice scan.
     if known_has_foreground is not None:
@@ -34766,14 +35443,22 @@ def materialize_nrrd_view_layer(
     )
     layer_dir = temp_dir / 'nrrd_layers' / str(view.name)
     storage_format = 'raw_u8'
-    if raw_bbox_nrrd_layers_enabled():
+    bbox_store_enabled = bool(raw_bbox_nrrd_layers_enabled() or internal_packbits_store)
+    bbox_store_format = (
+        INTERNAL_PACKED_CVOL_FORMAT
+        if bool(internal_packbits_store)
+        else CVOL_FORMAT
+    )
+    if bbox_store_enabled:
         raw_path = temp_dir / 'nrrd_work' / 'projected_layers' / str(view.name) / f'{key}.orthogonal.u8.dat'
         out_path = layer_dir / f'{key}.orthogonal.cvol'
     else:
         raw_path = layer_dir / f'{key}.orthogonal.u8.dat'
         out_path = raw_path
 
-    transient_projection_in_memory = bool(raw_bbox_nrrd_layers_enabled())
+    transient_projection_in_memory = bool(
+        bbox_store_enabled and not force_path_backed_store
+    )
     # projected radial/tilted layers directly into source geometry. keeps
     # non-radial layers reduced: Cartesian layers are reduced axis permutations and Tilted
     # layers are reduced sheared orthogonal grids. Their sparse stores are therefore built at
@@ -34801,7 +35486,7 @@ def materialize_nrrd_view_layer(
             if radial_sink_only_projection_supported(view) else 'dense_projection'
         ),
     }
-    if bool(raw_bbox_nrrd_layers_enabled()) and radial_sink_only_projection_supported(view):
+    if bool(bbox_store_enabled) and radial_sink_only_projection_supported(view):
         expected_shape = (
             tuple(int(v) for v in projection_out_shape)
             if projection_out_shape is not None
@@ -34811,9 +35496,10 @@ def materialize_nrrd_view_layer(
             incremental_writer = IncrementalRawBBoxMaskStoreWriter(
                 shape=(int(expected_shape[0]), int(expected_shape[1]), int(expected_shape[2])),
                 store_dir=out_path,
-                format_name=CVOL_FORMAT,
+                format_name=bbox_store_format,
                 desc=f'NRRD layer {key}',
                 extra_meta=incremental_extra_meta,
+                force_path_backed=bool(force_path_backed_store),
             )
             projection_block_callback = incremental_writer
         except Exception as exc:
@@ -34840,7 +35526,7 @@ def materialize_nrrd_view_layer(
             out_shape_tyx=projection_out_shape,
             # transverse layers headed for a raw-bbox store are encoded straight
             # from the source volume (identity projection, synchronous encode) — no copy.
-            allow_transverse_passthrough=bool(raw_bbox_nrrd_layers_enabled()),
+            allow_transverse_passthrough=bool(bbox_store_enabled),
             # device-union row occupancy (radial views only; valid for the
             # pre-interpolation layer, which is the only caller that supplies it).
             known_row_occupancy=known_row_occupancy,
@@ -34883,7 +35569,7 @@ def materialize_nrrd_view_layer(
         if projected_sink_only
         else tuple(int(x) for x in np.asarray(projected).shape)
     )
-    if raw_bbox_nrrd_layers_enabled():
+    if bbox_store_enabled:
         layer_stats: Optional[Dict[str, object]] = None
         if incremental_writer is not None:
             try:
@@ -34922,7 +35608,7 @@ def materialize_nrrd_view_layer(
             layer_stats = write_raw_bbox_mask_store(
                 projected,
                 out_path,
-                format_name=CVOL_FORMAT,
+                format_name=bbox_store_format,
                 desc=f'NRRD layer {key}',
                 workers=int(workers),
                 extra_meta={
@@ -34930,10 +35616,11 @@ def materialize_nrrd_view_layer(
                     'source_raw_path': 'encoded_direct_from_view_volume' if projected_is_source else str(raw_path),
                     'source_raw_workspace': 'in_memory_when_available' if bool(transient_projection_in_memory) else 'disk_backed',
                 },
+                force_path_backed=bool(force_path_backed_store),
             )
         segment_extent = _coerce_segment_extent(layer_stats.get('segment_extent_ijk')) or _nrrd_empty_segment_extent()
         segment_extent_source = 'raw_bbox_cvol_index'
-        storage_format = CVOL_FORMAT
+        storage_format = bbox_store_format
         if not projected_is_source and not projected_sink_only:
             close_memmap_array(projected)
             try:
@@ -34978,7 +35665,7 @@ def materialize_nrrd_view_layer(
         segment_extent_source=segment_extent_source,
     )
     sink = nrrd_layer_sink()
-    if sink is not None:
+    if sink is not None and bool(submit_to_sink):
         sink.submit_layer(
             layer_ref,
             nrrd_layer_output_suffix(
@@ -34991,6 +35678,40 @@ def materialize_nrrd_view_layer(
             ),
         )
     return layer_ref
+
+
+def materialize_internal_final_view_layer(
+    view_volume_mm: np.ndarray,
+    *,
+    model_name: str,
+    view: ViewInfo,
+    temp_dir: Path,
+    workers: int,
+) -> Optional[NrrdLayerRef]:
+    """Persist one private, pathname-backed final-view ref for dense retirement.
+
+    This layer is a terminal-union input, not a requested NRRD output.  Forcing pathname
+    storage prevents the replacement sparse payload from silently consuming memfd RAM. Its
+    bbox crops are row-wise bit-packed; exported CTILE/NRRD component formats remain raw u8.
+    """
+    return materialize_nrrd_view_layer(
+        view_volume_mm,
+        model_name=str(model_name),
+        view=view,
+        source='internal',
+        mask_kind='union',
+        pass_index=0,
+        stage='final_sparse_retention',
+        description=(
+            'Private final-view raw-bbox layer used to retire the dense canvas; '
+            'not submitted as an NRRD output.'
+        ),
+        temp_dir=Path(temp_dir),
+        workers=int(workers),
+        submit_to_sink=False,
+        force_path_backed_store=True,
+        internal_packbits_store=True,
+    )
 
 
 
@@ -35212,6 +35933,7 @@ def prepare_view_volume_after_fullframe(
     slice_meta: Optional[Dict[str, object]] = None,
     fuse_radial_component_layers: bool = False,
     parent_mask_ready_callback: Optional[Callable[[str, str, object], None]] = None,
+    internal_final_layer_enabled: bool = False,
 ) -> PreparedViewResult:
     baseline_native_volume = union_mm
     nrrd_layers: List[NrrdLayerRef] = []
@@ -35529,9 +36251,20 @@ def prepare_view_volume_after_fullframe(
         else:
             parent_bridge_support_mm = RawBBoxMaskStore.open(parent_bridge_support_path, mmap_payload=True)
 
-    # Angle variants remain dense until physical-view finalization immediately before
-    # the final global binary union in v16.4.0.
-    # Their component NRRDs and tile categories remain independently addressable meanwhile.
+    if bool(internal_final_layer_enabled) and not bool(dense_tiling_active):
+        internal_ref = materialize_internal_final_view_layer(
+            baseline_native_volume,
+            model_name=str(model_name),
+            view=view,
+            temp_dir=temp_dir,
+            workers=int(slice_workers),
+        )
+        if internal_ref is not None:
+            nrrd_layers.append(internal_ref)
+
+    # Return the dense angle variant to the scheduler. When immutable component NRRD
+    # references fully cover it, the scheduler may retire this canvas before physical-view
+    # finalization; otherwise the legacy dense TTA-collapse path remains authoritative.
     sparse_retire_dense = False
 
     if sparse_retire_dense:
@@ -36435,6 +37168,7 @@ def finalize_consolidated_tile_volume_for_parent(
     nrrd_layers_enabled: bool = False,
     tile_parent_mask_accumulator_mm: Optional[np.ndarray] = None,
     tile_parent_bridge_accumulator_mm: Optional[np.ndarray] = None,
+    internal_final_layer_enabled: bool = False,
 ) -> TileConsolidationResult:
     """Interpolate the consolidated gated-tile volume once for the parent view, then union it.
 
@@ -36454,6 +37188,16 @@ def finalize_consolidated_tile_volume_for_parent(
     )
 
     if not _volume_has_foreground(tile_accumulator_mm):
+        if bool(internal_final_layer_enabled):
+            internal_ref = materialize_internal_final_view_layer(
+                destination_mm,
+                model_name=str(model_name),
+                view=view,
+                temp_dir=temp_dir,
+                workers=int(slice_workers),
+            )
+            if internal_ref is not None:
+                nrrd_layers.append(internal_ref)
         return TileConsolidationResult(
             model_name=str(model_name),
             view_name=str(view.name),
@@ -36616,6 +37360,17 @@ def finalize_consolidated_tile_volume_for_parent(
             desc=f'Union consolidated gated tiles {model_name}/{view.name}',
         )
 
+    if bool(internal_final_layer_enabled):
+        internal_ref = materialize_internal_final_view_layer(
+            destination_mm,
+            model_name=str(model_name),
+            view=view,
+            temp_dir=temp_dir,
+            workers=int(slice_workers),
+        )
+        if internal_ref is not None:
+            nrrd_layers.append(internal_ref)
+
     return TileConsolidationResult(
         model_name=str(model_name),
         view_name=str(view.name),
@@ -36624,6 +37379,38 @@ def finalize_consolidated_tile_volume_for_parent(
         interpolation_stats=interpolation_stats,
         nrrd_layers=nrrd_layers,
         final_accumulator_mm=tile_accumulator_mm,
+    )
+
+
+def finalize_parent_without_tile_contribution_for_sparse_retirement(
+    *,
+    model_name: str,
+    view: ViewInfo,
+    destination_mm: np.ndarray,
+    destination_lock: threading.Lock,
+    temp_dir: Path,
+    slice_workers: int,
+) -> TileConsolidationResult:
+    """Materialize the private final-view ref when every original tile was empty."""
+    layers: List[NrrdLayerRef] = []
+    with destination_lock:
+        internal_ref = materialize_internal_final_view_layer(
+            destination_mm,
+            model_name=str(model_name),
+            view=view,
+            temp_dir=temp_dir,
+            workers=int(slice_workers),
+        )
+    if internal_ref is not None:
+        layers.append(internal_ref)
+    return TileConsolidationResult(
+        model_name=str(model_name),
+        view_name=str(view.name),
+        aug_id=str(view.tta_aug_id),
+        angle_deg=float(view.tta_angle_deg),
+        interpolation_stats=[],
+        nrrd_layers=layers,
+        final_accumulator_mm=None,
     )
 
 
@@ -42015,6 +42802,10 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     temp_dir = choose_scratch_dir(args.temp, out_dir, input_path.stem)
+    register_unique_run_scratch_cleanup(
+        temp_dir,
+        keep_temp=bool(keep_temp_artifacts),
+    )
     expose_scratch_in_output(out_dir, temp_dir)
     # Say which kind of scratch this is. Memory-backed scratch keeps tile residuals,
     # per-angle accumulators, and the shared source volume off persistent storage; disk-backed
@@ -42424,6 +43215,17 @@ def main() -> None:
             'A worker that cannot admit the source volume to VRAM will still use the completed-cube CPU path.'
         )
     spec_notes: List[str] = []
+    spec_notes.append(
+        'v17.0.4 interpolation resource patch: sparse-label packing releases source crops '
+        'incrementally; interpolation planning and its component/SDF caches are byte-bounded; '
+        'accepted plans render in bounded batches; adjacent-slice endpoint continuation uses '
+        'exact bbox label reads instead of quadratic component-pair scans; parent and '
+        'consolidated-tile interpolation share one global pass boundary; '
+        'tile outer/inner worker defaults divide the job CPU budget instead of multiplying it; '
+        'process-reopenable tile accumulators avoid anonymous-to-path full-volume copies; and '
+        'completed dense views retire through immutable terminal refs (private no-NRRD refs '
+        'use row-wise packbits); per-pass telemetry reports real plan/cache/label/backing usage.'
+    )
     spec_notes.append(
         'v17.0.3 hybrid scheduler patch: CPU lease target remains 10 seconds and seed ranges '
         'use the larger eligible backend target. Hybrid full-frame views are partitioned into an '
@@ -42908,6 +43710,11 @@ def main() -> None:
     interpolation_process_backend_active = bool(
         interpolation_process_backend_enabled() and len(interpolating_views) > 0
     )
+    interpolation_global_pass_limit = max(
+        1,
+        _env_int('YOLO_TTA_INTERPOLATION_GLOBAL_PASSES', 1),
+    )
+    configure_interpolation_pass_admission(int(interpolation_global_pass_limit))
     (
         parent_postprocess_workers,
         parent_slice_postprocess_workers,
@@ -42930,8 +43737,17 @@ def main() -> None:
         interpolation_process_backend_active=bool(interpolation_process_backend_active),
     )
 
-    tile_postprocess_workers_default = int(worker_budget)
-    tile_postprocess_workers = max(1, _env_int('YOLO_TTA_TILE_POSTPROCESS_WORKERS', tile_postprocess_workers_default))
+    # Gate tasks are themselves slice-parallel.  The previous worker_budget x
+    # worker_budget defaults could create 25,600 runnable tasks on a 160-CPU node.
+    # Keep a small outer fan-out and divide the box budget across its inner pools.
+    tile_postprocess_workers_default = max(1, min(4, int(worker_budget)))
+    tile_postprocess_workers = max(
+        1,
+        min(
+            int(worker_budget),
+            _env_int('YOLO_TTA_TILE_POSTPROCESS_WORKERS', tile_postprocess_workers_default),
+        ),
+    )
     # Dense GPU-worker tile results must never wait behind parent interpolation or sparse
     # gate work in the shared tile executor. A small dedicated outer pool performs cleanup
     # plus CTILE conversion; each task still uses the configured slice-parallel workers.
@@ -42961,15 +43777,26 @@ def main() -> None:
             int(tile_dense_retirement_slice_workers_default),
         ),
     )
-    tile_slice_postprocess_workers_default = int(worker_budget)
+    tile_slice_postprocess_workers_default = max(
+        1,
+        int(worker_budget) // max(1, int(tile_postprocess_workers)),
+    )
     tile_slice_postprocess_workers = max(
         1,
-        _env_int('YOLO_TTA_TILE_SLICE_WORKERS', tile_slice_postprocess_workers_default),
+        min(
+            int(worker_budget),
+            _env_int('YOLO_TTA_TILE_SLICE_WORKERS', tile_slice_postprocess_workers_default),
+        ),
     )
-    tile_interpolation_task_workers_default = max(1, _cpu_count())
+    # Consolidation runs in the same outer executor as gate tasks; give it one outer
+    # share rather than another full-box inner pool.
+    tile_interpolation_task_workers_default = int(tile_slice_postprocess_workers)
     tile_interpolation_task_workers = max(
         1,
-        _env_int('YOLO_TTA_TILE_INTERPOLATION_TASK_WORKERS', tile_interpolation_task_workers_default),
+        min(
+            int(worker_budget),
+            _env_int('YOLO_TTA_TILE_INTERPOLATION_TASK_WORKERS', tile_interpolation_task_workers_default),
+        ),
     )
 
     # Interpolation workers provide independent Python interpreters for GIL-heavy planning.
@@ -42983,7 +43810,16 @@ def main() -> None:
         ),
     )
     interpolation_process_workers = (
-        max(1, _env_int('YOLO_TTA_INTERPOLATION_PROCESS_WORKERS', interpolation_process_workers_default))
+        max(
+            1,
+            min(
+                int(interpolation_global_pass_limit),
+                _env_int(
+                    'YOLO_TTA_INTERPOLATION_PROCESS_WORKERS',
+                    interpolation_process_workers_default,
+                ),
+            ),
+        )
         if bool(interpolation_process_backend_active) else 0
     )
 
@@ -43036,6 +43872,7 @@ def main() -> None:
         print(
             'Interpolation process backend: enabled '
             f'(process workers: {int(interpolation_process_workers)}, start_method={interpolation_process_start_method()}, '
+            f'global pass limit={int(interpolation_global_pass_limit)}, '
             f'child cv2_threads={interpolation_process_cv2_threads()}, compiled kernels: {interpolation_compiled_kernels_status()})'
         )
     else:
@@ -43081,10 +43918,13 @@ def main() -> None:
         'so parent interpolation cannot extend dense uint8 result lifetime. '
         f'Dense-retirement concurrency={tile_dense_retirement_workers} task(s) x '
         f'{tile_dense_retirement_slice_workers} slice worker(s); '
-        f'Tile-set/category accumulators prefer anonymous RAM={int(tile_intermediate_accumulators_prefer_memory())}; '
+        f'Tile-set/category accumulators prefer process-reopenable memfd RAM={int(tile_intermediate_accumulators_prefer_memory())}; '
         f'the cgroup-corrected accumulator reserve is {tile_intermediate_accumulator_reserve_bytes() / GIB:.1f} GiB. '
-        'CTILE/CVOL stores elide empty slices and write only each nonempty slice bbox as raw uint8; '
-        'bitpacking and LZ4 are not used. YOLO_TTA_KEEP_TEMP=1 intentionally retains the original '
+        f'CTILE/CVOL payload memfd opt-in={int(raw_store_memfd_enabled())} '
+        '(YOLO_TTA_CVOL_MEMFD; pathname-backed by default because raw-store queues are not RAM-admitted). '
+        'External CTILE/CVOL support and NRRD stores elide empty slices and retain raw uint8 '
+        'bbox payloads; private no-NRRD final-view retention uses row-wise packbits (up to 8x '
+        'smaller) and no store uses LZ4. YOLO_TTA_KEEP_TEMP=1 intentionally retains the original '
         'dense artifacts for diagnostics and therefore disables the live-result storage guarantee.'
     )
     spec_notes.append(
@@ -43092,7 +43932,8 @@ def main() -> None:
     )
     spec_notes.append(
         'Interpolation labeling uses parallel 2D per-slice connected-component labeling, parallel adjacent-slice pair extraction, '
-        'row-blocked parallel compact relabeling, and unordered prebuilt per-slice component tables for endpoint scanning. '
+        'row-blocked parallel compact relabeling, lazy byte-bounded per-slice component tables, and exact bbox label-window '
+        'continuation tests that avoid quadratic same-label component-pair scans. '
         f'Per-parent interpolation task workers default to worker_budget / expected_live_parent_overlap = {int(parent_interpolation_task_workers_default)} '
         f'using YOLO_TTA_INTERPOLATION_CONCURRENT_PARENTS={int(parent_interpolation_overlap)}; '
         'YOLO_TTA_INTERPOLATION_TASK_WORKERS still overrides the exact per-parent worker count. '
@@ -43102,7 +43943,8 @@ def main() -> None:
     spec_notes.append(
         'v12.2.7 interpolation process isolation active by default: full-frame and consolidated-tile interpolation passes reopen uint8 mask volumes from disk-backed memmaps in a ProcessPoolExecutor worker and return only small stats. '
         f'Process backend enabled={bool(interpolation_process_backend_active)}, process_workers={int(interpolation_process_workers)}, start_method={interpolation_process_start_method()}, '
-        f'fallback_on_worker_failure={bool(interpolation_process_fallback_enabled())}. Anonymous in-memory mask arrays are copied once to a process memmap before interpolation, avoiding multi-GiB pickle payloads.'
+        f'global_pass_limit={int(interpolation_global_pass_limit)}, fallback_on_worker_failure={bool(interpolation_process_fallback_enabled())}. '
+        'The global lease covers backing conversion plus auxiliary/dedicated execution, so queued passes cannot create full-volume process inputs concurrently. Consolidated-tile accumulators are process-reopenable at creation; other anonymous in-memory mask arrays are copied once to a process memmap before interpolation, avoiding multi-GiB pickle payloads.'
     )
     spec_notes.append(
         f'v12.2.7 compiled interpolation kernels: {interpolation_compiled_kernels_status()}. '
@@ -43231,19 +44073,27 @@ def main() -> None:
     direct_union_inference_bytes: Dict[Tuple[str, str], int] = {}
     direct_union_postprocess_bytes: Dict[Tuple[str, str], int] = {}
     direct_union_backing_leases: Dict[Tuple[str, str], _DirectUnionBackingLease] = {}
-    # v16.4.0 keeps every completed angle variant dense until the physical-view OR.
-    # Sparse retirement before that OR would erase the independent contributor needed to
-    # reconstruct the physical view, so there is no compatibility/environment rollback.
-    direct_union_sparse_retirement_active = False
+    # Requested NRRD components already form an immutable terminal-union backing. Without
+    # --save nrrd, one private pathname-backed final-view cvol is materialized instead.
+    # Either representation lets the dense canvas retire; KEEP_TEMP preserves the legacy
+    # dense diagnostics contract. Activate direct-union byte/view admission whenever that
+    # bounded retirement path is authoritative.
+    component_ref_dense_retirement_active = bool(not keep_temp_artifacts)
+    direct_union_sparse_retirement_active = bool(component_ref_dense_retirement_active)
 
     _direct_headroom = max(0, int(available_anon_work_bytes()) - 64 * GIB)
-    _default_inference_view_limit = max(4, min(12, 2 * max(1, int(gpu_device_count))))
+    _default_inference_view_limit = max(2, min(4, max(1, int(gpu_device_count))))
     direct_union_inference_view_limit = max(
         1,
         _env_int('YOLO_TTA_DIRECT_UNION_INFERENCE_VIEWS', int(_default_inference_view_limit)),
     )
+    # Keep the live dense inference window deliberately below the interpolation heap.
+    # The former 512/768 GiB defaults could legally retain almost the entire 1 TiB job
+    # allocation before the one active interpolation pass allocated labels/bridges.  An
+    # individual oversize view still has an emergency lane, so these conservative caps never
+    # deadlock a 100+ GiB logical tiled parent.
     _default_inference_bytes = max(
-        128 * GIB, min(512 * GIB, int(max(1, _direct_headroom) * 0.55)),
+        64 * GIB, min(128 * GIB, int(max(1, _direct_headroom) * 0.25)),
     )
     direct_union_inference_byte_limit = int(
         max(
@@ -43255,7 +44105,7 @@ def main() -> None:
         ) * GIB
     )
     _default_total_dense_bytes = max(
-        256 * GIB, min(768 * GIB, int(max(1, _direct_headroom) * 0.75)),
+        128 * GIB, min(256 * GIB, int(max(1, _direct_headroom) * 0.40)),
     )
     direct_union_total_dense_byte_limit = int(
         max(
@@ -43447,6 +44297,7 @@ def main() -> None:
     # B (parent-only interpolation delta) becomes ready when the parent future completes.
     parent_mask_ready_events = queue.SimpleQueue()
     parent_bridge_ready: set[Tuple[str, str]] = set()
+    parent_tile_supports_retired: set[Tuple[str, str]] = set()
     postprocessed_tiles_waiting_by_parent: Dict[Tuple[str, str], Dict[str, object]] = {}
     residual_tiles_waiting_by_parent: Dict[Tuple[str, str], Dict[str, object]] = {}
     tile_parent_gate_futures: Dict[Future, Tuple[str, str, str, str]] = {}
@@ -43460,8 +44311,6 @@ def main() -> None:
     tile_category_accumulator_locks: Dict[Tuple[str, str, str], List[threading.Lock]] = {}
     tile_completed_by_parent: Dict[Tuple[str, str], set[str]] = {}
     tile_consolidation_submitted: set[Tuple[str, str]] = set()
-
-
     def _prediction_volume_queue_depth() -> int:
         return int(len(pending_prediction_volume_futures) + len(ready_fullframe) + len(ready_tile_infer))
 
@@ -43784,9 +44633,17 @@ def main() -> None:
                 or key in direct_union_postprocess_views
             ):
                 raise RuntimeError(f'direct-union backing {key} was admitted more than once')
-            backing_bytes = int(array_nbytes(processing_shape, np.uint8)) * (
-                2 if conf_mm is not None else 1
-            )
+            dense_volume_bytes = int(array_nbytes(processing_shape, np.uint8))
+            # Reserve the complete deterministic per-parent dense set before inference
+            # starts. Tiling adds the consolidated accumulator and NRRD decomposition adds
+            # two category accumulators; charging only the parent union let those canvases
+            # appear later outside admission.
+            dense_volume_count = (2 if conf_mm is not None else 1)
+            if bool(dense_tiling_active):
+                dense_volume_count += 1
+                if bool(nrrd_layers_needed):
+                    dense_volume_count += 2
+            backing_bytes = int(dense_volume_bytes) * int(dense_volume_count)
             direct_union_backing_leases[key] = _DirectUnionBackingLease(
                 key=key, nbytes=int(backing_bytes), phase='inference', owner_count=1,
             )
@@ -43871,6 +44728,10 @@ def main() -> None:
                     parent_mask_ready_callback=(
                         _publish_parent_mask_ready if bool(dense_tiling_active) else None
                     ),
+                    internal_final_layer_enabled=bool(
+                        component_ref_dense_retirement_active
+                        and not nrrd_layers_needed
+                    ),
                 )
 
         lease = direct_union_backing_leases.get(key)
@@ -43923,16 +44784,22 @@ def main() -> None:
             return acc
         view = view_infos_by_name[str(view_name)]
         acc_path = temp_dir / 'tile_consolidated' / str(model_name) / str(view_name) / 'gated_or.u8.dat'
+        prefer_shared_ram = bool(tile_intermediate_accumulators_prefer_memory())
         acc = allocate_workspace_array(
             shape=view_processing_volume_shape(view, int(args.imgsz)),
             dtype=np.uint8,
             path=acc_path,
             desc=f'{model_name}/{view_name} consolidated two-stage gated-tile accumulator',
-            prefer_memory=tile_intermediate_accumulators_prefer_memory(),
+            # The consolidated volume is subsequently reopened by a spawned
+            # interpolation process.  Prefer a parent-owned memfd, never an anonymous
+            # ndarray that would require a second full-volume process_input copy.
+            prefer_memory=False,
+            prefer_memfd=bool(prefer_shared_ram),
             reserve_bytes=tile_intermediate_accumulator_reserve_bytes(),
         )
         tile_accumulator_by_parent[key] = acc
-        tile_accumulator_paths[key] = acc_path
+        actual_path = _memmap_backing_path(acc)
+        tile_accumulator_paths[key] = Path(actual_path) if actual_path is not None else acc_path
         tile_accumulator_locks_by_parent[key] = [
             threading.Lock() for _ in range(_tile_gate_lock_shards(str(view_name)))
         ]
@@ -43955,12 +44822,17 @@ def main() -> None:
             return acc
         view = view_infos_by_name[str(view_name)]
         acc_path = temp_dir / 'tile_consolidated' / str(model_name) / str(view_name) / f'gated_or_accepted_by_{category_norm}.u8.dat'
+        prefer_shared_ram = bool(tile_intermediate_accumulators_prefer_memory())
         acc = allocate_workspace_array(
             shape=view_processing_volume_shape(view, int(args.imgsz)),
             dtype=np.uint8,
             path=acc_path,
             desc=f'{model_name}/{view_name} consolidated gated-tile accumulator accepted by {category_norm}',
-            prefer_memory=tile_intermediate_accumulators_prefer_memory(),
+            # Category canvases do not enter interpolation today, but keeping all tile
+            # accumulators process-reopenable avoids silently reintroducing anonymous
+            # full-volume state into this path.
+            prefer_memory=False,
+            prefer_memfd=bool(prefer_shared_ram),
             reserve_bytes=tile_intermediate_accumulator_reserve_bytes(),
         )
         store[key] = acc
@@ -43983,6 +44855,107 @@ def main() -> None:
             return tilted_native_output_by_model[str(model_name)][str(view_name)]
         return view_volumes_by_model[str(model_name)][str(view_name)]
 
+    def _retire_parent_dense_view(
+        model_name: str,
+        view_name: str,
+        *,
+        extra_arrays: Sequence[object] = (),
+        reason: str,
+    ) -> None:
+        """Drop every registry reference to one component-ref-backed dense view."""
+        parent_key = (str(model_name), str(view_name))
+        candidates: List[object] = list(extra_arrays)
+        for registry in (
+            native_view_support_by_model,
+            radial_native_output_by_model,
+            tilted_native_output_by_model,
+            view_volumes_by_model,
+        ):
+            value = registry.get(parent_key[0], {}).pop(parent_key[1], None)
+            if value is not None:
+                candidates.append(value)
+
+        retired_ids: set[int] = set()
+        retired_bytes = 0
+        for value in candidates:
+            if value is None or id(value) in retired_ids:
+                continue
+            retired_ids.add(id(value))
+            try:
+                retired_bytes += int(np.asarray(value).nbytes)
+            except Exception:
+                pass
+            backing_path = _memmap_backing_path(value)
+            close_memmap_array_without_flush(value)
+            if backing_path is not None and not str(backing_path).startswith('/proc/'):
+                try:
+                    Path(backing_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+        if retired_ids:
+            print(
+                f'Component-ref dense retirement: released {retired_bytes / GIB:.2f} GiB '
+                f'for {parent_key[0]}/{parent_key[1]} ({reason}).'
+            )
+
+        lease = direct_union_backing_leases.pop(parent_key, None)
+        if lease is not None:
+            if (
+                parent_key not in direct_union_postprocess_views
+                or str(lease.phase) != 'postprocess'
+            ):
+                raise RuntimeError(
+                    f'direct-union backing {parent_key} retired outside postprocess ownership'
+                )
+            lease.release('postprocess')
+            direct_union_postprocess_views.remove(parent_key)
+            direct_union_postprocess_bytes.pop(parent_key, None)
+            # A tiled parent can hold this byte lease well beyond its parent future.
+            # Refill inference immediately when consolidation finally retires it.
+            try:
+                if gpu_worker_pending_task_ids:
+                    _dispatch_inference_windows()
+            except (NameError, UnboundLocalError):
+                pass
+
+    def _retire_parent_tile_supports_if_gates_complete(
+        model_name: str,
+        view_name: str,
+    ) -> None:
+        """Release immutable P/B stores immediately after their final tile gate."""
+        parent_key = (str(model_name), str(view_name))
+        if parent_key in parent_tile_supports_retired:
+            return
+        expected_tiles = int(tile_expected_by_parent.get(parent_key, 0))
+        if expected_tiles <= 0:
+            return
+        if len(tile_completed_by_parent.get(parent_key, set())) < int(expected_tiles):
+            return
+        # parent_bridge_ready is published only after the parent future (which also
+        # returns the already-published P object) has been drained.  Waiting for it avoids
+        # closing P and then accidentally re-registering the same closed object later.
+        if parent_key not in parent_bridge_ready:
+            return
+
+        released: List[str] = []
+        for label, registry in (
+            ('P', parent_mask_support_by_model),
+            ('B', parent_bridge_support_by_model),
+        ):
+            support = registry.get(parent_key[0], {}).pop(parent_key[1], None)
+            if support is None:
+                continue
+            close_raw_store_or_memmap_volume(
+                support, keep_temp=bool(keep_temp_artifacts),
+            )
+            released.append(str(label))
+        parent_tile_supports_retired.add(parent_key)
+        if released:
+            print(
+                f'Released parent tile support {"/".join(released)} for '
+                f'{parent_key[0]}/{parent_key[1]} after all {expected_tiles} tile gate(s).'
+            )
+
     def _maybe_submit_tile_consolidation(model_name: str, view_name: str) -> None:
         parent_key = (str(model_name), str(view_name))
         if parent_key in tile_consolidation_submitted:
@@ -43992,6 +44965,9 @@ def main() -> None:
             return
         if len(tile_completed_by_parent.get(parent_key, set())) < expected_tiles:
             return
+        _retire_parent_tile_supports_if_gates_complete(
+            str(model_name), str(view_name),
+        )
         if not _parent_destination_ready(str(model_name), str(view_name)):
             return
 
@@ -43999,6 +44975,30 @@ def main() -> None:
         acc = tile_accumulator_by_parent.get(parent_key)
         if acc is None:
             # Every original tile was empty after cleanup; nothing can be interpolated.
+            if bool(component_ref_dense_retirement_active):
+                if bool(nrrd_layers_needed):
+                    _retire_parent_dense_view(
+                        str(model_name), str(view_name),
+                        reason='all tiles empty; full-frame terminal refs are complete',
+                    )
+                else:
+                    # No requested component set exists. Materialize one private final
+                    # pathname-backed ref on the worker pool before retiring the parent.
+                    view = view_infos_by_name[str(view_name)]
+                    fut = tile_postprocess_executor.submit(
+                        finalize_parent_without_tile_contribution_for_sparse_retirement,
+                        model_name=str(model_name),
+                        view=view,
+                        destination_mm=_parent_destination_volume(
+                            str(model_name), str(view_name),
+                        ),
+                        destination_lock=view_volume_locks[
+                            (str(model_name), str(view_name))
+                        ],
+                        temp_dir=temp_dir,
+                        slice_workers=int(tile_slice_postprocess_workers),
+                    )
+                    tile_consolidation_futures[fut] = parent_key
             return
 
         view = view_infos_by_name[str(view_name)]
@@ -44022,6 +45022,10 @@ def main() -> None:
             nrrd_layers_enabled=bool(nrrd_layers_needed),
             tile_parent_mask_accumulator_mm=tile_parent_mask_accumulator_by_parent.get(parent_key),
             tile_parent_bridge_accumulator_mm=tile_parent_bridge_accumulator_by_parent.get(parent_key),
+            internal_final_layer_enabled=bool(
+                component_ref_dense_retirement_active
+                and not nrrd_layers_needed
+            ),
         )
         tile_consolidation_futures[fut] = parent_key
 
@@ -44332,7 +45336,12 @@ def main() -> None:
                 continue
             result = fut.result()
             del view_processing_futures[fut]
-            if result.native_support_mm is not None:
+            completed_view_key = (str(result.model_name), str(result.view_name))
+            retire_completed_non_tiled_view = bool(
+                component_ref_dense_retirement_active
+                and int(tile_expected_by_parent.get(completed_view_key, 0)) <= 0
+            )
+            if result.native_support_mm is not None and not retire_completed_non_tiled_view:
                 native_view_support_by_model[result.model_name][result.view_name] = result.native_support_mm
             if result.parent_mask_support_mm is not None:
                 existing_parent_mask = parent_mask_support_by_model[result.model_name].get(result.view_name)
@@ -44348,26 +45357,34 @@ def main() -> None:
             _flush_ready_residual_tiles()
             interpolation_stats.extend(result.interpolation_stats)
             nrrd_layer_refs.extend(result.nrrd_layers)
-            completed_view_key = (str(result.model_name), str(result.view_name))
-            lease = direct_union_backing_leases.pop(completed_view_key, None)
+            lease = direct_union_backing_leases.get(completed_view_key)
             if lease is not None:
                 if completed_view_key not in direct_union_postprocess_views:
                     raise RuntimeError(
                         f'direct-union backing {completed_view_key} completed without a postprocess lease'
                     )
-                lease.release('postprocess')
-                direct_union_postprocess_views.remove(completed_view_key)
-                direct_union_postprocess_bytes.pop(completed_view_key, None)
-                direct_union_capacity_released = True
+                if not bool(component_ref_dense_retirement_active):
+                    direct_union_backing_leases.pop(completed_view_key, None)
+                    lease.release('postprocess')
+                    direct_union_postprocess_views.remove(completed_view_key)
+                    direct_union_postprocess_bytes.pop(completed_view_key, None)
+                    direct_union_capacity_released = True
 
             view_info = view_infos_by_name[result.view_name]
-            if result.final_view_volume_mm is not None:
+            if result.final_view_volume_mm is not None and not retire_completed_non_tiled_view:
                 if view_info.family == 'radial':
                     radial_native_output_by_model[result.model_name][result.view_name] = result.final_view_volume_mm
                 elif is_tilted_view(view_info):
                     tilted_native_output_by_model[result.model_name][result.view_name] = result.final_view_volume_mm
                 else:
                     view_volumes_by_model[result.model_name][result.view_name] = result.final_view_volume_mm
+            if retire_completed_non_tiled_view:
+                _retire_parent_dense_view(
+                    str(result.model_name),
+                    str(result.view_name),
+                    extra_arrays=(result.native_support_mm, result.final_view_volume_mm),
+                    reason='non-tiled terminal component refs are complete',
+                )
             # Parent YOLO and bridge supports are now immutable and same-angle. Release
             # any cleaned tiles that finished inference first, then check whether all original
             # tiles have completed their two-stage component gates.
@@ -44431,6 +45448,13 @@ def main() -> None:
             result = fut.result()
             interpolation_stats.extend(result.interpolation_stats)
             nrrd_layer_refs.extend(result.nrrd_layers)
+
+            if bool(component_ref_dense_retirement_active):
+                _retire_parent_dense_view(
+                    str(parent_key[0]),
+                    str(parent_key[1]),
+                    reason='full-frame and consolidated-tile terminal refs are complete',
+                )
 
             # The interpolation backend may rebind the consolidated accumulator to a
             # fresh memmap containing bridge voxels. Re-point the registry used for
@@ -45631,7 +46655,12 @@ def main() -> None:
         if len(shape) != 3:
             view_obj = task['view']
             shape = view_processing_volume_shape(view_obj, int(task.get('out_size', args.imgsz)))
-        return int(array_nbytes(shape, np.uint8)) * (2 if float(args.min_conf) > 0.0 else 1)
+        dense_volume_count = 2 if float(args.min_conf) > 0.0 else 1
+        if bool(dense_tiling_active):
+            dense_volume_count += 1
+            if bool(nrrd_layers_needed):
+                dense_volume_count += 2
+        return int(array_nbytes(shape, np.uint8)) * int(dense_volume_count)
 
     def _direct_union_task_admissible(task: Dict[str, object]) -> bool:
         key = _direct_union_task_key(task)
@@ -48012,12 +49041,7 @@ def main() -> None:
     # original source geometry (single resample) instead of the working geometry.
     source_output_shape_tyx = (int(input_T), int(input_H), int(input_W))
     final_backprojection_jobs: List[ViewBackprojectionQueueJob] = []
-    view_assemble_jobs: List[Tuple[str, ViewInfo, List[NrrdLayerRef]]] = []  #
     fused_projected_layer_refs: List[NrrdLayerRef] = []  #
-    g5_tail_eligible = bool(
-        fused_final_view_union_enabled()
-        and tuple(int(v) for v in source_output_shape_tyx) != (int(T), int(H), int(W))
-    )
     for view in views:
         for model_name, _ in yolo_models:
             if view.name in view_volumes_by_model[model_name]:
@@ -48025,21 +49049,18 @@ def main() -> None:
             view_projected_layer_refs = [
                 ref for ref in nrrd_layer_refs
                 if str(getattr(ref, 'view_name', '')) == str(view.name)
-            ] if bool(nrrd_layers_needed) else []
+            ]
             if view_projected_layer_refs and all(len(tuple(ref.shape)) == 3 for ref in view_projected_layer_refs):
                 print(
-                    f'Final {model_name}/{view.name}: restoring/assembling the union of '
-                    f'{len(view_projected_layer_refs)} orthogonal NRRD layer(s) directly into '
-                    f'output geometry (v16.1.3 sparse-retirement path).'
+                    f'Final {model_name}/{view.name}: contributing '
+                    f'{len(view_projected_layer_refs)} orthogonal component layer(s) directly '
+                    f'to the terminal output-geometry union (sparse-retirement path).'
                 )
-                if g5_tail_eligible:
-                    fused_projected_layer_refs.extend(view_projected_layer_refs)
-                    print(
-                        f'v13.3.9 (G5): {model_name}/{view.name} contributes its projected '
-                        f'layers directly to the fused final-union pass.'
-                    )
-                else:
-                    view_assemble_jobs.append((str(model_name), view, list(view_projected_layer_refs)))
+                # assemble_current_view_union_volume has an exact per-layer fallback when
+                # G5 is disabled or working geometry already equals output geometry.  Feeding
+                # refs directly in every case avoids recreating and retaining one dense volume
+                # per retired view immediately before the final union.
+                fused_projected_layer_refs.extend(view_projected_layer_refs)
                 continue
 
             if (view.family != 'radial' and not is_tilted_view(view)):
@@ -48062,44 +49083,6 @@ def main() -> None:
                 workers=1,
                 out_shape_tyx=source_output_shape_tyx,
             ))
-
-    if view_assemble_jobs:
-        # the per-view assemblies are independent unions of already-projected
-        # layer stores (I/O + memcpy bound). Run up to assemble_views_concurrency of them
-        # side by side, splitting the slice-worker budget so total thread count is unchanged.
-        assemble_concurrency = max(1, min(int(assemble_views_concurrency()), len(view_assemble_jobs)))
-        per_view_workers = max(1, int(tail_slice_workers) // int(assemble_concurrency))
-
-        def _run_view_assembly(job: Tuple[str, 'ViewInfo', List[NrrdLayerRef]]) -> np.ndarray:
-            job_model, job_view, job_refs = job
-            return assemble_view_volume_from_projected_layers(
-                job_refs,
-                source_output_shape_tyx,
-                temp_dir / 'view_volumes' / str(job_model) / f'{job_view.name}.u8.dat',
-                f'Assembling final {job_model}/{job_view.name} from projected layers',
-                prefer_memory=True,
-                workers=int(per_view_workers),
-            )
-
-        if assemble_concurrency <= 1:
-            for assemble_job in view_assemble_jobs:
-                view_volumes_by_model[assemble_job[0]][assemble_job[1].name] = _run_view_assembly(assemble_job)
-        else:
-            print(
-                f'v13.3.8 (G4): assembling {len(view_assemble_jobs)} projected view volume(s) with '
-                f'{int(assemble_concurrency)} concurrent assemblies x {int(per_view_workers)} workers '
-                '(YOLO_TTA_ASSEMBLE_VIEWS_CONCURRENCY=1 restores serial).'
-            )
-            assemble_pool = _acquire_parallel_pool(int(assemble_concurrency))
-            try:
-                assemble_futs = [
-                    (assemble_job[0], assemble_job[1], assemble_pool.submit(_run_view_assembly, assemble_job))
-                    for assemble_job in view_assemble_jobs
-                ]
-                for job_model, job_view, fut in assemble_futs:
-                    view_volumes_by_model[job_model][job_view.name] = fut.result()
-            finally:
-                _release_parallel_pool(int(assemble_concurrency), assemble_pool)
 
     if final_backprojection_jobs:
         # Run one set at a time with the full CPU fallback budget. Transverse Radial may use
@@ -48150,12 +49133,25 @@ def main() -> None:
         view_volumes_by_model,
         already_retired_ids=retired_tta_volume_ids,
     )
-    spec_notes.append(
-        'v16.4.0 TTA-angle finalization: every --angle variant remained independent through '
-        'cleanup, interpolation, per-tile parent/bridge gating, and component-layer output; '
-        'dense variants were OR-collapsed only at physical-view finalization immediately before '
-        'the global view union. The retired unified-angle path is unavailable.'
-    )
+    if bool(component_ref_dense_retirement_active):
+        spec_notes.append(
+            'v17.0.4 component-ref TTA retirement: every --angle variant remained logically '
+            'independent through cleanup, interpolation, per-tile parent/bridge gating, and '
+            'component-layer output. Non-tiled dense variants retired after an immutable terminal '
+            'representation was materialized; tiled variants retired after consolidation. Requested '
+            'NRRD component layers are reused when available; otherwise one private pathname-backed '
+            'row-wise packed raw-bbox final-view layer is created and is not submitted as output. These refs contribute '
+            'directly to the terminal union without rebuilding one dense volume per angle. '
+            'YOLO_TTA_KEEP_TEMP=1 preserves dense diagnostics.'
+        )
+    else:
+        spec_notes.append(
+            'v16.4.0 TTA-angle finalization: every --angle variant remained independent through '
+            'cleanup, interpolation, per-tile parent/bridge gating, and component-layer output; '
+            'dense variants were OR-collapsed only at physical-view finalization immediately before '
+            'the global view union. Component-ref dense retirement is disabled because '
+            'YOLO_TTA_KEEP_TEMP=1 preserves dense diagnostics.'
+        )
 
     print('\n=== Building final single-model view union after physical-view TTA collapse ===')
     # the union is assembled at ORIGINAL SOURCE dimensions.
@@ -48592,6 +49588,12 @@ def main() -> None:
 # v16.1.8 defaults Radial sampling to the hardware-linear texture, adds bilinear in-plane Tilted forward inputs (mask backprojection stays nearest/exact), and retries transient ffmpeg launch failures before failing the pipeline loudly.
 # v16.4.0 embeds low-quality downbins in --save and consolidates final-volume operations under --postprocessing.
 # v16.4.1 fixes the resident TensorRT ring static-affine gate after grouped-source removal: the task-local identity result now replaces the retired all_identity aggregate.
+# v17.0.4 bounds interpolation plans/component/SDF caches, streams sparse-label packing,
+# removes quadratic endpoint continuation scans, unifies parent/tile interpolation admission,
+# prevents multiplicative tile worker defaults, retires completed dense views through immutable
+# pathname-backed refs (private no-NRRD refs are row-wise bit-packed), makes external CTILE/CVOL
+# memfd opt-in, shortens support lifetimes, and reports the live bytes that v17.0.3's workspace
+# estimate omitted.
 # v16.4.2 makes per-tile storage bounded: parent-owned memfd results are preferred, waiting tile/residual masks always retire to crop-local CTILE stores, and scheduler backpressure caps live dense tile workspaces.
 # v16.4.3 moves dense tile retirement to the cleanup boundary: a dedicated pool converts every nonempty tile to CTILE, releases its memfd/pathname and dispatch credit immediately, lazily opens CTILEs inside gate workers, records retention age, and sweeps orphaned gpu_worker_results after scheduler teardown.
 # v16.2.1 prevents hardware-texture Radial startup false positives by allowing one raster-perimeter-equivalent high-error seam while retaining the strict mean and broad-mismatch gates.
