@@ -6,6 +6,8 @@ Current runtime behavior:
    slices wrap for Radial/Tilted Radial views and clamp for Cartesian/Tilted Cartesian views
  - streams full-frame and tiled inputs, with optional GPU-resident rendering
  - uses one persistent worker process per CUDA device and one socket-local OpenVINO process per CPU instance
+ - reserves four exclusive topology-local physical feeder cores per CUDA worker during inference
+ - preserves D1 with interpolation/tiles through an exact packed view-native shadow and delta-only continuation
  - overlaps decode, rendering, inference, cleanup/interpolation, backprojection, and output writing
  - supports Cartesian, Tilted, and Radial view families with dense tiles and source-geometry fusion
  - treats every --angle value as an independent view variant through cleanup, interpolation,
@@ -78,8 +80,8 @@ import numpy as np
 
 GIB = 1024 ** 3
 NRRD_SPACE = "left-posterior-superior"
-SCRIPT_VERSION = '17.0.4'
-SCRIPT_VERSION_COMPACT = '1704'
+SCRIPT_VERSION = '17.0.5'
+SCRIPT_VERSION_COMPACT = '1705'
 SCRIPT_BASENAME = f'GPT-5.6-Sol-Pro_v{SCRIPT_VERSION}_SLURM.py'
 OUTPUT_NRRD_PREFIX = ''
 LEGACY_OUTPUT_NRRD_PREFIX = 'HW_'
@@ -2156,74 +2158,230 @@ def _flatten_physical_core_groups(core_groups: Sequence[Sequence[int]]) -> List[
     return representatives + smt_siblings
 
 
+def gpu_feeder_reserved_physical_cores() -> int:
+    """Exclusive physical cores reserved for each CUDA worker during inference."""
+    return max(0, _env_int('YOLO_TTA_GPU_FEEDER_PHYSICAL_CORES', 4))
+
+
+def plan_gpu_feeder_core_reservations(
+    worker_tokens: Sequence[str],
+    excluded_cpus: Optional[Sequence[int]] = None,
+) -> List[List[int]]:
+    """Return disjoint whole-core feeder masks, preferring each GPU's measured NUMA node.
+
+    Every selected physical core includes all allocated SMT siblings.  Reservations are
+    process-exclusive during inference: the parent, OpenVINO instances, and other CUDA workers
+    exclude these logical CPUs.  When a local node cannot supply the configured target, unused
+    allocated cores from another node fill the deficit rather than overlapping reservations.
+    """
+    n = len(worker_tokens)
+    target = int(gpu_feeder_reserved_physical_cores())
+    reservations: List[List[List[int]]] = [[] for _ in range(n)]
+    if n <= 0 or target <= 0:
+        return [[] for _ in range(n)]
+
+    try:
+        allowed = {int(cpu) for cpu in os.sched_getaffinity(0)}
+    except Exception:
+        allowed = set(range(max(1, int(_cpu_count()))))
+    allowed.difference_update(int(cpu) for cpu in (excluded_cpus or ()))
+    if not allowed:
+        print('Warning: [affinity] no allocated CPUs remain for dedicated GPU feeder cores.')
+        return [[] for _ in range(n)]
+
+    all_groups = _physical_core_cpu_groups(sorted(allowed))
+    exact_topology = all_groups is not None
+    if all_groups is None:
+        # This fallback preserves exclusivity but cannot prove SMT completeness.  It is used
+        # only when Linux thread_siblings_list is unavailable or inconsistent.
+        all_groups = [[int(cpu)] for cpu in sorted(allowed)]
+        print(
+            'Warning: [affinity] physical-core topology is unavailable; dedicated GPU feeder '
+            'reservations fall back to disjoint logical CPUs.'
+        )
+
+    # Preserve at least one whole physical core for the parent scheduler/result drain.
+    # The target SLURM allocation has ample cores, so this guard only changes undersized jobs.
+    max_assignable_groups = max(0, int(len(all_groups)) - 1)
+    requested_groups = int(n) * int(target)
+    if int(max_assignable_groups) < int(requested_groups):
+        print(
+            'Warning: [affinity] the allocation cannot provide every requested dedicated '
+            f'GPU feeder core while retaining one parent core: requested={requested_groups}, '
+            f'assignable={max_assignable_groups}.'
+        )
+    assigned_groups = 0
+
+    topo = numa_topology()
+    worker_nodes: List[Optional[int]] = [None] * n
+    group_nodes: Dict[Tuple[int, ...], Optional[int]] = {}
+    if topo is not None:
+        cpu_to_node: Dict[int, int] = topo['cpu_to_node']  # type: ignore[assignment]
+        worker_nodes = [_resolve_gpu_numa_node(str(token), topo) for token in worker_tokens]
+        for group in all_groups:
+            nodes = {cpu_to_node.get(int(cpu)) for cpu in group}
+            nodes.discard(None)
+            group_nodes[tuple(int(cpu) for cpu in group)] = (
+                int(next(iter(nodes))) if len(nodes) == 1 else None
+            )
+    else:
+        for group in all_groups:
+            group_nodes[tuple(int(cpu) for cpu in group)] = None
+
+    unused: List[List[int]] = [list(group) for group in all_groups]
+
+    # Fair local allocation: one core per worker per round, then repeat up to the target.
+    for node in sorted({int(node) for node in worker_nodes if node is not None}):
+        worker_ids = [i for i, value in enumerate(worker_nodes) if value == node]
+        for _round in range(target):
+            for worker_id in worker_ids:
+                if (
+                    len(reservations[worker_id]) >= target
+                    or int(assigned_groups) >= int(max_assignable_groups)
+                ):
+                    continue
+                selected_pos = next(
+                    (
+                        pos for pos, group in enumerate(unused)
+                        if group_nodes.get(tuple(int(cpu) for cpu in group)) == int(node)
+                    ),
+                    None,
+                )
+                if selected_pos is None:
+                    break
+                reservations[worker_id].append(unused.pop(int(selected_pos)))
+                assigned_groups += 1
+
+    # Resolve unmapped GPUs and local shortages from the remaining globally disjoint cores.
+    for _round in range(target):
+        for worker_id in range(n):
+            if (
+                len(reservations[worker_id]) >= target
+                or not unused
+                or int(assigned_groups) >= int(max_assignable_groups)
+            ):
+                continue
+            reservations[worker_id].append(unused.pop(0))
+            assigned_groups += 1
+
+    flattened: List[List[int]] = []
+    for worker_id, groups in enumerate(reservations):
+        cpus = _flatten_physical_core_groups(groups)
+        flattened.append(cpus)
+        locality = (
+            f'node {worker_nodes[worker_id]}'
+            if worker_nodes[worker_id] is not None else 'NUMA node unresolved'
+        )
+        if len(groups) < target:
+            print(
+                f'Warning: [affinity] gpu-worker {worker_id} (token {worker_tokens[worker_id]}) '
+                f'received {len(groups)}/{target} dedicated physical core(s); allocation exhausted.'
+            )
+        print(
+            f'[affinity] gpu-worker {worker_id} (token {worker_tokens[worker_id]}): '
+            f'{len(groups)} dedicated {"physical" if exact_topology else "logical"} core(s), '
+            f'{len(cpus)} logical CPU(s), preferred {locality}; cpu_mask={cpus}'
+        )
+    return flattened
+
+
 def plan_gpu_worker_affinity(
     worker_tokens: Sequence[str],
     excluded_cpus: Optional[Sequence[int]] = None,
+    reserved_cpus_by_worker: Optional[Sequence[Sequence[int]]] = None,
 ) -> List[Optional[List[int]]]:
-    """Per-worker CPU pin sets; None entries stay unpinned.
+    """Per-worker CPU masks with exclusive feeder cores plus topology-local helpers.
 
- Discovery-driven — no GPU<->socket balance or fixed NUMA node is assumed. GPUs and allocated cpus are each
- bucketed by measured NUMA node and every node's PHYSICAL cores are split evenly among ITS
- OWN workers (the first remainder workers receive one extra core), so SMT siblings are never assigned to
- different workers. Representatives are listed before their SMT siblings. A node whose
- per-worker PHYSICAL-core share is below YOLO_TTA_NUMA_WORKER_MIN_CORES gives each of its
- workers the whole (overlapping) node instead of a starved slice."""
+    Dedicated feeder CPUs are removed from every shared/helper pool and added back only to
+    their owning worker.  With NUMA pinning active, the remaining physical cores on a GPU's
+    measured node are split among that node's workers.  Without NUMA discovery, workers share
+    the non-reserved allocation while retaining mutually exclusive feeder masks.
+    """
     n = len(worker_tokens)
     plan: List[Optional[List[int]]] = [None] * n
-    if n == 0 or not (numa_enabled() and numa_worker_pin_enabled()):
+    if n == 0:
         return plan
-    topo = numa_topology()
+    reserved: List[List[int]] = [
+        [int(cpu) for cpu in (reserved_cpus_by_worker[i] if reserved_cpus_by_worker and i < len(reserved_cpus_by_worker) else ())]
+        for i in range(n)
+    ]
+    all_reserved = {int(cpu) for values in reserved for cpu in values}
+    excluded = {int(cpu) for cpu in (excluded_cpus or ())} | all_reserved
+
+    try:
+        allowed_all = {int(cpu) for cpu in os.sched_getaffinity(0)}
+    except Exception:
+        allowed_all = set(range(max(1, int(_cpu_count()))))
+    shared_allowed = sorted(int(cpu) for cpu in (allowed_all - excluded))
+
+    topo = numa_topology() if (numa_enabled() and numa_worker_pin_enabled()) else None
     if topo is None:
-        print('[numa] worker pinning inactive: NUMA topology not discoverable')
+        if numa_enabled() and numa_worker_pin_enabled():
+            print('[numa] topology-local helper pinning inactive: NUMA topology not discoverable')
+        for i in range(n):
+            combined = list(dict.fromkeys([*reserved[i], *shared_allowed]))
+            plan[i] = combined or None
+            print(
+                f'[affinity] gpu-worker {i} (token {worker_tokens[i]}): '
+                f'dedicated={len(reserved[i])} logical CPU(s), shared helpers={len(shared_allowed)}; '
+                f'NUMA-local split unavailable.'
+            )
         return plan
-    excluded = {int(cpu) for cpu in (excluded_cpus or ())}
+
     node_cpus_raw: Dict[int, set] = topo['node_cpus']  # type: ignore[assignment]
     node_cpus: Dict[int, set] = {
         int(node): {int(cpu) for cpu in cpus if int(cpu) not in excluded}
         for node, cpus in node_cpus_raw.items()
     }
     node_of: List[Optional[int]] = []
-    physical_cores_in_plan: List[Optional[int]] = [None] * n
+    helper_groups_by_worker: List[List[List[int]]] = [[] for _ in range(n)]
     by_node: Dict[int, List[int]] = {}
     for i, tok in enumerate(worker_tokens):
         node = _resolve_gpu_numa_node(str(tok), topo)
         node_of.append(node)
         if node is not None and node in node_cpus:
             by_node.setdefault(int(node), []).append(i)
+
     min_cores = max(1, _env_int('YOLO_TTA_NUMA_WORKER_MIN_CORES', 4))
     for node, idxs in sorted(by_node.items()):
         core_groups = _physical_core_cpu_groups(sorted(node_cpus[int(node)]))
         if core_groups is None:
             print(
                 f'Warning: [numa] node {int(node)} thread_siblings_list topology is unavailable '
-                'or inconsistent; its GPU workers remain unpinned.'
+                'or inconsistent; its workers receive the shared non-reserved helper pool.'
             )
             continue
         physical_share = len(core_groups) // len(idxs)
         if physical_share < min_cores:
-            whole_node = _flatten_physical_core_groups(core_groups)
             for i in idxs:
-                plan[i] = list(whole_node)
-                physical_cores_in_plan[i] = int(len(core_groups))
+                helper_groups_by_worker[i] = [list(group) for group in core_groups]
             continue
         q, r = divmod(len(core_groups), len(idxs))
         pos = 0
         for j, i in enumerate(idxs):
             count = int(q + (1 if j < r else 0))
-            owned = core_groups[pos:pos + count]
+            helper_groups_by_worker[i] = [list(group) for group in core_groups[pos:pos + count]]
             pos += count
-            plan[i] = _flatten_physical_core_groups(owned)
-            physical_cores_in_plan[i] = int(len(owned))
+
     for i, tok in enumerate(worker_tokens):
-        cpus_i = plan[i]
-        if cpus_i is not None:
-            print(
-                f'[numa] gpu-worker {i} (token {tok}): node {node_of[i]}, '
-                f'{int(physical_cores_in_plan[i] or 0)} physical core(s), {len(cpus_i)} logical cpu(s)'
+        helpers = _flatten_physical_core_groups(helper_groups_by_worker[i])
+        if not helpers:
+            # A resolved node can still have too few remaining cores for a clean split, or
+            # thread_siblings discovery can fail after feeder removal. Fall back to that
+            # node's non-reserved CPUs, then to the global non-reserved pool. No worker can
+            # enter another GPU's dedicated feeder set.
+            node_local = (
+                sorted(int(cpu) for cpu in node_cpus.get(int(node_of[i]), set()))
+                if node_of[i] is not None else []
             )
-        else:
-            reason = 'gpu node unresolved' if node_of[i] is None else f'node {node_of[i]} holds no allocated cpus'
-            print(f'[numa] gpu-worker {i} (token {tok}): unpinned ({reason})')
+            helpers = node_local or list(shared_allowed)
+        combined = list(dict.fromkeys([*reserved[i], *helpers]))
+        plan[i] = combined or None
+        print(
+            f'[affinity] gpu-worker {i} (token {tok}): node={node_of[i]}, '
+            f'dedicated={len(reserved[i])} logical CPU(s), helper={len(helpers)} logical CPU(s), '
+            f'total_mask={len(combined)}.'
+        )
     return plan
 
 
@@ -2273,6 +2431,7 @@ def _distribute_integer_budget(total: int, capacities: Sequence[int]) -> List[in
 def plan_openvino_cpu_instances(
     requested_instances: Optional[int],
     requested_threads: Optional[int],
+    excluded_cpus: Optional[Sequence[int]] = None,
 ) -> List[CpuInferenceInstancePlan]:
     """Build socket-local CPU process masks for a non-SNC topology.
 
@@ -2280,16 +2439,24 @@ def plan_openvino_cpu_instances(
     decode, and output. An explicit --cpu_threads value is a whole-job logical-thread budget
     and may consume that reserve.
     """
+    excluded = {int(cpu) for cpu in (excluded_cpus or ())}
     try:
-        allowed_cpus = sorted(int(cpu) for cpu in os.sched_getaffinity(0))
+        allowed_cpus = sorted(
+            int(cpu) for cpu in os.sched_getaffinity(0) if int(cpu) not in excluded
+        )
     except Exception:
-        allowed_cpus = list(range(max(1, int(_cpu_count()))))
+        allowed_cpus = [
+            int(cpu) for cpu in range(max(1, int(_cpu_count()))) if int(cpu) not in excluded
+        ]
+    if not allowed_cpus:
+        raise RuntimeError('No CPUs remain for OpenVINO after dedicated GPU feeder reservations')
     topo = numa_topology()
     node_entries: List[Tuple[int, List[List[int]]]] = []
     if topo is not None:
         node_map: Dict[int, set] = topo['node_cpus']  # type: ignore[assignment]
         for node, cpus in sorted(node_map.items()):
-            groups = _physical_core_cpu_groups(sorted(int(cpu) for cpu in cpus))
+            eligible_cpus = sorted(int(cpu) for cpu in cpus if int(cpu) not in excluded)
+            groups = _physical_core_cpu_groups(eligible_cpus)
             if groups:
                 node_entries.append((int(node), groups))
     if not node_entries:
@@ -4206,10 +4373,11 @@ def set_interpolation_process_executor(executor: Optional[ProcessPoolExecutor], 
 
 
 #
-# Idle CUDA workers as auxiliary interpolation hosts
+# Warm CUDA workers as post-inference auxiliary interpolation hosts
 #
-# Workers remain alive as their inference leases drain. Individually idle interpreters provide
-# additional GILs for interpolation before the scheduler falls back to the dedicated process pool.
+# Workers remain alive after the global inference queue drains. Their already-started Python
+# interpreters then provide additional GILs for interpolation without ever delaying a future CUDA
+# inference lease; before global drain, the dedicated interpolation process pool is used instead.
 
 
 def gpu_worker_aux_interpolation_enabled() -> bool:
@@ -4217,12 +4385,12 @@ def gpu_worker_aux_interpolation_enabled() -> bool:
 
 
 class _GpuWorkerAuxInterpolationPool:
-    """Route interpolation passes to explicitly leased idle GPU workers.
+    """Route post-drain interpolation passes to explicitly leased warm GPU workers.
 
-    Each worker owns a targeted task queue.  The scheduler leases only workers with no
-    assigned inference task, and revokes that lease before dispatching new inference.
-    Submission is non-blocking; when every lease is busy or revoked the caller uses the
-    dedicated interpolation process pool instead.
+    Each worker owns a targeted task queue. The scheduler exposes no lease until every inference
+    result has been collected, so an auxiliary pass can never occupy an interpreter that may need
+    to feed CUDA again. Submission remains non-blocking; unavailable workers fall back to the
+    dedicated interpolation process pool.
     """
 
     def __init__(self, task_queues: Dict[int, object]) -> None:
@@ -4257,8 +4425,8 @@ class _GpuWorkerAuxInterpolationPool:
                 self._announced = True
         if announce:
             print(
-                'GPU-worker auxiliary interpolation leases active: individually idle CUDA '
-                'workers may run interpolation until their inference lease is revoked.'
+                'GPU-worker auxiliary interpolation leases active after global inference drain: '
+                'warm CUDA-worker interpreters may now run tail interpolation.'
             )
         return True
 
@@ -19226,7 +19394,8 @@ def run_prediction_volume_in_worker(
             'd1_backprojected_task_slices', 'd1_bitset_words',
             'd1_view_compute_seconds', 'd1_layer_ref', 'd1_cvol_stats',
             'd1_publication_seconds', 'd1_nonempty_task_slices',
-            'd1_scanned_bbox_pixels',
+            'd1_scanned_bbox_pixels', 'd1_view_shadow_path',
+            'd1_view_shadow_format', 'd1_view_shadow_stats',
         ):
             if d1_key in stats:
                 public_stats[d1_key] = stats[d1_key]
@@ -21109,22 +21278,22 @@ def label_foreground_volume_streaming(
     if sparse_enabled:
         logical_gib = array_nbytes((z_dim, h, w), label_dtype) / GIB
         print(
-            f'Interpolation label workspace: sparse per-slice arena '
+            f'3D topology label workspace: sparse per-slice arena '
             f'(dense logical size {logical_gib:.1f} GiB, dtype={label_dtype.name})'
         )
         labels_store: object = SparseSliceLabelStore((z_dim, h, w), label_dtype)
     elif use_in_memory:
-        print(f"Interpolation label workspace: in-memory ({budget}, dtype={label_dtype.name})")
+        print(f"3D topology label workspace: in-memory ({budget}, dtype={label_dtype.name})")
         labels_store = np.zeros((z_dim, h, w), dtype=label_dtype)
     else:
         print(
-            f"Interpolation label workspace: disk-backed ({budget}, dtype={label_dtype.name}) "
+            f"3D topology label workspace: disk-backed ({budget}, dtype={label_dtype.name}) "
             f"-> {work_prefix.parent}"
         )
         labels_store = np.memmap(provisional_path, dtype=label_dtype, mode='w+', shape=(z_dim, h, w))
         label_paths = [provisional_path]
     if not sparse_enabled:
-        numa_interleave_memory(labels_store, desc='Interpolation label store')  #
+        numa_interleave_memory(labels_store, desc='3D topology label store')  #
 
     if int(z_dim) <= 0:
         flush_array(labels_store)
@@ -21300,7 +21469,7 @@ def label_foreground_volume_streaming(
             int(z_dim),
             _label_slice_local,
             max_workers=label_workers,
-            desc='Interpolation: 2D slice labeling',
+            desc='3D topology: 2D slice labeling',
             show_progress=True,
             target_chunks_per_worker=2,
         )
@@ -21312,7 +21481,7 @@ def label_foreground_volume_streaming(
         logical_bytes = max(1, array_nbytes((z_dim, h, w), label_dtype))
         pct = 100.0 * float(int(labels_store.nbytes)) / float(logical_bytes)  # type: ignore[union-attr]
         print(
-            f'Interpolation sparse labels: {payload_gib:.3f} GiB packed '
+            f'3D topology sparse labels: {payload_gib:.3f} GiB packed '
             f'({pct:.2f}% of dense local-id raster)'
         )
 
@@ -21707,7 +21876,7 @@ def label_foreground_volume_streaming(
     kernel_done = False
     if compiled_topology_kernels_enabled() and _numba_compact_relabel_kernel is not None:
         try:
-            print('Interpolation: compact relabel via numba nogil kernel')
+            print('3D topology: compact relabel via numba nogil kernel')
             _numba_compact_relabel_kernel(
                 np.asarray(labels_store),
                 lut_flat,
@@ -21717,7 +21886,7 @@ def label_foreground_volume_streaming(
             )
             kernel_done = True
         except Exception as exc:
-            print(f'Interpolation: numba compact relabel unavailable ({exc}); using the thread pool.')
+            print(f'3D topology: numba compact relabel unavailable ({exc}); using the thread pool.')
 
     if not kernel_done:
         compact_tasks: List[Tuple[int, int, int, int, int]] = []
@@ -21743,7 +21912,7 @@ def label_foreground_volume_streaming(
         if compact_tasks:
             pending = max(compact_workers, compact_workers * 8)
             if compact_workers <= 1:
-                for task_idx in tqdm(range(len(compact_tasks)), desc='Interpolation: compact relabel'):
+                for task_idx in tqdm(range(len(compact_tasks)), desc='3D topology: compact relabel'):
                     _compact_block(int(task_idx))
             else:
                 for _rows_done in tqdm(
@@ -21754,7 +21923,7 @@ def label_foreground_volume_streaming(
                         max_pending=pending,
                     ),
                     total=len(compact_tasks),
-                    desc='Interpolation: compact relabel',
+                    desc='3D topology: compact relabel',
                 ):
                     pass
 
@@ -33523,6 +33692,119 @@ class IncrementalRawBBoxMaskStoreWriter:
             self._min_x = min(int(self._min_x), x0)
             self._max_x = max(int(self._max_x), int(x1) - 1)
 
+    def consume_sparse_slice(
+        self,
+        z: int,
+        y0: int,
+        y1: int,
+        x0: int,
+        x1: int,
+        crop: np.ndarray,
+    ) -> None:
+        """Append one already-bounded slice crop without constructing a dense plane."""
+        z_i = int(z)
+        y0_i, y1_i, x0_i, x1_i = int(y0), int(y1), int(x0), int(x1)
+        if not (0 <= z_i < int(self.shape[0])):
+            raise IndexError(f'{self.desc}: sparse slice {z_i} is outside {self.shape[0]} slices')
+        if not (
+            0 <= y0_i <= y1_i <= int(self.shape[1])
+            and 0 <= x0_i <= x1_i <= int(self.shape[2])
+        ):
+            raise ValueError(
+                f'{self.desc}: sparse bbox {(y0_i, y1_i, x0_i, x1_i)} is outside {self.shape}'
+            )
+        crop_arr = np.ascontiguousarray(np.asarray(crop, dtype=np.uint8))
+        if tuple(int(v) for v in crop_arr.shape) != (int(y1_i - y0_i), int(x1_i - x0_i)):
+            raise ValueError(
+                f'{self.desc}: sparse crop shape {tuple(crop_arr.shape)} does not match '
+                f'bbox {(y0_i, y1_i, x0_i, x1_i)}'
+            )
+
+        with self._lock:
+            if self._failed_reason is not None:
+                return
+            if self._finalized:
+                raise RuntimeError(f'{self.desc}: sparse slice arrived after finalization')
+            self._active_callbacks += 1
+        try:
+            tight_x, tight_y, tight_w, tight_h = (int(v) for v in cv2.boundingRect(crop_arr))
+            if int(tight_w) <= 0 or int(tight_h) <= 0:
+                self.consume_empty_range(int(z_i), 1)
+                return
+            x0_t = int(x0_i + tight_x)
+            y0_t = int(y0_i + tight_y)
+            x1_t = int(x0_t + tight_w)
+            y1_t = int(y0_t + tight_h)
+            tight_crop = crop_arr[
+                int(tight_y):int(tight_y + tight_h),
+                int(tight_x):int(tight_x + tight_w),
+            ]
+            payload_nbytes = int(tight_h) * int(tight_w)
+            encoded_row_width = (
+                int((int(tight_w) + 7) // 8)
+                if bool(self._packbits_payload) else int(tight_w)
+            )
+            payload_size = int(tight_h) * int(encoded_row_width)
+
+            with self._lock:
+                if self._failed_reason is not None:
+                    return
+                if int(self._slice_state[z_i]) != 0:
+                    raise ValueError(f'{self.desc}: projected slice {z_i} was delivered more than once')
+                if self._fd is None:
+                    raise RuntimeError(f'{self.desc}: chunks payload is already closed')
+                fd = int(self._fd)
+                offset = int(self._next_offset)
+                self._next_offset += int(payload_size)
+                self._slice_state[z_i] = np.uint8(1)
+
+            foreground_voxels = 0
+            rows_per_slab = max(1, int((1 * 1024 * 1024) // max(1, int(tight_w))))
+            for local_y0 in range(0, int(tight_h), int(rows_per_slab)):
+                local_y1 = min(int(tight_h), int(local_y0) + int(rows_per_slab))
+                slab_u8 = np.ascontiguousarray(
+                    tight_crop[int(local_y0):int(local_y1), :] != 0,
+                    dtype=np.uint8,
+                )
+                foreground_voxels += int(np.count_nonzero(slab_u8))
+                encoded_slab = (
+                    np.packbits(slab_u8, axis=1, bitorder='little')
+                    if bool(self._packbits_payload) else slab_u8
+                )
+                self._pwrite_all(
+                    fd,
+                    memoryview(np.ascontiguousarray(encoded_slab)).cast('B'),
+                    int(offset) + int(local_y0) * int(encoded_row_width),
+                )
+
+            with self._lock:
+                if self._failed_reason is not None:
+                    return
+                rec = self.index[z_i]
+                rec['kind'] = np.uint8(1)
+                rec['offset'] = np.uint64(offset)
+                rec['payload_size'] = np.uint64(payload_size)
+                rec['y0'] = np.uint32(y0_t)
+                rec['x0'] = np.uint32(x0_t)
+                rec['y1'] = np.uint32(y1_t)
+                rec['x1'] = np.uint32(x1_t)
+                rec['payload_nbytes'] = np.uint64(payload_nbytes)
+                self._slice_state[z_i] = np.uint8(2)
+                self._nonempty_slices += 1
+                self._foreground_voxels += int(foreground_voxels)
+                self._min_t = min(int(self._min_t), z_i)
+                self._max_t = max(int(self._max_t), z_i)
+                self._min_y = min(int(self._min_y), y0_t)
+                self._max_y = max(int(self._max_y), int(y1_t) - 1)
+                self._min_x = min(int(self._min_x), x0_t)
+                self._max_x = max(int(self._max_x), int(x1_t) - 1)
+        except Exception as exc:
+            self.abort(exc)
+            raise
+        finally:
+            with self._lock:
+                self._active_callbacks -= 1
+
     def consume(self, z0: int, block: np.ndarray) -> None:
         block_arr = np.asarray(block)
         if block_arr.ndim != 3:
@@ -34052,6 +34334,47 @@ class RawBBoxMaskStore:
         shutil.rmtree(self.root, ignore_errors=True)
 
 
+def materialize_raw_bbox_mask_store_workspace(
+    store_path: Path,
+    out_path: Path,
+    *,
+    desc: str,
+    workers: int,
+) -> np.ndarray:
+    """Decode a sparse raw-bbox store into one path-backed uint8 workspace."""
+    store = RawBBoxMaskStore.open(Path(store_path), mmap_payload=True)
+    workspace: Optional[np.ndarray] = None
+    try:
+        workspace = allocate_workspace_array(
+            shape=tuple(int(v) for v in store.shape),
+            dtype=np.uint8,
+            path=Path(out_path),
+            desc=str(desc),
+            prefer_memory=False,
+            prefer_memfd=False,
+            initialize_zero=False,
+        )
+
+        def _decode(idx: int) -> None:
+            store.fill_decoded_slice_into(int(idx), workspace[int(idx)])
+
+        parallel_for_indices_chunked(
+            int(store.shape[0]),
+            _decode,
+            max_workers=choose_slice_parallel_workers(int(workers), int(store.shape[0])),
+            desc=f'{desc}: sparse decode',
+            show_progress=False,
+            target_chunks_per_worker=2,
+        )
+        flush_array(workspace)
+        return workspace
+    except BaseException:
+        close_memmap_array_without_flush(workspace)
+        raise
+    finally:
+        store.close()
+
+
 def _encode_bool_mask_slice_payload(
     idx: int,
     mask_bool: np.ndarray,
@@ -34463,6 +34786,9 @@ class _D1WorkerViewState:
     angle_sin: object
     store_dir: Path
     created_at: float
+    view_shadow_writer: Optional[IncrementalRawBBoxMaskStoreWriter] = None
+    view_shadow_store_dir: Optional[Path] = None
+    view_shadow_shape: Optional[Tuple[int, int, int]] = None
 
 
 _D1_WORKER_VIEW_STATES: Dict[Tuple[str, str], _D1WorkerViewState] = {}
@@ -34496,6 +34822,13 @@ def _shutdown_d1_worker_pipeline() -> None:
             state.bitset = None
         except Exception:
             pass
+        shadow_writer = state.view_shadow_writer
+        state.view_shadow_writer = None
+        if shadow_writer is not None:
+            try:
+                shadow_writer.discard()
+            except Exception:
+                pass
     executor = _D1_PUBLICATION_EXECUTOR
     _D1_PUBLICATION_EXECUTOR = None
     _D1_PUBLICATION_SEMAPHORE = None
@@ -34560,6 +34893,22 @@ def _d1_get_or_create_state(task: Dict[str, object], accumulator: '_DeviceUnionA
     if not raw_store_dir:
         raise ValueError(f'D1 task {task.get("task_id")} has no cvol store path')
     store_dir = Path(raw_store_dir)
+    raw_shadow_dir = str(task.get('d1_view_shadow_store_dir', '') or '').strip()
+    shadow_store_dir = Path(raw_shadow_dir) if raw_shadow_dir else None
+    shadow_shape_raw = tuple(int(v) for v in task.get('d1_view_shadow_shape', ()))
+    shadow_shape: Optional[Tuple[int, int, int]] = None
+    if shadow_store_dir is not None:
+        if len(shadow_shape_raw) != 3 or any(int(v) <= 0 for v in shadow_shape_raw):
+            raise ValueError(
+                f'D1 task {task.get("task_id")} has invalid view-shadow shape {shadow_shape_raw}'
+            )
+        shadow_shape = (
+            int(shadow_shape_raw[0]), int(shadow_shape_raw[1]), int(shadow_shape_raw[2]),
+        )
+        if int(shadow_shape[0]) != int(view.num_slices):
+            raise ValueError(
+                f'D1 view-shadow depth {shadow_shape[0]} != view depth {view.num_slices}'
+            )
 
     with _D1_WORKER_VIEW_LOCK:
         existing = _D1_WORKER_VIEW_STATES.get(key)
@@ -34568,6 +34917,12 @@ def _d1_get_or_create_state(task: Dict[str, object], accumulator: '_DeviceUnionA
                 raise RuntimeError(
                     f'D1 owner state {key} output shape changed '
                     f'{existing.output_shape} -> {output_shape}'
+                )
+            if existing.view_shadow_store_dir != shadow_store_dir or existing.view_shadow_shape != shadow_shape:
+                raise RuntimeError(
+                    f'D1 owner state {key} view-shadow contract changed '
+                    f'{existing.view_shadow_store_dir}/{existing.view_shadow_shape} -> '
+                    f'{shadow_store_dir}/{shadow_shape}'
                 )
             return existing
         if _D1_WORKER_VIEW_STATES:
@@ -34606,6 +34961,22 @@ def _d1_get_or_create_state(task: Dict[str, object], accumulator: '_DeviceUnionA
         else:
             angle_cos = kernels.cp.asarray(np.ones((1,), dtype=np.float32))
             angle_sin = kernels.cp.asarray(np.zeros((1,), dtype=np.float32))
+        shadow_writer: Optional[IncrementalRawBBoxMaskStoreWriter] = None
+        if shadow_store_dir is not None and shadow_shape is not None:
+            shadow_writer = IncrementalRawBBoxMaskStoreWriter(
+                shape=shadow_shape,
+                store_dir=shadow_store_dir,
+                format_name=INTERNAL_PACKED_CVOL_FORMAT,
+                desc=f'D1 view-native shadow {key[0]}/{key[1]}',
+                force_path_backed=True,
+                extra_meta={
+                    'producer': 'v17.0.5_d1_sparse_view_shadow',
+                    'purpose': 'interpolation_and_tile_parent_compatibility',
+                    'physical_view': physical_view_name(view),
+                    'tta_aug_id': str(view.tta_aug_id),
+                    'tta_angle_deg': float(view.tta_angle_deg),
+                },
+            )
         state = _D1WorkerViewState(
             key=key,
             view=view,
@@ -34616,6 +34987,9 @@ def _d1_get_or_create_state(task: Dict[str, object], accumulator: '_DeviceUnionA
             angle_sin=angle_sin,
             store_dir=store_dir,
             created_at=time.perf_counter(),
+            view_shadow_writer=shadow_writer,
+            view_shadow_store_dir=shadow_store_dir,
+            view_shadow_shape=shadow_shape,
         )
         _D1_WORKER_VIEW_STATES[key] = state
         if not _D1_PIPELINE_ANNOUNCED:
@@ -34628,7 +35002,8 @@ def _d1_get_or_create_state(task: Dict[str, object], accumulator: '_DeviceUnionA
         print(
             f'D1 owner state opened for {key[0]}/{key[1]} on {accumulator.device}: '
             f'{word_count:,} uint32 words ({bitset_bytes / GIB:.2f} GiB), '
-            f'output_shape={output_shape}.'
+            f'output_shape={output_shape}, '
+            f'view_shadow={str(shadow_store_dir) if shadow_store_dir is not None else "disabled"}.'
         )
         return state
 
@@ -34873,6 +35248,70 @@ def _d1_consume_device_union(
         scanned_bbox_pixels += int(bbox_pixels)
         nonempty_slices += 1
     stream.synchronize()
+    shadow_writer = state.view_shadow_writer
+    if shadow_writer is not None:
+        crop_specs: Dict[int, Tuple[int, int, int, int, int, int]] = {}
+        crop_device_parts: List[object] = []
+        packed_size = 0
+        for local_slice in np.flatnonzero(slice_any):
+            local_i = int(local_slice)
+            global_slice = int(s0 + local_i)
+            y0, y1, x0, x1 = (int(v) for v in slice_bboxes[local_i])
+            y0 = max(0, min(int(mask_shape[1]), y0))
+            y1 = max(y0, min(int(mask_shape[1]), y1))
+            x0 = max(0, min(int(mask_shape[2]), x0))
+            x1 = max(x0, min(int(mask_shape[2]), x1))
+            size = int(y1 - y0) * int(x1 - x0)
+            if size <= 0:
+                raise RuntimeError(
+                    f'D1 view shadow received nonempty slice {global_slice} with empty bbox '
+                    f'{(y0, y1, x0, x1)}'
+                )
+            crop_specs[local_i] = (
+                int(global_slice), int(y0), int(y1), int(x0), int(x1), int(size),
+            )
+            crop_device_parts.append(
+                mask_cp[local_i, int(y0):int(y1), int(x0):int(x1)].reshape(-1)
+            )
+            packed_size += int(size)
+
+        if crop_device_parts:
+            packed_device = (
+                crop_device_parts[0]
+                if len(crop_device_parts) == 1
+                else cp.concatenate(crop_device_parts)
+            )
+            packed_host = np.ascontiguousarray(cp.asnumpy(packed_device), dtype=np.uint8)
+            del packed_device
+        else:
+            packed_host = np.empty((0,), dtype=np.uint8)
+        del crop_device_parts
+        if int(packed_host.size) != int(packed_size):
+            raise RuntimeError(
+                f'D1 packed view-shadow transfer produced {int(packed_host.size)} byte(s), '
+                f'expected {int(packed_size)}'
+            )
+
+        cursor = 0
+        for local_slice in range(int(count)):
+            spec = crop_specs.get(int(local_slice))
+            if spec is None:
+                shadow_writer.consume_empty_range(int(s0 + local_slice), 1)
+                continue
+            global_slice, y0, y1, x0, x1, size = spec
+            shadow_writer.consume_sparse_slice(
+                int(global_slice), int(y0), int(y1), int(x0), int(x1),
+                packed_host[int(cursor):int(cursor + size)].reshape(
+                    (int(y1 - y0), int(x1 - x0)),
+                ),
+            )
+            cursor += int(size)
+        if int(cursor) != int(packed_host.size):
+            raise RuntimeError(
+                f'D1 packed view-shadow cursor {int(cursor)} != payload {int(packed_host.size)}'
+            )
+        runtime_telemetry().add('d1.view_shadow_packed_d2h_bytes', int(packed_host.nbytes))
+        del packed_host, crop_specs
     state.coverage[s0:s1] = True
     covered = int(np.count_nonzero(state.coverage))
     complete = bool(covered == int(view.num_slices))
@@ -34892,9 +35331,22 @@ def _d1_consume_device_union(
         'd1_backprojected_task_slices': int(count),
         'd1_nonempty_task_slices': int(nonempty_slices),
         'd1_scanned_bbox_pixels': int(scanned_bbox_pixels),
+        'slice_meta': slice_meta,
     }
     if not complete:
         return result
+
+    if state.view_shadow_writer is not None:
+        shadow_stats = dict(state.view_shadow_writer.finalize())
+        state.view_shadow_writer = None
+        result['d1_view_shadow_path'] = str(state.view_shadow_store_dir)
+        result['d1_view_shadow_format'] = INTERNAL_PACKED_CVOL_FORMAT
+        result['d1_view_shadow_stats'] = shadow_stats
+        print(
+            f'D1 sparse view shadow complete for {state.key[0]}/{state.key[1]}: '
+            f'{int(shadow_stats.get("nonempty_slices", 0))}/{int(view.num_slices)} nonempty '
+            f'slice(s), payload={int(shadow_stats.get("raw_payload_bytes", 0)) / GIB:.3f} GiB.'
+        )
 
     # One D2H at view completion; sparse cvol construction proceeds on an independent CPU
     # publication credit while this GPU immediately accepts the next owner view.
@@ -35934,8 +36386,12 @@ def prepare_view_volume_after_fullframe(
     fuse_radial_component_layers: bool = False,
     parent_mask_ready_callback: Optional[Callable[[str, str, object], None]] = None,
     internal_final_layer_enabled: bool = False,
+    preinterpolation_layer_already_published: bool = False,
 ) -> PreparedViewResult:
     baseline_native_volume = union_mm
+    d1_delta_only = bool(preinterpolation_layer_already_published)
+    d1_additions_mm: Optional[np.ndarray] = None
+    d1_additions_path: Optional[Path] = None
     nrrd_layers: List[NrrdLayerRef] = []
     parent_mask_support_mm: Optional[object] = None
     parent_bridge_support_mm: Optional[object] = None
@@ -35946,6 +36402,7 @@ def prepare_view_volume_after_fullframe(
         and nrrd_layers_enabled
         and str(view.family) == 'radial'
         and not bool(dense_tiling_active)
+        and not bool(preinterpolation_layer_already_published)
     )
 
     # Device-union slice metadata is aggregated per view by the scheduler.
@@ -36001,7 +36458,24 @@ def prepare_view_volume_after_fullframe(
         except Exception:
             pass
 
-    if bool(nrrd_layers_enabled):
+    if bool(d1_delta_only):
+        d1_additions_path = (
+            temp_dir / 'd1_view_additions' / str(model_name)
+            / f'{str(view.name)}.u8.dat'
+        )
+        d1_additions_mm = allocate_workspace_array(
+            shape=tuple(int(v) for v in np.asarray(baseline_native_volume).shape),
+            dtype=np.uint8,
+            path=d1_additions_path,
+            desc=f'D1 delta-only continuation {model_name}/{view.name}',
+            prefer_memory=False,
+            prefer_memfd=False,
+            reserve_bytes=16 * GIB,
+            initialize_zero=True,
+        )
+        runtime_telemetry().add('d1.delta_continuation_volume_bytes', int(np.asarray(d1_additions_mm).nbytes))
+
+    if bool(nrrd_layers_enabled) and not bool(preinterpolation_layer_already_published):
         if not bool(fused_radial_components):
             layer_ref = materialize_nrrd_view_layer(
                 baseline_native_volume,
@@ -36067,7 +36541,10 @@ def prepare_view_volume_after_fullframe(
             # (bridge AND NOT pre-merge mask) to this path during its merge step, replacing
             # the old full-volume before-copy + subtract bookkeeping.
             pass_delta_path: Optional[Path] = None
-            if bool(nrrd_layers_enabled) and not bool(fused_radial_components):
+            if (
+                (bool(nrrd_layers_enabled) or bool(d1_delta_only))
+                and not bool(fused_radial_components)
+            ):
                 pass_delta_path = temp_dir / 'nrrd_work' / view.name / f'fullframe_bridge_pass{int(pass_idx):02d}.u8.dat'
 
             baseline_native_volume, stats_local = interpolate_view_volume_pass_maybe_process(
@@ -36104,7 +36581,7 @@ def prepare_view_volume_after_fullframe(
             })
             interpolation_stats.append(stats_local)
 
-            if bool(nrrd_layers_enabled) and pass_delta_path is not None:
+            if pass_delta_path is not None:
                 delta_reported = str(stats_local.get('bridge_delta_path', '') or '')
                 if delta_reported and Path(delta_reported).exists():
                     bridge_delta_mm = np.memmap(
@@ -36113,38 +36590,49 @@ def prepare_view_volume_after_fullframe(
                         mode='r',
                         shape=tuple(int(v) for v in np.asarray(baseline_native_volume).shape),
                     )
-                    layer_ref = materialize_nrrd_view_layer(
-                        bridge_delta_mm,
-                        model_name=str(model_name),
-                        view=view,
-                        source='fullframe',
-                        mask_kind='bridge',
-                        pass_index=int(pass_idx),
-                        stage='interpolation',
-                        description='Voxels added by this full-frame interpolation pass only.',
-                        temp_dir=temp_dir,
-                        workers=int(slice_workers),
-                        # the pass already counted its added voxels.
-                        known_has_foreground=int(stats_local.get('added_voxels', 0)) > 0,
-                        # interpolation computed these while forming the exact
-                        # delta. Radial projection consumes them without a strided rescan.
-                        known_row_occupancy=(
-                            np.asarray(stats_local.get('bridge_delta_row_occupancy'), dtype=bool)
-                            if (
-                                str(view.family) == 'radial'
-                                and stats_local.get('bridge_delta_row_occupancy') is not None
-                            ) else None
-                        ),
-                        known_slice_bboxes=(
-                            np.asarray(stats_local.get('bridge_delta_slice_bboxes'), dtype=np.int64)
-                            if (
-                                str(view.family) == 'radial'
-                                and stats_local.get('bridge_delta_slice_bboxes') is not None
-                            ) else None
-                        ),
-                    )
-                    if layer_ref is not None:
-                        nrrd_layers.append(layer_ref)
+                    if d1_additions_mm is not None:
+                        union_volume_into_volume(
+                            d1_additions_mm,
+                            bridge_delta_mm,
+                            workers=int(slice_workers),
+                            desc=(
+                                f'D1 delta-only full-frame bridge pass {int(pass_idx)} '
+                                f'{model_name}/{view.name}'
+                            ),
+                        )
+                    if bool(nrrd_layers_enabled):
+                        layer_ref = materialize_nrrd_view_layer(
+                            bridge_delta_mm,
+                            model_name=str(model_name),
+                            view=view,
+                            source='fullframe',
+                            mask_kind='bridge',
+                            pass_index=int(pass_idx),
+                            stage='interpolation',
+                            description='Voxels added by this full-frame interpolation pass only.',
+                            temp_dir=temp_dir,
+                            workers=int(slice_workers),
+                            # the pass already counted its added voxels.
+                            known_has_foreground=int(stats_local.get('added_voxels', 0)) > 0,
+                            # interpolation computed these while forming the exact
+                            # delta. Radial projection consumes them without a strided rescan.
+                            known_row_occupancy=(
+                                np.asarray(stats_local.get('bridge_delta_row_occupancy'), dtype=bool)
+                                if (
+                                    str(view.family) == 'radial'
+                                    and stats_local.get('bridge_delta_row_occupancy') is not None
+                                ) else None
+                            ),
+                            known_slice_bboxes=(
+                                np.asarray(stats_local.get('bridge_delta_slice_bboxes'), dtype=np.int64)
+                                if (
+                                    str(view.family) == 'radial'
+                                    and stats_local.get('bridge_delta_slice_bboxes') is not None
+                                ) else None
+                            ),
+                        )
+                        if layer_ref is not None:
+                            nrrd_layers.append(layer_ref)
                     close_memmap_array(bridge_delta_mm)
                 if not bool(keep_temp):
                     try:
@@ -36253,7 +36741,7 @@ def prepare_view_volume_after_fullframe(
 
     if bool(internal_final_layer_enabled) and not bool(dense_tiling_active):
         internal_ref = materialize_internal_final_view_layer(
-            baseline_native_volume,
+            (d1_additions_mm if d1_additions_mm is not None else baseline_native_volume),
             model_name=str(model_name),
             view=view,
             temp_dir=temp_dir,
@@ -36261,6 +36749,30 @@ def prepare_view_volume_after_fullframe(
         )
         if internal_ref is not None:
             nrrd_layers.append(internal_ref)
+
+    if bool(d1_delta_only):
+        if d1_additions_mm is None:
+            raise RuntimeError(
+                f'{model_name}/{view.name}: D1 continuation did not allocate its additions volume'
+            )
+        base_bytes = int(np.asarray(baseline_native_volume).nbytes)
+        close_memmap_array_without_flush(baseline_native_volume)
+        if (
+            not bool(keep_temp)
+            and union_path is not None
+            and not str(union_path).startswith('/proc/')
+        ):
+            try:
+                Path(union_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        baseline_native_volume = d1_additions_mm
+        print(
+            f'D1 delta-only continuation ready for {model_name}/{view.name}: '
+            f'released {base_bytes / GIB:.2f} GiB materialized base; final dense view now '
+            'contains only interpolation/tile additions because the source-space D1 base '
+            'was already published.'
+        )
 
     # Return the dense angle variant to the scheduler. When immutable component NRRD
     # references fully cover it, the scheduler may retire this canvas before physical-view
@@ -42467,61 +42979,156 @@ def main() -> None:
     gpu_worker_process_active = bool(gpu_inference_enabled)
     cpu_worker_process_active = bool(cpu_inference_enabled)
     inference_worker_process_active = bool(gpu_worker_process_active or cpu_worker_process_active)
+    try:
+        _allowed_main_cpus = {int(cpu) for cpu in os.sched_getaffinity(0)}
+    except Exception:
+        _allowed_main_cpus = set(range(max(1, int(_cpu_count()))))
+    gpu_logical_indices = [
+        int(str(device).split(':')[-1]) for device in backend_devices.gpu_devices
+    ]
+    _inherited_cvd_for_affinity = os.environ.get('CUDA_VISIBLE_DEVICES')
+    if _inherited_cvd_for_affinity is not None and gpu_logical_indices:
+        _visible_tokens_for_affinity = [
+            token.strip() for token in str(_inherited_cvd_for_affinity).split(',')
+            if token.strip()
+        ]
+        _bad_logical_indices = [
+            index for index in gpu_logical_indices
+            if int(index) < 0 or int(index) >= len(_visible_tokens_for_affinity)
+        ]
+        if _bad_logical_indices:
+            parser.error(
+                f'--device logical CUDA index(es) {_bad_logical_indices} are out of range for '
+                f'CUDA_VISIBLE_DEVICES={_inherited_cvd_for_affinity!r} '
+                f'({len(_visible_tokens_for_affinity)} visible device(s))'
+            )
+    try:
+        pinned_gpu_tokens = [
+            _pin_cuda_visible_device_token(int(idx)) for idx in gpu_logical_indices
+        ]
+    except RuntimeError as exc:
+        parser.error(str(exc))
+    gpu_feeder_core_plan: List[List[int]] = (
+        plan_gpu_feeder_core_reservations(pinned_gpu_tokens)
+        if gpu_worker_process_active else []
+    )
+    gpu_feeder_reserved_cpus = {
+        int(cpu) for values in gpu_feeder_core_plan for cpu in values
+    }
     cpu_instance_plans: List[CpuInferenceInstancePlan] = (
-        plan_openvino_cpu_instances(cpu_instances_requested, cpu_threads_requested)
+        plan_openvino_cpu_instances(
+            cpu_instances_requested,
+            cpu_threads_requested,
+            excluded_cpus=gpu_feeder_reserved_cpus,
+        )
         if cpu_worker_process_active else []
     )
     cpu_inference_reserved_cpus = {
         int(cpu) for plan in cpu_instance_plans for cpu in plan.cpus
     }
-    try:
-        _allowed_main_cpus = {int(cpu) for cpu in os.sched_getaffinity(0)}
-    except Exception:
-        _allowed_main_cpus = set(range(max(1, int(_cpu_count()))))
     hybrid_cpu_affinity_overlap_active = bool(
         gpu_worker_process_active
         and cpu_worker_process_active
         and hybrid_cpu_affinity_overlap_enabled()
     )
-    # OpenVINO remains pinned to its socket-local masks. In hybrid mode the parent and
-    # topology-local CUDA helper pools may share those logical CPUs because the measured
-    # non-inference workload is low-duty; exclusive isolation remains an opt-out mode.
+    # Dedicated feeder CPUs are always exclusive. OpenVINO remains socket-local; hybrid
+    # overlap only permits the parent and CUDA helper pools to share the non-feeder CPUs
+    # occupied by OpenVINO.
+    feeder_safe_parent_cpus = sorted(_allowed_main_cpus - gpu_feeder_reserved_cpus)
     main_process_reserved_cpus = sorted(
-        _allowed_main_cpus
+        (_allowed_main_cpus - gpu_feeder_reserved_cpus)
         if hybrid_cpu_affinity_overlap_active else
-        (_allowed_main_cpus - cpu_inference_reserved_cpus)
+        (_allowed_main_cpus - gpu_feeder_reserved_cpus - cpu_inference_reserved_cpus)
     )
-    main_process_affinity_restricted = False
+    if inference_worker_process_active and not main_process_reserved_cpus:
+        # An explicit OpenVINO thread request can consume every non-feeder CPU. Preserve
+        # feeder exclusivity and allow parent/OpenVINO overlap rather than leaving the parent
+        # with an invalid empty mask.
+        main_process_reserved_cpus = list(feeder_safe_parent_cpus)
+        print(
+            'Warning: [affinity] no CPU remained exclusively for parent work after the '
+            'OpenVINO request; parent threads will share non-feeder CPUs with OpenVINO.'
+        )
     parent_affinity_monitor_stop = threading.Event()
     parent_affinity_monitor_thread: Optional[threading.Thread] = None
     parent_affinity_monitor_errors: List[BaseException] = []
+    parent_affinity_lock = threading.Lock()
+    parent_applied_affinity_cpus: set[int] = set(_allowed_main_cpus)
 
-    def _apply_parent_inference_affinity(*, fail_fast: bool) -> bool:
-        nonlocal main_process_affinity_restricted
-        if main_process_affinity_restricted:
-            return True
-        if (
-            not cpu_worker_process_active
-            or not main_process_reserved_cpus
-            or set(int(cpu) for cpu in main_process_reserved_cpus) == set(_allowed_main_cpus)
-        ):
+    def _apply_parent_cpu_mask(
+        cpus: Sequence[int],
+        *,
+        fail_fast: bool,
+        phase_label: str,
+    ) -> bool:
+        nonlocal parent_applied_affinity_cpus
+        desired = {int(cpu) for cpu in cpus if int(cpu) in _allowed_main_cpus}
+        if not inference_worker_process_active:
             return False
-        if not _sched_setaffinity_all_threads(main_process_reserved_cpus):
+        if not desired:
             exc = RuntimeError(
-                'v17 could not isolate parent-process scheduler/render/output threads from '
-                f'OpenVINO CPU masks; requested parent mask={main_process_reserved_cpus}'
+                f'v17.0.5 cannot apply an empty parent CPU mask during {phase_label}'
             )
             if fail_fast:
                 raise exc
             parent_affinity_monitor_errors.append(exc)
             return False
-        main_process_affinity_restricted = True
+        with parent_affinity_lock:
+            if desired == parent_applied_affinity_cpus:
+                return True
+            if not _sched_setaffinity_all_threads(sorted(desired)):
+                exc = RuntimeError(
+                    'v17.0.5 could not apply the parent scheduler/render/output affinity '
+                    f'during {phase_label}; requested mask={sorted(desired)}'
+                )
+                if fail_fast:
+                    raise exc
+                parent_affinity_monitor_errors.append(exc)
+                return False
+            parent_applied_affinity_cpus = set(desired)
         print(
-            '[intel] Parent scheduler/render/output threads restricted to '
-            f'{len(main_process_reserved_cpus)} logical CPU(s) outside OpenVINO masks for '
-            'the inference phase.'
+            f'[affinity] Parent scheduler/render/output threads use {len(desired)} logical '
+            f'CPU(s) during {phase_label}; {len(gpu_feeder_reserved_cpus)} logical CPU(s) '
+            'remain exclusive to GPU feeders.'
         )
         return True
+
+    def _apply_parent_inference_affinity(*, fail_fast: bool) -> bool:
+        return _apply_parent_cpu_mask(
+            main_process_reserved_cpus,
+            fail_fast=bool(fail_fast),
+            phase_label='steady-state inference',
+        )
+
+    def _restore_parent_post_inference_affinity() -> None:
+        nonlocal parent_applied_affinity_cpus
+        parent_affinity_monitor_stop.set()
+        monitor = parent_affinity_monitor_thread
+        if monitor is not None and monitor is not threading.current_thread():
+            monitor.join(timeout=2.0)
+        with parent_affinity_lock:
+            if parent_applied_affinity_cpus == set(_allowed_main_cpus):
+                return
+            if not _sched_setaffinity_all_threads(sorted(_allowed_main_cpus)):
+                print(
+                    'Warning: could not restore the parent process to the full allocated CPU '
+                    f'mask after inference; requested mask={sorted(_allowed_main_cpus)}'
+                )
+                return
+            parent_applied_affinity_cpus = set(_allowed_main_cpus)
+        print(
+            f'[affinity] Parent CPU affinity restored to all {len(_allowed_main_cpus)} '
+            'allocated logical CPU(s) immediately after inference drain.'
+        )
+
+    if gpu_worker_process_active:
+        print(
+            f'[affinity] Dedicated GPU feeder reservation: '
+            f'{gpu_feeder_reserved_physical_cores()} physical core(s) per GPU requested; '
+            f'{len(gpu_feeder_reserved_cpus)} logical CPU(s) reserved across '
+            f'{len(gpu_feeder_core_plan)} worker(s). '
+            'YOLO_TTA_GPU_FEEDER_PHYSICAL_CORES adjusts the per-GPU reservation.'
+        )
 
     if cpu_worker_process_active:
         for plan in cpu_instance_plans:
@@ -42534,16 +43141,26 @@ def main() -> None:
             print(
                 f'[intel] Hybrid CPU-affinity overlap active: OpenVINO remains socket-local on '
                 f'{len(cpu_inference_reserved_cpus)} logical CPU(s), while parent/CUDA helper '
-                f'threads may share the full {len(_allowed_main_cpus)}-CPU allocation. GPU helper '
+                f'threads may share the {len(main_process_reserved_cpus)} non-feeder CPU(s). GPU helper '
                 "masks are still derived from each device's discovered NUMA node; no fixed node "
                 'is assumed. YOLO_TTA_HYBRID_CPU_AFFINITY_OVERLAP=0 restores exclusive masks.'
             )
         else:
             print(
-                f'[intel] OpenVINO reserves {len(cpu_inference_reserved_cpus)} logical CPU(s); '
-                f'{len(main_process_reserved_cpus)} logical CPU(s) remain outside those masks for '
-                'decode, GPU feeding, interpolation, scheduling, and output.'
+                f'[intel] OpenVINO reserves {len(cpu_inference_reserved_cpus)} logical CPU(s) '
+                f'outside the {len(gpu_feeder_reserved_cpus)} dedicated GPU-feeder logical CPU(s); '
+                f'{len(main_process_reserved_cpus)} shared logical CPU(s) remain for parent work.'
             )
+
+    if gpu_worker_process_active and gpu_feeder_reserved_cpus:
+        # Apply feeder exclusivity before decode, render-pool creation, or worker startup. The
+        # later steady-state mask may narrow this further to exclude OpenVINO, but no parent
+        # thread can run on another worker's four dedicated physical cores from this point on.
+        _apply_parent_cpu_mask(
+            feeder_safe_parent_cpus,
+            fail_fast=True,
+            phase_label='GPU worker startup and preprocessing',
+        )
 
     args.gpu_model = gpu_model_path
     args.cpu_model = cpu_model_path
@@ -42740,8 +43357,8 @@ def main() -> None:
         v1613_bundle_reasons.append('YOLO_TTA_V1613_FAST_BUNDLE=0')
     if not gpu_worker_process_active:
         v1613_bundle_reasons.append('CUDA worker processes inactive')
-    if int(args.interpolation_distance) != 0:
-        v1613_bundle_reasons.append('requires --interpolation_distance 0')
+    # v17.0.5 keeps D1 eligible with interpolation by retaining an exact packed
+    # view-native shadow for bridge planning while source-space publication remains authoritative.
     if float(args.min_conf) > 0.0:
         v1613_bundle_reasons.append('requires --min_conf 0')
     if float(args.min_radius) > 0.0:
@@ -42750,8 +43367,8 @@ def main() -> None:
         v1613_bundle_reasons.append('requires --batch 1')
     if str(retina_processor).strip().lower() != 'gpu':
         v1613_bundle_reasons.append('requires GPU retina processing')
-    if tile_configs:
-        v1613_bundle_reasons.append('dense tiles are not yet eligible')
+    # Dense tiles no longer disqualify D1: their parent/bridge gates consume the same exact
+    # packed view-native shadow used by interpolation.
     if str(channel_format.kind) != 'gray' or int(channel_format.channel_count) != 1:
         v1613_bundle_reasons.append('requires one-channel gray input')
     if not bool(save_nrrd_enabled):
@@ -43021,7 +43638,9 @@ def main() -> None:
             'slice metadata, D3 resident-proto closing, C1 runtime-sized leases, C2 '
             'compute/publication credit separation, C3 predicted-cost scheduling, and D1 '
             'project -> infer -> proto-close -> immediate owner-GPU backprojection -> '
-            'source-space sparse cvol publication. No dense host view union is allocated. '
+            'source-space sparse cvol publication. Commands with interpolation and/or tiles '
+            'retain an exact packed view-native shadow and materialize it only in the asynchronous '
+            'parent postprocess stage; the scheduler never owns a dense inference result. '
             'YOLO_TTA_V1613_FAST_BUNDLE=0 restores the compatibility paths.'
         )
     elif v1613_bundle_active:
@@ -43215,6 +43834,16 @@ def main() -> None:
             'A worker that cannot admit the source volume to VRAM will still use the completed-cube CPU path.'
         )
     spec_notes: List[str] = []
+    spec_notes.append(
+        'v17.0.5 GPU feed/D1 continuation patch: four whole physical feeder cores per CUDA '
+        'worker are topology-local and exclusive during inference; parent/OpenVINO/helper masks '
+        "exclude another worker's feeder cores and the parent reclaims the full allocation at "
+        'global drain. Auxiliary interpolation cannot borrow a CUDA worker interpreter before '
+        'that drain. D1 remains active with interpolation and dense tiles by publishing its '
+        'source-space base immediately, retaining one exact packed view-native shadow for parent '
+        'support, and backprojecting only interpolation/tile additions thereafter. The D1 '
+        'dispatch-window default remains two and topology backend auto-selection remains enabled.'
+    )
     spec_notes.append(
         'v17.0.4 interpolation resource patch: sparse-label packing releases source crops '
         'incrementally; interpolation planning and its component/SDF caches are byte-bounded; '
@@ -43676,7 +44305,11 @@ def main() -> None:
         # mode intentionally preserves the ordinary CUDA-side worker budget instead.
         parent_logical = max(1, int(len(main_process_reserved_cpus)))
         worker_budget = max(1, min(int(worker_budget), 2 * int(parent_logical)))
-    whole_box_worker_budget = int(default_worker_budget())
+    # Parent affinity is already narrowed to the non-feeder mask at this point, so
+    # ``default_worker_budget()`` would size the later tail from that temporary mask and
+    # fail to reclaim the four dedicated physical cores per GPU after inference drains.
+    # Preserve the original full SLURM/cpuset allocation explicitly for tail expansion.
+    whole_box_worker_budget = max(1, 2 * int(len(_allowed_main_cpus)))
     tail_budget_expansion_active = bool(tail_worker_budget_expansion_enabled())
     tail_worker_budget = int(whole_box_worker_budget if tail_budget_expansion_active else worker_budget)
     augmentation_workers = resolve_worker_count(
@@ -44665,11 +45298,22 @@ def main() -> None:
         if key in view_processing_submitted:
             return
         view_processing_submitted.add(key)
-        union_mm = baseline_union_by_model_view.pop(key)
-        confmap_mm = baseline_confmap_by_model_view.pop(key)
-        union_path = baseline_union_paths.pop(key)
-        confmap_path = baseline_confmap_paths.pop(key)
-        baseline_slice_locks_by_model_view.pop(key, None)
+        d1_shadow_path = d1_view_shadow_path_by_parent.pop(key, None)
+        preinterpolation_layer_already_published = bool(d1_shadow_path is not None)
+        if d1_shadow_path is None:
+            union_mm: Optional[np.ndarray] = baseline_union_by_model_view.pop(key)
+            confmap_mm = baseline_confmap_by_model_view.pop(key)
+            union_path = baseline_union_paths.pop(key)
+            confmap_path = baseline_confmap_paths.pop(key)
+            baseline_slice_locks_by_model_view.pop(key, None)
+        else:
+            union_mm = None
+            confmap_mm = None
+            union_path = (
+                Path(temp_dir) / 'd1_view_shadow_dense' / str(model_name)
+                / f'{str(view.name)}.fullframe.u8.dat'
+            )
+            confmap_path = None
         # every slice of this view already hole-filled on device by the GPU
         # workers -> the CPU "2D hole fill (<view>)" pass is a no-op recompute; skip it.
         hole_fill_done_on_device = bool(
@@ -44697,10 +45341,25 @@ def main() -> None:
             with parent_transient_admission.reserve(
                 int(transient_bytes), f'{model_name}/{view.name}',
             ):
+                local_union_mm = union_mm
+                if local_union_mm is None:
+                    if d1_shadow_path is None:
+                        raise RuntimeError(f'{model_name}/{view.name}: missing D1 view shadow')
+                    local_union_mm = materialize_raw_bbox_mask_store_workspace(
+                        d1_shadow_path,
+                        union_path,
+                        desc=f'D1 view-native shadow materialization {model_name}/{view.name}',
+                        workers=int(parent_slice_postprocess_workers),
+                    )
+                    if not bool(keep_temp_artifacts):
+                        try:
+                            shutil.rmtree(d1_shadow_path, ignore_errors=True)
+                        except Exception:
+                            pass
                 return prepare_view_volume_after_fullframe(
                     model_name=str(model_name),
                     view=view,
-                    union_mm=union_mm,
+                    union_mm=local_union_mm,
                     confmap_mm=confmap_mm,
                     union_path=union_path,
                     confmap_path=confmap_path,
@@ -44732,6 +45391,9 @@ def main() -> None:
                         component_ref_dense_retirement_active
                         and not nrrd_layers_needed
                     ),
+                    preinterpolation_layer_already_published=bool(
+                        preinterpolation_layer_already_published
+                    ),
                 )
 
         lease = direct_union_backing_leases.get(key)
@@ -44757,13 +45419,17 @@ def main() -> None:
                 direct_union_inference_views.add(key)
                 direct_union_inference_bytes[key] = int(lease.nbytes)
             # Restore ownership registries because the postprocess closure never started.
-            baseline_union_by_model_view[key] = union_mm
-            baseline_confmap_by_model_view[key] = confmap_mm
-            baseline_union_paths[key] = union_path
-            baseline_confmap_paths[key] = confmap_path
-            baseline_slice_locks_by_model_view[key] = [
-                threading.Lock() for _ in range(int(view.num_slices))
-            ]
+            if d1_shadow_path is not None:
+                d1_view_shadow_path_by_parent[key] = d1_shadow_path
+            else:
+                assert union_mm is not None
+                baseline_union_by_model_view[key] = union_mm
+                baseline_confmap_by_model_view[key] = confmap_mm
+                baseline_union_paths[key] = union_path
+                baseline_confmap_paths[key] = confmap_path
+                baseline_slice_locks_by_model_view[key] = [
+                    threading.Lock() for _ in range(int(view.num_slices))
+                ]
             view_processing_submitted.discard(key)
             raise
         view_processing_futures[fut] = key
@@ -45628,6 +46294,7 @@ def main() -> None:
     d1_owner_by_parent: Dict[Tuple[str, str], int] = {}
     d1_active_parent_by_worker: Dict[int, Tuple[str, str]] = {}
     d1_layer_ref_by_parent: Dict[Tuple[str, str], NrrdLayerRef] = {}
+    d1_view_shadow_path_by_parent: Dict[Tuple[str, str], Path] = {}
     # Hybrid full-frame views are committed as a whole. A bounded, ordered parent list is
     # reserved for sequential OpenVINO direct-union ownership; every other CPU-compatible
     # parent remains immediately available to CUDA D1. Only the active CPU parent may be
@@ -46825,7 +47492,7 @@ def main() -> None:
         )
 
     def _refresh_gpu_aux_interpolation_leases() -> None:
-        """Lease only workers that currently have no assigned or imminent inference work."""
+        """Lease warm CUDA worker interpreters only after global inference drain."""
         aux_pool = gpu_worker_aux_interpolation_pool()
         worker_ids = sorted(int(worker_id) for worker_id in gpu_task_queues)
         if aux_pool is None or not worker_ids:
@@ -46834,37 +47501,18 @@ def main() -> None:
             int(gpu_worker_total_tasks) > 0
             and int(gpu_worker_results_collected) >= int(gpu_worker_total_tasks)
         )
-        if len(worker_ids) == 1:
-            worker_id = int(worker_ids[0])
-            if (
-                inference_tail_drained
-                and _main_process_gpu_stage_can_dispatch_inference(worker_id)
-            ):
-                aux_pool.enable_worker(worker_id, allow_full_cpu_affinity=True)
-            else:
+        if not inference_tail_drained:
+            for worker_id in worker_ids:
                 aux_pool.revoke_worker(worker_id)
             return
-
-        # Multi-GPU workers can become useful interpolation hosts independently after their
-        # targeted queue drains, even while another GPU is finishing a long lease.  A newly
-        # ready inference task revokes the lease in the dispatcher before queueing that task.
-        no_imminent_task = not any(
-            (
-                _hybrid_task_is_gpu_mandatory(gpu_worker_tasks_by_id[int(task_id)])
-                or _hybrid_task_is_active_cpu_assist(gpu_worker_tasks_by_id[int(task_id)])
-            )
-            and _direct_union_task_admissible(gpu_worker_tasks_by_id[int(task_id)])
-            and _tile_dense_result_task_admissible(gpu_worker_tasks_by_id[int(task_id)])
-            for task_id in list(gpu_worker_pending_task_ids)
-        )
         for worker_id in worker_ids:
             if (
-                int(gpu_worker_dispatched_tasks) > 0
-                and no_imminent_task
-                and _gpu_worker_inflight(worker_id) == 0
+                _gpu_worker_inflight(worker_id) == 0
                 and _main_process_gpu_stage_can_dispatch_inference(worker_id)
             ):
-                aux_pool.enable_worker(worker_id, allow_full_cpu_affinity=False)
+                # Feeder exclusivity ends at global drain; post-inference interpolation may
+                # reclaim the worker's full inherited allocation.
+                aux_pool.enable_worker(worker_id, allow_full_cpu_affinity=True)
             else:
                 aux_pool.revoke_worker(worker_id)
 
@@ -47323,12 +47971,8 @@ def main() -> None:
             'angle_variant_gpu_fastpath_min_radius': angle_variant_gpu_fastpath_min_radius_value,
             'fused_preflight_specs': tuple(fused_preflight_specs),
         }
-        # Torch LOGICAL indices (positions within any inherited CUDA_VISIBLE_DEVICES list);
-        # validated against the inherited list early in main, and each worker resolves
-        # its physical pin via _pin_cuda_visible_device_token.
-        gpu_logical_indices = [
-            int(str(device).split(':')[-1]) for device in backend_devices.gpu_devices
-        ]
+        # Torch logical indices and their physical CUDA_VISIBLE_DEVICES tokens were resolved
+        # before OpenVINO planning so dedicated feeder cores could be excluded job-wide.
         _configure_main_process_gpu_stage_workers(gpu_logical_indices)
         if gpu_worker_process_active and main_process_gpu_stage_inference_priority_enabled():
             if v1613_d1_owner_active:
@@ -47350,9 +47994,7 @@ def main() -> None:
                     'the global inference queue is permanently drained. '
                     'YOLO_TTA_MAIN_GPU_STAGE_INFERENCE_PRIORITY=0 restores opportunistic leasing.'
                 )
-        pinned_tokens = [
-            _pin_cuda_visible_device_token(int(idx)) for idx in gpu_logical_indices
-        ]
+        pinned_tokens = list(pinned_gpu_tokens)
         # discovery-driven GPU-worker -> NUMA-node CPU pin plan (None entries
         # stay unpinned). Computed from the PHYSICAL tokens before CUDA_VISIBLE_DEVICES is
         # narrowed inside the workers.
@@ -47361,6 +48003,7 @@ def main() -> None:
             excluded_cpus=(
                 () if hybrid_cpu_affinity_overlap_active else cpu_inference_reserved_cpus
             ),
+            reserved_cpus_by_worker=gpu_feeder_core_plan,
         )
         explicit_worker_cpu = bool(os.environ.get('YOLO_TTA_GPU_WORKER_CPU', '').strip())
         worker_cpu_budgets: List[int] = []
@@ -47721,6 +48364,19 @@ def main() -> None:
                         Path(temp_dir) / 'nrrd_layers' / str(view.name)
                         / f'{d1_key}.orthogonal.cvol'
                     )
+                    d1_shadow_required = bool(
+                        _view_uses_interpolation(view, int(args.interpolation_distance))
+                        or bool(tile_jobs_by_view_config.get(str(view.name)))
+                    )
+                    task['d1_view_shadow_required'] = bool(d1_shadow_required)
+                    if d1_shadow_required:
+                        task['d1_view_shadow_shape'] = [
+                            int(v) for v in full_parent_processing_shape
+                        ]
+                        task['d1_view_shadow_store_dir'] = str(
+                            Path(temp_dir) / 'd1_view_shadow' / str(model_name)
+                            / f'{str(view.name)}.packed.cvol'
+                        )
                 gpu_worker_tasks_by_id[int(next_task_id)] = task
                 if str(kind) == 'fullframe':
                     parent_key = (str(model_name), str(view.name))
@@ -47854,10 +48510,10 @@ def main() -> None:
 
         gpu_worker_pending_task_ids.extend(range(int(gpu_worker_total_tasks)))
         # Hybrid native-t GPU residency can defer the 25+ GiB host processing cube until a
-        # CPU worker asks for it. Let that one-time resize use the full allocation while the
-        # OpenVINO workers are still waiting on the cube sentinel; restricting the parent to
-        # only its small housekeeping reserve first would turn the resize into a long barrier.
-        # A monitor applies strict parent/OpenVINO core isolation immediately after publication.
+        # CPU worker asks for it. Let that one-time resize use every NON-FEEDER CPU while the
+        # OpenVINO workers are still waiting on the cube sentinel. Dedicated feeder cores are
+        # protected immediately; a monitor applies the narrower parent/OpenVINO isolation mask
+        # after publication.
         defer_parent_affinity_until_cube = bool(
             cpu_worker_process_active
             and not hybrid_cpu_affinity_overlap_active
@@ -47867,6 +48523,13 @@ def main() -> None:
             and not Path(str(native_resize_task_spec['sentinel'])).exists()
         )
         if defer_parent_affinity_until_cube:
+            # GPU inference can begin before the host cube exists, so feeder exclusivity cannot
+            # wait for the cube sentinel. The resize may use all remaining non-feeder CPUs.
+            _apply_parent_cpu_mask(
+                feeder_safe_parent_cpus,
+                fail_fast=True,
+                phase_label='deferred processing-cube construction',
+            )
             sentinel_path = Path(str(native_resize_task_spec['sentinel']))
             failed_path = (
                 Path(str(native_resize_task_spec['failed']))
@@ -47889,8 +48552,9 @@ def main() -> None:
             )
             parent_affinity_monitor_thread.start()
             print(
-                '[intel] Parent/OpenVINO core isolation deferred until the shared processing '
-                'cube is materialized; the one-time cube resize may use the full CPU allocation.'
+                '[intel] Strict parent/OpenVINO isolation is deferred until the shared processing '
+                'cube is materialized; the one-time resize may use every non-feeder CPU while '
+                'the four-core-per-GPU feeder reservations remain exclusive.'
             )
         else:
             _apply_parent_inference_affinity(fail_fast=True)
@@ -47921,6 +48585,48 @@ def main() -> None:
         if int(fullframe_remaining.get(remaining_key, 0)) == 0:
             _submit_view_prepare(str(model_name_s), view)
 
+    def _accumulate_fullframe_slice_metadata(
+        task: Dict[str, object], stats: Dict[str, object], view: ViewInfo,
+    ) -> None:
+        meta_key = (str(task['model_name']), str(view.name))
+        holder = view_slice_meta.get(meta_key)
+        if holder is None:
+            holder = {
+                'valid': True,
+                'slice_any': np.zeros((int(view.num_slices),), dtype=bool),
+                'slice_bboxes': np.zeros((int(view.num_slices), 4), dtype=np.int64),
+                'slice_row_any': None,
+                'slice_row_count': 0,
+            }
+            view_slice_meta[meta_key] = holder
+        task_meta = stats.get('slice_meta')
+        if not isinstance(task_meta, dict):
+            holder['valid'] = False
+            return
+        if not bool(holder['valid']):
+            return
+        try:
+            s0_meta = int(task.get('slice_start', 0))
+            any_arr = np.asarray(task_meta['slice_any'], dtype=bool)
+            n_meta = int(any_arr.shape[0])
+            holder['slice_any'][s0_meta:s0_meta + n_meta] = any_arr
+            holder['slice_bboxes'][s0_meta:s0_meta + n_meta] = np.asarray(
+                task_meta['slice_bboxes'], dtype=np.int64,
+            )
+            rows_packed = task_meta.get('slice_row_any')
+            if rows_packed is not None:
+                rows_packed = np.asarray(rows_packed, dtype=np.uint8)
+                if holder['slice_row_any'] is None:
+                    holder['slice_row_any'] = np.zeros(
+                        (int(view.num_slices), int(rows_packed.shape[1])), dtype=np.uint8,
+                    )
+                    holder['slice_row_count'] = int(
+                        np.asarray(task_meta['slice_row_count']).reshape(-1)[0]
+                    )
+                holder['slice_row_any'][s0_meta:s0_meta + n_meta] = rows_packed
+        except Exception:
+            holder['valid'] = False
+
     def _handle_fullframe_worker_result(task: Dict[str, object], stats: Dict[str, object]) -> None:
         view = task['view']
         model_name_s = str(task['model_name'])
@@ -47931,6 +48637,7 @@ def main() -> None:
             key_fill = (model_name_s, str(view.name))
             view_device_hole_filled_slices[key_fill] = int(view_device_hole_filled_slices.get(key_fill, 0)) + _filled
         meta_key = (model_name_s, str(view.name))
+        _accumulate_fullframe_slice_metadata(task, stats, view)
         if str(task.get('result_mode', 'file')) == 'd1_owner':
             complete = bool(stats.get('d1_view_complete', False))
             layer_ref = stats.get('d1_layer_ref')
@@ -47952,6 +48659,15 @@ def main() -> None:
                             mask_kind='yolo', pass_index=0, stage='pre_interpolation',
                         ),
                     )
+            shadow_path_raw = str(stats.get('d1_view_shadow_path', '') or '').strip()
+            if shadow_path_raw:
+                shadow_path = Path(shadow_path_raw)
+                existing_shadow = d1_view_shadow_path_by_parent.get(meta_key)
+                if existing_shadow is not None and existing_shadow != shadow_path:
+                    raise RuntimeError(
+                        f'D1 view shadow {meta_key} changed {existing_shadow} -> {shadow_path}'
+                    )
+                d1_view_shadow_path_by_parent[meta_key] = shadow_path
             fullframe_remaining[meta_key] = int(fullframe_remaining.get(meta_key, 0)) - 1
             remaining = int(fullframe_remaining.get(meta_key, 0))
             if remaining < 0:
@@ -47961,40 +48677,18 @@ def main() -> None:
                     raise RuntimeError(
                         f'D1 view {meta_key} exhausted its tasks without a finalized source-space cvol'
                     )
-                view_processing_submitted.add(meta_key)
-            return
-        # Aggregate the task window's device-union slice metadata per view.
-        holder = view_slice_meta.get(meta_key)
-        if holder is None:
-            holder = {
-                'valid': True,
-                'slice_any': np.zeros((int(view.num_slices),), dtype=bool),
-                'slice_bboxes': np.zeros((int(view.num_slices), 4), dtype=np.int64),
-                'slice_row_any': None,
-                'slice_row_count': 0,
-            }
-            view_slice_meta[meta_key] = holder
-        task_meta = stats.get('slice_meta')
-        if not isinstance(task_meta, dict):
-            holder['valid'] = False
-        elif bool(holder['valid']):
-            try:
-                s0_meta = int(task.get('slice_start', 0))
-                any_arr = np.asarray(task_meta['slice_any'], dtype=bool)
-                n_meta = int(any_arr.shape[0])
-                holder['slice_any'][s0_meta:s0_meta + n_meta] = any_arr
-                holder['slice_bboxes'][s0_meta:s0_meta + n_meta] = np.asarray(task_meta['slice_bboxes'], dtype=np.int64)
-                rows_packed = task_meta.get('slice_row_any')
-                if rows_packed is not None:
-                    rows_packed = np.asarray(rows_packed, dtype=np.uint8)
-                    if holder['slice_row_any'] is None:
-                        holder['slice_row_any'] = np.zeros(
-                            (int(view.num_slices), int(rows_packed.shape[1])), dtype=np.uint8,
+                shadow_required = bool(task.get('d1_view_shadow_required', False))
+                if shadow_required:
+                    if meta_key not in d1_view_shadow_path_by_parent:
+                        raise RuntimeError(
+                            f'D1 view {meta_key} requires interpolation/tile support but returned no '
+                            'view-native sparse shadow'
                         )
-                        holder['slice_row_count'] = int(np.asarray(task_meta['slice_row_count']).reshape(-1)[0])
-                    holder['slice_row_any'][s0_meta:s0_meta + n_meta] = rows_packed
-            except Exception:
-                holder['valid'] = False
+                    _submit_view_prepare(model_name_s, view)
+                else:
+                    view_processing_submitted.add(meta_key)
+                    view_slice_meta.pop(meta_key, None)
+            return
         if str(task.get('result_mode', 'file')) == 'direct_union':
             # The worker already wrote its disjoint slice window straight into the
             # shared per-view union mapping; nothing to reopen, OR, flush, or unlink here, and
@@ -48092,6 +48786,7 @@ def main() -> None:
             return
         if gpu_worker_process_active:
             _set_main_process_gpu_inference_priority_active(False)
+        _restore_parent_post_inference_affinity()
         if bool(gpu_inference_drain_announced):
             return
         gpu_inference_drain_announced = True
@@ -48911,22 +49606,7 @@ def main() -> None:
             except TypeError:
                 interpolation_process_executor.shutdown(wait=True)
 
-        parent_affinity_monitor_stop.set()
-        if parent_affinity_monitor_thread is not None:
-            parent_affinity_monitor_thread.join(timeout=2.0)
-
-        if main_process_affinity_restricted:
-            if not _sched_setaffinity_all_threads(sorted(_allowed_main_cpus)):
-                print(
-                    'Warning: could not restore the parent process to the full allocated CPU '
-                    f'mask after inference; requested mask={sorted(_allowed_main_cpus)}'
-                )
-            else:
-                print(
-                    f'[intel] Parent CPU affinity restored to all {len(_allowed_main_cpus)} '
-                    'allocated logical CPU(s) for the post-inference tail.'
-                )
-            main_process_affinity_restricted = False
+        _restore_parent_post_inference_affinity()
 
         _set_main_process_gpu_pending_inference(False)
         _set_main_process_gpu_stage_wake_callback(None)
@@ -49044,6 +49724,16 @@ def main() -> None:
     fused_projected_layer_refs: List[NrrdLayerRef] = []  #
     for view in views:
         for model_name, _ in yolo_models:
+            d1_base_ref = d1_layer_ref_by_parent.get((str(model_name), str(view.name)))
+            d1_dense_orthogonal_additions_present = bool(
+                str(view.name) in view_volumes_by_model.get(str(model_name), {})
+            )
+            if d1_base_ref is not None and d1_dense_orthogonal_additions_present:
+                # Orthogonal dense D1 continuation contains additions only and takes the early
+                # dense-view branch below. Contribute the already-source-space base exactly once.
+                # Radial/Tilted D1 views instead reach the component-ref branch, which already
+                # includes both this base and every projected addition layer.
+                fused_projected_layer_refs.append(d1_base_ref)
             if view.name in view_volumes_by_model[model_name]:
                 continue
             view_projected_layer_refs = [
@@ -49135,7 +49825,7 @@ def main() -> None:
     )
     if bool(component_ref_dense_retirement_active):
         spec_notes.append(
-            'v17.0.4 component-ref TTA retirement: every --angle variant remained logically '
+            'v17.0.5 component-ref TTA retirement: every --angle variant remained logically '
             'independent through cleanup, interpolation, per-tile parent/bridge gating, and '
             'component-layer output. Non-tiled dense variants retired after an immutable terminal '
             'representation was materialized; tiled variants retired after consolidation. Requested '
@@ -49594,6 +50284,9 @@ def main() -> None:
 # pathname-backed refs (private no-NRRD refs are row-wise bit-packed), makes external CTILE/CVOL
 # memfd opt-in, shortens support lifetimes, and reports the live bytes that v17.0.3's workspace
 # estimate omitted.
+# v17.0.5 reserves four exclusive physical feeder cores per CUDA worker, leases auxiliary
+# interpolation only after global inference drain, and preserves D1 across interpolation/tiles
+# with an exact packed view-native shadow plus delta-only final continuation.
 # v16.4.2 makes per-tile storage bounded: parent-owned memfd results are preferred, waiting tile/residual masks always retire to crop-local CTILE stores, and scheduler backpressure caps live dense tile workspaces.
 # v16.4.3 moves dense tile retirement to the cleanup boundary: a dedicated pool converts every nonempty tile to CTILE, releases its memfd/pathname and dispatch credit immediately, lazily opens CTILEs inside gate workers, records retention age, and sweeps orphaned gpu_worker_results after scheduler teardown.
 # v16.2.1 prevents hardware-texture Radial startup false positives by allowing one raster-perimeter-equivalent high-error seam while retaining the strict mean and broad-mismatch gates.
