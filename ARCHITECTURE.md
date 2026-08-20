@@ -1,6 +1,6 @@
 # Volume TTA architecture
 
-The `GPT-5.6-Sol-Pro_v17.0.7_SLURM.py` filename remains a versioned compatibility
+The `GPT-5.6-Sol-Pro_v17.0.8_SLURM.py` filename remains a versioned compatibility
 launcher. The implementation lives in the importable `volume_tta` package so spawned
 processes resolve worker functions and data types through canonical module paths.
 
@@ -23,6 +23,8 @@ processes resolve worker functions and data types through canonical module paths
 | `cuda_d1` | D1 owner-GPU backprojection and packed source-space storage |
 | `assembly` | completed-view preparation, tile gates and smoothing handoff |
 | `outputs` | NRRD, TIFF/MKV, summaries and low-quality derivatives |
+| `intel_compression` | dependency-light policy/adapter for optional QATzip and QPL companion extensions |
+| `intel_dsa` | lazy policy, eligibility, drain transaction and lifecycle for optional Linux idxd workspace copy |
 | `pipeline` | the existing production orchestration routine |
 
 `volume_tta.__init__` is deliberately inert. In particular, it does not import OpenCV,
@@ -80,11 +82,14 @@ CUDA behavior.
 
 ## Verification
 
-The refactor manifest records the AST digest of every original top-level executable
-statement. `tools/verify_refactor.py` verifies that 1,128 statements remain bytecode-
-equivalent at the AST level and identifies the five reviewed seam changes. The test suite
-also covers dependency-light CLI/config imports, configuration parsing, cycle-safe package
-imports, and collective-ready backend contracts.
+The refactor manifest records the AST digest of all 1,133 historical top-level executable
+statements. The original monolith was intentionally retired after the manifest was
+checked in; `tools/verify_refactor.py` now verifies the package against that immutable
+inventory without requiring the deleted source file. Reviewed post-refactor seams are
+listed explicitly in the verifier rather than hidden by regenerating the manifest. The
+test suite also covers dependency-light CLI/config imports, configuration parsing,
+cycle-safe package imports, accelerator policy/lifecycle, and collective-ready backend
+contracts.
 
 Run the dependency-light checks with:
 
@@ -94,5 +99,7 @@ python tools/verify_refactor.py
 python tools/smoke_import.py
 ```
 
-Hardware-backed CUDA, TensorRT, OpenVINO and full data/model parity tests still require the
-production environment and representative artifacts.
+Hardware-backed CUDA, TensorRT, OpenVINO, QAT, IAA, DSA and full data/model parity tests
+still require the production environment and representative artifacts. Intel accelerator
+build, provisioning, and admission instructions live in ``native/README.md``; run
+``python tools/intel_accelerator_selftest.py --backend all`` on the target host.

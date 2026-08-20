@@ -1971,32 +1971,17 @@ def allocate_workspace_array(
     numa_interleave_memory(mm, desc=desc)  #
     return mm
 
-def copy_workspace_array(
+def _copy_workspace_array_cpu(
+    dst: np.ndarray,
     src: np.ndarray,
-    path: Optional[Path],
-    desc: str,
     *,
-    prefer_memory: bool = True,
-    prefer_memfd: bool = False,
-    reserve_bytes: int = 16 * GIB,
-    workers: int = 1,
-) -> np.ndarray:
-    """Allocate a workspace matching ``src`` and copy the contents in parallel."""
-    dst = allocate_workspace_array(
-        shape=src.shape,
-        dtype=src.dtype,
-        path=path,
-        desc=desc,
-        prefer_memory=bool(prefer_memory),
-        prefer_memfd=bool(prefer_memfd),
-        reserve_bytes=int(reserve_bytes),
-        initialize_zero=False,
-    )
-
+    workers: int,
+    desc: str,
+) -> None:
+    """Run the exact pre-DSA CPU implementation over the complete destination."""
     if src.ndim <= 1:
         np.copyto(dst, src)
-        flush_array(dst)
-        return dst
+        return
 
     total = int(src.shape[0])
 
@@ -2010,6 +1995,222 @@ def copy_workspace_array(
         desc=f'{desc} copy',
         show_progress=False,
     )
+
+def _discard_failed_workspace_copy(dst: object, path: Optional[Path]) -> None:
+    """Invalidate storage owned by ``copy_workspace_array`` after a failed copy."""
+    owner_key = _memfd_owner_key_from_array(dst)
+    root = _root_memmap_for_array(dst)
+    filename = getattr(root, 'filename', None) if root is not None else None
+    close_memmap_array_without_flush(dst)
+    if owner_key is not None or path is None or not filename:
+        return
+    try:
+        requested = Path(path).absolute()
+        actual = Path(str(filename)).absolute()
+        if actual == requested and requested.exists():
+            requested.unlink()
+    except OSError:
+        pass
+
+def _workspace_copy_fault_counts() -> Tuple[int, int]:
+    try:
+        import resource
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        return int(usage.ru_minflt), int(usage.ru_majflt)
+    except Exception:
+        return 0, 0
+
+def _record_dsa_copy_stats(
+    stats: Dict[str, object],
+    *,
+    capabilities: Dict[str, object],
+    elapsed_ns: int,
+    cpu_ns: int,
+    minor_faults: int,
+    major_faults: int,
+) -> None:
+    telemetry = runtime_telemetry()
+    for key in (
+        'hardware_bytes',
+        'descriptors',
+        'submitted_descriptors',
+        'batches',
+        'queue_full_events',
+        'partial_failures',
+        'page_faults',
+    ):
+        try:
+            telemetry.add(f'workspace.copy.dsa.{key}', int(stats.get(key, 0)))
+        except Exception:
+            pass
+    for key in ('minor_page_faults', 'major_page_faults'):
+        try:
+            telemetry.add(f'workspace.copy.dsa.native_{key}', int(stats.get(key, 0)))
+        except Exception:
+            pass
+    for key in ('submission_seconds', 'wait_seconds', 'total_seconds'):
+        try:
+            telemetry.add(f'workspace.copy.dsa.{key}', float(stats.get(key, 0.0)))
+        except Exception:
+            pass
+    seconds = max(1e-12, float(elapsed_ns) / 1e9)
+    copied = max(0, int(stats.get('hardware_bytes', 0)))
+    telemetry.gauge('workspace.copy.dsa.last_gib_per_second', copied / GIB / seconds)
+    telemetry.gauge('workspace.copy.dsa.last_cpu_seconds', max(0, int(cpu_ns)) / 1e9)
+    telemetry.add('workspace.copy.dsa.minor_page_faults', max(0, int(minor_faults)))
+    telemetry.add('workspace.copy.dsa.major_page_faults', max(0, int(major_faults)))
+    telemetry.gauge('workspace.copy.dsa.work_queue', capabilities.get('work_queue'))
+    telemetry.gauge('workspace.copy.dsa.work_queue_mode', capabilities.get('work_queue_mode'))
+    telemetry.gauge('workspace.copy.dsa.numa_node', capabilities.get('numa_node'))
+    telemetry.gauge('workspace.copy.dsa.caller_numa_node', capabilities.get('caller_numa_node'))
+    telemetry.gauge('workspace.copy.dsa.block_on_fault', capabilities.get('block_on_fault'))
+    telemetry.gauge('workspace.copy.dsa.queue_depth', stats.get('max_inflight'))
+
+def copy_workspace_array(
+    src: np.ndarray,
+    path: Optional[Path],
+    desc: str,
+    *,
+    prefer_memory: bool = True,
+    prefer_memfd: bool = False,
+    reserve_bytes: int = 16 * GIB,
+    workers: int = 1,
+) -> np.ndarray:
+    """Allocate and copy a workspace with optional, fail-closed Linux DSA offload."""
+    # Importing this dependency-free control plane is cheap; its native extension is
+    # still imported only when auto/dsa reaches an otherwise eligible copy.
+    from . import intel_dsa
+
+    backend = intel_dsa.requested_backend()
+    minimum_bytes = intel_dsa.minimum_copy_bytes() if backend != 'cpu' else 0
+    max_inflight = intel_dsa.requested_max_inflight() if backend != 'cpu' else 1
+    requested_wq = intel_dsa.requested_work_queue() if backend != 'cpu' else None
+    dst = allocate_workspace_array(
+        shape=src.shape,
+        dtype=src.dtype,
+        path=path,
+        desc=desc,
+        prefer_memory=bool(prefer_memory),
+        prefer_memfd=bool(prefer_memfd),
+        reserve_bytes=int(reserve_bytes),
+        initialize_zero=False,
+    )
+    if backend == 'cpu':
+        telemetry = runtime_telemetry()
+        telemetry.gauge('workspace.copy.requested_backend', 'cpu')
+        telemetry.gauge('workspace.copy.selected_backend', 'cpu')
+        _copy_workspace_array_cpu(dst, src, workers=int(workers), desc=desc)
+        flush_array(dst)
+        return dst
+
+    telemetry = runtime_telemetry()
+    telemetry.gauge('workspace.copy.requested_backend', backend)
+    eligibility = intel_dsa.assess_copy_eligibility(
+        src,
+        dst,
+        minimum_bytes=int(minimum_bytes),
+    )
+    telemetry.gauge('workspace.copy.source_backing', eligibility.source_backing)
+    telemetry.gauge('workspace.copy.destination_backing', eligibility.destination_backing)
+    telemetry.gauge('workspace.copy.destination_pages', 'unknown')
+    if not eligibility.eligible:
+        exc = intel_dsa.IntelDsaIneligible(eligibility.reasons)
+        telemetry.gauge('workspace.copy.dsa.last_ineligibility_reasons', eligibility.reasons)
+        if backend == 'dsa':
+            telemetry.gauge('workspace.copy.selected_backend', 'none')
+            _discard_failed_workspace_copy(dst, path)
+            raise exc
+        telemetry.fallback('workspace.copy.dsa.ineligible', exc)
+        telemetry.gauge('workspace.copy.selected_backend', 'cpu')
+        _copy_workspace_array_cpu(dst, src, workers=int(workers), desc=desc)
+        flush_array(dst)
+        return dst
+
+    # Capability failures occur before native submission and are therefore safe initial
+    # CPU fallbacks in auto mode. Execution failures take the stricter drained path below.
+    try:
+        manager = intel_dsa.get_manager()
+        capabilities = manager.capabilities(work_queue=requested_wq)
+    except intel_dsa.IntelDsaUnavailable as exc:
+        if backend == 'dsa':
+            telemetry.gauge('workspace.copy.selected_backend', 'none')
+            _discard_failed_workspace_copy(dst, path)
+            raise
+        telemetry.fallback('workspace.copy.dsa.unavailable', exc)
+        telemetry.gauge('workspace.copy.selected_backend', 'cpu')
+        _copy_workspace_array_cpu(dst, src, workers=int(workers), desc=desc)
+        flush_array(dst)
+        return dst
+
+    try:
+        native_limit = max(1, int(capabilities.get('max_inflight', max_inflight)))
+    except Exception:
+        native_limit = int(max_inflight)
+    effective_inflight = min(int(max_inflight), int(native_limit))
+    before_minor, before_major = _workspace_copy_fault_counts()
+    started_ns = time.monotonic_ns()
+    started_cpu_ns = time.process_time_ns()
+    try:
+        stats = manager.copy(
+            src,
+            dst,
+            capabilities=capabilities,
+            max_inflight=effective_inflight,
+            failure_cleanup=lambda: _discard_failed_workspace_copy(dst, path),
+        )
+    except intel_dsa.IntelDsaCopyError as exc:
+        failed_elapsed_ns = int(time.monotonic_ns() - started_ns)
+        failed_cpu_ns = int(time.process_time_ns() - started_cpu_ns)
+        failed_minor, failed_major = _workspace_copy_fault_counts()
+        failed_stats = dict(exc.stats)
+        failed_stats.setdefault('max_inflight', int(effective_inflight))
+        _record_dsa_copy_stats(
+            failed_stats,
+            capabilities=capabilities,
+            elapsed_ns=failed_elapsed_ns,
+            cpu_ns=failed_cpu_ns,
+            minor_faults=max(0, int(failed_minor) - int(before_minor)),
+            major_faults=max(0, int(failed_major) - int(before_major)),
+        )
+        telemetry.add('workspace.copy.dsa.failed_requests', 1)
+        telemetry.gauge('workspace.copy.dsa.last_failure_drained', bool(exc.drained))
+        telemetry.fallback('workspace.copy.dsa.execution', exc)
+        # An undrained error is fatal even in auto: a late device write could race and
+        # corrupt a CPU recovery copy. The failed destination is never handed to callers.
+        if not bool(exc.drained):
+            telemetry.gauge('workspace.copy.selected_backend', 'none')
+            telemetry.gauge('workspace.copy.dsa.buffers_quarantined', True)
+            raise
+        if backend == 'dsa':
+            telemetry.gauge('workspace.copy.selected_backend', 'none')
+            _discard_failed_workspace_copy(dst, path)
+            raise
+        telemetry.add('workspace.copy.dsa.full_cpu_recopies', 1)
+        telemetry.add('workspace.copy.dsa.full_cpu_recopy_bytes', int(eligibility.nbytes))
+        telemetry.gauge('workspace.copy.selected_backend', 'cpu_recopy_after_dsa')
+        try:
+            _copy_workspace_array_cpu(dst, src, workers=int(workers), desc=desc)
+            flush_array(dst)
+            return dst
+        except BaseException:
+            _discard_failed_workspace_copy(dst, path)
+            raise
+
+    elapsed_ns = int(time.monotonic_ns() - started_ns)
+    cpu_ns = int(time.process_time_ns() - started_cpu_ns)
+    after_minor, after_major = _workspace_copy_fault_counts()
+    stats = dict(stats)
+    stats.setdefault('max_inflight', int(effective_inflight))
+    _record_dsa_copy_stats(
+        stats,
+        capabilities=capabilities,
+        elapsed_ns=elapsed_ns,
+        cpu_ns=cpu_ns,
+        minor_faults=max(0, int(after_minor) - int(before_minor)),
+        major_faults=max(0, int(after_major) - int(before_major)),
+    )
+    telemetry.gauge('workspace.copy.dsa.buffers_quarantined', False)
+    telemetry.gauge('workspace.copy.selected_backend', 'dsa')
     flush_array(dst)
     return dst
 
@@ -3010,6 +3211,15 @@ def reset_runtime_state_for_new_run() -> None:
     _SCRATCH_DIR_IS_MEMORY_BACKED = False
     _RUN_TERMINATION_REQUESTED.clear()
     shutdown_parallel_pool_cache()
+    # The optional native DSA binding owns process-local work-queue state. Importing
+    # its Python control plane here does not load the native module, and close_manager
+    # is a no-op unless a prior copy selected DSA.
+    try:
+        from . import intel_dsa
+        intel_dsa.close_manager()
+        runtime_telemetry().gauge('workspace.copy.dsa.buffers_quarantined', False)
+    except Exception as exc:
+        runtime_telemetry().fallback('workspace.copy.dsa.close', exc)
 
 def _interpolation_array_backing_path(arr: object) -> Optional[Path]:
     if arr is None:

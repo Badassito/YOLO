@@ -15,6 +15,7 @@ from .config import (
     GIB,
 )
 from .runtime import (
+    runtime_telemetry,
     runtime_telemetry_phase,
 )
 
@@ -956,7 +957,7 @@ def slicer_segmentation_header_fields(
 def nrrd_gzip_compresslevel() -> int:
     """Return the NRRD member-gzip compression level.
 
-    ISA-L maps the configured 0..9 value to its native 0..3 range.
+    QAT maps this intent by hardware generation; ISA-L maps it to 0..3.
     """
     return int(np.clip(_env_int('YOLO_TTA_NRRD_GZIP_LEVEL', 3), 0, 9))
 
@@ -1072,18 +1073,201 @@ def nrrd_gzip_workers() -> int:
 def nrrd_gzip_chunk_bytes() -> int:
     return max(1, _env_int('YOLO_TTA_NRRD_GZIP_CHUNK_MIB', 16)) * 1024 * 1024
 
+# Historical single-pool state is retained as an inert compatibility symbol for the
+# refactor inventory; v17.0.8 uses the backend-sized pool map below.
 _NRRD_GZIP_EXECUTOR: Optional[ThreadPoolExecutor] = None
+
+_NRRD_GZIP_EXECUTORS: Dict[Tuple[str, int], ThreadPoolExecutor] = {}
 
 _NRRD_GZIP_EXECUTOR_LOCK = threading.Lock()
 
-def _nrrd_gzip_executor() -> ThreadPoolExecutor:
-    global _NRRD_GZIP_EXECUTOR
+_NRRD_GZIP_EXECUTOR_ATEXIT_REGISTERED = False
+
+def _nrrd_codec_worker_count(
+    codec_spec: Tuple[str, int, Callable[[object], bytes]],
+) -> int:
+    """Bound hardware sessions by the binding's advertised usable capacity."""
+    backend, _level, compressor = codec_spec
+    requested = int(nrrd_gzip_workers())
+    if not bool(getattr(compressor, 'hardware_backend', False)):
+        return max(1, requested)
+    limit = max(1, int(getattr(compressor, 'max_concurrency', 1)))
+    env_name = (
+        'YOLO_TTA_NRRD_QAT_WORKERS'
+        if str(backend) == 'qat' else
+        'YOLO_TTA_NRRD_IAA_WORKERS'
+    )
+    configured = max(1, _env_int(str(env_name), min(requested, limit)))
+    return max(1, min(int(configured), int(limit)))
+
+def _nrrd_gzip_executor(
+    codec_spec: Tuple[str, int, Callable[[object], bytes]],
+) -> ThreadPoolExecutor:
+    """Return a shared pool sized for the selected CPU or hardware backend."""
+    global _NRRD_GZIP_EXECUTOR_ATEXIT_REGISTERED
+    backend = str(codec_spec[0])
+    workers = int(_nrrd_codec_worker_count(codec_spec))
+    key = (backend, workers)
     with _NRRD_GZIP_EXECUTOR_LOCK:
-        if _NRRD_GZIP_EXECUTOR is None:
-            _NRRD_GZIP_EXECUTOR = ThreadPoolExecutor(
-                max_workers=int(nrrd_gzip_workers()), thread_name_prefix='nrrd-gzip',
+        executor = _NRRD_GZIP_EXECUTORS.get(key)
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=int(workers), thread_name_prefix=f'nrrd-gzip-{backend}',
             )
-        return _NRRD_GZIP_EXECUTOR
+            _NRRD_GZIP_EXECUTORS[key] = executor
+        if not _NRRD_GZIP_EXECUTOR_ATEXIT_REGISTERED:
+            atexit.register(shutdown_nrrd_gzip_executors)
+            _NRRD_GZIP_EXECUTOR_ATEXIT_REGISTERED = True
+        return executor
+
+def _run_on_every_executor_thread(
+    executor: ThreadPoolExecutor,
+    workers: int,
+    callback: Callable[[], None],
+) -> None:
+    """Use a barrier so one task is resident on every pool thread before callback."""
+    count = max(1, int(workers))
+    barrier = threading.Barrier(count)
+
+    def _call() -> None:
+        barrier.wait(timeout=60.0)
+        callback()
+
+    futures = [executor.submit(_call) for _ in range(count)]
+    first_error: Optional[BaseException] = None
+    for fut in futures:
+        try:
+            fut.result()
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise first_error
+
+def _report_nrrd_gzip_cleanup_failure(
+    operation: str,
+    exc: BaseException,
+) -> None:
+    """Best-effort cleanup diagnostics that cannot replace a pipeline exception."""
+    try:
+        runtime_telemetry().fallback(str(operation), exc)
+    except BaseException:
+        pass
+    try:
+        print(
+            'Warning: Intel compression cleanup failed during '
+            f'{operation} ({type(exc).__name__}: {exc}).'
+        )
+    except BaseException:
+        pass
+
+def _shutdown_nrrd_gzip_executor_safely(executor: ThreadPoolExecutor) -> None:
+    """Drain an executor without allowing teardown failures to escape cleanup."""
+    try:
+        executor.shutdown(wait=True, cancel_futures=True)
+    except TypeError:
+        # Python/runtime-compatible fallback for executors without cancel_futures.
+        try:
+            executor.shutdown(wait=True)
+        except BaseException as exc:
+            _report_nrrd_gzip_cleanup_failure(
+                'nrrd.compression.executor_shutdown', exc,
+            )
+    except BaseException as exc:
+        _report_nrrd_gzip_cleanup_failure(
+            'nrrd.compression.executor_shutdown', exc,
+        )
+
+def _record_nrrd_native_codec_stats(backend: str) -> None:
+    """Publish and reset native hardware counters after a codec pool drains."""
+    name = str(backend)
+    if name not in {'qat', 'iaa'}:
+        return
+    try:
+        from .intel_compression import native_stats
+
+        stats = dict(native_stats(name, reset=True))
+        if not stats:
+            return
+        telemetry = runtime_telemetry()
+        telemetry.gauge(f'nrrd.compression.{name}.native_stats', stats)
+        cumulative = {
+            'input_bytes',
+            'output_bytes',
+            'logical_requests',
+            'physical_members',
+            'hardware_requests',
+            'software_fallback_requests',
+            'queue_busy_events',
+            'failures',
+            'sessions_created',
+            'sessions_closed',
+            'elapsed_ns',
+        }
+        for key in cumulative:
+            value = stats.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            telemetry.add(f'nrrd.compression.{name}.native.{key}', value)
+    except BaseException as exc:
+        _report_nrrd_gzip_cleanup_failure(
+            f'nrrd.compression.{name}.native_stats', exc,
+        )
+
+def _close_nrrd_gzip_executor_entry(
+    backend: str,
+    workers: int,
+    executor: ThreadPoolExecutor,
+) -> None:
+    """Close one idle pool, including native state on hardware worker threads."""
+    try:
+        # CPython's private ThreadPoolExecutor exit hook may already have joined the
+        # pool before ordinary atexit callbacks run. Native TLS destructors have then
+        # run too, so there is no worker left on which to schedule explicit cleanup.
+        if (
+            str(backend) in {'qat', 'iaa'}
+            and not bool(getattr(executor, '_shutdown', False))
+        ):
+            from .intel_compression import close_current_thread_state
+
+            _run_on_every_executor_thread(
+                executor, int(workers), close_current_thread_state,
+            )
+    except BaseException as exc:
+        _report_nrrd_gzip_cleanup_failure(
+            'nrrd.compression.thread_cleanup', exc,
+        )
+    finally:
+        _shutdown_nrrd_gzip_executor_safely(executor)
+        _record_nrrd_native_codec_stats(str(backend))
+
+def _retire_nrrd_codec_executor(codec_spec: NrrdMemberCodecSpec) -> None:
+    """Release a failed hardware codec's sessions immediately after preflight/KAT."""
+    backend = str(codec_spec[0])
+    workers = int(_nrrd_codec_worker_count(codec_spec))
+    with _NRRD_GZIP_EXECUTOR_LOCK:
+        executor = _NRRD_GZIP_EXECUTORS.pop((backend, workers), None)
+    if executor is not None:
+        _close_nrrd_gzip_executor_entry(backend, workers, executor)
+
+def shutdown_nrrd_gzip_executors() -> None:
+    """Drain pools and close native TLS sessions on their owning worker threads."""
+    global _NRRD_MEMBER_GZIP_ANNOUNCED, _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED
+    with _NRRD_GZIP_EXECUTOR_LOCK:
+        entries = list(_NRRD_GZIP_EXECUTORS.items())
+        _NRRD_GZIP_EXECUTORS.clear()
+    try:
+        for (backend, workers), executor in entries:
+            _close_nrrd_gzip_executor_entry(str(backend), int(workers), executor)
+    finally:
+        # A subsequent embedded run gets a fresh hardware probe, KAT, thread preflight,
+        # and selected-backend announcement even when its environment policy changed.
+        with _NRRD_MEMBER_GZIP_TEST_LOCK:
+            _NRRD_MEMBER_GZIP_OK.clear()
+            _NRRD_MEMBER_GZIP_FAILURE_REASONS.clear()
+        _NRRD_MEMBER_CODEC_FAILURES_ANNOUNCED.clear()
+        _NRRD_MEMBER_GZIP_ANNOUNCED = False
+        _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED = False
 
 _GZIP_MEMBER_HEADER = b'\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03'
 
@@ -1116,17 +1300,19 @@ def _zero_gzip_member(length: int) -> bytes:
 
 _NRRD_MEMBER_CODEC_SETTING_WARNED = False
 
+NrrdMemberCodecSpec = Tuple[str, int, Callable[[object], bytes]]
+
 def nrrd_member_codec_requested() -> str:
-    """Complete-member CPU codec policy: auto, libdeflate, isal, or zlib."""
+    """NRRD gzip policy; ``cpu`` is the opt-out from preferred automatic QAT."""
     global _NRRD_MEMBER_CODEC_SETTING_WARNED
     raw = os.environ.get('YOLO_TTA_NRRD_MEMBER_CODEC', 'auto').strip().lower()
-    if raw in {'auto', 'libdeflate', 'isal', 'zlib'}:
+    if raw in {'auto', 'cpu', 'qat', 'iaa', 'libdeflate', 'isal', 'zlib'}:
         return str(raw)
     if not _NRRD_MEMBER_CODEC_SETTING_WARNED:
         _NRRD_MEMBER_CODEC_SETTING_WARNED = True
         print(
             f'Warning: invalid YOLO_TTA_NRRD_MEMBER_CODEC={raw!r}; using auto '
-            '(libdeflate -> ISA-L -> zlib).'
+            '(QAT -> libdeflate -> ISA-L -> zlib).'
         )
     return 'auto'
 
@@ -1143,15 +1329,124 @@ def nrrd_libdeflate_level() -> int:
 def _nrrd_member_codec_candidates() -> Tuple[str, ...]:
     requested = str(nrrd_member_codec_requested())
     if requested == 'auto':
+        return ('qat', 'libdeflate', 'isal', 'zlib')
+    if requested == 'cpu':
         return ('libdeflate', 'isal', 'zlib')
     return (requested,)
 
+def _nrrd_optional_numa_id(environment_name: str) -> Optional[int]:
+    raw = os.environ.get(str(environment_name), '').strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f'{environment_name} must be an integer, got {raw!r}') from exc
+    return None if value < 0 else int(value)
+
+def _nrrd_qat_level(capabilities: Dict[str, object]) -> int:
+    """Map zlib intent to Intel's generation-dependent QAT compression levels."""
+    raw_supported = capabilities.get('supported_levels', tuple(range(1, 10)))
+    try:
+        if isinstance(raw_supported, (str, bytes)):
+            supported = tuple(
+                sorted({int(token.strip()) for token in str(raw_supported).split(',') if token.strip()})
+            )
+        else:
+            supported = tuple(sorted({int(value) for value in raw_supported}))  # type: ignore[union-attr]
+    except Exception:
+        supported = tuple(range(1, 10))
+
+    def _validated(level: int) -> int:
+        if int(level) not in supported:
+            raise ValueError(
+                f'QAT level {int(level)} is unsupported; binding reports {supported}'
+            )
+        return int(level)
+
+    explicit = os.environ.get('YOLO_TTA_NRRD_QAT_LEVEL', '').strip()
+    if explicit:
+        try:
+            level = int(explicit)
+        except ValueError as exc:
+            raise ValueError(
+                f'YOLO_TTA_NRRD_QAT_LEVEL must be an integer, got {explicit!r}'
+            ) from exc
+        if not 1 <= int(level) <= 9:
+            raise ValueError('YOLO_TTA_NRRD_QAT_LEVEL must be in [1, 9]')
+        return _validated(int(level))
+    configured = int(nrrd_gzip_compresslevel())
+    if configured <= 0:
+        raise RuntimeError(
+            'QAT auto selection is ineligible for gzip level 0; choose '
+            'YOLO_TTA_NRRD_MEMBER_CODEC=cpu or set an explicit QAT level'
+        )
+    generation = str(
+        capabilities.get('hardware_generation', capabilities.get('qat_generation', ''))
+    ).strip().lower()
+    qat_1x = bool(
+        generation.startswith('1')
+        or generation.startswith('qat1')
+        or 'qat 1.' in generation
+    )
+    qat_2plus = bool(
+        generation.startswith(('2', '3', '4'))
+        or generation.startswith(('qat2', 'qat3', 'qat4'))
+        or any(f'qat {major}.' in generation for major in (2, 3, 4))
+    )
+    if configured <= 4:
+        return _validated(1)
+    if not qat_1x and not qat_2plus:
+        raise RuntimeError(
+            'QAT binding must report hardware_generation to map gzip levels above 4; '
+            'set YOLO_TTA_NRRD_QAT_LEVEL explicitly to override'
+        )
+    if configured == 5:
+        return _validated(5 if qat_1x else 1)
+    if configured <= 8:
+        return _validated(5 if qat_1x else 6)
+    return _validated(9)
+
+def _nrrd_iaa_level(capabilities: Dict[str, object]) -> int:
+    configured = int(nrrd_gzip_compresslevel())
+    default = 1 if configured <= 5 else 3
+    level = int(_env_int('YOLO_TTA_NRRD_IAA_LEVEL', int(default)))
+    raw_supported = capabilities.get('supported_levels', (1, 3))
+    try:
+        supported = tuple(sorted({int(value) for value in raw_supported}))  # type: ignore[union-attr]
+    except Exception:
+        supported = (1, 3)
+    if int(level) not in supported:
+        raise ValueError(
+            f'YOLO_TTA_NRRD_IAA_LEVEL={level} is unsupported; binding reports {supported}'
+        )
+    return int(level)
+
 def _nrrd_member_codec_spec(
     codec_name: str,
-) -> Tuple[str, int, Callable[[bytes], bytes]]:
-    """Resolve one complete-gzip codec without silently substituting another codec."""
+) -> NrrdMemberCodecSpec:
+    """Resolve one gzip-member-sequence codec without silently substituting."""
     name = str(codec_name).strip().lower()
     configured_level = int(nrrd_gzip_compresslevel())
+    if name in {'qat', 'iaa'}:
+        from .intel_compression import create_gzip_compressor, probe_capabilities
+
+        if name == 'qat' and _env_flag('YOLO_TTA_NRRD_QAT_SW_FALLBACK', False):
+            raise RuntimeError(
+                'YOLO_TTA_NRRD_QAT_SW_FALLBACK must remain disabled; '
+                'automatic fallback occurs only before an NRRD opens'
+            )
+        capabilities = probe_capabilities(name)
+        if name == 'qat':
+            level = int(_nrrd_qat_level(capabilities))
+            numa_id = _nrrd_optional_numa_id('YOLO_TTA_NRRD_QAT_NUMA_ID')
+        else:
+            level = int(_nrrd_iaa_level(capabilities))
+            numa_id = _nrrd_optional_numa_id('YOLO_TTA_NRRD_IAA_NUMA_ID')
+        compressor = create_gzip_compressor(
+            name, int(level), numa_id=numa_id, capabilities=capabilities,
+        )
+        return str(name), int(level), compressor
     if name == 'libdeflate':
         import deflate  # type: ignore
 
@@ -1196,7 +1491,7 @@ def nrrd_member_gzip_window_bytes() -> int:
     return max(64, _env_int('YOLO_TTA_NRRD_MEMBER_GZIP_WINDOW_MIB', 512)) * 1024 * 1024
 
 class _MemberParallelGzipPayloadWriter:
-    """File-like gzip encoder emitting one independent gzip member per chunk, pipelined.
+    """Pipelined encoder emitting one complete gzip member sequence per chunk.
 
  ``write(data)`` detaches chunks before deferring them, so callers may immediately reuse
  their buffers. Completion is unordered, but a sequence-indexed ready map drains the
@@ -1208,15 +1503,19 @@ class _MemberParallelGzipPayloadWriter:
         fh: object,
         *,
         chunk_bytes: Optional[int] = None,
-        codec_spec: Optional[Tuple[str, int, Callable[[bytes], bytes]]] = None,
+        codec_spec: Optional[NrrdMemberCodecSpec] = None,
     ) -> None:
         resolved = codec_spec if codec_spec is not None else _select_nrrd_member_codec()
         if resolved is None:
             raise RuntimeError('No validated complete-member NRRD gzip codec is available')
+        self.codec_spec = resolved
         self.fh = fh
         self.backend = str(resolved[0])
         self.eff_level = int(resolved[1])
         self.member_compress = resolved[2]
+        self.minimum_input_bytes = max(
+            1, int(getattr(self.member_compress, 'minimum_input_bytes', 1))
+        )
         self.chunk_bytes = int(chunk_bytes) if chunk_bytes else int(nrrd_gzip_chunk_bytes())
         self.window_bytes = int(nrrd_member_gzip_window_bytes())
         self.closed = False
@@ -1225,6 +1524,9 @@ class _MemberParallelGzipPayloadWriter:
         self._pending: Dict[Future, Tuple[int, int]] = {}
         self._completed: Dict[int, Tuple[bytes, int]] = {}
         self._inflight_bytes = 0
+        self._small_pending = bytearray()
+        self._hardware_lookbehind: Optional[object] = None
+        self._hardware_lookbehind_is_zero = False
 
     def _compress_member(self, payload: object) -> Tuple[bytes, int]:
         """Encode in one native gzip pass; CRC is produced by ISA-L/zlib itself.
@@ -1235,14 +1537,27 @@ class _MemberParallelGzipPayloadWriter:
         mv = payload if isinstance(payload, memoryview) else memoryview(payload)  # type: ignore[arg-type]
         mv = mv.cast('B')
         ln = int(len(mv))
-        # libdeflate, ISA-L, and zlib all emit the complete RFC-1952 member here,
-        # including CRC32/ISIZE in their native C pass.
+        telemetry = runtime_telemetry()
+        telemetry.add(f'nrrd.compression.{self.backend}.input_bytes', int(ln))
         try:
-            return bytes(self.member_compress(mv)), int(ln)
-        except TypeError:
-            # A codec wheel without generic buffer-protocol support is still valid; make
-            # its one required copy inside the worker, never on the sparse assembly thread.
-            return bytes(self.member_compress(bytes(mv))), int(ln)
+            with telemetry.span(f'nrrd.compression.{self.backend}.compress'):
+                try:
+                    member_sequence = bytes(self.member_compress(mv))
+                except TypeError:
+                    if bool(getattr(self.member_compress, 'hardware_backend', False)):
+                        # A hardware call may already have completed before a binding
+                        # raises while validating status/output. Never resubmit it.
+                        raise
+                    # A codec wheel without generic buffer-protocol support is still
+                    # valid; make its one required copy inside the worker, never on the
+                    # sparse assembly thread.
+                    member_sequence = bytes(self.member_compress(bytes(mv)))
+        except Exception:
+            telemetry.add(f'nrrd.compression.{self.backend}.failures', 1)
+            raise
+        telemetry.add(f'nrrd.compression.{self.backend}.output_bytes', len(member_sequence))
+        telemetry.add(f'nrrd.compression.{self.backend}.logical_requests', 1)
+        return member_sequence, int(ln)
 
     def _enqueue_completed(self, member: bytes) -> None:
         seq = int(self._next_sequence)
@@ -1254,7 +1569,7 @@ class _MemberParallelGzipPayloadWriter:
         self._next_sequence += 1
         payload = bytes(chunk_mv)  # detach once; classification no longer adds a NumPy scan
         ln = int(len(payload))
-        fut = _nrrd_gzip_executor().submit(
+        fut = _nrrd_gzip_executor(self.codec_spec).submit(
             self._compress_member, payload,
         )
         self._pending[fut] = (int(seq), int(ln))
@@ -1271,11 +1586,45 @@ class _MemberParallelGzipPayloadWriter:
         seq = int(self._next_sequence)
         self._next_sequence += 1
         ln = int(len(mv))
-        fut = _nrrd_gzip_executor().submit(
+        fut = _nrrd_gzip_executor(self.codec_spec).submit(
             self._compress_member, mv,
         )
         self._pending[fut] = (int(seq), int(ln))
         self._inflight_bytes += int(ln)
+
+    def _hardware_lookbehind_enabled(self) -> bool:
+        return bool(
+            getattr(self.member_compress, 'hardware_backend', False)
+            and int(self.minimum_input_bytes) > 1
+        )
+
+    def _submit_hardware_lookbehind(self) -> None:
+        owner = self._hardware_lookbehind
+        if owner is None:
+            return
+        is_zero = bool(self._hardware_lookbehind_is_zero)
+        self._hardware_lookbehind = None
+        self._hardware_lookbehind_is_zero = False
+        if is_zero:
+            self._enqueue_completed(_zero_gzip_member(len(memoryview(owner).cast('B'))))
+        else:
+            self._enqueue_owned_chunk(owner)
+
+    def _queue_data_chunk(self, chunk: object, *, owned: bool = False) -> None:
+        """Queue data, retaining one final hardware request for cross-write tails."""
+        mv = chunk if isinstance(chunk, memoryview) else memoryview(chunk)  # type: ignore[arg-type]
+        mv = mv.cast('B')
+        if not self._hardware_lookbehind_enabled():
+            if owned:
+                self._enqueue_owned_chunk(mv)
+            else:
+                self._enqueue_chunk(mv)
+            return
+        self._submit_hardware_lookbehind()
+        # Ordinary write() promises that its caller may immediately reuse the source;
+        # the owned path deliberately retains its exporter instead.
+        self._hardware_lookbehind = mv if owned else bytes(mv)
+        self._hardware_lookbehind_is_zero = False
 
     def _collect_completions(self, *, block: bool) -> int:
         if not self._pending:
@@ -1317,18 +1666,44 @@ class _MemberParallelGzipPayloadWriter:
         mv = data if isinstance(data, memoryview) else memoryview(data)
         mv = mv.cast('B')
         total = len(mv)
-        for off in range(0, total, self.chunk_bytes):
-            ln = min(self.chunk_bytes, total - off)
-            self._enqueue_chunk(mv[off:off + ln])
+        off = 0
+        if self._small_pending:
+            take = min(total, int(self.minimum_input_bytes) - len(self._small_pending))
+            if take > 0:
+                self._small_pending.extend(mv[:take])
+                off += int(take)
+            if len(self._small_pending) >= int(self.minimum_input_bytes):
+                self._queue_data_chunk(memoryview(bytes(self._small_pending)))
+                self._small_pending.clear()
+                self._drain(block=False)
+        remaining = int(total - off)
+        if 0 < remaining < int(self.minimum_input_bytes):
+            self._small_pending.extend(mv[off:])
+            return int(total)
+        while off < total:
+            remaining = int(total - off)
+            ln = min(int(self.chunk_bytes), remaining)
+            tail = int(remaining - ln)
+            # QATzip cannot prove hardware execution for sub-threshold tails. Merge a
+            # tiny tail into the preceding logical request instead of allowing SW work.
+            if 0 < tail < int(self.minimum_input_bytes):
+                ln = int(remaining)
+            self._queue_data_chunk(mv[off:off + ln])
+            off += int(ln)
             self._drain(block=False)
         return int(total)
 
     def write(self, data: bytes | bytearray | memoryview) -> int:
-        return self._write_impl(data)
+        try:
+            return self._write_impl(data)
+        except BaseException:
+            self.closed = True
+            self._abandon_and_settle()
+            raise
 
     def write_known_nonzero(self, data: bytes | bytearray | memoryview) -> int:
         """Encode cvol-index-classified bytes without a redundant all-zero scan."""
-        return self._write_impl(data)
+        return self.write(data)
 
     def write_owned_known_nonzero(self, data: object) -> int:
         """Ownership-transfer fast path for one already slice-aligned member."""
@@ -1338,26 +1713,100 @@ class _MemberParallelGzipPayloadWriter:
         mv = mv.cast('B')
         if len(mv) <= 0:
             return 0
-        self._enqueue_owned_chunk(mv)
-        self._drain(block=False)
+        if self._small_pending or len(mv) < int(self.minimum_input_bytes):
+            return self.write(mv)
+        try:
+            self._queue_data_chunk(mv, owned=True)
+            self._drain(block=False)
+        except BaseException:
+            self.closed = True
+            self._abandon_and_settle()
+            raise
         return int(len(mv))
 
     def write_aligned_zeros(self, nbytes: int) -> int:
         """Emit one complete cached zero member matching a whole-slice sparse member."""
         if self.closed:
             raise RuntimeError('Cannot write to a closed gzip payload stream')
-        ln = int(nbytes)
+        requested = int(nbytes)
+        ln = int(requested)
         if ln <= 0:
             return 0
-        self._enqueue_completed(_zero_gzip_member(int(ln)))
+        if self._small_pending:
+            take = min(ln, int(self.minimum_input_bytes) - len(self._small_pending))
+            self._small_pending.extend(bytes(int(take)))
+            ln -= int(take)
+            if len(self._small_pending) >= int(self.minimum_input_bytes):
+                self._queue_data_chunk(memoryview(bytes(self._small_pending)))
+                self._small_pending.clear()
+                self._drain(block=False)
+        if ln <= 0:
+            return int(nbytes)
+        if self._hardware_lookbehind_enabled() and ln < int(self.minimum_input_bytes):
+            if self._hardware_lookbehind is None:
+                self._small_pending.extend(bytes(int(ln)))
+            else:
+                self._hardware_lookbehind = (
+                    bytes(memoryview(self._hardware_lookbehind).cast('B'))
+                    + bytes(int(ln))
+                )
+            return int(requested)
+        self._submit_hardware_lookbehind()
+        if self._hardware_lookbehind_enabled():
+            # Retain the final hardware-sized zero span so a later sub-threshold
+            # nonzero write can be appended without reordering bytes or falling back
+            # to software. Most of a large zero run still uses the cached member.
+            cached = int(ln) - int(self.minimum_input_bytes)
+            if cached > 0:
+                self._enqueue_completed(_zero_gzip_member(int(cached)))
+            self._hardware_lookbehind = bytes(int(self.minimum_input_bytes))
+            self._hardware_lookbehind_is_zero = True
+        else:
+            self._enqueue_completed(_zero_gzip_member(int(ln)))
         self._drain(block=False)
-        return int(ln)
+        return int(requested)
 
     def write_zeros(self, nbytes: int) -> int:
         """Emit cached all-zero members without materializing the zeros."""
         if self.closed:
             raise RuntimeError('Cannot write to a closed gzip payload stream')
         remaining = int(nbytes)
+        if self._small_pending and remaining > 0:
+            take = min(remaining, int(self.minimum_input_bytes) - len(self._small_pending))
+            self._small_pending.extend(bytes(int(take)))
+            remaining -= int(take)
+            if len(self._small_pending) >= int(self.minimum_input_bytes):
+                self._queue_data_chunk(memoryview(bytes(self._small_pending)))
+                self._small_pending.clear()
+                self._drain(block=False)
+        if (
+            self._hardware_lookbehind_enabled()
+            and 0 < remaining < int(self.minimum_input_bytes)
+        ):
+            if self._hardware_lookbehind is None:
+                self._small_pending.extend(bytes(int(remaining)))
+            else:
+                self._hardware_lookbehind = (
+                    bytes(memoryview(self._hardware_lookbehind).cast('B'))
+                    + bytes(int(remaining))
+                )
+            remaining = 0
+        if remaining > 0:
+            self._submit_hardware_lookbehind()
+        if self._hardware_lookbehind_enabled() and remaining > 0:
+            # Keep the logical tail of the zero run unresolved. If the next call is
+            # tiny, close() merges it into this hardware-eligible span; if there is no
+            # next call, _submit_hardware_lookbehind() emits it from the zero cache.
+            retained = int(self.minimum_input_bytes)
+            cached_remaining = int(remaining) - retained
+            while cached_remaining > 0:
+                ln = min(self.chunk_bytes, cached_remaining)
+                self._enqueue_completed(_zero_gzip_member(int(ln)))
+                cached_remaining -= int(ln)
+                self._drain(block=False)
+            self._hardware_lookbehind = bytes(retained)
+            self._hardware_lookbehind_is_zero = True
+            remaining = 0
         while remaining > 0:
             ln = min(self.chunk_bytes, remaining)
             self._enqueue_completed(_zero_gzip_member(int(ln)))
@@ -1368,10 +1817,52 @@ class _MemberParallelGzipPayloadWriter:
     def close(self) -> None:
         if self.closed:
             return
+        if self._small_pending:
+            if self._hardware_lookbehind is not None:
+                combined = bytes(memoryview(self._hardware_lookbehind).cast('B')) + bytes(
+                    self._small_pending
+                )
+                self._hardware_lookbehind = None
+                self._hardware_lookbehind_is_zero = False
+                self._small_pending.clear()
+                self._queue_data_chunk(memoryview(combined), owned=True)
+            elif len(self._small_pending) < int(self.minimum_input_bytes):
+                pending_bytes = int(len(self._small_pending))
+                self.closed = True
+                self._abandon_and_settle()
+                raise RuntimeError(
+                    f'{self.backend} cannot encode the final {pending_bytes}-byte '
+                    f'payload entirely in hardware (minimum {self.minimum_input_bytes})'
+                )
+            else:
+                self._queue_data_chunk(memoryview(bytes(self._small_pending)))
+                self._small_pending.clear()
+        self._submit_hardware_lookbehind()
         self.closed = True
-        self._drain(block=True)
+        try:
+            self._drain(block=True)
+        except BaseException:
+            self._abandon_and_settle()
+            raise
         if self._pending or self._completed or int(self._next_write_sequence) != int(self._next_sequence):
             raise RuntimeError('NRRD member completion map did not drain completely')
+
+    def _abandon_and_settle(self) -> None:
+        """Retain inputs and wait until no failed native/DMA request can still run."""
+        pending = list(self._pending)
+        for fut in pending:
+            fut.cancel()
+        for fut in pending:
+            try:
+                fut.result()
+            except BaseException:
+                pass
+        self._pending.clear()
+        self._completed.clear()
+        self._small_pending.clear()
+        self._hardware_lookbehind = None
+        self._hardware_lookbehind_is_zero = False
+        self._inflight_bytes = 0
 
     def __enter__(self) -> '_MemberParallelGzipPayloadWriter':
         return self
@@ -1382,12 +1873,11 @@ class _MemberParallelGzipPayloadWriter:
             return
         # Broken stream: the file is already failed — abandon pending members.
         self.closed = True
-        for fut in self._pending:
-            fut.cancel()
-        self._pending.clear()
-        self._completed.clear()
+        self._abandon_and_settle()
 
 _NRRD_MEMBER_GZIP_OK: Dict[Tuple[str, int], bool] = {}
+
+_NRRD_MEMBER_GZIP_FAILURE_REASONS: Dict[Tuple[str, int], str] = {}
 
 _NRRD_MEMBER_GZIP_TEST_LOCK = threading.Lock()
 
@@ -1399,12 +1889,45 @@ _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED = False
 
 _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCE_LOCK = threading.Lock()
 
+def _after_nrrd_compression_fork_child() -> None:
+    """Discard parent compressor pools, locks, and policy caches in a fork child."""
+    global _NRRD_GZIP_EXECUTOR, _NRRD_GZIP_EXECUTORS
+    global _NRRD_GZIP_EXECUTOR_LOCK, _NRRD_ZERO_MEMBER_LOCK
+    global _NRRD_ZERO_MEMBER_CACHE, _NRRD_MEMBER_CODEC_SETTING_WARNED
+    global _NRRD_MEMBER_GZIP_OK, _NRRD_MEMBER_GZIP_FAILURE_REASONS
+    global _NRRD_MEMBER_GZIP_TEST_LOCK, _NRRD_MEMBER_GZIP_ANNOUNCED
+    global _NRRD_MEMBER_CODEC_FAILURES_ANNOUNCED
+    global _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED
+    global _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCE_LOCK
+
+    # No ThreadPoolExecutor worker survives fork(), and any inherited lock may have
+    # been held by a vanished parent thread. Never call shutdown() or acquire one of
+    # those locks in the child; replace the complete process-local state directly.
+    _NRRD_GZIP_EXECUTOR = None
+    _NRRD_GZIP_EXECUTORS = {}
+    _NRRD_GZIP_EXECUTOR_LOCK = threading.Lock()
+    _NRRD_ZERO_MEMBER_CACHE = {}
+    _NRRD_ZERO_MEMBER_LOCK = threading.Lock()
+    _NRRD_MEMBER_CODEC_SETTING_WARNED = False
+    _NRRD_MEMBER_GZIP_OK = {}
+    _NRRD_MEMBER_GZIP_FAILURE_REASONS = {}
+    _NRRD_MEMBER_GZIP_TEST_LOCK = threading.Lock()
+    _NRRD_MEMBER_GZIP_ANNOUNCED = False
+    _NRRD_MEMBER_CODEC_FAILURES_ANNOUNCED = set()
+    _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED = False
+    _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCE_LOCK = threading.Lock()
+    # _NRRD_GZIP_EXECUTOR_ATEXIT_REGISTERED intentionally remains unchanged:
+    # Python's atexit registry is inherited, so the child already owns that callback.
+
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(after_in_child=_after_nrrd_compression_fork_child)
+
 def _announce_nrrd_cpu_deflate_backend(
     tier: str,
     *,
-    codec_spec: Tuple[str, int, Callable[[bytes], bytes]],
+    codec_spec: NrrdMemberCodecSpec,
 ) -> None:
-    """Report the actual CPU encoder selected after its self-test, once per process."""
+    """Report the actual encoder selected after hardware proof/KAT, once per process."""
     global _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED
     if _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED:
         return
@@ -1413,18 +1936,49 @@ def _announce_nrrd_cpu_deflate_backend(
             return
         backend, level, _compress = codec_spec
         display = {
+            'qat': 'Intel QAT/QATzip hardware',
+            'iaa': 'Intel IAA/QPL hardware',
             'libdeflate': 'libdeflate (python-deflate)',
             'isal': 'ISA-L (python-isal)',
             'zlib': 'zlib',
         }.get(str(backend), str(backend))
-        print(f'CPU NRRD DEFLATE backend selected: {display}, level={int(level)}, tier={tier}.')
+        requested = str(nrrd_member_codec_requested())
+        print(
+            f'NRRD DEFLATE backend selected: {display}, level={int(level)}, '
+            f'policy={requested}, tier={tier}.'
+        )
+        telemetry = runtime_telemetry()
+        telemetry.gauge('nrrd.compression.requested_backend', requested)
+        telemetry.gauge('nrrd.compression.selected_backend', str(backend))
+        telemetry.gauge('nrrd.compression.effective_level', int(level))
+        capabilities = getattr(_compress, 'capabilities', None)
+        if isinstance(capabilities, dict):
+            telemetry.gauge(f'nrrd.compression.{backend}.capabilities', capabilities)
         _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED = True
 
+def _preflight_nrrd_codec_threads(codec_spec: NrrdMemberCodecSpec) -> None:
+    """Initialize every hardware pool worker before any logical NRRD is opened."""
+    compressor = codec_spec[2]
+    if not bool(getattr(compressor, 'hardware_backend', False)):
+        return
+    preflight = getattr(compressor, 'preflight_thread_state', None)
+    if not callable(preflight):
+        raise RuntimeError(
+            f'{codec_spec[0]} hardware codec does not expose thread-session preflight'
+        )
+    workers = int(_nrrd_codec_worker_count(codec_spec))
+    executor = _nrrd_gzip_executor(codec_spec)
+    _run_on_every_executor_thread(executor, workers, preflight)
+
+def _nrrd_member_codec_test_key(codec_spec: NrrdMemberCodecSpec) -> Tuple[str, int]:
+    compressor_identity = getattr(codec_spec[2], 'cache_key', str(codec_spec[0]))
+    return (repr(compressor_identity), int(codec_spec[1]))
+
 def _nrrd_member_codec_self_test(
-    codec_spec: Tuple[str, int, Callable[[bytes], bytes]],
+    codec_spec: NrrdMemberCodecSpec,
 ) -> bool:
     """KAT one codec's complete framing plus the member writer's ordered/zero paths."""
-    key = (str(codec_spec[0]), int(codec_spec[1]))
+    key = _nrrd_member_codec_test_key(codec_spec)
     cached = _NRRD_MEMBER_GZIP_OK.get(key)
     if cached is not None:
         return bool(cached)
@@ -1432,15 +1986,34 @@ def _nrrd_member_codec_self_test(
         cached = _NRRD_MEMBER_GZIP_OK.get(key)
         if cached is not None:
             return bool(cached)
+        failure_reason = ''
         try:
             import gzip as _gzip
-            part_a = bytes(range(256)) * 41 + b'\x00' * 3000  # spans members; all-zero tail member
-            part_b = b'\x00' * 8192                            # write_zeros: cached members only
-            part_c = b'nrrd-member-gzip-self-test' * 99
+            _preflight_nrrd_codec_threads(codec_spec)
+            minimum_input = max(
+                1, int(getattr(codec_spec[2], 'minimum_input_bytes', 1))
+            )
+            kat_chunk = max(4096, int(minimum_input))
+            # Scale both nonzero phases from the binding's hardware threshold. Fixed
+            # kilobyte-sized KAT data would incorrectly reject a valid accelerator whose
+            # minimum request is larger. The short tail makes the writer merge it into
+            # the preceding chunk instead of accidentally exercising software fallback.
+            short_tail = 1 if int(minimum_input) <= 1 else min(3000, minimum_input - 1)
+            part_a_size = int(kat_chunk) * 2 + int(short_tail)
+            part_a_seed = bytes(range(256)) + b'\x00' * 31
+            part_a = (
+                part_a_seed * ((int(part_a_size) + len(part_a_seed) - 1) // len(part_a_seed))
+            )[:int(part_a_size)]
+            part_b = b'\x00' * 8192  # write_zeros: cached members only
+            part_c_size = int(kat_chunk) + int(short_tail)
+            part_c_seed = b'nrrd-member-gzip-self-test\x00'
+            part_c = (
+                part_c_seed * ((int(part_c_size) + len(part_c_seed) - 1) // len(part_c_seed))
+            )[:int(part_c_size)]
             sink = io.BytesIO()
             writer = _MemberParallelGzipPayloadWriter(
                 sink,
-                chunk_bytes=4096,
+                chunk_bytes=int(kat_chunk),
                 codec_spec=codec_spec,
             )
             writer.write(part_a)
@@ -1448,43 +2021,84 @@ def _nrrd_member_codec_self_test(
             writer.write(part_c)
             writer.close()
             ok = bool(_gzip.decompress(sink.getvalue()) == part_a + part_b + part_c)
-        except Exception:
+            if not ok:
+                failure_reason = 'known-answer gzip round trip returned different bytes'
+        except Exception as exc:
             ok = False
+            failure_reason = f'{type(exc).__name__}: {exc}'
+        if not bool(ok) and bool(getattr(codec_spec[2], 'hardware_backend', False)):
+            _retire_nrrd_codec_executor(codec_spec)
         _NRRD_MEMBER_GZIP_OK[key] = bool(ok)
+        if ok:
+            _NRRD_MEMBER_GZIP_FAILURE_REASONS.pop(key, None)
+        else:
+            _NRRD_MEMBER_GZIP_FAILURE_REASONS[key] = (
+                str(failure_reason) or 'known-answer/round-trip self-test failed'
+            )
         return bool(ok)
 
-def _select_nrrd_member_codec() -> Optional[Tuple[str, int, Callable[[bytes], bytes]]]:
+def _select_nrrd_member_codec(
+    *,
+    expected_input_bytes: Optional[int] = None,
+) -> Optional[NrrdMemberCodecSpec]:
     """First available and KAT-validated configured complete-member codec wins."""
     requested = str(nrrd_member_codec_requested())
     for name in _nrrd_member_codec_candidates():
         codec_loaded = False
+        module_missing = False
         try:
             spec = _nrrd_member_codec_spec(str(name))
             codec_loaded = True
+            minimum_input = max(1, int(getattr(spec[2], 'minimum_input_bytes', 1)))
+            if (
+                expected_input_bytes is not None
+                and int(expected_input_bytes) < int(minimum_input)
+            ):
+                reason = (
+                    f'logical payload is {int(expected_input_bytes)} bytes, below the '
+                    f'{minimum_input}-byte hardware-only minimum'
+                )
+                raise RuntimeError(reason)
             if _nrrd_member_codec_self_test(spec):
+                runtime_telemetry().gauge('nrrd.compression.requested_backend', requested)
+                runtime_telemetry().gauge('nrrd.compression.selected_backend', str(spec[0]))
                 return spec
-            reason = 'known-answer/round-trip self-test failed'
+            reason = _NRRD_MEMBER_GZIP_FAILURE_REASONS.get(
+                _nrrd_member_codec_test_key(spec),
+                'known-answer/round-trip self-test failed',
+            )
         except Exception as exc:
             reason = str(exc) or type(exc).__name__
+            module_missing = bool(getattr(exc, 'module_missing', False))
         # Missing optional codecs are expected in auto mode. Forced selection and actual
         # codec corruption are announced once, without preventing the lower gzip tiers.
-        announce = bool(requested != 'auto' or codec_loaded or str(name) == 'zlib')
+        policy_chain = requested in {'auto', 'cpu'}
+        announce = bool(
+            not policy_chain
+            or codec_loaded
+            or str(name) == 'zlib'
+            or (str(name) in {'qat', 'iaa'} and not module_missing)
+        )
+        runtime_telemetry().fallback(f'nrrd.compression.{name}', RuntimeError(str(reason)))
         failure_key = (str(name), str(reason))
         if announce and failure_key not in _NRRD_MEMBER_CODEC_FAILURES_ANNOUNCED:
             _NRRD_MEMBER_CODEC_FAILURES_ANNOUNCED.add(failure_key)
-            print(
-                f'Warning: NRRD member codec {name!r} unavailable ({reason}); '
-                'using the next validated NRRD gzip tier.'
-            )
+            if policy_chain:
+                print(
+                    f'Warning: NRRD member codec {name!r} unavailable ({reason}); '
+                    'using the next validated NRRD gzip tier.'
+                )
+            else:
+                print(f'Warning: requested NRRD member codec {name!r} failed ({reason}).')
     return None
 
-def _open_nrrd_payload_writer(fh: object) -> _MemberParallelGzipPayloadWriter:
-    """Open the first KAT-validated complete-member CPU gzip codec.
-
- Automatic selection tries libdeflate, ISA-L, and stdlib zlib in that order.
- If every configured codec fails validation, output stops with a specific
- error rather than switching to an unvalidated framing implementation."""
-    member_codec = _select_nrrd_member_codec()
+def _require_nrrd_member_codec(
+    *,
+    expected_input_bytes: Optional[int] = None,
+) -> NrrdMemberCodecSpec:
+    member_codec = _select_nrrd_member_codec(
+        expected_input_bytes=expected_input_bytes,
+    )
     if member_codec is None:
         requested = nrrd_member_codec_requested()
         raise RuntimeError(
@@ -1492,6 +2106,19 @@ def _open_nrrd_payload_writer(fh: object) -> _MemberParallelGzipPayloadWriter:
             f'(YOLO_TTA_NRRD_MEMBER_CODEC={requested!r}; tried '
             f'{list(_nrrd_member_codec_candidates())}).'
         )
+    return member_codec
+
+def _open_nrrd_payload_writer(
+    fh: object,
+    *,
+    codec_spec: Optional[NrrdMemberCodecSpec] = None,
+) -> _MemberParallelGzipPayloadWriter:
+    """Open one already-proven or newly selected complete gzip codec.
+
+ Automatic selection tries hardware-only QAT, libdeflate, ISA-L, and zlib in order.
+ If every configured codec fails validation, output stops with a specific
+ error rather than switching to an unvalidated framing implementation."""
+    member_codec = codec_spec if codec_spec is not None else _require_nrrd_member_codec()
     global _NRRD_MEMBER_GZIP_ANNOUNCED
     if not _NRRD_MEMBER_GZIP_ANNOUNCED:
         _NRRD_MEMBER_GZIP_ANNOUNCED = True
@@ -1798,8 +2425,9 @@ def write_single_layer_nrrd_from_ref(
  The layer is restored from its backing-store geometry directly to the final output
  geometry while streaming, reusing the same per-layer restore/stream path as the legacy
  decomposed writer. Each file holds one uint8 binary mask and is compressed
- as KAT-validated complete gzip members using libdeflate, ISA-L, or stdlib
- zlib. The Slicer segmentation fields make the file import as a Segmentation
+ as KAT-validated complete gzip members, preferring hardware-only QAT before
+ libdeflate, ISA-L, or stdlib zlib; ``cpu`` opts out of QAT and IAA remains
+ explicit-only. The Slicer segmentation fields make the file import as a Segmentation
  node; segment_name defaults to the output filename stem and segment_color to
  the deterministic palette pick for that name."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1834,6 +2462,20 @@ def write_single_layer_nrrd_from_ref(
             1,
             min(int(stored_t), int(z_shards), int(_nrrd_zshard_capacity())),
         )
+    bands: Optional[List[Tuple[int, int]]] = None
+    band_weights: Optional[List[int]] = None
+    expected_codec_request_bytes = int(stored_t) * int(stored_h) * int(stored_w)
+    if shard_count > 1:
+        bands, band_weights = _nrrd_layer_zshard_bands(ref, int(out_t), int(shard_count))
+        expected_codec_request_bytes = min(
+            max(0, int(z1) - int(z0)) * int(stored_h) * int(stored_w)
+            for z0, z1 in bands
+        )
+    # Resolve, preflight, and KAT exactly once before a staging file/spool is opened.
+    # Every z shard of this logical NRRD is pinned to this immutable codec spec.
+    member_codec = _require_nrrd_member_codec(
+        expected_input_bytes=int(expected_codec_request_bytes),
+    )
     if shard_count <= 1:
         with _same_directory_atomic_output(out_path) as stage_path:
             with open(stage_path, 'wb') as fh:
@@ -1845,7 +2487,7 @@ def write_single_layer_nrrd_from_ref(
                     data_type='unsigned char',
                     encoding='gzip',
                 )
-                with _open_nrrd_payload_writer(fh) as payload_writer:
+                with _open_nrrd_payload_writer(fh, codec_spec=member_codec) as payload_writer:
                     _write_one_decomposed_nrrd_layer_payload(
                         ref,
                         (out_t, out_h, out_w),
@@ -1860,7 +2502,8 @@ def write_single_layer_nrrd_from_ref(
     # A band holds ONE process-global permit only while it is actually compressing. This
     # lets two 8-band global files use a 12-lane budget concurrently and removes the
     # ordered bounded-queue backpressure that previously kept later compressors idle.
-    bands, band_weights = _nrrd_layer_zshard_bands(ref, int(out_t), int(shard_count))
+    if bands is None:
+        raise RuntimeError('NRRD z-shard bands were not resolved')
     token = f'{os.getpid()}.{threading.get_ident()}'
     final_tmp = out_path.with_name(f'.{out_path.name}.{token}.assembling')
     shard_z_chunk = max(1, int(z_chunk) // int(shard_count))
@@ -1891,7 +2534,7 @@ def write_single_layer_nrrd_from_ref(
             spool = _open_memory_backed_encoded_chunk(
                 f'{out_path.stem}.nrrd.z{int(z0):06d}-{int(z1):06d}.gz',
             )
-            with _open_nrrd_payload_writer(spool) as payload_writer:
+            with _open_nrrd_payload_writer(spool, codec_spec=member_codec) as payload_writer:
                 _write_one_decomposed_nrrd_layer_payload(
                     ref,
                     (out_t, out_h, out_w),
@@ -2443,13 +3086,16 @@ def write_layer_nrrd_with_low_quality_mirrors(
             if vol is None:
                 raise RuntimeError('mirror tee produced no host payload')
             step = max(1, int(_nrrd_full_slice_z_chunk(1, stored_w, stored_h, stored_t)))
+            member_codec = _require_nrrd_member_codec(
+                expected_input_bytes=int(stored_t) * int(stored_h) * int(stored_w),
+            )
             with _same_directory_atomic_output(m_path) as stage_path:
                 with open(stage_path, 'wb') as fh:
                     _write_nrrd_ascii_header(
                         fh, header=header, sizes=(stored_w, stored_h, stored_t),
                         dimension=3, data_type='unsigned char', encoding='gzip',
                     )
-                    with _open_nrrd_payload_writer(fh) as payload_writer:
+                    with _open_nrrd_payload_writer(fh, codec_spec=member_codec) as payload_writer:
                         for z0 in range(0, int(stored_t), step):
                             z1 = min(int(stored_t), int(z0) + step)
                             payload_writer.write(memoryview(vol[z0:z1]).cast('B'))  # type: ignore[index]

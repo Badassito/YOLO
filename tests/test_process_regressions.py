@@ -271,6 +271,29 @@ class PipelineLifecycleRegressionTests(unittest.TestCase):
         self.assertEqual(process_queue.close_calls, 1)
         self.assertEqual(process_queue.join_calls, 0)
 
+    def test_compressor_shutdown_failure_does_not_strand_pipeline_lock(self) -> None:
+        implementation_calls = 0
+        telemetry = mock.Mock()
+
+        def _implementation() -> None:
+            nonlocal implementation_calls
+            implementation_calls += 1
+
+        with (
+            mock.patch.object(pipeline, '_main_impl', side_effect=_implementation),
+            mock.patch.object(
+                pipeline, 'shutdown_nrrd_gzip_executors',
+                side_effect=RuntimeError('compressor shutdown sentinel'),
+            ),
+            mock.patch.object(pipeline, 'runtime_telemetry', return_value=telemetry),
+            mock.patch('builtins.print'),
+        ):
+            pipeline.main()
+            pipeline.main()
+
+        self.assertEqual(implementation_calls, 2)
+        self.assertEqual(telemetry.fallback.call_count, 2)
+
     def test_later_thread_pool_constructor_failure_closes_earlier_pool(self) -> None:
         class _Executor:
             def __init__(self) -> None:

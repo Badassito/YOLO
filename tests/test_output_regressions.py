@@ -55,7 +55,7 @@ def _serial_indices(total: int, function: object, **_kwargs: object) -> None:
 
 
 @contextlib.contextmanager
-def _payload_writer(file_handle: object):
+def _payload_writer(file_handle: object, **_kwargs: object):
     yield file_handle
 
 

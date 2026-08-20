@@ -46,12 +46,20 @@ class ImportRegressionTests(unittest.TestCase):
 
             install_stubs()
             importlib.import_module("volume_tta." + sys.argv[1])
-            forbidden = {"cupy", "jax", "openvino", "torch", "ultralytics"}
+            forbidden = {
+                "cupy", "jax", "openvino", "torch", "ultralytics",
+                "qatzip", "qpl", "accel_config", "dto", "dml",
+            }
             loaded = {name.split(".")[0] for name in sys.modules}
             assert not (forbidden & loaded), forbidden & loaded
+            native_modules = {
+                "volume_tta._qat_codec", "volume_tta._qpl_codec",
+                "volume_tta._dsa_copy",
+            }
+            assert not (native_modules & set(sys.modules)), native_modules & set(sys.modules)
             """
         )
-        for subsystem in ("topology", "interpolation"):
+        for subsystem in ("topology", "interpolation", "outputs", "runtime"):
             with self.subTest(subsystem=subsystem):
                 completed = self.run_python("-c", program, subsystem)
                 self.assertEqual(completed.returncode, 0, completed.stdout)

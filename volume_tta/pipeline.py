@@ -185,6 +185,25 @@ def main() -> None:
                 'Warning: streaming producer teardown exceeded 30 seconds; abort state '
                 'remains set and a repeated embedded run will be rejected.'
             )
+        else:
+            # Native QAT/QPL sessions are thread-owned. Close them on the compressor
+            # workers only after every sink/producer has stopped issuing members.
+            try:
+                shutdown_nrrd_gzip_executors()
+            except BaseException as exc:
+                # Compressor teardown is best-effort at this outer lifecycle boundary.
+                # It must not replace the pipeline failure or strand _PIPELINE_RUN_LOCK.
+                try:
+                    runtime_telemetry().fallback('nrrd.compression.shutdown', exc)
+                except BaseException:
+                    pass
+                try:
+                    print(
+                        'Warning: NRRD compressor shutdown failed '
+                        f'({type(exc).__name__}: {exc}).'
+                    )
+                except BaseException:
+                    pass
         shutdown_parallel_pool_cache()
         try:
             _set_main_process_gpu_stage_wake_callback(None)
@@ -1342,8 +1361,10 @@ def _main_impl() -> None:
         'captured by YOLO_TTA_FUSED_RENDER_CUDA_GRAPHS.'
     )
     spec_notes.append(
-        'v13.3.14 N17/N15: complete-member NRRD compression selects a validated libdeflate, '
-        'ISA-L, or zlib codec via YOLO_TTA_NRRD_MEMBER_CODEC; global z-shard counts are resolved '
+        'v17.0.8 / N17/N15: complete-member NRRD compression prefers validated hardware-only '
+        'QAT, then libdeflate, ISA-L, or zlib via YOLO_TTA_NRRD_MEMBER_CODEC; `cpu` opts out '
+        'of QAT while retaining the CPU chain, and explicit `iaa` remains hardware-only; '
+        'global z-shard counts are resolved '
         'at sink execution against the shared band capacity, and the ordered shard queue defaults '
         'to 32 items.'
     )
@@ -1499,7 +1520,9 @@ def _main_impl() -> None:
         'streaming, gzip-compressed by the selected validated backend, and written by a background sink as the layer is produced '
         'during the intermediate pipeline steps (so the Transverse layer compresses while Tiled Transverse is still '
         'inferencing, and the global union layer is written while smoothing runs). A single '
-        f'{OUTPUT_NRRD_PREFIX}{{Filestem}}_nrrd_manifest.json lists every written layer. Tune YOLO_TTA_NRRD_MEMBER_CODEC, '
+        f'{OUTPUT_NRRD_PREFIX}{{Filestem}}_nrrd_manifest.json lists every written layer. '
+        'The default member codec policy is QAT-first `auto`; set YOLO_TTA_NRRD_MEMBER_CODEC=cpu '
+        'to opt out without losing the CPU fallback chain. Tune YOLO_TTA_NRRD_MEMBER_CODEC, '
         'YOLO_TTA_NRRD_MEMBER_GZIP_WINDOW_MIB, YOLO_TTA_NRRD_GZIP_CHUNK_MIB, and '
         'YOLO_TTA_NRRD_LAYER_SINK_WORKERS for member-parallel compression. The previous mega '
         f'4D decomposed NRRD (one file, trailing list axis) was removed. space={NRRD_SPACE}.'
@@ -7876,6 +7899,7 @@ _bind_late_symbols(
             "nrrd_layer_sink_workers",
             "resolve_low_quality_downbin_specs",
             "set_nrrd_layer_sink",
+            "shutdown_nrrd_gzip_executors",
             "write_summary_file",
             "write_view_images",
         ),

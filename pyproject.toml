@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "volume-tta"
-version = "17.0.7"
+version = "17.0.8"
 description = "YOLO segmentation test-time augmentation for large cylindrical video volumes"
 requires-python = ">=3.10"
 dependencies = [
@@ -26,3 +26,9 @@ volume-tta = "volume_tta.__main__:run"
 
 [tool.setuptools.packages.find]
 include = ["volume_tta*"]
+
+[tool.setuptools.data-files]
+"share/volume-tta" = [
+  "ARCHITECTURE.md",
+  "GPT-5.6-Sol-Pro_v17.0.8_SLURM.py",
+]
