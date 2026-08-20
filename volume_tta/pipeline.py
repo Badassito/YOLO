@@ -10,7 +10,193 @@ from ._stdlib import *
 import numpy as np
 from ._deps import cv2
 
+class _PipelineRunResources:
+    """Last-resort ownership for resources created anywhere in one pipeline run.
+
+    The scheduler retains its detailed, phase-aware teardown.  This outer registry covers
+    construction failures before that ``try`` and failures in the final assembly/output
+    tail, where local executors and processes previously escaped their cleanup block.
+    """
+
+    def __init__(self) -> None:
+        self.executors: List[object] = []
+        self.output_managers: List[object] = []
+        self.sinks: List[object] = []
+        self.processes: List[object] = []
+        self.queues: List[object] = []
+        self.threads: List[Tuple[threading.Thread, Optional[threading.Event]]] = []
+        self._seen: set[int] = set()
+
+    def _add(self, collection: List[object], resource: object) -> object:
+        if resource is not None and id(resource) not in self._seen:
+            self._seen.add(id(resource))
+            collection.append(resource)
+        return resource
+
+    def track_executor(self, resource: object) -> object:
+        return self._add(self.executors, resource)
+
+    def track_output_manager(self, resource: object) -> object:
+        return self._add(self.output_managers, resource)
+
+    def track_sink(self, resource: object) -> object:
+        return self._add(self.sinks, resource)
+
+    def track_process(self, resource: object) -> object:
+        return self._add(self.processes, resource)
+
+    def track_queue(self, resource: object) -> object:
+        return self._add(self.queues, resource)
+
+    def track_thread(
+        self,
+        thread: threading.Thread,
+        stop_event: Optional[threading.Event] = None,
+    ) -> threading.Thread:
+        if id(thread) not in self._seen:
+            self._seen.add(id(thread))
+            self.threads.append((thread, stop_event))
+        return thread
+
+    def close(self, *, failed: bool) -> None:
+        for _thread, stop_event in self.threads:
+            if stop_event is not None:
+                stop_event.set()
+
+        # A process left here escaped the scheduler's cooperative sentinel path. Terminate
+        # it before closing queues or waiting on parent thread pools that may depend on it.
+        for proc in reversed(self.processes):
+            try:
+                proc.join(timeout=0.0 if failed else 0.25)  # type: ignore[attr-defined]
+                if proc.is_alive():  # type: ignore[attr-defined]
+                    proc.terminate()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        for proc in reversed(self.processes):
+            try:
+                proc.join(timeout=2.0)  # type: ignore[attr-defined]
+                if proc.is_alive() and hasattr(proc, 'kill'):  # type: ignore[attr-defined]
+                    proc.kill()  # type: ignore[attr-defined]
+                    proc.join(timeout=1.0)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+        for manager in reversed(self.output_managers):
+            try:
+                manager.wait()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        for sink in reversed(self.sinks):
+            try:
+                sink.shutdown()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        for executor in reversed(self.executors):
+            try:
+                executor.shutdown(wait=True, cancel_futures=bool(failed))  # type: ignore[attr-defined]
+            except TypeError:
+                try:
+                    executor.shutdown(wait=True)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        for thread, _stop_event in reversed(self.threads):
+            try:
+                if thread is not threading.current_thread():
+                    thread.join(timeout=5.0)
+            except Exception:
+                pass
+        for process_queue in reversed(self.queues):
+            if failed:
+                try:
+                    process_queue.cancel_join_thread()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            try:
+                process_queue.close()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            if not failed:
+                try:
+                    process_queue.join_thread()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+
+_PIPELINE_RUN_LOCK = threading.Lock()
+
+_ACTIVE_PIPELINE_RUN_RESOURCES: Optional[_PipelineRunResources] = None
+
+def _run_resources() -> _PipelineRunResources:
+    resources = _ACTIVE_PIPELINE_RUN_RESOURCES
+    if resources is None:
+        raise RuntimeError('pipeline resource created outside an active main() invocation')
+    return resources
+
+def _create_tracked_thread_pool(
+    *,
+    max_workers: int,
+    thread_name_prefix: str,
+) -> ThreadPoolExecutor:
+    """Construct and register one pool before the next fallible constructor runs."""
+    executor = ThreadPoolExecutor(
+        max_workers=int(max_workers),
+        thread_name_prefix=str(thread_name_prefix),
+    )
+    _run_resources().track_executor(executor)
+    return executor
+
 def main() -> None:
+    """Execute one pipeline run with a lifecycle boundary spanning the full function."""
+    global _ACTIVE_PIPELINE_RUN_RESOURCES
+    if not _PIPELINE_RUN_LOCK.acquire(blocking=False):
+        raise RuntimeError('concurrent volume_tta.pipeline.main() invocations are not supported')
+    resources = _PipelineRunResources()
+    _ACTIVE_PIPELINE_RUN_RESOURCES = resources
+    failed = True
+    try:
+        reset_streaming_state_for_new_run()
+        reset_runtime_state_for_new_run()
+        _main_impl()
+        failed = False
+    finally:
+        if failed:
+            abort_streaming_producers('pipeline run failed')
+        aux_pool = gpu_worker_aux_interpolation_pool()
+        if aux_pool is not None and failed:
+            try:
+                aux_pool.mark_failed('pipeline run failed')
+            except Exception:
+                pass
+        set_gpu_worker_aux_interpolation_pool(None)
+        set_interpolation_process_executor(None, 0)
+        resources.close(failed=bool(failed))
+        active_sink = nrrd_layer_sink()
+        if active_sink is not None:
+            try:
+                active_sink.shutdown()
+            except Exception:
+                pass
+            set_nrrd_layer_sink(None)
+        producer_timeout = 30.0 if failed else None
+        producers_settled = wait_for_streaming_producers(timeout=producer_timeout)
+        if not producers_settled:
+            print(
+                'Warning: streaming producer teardown exceeded 30 seconds; abort state '
+                'remains set and a repeated embedded run will be rejected.'
+            )
+        shutdown_parallel_pool_cache()
+        try:
+            _set_main_process_gpu_stage_wake_callback(None)
+            _set_main_process_gpu_pending_inference(False)
+            _set_main_process_gpu_inference_priority_active(False)
+            _reset_main_process_gpu_stage_coordinator()
+        except Exception:
+            pass
+        _ACTIVE_PIPELINE_RUN_RESOURCES = None
+        _PIPELINE_RUN_LOCK.release()
+
+def _main_impl() -> None:
     initialize_runtime_observability()
     parser = build_argparser()
     args = parser.parse_args()
@@ -645,14 +831,16 @@ def main() -> None:
             if bool(save_nrrd_enabled) and bool(low_quality_requested)
             else []
         )
-        set_nrrd_layer_sink(NrrdLayerSink(
+        layer_sink_for_run = NrrdLayerSink(
             nrrd_dir=nrrd_dir,
             stem=input_path.stem,
             output_shape_tyx=(input_T, input_H, input_W),
             max_workers=nrrd_layer_sink_workers(),
             low_quality_specs=sink_low_quality_specs,
             low_quality_root=(out_dir / 'low_quality'),
-        ))
+        )
+        _run_resources().track_sink(layer_sink_for_run)
+        set_nrrd_layer_sink(layer_sink_for_run)
     else:
         set_nrrd_layer_sink(None)
 
@@ -1754,6 +1942,7 @@ def main() -> None:
     )
 
     output_manager = BackgroundOutputManager(max_workers=output_workers)
+    _run_resources().track_output_manager(output_manager)
 
     if augmentation_workers > 1 or interpolation_workers > 1 or slice_postprocess_workers > 1 or output_workers > 1:
         try:
@@ -1764,6 +1953,8 @@ def main() -> None:
     interpolation_process_executor: Optional[ProcessPoolExecutor] = None
     if bool(interpolation_process_backend_active):
         interpolation_process_executor = create_interpolation_process_executor(int(interpolation_process_workers))
+        if interpolation_process_executor is not None:
+            _run_resources().track_executor(interpolation_process_executor)
         set_interpolation_process_executor(interpolation_process_executor, int(interpolation_process_workers))
     else:
         set_interpolation_process_executor(None, 0)
@@ -2060,20 +2251,38 @@ def main() -> None:
 
     prediction_render_executor: Optional[ThreadPoolExecutor] = None
     if bool(streaming_sources_active) and shared_streaming_render_pool_enabled():
-        prediction_render_executor = ThreadPoolExecutor(max_workers=int(prediction_render_workers), thread_name_prefix='prediction-render')
+        prediction_render_executor = _create_tracked_thread_pool(
+            max_workers=int(prediction_render_workers),
+            thread_name_prefix='prediction-render',
+        )
         print(f'Shared streaming render pool: enabled ({int(prediction_render_workers)} worker thread(s))')
     elif bool(streaming_sources_active):
         print('Shared streaming render pool: disabled; each source owns its render executor.')
 
-    prediction_volume_executor = ThreadPoolExecutor(max_workers=int(prediction_volume_builder_workers), thread_name_prefix='prediction-volume')
-    prediction_result_executor = ThreadPoolExecutor(max_workers=int(async_prediction_result_worker_count), thread_name_prefix='predict-result')
-    prediction_join_executor = ThreadPoolExecutor(max_workers=int(async_prediction_join_worker_count), thread_name_prefix='predict-join')
-    parent_postprocess_executor = ThreadPoolExecutor(max_workers=int(parent_postprocess_workers), thread_name_prefix='parent-postprocess')
-    tile_dense_retirement_executor = ThreadPoolExecutor(
+    prediction_volume_executor = _create_tracked_thread_pool(
+        max_workers=int(prediction_volume_builder_workers),
+        thread_name_prefix='prediction-volume',
+    )
+    prediction_result_executor = _create_tracked_thread_pool(
+        max_workers=int(async_prediction_result_worker_count),
+        thread_name_prefix='predict-result',
+    )
+    prediction_join_executor = _create_tracked_thread_pool(
+        max_workers=int(async_prediction_join_worker_count),
+        thread_name_prefix='predict-join',
+    )
+    parent_postprocess_executor = _create_tracked_thread_pool(
+        max_workers=int(parent_postprocess_workers),
+        thread_name_prefix='parent-postprocess',
+    )
+    tile_dense_retirement_executor = _create_tracked_thread_pool(
         max_workers=int(tile_dense_retirement_workers),
         thread_name_prefix='tile-dense-retire',
     )
-    tile_postprocess_executor = ThreadPoolExecutor(max_workers=int(tile_postprocess_workers), thread_name_prefix='tile-postprocess')
+    tile_postprocess_executor = _create_tracked_thread_pool(
+        max_workers=int(tile_postprocess_workers),
+        thread_name_prefix='tile-postprocess',
+    )
 
     pending_prediction_build_jobs: deque[Tuple[str, ViewInfo, object]] = deque()
     for view, aug_job in iter_aug_jobs_round_robin(inference_views, aug_jobs_by_view):
@@ -4771,6 +4980,7 @@ def main() -> None:
                 dispatch_task = dict(task_to_dispatch)
                 dispatch_task.pop('hybrid_gpu_assist_dispatch', None)
                 _attach_memfd_transfers_to_task(dispatch_task)
+                preflight_multiprocessing_payload(dispatch_task)
                 gpu_task_queues[int(worker_id)].put(dispatch_task)
             except BaseException:
                 if tile_storage_reserved:
@@ -5032,6 +5242,7 @@ def main() -> None:
                     _prepare_tile_dense_result_workspaces(task)
                 dispatch_task = dict(task)
                 _attach_memfd_transfers_to_task(dispatch_task)
+                preflight_multiprocessing_payload(dispatch_task)
                 cpu_task_queues[int(worker_id)].put(dispatch_task)
             except BaseException:
                 if tile_storage_reserved:
@@ -5199,9 +5410,11 @@ def main() -> None:
         # enqueued below once the shared source volume is ready.
         mp_ctx = mp.get_context('spawn')
         gpu_result_queue = mp_ctx.Queue()
+        _run_resources().track_queue(gpu_result_queue)
         for worker_pos, gpu_index in enumerate(gpu_logical_indices):
             worker_id = int(gpu_index)
             worker_queue = mp_ctx.Queue()
+            _run_resources().track_queue(worker_queue)
             gpu_task_queues[worker_id] = worker_queue
             gpu_worker_dispatched_by_id[worker_id] = 0
             gpu_worker_results_by_id[worker_id] = 0
@@ -5216,6 +5429,7 @@ def main() -> None:
                 ),
                 name=f'gpu-worker-{gpu_index}', daemon=True,
             )
+            _run_resources().track_process(proc)
             proc.start()
             gpu_worker_processes.append(proc)
         startup_overlap_note = (
@@ -5235,6 +5449,7 @@ def main() -> None:
             for plan in cpu_instance_plans:
                 instance_id = int(plan.instance_id)
                 worker_queue = mp_ctx.Queue()
+                _run_resources().track_queue(worker_queue)
                 cpu_task_queues[instance_id] = worker_queue
                 cpu_worker_dispatched_by_id[instance_id] = 0
                 cpu_worker_results_by_id[instance_id] = 0
@@ -5261,6 +5476,7 @@ def main() -> None:
                     ),
                     name=f'openvino-worker-{instance_id}', daemon=True,
                 )
+                _run_resources().track_process(proc)
                 proc.start()
                 cpu_worker_processes.append(proc)
             print(
@@ -5343,7 +5559,13 @@ def main() -> None:
                             # any workers parked on the (never-written) sentinel.
                             print(f'Warning: cube-ready signaling failed ({exc}).')
 
-                    threading.Thread(target=_signal_cube_ready, name='cube-ready-sentinel', daemon=True).start()
+                    cube_ready_thread = threading.Thread(
+                        target=_signal_cube_ready,
+                        name='cube-ready-sentinel',
+                        daemon=True,
+                    )
+                    _run_resources().track_thread(cube_ready_thread)
+                    cube_ready_thread.start()
                 print(
                     'v13.3.9 (E3): task enqueue gated on the decode only — GPU workers retain the '
                     'NATIVE-t decoded volume and fold t scaling into device renderers '
@@ -5718,6 +5940,9 @@ def main() -> None:
                 target=_restrict_parent_after_cube_ready,
                 name='v17-parent-affinity-after-cube',
                 daemon=True,
+            )
+            _run_resources().track_thread(
+                parent_affinity_monitor_thread, parent_affinity_monitor_stop,
             )
             parent_affinity_monitor_thread.start()
             print(
@@ -6285,7 +6510,13 @@ def main() -> None:
             scheduler_wake.set()
 
     if push_drain_active:
-        threading.Thread(target=_push_drain_pump, name='inference-result-push-drain', daemon=True).start()
+        push_drain_thread = threading.Thread(
+            target=_push_drain_pump,
+            name='inference-result-push-drain',
+            daemon=True,
+        )
+        _run_resources().track_thread(push_drain_thread, push_drain_stop)
+        push_drain_thread.start()
         print(
             'Scheduler push drain active (v13.3.8 G1; results handled the instant they '
             'arrive; YOLO_TTA_SCHEDULER_PUSH_DRAIN=0 restores polling).'
@@ -6833,6 +7064,7 @@ def main() -> None:
         # but waiting here keeps the transition correct if an earlier output is added later.
         output_manager.wait()
         output_manager = BackgroundOutputManager(max_workers=int(tail_output_workers))
+        _run_resources().track_output_manager(output_manager)
     print(
         'v13.3.10 G7 post-inference CPU expansion: '
         f'slice workers={int(tail_slice_workers)}, output workers={int(tail_output_workers)}, '
@@ -7622,6 +7854,7 @@ _bind_late_symbols(
             "ffprobe_info",
             "processing_volume_mode",
             "purge_remaining_temporary_mkvs",
+            "reset_streaming_state_for_new_run",
             "resize_volume_to_processing_cube_gray8",
             "resize_volume_to_processing_cube_gray8_streaming",
             "resolve_radial_azimuth_angles",
@@ -7629,6 +7862,7 @@ _bind_late_symbols(
             "should_resize_to_processing_cube",
             "streaming_preprocess_enabled",
             "wait_for_volume_ready",
+            "wait_for_streaming_producers",
         ),
         "outputs": (
             "BackgroundOutputManager",
@@ -7707,16 +7941,19 @@ _bind_late_symbols(
             "plan_gpu_feeder_core_reservations",
             "plan_gpu_worker_affinity",
             "plan_openvino_cpu_instances",
+            "preflight_multiprocessing_payload",
             "raw_store_memfd_enabled",
             "register_unique_run_scratch_cleanup",
             "release_memfd_owners_under",
             "resolve_parent_interpolation_worker_allocation",
             "resolve_parent_postprocess_worker_allocation",
             "resolve_worker_count",
+            "reset_runtime_state_for_new_run",
             "runtime_telemetry",
             "scratch_dir_is_memory_backed",
             "set_gpu_worker_aux_interpolation_pool",
             "set_interpolation_process_executor",
+            "shutdown_parallel_pool_cache",
             "tail_worker_budget_expansion_enabled",
             "workspace_anon_cap_bytes",
         ),

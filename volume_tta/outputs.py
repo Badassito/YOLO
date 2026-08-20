@@ -108,7 +108,9 @@ def _publish_staged_file_atomically(stage_path: Path, out_path: Path) -> None:
     final_path = Path(out_path)
     if not stage.is_file() or int(stage.stat().st_size) <= 0:
         raise RuntimeError(f'Atomic publication stage is missing or empty: {stage}')
-    with open(stage, 'rb') as stage_fh:
+    # Windows rejects FlushFileBuffers (os.fsync) on a read-only handle with EBADF.
+    # Open update-capable without modifying the completed payload.
+    with open(stage, 'rb+') as stage_fh:
         os.fsync(stage_fh.fileno())
     os.replace(stage, final_path)
     try:
@@ -119,6 +121,38 @@ def _publish_staged_file_atomically(stage_path: Path, out_path: Path) -> None:
             os.close(parent_fd)
     except OSError:
         pass
+
+
+@contextlib.contextmanager
+def _same_directory_atomic_output(out_path: Path) -> Iterator[Path]:
+    """Yield a private sibling path and publish it only after a successful write.
+
+    Keeping the temporary inode in the destination directory guarantees that the final
+    ``os.replace`` cannot cross filesystems.  The previous output remains intact if the
+    producer raises, and the private file is removed on every exit path.
+    """
+    final_path = Path(out_path)
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    token = f'{os.getpid()}.{threading.get_ident()}.{time.time_ns()}'
+    stage_path = final_path.with_name(
+        f'.{final_path.name}.{token}.assembling'
+    )
+    try:
+        yield stage_path
+        _publish_staged_file_atomically(stage_path, final_path)
+    finally:
+        try:
+            stage_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _write_json_atomically(out_path: Path, payload: object) -> Path:
+    """Serialize JSON completely before atomically replacing its public sidecar."""
+    final_path = Path(out_path)
+    with _same_directory_atomic_output(final_path) as stage_path:
+        stage_path.write_text(json.dumps(payload, indent=2))
+    return final_path
 
 def _run_sharded_ffv1_encode(
     *,
@@ -428,6 +462,107 @@ def _format_frame_path(pattern_path: Path, frame_idx_1based: int) -> Path:
             pass
     return pattern_path.with_name(f"{pattern_path.stem}_{int(frame_idx_1based):04d}{pattern_path.suffix}")
 
+
+_FRAME_NUMBER_PLACEHOLDER_RE = re.compile(r'%(?:0\d+)?d')
+
+
+def _frame_sequence_name_matcher(
+    pattern_path: Path,
+    extensions: Sequence[str],
+) -> re.Pattern[str]:
+    """Match files belonging to a frame pattern, independent of frame count/extension."""
+    pattern = Path(pattern_path)
+    name = pattern.name
+    placeholder = _FRAME_NUMBER_PLACEHOLDER_RE.search(name)
+    suffix = pattern.suffix
+    if placeholder is not None:
+        prefix = name[:placeholder.start()]
+        tail = name[placeholder.end():]
+        tail_without_suffix = tail[:-len(suffix)] if suffix and tail.lower().endswith(suffix.lower()) else tail
+    else:
+        prefix = f'{pattern.stem}_'
+        tail_without_suffix = ''
+
+    def _normalize_extension(extension: object) -> str:
+        value = str(extension)
+        value = value if value.startswith('.') else f'.{value}'
+        return value.lower() if os.name == 'nt' else value
+
+    normalized_extensions = {
+        _normalize_extension(ext)
+        for ext in extensions
+        if str(ext)
+    }
+    if suffix:
+        normalized_extensions.add(_normalize_extension(suffix))
+    extension_expr = (
+        '(?:' + '|'.join(re.escape(ext) for ext in sorted(normalized_extensions)) + ')'
+        if normalized_extensions else ''
+    )
+    return re.compile(
+        rf'^{re.escape(prefix)}\d+{re.escape(tail_without_suffix)}{extension_expr}$',
+        # Windows paths are conventionally case-insensitive; POSIX paths are not.  On
+        # Linux, folding case here could delete a distinct sequence in the same directory.
+        flags=(re.IGNORECASE if os.name == 'nt' else 0),
+    )
+
+
+def _publish_staged_frame_sequence(
+    stage_pattern: Path,
+    final_pattern: Path,
+    total: int,
+    *,
+    stale_extensions: Sequence[str],
+) -> None:
+    """Publish a fully rendered sequence, then remove tails/obsolete extensions.
+
+    Rendering happens in a hidden directory under the destination directory.  Therefore a
+    rendering failure exposes none of the new generation and preserves every prior frame.
+    Each completed frame enters the public sequence with an atomic same-filesystem replace.
+    """
+    count = max(0, int(total))
+    pairs = [
+        (
+            _format_frame_path(Path(stage_pattern), idx),
+            _format_frame_path(Path(final_pattern), idx),
+        )
+        for idx in range(1, count + 1)
+    ]
+    missing = [stage for stage, _final in pairs if not stage.is_file()]
+    if missing:
+        raise RuntimeError(f'Frame sequence staging is incomplete; missing {missing[0]}')
+
+    for stage_path, final_path in pairs:
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(stage_path, final_path)
+
+    expected = {
+        os.path.normcase(os.path.abspath(str(final_path)))
+        for _stage_path, final_path in pairs
+    }
+    matcher = _frame_sequence_name_matcher(Path(final_pattern), stale_extensions)
+    for candidate in Path(final_pattern).parent.iterdir():
+        if not candidate.is_file() or matcher.fullmatch(candidate.name) is None:
+            continue
+        normalized = os.path.normcase(os.path.abspath(str(candidate)))
+        if normalized not in expected:
+            candidate.unlink()
+
+
+@contextlib.contextmanager
+def _staged_frame_sequence(pattern_path: Path) -> Iterator[Path]:
+    """Yield an equivalent frame pattern rooted in a private destination-side directory."""
+    final_pattern = Path(pattern_path)
+    final_pattern.parent.mkdir(parents=True, exist_ok=True)
+    stage_dir = Path(tempfile.mkdtemp(
+        prefix=f'.{final_pattern.parent.name}.frame-generation-',
+        dir=str(final_pattern.parent),
+    ))
+    try:
+        yield stage_dir / final_pattern.name
+    finally:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+
 def _write_label_file_from_mask(mask2d: np.ndarray, out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     m = np.asarray(mask2d) > 0
@@ -468,18 +603,24 @@ def write_yolo_labels_from_pattern(
 ) -> Path:
     pattern_path.parent.mkdir(parents=True, exist_ok=True)
     total = int(mask_u8.shape[0])
+    with _staged_frame_sequence(pattern_path) as stage_pattern:
+        def _write_frame(t: int) -> None:
+            fp = _format_frame_path(stage_pattern, int(t) + 1)
+            _write_label_file_from_mask(np.asarray(mask_u8[int(t)]), fp)
 
-    def _write_frame(t: int) -> None:
-        fp = _format_frame_path(pattern_path, int(t) + 1)
-        _write_label_file_from_mask(np.asarray(mask_u8[int(t)]), fp)
-
-    parallel_for_indices(
-        total,
-        _write_frame,
-        max_workers=choose_slice_parallel_workers(int(workers), total),
-        desc=f"Writing YOLO labels ({pattern_path.parent.name})",
-        show_progress=show_progress,
-    )
+        parallel_for_indices(
+            total,
+            _write_frame,
+            max_workers=choose_slice_parallel_workers(int(workers), total),
+            desc=f"Writing YOLO labels ({pattern_path.parent.name})",
+            show_progress=show_progress,
+        )
+        _publish_staged_frame_sequence(
+            stage_pattern,
+            pattern_path,
+            total,
+            stale_extensions=(pattern_path.suffix, '.txt'),
+        )
     return pattern_path.parent
 
 def write_binary_tiff_sequence_from_pattern(
@@ -490,18 +631,24 @@ def write_binary_tiff_sequence_from_pattern(
 ) -> Path:
     pattern_path.parent.mkdir(parents=True, exist_ok=True)
     total = int(mask_u8.shape[0])
+    with _staged_frame_sequence(pattern_path) as stage_pattern:
+        def _write_frame(t: int) -> None:
+            fp = _format_frame_path(stage_pattern, int(t) + 1)
+            _write_binary_tiff_frame(np.asarray(mask_u8[int(t)]), fp)
 
-    def _write_frame(t: int) -> None:
-        fp = _format_frame_path(pattern_path, int(t) + 1)
-        _write_binary_tiff_frame(np.asarray(mask_u8[int(t)]), fp)
-
-    parallel_for_indices(
-        total,
-        _write_frame,
-        max_workers=choose_slice_parallel_workers(int(workers), total),
-        desc=f"Writing binary TIFF sequence ({pattern_path.parent.name})",
-        show_progress=show_progress,
-    )
+        parallel_for_indices(
+            total,
+            _write_frame,
+            max_workers=choose_slice_parallel_workers(int(workers), total),
+            desc=f"Writing binary TIFF sequence ({pattern_path.parent.name})",
+            show_progress=show_progress,
+        )
+        _publish_staged_frame_sequence(
+            stage_pattern,
+            pattern_path,
+            total,
+            stale_extensions=(pattern_path.suffix, '.tif', '.tiff'),
+        )
     return pattern_path.parent
 
 def write_binary_video_from_mask_volume(
@@ -1688,24 +1835,25 @@ def write_single_layer_nrrd_from_ref(
             min(int(stored_t), int(z_shards), int(_nrrd_zshard_capacity())),
         )
     if shard_count <= 1:
-        with open(out_path, 'wb') as fh:
-            _write_nrrd_ascii_header(
-                fh,
-                header=header,
-                sizes=(stored_w, stored_h, stored_t),
-                dimension=3,
-                data_type='unsigned char',
-                encoding='gzip',
-            )
-            with _open_nrrd_payload_writer(fh) as payload_writer:
-                _write_one_decomposed_nrrd_layer_payload(
-                    ref,
-                    (out_t, out_h, out_w),
-                    payload_writer,
-                    z_chunk=int(z_chunk),
-                    block_consumer=block_consumer,
-                    sparse_consumer=sparse_consumer,
+        with _same_directory_atomic_output(out_path) as stage_path:
+            with open(stage_path, 'wb') as fh:
+                _write_nrrd_ascii_header(
+                    fh,
+                    header=header,
+                    sizes=(stored_w, stored_h, stored_t),
+                    dimension=3,
+                    data_type='unsigned char',
+                    encoding='gzip',
                 )
+                with _open_nrrd_payload_writer(fh) as payload_writer:
+                    _write_one_decomposed_nrrd_layer_payload(
+                        ref,
+                        (out_t, out_h, out_w),
+                        payload_writer,
+                        z_chunk=int(z_chunk),
+                        block_consumer=block_consumer,
+                        sparse_consumer=sparse_consumer,
+                    )
         return out_path
 
     # each z band compresses into an independent anonymous memory-backed chunk.
@@ -2295,15 +2443,16 @@ def write_layer_nrrd_with_low_quality_mirrors(
             if vol is None:
                 raise RuntimeError('mirror tee produced no host payload')
             step = max(1, int(_nrrd_full_slice_z_chunk(1, stored_w, stored_h, stored_t)))
-            with open(m_path, 'wb') as fh:
-                _write_nrrd_ascii_header(
-                    fh, header=header, sizes=(stored_w, stored_h, stored_t),
-                    dimension=3, data_type='unsigned char', encoding='gzip',
-                )
-                with _open_nrrd_payload_writer(fh) as payload_writer:
-                    for z0 in range(0, int(stored_t), step):
-                        z1 = min(int(stored_t), int(z0) + step)
-                        payload_writer.write(memoryview(vol[z0:z1]).cast('B'))  # type: ignore[index]
+            with _same_directory_atomic_output(m_path) as stage_path:
+                with open(stage_path, 'wb') as fh:
+                    _write_nrrd_ascii_header(
+                        fh, header=header, sizes=(stored_w, stored_h, stored_t),
+                        dimension=3, data_type='unsigned char', encoding='gzip',
+                    )
+                    with _open_nrrd_payload_writer(fh) as payload_writer:
+                        for z0 in range(0, int(stored_t), step):
+                            z1 = min(int(stored_t), int(z0) + step)
+                            payload_writer.write(memoryview(vol[z0:z1]).cast('B'))  # type: ignore[index]
         except Exception as exc:
             print(
                 f'Warning: low-quality NRRD mirror tee failed for {m_path.name} ({exc}); '
@@ -2359,7 +2508,6 @@ class NrrdLayerSink:
         self.stem = variant_nrrd_stem(stem)
         self.output_shape = (int(output_shape_tyx[0]), int(output_shape_tyx[1]), int(output_shape_tyx[2]))
         self.max_workers = max(1, int(max_workers))
-        self.executor = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix='nrrd-layer')
         self._lock = threading.Lock()
         self._futures: List[Future] = []
         self._manifest: List[Dict[str, object]] = []
@@ -2374,9 +2522,20 @@ class NrrdLayerSink:
         self.low_quality_specs: List['LowQualityDownbinSpec'] = list(low_quality_specs or [])
         self.low_quality_root = Path(low_quality_root) if low_quality_root is not None else None
         self._lq_manifests: Dict[str, List[Dict[str, object]]] = {}
-        if self.low_quality_specs and self.low_quality_root is not None:
+        if self.low_quality_specs:
+            if self.low_quality_root is None:
+                raise RuntimeError(
+                    'low-quality NRRD specs require a low_quality_root'
+                )
             for spec in self.low_quality_specs:
                 self._lq_nrrd_dir(spec).mkdir(parents=True, exist_ok=True)
+        # Construct the executor only after every validating/construction-time filesystem
+        # operation has succeeded. A failed mkdir can therefore never strand worker threads
+        # in an object that the pipeline did not receive and cannot shut down.
+        self.executor = ThreadPoolExecutor(
+            max_workers=self.max_workers,
+            thread_name_prefix='nrrd-layer',
+        )
 
     def _lq_nrrd_dir(self, spec: 'LowQualityDownbinSpec') -> Path:
         if self.low_quality_root is None:
@@ -2637,7 +2796,7 @@ class NrrdLayerSink:
                     int(spec.output_shape_t_y_x[2]),
                 )
                 lq_manifest_path = self._lq_nrrd_dir(spec) / f'{self.stem}_nrrd_manifest.json'
-                lq_manifest_path.write_text(json.dumps({
+                _write_json_atomically(lq_manifest_path, {
                     'layout': 'one_single_layer_nrrd_per_component',
                     'quality': 'low_quality',
                     'downbin_value': str(spec.raw_value),
@@ -2656,7 +2815,7 @@ class NrrdLayerSink:
                         'Layer suffixes match the corresponding full-quality layers. Centerline removed-component and watershed-candidate audit layers are mirrored as non-recomposable downbins (diagnostic_only and none, respectively).',
                         'Use each layer\'s recomposition_op. Only union entries marked union; select entries are complete checkpoints.',
                     ],
-                }, indent=2))
+                })
         if not manifest_layers:
             return None
         manifest_path = self.nrrd_dir / f'{self.stem}_nrrd_manifest.json'
@@ -2675,7 +2834,7 @@ class NrrdLayerSink:
                 'The manifest lists only this run. In a reused output directory, similarly named files absent from this manifest are stale and must be ignored.',
             ],
         }
-        manifest_path.write_text(json.dumps(manifest, indent=2))
+        _write_json_atomically(manifest_path, manifest)
         return manifest_path
 
 _NRRD_LAYER_SINK: Optional[NrrdLayerSink] = None
@@ -3616,6 +3775,12 @@ def _try_gpu_downbin_volume(src_vol: np.ndarray, out_mm: np.ndarray, mode: str) 
     """Fill ``out_mm`` on an exclusively leased GPU; False selects the CPU path."""
     if not low_quality_gpu_downbin_enabled():
         return False
+    # PyTorch adaptive pooling does not reproduce OpenCV INTER_AREA's fractional-bin
+    # support or its uint8 rounding.  Gray distribution assets are an external output
+    # contract, so keep them on the reference CPU/OpenCV path until an exact CUDA kernel
+    # is available.  Binary-mask max pooling retains its existing GPU acceleration.
+    if str(mode) == 'gray':
+        return False
     in_t, in_h, in_w = (int(src_vol.shape[0]), int(src_vol.shape[1]), int(src_vol.shape[2]))
     out_t, out_h, out_w = (int(out_mm.shape[0]), int(out_mm.shape[1]), int(out_mm.shape[2]))
     if out_h > in_h or out_w > in_w:
@@ -3656,6 +3821,8 @@ def _try_gpu_downbin_volume_on_device(
     F: object,
     device: object,
 ) -> bool:
+    if str(mode) == 'gray':
+        return False
     in_t, in_h, in_w = (int(src_vol.shape[0]), int(src_vol.shape[1]), int(src_vol.shape[2]))
     out_t, out_h, out_w = (int(out_mm.shape[0]), int(out_mm.shape[1]), int(out_mm.shape[2]))
     chunk = int(low_quality_gpu_downbin_chunk_slices())
@@ -4280,25 +4447,32 @@ def write_view_images(
         view,
         fmt,
     )
+    final_pattern = view_dir / f'{stem}_{view.name}_%04d{suffix}'
+    with _staged_frame_sequence(final_pattern) as stage_pattern:
+        def _write_frame(idx: int) -> None:
+            frame = np.ascontiguousarray(renderer(int(idx)), dtype=np.uint8)
+            out_path = _format_frame_path(stage_pattern, int(idx) + 1)
+            if multipage_tiff:
+                _write_multichannel_tiff(out_path, frame, int(fmt.channel_count))
+                return
+            if frame.ndim == 3 and int(frame.shape[2]) == 1:
+                frame = np.ascontiguousarray(frame[:, :, 0])
+            if not cv2.imwrite(str(out_path), frame):
+                raise RuntimeError(f'Failed to write image: {out_path}')
 
-    def _write_frame(idx: int) -> None:
-        frame = np.ascontiguousarray(renderer(int(idx)), dtype=np.uint8)
-        out_path = view_dir / f'{stem}_{view.name}_{int(idx) + 1:04d}{suffix}'
-        if multipage_tiff:
-            _write_multichannel_tiff(out_path, frame, int(fmt.channel_count))
-            return
-        if frame.ndim == 3 and int(frame.shape[2]) == 1:
-            frame = np.ascontiguousarray(frame[:, :, 0])
-        if not cv2.imwrite(str(out_path), frame):
-            raise RuntimeError(f'Failed to write image: {out_path}')
-
-    parallel_for_indices(
-        total,
-        _write_frame,
-        max_workers=choose_slice_parallel_workers(int(workers), total),
-        desc=f'Writing {view.name} {fmt.token} image sequence',
-        show_progress=show_progress,
-    )
+        parallel_for_indices(
+            total,
+            _write_frame,
+            max_workers=choose_slice_parallel_workers(int(workers), total),
+            desc=f'Writing {view.name} {fmt.token} image sequence',
+            show_progress=show_progress,
+        )
+        _publish_staged_frame_sequence(
+            stage_pattern,
+            final_pattern,
+            total,
+            stale_extensions=('.png', '.tif', '.tiff'),
+        )
     return view_dir
 
 def write_summary_file(

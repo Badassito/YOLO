@@ -29,6 +29,7 @@ class _BindingRequest:
 _LOCK = threading.RLock()
 _REQUESTS: dict[str, _BindingRequest] = {}
 _RESOLVING = False
+_REQUEST_GENERATION = 0
 
 
 def _provider_module(consumer: str, provider: str) -> str:
@@ -48,6 +49,7 @@ def _resolve_registered() -> None:
         while True:
             progress = False
             with _LOCK:
+                generation = _REQUEST_GENERATION
                 snapshot = list(_REQUESTS.items())
             for consumer, request in snapshot:
                 for provider, names in list(request.pending.items()):
@@ -55,11 +57,20 @@ def _resolve_registered() -> None:
                     module: ModuleType
                     try:
                         module = importlib.import_module(qualified)
-                    except ImportError:
-                        # A normal ImportError from inside a fully initialized provider is
-                        # a real failure; only partially initialized cycles are deferred.
+                    except (ImportError, RuntimeError) as exc:
+                        # A normal failure from inside a fully initialized provider is a
+                        # real failure; only partially initialized cycles are deferred.
+                        #
+                        # Concurrent imports add one more cycle shape: importlib detects
+                        # that two threads own opposing module locks and raises its private
+                        # ``_DeadlockError`` (a RuntimeError) in one of them.  The provider
+                        # is already present in sys.modules in that case.  Deferring its
+                        # callable-only names lets this module finish and release its lock,
+                        # after which the active resolver's next pass can bind them.
                         partial = sys.modules.get(qualified)
-                        if partial is None:
+                        is_import_cycle = isinstance(exc, ImportError)
+                        is_thread_cycle = type(exc).__name__ == "_DeadlockError"
+                        if partial is None or not (is_import_cycle or is_thread_cycle):
                             raise
                         module = partial
                     resolved = {name for name in names if hasattr(module, name)}
@@ -75,7 +86,16 @@ def _resolve_registered() -> None:
                     with _LOCK:
                         _REQUESTS.pop(consumer, None)
             if not progress:
-                break
+                with _LOCK:
+                    # A module imported by another thread can register a request while
+                    # this resolver is walking its snapshot.  Do not strand that request
+                    # merely because the old snapshot made no progress.  The stable
+                    # generation check and resolver hand-off happen under the same lock,
+                    # so a registration either belongs to this pass or starts a new one.
+                    if generation != _REQUEST_GENERATION:
+                        continue
+                    _RESOLVING = False
+                    return
     finally:
         with _LOCK:
             _RESOLVING = False
@@ -88,12 +108,14 @@ def bind_late_symbols(
 ) -> None:
     """Register and resolve names used only after module initialization."""
 
+    global _REQUEST_GENERATION
     request = _BindingRequest(
         namespace=namespace,
         pending={provider: set(names) for provider, names in dependencies.items()},
     )
     with _LOCK:
         _REQUESTS[consumer] = request
+        _REQUEST_GENERATION += 1
     _resolve_registered()
 
 

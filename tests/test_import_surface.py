@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WRAPPER = ROOT / "GPT-5.6-Sol-Pro_v17.0.6_SLURM.py"
+WRAPPER = ROOT / "GPT-5.6-Sol-Pro_v17.0.7_SLURM.py"
 
 
 class ImportSurfaceTests(unittest.TestCase):
@@ -39,7 +39,7 @@ class ImportSurfaceTests(unittest.TestCase):
     def test_module_version(self) -> None:
         completed = self.run_python("-m", "volume_tta", "--version")
         self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertIn("17.0.6", completed.stdout)
+        self.assertIn("17.0.7", completed.stdout)
 
     def test_cycle_safe_full_import_smoke(self) -> None:
         completed = self.run_python(str(ROOT / "tools" / "smoke_import.py"), "pipeline")
@@ -50,7 +50,7 @@ class ImportSurfaceTests(unittest.TestCase):
     def test_original_statement_inventory(self) -> None:
         completed = self.run_python(str(ROOT / "tools" / "verify_refactor.py"))
         self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertIn("1133 total", completed.stdout)
+        self.assertIn("1133 original statements total", completed.stdout)
 
     def test_no_mutable_global_is_copied_across_subsystems(self) -> None:
         completed = self.run_python(str(ROOT / "tools" / "analyze_package_state.py"))

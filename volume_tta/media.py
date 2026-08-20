@@ -140,6 +140,42 @@ _VOLUME_READINESS_BY_ARRAY_ID: Dict[int, VolumeReadiness] = {}
 
 _STREAMING_PRODUCER_ABORT = threading.Event()
 
+_STREAMING_PRODUCER_LOCK = threading.Lock()
+
+_ACTIVE_STREAMING_PRODUCER_THREADS: set[threading.Thread] = set()
+
+_ACTIVE_STREAMING_PRODUCER_PROCESSES: set[subprocess.Popen] = set()
+
+def _start_streaming_producer(target: Callable[[], None], *, name: str) -> None:
+    """Start and lifecycle-track one daemon producer."""
+    thread: Optional[threading.Thread] = None
+
+    def _tracked() -> None:
+        try:
+            target()
+        finally:
+            assert thread is not None
+            with _STREAMING_PRODUCER_LOCK:
+                _ACTIVE_STREAMING_PRODUCER_THREADS.discard(thread)
+
+    thread = threading.Thread(target=_tracked, name=str(name), daemon=True)
+    with _STREAMING_PRODUCER_LOCK:
+        _ACTIVE_STREAMING_PRODUCER_THREADS.add(thread)
+    try:
+        thread.start()
+    except BaseException:
+        with _STREAMING_PRODUCER_LOCK:
+            _ACTIVE_STREAMING_PRODUCER_THREADS.discard(thread)
+        raise
+
+def _register_streaming_subprocess(proc: subprocess.Popen) -> None:
+    with _STREAMING_PRODUCER_LOCK:
+        _ACTIVE_STREAMING_PRODUCER_PROCESSES.add(proc)
+
+def _unregister_streaming_subprocess(proc: subprocess.Popen) -> None:
+    with _STREAMING_PRODUCER_LOCK:
+        _ACTIVE_STREAMING_PRODUCER_PROCESSES.discard(proc)
+
 def streaming_producers_aborted() -> bool:
     return _STREAMING_PRODUCER_ABORT.is_set()
 
@@ -151,6 +187,51 @@ def abort_streaming_producers(reason: str = 'pipeline aborted') -> None:
             readiness.fail_if_incomplete(exc)
         except Exception:
             pass
+    with _STREAMING_PRODUCER_LOCK:
+        processes = list(_ACTIVE_STREAMING_PRODUCER_PROCESSES)
+    for proc in processes:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+
+def wait_for_streaming_producers(timeout: Optional[float] = None) -> bool:
+    """Join tracked producer threads; return False if any exceed the deadline."""
+    deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+    while True:
+        with _STREAMING_PRODUCER_LOCK:
+            threads = [thread for thread in _ACTIVE_STREAMING_PRODUCER_THREADS if thread.is_alive()]
+        if not threads:
+            return True
+        for thread in threads:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            thread.join(timeout=remaining)
+            if deadline is not None and time.monotonic() >= deadline:
+                with _STREAMING_PRODUCER_LOCK:
+                    return not any(
+                        candidate.is_alive() for candidate in _ACTIVE_STREAMING_PRODUCER_THREADS
+                    )
+
+def reset_streaming_state_for_new_run() -> None:
+    """Clear sticky abort/readiness state after all previous producers settled."""
+    with _STREAMING_PRODUCER_LOCK:
+        live_threads = [
+            thread for thread in _ACTIVE_STREAMING_PRODUCER_THREADS if thread.is_alive()
+        ]
+        live_processes = [
+            proc for proc in _ACTIVE_STREAMING_PRODUCER_PROCESSES if proc.poll() is None
+        ]
+        if live_threads or live_processes:
+            raise RuntimeError(
+                'cannot reset streaming state while prior producers remain active: '
+                f'threads={[thread.name for thread in live_threads]}, '
+                f'processes={[getattr(proc, "pid", None) for proc in live_processes]}'
+            )
+        _ACTIVE_STREAMING_PRODUCER_THREADS.clear()
+        _ACTIVE_STREAMING_PRODUCER_PROCESSES.clear()
+        _VOLUME_READINESS_BY_ARRAY_ID.clear()
+        _STREAMING_PRODUCER_ABORT.clear()
 
 def streaming_preprocess_enabled() -> bool:
     """Return True when decode/cube preprocessing may run ahead of consumers."""
@@ -377,6 +458,7 @@ def decode_video_to_memmap_gray8_streaming(
                 lambda: subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
                 'ffmpeg streaming gray8 decode',
             )
+            _register_streaming_subprocess(proc)
             assert proc.stdout is not None
             with tqdm(total=num_frames, desc='Streaming decode input volume (gray8)') as pbar:
                 for start in range(0, int(num_frames), int(chunk_frames)):
@@ -412,16 +494,19 @@ def decode_video_to_memmap_gray8_streaming(
             raise
         finally:
             if proc is not None:
-                if proc.stdout:
-                    proc.stdout.close()
-                _out, err = proc.communicate()
-                if proc.returncode not in (0, None):
-                    msg = err.decode("utf-8", errors="ignore") if isinstance(err, (bytes, bytearray)) else str(err)
-                    readiness.mark_failed(RuntimeError(f"ffmpeg decode failed: {msg}"))
+                try:
+                    if proc.stdout:
+                        proc.stdout.close()
+                    _out, err = proc.communicate()
+                    if proc.returncode not in (0, None):
+                        msg = err.decode("utf-8", errors="ignore") if isinstance(err, (bytes, bytearray)) else str(err)
+                        readiness.mark_failed(RuntimeError(f"ffmpeg decode failed: {msg}"))
+                finally:
+                    _unregister_streaming_subprocess(proc)
 
     # daemon=True: if main dies without reaching abort_streaming_producers,
     # interpreter shutdown must not join a producer that may have hours of decode left.
-    threading.Thread(target=_decode_worker, name='streaming-gray8-decode', daemon=True).start()
+    _start_streaming_producer(_decode_worker, name='streaming-gray8-decode')
     return arr
 
 def compute_cube_resize_shape(
@@ -727,7 +812,7 @@ def resize_volume_to_processing_cube_gray8_streaming(
             raise
 
     # daemon=True: see the streaming decode producer.
-    threading.Thread(target=_resize_worker, name='streaming-cubic-resize', daemon=True).start()
+    _start_streaming_producer(_resize_worker, name='streaming-cubic-resize')
     return out_mm
 
 class LazyProcessingCube:

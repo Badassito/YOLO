@@ -12,10 +12,10 @@ import numpy as np
 from .geometry import (
     ViewInfo,
 )
-from .interpolation import (
-    CVOL_FORMAT,
-    IncrementalRawBBoxMaskStoreWriter,
-)
+
+# This immutable format identifier is needed while Python evaluates a function default
+# below.  The writer implementation itself remains a callable-only late dependency.
+CVOL_FORMAT = 'cvol-mask-v2-raw'
 
 def d1_owner_pipeline_enabled() -> bool:
     """Return the D1 mode admitted and published by the current run."""

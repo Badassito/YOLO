@@ -1731,6 +1731,11 @@ def _materialize_worker_task_memfd_paths(
     dropping them after the task permits immediate sparse retirement in the parent.
     """
     transient_fds: List[int] = []
+    # The caller can only close descriptors after this function returns.  Keep enough
+    # transaction state here to roll back descriptors detached before a later handle
+    # fails to materialize; otherwise the assignment at the call site never happens and
+    # those descriptors are lost for the lifetime of the worker.
+    persistent_keys_before = set(persistent_sources)
 
     def _resolve(
         holder: Dict[str, object],
@@ -1761,21 +1766,29 @@ def _materialize_worker_task_memfd_paths(
             transient_fds.append(int(fd))
         holder[path_field] = str(_memfd_proc_path(int(fd), owner_pid=os.getpid()))
 
-    _resolve(task, path_field='source_volume_path', handle_field='source_volume_fd', persistent=True)
-    _resolve(task, path_field='result_mask_path', handle_field='result_mask_fd', persistent=False)
-    _resolve(task, path_field='result_conf_path', handle_field='result_conf_fd', persistent=False)
-    _resolve(task, path_field='canvas_path', handle_field='canvas_fd', persistent=False)
-    _resolve(task, path_field='d1_bitset_path', handle_field='d1_bitset_fd', persistent=False)
+    try:
+        _resolve(task, path_field='source_volume_path', handle_field='source_volume_fd', persistent=True)
+        _resolve(task, path_field='result_mask_path', handle_field='result_mask_fd', persistent=False)
+        _resolve(task, path_field='result_conf_path', handle_field='result_conf_fd', persistent=False)
+        _resolve(task, path_field='canvas_path', handle_field='canvas_fd', persistent=False)
+        _resolve(task, path_field='d1_bitset_path', handle_field='d1_bitset_fd', persistent=False)
 
-    native_resize = task.get('native_resize')
-    if isinstance(native_resize, dict):
-        native_copy = dict(native_resize)
-        # Keep the key beside the handle while reusing the generic resolver.
-        if 'path_fd_key' in native_copy:
-            native_copy['path_fd_key'] = native_copy.get('path_fd_key')
-        _resolve(native_copy, path_field='path', handle_field='path_fd', persistent=True)
-        task['native_resize'] = native_copy
-    return transient_fds
+        native_resize = task.get('native_resize')
+        if isinstance(native_resize, dict):
+            native_copy = dict(native_resize)
+            # Keep the key beside the handle while reusing the generic resolver.
+            if 'path_fd_key' in native_copy:
+                native_copy['path_fd_key'] = native_copy.get('path_fd_key')
+            _resolve(native_copy, path_field='path', handle_field='path_fd', persistent=True)
+            task['native_resize'] = native_copy
+        return transient_fds
+    except BaseException:
+        _close_fd_list(transient_fds)
+        for key in list(set(persistent_sources) - persistent_keys_before):
+            fd = persistent_sources.pop(key, None)
+            if fd is not None:
+                _close_fd_list((int(fd),))
+        raise
 
 def _close_fd_list(fds: Iterable[int]) -> None:
     for fd in list(fds):
@@ -1783,6 +1796,21 @@ def _close_fd_list(fds: Iterable[int]) -> None:
             os.close(int(fd))
         except OSError:
             pass
+
+def preflight_multiprocessing_payload(payload: object) -> None:
+    """Synchronously prove that a queue payload can cross a process boundary.
+
+    ``multiprocessing.Queue.put`` normally returns before its feeder thread pickles the
+    object.  A serialization error would therefore be printed by that background thread
+    after the scheduler had committed ownership and dispatch counters.  Use the same
+    ForkingPickler up front so such errors remain ordinary, rollback-capable exceptions.
+    """
+    try:
+        mp_reduction.ForkingPickler.dumps(payload)
+    except BaseException as exc:
+        raise TypeError(
+            f'multiprocessing dispatch payload is not serializable: {type(exc).__name__}: {exc}'
+        ) from exc
 
 def _madvise_dontneed_array(arr: object) -> None:
     """Best-effort immediate page-cache/RAM release before a scratch mapping closes."""
@@ -2008,6 +2036,17 @@ def _release_parallel_pool(workers: int, pool: ThreadPoolExecutor) -> None:
             _PARALLEL_POOL_CACHE.setdefault(w, []).append(pool)
             return
     pool.shutdown(wait=False)
+
+def shutdown_parallel_pool_cache() -> None:
+    """Close every idle reusable pool at a top-level run boundary."""
+    with _PARALLEL_POOL_CACHE_LOCK:
+        pools = [pool for stack in _PARALLEL_POOL_CACHE.values() for pool in stack]
+        _PARALLEL_POOL_CACHE.clear()
+    for pool in pools:
+        try:
+            pool.shutdown(wait=True, cancel_futures=True)
+        except TypeError:
+            pool.shutdown(wait=True)
 
 def _settle_parallel_futures(futures: Iterable[Future]) -> None:
     """Cancel-or-wait every future so a pool can safely return to the cache.
@@ -2728,8 +2767,12 @@ def interpolation_process_fallback_enabled() -> bool:
 
 def interpolation_process_start_method() -> str:
     method = os.environ.get('YOLO_TTA_INTERPOLATION_PROCESS_START_METHOD', 'spawn').strip().lower()
-    if method not in {'spawn', 'forkserver', 'fork'}:
-        method = 'spawn'
+    if method not in {'spawn', 'forkserver'}:
+        raise ValueError(
+            'YOLO_TTA_INTERPOLATION_PROCESS_START_METHOD must be spawn or forkserver; '
+            f'{method or "<empty>"!r} is unsafe because it can inherit live thread pools '
+            'and accelerator runtime state'
+        )
     return method
 
 def interpolation_process_cv2_threads() -> int:
@@ -2869,12 +2912,14 @@ class _GpuWorkerAuxInterpolationPool:
             allow_full_cpu_affinity = bool(self._leased.get(int(worker_id), False))
             task_queue = self._task_queues[int(worker_id)]
         try:
-            task_queue.put({
+            envelope = {
                 'task_id': int(task_id),
                 'task_type': 'interpolation_pass',
                 'aux_kwargs': dict(aux_kwargs),
                 'allow_full_cpu_affinity': bool(allow_full_cpu_affinity),
-            })
+            }
+            preflight_multiprocessing_payload(envelope)
+            task_queue.put(envelope)
         except Exception:
             with self._lock:
                 self._pending.pop(task_id, None)
@@ -2924,6 +2969,47 @@ def set_gpu_worker_aux_interpolation_pool(pool: Optional[_GpuWorkerAuxInterpolat
 
 def gpu_worker_aux_interpolation_pool() -> Optional[_GpuWorkerAuxInterpolationPool]:
     return _GPU_WORKER_AUX_INTERPOLATION_POOL
+
+def reset_runtime_state_for_new_run() -> None:
+    """Settle process-global runtime state before an embedded pipeline invocation.
+
+    The command-line launcher normally executes once, but tests and Python callers may run
+    the pipeline repeatedly in one interpreter.  Do not let an executor, auxiliary lease,
+    termination flag, scratch registration, or cached thread pool from an earlier failed
+    invocation become part of the next run.
+    """
+    global _INTERPOLATION_PROCESS_EXECUTOR, _INTERPOLATION_PROCESS_MAX_WORKERS
+    global _INTERPOLATION_PROCESS_WORKER, _GPU_WORKER_AUX_INTERPOLATION_POOL
+    global _INTERPOLATION_PASS_ADMISSION
+    global _RUN_SCRATCH_CLEANUP_PATH, _RUN_SCRATCH_CLEANUP_KEEP
+    global _SCRATCH_DIR_IS_MEMORY_BACKED
+
+    executor = _INTERPOLATION_PROCESS_EXECUTOR
+    aux_pool = _GPU_WORKER_AUX_INTERPOLATION_POOL
+    _INTERPOLATION_PROCESS_EXECUTOR = None
+    _INTERPOLATION_PROCESS_MAX_WORKERS = 0
+    _INTERPOLATION_PROCESS_WORKER = False
+    _GPU_WORKER_AUX_INTERPOLATION_POOL = None
+    _INTERPOLATION_PASS_ADMISSION = _InterpolationPassAdmission(1)
+
+    if aux_pool is not None:
+        try:
+            aux_pool.mark_failed('pipeline run boundary')
+        except Exception:
+            pass
+    if executor is not None:
+        try:
+            executor.shutdown(wait=True, cancel_futures=True)
+        except TypeError:
+            executor.shutdown(wait=True)
+
+    _cleanup_registered_unique_run_scratch()
+    with _RUN_SCRATCH_CLEANUP_LOCK:
+        _RUN_SCRATCH_CLEANUP_PATH = None
+        _RUN_SCRATCH_CLEANUP_KEEP = True
+    _SCRATCH_DIR_IS_MEMORY_BACKED = False
+    _RUN_TERMINATION_REQUESTED.clear()
+    shutdown_parallel_pool_cache()
 
 def _interpolation_array_backing_path(arr: object) -> Optional[Path]:
     if arr is None:
@@ -3118,88 +3204,91 @@ def interpolate_view_volume_pass_maybe_process(
         pass_tag=str(pass_tag),
         workers=max(1, min(int(workers), int(mask_mm.shape[0]) if getattr(mask_mm, 'ndim', 0) else int(workers))),
     )
-    shape = tuple(int(x) for x in np.asarray(process_mm).shape)
-    dtype_str = str(np.asarray(process_mm).dtype)
-    flush_array(process_mm)
+    fallback_enabled = bool(interpolation_process_fallback_enabled())
+    worker_mm = process_mm
+    worker_path = Path(process_path)
+    staged_bridge_path: Optional[Path] = None
 
-    pass_entry_kwargs: Dict[str, object] = dict(
-        mask_path=str(process_path),
-        mask_shape=shape,
-        mask_dtype=dtype_str,
-        work_dir=str(work_dir),
-        pass_tag=str(pass_tag),
-        max_slice_distance=int(max_slice_distance),
-        search_angle_deg=float(search_angle_deg),
-        interpolation_walk_back=int(interpolation_walk_back),
-        interpolation_candidates=int(interpolation_candidates),
-        interpolate_min_radius=float(interpolate_min_radius),
-        keep_temp=bool(keep_temp),
-        reserve_bytes=int(reserve_bytes),
-        workers=int(workers),
-        wrap_axis=bool(wrap_axis),
-        bridge_delta_path=str(bridge_delta_path) if bridge_delta_path is not None else None,
-        # small per-slice metadata arrays pickle across the process boundary.
-        known_slice_any=known_slice_any,
-        known_slice_bboxes=known_slice_bboxes,
-    )
-
-    # once inference has drained, the warm GPU worker processes serve
-    # interpolation passes too — try them first (non-blocking), then the dedicated pool.
-    aux_pool = gpu_worker_aux_interpolation_pool()
-    if aux_pool is not None:
-        aux_handle = aux_pool.try_submit(pass_entry_kwargs)
-        if aux_handle is not None:
-            try:
-                stats = dict(aux_pool.wait(aux_handle))
-            except Exception as exc:
-                if not interpolation_process_fallback_enabled():
-                    raise RuntimeError(
-                        f'GPU-worker aux interpolation failed for {pass_tag} at {process_path}. '
-                        'Set YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK=1 to rerun failed passes in-process for recovery.'
-                    ) from exc
-                print(
-                    f'Warning: GPU-worker aux interpolation failed for {pass_tag} ({exc}); '
-                    'falling back to in-process interpolation because YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK=1.'
-                )
-                stats = dict(interpolate_view_volume_pass_inplace(
-                    mask_mm=process_mm,
-                    work_dir=work_dir,
-                    pass_tag=pass_tag,
-                    max_slice_distance=int(max_slice_distance),
-                    search_angle_deg=float(search_angle_deg),
-                    interpolation_walk_back=int(interpolation_walk_back),
-                    interpolation_candidates=int(interpolation_candidates),
-                    interpolate_min_radius=float(interpolate_min_radius),
-                    keep_temp=bool(keep_temp),
-                    prefer_memory=bool(prefer_memory),
-                    reserve_bytes=int(reserve_bytes),
-                    workers=int(workers),
-                    wrap_axis=bool(wrap_axis),
-                    bridge_delta_path=bridge_delta_path,
-                    known_slice_any=known_slice_any,
-                    known_slice_bboxes=known_slice_bboxes,
-                ))
-                stats['process_backend'] = 'fallback_in_process_after_aux_failure'
-            stats.setdefault('process_backend', 'gpu_worker_aux_process')
-            stats['process_memmap_copied_from_anonymous_array'] = bool(copied_to_memmap)
-            stats['process_pool_workers'] = int(_INTERPOLATION_PROCESS_MAX_WORKERS)
-            flush_array(process_mm)
-            return process_mm, stats
-
-    fut = executor.submit(_interpolation_process_entry, **pass_entry_kwargs)
-    try:
-        stats = dict(fut.result())
-    except Exception as exc:
-        if not interpolation_process_fallback_enabled():
-            raise RuntimeError(
-                f'Interpolation process worker failed for {pass_tag} at {process_path}. '
-                'Set YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK=1 to rerun this pass in-process for recovery.'
-            ) from exc
-        print(
-            f'Warning: interpolation process worker failed for {pass_tag} ({exc}); '
-            'falling back to legacy in-process interpolation because YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK=1.'
+    # A failed interpolation pass is allowed to have modified any byte before it raises.
+    # When recovery is enabled, isolate that speculative write set in a private pathname
+    # transaction.  The clean input is retained for the in-process retry, and an auxiliary
+    # worker whose transport failed can continue touching only the abandoned transaction.
+    if fallback_enabled:
+        transaction_token = (
+            f'{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}'
         )
-        stats = interpolate_view_volume_pass_inplace(
+        worker_path = Path(work_dir) / (
+            f'{_sanitize_filesystem_token(pass_tag)}.{transaction_token}.fallback-stage.u8.dat'
+        )
+        worker_mm = copy_workspace_array(
+            np.asarray(process_mm),
+            worker_path,
+            desc=f'Interpolation fallback transaction {pass_tag}',
+            prefer_memory=False,
+            workers=max(
+                1,
+                min(
+                    int(workers),
+                    int(mask_mm.shape[0]) if getattr(mask_mm, 'ndim', 0) else int(workers),
+                ),
+            ),
+        )
+        if bridge_delta_path is not None:
+            staged_bridge_path = Path(work_dir) / (
+                f'{_sanitize_filesystem_token(pass_tag)}.{transaction_token}.bridge-stage.u8.dat'
+            )
+
+    shape = tuple(int(x) for x in np.asarray(worker_mm).shape)
+    dtype_str = str(np.asarray(worker_mm).dtype)
+    flush_array(process_mm)
+    if worker_mm is not process_mm:
+        flush_array(worker_mm)
+
+    def _discard_speculative_worker_storage() -> None:
+        if worker_mm is process_mm:
+            return
+        close_memmap_array(worker_mm)
+        if not bool(keep_temp):
+            try:
+                Path(worker_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            if staged_bridge_path is not None:
+                try:
+                    Path(staged_bridge_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    def _commit_speculative_worker_storage(stats: Dict[str, object]) -> np.ndarray:
+        try:
+            if worker_mm is not process_mm:
+                total_slices = int(np.asarray(process_mm).shape[0])
+
+                def _commit_slice(idx: int) -> None:
+                    np.copyto(process_mm[int(idx)], worker_mm[int(idx)])
+
+                parallel_for_indices(
+                    total_slices,
+                    _commit_slice,
+                    max_workers=max(1, min(int(workers), total_slices)),
+                    desc=f'Committing interpolation transaction {pass_tag}',
+                    show_progress=False,
+                )
+                flush_array(process_mm)
+            if staged_bridge_path is not None and bridge_delta_path is not None:
+                if Path(staged_bridge_path).exists():
+                    Path(bridge_delta_path).parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(Path(staged_bridge_path), Path(bridge_delta_path))
+                    stats['bridge_delta_path'] = str(bridge_delta_path)
+        finally:
+            _discard_speculative_worker_storage()
+        return process_mm
+
+    def _fallback_in_process(backend_name: str) -> Dict[str, object]:
+        # Close/unlink only the parent's speculative mapping. A transport-failed auxiliary
+        # process may still hold its own mapping, but it cannot race this clean base volume.
+        _discard_speculative_worker_storage()
+        fallback_stats = interpolate_view_volume_pass_inplace(
             mask_mm=process_mm,
             work_dir=work_dir,
             pass_tag=pass_tag,
@@ -3217,14 +3306,88 @@ def interpolate_view_volume_pass_maybe_process(
             known_slice_any=known_slice_any,
             known_slice_bboxes=known_slice_bboxes,
         )
-        stats = dict(stats)
-        stats['process_backend'] = 'fallback_in_process_after_worker_failure'
+        result = dict(fallback_stats)
+        result['process_backend'] = str(backend_name)
+        return result
+
+    pass_entry_kwargs: Dict[str, object] = dict(
+        mask_path=str(worker_path),
+        mask_shape=shape,
+        mask_dtype=dtype_str,
+        work_dir=str(work_dir),
+        pass_tag=str(pass_tag),
+        max_slice_distance=int(max_slice_distance),
+        search_angle_deg=float(search_angle_deg),
+        interpolation_walk_back=int(interpolation_walk_back),
+        interpolation_candidates=int(interpolation_candidates),
+        interpolate_min_radius=float(interpolate_min_radius),
+        keep_temp=bool(keep_temp),
+        reserve_bytes=int(reserve_bytes),
+        workers=int(workers),
+        wrap_axis=bool(wrap_axis),
+        bridge_delta_path=(
+            str(staged_bridge_path)
+            if staged_bridge_path is not None else
+            (str(bridge_delta_path) if bridge_delta_path is not None else None)
+        ),
+        # small per-slice metadata arrays pickle across the process boundary.
+        known_slice_any=known_slice_any,
+        known_slice_bboxes=known_slice_bboxes,
+    )
+
+    # once inference has drained, the warm GPU worker processes serve
+    # interpolation passes too — try them first (non-blocking), then the dedicated pool.
+    aux_pool = gpu_worker_aux_interpolation_pool()
+    if aux_pool is not None:
+        aux_handle = aux_pool.try_submit(pass_entry_kwargs)
+        if aux_handle is not None:
+            try:
+                stats = dict(aux_pool.wait(aux_handle))
+            except Exception as exc:
+                if not fallback_enabled:
+                    raise RuntimeError(
+                        f'GPU-worker aux interpolation failed for {pass_tag} at {process_path}. '
+                        'Set YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK=1 to rerun failed passes in-process for recovery.'
+                    ) from exc
+                print(
+                    f'Warning: GPU-worker aux interpolation failed for {pass_tag} ({exc}); '
+                    'falling back to in-process interpolation because YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK=1.'
+                )
+                stats = _fallback_in_process('fallback_in_process_after_aux_failure')
+                result_mm = process_mm
+            else:
+                result_mm = _commit_speculative_worker_storage(stats)
+            stats.setdefault('process_backend', 'gpu_worker_aux_process')
+            stats['process_memmap_copied_from_anonymous_array'] = bool(copied_to_memmap)
+            stats['process_pool_workers'] = int(_INTERPOLATION_PROCESS_MAX_WORKERS)
+            flush_array(result_mm)
+            return result_mm, stats
+
+    try:
+        # Submission itself may fail when the pool is broken or shutting down. Keep it in
+        # the same recovery transaction as Future.result() rather than leaking a raw error.
+        fut = executor.submit(_interpolation_process_entry, **pass_entry_kwargs)
+        stats = dict(fut.result())
+    except Exception as exc:
+        if not fallback_enabled:
+            raise RuntimeError(
+                f'Interpolation process worker failed for {pass_tag} at {process_path}. '
+                'Set YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK=1 to rerun this pass in-process for recovery.'
+            ) from exc
+        print(
+            f'Warning: interpolation process worker failed for {pass_tag} ({exc}); '
+            'falling back to legacy in-process interpolation because YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK=1.'
+        )
+        stats = _fallback_in_process('fallback_in_process_after_worker_failure')
+        result_mm = process_mm
+    else:
+        result_mm = _commit_speculative_worker_storage(stats)
 
     stats.setdefault('process_backend', 'process_pool_memmap')
     stats['process_memmap_copied_from_anonymous_array'] = bool(copied_to_memmap)
     stats['process_pool_workers'] = int(_INTERPOLATION_PROCESS_MAX_WORKERS)
-    flush_array(process_mm)
-    return process_mm, stats
+    flush_array(result_mm)
+    return result_mm, stats
 
 
 # Late imports keep callable-only dependency cycles import-safe.

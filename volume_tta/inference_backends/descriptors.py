@@ -54,7 +54,7 @@ def cuda_local_capabilities() -> BackendCapabilities:
 
     return BackendCapabilities(
         task_kinds=frozenset({"fullframe", "tile"}),
-        view_families=frozenset({"cartesian", "tilted", "radial", "tilted_radial"}),
+        view_families=frozenset({"orthogonal", "tilted", "radial", "tilted_radial"}),
         pipeline_extents=frozenset(
             {
                 PipelineExtent.INFER_ONLY,
@@ -85,7 +85,7 @@ def openvino_local_capabilities() -> BackendCapabilities:
 
     return BackendCapabilities(
         task_kinds=frozenset({"fullframe", "tile"}),
-        view_families=frozenset({"cartesian", "tilted"}),
+        view_families=frozenset({"orthogonal", "tilted"}),
         pipeline_extents=frozenset({PipelineExtent.INFER_ONLY}),
         result_contracts=frozenset(
             {ResultContract.TASK_ARTIFACT, ResultContract.SHARED_DISJOINT_UNION}

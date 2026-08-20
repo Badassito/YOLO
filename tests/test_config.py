@@ -40,6 +40,19 @@ class ConfigTests(unittest.TestCase):
         batches = resolve_backend_batches(["gpu:4", "cpu:2"], devices)
         self.assertEqual((batches.gpu, batches.cpu), (4, 2))
 
+    def test_unselected_backend_settings_fail_instead_of_being_discarded(self) -> None:
+        cpu_only = resolve_backend_devices(["cpu"])
+        with self.assertRaisesRegex(ValueError, "selected no GPU backend"):
+            resolve_backend_precisions(["gpu:fp16"], cpu_only)
+        with self.assertRaisesRegex(ValueError, "selected no GPU backend"):
+            resolve_backend_batches(["gpu:8"], cpu_only)
+
+        gpu_only = resolve_backend_devices(["0"])
+        with self.assertRaisesRegex(ValueError, "selected no CPU backend"):
+            resolve_backend_precisions(["cpu:bf16"], gpu_only)
+        with self.assertRaisesRegex(ValueError, "selected no CPU backend"):
+            resolve_backend_batches(["cpu:2"], gpu_only)
+
 
 if __name__ == "__main__":
     unittest.main()

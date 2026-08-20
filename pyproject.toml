@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "volume-tta"
-version = "17.0.6"
+version = "17.0.7"
 description = "YOLO segmentation test-time augmentation for large cylindrical video volumes"
 requires-python = ">=3.10"
 dependencies = [

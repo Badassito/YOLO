@@ -16,7 +16,6 @@ from .config import (
 from .runtime import (
     runtime_telemetry_phase,
 )
-from .topology import gpu_slice_labeling_configured_devices
 
 def _union_projected_layer_ref_into_volume(
     ref: 'NrrdLayerRef',
@@ -4221,6 +4220,7 @@ _bind_late_symbols(
             "binary_volume_slice_metadata",
             "discard_binary_volume_slice_metadata",
             "fill_3d_voids_inplace_streaming",
+            "gpu_slice_labeling_configured_devices",
             "label_foreground_volume_streaming",
             "register_binary_volume_slice_metadata",
             "scan_binary_volume_slice_metadata",

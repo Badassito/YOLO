@@ -13,9 +13,9 @@ GIB = 1024 ** 3
 
 NRRD_SPACE = "left-posterior-superior"
 
-SCRIPT_VERSION = '17.0.6'
+SCRIPT_VERSION = '17.0.7'
 
-SCRIPT_VERSION_COMPACT = '1706'
+SCRIPT_VERSION_COMPACT = '1707'
 
 SCRIPT_BASENAME = f'GPT-5.6-Sol-Pro_v{SCRIPT_VERSION}_SLURM.py'
 
@@ -750,6 +750,10 @@ def resolve_backend_precisions(
             untagged.append(str(raw).strip())
     if tagged and untagged:
         raise ValueError('--quantize cannot mix tagged and untagged values')
+    if 'gpu' in tagged and not devices.gpu_devices:
+        raise ValueError('--quantize contains gpu: settings, but --device selected no GPU backend')
+    if 'cpu' in tagged and not devices.cpu:
+        raise ValueError('--quantize contains cpu: settings, but --device selected no CPU backend')
     if untagged:
         if len(untagged) != 1:
             raise ValueError('--quantize accepts one shorthand value or tagged gpu:/cpu: values')
@@ -785,6 +789,10 @@ def resolve_backend_batches(
             untagged.append(str(raw).strip())
     if tagged and untagged:
         raise ValueError('--batch cannot mix tagged and untagged values')
+    if 'gpu' in tagged and not devices.gpu_devices:
+        raise ValueError('--batch contains gpu: settings, but --device selected no GPU backend')
+    if 'cpu' in tagged and not devices.cpu:
+        raise ValueError('--batch contains cpu: settings, but --device selected no CPU backend')
     if untagged:
         if len(untagged) != 1:
             raise ValueError('--batch accepts one shorthand value or tagged gpu:/cpu: values')
