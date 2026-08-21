@@ -666,6 +666,51 @@ class SliceEndpointSeed:
     label: int
     point: Tuple[int, int, int]  # (slice, row, col)
     direction_sign: int          # 1 or +1 along the slice axis
+    # Cheap scheduler hint captured while the source 2D component is already hot.
+    # It never participates in candidate selection or bridge geometry.
+    planning_cost: int = 1
+
+
+def interpolation_seed_schedule_window_factor() -> int:
+    """Number of planner-worker waves rebalanced within one slice-local window.
+
+    Zero restores strictly slice-major submission.  A bounded window starts expensive
+    component seeds first without globally scattering component-table/SDF cache access.
+    """
+    return max(0, _env_int('YOLO_TTA_INTERPOLATION_SEED_SCHEDULE_WINDOW_FACTOR', 4))
+
+
+def _rebalance_slice_major_endpoint_seeds(
+    seeds: List[SliceEndpointSeed],
+    *,
+    plan_workers: int,
+    window_factor: Optional[int] = None,
+) -> int:
+    """Stable largest-cost-first scheduling inside bounded slice-major windows.
+
+    All seeds plan against the same frozen label/mask snapshot and rendered sections are
+    reduced with OR, so submission order is not semantic.  Keeping the rebalance bounded
+    preserves the component-cache locality of the prior slice-major traversal while moving
+    the expensive SDF seeds ahead of cheap work that can fill each worker wave's tail.
+    """
+    workers = max(1, int(plan_workers))
+    factor = (
+        interpolation_seed_schedule_window_factor()
+        if window_factor is None else max(0, int(window_factor))
+    )
+    if workers <= 1 or factor <= 0 or len(seeds) <= 1:
+        return 0
+    window = max(workers, workers * factor)
+    for start in range(0, len(seeds), int(window)):
+        end = min(len(seeds), int(start) + int(window))
+        # Python's sort is stable: equal-cost seeds retain the exact prior slice-major
+        # order, which keeps the scheduling policy deterministic across worker counts.
+        seeds[start:end] = sorted(
+            seeds[start:end],
+            key=lambda seed: -max(1, int(getattr(seed, 'planning_cost', 1))),
+        )
+    return int(window)
+
 
 @dataclass(frozen=True)
 class SliceProjectionCandidate:
@@ -2245,6 +2290,13 @@ def interpolate_view_volume_pass_inplace(
             int(seed.point[1]), int(seed.point[2]),
         ))
         plan_workers = choose_slice_parallel_workers(int(workers), len(seeds))
+        max_seed_planning_cost = max(
+            max(1, int(getattr(seed, 'planning_cost', 1))) for seed in seeds
+        )
+        seed_schedule_window = _rebalance_slice_major_endpoint_seeds(
+            seeds,
+            plan_workers=int(plan_workers),
+        )
 
         def _render_plan_batch() -> None:
             nonlocal added_voxels
@@ -2385,7 +2437,10 @@ def interpolate_view_volume_pass_inplace(
             f'component-table payload peak '
             f'{cache_telemetry.get("component_table_cache_peak_payload_bytes", 0) / GIB:.2f} GiB; '
             f'projection-SDF peak '
-            f'{cache_telemetry.get("projection_sdf_cache_peak_bytes", 0) / GIB:.2f} GiB.'
+            f'{cache_telemetry.get("projection_sdf_cache_peak_bytes", 0) / GIB:.2f} GiB; '
+            f'seed schedule '
+            f'{"cost-balanced/" + str(seed_schedule_window) if seed_schedule_window else "slice-major"} '
+            f'(max cost {max_seed_planning_cost:,}).'
         )
 
         if planned_plan_count > 0:
@@ -2512,6 +2567,11 @@ def interpolate_view_volume_pass_inplace(
         'planner_plan_batch_peak_payload_bytes': int(plan_batch_peak_payload_bytes),
         'planner_plan_batch_peak_charge_bytes': int(plan_batch_peak_charge_bytes),
         'planner_plan_batch_peak_plans': int(plan_batch_peak_plans),
+        'planner_seed_schedule': (
+            'cost_balanced_slice_window' if int(seed_schedule_window) > 0 else 'slice_major'
+        ),
+        'planner_seed_schedule_window': int(seed_schedule_window),
+        'planner_seed_max_cost': int(max_seed_planning_cost),
     }
     result_stats.update(cache_telemetry)
     if bool(bridge_delta_written) and bridge_delta_path is not None:

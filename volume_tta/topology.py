@@ -2288,6 +2288,12 @@ def build_slice_endpoint_seeds_from_label_volume(
 
         seeds_local: List[SliceEndpointSeed] = []
         for record in table.components:
+            y0, x0, y1, x1 = (int(v) for v in record.bbox)
+            planning_cost = max(
+                1,
+                int(record.area),
+                max(0, int(y1) - int(y0)) * max(0, int(x1) - int(x0)),
+            )
             has_prev = _record_continues_in_neighbor(
                 record, prev_z, mirrored=bool(prev_wrapped),
             )
@@ -2300,12 +2306,14 @@ def build_slice_endpoint_seeds_from_label_volume(
                     label=int(record.label),
                     point=(z_i, int(record.anchor[0]), int(record.anchor[1])),
                     direction_sign=-1,
+                    planning_cost=int(planning_cost),
                 ))
             if not has_next:
                 seeds_local.append(SliceEndpointSeed(
                     label=int(record.label),
                     point=(z_i, int(record.anchor[0]), int(record.anchor[1])),
                     direction_sign=1,
+                    planning_cost=int(planning_cost),
                 ))
         return seeds_local
 
@@ -2352,6 +2360,13 @@ def build_slice_endpoint_seeds_from_label_volume(
                 anchor = _component_centroid_anchor(comp)
                 if anchor is None:
                     continue
+                ys, xs = np.nonzero(comp)
+                planning_cost = max(
+                    1,
+                    int(ys.size),
+                    (int(ys.max()) - int(ys.min()) + 1)
+                    * (int(xs.max()) - int(xs.min()) + 1),
+                )
 
                 # endpoint continuation is defined by direct footprint overlap in
                 # the adjacent slice; do not dilate/skeletonize the component for endpoint discovery.
@@ -2363,12 +2378,14 @@ def build_slice_endpoint_seeds_from_label_volume(
                         label=int(obj_id),
                         point=(int(z), int(anchor[0]), int(anchor[1])),
                         direction_sign=-1,
+                        planning_cost=int(planning_cost),
                     ))
                 if not has_next:
                     seeds_local.append(SliceEndpointSeed(
                         label=int(obj_id),
                         point=(int(z), int(anchor[0]), int(anchor[1])),
                         direction_sign=1,
+                        planning_cost=int(planning_cost),
                     ))
 
         return seeds_local

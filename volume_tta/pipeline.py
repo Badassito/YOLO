@@ -1639,6 +1639,8 @@ def _main_impl() -> None:
     spec_notes.append(
         'Interpolation endpoint discovery uses the per-slice connected-component scan backed by cached per-slice component tables. '
         'Projection candidate search runs on source-component local SDF crops, and variable-cost seed planning is consumed through a bounded unordered completion queue. '
+        'v17.0.9 planner seeds are stably cost-balanced within four worker-wave slice-local windows by default; '
+        'YOLO_TTA_INTERPOLATION_SEED_SCHEDULE_WINDOW_FACTOR=0 restores strict slice-major submission for A/B verification. '
         'v13.0.0 removed optional skeletonization entirely; interpolation never used skeletonization.'
     )
     spec_notes.append(

@@ -49,6 +49,9 @@ INTENTIONALLY_CHANGED = {
     ("runtime", "reset_runtime_state_for_new_run"),
     ("workers", "run_prediction_volume_in_worker"),
     ("topology", "_try_label_slices_stage_a_gpu"),
+    ("topology", "build_slice_endpoint_seeds_from_label_volume"),
+    ("interpolation", "SliceEndpointSeed"),
+    ("interpolation", "interpolate_view_volume_pass_inplace"),
     ("interpolation", "interpolation_planning_backend_name"),
     ("finalization", "assemble_view_volumes_and_projected_layers_fused"),
 }
