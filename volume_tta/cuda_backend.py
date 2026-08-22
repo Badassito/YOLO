@@ -2650,15 +2650,36 @@ class _GpuWorkerRenderEngine:
             return self._render_radial_native_resident(view, int(frame_idx))
         raise ValueError(f'Unsupported view for GPU native plane: {name}')
 
-    def _render_fullframe_frame(self, view: ViewInfo, aff: AffineSpec, frame_idx: int, out_size: int) -> object:
+    @staticmethod
+    def _mirror_radial_u_out_to_src(M_out_to_src: np.ndarray, source_width: int) -> np.ndarray:
+        """Compose output-to-source sampling with native radial-u reversal."""
+        mirrored = np.asarray(M_out_to_src, dtype=np.float32).copy()
+        mirrored[0, :] *= np.float32(-1.0)
+        mirrored[0, 2] += np.float32(max(0, int(source_width) - 1))
+        return mirrored
+
+    def _render_fullframe_frame(
+        self,
+        view: ViewInfo,
+        aff: AffineSpec,
+        frame_idx: int,
+        out_size: int,
+        *,
+        mirror_radial_u: bool = False,
+    ) -> object:
         if is_tilted_view(view):
             return self._render_tilted_frame(
                 view, aff.M_out_to_src, int(out_size), int(out_size), int(frame_idx),
             )
+        mirror_u = bool(mirror_radial_u and is_radial_view(view))
         if is_radial_view(view) and _env_flag('YOLO_TTA_GPU_RADIAL_DIRECT_TEXTURE_GRID', True):
             try:
+                direct_matrix = (
+                    self._mirror_radial_u_out_to_src(aff.M_out_to_src, int(view.src_w))
+                    if mirror_u else aff.M_out_to_src
+                )
                 return self._render_radial_texture_grid(
-                    view, int(frame_idx), aff.M_out_to_src, int(out_size), int(out_size),
+                    view, int(frame_idx), direct_matrix, int(out_size), int(out_size),
                 )
             except Exception as exc:
                 warning_key = 'tilted_radial_grid_fallback' if is_tilted_radial_view(view) else 'radial_grid_fallback'
@@ -2669,6 +2690,8 @@ class _GpuWorkerRenderEngine:
                         'using native-plane reconstruction followed by the affine warp.'
                     )
         plane = self._render_native_plane(view, int(frame_idx))
+        if mirror_u:
+            plane = self.torch.flip(plane, dims=(1,))
         if self._affine_is_identity_render(aff):
             return plane
         theta = _affine_theta_from_dst_to_src(
@@ -2687,6 +2710,8 @@ class _GpuWorkerRenderEngine:
         M_out_to_src: np.ndarray,
         frame_idx: int,
         out_size: int,
+        *,
+        mirror_radial_u: bool = False,
     ) -> object:
         """Render one dense-tile inference raster directly when the view supports it."""
         matrix = np.asarray(M_out_to_src, dtype=np.float32)
@@ -2694,10 +2719,15 @@ class _GpuWorkerRenderEngine:
             return self._render_tilted_frame(
                 view, matrix, int(out_size), int(out_size), int(frame_idx),
             )
+        mirror_u = bool(mirror_radial_u and is_radial_view(view))
         if is_radial_view(view) and _env_flag('YOLO_TTA_GPU_RADIAL_DIRECT_TEXTURE_GRID', True):
             try:
+                direct_matrix = (
+                    self._mirror_radial_u_out_to_src(matrix, int(view.src_w))
+                    if mirror_u else matrix
+                )
                 return self._render_radial_texture_grid(
-                    view, int(frame_idx), matrix, int(out_size), int(out_size),
+                    view, int(frame_idx), direct_matrix, int(out_size), int(out_size),
                 )
             except Exception as exc:
                 warning_key = 'tilted_radial_tile_grid_fallback' if is_tilted_radial_view(view) else 'radial_tile_grid_fallback'
@@ -2708,6 +2738,8 @@ class _GpuWorkerRenderEngine:
                         'using the cached native plane plus affine grid sampling.'
                     )
         plane = self._render_native_plane_cached(view, int(frame_idx))
+        if mirror_u:
+            plane = self.torch.flip(plane, dims=(1,))
         theta = _affine_theta_from_dst_to_src(
             matrix,
             int(plane.shape[0]), int(plane.shape[1]), int(out_size), int(out_size),
@@ -2739,27 +2771,29 @@ class _GpuWorkerRenderEngine:
         offsets = (0,) if fmt.kind == 'gray' else tuple(int(v) for v in fmt.offsets)
         matrix = np.asarray(tile_affine, dtype=np.float32)
         with torch.cuda.stream(self._stream):
-            requested_indices: List[Tuple[int, ...]] = []
-            unique_indices: Dict[int, object] = {}
+            requested_sources: List[Tuple[Tuple[int, bool], ...]] = []
+            unique_sources: Dict[Tuple[int, bool], object] = {}
             for frame_idx in frame_indices:
                 contextual = tuple(
-                    channel_view_slice_index(view, int(frame_idx) + int(offset))
+                    channel_view_slice_source(view, int(frame_idx) + int(offset))
                     for offset in offsets
                 )
-                requested_indices.append(contextual)
-                for source_idx in contextual:
-                    if int(source_idx) not in unique_indices:
-                        unique_indices[int(source_idx)] = self._render_tile_plane(
+                requested_sources.append(contextual)
+                for source in contextual:
+                    if source not in unique_sources:
+                        source_idx, mirror_u = source
+                        unique_sources[source] = self._render_tile_plane(
                             view, matrix, int(source_idx), int(out_size),
+                            mirror_radial_u=bool(mirror_u),
                         )
 
             frames: List[object] = []
-            for contextual in requested_indices:
+            for contextual in requested_sources:
                 if fmt.kind == 'gray':
-                    frames.append(unique_indices[int(contextual[0])].unsqueeze(0))
+                    frames.append(unique_sources[contextual[0]].unsqueeze(0))
                 else:
                     frames.append(torch.stack(
-                        [unique_indices[int(source_idx)] for source_idx in contextual], dim=0,
+                        [unique_sources[source] for source in contextual], dim=0,
                     ))
             batch = torch.stack(frames, dim=0)
             batch = batch.clamp_(0.0, 255.0).mul_(1.0 / 255.0)
@@ -2782,29 +2816,31 @@ class _GpuWorkerRenderEngine:
         torch = self.torch
         fmt = resolve_channel_format(channel_format)
         with torch.cuda.stream(self._stream):
-            requested_indices: List[Tuple[int, ...]] = []
-            unique_indices: Dict[int, object] = {}
+            requested_sources: List[Tuple[Tuple[int, bool], ...]] = []
+            unique_sources: Dict[Tuple[int, bool], object] = {}
             for frame_idx in frame_indices:
                 center = int(frame_idx)
                 offsets = (0,) if fmt.kind == 'gray' else tuple(int(v) for v in fmt.offsets)
                 contextual = tuple(
-                    channel_view_slice_index(view, center + int(offset))
+                    channel_view_slice_source(view, center + int(offset))
                     for offset in offsets
                 )
-                requested_indices.append(contextual)
-                for source_idx in contextual:
-                    if source_idx not in unique_indices:
-                        unique_indices[source_idx] = self._render_fullframe_frame(
-                            view, job.aff, int(source_idx), int(out_size)
+                requested_sources.append(contextual)
+                for source in contextual:
+                    if source not in unique_sources:
+                        source_idx, mirror_u = source
+                        unique_sources[source] = self._render_fullframe_frame(
+                            view, job.aff, int(source_idx), int(out_size),
+                            mirror_radial_u=bool(mirror_u),
                         )
 
             frames: List[object] = []
-            for contextual in requested_indices:
+            for contextual in requested_sources:
                 if fmt.kind == 'gray':
-                    frames.append(unique_indices[int(contextual[0])].unsqueeze(0))
+                    frames.append(unique_sources[contextual[0]].unsqueeze(0))
                 else:
                     frames.append(torch.stack(
-                        [unique_indices[int(source_idx)] for source_idx in contextual],
+                        [unique_sources[source] for source in contextual],
                         dim=0,
                     ))
             batch = torch.stack(frames, dim=0)
@@ -2853,23 +2889,25 @@ class _GpuWorkerRenderEngine:
                 return
 
             contextual = tuple(
-                channel_view_slice_index(view, int(frame_index) + int(offset))
+                channel_view_slice_source(view, int(frame_index) + int(offset))
                 for offset in fmt.offsets
             )
-            first_channel_by_source: Dict[int, int] = {}
-            for channel_idx, source_idx in enumerate(contextual):
-                first_channel = first_channel_by_source.get(int(source_idx))
+            first_channel_by_source: Dict[Tuple[int, bool], int] = {}
+            for channel_idx, source in enumerate(contextual):
+                first_channel = first_channel_by_source.get(source)
                 if first_channel is not None:
                     slot.input[0, int(channel_idx)].copy_(
                         slot.input[0, int(first_channel)], non_blocking=True,
                     )
                     continue
+                source_idx, mirror_u = source
                 plane = self._render_fullframe_frame(
-                    view, job.aff, int(source_idx), int(out_size)
+                    view, job.aff, int(source_idx), int(out_size),
+                    mirror_radial_u=bool(mirror_u),
                 )
                 plane.clamp_(0.0, 255.0).mul_(1.0 / 255.0)
                 slot.input[0, int(channel_idx)].copy_(plane, non_blocking=True)
-                first_channel_by_source[int(source_idx)] = int(channel_idx)
+                first_channel_by_source[source] = int(channel_idx)
             slot.render_done.record(self._stream)
 
 
@@ -2896,23 +2934,25 @@ class _GpuWorkerRenderEngine:
             if bool(slot.infer_valid):
                 self._stream.wait_event(slot.infer_done)
             contextual = tuple(
-                channel_view_slice_index(view, int(frame_index) + int(offset))
+                channel_view_slice_source(view, int(frame_index) + int(offset))
                 for offset in fmt.offsets
             )
-            first_channel_by_source: Dict[int, int] = {}
-            for channel_index, source_index in enumerate(contextual):
-                first_channel = first_channel_by_source.get(int(source_index))
+            first_channel_by_source: Dict[Tuple[int, bool], int] = {}
+            for channel_index, source in enumerate(contextual):
+                first_channel = first_channel_by_source.get(source)
                 if first_channel is not None:
                     slot.input[0, int(channel_index)].copy_(
                         slot.input[0, int(first_channel)], non_blocking=True,
                     )
                     continue
+                source_index, mirror_u = source
                 plane = self._render_tile_plane(
                     view, matrix, int(source_index), int(out_size),
+                    mirror_radial_u=bool(mirror_u),
                 )
                 plane.clamp_(0.0, 255.0).mul_(1.0 / 255.0)
                 slot.input[0, int(channel_index)].copy_(plane, non_blocking=True)
-                first_channel_by_source[int(source_index)] = int(channel_index)
+                first_channel_by_source[source] = int(channel_index)
             slot.render_done.record(self._stream)
 
 class GpuRenderedYoloSource:
@@ -3365,27 +3405,31 @@ def _radial_slab_channel_renderer(
         and int(aff.canvas_h) == int(aff.src_h)
         and float(aff.angle_deg) % 360.0 == 0.0
     )
-    transformed = np.empty(
-        (len(indices), int(aff.out_size), int(aff.out_size)), dtype=np.uint8,
-    )
-    for row, native_plane in enumerate(bank):
+    def _transform_native_plane(native_plane: np.ndarray, *, mirror_u: bool) -> np.ndarray:
         plane = np.ascontiguousarray(native_plane, dtype=np.uint8)
+        if bool(mirror_u):
+            plane = np.ascontiguousarray(plane[:, ::-1])
         if identity:
             if plane.shape != (int(aff.out_size), int(aff.out_size)):
                 raise ValueError(
                     f'identity radial slab plane has shape {plane.shape}, expected '
                     f'({int(aff.out_size)},{int(aff.out_size)})'
                 )
-            transformed[row] = plane
-        else:
-            transformed[row] = cv2.warpAffine(
-                plane,
-                aff.M_src_to_out,
-                dsize=(int(aff.out_size), int(aff.out_size)),
-                flags=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=0,
-            )
+            return plane
+        return cv2.warpAffine(
+            plane,
+            aff.M_src_to_out,
+            dsize=(int(aff.out_size), int(aff.out_size)),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+
+    transformed = np.empty(
+        (len(indices), int(aff.out_size), int(aff.out_size)), dtype=np.uint8,
+    )
+    for row, native_plane in enumerate(bank):
+        transformed[row] = _transform_native_plane(native_plane, mirror_u=False)
 
     row_by_index = {value: row for row, value in enumerate(indices)}
 
@@ -3397,8 +3441,23 @@ def _radial_slab_channel_renderer(
                 f'global radial plane {int(global_idx)} was not prerendered'
             ) from exc
 
+    def _render_mirrored_plane(global_idx: int) -> np.ndarray:
+        try:
+            native_plane = bank[row_by_index[int(global_idx)]]
+        except KeyError as exc:
+            raise IndexError(
+                f'global radial plane {int(global_idx)} was not prerendered'
+            ) from exc
+        # Reverse native radial-u before the job affine. Flipping the already transformed
+        # inference plane would compose in the wrong order for nonzero TTA angles.
+        return _transform_native_plane(native_plane, mirror_u=True)
+
     formatted = ChannelFormattedFrameRenderer(
-        _render_plane, view, fmt, cache_frames=0,
+        _render_plane,
+        view,
+        fmt,
+        cache_frames=0,
+        mirrored_plane_renderer=_render_mirrored_plane,
     )
     start = int(center_start)
 
@@ -3471,6 +3530,7 @@ _bind_late_symbols(
             "_tilted_plan_cache_key",
             "cartesian_view_axis_spec",
             "channel_view_slice_index",
+            "channel_view_slice_source",
             "ensure_ultralytics_accepts_in_memory_volume_source",
             "get_tilted_render_plan",
             "is_radial_view",

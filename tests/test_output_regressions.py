@@ -59,6 +59,40 @@ def _payload_writer(file_handle: object, **_kwargs: object):
     yield file_handle
 
 
+class SummaryTests(unittest.TestCase):
+    def test_summary_contains_run_results_without_specification_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summary_path = outputs.write_summary_file(
+                root / 'sample_Summary.txt',
+                command='volume-tta --input sample.mkv',
+                input_path=Path('sample.mkv'),
+                out_dir=root,
+                scratch_dir=root / 'temp',
+                source_shape_x_y_t=(8, 8, 4),
+                volume_shape=(4, 8, 8),
+                fps=24.0,
+                model_paths=['gpu:model.engine'],
+                view_names=['transverse (4 frames)'],
+                view_prediction_stats={'transverse': 4},
+                interpolation_stats=[],
+                enable_3d_void_fill=False,
+                gaussian_smoothing_stats=None,
+                keep_objects_stats=None,
+                voxel_volume=None,
+                final_paths={'binary': root / 'sample_binary.mkv'},
+                augmentation_workers=1,
+                slice_postprocess_workers=1,
+                interpolation_workers=1,
+                output_workers=1,
+            )
+
+            text = summary_path.read_text()
+            self.assertIn('View statistics:', text)
+            self.assertIn('Final outputs:', text)
+            self.assertNotIn('Specification notes:', text)
+
+
 class AtomicNrrdTests(unittest.TestCase):
     def _nrrd_patches(self) -> contextlib.ExitStack:
         stack = contextlib.ExitStack()

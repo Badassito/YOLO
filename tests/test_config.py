@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import unittest
 
 from volume_tta.config import (
+    build_argparser,
     resolve_backend_batches,
     resolve_backend_devices,
     resolve_backend_models,
@@ -13,6 +16,22 @@ from volume_tta.config import (
 
 
 class ConfigTests(unittest.TestCase):
+    def test_retired_centerline_backend_and_tilt_alias_are_not_registered(self) -> None:
+        parser = build_argparser()
+        option_strings = {option for action in parser._actions for option in action.option_strings}
+        self.assertNotIn('--centerline_filter_backend', option_strings)
+        self.assertNotIn('--enable_tilt', option_strings)
+        self.assertIn('--enable_tilted', option_strings)
+        required = ['--input', 'input.mkv', '--model', 'gpu:model.engine']
+        for retired_option, value in (
+            ('--centerline_filter_backend', 'off'),
+            ('--enable_tilt', 'transverse'),
+        ):
+            with self.subTest(retired_option=retired_option):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        parser.parse_args([*required, retired_option, value])
+
     def test_angles_are_normalized_and_unique(self) -> None:
         self.assertEqual(resolve_tta_angles("-120,0,120"), [240.0, 0.0, 120.0])
         with self.assertRaises(ValueError):

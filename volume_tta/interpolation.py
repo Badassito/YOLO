@@ -2845,6 +2845,7 @@ class NrrdLayerRef:
     source: str = ''  # fullframe, tile, or global
     mask_kind: str = ''  # yolo, bridge, union, smoothing_result
     pass_index: int = 0
+    tile_config_id: str = ''
     tile_acceptance: str = ''  # parent_mask, parent_bridge, consolidated, or blank
     stage: str = ''
     description: str = ''

@@ -1002,6 +1002,7 @@ def _nrrd_layer_key(
     source: str,
     mask_kind: str,
     pass_index: int = 0,
+    tile_config_id: str = '',
     tile_acceptance: str = '',
     stage: str = '',
 ) -> str:
@@ -1012,6 +1013,8 @@ def _nrrd_layer_key(
     ]
     if int(pass_index) > 0:
         parts.append(f'pass{int(pass_index):02d}')
+    if tile_config_id:
+        parts.append(_sanitize_nrrd_layer_token(tile_config_id))
     if tile_acceptance:
         parts.append(_sanitize_nrrd_layer_token(tile_acceptance))
     if stage:
@@ -1024,6 +1027,7 @@ def _nrrd_layer_name(
     source: str,
     mask_kind: str,
     pass_index: int = 0,
+    tile_config_id: str = '',
     tile_acceptance: str = '',
     stage: str = '',
 ) -> str:
@@ -1043,6 +1047,8 @@ def _nrrd_layer_name(
         pieces.append(str(mask_kind))
     if int(pass_index) > 0:
         pieces.append(f'pass {int(pass_index)}')
+    if tile_config_id:
+        pieces.append(f'tile set {str(tile_config_id)}')
     if tile_acceptance:
         pieces.append(f'accepted by {str(tile_acceptance).replace("_", " ")}')
     if stage:

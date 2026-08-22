@@ -15,9 +15,22 @@ MANIFEST = PACKAGE / "_refactor_manifest.json"
 
 # These definitions received small, intentional seam fixes after physical extraction.
 INTENTIONALLY_CHANGED = {
+    ("backprojection", "HybridBackprojectionQueue"),
     ("config", "build_argparser"),
     ("config", "resolve_backend_batches"),
     ("config", "resolve_backend_precisions"),
+    ("cuda_backend", "_GpuWorkerRenderEngine"),
+    ("cuda_backend", "_radial_slab_channel_renderer"),
+    ("cuda_d1", "_nrrd_layer_key"),
+    ("cuda_d1", "_nrrd_layer_name"),
+    ("geometry", "ChannelFormattedFrameRenderer"),
+    ("geometry", "channel_view_slice_index"),
+    ("geometry", "make_dense_tile_channel_renderer"),
+    ("geometry", "make_fullframe_channel_renderer"),
+    ("geometry", "render_dense_tile_frame_for_job"),
+    ("geometry", "render_fullframe_frame_for_job"),
+    ("geometry", "write_aug_job_meta"),
+    ("geometry", "write_dense_tile_job_meta"),
     ("media", "abort_streaming_producers"),
     ("media", "decode_video_to_memmap_gray8_streaming"),
     ("media", "resize_volume_to_processing_cube_gray8_streaming"),
@@ -51,9 +64,15 @@ INTENTIONALLY_CHANGED = {
     ("topology", "_try_label_slices_stage_a_gpu"),
     ("topology", "build_slice_endpoint_seeds_from_label_volume"),
     ("interpolation", "SliceEndpointSeed"),
+    ("interpolation", "NrrdLayerRef"),
     ("interpolation", "interpolate_view_volume_pass_inplace"),
     ("interpolation", "interpolation_planning_backend_name"),
     ("finalization", "assemble_view_volumes_and_projected_layers_fused"),
+    ("assembly", "finalize_consolidated_tile_volume_for_parent"),
+    ("assembly", "materialize_nrrd_view_layer"),
+    ("geometry", "is_tilted_view"),
+    ("outputs", "write_summary_file"),
+    ("outputs", "nrrd_layer_output_suffix"),
 }
 
 # The public wrapper now owns the full-run cleanup boundary; the preserved orchestration

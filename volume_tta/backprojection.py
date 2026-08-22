@@ -4083,7 +4083,7 @@ class HybridBackprojectionQueue:
 
  Upright Radial views use orientation-aware dense or sink-only projection; transverse may also
  use the resident GPU backprojector. Tilted Radial jobs use the direct composed Radial/shear
- projector, while ordinary Tilted jobs use the generalized CPU shear path. The historical
+ projector, while ordinary Tilted jobs use the shared CPU shear path. The historical
  class name is retained to avoid scheduler call-site churn."""
 
     def __init__(self, *, cpu_workers: int = 1) -> None:

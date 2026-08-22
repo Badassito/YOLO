@@ -2256,6 +2256,7 @@ def nrrd_layer_output_suffix(
     source: str,
     mask_kind: str,
     pass_index: int = 0,
+    tile_config_id: str = '',
     tile_acceptance: str = '',
     stage: str = '',
 ) -> str:
@@ -2278,10 +2279,12 @@ def nrrd_layer_output_suffix(
             return f'{vt}_fullframe_bridge_pass{int(pass_index):02d}'
         return f'{vt}_fullframe_yolo'
     if source_l == 'tile':
+        config = _sanitize_nrrd_layer_token(tile_config_id) if tile_config_id else ''
+        config_part = f'_{config}' if config else ''
         if mask_kind_l == 'bridge':
-            return f'{vt}_tile_bridge_pass{int(pass_index):02d}'
+            return f'{vt}_tile{config_part}_bridge_pass{int(pass_index):02d}'
         acceptance = _sanitize_nrrd_layer_token(tile_acceptance) or 'parent_support'
-        return f'{vt}_tile_yolo_{acceptance}'
+        return f'{vt}_tile{config_part}_yolo_{acceptance}'
     parts = [vt, source_l or 'layer', mask_kind_l or 'mask']
     if int(pass_index) > 0:
         parts.append(f'pass{int(pass_index):02d}')
@@ -3234,6 +3237,7 @@ class NrrdLayerSink:
                 'source': getattr(ref, 'source', ''),
                 'mask_kind': getattr(ref, 'mask_kind', ''),
                 'pass_index': int(getattr(ref, 'pass_index', 0)),
+                'tile_config_id': getattr(ref, 'tile_config_id', ''),
                 'tile_acceptance': getattr(ref, 'tile_acceptance', ''),
                 'stage': getattr(ref, 'stage', ''),
                 'description': getattr(ref, 'description', ''),
@@ -3281,6 +3285,7 @@ class NrrdLayerSink:
                     'source': getattr(ref, 'source', ''),
                     'mask_kind': getattr(ref, 'mask_kind', ''),
                     'pass_index': int(getattr(ref, 'pass_index', 0)),
+                    'tile_config_id': getattr(ref, 'tile_config_id', ''),
                     'tile_acceptance': getattr(ref, 'tile_acceptance', ''),
                     'stage': getattr(ref, 'stage', ''),
                     'description': getattr(ref, 'description', ''),
@@ -5144,7 +5149,6 @@ def write_summary_file(
     slice_postprocess_workers: int,
     interpolation_workers: int,
     output_workers: int,
-    spec_notes: Optional[Sequence[str]] = None,
     view_prediction_labels: Optional[Dict[str, str]] = None,
 ) -> Path:
     lines: List[str] = []
@@ -5171,12 +5175,6 @@ def write_summary_file(
     else:
         lines.append('Models: <none>')
     lines.append(f'Views: {", ".join(view_names)}')
-    if spec_notes:
-        lines.append('')
-        lines.append('Specification notes:')
-        for note in spec_notes:
-            lines.append(f'  - {note}')
-
     lines.append('')
     lines.append('View statistics:')
     total_prediction_count = 0

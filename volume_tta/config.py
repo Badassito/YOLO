@@ -13,9 +13,9 @@ GIB = 1024 ** 3
 
 NRRD_SPACE = "left-posterior-superior"
 
-SCRIPT_VERSION = '17.0.9'
+SCRIPT_VERSION = '17.0.10'
 
-SCRIPT_VERSION_COMPACT = '1709'
+SCRIPT_VERSION_COMPACT = '17010'
 
 SCRIPT_BASENAME = f'GPT-5.6-Sol-Pro_v{SCRIPT_VERSION}_SLURM.py'
 
@@ -830,6 +830,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="YOLO segmentation TTA for large cylindrical video volumes.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        allow_abbrev=False,
     )
     p.add_argument(
         "--version",
@@ -875,7 +876,9 @@ def build_argparser() -> argparse.ArgumentParser:
             "Model-input channel layout. gray/grey uses center slice N as one channel; "
             "RGB triplicates N into three channels; C{odd}S{stride>=1}, e.g. C5S1, "
             "uses neighboring view slices in ascending offset order. Radial and Tilted "
-            "Radial indices wrap; Cartesian and Tilted Cartesian indices edge-clamp. "
+            "Radial indices wrap; after an odd number of 0/180-degree seam crossings, "
+            "the contextual plane's radial-u axis is reversed. Cartesian and Tilted "
+            "Cartesian indices edge-clamp. "
             "Only one value is accepted and every prediction remains assigned to N"
         ),
     )
@@ -1024,8 +1027,6 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument("--centerline_filter_passes", default=0, type=int,
                    help="Maximum centerline-guided post-union passes. Pass 0 is the untouched audit checkpoint; 0 disables filtering and its audit NRRDs")
-    p.add_argument("--centerline_filter_backend", default="embedded", choices=["embedded", "off"],
-                   help="Centerline backend. embedded uses the in-script SciPy EDT medial-ridge tracker; off disables filtering")
     p.add_argument("--centerline_auto_remove", action="store_true",
                    help="Opt in to removing whole unprotected 2D components that satisfy every centerline, temporal, and backend-reliability guard. Protected connected anatomy remains marker-only; this flag never subtracts a watershed partition")
     p.add_argument("--centerline_radius_factor", default=2.5, type=float, metavar="X",

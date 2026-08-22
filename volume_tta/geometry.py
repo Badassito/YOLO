@@ -400,7 +400,7 @@ def expand_views_into_tta_variants(
     return variants
 
 def is_tilted_view(view: ViewInfo) -> bool:
-    """Return True for a concrete generalized Tilted Cartesian view."""
+    """Return True for a concrete member of the Tilted view family."""
     return str(view.family) == TILTED_VIEW_FAMILY
 
 def is_radial_view(view: ViewInfo) -> bool:
@@ -1189,7 +1189,7 @@ def write_aug_job_meta(
                 'model_input_channels': int(fmt.channel_count),
                 'channel_stride': int(fmt.stride),
                 'channel_offsets': [int(v) for v in fmt.offsets],
-                'channel_boundary_policy': 'radial_wrap_cartesian_edge_clamp',
+                'channel_boundary_policy': 'radial_wrap_mirror_u_cartesian_edge_clamp',
                 'prediction_slice_policy': 'center_N_only',
             },
             indent=2,
@@ -1338,19 +1338,33 @@ class DenseTileJob:
     parent_crop: Tuple[int, int, int, int] = (0, 0, 0, 0)
     M_out_to_crop: Optional[np.ndarray] = None
 
+def channel_view_slice_source(view: ViewInfo, index: int) -> Tuple[int, bool]:
+    """Resolve one contextual channel source as ``(slice_index, mirror_u)``.
+
+    Radial frames cover the unoriented angular domain ``[0, 180)``. Crossing either
+    end therefore reuses the modulo-resolved frame with its radial ``u`` coordinate
+    reversed. Multiple-period custom strides retain the reversal only after an odd
+    number of seam crossings. Cartesian view families continue to edge-clamp.
+    """
+    count = max(1, int(view.num_slices))
+    requested = int(index)
+    if is_radial_view(view):
+        wraps, source_idx = divmod(requested, int(count))
+        return int(source_idx), bool(int(wraps) % 2)
+    return max(0, min(int(count) - 1, requested)), False
+
+
 def channel_view_slice_index(view: ViewInfo, index: int) -> int:
     """Resolve one contextual channel index under the view family's boundary policy."""
-    count = max(1, int(view.num_slices))
-    if is_radial_view(view):
-        return int(index) % int(count)
-    return max(0, min(int(count) - 1, int(index)))
+    return int(channel_view_slice_source(view, index)[0])
 
 class ChannelFormattedFrameRenderer:
     """Build one model input from independently rendered view planes.
 
  The bounded single-flight cache reuses transformed neighboring planes across
  overlapping 2.5D centers without materializing a complete channel-formatted
- volume. It also deduplicates repeated boundary-resolved indices within one frame."""
+ volume. It also deduplicates repeated boundary-resolved source/orientation pairs
+ within one frame."""
 
     def __init__(
         self,
@@ -1359,8 +1373,10 @@ class ChannelFormattedFrameRenderer:
         channel_format: ChannelFormat,
         *,
         cache_frames: Optional[int] = None,
+        mirrored_plane_renderer: Optional[Callable[[int], np.ndarray]] = None,
     ) -> None:
         self.plane_renderer = plane_renderer
+        self.mirrored_plane_renderer = mirrored_plane_renderer
         self.view = view
         self.channel_format = resolve_channel_format(channel_format)
         if cache_frames is None:
@@ -1369,11 +1385,15 @@ class ChannelFormattedFrameRenderer:
             )
             cache_frames = _env_int('YOLO_TTA_CHANNEL_PLANE_CACHE_FRAMES', default_cache)
         self.cache_frames = max(0, int(cache_frames))
-        self._cache: 'OrderedDict[int, Future]' = OrderedDict()
+        self._cache: 'OrderedDict[Tuple[int, bool], Future]' = OrderedDict()
         self._lock = threading.Lock()
 
-    def _render_plane(self, source_idx: int) -> np.ndarray:
-        plane = np.asarray(self.plane_renderer(int(source_idx)), dtype=np.uint8)
+    def _render_plane(self, source_idx: int, mirror_u: bool = False) -> np.ndarray:
+        if bool(mirror_u) and self.mirrored_plane_renderer is not None:
+            rendered = self.mirrored_plane_renderer(int(source_idx))
+        else:
+            rendered = self.plane_renderer(int(source_idx))
+        plane = np.asarray(rendered, dtype=np.uint8)
         if plane.ndim == 3 and int(plane.shape[2]) == 1:
             plane = plane[:, :, 0]
         if plane.ndim != 2:
@@ -1381,30 +1401,32 @@ class ChannelFormattedFrameRenderer:
                 f'Channel plane renderer returned {plane.shape} for {self.view.name} '
                 f'slice {int(source_idx)}; expected HxW grayscale'
             )
+        if bool(mirror_u) and self.mirrored_plane_renderer is None:
+            plane = plane[:, ::-1]
         return np.ascontiguousarray(plane, dtype=np.uint8)
 
-    def _get_plane(self, source_idx: int) -> np.ndarray:
-        idx = int(source_idx)
+    def _get_plane(self, source_idx: int, mirror_u: bool = False) -> np.ndarray:
+        key = (int(source_idx), bool(mirror_u))
         if self.cache_frames <= 0:
-            return self._render_plane(idx)
+            return self._render_plane(*key)
 
         owner = False
         with self._lock:
-            future = self._cache.get(idx)
+            future = self._cache.get(key)
             if future is None:
                 future = Future()
-                self._cache[idx] = future
+                self._cache[key] = future
                 owner = True
             else:
-                self._cache.move_to_end(idx)
+                self._cache.move_to_end(key)
 
         if owner:
             try:
-                future.set_result(self._render_plane(idx))
+                future.set_result(self._render_plane(*key))
             except BaseException as exc:
                 future.set_exception(exc)
                 with self._lock:
-                    self._cache.pop(idx, None)
+                    self._cache.pop(key, None)
                 raise
 
         plane = future.result()
@@ -1412,13 +1434,13 @@ class ChannelFormattedFrameRenderer:
             # A different center can evict this completed entry after
             # future.result wakes us but before this lock is reacquired.
             # The local plane remains valid even when the LRU no longer owns it.
-            if self._cache.get(idx) is future:
-                self._cache.move_to_end(idx, last=True)
+            if self._cache.get(key) is future:
+                self._cache.move_to_end(key, last=True)
             while len(self._cache) > int(self.cache_frames):
                 removed = False
-                for old_idx, old_future in list(self._cache.items()):
-                    if old_idx != idx and old_future.done():
-                        self._cache.pop(old_idx, None)
+                for old_key, old_future in list(self._cache.items()):
+                    if old_key != key and old_future.done():
+                        self._cache.pop(old_key, None)
                         removed = True
                         break
                 if not removed:
@@ -1429,22 +1451,24 @@ class ChannelFormattedFrameRenderer:
         fmt = self.channel_format
         center = int(center_idx)
         if fmt.kind == 'gray':
-            return self._get_plane(channel_view_slice_index(self.view, center))
+            source_idx, mirror_u = channel_view_slice_source(self.view, center)
+            return self._get_plane(source_idx, mirror_u)
 
         if fmt.kind == 'rgb':
-            plane = self._get_plane(channel_view_slice_index(self.view, center))
+            source_idx, mirror_u = channel_view_slice_source(self.view, center)
+            plane = self._get_plane(source_idx, mirror_u)
             return np.ascontiguousarray(np.repeat(plane[:, :, None], 3, axis=2))
 
         # Deduplicate repeated boundary-resolved indices inside this stack even when the
         # shared cache is disabled.
-        local_planes: Dict[int, np.ndarray] = {}
+        local_planes: Dict[Tuple[int, bool], np.ndarray] = {}
         ordered_planes: List[np.ndarray] = []
         for offset in fmt.offsets:
-            source_idx = channel_view_slice_index(self.view, center + int(offset))
-            plane = local_planes.get(source_idx)
+            source = channel_view_slice_source(self.view, center + int(offset))
+            plane = local_planes.get(source)
             if plane is None:
-                plane = self._get_plane(source_idx)
-                local_planes[source_idx] = plane
+                plane = self._get_plane(*source)
+                local_planes[source] = plane
             ordered_planes.append(plane)
         return np.ascontiguousarray(np.stack(ordered_planes, axis=2), dtype=np.uint8)
 
@@ -2608,7 +2632,7 @@ def write_dense_tile_job_meta(
             'model_input_channels': int(fmt.channel_count),
             'channel_stride': int(fmt.stride),
             'channel_offsets': [int(v) for v in fmt.offsets],
-            'channel_boundary_policy': 'radial_wrap_cartesian_edge_clamp',
+            'channel_boundary_policy': 'radial_wrap_mirror_u_cartesian_edge_clamp',
             'prediction_slice_policy': 'center_N_only',
         },
         separators=(',', ':'),
@@ -3160,6 +3184,8 @@ def render_fullframe_frame_for_job(
     job: AugJob,
     frame_idx: int,
     view_frames: Optional[np.ndarray] = None,
+    *,
+    mirror_radial_u: bool = False,
 ) -> np.ndarray:
     if is_tilted_view(view):
         return render_tilted_frame_on_grid(
@@ -3172,6 +3198,10 @@ def render_fullframe_frame_for_job(
         )
 
     native_frame = np.ascontiguousarray(get_view_frame_by_index(volume_rgb, view, int(frame_idx), view_frames=view_frames))
+    if bool(mirror_radial_u):
+        if not is_radial_view(view):
+            raise ValueError('radial-u mirroring requested for a non-Radial view')
+        native_frame = np.ascontiguousarray(native_frame[:, ::-1])
     # identity fast path — a rotation-free job whose native frame already
     # matches the model raster (e.g. every imgsz-folded radial frame at --angle 0) needs no warp.
     aff = job.aff
@@ -3199,6 +3229,8 @@ def render_dense_tile_frame_for_job(
     tile_job: DenseTileJob,
     frame_idx: int,
     view_frames: Optional[np.ndarray] = None,
+    *,
+    mirror_radial_u: bool = False,
 ) -> np.ndarray:
     """Render one dense-tile inference range directly from the native view volume.
 
@@ -3219,6 +3251,10 @@ def render_dense_tile_frame_for_job(
         )
 
     native_frame = np.ascontiguousarray(get_view_frame_by_index(volume_rgb, view, int(frame_idx), view_frames=view_frames))
+    if bool(mirror_radial_u):
+        if not is_radial_view(view):
+            raise ValueError('radial-u mirroring requested for a non-Radial view')
+        native_frame = np.ascontiguousarray(native_frame[:, ::-1])
     return cv2.warpAffine(
         native_frame,
         tile_job.M_src_to_out,
@@ -3247,11 +3283,22 @@ def make_fullframe_channel_renderer(
             view_frames=view_frames,
         )
 
+    def _render_mirrored_plane(source_idx: int) -> np.ndarray:
+        return render_fullframe_frame_for_job(
+            volume_rgb=volume_rgb,
+            view=view,
+            job=job,
+            frame_idx=int(source_idx),
+            view_frames=view_frames,
+            mirror_radial_u=True,
+        )
+
     return ChannelFormattedFrameRenderer(
         _render_plane,
         view,
         resolve_channel_format(channel_format),
         cache_frames=cache_frames,
+        mirrored_plane_renderer=_render_mirrored_plane if is_radial_view(view) else None,
     )
 
 def make_dense_tile_channel_renderer(
@@ -3273,11 +3320,22 @@ def make_dense_tile_channel_renderer(
             view_frames=view_frames,
         )
 
+    def _render_mirrored_plane(source_idx: int) -> np.ndarray:
+        return render_dense_tile_frame_for_job(
+            volume_rgb=volume_rgb,
+            view=view,
+            tile_job=tile_job,
+            frame_idx=int(source_idx),
+            view_frames=view_frames,
+            mirror_radial_u=True,
+        )
+
     return ChannelFormattedFrameRenderer(
         _render_plane,
         view,
         resolve_channel_format(channel_format),
         cache_frames=cache_frames,
+        mirrored_plane_renderer=_render_mirrored_plane if is_radial_view(view) else None,
     )
 
 def _materialize_prediction_volume_from_renderer(

@@ -263,8 +263,9 @@ def _main_impl() -> None:
         'interpolation flags use the interpolation_* names; component-NRRD streaming no '
         'longer pauses for topology; and dead telemetry-detail, CPU-retina override, NRRD-yield, '
         'and scratch-msync environment controls are removed. Existing Cartesian, Tilted, and '
-        'Radial geometry builders are retained unchanged. The v16.2.2 channel/output behavior '
-        'also remains active: Radial channel stacks wrap across the angular seam, C>=5 saved '
+        'Radial geometry builders are retained unchanged. The v17.0.10 channel/output behavior '
+        'is active: Radial channel stacks wrap across the angular seam and reverse '
+        'radial-u after odd 0°/180° crossings, C>=5 saved '
         'view inputs use multi-page TIFF, and unified --save selection controls images, labels, '
         'binary, low_quality[:DOWNBIN], nrrd, voxel_volume, high_quality, and summary, while '
         '--postprocessing selects keep_objects, 3d_void_fill, and gaussian_smoothing. The retained '
@@ -278,7 +279,7 @@ def _main_impl() -> None:
         f'Model input channel format: {channel_format.token} '
         f'(kind={channel_format.kind}, channels={int(channel_format.channel_count)}, '
         f'stride={int(channel_format.stride)}, offsets={list(channel_format.offsets)}; '
-        'boundary=radial-wrap/cartesian-clamp; result=center slice N only).'
+        'boundary=radial-wrap+mirror-u/cartesian-clamp; result=center slice N only).'
     )
 
     print(
@@ -620,10 +621,7 @@ def _main_impl() -> None:
         raise ValueError('--centerline_surface_points must be >= 1000')
     if float(args.centerline_timeout) <= 0.0:
         raise ValueError('--centerline_timeout must be > 0')
-    centerline_filter_enabled = bool(
-        int(args.centerline_filter_passes) > 0
-        and str(args.centerline_filter_backend).strip().lower() != 'off'
-    )
+    centerline_filter_enabled = bool(int(args.centerline_filter_passes) > 0)
     # Backends are process-local. Every CUDA device and every populated CPU socket owns
     # one persistent model process; the parent retains only path and scheduling metadata.
     configure_gpu_slice_labeling_devices(list(backend_devices.gpu_devices))
@@ -1083,7 +1081,7 @@ def _main_impl() -> None:
             'model_input_channels': int(channel_format.channel_count),
             'model_channel_stride': int(channel_format.stride),
             'model_channel_offsets': [int(v) for v in channel_format.offsets],
-            'model_channel_boundary_policy': 'radial_wrap_cartesian_edge_clamp',
+            'model_channel_boundary_policy': 'radial_wrap_mirror_u_cartesian_edge_clamp',
             'model_prediction_slice_policy': 'center_N_only',
             'fps': fps,
             'enable_cartesian': list(enabled_cartesian_views),
@@ -1266,8 +1264,9 @@ def _main_impl() -> None:
         'selectable with their established paths and filenames.'
     )
     spec_notes.append(
-        'v16.2.2 channel/output maintenance: Radial and Tilted Radial channel offsets wrap '
-        'modulo their angular frame count, while Cartesian and Tilted Cartesian offsets clamp '
+        'v17.0.10 channel seam handling: Radial and Tilted Radial channel offsets wrap '
+        'modulo their angular frame count and reverse radial-u after each odd 0°/180° seam '
+        'crossing, while Cartesian and Tilted Cartesian offsets clamp '
         'at the stack ends. With --save images, C>=5 channel inputs are written as multi-page '
         'TIFFs containing one uint8 grayscale page per channel in model-input order. The retired '
         '--troubleshooting CLI and legacy environment-variable aliases are removed.'
@@ -1415,10 +1414,11 @@ def _main_impl() -> None:
         '--min_conf and --min_radius before that variant is interpolated.'
     )
     spec_notes.append(
-        'v15 input-channel handling: RGB/YUV video is flattened to one gray/luma source volume; '
+        'Input-channel handling: RGB/YUV video is flattened to one gray/luma source volume; '
         f'--channel_format {channel_format.token} then constructs H×W×{int(channel_format.channel_count)} '
         f'model inputs with offsets {list(channel_format.offsets)} in each active view. '
-        'Radial and Tilted Radial neighbors wrap modulo the view slice count; Cartesian and '
+        'Radial and Tilted Radial neighbors wrap modulo the view slice count and reverse '
+        'radial-u after odd 0°/180° seam crossings; Cartesian and '
         'Tilted Cartesian neighbors edge-clamp. Channel order is preserved, each result is assigned '
         'only to center slice N, and no reverse-order inference set is generated.'
     )
@@ -1526,14 +1526,6 @@ def _main_impl() -> None:
         'YOLO_TTA_NRRD_MEMBER_GZIP_WINDOW_MIB, YOLO_TTA_NRRD_GZIP_CHUNK_MIB, and '
         'YOLO_TTA_NRRD_LAYER_SINK_WORKERS for member-parallel compression. The previous mega '
         f'4D decomposed NRRD (one file, trailing list axis) was removed. space={NRRD_SPACE}.'
-    )
-    spec_notes.append(
-        'CONFLICT NOTE 2 (single-layer NRRD filenames): spec 7.2 lists layer family #5 ("Tiled Bridges") with the '
-        'same filename token as family #4 ("Tiled YOLO masks accepted by Parent Bridges", '
-        f'{OUTPUT_NRRD_PREFIX}{{Filestem}}_{{ViewToken}}_tile_yolo_parent_bridge), which would collide. The implementation keeps them '
-        'distinct: tiles accepted by a parent bridge are {ViewToken}_tile_yolo_parent_bridge, while consolidated '
-        'tile interpolation bridges are {ViewToken}_tile_bridge_pass<N>. Suggested spec edit: rename family #5 to '
-        f'{OUTPUT_NRRD_PREFIX}{{Filestem}}_{{ViewToken}}_tile_bridge_pass<N> to match the per-pass consolidated tile bridge layers.'
     )
     spec_notes.append(
         'CONFLICT NOTE 3 (low-quality NRRD form): spec --save low_quality says "low bitrate output videos and '
@@ -2042,6 +2034,8 @@ def _main_impl() -> None:
                 tile_jobs_by_view_config[view.name] = jobs_by_config
 
     tile_expected_by_parent: Dict[Tuple[str, str], int] = {}
+    tile_expected_by_set: Dict[Tuple[str, str, str], int] = {}
+    tile_config_ids_by_parent: Dict[Tuple[str, str], Tuple[str, ...]] = {}
     if dense_tiling_active:
         for view in inference_views:
             jobs_by_config = tile_jobs_by_view_config.get(view.name, {})
@@ -2049,7 +2043,13 @@ def _main_impl() -> None:
             if expected_for_variant <= 0:
                 continue
             for model_name, _ in yolo_models:
-                tile_expected_by_parent[(str(model_name), str(view.name))] = int(expected_for_variant)
+                parent_key = (str(model_name), str(view.name))
+                tile_expected_by_parent[parent_key] = int(expected_for_variant)
+                tile_config_ids_by_parent[parent_key] = tuple(str(v) for v in jobs_by_config)
+                for config_id, config_jobs in jobs_by_config.items():
+                    tile_expected_by_set[(
+                        str(model_name), str(view.name), str(config_id),
+                    )] = int(len(config_jobs))
 
     view_frame_caches: Dict[str, np.ndarray] = {}
     view_frame_cache_paths: Dict[str, Path] = {}
@@ -2338,15 +2338,19 @@ def _main_impl() -> None:
     residual_tiles_waiting_by_parent: Dict[Tuple[str, str], Dict[str, object]] = {}
     tile_parent_gate_futures: Dict[Future, Tuple[str, str, str, str]] = {}
     tile_bridge_gate_futures: Dict[Future, Tuple[str, str, str, str]] = {}
-    tile_consolidation_futures: Dict[Future, Tuple[str, str]] = {}
-    tile_accumulator_by_parent: Dict[Tuple[str, str], np.ndarray] = {}
-    tile_accumulator_paths: Dict[Tuple[str, str], Path] = {}
-    tile_accumulator_locks_by_parent: Dict[Tuple[str, str], List[threading.Lock]] = {}
-    tile_parent_mask_accumulator_by_parent: Dict[Tuple[str, str], np.ndarray] = {}
-    tile_parent_bridge_accumulator_by_parent: Dict[Tuple[str, str], np.ndarray] = {}
-    tile_category_accumulator_locks: Dict[Tuple[str, str, str], List[threading.Lock]] = {}
+    tile_consolidation_futures: Dict[Future, Tuple[str, str, str]] = {}
+    tile_parent_finalization_futures: Dict[Future, Tuple[str, str]] = {}
+    tile_accumulator_by_set: Dict[Tuple[str, str, str], np.ndarray] = {}
+    tile_accumulator_paths: Dict[Tuple[str, str, str], Path] = {}
+    tile_accumulator_locks_by_set: Dict[Tuple[str, str, str], List[threading.Lock]] = {}
+    tile_parent_mask_accumulator_by_set: Dict[Tuple[str, str, str], np.ndarray] = {}
+    tile_parent_bridge_accumulator_by_set: Dict[Tuple[str, str, str], np.ndarray] = {}
+    tile_category_accumulator_locks: Dict[Tuple[str, str, str, str], List[threading.Lock]] = {}
     tile_completed_by_parent: Dict[Tuple[str, str], set[str]] = {}
-    tile_consolidation_submitted: set[Tuple[str, str]] = set()
+    tile_completed_by_set: Dict[Tuple[str, str, str], set[str]] = {}
+    tile_consolidation_submitted: set[Tuple[str, str, str]] = set()
+    tile_consolidation_completed: set[Tuple[str, str, str]] = set()
+    tile_parent_finalization_submitted: set[Tuple[str, str]] = set()
     def _prediction_volume_queue_depth() -> int:
         return int(len(pending_prediction_volume_futures) + len(ready_fullframe) + len(ready_tile_infer))
 
@@ -2846,19 +2850,29 @@ def _main_impl() -> None:
         view = view_infos_by_name[str(view_name)]
         return max(1, min(64, int(view.num_slices)))
 
-    def _get_tile_accumulator(model_name: str, view_name: str) -> np.ndarray:
-        key = (str(model_name), str(view_name))
-        acc = tile_accumulator_by_parent.get(key)
+    def _get_tile_accumulator(
+        model_name: str,
+        view_name: str,
+        config_id: str,
+    ) -> np.ndarray:
+        key = (str(model_name), str(view_name), str(config_id))
+        acc = tile_accumulator_by_set.get(key)
         if acc is not None:
             return acc
         view = view_infos_by_name[str(view_name)]
-        acc_path = temp_dir / 'tile_consolidated' / str(model_name) / str(view_name) / 'gated_or.u8.dat'
+        acc_path = (
+            temp_dir / 'tile_consolidated' / str(model_name) /
+            str(view_name) / str(config_id) / 'gated_or.u8.dat'
+        )
         prefer_shared_ram = bool(tile_intermediate_accumulators_prefer_memory())
         acc = allocate_workspace_array(
             shape=view_processing_volume_shape(view, int(args.imgsz)),
             dtype=np.uint8,
             path=acc_path,
-            desc=f'{model_name}/{view_name} consolidated two-stage gated-tile accumulator',
+            desc=(
+                f'{model_name}/{view_name}/{config_id} consolidated '
+                'two-stage gated-tile accumulator'
+            ),
             # The consolidated volume is subsequently reopened by a spawned
             # interpolation process.  Prefer a parent-owned memfd, never an anonymous
             # ndarray that would require a second full-volume process_input copy.
@@ -2866,37 +2880,48 @@ def _main_impl() -> None:
             prefer_memfd=bool(prefer_shared_ram),
             reserve_bytes=tile_intermediate_accumulator_reserve_bytes(),
         )
-        tile_accumulator_by_parent[key] = acc
+        tile_accumulator_by_set[key] = acc
         actual_path = _memmap_backing_path(acc)
         tile_accumulator_paths[key] = Path(actual_path) if actual_path is not None else acc_path
-        tile_accumulator_locks_by_parent[key] = [
+        tile_accumulator_locks_by_set[key] = [
             threading.Lock() for _ in range(_tile_gate_lock_shards(str(view_name)))
         ]
         return acc
 
-    def _get_tile_category_accumulator(model_name: str, view_name: str, category: str) -> np.ndarray:
-        key = (str(model_name), str(view_name))
+    def _get_tile_category_accumulator(
+        model_name: str,
+        view_name: str,
+        config_id: str,
+        category: str,
+    ) -> np.ndarray:
+        key = (str(model_name), str(view_name), str(config_id))
         category_norm = str(category)
         store = (
-            tile_parent_mask_accumulator_by_parent
+            tile_parent_mask_accumulator_by_set
             if category_norm == 'parent_mask'
-            else tile_parent_bridge_accumulator_by_parent
+            else tile_parent_bridge_accumulator_by_set
         )
         tile_category_accumulator_locks.setdefault(
-            (key[0], key[1], category_norm),
+            (key[0], key[1], key[2], category_norm),
             [threading.Lock() for _ in range(_tile_gate_lock_shards(str(view_name)))],
         )
         acc = store.get(key)
         if acc is not None:
             return acc
         view = view_infos_by_name[str(view_name)]
-        acc_path = temp_dir / 'tile_consolidated' / str(model_name) / str(view_name) / f'gated_or_accepted_by_{category_norm}.u8.dat'
+        acc_path = (
+            temp_dir / 'tile_consolidated' / str(model_name) / str(view_name) /
+            str(config_id) / f'gated_or_accepted_by_{category_norm}.u8.dat'
+        )
         prefer_shared_ram = bool(tile_intermediate_accumulators_prefer_memory())
         acc = allocate_workspace_array(
             shape=view_processing_volume_shape(view, int(args.imgsz)),
             dtype=np.uint8,
             path=acc_path,
-            desc=f'{model_name}/{view_name} consolidated gated-tile accumulator accepted by {category_norm}',
+            desc=(
+                f'{model_name}/{view_name}/{config_id} consolidated gated-tile '
+                f'accumulator accepted by {category_norm}'
+            ),
             # Category canvases do not enter interpolation today, but keeping all tile
             # accumulators process-reopenable avoids silently reintroducing anonymous
             # full-volume state into this path.
@@ -3025,14 +3050,57 @@ def _main_impl() -> None:
                 f'{parent_key[0]}/{parent_key[1]} after all {expected_tiles} tile gate(s).'
             )
 
-    def _maybe_submit_tile_consolidation(model_name: str, view_name: str) -> None:
+    def _maybe_finalize_tile_parent(model_name: str, view_name: str) -> None:
+        """Retire one parent only after every configured tile set has been unioned."""
         parent_key = (str(model_name), str(view_name))
-        if parent_key in tile_consolidation_submitted:
+        config_ids = tile_config_ids_by_parent.get(parent_key, ())
+        if not config_ids or parent_key in tile_parent_finalization_submitted:
             return
-        expected_tiles = int(tile_expected_by_parent.get(parent_key, 0))
+        if any(
+            (parent_key[0], parent_key[1], str(config_id))
+            not in tile_consolidation_completed
+            for config_id in config_ids
+        ):
+            return
+
+        tile_parent_finalization_submitted.add(parent_key)
+        if not bool(component_ref_dense_retirement_active):
+            return
+        if bool(nrrd_layers_needed):
+            _retire_parent_dense_view(
+                str(model_name),
+                str(view_name),
+                reason='full-frame and all configured tile-set terminal refs are complete',
+            )
+            return
+
+        # With no requested component NRRDs, retain one private sparse reference to the
+        # destination only after every independently interpolated tile set has entered it.
+        view = view_infos_by_name[str(view_name)]
+        fut = tile_postprocess_executor.submit(
+            finalize_parent_without_tile_contribution_for_sparse_retirement,
+            model_name=str(model_name),
+            view=view,
+            destination_mm=_parent_destination_volume(str(model_name), str(view_name)),
+            destination_lock=view_volume_locks[(str(model_name), str(view_name))],
+            temp_dir=temp_dir,
+            slice_workers=int(tile_slice_postprocess_workers),
+        )
+        tile_parent_finalization_futures[fut] = parent_key
+
+    def _maybe_submit_tile_consolidation(
+        model_name: str,
+        view_name: str,
+        config_id: str,
+    ) -> None:
+        parent_key = (str(model_name), str(view_name))
+        set_key = (str(model_name), str(view_name), str(config_id))
+        if set_key in tile_consolidation_submitted:
+            return
+        expected_tiles = int(tile_expected_by_set.get(set_key, 0))
         if expected_tiles <= 0:
             return
-        if len(tile_completed_by_parent.get(parent_key, set())) < expected_tiles:
+        if len(tile_completed_by_set.get(set_key, set())) < expected_tiles:
             return
         _retire_parent_tile_supports_if_gates_complete(
             str(model_name), str(view_name),
@@ -3040,34 +3108,13 @@ def _main_impl() -> None:
         if not _parent_destination_ready(str(model_name), str(view_name)):
             return
 
-        tile_consolidation_submitted.add(parent_key)
-        acc = tile_accumulator_by_parent.get(parent_key)
+        tile_consolidation_submitted.add(set_key)
+        acc = tile_accumulator_by_set.get(set_key)
         if acc is None:
-            # Every original tile was empty after cleanup; nothing can be interpolated.
-            if bool(component_ref_dense_retirement_active):
-                if bool(nrrd_layers_needed):
-                    _retire_parent_dense_view(
-                        str(model_name), str(view_name),
-                        reason='all tiles empty; full-frame terminal refs are complete',
-                    )
-                else:
-                    # No requested component set exists. Materialize one private final
-                    # pathname-backed ref on the worker pool before retiring the parent.
-                    view = view_infos_by_name[str(view_name)]
-                    fut = tile_postprocess_executor.submit(
-                        finalize_parent_without_tile_contribution_for_sparse_retirement,
-                        model_name=str(model_name),
-                        view=view,
-                        destination_mm=_parent_destination_volume(
-                            str(model_name), str(view_name),
-                        ),
-                        destination_lock=view_volume_locks[
-                            (str(model_name), str(view_name))
-                        ],
-                        temp_dir=temp_dir,
-                        slice_workers=int(tile_slice_postprocess_workers),
-                    )
-                    tile_consolidation_futures[fut] = parent_key
+            # Every tile in this configuration was empty after cleanup. Other configured
+            # sets still have their own consolidation and parent-terminal barrier.
+            tile_consolidation_completed.add(set_key)
+            _maybe_finalize_tile_parent(str(model_name), str(view_name))
             return
 
         view = view_infos_by_name[str(view_name)]
@@ -3089,22 +3136,42 @@ def _main_impl() -> None:
             slice_workers=int(tile_slice_postprocess_workers),
             interpolation_task_workers=int(tile_interpolation_task_workers),
             nrrd_layers_enabled=bool(nrrd_layers_needed),
-            tile_parent_mask_accumulator_mm=tile_parent_mask_accumulator_by_parent.get(parent_key),
-            tile_parent_bridge_accumulator_mm=tile_parent_bridge_accumulator_by_parent.get(parent_key),
-            internal_final_layer_enabled=bool(
-                component_ref_dense_retirement_active
-                and not nrrd_layers_needed
-            ),
+            tile_parent_mask_accumulator_mm=tile_parent_mask_accumulator_by_set.get(set_key),
+            tile_parent_bridge_accumulator_mm=tile_parent_bridge_accumulator_by_set.get(set_key),
+            # A parent-level terminal task materializes this only after every configured
+            # set has entered the destination, avoiding an incomplete private final ref.
+            internal_final_layer_enabled=False,
+            config_id=str(config_id),
         )
-        tile_consolidation_futures[fut] = parent_key
+        tile_consolidation_futures[fut] = set_key
 
-    def _mark_tile_complete(model_name: str, view_name: str, tile_id: str) -> None:
+    def _maybe_submit_tile_consolidations_for_parent(
+        model_name: str,
+        view_name: str,
+    ) -> None:
+        parent_key = (str(model_name), str(view_name))
+        for config_id in tile_config_ids_by_parent.get(parent_key, ()):
+            _maybe_submit_tile_consolidation(
+                str(model_name), str(view_name), str(config_id),
+            )
+
+    def _mark_tile_complete(
+        model_name: str,
+        view_name: str,
+        config_id: str,
+        tile_id: str,
+    ) -> None:
         parent_key = (str(model_name), str(view_name))
         if parent_key not in tile_expected_by_parent:
             return
         completed = tile_completed_by_parent.setdefault(parent_key, set())
         completed.add(str(tile_id))
-        _maybe_submit_tile_consolidation(str(model_name), str(view_name))
+        set_key = (str(model_name), str(view_name), str(config_id))
+        completed_for_set = tile_completed_by_set.setdefault(set_key, set())
+        completed_for_set.add(str(tile_id))
+        _maybe_submit_tile_consolidation(
+            str(model_name), str(view_name), str(config_id),
+        )
 
     def _retire_tile_result(
         result: TilePostprocessResult | DeferredTilePostprocessResult,
@@ -3146,12 +3213,16 @@ def _main_impl() -> None:
             return
 
         tile_accumulator_mm = _get_tile_accumulator(
-            str(result.model_name), str(result.view_name),
+            str(result.model_name), str(result.view_name), str(result.config_id),
+        )
+        set_key = (
+            str(result.model_name), str(result.view_name), str(result.config_id),
         )
         tile_parent_mask_accumulator_mm = None
         if bool(nrrd_layers_needed):
             tile_parent_mask_accumulator_mm = _get_tile_category_accumulator(
-                str(result.model_name), str(result.view_name), 'parent_mask',
+                str(result.model_name), str(result.view_name),
+                str(result.config_id), 'parent_mask',
             )
 
         fut = tile_postprocess_executor.submit(
@@ -3159,13 +3230,16 @@ def _main_impl() -> None:
             result,
             parent_mask_support_mm=parent_mask_support,
             tile_accumulator_mm=tile_accumulator_mm,
-            tile_accumulator_locks=tile_accumulator_locks_by_parent.get(parent_key),
+            tile_accumulator_locks=tile_accumulator_locks_by_set.get(set_key),
             work_dir=temp_dir / 'tile_parent_gate_residuals',
             keep_temp=bool(keep_temp_artifacts),
             slice_workers=int(tile_slice_postprocess_workers),
             tile_parent_mask_accumulator_mm=tile_parent_mask_accumulator_mm,
             tile_parent_mask_accumulator_locks=tile_category_accumulator_locks.get(
-                (str(result.model_name), str(result.view_name), 'parent_mask')
+                (
+                    str(result.model_name), str(result.view_name),
+                    str(result.config_id), 'parent_mask',
+                )
             ),
         )
         tile_parent_gate_futures[fut] = (
@@ -3185,7 +3259,8 @@ def _main_impl() -> None:
             # for the parent postprocess future to publish an empty bridge milestone.
             _retire_tile_result(result)
             _mark_tile_complete(
-                str(result.model_name), str(result.view_name), str(result.tile_id)
+                str(result.model_name), str(result.view_name),
+                str(result.config_id), str(result.tile_id),
             )
             return
         if parent_key not in parent_bridge_ready:
@@ -3216,16 +3291,23 @@ def _main_impl() -> None:
             # Parent interpolation produced no bridge voxels (or was disabled), so every
             # remaining whole component is definitively rejected.
             _retire_tile_result(result)
-            _mark_tile_complete(str(result.model_name), str(result.view_name), str(result.tile_id))
+            _mark_tile_complete(
+                str(result.model_name), str(result.view_name),
+                str(result.config_id), str(result.tile_id),
+            )
             return
 
         tile_accumulator_mm = _get_tile_accumulator(
-            str(result.model_name), str(result.view_name),
+            str(result.model_name), str(result.view_name), str(result.config_id),
+        )
+        set_key = (
+            str(result.model_name), str(result.view_name), str(result.config_id),
         )
         tile_parent_bridge_accumulator_mm = None
         if bool(nrrd_layers_needed):
             tile_parent_bridge_accumulator_mm = _get_tile_category_accumulator(
-                str(result.model_name), str(result.view_name), 'parent_bridge',
+                str(result.model_name), str(result.view_name),
+                str(result.config_id), 'parent_bridge',
             )
 
         fut = tile_postprocess_executor.submit(
@@ -3233,13 +3315,16 @@ def _main_impl() -> None:
             result,
             parent_bridge_support_mm=parent_bridge_support,
             tile_accumulator_mm=tile_accumulator_mm,
-            tile_accumulator_locks=tile_accumulator_locks_by_parent.get(parent_key),
+            tile_accumulator_locks=tile_accumulator_locks_by_set.get(set_key),
             work_dir=temp_dir / 'tile_bridge_gate_residuals',
             keep_temp=bool(keep_temp_artifacts),
             slice_workers=int(tile_slice_postprocess_workers),
             tile_parent_bridge_accumulator_mm=tile_parent_bridge_accumulator_mm,
             tile_parent_bridge_accumulator_locks=tile_category_accumulator_locks.get(
-                (str(result.model_name), str(result.view_name), 'parent_bridge')
+                (
+                    str(result.model_name), str(result.view_name),
+                    str(result.config_id), 'parent_bridge',
+                )
             ),
         )
         tile_bridge_gate_futures[fut] = (
@@ -3363,7 +3448,10 @@ def _main_impl() -> None:
                                 tile_conf_path.unlink(missing_ok=True)
                             except Exception:
                                 pass
-                    _mark_tile_complete(str(model_name), str(view.name), str(tile_job.tile_id))
+                    _mark_tile_complete(
+                        str(model_name), str(view.name),
+                        str(tile_job.config_id), str(tile_job.tile_id),
+                    )
                     continue
 
                 task = TilePostprocessTask(
@@ -3457,7 +3545,9 @@ def _main_impl() -> None:
             # Parent YOLO and bridge supports are now immutable and same-angle. Release
             # any cleaned tiles that finished inference first, then check whether all original
             # tiles have completed their two-stage component gates.
-            _maybe_submit_tile_consolidation(str(result.model_name), str(result.view_name))
+            _maybe_submit_tile_consolidations_for_parent(
+                str(result.model_name), str(result.view_name),
+            )
 
         for fut in list(tile_cleanup_futures.keys()):
             if not fut.done():
@@ -3469,7 +3559,10 @@ def _main_impl() -> None:
                     str(ready_key[0]), str(ready_key[1]), str(ready_key[3]),
                     reason='tile empty after cleanup',
                 )
-                _mark_tile_complete(str(ready_key[0]), str(ready_key[1]), str(ready_key[3]))
+                _mark_tile_complete(
+                    str(ready_key[0]), str(ready_key[1]),
+                    str(ready_key[2]), str(ready_key[3]),
+                )
                 continue
             if isinstance(result, DeferredTilePostprocessResult):
                 # v16.4.3: CTILE publication is the dense-result retirement boundary.
@@ -3493,7 +3586,9 @@ def _main_impl() -> None:
                     str(model_name), str(view_name), str(tile_id),
                     reason='parent gate consumed dense tile result',
                 )
-                _mark_tile_complete(str(model_name), str(view_name), str(tile_id))
+                _mark_tile_complete(
+                    str(model_name), str(view_name), str(config_id), str(tile_id),
+                )
             else:
                 _submit_tile_bridge_gate(parent_gate_result.residual_result)
 
@@ -3508,35 +3603,31 @@ def _main_impl() -> None:
                 str(model_name), str(view_name), str(tile_id),
                 reason='bridge gate consumed dense tile residual',
             )
-            _mark_tile_complete(str(model_name), str(view_name), str(tile_id))
+            _mark_tile_complete(
+                str(model_name), str(view_name), str(config_id), str(tile_id),
+            )
 
         for fut in list(tile_consolidation_futures.keys()):
             if not fut.done():
                 continue
-            parent_key = tile_consolidation_futures.pop(fut)
+            set_key = tile_consolidation_futures.pop(fut)
+            parent_key = (str(set_key[0]), str(set_key[1]))
             result = fut.result()
             interpolation_stats.extend(result.interpolation_stats)
             nrrd_layer_refs.extend(result.nrrd_layers)
-
-            if bool(component_ref_dense_retirement_active):
-                _retire_parent_dense_view(
-                    str(parent_key[0]),
-                    str(parent_key[1]),
-                    reason='full-frame and consolidated-tile terminal refs are complete',
-                )
 
             # The interpolation backend may rebind the consolidated accumulator to a
             # fresh memmap containing bridge voxels. Re-point the registry used for
             # keep-temp archiving, then release the superseded pre-interpolation array.
             final_acc = result.final_accumulator_mm
-            stale_acc = tile_accumulator_by_parent.get(parent_key)
+            stale_acc = tile_accumulator_by_set.get(set_key)
             if final_acc is not None and stale_acc is not None and stale_acc is not final_acc:
-                tile_accumulator_by_parent[parent_key] = final_acc
+                tile_accumulator_by_set[set_key] = final_acc
                 final_acc_path = _memmap_backing_path(final_acc)
                 if final_acc_path is not None:
-                    tile_accumulator_paths[parent_key] = Path(final_acc_path)
+                    tile_accumulator_paths[set_key] = Path(final_acc_path)
                 else:
-                    tile_accumulator_paths.pop(parent_key, None)
+                    tile_accumulator_paths.pop(set_key, None)
                 stale_acc_path = _memmap_backing_path(stale_acc)
                 try:
                     close_memmap_array_without_flush(stale_acc)
@@ -3551,20 +3642,36 @@ def _main_impl() -> None:
             # Once the consolidated tile volume has entered its parent destination and any
             # NRRD layers have been materialized, all tile accumulators can retire.
             for label, store in (
-                ('consolidated gated tiles', tile_accumulator_by_parent),
-                ('tile components accepted by parent mask', tile_parent_mask_accumulator_by_parent),
-                ('tile components accepted by parent bridge', tile_parent_bridge_accumulator_by_parent),
+                ('consolidated gated tiles', tile_accumulator_by_set),
+                ('tile components accepted by parent mask', tile_parent_mask_accumulator_by_set),
+                ('tile components accepted by parent bridge', tile_parent_bridge_accumulator_by_set),
             ):
-                acc = store.pop(parent_key, None)
+                acc = store.pop(set_key, None)
                 if acc is not None:
                     archive_or_delete_binary_volume_storage(
                         acc,
                         keep_temp=bool(keep_temp_artifacts),
                         workers=int(tile_slice_postprocess_workers),
-                        desc=f'{label} {parent_key[0]}/{parent_key[1]}',
+                        desc=f'{label} {set_key[0]}/{set_key[1]}/{set_key[2]}',
                     )
                     if label == 'consolidated gated tiles':
-                        tile_accumulator_paths.pop(parent_key, None)
+                        tile_accumulator_paths.pop(set_key, None)
+
+            tile_consolidation_completed.add(set_key)
+            _maybe_finalize_tile_parent(str(parent_key[0]), str(parent_key[1]))
+
+        for fut in list(tile_parent_finalization_futures.keys()):
+            if not fut.done():
+                continue
+            parent_key = tile_parent_finalization_futures.pop(fut)
+            result = fut.result()
+            interpolation_stats.extend(result.interpolation_stats)
+            nrrd_layer_refs.extend(result.nrrd_layers)
+            _retire_parent_dense_view(
+                str(parent_key[0]),
+                str(parent_key[1]),
+                reason='full-frame and all configured tile-set terminal refs are complete',
+            )
 
         output_manager.reap_completed()
         # Allocation admission can block every otherwise-idle worker while the active
@@ -3606,6 +3713,7 @@ def _main_impl() -> None:
             f'tile_parent_gate={len(tile_parent_gate_futures)}, '
             f'tile_bridge_gate={len(tile_bridge_gate_futures)}, '
             f'tile_consolidation={len(tile_consolidation_futures)}, '
+            f'tile_parent_finalization={len(tile_parent_finalization_futures)}, '
             f'waiting_tiles_for_parent={waiting_parent_tiles}, '
             f'waiting_residuals_for_bridge={waiting_bridge_tiles}, '
             f'ready_fullframe={len(ready_fullframe)}, ready_tiles={len(ready_tile_infer)}'
@@ -6166,7 +6274,10 @@ def _main_impl() -> None:
                 reason='inference worker reported an empty tile result',
                 refill=True,
             )
-            _mark_tile_complete(model_name_s, str(view.name), str(tile_job.tile_id))
+            _mark_tile_complete(
+                model_name_s, str(view.name),
+                str(tile_job.config_id), str(tile_job.tile_id),
+            )
             return
         result_shape = tuple(int(v) for v in task.get(
             'processing_shape', view_processing_volume_shape(view, int(task.get('out_size', args.imgsz))),
@@ -6276,6 +6387,7 @@ def _main_impl() -> None:
             f'tile_parent_gate={len(tile_parent_gate_futures)}, '
             f'tile_bridge_gate={len(tile_bridge_gate_futures)}, '
             f'tile_consolidation={len(tile_consolidation_futures)}, '
+            f'tile_parent_finalization={len(tile_parent_finalization_futures)}, '
             f'waiting_tiles_for_parent={int(waiting_parent_tiles_now)}, '
             f'waiting_residuals_for_bridge={int(waiting_bridge_tiles_now)}, '
             f'NRRD writes={int(nrrd_done_now)}/{int(nrrd_total_now)}. '
@@ -6861,7 +6973,10 @@ def _main_impl() -> None:
                                         tile_conf_path.unlink(missing_ok=True)
                                     except Exception:
                                         pass
-                            _mark_tile_complete(str(model_name), str(view.name), str(tile_job.tile_id))
+                            _mark_tile_complete(
+                                str(model_name), str(view.name),
+                                str(tile_job.config_id), str(tile_job.tile_id),
+                            )
                             continue
 
                         task = TilePostprocessTask(
@@ -6903,6 +7018,7 @@ def _main_impl() -> None:
             waitables.extend(list(tile_parent_gate_futures.keys()))
             waitables.extend(list(tile_bridge_gate_futures.keys()))
             waitables.extend(list(tile_consolidation_futures.keys()))
+            waitables.extend(list(tile_parent_finalization_futures.keys()))
             if not waitables:
                 _drain_parent_mask_ready_events()
                 _flush_ready_postprocessed_tiles()
@@ -6925,6 +7041,7 @@ def _main_impl() -> None:
                     not tile_bridge_gate_futures and
                     not tile_cleanup_futures and
                     not tile_consolidation_futures and
+                    not tile_parent_finalization_futures and
                     not view_processing_futures
                 )
                 if scheduler_quiescent:
@@ -7295,7 +7412,7 @@ def _main_impl() -> None:
         final_union_mm,
         model_name=str(model_name), temp_dir=temp_dir,
         passes=int(args.centerline_filter_passes),
-        backend=str(args.centerline_filter_backend),
+        backend='embedded',
         radius_factor=float(args.centerline_radius_factor),
         temporal_context=int(args.centerline_temporal_context),
         automatic_removal_enabled=bool(args.centerline_auto_remove),
@@ -7322,8 +7439,8 @@ def _main_impl() -> None:
         ]
         spec_notes.append(
             'Centerline post-union filter: pass 0 preserves the untouched union; '
-            f'requested backend={str(args.centerline_filter_backend)}; the default embedded backend '
-            'uses exact 3D EDT on the block-max raster plus three-axis medial-ridge tracking; '
+            'the embedded backend uses exact 3D EDT on the block-max raster plus three-axis '
+            'medial-ridge tracking; '
             f'X={float(args.centerline_radius_factor):g}; anomaly duration is uncapped; '
             f'automatic component removal requested={bool(args.centerline_auto_remove)}; '
             'protected or otherwise unsafe 2D components are marker-only; '
@@ -7593,7 +7710,6 @@ def _main_impl() -> None:
             slice_postprocess_workers=slice_postprocess_workers,
             interpolation_workers=interpolation_workers,
             output_workers=tail_output_workers,
-            spec_notes=spec_notes,
         )
 
 
@@ -7624,30 +7740,30 @@ def _main_impl() -> None:
         for mm in model_support.values():
             close_raw_store_or_memmap_volume(mm, keep_temp=bool(keep_temp_artifacts))
         model_support.clear()
-    for mm in tile_accumulator_by_parent.values():
+    for mm in tile_accumulator_by_set.values():
         archive_or_delete_binary_volume_storage(
             mm,
             keep_temp=bool(keep_temp_artifacts),
             workers=int(tail_tile_slice_workers),
             desc='remaining consolidated tile accumulator',
         )
-    tile_accumulator_by_parent.clear()
-    for mm in tile_parent_mask_accumulator_by_parent.values():
+    tile_accumulator_by_set.clear()
+    for mm in tile_parent_mask_accumulator_by_set.values():
         archive_or_delete_binary_volume_storage(
             mm,
             keep_temp=bool(keep_temp_artifacts),
             workers=int(tail_tile_slice_workers),
             desc='remaining parent-mask tile category accumulator',
         )
-    tile_parent_mask_accumulator_by_parent.clear()
-    for mm in tile_parent_bridge_accumulator_by_parent.values():
+    tile_parent_mask_accumulator_by_set.clear()
+    for mm in tile_parent_bridge_accumulator_by_set.values():
         archive_or_delete_binary_volume_storage(
             mm,
             keep_temp=bool(keep_temp_artifacts),
             workers=int(tail_tile_slice_workers),
             desc='remaining parent-bridge tile category accumulator',
         )
-    tile_parent_bridge_accumulator_by_parent.clear()
+    tile_parent_bridge_accumulator_by_set.clear()
     for mm in baseline_union_by_model_view.values():
         close_memmap_array(mm)
     for mm in baseline_confmap_by_model_view.values():

@@ -202,6 +202,7 @@ def materialize_nrrd_view_layer(
     source: str,
     mask_kind: str,
     pass_index: int = 0,
+    tile_config_id: str = '',
     tile_acceptance: str = '',
     stage: str = '',
     description: str = '',
@@ -230,6 +231,7 @@ def materialize_nrrd_view_layer(
         source=str(source),
         mask_kind=str(mask_kind),
         pass_index=int(pass_index),
+        tile_config_id=str(tile_config_id),
         tile_acceptance=str(tile_acceptance),
         stage=str(stage),
     )
@@ -433,6 +435,7 @@ def materialize_nrrd_view_layer(
             source=str(source),
             mask_kind=str(mask_kind),
             pass_index=int(pass_index),
+            tile_config_id=str(tile_config_id),
             tile_acceptance=str(tile_acceptance),
             stage=str(stage),
         ),
@@ -449,6 +452,7 @@ def materialize_nrrd_view_layer(
         source=str(source),
         mask_kind=str(mask_kind),
         pass_index=int(pass_index),
+        tile_config_id=str(tile_config_id),
         tile_acceptance=str(tile_acceptance),
         stage=str(stage),
         description=str(description),
@@ -465,6 +469,7 @@ def materialize_nrrd_view_layer(
                 source=str(source),
                 mask_kind=str(mask_kind),
                 pass_index=int(pass_index),
+                tile_config_id=str(tile_config_id),
                 tile_acceptance=str(tile_acceptance),
                 stage=str(stage),
             ),
@@ -1996,16 +2001,27 @@ def finalize_consolidated_tile_volume_for_parent(
     tile_parent_mask_accumulator_mm: Optional[np.ndarray] = None,
     tile_parent_bridge_accumulator_mm: Optional[np.ndarray] = None,
     internal_final_layer_enabled: bool = False,
+    config_id: str = '',
 ) -> TileConsolidationResult:
-    """Interpolate the consolidated gated-tile volume once for the parent view, then union it.
+    """Interpolate one configuration's consolidated gated tiles, then union them.
 
- The input accumulator already contains the OR of every accepted tile mask for this parent view.
- Interpolation is now performed once on that consolidated volume instead of once per tile. When
- NRRD decomposition is enabled, the accepted YOLO tile support is written separately for tiles
- accepted by parent YOLO masks and by parent interpolation bridges; tile interpolation bridges are
- then exported per pass as consolidated tile-bridge layers."""
+ The input accumulator contains the OR of every accepted tile mask for one tile configuration
+ of this parent view. Interpolation is performed once per configuration instead of once per tile
+ or once across unrelated configurations. When NRRD decomposition is enabled, the accepted YOLO
+ tile support is written separately for tiles accepted by parent YOLO masks and by parent
+ interpolation bridges; tile interpolation bridges are then exported per configuration/pass."""
     interpolation_stats: List[Dict[str, object]] = []
     nrrd_layers: List[NrrdLayerRef] = []
+    config_id_norm = str(config_id).strip()
+    config_label = config_id_norm or 'consolidated'
+    pre_interpolation_stage = (
+        f'{config_id_norm}_pre_tile_interpolation'
+        if config_id_norm else 'pre_tile_interpolation'
+    )
+    interpolation_stage = (
+        f'{config_id_norm}_tile_interpolation'
+        if config_id_norm else 'tile_interpolation'
+    )
     tile_plane_shape = tuple(int(v) for v in np.asarray(tile_accumulator_mm).shape[-2:])
     effective_interpolate_min_radius = view_processing_min_radius(
         view, float(interpolate_min_radius), tile_plane_shape,
@@ -2045,9 +2061,10 @@ def finalize_consolidated_tile_volume_for_parent(
                 source='tile',
                 mask_kind='yolo',
                 pass_index=0,
+                tile_config_id=config_id_norm,
                 tile_acceptance='parent_mask',
-                stage='pre_tile_interpolation',
-                description='Accepted tile YOLO masks whose components intersected parent full-frame YOLO support. Parent-mask support has priority when a component intersects both parent mask and parent bridge.',
+                stage=pre_interpolation_stage,
+                description=f'Accepted {config_label} tile YOLO masks whose components intersected parent full-frame YOLO support. Parent-mask support has priority when a component intersects both parent mask and parent bridge.',
                 temp_dir=temp_dir,
                 workers=int(slice_workers),
             )
@@ -2062,9 +2079,10 @@ def finalize_consolidated_tile_volume_for_parent(
                 source='tile',
                 mask_kind='yolo',
                 pass_index=0,
+                tile_config_id=config_id_norm,
                 tile_acceptance='parent_bridge',
-                stage='pre_tile_interpolation',
-                description='Accepted tile YOLO masks whose components did not intersect parent YOLO support but did intersect a parent interpolation bridge.',
+                stage=pre_interpolation_stage,
+                description=f'Accepted {config_label} tile YOLO masks whose components did not intersect parent YOLO support but did intersect a parent interpolation bridge.',
                 temp_dir=temp_dir,
                 workers=int(slice_workers),
             )
@@ -2079,9 +2097,10 @@ def finalize_consolidated_tile_volume_for_parent(
                 source='tile',
                 mask_kind='yolo',
                 pass_index=0,
+                tile_config_id=config_id_norm,
                 tile_acceptance='parent_support',
-                stage='pre_tile_interpolation',
-                description='Accepted tile YOLO masks before tile interpolation. Parent mask/bridge category supports were unavailable, so the category is the total parent support.',
+                stage=pre_interpolation_stage,
+                description=f'Accepted {config_label} tile YOLO masks before tile interpolation. Parent mask/bridge category supports were unavailable, so the category is the total parent support.',
                 temp_dir=temp_dir,
                 workers=int(slice_workers),
             )
@@ -2096,12 +2115,18 @@ def finalize_consolidated_tile_volume_for_parent(
             # replacing the old full-volume before-copy + subtract bookkeeping.
             pass_delta_path: Optional[Path] = None
             if bool(nrrd_layers_enabled):
-                pass_delta_path = temp_dir / 'nrrd_work' / view.name / f'tile_bridge_pass{int(pass_idx):02d}.u8.dat'
+                pass_delta_path = (
+                    temp_dir / 'nrrd_work' / view.name / config_label /
+                    f'tile_bridge_pass{int(pass_idx):02d}.u8.dat'
+                )
 
             tile_accumulator_mm, stats_local = interpolate_view_volume_pass_maybe_process(
                 mask_mm=tile_accumulator_mm,
                 view=view,
-                work_dir=temp_dir / 'tile_interpolation' / str(model_name) / view.name / 'consolidated',
+                work_dir=(
+                    temp_dir / 'tile_interpolation' / str(model_name) /
+                    view.name / config_label
+                ),
                 pass_tag=f'pass{pass_idx}',
                 max_slice_distance=int(interpolate),
                 search_angle_deg=float(effective_interpolation_search_angle),
@@ -2117,8 +2142,9 @@ def finalize_consolidated_tile_volume_for_parent(
             stats_local.update({
                 'pass_index': int(pass_idx),
                 'model': str(model_name),
-                'view': f'{view.name}[tiles:consolidated]',
+                'view': f'{view.name}[tiles:{config_label}]',
                 'source': 'tile',
+                'tile_config_id': config_id_norm,
                 'max_slice_distance': int(interpolate),
                 'interpolation_walk_back': int(interpolation_walk_back),
                 'interpolation_candidates': int(interpolation_candidates),
@@ -2144,9 +2170,10 @@ def finalize_consolidated_tile_volume_for_parent(
                         source='tile',
                         mask_kind='bridge',
                         pass_index=int(pass_idx),
+                        tile_config_id=config_id_norm,
                         tile_acceptance='consolidated',
-                        stage='tile_interpolation',
-                        description='Voxels added by this consolidated tile interpolation pass. Bridges are generated after accepted tile masks are consolidated, so they are not attributed back to parent-mask vs parent-bridge acceptance categories.',
+                        stage=interpolation_stage,
+                        description=f'Voxels added by this {config_label} tile interpolation pass. Bridges are generated after accepted tile masks within this configuration are consolidated, so they are not attributed back to parent-mask vs parent-bridge acceptance categories.',
                         temp_dir=temp_dir,
                         workers=int(slice_workers),
                         # the pass already counted its added voxels.
@@ -2184,7 +2211,7 @@ def finalize_consolidated_tile_volume_for_parent(
             destination_mm,
             tile_accumulator_mm,
             workers=int(slice_workers),
-            desc=f'Union consolidated gated tiles {model_name}/{view.name}',
+            desc=f'Union consolidated gated tiles {model_name}/{view.name}/{config_label}',
         )
 
     if bool(internal_final_layer_enabled):
