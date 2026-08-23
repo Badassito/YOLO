@@ -1,6 +1,6 @@
 # Volume TTA architecture
 
-The `GPT-5.6-Sol-Ultra_v17.1.1_SLURM.py` filename remains a versioned compatibility
+The `GPT-5.6-Sol-Ultra_v17.1.2_SLURM.py` filename remains a versioned compatibility
 launcher. The implementation lives in the importable `volume_tta` package so spawned
 processes resolve worker functions and data types through canonical module paths.
 
@@ -105,19 +105,33 @@ still require the production environment and representative artifacts. Intel acc
 build, provisioning, and admission instructions live in ``native/README.md``; run
 ``python tools/intel_accelerator_selftest.py --backend all`` on the target host.
 
-CUDA bridge interpolation is attempted by default only inside a leased, already-warm CUDA
-worker and requires the CUDA extra's CuPy 13+ ndimage primitives.
-`YOLO_TTA_GPU_INTERPOLATION=0` disables it; setting
-`YOLO_TTA_GPU_INTERPOLATION_REQUIRED=1` makes admission or execution failure fatal instead
-of replaying the affected work on CPU. Dedicated interpolation children and the main process
-do not create or claim CUDA contexts unless `YOLO_TTA_GPU_INTERPOLATION_CREATE_CONTEXT=1`
-and, for the latter, `YOLO_TTA_GPU_INTERPOLATION_MAIN_PROCESS=1` are both explicitly set.
-At admission, the renderer requires `YOLO_TTA_GPU_INTERPOLATION_RESERVE_MIB` (1024 by
-default) of free VRAM and withholds that amount when sizing its live SDF/section cache.
-`YOLO_TTA_GPU_INTERPOLATION_CACHE_MIB` (1024 by default) caps those retained array
-payloads; temporary CuPy/CuPyX workspaces and allocator-pool blocks are outside that
-logical cache limit and are released when the interpolation lease closes. Accepted
-sections stay device-only; an evicted section or CPU recovery is reconstructed from its
-host SDFs instead of copying every intermediate canvas over PCIe. Runtime stats
-distinguish the process host from the actual numerical render backend and expose
-transfer/cache/fallback counters.
+CUDA bridge painting is attempted by default only inside a leased, already-warm CUDA
+worker and requires the CUDA extra's CuPy 13+ primitives. The first nonempty bounded
+plan batch is rendered first through the exact parallel CPU painter and then replayed on
+CUDA; CUDA keeps the remaining batches only when it is at least 5% faster. The replay is
+safe because bridge painting is OR-idempotent. `YOLO_TTA_GPU_INTERPOLATION_RENDER_AUTOTUNE=0` forces
+CUDA painting after admission, while `YOLO_TTA_GPU_INTERPOLATION=0` disables it entirely.
+`YOLO_TTA_GPU_INTERPOLATION_REQUIRED=1` also forces CUDA and makes admission or execution
+failure fatal instead of replaying work on CPU.
+
+The min-radius acceptance scan uses the existing no-GIL parallel CPU evaluator by default.
+Production evidence from v17.1.1 showed that issuing each plan's CuPyX labeling, hole fill,
+and EDT through one renderer lock serialized 128 planner threads and reduced throughput by
+roughly fourfold. `YOLO_TTA_GPU_INTERPOLATION_RADIUS=1` restores that CUDA radius path as an
+explicit experiment. Radius failure is isolated from painting: unless CUDA is required, the
+affected plan and remaining radius work return to CPU while an otherwise healthy renderer
+may continue painting. Rendering coalesces per-section device reductions into one scalar
+transfer per destination group instead of synchronizing twice for every section.
+
+Dedicated interpolation children and the main process do not create or claim CUDA contexts
+unless `YOLO_TTA_GPU_INTERPOLATION_CREATE_CONTEXT=1` and, for the latter,
+`YOLO_TTA_GPU_INTERPOLATION_MAIN_PROCESS=1` are both explicitly set. At admission, the
+renderer requires `YOLO_TTA_GPU_INTERPOLATION_RESERVE_MIB` (1024 by default) of free VRAM
+and withholds that amount when sizing its live SDF/section cache.
+`YOLO_TTA_GPU_INTERPOLATION_CACHE_MIB` (1024 by default) caps retained device payloads;
+temporary CuPy/CuPyX workspaces and allocator-pool blocks are outside that logical cache
+limit and are released when the lease closes. The default global interpolation-pass limit
+remains one because a production pass required about 117 GiB of host workspace. Per-pass
+logs and runtime stats separately report radius/render backends, autotune timings, lock wait,
+execution time, transfer categories, crop/patch pixels, cache eviction, fallback, and the
+worker-visible physical CUDA token.

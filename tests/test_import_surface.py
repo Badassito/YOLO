@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WRAPPER = ROOT / "GPT-5.6-Sol-Ultra_v17.1.1_SLURM.py"
+WRAPPER = ROOT / "GPT-5.6-Sol-Ultra_v17.1.2_SLURM.py"
 
 
 class ImportSurfaceTests(unittest.TestCase):
@@ -41,7 +41,7 @@ class ImportSurfaceTests(unittest.TestCase):
     def test_module_version(self) -> None:
         completed = self.run_python("-m", "volume_tta", "--version")
         self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertIn("17.1.1", completed.stdout)
+        self.assertIn("17.1.2", completed.stdout)
 
     def test_cycle_safe_full_import_smoke(self) -> None:
         completed = self.run_python(str(ROOT / "tools" / "smoke_import.py"), "pipeline")

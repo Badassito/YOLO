@@ -14,8 +14,10 @@ a failed batch.
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -32,6 +34,25 @@ def gpu_interpolation_enabled() -> bool:
     """Whether CUDA bridge interpolation should be attempted."""
 
     return _env_flag("YOLO_TTA_GPU_INTERPOLATION", True)
+
+
+def gpu_interpolation_radius_enabled() -> bool:
+    """Whether the fine-grained min-radius scan should run on CUDA.
+
+    The v17.1.1 implementation serialized every planner thread through one CUDA
+    renderer and was substantially slower than the parallel CPU evaluator on a
+    production four-GPU workload.  Painting remains enabled by the master CUDA
+    interpolation switch; the legacy per-plan radius path is now an explicit
+    experiment until it can be replaced by a genuinely batched implementation.
+    """
+
+    return _env_flag("YOLO_TTA_GPU_INTERPOLATION_RADIUS", False)
+
+
+def gpu_interpolation_render_autotune_enabled() -> bool:
+    """Probe one representative batch and retain GPU painting only when faster."""
+
+    return _env_flag("YOLO_TTA_GPU_INTERPOLATION_RENDER_AUTOTUNE", True)
 
 
 def gpu_interpolation_required() -> bool:
@@ -222,6 +243,16 @@ class CudaInterpolationRenderer:
         self.xp = getattr(self.runtime, "xp")
         self.ndi = getattr(self.runtime, "ndi")
         self.device_index = int(getattr(self.runtime, "device_index", device_index))
+        visible_tokens = [
+            token.strip()
+            for token in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+            if token.strip()
+        ]
+        self.visible_device_token = (
+            visible_tokens[int(self.device_index)]
+            if 0 <= int(self.device_index) < len(visible_tokens)
+            else None
+        )
         self.reserve_bytes = int(
             gpu_interpolation_reserve_bytes()
             if reserve_bytes is None else max(0, int(reserve_bytes))
@@ -241,16 +272,30 @@ class CudaInterpolationRenderer:
         self._cache_live_bytes = 0
         self._lock = threading.RLock()
         self._failed_reason: Optional[str] = None
-        self._metrics: Dict[str, int] = {
+        self._radius_failed_reason: Optional[str] = None
+        self._metrics: Dict[str, object] = {
             "estimated_plans": 0,
             "estimated_sections": 0,
             "rendered_slices": 0,
             "rendered_sections": 0,
             "host_to_device_bytes": 0,
             "device_to_host_bytes": 0,
+            "sdf_host_to_device_bytes": 0,
+            "section_host_to_device_bytes": 0,
+            "destination_host_to_device_bytes": 0,
+            "destination_device_to_host_bytes": 0,
+            "metrics_device_to_host_bytes": 0,
             "cache_hits": 0,
             "cache_misses": 0,
+            "cache_evictions": 0,
+            "cache_evicted_bytes": 0,
             "cache_peak_bytes": 0,
+            "render_crop_pixels": 0,
+            "render_patch_pixels": 0,
+            "radius_lock_wait_seconds": 0.0,
+            "radius_execution_seconds": 0.0,
+            "render_lock_wait_seconds": 0.0,
+            "render_execution_seconds": 0.0,
         }
         self._structure8 = None
 
@@ -261,6 +306,14 @@ class CudaInterpolationRenderer:
     @property
     def failed_reason(self) -> Optional[str]:
         return self._failed_reason
+
+    @property
+    def radius_available(self) -> bool:
+        return self._failed_reason is None and self._radius_failed_reason is None
+
+    @property
+    def radius_failed_reason(self) -> Optional[str]:
+        return self._radius_failed_reason
 
     def disable(self, exc: BaseException) -> bool:
         """Disable future CUDA work; return True only for the first failure."""
@@ -273,9 +326,28 @@ class CudaInterpolationRenderer:
                 self._clear_cache()
             return bool(first)
 
+    def disable_radius(self, exc: BaseException) -> bool:
+        """Disable only CUDA radius evaluation while preserving GPU painting."""
+
+        reason = f"{type(exc).__name__}: {exc}"
+        with self._lock:
+            first = self._radius_failed_reason is None
+            if first:
+                self._radius_failed_reason = reason
+                # A failed scan may have left valid but incomplete plan entries.  The
+                # CPU retry becomes authoritative, so force painting to reload those
+                # exact host sections instead of reusing a partial device cache.
+                self._clear_cache()
+            return bool(first)
+
     def _ensure_available(self) -> None:
         if self._failed_reason is not None:
             raise GpuInterpolationUnavailable(self._failed_reason)
+
+    def _ensure_radius_available(self) -> None:
+        self._ensure_available()
+        if self._radius_failed_reason is not None:
+            raise GpuInterpolationUnavailable(self._radius_failed_reason)
 
     def _cache_get(
         self,
@@ -317,6 +389,12 @@ class CudaInterpolationRenderer:
             self._cache_live_bytes = max(
                 0, self._cache_live_bytes - int(old_entry.nbytes),
             )
+            self._metrics["cache_evictions"] = int(
+                self._metrics["cache_evictions"]
+            ) + 1
+            self._metrics["cache_evicted_bytes"] = int(
+                self._metrics["cache_evicted_bytes"]
+            ) + int(old_entry.nbytes)
         self._cache[key] = _DeviceCacheEntry(
             value=value,
             nbytes=int(size),
@@ -348,6 +426,9 @@ class CudaInterpolationRenderer:
             return cached  # type: ignore[return-value]
         sdf0 = self._device_array(sdf0_host)
         sdf1 = self._device_array(sdf1_host)
+        self._metrics["sdf_host_to_device_bytes"] = int(
+            self._metrics["sdf_host_to_device_bytes"]
+        ) + int(sdf0_host.nbytes + sdf1_host.nbytes)
         pair = (sdf0, sdf1)
         self._cache_put(
             key,
@@ -404,8 +485,8 @@ class CudaInterpolationRenderer:
         distances = self._distance_transform(section)
         return _scalar_float(self.xp.max(distances))
 
-    def preflight(self) -> None:
-        """Exercise every required CuPyX primitive before any host canvas can change."""
+    def preflight(self, *, check_radius: bool = True) -> None:
+        """Exercise requested CuPyX primitives before any host canvas can change."""
 
         with self._lock, self.runtime.activate():
             self._ensure_available()
@@ -416,14 +497,16 @@ class CudaInterpolationRenderer:
             kept = self._keep_center_component_and_fill(device_probe)
             if kept is None:
                 raise RuntimeError("CUDA interpolation preflight produced an empty component")
-            radius = self._section_radius(kept)
+            radius = self._section_radius(kept) if bool(check_radius) else 1.0
             host = self.runtime.to_host(kept)
             self._metrics["device_to_host_bytes"] += int(host.nbytes)
             if host.shape != probe.shape or not bool(host[2, 2]) or radius <= 0.0:
                 raise RuntimeError("CUDA interpolation preflight failed its morphology check")
             self._clear_cache()
             for key in self._metrics:
-                self._metrics[key] = 0
+                self._metrics[key] = (
+                    0.0 if str(key).endswith("_seconds") else 0
+                )
 
     def estimate_min_radius(
         self,
@@ -440,49 +523,66 @@ class CudaInterpolationRenderer:
         host copies; CPU recovery can always reconstruct a missing section from the SDFs.
         """
 
-        with self._lock, self.runtime.activate():
-            self._ensure_available()
-            sdf0_host = np.asarray(getattr(plan, "sdf0"), dtype=np.float32)
-            sdf1_host = np.asarray(getattr(plan, "sdf1"), dtype=np.float32)
-            if not bool(np.any(sdf0_host >= 0.0)) or not bool(np.any(sdf1_host >= 0.0)):
-                return 0.0
-            min_radius = float(min(float(np.max(sdf0_host)), float(np.max(sdf1_host))))
-            threshold = float(reject_at_or_below)
-            if threshold > 0.0 and min_radius <= threshold:
-                return float(min_radius)
+        queued_at = time.perf_counter()
+        with self._lock:
+            acquired_at = time.perf_counter()
+            self._metrics["radius_lock_wait_seconds"] = float(
+                self._metrics["radius_lock_wait_seconds"]
+            ) + max(0.0, acquired_at - queued_at)
+            try:
+                with self.runtime.activate():
+                    self._ensure_radius_available()
+                    sdf0_host = np.asarray(getattr(plan, "sdf0"), dtype=np.float32)
+                    sdf1_host = np.asarray(getattr(plan, "sdf1"), dtype=np.float32)
+                    if not bool(np.any(sdf0_host >= 0.0)) or not bool(np.any(sdf1_host >= 0.0)):
+                        return 0.0
+                    min_radius = float(min(float(np.max(sdf0_host)), float(np.max(sdf1_host))))
+                    threshold = float(reject_at_or_below)
+                    if threshold > 0.0 and min_radius <= threshold:
+                        return float(min_radius)
 
-            section_cache = getattr(plan, "cached_sections")
-            if bool(cache_sections):
-                section_cache[:] = [None] * (int(getattr(plan, "steps")) + 1)
-            sdf0, sdf1 = self._device_sdfs(plan)
-            self._metrics["estimated_plans"] += 1
-            for idx in range(1, int(getattr(plan, "steps"))):
-                alpha = float(idx) / float(getattr(plan, "steps"))
-                section = self._blend_section(sdf0, sdf1, alpha)
-                section = self._keep_center_component_and_fill(section)
-                if section is None:
-                    return 0.0
-                if bool(cache_sections):
-                    if bool(cache_host_sections):
-                        host_section = np.ascontiguousarray(
-                            self.runtime.to_host(section), dtype=bool,
-                        )
-                        self._metrics["device_to_host_bytes"] += int(host_section.nbytes)
-                        section_cache[int(idx)] = host_section
-                    # Insert as the scan proceeds so the LRU budget also bounds a
-                    # long plan; the planner releases all entries if it rejects it.
-                    self._cache_put(
-                        ("section", id(section_cache), int(idx)),
-                        section,
-                        int(getattr(section, "nbytes")),
-                        (section_cache,),
-                    )
-                min_radius = min(float(min_radius), float(self._section_radius(section)))
-                self._metrics["estimated_sections"] += 1
-                if threshold > 0.0 and min_radius <= threshold:
+                    section_cache = getattr(plan, "cached_sections")
+                    if bool(cache_sections):
+                        section_cache[:] = [None] * (int(getattr(plan, "steps")) + 1)
+                    sdf0, sdf1 = self._device_sdfs(plan)
+                    self._metrics["estimated_plans"] = int(
+                        self._metrics["estimated_plans"]
+                    ) + 1
+                    for idx in range(1, int(getattr(plan, "steps"))):
+                        alpha = float(idx) / float(getattr(plan, "steps"))
+                        section = self._blend_section(sdf0, sdf1, alpha)
+                        section = self._keep_center_component_and_fill(section)
+                        if section is None:
+                            return 0.0
+                        if bool(cache_sections):
+                            if bool(cache_host_sections):
+                                host_section = np.ascontiguousarray(
+                                    self.runtime.to_host(section), dtype=bool,
+                                )
+                                self._metrics["device_to_host_bytes"] = int(
+                                    self._metrics["device_to_host_bytes"]
+                                ) + int(host_section.nbytes)
+                                section_cache[int(idx)] = host_section
+                            # Insert as the scan proceeds so the LRU budget also bounds a
+                            # long plan; the planner releases all entries if it rejects it.
+                            self._cache_put(
+                                ("section", id(section_cache), int(idx)),
+                                section,
+                                int(getattr(section, "nbytes")),
+                                (section_cache,),
+                            )
+                        min_radius = min(float(min_radius), float(self._section_radius(section)))
+                        self._metrics["estimated_sections"] = int(
+                            self._metrics["estimated_sections"]
+                        ) + 1
+                        if threshold > 0.0 and min_radius <= threshold:
+                            return float(min_radius)
+
                     return float(min_radius)
-
-            return float(min_radius)
+            finally:
+                self._metrics["radius_execution_seconds"] = float(
+                    self._metrics["radius_execution_seconds"]
+                ) + max(0.0, time.perf_counter() - acquired_at)
 
     def _device_section(self, plan: object, step_idx: int) -> Optional[object]:
         section_cache = getattr(plan, "cached_sections")
@@ -493,13 +593,14 @@ class CudaInterpolationRenderer:
                 return cached_device
             cached_host = section_cache[int(step_idx)]
             if cached_host is not None:
-                section = self._device_array(np.asarray(cached_host, dtype=bool))
-                self._cache_put(
-                    key,
-                    section,
-                    int(np.asarray(cached_host).nbytes),
-                    (section_cache,),
-                )
+                # CPU-radius mode retains the exact accepted section on the host.
+                # A plan-step is painted once, so putting this one-shot upload into
+                # the device LRU only evicts reusable SDF entries before later jobs.
+                host_section = np.asarray(cached_host, dtype=bool)
+                section = self._device_array(host_section)
+                self._metrics["section_host_to_device_bytes"] = int(
+                    self._metrics["section_host_to_device_bytes"]
+                ) + int(host_section.nbytes)
                 return section
         sdf0, sdf1 = self._device_sdfs(plan)
         alpha = float(step_idx) / float(getattr(plan, "steps"))
@@ -533,72 +634,129 @@ class CudaInterpolationRenderer:
         crop_x0 = min(item[3].dst_x0 for item in placements)
         crop_x1 = max(item[3].dst_x1 for item in placements)
 
-        with self._lock, self.runtime.activate():
-            self._ensure_available()
-            initial_host = np.ascontiguousarray(
-                destination_array[crop_y0:crop_y1, crop_x0:crop_x1]
-            )
-            device_crop = self._device_array(initial_host)
-            added_voxels = 0
-            rendered_sections = 0
-            actual_bbox: Optional[List[int]] = None
-            for plan, step_idx, paint_value, placement in placements:
-                section = self._device_section(plan, int(step_idx))
-                if section is None:
-                    continue
-                if bool(placement.mirrored):
-                    section = section[:, ::-1]
-                patch = section[
-                    int(placement.src_y0):int(placement.src_y1),
-                    int(placement.src_x0):int(placement.src_x1),
-                ]
-                if not bool(_scalar_int(self.xp.any(patch))):
-                    continue
-                local_y0 = int(placement.dst_y0 - crop_y0)
-                local_y1 = int(placement.dst_y1 - crop_y0)
-                local_x0 = int(placement.dst_x0 - crop_x0)
-                local_x1 = int(placement.dst_x1 - crop_x0)
-                current = device_crop[local_y0:local_y1, local_x0:local_x1]
-                value = self.xp.asarray(int(paint_value), dtype=current.dtype)
-                missing = patch & ((self.xp.bitwise_and(current, value)) == 0)
-                added_voxels += _scalar_int(self.xp.count_nonzero(missing))
-                painted = patch.astype(current.dtype, copy=False) * value
-                self.xp.bitwise_or(current, painted, out=current)
-                rendered_sections += 1
-                if actual_bbox is None:
-                    actual_bbox = [
-                        int(placement.dst_y0), int(placement.dst_x0),
-                        int(placement.dst_y1), int(placement.dst_x1),
-                    ]
-                else:
-                    actual_bbox[0] = min(actual_bbox[0], int(placement.dst_y0))
-                    actual_bbox[1] = min(actual_bbox[1], int(placement.dst_x0))
-                    actual_bbox[2] = max(actual_bbox[2], int(placement.dst_y1))
-                    actual_bbox[3] = max(actual_bbox[3], int(placement.dst_x1))
+        queued_at = time.perf_counter()
+        with self._lock:
+            acquired_at = time.perf_counter()
+            self._metrics["render_lock_wait_seconds"] = float(
+                self._metrics["render_lock_wait_seconds"]
+            ) + max(0.0, acquired_at - queued_at)
+            try:
+                with self.runtime.activate():
+                    self._ensure_available()
+                    initial_host = np.ascontiguousarray(
+                        destination_array[crop_y0:crop_y1, crop_x0:crop_x1]
+                    )
+                    device_crop = self._device_array(initial_host)
+                    self._metrics["destination_host_to_device_bytes"] = int(
+                        self._metrics["destination_host_to_device_bytes"]
+                    ) + int(initial_host.nbytes)
+                    self._metrics["render_crop_pixels"] = int(
+                        self._metrics["render_crop_pixels"]
+                    ) + int(initial_host.size)
+                    added_counts_device: List[object] = []
+                    nonempty_flags_device: List[object] = []
+                    stat_placements: List[_SlicePlacement] = []
+                    for plan, step_idx, paint_value, placement in placements:
+                        section = self._device_section(plan, int(step_idx))
+                        if section is None:
+                            continue
+                        if bool(placement.mirrored):
+                            section = section[:, ::-1]
+                        patch = section[
+                            int(placement.src_y0):int(placement.src_y1),
+                            int(placement.src_x0):int(placement.src_x1),
+                        ]
+                        local_y0 = int(placement.dst_y0 - crop_y0)
+                        local_y1 = int(placement.dst_y1 - crop_y0)
+                        local_x0 = int(placement.dst_x0 - crop_x0)
+                        local_x1 = int(placement.dst_x1 - crop_x0)
+                        current = device_crop[local_y0:local_y1, local_x0:local_x1]
+                        value = self.xp.asarray(int(paint_value), dtype=current.dtype)
+                        missing = patch & ((self.xp.bitwise_and(current, value)) == 0)
+                        # Queue reductions and fetch all tiny scalars together after every
+                        # section has been painted. v17.1.1 called .item() twice per job,
+                        # forcing thousands of device synchronizations in a typical slice.
+                        nonempty_flags_device.append(self.xp.any(patch))
+                        added_counts_device.append(self.xp.count_nonzero(missing))
+                        self._metrics["render_patch_pixels"] = int(
+                            self._metrics["render_patch_pixels"]
+                        ) + int(patch.size)
+                        stat_placements.append(placement)
+                        painted = patch.astype(current.dtype, copy=False) * value
+                        self.xp.bitwise_or(current, painted, out=current)
 
-            # This is the transaction boundary: no host destination changes until every
-            # device operation and the complete blocking D2H copy have succeeded.
-            rendered_host = np.ascontiguousarray(self.runtime.to_host(device_crop))
-            self._metrics["device_to_host_bytes"] += int(rendered_host.nbytes)
-            np.copyto(
-                destination_array[crop_y0:crop_y1, crop_x0:crop_x1],
-                rendered_host,
-                casting="no",
-            )
-            self._metrics["rendered_slices"] += 1
-            self._metrics["rendered_sections"] += int(rendered_sections)
-            result_bbox = (
-                (
-                    int(actual_bbox[0]), int(actual_bbox[1]),
-                    int(actual_bbox[2]), int(actual_bbox[3]),
-                )
-                if actual_bbox is not None else None
-            )
-            return GpuInterpolationSliceResult(
-                added_voxels=int(added_voxels),
-                rendered_sections=int(rendered_sections),
-                bbox=result_bbox,
-            )
+                    if added_counts_device:
+                        counts_device = self.xp.stack(tuple(added_counts_device))
+                        flags_device = self.xp.stack(tuple(nonempty_flags_device)).astype(
+                            self.xp.int64, copy=False,
+                        )
+                        stats_device = self.xp.stack((counts_device, flags_device), axis=1)
+                        stats_host = np.ascontiguousarray(
+                            self.runtime.to_host(stats_device), dtype=np.int64,
+                        )
+                        self._metrics["device_to_host_bytes"] = int(
+                            self._metrics["device_to_host_bytes"]
+                        ) + int(stats_host.nbytes)
+                        self._metrics["metrics_device_to_host_bytes"] = int(
+                            self._metrics["metrics_device_to_host_bytes"]
+                        ) + int(stats_host.nbytes)
+                    else:
+                        stats_host = np.zeros((0, 2), dtype=np.int64)
+
+                    added_voxels = int(np.sum(stats_host[:, 0], dtype=np.int64))
+                    nonempty_flags = np.asarray(stats_host[:, 1] != 0, dtype=bool)
+                    rendered_sections = int(np.count_nonzero(nonempty_flags))
+                    actual_bbox: Optional[List[int]] = None
+                    for placement, nonempty in zip(stat_placements, nonempty_flags):
+                        if not bool(nonempty):
+                            continue
+                        if actual_bbox is None:
+                            actual_bbox = [
+                                int(placement.dst_y0), int(placement.dst_x0),
+                                int(placement.dst_y1), int(placement.dst_x1),
+                            ]
+                        else:
+                            actual_bbox[0] = min(actual_bbox[0], int(placement.dst_y0))
+                            actual_bbox[1] = min(actual_bbox[1], int(placement.dst_x0))
+                            actual_bbox[2] = max(actual_bbox[2], int(placement.dst_y1))
+                            actual_bbox[3] = max(actual_bbox[3], int(placement.dst_x1))
+
+                    # This is the transaction boundary: no host destination changes until
+                    # every device operation and the complete blocking D2H copy succeed.
+                    rendered_host = np.ascontiguousarray(self.runtime.to_host(device_crop))
+                    self._metrics["device_to_host_bytes"] = int(
+                        self._metrics["device_to_host_bytes"]
+                    ) + int(rendered_host.nbytes)
+                    self._metrics["destination_device_to_host_bytes"] = int(
+                        self._metrics["destination_device_to_host_bytes"]
+                    ) + int(rendered_host.nbytes)
+                    np.copyto(
+                        destination_array[crop_y0:crop_y1, crop_x0:crop_x1],
+                        rendered_host,
+                        casting="no",
+                    )
+                    self._metrics["rendered_slices"] = int(
+                        self._metrics["rendered_slices"]
+                    ) + 1
+                    self._metrics["rendered_sections"] = int(
+                        self._metrics["rendered_sections"]
+                    ) + int(rendered_sections)
+                    result_bbox = (
+                        (
+                            int(actual_bbox[0]), int(actual_bbox[1]),
+                            int(actual_bbox[2]), int(actual_bbox[3]),
+                        )
+                        if actual_bbox is not None else None
+                    )
+                    return GpuInterpolationSliceResult(
+                        added_voxels=int(added_voxels),
+                        rendered_sections=int(rendered_sections),
+                        bbox=result_bbox,
+                    )
+            finally:
+                self._metrics["render_execution_seconds"] = float(
+                    self._metrics["render_execution_seconds"]
+                ) + max(0.0, time.perf_counter() - acquired_at)
 
     def release_plans(self, plans: Iterable[object]) -> None:
         """Release device cache entries owned by a completed host plan batch."""
@@ -627,9 +785,11 @@ class CudaInterpolationRenderer:
             result: Dict[str, object] = dict(self._metrics)
             result.update({
                 "device_index": int(self.device_index),
+                "visible_device_token": self.visible_device_token,
                 "cache_budget_bytes": int(self.cache_budget_bytes),
                 "cache_live_bytes": int(self._cache_live_bytes),
                 "failed_reason": self._failed_reason,
+                "radius_failed_reason": self._radius_failed_reason,
             })
             return result
 
@@ -687,8 +847,24 @@ def create_cuda_interpolation_renderer(
                 f"only {int(free_bytes) / MIB:.0f} MiB VRAM free; "
                 f"{int(renderer.reserve_bytes) / MIB:.0f} MiB is reserved"
             )
-        renderer.preflight()
-        return renderer, f"cuda:{int(device_index)} CuPy/CuPyX"
+        radius_requested = bool(gpu_interpolation_radius_enabled())
+        try:
+            renderer.preflight(check_radius=bool(radius_requested))
+        except Exception as exc:
+            if not bool(radius_requested):
+                raise
+            renderer.disable_radius(exc)
+            # EDT/radius support is an optional capability. Re-run the render
+            # morphology preflight so a radius-only failure cannot prevent the
+            # default GPU painting path from being admitted.
+            renderer.preflight(check_radius=False)
+        status = f"cuda:{int(device_index)} CuPy/CuPyX"
+        visible_token = getattr(renderer, "visible_device_token", None)
+        if visible_token is not None:
+            status += f" [CUDA_VISIBLE_DEVICES={visible_token}]"
+        if renderer.radius_failed_reason:
+            status += f"; radius unavailable ({renderer.radius_failed_reason})"
+        return renderer, status
     except Exception as exc:
         if renderer is not None:
             try:
@@ -706,5 +882,7 @@ __all__ = (
     "gpu_interpolation_create_context_enabled",
     "gpu_interpolation_enabled",
     "gpu_interpolation_main_process_enabled",
+    "gpu_interpolation_radius_enabled",
+    "gpu_interpolation_render_autotune_enabled",
     "gpu_interpolation_required",
 )

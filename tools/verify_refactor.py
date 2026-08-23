@@ -82,6 +82,7 @@ INTENTIONALLY_CHANGED = {
     ("interpolation", "SliceEndpointSeed"),
     ("interpolation", "NrrdLayerRef"),
     ("interpolation", "SliceBridgeRenderPlan"),
+    ("interpolation", "SliceSeedBridgePlanResult"),
     ("interpolation", "_paint_linear_slice_bridge_plan_onto_slice"),
     ("interpolation", "_paste_local_mask_onto_slice"),
     ("interpolation", "_plan_slice_seed_bridges"),
@@ -194,7 +195,7 @@ REVIEWED_LOCAL_IMPORT_SEAMS = {
         "126545d0d25722c4df5918428643130e3c6a1eb639a0c61476fd7a259ad57cdf",
     ),
     ("interpolation", "interpolate_view_volume_pass_inplace"): (
-        "13aa2ffa922299f34b8db3b23568f10715911298ca2a6bc8fe74abf6079b85a6",
+        "6a6f314113914170721da31bc657cc9fd0391320ed2815c561506a07522276ad",
         "0a585dbad86412327820dccb21e479e86057fa65bb0ae01a016b198238a3f661",
     ),
     ("interpolation", "RawBBoxMaskStore"): (

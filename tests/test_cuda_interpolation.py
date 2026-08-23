@@ -149,6 +149,20 @@ class _NumpyDeviceRuntime:
         self.freed = True
 
 
+class _EdtFailingNdimage(_NumpyNdimage):
+    @staticmethod
+    def distance_transform_edt(
+        value: object,
+        return_indices: bool = False,
+        float64_distances: bool = True,
+    ) -> np.ndarray:
+        raise RuntimeError('injected EDT failure')
+
+
+class _EdtFailingRuntime(_NumpyDeviceRuntime):
+    ndi = _EdtFailingNdimage()
+
+
 def _plan(
     sdf: np.ndarray,
     *,
@@ -178,6 +192,47 @@ def _plan(
         sdf1=np.ascontiguousarray(sdf, dtype=np.float32),
         cached_sections=(list(cached_sections) if cached_sections is not None else []),
     )
+
+
+class CudaInterpolationConfigurationTests(unittest.TestCase):
+    def test_radius_offload_is_opt_in_while_cuda_rendering_remains_opt_out(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(cuda_interpolation.gpu_interpolation_enabled())
+            self.assertFalse(cuda_interpolation.gpu_interpolation_radius_enabled())
+            self.assertTrue(
+                cuda_interpolation.gpu_interpolation_render_autotune_enabled()
+            )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                'YOLO_TTA_GPU_INTERPOLATION': '1',
+                'YOLO_TTA_GPU_INTERPOLATION_RADIUS': '1',
+            },
+            clear=True,
+        ):
+            self.assertTrue(cuda_interpolation.gpu_interpolation_enabled())
+            self.assertTrue(cuda_interpolation.gpu_interpolation_radius_enabled())
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                'YOLO_TTA_GPU_INTERPOLATION': '0',
+                'YOLO_TTA_GPU_INTERPOLATION_RADIUS': '1',
+            },
+            clear=True,
+        ):
+            self.assertFalse(cuda_interpolation.gpu_interpolation_enabled())
+            self.assertTrue(cuda_interpolation.gpu_interpolation_radius_enabled())
+
+        with mock.patch.dict(
+            os.environ,
+            {'YOLO_TTA_GPU_INTERPOLATION_RENDER_AUTOTUNE': '0'},
+            clear=True,
+        ):
+            self.assertFalse(
+                cuda_interpolation.gpu_interpolation_render_autotune_enabled()
+            )
 
 
 class CudaInterpolationRendererContractTests(unittest.TestCase):
@@ -214,13 +269,103 @@ class CudaInterpolationRendererContractTests(unittest.TestCase):
         class _FakeRenderer:
             reserve_bytes = 1024 ** 3
             runtime = _FakeRuntime()
+            radius_failed_reason = None
 
             def __init__(self, device_index: int) -> None:
                 events.append(f'construct:{int(device_index)}')
 
             @staticmethod
-            def preflight() -> None:
-                events.append('preflight')
+            def preflight(*, check_radius: bool = True) -> None:
+                events.append(f'preflight:{bool(check_radius)}')
+
+        fake_torch = mock.Mock(cuda=_FakeCuda())
+        for check_radius in (False, True):
+            with self.subTest(check_radius=check_radius):
+                events.clear()
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {
+                            'YOLO_TTA_GPU_INTERPOLATION': '1',
+                            'YOLO_TTA_GPU_INTERPOLATION_CREATE_CONTEXT': '0',
+                            'YOLO_TTA_GPU_INTERPOLATION_RADIUS': (
+                                '1' if check_radius else '0'
+                            ),
+                        },
+                        clear=True,
+                    ),
+                    mock.patch.dict(sys.modules, {'torch': fake_torch}),
+                    mock.patch.object(
+                        cuda_interpolation, 'CudaInterpolationRenderer', _FakeRenderer,
+                    ),
+                ):
+                    renderer, status = (
+                        cuda_interpolation.create_cuda_interpolation_renderer(
+                            process_worker=True,
+                        )
+                    )
+
+                self.assertIsInstance(renderer, _FakeRenderer)
+                self.assertEqual(status, 'cuda:2 CuPy/CuPyX')
+                self.assertEqual(
+                    events,
+                    [
+                        'synchronize:2', 'empty_cache', 'construct:2', 'mem_info',
+                        f'preflight:{check_radius}',
+                    ],
+                )
+
+    def test_factory_keeps_rendering_when_only_radius_preflight_fails(self) -> None:
+        events: list[str] = []
+
+        class _FakeCuda:
+            @staticmethod
+            def is_available() -> bool:
+                return True
+
+            @staticmethod
+            def is_initialized() -> bool:
+                return True
+
+            @staticmethod
+            def current_device() -> int:
+                return 0
+
+            @staticmethod
+            def synchronize(_device: int) -> None:
+                return None
+
+            @staticmethod
+            def empty_cache() -> None:
+                return None
+
+        class _FakeRuntime:
+            @staticmethod
+            def mem_info() -> tuple[int, int]:
+                return 4 * 1024 ** 3, 8 * 1024 ** 3
+
+        class _SplitPreflightRenderer:
+            reserve_bytes = 1024 ** 3
+            runtime = _FakeRuntime()
+            visible_device_token = None
+
+            def __init__(self, device_index: int) -> None:
+                self.device_index = int(device_index)
+                self.radius_failed_reason: str | None = None
+
+            def preflight(self, *, check_radius: bool = True) -> None:
+                events.append(f'preflight:{bool(check_radius)}')
+                if bool(check_radius):
+                    raise RuntimeError('injected EDT failure')
+
+            def disable_radius(self, exc: BaseException) -> bool:
+                events.append('disable-radius')
+                self.radius_failed_reason = f'{type(exc).__name__}: {exc}'
+                return True
+
+            @staticmethod
+            def close() -> None:
+                events.append('close')
 
         fake_torch = mock.Mock(cuda=_FakeCuda())
         with (
@@ -229,24 +374,41 @@ class CudaInterpolationRendererContractTests(unittest.TestCase):
                 {
                     'YOLO_TTA_GPU_INTERPOLATION': '1',
                     'YOLO_TTA_GPU_INTERPOLATION_CREATE_CONTEXT': '0',
+                    'YOLO_TTA_GPU_INTERPOLATION_RADIUS': '1',
                 },
-                clear=False,
+                clear=True,
             ),
             mock.patch.dict(sys.modules, {'torch': fake_torch}),
             mock.patch.object(
-                cuda_interpolation, 'CudaInterpolationRenderer', _FakeRenderer,
+                cuda_interpolation,
+                'CudaInterpolationRenderer',
+                _SplitPreflightRenderer,
             ),
         ):
             renderer, status = cuda_interpolation.create_cuda_interpolation_renderer(
                 process_worker=True,
             )
 
-        self.assertIsInstance(renderer, _FakeRenderer)
-        self.assertEqual(status, 'cuda:2 CuPy/CuPyX')
+        self.assertIsInstance(renderer, _SplitPreflightRenderer)
+        self.assertEqual(
+            status,
+            'cuda:0 CuPy/CuPyX; radius unavailable '
+            '(RuntimeError: injected EDT failure)',
+        )
         self.assertEqual(
             events,
-            ['synchronize:2', 'empty_cache', 'construct:2', 'mem_info', 'preflight'],
+            ['preflight:True', 'disable-radius', 'preflight:False'],
         )
+
+    def test_preflight_skips_edt_when_cuda_radius_is_disabled(self) -> None:
+        renderer = CudaInterpolationRenderer(
+            runtime=_EdtFailingRuntime(), cache_bytes=0, reserve_bytes=0,
+        )
+
+        renderer.preflight(check_radius=False)
+        self.assertTrue(renderer.available)
+        with self.assertRaisesRegex(RuntimeError, 'injected EDT failure'):
+            renderer.preflight(check_radius=True)
 
     def test_uncached_radius_scan_and_render_match_expected_morphology(self) -> None:
         sdf = np.full((5, 5), -1.0, dtype=np.float32)
@@ -358,6 +520,28 @@ class CudaInterpolationRendererContractTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'injected D2H failure'):
             renderer.render_slice(destination, [(plan, 1, 1)])
         np.testing.assert_array_equal(destination, before)
+
+    def test_radius_failure_does_not_disable_gpu_rendering(self) -> None:
+        section = np.ones((3, 3), dtype=bool)
+        plan = _plan(
+            np.ones((3, 3), dtype=np.float32),
+            cached_sections=[None, section, None],
+        )
+        renderer = CudaInterpolationRenderer(
+            runtime=_NumpyDeviceRuntime(), cache_bytes=0, reserve_bytes=0,
+        )
+
+        self.assertTrue(renderer.disable_radius(RuntimeError('injected radius failure')))
+        self.assertFalse(renderer.radius_available)
+        self.assertTrue(renderer.available)
+
+        destination = np.zeros((7, 7), dtype=np.uint8)
+        result = renderer.render_slice(destination, [(plan, 1, 1)])
+        self.assertEqual(result.added_voxels, 9)
+        self.assertEqual(int(np.count_nonzero(destination)), 9)
+        telemetry = renderer.telemetry()
+        self.assertIsNone(telemetry['failed_reason'])
+        self.assertIn('injected radius failure', str(telemetry['radius_failed_reason']))
 
     def test_cache_validates_host_owner_identity_for_id_derived_keys(self) -> None:
         renderer = CudaInterpolationRenderer(
@@ -471,14 +655,133 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
         )
         return mask, labels, seed, plan_result
 
+    @staticmethod
+    def _accept_radius_on_cpu(
+        plan: interpolation.SliceBridgeRenderPlan,
+        **_kwargs: object,
+    ) -> float:
+        plan.cached_sections[:] = (
+            [None]
+            + [np.ones(plan.sdf0.shape, dtype=bool) for _ in range(int(plan.steps) - 1)]
+            + [None]
+        )
+        return 1.0
+
+    @staticmethod
+    def _clock(*ticks: float) -> mock.Mock:
+        clock = mock.Mock()
+        clock.perf_counter.side_effect = [float(tick) for tick in ticks]
+        return clock
+
+    @staticmethod
+    def _distinct_single_pixel_plans() -> list[interpolation.SliceBridgeRenderPlan]:
+        section = np.ones((1, 1), dtype=bool)
+        sdf = np.ones((1, 1), dtype=np.float32)
+        return [
+            _plan(
+                sdf,
+                source_anchor=(anchor, anchor),
+                target_anchor=(anchor, anchor),
+                cached_sections=[None, section.copy(), None],
+            )
+            for anchor in (1, 5)
+        ]
+
     def _run_pass(
         self,
         renderer: object,
         *,
         required: bool = False,
         steps: int = 2,
+        interpolate_min_radius: float = 0.0,
+        radius_enabled: bool | None = None,
+        render_autotune: bool | None = False,
+        exercise_radius_routing: bool = False,
+        seed_count: int = 1,
+        planned_plans: list[interpolation.SliceBridgeRenderPlan] | None = None,
+        plan_batch_budget_bytes: int | None = None,
     ):
         mask, labels, seed, plan_result = self._pass_fixture(steps=int(steps))
+        plan = plan_result.plans[0]
+        render_plans = (
+            list(planned_plans)
+            if planned_plans is not None
+            else [plan for _ in range(max(1, int(seed_count)))]
+        )
+        if not render_plans:
+            raise ValueError('planned_plans must contain at least one plan')
+        seeds = [seed for _ in render_plans]
+        candidate = interpolation.SliceProjectionCandidate(
+            source_label=1,
+            target_label=2,
+            source_point=seed.point,
+            target_point=plan.target_point,
+            slice_distance=int(steps),
+        )
+        plan_seed_patch = (
+            contextlib.nullcontext()
+            if bool(exercise_radius_routing)
+            else mock.patch.object(
+                interpolation,
+                '_plan_slice_seed_bridges',
+                side_effect=[
+                    interpolation.SliceSeedBridgePlanResult(
+                        candidate_connections=1,
+                        accepted_connections=1,
+                        default_bridges=1,
+                        plans=[render_plan],
+                    )
+                    for render_plan in render_plans
+                ],
+            )
+        )
+        candidate_patch = (
+            mock.patch.object(
+                interpolation, '_find_slice_projection_candidates',
+                return_value=[candidate],
+            )
+            if bool(exercise_radius_routing)
+            else contextlib.nullcontext()
+        )
+        walkback_patch = (
+            mock.patch.object(
+                interpolation, '_collect_walkback_source_points', return_value=[],
+            )
+            if bool(exercise_radius_routing)
+            else contextlib.nullcontext()
+        )
+        build_plan_patch = (
+            mock.patch.object(
+                interpolation, '_build_linear_slice_bridge_plan', return_value=plan,
+            )
+            if bool(exercise_radius_routing)
+            else contextlib.nullcontext()
+        )
+        env = {
+            'YOLO_TTA_GPU_INTERPOLATION': '1',
+            'YOLO_TTA_GPU_INTERPOLATION_REQUIRED': '1' if required else '0',
+            'YOLO_TTA_INTERPOLATION_CACHE_BRIDGE_SECTIONS': '1',
+            # CUDA routing tests should not depend on an optional Numba installation
+            # or pay a first-call JIT cost inside the CPU side of the autotune probe.
+            'YOLO_TTA_INTERPOLATION_COMPILED_KERNELS': '0',
+        }
+        if radius_enabled is not None:
+            env['YOLO_TTA_GPU_INTERPOLATION_RADIUS'] = (
+                '1' if bool(radius_enabled) else '0'
+            )
+        if render_autotune is not None:
+            env['YOLO_TTA_GPU_INTERPOLATION_RENDER_AUTOTUNE'] = (
+                '1' if bool(render_autotune) else '0'
+            )
+        plan_budget_patch = (
+            mock.patch.object(
+                interpolation,
+                'interpolation_plan_batch_budget_bytes',
+                return_value=int(plan_batch_budget_bytes),
+            )
+            if plan_batch_budget_bytes is not None
+            else contextlib.nullcontext()
+        )
         temp_context = tempfile.TemporaryDirectory()
         self.addCleanup(temp_context.cleanup)
         with (
@@ -490,11 +793,13 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
                 return_value=(labels, 2, []),
             ),
             mock.patch.object(
-                interpolation, '_build_slice_endpoint_seeds', return_value=([seed], 1),
+                interpolation, '_build_slice_endpoint_seeds', return_value=(seeds, 1),
             ),
-            mock.patch.object(
-                interpolation, '_plan_slice_seed_bridges', return_value=plan_result,
-            ),
+            plan_seed_patch,
+            candidate_patch,
+            walkback_patch,
+            build_plan_patch,
+            plan_budget_patch,
             mock.patch.object(
                 interpolation, 'should_use_in_memory_workspace', return_value=True,
             ),
@@ -502,10 +807,7 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
                 interpolation, 'create_cuda_interpolation_renderer',
                 return_value=(renderer, 'test cuda:0'),
             ),
-            mock.patch.dict(
-                os.environ,
-                {'YOLO_TTA_GPU_INTERPOLATION_REQUIRED': '1' if required else '0'},
-            ),
+            mock.patch.dict(os.environ, env, clear=True),
         ):
             stats = interpolation.interpolate_view_volume_pass_inplace(
                 mask_mm=mask,
@@ -515,7 +817,7 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
                 search_angle_deg=15.0,
                 interpolation_walk_back=0,
                 interpolation_candidates=1,
-                interpolate_min_radius=0.0,
+                interpolate_min_radius=float(interpolate_min_radius),
                 workers=1,
             )
         return mask, stats
@@ -523,6 +825,20 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
     def test_required_mode_rejects_cpu_admission_fallback(self) -> None:
         with self.assertRaisesRegex(RuntimeError, 'CUDA interpolation is unavailable'):
             self._run_pass(None, required=True)
+
+    def test_optional_cpu_admission_reports_cpu_selected(self) -> None:
+        mask, stats = self._run_pass(
+            None,
+            required=False,
+            render_autotune=None,
+        )
+
+        self.assertEqual(int(np.count_nonzero(mask[1])), 9)
+        self.assertEqual(stats['interpolation_render_backend'], 'cpu_numpy_numba')
+        self.assertFalse(stats['gpu_interpolation_active'])
+        self.assertTrue(stats['gpu_interpolation_render_autotune_enabled'])
+        self.assertIs(stats['gpu_interpolation_render_selected'], False)
+        self.assertEqual(int(stats['gpu_interpolation_batches']), 0)
 
     def test_pass_reports_real_cuda_computation_backend(self) -> None:
         renderer = CudaInterpolationRenderer(
@@ -533,6 +849,328 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
         self.assertEqual(stats['interpolation_render_backend'], 'cuda_cupy_crop_bounded')
         self.assertTrue(stats['gpu_interpolation_active'])
         self.assertEqual(int(stats['gpu_interpolation_batches']), 1)
+        self.assertEqual(int(stats['gpu_interpolation_rendered_sections']), 1)
+
+    def test_render_autotune_selects_cpu_after_a_successful_gpu_probe(self) -> None:
+        renderer = CudaInterpolationRenderer(
+            runtime=_NumpyDeviceRuntime(), cache_bytes=0, reserve_bytes=0,
+        )
+        first_plan, second_plan = self._distinct_single_pixel_plans()
+
+        # Calls are planner start; probe CPU start/end; probe GPU start/end;
+        # second-batch CPU start/end; planner end. The 1s/2s comparison forces CPU.
+        with mock.patch.object(
+            interpolation,
+            'time',
+            self._clock(0.0, 1.0, 2.0, 3.0, 5.0, 6.0, 7.0, 8.0),
+        ):
+            mask, stats = self._run_pass(
+                renderer,
+                render_autotune=True,
+                planned_plans=[first_plan, second_plan],
+                plan_batch_budget_bytes=1,
+            )
+
+        self.assertEqual(int(np.count_nonzero(mask[1])), 2)
+        self.assertEqual(int(mask[1, 1, 1]), 1)
+        # This pixel belongs only to the post-probe batch. Its presence proves the
+        # selected CPU backend continued rendering instead of silently dropping work.
+        self.assertEqual(int(mask[1, 5, 5]), 1)
+        self.assertEqual(int(stats['planner_plan_batches']), 2)
+        self.assertTrue(stats['gpu_interpolation_render_autotune_enabled'])
+        self.assertFalse(stats['gpu_interpolation_render_selected'])
+        self.assertEqual(
+            stats['interpolation_render_backend'],
+            'cuda_cupy_probe+cpu_numpy_numba',
+        )
+        self.assertEqual(int(stats['gpu_interpolation_batches']), 1)
+        self.assertEqual(int(stats['gpu_interpolation_rendered_sections']), 1)
+        self.assertAlmostEqual(
+            float(stats['gpu_interpolation_render_probe_gpu_seconds']), 2.0,
+        )
+        self.assertAlmostEqual(
+            float(stats['gpu_interpolation_render_probe_cpu_seconds']), 1.0,
+        )
+        self.assertAlmostEqual(float(stats['planner_cpu_render_wall_seconds']), 2.0)
+
+    def test_render_autotune_keeps_gpu_after_a_clear_gpu_win(self) -> None:
+        renderer = CudaInterpolationRenderer(
+            runtime=_NumpyDeviceRuntime(), cache_bytes=0, reserve_bytes=0,
+        )
+        first_plan, second_plan = self._distinct_single_pixel_plans()
+
+        # CPU is measured first on the real empty destination; the following
+        # 0.5s/1s GPU/CPU comparison is comfortably beyond the 5% win threshold.
+        with mock.patch.object(
+            interpolation,
+            'time',
+            self._clock(0.0, 1.0, 2.0, 3.0, 3.5, 4.0, 4.5, 5.0),
+        ):
+            mask, stats = self._run_pass(
+                renderer,
+                render_autotune=True,
+                planned_plans=[first_plan, second_plan],
+                plan_batch_budget_bytes=1,
+            )
+
+        self.assertEqual(int(np.count_nonzero(mask[1])), 2)
+        self.assertEqual(int(mask[1, 1, 1]), 1)
+        self.assertEqual(int(mask[1, 5, 5]), 1)
+        self.assertEqual(int(stats['planner_plan_batches']), 2)
+        self.assertTrue(stats['gpu_interpolation_render_autotune_enabled'])
+        self.assertTrue(stats['gpu_interpolation_render_selected'])
+        self.assertEqual(
+            stats['interpolation_render_backend'],
+            'cuda_cupy_crop_bounded',
+        )
+        self.assertEqual(int(stats['gpu_interpolation_batches']), 2)
+        self.assertEqual(int(stats['gpu_interpolation_rendered_sections']), 2)
+        self.assertAlmostEqual(
+            float(stats['gpu_interpolation_render_probe_gpu_seconds']), 0.5,
+        )
+        self.assertAlmostEqual(
+            float(stats['gpu_interpolation_render_probe_cpu_seconds']), 1.0,
+        )
+        self.assertAlmostEqual(float(stats['planner_cpu_render_wall_seconds']), 1.0)
+
+    def test_default_hybrid_uses_cpu_radius_and_gpu_rendering(self) -> None:
+        renderer = CudaInterpolationRenderer(
+            runtime=_NumpyDeviceRuntime(), cache_bytes=0, reserve_bytes=0,
+        )
+        with (
+            mock.patch.object(
+                interpolation,
+                '_estimate_linear_slice_bridge_min_radius_from_plan',
+                side_effect=self._accept_radius_on_cpu,
+            ) as cpu_estimate,
+            mock.patch.object(
+                renderer,
+                'estimate_min_radius',
+                wraps=renderer.estimate_min_radius,
+            ) as gpu_estimate,
+            mock.patch.object(
+                interpolation,
+                'time',
+                self._clock(0.0, 1.0, 2.0, 3.0, 3.5, 4.0),
+            ),
+        ):
+            mask, stats = self._run_pass(
+                renderer,
+                interpolate_min_radius=0.5,
+                radius_enabled=None,
+                render_autotune=None,
+                exercise_radius_routing=True,
+            )
+
+        self.assertEqual(cpu_estimate.call_count, 1)
+        gpu_estimate.assert_not_called()
+        self.assertEqual(int(np.count_nonzero(mask[1])), 9)
+        self.assertEqual(stats['interpolation_render_backend'], 'cuda_cupy_crop_bounded')
+        self.assertEqual(stats['interpolation_radius_backend'], 'cpu_numpy_numba')
+        self.assertTrue(stats['gpu_interpolation_active'])
+        self.assertTrue(stats['gpu_interpolation_render_autotune_enabled'])
+        self.assertTrue(stats['gpu_interpolation_render_selected'])
+        self.assertFalse(stats['gpu_interpolation_radius_enabled'])
+        self.assertFalse(stats['gpu_interpolation_radius_active'])
+        self.assertEqual(int(stats['gpu_interpolation_estimated_plans']), 0)
+        self.assertEqual(int(stats['gpu_interpolation_rendered_sections']), 1)
+
+    def test_required_mode_allows_the_intentional_default_cpu_radius(self) -> None:
+        renderer = CudaInterpolationRenderer(
+            runtime=_NumpyDeviceRuntime(), cache_bytes=0, reserve_bytes=0,
+        )
+        with mock.patch.object(
+            interpolation,
+            '_estimate_linear_slice_bridge_min_radius_from_plan',
+            side_effect=self._accept_radius_on_cpu,
+        ) as cpu_estimate:
+            mask, stats = self._run_pass(
+                renderer,
+                required=True,
+                interpolate_min_radius=0.5,
+                radius_enabled=None,
+                exercise_radius_routing=True,
+            )
+
+        self.assertEqual(cpu_estimate.call_count, 1)
+        self.assertEqual(int(np.count_nonzero(mask[1])), 9)
+        self.assertTrue(stats['gpu_interpolation_required'])
+        self.assertFalse(stats['gpu_interpolation_radius_enabled'])
+        self.assertEqual(stats['interpolation_radius_backend'], 'cpu_numpy_numba')
+        self.assertEqual(int(stats['gpu_interpolation_rendered_sections']), 1)
+
+    def test_required_mode_bypasses_render_autotune_and_cpu_replay(self) -> None:
+        renderer = CudaInterpolationRenderer(
+            runtime=_NumpyDeviceRuntime(), cache_bytes=0, reserve_bytes=0,
+        )
+        first_plan, second_plan = self._distinct_single_pixel_plans()
+
+        # Required mode must never enter either the compatibility probe replay or a
+        # post-probe CPU route, even when the autotune environment switch is enabled.
+        with mock.patch.object(
+            interpolation,
+            '_paint_linear_slice_bridge_plan_onto_slice',
+            side_effect=AssertionError('required mode attempted CPU rendering'),
+        ) as cpu_paint:
+            mask, stats = self._run_pass(
+                renderer,
+                required=True,
+                render_autotune=True,
+                planned_plans=[first_plan, second_plan],
+                plan_batch_budget_bytes=1,
+            )
+
+        cpu_paint.assert_not_called()
+        self.assertEqual(int(np.count_nonzero(mask[1])), 2)
+        self.assertFalse(stats['gpu_interpolation_render_autotune_enabled'])
+        self.assertTrue(stats['gpu_interpolation_render_selected'])
+        self.assertEqual(int(stats['gpu_interpolation_batches']), 2)
+        self.assertEqual(float(stats['planner_cpu_render_wall_seconds']), 0.0)
+
+    def test_radius_env_override_restores_cuda_radius_evaluation(self) -> None:
+        renderer = CudaInterpolationRenderer(
+            runtime=_NumpyDeviceRuntime(), cache_bytes=0, reserve_bytes=0,
+        )
+        with mock.patch.object(
+            interpolation,
+            '_estimate_linear_slice_bridge_min_radius_from_plan',
+            side_effect=self._accept_radius_on_cpu,
+        ) as cpu_estimate:
+            mask, stats = self._run_pass(
+                renderer,
+                interpolate_min_radius=0.5,
+                radius_enabled=True,
+                exercise_radius_routing=True,
+            )
+
+        cpu_estimate.assert_not_called()
+        self.assertEqual(int(np.count_nonzero(mask[1])), 9)
+        self.assertEqual(stats['interpolation_radius_backend'], 'cuda_cupy')
+        self.assertTrue(stats['gpu_interpolation_radius_enabled'])
+        self.assertTrue(stats['gpu_interpolation_radius_active'])
+        self.assertEqual(int(stats['gpu_interpolation_estimated_plans']), 1)
+        self.assertGreater(int(stats['gpu_interpolation_estimated_sections']), 0)
+        self.assertEqual(int(stats['gpu_interpolation_radius_fallback_plans']), 0)
+
+    def test_radius_failure_falls_back_to_cpu_without_disabling_gpu_render(self) -> None:
+        renderer = CudaInterpolationRenderer(
+            runtime=_NumpyDeviceRuntime(), cache_bytes=1024, reserve_bytes=0,
+        )
+
+        def _fail_after_caching_stale_section(
+            plan: interpolation.SliceBridgeRenderPlan,
+            **_kwargs: object,
+        ) -> float:
+            stale_section = np.zeros(plan.sdf0.shape, dtype=bool)
+            renderer._cache_put(
+                ('section', id(plan.cached_sections), 1),
+                stale_section,
+                int(stale_section.nbytes),
+                (plan.cached_sections,),
+            )
+            raise RuntimeError('injected device radius failure')
+
+        with (
+            mock.patch.object(
+                renderer,
+                'estimate_min_radius',
+                side_effect=_fail_after_caching_stale_section,
+            ),
+            mock.patch.object(
+                interpolation,
+                '_estimate_linear_slice_bridge_min_radius_from_plan',
+                side_effect=self._accept_radius_on_cpu,
+            ) as cpu_estimate,
+        ):
+            mask, stats = self._run_pass(
+                renderer,
+                interpolate_min_radius=0.5,
+                radius_enabled=True,
+                exercise_radius_routing=True,
+            )
+
+        self.assertEqual(cpu_estimate.call_count, 1)
+        # The stale all-false device section must be discarded before the CPU retry
+        # publishes its authoritative all-true host section for GPU painting.
+        self.assertEqual(int(np.count_nonzero(mask[1])), 9)
+        self.assertEqual(stats['interpolation_render_backend'], 'cuda_cupy_crop_bounded')
+        self.assertEqual(stats['interpolation_radius_backend'], 'cuda_cupy+cpu_fallback')
+        self.assertTrue(stats['gpu_interpolation_active'])
+        self.assertFalse(stats['gpu_interpolation_radius_active'])
+        self.assertEqual(int(stats['gpu_interpolation_radius_fallback_plans']), 1)
+        self.assertIn(
+            'injected device radius failure',
+            str(stats['gpu_interpolation_radius_fallback_reason']),
+        )
+        self.assertEqual(int(stats['gpu_interpolation_rendered_sections']), 1)
+        self.assertIsNone(stats['gpu_interpolation_fallback_reason'])
+
+    def test_required_mode_makes_opted_in_cuda_radius_failure_fatal(self) -> None:
+        renderer = CudaInterpolationRenderer(
+            runtime=_NumpyDeviceRuntime(), cache_bytes=0, reserve_bytes=0,
+        )
+        with (
+            mock.patch.object(
+                renderer,
+                'estimate_min_radius',
+                side_effect=RuntimeError('injected required radius failure'),
+            ),
+            self.assertRaisesRegex(
+                RuntimeError, 'required CUDA interpolation radius evaluation failed',
+            ),
+        ):
+            self._run_pass(
+                renderer,
+                required=True,
+                interpolate_min_radius=0.5,
+                radius_enabled=True,
+                exercise_radius_routing=True,
+            )
+
+    def test_required_mode_rejects_radius_disabled_during_preflight(self) -> None:
+        renderer = CudaInterpolationRenderer(
+            runtime=_NumpyDeviceRuntime(), cache_bytes=0, reserve_bytes=0,
+        )
+        renderer.disable_radius(RuntimeError('injected radius preflight failure'))
+
+        with self.assertRaisesRegex(
+            RuntimeError, 'CUDA radius evaluation is unavailable',
+        ):
+            self._run_pass(
+                renderer,
+                required=True,
+                interpolate_min_radius=0.5,
+                radius_enabled=True,
+                exercise_radius_routing=True,
+            )
+
+    def test_required_mode_ignores_disabled_radius_when_filter_is_inactive(self) -> None:
+        renderer = CudaInterpolationRenderer(
+            runtime=_NumpyDeviceRuntime(), cache_bytes=0, reserve_bytes=0,
+        )
+        renderer.disable_radius(RuntimeError('injected unused radius failure'))
+
+        with mock.patch.object(
+            renderer,
+            'estimate_min_radius',
+            wraps=renderer.estimate_min_radius,
+        ) as gpu_estimate:
+            mask, stats = self._run_pass(
+                renderer,
+                required=True,
+                interpolate_min_radius=0.0,
+                radius_enabled=True,
+                exercise_radius_routing=True,
+            )
+
+        gpu_estimate.assert_not_called()
+        self.assertEqual(int(np.count_nonzero(mask[1])), 9)
+        self.assertTrue(stats['gpu_interpolation_required'])
+        self.assertTrue(stats['gpu_interpolation_radius_enabled'])
+        self.assertFalse(stats['gpu_interpolation_radius_active'])
+        self.assertEqual(stats['interpolation_radius_backend'], 'disabled')
+        self.assertEqual(stats['interpolation_render_backend'], 'cuda_cupy_crop_bounded')
+        self.assertTrue(stats['gpu_interpolation_render_selected'])
         self.assertEqual(int(stats['gpu_interpolation_rendered_sections']), 1)
 
     def test_device_failure_replays_the_batch_on_cpu(self) -> None:
@@ -570,6 +1208,20 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
         self.assertFalse(stats['gpu_interpolation_active'])
         self.assertEqual(int(stats['gpu_interpolation_fallback_batches']), 1)
         self.assertIn('injected device render failure', str(stats['gpu_interpolation_fallback_reason']))
+
+        with (
+            mock.patch.object(
+                interpolation,
+                '_paint_linear_slice_bridge_plan_onto_slice',
+                side_effect=AssertionError('required render failure replayed on CPU'),
+            ) as cpu_paint,
+            self.assertRaisesRegex(
+                RuntimeError,
+                'required CUDA interpolation bridge rendering failed',
+            ),
+        ):
+            self._run_pass(_FailingRenderer(), required=True)
+        cpu_paint.assert_not_called()
 
     def test_failure_after_one_gpu_commit_replays_the_whole_batch_safely(self) -> None:
         inner = CudaInterpolationRenderer(

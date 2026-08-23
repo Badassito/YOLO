@@ -14,6 +14,7 @@ import os
 import shutil
 import sys
 import threading
+import time
 from collections import deque
 from dataclasses import (
     dataclass,
@@ -37,6 +38,8 @@ from ._deps import _NUMBA_IMPORT_ERROR, _numba, cv2, ndi, tqdm
 from .cuda_interpolation import (
     CudaInterpolationRenderer,
     create_cuda_interpolation_renderer,
+    gpu_interpolation_radius_enabled,
+    gpu_interpolation_render_autotune_enabled,
     gpu_interpolation_required,
 )
 
@@ -1894,6 +1897,8 @@ class SliceSeedBridgePlanResult:
     default_bridges: int = 0
     walk_back_bridges: int = 0
     skipped_by_min_radius: int = 0
+    gpu_radius_attempts: int = 0
+    gpu_radius_cpu_fallbacks: int = 0
     plans: List[SliceBridgeRenderPlan] = field(default_factory=list)
 
 
@@ -2125,6 +2130,7 @@ def _plan_slice_seed_bridges(
     component_cache: Optional[SliceComponentTableCache] = None,
     slice_luts: Optional['SliceLocalLabelLUTs'] = None,
     gpu_renderer: Optional[CudaInterpolationRenderer] = None,
+    gpu_radius_enabled: bool = False,
     gpu_required: bool = False,
 ) -> SliceSeedBridgePlanResult:
     result = SliceSeedBridgePlanResult()
@@ -2176,8 +2182,16 @@ def _plan_slice_seed_bridges(
 
             if float(interpolate_min_radius) > 0.0:
                 bridge_radius: Optional[float] = None
-                if gpu_renderer is not None and gpu_renderer.available:
+                gpu_radius_requested = bool(
+                    gpu_radius_enabled and gpu_renderer is not None
+                )
+                if (
+                    bool(gpu_radius_requested)
+                    and gpu_renderer is not None
+                    and gpu_renderer.radius_available
+                ):
                     try:
+                        result.gpu_radius_attempts += 1
                         bridge_radius = gpu_renderer.estimate_min_radius(
                             plan,
                             reject_at_or_below=float(interpolate_min_radius),
@@ -2185,7 +2199,7 @@ def _plan_slice_seed_bridges(
                             cache_host_sections=False,
                         )
                     except Exception as exc:
-                        first_failure = gpu_renderer.disable(exc)
+                        first_failure = gpu_renderer.disable_radius(exc)
                         if bool(gpu_required):
                             raise RuntimeError(
                                 'required CUDA interpolation radius evaluation failed'
@@ -2193,9 +2207,11 @@ def _plan_slice_seed_bridges(
                         if first_failure:
                             print(
                                 f'Warning: CUDA interpolation radius evaluation failed ({exc}); '
-                                'using the CPU bridge evaluator for this and remaining plans.'
+                                'using the CPU bridge evaluator while retaining GPU painting.'
                             )
                 if bridge_radius is None:
+                    if bool(gpu_radius_requested):
+                        result.gpu_radius_cpu_fallbacks += 1
                     bridge_radius = _estimate_linear_slice_bridge_min_radius_from_plan(
                         plan,
                         reject_at_or_below=float(interpolate_min_radius),
@@ -2571,6 +2587,8 @@ def interpolate_view_volume_pass_inplace(
     default_bridges = 0
     walk_back_bridges = 0
     skipped_by_min_radius = 0
+    gpu_radius_attempts = 0
+    gpu_radius_cpu_fallbacks = 0
     added_voxels = 0
     bridge_delta_written = False
     # interpolation already visits every bridge-delta crop while it is hot.
@@ -2592,8 +2610,26 @@ def interpolate_view_volume_pass_inplace(
     gpu_renderer_status = 'not attempted'
     gpu_renderer_telemetry: Dict[str, object] = {}
     gpu_required = bool(gpu_interpolation_required())
+    gpu_radius_configured = bool(gpu_interpolation_radius_enabled())
+    # A zero threshold never evaluates bridge radii.  Keep an explicitly enabled
+    # CUDA radius capability visible in telemetry, but do not make an unused EDT
+    # capability a REQUIRED-mode admission condition for this pass.
+    gpu_radius_requested = bool(
+        gpu_radius_configured and float(interpolate_min_radius) > 0.0
+    )
+    gpu_render_autotune = bool(
+        gpu_interpolation_render_autotune_enabled() and not bool(gpu_required)
+    )
+    # Selection is an execution result, not merely the configured policy.  Resolve it
+    # only after CUDA admission so CPU-only fallback cannot be reported as GPU-selected.
+    gpu_render_selected: Optional[bool] = None
     gpu_render_batches = 0
     gpu_render_fallback_batches = 0
+    gpu_render_probe_gpu_seconds = 0.0
+    gpu_render_probe_cpu_seconds = 0.0
+    gpu_render_wall_seconds = 0.0
+    cpu_render_wall_seconds = 0.0
+    planner_wall_seconds = 0.0
     render_workers = choose_slice_parallel_workers(int(workers), int(mask_mm.shape[0]))
     fused_bridge_merge = bool(interpolation_fused_bridge_merge_enabled())
     rendered_paste_bboxes = (
@@ -2611,11 +2647,37 @@ def interpolate_view_volume_pass_inplace(
                 'YOLO_TTA_GPU_INTERPOLATION_REQUIRED=1 but CUDA interpolation is '
                 f'unavailable: {gpu_renderer_status}'
             )
+        if gpu_renderer is None:
+            gpu_render_selected = False
+        elif not bool(gpu_render_autotune):
+            gpu_render_selected = True
+        if (
+            gpu_renderer is not None
+            and bool(gpu_required)
+            and bool(gpu_radius_requested)
+            and not bool(gpu_renderer.radius_available)
+        ):
+            raise RuntimeError(
+                'YOLO_TTA_GPU_INTERPOLATION_REQUIRED=1 and '
+                'YOLO_TTA_GPU_INTERPOLATION_RADIUS=1, but CUDA radius evaluation '
+                f'is unavailable: {gpu_renderer.radius_failed_reason}'
+            )
         if gpu_renderer is not None:
+            if bool(gpu_radius_requested):
+                radius_backend = 'CUDA (experimental)'
+            elif float(interpolate_min_radius) <= 0.0:
+                radius_backend = 'unused (minimum-radius filter disabled)'
+            else:
+                radius_backend = 'parallel CPU (default)'
+            painting_backend = (
+                'GPU/CPU first-batch autotune'
+                if bool(gpu_render_autotune) else 'required/forced GPU'
+            )
             print(
                 f'CUDA bridge interpolation active on {gpu_renderer_status}: '
-                'min-radius morphology and crop-bounded bridge painting run on-device; '
-                'YOLO_TTA_GPU_INTERPOLATION=0 disables.'
+                f'min-radius evaluator={radius_backend}; bridge painting={painting_backend}. '
+                'YOLO_TTA_GPU_INTERPOLATION=0 disables painting; '
+                'YOLO_TTA_GPU_INTERPOLATION_RADIUS=1 restores the v17.1.1 radius experiment.'
             )
         # Endpoint discovery returns label-major order. Planning is independent per seed
         # and the renderer only ORs sections, so consume the same seeds slice-major to
@@ -2639,6 +2701,9 @@ def interpolate_view_volume_pass_inplace(
             nonlocal plan_batch_peak_payload_bytes, plan_batch_peak_charge_bytes
             nonlocal plan_batch_peak_plans, plan_batches_rendered
             nonlocal gpu_render_batches, gpu_render_fallback_batches
+            nonlocal gpu_render_selected
+            nonlocal gpu_render_probe_gpu_seconds, gpu_render_probe_cpu_seconds
+            nonlocal gpu_render_wall_seconds, cpu_render_wall_seconds
             if not plan_batch:
                 return
 
@@ -2715,8 +2780,45 @@ def interpolate_view_volume_pass_inplace(
                 if rendered_paste_bboxes is not None and bbox_union is not None:
                     rendered_paste_bboxes[int(z)] = np.asarray(bbox_union, dtype=np.int64)
 
+            def _render_batch_cpu() -> float:
+                nonlocal cpu_render_wall_seconds
+                started = time.perf_counter()
+                parallel_for_indices(
+                    len(batch_slices),
+                    _render_batch_slice_cpu,
+                    max_workers=choose_slice_parallel_workers(
+                        int(render_workers), max(1, len(batch_slices)),
+                    ),
+                    desc='Interpolation: render bounded plan batch',
+                    show_progress=False,
+                )
+                elapsed = max(0.0, time.perf_counter() - started)
+                cpu_render_wall_seconds += float(elapsed)
+                return float(elapsed)
+
             gpu_batch_complete = False
-            if gpu_renderer is not None and gpu_renderer.available:
+            cpu_probe_complete = False
+            gpu_batch_seconds = 0.0
+            cpu_probe_seconds = 0.0
+            if (
+                gpu_renderer is not None
+                and gpu_renderer.available
+                and gpu_render_selected is None
+                and len(batch_slices) > 0
+            ):
+                # Time CPU against the real, initially empty destinations.  CUDA then
+                # replays the same OR-idempotent batch, whose kernels still read/write
+                # every patch and pay the real H2D/D2H cost.  The former GPU-first order
+                # timed CPU only after CUDA had populated and warmed the destinations,
+                # systematically understating the cost of CPU-selected later batches.
+                cpu_probe_seconds = _render_batch_cpu()
+                cpu_probe_complete = True
+            if (
+                gpu_renderer is not None
+                and gpu_renderer.available
+                and gpu_render_selected is not False
+            ):
+                gpu_started = time.perf_counter()
                 try:
                     for list_idx, z in enumerate(batch_slices):
                         bbox_union = _initial_bbox_union(int(z))
@@ -2749,7 +2851,11 @@ def interpolate_view_volume_pass_inplace(
                             gpu_result = gpu_renderer.render_slice(destination, jobs)
                             local_added += int(gpu_result.added_voxels)
                             _extend_bbox_union(bbox_union, gpu_result.bbox)
-                        batch_added_counts[int(list_idx)] += np.int64(local_added)
+                        # During autotune, CPU painted this batch first and therefore
+                        # owns its addition count.  CUDA replay should normally add zero;
+                        # never double-account a numerically divergent extra bit here.
+                        if not bool(cpu_probe_complete):
+                            batch_added_counts[int(list_idx)] += np.int64(local_added)
                         if rendered_paste_bboxes is not None and bbox_union is not None:
                             rendered_paste_bboxes[int(z)] = np.asarray(
                                 bbox_union, dtype=np.int64,
@@ -2759,26 +2865,48 @@ def interpolate_view_volume_pass_inplace(
                 except Exception as exc:
                     first_failure = gpu_renderer.disable(exc)
                     gpu_render_fallback_batches += 1
+                    gpu_render_selected = False
                     if bool(gpu_required):
                         raise RuntimeError(
                             'required CUDA interpolation bridge rendering failed'
                         ) from exc
                     if first_failure:
+                        recovery = (
+                            'the CPU autotune trial already completed the batch'
+                            if bool(cpu_probe_complete)
+                            else 'replaying the batch on CPU'
+                        )
                         print(
                             f'Warning: CUDA interpolation bridge rendering failed ({exc}); '
-                            'replaying the batch on CPU and keeping CUDA disabled.'
+                            f'{recovery} and CUDA will remain disabled.'
                         )
+                finally:
+                    gpu_batch_seconds = max(0.0, time.perf_counter() - gpu_started)
+                    gpu_render_wall_seconds += float(gpu_batch_seconds)
 
-            if not gpu_batch_complete:
-                parallel_for_indices(
-                    len(batch_slices),
-                    _render_batch_slice_cpu,
-                    max_workers=choose_slice_parallel_workers(
-                        int(render_workers), max(1, len(batch_slices)),
-                    ),
-                    desc='Interpolation: render bounded plan batch',
-                    show_progress=False,
+            if (
+                bool(gpu_batch_complete)
+                and gpu_render_selected is None
+                and len(batch_slices) > 0
+            ):
+                # Both exact painters have now processed the same nonempty bounded batch.
+                # Require a clear GPU win before the accelerator owns later batches.
+                gpu_render_probe_gpu_seconds = float(gpu_batch_seconds)
+                gpu_render_probe_cpu_seconds = float(cpu_probe_seconds)
+                gpu_render_selected = bool(
+                    float(gpu_batch_seconds) <= 0.95 * max(1.0e-9, float(cpu_probe_seconds))
                 )
+                selected_label = 'GPU' if bool(gpu_render_selected) else 'parallel CPU'
+                print(
+                    f'CUDA bridge painting autotune ({pass_tag}): '
+                    f'{len(plan_batch):,} plan(s), {len(batch_slices):,} slice(s); '
+                    f'GPU={float(gpu_batch_seconds):.3f}s, '
+                    f'CPU trial={float(cpu_probe_seconds):.3f}s -> '
+                    f'{selected_label} for remaining batches.'
+                )
+
+            if not gpu_batch_complete and not cpu_probe_complete:
+                _render_batch_cpu()
             added_voxels += int(np.sum(batch_added_counts, dtype=np.int64))
             plan_batches_rendered += 1
             schedule.clear()
@@ -2804,6 +2932,7 @@ def interpolate_view_volume_pass_inplace(
                 component_cache=component_cache,
                 slice_luts=slice_luts,
                 gpu_renderer=gpu_renderer,
+                gpu_radius_enabled=bool(gpu_radius_requested),
                 gpu_required=bool(gpu_required),
             )
 
@@ -2821,12 +2950,15 @@ def interpolate_view_volume_pass_inplace(
                 max_pending=pending,
             )
 
+        planner_started = time.perf_counter()
         for seed_result in tqdm(iterable, total=len(seeds), desc='Interpolation: seed planning'):
             candidate_connections += int(seed_result.candidate_connections)
             accepted_connections += int(seed_result.accepted_connections)
             default_bridges += int(seed_result.default_bridges)
             walk_back_bridges += int(seed_result.walk_back_bridges)
             skipped_by_min_radius += int(seed_result.skipped_by_min_radius)
+            gpu_radius_attempts += int(seed_result.gpu_radius_attempts)
+            gpu_radius_cpu_fallbacks += int(seed_result.gpu_radius_cpu_fallbacks)
             if seed_result.plans:
                 seed_plans = seed_result.plans
                 seed_result.plans = []
@@ -2853,6 +2985,7 @@ def interpolate_view_volume_pass_inplace(
         del iterable
         _render_plan_batch()
         seeds.clear()
+        planner_wall_seconds = max(0.0, time.perf_counter() - planner_started)
 
         cache_telemetry = component_cache.telemetry()
         component_cache.clear()
@@ -2868,6 +3001,28 @@ def interpolate_view_volume_pass_inplace(
             f'seed schedule '
             f'{"cost-balanced/" + str(seed_schedule_window) if seed_schedule_window else "slice-major"} '
             f'(max cost {max_seed_planning_cost:,}).'
+        )
+        live_gpu_telemetry = (
+            gpu_renderer.telemetry() if gpu_renderer is not None else {}
+        )
+        render_choice = (
+            'gpu' if gpu_render_selected is True
+            else ('cpu' if gpu_render_selected is False else 'not-probed')
+        )
+        print(
+            f'Interpolation timing ({pass_tag}): planner+bounded-render='
+            f'{float(planner_wall_seconds):.3f}s; GPU render wall='
+            f'{float(gpu_render_wall_seconds):.3f}s; CPU render wall='
+            f'{float(cpu_render_wall_seconds):.3f}s; render choice={render_choice}; '
+            f'CUDA radius lock-wait='
+            f'{float(live_gpu_telemetry.get("radius_lock_wait_seconds", 0.0)):.3f}s; '
+            f'CUDA radius execution='
+            f'{float(live_gpu_telemetry.get("radius_execution_seconds", 0.0)):.3f}s; '
+            f'CUDA render execution='
+            f'{float(live_gpu_telemetry.get("render_execution_seconds", 0.0)):.3f}s; '
+            f'render crop/patch pixels='
+            f'{int(live_gpu_telemetry.get("render_crop_pixels", 0)):,}/'
+            f'{int(live_gpu_telemetry.get("render_patch_pixels", 0)):,}.'
         )
 
         if planned_plan_count > 0:
@@ -3102,6 +3257,32 @@ def interpolate_view_volume_pass_inplace(
                 except OSError:
                     pass
 
+    gpu_radius_active = bool(
+        int(gpu_renderer_telemetry.get('estimated_plans', 0)) > 0
+    )
+    if float(interpolate_min_radius) <= 0.0:
+        interpolation_radius_backend = 'disabled'
+    elif bool(gpu_radius_requested):
+        interpolation_radius_backend = (
+            'cuda_cupy+cpu_fallback'
+            if int(gpu_radius_cpu_fallbacks) > 0
+            else ('cuda_cupy' if int(gpu_radius_attempts) > 0 else 'cpu_numpy_numba')
+        )
+    else:
+        interpolation_radius_backend = 'cpu_numpy_numba'
+    gpu_render_active = bool(
+        int(gpu_renderer_telemetry.get('rendered_slices', 0)) > 0
+    )
+    if bool(gpu_render_active):
+        if gpu_renderer_telemetry.get('failed_reason'):
+            interpolation_render_backend = 'cuda_cupy_crop_bounded+cpu_fallback'
+        elif bool(gpu_render_autotune) and gpu_render_selected is False:
+            interpolation_render_backend = 'cuda_cupy_probe+cpu_numpy_numba'
+        else:
+            interpolation_render_backend = 'cuda_cupy_crop_bounded'
+    else:
+        interpolation_render_backend = 'cpu_numpy_numba'
+
     result_stats: Dict[str, object] = {
         'num_objects': int(num_objects),
         'num_endpoints': int(num_endpoints),
@@ -3127,6 +3308,9 @@ def interpolate_view_volume_pass_inplace(
         ),
         'planner_seed_schedule_window': int(seed_schedule_window),
         'planner_seed_max_cost': int(max_seed_planning_cost),
+        'planner_wall_seconds': float(planner_wall_seconds),
+        'planner_gpu_render_wall_seconds': float(gpu_render_wall_seconds),
+        'planner_cpu_render_wall_seconds': float(cpu_render_wall_seconds),
         'bridge_component_count': int(component_count),
         'bridge_component_render_storage': (
             f'packed_{component_word_dtype.name}_membership_bitplanes'
@@ -3137,21 +3321,34 @@ def interpolate_view_volume_pass_inplace(
             int(component_word_count)
             * array_nbytes(tuple(int(v) for v in np.asarray(mask_mm).shape), component_word_dtype)
         ),
-        'interpolation_render_backend': (
-            'cuda_cupy_crop_bounded'
-            + ('+cpu_fallback' if gpu_renderer_telemetry.get('failed_reason') else '')
-            if (
-                int(gpu_renderer_telemetry.get('estimated_plans', 0)) > 0
-                or int(gpu_renderer_telemetry.get('rendered_slices', 0)) > 0
-            )
-            else 'cpu_numpy_numba'
-        ),
+        'interpolation_render_backend': str(interpolation_render_backend),
+        'interpolation_radius_backend': str(interpolation_radius_backend),
         'gpu_interpolation_status': str(gpu_renderer_status),
+        'gpu_interpolation_visible_device_token': (
+            gpu_renderer_telemetry.get('visible_device_token')
+        ),
         'gpu_interpolation_active': bool(
             int(gpu_renderer_telemetry.get('estimated_plans', 0)) > 0
             or int(gpu_renderer_telemetry.get('rendered_slices', 0)) > 0
         ),
         'gpu_interpolation_required': bool(gpu_required),
+        'gpu_interpolation_render_autotune_enabled': bool(gpu_render_autotune),
+        'gpu_interpolation_render_selected': (
+            None if gpu_render_selected is None else bool(gpu_render_selected)
+        ),
+        'gpu_interpolation_render_probe_gpu_seconds': float(
+            gpu_render_probe_gpu_seconds
+        ),
+        'gpu_interpolation_render_probe_cpu_seconds': float(
+            gpu_render_probe_cpu_seconds
+        ),
+        'gpu_interpolation_radius_enabled': bool(gpu_radius_configured),
+        'gpu_interpolation_radius_active': bool(gpu_radius_active),
+        'gpu_interpolation_radius_attempts': int(gpu_radius_attempts),
+        'gpu_interpolation_radius_fallback_plans': int(gpu_radius_cpu_fallbacks),
+        'gpu_interpolation_radius_fallback_reason': (
+            gpu_renderer_telemetry.get('radius_failed_reason')
+        ),
         'gpu_interpolation_batches': int(gpu_render_batches),
         'gpu_interpolation_fallback_batches': int(gpu_render_fallback_batches),
         'gpu_interpolation_estimated_plans': int(
@@ -3178,10 +3375,49 @@ def interpolate_view_volume_pass_inplace(
         'gpu_interpolation_cache_misses': int(
             gpu_renderer_telemetry.get('cache_misses', 0)
         ),
+        'gpu_interpolation_cache_evictions': int(
+            gpu_renderer_telemetry.get('cache_evictions', 0)
+        ),
+        'gpu_interpolation_cache_evicted_bytes': int(
+            gpu_renderer_telemetry.get('cache_evicted_bytes', 0)
+        ),
         'gpu_interpolation_cache_peak_bytes': int(
             gpu_renderer_telemetry.get('cache_peak_bytes', 0)
         ),
+        'gpu_interpolation_sdf_host_to_device_bytes': int(
+            gpu_renderer_telemetry.get('sdf_host_to_device_bytes', 0)
+        ),
+        'gpu_interpolation_section_host_to_device_bytes': int(
+            gpu_renderer_telemetry.get('section_host_to_device_bytes', 0)
+        ),
+        'gpu_interpolation_destination_host_to_device_bytes': int(
+            gpu_renderer_telemetry.get('destination_host_to_device_bytes', 0)
+        ),
+        'gpu_interpolation_destination_device_to_host_bytes': int(
+            gpu_renderer_telemetry.get('destination_device_to_host_bytes', 0)
+        ),
+        'gpu_interpolation_metrics_device_to_host_bytes': int(
+            gpu_renderer_telemetry.get('metrics_device_to_host_bytes', 0)
+        ),
+        'gpu_interpolation_render_crop_pixels': int(
+            gpu_renderer_telemetry.get('render_crop_pixels', 0)
+        ),
+        'gpu_interpolation_render_patch_pixels': int(
+            gpu_renderer_telemetry.get('render_patch_pixels', 0)
+        ),
         'gpu_interpolation_fallback_reason': gpu_renderer_telemetry.get('failed_reason'),
+        'gpu_interpolation_radius_lock_wait_seconds': float(
+            gpu_renderer_telemetry.get('radius_lock_wait_seconds', 0.0)
+        ),
+        'gpu_interpolation_radius_execution_seconds': float(
+            gpu_renderer_telemetry.get('radius_execution_seconds', 0.0)
+        ),
+        'gpu_interpolation_render_lock_wait_seconds': float(
+            gpu_renderer_telemetry.get('render_lock_wait_seconds', 0.0)
+        ),
+        'gpu_interpolation_render_execution_seconds': float(
+            gpu_renderer_telemetry.get('render_execution_seconds', 0.0)
+        ),
     }
     result_stats.update(cache_telemetry)
     result_stats['bridge_component_deltas'] = _bridge_component_stats(
