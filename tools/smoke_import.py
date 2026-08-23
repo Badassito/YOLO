@@ -1,12 +1,13 @@
 """Import the refactored package with lightweight native-dependency stubs.
 
 The development runtime does not ship OpenCV/SciPy.  These stubs exercise Python import
-order, circular-dependency safety, and eager module initialization without pretending to
+order, the acyclic package graph, and eager module initialization without pretending to
 validate numerical kernels.
 """
 
 from __future__ import annotations
 
+import ast
 import importlib
 import builtins
 import dis
@@ -80,11 +81,24 @@ def unresolved_function_globals(module: types.ModuleType) -> set[str]:
         if inspect.isfunction(value) and value.__module__ == module.__name__:
             functions.append(value)
         elif inspect.isclass(value) and value.__module__ == module.__name__:
-            functions.extend(
-                member
-                for member in vars(value).values()
-                if inspect.isfunction(member) and member.__module__ == module.__name__
-            )
+            for member in vars(value).values():
+                candidates: tuple[object, ...]
+                if isinstance(member, (staticmethod, classmethod)):
+                    candidates = (member.__func__,)
+                elif isinstance(member, property):
+                    candidates = tuple(
+                        accessor
+                        for accessor in (member.fget, member.fset, member.fdel)
+                        if accessor is not None
+                    )
+                else:
+                    candidates = (member,)
+                functions.extend(
+                    candidate
+                    for candidate in candidates
+                    if inspect.isfunction(candidate)
+                    and candidate.__module__ == module.__name__
+                )
         for function in functions:
             function_globals = function.__globals__
             for code in _code_objects(function.__code__):
@@ -95,6 +109,48 @@ def unresolved_function_globals(module: types.ModuleType) -> set[str]:
                     if name not in function_globals and name not in builtin_names:
                         missing.add(name)
     return missing
+
+
+def eager_package_dependencies(module_name: str, known_modules: set[str]) -> set[str]:
+    """Return package subsystems imported while ``module_name`` initializes."""
+
+    path = ROOT / "volume_tta" / f"{module_name}.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    dependencies: set[str] = set()
+    for node in tree.body:
+        if not isinstance(node, ast.ImportFrom) or node.level != 1 or not node.module:
+            continue
+        provider = node.module.partition(".")[0]
+        if provider in known_modules:
+            dependencies.add(provider)
+        if any(alias.name == "*" for alias in node.names):
+            raise RuntimeError(f"wildcard package import remains in {module_name}: {node.module}")
+    return dependencies
+
+
+def assert_acyclic_eager_imports(module_names: tuple[str, ...]) -> None:
+    known_modules = set(module_names)
+    graph = {
+        name: eager_package_dependencies(name, known_modules)
+        for name in module_names
+    }
+    visiting: list[str] = []
+    visited: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in visiting:
+            cycle = visiting[visiting.index(name):] + [name]
+            raise RuntimeError(f"eager package import cycle: {' -> '.join(cycle)}")
+        if name in visited:
+            return
+        visiting.append(name)
+        for dependency in sorted(graph[name]):
+            visit(dependency)
+        visiting.pop()
+        visited.add(name)
+
+    for name in module_names:
+        visit(name)
 
 
 def main() -> None:
@@ -117,6 +173,8 @@ def main() -> None:
         "outputs",
         "pipeline",
     )
+    assert_acyclic_eager_imports(default_modules)
+    print("eager package import graph is acyclic")
     requested = [str(name).strip() for name in sys.argv[1:] if str(name).strip()]
     unknown = sorted(set(requested) - set(default_modules))
     if unknown:
@@ -126,12 +184,6 @@ def main() -> None:
     for name in modules:
         loaded_modules.append(importlib.import_module(f"volume_tta.{name}"))
         print(f"imported volume_tta.{name}")
-    from volume_tta._latebind import unresolved_bindings
-
-    unresolved = unresolved_bindings()
-    if unresolved:
-        raise RuntimeError(f"unresolved callable dependencies: {unresolved}")
-    print("all callable-only dependencies resolved")
     missing_globals = {
         module.__name__: sorted(unresolved_function_globals(module))
         for module in loaded_modules

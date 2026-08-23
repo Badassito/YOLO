@@ -6,7 +6,13 @@ behavior. Public coordination contracts live under ``inference_backends``.
 
 from __future__ import annotations
 
-from ._stdlib import *
+import os
+import re
+from pathlib import Path
+from typing import (
+    Dict,
+    Optional,
+)
 import numpy as np
 
 def _read_meminfo_bytes() -> Dict[str, int]:

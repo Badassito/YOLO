@@ -6,7 +6,45 @@ behavior. Public coordination contracts live under ``inference_backends``.
 
 from __future__ import annotations
 
-from ._stdlib import *
+import atexit
+import colorsys
+import contextlib
+import gc
+import io
+import json
+import math
+import os
+import re
+import shutil
+import struct
+import subprocess
+import tempfile
+import threading
+import time
+import zlib
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
+)
+from dataclasses import (
+    dataclass,
+    field,
+    replace as dataclasses_replace,
+)
+from functools import lru_cache
+from pathlib import Path
+from typing import (
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+)
 import numpy as np
 from ._deps import _numba, cv2, tifffile, tqdm
 
@@ -17,6 +55,75 @@ from .config import (
 from .runtime import (
     runtime_telemetry,
     runtime_telemetry_phase,
+)
+
+# Explicit lower-layer dependencies keep imports one-way.
+from .config import (
+    ChannelFormat,
+    NRRD_SPACE,
+    SCRIPT_BASENAME,
+    _parse_token_list,
+    resolve_channel_format,
+    variant_nrrd_stem,
+)
+from .workspace import (
+    _cpu_count,
+    _env_flag,
+    _env_float,
+    _env_int,
+    available_anon_work_bytes,
+)
+from .runtime import (
+    _acquire_parallel_pool,
+    _release_parallel_pool,
+    _settle_parallel_futures,
+    allocate_workspace_array,
+    choose_parallel_chunk_size,
+    choose_slice_parallel_workers,
+    close_memmap_array,
+    flush_array,
+    parallel_for_indices,
+    parallel_for_indices_chunked,
+)
+from .media import (
+    _linear_source_index,
+    _memory_backed_encoded_chunk_path,
+    _memory_backed_encoded_chunk_size,
+    _open_memory_backed_encoded_chunk,
+    _resize_gray_slice_nearest_or_linear,
+    _spawn_subprocess_with_retry,
+    close_ffmpeg_writer,
+    ffmpeg_ffv1_gray_writer,
+    ffmpeg_ffv1_rgb_writer,
+    ffmpeg_rawvideo_writer,
+)
+from .geometry import (
+    ChannelFormattedFrameRenderer,
+    ViewInfo,
+    get_view_frame_by_index,
+)
+from .interpolation import (
+    CTILE_INDEX_DTYPE,
+    MASK_STORE_FORMATS,
+    NrrdLayerRef,
+    NrrdRasterPlan,
+    NrrdSegmentExtent,
+    RawBBoxMaskStore,
+    _coerce_segment_extent,
+    _nrrd_empty_segment_extent,
+    _release_raw_store_chunks_ram_cache,
+)
+from .cuda_d1 import (
+    _read_binary_volume_slice_bool,
+    _read_binary_volume_slice_u8,
+    _sanitize_nrrd_layer_token,
+    _volume_shape_tuple,
+)
+from .backprojection import (
+    _MainProcessGpuStageLease,
+    _announce_main_gpu_stage_skip_once,
+    _trim_main_process_cuda_device,
+    _try_acquire_main_process_gpu_stage,
 )
 
 _OVERLAY_BLUE_U16 = np.array([0, 0, 255], dtype=np.uint16)  # RGB blue in the uint16 blend domain
@@ -2251,6 +2358,8 @@ def nrrd_layer_output_suffix(
     source: str,
     mask_kind: str,
     pass_index: int = 0,
+    interpolation_walk_back_index: int = 0,
+    interpolation_candidate_index: int = 0,
     tile_config_id: str = '',
     tile_acceptance: str = '',
     stage: str = '',
@@ -2271,13 +2380,25 @@ def nrrd_layer_output_suffix(
     vt = _sanitize_nrrd_layer_token(view_token) or 'view'
     if source_l == 'fullframe':
         if mask_kind_l == 'bridge':
-            return f'{vt}_fullframe_bridge_pass{int(pass_index):02d}'
+            suffix = f'{vt}_fullframe_bridge_pass{int(pass_index):02d}'
+            if int(interpolation_walk_back_index) > 0 and int(interpolation_candidate_index) > 0:
+                suffix += (
+                    f'_walkback{int(interpolation_walk_back_index):02d}'
+                    f'_candidate{int(interpolation_candidate_index):02d}'
+                )
+            return suffix
         return f'{vt}_fullframe_yolo'
     if source_l == 'tile':
         config = _sanitize_nrrd_layer_token(tile_config_id) if tile_config_id else ''
         config_part = f'_{config}' if config else ''
         if mask_kind_l == 'bridge':
-            return f'{vt}_tile{config_part}_bridge_pass{int(pass_index):02d}'
+            suffix = f'{vt}_tile{config_part}_bridge_pass{int(pass_index):02d}'
+            if int(interpolation_walk_back_index) > 0 and int(interpolation_candidate_index) > 0:
+                suffix += (
+                    f'_walkback{int(interpolation_walk_back_index):02d}'
+                    f'_candidate{int(interpolation_candidate_index):02d}'
+                )
+            return suffix
         acceptance = _sanitize_nrrd_layer_token(tile_acceptance) or 'parent_support'
         return f'{vt}_tile{config_part}_yolo_{acceptance}'
     parts = [vt, source_l or 'layer', mask_kind_l or 'mask']
@@ -3232,6 +3353,8 @@ class NrrdLayerSink:
                 'source': getattr(ref, 'source', ''),
                 'mask_kind': getattr(ref, 'mask_kind', ''),
                 'pass_index': int(getattr(ref, 'pass_index', 0)),
+                'interpolation_walk_back_index': int(getattr(ref, 'interpolation_walk_back_index', 0)),
+                'interpolation_candidate_index': int(getattr(ref, 'interpolation_candidate_index', 0)),
                 'tile_config_id': getattr(ref, 'tile_config_id', ''),
                 'tile_acceptance': getattr(ref, 'tile_acceptance', ''),
                 'stage': getattr(ref, 'stage', ''),
@@ -3280,6 +3403,8 @@ class NrrdLayerSink:
                     'source': getattr(ref, 'source', ''),
                     'mask_kind': getattr(ref, 'mask_kind', ''),
                     'pass_index': int(getattr(ref, 'pass_index', 0)),
+                    'interpolation_walk_back_index': int(getattr(ref, 'interpolation_walk_back_index', 0)),
+                    'interpolation_candidate_index': int(getattr(ref, 'interpolation_candidate_index', 0)),
                     'tile_config_id': getattr(ref, 'tile_config_id', ''),
                     'tile_acceptance': getattr(ref, 'tile_acceptance', ''),
                     'stage': getattr(ref, 'stage', ''),
@@ -5274,82 +5399,3 @@ def write_summary_file(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines) + "\n")
     return out_path
-
-
-# Late imports keep callable-only dependency cycles import-safe.
-from ._latebind import bind_late_symbols as _bind_late_symbols
-
-_bind_late_symbols(
-    __name__,
-    globals(),
-    {
-        "backprojection": (
-            "_MainProcessGpuStageLease",
-            "_announce_main_gpu_stage_skip_once",
-            "_trim_main_process_cuda_device",
-            "_try_acquire_main_process_gpu_stage",
-        ),
-        "config": (
-            "ChannelFormat",
-            "GIB",
-            "NRRD_SPACE",
-            "SCRIPT_BASENAME",
-            "_parse_token_list",
-            "resolve_channel_format",
-            "variant_nrrd_stem",
-        ),
-        "cuda_d1": (
-            "_read_binary_volume_slice_bool",
-            "_read_binary_volume_slice_u8",
-            "_sanitize_nrrd_layer_token",
-            "_volume_shape_tuple",
-        ),
-        "geometry": (
-            "ChannelFormattedFrameRenderer",
-            "ViewInfo",
-            "get_view_frame_by_index",
-        ),
-        "interpolation": (
-            "CTILE_INDEX_DTYPE",
-            "MASK_STORE_FORMATS",
-            "NrrdLayerRef",
-            "NrrdRasterPlan",
-            "NrrdSegmentExtent",
-            "RawBBoxMaskStore",
-            "_coerce_segment_extent",
-            "_nrrd_empty_segment_extent",
-            "_release_raw_store_chunks_ram_cache",
-        ),
-        "media": (
-            "_linear_source_index",
-            "_memory_backed_encoded_chunk_path",
-            "_memory_backed_encoded_chunk_size",
-            "_open_memory_backed_encoded_chunk",
-            "_resize_gray_slice_nearest_or_linear",
-            "_spawn_subprocess_with_retry",
-            "close_ffmpeg_writer",
-            "ffmpeg_ffv1_gray_writer",
-            "ffmpeg_ffv1_rgb_writer",
-            "ffmpeg_rawvideo_writer",
-        ),
-        "runtime": (
-            "_acquire_parallel_pool",
-            "_release_parallel_pool",
-            "_settle_parallel_futures",
-            "allocate_workspace_array",
-            "choose_parallel_chunk_size",
-            "choose_slice_parallel_workers",
-            "close_memmap_array",
-            "flush_array",
-            "parallel_for_indices",
-            "parallel_for_indices_chunked",
-        ),
-        "workspace": (
-            "_cpu_count",
-            "_env_flag",
-            "_env_float",
-            "_env_int",
-            "available_anon_work_bytes",
-        ),
-    },
-)

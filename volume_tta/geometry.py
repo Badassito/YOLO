@@ -6,7 +6,36 @@ behavior. Public coordination contracts live under ``inference_backends``.
 
 from __future__ import annotations
 
-from ._stdlib import *
+import argparse
+import json
+import math
+import os
+import queue
+import re
+import threading
+from collections import (
+    OrderedDict,
+    deque,
+)
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+)
+from dataclasses import (
+    dataclass,
+    replace as dataclasses_replace,
+)
+from pathlib import Path
+from typing import (
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    TYPE_CHECKING,
+    Tuple,
+)
 import numpy as np
 from ._deps import cv2
 
@@ -15,6 +44,56 @@ from .config import (
     DEFAULT_CHANNEL_FORMAT,
     GIB,
 )
+
+# Explicit lower-layer dependencies keep imports one-way.
+from .config import (
+    CARTESIAN_VIEW_TOKENS,
+    RADIAL_VIEW_TOKENS,
+    TiltedViewGroup,
+    _parse_comma_slot,
+    _resolve_unique_view_tokens,
+    _split_structured_group,
+    _structured_group_values,
+    quantize_uses_fp16,
+    resolve_cartesian_views,
+    resolve_channel_format,
+)
+from .workspace import (
+    _TILTED_IDENTITY_M,
+    _cpu_count,
+    _env_flag,
+    _env_float,
+    _env_int,
+    _tilted_grid_is_identity,
+    tilted_inplane_linear_enabled,
+)
+from .runtime import (
+    _sanitize_filesystem_token,
+    allocate_workspace_array,
+    choose_parallel_chunk_size,
+    choose_slice_parallel_workers,
+    close_memmap_array,
+    close_memmap_array_without_flush,
+    flush_array,
+    parallel_for_indices,
+    parallel_for_indices_chunked,
+    prediction_volume_build_flush_enabled,
+)
+from .media import (
+    wait_for_volume_ready,
+    wait_for_volume_slice_ready,
+)
+
+
+if TYPE_CHECKING:
+    from .inference import (
+        canonical_single_device,
+        inference_batch_size,
+    )
+    from .cuda_backend import (
+        GpuRenderedYoloSource,
+        GpuTileRenderedYoloSource,
+    )
 
 @dataclass(frozen=True)
 class AffineSpec:
@@ -1343,6 +1422,232 @@ def channel_view_slice_index(view: ViewInfo, index: int) -> int:
     """Resolve one contextual channel index under the view family's boundary policy."""
     return int(channel_view_slice_source(view, index)[0])
 
+
+@dataclass(frozen=True)
+class BatchResultFrameSpec:
+    """Logical destination for one result emitted by a fixed-batch source.
+
+    Ordinary frames retain their task-local index. A final-batch Radial extension is a
+    real seam augmentation: its global destination wraps within the view and its native
+    radial-u coordinate is reversed again only after an odd number of seam crossings.
+    Cartesian extensions deliberately return no spec and retain the legacy discard policy.
+    """
+
+    result_index: int
+    task_index: int
+    global_destination_index: int
+    mirror_radial_u: bool
+    radial_padding_ordinal: Optional[int] = None
+
+    @property
+    def is_radial_padding(self) -> bool:
+        return self.radial_padding_ordinal is not None
+
+
+RADIAL_BATCH_PADDING_TILE_SUFFIX = '__radial_batch_seam'
+
+
+def radial_batch_padding_tile_id(tile_id: str, *, mirror_radial_u: bool = True) -> str:
+    """Return the scheduler identity for one tile's seam-augmentation result."""
+    parity = 'mirrored' if bool(mirror_radial_u) else 'unmirrored'
+    return f'{str(tile_id)}{RADIAL_BATCH_PADDING_TILE_SUFFIX}_{parity}'
+
+
+def mirrored_radial_parent_crop(
+    parent_crop: Sequence[int], parent_width: int,
+) -> Tuple[int, int, int, int]:
+    """Mirror a crop footprint along the native radial-u (parent-x) axis."""
+    py0, py1, px0, px1 = (int(value) for value in parent_crop)
+    width = int(parent_width)
+    if not (0 <= px0 <= px1 <= width):
+        raise ValueError(
+            f'Cannot mirror radial parent crop {(py0, py1, px0, px1)} '
+            f'across width {width}'
+        )
+    return (int(py0), int(py1), int(width - px1), int(width - px0))
+
+
+def radial_batch_padding_count(
+    view: Optional[ViewInfo],
+    num_frames: int,
+    batch_size: int,
+    *,
+    slice_offset: int = 0,
+) -> int:
+    """Return final fixed-batch slots that cross a Radial view's 0/180 seam."""
+
+    count = max(0, int(num_frames))
+    batch = max(1, int(batch_size))
+    if (
+        view is None
+        or not is_radial_view(view)
+        or count <= 0
+        or int(slice_offset) + count != int(view.num_slices)
+    ):
+        return 0
+    return int((-count) % batch)
+
+
+def batch_result_frame_spec_for_view(
+    view: Optional[ViewInfo],
+    result_index: int,
+    *,
+    num_frames: int,
+    batch_size: int,
+    slice_offset: int = 0,
+) -> Optional[BatchResultFrameSpec]:
+    """Resolve one streamed result under the view family's final-batch policy."""
+
+    index = int(result_index)
+    count = max(0, int(num_frames))
+    offset = int(slice_offset)
+    if index < 0:
+        return None
+    if index < count:
+        return BatchResultFrameSpec(
+            result_index=index,
+            task_index=index,
+            global_destination_index=offset + index,
+            mirror_radial_u=False,
+        )
+    padding_count = radial_batch_padding_count(
+        view, count, int(batch_size), slice_offset=offset,
+    )
+    padding_ordinal = int(index) - int(count)
+    if padding_ordinal < 0 or padding_ordinal >= int(padding_count) or view is None:
+        return None
+    destination, mirror_u = channel_view_slice_source(view, offset + index)
+    return BatchResultFrameSpec(
+        result_index=index,
+        task_index=index,
+        global_destination_index=int(destination),
+        mirror_radial_u=bool(mirror_u),
+        radial_padding_ordinal=int(padding_ordinal),
+    )
+
+
+def radial_batch_padding_frame_specs(
+    view: Optional[ViewInfo],
+    num_frames: int,
+    batch_size: int,
+    *,
+    slice_offset: int = 0,
+) -> Tuple[BatchResultFrameSpec, ...]:
+    """Describe every real Radial seam-extension slot in final-batch order."""
+
+    padding_count = radial_batch_padding_count(
+        view, int(num_frames), int(batch_size), slice_offset=int(slice_offset),
+    )
+    specs: List[BatchResultFrameSpec] = []
+    for ordinal in range(int(padding_count)):
+        spec = batch_result_frame_spec_for_view(
+            view,
+            int(num_frames) + int(ordinal),
+            num_frames=int(num_frames),
+            batch_size=int(batch_size),
+            slice_offset=int(slice_offset),
+        )
+        if spec is None or not bool(spec.is_radial_padding):
+            raise RuntimeError(
+                f'Radial padding slot {ordinal}/{padding_count} produced no frame mapping'
+            )
+        specs.append(spec)
+    return tuple(specs)
+
+
+def radial_batch_padding_mirror_groups(
+    view: Optional[ViewInfo],
+    num_frames: int,
+    batch_size: int,
+    *,
+    slice_offset: int = 0,
+) -> Tuple[bool, ...]:
+    """Return the ordered radial-u parity groups needed by auxiliary tile results."""
+
+    parities = {
+        bool(spec.mirror_radial_u)
+        for spec in radial_batch_padding_frame_specs(
+            view,
+            int(num_frames),
+            int(batch_size),
+            slice_offset=int(slice_offset),
+        )
+    }
+    # Keep the common first-crossing mirrored result first for deterministic scheduling.
+    return tuple(parity for parity in (True, False) if parity in parities)
+
+
+def radial_batch_padding_tile_result_ids(
+    tile_id: str,
+    view: Optional[ViewInfo],
+    num_frames: int,
+    batch_size: int,
+    *,
+    slice_offset: int = 0,
+) -> Tuple[str, ...]:
+    """Return every completion ID owed by one logical tile inference task.
+
+    Parity-group IDs are present even when their masks are empty after inference. This
+    makes scheduler completion depend on cleanup/gating retirement rather than foreground
+    statistics, so padding-only and fully empty tiles cannot finalize a parent early.
+    """
+
+    result_ids = [str(tile_id)]
+    result_ids.extend(
+        radial_batch_padding_tile_id(
+            str(tile_id), mirror_radial_u=bool(parity),
+        )
+        for parity in radial_batch_padding_mirror_groups(
+            view,
+            int(num_frames),
+            int(batch_size),
+            slice_offset=int(slice_offset),
+        )
+    )
+    return tuple(result_ids)
+
+
+def prediction_result_frame_spec(
+    source: object,
+    result_index: int,
+    *,
+    num_frames: int,
+) -> Optional[BatchResultFrameSpec]:
+    """Return a source's result mapping, unwrapping staging adapters when necessary."""
+
+    resolver = getattr(source, 'result_frame_spec', None)
+    if callable(resolver):
+        return resolver(int(result_index))
+    base = getattr(source, 'base_source', None)
+    if base is not None and base is not source:
+        return prediction_result_frame_spec(base, int(result_index), num_frames=int(num_frames))
+    if 0 <= int(result_index) < int(num_frames):
+        return BatchResultFrameSpec(
+            result_index=int(result_index),
+            task_index=int(result_index),
+            global_destination_index=int(result_index),
+            mirror_radial_u=False,
+        )
+    return None
+
+
+def mirror_radial_u_output_to_native_affine(
+    M_out_to_native: np.ndarray,
+    native_width: int,
+) -> np.ndarray:
+    """Compose output-to-native sampling with a destination-space radial-u reversal."""
+
+    matrix = np.asarray(M_out_to_native, dtype=np.float32).reshape(2, 3)
+    homogeneous = np.eye(3, dtype=np.float32)
+    homogeneous[:2, :3] = matrix
+    mirror = np.asarray(
+        [[-1.0, 0.0, float(max(0, int(native_width) - 1))],
+         [0.0, 1.0, 0.0],
+         [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+    return np.ascontiguousarray((mirror @ homogeneous)[:2, :3], dtype=np.float32)
+
 class ChannelFormattedFrameRenderer:
     """Build one model input from independently rendered view planes.
 
@@ -1471,6 +1776,7 @@ class PredictionVolumeRef:
     kind: str = 'fullframe'
     source: Optional[object] = None
     channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT
+    view: Optional[ViewInfo] = None
 
 def close_prediction_volume_ref(ref: Optional[PredictionVolumeRef], *, keep_temp: bool = False) -> None:
     """Release one prediction source and remove any fallback backing file."""
@@ -1510,10 +1816,11 @@ class InMemoryYoloVolumeSource:
  Ultralytics' public Python API accepts in-memory numpy inputs, but its built-in
  ``LoadPilAndNumpy`` loader treats a list of arrays as one large batch. This
  loader lets the predictor consume a 3-D gray volume or 4-D H×W×C volume
- incrementally with ``stream=True`` and the requested ``--batch``. The final
- batch repeats the final complete channel-formatted center frame so fixed-batch
- engines always receive the same batch size. Downstream accumulation discards
- synthetic padded results."""
+ incrementally with ``stream=True`` and the requested ``--batch``. Cartesian
+ sources extend a final partial batch by repeating the last real frame and
+ discard those synthetic results. Radial sources instead wrap across the
+ 0/180-degree seam, mirror radial-u after an odd crossing, inverse-map the
+ predictions, and union them into the wrapped destination slices."""
 
     def __init__(
         self,
@@ -1522,6 +1829,9 @@ class InMemoryYoloVolumeSource:
         batch_size: int = 1,
         max_frames: Optional[int] = None,
         channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
+        view: Optional[ViewInfo] = None,
+        slice_offset: int = 0,
+        logical_num_frames: Optional[int] = None,
     ) -> None:
         if volume_gray is None:
             raise ValueError('InMemoryYoloVolumeSource requires a volume array')
@@ -1543,12 +1853,20 @@ class InMemoryYoloVolumeSource:
                 f'--channel_format {self.channel_format.token} requires {int(self.channel_count)} channels'
             )
         self.name = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(name)).strip('_') or 'in_memory_volume'
-        self.nf = int(self.volume_gray.shape[0])
+        self.view = view
+        self.slice_offset = int(slice_offset)
+        available_frames = int(self.volume_gray.shape[0])
+        self.nf = int(
+            available_frames if logical_num_frames is None else min(available_frames, int(logical_num_frames))
+        )
         if max_frames is not None:
             self.nf = max(0, min(self.nf, int(max_frames)))
         self.bs = max(1, int(batch_size))
         self.yield_nf = int(math.ceil(float(self.nf) / float(self.bs)) * self.bs) if self.nf > 0 else 0
         self.synthetic_count = max(0, int(self.yield_nf) - int(self.nf))
+        self.radial_padding_count = radial_batch_padding_count(
+            self.view, self.nf, self.bs, slice_offset=self.slice_offset,
+        )
         self.mode = 'image'
         self.count = 0
         try:
@@ -1564,6 +1882,15 @@ class InMemoryYoloVolumeSource:
 
     def __len__(self) -> int:
         return int(math.ceil(float(self.nf) / float(self.bs))) if self.nf > 0 else 0
+
+    def result_frame_spec(self, result_index: int) -> Optional[BatchResultFrameSpec]:
+        return batch_result_frame_spec_for_view(
+            self.view,
+            int(result_index),
+            num_frames=self.nf,
+            batch_size=self.bs,
+            slice_offset=self.slice_offset,
+        )
 
     @staticmethod
     def _frame_to_model_channels(frame: np.ndarray, channel_count: int) -> np.ndarray:
@@ -1594,14 +1921,42 @@ class InMemoryYoloVolumeSource:
         info: List[str] = []
         last_real_idx = max(0, int(self.nf) - 1)
         for idx in range(start, stop):
-            real_idx = int(idx) if int(idx) < int(self.nf) else int(last_real_idx)
+            spec = self.result_frame_spec(int(idx))
+            radial_wrap = bool(spec is not None and spec.is_radial_padding)
+            if int(idx) < int(self.nf):
+                real_idx = int(idx)
+            elif radial_wrap and int(idx) < int(self.volume_gray.shape[0]):
+                # Official materialized Radial refs include renderer-produced seam frames,
+                # preserving native-before-affine mirroring for nonzero TTA rotations.
+                real_idx = int(idx)
+            elif radial_wrap and spec is not None:
+                # Compatibility for callers that provide only the logical frames. This is
+                # exact for identity/post-affine-symmetric jobs; package-created refs use the
+                # renderer-produced branch above.
+                real_idx = int(spec.global_destination_index)
+            else:
+                real_idx = int(last_real_idx)
             synthetic = int(idx) >= int(self.nf)
-            suffix = '_synthetic' if synthetic else ''
+            suffix = '_radial_wrap' if radial_wrap else ('_synthetic' if synthetic else '')
             paths.append(f'{self.name}_{idx + 1:06d}{suffix}.png')
-            imgs.append(self._frame_to_model_channels(
+            frame = self._frame_to_model_channels(
                 self.volume_gray[int(real_idx)], int(self.channel_count)
-            ))
-            if synthetic:
+            )
+            if (
+                radial_wrap
+                and spec is not None
+                and bool(spec.mirror_radial_u)
+                and int(idx) >= int(self.volume_gray.shape[0])
+            ):
+                frame = np.ascontiguousarray(frame[:, ::-1])
+            imgs.append(frame)
+            if radial_wrap and spec is not None:
+                info.append(
+                    f'in-memory {self.name} radial seam extension {idx + 1}/{self.yield_nf} '
+                    f'wraps to slice {int(spec.global_destination_index) + 1}/{int(self.view.num_slices)} '
+                    f'with radial-u {"mirrored" if spec.mirror_radial_u else "unchanged"}: '
+                )
+            elif synthetic:
                 info.append(f'in-memory {self.name} synthetic padded slice {idx + 1}/{self.yield_nf} repeats real slice {real_idx + 1}/{self.nf}: ')
             else:
                 info.append(f'in-memory {self.name} slice {idx + 1}/{self.nf}: ')
@@ -1630,8 +1985,12 @@ class StreamingYoloVolumeSource:
         autostart: bool = True,
         shared_executor: Optional[ThreadPoolExecutor] = None,
         channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
+        view: Optional[ViewInfo] = None,
+        slice_offset: int = 0,
     ) -> None:
         self.renderer = renderer
+        self.view = view
+        self.slice_offset = int(slice_offset)
         self.channel_format = resolve_channel_format(channel_format)
         self.channel_count = int(self.channel_format.channel_count)
         self.name = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(name)).strip('_') or 'streaming_volume'
@@ -1642,6 +2001,9 @@ class StreamingYoloVolumeSource:
         self.bs = max(1, int(batch_size))
         self.yield_nf = int(math.ceil(float(self.nf) / float(self.bs)) * self.bs) if self.nf > 0 else 0
         self.synthetic_count = max(0, int(self.yield_nf) - int(self.nf))
+        self.radial_padding_count = radial_batch_padding_count(
+            self.view, self.nf, self.bs, slice_offset=self.slice_offset,
+        )
         self.render_workers = max(1, min(int(render_workers), max(1, int(self.nf))))
         default_prefetch = streaming_prediction_source_prefetch_frames(self.bs)
         self.prefetch_frames = max(self.bs, int(prefetch_frames if prefetch_frames is not None else default_prefetch))
@@ -1670,6 +2032,15 @@ class StreamingYoloVolumeSource:
         self.count = 0
         self._fill_prefetch_locked(target_index=0)
         return self
+
+    def result_frame_spec(self, result_index: int) -> Optional[BatchResultFrameSpec]:
+        return batch_result_frame_spec_for_view(
+            self.view,
+            int(result_index),
+            num_frames=self.nf,
+            batch_size=self.bs,
+            slice_offset=self.slice_offset,
+        )
 
     @staticmethod
     def _frame_to_model_channels(frame: np.ndarray, channel_count: int) -> np.ndarray:
@@ -1780,13 +2151,24 @@ class StreamingYoloVolumeSource:
         info: List[str] = []
         last_real_idx = max(0, int(self.nf) - 1)
         for idx in range(start, stop):
-            real_idx = int(idx) if int(idx) < int(self.nf) else int(last_real_idx)
+            spec = self.result_frame_spec(int(idx))
+            radial_wrap = bool(spec is not None and spec.is_radial_padding)
+            real_idx = int(idx) if (int(idx) < int(self.nf) or radial_wrap) else int(last_real_idx)
             synthetic = int(idx) >= int(self.nf)
-            suffix = '_synthetic' if synthetic else ''
-            frame = self._get_real_frame(real_idx)
+            suffix = '_radial_wrap' if radial_wrap else ('_synthetic' if synthetic else '')
+            # Wrapped centers intentionally bypass the real-frame prefetch range. The
+            # center-aware renderer resolves the global seam and mirrors every contextual
+            # channel with the correct crossing parity.
+            frame = self._render_one(real_idx) if radial_wrap else self._get_real_frame(real_idx)
             paths.append(f'{self.name}_{idx + 1:06d}{suffix}.png')
             imgs.append(self._frame_to_model_channels(frame, int(self.channel_count)))
-            if synthetic:
+            if radial_wrap and spec is not None:
+                info.append(
+                    f'streaming {self.name} radial seam extension {idx + 1}/{self.yield_nf} '
+                    f'wraps to slice {int(spec.global_destination_index) + 1}/{int(self.view.num_slices)} '
+                    f'with radial-u {"mirrored" if spec.mirror_radial_u else "unchanged"}: '
+                )
+            elif synthetic:
                 info.append(f'streaming {self.name} synthetic padded slice {idx + 1}/{self.yield_nf} repeats real slice {real_idx + 1}/{self.nf}: ')
             else:
                 info.append(f'streaming {self.name} slice {idx + 1}/{self.nf}: ')
@@ -1858,6 +2240,9 @@ class GpuPrefetchingYoloSource:
         pin_memory: bool = True,
         staging_reservation_bytes: int = 0,
     ) -> None:
+        # Local import keeps the package dependency graph acyclic.
+        from .inference import canonical_single_device
+
         self.base_source = base_source
         self.cfg = cfg
         self.source_label = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(source_label)).strip('_') or 'gpu_prefetch_source'
@@ -1878,6 +2263,7 @@ class GpuPrefetchingYoloSource:
         self.nf = int(getattr(base_source, 'nf', 0) or 0)
         self.yield_nf = int(getattr(base_source, 'yield_nf', 0) or 0)
         self.synthetic_count = int(getattr(base_source, 'synthetic_count', max(0, self.yield_nf - self.nf)))
+        self.radial_padding_count = int(getattr(base_source, 'radial_padding_count', 0) or 0)
         self.source_type = getattr(base_source, 'source_type', argparse.Namespace(stream=False, screenshot=False, from_img=True, tensor=False))
         self._queue: 'queue.Queue[object]' = queue.Queue(maxsize=self.queue_batches)
         self._stop_event = threading.Event()
@@ -1927,6 +2313,17 @@ class GpuPrefetchingYoloSource:
     def __iter__(self) -> 'GpuPrefetchingYoloSource':
         self.start()
         return self
+
+    def result_frame_spec(self, result_index: int) -> Optional[BatchResultFrameSpec]:
+        resolver = getattr(self.base_source, 'result_frame_spec', None)
+        if callable(resolver):
+            return resolver(int(result_index))
+        return batch_result_frame_spec_for_view(
+            None,
+            int(result_index),
+            num_frames=self.nf,
+            batch_size=self.bs,
+        )
 
     def start(self) -> None:
         if self._started:
@@ -2148,6 +2545,9 @@ class GpuPrefetchingYoloSource:
 
 def gpu_input_staging_enabled(cfg: 'PredictConfig') -> bool:
     """Return True when a small queue of YOLO input batches should be staged in VRAM."""
+    # Local import keeps the package dependency graph acyclic.
+    from .inference import canonical_single_device
+
     if not _env_flag('YOLO_TTA_GPU_INPUT_STAGING', True):
         return False
     target = canonical_single_device(str(cfg.device))
@@ -2224,6 +2624,9 @@ def gpu_input_staging_preflight_reserve(source: object, cfg: 'PredictConfig', qu
 
  Returns the reserved byte count (0 when the need cannot be estimated) or None when
  staging must be skipped for this source."""
+    # Local import keeps the package dependency graph acyclic.
+    from .inference import canonical_single_device
+
     out_size = _source_prediction_out_size(source)
     if out_size is None or int(out_size) <= 0:
         return 0
@@ -2268,6 +2671,13 @@ def gpu_input_staging_preflight_reserve(source: object, cfg: 'PredictConfig', qu
         return None
 
 def maybe_wrap_source_with_gpu_input_staging(source: object, cfg: 'PredictConfig', source_label: str) -> object:
+    # Local import keeps the package dependency graph acyclic.
+    from .inference import canonical_single_device
+    from .cuda_backend import (
+        GpuRenderedYoloSource,
+        GpuTileRenderedYoloSource,
+    )
+
     if isinstance(source, GpuPrefetchingYoloSource):
         return source
     # GPU-rendered sources already produce device-resident normalized batches;
@@ -2340,6 +2750,11 @@ def maybe_eager_stage_prediction_ref_on_gpu(prediction_ref: PredictionVolumeRef,
                 batch_size=max(1, int(cfg.batch)),
                 max_frames=None,
                 channel_format=resolve_channel_format(prediction_ref.channel_format),
+                view=prediction_ref.view,
+                logical_num_frames=(
+                    int(prediction_ref.view.num_slices)
+                    if prediction_ref.view is not None else None
+                ),
             )
         wrapped = maybe_wrap_source_with_gpu_input_staging(source, cfg, prediction_ref.name)
         prediction_ref.source = wrapped
@@ -2420,6 +2835,12 @@ def resolve_prediction_source_queue_slots(total_tasks: int, *, streaming_sources
 
 def ensure_ultralytics_accepts_in_memory_volume_source() -> None:
     """Register the in-memory volume loader with Ultralytics' source checker."""
+    # Local import keeps the package dependency graph acyclic.
+    from .cuda_backend import (
+        GpuRenderedYoloSource,
+        GpuTileRenderedYoloSource,
+    )
+
     try:
         import ultralytics.data.build as ultralytics_build  # type: ignore
     except Exception as exc:  # pragma: no cover - ultralytics is imported lazily on SLURM
@@ -2447,6 +2868,9 @@ def make_in_memory_yolo_source(
     batch_size: int = 1,
     max_frames: Optional[int] = None,
     channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
+    view: Optional[ViewInfo] = None,
+    slice_offset: int = 0,
+    logical_num_frames: Optional[int] = None,
 ) -> InMemoryYoloVolumeSource:
     ensure_ultralytics_accepts_in_memory_volume_source()
     return InMemoryYoloVolumeSource(
@@ -2455,6 +2879,9 @@ def make_in_memory_yolo_source(
         batch_size=max(1, int(batch_size)),
         max_frames=max_frames,
         channel_format=resolve_channel_format(channel_format),
+        view=view,
+        slice_offset=int(slice_offset),
+        logical_num_frames=logical_num_frames,
     )
 
 def make_prediction_ref_yolo_source(
@@ -2475,6 +2902,11 @@ def make_prediction_ref_yolo_source(
         batch_size=max(1, int(batch_size)),
         max_frames=max_frames,
         channel_format=resolve_channel_format(prediction_volume.channel_format),
+        view=prediction_volume.view,
+        logical_num_frames=(
+            int(prediction_volume.view.num_slices)
+            if prediction_volume.view is not None else max_frames
+        ),
     )
 
 def _center_preserving_scale_matrix(src_w: int, src_h: int, out_w: int, out_h: int) -> np.ndarray:
@@ -3335,10 +3767,14 @@ def _materialize_prediction_volume_from_renderer(
     job_id: str = '',
     kind: str = 'fullframe',
     channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
+    view: Optional[ViewInfo] = None,
 ) -> PredictionVolumeRef:
     """Return a streaming render-backed prediction source by default.
     
     Disabling streaming materializes the complete model-sized volume in a workspace array."""
+    # Local import keeps the package dependency graph acyclic.
+    from .inference import inference_batch_size
+
     fmt = resolve_channel_format(channel_format)
     stream_name = str(desc).replace('Materializing in-memory ', 'Streaming render-backed ')
     if streaming_prediction_sources_enabled():
@@ -3361,6 +3797,7 @@ def _materialize_prediction_volume_from_renderer(
             prefetch_frames=stream_prefetch,
             autostart=streaming_prediction_source_autostart_enabled(),
             channel_format=fmt,
+            view=view,
         )
         return PredictionVolumeRef(
             array=None,
@@ -3371,13 +3808,17 @@ def _materialize_prediction_volume_from_renderer(
             kind=str(kind),
             source=source,
             channel_format=fmt,
+            view=view,
         )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    materialized_slices = int(num_slices) + radial_batch_padding_count(
+        view, int(num_slices), inference_batch_size(), slice_offset=0,
+    )
     prediction_shape = (
-        (int(num_slices), int(out_size), int(out_size))
+        (int(materialized_slices), int(out_size), int(out_size))
         if int(fmt.channel_count) == 1
-        else (int(num_slices), int(out_size), int(out_size), int(fmt.channel_count))
+        else (int(materialized_slices), int(out_size), int(out_size), int(fmt.channel_count))
     )
     pred_volume = allocate_workspace_array(
         shape=prediction_shape,
@@ -3388,8 +3829,8 @@ def _materialize_prediction_volume_from_renderer(
         reserve_bytes=32 * GIB,
         initialize_zero=False,
     )
-    worker_count = choose_slice_parallel_workers(int(workers), int(num_slices))
-    chunk_size = choose_parallel_chunk_size(int(num_slices), worker_count, target_chunks_per_worker=2, min_chunk_size=1)
+    worker_count = choose_slice_parallel_workers(int(workers), int(materialized_slices))
+    chunk_size = choose_parallel_chunk_size(int(materialized_slices), worker_count, target_chunks_per_worker=2, min_chunk_size=1)
 
     def _render(idx: int) -> None:
         frame = np.asarray(renderer(int(idx)), dtype=np.uint8)
@@ -3398,7 +3839,7 @@ def _materialize_prediction_volume_from_renderer(
         pred_volume[int(idx)] = np.ascontiguousarray(frame, dtype=np.uint8)
 
     parallel_for_indices_chunked(
-        int(num_slices),
+        int(materialized_slices),
         _render,
         max_workers=worker_count,
         desc=desc,
@@ -3415,6 +3856,7 @@ def _materialize_prediction_volume_from_renderer(
         job_id=str(job_id),
         kind=str(kind),
         channel_format=fmt,
+        view=view,
     )
 
 def materialize_fullframe_prediction_volume_for_job(
@@ -3454,6 +3896,7 @@ def materialize_fullframe_prediction_volume_for_job(
         job_id=str(job.aug_id),
         kind='fullframe',
         channel_format=fmt,
+        view=view,
     )
 
 def materialize_dense_tile_prediction_volume_for_job(
@@ -3491,6 +3934,7 @@ def materialize_dense_tile_prediction_volume_for_job(
         job_id=str(tile_job.tile_id),
         kind='tile',
         channel_format=fmt,
+        view=view,
     )
 
 def should_cache_view_frames(view: ViewInfo, dense_tiling_active: bool) -> bool:
@@ -3648,62 +4092,3 @@ def get_view_frame_by_index(
         return render_tilted_native_frame(volume_rgb, view, int(index))
 
     raise ValueError(f'Unknown view: {view.name}')
-
-
-# Late imports keep callable-only dependency cycles import-safe.
-from ._latebind import bind_late_symbols as _bind_late_symbols
-
-_bind_late_symbols(
-    __name__,
-    globals(),
-    {
-        "config": (
-            "CARTESIAN_VIEW_TOKENS",
-            "ChannelFormat",
-            "DEFAULT_CHANNEL_FORMAT",
-            "GIB",
-            "RADIAL_VIEW_TOKENS",
-            "TiltedViewGroup",
-            "_parse_comma_slot",
-            "_resolve_unique_view_tokens",
-            "_split_structured_group",
-            "_structured_group_values",
-            "quantize_uses_fp16",
-            "resolve_cartesian_views",
-            "resolve_channel_format",
-        ),
-        "cuda_backend": (
-            "GpuRenderedYoloSource",
-            "GpuTileRenderedYoloSource",
-        ),
-        "inference": (
-            "canonical_single_device",
-            "inference_batch_size",
-        ),
-        "media": (
-            "wait_for_volume_ready",
-            "wait_for_volume_slice_ready",
-        ),
-        "runtime": (
-            "_sanitize_filesystem_token",
-            "allocate_workspace_array",
-            "choose_parallel_chunk_size",
-            "choose_slice_parallel_workers",
-            "close_memmap_array",
-            "close_memmap_array_without_flush",
-            "flush_array",
-            "parallel_for_indices",
-            "parallel_for_indices_chunked",
-            "prediction_volume_build_flush_enabled",
-        ),
-        "workspace": (
-            "_TILTED_IDENTITY_M",
-            "_cpu_count",
-            "_env_flag",
-            "_env_float",
-            "_env_int",
-            "_tilted_grid_is_identity",
-            "tilted_inplane_linear_enabled",
-        ),
-    },
-)

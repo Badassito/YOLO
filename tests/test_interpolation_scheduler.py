@@ -131,7 +131,7 @@ class InterpolationSeedSchedulingTests(unittest.TestCase):
                         pass_tag='pass1',
                         max_slice_distance=7,
                         search_angle_deg=45.0,
-                        interpolation_walk_back=0,
+                        interpolation_walk_back=1,
                         interpolation_candidates=2,
                         interpolate_min_radius=0.0,
                         prefer_memory=True,

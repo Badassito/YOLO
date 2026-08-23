@@ -1,6 +1,6 @@
 # Volume TTA architecture
 
-The `GPT-5.6-Sol-Pro_v17.0.11_SLURM.py` filename remains a versioned compatibility
+The `GPT-5.6-Sol-Ultra_v17.1.0_SLURM.py` filename remains a versioned compatibility
 launcher. The implementation lives in the importable `volume_tta` package so spawned
 processes resolve worker functions and data types through canonical module paths.
 
@@ -31,11 +31,11 @@ processes resolve worker functions and data types through canonical module paths
 SciPy, Ultralytics, CUDA, OpenVINO or future accelerator runtimes. The compatibility
 launcher and `python -m volume_tta` both use `volume_tta.__main__.run()`.
 
-The physical split preserves the original numerical functions. Callable-only references
-that were legal forward references in the monolith are resolved by `_latebind`; imports
-needed for decorators, class construction, defaults or module initialization remain normal
-eager imports. `_latebind` is transitional compatibility infrastructure for the physical
-split, not a service locator for new code. New code should use explicit one-way imports.
+The physical split preserves the original numerical functions while enforcing an acyclic
+eager import graph. Lower-level subsystems are imported explicitly; the small number of
+callbacks into a higher-level subsystem use a function-local import. This keeps every
+module independently importable, including concurrent first imports, without a global
+symbol registry or wildcard-import facade.
 
 ## Backend boundary
 

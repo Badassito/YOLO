@@ -18,6 +18,14 @@ from volume_tta.config import (
 
 
 class ConfigTests(unittest.TestCase):
+    def test_v17_1_inference_and_interpolation_defaults(self) -> None:
+        args = build_argparser().parse_args([
+            '--input', 'input.mkv', '--model', 'gpu:model.engine',
+        ])
+        self.assertEqual(args.imgsz, 3072)
+        self.assertEqual(args.interpolation_walk_back, 1)
+        self.assertEqual(args.interpolation_candidates, 1)
+
     def test_unknown_processor_and_crop_options_are_rejected(self) -> None:
         parser = build_argparser()
         option_strings = {

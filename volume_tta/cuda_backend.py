@@ -6,13 +6,98 @@ behavior. Public coordination contracts live under ``inference_backends``.
 
 from __future__ import annotations
 
-from ._stdlib import *
+import argparse
+import math
+import os
+import re
+import threading
+import time
+from collections import OrderedDict
+from pathlib import Path
+from typing import (
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    TYPE_CHECKING,
+    Tuple,
+)
 import numpy as np
 from ._deps import cv2
 
 from .config import (
     DEFAULT_CHANNEL_FORMAT,
 )
+
+# Explicit lower-layer dependencies keep imports one-way.
+from .config import (
+    ChannelFormat,
+    GIB,
+    resolve_channel_format,
+)
+from .workspace import (
+    _TILTED_IDENTITY_M,
+    _env_flag,
+    _env_float,
+    _env_int,
+    _tilted_grid_is_identity,
+    radial_source_mode,
+    tilted_inplane_linear_enabled,
+)
+from .runtime import (
+    choose_slice_parallel_workers,
+    flush_array,
+    parallel_for_indices,
+)
+from .geometry import (
+    AffineSpec,
+    AugJob,
+    BatchResultFrameSpec,
+    ChannelFormattedFrameRenderer,
+    DenseTileJob,
+    GpuPrefetchedYoloBatch,
+    RADIAL_FILTER_LABEL,
+    RADIAL_FILTER_MODE,
+    RADIAL_FILTER_TAP_COUNT,
+    ViewInfo,
+    _cupy_external_stream,
+    _tilted_plan_cache_key,
+    cartesian_view_axis_spec,
+    channel_view_slice_index,
+    channel_view_slice_source,
+    batch_result_frame_spec_for_view,
+    radial_batch_padding_count,
+    ensure_ultralytics_accepts_in_memory_volume_source,
+    get_tilted_render_plan,
+    is_radial_view,
+    is_tilted_radial_view,
+    is_tilted_view,
+    make_dense_tile_channel_renderer,
+    make_fullframe_channel_renderer,
+    physical_view_name,
+    radial_base_view_name,
+    radial_fused_render_supported,
+    radial_plane_shape,
+    radial_resident_gpu_render_supported,
+    radial_stack_length,
+    radial_streaming_gpu_render_supported,
+    tilted_base_view_name,
+    tilted_frame_center,
+    tilted_stack_axis_length,
+)
+from .inference import (
+    _ResidentGpuPipelineSlot,
+    _affine_theta_from_dst_to_src,
+    _cuda_graph_capture_context,
+    _cuda_stream_priority,
+    _get_cached_affine_grid,
+    resident_trt_cuda_graphs_enabled,
+)
+
+
+if TYPE_CHECKING:
+    from .backprojection import _ResidentTensorRTRingFatalError
 
 def open_existing_gray_memmap(path: object, shape: Sequence[int], dtype: object = np.uint8, mode: str = 'r') -> np.memmap:
     return np.memmap(Path(path), dtype=np.dtype(dtype), mode=str(mode), shape=tuple(int(x) for x in shape))
@@ -1537,6 +1622,9 @@ class _GpuWorkerRenderEngine:
         disable_on_failure: bool = True,
     ) -> bool:
         """Render an eligible resident-ring Radial or Tilted frame into its fixed binding."""
+        # Local import keeps the package dependency graph acyclic.
+        from .backprojection import _ResidentTensorRTRingFatalError
+
         family = 'radial' if str(view.family) == 'radial' else ('tilted' if is_tilted_view(view) else '')
         if not family:
             return False
@@ -1668,6 +1756,9 @@ class _GpuWorkerRenderEngine:
         slower reference path.  The startup probe compares one representative frame from each
         fused family under explicit, user-adjustable tolerances.
         """
+        # Local import keeps the package dependency graph acyclic.
+        from .backprojection import _ResidentTensorRTRingFatalError
+
         family = 'radial' if str(view.family) == 'radial' else ('tilted' if is_tilted_view(view) else '')
         preflight_family = _fused_preflight_family(view)
         if not family:
@@ -1800,6 +1891,9 @@ class _GpuWorkerRenderEngine:
         fp16: bool,
     ) -> None:
         """Validate one upright-Radial, Tilted, and tilted-Radial frame per volume."""
+        # Local import keeps the package dependency graph acyclic.
+        from .backprojection import _ResidentTensorRTRingFatalError
+
         if not fused_renderer_preflight_enabled() or not specs:
             return
         if self._mode != 'resident' or self._volume_key is None:
@@ -1858,6 +1952,9 @@ class _GpuWorkerRenderEngine:
  replay has fixed volume/descriptor/output addresses but reads the just-staged frame
  index or Tilted center from ``slot.render_meta``. Capture failures with a healthy
  stream retain the uncaptured fused launch; failed recovery is worker-fatal."""
+        # Local import keeps the package dependency graph acyclic.
+        from .backprojection import _ResidentTensorRTRingFatalError
+
         if not fused_render_cuda_graphs_enabled():
             return
         family = 'radial' if str(view.family) == 'radial' else ('tilted' if is_tilted_view(view) else '')
@@ -2991,6 +3088,9 @@ class GpuRenderedYoloSource:
         self.bs = max(1, int(batch_size))
         self.yield_nf = int(math.ceil(float(self.nf) / float(self.bs)) * self.bs) if self.nf > 0 else 0
         self.synthetic_count = max(0, int(self.yield_nf) - int(self.nf))
+        self.radial_padding_count = radial_batch_padding_count(
+            self.view, self.nf, self.bs, slice_offset=self.slice_offset,
+        )
         self.mode = 'image'
         self.count = 0
         self._direct_count = 0
@@ -3015,6 +3115,15 @@ class GpuRenderedYoloSource:
         self.count = 0
         self._direct_count = 0
         return self
+
+    def result_frame_spec(self, result_index: int) -> Optional[BatchResultFrameSpec]:
+        return batch_result_frame_spec_for_view(
+            self.view,
+            int(result_index),
+            num_frames=self.nf,
+            batch_size=self.bs,
+            slice_offset=self.slice_offset,
+        )
 
     def start(self) -> None:
         return None
@@ -3151,12 +3260,20 @@ class GpuRenderedYoloSource:
         abs_indices: List[int] = []
         last_real_idx = max(0, int(self.nf) - 1)
         for idx in range(start, stop):
-            real_idx = int(idx) if int(idx) < int(self.nf) else int(last_real_idx)
+            spec = self.result_frame_spec(int(idx))
+            radial_wrap = bool(spec is not None and spec.is_radial_padding)
+            real_idx = int(idx) if (int(idx) < int(self.nf) or radial_wrap) else int(last_real_idx)
             synthetic = int(idx) >= int(self.nf)
-            suffix = '_synthetic' if synthetic else ''
+            suffix = '_radial_wrap' if radial_wrap else ('_synthetic' if synthetic else '')
             abs_indices.append(int(self.slice_offset) + int(real_idx))
             paths.append(f'{self.name}_{idx + 1:06d}{suffix}.png')
-            if synthetic:
+            if radial_wrap and spec is not None:
+                info.append(
+                    f'gpu-rendered {self.name} radial seam extension {idx + 1}/{self.yield_nf} '
+                    f'wraps to slice {int(spec.global_destination_index) + 1}/{int(self.view.num_slices)} '
+                    f'with radial-u {"mirrored" if spec.mirror_radial_u else "unchanged"}: '
+                )
+            elif synthetic:
                 info.append(f'gpu-rendered {self.name} synthetic padded slice {idx + 1}/{self.yield_nf} repeats real slice {real_idx + 1}/{self.nf}: ')
             else:
                 info.append(f'gpu-rendered {self.name} slice {idx + 1}/{self.nf}: ')
@@ -3211,6 +3328,9 @@ class GpuTileRenderedYoloSource:
         self.bs = max(1, int(batch_size))
         self.yield_nf = int(math.ceil(float(self.nf) / float(self.bs)) * self.bs) if self.nf > 0 else 0
         self.synthetic_count = max(0, int(self.yield_nf) - int(self.nf))
+        self.radial_padding_count = radial_batch_padding_count(
+            self.view, self.nf, self.bs, slice_offset=self.slice_offset,
+        )
         self.mode = 'image'
         self.count = 0
         self._direct_count = 0
@@ -3233,6 +3353,15 @@ class GpuTileRenderedYoloSource:
         self.count = 0
         self._direct_count = 0
         return self
+
+    def result_frame_spec(self, result_index: int) -> Optional[BatchResultFrameSpec]:
+        return batch_result_frame_spec_for_view(
+            self.view,
+            int(result_index),
+            num_frames=self.nf,
+            batch_size=self.bs,
+            slice_offset=self.slice_offset,
+        )
 
     def start(self) -> None:
         return None
@@ -3314,12 +3443,20 @@ class GpuTileRenderedYoloSource:
         absolute_indices: List[int] = []
         last_real_idx = max(0, int(self.nf) - 1)
         for idx in range(start, stop):
-            real_idx = int(idx) if int(idx) < int(self.nf) else int(last_real_idx)
+            spec = self.result_frame_spec(int(idx))
+            radial_wrap = bool(spec is not None and spec.is_radial_padding)
+            real_idx = int(idx) if (int(idx) < int(self.nf) or radial_wrap) else int(last_real_idx)
             synthetic = int(idx) >= int(self.nf)
-            suffix = '_synthetic' if synthetic else ''
+            suffix = '_radial_wrap' if radial_wrap else ('_synthetic' if synthetic else '')
             absolute_indices.append(int(self.slice_offset) + int(real_idx))
             paths.append(f'{self.name}_{idx + 1:06d}{suffix}.png')
-            if synthetic:
+            if radial_wrap and spec is not None:
+                info.append(
+                    f'gpu-tile {self.name} radial seam extension {idx + 1}/{self.yield_nf} '
+                    f'wraps to slice {int(spec.global_destination_index) + 1}/{int(self.view.num_slices)} '
+                    f'with radial-u {"mirrored" if spec.mirror_radial_u else "unchanged"}: '
+                )
+            elif synthetic:
                 info.append(
                     f'gpu-tile {self.name} synthetic padded slice {idx + 1}/{self.yield_nf} '
                     f'repeats real slice {real_idx + 1}/{self.nf}: '
@@ -3367,12 +3504,16 @@ def _radial_slab_context_indices(
     center_start: int,
     center_count: int,
     channel_format: ChannelFormat,
+    batch_size: int = 1,
 ) -> Tuple[int, ...]:
     """Return the sparse global plane bank required by one radial task window."""
     fmt = resolve_channel_format(channel_format)
+    execution_count = int(center_count) + radial_batch_padding_count(
+        view, int(center_count), int(batch_size), slice_offset=int(center_start),
+    )
     required = {
         channel_view_slice_index(view, center + int(offset))
-        for center in range(int(center_start), int(center_start) + int(center_count))
+        for center in range(int(center_start), int(center_start) + int(execution_count))
         for offset in fmt.offsets
     }
     return tuple(sorted(int(value) for value in required))
@@ -3499,77 +3640,3 @@ def _worker_render_callable(
         return formatted(off + int(local_idx))
 
     return _render_center
-
-
-# Late imports keep callable-only dependency cycles import-safe.
-from ._latebind import bind_late_symbols as _bind_late_symbols
-
-_bind_late_symbols(
-    __name__,
-    globals(),
-    {
-        "backprojection": (
-            "_ResidentTensorRTRingFatalError",
-        ),
-        "config": (
-            "ChannelFormat",
-            "GIB",
-            "resolve_channel_format",
-        ),
-        "geometry": (
-            "AffineSpec",
-            "AugJob",
-            "ChannelFormattedFrameRenderer",
-            "DenseTileJob",
-            "GpuPrefetchedYoloBatch",
-            "RADIAL_FILTER_LABEL",
-            "RADIAL_FILTER_MODE",
-            "RADIAL_FILTER_TAP_COUNT",
-            "ViewInfo",
-            "_cupy_external_stream",
-            "_tilted_plan_cache_key",
-            "cartesian_view_axis_spec",
-            "channel_view_slice_index",
-            "channel_view_slice_source",
-            "ensure_ultralytics_accepts_in_memory_volume_source",
-            "get_tilted_render_plan",
-            "is_radial_view",
-            "is_tilted_radial_view",
-            "is_tilted_view",
-            "make_dense_tile_channel_renderer",
-            "make_fullframe_channel_renderer",
-            "physical_view_name",
-            "radial_base_view_name",
-            "radial_fused_render_supported",
-            "radial_plane_shape",
-            "radial_resident_gpu_render_supported",
-            "radial_stack_length",
-            "radial_streaming_gpu_render_supported",
-            "tilted_base_view_name",
-            "tilted_frame_center",
-            "tilted_stack_axis_length",
-        ),
-        "inference": (
-            "_ResidentGpuPipelineSlot",
-            "_affine_theta_from_dst_to_src",
-            "_cuda_graph_capture_context",
-            "_cuda_stream_priority",
-            "_get_cached_affine_grid",
-            "resident_trt_cuda_graphs_enabled",
-        ),
-        "runtime": (
-            "choose_slice_parallel_workers",
-            "flush_array",
-            "parallel_for_indices",
-        ),
-        "workspace": (
-            "_TILTED_IDENTITY_M",
-            "_env_flag",
-            "_env_float",
-            "_env_int",
-            "_tilted_grid_is_identity",
-            "radial_source_mode",
-            "tilted_inplane_linear_enabled",
-        ),
-    },
-)

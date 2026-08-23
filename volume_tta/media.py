@@ -6,13 +6,53 @@ behavior. Public coordination contracts live under ``inference_backends``.
 
 from __future__ import annotations
 
-from ._stdlib import *
+import io
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import threading
+import time
+from pathlib import Path
+from typing import (
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    TYPE_CHECKING,
+    Tuple,
+)
 import numpy as np
 from ._deps import cv2, tqdm
 
 from .config import (
     GIB,
 )
+
+# Explicit lower-layer dependencies keep imports one-way.
+from .config import RadialViewRequest
+from .workspace import (
+    _cpu_count,
+    _env_flag,
+    _env_float,
+    _env_int,
+)
+from .runtime import (
+    allocate_workspace_array,
+    array_nbytes,
+    choose_parallel_chunk_size,
+    choose_slice_parallel_workers,
+    close_memmap_array,
+    flush_array,
+    parallel_for_indices_chunked,
+)
+
+
+if TYPE_CHECKING:
+    from .backprojection import radial_full_coverage_angle_deg
 
 def _require_bin(name: str) -> None:
     if shutil.which(name) is None:
@@ -1086,6 +1126,9 @@ def resolve_radial_azimuth_angles(
     diameters: Sequence[int],
 ) -> List[float]:
     """Resolve each Radial request's paired spacing after its diameter is known."""
+    # Local import keeps the package dependency graph acyclic.
+    from .backprojection import radial_full_coverage_angle_deg
+
     request_list = list(requests)
     if len(diameters) != len(request_list):
         raise ValueError(
@@ -1317,36 +1360,3 @@ def purge_remaining_temporary_mkvs(temp_dir: Path, *, keep_temp: bool) -> int:
         if purge_temporary_mkv(path, temp_dir=root, keep_temp=False, reason='final scratch sweep'):
             purged += 1
     return int(purged)
-
-
-# Late imports keep callable-only dependency cycles import-safe.
-from ._latebind import bind_late_symbols as _bind_late_symbols
-
-_bind_late_symbols(
-    __name__,
-    globals(),
-    {
-        "backprojection": (
-            "radial_full_coverage_angle_deg",
-        ),
-        "config": (
-            "GIB",
-            "RadialViewRequest",
-        ),
-        "runtime": (
-            "allocate_workspace_array",
-            "array_nbytes",
-            "choose_parallel_chunk_size",
-            "choose_slice_parallel_workers",
-            "close_memmap_array",
-            "flush_array",
-            "parallel_for_indices_chunked",
-        ),
-        "workspace": (
-            "_cpu_count",
-            "_env_flag",
-            "_env_float",
-            "_env_int",
-        ),
-    },
-)

@@ -6,16 +6,69 @@ behavior. Public coordination contracts live under ``inference_backends``.
 
 from __future__ import annotations
 
-from ._stdlib import *
+import argparse
+import math
+import os
+import re
+import sys
+import threading
+import time
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+)
+from dataclasses import dataclass
+from pathlib import Path
+from typing import (
+    Dict,
+    List,
+    Optional,
+    Tuple,
+)
 import numpy as np
 
 from .geometry import (
     ViewInfo,
 )
 
-# This immutable format identifier is needed while Python evaluates a function default
-# below.  The writer implementation itself remains a callable-only late dependency.
-CVOL_FORMAT = 'cvol-mask-v2-raw'
+# Explicit lower-layer dependencies keep imports one-way.
+from .config import GIB
+from .workspace import (
+    _env_flag,
+    _env_float,
+    _env_int,
+    available_anon_work_bytes,
+    v1613_d1_pipeline_active,
+)
+from .runtime import (
+    _memfd_backing_path_from_array,
+    close_memmap_array,
+    runtime_telemetry,
+)
+from .geometry import (
+    is_radial_view,
+    is_tilted_radial_view,
+    is_tilted_view,
+    physical_view_name,
+    pretty_view_name,
+    radial_base_view_name,
+    radial_stack_length,
+    tilted_base_view_name,
+    tilted_stack_axis_length,
+)
+from .interpolation import (
+    CVOL_FORMAT,
+    INTERNAL_PACKED_CVOL_FORMAT,
+    IncrementalRawBBoxMaskStoreWriter,
+    NrrdLayerRef,
+    RawBBoxMaskStore,
+    RawBBoxSlicePayload,
+    _coerce_segment_extent,
+    _encode_bool_mask_slice_payload,
+    _nrrd_empty_segment_extent,
+    _write_raw_bbox_payload_store,
+    write_raw_bbox_mask_store,
+)
 
 def d1_owner_pipeline_enabled() -> bool:
     """Return the D1 mode admitted and published by the current run."""
@@ -1054,54 +1107,3 @@ def _nrrd_layer_name(
     if stage:
         pieces.append(str(stage).replace('_', ' '))
     return ' / '.join(pieces)
-
-
-# Late imports keep callable-only dependency cycles import-safe.
-from ._latebind import bind_late_symbols as _bind_late_symbols
-
-_bind_late_symbols(
-    __name__,
-    globals(),
-    {
-        "config": (
-            "GIB",
-        ),
-        "geometry": (
-            "ViewInfo",
-            "is_radial_view",
-            "is_tilted_radial_view",
-            "is_tilted_view",
-            "physical_view_name",
-            "pretty_view_name",
-            "radial_base_view_name",
-            "radial_stack_length",
-            "tilted_base_view_name",
-            "tilted_stack_axis_length",
-        ),
-        "interpolation": (
-            "CVOL_FORMAT",
-            "INTERNAL_PACKED_CVOL_FORMAT",
-            "IncrementalRawBBoxMaskStoreWriter",
-            "NrrdLayerRef",
-            "RawBBoxMaskStore",
-            "RawBBoxSlicePayload",
-            "_coerce_segment_extent",
-            "_encode_bool_mask_slice_payload",
-            "_nrrd_empty_segment_extent",
-            "_write_raw_bbox_payload_store",
-            "write_raw_bbox_mask_store",
-        ),
-        "runtime": (
-            "_memfd_backing_path_from_array",
-            "close_memmap_array",
-            "runtime_telemetry",
-        ),
-        "workspace": (
-            "_env_flag",
-            "_env_float",
-            "_env_int",
-            "available_anon_work_bytes",
-            "v1613_d1_pipeline_active",
-        ),
-    },
-)

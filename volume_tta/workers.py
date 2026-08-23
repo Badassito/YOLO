@@ -6,11 +6,112 @@ behavior. Public coordination contracts live under ``inference_backends``.
 
 from __future__ import annotations
 
-from ._stdlib import *
+import gc
+import json
+import os
+import queue
+import re
+import threading
+import time
+from concurrent.futures import Future
+from dataclasses import dataclass
+from pathlib import Path
+from typing import (
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+)
 import numpy as np
 from ._deps import cv2
 
 from .cuda_backend import gpu_worker_fused_preflight_specs
+
+# Explicit lower-layer dependencies keep imports one-way.
+from .config import (
+    DEFAULT_CHANNEL_FORMAT,
+    _resolve_cpu_precision,
+    quantize_uses_fp16,
+    resolve_channel_format,
+    resolve_quantize,
+)
+from .runtime import (
+    HYBRID_DEFERRED_RESULT_MODE,
+    _close_fd_list,
+    _interpolation_process_entry,
+    _materialize_worker_task_memfd_paths,
+    _sched_setaffinity_all_threads,
+    close_memmap_array,
+    cpu_inference_supports_view,
+    initialize_runtime_observability,
+)
+from .geometry import (
+    AugJob,
+    BatchResultFrameSpec,
+    DenseTileJob,
+    InMemoryYoloVolumeSource,
+    StreamingYoloVolumeSource,
+    ViewInfo,
+    is_radial_view,
+    is_tilted_radial_view,
+    is_tilted_view,
+    mirrored_radial_parent_crop,
+    prediction_result_frame_spec,
+    radial_batch_padding_count,
+    radial_batch_padding_frame_specs,
+    output_to_view_processing_affine,
+    radial_resident_gpu_render_supported,
+    radial_streaming_gpu_render_supported,
+    view_processing_volume_shape,
+)
+from .inference import (
+    CpuRetinaMaskPayload,
+    ModelInputChannelMismatchError,
+    PredictConfig,
+    _cleanup_prediction_slice_inplace,
+    _clip_boxes_np,
+    _gpu_union_retirement_manager,
+    _init_gpu_union_retirement_manager,
+    _process_cpu_retina_prediction_frame,
+    _prediction_accumulation_target,
+    _shutdown_gpu_union_retirement_manager,
+    cpu_retina_masks_enabled,
+    ensure_cpu_retina_mask_predictor_patch,
+    ensure_gpu_retina_proto_union_predictor_patch,
+    ensure_yolo_ready_for_predict,
+    gpu_union_flush_overlap_enabled,
+    load_ultralytics_model,
+    predict_source_and_accumulate,
+    request_affine_grid_cache_entries,
+    require_channel_aware_yolo_preprocess_patch,
+    set_angle_variant_gpu_fastpath,
+    set_retina_mask_processor,
+    validate_yolo_model_input_channels,
+)
+from .cuda_backend import (
+    GpuRenderedYoloSource,
+    GpuTileRenderedYoloSource,
+    _WORKER_TILTED_RADIAL_CPU_WARNED,
+    _init_worker_gpu_render_engine,
+    _radial_slab_channel_renderer,
+    _radial_slab_context_indices,
+    _wait_for_cube_ready_sentinel,
+    _worker_gpu_render_engine,
+    _worker_render_callable,
+    open_existing_gray_memmap,
+    set_gpu_worker_fused_preflight_specs,
+)
+from .cuda_d1 import (
+    _d1_backproject_kernels,
+    _d1_consume_device_union,
+    _shutdown_d1_worker_pipeline,
+    d1_owner_pipeline_enabled,
+)
+from .backprojection import (
+    _ResidentTensorRTRingFatalError,
+    _shutdown_resident_trt_pipeline_cache,
+)
 
 
 # Worker-local affinity state. Spawned accelerator workers initialize these values after
@@ -603,6 +704,8 @@ class _OpenVinoCpuSegmenter:
         native_w: int,
         min_conf: float,
         min_radius: float,
+        radial_padding_union_mm: Optional[np.ndarray] = None,
+        radial_padding_confmap_mm: Optional[np.ndarray] = None,
     ) -> Dict[str, object]:
         """Run a bounded asynchronous request queue and consume results in frame order."""
         output_queue: 'queue.Queue[object]' = queue.Queue(maxsize=max(2, int(self.request_count)))
@@ -610,6 +713,8 @@ class _OpenVinoCpuSegmenter:
         consumer_errors: List[BaseException] = []
         stats = {'prediction_count': 0, 'frames_with_predictions': 0}
         submitted_real = 0
+        submitted_results = 0
+        radial_padding_processed = 0
 
         def _callback(request: object, userdata: object) -> None:
             try:
@@ -635,9 +740,7 @@ class _OpenVinoCpuSegmenter:
                     continue
                 if consumer_errors:
                     continue
-                start_index, real_count, submitted_batch = (
-                    int(value) for value in userdata
-                )
+                frame_specs, submitted_batch = userdata
                 try:
                     payloads = _openvino_cpu_payloads_from_outputs(
                         payload,
@@ -650,28 +753,44 @@ class _OpenVinoCpuSegmenter:
                         out_size=int(out_size),
                         expected_class_count=self.expected_class_count,
                     )
-                    for local_index in range(int(real_count)):
-                        frame_index = int(start_index) + int(local_index)
+                    for local_index, spec_obj in enumerate(frame_specs):
+                        if spec_obj is None:
+                            continue
+                        spec = spec_obj
+                        if not isinstance(spec, BatchResultFrameSpec):
+                            raise TypeError(f'OpenVINO frame spec has invalid type {type(spec)!r}')
+                        target_union, target_conf, frame_index, target_affine, count_stats = (
+                            _prediction_accumulation_target(
+                                spec,
+                                view_union_mm=view_union_mm,
+                                view_confmap_mm=view_confmap_mm,
+                                radial_padding_union_mm=radial_padding_union_mm,
+                                radial_padding_confmap_mm=radial_padding_confmap_mm,
+                                M_out_to_native=M_out_to_native,
+                                native_w=int(native_w),
+                            )
+                        )
                         instance_count, frame_count = _process_cpu_retina_prediction_frame(
                             frame_index,
                             payloads[int(local_index)],
                             int(out_size),
-                            view_union_mm,
-                            view_confmap_mm,
-                            np.asarray(M_out_to_native, dtype=np.float32),
+                            target_union,
+                            target_conf,
+                            np.asarray(target_affine, dtype=np.float32),
                             int(native_h),
                             int(native_w),
                             slice_lock=None,
                         )
                         has_foreground = _cleanup_prediction_slice_inplace(
-                            view_union_mm,
-                            view_confmap_mm,
+                            target_union,
+                            target_conf,
                             int(frame_index),
                             min_conf=float(min_conf),
                             min_radius=float(min_radius),
                         )
-                        stats['prediction_count'] = int(stats['prediction_count']) + int(instance_count)
-                        if bool(frame_count) and bool(has_foreground):
+                        if bool(count_stats):
+                            stats['prediction_count'] = int(stats['prediction_count']) + int(instance_count)
+                        if bool(count_stats) and bool(frame_count) and bool(has_foreground):
                             stats['frames_with_predictions'] = int(stats['frames_with_predictions']) + 1
                 except BaseException as exc:
                     consumer_errors.append(exc)
@@ -686,11 +805,27 @@ class _OpenVinoCpuSegmenter:
             for _paths, images, _info in source:  # type: ignore[operator]
                 if submitted_real >= int(num_frames):
                     break
-                real_count = min(len(images), int(num_frames) - int(submitted_real))
+                frame_specs = [
+                    prediction_result_frame_spec(
+                        source, int(submitted_results) + int(local_index),
+                        num_frames=int(num_frames),
+                    )
+                    for local_index in range(len(images))
+                ]
+                real_count = sum(
+                    1 for spec in frame_specs
+                    if spec is not None and not bool(spec.is_radial_padding)
+                )
+                radial_count = sum(
+                    1 for spec in frame_specs
+                    if spec is not None and bool(spec.is_radial_padding)
+                )
                 input_value = self._prepare_input(images)
-                userdata = (int(submitted_real), int(real_count), int(input_value.shape[0]))
+                userdata = (tuple(frame_specs), int(input_value.shape[0]))
                 self.infer_queue.start_async({self.input_name: input_value}, userdata=userdata)
                 submitted_real += int(real_count)
+                submitted_results += int(len(images))
+                radial_padding_processed += int(radial_count)
             self.infer_queue.wait_all()
         finally:
             output_queue.put(sentinel)
@@ -704,6 +839,9 @@ class _OpenVinoCpuSegmenter:
                 f'OpenVINO CPU source produced {submitted_real}/{int(num_frames)} real frames'
             )
         stats['slice_meta'] = _binary_slice_metadata_from_array(view_union_mm)
+        if int(radial_padding_processed) > 0:
+            stats['slice_meta'] = None
+        stats['radial_padding_processed'] = int(radial_padding_processed)
         stats['device_hole_filled_frames'] = 0
         stats['proto_hole_treated_frames'] = 0
         stats['openvino_request_count'] = int(self.request_count)
@@ -814,6 +952,8 @@ def run_prediction_volume_in_openvino_worker(
             autostart=True,
             shared_executor=None,
             channel_format=channel_format,
+            view=view,
+            slice_offset=int(slice_offset),
         )
         task_affine = np.asarray(
             task.get('M_out_to_processing')
@@ -1043,8 +1183,63 @@ def run_prediction_volume_in_worker(
     result_conf: Optional[np.ndarray] = None
     result_mask_full: Optional[np.memmap] = None
     result_conf_full: Optional[np.memmap] = None
+    radial_padding_mask: Optional[np.memmap] = None
+    radial_padding_conf: Optional[np.memmap] = None
+    radial_padding_mask_path: Optional[Path] = None
+    radial_padding_conf_path: Optional[Path] = None
     source: Optional[object] = None
     deferred_result: Optional[_DeferredGpuWorkerTaskResult] = None
+
+    radial_padding_count = radial_batch_padding_count(
+        view,
+        int(num_frames),
+        max(1, int(cfg.batch)),
+        slice_offset=int(slice_offset),
+    )
+    if int(radial_padding_count) > 0:
+        padding_dir = Path(str(task.get('radial_padding_dir') or Path(str(task['source_volume_path'])).parent))
+        padding_dir.mkdir(parents=True, exist_ok=True)
+        padding_token = re.sub(
+            r'[^A-Za-z0-9_.-]+', '_',
+            f"{kind}-{view.name}-{task.get('job_id', 'job')}-task{task.get('task_id', 'x')}",
+        )
+        radial_padding_mask_path = padding_dir / f'{padding_token}.mask.u8.dat'
+        radial_padding_shape = (
+            int(radial_padding_count), int(processing_h), int(processing_w)
+        )
+        try:
+            radial_padding_mask = np.memmap(
+                radial_padding_mask_path,
+                dtype=np.uint8,
+                mode='w+',
+                shape=radial_padding_shape,
+            )
+            radial_padding_mask[...] = np.uint8(0)
+            if task.get('result_conf_path'):
+                radial_padding_conf_path = padding_dir / f'{padding_token}.conf.u8.dat'
+                radial_padding_conf = np.memmap(
+                    radial_padding_conf_path,
+                    dtype=np.uint8,
+                    mode='w+',
+                    shape=radial_padding_shape,
+                )
+                radial_padding_conf[...] = np.uint8(0)
+        except BaseException:
+            for mm in (radial_padding_conf, radial_padding_mask):
+                if mm is not None:
+                    try:
+                        close_memmap_array(mm)
+                    except Exception:
+                        pass
+            for failed_path in (radial_padding_conf_path, radial_padding_mask_path):
+                if failed_path is not None:
+                    try:
+                        Path(failed_path).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            radial_padding_conf = None
+            radial_padding_mask = None
+            raise
 
     def _open_cpu_render_source() -> Tuple[np.memmap, object]:
         if native_resize is not None:
@@ -1076,6 +1271,8 @@ def run_prediction_volume_in_worker(
                 autostart=True,
                 shared_executor=None,
                 channel_format=channel_format,
+                view=view,
+                slice_offset=int(slice_offset),
             )
         except BaseException:
             close_memmap_array(mm)
@@ -1201,6 +1398,7 @@ def run_prediction_volume_in_worker(
                 ):
                     slab_indices = _radial_slab_context_indices(
                         view, slice_offset, num_frames, channel_format,
+                        batch_size=max(1, int(cfg.batch)),
                     )
                     slab = gpu_engine.prerender_radial_slab(view, slab_indices)
                     source = StreamingYoloVolumeSource(
@@ -1221,6 +1419,8 @@ def run_prediction_volume_in_worker(
                         autostart=True,
                         shared_executor=None,
                         channel_format=channel_format,
+                        view=view,
+                        slice_offset=int(slice_offset),
                     )
             except _ResidentTensorRTRingFatalError:
                 raise
@@ -1283,6 +1483,8 @@ def run_prediction_volume_in_worker(
                 require_proto_hole_treatment=bool(
                     str(task.get('result_mode', 'file')) == 'd1_owner'
                 ),
+                radial_padding_union_mm=radial_padding_mask,
+                radial_padding_confmap_mm=radial_padding_conf,
             )
 
         retry_with_cpu_render = False
@@ -1310,6 +1512,10 @@ def run_prediction_volume_in_worker(
                 result_mask[...] = np.uint8(0)
             if result_conf is not None:
                 result_conf[...] = np.uint8(0)
+            if radial_padding_mask is not None:
+                radial_padding_mask[...] = np.uint8(0)
+            if radial_padding_conf is not None:
+                radial_padding_conf[...] = np.uint8(0)
             retry_with_cpu_render = True
 
         if retry_with_cpu_render:
@@ -1330,7 +1536,44 @@ def run_prediction_volume_in_worker(
                 stats.get('proto_hole_treated_frames', stats.get('device_hole_filled_frames', 0))
             ),
             'slice_meta': stats.get('slice_meta'),
+            'radial_padding_processed': int(stats.get('radial_padding_processed', 0)),
         }
+        if int(public_stats['radial_padding_processed']) > 0:
+            padding_specs = radial_batch_padding_frame_specs(
+                view,
+                int(num_frames),
+                max(1, int(cfg.batch)),
+                slice_offset=int(slice_offset),
+            )
+            public_stats.update({
+                'radial_padding_count': int(radial_padding_count),
+                'radial_padding_mask_path': (
+                    str(radial_padding_mask_path) if radial_padding_mask_path is not None else ''
+                ),
+                'radial_padding_conf_path': (
+                    str(radial_padding_conf_path) if radial_padding_conf_path is not None else ''
+                ),
+                'radial_padding_destinations': tuple(
+                    int(spec.global_destination_index) for spec in padding_specs
+                ),
+                'radial_padding_frames': tuple({
+                    'ordinal': int(spec.radial_padding_ordinal or 0),
+                    'destination': int(spec.global_destination_index),
+                    'mirror_radial_u': bool(spec.mirror_radial_u),
+                } for spec in padding_specs),
+                'radial_padding_shape': tuple(int(value) for value in radial_padding_mask.shape),
+            })
+            if str(kind) == 'tile':
+                py0, py1, px0, px1 = (int(v) for v in task.get('parent_crop', job.parent_crop))
+                parent_w = int(task.get('threshold_plane_shape', (processing_h, processing_w))[1])
+                original_crop = (int(py0), int(py1), int(px0), int(px1))
+                public_stats['radial_padding_frames'] = tuple({
+                    **frame,
+                    'parent_crop': (
+                        mirrored_radial_parent_crop(original_crop, int(parent_w))
+                        if bool(frame['mirror_radial_u']) else original_crop
+                    ),
+                } for frame in public_stats['radial_padding_frames'])
         for d1_key in (
             'd1_view_complete', 'd1_covered_slices', 'd1_total_slices',
             'd1_backprojected_task_slices', 'd1_bitset_words',
@@ -1346,12 +1589,17 @@ def run_prediction_volume_in_worker(
             deferred_result = _DeferredGpuWorkerTaskResult(
                 stats=public_stats,
                 flush_future=flush_future,
-                memmaps=(result_mask, result_conf, result_mask_full, result_conf_full),
+                memmaps=(
+                    result_mask, result_conf, result_mask_full, result_conf_full,
+                    radial_padding_mask, radial_padding_conf,
+                ),
             )
             result_mask = None
             result_conf = None
             result_mask_full = None
             result_conf_full = None
+            radial_padding_mask = None
+            radial_padding_conf = None
             return deferred_result
         return public_stats
     finally:
@@ -1360,7 +1608,10 @@ def run_prediction_volume_in_worker(
                 source.close()
             except Exception:
                 pass
-        for mm in (result_mask, result_conf, result_mask_full, result_conf_full, source_mm):
+        for mm in (
+            result_mask, result_conf, result_mask_full, result_conf_full,
+            radial_padding_mask, radial_padding_conf, source_mm,
+        ):
             if mm is not None:
                 try:
                     close_memmap_array(mm)
@@ -1648,91 +1899,3 @@ def _gpu_inference_worker_main(
         _shutdown_gpu_union_retirement_manager()
         _close_fd_list(persistent_source_memfds.values())
         persistent_source_memfds.clear()
-
-
-# Late imports keep callable-only dependency cycles import-safe.
-from ._latebind import bind_late_symbols as _bind_late_symbols
-
-_bind_late_symbols(
-    __name__,
-    globals(),
-    {
-        "backprojection": (
-            "_ResidentTensorRTRingFatalError",
-            "_shutdown_resident_trt_pipeline_cache",
-        ),
-        "config": (
-            "DEFAULT_CHANNEL_FORMAT",
-            "_resolve_cpu_precision",
-            "quantize_uses_fp16",
-            "resolve_channel_format",
-            "resolve_quantize",
-        ),
-        "cuda_backend": (
-            "GpuRenderedYoloSource",
-            "GpuTileRenderedYoloSource",
-            "_WORKER_TILTED_RADIAL_CPU_WARNED",
-            "_init_worker_gpu_render_engine",
-            "_radial_slab_channel_renderer",
-            "_radial_slab_context_indices",
-            "_wait_for_cube_ready_sentinel",
-            "_worker_gpu_render_engine",
-            "_worker_render_callable",
-            "open_existing_gray_memmap",
-            "set_gpu_worker_fused_preflight_specs",
-        ),
-        "cuda_d1": (
-            "_d1_backproject_kernels",
-            "_d1_consume_device_union",
-            "_shutdown_d1_worker_pipeline",
-            "d1_owner_pipeline_enabled",
-        ),
-        "geometry": (
-            "AugJob",
-            "DenseTileJob",
-            "InMemoryYoloVolumeSource",
-            "StreamingYoloVolumeSource",
-            "ViewInfo",
-            "is_radial_view",
-            "is_tilted_radial_view",
-            "is_tilted_view",
-            "output_to_view_processing_affine",
-            "radial_resident_gpu_render_supported",
-            "radial_streaming_gpu_render_supported",
-            "view_processing_volume_shape",
-        ),
-        "inference": (
-            "CpuRetinaMaskPayload",
-            "ModelInputChannelMismatchError",
-            "PredictConfig",
-            "_cleanup_prediction_slice_inplace",
-            "_clip_boxes_np",
-            "_gpu_union_retirement_manager",
-            "_init_gpu_union_retirement_manager",
-            "_process_cpu_retina_prediction_frame",
-            "_shutdown_gpu_union_retirement_manager",
-            "cpu_retina_masks_enabled",
-            "ensure_cpu_retina_mask_predictor_patch",
-            "ensure_gpu_retina_proto_union_predictor_patch",
-            "ensure_yolo_ready_for_predict",
-            "gpu_union_flush_overlap_enabled",
-            "load_ultralytics_model",
-            "predict_source_and_accumulate",
-            "request_affine_grid_cache_entries",
-            "require_channel_aware_yolo_preprocess_patch",
-            "set_angle_variant_gpu_fastpath",
-            "set_retina_mask_processor",
-            "validate_yolo_model_input_channels",
-        ),
-        "runtime": (
-            "HYBRID_DEFERRED_RESULT_MODE",
-            "_close_fd_list",
-            "_interpolation_process_entry",
-            "_materialize_worker_task_memfd_paths",
-            "_sched_setaffinity_all_threads",
-            "close_memmap_array",
-            "cpu_inference_supports_view",
-            "initialize_runtime_observability",
-        ),
-    },
-)

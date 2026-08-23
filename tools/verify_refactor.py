@@ -24,14 +24,26 @@ INTENTIONALLY_CHANGED = {
     ("cuda_d1", "_nrrd_layer_key"),
     ("cuda_d1", "_nrrd_layer_name"),
     ("geometry", "ChannelFormattedFrameRenderer"),
+    ("geometry", "InMemoryYoloVolumeSource"),
+    ("geometry", "PredictionVolumeRef"),
+    ("geometry", "StreamingYoloVolumeSource"),
     ("geometry", "channel_view_slice_index"),
     ("geometry", "make_dense_tile_channel_renderer"),
     ("geometry", "make_fullframe_channel_renderer"),
+    ("geometry", "make_in_memory_yolo_source"),
+    ("geometry", "make_prediction_ref_yolo_source"),
+    ("geometry", "materialize_dense_tile_prediction_volume_for_job"),
+    ("geometry", "materialize_fullframe_prediction_volume_for_job"),
+    ("geometry", "maybe_eager_stage_prediction_ref_on_gpu"),
     ("geometry", "render_dense_tile_frame_for_job"),
     ("geometry", "render_fullframe_frame_for_job"),
     ("geometry", "write_aug_job_meta"),
     ("geometry", "write_dense_tile_job_meta"),
     ("inference", "cpu_retina_masks_enabled"),
+    ("inference", "PredictionAccumulationHandle"),
+    ("inference", "_DeviceUnionAccumulator"),
+    ("inference", "predict_in_memory_volume_and_accumulate"),
+    ("inference", "predict_in_memory_volume_and_submit_accumulation"),
     ("media", "abort_streaming_producers"),
     ("media", "decode_video_to_memmap_gray8_streaming"),
     ("media", "resize_volume_to_processing_cube_gray8_streaming"),
@@ -61,19 +73,30 @@ INTENTIONALLY_CHANGED = {
     ("runtime", "interpolate_view_volume_pass_maybe_process"),
     ("runtime", "interpolation_process_start_method"),
     ("runtime", "reset_runtime_state_for_new_run"),
+    ("runtime", "RuntimeTelemetry"),
     ("workers", "run_prediction_volume_in_worker"),
+    ("workers", "_OpenVinoCpuSegmenter"),
+    ("workers", "run_prediction_volume_in_openvino_worker"),
     ("topology", "_try_label_slices_stage_a_gpu"),
     ("topology", "build_slice_endpoint_seeds_from_label_volume"),
     ("interpolation", "SliceEndpointSeed"),
     ("interpolation", "NrrdLayerRef"),
+    ("interpolation", "SliceBridgeRenderPlan"),
+    ("interpolation", "_paint_linear_slice_bridge_plan_onto_slice"),
+    ("interpolation", "_paste_local_mask_onto_slice"),
+    ("interpolation", "_plan_slice_seed_bridges"),
     ("interpolation", "interpolate_view_volume_pass_inplace"),
     ("interpolation", "interpolation_planning_backend_name"),
     ("finalization", "assemble_view_volumes_and_projected_layers_fused"),
+    ("finalization", "assemble_current_view_union_volume"),
     ("assembly", "finalize_consolidated_tile_volume_for_parent"),
     ("assembly", "materialize_nrrd_view_layer"),
     ("geometry", "is_tilted_view"),
     ("outputs", "write_summary_file"),
     ("outputs", "nrrd_layer_output_suffix"),
+    ("cuda_backend", "GpuRenderedYoloSource"),
+    ("cuda_backend", "GpuTileRenderedYoloSource"),
+    ("cuda_backend", "_radial_slab_context_indices"),
 }
 
 # The public wrapper now owns the full-run cleanup boundary; the preserved orchestration
@@ -87,6 +110,129 @@ INTENTIONALLY_VERSIONED = {
         "SCRIPT_VERSION",
     ("config", "bbaeec59e08232583950d10ce19229b162f82f5f41ec60afe2dff19fc2e9c6b2"):
         "SCRIPT_VERSION_COMPACT",
+    ("config", "7eeed39e30c270fc4e56bbef52e6bc94b6e61bce6599988450ac920bb180a67f"):
+        "SCRIPT_BASENAME",
+}
+
+# Functions that need to call back into a higher architectural layer carry this marker
+# immediately above an explicit function-local import.  Treat that narrow import seam as
+# a reviewed AST change without weakening the historical inventory for the function body.
+LOCAL_IMPORT_SEAM_MARKER = "# Local import keeps the package dependency graph acyclic."
+
+# Each entry pins both the complete reviewed top-level definition and the exact marker-to-
+# import associations inside it.  The second digest covers the import's relative offset,
+# enclosing lexical scopes, and normalized ImportFrom AST.  Comments are absent from Python's
+# AST, so pinning only the definition digest would still let a marker move to a different
+# already-existing local import without review.
+REVIEWED_LOCAL_IMPORT_SEAMS = {
+    ("assembly", "prepare_view_volume_after_fullframe"): (
+        "97fba54f3926ed644b98139bf880f6d37f711afd4f8b6ad2d15c064e394755fe",
+        "ef76a565816d431f18d15e145b7a2c42ffd316df45905e9daee00b8b5fd26477",
+    ),
+    ("assembly", "finalize_consolidated_tile_volume_for_parent"): (
+        "bc3ecd1d7d9f2d9e9f158a290d0e075bae85565b2b299cfe84f08b08ec7491a4",
+        "c955712cc1202c0be55b529d57026f25537c1d43e0e9c692ad6cdc85b3b913f5",
+    ),
+    ("backprojection", "backproject_tilted_volume_to_volume"): (
+        "7d3d558f67fad8df3dacb4fe385e7f4d2d600fe63a815c63cf414b9a8d66044a",
+        "101a6fb2b4446cf0d71be4e025f1224cfecb863185f21e3482bfcfc9cf3a3231",
+    ),
+    ("cuda_backend", "_GpuWorkerRenderEngine"): (
+        "0fd9ae9c9ad1205a1a3466d79b1c8e030bab0a5907b30da25d2da26e4d0437e2",
+        "6af12722154b40f75aca9726a04dcfad36c02c9160737a4a39c5ab3697562e09",
+    ),
+    ("geometry", "GpuPrefetchingYoloSource"): (
+        "d34ae87abc324d9aa32dd8906bad4d1ccb3cbab27bad863c4b1979404bfb5bc8",
+        "b230c59c54aa3f8c1c0efe9ffd6c4d6172f49531e530ce0a02acfc252c19a35d",
+    ),
+    ("geometry", "gpu_input_staging_enabled"): (
+        "3ac4bb523c36af4f98daf48f3153a3813cc9459f2aa879846459c4c3e3352e70",
+        "27c0b26fbbf4d1ccfa8a5af862a09cce91b81ea32d281a1b5301c84d4eb2876e",
+    ),
+    ("geometry", "gpu_input_staging_preflight_reserve"): (
+        "0fab02a75013aaff85c7b63328c518f3c2022e2de9fe8c5f64471b2a4cdde919",
+        "0dab677f37a32eea1b3a0138dcf73c6b876b41093fee8d61af77c89abbeb9699",
+    ),
+    ("geometry", "maybe_wrap_source_with_gpu_input_staging"): (
+        "496bf1060982040fb935f932af7624277ab7f4c8f8abe4f01f7864f1ab1f4213",
+        "28dda3f8902c87b048214bf8d3dd28f3117785ea42503b66e20db91056c6c2e2",
+    ),
+    ("geometry", "ensure_ultralytics_accepts_in_memory_volume_source"): (
+        "60badc92d2dc2b6667dd10e4d14364d82fb8496c819c2e6a523682eca0802030",
+        "857b70aaccd5a89c0104cd8a7bb39fea7e92d30adc84025789fc7f03cfc81eb4",
+    ),
+    ("geometry", "_materialize_prediction_volume_from_renderer"): (
+        "9f25cfa6cfa5031abf332f6001711bd58a9dfd344a831a40cfe90cb7c6069d49",
+        "c307c54502fdd0c1e867c6f0b72e74e7664fa6d875764b18cb182b65fe04ebd1",
+    ),
+    ("inference", "infer_yolo_model_input_channels"): (
+        "7e8d329f12766affd78ee938e593bb989e8535d157c375b143f4fbbeee1bec6c",
+        "d0e25f9ae060e0c7d74bece86ae3befb49f781d4a703061bb311fcb2c8d4f410",
+    ),
+    ("inference", "predict_source_and_accumulate"): (
+        "ade96e190b2d8e1dca2bf1e691e39e7cf2a5814008b4b98fcd88a86098485fdf",
+        "ccf37e9656817910658d67d9c07dd114ce6eb29a820fda1bfa904ac246d955d8",
+    ),
+    ("inference", "predict_source_and_submit_accumulation"): (
+        "a815666f85c4b0df61997937dea9279b32fe72b98afc1030727db1c3217c4838",
+        "1ce8d95596c7f073801ec32a1245bb5751595f1b3d6b5a2884063a126b89efdf",
+    ),
+    ("interpolation", "SliceComponentTableCache"): (
+        "fcb31853f671ae2dc0a8a7e9bada7e481186cd2b2d5c3369f803e850ff9bceab",
+        "29f4bad74e6bec994ef8fa59ab290dcb079b0a5ae918342c108b472e66ab66ab",
+    ),
+    ("interpolation", "_find_slice_projection_candidates_numba"): (
+        "cbeebf1855fd025de032082a83f62ed77b1120e6e16bdeba779c4f0badfc8e29",
+        "7fbd6e38c3db9d3821d9622ed891b1b7fbfe0f838c27de910d0944c749cfdcda",
+    ),
+    ("interpolation", "_find_slice_projection_candidates_python"): (
+        "2964a4a06f74b43fbdca643ab9663fd3332fa8f854a2ae69f3fae162a7775dc0",
+        "94740a539572d09297cb90016159014fc849ececb6d5c529e605783041542bfd",
+    ),
+    ("interpolation", "_build_slice_endpoint_seeds"): (
+        "fc5d6a613a8cd296ee5723e56650361859962addc085e130d3cb70d47946eb7e",
+        "126545d0d25722c4df5918428643130e3c6a1eb639a0c61476fd7a259ad57cdf",
+    ),
+    ("interpolation", "interpolate_view_volume_pass_inplace"): (
+        "a3e05e199bbcb2642a203bad091baef389c8f033149d7e54adc7f3f190afc224",
+        "0a585dbad86412327820dccb21e479e86057fa65bb0ae01a016b198238a3f661",
+    ),
+    ("interpolation", "RawBBoxMaskStore"): (
+        "5e076700cb529dfbbb7a0e6bb7f7b582249b312252ab7510afe9da701402aa0a",
+        "a19c94672d63a393b3a647ec73bba9da4791667f7b0082fa9f739ee56c50d16c",
+    ),
+    ("media", "resolve_radial_azimuth_angles"): (
+        "938f099878fc06c1be11510b28e23a799ab12ff42f496cc4e54f0126fc80541f",
+        "8d5afec87722d10ab7ef8bbc7606ce19d0bdae2fd6e68cf91fe3cd23ec5d77ca",
+    ),
+    ("runtime", "gpu_worker_default_seconds_per_frame"): (
+        "8a1c116c3636a5c90ea5f13260fad70cd2360f8dc703fe079e5209f0f8e1948c",
+        "efe66c8507863ddaabdad07859530397e9d25215132e7b9c854a6260bfe1281c",
+    ),
+    ("runtime", "gpu_worker_task_cost_key"): (
+        "7a962f913cbd65ea9efcf961dc0c240d9b4ec53048f5422c071259ae1b6928a6",
+        "bdd65ef45ec484d03fe3b3521df8ef368fde4d34eb9eeaa88529aedb4dd85082",
+    ),
+    ("runtime", "cpu_inference_supports_view"): (
+        "832bf116476c2bd39211d1d7232ca1b6d18bbe7d084445c3caa5809bb284e0d0",
+        "3c719dcf6dbaac2ea8151cbf0f55b27f848103316013a3aa0b26a8b24ba7439a",
+    ),
+    ("runtime", "cpu_inference_task_priority"): (
+        "bad6fb69cdc53cbb9b104e739de56a99392093d5c8b16666d6687a9cdb133090",
+        "50a97e164a4f6a098fbf7e773de161a7a1ad4a8ce05c9c37f286606a965df3bb",
+    ),
+    ("runtime", "_interpolation_process_entry"): (
+        "169ad5a655a0fa423b523db1b94d02980586180992f506701a56baa0848eaaf6",
+        "babab2eb1d231e00bab18c5e3d624b34d92401f4a0fadd98b03035b6d38e0775",
+    ),
+    ("runtime", "interpolate_view_volume_pass_maybe_process"): (
+        "41a28a721c9c6c7c4e8b85eeb36ab502f19f6e0bc782ebad2042c36d237299f5",
+        "539803830c71cfc4b66cdf2c096504b9cf2d4e970aa94d8a5121c57ed15acd98",
+    ),
+    ("topology", "_try_label_slices_stage_a_gpu"): (
+        "6dce9807e442982e580688a8466cb4076b7cf5d22db2599d943ac51b915aceff",
+        "79f6cfde9d6e366582897499240cf9ea21081d92328d16c658d9113891e0004e",
+    ),
 }
 
 INTENTIONALLY_RELOCATED = {
@@ -151,6 +297,106 @@ def digest(node: ast.AST) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def reviewed_local_import_seams(
+    module: str,
+    module_source: str,
+    tree: ast.Module,
+) -> dict[tuple[str, str], tuple[str, str]]:
+    """Validate and fingerprint every explicitly reviewed function-local import seam."""
+    source_lines = module_source.splitlines()
+    marker_lines: list[int] = []
+    malformed_marker_lines: list[int] = []
+    for line_number, line in enumerate(source_lines, start=1):
+        if LOCAL_IMPORT_SEAM_MARKER not in line:
+            continue
+        if line.strip() != LOCAL_IMPORT_SEAM_MARKER:
+            malformed_marker_lines.append(line_number)
+        else:
+            marker_lines.append(line_number)
+    if malformed_marker_lines:
+        raise RuntimeError(
+            f"{module}: local-import seam marker must be the complete comment on lines "
+            f"{malformed_marker_lines!r}"
+        )
+
+    parents = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+    imports_by_line: dict[int, list[ast.ImportFrom]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            imports_by_line.setdefault(node.lineno, []).append(node)
+
+    seams_by_top_level: dict[ast.stmt, list[tuple[int, str, str]]] = {}
+    for marker_line in marker_lines:
+        import_line = marker_line + 1
+        import_nodes = imports_by_line.get(import_line, [])
+        if len(import_nodes) != 1:
+            raise RuntimeError(
+                f"{module}:{marker_line}: local-import seam marker must be immediately "
+                "followed by exactly one from-import"
+            )
+        import_node = import_nodes[0]
+        if import_node.level < 1:
+            raise RuntimeError(
+                f"{module}:{import_line}: reviewed local-import seam must use a relative import"
+            )
+
+        marker_indent = source_lines[marker_line - 1][
+            : len(source_lines[marker_line - 1])
+            - len(source_lines[marker_line - 1].lstrip(" \t"))
+        ]
+        import_indent = source_lines[import_line - 1][
+            : len(source_lines[import_line - 1])
+            - len(source_lines[import_line - 1].lstrip(" \t"))
+        ]
+        if marker_indent != import_indent:
+            raise RuntimeError(
+                f"{module}:{marker_line}: local-import seam marker and import must have "
+                "identical indentation"
+            )
+
+        ancestors: list[ast.AST] = []
+        cursor: ast.AST = import_node
+        while cursor in parents:
+            cursor = parents[cursor]
+            ancestors.append(cursor)
+        if not any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) for node in ancestors):
+            raise RuntimeError(
+                f"{module}:{import_line}: reviewed import is not function-local"
+            )
+        top_level_nodes = [node for node in ancestors if parents.get(node) is tree]
+        if len(top_level_nodes) != 1 or not isinstance(
+            top_level_nodes[0],
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+        ):
+            raise RuntimeError(
+                f"{module}:{import_line}: reviewed import must belong to one top-level definition"
+            )
+        top_level_node = top_level_nodes[0]
+        lexical_scope = ".".join(
+            node.name
+            for node in reversed(ancestors)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        )
+        import_ast = ast.dump(import_node, annotate_fields=True, include_attributes=False)
+        seams_by_top_level.setdefault(top_level_node, []).append(
+            (import_node.lineno - top_level_node.lineno, lexical_scope, import_ast)
+        )
+
+    reviewed: dict[tuple[str, str], tuple[str, str]] = {}
+    for top_level_node, seams in seams_by_top_level.items():
+        assert isinstance(top_level_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        seam_payload = json.dumps(sorted(seams), separators=(",", ":"))
+        reviewed[(module, top_level_node.name)] = (
+            digest(top_level_node),
+            hashlib.sha256(seam_payload.encode("utf-8")).hexdigest(),
+        )
+    return reviewed
+
+
 def main() -> None:
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     source_path = ROOT / str(manifest["source"])
@@ -167,14 +413,36 @@ def main() -> None:
     available: dict[str, Counter[str]] = {}
     trees: dict[str, ast.Module] = {}
     top_level: dict[str, list[ast.stmt]] = {}
+    local_import_seams: dict[tuple[str, str], tuple[str, str]] = {}
     for module in {str(item["module"]) for item in manifest["statements"]}:
-        tree = ast.parse(
-            (PACKAGE / f"{module}.py").read_text(encoding="utf-8"),
-            filename=str(PACKAGE / f"{module}.py"),
-        )
+        module_path = PACKAGE / f"{module}.py"
+        module_source = module_path.read_text(encoding="utf-8")
+        tree = ast.parse(module_source, filename=str(module_path))
         trees[module] = tree
         top_level[module] = list(tree.body)
         available[module] = Counter(digest(node) for node in tree.body)
+        local_import_seams.update(reviewed_local_import_seams(module, module_source, tree))
+
+    unexpected_local_import_seams = sorted(
+        set(local_import_seams) - set(REVIEWED_LOCAL_IMPORT_SEAMS)
+    )
+    missing_local_import_seams = sorted(
+        set(REVIEWED_LOCAL_IMPORT_SEAMS) - set(local_import_seams)
+    )
+    changed_local_import_seams = sorted(
+        key
+        for key in set(local_import_seams) & set(REVIEWED_LOCAL_IMPORT_SEAMS)
+        if local_import_seams[key] != REVIEWED_LOCAL_IMPORT_SEAMS[key]
+    )
+    if unexpected_local_import_seams or missing_local_import_seams or changed_local_import_seams:
+        raise RuntimeError(
+            "local-import seam review mismatch: "
+            f"unexpected={unexpected_local_import_seams!r}, "
+            f"missing={missing_local_import_seams!r}, "
+            f"changed={changed_local_import_seams!r}"
+        )
+
+    effective_changed = INTENTIONALLY_CHANGED | set(REVIEWED_LOCAL_IMPORT_SEAMS)
 
     inventory_keys = {
         (str(item["module"]), str(item["sha256"]))
@@ -231,7 +499,7 @@ def main() -> None:
 
     missing_changed = [
         (module, name)
-        for module, name in sorted(INTENTIONALLY_CHANGED)
+        for module, name in sorted(effective_changed)
         if sum(
             isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
             and node.name == INTENTIONALLY_RENAMED_CHANGED.get((module, name), name)
@@ -282,7 +550,7 @@ def main() -> None:
             changed += 1
             continue
         if (
-            (module, name) in INTENTIONALLY_CHANGED
+            (module, name) in effective_changed
             or (module, statement_hash) in INTENTIONALLY_VERSIONED
         ):
             changed += 1

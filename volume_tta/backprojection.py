@@ -6,7 +6,32 @@ behavior. Public coordination contracts live under ``inference_backends``.
 
 from __future__ import annotations
 
-from ._stdlib import *
+import argparse
+import gc
+import math
+import os
+import sys
+import threading
+import time
+from collections import (
+    Counter,
+    deque,
+)
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+)
+from dataclasses import dataclass
+from pathlib import Path
+from typing import (
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    TYPE_CHECKING,
+    Tuple,
+)
 import numpy as np
 from ._deps import _numba, cv2, tqdm
 
@@ -19,6 +44,70 @@ from .geometry import (
 from .runtime import (
     runtime_telemetry_phase,
 )
+
+# Explicit lower-layer dependencies keep imports one-way.
+from .workspace import (
+    _cpu_count,
+    _env_flag,
+    _env_float,
+    _env_int,
+    proto_hole_treatment_mode,
+    proto_hole_treatment_radius,
+    v1613_d1_backprojection_overlap_enabled,
+)
+from .runtime import (
+    _acquire_parallel_pool,
+    _release_parallel_pool,
+    allocate_workspace_array,
+    array_nbytes,
+    choose_slice_parallel_workers,
+    close_memmap_array,
+    close_memmap_array_without_flush,
+    flush_array,
+    gpu_worker_aux_interpolation_pool,
+    parallel_for_indices,
+    parallel_for_indices_chunked,
+    parallel_map_unordered,
+    runtime_telemetry,
+)
+from .geometry import (
+    _affine2x3_to_3x3,
+    _cupy_external_stream,
+    build_affine,
+    build_radial_azimuths,
+    delayed_native_expansion_enabled,
+    is_radial_view,
+    is_tilted_radial_view,
+    is_tilted_view,
+    radial_base_view_name,
+    radial_plane_shape,
+    radial_source_tilted_view,
+    tilted_base_view_name,
+    tilted_frame_center,
+    tilted_stack_axis_length,
+    view_processing_plane_shape,
+    view_uses_inference_processing_grid,
+)
+from .inference import (
+    ModelInputChannelMismatchError,
+    ResidentRingUnitDescriptor,
+    _ResidentGpuPipelineSlot,
+    _cuda_graph_capture_context,
+    _resident_mask_kernels,
+    _split_segmentation_backend_outputs,
+    _warp_matrix_is_identity,
+    resident_trt_cuda_graphs_enabled,
+    resident_trt_native_warp_enabled,
+    resident_trt_ring_enabled,
+)
+from .cuda_backend import (
+    GpuRenderedYoloSource,
+    GpuTileRenderedYoloSource,
+)
+
+
+if TYPE_CHECKING:
+    from .outputs import _read_layer_slice_in_output_shape
 
 
 # These announcements belong to the resident TensorRT executor implemented in this
@@ -3894,6 +3983,9 @@ def backproject_tilted_volume_to_volume(
             )
 
             def _restore_tilted_slice(z_idx: int) -> None:
+                # Local import keeps the package dependency graph acyclic.
+                from .outputs import _read_layer_slice_in_output_shape
+
                 restored_mm[int(z_idx), :, :] = _read_layer_slice_in_output_shape(
                     reduced_mm, target_shape, int(z_idx),
                 )
@@ -4136,79 +4228,3 @@ class HybridBackprojectionQueue:
             print(f'Backprojection queue: running {job.model_name}/{job.view.name} via {backend_note}')
             results.append(self._run_job(job))
         return results
-
-
-# Late imports keep callable-only dependency cycles import-safe.
-from ._latebind import bind_late_symbols as _bind_late_symbols
-
-_bind_late_symbols(
-    __name__,
-    globals(),
-    {
-        "config": (
-            "GIB",
-        ),
-        "cuda_backend": (
-            "GpuRenderedYoloSource",
-            "GpuTileRenderedYoloSource",
-        ),
-        "geometry": (
-            "ViewInfo",
-            "_affine2x3_to_3x3",
-            "_cupy_external_stream",
-            "build_affine",
-            "build_radial_azimuths",
-            "delayed_native_expansion_enabled",
-            "is_radial_view",
-            "is_tilted_radial_view",
-            "is_tilted_view",
-            "radial_base_view_name",
-            "radial_plane_shape",
-            "radial_source_tilted_view",
-            "tilted_base_view_name",
-            "tilted_frame_center",
-            "tilted_stack_axis_length",
-            "view_processing_plane_shape",
-            "view_uses_inference_processing_grid",
-        ),
-        "inference": (
-            "ModelInputChannelMismatchError",
-            "ResidentRingUnitDescriptor",
-            "_ResidentGpuPipelineSlot",
-            "_cuda_graph_capture_context",
-            "_resident_mask_kernels",
-            "_split_segmentation_backend_outputs",
-            "_warp_matrix_is_identity",
-            "resident_trt_cuda_graphs_enabled",
-            "resident_trt_native_warp_enabled",
-            "resident_trt_ring_enabled",
-        ),
-        "outputs": (
-            "_read_layer_slice_in_output_shape",
-        ),
-        "runtime": (
-            "_acquire_parallel_pool",
-            "_release_parallel_pool",
-            "allocate_workspace_array",
-            "array_nbytes",
-            "choose_slice_parallel_workers",
-            "close_memmap_array",
-            "close_memmap_array_without_flush",
-            "flush_array",
-            "gpu_worker_aux_interpolation_pool",
-            "parallel_for_indices",
-            "parallel_for_indices_chunked",
-            "parallel_map_unordered",
-            "runtime_telemetry",
-        ),
-        "workspace": (
-            "_cpu_count",
-            "_env_flag",
-            "_env_float",
-            "_env_int",
-            "proto_hole_treatment_mode",
-            "proto_hole_treatment_radius",
-            "v1613_d1_backprojection_overlap_enabled",
-        ),
-    },
-)

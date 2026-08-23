@@ -6,17 +6,28 @@ behavior. Public coordination contracts live under ``inference_backends``.
 
 from __future__ import annotations
 
-from ._stdlib import *
+import argparse
+import math
+import re
+import shlex
+from dataclasses import dataclass
+from typing import (
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 GIB = 1024 ** 3
 
 NRRD_SPACE = "left-posterior-superior"
 
-SCRIPT_VERSION = '17.0.11'
+SCRIPT_VERSION = '17.1.0'
 
-SCRIPT_VERSION_COMPACT = '17011'
+SCRIPT_VERSION_COMPACT = '1710'
 
-SCRIPT_BASENAME = f'GPT-5.6-Sol-Pro_v{SCRIPT_VERSION}_SLURM.py'
+SCRIPT_BASENAME = f'GPT-5.6-Sol-Ultra_v{SCRIPT_VERSION}_SLURM.py'
 
 LEGACY_OUTPUT_NRRD_PREFIX = 'HW_'
 
@@ -868,13 +879,15 @@ def build_argparser() -> argparse.ArgumentParser:
         ),
     )
 
-    p.add_argument("--imgsz", default=2048, type=int, help="Square input size used for inference")
+    p.add_argument("--imgsz", default=3072, type=int, help="Square input size used for inference")
     p.add_argument(
         "--batch", nargs="+", default=None, type=str, metavar="[{gpu,cpu}:]N",
         help=(
             "Backend-specific static model batch. Use gpu:1 cpu:1 in hybrid mode; a "
-            "single untagged value is accepted for a single-backend run. Each source pads "
-            "its final batch by repeating the last real slice and discards synthetic results"
+            "single untagged value is accepted for a single-backend run. Cartesian sources "
+            "extend a final partial batch by repeating the last real slice and discard those "
+            "synthetic results. Radial sources wrap across the 0/180 seam, mirror radial-u "
+            "after odd seam crossings, and merge each prediction into its wrapped destination"
         ),
     )
     p.add_argument("--conf", default=0.15, type=float, help="Passed to YOLO predict")
@@ -1026,8 +1039,8 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Seconds allowed for each isolated embedded-centerline attempt before preserving the current union and using safe pass-through behavior")
     p.add_argument("--interpolation_distance", default=15, type=int,
                    help="Maximum view-native slice/frame distance used to search for interpolation candidates. Radial interpolation wraps around frame order. 0 disables interpolation")
-    p.add_argument("--interpolation_walk_back", default=3, type=int,
-                   help="Additional source slices to bridge before the endpoint slice. 0 disables walk-back bridges")
+    p.add_argument("--interpolation_walk_back", default=1, type=int,
+                   help="Additional source slices to bridge before the endpoint slice. The endpoint and first walked-back origin share output layer 1, preserving exactly N x --interpolation_candidates component NRRDs. 0 disables walk-back bridges but retains endpoint bridges")
     p.add_argument("--interpolation_candidates", default=1, type=int,
                    help="Accept up to the Nth nearest interpolation candidate per endpoint projection")
     p.add_argument("--interpolation_passes", default=1, type=int,

@@ -6,13 +6,80 @@ behavior. Public coordination contracts live under ``inference_backends``.
 
 from __future__ import annotations
 
-from ._stdlib import *
+import atexit
+import contextlib
+import functools
+import inspect
+import json
+import math
+import mmap
+import os
+import queue
+import re
+import shutil
+import signal
+import sys
+import tempfile
+import threading
+import time
+import importlib.metadata as importlib_metadata
+import multiprocessing as mp
+from multiprocessing import reduction as mp_reduction
+from collections import Counter
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
+)
+from dataclasses import dataclass
+from pathlib import Path
+from typing import (
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    TYPE_CHECKING,
+    Tuple,
+)
 import numpy as np
 from ._deps import cv2, tqdm
 
 from .config import (
     GIB,
 )
+
+# Explicit lower-layer dependencies keep imports one-way.
+from .config import (
+    SCRIPT_VERSION,
+    SCRIPT_VERSION_COMPACT,
+)
+from .workspace import (
+    _cpu_count,
+    _env_flag,
+    _env_float,
+    _env_int,
+    available_anon_work_bytes,
+)
+
+
+if TYPE_CHECKING:
+    from .geometry import (
+        TILTED_VIEW_FAMILY,
+        ViewInfo,
+        is_radial_view,
+        is_tilted_radial_view,
+        is_tilted_view,
+        radial_base_view_name,
+        tilted_base_view_name,
+    )
+    from .interpolation import interpolate_view_volume_pass_inplace
+    from .assembly import view_interpolation_wrap_axis
 
 _NVIDIA_ML_PY_MODULE: Optional[object] = None
 
@@ -73,7 +140,7 @@ class RuntimeTelemetry:
         else:
             base = os.environ.get('SLURM_JOB_ID') or str(os.getpid())
             self.path = Path(tempfile.gettempdir()) / (
-                f'gpt56-sol-pro-v{SCRIPT_VERSION_COMPACT}-'
+                f'gpt56-sol-ultra-v{SCRIPT_VERSION_COMPACT}-'
                 f'telemetry-{base}-{os.getpid()}.jsonl'
             )
 
@@ -145,7 +212,7 @@ class RuntimeTelemetry:
                     'mean_ms': (seconds * 1000.0 / calls) if calls else 0.0,
                 }
             payload: Dict[str, object] = {
-                'schema': f'gpt-5.6-sol-pro-v{SCRIPT_VERSION}.telemetry.v1',
+                'schema': f'gpt-5.6-sol-ultra-v{SCRIPT_VERSION}.telemetry.v1',
                 'pid': os.getpid(),
                 'monotonic_seconds': (now_ns - self.started_ns) / 1e9,
                 'wall_time': time.time(),
@@ -1244,6 +1311,13 @@ def gpu_worker_max_lease_slices() -> int:
 
 def gpu_worker_default_seconds_per_frame(view: 'ViewInfo') -> float:
     """Cold-start cost prior used until measured worker telemetry is available."""
+    # Local import keeps the package dependency graph acyclic.
+    from .geometry import (
+        is_radial_view,
+        is_tilted_radial_view,
+        is_tilted_view,
+    )
+
     if is_tilted_radial_view(view):
         default = 0.060
         env = 'YOLO_TTA_GPU_WORKER_DEFAULT_SEC_PER_FRAME_TILTED_RADIAL'
@@ -1266,6 +1340,14 @@ def gpu_worker_initial_lease_slices(view: 'ViewInfo', batch: int = 1) -> int:
     return int(estimate)
 
 def gpu_worker_task_cost_key(task: Dict[str, object]) -> Tuple[object, ...]:
+    # Local import keeps the package dependency graph acyclic.
+    from .geometry import (
+        ViewInfo,
+        is_radial_view,
+        radial_base_view_name,
+        tilted_base_view_name,
+    )
+
     view = task.get('view')
     if not isinstance(view, ViewInfo):
         return (str(task.get('kind', 'unknown')),)
@@ -1281,6 +1363,13 @@ def gpu_worker_task_cost_key(task: Dict[str, object]) -> Tuple[object, ...]:
 
 def cpu_inference_supports_view(view: object) -> bool:
     """OpenVINO owns Cartesian and Tilted Cartesian work, never Radial work."""
+    # Local import keeps the package dependency graph acyclic.
+    from .geometry import (
+        TILTED_VIEW_FAMILY,
+        ViewInfo,
+        is_radial_view,
+    )
+
     return bool(
         isinstance(view, ViewInfo)
         and not is_radial_view(view)
@@ -1289,6 +1378,9 @@ def cpu_inference_supports_view(view: object) -> bool:
 
 def cpu_inference_task_priority(task: Dict[str, object]) -> int:
     """Cartesian first (right-angle TTA first), then Tilted Cartesian."""
+    # Local import keeps the package dependency graph acyclic.
+    from .geometry import ViewInfo
+
     view = task.get('view')
     if not cpu_inference_supports_view(view):
         return 100
@@ -3307,9 +3399,13 @@ def _interpolation_process_entry(
     workers: int,
     wrap_axis: bool,
     bridge_delta_path: Optional[str] = None,
+    bridge_component_dir: Optional[str] = None,
     known_slice_any: Optional[np.ndarray] = None,
     known_slice_bboxes: Optional[np.ndarray] = None,
 ) -> Dict[str, object]:
+    # Local import keeps the package dependency graph acyclic.
+    from .interpolation import interpolate_view_volume_pass_inplace
+
     global _INTERPOLATION_PROCESS_WORKER
     _INTERPOLATION_PROCESS_WORKER = True
     try:
@@ -3339,6 +3435,9 @@ def _interpolation_process_entry(
             workers=int(workers),
             wrap_axis=bool(wrap_axis),
             bridge_delta_path=Path(bridge_delta_path) if bridge_delta_path else None,
+            bridge_component_dir=(
+                Path(bridge_component_dir) if bridge_component_dir else None
+            ),
             known_slice_any=known_slice_any,
             known_slice_bboxes=known_slice_bboxes,
         )
@@ -3370,6 +3469,7 @@ def interpolate_view_volume_pass_maybe_process(
     reserve_bytes: int = 16 * GIB,
     workers: int = 1,
     bridge_delta_path: Optional[Path] = None,
+    bridge_component_dir: Optional[Path] = None,
     known_slice_any: Optional[np.ndarray] = None,
     known_slice_bboxes: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, Dict[str, object]]:
@@ -3379,6 +3479,10 @@ def interpolate_view_volume_pass_maybe_process(
     and Tilted Cartesian views never wrap. This is derived from ``view`` and has no CLI or
     environment override. The returned array may be a new process-shareable memmap.
     """
+    # Local import keeps the package dependency graph acyclic.
+    from .interpolation import interpolate_view_volume_pass_inplace
+    from .assembly import view_interpolation_wrap_axis
+
     wrap_axis = view_interpolation_wrap_axis(view)
     executor = _INTERPOLATION_PROCESS_EXECUTOR
     if (
@@ -3401,6 +3505,7 @@ def interpolate_view_volume_pass_maybe_process(
             workers=int(workers),
             wrap_axis=bool(wrap_axis),
             bridge_delta_path=bridge_delta_path,
+            bridge_component_dir=bridge_component_dir,
             known_slice_any=known_slice_any,
             known_slice_bboxes=known_slice_bboxes,
         )
@@ -3418,6 +3523,7 @@ def interpolate_view_volume_pass_maybe_process(
     worker_mm = process_mm
     worker_path = Path(process_path)
     staged_bridge_path: Optional[Path] = None
+    staged_component_dir: Optional[Path] = None
 
     # A failed interpolation pass is allowed to have modified any byte before it raises.
     # When recovery is enabled, isolate that speculative write set in a private pathname
@@ -3447,6 +3553,10 @@ def interpolate_view_volume_pass_maybe_process(
             staged_bridge_path = Path(work_dir) / (
                 f'{_sanitize_filesystem_token(pass_tag)}.{transaction_token}.bridge-stage.u8.dat'
             )
+        if bridge_component_dir is not None:
+            staged_component_dir = Path(work_dir) / (
+                f'{_sanitize_filesystem_token(pass_tag)}.{transaction_token}.component-stage'
+            )
 
     shape = tuple(int(x) for x in np.asarray(worker_mm).shape)
     dtype_str = str(np.asarray(worker_mm).dtype)
@@ -3468,6 +3578,8 @@ def interpolate_view_volume_pass_maybe_process(
                     Path(staged_bridge_path).unlink(missing_ok=True)
                 except Exception:
                     pass
+            if staged_component_dir is not None:
+                shutil.rmtree(staged_component_dir, ignore_errors=True)
 
     def _commit_speculative_worker_storage(stats: Dict[str, object]) -> np.ndarray:
         try:
@@ -3490,6 +3602,21 @@ def interpolate_view_volume_pass_maybe_process(
                     Path(bridge_delta_path).parent.mkdir(parents=True, exist_ok=True)
                     os.replace(Path(staged_bridge_path), Path(bridge_delta_path))
                     stats['bridge_delta_path'] = str(bridge_delta_path)
+            if staged_component_dir is not None and bridge_component_dir is not None:
+                target_root = Path(bridge_component_dir)
+                target_root.mkdir(parents=True, exist_ok=True)
+                rewritten: List[Dict[str, object]] = []
+                for raw_entry in stats.get('bridge_component_deltas', []):
+                    entry = dict(raw_entry)
+                    source_path = Path(str(entry.get('path', '')))
+                    target_path = target_root / source_path.name
+                    if target_path.exists():
+                        shutil.rmtree(target_path, ignore_errors=True)
+                    if source_path.exists():
+                        os.replace(source_path, target_path)
+                    entry['path'] = str(target_path)
+                    rewritten.append(entry)
+                stats['bridge_component_deltas'] = rewritten
         finally:
             _discard_speculative_worker_storage()
         return process_mm
@@ -3497,6 +3624,9 @@ def interpolate_view_volume_pass_maybe_process(
     def _fallback_in_process(backend_name: str) -> Dict[str, object]:
         # Close/unlink only the parent's speculative mapping. A transport-failed auxiliary
         # process may still hold its own mapping, but it cannot race this clean base volume.
+        # Local import keeps the package dependency graph acyclic.
+        from .interpolation import interpolate_view_volume_pass_inplace
+
         _discard_speculative_worker_storage()
         fallback_stats = interpolate_view_volume_pass_inplace(
             mask_mm=process_mm,
@@ -3513,6 +3643,7 @@ def interpolate_view_volume_pass_maybe_process(
             workers=int(workers),
             wrap_axis=bool(wrap_axis),
             bridge_delta_path=bridge_delta_path,
+            bridge_component_dir=bridge_component_dir,
             known_slice_any=known_slice_any,
             known_slice_bboxes=known_slice_bboxes,
         )
@@ -3539,6 +3670,11 @@ def interpolate_view_volume_pass_maybe_process(
             str(staged_bridge_path)
             if staged_bridge_path is not None else
             (str(bridge_delta_path) if bridge_delta_path is not None else None)
+        ),
+        bridge_component_dir=(
+            str(staged_component_dir)
+            if staged_component_dir is not None else
+            (str(bridge_component_dir) if bridge_component_dir is not None else None)
         ),
         # small per-slice metadata arrays pickle across the process boundary.
         known_slice_any=known_slice_any,
@@ -3598,41 +3734,3 @@ def interpolate_view_volume_pass_maybe_process(
     stats['process_pool_workers'] = int(_INTERPOLATION_PROCESS_MAX_WORKERS)
     flush_array(result_mm)
     return result_mm, stats
-
-
-# Late imports keep callable-only dependency cycles import-safe.
-from ._latebind import bind_late_symbols as _bind_late_symbols
-
-_bind_late_symbols(
-    __name__,
-    globals(),
-    {
-        "assembly": (
-            "view_interpolation_wrap_axis",
-        ),
-        "config": (
-            "GIB",
-            "SCRIPT_VERSION",
-            "SCRIPT_VERSION_COMPACT",
-        ),
-        "geometry": (
-            "TILTED_VIEW_FAMILY",
-            "ViewInfo",
-            "is_radial_view",
-            "is_tilted_radial_view",
-            "is_tilted_view",
-            "radial_base_view_name",
-            "tilted_base_view_name",
-        ),
-        "interpolation": (
-            "interpolate_view_volume_pass_inplace",
-        ),
-        "workspace": (
-            "_cpu_count",
-            "_env_flag",
-            "_env_float",
-            "_env_int",
-            "available_anon_work_bytes",
-        ),
-    },
-)

@@ -6,9 +6,334 @@ behavior. Public coordination contracts live under ``inference_backends``.
 
 from __future__ import annotations
 
-from ._stdlib import *
+import gc
+import json
+import math
+import os
+import queue
+import shlex
+import shutil
+import sys
+import threading
+import time
+import weakref
+import multiprocessing as mp
+from collections import (
+    Counter,
+    deque,
+)
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    wait,
+)
+from pathlib import Path
+from typing import (
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+)
 import numpy as np
 from ._deps import cv2
+
+# Explicit lower-layer dependencies keep imports one-way.
+from .config import (
+    GIB,
+    SCRIPT_VERSION,
+    build_argparser,
+    quantize_display,
+    resolve_auto_positive_int,
+    resolve_backend_batches,
+    resolve_backend_devices,
+    resolve_backend_models,
+    resolve_backend_precisions,
+    resolve_cartesian_views,
+    resolve_channel_format,
+    resolve_postprocessing_options,
+    resolve_quantize,
+    resolve_radial_view_requests,
+    resolve_save_request,
+    resolve_tilted_view_groups,
+    resolve_tta_angles,
+    tilted_group_base_views,
+)
+from .workspace import (
+    _cpu_count,
+    _env_flag,
+    _env_float,
+    _env_int,
+    available_anon_work_bytes,
+    radial_source_mode,
+    v1613_d1_backprojection_overlap_enabled,
+    v1613_fast_bundle_requested,
+)
+from .runtime import (
+    CpuInferenceInstancePlan,
+    HYBRID_DEFERRED_RESULT_MODE,
+    INTERPOLATION_PROCESS_WORKER_DEFAULT_CAP,
+    _GpuWorkerAuxInterpolationPool,
+    _attach_memfd_transfers_to_task,
+    _filesystem_free_bytes,
+    _memfd_owner_key_from_array,
+    _mount_fstype_for_path,
+    _sanitize_filesystem_token,
+    _sched_setaffinity_all_threads,
+    allocate_workspace_array,
+    array_nbytes,
+    choose_scratch_dir,
+    choose_slice_parallel_workers,
+    close_memmap_array,
+    close_memmap_array_without_flush,
+    configure_interpolation_pass_admission,
+    copy_workspace_array,
+    cpu_inference_supports_view,
+    cpu_inference_task_priority,
+    cpu_worker_default_seconds_per_frame,
+    cpu_worker_initial_lease_slices,
+    cpu_worker_max_lease_slices,
+    cpu_worker_min_lease_slices,
+    cpu_worker_target_lease_seconds,
+    create_interpolation_process_executor,
+    default_worker_budget,
+    expose_scratch_in_output,
+    flush_array,
+    gpu_feeder_reserved_physical_cores,
+    gpu_worker_aux_interpolation_enabled,
+    gpu_worker_aux_interpolation_pool,
+    gpu_worker_cpu_share,
+    gpu_worker_default_seconds_per_frame,
+    gpu_worker_direct_union_enabled,
+    gpu_worker_fullframe_task_ranges,
+    gpu_worker_initial_lease_slices,
+    gpu_worker_max_lease_slices,
+    gpu_worker_min_lease_slices,
+    gpu_worker_tail_split_point,
+    gpu_worker_target_lease_seconds,
+    gpu_worker_task_cost_key,
+    hybrid_cpu_affinity_overlap_enabled,
+    hybrid_cpu_reserved_view_count,
+    hybrid_gpu_stealback_enabled,
+    hybrid_gpu_stealback_eta_ratio,
+    hybrid_gpu_stealback_max_fraction,
+    hybrid_gpu_stealback_min_cpu_samples,
+    hybrid_gpu_stealback_min_lead_seconds,
+    initialize_runtime_observability,
+    interpolation_process_backend_enabled,
+    interpolation_process_cv2_threads,
+    interpolation_process_start_method,
+    main_process_worker_budget,
+    memfd_workspace_enabled,
+    parallel_for_indices,
+    path_is_memory_backed,
+    plan_gpu_feeder_core_reservations,
+    plan_gpu_worker_affinity,
+    plan_openvino_cpu_instances,
+    preflight_multiprocessing_payload,
+    register_unique_run_scratch_cleanup,
+    release_memfd_owners_under,
+    reset_runtime_state_for_new_run,
+    resolve_parent_interpolation_worker_allocation,
+    resolve_parent_postprocess_worker_allocation,
+    resolve_worker_count,
+    runtime_telemetry,
+    scratch_dir_is_memory_backed,
+    set_gpu_worker_aux_interpolation_pool,
+    set_interpolation_process_executor,
+    shutdown_parallel_pool_cache,
+    tail_worker_budget_expansion_enabled,
+    workspace_anon_cap_bytes,
+)
+from .media import (
+    LazyProcessingCube,
+    _cube_t_axis_resize_backend,
+    _path_is_relative_to,
+    abort_streaming_producers,
+    compute_cube_resize_shape,
+    decode_video_to_memmap_gray8,
+    decode_video_to_memmap_gray8_streaming,
+    ffprobe_info,
+    processing_volume_mode,
+    purge_remaining_temporary_mkvs,
+    reset_streaming_state_for_new_run,
+    resize_volume_to_processing_cube_gray8,
+    resize_volume_to_processing_cube_gray8_streaming,
+    resolve_radial_azimuth_angles,
+    restore_mask_volume_to_original_shape,
+    should_resize_to_processing_cube,
+    streaming_preprocess_enabled,
+    wait_for_streaming_producers,
+    wait_for_volume_ready,
+)
+from .geometry import (
+    AugJob,
+    DenseTileJob,
+    PredictionVolumeRef,
+    StreamingYoloVolumeSource,
+    ViewInfo,
+    _prediction_ref_has_gpu_input_staging,
+    build_aug_job_for_variant,
+    build_dense_tile_jobs_for_aug,
+    build_view_frame_cache,
+    close_prediction_volume_ref,
+    expand_views_into_tta_variants,
+    get_view_infos,
+    gpu_input_staging_ahead_sources,
+    gpu_input_staging_enabled,
+    is_radial_view,
+    is_tilted_radial_view,
+    is_tilted_view,
+    iter_aug_jobs_round_robin,
+    make_dense_tile_channel_renderer,
+    make_fullframe_channel_renderer,
+    materialize_dense_tile_prediction_volume_for_job,
+    materialize_fullframe_prediction_volume_for_job,
+    maybe_eager_stage_prediction_ref_on_gpu,
+    orthogonal_views_only,
+    output_to_view_processing_affine,
+    physical_view_name,
+    pretty_view_name,
+    queued_streaming_source_cpu_warmup_slots,
+    mirrored_radial_parent_crop,
+    radial_batch_padding_count,
+    radial_batch_padding_frame_specs,
+    radial_batch_padding_mirror_groups,
+    radial_batch_padding_tile_id,
+    radial_batch_padding_tile_result_ids,
+    radial_base_view_name,
+    radial_target_base_view,
+    radial_target_diameter,
+    resolve_prediction_render_workers,
+    resolve_prediction_source_queue_slots,
+    resolve_tile_configs,
+    shared_streaming_render_pool_enabled,
+    should_cache_view_frames,
+    streaming_prediction_source_autostart_enabled,
+    streaming_prediction_source_prefetch_frames,
+    streaming_prediction_source_workers,
+    streaming_prediction_sources_enabled,
+    view_output_token,
+    view_processing_min_radius,
+    view_processing_volume_shape,
+    write_aug_job_meta,
+    write_dense_tile_job_meta,
+)
+from .inference import (
+    PredictConfig,
+    PredictionAccumulationHandle,
+    async_predict_join_workers,
+    async_predict_postprocess_enabled,
+    gpu_device_hole_fill_enabled,
+    gpu_device_union_enabled,
+    gpu_worker_chunk_hole_fill_enabled,
+    offload_between_jobs_enabled,
+    offload_yolo_from_gpu,
+    predict_in_memory_volume_and_accumulate,
+    predict_in_memory_volume_and_submit_accumulation,
+    resolve_gaussian_smoothing_settings,
+    set_angle_variant_gpu_fastpath,
+    set_inference_batch_size,
+    set_retina_mask_processor,
+    trim_cuda_memory,
+    unload_yolo_model,
+)
+from .cuda_backend import (
+    _fused_preflight_family,
+    fused_renderer_preflight_enabled,
+    gpu_cube_resize_enabled,
+    open_existing_gray_memmap,
+    union_conf_volume_into_volume_inplace,
+)
+from .interpolation import (
+    DeferredTilePostprocessResult,
+    NrrdLayerRef,
+    PreparedViewResult,
+    TilePostprocessResult,
+    TilePostprocessTask,
+    _ByteAdmissionPool,
+    _DirectUnionBackingLease,
+    _view_uses_interpolation,
+    interpolation_compiled_kernels_status,
+    materialize_raw_bbox_mask_store_workspace,
+)
+from .cuda_d1 import (
+    _memmap_backing_path,
+    _nrrd_layer_key,
+    archive_or_delete_binary_volume_storage,
+    close_raw_store_or_memmap_volume,
+    d1_owner_pipeline_enabled,
+    raw_bbox_nrrd_layers_enabled,
+    tile_dense_worker_result_limit_bytes,
+    tile_dense_worker_result_limit_tasks,
+    tile_dense_worker_result_warn_seconds,
+    tile_intermediate_accumulator_reserve_bytes,
+    tile_intermediate_accumulators_prefer_memory,
+)
+from .topology import (
+    configure_gpu_slice_labeling_devices,
+    discard_binary_volume_slice_metadata,
+)
+from .backprojection import (
+    HybridBackprojectionQueue,
+    ViewBackprojectionQueueJob,
+    _MAIN_PROCESS_GPU_STAGE_COORDINATOR,
+    _configure_main_process_gpu_stage_workers,
+    _main_process_gpu_stage_begin_inference,
+    _main_process_gpu_stage_can_dispatch_inference,
+    _main_process_gpu_stage_finish_inference,
+    _reset_main_process_gpu_stage_coordinator,
+    _set_main_process_gpu_inference_priority_active,
+    _set_main_process_gpu_pending_inference,
+    _set_main_process_gpu_stage_wake_callback,
+    fused_angle_variant_radial_component_layer_enabled,
+    main_process_gpu_stage_inference_priority_enabled,
+)
+from .outputs import (
+    BackgroundOutputManager,
+    BackgroundOutputSubmission,
+    NrrdLayerSink,
+    collect_low_quality_output_futures,
+    collect_pipeline_output_futures,
+    nrrd_layer_output_suffix,
+    nrrd_layer_sink,
+    nrrd_layer_sink_workers,
+    resolve_low_quality_downbin_specs,
+    set_nrrd_layer_sink,
+    shutdown_nrrd_gzip_executors,
+    write_summary_file,
+    write_view_images,
+)
+from .assembly import (
+    _delete_tile_result_storage,
+    apply_gaussian_smoothing_inplace,
+    defer_open_tile_result_store,
+    finalize_consolidated_tile_volume_for_parent,
+    finalize_parent_without_tile_contribution_for_sparse_retirement,
+    gate_tile_residual_against_parent_bridge,
+    gate_tile_result_against_parent_mask,
+    materialize_nrrd_global_layer,
+    postprocess_tile_volume_after_inference,
+    prepare_view_volume_after_fullframe,
+    set_final_source_output_shape,
+    spill_waiting_tile_result_to_raw_store,
+)
+from .finalization import (
+    apply_keep_largest_objects_inplace,
+    apply_v14_centerline_filter_inplace,
+    assemble_final_union_after_view_union,
+    collapse_tta_variant_volumes_to_physical_views,
+    release_unretained_volume_maps,
+    scheduler_push_drain_enabled,
+    scheduler_push_drain_heartbeat_seconds,
+)
+from .workers import (
+    _cpu_inference_worker_main,
+    _gpu_inference_worker_main,
+    _pin_cuda_visible_device_token,
+)
 
 class _PipelineRunResources:
     """Last-resort ownership for resources created anywhere in one pipeline run.
@@ -1523,14 +1848,27 @@ def _main_impl() -> None:
             expected_for_variant = int(sum(len(jobs) for jobs in jobs_by_config.values()))
             if expected_for_variant <= 0:
                 continue
+            # A radial partial batch publishes its seam-wrapped predictions as a second,
+            # mirrored tile result.  It must cross the same cleanup and P/B gates before
+            # the parent or any configured tile set is allowed to consolidate.
+            tile_result_factor = len(
+                radial_batch_padding_tile_result_ids(
+                    '__count_only__',
+                    view,
+                    int(view.num_slices),
+                    max(1, int(args.batch)),
+                )
+            )
             for model_name, _ in yolo_models:
                 parent_key = (str(model_name), str(view.name))
-                tile_expected_by_parent[parent_key] = int(expected_for_variant)
+                tile_expected_by_parent[parent_key] = int(
+                    expected_for_variant * tile_result_factor
+                )
                 tile_config_ids_by_parent[parent_key] = tuple(str(v) for v in jobs_by_config)
                 for config_id, config_jobs in jobs_by_config.items():
                     tile_expected_by_set[(
                         str(model_name), str(view.name), str(config_id),
-                    )] = int(len(config_jobs))
+                    )] = int(len(config_jobs) * tile_result_factor)
 
     view_frame_caches: Dict[str, np.ndarray] = {}
     view_frame_cache_paths: Dict[str, Path] = {}
@@ -1839,6 +2177,7 @@ def _main_impl() -> None:
             autostart=bool(streaming_prediction_source_autostart_enabled()),
             shared_executor=prediction_render_executor,
             channel_format=channel_format,
+            view=view,
         )
         return PredictionVolumeRef(
             array=None,
@@ -1876,6 +2215,7 @@ def _main_impl() -> None:
             autostart=bool(streaming_prediction_source_autostart_enabled()),
             shared_executor=prediction_render_executor,
             channel_format=channel_format,
+            view=view,
         )
         return PredictionVolumeRef(
             array=None,
@@ -2853,6 +3193,213 @@ def _main_impl() -> None:
         fut = prediction_join_executor.submit(handle.wait)
         prediction_accumulation_futures[fut] = dict(context)
 
+    def _submit_radial_padding_tile_cleanups(
+        *,
+        model_name: str,
+        view: ViewInfo,
+        tile_job: DenseTileJob,
+        padding_mask_mm: np.ndarray,
+        padding_conf_mm: Optional[np.ndarray],
+        padding_mask_path: Path,
+        padding_conf_path: Optional[Path],
+        padding_frames: Sequence[Dict[str, object]],
+        threshold_plane_shape: Sequence[int],
+    ) -> None:
+        """Regroup compact seam slots into parity-specific full-depth tile results."""
+
+        def _retire_compact_sink() -> None:
+            close_memmap_array(padding_conf_mm)
+            close_memmap_array(padding_mask_mm)
+            if not keep_temp_artifacts:
+                for compact_path in (padding_mask_path, padding_conf_path):
+                    if compact_path is not None:
+                        try:
+                            Path(compact_path).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+
+        compact_shape = tuple(int(value) for value in np.asarray(padding_mask_mm).shape)
+        if len(compact_shape) != 3 or int(compact_shape[0]) != int(len(padding_frames)):
+            _retire_compact_sink()
+            raise ValueError(
+                f'{model_name}/{view.name}/{tile_job.tile_id}: compact radial padding '
+                f'shape {compact_shape} does not match {len(padding_frames)} frame specs'
+            )
+        threshold_shape = tuple(int(value) for value in threshold_plane_shape)
+        if len(threshold_shape) != 2:
+            _retire_compact_sink()
+            raise ValueError(f'Invalid tile threshold plane shape: {threshold_shape}')
+        original_crop = tuple(int(value) for value in tile_job.parent_crop)
+        grouped_frames: Dict[bool, List[Dict[str, object]]] = {}
+        for frame in padding_frames:
+            ordinal = int(frame.get('ordinal', -1))
+            destination = int(frame.get('destination', -1))
+            if ordinal < 0 or ordinal >= int(compact_shape[0]):
+                _retire_compact_sink()
+                raise IndexError(f'Radial padding ordinal {ordinal} is outside {compact_shape}')
+            if destination < 0 or destination >= int(view.num_slices):
+                _retire_compact_sink()
+                raise IndexError(
+                    f'Radial padding destination {destination} is outside '
+                    f'{view.name} ({int(view.num_slices)} slices)'
+                )
+            grouped_frames.setdefault(bool(frame.get('mirror_radial_u', False)), []).append(
+                dict(frame)
+            )
+
+        grouped_results: List[
+            Tuple[str, Tuple[int, int, int, int], np.ndarray, Optional[np.ndarray], Path, Optional[Path]]
+        ] = []
+
+        def _discard_grouped_result(
+            grouped_result: Tuple[
+                str, Tuple[int, int, int, int], np.ndarray, Optional[np.ndarray],
+                Path, Optional[Path],
+            ],
+        ) -> None:
+            _result_id, _crop, mask_mm, conf_mm, mask_path, conf_path = grouped_result
+            close_memmap_array_without_flush(conf_mm)
+            close_memmap_array_without_flush(mask_mm)
+            if not keep_temp_artifacts:
+                for grouped_path in (mask_path, conf_path):
+                    if grouped_path is not None:
+                        try:
+                            Path(grouped_path).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+
+        try:
+            for mirror_radial_u in (True, False):
+                frames = grouped_frames.get(bool(mirror_radial_u), [])
+                if not frames:
+                    continue
+                auxiliary_id = radial_batch_padding_tile_id(
+                    str(tile_job.tile_id), mirror_radial_u=bool(mirror_radial_u),
+                )
+                auxiliary_crop = (
+                    mirrored_radial_parent_crop(original_crop, int(threshold_shape[1]))
+                    if bool(mirror_radial_u) else original_crop
+                )
+                declared_crops = {
+                    tuple(int(value) for value in frame.get('parent_crop', auxiliary_crop))
+                    for frame in frames
+                }
+                if declared_crops != {tuple(auxiliary_crop)}:
+                    raise ValueError(
+                        f'{model_name}/{view.name}/{auxiliary_id}: inconsistent radial '
+                        f'padding crops {sorted(declared_crops)}; expected {auxiliary_crop}'
+                    )
+                full_shape = (
+                    int(view.num_slices), int(compact_shape[1]), int(compact_shape[2]),
+                )
+                auxiliary_dir = (
+                    temp_dir / 'tile_volumes' / str(model_name) / str(view.name)
+                )
+                auxiliary_dir.mkdir(parents=True, exist_ok=True)
+                auxiliary_mask_path = auxiliary_dir / f'{auxiliary_id}.u8.dat'
+                auxiliary_conf_path = (
+                    auxiliary_dir / f'{auxiliary_id}.confmap.u8.dat'
+                    if padding_conf_mm is not None else None
+                )
+                auxiliary_mask_mm: Optional[np.ndarray] = None
+                auxiliary_conf_mm: Optional[np.ndarray] = None
+                try:
+                    auxiliary_mask_mm = allocate_workspace_array(
+                        shape=full_shape,
+                        dtype=np.uint8,
+                        path=auxiliary_mask_path,
+                        desc=f'{model_name}/{view.name}/{auxiliary_id} radial seam tile volume',
+                        prefer_memory=True,
+                        initialize_zero=True,
+                    )
+                    auxiliary_conf_mm = (
+                        allocate_workspace_array(
+                            shape=full_shape,
+                            dtype=np.uint8,
+                            path=auxiliary_conf_path,
+                            desc=(
+                                f'{model_name}/{view.name}/{auxiliary_id} radial seam '
+                                'tile confidence workspace'
+                            ),
+                            prefer_memory=True,
+                            initialize_zero=True,
+                        )
+                        if auxiliary_conf_path is not None else None
+                    )
+                    for frame in frames:
+                        ordinal = int(frame['ordinal'])
+                        destination = int(frame['destination'])
+                        np.bitwise_or(
+                            auxiliary_mask_mm[destination],
+                            np.asarray(padding_mask_mm[ordinal], dtype=np.uint8),
+                            out=auxiliary_mask_mm[destination],
+                        )
+                        if auxiliary_conf_mm is not None and padding_conf_mm is not None:
+                            np.maximum(
+                                auxiliary_conf_mm[destination],
+                                np.asarray(padding_conf_mm[ordinal], dtype=np.uint8),
+                                out=auxiliary_conf_mm[destination],
+                            )
+                    grouped_results.append((
+                        str(auxiliary_id), tuple(auxiliary_crop),
+                        auxiliary_mask_mm, auxiliary_conf_mm,
+                        auxiliary_mask_path, auxiliary_conf_path,
+                    ))
+                except BaseException:
+                    if auxiliary_mask_mm is not None:
+                        _discard_grouped_result((
+                            str(auxiliary_id), tuple(auxiliary_crop),
+                            auxiliary_mask_mm, auxiliary_conf_mm,
+                            auxiliary_mask_path, auxiliary_conf_path,
+                        ))
+                    for grouped_result in grouped_results:
+                        _discard_grouped_result(grouped_result)
+                    grouped_results.clear()
+                    raise
+        finally:
+            _retire_compact_sink()
+
+        submitted_count = 0
+        try:
+            for (
+                auxiliary_id, auxiliary_crop, auxiliary_mask_mm, auxiliary_conf_mm,
+                auxiliary_mask_path, auxiliary_conf_path,
+            ) in grouped_results:
+                task = TilePostprocessTask(
+                    model_name=str(model_name),
+                    view_name=str(view.name),
+                    aug_id=str(view.tta_aug_id),
+                    angle_deg=float(view.tta_angle_deg),
+                    config_id=str(tile_job.config_id),
+                    tile_id=str(auxiliary_id),
+                    parent_crop=tuple(auxiliary_crop),
+                    tile_mask_mm=auxiliary_mask_mm,
+                    tile_confmap_mm=auxiliary_conf_mm,
+                    tile_mask_path=auxiliary_mask_path,
+                    tile_confmap_path=auxiliary_conf_path,
+                    precleaned_slice_cleanup=bool(angle_variant_streaming_cleanup_active),
+                    processing_shape=tuple(int(value) for value in np.asarray(auxiliary_mask_mm).shape),
+                    threshold_plane_shape=threshold_shape,
+                )
+                tile_fut = tile_dense_retirement_executor.submit(
+                    postprocess_tile_volume_after_inference,
+                    task,
+                    view=view,
+                    min_conf=float(args.min_conf),
+                    min_radius=float(args.min_radius),
+                    keep_temp=bool(keep_temp_artifacts),
+                    slice_workers=int(tile_dense_retirement_slice_workers),
+                    sparse_retire_dir=temp_dir,
+                )
+                tile_cleanup_futures[tile_fut] = (
+                    str(model_name), str(view.name), str(tile_job.config_id), str(auxiliary_id),
+                )
+                submitted_count += 1
+        except BaseException:
+            for grouped_result in grouped_results[int(submitted_count):]:
+                _discard_grouped_result(grouped_result)
+            raise
+
     def _drain_completed_prediction_accumulation_futures() -> None:
         for fut in list(prediction_accumulation_futures.keys()):
             if not fut.done():
@@ -2868,6 +3415,17 @@ def _main_impl() -> None:
                 yolo_obj = context.get('yolo')
                 if offload_between_jobs_enabled() and yolo_obj is not None:
                     offload_yolo_from_gpu(yolo_obj)
+                expected_padding_count = radial_batch_padding_count(
+                    view, int(view.num_slices), max(1, int(pred_cfg.batch)),
+                )
+                processed_padding_count = int(
+                    pred_stats.get('radial_padding_processed', 0) or 0
+                )
+                if processed_padding_count != int(expected_padding_count):
+                    raise RuntimeError(
+                        f'{model_name}/{view.name}: async full-frame inference processed '
+                        f'{processed_padding_count}/{expected_padding_count} radial batch seam slots'
+                    )
                 view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(pred_stats.get('prediction_count', 0))
                 remaining_key = (model_name, view.name)
                 fullframe_remaining[remaining_key] = int(fullframe_remaining.get(remaining_key, 0)) - 1
@@ -2892,6 +3450,65 @@ def _main_impl() -> None:
                     offload_yolo_from_gpu(yolo_obj)
                 tile_inference_done.add(ready_key)
                 view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(pred_stats.get('prediction_count', 0))
+
+                padding_frames_raw = context.get('radial_padding_frames', ())
+                if isinstance(padding_frames_raw, (list, tuple)) and padding_frames_raw:
+                    expected_padding_count = int(len(padding_frames_raw))
+                    processed_padding_count = int(
+                        pred_stats.get('radial_padding_processed', 0) or 0
+                    )
+                    if processed_padding_count != expected_padding_count:
+                        for array_obj in (
+                            context.get('radial_padding_conf_mm'),
+                            context.get('radial_padding_mask_mm'),
+                            tile_conf_mm,
+                            tile_mask_mm,
+                        ):
+                            close_memmap_array_without_flush(array_obj)
+                        if not keep_temp_artifacts:
+                            for raw_path in (
+                                context.get('radial_padding_conf_path'),
+                                context.get('radial_padding_mask_path'),
+                                tile_conf_path,
+                                tile_mask_path,
+                            ):
+                                if raw_path is not None:
+                                    try:
+                                        Path(raw_path).unlink(missing_ok=True)
+                                    except Exception:
+                                        pass
+                        raise RuntimeError(
+                            f'{model_name}/{view.name}/{tile_job.tile_id}: async inference '
+                            f'processed {processed_padding_count}/{expected_padding_count} '
+                            'radial batch seam slots'
+                        )
+                    padding_mask_mm = context.get('radial_padding_mask_mm')
+                    if padding_mask_mm is None:
+                        raise RuntimeError('Async radial tile result has no compact mask sink')
+                    padding_conf_obj = context.get('radial_padding_conf_mm')
+                    padding_mask_path = Path(context['radial_padding_mask_path'])
+                    padding_conf_path_obj = context.get('radial_padding_conf_path')
+                    _submit_radial_padding_tile_cleanups(
+                        model_name=str(model_name),
+                        view=view,
+                        tile_job=tile_job,
+                        padding_mask_mm=padding_mask_mm,
+                        padding_conf_mm=padding_conf_obj,
+                        padding_mask_path=padding_mask_path,
+                        padding_conf_path=(
+                            Path(padding_conf_path_obj)
+                            if padding_conf_path_obj is not None else None
+                        ),
+                        padding_frames=[dict(value) for value in padding_frames_raw],
+                        threshold_plane_shape=tuple(
+                            int(value) for value in context['threshold_plane_shape']
+                        ),
+                    )
+                elif int(pred_stats.get('radial_padding_processed', 0) or 0) > 0:
+                    raise RuntimeError(
+                        f'{model_name}/{view.name}/{tile_job.tile_id}: async inference '
+                        'returned unexpected radial padding results'
+                    )
 
                 if int(pred_stats.get('frames_with_predictions', 0)) <= 0:
                     close_memmap_array(tile_mask_mm)
@@ -3255,6 +3872,7 @@ def _main_impl() -> None:
         int, Tuple[Optional[np.ndarray], Optional[np.ndarray]]
     ] = {}
     gpu_worker_tile_task_id_by_key: Dict[Tuple[str, str, str], int] = {}
+    gpu_worker_tile_pending_result_ids_by_task: Dict[int, set[str]] = {}
     gpu_inference_drained_at: Optional[float] = None
     gpu_inference_drain_announced = False
     # D1 source-space bitsets are deliberately view-owned. One worker may own exactly one
@@ -3288,6 +3906,19 @@ def _main_impl() -> None:
     hybrid_view_tasks_by_backend: Dict[Tuple[str, str], Counter[str]] = {}
     gpu_worker_seed_task_count = 0
 
+    def _tile_task_radial_padding_count(task: Dict[str, object]) -> int:
+        if str(task.get('kind', '')) != 'tile':
+            return 0
+        view_obj = task.get('view')
+        if not isinstance(view_obj, ViewInfo):
+            return 0
+        return radial_batch_padding_count(
+            view_obj,
+            int(task.get('slice_count', view_obj.num_slices)),
+            max(1, int(task.get('prediction_batch', args.batch))),
+            slice_offset=int(task.get('slice_start', 0)),
+        )
+
     def _tile_dense_result_task_bytes(task: Dict[str, object]) -> int:
         if str(task.get('kind', '')) != 'tile':
             return 0
@@ -3295,7 +3926,22 @@ def _main_impl() -> None:
         if len(shape) != 3:
             return 0
         planes = 2 if task.get('result_conf_path') else 1
-        return int(array_nbytes(shape, np.uint8)) * int(planes)
+        main_bytes = int(array_nbytes(shape, np.uint8)) * int(planes)
+        padding_count = int(_tile_task_radial_padding_count(task))
+        if padding_count <= 0:
+            return int(main_bytes)
+        view_obj = task.get('view')
+        assert isinstance(view_obj, ViewInfo)
+        group_count = len(radial_batch_padding_mirror_groups(
+            view_obj,
+            int(task.get('slice_count', view_obj.num_slices)),
+            max(1, int(task.get('prediction_batch', args.batch))),
+            slice_offset=int(task.get('slice_start', 0)),
+        ))
+        plane_bytes = int(shape[1]) * int(shape[2]) * int(np.dtype(np.uint8).itemsize)
+        compact_padding_bytes = int(padding_count) * int(plane_bytes) * int(planes)
+        grouped_result_bytes = int(group_count) * int(main_bytes)
+        return int(main_bytes + compact_padding_bytes + grouped_result_bytes)
 
     def _tile_dense_result_task_admissible(task: Dict[str, object]) -> bool:
         if bool(keep_temp_artifacts) or str(task.get('kind', '')) != 'tile':
@@ -3484,6 +4130,10 @@ def _main_impl() -> None:
         nonlocal gpu_worker_tile_dense_result_memfd_bytes_reserved
         nonlocal gpu_worker_tile_dense_result_max_retention_seconds
         task_id_i = int(task_id)
+        gpu_worker_tile_pending_result_ids_by_task.pop(task_id_i, None)
+        for result_key, mapped_task_id in list(gpu_worker_tile_task_id_by_key.items()):
+            if int(mapped_task_id) == int(task_id_i):
+                gpu_worker_tile_task_id_by_key.pop(result_key, None)
         released = gpu_worker_tile_dense_result_reservations.pop(task_id_i, None)
         released_memfd = gpu_worker_tile_dense_result_memfd_reservations.pop(task_id_i, None)
         reserved_at = gpu_worker_tile_dense_result_reserved_at.pop(task_id_i, None)
@@ -3609,11 +4259,16 @@ def _main_impl() -> None:
         task_id = gpu_worker_tile_task_id_by_key.get(key)
         if task_id is None:
             return False
+        pending_ids = gpu_worker_tile_pending_result_ids_by_task.get(int(task_id))
+        if pending_ids is not None:
+            pending_ids.discard(str(tile_id_s))
+            gpu_worker_tile_task_id_by_key.pop(key, None)
+            if pending_ids:
+                return False
+            gpu_worker_tile_pending_result_ids_by_task.pop(int(task_id), None)
         did_release = _release_tile_dense_result_task_id(
             int(task_id), reason=str(reason), refill=True,
         )
-        if did_release:
-            gpu_worker_tile_task_id_by_key.pop(key, None)
         return bool(did_release)
 
     def _gpu_worker_task_seconds(task: Dict[str, object]) -> float:
@@ -5270,12 +5925,20 @@ def _main_impl() -> None:
                     cpu_worker_process_active and cpu_inference_supports_view(view)
                 )
                 gpu_eligible = bool(gpu_worker_process_active)
+                radial_parent_requires_seam_union = bool(
+                    radial_batch_padding_count(
+                        view,
+                        int(n_slices),
+                        max(1, int(args.gpu_batch)),
+                    ) > 0
+                )
                 hybrid_deferred = bool(
                     str(kind) == 'fullframe'
                     and v1613_d1_owner_active
                     and worker_direct_union_active
                     and cpu_eligible
                     and gpu_eligible
+                    and not radial_parent_requires_seam_union
                 )
                 if hybrid_deferred:
                     # First claim resolves the whole view: OpenVINO -> shared direct union;
@@ -5284,7 +5947,12 @@ def _main_impl() -> None:
                     rmask = None
                     rconf = None
                     result_mode = HYBRID_DEFERRED_RESULT_MODE
-                elif str(kind) == 'fullframe' and v1613_d1_owner_active and not cpu_eligible:
+                elif (
+                    str(kind) == 'fullframe'
+                    and v1613_d1_owner_active
+                    and not cpu_eligible
+                    and not radial_parent_requires_seam_union
+                ):
                     # D1 retains only a task-local device union and one persistent source-space
                     # bitset on the owner GPU. No host result path or dense per-view workspace exists.
                     rmask = None
@@ -5323,6 +5991,8 @@ def _main_impl() -> None:
                     'result_mask_path': (str(rmask) if rmask is not None else None),
                     'result_conf_path': (str(rconf) if rconf is not None else None),
                     'result_mode': str(result_mode), 'union_num_slices': int(n_slices),
+                    'prediction_batch': max(1, int(args.gpu_batch)),
+                    'radial_padding_dir': str(gpu_worker_result_dir / 'radial_batch_padding'),
                     'hybrid_cpu_eligible_origin': bool(hybrid_deferred),
                     'render_workers': int(render_workers), 'prefetch_frames': int(prefetch_frames),
                     'postprocess_workers': int(per_worker_workers),
@@ -5364,10 +6034,21 @@ def _main_impl() -> None:
                     parent_key = (str(model_name), str(view.name))
                     fullframe_task_ids_by_parent.setdefault(parent_key, []).append(int(next_task_id))
                 if str(kind) == 'tile':
-                    tile_key = (str(model_name), str(view.name), str(job_id))
-                    if tile_key in gpu_worker_tile_task_id_by_key:
-                        raise RuntimeError(f'duplicate tile worker task key: {tile_key}')
-                    gpu_worker_tile_task_id_by_key[tile_key] = int(next_task_id)
+                    result_ids = radial_batch_padding_tile_result_ids(
+                        str(job_id),
+                        view,
+                        int(count),
+                        max(1, int(args.gpu_batch)),
+                        slice_offset=int(s0),
+                    )
+                    for result_id in result_ids:
+                        tile_key = (str(model_name), str(view.name), str(result_id))
+                        if tile_key in gpu_worker_tile_task_id_by_key:
+                            raise RuntimeError(f'duplicate tile worker task key: {tile_key}')
+                        gpu_worker_tile_task_id_by_key[tile_key] = int(next_task_id)
+                    gpu_worker_tile_pending_result_ids_by_task[int(next_task_id)] = set(
+                        str(result_id) for result_id in result_ids
+                    )
                 next_task_id += 1
         gpu_worker_total_tasks = int(next_task_id)
         gpu_worker_seed_task_count = int(next_task_id)
@@ -5564,10 +6245,97 @@ def _main_impl() -> None:
             f'tracked after {dynamic_splits} claim-time split(s) (hard full-frame chunk cap={slice_chunk}; '
             f'{", ".join(lease_details)}).{hybrid_policy}'
         )
+    pending_radial_padding_by_parent: Dict[
+        Tuple[str, str], List[Tuple[Dict[str, object], Dict[str, object]]]
+    ] = {}
+
+    def _merge_pending_radial_padding_for_parent(model_name_s: str, view: ViewInfo) -> None:
+        parent_key = (str(model_name_s), str(view.name))
+        pending = pending_radial_padding_by_parent.pop(parent_key, [])
+        if not pending:
+            return
+        _ensure_baseline_workspaces(str(model_name_s), view)
+        dst_mask = baseline_union_by_model_view[parent_key]
+        dst_conf = baseline_confmap_by_model_view.get(parent_key)
+        for task_obj, stats_obj in pending:
+            pad_count = int(stats_obj.get('radial_padding_count', 0) or 0)
+            mask_path_raw = str(stats_obj.get('radial_padding_mask_path', '') or '')
+            if pad_count <= 0 or not mask_path_raw:
+                raise RuntimeError(
+                    f'{model_name_s}/{view.name}: worker reported processed radial '
+                    'padding without a positive count and mask path'
+                )
+            proc_shape = tuple(int(v) for v in task_obj.get(
+                'processing_shape',
+                view_processing_volume_shape(view, int(task_obj.get('out_size', args.imgsz))),
+            ))
+            pad_shape = tuple(int(value) for value in stats_obj.get(
+                'radial_padding_shape',
+                (int(pad_count), int(proc_shape[1]), int(proc_shape[2])),
+            ))
+            if len(pad_shape) != 3 or int(pad_shape[0]) < int(pad_count):
+                raise ValueError(
+                    f'{model_name_s}/{view.name}: invalid radial padding result shape '
+                    f'{pad_shape} for {pad_count} wrapped slice(s)'
+                )
+            conf_path_raw = str(stats_obj.get('radial_padding_conf_path', '') or '')
+            destinations = tuple(
+                int(v) for v in stats_obj.get('radial_padding_destinations', tuple(range(pad_count)))
+            )
+            if len(destinations) != int(pad_count):
+                raise ValueError(
+                    f'{model_name_s}/{view.name}: radial padding returned '
+                    f'{len(destinations)} destinations for {pad_count} slots'
+                )
+            pad_mask: Optional[np.ndarray] = None
+            pad_conf: Optional[np.ndarray] = None
+            try:
+                pad_mask = open_existing_gray_memmap(
+                    mask_path_raw, pad_shape, 'uint8', mode='r',
+                )
+                if conf_path_raw:
+                    pad_conf = open_existing_gray_memmap(
+                        conf_path_raw, pad_shape, 'uint8', mode='r',
+                    )
+                for pad_index, destination in enumerate(destinations):
+                    if destination < 0 or destination >= int(view.num_slices):
+                        raise IndexError(
+                            f'{model_name_s}/{view.name}: radial padding destination '
+                            f'{destination} is outside {int(view.num_slices)} slices'
+                        )
+                    union_conf_volume_into_volume_inplace(
+                        dst_mask[int(destination):int(destination) + 1],
+                        (
+                            dst_conf[int(destination):int(destination) + 1]
+                            if dst_conf is not None else None
+                        ),
+                        pad_mask[int(pad_index):int(pad_index) + 1],
+                        (
+                            pad_conf[int(pad_index):int(pad_index) + 1]
+                            if pad_conf is not None else None
+                        ),
+                        workers=1,
+                        desc=(
+                            f'Union {view.name} radial batch seam padding '
+                            f'into slice {int(destination)}'
+                        ),
+                    )
+            finally:
+                close_memmap_array(pad_mask)
+                close_memmap_array(pad_conf)
+                if not keep_temp_artifacts:
+                    for raw_path in (mask_path_raw, conf_path_raw):
+                        if raw_path:
+                            try:
+                                Path(raw_path).unlink(missing_ok=True)
+                            except Exception:
+                                pass
+
     def _finalize_fullframe_view_after_worker(model_name_s: str, view: ViewInfo) -> None:
         remaining_key = (str(model_name_s), str(view.name))
         fullframe_remaining[remaining_key] = int(fullframe_remaining.get(remaining_key, 0)) - 1
         if int(fullframe_remaining.get(remaining_key, 0)) == 0:
+            _merge_pending_radial_padding_for_parent(str(model_name_s), view)
             _submit_view_prepare(str(model_name_s), view)
 
     def _accumulate_fullframe_slice_metadata(
@@ -5622,6 +6390,31 @@ def _main_impl() -> None:
             key_fill = (model_name_s, str(view.name))
             view_device_hole_filled_slices[key_fill] = int(view_device_hole_filled_slices.get(key_fill, 0)) + _filled
         meta_key = (model_name_s, str(view.name))
+        expected_radial_padding = radial_batch_padding_count(
+            view,
+            int(task.get('slice_count', view.num_slices)),
+            max(1, int(task.get('prediction_batch', args.batch))),
+            slice_offset=int(task.get('slice_start', 0)),
+        )
+        processed_radial_padding = int(stats.get('radial_padding_processed', 0) or 0)
+        if int(processed_radial_padding) != int(expected_radial_padding):
+            raise RuntimeError(
+                f'{model_name_s}/{view.name}: worker processed '
+                f'{processed_radial_padding}/{expected_radial_padding} radial batch seam slots'
+            )
+        if int(processed_radial_padding) > 0:
+            declared_radial_padding = int(stats.get('radial_padding_count', 0) or 0)
+            if declared_radial_padding != int(expected_radial_padding):
+                raise RuntimeError(
+                    f'{model_name_s}/{view.name}: worker declared '
+                    f'{declared_radial_padding}/{expected_radial_padding} radial padding slots'
+                )
+            if str(task.get('result_mode', 'file')) == 'd1_owner':
+                raise RuntimeError(
+                    f'{model_name_s}/{view.name}: radial batch seam padding cannot enter '
+                    'the source-space D1 owner result; this parent must use direct/file union'
+                )
+            pending_radial_padding_by_parent.setdefault(meta_key, []).append((task, stats))
         _accumulate_fullframe_slice_metadata(task, stats, view)
         if str(task.get('result_mode', 'file')) == 'd1_owner':
             complete = bool(stats.get('d1_view_complete', False))
@@ -5713,12 +6506,80 @@ def _main_impl() -> None:
                         pass
         _finalize_fullframe_view_after_worker(model_name_s, view)
 
-    def _handle_tile_worker_result(task: Dict[str, object], stats: Dict[str, int]) -> None:
+    def _handle_tile_worker_result(task: Dict[str, object], stats: Dict[str, object]) -> None:
         view = task['view']
+        assert isinstance(view, ViewInfo)
         model_name_s = str(task['model_name'])
         tile_job = task['job']
+        assert isinstance(tile_job, DenseTileJob)
         view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(stats.get('prediction_count', 0))
         tile_inference_done.add((model_name_s, str(view.name), str(tile_job.tile_id)))
+        expected_padding_count = int(_tile_task_radial_padding_count(task))
+        processed_padding_count = int(stats.get('radial_padding_processed', 0) or 0)
+        if expected_padding_count > 0:
+            if int(processed_padding_count) != int(expected_padding_count):
+                raise RuntimeError(
+                    f'{model_name_s}/{view.name}/{tile_job.tile_id}: worker processed '
+                    f'{processed_padding_count}/{expected_padding_count} radial batch seam slots'
+                )
+            padding_shape = tuple(int(value) for value in stats.get(
+                'radial_padding_shape',
+                (
+                    int(expected_padding_count),
+                    int(task['processing_shape'][1]),
+                    int(task['processing_shape'][2]),
+                ),
+            ))
+            padding_mask_path_raw = str(stats.get('radial_padding_mask_path', '') or '')
+            if not padding_mask_path_raw:
+                raise RuntimeError(
+                    f'{model_name_s}/{view.name}/{tile_job.tile_id}: worker returned no '
+                    'radial padding mask path'
+                )
+            padding_mask_path = Path(padding_mask_path_raw)
+            padding_conf_path_raw = str(stats.get('radial_padding_conf_path', '') or '')
+            padding_conf_path = Path(padding_conf_path_raw) if padding_conf_path_raw else None
+            padding_mask_mm: Optional[np.ndarray] = None
+            padding_conf_mm: Optional[np.ndarray] = None
+            try:
+                padding_mask_mm = open_existing_gray_memmap(
+                    padding_mask_path, padding_shape, 'uint8', mode='r+',
+                )
+                if padding_conf_path is not None:
+                    padding_conf_mm = open_existing_gray_memmap(
+                        padding_conf_path, padding_shape, 'uint8', mode='r+',
+                    )
+            except BaseException:
+                close_memmap_array(padding_conf_mm)
+                close_memmap_array(padding_mask_mm)
+                raise
+            padding_frames_raw = stats.get('radial_padding_frames')
+            if not isinstance(padding_frames_raw, (list, tuple)):
+                close_memmap_array(padding_conf_mm)
+                close_memmap_array(padding_mask_mm)
+                raise TypeError(
+                    f'{model_name_s}/{view.name}/{tile_job.tile_id}: worker returned invalid '
+                    'radial padding frame metadata'
+                )
+            _submit_radial_padding_tile_cleanups(
+                model_name=model_name_s,
+                view=view,
+                tile_job=tile_job,
+                padding_mask_mm=padding_mask_mm,
+                padding_conf_mm=padding_conf_mm,
+                padding_mask_path=padding_mask_path,
+                padding_conf_path=padding_conf_path,
+                padding_frames=[dict(value) for value in padding_frames_raw],
+                threshold_plane_shape=tuple(int(value) for value in task.get(
+                    'threshold_plane_shape',
+                    view_processing_volume_shape(view, int(task.get('out_size', args.imgsz)))[-2:],
+                )),
+            )
+        elif processed_padding_count > 0:
+            raise RuntimeError(
+                f'{model_name_s}/{view.name}/{tile_job.tile_id}: unexpected radial '
+                f'padding result ({processed_padding_count} slot(s))'
+            )
         if int(stats.get('frames_with_predictions', 0)) <= 0:
             if not keep_temp_artifacts:
                 for pth in (task.get('result_mask_path'), task.get('result_conf_path')):
@@ -5727,10 +6588,9 @@ def _main_impl() -> None:
                             Path(str(pth)).unlink(missing_ok=True)
                         except Exception:
                             pass
-            _release_tile_dense_result_task_id(
-                int(task.get('task_id', -1)),
+            _release_tile_dense_result_for_key(
+                model_name_s, str(view.name), str(tile_job.tile_id),
                 reason='inference worker reported an empty tile result',
-                refill=True,
             )
             _mark_tile_complete(
                 model_name_s, str(view.name),
@@ -6298,6 +7158,20 @@ def _main_impl() -> None:
                             )
                             if offload_between_jobs_enabled():
                                 offload_yolo_from_gpu(yolo)
+                            expected_padding_count = radial_batch_padding_count(
+                                view,
+                                int(view.num_slices),
+                                max(1, int(pred_cfg.batch)),
+                            )
+                            processed_padding_count = int(
+                                pred_stats.get('radial_padding_processed', 0) or 0
+                            )
+                            if processed_padding_count != int(expected_padding_count):
+                                raise RuntimeError(
+                                    f'{model_name}/{view.name}: full-frame inference processed '
+                                    f'{processed_padding_count}/{expected_padding_count} '
+                                    'radial batch seam slots'
+                                )
                             view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(pred_stats.get('prediction_count', 0))
 
                             remaining_key = (model_name, view.name)
@@ -6334,6 +7208,20 @@ def _main_impl() -> None:
                 tile_conf_path = temp_dir / 'tile_volumes' / model_name / view.name / f'{tile_job.tile_id}.confmap.u8.dat'
                 tile_mask_path.parent.mkdir(parents=True, exist_ok=True)
 
+                tile_radial_specs = radial_batch_padding_frame_specs(
+                    view,
+                    int(view.num_slices),
+                    max(1, int(pred_cfg.batch)),
+                )
+                radial_padding_mask_path = (
+                    temp_dir / 'tile_volumes' / model_name / view.name /
+                    f'{tile_job.tile_id}.radial_batch_padding.u8.dat'
+                )
+                radial_padding_conf_path = (
+                    temp_dir / 'tile_volumes' / model_name / view.name /
+                    f'{tile_job.tile_id}.radial_batch_padding.confmap.u8.dat'
+                )
+
                 tile_mask_mm = allocate_workspace_array(
                     shape=tile_shape,
                     dtype=np.uint8,
@@ -6354,6 +7242,66 @@ def _main_impl() -> None:
                     tile_conf_mm = None
                     tile_conf_store_path = None
 
+                if tile_radial_specs:
+                    compact_padding_shape = (
+                        int(len(tile_radial_specs)), int(tile_shape[1]), int(tile_shape[2]),
+                    )
+                    radial_padding_mask_mm: Optional[np.ndarray] = None
+                    radial_padding_conf_mm: Optional[np.ndarray] = None
+                    try:
+                        radial_padding_mask_mm = allocate_workspace_array(
+                            shape=compact_padding_shape,
+                            dtype=np.uint8,
+                            path=radial_padding_mask_path,
+                            desc=(
+                                f'{model_name}/{view.name}/{tile_job.tile_id} compact radial '
+                                'batch seam tile volume'
+                            ),
+                            prefer_memory=True,
+                            initialize_zero=True,
+                        )
+                        radial_padding_conf_mm = (
+                            allocate_workspace_array(
+                                shape=compact_padding_shape,
+                                dtype=np.uint8,
+                                path=radial_padding_conf_path,
+                                desc=(
+                                    f'{model_name}/{view.name}/{tile_job.tile_id} compact radial '
+                                    'batch seam confidence workspace'
+                                ),
+                                prefer_memory=True,
+                                initialize_zero=True,
+                            )
+                            if tile_conf_mm is not None else None
+                        )
+                    except BaseException:
+                        close_memmap_array_without_flush(radial_padding_conf_mm)
+                        close_memmap_array_without_flush(radial_padding_mask_mm)
+                        close_memmap_array_without_flush(tile_conf_mm)
+                        close_memmap_array_without_flush(tile_mask_mm)
+                        if not keep_temp_artifacts:
+                            for failed_path in (
+                                radial_padding_conf_path, radial_padding_mask_path,
+                                tile_conf_store_path, tile_mask_path,
+                            ):
+                                if failed_path is not None:
+                                    try:
+                                        Path(failed_path).unlink(missing_ok=True)
+                                    except Exception:
+                                        pass
+                        close_prediction_volume_ref(
+                            prediction_ref, keep_temp=bool(keep_temp_artifacts),
+                        )
+                        _pump_prediction_volume_build_queue()
+                        raise
+                    radial_padding_conf_store_path: Optional[Path] = (
+                        radial_padding_conf_path if radial_padding_conf_mm is not None else None
+                    )
+                else:
+                    radial_padding_mask_mm = None
+                    radial_padding_conf_mm = None
+                    radial_padding_conf_store_path = None
+
                 yolo = yolo_by_model_name[str(model_name)]
                 try:
                     if bool(async_prediction_accumulation_active):
@@ -6372,6 +7320,8 @@ def _main_impl() -> None:
                             streaming_cleanup_enabled=bool(angle_variant_streaming_cleanup_active),
                             streaming_cleanup_min_conf=float(args.min_conf),
                             streaming_cleanup_min_radius=float(tile_processing_min_radius),
+                            radial_padding_union_mm=radial_padding_mask_mm,
+                            radial_padding_confmap_mm=radial_padding_conf_mm,
                         )
                         _submit_prediction_accumulation_join(handle, {
                             'kind': 'tile',
@@ -6383,6 +7333,15 @@ def _main_impl() -> None:
                             'tile_mask_path': tile_mask_path,
                             'tile_conf_path': tile_conf_store_path,
                             'threshold_plane_shape': tile_threshold_plane_shape,
+                            'radial_padding_mask_mm': radial_padding_mask_mm,
+                            'radial_padding_conf_mm': radial_padding_conf_mm,
+                            'radial_padding_mask_path': radial_padding_mask_path,
+                            'radial_padding_conf_path': radial_padding_conf_store_path,
+                            'radial_padding_frames': tuple({
+                                'ordinal': int(spec.radial_padding_ordinal or 0),
+                                'destination': int(spec.global_destination_index),
+                                'mirror_radial_u': bool(spec.mirror_radial_u),
+                            } for spec in tile_radial_specs),
                             'yolo': yolo,
                         })
                     else:
@@ -6401,11 +7360,56 @@ def _main_impl() -> None:
                             streaming_cleanup_enabled=bool(angle_variant_streaming_cleanup_active),
                             streaming_cleanup_min_conf=float(args.min_conf),
                             streaming_cleanup_min_radius=float(tile_processing_min_radius),
+                            radial_padding_union_mm=radial_padding_mask_mm,
+                            radial_padding_confmap_mm=radial_padding_conf_mm,
                         )
                         if offload_between_jobs_enabled():
                             offload_yolo_from_gpu(yolo)
                         tile_inference_done.add(ready_key)
                         view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(pred_stats.get('prediction_count', 0))
+
+                        if tile_radial_specs:
+                            if int(pred_stats.get('radial_padding_processed', 0) or 0) != int(len(tile_radial_specs)):
+                                for array_obj in (
+                                    radial_padding_conf_mm,
+                                    radial_padding_mask_mm,
+                                    tile_conf_mm,
+                                    tile_mask_mm,
+                                ):
+                                    close_memmap_array_without_flush(array_obj)
+                                if not keep_temp_artifacts:
+                                    for raw_path in (
+                                        radial_padding_conf_store_path,
+                                        radial_padding_mask_path,
+                                        tile_conf_store_path,
+                                        tile_mask_path,
+                                    ):
+                                        if raw_path is not None:
+                                            try:
+                                                Path(raw_path).unlink(missing_ok=True)
+                                            except Exception:
+                                                pass
+                                raise RuntimeError(
+                                    f'{model_name}/{view.name}/{tile_job.tile_id}: in-process '
+                                    f'inference processed {int(pred_stats.get("radial_padding_processed", 0) or 0)}/'
+                                    f'{len(tile_radial_specs)} radial batch seam slots'
+                                )
+                            assert radial_padding_mask_mm is not None
+                            _submit_radial_padding_tile_cleanups(
+                                model_name=str(model_name),
+                                view=view,
+                                tile_job=tile_job,
+                                padding_mask_mm=radial_padding_mask_mm,
+                                padding_conf_mm=radial_padding_conf_mm,
+                                padding_mask_path=radial_padding_mask_path,
+                                padding_conf_path=radial_padding_conf_store_path,
+                                padding_frames=[{
+                                    'ordinal': int(spec.radial_padding_ordinal or 0),
+                                    'destination': int(spec.global_destination_index),
+                                    'mirror_radial_u': bool(spec.mirror_radial_u),
+                                } for spec in tile_radial_specs],
+                                threshold_plane_shape=tile_threshold_plane_shape,
+                            )
 
                         if int(pred_stats.get('frames_with_predictions', 0)) <= 0:
                             close_memmap_array(tile_mask_mm)
@@ -6568,6 +7572,7 @@ def _main_impl() -> None:
             | set(gpu_worker_tile_dense_result_memfd_reservations)
             | set(gpu_worker_tile_dense_result_reserved_at)
             | set(gpu_worker_tile_dense_result_workspaces)
+            | set(gpu_worker_tile_pending_result_ids_by_task)
         ):
             _release_tile_dense_result_task_id(
                 int(tile_task_id), reason='scheduler teardown', refill=False,
@@ -7147,301 +8152,3 @@ def _main_impl() -> None:
         print(f"Final overlay: {final_paths['overlay']}")
     if summary_path is not None:
         print(f'Summary: {summary_path}')
-
-
-# Late imports keep callable-only dependency cycles import-safe.
-from ._latebind import bind_late_symbols as _bind_late_symbols
-
-_bind_late_symbols(
-    __name__,
-    globals(),
-    {
-        "assembly": (
-            "_delete_tile_result_storage",
-            "apply_gaussian_smoothing_inplace",
-            "defer_open_tile_result_store",
-            "finalize_consolidated_tile_volume_for_parent",
-            "finalize_parent_without_tile_contribution_for_sparse_retirement",
-            "gate_tile_residual_against_parent_bridge",
-            "gate_tile_result_against_parent_mask",
-            "materialize_nrrd_global_layer",
-            "postprocess_tile_volume_after_inference",
-            "prepare_view_volume_after_fullframe",
-            "set_final_source_output_shape",
-            "spill_waiting_tile_result_to_raw_store",
-        ),
-        "backprojection": (
-            "HybridBackprojectionQueue",
-            "ViewBackprojectionQueueJob",
-            "_MAIN_PROCESS_GPU_STAGE_COORDINATOR",
-            "_configure_main_process_gpu_stage_workers",
-            "_main_process_gpu_stage_begin_inference",
-            "_main_process_gpu_stage_can_dispatch_inference",
-            "_main_process_gpu_stage_finish_inference",
-            "_reset_main_process_gpu_stage_coordinator",
-            "_set_main_process_gpu_inference_priority_active",
-            "_set_main_process_gpu_pending_inference",
-            "_set_main_process_gpu_stage_wake_callback",
-            "fused_angle_variant_radial_component_layer_enabled",
-            "main_process_gpu_stage_inference_priority_enabled",
-        ),
-        "config": (
-            "GIB",
-            "SCRIPT_VERSION",
-            "build_argparser",
-            "quantize_display",
-            "resolve_auto_positive_int",
-            "resolve_backend_batches",
-            "resolve_backend_devices",
-            "resolve_backend_models",
-            "resolve_backend_precisions",
-            "resolve_cartesian_views",
-            "resolve_channel_format",
-            "resolve_postprocessing_options",
-            "resolve_quantize",
-            "resolve_radial_view_requests",
-            "resolve_save_request",
-            "resolve_tilted_view_groups",
-            "resolve_tta_angles",
-            "tilted_group_base_views",
-        ),
-        "cuda_backend": (
-            "_fused_preflight_family",
-            "fused_renderer_preflight_enabled",
-            "gpu_cube_resize_enabled",
-            "open_existing_gray_memmap",
-            "union_conf_volume_into_volume_inplace",
-        ),
-        "cuda_d1": (
-            "_memmap_backing_path",
-            "_nrrd_layer_key",
-            "archive_or_delete_binary_volume_storage",
-            "close_raw_store_or_memmap_volume",
-            "d1_owner_pipeline_enabled",
-            "raw_bbox_nrrd_layers_enabled",
-            "tile_dense_worker_result_limit_bytes",
-            "tile_dense_worker_result_limit_tasks",
-            "tile_dense_worker_result_warn_seconds",
-            "tile_intermediate_accumulator_reserve_bytes",
-            "tile_intermediate_accumulators_prefer_memory",
-        ),
-        "finalization": (
-            "apply_keep_largest_objects_inplace",
-            "apply_v14_centerline_filter_inplace",
-            "assemble_final_union_after_view_union",
-            "collapse_tta_variant_volumes_to_physical_views",
-            "release_unretained_volume_maps",
-            "scheduler_push_drain_enabled",
-            "scheduler_push_drain_heartbeat_seconds",
-        ),
-        "geometry": (
-            "AugJob",
-            "DenseTileJob",
-            "PredictionVolumeRef",
-            "StreamingYoloVolumeSource",
-            "ViewInfo",
-            "_prediction_ref_has_gpu_input_staging",
-            "build_aug_job_for_variant",
-            "build_dense_tile_jobs_for_aug",
-            "build_view_frame_cache",
-            "close_prediction_volume_ref",
-            "expand_views_into_tta_variants",
-            "get_view_infos",
-            "gpu_input_staging_ahead_sources",
-            "gpu_input_staging_enabled",
-            "is_radial_view",
-            "is_tilted_radial_view",
-            "is_tilted_view",
-            "iter_aug_jobs_round_robin",
-            "make_dense_tile_channel_renderer",
-            "make_fullframe_channel_renderer",
-            "materialize_dense_tile_prediction_volume_for_job",
-            "materialize_fullframe_prediction_volume_for_job",
-            "maybe_eager_stage_prediction_ref_on_gpu",
-            "orthogonal_views_only",
-            "output_to_view_processing_affine",
-            "physical_view_name",
-            "pretty_view_name",
-            "queued_streaming_source_cpu_warmup_slots",
-            "radial_base_view_name",
-            "radial_target_base_view",
-            "radial_target_diameter",
-            "resolve_prediction_render_workers",
-            "resolve_prediction_source_queue_slots",
-            "resolve_tile_configs",
-            "shared_streaming_render_pool_enabled",
-            "should_cache_view_frames",
-            "streaming_prediction_source_autostart_enabled",
-            "streaming_prediction_source_prefetch_frames",
-            "streaming_prediction_source_workers",
-            "streaming_prediction_sources_enabled",
-            "view_output_token",
-            "view_processing_min_radius",
-            "view_processing_volume_shape",
-            "write_aug_job_meta",
-            "write_dense_tile_job_meta",
-        ),
-        "inference": (
-            "PredictConfig",
-            "PredictionAccumulationHandle",
-            "async_predict_join_workers",
-            "async_predict_postprocess_enabled",
-            "gpu_device_hole_fill_enabled",
-            "gpu_device_union_enabled",
-            "gpu_worker_chunk_hole_fill_enabled",
-            "offload_between_jobs_enabled",
-            "offload_yolo_from_gpu",
-            "predict_in_memory_volume_and_accumulate",
-            "predict_in_memory_volume_and_submit_accumulation",
-            "resolve_gaussian_smoothing_settings",
-            "set_angle_variant_gpu_fastpath",
-            "set_inference_batch_size",
-            "set_retina_mask_processor",
-            "trim_cuda_memory",
-            "unload_yolo_model",
-        ),
-        "interpolation": (
-            "DeferredTilePostprocessResult",
-            "NrrdLayerRef",
-            "PreparedViewResult",
-            "TilePostprocessResult",
-            "TilePostprocessTask",
-            "_ByteAdmissionPool",
-            "_DirectUnionBackingLease",
-            "_view_uses_interpolation",
-            "interpolation_compiled_kernels_status",
-            "materialize_raw_bbox_mask_store_workspace",
-        ),
-        "media": (
-            "LazyProcessingCube",
-            "_cube_t_axis_resize_backend",
-            "_path_is_relative_to",
-            "abort_streaming_producers",
-            "compute_cube_resize_shape",
-            "decode_video_to_memmap_gray8",
-            "decode_video_to_memmap_gray8_streaming",
-            "ffprobe_info",
-            "processing_volume_mode",
-            "purge_remaining_temporary_mkvs",
-            "reset_streaming_state_for_new_run",
-            "resize_volume_to_processing_cube_gray8",
-            "resize_volume_to_processing_cube_gray8_streaming",
-            "resolve_radial_azimuth_angles",
-            "restore_mask_volume_to_original_shape",
-            "should_resize_to_processing_cube",
-            "streaming_preprocess_enabled",
-            "wait_for_volume_ready",
-            "wait_for_streaming_producers",
-        ),
-        "outputs": (
-            "BackgroundOutputManager",
-            "BackgroundOutputSubmission",
-            "NrrdLayerSink",
-            "collect_low_quality_output_futures",
-            "collect_pipeline_output_futures",
-            "nrrd_layer_output_suffix",
-            "nrrd_layer_sink",
-            "nrrd_layer_sink_workers",
-            "resolve_low_quality_downbin_specs",
-            "set_nrrd_layer_sink",
-            "shutdown_nrrd_gzip_executors",
-            "write_summary_file",
-            "write_view_images",
-        ),
-        "runtime": (
-            "CpuInferenceInstancePlan",
-            "HYBRID_DEFERRED_RESULT_MODE",
-            "INTERPOLATION_PROCESS_WORKER_DEFAULT_CAP",
-            "_GpuWorkerAuxInterpolationPool",
-            "_attach_memfd_transfers_to_task",
-            "_filesystem_free_bytes",
-            "_memfd_owner_key_from_array",
-            "_mount_fstype_for_path",
-            "_sanitize_filesystem_token",
-            "_sched_setaffinity_all_threads",
-            "allocate_workspace_array",
-            "array_nbytes",
-            "choose_scratch_dir",
-            "choose_slice_parallel_workers",
-            "close_memmap_array",
-            "close_memmap_array_without_flush",
-            "configure_interpolation_pass_admission",
-            "copy_workspace_array",
-            "cpu_inference_supports_view",
-            "cpu_inference_task_priority",
-            "cpu_worker_default_seconds_per_frame",
-            "cpu_worker_initial_lease_slices",
-            "cpu_worker_max_lease_slices",
-            "cpu_worker_min_lease_slices",
-            "cpu_worker_target_lease_seconds",
-            "create_interpolation_process_executor",
-            "default_worker_budget",
-            "expose_scratch_in_output",
-            "flush_array",
-            "gpu_feeder_reserved_physical_cores",
-            "gpu_worker_aux_interpolation_enabled",
-            "gpu_worker_aux_interpolation_pool",
-            "gpu_worker_cpu_share",
-            "gpu_worker_default_seconds_per_frame",
-            "gpu_worker_direct_union_enabled",
-            "gpu_worker_fullframe_task_ranges",
-            "gpu_worker_initial_lease_slices",
-            "gpu_worker_max_lease_slices",
-            "gpu_worker_min_lease_slices",
-            "gpu_worker_tail_split_point",
-            "gpu_worker_target_lease_seconds",
-            "gpu_worker_task_cost_key",
-            "hybrid_cpu_affinity_overlap_enabled",
-            "hybrid_cpu_reserved_view_count",
-            "hybrid_gpu_stealback_enabled",
-            "hybrid_gpu_stealback_eta_ratio",
-            "hybrid_gpu_stealback_max_fraction",
-            "hybrid_gpu_stealback_min_cpu_samples",
-            "hybrid_gpu_stealback_min_lead_seconds",
-            "initialize_runtime_observability",
-            "interpolation_process_backend_enabled",
-            "interpolation_process_cv2_threads",
-            "interpolation_process_start_method",
-            "main_process_worker_budget",
-            "memfd_workspace_enabled",
-            "parallel_for_indices",
-            "path_is_memory_backed",
-            "plan_gpu_feeder_core_reservations",
-            "plan_gpu_worker_affinity",
-            "plan_openvino_cpu_instances",
-            "preflight_multiprocessing_payload",
-            "register_unique_run_scratch_cleanup",
-            "release_memfd_owners_under",
-            "resolve_parent_interpolation_worker_allocation",
-            "resolve_parent_postprocess_worker_allocation",
-            "resolve_worker_count",
-            "reset_runtime_state_for_new_run",
-            "runtime_telemetry",
-            "scratch_dir_is_memory_backed",
-            "set_gpu_worker_aux_interpolation_pool",
-            "set_interpolation_process_executor",
-            "shutdown_parallel_pool_cache",
-            "tail_worker_budget_expansion_enabled",
-            "workspace_anon_cap_bytes",
-        ),
-        "topology": (
-            "configure_gpu_slice_labeling_devices",
-            "discard_binary_volume_slice_metadata",
-        ),
-        "workers": (
-            "_cpu_inference_worker_main",
-            "_gpu_inference_worker_main",
-            "_pin_cuda_visible_device_token",
-        ),
-        "workspace": (
-            "_cpu_count",
-            "_env_flag",
-            "_env_float",
-            "_env_int",
-            "available_anon_work_bytes",
-            "radial_source_mode",
-            "v1613_d1_backprojection_overlap_enabled",
-            "v1613_fast_bundle_requested",
-        ),
-    },
-)

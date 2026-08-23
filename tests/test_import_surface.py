@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WRAPPER = ROOT / "GPT-5.6-Sol-Pro_v17.0.11_SLURM.py"
+WRAPPER = ROOT / "GPT-5.6-Sol-Ultra_v17.1.0_SLURM.py"
 
 
 class ImportSurfaceTests(unittest.TestCase):
@@ -41,12 +41,12 @@ class ImportSurfaceTests(unittest.TestCase):
     def test_module_version(self) -> None:
         completed = self.run_python("-m", "volume_tta", "--version")
         self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertIn("17.0.11", completed.stdout)
+        self.assertIn("17.1.0", completed.stdout)
 
     def test_cycle_safe_full_import_smoke(self) -> None:
         completed = self.run_python(str(ROOT / "tools" / "smoke_import.py"), "pipeline")
         self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertIn("all callable-only dependencies resolved", completed.stdout)
+        self.assertIn("eager package import graph is acyclic", completed.stdout)
         self.assertIn("all function globals resolved", completed.stdout)
 
     def test_refactor_manifest_inventory(self) -> None:

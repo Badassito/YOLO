@@ -6,7 +6,32 @@ behavior. Public coordination contracts live under ``inference_backends``.
 
 from __future__ import annotations
 
-from ._stdlib import *
+import contextlib
+import json
+import math
+import mmap
+import os
+import shutil
+import sys
+import threading
+from collections import deque
+from dataclasses import (
+    dataclass,
+    field,
+    replace as dataclasses_replace,
+)
+from pathlib import Path
+from typing import (
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    TYPE_CHECKING,
+    Tuple,
+)
 import numpy as np
 from ._deps import _NUMBA_IMPORT_ERROR, _numba, cv2, ndi, tqdm
 
@@ -17,6 +42,56 @@ from .runtime import (
     interpolation_process_worker_active,
     runtime_telemetry_phase,
 )
+
+# Explicit lower-layer dependencies keep imports one-way.
+from .workspace import (
+    _env_flag,
+    _env_int,
+)
+from .runtime import (
+    _create_memfd_backed_payload_path,
+    allocate_workspace_array,
+    array_nbytes,
+    choose_slice_parallel_workers,
+    close_memmap_array,
+    close_memmap_array_without_flush,
+    copy_workspace_array,
+    estimate_interpolation_workspace_bytes,
+    flush_array,
+    numa_interleave_memory,
+    open_raw_store_payload_writer,
+    parallel_for_indices,
+    parallel_for_indices_chunked,
+    parallel_map_in_order,
+    parallel_map_unordered,
+    raw_store_memfd_enabled,
+    release_memfd_owners_under,
+    runtime_telemetry,
+    should_use_in_memory_workspace,
+)
+from .geometry import (
+    ViewInfo,
+    is_tilted_view,
+)
+from .inference import (
+    _cv2_connected_components,
+    _fill_holes_2d_opencv,
+)
+
+
+if TYPE_CHECKING:
+    from .topology import (
+        SliceLocalLabelLUTs,
+        SparseSliceLabelStore,
+        _local_label_store_dtype,
+        build_slice_endpoint_seeds_from_label_volume,
+        interpolation_skip_compact_relabel_enabled,
+        label_foreground_volume_streaming,
+    )
+    from .outputs import (
+        _resize_sparse_binary_crop_to_output_region,
+        _restore_source_indices_for_output_z,
+    )
 
 def _keep_center_component_2d(mask2d: np.ndarray) -> np.ndarray:
     # cv2 connectedComponents + the cv2 hole fill replace scipy.ndimage,
@@ -246,6 +321,9 @@ class SliceComponentTableCache:
             return table
 
     def get(self, z: int) -> SliceComponentTable:
+        # Local import keeps the package dependency graph acyclic.
+        from .topology import SparseSliceLabelStore
+
         z_i = int(z)
         if z_i < 0 or z_i >= self.z_dim:
             raise IndexError(z_i)
@@ -826,6 +904,8 @@ def _paste_local_mask_onto_slice(
     center_yx: Tuple[float, float],
     *,
     dst_bbox_union: Optional[List[int]] = None,
+    paint_value: int = 1,
+    binary_destination: bool = True,
 ) -> int:
     """OR a local mask into one destination slice and update the caller-provided touched bbox."""
     if not np.any(local_mask):
@@ -866,7 +946,7 @@ def _paste_local_mask_onto_slice(
         dst_bbox_union[2] = max(int(dst_bbox_union[2]), int(dst_y1))
         dst_bbox_union[3] = max(int(dst_bbox_union[3]), int(dst_x1))
 
-    if _planning_kernels_active():
+    if bool(binary_destination) and int(paint_value) == 1 and _planning_kernels_active():
         try:
             # one nogil pass counts+writes only newly-set pixels (bridge slices
             # hold 0/1) instead of two bool temporaries + a count + an OR store per paste.
@@ -879,9 +959,10 @@ def _paste_local_mask_onto_slice(
             _disable_planning_kernels(exc)
 
     patch = np.asarray(local_mask[src_y0:src_y1, src_x0:src_x1], dtype=bool)
-    current = np.asarray(dest_slice[dst_y0:dst_y1, dst_x0:dst_x1], dtype=bool)
-    added = int(np.count_nonzero(patch & (~current)))
-    dest_slice[dst_y0:dst_y1, dst_x0:dst_x1] |= patch
+    current = np.asarray(dest_slice[dst_y0:dst_y1, dst_x0:dst_x1])
+    value = np.asarray(int(paint_value), dtype=current.dtype)
+    added = int(np.count_nonzero(patch & ((current & value) == 0)))
+    np.bitwise_or(current, value, out=current, where=patch)
     return added
 
 def _local_half_width_for_components(
@@ -1356,6 +1437,9 @@ def _find_slice_projection_candidates_numba(
     component_cache: Optional[SliceComponentTableCache] = None,
     slice_luts: Optional['SliceLocalLabelLUTs'] = None,
 ) -> Optional[List[SliceProjectionCandidate]]:
+    # Local import keeps the package dependency graph acyclic.
+    from .topology import SparseSliceLabelStore
+
     global _NUMBA_PROJECTION_KERNEL_RUNTIME_DISABLED
     if (
         _numba_find_projection_candidates_kernel is None
@@ -1488,6 +1572,9 @@ def _find_slice_projection_candidates_python(
     component_cache: Optional[SliceComponentTableCache] = None,
     slice_luts: Optional['SliceLocalLabelLUTs'] = None,
 ) -> List[SliceProjectionCandidate]:
+    # Local import keeps the package dependency graph acyclic.
+    from .topology import SparseSliceLabelStore
+
     if int(max_slice_distance) <= 0 or int(max_candidates) <= 0:
         return []
 
@@ -1784,6 +1871,12 @@ class SliceBridgeRenderPlan:
     num_slices: int
     sdf0: np.ndarray
     sdf1: np.ndarray
+    # One-based output-decomposition coordinates. To preserve the historical bridge
+    # union while emitting exactly ``walk_back * candidates`` layers, index 1 combines
+    # the endpoint and first walked-back origin; indices 2..N are progressively earlier
+    # source slices. Candidate indices follow nearest-first projection-search ordering.
+    interpolation_walk_back_index: int = 1
+    interpolation_candidate_index: int = 1
     # the min-radius acceptance scan already constructs every
     # intermediate bool section. Accepted plans retain those exact post-component-filter
     # arrays by step index so painting does not repeat SDF lerp/threshold/component work.
@@ -1797,6 +1890,33 @@ class SliceSeedBridgePlanResult:
     walk_back_bridges: int = 0
     skipped_by_min_radius: int = 0
     plans: List[SliceBridgeRenderPlan] = field(default_factory=list)
+
+
+def interpolation_bridge_component_paths(
+    root: Path,
+    interpolation_walk_back: int,
+    interpolation_candidates: int,
+) -> List[Tuple[int, int, Path]]:
+    """Return the deterministic walk-back/candidate delta layout for one pass.
+
+    ``interpolation_walk_back`` retains its historical meaning: the number of additional
+    source slices before the endpoint. Output index 1 combines the endpoint and first
+    additional origin, while indices 2..N hold the remaining origins. Consequently the
+    returned cardinality is exactly ``walk_back * candidates`` without changing the
+    aggregate bridge union; zero walk-back produces no component stores.
+    """
+    return [
+        (
+            int(walk_back_index),
+            int(candidate_index),
+            Path(root) / (
+                f'walkback{int(walk_back_index):02d}_'
+                f'candidate{int(candidate_index):02d}.cvol'
+            ),
+        )
+        for walk_back_index in range(1, max(0, int(interpolation_walk_back)) + 1)
+        for candidate_index in range(1, max(0, int(interpolation_candidates)) + 1)
+    ]
 
 def _slice_bridge_plan_payload_bytes(plan: SliceBridgeRenderPlan) -> int:
     """Exact retained NumPy payload bytes owned by one accepted render plan."""
@@ -1822,6 +1942,9 @@ def _build_slice_endpoint_seeds(
  into the previous and next slice. Components without continuation become endpoint seeds in
  the corresponding direction. Radial interpolation can wrap the slice/frame axis so frame 0
  and the final radial frame are considered adjacent."""
+    # Local import keeps the package dependency graph acyclic.
+    from .topology import build_slice_endpoint_seeds_from_label_volume
+
     return build_slice_endpoint_seeds_from_label_volume(
         labels_real,
         workers=int(workers),
@@ -1951,6 +2074,8 @@ def _paint_linear_slice_bridge_plan_onto_slice(
     step_idx: int,
     *,
     dst_bbox_union: Optional[List[int]] = None,
+    paint_value: int = 1,
+    binary_destination: bool = True,
 ) -> int:
     if int(step_idx) <= 0 or int(step_idx) >= int(plan.steps):
         return 0
@@ -1979,6 +2104,8 @@ def _paint_linear_slice_bridge_plan_onto_slice(
         section,
         (center_y, center_x),
         dst_bbox_union=dst_bbox_union,
+        paint_value=int(paint_value),
+        binary_destination=bool(binary_destination),
     )
 
 def _plan_slice_seed_bridges(
@@ -1994,6 +2121,11 @@ def _plan_slice_seed_bridges(
     slice_luts: Optional['SliceLocalLabelLUTs'] = None,
 ) -> SliceSeedBridgePlanResult:
     result = SliceSeedBridgePlanResult()
+
+    # Keep the historical bridge set: the endpoint plus N additional source slices.
+    # Layer 1 coalesces the endpoint and nearest walked-back origin so the externally
+    # visible decomposition is still exactly N x C rather than (N + 1) x C.
+    walk_back_count = max(0, int(interpolation_walk_back))
 
     candidates = _find_slice_projection_candidates(
         labels_real=labels_real,
@@ -2014,14 +2146,14 @@ def _plan_slice_seed_bridges(
         label=int(seed.label),
         start_point=seed.point,
         direction_sign=int(seed.direction_sign),
-        walk_back=int(interpolation_walk_back),
+        walk_back=int(walk_back_count),
         wrap_axis=bool(wrap_axis),
         component_cache=component_cache,
     )
 
-    for candidate in candidates:
+    for candidate_idx, candidate in enumerate(candidates, start=1):
         accepted_this_candidate = False
-        for walk_idx, src_point in enumerate(source_points):
+        for source_index, src_point in enumerate(source_points):
             plan = _build_linear_slice_bridge_plan(
                 labels_real=labels_real,
                 source_label=int(candidate.source_label),
@@ -2045,7 +2177,7 @@ def _plan_slice_seed_bridges(
                     result.skipped_by_min_radius += 1
                     continue
 
-            if walk_idx == 0:
+            if source_index == 0:
                 result.default_bridges += 1
             else:
                 result.walk_back_bridges += 1
@@ -2054,7 +2186,13 @@ def _plan_slice_seed_bridges(
                 result.accepted_connections += 1
                 accepted_this_candidate = True
 
-            result.plans.append(plan)
+            result.plans.append(dataclasses_replace(
+                plan,
+                interpolation_walk_back_index=(
+                    max(1, int(source_index)) if int(walk_back_count) > 0 else 0
+                ),
+                interpolation_candidate_index=int(candidate_idx),
+            ))
 
     return result
 
@@ -2090,12 +2228,20 @@ def interpolate_view_volume_pass_inplace(
     workers: int = 1,
     wrap_axis: bool = False,
     bridge_delta_path: Optional[Path] = None,
+    bridge_component_dir: Optional[Path] = None,
     known_slice_any: Optional[np.ndarray] = None,
     known_slice_bboxes: Optional[np.ndarray] = None,
 ) -> Dict[str, object]:
     """Run one interpolation pass in place.
     
     Optional outputs capture exact added voxels and sparse label metadata; accepted bridge sections are reused during painting."""
+    # Local import keeps the package dependency graph acyclic.
+    from .topology import (
+        _local_label_store_dtype,
+        interpolation_skip_compact_relabel_enabled,
+        label_foreground_volume_streaming,
+    )
+
     if int(max_slice_distance) <= 0:
         return {
             'num_objects': 0,
@@ -2113,6 +2259,101 @@ def interpolate_view_volume_pass_inplace(
         }
 
     work_dir.mkdir(parents=True, exist_ok=True)
+    component_specs = (
+        interpolation_bridge_component_paths(
+            Path(bridge_component_dir),
+            int(interpolation_walk_back),
+            int(interpolation_candidates),
+        )
+        if bridge_component_dir is not None else []
+    )
+    component_count = int(len(component_specs))
+    if int(component_count) <= 8:
+        component_word_dtype = np.dtype(np.uint8)
+    elif int(component_count) <= 16:
+        component_word_dtype = np.dtype(np.uint16)
+    elif int(component_count) <= 32:
+        component_word_dtype = np.dtype(np.uint32)
+    else:
+        component_word_dtype = np.dtype(np.uint64)
+    component_bits_per_word = int(component_word_dtype.itemsize * 8)
+    component_word_count = (
+        (int(component_count) + int(component_bits_per_word) - 1) // int(component_bits_per_word)
+        if int(component_count) > 0 else 0
+    )
+    component_membership_paths = [
+        Path(bridge_component_dir) / '_membership' / (
+            f'word{int(word_index):02d}.{component_word_dtype.name}.dat'
+        )
+        for word_index in range(int(component_word_count))
+    ]
+
+    def _discard_failed_component_outputs() -> None:
+        if bool(keep_temp):
+            return
+        for membership_path in component_membership_paths:
+            try:
+                membership_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        if component_membership_paths:
+            try:
+                component_membership_paths[0].parent.rmdir()
+            except OSError:
+                pass
+        for _walk_back_index, _candidate_index, component_path in component_specs:
+            shutil.rmtree(component_path, ignore_errors=True)
+        if bridge_component_dir is not None:
+            try:
+                Path(bridge_component_dir).rmdir()
+            except OSError:
+                pass
+
+    component_bit_layout: Dict[Tuple[int, int], Tuple[int, int]] = {}
+    for flat_index, (walk_back_index, candidate_index, _component_path) in enumerate(component_specs):
+        component_bit_layout[(int(walk_back_index), int(candidate_index))] = (
+            int(flat_index // int(component_bits_per_word)),
+            int(1 << int(flat_index % int(component_bits_per_word))),
+        )
+    # Publish a compact empty cvol for every configured combination before any early return.
+    # Render scratch canvases are created only after endpoint discovery proves planning work
+    # exists, then compacted one at a time before this pass returns.
+    try:
+        for _walk_back_index, _candidate_index, component_path in component_specs:
+            empty_writer = IncrementalRawBBoxMaskStoreWriter(
+                shape=tuple(int(v) for v in np.asarray(mask_mm).shape),
+                store_dir=component_path,
+                format_name=CVOL_FORMAT,
+                desc=(
+                    f'Empty interpolation component {pass_tag} walkback '
+                    f'{int(_walk_back_index)} candidate {int(_candidate_index)}'
+                ),
+                extra_meta={
+                    'interpolation_walk_back_index': int(_walk_back_index),
+                    'interpolation_candidate_index': int(_candidate_index),
+                    'added_voxels': 0,
+                },
+                force_path_backed=True,
+            )
+            empty_writer.consume_empty_range(0, int(mask_mm.shape[0]))
+            empty_writer.finalize()
+    except BaseException:
+        _discard_failed_component_outputs()
+        raise
+
+    def _bridge_component_stats(
+        added_counts: Optional[Dict[Tuple[int, int], int]] = None,
+    ) -> List[Dict[str, object]]:
+        counts = added_counts or {}
+        return [
+            {
+                'walk_back_index': int(walk_back_index),
+                'candidate_index': int(candidate_index),
+                'path': str(component_path),
+                'added_voxels': int(counts.get((int(walk_back_index), int(candidate_index)), 0)),
+            }
+            for walk_back_index, candidate_index, component_path in component_specs
+        ]
     # Keep per-slice local ids in the label store and consume them through exported LUTs.
     # Size admission with the actual local dtype so a uint16-capable pass is not forced to disk.
     skip_relabel = interpolation_skip_compact_relabel_enabled()
@@ -2129,19 +2370,30 @@ def interpolate_view_volume_pass_inplace(
     # Component tables + candidate kernels canonicalize at read time, deleting the
     # full-volume compact-relabel read+write pass over the label store.
     label_stats: Dict[str, object] = {}
-    labels_mm, num_objects, label_paths = label_foreground_volume_streaming(
-        mask_mm,
-        work_dir / f'{pass_tag}_labels',
-        prefer_memory=use_in_memory,
-        reserve_bytes=reserve_bytes,
-        wrap_axis=bool(wrap_axis),
-        workers=int(workers),
-        compact_relabel=not skip_relabel,
-        component_stats_out=label_stats if skip_relabel else None,
-        known_slice_any=known_slice_any,
-        known_slice_bboxes=known_slice_bboxes,
-        sparse_local_labels=bool(skip_relabel),
-    )
+    label_work_prefix = work_dir / f'{pass_tag}_labels'
+    try:
+        labels_mm, num_objects, label_paths = label_foreground_volume_streaming(
+            mask_mm,
+            label_work_prefix,
+            prefer_memory=use_in_memory,
+            reserve_bytes=reserve_bytes,
+            wrap_axis=bool(wrap_axis),
+            workers=int(workers),
+            compact_relabel=not skip_relabel,
+            component_stats_out=label_stats if skip_relabel else None,
+            known_slice_any=known_slice_any,
+            known_slice_bboxes=known_slice_bboxes,
+            sparse_local_labels=bool(skip_relabel),
+        )
+    except BaseException:
+        if not bool(keep_temp):
+            for suffix in ('.fg_labels.u16.dat', '.fg_labels.u32.dat'):
+                try:
+                    label_work_prefix.with_suffix(suffix).unlink(missing_ok=True)
+                except Exception:
+                    pass
+        _discard_failed_component_outputs()
+        raise
     slice_luts: Optional[SliceLocalLabelLUTs] = (
         label_stats.get('slice_local_luts') if skip_relabel else None  # type: ignore[assignment]
     )
@@ -2167,21 +2419,42 @@ def interpolate_view_volume_pass_inplace(
             'wrap_axis': bool(wrap_axis),
             'endpoint_method': 'slice_component_scan',
             'planning_backend': interpolation_planning_backend_name(),
+            'bridge_component_deltas': _bridge_component_stats(),
         }
 
     if skip_relabel and slice_luts is None:
         # Defensive: a local-id raster without LUTs would be misread downstream. This can
         # only happen through an unexpected labeler edit; fail loudly rather than corrupt.
+        close_memmap_array(labels_mm)
+        if not bool(keep_temp):
+            for p in label_paths:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        _discard_failed_component_outputs()
         raise RuntimeError(f'interpolation pass {pass_tag}: local-id label store without slice LUTs')
 
     component_cache = SliceComponentTableCache(labels_mm, slice_luts=slice_luts)
     worker_count = choose_slice_parallel_workers(int(workers), int(labels_mm.shape[0]))
-    seeds, num_endpoints = _build_slice_endpoint_seeds(
-        labels_mm,
-        workers=worker_count,
-        wrap_axis=bool(wrap_axis),
-        component_cache=component_cache,
-    )
+    try:
+        seeds, num_endpoints = _build_slice_endpoint_seeds(
+            labels_mm,
+            workers=worker_count,
+            wrap_axis=bool(wrap_axis),
+            component_cache=component_cache,
+        )
+    except BaseException:
+        component_cache.clear()
+        close_memmap_array(labels_mm)
+        if not bool(keep_temp):
+            for p in label_paths:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        _discard_failed_component_outputs()
+        raise
     if not seeds:
         del labels_mm
         if not keep_temp:
@@ -2203,15 +2476,63 @@ def interpolate_view_volume_pass_inplace(
             'wrap_axis': bool(wrap_axis),
             'endpoint_method': 'slice_component_scan',
             'planning_backend': interpolation_planning_backend_name(),
+            'bridge_component_deltas': _bridge_component_stats(),
         }
 
     bridge_path: Optional[Path] = None
-    if use_in_memory:
-        bridge_mm: np.ndarray = np.zeros(mask_mm.shape, dtype=np.uint8)
-    else:
-        bridge_path = work_dir / f'{pass_tag}_bridges.u8.dat'
-        bridge_mm = np.memmap(bridge_path, dtype=np.uint8, mode='w+', shape=mask_mm.shape)
-    numa_interleave_memory(bridge_mm, desc='Interpolation bridge canvas')  #
+    bridge_mm: Optional[np.ndarray] = None
+    component_membership_mms: List[np.memmap] = []
+    pending_membership_mm: Optional[np.memmap] = None
+    try:
+        if component_specs:
+            # One packed membership word replaces both the aggregate bridge canvas and up to
+            # 8/16/32/64 per-combination uint8 canvases. Additional words are added only after
+            # exhausting all bits in the current machine word.
+            bridge_mm = None
+        elif use_in_memory:
+            bridge_mm = np.zeros(mask_mm.shape, dtype=np.uint8)
+        else:
+            bridge_path = work_dir / f'{pass_tag}_bridges.u8.dat'
+            bridge_mm = np.memmap(bridge_path, dtype=np.uint8, mode='w+', shape=mask_mm.shape)
+        if bridge_mm is not None:
+            numa_interleave_memory(bridge_mm, desc='Interpolation bridge canvas')  #
+        for membership_path in component_membership_paths:
+            membership_path.parent.mkdir(parents=True, exist_ok=True)
+            pending_membership_mm = np.memmap(
+                membership_path,
+                dtype=component_word_dtype,
+                mode='w+',
+                shape=tuple(int(v) for v in np.asarray(mask_mm).shape),
+            )
+            component_membership_mms.append(pending_membership_mm)
+            pending_membership_mm = None
+    except BaseException:
+        close_memmap_array(pending_membership_mm)
+        pending_membership_mm = None
+        for membership_mm in component_membership_mms:
+            close_memmap_array(membership_mm)
+        component_membership_mms.clear()
+        close_memmap_array(bridge_mm)
+        bridge_mm = None
+        component_cache.clear()
+        close_memmap_array(labels_mm)
+        if not bool(keep_temp):
+            for p in label_paths:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            if bridge_path is not None:
+                try:
+                    bridge_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        _discard_failed_component_outputs()
+        raise
+    component_added_by_slice: Dict[Tuple[int, int], np.ndarray] = {
+        key: np.zeros((int(mask_mm.shape[0]),), dtype=np.int64)
+        for key in component_bit_layout
+    }
 
     candidate_connections = 0
     accepted_connections = 0
@@ -2288,7 +2609,6 @@ def interpolate_view_volume_pass_inplace(
 
             def _render_batch_slice(list_idx: int) -> None:
                 z = int(batch_slices[int(list_idx)])
-                bridge_slice = bridge_mm[int(z)]
                 bbox_union: Optional[List[int]] = None
                 if rendered_paste_bboxes is not None:
                     old_y0, old_x0, old_y1, old_x1 = (
@@ -2298,16 +2618,32 @@ def interpolate_view_volume_pass_inplace(
                         bbox_union = [old_y0, old_x0, old_y1, old_x1]
                     else:
                         bbox_union = [
-                            int(bridge_slice.shape[0]), int(bridge_slice.shape[1]), 0, 0,
+                            int(mask_mm.shape[1]), int(mask_mm.shape[2]), 0, 0,
                         ]
                 local_added = 0
                 for plan_idx, step_idx in schedule[int(z)]:
-                    local_added += _paint_linear_slice_bridge_plan_onto_slice(
-                        bridge_slice,
-                        plan_batch[int(plan_idx)],
-                        int(step_idx),
-                        dst_bbox_union=bbox_union,
-                    )
+                    plan = plan_batch[int(plan_idx)]
+                    component_layout = component_bit_layout.get((
+                        int(plan.interpolation_walk_back_index),
+                        int(plan.interpolation_candidate_index),
+                    ))
+                    if component_layout is not None:
+                        word_index, bit_value = component_layout
+                        local_added += _paint_linear_slice_bridge_plan_onto_slice(
+                            component_membership_mms[int(word_index)][int(z)],
+                            plan,
+                            int(step_idx),
+                            dst_bbox_union=bbox_union,
+                            paint_value=int(bit_value),
+                            binary_destination=False,
+                        )
+                    elif bridge_mm is not None:
+                        local_added += _paint_linear_slice_bridge_plan_onto_slice(
+                            bridge_mm[int(z)],
+                            plan,
+                            int(step_idx),
+                            dst_bbox_union=bbox_union,
+                        )
                 batch_added_counts[int(list_idx)] = np.int64(local_added)
                 if rendered_paste_bboxes is not None and bbox_union is not None:
                     rendered_paste_bboxes[int(z)] = np.asarray(bbox_union, dtype=np.int64)
@@ -2446,34 +2782,67 @@ def interpolate_view_volume_pass_inplace(
                 ), dtype=np.int64)
                 bridge_delta_rows_by_slice[int(z), int(base_y):int(base_y) + int(rows.size)] = rows
 
+            merged_added_by_slice = np.zeros((int(mask_mm.shape[0]),), dtype=np.int64)
+
             def _merge_slice(list_idx: int) -> None:
                 z = int(scheduled_slices[int(list_idx)])
-                bridge_slice = np.asarray(bridge_mm[z])
                 if rendered_paste_bboxes is not None:
                     y0, x0, y1, x1 = (int(v) for v in rendered_paste_bboxes[z])
                     if y0 >= y1 or x0 >= x1:
                         return
-                    bridge_region = bridge_slice[y0:y1, x0:x1]
-                    if not np.any(bridge_region):
-                        return
-                    mask_region = np.asarray(mask_mm[z, y0:y1, x0:x1])
-                    if delta_mm is not None:
-                        # The new w+ delta starts zero; only its possible-bridge region
-                        # needs an explicit write. mask_mm remains frozen until this merge.
-                        delta_region = np.where(
-                            mask_region == 0, bridge_region, np.uint8(0)
+                else:
+                    y0, x0, y1, x1 = 0, 0, int(mask_mm.shape[1]), int(mask_mm.shape[2])
+
+                if component_membership_mms:
+                    bridge_region = np.asarray(
+                        component_membership_mms[0][z, y0:y1, x0:x1] != 0,
+                        dtype=bool,
+                    )
+                    for membership_mm in component_membership_mms[1:]:
+                        bridge_region |= np.asarray(
+                            membership_mm[z, y0:y1, x0:x1] != 0,
+                            dtype=bool,
                         )
-                        delta_mm[z, y0:y1, x0:x1] = delta_region
-                        _record_bridge_delta_metadata(int(z), delta_region, int(y0), int(x0))
-                    mask_region |= bridge_region
-                elif np.any(bridge_slice):
-                    # YOLO_TTA_INTERPOLATION_FUSED_BRIDGE_MERGE=0: exact legacy sweep.
-                    if delta_mm is not None:
-                        mask_slice = np.asarray(mask_mm[z])
-                        delta_region = np.where(mask_slice == 0, bridge_slice, np.uint8(0))
-                        delta_mm[z, :, :] = delta_region
-                        _record_bridge_delta_metadata(int(z), delta_region, 0, 0)
-                    mask_mm[z, :, :] |= bridge_slice
+                elif bridge_mm is not None:
+                    bridge_region = np.asarray(bridge_mm[z, y0:y1, x0:x1])
+                else:  # pragma: no cover - one canvas is always configured
+                    return
+                if not np.any(bridge_region):
+                    return
+
+                mask_region = np.asarray(mask_mm[z, y0:y1, x0:x1])
+                base_foreground = np.asarray(mask_region != 0, dtype=bool)
+                delta_region = np.where(
+                    ~base_foreground, bridge_region, np.uint8(0)
+                ).astype(np.uint8, copy=False)
+                merged_added_by_slice[int(z)] = np.int64(np.count_nonzero(delta_region))
+
+                if component_membership_mms:
+                    # Difference every packed membership bit against the same immutable
+                    # pre-pass mask. Combinations may overlap; their OR remains the exact
+                    # aggregate delta merged below and supplied to subsequent passes.
+                    for membership_mm in component_membership_mms:
+                        membership_region = np.asarray(
+                            membership_mm[z, y0:y1, x0:x1]
+                        )
+                        membership_region[base_foreground] = np.asarray(
+                            0, dtype=membership_region.dtype
+                        )
+                    for component_key, (word_index, bit_value) in component_bit_layout.items():
+                        membership_region = np.asarray(
+                            component_membership_mms[int(word_index)][z, y0:y1, x0:x1]
+                        )
+                        component_added_by_slice[component_key][int(z)] = np.int64(
+                            np.count_nonzero(
+                                membership_region
+                                & np.asarray(int(bit_value), dtype=membership_region.dtype)
+                            )
+                        )
+
+                if delta_mm is not None:
+                    delta_mm[z, y0:y1, x0:x1] = delta_region
+                    _record_bridge_delta_metadata(int(z), delta_region, int(y0), int(x0))
+                mask_region |= np.asarray(bridge_region, dtype=np.uint8)
 
             parallel_for_indices(
                 len(scheduled_slices),
@@ -2481,15 +2850,21 @@ def interpolate_view_volume_pass_inplace(
                 max_workers=choose_slice_parallel_workers(int(render_workers), max(1, len(scheduled_slices))),
                 desc='Interpolation: merge bridges',
             )
+            added_voxels = int(np.sum(merged_added_by_slice, dtype=np.int64))
             flush_array(mask_mm)
             if delta_mm is not None:
                 flush_array(delta_mm)
                 close_memmap_array(delta_mm)
                 bridge_delta_written = True
     finally:
+        pass_failed = sys.exc_info()[0] is not None
         if isinstance(bridge_mm, np.memmap):
             flush_array(bridge_mm)
         del bridge_mm
+        for membership_mm in component_membership_mms:
+            flush_array(membership_mm)
+            close_memmap_array(membership_mm)
+        component_membership_mms.clear()
         try:
             del component_cache
         except Exception:
@@ -2507,6 +2882,86 @@ def interpolate_view_volume_pass_inplace(
                 try:
                     bridge_path.unlink(missing_ok=True)
                 except Exception:
+                    pass
+            if bool(pass_failed):
+                for membership_path in component_membership_paths:
+                    try:
+                        membership_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                for _walk_back_index, _candidate_index, component_path in component_specs:
+                    shutil.rmtree(component_path, ignore_errors=True)
+
+    component_added_counts = {
+        key: int(np.sum(counts, dtype=np.int64))
+        for key, counts in component_added_by_slice.items()
+    }
+    membership_readers: List[np.memmap] = []
+    try:
+        membership_readers = [
+            np.memmap(
+                membership_path,
+                dtype=component_word_dtype,
+                mode='r',
+                shape=tuple(int(v) for v in np.asarray(mask_mm).shape),
+            )
+            for membership_path in component_membership_paths
+        ]
+        # Extract each logical bit-plane directly into a bbox-cropped cvol. Empty
+        # combinations retain the already-published no-scan cvol from initialization.
+        for walk_back_index, candidate_index, component_path in component_specs:
+            component_key = (int(walk_back_index), int(candidate_index))
+            component_voxel_count = int(component_added_counts.get(component_key, 0))
+            if component_voxel_count <= 0:
+                continue
+            word_index, bit_value = component_bit_layout[component_key]
+            membership_reader = membership_readers[int(word_index)]
+            bit_scalar = np.asarray(int(bit_value), dtype=component_word_dtype)
+
+            def _encode_component_slice(idx: int) -> RawBBoxSlicePayload:
+                return _encode_bool_mask_slice_payload(
+                    int(idx),
+                    np.bitwise_and(membership_reader[int(idx)], bit_scalar) != 0,
+                )
+
+            _write_raw_bbox_payload_store(
+                shape=tuple(int(v) for v in np.asarray(mask_mm).shape),
+                store_dir=component_path,
+                encode_slice=_encode_component_slice,
+                format_name=CVOL_FORMAT,
+                desc=(
+                    f'Interpolation component {pass_tag} walkback '
+                    f'{int(walk_back_index)} candidate {int(candidate_index)}'
+                ),
+                workers=int(workers),
+                extra_meta={
+                    'interpolation_walk_back_index': int(walk_back_index),
+                    'interpolation_candidate_index': int(candidate_index),
+                    'added_voxels': int(component_voxel_count),
+                    'render_storage': (
+                        f'packed_{component_word_dtype.name}_membership_bitplane'
+                    ),
+                },
+                force_path_backed=True,
+            )
+    except BaseException:
+        if not bool(keep_temp):
+            for _walk_back_index, _candidate_index, component_path in component_specs:
+                shutil.rmtree(component_path, ignore_errors=True)
+        raise
+    finally:
+        for membership_reader in membership_readers:
+            close_memmap_array(membership_reader)
+        if not bool(keep_temp):
+            for membership_path in component_membership_paths:
+                try:
+                    membership_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            if component_membership_paths:
+                try:
+                    component_membership_paths[0].parent.rmdir()
+                except OSError:
                     pass
 
     result_stats: Dict[str, object] = {
@@ -2534,8 +2989,21 @@ def interpolate_view_volume_pass_inplace(
         ),
         'planner_seed_schedule_window': int(seed_schedule_window),
         'planner_seed_max_cost': int(max_seed_planning_cost),
+        'bridge_component_count': int(component_count),
+        'bridge_component_render_storage': (
+            f'packed_{component_word_dtype.name}_membership_bitplanes'
+            if int(component_count) > 0 else 'none'
+        ),
+        'bridge_component_render_word_count': int(component_word_count),
+        'bridge_component_render_logical_bytes': int(
+            int(component_word_count)
+            * array_nbytes(tuple(int(v) for v in np.asarray(mask_mm).shape), component_word_dtype)
+        ),
     }
     result_stats.update(cache_telemetry)
+    result_stats['bridge_component_deltas'] = _bridge_component_stats(
+        component_added_counts
+    )
     if bool(bridge_delta_written) and bridge_delta_path is not None:
         result_stats['bridge_delta_path'] = str(bridge_delta_path)
         if bridge_delta_slice_bboxes is not None:
@@ -2807,6 +3275,8 @@ class NrrdLayerRef:
     source: str = ''  # fullframe, tile, or global
     mask_kind: str = ''  # yolo, bridge, union, smoothing_result
     pass_index: int = 0
+    interpolation_walk_back_index: int = 0
+    interpolation_candidate_index: int = 0
     tile_config_id: str = ''
     tile_acceptance: str = ''  # parent_mask, parent_bridge, consolidated, or blank
     stage: str = ''
@@ -3681,6 +4151,12 @@ class RawBBoxMaskStore:
  never decodes or resizes an ``in_h x in_w`` zero background. Members contain an
  integral number of output slices so gzip, sparse assembly, and mirror tee all share
  one stable unit of work."""
+        # Local import keeps the package dependency graph acyclic.
+        from .outputs import (
+            _resize_sparse_binary_crop_to_output_region,
+            _restore_source_indices_for_output_z,
+        )
+
         in_t, in_h, in_w = (int(v) for v in self.shape)
         out_t, out_h, out_w = (int(v) for v in output_shape)
         z0 = int(np.clip(int(z_start), 0, out_t))
@@ -4038,62 +4514,3 @@ def write_raw_bbox_mask_store(
         extra_meta=extra_meta,
         force_path_backed=bool(force_path_backed),
     )
-
-
-# Late imports keep callable-only dependency cycles import-safe.
-from ._latebind import bind_late_symbols as _bind_late_symbols
-
-_bind_late_symbols(
-    __name__,
-    globals(),
-    {
-        "config": (
-            "GIB",
-        ),
-        "geometry": (
-            "ViewInfo",
-            "is_tilted_view",
-        ),
-        "inference": (
-            "_cv2_connected_components",
-            "_fill_holes_2d_opencv",
-        ),
-        "outputs": (
-            "_resize_sparse_binary_crop_to_output_region",
-            "_restore_source_indices_for_output_z",
-        ),
-        "runtime": (
-            "_create_memfd_backed_payload_path",
-            "allocate_workspace_array",
-            "array_nbytes",
-            "choose_slice_parallel_workers",
-            "close_memmap_array",
-            "close_memmap_array_without_flush",
-            "copy_workspace_array",
-            "estimate_interpolation_workspace_bytes",
-            "flush_array",
-            "numa_interleave_memory",
-            "open_raw_store_payload_writer",
-            "parallel_for_indices",
-            "parallel_for_indices_chunked",
-            "parallel_map_in_order",
-            "parallel_map_unordered",
-            "raw_store_memfd_enabled",
-            "release_memfd_owners_under",
-            "runtime_telemetry",
-            "should_use_in_memory_workspace",
-        ),
-        "topology": (
-            "SliceLocalLabelLUTs",
-            "SparseSliceLabelStore",
-            "_local_label_store_dtype",
-            "build_slice_endpoint_seeds_from_label_volume",
-            "interpolation_skip_compact_relabel_enabled",
-            "label_foreground_volume_streaming",
-        ),
-        "workspace": (
-            "_env_flag",
-            "_env_int",
-        ),
-    },
-)

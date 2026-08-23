@@ -14,7 +14,7 @@ from tools.smoke_import import install_stubs
 
 install_stubs()
 
-from volume_tta import media, pipeline, runtime
+from volume_tta import assembly, interpolation, media, pipeline, runtime
 
 
 class _DetachHandle:
@@ -123,8 +123,8 @@ class ProcessRuntimeRegressionTests(unittest.TestCase):
                 },
                 clear=False,
             ),
-            mock.patch.object(runtime, 'view_interpolation_wrap_axis', return_value=False),
-            mock.patch.object(runtime, 'interpolate_view_volume_pass_inplace', side_effect=_fallback),
+            mock.patch.object(assembly, 'view_interpolation_wrap_axis', return_value=False),
+            mock.patch.object(interpolation, 'interpolate_view_volume_pass_inplace', side_effect=_fallback),
         ):
             result, stats = runtime.interpolate_view_volume_pass_maybe_process(
                 original,
@@ -172,9 +172,9 @@ class ProcessRuntimeRegressionTests(unittest.TestCase):
                 },
                 clear=False,
             ),
-            mock.patch.object(runtime, 'view_interpolation_wrap_axis', return_value=False),
+            mock.patch.object(assembly, 'view_interpolation_wrap_axis', return_value=False),
             mock.patch.object(
-                runtime,
+                interpolation,
                 'interpolate_view_volume_pass_inplace',
                 side_effect=AssertionError('fallback must not run after success'),
             ),

@@ -6,7 +6,21 @@ behavior. Public coordination contracts live under ``inference_backends``.
 
 from __future__ import annotations
 
-from ._stdlib import *
+import contextlib
+import math
+import shutil
+import threading
+from dataclasses import replace as dataclasses_replace
+from pathlib import Path
+from typing import (
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    TYPE_CHECKING,
+    Tuple,
+)
 import numpy as np
 from ._deps import cv2, ndi, tqdm
 
@@ -16,6 +30,89 @@ from .config import (
 from .runtime import (
     runtime_telemetry_phase,
 )
+
+# Explicit lower-layer dependencies keep imports one-way.
+from .workspace import (
+    _env_flag,
+    _env_int,
+)
+from .runtime import (
+    _interpolation_array_backing_path,
+    allocate_workspace_array,
+    choose_slice_parallel_workers,
+    close_memmap_array,
+    close_memmap_array_without_flush,
+    copy_workspace_array,
+    flush_array,
+    interpolate_view_volume_pass_maybe_process,
+    parallel_for_indices_chunked,
+    parallel_map_in_order,
+    release_memfd_owners_under,
+    runtime_telemetry,
+)
+from .geometry import (
+    ViewInfo,
+    coronal_block_cols,
+    delayed_native_expansion_enabled,
+    is_radial_view,
+    is_tilted_radial_view,
+    is_tilted_view,
+    physical_view_name,
+    radial_base_view_name,
+    radial_sink_only_projection_supported,
+    view_output_token,
+    view_processing_min_radius,
+    view_processing_search_angle,
+)
+from .inference import cleanup_view_volume_after_prediction_inplace
+from .interpolation import (
+    CTILE_FORMAT,
+    CVOL_FORMAT,
+    DeferredTilePostprocessResult,
+    INTERNAL_PACKED_CVOL_FORMAT,
+    IncrementalRawBBoxMaskStoreWriter,
+    NrrdLayerRef,
+    PreparedViewResult,
+    RawBBoxMaskStore,
+    RawBBoxSlicePayload,
+    TileConsolidationResult,
+    TileGateResult,
+    TileParentGateResult,
+    TilePostprocessResult,
+    TilePostprocessTask,
+    _coerce_segment_extent,
+    _drain_volume_to_mmap,
+    _encode_bool_mask_slice_payload,
+    _nrrd_empty_segment_extent,
+    _view_uses_interpolation,
+    _write_raw_bbox_payload_store,
+    write_raw_bbox_mask_store,
+)
+from .cuda_d1 import (
+    _nrrd_layer_key,
+    _nrrd_layer_name,
+    _read_binary_volume_slice_crop_bool,
+    _volume_has_foreground,
+    _volume_shape_tuple,
+    close_raw_store_or_memmap_volume,
+    raw_bbox_nrrd_layers_enabled,
+    subtract_volume_to_raw_bbox_store,
+)
+from .backprojection import (
+    SinkOnlyProjectionResult,
+    backproject_radial_volume_to_volume,
+    backproject_tilted_volume_to_volume,
+)
+from .outputs import (
+    compute_segment_extent_zyx,
+    nrrd_layer_output_suffix,
+    nrrd_layer_sink,
+    nrrd_live_global_layer_enabled,
+)
+
+
+if TYPE_CHECKING:
+    from .finalization import union_volume_into_volume
 
 _FINAL_SOURCE_OUTPUT_SHAPE_TYX: Optional[Tuple[int, int, int]] = None
 
@@ -202,6 +299,8 @@ def materialize_nrrd_view_layer(
     source: str,
     mask_kind: str,
     pass_index: int = 0,
+    interpolation_walk_back_index: int = 0,
+    interpolation_candidate_index: int = 0,
     tile_config_id: str = '',
     tile_acceptance: str = '',
     stage: str = '',
@@ -214,6 +313,7 @@ def materialize_nrrd_view_layer(
     submit_to_sink: bool = True,
     force_path_backed_store: bool = False,
     internal_packbits_store: bool = False,
+    emit_empty: bool = False,
 ) -> Optional[NrrdLayerRef]:
     """Persist a view-derived layer in orthogonal processing geometry for the NRRD writer."""
     if bool(internal_packbits_store) and bool(submit_to_sink):
@@ -221,9 +321,9 @@ def materialize_nrrd_view_layer(
     # callers that already know whether the volume has foreground (e.g. the
     # interpolation pass's added_voxels stat for bridge deltas) skip the per-slice scan.
     if known_has_foreground is not None:
-        if not bool(known_has_foreground):
+        if not bool(known_has_foreground) and not bool(emit_empty):
             return None
-    elif not _volume_has_foreground(view_volume_mm):
+    elif not bool(emit_empty) and not _volume_has_foreground(view_volume_mm):
         return None
 
     key = _nrrd_layer_key(
@@ -452,6 +552,8 @@ def materialize_nrrd_view_layer(
         source=str(source),
         mask_kind=str(mask_kind),
         pass_index=int(pass_index),
+        interpolation_walk_back_index=int(interpolation_walk_back_index),
+        interpolation_candidate_index=int(interpolation_candidate_index),
         tile_config_id=str(tile_config_id),
         tile_acceptance=str(tile_acceptance),
         stage=str(stage),
@@ -469,12 +571,176 @@ def materialize_nrrd_view_layer(
                 source=str(source),
                 mask_kind=str(mask_kind),
                 pass_index=int(pass_index),
+                interpolation_walk_back_index=int(interpolation_walk_back_index),
+                interpolation_candidate_index=int(interpolation_candidate_index),
                 tile_config_id=str(tile_config_id),
                 tile_acceptance=str(tile_acceptance),
                 stage=str(stage),
             ),
         )
     return layer_ref
+
+
+def materialize_interpolation_component_nrrd_view_layer(
+    component_store_path: Path,
+    *,
+    added_voxels: int,
+    model_name: str,
+    view: ViewInfo,
+    source: str,
+    pass_index: int,
+    interpolation_walk_back_index: int,
+    interpolation_candidate_index: int,
+    tile_config_id: str = '',
+    tile_acceptance: str = '',
+    stage: str,
+    description: str,
+    temp_dir: Path,
+    workers: int,
+    keep_temp: bool,
+) -> NrrdLayerRef:
+    """Project one sparse interpolation component and submit its deterministic NRRD.
+
+    Nonempty cvol inputs are expanded into only one reusable dense workspace at a time;
+    empty combinations bypass projection entirely and reuse their compact all-empty cvol.
+    """
+    component_store_path = Path(component_store_path)
+    store = RawBBoxMaskStore.open(component_store_path, mmap_payload=True)
+    combo_stage = (
+        f'{str(stage)}_walkback{int(interpolation_walk_back_index):02d}_'
+        f'candidate{int(interpolation_candidate_index):02d}'
+    )
+    if int(added_voxels) <= 0:
+        try:
+            shape = tuple(int(v) for v in store.shape)
+            key = _nrrd_layer_key(
+                view_name=str(view.name),
+                source=str(source),
+                mask_kind='bridge',
+                pass_index=int(pass_index),
+                tile_config_id=str(tile_config_id),
+                tile_acceptance=str(tile_acceptance),
+                stage=str(combo_stage),
+            )
+            layer_ref = NrrdLayerRef(
+                key=key,
+                name=_nrrd_layer_name(
+                    view=view,
+                    source=str(source),
+                    mask_kind='bridge',
+                    pass_index=int(pass_index),
+                    tile_config_id=str(tile_config_id),
+                    tile_acceptance=str(tile_acceptance),
+                    stage=str(combo_stage),
+                ),
+                path=component_store_path,
+                shape=(int(shape[0]), int(shape[1]), int(shape[2])),
+                dtype='uint8',
+                storage_format=CVOL_FORMAT,
+                model_name=str(model_name),
+                view_name=str(view.name),
+                physical_view_name=physical_view_name(view),
+                aug_id=str(view.tta_aug_id),
+                angle_deg=float(view.tta_angle_deg),
+                view_family=str(view.family),
+                source=str(source),
+                mask_kind='bridge',
+                pass_index=int(pass_index),
+                interpolation_walk_back_index=int(interpolation_walk_back_index),
+                interpolation_candidate_index=int(interpolation_candidate_index),
+                tile_config_id=str(tile_config_id),
+                tile_acceptance=str(tile_acceptance),
+                stage=str(combo_stage),
+                description=str(description),
+                segment_extent_ijk=_nrrd_empty_segment_extent(),
+                segment_extent_shape_tyx=(int(shape[0]), int(shape[1]), int(shape[2])),
+                segment_extent_source='interpolation_empty_component_cvol',
+            )
+        finally:
+            store.close()
+        sink = nrrd_layer_sink()
+        if sink is not None:
+            sink.submit_layer(
+                layer_ref,
+                nrrd_layer_output_suffix(
+                    view_token=view_output_token(view),
+                    source=str(source),
+                    mask_kind='bridge',
+                    pass_index=int(pass_index),
+                    interpolation_walk_back_index=int(interpolation_walk_back_index),
+                    interpolation_candidate_index=int(interpolation_candidate_index),
+                    tile_config_id=str(tile_config_id),
+                    tile_acceptance=str(tile_acceptance),
+                    stage=str(combo_stage),
+                ),
+            )
+        return layer_ref
+
+    decode_path = (
+        Path(temp_dir) / 'nrrd_work' / 'interpolation_component_decode'
+        / str(view.name)
+        / f'{combo_stage}.u8.dat'
+    )
+    decoded_mm: Optional[np.ndarray] = None
+    try:
+        decoded_mm = allocate_workspace_array(
+            shape=tuple(int(v) for v in store.shape),
+            dtype=np.uint8,
+            path=decode_path,
+            desc=(
+                f'Interpolation component decode {model_name}/{view.name} '
+                f'walkback {int(interpolation_walk_back_index)} '
+                f'candidate {int(interpolation_candidate_index)}'
+            ),
+            prefer_memory=False,
+            prefer_memfd=False,
+            initialize_zero=False,
+        )
+
+        def _decode_component_slice(idx: int) -> None:
+            store.fill_decoded_slice_into(int(idx), decoded_mm[int(idx)])  # type: ignore[index]
+
+        parallel_for_indices_chunked(
+            int(store.shape[0]),
+            _decode_component_slice,
+            max_workers=choose_slice_parallel_workers(int(workers), int(store.shape[0])),
+            desc=f'Interpolation component decode {view.name}',
+            show_progress=False,
+            target_chunks_per_worker=2,
+        )
+        flush_array(decoded_mm)
+        layer_ref = materialize_nrrd_view_layer(
+            decoded_mm,
+            model_name=str(model_name),
+            view=view,
+            source=str(source),
+            mask_kind='bridge',
+            pass_index=int(pass_index),
+            interpolation_walk_back_index=int(interpolation_walk_back_index),
+            interpolation_candidate_index=int(interpolation_candidate_index),
+            tile_config_id=str(tile_config_id),
+            tile_acceptance=str(tile_acceptance),
+            stage=str(combo_stage),
+            description=str(description),
+            temp_dir=Path(temp_dir),
+            workers=int(workers),
+            known_has_foreground=True,
+        )
+        if layer_ref is None:  # pragma: no cover - known nonempty cvol contract
+            raise RuntimeError(f'Nonempty interpolation component was suppressed: {component_store_path}')
+        return layer_ref
+    finally:
+        store.close()
+        close_memmap_array(decoded_mm)
+        if not bool(keep_temp):
+            try:
+                decode_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            # Nonempty inputs have been synchronously projected into the returned ref's own
+            # store, so their view-native cvol can be retired immediately. Empty cvols remain
+            # the returned ref backing until the NRRD sink finishes.
+            shutil.rmtree(component_store_path, ignore_errors=True)
 
 def materialize_internal_final_view_layer(
     view_volume_mm: np.ndarray,
@@ -729,6 +995,9 @@ def prepare_view_volume_after_fullframe(
     internal_final_layer_enabled: bool = False,
     preinterpolation_layer_already_published: bool = False,
 ) -> PreparedViewResult:
+    # Local import keeps the package dependency graph acyclic.
+    from .finalization import union_volume_into_volume
+
     baseline_native_volume = union_mm
     d1_delta_only = bool(preinterpolation_layer_already_published)
     d1_additions_mm: Optional[np.ndarray] = None
@@ -744,6 +1013,11 @@ def prepare_view_volume_after_fullframe(
         and str(view.family) == 'radial'
         and not bool(dense_tiling_active)
         and not bool(preinterpolation_layer_already_published)
+        and not (
+            _view_uses_interpolation(view, int(interpolate))
+            and int(interpolation_walk_back) > 0
+            and int(interpolation_candidates) > 0
+        )
     )
 
     # Device-union slice metadata is aggregated per view by the scheduler.
@@ -882,11 +1156,19 @@ def prepare_view_volume_after_fullframe(
             # (bridge AND NOT pre-merge mask) to this path during its merge step, replacing
             # the old full-volume before-copy + subtract bookkeeping.
             pass_delta_path: Optional[Path] = None
-            if (
-                (bool(nrrd_layers_enabled) or bool(d1_delta_only))
-                and not bool(fused_radial_components)
-            ):
+            if bool(d1_delta_only) and not bool(fused_radial_components):
                 pass_delta_path = temp_dir / 'nrrd_work' / view.name / f'fullframe_bridge_pass{int(pass_idx):02d}.u8.dat'
+            pass_component_dir: Optional[Path] = None
+            if (
+                bool(nrrd_layers_enabled)
+                and not bool(fused_radial_components)
+                and int(interpolation_walk_back) > 0
+                and int(interpolation_candidates) > 0
+            ):
+                pass_component_dir = (
+                    temp_dir / 'nrrd_work' / view.name
+                    / f'fullframe_bridge_pass{int(pass_idx):02d}_components'
+                )
 
             baseline_native_volume, stats_local = interpolate_view_volume_pass_maybe_process(
                 mask_mm=baseline_native_volume,
@@ -902,6 +1184,7 @@ def prepare_view_volume_after_fullframe(
                 prefer_memory=True,
                 workers=int(interpolation_task_workers),
                 bridge_delta_path=pass_delta_path,
+                bridge_component_dir=pass_component_dir,
                 # pass 1 labels exactly the flushed volume; later passes see
                 # bridge-mutated content, so the metadata is only forwarded for pass 1.
                 known_slice_any=(meta_slice_any if (meta_valid and int(pass_idx) == 1) else None),
@@ -941,45 +1224,53 @@ def prepare_view_volume_after_fullframe(
                                 f'{model_name}/{view.name}'
                             ),
                         )
-                    if bool(nrrd_layers_enabled):
-                        layer_ref = materialize_nrrd_view_layer(
-                            bridge_delta_mm,
-                            model_name=str(model_name),
-                            view=view,
-                            source='fullframe',
-                            mask_kind='bridge',
-                            pass_index=int(pass_idx),
-                            stage='interpolation',
-                            description='Voxels added by this full-frame interpolation pass only.',
-                            temp_dir=temp_dir,
-                            workers=int(slice_workers),
-                            # the pass already counted its added voxels.
-                            known_has_foreground=int(stats_local.get('added_voxels', 0)) > 0,
-                            # interpolation computed these while forming the exact
-                            # delta. Radial projection consumes them without a strided rescan.
-                            known_row_occupancy=(
-                                np.asarray(stats_local.get('bridge_delta_row_occupancy'), dtype=bool)
-                                if (
-                                    str(view.family) == 'radial'
-                                    and stats_local.get('bridge_delta_row_occupancy') is not None
-                                ) else None
-                            ),
-                            known_slice_bboxes=(
-                                np.asarray(stats_local.get('bridge_delta_slice_bboxes'), dtype=np.int64)
-                                if (
-                                    str(view.family) == 'radial'
-                                    and stats_local.get('bridge_delta_slice_bboxes') is not None
-                                ) else None
-                            ),
-                        )
-                        if layer_ref is not None:
-                            nrrd_layers.append(layer_ref)
                     close_memmap_array(bridge_delta_mm)
                 if not bool(keep_temp):
                     try:
                         pass_delta_path.unlink(missing_ok=True)
                     except Exception:
                         pass
+
+            if pass_component_dir is not None:
+                component_entries = [
+                    dict(entry)
+                    for entry in stats_local.get('bridge_component_deltas', [])
+                ]
+                expected_components = int(interpolation_walk_back) * int(interpolation_candidates)
+                if len(component_entries) != int(expected_components):
+                    raise RuntimeError(
+                        f'{model_name}/{view.name} interpolation pass {int(pass_idx)} returned '
+                        f'{len(component_entries)} component delta(s); expected '
+                        f'{int(interpolation_walk_back)} x {int(interpolation_candidates)} = '
+                        f'{int(expected_components)}'
+                    )
+                component_entries.sort(key=lambda entry: (
+                    int(entry.get('walk_back_index', 0)),
+                    int(entry.get('candidate_index', 0)),
+                ))
+                for component_entry in component_entries:
+                    walk_back_index = int(component_entry['walk_back_index'])
+                    candidate_index = int(component_entry['candidate_index'])
+                    layer_ref = materialize_interpolation_component_nrrd_view_layer(
+                        Path(str(component_entry['path'])),
+                        added_voxels=int(component_entry.get('added_voxels', 0)),
+                        model_name=str(model_name),
+                        view=view,
+                        source='fullframe',
+                        pass_index=int(pass_idx),
+                        interpolation_walk_back_index=int(walk_back_index),
+                        interpolation_candidate_index=int(candidate_index),
+                        stage='interpolation',
+                        description=(
+                            'Voxels added by this full-frame interpolation pass for '
+                            f'walk-back origin {int(walk_back_index)} and candidate '
+                            f'{int(candidate_index)} only.'
+                        ),
+                        temp_dir=temp_dir,
+                        workers=int(slice_workers),
+                        keep_temp=bool(keep_temp),
+                    )
+                    nrrd_layers.append(layer_ref)
 
 
             if int(stats_local.get('added_voxels', 0)) <= 0:
@@ -2010,6 +2301,9 @@ def finalize_consolidated_tile_volume_for_parent(
  or once across unrelated configurations. When NRRD decomposition is enabled, the accepted YOLO
  tile support is written separately for tiles accepted by parent YOLO masks and by parent
  interpolation bridges; tile interpolation bridges are then exported per configuration/pass."""
+    # Local import keeps the package dependency graph acyclic.
+    from .finalization import union_volume_into_volume
+
     interpolation_stats: List[Dict[str, object]] = []
     nrrd_layers: List[NrrdLayerRef] = []
     config_id_norm = str(config_id).strip()
@@ -2113,11 +2407,15 @@ def finalize_consolidated_tile_volume_for_parent(
         for pass_idx in range(1, total_passes + 1):
             # the pass writes the exact added-voxel delta itself,
             # replacing the old full-volume before-copy + subtract bookkeeping.
-            pass_delta_path: Optional[Path] = None
-            if bool(nrrd_layers_enabled):
-                pass_delta_path = (
+            pass_component_dir: Optional[Path] = None
+            if (
+                bool(nrrd_layers_enabled)
+                and int(interpolation_walk_back) > 0
+                and int(interpolation_candidates) > 0
+            ):
+                pass_component_dir = (
                     temp_dir / 'nrrd_work' / view.name / config_label /
-                    f'tile_bridge_pass{int(pass_idx):02d}.u8.dat'
+                    f'tile_bridge_pass{int(pass_idx):02d}_components'
                 )
 
             tile_accumulator_mm, stats_local = interpolate_view_volume_pass_maybe_process(
@@ -2136,7 +2434,7 @@ def finalize_consolidated_tile_volume_for_parent(
                 keep_temp=bool(keep_temp),
                 prefer_memory=True,
                 workers=int(interpolation_task_workers),
-                bridge_delta_path=pass_delta_path,
+                bridge_component_dir=pass_component_dir,
             )
             stats_local = dict(stats_local)
             stats_local.update({
@@ -2154,53 +2452,51 @@ def finalize_consolidated_tile_volume_for_parent(
             })
             interpolation_stats.append(stats_local)
 
-            if bool(nrrd_layers_enabled) and pass_delta_path is not None:
-                delta_reported = str(stats_local.get('bridge_delta_path', '') or '')
-                if delta_reported and Path(delta_reported).exists():
-                    bridge_delta_mm = np.memmap(
-                        Path(delta_reported),
-                        dtype=np.uint8,
-                        mode='r',
-                        shape=tuple(int(v) for v in np.asarray(tile_accumulator_mm).shape),
+            if pass_component_dir is not None:
+                component_entries = [
+                    dict(entry)
+                    for entry in stats_local.get('bridge_component_deltas', [])
+                ]
+                expected_components = int(interpolation_walk_back) * int(interpolation_candidates)
+                if len(component_entries) != int(expected_components):
+                    raise RuntimeError(
+                        f'{model_name}/{view.name}/{config_label} interpolation pass '
+                        f'{int(pass_idx)} returned {len(component_entries)} component delta(s); '
+                        f'expected {int(interpolation_walk_back)} x '
+                        f'{int(interpolation_candidates)} = {int(expected_components)}'
                     )
-                    layer_ref = materialize_nrrd_view_layer(
-                        bridge_delta_mm,
+                component_entries.sort(key=lambda entry: (
+                    int(entry.get('walk_back_index', 0)),
+                    int(entry.get('candidate_index', 0)),
+                ))
+                for component_entry in component_entries:
+                    walk_back_index = int(component_entry['walk_back_index'])
+                    candidate_index = int(component_entry['candidate_index'])
+                    layer_ref = materialize_interpolation_component_nrrd_view_layer(
+                        Path(str(component_entry['path'])),
+                        added_voxels=int(component_entry.get('added_voxels', 0)),
                         model_name=str(model_name),
                         view=view,
                         source='tile',
-                        mask_kind='bridge',
                         pass_index=int(pass_idx),
+                        interpolation_walk_back_index=int(walk_back_index),
+                        interpolation_candidate_index=int(candidate_index),
                         tile_config_id=config_id_norm,
                         tile_acceptance='consolidated',
                         stage=interpolation_stage,
-                        description=f'Voxels added by this {config_label} tile interpolation pass. Bridges are generated after accepted tile masks within this configuration are consolidated, so they are not attributed back to parent-mask vs parent-bridge acceptance categories.',
+                        description=(
+                            f'Voxels added by this {config_label} tile interpolation pass '
+                            f'for walk-back origin {int(walk_back_index)} and candidate '
+                            f'{int(candidate_index)} only. Bridges are generated after '
+                            'accepted tile masks within this configuration are consolidated, '
+                            'so they are not attributed back to parent-mask vs parent-bridge '
+                            'acceptance categories.'
+                        ),
                         temp_dir=temp_dir,
                         workers=int(slice_workers),
-                        # the pass already counted its added voxels.
-                        known_has_foreground=int(stats_local.get('added_voxels', 0)) > 0,
-                        known_row_occupancy=(
-                            np.asarray(stats_local.get('bridge_delta_row_occupancy'), dtype=bool)
-                            if (
-                                str(view.family) == 'radial'
-                                and stats_local.get('bridge_delta_row_occupancy') is not None
-                            ) else None
-                        ),
-                        known_slice_bboxes=(
-                            np.asarray(stats_local.get('bridge_delta_slice_bboxes'), dtype=np.int64)
-                            if (
-                                str(view.family) == 'radial'
-                                and stats_local.get('bridge_delta_slice_bboxes') is not None
-                            ) else None
-                        ),
+                        keep_temp=bool(keep_temp),
                     )
-                    if layer_ref is not None:
-                        nrrd_layers.append(layer_ref)
-                    close_memmap_array(bridge_delta_mm)
-                if not bool(keep_temp):
-                    try:
-                        pass_delta_path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                    nrrd_layers.append(layer_ref)
 
 
             if int(stats_local.get('added_voxels', 0)) <= 0:
@@ -2555,99 +2851,3 @@ def apply_gaussian_smoothing_inplace(
                 pass
 
     return stats
-
-
-# Late imports keep callable-only dependency cycles import-safe.
-from ._latebind import bind_late_symbols as _bind_late_symbols
-
-_bind_late_symbols(
-    __name__,
-    globals(),
-    {
-        "backprojection": (
-            "SinkOnlyProjectionResult",
-            "backproject_radial_volume_to_volume",
-            "backproject_tilted_volume_to_volume",
-        ),
-        "config": (
-            "GIB",
-        ),
-        "cuda_d1": (
-            "_nrrd_layer_key",
-            "_nrrd_layer_name",
-            "_read_binary_volume_slice_crop_bool",
-            "_volume_has_foreground",
-            "_volume_shape_tuple",
-            "close_raw_store_or_memmap_volume",
-            "raw_bbox_nrrd_layers_enabled",
-            "subtract_volume_to_raw_bbox_store",
-        ),
-        "finalization": (
-            "union_volume_into_volume",
-        ),
-        "geometry": (
-            "ViewInfo",
-            "coronal_block_cols",
-            "delayed_native_expansion_enabled",
-            "is_radial_view",
-            "is_tilted_radial_view",
-            "is_tilted_view",
-            "physical_view_name",
-            "radial_base_view_name",
-            "radial_sink_only_projection_supported",
-            "view_output_token",
-            "view_processing_min_radius",
-            "view_processing_search_angle",
-        ),
-        "inference": (
-            "cleanup_view_volume_after_prediction_inplace",
-        ),
-        "interpolation": (
-            "CTILE_FORMAT",
-            "CVOL_FORMAT",
-            "DeferredTilePostprocessResult",
-            "INTERNAL_PACKED_CVOL_FORMAT",
-            "IncrementalRawBBoxMaskStoreWriter",
-            "NrrdLayerRef",
-            "PreparedViewResult",
-            "RawBBoxMaskStore",
-            "RawBBoxSlicePayload",
-            "TileConsolidationResult",
-            "TileGateResult",
-            "TileParentGateResult",
-            "TilePostprocessResult",
-            "TilePostprocessTask",
-            "_coerce_segment_extent",
-            "_drain_volume_to_mmap",
-            "_encode_bool_mask_slice_payload",
-            "_nrrd_empty_segment_extent",
-            "_view_uses_interpolation",
-            "_write_raw_bbox_payload_store",
-            "write_raw_bbox_mask_store",
-        ),
-        "outputs": (
-            "compute_segment_extent_zyx",
-            "nrrd_layer_output_suffix",
-            "nrrd_layer_sink",
-            "nrrd_live_global_layer_enabled",
-        ),
-        "runtime": (
-            "_interpolation_array_backing_path",
-            "allocate_workspace_array",
-            "choose_slice_parallel_workers",
-            "close_memmap_array",
-            "close_memmap_array_without_flush",
-            "copy_workspace_array",
-            "flush_array",
-            "interpolate_view_volume_pass_maybe_process",
-            "parallel_for_indices_chunked",
-            "parallel_map_in_order",
-            "release_memfd_owners_under",
-            "runtime_telemetry",
-        ),
-        "workspace": (
-            "_env_flag",
-            "_env_int",
-        ),
-    },
-)

@@ -6,7 +6,26 @@ behavior. Public coordination contracts live under ``inference_backends``.
 
 from __future__ import annotations
 
-from ._stdlib import *
+import gc
+import math
+import os
+import threading
+import time
+import weakref
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+)
+from dataclasses import dataclass
+from pathlib import Path
+from typing import (
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    TYPE_CHECKING,
+    Tuple,
+)
 import numpy as np
 from ._deps import _numba, cv2, tqdm
 
@@ -17,6 +36,45 @@ from .runtime import (
     interpolation_process_worker_active,
     runtime_telemetry_phase,
 )
+
+# Explicit lower-layer dependencies keep imports one-way.
+from .workspace import (
+    _cpu_count,
+    _env_flag,
+    _env_float,
+    _env_int,
+)
+from .runtime import (
+    array_nbytes,
+    choose_slice_parallel_workers,
+    estimate_voidfill_workspace_bytes,
+    flush_array,
+    numa_interleave_memory,
+    parallel_for_indices_chunked,
+    parallel_map_unordered,
+    runtime_telemetry,
+    should_use_in_memory_workspace,
+    workspace_budget_summary,
+)
+from .inference import (
+    _cv2_connected_components,
+    _try_import_cupy_ndimage,
+)
+from .interpolation import (
+    SliceComponentRecord,
+    SliceEndpointSeed,
+    _component_centroid_anchor,
+    compiled_topology_kernels_enabled,
+)
+
+
+if TYPE_CHECKING:
+    from .backprojection import (
+        _MainProcessGpuStageLease,
+        _announce_main_gpu_stage_skip_once,
+        _trim_main_process_cuda_device,
+        _try_acquire_specific_main_process_gpu_stage,
+    )
 
 if _numba is not None:
     @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
@@ -1009,6 +1067,12 @@ def _try_label_slices_stage_a_gpu(
     """Label independent slice blocks on the selected GPUs.
     
     Produces slice-local labels, area/bbox metadata, and optional adjacent-slice pair codes without a duplicate CPU pass."""
+    # Local import keeps the package dependency graph acyclic.
+    from .backprojection import (
+        _announce_main_gpu_stage_skip_once,
+        _try_acquire_specific_main_process_gpu_stage,
+    )
+
     if not gpu_slice_labeling_enabled():
         return False, None
     try:
@@ -1046,6 +1110,9 @@ def _try_label_slices_stage_a_gpu(
     prev_cp = curr_cp = copied_prev = boundary_dev = None
 
     def _free_admitted_device_pools() -> None:
+        # Local import keeps the package dependency graph acyclic.
+        from .backprojection import _trim_main_process_cuda_device
+
         cleanup_indices = sorted({int(v) for v in device_indices} or {int(v) for v in stage_leases})
         for cleanup_dev_idx in cleanup_indices:
             try:
@@ -2413,51 +2480,3 @@ def build_slice_endpoint_seeds_from_label_volume(
 
     seeds.sort(key=lambda s: (int(s.label), int(s.point[0]), int(s.direction_sign), int(s.point[1]), int(s.point[2])))
     return seeds, int(len(seeds))
-
-
-# Late imports keep callable-only dependency cycles import-safe.
-from ._latebind import bind_late_symbols as _bind_late_symbols
-
-_bind_late_symbols(
-    __name__,
-    globals(),
-    {
-        "backprojection": (
-            "_MainProcessGpuStageLease",
-            "_announce_main_gpu_stage_skip_once",
-            "_trim_main_process_cuda_device",
-            "_try_acquire_specific_main_process_gpu_stage",
-        ),
-        "config": (
-            "GIB",
-        ),
-        "inference": (
-            "_cv2_connected_components",
-            "_try_import_cupy_ndimage",
-        ),
-        "interpolation": (
-            "SliceComponentRecord",
-            "SliceEndpointSeed",
-            "_component_centroid_anchor",
-            "compiled_topology_kernels_enabled",
-        ),
-        "runtime": (
-            "array_nbytes",
-            "choose_slice_parallel_workers",
-            "estimate_voidfill_workspace_bytes",
-            "flush_array",
-            "numa_interleave_memory",
-            "parallel_for_indices_chunked",
-            "parallel_map_unordered",
-            "runtime_telemetry",
-            "should_use_in_memory_workspace",
-            "workspace_budget_summary",
-        ),
-        "workspace": (
-            "_cpu_count",
-            "_env_flag",
-            "_env_float",
-            "_env_int",
-        ),
-    },
-)

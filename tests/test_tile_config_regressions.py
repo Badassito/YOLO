@@ -13,7 +13,7 @@ from tools.smoke_import import install_stubs
 
 install_stubs()
 
-from volume_tta import assembly, geometry
+from volume_tta import assembly, finalization, geometry
 
 
 class MultipleTileConfigurationTests(unittest.TestCase):
@@ -47,7 +47,16 @@ class MultipleTileConfigurationTests(unittest.TestCase):
                 for index in np.argwhere(np.asarray(mask_mm) > 0)
             })
             interpolation_work_dirs.append(Path(work_dir))
-            return mask_mm, {'added_voxels': 0}
+            component_dir = Path(_kwargs['bridge_component_dir'])
+            return mask_mm, {
+                'added_voxels': 0,
+                'bridge_component_deltas': [{
+                    'walk_back_index': 1,
+                    'candidate_index': 1,
+                    'path': str(component_dir / 'walkback01_candidate01.cvol'),
+                    'added_voxels': 0,
+                }],
+            }
 
         def record_layer(_volume: np.ndarray, **kwargs: object) -> object:
             nrrd_stages.append(str(kwargs['stage']))
@@ -65,7 +74,12 @@ class MultipleTileConfigurationTests(unittest.TestCase):
                 side_effect=interpolate_one_set,
             ),
             mock.patch.object(assembly, 'materialize_nrrd_view_layer', side_effect=record_layer),
-            mock.patch.object(assembly, 'union_volume_into_volume', side_effect=union_into),
+            mock.patch.object(
+                assembly,
+                'materialize_interpolation_component_nrrd_view_layer',
+                side_effect=record_layer,
+            ),
+            mock.patch.object(finalization, 'union_volume_into_volume', side_effect=union_into),
             mock.patch.object(assembly, 'view_processing_min_radius', return_value=0.0),
             mock.patch.object(assembly, 'view_processing_search_angle', return_value=15.0),
         ):
@@ -105,10 +119,15 @@ class MultipleTileConfigurationTests(unittest.TestCase):
             nrrd_stages,
             [
                 's2048_st1024_pre_tile_interpolation',
+                's2048_st1024_tile_interpolation',
                 's1536_st768_pre_tile_interpolation',
+                's1536_st768_tile_interpolation',
             ],
         )
-        self.assertEqual(nrrd_config_ids, ['s2048_st1024', 's1536_st768'])
+        self.assertEqual(
+            nrrd_config_ids,
+            ['s2048_st1024', 's2048_st1024', 's1536_st768', 's1536_st768'],
+        )
         self.assertEqual(
             {
                 assembly.nrrd_layer_output_suffix(

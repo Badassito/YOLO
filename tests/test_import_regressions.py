@@ -25,7 +25,7 @@ class ImportRegressionTests(unittest.TestCase):
     def test_topology_can_be_the_first_subsystem_imported(self) -> None:
         completed = self.run_python(str(ROOT / "tools" / "smoke_import.py"), "topology")
         self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertIn("all callable-only dependencies resolved", completed.stdout)
+        self.assertIn("eager package import graph is acyclic", completed.stdout)
         self.assertIn("all function globals resolved", completed.stdout)
 
     def test_interpolation_can_be_the_first_subsystem_imported(self) -> None:
@@ -33,7 +33,7 @@ class ImportRegressionTests(unittest.TestCase):
             str(ROOT / "tools" / "smoke_import.py"), "interpolation"
         )
         self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertIn("all callable-only dependencies resolved", completed.stdout)
+        self.assertIn("eager package import graph is acyclic", completed.stdout)
         self.assertIn("all function globals resolved", completed.stdout)
 
     def test_retina_processor_state_remains_backend_settable(self) -> None:
@@ -100,7 +100,7 @@ class ImportRegressionTests(unittest.TestCase):
                 completed = self.run_python("-c", program, subsystem)
                 self.assertEqual(completed.returncode, 0, completed.stdout)
 
-    def test_concurrent_cycle_imports_do_not_raise_importlib_deadlock(self) -> None:
+    def test_concurrent_first_imports_do_not_raise_importlib_deadlock(self) -> None:
         program = textwrap.dedent(
             """
             import importlib
@@ -133,10 +133,6 @@ class ImportRegressionTests(unittest.TestCase):
 
             assert not any(thread.is_alive() for thread in threads), "import threads hung"
             assert not errors, "\\n".join(errors)
-
-            from volume_tta._latebind import unresolved_bindings
-
-            assert not unresolved_bindings(), unresolved_bindings()
             """
         )
         for pair in (("topology", "finalization"), ("interpolation", "cuda_d1")):
@@ -144,63 +140,15 @@ class ImportRegressionTests(unittest.TestCase):
                 completed = self.run_python("-c", program, *pair)
                 self.assertEqual(completed.returncode, 0, completed.stdout)
 
-    def test_registration_during_resolution_is_not_stranded(self) -> None:
-        program = textwrap.dedent(
-            """
-            import sys
-            import threading
-            import types
-
-            import volume_tta._latebind as latebind
-
-            first_provider = types.ModuleType("race.first_provider")
-            second_provider = types.ModuleType("race.second_provider")
-            sentinel = object()
-            second_provider.second_symbol = sentinel
-            sys.modules[first_provider.__name__] = first_provider
-            sys.modules[second_provider.__name__] = second_provider
-
-            entered = threading.Event()
-            release = threading.Event()
-            original_import_module = latebind.importlib.import_module
-
-            def controlled_import(name):
-                if name == first_provider.__name__ and not entered.is_set():
-                    entered.set()
-                    assert release.wait(5), "resolver release timed out"
-                return sys.modules.get(name) or original_import_module(name)
-
-            latebind.importlib.import_module = controlled_import
-            first_namespace = {}
-            second_namespace = {}
-            resolver = threading.Thread(
-                target=latebind.bind_late_symbols,
-                args=(
-                    "race.first_consumer",
-                    first_namespace,
-                    {"first_provider": ("missing_symbol",)},
-                ),
-                daemon=True,
-            )
-            resolver.start()
-            assert entered.wait(5), "resolver did not enter controlled import"
-
-            latebind.bind_late_symbols(
-                "race.second_consumer",
-                second_namespace,
-                {"second_provider": ("second_symbol",)},
-            )
-            release.set()
-            resolver.join(5)
-
-            assert not resolver.is_alive(), "resolver thread hung"
-            assert second_namespace.get("second_symbol") is sentinel, second_namespace
-            pending = latebind.unresolved_bindings()
-            assert "race.second_consumer" not in pending, pending
-            """
-        )
-        completed = self.run_python("-c", program)
-        self.assertEqual(completed.returncode, 0, completed.stdout)
+    def test_transitional_import_shims_are_retired(self) -> None:
+        package = ROOT / "volume_tta"
+        self.assertFalse((package / "_latebind.py").exists())
+        self.assertFalse((package / "_stdlib.py").exists())
+        for path in package.glob("*.py"):
+            source = path.read_text(encoding="utf-8")
+            self.assertNotIn("_latebind", source, path.name)
+            self.assertNotIn("_stdlib", source, path.name)
+            self.assertNotIn("import *", source, path.name)
 
 
 if __name__ == "__main__":

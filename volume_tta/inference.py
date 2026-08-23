@@ -6,9 +6,85 @@ behavior. Public coordination contracts live under ``inference_backends``.
 
 from __future__ import annotations
 
-from ._stdlib import *
+import argparse
+import contextlib
+import gc
+import math
+import os
+import queue
+import threading
+from collections import OrderedDict
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
+)
+from dataclasses import (
+    dataclass,
+    field,
+)
+from typing import (
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    TYPE_CHECKING,
+    Tuple,
+)
 import numpy as np
 from ._deps import cv2, ndi
+
+# Explicit lower-layer dependencies keep imports one-way.
+from .config import (
+    GIB,
+    quantize_uses_fp16,
+    resolve_quantize,
+)
+from .workspace import (
+    _env_flag,
+    _env_int,
+)
+from .runtime import (
+    _acquire_parallel_pool,
+    _release_parallel_pool,
+    _settle_parallel_futures,
+    choose_parallel_chunk_size,
+    choose_slice_parallel_workers,
+    flush_array,
+    parallel_for_indices_chunked,
+    prediction_hot_path_flush_enabled,
+)
+from .geometry import (
+    BatchResultFrameSpec,
+    GpuPrefetchingYoloSource,
+    InMemoryYoloVolumeSource,
+    PredictionVolumeRef,
+    StreamingYoloVolumeSource,
+    ViewInfo,
+    _cupy_external_stream,
+    _source_prediction_channel_count,
+    make_prediction_ref_yolo_source,
+    maybe_wrap_source_with_gpu_input_staging,
+    mirror_radial_u_output_to_native_affine,
+    prediction_result_frame_spec,
+    view_processing_min_radius,
+)
+
+
+if TYPE_CHECKING:
+    from .cuda_backend import (
+        GpuRenderedYoloSource,
+        GpuTileRenderedYoloSource,
+    )
+    from .backprojection import (
+        _trt_binding_layout_for_backend,
+        _trt_engine_from_autobackend,
+        _try_resident_trt_ring_accumulate,
+    )
 
 def load_ultralytics_model(path: str, task: str = 'segment'):
     try:
@@ -214,6 +290,12 @@ def _channel_count_from_bchw_shape(value: object) -> Optional[int]:
 
 def infer_yolo_model_input_channels(model: object) -> Tuple[Optional[int], str]:
     """Best-effort first-convolution or backend-binding channel discovery."""
+    # Local import keeps the package dependency graph acyclic.
+    from .backprojection import (
+        _trt_binding_layout_for_backend,
+        _trt_engine_from_autobackend,
+    )
+
     candidates: List[Tuple[str, object]] = [('YOLO', model)]
     direct_model = getattr(model, 'model', None)
     if direct_model is not None:
@@ -436,6 +518,9 @@ class PredictionAccumulationHandle:
     precompleted_prediction_count: int = 0
     precompleted_frames_with_predictions: int = 0
     pending_limit: int = 0
+    radial_padding_processed: int = 0
+    radial_padding_union_mm: Optional[np.ndarray] = None
+    radial_padding_confmap_mm: Optional[np.ndarray] = None
 
     def wait(self) -> Dict[str, int]:
         prediction_count = int(self.precompleted_prediction_count)
@@ -450,11 +535,16 @@ class PredictionAccumulationHandle:
                 if self.view_confmap_mm is not None:
                     flush_array(self.view_confmap_mm)
                 flush_array(self.view_union_mm)
+                if self.radial_padding_confmap_mm is not None:
+                    flush_array(self.radial_padding_confmap_mm)
+                if self.radial_padding_union_mm is not None:
+                    flush_array(self.radial_padding_union_mm)
         return {
             'prediction_count': int(prediction_count),
             'frames_with_predictions': int(frames_with_predictions),
             'submitted_frames': int(self.submitted_frames),
             'synthetic_discarded': int(self.synthetic_discarded),
+            'radial_padding_processed': int(self.radial_padding_processed),
             'async_accumulation': 1,
         }
 
@@ -2189,7 +2279,13 @@ class _DeviceUnionAccumulator:
             events = (torch.cuda.Event(), torch.cuda.Event())
         pin_np = (pin_views[0].numpy(), pin_views[1].numpy())
 
-        def _drain(src_dev: object, dst_mm: np.ndarray, *, collect_metadata: bool = False) -> None:
+        def _drain(
+            src_dev: object,
+            dst_mm: np.ndarray,
+            *,
+            collect_metadata: bool = False,
+            confidence: bool = False,
+        ) -> None:
             chunks = [
                 (z0, min(n, z0 + chunk))
                 for z0 in range(0, n, chunk)
@@ -2217,15 +2313,23 @@ class _DeviceUnionAccumulator:
                     _collect_metadata(int(z0), int(z1), host)
                 wr = written[z0:z1]
                 if bool(wr.all()):
-                    np.copyto(np.asarray(dst_mm[z0:z1]), host)
+                    dst = np.asarray(dst_mm[z0:z1])
+                    if bool(confidence):
+                        np.maximum(dst, host, out=dst)
+                    else:
+                        np.bitwise_or(dst, host, out=dst)
                 else:
                     for zi in range(z1 - z0):
                         if wr[zi]:
-                            np.copyto(np.asarray(dst_mm[z0 + zi]), host[zi])
+                            dst = np.asarray(dst_mm[z0 + zi])
+                            if bool(confidence):
+                                np.maximum(dst, host[zi], out=dst)
+                            else:
+                                np.bitwise_or(dst, host[zi], out=dst)
 
         _drain(self.union_dev, view_union_mm, collect_metadata=bool(metadata_enabled))
         if self.conf_dev is not None and view_confmap_mm is not None:
-            _drain(self.conf_dev, view_confmap_mm, collect_metadata=False)
+            _drain(self.conf_dev, view_confmap_mm, collect_metadata=False, confidence=True)
         owned_pin = None
         self.union_dev = None
         self.conf_dev = None
@@ -2571,6 +2675,60 @@ def _process_prediction_frame(
             _write_native_outputs()
 
     return int(num_inst), 1
+
+
+def _prediction_accumulation_target(
+    spec: BatchResultFrameSpec,
+    *,
+    view_union_mm: np.ndarray,
+    view_confmap_mm: Optional[np.ndarray],
+    radial_padding_union_mm: Optional[np.ndarray],
+    radial_padding_confmap_mm: Optional[np.ndarray],
+    M_out_to_native: np.ndarray,
+    native_w: int,
+) -> Tuple[np.ndarray, Optional[np.ndarray], int, np.ndarray, bool]:
+    """Resolve storage, destination index, affine, and stat policy for one result."""
+
+    if not bool(spec.is_radial_padding):
+        target_index = int(spec.task_index)
+        if target_index < 0 or target_index >= int(view_union_mm.shape[0]):
+            raise IndexError(
+                f'prediction result {int(spec.result_index)} maps outside task union '
+                f'{tuple(int(v) for v in view_union_mm.shape)}'
+            )
+        return (
+            view_union_mm,
+            view_confmap_mm,
+            target_index,
+            np.asarray(M_out_to_native, dtype=np.float32),
+            True,
+        )
+
+    if radial_padding_union_mm is not None:
+        target_union = radial_padding_union_mm
+        target_conf = radial_padding_confmap_mm
+        target_index = int(spec.radial_padding_ordinal or 0)
+    else:
+        target_union = view_union_mm
+        target_conf = view_confmap_mm
+        target_index = int(spec.global_destination_index)
+    if target_index < 0 or target_index >= int(target_union.shape[0]):
+        raise IndexError(
+            f'Radial padding result {int(spec.result_index)} maps to {target_index}, but '
+            f'target shape is {tuple(int(v) for v in target_union.shape)}; provide a '
+            'task-local radial padding sink for split leases'
+        )
+    return (
+        target_union,
+        target_conf,
+        target_index,
+        (
+            mirror_radial_u_output_to_native_affine(M_out_to_native, int(native_w))
+            if bool(spec.mirror_radial_u)
+            else np.asarray(M_out_to_native, dtype=np.float32)
+        ),
+        False,
+    )
 
 _DIRECT_PREDICT_ANNOUNCED = False
 
@@ -3287,6 +3445,8 @@ def predict_source_and_accumulate(
     device_union_consumer: Optional[Callable[['_DeviceUnionAccumulator'], Dict[str, object]]] = None,
     require_device_union: bool = False,
     require_proto_hole_treatment: bool = False,
+    radial_padding_union_mm: Optional[np.ndarray] = None,
+    radial_padding_confmap_mm: Optional[np.ndarray] = None,
 ) -> Dict[str, object]:
     """Run YOLO predict(stream=True) on an in-memory source and accumulate native masks.
 
@@ -3299,6 +3459,13 @@ def predict_source_and_accumulate(
  the full view volume has finished inferencing."""
     # only compute the GPU flatten's max-conf plane when a confidence
     # volume actually exists downstream.
+    # Local import keeps the package dependency graph acyclic.
+    from .cuda_backend import (
+        GpuRenderedYoloSource,
+        GpuTileRenderedYoloSource,
+    )
+    from .backprojection import _try_resident_trt_ring_accumulate
+
     set_gpu_flatten_conf_tracking(view_confmap_mm is not None)
     ensure_yolo_ready_for_predict(model, cfg)
     source_channels = _source_prediction_channel_count(source, cfg)
@@ -3438,10 +3605,36 @@ def predict_source_and_accumulate(
                 prediction_count = int(specialized_stats['prediction_count'])
                 frames_with_predictions = int(specialized_stats['frames_with_predictions'])
 
-        def _process_prediction_unit(idx_i: int, masks_obj: Optional[object], confs_arr: Optional[np.ndarray]) -> Tuple[int, int]:
+        source_padding_count = max(0, int(getattr(source, 'radial_padding_count', 0) or 0))
+        effective_slice_locks = slice_locks
+        if effective_slice_locks is None and source_padding_count > 0:
+            effective_slice_locks = [
+                threading.Lock() for _ in range(max(1, int(view_union_mm.shape[0])))
+            ]
+
+        def _process_prediction_unit(
+            spec: BatchResultFrameSpec,
+            masks_obj: Optional[object],
+            confs_arr: Optional[np.ndarray],
+        ) -> Tuple[int, int]:
+            target_union, target_conf, target_index, target_affine, count_stats = (
+                _prediction_accumulation_target(
+                    spec,
+                    view_union_mm=view_union_mm,
+                    view_confmap_mm=view_confmap_mm,
+                    radial_padding_union_mm=radial_padding_union_mm,
+                    radial_padding_confmap_mm=radial_padding_confmap_mm,
+                    M_out_to_native=M_out_to_native,
+                    native_w=int(native_w),
+                )
+            )
             slice_lock = None
-            if slice_locks is not None and len(slice_locks) > 0:
-                slice_lock = slice_locks[int(idx_i) % len(slice_locks)]
+            if effective_slice_locks is not None and len(effective_slice_locks) > 0:
+                lock_index = (
+                    int(spec.global_destination_index)
+                    if bool(spec.is_radial_padding) else int(spec.task_index)
+                )
+                slice_lock = effective_slice_locks[lock_index % len(effective_slice_locks)]
             if isinstance(masks_obj, GpuFlattenedRetinaPayload):
                 # The payload builder sees only the process-global/native radius. Override it
                 # with this source's scaled processing-grid radius before GPU cleanup.
@@ -3451,49 +3644,59 @@ def predict_source_and_accumulate(
                     and gpu_retina_cleanup_enabled()
                     and float(stream_min_radius) > 0.0
                 )
-            pred_inc, frame_inc = _process_prediction_frame(
-                idx=int(idx_i),
-                masks_np=masks_obj,
-                confs_np=confs_arr,
-                out_size=out_size,
-                view_union_mm=view_union_mm,
-                view_confmap_mm=view_confmap_mm,
-                M_out_to_native=M_out_to_native,
-                native_h=native_h,
-                native_w=native_w,
-                slice_lock=slice_lock,
-                device_union=device_union,
-            )
-            # skip the per-slice CPU streaming cleanup when the GPU fast path already ran
-            # min_conf + --min_radius + hole fill on this slice (cleanup_done_on_gpu is set by the frame
-            # processor only when the on-GPU connected-component cleanup actually completed).
-            # also skip it for device-accumulated frames — their host slice is
-            # written by the task-end flush, and this cleanup was gated to scan-only work anyway.
-            if (
-                stream_cleanup
-                and not bool(getattr(masks_obj, 'cleanup_done_on_gpu', False))
-                and not bool(getattr(masks_obj, 'accumulated_on_device', False))
-            ):
-                cleaned_has_foreground = _cleanup_prediction_slice_inplace(
-                    view_union_mm,
-                    view_confmap_mm,
-                    int(idx_i),
-                    min_conf=stream_min_conf,
-                    min_radius=stream_min_radius,
-                    backend=stream_backend,
-                    structure2=stream_structure2,
-                    min_conf_u8=stream_min_conf_u8,
+            # Hold the destination shard across both union and cleanup. Ordinary slice 0,
+            # wrapped slice 0, and repeated multi-wrap destinations can otherwise clean the
+            # same host plane concurrently after _process_prediction_frame releases its lock.
+            with (slice_lock if slice_lock is not None else contextlib.nullcontext()):
+                pred_inc, frame_inc = _process_prediction_frame(
+                    idx=int(target_index),
+                    masks_np=masks_obj,
+                    confs_np=confs_arr,
+                    out_size=out_size,
+                    view_union_mm=target_union,
+                    view_confmap_mm=target_conf,
+                    M_out_to_native=target_affine,
+                    native_h=native_h,
+                    native_w=native_w,
+                    slice_lock=None,
+                    # The task-local device union has only logical frames. Radial extension
+                    # slots are few and retire through their explicit host/auxiliary sink.
+                    device_union=(device_union if count_stats else None),
                 )
-                frame_inc = 1 if bool(cleaned_has_foreground) else 0
+                # skip the per-slice CPU streaming cleanup when the GPU fast path already ran
+                # min_conf + --min_radius + hole fill on this slice (cleanup_done_on_gpu is set by the frame
+                # processor only when the on-GPU connected-component cleanup actually completed).
+                # also skip it for device-accumulated frames — their host slice is
+                # written by the task-end flush, and this cleanup was gated to scan-only work anyway.
+                if (
+                    stream_cleanup
+                    and not bool(getattr(masks_obj, 'cleanup_done_on_gpu', False))
+                    and not bool(getattr(masks_obj, 'accumulated_on_device', False))
+                ):
+                    cleaned_has_foreground = _cleanup_prediction_slice_inplace(
+                        target_union,
+                        target_conf,
+                        int(target_index),
+                        min_conf=stream_min_conf,
+                        min_radius=stream_min_radius,
+                        backend=stream_backend,
+                        structure2=stream_structure2,
+                        min_conf_u8=stream_min_conf_u8,
+                    )
+                    frame_inc = 1 if bool(cleaned_has_foreground) else 0
+            if not count_stats:
+                # Wrapped slots improve the logical slice union but are not additional
+                # source frames; keep task/frame telemetry bounded by num_frames.
+                return 0, 0
             return int(pred_inc), int(frame_inc)
 
-        def _extract_and_process_result(idx_i: int, result_obj: object) -> Tuple[int, int]:
+        def _extract_and_process_result(spec: BatchResultFrameSpec, result_obj: object) -> Tuple[int, int]:
             masks_np, confs_np = _extract_result_masks_and_confs(result_obj)
             try:
                 del result_obj
             except Exception:
                 pass
-            return _process_prediction_unit(int(idx_i), masks_np, confs_np)
+            return _process_prediction_unit(spec, masks_np, confs_np)
 
         # on the GPU-flatten path, eagerly reduce each (n,Hr,Wr) GPU stack to 2 small
         # planes on this (stream) thread so the full stack is released immediately, and bound the queue so
@@ -3505,17 +3708,18 @@ def predict_source_and_accumulate(
         if gpu_flatten_eager:
             effective_pending_limit = max(1, min(int(pending_limit), gpu_retina_flatten_pending_limit(worker_count)))
 
+        radial_padding_processed = 0
         if specialized_stats is not None:
             # The resident ring wrote the device union and task metadata directly.
             pass
         elif worker_count <= 1:
             for idx, r in enumerate(results):
-                if idx >= num_frames:
-                    # Synthetic final-batch padding is required for fixed-batch inference engines;
-                    # consume but discard those results so the predictor stream drains cleanly.
+                spec = prediction_result_frame_spec(source, int(idx), num_frames=int(num_frames))
+                if spec is None:
                     continue
+                radial_padding_processed += int(bool(spec.is_radial_padding))
                 masks_np, confs_np = _extract_result_masks_and_confs(r)
-                pred_inc, frame_inc = _process_prediction_unit(int(idx), masks_np, confs_np)
+                pred_inc, frame_inc = _process_prediction_unit(spec, masks_np, confs_np)
                 prediction_count += int(pred_inc)
                 frames_with_predictions += int(frame_inc)
         else:
@@ -3524,9 +3728,10 @@ def predict_source_and_accumulate(
             executor = _acquire_parallel_pool(worker_count)
             try:
                 for idx, r in enumerate(results):
-                    if idx >= num_frames:
-                        # Discard synthetic repeated-slice results from the padded final batch.
+                    spec = prediction_result_frame_spec(source, int(idx), num_frames=int(num_frames))
+                    if spec is None:
                         continue
+                    radial_padding_processed += int(bool(spec.is_radial_padding))
 
                     if gpu_flatten_eager:
                         masks_np, confs_np = _extract_result_masks_and_confs(r)
@@ -3534,9 +3739,9 @@ def predict_source_and_accumulate(
                             del r
                         except Exception:
                             pass
-                        pending.append(executor.submit(_process_prediction_unit, int(idx), masks_np, confs_np))
+                        pending.append(executor.submit(_process_prediction_unit, spec, masks_np, confs_np))
                     else:
-                        pending.append(executor.submit(_extract_and_process_result, int(idx), r))
+                        pending.append(executor.submit(_extract_and_process_result, spec, r))
                     if len(pending) >= effective_pending_limit:
                         fut = pending.pop(0)
                         pred_inc, frame_inc = fut.result()
@@ -3604,6 +3809,7 @@ def predict_source_and_accumulate(
                 'device_hole_filled_frames': int(device_hole_filled_frames),
                 'proto_hole_treated_frames': int(device_hole_filled_frames),
                 'slice_meta': None,
+                'radial_padding_processed': int(radial_padding_processed),
                 **consumed,
                 # Reuse the established worker-private future channel; the deferred result
                 # wrapper is agnostic to whether the future retires D2H or publishes cvol.
@@ -3651,11 +3857,18 @@ def predict_source_and_accumulate(
                             if view_confmap_mm is not None:
                                 flush_array(view_confmap_mm)
                             flush_array(view_union_mm)
+                            if radial_padding_confmap_mm is not None:
+                                flush_array(radial_padding_confmap_mm)
+                            if radial_padding_union_mm is not None:
+                                flush_array(radial_padding_union_mm)
                         return {
                             'prediction_count': int(base_prediction_count + compacted_predictions),
                             'frames_with_predictions': int(base_frames_with_predictions + compacted_frames),
                             'device_hole_filled_frames': int(filled_frames_for_result),
-                            'slice_meta': retired_meta,
+                            'slice_meta': (
+                                None if int(radial_padding_processed) > 0 else retired_meta
+                            ),
+                            'radial_padding_processed': int(radial_padding_processed),
                         }
                     finally:
                         if retirement_manager is not None and retirement_lane is not None:
@@ -3697,12 +3910,17 @@ def predict_source_and_accumulate(
             if view_confmap_mm is not None:
                 flush_array(view_confmap_mm)
             flush_array(view_union_mm)
+            if radial_padding_confmap_mm is not None:
+                flush_array(radial_padding_confmap_mm)
+            if radial_padding_union_mm is not None:
+                flush_array(radial_padding_union_mm)
 
         return {
             'prediction_count': int(prediction_count),
             'frames_with_predictions': int(frames_with_predictions),
             'device_hole_filled_frames': int(device_hole_filled_frames),
-            'slice_meta': slice_meta,
+            'slice_meta': None if int(radial_padding_processed) > 0 else slice_meta,
+            'radial_padding_processed': int(radial_padding_processed),
             # Private worker protocol; removed before the stats cross the process queue.
             '_device_union_flush_future': device_union_flush_future,
         }
@@ -3731,10 +3949,18 @@ def predict_source_and_submit_accumulation(
     streaming_cleanup_min_conf: float = 0.0,
     streaming_cleanup_min_radius: float = 0.0,
     slice_locks: Optional[Sequence[threading.Lock]] = None,
+    radial_padding_union_mm: Optional[np.ndarray] = None,
+    radial_padding_confmap_mm: Optional[np.ndarray] = None,
 ) -> PredictionAccumulationHandle:
     """Run YOLO streaming inference and enqueue result accumulation without draining it."""
     # only compute the GPU flatten's max-conf plane when a confidence
     # volume actually exists downstream.
+    # Local import keeps the package dependency graph acyclic.
+    from .cuda_backend import (
+        GpuRenderedYoloSource,
+        GpuTileRenderedYoloSource,
+    )
+
     set_gpu_flatten_conf_tracking(view_confmap_mm is not None)
     ensure_yolo_ready_for_predict(model, cfg)
     source_channels = _source_prediction_channel_count(source, cfg)
@@ -3813,10 +4039,36 @@ def predict_source_and_submit_accumulation(
         stream_min_radius = float(streaming_cleanup_min_radius)
         stream_min_conf_u8 = int(min_conf_to_u8_threshold(stream_min_conf)) if stream_min_conf > 0.0 else 0
 
-        def _process_prediction_unit(idx_i: int, masks_obj: Optional[object], confs_arr: Optional[np.ndarray]) -> Tuple[int, int]:
+        source_padding_count = max(0, int(getattr(source, 'radial_padding_count', 0) or 0))
+        effective_slice_locks = slice_locks
+        if effective_slice_locks is None and source_padding_count > 0:
+            effective_slice_locks = [
+                threading.Lock() for _ in range(max(1, int(view_union_mm.shape[0])))
+            ]
+
+        def _process_prediction_unit(
+            spec: BatchResultFrameSpec,
+            masks_obj: Optional[object],
+            confs_arr: Optional[np.ndarray],
+        ) -> Tuple[int, int]:
+            target_union, target_conf, target_index, target_affine, count_stats = (
+                _prediction_accumulation_target(
+                    spec,
+                    view_union_mm=view_union_mm,
+                    view_confmap_mm=view_confmap_mm,
+                    radial_padding_union_mm=radial_padding_union_mm,
+                    radial_padding_confmap_mm=radial_padding_confmap_mm,
+                    M_out_to_native=M_out_to_native,
+                    native_w=int(native_w),
+                )
+            )
             slice_lock = None
-            if slice_locks is not None and len(slice_locks) > 0:
-                slice_lock = slice_locks[int(idx_i) % len(slice_locks)]
+            if effective_slice_locks is not None and len(effective_slice_locks) > 0:
+                lock_index = (
+                    int(spec.global_destination_index)
+                    if bool(spec.is_radial_padding) else int(spec.task_index)
+                )
+                slice_lock = effective_slice_locks[lock_index % len(effective_slice_locks)]
             if isinstance(masks_obj, GpuFlattenedRetinaPayload):
                 masks_obj.gpu_min_radius = float(stream_min_radius)
                 masks_obj.run_gpu_cleanup = bool(
@@ -3824,46 +4076,48 @@ def predict_source_and_submit_accumulation(
                     and gpu_retina_cleanup_enabled()
                     and float(stream_min_radius) > 0.0
                 )
-            pred_inc, frame_inc = _process_prediction_frame(
-                idx=int(idx_i),
-                masks_np=masks_obj,
-                confs_np=confs_arr,
-                out_size=out_size,
-                view_union_mm=view_union_mm,
-                view_confmap_mm=view_confmap_mm,
-                M_out_to_native=M_out_to_native,
-                native_h=native_h,
-                native_w=native_w,
-                slice_lock=slice_lock,
-            )
-            # skip the per-slice CPU streaming cleanup when the GPU fast path already ran
-            # min_conf + --min_radius + hole fill on this slice (cleanup_done_on_gpu is set by the frame
-            # processor only when the on-GPU connected-component cleanup actually completed).
-            if stream_cleanup and not bool(getattr(masks_obj, 'cleanup_done_on_gpu', False)):
-                cleaned_has_foreground = _cleanup_prediction_slice_inplace(
-                    view_union_mm,
-                    view_confmap_mm,
-                    int(idx_i),
-                    min_conf=stream_min_conf,
-                    min_radius=stream_min_radius,
-                    backend=stream_backend,
-                    structure2=stream_structure2,
-                    min_conf_u8=stream_min_conf_u8,
+            with (slice_lock if slice_lock is not None else contextlib.nullcontext()):
+                pred_inc, frame_inc = _process_prediction_frame(
+                    idx=int(target_index),
+                    masks_np=masks_obj,
+                    confs_np=confs_arr,
+                    out_size=out_size,
+                    view_union_mm=target_union,
+                    view_confmap_mm=target_conf,
+                    M_out_to_native=target_affine,
+                    native_h=native_h,
+                    native_w=native_w,
+                    slice_lock=None,
                 )
-                frame_inc = 1 if bool(cleaned_has_foreground) else 0
+                # Keep union and streamed cleanup atomic for repeated wrapped destinations.
+                if stream_cleanup and not bool(getattr(masks_obj, 'cleanup_done_on_gpu', False)):
+                    cleaned_has_foreground = _cleanup_prediction_slice_inplace(
+                        target_union,
+                        target_conf,
+                        int(target_index),
+                        min_conf=stream_min_conf,
+                        min_radius=stream_min_radius,
+                        backend=stream_backend,
+                        structure2=stream_structure2,
+                        min_conf_u8=stream_min_conf_u8,
+                    )
+                    frame_inc = 1 if bool(cleaned_has_foreground) else 0
+            if not count_stats:
+                return 0, 0
             return int(pred_inc), int(frame_inc)
 
-        def _extract_and_process_result(idx_i: int, result_obj: object) -> Tuple[int, int]:
+        def _extract_and_process_result(spec: BatchResultFrameSpec, result_obj: object) -> Tuple[int, int]:
             masks_np, confs_np = _extract_result_masks_and_confs(result_obj)
             try:
                 del result_obj
             except Exception:
                 pass
-            return _process_prediction_unit(int(idx_i), masks_np, confs_np)
+            return _process_prediction_unit(spec, masks_np, confs_np)
 
         futures: List[Future] = []
         submitted_frames = 0
         synthetic_discarded = 0
+        radial_padding_processed = 0
         precompleted_prediction_count = 0
         precompleted_frames_with_predictions = 0
         pending_limit = async_predict_pending_frame_limit(int(num_frames))
@@ -3889,19 +4143,23 @@ def predict_source_and_submit_accumulation(
                 precompleted_frames_with_predictions += int(frame_inc)
 
         for idx, r in enumerate(results):
-            if int(idx) >= int(num_frames):
+            spec = prediction_result_frame_spec(source, int(idx), num_frames=int(num_frames))
+            if spec is None:
                 synthetic_discarded += 1
                 continue
-            submitted_frames += 1
+            if spec.is_radial_padding:
+                radial_padding_processed += 1
+            else:
+                submitted_frames += 1
             if gpu_flatten_eager:
                 masks_np, confs_np = _extract_result_masks_and_confs(r)
                 try:
                     del r
                 except Exception:
                     pass
-                futures.append(postprocess_executor.submit(_process_prediction_unit, int(idx), masks_np, confs_np))
+                futures.append(postprocess_executor.submit(_process_prediction_unit, spec, masks_np, confs_np))
             else:
-                futures.append(postprocess_executor.submit(_extract_and_process_result, int(idx), r))
+                futures.append(postprocess_executor.submit(_extract_and_process_result, spec, r))
             while int(pending_limit) > 0 and len(futures) >= int(pending_limit):
                 _join_one_pending()
 
@@ -3915,6 +4173,9 @@ def predict_source_and_submit_accumulation(
             precompleted_prediction_count=int(precompleted_prediction_count),
             precompleted_frames_with_predictions=int(precompleted_frames_with_predictions),
             pending_limit=int(pending_limit),
+            radial_padding_processed=int(radial_padding_processed),
+            radial_padding_union_mm=radial_padding_union_mm,
+            radial_padding_confmap_mm=radial_padding_confmap_mm,
         )
     finally:
         if owned_staging_wrapper is not None:
@@ -3940,6 +4201,8 @@ def predict_in_memory_volume_and_submit_accumulation(
     streaming_cleanup_min_conf: float = 0.0,
     streaming_cleanup_min_radius: float = 0.0,
     slice_locks: Optional[Sequence[threading.Lock]] = None,
+    radial_padding_union_mm: Optional[np.ndarray] = None,
+    radial_padding_confmap_mm: Optional[np.ndarray] = None,
 ) -> PredictionAccumulationHandle:
     source = make_prediction_ref_yolo_source(
         prediction_volume,
@@ -3963,6 +4226,8 @@ def predict_in_memory_volume_and_submit_accumulation(
         streaming_cleanup_min_conf=float(streaming_cleanup_min_conf),
         streaming_cleanup_min_radius=float(streaming_cleanup_min_radius),
         slice_locks=slice_locks,
+        radial_padding_union_mm=radial_padding_union_mm,
+        radial_padding_confmap_mm=radial_padding_confmap_mm,
     )
 
 def predict_in_memory_volume_and_accumulate(
@@ -3982,6 +4247,8 @@ def predict_in_memory_volume_and_accumulate(
     streaming_cleanup_min_conf: float = 0.0,
     streaming_cleanup_min_radius: float = 0.0,
     slice_locks: Optional[Sequence[threading.Lock]] = None,
+    radial_padding_union_mm: Optional[np.ndarray] = None,
+    radial_padding_confmap_mm: Optional[np.ndarray] = None,
 ) -> Dict[str, int]:
     source = make_prediction_ref_yolo_source(
         prediction_volume,
@@ -4005,6 +4272,8 @@ def predict_in_memory_volume_and_accumulate(
         streaming_cleanup_min_conf=float(streaming_cleanup_min_conf),
         streaming_cleanup_min_radius=float(streaming_cleanup_min_radius),
         slice_locks=slice_locks,
+        radial_padding_union_mm=radial_padding_union_mm,
+        radial_padding_confmap_mm=radial_padding_confmap_mm,
     )
 
 def cleanup_backend() -> str:
@@ -4480,54 +4749,3 @@ def cleanup_view_volume_after_prediction_inplace(
     flush_array(mask_mm)
     if confmap_mm is not None:
         flush_array(confmap_mm)
-
-
-# Late imports keep callable-only dependency cycles import-safe.
-from ._latebind import bind_late_symbols as _bind_late_symbols
-
-_bind_late_symbols(
-    __name__,
-    globals(),
-    {
-        "backprojection": (
-            "_trt_binding_layout_for_backend",
-            "_trt_engine_from_autobackend",
-            "_try_resident_trt_ring_accumulate",
-        ),
-        "config": (
-            "GIB",
-            "quantize_uses_fp16",
-            "resolve_quantize",
-        ),
-        "cuda_backend": (
-            "GpuRenderedYoloSource",
-            "GpuTileRenderedYoloSource",
-        ),
-        "geometry": (
-            "GpuPrefetchingYoloSource",
-            "InMemoryYoloVolumeSource",
-            "PredictionVolumeRef",
-            "StreamingYoloVolumeSource",
-            "ViewInfo",
-            "_cupy_external_stream",
-            "_source_prediction_channel_count",
-            "make_prediction_ref_yolo_source",
-            "maybe_wrap_source_with_gpu_input_staging",
-            "view_processing_min_radius",
-        ),
-        "runtime": (
-            "_acquire_parallel_pool",
-            "_release_parallel_pool",
-            "_settle_parallel_futures",
-            "choose_parallel_chunk_size",
-            "choose_slice_parallel_workers",
-            "flush_array",
-            "parallel_for_indices_chunked",
-            "prediction_hot_path_flush_enabled",
-        ),
-        "workspace": (
-            "_env_flag",
-            "_env_int",
-        ),
-    },
-)

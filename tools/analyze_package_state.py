@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "volume_tta"
-IGNORED = {"_stdlib", "_deps", "_latebind", "__init__", "__main__"}
+IGNORED = {"_deps", "__init__", "__main__"}
 
 
 def assigned_names(target: ast.AST) -> set[str]:

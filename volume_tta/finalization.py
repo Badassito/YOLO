@@ -6,7 +6,34 @@ behavior. Public coordination contracts live under ``inference_backends``.
 
 from __future__ import annotations
 
-from ._stdlib import *
+import gc
+import json
+import math
+import mmap
+import os
+import re
+import threading
+import time
+import multiprocessing as mp
+from collections import OrderedDict
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+)
+from dataclasses import (
+    dataclass,
+    field,
+    replace as dataclasses_replace,
+)
+from pathlib import Path
+from typing import (
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+)
 import numpy as np
 from ._deps import cv2, ndi, tqdm
 
@@ -16,6 +43,73 @@ from .config import (
 from .runtime import (
     runtime_telemetry_phase,
 )
+
+# Explicit lower-layer dependencies keep imports one-way.
+from .config import SCRIPT_VERSION
+from .workspace import (
+    _cpu_count,
+    _env_flag,
+    _env_float,
+    _env_int,
+)
+from .runtime import (
+    _acquire_parallel_pool,
+    _release_parallel_pool,
+    allocate_workspace_array,
+    choose_slice_parallel_workers,
+    close_memmap_array,
+    flush_array,
+    parallel_for_indices,
+    parallel_for_indices_chunked,
+    runtime_telemetry,
+)
+from .geometry import (
+    ViewInfo,
+    coronal_block_cols,
+    physical_view_name,
+)
+from .interpolation import (
+    CVOL_FORMAT,
+    IncrementalRawBBoxMaskStoreWriter,
+    NrrdLayerRef,
+    RawBBoxMaskStore,
+    _coerce_segment_extent,
+    _nrrd_empty_segment_extent,
+    compiled_topology_kernels_enabled,
+)
+from .cuda_d1 import (
+    _nrrd_layer_key,
+    _nrrd_layer_name,
+    _volume_shape_tuple,
+)
+from .topology import (
+    SparseSliceLabelStore,
+    _numba_keep_lut_apply_kernel,
+    _numba_sparse_keep_lut_apply_kernel,
+    binary_slice_bbox_coverage,
+    binary_volume_slice_metadata,
+    discard_binary_volume_slice_metadata,
+    fill_3d_voids_inplace_streaming,
+    gpu_slice_labeling_configured_devices,
+    label_foreground_volume_streaming,
+    register_binary_volume_slice_metadata,
+    scan_binary_volume_slice_metadata,
+    topology_slab_slices,
+)
+from .outputs import (
+    _close_nrrd_layer_source,
+    _drop_nrrd_raw_store_chunks_ram_cache,
+    _ffv1_contiguous_segments,
+    _madvise_array_mmap,
+    _nrrd_layer_ref_is_raw_bbox_store,
+    _open_nrrd_layer_ref,
+    _read_layer_slice_in_output_shape,
+    _restore_source_indices_for_output_z,
+    compute_segment_extent_zyx,
+    nrrd_layer_output_suffix,
+    nrrd_layer_sink,
+)
+from .assembly import materialize_nrrd_global_layer
 
 def _union_projected_layer_ref_into_volume(
     ref: 'NrrdLayerRef',
@@ -1419,7 +1513,7 @@ def assemble_current_view_union_volume(
     uses source geometry when requested."""
     if len(view_volumes_by_model) != 1:
         raise ValueError(
-            f'GPT-5.6-Sol-Pro v{SCRIPT_VERSION} expected one logical GPU/CPU model pair; '
+            f'GPT-5.6-Sol-Ultra v{SCRIPT_VERSION} expected one logical GPU/CPU model pair; '
             f'found {len(view_volumes_by_model)} result namespaces'
         )
 
@@ -4107,84 +4201,3 @@ def apply_v14_centerline_filter_inplace(
     stats['total_removed_voxels'] = int(sum(int(item['removed_voxels']) for item in pass_records))
     stats['total_watershed_voxels'] = int(sum(int(item['watershed_voxels']) for item in pass_records))
     return stats
-
-
-# Late imports keep callable-only dependency cycles import-safe.
-from ._latebind import bind_late_symbols as _bind_late_symbols
-
-_bind_late_symbols(
-    __name__,
-    globals(),
-    {
-        "assembly": (
-            "materialize_nrrd_global_layer",
-        ),
-        "config": (
-            "GIB",
-            "SCRIPT_VERSION",
-        ),
-        "cuda_d1": (
-            "_nrrd_layer_key",
-            "_nrrd_layer_name",
-            "_volume_shape_tuple",
-        ),
-        "geometry": (
-            "ViewInfo",
-            "coronal_block_cols",
-            "physical_view_name",
-        ),
-        "interpolation": (
-            "CVOL_FORMAT",
-            "IncrementalRawBBoxMaskStoreWriter",
-            "NrrdLayerRef",
-            "RawBBoxMaskStore",
-            "_coerce_segment_extent",
-            "_nrrd_empty_segment_extent",
-            "compiled_topology_kernels_enabled",
-        ),
-        "outputs": (
-            "_close_nrrd_layer_source",
-            "_drop_nrrd_raw_store_chunks_ram_cache",
-            "_ffv1_contiguous_segments",
-            "_madvise_array_mmap",
-            "_nrrd_layer_ref_is_raw_bbox_store",
-            "_open_nrrd_layer_ref",
-            "_read_layer_slice_in_output_shape",
-            "_restore_source_indices_for_output_z",
-            "compute_segment_extent_zyx",
-            "nrrd_layer_output_suffix",
-            "nrrd_layer_sink",
-        ),
-        "runtime": (
-            "_acquire_parallel_pool",
-            "_release_parallel_pool",
-            "allocate_workspace_array",
-            "choose_slice_parallel_workers",
-            "close_memmap_array",
-            "flush_array",
-            "parallel_for_indices",
-            "parallel_for_indices_chunked",
-            "runtime_telemetry",
-        ),
-        "topology": (
-            "SparseSliceLabelStore",
-            "_numba_keep_lut_apply_kernel",
-            "_numba_sparse_keep_lut_apply_kernel",
-            "binary_slice_bbox_coverage",
-            "binary_volume_slice_metadata",
-            "discard_binary_volume_slice_metadata",
-            "fill_3d_voids_inplace_streaming",
-            "gpu_slice_labeling_configured_devices",
-            "label_foreground_volume_streaming",
-            "register_binary_volume_slice_metadata",
-            "scan_binary_volume_slice_metadata",
-            "topology_slab_slices",
-        ),
-        "workspace": (
-            "_cpu_count",
-            "_env_flag",
-            "_env_float",
-            "_env_int",
-        ),
-    },
-)
