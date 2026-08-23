@@ -20,13 +20,6 @@ def load_ultralytics_model(path: str, task: str = 'segment'):
         ) from e
     return YOLO(path, task=task)
 
-def background_model_load_enabled() -> bool:
-    """Return whether model loading overlaps decode and view preparation.
-
-    CUDA models load inside persistent GPU workers; CPU models use a loader thread.
-    """
-    return _env_flag('YOLO_TTA_BACKGROUND_MODEL_LOAD', True)
-
 def canonical_single_device(device: str) -> str:
     raw = str(device or '').strip()
     if not raw:
@@ -41,69 +34,6 @@ def canonical_single_device(device: str) -> str:
     if token.isdigit():
         return f'cuda:{token}'
     return token
-
-def _canonical_single_device_token(token: str) -> str:
-    low = str(token).strip().lower()
-    if low in ('cpu', 'mps'):
-        return low
-    if low.startswith('cuda'):
-        return low
-    if low.isdigit():
-        return f'cuda:{low}'
-    return str(token).strip()
-
-def parse_device_list(device: 'Sequence[str] | str | None') -> List[str]:
-    """Parse one-or-more CUDA devices, MPS, or CPU into canonical device strings.
-
- Comma-separated, whitespace-separated, and ``argparse`` list forms are accepted. CPU
- cannot be mixed with accelerators; duplicates are removed while preserving order."""
-    if device is None:
-        return ['cpu']
-    if isinstance(device, str):
-        raw = device.strip()
-    else:
-        # nargs='+' list (or any sequence): join on spaces, then split on comma/whitespace below.
-        raw = ' '.join(str(t) for t in device).strip()
-    if not raw:
-        return ['cpu']
-    tokens = [t for t in re.split(r'[\s,]+', raw) if t]
-    if not tokens:
-        return ['cpu']
-
-    canon: List[str] = []
-    seen: set[str] = set()
-    saw_cpu = False
-    saw_gpu = False
-    for tok in tokens:
-        dev = _canonical_single_device_token(tok)
-        if dev == 'cpu':
-            saw_cpu = True
-        elif dev == 'mps' or str(dev).startswith('cuda'):
-            saw_gpu = True
-        if dev not in seen:
-            seen.add(dev)
-            canon.append(dev)
-
-    if saw_cpu and saw_gpu:
-        raise ValueError('--device cannot mix cpu and GPU indices; use either cpu or one/more GPU indices')
-    if saw_cpu:
-        # cpu is a single logical device regardless of how many times it was listed.
-        return ['cpu']
-    return canon
-
-def is_cpu_device_list(devices: Sequence[str]) -> bool:
-    return all(str(d).strip().lower() == 'cpu' for d in devices)
-
-def resolve_retina_mask_processor(explicit: Optional[str], devices: Sequence[str]) -> Tuple[str, str]:
-    """Resolve retina reconstruction placement for the selected inference devices."""
-    explicit_norm = None if explicit is None else str(explicit).strip().lower()
-    if is_cpu_device_list(devices):
-        return 'cpu', '--device cpu forces CPU retina reconstruction'
-    if explicit_norm in ('cpu', 'gpu'):
-        return explicit_norm, f'explicit --retina_mask_processor {explicit_norm}'
-    if any(str(d).startswith('cuda') for d in devices):
-        return 'gpu', 'CUDA default uses GPU retina reconstruction'
-    return 'cpu', 'non-CUDA default uses CPU retina reconstruction'
 
 _RETINA_MASK_PROCESSOR_IS_CPU: Optional[bool] = None
 
@@ -641,10 +571,10 @@ def _detach_clone_tensor_if_torch(value: object) -> object:
     return clone()
 
 def cpu_retina_masks_enabled() -> bool:
-    """Return the CLI/device-resolved retina-mask placement.
+    """Return the backend-resolved retina-mask placement.
 
-    Main and CUDA-worker initialization always publish the resolved setting. CPU remains the
-    safe default only for isolated helper calls made before that initialization.
+    Parent, CUDA-worker, and OpenVINO-worker initialization publish the backend-local setting.
+    CPU remains the safe default only for isolated helper calls made before initialization.
     """
     if _RETINA_MASK_PROCESSOR_IS_CPU is not None:
         return bool(_RETINA_MASK_PROCESSOR_IS_CPU)

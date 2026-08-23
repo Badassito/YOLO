@@ -5,17 +5,46 @@ import io
 import unittest
 
 from volume_tta.config import (
+    SAVE_OPTION_TOKENS,
     build_argparser,
     resolve_backend_batches,
     resolve_backend_devices,
     resolve_backend_models,
     resolve_backend_precisions,
     resolve_channel_format,
+    resolve_save_request,
     resolve_tta_angles,
 )
 
 
 class ConfigTests(unittest.TestCase):
+    def test_unknown_processor_and_crop_options_are_rejected(self) -> None:
+        parser = build_argparser()
+        option_strings = {
+            option for action in parser._actions for option in action.option_strings
+        }
+        unknown_options = [
+            "--" + "_".join(("retina", "mask", "processor")),
+            "--" + "_".join(("save", "nrrd", "tight", "crop")),
+        ]
+        help_text = parser.format_help()
+        required = ["--input", "input.mkv", "--model", "gpu:model.engine"]
+        for underscored in unknown_options:
+            for option in (underscored, underscored.replace("_", "-")):
+                with self.subTest(option=option):
+                    self.assertNotIn(option, option_strings)
+                    self.assertNotIn(option, help_text)
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        with self.assertRaises(SystemExit):
+                            parser.parse_args([*required, option])
+
+        crop_value = "_".join(("nrrd", "tight", "crop"))
+        for value in (crop_value, crop_value.replace("_", "-")):
+            with self.subTest(save_value=value):
+                self.assertNotIn(value, SAVE_OPTION_TOKENS)
+                with self.assertRaises(ValueError):
+                    resolve_save_request(value)
+
     def test_retired_centerline_backend_and_tilt_alias_are_not_registered(self) -> None:
         parser = build_argparser()
         option_strings = {option for action in parser._actions for option in action.option_strings}

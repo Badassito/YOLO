@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compatibility launcher for the packaged volume TTA pipeline.
+"""Versioned compatibility launcher for the packaged volume TTA pipeline.
 
 The implementation lives in :mod:`volume_tta`; the filename remains versioned for
 existing SLURM submission scripts.

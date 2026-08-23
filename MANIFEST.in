@@ -1,5 +1,5 @@
 include ARCHITECTURE.md
-include GPT-5.6-Sol-Pro_v17.0.10_SLURM.py
+include GPT-5.6-Sol-Pro_v17.0.11_SLURM.py
 include setup.py
 include tools/intel_accelerator_selftest.py
 recursive-include native *.c *.h *.md

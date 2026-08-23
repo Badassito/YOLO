@@ -1,6 +1,6 @@
 # Volume TTA architecture
 
-The `GPT-5.6-Sol-Pro_v17.0.10_SLURM.py` filename remains a versioned compatibility
+The `GPT-5.6-Sol-Pro_v17.0.11_SLURM.py` filename remains a versioned compatibility
 launcher. The implementation lives in the importable `volume_tta` package so spawned
 processes resolve worker functions and data types through canonical module paths.
 

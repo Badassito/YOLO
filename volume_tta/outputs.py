@@ -1073,10 +1073,6 @@ def nrrd_gzip_workers() -> int:
 def nrrd_gzip_chunk_bytes() -> int:
     return max(1, _env_int('YOLO_TTA_NRRD_GZIP_CHUNK_MIB', 16)) * 1024 * 1024
 
-# Historical single-pool state is retained as an inert compatibility symbol for the
-# refactor inventory; v17.0.8 uses the backend-sized pool map below.
-_NRRD_GZIP_EXECUTOR: Optional[ThreadPoolExecutor] = None
-
 _NRRD_GZIP_EXECUTORS: Dict[Tuple[str, int], ThreadPoolExecutor] = {}
 
 _NRRD_GZIP_EXECUTOR_LOCK = threading.Lock()
@@ -1891,7 +1887,7 @@ _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCE_LOCK = threading.Lock()
 
 def _after_nrrd_compression_fork_child() -> None:
     """Discard parent compressor pools, locks, and policy caches in a fork child."""
-    global _NRRD_GZIP_EXECUTOR, _NRRD_GZIP_EXECUTORS
+    global _NRRD_GZIP_EXECUTORS
     global _NRRD_GZIP_EXECUTOR_LOCK, _NRRD_ZERO_MEMBER_LOCK
     global _NRRD_ZERO_MEMBER_CACHE, _NRRD_MEMBER_CODEC_SETTING_WARNED
     global _NRRD_MEMBER_GZIP_OK, _NRRD_MEMBER_GZIP_FAILURE_REASONS
@@ -1903,7 +1899,6 @@ def _after_nrrd_compression_fork_child() -> None:
     # No ThreadPoolExecutor worker survives fork(), and any inherited lock may have
     # been held by a vanished parent thread. Never call shutdown() or acquire one of
     # those locks in the child; replace the complete process-local state directly.
-    _NRRD_GZIP_EXECUTOR = None
     _NRRD_GZIP_EXECUTORS = {}
     _NRRD_GZIP_EXECUTOR_LOCK = threading.Lock()
     _NRRD_ZERO_MEMBER_CACHE = {}

@@ -7,19 +7,16 @@ behavior. Public coordination contracts live under ``inference_backends``.
 from __future__ import annotations
 
 from ._stdlib import *
-import numpy as np
 
 GIB = 1024 ** 3
 
 NRRD_SPACE = "left-posterior-superior"
 
-SCRIPT_VERSION = '17.0.10'
+SCRIPT_VERSION = '17.0.11'
 
-SCRIPT_VERSION_COMPACT = '17010'
+SCRIPT_VERSION_COMPACT = '17011'
 
 SCRIPT_BASENAME = f'GPT-5.6-Sol-Pro_v{SCRIPT_VERSION}_SLURM.py'
-
-OUTPUT_NRRD_PREFIX = ''
 
 LEGACY_OUTPUT_NRRD_PREFIX = 'HW_'
 
@@ -33,8 +30,6 @@ def variant_nrrd_stem(stem: object) -> str:
     while raw.startswith(LEGACY_OUTPUT_NRRD_PREFIX):
         raw = raw[len(LEGACY_OUTPUT_NRRD_PREFIX):]
     return raw
-
-RADIAL_TEXTURE_VARIANT_LABEL = 'pure hardware-linear texture'
 
 def _parse_angles(
     values: Sequence[str] | str | float | int | None,
@@ -174,10 +169,6 @@ def resolve_save_request(values: Sequence[str] | str | None) -> SaveRequest:
         options=tuple(resolved),
         low_quality_downbins=tuple(low_quality_downbins),
     )
-
-def resolve_save_options(values: Sequence[str] | str | None) -> List[str]:
-    """Compatibility helper returning only canonical output option names."""
-    return list(resolve_save_request(values).options)
 
 @dataclass(frozen=True)
 class PostprocessingRequest:
@@ -594,12 +585,6 @@ def resolve_quantize(value: object) -> int | str | None:
         valid = ', '.join(repr(v) for v in QUANTIZE_ALIASES)
         raise ValueError(f'unsupported --quantize value {value!r}; expected one of {valid}, or none')
     return resolved
-
-def _parse_quantize_arg(value: str) -> int | str | None:
-    try:
-        return resolve_quantize(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 def quantize_uses_fp16(value: object) -> bool:
     """True only for the FP16 inference scheme; exported INT8 backends own their binding dtype."""

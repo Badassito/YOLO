@@ -475,29 +475,6 @@ def _component_record_dilated_overlap_count(prev_record: SliceComponentRecord, c
     cand_block = candidate_record.mask_crop[iy0 - int(cy0):iy1 - int(cy0), ix0 - int(cx0):ix1 - int(cx0)]
     return int(np.count_nonzero(prev_block & cand_block))
 
-def _component_records_directly_overlap(a: SliceComponentRecord, b: SliceComponentRecord) -> bool:
-    ay0, ax0, ay1, ax1 = a.bbox
-    by0, bx0, by1, bx1 = b.bbox
-    iy0 = max(int(ay0), int(by0))
-    ix0 = max(int(ax0), int(bx0))
-    iy1 = min(int(ay1), int(by1))
-    ix1 = min(int(ax1), int(bx1))
-    if iy0 >= iy1 or ix0 >= ix1:
-        return False
-    if _planning_kernels_active():
-        try:
-            # early-exit scan — no temporary AND plane per test.
-            return bool(_numba_blocks_overlap_any_kernel(
-                a.mask_crop, int(ay0), int(ax0),
-                b.mask_crop, int(by0), int(bx0),
-                int(iy0), int(ix0), int(iy1), int(ix1),
-            ))
-        except Exception as exc:
-            _disable_planning_kernels(exc)
-    a_block = a.mask_crop[iy0 - int(ay0):iy1 - int(ay0), ix0 - int(ax0):ix1 - int(ax0)]
-    b_block = b.mask_crop[iy0 - int(by0):iy1 - int(by0), ix0 - int(bx0):ix1 - int(bx0)]
-    return bool(np.any(a_block & b_block))
-
 def _component_record_mirrored_u(record: SliceComponentRecord, width: int) -> SliceComponentRecord:
     """Mirror a component record along the u (x) axis of its full slice.
 
@@ -1028,20 +1005,6 @@ if _numba is not None:
         return count
 
     @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
-    def _numba_blocks_overlap_any_kernel(
-        a_mask: np.ndarray, a_oy: int, a_ox: int,
-        b_mask: np.ndarray, b_oy: int, b_ox: int,
-        iy0: int, ix0: int, iy1: int, ix1: int,
-    ) -> int:
-        for gy in range(iy0, iy1):
-            ay = gy - a_oy
-            by = gy - b_oy
-            for gx in range(ix0, ix1):
-                if a_mask[ay, gx - a_ox] and b_mask[by, gx - b_ox]:
-                    return 1
-        return 0
-
-    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
     def _numba_keep_center_fill_kernel(mask: np.ndarray) -> np.ndarray:
         # keep-center-component (8-connected) + enclosed-hole fill (4-connected background),
         # fused: result = NOT(border-4-connected component of NOT kept). Matches
@@ -1179,7 +1142,6 @@ else:
     _numba_scatter_true_kernel = None
     _numba_max_abs_extent_kernel = None
     _numba_dilated_overlap_count_kernel = None
-    _numba_blocks_overlap_any_kernel = None
     _numba_keep_center_fill_kernel = None
     _numba_paste_masked_or_kernel = None
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import mmap
 import os
 import tempfile
 import threading

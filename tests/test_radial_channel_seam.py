@@ -78,6 +78,28 @@ class RadialChannelSeamTests(unittest.TestCase):
         for channel, expected in enumerate(planes[:3]):
             np.testing.assert_array_equal(no_crossing[:, :, channel], expected)
 
+    def test_nonunit_channel_stride_flips_both_radial_seams_in_one_stack(self) -> None:
+        view = self._radial_view(num_slices=5)
+        planes = self._planes(num_slices=5)
+        renderer = geometry.ChannelFormattedFrameRenderer(
+            lambda index: planes[int(index)],
+            view,
+            resolve_channel_format("C5S2"),
+            cache_frames=0,
+        )
+
+        rendered = renderer(1)
+        expected = (
+            planes[2][:, ::-1],
+            planes[4][:, ::-1],
+            planes[1],
+            planes[3],
+            planes[0][:, ::-1],
+        )
+        self.assertEqual(rendered.shape, (2, 3, 5))
+        for channel, expected_plane in enumerate(expected):
+            np.testing.assert_array_equal(rendered[:, :, channel], expected_plane)
+
     def test_cache_keeps_mirrored_and_unmirrored_orientation_separate(self) -> None:
         view = self._radial_view(num_slices=1)
         plane = self._planes(num_slices=1)[0]

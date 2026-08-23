@@ -229,9 +229,7 @@ def _main_impl() -> None:
         list(save_request.low_quality_downbins)
         if save_request.low_quality_downbins else None
     )
-    # Internal compatibility attributes keep the established post-union implementation
-    # unchanged.  The retired individual CLI flags are not registered with argparse and
-    # therefore cannot be selected or used as a rollback path.
+    # Project the canonical postprocessing request onto the internal fields consumed below.
     args.keep_objects = int(postprocessing_request.keep_objects)
     args.enable_3d_void_fill = bool(postprocessing_request.enable_3d_void_fill)
     args.gaussian_smoothing = (
@@ -256,15 +254,11 @@ def _main_impl() -> None:
         f'[v{SCRIPT_VERSION}] every --angle value is an independent view variant through cleanup, '
         'interpolation, tile gating, NRRD decomposition, and final per-view union. Tile '
         'components are gated individually against their same-angle parent YOLO mask, then '
-        'only the residual components are re-gated against same-angle parent bridges. The '
-        'retired unified-angle and configuration-canvas tile paths are not present. Radial '
-        'interpolation wrapping is mandatory. '
+        'only the residual components are re-gated against same-angle parent bridges. Radial '
+        'interpolation wraps across its angular boundary. '
         'View selection uses structured Radial, Tilted, and Tile groups; '
-        'interpolation flags use the interpolation_* names; component-NRRD streaming no '
-        'longer pauses for topology; and dead telemetry-detail, CPU-retina override, NRRD-yield, '
-        'and scratch-msync environment controls are removed. Existing Cartesian, Tilted, and '
-        'Radial geometry builders are retained unchanged. The v17.0.10 channel/output behavior '
-        'is active: Radial channel stacks wrap across the angular seam and reverse '
+        'interpolation flags use the interpolation_* names; and component-NRRD streaming '
+        'continues during topology. Radial channel stacks wrap across the angular seam and reverse '
         'radial-u after odd 0°/180° crossings, C>=5 saved '
         'view inputs use multi-page TIFF, and unified --save selection controls images, labels, '
         'binary, low_quality[:DOWNBIN], nrrd, voxel_volume, high_quality, and summary, while '
@@ -607,8 +601,7 @@ def _main_impl() -> None:
             'a matching --enable_tilted base.'
         )
 
-    # Resolve post-union behavior before starting the background model loader.
-    # Invalid settings therefore cannot leave a heavyweight loader thread running.
+    # Resolve post-union behavior before starting inference or volume decoding.
     if int(args.centerline_filter_passes) < 0:
         raise ValueError('--centerline_filter_passes must be >= 0; use 0 to disable')
     if float(args.centerline_radius_factor) <= 1.0:
@@ -625,8 +618,6 @@ def _main_impl() -> None:
     # Backends are process-local. Every CUDA device and every populated CPU socket owns
     # one persistent model process; the parent retains only path and scheduling metadata.
     configure_gpu_slice_labeling_devices(list(backend_devices.gpu_devices))
-    model_load_executor: Optional[ThreadPoolExecutor] = None
-    model_load_future: Optional[Future] = None
     if gpu_worker_process_active:
         print(
             f'Parent GPU model load skipped: {gpu_device_count} CUDA worker process(es) will '
@@ -661,11 +652,6 @@ def _main_impl() -> None:
     # Mask/proto postprocessing follows the inference backend automatically. The parent
     # selects GPU semantics when CUDA is active; each OpenVINO worker explicitly selects CPU.
     retina_processor = 'gpu' if gpu_worker_process_active else 'cpu'
-    retina_processor_reason = (
-        'automatic: GPU inference owns GPU proto/mask processing'
-        if gpu_worker_process_active else
-        'automatic: OpenVINO inference owns CPU proto/mask processing'
-    )
     set_retina_mask_processor(retina_processor)
     # Angle-variant + GPU-retina fast path. Every requested angle is now a separate
     # accumulator, so the per-frame radius cleanup is eligible for every variant: instances below
@@ -761,8 +747,6 @@ def _main_impl() -> None:
         raise ValueError('--interpolation_candidates must be >= 1')
     if int(args.interpolation_passes) < 1:
         raise ValueError('--interpolation_passes must be >= 1')
-    gaussian_smoothing_cli_requested = bool(args.gaussian_smoothing is not None or args.gaussian_smoothing_passes is not None)
-    gaussian_smoothing_disabled_by_zero = False
     gaussian_smoothing_enabled, gaussian_smoothing_sigma, gaussian_smoothing_passes = resolve_gaussian_smoothing_settings(
         args.gaussian_smoothing,
         args.gaussian_smoothing_passes,
@@ -1207,441 +1191,9 @@ def _main_impl() -> None:
             '(YOLO_TTA_GPU_TILTED_RADIAL_RENDER=0 selects the CPU fallback). '
             'A worker that cannot admit the source volume to VRAM will still use the completed-cube CPU path.'
         )
-    spec_notes: List[str] = []
-    spec_notes.append(
-        'v17.0.5 GPU feed/D1 continuation patch: four whole physical feeder cores per CUDA '
-        'worker are topology-local and exclusive during inference; parent/OpenVINO/helper masks '
-        "exclude another worker's feeder cores and the parent reclaims the full allocation at "
-        'global drain. Auxiliary interpolation cannot borrow a CUDA worker interpreter before '
-        'that drain. D1 remains active with interpolation and dense tiles by publishing its '
-        'source-space base immediately, retaining one exact packed view-native shadow for parent '
-        'support, and backprojecting only interpolation/tile additions thereafter. The D1 '
-        'dispatch-window default remains two and topology backend auto-selection remains enabled.'
-    )
-    spec_notes.append(
-        'v17.0.4 interpolation resource patch: sparse-label packing releases source crops '
-        'incrementally; interpolation planning and its component/SDF caches are byte-bounded; '
-        'accepted plans render in bounded batches; adjacent-slice endpoint continuation uses '
-        'exact bbox label reads instead of quadratic component-pair scans; parent and '
-        'consolidated-tile interpolation share one global pass boundary; '
-        'tile outer/inner worker defaults divide the job CPU budget instead of multiplying it; '
-        'process-reopenable tile accumulators avoid anonymous-to-path full-volume copies; and '
-        'completed dense views retire through immutable terminal refs (private no-NRRD refs '
-        'use row-wise packbits); per-pass telemetry reports real plan/cache/label/backing usage.'
-    )
-    spec_notes.append(
-        'v17.0.3 hybrid scheduler patch: CPU lease target remains 10 seconds and seed ranges '
-        'use the larger eligible backend target. Hybrid full-frame views are partitioned into an '
-        'ordered CPU reservation sequence (default three views) and immediately CUDA-owned D1 '
-        'views. OpenVINO opens one reserved direct-union view at a time, may open the next after '
-        'the prior view drains, and is no longer disabled by a global GPU-claim latch. Stealback '
-        'uses only the active CPU view ETA, waits for measured CPU samples while mandatory GPU work '
-        'remains, and borrows only the proportional CUDA capacity required to converge with that horizon. '
-        'After the mandatory backlog drains, all CUDA workers may finish the active reservation. Frame totals '
-        'and per-view backend splits are logged.'
-    )
-    spec_notes.append(
-        'v17.0.3 Intel inference update: --model accepts gpu:/PATH and cpu:/PATH; '
-        '--device selects GPU indexes, cpu, or GPU_INDEXES:cpu; --quantize and --batch '
-        'accept backend-qualified gpu:/cpu: values. OpenVINO runs in persistent socket-local '
-        'processes, automatically claims the reserved Cartesian sequence before any reserved '
-        'Tilted Cartesian fallback, and never claims Radial/Tilted-Radial work. Unreserved '
-        'eligible views remain immediately available to CUDA D1; already-running OpenVINO '
-        'requests are never preempted. OpenVINO remains socket-local, low-duty parent/CUDA '
-        'helper overlap is enabled by default, and GPU affinity remains per-device topology-discovered. '
-        'Mask/proto processing follows the inference backend automatically; --retina_mask_processor '
-        'and manual CPU-offload/GPU-steal switches do not exist. Hybrid model identity is warning-only, '
-        'and BF16 output quality is accepted as a v17 specification assumption.'
-    )
-    effective_save_options = list(save_options)
-    if bool(low_quality_requested) and 'low_quality' not in effective_save_options:
-        effective_save_options.append('low_quality')
-    spec_notes.append(
-        'v16.2.0 unified output selection: --save=' + (
-            ', '.join(effective_save_options) if effective_save_options else '<none>'
-        ) + '. high_quality controls the native-resolution final overlay; summary controls the '
-        'summary text file; labels, binary, images, low_quality, and nrrd remain independently '
-        'selectable with their established paths and filenames.'
-    )
-    spec_notes.append(
-        'v17.0.10 channel seam handling: Radial and Tilted Radial channel offsets wrap '
-        'modulo their angular frame count and reverse radial-u after each odd 0°/180° seam '
-        'crossing, while Cartesian and Tilted Cartesian offsets clamp '
-        'at the stack ends. With --save images, C>=5 channel inputs are written as multi-page '
-        'TIFFs containing one uint8 grayscale page per channel in model-input order. The retired '
-        '--troubleshooting CLI and legacy environment-variable aliases are removed.'
-    )
-    spec_notes.append(
-        'v16.3.0 CLI maintenance: --enable_radial uses VIEWS:AZIMUTH_ANGLE groups, '
-        '--enable_tilted uses VIEW:TILT_ANGLE:TILT_DIRECTION groups, and --enable_tile uses '
-        'TILE_SIZE:TILE_STRIDE groups. Spaces separate groups and commas select multiple values '
-        'inside a slot. The interpolation flags are --interpolation_distance, '
-        '--interpolation_passes, and --interpolation_min_radius. Component-NRRD decode/deflate '
-        'continues during topology instead of pausing at member boundaries. Dead telemetry-detail, '
-        'CPU-retina override, NRRD-yield, and synchronous scratch-msync environment controls are removed.'
-    )
-    if tilted_radial_concrete_views:
-        spec_notes.append(
-            'Concrete tilted-Radial views use the resident CUDA source '
-            'renderer and persistent batch-1 TensorRT ring instead of silently materializing the '
-            'deferred host cube and running the active-filter/sheared frame renderer on the CPU. '
-            'YOLO_TTA_GPU_TILTED_RADIAL_RENDER=0 selects the compatibility CPU path.'
-        )
-    # spec<->implementation conflict notes (see header docstring and suggested spec edits).
-    spec_notes.append(
-        'CONFLICT NOTE 1 (--min_radius): the task says --min_radius is now applied per view in each '
-        'prediction set\'s own native 2D slice plane before backprojection. Spec flag #8 and item 5 '
-        'already agree, but earlier prose ("transverse-plane radius", deferred Sagittal/Coronal pass, '
-        'post-backprojection Radial/Tilted pass) conflicted. Per the task, --min_radius is now applied '
-        'on every view\'s analysis slices during per-view cleanup (native raster in compatibility '
-        'mode; radius-scaled canonical inference raster under v13.3.12 D6) and is NOT re-applied after '
-        'backprojection. Suggested spec edit: delete every "transverse plane" reference for --min_radius '
-        'and state "measured on the YOLO output masks in each prediction set\'s own native 2D slice '
-        'plane, before backprojection, independently per active view".'
-    )
-    if str(retina_processor).strip().lower() == 'gpu':
-        spec_notes.append(
-            'CUDA-task path (v13.1.0 #2.2): GPU retina-mask flatten + warp. The (n,H,W) retina-mask stack is reduced on '
-            'the GPU to a union plane and a max-confidence plane, and both are warped to the view analysis grid '
-            'on the GPU (torch grid_sample), so only those reduced planes cross PCIe (O(2*H*W)); no '
-            'affine warp and no per-instance loop run on the CPU.'
-        )
-    if angle_variant_gpu_fastpath_active:
-        spec_notes.append(
-            'CUDA-task path (v13.1.0 #2.3 + v13.3.0 R8): angle-variant GPU fast path. YOLO -> proto-resolution union '
-            '(R9) -> --min_conf -> warp (identity-skipped/grid-cached) -> --min_radius (cupy, only when '
-            'positive) run on the GPU, then one finished view-native plane is sent to the CPU. The '
-            'per-frame retina GPU 2D hole fill is removed: a completed-view pass or eligible task-end '
-            'device-union pass fills once, preserving --min_conf -> --min_radius -> hole fill.'
-        )
-    if str(retina_processor).strip().lower() == 'gpu':
-        spec_notes.append(
-            'CUDA-task path (v13.3.0 R9/R18/R1/R21): GPU retina unions are reduced at PROTO resolution inside a patched '
-            'construct_result (one plane upsampled per frame instead of an (n, imgsz, imgsz) retina stack; '
-            'YOLO_TTA_GPU_PROTO_UNION=0 restores the native path); the GPU postprocess tail runs on '
-            'per-thread side CUDA streams with pinned D2H staging (YOLO_TTA_GPU_POSTPROCESS_STREAM / '
-            'YOLO_TTA_GPU_POSTPROCESS_PINNED); CUDA workers render full-frame views on their own '
-            'GPU when the source volume fits resident (YOLO_TTA_GPU_RENDER / YOLO_TTA_GPU_RENDER_RESIDENT '
-            '/ YOLO_TTA_GPU_RENDER_RESERVE_GIB), with upright radial tasks GPU-prerendered from '
-            'orientation-aware logical-stack blocks '
-            'otherwise (YOLO_TTA_GPU_RENDER_TBLOCK_SLICES).'
-        )
-    spec_notes.append(
-        'v13.3.1 (R3/R4/R7b/R12/R16/R19/R24/R25): same-host shared-mapping coherence needs '
-        'no synchronous scratch flushes; v16.3.0 removes the obsolete opt-in msync path because '
-        'ephemeral mappings are retired rather than treated as durability records. Angle-variant '
-        'CUDA workers write disjoint angle-variant result windows directly into bounded memfd-backed variant unions '
-        '(YOLO_TTA_GPU_WORKER_DIRECT_UNION); NRRD payload writes stream bounded double-buffered blocks '
-        '(YOLO_TTA_NRRD_Z_CHUNK_SLICES) filled by a GIL-releasing pool (YOLO_TTA_NRRD_FILL_WORKERS) '
-        'that overlaps the selected gzip backend; CUDA workers receive the native source through descriptor-transferred memfd storage '
-        '(no post-decode copy to scratch); foreground scans and the raw-bbox encoder no longer make '
-        'full-slice cast copies, and interpolation bridge-delta layers reuse the pass added_voxels '
-        'stat instead of rescanning; the interpolation merge visits only schedule-touched slices; '
-        'the NRRD member-gzip level defaults to 3 (YOLO_TTA_NRRD_GZIP_LEVEL), and low-quality '
-        'MP4s use x264 '
-        'preset slow.'
-    )
-    spec_notes.append(
-        'Capable views remain on the canonical angle-0 inference raster through '
-        'union, component labeling, interpolation/SDF work, tile gating, and sparse-layer encoding; '
-        'Cartesian, Tilted, and Radial contributors receive one terminal mapped restore to source geometry. '
-        'Radius and interpolation-cone thresholds are scaled by the smaller in-plane axis factor; '
-        'intermediate added/accepted voxel counters are therefore processing-grid pixel units. '
-        'YOLO_TTA_DELAY_NATIVE_EXPANSION=0 restores native-view accumulation.'
-    )
-    spec_notes.append(
-        'v13.3.14 D6/D7/G8/P4: CUDA slice labeling emits exact adjacent-slice pair codes before '
-        'releasing each device block and distributes blocks across the selected devices '
-        '(YOLO_TTA_GPU_SLICE_LABELING_PAIRS / YOLO_TTA_GPU_SLICE_LABELING_DEVICES); CUDA '
-        'workers overlap one sealed device-union flush with the next task '
-        '(YOLO_TTA_GPU_UNION_FLUSH_OVERLAP); and resident-ring Radial/Tilted frames can render '
-        'directly from the uint8 source volume into the TensorRT binding '
-        '(YOLO_TTA_FUSED_DIRECT_RENDER and the per-family renderer gates), with stable launches '
-        'captured by YOLO_TTA_FUSED_RENDER_CUDA_GRAPHS.'
-    )
-    spec_notes.append(
-        'v17.0.8 / N17/N15: complete-member NRRD compression prefers validated hardware-only '
-        'QAT, then libdeflate, ISA-L, or zlib via YOLO_TTA_NRRD_MEMBER_CODEC; `cpu` opts out '
-        'of QAT while retaining the CPU chain, and explicit `iaa` remains hardware-only; '
-        'global z-shard counts are resolved '
-        'at sink execution against the shared band capacity, and the ordered shard queue defaults '
-        'to 32 items.'
-    )
-    spec_notes.append(
-        'v13.3.18 C11/C12/C13/C14/N21: the process-per-GPU scheduler keeps only a bounded issued '
-        'window, prioritizes parent-unlocking work, and splits a full-frame lease only at the '
-        'actual dispatch tail; deferred device unions publish '
-        'as soon as their D2H Future retires; the angle-variant Radial path pipelines projection '
-        'and fuses YOLO+bridge layers; sparse topology unions are compiled in larger batches and '
-        'G5 may use idle GPUs; FFV1 shards remain in scratch and videos enter publication only '
-        'after an atomic replace; '
-        'all single-layer NRRDs use full reference rasters; compact per-layer NRRD cropping is removed.'
-    )
-    spec_notes.append(
-        'v13.3.2 (R5/R6/R10/R14/R15/R21): CPU tilted rendering hoists all frame-invariant shear '
-        'math into the render plan (contiguous row fast path where separable, single clipped flat '
-        'gather otherwise); radial backprojection skips empty cross-sections and streams through '
-        'the GPU when available (YOLO_TTA_GPU_BACKPROJECT); the interpolation compact relabel is '
-        'bbox-restricted and numba-nogil when available; keep_objects harvests component areas '
-        'during 2D labeling (no full-volume bincount, no compact relabel, untouched slices are '
-        'never rewritten); tilted scatter and CUDA input staging drop redundant casts/copies '
-        '(staging now ships pinned uint8 and normalizes on device); coronal frame reads and '
-        'projection writes go through K-column transposed blocks (YOLO_TTA_CORONAL_BLOCK_COLS / '
-        'YOLO_TTA_CORONAL_BLOCK_CACHE); global/transverse NRRD layers encode straight from the '
-        'source volume (no pre-encode copy); and compatible GPU-retina tasks accumulate raw '
-        'task-local unions in an on-device volume with one chunked pinned D2H per task '
-        '(YOLO_TTA_GPU_DEVICE_UNION) when VRAM allows. Angle-variant confidence/radius cleanup '
-        'is variant-local; every angle is cleaned before physical-view union.'
-    )
-    if preprocess_streaming_active:
-        spec_notes.append(
-            'v12.2.15 streaming preprocessing is active: decoded native slices become available as ffmpeg produces them. Transverse readers wait only for the needed decoded slice; stack-sampling view families wait for the completed decoded volume. Legacy cube resize, when explicitly enabled, still streams its output slices.'
-        )
-    else:
-        spec_notes.append(
-            'v12.2.15 streaming preprocessing is disabled by YOLO_TTA_STREAMING_PREPROCESS=0; decode finishes before inference scheduling begins, and legacy cube resize runs only when explicitly requested.'
-        )
-    spec_notes.append(
-        'v17.0.3 process-local model startup: the parent loads no inference model. Each persistent '
-        'CUDA worker deserializes its GPU engine, and each socket-local CPU worker compiles its '
-        'OpenVINO model only after applying its CPU affinity. Startup overlaps the default streaming '
-        'decode producer; YOLO_TTA_STREAMING_PREPROCESS=0 makes decode synchronous.'
-    )
-    spec_notes.append(
-        'v16.4.0 angle-variant streaming cleanup is mandatory: every --angle variant is '
-        'confidence-filtered and analysis-grid min_radius-filtered as it streams. D6 scales '
-        'the threshold on a reduced canonical raster, and 2D hole filling runs after '
-        '--min_conf and --min_radius before that variant is interpolated.'
-    )
-    spec_notes.append(
-        'Input-channel handling: RGB/YUV video is flattened to one gray/luma source volume; '
-        f'--channel_format {channel_format.token} then constructs H×W×{int(channel_format.channel_count)} '
-        f'model inputs with offsets {list(channel_format.offsets)} in each active view. '
-        'Radial and Tilted Radial neighbors wrap modulo the view slice count and reverse '
-        'radial-u after odd 0°/180° seam crossings; Cartesian and '
-        'Tilted Cartesian neighbors edge-clamp. Channel order is preserved, each result is assigned '
-        'only to center slice N, and no reverse-order inference set is generated.'
-    )
-    if bool(save_images_enabled):
-        spec_notes.append(
-            f'Active-view image saving uses the inference channel layout {channel_format.token}: '
-            + (
-                'one multi-page TIFF per center, with one grayscale page per channel in input order.'
-                if int(channel_format.channel_count) >= 5 else
-                'PNG output for each center.'
-            )
-        )
-    spec_notes.append('Voxel-volume reporting, when enabled, counts the final binary mask after restoration to native input geometry, not imgsz or cubic working geometry.')
-    spec_notes.append('v12.2.0 tilt-angle validation follows the specification: values must be greater than 0 and less than or equal to 45 degrees.')
     if low_quality_downbin_warnings:
         for warning in low_quality_downbin_warnings:
             print(f'Warning: {warning}')
-            spec_notes.append(warning)
-    if low_quality_downbin_specs:
-        spec_notes.append(
-            'Low-quality outputs use isotropic X/Y/t downbinning in native input space; frame count is resampled with the same scale as XY, rather than preserving the original frame count. '
-            + '; '.join(
-                f'{spec.raw_value}->(t,Y,X)={spec.output_shape_t_y_x}'
-                for spec in low_quality_downbin_specs
-            )
-        )
-        spec_notes.append(
-            'v13.2.1 (bug #2): each low-quality downbin is submitted as an independent background job whose '
-            'overlay and binary videos always run. When --save nrrd is also enabled, the low-quality NRRD now '
-            'follows the full-quality format and schedule: one downbinned single-layer NRRD per component layer '
-            'under low_quality/<token>/nrrd/, written by the NrrdLayerSink as each view completes (sharing the '
-            'full-quality layer suffixes and a per-downbin manifest), replacing the single combined tail volume. '
-            'Requesting only low-quality outputs still produces the low-quality videos but no NRRD.'
-        )
-    if (int(T), int(H), int(W)) != (int(input_T), int(input_H), int(input_W)):
-        spec_notes.append(
-            f'Working volume resized to v12.2.0 approximately-cubic processing geometry '
-            f'(t,Y,X)=({int(T)},{int(H)},{int(W)}). v13.2.4 (ruling A1): the final stage runs in the '
-            f'original source geometry (t,Y,X)=({int(input_T)},{int(input_H)},{int(input_W)}) — '
-            'Radial/Tilted results are backprojected directly to source dimensions in a single resample, '
-            'Cartesian view stacks are restored with one resample during union assembly, and the global '
-            'union / optional 3D void fill / Gaussian smoothing (sigma in source voxels) / postprocessing keep_objects '
-            'all execute at source dimensions. No tail restore resample occurs.'
-        )
-    spec_notes.append(
-        f'v16.0.2 Cartesian selection: --enable_cartesian={list(enabled_cartesian_views)}. '
-        'No Cartesian view is implicit; non-90 degree Cartesian augmentations use clamp-to-frame '
-        'black fill rather than expanded padding.'
-    )
-    concrete_tilted = [v for v in views if is_tilted_view(v)]
-    if concrete_tilted:
-        active_tilt_labels = ', '.join(pretty_view_name(v) for v in concrete_tilted)
-        requested_tilt_groups = ' '.join(
-            f'{",".join(group.views)}:'
-            f'{",".join(f"{float(angle):g}" for angle in group.tilt_angles)}:'
-            f'{",".join(group.tilt_directions)}'
-            for group in tilt_groups
-        )
-        spec_notes.append(
-            f'v16.3.0 Tilted Views active from --enable_tilted {requested_tilt_groups}. '
-            'No Tilted base is implicit; each group preserves its own view/angle/direction '
-            'associations, and every positive angle expands to independent positive and negative '
-            'variants before final union. Active tilted configurations: '
-            f'{active_tilt_labels}'
-        )
-    else:
-        spec_notes.append('Tilted Views disabled because --enable_tilted was not supplied.')
-    concrete_radial = [v for v in views if is_radial_view(v)]
-    if concrete_radial:
-        radial_notes = ', '.join(
-            f'{v.radial_request_token}->{v.name}@{_radial_view_nominal_spacing_deg(v):.8g}° '
-            f'(diameter={int(v.diameter)})'
-            for v in concrete_radial
-        )
-        spec_notes.append(
-            'Radial transforms active: ' + radial_notes + '. Cartesian Radial bases do '
-            'not require upright Cartesian views. Each tilted_* target expands across every matching '
-            'enabled signed-angle/direction Tilted variant. Circles are constructed in working projected '
-            'view space; source-geometry t restoration naturally produces sagittal/coronal and Tilted '
-            f'ellipses. {RADIAL_TEXTURE_VARIANT_LABEL} sampling and wraparound interpolation are retained. Upright bases can '
-            'use fused resident rendering, orientation-aware streamed GPU prerender, and reduced-grid '
-            'processing when admitted.'
-        )
-    if any((v.family == 'radial' or is_tilted_view(v)) for v in views):
-        spec_notes.append(
-            'Current final backprojection: upright Radial bases use orientation-aware dense or '
-            'sink-only mapping into source-space bands; transverse can additionally use the GPU '
-            'backprojector. Tilted Radial views reconstruct their concrete Tilted stack before the '
-            'Tilted shear backprojection. The sequential queue preserves the full CPU worker budget.'
-        )
-    spec_notes.append(
-        'v13.2.0 NRRD export (--save nrrd) writes one single-layer 3-axis NRRD (X,Y,t) per component layer to '
-        f'nrrd/, named {OUTPUT_NRRD_PREFIX}{{Filestem}}_{{ViewToken|Global}}_{{layer}}.seg.nrrd (model name dropped; v13.2.3 tags each file '
-        'with the 3D Slicer segmentation header fields — segment named after the file, deterministic per-layer '
-        'palette color). Layer families: full-frame '
-        'YOLO masks, full-frame interpolation bridges per pass, tiled masks accepted by parent YOLO masks, tiled '
-        'masks accepted by parent bridges, consolidated tile bridges per pass, optional Global_union_presmoothing, '
-        'Global_smoothing_pass<N>, and Global_final_output. Each layer is restored to source output geometry while '
-        'streaming, gzip-compressed by the selected validated backend, and written by a background sink as the layer is produced '
-        'during the intermediate pipeline steps (so the Transverse layer compresses while Tiled Transverse is still '
-        'inferencing, and the global union layer is written while smoothing runs). A single '
-        f'{OUTPUT_NRRD_PREFIX}{{Filestem}}_nrrd_manifest.json lists every written layer. '
-        'The default member codec policy is QAT-first `auto`; set YOLO_TTA_NRRD_MEMBER_CODEC=cpu '
-        'to opt out without losing the CPU fallback chain. Tune YOLO_TTA_NRRD_MEMBER_CODEC, '
-        'YOLO_TTA_NRRD_MEMBER_GZIP_WINDOW_MIB, YOLO_TTA_NRRD_GZIP_CHUNK_MIB, and '
-        'YOLO_TTA_NRRD_LAYER_SINK_WORKERS for member-parallel compression. The previous mega '
-        f'4D decomposed NRRD (one file, trailing list axis) was removed. space={NRRD_SPACE}.'
-    )
-    spec_notes.append(
-        'CONFLICT NOTE 3 (low-quality NRRD form): spec --save low_quality says "low bitrate output videos and '
-        'NRRDs". v13.2.1 (bug #2) makes the low-quality NRRD follow the full-quality NRRD format and scheduling: '
-        'one downbinned single-layer NRRD per component layer under low_quality/<token>/nrrd/, restored from the '
-        'same NrrdLayerRef and written as each view completes, with a per-downbin manifest whose layer suffixes '
-        'match the full-quality nrrd/ folder. This supersedes the v13.2.0 single combined volume. It remains gated '
-        'behind --save nrrd (the decomposition is only meaningful when --save nrrd is set). Suggested spec edit: '
-        'state that low-quality NRRDs are emitted as one single-layer NRRD per component layer (downbinned) per '
-        '--save low_quality[:LOW_QUALITY_DOWNBIN] specification, only when --save nrrd is enabled.'
-    )
-    spec_notes.append(
-        'v17 backend-local result processing: CUDA tasks retain the proto-union/flatten, warp, '
-        '--min_conf, and positive --min_radius GPU path before their reduced result is published. '
-        'OpenVINO tasks keep raw head/prototype outputs on the CPU and reconstruct bbox-local masks. '
-        'Within an OpenVINO-committed direct-union view, CPU and assisting CUDA tasks publish '
-        'disjoint view-union windows; CUDA-committed views instead retain the D1 source-space sparse '
-        'contract. Progress bars outside inference therefore describe independent '
-        'render/postprocess/output stages rather than cross-device mask migration.'
-    )
-    inference_backend_details: List[str] = []
-    if gpu_worker_process_active:
-        inference_backend_details.append(
-            f'{gpu_device_count} CUDA worker process(es), one per logical GPU, with '
-            'persistent model/context ownership and central short-lease dispatch'
-        )
-    if cpu_worker_process_active:
-        inference_backend_details.append(
-            f'{len(cpu_instance_plans)} socket-local OpenVINO worker process(es), each with '
-            'one compiled model and a shallow asynchronous infer-request pool'
-        )
-    if gpu_worker_process_active and cpu_worker_process_active:
-        inference_routing_note = (
-            'OpenVINO opens one ordered reserved shared-union view at a time and advances to '
-            'the next reservation after completion. Unreserved Cartesian/Tilted views are '
-            'ordinary CUDA D1 work. CUDA assists only the active CPU view when its measured ETA '
-            'exceeds the mandatory-GPU horizon; already-running OpenVINO requests are never preempted.'
-        )
-    elif gpu_worker_process_active:
-        inference_routing_note = (
-            'CUDA workers own every selected view and prioritize Radial/Tilted-Radial work '
-            'within the central short-lease scheduler.'
-        )
-    else:
-        inference_routing_note = (
-            'OpenVINO workers own Cartesian/Tilted-Cartesian work; unsupported Radial '
-            'requests were removed before scheduling.'
-        )
-    spec_notes.append(
-        f'v17.0.3 inference backends: {inference_devices}; ' + '; '.join(inference_backend_details) + '. '
-        'All backends claim atomically from one central queue; each full-frame view is committed '
-        f'to exactly one result contract before its first task leaves that queue. {inference_routing_note}'
-    )
-    if gpu_worker_process_active and cpu_worker_process_active:
-        spec_notes.append(
-            'Mask/prototype processing is backend-local in hybrid mode: CUDA tasks reduce and '
-            'warp their proto/mask unions on the GPU, while OpenVINO tasks reconstruct '
-            'bbox-ROI retina-quality masks on the CPU from raw head/prototype outputs. CPU-owned '
-            'views use one shared direct-union binary/confidence contract for both backends; '
-            'CUDA-owned eligible views use D1 and are no longer CPU-claimable. There is no global '
-            '--retina_mask_processor selection.'
-        )
-    elif cpu_worker_process_active:
-        spec_notes.append(
-            'Mask/prototype processing follows the OpenVINO CPU backend: raw segmentation head '
-            'and prototype outputs are converted to compact CPU payloads, and bbox-ROI masks are '
-            'bilinearly reconstructed and thresholded on the CPU before view-union publication.'
-        )
-    else:
-        spec_notes.append(
-            'Mask/prototype processing follows the CUDA backend: proto-resolution unions, '
-            'confidence handling, affine warp, and eligible radius cleanup remain GPU-local '
-            'before reduced result publication.'
-        )
-    native_ffv1_outputs = []
-    if bool(save_high_quality_enabled):
-        native_ffv1_outputs.append('overlay')
-    if bool(save_binary_enabled):
-        native_ffv1_outputs.append('binary')
-    if native_ffv1_outputs:
-        spec_notes.append(
-            f'v13.3.12 final FFV1 encode sharding: segments={int(ffv1_segment_count(int(input_T)))} '
-            '(YOLO_TTA_FFV1_SEGMENTS; automatic default min(6, ceil(allocated_cpus/32))). '
-            f'Selected native-resolution {" and ".join(native_ffv1_outputs)} MKV output(s) encode '
-            'contiguous t segments concurrently and losslessly concat their FFV1 packets; value 1 '
-            'restores one encoder.'
-        )
-    if bool(keep_temp_artifacts):
-        spec_notes.append('YOLO_TTA_KEEP_TEMP=1 active: temporary scratch artifacts are retained.')
-    if bool(gaussian_smoothing_enabled):
-        spec_notes.append(
-            f'Gaussian smoothing active by v12.2.0 explicit-flag rule: sigma={float(gaussian_smoothing_sigma):g} voxel(s), '
-            f'passes={int(gaussian_smoothing_passes)}; applied after final union/optional 3D void fill and before postprocessing keep_objects. '
-            'The default smoothing backend attempts chunked GPU execution through CuPy/cupyx.scipy.ndimage with halo/core writes, then falls back to scipy.ndimage on CPU if the GPU backend is unavailable.'
-        )
-    else:
-        if not bool(gaussian_smoothing_cli_requested):
-            spec_notes.append('Gaussian smoothing disabled by v12.2.0 activation rule because neither Gaussian flag was explicitly set.')
-        elif bool(gaussian_smoothing_disabled_by_zero):
-            spec_notes.append('Gaussian smoothing disabled because at least one explicitly supplied Gaussian flag was set to 0.')
-        else:
-            spec_notes.append('Gaussian smoothing disabled because the resolved sigma or pass count was not positive.')
-    spec_notes.append(
-        'Interpolation endpoint discovery uses the per-slice connected-component scan backed by cached per-slice component tables. '
-        'Projection candidate search runs on source-component local SDF crops, and variable-cost seed planning is consumed through a bounded unordered completion queue. '
-        'v17.0.9 planner seeds are stably cost-balanced within four worker-wave slice-local windows by default; '
-        'YOLO_TTA_INTERPOLATION_SEED_SCHEDULE_WINDOW_FACTOR=0 restores strict slice-major submission for A/B verification. '
-        'v13.0.0 removed optional skeletonization entirely; interpolation never used skeletonization.'
-    )
-    spec_notes.append(
-        f'Processing volume mode={processing_mode}; cube_resize_applied={bool(tuple(int(x) for x in processing_shape) != tuple(int(x) for x in input_processing_shape))}. '
-        'v13.0.0 (bug fix) defaults to approximately-cubic virtual working geometry so the working dimensions '
-        'stay within 5% of the longest source axis (spec item 2); the t/Transverse stacking axis is no longer left short. '
-        f'Approximately-cubic target = {tuple(int(x) for x in legacy_cube_shape)}. Set YOLO_TTA_PROCESSING_VOLUME_MODE=native to opt back into v12.2.15 decoded-native geometry for regression. '
-        f'Cube T-axis backend={_cube_t_axis_resize_backend()} (YOLO_TTA_CUBE_T_RESIZE_BACKEND=slice_exact restores the endpoint-aligned per-slice interpolation path).'
-    )
     yolo_model: Optional[object] = None
     if not inference_worker_process_active:
         raise RuntimeError('v17 requires at least one process-local GPU or OpenVINO CPU backend')
@@ -1736,7 +1288,7 @@ def _main_impl() -> None:
     )
     (
         parent_interpolation_overlap,
-        parent_interpolation_task_workers_default,
+        _,
         parent_interpolation_task_workers,
     ) = resolve_parent_interpolation_worker_allocation(
         worker_budget=int(worker_budget),
@@ -1886,77 +1438,6 @@ def _main_impl() -> None:
         reason = 'no interpolation-enabled views' if len(interpolating_views) <= 0 else 'backend disabled'
         print(f'Interpolation process backend: inactive for this command ({reason}).')
     print(f'Background output workers: {output_workers} (frame workers per labels/TIFF task: {output_frame_workers})')
-    max_predict_video_frames = max(1, max((int(v.num_slices) for v in inference_views), default=1))
-    example_cpu_mask_workers = max(1, min(int(predict_postprocess_workers), int(max_predict_video_frames)))
-    example_cpu_mask_pending = cpu_mask_postprocess_pending_limit(int(example_cpu_mask_workers), int(max_predict_video_frames))
-    spec_notes.append(
-        'YOLO result accumulation is bounded per in-memory prediction source by the number of pending CPU postprocess futures. ' 
-        'worker_count=max(1, min(YOLO_TTA_PREDICT_POSTPROCESS_WORKERS, num_frames)) for the live v12 in-memory source path; ' 
-        'v12.2.15 keeps the v12.2.14 hard 32-worker ceiling removed and defaults YOLO_TTA_PREDICT_POSTPROCESS_MAX_WORKERS to the oversubscribed worker budget so CPU result processing can queue/drain behind the GPU instead of throttling inference. '
-        'pending_limit=cpu_mask_postprocess_pending_limit(worker_count, num_frames) = max(worker_count, min(num_frames, max(YOLO_TTA_CPU_MASK_PENDING_FRAMES, worker_count*2))). ' 
-        'The default YOLO_TTA_CPU_MASK_PENDING_FRAMES is 0, so the GPU-facing iterator can buffer all CPU result work for that prediction source; set it positive only to reintroduce a RAM cap. ' 
-        f'For this run, the largest active prediction source has {int(max_predict_video_frames)} frame(s), ' 
-        f'example worker_count={int(example_cpu_mask_workers)}, pending_limit={int(example_cpu_mask_pending)}.'
-    )
-    spec_notes.append(
-        f'Backend-specific batching: GPU batch={int(args.gpu_batch) if gpu_worker_process_active else "disabled"}, '
-        f'CPU batch={int(args.cpu_batch) if cpu_worker_process_active else "disabled"}. Each backend '
-        f'independently pads its final source batch by repeating the last complete H×W×{int(channel_format.channel_count)} '
-        'channel stack and discards synthetic results. StreamingYoloVolumeSource remains the bounded '
-        'render/prefetch source; CUDA tasks may additionally stage complete BCHW batches in VRAM.'
-    )
-    spec_notes.append(
-        'v16.4 per-tile semantics remain active: every original tile stays crop-local and is '
-        'component-gated independently against its same-angle parent mask, then only its failed '
-        'components are re-gated against the same-angle parent interpolation bridge. No raw '
-        'configuration-wide tile canvas or cross-tile component authorization path exists. '
-        f'v16.4.3 bounds live dense tile-result workspaces to approximately '
-        f'{tile_dense_worker_result_limit_bytes() / GIB:.1f} GiB and '
-        f'{tile_dense_worker_result_limit_tasks()} task(s) '
-        '(YOLO_TTA_TILE_DENSE_RESULT_MAX_GIB / _MAX_TASKS) when YOLO_TTA_KEEP_TEMP is disabled, '
-        'preferring parent-owned memfd shared RAM and using gpu_worker_results pathnames only '
-        'when anonymous-memory admission cannot preserve the configured reserve; stale '
-        'gpu_worker_results from interrupted older runs are purged before dispatch. '
-        'Full-frame parent tasks and tiles whose same-angle parent mask P is already published are '
-        'scheduled ahead of P-not-ready tiles. Every nonempty tile is cleaned and converted to '
-        'crop-local ctile-mask-v2-raw on a dedicated retirement pool before it enters either '
-        'parent/bridge gate; CTILE publication immediately closes the parent-owned memfd/pathname '
-        'and returns its dense-result scheduling credit. Gate workers open sparse descriptors lazily, '
-        'so parent interpolation cannot extend dense uint8 result lifetime. '
-        f'Dense-retirement concurrency={tile_dense_retirement_workers} task(s) x '
-        f'{tile_dense_retirement_slice_workers} slice worker(s); '
-        f'Tile-set/category accumulators prefer process-reopenable memfd RAM={int(tile_intermediate_accumulators_prefer_memory())}; '
-        f'the cgroup-corrected accumulator reserve is {tile_intermediate_accumulator_reserve_bytes() / GIB:.1f} GiB. '
-        f'CTILE/CVOL payload memfd opt-in={int(raw_store_memfd_enabled())} '
-        '(YOLO_TTA_CVOL_MEMFD; pathname-backed by default because raw-store queues are not RAM-admitted). '
-        'External CTILE/CVOL support and NRRD stores elide empty slices and retain raw uint8 '
-        'bbox payloads; private no-NRRD final-view retention uses row-wise packbits (up to 8x '
-        'smaller) and no store uses LZ4. YOLO_TTA_KEEP_TEMP=1 intentionally retains the original '
-        'dense artifacts for diagnostics and therefore disables the live-result storage guarantee.'
-    )
-    spec_notes.append(
-        f'Fused cleanup backend={cleanup_backend()}; set YOLO_TTA_CLEANUP_BACKEND=scipy to use the previous scipy.ndimage cleanup path.'
-    )
-    spec_notes.append(
-        'Interpolation labeling uses parallel 2D per-slice connected-component labeling, parallel adjacent-slice pair extraction, '
-        'row-blocked parallel compact relabeling, lazy byte-bounded per-slice component tables, and exact bbox label-window '
-        'continuation tests that avoid quadratic same-label component-pair scans. '
-        f'Per-parent interpolation task workers default to worker_budget / expected_live_parent_overlap = {int(parent_interpolation_task_workers_default)} '
-        f'using YOLO_TTA_INTERPOLATION_CONCURRENT_PARENTS={int(parent_interpolation_overlap)}; '
-        'YOLO_TTA_INTERPOLATION_TASK_WORKERS still overrides the exact per-parent worker count. '
-        'Tune YOLO_TTA_INTERPOLATION_LABEL_WORKERS, YOLO_TTA_INTERPOLATION_PAIR_WORKERS, YOLO_TTA_INTERPOLATION_COMPACT_WORKERS, '
-        'YOLO_TTA_INTERPOLATION_COMPACT_RELABEL_ROWS, and YOLO_TTA_INTERPOLATION_CONCURRENT_PARENTS if needed.'
-    )
-    spec_notes.append(
-        'v12.2.7 interpolation process isolation active by default: full-frame and consolidated-tile interpolation passes reopen uint8 mask volumes from disk-backed memmaps in a ProcessPoolExecutor worker and return only small stats. '
-        f'Process backend enabled={bool(interpolation_process_backend_active)}, process_workers={int(interpolation_process_workers)}, start_method={interpolation_process_start_method()}, '
-        f'global_pass_limit={int(interpolation_global_pass_limit)}, fallback_on_worker_failure={bool(interpolation_process_fallback_enabled())}. '
-        'The global lease covers backing conversion plus auxiliary/dedicated execution, so queued passes cannot create full-volume process inputs concurrently. Consolidated-tile accumulators are process-reopenable at creation; other anonymous in-memory mask arrays are copied once to a process memmap before interpolation, avoiding multi-GiB pickle payloads.'
-    )
-    spec_notes.append(
-        f'v12.2.7 compiled interpolation kernels: {interpolation_compiled_kernels_status()}. '
-        'The compiled kernel accelerates projection-candidate discovery in seed planning with Numba nogil=True when numba is installed; the exact Python candidate search remains the fallback.'
-    )
 
     output_manager = BackgroundOutputManager(max_workers=output_workers)
     _run_resources().track_output_manager(output_manager)
@@ -2241,18 +1722,8 @@ def _main_impl() -> None:
             f'join workers={int(async_prediction_join_worker_count)}, '
             'each angle variant owns an independent full-frame accumulator)'
         )
-        spec_notes.append(
-            'v16.4.0 async prediction accumulation queues YOLO result detach/copy, native inverse-mapping, and variant-local streaming cleanup to a shared prediction-result executor. Each angle variant owns its union/confidence accumulator, so no cross-angle writer locks or unified-angle drain barrier exists.'
-        )
     else:
         print('Async prediction accumulation: disabled by YOLO_TTA_ASYNC_PREDICT_POSTPROCESS=0; prediction sources are drained synchronously.')
-        spec_notes.append(
-            'v12.2.12 async prediction accumulation was disabled by configuration; prediction sources are drained synchronously.'
-        )
-    spec_notes.append(
-        'v15 streaming prediction sources are active by default: full-frame and tiled YOLO inputs render only a bounded CPU prefetch window before model.predict starts, rather than materializing a complete (slice,--imgsz,--imgsz[,channels]) volume first. '
-        'Set YOLO_TTA_STREAMING_PREDICTION_SOURCES=0 to restore the legacy dense prediction-volume path; per-source prediction memmap flushes are still skipped by default unless YOLO_TTA_FLUSH_PREDICTION_VOLUME_ON_BUILD=1 or YOLO_TTA_PREDICT_FLUSH_EACH_VOLUME=1 is set.'
-    )
     print(
         f'Streaming prediction-source preparers: {prediction_volume_builder_workers} '
         f'(per-source render workers: {per_prediction_volume_workers}, shared render workers: {prediction_render_workers}, '
@@ -2260,19 +1731,6 @@ def _main_impl() -> None:
         f'CPU-warmed queued sources: {int(queued_streaming_cpu_warmup_sources)}, '
         f'eager CUDA-staged queued sources: {int(eager_gpu_input_staging_ahead_sources)})'
     )
-    spec_notes.append(
-        f'v15 prediction scheduler active: full-frame and tiled YOLO sources stream H×W×{int(channel_format.channel_count)} frames through StreamingYoloVolumeSource for --channel_format {channel_format.token}. Streaming prediction-source creation is unbounded by default, so cheap source refs for every remaining view/tile can be queued immediately; expensive CPU rendering is separately bounded by the shared render pool and each source prefetch window. '
-        f'The resolved queued-source bound is {int(prediction_volume_queue_slots)} source(s); set YOLO_TTA_PREDICTION_VOLUME_QUEUE_SLOTS to a positive value to cap it or 0 to force all remaining sources in legacy dense mode too. '
-        f'Each active streaming source can submit enough work to use the full shared render pool ({int(prediction_render_workers)} worker thread(s)); legacy dense materialization still uses {int(legacy_per_prediction_volume_workers)} worker(s) per builder. '
-        f'Up to {int(queued_streaming_cpu_warmup_sources)} ready queued source(s) are CPU-warmed at a time (YOLO_TTA_STREAMING_SOURCE_WARMUP_SOURCES), so source creation can be unbounded without every future source enqueueing a prefetch window. '
-        f'Up to {int(eager_gpu_input_staging_ahead_sources)} queued source(s) are eagerly CUDA-staged before they become the active model.predict source (YOLO_TTA_GPU_INPUT_STAGING_AHEAD_SOURCES), with no fixed four-source default. '
-        'v12.2.11 lazily allocates each full-view union/confidence workspace only when that view first reaches inference, avoiding an eager all-views zero-fill before the first prediction.'
-    )
-    if dense_tiling_active:
-        spec_notes.append(
-            'Tiled prediction sources follow the deterministic tile footprint, stride order, angle variant, '
-            'and inverse-mapping rules from the v12.2.0 specification.'
-        )
 
     prediction_render_executor: Optional[ThreadPoolExecutor] = None
     if bool(streaming_sources_active) and shared_streaming_render_pool_enabled():
@@ -6449,17 +5907,6 @@ def _main_impl() -> None:
                         'model_xml': str(msg.get('model_xml')),
                     }
                     cpu_worker_ready_details_by_id[ready_cpu_index] = ready_details
-                    spec_notes.append(
-                        f'v17 OpenVINO CPU instance {ready_cpu_index}: resolved precision='
-                        f'{ready_details["precision"]}, requests={ready_details["requests"]}, '
-                        f'threads={ready_details["threads"]}, input={ready_details["input_element_type"]}, '
-                        f'INT8-export={ready_details["model_int8_quantized"]}, '
-                        f'classes={ready_details["class_count"]}, '
-                        f'AMX(tile/bf16/int8)={ready_details["amx_tile"]}/'
-                        f'{ready_details["amx_bf16"]}/{ready_details["amx_int8"]}, '
-                        f'capabilities={ready_details["openvino_capabilities"]}, '
-                        f'model={ready_details["model_xml"]}.'
-                    )
                     runtime_telemetry().gauge(
                         f'inference.cpu_instance.{ready_cpu_index}.ready', ready_details,
                     )
@@ -7212,17 +6659,6 @@ def _main_impl() -> None:
         f'slice workers={int(tail_slice_workers)}, output workers={int(tail_output_workers)}, '
         f'output frame workers={int(tail_output_frame_workers)}.'
     )
-    if tail_budget_expansion_active:
-        spec_notes.append(
-            'v13.3.10 G7 tail CPU expansion: after all GPU/OpenVINO inference workers and interpolation '
-            f'executors joined, strictly post-inference stages used worker_budget={int(tail_worker_budget)}; '
-            'YOLO_TTA_TAIL_WORKER_BUDGET_EXPAND=0 restores inference-phase tail sizing.'
-        )
-    else:
-        spec_notes.append(
-            'v13.3.10 G7 tail CPU expansion was disabled by '
-            'YOLO_TTA_TAIL_WORKER_BUDGET_EXPAND=0; legacy per-stage tail sizing was retained.'
-        )
 
     if preprocess_streaming_active:
         if isinstance(volume_rgb, LazyProcessingCube) and not volume_rgb.materialized:
@@ -7253,12 +6689,6 @@ def _main_impl() -> None:
         swept_mkvs = purge_remaining_temporary_mkvs(temp_dir, keep_temp=False)
         if int(swept_mkvs) > 0:
             print(f'Final legacy temporary MKV sweep removed {int(swept_mkvs)} leftover file(s).')
-        spec_notes.append(
-            'No prediction MKVs are produced by the v12 in-memory path. A best-effort final sweep still removes '
-            f'{int(swept_mkvs)} legacy/interrupted scratch MKV file(s) when YOLO_TTA_KEEP_TEMP is disabled.'
-        )
-    else:
-        spec_notes.append('YOLO_TTA_KEEP_TEMP retained scratch artifacts; the v12.2.0 in-memory inference path itself does not create prediction MKVs.')
 
     # radial/tilted results are backprojected DIRECTLY into the
     # original source geometry (single resample) instead of the working geometry.
@@ -7366,25 +6796,6 @@ def _main_impl() -> None:
         view_volumes_by_model,
         already_retired_ids=retired_tta_volume_ids,
     )
-    if bool(component_ref_dense_retirement_active):
-        spec_notes.append(
-            'v17.0.5 component-ref TTA retirement: every --angle variant remained logically '
-            'independent through cleanup, interpolation, per-tile parent/bridge gating, and '
-            'component-layer output. Non-tiled dense variants retired after an immutable terminal '
-            'representation was materialized; tiled variants retired after consolidation. Requested '
-            'NRRD component layers are reused when available; otherwise one private pathname-backed '
-            'row-wise packed raw-bbox final-view layer is created and is not submitted as output. These refs contribute '
-            'directly to the terminal union without rebuilding one dense volume per angle. '
-            'YOLO_TTA_KEEP_TEMP=1 preserves dense diagnostics.'
-        )
-    else:
-        spec_notes.append(
-            'v16.4.0 TTA-angle finalization: every --angle variant remained independent through '
-            'cleanup, interpolation, per-tile parent/bridge gating, and component-layer output; '
-            'dense variants were OR-collapsed only at physical-view finalization immediately before '
-            'the global view union. Component-ref dense retirement is disabled because '
-            'YOLO_TTA_KEEP_TEMP=1 preserves dense diagnostics.'
-        )
 
     print('\n=== Building final single-model view union after physical-view TTA collapse ===')
     # the union is assembled at ORIGINAL SOURCE dimensions.
@@ -7408,7 +6819,7 @@ def _main_impl() -> None:
 
     if int(args.centerline_filter_passes) > 0:
         discard_binary_volume_slice_metadata(final_union_mm)
-    centerline_filter_stats: Dict[str, object] = apply_v14_centerline_filter_inplace(
+    apply_v14_centerline_filter_inplace(
         final_union_mm,
         model_name=str(model_name), temp_dir=temp_dir,
         passes=int(args.centerline_filter_passes),
@@ -7422,32 +6833,6 @@ def _main_impl() -> None:
         workers=int(tail_slice_workers), keep_temp=bool(keep_temp_artifacts),
         nrrd_layer_refs=nrrd_layer_refs,
     )
-    if bool(centerline_filter_stats.get('enabled', False)):
-        pass_summaries = [
-            (
-                f"pass {int(record.get('pass_index', 0))}: backend={record.get('backend', 'unknown')}, "
-                f"backend_allows_removal={bool(record.get('backend_automatic_removal_allowed', False))}, "
-                f"anomaly_fraction={float(record.get('section_anomaly_fraction', 0.0)):.3f}, "
-                f"reliability_guard={bool(record.get('section_reliability_guard_triggered', False))}, "
-                f"events={int(record.get('longitudinal_events', 0))}, "
-                f"removed_components={int(record.get('removed_components', 0))}, "
-                f"removed_voxels={int(record.get('removed_voxels', 0))}, "
-                f"watershed_voxels={int(record.get('watershed_voxels', 0))}, "
-                f"marker_mode={record.get('marker_mode', 'unknown')}"
-            )
-            for record in centerline_filter_stats.get('passes', [])
-        ]
-        spec_notes.append(
-            'Centerline post-union filter: pass 0 preserves the untouched union; '
-            'the embedded backend uses exact 3D EDT on the block-max raster plus three-axis '
-            'medial-ridge tracking; '
-            f'X={float(args.centerline_radius_factor):g}; anomaly duration is uncapped; '
-            f'automatic component removal requested={bool(args.centerline_auto_remove)}; '
-            'protected or otherwise unsafe 2D components are marker-only; '
-            f"stop={centerline_filter_stats.get('stop_reason', 'unknown')}. "
-            + ('; '.join(pass_summaries) if pass_summaries else 'No filter pass completed.')
-        )
-
     if bool(nrrd_layers_needed and gaussian_smoothing_enabled):
         pre_smoothing_ref = materialize_nrrd_global_layer(
             final_union_mm,
@@ -7602,21 +6987,11 @@ def _main_impl() -> None:
     output_manager.wait()
 
     nrrd_manifest_path: Optional[Path] = None
-    nrrd_layer_files_written = 0
-    nrrd_low_quality_layer_files_written = 0
-    nrrd_centerline_audit_files_written = 0
-    nrrd_low_quality_centerline_audit_files_written = 0
     layer_sink = nrrd_layer_sink()
     if layer_sink is not None:
         runtime_telemetry().gauge('pipeline.phase', 'post_nrrd_wait')
         print('\n=== Finishing single-layer NRRD writes ===')
         layer_sink.wait()
-        nrrd_layer_files_written = int(layer_sink.layer_count())
-        nrrd_low_quality_layer_files_written = int(layer_sink.low_quality_layer_count())
-        nrrd_centerline_audit_files_written = int(layer_sink.centerline_audit_layer_count())
-        nrrd_low_quality_centerline_audit_files_written = int(
-            layer_sink.low_quality_centerline_audit_layer_count()
-        )
         nrrd_manifest_path = layer_sink.write_manifest()
         layer_sink.shutdown()
         set_nrrd_layer_sink(None)
@@ -7637,46 +7012,6 @@ def _main_impl() -> None:
                 show_progress=False,
             )
             final_paths[f'{view.name}_images_dir'] = image_dir
-
-    if bool(nrrd_layers_needed):
-        legacy_nrrd_count = max(
-            0, int(nrrd_layer_files_written) - int(nrrd_centerline_audit_files_written),
-        )
-        spec_notes.append(
-            f'NRRD decomposition (v13.2.0): {int(legacy_nrrd_count)} legacy component/checkpoint NRRD file(s) written to '
-            f'{nrrd_dir} as one uint8 binary mask per component layer (X,Y,t source geometry), named '
-            f'{OUTPUT_NRRD_PREFIX}{{Filestem}}_{{ViewToken|Global}}_{{layer}}.seg.nrrd with the model name dropped, tagged as a 3D Slicer '
-            'segmentation (v13.2.3: segment named after the file, deterministic per-layer color). Each layer is created during '
-            'the intermediate pipeline steps (e.g. the Transverse layer compresses while Tiled Transverse is still '
-            'inferencing) and, when Gaussian smoothing is enabled, Global_union_presmoothing is written while smoothing runs; a single '
-            f'{variant_nrrd_stem(input_path.stem)}_nrrd_manifest.json sidecar lists every written layer. The previous mega 4D '
-            'decomposed NRRD (one file with a trailing list axis) has been removed.'
-        )
-        if int(nrrd_low_quality_layer_files_written) > 0:
-            legacy_lq_nrrd_count = max(
-                0,
-                int(nrrd_low_quality_layer_files_written)
-                - int(nrrd_low_quality_centerline_audit_files_written),
-            )
-            spec_notes.append(
-                f'Low-quality NRRD decomposition (v13.2.1, bug #2): {int(legacy_lq_nrrd_count)} legacy '
-                'downbinned single-layer NRRD file(s) written under low_quality/<token>/nrrd/, mirroring the '
-                'full-quality component layers per --save low_quality[:LOW_QUALITY_DOWNBIN] spec and written on the same '
-                f'view-completion schedule. Each downbin has its own {OUTPUT_NRRD_PREFIX}{{Filestem}}_nrrd_manifest.json with layer '
-                'suffixes matching the full-quality nrrd/ folder.'
-            )
-    if bool(centerline_audit_nrrd_needed):
-        spec_notes.append(
-            f'v14.0.1 centerline audit NRRDs: pass 0 and, for each completed detection pass, '
-            f'sparse removed-component/watershed-candidate layers plus a result checkpoint were written under '
-            f'{nrrd_dir}. Audit-only mode uses the same full reference raster as every other NRRD '
-            f'and does not enable the legacy per-view decomposition. The manifest identifies explicit select/subtract/marker '
-            f'roles for {int(nrrd_centerline_audit_files_written)} full-quality centerline audit file(s), '
-            f'{int(nrrd_low_quality_centerline_audit_files_written)} matching low-quality audit mirror file(s), and '
-            f'{int(nrrd_layer_files_written)} total full-quality layer file(s) from this run. Removed-component '
-            'downbins use diagnostic_only and watershed-candidate downbins use none; neither participates in '
-            'low-quality recomposition because max-pool downbinning does not commute with subtraction.'
-        )
 
     summary_path: Optional[Path] = None
     if bool(save_summary_enabled):
@@ -7843,7 +7178,6 @@ _bind_late_symbols(
             "_main_process_gpu_stage_begin_inference",
             "_main_process_gpu_stage_can_dispatch_inference",
             "_main_process_gpu_stage_finish_inference",
-            "_radial_view_nominal_spacing_deg",
             "_reset_main_process_gpu_stage_coordinator",
             "_set_main_process_gpu_inference_priority_active",
             "_set_main_process_gpu_pending_inference",
@@ -7853,9 +7187,6 @@ _bind_late_symbols(
         ),
         "config": (
             "GIB",
-            "NRRD_SPACE",
-            "OUTPUT_NRRD_PREFIX",
-            "RADIAL_TEXTURE_VARIANT_LABEL",
             "SCRIPT_VERSION",
             "build_argparser",
             "quantize_display",
@@ -7873,7 +7204,6 @@ _bind_late_symbols(
             "resolve_tilted_view_groups",
             "resolve_tta_angles",
             "tilted_group_base_views",
-            "variant_nrrd_stem",
         ),
         "cuda_backend": (
             "_fused_preflight_family",
@@ -7956,8 +7286,6 @@ _bind_late_symbols(
             "PredictionAccumulationHandle",
             "async_predict_join_workers",
             "async_predict_postprocess_enabled",
-            "cleanup_backend",
-            "cpu_mask_postprocess_pending_limit",
             "gpu_device_hole_fill_enabled",
             "gpu_device_union_enabled",
             "gpu_worker_chunk_hole_fill_enabled",
@@ -8011,7 +7339,6 @@ _bind_late_symbols(
             "NrrdLayerSink",
             "collect_low_quality_output_futures",
             "collect_pipeline_output_futures",
-            "ffv1_segment_count",
             "nrrd_layer_output_suffix",
             "nrrd_layer_sink",
             "nrrd_layer_sink_workers",
@@ -8074,7 +7401,6 @@ _bind_late_symbols(
             "initialize_runtime_observability",
             "interpolation_process_backend_enabled",
             "interpolation_process_cv2_threads",
-            "interpolation_process_fallback_enabled",
             "interpolation_process_start_method",
             "main_process_worker_budget",
             "memfd_workspace_enabled",
@@ -8084,7 +7410,6 @@ _bind_late_symbols(
             "plan_gpu_worker_affinity",
             "plan_openvino_cpu_instances",
             "preflight_multiprocessing_payload",
-            "raw_store_memfd_enabled",
             "register_unique_run_scratch_cleanup",
             "release_memfd_owners_under",
             "resolve_parent_interpolation_worker_allocation",

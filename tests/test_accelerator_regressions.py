@@ -348,7 +348,6 @@ class CompressionLifecycleTests(unittest.TestCase):
         old_zero_lock = outputs._NRRD_ZERO_MEMBER_LOCK
         old_test_lock = outputs._NRRD_MEMBER_GZIP_TEST_LOCK
         old_announce_lock = outputs._NRRD_CPU_DEFLATE_BACKEND_ANNOUNCE_LOCK
-        outputs._NRRD_GZIP_EXECUTOR = inherited
         outputs._NRRD_GZIP_EXECUTORS[('qat', 1)] = inherited
         outputs._NRRD_ZERO_MEMBER_CACHE[8] = b'parent member'
         outputs._NRRD_MEMBER_CODEC_SETTING_WARNED = True
@@ -361,7 +360,6 @@ class CompressionLifecycleTests(unittest.TestCase):
         outputs._after_nrrd_compression_fork_child()
 
         self.assertEqual(inherited.shutdown_calls, 0)
-        self.assertIsNone(outputs._NRRD_GZIP_EXECUTOR)
         self.assertEqual(outputs._NRRD_GZIP_EXECUTORS, {})
         self.assertEqual(outputs._NRRD_ZERO_MEMBER_CACHE, {})
         self.assertEqual(outputs._NRRD_MEMBER_GZIP_OK, {})

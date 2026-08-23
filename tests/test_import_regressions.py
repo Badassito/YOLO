@@ -36,6 +36,42 @@ class ImportRegressionTests(unittest.TestCase):
         self.assertIn("all callable-only dependencies resolved", completed.stdout)
         self.assertIn("all function globals resolved", completed.stdout)
 
+    def test_retina_processor_state_remains_backend_settable(self) -> None:
+        program = textwrap.dedent(
+            """
+            from tools.smoke_import import install_stubs
+
+            install_stubs()
+            from volume_tta.inference import (
+                cpu_retina_masks_enabled,
+                set_retina_mask_processor,
+            )
+
+            set_retina_mask_processor("gpu")
+            assert not cpu_retina_masks_enabled()
+            set_retina_mask_processor("cpu")
+            assert cpu_retina_masks_enabled()
+            """
+        )
+        completed = self.run_python("-c", program)
+        self.assertEqual(completed.returncode, 0, completed.stdout)
+
+    def test_automatic_retina_backend_selection_remains_wired(self) -> None:
+        pipeline_source = (ROOT / "volume_tta" / "pipeline.py").read_text(encoding="utf-8")
+        workers_source = (ROOT / "volume_tta" / "workers.py").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "retina_processor = 'gpu' if gpu_worker_process_active else 'cpu'",
+            pipeline_source,
+        )
+        self.assertIn("set_retina_mask_processor(retina_processor)", pipeline_source)
+        self.assertIn("'retina_processor': str(retina_processor)", pipeline_source)
+        self.assertIn("set_retina_mask_processor('cpu')", workers_source)
+        self.assertIn(
+            "set_retina_mask_processor(str(init_dict.get('retina_processor', 'cpu')))",
+            workers_source,
+        )
+
     def test_regression_imports_do_not_initialize_accelerator_runtimes(self) -> None:
         program = textwrap.dedent(
             """

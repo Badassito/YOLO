@@ -104,16 +104,6 @@ def scheduler_push_drain_heartbeat_seconds() -> float:
     """Upper bound on one push-drain sleep (worker-liveness re-check cadence)."""
     return max(0.05, _env_float('YOLO_TTA_SCHEDULER_PUSH_DRAIN_HEARTBEAT', 1.0))
 
-def assemble_views_concurrency() -> int:
-    """Concurrent assemble-from-projected-layers views.
-
- The per-view assemblies are independent unions of already-projected layer stores
- (I/O + memcpy bound), but were run strictly one view at a time. Two concurrent views
- roughly halve that tail segment on the reference 8-tilted + 1-radial run; the
- per-view worker budget is split across active assemblies so the total thread count
- is unchanged. YOLO_TTA_ASSEMBLE_VIEWS_CONCURRENCY=1 restores serial assembly."""
-    return max(1, _env_int('YOLO_TTA_ASSEMBLE_VIEWS_CONCURRENCY', 2))
-
 def fused_final_view_union_enabled() -> bool:
     """Return whether Cartesian and projected-layer restoration may share one output-z pass."""
     return _env_flag('YOLO_TTA_FUSED_FINAL_VIEW_UNION', True)
@@ -219,42 +209,6 @@ def _resize_union_plane_to_out_xy(plane: np.ndarray, out_h: int, out_w: int) -> 
         interpolation=int(interp),
     )
     return (scaled > 0).astype(np.uint8, copy=False)
-
-def assemble_view_volume_from_projected_layers(
-    layer_refs: Sequence['NrrdLayerRef'],
-    out_shape_tyx: Tuple[int, int, int],
-    out_path: Path,
-    desc: str,
-    *,
-    prefer_memory: bool = True,
-    reserve_bytes: int = 16 * GIB,
-    workers: int = 1,
-) -> np.ndarray:
-    """Rebuild a radial/tilted view's final projected volume from its layers.
-
- The dense radial gather and the tilted shear scatter both commute exactly with union, and the
- view's final native volume is by construction the union of its component layers (cleaned
- full-frame YOLO mask, one bridge delta per interpolation pass, and any accepted-tile / tile
- bridge layers). OR-ing the ALREADY-projected --save nrrd component layers therefore
- reproduces the projected final volume bit-for-bit without a second full backprojection."""
-    out_shape = tuple(int(v) for v in out_shape_tyx)
-    vol_mm = allocate_workspace_array(
-        shape=out_shape,
-        dtype=np.uint8,
-        path=out_path,
-        desc=f'{desc} workspace',
-        prefer_memory=bool(prefer_memory),
-        reserve_bytes=int(reserve_bytes),
-    )
-    for ref in layer_refs:
-        _union_projected_layer_ref_into_volume(
-            ref,
-            vol_mm,
-            workers=int(workers),
-            desc=f'{desc}: OR layer {ref.key}',
-        )
-    flush_array(vol_mm)
-    return vol_mm
 
 def collapse_tta_variant_volumes_to_physical_views(
     view_volumes_by_model: Dict[str, Dict[str, np.ndarray]],

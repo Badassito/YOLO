@@ -260,21 +260,6 @@ def tile_parent_crop_window(
     M_crop[1, 2] -= float(py0)
     return (int(py0), int(py1), int(px0), int(px1)), M_crop.astype(np.float32)
 
-def tile_jobs_uniform_crop_shape(
-    view: 'ViewInfo',
-    tile_jobs: 'Sequence[DenseTileJob]',
-    out_size: int,
-) -> Tuple[int, int]:
-    """Largest crop window across one tile configuration, so all tiles share a result shape."""
-    ph, pw = view_processing_plane_shape(view, int(out_size))
-    best_h = 1
-    best_w = 1
-    for job in tile_jobs:
-        (y0, y1, x0, x1), _ = tile_parent_crop_window(view, job.M_out_to_src, int(out_size))
-        best_h = max(int(best_h), int(y1) - int(y0))
-        best_w = max(int(best_w), int(x1) - int(x0))
-    return int(min(int(ph), best_h)), int(min(int(pw), best_w))
-
 def view_processing_min_radius(
     view: 'ViewInfo',
     min_radius: float,
@@ -2588,8 +2573,7 @@ def build_dense_tile_jobs_for_aug(
     ]
 
     # v16.4.0 gates every tile independently, so each tile keeps only its own minimal
-    # parent-grid footprint. The retired grouped/configuration-canvas path required a
-    # configuration-wide uniform crop and no longer exists.
+    # parent-grid footprint.
     if jobs:
         resolved: List[DenseTileJob] = []
         for job in jobs:
