@@ -34,6 +34,11 @@ from typing import (
 )
 import numpy as np
 from ._deps import _NUMBA_IMPORT_ERROR, _numba, cv2, ndi, tqdm
+from .cuda_interpolation import (
+    CudaInterpolationRenderer,
+    create_cuda_interpolation_renderer,
+    gpu_interpolation_required,
+)
 
 from .config import (
     GIB,
@@ -2119,6 +2124,8 @@ def _plan_slice_seed_bridges(
     wrap_axis: bool = False,
     component_cache: Optional[SliceComponentTableCache] = None,
     slice_luts: Optional['SliceLocalLabelLUTs'] = None,
+    gpu_renderer: Optional[CudaInterpolationRenderer] = None,
+    gpu_required: bool = False,
 ) -> SliceSeedBridgePlanResult:
     result = SliceSeedBridgePlanResult()
 
@@ -2168,13 +2175,38 @@ def _plan_slice_seed_bridges(
                 continue
 
             if float(interpolate_min_radius) > 0.0:
-                bridge_radius = _estimate_linear_slice_bridge_min_radius_from_plan(
-                    plan,
-                    reject_at_or_below=float(interpolate_min_radius),
-                    cache_sections=bool(interpolation_cache_bridge_sections_enabled()),
-                )
+                bridge_radius: Optional[float] = None
+                if gpu_renderer is not None and gpu_renderer.available:
+                    try:
+                        bridge_radius = gpu_renderer.estimate_min_radius(
+                            plan,
+                            reject_at_or_below=float(interpolate_min_radius),
+                            cache_sections=bool(interpolation_cache_bridge_sections_enabled()),
+                            cache_host_sections=False,
+                        )
+                    except Exception as exc:
+                        first_failure = gpu_renderer.disable(exc)
+                        if bool(gpu_required):
+                            raise RuntimeError(
+                                'required CUDA interpolation radius evaluation failed'
+                            ) from exc
+                        if first_failure:
+                            print(
+                                f'Warning: CUDA interpolation radius evaluation failed ({exc}); '
+                                'using the CPU bridge evaluator for this and remaining plans.'
+                            )
+                if bridge_radius is None:
+                    bridge_radius = _estimate_linear_slice_bridge_min_radius_from_plan(
+                        plan,
+                        reject_at_or_below=float(interpolate_min_radius),
+                        cache_sections=bool(interpolation_cache_bridge_sections_enabled()),
+                    )
                 if bridge_radius <= float(interpolate_min_radius):
                     result.skipped_by_min_radius += 1
+                    if gpu_renderer is not None:
+                        # Rejected plans never enter the render batch, so retire their
+                        # device SDFs here instead of waiting for LRU pressure.
+                        gpu_renderer.release_plans((plan,))
                     continue
 
             if source_index == 0:
@@ -2556,6 +2588,12 @@ def interpolate_view_volume_pass_inplace(
     plan_batches_rendered = 0
     planned_plan_count = 0
     cache_telemetry: Dict[str, int] = {}
+    gpu_renderer: Optional[CudaInterpolationRenderer] = None
+    gpu_renderer_status = 'not attempted'
+    gpu_renderer_telemetry: Dict[str, object] = {}
+    gpu_required = bool(gpu_interpolation_required())
+    gpu_render_batches = 0
+    gpu_render_fallback_batches = 0
     render_workers = choose_slice_parallel_workers(int(workers), int(mask_mm.shape[0]))
     fused_bridge_merge = bool(interpolation_fused_bridge_merge_enabled())
     rendered_paste_bboxes = (
@@ -2565,6 +2603,20 @@ def interpolate_view_volume_pass_inplace(
     scheduled_slice_flags = np.zeros((int(mask_mm.shape[0]),), dtype=bool)
 
     try:
+        gpu_renderer, gpu_renderer_status = create_cuda_interpolation_renderer(
+            process_worker=bool(interpolation_process_worker_active()),
+        )
+        if gpu_renderer is None and bool(gpu_required):
+            raise RuntimeError(
+                'YOLO_TTA_GPU_INTERPOLATION_REQUIRED=1 but CUDA interpolation is '
+                f'unavailable: {gpu_renderer_status}'
+            )
+        if gpu_renderer is not None:
+            print(
+                f'CUDA bridge interpolation active on {gpu_renderer_status}: '
+                'min-radius morphology and crop-bounded bridge painting run on-device; '
+                'YOLO_TTA_GPU_INTERPOLATION=0 disables.'
+            )
         # Endpoint discovery returns label-major order. Planning is independent per seed
         # and the renderer only ORs sections, so consume the same seeds slice-major to
         # keep bounded component tables hot instead of repeatedly rebuilding distant z.
@@ -2586,6 +2638,7 @@ def interpolate_view_volume_pass_inplace(
             nonlocal plan_batch_payload_bytes, plan_batch_charge_bytes
             nonlocal plan_batch_peak_payload_bytes, plan_batch_peak_charge_bytes
             nonlocal plan_batch_peak_plans, plan_batches_rendered
+            nonlocal gpu_render_batches, gpu_render_fallback_batches
             if not plan_batch:
                 return
 
@@ -2607,19 +2660,30 @@ def interpolate_view_volume_pass_inplace(
                 scheduled_slice_flags[np.asarray(batch_slices, dtype=np.int64)] = True
             batch_added_counts = np.zeros((len(batch_slices),), dtype=np.int64)
 
-            def _render_batch_slice(list_idx: int) -> None:
+            def _initial_bbox_union(z: int) -> Optional[List[int]]:
+                if rendered_paste_bboxes is None:
+                    return None
+                old_y0, old_x0, old_y1, old_x1 = (
+                    int(v) for v in rendered_paste_bboxes[int(z)]
+                )
+                if old_y0 < old_y1 and old_x0 < old_x1:
+                    return [old_y0, old_x0, old_y1, old_x1]
+                return [int(mask_mm.shape[1]), int(mask_mm.shape[2]), 0, 0]
+
+            def _extend_bbox_union(
+                bbox_union: Optional[List[int]],
+                bbox: Optional[Tuple[int, int, int, int]],
+            ) -> None:
+                if bbox_union is None or bbox is None:
+                    return
+                bbox_union[0] = min(int(bbox_union[0]), int(bbox[0]))
+                bbox_union[1] = min(int(bbox_union[1]), int(bbox[1]))
+                bbox_union[2] = max(int(bbox_union[2]), int(bbox[2]))
+                bbox_union[3] = max(int(bbox_union[3]), int(bbox[3]))
+
+            def _render_batch_slice_cpu(list_idx: int) -> None:
                 z = int(batch_slices[int(list_idx)])
-                bbox_union: Optional[List[int]] = None
-                if rendered_paste_bboxes is not None:
-                    old_y0, old_x0, old_y1, old_x1 = (
-                        int(v) for v in rendered_paste_bboxes[int(z)]
-                    )
-                    if old_y0 < old_y1 and old_x0 < old_x1:
-                        bbox_union = [old_y0, old_x0, old_y1, old_x1]
-                    else:
-                        bbox_union = [
-                            int(mask_mm.shape[1]), int(mask_mm.shape[2]), 0, 0,
-                        ]
+                bbox_union = _initial_bbox_union(int(z))
                 local_added = 0
                 for plan_idx, step_idx in schedule[int(z)]:
                     plan = plan_batch[int(plan_idx)]
@@ -2644,22 +2708,85 @@ def interpolate_view_volume_pass_inplace(
                             int(step_idx),
                             dst_bbox_union=bbox_union,
                         )
-                batch_added_counts[int(list_idx)] = np.int64(local_added)
+                # If CUDA committed earlier slices before a later slice failed, replaying
+                # the whole batch is safe because painting is OR-idempotent.  Preserve the
+                # already-counted additions and add only the bits CPU replay newly sets.
+                batch_added_counts[int(list_idx)] += np.int64(local_added)
                 if rendered_paste_bboxes is not None and bbox_union is not None:
                     rendered_paste_bboxes[int(z)] = np.asarray(bbox_union, dtype=np.int64)
 
-            parallel_for_indices(
-                len(batch_slices),
-                _render_batch_slice,
-                max_workers=choose_slice_parallel_workers(
-                    int(render_workers), max(1, len(batch_slices)),
-                ),
-                desc='Interpolation: render bounded plan batch',
-                show_progress=False,
-            )
+            gpu_batch_complete = False
+            if gpu_renderer is not None and gpu_renderer.available:
+                try:
+                    for list_idx, z in enumerate(batch_slices):
+                        bbox_union = _initial_bbox_union(int(z))
+                        # One destination group per packed membership word (or -1 for
+                        # the ordinary binary bridge canvas). Different logical bits in
+                        # the same word remain in schedule order and are ORed together.
+                        grouped_jobs: Dict[int, List[Tuple[object, int, int]]] = {}
+                        for plan_idx, step_idx in schedule[int(z)]:
+                            plan = plan_batch[int(plan_idx)]
+                            component_layout = component_bit_layout.get((
+                                int(plan.interpolation_walk_back_index),
+                                int(plan.interpolation_candidate_index),
+                            ))
+                            if component_layout is None:
+                                group_index, paint_value = -1, 1
+                            else:
+                                group_index, paint_value = component_layout
+                            grouped_jobs.setdefault(int(group_index), []).append((
+                                plan, int(step_idx), int(paint_value),
+                            ))
+
+                        local_added = 0
+                        for group_index, jobs in grouped_jobs.items():
+                            if int(group_index) < 0:
+                                if bridge_mm is None:  # pragma: no cover - invalid layout
+                                    raise RuntimeError('missing aggregate bridge canvas')
+                                destination = bridge_mm[int(z)]
+                            else:
+                                destination = component_membership_mms[int(group_index)][int(z)]
+                            gpu_result = gpu_renderer.render_slice(destination, jobs)
+                            local_added += int(gpu_result.added_voxels)
+                            _extend_bbox_union(bbox_union, gpu_result.bbox)
+                        batch_added_counts[int(list_idx)] += np.int64(local_added)
+                        if rendered_paste_bboxes is not None and bbox_union is not None:
+                            rendered_paste_bboxes[int(z)] = np.asarray(
+                                bbox_union, dtype=np.int64,
+                            )
+                    gpu_render_batches += 1
+                    gpu_batch_complete = True
+                except Exception as exc:
+                    first_failure = gpu_renderer.disable(exc)
+                    gpu_render_fallback_batches += 1
+                    if bool(gpu_required):
+                        raise RuntimeError(
+                            'required CUDA interpolation bridge rendering failed'
+                        ) from exc
+                    if first_failure:
+                        print(
+                            f'Warning: CUDA interpolation bridge rendering failed ({exc}); '
+                            'replaying the batch on CPU and keeping CUDA disabled.'
+                        )
+
+            if not gpu_batch_complete:
+                parallel_for_indices(
+                    len(batch_slices),
+                    _render_batch_slice_cpu,
+                    max_workers=choose_slice_parallel_workers(
+                        int(render_workers), max(1, len(batch_slices)),
+                    ),
+                    desc='Interpolation: render bounded plan batch',
+                    show_progress=False,
+                )
             added_voxels += int(np.sum(batch_added_counts, dtype=np.int64))
             plan_batches_rendered += 1
             schedule.clear()
+            if gpu_renderer is not None:
+                try:
+                    gpu_renderer.release_plans(plan_batch)
+                except Exception:
+                    pass
             plan_batch.clear()
             plan_batch_payload_bytes = 0
             plan_batch_charge_bytes = 0
@@ -2676,6 +2803,8 @@ def interpolate_view_volume_pass_inplace(
                 wrap_axis=bool(wrap_axis),
                 component_cache=component_cache,
                 slice_luts=slice_luts,
+                gpu_renderer=gpu_renderer,
+                gpu_required=bool(gpu_required),
             )
 
         # A completed future owns its plan arrays until the consumer accepts it.
@@ -2858,6 +2987,15 @@ def interpolate_view_volume_pass_inplace(
                 bridge_delta_written = True
     finally:
         pass_failed = sys.exc_info()[0] is not None
+        if gpu_renderer is not None:
+            try:
+                gpu_renderer_telemetry = gpu_renderer.telemetry()
+            except Exception:
+                gpu_renderer_telemetry = {}
+            try:
+                gpu_renderer.close()
+            except Exception:
+                pass
         if isinstance(bridge_mm, np.memmap):
             flush_array(bridge_mm)
         del bridge_mm
@@ -2999,6 +3137,51 @@ def interpolate_view_volume_pass_inplace(
             int(component_word_count)
             * array_nbytes(tuple(int(v) for v in np.asarray(mask_mm).shape), component_word_dtype)
         ),
+        'interpolation_render_backend': (
+            'cuda_cupy_crop_bounded'
+            + ('+cpu_fallback' if gpu_renderer_telemetry.get('failed_reason') else '')
+            if (
+                int(gpu_renderer_telemetry.get('estimated_plans', 0)) > 0
+                or int(gpu_renderer_telemetry.get('rendered_slices', 0)) > 0
+            )
+            else 'cpu_numpy_numba'
+        ),
+        'gpu_interpolation_status': str(gpu_renderer_status),
+        'gpu_interpolation_active': bool(
+            int(gpu_renderer_telemetry.get('estimated_plans', 0)) > 0
+            or int(gpu_renderer_telemetry.get('rendered_slices', 0)) > 0
+        ),
+        'gpu_interpolation_required': bool(gpu_required),
+        'gpu_interpolation_batches': int(gpu_render_batches),
+        'gpu_interpolation_fallback_batches': int(gpu_render_fallback_batches),
+        'gpu_interpolation_estimated_plans': int(
+            gpu_renderer_telemetry.get('estimated_plans', 0)
+        ),
+        'gpu_interpolation_estimated_sections': int(
+            gpu_renderer_telemetry.get('estimated_sections', 0)
+        ),
+        'gpu_interpolation_rendered_slices': int(
+            gpu_renderer_telemetry.get('rendered_slices', 0)
+        ),
+        'gpu_interpolation_rendered_sections': int(
+            gpu_renderer_telemetry.get('rendered_sections', 0)
+        ),
+        'gpu_interpolation_host_to_device_bytes': int(
+            gpu_renderer_telemetry.get('host_to_device_bytes', 0)
+        ),
+        'gpu_interpolation_device_to_host_bytes': int(
+            gpu_renderer_telemetry.get('device_to_host_bytes', 0)
+        ),
+        'gpu_interpolation_cache_hits': int(
+            gpu_renderer_telemetry.get('cache_hits', 0)
+        ),
+        'gpu_interpolation_cache_misses': int(
+            gpu_renderer_telemetry.get('cache_misses', 0)
+        ),
+        'gpu_interpolation_cache_peak_bytes': int(
+            gpu_renderer_telemetry.get('cache_peak_bytes', 0)
+        ),
+        'gpu_interpolation_fallback_reason': gpu_renderer_telemetry.get('failed_reason'),
     }
     result_stats.update(cache_telemetry)
     result_stats['bridge_component_deltas'] = _bridge_component_stats(

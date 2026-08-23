@@ -3703,7 +3703,11 @@ def interpolate_view_volume_pass_maybe_process(
                 result_mm = process_mm
             else:
                 result_mm = _commit_speculative_worker_storage(stats)
-            stats.setdefault('process_backend', 'gpu_worker_aux_process')
+                # _interpolation_process_entry is shared with the ordinary process pool
+                # and stamps that transport by default. This branch knows the actual
+                # successful host; numerical CUDA use is reported independently by
+                # interpolation_render_backend/gpu_interpolation_active.
+                stats['process_backend'] = 'gpu_worker_aux_process'
             stats['process_memmap_copied_from_anonymous_array'] = bool(copied_to_memmap)
             stats['process_pool_workers'] = int(_INTERPOLATION_PROCESS_MAX_WORKERS)
             flush_array(result_mm)

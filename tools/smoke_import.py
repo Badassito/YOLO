@@ -163,6 +163,7 @@ def main() -> None:
         "geometry",
         "inference",
         "cuda_backend",
+        "cuda_interpolation",
         "workers",
         "topology",
         "backprojection",

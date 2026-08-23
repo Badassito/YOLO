@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "volume-tta"
-version = "17.1.0"
+version = "17.1.1"
 description = "YOLO segmentation test-time augmentation for large cylindrical video volumes"
 requires-python = ">=3.10"
 dependencies = [
@@ -18,7 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 openvino = ["openvino"]
-cuda12 = ["cupy-cuda12x", "nvidia-ml-py"]
+cuda12 = ["cupy-cuda12x>=13.0", "nvidia-ml-py"]
 acceleration = ["numba", "deflate", "isal"]
 
 [project.scripts]
@@ -30,5 +30,5 @@ include = ["volume_tta*"]
 [tool.setuptools.data-files]
 "share/volume-tta" = [
   "ARCHITECTURE.md",
-  "GPT-5.6-Sol-Ultra_v17.1.0_SLURM.py",
+  "GPT-5.6-Sol-Ultra_v17.1.1_SLURM.py",
 ]

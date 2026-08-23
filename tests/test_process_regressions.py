@@ -64,6 +64,16 @@ class _SuccessfulExecutor:
         return _Future()
 
 
+class _FailingAuxPool:
+    @staticmethod
+    def try_submit(_kwargs: object) -> object:
+        return object()
+
+    @staticmethod
+    def wait(_handle: object) -> dict[str, object]:
+        raise RuntimeError('aux wait failure sentinel')
+
+
 class ProcessRuntimeRegressionTests(unittest.TestCase):
     def tearDown(self) -> None:
         runtime.set_interpolation_process_executor(None, 0)
@@ -197,6 +207,23 @@ class ProcessRuntimeRegressionTests(unittest.TestCase):
             np.testing.assert_array_equal(np.asarray(original), np.full((2, 2, 2), 9, dtype=np.uint8))
             self.assertTrue(stats['worker_completed'])
             self.assertEqual(list(work_dir.glob('*fallback-stage*')), [])
+        finally:
+            runtime.close_memmap_array(original)
+
+    def test_aux_failure_fallback_retains_fallback_backend_telemetry(self) -> None:
+        runtime.set_gpu_worker_aux_interpolation_pool(_FailingAuxPool())  # type: ignore[arg-type]
+        original, result, stats, _work_dir = self._run_interpolation_case(
+            _SuccessfulExecutor(),
+        )
+        try:
+            self.assertIs(result, original)
+            np.testing.assert_array_equal(
+                np.asarray(result), np.full((2, 2, 2), 7, dtype=np.uint8),
+            )
+            self.assertTrue(stats['fallback_saw_clean_input'])
+            self.assertEqual(
+                stats['process_backend'], 'fallback_in_process_after_aux_failure',
+            )
         finally:
             runtime.close_memmap_array(original)
 

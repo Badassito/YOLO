@@ -1,6 +1,6 @@
 # Volume TTA architecture
 
-The `GPT-5.6-Sol-Ultra_v17.1.0_SLURM.py` filename remains a versioned compatibility
+The `GPT-5.6-Sol-Ultra_v17.1.1_SLURM.py` filename remains a versioned compatibility
 launcher. The implementation lives in the importable `volume_tta` package so spawned
 processes resolve worker functions and data types through canonical module paths.
 
@@ -15,6 +15,7 @@ processes resolve worker functions and data types through canonical module paths
 | `geometry` | affine transforms, view definitions, slicing and render-source geometry |
 | `inference` | shared Ultralytics execution, mask payloads and inference cleanup |
 | `cuda_backend` | CUDA-resident rendering and CUDA worker-side helpers |
+| `cuda_interpolation` | Lazy CUDA bridge morphology/radius evaluation and crop-bounded painting |
 | `workers` | module-level OpenVINO and CUDA worker entry points |
 | `topology` | slice labeling, union-find and component metadata |
 | `backprojection` | radial/tilted projection plans and source-space accumulation |
@@ -103,3 +104,20 @@ Hardware-backed CUDA, TensorRT, OpenVINO, QAT, IAA, DSA and full data/model pari
 still require the production environment and representative artifacts. Intel accelerator
 build, provisioning, and admission instructions live in ``native/README.md``; run
 ``python tools/intel_accelerator_selftest.py --backend all`` on the target host.
+
+CUDA bridge interpolation is attempted by default only inside a leased, already-warm CUDA
+worker and requires the CUDA extra's CuPy 13+ ndimage primitives.
+`YOLO_TTA_GPU_INTERPOLATION=0` disables it; setting
+`YOLO_TTA_GPU_INTERPOLATION_REQUIRED=1` makes admission or execution failure fatal instead
+of replaying the affected work on CPU. Dedicated interpolation children and the main process
+do not create or claim CUDA contexts unless `YOLO_TTA_GPU_INTERPOLATION_CREATE_CONTEXT=1`
+and, for the latter, `YOLO_TTA_GPU_INTERPOLATION_MAIN_PROCESS=1` are both explicitly set.
+At admission, the renderer requires `YOLO_TTA_GPU_INTERPOLATION_RESERVE_MIB` (1024 by
+default) of free VRAM and withholds that amount when sizing its live SDF/section cache.
+`YOLO_TTA_GPU_INTERPOLATION_CACHE_MIB` (1024 by default) caps those retained array
+payloads; temporary CuPy/CuPyX workspaces and allocator-pool blocks are outside that
+logical cache limit and are released when the interpolation lease closes. Accepted
+sections stay device-only; an evicted section or CPU recovery is reconstructed from its
+host SDFs instead of copying every intermediate canvas over PCIe. Runtime stats
+distinguish the process host from the actual numerical render backend and expose
+transfer/cache/fallback counters.

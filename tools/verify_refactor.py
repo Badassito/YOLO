@@ -194,7 +194,7 @@ REVIEWED_LOCAL_IMPORT_SEAMS = {
         "126545d0d25722c4df5918428643130e3c6a1eb639a0c61476fd7a259ad57cdf",
     ),
     ("interpolation", "interpolate_view_volume_pass_inplace"): (
-        "a3e05e199bbcb2642a203bad091baef389c8f033149d7e54adc7f3f190afc224",
+        "13aa2ffa922299f34b8db3b23568f10715911298ca2a6bc8fe74abf6079b85a6",
         "0a585dbad86412327820dccb21e479e86057fa65bb0ae01a016b198238a3f661",
     ),
     ("interpolation", "RawBBoxMaskStore"): (
@@ -226,7 +226,7 @@ REVIEWED_LOCAL_IMPORT_SEAMS = {
         "babab2eb1d231e00bab18c5e3d624b34d92401f4a0fadd98b03035b6d38e0775",
     ),
     ("runtime", "interpolate_view_volume_pass_maybe_process"): (
-        "41a28a721c9c6c7c4e8b85eeb36ab502f19f6e0bc782ebad2042c36d237299f5",
+        "c33d75c4f4bfa4ed742665fd1b66d68e2ef60026cfcf4432f336fe892dfea740",
         "539803830c71cfc4b66cdf2c096504b9cf2d4e970aa94d8a5121c57ed15acd98",
     ),
     ("topology", "_try_label_slices_stage_a_gpu"): (
