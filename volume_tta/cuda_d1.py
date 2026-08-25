@@ -123,10 +123,38 @@ def _d1_backproject_kernels() -> object:
       return value >= 0.0f && value <= (float)(count - 1);
     }
 
-    extern "C" __global__ void d1_backproject_bbox_to_bits(
+    __device__ __forceinline__ void d1_warp_aggregated_atomic_or(
+        unsigned int* output_bits, unsigned long long word, unsigned int bit,
+        unsigned int* warp_bits) {
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+      // Group every active lane targeting the same 64-bit output-word index.
+      unsigned int active = __activemask();
+      int lane = (int)threadIdx.x & 31;
+      int warp_base = (int)threadIdx.x - lane;
+      warp_bits[(int)threadIdx.x] = bit;
+      __syncwarp(active);
+      unsigned int group = __match_any_sync(active, word);
+      if (lane == __ffs(group) - 1) {
+        unsigned int remaining = group;
+        unsigned int combined = 0;
+        while (remaining != 0) {
+          int source_lane = __ffs(remaining) - 1;
+          combined |= warp_bits[warp_base + source_lane];
+          remaining &= remaining - 1;
+        }
+        atomicOr(output_bits + word, combined);
+      }
+    #else
+      // Preserve compatibility with pre-Volta NVRTC targets, where match-any is not
+      // available.  Those devices retain the correct per-pixel atomic implementation.
+      atomicOr(output_bits + word, bit);
+    #endif
+    }
+
+    extern "C" __global__ void d1_backproject_bboxes_to_bits(
         const unsigned char* mask,
-        int proc_h, int proc_w, int local_slice, int slice_start,
-        int bbox_y0, int bbox_x0, int bbox_h, int bbox_w,
+        int proc_h, int proc_w, int slice_start,
+        const int* bbox_specs, int bbox_count,
         int view_slices, int view_h, int view_w,
         int logical_t, int logical_h, int logical_w,
         int out_t, int out_h, int out_w,
@@ -135,15 +163,22 @@ def _d1_backproject_kernels() -> object:
         float center_x, float center_y, float roi_radius,
         const float* angle_cos, const float* angle_sin,
         unsigned int* output_bits) {
-      unsigned long long q =
-          (unsigned long long)blockDim.x * (unsigned long long)blockIdx.x
-          + (unsigned long long)threadIdx.x;
-      unsigned long long total =
-          (unsigned long long)bbox_h * (unsigned long long)bbox_w;
+      __shared__ unsigned int warp_bits[256];
+      int bbox_index = (int)blockIdx.y;
+      if (bbox_index < 0 || bbox_index >= bbox_count) return;
+      const int* bbox = bbox_specs + 5 * bbox_index;
+      int local_slice = bbox[0];
+      int bbox_y0 = bbox[1];
+      int bbox_x0 = bbox[2];
+      int bbox_h = bbox[3];
+      int bbox_w = bbox[4];
+      unsigned int q = blockDim.x * blockIdx.x + threadIdx.x;
+      unsigned int total = (unsigned int)bbox_h * (unsigned int)bbox_w;
       if (q >= total) return;
 
-      int py_i = bbox_y0 + (int)(q / (unsigned long long)bbox_w);
-      int px_i = bbox_x0 + (int)(q % (unsigned long long)bbox_w);
+      unsigned int bbox_row = q / (unsigned int)bbox_w;
+      int py_i = bbox_y0 + (int)bbox_row;
+      int px_i = bbox_x0 + (int)(q - bbox_row * (unsigned int)bbox_w);
       if (py_i < 0 || py_i >= proc_h || px_i < 0 || px_i >= proc_w) return;
       unsigned long long mask_index =
           ((unsigned long long)local_slice * (unsigned long long)proc_h
@@ -197,7 +232,7 @@ def _d1_backproject_kernels() -> object:
           * (unsigned long long)out_w + (unsigned long long)ox;
       unsigned long long word = linear >> 5;
       unsigned int bit = 1u << (unsigned int)(linear & 31ull);
-      atomicOr(output_bits + word, bit);
+      d1_warp_aggregated_atomic_or(output_bits, word, bit, warp_bits);
     }
     '''
     try:
@@ -205,7 +240,7 @@ def _d1_backproject_kernels() -> object:
         module = cp.RawModule(
             code=source,
             options=('--std=c++14',),
-            name_expressions=('d1_backproject_bbox_to_bits',),
+            name_expressions=('d1_backproject_bboxes_to_bits',),
         )
         compile_fn = getattr(module, 'compile', None)
         if callable(compile_fn):
@@ -213,7 +248,7 @@ def _d1_backproject_kernels() -> object:
         _D1_BACKPROJECT_KERNELS = argparse.Namespace(
             cp=cp,
             module=module,
-            d1_backproject_bbox_to_bits=module.get_function('d1_backproject_bbox_to_bits'),
+            d1_backproject_bboxes_to_bits=module.get_function('d1_backproject_bboxes_to_bits'),
         )
         _D1_BACKPROJECT_KERNELS_ERROR = None
         return _D1_BACKPROJECT_KERNELS
@@ -602,6 +637,79 @@ def _d1_submit_publication(
         semaphore.release()
         raise
 
+
+_D1_BACKPROJECT_THREADS = 256
+
+
+def _d1_prepare_bbox_launch_plan(
+    slice_any: np.ndarray,
+    slice_bboxes: np.ndarray,
+    mask_shape: Tuple[int, int, int],
+) -> Tuple[np.ndarray, List[Tuple[int, int, int]], int]:
+    """Pack nonempty bboxes and group them into a small number of 2D CUDA launches.
+
+    Grid Y selects a bbox and grid X scans its flattened pixels. Power-of-two block-count
+    buckets keep each launch below 2x rounded work while collapsing similarly sized slices
+    into one kernel. Each returned group is ``(grid_x_blocks, first_spec, spec_count)``.
+    """
+
+    any_flags = np.asarray(slice_any, dtype=bool)
+    bboxes = np.asarray(slice_bboxes, dtype=np.int64)
+    if any_flags.ndim != 1 or bboxes.shape != (int(any_flags.size), 4):
+        raise ValueError(
+            f'D1 bbox launch metadata mismatch: any={any_flags.shape}, bboxes={bboxes.shape}'
+        )
+    if len(mask_shape) != 3 or any(int(value) <= 0 for value in mask_shape):
+        raise ValueError(f'D1 bbox launch received invalid mask shape {mask_shape}')
+
+    rows: List[Tuple[int, int, int, int, int, int]] = []
+    scanned_bbox_pixels = 0
+    max_linear_pixels = int(np.iinfo(np.int32).max)
+    for local_slice in np.flatnonzero(any_flags):
+        local_i = int(local_slice)
+        y0, y1, x0, x1 = (int(value) for value in bboxes[local_i])
+        y0 = max(0, min(int(mask_shape[1]), y0))
+        y1 = max(y0, min(int(mask_shape[1]), y1))
+        x0 = max(0, min(int(mask_shape[2]), x0))
+        x1 = max(x0, min(int(mask_shape[2]), x1))
+        bbox_h = int(y1 - y0)
+        bbox_w = int(x1 - x0)
+        bbox_pixels = int(bbox_h) * int(bbox_w)
+        if bbox_pixels <= 0:
+            raise RuntimeError(
+                f'D1 metadata marks local slice {local_i} nonempty but gives '
+                f'empty bbox {(y0, y1, x0, x1)}'
+            )
+        if bbox_pixels > max_linear_pixels:
+            raise RuntimeError(
+                f'D1 bbox for local slice {local_i} contains {bbox_pixels} pixels; '
+                f'the batched 32-bit launch limit is {max_linear_pixels}'
+            )
+        block_count = (
+            int(bbox_pixels) + int(_D1_BACKPROJECT_THREADS) - 1
+        ) // int(_D1_BACKPROJECT_THREADS)
+        bucket_blocks = 1 << (int(block_count) - 1).bit_length()
+        rows.append((
+            int(bucket_blocks), local_i, int(y0), int(x0), int(bbox_h), int(bbox_w),
+        ))
+        scanned_bbox_pixels += int(bbox_pixels)
+
+    rows.sort(key=lambda row: (int(row[0]), int(row[1])))
+    specs = np.ascontiguousarray(
+        np.asarray([row[1:] for row in rows], dtype=np.int32).reshape(-1, 5),
+    )
+    launch_groups: List[Tuple[int, int, int]] = []
+    first = 0
+    while first < len(rows):
+        bucket_blocks = int(rows[first][0])
+        stop = int(first + 1)
+        while stop < len(rows) and int(rows[stop][0]) == bucket_blocks:
+            stop += 1
+        launch_groups.append((bucket_blocks, int(first), int(stop - first)))
+        first = int(stop)
+    return specs, launch_groups, int(scanned_bbox_pixels)
+
+
 def _d1_consume_device_union(
     task: Dict[str, object],
     accumulator: '_DeviceUnionAccumulator',
@@ -637,11 +745,10 @@ def _d1_consume_device_union(
         raise RuntimeError(
             f'D1 task union depth {mask_shape[0]} != dispatched slice count {count}'
         )
-    # B1 metadata is already computed from the committed device union. Use it as the
-    # launch domain: a 128-slice 3072^2 task would otherwise launch ~1.2 billion threads
-    # merely to rediscover zeros. Empty slices launch no kernel and each nonempty slice scans
-    # only its known foreground bbox.
-    slice_meta = accumulator.compute_slice_metadata()
+    # The resident quantizer emitted these four-int bboxes while writing the final mask.
+    # The caller already sealed/synchronized every producer, so this reads only the tiny
+    # metadata array instead of reducing the complete task union over rows and columns.
+    slice_meta = accumulator.compute_d1_slice_metadata(synchronize_device=False)
     if not isinstance(slice_meta, dict):
         raise RuntimeError('D1 requires valid device slice metadata for bbox-limited backprojection')
     slice_any = np.asarray(slice_meta.get('slice_any'), dtype=bool)
@@ -651,33 +758,26 @@ def _d1_consume_device_union(
             f'D1 metadata shape mismatch: any={slice_any.shape}, bboxes={slice_bboxes.shape}, '
             f'expected ({count},) and ({count},4)'
         )
+    runtime_telemetry().add('d1.bbox_metadata_d2h_bytes', int(slice_bboxes.nbytes))
 
     stream = cp.cuda.get_current_stream()
     mask_cp = cp.asarray(accumulator.union_dev)
     bitset_cp = cp.asarray(state.bitset)
-    scanned_bbox_pixels = 0
-    nonempty_slices = 0
-    for local_slice in np.flatnonzero(slice_any):
-        y0, y1, x0, x1 = (int(v) for v in slice_bboxes[int(local_slice)])
-        y0 = max(0, min(int(mask_shape[1]), y0))
-        y1 = max(y0, min(int(mask_shape[1]), y1))
-        x0 = max(0, min(int(mask_shape[2]), x0))
-        x1 = max(x0, min(int(mask_shape[2]), x1))
-        bbox_h = int(y1 - y0)
-        bbox_w = int(x1 - x0)
-        bbox_pixels = int(bbox_h) * int(bbox_w)
-        if bbox_pixels <= 0:
-            raise RuntimeError(
-                f'D1 metadata marks local slice {int(local_slice)} nonempty but gives '
-                f'empty bbox {(y0, y1, x0, x1)}'
-            )
-        kernels.d1_backproject_bbox_to_bits(
-            ((int(bbox_pixels) + 255) // 256,), (256,),
+    bbox_specs_host, bbox_launch_groups, scanned_bbox_pixels = (
+        _d1_prepare_bbox_launch_plan(slice_any, slice_bboxes, mask_shape)
+    )
+    nonempty_slices = int(bbox_specs_host.shape[0])
+    bbox_specs_cp = cp.asarray(bbox_specs_host)
+    for grid_x_blocks, first_spec, spec_count in bbox_launch_groups:
+        group_specs_cp = bbox_specs_cp[
+            int(first_spec):int(first_spec) + int(spec_count)
+        ]
+        kernels.d1_backproject_bboxes_to_bits(
+            (int(grid_x_blocks), int(spec_count)), (_D1_BACKPROJECT_THREADS,),
             (
                 mask_cp,
                 np.int32(mask_shape[1]), np.int32(mask_shape[2]),
-                np.int32(local_slice), np.int32(s0),
-                np.int32(y0), np.int32(x0), np.int32(bbox_h), np.int32(bbox_w),
+                np.int32(s0), group_specs_cp, np.int32(spec_count),
                 np.int32(view.num_slices), np.int32(view.src_h), np.int32(view.src_w),
                 np.int32(view.full_t), np.int32(view.full_h), np.int32(view.full_w),
                 np.int32(state.output_shape[0]), np.int32(state.output_shape[1]),
@@ -690,9 +790,13 @@ def _d1_consume_device_union(
             ),
             stream=stream,
         )
-        scanned_bbox_pixels += int(bbox_pixels)
-        nonempty_slices += 1
+    # The Torch-owned task mask is retired below and completion may copy the bitset through a
+    # Torch stream. Keep this cross-framework lifetime/order barrier until those operations are
+    # joined by explicit CUDA events and allocator record-stream ownership.
     stream.synchronize()
+    runtime_telemetry().add(
+        'd1.backprojection_kernel_launches', int(len(bbox_launch_groups)),
+    )
     shadow_writer = state.view_shadow_writer
     if shadow_writer is not None:
         crop_specs: Dict[int, Tuple[int, int, int, int, int, int]] = {}
@@ -768,6 +872,8 @@ def _d1_consume_device_union(
     accumulator.union_dev = None
     accumulator.conf_dev = None
     accumulator.prediction_counts_dev = None
+    accumulator.slice_bboxes_dev = None
+    accumulator.slice_bboxes_written = None
 
     result: Dict[str, object] = {
         'd1_view_complete': bool(complete),

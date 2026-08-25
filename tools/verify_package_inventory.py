@@ -17,13 +17,19 @@ MANIFEST = PACKAGE / "_package_inventory.json"
 # These definitions have reviewed, intentional implementation changes.
 INTENTIONALLY_CHANGED = {
     ("backprojection", "_MainProcessGpuStageCoordinator"),
+    ("backprojection", "_ResidentTensorRTRingExecutor"),
     ("backprojection", "_radial_resident_backproject_kernel"),
+    ("backprojection", "_resident_trt_pipeline_acquire"),
+    ("backprojection", "_try_resident_trt_ring_accumulate"),
     ("backprojection", "HybridBackprojectionQueue"),
     ("config", "build_argparser"),
     ("config", "resolve_backend_batches"),
     ("config", "resolve_backend_precisions"),
     ("cuda_backend", "_GpuWorkerRenderEngine"),
+    ("cuda_backend", "_fused_direct_render_kernels"),
     ("cuda_backend", "_radial_slab_channel_renderer"),
+    ("cuda_d1", "_d1_backproject_kernels"),
+    ("cuda_d1", "_d1_consume_device_union"),
     ("cuda_d1", "_nrrd_layer_key"),
     ("cuda_d1", "_nrrd_layer_name"),
     ("geometry", "ChannelFormattedFrameRenderer"),
@@ -49,6 +55,9 @@ INTENTIONALLY_CHANGED = {
     ("inference", "cpu_retina_masks_enabled"),
     ("inference", "PredictionAccumulationHandle"),
     ("inference", "_DeviceUnionAccumulator"),
+    ("inference", "_ResidentGpuPipelineSlot"),
+    ("inference", "_resident_mask_kernels"),
+    ("inference", "_try_create_device_union_accumulator"),
     ("inference", "gpu_union_retirement_lane_count"),
     ("inference", "predict_in_memory_volume_and_accumulate"),
     ("inference", "predict_in_memory_volume_and_submit_accumulation"),
@@ -158,8 +167,8 @@ REVIEWED_LOCAL_IMPORT_SEAMS = {
         "101a6fb2b4446cf0d71be4e025f1224cfecb863185f21e3482bfcfc9cf3a3231",
     ),
     ("cuda_backend", "_GpuWorkerRenderEngine"): (
-        "0fd9ae9c9ad1205a1a3466d79b1c8e030bab0a5907b30da25d2da26e4d0437e2",
-        "6af12722154b40f75aca9726a04dcfad36c02c9160737a4a39c5ab3697562e09",
+        "c0d5b5e7ca12aa64a0038cf23a62bdfad072b9ac3484ca9e30bcff58e57feb67",
+        "3effca29f240ab39a342363eb17bb6bee8c7e66664a46b35ed17beb7eb6034ff",
     ),
     ("geometry", "GpuPrefetchingYoloSource"): (
         "d34ae87abc324d9aa32dd8906bad4d1ccb3cbab27bad863c4b1979404bfb5bc8",
@@ -190,7 +199,7 @@ REVIEWED_LOCAL_IMPORT_SEAMS = {
         "d0e25f9ae060e0c7d74bece86ae3befb49f781d4a703061bb311fcb2c8d4f410",
     ),
     ("inference", "predict_source_and_accumulate"): (
-        "ade96e190b2d8e1dca2bf1e691e39e7cf2a5814008b4b98fcd88a86098485fdf",
+        "87ba0521c2b55f8f55f85eba1d77c0e654bfda5629f5d895a914709812708ea2",
         "ccf37e9656817910658d67d9c07dd114ce6eb29a820fda1bfa904ac246d955d8",
     ),
     ("inference", "predict_source_and_submit_accumulation"): (

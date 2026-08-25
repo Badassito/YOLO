@@ -238,7 +238,7 @@ from .inference import (
     unload_yolo_model,
 )
 from .cuda_backend import (
-    _fused_preflight_family,
+    build_fused_renderer_preflight_specs,
     fused_renderer_preflight_enabled,
     gpu_cube_resize_enabled,
     open_existing_gray_memmap,
@@ -5545,30 +5545,17 @@ def _main_impl() -> None:
         )
         fused_preflight_specs: List[Dict[str, object]] = []
         if gpu_worker_process_active and fused_renderer_preflight_enabled():
-            for requested_family in ('radial', 'tilted', 'tilted_radial'):
-                selected_view: Optional[ViewInfo] = None
-                for candidate in inference_views:
-                    if _fused_preflight_family(candidate) == requested_family:
-                        selected_view = candidate
-                        break
-                if selected_view is None:
-                    continue
-                candidate_jobs = list(aug_jobs_by_view.get(selected_view.name, ()))
-                if not candidate_jobs:
-                    raise RuntimeError(
-                        f'No augmentation job is available for fused-render preflight '
-                        f'{requested_family}/{selected_view.name}'
-                    )
-                selected_job = min(candidate_jobs, key=lambda item: abs(float(item.angle_deg)))
-                fused_preflight_specs.append({
-                    'view': selected_view,
-                    'job': selected_job,
-                    'frame_index': max(0, min(int(selected_view.num_slices) - 1, int(selected_view.num_slices) // 2)),
-                })
+            fused_preflight_specs = build_fused_renderer_preflight_specs(
+                inference_views,
+                aug_jobs_by_view,
+            )
             if fused_preflight_specs:
                 print(
-                    'v16.1.3 fused-render fail-fast preflight armed for: '
-                    + ', '.join(_fused_preflight_family(spec['view']) for spec in fused_preflight_specs)
+                    'Fused-render fail-fast preflight armed for: '
+                    + ', '.join(
+                        f'{spec["view"].name}@{float(spec["job"].angle_deg):g}deg'
+                        for spec in fused_preflight_specs
+                    )
                 )
 
         worker_init = {

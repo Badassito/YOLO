@@ -86,6 +86,7 @@ from .inference import (
     _cuda_graph_capture_context,
     _resident_mask_kernels,
     _split_segmentation_backend_outputs,
+    _tiled_f16_proto_union_applicable,
     _warp_matrix_is_identity,
     resident_trt_cuda_graphs_enabled,
     resident_trt_native_warp_enabled,
@@ -998,6 +999,7 @@ class _ResidentTensorRTRingExecutor:
         M_out_to_native: np.ndarray,
         track_conf: bool,
         confidence_threshold: float,
+        collect_slice_bboxes: bool = False,
         dynamic_unit_descriptors: bool = False,
     ) -> None:
         import torch  # type: ignore
@@ -1046,6 +1048,7 @@ class _ResidentTensorRTRingExecutor:
             self.default_descriptor,
         )
         self.track_conf = bool(track_conf)
+        self.collect_slice_bboxes = bool(collect_slice_bboxes)
         self.confidence_threshold = float(confidence_threshold)
         requested_proto_mode = proto_hole_treatment_mode()
         # Confidence-based component cleanup expects an untouched confidence/mask relation;
@@ -1267,6 +1270,23 @@ class _ResidentTensorRTRingExecutor:
         device = head.device
         slot.compact_indices = torch.empty((anchors,), dtype=torch.int32, device=device)
         slot.compact_count = torch.zeros((1,), dtype=torch.int32, device=device)
+        slot.compact_coeff = None
+        slot.compact_proto_boxes = None
+        slot.compact_confs = None
+        if _tiled_f16_proto_union_applicable(torch, head, proto):
+            masks = int(proto.shape[1])
+            # Capacity remains anchors so confidence compaction preserves the existing
+            # no-truncation semantics.  At 3K/32 prototypes these add ~16 MiB per ring
+            # slot and keep all addresses stable for postprocess CUDA Graph capture.
+            slot.compact_coeff = torch.empty(
+                (anchors, masks), dtype=torch.float16, device=device,
+            )
+            slot.compact_proto_boxes = torch.empty(
+                (anchors, 4), dtype=torch.float32, device=device,
+            )
+            slot.compact_confs = torch.empty(
+                (anchors,), dtype=torch.float32, device=device,
+            )
         slot.max_logit = torch.empty((ph, pw), dtype=torch.float32, device=device)
         slot.proto_tmp = (
             torch.empty((ph, pw), dtype=torch.float32, device=device)
@@ -1285,12 +1305,17 @@ class _ResidentTensorRTRingExecutor:
             'max_logit': cp.asarray(slot.max_logit),
             'native_union': cp.asarray(slot.native_union),
         }
+        if slot.compact_coeff is not None:
+            refs['compact_coeff'] = cp.asarray(slot.compact_coeff)
+            refs['compact_proto_boxes'] = cp.asarray(slot.compact_proto_boxes)
+            refs['compact_confs'] = cp.asarray(slot.compact_confs)
         if slot.proto_tmp is not None:
             refs['proto_tmp'] = cp.asarray(slot.proto_tmp)
         if slot.conf_proto is not None:
             refs['conf_proto'] = cp.asarray(slot.conf_proto)
         if slot.native_conf is not None:
             refs['native_conf'] = cp.asarray(slot.native_conf)
+        refs['native_bbox'] = cp.asarray(slot.native_bbox)
         slot._cupy_refs = refs
 
     def _allocate_native_output_buffers(self, slot: _ResidentGpuPipelineSlot) -> None:
@@ -1303,6 +1328,22 @@ class _ResidentTensorRTRingExecutor:
             torch.empty((int(self.native_h), int(self.native_w)), dtype=torch.uint8, device=device)
             if self.track_conf else None
         )
+        # Four stable int32 values per ring slot.  Collection is enabled only for D1,
+        # but keeping this tiny allocation resident lets cached TensorRT contexts serve
+        # D1 and ordinary tasks without context churn.
+        slot.native_bbox = torch.empty((4,), dtype=torch.int32, device=device)
+
+    def configure_slice_bbox_collection(self, enabled: bool) -> None:
+        """Select whether post quantization emits D1 metadata for the next task."""
+        enabled = bool(enabled)
+        if enabled == bool(self.collect_slice_bboxes):
+            return
+        self.synchronize()
+        self.collect_slice_bboxes = enabled
+        # Kernel pointer/scalar arguments are captured by value.  The persistent path
+        # currently uses dynamic descriptors, but invalidate defensively if that changes.
+        for slot in self.slots:
+            slot.post_graph = None
 
     def reconfigure_destination(
         self,
@@ -1338,13 +1379,16 @@ class _ResidentTensorRTRingExecutor:
             slot.post_graph = None
             slot._cupy_refs.pop('native_union', None)
             slot._cupy_refs.pop('native_conf', None)
+            slot._cupy_refs.pop('native_bbox', None)
             slot.native_union = None
             slot.native_conf = None
+            slot.native_bbox = None
             self._allocate_native_output_buffers(slot)
             cp = self.kernels.cp
             slot._cupy_refs['native_union'] = cp.asarray(slot.native_union)
             if slot.native_conf is not None:
                 slot._cupy_refs['native_conf'] = cp.asarray(slot.native_conf)
+            slot._cupy_refs['native_bbox'] = cp.asarray(slot.native_bbox)
             self._set_slot_unit_descriptor(slot, self.default_descriptor)
             slot.infer_valid = False
             slot.post_valid = False
@@ -1377,26 +1421,69 @@ class _ResidentTensorRTRingExecutor:
         # _launch_post is always entered under torch.cuda.stream(post_stream), so this
         # clear and the external CuPy launches share the same capture-safe CUDA stream.
         slot.compact_count.zero_()
-        compact = self.kernels.compact_f16 if head.dtype == self.torch.float16 else self.kernels.compact_f32
-        compact(
-            ((anchors + 255) // 256,), (256,),
-            (refs['head'], np.int32(anchors), np.float32(self.confidence_threshold), refs['indices'], refs['count']),
-            stream=external,
+        bbox_arg = (
+            refs['native_bbox'] if self.collect_slice_bboxes else np.uintp(0)
         )
-        htag = 'f16' if head.dtype == self.torch.float16 else 'f32'
-        ptag = 'f16' if proto.dtype == self.torch.float16 else 'f32'
-        union_kernel = getattr(self.kernels, f'union_{htag}_{ptag}')
+        use_tiled_union = 'compact_coeff' in refs
+        if use_tiled_union:
+            self.kernels.compact_f16_tiled(
+                ((anchors + 255) // 256,), (256,),
+                (
+                    refs['head'], np.int32(anchors), np.float32(self.confidence_threshold),
+                    refs['indices'], refs['count'], np.int32(self.native_h),
+                    np.int32(self.native_w), bbox_arg,
+                    np.int32(masks), np.int32(ph), np.int32(pw),
+                    np.int32(self.out_size), np.int32(self.out_size),
+                    refs['compact_coeff'], refs['compact_proto_boxes'],
+                    refs['compact_confs'],
+                ),
+                stream=external,
+            )
+        else:
+            compact = (
+                self.kernels.compact_f16
+                if head.dtype == self.torch.float16 else self.kernels.compact_f32
+            )
+            compact(
+                ((anchors + 255) // 256,), (256,),
+                (
+                    refs['head'], np.int32(anchors), np.float32(self.confidence_threshold),
+                    refs['indices'], refs['count'], np.int32(self.native_h),
+                    np.int32(self.native_w), bbox_arg,
+                ),
+                stream=external,
+            )
         conf_proto_arg = refs.get('conf_proto', np.uintp(0))
         pixels = ph * pw
-        union_kernel(
-            ((pixels + 255) // 256,), (256,),
-            (
-                refs['head'], refs['proto'], refs['indices'], refs['count'],
-                np.int32(anchors), np.int32(masks), np.int32(ph), np.int32(pw),
-                np.int32(self.out_size), np.int32(self.out_size), refs['max_logit'], conf_proto_arg,
-            ),
-            stream=external,
-        )
+        if use_tiled_union:
+            tiled_block = (32, 4)
+            tiled_grid = (
+                (pw + tiled_block[0] * 2 - 1) // (tiled_block[0] * 2),
+                (ph + tiled_block[1] - 1) // tiled_block[1],
+            )
+            self.kernels.union_f16_f16_tiled(
+                tiled_grid, tiled_block,
+                (
+                    refs['proto'], refs['compact_coeff'], refs['compact_proto_boxes'],
+                    refs['compact_confs'], refs['count'], np.int32(masks),
+                    np.int32(ph), np.int32(pw), refs['max_logit'], conf_proto_arg,
+                ),
+                stream=external,
+            )
+        else:
+            htag = 'f16' if head.dtype == self.torch.float16 else 'f32'
+            ptag = 'f16' if proto.dtype == self.torch.float16 else 'f32'
+            union_kernel = getattr(self.kernels, f'union_{htag}_{ptag}')
+            union_kernel(
+                ((pixels + 255) // 256,), (256,),
+                (
+                    refs['head'], refs['proto'], refs['indices'], refs['count'],
+                    np.int32(anchors), np.int32(masks), np.int32(ph), np.int32(pw),
+                    np.int32(self.out_size), np.int32(self.out_size),
+                    refs['max_logit'], conf_proto_arg,
+                ),
+                stream=external,
+            )
         if self.proto_hole_treatment_active:
             self.kernels.proto_threshold_signed(
                 ((pixels + 255) // 256,), (256,),
@@ -1418,28 +1505,32 @@ class _ResidentTensorRTRingExecutor:
         post_logit_arg = refs['proto_tmp'] if self.proto_hole_treatment_active else refs['max_logit']
         if slot.unit_descriptor is None:
             raise RuntimeError(f'resident ring slot {slot.slot_id} has no unit descriptor')
-        out_pixels = self.native_h * self.native_w
+        quantize_block = (32, 8)
+        quantize_grid = (
+            (int(self.native_w) + quantize_block[0] - 1) // quantize_block[0],
+            (int(self.native_h) + quantize_block[1] - 1) // quantize_block[1],
+        )
         if slot.identity_native_warp:
             # Preserve the original radial/identity specialization byte-for-byte: proto
             # bilinear upsample to out_size, threshold, and nearest confidence sampling.
             self.kernels.upsample_quantize(
-                ((out_pixels + 255) // 256,), (256,),
+                quantize_grid, quantize_block,
                 (
                     post_logit_arg, conf_proto_arg, np.int32(ph), np.int32(pw),
                     np.int32(self.out_size), np.int32(self.out_size), refs['native_union'],
-                    refs.get('native_conf', np.uintp(0)),
+                    refs.get('native_conf', np.uintp(0)), bbox_arg,
                 ),
                 stream=external,
             )
         else:
             self.kernels.upsample_quantize_affine(
-                ((out_pixels + 255) // 256,), (256,),
+                quantize_grid, quantize_block,
                 (
                     post_logit_arg, conf_proto_arg, np.int32(ph), np.int32(pw),
                     np.int32(self.out_size), np.int32(self.out_size),
                     np.int32(self.native_h), np.int32(self.native_w),
                     *slot.native_to_out,
-                    refs['native_union'], refs.get('native_conf', np.uintp(0)),
+                    refs['native_union'], refs.get('native_conf', np.uintp(0)), bbox_arg,
                 ),
                 stream=external,
             )
@@ -1549,6 +1640,11 @@ class _ResidentTensorRTRingExecutor:
         unit_index = int(descriptor.unit_index)
         destination_index = int(descriptor.destination_index)
         torch = self.torch
+        bbox_collection_requested = getattr(device_union, 'slice_bboxes_dev', None) is not None
+        if bool(bbox_collection_requested) != bool(self.collect_slice_bboxes):
+            raise RuntimeError(
+                'resident TensorRT bbox collection mode does not match the task device union'
+            )
         device_union.register_producer_stream(slot.post_stream)
         with torch.cuda.stream(slot.post_stream):
             slot.post_stream.wait_event(slot.infer_done)
@@ -1561,6 +1657,8 @@ class _ResidentTensorRTRingExecutor:
             device_union.union_dev[destination_index].copy_(slot.native_union, non_blocking=True)
             if device_union.conf_dev is not None and slot.native_conf is not None:
                 device_union.conf_dev[destination_index].copy_(slot.native_conf, non_blocking=True)
+            if bbox_collection_requested:
+                device_union.write_slice_bbox(destination_index, slot.native_bbox)
             frame_counts_dev[unit_index].copy_(slot.compact_count[0], non_blocking=True)
             slot.post_done.record(slot.post_stream)
         device_union.written[destination_index] = True
@@ -1629,11 +1727,15 @@ class _ResidentTensorRTRingExecutor:
             slot.proto = None
             slot.compact_indices = None
             slot.compact_count = None
+            slot.compact_coeff = None
+            slot.compact_proto_boxes = None
+            slot.compact_confs = None
             slot.max_logit = None
             slot.proto_tmp = None
             slot.conf_proto = None
             slot.native_union = None
             slot.native_conf = None
+            slot.native_bbox = None
             slot.unit_descriptor = None
             slot.native_to_out = tuple()
             slot._cupy_refs.clear()
@@ -1747,6 +1849,7 @@ def _resident_trt_pipeline_acquire(
     M_out_to_native: np.ndarray,
     track_conf: bool,
     confidence_threshold: float,
+    collect_slice_bboxes: bool,
     dynamic_unit_descriptors: bool,
 ) -> Tuple['_ResidentTensorRTRingExecutor', bool]:
     """Acquire the actual executor, not merely its two render slots."""
@@ -1782,6 +1885,7 @@ def _resident_trt_pipeline_acquire(
     if executor is not None:
         try:
             executor.reset_for_task()
+            executor.configure_slice_bbox_collection(bool(collect_slice_bboxes))
             executor.reconfigure_destination(
                 native_h=int(native_h),
                 native_w=int(native_w),
@@ -1806,6 +1910,7 @@ def _resident_trt_pipeline_acquire(
         native_h=int(native_h), native_w=int(native_w),
         M_out_to_native=np.asarray(M_out_to_native, dtype=np.float32),
         track_conf=bool(track_conf), confidence_threshold=float(confidence_threshold),
+        collect_slice_bboxes=bool(collect_slice_bboxes),
         # Persistent executors use runtime post descriptors so destination geometry
         # can change without invalidating TensorRT execution contexts.
         dynamic_unit_descriptors=True,
@@ -1985,6 +2090,7 @@ def _try_resident_trt_ring_accumulate(
             M_out_to_native=matrix,
             track_conf=device_union.conf_dev is not None,
             confidence_threshold=float(threshold),
+            collect_slice_bboxes=getattr(device_union, 'slice_bboxes_dev', None) is not None,
             dynamic_unit_descriptors=bool(dynamic_descriptors),
         )
     except _ResidentTensorRTRingFatalError:

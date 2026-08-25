@@ -1,6 +1,6 @@
 # Volume TTA architecture
 
-The `GPT-5.6-Sol-Ultra_v17.1.3_SLURM.py` filename remains a versioned compatibility
+The `GPT-5.6-Sol-Ultra_v17.1.4_SLURM.py` filename remains a versioned compatibility
 launcher. The implementation lives in the importable `volume_tta` package so spawned
 processes resolve worker functions and data types through canonical module paths.
 
@@ -99,6 +99,14 @@ Hardware-backed CUDA, TensorRT, OpenVINO, QAT, IAA, DSA and full data/model pari
 still require the production environment and representative artifacts. Intel accelerator
 build, provisioning, and admission instructions live in ``native/README.md``; run
 ``python tools/intel_accelerator_selftest.py --backend all`` on the target host.
+
+Direct Radial/Tilted rendering and resident mask quantization use 32-by-8 pixel launches,
+avoiding flattened-index division in the output kernels. The D1 path also derives each
+slice's nonempty flag and exclusive bbox during final quantization. One tiny four-int record
+per slice is copied with the task union, so D1 does not rescan the full device volume for
+row/column extents. Batched bbox backprojection groups similarly sized slices into a bounded
+number of launches, and Volta-or-newer kernels aggregate output-bit updates by warp/word
+before the global atomic.
 
 CUDA bridge painting is attempted by default only inside a leased, already-warm CUDA
 worker and requires the CUDA extra's CuPy 13+ primitives. The first nonempty bounded

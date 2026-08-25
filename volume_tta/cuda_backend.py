@@ -369,12 +369,9 @@ def _fused_direct_render_kernels() -> Optional[object]:
         int rows, int n_u, int stack_len, int base_id, int direction_id,
         const int* render_meta, float tan_tilt,
         float center_x, float center_y, float roi_radius,
-        int oh, int ow,
         float m00, float m01, float m02, float m10, float m11, float m12,
-        const float* angle_cos, const float* angle_sin, int q) {
+        const float* angle_cos, const float* angle_sin, int oy, int ox) {
       int angle_idx = render_meta[0];
-      int oy = q / ow;
-      int ox = q - oy * ow;
       float radial_x = __fadd_rn(
           __fadd_rn(__fmul_rn(m00, (float)ox), __fmul_rn(m01, (float)oy)), m02);
       float radial_y = __fadd_rn(
@@ -395,13 +392,15 @@ def _fused_direct_render_kernels() -> Optional[object]:
         int oh, int ow,
         float m00, float m01, float m02, float m10, float m11, float m12,
         const float* angle_cos, const float* angle_sin, float* out) {
-      int q = (int)(blockDim.x * blockIdx.x + threadIdx.x);
-      if (q >= oh * ow) return;
+      int ox = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+      int oy = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
+      if (ox >= ow || oy >= oh) return;
+      int q = oy * ow + ox;
       out[q] = clamp_f(radial_texture_direct_value(
           volume_tex, native_t, full_h, full_w, logical_t,
           rows, n_u, stack_len, base_id, direction_id, render_meta, tan_tilt,
-          center_x, center_y, roi_radius, oh, ow,
-          m00, m01, m02, m10, m11, m12, angle_cos, angle_sin, q), 0.0f, 1.0f);
+          center_x, center_y, roi_radius,
+          m00, m01, m02, m10, m11, m12, angle_cos, angle_sin, oy, ox), 0.0f, 1.0f);
     }
 
     extern "C" __global__ void radial_texture_direct_f16(
@@ -413,13 +412,15 @@ def _fused_direct_render_kernels() -> Optional[object]:
         int oh, int ow,
         float m00, float m01, float m02, float m10, float m11, float m12,
         const float* angle_cos, const float* angle_sin, __half* out) {
-      int q = (int)(blockDim.x * blockIdx.x + threadIdx.x);
-      if (q >= oh * ow) return;
+      int ox = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+      int oy = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
+      if (ox >= ow || oy >= oh) return;
+      int q = oy * ow + ox;
       float value = clamp_f(radial_texture_direct_value(
           volume_tex, native_t, full_h, full_w, logical_t,
           rows, n_u, stack_len, base_id, direction_id, render_meta, tan_tilt,
-          center_x, center_y, roi_radius, oh, ow,
-          m00, m01, m02, m10, m11, m12, angle_cos, angle_sin, q), 0.0f, 1.0f);
+          center_x, center_y, roi_radius,
+          m00, m01, m02, m10, m11, m12, angle_cos, angle_sin, oy, ox), 0.0f, 1.0f);
       out[q] = __float2half_rn(value);
     }
 
@@ -430,10 +431,10 @@ def _fused_direct_render_kernels() -> Optional[object]:
         int angle_idx, float tan_tilt,
         float center_x, float center_y, float roi_radius,
         const float* angle_cos, const float* angle_sin, float* out) {
-      int q = (int)(blockDim.x * blockIdx.x + threadIdx.x);
-      if (q >= rows * n_u) return;
-      int row = q / n_u;
-      int u = q - row * n_u;
+      int u = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+      int row = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
+      if (u >= n_u || row >= rows) return;
+      int q = row * n_u + u;
       float value = radial_texture_sample(
           volume_tex, native_t, full_h, full_w, logical_t,
           rows, n_u, stack_len, base_id, direction_id,
@@ -451,10 +452,10 @@ def _fused_direct_render_kernels() -> Optional[object]:
         int oh, int ow,
         float m00, float m01, float m02, float m10, float m11, float m12,
         const float* angle_cos, const float* angle_sin, float* out) {
-      int q = (int)(blockDim.x * blockIdx.x + threadIdx.x);
-      if (q >= oh * ow) return;
-      int oy = q / ow;
-      int ox = q - oy * ow;
+      int ox = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+      int oy = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
+      if (ox >= ow || oy >= oh) return;
+      int q = oy * ow + ox;
       float radial_x = __fadd_rn(
           __fadd_rn(__fmul_rn(m00, (float)ox), __fmul_rn(m01, (float)oy)), m02);
       float radial_y = __fadd_rn(
@@ -545,12 +546,9 @@ def _fused_direct_render_kernels() -> Optional[object]:
         int rows, int n_u, int stack_len, int base_id, int direction_id,
         const int* render_meta, float tan_tilt,
         float center_x, float center_y, float roi_radius,
-        int oh, int ow,
         float m00, float m01, float m02, float m10, float m11, float m12,
-        const float* angle_cos, const float* angle_sin, int q) {
+        const float* angle_cos, const float* angle_sin, int oy, int ox) {
       int angle_idx = render_meta[0];
-      int oy = q / ow;
-      int ox = q - oy * ow;
       float radial_x = __fadd_rn(
           __fadd_rn(__fmul_rn(m00, (float)ox), __fmul_rn(m01, (float)oy)), m02);
       float radial_y = __fadd_rn(
@@ -571,13 +569,15 @@ def _fused_direct_render_kernels() -> Optional[object]:
         int oh, int ow,
         float m00, float m01, float m02, float m10, float m11, float m12,
         const float* angle_cos, const float* angle_sin, float* out) {
-      int q = (int)(blockDim.x * blockIdx.x + threadIdx.x);
-      if (q >= oh * ow) return;
+      int ox = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+      int oy = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
+      if (ox >= ow || oy >= oh) return;
+      int q = oy * ow + ox;
       out[q] = clamp_f(radial_pointer_direct_value(
           volume, native_t, full_h, full_w, logical_t,
           rows, n_u, stack_len, base_id, direction_id, render_meta, tan_tilt,
-          center_x, center_y, roi_radius, oh, ow,
-          m00, m01, m02, m10, m11, m12, angle_cos, angle_sin, q), 0.0f, 1.0f);
+          center_x, center_y, roi_radius,
+          m00, m01, m02, m10, m11, m12, angle_cos, angle_sin, oy, ox), 0.0f, 1.0f);
     }
 
     extern "C" __global__ void radial_pointer_direct_f16(
@@ -589,13 +589,15 @@ def _fused_direct_render_kernels() -> Optional[object]:
         int oh, int ow,
         float m00, float m01, float m02, float m10, float m11, float m12,
         const float* angle_cos, const float* angle_sin, __half* out) {
-      int q = (int)(blockDim.x * blockIdx.x + threadIdx.x);
-      if (q >= oh * ow) return;
+      int ox = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+      int oy = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
+      if (ox >= ow || oy >= oh) return;
+      int q = oy * ow + ox;
       float value = clamp_f(radial_pointer_direct_value(
           volume, native_t, full_h, full_w, logical_t,
           rows, n_u, stack_len, base_id, direction_id, render_meta, tan_tilt,
-          center_x, center_y, roi_radius, oh, ow,
-          m00, m01, m02, m10, m11, m12, angle_cos, angle_sin, q), 0.0f, 1.0f);
+          center_x, center_y, roi_radius,
+          m00, m01, m02, m10, m11, m12, angle_cos, angle_sin, oy, ox), 0.0f, 1.0f);
       out[q] = __float2half_rn(value);
     }
 
@@ -606,10 +608,10 @@ def _fused_direct_render_kernels() -> Optional[object]:
         int angle_idx, float tan_tilt,
         float center_x, float center_y, float roi_radius,
         const float* angle_cos, const float* angle_sin, float* out) {
-      int q = (int)(blockDim.x * blockIdx.x + threadIdx.x);
-      if (q >= rows * n_u) return;
-      int row = q / n_u;
-      int u = q - row * n_u;
+      int u = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+      int row = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
+      if (u >= n_u || row >= rows) return;
+      int q = row * n_u + u;
       float value = radial_pointer_sample(
           volume, native_t, full_h, full_w, logical_t,
           rows, n_u, stack_len, base_id, direction_id,
@@ -627,10 +629,10 @@ def _fused_direct_render_kernels() -> Optional[object]:
         int oh, int ow,
         float m00, float m01, float m02, float m10, float m11, float m12,
         const float* angle_cos, const float* angle_sin, float* out) {
-      int q = (int)(blockDim.x * blockIdx.x + threadIdx.x);
-      if (q >= oh * ow) return;
-      int oy = q / ow;
-      int ox = q - oy * ow;
+      int ox = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+      int oy = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
+      if (ox >= ow || oy >= oh) return;
+      int q = oy * ow + ox;
       float radial_x = __fadd_rn(
           __fadd_rn(__fmul_rn(m00, (float)ox), __fmul_rn(m01, (float)oy)), m02);
       float radial_y = __fadd_rn(
@@ -718,10 +720,9 @@ def _fused_direct_render_kernels() -> Optional[object]:
     __device__ __forceinline__ float tilted_direct_value(
         const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
         int src_h, int src_w, int stack_len, int base_id, int direction_id,
-        const int* render_meta, float tan_tilt, int inplane_linear, int oh, int ow,
-        float m00, float m01, float m02, float m10, float m11, float m12, int q) {
+        const int* render_meta, float tan_tilt, int inplane_linear, int oy, int ox,
+        float m00, float m01, float m02, float m10, float m11, float m12) {
       int frame_center = render_meta[0];
-      int oy = q / ow, ox = q - oy * ow;
       float sx = __fadd_rn(__fadd_rn(__fmul_rn(m00, (float)ox), __fmul_rn(m01, (float)oy)), m02);
       float sy = __fadd_rn(__fadd_rn(__fmul_rn(m10, (float)ox), __fmul_rn(m11, (float)oy)), m12);
       if (!inplane_linear) {
@@ -767,11 +768,13 @@ def _fused_direct_render_kernels() -> Optional[object]:
         int src_h, int src_w, int stack_len, int base_id, int direction_id,
         const int* render_meta, float tan_tilt, int inplane_linear, int oh, int ow,
         float m00, float m01, float m02, float m10, float m11, float m12, float* out) {
-      int q = (int)(blockDim.x * blockIdx.x + threadIdx.x);
-      if (q >= oh * ow) return;
+      int ox = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+      int oy = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
+      if (ox >= ow || oy >= oh) return;
+      int q = oy * ow + ox;
       out[q] = norm_u8(tilted_direct_value(volume, native_t, full_h, full_w, logical_t,
           src_h, src_w, stack_len, base_id, direction_id, render_meta, tan_tilt,
-          inplane_linear, oh, ow, m00, m01, m02, m10, m11, m12, q));
+          inplane_linear, oy, ox, m00, m01, m02, m10, m11, m12));
     }
 
     extern "C" __global__ void tilted_direct_f16(
@@ -779,11 +782,13 @@ def _fused_direct_render_kernels() -> Optional[object]:
         int src_h, int src_w, int stack_len, int base_id, int direction_id,
         const int* render_meta, float tan_tilt, int inplane_linear, int oh, int ow,
         float m00, float m01, float m02, float m10, float m11, float m12, __half* out) {
-      int q = (int)(blockDim.x * blockIdx.x + threadIdx.x);
-      if (q >= oh * ow) return;
+      int ox = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+      int oy = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
+      if (ox >= ow || oy >= oh) return;
+      int q = oy * ow + ox;
       float value = norm_u8(tilted_direct_value(volume, native_t, full_h, full_w, logical_t,
           src_h, src_w, stack_len, base_id, direction_id, render_meta, tan_tilt,
-          inplane_linear, oh, ow, m00, m01, m02, m10, m11, m12, q));
+          inplane_linear, oy, ox, m00, m01, m02, m10, m11, m12));
       out[q] = __float2half_rn(value);
     }
     '''
@@ -924,6 +929,72 @@ def _fused_preflight_family(view: ViewInfo) -> str:
     if is_tilted_view(view):
         return 'tilted'
     return ''
+
+
+def _fused_renderer_affine_key(aff: AffineSpec) -> Tuple[float, ...]:
+    """Return the graph/preflight identity of one output-to-source affine."""
+
+    return tuple(
+        round(float(value), 7)
+        for value in np.asarray(
+            aff.M_out_to_src, dtype=np.float32,
+        ).reshape(-1).tolist()
+    )
+
+
+def _fused_preflight_spec_key(
+    view: ViewInfo,
+    job: AugJob,
+) -> Tuple[str, Tuple[float, ...]]:
+    return _fused_preflight_family(view), _fused_renderer_affine_key(job.aff)
+
+
+def build_fused_renderer_preflight_specs(
+    inference_views: Sequence[ViewInfo],
+    aug_jobs_by_view: Dict[str, Sequence[AugJob]],
+) -> List[Dict[str, object]]:
+    """Choose one startup comparison for every fused family/affine pair.
+
+    TTA variants are represented as separate views, so selecting only the first view in a
+    family normally selects 0 degrees. Deduplicating by the same rounded matrix key used by
+    graph capture keeps startup work bounded while ensuring every distinct nonzero transform
+    is numerically checked before its direct renderer is used.
+    """
+
+    specs: List[Dict[str, object]] = []
+    for requested_family in ('radial', 'tilted', 'tilted_radial'):
+        seen_affines: set[Tuple[float, ...]] = set()
+        for view in inference_views:
+            if _fused_preflight_family(view) != requested_family:
+                continue
+            candidate_jobs = list(aug_jobs_by_view.get(str(view.name), ()))
+            if not candidate_jobs:
+                raise RuntimeError(
+                    'No augmentation job is available for fused-render preflight '
+                    f'{requested_family}/{view.name}'
+                )
+            for job in candidate_jobs:
+                if not isinstance(job, AugJob):
+                    raise TypeError(
+                        f'Invalid fused-render preflight job for {requested_family}/{view.name}'
+                    )
+                affine_key = _fused_renderer_affine_key(job.aff)
+                if affine_key in seen_affines:
+                    continue
+                seen_affines.add(affine_key)
+                specs.append({
+                    'view': view,
+                    'job': job,
+                    'frame_index': max(
+                        0,
+                        min(
+                            int(view.num_slices) - 1,
+                            int(view.num_slices) // 2,
+                        ),
+                    ),
+                })
+    return specs
+
 
 def _single_pixel_closed_seam_fraction(height: int, width: int) -> float:
     """Return the fraction occupied by a one-pixel closed seam around an HxW raster.
@@ -1473,7 +1544,11 @@ class _GpuWorkerRenderEngine:
                 slot, kernels, int(frame_index) if bool(stage_metadata) else None,
             )
             output_ref = self._fused_slot_output(slot, kernels)
-            pixels = int(out_size) * int(out_size)
+            render_block = (32, 8)
+            render_grid = (
+                (int(out_size) + render_block[0] - 1) // render_block[0],
+                (int(out_size) + render_block[1] - 1) // render_block[1],
+            )
             kernel = getattr(
                 kernels,
                 f'{kernel_prefix}_direct_f16'
@@ -1481,7 +1556,7 @@ class _GpuWorkerRenderEngine:
                 else f'{kernel_prefix}_direct_f32',
             )
             kernel(
-                ((pixels + 255) // 256,), (256,),
+                render_grid, render_block,
                 (
                     source_arg,
                     np.int32(native_t), np.int32(full_h), np.int32(full_w),
@@ -1570,9 +1645,13 @@ class _GpuWorkerRenderEngine:
             )
             if slot.input.dtype not in (self.torch.float16, self.torch.float32):
                 raise RuntimeError(f'unsupported binding dtype {slot.input.dtype}')
-            pixels = int(out_size) * int(out_size)
+            render_block = (32, 8)
+            render_grid = (
+                (int(out_size) + render_block[0] - 1) // render_block[0],
+                (int(out_size) + render_block[1] - 1) // render_block[1],
+            )
             kernel(
-                ((pixels + 255) // 256,), (256,),
+                render_grid, render_block,
                 (
                     self._fused_cupy_volume(kernels),
                     np.int32(native_t), np.int32(full_h), np.int32(full_w), np.int32(self._logical_t),
@@ -1676,10 +1755,7 @@ class _GpuWorkerRenderEngine:
         out_size: int,
     ) -> Tuple[object, ...]:
         family = 'radial' if str(view.family) == 'radial' else ('tilted' if is_tilted_view(view) else '')
-        matrix_key = tuple(
-            round(float(x), 7)
-            for x in np.asarray(aff.M_out_to_src, dtype=np.float32).reshape(-1).tolist()
-        )
+        matrix_key = _fused_renderer_affine_key(aff)
         if family == 'radial':
             family_geometry: Tuple[object, ...] = (
                 radial_base_view_name(view), bool(is_tilted_radial_view(view)),
@@ -1747,8 +1823,8 @@ class _GpuWorkerRenderEngine:
 
         Enabled fused renderers are fail-fast by default.  A launch rejection or CUDA fault
         aborts the worker instead of silently routing tens of thousands of frames through the
-        slower reference path.  The startup probe compares one representative frame from each
-        fused family under explicit, user-adjustable tolerances.
+        slower reference path. The startup probe compares one representative frame for every
+        fused-family/affine pair under explicit, user-adjustable tolerances.
         """
         # Local import keeps the package dependency graph acyclic.
         from .backprojection import _ResidentTensorRTRingFatalError
@@ -1884,7 +1960,7 @@ class _GpuWorkerRenderEngine:
         out_size: int,
         fp16: bool,
     ) -> None:
-        """Validate one upright-Radial, Tilted, and tilted-Radial frame per volume."""
+        """Validate every distinct TTA affine for each fused family once per volume."""
         # Local import keeps the package dependency graph acyclic.
         from .backprojection import _ResidentTensorRTRingFatalError
 
@@ -1896,7 +1972,7 @@ class _GpuWorkerRenderEngine:
             return
         torch = self.torch
         dtype = torch.float16 if bool(fp16) else torch.float32
-        found: set[str] = set()
+        found: set[Tuple[str, Tuple[float, ...]]] = set()
         for spec in specs:
             view = spec.get('view')
             job = spec.get('job')
@@ -1904,7 +1980,8 @@ class _GpuWorkerRenderEngine:
             if not isinstance(view, ViewInfo) or not isinstance(job, AugJob):
                 raise _ResidentTensorRTRingFatalError('invalid fused-render preflight descriptor')
             family = _fused_preflight_family(view)
-            if not family or family in found:
+            preflight_key = _fused_preflight_spec_key(view, job)
+            if not family or preflight_key in found:
                 continue
             slot = argparse.Namespace(
                 input=torch.empty(
@@ -1919,11 +1996,15 @@ class _GpuWorkerRenderEngine:
             self.validate_fused_ring_renderer(
                 slot, view, job, int(frame_index), int(out_size), compare_reference=True,
             )
-            found.add(family)
+            found.add(preflight_key)
         expected = {
-            _fused_preflight_family(spec['view'])
+            _fused_preflight_spec_key(spec['view'], spec['job'])
             for spec in specs
-            if isinstance(spec.get('view'), ViewInfo) and _fused_preflight_family(spec['view'])
+            if (
+                isinstance(spec.get('view'), ViewInfo)
+                and isinstance(spec.get('job'), AugJob)
+                and _fused_preflight_family(spec['view'])
+            )
         }
         missing = sorted(expected.difference(found))
         if missing:
@@ -2291,9 +2372,13 @@ class _GpuWorkerRenderEngine:
         stack_len = int(radial_stack_length(view))
         out = self.torch.empty((rows, n_u), dtype=self.torch.float32, device=self.device)
         cp_out = kernels.cp.asarray(out)
-        pixels = int(rows) * int(n_u)
+        render_block = (32, 8)
+        render_grid = (
+            (int(n_u) + render_block[0] - 1) // render_block[0],
+            (int(rows) + render_block[1] - 1) // render_block[1],
+        )
         kernel(
-            ((pixels + 255) // 256,), (256,),
+            render_grid, render_block,
             (
                 source_arg,
                 np.int32(self._volume_gpu.shape[0]), np.int32(self._volume_gpu.shape[1]),
@@ -2368,9 +2453,13 @@ class _GpuWorkerRenderEngine:
             (int(out_h), int(out_w)), dtype=self.torch.float32, device=self.device,
         )
         cp_out = kernels.cp.asarray(out)
-        pixels = int(out_h) * int(out_w)
+        render_block = (32, 8)
+        render_grid = (
+            (int(out_w) + render_block[0] - 1) // render_block[0],
+            (int(out_h) + render_block[1] - 1) // render_block[1],
+        )
         kernel(
-            ((pixels + 255) // 256,), (256,),
+            render_grid, render_block,
             (
                 source_arg,
                 np.int32(self._volume_gpu.shape[0]), np.int32(self._volume_gpu.shape[1]),
@@ -2971,7 +3060,6 @@ class _GpuWorkerRenderEngine:
             # with the channel-aware Torch renderer filling those bindings in place.
             if (
                 int(fmt.channel_count) == 1
-                and abs(float(job.angle_deg)) <= 1.0e-7
                 and self._try_fused_render_into_ring_slot(
                     slot, view, job.aff, int(frame_index), int(out_size),
                 )
@@ -3165,20 +3253,14 @@ class GpuRenderedYoloSource:
                 )
                 for i in range(2)
             ]
-        if (
-            int(self.channel_count) == 1
-            and abs(float(self.job.angle_deg)) <= 1.0e-7
-        ):
-            family = (
-                'radial' if str(self.view.family) == 'radial'
-                else ('tilted' if is_tilted_view(self.view) else '')
-            )
+        family = (
+            'radial' if str(self.view.family) == 'radial'
+            else ('tilted' if is_tilted_view(self.view) else '')
+        )
+        if int(self.channel_count) == 1 and family:
             for slot in self._direct_ring:
-                expected_key = (
-                    self.engine._fused_renderer_key(
-                        slot, self.view, self.job.aff, int(self.out_size),
-                    )
-                    if family else None
+                expected_key = self.engine._fused_renderer_key(
+                    slot, self.view, self.job.aff, int(self.out_size),
                 )
                 slot.render_expected_key = expected_key
                 if slot.render_graph is not None and slot.render_graph_key != expected_key:

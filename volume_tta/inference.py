@@ -1988,7 +1988,16 @@ class _DeviceUnionAccumulator:
     
     Written slices flush through bounded pinned chunks; any host fallback disables device-only hole-fill assumptions."""
 
-    def __init__(self, torch_mod: object, device: object, num_frames: int, native_h: int, native_w: int, want_conf: bool) -> None:
+    def __init__(
+        self,
+        torch_mod: object,
+        device: object,
+        num_frames: int,
+        native_h: int,
+        native_w: int,
+        want_conf: bool,
+        collect_slice_bboxes: bool = False,
+    ) -> None:
         self.torch = torch_mod
         self.device = device
         self.union_dev = torch_mod.zeros(
@@ -2002,6 +2011,18 @@ class _DeviceUnionAccumulator:
         # payloads leave zero here and continue returning their host-known stats normally.
         self.prediction_counts_dev = torch_mod.zeros(
             (int(num_frames),), dtype=torch_mod.int32, device=device,
+        )
+        # D1's resident quantizer can derive each final mask bbox while those pixels are
+        # already in registers.  Keep only four int32 values per slice instead of later
+        # reducing the complete task union once over rows and again over columns.
+        self.collect_slice_bboxes = bool(collect_slice_bboxes)
+        self.slice_bboxes_dev = (
+            torch_mod.empty((int(num_frames), 4), dtype=torch_mod.int32, device=device)
+            if self.collect_slice_bboxes else None
+        )
+        self.slice_bboxes_written = (
+            np.zeros((int(num_frames),), dtype=bool)
+            if self.collect_slice_bboxes else None
         )
         # Per-slice device-write tracking (GIL-atomic independent cells; indices are disjoint
         # across postprocess threads). host_written records any frame that bypassed the device
@@ -2050,6 +2071,17 @@ class _DeviceUnionAccumulator:
                 prediction_count_dev.reshape(-1)[0], non_blocking=True,
             )
         self.written[int(idx)] = True
+
+    def write_slice_bbox(
+        self,
+        idx: int,
+        bbox_t: object,
+    ) -> None:
+        """Copy one bbox on the resident producer stream registered by the caller."""
+        if self.slice_bboxes_dev is None or self.slice_bboxes_written is None:
+            raise RuntimeError('slice bbox collection was not enabled for this device union')
+        self.slice_bboxes_dev[int(idx)].copy_(bbox_t, non_blocking=True)
+        self.slice_bboxes_written[int(idx)] = True
 
     def take_device_prediction_stats(
         self,
@@ -2185,6 +2217,54 @@ class _DeviceUnionAccumulator:
                 # Bit-packed (n, ceil(h/8)) row-occupancy — small enough for the mp result queue.
                 'slice_row_any': np.packbits(np.ascontiguousarray(rows_np), axis=1),
                 'slice_row_count': np.asarray([int(h)], dtype=np.int64),
+            }
+        except Exception:
+            return None
+
+    def compute_d1_slice_metadata(
+        self,
+        *,
+        synchronize_device: bool = True,
+    ) -> Optional[Dict[str, np.ndarray]]:
+        """Read D1 bboxes emitted by resident quantization without scanning the mask.
+
+        Empty slices retain the quantizer sentinel ``(h, 0, w, 0)`` and are normalized
+        to the public all-zero bbox.  D1 calls this after its task retirement barrier,
+        so its steady-state readback is only ``num_slices * 16`` bytes.
+        """
+        if (
+            self.union_dev is None
+            or bool(self.host_written)
+            or self.slice_bboxes_dev is None
+            or self.slice_bboxes_written is None
+        ):
+            return None
+        try:
+            n, h, w = (int(x) for x in self.union_dev.shape)
+            if self.written.shape != (n,) or self.slice_bboxes_written.shape != (n,):
+                return None
+            if not bool(self.written.all()) or not bool(self.slice_bboxes_written.all()):
+                return None
+            if bool(synchronize_device):
+                self.torch.cuda.synchronize(self.device)
+            raw = np.asarray(self.slice_bboxes_dev.cpu().numpy(), dtype=np.int64)
+            if raw.shape != (n, 4):
+                return None
+            y0, y1, x0, x1 = (raw[:, i] for i in range(4))
+            nonempty = (y0 < y1) & (x0 < x1)
+            sentinel = (y0 == int(h)) & (y1 == 0) & (x0 == int(w)) & (x1 == 0)
+            if bool((~nonempty & ~sentinel).any()):
+                return None
+            if bool((
+                nonempty
+                & ((y0 < 0) | (y1 > int(h)) | (x0 < 0) | (x1 > int(w)))
+            ).any()):
+                return None
+            bboxes = np.ascontiguousarray(raw)
+            bboxes[~nonempty] = 0
+            return {
+                'slice_any': np.ascontiguousarray(nonempty),
+                'slice_bboxes': bboxes,
             }
         except Exception:
             return None
@@ -2332,6 +2412,8 @@ class _DeviceUnionAccumulator:
         self.union_dev = None
         self.conf_dev = None
         self.prediction_counts_dev = None
+        self.slice_bboxes_dev = None
+        self.slice_bboxes_written = None
         if not metadata_enabled:
             return None
         return {
@@ -2342,7 +2424,13 @@ class _DeviceUnionAccumulator:
         }
 
 def _try_create_device_union_accumulator(
-    device_str: str, num_frames: int, native_h: int, native_w: int, *, want_conf: bool,
+    device_str: str,
+    num_frames: int,
+    native_h: int,
+    native_w: int,
+    *,
+    want_conf: bool,
+    collect_slice_bboxes: bool = False,
 ) -> Optional[_DeviceUnionAccumulator]:
     """Build the per-task device union when VRAM allows; None -> per-frame D2H."""
     if not gpu_device_union_enabled():
@@ -2352,11 +2440,22 @@ def _try_create_device_union_accumulator(
         if not str(device_str).startswith('cuda') or not bool(torch.cuda.is_available()):
             return None
         device = torch.device(str(device_str))
-        need = int(num_frames) * int(native_h) * int(native_w) * (2 if bool(want_conf) else 1)
+        need = (
+            int(num_frames) * int(native_h) * int(native_w) * (2 if bool(want_conf) else 1)
+            + (int(num_frames) * 4 * 4 if bool(collect_slice_bboxes) else 0)
+        )
         free_bytes, _total = torch.cuda.mem_get_info(device)
         if int(free_bytes) < int(need) + 2 * GIB:
             return None
-        return _DeviceUnionAccumulator(torch, device, int(num_frames), int(native_h), int(native_w), bool(want_conf))
+        return _DeviceUnionAccumulator(
+            torch,
+            device,
+            int(num_frames),
+            int(native_h),
+            int(native_w),
+            bool(want_conf),
+            collect_slice_bboxes=bool(collect_slice_bboxes),
+        )
     except Exception:
         return None
 
@@ -2816,11 +2915,15 @@ class _ResidentGpuPipelineSlot:
         self.proto = None
         self.compact_indices = None
         self.compact_count = None
+        self.compact_coeff = None
+        self.compact_proto_boxes = None
+        self.compact_confs = None
         self.max_logit = None
         self.proto_tmp = None
         self.conf_proto = None
         self.native_union = None
         self.native_conf = None
+        self.native_bbox = None
         self.unit_descriptor: Optional[ResidentRingUnitDescriptor] = None
         self.identity_native_warp = False
         self.native_to_out: Tuple[np.float32, ...] = tuple()
@@ -2841,6 +2944,26 @@ _RESIDENT_MASK_KERNELS: Optional[object] = None
 
 _RESIDENT_MASK_KERNELS_FAILED = False
 
+
+def _tiled_f16_proto_union_applicable(
+    torch_mod: object,
+    head: object,
+    proto: object,
+) -> bool:
+    """Whether the benchmarked bbox-aware FP16 proto-union kernel is layout-safe."""
+    try:
+        return bool(
+            head.dtype == torch_mod.float16
+            and proto.dtype == torch_mod.float16
+            and int(proto.shape[-3]) == 32
+            and int(proto.shape[-2]) > 0
+            and int(proto.shape[-1]) > 0
+            and int(proto.shape[-1]) % 2 == 0
+        )
+    except Exception:
+        return False
+
+
 def _resident_mask_kernels() -> Optional[object]:
     """Compile the small device compaction/proto-union kernels once with NVRTC.
 
@@ -2858,19 +2981,62 @@ def _resident_mask_kernels() -> Optional[object]:
         src = r'''
         #include <cuda_fp16.h>
         extern "C" __global__ void compact_f32(
-            const float* head, int anchors, float threshold, int* indices, int* count) {
+            const float* head, int anchors, float threshold, int* indices, int* count,
+            int bbox_h, int bbox_w, int* out_bbox) {
           int a = blockDim.x * blockIdx.x + threadIdx.x;
+          if (a == 0 && out_bbox != nullptr) {
+            out_bbox[0] = bbox_h; out_bbox[1] = 0;
+            out_bbox[2] = bbox_w; out_bbox[3] = 0;
+          }
           if (a < anchors && head[4 * anchors + a] >= threshold) {
             int dst = atomicAdd(count, 1);
             indices[dst] = a;
           }
         }
         extern "C" __global__ void compact_f16(
-            const half* head, int anchors, float threshold, int* indices, int* count) {
+            const half* head, int anchors, float threshold, int* indices, int* count,
+            int bbox_h, int bbox_w, int* out_bbox) {
           int a = blockDim.x * blockIdx.x + threadIdx.x;
+          if (a == 0 && out_bbox != nullptr) {
+            out_bbox[0] = bbox_h; out_bbox[1] = 0;
+            out_bbox[2] = bbox_w; out_bbox[3] = 0;
+          }
           if (a < anchors && __half2float(head[4 * anchors + a]) >= threshold) {
             int dst = atomicAdd(count, 1);
             indices[dst] = a;
+          }
+        }
+
+        extern "C" __global__ void compact_f16_tiled(
+            const half* head, int anchors, float threshold, int* indices, int* count,
+            int bbox_h, int bbox_w, int* out_bbox,
+            int masks, int ph, int pw, int ih, int iw,
+            half* packed_coeff, float* packed_boxes, float* packed_confs) {
+          int a = blockDim.x * blockIdx.x + threadIdx.x;
+          if (a == 0 && out_bbox != nullptr) {
+            out_bbox[0] = bbox_h; out_bbox[1] = 0;
+            out_bbox[2] = bbox_w; out_bbox[3] = 0;
+          }
+          if (a < anchors && __half2float(head[4 * anchors + a]) >= threshold) {
+            int dst = atomicAdd(count, 1);
+            indices[dst] = a;
+            float cx = __half2float(head[0 * anchors + a]);
+            float cy = __half2float(head[1 * anchors + a]);
+            float bw = __half2float(head[2 * anchors + a]);
+            float bh = __half2float(head[3 * anchors + a]);
+            packed_boxes[dst * 4 + 0] =
+                (cx - 0.5f * bw) * ((float)pw / (float)iw);
+            packed_boxes[dst * 4 + 1] =
+                (cy - 0.5f * bh) * ((float)ph / (float)ih);
+            packed_boxes[dst * 4 + 2] =
+                (cx + 0.5f * bw) * ((float)pw / (float)iw);
+            packed_boxes[dst * 4 + 3] =
+                (cy + 0.5f * bh) * ((float)ph / (float)ih);
+            packed_confs[dst] = __half2float(head[4 * anchors + a]);
+            #pragma unroll 4
+            for (int c = 0; c < masks; ++c) {
+              packed_coeff[dst * masks + c] = head[(5 + c) * anchors + a];
+            }
           }
         }
 
@@ -2928,6 +3094,116 @@ def _resident_mask_kernels() -> Optional[object]:
         DECL_UNION(union_f16_f32, half, float)
         DECL_UNION(union_f16_f16, half, half)
 
+        #define PROTO_DET_TILE 4
+        #define PROTO_MAX_MASKS 64
+
+        // H100 profiling at 32 prototype channels showed this bbox-aware path winning
+        // every tested retained-count/box-coverage case.  One 32x4 block owns 64x4
+        // pixels; packed coefficients remove the original per-pixel head gathers and
+        // half2 loads preserve the scalar kernel's FP32 accumulation order.
+        extern "C" __global__ void union_f16_f16_tiled(
+            const half* proto, const half* packed_coeff,
+            const float* packed_boxes, const float* packed_confs,
+            const int* count, int masks, int ph, int pw,
+            float* max_logit, float* conf_proto) {
+          __shared__ half sh_coeff[PROTO_DET_TILE * PROTO_MAX_MASKS];
+          __shared__ float sh_meta[PROTO_DET_TILE * 5];
+          int tid = (int)threadIdx.y * (int)blockDim.x + (int)threadIdx.x;
+          int threads = (int)blockDim.x * (int)blockDim.y;
+          int ox0 = ((int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x) * 2;
+          int oy = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
+          if (masks <= 0 || masks > PROTO_MAX_MASKS) return;
+          bool valid0 = oy < ph && ox0 < pw;
+          bool valid1 = oy < ph && ox0 + 1 < pw;
+          int pixels = ph * pw;
+          int p0 = oy * pw + ox0;
+          int p1 = p0 + 1;
+          int n = *count;
+          float best0 = -6.0f;
+          float best1 = -6.0f;
+          float best_conf0 = 0.0f;
+          float best_conf1 = 0.0f;
+
+          for (int d0 = 0; d0 < n; d0 += PROTO_DET_TILE) {
+            for (int item = tid; item < PROTO_DET_TILE * masks; item += threads) {
+              int d = item / masks;
+              int c = item - d * masks;
+              int gd = d0 + d;
+              sh_coeff[d * PROTO_MAX_MASKS + c] = gd < n
+                  ? packed_coeff[gd * masks + c]
+                  : __float2half_rn(0.0f);
+            }
+            if (tid < PROTO_DET_TILE) {
+              int gd = d0 + tid;
+              if (gd < n) {
+                sh_meta[tid * 5 + 0] = packed_boxes[gd * 4 + 0];
+                sh_meta[tid * 5 + 1] = packed_boxes[gd * 4 + 1];
+                sh_meta[tid * 5 + 2] = packed_boxes[gd * 4 + 2];
+                sh_meta[tid * 5 + 3] = packed_boxes[gd * 4 + 3];
+                sh_meta[tid * 5 + 4] = packed_confs[gd];
+              } else {
+                sh_meta[tid * 5 + 0] = 1.0f;
+                sh_meta[tid * 5 + 1] = 1.0f;
+                sh_meta[tid * 5 + 2] = 0.0f;
+                sh_meta[tid * 5 + 3] = 0.0f;
+                sh_meta[tid * 5 + 4] = 0.0f;
+              }
+            }
+            __syncthreads();
+
+            #pragma unroll
+            for (int d = 0; d < PROTO_DET_TILE; ++d) {
+              int gd = d0 + d;
+              if (gd >= n || (!valid0 && !valid1)) continue;
+              float x1 = sh_meta[d * 5 + 0];
+              float y1 = sh_meta[d * 5 + 1];
+              float x2 = sh_meta[d * 5 + 2];
+              float y2 = sh_meta[d * 5 + 3];
+              bool inside0 = valid0 && (float)ox0 >= x1 && (float)ox0 < x2 &&
+                             (float)oy >= y1 && (float)oy < y2;
+              bool inside1 = valid1 && (float)(ox0 + 1) >= x1 &&
+                             (float)(ox0 + 1) < x2 &&
+                             (float)oy >= y1 && (float)oy < y2;
+              if (!inside0 && !inside1) continue;
+              float logit0 = 0.0f;
+              float logit1 = 0.0f;
+              #pragma unroll 4
+              for (int c = 0; c < masks; ++c) {
+                float coefficient =
+                    __half2float(sh_coeff[d * PROTO_MAX_MASKS + c]);
+                half2 packed = *reinterpret_cast<const half2*>(
+                    proto + c * pixels + p0);
+                float2 values = __half22float2(packed);
+                logit0 += coefficient * values.x;
+                logit1 += coefficient * values.y;
+              }
+              float confidence = sh_meta[d * 5 + 4];
+              if (inside0) {
+                best0 = fmaxf(best0, logit0);
+                if (conf_proto != nullptr && logit0 > 0.0f) {
+                  best_conf0 = fmaxf(best_conf0, confidence);
+                }
+              }
+              if (inside1) {
+                best1 = fmaxf(best1, logit1);
+                if (conf_proto != nullptr && logit1 > 0.0f) {
+                  best_conf1 = fmaxf(best_conf1, confidence);
+                }
+              }
+            }
+            __syncthreads();
+          }
+
+          if (valid0) {
+            max_logit[p0] = best0;
+            if (conf_proto != nullptr) conf_proto[p0] = best_conf0;
+          }
+          if (valid1) {
+            max_logit[p1] = best1;
+            if (conf_proto != nullptr) conf_proto[p1] = best_conf1;
+          }
+        }
+
         extern "C" __global__ void proto_threshold_signed(
             const float* src, int ph, int pw, float* dst) {
           int p = blockDim.x * blockIdx.x + threadIdx.x;
@@ -2972,37 +3248,79 @@ def _resident_mask_kernels() -> Optional[object]:
           dst[p] = fg ? 1.0f : -1.0f;
         }
 
+        __device__ __forceinline__ void merge_quantize_block_bbox(
+            bool foreground, int oh, int ow, int* out_bbox,
+            unsigned int* row_masks) {
+          // The launch is fixed at (32,8): each warp owns one output row.  Every
+          // warp emits one occupancy mask and only block thread (0,0) touches the
+          // four global bbox atomics, independent of foreground-pixel count.
+          if (out_bbox == nullptr) return;
+          unsigned int row_mask = __ballot_sync(0xffffffffu, foreground);
+          if (threadIdx.x == 0) row_masks[threadIdx.y] = row_mask;
+          __syncthreads();
+          if (threadIdx.x != 0 || threadIdx.y != 0) return;
+
+          int local_y0 = oh;
+          int local_y1 = 0;
+          int local_x0 = ow;
+          int local_x1 = 0;
+          int block_x0 = (int)blockIdx.x * 32;
+          int block_y0 = (int)blockIdx.y * (int)blockDim.y;
+          for (int row = 0; row < (int)blockDim.y; ++row) {
+            unsigned int mask = row_masks[row];
+            if (mask == 0) continue;
+            int gy = block_y0 + row;
+            if (gy >= oh) continue;
+            local_y0 = min(local_y0, gy);
+            local_y1 = max(local_y1, gy + 1);
+            local_x0 = min(local_x0, block_x0 + __ffs(mask) - 1);
+            local_x1 = max(local_x1, block_x0 + 32 - __clz(mask));
+          }
+          if (local_y0 < local_y1 && local_x0 < local_x1) {
+            atomicMin(out_bbox + 0, local_y0);
+            atomicMax(out_bbox + 1, local_y1);
+            atomicMin(out_bbox + 2, local_x0);
+            atomicMax(out_bbox + 3, local_x1);
+          }
+        }
+
         extern "C" __global__ void upsample_quantize(
             const float* max_logit, const float* conf_proto,
             int ph, int pw, int oh, int ow, unsigned char* out_union,
-            unsigned char* out_conf) {
-          int q = blockDim.x * blockIdx.x + threadIdx.x;
-          int out_pixels = oh * ow;
-          if (q >= out_pixels) return;
-          int oy = q / ow;
-          int ox = q - oy * ow;
-          float sy = ((float)oy + 0.5f) * ((float)ph / (float)oh) - 0.5f;
-          float sx = ((float)ox + 0.5f) * ((float)pw / (float)ow) - 0.5f;
-          int y0r = (int)floorf(sy), x0r = (int)floorf(sx);
-          float fy = sy - (float)y0r, fx = sx - (float)x0r;
-          int y0 = max(0, min(ph - 1, y0r));
-          int x0 = max(0, min(pw - 1, x0r));
-          int y1 = max(0, min(ph - 1, y0r + 1));
-          int x1 = max(0, min(pw - 1, x0r + 1));
-          float v00 = max_logit[y0 * pw + x0];
-          float v01 = max_logit[y0 * pw + x1];
-          float v10 = max_logit[y1 * pw + x0];
-          float v11 = max_logit[y1 * pw + x1];
-          float v0 = v00 + fx * (v01 - v00);
-          float v1 = v10 + fx * (v11 - v10);
-          unsigned char fg = (v0 + fy * (v1 - v0)) > 0.0f ? 1 : 0;
-          out_union[q] = fg;
-          if (out_conf != nullptr) {
-            int ny = min(ph - 1, (int)((long long)oy * ph / oh));
-            int nx = min(pw - 1, (int)((long long)ox * pw / ow));
-            float cf = fminf(1.0f, fmaxf(0.0f, conf_proto[ny * pw + nx]));
-            out_conf[q] = fg ? (unsigned char)__float2uint_rn(cf * 255.0f) : 0;
+            unsigned char* out_conf, int* out_bbox) {
+          __shared__ unsigned int row_masks[8];
+          int ox = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+          int oy = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
+          bool valid = ox < ow && oy < oh;
+          unsigned char fg = 0;
+          if (valid) {
+            int q = oy * ow + ox;
+            float sy = ((float)oy + 0.5f) * ((float)ph / (float)oh) - 0.5f;
+            float sx = ((float)ox + 0.5f) * ((float)pw / (float)ow) - 0.5f;
+            int y0r = (int)floorf(sy), x0r = (int)floorf(sx);
+            float fy = sy - (float)y0r, fx = sx - (float)x0r;
+            int y0 = max(0, min(ph - 1, y0r));
+            int x0 = max(0, min(pw - 1, x0r));
+            int y1 = max(0, min(ph - 1, y0r + 1));
+            int x1 = max(0, min(pw - 1, x0r + 1));
+            float v00 = max_logit[y0 * pw + x0];
+            float v01 = max_logit[y0 * pw + x1];
+            float v10 = max_logit[y1 * pw + x0];
+            float v11 = max_logit[y1 * pw + x1];
+            float v0 = v00 + fx * (v01 - v00);
+            float v1 = v10 + fx * (v11 - v10);
+            fg = (v0 + fy * (v1 - v0)) > 0.0f ? 1 : 0;
+            out_union[q] = fg;
+            if (out_conf != nullptr) {
+              // Realistic raster/proto dimensions keep these exact 32-bit products
+              // far below INT_MAX; avoid the former per-pixel 64-bit divisions.
+              int ny = min(ph - 1, oy * ph / oh);
+              int nx = min(pw - 1, ox * pw / ow);
+              float cf = fminf(1.0f, fmaxf(0.0f, conf_proto[ny * pw + nx]));
+              out_conf[q] = fg ? (unsigned char)__float2uint_rn(cf * 255.0f) : 0;
+            }
           }
+          merge_quantize_block_bbox(fg != 0, oh, ow, out_bbox, row_masks);
         }
 
         extern "C" __global__ void upsample_quantize_affine(
@@ -3010,57 +3328,63 @@ def _resident_mask_kernels() -> Optional[object]:
             int ph, int pw, int ih, int iw, int oh, int ow,
             float m00, float m01, float m02,
             float m10, float m11, float m12,
-            unsigned char* out_union, unsigned char* out_conf) {
-          int q = blockDim.x * blockIdx.x + threadIdx.x;
-          int out_pixels = oh * ow;
-          if (q >= out_pixels) return;
-          int oy = q / ow;
-          int ox = q - oy * ow;
+            unsigned char* out_union, unsigned char* out_conf, int* out_bbox) {
+          __shared__ unsigned int row_masks[8];
+          int ox = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+          int oy = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
+          bool valid = ox < ow && oy < oh;
+          unsigned char fg = 0;
+          if (valid) {
+            int q = oy * ow + ox;
 
-          // Pixel-center convention: integer (ox,oy) is a native pixel center.  The
-          // precomputed inverse affine maps it to the network raster, matching
-          // _affine_theta_for_grid_sample with align_corners=False.  Outside the
-          // network pixel-center extent is constant zero padding.  Inside, compose
-          // that coordinate directly with the align_corners=False proto upsample;
-          // threshold only after this one bilinear sample (there is no intermediate
-          // out_size binary plane and no full-resolution grid tensor).
-          float ix = m00 * (float)ox + m01 * (float)oy + m02;
-          float iy = m10 * (float)ox + m11 * (float)oy + m12;
-          if (ix < -0.5f || ix >= (float)iw - 0.5f ||
-              iy < -0.5f || iy >= (float)ih - 0.5f) {
+            // Pixel-center convention: integer (ox,oy) is a native pixel center.  The
+            // precomputed inverse affine maps it to the network raster, matching
+            // _affine_theta_for_grid_sample with align_corners=False.  Outside the
+            // network pixel-center extent is constant zero padding.  Inside, compose
+            // that coordinate directly with the align_corners=False proto upsample;
+            // threshold only after this one bilinear sample (there is no intermediate
+            // out_size binary plane and no full-resolution grid tensor).
+            float ix = m00 * (float)ox + m01 * (float)oy + m02;
+            float iy = m10 * (float)ox + m11 * (float)oy + m12;
+            bool inside = !(
+                ix < -0.5f || ix >= (float)iw - 0.5f
+                || iy < -0.5f || iy >= (float)ih - 0.5f
+            );
             out_union[q] = 0;
             if (out_conf != nullptr) out_conf[q] = 0;
-            return;
+            if (inside) {
+              float sx = (ix + 0.5f) * ((float)pw / (float)iw) - 0.5f;
+              float sy = (iy + 0.5f) * ((float)ph / (float)ih) - 0.5f;
+              int y0r = (int)floorf(sy), x0r = (int)floorf(sx);
+              float fy = sy - (float)y0r, fx = sx - (float)x0r;
+              int y0 = max(0, min(ph - 1, y0r));
+              int x0 = max(0, min(pw - 1, x0r));
+              int y1 = max(0, min(ph - 1, y0r + 1));
+              int x1 = max(0, min(pw - 1, x0r + 1));
+              float v00 = max_logit[y0 * pw + x0];
+              float v01 = max_logit[y0 * pw + x1];
+              float v10 = max_logit[y1 * pw + x0];
+              float v11 = max_logit[y1 * pw + x1];
+              float v0 = v00 + fx * (v01 - v00);
+              float v1 = v10 + fx * (v11 - v10);
+              fg = (v0 + fy * (v1 - v0)) > 0.0f ? 1 : 0;
+              out_union[q] = fg;
+              if (out_conf != nullptr) {
+                // Confidence remains nearest-proto sampled, as in the generic path.
+                int ny = max(0, min(ph - 1, (int)floorf(iy * ((float)ph / (float)ih))));
+                int nx = max(0, min(pw - 1, (int)floorf(ix * ((float)pw / (float)iw))));
+                float cf = fminf(1.0f, fmaxf(0.0f, conf_proto[ny * pw + nx]));
+                out_conf[q] = fg ? (unsigned char)__float2uint_rn(cf * 255.0f) : 0;
+              }
+            }
           }
-
-          float sx = (ix + 0.5f) * ((float)pw / (float)iw) - 0.5f;
-          float sy = (iy + 0.5f) * ((float)ph / (float)ih) - 0.5f;
-          int y0r = (int)floorf(sy), x0r = (int)floorf(sx);
-          float fy = sy - (float)y0r, fx = sx - (float)x0r;
-          int y0 = max(0, min(ph - 1, y0r));
-          int x0 = max(0, min(pw - 1, x0r));
-          int y1 = max(0, min(ph - 1, y0r + 1));
-          int x1 = max(0, min(pw - 1, x0r + 1));
-          float v00 = max_logit[y0 * pw + x0];
-          float v01 = max_logit[y0 * pw + x1];
-          float v10 = max_logit[y1 * pw + x0];
-          float v11 = max_logit[y1 * pw + x1];
-          float v0 = v00 + fx * (v01 - v00);
-          float v1 = v10 + fx * (v11 - v10);
-          unsigned char fg = (v0 + fy * (v1 - v0)) > 0.0f ? 1 : 0;
-          out_union[q] = fg;
-          if (out_conf != nullptr) {
-            // Confidence remains nearest-proto sampled, as in the generic path.
-            int ny = max(0, min(ph - 1, (int)floorf(iy * ((float)ph / (float)ih))));
-            int nx = max(0, min(pw - 1, (int)floorf(ix * ((float)pw / (float)iw))));
-            float cf = fminf(1.0f, fmaxf(0.0f, conf_proto[ny * pw + nx]));
-            out_conf[q] = fg ? (unsigned char)__float2uint_rn(cf * 255.0f) : 0;
-          }
+          merge_quantize_block_bbox(fg != 0, oh, ow, out_bbox, row_masks);
         }
         '''
         names = (
-            'compact_f32', 'compact_f16',
+            'compact_f32', 'compact_f16', 'compact_f16_tiled',
             'union_f32_f32', 'union_f32_f16', 'union_f16_f32', 'union_f16_f16',
+            'union_f16_f16_tiled',
             'proto_threshold_signed', 'proto_dilate_signed', 'proto_erode_signed',
             'upsample_quantize', 'upsample_quantize_affine',
         )
@@ -3572,6 +3896,7 @@ def predict_source_and_accumulate(
                 canonical_single_device(str(cfg.device)),
                 int(num_frames), int(native_h), int(native_w),
                 want_conf=view_confmap_mm is not None,
+                collect_slice_bboxes=device_union_consumer is not None,
             )
             if device_union is not None:
                 print(
