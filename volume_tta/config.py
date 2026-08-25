@@ -1,8 +1,4 @@
-"""Implementation subsystem extracted from the v17.0.5 volume TTA runtime.
-
-This physical split intentionally preserves the original numerical and scheduling
-behavior. Public coordination contracts live under ``inference_backends``.
-"""
+"""Command-line grammar and validated pipeline configuration."""
 
 from __future__ import annotations
 
@@ -23,24 +19,11 @@ GIB = 1024 ** 3
 
 NRRD_SPACE = "left-posterior-superior"
 
-SCRIPT_VERSION = '17.1.2'
+SCRIPT_VERSION = '17.1.3'
 
-SCRIPT_VERSION_COMPACT = '1712'
+SCRIPT_VERSION_COMPACT = '1713'
 
 SCRIPT_BASENAME = f'GPT-5.6-Sol-Ultra_v{SCRIPT_VERSION}_SLURM.py'
-
-LEGACY_OUTPUT_NRRD_PREFIX = 'HW_'
-
-def variant_nrrd_stem(stem: object) -> str:
-    """Return an unprefixed NRRD/manifest stem.
-
-    v16.1.3 removes the HW_ output namespace. Repeated legacy prefixes are stripped so
-    caller-supplied stems and resumed metadata cannot recreate the retired prefix.
-    """
-    raw = str(stem)
-    while raw.startswith(LEGACY_OUTPUT_NRRD_PREFIX):
-        raw = raw[len(LEGACY_OUTPUT_NRRD_PREFIX):]
-    return raw
 
 def _parse_angles(
     values: Sequence[str] | str | float | int | None,
@@ -843,7 +826,7 @@ def build_argparser() -> argparse.ArgumentParser:
         help=(
             "Scratch/temp root location. The supplied root is created when needed and receives a "
             "unique {Filename}_{PID}_temp run directory. Omission defaults to <output>/temp; "
-            "an explicit YOLO_TTA_SCRATCH_PREFER_SHM setting may select a roomy memory-backed root"
+            "pass a tmpfs path such as /dev/shm explicitly to use memory-backed scratch"
         ),
     )
     p.add_argument(
@@ -1051,4 +1034,3 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Projection growth angle in degrees. Must be greater than -90 and less than 90")
 
     return p
-

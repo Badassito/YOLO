@@ -26,6 +26,11 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(args.interpolation_walk_back, 1)
         self.assertEqual(args.interpolation_candidates, 1)
 
+    def test_temp_help_requires_explicit_memory_backed_scratch(self) -> None:
+        help_text = build_argparser().format_help()
+        self.assertIn('/dev/shm', help_text)
+        self.assertNotIn('YOLO_TTA_SCRATCH', help_text)
+
     def test_unknown_processor_and_crop_options_are_rejected(self) -> None:
         parser = build_argparser()
         option_strings = {

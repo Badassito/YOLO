@@ -1,8 +1,7 @@
 """Backend control-plane contracts.
 
-Numerical implementations remain in the extracted CUDA/OpenVINO modules for this
-behavior-preserving refactor.  New backends should enter through these contracts rather
-than adding another CPU/GPU branch to the pipeline orchestrator.
+New backends should enter through these contracts rather than adding another CPU/GPU
+branch to the pipeline orchestrator.
 """
 
 from .contracts import (

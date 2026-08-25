@@ -9,8 +9,7 @@
 fail if the dependency is absent, with:
 
 ```bash
-VOLUME_TTA_BUILD_QAT=1 python -m pip wheel . --no-deps
-# Also accepted: VOLUME_TTA_BUILD_INTEL=qat
+VOLUME_TTA_BUILD_INTEL=qat python -m pip wheel . --no-deps
 ```
 
 At runtime, `YOLO_TTA_NRRD_MEMBER_CODEC=auto` prefers QAT before the CPU codec
@@ -58,7 +57,7 @@ software memcpy fallback. Build it on Linux x86-64 with Python development tools
 and a distro kernel-UAPI package that provides `linux/idxd.h`:
 
 ```bash
-VOLUME_TTA_BUILD_DSA=1 python -m pip install .
+VOLUME_TTA_BUILD_INTEL=dsa python -m pip install .
 ```
 
 An explicit build fails if the header or platform is unsuitable. The ordinary

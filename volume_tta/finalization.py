@@ -1,8 +1,4 @@
-"""Implementation subsystem extracted from the v17.0.5 volume TTA runtime.
-
-This physical split intentionally preserves the original numerical and scheduling
-behavior. Public coordination contracts live under ``inference_backends``.
-"""
+"""Source-volume fusion, object filtering, and centerline processing."""
 
 from __future__ import annotations
 
@@ -10,8 +6,6 @@ import gc
 import json
 import math
 import mmap
-import os
-import re
 import threading
 import time
 import multiprocessing as mp
@@ -39,18 +33,7 @@ from ._deps import cv2, ndi, tqdm
 
 from .config import (
     GIB,
-)
-from .runtime import (
-    runtime_telemetry_phase,
-)
-
-# Explicit lower-layer dependencies keep imports one-way.
-from .config import SCRIPT_VERSION
-from .workspace import (
-    _cpu_count,
-    _env_flag,
-    _env_float,
-    _env_int,
+    SCRIPT_VERSION,
 )
 from .runtime import (
     _acquire_parallel_pool,
@@ -62,6 +45,15 @@ from .runtime import (
     parallel_for_indices,
     parallel_for_indices_chunked,
     runtime_telemetry,
+    runtime_telemetry_phase,
+)
+
+# Explicit lower-layer dependencies keep imports one-way.
+from .workspace import (
+    _cpu_count,
+    _env_flag,
+    _env_float,
+    _env_int,
 )
 from .geometry import (
     ViewInfo,
@@ -920,21 +912,7 @@ def assemble_view_volumes_and_projected_layers_fused(
                 return False
 
             configured = gpu_slice_labeling_configured_devices()
-            devices: List[int] = []
-            raw_devices = os.environ.get('YOLO_TTA_FUSED_FINAL_GPU_DEVICES', '').strip()
-            if raw_devices:
-                try:
-                    devices = [
-                        int(tok) for tok in re.split(r'[,\s]+', raw_devices) if str(tok).strip()
-                    ]
-                except Exception as exc:
-                    print(
-                        f'Warning: invalid YOLO_TTA_FUSED_FINAL_GPU_DEVICES ({exc}); '
-                        'using configured devices.'
-                    )
-                    devices = []
-            if not devices and configured:
-                devices = [int(v) for v in configured]
+            devices: List[int] = [int(v) for v in configured] if configured else []
             if not devices:
                 devices = list(range(int(torch.cuda.device_count())))
             max_devices = max(1, _env_int('YOLO_TTA_FUSED_FINAL_GPU_MAX_DEVICES', 4))

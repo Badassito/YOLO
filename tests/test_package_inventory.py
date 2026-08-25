@@ -4,9 +4,10 @@ import ast
 import textwrap
 import unittest
 
-from tools.verify_refactor import (
+from tools.verify_package_inventory import (
     LOCAL_IMPORT_SEAM_MARKER,
     reviewed_local_import_seams,
+    stable_ast_dump,
 )
 
 
@@ -15,7 +16,14 @@ def inspect_seams(source: str):
     return reviewed_local_import_seams("sample", source, ast.parse(source))
 
 
-class RefactorVerifierTests(unittest.TestCase):
+class PackageInventoryTests(unittest.TestCase):
+    def test_ast_dump_keeps_empty_fields_across_python_versions(self) -> None:
+        function = ast.parse("def callback():\n    pass\n").body[0]
+
+        dumped = stable_ast_dump(function)
+
+        self.assertIn("decorator_list=[]", dumped)
+
     def test_marker_move_changes_seam_digest_even_when_definition_ast_is_unchanged(self) -> None:
         first_import_reviewed = inspect_seams(
             f"""

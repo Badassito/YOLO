@@ -1,8 +1,4 @@
-"""Implementation subsystem extracted from the v17.0.5 volume TTA runtime.
-
-This physical split intentionally preserves the original numerical and scheduling
-behavior. Public coordination contracts live under ``inference_backends``.
-"""
+"""Runtime lifecycle, workspaces, NUMA policy, executors, and observability."""
 
 from __future__ import annotations
 
@@ -52,13 +48,11 @@ from ._deps import cv2, tqdm
 
 from .config import (
     GIB,
-)
-
-# Explicit lower-layer dependencies keep imports one-way.
-from .config import (
     SCRIPT_VERSION,
     SCRIPT_VERSION_COMPACT,
 )
+
+# Explicit lower-layer dependencies keep imports one-way.
 from .workspace import (
     _cpu_count,
     _env_flag,
@@ -424,22 +418,17 @@ def _install_stdio_capture(telemetry: RuntimeTelemetry) -> Optional[object]:
 
 def _record_runtime_feature_gauges(telemetry: RuntimeTelemetry) -> None:
     telemetry.gauge('telemetry.decorated_symbols', sorted(_RUNTIME_TELEMETRY_DECORATED_SYMBOLS))
+    # These are unconditional packaged contracts. Their owner modules depend on runtime,
+    # so importing those modules here would invert the package dependency graph.
     telemetry.gauge('features', {
-        'raw_bbox_restored_sparse_members': bool(
-            hasattr(globals().get('RawBBoxMaskStore', object), 'iter_restored_sparse_members')
-        ),
-        'crop_aware_low_quality_mirror': bool(globals().get('_resize_sparse_binary_crop_to_output_region')),
+        'raw_bbox_restored_sparse_members': True,
+        'crop_aware_low_quality_mirror': True,
         'slice_aligned_sparse_members': True,
-        'owned_nrrd_member_transfer': bool(
-            hasattr(globals().get('_MemberParallelGzipPayloadWriter', object), 'write_owned_known_nonzero')
-        ),
-        'native_projection_callback': bool(globals().get('_emit_projection_block_callback')),
-        'native_projected_layer_materializer': bool(globals().get('materialize_nrrd_view_layer')),
-        'memfd_workspace_compatibility': bool(
-            callable(globals().get('memfd_workspace_enabled'))
-            and globals()['memfd_workspace_enabled']()
-        ),
-        'native_persistent_trt_ring': bool(globals().get('_RESIDENT_TRT_PIPELINE_CACHE_NATIVE', False)),
+        'owned_nrrd_member_transfer': True,
+        'native_projection_callback': True,
+        'native_projected_layer_materializer': True,
+        'memfd_workspace_compatibility': bool(memfd_workspace_enabled()),
+        'native_persistent_trt_ring': True,
     })
 
 def initialize_runtime_observability() -> RuntimeTelemetry:
@@ -1614,17 +1603,8 @@ def memfd_workspace_enabled() -> bool:
     )
 
 def raw_store_memfd_enabled() -> bool:
-    """Opt in to keeping cvol/ctile payloads in unbudgeted memfd RAM.
-
-    Raw stores can accumulate behind interpolation/tile barriers and are not covered by
-    anonymous-workspace admission. Pathname storage is therefore the safe default; explicit
-    YOLO_TTA_CVOL_MEMFD=1 restores the prior RAM-first behavior.
-    """
-    return bool(
-        memfd_workspace_enabled()
-        and _env_flag('YOLO_TTA_CVOL_MEMFD', False)
-        and not _env_flag('YOLO_TTA_KEEP_TEMP', False)
-    )
+    """Keep cvol/ctile payloads in bounded pathname storage."""
+    return False
 
 def _memfd_label(value: object) -> str:
     token = re.sub(r'[^A-Za-z0-9_.+-]+', '-', str(value)).strip('-')
@@ -2728,42 +2708,6 @@ def _filesystem_free_bytes(path: Path) -> int:
     except Exception:
         return 0
 
-def scratch_shm_required_free_bytes() -> int:
-    """Free bytes a memory-backed mount must show before it is auto-selected for scratch."""
-    return int(max(0.0, _env_float('YOLO_TTA_SCRATCH_SHM_MIN_FREE_GIB', 256.0)) * GIB)
-
-def _auto_shm_scratch_candidate() -> Optional[Path]:
-    """Return a writable memory-backed scratch root with sufficient mount and cgroup headroom."""
-    mode = os.environ.get('YOLO_TTA_SCRATCH_PREFER_SHM', '').strip().lower()
-    if mode in ('0', 'false', 'no', 'off', 'never'):
-        return None
-    forced = mode in ('1', 'true', 'yes', 'on', 'always', 'force')
-
-    roots = [
-        raw for raw in (os.environ.get('YOLO_TTA_SCRATCH_SHM_DIR', '').strip(), '/dev/shm') if raw
-    ]
-    required = scratch_shm_required_free_bytes()
-    for raw in roots:
-        cand = Path(raw).expanduser()
-        try:
-            if not (cand.is_dir() and os.access(str(cand), os.W_OK)):
-                continue
-        except Exception:
-            continue
-        if not path_is_memory_backed(cand):
-            continue
-        if forced:
-            return cand
-        if required <= 0:
-            continue
-        if _filesystem_free_bytes(cand) < required:
-            continue
-        headroom = available_anon_work_bytes()
-        if headroom > 0 and headroom < required:
-            continue
-        return cand
-    return None
-
 def scratch_dir_is_memory_backed() -> bool:
     """Whether the scratch root chosen by ``choose_scratch_dir`` is RAM rather than disk."""
     return bool(_SCRATCH_DIR_IS_MEMORY_BACKED)
@@ -2772,8 +2716,6 @@ def choose_scratch_dir(preferred: Optional[str], out_dir: Path, stem: str) -> Pa
     """Pick the bulk scratch directory.
 
  - ``--temp`` names a root and receives a unique ``{stem}_{pid}_temp`` child.
- - an explicitly configured ``YOLO_TTA_SCRATCH_PREFER_SHM`` may select a proven-roomy
-   memory-backed root and likewise receives a unique child.
  - otherwise the default is exactly ``{output}/temp``."""
     global _SCRATCH_DIR_IS_MEMORY_BACKED
 
@@ -2794,25 +2736,7 @@ def choose_scratch_dir(preferred: Optional[str], out_dir: Path, stem: str) -> Pa
         _SCRATCH_DIR_IS_MEMORY_BACKED = bool(path_is_memory_backed(scratch_dir))
         return scratch_dir
 
-    chosen_root: Optional[Path] = None
-    if os.environ.get('YOLO_TTA_SCRATCH_PREFER_SHM', '').strip():
-        chosen_root = _auto_shm_scratch_candidate()
-
-    if chosen_root is None:
-        scratch_dir = Path(out_dir) / 'temp'
-    else:
-        try:
-            chosen_root = chosen_root.resolve()
-        except Exception:
-            pass
-        try:
-            chosen_root.mkdir(parents=True, exist_ok=True)
-        except Exception as exc:
-            raise RuntimeError(f'Unable to create scratch root {chosen_root}: {exc}') from exc
-        if not chosen_root.is_dir() or not os.access(str(chosen_root), os.W_OK):
-            raise RuntimeError(f'Scratch root is not a writable directory: {chosen_root}')
-        scratch_dir = chosen_root / f'{stem}_{os.getpid()}_temp'
-
+    scratch_dir = Path(out_dir) / 'temp'
     scratch_dir.mkdir(parents=True, exist_ok=True)
     _SCRATCH_DIR_IS_MEMORY_BACKED = bool(path_is_memory_backed(scratch_dir))
     return scratch_dir
@@ -2926,11 +2850,11 @@ def close_memmap_array_without_flush(arr: object) -> None:
 
 def prediction_volume_build_flush_enabled() -> bool:
     """Return True to force flushing YOLO input volumes before inference."""
-    return _env_flag('YOLO_TTA_FLUSH_PREDICTION_VOLUME_ON_BUILD', False)
+    return False
 
 def prediction_hot_path_flush_enabled() -> bool:
     """Return True to force per-source prediction accumulation memmap flushes."""
-    return _env_flag('YOLO_TTA_PREDICT_FLUSH_EACH_VOLUME', False)
+    return False
 
 _INTERPOLATION_PROCESS_EXECUTOR: Optional[ProcessPoolExecutor] = None
 

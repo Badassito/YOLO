@@ -33,12 +33,11 @@ To force a QPL build and fail if its development package is missing:
 
 ```bash
 pkg-config --atleast-version=1.9.0 qpl
-VOLUME_TTA_BUILD_QPL=1 python -m pip wheel . --no-deps
+VOLUME_TTA_BUILD_INTEL=qpl python -m pip wheel . --no-deps
 ```
 
-`VOLUME_TTA_BUILD_INTEL=qpl` is equivalent. The normal `auto` build includes the
-extension only when pkg-config discovers QPL; `VOLUME_TTA_BUILD_INTEL=none`
-forces a pure-Python build.
+The normal `auto` build includes the extension only when pkg-config discovers
+QPL; `VOLUME_TTA_BUILD_INTEL=none` forces a pure-Python build.
 
 ## Runtime contract
 

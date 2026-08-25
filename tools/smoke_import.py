@@ -1,4 +1,4 @@
-"""Import the refactored package with lightweight native-dependency stubs.
+"""Import the package with lightweight native-dependency stubs.
 
 The development runtime does not ship OpenCV/SciPy.  These stubs exercise Python import
 order, the acyclic package graph, and eager module initialization without pretending to
@@ -25,7 +25,14 @@ if str(ROOT) not in sys.path:
 
 
 class _StubModule(types.ModuleType):
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.__file__ = None
+
     def __getattr__(self, name: str) -> object:
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+
         def unavailable(*args: object, **kwargs: object) -> object:
             raise RuntimeError(f"stubbed dependency attribute called: {self.__name__}.{name}")
 
@@ -155,7 +162,7 @@ def assert_acyclic_eager_imports(module_names: tuple[str, ...]) -> None:
 
 def main() -> None:
     install_stubs()
-    default_modules = (
+    eager_graph_modules = (
         "config",
         "workspace",
         "runtime",
@@ -173,8 +180,16 @@ def main() -> None:
         "assembly",
         "outputs",
         "pipeline",
+        "intel_compression",
+        "intel_dsa",
     )
-    assert_acyclic_eager_imports(default_modules)
+    default_modules = eager_graph_modules + (
+        "inference_backends",
+        "inference_backends.contracts",
+        "inference_backends.descriptors",
+        "inference_backends.registry",
+    )
+    assert_acyclic_eager_imports(eager_graph_modules)
     print("eager package import graph is acyclic")
     requested = [str(name).strip() for name in sys.argv[1:] if str(name).strip()]
     unknown = sorted(set(requested) - set(default_modules))

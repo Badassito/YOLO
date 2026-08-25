@@ -1,8 +1,4 @@
-"""Implementation subsystem extracted from the v17.0.5 volume TTA runtime.
-
-This physical split intentionally preserves the original numerical and scheduling
-behavior. Public coordination contracts live under ``inference_backends``.
-"""
+"""CUDA-resident rendering and worker-side GPU helpers."""
 
 from __future__ import annotations
 
@@ -27,15 +23,13 @@ import numpy as np
 from ._deps import cv2
 
 from .config import (
-    DEFAULT_CHANNEL_FORMAT,
-)
-
-# Explicit lower-layer dependencies keep imports one-way.
-from .config import (
     ChannelFormat,
+    DEFAULT_CHANNEL_FORMAT,
     GIB,
     resolve_channel_format,
 )
+
+# Explicit lower-layer dependencies keep imports one-way.
 from .workspace import (
     _TILTED_IDENTITY_M,
     _env_flag,

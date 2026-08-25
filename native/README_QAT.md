@@ -29,13 +29,10 @@ still produces a CPU-capable wheel. To require QAT and fail the build if it
 cannot be compiled:
 
 ```bash
-VOLUME_TTA_BUILD_QAT=1 python -m pip wheel . --no-deps
-# Equivalent:
 VOLUME_TTA_BUILD_INTEL=qat python -m pip wheel . --no-deps
 ```
 
-`VOLUME_TTA_BUILD_INTEL=none` or `VOLUME_TTA_BUILD_QAT=0` forces a build
-without this extension.
+`VOLUME_TTA_BUILD_INTEL=none` forces a build without this extension.
 
 ## Runtime contract
 
@@ -73,9 +70,9 @@ level 1. Restoring level 9 requires an upstream API/version that reports either
 hardware generation or dependable per-request execution provenance.
 
 The public QATzip session API does not provide deterministic instance NUMA
-binding, so a nonnegative `YOLO_TTA_NRRD_QAT_NUMA_ID` is rejected rather than
-misreported. Current QATzip status APIs also do not expose a reliable instance
-count, hardware generation, physical gzip-member count, or queue-busy count.
+binding, so the codec uses library-managed placement. Current QATzip status
+APIs also do not expose a reliable instance count, hardware generation,
+physical gzip-member count, or queue-busy count.
 The binding therefore uses a conservative concurrency of one when the optional
 device count is absent and reports unavailable metrics as `None`.
 
@@ -115,7 +112,7 @@ On the provisioned production host, force the extension build and run the
 hardware-gated smoke test/microbenchmark:
 
 ```bash
-VOLUME_TTA_BUILD_QAT=1 python -m pip install .
+VOLUME_TTA_BUILD_INTEL=qat python -m pip install .
 python tools/intel_accelerator_selftest.py \
   --backend qat --qat-level 1 --size-mib 16 --iterations 5
 ```

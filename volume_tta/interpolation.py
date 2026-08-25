@@ -1,8 +1,4 @@
-"""Implementation subsystem extracted from the v17.0.5 volume TTA runtime.
-
-This physical split intentionally preserves the original numerical and scheduling
-behavior. Public coordination contracts live under ``inference_backends``.
-"""
+"""Interpolation planning, execution, and sparse continuation."""
 
 from __future__ import annotations
 
@@ -47,16 +43,6 @@ from .config import (
     GIB,
 )
 from .runtime import (
-    interpolation_process_worker_active,
-    runtime_telemetry_phase,
-)
-
-# Explicit lower-layer dependencies keep imports one-way.
-from .workspace import (
-    _env_flag,
-    _env_int,
-)
-from .runtime import (
     _create_memfd_backed_payload_path,
     allocate_workspace_array,
     array_nbytes,
@@ -66,6 +52,7 @@ from .runtime import (
     copy_workspace_array,
     estimate_interpolation_workspace_bytes,
     flush_array,
+    interpolation_process_worker_active,
     numa_interleave_memory,
     open_raw_store_payload_writer,
     parallel_for_indices,
@@ -75,7 +62,14 @@ from .runtime import (
     raw_store_memfd_enabled,
     release_memfd_owners_under,
     runtime_telemetry,
+    runtime_telemetry_phase,
     should_use_in_memory_workspace,
+)
+
+# Explicit lower-layer dependencies keep imports one-way.
+from .workspace import (
+    _env_flag,
+    _env_int,
 )
 from .geometry import (
     ViewInfo,

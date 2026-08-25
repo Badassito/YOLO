@@ -95,10 +95,95 @@ class ImportRegressionTests(unittest.TestCase):
             assert not (native_modules & set(sys.modules)), native_modules & set(sys.modules)
             """
         )
-        for subsystem in ("topology", "interpolation", "outputs", "runtime"):
+        for subsystem in (
+            "topology",
+            "interpolation",
+            "outputs",
+            "runtime",
+            "intel_compression",
+            "intel_dsa",
+            "inference_backends",
+        ):
             with self.subTest(subsystem=subsystem):
                 completed = self.run_python("-c", program, subsystem)
                 self.assertEqual(completed.returncode, 0, completed.stdout)
+
+    def test_dependency_stubs_preserve_module_metadata_semantics(self) -> None:
+        program = textwrap.dedent(
+            """
+            import sys
+
+            from tools.smoke_import import install_stubs
+
+            install_stubs()
+            for name in ("cv2", "scipy", "scipy.ndimage", "tifffile", "tqdm"):
+                module = sys.modules[name]
+                assert module.__file__ is None or isinstance(module.__file__, str)
+                try:
+                    getattr(module, "__missing_stub_metadata__")
+                except AttributeError:
+                    pass
+                else:
+                    raise AssertionError(f"{name} fabricated missing dunder metadata")
+            """
+        )
+        completed = self.run_python("-c", program)
+        self.assertEqual(completed.returncode, 0, completed.stdout)
+
+    def test_split_feature_telemetry_reports_packaged_capabilities(self) -> None:
+        program = textwrap.dedent(
+            """
+            import sys
+
+            from tools.smoke_import import install_stubs
+
+            install_stubs()
+            from volume_tta import runtime
+
+            owner_names = {
+                "volume_tta.assembly",
+                "volume_tta.backprojection",
+                "volume_tta.interpolation",
+                "volume_tta.outputs",
+            }
+            assert not (owner_names & set(sys.modules)), owner_names & set(sys.modules)
+
+            class Capture:
+                def __init__(self):
+                    self.gauges = {}
+
+                def gauge(self, name, value):
+                    self.gauges[name] = value
+
+            capture = Capture()
+            runtime._record_runtime_feature_gauges(capture)
+            features = capture.gauges["features"]
+            expected = {
+                "raw_bbox_restored_sparse_members",
+                "crop_aware_low_quality_mirror",
+                "owned_nrrd_member_transfer",
+                "native_projection_callback",
+                "native_projected_layer_materializer",
+                "native_persistent_trt_ring",
+            }
+            assert all(features[name] is True for name in expected), features
+            assert not (owner_names & set(sys.modules)), owner_names & set(sys.modules)
+
+            from volume_tta import assembly, backprojection, interpolation, outputs
+
+            assert hasattr(interpolation.RawBBoxMaskStore, "iter_restored_sparse_members")
+            assert callable(outputs._resize_sparse_binary_crop_to_output_region)
+            assert hasattr(
+                outputs._MemberParallelGzipPayloadWriter,
+                "write_owned_known_nonzero",
+            )
+            assert callable(backprojection._emit_projection_block_callback)
+            assert callable(assembly.materialize_nrrd_view_layer)
+            assert backprojection._RESIDENT_TRT_PIPELINE_CACHE_NATIVE is True
+            """
+        )
+        completed = self.run_python("-c", program)
+        self.assertEqual(completed.returncode, 0, completed.stdout)
 
     def test_concurrent_first_imports_do_not_raise_importlib_deadlock(self) -> None:
         program = textwrap.dedent(

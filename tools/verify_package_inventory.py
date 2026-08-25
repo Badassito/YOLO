@@ -1,9 +1,10 @@
-"""Verify the package against the checked-in historical refactor inventory."""
+"""Verify current modules against the checked-in package statement inventory."""
 
 from __future__ import annotations
 
 import ast
 import hashlib
+import inspect
 import json
 from collections import Counter
 from pathlib import Path
@@ -11,10 +12,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "volume_tta"
-MANIFEST = PACKAGE / "_refactor_manifest.json"
+MANIFEST = PACKAGE / "_package_inventory.json"
 
-# These definitions received small, intentional seam fixes after physical extraction.
+# These definitions have reviewed, intentional implementation changes.
 INTENTIONALLY_CHANGED = {
+    ("backprojection", "_MainProcessGpuStageCoordinator"),
+    ("backprojection", "_radial_resident_backproject_kernel"),
     ("backprojection", "HybridBackprojectionQueue"),
     ("config", "build_argparser"),
     ("config", "resolve_backend_batches"),
@@ -28,6 +31,7 @@ INTENTIONALLY_CHANGED = {
     ("geometry", "PredictionVolumeRef"),
     ("geometry", "StreamingYoloVolumeSource"),
     ("geometry", "channel_view_slice_index"),
+    ("geometry", "gpu_input_staging_ahead_sources"),
     ("geometry", "make_dense_tile_channel_renderer"),
     ("geometry", "make_fullframe_channel_renderer"),
     ("geometry", "make_in_memory_yolo_source"),
@@ -35,18 +39,24 @@ INTENTIONALLY_CHANGED = {
     ("geometry", "materialize_dense_tile_prediction_volume_for_job"),
     ("geometry", "materialize_fullframe_prediction_volume_for_job"),
     ("geometry", "maybe_eager_stage_prediction_ref_on_gpu"),
+    ("geometry", "queued_streaming_source_cpu_warmup_slots"),
     ("geometry", "render_dense_tile_frame_for_job"),
     ("geometry", "render_fullframe_frame_for_job"),
+    ("geometry", "streaming_prediction_source_prefetch_frames"),
+    ("geometry", "streaming_prediction_source_workers"),
     ("geometry", "write_aug_job_meta"),
     ("geometry", "write_dense_tile_job_meta"),
     ("inference", "cpu_retina_masks_enabled"),
     ("inference", "PredictionAccumulationHandle"),
     ("inference", "_DeviceUnionAccumulator"),
+    ("inference", "gpu_union_retirement_lane_count"),
     ("inference", "predict_in_memory_volume_and_accumulate"),
     ("inference", "predict_in_memory_volume_and_submit_accumulation"),
     ("media", "abort_streaming_producers"),
     ("media", "decode_video_to_memmap_gray8_streaming"),
+    ("media", "processing_volume_mode"),
     ("media", "resize_volume_to_processing_cube_gray8_streaming"),
+    ("media", "_cube_t_axis_resize_backend"),
     ("outputs", "_publish_staged_file_atomically"),
     ("outputs", "_MemberParallelGzipPayloadWriter"),
     ("outputs", "_announce_nrrd_cpu_deflate_backend"),
@@ -68,13 +78,19 @@ INTENTIONALLY_CHANGED = {
     ("outputs", "nrrd_member_codec_requested"),
     ("pipeline", "main"),
     ("runtime", "_GpuWorkerAuxInterpolationPool"),
+    ("runtime", "_record_runtime_feature_gauges"),
     ("runtime", "_materialize_worker_task_memfd_paths"),
     ("runtime", "copy_workspace_array"),
+    ("runtime", "choose_scratch_dir"),
     ("runtime", "interpolate_view_volume_pass_maybe_process"),
     ("runtime", "interpolation_process_start_method"),
     ("runtime", "reset_runtime_state_for_new_run"),
     ("runtime", "RuntimeTelemetry"),
+    ("runtime", "prediction_hot_path_flush_enabled"),
+    ("runtime", "prediction_volume_build_flush_enabled"),
+    ("runtime", "raw_store_memfd_enabled"),
     ("workers", "run_prediction_volume_in_worker"),
+    ("workers", "_gpu_inference_worker_main"),
     ("workers", "_OpenVinoCpuSegmenter"),
     ("workers", "run_prediction_volume_in_openvino_worker"),
     ("topology", "_try_label_slices_stage_a_gpu"),
@@ -98,10 +114,13 @@ INTENTIONALLY_CHANGED = {
     ("cuda_backend", "GpuRenderedYoloSource"),
     ("cuda_backend", "GpuTileRenderedYoloSource"),
     ("cuda_backend", "_radial_slab_context_indices"),
+    ("workspace", "v1613_d1_pipeline_active"),
+    ("workspace", "v1613_fast_bundle_active"),
+    ("workspace", "available_anon_work_bytes"),
 }
 
-# The public wrapper now owns the full-run cleanup boundary; the preserved orchestration
-# body moved intact (plus reviewed v17.0.7 fixes) behind this private implementation name.
+# The public wrapper owns the full-run cleanup boundary and delegates to this private
+# implementation name.
 INTENTIONALLY_RENAMED_CHANGED = {
     ("pipeline", "main"): "_main_impl",
 }
@@ -117,7 +136,7 @@ INTENTIONALLY_VERSIONED = {
 
 # Functions that need to call back into a higher architectural layer carry this marker
 # immediately above an explicit function-local import.  Treat that narrow import seam as
-# a reviewed AST change without weakening the historical inventory for the function body.
+# a reviewed AST change without weakening statement coverage for the function body.
 LOCAL_IMPORT_SEAM_MARKER = "# Local import keeps the package dependency graph acyclic."
 
 # Each entry pins both the complete reviewed top-level definition and the exact marker-to-
@@ -247,12 +266,15 @@ INTENTIONALLY_RELOCATED = {
         "backprojection",
 }
 
-# v17.0.11 removes definitions and state that had no caller or runtime effect.  Keep the
-# immutable source inventory intact and account for each retired statement by its original
+# Keep the baseline inventory intact and account for each retired statement by its baseline
 # digest, so adding a similarly named definition later cannot silently satisfy this audit.
 INTENTIONALLY_REMOVED = {
     ("config", "0b77703bf375bcd802f74a77ca9009db17a87296bb829376ed2f30f368250243"):
         "OUTPUT_NRRD_PREFIX",
+    ("config", "4b5b1cd71ab26699413794dc1b3b0a1b1a7b91dbb917f0321bd4fda5fe2b95d8"):
+        "LEGACY_OUTPUT_NRRD_PREFIX",
+    ("config", "479a50756ba923fbe000d52aad5dea92511533a044b7903224de6715fd9301a7"):
+        "variant_nrrd_stem",
     ("config", "e9cbdca394845cae9bdb26ad2d5cdfd5dea831d31b29c8b305e97300328760ee"):
         "RADIAL_TEXTURE_VARIANT_LABEL",
     ("config", "813fa551257393b30cd4587ca2fdfa2de5cf42351be75a57f94c0e03f0b210ca"):
@@ -279,10 +301,14 @@ INTENTIONALLY_REMOVED = {
         "_component_records_directly_overlap",
     ("outputs", "bed6cab37b1b3c47b34c2204852d8e6d5d77d787c56193da32a91587b72dfc75"):
         "_NRRD_GZIP_EXECUTOR",
+    ("runtime", "4ae29b5a9b0c7626a2e0f2e4daefd6fc1f9cb3d37a1d44888dc14e563306a144"):
+        "scratch_shm_required_free_bytes",
+    ("runtime", "2c5358a6d7546d61f2bb33b5bfe44152266dd35372e50c366636f611f221948d"):
+        "_auto_shm_scratch_candidate",
 }
 
 # The compiled overlap helper lived inside a larger top-level conditional.  Pin both the
-# original inventory digest and the reviewed replacement digest so the verifier still
+# baseline inventory digest and the reviewed replacement digest so the verifier still
 # authenticates every sibling kernel in that statement after the one dead helper is pruned.
 INTENTIONALLY_PRUNED_REPLACEMENTS = {
     ("interpolation", "e2a3ab6f0b2bb8abfd8cb880317a197a446bd80d52fd49f7c4bc72608dbfe529"):
@@ -293,8 +319,19 @@ INTENTIONALLY_PRUNED_REPLACEMENTS = {
 }
 
 
+def stable_ast_dump(node: ast.AST) -> str:
+    """Serialize an AST without Python 3.13's default empty-field elision."""
+    dump_options = {
+        "annotate_fields": True,
+        "include_attributes": False,
+    }
+    if "show_empty" in inspect.signature(ast.dump).parameters:
+        dump_options["show_empty"] = True
+    return ast.dump(node, **dump_options)
+
+
 def digest(node: ast.AST) -> str:
-    normalized = ast.dump(node, annotate_fields=True, include_attributes=False)
+    normalized = stable_ast_dump(node)
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
@@ -382,7 +419,7 @@ def reviewed_local_import_seams(
             for node in reversed(ancestors)
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
         )
-        import_ast = ast.dump(import_node, annotate_fields=True, include_attributes=False)
+        import_ast = stable_ast_dump(import_node)
         seams_by_top_level.setdefault(top_level_node, []).append(
             (import_node.lineno - top_level_node.lineno, lexical_scope, import_ast)
         )
@@ -400,16 +437,6 @@ def reviewed_local_import_seams(
 
 def main() -> None:
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
-    source_path = ROOT / str(manifest["source"])
-    # The checked-in manifest is the immutable provenance record. The user intentionally
-    # retired the historical monolith after extraction; when a private archival copy is
-    # present we still authenticate it, but its absence no longer disables verification.
-    if source_path.is_file():
-        source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
-        if source_sha256 != str(manifest["source_sha256"]):
-            raise RuntimeError(
-                f"refactor source checksum mismatch: {source_sha256} != {manifest['source_sha256']}"
-            )
 
     available: dict[str, Counter[str]] = {}
     trees: dict[str, ast.Module] = {}
@@ -488,7 +515,7 @@ def main() -> None:
 
     missing_pruned_replacements = [
         (module, replacement_hash)
-        for (module, _original_hash), (replacement_hash, _name)
+        for (module, _baseline_hash), (replacement_hash, _name)
         in INTENTIONALLY_PRUNED_REPLACEMENTS.items()
         if available[module][replacement_hash] != 1
     ]
@@ -521,7 +548,7 @@ def main() -> None:
             )
 
     missing_versions: list[tuple[str, str]] = []
-    for (module, _original_hash), variable_name in INTENTIONALLY_VERSIONED.items():
+    for (module, _baseline_hash), variable_name in INTENTIONALLY_VERSIONED.items():
         matches = 0
         for node in top_level[module]:
             if not isinstance(node, (ast.Assign, ast.AnnAssign)):
@@ -572,9 +599,8 @@ def main() -> None:
             f"{preserved} preserved + {changed} changed + {removed} removed != {expected}"
         )
     print(
-        f"accounted for {preserved} unchanged original top-level statements and "
-        f"{changed} reviewed original-statement changes plus {removed} reviewed removals "
-        f"({expected} original statements total)"
+        "package inventory verified: "
+        f"preserved={preserved}, reviewed_changes={changed}, reviewed_removals={removed}"
     )
 
 

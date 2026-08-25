@@ -1,8 +1,4 @@
-"""Implementation subsystem extracted from the v17.0.5 volume TTA runtime.
-
-This physical split intentionally preserves the original numerical and scheduling
-behavior. Public coordination contracts live under ``inference_backends``.
-"""
+"""NRRD, TIFF, MKV, summary, and low-quality output writers."""
 
 from __future__ import annotations
 
@@ -49,29 +45,13 @@ import numpy as np
 from ._deps import _numba, cv2, tifffile, tqdm
 
 from .config import (
+    ChannelFormat,
     DEFAULT_CHANNEL_FORMAT,
     GIB,
-)
-from .runtime import (
-    runtime_telemetry,
-    runtime_telemetry_phase,
-)
-
-# Explicit lower-layer dependencies keep imports one-way.
-from .config import (
-    ChannelFormat,
     NRRD_SPACE,
     SCRIPT_BASENAME,
     _parse_token_list,
     resolve_channel_format,
-    variant_nrrd_stem,
-)
-from .workspace import (
-    _cpu_count,
-    _env_flag,
-    _env_float,
-    _env_int,
-    available_anon_work_bytes,
 )
 from .runtime import (
     _acquire_parallel_pool,
@@ -84,6 +64,17 @@ from .runtime import (
     flush_array,
     parallel_for_indices,
     parallel_for_indices_chunked,
+    runtime_telemetry,
+    runtime_telemetry_phase,
+)
+
+# Explicit lower-layer dependencies keep imports one-way.
+from .workspace import (
+    _cpu_count,
+    _env_flag,
+    _env_float,
+    _env_int,
+    available_anon_work_bytes,
 )
 from .media import (
     _linear_source_index,
@@ -1534,15 +1525,10 @@ def _nrrd_member_codec_spec(
     if name in {'qat', 'iaa'}:
         from .intel_compression import create_gzip_compressor, probe_capabilities
 
-        if name == 'qat' and _env_flag('YOLO_TTA_NRRD_QAT_SW_FALLBACK', False):
-            raise RuntimeError(
-                'YOLO_TTA_NRRD_QAT_SW_FALLBACK must remain disabled; '
-                'automatic fallback occurs only before an NRRD opens'
-            )
         capabilities = probe_capabilities(name)
         if name == 'qat':
             level = int(_nrrd_qat_level(capabilities))
-            numa_id = _nrrd_optional_numa_id('YOLO_TTA_NRRD_QAT_NUMA_ID')
+            numa_id = None
         else:
             level = int(_nrrd_iaa_level(capabilities))
             numa_id = _nrrd_optional_numa_id('YOLO_TTA_NRRD_IAA_NUMA_ID')
@@ -3270,7 +3256,7 @@ class NrrdLayerSink:
     ) -> None:
         self.nrrd_dir = Path(nrrd_dir)
         self.nrrd_dir.mkdir(parents=True, exist_ok=True)
-        self.stem = variant_nrrd_stem(stem)
+        self.stem = str(stem)
         self.output_shape = (int(output_shape_tyx[0]), int(output_shape_tyx[1]), int(output_shape_tyx[2]))
         self.max_workers = max(1, int(max_workers))
         self._lock = threading.Lock()

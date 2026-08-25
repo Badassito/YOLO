@@ -27,18 +27,6 @@ SUPPORTED_PLATFORM = sys.platform.startswith("linux") and SUPPORTED_MACHINE
 BACKENDS = ("qat", "qpl", "dsa")
 
 
-def _bool_override(name: str) -> Optional[bool]:
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
-        return None
-    normalized = raw.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    raise RuntimeError(f"{name} must be a boolean value, got {raw!r}")
-
-
 def _pkg_config(
     package: str,
     *,
@@ -130,17 +118,6 @@ def _requested_backends() -> tuple[set[str], bool]:
                 "VOLUME_TTA_BUILD_INTEL accepts auto, none, all, or a comma-separated "
                 f"subset of {BACKENDS}; unknown values: {sorted(unknown)}"
             )
-    for backend, variable in (
-        ("qat", "VOLUME_TTA_BUILD_QAT"),
-        ("qpl", "VOLUME_TTA_BUILD_QPL"),
-        ("dsa", "VOLUME_TTA_BUILD_DSA"),
-    ):
-        override = _bool_override(variable)
-        if override is True:
-            selected.add(backend)
-            explicit = True
-        elif override is False:
-            selected.discard(backend)
     return selected, explicit
 
 
@@ -188,16 +165,13 @@ def _intel_extensions() -> List[Extension]:
         return []
 
     auto = os.environ.get("VOLUME_TTA_BUILD_INTEL", "auto").strip().lower() in {"", "auto"}
-    qat_override = _bool_override("VOLUME_TTA_BUILD_QAT")
-    qpl_override = _bool_override("VOLUME_TTA_BUILD_QPL")
-    dsa_override = _bool_override("VOLUME_TTA_BUILD_DSA")
     qat_config = (
         _pkg_config("qatzip", minimum_version="1.3.2")
-        if auto and qat_override is not False and "qat" not in selected else None
+        if auto and "qat" not in selected else None
     )
     qpl_config = (
         _pkg_config("qpl", minimum_version="1.9.0")
-        if auto and qpl_override is not False and "qpl" not in selected else None
+        if auto and "qpl" not in selected else None
     )
     dsa_detected = _header_available("linux/idxd.h")
     if auto:
@@ -205,7 +179,7 @@ def _intel_extensions() -> List[Extension]:
             selected.add("qat")
         if qpl_config is not None:
             selected.add("qpl")
-        if dsa_override is not False and dsa_detected:
+        if dsa_detected:
             selected.add("dsa")
 
     extensions: List[Extension] = []

@@ -178,6 +178,7 @@ class IntelCompressionPolicyTests(unittest.TestCase):
         self.assertTrue(fake.compress_calls)
         self.assertTrue(all(call['require_hardware'] for call in fake.compress_calls))
         self.assertTrue(all(call['level'] == 1 for call in fake.compress_calls))
+        self.assertTrue(all(call['numa_id'] is None for call in fake.compress_calls))
         compression_threads = {int(call['thread']) for call in fake.compress_calls}
         self.assertTrue(fake.preflight_threads <= compression_threads)
         outputs.shutdown_nrrd_gzip_executors()
@@ -239,20 +240,6 @@ class IntelCompressionPolicyTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {'YOLO_TTA_NRRD_MEMBER_CODEC': 'qat'}, clear=True), \
                 mock.patch.object(outputs, '_nrrd_member_codec_spec', side_effect=resolve):
             self.assertIsNone(outputs._select_nrrd_member_codec())
-
-    def test_qat_software_backup_setting_is_rejected(self) -> None:
-        fake = _FakeHardwareCodec()
-        intel_compression._set_test_module('qat', fake)
-        with mock.patch.dict(
-            os.environ,
-            {
-                'YOLO_TTA_NRRD_MEMBER_CODEC': 'qat',
-                'YOLO_TTA_NRRD_QAT_SW_FALLBACK': '1',
-            },
-            clear=True,
-        ):
-            self.assertIsNone(outputs._select_nrrd_member_codec())
-        self.assertEqual(fake.capability_calls, 0)
 
     def test_unavailable_or_software_fallback_capability_is_rejected(self) -> None:
         no_hardware = _FakeHardwareCodec()

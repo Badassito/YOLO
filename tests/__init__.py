@@ -1,1 +1,1 @@
-"""Regression tests for the volume TTA refactor."""
+"""Regression tests for the volume TTA pipeline."""

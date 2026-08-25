@@ -1,8 +1,4 @@
-"""Implementation subsystem extracted from the v17.0.5 volume TTA runtime.
-
-This physical split intentionally preserves the original numerical and scheduling
-behavior. Public coordination contracts live under ``inference_backends``.
-"""
+"""D1 owner-GPU backprojection and packed source-space storage."""
 
 from __future__ import annotations
 
@@ -29,6 +25,15 @@ import numpy as np
 
 from .geometry import (
     ViewInfo,
+    is_radial_view,
+    is_tilted_radial_view,
+    is_tilted_view,
+    physical_view_name,
+    pretty_view_name,
+    radial_base_view_name,
+    radial_stack_length,
+    tilted_base_view_name,
+    tilted_stack_axis_length,
 )
 
 # Explicit lower-layer dependencies keep imports one-way.
@@ -44,17 +49,6 @@ from .runtime import (
     _memfd_backing_path_from_array,
     close_memmap_array,
     runtime_telemetry,
-)
-from .geometry import (
-    is_radial_view,
-    is_tilted_radial_view,
-    is_tilted_view,
-    physical_view_name,
-    pretty_view_name,
-    radial_base_view_name,
-    radial_stack_length,
-    tilted_base_view_name,
-    tilted_stack_axis_length,
 )
 from .interpolation import (
     CVOL_FORMAT,

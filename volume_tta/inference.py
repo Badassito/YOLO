@@ -1,8 +1,4 @@
-"""Implementation subsystem extracted from the v17.0.5 volume TTA runtime.
-
-This physical split intentionally preserves the original numerical and scheduling
-behavior. Public coordination contracts live under ``inference_backends``.
-"""
+"""Shared model execution, mask payloads, and inference cleanup."""
 
 from __future__ import annotations
 
@@ -47,6 +43,7 @@ from .config import (
 from .workspace import (
     _env_flag,
     _env_int,
+    v1613_fast_bundle_active,
 )
 from .runtime import (
     _acquire_parallel_pool,
@@ -1808,7 +1805,8 @@ def _cuda_graph_capture_context(torch_mod: object, graph: object, stream: object
 
 def gpu_union_retirement_lane_count() -> int:
     """Persistent event/copy lanes per CUDA worker."""
-    return max(1, min(3, _env_int('YOLO_TTA_GPU_UNION_RETIREMENT_LANES', 2)))
+    default = 3 if v1613_fast_bundle_active() else 2
+    return max(1, min(3, _env_int('YOLO_TTA_GPU_UNION_RETIREMENT_LANES', default)))
 
 def gpu_union_retirement_chunk_slices() -> int:
     """Slices staged by each half of a lane's persistent double buffer."""

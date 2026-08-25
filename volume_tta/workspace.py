@@ -1,8 +1,4 @@
-"""Implementation subsystem extracted from the v17.0.5 volume TTA runtime.
-
-This physical split intentionally preserves the original numerical and scheduling
-behavior. Public coordination contracts live under ``inference_backends``.
-"""
+"""Memory accounting and process-local pipeline settings."""
 
 from __future__ import annotations
 
@@ -113,8 +109,6 @@ def available_anon_work_bytes() -> int:
     mem_avail = int(info.get('MemAvailable', 0))
     swap_free = int(info.get('SwapFree', 0))
     node_avail = max(0, mem_avail + swap_free)
-    if _env_flag('YOLO_TTA_IGNORE_CGROUP_MEMORY_LIMIT', False):
-        return node_avail
     cgroup_headroom = _cgroup_memory_headroom_bytes()
     if cgroup_headroom is None:
         return node_avail
@@ -148,26 +142,37 @@ def _env_int(name: str, default: int) -> int:
     except Exception:
         return int(default)
 
+_V1613_FAST_BUNDLE_ACTIVE = False
+
+_V1613_D1_PIPELINE_ACTIVE = False
+
+def configure_pipeline_modes(*, fast_bundle_active: bool, d1_pipeline_active: bool) -> None:
+    """Publish resolved run modes within this process.
+
+    Spawned workers receive the resolved values in their initialization payload instead of
+    inheriting user-overridable environment state.
+    """
+    global _V1613_FAST_BUNDLE_ACTIVE, _V1613_D1_PIPELINE_ACTIVE
+    _V1613_FAST_BUNDLE_ACTIVE = bool(fast_bundle_active)
+    _V1613_D1_PIPELINE_ACTIVE = bool(
+        _V1613_FAST_BUNDLE_ACTIVE and d1_pipeline_active
+    )
+
 def v1613_fast_bundle_requested() -> bool:
     """Enable the command-specialized v16.1.3 pipeline unless explicitly disabled."""
     return _env_flag('YOLO_TTA_V1613_FAST_BUNDLE', True)
 
 def v1613_fast_bundle_active() -> bool:
     """True after ``main`` proves the current command satisfies the fast-path contract."""
-    return _env_flag('YOLO_TTA_V1613_BUNDLE_ACTIVE', False)
+    return bool(_V1613_FAST_BUNDLE_ACTIVE)
+
+def v1613_d1_owner_requested() -> bool:
+    """Whether an eligible run should use the D1 owner pipeline."""
+    return _env_flag('YOLO_TTA_V1613_D1_OWNER_PIPELINE', True)
 
 def v1613_d1_pipeline_active() -> bool:
     """Project, infer, treat 2D topology, and backproject inside each eligible GPU lease."""
-    # ``main`` publishes the resolved state before spawning CUDA workers.
-    if os.environ.get('YOLO_TTA_V1613_D1_PIPELINE_ACTIVE') is not None:
-        return bool(
-            v1613_fast_bundle_active()
-            and _env_flag('YOLO_TTA_V1613_D1_PIPELINE_ACTIVE', False)
-        )
-    return bool(
-        v1613_fast_bundle_active()
-        and _env_flag('YOLO_TTA_V1613_D1_OWNER_PIPELINE', True)
-    )
+    return bool(_V1613_FAST_BUNDLE_ACTIVE and _V1613_D1_PIPELINE_ACTIVE)
 
 def v1613_d1_backprojection_overlap_enabled() -> bool:
     """Allow fallback completed-view backprojection to borrow an idle worker GPU."""
@@ -259,4 +264,3 @@ def _cpu_count() -> int:
         return max(1, int(slurm_cpus))
 
     return max(1, int(os.cpu_count() or 1))
-

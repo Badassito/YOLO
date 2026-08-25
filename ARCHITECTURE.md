@@ -1,6 +1,6 @@
 # Volume TTA architecture
 
-The `GPT-5.6-Sol-Ultra_v17.1.2_SLURM.py` filename remains a versioned compatibility
+The `GPT-5.6-Sol-Ultra_v17.1.3_SLURM.py` filename remains a versioned compatibility
 launcher. The implementation lives in the importable `volume_tta` package so spawned
 processes resolve worker functions and data types through canonical module paths.
 
@@ -32,19 +32,17 @@ processes resolve worker functions and data types through canonical module paths
 SciPy, Ultralytics, CUDA, OpenVINO or future accelerator runtimes. The compatibility
 launcher and `python -m volume_tta` both use `volume_tta.__main__.run()`.
 
-The physical split preserves the original numerical functions while enforcing an acyclic
-eager import graph. Lower-level subsystems are imported explicitly; the small number of
-callbacks into a higher-level subsystem use a function-local import. This keeps every
-module independently importable, including concurrent first imports, without a global
-symbol registry or wildcard-import facade.
+The package enforces an acyclic eager import graph. Lower-level subsystems are imported
+explicitly; the small number of callbacks into a higher-level subsystem use a function-local
+import. This keeps every module independently importable, including concurrent first
+imports, without a global symbol registry or wildcard-import facade.
 
 ## Backend boundary
 
 `volume_tta.inference_backends` contains dependency-free control-plane contracts. The
-current CUDA/OpenVINO scheduler has not been rewritten in this refactor; its tuned leasing
-and hybrid policy remains behaviorally unchanged. Future scheduler work should adapt those
-workers to `InferenceBackend` rather than adding another backend-specific branch to
-`pipeline.main()`.
+current CUDA/OpenVINO scheduler owns tuned leasing and hybrid policy. Future scheduler work
+should adapt those workers to `InferenceBackend` rather than adding another backend-specific
+branch to `pipeline.main()`.
 
 The scheduler-facing unit is an `ExecutionTarget`, not a device or process:
 
@@ -83,21 +81,18 @@ CUDA behavior.
 
 ## Verification
 
-The refactor manifest records the AST digest of all 1,133 historical top-level executable
-statements. The original monolith was intentionally retired after the manifest was
-checked in; `tools/verify_refactor.py` now verifies the package against that immutable
-inventory without requiring the deleted source file. Reviewed post-refactor seams are
-listed explicitly in the verifier rather than hidden by regenerating the manifest. The
-test suite also covers dependency-light CLI/config imports, configuration parsing,
+The test suite covers dependency-light CLI/config imports, configuration parsing,
 cycle-safe package imports, accelerator policy/lifecycle, and collective-ready backend
-contracts.
+contracts. The checked-in package statement inventory verifies unchanged definitions,
+reviewed implementation changes, retired bindings, and explicitly reviewed local-import
+seams.
 
 Run the dependency-light checks with:
 
 ```powershell
 python -m unittest discover -s tests -v
-python tools/verify_refactor.py
 python tools/smoke_import.py
+python tools/verify_package_inventory.py
 ```
 
 Hardware-backed CUDA, TensorRT, OpenVINO, QAT, IAA, DSA and full data/model parity tests

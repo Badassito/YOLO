@@ -1,15 +1,10 @@
-"""Implementation subsystem extracted from the v17.0.5 volume TTA runtime.
-
-This physical split intentionally preserves the original numerical and scheduling
-behavior. Public coordination contracts live under ``inference_backends``.
-"""
+"""Cartesian, radial, and tilted backprojection implementations."""
 
 from __future__ import annotations
 
 import argparse
 import gc
 import math
-import os
 import sys
 import threading
 import time
@@ -40,37 +35,6 @@ from .config import (
 )
 from .geometry import (
     ViewInfo,
-)
-from .runtime import (
-    runtime_telemetry_phase,
-)
-
-# Explicit lower-layer dependencies keep imports one-way.
-from .workspace import (
-    _cpu_count,
-    _env_flag,
-    _env_float,
-    _env_int,
-    proto_hole_treatment_mode,
-    proto_hole_treatment_radius,
-    v1613_d1_backprojection_overlap_enabled,
-)
-from .runtime import (
-    _acquire_parallel_pool,
-    _release_parallel_pool,
-    allocate_workspace_array,
-    array_nbytes,
-    choose_slice_parallel_workers,
-    close_memmap_array,
-    close_memmap_array_without_flush,
-    flush_array,
-    gpu_worker_aux_interpolation_pool,
-    parallel_for_indices,
-    parallel_for_indices_chunked,
-    parallel_map_unordered,
-    runtime_telemetry,
-)
-from .geometry import (
     _affine2x3_to_3x3,
     _cupy_external_stream,
     build_affine,
@@ -87,6 +51,33 @@ from .geometry import (
     tilted_stack_axis_length,
     view_processing_plane_shape,
     view_uses_inference_processing_grid,
+)
+from .runtime import (
+    _acquire_parallel_pool,
+    _release_parallel_pool,
+    allocate_workspace_array,
+    array_nbytes,
+    choose_slice_parallel_workers,
+    close_memmap_array,
+    close_memmap_array_without_flush,
+    flush_array,
+    gpu_worker_aux_interpolation_pool,
+    parallel_for_indices,
+    parallel_for_indices_chunked,
+    parallel_map_unordered,
+    runtime_telemetry,
+    runtime_telemetry_phase,
+)
+
+# Explicit lower-layer dependencies keep imports one-way.
+from .workspace import (
+    _cpu_count,
+    _env_flag,
+    _env_float,
+    _env_int,
+    proto_hole_treatment_mode,
+    proto_hole_treatment_radius,
+    v1613_d1_backprojection_overlap_enabled,
 )
 from .inference import (
     ModelInputChannelMismatchError,
@@ -639,16 +630,7 @@ class _MainProcessGpuStageCoordinator:
                 int(idx) for idx in self._worker_devices
                 if 0 <= int(idx) < int(count)
             )
-            eligible_devices = configured if configured else list(range(count))
-            explicit = os.environ.get('YOLO_TTA_GPU_BACKPROJECT_DEVICE', '').strip()
-            if explicit:
-                try:
-                    requested = int(explicit)
-                except Exception:
-                    return None
-                candidates = [requested] if requested in eligible_devices else []
-            else:
-                candidates = list(eligible_devices)
+            candidates = configured if configured else list(range(count))
             if not candidates:
                 return None
 
@@ -2355,7 +2337,6 @@ def _radial_resident_backproject_kernel() -> Optional[object]:
         _RADIAL_RESIDENT_BACKPROJECT_KERNEL = argparse.Namespace(
             cp=cp,
             module=module,
-            kernel=kernel_azmajor,  # compatibility alias
             kernel_azmajor=kernel_azmajor,
             kernel_tmajor=module.get_function('radial_backproject_tmajor_u8'),
             transpose=module.get_function('radial_azmajor_to_tmajor_u8'),

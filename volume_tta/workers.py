@@ -1,8 +1,4 @@
-"""Implementation subsystem extracted from the v17.0.5 volume TTA runtime.
-
-This physical split intentionally preserves the original numerical and scheduling
-behavior. Public coordination contracts live under ``inference_backends``.
-"""
+"""Persistent OpenVINO and CUDA worker entry points."""
 
 from __future__ import annotations
 
@@ -26,7 +22,20 @@ from typing import (
 import numpy as np
 from ._deps import cv2
 
-from .cuda_backend import gpu_worker_fused_preflight_specs
+from .cuda_backend import (
+    GpuRenderedYoloSource,
+    GpuTileRenderedYoloSource,
+    _WORKER_TILTED_RADIAL_CPU_WARNED,
+    _init_worker_gpu_render_engine,
+    _radial_slab_channel_renderer,
+    _radial_slab_context_indices,
+    _wait_for_cube_ready_sentinel,
+    _worker_gpu_render_engine,
+    _worker_render_callable,
+    gpu_worker_fused_preflight_specs,
+    open_existing_gray_memmap,
+    set_gpu_worker_fused_preflight_specs,
+)
 
 # Explicit lower-layer dependencies keep imports one-way.
 from .config import (
@@ -46,6 +55,7 @@ from .runtime import (
     cpu_inference_supports_view,
     initialize_runtime_observability,
 )
+from .workspace import configure_pipeline_modes
 from .geometry import (
     AugJob,
     BatchResultFrameSpec,
@@ -88,19 +98,6 @@ from .inference import (
     set_angle_variant_gpu_fastpath,
     set_retina_mask_processor,
     validate_yolo_model_input_channels,
-)
-from .cuda_backend import (
-    GpuRenderedYoloSource,
-    GpuTileRenderedYoloSource,
-    _WORKER_TILTED_RADIAL_CPU_WARNED,
-    _init_worker_gpu_render_engine,
-    _radial_slab_channel_renderer,
-    _radial_slab_context_indices,
-    _wait_for_cube_ready_sentinel,
-    _worker_gpu_render_engine,
-    _worker_render_callable,
-    open_existing_gray_memmap,
-    set_gpu_worker_fused_preflight_specs,
 )
 from .cuda_d1 import (
     _d1_backproject_kernels,
@@ -1644,9 +1641,12 @@ def _gpu_inference_worker_main(
     try:
         # Pin the process to its physical GPU before any CUDA context is created, so the model and
         # all tensors live on that device and never contend with the other workers' GPUs. The
-        # logical --device index is remapped through the inherited CUDA_VISIBLE_DEVICES list
-        # .
+        # logical --device index is remapped through the inherited CUDA_VISIBLE_DEVICES list.
         os.environ['CUDA_VISIBLE_DEVICES'] = _pin_cuda_visible_device_token(int(gpu_index))
+        configure_pipeline_modes(
+            fast_bundle_active=bool(init_dict.get('fast_bundle_active', False)),
+            d1_pipeline_active=bool(init_dict.get('d1_pipeline_active', False)),
+        )
         initialize_runtime_observability()
         # pin every thread of this worker to its GPU's NUMA node BEFORE any
         # CUDA/model work, so allocator arenas, pinned staging and TRT host scratch land

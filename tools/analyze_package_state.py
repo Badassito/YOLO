@@ -1,4 +1,4 @@
-"""Report mutable module globals read across extracted subsystem boundaries."""
+"""Report mutable module globals read across subsystem boundaries."""
 
 from __future__ import annotations
 

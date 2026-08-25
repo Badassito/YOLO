@@ -1,8 +1,4 @@
-"""Implementation subsystem extracted from the v17.0.5 volume TTA runtime.
-
-This physical split intentionally preserves the original numerical and scheduling
-behavior. Public coordination contracts live under ``inference_backends``.
-"""
+"""View geometry, affine transforms, slicing, and render sources."""
 
 from __future__ import annotations
 
@@ -40,14 +36,10 @@ import numpy as np
 from ._deps import cv2
 
 from .config import (
+    CARTESIAN_VIEW_TOKENS,
     ChannelFormat,
     DEFAULT_CHANNEL_FORMAT,
     GIB,
-)
-
-# Explicit lower-layer dependencies keep imports one-way.
-from .config import (
-    CARTESIAN_VIEW_TOKENS,
     RADIAL_VIEW_TOKENS,
     TiltedViewGroup,
     _parse_comma_slot,
@@ -58,6 +50,8 @@ from .config import (
     resolve_cartesian_views,
     resolve_channel_format,
 )
+
+# Explicit lower-layer dependencies keep imports one-way.
 from .workspace import (
     _TILTED_IDENTITY_M,
     _cpu_count,
@@ -2725,7 +2719,7 @@ def gpu_input_staging_ahead_sources(default_queue_slots: int) -> int:
             return max(0, int(raw))
         except Exception:
             return 0
-    default_ahead = max(1, _env_int('YOLO_TTA_GPU_INPUT_STAGING_AHEAD_DEFAULT', max(1, _cpu_count())))
+    default_ahead = max(1, _cpu_count())
     return max(0, min(max(1, int(default_queue_slots)), int(default_ahead)))
 
 def _prediction_ref_has_gpu_input_staging(ref: PredictionVolumeRef) -> bool:
@@ -2787,22 +2781,18 @@ def queued_streaming_source_cpu_warmup_slots(default_queue_slots: int) -> int:
             return max(0, int(raw))
         except Exception:
             return 0
-    default_slots = max(1, _env_int('YOLO_TTA_STREAMING_SOURCE_WARMUP_DEFAULT', max(2, min(8, _cpu_count()))))
+    default_slots = max(2, min(8, _cpu_count()))
     return max(0, min(max(1, int(default_queue_slots)), int(default_slots)))
 
 def streaming_prediction_source_prefetch_frames(batch_size: int) -> int:
     explicit = _env_int('YOLO_TTA_STREAMING_SOURCE_PREFETCH_FRAMES', 0)
     if explicit > 0:
         return max(1, int(explicit))
-    batches = max(1, _env_int('YOLO_TTA_STREAMING_SOURCE_PREFETCH_BATCHES', 32))
-    max_frames = max(1, _env_int('YOLO_TTA_STREAMING_SOURCE_PREFETCH_MAX_FRAMES', 2048))
-    return max(1, min(int(max_frames), max(int(batch_size), int(batch_size) * int(batches))))
+    return max(1, min(2048, max(int(batch_size), int(batch_size) * 32)))
 
 def streaming_prediction_source_workers(default_workers: int, num_frames: int) -> int:
     """Resolve the render-worker budget for one streaming source, capped by its frame count."""
-    full_cpu_default = max(1, _env_int('YOLO_TTA_STREAMING_SOURCE_DEFAULT_WORKERS', max(1, _cpu_count())))
-    min_workers = max(1, _env_int('YOLO_TTA_STREAMING_SOURCE_MIN_WORKERS', full_cpu_default))
-    default_resolved = max(1, int(default_workers), int(min_workers), int(full_cpu_default))
+    default_resolved = max(1, int(default_workers), int(_cpu_count()))
     requested = _env_int('YOLO_TTA_STREAMING_SOURCE_WORKERS', int(default_resolved))
     return choose_slice_parallel_workers(max(1, int(requested)), max(1, int(num_frames)))
 

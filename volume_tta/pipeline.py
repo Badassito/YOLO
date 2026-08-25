@@ -1,8 +1,4 @@
-"""Implementation subsystem extracted from the v17.0.5 volume TTA runtime.
-
-This physical split intentionally preserves the original numerical and scheduling
-behavior. Public coordination contracts live under ``inference_backends``.
-"""
+"""Top-level pipeline orchestration and scheduler lifecycle."""
 
 from __future__ import annotations
 
@@ -63,12 +59,13 @@ from .config import (
 )
 from .workspace import (
     _cpu_count,
-    _env_flag,
     _env_float,
     _env_int,
     available_anon_work_bytes,
+    configure_pipeline_modes,
     radial_source_mode,
     v1613_d1_backprojection_overlap_enabled,
+    v1613_d1_owner_requested,
     v1613_fast_bundle_requested,
 )
 from .runtime import (
@@ -264,7 +261,6 @@ from .cuda_d1 import (
     _nrrd_layer_key,
     archive_or_delete_binary_volume_storage,
     close_raw_store_or_memmap_volume,
-    d1_owner_pipeline_enabled,
     raw_bbox_nrrd_layers_enabled,
     tile_dense_worker_result_limit_bytes,
     tile_dense_worker_result_limit_tasks,
@@ -480,6 +476,7 @@ def main() -> None:
     _ACTIVE_PIPELINE_RUN_RESOURCES = resources
     failed = True
     try:
+        configure_pipeline_modes(fast_bundle_active=False, d1_pipeline_active=False)
         reset_streaming_state_for_new_run()
         reset_runtime_state_for_new_run()
         _main_impl()
@@ -538,6 +535,7 @@ def main() -> None:
         except Exception:
             pass
         _ACTIVE_PIPELINE_RUN_RESOURCES = None
+        configure_pipeline_modes(fast_bundle_active=False, d1_pipeline_active=False)
         _PIPELINE_RUN_LOCK.release()
 
 def _main_impl() -> None:
@@ -1094,7 +1092,7 @@ def _main_impl() -> None:
     nrrd_layers_needed = bool(save_nrrd_enabled)
     centerline_audit_nrrd_needed = bool(centerline_filter_enabled)
     nrrd_sink_needed = bool(nrrd_layers_needed or centerline_audit_nrrd_needed)
-    keep_temp_artifacts = bool(_env_flag('YOLO_TTA_KEEP_TEMP', False))
+    keep_temp_artifacts = False
 
     out_dir = Path(args.output).expanduser().resolve() if args.output else (Path.cwd() / input_path.stem)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1282,9 +1280,8 @@ def _main_impl() -> None:
             print(f'v13.0.0 processing geometry: approximately-cubic (default), input already within 5% cube tolerance ({processing_shape}).')
         else:
             print(
-                'v13.0.0 processing geometry: native decoded volume (YOLO_TTA_PROCESSING_VOLUME_MODE=native), no cube resize. '
-                f'input/processing shape (t,Y,X)={processing_shape}; approximately-cubic target would have been {legacy_cube_shape}. '
-                'Unset YOLO_TTA_PROCESSING_VOLUME_MODE to use the default approximately-cubic working geometry.'
+                'v13.0.0 processing geometry: native decoded volume, no cube resize. '
+                f'input/processing shape (t,Y,X)={processing_shape}; approximately-cubic target would have been {legacy_cube_shape}.'
             )
 
     T, H, W = (int(processing_shape[0]), int(processing_shape[1]), int(processing_shape[2]))
@@ -1297,21 +1294,12 @@ def _main_impl() -> None:
             'requires processing XY to equal source XY (only the T axis may be cube-rescaled)'
         )
     v1613_bundle_active = bool(not v1613_bundle_reasons)
-    os.environ['YOLO_TTA_V1613_BUNDLE_ACTIVE'] = '1' if v1613_bundle_active else '0'
-    # This variable is a parent-to-worker resolved-state publication, not a user input.
-    # Clear inherited worker state before resolving this run's canonical request.
-    os.environ.pop('YOLO_TTA_V1613_D1_PIPELINE_ACTIVE', None)
-    if v1613_bundle_active:
-        # v16.1.8: the fast bundle keeps hardware-linear texture sampling. The pointer
-        # mode (nearest_xy_linear_t) benchmarked no faster on the standard command, so it
-        # is opt-in for VRAM-constrained volumes rather than the bundle default.
-        os.environ.setdefault('YOLO_TTA_RADIAL_SOURCE_MODE', 'texture_linear')
-        os.environ.setdefault('YOLO_TTA_PROTO_HOLE_TREATMENT', 'close')
-        os.environ.setdefault('YOLO_TTA_PROTO_HOLE_RADIUS', '2')
-        os.environ.setdefault('YOLO_TTA_GPU_UNION_RETIREMENT_LANES', '3')
-    v1613_d1_owner_active = bool(v1613_bundle_active and d1_owner_pipeline_enabled())
-    os.environ['YOLO_TTA_V1613_D1_PIPELINE_ACTIVE'] = (
-        '1' if v1613_d1_owner_active else '0'
+    v1613_d1_owner_active = bool(
+        v1613_bundle_active and v1613_d1_owner_requested()
+    )
+    configure_pipeline_modes(
+        fast_bundle_active=bool(v1613_bundle_active),
+        d1_pipeline_active=bool(v1613_d1_owner_active),
     )
     if v1613_d1_owner_active:
         # D1 supersedes the 25-39 GiB host direct-union workspace entirely.
@@ -1441,8 +1429,8 @@ def _main_impl() -> None:
         }, indent=2)
     )
 
-    # Fold each Radial transformed stack/diameter to --imgsz unless explicitly disabled.
-    radial_fold_raster = int(args.imgsz) if _env_flag('YOLO_TTA_RADIAL_FOLD_IMGSZ', True) else 0
+    # Fold each Radial transformed stack/diameter to the requested model raster.
+    radial_fold_raster = int(args.imgsz)
     physical_views = get_view_infos(
         T=T,
         H=H,
@@ -1912,8 +1900,7 @@ def _main_impl() -> None:
     direct_union_backing_leases: Dict[Tuple[str, str], _DirectUnionBackingLease] = {}
     # Requested NRRD components already form an immutable terminal-union backing. Without
     # --save nrrd, one private pathname-backed final-view cvol is materialized instead.
-    # Either representation lets the dense canvas retire; KEEP_TEMP preserves the legacy
-    # dense diagnostics contract. Activate direct-union byte/view admission whenever that
+    # Either representation lets the dense canvas retire. Activate direct-union byte/view admission whenever that
     # bounded retirement path is authoritative.
     component_ref_dense_retirement_active = bool(not keep_temp_artifacts)
     direct_union_sparse_retirement_active = bool(component_ref_dense_retirement_active)
@@ -5151,7 +5138,7 @@ def _main_impl() -> None:
             return
         _publish_gpu_worker_admissible_backlog()
         per_gpu = (
-            max(1, min(4, _env_int('YOLO_TTA_V1613_D1_DISPATCH_WINDOW_PER_GPU', 2)))
+            max(1, min(4, _env_int('YOLO_TTA_GPU_WORKER_DISPATCH_WINDOW_PER_GPU', 2)))
             if bool(v1613_d1_owner_active) else max(
                 1, _env_int('YOLO_TTA_GPU_WORKER_DISPATCH_WINDOW_PER_GPU', 2),
             )
@@ -5591,6 +5578,8 @@ def _main_impl() -> None:
             'input_channels': int(channel_format.channel_count),
             'channel_token': str(channel_format.token),
             'retina_processor': str(retina_processor),
+            'fast_bundle_active': bool(v1613_bundle_active),
+            'd1_pipeline_active': bool(v1613_d1_owner_active),
             'cv2_threads': max(1, _env_int('YOLO_TTA_GPU_WORKER_CV2_THREADS', 1)),
             # angle-variant GPU fast-path (min_conf None when inactive) + min_radius.
             'angle_variant_gpu_fastpath_min_conf': angle_variant_gpu_fastpath_min_conf_value,
@@ -5820,8 +5809,7 @@ def _main_impl() -> None:
                 )
         elif gpu_worker_process_active and gpu_cube_resize_enabled() and bool(cube_resize_will_apply) and (volume_rgb is not input_volume_rgb):
             print(
-                'v13.3.9 (E3): native-t residency bypassed because the cube resize changes X/Y '
-                'or uses YOLO_TTA_CUBE_T_RESIZE_BACKEND=slice_exact; waiting for the exact cube '
+                'v13.3.9 (E3): native-t residency bypassed because the cube resize changes X/Y; waiting for the exact cube '
                 'volume before worker rendering.'
             )
         if not source_volume_ready_async:
@@ -6138,8 +6126,8 @@ def _main_impl() -> None:
             largest_tile_result = int(max(tile_result_sizes))
             if bool(keep_temp_artifacts):
                 print(
-                    'Warning: YOLO_TTA_KEEP_TEMP=1 retains every dense tile worker result for '
-                    'diagnostics; v16.4.3 tile-result backpressure and immediate dense-file '
+                    'Warning: retaining temporary artifacts keeps every dense tile worker result for '
+                    'diagnostics; tile-result backpressure and immediate dense-file '
                     f'retirement are intentionally disabled (largest result={largest_tile_result / GIB:.2f} GiB).'
                 )
             else:

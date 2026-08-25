@@ -1,8 +1,4 @@
-"""Implementation subsystem extracted from the v17.0.5 volume TTA runtime.
-
-This physical split intentionally preserves the original numerical and scheduling
-behavior. Public coordination contracts live under ``inference_backends``.
-"""
+"""Video decoding, processing-volume resize, and source lifecycle."""
 
 from __future__ import annotations
 
@@ -30,10 +26,10 @@ from ._deps import cv2, tqdm
 
 from .config import (
     GIB,
+    RadialViewRequest,
 )
 
 # Explicit lower-layer dependencies keep imports one-way.
-from .config import RadialViewRequest
 from .workspace import (
     _cpu_count,
     _env_flag,
@@ -571,16 +567,7 @@ def compute_cube_resize_shape(
     )
 
 def processing_volume_mode() -> str:
-    """Return the canonical ``cube`` or ``native`` processing geometry."""
-    raw = os.environ.get('YOLO_TTA_PROCESSING_VOLUME_MODE', '').strip().lower()
-    if raw in ('', 'cube'):
-        return 'cube'
-    if raw == 'native':
-        return 'native'
-    print(
-        f"Warning: unsupported YOLO_TTA_PROCESSING_VOLUME_MODE={raw!r}; "
-        "expected 'cube' or 'native'; using 'cube'."
-    )
+    """Return the canonical processing geometry."""
     return 'cube'
 
 def should_resize_to_processing_cube(input_shape: Tuple[int, int, int], cube_shape: Tuple[int, int, int]) -> bool:
@@ -615,12 +602,8 @@ def _cube_t_axis_resize_backend() -> str:
  ``slab`` is the default because the common 3072x3072x1930 -> approximately
  cubic case does not need XY resampling. It processes row slabs through
  OpenCV's native vertical resize and fans the slabs out across Python worker
- threads. ``slice_exact`` preserves the older endpoint-aligned per-output-slice
- interpolation path for regression testing."""
-    backend = os.environ.get('YOLO_TTA_CUBE_T_RESIZE_BACKEND', 'slab').strip().lower()
-    if backend not in {'slab', 'slice_exact'}:
-        backend = 'slab'
-    return backend
+ threads."""
+    return 'slab'
 
 def _cube_t_axis_slab_rows(in_w: int, workers: int) -> int:
     """Choose a bounded row-slab height for T-axis-only cubic resizing."""

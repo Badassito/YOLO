@@ -1,8 +1,4 @@
-"""Implementation subsystem extracted from the v17.0.5 volume TTA runtime.
-
-This physical split intentionally preserves the original numerical and scheduling
-behavior. Public coordination contracts live under ``inference_backends``.
-"""
+"""Completed-view assembly, tile gates, smoothing, and output handoff."""
 
 from __future__ import annotations
 
@@ -28,15 +24,6 @@ from .config import (
     GIB,
 )
 from .runtime import (
-    runtime_telemetry_phase,
-)
-
-# Explicit lower-layer dependencies keep imports one-way.
-from .workspace import (
-    _env_flag,
-    _env_int,
-)
-from .runtime import (
     _interpolation_array_backing_path,
     allocate_workspace_array,
     choose_slice_parallel_workers,
@@ -49,6 +36,13 @@ from .runtime import (
     parallel_map_in_order,
     release_memfd_owners_under,
     runtime_telemetry,
+    runtime_telemetry_phase,
+)
+
+# Explicit lower-layer dependencies keep imports one-way.
+from .workspace import (
+    _env_flag,
+    _env_int,
 )
 from .geometry import (
     ViewInfo,

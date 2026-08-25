@@ -1,8 +1,4 @@
-"""Implementation subsystem extracted from the v17.0.5 volume TTA runtime.
-
-This physical split intentionally preserves the original numerical and scheduling
-behavior. Public coordination contracts live under ``inference_backends``.
-"""
+"""Slice labeling, union-find, and component metadata."""
 
 from __future__ import annotations
 
@@ -33,8 +29,18 @@ from .config import (
     GIB,
 )
 from .runtime import (
+    array_nbytes,
+    choose_slice_parallel_workers,
+    estimate_voidfill_workspace_bytes,
+    flush_array,
     interpolation_process_worker_active,
+    numa_interleave_memory,
+    parallel_for_indices_chunked,
+    parallel_map_unordered,
+    runtime_telemetry,
     runtime_telemetry_phase,
+    should_use_in_memory_workspace,
+    workspace_budget_summary,
 )
 
 # Explicit lower-layer dependencies keep imports one-way.
@@ -43,18 +49,6 @@ from .workspace import (
     _env_flag,
     _env_float,
     _env_int,
-)
-from .runtime import (
-    array_nbytes,
-    choose_slice_parallel_workers,
-    estimate_voidfill_workspace_bytes,
-    flush_array,
-    numa_interleave_memory,
-    parallel_for_indices_chunked,
-    parallel_map_unordered,
-    runtime_telemetry,
-    should_use_in_memory_workspace,
-    workspace_budget_summary,
 )
 from .inference import (
     _cv2_connected_components,
