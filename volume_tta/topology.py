@@ -756,7 +756,7 @@ def _validate_binary_slice_metadata(
             f'!= {(int(z_dim), 4)}'
         )
     # Empty slices must carry an empty bbox. Nonempty bboxes are clipped only after
-    # validating their ordering; silently accepting inverted metadata could drop anatomy.
+    # validating their ordering; silently accepting inverted metadata could drop valid foreground support.
     for z in range(int(z_dim)):
         y0, y1, x0, x1 = (int(v) for v in bbox_arr[int(z)])
         if not bool(any_arr[int(z)]):

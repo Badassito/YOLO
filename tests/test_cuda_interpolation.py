@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import importlib.util
 import math
 import os
 import sys
 import tempfile
+import threading
 import unittest
+import weakref
 from pathlib import Path
 from unittest import mock
 
@@ -28,7 +31,7 @@ def _module_is_available(name: str) -> bool:
 if not all(_module_is_available(name) for name in ('cv2', 'scipy', 'tifffile', 'tqdm')):
     install_stubs()
 
-from volume_tta import cuda_interpolation, interpolation, topology
+from volume_tta import cuda_interpolation, interpolation, runtime as runtime_helpers, topology
 from volume_tta.cuda_interpolation import (
     CudaInterpolationRenderer,
     _slice_job_placement,
@@ -123,9 +126,18 @@ class _NumpyDeviceRuntime:
     def __init__(self, *, fail_copy_to_host: bool = False) -> None:
         self.fail_copy_to_host = bool(fail_copy_to_host)
         self.freed = False
+        self._next_stream = 0
 
     @staticmethod
     def activate() -> object:
+        return contextlib.nullcontext()
+
+    def create_stream(self) -> object:
+        self._next_stream += 1
+        return int(self._next_stream)
+
+    @staticmethod
+    def activate_stream(_stream: object) -> object:
         return contextlib.nullcontext()
 
     @staticmethod
@@ -137,6 +149,25 @@ class _NumpyDeviceRuntime:
             raise RuntimeError('injected D2H failure')
         return np.array(value, copy=True)
 
+    def to_host_async(self, value: object, _stream: object) -> np.ndarray:
+        return self.to_host(value)
+
+    @staticmethod
+    def record_completion(_stream: object) -> object:
+        return contextlib.nullcontext()
+
+    @staticmethod
+    def make_stream_wait(_stream: object, _event: object) -> None:
+        return None
+
+    @staticmethod
+    def wait_completion(_event: object) -> None:
+        return None
+
+    @staticmethod
+    def synchronize_stream(_stream: object) -> None:
+        return None
+
     @staticmethod
     def mem_info() -> tuple[int, int]:
         return 8 * 1024 ** 3, 16 * 1024 ** 3
@@ -147,6 +178,57 @@ class _NumpyDeviceRuntime:
 
     def free_cached_memory(self) -> None:
         self.freed = True
+
+
+class _DeferredCompletion:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.release = threading.Event()
+        self.wait_started = threading.Event()
+        self.fail = bool(fail)
+
+    def synchronize(self) -> None:
+        self.wait_started.set()
+        if not self.release.wait(timeout=5.0):
+            raise RuntimeError('timed out waiting for injected stream completion')
+        if self.fail:
+            raise RuntimeError('injected asynchronous D2H failure')
+
+
+class _DeferredNumpyRuntime(_NumpyDeviceRuntime):
+    def __init__(self, *, fail_completion: bool = False) -> None:
+        super().__init__()
+        self.fail_completion = bool(fail_completion)
+        self.created_streams: list[object] = []
+        self.completions: list[_DeferredCompletion] = []
+        self._completion_condition = threading.Condition()
+
+    def create_stream(self) -> object:
+        stream = super().create_stream()
+        with self._completion_condition:
+            self.created_streams.append(stream)
+        return stream
+
+    def record_completion(self, _stream: object) -> object:
+        completion = _DeferredCompletion(fail=self.fail_completion)
+        with self._completion_condition:
+            self.completions.append(completion)
+            self._completion_condition.notify_all()
+        return completion
+
+    @staticmethod
+    def wait_completion(event: object) -> None:
+        event.synchronize()  # type: ignore[attr-defined]
+
+    def wait_for_completions(self, count: int) -> list[_DeferredCompletion]:
+        with self._completion_condition:
+            ready = self._completion_condition.wait_for(
+                lambda: len(self.completions) >= int(count), timeout=5.0,
+            )
+            if not ready:
+                raise AssertionError(
+                    f'expected {int(count)} queued completion(s), got {len(self.completions)}'
+                )
+            return list(self.completions)
 
 
 class _EdtFailingNdimage(_NumpyNdimage):
@@ -202,6 +284,7 @@ class CudaInterpolationConfigurationTests(unittest.TestCase):
             self.assertTrue(
                 cuda_interpolation.gpu_interpolation_render_autotune_enabled()
             )
+            self.assertEqual(cuda_interpolation.gpu_interpolation_stream_count(), 4)
 
         with mock.patch.dict(
             os.environ,
@@ -213,6 +296,13 @@ class CudaInterpolationConfigurationTests(unittest.TestCase):
         ):
             self.assertTrue(cuda_interpolation.gpu_interpolation_enabled())
             self.assertTrue(cuda_interpolation.gpu_interpolation_radius_enabled())
+
+        with mock.patch.dict(
+            os.environ,
+            {'YOLO_TTA_GPU_INTERPOLATION_STREAMS': '7'},
+            clear=True,
+        ):
+            self.assertEqual(cuda_interpolation.gpu_interpolation_stream_count(), 7)
 
         with mock.patch.dict(
             os.environ,
@@ -236,6 +326,45 @@ class CudaInterpolationConfigurationTests(unittest.TestCase):
 
 
 class CudaInterpolationRendererContractTests(unittest.TestCase):
+    def test_async_cupy_copy_targets_retained_pinned_host_storage(self) -> None:
+        allocations: list[bytearray] = []
+        calls: list[tuple[object, np.ndarray, object, bool]] = []
+
+        class _FakeCuda:
+            @staticmethod
+            def alloc_pinned_memory(size: int) -> bytearray:
+                allocation = bytearray(int(size))
+                allocations.append(allocation)
+                return allocation
+
+        class _FakeXp:
+            cuda = _FakeCuda()
+
+            @staticmethod
+            def asnumpy(
+                value: object, *, out: np.ndarray, stream: object, blocking: bool,
+            ) -> np.ndarray:
+                calls.append((value, out, stream, bool(blocking)))
+                out[...] = np.arange(out.size, dtype=out.dtype).reshape(out.shape)
+                return out
+
+        runtime = object.__new__(cuda_interpolation._CupyInterpolationRuntime)
+        runtime.xp = _FakeXp()
+        source = mock.Mock(shape=(2, 3), dtype=np.dtype(np.int16))
+        stream = object()
+
+        result = runtime.to_host_async(source, stream)
+
+        self.assertEqual(len(allocations), 1)
+        self.assertEqual(len(allocations[0]), 12)
+        self.assertIs(calls[0][0], source)
+        self.assertIs(calls[0][1], result)
+        self.assertIs(calls[0][2], stream)
+        self.assertFalse(calls[0][3])
+        np.testing.assert_array_equal(
+            result, np.arange(6, dtype=np.int16).reshape(2, 3),
+        )
+
     def test_factory_reclaims_torch_cache_before_cupy_admission(self) -> None:
         events: list[str] = []
 
@@ -521,6 +650,199 @@ class CudaInterpolationRendererContractTests(unittest.TestCase):
             renderer.render_slice(destination, [(plan, 1, 1)])
         np.testing.assert_array_equal(destination, before)
 
+    def test_distinct_destinations_enqueue_while_another_d2h_is_pending(self) -> None:
+        section = np.ones((3, 3), dtype=bool)
+        plan = _plan(
+            np.ones((3, 3), dtype=np.float32),
+            cached_sections=[None, section, None],
+        )
+        runtime = _DeferredNumpyRuntime()
+        renderer = CudaInterpolationRenderer(
+            runtime=runtime, cache_bytes=0, reserve_bytes=0, stream_count=2,
+        )
+        destinations = [
+            np.zeros((7, 7), dtype=np.uint8),
+            np.zeros((7, 7), dtype=np.uint8),
+        ]
+        results: list[object] = []
+        errors: list[BaseException] = []
+
+        def _render(index: int) -> None:
+            try:
+                results.append(renderer.render_slice(
+                    destinations[int(index)], [(plan, 1, 1)],
+                ))
+            except BaseException as exc:  # pragma: no cover - assertion reports detail
+                errors.append(exc)
+
+        first = threading.Thread(target=_render, args=(0,))
+        second = threading.Thread(target=_render, args=(1,))
+        first.start()
+        completions = runtime.wait_for_completions(1)
+        self.assertTrue(completions[0].wait_started.wait(timeout=5.0))
+        first_before_completion = destinations[0].copy()
+
+        second.start()
+        completions = runtime.wait_for_completions(2)
+        self.assertTrue(completions[1].wait_started.wait(timeout=5.0))
+        # The first thread is blocked outside the renderer lock. The second therefore
+        # acquired a distinct lease stream and enqueued its own D2H before either commit.
+        self.assertEqual(runtime.created_streams, [1, 2])
+        np.testing.assert_array_equal(destinations[0], first_before_completion)
+        np.testing.assert_array_equal(destinations[1], np.zeros_like(destinations[1]))
+
+        for completion in completions:
+            completion.release.set()
+        first.join(timeout=5.0)
+        second.join(timeout=5.0)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+        self.assertEqual(int(np.count_nonzero(destinations[0])), 9)
+        self.assertEqual(int(np.count_nonzero(destinations[1])), 9)
+        telemetry = renderer.telemetry()
+        self.assertEqual(int(telemetry['stream_peak']), 2)
+        self.assertEqual(int(telemetry['max_streams']), 2)
+
+    def test_uncached_morphology_executes_outside_the_renderer_lock(self) -> None:
+        plans = [
+            _plan(np.ones((5, 5), dtype=np.float32), cached_sections=[]),
+            _plan(np.ones((5, 5), dtype=np.float32), cached_sections=[]),
+        ]
+        renderer = CudaInterpolationRenderer(
+            runtime=_NumpyDeviceRuntime(), cache_bytes=0, reserve_bytes=0,
+            stream_count=2,
+        )
+        original_keep = renderer._keep_center_component_and_fill
+        guard = threading.Lock()
+        two_active = threading.Event()
+        active = 0
+        peak = 0
+
+        def _concurrent_keep(section: object, stream: object = None) -> object:
+            nonlocal active, peak
+            with guard:
+                active += 1
+                peak = max(int(peak), int(active))
+                if active >= 2:
+                    two_active.set()
+            try:
+                if not two_active.wait(timeout=5.0):
+                    raise AssertionError('uncached CUDA morphology remained lock-serialized')
+                return original_keep(section, stream=stream)
+            finally:
+                with guard:
+                    active -= 1
+
+        destinations = [
+            np.zeros((9, 9), dtype=np.uint8),
+            np.zeros((9, 9), dtype=np.uint8),
+        ]
+        errors: list[BaseException] = []
+
+        def _render(index: int) -> None:
+            try:
+                renderer.render_slice(
+                    destinations[int(index)], [(plans[int(index)], 1, 1)],
+                )
+            except BaseException as exc:  # pragma: no cover - assertion reports detail
+                errors.append(exc)
+
+        with mock.patch.object(
+            renderer, '_keep_center_component_and_fill', side_effect=_concurrent_keep,
+        ):
+            threads = [threading.Thread(target=_render, args=(index,)) for index in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5.0)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(peak, 2)
+        self.assertTrue(all(int(np.count_nonzero(dst)) == 25 for dst in destinations))
+
+    def test_inflight_cache_value_survives_cross_stream_eviction(self) -> None:
+        plan = _plan(
+            np.ones((3, 3), dtype=np.float32),
+            cached_sections=[None, None, None],
+        )
+        runtime = _DeferredNumpyRuntime()
+        renderer = CudaInterpolationRenderer(
+            runtime=runtime, cache_bytes=1024, reserve_bytes=0, stream_count=2,
+        )
+        cached_device_section = np.ones((3, 3), dtype=bool)
+        cached_ref = weakref.ref(cached_device_section)
+        renderer._cache_put(
+            ('section', id(plan.cached_sections), 1),
+            cached_device_section,
+            int(cached_device_section.nbytes),
+            (plan.cached_sections,),
+        )
+        del cached_device_section
+
+        destination = np.zeros((7, 7), dtype=np.uint8)
+        errors: list[BaseException] = []
+
+        def _render() -> None:
+            try:
+                renderer.render_slice(destination, [(plan, 1, 1)])
+            except BaseException as exc:  # pragma: no cover - assertion reports detail
+                errors.append(exc)
+
+        thread = threading.Thread(target=_render)
+        thread.start()
+        completion = runtime.wait_for_completions(1)[0]
+        self.assertTrue(completion.wait_started.wait(timeout=5.0))
+
+        renderer.release_plans((plan,))
+        gc.collect()
+        self.assertIsNotNone(
+            cached_ref(), 'in-flight stream lost its device cache owner after eviction',
+        )
+
+        completion.release.set()
+        thread.join(timeout=5.0)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(int(np.count_nonzero(destination)), 9)
+        gc.collect()
+        self.assertIsNone(cached_ref())
+
+    def test_async_completion_failure_preserves_host_transaction(self) -> None:
+        section = np.ones((3, 3), dtype=bool)
+        plan = _plan(
+            np.ones((3, 3), dtype=np.float32),
+            cached_sections=[None, section, None],
+        )
+        runtime = _DeferredNumpyRuntime(fail_completion=True)
+        renderer = CudaInterpolationRenderer(
+            runtime=runtime, cache_bytes=0, reserve_bytes=0, stream_count=1,
+        )
+        destination = np.zeros((7, 7), dtype=np.uint8)
+        before = destination.copy()
+        errors: list[BaseException] = []
+
+        def _render() -> None:
+            try:
+                renderer.render_slice(destination, [(plan, 1, 1)])
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=_render)
+        thread.start()
+        completion = runtime.wait_for_completions(1)[0]
+        self.assertTrue(completion.wait_started.wait(timeout=5.0))
+        np.testing.assert_array_equal(destination, before)
+        completion.release.set()
+        thread.join(timeout=5.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertRegex(str(errors[0]), 'injected asynchronous D2H failure')
+        np.testing.assert_array_equal(destination, before)
+
     def test_radius_failure_does_not_disable_gpu_rendering(self) -> None:
         section = np.ones((3, 3), dtype=bool)
         plan = _plan(
@@ -564,6 +886,60 @@ class CudaInterpolationRendererContractTests(unittest.TestCase):
         self.assertLessEqual(int(telemetry['cache_peak_bytes']), 60)
         self.assertLessEqual(int(telemetry['cache_live_bytes']), 60)
         self.assertEqual(sum(section is not None for section in plan.cached_sections), 7)
+
+    def test_radius_planners_execute_on_independent_stream_leases(self) -> None:
+        plans = [
+            _plan(np.ones((5, 5), dtype=np.float32), steps=2),
+            _plan(np.ones((5, 5), dtype=np.float32), steps=2),
+        ]
+        renderer = CudaInterpolationRenderer(
+            runtime=_NumpyDeviceRuntime(), cache_bytes=0, reserve_bytes=0,
+            stream_count=2,
+        )
+        original_section_radius = renderer._section_radius
+        guard = threading.Lock()
+        two_active = threading.Event()
+        active = 0
+        peak = 0
+
+        def _concurrent_radius(section: object) -> float:
+            nonlocal active, peak
+            with guard:
+                active += 1
+                peak = max(int(peak), int(active))
+                if active >= 2:
+                    two_active.set()
+            try:
+                if not two_active.wait(timeout=5.0):
+                    raise AssertionError('CUDA radius evaluation remained renderer-serialized')
+                return original_section_radius(section)
+            finally:
+                with guard:
+                    active -= 1
+
+        results: list[float] = []
+        errors: list[BaseException] = []
+
+        def _estimate(index: int) -> None:
+            try:
+                results.append(renderer.estimate_min_radius(plans[int(index)]))
+            except BaseException as exc:  # pragma: no cover - assertion reports detail
+                errors.append(exc)
+
+        with mock.patch.object(renderer, '_section_radius', side_effect=_concurrent_radius):
+            threads = [
+                threading.Thread(target=_estimate, args=(index,)) for index in range(2)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5.0)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+        self.assertEqual(peak, 2)
+        self.assertEqual(int(renderer.telemetry()['stream_peak']), 2)
 
     def test_device_only_section_cache_avoids_d2h_and_recomputes_after_eviction(self) -> None:
         plan = _plan(np.ones((5, 5), dtype=np.float32), steps=8)
@@ -698,6 +1074,7 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
         render_autotune: bool | None = False,
         exercise_radius_routing: bool = False,
         seed_count: int = 1,
+        workers: int = 1,
         planned_plans: list[interpolation.SliceBridgeRenderPlan] | None = None,
         plan_batch_budget_bytes: int | None = None,
     ):
@@ -818,7 +1195,7 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
                 interpolation_walk_back=0,
                 interpolation_candidates=1,
                 interpolate_min_radius=float(interpolate_min_radius),
-                workers=1,
+                workers=int(workers),
             )
         return mask, stats
 
@@ -850,6 +1227,78 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
         self.assertTrue(stats['gpu_interpolation_active'])
         self.assertEqual(int(stats['gpu_interpolation_batches']), 1)
         self.assertEqual(int(stats['gpu_interpolation_rendered_sections']), 1)
+
+    def test_painting_dispatches_disjoint_slices_up_to_renderer_stream_bound(self) -> None:
+        inner = CudaInterpolationRenderer(
+            runtime=_NumpyDeviceRuntime(), cache_bytes=0, reserve_bytes=0,
+            stream_count=2,
+        )
+
+        class _ConcurrentRenderer:
+            available = True
+            max_streams = 2
+
+            def __init__(self) -> None:
+                self._guard = threading.Lock()
+                self._two_active = threading.Event()
+                self.active = 0
+                self.peak = 0
+
+            def render_slice(self, *args: object, **kwargs: object):
+                with self._guard:
+                    self.active += 1
+                    self.peak = max(int(self.peak), int(self.active))
+                    if self.active >= 2:
+                        self._two_active.set()
+                try:
+                    if not self._two_active.wait(timeout=5.0):
+                        raise AssertionError('CUDA slice painting remained sequential')
+                    return inner.render_slice(*args, **kwargs)
+                finally:
+                    with self._guard:
+                        self.active -= 1
+
+            @staticmethod
+            def disable(exc: BaseException) -> bool:
+                return inner.disable(exc)
+
+            @staticmethod
+            def release_plans(plans: object) -> None:
+                inner.release_plans(plans)  # type: ignore[arg-type]
+
+            @staticmethod
+            def telemetry() -> dict[str, object]:
+                return inner.telemetry()
+
+            @staticmethod
+            def close() -> None:
+                inner.close()
+
+        renderer = _ConcurrentRenderer()
+
+        class _ProgressFixture:
+            def __init__(self, iterable: object = None, **_kwargs: object) -> None:
+                self.iterable = iterable
+
+            def __iter__(self):
+                return iter(self.iterable)  # type: ignore[arg-type]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            @staticmethod
+            def update(_count: int) -> None:
+                return None
+
+        with mock.patch.object(runtime_helpers, 'tqdm', _ProgressFixture):
+            mask, stats = self._run_pass(renderer, steps=4, workers=4)
+
+        self.assertEqual(renderer.peak, 2)
+        self.assertEqual(int(np.count_nonzero(mask[1:4])), 27)
+        self.assertEqual(int(stats['gpu_interpolation_rendered_sections']), 3)
 
     def test_render_autotune_selects_cpu_after_a_successful_gpu_probe(self) -> None:
         renderer = CudaInterpolationRenderer(

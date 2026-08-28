@@ -136,19 +136,16 @@ def _union_projected_layer_ref_into_volume(
             return
         if isinstance(src, RawBBoxMaskStore):
             index = src.index
-            scratch_tls = threading.local()
 
             def _or_store_slice(z_idx: int) -> None:
                 rec = index[int(z_idx)]
                 if int(rec['kind']) != 1:
                     return
-                buf = getattr(scratch_tls, 'buf', None)
-                if buf is None:
-                    buf = np.zeros((int(h_dim), int(w_dim)), dtype=np.uint8)
-                    scratch_tls.buf = buf
-                src.fill_decoded_slice_into(int(z_idx), buf)
-                y0 = int(rec['y0']); x0 = int(rec['x0']); y1 = int(rec['y1']); x1 = int(rec['x1'])
-                vol_mm[int(z_idx), y0:y1, x0:x1] |= buf[y0:y1, x0:x1]
+                decoded = src.decode_slice_crop(int(z_idx), dtype=np.uint8)
+                if decoded is None:
+                    return
+                y0, x0, y1, x1, crop = decoded
+                vol_mm[int(z_idx), int(y0):int(y1), int(x0):int(x1)] |= crop
 
             parallel_for_indices_chunked(
                 int(z_dim),
@@ -175,6 +172,131 @@ def _union_projected_layer_ref_into_volume(
             _close_nrrd_layer_source(src)
         finally:
             _drop_nrrd_raw_store_chunks_ram_cache(src)
+
+
+def _union_projected_layer_refs_grouped_into_volume(
+    refs: Sequence['NrrdLayerRef'],
+    vol_mm: np.ndarray,
+    *,
+    workers: int = 1,
+    desc: str = 'Grouped layer union',
+) -> None:
+    """OR projected layers into an existing union, grouping equal restore geometry.
+
+    This is the incremental counterpart of the G5 final-fusion path.  Unlike G5 it
+    performs read/modify/write on an already-populated destination, while retaining the
+    important ``N layers -> one resize`` property for reduced component stores.
+    """
+    refs_i = tuple(refs)
+    if not refs_i:
+        return
+    out_t, out_h, out_w = (int(value) for value in np.asarray(vol_mm).shape)
+    opened: List[Tuple['NrrdLayerRef', object]] = []
+    try:
+        for ref in refs_i:
+            if _nrrd_layer_ref_is_raw_bbox_store(ref):
+                src = RawBBoxMaskStore.open(
+                    ref.path,
+                    cache_payload_in_ram=False,
+                    mmap_payload=True,
+                )
+            else:
+                src = _open_nrrd_layer_ref(ref)
+                _madvise_array_mmap(src, 'MADV_SEQUENTIAL')
+            opened.append((ref, src))
+
+        native_sources: List[Tuple['NrrdLayerRef', object]] = []
+        restore_groups: List[
+            Tuple[Tuple[int, int, int], List[Tuple['NrrdLayerRef', object]]]
+        ] = []
+        grouped_by_geometry: 'OrderedDict[Tuple[int, int, int], List[Tuple[NrrdLayerRef, object]]]' = OrderedDict()
+        for ref, src in opened:
+            geometry = tuple(int(value) for value in _volume_shape_tuple(src))
+            if geometry == (out_t, out_h, out_w):
+                native_sources.append((ref, src))
+            elif fused_final_restore_geometry_groups_enabled():
+                grouped_by_geometry.setdefault(geometry, []).append((ref, src))
+            else:
+                restore_groups.append((geometry, [(ref, src)]))
+        restore_groups.extend(grouped_by_geometry.items())
+
+        grouped_layer_count = sum(len(group) for _geometry, group in restore_groups)
+        if grouped_layer_count:
+            print(
+                f'{desc}: {int(grouped_layer_count)} reduced layer(s) use '
+                f'{len(restore_groups)} geometry-group restore(s) per output slice; '
+                f'{len(native_sources)} output-native layer(s) remain direct.'
+            )
+
+        scratch_tls = threading.local()
+
+        def _scratch_map() -> Dict[Tuple[str, int, int], np.ndarray]:
+            buffers = getattr(scratch_tls, 'buffers', None)
+            if buffers is None:
+                buffers = {}
+                scratch_tls.buffers = buffers
+            return buffers
+
+        def _or_source_slice(dst: np.ndarray, src: object, src_z: int) -> None:
+            if isinstance(src, RawBBoxMaskStore):
+                rec = src.index[int(src_z)]
+                if int(rec['kind']) != 1:
+                    return
+                decoded = src.decode_slice_crop(int(src_z), dtype=np.uint8)
+                if decoded is None:
+                    return
+                y0, x0, y1, x1, crop = decoded
+                window = dst[int(y0):int(y1), int(x0):int(x1)]
+                np.bitwise_or(window, crop, out=window)
+                return
+            np.bitwise_or(dst, np.asarray(src[int(src_z)], dtype=np.uint8), out=dst)
+
+        def _merge_output_slice(out_z: int) -> None:
+            dst = np.asarray(vol_mm[int(out_z)])
+            for _ref, src in native_sources:
+                _or_source_slice(dst, src, int(out_z))
+
+            buffers = _scratch_map()
+            for geometry, group in restore_groups:
+                in_t, in_h, in_w = (int(value) for value in geometry)
+                key = ('restore', int(in_h), int(in_w))
+                reduced = buffers.get(key)
+                if reduced is None:
+                    reduced = np.zeros((int(in_h), int(in_w)), dtype=np.uint8)
+                    buffers[key] = reduced
+                else:
+                    reduced.fill(np.uint8(0))
+                source_zs = _restore_source_indices_for_output_z(
+                    int(in_t), int(out_t), int(out_z),
+                )
+                for _ref, src in group:
+                    for src_z in source_zs:
+                        _or_source_slice(reduced, src, int(src_z))
+                restored = _resize_union_plane_to_out_xy(
+                    reduced, int(out_h), int(out_w),
+                )
+                np.bitwise_or(dst, restored, out=dst)
+
+        worker_count = choose_slice_parallel_workers(int(workers), int(out_t))
+        band_slices = max(int(worker_count), min(256, int(out_t)))
+        for band0 in range(0, int(out_t), int(band_slices)):
+            band1 = min(int(out_t), int(band0) + int(band_slices))
+            parallel_for_indices_chunked(
+                int(band1 - band0),
+                lambda local_z, _band0=int(band0): _merge_output_slice(
+                    int(_band0) + int(local_z)
+                ),
+                max_workers=min(int(worker_count), int(band1 - band0)),
+                desc=desc,
+                show_progress=False,
+                target_chunks_per_worker=2,
+            )
+    finally:
+        for _ref, src in reversed(opened):
+            try:
+                _close_nrrd_layer_source(src)
+            finally:
+                _drop_nrrd_raw_store_chunks_ram_cache(src)
 
 def scheduler_push_drain_enabled() -> bool:
     """Push-drain the GPU-worker result queue instead of timeout polling.
@@ -1958,7 +2080,7 @@ def _v1401_embedded_plane_ridges(
 
  Equality with a 3x3 maximum is intentionally retained along flat medial
  plateaus. A second deterministic non-maximum-suppression step samples long
- plateaus instead of collapsing an in-plane airway branch to one point."""
+ plateaus instead of collapsing an in-plane medial-axis branch to one point."""
     foreground = np.asarray(mask_2d) != 0
     if not bool(np.any(foreground)):
         return [], False, False
@@ -2227,7 +2349,7 @@ def _v1401_embedded_centerline_arrays(
     # *surface* of a capped cylinder and creates false transverse centerlines;
     # three-way agreement retains its 1D axis while still following oblique tubes.
     # One-coarse-voxel sheets are also medial plateaus, but they are surface-like
-    # rather than usable lumen centerlines. Prefer a radius-resolved core and
+    # rather than usable longitudinal centerlines. Prefer a radius-resolved core and
     # relax only when that would otherwise make a genuinely thin object empty.
     ridge_consensus = foreground & (ridge_votes == 3)
     preferred_ridge_radius = 1.25 * min(float(v) for v in spacing_tyx)
@@ -2262,7 +2384,7 @@ def _v1401_embedded_centerline_arrays(
     del ridge_mask
 
     # A plane sweep perpendicular to a clean tube also traces a short path across
-    # its diameter. That is not a lumen centerline. Require tube-like
+    # its diameter. That is not a longitudinal centerline. Require tube-like
     # longitudinal persistence (path length >= 3 local radii), then suppress
     # near-duplicate paths emitted by the three orthogonal sweeps. Missed paths
     # are conservative: without centerline evidence they cannot trigger removal.
@@ -3412,10 +3534,10 @@ def _v14_cluster_centerline_events(
                 min_t = int(math.floor(float(np.min(center_t))))
                 max_t = int(math.ceil(float(np.max(center_t))))
             event_selected_indices: List[int] = []
-            # The requested failure pattern is bracketed by reliable anatomy.
+            # The requested failure pattern is bracketed by reliable foreground structure.
             # Unbracketed runs remain in event statistics but are too ambiguous
             # to produce a watershed/deletion proposal (volume ends, uncovered
-            # branches, and persistently eccentric valid anatomy are common).
+            # branches, and persistently eccentric valid foreground are common).
             if bool(clean_left and clean_right):
                 for item in actual:
                     event_selected_indices.append(len(selected))
@@ -3641,7 +3763,7 @@ def _v14_component_flank_is_clear(
     component = np.asarray(component_crop) != 0
     area = max(1, int(np.count_nonzero(component)))
     # Permit modest source-slice motion while testing continuity. Dilating the
-    # candidate support makes the guard conservative: nearby anatomy in *any* of
+    # candidate support makes the guard conservative: nearby foreground support in *any* of
     # the requested clean slices prevents deletion.
     default_motion = max(2, min(8, int(math.ceil(math.sqrt(float(context))))))
     motion = max(0, _env_int('YOLO_TTA_CENTERLINE_FLANK_MOTION_PX', default_motion))
@@ -3914,7 +4036,7 @@ def _v14_plan_components_and_write_sparse_audits(
         pass_index=int(pass_index),
         description=(
             'Marker-only artifact candidates for suspect components that contain protected '
-            'centerline anatomy or do not satisfy every automatic-removal guard. A triggered '
+            'centerline support or do not satisfy every automatic-removal guard. A triggered '
             'backend-reliability/evidence-cap guard records bounded evidence seeds instead of '
             'expanding an unreliable watershed basin.'
         ),

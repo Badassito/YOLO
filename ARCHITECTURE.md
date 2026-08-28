@@ -1,6 +1,6 @@
 # Volume TTA architecture
 
-The `GPT-5.6-Sol-Ultra_v17.1.4_SLURM.py` filename remains a versioned compatibility
+The `GPT-5.6-Sol-Ultra_v17.1.5_SLURM.py` filename remains a versioned compatibility
 launcher. The implementation lives in the importable `volume_tta` package so spawned
 processes resolve worker functions and data types through canonical module paths.
 
@@ -117,14 +117,27 @@ CUDA painting after admission, while `YOLO_TTA_GPU_INTERPOLATION=0` disables it 
 `YOLO_TTA_GPU_INTERPOLATION_REQUIRED=1` also forces CUDA and makes admission or execution
 failure fatal instead of replaying work on CPU.
 
+One interpolation GPU lease owns a bounded pool of non-default CuPy streams (four by
+default, configurable with `YOLO_TTA_GPU_INTERPOLATION_STREAMS`). Disjoint destination
+slices are dispatched in parallel up to that bound. The renderer lock covers shared cache
+metadata and enqueue ordering only: metrics and destination D2H copies use explicitly pinned
+host buffers with `blocking=False`, then one stream event is awaited without holding the
+lock. The host crop is committed only after that event succeeds, preserving the failed-batch
+CPU replay transaction. Cache entries
+carry producer events for cross-stream dependencies, and every lease retains the device
+objects it touched until its stream is quiescent so concurrent LRU eviction cannot recycle
+in-flight storage.
+
 The min-radius acceptance scan uses the existing no-GIL parallel CPU evaluator by default.
 Production evidence from v17.1.1 showed that issuing each plan's CuPyX labeling, hole fill,
 and EDT through one renderer lock serialized 128 planner threads and reduced throughput by
-roughly fourfold. `YOLO_TTA_GPU_INTERPOLATION_RADIUS=1` restores that CUDA radius path as an
-explicit experiment. Radius failure is isolated from painting: unless CUDA is required, the
-affected plan and remaining radius work return to CPU while an otherwise healthy renderer
-may continue painting. Rendering coalesces per-section device reductions into one scalar
-transfer per destination group instead of synchronizing twice for every section.
+roughly fourfold. `YOLO_TTA_GPU_INTERPOLATION_RADIUS=1` keeps that CUDA radius path as an
+explicit experiment, but opted-in planners now borrow independent streams and hold the
+renderer lock only for shared cache/telemetry mutations. Radius failure is isolated from
+painting: unless CUDA is required, the affected plan and remaining radius work return to CPU
+while an otherwise healthy renderer may continue painting. Rendering coalesces per-section
+device reductions into one scalar transfer per destination group instead of synchronizing
+twice for every section.
 
 Dedicated interpolation children and the main process do not create or claim CUDA contexts
 unless `YOLO_TTA_GPU_INTERPOLATION_CREATE_CONTEXT=1` and, for the latter,
@@ -138,3 +151,25 @@ remains one because a production pass required about 117 GiB of host workspace. 
 logs and runtime stats separately report radius/render backends, autotune timings, lock wait,
 execution time, transfer categories, crop/patch pixels, cache eviction, fallback, and the
 worker-visible physical CUDA token.
+
+## Streaming inference completion and terminal fusion
+
+OpenVINO request callbacks publish indexed completions into a bounded queue. A bounded
+consumer pool, sized to the useful infer-request count, performs output decoding and
+destination writes concurrently. Destination slices and aggregate statistics have separate
+locks, callback/request draining is unconditional on failure, and competing failures are
+reported in submission order so concurrency does not make error selection nondeterministic.
+
+The scheduler treats each runtime TTA view as terminal when its full-frame/tile continuation
+has retired. As soon as every variant of one physical view is terminal, ownership of that
+group is detached from the inference registries, its variants are OR-collapsed, and any
+Radial/Tilted projection runs while other views may still be inferencing. Completed physical
+views feed one path-backed, single-writer source-space union reducer. Equal-geometry sparse
+component layers are ORed before one restore per output slice, retaining the grouped G5
+optimization. A one-credit dense handoff prevents finalizers from retaining multiple
+source-sized volumes while waiting for the reducer.
+
+Finalization and reducer futures are first-class scheduler dependencies, including terminal
+coverage assertions at quiescence. The global centerline/smoothing stages still wait for the
+complete union because their semantics span every view, but they no longer wait for a
+separate post-inference collapse/backprojection/fusion phase.

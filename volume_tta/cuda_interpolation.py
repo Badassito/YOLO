@@ -19,8 +19,9 @@ import sys
 import threading
 import time
 from collections import OrderedDict
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -41,9 +42,9 @@ def gpu_interpolation_radius_enabled() -> bool:
 
     The v17.1.1 implementation serialized every planner thread through one CUDA
     renderer and was substantially slower than the parallel CPU evaluator on a
-    production four-GPU workload.  Painting remains enabled by the master CUDA
-    interpolation switch; the legacy per-plan radius path is now an explicit
-    experiment until it can be replaced by a genuinely batched implementation.
+    production four-GPU workload. The renderer now gives opted-in planners bounded
+    independent streams, but the per-plan path remains an explicit experiment until
+    that change has production profiling. Painting stays enabled by the master switch.
     """
 
     return _env_flag("YOLO_TTA_GPU_INTERPOLATION_RADIUS", False)
@@ -85,6 +86,12 @@ def gpu_interpolation_reserve_bytes() -> int:
     return max(0, _env_int("YOLO_TTA_GPU_INTERPOLATION_RESERVE_MIB", 1024)) * MIB
 
 
+def gpu_interpolation_stream_count() -> int:
+    """Maximum concurrent CUDA streams owned by one interpolation lease."""
+
+    return max(1, _env_int("YOLO_TTA_GPU_INTERPOLATION_STREAMS", 4))
+
+
 class GpuInterpolationUnavailable(RuntimeError):
     """Raised when a renderer was disabled or cannot execute a requested operation."""
 
@@ -117,6 +124,9 @@ class _DeviceCacheEntry:
     # Without this, a rejected plan can die before eviction and CPython may reuse
     # its ndarray/list id for an unrelated plan, producing a stale device hit.
     owners: Tuple[object, ...]
+    # Entries may become visible while their creating stream is still in flight.
+    # A consumer on another stream inserts this dependency before using ``value``.
+    ready_event: Optional[object] = None
 
 
 def _slice_job_placement(
@@ -200,12 +210,52 @@ class _CupyInterpolationRuntime:
     def activate(self) -> object:
         return self.device
 
+    def create_stream(self) -> object:
+        with self.device:
+            return self.xp.cuda.Stream(non_blocking=True)
+
+    @staticmethod
+    def activate_stream(stream: object) -> object:
+        return stream
+
     def to_device(self, value: np.ndarray) -> object:
         return self.xp.asarray(value)
 
     def to_host(self, value: object) -> np.ndarray:
         # cp.asnumpy has been a blocking copy since the oldest supported CuPy releases.
         return np.asarray(self.xp.asnumpy(value))
+
+    def to_host_async(self, value: object, stream: object) -> np.ndarray:
+        # CuPy 13 exposes ``blocking=False``, but an implicitly allocated NumPy result is
+        # not documented as page-locked.  Supply pinned storage explicitly so the CUDA
+        # runtime can enqueue a genuine asynchronous D2H transfer.  ``numpy.ndarray``
+        # retains the buffer object as its base; the renderer, in turn, retains this array
+        # and does not inspect it until ``wait_completion`` succeeds.
+        shape = tuple(int(size) for size in getattr(value, "shape"))
+        dtype = np.dtype(getattr(value, "dtype"))
+        pinned = self.xp.cuda.alloc_pinned_memory(
+            int(np.prod(shape, dtype=np.int64)) * int(dtype.itemsize)
+        )
+        host = np.ndarray(shape, dtype=dtype, buffer=pinned, order="C")
+        return np.asarray(self.xp.asnumpy(
+            value, out=host, stream=stream, blocking=False,
+        ))
+
+    @staticmethod
+    def record_completion(stream: object) -> object:
+        return stream.record()
+
+    @staticmethod
+    def make_stream_wait(stream: object, event: object) -> None:
+        stream.wait_event(event)
+
+    @staticmethod
+    def wait_completion(event: object) -> None:
+        event.synchronize()
+
+    @staticmethod
+    def synchronize_stream(stream: object) -> None:
+        stream.synchronize()
 
     def mem_info(self) -> Tuple[int, int]:
         # Construction alone does not make cp.cuda.Device current on this thread.
@@ -235,6 +285,7 @@ class CudaInterpolationRenderer:
         runtime: Optional[object] = None,
         cache_bytes: Optional[int] = None,
         reserve_bytes: Optional[int] = None,
+        stream_count: Optional[int] = None,
     ) -> None:
         self.runtime = (
             runtime if runtime is not None
@@ -270,7 +321,27 @@ class CudaInterpolationRenderer:
         ))
         self._cache: "OrderedDict[Tuple[object, ...], _DeviceCacheEntry]" = OrderedDict()
         self._cache_live_bytes = 0
+        self._cache_generation = 0
         self._lock = threading.RLock()
+        self.max_streams = max(
+            1,
+            int(
+                gpu_interpolation_stream_count()
+                if stream_count is None else stream_count
+            ),
+        )
+        # Streams are created lazily inside the selected device context. The pool is
+        # renderer-local because one renderer is scoped to one scheduler GPU lease.
+        self._stream_condition = threading.Condition(threading.Lock())
+        self._idle_streams: List[object] = []
+        self._created_streams = 0
+        self._leased_streams = 0
+        self._closing = False
+        self._stream_local = threading.local()
+        self._destination_lock_guard = threading.Lock()
+        self._destination_locks: Dict[
+            Tuple[int, Tuple[int, ...], Tuple[int, ...]], Tuple[threading.Lock, int]
+        ] = {}
         self._failed_reason: Optional[str] = None
         self._radius_failed_reason: Optional[str] = None
         self._metrics: Dict[str, object] = {
@@ -296,8 +367,11 @@ class CudaInterpolationRenderer:
             "radius_execution_seconds": 0.0,
             "render_lock_wait_seconds": 0.0,
             "render_execution_seconds": 0.0,
+            "stream_leases": 0,
+            "stream_peak": 0,
         }
         self._structure8 = None
+        self._structure8_ready: Optional[object] = None
 
     @property
     def available(self) -> bool:
@@ -315,6 +389,172 @@ class CudaInterpolationRenderer:
     def radius_failed_reason(self) -> Optional[str]:
         return self._radius_failed_reason
 
+    @contextmanager
+    def _lease_stream(self) -> Iterator[object]:
+        """Borrow one renderer-local stream until its final event has settled."""
+
+        create_new = False
+        stream: object
+        with self._stream_condition:
+            while (
+                not self._idle_streams
+                and self._created_streams >= int(self.max_streams)
+                and not self._closing
+            ):
+                self._stream_condition.wait()
+            if self._closing:
+                raise GpuInterpolationUnavailable("CUDA interpolation renderer is closed")
+            if self._idle_streams:
+                stream = self._idle_streams.pop()
+            else:
+                self._created_streams += 1
+                create_new = True
+                stream = None
+            self._leased_streams += 1
+            leased_now = int(self._leased_streams)
+
+        if create_new:
+            try:
+                create_stream = getattr(self.runtime, "create_stream", None)
+                if callable(create_stream):
+                    with self.runtime.activate():
+                        stream = create_stream()
+            except BaseException:
+                with self._stream_condition:
+                    self._created_streams = max(0, self._created_streams - 1)
+                    self._leased_streams = max(0, self._leased_streams - 1)
+                    self._stream_condition.notify_all()
+                raise
+
+        with self._lock:
+            self._metrics["stream_leases"] = int(self._metrics["stream_leases"]) + 1
+            self._metrics["stream_peak"] = max(
+                int(self._metrics["stream_peak"]), int(leased_now),
+            )
+
+        active_error = False
+        previous_keepalive = getattr(self._stream_local, "keepalive", None)
+        previous_cache_generation = getattr(
+            self._stream_local, "cache_generation", None,
+        )
+        self._stream_local.keepalive = []
+        with self._lock:
+            self._stream_local.cache_generation = int(self._cache_generation)
+        try:
+            activate_stream = getattr(self.runtime, "activate_stream", None)
+            stream_context = (
+                activate_stream(stream)
+                if callable(activate_stream) else nullcontext()
+            )
+            with self.runtime.activate(), stream_context:
+                yield stream
+        except BaseException:
+            active_error = True
+            raise
+        finally:
+            # A failed enqueue may still have work using temporary arrays. Quiesce the
+            # borrowed stream before those owners die or the stream is reused.
+            synchronize_stream = getattr(self.runtime, "synchronize_stream", None)
+            synchronize_error: Optional[BaseException] = None
+            if callable(synchronize_stream) and stream is not None:
+                try:
+                    with self.runtime.activate():
+                        synchronize_stream(stream)
+                except BaseException as exc:
+                    synchronize_error = exc
+            if previous_keepalive is None:
+                try:
+                    del self._stream_local.keepalive
+                except AttributeError:
+                    pass
+            else:
+                self._stream_local.keepalive = previous_keepalive
+            if previous_cache_generation is None:
+                try:
+                    del self._stream_local.cache_generation
+                except AttributeError:
+                    pass
+            else:
+                self._stream_local.cache_generation = previous_cache_generation
+            with self._stream_condition:
+                self._leased_streams = max(0, self._leased_streams - 1)
+                if self._closing or active_error or synchronize_error is not None:
+                    self._created_streams = max(0, self._created_streams - 1)
+                else:
+                    self._idle_streams.append(stream)
+                self._stream_condition.notify_all()
+            if synchronize_error is not None and not active_error:
+                raise synchronize_error
+
+    def _retain_for_stream_lease(self, *values: object) -> None:
+        """Keep device arrays/events alive until this thread's stream is quiescent."""
+
+        keepalive = getattr(self._stream_local, "keepalive", None)
+        if keepalive is not None:
+            keepalive.extend(value for value in values if value is not None)
+
+    @contextmanager
+    def _lease_destination(self, destination: np.ndarray) -> Iterator[None]:
+        """Serialize only calls targeting the same host view transaction."""
+
+        array = np.asarray(destination)
+        key = (
+            int(array.__array_interface__["data"][0]),
+            tuple(int(v) for v in array.shape),
+            tuple(int(v) for v in array.strides),
+        )
+        with self._destination_lock_guard:
+            entry = self._destination_locks.get(key)
+            if entry is None:
+                destination_lock = threading.Lock()
+                users = 0
+            else:
+                destination_lock, users = entry
+            self._destination_locks[key] = (destination_lock, int(users) + 1)
+        destination_lock.acquire()
+        try:
+            yield
+        finally:
+            destination_lock.release()
+            with self._destination_lock_guard:
+                current = self._destination_locks.get(key)
+                if current is not None and current[0] is destination_lock:
+                    remaining = int(current[1]) - 1
+                    if remaining <= 0:
+                        self._destination_locks.pop(key, None)
+                    else:
+                        self._destination_locks[key] = (
+                            destination_lock, int(remaining),
+                        )
+
+    def _record_completion(self, stream: object) -> Optional[object]:
+        record_completion = getattr(self.runtime, "record_completion", None)
+        if not callable(record_completion):
+            return None
+        return record_completion(stream)
+
+    def _make_stream_wait(self, stream: object, event: Optional[object]) -> None:
+        if event is None:
+            return
+        make_stream_wait = getattr(self.runtime, "make_stream_wait", None)
+        if callable(make_stream_wait):
+            make_stream_wait(stream, event)
+
+    def _wait_completion(self, event: Optional[object]) -> None:
+        if event is None:
+            return
+        wait_completion = getattr(self.runtime, "wait_completion", None)
+        if callable(wait_completion):
+            wait_completion(event)
+
+    def _to_host_async(self, value: object, stream: object) -> np.ndarray:
+        to_host_async = getattr(self.runtime, "to_host_async", None)
+        if callable(to_host_async):
+            return np.asarray(to_host_async(value, stream))
+        # Compatibility for injected runtimes predating the stream contract. Production
+        # always takes the asynchronous CuPy branch above.
+        return np.asarray(self.runtime.to_host(value))
+
     def disable(self, exc: BaseException) -> bool:
         """Disable future CUDA work; return True only for the first failure."""
 
@@ -323,6 +563,7 @@ class CudaInterpolationRenderer:
             first = self._failed_reason is None
             if first:
                 self._failed_reason = reason
+                self._cache_generation += 1
                 self._clear_cache()
             return bool(first)
 
@@ -337,6 +578,7 @@ class CudaInterpolationRenderer:
                 # A failed scan may have left valid but incomplete plan entries.  The
                 # CPU retry becomes authoritative, so force painting to reload those
                 # exact host sections instead of reusing a partial device cache.
+                self._cache_generation += 1
                 self._clear_cache()
             return bool(first)
 
@@ -353,6 +595,7 @@ class CudaInterpolationRenderer:
         self,
         key: Tuple[object, ...],
         owners: Sequence[object] = (),
+        stream: object = None,
     ) -> Optional[object]:
         entry = self._cache.pop(key, None)
         if entry is None:
@@ -369,6 +612,9 @@ class CudaInterpolationRenderer:
             return None
         self._cache[key] = entry
         self._metrics["cache_hits"] += 1
+        self._retain_for_stream_lease(entry.value, entry.ready_event)
+        if stream is not None:
+            self._make_stream_wait(stream, entry.ready_event)
         return entry.value
 
     def _cache_put(
@@ -377,8 +623,16 @@ class CudaInterpolationRenderer:
         value: object,
         nbytes: int,
         owners: Sequence[object] = (),
+        stream: object = None,
     ) -> None:
         size = max(0, int(nbytes))
+        self._retain_for_stream_lease(value)
+        lease_generation = getattr(self._stream_local, "cache_generation", None)
+        if (
+            lease_generation is not None
+            and int(lease_generation) != int(self._cache_generation)
+        ):
+            return
         old = self._cache.pop(key, None)
         if old is not None:
             self._cache_live_bytes = max(0, self._cache_live_bytes - int(old.nbytes))
@@ -395,10 +649,15 @@ class CudaInterpolationRenderer:
             self._metrics["cache_evicted_bytes"] = int(
                 self._metrics["cache_evicted_bytes"]
             ) + int(old_entry.nbytes)
+        ready_event = (
+            self._record_completion(stream) if stream is not None else None
+        )
+        self._retain_for_stream_lease(ready_event)
         self._cache[key] = _DeviceCacheEntry(
             value=value,
             nbytes=int(size),
             owners=tuple(owners),
+            ready_event=ready_event,
         )
         self._cache_live_bytes += int(size)
         self._metrics["cache_peak_bytes"] = max(
@@ -412,31 +671,51 @@ class CudaInterpolationRenderer:
     def _device_array(self, value: np.ndarray) -> object:
         contiguous = np.ascontiguousarray(value)
         result = self.runtime.to_device(contiguous)
-        self._metrics["host_to_device_bytes"] += int(contiguous.nbytes)
+        with self._lock:
+            self._metrics["host_to_device_bytes"] += int(contiguous.nbytes)
         return result
 
-    def _device_sdfs(self, plan: object) -> Tuple[object, object]:
+    def _device_sdfs(
+        self, plan: object, stream: object = None,
+    ) -> Tuple[object, object]:
         sdf0_owner = getattr(plan, "sdf0")
         sdf1_owner = getattr(plan, "sdf1")
         sdf0_host = np.asarray(sdf0_owner, dtype=np.float32)
         sdf1_host = np.asarray(sdf1_owner, dtype=np.float32)
         key = ("sdf", id(sdf0_owner), id(sdf1_owner))
-        cached = self._cache_get(key, (sdf0_owner, sdf1_owner))
-        if cached is not None:
-            return cached  # type: ignore[return-value]
+        with self._lock:
+            cached = self._cache_get(
+                key, (sdf0_owner, sdf1_owner), stream=stream,
+            )
+            if cached is not None:
+                return cached  # type: ignore[return-value]
+
+        # Pageable H2D staging can block the submitting host thread. Keep it outside the
+        # renderer metadata lock so independent stream leases can upload/compute in parallel.
+        # A same-key race may duplicate one upload; the second cache check below selects the
+        # already-published entry and the lease keepalive safely retires the redundant pair.
         sdf0 = self._device_array(sdf0_host)
         sdf1 = self._device_array(sdf1_host)
-        self._metrics["sdf_host_to_device_bytes"] = int(
-            self._metrics["sdf_host_to_device_bytes"]
-        ) + int(sdf0_host.nbytes + sdf1_host.nbytes)
         pair = (sdf0, sdf1)
-        self._cache_put(
-            key,
-            pair,
-            int(sdf0_host.nbytes + sdf1_host.nbytes),
-            (sdf0_owner, sdf1_owner),
-        )
-        return pair
+        self._retain_for_stream_lease(pair)
+        with self._lock:
+            self._metrics["sdf_host_to_device_bytes"] = int(
+                self._metrics["sdf_host_to_device_bytes"]
+            ) + int(sdf0_host.nbytes + sdf1_host.nbytes)
+            if key in self._cache:
+                raced = self._cache_get(
+                    key, (sdf0_owner, sdf1_owner), stream=stream,
+                )
+                if raced is not None:
+                    return raced  # type: ignore[return-value]
+            self._cache_put(
+                key,
+                pair,
+                int(sdf0_host.nbytes + sdf1_host.nbytes),
+                (sdf0_owner, sdf1_owner),
+                stream=stream,
+            )
+            return pair
 
     def _blend_section(self, sdf0: object, sdf1: object, alpha: float) -> object:
         # Separate multiply/add ufunc launches avoid device FMA changing a zero-boundary
@@ -445,10 +724,20 @@ class CudaInterpolationRenderer:
         right = self.xp.multiply(sdf1, np.float32(float(alpha)))
         return self.xp.add(left, right) >= np.float32(0.0)
 
-    def _keep_center_component_and_fill(self, section: object) -> Optional[object]:
-        if self._structure8 is None:
-            self._structure8 = self.xp.ones((3, 3), dtype=self.xp.bool_)
-        labels, num = self.ndi.label(section, structure=self._structure8)
+    def _keep_center_component_and_fill(
+        self, section: object, stream: object = None,
+    ) -> Optional[object]:
+        with self._lock:
+            if self._structure8 is None:
+                self._structure8 = self.xp.ones((3, 3), dtype=self.xp.bool_)
+                self._structure8_ready = (
+                    self._record_completion(stream) if stream is not None else None
+                )
+            structure8 = self._structure8
+            structure8_ready = self._structure8_ready
+        if stream is not None:
+            self._make_stream_wait(stream, structure8_ready)
+        labels, num = self.ndi.label(section, structure=structure8)
         component_count = _scalar_int(num)
         if component_count <= 0:
             return None
@@ -524,89 +813,116 @@ class CudaInterpolationRenderer:
         """
 
         queued_at = time.perf_counter()
-        with self._lock:
-            acquired_at = time.perf_counter()
-            self._metrics["radius_lock_wait_seconds"] = float(
-                self._metrics["radius_lock_wait_seconds"]
-            ) + max(0.0, acquired_at - queued_at)
-            try:
-                with self.runtime.activate():
-                    self._ensure_radius_available()
-                    sdf0_host = np.asarray(getattr(plan, "sdf0"), dtype=np.float32)
-                    sdf1_host = np.asarray(getattr(plan, "sdf1"), dtype=np.float32)
-                    if not bool(np.any(sdf0_host >= 0.0)) or not bool(np.any(sdf1_host >= 0.0)):
-                        return 0.0
-                    min_radius = float(min(float(np.max(sdf0_host)), float(np.max(sdf1_host))))
-                    threshold = float(reject_at_or_below)
-                    if threshold > 0.0 and min_radius <= threshold:
-                        return float(min_radius)
+        acquired_at: Optional[float] = None
+        try:
+            sdf0_host = np.asarray(getattr(plan, "sdf0"), dtype=np.float32)
+            sdf1_host = np.asarray(getattr(plan, "sdf1"), dtype=np.float32)
+            if not bool(np.any(sdf0_host >= 0.0)) or not bool(np.any(sdf1_host >= 0.0)):
+                return 0.0
+            min_radius = float(min(float(np.max(sdf0_host)), float(np.max(sdf1_host))))
+            threshold = float(reject_at_or_below)
+            if threshold > 0.0 and min_radius <= threshold:
+                return float(min_radius)
 
-                    section_cache = getattr(plan, "cached_sections")
-                    if bool(cache_sections):
-                        section_cache[:] = [None] * (int(getattr(plan, "steps")) + 1)
-                    sdf0, sdf1 = self._device_sdfs(plan)
+            section_cache = getattr(plan, "cached_sections")
+            if bool(cache_sections):
+                section_cache[:] = [None] * (int(getattr(plan, "steps")) + 1)
+
+            with self._lease_stream() as stream:
+                with self._lock:
+                    acquired_at = time.perf_counter()
+                    self._metrics["radius_lock_wait_seconds"] = float(
+                        self._metrics["radius_lock_wait_seconds"]
+                    ) + max(0.0, acquired_at - queued_at)
+                    self._ensure_radius_available()
+                # Shared renderer metadata/cache mutations lock themselves. H2D staging,
+                # CuPyX execution, scalar completion reads, and D2H waits are stream-local.
+                sdf0, sdf1 = self._device_sdfs(plan, stream=stream)
+                with self._lock:
                     self._metrics["estimated_plans"] = int(
                         self._metrics["estimated_plans"]
                     ) + 1
-                    for idx in range(1, int(getattr(plan, "steps"))):
-                        alpha = float(idx) / float(getattr(plan, "steps"))
-                        section = self._blend_section(sdf0, sdf1, alpha)
-                        section = self._keep_center_component_and_fill(section)
-                        if section is None:
-                            return 0.0
-                        if bool(cache_sections):
-                            if bool(cache_host_sections):
-                                host_section = np.ascontiguousarray(
-                                    self.runtime.to_host(section), dtype=bool,
-                                )
+                for idx in range(1, int(getattr(plan, "steps"))):
+                    alpha = float(idx) / float(getattr(plan, "steps"))
+                    section = self._blend_section(sdf0, sdf1, alpha)
+                    section = self._keep_center_component_and_fill(
+                        section, stream=stream,
+                    )
+                    if section is None:
+                        return 0.0
+                    if bool(cache_sections):
+                        if bool(cache_host_sections):
+                            pending_host_section = self._to_host_async(section, stream)
+                            host_completion = self._record_completion(stream)
+                            self._wait_completion(host_completion)
+                            host_section = np.ascontiguousarray(
+                                pending_host_section, dtype=bool,
+                            )
+                            with self._lock:
                                 self._metrics["device_to_host_bytes"] = int(
                                     self._metrics["device_to_host_bytes"]
                                 ) + int(host_section.nbytes)
-                                section_cache[int(idx)] = host_section
-                            # Insert as the scan proceeds so the LRU budget also bounds a
-                            # long plan; the planner releases all entries if it rejects it.
+                            section_cache[int(idx)] = host_section
+                        # Insert as the scan proceeds so the LRU budget also bounds a
+                        # long plan; the planner releases all entries if it rejects it.
+                        with self._lock:
                             self._cache_put(
                                 ("section", id(section_cache), int(idx)),
                                 section,
                                 int(getattr(section, "nbytes")),
                                 (section_cache,),
+                                stream=stream,
                             )
-                        min_radius = min(float(min_radius), float(self._section_radius(section)))
+                    min_radius = min(
+                        float(min_radius), float(self._section_radius(section)),
+                    )
+                    with self._lock:
                         self._metrics["estimated_sections"] = int(
                             self._metrics["estimated_sections"]
                         ) + 1
-                        if threshold > 0.0 and min_radius <= threshold:
-                            return float(min_radius)
+                    if threshold > 0.0 and min_radius <= threshold:
+                        return float(min_radius)
 
-                    return float(min_radius)
-            finally:
-                self._metrics["radius_execution_seconds"] = float(
-                    self._metrics["radius_execution_seconds"]
-                ) + max(0.0, time.perf_counter() - acquired_at)
+                return float(min_radius)
+        finally:
+            if acquired_at is not None:
+                with self._lock:
+                    self._metrics["radius_execution_seconds"] = float(
+                        self._metrics["radius_execution_seconds"]
+                    ) + max(0.0, time.perf_counter() - acquired_at)
 
-    def _device_section(self, plan: object, step_idx: int) -> Optional[object]:
+    def _device_section(
+        self, plan: object, step_idx: int, stream: object = None,
+    ) -> Optional[object]:
         section_cache = getattr(plan, "cached_sections")
         if int(step_idx) < len(section_cache):
             key = ("section", id(section_cache), int(step_idx))
-            cached_device = self._cache_get(key, (section_cache,))
+            with self._lock:
+                cached_device = self._cache_get(
+                    key, (section_cache,), stream=stream,
+                )
+                cached_host = section_cache[int(step_idx)]
             if cached_device is not None:
                 return cached_device
-            cached_host = section_cache[int(step_idx)]
             if cached_host is not None:
                 # CPU-radius mode retains the exact accepted section on the host.
                 # A plan-step is painted once, so putting this one-shot upload into
                 # the device LRU only evicts reusable SDF entries before later jobs.
                 host_section = np.asarray(cached_host, dtype=bool)
                 section = self._device_array(host_section)
-                self._metrics["section_host_to_device_bytes"] = int(
-                    self._metrics["section_host_to_device_bytes"]
-                ) + int(host_section.nbytes)
+                with self._lock:
+                    self._metrics["section_host_to_device_bytes"] = int(
+                        self._metrics["section_host_to_device_bytes"]
+                    ) + int(host_section.nbytes)
+                self._retain_for_stream_lease(section)
                 return section
-        sdf0, sdf1 = self._device_sdfs(plan)
+        sdf0, sdf1 = self._device_sdfs(plan, stream=stream)
         alpha = float(step_idx) / float(getattr(plan, "steps"))
-        return self._keep_center_component_and_fill(
-            self._blend_section(sdf0, sdf1, alpha)
+        section = self._keep_center_component_and_fill(
+            self._blend_section(sdf0, sdf1, alpha), stream=stream,
         )
+        self._retain_for_stream_lease(section)
+        return section
 
     def render_slice(
         self,
@@ -635,128 +951,157 @@ class CudaInterpolationRenderer:
         crop_x1 = max(item[3].dst_x1 for item in placements)
 
         queued_at = time.perf_counter()
-        with self._lock:
-            acquired_at = time.perf_counter()
-            self._metrics["render_lock_wait_seconds"] = float(
-                self._metrics["render_lock_wait_seconds"]
-            ) + max(0.0, acquired_at - queued_at)
-            try:
-                with self.runtime.activate():
+        acquired_at: Optional[float] = None
+        try:
+            # Separate destination groups can overlap. Calls that target the same host
+            # view retain the old lost-update protection without monopolizing the GPU.
+            with self._lease_destination(destination_array), self._lease_stream() as stream:
+                with self._lock:
+                    acquired_at = time.perf_counter()
+                    self._metrics["render_lock_wait_seconds"] = float(
+                        self._metrics["render_lock_wait_seconds"]
+                    ) + max(0.0, acquired_at - queued_at)
                     self._ensure_available()
-                    initial_host = np.ascontiguousarray(
-                        destination_array[crop_y0:crop_y1, crop_x0:crop_x1]
-                    )
-                    device_crop = self._device_array(initial_host)
+
+                initial_host = np.ascontiguousarray(
+                    destination_array[crop_y0:crop_y1, crop_x0:crop_x1]
+                )
+                device_crop = self._device_array(initial_host)
+                with self._lock:
                     self._metrics["destination_host_to_device_bytes"] = int(
                         self._metrics["destination_host_to_device_bytes"]
                     ) + int(initial_host.nbytes)
                     self._metrics["render_crop_pixels"] = int(
                         self._metrics["render_crop_pixels"]
                     ) + int(initial_host.size)
-                    added_counts_device: List[object] = []
-                    nonempty_flags_device: List[object] = []
-                    stat_placements: List[_SlicePlacement] = []
-                    for plan, step_idx, paint_value, placement in placements:
-                        section = self._device_section(plan, int(step_idx))
-                        if section is None:
-                            continue
-                        if bool(placement.mirrored):
-                            section = section[:, ::-1]
-                        patch = section[
-                            int(placement.src_y0):int(placement.src_y1),
-                            int(placement.src_x0):int(placement.src_x1),
+
+                added_counts_device: List[object] = []
+                nonempty_flags_device: List[object] = []
+                stat_placements: List[_SlicePlacement] = []
+                patch_pixels = 0
+                # Keep every section owner alive until the stream completion event;
+                # another concurrent stream may evict its global LRU entry meanwhile.
+                section_keepalive: List[object] = []
+                for plan, step_idx, paint_value, placement in placements:
+                    section = self._device_section(
+                        plan, int(step_idx), stream=stream,
+                    )
+                    if section is None:
+                        continue
+                    section_keepalive.append(section)
+                    if bool(placement.mirrored):
+                        section = section[:, ::-1]
+                    patch = section[
+                        int(placement.src_y0):int(placement.src_y1),
+                        int(placement.src_x0):int(placement.src_x1),
+                    ]
+                    local_y0 = int(placement.dst_y0 - crop_y0)
+                    local_y1 = int(placement.dst_y1 - crop_y0)
+                    local_x0 = int(placement.dst_x0 - crop_x0)
+                    local_x1 = int(placement.dst_x1 - crop_x0)
+                    current = device_crop[local_y0:local_y1, local_x0:local_x1]
+                    value = self.xp.asarray(int(paint_value), dtype=current.dtype)
+                    missing = patch & ((self.xp.bitwise_and(current, value)) == 0)
+                    # Queue reductions and fetch all tiny scalars together after every
+                    # section has been painted. v17.1.1 called .item() twice per job,
+                    # forcing thousands of device synchronizations in a typical slice.
+                    nonempty_flags_device.append(self.xp.any(patch))
+                    added_counts_device.append(self.xp.count_nonzero(missing))
+                    patch_pixels += int(patch.size)
+                    stat_placements.append(placement)
+                    painted = patch.astype(current.dtype, copy=False) * value
+                    self.xp.bitwise_or(current, painted, out=current)
+
+                with self._lock:
+                    self._metrics["render_patch_pixels"] = int(
+                        self._metrics["render_patch_pixels"]
+                    ) + int(patch_pixels)
+
+                if added_counts_device:
+                    counts_device = self.xp.stack(tuple(added_counts_device))
+                    flags_device = self.xp.stack(tuple(nonempty_flags_device)).astype(
+                        self.xp.int64, copy=False,
+                    )
+                    stats_device = self.xp.stack((counts_device, flags_device), axis=1)
+                    pending_stats_host: Optional[np.ndarray] = self._to_host_async(
+                        stats_device, stream,
+                    )
+                else:
+                    pending_stats_host = None
+
+                pending_rendered_host = self._to_host_async(device_crop, stream)
+                completion = self._record_completion(stream)
+
+                # The renderer metadata/cache lock is intentionally not held here. The
+                # event covers every kernel and both asynchronous D2H transfers queued on
+                # this lease stream, so other destination groups can enqueue and run.
+                self._wait_completion(completion)
+                stats_host = (
+                    np.ascontiguousarray(pending_stats_host, dtype=np.int64)
+                    if pending_stats_host is not None
+                    else np.zeros((0, 2), dtype=np.int64)
+                )
+                rendered_host = np.ascontiguousarray(pending_rendered_host)
+
+                added_voxels = int(np.sum(stats_host[:, 0], dtype=np.int64))
+                nonempty_flags = np.asarray(stats_host[:, 1] != 0, dtype=bool)
+                rendered_sections = int(np.count_nonzero(nonempty_flags))
+                actual_bbox: Optional[List[int]] = None
+                for placement, nonempty in zip(stat_placements, nonempty_flags):
+                    if not bool(nonempty):
+                        continue
+                    if actual_bbox is None:
+                        actual_bbox = [
+                            int(placement.dst_y0), int(placement.dst_x0),
+                            int(placement.dst_y1), int(placement.dst_x1),
                         ]
-                        local_y0 = int(placement.dst_y0 - crop_y0)
-                        local_y1 = int(placement.dst_y1 - crop_y0)
-                        local_x0 = int(placement.dst_x0 - crop_x0)
-                        local_x1 = int(placement.dst_x1 - crop_x0)
-                        current = device_crop[local_y0:local_y1, local_x0:local_x1]
-                        value = self.xp.asarray(int(paint_value), dtype=current.dtype)
-                        missing = patch & ((self.xp.bitwise_and(current, value)) == 0)
-                        # Queue reductions and fetch all tiny scalars together after every
-                        # section has been painted. v17.1.1 called .item() twice per job,
-                        # forcing thousands of device synchronizations in a typical slice.
-                        nonempty_flags_device.append(self.xp.any(patch))
-                        added_counts_device.append(self.xp.count_nonzero(missing))
-                        self._metrics["render_patch_pixels"] = int(
-                            self._metrics["render_patch_pixels"]
-                        ) + int(patch.size)
-                        stat_placements.append(placement)
-                        painted = patch.astype(current.dtype, copy=False) * value
-                        self.xp.bitwise_or(current, painted, out=current)
-
-                    if added_counts_device:
-                        counts_device = self.xp.stack(tuple(added_counts_device))
-                        flags_device = self.xp.stack(tuple(nonempty_flags_device)).astype(
-                            self.xp.int64, copy=False,
-                        )
-                        stats_device = self.xp.stack((counts_device, flags_device), axis=1)
-                        stats_host = np.ascontiguousarray(
-                            self.runtime.to_host(stats_device), dtype=np.int64,
-                        )
-                        self._metrics["device_to_host_bytes"] = int(
-                            self._metrics["device_to_host_bytes"]
-                        ) + int(stats_host.nbytes)
-                        self._metrics["metrics_device_to_host_bytes"] = int(
-                            self._metrics["metrics_device_to_host_bytes"]
-                        ) + int(stats_host.nbytes)
                     else:
-                        stats_host = np.zeros((0, 2), dtype=np.int64)
+                        actual_bbox[0] = min(actual_bbox[0], int(placement.dst_y0))
+                        actual_bbox[1] = min(actual_bbox[1], int(placement.dst_x0))
+                        actual_bbox[2] = max(actual_bbox[2], int(placement.dst_y1))
+                        actual_bbox[3] = max(actual_bbox[3], int(placement.dst_x1))
 
-                    added_voxels = int(np.sum(stats_host[:, 0], dtype=np.int64))
-                    nonempty_flags = np.asarray(stats_host[:, 1] != 0, dtype=bool)
-                    rendered_sections = int(np.count_nonzero(nonempty_flags))
-                    actual_bbox: Optional[List[int]] = None
-                    for placement, nonempty in zip(stat_placements, nonempty_flags):
-                        if not bool(nonempty):
-                            continue
-                        if actual_bbox is None:
-                            actual_bbox = [
-                                int(placement.dst_y0), int(placement.dst_x0),
-                                int(placement.dst_y1), int(placement.dst_x1),
-                            ]
-                        else:
-                            actual_bbox[0] = min(actual_bbox[0], int(placement.dst_y0))
-                            actual_bbox[1] = min(actual_bbox[1], int(placement.dst_x0))
-                            actual_bbox[2] = max(actual_bbox[2], int(placement.dst_y1))
-                            actual_bbox[3] = max(actual_bbox[3], int(placement.dst_x1))
-
-                    # This is the transaction boundary: no host destination changes until
-                    # every device operation and the complete blocking D2H copy succeed.
-                    rendered_host = np.ascontiguousarray(self.runtime.to_host(device_crop))
+                # This is the transaction boundary: the destination remains untouched
+                # until the completion event proves that the entire D2H copy succeeded.
+                np.copyto(
+                    destination_array[crop_y0:crop_y1, crop_x0:crop_x1],
+                    rendered_host,
+                    casting="no",
+                )
+                with self._lock:
                     self._metrics["device_to_host_bytes"] = int(
                         self._metrics["device_to_host_bytes"]
-                    ) + int(rendered_host.nbytes)
+                    ) + int(rendered_host.nbytes + stats_host.nbytes)
                     self._metrics["destination_device_to_host_bytes"] = int(
                         self._metrics["destination_device_to_host_bytes"]
                     ) + int(rendered_host.nbytes)
-                    np.copyto(
-                        destination_array[crop_y0:crop_y1, crop_x0:crop_x1],
-                        rendered_host,
-                        casting="no",
-                    )
+                    self._metrics["metrics_device_to_host_bytes"] = int(
+                        self._metrics["metrics_device_to_host_bytes"]
+                    ) + int(stats_host.nbytes)
                     self._metrics["rendered_slices"] = int(
                         self._metrics["rendered_slices"]
                     ) + 1
                     self._metrics["rendered_sections"] = int(
                         self._metrics["rendered_sections"]
                     ) + int(rendered_sections)
-                    result_bbox = (
-                        (
-                            int(actual_bbox[0]), int(actual_bbox[1]),
-                            int(actual_bbox[2]), int(actual_bbox[3]),
-                        )
-                        if actual_bbox is not None else None
+                result_bbox = (
+                    (
+                        int(actual_bbox[0]), int(actual_bbox[1]),
+                        int(actual_bbox[2]), int(actual_bbox[3]),
                     )
-                    return GpuInterpolationSliceResult(
-                        added_voxels=int(added_voxels),
-                        rendered_sections=int(rendered_sections),
-                        bbox=result_bbox,
-                    )
-            finally:
-                self._metrics["render_execution_seconds"] = float(
-                    self._metrics["render_execution_seconds"]
-                ) + max(0.0, time.perf_counter() - acquired_at)
+                    if actual_bbox is not None else None
+                )
+                return GpuInterpolationSliceResult(
+                    added_voxels=int(added_voxels),
+                    rendered_sections=int(rendered_sections),
+                    bbox=result_bbox,
+                )
+        finally:
+            if acquired_at is not None:
+                with self._lock:
+                    self._metrics["render_execution_seconds"] = float(
+                        self._metrics["render_execution_seconds"]
+                    ) + max(0.0, time.perf_counter() - acquired_at)
 
     def release_plans(self, plans: Iterable[object]) -> None:
         """Release device cache entries owned by a completed host plan batch."""
@@ -788,12 +1133,24 @@ class CudaInterpolationRenderer:
                 "visible_device_token": self.visible_device_token,
                 "cache_budget_bytes": int(self.cache_budget_bytes),
                 "cache_live_bytes": int(self._cache_live_bytes),
+                "max_streams": int(self.max_streams),
                 "failed_reason": self._failed_reason,
                 "radius_failed_reason": self._radius_failed_reason,
             })
             return result
 
     def close(self) -> None:
+        with self._stream_condition:
+            if self._closing:
+                while self._leased_streams > 0:
+                    self._stream_condition.wait()
+                return
+            self._closing = True
+            self._stream_condition.notify_all()
+            while self._leased_streams > 0:
+                self._stream_condition.wait()
+            self._idle_streams.clear()
+            self._created_streams = 0
         with self._lock:
             self._clear_cache()
             self._structure8 = None
@@ -885,4 +1242,5 @@ __all__ = (
     "gpu_interpolation_radius_enabled",
     "gpu_interpolation_render_autotune_enabled",
     "gpu_interpolation_required",
+    "gpu_interpolation_stream_count",
 )

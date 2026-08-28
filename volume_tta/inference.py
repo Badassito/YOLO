@@ -1391,7 +1391,7 @@ _AFFINE_GRID_CACHE_MIN_ENTRIES = 0
 
 def request_affine_grid_cache_entries(entries: int) -> None:
     global _AFFINE_GRID_CACHE_MIN_ENTRIES
-    # Capped: each entry is a full dst_h x dst_w x 2 float32 grid, so an unusually dense tile
+    # Capped: each entry is a full dst_h x dst_w x 2 float32 grid, so a high-tile-count
     # configuration must not be allowed to trade the whole VRAM budget for grid reuse.
     capped = min(int(entries), max(16, _env_int('YOLO_TTA_GPU_WARP_GRID_CACHE_MAX_ENTRIES', 320)))
     _AFFINE_GRID_CACHE_MIN_ENTRIES = max(int(_AFFINE_GRID_CACHE_MIN_ENTRIES), int(capped))

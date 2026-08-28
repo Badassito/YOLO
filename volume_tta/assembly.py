@@ -1966,7 +1966,7 @@ def postprocess_tile_volume_after_inference(
         tile_mask_path=task.tile_mask_path,
     )
     if sparse_retire_dir is not None and not bool(keep_temp):
-        # v16.4.3: the GPU-worker dense result is only a cleanup workspace.  Convert the
+        # v16.4.3: the GPU-worker array-backed result is only a cleanup workspace. Convert the
         # cleaned crop immediately to CTILE and close/unlink the uint8 .dat before parent
         # interpolation or either component gate can delay its retirement.
         return spill_waiting_tile_result_to_raw_store(
@@ -1986,7 +1986,7 @@ def spill_waiting_tile_result_to_raw_store(
 ) -> DeferredTilePostprocessResult:
     """Spill one crop-local tile or residual without expanding it to the parent canvas."""
     if result.tile_mask_mm is None:
-        raise ValueError('Cannot spill a tile result without a dense tile_mask_mm')
+        raise ValueError('Cannot spill a tile result without an array-backed tile_mask_mm')
     tile_arr = np.asarray(result.tile_mask_mm)
     if tile_arr.ndim != 3:
         raise ValueError(f'Waiting tile spill expects a 3-D mask volume, got {tile_arr.shape}')
@@ -2134,14 +2134,14 @@ def gate_tile_result_against_parent_mask(
 
     Waiting CTILE inputs remain sparse throughout the gate. Fresh worker results are also
     sparse-retired at the cleanup boundary in v16.4.3, so deferred descriptors are opened
-    only inside the gate worker and never reconstruct a dense crop-local volume.
+    only inside the gate worker and never reconstruct an array-backed crop-local volume.
     """
     if isinstance(result, DeferredTilePostprocessResult):
         result = load_waiting_tile_result_from_raw_store(result)
     dense_tile = result.tile_mask_mm
     if dense_tile is None:
         if result.tile_mask_store is None:
-            raise ValueError('Parent tile gate requires a dense mask or raw tile store')
+            raise ValueError('Parent tile gate requires an array-backed mask or raw tile store')
         return gate_raw_bbox_tile_store_against_parent_mask(
             result,
             parent_mask_support_mm=parent_mask_support_mm,
@@ -2216,14 +2216,14 @@ def gate_tile_residual_against_parent_bridge(
     """Re-gate only parent-failed components against immutable parent bridge support.
 
     A deferred sparse residual CTILE is opened inside this gate worker, consumed slice-by-slice,
-    and retired directly; it is never expanded back into a dense crop-local volume.
+    and retired directly; it is never expanded back into an array-backed crop-local volume.
     """
     if isinstance(result, DeferredTilePostprocessResult):
         result = load_waiting_tile_result_from_raw_store(result)
     dense_tile = result.tile_mask_mm
     if dense_tile is None:
         if result.tile_mask_store is None:
-            raise ValueError('Bridge tile gate requires a dense residual or raw tile store')
+            raise ValueError('Bridge tile gate requires an array-backed residual or raw tile store')
         return gate_raw_bbox_tile_store_against_parent_bridge(
             result,
             parent_bridge_support_mm=parent_bridge_support_mm,

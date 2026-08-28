@@ -264,7 +264,7 @@ def output_to_view_processing_affine(
     return out
 
 def tile_crop_border_pixels() -> int:
-    """Safety ring added around every computed dense-tile crop window."""
+    """Safety ring added around every computed tile crop window."""
     return max(0, _env_int('YOLO_TTA_TILE_CROP_BORDER', 2))
 
 def tile_parent_crop_window(
@@ -275,9 +275,9 @@ def tile_parent_crop_window(
     border: Optional[int] = None,
     force_shape: Optional[Tuple[int, int]] = None,
 ) -> Tuple[Tuple[int, int, int, int], np.ndarray]:
-    """Return ``((py0, py1, px0, px1), M_out_to_crop)`` for one dense-tile output raster.
+    """Return ``((py0, py1, px0, px1), M_out_to_crop)`` for one tile output raster.
 
- A dense tile's ``M_out_to_src`` is frame-invariant, so the region of the parent
+ A tile's ``M_out_to_src`` is frame-invariant, so the region of the parent
  processing grid the tile can ever write is a fixed rectangle: the axis-aligned hull of
  the four output-raster corners pushed through ``output_to_view_processing_affine``.
  Everything downstream of the warp (device union, D2H, cleanup, hole fill, staging OR)
@@ -2922,7 +2922,7 @@ def dense_tile_positions(length: int, tile_size: int, stride: int) -> List[int]:
     if tile_size <= 0:
         return []
     if stride <= 0:
-        raise ValueError('tile stride must be > 0 when dense tiling is enabled')
+        raise ValueError('tile stride must be > 0 when tiling is enabled')
 
     last = max(0, length - tile_size)
     starts = list(range(0, last + 1, stride)) if last > 0 else [0]
@@ -3638,7 +3638,7 @@ def render_dense_tile_frame_for_job(
     *,
     mirror_radial_u: bool = False,
 ) -> np.ndarray:
-    """Render one dense-tile inference range directly from the native view volume.
+    """Render one tile inference range directly from the native view volume.
 
  This replaces the legacy canvas-video -> crop -> scale FFmpeg path with the
  same transform collapsed into one in-memory reslice. ``tile_job.M_src_to_out``
@@ -3716,7 +3716,7 @@ def make_dense_tile_channel_renderer(
     view_frames: Optional[np.ndarray] = None,
     cache_frames: Optional[int] = None,
 ) -> ChannelFormattedFrameRenderer:
-    """Create a center-indexed dense-tile renderer for gray/RGB/2.5D inputs."""
+    """Create a center-indexed tile renderer for gray/RGB/2.5D inputs."""
     def _render_plane(source_idx: int) -> np.ndarray:
         return render_dense_tile_frame_for_job(
             volume_rgb=volume_rgb,
@@ -3900,7 +3900,7 @@ def materialize_dense_tile_prediction_volume_for_job(
     show_progress: bool = True,
     channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
 ) -> PredictionVolumeRef:
-    """Create one dense-tile prediction range as an in-memory YOLO volume."""
+    """Create one tile prediction range as an in-memory YOLO volume."""
     write_dense_tile_job_meta(tile_job, channel_format)
 
     fmt = resolve_channel_format(channel_format)
@@ -3928,7 +3928,7 @@ def materialize_dense_tile_prediction_volume_for_job(
     )
 
 def should_cache_view_frames(view: ViewInfo, dense_tiling_active: bool) -> bool:
-    """Return whether an opt-in dense-tile Radial frame cache should be prebuilt.
+    """Return whether an opt-in Radial tile-frame cache should be prebuilt.
 
     Streaming remains the default to avoid a full-view time-to-first-prediction barrier.
     """
@@ -3946,7 +3946,7 @@ def build_view_frame_cache(
 ) -> np.ndarray:
     """Materialize native single-channel frames for a view into a reusable cache volume.
 
- This is used primarily for the radial view when dense tiling is enabled so later tile video
+ This is used primarily for the radial view when tiling is enabled so later tile video
  generation no longer recomputes the same radial slices for every tile location."""
     cache_mm = allocate_workspace_array(
         shape=(int(view.num_slices), int(view.src_h), int(view.src_w)),

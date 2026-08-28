@@ -1069,17 +1069,17 @@ def tile_intermediate_accumulator_reserve_bytes() -> int:
     return int(min(max(floor_bytes, proportional), max(floor_bytes, cap_bytes)))
 
 def tile_dense_worker_result_limit_bytes() -> int:
-    """Bound live dense per-tile GPU-worker result files before sparse retirement.
+    """Bound live array-backed per-tile GPU-worker results before sparse retirement.
 
     The limit is a hard scheduling backpressure budget, not a storage target. A single tile
-    larger than the budget is still admitted when no other dense tile result is live, so valid
+    larger than the budget is still admitted when no other array-backed tile result is live, so valid
     geometries cannot deadlock. Waiting parent/bridge masks are always converted to crop-local
-    raw-bbox stores; there is no dense-waiting compatibility path in v16.4.3.
+    raw-bbox stores; there is no array-backed waiting compatibility path in v16.4.3.
     """
     return int(max(1.0, _env_float('YOLO_TTA_TILE_DENSE_RESULT_MAX_GIB', 96.0)) * GIB)
 
 def tile_dense_worker_result_limit_tasks() -> int:
-    """Bound live dense tile mappings/fds even when each crop is individually small."""
+    """Bound live tile-result mappings/file descriptors even when each crop is individually small."""
     return max(1, _env_int('YOLO_TTA_TILE_DENSE_RESULT_MAX_TASKS', 64))
 
 def tile_dense_worker_result_warn_seconds() -> float:

@@ -704,16 +704,24 @@ class _OpenVinoCpuSegmenter:
         radial_padding_union_mm: Optional[np.ndarray] = None,
         radial_padding_confmap_mm: Optional[np.ndarray] = None,
     ) -> Dict[str, object]:
-        """Run a bounded asynchronous request queue and consume results in frame order."""
-        output_queue: 'queue.Queue[object]' = queue.Queue(maxsize=max(2, int(self.request_count)))
+        """Run a bounded async request queue with concurrent output postprocessing."""
+        output_queue: 'queue.Queue[object]' = queue.Queue(
+            maxsize=max(2, int(self.request_count)),
+        )
         sentinel = object()
-        consumer_errors: List[BaseException] = []
+        consumer_errors: List[Tuple[int, BaseException]] = []
+        consumer_error_lock = threading.Lock()
+        stats_lock = threading.Lock()
+        slice_locks: Dict[Tuple[int, int], threading.Lock] = {}
+        slice_locks_lock = threading.Lock()
         stats = {'prediction_count': 0, 'frames_with_predictions': 0}
         submitted_real = 0
         submitted_results = 0
+        submitted_batches = 0
         radial_padding_processed = 0
 
         def _callback(request: object, userdata: object) -> None:
+            submission_index = int(userdata[0])  # type: ignore[index]
             try:
                 copied = [
                     np.array(request.get_output_tensor(index).data, copy=True)
@@ -721,23 +729,35 @@ class _OpenVinoCpuSegmenter:
                 ]
                 output_queue.put(('result', userdata, copied))
             except BaseException as exc:
-                output_queue.put(('error', userdata, exc))
+                output_queue.put(('error', submission_index, exc))
 
         self.infer_queue.set_callback(_callback)
 
+        def _record_consumer_error(submission_index: int, exc: BaseException) -> None:
+            with consumer_error_lock:
+                consumer_errors.append((int(submission_index), exc))
+
+        def _target_slice_lock(
+            target: np.ndarray, frame_index: int,
+        ) -> threading.Lock:
+            key = (id(target), int(frame_index))
+            with slice_locks_lock:
+                target_lock = slice_locks.get(key)
+                if target_lock is None:
+                    target_lock = threading.Lock()
+                    slice_locks[key] = target_lock
+                return target_lock
+
         def _consume() -> None:
-            nonlocal stats
             while True:
                 item = output_queue.get()
                 if item is sentinel:
                     return
                 kind, userdata, payload = item  # type: ignore[misc]
                 if kind == 'error':
-                    consumer_errors.append(payload)
+                    _record_consumer_error(int(userdata), payload)
                     continue
-                if consumer_errors:
-                    continue
-                frame_specs, submitted_batch = userdata
+                submission_index, frame_specs, submitted_batch = userdata
                 try:
                     payloads = _openvino_cpu_payloads_from_outputs(
                         payload,
@@ -750,6 +770,8 @@ class _OpenVinoCpuSegmenter:
                         out_size=int(out_size),
                         expected_class_count=self.expected_class_count,
                     )
+                    batch_prediction_count = 0
+                    batch_frames_with_predictions = 0
                     for local_index, spec_obj in enumerate(frame_specs):
                         if spec_obj is None:
                             continue
@@ -767,37 +789,71 @@ class _OpenVinoCpuSegmenter:
                                 native_w=int(native_w),
                             )
                         )
-                        instance_count, frame_count = _process_cpu_retina_prediction_frame(
-                            frame_index,
-                            payloads[int(local_index)],
-                            int(out_size),
-                            target_union,
-                            target_conf,
-                            np.asarray(target_affine, dtype=np.float32),
-                            int(native_h),
-                            int(native_w),
-                            slice_lock=None,
-                        )
-                        has_foreground = _cleanup_prediction_slice_inplace(
-                            target_union,
-                            target_conf,
-                            int(frame_index),
-                            min_conf=float(min_conf),
-                            min_radius=float(min_radius),
-                        )
+                        # Ordinary OpenVINO tasks map each result to a distinct Cartesian
+                        # slice. Keep the generic accumulation contract race-free as well:
+                        # seam-padding results may target a slice already touched by an
+                        # ordinary result, so reconstruction and cleanup share one lock.
+                        target_lock = _target_slice_lock(target_union, int(frame_index))
+                        with target_lock:
+                            instance_count, frame_count = _process_cpu_retina_prediction_frame(
+                                frame_index,
+                                payloads[int(local_index)],
+                                int(out_size),
+                                target_union,
+                                target_conf,
+                                np.asarray(target_affine, dtype=np.float32),
+                                int(native_h),
+                                int(native_w),
+                                slice_lock=None,
+                            )
+                            has_foreground = _cleanup_prediction_slice_inplace(
+                                target_union,
+                                target_conf,
+                                int(frame_index),
+                                min_conf=float(min_conf),
+                                min_radius=float(min_radius),
+                            )
                         if bool(count_stats):
-                            stats['prediction_count'] = int(stats['prediction_count']) + int(instance_count)
+                            batch_prediction_count += int(instance_count)
                         if bool(count_stats) and bool(frame_count) and bool(has_foreground):
-                            stats['frames_with_predictions'] = int(stats['frames_with_predictions']) + 1
+                            batch_frames_with_predictions += 1
+                    with stats_lock:
+                        stats['prediction_count'] = (
+                            int(stats['prediction_count']) + int(batch_prediction_count)
+                        )
+                        stats['frames_with_predictions'] = (
+                            int(stats['frames_with_predictions'])
+                            + int(batch_frames_with_predictions)
+                        )
                 except BaseException as exc:
-                    consumer_errors.append(exc)
+                    _record_consumer_error(int(submission_index), exc)
 
-        consumer = threading.Thread(
-            target=_consume,
-            name='openvino-output-consumer',
-            daemon=True,
-        )
-        consumer.start()
+        # OpenVINO already bounds concurrent inference with request_count. Mirror the
+        # useful part of that capacity on the output side so completed requests can
+        # reconstruct masks in parallel without letting copied tensors grow unbounded.
+        consumer_count = max(1, int(self.request_count))
+        consumers = [
+            threading.Thread(
+                target=_consume,
+                name=f'openvino-output-consumer-{index}',
+                daemon=True,
+            )
+            for index in range(int(consumer_count))
+        ]
+        started_consumers: List[threading.Thread] = []
+        try:
+            for consumer in consumers:
+                consumer.start()
+                started_consumers.append(consumer)
+        except BaseException:
+            for _consumer in started_consumers:
+                output_queue.put(sentinel)
+            for consumer in started_consumers:
+                consumer.join()
+            raise
+
+        producer_error: Optional[BaseException] = None
+        wait_error: Optional[BaseException] = None
         try:
             for _paths, images, _info in source:  # type: ignore[operator]
                 if submitted_real >= int(num_frames):
@@ -818,19 +874,39 @@ class _OpenVinoCpuSegmenter:
                     if spec is not None and bool(spec.is_radial_padding)
                 )
                 input_value = self._prepare_input(images)
-                userdata = (tuple(frame_specs), int(input_value.shape[0]))
+                userdata = (
+                    int(submitted_batches),
+                    tuple(frame_specs),
+                    int(input_value.shape[0]),
+                )
                 self.infer_queue.start_async({self.input_name: input_value}, userdata=userdata)
                 submitted_real += int(real_count)
                 submitted_results += int(len(images))
+                submitted_batches += 1
                 radial_padding_processed += int(radial_count)
+        except BaseException as exc:
+            producer_error = exc
+        try:
             self.infer_queue.wait_all()
+        except BaseException as exc:
+            wait_error = exc
         finally:
-            output_queue.put(sentinel)
-            consumer.join()
+            for _consumer in consumers:
+                output_queue.put(sentinel)
+            for consumer in consumers:
+                consumer.join()
+        if producer_error is not None:
+            raise producer_error
+        if wait_error is not None:
+            raise wait_error
         if consumer_errors:
+            _submission_index, consumer_error = min(
+                consumer_errors,
+                key=lambda indexed_error: int(indexed_error[0]),
+            )
             raise RuntimeError(
-                f'OpenVINO CPU inference/postprocess failed: {consumer_errors[0]}'
-            ) from consumer_errors[0]
+                f'OpenVINO CPU inference/postprocess failed: {consumer_error}'
+            ) from consumer_error
         if int(submitted_real) != int(num_frames):
             raise RuntimeError(
                 f'OpenVINO CPU source produced {submitted_real}/{int(num_frames)} real frames'

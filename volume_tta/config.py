@@ -19,9 +19,9 @@ GIB = 1024 ** 3
 
 NRRD_SPACE = "left-posterior-superior"
 
-SCRIPT_VERSION = '17.1.4'
+SCRIPT_VERSION = '17.1.5'
 
-SCRIPT_VERSION_COMPACT = '1714'
+SCRIPT_VERSION_COMPACT = '1715'
 
 SCRIPT_BASENAME = f'GPT-5.6-Sol-Ultra_v{SCRIPT_VERSION}_SLURM.py'
 
@@ -966,7 +966,7 @@ def build_argparser() -> argparse.ArgumentParser:
         type=str,
         metavar="TILE_SIZE:TILE_STRIDE",
         help=(
-            "Enable one or more structured dense-tile groups. TILE_SIZE is the side length in "
+            "Enable one or more structured tile groups. TILE_SIZE is the side length in "
             "parent-view source pixels represented by one (--imgsz,--imgsz) inference range; "
             "smaller values increase magnification. TILE_STRIDE is the positive parent-view "
             "source-pixel step between adjacent tiles and must be <= TILE_SIZE; smaller values "
@@ -1009,7 +1009,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--centerline_filter_passes", default=0, type=int,
                    help="Maximum centerline-guided post-union passes. Pass 0 is the untouched audit checkpoint; 0 disables filtering and its audit NRRDs")
     p.add_argument("--centerline_auto_remove", action="store_true",
-                   help="Opt in to removing whole unprotected 2D components that satisfy every centerline, temporal, and backend-reliability guard. Protected connected anatomy remains marker-only; this flag never subtracts a watershed partition")
+                   help="Opt in to removing whole unprotected 2D components that satisfy every centerline, temporal, and backend-reliability guard. Protected connected foreground remains marker-only; this flag never subtracts a watershed partition")
     p.add_argument("--centerline_radius_factor", default=2.5, type=float, metavar="X",
                    help="Flag foreground that reaches the circle of radius X times the local EDT medial-ridge radius in the strict tangent-normal 2D plane")
     p.add_argument("--centerline_temporal_context", default=8, type=int,

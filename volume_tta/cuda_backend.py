@@ -2893,7 +2893,7 @@ class _GpuWorkerRenderEngine:
         *,
         mirror_radial_u: bool = False,
     ) -> object:
-        """Render one dense-tile inference raster directly when the view supports it."""
+        """Render one tile inference raster directly when the view supports it."""
         matrix = np.asarray(M_out_to_src, dtype=np.float32)
         if is_tilted_view(view):
             return self._render_tilted_frame(
@@ -3370,7 +3370,7 @@ class GpuRenderedYoloSource:
         return paths, batch, info
 
 class GpuTileRenderedYoloSource:
-    """GPU-rendered source for exactly one dense tile.
+    """GPU-rendered source for exactly one tile.
 
     Each task retains its own tile identity and affine from render through inference and
     postprocessing. The source never flattens or unions several tiles into one stream.

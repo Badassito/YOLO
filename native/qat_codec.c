@@ -912,10 +912,12 @@ static PyObject *qat_compress_gzip(
             destination_capacity, source_expected);
         goto error;
     }
+#if SIZEOF_VOID_P < 8
     if ((uint64_t)destination_capacity > (uint64_t)PY_SSIZE_T_MAX) {
         PyErr_SetString(PyExc_OverflowError, "QATzip output bound exceeds PY_SSIZE_T_MAX");
         goto error;
     }
+#endif
     output = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)destination_capacity);
     if (output == NULL) {
         goto error;

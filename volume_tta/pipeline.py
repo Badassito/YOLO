@@ -27,6 +27,7 @@ from concurrent.futures import (
 )
 from pathlib import Path
 from typing import (
+    Callable,
     Dict,
     List,
     Optional,
@@ -325,6 +326,11 @@ from .finalization import (
     scheduler_push_drain_enabled,
     scheduler_push_drain_heartbeat_seconds,
 )
+from .finalization import (
+    _union_projected_layer_refs_grouped_into_volume,
+    assemble_view_volumes_into_native_union,
+)
+from .topology import fill_3d_voids_inplace_streaming
 from .workers import (
     _cpu_inference_worker_main,
     _gpu_inference_worker_main,
@@ -466,6 +472,131 @@ def _create_tracked_thread_pool(
     )
     _run_resources().track_executor(executor)
     return executor
+
+
+def _finalize_physical_view_volume_group(
+    *,
+    model_name: str,
+    physical_view: ViewInfo,
+    variant_volumes: Sequence[Tuple[ViewInfo, np.ndarray]],
+    out_path: Path,
+    out_shape_tyx: Tuple[int, int, int],
+    workers: int,
+) -> Tuple[str, str, np.ndarray]:
+    """Collapse one completed TTA group and perform its terminal projection.
+
+    The scheduler calls this as soon as every runtime variant of one physical view is
+    terminal.  Keeping the operation independent of the scheduler's shared registries lets
+    it overlap remaining inference without exposing a half-collapsed group to result
+    handlers.  Radial/Tilted projection is an OR-homomorphism, so collapsing the native
+    variants first is equivalent to the retired project-each-variant-then-OR tail and avoids
+    repeated source-geometry allocations.
+    """
+    if not variant_volumes:
+        raise ValueError(
+            f'{model_name}/{physical_view_name(physical_view)} has no dense variant volumes'
+        )
+
+    runtime_views = [view for view, _volume in variant_volumes]
+    runtime_volumes = {
+        str(view.name): volume
+        for view, volume in variant_volumes
+    }
+    input_volumes = list(runtime_volumes.values())
+    try:
+        collapsed = collapse_tta_variant_volumes_to_physical_views(
+            {str(model_name): runtime_volumes},
+            runtime_views,
+            workers=max(1, int(workers)),
+        )
+        physical_name = str(physical_view_name(physical_view))
+        physical_volumes = collapsed.get(str(model_name), {})
+        native_volume = physical_volumes.get(physical_name)
+        if native_volume is None or len(physical_volumes) != 1:
+            raise RuntimeError(
+                f'{model_name}/{physical_name}: TTA collapse produced '
+                f'{sorted(physical_volumes)} instead of one physical volume'
+            )
+
+        if physical_view.family != 'radial' and not is_tilted_view(physical_view):
+            return str(model_name), physical_name, native_volume
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            queue_runner = HybridBackprojectionQueue(cpu_workers=max(1, int(workers)))
+            projected_results = queue_runner.run((ViewBackprojectionQueueJob(
+                model_name=str(model_name),
+                view=physical_view,
+                native_source=native_volume,
+                out_path=out_path,
+                desc=f'Backprojecting completed physical view {model_name}/{physical_name}',
+                min_radius=0.0,
+                workers=max(1, int(workers)),
+                out_shape_tyx=tuple(int(value) for value in out_shape_tyx),
+            ),))
+            if len(projected_results) != 1:
+                raise RuntimeError(
+                    f'{model_name}/{physical_name}: terminal backprojection returned '
+                    f'{len(projected_results)} result(s)'
+                )
+            result_model, result_view, projected = projected_results[0]
+            return str(result_model), str(result_view), projected
+        finally:
+            close_memmap_array(native_volume)
+    except BaseException:
+        # Collapse retires all but its first accumulator.  Error paths can stop before that
+        # ownership transfer completes, so close every distinct input defensively.
+        closed_ids: set[int] = set()
+        for volume in input_volumes:
+            if id(volume) in closed_ids:
+                continue
+            closed_ids.add(id(volume))
+            try:
+                close_memmap_array_without_flush(volume)
+            except Exception:
+                pass
+        raise
+
+
+def _run_physical_view_finalization_with_handoff(
+    *,
+    handoff_credit: threading.Semaphore,
+    stop_event: threading.Event,
+    variant_volumes: Sequence[Tuple[ViewInfo, np.ndarray]],
+    finalize: Callable[[], Tuple[str, str, np.ndarray]],
+) -> Tuple[str, str, np.ndarray]:
+    """Run one dense finalizer while transferring exactly one reducer credit.
+
+    A successful return transfers the credit with the returned physical volume. Every
+    exceptional path retains ownership locally, releases the credit if acquired, and closes
+    the detached variants so scheduler teardown cannot strand registry-less workspaces.
+    """
+    credit_acquired = False
+    try:
+        while not handoff_credit.acquire(timeout=0.25):
+            if stop_event.is_set():
+                raise RuntimeError(
+                    'streaming physical-view finalization stopped while waiting '
+                    'for the dense union handoff credit'
+                )
+        credit_acquired = True
+        if stop_event.is_set():
+            raise RuntimeError('streaming physical-view finalization was stopped')
+        return finalize()
+    except BaseException:
+        if credit_acquired:
+            handoff_credit.release()
+        retired_ids: set[int] = set()
+        for _view, volume in variant_volumes:
+            if id(volume) in retired_ids:
+                continue
+            retired_ids.add(id(volume))
+            try:
+                close_memmap_array_without_flush(volume)
+            except Exception:
+                pass
+        raise
+
 
 def main() -> None:
     """Execute one pipeline run with a lifecycle boundary spanning the full function."""
@@ -1048,7 +1179,7 @@ def _main_impl() -> None:
         v1613_bundle_reasons.append('requires --batch 1')
     if str(retina_processor).strip().lower() != 'gpu':
         v1613_bundle_reasons.append('requires GPU retina processing')
-    # Dense tiles no longer disqualify D1: their parent/bridge gates consume the same exact
+    # Tiles no longer disqualify D1: their parent/bridge gates consume the same exact
     # packed view-native shadow used by interpolation.
     if str(channel_format.kind) != 'gray' or int(channel_format.channel_count) != 1:
         v1613_bundle_reasons.append('requires one-channel gray input')
@@ -1451,8 +1582,8 @@ def _main_impl() -> None:
 
     # v16.4.0: TTA rotations are first-class view variants. Every runtime view owns exactly
     # one augmentation, one full-frame accumulator, one tile gate graph, one interpolation
-    # graph, and its own NRRD namespace. The physical view list is retained only for the final
-    # post-variant OR/backprojection stage.
+    # graph, and its own NRRD namespace. The physical view list drives scheduler-time terminal
+    # TTA collapse/backprojection as soon as all variants of that view become immutable.
     views = expand_views_into_tta_variants(physical_views, angles)
     # Reserve the second resident allocation only for runs that actually contain a
     # Radial task. This keeps Cartesian/Tilted-only runs from losing GPU residency merely
@@ -1620,7 +1751,7 @@ def _main_impl() -> None:
             _env_int('YOLO_TTA_TILE_POSTPROCESS_WORKERS', tile_postprocess_workers_default),
         ),
     )
-    # Dense GPU-worker tile results must never wait behind parent interpolation or sparse
+    # Array-backed GPU-worker tile results must never wait behind parent interpolation or sparse
     # gate work in the shared tile executor. A small dedicated outer pool performs cleanup
     # plus CTILE conversion; each task still uses the configured slice-parallel workers.
     tile_dense_retirement_workers_default = max(
@@ -1668,6 +1799,26 @@ def _main_impl() -> None:
         min(
             int(worker_budget),
             _env_int('YOLO_TTA_TILE_INTERPOLATION_TASK_WORKERS', tile_interpolation_task_workers_default),
+        ),
+    )
+    # One terminal physical-view lane overlaps completed TTA collapse/backprojection with
+    # still-running inference.  Its inner slice budget is one ordinary parent-pool share,
+    # avoiding a second whole-box CPU pool while inference subprocesses are live.
+    streaming_view_finalization_workers = max(
+        1,
+        min(
+            max(1, len(physical_views)),
+            _env_int('YOLO_TTA_STREAMING_VIEW_FINALIZATION_WORKERS', 1),
+        ),
+    )
+    streaming_view_finalization_slice_workers = max(
+        1,
+        min(
+            int(worker_budget),
+            _env_int(
+                'YOLO_TTA_STREAMING_VIEW_FINALIZATION_SLICE_WORKERS',
+                max(1, int(worker_budget) // max(1, int(parent_postprocess_workers) + 2)),
+            ),
         ),
     )
 
@@ -1734,11 +1885,17 @@ def _main_impl() -> None:
     )
     print(
         'Tile postprocess workers: '
-        f'{tile_postprocess_workers} (dedicated dense cleanup/CTILE retirement workers: '
+        f'{tile_postprocess_workers} (dedicated tile-result cleanup/CTILE retirement workers: '
         f'{tile_dense_retirement_workers} x {tile_dense_retirement_slice_workers} slice workers, '
         f'gate/consolidation per-tile slice workers: '
         f'{tile_slice_postprocess_workers}, consolidated-tile interpolation workers: '
         f'{tile_interpolation_task_workers})'
+    )
+    print(
+        'Streaming physical-view finalization: '
+        f'{int(streaming_view_finalization_workers)} lane(s) x '
+        f'{int(streaming_view_finalization_slice_workers)} slice worker(s); '
+        'completed TTA groups collapse/backproject while later views continue inference.'
     )
     if bool(interpolation_process_backend_active):
         print(
@@ -1774,6 +1931,16 @@ def _main_impl() -> None:
 
     view_infos_by_name: Dict[str, ViewInfo] = {view.name: view for view in views}
     view_infos_by_name.update({view.name: view for view in physical_views})
+    physical_view_infos_by_name: Dict[str, ViewInfo] = {
+        str(physical_view_name(view)): view for view in physical_views
+    }
+    variant_views_by_physical_name: Dict[str, Tuple[ViewInfo, ...]] = {
+        physical_name: tuple(
+            view for view in views
+            if str(physical_view_name(view)) == str(physical_name)
+        )
+        for physical_name in physical_view_infos_by_name
+    }
     view_volumes_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
     native_view_support_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
     parent_mask_support_by_model: Dict[str, Dict[str, object]] = {model_name: {} for model_name, _ in yolo_models}
@@ -2091,6 +2258,19 @@ def _main_impl() -> None:
         max_workers=int(tile_postprocess_workers),
         thread_name_prefix='tile-postprocess',
     )
+    view_finalization_executor = _create_tracked_thread_pool(
+        max_workers=int(streaming_view_finalization_workers),
+        thread_name_prefix='physical-view-finalize',
+    )
+    final_union_reducer_executor = _create_tracked_thread_pool(
+        max_workers=1,
+        thread_name_prefix='streaming-final-union',
+    )
+    # A finalized dense physical view is source-sized.  Keep at most one such handoff
+    # alive between the finalizer and the single-writer union reducer; otherwise several
+    # fast finalizers can outrun the reducer and retain multiple uncharged source volumes.
+    physical_view_dense_handoff_credit = threading.BoundedSemaphore(1)
+    physical_view_finalization_stop = threading.Event()
 
     pending_prediction_build_jobs: deque[Tuple[str, ViewInfo, object]] = deque()
     for view, aug_job in iter_aug_jobs_round_robin(inference_views, aug_jobs_by_view):
@@ -2111,6 +2291,14 @@ def _main_impl() -> None:
 
     view_processing_futures: Dict[Future, Tuple[str, str]] = {}
     view_processing_submitted: set[Tuple[str, str]] = set()
+    physical_view_finalization_futures: Dict[Future, Tuple[str, str]] = {}
+    physical_view_finalization_submitted: set[Tuple[str, str]] = set()
+    physical_view_finalization_refs: Dict[Tuple[str, str], Tuple[NrrdLayerRef, ...]] = {}
+    terminal_view_variants: set[Tuple[str, str]] = set()
+    physical_view_union_futures: Dict[Future, Tuple[str, str]] = {}
+    physical_view_union_submitted: set[Tuple[str, str]] = set()
+    physical_view_union_completed: set[Tuple[str, str]] = set()
+    streaming_final_union_holder: Dict[str, np.ndarray] = {}
     tile_cleanup_futures: Dict[Future, Tuple[str, str, str, str]] = {}
     # P (cleaned parent YOLO) is published before parent interpolation through this queue.
     # B (parent-only interpolation delta) becomes ready when the parent future completes.
@@ -2734,6 +2922,235 @@ def _main_impl() -> None:
             return tilted_native_output_by_model[str(model_name)][str(view_name)]
         return view_volumes_by_model[str(model_name)][str(view_name)]
 
+    def _submit_physical_view_union_reduction(
+        physical_key: Tuple[str, str],
+        *,
+        physical_volume: Optional[np.ndarray],
+        layer_refs: Sequence[NrrdLayerRef],
+        dense_handoff_credit_held: bool = False,
+    ) -> None:
+        if physical_key in physical_view_union_submitted:
+            raise RuntimeError(f'physical view {physical_key} was submitted to final union twice')
+        physical_view_union_submitted.add(physical_key)
+        refs = tuple(layer_refs)
+        if physical_volume is None and not refs:
+            physical_view_union_completed.add(physical_key)
+            return
+
+        def _reduce_physical_view() -> Tuple[str, str]:
+            model_name_local, physical_name_local = physical_key
+            try:
+                final_union = streaming_final_union_holder.get(str(model_name_local))
+                if final_union is None:
+                    # The accumulator persists until global postprocessing, so keep it
+                    # path-backed while inference canvases are still live. The OS page cache
+                    # remains reclaimable; this avoids an uncharged source-sized anonymous
+                    # array. Allocation is inside the ownership guard so failure still retires
+                    # the dense handoff and returns its credit.
+                    final_union = allocate_workspace_array(
+                        shape=(int(input_T), int(input_H), int(input_W)),
+                        dtype=np.uint8,
+                        path=temp_dir / 'final_union_volume.u8.dat',
+                        desc='Streaming final single-model view-union volume',
+                        prefer_memory=False,
+                        reserve_bytes=16 * GIB,
+                    )
+                    streaming_final_union_holder[str(model_name_local)] = final_union
+                if physical_volume is not None:
+                    assemble_view_volumes_into_native_union(
+                        final_union_mm=final_union,
+                        view_volume_mms={str(physical_name_local): physical_volume},
+                        T=int(T), H=int(H), W=int(W),
+                        out_shape_tyx=(int(input_T), int(input_H), int(input_W)),
+                        workers=int(streaming_view_finalization_slice_workers),
+                    )
+                _union_projected_layer_refs_grouped_into_volume(
+                    refs,
+                    final_union,
+                    workers=int(streaming_view_finalization_slice_workers),
+                    desc=(
+                        f'Streaming final union {model_name_local}/'
+                        f'{physical_name_local}'
+                    ),
+                )
+                return physical_key
+            finally:
+                if physical_volume is not None:
+                    close_memmap_array(physical_volume)
+                if dense_handoff_credit_held:
+                    physical_view_dense_handoff_credit.release()
+
+        try:
+            fut = final_union_reducer_executor.submit(_reduce_physical_view)
+        except BaseException:
+            physical_view_union_submitted.discard(physical_key)
+            if physical_volume is not None:
+                close_memmap_array_without_flush(physical_volume)
+            if dense_handoff_credit_held:
+                physical_view_dense_handoff_credit.release()
+            raise
+        physical_view_union_futures[fut] = physical_key
+
+    def _detach_terminal_physical_group_inputs(
+        model_name: str,
+        variants: Sequence[ViewInfo],
+    ) -> Tuple[Tuple[Tuple[ViewInfo, np.ndarray], ...], Tuple[NrrdLayerRef, ...]]:
+        """Transfer immutable dense owners/refs out of scheduler registries."""
+        dense_inputs: List[Tuple[ViewInfo, np.ndarray]] = []
+        selected_refs: Dict[str, NrrdLayerRef] = {}
+        for view in variants:
+            runtime_name = str(view.name)
+            view_refs = tuple(
+                ref for ref in nrrd_layer_refs
+                if str(getattr(ref, 'model_name', '')) == str(model_name)
+                and str(getattr(ref, 'view_name', '')) == runtime_name
+                and str(getattr(ref, 'layer_role', 'additive_component')) == 'additive_component'
+                and str(getattr(ref, 'recomposition_op', 'union')) == 'union'
+            )
+            if view.family == 'radial':
+                primary = radial_native_output_by_model[str(model_name)].get(runtime_name)
+            elif is_tilted_view(view):
+                primary = tilted_native_output_by_model[str(model_name)].get(runtime_name)
+            else:
+                primary = view_volumes_by_model[str(model_name)].get(runtime_name)
+            fallback = native_view_support_by_model[str(model_name)].get(runtime_name)
+
+            # Match the established tail's contribution choice. Projected component refs
+            # supersede retained Radial/Tilted canvases. Cartesian dense volumes remain
+            # authoritative, except that a D1 source-space base ref accompanies a dense
+            # orthogonal-additions continuation.
+            refs_are_authoritative = bool(
+                view_refs and (
+                    view.family == 'radial'
+                    or is_tilted_view(view)
+                    or primary is None
+                )
+            )
+            dense_owner: Optional[np.ndarray]
+            if refs_are_authoritative:
+                dense_owner = None
+                for ref in view_refs:
+                    selected_refs.setdefault(str(ref.key), ref)
+            else:
+                dense_owner = primary
+                if dense_owner is None and (view.family == 'radial' or is_tilted_view(view)):
+                    dense_owner = fallback
+                d1_ref = d1_layer_ref_by_parent.get((str(model_name), runtime_name))
+                if dense_owner is not None and d1_ref is not None:
+                    selected_refs.setdefault(str(d1_ref.key), d1_ref)
+
+            detached: List[object] = []
+            for registry in (
+                native_view_support_by_model,
+                radial_native_output_by_model,
+                tilted_native_output_by_model,
+                view_volumes_by_model,
+            ):
+                value = registry.get(str(model_name), {}).pop(runtime_name, None)
+                if value is not None:
+                    detached.append(value)
+            if dense_owner is not None:
+                dense_inputs.append((view, dense_owner))
+
+            retired_ids: set[int] = set()
+            for value in detached:
+                if value is dense_owner or id(value) in retired_ids:
+                    continue
+                retired_ids.add(id(value))
+                try:
+                    close_memmap_array_without_flush(value)
+                except Exception:
+                    pass
+
+        return tuple(dense_inputs), tuple(selected_refs.values())
+
+    def _submit_ready_physical_view_finalization(
+        model_name: str,
+        physical_name: str,
+    ) -> None:
+        physical_key = (str(model_name), str(physical_name))
+        if physical_key in physical_view_finalization_submitted:
+            return
+        variants = variant_views_by_physical_name[str(physical_name)]
+        if not all(
+            (str(model_name), str(view.name)) in terminal_view_variants
+            for view in variants
+        ):
+            return
+
+        variant_volumes, group_refs = _detach_terminal_physical_group_inputs(
+            str(model_name), variants,
+        )
+        physical_view_finalization_submitted.add(physical_key)
+        if not variant_volumes:
+            _submit_physical_view_union_reduction(
+                physical_key, physical_volume=None, layer_refs=group_refs,
+            )
+            print(
+                f'Streaming physical-view finalization {model_name}/{physical_name}: '
+                f'{len(group_refs)} immutable component ref(s) queued for early global fusion.'
+            )
+            return
+
+        physical_view = physical_view_infos_by_name[str(physical_name)]
+        projection_bytes = (
+            int(array_nbytes((int(input_T), int(input_H), int(input_W)), np.uint8))
+            if physical_view.family == 'radial' or is_tilted_view(physical_view)
+            else 1
+        )
+
+        def _run_terminal_group() -> Tuple[str, str, np.ndarray]:
+            def _finalize_admitted_group() -> Tuple[str, str, np.ndarray]:
+                with parent_transient_admission.reserve(
+                    int(projection_bytes),
+                    f'streaming physical-view finalization {model_name}/{physical_name}',
+                ):
+                    return _finalize_physical_view_volume_group(
+                        model_name=str(model_name),
+                        physical_view=physical_view,
+                        variant_volumes=variant_volumes,
+                        out_path=(
+                            temp_dir / 'view_volumes' / str(model_name)
+                            / f'{str(physical_name)}.u8.dat'
+                        ),
+                        out_shape_tyx=(int(input_T), int(input_H), int(input_W)),
+                        workers=int(streaming_view_finalization_slice_workers),
+                    )
+
+            return _run_physical_view_finalization_with_handoff(
+                handoff_credit=physical_view_dense_handoff_credit,
+                stop_event=physical_view_finalization_stop,
+                variant_volumes=variant_volumes,
+                finalize=_finalize_admitted_group,
+            )
+
+        try:
+            fut = view_finalization_executor.submit(_run_terminal_group)
+        except BaseException:
+            physical_view_finalization_submitted.discard(physical_key)
+            for _view, volume in variant_volumes:
+                try:
+                    close_memmap_array_without_flush(volume)
+                except Exception:
+                    pass
+            raise
+        physical_view_finalization_futures[fut] = physical_key
+        physical_view_finalization_refs[physical_key] = tuple(group_refs)
+        print(
+            f'Streaming physical-view finalization queued {model_name}/{physical_name} '
+            f'after {len(variants)} terminal TTA variant(s).'
+        )
+
+    def _mark_view_variant_terminal(model_name: str, view_name: str) -> None:
+        terminal_key = (str(model_name), str(view_name))
+        if terminal_key in terminal_view_variants:
+            raise RuntimeError(f'view variant {terminal_key} became terminal more than once')
+        terminal_view_variants.add(terminal_key)
+        view = view_infos_by_name[str(view_name)]
+        _submit_ready_physical_view_finalization(
+            str(model_name), str(physical_view_name(view)),
+        )
+
     def _retire_parent_dense_view(
         model_name: str,
         view_name: str,
@@ -2796,6 +3213,7 @@ def _main_impl() -> None:
                     _dispatch_inference_windows()
             except (NameError, UnboundLocalError):
                 pass
+        _mark_view_variant_terminal(str(model_name), str(view_name))
 
     def _retire_parent_tile_supports_if_gates_complete(
         model_name: str,
@@ -2850,6 +3268,7 @@ def _main_impl() -> None:
 
         tile_parent_finalization_submitted.add(parent_key)
         if not bool(component_ref_dense_retirement_active):
+            _mark_view_variant_terminal(str(model_name), str(view_name))
             return
         if bool(nrrd_layers_needed):
             _retire_parent_dense_view(
@@ -3604,6 +4023,10 @@ def _main_impl() -> None:
                     extra_arrays=(result.native_support_mm, result.final_view_volume_mm),
                     reason='non-tiled terminal component refs are complete',
                 )
+            elif int(tile_expected_by_parent.get(completed_view_key, 0)) <= 0:
+                _mark_view_variant_terminal(
+                    str(result.model_name), str(result.view_name),
+                )
             # Parent YOLO and bridge supports are now immutable and same-angle. Release
             # any cleaned tiles that finished inference first, then check whether all original
             # tiles have completed their two-stage component gates.
@@ -3627,7 +4050,7 @@ def _main_impl() -> None:
                 )
                 continue
             if isinstance(result, DeferredTilePostprocessResult):
-                # v16.4.3: CTILE publication is the dense-result retirement boundary.
+                # v16.4.3: CTILE publication is the array-backed-result retirement boundary.
                 # Release the parent-owned memfd/path mapping before interpolation or either
                 # gate can queue behind unrelated CPU work.
                 _release_tile_dense_result_for_key(
@@ -3646,7 +4069,7 @@ def _main_impl() -> None:
             if parent_gate_result.residual_result is None:
                 _release_tile_dense_result_for_key(
                     str(model_name), str(view_name), str(tile_id),
-                    reason='parent gate consumed dense tile result',
+                    reason='parent gate consumed array-backed tile result',
                 )
                 _mark_tile_complete(
                     str(model_name), str(view_name), str(config_id), str(tile_id),
@@ -3663,7 +4086,7 @@ def _main_impl() -> None:
             fut.result()
             _release_tile_dense_result_for_key(
                 str(model_name), str(view_name), str(tile_id),
-                reason='bridge gate consumed dense tile residual',
+                reason='bridge gate consumed array-backed tile residual',
             )
             _mark_tile_complete(
                 str(model_name), str(view_name), str(config_id), str(tile_id),
@@ -3733,6 +4156,46 @@ def _main_impl() -> None:
                 str(parent_key[0]),
                 str(parent_key[1]),
                 reason='full-frame and all configured tile-set terminal refs are complete',
+            )
+
+        for fut in list(physical_view_finalization_futures.keys()):
+            if not fut.done():
+                continue
+            expected_key = physical_view_finalization_futures.pop(fut)
+            result_model, result_view, physical_volume = fut.result()
+            result_key = (str(result_model), str(result_view))
+            if result_key != expected_key:
+                close_memmap_array_without_flush(physical_volume)
+                physical_view_dense_handoff_credit.release()
+                raise RuntimeError(
+                    f'physical-view finalizer returned {result_key}, expected {expected_key}'
+                )
+
+            group_refs = physical_view_finalization_refs.pop(expected_key, ())
+            _submit_physical_view_union_reduction(
+                expected_key,
+                physical_volume=physical_volume,
+                layer_refs=group_refs,
+                dense_handoff_credit_held=True,
+            )
+            print(
+                f'Streaming physical-view finalization completed '
+                f'{result_model}/{result_view}; terminal global fusion is queued.'
+            )
+
+        for fut in list(physical_view_union_futures.keys()):
+            if not fut.done():
+                continue
+            expected_key = physical_view_union_futures.pop(fut)
+            result_key = fut.result()
+            if tuple(result_key) != tuple(expected_key):
+                raise RuntimeError(
+                    f'streaming final-union reducer returned {result_key}, '
+                    f'expected {expected_key}'
+                )
+            physical_view_union_completed.add(expected_key)
+            print(
+                f'Streaming final union committed {expected_key[0]}/{expected_key[1]}.'
             )
 
         output_manager.reap_completed()
@@ -3828,7 +4291,7 @@ def _main_impl() -> None:
             )
         else:
             print(f'Purged stale inference-worker result scratch before this run: {gpu_worker_result_dir}')
-    # v16.4.3: every tile needs one independent dense crop only through GPU publication and
+    # v16.4.3: every tile needs one independent array-backed crop only through GPU publication and
     # cleanup. Those files must not form a producer/consumer queue behind interpolation or
     # component gates. Reserve their logical uint8 bytes at dispatch and release the credit
     # immediately when the dedicated cleanup pool publishes a crop-local CTILE store.
@@ -3837,7 +4300,7 @@ def _main_impl() -> None:
     gpu_worker_tile_dense_result_memory_safe_limit: Optional[int] = None
     if scratch_dir_is_memory_backed():
         # A pathname fallback on tmpfs consumes the same cgroup/anonymous-memory budget as
-        # memfd. Keep the live dense cap below current headroom after a fixed safety reserve;
+        # memfd. Keep the live array-backed-result cap below current headroom after a fixed safety reserve;
         # unlike the old max(1 GiB, ...) floor, zero headroom must reject every positive tile
         # before dispatch instead of knowingly risking an uncatchable cgroup OOM kill.
         safe_headroom = max(0, int(available_anon_work_bytes()) - 16 * GIB)
@@ -3978,7 +4441,7 @@ def _main_impl() -> None:
             return False
         if not _tile_dense_result_task_admissible(task):
             raise RuntimeError(
-                f'tile dense-result admission raced its {gpu_worker_tile_dense_result_limit / GIB:.1f} GiB budget'
+                f'array-backed tile-result admission raced its {gpu_worker_tile_dense_result_limit / GIB:.1f} GiB budget'
             )
         need = int(_tile_dense_result_task_bytes(task))
         gpu_worker_tile_dense_result_reservations[task_id] = int(need)
@@ -3995,7 +4458,7 @@ def _main_impl() -> None:
         return True
 
     def _prepare_tile_dense_result_workspaces(task: Dict[str, object]) -> None:
-        """Allocate one task's dense tile result in shared RAM when possible.
+        """Allocate one task's array-backed tile result in shared RAM when possible.
 
         The parent owns each mapping and transfers duplicate memfd descriptors to the selected
         CUDA worker. Pathname files remain a bounded fallback when cgroup/RAM headroom is too
@@ -4217,7 +4680,7 @@ def _main_impl() -> None:
             warn_seconds = float(tile_dense_worker_result_warn_seconds())
             if warn_seconds > 0.0 and retention_seconds >= warn_seconds:
                 print(
-                    f'Warning: dense tile worker result task {task_id_i} remained live for '
+                    f'Warning: array-backed tile worker result task {task_id_i} remained live for '
                     f'{retention_seconds:.1f}s before {reason or "retirement"}; '
                     'the backing has now been closed and deleted. '
                     'YOLO_TTA_TILE_DENSE_RESULT_WARN_SECONDS adjusts this diagnostic.'
@@ -6113,8 +6576,8 @@ def _main_impl() -> None:
             largest_tile_result = int(max(tile_result_sizes))
             if bool(keep_temp_artifacts):
                 print(
-                    'Warning: retaining temporary artifacts keeps every dense tile worker result for '
-                    'diagnostics; tile-result backpressure and immediate dense-file '
+                    'Warning: retaining temporary artifacts keeps every array-backed tile worker result for '
+                    'diagnostics; tile-result backpressure and immediate backing-file '
                     f'retirement are intentionally disabled (largest result={largest_tile_result / GIB:.2f} GiB).'
                 )
             else:
@@ -6123,7 +6586,7 @@ def _main_impl() -> None:
                     and int(largest_tile_result) > int(gpu_worker_tile_dense_result_memory_safe_limit)
                 ):
                     raise RuntimeError(
-                        'One dense crop-local tile result requires '
+                        'One array-backed crop-local tile result requires '
                         f'{largest_tile_result / GIB:.2f} GiB, but the memory-backed scratch '
                         'root has only '
                         f'{gpu_worker_tile_dense_result_memory_safe_limit / GIB:.2f} GiB of '
@@ -6133,7 +6596,7 @@ def _main_impl() -> None:
                     )
                 print(
                     'v16.4.3 cleanup-boundary tile-result retirement active: '
-                    f'live dense result budget={gpu_worker_tile_dense_result_limit / GIB:.1f} GiB / '
+                    f'live array-backed result budget={gpu_worker_tile_dense_result_limit / GIB:.1f} GiB / '
                     f'{gpu_worker_tile_dense_result_task_limit} task(s), '
                     f'largest tile result={largest_tile_result / GIB:.2f} GiB; '
                     'shared memfd RAM is preferred so gpu_worker_results is a bounded pathname fallback. '
@@ -6141,7 +6604,7 @@ def _main_impl() -> None:
                     'P-ready tiles are scheduled ahead of P-not-ready tiles. '
                     f'every nonempty tile retires to CTILE on {tile_dense_retirement_workers} dedicated '
                     f'cleanup task(s) x {tile_dense_retirement_slice_workers} slice worker(s) before '
-                    'parent interpolation or component gates can retain its dense backing. '
+                    'parent interpolation or component gates can retain its array backing. '
                     'YOLO_TTA_TILE_DENSE_RESULT_MAX_GIB / _MAX_TASKS adjust admission; '
                     'YOLO_TTA_TILE_DENSE_RETIREMENT_WORKERS / _SLICE_WORKERS adjust retirement throughput.'
                 )
@@ -6441,6 +6904,7 @@ def _main_impl() -> None:
                 else:
                     view_processing_submitted.add(meta_key)
                     view_slice_meta.pop(meta_key, None)
+                    _mark_view_variant_terminal(model_name_s, str(view.name))
             return
         if str(task.get('result_mode', 'file')) == 'direct_union':
             # The worker already wrote its disjoint slice window straight into the
@@ -7440,6 +7904,8 @@ def _main_impl() -> None:
             waitables: List[Future] = list(pending_prediction_volume_futures)
             waitables.extend(list(prediction_accumulation_futures.keys()))
             waitables.extend(list(view_processing_futures.keys()))
+            waitables.extend(list(physical_view_finalization_futures.keys()))
+            waitables.extend(list(physical_view_union_futures.keys()))
             waitables.extend(list(tile_cleanup_futures.keys()))
             waitables.extend(list(tile_parent_gate_futures.keys()))
             waitables.extend(list(tile_bridge_gate_futures.keys()))
@@ -7468,7 +7934,9 @@ def _main_impl() -> None:
                     not tile_cleanup_futures and
                     not tile_consolidation_futures and
                     not tile_parent_finalization_futures and
-                    not view_processing_futures
+                    not view_processing_futures and
+                    not physical_view_finalization_futures and
+                    not physical_view_union_futures
                 )
                 if scheduler_quiescent:
                     waiting_parent = {
@@ -7489,12 +7957,33 @@ def _main_impl() -> None:
                         for key, expected in tile_expected_by_parent.items()
                         if len(tile_completed_by_parent.get(key, set())) < int(expected)
                     }
-                    if waiting_parent or waiting_bridge or incomplete_tiles:
+                    expected_terminal_variants = {
+                        (str(model_name), str(view.name))
+                        for model_name, _model in yolo_models
+                        for view in inference_views
+                    }
+                    missing_terminal_variants = sorted(
+                        expected_terminal_variants - terminal_view_variants
+                    )
+                    expected_physical_unions = {
+                        (str(model_name), str(physical_name))
+                        for model_name, _model in yolo_models
+                        for physical_name in physical_view_infos_by_name
+                    }
+                    missing_physical_unions = sorted(
+                        expected_physical_unions - physical_view_union_completed
+                    )
+                    if (
+                        waiting_parent or waiting_bridge or incomplete_tiles
+                        or missing_terminal_variants or missing_physical_unions
+                    ):
                         raise RuntimeError(
-                            'Tile scheduler became quiescent with unresolved two-stage gate '
-                            f'dependencies: waiting_for_parent={waiting_parent}, '
+                            'Scheduler became quiescent with unresolved terminal dependencies: '
+                            f'waiting_for_parent={waiting_parent}, '
                             f'waiting_for_bridge={waiting_bridge}, '
-                            f'incomplete_tiles={incomplete_tiles}'
+                            f'incomplete_tiles={incomplete_tiles}, '
+                            f'missing_terminal_variants={missing_terminal_variants}, '
+                            f'missing_physical_unions={missing_physical_unions}'
                         )
                     break
                 continue
@@ -7512,6 +8001,7 @@ def _main_impl() -> None:
                 wait(waitables, timeout=(0.1 if inference_worker_process_active else None), return_when=FIRST_COMPLETED)
 
     finally:
+        physical_view_finalization_stop.set()
         if sys.exc_info()[0] is not None:
             # (completion): the wait=True shutdowns below block on render
             # tasks parked in wait_for_volume_ready for still-running streaming
@@ -7539,6 +8029,26 @@ def _main_impl() -> None:
         parent_postprocess_executor.shutdown(wait=True)
         tile_dense_retirement_executor.shutdown(wait=True)
         tile_postprocess_executor.shutdown(wait=True)
+        view_finalization_executor.shutdown(wait=True)
+        if sys.exc_info()[0] is not None:
+            # A scheduler error can bypass the normal future-drain handoff. Successful
+            # finalizers still own both their source-sized result and the sole dense credit;
+            # consume those completed results now that every finalizer is quiescent.
+            for pending_finalizer in list(physical_view_finalization_futures):
+                if pending_finalizer.cancelled():
+                    continue
+                try:
+                    pending_result = pending_finalizer.result()
+                except BaseException:
+                    # The worker releases the credit on every exceptional exit.
+                    continue
+                try:
+                    close_memmap_array_without_flush(pending_result[2])
+                finally:
+                    physical_view_dense_handoff_credit.release()
+            physical_view_finalization_futures.clear()
+            physical_view_finalization_refs.clear()
+        final_union_reducer_executor.shutdown(wait=True)
         # Error teardown can bypass the normal tile-result lifecycle. Every worker and
         # tile-postprocess future is quiescent now, so release any parent-owned memfd/disk
         # mappings that never reached sparse retirement without racing an active consumer.
@@ -7596,17 +8106,19 @@ def _main_impl() -> None:
         nrrd_done_at_boundary, nrrd_total_at_boundary = active_layer_sink.progress_counts()
     else:
         nrrd_done_at_boundary, nrrd_total_at_boundary = 0, 0
-    print('\n=== Scheduler postprocessing drained; entering final assembly/output tail ===')
+    print('\n=== Scheduler and streamed physical-view finalization drained; entering global output tail ===')
     print(
         f'Inference tasks completed={int(gpu_worker_results_collected)}/{int(gpu_worker_total_tasks)}; '
         f'queued NRRD writes completed={int(nrrd_done_at_boundary)}/{int(nrrd_total_at_boundary)}. '
         'Subsequent phase banners and telemetry identify every remaining tail stage.'
     )
 
-    # The scheduler's finally block above has joined every GPU/OpenVINO inference worker and
-    # interpolation executor. Only now may CPU-only tail stages reclaim the CPU reservations
-    # held for live inference subprocesses. Keep
-    # Separate budgets preserve the configured per-stage sizes when expansion is disabled.
+    # Per-view TTA collapse/backprojection and source-space union ran as scheduler futures
+    # while later views were still inferencing. The remaining topology-dependent 3D
+    # postprocessing and final output checkpoints genuinely depend on every view. With all
+    # GPU/OpenVINO workers and interpolation executors joined, those global stages may now
+    # reclaim the subprocess CPU reservations. Separate budgets preserve the configured
+    # per-stage sizes when expansion is disabled.
     tail_slice_workers = int(
         tail_worker_budget if tail_budget_expansion_active else slice_postprocess_workers
     )
@@ -7677,6 +8189,10 @@ def _main_impl() -> None:
     fused_projected_layer_refs: List[NrrdLayerRef] = []  #
     for view in views:
         for model_name, _ in yolo_models:
+            if str(model_name) in streaming_final_union_holder:
+                # This physical view's dense/ref contribution was already committed by the
+                # scheduler-time single-writer reducer.
+                continue
             d1_base_ref = d1_layer_ref_by_parent.get((str(model_name), str(view.name)))
             d1_dense_orthogonal_additions_present = bool(
                 str(view.name) in view_volumes_by_model.get(str(model_name), {})
@@ -7782,20 +8298,45 @@ def _main_impl() -> None:
     # Cartesian working stacks are restored working->source with one resample while merging;
     # radial/tilted volumes arrive already backprojected to source geometry. Void fill,
     # Gaussian smoothing (sigma in SOURCE voxels) and postprocessing keep_objects run at source dimensions.
-    final_union_mm = assemble_final_union_after_view_union(
-        view_volumes_by_model=view_volumes_by_model,
-        T=T,
-        H=H,
-        W=W,
-        out_path=temp_dir / 'final_union_volume.u8.dat',
-        temp_dir=temp_dir,
-        out_shape_tyx=source_output_shape_tyx,
-        enable_3d_void_fill=bool(args.enable_3d_void_fill),
-        keep_temp=bool(keep_temp_artifacts),
-        prefer_memory=True,
-        workers=tail_slice_workers,
-        projected_layer_refs=fused_projected_layer_refs,
-    )
+    streamed_final_union_mm = streaming_final_union_holder.get(str(model_name))
+    if streamed_final_union_mm is None:
+        final_union_mm = assemble_final_union_after_view_union(
+            view_volumes_by_model=view_volumes_by_model,
+            T=T,
+            H=H,
+            W=W,
+            out_path=temp_dir / 'final_union_volume.u8.dat',
+            temp_dir=temp_dir,
+            out_shape_tyx=source_output_shape_tyx,
+            enable_3d_void_fill=bool(args.enable_3d_void_fill),
+            keep_temp=bool(keep_temp_artifacts),
+            prefer_memory=True,
+            workers=tail_slice_workers,
+            projected_layer_refs=fused_projected_layer_refs,
+        )
+    else:
+        final_union_mm = streamed_final_union_mm
+        flush_array(final_union_mm)
+        print(
+            '\n=== Final view union was assembled incrementally while inference was active ==='
+        )
+        if bool(args.enable_3d_void_fill):
+            print('\n=== Optional 3D void fill after final global union ===')
+            discard_binary_volume_slice_metadata(final_union_mm)
+            final_void_dir = temp_dir / 'final_global_void_fill'
+            final_void_dir.mkdir(parents=True, exist_ok=True)
+            fill_3d_voids_inplace_streaming(
+                final_union_mm,
+                final_void_dir / 'final_union',
+                keep_temp=bool(keep_temp_artifacts),
+                prefer_memory=True,
+                reserve_bytes=16 * GIB,
+            )
+        else:
+            print(
+                '\n=== Optional 3D void fill disabled '
+                '(--postprocessing 3d_void_fill not selected) ==='
+            )
 
     if int(args.centerline_filter_passes) > 0:
         discard_binary_volume_slice_metadata(final_union_mm)

@@ -2814,7 +2814,8 @@ def interpolate_view_volume_pass_inplace(
             ):
                 gpu_started = time.perf_counter()
                 try:
-                    for list_idx, z in enumerate(batch_slices):
+                    def _render_batch_slice_gpu(list_idx: int) -> None:
+                        z = int(batch_slices[int(list_idx)])
                         bbox_union = _initial_bbox_union(int(z))
                         # One destination group per packed membership word (or -1 for
                         # the ordinary binary bridge canvas). Different logical bits in
@@ -2854,6 +2855,21 @@ def interpolate_view_volume_pass_inplace(
                             rendered_paste_bboxes[int(z)] = np.asarray(
                                 bbox_union, dtype=np.int64,
                             )
+
+                    gpu_render_workers = choose_slice_parallel_workers(
+                        min(
+                            int(render_workers),
+                            max(1, int(getattr(gpu_renderer, 'max_streams', 1))),
+                        ),
+                        len(batch_slices),
+                    )
+                    parallel_for_indices(
+                        len(batch_slices),
+                        _render_batch_slice_gpu,
+                        max_workers=int(gpu_render_workers),
+                        desc='Interpolation: render CUDA plan batch',
+                        show_progress=False,
+                    )
                     gpu_render_batches += 1
                     gpu_batch_complete = True
                 except Exception as exc:
@@ -3014,6 +3030,9 @@ def interpolate_view_volume_pass_inplace(
             f'{float(live_gpu_telemetry.get("radius_execution_seconds", 0.0)):.3f}s; '
             f'CUDA render execution='
             f'{float(live_gpu_telemetry.get("render_execution_seconds", 0.0)):.3f}s; '
+            f'CUDA render streams='
+            f'{int(live_gpu_telemetry.get("stream_peak", 0))}/'
+            f'{int(live_gpu_telemetry.get("max_streams", 0))}; '
             f'render crop/patch pixels='
             f'{int(live_gpu_telemetry.get("render_crop_pixels", 0)):,}/'
             f'{int(live_gpu_telemetry.get("render_patch_pixels", 0)):,}.'
@@ -3345,6 +3364,15 @@ def interpolate_view_volume_pass_inplace(
         ),
         'gpu_interpolation_batches': int(gpu_render_batches),
         'gpu_interpolation_fallback_batches': int(gpu_render_fallback_batches),
+        'gpu_interpolation_stream_leases': int(
+            gpu_renderer_telemetry.get('stream_leases', 0)
+        ),
+        'gpu_interpolation_stream_peak': int(
+            gpu_renderer_telemetry.get('stream_peak', 0)
+        ),
+        'gpu_interpolation_max_streams': int(
+            gpu_renderer_telemetry.get('max_streams', 0)
+        ),
         'gpu_interpolation_estimated_plans': int(
             gpu_renderer_telemetry.get('estimated_plans', 0)
         ),
