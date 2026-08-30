@@ -581,6 +581,27 @@ def _linear_source_index(out_idx: int, out_count: int, in_count: int) -> float:
         return 0.0
     return float(out_idx) * float(in_count - 1) / float(out_count - 1)
 
+def _endpoint_aligned_nearest_source_indices(in_count: int, out_count: int) -> np.ndarray:
+    """Map output coordinates to nearest input coordinates with TTA endpoint alignment."""
+    in_count_i = int(in_count)
+    out_count_i = int(out_count)
+    if in_count_i <= 0 or out_count_i <= 0:
+        raise ValueError(
+            "Endpoint-aligned categorical resize requires positive input and output axes; "
+            f"got input={in_count_i}, output={out_count_i}"
+        )
+    return np.asarray(
+        [
+            int(np.clip(
+                int(round(_linear_source_index(out_idx, out_count_i, in_count_i))),
+                0,
+                in_count_i - 1,
+            ))
+            for out_idx in range(out_count_i)
+        ],
+        dtype=np.intp,
+    )
+
 def _resize_gray_slice_nearest_or_linear(
     frame: np.ndarray,
     out_w: int,
@@ -766,6 +787,96 @@ def resize_volume_to_processing_cube_gray8(
         _render_target_slice,
         max_workers=worker_count,
         desc='Resizing orthogonal volume to v12.2.0 cube',
+        chunk_size=chunk_size,
+    )
+    flush_array(out_mm)
+    return out_mm
+
+def resize_categorical_volume_to_processing_cube_uint8(
+    mask_u8: np.ndarray,
+    out_shape: Tuple[int, int, int],
+    out_path: Path,
+    *,
+    workers: int = 1,
+    prefer_memory: bool = True,
+    reserve_bytes: int = 32 * GIB,
+) -> np.ndarray:
+    """Resize a binary ``(t,Y,X)`` mask with endpoint-aligned nearest sampling.
+
+    This is the categorical counterpart to
+    :func:`resize_volume_to_processing_cube_gray8`.  It deliberately samples one
+    source voxel on every axis and binarizes the selected value, so categorical
+    ground truth never passes through an intensity interpolation kernel.  The
+    function is module-level and uses only spawn-safe, CPU-owned state.
+
+    Callers provide a canonical uint8 0/1 mask.  When the requested shape already
+    matches, that input object is returned without allocation or normalization.
+    """
+    mask_arr = np.asarray(mask_u8)
+    if int(mask_arr.ndim) != 3:
+        raise ValueError(
+            "Categorical processing-cube resize requires a three-dimensional "
+            f"(t,Y,X) mask; got shape {tuple(int(value) for value in mask_arr.shape)}"
+        )
+
+    in_t, in_h, in_w = (
+        int(mask_arr.shape[0]),
+        int(mask_arr.shape[1]),
+        int(mask_arr.shape[2]),
+    )
+    try:
+        out_t, out_h, out_w = (
+            int(out_shape[0]),
+            int(out_shape[1]),
+            int(out_shape[2]),
+        )
+    except (IndexError, TypeError) as exc:
+        raise ValueError(
+            f"Categorical processing-cube output shape must contain three axes; got {out_shape!r}"
+        ) from exc
+
+    if any(value <= 0 for value in (in_t, in_h, in_w, out_t, out_h, out_w)):
+        raise ValueError(
+            "Categorical processing-cube resize requires positive axis lengths; "
+            f"got input={(in_t, in_h, in_w)}, output={(out_t, out_h, out_w)}"
+        )
+    if (in_t, in_h, in_w) == (out_t, out_h, out_w):
+        return mask_u8
+
+    out_mm = allocate_workspace_array(
+        shape=(out_t, out_h, out_w),
+        dtype=np.uint8,
+        path=out_path,
+        desc='Categorical processing-cube volume (endpoint-aligned nearest)',
+        prefer_memory=bool(prefer_memory),
+        reserve_bytes=int(reserve_bytes),
+        initialize_zero=False,
+    )
+
+    source_t = _endpoint_aligned_nearest_source_indices(in_t, out_t)
+    source_y = _endpoint_aligned_nearest_source_indices(in_h, out_h)
+    source_x = _endpoint_aligned_nearest_source_indices(in_w, out_w)
+    source_y_grid = source_y[:, np.newaxis]
+    source_x_grid = source_x[np.newaxis, :]
+
+    worker_count = choose_slice_parallel_workers(int(workers), int(out_t))
+    chunk_size = choose_parallel_chunk_size(
+        out_t,
+        worker_count,
+        target_chunks_per_worker=2,
+        min_chunk_size=1,
+    )
+
+    def _render_target_slice(out_z: int) -> None:
+        source_frame = mask_arr[int(source_t[int(out_z)])]
+        sampled = source_frame[source_y_grid, source_x_grid]
+        out_mm[int(out_z), :, :] = sampled != 0
+
+    parallel_for_indices_chunked(
+        int(out_t),
+        _render_target_slice,
+        max_workers=worker_count,
+        desc='Resizing categorical volume to processing cube',
         chunk_size=chunk_size,
     )
     flush_array(out_mm)

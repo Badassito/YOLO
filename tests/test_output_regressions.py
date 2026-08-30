@@ -39,14 +39,14 @@ def _native_dependency_stubs() -> dict[str, types.ModuleType]:
     }
 
 
-if 'volume_tta.outputs' in sys.modules:
-    outputs = sys.modules['volume_tta.outputs']
+if 'XTA.outputs' in sys.modules:
+    outputs = sys.modules['XTA.outputs']
 else:
     # Deliberately use stubs even when native wheels happen to be installed. This keeps
     # the regression suite honest: none of its control-flow assertions depends on cv2,
     # SciPy, tifffile, CUDA, or their platform loaders.
     with mock.patch.dict(sys.modules, _native_dependency_stubs(), clear=False):
-        from volume_tta import outputs
+        from XTA import outputs
 
 
 def _serial_indices(total: int, function: object, **_kwargs: object) -> None:

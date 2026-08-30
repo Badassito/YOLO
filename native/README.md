@@ -2,7 +2,7 @@
 
 ## QAT/QATzip gzip
 
-`qat_codec.c` builds `volume_tta._qat_codec` on Linux x86-64 against QATzip
+`qat_codec.c` builds `XTA._qat_codec` on Linux x86-64 against QATzip
 1.3.2 or newer (public API 2.5+, `qatzip.h`, pkg-config package `qatzip`, and
 `libqatzip`) with C11 and pthreads. Automatic source builds include it when
 `pkg-config` discovers QATzip; CPU-only builds remain valid. Force a build, and
@@ -43,7 +43,7 @@ deployment notes.
 
 ## IAA/QPL gzip
 
-`qpl_codec.c` is the explicit, hardware-only `volume_tta._qpl_codec` backend.
+`qpl_codec.c` is the explicit, hardware-only `XTA._qpl_codec` backend.
 See `README_QPL.md` for its QPL 1.9.0 build floor, runtime work-queue checks,
 level-1 limitation, descriptor-safe chunking, fork policy, telemetry, and the
 real-hardware smoke command. IAA remains outside the automatic codec chain and

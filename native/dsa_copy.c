@@ -1051,7 +1051,7 @@ PyInit__dsa_copy(void)
         native_lock = NULL;
         return NULL;
     }
-    DsaCopyError = PyErr_NewException("volume_tta._dsa_copy.DsaCopyError", PyExc_RuntimeError, NULL);
+    DsaCopyError = PyErr_NewException("XTA._dsa_copy.DsaCopyError", PyExc_RuntimeError, NULL);
     if (DsaCopyError == NULL || PyModule_AddObject(module, "DsaCopyError", DsaCopyError) != 0) {
         Py_XDECREF(DsaCopyError);
         Py_DECREF(module);

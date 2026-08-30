@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PACKAGE = ROOT / "volume_tta"
+PACKAGE = ROOT / "XTA"
 IGNORED = {"_deps", "__init__", "__main__"}
 
 

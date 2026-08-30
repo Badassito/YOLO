@@ -12,7 +12,7 @@ from tools.smoke_import import install_stubs
 
 install_stubs()
 
-from volume_tta import assembly, interpolation, outputs, topology
+from XTA import assembly, interpolation, outputs, topology
 
 
 class InterpolationComponentDecompositionTests(unittest.TestCase):

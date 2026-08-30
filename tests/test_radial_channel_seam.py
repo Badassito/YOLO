@@ -4,8 +4,8 @@ from unittest import mock
 
 import numpy as np
 
-from volume_tta import cuda_backend, geometry
-from volume_tta.config import resolve_channel_format
+from XTA import cuda_backend, geometry
+from XTA.config import resolve_channel_format
 
 
 class RadialChannelSeamTests(unittest.TestCase):

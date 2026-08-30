@@ -188,7 +188,7 @@ def _intel_extensions() -> List[Extension]:
             backend="QAT/QATzip",
             package="qatzip",
             minimum_version="1.3.2",
-            module="volume_tta._qat_codec",
+            module="XTA._qat_codec",
             source="native/qat_codec.c",
             forced=bool(explicit_policy),
         )
@@ -203,7 +203,7 @@ def _intel_extensions() -> List[Extension]:
             backend="IAA/QPL",
             package="qpl",
             minimum_version="1.9.0",
-            module="volume_tta._qpl_codec",
+            module="XTA._qpl_codec",
             source="native/qpl_codec.c",
             forced=bool(explicit_policy),
         )
@@ -227,7 +227,7 @@ def _intel_extensions() -> List[Extension]:
         else:
             extensions.append(
                 Extension(
-                    "volume_tta._dsa_copy",
+                    "XTA._dsa_copy",
                     sources=[str(ROOT / "native/dsa_copy.c")],
                     define_macros=[("_GNU_SOURCE", "1")],
                     extra_compile_args=["-O3", "-std=c11", "-pthread"],

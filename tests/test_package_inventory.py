@@ -3,9 +3,12 @@ from __future__ import annotations
 import ast
 import textwrap
 import unittest
+from unittest import mock
 
 from tools.verify_package_inventory import (
+    INTENTIONALLY_CHANGED_BINDINGS,
     LOCAL_IMPORT_SEAM_MARKER,
+    main as verify_inventory,
     reviewed_local_import_seams,
     stable_ast_dump,
 )
@@ -84,6 +87,18 @@ class PackageInventoryTests(unittest.TestCase):
         for source in invalid_sources:
             with self.subTest(source=source), self.assertRaises(RuntimeError):
                 inspect_seams(source)
+
+    def test_changed_binding_review_must_reference_the_immutable_inventory(self) -> None:
+        unknown = ("config", "0" * 64)
+        with mock.patch.dict(
+            INTENTIONALLY_CHANGED_BINDINGS,
+            {unknown: "SAVE_OPTION_TOKENS"},
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "changed-binding entries are absent from the immutable inventory",
+            ):
+                verify_inventory()
 
 
 if __name__ == "__main__":

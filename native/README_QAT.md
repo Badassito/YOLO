@@ -1,6 +1,6 @@
 # Optional Intel QAT/QATzip gzip extension
 
-`qat_codec.c` implements the optional `volume_tta._qat_codec` companion used by
+`qat_codec.c` implements the optional `XTA._qat_codec` companion used by
 the preferred `YOLO_TTA_NRRD_MEMBER_CODEC=auto` path and explicit `qat`
 selection. The base package imports it lazily, so a CPU-only installation does
 not need QATzip or QAT hardware.

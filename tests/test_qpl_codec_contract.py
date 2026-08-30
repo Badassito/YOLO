@@ -91,7 +91,7 @@ class QplNativeSourceContractTests(unittest.TestCase):
 )
 class QplHardwareSmokeTests(unittest.TestCase):
     def test_hardware_only_gzip_round_trip_and_counters(self) -> None:
-        from volume_tta import _qpl_codec
+        from XTA import _qpl_codec
 
         capabilities = dict(_qpl_codec.capabilities())
         self.assertTrue(capabilities.get("hardware_available"), capabilities)
@@ -121,7 +121,7 @@ class QplHardwareSmokeTests(unittest.TestCase):
             _qpl_codec.close_thread_state()
 
     def test_non_hardware_and_high_level_requests_fail_closed(self) -> None:
-        from volume_tta import _qpl_codec
+        from XTA import _qpl_codec
 
         with self.assertRaises(ValueError):
             _qpl_codec.compress_gzip(b"hardware only", 1, require_hardware=False)

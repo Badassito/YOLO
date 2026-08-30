@@ -1,7 +1,7 @@
 """Lazy control plane for optional Intel hardware gzip backends.
 
 Linux x86-64 source builds conditionally compile the project-owned
-``volume_tta._qat_codec`` and ``volume_tta._qpl_codec`` extensions when suitable
+``XTA._qat_codec`` and ``XTA._qpl_codec`` extensions when suitable
 QATzip/QPL development libraries are available. Other builds remain usable
 without them. This module is the only place that imports either extension, and
 only after NRRD output policy selects that backend.
@@ -56,8 +56,8 @@ class NativeCompressionModule(Protocol):
 
 
 _MODULE_NAMES = {
-    'qat': 'volume_tta._qat_codec',
-    'iaa': 'volume_tta._qpl_codec',
+    'qat': 'XTA._qat_codec',
+    'iaa': 'XTA._qpl_codec',
 }
 
 _MODULE_LOCK = threading.RLock()

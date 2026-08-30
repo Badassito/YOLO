@@ -4,7 +4,7 @@ import multiprocessing as mp
 import queue
 import unittest
 
-from volume_tta.inference_backends import DispatchSemantics, ExecutionTarget
+from XTA.inference_backends import DispatchSemantics, ExecutionTarget
 
 
 def _echo_target(result_queue: object, target: ExecutionTarget) -> None:

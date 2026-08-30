@@ -19,9 +19,9 @@ GIB = 1024 ** 3
 
 NRRD_SPACE = "left-posterior-superior"
 
-SCRIPT_VERSION = '17.1.5'
+SCRIPT_VERSION = '18.0.0'
 
-SCRIPT_VERSION_COMPACT = '1715'
+SCRIPT_VERSION_COMPACT = '1800'
 
 SCRIPT_BASENAME = f'GPT-5.6-Sol-Ultra_v{SCRIPT_VERSION}_SLURM.py'
 
@@ -84,8 +84,13 @@ SAVE_OPTION_TOKENS: Tuple[str, ...] = (
     'nrrd',
     'voxel_volume',
     'high_quality',
+    'overlay',
     'summary',
 )
+
+SAVE_OPTION_ALIASES: Dict[str, str] = {
+    'overlay': 'high_quality',
+}
 
 @dataclass(frozen=True)
 class SaveRequest:
@@ -135,8 +140,9 @@ def resolve_save_request(values: Sequence[str] | str | None) -> SaveRequest:
 
         if lowered in valid:
             collecting_low_quality = False
-            if lowered not in resolved:
-                resolved.append(lowered)
+            canonical = SAVE_OPTION_ALIASES.get(lowered, lowered)
+            if canonical not in resolved:
+                resolved.append(canonical)
             continue
 
         if collecting_low_quality:
@@ -987,7 +993,9 @@ def build_argparser() -> argparse.ArgumentParser:
             "low_quality[:LOW_QUALITY_DOWNBIN] (one or more isotropic presentation resolutions; "
             "for example low_quality:0.5,1024), nrrd "
             "(single-layer Slicer decomposition plus manifest), voxel_volume (native-space "
-            "white-voxel count for the summary), high_quality (native-resolution final overlay), "
+            "foreground-voxel count JSON report, also included in summary when selected), "
+            "high_quality (native-resolution final overlay; "
+            "overlay is an alias), "
             "and summary (summary text file). Comma-separated, whitespace-separated, and mixed "
             "forms are accepted. No output group is selected by default; existing output paths "
             "and filenames are retained"

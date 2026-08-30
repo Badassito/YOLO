@@ -39,6 +39,25 @@ class _StubModule(types.ModuleType):
         return unavailable
 
 
+class _TqdmStub:
+    """Small tqdm stand-in supporting both iteration and context-manager use."""
+
+    def __init__(self, iterable: object = None, *args: object, **kwargs: object) -> None:
+        self._iterable = () if iterable is None else iterable
+
+    def __iter__(self):
+        return iter(self._iterable)
+
+    def __enter__(self) -> "_TqdmStub":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def update(self, count: int = 1) -> None:
+        return None
+
+
 def install_stubs() -> None:
     cv2 = _StubModule("cv2")
     scipy = _StubModule("scipy")
@@ -47,7 +66,7 @@ def install_stubs() -> None:
     scipy.ndimage = ndimage  # type: ignore[attr-defined]
     tifffile = _StubModule("tifffile")
     tqdm_module = _StubModule("tqdm")
-    tqdm_module.tqdm = lambda iterable=None, *args, **kwargs: iterable
+    tqdm_module.tqdm = _TqdmStub
     modules = {
         "cv2": cv2,
         "scipy": scipy,
@@ -121,7 +140,7 @@ def unresolved_function_globals(module: types.ModuleType) -> set[str]:
 def eager_package_dependencies(module_name: str, known_modules: set[str]) -> set[str]:
     """Return package subsystems imported while ``module_name`` initializes."""
 
-    path = ROOT / "volume_tta" / f"{module_name}.py"
+    path = ROOT / "XTA" / f"{module_name}.py"
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     dependencies: set[str] = set()
     for node in tree.body:
@@ -167,6 +186,8 @@ def main() -> None:
         "workspace",
         "runtime",
         "media",
+        "gaussian",
+        "render_batch",
         "geometry",
         "inference",
         "cuda_backend",
@@ -180,6 +201,13 @@ def main() -> None:
         "assembly",
         "outputs",
         "pipeline",
+        "pta_config",
+        "pta_mode",
+        "pta_runtime",
+        "pta_scheduler",
+        "pta",
+        "tta_mode",
+        "cli",
         "intel_compression",
         "intel_dsa",
     )
@@ -188,6 +216,16 @@ def main() -> None:
         "inference_backends.contracts",
         "inference_backends.descriptors",
         "inference_backends.registry",
+        "unification",
+        "unification.channels",
+        "unification.context",
+        "unification.contracts",
+        "unification.manifest",
+        "unification.runtime",
+        "unification.sampling",
+        "unification.tiles",
+        "unification.tta_manifest",
+        "unification.views",
     )
     assert_acyclic_eager_imports(eager_graph_modules)
     print("eager package import graph is acyclic")
@@ -198,8 +236,8 @@ def main() -> None:
     modules = tuple(requested) + tuple(name for name in default_modules if name not in requested)
     loaded_modules = []
     for name in modules:
-        loaded_modules.append(importlib.import_module(f"volume_tta.{name}"))
-        print(f"imported volume_tta.{name}")
+        loaded_modules.append(importlib.import_module(f"XTA.{name}"))
+        print(f"imported XTA.{name}")
     missing_globals = {
         module.__name__: sorted(unresolved_function_globals(module))
         for module in loaded_modules

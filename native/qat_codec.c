@@ -6,7 +6,7 @@
 #include <Python.h>
 
 #if !defined(__linux__) || !defined(__x86_64__)
-#error "volume_tta._qat_codec is supported only on Linux x86_64"
+#error "XTA._qat_codec is supported only on Linux x86_64"
 #endif
 
 #include <errno.h>
@@ -24,7 +24,7 @@
 #include <qatzip.h>
 
 #if !defined(QATZIP_API_VERSION) || QATZIP_API_VERSION < 20500
-#error "volume_tta._qat_codec requires QATzip API 2.5 or newer (QATzip 1.3.2+)"
+#error "XTA._qat_codec requires QATzip API 2.5 or newer (QATzip 1.3.2+)"
 #endif
 
 #define VOLUME_TTA_QAT_BINDING_VERSION "17.0.8-capi1"
@@ -787,7 +787,7 @@ static PyObject *qat_preflight_thread_state(
     if (!require_hardware) {
         PyErr_SetString(
             PyExc_ValueError,
-            "volume_tta._qat_codec is hardware-only; require_hardware must be true");
+            "XTA._qat_codec is hardware-only; require_hardware must be true");
         return NULL;
     }
     if (validate_numa_argument(numa_id) != 0) {
@@ -868,7 +868,7 @@ static PyObject *qat_compress_gzip(
     if (!require_hardware) {
         PyErr_SetString(
             PyExc_ValueError,
-            "volume_tta._qat_codec is hardware-only; require_hardware must be true");
+            "XTA._qat_codec is hardware-only; require_hardware must be true");
         return NULL;
     }
     if (validate_numa_argument(numa_id) != 0) {
@@ -1100,7 +1100,7 @@ static PyObject *qat_close_thread_state(PyObject *self, PyObject *Py_UNUSED(args
 
 PyDoc_STRVAR(
     module_doc,
-    "Optional Linux QATzip backend for volume_tta.\n\n"
+    "Optional Linux QATzip backend for XTA.\n\n"
     "The module never enables QATzip software fallback or latency-sensitive host "
     "selection. Native sessions are owned by the calling thread; admission requires "
     "a hardware-only session, and each request requires success, complete input "
@@ -1165,7 +1165,7 @@ PyMODINIT_FUNC PyInit__qat_codec(void)
         return NULL;
     }
     new_error = PyErr_NewException(
-        "volume_tta._qat_codec.QATzipError", PyExc_RuntimeError, NULL);
+        "XTA._qat_codec.QATzipError", PyExc_RuntimeError, NULL);
     if (new_error == NULL) {
         Py_DECREF(module);
         return NULL;

@@ -3097,7 +3097,7 @@ def _resident_mask_kernels() -> Optional[object]:
         #define PROTO_DET_TILE 4
         #define PROTO_MAX_MASKS 64
 
-        // H100 profiling at 32 prototype channels showed this bbox-aware path winning
+        // Production-device profiling at 32 prototype channels showed this bbox-aware path winning
         // every tested retained-count/box-coverage case.  One 32x4 block owns 64x4
         // pixels; packed coefficients remove the original per-pixel head gathers and
         // half2 loads preserve the scalar kernel's FP32 accumulation order.

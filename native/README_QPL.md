@@ -1,6 +1,6 @@
 # Optional Intel IAA/QPL gzip extension
 
-`qpl_codec.c` implements the optional `volume_tta._qpl_codec` companion used by
+`qpl_codec.c` implements the optional `XTA._qpl_codec` companion used by
 explicit `YOLO_TTA_NRRD_MEMBER_CODEC=iaa` selection. Importing the base package
 does not import this extension, and a base wheel still builds without QPL.
 
@@ -94,7 +94,7 @@ pkg-config --modversion qpl
 ldconfig -p | grep -E 'libqpl|libaccel-config'
 accel-config list -i
 YOLO_TTA_NRRD_MEMBER_CODEC=iaa python -c \
-  'from volume_tta.intel_compression import probe_capabilities; print(probe_capabilities("iaa"))'
+  'from XTA.intel_compression import probe_capabilities; print(probe_capabilities("iaa"))'
 ```
 
 The production run should also confirm work-queue permissions in the Slurm job,

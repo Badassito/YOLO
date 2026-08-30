@@ -31,8 +31,8 @@ def _module_is_available(name: str) -> bool:
 if not all(_module_is_available(name) for name in ('cv2', 'scipy', 'tifffile', 'tqdm')):
     install_stubs()
 
-from volume_tta import cuda_interpolation, interpolation, runtime as runtime_helpers, topology
-from volume_tta.cuda_interpolation import (
+from XTA import cuda_interpolation, interpolation, runtime as runtime_helpers, topology
+from XTA.cuda_interpolation import (
     CudaInterpolationRenderer,
     _slice_job_placement,
 )

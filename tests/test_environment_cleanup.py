@@ -10,7 +10,7 @@ from tools.smoke_import import install_stubs
 
 install_stubs()
 
-from volume_tta import geometry, inference, media, runtime, workspace
+from XTA import geometry, inference, media, runtime, workspace
 
 
 class EnvironmentCleanupTests(unittest.TestCase):

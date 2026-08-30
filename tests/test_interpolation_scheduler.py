@@ -29,7 +29,7 @@ HAS_NUMERICAL_RUNTIME = all(
 if not HAS_NUMERICAL_RUNTIME:
     install_stubs()
 
-from volume_tta import interpolation, topology
+from XTA import interpolation, topology
 
 
 class InterpolationSeedSchedulingTests(unittest.TestCase):

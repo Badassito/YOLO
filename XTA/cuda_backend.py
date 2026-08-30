@@ -88,6 +88,8 @@ from .inference import (
     _get_cached_affine_grid,
     resident_trt_cuda_graphs_enabled,
 )
+from .unification.contracts import DataRole
+from .unification.sampling import require_forward_sampling
 
 
 if TYPE_CHECKING:
@@ -3156,7 +3158,9 @@ class GpuRenderedYoloSource:
         fp16: bool,
         name: str,
         channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
+        render_batch_sink: Optional[object] = None,
     ) -> None:
+        require_forward_sampling('cuda', DataRole.INTENSITY)
         self.engine = engine
         self.view = view
         self.job = job
@@ -3164,6 +3168,12 @@ class GpuRenderedYoloSource:
         self.name = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(name)).strip('_') or 'gpu_rendered_volume'
         self.channel_format = resolve_channel_format(channel_format)
         self.channel_count = int(self.channel_format.channel_count)
+        # The CUDA renderer currently produces normalized BCHW tensors directly. Keep
+        # the common observer slot on the source so a device-aware RenderBatch adapter
+        # can be qualified without changing scheduler/task plumbing; never feed its
+        # shape-only host placeholders to an image sink.
+        self.render_batch_sink = render_batch_sink
+        self.canonical_render_batch_capability = 'device_normalized_capture_pending'
         self.out_size = int(out_size)
         self.fp16 = bool(fp16)
         self.nf = max(0, int(num_frames))
@@ -3389,7 +3399,9 @@ class GpuTileRenderedYoloSource:
         fp16: bool,
         name: str,
         channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
+        render_batch_sink: Optional[object] = None,
     ) -> None:
+        require_forward_sampling('cuda', DataRole.INTENSITY)
         self.engine = engine
         self.view = view
         self.tile_job = tile_job
@@ -3398,6 +3410,8 @@ class GpuTileRenderedYoloSource:
         self.name = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(name)).strip('_') or 'gpu_tile_volume'
         self.channel_format = resolve_channel_format(channel_format)
         self.channel_count = int(self.channel_format.channel_count)
+        self.render_batch_sink = render_batch_sink
+        self.canonical_render_batch_capability = 'device_normalized_capture_pending'
         self.out_size = int(out_size)
         self.fp16 = bool(fp16)
         self.nf = max(0, int(num_frames))

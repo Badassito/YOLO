@@ -93,6 +93,7 @@ from .geometry import (
     ViewInfo,
     get_view_frame_by_index,
 )
+from .render_batch import RenderBatch
 from .interpolation import (
     CTILE_INDEX_DTYPE,
     MASK_STORE_FORMATS,
@@ -5181,6 +5182,137 @@ def _write_multichannel_tiff(path: Path, frame_hwc: np.ndarray, channel_count: i
     ]
     if not bool(writer(str(path), pages)):
         raise RuntimeError(f'Failed to write multi-page TIFF: {path}')
+
+def _canonical_image_token(
+    value: object, fallback: str, *, max_length: int = 80,
+) -> str:
+    token = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(value)).strip('_.-')
+    token = token or str(fallback)
+    limit = max(16, int(max_length))
+    if len(token) > limit:
+        digest = f'{zlib.crc32(token.encode("utf-8")) & 0xFFFFFFFF:08x}'
+        token = f'{token[:limit - len(digest) - 1]}-{digest}'
+    return token
+
+@dataclass(frozen=True)
+class CanonicalRenderImageSink:
+    """Persist the exact CPU canonical arrays shared with the model loader."""
+
+    stage_root: Path
+    stem: str
+    model_name: str
+    view_name: str
+    kind: str
+    aug_id: str
+    channel_count: int
+    config_id: Optional[str] = None
+    tile_id: Optional[str] = None
+    backend: str = 'cpu'
+
+    def _directory(self) -> Path:
+        root = Path(self.stage_root)
+        parts = [
+            _canonical_image_token(self.backend, 'cpu'),
+            _canonical_image_token(self.model_name, 'shared'),
+            _canonical_image_token(self.view_name, 'view'),
+            _canonical_image_token(self.kind, 'fullframe'),
+            _canonical_image_token(self.aug_id, 'a0'),
+        ]
+        if str(self.kind) == 'tile':
+            parts.extend((
+                _canonical_image_token(self.config_id, 'tile_config'),
+                _canonical_image_token(self.tile_id, 'tile'),
+            ))
+        for part in parts:
+            root = root / part
+        return root
+
+    def _path_for_center(self, center_index: int) -> Path:
+        suffix = '.tif' if int(self.channel_count) >= 5 else '.png'
+        identity = [
+            f'view-{_canonical_image_token(self.view_name, "view", max_length=40)}',
+            f'aug-{_canonical_image_token(self.aug_id, "a0", max_length=24)}',
+        ]
+        if str(self.kind) == 'tile':
+            identity.extend((
+                f'config-{_canonical_image_token(self.config_id, "tile_config", max_length=32)}',
+                f'tile-{_canonical_image_token(self.tile_id, "tile", max_length=48)}',
+            ))
+        identity.append(f'frame-{int(center_index) + 1:06d}')
+        return self._directory() / ('__'.join(identity) + suffix)
+
+    def __call__(self, batch: RenderBatch) -> None:
+        for item in batch.items:
+            # Cartesian tail repeats and Radial seam-extension slots are model batch
+            # bookkeeping, not distinct canonical center rasters.
+            if bool(item.synthetic_padding) or bool(item.radial_padding):
+                continue
+            if item.center_index is None:
+                continue
+            frame = np.asarray(item.frame)
+            if frame.dtype != np.uint8:
+                raise TypeError(
+                    f'Canonical model-input image must be uint8, got {frame.dtype}'
+                )
+            if frame.ndim != 3 or int(frame.shape[2]) != int(self.channel_count):
+                raise ValueError(
+                    f'Canonical model-input image expected HxWx{int(self.channel_count)}, '
+                    f'got {tuple(frame.shape)}'
+                )
+            out_path = self._path_for_center(int(item.center_index))
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = out_path.with_name(
+                f'.{out_path.stem}.tmp-{os.getpid()}-{threading.get_ident()}{out_path.suffix}'
+            )
+            try:
+                if int(self.channel_count) >= 5:
+                    _write_multichannel_tiff(temp_path, frame, int(self.channel_count))
+                else:
+                    encoded = frame
+                    if int(self.channel_count) == 1:
+                        encoded = np.asarray(frame[:, :, 0])
+                    if not bool(cv2.imwrite(str(temp_path), encoded)):
+                        raise RuntimeError(f'Failed to write canonical model-input image: {out_path}')
+                os.replace(temp_path, out_path)
+            finally:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+def canonical_render_image_sink_from_spec(
+    spec: Dict[str, object],
+    *,
+    backend: Optional[str] = None,
+) -> CanonicalRenderImageSink:
+    """Build a spawn-safe sink from a worker task's plain-data description."""
+    return CanonicalRenderImageSink(
+        stage_root=Path(str(spec['stage_root'])),
+        stem=str(spec['stem']),
+        model_name=str(spec.get('model_name', 'shared')),
+        view_name=str(spec['view_name']),
+        kind=str(spec['kind']),
+        aug_id=str(spec['aug_id']),
+        channel_count=max(1, int(spec['channel_count'])),
+        config_id=(str(spec['config_id']) if spec.get('config_id') is not None else None),
+        tile_id=(str(spec['tile_id']) if spec.get('tile_id') is not None else None),
+        backend=str(backend if backend is not None else spec.get('backend', 'cpu')),
+    )
+
+def publish_canonical_render_images(stage_root: Path, final_root: Path) -> Path:
+    """Publish one completed same-filesystem canonical image tree."""
+    stage = Path(stage_root)
+    final = Path(final_root)
+    if not stage.is_dir():
+        raise FileNotFoundError(f'Canonical model-input image stage is missing: {stage}')
+    final.parent.mkdir(parents=True, exist_ok=True)
+    if final.exists():
+        if final.is_dir():
+            shutil.rmtree(final)
+        else:
+            final.unlink()
+    os.replace(stage, final)
+    return final
 
 def write_view_images(
     volume_rgb: np.ndarray,

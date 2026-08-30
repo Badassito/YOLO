@@ -77,6 +77,22 @@ from .media import (
     wait_for_volume_ready,
     wait_for_volume_slice_ready,
 )
+from .render_batch import (
+    RenderBatch,
+    RenderBatchItem,
+    RenderBatchSink,
+)
+from .unification.contracts import (
+    DataRole,
+    FrameAddress,
+    RasterPlan,
+    RenderItem,
+)
+from .unification.sampling import (
+    build_forward_raster_plan,
+    require_forward_sampling,
+)
+from .unification.tiles import resolve_tile_groups
 
 
 if TYPE_CHECKING:
@@ -1096,6 +1112,50 @@ def extract_radial_slice_frame(
     folded = proj[r0] * (np.float32(1.0) - alpha) + proj[r1] * alpha
     return np.clip(np.rint(folded), 0.0, 255.0).astype(np.uint8)
 
+
+def _center_aligned_nearest_fold_indices(source_rows: int, output_rows: int) -> np.ndarray:
+    """Map output-row centers to their nearest source-row centers."""
+    source_count = int(source_rows)
+    output_count = int(output_rows)
+    if source_count <= 0 or output_count <= 0:
+        raise ValueError('center-aligned nearest folding requires positive row counts')
+    if source_count == output_count:
+        return np.arange(source_count, dtype=np.int64)
+    # Nearest integer to (r + 0.5) * source/output - 0.5. Writing the
+    # expression this way gives deterministic half-up ties without np.rint's
+    # even-integer tie behavior.
+    indices = np.floor(
+        (np.arange(output_count, dtype=np.float64) + 0.5)
+        * (float(source_count) / float(output_count))
+    ).astype(np.int64)
+    return np.clip(indices, 0, source_count - 1)
+
+
+def extract_radial_categorical_slice_frame(
+    mask_u8: np.ndarray,
+    sampler: RadialSampler,
+    out_rows: Optional[int] = None,
+) -> np.ndarray:
+    """Extract one upright Radial categorical frame with nearest-only sampling.
+
+    In-plane coordinates come from the authoritative Radial sampler's
+    precomputed nearest taps. If TTA's native Radial raster folds the selected
+    base stack, output-row centers select their nearest source-row centers.
+    """
+    arr = np.asarray(mask_u8)
+    if arr.ndim != 3:
+        raise ValueError(f'Radial categorical source volume must be 3D, got {arr.shape}')
+    stack_len = int(arr.shape[0])
+    rows = int(out_rows) if out_rows is not None and int(out_rows) > 0 else stack_len
+    row_indices = _center_aligned_nearest_fold_indices(stack_len, rows)
+    sampled = arr[
+        row_indices[:, None],
+        np.asarray(sampler.nn_y, dtype=np.intp)[None, :],
+        np.asarray(sampler.nn_x, dtype=np.intp)[None, :],
+    ]
+    return np.ascontiguousarray(np.asarray(sampled) > 0, dtype=np.uint8)
+
+
 def _tilted_radial_row_centers(stack_len: int, rows: int) -> np.ndarray:
     if int(rows) == int(stack_len):
         return np.arange(int(stack_len), dtype=np.float32)
@@ -1187,6 +1247,72 @@ def extract_tilted_radial_slice_frame(
             acc += values * weight[None, :]
         out[row0:row1] = np.clip(np.rint(acc), 0.0, 255.0).astype(np.uint8)
     return out
+
+
+def extract_tilted_radial_categorical_slice_frame(
+    mask_u8: np.ndarray,
+    view: ViewInfo,
+    sampler: RadialSampler,
+    out_rows: Optional[int] = None,
+) -> np.ndarray:
+    """Render one tilted-Radial categorical frame without intensity filtering.
+
+    The in-plane circle uses one nearest coordinate per diameter position. The
+    selected concrete Tilted view's stack shear and two-slice blend remain
+    unchanged, after which categorical occupancy is thresholded at ``>= 0.5``.
+    """
+    if not is_tilted_radial_view(view):
+        raise ValueError('Tilted Radial categorical renderer requires a tilted Radial view')
+    arr = np.asarray(mask_u8)
+    if arr.ndim != 3:
+        raise ValueError(f'Tilted Radial categorical source volume must be 3D, got {arr.shape}')
+
+    base = radial_base_view_name(view)
+    stack_len = int(radial_stack_length(view))
+    rows = int(out_rows) if out_rows is not None and int(out_rows) > 0 else stack_len
+    row_centers = _tilted_radial_row_centers(stack_len, rows)
+    px = np.asarray(sampler.nn_x, dtype=np.intp)
+    py = np.asarray(sampler.nn_y, dtype=np.intp)
+    u_len = int(px.size)
+    if int(py.size) != u_len:
+        raise ValueError('Tilted Radial categorical sampler has mismatched nearest coordinates')
+
+    tan_alpha = np.float32(math.tan(math.radians(float(view.tilt_angle_deg))))
+    if str(view.tilt_direction) == 'vertical':
+        tap_offsets = py.astype(np.float32, copy=False) - np.float32(view.center_y)
+    elif str(view.tilt_direction) == 'horizontal':
+        tap_offsets = px.astype(np.float32, copy=False) - np.float32(view.center_x)
+    else:
+        raise ValueError(f'Unsupported Tilted Radial direction: {view.tilt_direction!r}')
+
+    out = np.zeros((rows, u_len), dtype=np.uint8)
+    block_rows = max(1, _env_int('YOLO_TTA_TILTED_RADIAL_ROW_BLOCK', 16))
+    for row0 in range(0, rows, block_rows):
+        row1 = min(rows, row0 + block_rows)
+        stack_src = row_centers[row0:row1, None] + tan_alpha * tap_offsets[None, :]
+        valid = (stack_src >= 0.0) & (stack_src <= float(stack_len - 1))
+        if not np.any(valid):
+            continue
+        s0 = np.clip(np.floor(stack_src).astype(np.int32), 0, stack_len - 1)
+        s1 = np.minimum(s0 + 1, stack_len - 1)
+        alpha = (stack_src - s0).astype(np.float32, copy=False)
+
+        if base == 'transverse':
+            f0 = np.asarray(arr[s0, py[None, :], px[None, :]] > 0, dtype=np.float32)
+            f1 = np.asarray(arr[s1, py[None, :], px[None, :]] > 0, dtype=np.float32)
+        elif base == 'sagittal':
+            f0 = np.asarray(arr[py[None, :], s0, px[None, :]] > 0, dtype=np.float32)
+            f1 = np.asarray(arr[py[None, :], s1, px[None, :]] > 0, dtype=np.float32)
+        elif base == 'coronal':
+            f0 = np.asarray(arr[py[None, :], px[None, :], s0] > 0, dtype=np.float32)
+            f1 = np.asarray(arr[py[None, :], px[None, :], s1] > 0, dtype=np.float32)
+        else:  # pragma: no cover
+            raise ValueError(f'Unsupported Tilted Radial base: {base}')
+
+        values = f0 + alpha * (f1 - f0)
+        out[row0:row1] = np.asarray(valid & (values >= 0.5), dtype=np.uint8)
+    return out
+
 
 def _cupy_external_stream(cp: object, torch_stream: object) -> object:
     """Bridge a Torch CUDA stream into CuPy without the CuPy 14 ExternalStream warning.
@@ -1324,56 +1450,14 @@ def resolve_tile_configs(
     values: Sequence[str] | str | None,
 ) -> List[TileConfig]:
     """Resolve structured ``TILE_SIZE:TILE_STRIDE`` groups."""
-    configs: List[TileConfig] = []
-    seen: set[str] = set()
-    for raw_group in _structured_group_values(values, flag_name='--enable_tile'):
-        size_slot, stride_slot = _split_structured_group(
-            raw_group,
-            slot_count=2,
-            flag_name='--enable_tile',
+    return [
+        TileConfig(
+            tile_size=int(group.tile_size),
+            tile_stride=int(group.tile_stride),
+            config_id=str(group.config_id),
         )
-        if not size_slot or not stride_slot:
-            raise ValueError(
-                f'--enable_tile group {raw_group!r} requires both '
-                'TILE_SIZE and TILE_STRIDE'
-            )
-        if len(_parse_comma_slot(size_slot)) != 1 or len(_parse_comma_slot(stride_slot)) != 1:
-            raise ValueError(
-                f'--enable_tile group {raw_group!r} accepts one TILE_SIZE and one '
-                'TILE_STRIDE; use spaces to separate additional groups'
-            )
-        try:
-            tile_size = int(size_slot)
-            tile_stride = int(stride_slot)
-        except Exception as exc:
-            raise ValueError(
-                f'--enable_tile group {raw_group!r} requires integer '
-                'TILE_SIZE:TILE_STRIDE values'
-            ) from exc
-        if int(tile_size) <= 0:
-            raise ValueError(
-                f'--enable_tile group {raw_group!r} requires TILE_SIZE > 0'
-            )
-        if int(tile_stride) <= 0:
-            raise ValueError(
-                f'--enable_tile group {raw_group!r} requires TILE_STRIDE > 0'
-            )
-        if int(tile_stride) > int(tile_size):
-            raise ValueError(
-                f'--enable_tile group {raw_group!r} requires TILE_STRIDE <= TILE_SIZE'
-            )
-        config_id = f's{int(tile_size)}_st{int(tile_stride)}'
-        if config_id in seen:
-            raise ValueError(
-                f'--enable_tile contains duplicate group {int(tile_size)}:{int(tile_stride)}'
-            )
-        seen.add(config_id)
-        configs.append(TileConfig(
-            tile_size=int(tile_size),
-            tile_stride=int(tile_stride),
-            config_id=config_id,
-        ))
-    return configs
+        for group in resolve_tile_groups(values)
+    ]
 
 @dataclass(frozen=True)
 class DenseTileJob:
@@ -1771,6 +1855,8 @@ class PredictionVolumeRef:
     source: Optional[object] = None
     channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT
     view: Optional[ViewInfo] = None
+    render_batch_sink: Optional[RenderBatchSink] = None
+    raster_plan: Optional[RasterPlan] = None
 
 def close_prediction_volume_ref(ref: Optional[PredictionVolumeRef], *, keep_temp: bool = False) -> None:
     """Release one prediction source and remove any fallback backing file."""
@@ -1804,6 +1890,56 @@ class ChannelFormattedYoloBatch(list):
         super().__init__()
         self._tta_channel_count = max(1, int(channel_count))
 
+def _fan_out_canonical_render_batch(
+    *,
+    start: int,
+    paths: List[str],
+    frames: List[np.ndarray],
+    info: List[str],
+    result_frame_spec: Callable[[int], Optional[BatchResultFrameSpec]],
+    sink: Optional[RenderBatchSink],
+    raster_plan: Optional[RasterPlan] = None,
+) -> Tuple[List[str], List[np.ndarray], List[str]]:
+    """Publish and return one batch without copying any model-bound frame."""
+    items: List[RenderBatchItem] = []
+    for offset, frame in enumerate(frames):
+        result_index = int(start) + int(offset)
+        spec = result_frame_spec(result_index)
+        request = (
+            None
+            if spec is None or raster_plan is None
+            else RenderItem(
+                plan=raster_plan,
+                data_role=DataRole.INTENSITY,
+                frame_address=FrameAddress(
+                    int(spec.global_destination_index),
+                    mirror_u=bool(spec.mirror_radial_u),
+                ),
+                metadata={
+                    'result_index': int(result_index),
+                    'radial_padding': bool(spec.is_radial_padding),
+                },
+            )
+        )
+        items.append(RenderBatchItem(
+            result_index=result_index,
+            center_index=(int(spec.global_destination_index) if spec is not None else None),
+            synthetic_padding=bool(spec is None),
+            radial_padding=bool(spec is not None and spec.is_radial_padding),
+            frame=frame,
+            request=request,
+        ))
+    render_batch = RenderBatch(
+        paths=paths,
+        frames=frames,
+        info=info,
+        items=tuple(items),
+        raster_plan=raster_plan,
+    )
+    if sink is not None:
+        sink(render_batch)
+    return render_batch.model_payload()
+
 class InMemoryYoloVolumeSource:
     """Ultralytics-compatible in-memory source that streams model-input batches.
 
@@ -1826,6 +1962,8 @@ class InMemoryYoloVolumeSource:
         view: Optional[ViewInfo] = None,
         slice_offset: int = 0,
         logical_num_frames: Optional[int] = None,
+        render_batch_sink: Optional[RenderBatchSink] = None,
+        raster_plan: Optional[RasterPlan] = None,
     ) -> None:
         if volume_gray is None:
             raise ValueError('InMemoryYoloVolumeSource requires a volume array')
@@ -1848,6 +1986,8 @@ class InMemoryYoloVolumeSource:
             )
         self.name = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(name)).strip('_') or 'in_memory_volume'
         self.view = view
+        self.render_batch_sink = render_batch_sink
+        self.raster_plan = raster_plan
         self.slice_offset = int(slice_offset)
         available_frames = int(self.volume_gray.shape[0])
         self.nf = int(
@@ -1954,7 +2094,15 @@ class InMemoryYoloVolumeSource:
                 info.append(f'in-memory {self.name} synthetic padded slice {idx + 1}/{self.yield_nf} repeats real slice {real_idx + 1}/{self.nf}: ')
             else:
                 info.append(f'in-memory {self.name} slice {idx + 1}/{self.nf}: ')
-        return paths, imgs, info
+        return _fan_out_canonical_render_batch(
+            start=start,
+            paths=paths,
+            frames=imgs,
+            info=info,
+            result_frame_spec=self.result_frame_spec,
+            sink=self.render_batch_sink,
+            raster_plan=self.raster_plan,
+        )
 
 class StreamingYoloVolumeSource:
     """Ultralytics-compatible source that renders prediction centers just ahead of YOLO.
@@ -1981,9 +2129,13 @@ class StreamingYoloVolumeSource:
         channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
         view: Optional[ViewInfo] = None,
         slice_offset: int = 0,
+        render_batch_sink: Optional[RenderBatchSink] = None,
+        raster_plan: Optional[RasterPlan] = None,
     ) -> None:
         self.renderer = renderer
         self.view = view
+        self.render_batch_sink = render_batch_sink
+        self.raster_plan = raster_plan
         self.slice_offset = int(slice_offset)
         self.channel_format = resolve_channel_format(channel_format)
         self.channel_count = int(self.channel_format.channel_count)
@@ -2169,7 +2321,15 @@ class StreamingYoloVolumeSource:
         self.count = int(stop)
         with self._lock:
             self._fill_prefetch_locked(target_index=int(self.count))
-        return paths, imgs, info
+        return _fan_out_canonical_render_batch(
+            start=start,
+            paths=paths,
+            frames=imgs,
+            info=info,
+            result_frame_spec=self.result_frame_spec,
+            sink=self.render_batch_sink,
+            raster_plan=self.raster_plan,
+        )
 
 class GpuPrefetchedYoloBatch(list):
     """List-like orig-image batch whose YOLO tensor is already staged in GPU VRAM.
@@ -2749,6 +2909,8 @@ def maybe_eager_stage_prediction_ref_on_gpu(prediction_ref: PredictionVolumeRef,
                     int(prediction_ref.view.num_slices)
                     if prediction_ref.view is not None else None
                 ),
+                render_batch_sink=prediction_ref.render_batch_sink,
+                raster_plan=prediction_ref.raster_plan,
             )
         wrapped = maybe_wrap_source_with_gpu_input_staging(source, cfg, prediction_ref.name)
         prediction_ref.source = wrapped
@@ -2861,6 +3023,8 @@ def make_in_memory_yolo_source(
     view: Optional[ViewInfo] = None,
     slice_offset: int = 0,
     logical_num_frames: Optional[int] = None,
+    render_batch_sink: Optional[RenderBatchSink] = None,
+    raster_plan: Optional[RasterPlan] = None,
 ) -> InMemoryYoloVolumeSource:
     ensure_ultralytics_accepts_in_memory_volume_source()
     return InMemoryYoloVolumeSource(
@@ -2872,6 +3036,8 @@ def make_in_memory_yolo_source(
         view=view,
         slice_offset=int(slice_offset),
         logical_num_frames=logical_num_frames,
+        render_batch_sink=render_batch_sink,
+        raster_plan=raster_plan,
     )
 
 def make_prediction_ref_yolo_source(
@@ -2897,6 +3063,8 @@ def make_prediction_ref_yolo_source(
             int(prediction_volume.view.num_slices)
             if prediction_volume.view is not None else max_frames
         ),
+        render_batch_sink=prediction_volume.render_batch_sink,
+        raster_plan=prediction_volume.raster_plan,
     )
 
 def _center_preserving_scale_matrix(src_w: int, src_h: int, out_w: int, out_h: int) -> np.ndarray:
@@ -3543,6 +3711,30 @@ def render_tilted_frame_on_grid(
         block_rows=int(block_rows),
     )
 
+
+def render_tilted_categorical_frame_on_grid(
+    mask_u8: np.ndarray,
+    view: ViewInfo,
+    frame_idx: int,
+    M_grid_to_src: np.ndarray,
+    grid_h: int,
+    grid_w: int,
+    block_rows: int = 256,
+) -> np.ndarray:
+    """Render a binary ground-truth Tilted frame on an arbitrary output grid."""
+    rendered = _render_tilted_array_on_grid(
+        mask_u8,
+        view,
+        int(frame_idx),
+        M_grid_to_src,
+        int(grid_h),
+        int(grid_w),
+        mask_mode=True,
+        block_rows=int(block_rows),
+    )
+    return np.ascontiguousarray(np.asarray(rendered) > 0, dtype=np.uint8)
+
+
 def render_tilted_canvas_frame(
     volume_rgb: np.ndarray,
     view: ViewInfo,
@@ -3584,6 +3776,134 @@ def render_tilted_native_frame(volume_rgb: np.ndarray, view: ViewInfo, frame_idx
     aff = get_tilted_native_affine(view)
     return render_tilted_canvas_frame(volume_rgb, view, int(frame_idx), aff)
 
+def render_intensity_frame_on_grid(
+    volume_rgb: np.ndarray,
+    view: ViewInfo,
+    frame_idx: int,
+    *,
+    M_src_to_out: np.ndarray,
+    M_out_to_src: np.ndarray,
+    output_height: int,
+    output_width: int,
+    view_frames: Optional[np.ndarray] = None,
+    mirror_radial_u: bool = False,
+) -> np.ndarray:
+    """Render intensity data through the canonical TTA grid sampler.
+
+    The established TTA jobs use square grids, while PTA's ``--imgsz 0`` uses
+    the physical view's native rectangular grid. Both routes enter here so a
+    forward-sampling change cannot leave native PTA publication on a side path.
+    """
+
+    require_forward_sampling('cpu', DataRole.INTENSITY)
+    out_h, out_w = int(output_height), int(output_width)
+    if out_h <= 0 or out_w <= 0:
+        raise ValueError('output grid dimensions must be positive')
+    if is_tilted_view(view):
+        return render_tilted_frame_on_grid(
+            volume_rgb=volume_rgb,
+            view=view,
+            frame_idx=int(frame_idx),
+            M_grid_to_src=M_out_to_src,
+            grid_h=out_h,
+            grid_w=out_w,
+        )
+
+    native_frame = np.ascontiguousarray(
+        get_view_frame_by_index(
+            volume_rgb, view, int(frame_idx), view_frames=view_frames,
+        )
+    )
+    if bool(mirror_radial_u):
+        if not is_radial_view(view):
+            raise ValueError('radial-u mirroring requested for a non-Radial view')
+        native_frame = np.ascontiguousarray(native_frame[:, ::-1])
+    identity = np.asarray(
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32,
+    )
+    if (
+        out_h == int(view.src_h)
+        and out_w == int(view.src_w)
+        and np.allclose(
+            np.asarray(M_src_to_out, dtype=np.float32).reshape(2, 3),
+            identity,
+            rtol=0.0,
+            atol=2e-6,
+        )
+    ):
+        return native_frame.copy() if native_frame.base is not None else native_frame
+    return cv2.warpAffine(
+        native_frame,
+        np.asarray(M_src_to_out, dtype=np.float32).reshape(2, 3),
+        dsize=(out_w, out_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+
+def render_categorical_frame_on_grid(
+    mask_u8: np.ndarray,
+    view: ViewInfo,
+    frame_idx: int,
+    *,
+    M_src_to_out: np.ndarray,
+    M_out_to_src: np.ndarray,
+    output_height: int,
+    output_width: int,
+    view_frames: Optional[np.ndarray] = None,
+    mirror_radial_u: bool = False,
+) -> np.ndarray:
+    """Render categorical data on the same grid with nearest/threshold rules."""
+
+    require_forward_sampling('cpu', DataRole.CATEGORICAL_GROUND_TRUTH)
+    out_h, out_w = int(output_height), int(output_width)
+    if out_h <= 0 or out_w <= 0:
+        raise ValueError('output grid dimensions must be positive')
+    if is_tilted_view(view):
+        return render_tilted_categorical_frame_on_grid(
+            mask_u8=mask_u8,
+            view=view,
+            frame_idx=int(frame_idx),
+            M_grid_to_src=M_out_to_src,
+            grid_h=out_h,
+            grid_w=out_w,
+        )
+
+    native_frame = np.ascontiguousarray(
+        get_categorical_view_frame_by_index(
+            mask_u8, view, int(frame_idx), view_frames=view_frames,
+        )
+    )
+    if bool(mirror_radial_u):
+        if not is_radial_view(view):
+            raise ValueError(
+                'radial-u mirroring requested for a non-Radial categorical view'
+            )
+        native_frame = np.ascontiguousarray(native_frame[:, ::-1])
+    identity = np.asarray(
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32,
+    )
+    if (
+        out_h == int(view.src_h)
+        and out_w == int(view.src_w)
+        and np.allclose(
+            np.asarray(M_src_to_out, dtype=np.float32).reshape(2, 3),
+            identity,
+            rtol=0.0,
+            atol=2e-6,
+        )
+    ):
+        return np.ascontiguousarray(np.asarray(native_frame) > 0, dtype=np.uint8)
+    rendered = cv2.warpAffine(
+        native_frame,
+        np.asarray(M_src_to_out, dtype=np.float32).reshape(2, 3),
+        dsize=(out_w, out_h),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    return np.ascontiguousarray(np.asarray(rendered) > 0, dtype=np.uint8)
+
 def render_fullframe_frame_for_job(
     volume_rgb: np.ndarray,
     view: ViewInfo,
@@ -3593,40 +3913,16 @@ def render_fullframe_frame_for_job(
     *,
     mirror_radial_u: bool = False,
 ) -> np.ndarray:
-    if is_tilted_view(view):
-        return render_tilted_frame_on_grid(
-            volume_rgb=volume_rgb,
-            view=view,
-            frame_idx=int(frame_idx),
-            M_grid_to_src=job.aff.M_out_to_src,
-            grid_h=int(job.aff.out_size),
-            grid_w=int(job.aff.out_size),
-        )
-
-    native_frame = np.ascontiguousarray(get_view_frame_by_index(volume_rgb, view, int(frame_idx), view_frames=view_frames))
-    if bool(mirror_radial_u):
-        if not is_radial_view(view):
-            raise ValueError('radial-u mirroring requested for a non-Radial view')
-        native_frame = np.ascontiguousarray(native_frame[:, ::-1])
-    # identity fast path — a rotation-free job whose native frame already
-    # matches the model raster (e.g. every imgsz-folded radial frame at --angle 0) needs no warp.
-    aff = job.aff
-    if (
-        int(aff.src_w) == int(aff.out_size)
-        and int(aff.src_h) == int(aff.out_size)
-        and int(aff.canvas_w) == int(aff.src_w)
-        and int(aff.canvas_h) == int(aff.src_h)
-        and float(aff.angle_deg) % 360.0 == 0.0
-    ):
-        # Defensive copy only when the frame aliases the source volume (e.g. a transverse slice).
-        return native_frame.copy() if native_frame.base is not None else native_frame
-    return cv2.warpAffine(
-        native_frame,
-        aff.M_src_to_out,
-        dsize=(int(aff.out_size), int(aff.out_size)),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
+    return render_intensity_frame_on_grid(
+        volume_rgb,
+        view,
+        int(frame_idx),
+        M_src_to_out=job.aff.M_src_to_out,
+        M_out_to_src=job.aff.M_out_to_src,
+        output_height=int(job.aff.out_size),
+        output_width=int(job.aff.out_size),
+        view_frames=view_frames,
+        mirror_radial_u=bool(mirror_radial_u),
     )
 
 def render_dense_tile_frame_for_job(
@@ -3646,29 +3942,69 @@ def render_dense_tile_frame_for_job(
  raster; for Tilted Views the inverse grid-to-native transform is passed into
  the tilted sampler so the stacking-axis shear, in-plane augmentation, crop,
  and scale are sampled in one pass."""
-    if is_tilted_view(view):
-        return render_tilted_frame_on_grid(
-            volume_rgb=volume_rgb,
-            view=view,
-            frame_idx=int(frame_idx),
-            M_grid_to_src=tile_job.M_out_to_src,
-            grid_h=int(tile_job.out_size),
-            grid_w=int(tile_job.out_size),
-        )
-
-    native_frame = np.ascontiguousarray(get_view_frame_by_index(volume_rgb, view, int(frame_idx), view_frames=view_frames))
-    if bool(mirror_radial_u):
-        if not is_radial_view(view):
-            raise ValueError('radial-u mirroring requested for a non-Radial view')
-        native_frame = np.ascontiguousarray(native_frame[:, ::-1])
-    return cv2.warpAffine(
-        native_frame,
-        tile_job.M_src_to_out,
-        dsize=(int(tile_job.out_size), int(tile_job.out_size)),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
+    return render_intensity_frame_on_grid(
+        volume_rgb,
+        view,
+        int(frame_idx),
+        M_src_to_out=tile_job.M_src_to_out,
+        M_out_to_src=tile_job.M_out_to_src,
+        output_height=int(tile_job.out_size),
+        output_width=int(tile_job.out_size),
+        view_frames=view_frames,
+        mirror_radial_u=bool(mirror_radial_u),
     )
+
+
+def render_categorical_fullframe_for_job(
+    mask_u8: np.ndarray,
+    view: ViewInfo,
+    job: AugJob,
+    frame_idx: int,
+    view_frames: Optional[np.ndarray] = None,
+    *,
+    mirror_radial_u: bool = False,
+) -> np.ndarray:
+    """Render one full-frame categorical ground-truth raster for an ``AugJob``.
+
+    Physical extraction and affine stage order mirror the intensity renderer,
+    while every in-plane affine operation is nearest-neighbor and the returned
+    raster is canonical uint8 ``0/1``.
+    """
+    return render_categorical_frame_on_grid(
+        mask_u8,
+        view,
+        int(frame_idx),
+        M_src_to_out=job.aff.M_src_to_out,
+        M_out_to_src=job.aff.M_out_to_src,
+        output_height=int(job.aff.out_size),
+        output_width=int(job.aff.out_size),
+        view_frames=view_frames,
+        mirror_radial_u=bool(mirror_radial_u),
+    )
+
+
+def render_categorical_dense_tile_for_job(
+    mask_u8: np.ndarray,
+    view: ViewInfo,
+    tile_job: DenseTileJob,
+    frame_idx: int,
+    view_frames: Optional[np.ndarray] = None,
+    *,
+    mirror_radial_u: bool = False,
+) -> np.ndarray:
+    """Render one categorical ground-truth tile for a ``DenseTileJob``."""
+    return render_categorical_frame_on_grid(
+        mask_u8,
+        view,
+        int(frame_idx),
+        M_src_to_out=tile_job.M_src_to_out,
+        M_out_to_src=tile_job.M_out_to_src,
+        output_height=int(tile_job.out_size),
+        output_width=int(tile_job.out_size),
+        view_frames=view_frames,
+        mirror_radial_u=bool(mirror_radial_u),
+    )
+
 
 def make_fullframe_channel_renderer(
     volume_rgb: np.ndarray,
@@ -3744,6 +4080,72 @@ def make_dense_tile_channel_renderer(
         mirrored_plane_renderer=_render_mirrored_plane if is_radial_view(view) else None,
     )
 
+
+def build_fullframe_raster_plan(
+    view: ViewInfo,
+    job: AugJob,
+    channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
+) -> RasterPlan:
+    """Build the canonical v18 TTA plan consumed by one full-frame job."""
+
+    fmt = resolve_channel_format(channel_format)
+    return build_forward_raster_plan(
+        mode='tta',
+        physical_view_id=physical_view_name(view),
+        angle_deg=float(job.angle_deg),
+        channel_token=str(fmt.token),
+        channel_kind=str(fmt.kind),
+        channel_count=int(fmt.channel_count),
+        channel_stride=int(fmt.stride),
+        channel_offsets=tuple(int(value) for value in fmt.offsets),
+        channel_direction='ascending',
+        output_shape=(int(job.aff.out_size), int(job.aff.out_size)),
+        metadata={
+            'runtime_view_id': str(view.name),
+            'runtime_job_id': str(job.aug_id),
+            'runtime_kind': 'fullframe',
+        },
+    )
+
+
+def _angle_from_aug_id(aug_id: str) -> float:
+    token = str(aug_id)
+    if not token.startswith('a'):
+        raise ValueError(f'augmentation id does not encode an angle: {aug_id!r}')
+    return float(token[1:].replace('m', '-').replace('p', '.'))
+
+
+def build_dense_tile_raster_plan(
+    view: ViewInfo,
+    tile_job: DenseTileJob,
+    channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
+) -> RasterPlan:
+    """Build the canonical v18 TTA plan consumed by one collapsed tile job."""
+
+    fmt = resolve_channel_format(channel_format)
+    return build_forward_raster_plan(
+        mode='tta',
+        physical_view_id=physical_view_name(view),
+        angle_deg=_angle_from_aug_id(tile_job.aug_id),
+        channel_token=str(fmt.token),
+        channel_kind=str(fmt.kind),
+        channel_count=int(fmt.channel_count),
+        channel_stride=int(fmt.stride),
+        channel_offsets=tuple(int(value) for value in fmt.offsets),
+        channel_direction='ascending',
+        output_shape=(int(tile_job.out_size), int(tile_job.out_size)),
+        tile_size=int(tile_job.tile_size),
+        tile_stride=int(tile_job.tile_stride),
+        metadata={
+            'runtime_view_id': str(view.name),
+            'runtime_job_id': str(tile_job.tile_id),
+            'runtime_kind': 'tile',
+            'tile_config_id': str(tile_job.config_id),
+            'tile_x': int(tile_job.tile_x),
+            'tile_y': int(tile_job.tile_y),
+        },
+    )
+
 def _materialize_prediction_volume_from_renderer(
     *,
     num_slices: int,
@@ -3758,6 +4160,8 @@ def _materialize_prediction_volume_from_renderer(
     kind: str = 'fullframe',
     channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
     view: Optional[ViewInfo] = None,
+    render_batch_sink: Optional[RenderBatchSink] = None,
+    raster_plan: RasterPlan,
 ) -> PredictionVolumeRef:
     """Return a streaming render-backed prediction source by default.
     
@@ -3788,6 +4192,8 @@ def _materialize_prediction_volume_from_renderer(
             autostart=streaming_prediction_source_autostart_enabled(),
             channel_format=fmt,
             view=view,
+            render_batch_sink=render_batch_sink,
+            raster_plan=raster_plan,
         )
         return PredictionVolumeRef(
             array=None,
@@ -3799,6 +4205,8 @@ def _materialize_prediction_volume_from_renderer(
             source=source,
             channel_format=fmt,
             view=view,
+            render_batch_sink=render_batch_sink,
+            raster_plan=raster_plan,
         )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3847,6 +4255,8 @@ def _materialize_prediction_volume_from_renderer(
         kind=str(kind),
         channel_format=fmt,
         view=view,
+        render_batch_sink=render_batch_sink,
+        raster_plan=raster_plan,
     )
 
 def materialize_fullframe_prediction_volume_for_job(
@@ -3859,6 +4269,7 @@ def materialize_fullframe_prediction_volume_for_job(
     workers: int = 1,
     show_progress: bool = True,
     channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
+    render_batch_sink: Optional[RenderBatchSink] = None,
 ) -> PredictionVolumeRef:
     """Create the model-sized full-frame prediction volume for one view/angle in RAM."""
     # Refresh reusable scratch metadata so changing --channel_format cannot
@@ -3866,6 +4277,7 @@ def materialize_fullframe_prediction_volume_for_job(
     write_aug_job_meta(job, view, channel_format)
 
     fmt = resolve_channel_format(channel_format)
+    raster_plan = build_fullframe_raster_plan(view, job, fmt)
     renderer = make_fullframe_channel_renderer(
         volume_rgb,
         view,
@@ -3887,6 +4299,8 @@ def materialize_fullframe_prediction_volume_for_job(
         kind='fullframe',
         channel_format=fmt,
         view=view,
+        render_batch_sink=render_batch_sink,
+        raster_plan=raster_plan,
     )
 
 def materialize_dense_tile_prediction_volume_for_job(
@@ -3899,11 +4313,13 @@ def materialize_dense_tile_prediction_volume_for_job(
     workers: int = 1,
     show_progress: bool = True,
     channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
+    render_batch_sink: Optional[RenderBatchSink] = None,
 ) -> PredictionVolumeRef:
     """Create one tile prediction range as an in-memory YOLO volume."""
     write_dense_tile_job_meta(tile_job, channel_format)
 
     fmt = resolve_channel_format(channel_format)
+    raster_plan = build_dense_tile_raster_plan(view, tile_job, fmt)
     renderer = make_dense_tile_channel_renderer(
         volume_rgb,
         view,
@@ -3925,6 +4341,8 @@ def materialize_dense_tile_prediction_volume_for_job(
         kind='tile',
         channel_format=fmt,
         view=view,
+        render_batch_sink=render_batch_sink,
+        raster_plan=raster_plan,
     )
 
 def should_cache_view_frames(view: ViewInfo, dense_tiling_active: bool) -> bool:
@@ -4082,3 +4500,56 @@ def get_view_frame_by_index(
         return render_tilted_native_frame(volume_rgb, view, int(index))
 
     raise ValueError(f'Unknown view: {view.name}')
+
+
+def get_categorical_view_frame_by_index(
+    mask_u8: np.ndarray,
+    view: ViewInfo,
+    index: int,
+    view_frames: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Return one native binary ground-truth frame for every physical view family."""
+    if view_frames is not None:
+        return np.ascontiguousarray(np.asarray(view_frames[int(index)]) > 0, dtype=np.uint8)
+
+    mask = np.asarray(mask_u8)
+    if mask.ndim != 3:
+        raise ValueError(f'Categorical source volume must be 3D, got {mask.shape}')
+
+    if physical_view_name(view) == 'transverse':
+        wait_for_volume_slice_ready(mask_u8, int(index))
+        return np.ascontiguousarray(np.asarray(mask[int(index)]) > 0, dtype=np.uint8)
+    if physical_view_name(view) == 'sagittal':
+        wait_for_volume_ready(mask_u8)
+        return np.ascontiguousarray(np.asarray(mask[:, int(index), :]) > 0, dtype=np.uint8)
+    if physical_view_name(view) == 'coronal':
+        wait_for_volume_ready(mask_u8)
+        return np.ascontiguousarray(np.asarray(mask[:, :, int(index)]) > 0, dtype=np.uint8)
+    if is_radial_view(view):
+        wait_for_volume_ready(mask_u8)
+        angle_deg = float(view.azimuths_deg[int(index)])
+        sampler = get_radial_sampler(view, angle_deg)
+        if is_tilted_radial_view(view):
+            return np.ascontiguousarray(
+                extract_tilted_radial_categorical_slice_frame(
+                    mask, view, sampler, out_rows=int(view.src_h),
+                )
+            )
+        oriented = radial_oriented_stack_view(mask, view)
+        return np.ascontiguousarray(
+            extract_radial_categorical_slice_frame(
+                oriented, sampler, out_rows=int(view.src_h),
+            )
+        )
+    if is_tilted_view(view):
+        wait_for_volume_ready(mask_u8)
+        return render_tilted_categorical_frame_on_grid(
+            mask,
+            view,
+            int(index),
+            _TILTED_IDENTITY_M,
+            int(view.src_h),
+            int(view.src_w),
+        )
+
+    raise ValueError(f'Unknown categorical view: {view.name}')

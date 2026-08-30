@@ -15,8 +15,8 @@ from tools.smoke_import import install_stubs
 
 install_stubs()
 
-from volume_tta import pipeline
-from volume_tta.geometry import ViewInfo
+from XTA import pipeline
+from XTA.geometry import ViewInfo
 
 
 def _physical_view(name: str = 'transverse', *, family: str = 'orthogonal') -> ViewInfo:

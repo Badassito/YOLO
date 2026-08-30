@@ -10,7 +10,7 @@ from tools.smoke_import import install_stubs
 
 install_stubs()
 
-from volume_tta import cuda_backend, geometry, inference
+from XTA import cuda_backend, geometry, inference
 
 
 class RadialBatchPaddingTests(unittest.TestCase):

@@ -19,6 +19,7 @@ from typing import (
 )
 import numpy as np
 from ._deps import cv2, ndi, tqdm
+from .gaussian import binary_gaussian_pass
 
 from .config import (
     GIB,
@@ -2650,14 +2651,13 @@ def _try_apply_gaussian_smoothing_gpu_chunked_inplace(
                 core1 = core0 + int(z1 - z0)
                 chunk_cpu = np.ascontiguousarray(np.asarray(source_mm[int(read0):int(read1)], dtype=np.float32))
                 chunk_gpu = cp.asarray(chunk_cpu)
-                smoothed_gpu = cpx_ndi.gaussian_filter(
+                smoothed_gpu = binary_gaussian_pass(
                     chunk_gpu,
                     sigma=float(sigma_f),
-                    mode='constant',
-                    cval=0.0,
-                    truncate=4.0,
+                    gaussian_filter=cpx_ndi.gaussian_filter,
+                    array_module=cp,
                 )
-                core_bool = cp.asnumpy(smoothed_gpu[int(core0):int(core1)] >= 0.5).astype(bool, copy=False)
+                core_bool = cp.asnumpy(smoothed_gpu[int(core0):int(core1)]).astype(bool, copy=False)
                 old_bool = np.asarray(source_mm[int(z0):int(z1)], dtype=bool)
                 for local_z in range(int(z1 - z0)):
                     new = core_bool[int(local_z)]
@@ -2771,47 +2771,40 @@ def apply_gaussian_smoothing_inplace(
         for pass_idx in range(1, passes_i + 1):
             print(f'Gaussian smoothing pass {int(pass_idx)}/{int(passes_i)} (sigma={sigma_f:g} voxels)')
 
-            def _copy_to_float(z: int) -> None:
-                work_mm[int(z), :, :] = np.asarray(mask_mm[int(z)], dtype=np.float32)
-
-            parallel_for_indices_chunked(
-                num_slices,
-                _copy_to_float,
-                max_workers=worker_count,
-                desc=f'Gaussian smoothing pass {int(pass_idx)}: copy binary volume',
-                show_progress=True,
-                target_chunks_per_worker=2,
-            )
-            flush_array(work_mm)
-
-            ndi.gaussian_filter(
-                input=work_mm,
-                sigma=float(sigma_f),
-                output=work_mm,
-                mode='constant',
-                cval=0.0,
-                truncate=4.0,
-            )
-            flush_array(work_mm)
-
             added_by_slice = np.zeros((num_slices,), dtype=np.int64)
             removed_by_slice = np.zeros((num_slices,), dtype=np.int64)
 
-            def _threshold_slice(z: int) -> None:
-                old = np.asarray(mask_mm[int(z)], dtype=bool)
-                new = np.asarray(work_mm[int(z)] >= 0.5, dtype=bool)
+            def _observe_slice(z: int, old: object, new: object) -> None:
+                old = np.asarray(old, dtype=bool)
+                new = np.asarray(new, dtype=bool)
                 added_by_slice[int(z)] = np.int64(np.count_nonzero(new & (~old)))
                 removed_by_slice[int(z)] = np.int64(np.count_nonzero(old & (~new)))
-                mask_mm[int(z), :, :] = new.astype(np.uint8, copy=False)
 
-            parallel_for_indices_chunked(
-                num_slices,
-                _threshold_slice,
-                max_workers=worker_count,
-                desc=f'Gaussian smoothing pass {int(pass_idx)}: threshold smoothed volume',
-                show_progress=True,
-                target_chunks_per_worker=2,
+            def _run_slices(phase: str, count: int, operation: Callable[[int], None]) -> None:
+                description = (
+                    f'Gaussian smoothing pass {int(pass_idx)}: copy binary volume'
+                    if phase == 'copy'
+                    else f'Gaussian smoothing pass {int(pass_idx)}: threshold smoothed volume'
+                )
+                parallel_for_indices_chunked(
+                    int(count),
+                    operation,
+                    max_workers=worker_count,
+                    desc=description,
+                    show_progress=True,
+                    target_chunks_per_worker=2,
+                )
+
+            binary_gaussian_pass(
+                mask_mm,
+                sigma=float(sigma_f),
+                gaussian_filter=ndi.gaussian_filter,
+                float_workspace=work_mm,
+                destination=mask_mm,
+                slice_runner=_run_slices,
+                observe_slice=_observe_slice,
             )
+            flush_array(work_mm)
             flush_array(mask_mm)
 
             if nrrd_layers is not None:

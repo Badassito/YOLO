@@ -3,7 +3,7 @@ from __future__ import annotations
 import pickle
 import unittest
 
-from volume_tta.inference_backends import (
+from XTA.inference_backends import (
     ArtifactRef,
     BackendRegistry,
     DispatchLease,

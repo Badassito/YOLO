@@ -10,7 +10,7 @@ from tools.smoke_import import install_stubs
 
 install_stubs()
 
-from volume_tta import workers
+from XTA import workers
 
 
 class _FakeOutputTensor:

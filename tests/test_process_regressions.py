@@ -14,7 +14,7 @@ from tools.smoke_import import install_stubs
 
 install_stubs()
 
-from volume_tta import assembly, interpolation, media, pipeline, runtime
+from XTA import assembly, interpolation, media, pipeline, runtime
 
 
 class _DetachHandle:

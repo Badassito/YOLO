@@ -42,7 +42,7 @@ class ImportRegressionTests(unittest.TestCase):
             from tools.smoke_import import install_stubs
 
             install_stubs()
-            from volume_tta.inference import (
+            from XTA.inference import (
                 cpu_retina_masks_enabled,
                 set_retina_mask_processor,
             )
@@ -57,8 +57,8 @@ class ImportRegressionTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stdout)
 
     def test_automatic_retina_backend_selection_remains_wired(self) -> None:
-        pipeline_source = (ROOT / "volume_tta" / "pipeline.py").read_text(encoding="utf-8")
-        workers_source = (ROOT / "volume_tta" / "workers.py").read_text(encoding="utf-8")
+        pipeline_source = (ROOT / "XTA" / "pipeline.py").read_text(encoding="utf-8")
+        workers_source = (ROOT / "XTA" / "workers.py").read_text(encoding="utf-8")
 
         self.assertIn(
             "retina_processor = 'gpu' if gpu_worker_process_active else 'cpu'",
@@ -81,7 +81,7 @@ class ImportRegressionTests(unittest.TestCase):
             from tools.smoke_import import install_stubs
 
             install_stubs()
-            importlib.import_module("volume_tta." + sys.argv[1])
+            importlib.import_module("XTA." + sys.argv[1])
             forbidden = {
                 "cupy", "jax", "openvino", "torch", "ultralytics",
                 "qatzip", "qpl", "accel_config", "dto", "dml",
@@ -89,8 +89,8 @@ class ImportRegressionTests(unittest.TestCase):
             loaded = {name.split(".")[0] for name in sys.modules}
             assert not (forbidden & loaded), forbidden & loaded
             native_modules = {
-                "volume_tta._qat_codec", "volume_tta._qpl_codec",
-                "volume_tta._dsa_copy",
+                "XTA._qat_codec", "XTA._qpl_codec",
+                "XTA._dsa_copy",
             }
             assert not (native_modules & set(sys.modules)), native_modules & set(sys.modules)
             """
@@ -138,13 +138,13 @@ class ImportRegressionTests(unittest.TestCase):
             from tools.smoke_import import install_stubs
 
             install_stubs()
-            from volume_tta import runtime
+            from XTA import runtime
 
             owner_names = {
-                "volume_tta.assembly",
-                "volume_tta.backprojection",
-                "volume_tta.interpolation",
-                "volume_tta.outputs",
+                "XTA.assembly",
+                "XTA.backprojection",
+                "XTA.interpolation",
+                "XTA.outputs",
             }
             assert not (owner_names & set(sys.modules)), owner_names & set(sys.modules)
 
@@ -169,7 +169,7 @@ class ImportRegressionTests(unittest.TestCase):
             assert all(features[name] is True for name in expected), features
             assert not (owner_names & set(sys.modules)), owner_names & set(sys.modules)
 
-            from volume_tta import assembly, backprojection, interpolation, outputs
+            from XTA import assembly, backprojection, interpolation, outputs
 
             assert hasattr(interpolation.RawBBoxMaskStore, "iter_restored_sparse_members")
             assert callable(outputs._resize_sparse_binary_crop_to_output_region)
@@ -202,7 +202,7 @@ class ImportRegressionTests(unittest.TestCase):
             def load(name):
                 try:
                     barrier.wait()
-                    importlib.import_module("volume_tta." + name)
+                    importlib.import_module("XTA." + name)
                 except BaseException:
                     errors.append(traceback.format_exc())
 
@@ -226,7 +226,7 @@ class ImportRegressionTests(unittest.TestCase):
                 self.assertEqual(completed.returncode, 0, completed.stdout)
 
     def test_transitional_import_shims_are_retired(self) -> None:
-        package = ROOT / "volume_tta"
+        package = ROOT / "XTA"
         self.assertFalse((package / "_latebind.py").exists())
         self.assertFalse((package / "_stdlib.py").exists())
         for path in package.glob("*.py"):

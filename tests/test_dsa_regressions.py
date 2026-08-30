@@ -16,7 +16,7 @@ from tools.smoke_import import install_stubs
 
 install_stubs()
 
-from volume_tta import intel_dsa, runtime
+from XTA import intel_dsa, runtime
 
 runtime.runtime_telemetry().enabled = False
 
@@ -149,7 +149,7 @@ class DsaNativeSourceContractTests(unittest.TestCase):
         setup_source = (ROOT / 'setup.py').read_text(encoding='utf-8')
         self.assertIn('VOLUME_TTA_BUILD_INTEL', setup_source)
         self.assertIn('native/dsa_copy.c', setup_source)
-        self.assertIn('volume_tta._dsa_copy', setup_source)
+        self.assertIn('XTA._dsa_copy', setup_source)
         self.assertIn('extra_link_args=["-pthread"]', setup_source)
 
 

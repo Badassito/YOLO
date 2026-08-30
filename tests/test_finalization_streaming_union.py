@@ -12,7 +12,7 @@ from tools.smoke_import import install_stubs
 
 install_stubs()
 
-from volume_tta import finalization, interpolation
+from XTA import finalization, interpolation
 
 
 def _bbox(plane: np.ndarray) -> tuple[int, int, int, int]:

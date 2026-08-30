@@ -14,7 +14,7 @@ from unittest import mock
 os.environ['YOLO_TTA_TELEMETRY'] = '0'
 
 from tests.test_output_regressions import outputs
-from volume_tta import intel_compression
+from XTA import intel_compression
 
 # Several policy tests deliberately replace the entire environment. Initialize the
 # process-local singleton while telemetry is disabled so those temporary clear=True

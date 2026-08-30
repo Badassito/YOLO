@@ -8,7 +8,28 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WRAPPER = ROOT / "GPT-5.6-Sol-Ultra_v17.1.5_SLURM.py"
+WRAPPER = ROOT / "GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py"
+UNIFIED_MODULES = (
+    "gaussian",
+    "pta_config",
+    "pta_mode",
+    "pta_runtime",
+    "pta_scheduler",
+    "pta",
+    "tta_mode",
+    "render_batch",
+    "cli",
+    "unification",
+    "unification.channels",
+    "unification.context",
+    "unification.contracts",
+    "unification.manifest",
+    "unification.runtime",
+    "unification.sampling",
+    "unification.tiles",
+    "unification.tta_manifest",
+    "unification.views",
+)
 
 
 class ImportSurfaceTests(unittest.TestCase):
@@ -25,7 +46,7 @@ class ImportSurfaceTests(unittest.TestCase):
 
     def test_config_import_does_not_load_native_or_accelerator_runtimes(self) -> None:
         program = (
-            "import sys; import volume_tta.config; "
+            "import sys; import XTA.config; "
             "forbidden={'cv2','scipy','torch','cupy','openvino','ultralytics','jax'}; "
             "loaded={name.split('.')[0] for name in sys.modules}; "
             "assert not (forbidden & loaded), forbidden & loaded"
@@ -33,15 +54,15 @@ class ImportSurfaceTests(unittest.TestCase):
         completed = self.run_python("-c", program)
         self.assertEqual(completed.returncode, 0, completed.stdout)
 
-    def test_compatibility_launcher_help_is_dependency_light(self) -> None:
+    def test_unified_launcher_help_is_dependency_light(self) -> None:
         completed = self.run_python(str(WRAPPER), "--help")
         self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertIn("YOLO segmentation TTA", completed.stdout)
+        self.assertIn("--mode {tta,pta}", completed.stdout)
 
     def test_module_version(self) -> None:
-        completed = self.run_python("-m", "volume_tta", "--version")
+        completed = self.run_python("-m", "XTA", "--version")
         self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertIn("17.1.5", completed.stdout)
+        self.assertIn("18.0.0", completed.stdout)
 
     def test_cycle_safe_full_import_smoke(self) -> None:
         completed = self.run_python(str(ROOT / "tools" / "smoke_import.py"), "pipeline")
@@ -55,9 +76,10 @@ class ImportSurfaceTests(unittest.TestCase):
             "inference_backends.contracts",
             "inference_backends.descriptors",
             "inference_backends.registry",
+            *UNIFIED_MODULES,
         ):
             with self.subTest(module=module):
-                self.assertIn(f"imported volume_tta.{module}", completed.stdout)
+                self.assertIn(f"imported XTA.{module}", completed.stdout)
 
     def test_package_statement_inventory(self) -> None:
         completed = self.run_python(str(ROOT / "tools" / "verify_package_inventory.py"))

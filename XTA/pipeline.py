@@ -30,6 +30,7 @@ from typing import (
     Callable,
     Dict,
     List,
+    Mapping,
     Optional,
     Sequence,
     Tuple,
@@ -159,7 +160,6 @@ from .media import (
     reset_streaming_state_for_new_run,
     resize_volume_to_processing_cube_gray8,
     resize_volume_to_processing_cube_gray8_streaming,
-    resolve_radial_azimuth_angles,
     restore_mask_volume_to_original_shape,
     should_resize_to_processing_cube,
     streaming_preprocess_enabled,
@@ -175,10 +175,11 @@ from .geometry import (
     _prediction_ref_has_gpu_input_staging,
     build_aug_job_for_variant,
     build_dense_tile_jobs_for_aug,
+    build_dense_tile_raster_plan,
+    build_fullframe_raster_plan,
     build_view_frame_cache,
     close_prediction_volume_ref,
     expand_views_into_tta_variants,
-    get_view_infos,
     gpu_input_staging_ahead_sources,
     gpu_input_staging_enabled,
     is_radial_view,
@@ -203,7 +204,6 @@ from .geometry import (
     radial_batch_padding_tile_result_ids,
     radial_base_view_name,
     radial_target_base_view,
-    radial_target_diameter,
     resolve_prediction_render_workers,
     resolve_prediction_source_queue_slots,
     resolve_tile_configs,
@@ -291,6 +291,7 @@ from .backprojection import (
 from .outputs import (
     BackgroundOutputManager,
     BackgroundOutputSubmission,
+    CanonicalRenderImageSink,
     NrrdLayerSink,
     collect_low_quality_output_futures,
     collect_pipeline_output_futures,
@@ -300,8 +301,8 @@ from .outputs import (
     resolve_low_quality_downbin_specs,
     set_nrrd_layer_sink,
     shutdown_nrrd_gzip_executors,
+    publish_canonical_render_images,
     write_summary_file,
-    write_view_images,
 )
 from .assembly import (
     _delete_tile_result_storage,
@@ -331,6 +332,18 @@ from .finalization import (
     assemble_view_volumes_into_native_union,
 )
 from .topology import fill_3d_voids_inplace_streaming
+from .unification.context import current_unified_launch
+from .unification.manifest import write_json_manifest
+from .unification.runtime import compile_physical_views
+from .unification.sampling import (
+    forward_sampling_execution_record,
+    raster_plan_spawn_spec,
+)
+from .unification.tta_manifest import (
+    assert_tta_artifacts_unchanged,
+    build_tta_run_manifest,
+    capture_tta_artifact_identities,
+)
 from .workers import (
     _cpu_inference_worker_main,
     _gpu_inference_worker_main,
@@ -459,6 +472,92 @@ def _run_resources() -> _PipelineRunResources:
     if resources is None:
         raise RuntimeError('pipeline resource created outside an active main() invocation')
     return resources
+
+
+def _cleanup_tta_selected_run_scratch(*, temp_dir: Path, out_dir: Path) -> None:
+    """Strictly retire scratch owned by the selected run.
+
+    A v18 complete manifest is a success commit, so cleanup cannot remain a
+    best-effort warning immediately before that commit.  Every owned path is
+    removed without ``ignore_errors``; any failure propagates and prevents
+    complete-manifest publication.
+    """
+
+    temp_dir = Path(temp_dir)
+    out_dir = Path(out_dir)
+    try:
+        released_memfd_files = release_memfd_owners_under(temp_dir)
+        if int(released_memfd_files) > 0:
+            print(f'Released {int(released_memfd_files)} memfd-backed scratch payload(s).')
+
+        for child in list(temp_dir.iterdir()):
+            if child.is_symlink() or child.is_file():
+                child.unlink(missing_ok=True)
+            elif child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink(missing_ok=True)
+
+        default_temp_dir = out_dir / 'temp'
+        if temp_dir != default_temp_dir:
+            # The explicit --temp child is uniquely owned by this run.
+            temp_dir.rmdir()
+            temp_link = default_temp_dir
+            if temp_link.is_symlink():
+                temp_link.unlink()
+            elif temp_link.exists():
+                # ``expose_scratch_in_output`` uses this marker when directory
+                # symlinks are unavailable.  Refuse to remove an unowned path.
+                marker = temp_link / 'SCRATCH_LOCATION.txt'
+                if not marker.is_file() or marker.read_text(encoding='utf-8').strip() != str(temp_dir):
+                    raise RuntimeError(
+                        'scratch exposure path is not the selected run marker: '
+                        f'{temp_link}'
+                    )
+                marker.unlink()
+                temp_link.rmdir()
+    except Exception as exc:
+        raise RuntimeError(
+            'TTA selected-run scratch cleanup failed; refusing a complete manifest: '
+            f'{temp_dir}'
+        ) from exc
+
+
+def _publish_complete_tta_manifest(
+    *,
+    path: Path,
+    manifest: Mapping[str, object],
+    artifact_identities: Mapping[str, object],
+) -> Path:
+    """Revalidate authoritative artifacts and atomically commit TTA success."""
+
+    if str(manifest.get('status', '')) != 'complete':
+        raise ValueError('TTA complete-manifest publisher requires status=complete')
+    # Keep this check immediately adjacent to the atomic write.  In particular,
+    # no cleanup, summary generation, or manifest construction may be inserted
+    # between the identity barrier and publication.
+    assert_tta_artifacts_unchanged(artifact_identities)
+    return write_json_manifest(path, manifest)
+
+
+def _finalize_tta_selected_run_and_publish(
+    *,
+    temp_dir: Path,
+    out_dir: Path,
+    keep_temp_artifacts: bool,
+    manifest_path: Path,
+    manifest: Mapping[str, object],
+    artifact_identities: Mapping[str, object],
+) -> Path:
+    """Finish selected-run cleanup before publishing the complete manifest."""
+
+    if not bool(keep_temp_artifacts):
+        _cleanup_tta_selected_run_scratch(temp_dir=temp_dir, out_dir=out_dir)
+    return _publish_complete_tta_manifest(
+        path=manifest_path,
+        manifest=manifest,
+        artifact_identities=artifact_identities,
+    )
 
 def _create_tracked_thread_pool(
     *,
@@ -602,7 +701,7 @@ def main() -> None:
     """Execute one pipeline run with a lifecycle boundary spanning the full function."""
     global _ACTIVE_PIPELINE_RUN_RESOURCES
     if not _PIPELINE_RUN_LOCK.acquire(blocking=False):
-        raise RuntimeError('concurrent volume_tta.pipeline.main() invocations are not supported')
+        raise RuntimeError('concurrent XTA.pipeline.main() invocations are not supported')
     resources = _PipelineRunResources()
     _ACTIVE_PIPELINE_RUN_RESOURCES = resources
     failed = True
@@ -1228,6 +1327,55 @@ def _main_impl() -> None:
     out_dir = Path(args.output).expanduser().resolve() if args.output else (Path.cwd() / input_path.stem)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    unified_launch_at_start = current_unified_launch()
+    tta_artifact_identities: Optional[Dict[str, object]] = None
+    if (
+        unified_launch_at_start is not None
+        and str(unified_launch_at_start.mode) == 'tta'
+    ):
+        tta_artifact_identities = capture_tta_artifact_identities(
+            input_path=input_path,
+            gpu_model_path=gpu_model_path,
+            cpu_model_path=cpu_model_path,
+        )
+        # Atomically invalidate any prior successful association before this run
+        # starts creating or replacing output artifacts.
+        write_json_manifest(
+            out_dir / 'manifest.json',
+            {
+                'schema': 'volume_tta.v18.run_manifest/1',
+                'status': 'in_progress',
+                'launcher': {
+                    'name': str(unified_launch_at_start.launcher),
+                    'version': str(unified_launch_at_start.version),
+                    'mode': 'tta',
+                    'command': list(unified_launch_at_start.command),
+                },
+                'inputs': tta_artifact_identities,
+                'note': (
+                    'A complete manifest replaces this record only after every '
+                    'selected output and resource-finalization stage succeeds.'
+                ),
+            },
+        )
+
+    canonical_images_stage_root: Optional[Path] = None
+    if bool(save_images_enabled):
+        canonical_images_parent = out_dir / 'images'
+        canonical_images_parent.mkdir(parents=True, exist_ok=True)
+        canonical_images_stage_root = (
+            canonical_images_parent / f'.model_input.stage.{os.getpid()}'
+        )
+        if canonical_images_stage_root.exists():
+            shutil.rmtree(canonical_images_stage_root)
+        canonical_images_stage_root.mkdir(parents=True, exist_ok=True)
+        if bool(gpu_worker_process_active):
+            print(
+                'Warning: --save images captures canonical CPU/materialized model-input '
+                'batches. Device-resident CUDA render capture remains pending hardware '
+                'qualification and those tasks may not emit image artifacts.'
+            )
+
     temp_dir = choose_scratch_dir(args.temp, out_dir, input_path.stem)
     register_unique_run_scratch_cleanup(
         temp_dir,
@@ -1478,14 +1626,17 @@ def _main_impl() -> None:
             'Set YOLO_TTA_GPU_WORKER_DIRECT_UNION=0 to select per-task result files.'
         )
 
-    radial_diameters = [
-        radial_target_diameter(target, int(T), int(H), int(W))
-        for target in radial_targets
-    ]
-    resolved_azimuth_angles = resolve_radial_azimuth_angles(
-        radial_requests,
-        diameters=radial_diameters,
+    compiled_physical_views = compile_physical_views(
+        t_dim=int(T),
+        height=int(H),
+        width=int(W),
+        cartesian_views=enabled_cartesian_views,
+        radial_requests=radial_requests,
+        tilted_groups=tilt_groups,
+        radial_native_raster=int(args.imgsz),
     )
+    radial_diameters = list(compiled_physical_views.radial_diameters)
+    resolved_azimuth_angles = list(compiled_physical_views.radial_azimuth_angles)
     for request, diameter, spacing in zip(
         radial_requests, radial_diameters, resolved_azimuth_angles,
     ):
@@ -1562,16 +1713,9 @@ def _main_impl() -> None:
 
     # Fold each Radial transformed stack/diameter to the requested model raster.
     radial_fold_raster = int(args.imgsz)
-    physical_views = get_view_infos(
-        T=T,
-        H=H,
-        W=W,
-        cartesian_views=enabled_cartesian_views,
-        radial_views=radial_targets,
-        radial_azimuth_angles=resolved_azimuth_angles,
-        tilt_groups=tilt_groups,
-        radial_native_raster=int(radial_fold_raster),
-    )
+    if int(radial_fold_raster) != int(args.imgsz):  # pragma: no cover - defensive alias guard
+        raise RuntimeError("radial fold raster changed after physical-view compilation")
+    physical_views = list(compiled_physical_views.views)
     if not physical_views:
         raise ValueError(
             'No inference views are active. Enable at least one view with --enable_cartesian, '
@@ -1994,6 +2138,31 @@ def _main_impl() -> None:
             if jobs_by_config:
                 tile_jobs_by_view_config[view.name] = jobs_by_config
 
+    tta_raster_plan_records: List[Dict[str, object]] = []
+    for view in inference_views:
+        for aug_job in aug_jobs_by_view.get(view.name, ()):
+            full_plan = build_fullframe_raster_plan(view, aug_job, channel_format)
+            full_record = full_plan.canonical_record()
+            full_record["sampling_policy"] = {
+                "policy_id": str(full_plan.sampling_policy.policy_id),
+                "policy_version": int(full_plan.sampling_policy.policy_version),
+                "policy_digest": str(full_plan.sampling_policy.digest),
+            }
+            full_record["plan_digest"] = str(full_plan.digest)
+            tta_raster_plan_records.append(full_record)
+            for tile_job in tile_jobs_by_aug.get((view.name, aug_job.aug_id), ()):
+                tile_plan = build_dense_tile_raster_plan(
+                    view, tile_job, channel_format
+                )
+                tile_record = tile_plan.canonical_record()
+                tile_record["sampling_policy"] = {
+                    "policy_id": str(tile_plan.sampling_policy.policy_id),
+                    "policy_version": int(tile_plan.sampling_policy.policy_version),
+                    "policy_digest": str(tile_plan.sampling_policy.digest),
+                }
+                tile_record["plan_digest"] = str(tile_plan.digest)
+                tta_raster_plan_records.append(tile_record)
+
     tile_expected_by_parent: Dict[Tuple[str, str], int] = {}
     tile_expected_by_set: Dict[Tuple[str, str, str], int] = {}
     tile_config_ids_by_parent: Dict[Tuple[str, str], Tuple[str, ...]] = {}
@@ -2325,8 +2494,34 @@ def _main_impl() -> None:
     def _prediction_volume_queue_depth() -> int:
         return int(len(pending_prediction_volume_futures) + len(ready_fullframe) + len(ready_tile_infer))
 
+    def _canonical_image_sink(
+        view: ViewInfo,
+        job: AugJob | DenseTileJob,
+        kind: str,
+        *,
+        model_name: str = 'shared',
+        backend: str = 'inprocess_cpu',
+    ) -> Optional[CanonicalRenderImageSink]:
+        if canonical_images_stage_root is None:
+            return None
+        tile_job = job if isinstance(job, DenseTileJob) else None
+        return CanonicalRenderImageSink(
+            stage_root=canonical_images_stage_root,
+            stem=input_path.stem,
+            model_name=str(model_name),
+            view_name=str(view.name),
+            kind=str(kind),
+            aug_id=str(job.aug_id),
+            channel_count=int(channel_format.channel_count),
+            config_id=(str(tile_job.config_id) if tile_job is not None else None),
+            tile_id=(str(tile_job.tile_id) if tile_job is not None else None),
+            backend=str(backend),
+        )
+
     def _make_streaming_fullframe_ref(view: ViewInfo, aug_job: AugJob) -> PredictionVolumeRef:
         write_aug_job_meta(aug_job, view, channel_format)
+        raster_plan = build_fullframe_raster_plan(view, aug_job, channel_format)
+        image_sink = _canonical_image_sink(view, aug_job, 'fullframe')
         render_workers = streaming_prediction_source_workers(int(per_prediction_volume_workers), int(view.num_slices))
         prefetch_frames = streaming_prediction_source_prefetch_frames(
             max(1, int(max(args.gpu_batch if gpu_worker_process_active else 1, args.cpu_batch if cpu_worker_process_active else 1)))
@@ -2353,6 +2548,8 @@ def _main_impl() -> None:
             shared_executor=prediction_render_executor,
             channel_format=channel_format,
             view=view,
+            render_batch_sink=image_sink,
+            raster_plan=raster_plan,
         )
         return PredictionVolumeRef(
             array=None,
@@ -2363,10 +2560,15 @@ def _main_impl() -> None:
             kind='fullframe',
             source=source,
             channel_format=channel_format,
+            view=view,
+            render_batch_sink=image_sink,
+            raster_plan=raster_plan,
         )
 
     def _make_streaming_tile_ref(view: ViewInfo, tile_job: DenseTileJob) -> PredictionVolumeRef:
         write_dense_tile_job_meta(tile_job, channel_format)
+        raster_plan = build_dense_tile_raster_plan(view, tile_job, channel_format)
+        image_sink = _canonical_image_sink(view, tile_job, 'tile')
         render_workers = streaming_prediction_source_workers(int(per_prediction_volume_workers), int(view.num_slices))
         prefetch_frames = streaming_prediction_source_prefetch_frames(max(1, int(args.batch)))
 
@@ -2391,6 +2593,8 @@ def _main_impl() -> None:
             shared_executor=prediction_render_executor,
             channel_format=channel_format,
             view=view,
+            render_batch_sink=image_sink,
+            raster_plan=raster_plan,
         )
         return PredictionVolumeRef(
             array=None,
@@ -2401,6 +2605,9 @@ def _main_impl() -> None:
             kind='tile',
             source=source,
             channel_format=channel_format,
+            view=view,
+            render_batch_sink=image_sink,
+            raster_plan=raster_plan,
         )
 
     def _submit_prediction_volume_build(kind: str, view: ViewInfo, job_obj: object) -> None:
@@ -2421,6 +2628,7 @@ def _main_impl() -> None:
                     workers=int(per_prediction_volume_workers),
                     show_progress=False,
                     channel_format=channel_format,
+                    render_batch_sink=_canonical_image_sink(view, aug_job, 'fullframe'),
                 )
         elif str(kind) == 'tile':
             tile_job = job_obj
@@ -2439,6 +2647,7 @@ def _main_impl() -> None:
                     workers=int(per_prediction_volume_workers),
                     show_progress=False,
                     channel_format=channel_format,
+                    render_batch_sink=_canonical_image_sink(view, tile_job, 'tile'),
                 )
         else:  # pragma: no cover
             raise ValueError(f'Unknown prediction volume build kind: {kind}')
@@ -6300,6 +6509,9 @@ def _main_impl() -> None:
             if str(kind) == 'fullframe':
                 aug_job = job_obj
                 write_aug_job_meta(aug_job, view, channel_format)
+                worker_raster_plan_spec = raster_plan_spawn_spec(
+                    build_fullframe_raster_plan(view, aug_job, channel_format)
+                )
                 m_out = np.asarray(aug_job.aff.M_out_to_src, dtype=np.float32)
                 out_size = int(aug_job.aff.out_size)
                 job_id = str(aug_job.aug_id)
@@ -6333,6 +6545,9 @@ def _main_impl() -> None:
             else:
                 tile_job = job_obj
                 write_dense_tile_job_meta(tile_job, channel_format)
+                worker_raster_plan_spec = raster_plan_spawn_spec(
+                    build_dense_tile_raster_plan(view, tile_job, channel_format)
+                )
                 m_out = np.asarray(tile_job.M_out_to_src, dtype=np.float32)
                 out_size = int(tile_job.out_size)
                 job_id = str(tile_job.tile_id)
@@ -6411,6 +6626,25 @@ def _main_impl() -> None:
                     'cpu_eligible': bool(cpu_eligible), 'gpu_eligible': bool(gpu_eligible),
                     'view': view, 'job': job_obj, 'job_id': job_id, 'out_size': int(out_size),
                     'channel_format': channel_format,
+                    'raster_plan_spec': worker_raster_plan_spec,
+                    'canonical_image_spec': (
+                        {
+                            'stage_root': str(canonical_images_stage_root),
+                            'stem': str(input_path.stem),
+                            'model_name': str(model_name),
+                            'view_name': str(view.name),
+                            'kind': str(kind),
+                            'aug_id': str(getattr(job_obj, 'aug_id')),
+                            'channel_count': int(channel_format.channel_count),
+                            'config_id': (
+                                str(tile_job.config_id) if str(kind) == 'tile' else None
+                            ),
+                            'tile_id': (
+                                str(tile_job.tile_id) if str(kind) == 'tile' else None
+                            ),
+                        }
+                        if canonical_images_stage_root is not None else None
+                    ),
                     'M_out_to_src': m_out,
                     'M_out_to_processing': m_out_processing,
                     'processing_shape': task_processing_shape,
@@ -8502,6 +8736,22 @@ def _main_impl() -> None:
             desc='Counting voxel_volume',
         )
         voxel_volume = int(np.sum(voxel_counts, dtype=np.int64))
+        voxel_volume_path = write_json_manifest(
+            out_dir / f'{input_path.stem}_VoxelVolume.json',
+            {
+                'schema': 'volume_tta.v18.voxel_count/1',
+                'voxel_count': int(voxel_volume),
+                'source_stage': 'final_output_after_all_postprocessing',
+                'target': 'native_input_space_final_binary_prediction',
+                'units': 'foreground_voxels',
+                'shape_t_y_x': [
+                    int(final_output_mask_mm.shape[0]),
+                    int(final_output_mask_mm.shape[1]),
+                    int(final_output_mask_mm.shape[2]),
+                ],
+            },
+        )
+        final_paths['voxel_volume'] = voxel_volume_path
 
     runtime_telemetry().gauge('pipeline.phase', 'post_output_wait')
     print('\n=== Waiting for background video/label output tasks ===')
@@ -8521,18 +8771,23 @@ def _main_impl() -> None:
             final_paths['nrrd_manifest'] = nrrd_manifest_path
 
     if bool(save_images_enabled):
-        print('\n=== Saving active-view image sequences ===')
-        for view in views:
-            image_dir = write_view_images(
-                volume_rgb=volume_rgb,
-                view=view,
-                out_dir=out_dir,
-                stem=input_path.stem,
-                channel_format=channel_format,
-                workers=tail_output_frame_workers,
-                show_progress=False,
-            )
-            final_paths[f'{view.name}_images_dir'] = image_dir
+        print('\n=== Publishing canonical model-input image sequences ===')
+        if canonical_images_stage_root is None:  # pragma: no cover - guarded at setup
+            raise RuntimeError('Canonical image stage was not initialized')
+        image_dir = publish_canonical_render_images(
+            canonical_images_stage_root,
+            out_dir / 'images' / 'model_input',
+        )
+        final_paths['model_input_images_dir'] = image_dir
+
+    unified_launch = current_unified_launch()
+    run_manifest_path: Optional[Path] = None
+    run_manifest: Optional[Dict[str, object]] = None
+    if unified_launch is not None and str(unified_launch.mode) == 'tta':
+        run_manifest_path = out_dir / 'manifest.json'
+        # Predeclare the mandatory manifest so the optional text summary can link it.
+        # Publication is deferred until that summary has also succeeded.
+        final_paths['run_manifest'] = run_manifest_path
 
     summary_path: Optional[Path] = None
     if bool(save_summary_enabled):
@@ -8566,6 +8821,178 @@ def _main_impl() -> None:
             slice_postprocess_workers=slice_postprocess_workers,
             interpolation_workers=interpolation_workers,
             output_workers=tail_output_workers,
+        )
+        final_paths['summary'] = summary_path
+
+    if run_manifest_path is not None:
+        assert unified_launch is not None
+        if tta_artifact_identities is None:  # pragma: no cover - launch invariant
+            raise RuntimeError('v18 TTA artifact identities were not captured')
+        assert_tta_artifacts_unchanged(tta_artifact_identities)
+        run_manifest = build_tta_run_manifest(
+            launch_context=unified_launch,
+            pipeline_version=SCRIPT_VERSION,
+            resolved_config=dict(vars(args)),
+            artifact_identities=tta_artifact_identities,
+            source_shape_tyx=(input_T, input_H, input_W),
+            processing_shape_tyx=(T, H, W),
+            fps=fps,
+            physical_views=physical_views,
+            inference_views=inference_views,
+            angles=angles,
+            channel_format=channel_format,
+            tile_configs=tile_configs,
+            radial_requests=radial_requests,
+            radial_diameters=radial_diameters,
+            radial_azimuth_angles=resolved_azimuth_angles,
+            backend={
+                'inference_devices': list(inference_devices),
+                'gpu_worker_process_active': bool(gpu_worker_process_active),
+                'cpu_worker_process_active': bool(cpu_worker_process_active),
+                'gpu_count': int(gpu_device_count),
+                'pinned_cuda_visible_device_tokens': list(pinned_gpu_tokens),
+                'retina_mask_processor': str(retina_processor),
+                'gpu_precision': str(quantize_display(args.gpu_quantize)),
+                'cpu_precision': str(args.cpu_precision),
+                'gpu_batch': int(args.gpu_batch),
+                'cpu_batch': int(args.cpu_batch),
+                'cpu_instances': [
+                    {
+                        'instance_id': int(plan.instance_id),
+                        'numa_nodes': [int(value) for value in plan.numa_nodes],
+                        'cpus': [int(value) for value in plan.cpus],
+                        'physical_cores': int(plan.physical_cores),
+                        'inference_threads': int(plan.inference_threads),
+                    }
+                    for plan in cpu_instance_plans
+                ],
+                'cpu_worker_ready_details': {
+                    str(instance_id): dict(details)
+                    for instance_id, details in sorted(
+                        cpu_worker_ready_details_by_id.items()
+                    )
+                },
+                'worker_task_counts': {
+                    'gpu_dispatched_by_worker': {
+                        str(worker_id): int(count)
+                        for worker_id, count in sorted(gpu_worker_dispatched_by_id.items())
+                    },
+                    'gpu_completed_by_worker': {
+                        str(worker_id): int(count)
+                        for worker_id, count in sorted(gpu_worker_results_by_id.items())
+                    },
+                    'cpu_dispatched_by_worker': {
+                        str(worker_id): int(count)
+                        for worker_id, count in sorted(cpu_worker_dispatched_by_id.items())
+                    },
+                    'cpu_completed_by_worker': {
+                        str(worker_id): int(count)
+                        for worker_id, count in sorted(cpu_worker_results_by_id.items())
+                    },
+                },
+                'physical_view_backend_ownership': [
+                    {
+                        'model': str(parent[0]),
+                        'physical_view': str(parent[1]),
+                        'contract': str(
+                            hybrid_view_mode_by_parent.get(parent, 'single_backend')
+                        ),
+                        'frames': {
+                            str(backend_name): int(count)
+                            for backend_name, count in sorted(
+                                hybrid_view_frames_by_backend.get(parent, Counter()).items()
+                            )
+                        },
+                        'tasks': {
+                            str(backend_name): int(count)
+                            for backend_name, count in sorted(
+                                hybrid_view_tasks_by_backend.get(parent, Counter()).items()
+                            )
+                        },
+                    }
+                    for parent in sorted(
+                        set(hybrid_view_frames_by_backend)
+                        | set(hybrid_view_tasks_by_backend)
+                        | set(hybrid_view_mode_by_parent)
+                    )
+                ],
+            },
+            forward_sampling={
+                **forward_sampling_execution_record(
+                    tuple(
+                        ([('cpu', 'intensity')] if cpu_inference_enabled else [])
+                        + ([('cuda', 'intensity')] if gpu_inference_enabled else [])
+                    )
+                ),
+                'raster_plans': tta_raster_plan_records,
+                'data_role': 'intensity',
+                'authoritative_modules': [
+                    'XTA.geometry',
+                    'XTA.cuda_backend',
+                    'XTA.render_batch',
+                ],
+                'processing_volume_mode': str(processing_mode),
+                'streaming_preprocess': bool(preprocess_streaming_active),
+                'cube_t_axis_resize_backend': str(_cube_t_axis_resize_backend()),
+                'radial_source_mode': str(radial_source_mode()),
+                'image_capture': (
+                    'canonical_render_batch_tee'
+                    if bool(save_images_enabled)
+                    else 'disabled'
+                ),
+                'device_resident_cuda_image_capture_qualification': 'pending',
+                'runtime_cuda_renderer_fallback_capture': (
+                    'pending_gpu_qualification'
+                    if bool(gpu_worker_process_active)
+                    else 'not_applicable'
+                ),
+            },
+            prediction_processing={
+                'owner': 'tta_only',
+                'interpolation': {
+                    'distance': int(args.interpolation_distance),
+                    'walk_back': int(args.interpolation_walk_back),
+                    'candidates': int(args.interpolation_candidates),
+                    'passes': int(args.interpolation_passes),
+                    'search_angle_deg': float(args.interpolation_search_angle),
+                    'min_radius': float(args.interpolation_min_radius),
+                },
+                'postprocessing': {
+                    'fill_3d_voids': bool(args.enable_3d_void_fill),
+                    'gaussian_smoothing': bool(gaussian_smoothing_enabled),
+                    'gaussian_sigma': float(gaussian_smoothing_sigma),
+                    'gaussian_passes': int(gaussian_smoothing_passes),
+                    'keep_objects': int(args.keep_objects),
+                    'centerline_filter_passes': int(args.centerline_filter_passes),
+                },
+            },
+            requested_outputs=save_options,
+            output_paths=final_paths,
+            output_metadata={
+                'voxel_volume': (
+                    {
+                        'schema': 'volume_tta.v18.voxel_count/1',
+                        'voxel_count': int(voxel_volume),
+                        'source_stage': 'final_output_after_all_postprocessing',
+                        'target': 'native_input_space_final_binary_prediction',
+                        'units': 'foreground_voxels',
+                        'shape_t_y_x': [
+                            int(output_T), int(output_H), int(output_W),
+                        ],
+                    }
+                    if voxel_volume is not None
+                    else None
+                ),
+                'model_input_images': (
+                    {
+                        'fanout': 'canonical_render_batch_tee',
+                        'cpu_and_worker_slab_paths': 'qualified',
+                        'device_resident_cuda_paths': 'pending',
+                    }
+                    if bool(save_images_enabled)
+                    else None
+                ),
+            },
         )
 
 
@@ -8633,29 +9060,21 @@ def _main_impl() -> None:
     trim_cuda_memory()
     gc.collect()
 
-    if not keep_temp_artifacts:
-        released_memfd_files = release_memfd_owners_under(temp_dir)
-        if int(released_memfd_files) > 0:
-            print(f'Released {int(released_memfd_files)} memfd-backed scratch payload(s).')
-        try:
-            for child in list(temp_dir.iterdir()):
-                try:
-                    if child.is_dir():
-                        shutil.rmtree(child, ignore_errors=True)
-                    else:
-                        child.unlink(missing_ok=True)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        try:
-            if temp_dir != out_dir / 'temp':
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                temp_link = out_dir / 'temp'
-                if temp_link.is_symlink():
-                    temp_link.unlink(missing_ok=True)
-        except Exception:
-            pass
+    if run_manifest_path is not None:
+        if run_manifest is None:  # pragma: no cover - paired construction invariant
+            raise RuntimeError('v18 TTA run manifest was not constructed')
+        if tta_artifact_identities is None:  # pragma: no cover - launch invariant
+            raise RuntimeError('v18 TTA artifact identities were not captured')
+        _finalize_tta_selected_run_and_publish(
+            temp_dir=temp_dir,
+            out_dir=out_dir,
+            keep_temp_artifacts=bool(keep_temp_artifacts),
+            manifest_path=run_manifest_path,
+            manifest=run_manifest,
+            artifact_identities=tta_artifact_identities,
+        )
+    elif not keep_temp_artifacts:
+        _cleanup_tta_selected_run_scratch(temp_dir=temp_dir, out_dir=out_dir)
 
     post_inference_tail_seconds = float(time.perf_counter() - post_inference_tail_started)
     runtime_telemetry().gauge('post_inference_tail.seconds', post_inference_tail_seconds)
@@ -8668,3 +9087,5 @@ def _main_impl() -> None:
         print(f"Final overlay: {final_paths['overlay']}")
     if summary_path is not None:
         print(f'Summary: {summary_path}')
+    if run_manifest_path is not None:
+        print(f'Manifest: {run_manifest_path}')

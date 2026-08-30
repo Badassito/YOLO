@@ -29,7 +29,7 @@ def _payload(size: int) -> bytes:
 
 
 def _compression_backend(name: str, size: int, iterations: int, level: int) -> Dict[str, object]:
-    from volume_tta import intel_compression
+    from XTA import intel_compression
 
     capabilities = intel_compression.probe_capabilities(name)
     supported = tuple(int(value) for value in capabilities.get("supported_levels", (level,)))
@@ -76,7 +76,7 @@ def _compression_backend(name: str, size: int, iterations: int, level: int) -> D
 def _dsa_backend(size: int, iterations: int) -> Dict[str, object]:
     import numpy as np
 
-    from volume_tta import intel_dsa
+    from XTA import intel_dsa
 
     manager = intel_dsa.get_manager()
     capabilities = manager.capabilities(work_queue=intel_dsa.requested_work_queue())

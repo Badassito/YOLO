@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PACKAGE = ROOT / "volume_tta"
+PACKAGE = ROOT / "XTA"
 MANIFEST = PACKAGE / "_package_inventory.json"
 
 # These definitions have reviewed, intentional implementation changes.
@@ -23,6 +23,7 @@ INTENTIONALLY_CHANGED = {
     ("backprojection", "_try_resident_trt_ring_accumulate"),
     ("backprojection", "HybridBackprojectionQueue"),
     ("config", "build_argparser"),
+    ("config", "resolve_save_request"),
     ("config", "resolve_backend_batches"),
     ("config", "resolve_backend_precisions"),
     ("cuda_backend", "_GpuWorkerRenderEngine"),
@@ -59,6 +60,7 @@ INTENTIONALLY_CHANGED = {
     ("geometry", "tile_parent_crop_window"),
     ("geometry", "write_aug_job_meta"),
     ("geometry", "write_dense_tile_job_meta"),
+    ("geometry", "resolve_tile_configs"),
     ("inference", "cpu_retina_masks_enabled"),
     ("inference", "PredictionAccumulationHandle"),
     ("inference", "_DeviceUnionAccumulator"),
@@ -129,6 +131,8 @@ INTENTIONALLY_CHANGED = {
     ("assembly", "gate_tile_residual_against_parent_bridge"),
     ("assembly", "gate_tile_result_against_parent_mask"),
     ("assembly", "materialize_nrrd_view_layer"),
+    ("assembly", "_try_apply_gaussian_smoothing_gpu_chunked_inplace"),
+    ("assembly", "apply_gaussian_smoothing_inplace"),
     ("assembly", "spill_waiting_tile_result_to_raw_store"),
     ("geometry", "is_tilted_view"),
     ("outputs", "write_summary_file"),
@@ -154,6 +158,14 @@ INTENTIONALLY_VERSIONED = {
         "SCRIPT_VERSION_COMPACT",
     ("config", "7eeed39e30c270fc4e56bbef52e6bc94b6e61bce6599988450ac920bb180a67f"):
         "SCRIPT_BASENAME",
+}
+
+# Non-definition bindings whose reviewed contract changed after the immutable baseline.
+# Pin the original statement digest and require the named replacement binding to remain
+# unique, matching the version-binding treatment without misclassifying it as metadata.
+INTENTIONALLY_CHANGED_BINDINGS = {
+    ("config", "9a8d538aa3d7fa8f8d2cf55e46f6ac5b31ff4bc6b5823d7bf242954e9055c6df"):
+        "SAVE_OPTION_TOKENS",
 }
 
 # Functions that need to call back into a higher architectural layer carry this marker
@@ -204,8 +216,8 @@ REVIEWED_LOCAL_IMPORT_SEAMS = {
         "857b70aaccd5a89c0104cd8a7bb39fea7e92d30adc84025789fc7f03cfc81eb4",
     ),
     ("geometry", "_materialize_prediction_volume_from_renderer"): (
-        "9f25cfa6cfa5031abf332f6001711bd58a9dfd344a831a40cfe90cb7c6069d49",
-        "c307c54502fdd0c1e867c6f0b72e74e7664fa6d875764b18cb182b65fe04ebd1",
+        "f0200aabbc1545106e922801809d78c8a64b33135149f95303343f68551cfad5",
+        "4a8cb9169fcfbc4bf1fa1658615d8f3ae1377e8ac32cc1aeaa65707f37e22cd3",
     ),
     ("inference", "infer_yolo_model_input_channels"): (
         "7e8d329f12766affd78ee938e593bb989e8535d157c375b143f4fbbeee1bec6c",
@@ -498,6 +510,14 @@ def main() -> None:
         (str(item["module"]), str(item["sha256"]))
         for item in manifest["statements"]
     }
+    untracked_changed_bindings = sorted(
+        set(INTENTIONALLY_CHANGED_BINDINGS) - inventory_keys
+    )
+    if untracked_changed_bindings:
+        raise RuntimeError(
+            "reviewed changed-binding entries are absent from the immutable inventory: "
+            f"{untracked_changed_bindings!r}"
+        )
     untracked_pruning = sorted(
         (set(INTENTIONALLY_REMOVED) | set(INTENTIONALLY_PRUNED_REPLACEMENTS))
         - inventory_keys
@@ -582,6 +602,25 @@ def main() -> None:
     if missing_versions:
         raise RuntimeError(f"missing or duplicate version declarations: {missing_versions!r}")
 
+    missing_changed_bindings: list[tuple[str, str]] = []
+    for (module, _baseline_hash), variable_name in INTENTIONALLY_CHANGED_BINDINGS.items():
+        matches = 0
+        for node in top_level[module]:
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            matches += sum(
+                isinstance(target, ast.Name) and target.id == variable_name
+                for target in targets
+            )
+        if matches != 1:
+            missing_changed_bindings.append((module, variable_name))
+    if missing_changed_bindings:
+        raise RuntimeError(
+            "missing or duplicate reviewed changed bindings: "
+            f"{missing_changed_bindings!r}"
+        )
+
     missing: list[dict[str, object]] = []
     preserved = 0
     changed = 0
@@ -602,6 +641,7 @@ def main() -> None:
         if (
             (module, name) in effective_changed
             or (module, statement_hash) in INTENTIONALLY_VERSIONED
+            or inventory_key in INTENTIONALLY_CHANGED_BINDINGS
         ):
             changed += 1
             continue

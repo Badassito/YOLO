@@ -1,6 +1,7 @@
 include ARCHITECTURE.md
-include GPT-5.6-Sol-Ultra_v17.1.5_SLURM.py
+include GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py
 include setup.py
-include tools/intel_accelerator_selftest.py
+include XTA/_package_inventory.json
+recursive-include tools *.py
 recursive-include native *.c *.h *.md
 recursive-include tests/native_qatzip_fake *.c *.h

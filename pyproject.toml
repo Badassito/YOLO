@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "volume-tta"
-version = "17.1.5"
-description = "YOLO segmentation test-time augmentation for large volumes"
+version = "18.0.0"
+description = "YOLO segmentation pretraining and test-time augmentation for large volumes"
 requires-python = ">=3.10"
 dependencies = [
   "numpy",
@@ -20,15 +20,16 @@ dependencies = [
 openvino = ["openvino"]
 cuda12 = ["cupy-cuda12x>=13.0", "nvidia-ml-py"]
 acceleration = ["numba", "deflate", "isal"]
+pta = ["pynrrd", "albumentations"]
 
 [project.scripts]
-volume-tta = "volume_tta.__main__:run"
+volume-tta = "XTA.cli:run"
 
 [tool.setuptools.packages.find]
-include = ["volume_tta*"]
+include = ["XTA*"]
 
 [tool.setuptools.data-files]
 "share/volume-tta" = [
   "ARCHITECTURE.md",
-  "GPT-5.6-Sol-Ultra_v17.1.5_SLURM.py",
+  "GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py",
 ]

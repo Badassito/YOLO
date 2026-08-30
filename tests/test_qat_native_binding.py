@@ -86,7 +86,7 @@ class QatNativeBindingFakeProviderTests(unittest.TestCase):
         )
         build_root = Path(cls.build_directory.name)
         extension = Extension(
-            'volume_tta._qat_codec',
+            'XTA._qat_codec',
             sources=[
                 str(ROOT / 'native' / 'qat_codec.c'),
                 str(ROOT / 'tests' / 'native_qatzip_fake' / 'fake_qatzip.c'),
@@ -106,7 +106,7 @@ class QatNativeBindingFakeProviderTests(unittest.TestCase):
         command.force = True
         command.run()
         cls.extension_path = Path(
-            command.get_ext_fullpath('volume_tta._qat_codec')
+            command.get_ext_fullpath('XTA._qat_codec')
         ).resolve()
         if not cls.extension_path.is_file():
             raise AssertionError(
@@ -126,7 +126,7 @@ class QatNativeBindingFakeProviderTests(unittest.TestCase):
 
             extension_path = pathlib.Path({str(self.extension_path)!r})
             spec = importlib.util.spec_from_file_location(
-                'volume_tta._qat_codec', extension_path,
+                'XTA._qat_codec', extension_path,
             )
             assert spec is not None and spec.loader is not None
             qat = importlib.util.module_from_spec(spec)

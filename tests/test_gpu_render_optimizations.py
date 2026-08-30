@@ -13,8 +13,8 @@ from tools.smoke_import import install_stubs
 
 install_stubs()
 
-from volume_tta import backprojection, cuda_backend, cuda_d1, inference
-from volume_tta.geometry import AffineSpec, AugJob
+from XTA import backprojection, cuda_backend, cuda_d1, inference
+from XTA.geometry import AffineSpec, AugJob
 
 
 def make_job(name: str, angle_deg: float, matrix: np.ndarray) -> AugJob:

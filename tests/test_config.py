@@ -4,7 +4,7 @@ import contextlib
 import io
 import unittest
 
-from volume_tta.config import (
+from XTA.config import (
     SAVE_OPTION_TOKENS,
     build_argparser,
     resolve_backend_batches,
@@ -31,18 +31,18 @@ class ConfigTests(unittest.TestCase):
         self.assertIn('/dev/shm', help_text)
         self.assertNotIn('YOLO_TTA_SCRATCH', help_text)
 
-    def test_unknown_processor_and_crop_options_are_rejected(self) -> None:
+    def test_unavailable_processor_and_crop_options_are_rejected(self) -> None:
         parser = build_argparser()
         option_strings = {
             option for action in parser._actions for option in action.option_strings
         }
-        unknown_options = [
+        unavailable_options = [
             "--" + "_".join(("retina", "mask", "processor")),
             "--" + "_".join(("save", "nrrd", "tight", "crop")),
         ]
         help_text = parser.format_help()
         required = ["--input", "input.mkv", "--model", "gpu:model.engine"]
-        for underscored in unknown_options:
+        for underscored in unavailable_options:
             for option in (underscored, underscored.replace("_", "-")):
                 with self.subTest(option=option):
                     self.assertNotIn(option, option_strings)

@@ -13,7 +13,7 @@ def main() -> None:
     install_stubs()
     os.environ["YOLO_TTA_TELEMETRY"] = "0"
     os.environ.pop("YOLO_TTA_CAPTURE_STDIO_PATH", None)
-    missing = ROOT / "__volume_tta_missing_input__.mkv"
+    missing = ROOT / "__XTA_missing_input__.mkv"
     if missing.exists():
         raise RuntimeError(f"reserved smoke-test path unexpectedly exists: {missing}")
     sys.argv = [
@@ -25,7 +25,7 @@ def main() -> None:
         "--device",
         "0",
     ]
-    from volume_tta.pipeline import main as pipeline_main
+    from XTA.pipeline import main as pipeline_main
 
     try:
         pipeline_main()

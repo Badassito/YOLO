@@ -63,6 +63,8 @@ from .geometry import (
     InMemoryYoloVolumeSource,
     StreamingYoloVolumeSource,
     ViewInfo,
+    build_dense_tile_raster_plan,
+    build_fullframe_raster_plan,
     is_radial_view,
     is_tilted_radial_view,
     is_tilted_view,
@@ -75,6 +77,8 @@ from .geometry import (
     radial_streaming_gpu_render_supported,
     view_processing_volume_shape,
 )
+from .unification.contracts import RasterPlan
+from .unification.sampling import raster_plan_from_spawn_spec
 from .inference import (
     CpuRetinaMaskPayload,
     ModelInputChannelMismatchError,
@@ -115,6 +119,63 @@ from .backprojection import (
 # applying their target-specific CPU placement; no parent-process state is inherited.
 _GPU_WORKER_NUMA_PIN: Optional[set] = None
 _GPU_WORKER_NUMA_FULL: Optional[set] = None
+
+def _canonical_image_sink_for_task(
+    task: Dict[str, object], *, backend: str,
+) -> Optional[object]:
+    """Resolve a process-local image sink from spawn-safe task metadata."""
+    spec = task.get('canonical_image_spec')
+    if not isinstance(spec, dict):
+        return None
+    # Function-local import avoids broadening the worker's startup dependency surface.
+    from .outputs import canonical_render_image_sink_from_spec
+    return canonical_render_image_sink_from_spec(spec, backend=str(backend))
+
+
+def _canonical_raster_plan_for_task(
+    task: Dict[str, object],
+) -> Optional[RasterPlan]:
+    """Rebuild and verify one worker source's canonical RasterPlan.
+
+    The task carries primitive-only metadata across ``spawn``.  Rebuilding it
+    here avoids relying on dataclass pickle internals and also proves that the
+    plan describes the actual view/job/channel tuple received by this worker.
+    """
+
+    spec = task.get('raster_plan_spec')
+    if spec is None:
+        if isinstance(task.get('canonical_image_spec'), dict):
+            raise RuntimeError(
+                'canonical worker image publication requires raster_plan_spec provenance'
+            )
+        return None
+    if not isinstance(spec, dict):
+        raise TypeError('worker raster_plan_spec must be a dictionary')
+    plan = raster_plan_from_spawn_spec(spec)
+
+    view = task.get('view')
+    job = task.get('job')
+    kind = str(task.get('kind', ''))
+    if not isinstance(view, ViewInfo):
+        raise TypeError('worker raster-plan reconstruction requires a ViewInfo task view')
+    channel_format = resolve_channel_format(
+        task.get('channel_format', DEFAULT_CHANNEL_FORMAT)  # type: ignore[arg-type]
+    )
+    if kind == 'fullframe' and isinstance(job, AugJob):
+        expected = build_fullframe_raster_plan(view, job, channel_format)
+    elif kind == 'tile' and isinstance(job, DenseTileJob):
+        expected = build_dense_tile_raster_plan(view, job, channel_format)
+    else:
+        raise TypeError(
+            f'worker raster-plan task kind/job mismatch: kind={kind!r}, job={type(job)!r}'
+        )
+    if str(plan.digest) != str(expected.digest):
+        raise RuntimeError(
+            'worker raster-plan provenance does not match its render task: '
+            f'spawned={plan.digest}, expected={expected.digest}'
+        )
+    return plan
+
 
 def _linux_cpu_feature_flags() -> set[str]:
     """Return the Linux CPU feature flags visible inside the current allocation."""
@@ -972,6 +1033,8 @@ def run_prediction_volume_in_openvino_worker(
     result_mask_full: Optional[np.memmap] = None
     result_conf_full: Optional[np.memmap] = None
     source: Optional[object] = None
+    raster_plan = _canonical_raster_plan_for_task(task)
+    render_batch_sink = _canonical_image_sink_for_task(task, backend='openvino_cpu')
     try:
         result_mode = str(task.get('result_mode', 'file'))
         if result_mode == 'direct_union':
@@ -1027,6 +1090,8 @@ def run_prediction_volume_in_openvino_worker(
             channel_format=channel_format,
             view=view,
             slice_offset=int(slice_offset),
+            render_batch_sink=render_batch_sink,
+            raster_plan=raster_plan,
         )
         task_affine = np.asarray(
             task.get('M_out_to_processing')
@@ -1262,6 +1327,8 @@ def run_prediction_volume_in_worker(
     radial_padding_conf_path: Optional[Path] = None
     source: Optional[object] = None
     deferred_result: Optional[_DeferredGpuWorkerTaskResult] = None
+    raster_plan = _canonical_raster_plan_for_task(task)
+    render_batch_sink = _canonical_image_sink_for_task(task, backend='cuda_cpu_source')
 
     radial_padding_count = radial_batch_padding_count(
         view,
@@ -1346,6 +1413,8 @@ def run_prediction_volume_in_worker(
                 channel_format=channel_format,
                 view=view,
                 slice_offset=int(slice_offset),
+                render_batch_sink=render_batch_sink,
+                raster_plan=raster_plan,
             )
         except BaseException:
             close_memmap_array(mm)
@@ -1450,6 +1519,7 @@ def run_prediction_volume_in_worker(
                         fp16=quantize_uses_fp16(cfg.quantize),
                         name=f"gpu-render-tile-{view.name}-{task['job_id']}",
                         channel_format=channel_format,
+                        render_batch_sink=render_batch_sink,
                     )
                 elif render_mode == 'resident' and resident_view_supported:
                     source = GpuRenderedYoloSource(
@@ -1463,6 +1533,7 @@ def run_prediction_volume_in_worker(
                         fp16=quantize_uses_fp16(cfg.quantize),
                         name=f"gpu-render-fullframe-{view.name}-{task['job_id']}",
                         channel_format=channel_format,
+                        render_batch_sink=render_batch_sink,
                     )
                 elif (
                     kind == 'fullframe'
@@ -1494,6 +1565,8 @@ def run_prediction_volume_in_worker(
                         channel_format=channel_format,
                         view=view,
                         slice_offset=int(slice_offset),
+                        render_batch_sink=render_batch_sink,
+                        raster_plan=raster_plan,
                     )
             except _ResidentTensorRTRingFatalError:
                 raise

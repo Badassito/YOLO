@@ -3,7 +3,7 @@
 #include <Python.h>
 
 #if !defined(__linux__)
-#error "volume_tta._qpl_codec supports the Intel QPL hardware path on Linux only"
+#error "XTA._qpl_codec supports the Intel QPL hardware path on Linux only"
 #endif
 
 #include <qpl/qpl.h>
@@ -23,11 +23,11 @@
 #error "Intel QPL development headers must expose QPL_VERSION_MAJOR/MINOR"
 #endif
 #if QPL_VERSION_MAJOR < 1 || (QPL_VERSION_MAJOR == 1 && QPL_VERSION_MINOR < 9)
-#error "volume_tta._qpl_codec requires Intel QPL 1.9 or newer"
+#error "XTA._qpl_codec requires Intel QPL 1.9 or newer"
 #endif
 
 /*
- * Optional Intel QPL companion for volume_tta.intel_compression.
+ * Optional Intel QPL companion for XTA.intel_compression.
  *
  * Deliberate safety properties:
  *   - qpl_path_hardware is the only execution path used;

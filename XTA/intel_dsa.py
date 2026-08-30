@@ -1,6 +1,6 @@
 """Lazy, hardware-only Intel DSA workspace-copy control plane.
 
-Linux x86-64 builds may include the project-owned ``volume_tta._dsa_copy``
+Linux x86-64 builds may include the project-owned ``XTA._dsa_copy``
 extension from ``native/dsa_copy.c`` without adding a userspace DSA library.
 Other builds remain usable without it. The extension submits MEMMOVE descriptors through the kernel
 ``idxd`` user-work-queue character device; this module deliberately rejects
@@ -69,7 +69,7 @@ class IntelDsaCopyError(IntelDsaError):
 
 
 class NativeDsaModule(Protocol):
-    """Interface required from ``volume_tta._dsa_copy``."""
+    """Interface required from ``XTA._dsa_copy``."""
 
     def capabilities(self, *, work_queue: Optional[str] = None) -> Mapping[str, object]: ...
 
@@ -98,7 +98,7 @@ class CopyEligibility:
     nbytes: int
 
 
-_NATIVE_MODULE_NAME = 'volume_tta._dsa_copy'
+_NATIVE_MODULE_NAME = 'XTA._dsa_copy'
 _STATE_LOCK = threading.RLock()
 _LOADED_MODULE: Optional[NativeDsaModule] = None
 _TEST_MODULE: Optional[NativeDsaModule] = None
