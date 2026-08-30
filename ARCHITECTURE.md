@@ -1,6 +1,6 @@
 # Volume TTA architecture
 
-`GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py` is the sole versioned launcher. It, the
+`GPT-5.6-Sol-Ultra_v18.0.1_SLURM.py` is the sole versioned launcher. It, the
 installed `volume-tta` console script, and `python -m XTA` all dispatch
 through `XTA.cli.run()`.
 The implementation lives in the importable `XTA` package so spawned processes

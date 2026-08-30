@@ -47,6 +47,7 @@ class PtaModeBoundaryTests(unittest.TestCase):
             "--overlay_pending_frames", "8", "--worker_backend", "thread",
             "--pipeline_depth", "1", "--jpeg_decode_backend", "opencv",
             "--jpeg_batch_size", "17", "--jpeg_encode_backend", "opencv",
+            "--tiff_encode_backend", "nvtiff",
             "--jpeg_quality", "88", "--no-topology_aware",
         ]
         runtime = types.SimpleNamespace(run=mock.Mock())
@@ -70,6 +71,7 @@ class PtaModeBoundaryTests(unittest.TestCase):
             "worker_backend": "thread", "pipeline_depth": 1,
             "jpeg_decode_backend": "opencv", "jpeg_batch_size": 17,
             "jpeg_encode_backend": "opencv", "jpeg_quality": 88,
+            "tiff_encode_backend": "nvtiff",
             "topology_aware": False,
         }
         for name, expected in expected_direct.items():

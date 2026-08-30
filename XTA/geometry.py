@@ -949,7 +949,9 @@ class RadialSampler:
     nn_x: np.ndarray
     nn_y: np.ndarray
 
-_RADIAL_SAMPLER_CACHE: Dict[Tuple[object, ...], RadialSampler] = {}
+_RADIAL_SAMPLER_CACHE: 'OrderedDict[Tuple[object, ...], RadialSampler]' = OrderedDict()
+
+_RADIAL_SAMPLER_CACHE_LOCK = threading.Lock()
 
 RADIAL_FILTER_MODE = 'hardware_linear'
 
@@ -983,9 +985,11 @@ def get_radial_sampler(view: ViewInfo, angle_deg: float) -> RadialSampler:
         round(float(view.center_y), 6), round(float(view.roi_radius), 6),
         round(float(angle_deg), 6),
     )
-    cached = _RADIAL_SAMPLER_CACHE.get(key)
-    if cached is not None:
-        return cached
+    with _RADIAL_SAMPLER_CACHE_LOCK:
+        cached = _RADIAL_SAMPLER_CACHE.get(key)
+        if cached is not None:
+            _RADIAL_SAMPLER_CACHE.move_to_end(key)
+            return cached
 
     diameter = int(n_u)
     coords = np.linspace(-float(view.roi_radius), float(view.roi_radius), diameter, dtype=np.float32)
@@ -1022,8 +1026,21 @@ def get_radial_sampler(view: ViewInfo, angle_deg: float) -> RadialSampler:
         nn_x=np.clip(np.rint(xs).astype(np.int32, copy=False), 0, int(plane_w) - 1),
         nn_y=np.clip(np.rint(ys).astype(np.int32, copy=False), 0, int(plane_h) - 1),
     )
-    _RADIAL_SAMPLER_CACHE[key] = sampler
-    return sampler
+    with _RADIAL_SAMPLER_CACHE_LOCK:
+        cached = _RADIAL_SAMPLER_CACHE.get(key)
+        if cached is not None:
+            _RADIAL_SAMPLER_CACHE.move_to_end(key)
+            return cached
+        _RADIAL_SAMPLER_CACHE[key] = sampler
+        _RADIAL_SAMPLER_CACHE.move_to_end(key)
+        # A coverage-default sweep visits thousands of azimuths. Retaining
+        # every sampler indefinitely costs roughly 100 KiB per angle at a
+        # 3K raster and provides little reuse after neighboring image/mask
+        # renders finish. Keep a bounded working set instead.
+        cache_limit = max(16, _env_int('YOLO_TTA_RADIAL_SAMPLER_CACHE', 512))
+        while len(_RADIAL_SAMPLER_CACHE) > cache_limit:
+            _RADIAL_SAMPLER_CACHE.popitem(last=False)
+        return sampler
 
 def choose_radial_exact_block_frames(diameter: int, target_bytes: int = 256 * 1024 * 1024) -> int:
     env = os.environ.get('YOLO_TTA_RADIAL_EXACT_BLOCK_FRAMES', '').strip()
@@ -1068,6 +1085,37 @@ def radial_oriented_stack_view(volume_rgb: np.ndarray, view: ViewInfo) -> np.nda
         return np.transpose(arr, (2, 0, 1))
     raise ValueError(f'Unsupported Radial base: {base}')
 
+
+def _radial_selected_samples_from_strided_block(
+    block: np.ndarray,
+    sampler: RadialSampler,
+) -> np.ndarray:
+    """Gather only active radial taps from a noncontiguous logical stack.
+
+    Sagittal and coronal radial stacks are transposed views of ``(T,Y,X)``.
+    Materializing ``block`` would copy every voxel in the selected stack
+    range for every azimuth. This gather has the same tap order as
+    ``_radial_sampler_flat_taps`` but allocates only ``rows * diameter * 4``
+    source samples for the hardware-linear filter.
+    """
+
+    rows = int(block.shape[0])
+    u_len = int(sampler.diameter)
+    y_taps = int(sampler.y_idx.shape[1])
+    x_taps = int(sampler.x_idx.shape[1])
+    selected = np.empty(
+        (rows, u_len, y_taps * x_taps),
+        dtype=block.dtype,
+    )
+    tap_index = 0
+    for y_tap in range(y_taps):
+        y_idx = np.asarray(sampler.y_idx[:, y_tap], dtype=np.intp)
+        for x_tap in range(x_taps):
+            x_idx = np.asarray(sampler.x_idx[:, x_tap], dtype=np.intp)
+            selected[:, :, tap_index] = block[:, y_idx, x_idx]
+            tap_index += 1
+    return selected
+
 def extract_radial_slice_frame(
     volume_rgb: np.ndarray,
     sampler: RadialSampler,
@@ -1087,14 +1135,19 @@ def extract_radial_slice_frame(
     proj = np.empty((stack_dim, u_len), dtype=np.float32) if fold_stack else None
     out = None if fold_stack else np.empty((stack_dim, u_len), dtype=np.uint8)
 
+    contiguous_stack = bool(volume_rgb.flags['C_CONTIGUOUS'])
     for start_idx in range(0, stack_dim, block_frames):
         stop_idx = min(stack_dim, start_idx + block_frames)
-        # Sagittal/Coronal orientation views are strided. Materialize only this bounded
-        # stack block contiguously so the active-filter gather remains vectorized.
-        block2d = np.ascontiguousarray(volume_rgb[start_idx:stop_idx]).reshape(
-            stop_idx - start_idx, plane_len,
-        )
-        samples = block2d[:, flat_idx].astype(np.float32, copy=False)
+        block = volume_rgb[start_idx:stop_idx]
+        if contiguous_stack:
+            block2d = np.asarray(block).reshape(stop_idx - start_idx, plane_len)
+            selected = block2d[:, flat_idx]
+        else:
+            # A sagittal/coronal logical stack is a transposed view. Copying
+            # the full block here makes each azimuth scan the entire volume;
+            # gather only the four active samples per output pixel instead.
+            selected = _radial_selected_samples_from_strided_block(block, sampler)
+        samples = selected.astype(np.float32, copy=False)
         acc = np.einsum('tuk,uk->tu', samples, w2d)
         if fold_stack:
             proj[start_idx:stop_idx, :] = acc

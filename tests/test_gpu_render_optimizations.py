@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from collections import OrderedDict
 import inspect
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -13,7 +15,7 @@ from tools.smoke_import import install_stubs
 
 install_stubs()
 
-from XTA import backprojection, cuda_backend, cuda_d1, inference
+from XTA import backprojection, cuda_backend, cuda_d1, geometry, inference
 from XTA.geometry import AffineSpec, AugJob
 
 
@@ -234,6 +236,332 @@ class FusedRendererOptimizationTests(unittest.TestCase):
         )
         self.assertIn('render_block = (32, 8)', launch_source)
         self.assertIn('render_grid, render_block', launch_source)
+        self.assertIn('int quantize_native_taps', kernel_source)
+        self.assertIn('if (quantize_native_taps)', kernel_source)
+        tta_tilted_launch = inspect.getsource(
+            cuda_backend._GpuWorkerRenderEngine._try_fused_tilted_into_slot,
+        )
+        pta_tilted_launch = inspect.getsource(
+            cuda_backend._GpuWorkerRenderEngine._render_tilted_direct_grid,
+        )
+        self.assertIn('np.int32(0)', tta_tilted_launch)
+        self.assertIn('np.int32(1)', pta_tilted_launch)
+
+    def test_pta_array_volume_upload_is_resident_and_reused(self) -> None:
+        copies: list[tuple[int, int]] = []
+
+        class ResidentSlice:
+            def __init__(self, span: tuple[int, int]):
+                self.span = span
+
+            def copy_(self, _source: object, *, non_blocking: bool):
+                self.non_blocking = non_blocking
+                copies.append(self.span)
+
+        class Resident:
+            dtype = object()
+
+            def __init__(self, shape: tuple[int, ...]):
+                self.shape = shape
+
+            def __getitem__(self, key: slice):
+                return ResidentSlice((int(key.start), int(key.stop)))
+
+            def view(self, *_shape: int):
+                return object()
+
+        stream = SimpleNamespace(synchronize=mock.Mock())
+        resident_allocations: list[tuple[int, ...]] = []
+        uint8 = object()
+
+        def empty(shape: tuple[int, ...], **_kwargs: object) -> Resident:
+            resident_allocations.append(tuple(int(value) for value in shape))
+            resident = Resident(resident_allocations[-1])
+            resident.dtype = uint8
+            return resident
+
+        engine = object.__new__(cuda_backend._GpuWorkerRenderEngine)
+        engine.torch = SimpleNamespace(
+            uint8=uint8,
+            empty=empty,
+            from_numpy=lambda value: value,
+            cuda=SimpleNamespace(mem_get_info=lambda _device: (8 << 30, 12 << 30)),
+        )
+        engine.device = "cuda:0"
+        engine._stream = stream
+        engine._volume_key = None
+        engine._volume_mm = None
+        engine._volume_gpu = None
+        engine._volume_flat = None
+        engine._logical_t = 0
+        engine._mode = "unresolved"
+        engine._resident_runtime_disabled = False
+        for name in (
+            "_native_t_map_cache", "_native_plane_cache", "_native_u8_plane_cache", "_fold_cache",
+            "_tilted_plans", "_fused_radial_taps",
+        ):
+            setattr(engine, name, {})
+        for name in (
+            "_fused_disabled_families", "_fused_graph_rejected_keys",
+            "_fused_validated_keys", "_fused_preflight_validated_families",
+        ):
+            setattr(engine, name, set())
+        engine._fused_volume_ref = None
+        engine._radial_texture_ref = None
+        engine._fused_preflight_volume_key = None
+        engine._native_t_indices = mock.Mock(return_value=(object(), object(), object()))
+        volume = np.arange(4 * 5 * 6, dtype=np.uint8).reshape(4, 5, 6)
+
+        with (
+            mock.patch.object(cuda_backend, "gpu_worker_render_resident_enabled", return_value=True),
+            mock.patch.object(cuda_backend, "gpu_render_reserve_bytes", return_value=0),
+            mock.patch("builtins.print"),
+        ):
+            first = engine.ensure_volume_array(volume, identity="shm:test")
+            second = engine.ensure_volume_array(volume, identity="shm:test")
+
+        self.assertEqual(first, "resident")
+        self.assertEqual(second, "resident")
+        self.assertEqual(resident_allocations, [(4, 5, 6)])
+        self.assertEqual(copies, [(0, 4)])
+        self.assertIsNone(engine._volume_mm)
+
+    def test_cartesian_resident_renderer_extracts_native_u8_without_float_roundtrip(self) -> None:
+        uint8_token = object()
+        selections: list[object] = []
+
+        class Plane:
+            dtype = uint8_token
+
+            def contiguous(self):
+                return self
+
+        class Volume:
+            dtype = uint8_token
+            shape = (4, 5, 6)
+
+            def __getitem__(self, key: object):
+                selections.append(key)
+                return Plane()
+
+        engine = object.__new__(cuda_backend._GpuWorkerRenderEngine)
+        engine.torch = SimpleNamespace(uint8=uint8_token)
+        engine._volume_gpu = Volume()
+        engine._logical_t = 4
+        engine._native_u8_plane_cache = OrderedDict()
+        engine._native_plane_cache_entries = lambda: 8
+        engine._render_native_plane = mock.Mock(
+            side_effect=AssertionError("identity processing cube used float reconstruction")
+        )
+        expected = object()
+        engine.warp_native_uint8_frame = mock.Mock(return_value=expected)
+        view = SimpleNamespace(name="sagittal", num_slices=5)
+
+        with (
+            mock.patch.object(cuda_backend, "is_radial_view", return_value=False),
+            mock.patch.object(cuda_backend, "is_tilted_view", return_value=False),
+            mock.patch.object(cuda_backend, "physical_view_name", return_value="sagittal"),
+        ):
+            actual = engine.render_cartesian_grid_resident(
+                view,
+                self.identity,
+                frame_index=2,
+                out_h=8,
+                out_w=8,
+            )
+
+        self.assertIs(actual, expected)
+        self.assertEqual(len(selections), 1)
+        self.assertEqual(selections[0][1], 2)
+        engine.warp_native_uint8_frame.assert_called_once()
+
+    @unittest.skipUnless(
+        os.environ.get("XTA_RUN_CUDA_RENDER_INTEGRATION", "0") == "1",
+        "set XTA_RUN_CUDA_RENDER_INTEGRATION=1 on a CUDA host",
+    )
+    def test_cartesian_cuda_identity_and_affine_match_registered_policy(self) -> None:
+        try:
+            import torch  # type: ignore
+        except Exception as exc:  # pragma: no cover - opt-in hardware gate
+            self.skipTest(f"PyTorch unavailable: {exc}")
+        if not bool(torch.cuda.is_available()):
+            self.skipTest("CUDA unavailable")
+
+        volume = np.ascontiguousarray(
+            (np.indices((11, 13, 15), dtype=np.int16).sum(axis=0) % 2) * 255,
+            dtype=np.uint8,
+        )
+        views = geometry.get_view_infos(
+            11,
+            13,
+            15,
+            cartesian_views=("transverse", "sagittal", "coronal"),
+            radial_views=(),
+            radial_azimuth_angles=(),
+        )
+        engine = cuda_backend._GpuWorkerRenderEngine("cuda:0")
+        with mock.patch.dict(
+            os.environ,
+            {"YOLO_TTA_GPU_RENDER_RESERVE_GIB": "1"},
+        ):
+            self.assertEqual(
+                engine.ensure_volume_array(
+                    volume,
+                    identity="test:cartesian-cuda-parity",
+                    require_radial_texture=False,
+                ),
+                "resident",
+            )
+
+        identity = np.asarray(
+            ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0)), dtype=np.float32,
+        )
+        for view in views:
+            frame_index = int(view.num_slices) // 2
+            with self.subTest(view=view.name, raster="identity"):
+                expected_native = np.ascontiguousarray(
+                    geometry.get_view_frame_by_index(volume, view, frame_index),
+                    dtype=np.uint8,
+                )
+                with torch.cuda.stream(engine._stream):
+                    actual_native = engine.render_cartesian_grid_resident(
+                        view,
+                        identity,
+                        frame_index,
+                        int(view.src_h),
+                        int(view.src_w),
+                    )
+                engine._stream.synchronize()
+                np.testing.assert_array_equal(
+                    actual_native.to("cpu").numpy(),
+                    expected_native,
+                )
+
+            with self.subTest(view=view.name, raster="affine"):
+                affine = geometry.build_affine(
+                    view=str(view.name),
+                    src_w=int(view.src_w),
+                    src_h=int(view.src_h),
+                    out_size=9,
+                    angle_deg=0.0,
+                    pad_mode=str(view.pad_mode),
+                )
+                expected = geometry.render_intensity_frame_on_grid(
+                    volume,
+                    view,
+                    frame_index,
+                    M_src_to_out=affine.M_src_to_out,
+                    M_out_to_src=affine.M_out_to_src,
+                    output_height=9,
+                    output_width=9,
+                )
+                with torch.cuda.stream(engine._stream):
+                    actual = engine.render_cartesian_grid_resident(
+                        view,
+                        affine.M_out_to_src,
+                        frame_index,
+                        9,
+                        9,
+                    )
+                engine._stream.synchronize()
+                delta = np.abs(
+                    actual.to("cpu").numpy().astype(np.int16)
+                    - np.asarray(expected, dtype=np.int16)
+                )
+                self.assertLessEqual(int(delta.max()), 1)
+
+    def test_pta_postquantization_affine_stays_on_cuda(self) -> None:
+        uint8 = object()
+        float32 = object()
+
+        class Tensor:
+            def __init__(self, shape: tuple[int, ...], dtype: object):
+                self.shape = shape
+                self.ndim = len(shape)
+                self.dtype = dtype
+
+            def to(self, dtype: object):
+                return Tensor(self.shape, dtype)
+
+            def reshape(self, *shape: int):
+                return Tensor(tuple(shape), self.dtype)
+
+            def round_(self):
+                return self
+
+            def clamp_(self, *_args: float):
+                return self
+
+            def contiguous(self):
+                return self
+
+        grid_sample = mock.Mock(return_value=Tensor((1, 1, 4, 4), float32))
+        engine = object.__new__(cuda_backend._GpuWorkerRenderEngine)
+        engine.torch = SimpleNamespace(uint8=uint8, float32=float32)
+        engine.F = SimpleNamespace(grid_sample=grid_sample)
+        engine.device = "cuda:0"
+        source = Tensor((8, 8), uint8)
+
+        with (
+            mock.patch.object(cuda_backend, "_affine_theta_from_dst_to_src", return_value=object()),
+            mock.patch.object(cuda_backend, "_get_cached_affine_grid", return_value=object()),
+        ):
+            actual = engine.warp_native_uint8_frame(
+                source,
+                np.asarray(((0.5, 0.0, 0.0), (0.0, 0.5, 0.0)), dtype=np.float32),
+                4,
+                4,
+            )
+
+        self.assertEqual(actual.shape, (4, 4))
+        self.assertIs(actual.dtype, uint8)
+        self.assertEqual(grid_sample.call_count, 1)
+        self.assertFalse(grid_sample.call_args.kwargs["align_corners"])
+
+    def test_pta_tilted_grid_prefers_standalone_fused_kernel(self) -> None:
+        expected = object()
+        engine = object.__new__(cuda_backend._GpuWorkerRenderEngine)
+        engine._fused_disabled_families = set()
+        engine._render_tilted_direct_grid = mock.Mock(return_value=expected)
+        engine._render_tilted_frame = mock.Mock(
+            side_effect=AssertionError("fused Tilted path unexpectedly fell back")
+        )
+        view = SimpleNamespace(name="tilted_transverse")
+
+        with mock.patch.object(
+            cuda_backend, "fused_tilted_render_enabled", return_value=True,
+        ):
+            actual = engine.render_tilted_grid_resident(
+                view, self.identity, frame_index=3, out_h=8, out_w=8,
+            )
+
+        self.assertIs(actual, expected)
+        engine._render_tilted_direct_grid.assert_called_once_with(
+            view, self.identity, 3, 8, 8,
+        )
+
+    def test_tilted_nearest_fallback_keeps_final_grid_sampling(self) -> None:
+        expected = object()
+        engine = object.__new__(cuda_backend._GpuWorkerRenderEngine)
+        engine._fused_disabled_families = {"tilted"}
+        engine._render_tilted_frame = mock.Mock(return_value=expected)
+        engine.warp_native_uint8_frame = mock.Mock(
+            side_effect=AssertionError("nearest Tilted fallback used a bilinear warp")
+        )
+        view = SimpleNamespace(name="tilted_coronal")
+
+        with (
+            mock.patch.object(cuda_backend, "fused_tilted_render_enabled", return_value=True),
+            mock.patch.object(cuda_backend, "tilted_inplane_linear_enabled", return_value=False),
+        ):
+            actual = engine.render_tilted_grid_resident(
+                view, self.identity, frame_index=4, out_h=8, out_w=8,
+            )
+
+        self.assertIs(actual, expected)
+        engine._render_tilted_frame.assert_called_once_with(
+            view, self.identity, 8, 8, 4,
+        )
 
 
 class ProtoUnionOptimizationTests(unittest.TestCase):

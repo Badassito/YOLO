@@ -854,7 +854,7 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
             )
             voxel = json.loads(voxel_path.read_text())
 
-        self.assertEqual(manifest["pipeline_version"], "18.0.0")
+        self.assertEqual(manifest["pipeline_version"], "18.0.1")
         self.assertEqual(manifest["mode"], "pta")
         self.assertEqual(manifest["resolved_configuration"]["in_plane_variants_deg"], [0.0])
         self.assertEqual(

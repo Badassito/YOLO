@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import dataclasses
+from contextlib import nullcontext
 import multiprocessing
 import importlib.util
+import os
 import pickle
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -36,6 +40,29 @@ from XTA import pta_scheduler
 
 
 class PtaSpawnSchedulerTests(unittest.TestCase):
+    def test_ready_gpu_work_flushes_at_one_full_batch(self) -> None:
+        self.assertFalse(
+            pta_scheduler.should_flush_ready_gpu_work(
+                ready_candidates=63,
+                effective_candidate_limit=64,
+                producer_drained=False,
+            )
+        )
+        self.assertTrue(
+            pta_scheduler.should_flush_ready_gpu_work(
+                ready_candidates=64,
+                effective_candidate_limit=64,
+                producer_drained=False,
+            )
+        )
+        self.assertTrue(
+            pta_scheduler.should_flush_ready_gpu_work(
+                ready_candidates=1,
+                effective_candidate_limit=64,
+                producer_drained=True,
+            )
+        )
+
     def _install_static(
         self,
         out_dir: Path,
@@ -290,7 +317,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                 requested_frame_workers=0,
                 gpu_count=1,
             ),
-            (1, 8),
+            (1, 16),
         )
         self.assertEqual(
             pta_scheduler.resolve_gpu_worker_layout(
@@ -303,10 +330,18 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
         self.assertEqual(
             pta_scheduler.resolve_gpu_worker_layout(
                 worker_budget=64,
+                requested_frame_workers=32,
+                gpu_count=1,
+            ),
+            (1, 32),
+        )
+        self.assertEqual(
+            pta_scheduler.resolve_gpu_worker_layout(
+                worker_budget=64,
                 requested_frame_workers=0,
                 gpu_count=4,
             ),
-            (4, 8),
+            (4, 16),
         )
 
     def test_multi_source_batches_preserve_candidate_order(self) -> None:
@@ -336,6 +371,571 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
         ]
         self.assertEqual([sum(len(work.candidates) for work in batch) for batch in batches], [3, 4])
         self.assertEqual(flattened, list(range(7)))
+
+    def test_projection_phase_summary_reports_family_boundaries(self) -> None:
+        views = {
+            "cart": types.SimpleNamespace(kind="cart"),
+            "radial": types.SimpleNamespace(kind="radial"),
+            "tilted": types.SimpleNamespace(kind="tilted"),
+            "tilted_radial": types.SimpleNamespace(kind="tilted_radial"),
+        }
+        plans = tuple(
+            types.SimpleNamespace(
+                tag=tag,
+                view=types.SimpleNamespace(shared_view=view),
+            )
+            for tag, view in views.items()
+        )
+        candidates = tuple(
+            dataclasses.replace(self._candidate(index), parent_view_tag=tag)
+            for index, tag in enumerate(
+                ("cart", "cart", "radial", "radial", "radial", "tilted", "tilted_radial")
+            )
+        )
+        with (
+            mock.patch.object(
+                pta.shared_geometry,
+                "is_radial_view",
+                side_effect=lambda view: view.kind in {"radial", "tilted_radial"},
+            ),
+            mock.patch.object(
+                pta.shared_geometry,
+                "is_tilted_radial_view",
+                side_effect=lambda view: view.kind == "tilted_radial",
+            ),
+            mock.patch.object(
+                pta.shared_geometry,
+                "is_tilted_view",
+                side_effect=lambda view: view.kind in {"tilted", "tilted_radial"},
+            ),
+        ):
+            summary = pta.projection_phase_summary(plans, candidates)
+
+        self.assertEqual(
+            summary,
+            (
+                ("cartesian", 2, 2),
+                ("upright-radial", 3, 5),
+                ("tilted-cartesian", 1, 6),
+                ("tilted-radial", 1, 7),
+            ),
+        )
+
+    def test_host_and_cuda_sources_are_never_mixed_in_one_policy_batch(self) -> None:
+        class DeviceImage:
+            is_cuda = True
+            shape = (8, 8)
+
+        host = pta._GpuItemWork(
+            candidates=(self._candidate(0),),
+            image=np.zeros((8, 8), dtype=np.uint8),
+            mask=np.zeros((8, 8), dtype=np.uint8),
+            output_size=(8, 8),
+            channel_kind="gray",
+            context="host",
+        )
+        device = dataclasses.replace(
+            host,
+            candidates=(self._candidate(1),),
+            image=DeviceImage(),
+            context="cuda",
+        )
+
+        batches = list(
+            pta_scheduler.iter_compatible_work_batches(
+                (host, device),
+                candidate_limit=2,
+            )
+        )
+
+        self.assertEqual(len(batches), 2)
+        self.assertEqual([batch[0].context for batch in batches], ["host", "cuda"])
+
+    def test_original_gpu_batch_is_identity_fast_path_eligible(self) -> None:
+        candidates = tuple(self._candidate(index) for index in range(2))
+        work = (
+            pta._GpuItemWork(
+                candidates=(candidates[0],),
+                image=np.zeros((8, 8), dtype=np.uint8),
+                mask=np.zeros((8, 8), dtype=np.uint8),
+                output_size=(8, 8),
+                channel_kind="gray",
+                context="first",
+            ),
+            pta._GpuItemWork(
+                candidates=(candidates[1],),
+                image=np.zeros((8, 8), dtype=np.uint8),
+                mask=np.zeros((8, 8), dtype=np.uint8),
+                output_size=(8, 8),
+                channel_kind="gray",
+                context="second",
+            ),
+        )
+
+        self.assertTrue(pta._gpu_identity_fast_path_eligible(work, ((None,), (None,))))
+        self.assertFalse(pta._gpu_identity_fast_path_eligible(work, ((None,), (123,))))
+        resized = (work[0], dataclasses.replace(work[1], output_size=(4, 4)))
+        self.assertFalse(pta._gpu_identity_fast_path_eligible(resized, ((None,), (None,))))
+
+        malformed_gray = (
+            dataclasses.replace(work[0], image=np.zeros((8, 8, 1), dtype=np.uint8)),
+        )
+        self.assertFalse(pta._gpu_identity_fast_path_eligible(malformed_gray, ((None,),)))
+        valid_rgb = dataclasses.replace(
+            work[0],
+            image=np.zeros((8, 8, 3), dtype=np.uint8),
+            channel_kind="rgb",
+        )
+        invalid_rgb = dataclasses.replace(
+            valid_rgb,
+            image=np.zeros((8, 8, 4), dtype=np.uint8),
+        )
+        self.assertTrue(pta._gpu_identity_fast_path_eligible((valid_rgb,), ((None,),)))
+        self.assertFalse(pta._gpu_identity_fast_path_eligible((invalid_rgb,), ((None,),)))
+        self.assertFalse(
+            pta._gpu_identity_fast_path_eligible((work[0], valid_rgb), ((None,), (None,)))
+        )
+        valid_custom = dataclasses.replace(
+            work[0],
+            image=np.zeros((8, 8, 5), dtype=np.uint8),
+            channel_kind="custom",
+            channel_count=5,
+        )
+        self.assertTrue(
+            pta._gpu_identity_fast_path_eligible((valid_custom,), ((None,),))
+        )
+        self.assertFalse(
+            pta._gpu_identity_fast_path_eligible(
+                (dataclasses.replace(valid_custom, channel_count=7),),
+                ((None,),),
+            )
+        )
+
+    def test_unlabeled_identity_batch_does_not_materialize_or_upload_masks(self) -> None:
+        dtype_token = object()
+        from_numpy_shapes: list[tuple[int, ...]] = []
+        zero_shapes: list[tuple[int, ...]] = []
+
+        class DeviceTensor:
+            def __init__(self, shape: tuple[int, ...]):
+                self.shape = shape
+
+            def contiguous(self):
+                return self
+
+            def expand(self, *shape: int):
+                self.shape = tuple(shape)
+                return self
+
+        class HostTensor:
+            def __init__(self, shape: tuple[int, ...]):
+                self.shape = shape
+
+            def pin_memory(self):
+                return self
+
+            def to(self, _device: str, *, non_blocking: bool):
+                self.non_blocking = non_blocking
+                return DeviceTensor(self.shape)
+
+        class ExplodingMask:
+            def __array__(self, *_args, **_kwargs):
+                raise AssertionError("unlabeled masks must not be materialized")
+
+        def from_numpy(array: np.ndarray) -> HostTensor:
+            from_numpy_shapes.append(tuple(int(x) for x in array.shape))
+            return HostTensor(from_numpy_shapes[-1])
+
+        def zeros(shape: tuple[int, ...], *, device: str, dtype: object) -> DeviceTensor:
+            self.assertEqual(device, "cuda:0")
+            self.assertIs(dtype, fake_torch.uint8)
+            zero_shapes.append(tuple(int(x) for x in shape))
+            return DeviceTensor(zero_shapes[-1])
+
+        fake_torch = types.SimpleNamespace(
+            uint8=dtype_token,
+            from_numpy=from_numpy,
+            zeros=zeros,
+        )
+        work = tuple(
+            pta._GpuItemWork(
+                candidates=(self._candidate(index),),
+                image=np.full((8, 8), index, dtype=np.uint8),
+                mask=ExplodingMask(),
+                output_size=(8, 8),
+                channel_kind="gray",
+                context=str(index),
+            )
+            for index in range(2)
+        )
+
+        images, masks = pta._apply_gpu_identity_batch_many(
+            {"torch": fake_torch, "device_id": 0},
+            work,
+        )
+
+        self.assertEqual(from_numpy_shapes, [(2, 1, 8, 8)])
+        self.assertEqual(zero_shapes, [(1, 1, 1)])
+        self.assertEqual(images.shape, (2, 1, 8, 8))
+        self.assertEqual(masks.shape, (2, 8, 8))
+
+    def test_cuda_projected_identity_sources_stay_on_device(self) -> None:
+        dtype = object()
+        stack_shapes: list[tuple[tuple[int, ...], ...]] = []
+
+        class DeviceTensor:
+            is_cuda = True
+
+            def __init__(self, shape: tuple[int, ...]):
+                self.shape = shape
+                self.dtype = dtype
+                self.device = "cuda:0"
+
+            def unsqueeze(self, axis: int):
+                self.assert_axis = axis
+                return DeviceTensor((1,) + self.shape)
+
+            def permute(self, *axes: int):
+                return DeviceTensor(tuple(self.shape[index] for index in axes))
+
+            def contiguous(self):
+                return self
+
+            def expand(self, *shape: int):
+                return DeviceTensor(tuple(shape))
+
+        def stack(values: list[DeviceTensor], *, dim: int) -> DeviceTensor:
+            self.assertEqual(dim, 0)
+            stack_shapes.append(tuple(value.shape for value in values))
+            return DeviceTensor((len(values),) + values[0].shape)
+
+        fake_torch = types.SimpleNamespace(
+            uint8=dtype,
+            device=lambda value: value,
+            stack=stack,
+            zeros=lambda shape, **_kwargs: DeviceTensor(tuple(shape)),
+        )
+        work = tuple(
+            pta._GpuItemWork(
+                candidates=(self._candidate(index),),
+                image=DeviceTensor((8, 8)),
+                mask=np.zeros((8, 8), dtype=np.uint8),
+                output_size=(8, 8),
+                channel_kind="gray",
+                context=str(index),
+            )
+            for index in range(2)
+        )
+
+        images, masks = pta._apply_gpu_identity_batch_many(
+            {"torch": fake_torch, "device_id": 0},
+            work,
+        )
+
+        self.assertEqual(stack_shapes, [((1, 8, 8), (1, 8, 8))])
+        self.assertEqual(images.shape, (2, 1, 8, 8))
+        self.assertEqual(masks.shape, (2, 8, 8))
+
+    def test_augmented_policy_boundary_materializes_cuda_source_once(self) -> None:
+        expected = np.arange(64, dtype=np.uint8).reshape(8, 8)
+
+        class DeviceTensor:
+            is_cuda = True
+
+            def detach(self):
+                return self
+
+            def to(self, device: str):
+                self.assert_device = device
+                return self
+
+            def numpy(self):
+                return expected
+
+        actual = pta._gpu_policy_host_image(DeviceTensor())
+        self.assertTrue(bool(actual.flags["C_CONTIGUOUS"]))
+        np.testing.assert_array_equal(actual, expected)
+
+    def test_cuda_capable_policy_receives_projected_sources_without_host_copy(self) -> None:
+        class DeviceTensor:
+            is_cuda = True
+
+            def detach(self):
+                raise AssertionError("CUDA-capable policy must not trigger D2H")
+
+        images = (DeviceTensor(), DeviceTensor())
+        work = tuple(
+            pta._GpuItemWork(
+                candidates=(self._candidate(index),),
+                image=image,
+                mask=np.zeros((8, 8), dtype=np.uint8),
+                output_size=(8, 8),
+                channel_kind="gray",
+                context=str(index),
+            )
+            for index, image in enumerate(images)
+        )
+        policy = types.SimpleNamespace(supports_cuda_sources=True)
+
+        selected, zero_copy = pta._gpu_policy_source_images(policy, work)
+
+        self.assertTrue(zero_copy)
+        self.assertEqual(selected, images)
+
+    def test_policy_stream_waits_for_async_projection_events(self) -> None:
+        waits: list[object] = []
+        records: list[object] = []
+        consumer = types.SimpleNamespace(wait_event=lambda event: waits.append(event))
+
+        class DeviceTensor:
+            is_cuda = True
+
+            def record_stream(self, stream: object):
+                records.append(stream)
+
+        first_event = object()
+        second_event = object()
+        work = tuple(
+            pta._GpuItemWork(
+                candidates=(self._candidate(index),),
+                image=DeviceTensor(),
+                mask=np.zeros((8, 8), dtype=np.uint8),
+                output_size=(8, 8),
+                channel_kind="gray",
+                context=str(index),
+                ready_event=event,
+            )
+            for index, event in enumerate((first_event, second_event))
+        )
+        runtime = {
+            "device_id": 0,
+            "torch": types.SimpleNamespace(
+                cuda=types.SimpleNamespace(current_stream=lambda **_kwargs: consumer),
+            ),
+        }
+
+        pta._wait_for_gpu_work_ready(runtime, work)
+
+        self.assertEqual(waits, [first_event, second_event])
+        self.assertEqual(records, [consumer, consumer])
+
+    def test_unlabeled_gpu_work_does_not_reslice_blank_mask(self) -> None:
+        candidate = self._candidate(0)
+        plan = types.SimpleNamespace(tile_layout=(), tag="transverse")
+        image = np.arange(64, dtype=np.uint8).reshape(8, 8)
+        with (
+            mock.patch.object(
+                pta,
+                "render_channel_formatted_images",
+                return_value=(image, None),
+            ),
+            mock.patch.object(
+                pta,
+                "render_plan_frame_mask_source",
+                side_effect=AssertionError("blank source mask must not be resliced"),
+            ),
+        ):
+            rendered = pta._render_gpu_item_group(
+                np.zeros((2, 2, 2), dtype=np.uint8),
+                np.zeros((2, 2, 2), dtype=np.uint8),
+                plan,
+                0,
+                (("full", (candidate,)),),
+            )
+
+        self.assertEqual(len(rendered), 1)
+        np.testing.assert_array_equal(rendered[0].image, image)
+        np.testing.assert_array_equal(rendered[0].mask, np.zeros((8, 8), dtype=np.uint8))
+
+    def test_gpu_projected_view_route_bypasses_cpu_intensity_renderer(self) -> None:
+        candidate = self._candidate(0)
+        plan = types.SimpleNamespace(tile_layout=(), tag="radial_sagittal")
+        projected = np.arange(64, dtype=np.uint8).reshape(8, 8)
+        with (
+            mock.patch.object(
+                pta,
+                "_gpu_projected_item_image",
+                return_value=(projected, None),
+            ) as gpu_renderer,
+            mock.patch.object(
+                pta,
+                "render_channel_formatted_images",
+                side_effect=AssertionError("CPU intensity projection must be bypassed"),
+            ),
+            mock.patch.object(
+                pta,
+                "render_plan_frame_mask_source",
+                side_effect=AssertionError("unlabeled masks must not be rendered"),
+            ),
+        ):
+            rendered = pta._render_gpu_item_group(
+                np.zeros((2, 2, 2), dtype=np.uint8),
+                np.zeros((2, 2, 2), dtype=np.uint8),
+                plan,
+                0,
+                (("full", (candidate,)),),
+                {"device_id": 0},
+            )
+
+        gpu_renderer.assert_called_once()
+        self.assertIs(rendered[0].image, projected)
+        self.assertEqual(rendered[0].output_size, (8, 8))
+        np.testing.assert_array_equal(rendered[0].mask, np.zeros((8, 8), dtype=np.uint8))
+
+    def test_tilted_cartesian_projection_uses_resident_cuda_renderer(self) -> None:
+        dtype_token = object()
+
+        class DeviceTensor:
+            is_cuda = True
+            shape = (8, 8)
+            ndim = 2
+            device = "cuda:0"
+            dtype = dtype_token
+
+            def round(self):
+                return self
+
+            def clamp_(self, *_args: float):
+                return self
+
+            def to(self, _dtype: object):
+                return self
+
+            def contiguous(self):
+                return self
+
+        renderer = types.SimpleNamespace(
+            ensure_volume_array=mock.Mock(return_value="resident"),
+            render_tilted_grid_resident=mock.Mock(return_value=DeviceTensor()),
+            _stream=types.SimpleNamespace(synchronize=mock.Mock()),
+        )
+        class Event:
+            def record(self, stream: object):
+                self.stream = stream
+        shared_view = object()
+        identity = np.asarray(
+            ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0)), dtype=np.float32,
+        )
+        plan = types.SimpleNamespace(
+            view=types.SimpleNamespace(shared_view=shared_view),
+            channel_variant=pta.ChannelVariant("gray", "gray", 1, 1, False, (0,)),
+            aff=types.SimpleNamespace(out_h=8, out_w=8, M_out_to_src=identity),
+            tile_layout=(),
+            source_encoded_indices=(),
+        )
+        runtime = {
+            "torch": types.SimpleNamespace(
+                uint8=dtype_token,
+                cuda=types.SimpleNamespace(
+                    stream=lambda _stream: nullcontext(),
+                    Event=Event,
+                ),
+            ),
+            "radial_renderer": renderer,
+            "radial_render_lock": threading.Lock(),
+            "cuda_projection_disabled_families": set(),
+            "radial_texture_required": True,
+        }
+        with (
+            mock.patch.object(pta.shared_geometry, "is_radial_view", return_value=False),
+            mock.patch.object(pta.shared_geometry, "is_tilted_view", return_value=True),
+            mock.patch.object(pta, "_require_pta_canonical_plan"),
+            mock.patch("builtins.print"),
+        ):
+            actual, ready_event = pta._gpu_projected_item_image(
+                runtime,
+                np.zeros((2, 2, 2), dtype=np.uint8),
+                plan,
+                3,
+                "full",
+            )
+
+        self.assertIsInstance(actual, DeviceTensor)
+        self.assertIs(ready_event.stream, renderer._stream)
+        renderer.render_tilted_grid_resident.assert_called_once_with(
+            shared_view, identity, 3, 8, 8,
+        )
+
+    def test_orthogonal_cartesian_projection_uses_resident_cuda_renderer(self) -> None:
+        dtype_token = object()
+
+        class DeviceTensor:
+            is_cuda = True
+            shape = (8, 8)
+            ndim = 2
+            device = "cuda:0"
+            dtype = dtype_token
+
+            def round(self):
+                return self
+
+            def clamp_(self, *_args: float):
+                return self
+
+            def to(self, _dtype: object):
+                return self
+
+            def contiguous(self):
+                return self
+
+        class Event:
+            def record(self, stream: object):
+                self.stream = stream
+
+        projected = DeviceTensor()
+        renderer = types.SimpleNamespace(
+            ensure_volume_array=mock.Mock(return_value="resident"),
+            render_cartesian_grid_resident=mock.Mock(return_value=projected),
+            _stream=types.SimpleNamespace(),
+        )
+        shared_view = object()
+        identity = np.asarray(
+            ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0)), dtype=np.float32,
+        )
+        plan = types.SimpleNamespace(
+            view=types.SimpleNamespace(shared_view=shared_view),
+            channel_variant=pta.ChannelVariant("gray", "gray", 1, 1, False, (0,)),
+            aff=types.SimpleNamespace(out_h=8, out_w=8, M_out_to_src=identity),
+            tile_layout=(),
+            source_encoded_indices=(),
+        )
+        runtime = {
+            "torch": types.SimpleNamespace(
+                uint8=dtype_token,
+                cuda=types.SimpleNamespace(
+                    stream=lambda _stream: nullcontext(),
+                    Event=Event,
+                ),
+            ),
+            "radial_renderer": renderer,
+            "radial_render_lock": threading.Lock(),
+            "cuda_projection_disabled_families": set(),
+            "radial_texture_required": True,
+        }
+        with (
+            mock.patch.object(pta.shared_geometry, "is_radial_view", return_value=False),
+            mock.patch.object(pta.shared_geometry, "is_tilted_view", return_value=False),
+            mock.patch.object(
+                pta.shared_geometry,
+                "physical_view_name",
+                return_value="sagittal",
+            ),
+            mock.patch.object(pta, "_require_pta_canonical_plan"),
+            mock.patch("builtins.print"),
+        ):
+            actual, ready_event = pta._gpu_projected_item_image(
+                runtime,
+                np.zeros((2, 2, 2), dtype=np.uint8),
+                plan,
+                3,
+                "full",
+            )
+
+        self.assertIs(actual, projected)
+        self.assertIs(ready_event.stream, renderer._stream)
+        renderer.render_cartesian_grid_resident.assert_called_once_with(
+            shared_view, identity, 3, 8, 8,
+        )
 
     def test_gpu_oom_split_preserves_order_and_sources(self) -> None:
         candidates = [self._candidate(index) for index in range(6)]
@@ -391,9 +991,13 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                 self.shape = shape
                 self.ndim = len(shape)
                 self.dtype = dtype
+                self.device = "cuda:0"
 
         candidate = self._candidate(0)
-        runtime = {"torch": types.SimpleNamespace(uint8=dtype)}
+        runtime = {
+            "torch": types.SimpleNamespace(uint8=dtype, device=lambda value: value),
+            "device_id": 0,
+        }
         with self.assertRaisesRegex(ValueError, "wrong channel/spatial shape"):
             pta._publish_gpu_policy_batch(
                 runtime=runtime,
@@ -404,6 +1008,399 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                 channel_kind="gray",
                 local_warnings=pta.WarningLog(),
             )
+
+    def test_multi_source_publisher_rejects_foreign_cuda_device(self) -> None:
+        dtype = object()
+
+        class FakeTensor:
+            is_cuda = True
+
+            def __init__(self, shape: tuple[int, ...], device: str):
+                self.shape = shape
+                self.ndim = len(shape)
+                self.dtype = dtype
+                self.device = device
+
+        runtime = {
+            "torch": types.SimpleNamespace(uint8=dtype, device=lambda value: value),
+            "device_id": 0,
+        }
+        with self.assertRaisesRegex(ValueError, "assigned device"):
+            pta._publish_gpu_policy_batch(
+                runtime=runtime,
+                batch_images=FakeTensor((1, 1, 8, 8), "cuda:0"),
+                batch_masks=FakeTensor((1, 8, 8), "cuda:1"),
+                candidates=(self._candidate(0),),
+                output_size=(8, 8),
+                channel_kind="gray",
+                local_warnings=pta.WarningLog(),
+            )
+
+    def test_unlabeled_publisher_skips_mask_reduction(self) -> None:
+        dtype = object()
+
+        class FakeTensor:
+            is_cuda = True
+
+            def __init__(self, shape: tuple[int, ...]):
+                self.shape = shape
+                self.ndim = len(shape)
+                self.dtype = dtype
+                self.device = "cuda:0"
+
+        class NoReduceMask(FakeTensor):
+            def reshape(self, *_args):
+                raise AssertionError("unlabeled masks must not be reduced")
+
+        runtime = {
+            "torch": types.SimpleNamespace(uint8=dtype, device=lambda value: value),
+            "device_id": 0,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._install_static(Path(temp_dir) / "output")
+            written, flips = pta._publish_gpu_policy_batch(
+                runtime=runtime,
+                batch_images=FakeTensor((1, 1, 8, 8)),
+                batch_masks=NoReduceMask((1, 8, 8)),
+                candidates=(self._candidate(0),),
+                output_size=(8, 8),
+                channel_kind="gray",
+                local_warnings=pta.WarningLog(),
+            )
+
+        self.assertEqual(written, 1)
+        self.assertEqual(flips, {})
+
+    def test_custom_cuda_batch_writes_multipage_nvtiff_without_host_copy(self) -> None:
+        writes: list[tuple[Path, object, int]] = []
+
+        class Sample:
+            def contiguous(self):
+                return self
+
+        class Selected:
+            device = "cuda:0"
+
+            def __getitem__(self, index: int):
+                self.last_index = index
+                return Sample()
+
+            def detach(self):
+                raise AssertionError("nvTIFF path must not copy image pages to the host")
+
+        class Images:
+            device = "cuda:0"
+
+            def index_select(self, _axis: int, _indices: object):
+                return Selected()
+
+        class NvTiff:
+            def write_multipage_lzw(
+                self,
+                path: Path,
+                pages: object,
+                *,
+                cuda_stream: int,
+            ) -> None:
+                writes.append((path, pages, cuda_stream))
+
+        fake_stream = types.SimpleNamespace(cuda_stream=1234)
+        fake_torch = types.SimpleNamespace(
+            as_tensor=lambda values, **_kwargs: tuple(values),
+            cuda=types.SimpleNamespace(current_stream=lambda **_kwargs: fake_stream),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._install_static(root)
+            pta._WORKER_STATIC["tiff_encode_backend"] = "nvtiff"
+            paths = (root / "first.tif", root / "second.tif")
+            fallback = pta._write_gpu_image_batch(
+                runtime={
+                    "torch": fake_torch,
+                    "device_id": 0,
+                    "nvtiff_encoder": NvTiff(),
+                },
+                images_nchw=Images(),
+                indices=(0, 1),
+                paths=paths,
+                channel_kind="custom",
+                image_format="tif",
+                png_compression=1,
+                jpeg_quality=95,
+            )
+
+        self.assertIsNone(fallback)
+        self.assertEqual([entry[0] for entry in writes], list(paths))
+        self.assertEqual([entry[2] for entry in writes], [1234, 1234])
+
+    def test_nvjpeg_codestreams_publish_atomically_after_validation(self) -> None:
+        payloads = (b"\xff\xd8first\xff\xd9", b"\xff\xd8second\xff\xd9")
+        order: list[str] = []
+
+        class Encoder:
+            def encode(self, images: object, **_kwargs: object):
+                order.append("encode")
+                self.images = images
+                return list(payloads)
+
+        stream = types.SimpleNamespace(
+            cuda_stream=123,
+            synchronize=lambda: order.append("stream_sync"),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            finals = (root / "a.jpg", root / "b.jpg")
+            for path in finals:
+                path.write_bytes(b"OLD")
+            pta._write_nvjpeg_batch_atomically(
+                encoder=Encoder(),
+                images=(object(), object()),
+                final_paths=finals,
+                params=object(),
+                cuda_stream=stream,
+                synchronize_device=lambda: order.append("device_sync"),
+            )
+
+            self.assertEqual(tuple(path.read_bytes() for path in finals), payloads)
+            self.assertEqual(list(root.glob(".*.nvjpeg.*.jpg")), [])
+        self.assertEqual(order, ["encode", "stream_sync", "device_sync"])
+
+    def test_nvjpeg_empty_codestream_preserves_existing_outputs(self) -> None:
+        class Encoder:
+            def encode(self, _images: object, **_kwargs: object):
+                return [b"\xff\xd8good\xff\xd9", b""]
+
+        stream = types.SimpleNamespace(cuda_stream=1, synchronize=lambda: None)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            finals = (root / "a.jpg", root / "b.jpg")
+            for path in finals:
+                path.write_bytes(b"OLD")
+            with self.assertRaisesRegex(RuntimeError, "empty/truncated JPEG CodeStream"):
+                pta._write_nvjpeg_batch_atomically(
+                    encoder=Encoder(),
+                    images=(object(), object()),
+                    final_paths=finals,
+                    params=object(),
+                    cuda_stream=stream,
+                )
+
+            self.assertEqual(tuple(path.read_bytes() for path in finals), (b"OLD", b"OLD"))
+            self.assertEqual(list(root.glob(".*.nvjpeg.*.jpg")), [])
+
+    def test_nvjpeg_partial_none_result_publishes_nothing(self) -> None:
+        class Encoder:
+            def encode(self, _images: object, **_kwargs: object):
+                return [b"\xff\xd8good\xff\xd9", None]
+
+        stream = types.SimpleNamespace(cuda_stream=1, synchronize=lambda: None)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            finals = (root / "a.jpg", root / "b.jpg")
+            for path in finals:
+                path.write_bytes(b"OLD")
+            with self.assertRaisesRegex(RuntimeError, "failed JPEG batch index 1"):
+                pta._write_nvjpeg_batch_atomically(
+                    encoder=Encoder(),
+                    images=(object(), object()),
+                    final_paths=finals,
+                    params=object(),
+                    cuda_stream=stream,
+                )
+            self.assertEqual(tuple(path.read_bytes() for path in finals), (b"OLD", b"OLD"))
+
+    def test_nvjpeg_auto_empty_codestream_disables_encoder_and_falls_back(self) -> None:
+        class Tensor:
+            device = "cuda:0"
+
+            def __init__(self, array: np.ndarray):
+                self.array = np.asarray(array)
+                self.shape = self.array.shape
+                self.ndim = self.array.ndim
+
+            def index_select(self, _axis: int, _indices: object):
+                return self
+
+            def permute(self, *axes: int):
+                return Tensor(np.transpose(self.array, axes))
+
+            def contiguous(self):
+                return self
+
+            def __getitem__(self, index: int):
+                return Tensor(self.array[index])
+
+            def detach(self):
+                return self
+
+            def to(self, _device: str):
+                return self
+
+            def numpy(self):
+                return self.array
+
+        class Encoder:
+            def encode(self, images: object, **_kwargs: object):
+                return [b"" for _image in images]
+
+        stream = types.SimpleNamespace(cuda_stream=1, synchronize=lambda: None)
+        fake_torch = types.SimpleNamespace(
+            as_tensor=lambda values, **_kwargs: tuple(values),
+            cuda=types.SimpleNamespace(
+                current_stream=lambda **_kwargs: stream,
+                synchronize=lambda _device: None,
+            ),
+        )
+        fake_nvimgcodec = types.SimpleNamespace(
+            QualityType=types.SimpleNamespace(QUALITY=1),
+            ColorSpec=types.SimpleNamespace(GRAY=1, SRGB=2),
+            ChromaSubsampling=types.SimpleNamespace(CSS_GRAY=1),
+            EncodeParams=lambda **kwargs: kwargs,
+            as_images=lambda samples, **_kwargs: samples,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._install_static(root)
+            pta._WORKER_STATIC["image_format"] = "jpg"
+            pta._WORKER_STATIC["jpeg_encode_backend"] = "auto"
+            path = root / "fallback.jpg"
+            runtime = {
+                "torch": fake_torch,
+                "device_id": 0,
+                "encoder": Encoder(),
+                "nvimgcodec": fake_nvimgcodec,
+            }
+            with mock.patch.object(
+                pta,
+                "write_image",
+                side_effect=lambda output, *_args, **_kwargs: output.write_bytes(
+                    b"\xff\xd8fallback\xff\xd9"
+                ),
+            ):
+                note = pta._write_gpu_image_batch(
+                    runtime=runtime,
+                    images_nchw=Tensor(np.arange(64, dtype=np.uint8).reshape(1, 1, 8, 8)),
+                    indices=(0,),
+                    paths=(path,),
+                    channel_kind="gray",
+                    image_format="jpg",
+                    png_compression=1,
+                    jpeg_quality=95,
+                )
+
+            self.assertIsNotNone(note)
+            self.assertIsNone(runtime["encoder"])
+            self.assertIsNone(runtime["nvimgcodec"])
+            self.assertGreater(path.stat().st_size, 0)
+            self.assertEqual(path.read_bytes(), b"\xff\xd8fallback\xff\xd9")
+
+    def test_final_image_tree_rejects_zero_or_missing_publications(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            images = root / "images"
+            images.mkdir()
+            (images / "a.jpg").write_bytes(b"\xff\xd8a\xff\xd9")
+            (images / "b.jpg").write_bytes(b"\xff\xd8b\xff\xd9")
+            record = pta.verify_published_image_tree(
+                root,
+                expected_count=2,
+                image_format="jpg",
+            )
+            self.assertEqual(record["verified_image_count"], 2)
+            self.assertGreater(int(record["verified_total_bytes"]), 0)
+
+            (images / "empty.jpg").write_bytes(b"")
+            with self.assertRaisesRegex(RuntimeError, "integrity check failed"):
+                pta.verify_published_image_tree(
+                    root,
+                    expected_count=3,
+                    image_format="jpg",
+                )
+            (images / "empty.jpg").unlink()
+            with self.assertRaisesRegex(RuntimeError, "expected=3, verified=2"):
+                pta.verify_published_image_tree(
+                    root,
+                    expected_count=3,
+                    image_format="jpg",
+                )
+
+    @unittest.skipUnless(
+        os.environ.get("XTA_RUN_NVJPEG_INTEGRATION", "0") == "1",
+        "set XTA_RUN_NVJPEG_INTEGRATION=1 on an nvImageCodec CUDA host",
+    )
+    def test_nvimgcodec_09_gray_and_rgb_codestream_publication(self) -> None:
+        try:
+            import torch  # type: ignore
+            from nvidia import nvimgcodec  # type: ignore
+        except Exception as exc:  # pragma: no cover - opt-in hardware gate
+            self.skipTest(f"CUDA/nvImageCodec unavailable: {exc}")
+        if not bool(torch.cuda.is_available()):
+            self.skipTest("CUDA unavailable")
+        device_id = int(torch.cuda.current_device())
+        encoder = nvimgcodec.Encoder(
+            device_id=device_id,
+            max_num_cpu_threads=2,
+            backends=[nvimgcodec.Backend(nvimgcodec.BackendKind.HYBRID_CPU_GPU)],
+            options=":num_cuda_streams=2",
+        )
+        checker = (
+            (torch.arange(32, device=f"cuda:{device_id}")[:, None]
+             + torch.arange(32, device=f"cuda:{device_id}")[None, :])
+            % 2
+        ).to(torch.uint8).mul_(255)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._install_static(root)
+            pta._WORKER_STATIC["image_format"] = "jpg"
+            pta._WORKER_STATIC["jpeg_encode_backend"] = "nvjpeg"
+            runtime = {
+                "torch": torch,
+                "device_id": device_id,
+                "encoder": encoder,
+                "nvimgcodec": nvimgcodec,
+            }
+            gray_paths = (root / "gray-a.jpg", root / "gray-b.jpg")
+            gray_batch = torch.stack((checker, 255 - checker), dim=0).unsqueeze(1)
+            self.assertIsNone(
+                pta._write_gpu_image_batch(
+                    runtime=runtime,
+                    images_nchw=gray_batch,
+                    indices=(0, 1),
+                    paths=gray_paths,
+                    channel_kind="gray",
+                    image_format="jpg",
+                    png_compression=1,
+                    jpeg_quality=100,
+                )
+            )
+            rgb_path = root / "rgb.jpg"
+            rgb_batch = torch.stack(
+                (checker, torch.flip(checker, dims=(0,)), 255 - checker), dim=0,
+            ).unsqueeze(0)
+            self.assertIsNone(
+                pta._write_gpu_image_batch(
+                    runtime=runtime,
+                    images_nchw=rgb_batch,
+                    indices=(0,),
+                    paths=(rgb_path,),
+                    channel_kind="rgb",
+                    image_format="jpg",
+                    png_compression=1,
+                    jpeg_quality=100,
+                )
+            )
+            for path, expected_shape in (
+                (gray_paths[0], (32, 32)),
+                (gray_paths[1], (32, 32)),
+                (rgb_path, (32, 32, 3)),
+            ):
+                self.assertGreater(path.stat().st_size, 0)
+                decoded = pta.cv2.imread(str(path), pta.cv2.IMREAD_UNCHANGED)
+                self.assertIsNotNone(decoded)
+                self.assertEqual(tuple(decoded.shape), expected_shape)
+                self.assertGreater(int(np.ptp(decoded)), 0)
+            self.assertEqual(list(root.glob(".*.nvjpeg.*.jpg")), [])
 
     @unittest.skipUnless(
         HAS_NUMERICAL_RUNTIME,

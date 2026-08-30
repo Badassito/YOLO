@@ -43,6 +43,7 @@ INTENTIONALLY_CHANGED = {
     ("geometry", "build_view_frame_cache"),
     ("geometry", "dense_tile_positions"),
     ("geometry", "gpu_input_staging_ahead_sources"),
+    ("geometry", "get_radial_sampler"),
     ("geometry", "make_dense_tile_channel_renderer"),
     ("geometry", "make_fullframe_channel_renderer"),
     ("geometry", "make_in_memory_yolo_source"),
@@ -61,6 +62,7 @@ INTENTIONALLY_CHANGED = {
     ("geometry", "write_aug_job_meta"),
     ("geometry", "write_dense_tile_job_meta"),
     ("geometry", "resolve_tile_configs"),
+    ("geometry", "extract_radial_slice_frame"),
     ("inference", "cpu_retina_masks_enabled"),
     ("inference", "PredictionAccumulationHandle"),
     ("inference", "_DeviceUnionAccumulator"),
@@ -166,6 +168,8 @@ INTENTIONALLY_VERSIONED = {
 INTENTIONALLY_CHANGED_BINDINGS = {
     ("config", "9a8d538aa3d7fa8f8d2cf55e46f6ac5b31ff4bc6b5823d7bf242954e9055c6df"):
         "SAVE_OPTION_TOKENS",
+    ("geometry", "a4f438f50fb19a43076e30f5f4b09acf5b68ca6487f501f2c51f2e2b4bd86623"):
+        "_RADIAL_SAMPLER_CACHE",
 }
 
 # Functions that need to call back into a higher architectural layer carry this marker
@@ -192,8 +196,8 @@ REVIEWED_LOCAL_IMPORT_SEAMS = {
         "101a6fb2b4446cf0d71be4e025f1224cfecb863185f21e3482bfcfc9cf3a3231",
     ),
     ("cuda_backend", "_GpuWorkerRenderEngine"): (
-        "13038f7091cbd634ebe31134c7bfeefe9af8ab24c4ec66dd7daf58977f9d195f",
-        "3effca29f240ab39a342363eb17bb6bee8c7e66664a46b35ed17beb7eb6034ff",
+        "ed4f3a7861ffb749b2cfcfc71f9f868ace173a1e8ef53b6a59dfc409754f1e55",
+        "297c8c8888f5e6a6fdf91c8811c99f7bb75288b71ca8fd5b91cf44c50c01d910",
     ),
     ("geometry", "GpuPrefetchingYoloSource"): (
         "d34ae87abc324d9aa32dd8906bad4d1ccb3cbab27bad863c4b1979404bfb5bc8",

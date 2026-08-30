@@ -205,6 +205,7 @@ def main() -> None:
         "pta_mode",
         "pta_runtime",
         "pta_scheduler",
+        "nvtiff_backend",
         "pta",
         "tta_mode",
         "cli",

@@ -37,10 +37,12 @@ def resolve_gpu_worker_layout(
         if int(requested_frame_workers) > 0
         else max(devices, int(worker_budget))
     )
-    threads_per_owner = max(
-        1,
-        min(8, int(math.ceil(float(cpu_budget) / float(devices)))),
-    )
+    per_owner_budget = int(math.ceil(float(cpu_budget) / float(devices)))
+    # Auto mode leaves CPU capacity for volume planning and input prefetch.
+    # An explicit frame-worker budget is authoritative up to a conservative
+    # per-owner ceiling for bounded host memory.
+    per_owner_cap = 32 if int(requested_frame_workers) > 0 else 16
+    threads_per_owner = max(1, min(per_owner_cap, per_owner_budget))
     return devices, threads_per_owner
 
 
@@ -59,6 +61,8 @@ def iter_compatible_work_batches(
             tuple(int(x) for x in item.mask.shape),  # type: ignore[attr-defined]
             tuple(int(x) for x in item.output_size),  # type: ignore[attr-defined]
             str(item.channel_kind),  # type: ignore[attr-defined]
+            int(getattr(item, "channel_count", 1)),
+            bool(getattr(item.image, "is_cuda", False)),  # type: ignore[attr-defined]
         )
         candidates = tuple(item.candidates)  # type: ignore[attr-defined]
         for start in range(0, len(candidates), limit):
@@ -102,7 +106,7 @@ def gpu_memory_candidate_limit(
     # The policy materializes source/candidate floats, inverse-coordinate and
     # sampling grids, warped images/masks, and intensity/noise buffers.
     bytes_per_pixel = max(
-        160 if str(item.channel_kind) == "gray" else 256  # type: ignore[attr-defined]
+        112 + 48 * max(1, int(getattr(item, "channel_count", 1)))
         for item in work
     )
     try:
@@ -117,6 +121,27 @@ def gpu_memory_candidate_limit(
     except Exception:
         return requested
     return max(1, min(requested, memory_limit))
+
+
+def should_flush_ready_gpu_work(
+    *,
+    ready_candidates: int,
+    effective_candidate_limit: int,
+    producer_drained: bool,
+) -> bool:
+    """Launch the first full device batch while CPU producers continue.
+
+    Waiting for two complete device batches defeats producer/consumer overlap
+    when an outer task itself contains only two batches: CUDA starts only
+    after all CPU rendering has finished. One full batch is sufficient; the
+    bounded producer window can fill the following batch during the policy
+    and encoder call.
+    """
+
+    return bool(
+        bool(producer_drained)
+        or int(ready_candidates) >= max(1, int(effective_candidate_limit))
+    )
 
 
 def split_work_batch(batch: Sequence[WorkT]) -> Tuple[Tuple[WorkT, ...], Tuple[WorkT, ...]]:
@@ -158,5 +183,6 @@ __all__ = [
     "is_cuda_out_of_memory",
     "iter_compatible_work_batches",
     "resolve_gpu_worker_layout",
+    "should_flush_ready_gpu_work",
     "split_work_batch",
 ]

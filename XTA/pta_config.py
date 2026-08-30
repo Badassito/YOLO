@@ -341,6 +341,15 @@ def build_pta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         default="auto",
         choices=("auto", "nvjpeg", "opencv"),
     )
+    parser.add_argument(
+        "--tiff_encode_backend",
+        default="auto",
+        choices=("auto", "nvtiff", "opencv"),
+        help=(
+            "Multipage custom-channel TIFF encoder. nvTIFF requires the GPU offline "
+            "path and nvidia-nvtiff matching the active CUDA major version"
+        ),
+    )
     parser.add_argument("--jpeg_quality", default=95, type=int)
     parser.add_argument(
         "--topology_aware",

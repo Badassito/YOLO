@@ -62,6 +62,7 @@ def build_runtime_options(config: PtaConfig) -> argparse.Namespace:
         jpeg_decode_backend=public.jpeg_decode_backend,
         jpeg_batch_size=public.jpeg_batch_size,
         jpeg_encode_backend=public.jpeg_encode_backend,
+        tiff_encode_backend=public.tiff_encode_backend,
         jpeg_quality=public.jpeg_quality,
         topology_aware=public.topology_aware,
         # Resolved v18 geometry is authoritative. These neutral values satisfy

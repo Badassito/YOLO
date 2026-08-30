@@ -46,6 +46,7 @@ Dependencies:
   pip install albumentations  # needed only for --augmentation_execution offline
   pip install torch  # CUDA build; needed by the supplied GPU policy
   pip install nvidia-nvimgcodec-cu13[all]  # CUDA 13; use the cu12 package on CUDA 12
+  pip install nvidia-nvtiff-cu13  # optional lossless multipage TIFF GPU encoder
   pip install pynrrd     # needed for NRRD input or --save_nrrd
 System:
   ffmpeg + ffprobe on PATH for video input and overlay output.
@@ -55,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import atexit
 import copy
 import gc
 import hashlib
@@ -71,10 +73,12 @@ import re
 import shlex
 import shutil
 import string
+import stat as statlib
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from bisect import bisect_left
 from collections import Counter, defaultdict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
@@ -113,9 +117,11 @@ from .pta_scheduler import (
     is_cuda_out_of_memory as _is_cuda_out_of_memory,
     iter_compatible_work_batches as _gpu_multi_source_work_batches,
     resolve_gpu_worker_layout,
+    should_flush_ready_gpu_work as _should_flush_ready_gpu_work,
     split_work_batch as _split_gpu_work_batch,
 )
 from .unification.channels import resolve_channel_variants as resolve_v18_channel_variants
+from .workspace import radial_source_mode as _radial_source_mode
 from .unification.runtime import compile_physical_views
 from .unification.sampling import (
     build_forward_raster_plan,
@@ -130,7 +136,7 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 VIDEO_EXTS = {".mkv", ".mp4", ".mov", ".avi", ".mpg", ".mpeg", ".m4v", ".webm"}
 NRRD_EXTS = {".nrrd", ".nhdr"}
 OUTPUT_IMAGE_FORMATS = {"png", "jpg", "jpeg", "tif", "tiff"}
-PIPELINE_SPEC_VERSION = "v18.0.0"
+PIPELINE_SPEC_VERSION = "v18.0.1"
 RADIAL_LANCZOS_A = 3
 NRRD_SPACE = "left-posterior-superior"
 NRRD_AXIS_ORDER_NOTE = "internal mask (t,Y,X) is exported as Slicer spatial axes (X,Y,t)"
@@ -3362,6 +3368,201 @@ def ensure_output_parent_once(path: Path) -> None:
             _CREATED_OUTPUT_DIRS.add(parent_key)
 
 
+def _private_image_stage_path(path: Path, family: str) -> Path:
+    """Return a hidden same-directory image stage retaining the codec suffix."""
+
+    token = uuid.uuid4().hex
+    return path.with_name(
+        f".{path.stem}.{str(family)}.{os.getpid()}.{threading.get_ident()}.{token}{path.suffix}"
+    )
+
+
+def _validate_nonempty_regular_file(path: Path, *, context: str) -> int:
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        raise RuntimeError(f"{context} did not create a readable file: {path}") from exc
+    if not statlib.S_ISREG(stat.st_mode):
+        raise RuntimeError(f"{context} output is not a regular file: {path}")
+    if int(stat.st_size) <= 0:
+        raise RuntimeError(f"{context} produced an empty file: {path}")
+    return int(stat.st_size)
+
+
+def _validate_jpeg_file(path: Path, *, context: str) -> int:
+    size = _validate_nonempty_regular_file(path, context=context)
+    if size < 4:
+        raise RuntimeError(f"{context} produced a truncated JPEG ({size} bytes): {path}")
+    with path.open("rb") as handle:
+        start = handle.read(2)
+        handle.seek(max(0, size - 64))
+        tail = handle.read()
+    if start != b"\xff\xd8" or b"\xff\xd9" not in tail:
+        raise RuntimeError(f"{context} produced an invalid JPEG marker sequence: {path}")
+    return size
+
+
+def _write_nvjpeg_batch_atomically(
+    *,
+    encoder: object,
+    images: Sequence[object],
+    final_paths: Sequence[Path],
+    params: object,
+    cuda_stream: object,
+    synchronize_device: Optional[Callable[[], None]] = None,
+) -> None:
+    """Encode, settle, validate, then publish one nvJPEG batch.
+
+    nvImageCodec 0.9's native file sink can report encoder success even when a
+    sink write leaves an empty file. Encode to in-memory CodeStreams, validate
+    their buffers, and let Python own the checked same-directory file write.
+    """
+
+    finals = tuple(Path(path) for path in final_paths)
+    if not finals or len(finals) != len(images):
+        raise ValueError(
+            f"nvJPEG atomic batch mismatch: images={len(images)}, paths={len(finals)}"
+        )
+    resolved_finals = [path.resolve(strict=False) for path in finals]
+    if len(set(resolved_finals)) != len(resolved_finals):
+        raise ValueError("nvJPEG atomic batch contains duplicate destination paths")
+    stages = tuple(_private_image_stage_path(path, "nvjpeg") for path in finals)
+    for path in finals:
+        ensure_output_parent_once(path)
+    try:
+        raw_results = encoder.encode(  # type: ignore[union-attr]
+            list(images),
+            codec=".jpg",
+            params=params,
+            cuda_stream=int(getattr(cuda_stream, "cuda_stream")),
+        )
+        synchronize = getattr(cuda_stream, "synchronize", None)
+        if callable(synchronize):
+            synchronize()
+        if synchronize_device is not None:
+            synchronize_device()
+        results = (
+            list(raw_results)
+            if isinstance(raw_results, (list, tuple))
+            else [raw_results]
+        )
+        if len(results) != len(stages):
+            raise RuntimeError(
+                f"nvImageCodec returned {len(results)} result(s) for {len(stages)} JPEG file(s)"
+            )
+        payloads: List[memoryview] = []
+        for index, result in enumerate(results):
+            if result is None:
+                raise RuntimeError(f"nvImageCodec failed JPEG batch index {index}")
+            try:
+                payload = memoryview(result)
+                if payload.format != "B" or payload.ndim != 1:
+                    payload = payload.cast("B")
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"nvImageCodec returned a non-buffer CodeStream at JPEG batch index {index}: "
+                    f"{type(result).__name__}"
+                ) from exc
+            declared_size = int(getattr(result, "size", payload.nbytes))
+            if declared_size < 0 or declared_size > int(payload.nbytes):
+                raise RuntimeError(
+                    f"nvImageCodec returned an invalid JPEG CodeStream size at batch index "
+                    f"{index}: size={declared_size}, buffer={payload.nbytes}"
+                )
+            payload = payload[:declared_size]
+            if int(payload.nbytes) < 4:
+                raise RuntimeError(
+                    f"nvImageCodec produced an empty/truncated JPEG CodeStream at batch index "
+                    f"{index}: {int(payload.nbytes)} bytes"
+                )
+            if bytes(payload[:2]) != b"\xff\xd8" or b"\xff\xd9" not in bytes(payload[-64:]):
+                raise RuntimeError(
+                    f"nvImageCodec produced invalid JPEG markers at batch index {index}"
+                )
+            payloads.append(payload)
+        for index, (payload, stage) in enumerate(zip(payloads, stages)):
+            with stage.open("wb") as handle:
+                written = handle.write(payload)
+                if int(written) != int(payload.nbytes):
+                    raise RuntimeError(
+                        f"Python JPEG stage write was short at batch index {index}: "
+                        f"{written}/{payload.nbytes} bytes"
+                    )
+            _validate_jpeg_file(stage, context=f"nvJPEG batch index {index}")
+        for stage, final in zip(stages, finals):
+            os.replace(stage, final)
+    finally:
+        for stage in stages:
+            try:
+                stage.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def verify_published_image_tree(
+    out_dir: Path,
+    *,
+    expected_count: int,
+    image_format: str,
+) -> Dict[str, object]:
+    """Fail closed before a complete manifest can describe missing/empty images."""
+
+    expected = max(0, int(expected_count))
+    image_root = Path(out_dir) / "images"
+    expected_suffix = output_image_suffix(str(image_format)).lower()
+    if not image_root.exists():
+        if expected == 0:
+            return {
+                "selected": True,
+                "verified_image_count": 0,
+                "verified_total_bytes": 0,
+                "suffix": expected_suffix,
+            }
+        raise RuntimeError(
+            f"PTA image publication is missing its image root: {image_root}; expected={expected}"
+        )
+
+    count = 0
+    total_bytes = 0
+    problems: List[str] = []
+    for path in image_root.rglob("*"):
+        if path.is_symlink():
+            if len(problems) < 12:
+                problems.append(f"unexpected_symlink={path}")
+            continue
+        if path.is_dir():
+            continue
+        if path.suffix.lower() != expected_suffix:
+            if len(problems) < 12:
+                problems.append(f"unexpected={path}")
+            continue
+        try:
+            stat = path.stat()
+        except OSError as exc:
+            if len(problems) < 12:
+                problems.append(f"unreadable={path} ({type(exc).__name__}: {exc})")
+            continue
+        if not statlib.S_ISREG(stat.st_mode) or int(stat.st_size) <= 0:
+            if len(problems) < 12:
+                problems.append(f"empty_or_irregular={path} size={int(stat.st_size)}")
+            continue
+        count += 1
+        total_bytes += int(stat.st_size)
+    if problems or count != expected:
+        detail = "; ".join(problems) if problems else "none"
+        raise RuntimeError(
+            "PTA image publication integrity check failed: "
+            f"expected={expected}, verified={count}, suffix={expected_suffix}, problems={detail}"
+        )
+    return {
+        "selected": True,
+        "verified_image_count": int(count),
+        "verified_total_bytes": int(total_bytes),
+        "suffix": expected_suffix,
+        "all_files_nonempty": True,
+    }
+
+
 def write_yolo_lines(lines: Sequence[str], path: Path) -> None:
     ensure_output_parent_once(path)
     if lines:
@@ -3455,6 +3656,10 @@ def write_image(
 
     if not ok:
         raise RuntimeError(f"Failed to write image: {path}")
+    if suffix in {".jpg", ".jpeg"}:
+        _validate_jpeg_file(path, context="OpenCV JPEG encoder")
+    else:
+        _validate_nonempty_regular_file(path, context="OpenCV image encoder")
 
 
 def write_image_gray(path: Path, frame: np.ndarray, png_compression: int) -> None:
@@ -3871,7 +4076,7 @@ def build_render_plan(
         ],
         "scheduler": "global_source_frame_and_output_frame_parallel",
         "forward_geometry": "XTA.geometry",
-        "forward_backend": "cpu_tta_canonical",
+        "forward_backend": "runtime_selected_cpu_or_cuda_tta_canonical",
         "sampling_policy_digest": forward_sampling_policy().digest,
         "canonical_plan_digest": (
             None if canonical_plan is None else str(canonical_plan.digest)
@@ -3980,8 +4185,9 @@ def _require_pta_canonical_plan(
     role: str,
     *,
     tile: Optional[RenderTileItem] = None,
+    backend: str = "cpu",
 ) -> None:
-    """Mechanically bind shared PTA work to the registered CPU policy."""
+    """Mechanically bind shared PTA work to one registered sampling backend."""
 
     if plan.view.shared_view is None:
         return
@@ -3996,7 +4202,7 @@ def _require_pta_canonical_plan(
             f"PTA RasterPlan policy drift for {plan.tag!r}: "
             f"plan={canonical.sampling_policy.digest}, current={current_policy.digest}"
         )
-    require_forward_sampling("cpu", role)
+    require_forward_sampling(str(backend), role)
 
 
 def render_channel_formatted_images(
@@ -5006,6 +5212,7 @@ def write_v18_pta_manifest(
     summary_path: Optional[Path] = None,
     voxel_report_path: Optional[Path] = None,
     dataset_yaml_path: Optional[Path] = None,
+    publication_integrity: Optional[Mapping[str, object]] = None,
 ) -> Path:
     """Write the mandatory v18 reproducibility and geometry manifest."""
 
@@ -5034,12 +5241,23 @@ def write_v18_pta_manifest(
         }
         for record in records
     ]
+    cuda_intensity_selected = "cuda" in str(
+        augmentation_stats.runtime_backend
+    ).lower()
+    sampling_bindings: Tuple[Tuple[str, str], ...] = (
+        (
+            (("cuda", "intensity"), ("cpu", "intensity"))
+            if cuda_intensity_selected
+            else (("cpu", "intensity"),)
+        )
+        + (("cpu", "categorical_ground_truth"),)
+    )
     manifest = {
         "schema": "pta-tta.v18.manifest.1",
         "status": "complete",
-        "pipeline_version": "18.0.0",
+        "pipeline_version": "18.0.1",
         "mode": "pta",
-        "command": ["GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py", "--mode", "pta", *list(cli_argv)],
+        "command": ["GPT-5.6-Sol-Ultra_v18.0.1_SLURM.py", "--mode", "pta", *list(cli_argv)],
         "determinism_contract": "same v18 version, command, and input identities",
         "coordinate_contract": {
             "source": "gray8_t_y_x",
@@ -5108,15 +5326,20 @@ def write_v18_pta_manifest(
         },
         "forward_sampling": {
             **forward_sampling_execution_record(
-                (
-                    ("cpu", "intensity"),
-                    ("cpu", "categorical_ground_truth"),
-                )
+                sampling_bindings
             ),
             "geometry_module": "XTA.geometry",
-            "backend": "cpu",
+            "backend": (
+                "cuda_intensity_with_cpu_fallback;cpu_categorical"
+                if cuda_intensity_selected
+                else "cpu"
+            ),
             "intensity_radial_filter": str(shared_geometry.RADIAL_FILTER_MODE),
-            "intensity_affine_filter": "opencv_inter_linear",
+            "intensity_affine_filter": (
+                "cuda_grid_sample_bilinear_or_opencv_inter_linear_fallback"
+                if cuda_intensity_selected
+                else "opencv_inter_linear"
+            ),
             "categorical_filter": "nearest_with_tilt_stack_threshold_0.5",
             "radial_channel_boundary": "index_wrap_with_odd_crossing_mirror_u",
             "prediction_interpolation": "not_applicable_to_pta",
@@ -5160,6 +5383,7 @@ def write_v18_pta_manifest(
                 ],
             },
             "dataset_candidates_processed": int(total_written),
+            "image_publication_integrity": dict(publication_integrity or {}),
             "zero_view_success": not any(record.views for record in records),
         },
     }
@@ -6834,6 +7058,8 @@ def trim_background_overage_after_flips(
     image_format: str,
     background_stats: BackgroundFilterStats,
     warnings: WarningLog,
+    images_selected: bool = True,
+    labels_selected: bool = True,
 ) -> int:
     """Re-tighten the per-subset background cap after render-time flips.
 
@@ -6885,9 +7111,18 @@ def trim_background_overage_after_flips(
         deleted_augmented = 0
         for cand in victims:
             img_path, lbl_path = candidate_output_paths(out_dir, cand, split_active=split_active, image_format=image_format)
-            img_path.unlink(missing_ok=True)
-            if lbl_path is not None:
-                lbl_path.unlink(missing_ok=True)
+            if bool(images_selected):
+                _validate_nonempty_regular_file(
+                    img_path,
+                    context="background-overage trim expected image",
+                )
+                img_path.unlink()
+            if bool(labels_selected) and cand.label_enabled and lbl_path is not None:
+                if not lbl_path.is_file():
+                    raise RuntimeError(
+                        f"background-overage trim expected label is missing: {lbl_path}"
+                    )
+                lbl_path.unlink()
             cand.keep = False
             if int(cand.augmentation_index) == 0:
                 deleted_original += 1
@@ -7420,6 +7655,7 @@ def _render_worker_initializer(
     # a spawned interpreter in tests/embedders.  Never let an earlier pool's
     # shared-memory attachments leak into a later worker contract.
     _WORKER_PAYLOAD_CACHE.clear()
+    _WORKER_VOLUME_IDENTITY_BY_POINTER.clear()
     for state in _WORKER_GEN_CACHE.values():
         for shm in state.get("shms", ()):  # type: ignore[union-attr]
             try:
@@ -7474,6 +7710,7 @@ def set_worker_static_context(
     augmentation: Optional[OfflineAugmentation],
     save_images: bool = True,
     save_labels: bool = True,
+    tiff_encode_backend: str = "auto",
 ) -> None:
     """Install run-constant worker state.  Must run before the pool is created."""
     _WORKER_STATIC.clear()
@@ -7484,6 +7721,7 @@ def set_worker_static_context(
         "png_compression": int(png_compression),
         "jpeg_quality": int(jpeg_quality),
         "jpeg_encode_backend": str(jpeg_encode_backend),
+        "tiff_encode_backend": str(tiff_encode_backend),
         "gpu_batch_size": int(gpu_batch_size),
         "gpu_render_threads": max(1, int(gpu_render_threads)),
         "gpu_device_ids": tuple(int(x) for x in gpu_device_ids),
@@ -7532,6 +7770,7 @@ def _spawn_worker_static_payload() -> Dict[str, object]:
         "png_compression": int(_WORKER_STATIC["png_compression"]),
         "jpeg_quality": int(_WORKER_STATIC["jpeg_quality"]),
         "jpeg_encode_backend": str(_WORKER_STATIC["jpeg_encode_backend"]),
+        "tiff_encode_backend": str(_WORKER_STATIC.get("tiff_encode_backend", "auto")),
         "gpu_batch_size": int(_WORKER_STATIC["gpu_batch_size"]),
         "gpu_render_threads": int(_WORKER_STATIC.get("gpu_render_threads", 1)),
         "gpu_device_ids": (),
@@ -7583,6 +7822,7 @@ def _initialize_spawned_worker_static_context(payload: Mapping[str, object]) -> 
         "png_compression": int(payload["png_compression"]),
         "jpeg_quality": int(payload["jpeg_quality"]),
         "jpeg_encode_backend": str(payload["jpeg_encode_backend"]),
+        "tiff_encode_backend": str(payload.get("tiff_encode_backend", "auto")),
         "gpu_batch_size": int(payload["gpu_batch_size"]),
         "gpu_render_threads": max(1, int(payload.get("gpu_render_threads", 1))),
         "gpu_device_ids": (),
@@ -7686,6 +7926,45 @@ def build_phase_render_tasks(
     return list(ordered)
 
 
+def projection_phase_summary(
+    plans: Sequence[RenderPlan],
+    candidates: Sequence[OutputCandidate],
+) -> Tuple[Tuple[str, int, int], ...]:
+    """Return ordered ``(family, count, cumulative_end)`` projection phases."""
+
+    counts_by_tag: Dict[str, int] = defaultdict(int)
+    for candidate in candidates:
+        counts_by_tag[str(candidate.parent_view_tag)] += 1
+    family_counts: Dict[str, int] = {}
+    family_order: List[str] = []
+    for plan in plans:
+        count = int(counts_by_tag.get(str(plan.tag), 0))
+        if count <= 0:
+            continue
+        shared_view = plan.view.shared_view
+        if shared_view is not None and shared_geometry.is_radial_view(shared_view):
+            family = (
+                "tilted-radial"
+                if shared_geometry.is_tilted_radial_view(shared_view)
+                else "upright-radial"
+            )
+        elif shared_view is not None and shared_geometry.is_tilted_view(shared_view):
+            family = "tilted-cartesian"
+        else:
+            family = "cartesian"
+        if family not in family_counts:
+            family_counts[family] = 0
+            family_order.append(family)
+        family_counts[family] += count
+    cumulative = 0
+    summary: List[Tuple[str, int, int]] = []
+    for family in family_order:
+        count = int(family_counts[family])
+        cumulative += count
+        summary.append((family, count, cumulative))
+    return tuple(summary)
+
+
 def _derive_item_arrays(source: RenderFrameSource, plan: RenderPlan, item_key: str) -> Tuple[np.ndarray, np.ndarray]:
     if item_key == "full":
         return source.img_full, source.mask_full
@@ -7764,9 +8043,19 @@ def _gpu_runtime_for_worker() -> Dict[str, object]:
         batch_size=int(_WORKER_STATIC["gpu_batch_size"]),
     )
 
+    radial_renderer = None
+    radial_renderer_error = ""
+    try:
+        cuda_backend = importlib.import_module(".cuda_backend", package=__package__)
+        radial_renderer = cuda_backend._GpuWorkerRenderEngine(device)
+    except Exception as exc:
+        radial_renderer_error = f"{type(exc).__name__}: {exc}"
+
     encoder = None
     nvimgcodec = None
     codec_error = ""
+    nvtiff_encoder = None
+    nvtiff_error = ""
     image_format = parse_output_image_format(str(_WORKER_STATIC["image_format"]))
     codec_request = str(_WORKER_STATIC["jpeg_encode_backend"])
     if image_format == "jpg" and codec_request in {"auto", "nvjpeg"}:
@@ -7776,14 +8065,18 @@ def _gpu_runtime_for_worker() -> Dict[str, object]:
             # CPU.  Restricting it to GPU_ONLY makes the framework reject
             # otherwise valid CUDA-resident samples as unprocessable.
             nvjpeg_backend = nvimgcodec.Backend(nvimgcodec.BackendKind.HYBRID_CPU_GPU)
+            encoder_lanes = max(
+                1,
+                min(4, int(_WORKER_STATIC.get("gpu_render_threads", 1))),
+            )
             encoder = nvimgcodec.Encoder(
                 device_id=device_id,
-                max_num_cpu_threads=1,
+                max_num_cpu_threads=encoder_lanes,
                 backends=[nvjpeg_backend],
-                # Global nvImageCodec options require a leading colon.  Keep
-                # the stream count consistent with max_num_cpu_threads: each
-                # persistent render rank is deliberately a one-thread owner.
-                options=":num_cuda_streams=1",
+                # Global nvImageCodec options require a leading colon. Several
+                # bounded lanes allow a JPEG batch to use the otherwise-idle
+                # CPU/GPU encode capacity without creating another CUDA owner.
+                options=f":num_cuda_streams={encoder_lanes}",
             )
         except Exception as exc:
             if codec_request == "nvjpeg":
@@ -7795,6 +8088,24 @@ def _gpu_runtime_for_worker() -> Dict[str, object]:
             encoder = None
             nvimgcodec = None
             codec_error = f"{type(exc).__name__}: {exc}"
+    tiff_codec_request = str(_WORKER_STATIC.get("tiff_encode_backend", "auto"))
+    if image_format == "tif" and tiff_codec_request in {"auto", "nvtiff"}:
+        try:
+            nvtiff_module = importlib.import_module(".nvtiff_backend", package=__package__)
+            cuda_version = str(getattr(torch.version, "cuda", "") or "")
+            cuda_major = int(cuda_version.split(".", 1)[0]) if cuda_version else None
+            nvtiff_encoder = nvtiff_module.NvTiffBackend(
+                device_id,
+                cuda_major=cuda_major,
+            )
+            atexit.register(nvtiff_encoder.close)
+        except Exception as exc:
+            if tiff_codec_request == "nvtiff":
+                raise RuntimeError(
+                    "--tiff_encode_backend nvtiff requires nvTIFF 0.8 or newer; install "
+                    "nvidia-nvtiff-cu13 for CUDA 13 or nvidia-nvtiff-cu12 for CUDA 12"
+                ) from exc
+            nvtiff_error = f"{type(exc).__name__}: {exc}"
     _WORKER_GPU_RUNTIME = {
         "torch": torch,
         "policy": policy,
@@ -7802,6 +8113,21 @@ def _gpu_runtime_for_worker() -> Dict[str, object]:
         "encoder": encoder,
         "nvimgcodec": nvimgcodec,
         "codec_error": codec_error,
+        "nvtiff_encoder": nvtiff_encoder,
+        "nvtiff_error": nvtiff_error,
+        "radial_renderer": radial_renderer,
+        "radial_renderer_error": radial_renderer_error,
+        "radial_render_lock": threading.Lock(),
+        "radial_renderer_announced": False,
+        "radial_renderer_manifest_announced": False,
+        "cartesian_renderer_announced": False,
+        "cartesian_renderer_manifest_announced": False,
+        "tilted_renderer_announced": False,
+        "tilted_renderer_manifest_announced": False,
+        "radial_renderer_fallback_announced": False,
+        "cartesian_renderer_fallback_announced": False,
+        "tilted_renderer_fallback_announced": False,
+        "cuda_projection_disabled_families": set(),
     }
     return _WORKER_GPU_RUNTIME
 
@@ -7888,7 +8214,7 @@ def _write_gpu_image_batch(
     png_compression: int,
     jpeg_quality: int,
 ) -> Optional[str]:
-    """Batch nvJPEG encode from CUDA tensors, or return an auto-fallback note."""
+    """Encode CUDA images with nvJPEG/nvTIFF, or return an auto-fallback note."""
     if not indices:
         return None
     if len(indices) != len(paths):
@@ -7902,8 +8228,40 @@ def _write_gpu_image_batch(
     encoder = runtime.get("encoder")
     nvimgcodec = runtime.get("nvimgcodec")
     codec_request = str(_WORKER_STATIC["jpeg_encode_backend"])
+    tiff_codec_request = str(_WORKER_STATIC.get("tiff_encode_backend", "auto"))
     fallback_note: Optional[str] = None
-    if parse_output_image_format(image_format) == "jpg" and encoder is not None and nvimgcodec is not None:
+    parsed_format = parse_output_image_format(image_format)
+    if parsed_format == "tif" and str(channel_kind) == "custom":
+        nvtiff_encoder = runtime.get("nvtiff_encoder")
+        if nvtiff_encoder is not None:
+            try:
+                stream = torch.cuda.current_stream(device=int(runtime["device_id"]))  # type: ignore[attr-defined]
+                for sample_index, path in enumerate(paths):
+                    nvtiff_encoder.write_multipage_lzw(  # type: ignore[union-attr]
+                        path,
+                        selected[int(sample_index)].contiguous(),
+                        cuda_stream=int(stream.cuda_stream),
+                    )
+                return None
+            except Exception as exc:
+                if tiff_codec_request == "nvtiff":
+                    raise RuntimeError("nvTIFF multipage encoding failed") from exc
+                fallback_note = f"{type(exc).__name__}: {exc}"
+                if isinstance(runtime, dict):
+                    try:
+                        nvtiff_encoder.close()
+                    except Exception:
+                        pass
+                    runtime["nvtiff_encoder"] = None
+                    runtime["nvtiff_error"] = fallback_note
+        elif tiff_codec_request == "nvtiff":
+            raise RuntimeError(
+                "nvTIFF was explicitly requested but no encoder is active: "
+                f"{runtime.get('nvtiff_error') or 'no diagnostic'}"
+            )
+        elif runtime.get("nvtiff_error"):
+            fallback_note = str(runtime["nvtiff_error"])
+    if parsed_format == "jpg" and encoder is not None and nvimgcodec is not None:
         try:
             stream = torch.cuda.current_stream(device=int(runtime["device_id"]))  # type: ignore[attr-defined]
             samples_tensor = _nvjpeg_samples_nhwc(selected, channel_kind=str(channel_kind))
@@ -7914,33 +8272,20 @@ def _write_gpu_image_batch(
                 channel_kind=str(channel_kind),
                 cuda_stream=int(stream.cuda_stream),
             )
-            results = encoder.write(
-                [str(path) for path in paths],
-                wrapped,
-                codec=".jpg",
+            _write_nvjpeg_batch_atomically(
+                encoder=encoder,
+                images=wrapped,
+                final_paths=paths,
                 params=_nvjpeg_encode_params(
                     nvimgcodec,
                     quality=int(jpeg_quality),
                     channel_kind=str(channel_kind),
                 ),
-                cuda_stream=int(stream.cuda_stream),
+                cuda_stream=stream,
+                synchronize_device=(
+                    lambda: torch.cuda.synchronize(int(runtime["device_id"]))
+                ),
             )
-            stream.synchronize()
-            result_list = list(results) if isinstance(results, (list, tuple)) else [results]
-            if len(result_list) != len(paths):
-                raise RuntimeError(
-                    f"nvImageCodec returned {len(result_list)} result(s) for "
-                    f"{len(paths)} JPEG input image(s)"
-                )
-            failed_indices = [index for index, result in enumerate(result_list) if result is None]
-            if failed_indices:
-                preview = ", ".join(str(index) for index in failed_indices[:12])
-                if len(failed_indices) > 12:
-                    preview += ", ..."
-                raise RuntimeError(
-                    f"nvImageCodec failed to encode {len(failed_indices)}/{len(paths)} JPEG image(s); "
-                    f"failed batch indices: {preview}; input sample shape={tuple(samples_tensor.shape[1:])}"
-                )
             return None
         except Exception as exc:
             if codec_request == "nvjpeg":
@@ -7958,8 +8303,10 @@ def _write_gpu_image_batch(
             sample_out = np.ascontiguousarray(sample[0])
         elif str(channel_kind) == "rgb":
             sample_out = np.ascontiguousarray(np.transpose(sample, (1, 2, 0)))
+        elif str(channel_kind) == "custom":
+            sample_out = np.ascontiguousarray(np.transpose(sample, (1, 2, 0)))
         else:
-            raise ValueError("GPU augmentation CPU-encode fallback supports gray or RGB outputs")
+            raise ValueError("GPU augmentation CPU-encode fallback received an unknown channel kind")
         write_image(
             path,
             sample_out,
@@ -7975,11 +8322,421 @@ class _GpuItemWork:
     """One rendered source item and the candidate versions derived from it."""
 
     candidates: Tuple[OutputCandidate, ...]
-    image: np.ndarray
+    image: object
     mask: np.ndarray
     output_size: Tuple[int, int]
     channel_kind: str
     context: str
+    channel_count: int = 1
+    ready_event: Optional[object] = None
+
+
+def _gpu_identity_fast_path_eligible(
+    work: Sequence[_GpuItemWork],
+    seeds: Sequence[Sequence[Optional[int]]],
+) -> bool:
+    """Return whether originals can bypass an external identity grid warp."""
+
+    if not work or len(work) != len(seeds):
+        return False
+    channel_kind = str(work[0].channel_kind)
+    if channel_kind not in {"gray", "rgb", "custom"}:
+        return False
+    for item, item_seeds in zip(work, seeds):
+        if len(item.candidates) != len(item_seeds) or any(seed is not None for seed in item_seeds):
+            return False
+        image_shape = tuple(int(x) for x in item.image.shape)
+        if str(item.channel_kind) != channel_kind:
+            return False
+        if channel_kind == "gray" and len(image_shape) != 2:
+            return False
+        if channel_kind == "rgb" and (len(image_shape) != 3 or image_shape[2] != 3):
+            return False
+        if channel_kind == "custom" and (
+            len(image_shape) != 3
+            or image_shape[2] != int(item.channel_count)
+            or int(item.channel_count) < 1
+        ):
+            return False
+        if tuple(image_shape[:2]) != tuple(int(x) for x in item.output_size):
+            return False
+        if tuple(int(x) for x in item.mask.shape) != tuple(image_shape[:2]):
+            return False
+    return True
+
+
+def _apply_gpu_identity_batch_many(
+    runtime: Mapping[str, object],
+    work: Sequence[_GpuItemWork],
+) -> Tuple[object, object]:
+    """Upload already-rendered originals without building or sampling a grid."""
+
+    torch = runtime["torch"]
+    channel_kind = str(work[0].channel_kind)
+    device = f"cuda:{int(runtime['device_id'])}"
+    cuda_images = [bool(getattr(item.image, "is_cuda", False)) for item in work]
+    if any(cuda_images) and not all(cuda_images):
+        raise ValueError("GPU identity publication cannot mix host and CUDA source images")
+    if all(cuda_images):
+        expected_device = torch.device(device)
+        image_planes = []
+        for item in work:
+            image = item.image
+            if getattr(image, "dtype", None) != torch.uint8:
+                raise TypeError("GPU-rendered identity sources must be torch.uint8")
+            if torch.device(getattr(image, "device", None)) != expected_device:
+                raise ValueError(
+                    "GPU-rendered identity source is on the wrong device: "
+                    f"expected {expected_device}, got {getattr(image, 'device', None)}"
+                )
+            if channel_kind == "gray":
+                image_planes.append(image.unsqueeze(0))
+            elif channel_kind in {"rgb", "custom"}:
+                image_planes.append(image.permute(2, 0, 1))
+            else:
+                raise ValueError(
+                    f"GPU identity publication does not support channel kind {channel_kind!r}"
+                )
+        image_sources = torch.stack(image_planes, dim=0).contiguous()
+    else:
+        image_arrays = [
+            np.ascontiguousarray(np.asarray(item.image), dtype=np.uint8)
+            for item in work
+        ]
+        if channel_kind == "gray":
+            image_nchw = np.stack(image_arrays, axis=0)[:, None, :, :]
+        elif channel_kind in {"rgb", "custom"}:
+            image_nchw = np.transpose(np.stack(image_arrays, axis=0), (0, 3, 1, 2))
+        else:
+            raise ValueError(
+                f"GPU identity publication does not support channel kind {channel_kind!r}"
+            )
+        image_host = torch.from_numpy(np.ascontiguousarray(image_nchw)).pin_memory()
+        image_sources = image_host.to(device, non_blocking=True)
+    source_mask_required = any(
+        bool(candidate.label_enabled)
+        for item in work
+        for candidate in item.candidates
+    )
+    total_candidates = sum(len(item.candidates) for item in work)
+    if source_mask_required:
+        mask_arrays = [
+            np.ascontiguousarray((np.asarray(item.mask) > 0).astype(np.uint8))
+            for item in work
+        ]
+        mask_nhw = np.stack(mask_arrays, axis=0)
+        mask_host = torch.from_numpy(np.ascontiguousarray(mask_nhw)).pin_memory()
+        mask_sources = mask_host.to(device, non_blocking=True)
+    else:
+        # The publisher does not inspect mask pixels for an unlabeled batch.
+        # Retain the NHW contract as a zero-strided device view without
+        # allocating or transferring one full blank mask per candidate.
+        out_h, out_w = (int(value) for value in work[0].output_size)
+        mask_sources = torch.zeros(
+            (1, 1, 1),
+            device=device,
+            dtype=torch.uint8,
+        ).expand(total_candidates, out_h, out_w)
+
+    if all(len(item.candidates) == 1 for item in work):
+        return image_sources.contiguous(), mask_sources
+
+    source_indices = torch.as_tensor(
+        [
+            source_index
+            for source_index, item in enumerate(work)
+            for _candidate in item.candidates
+        ],
+        device=device,
+        dtype=torch.int64,
+    )
+    return (
+        image_sources.index_select(0, source_indices).contiguous(),
+        (
+            mask_sources.index_select(0, source_indices).contiguous()
+            if source_mask_required
+            else mask_sources
+        ),
+    )
+
+
+def _zero_mask_view(height: int, width: int) -> np.ndarray:
+    """Return a shape-correct, zero-strided unlabeled mask without a raster allocation."""
+
+    return np.broadcast_to(
+        np.zeros((1, 1), dtype=np.uint8),
+        (int(height), int(width)),
+    )
+
+
+def _gpu_policy_host_image(image: object) -> np.ndarray:
+    """Return the legacy writable NumPy policy input for a CUDA-rendered source."""
+
+    if bool(getattr(image, "is_cuda", False)):
+        image = image.detach().to("cpu").numpy()  # type: ignore[union-attr]
+    return np.ascontiguousarray(np.asarray(image), dtype=np.uint8)
+
+
+def _gpu_policy_source_images(
+    policy: object,
+    batch: Sequence[_GpuItemWork],
+) -> Tuple[Tuple[object, ...], bool]:
+    """Choose the zero-copy CUDA policy contract when every source supports it."""
+
+    cuda_sources = bool(batch) and all(
+        bool(getattr(item.image, "is_cuda", False)) for item in batch
+    )
+    if cuda_sources and bool(getattr(policy, "supports_cuda_sources", False)):
+        return tuple(item.image for item in batch), True
+    return tuple(_gpu_policy_host_image(item.image) for item in batch), False
+
+
+def _wait_for_gpu_work_ready(
+    runtime: Mapping[str, object],
+    batch: Sequence[_GpuItemWork],
+) -> None:
+    """Order policy/publication after asynchronous CUDA projection events."""
+
+    events: List[object] = []
+    seen: set[int] = set()
+    for item in batch:
+        event = item.ready_event
+        if event is None or id(event) in seen:
+            continue
+        seen.add(id(event))
+        events.append(event)
+    if not events:
+        return
+    torch = runtime["torch"]
+    consumer_stream = torch.cuda.current_stream(device=int(runtime["device_id"]))
+    for event in events:
+        consumer_stream.wait_event(event)
+    for item in batch:
+        image = item.image
+        record_stream = getattr(image, "record_stream", None)
+        if bool(getattr(image, "is_cuda", False)) and callable(record_stream):
+            record_stream(consumer_stream)
+
+
+def _gpu_projected_item_image(
+    runtime: Mapping[str, object],
+    volume: np.ndarray,
+    plan: RenderPlan,
+    frame_idx: int,
+    item_key: str,
+) -> Optional[Tuple[object, object]]:
+    """Render one canonical Cartesian/Radial/Tilted intensity item on CUDA."""
+
+    shared_view = plan.view.shared_view
+    radial_view = bool(
+        shared_view is not None and shared_geometry.is_radial_view(shared_view)
+    )
+    tilted_view = bool(
+        shared_view is not None
+        and shared_geometry.is_tilted_view(shared_view)
+        and not radial_view
+    )
+    cartesian_view = bool(
+        shared_view is not None
+        and not radial_view
+        and not tilted_view
+        and shared_geometry.physical_view_name(shared_view)
+        in {"transverse", "sagittal", "coronal"}
+    )
+    if (
+        shared_view is None
+        or not (cartesian_view or radial_view or tilted_view)
+        or str(plan.channel_variant.kind) not in {"gray", "rgb", "custom"}
+    ):
+        return None
+    gate_name = (
+        "YOLO_TTA_PTA_GPU_RADIAL_RENDER"
+        if radial_view
+        else (
+            "YOLO_TTA_PTA_GPU_TILTED_RENDER"
+            if tilted_view
+            else "YOLO_TTA_PTA_GPU_CARTESIAN_RENDER"
+        )
+    )
+    if os.environ.get(gate_name, "1").strip().lower() in {
+        "0", "false", "no", "off", "disabled",
+    }:
+        return None
+    if radial_view and _radial_source_mode() != "texture_linear":
+        return None
+    family_key = (
+        "radial" if radial_view else ("tilted" if tilted_view else "cartesian")
+    )
+    if family_key in runtime.get("cuda_projection_disabled_families", set()):
+        return None
+    renderer = runtime.get("radial_renderer")
+    lock = runtime.get("radial_render_lock")
+    if renderer is None or lock is None:
+        fallback_key = f"{family_key}_renderer_fallback_announced"
+        if isinstance(runtime, dict) and not bool(runtime.get(fallback_key)):
+            runtime[fallback_key] = True
+            print(
+                "Warning: PTA resident CUDA view renderer is unavailable "
+                f"({runtime.get('radial_renderer_error') or 'no diagnostic'}); using CPU projection."
+            )
+        return None
+    if str(item_key) == "full":
+        _require_pta_canonical_plan(
+            plan,
+            "intensity",
+            backend="cuda",
+        )
+        output_height = int(plan.aff.out_h)
+        output_width = int(plan.aff.out_w)
+        output_to_source = np.asarray(plan.aff.M_out_to_src, dtype=np.float32)
+    else:
+        tile = next(
+            (candidate for candidate in plan.tile_layout if str(candidate.tile_tag) == str(item_key)),
+            None,
+        )
+        if tile is None or tile.shared_job is None:
+            return None
+        _require_pta_canonical_plan(
+            plan,
+            "intensity",
+            tile=tile,
+            backend="cuda",
+        )
+        output_height = int(tile.out_h)
+        output_width = int(tile.out_w)
+        output_to_source = np.asarray(tile.shared_job.M_out_to_src, dtype=np.float32)
+
+    try:
+        with lock:  # type: ignore[attr-defined]
+            volume_identity = _WORKER_VOLUME_IDENTITY_BY_POINTER.get(
+                int(volume.__array_interface__["data"][0]),
+                f"array:{int(volume.__array_interface__['data'][0])}",
+            )
+            mode = renderer.ensure_volume_array(  # type: ignore[union-attr]
+                volume,
+                identity=volume_identity,
+                require_radial_texture=bool(
+                    runtime.get("radial_texture_required", True)
+                ),
+            )
+            if str(mode) != "resident":
+                return None
+            torch = runtime["torch"]
+            channel_kind = str(plan.channel_variant.kind)
+            if channel_kind == "custom":
+                if plan.source_encoded_indices:
+                    source_positions, missing = encoded_channel_source_positions(
+                        plan.source_encoded_indices,
+                        int(frame_idx),
+                        plan.channel_variant.offsets,
+                    )
+                    if source_positions is None:
+                        return None
+                    addresses = tuple((int(position), False) for position in source_positions)
+                else:
+                    addresses = tuple(
+                        shared_geometry.channel_view_slice_source(
+                            shared_view,
+                            int(frame_idx) + int(offset),
+                        )
+                        for offset in plan.channel_variant.offsets
+                    )
+            else:
+                addresses = ((int(frame_idx), False),)
+
+            native_by_address: Dict[Tuple[int, bool], object] = {}
+            with torch.cuda.stream(renderer._stream):  # type: ignore[union-attr]
+                for source_index, mirror_u in dict.fromkeys(addresses):
+                    if radial_view:
+                        if shared_geometry.is_tilted_radial_view(shared_view):
+                            native = renderer._render_tilted_radial_native_resident(  # type: ignore[union-attr]
+                                shared_view,
+                                int(source_index),
+                            )
+                        else:
+                            # Upright Radial uses TTA's allocation-free
+                            # hardware-linear texture projector, stopping at
+                            # the native uint8 boundary before the PTA affine.
+                            native = renderer._render_radial_native_resident(  # type: ignore[union-attr]
+                                shared_view,
+                                int(source_index),
+                            )
+                        native_u8 = native.round().clamp_(0.0, 255.0).to(torch.uint8)
+                        if bool(mirror_u):
+                            native_u8 = torch.flip(native_u8, dims=(1,))
+                        rendered_u8 = renderer.warp_native_uint8_frame(  # type: ignore[union-attr]
+                            native_u8.contiguous(), output_to_source,
+                            int(output_height), int(output_width),
+                        )
+                    elif tilted_view:
+                        if bool(mirror_u):
+                            raise RuntimeError("Tilted Cartesian addressing cannot mirror radial-u")
+                        rendered = renderer.render_tilted_grid_resident(  # type: ignore[union-attr]
+                            shared_view,
+                            output_to_source,
+                            int(source_index),
+                            int(output_height),
+                            int(output_width),
+                        )
+                        rendered_u8 = rendered.round().clamp_(0.0, 255.0).to(
+                            torch.uint8
+                        ).contiguous()
+                    else:
+                        if bool(mirror_u):
+                            raise RuntimeError("Cartesian addressing cannot mirror radial-u")
+                        rendered_u8 = renderer.render_cartesian_grid_resident(  # type: ignore[union-attr]
+                            shared_view,
+                            output_to_source,
+                            int(source_index),
+                            int(output_height),
+                            int(output_width),
+                        )
+                    native_by_address[(int(source_index), bool(mirror_u))] = rendered_u8
+                first_native = native_by_address[addresses[0]]
+                if channel_kind == "gray":
+                    image = first_native
+                elif channel_kind == "rgb":
+                    image = first_native.unsqueeze(2).expand(-1, -1, 3).contiguous()
+                else:
+                    image = torch.stack(
+                        [native_by_address[address] for address in addresses],
+                        dim=2,
+                    ).contiguous()
+                ready_event = torch.cuda.Event()
+                ready_event.record(renderer._stream)  # type: ignore[union-attr]
+            announced_key = (
+                "radial_renderer_announced"
+                if radial_view
+                else (
+                    "tilted_renderer_announced"
+                    if tilted_view
+                    else "cartesian_renderer_announced"
+                )
+            )
+            if isinstance(runtime, dict) and not bool(runtime.get(announced_key)):
+                runtime[announced_key] = True
+                family_label = (
+                    "Radial"
+                    if radial_view
+                    else ("Tilted Cartesian" if tilted_view else "Cartesian")
+                )
+                print(
+                    f"PTA {family_label} intensity projection: TTA resident CUDA renderer active; "
+                    "projected uint8 sources remain on device through CUDA policy/publication."
+                )
+            return image, ready_event
+    except Exception as exc:
+        if isinstance(runtime, dict):
+            disabled = runtime.setdefault("cuda_projection_disabled_families", set())
+            disabled.add(family_key)
+            fallback_key = f"{family_key}_renderer_fallback_announced"
+            if not bool(runtime.get(fallback_key)):
+                runtime[fallback_key] = True
+                print(
+                    "Warning: PTA CUDA view projection failed "
+                    f"({type(exc).__name__}: {exc}); using CPU projection for this worker."
+                )
+        return None
 
 
 def _render_gpu_frame_items(
@@ -8013,6 +8770,7 @@ def _render_gpu_frame_items(
                 output_size=tuple(int(x) for x in output_size),
                 channel_kind=str(candidates[0].channel_kind),
                 context=f"{plan.tag}/{item_key}/frame={int(frame_task.frame_idx) + 1:04d}",
+                channel_count=int(plan.channel_variant.channel_count),
             )
         )
     return tuple(rendered)
@@ -8024,10 +8782,88 @@ def _render_gpu_item_group(
     plan: RenderPlan,
     frame_idx: int,
     items: Sequence[Tuple[str, Tuple[OutputCandidate, ...]]],
+    runtime: Optional[Mapping[str, object]] = None,
 ) -> Tuple[_GpuItemWork, ...]:
     """Render an independently schedulable full/tile item group on the CPU."""
 
     tile_by_tag = {str(tile.tile_tag): tile for tile in plan.tile_layout}
+    plan_channel_count = max(
+        1,
+        int(getattr(getattr(plan, "channel_variant", None), "channel_count", 1)),
+    )
+    source_mask_required = any(
+        bool(candidate.label_enabled)
+        for _item_key, candidates in items
+        for candidate in candidates
+    )
+    if runtime is not None and len(items) == 1:
+        item_key, candidates = items[0]
+        gpu_projection = _gpu_projected_item_image(
+            runtime,
+            volume,
+            plan,
+            int(frame_idx),
+            str(item_key),
+        )
+        if gpu_projection is not None:
+            gpu_image, gpu_ready_event = gpu_projection
+            if str(item_key) == "full":
+                if source_mask_required:
+                    item_mask, _mask_canvas = render_plan_frame_mask_source(
+                        mask=mask,
+                        plan=plan,
+                        idx=int(frame_idx),
+                        need_canvas=False,
+                    )
+                else:
+                    item_mask = _zero_mask_view(
+                        int(gpu_image.shape[0]),
+                        int(gpu_image.shape[1]),
+                    )
+                output_size = (
+                    int(gpu_image.shape[0]),
+                    int(gpu_image.shape[1]),
+                )
+            else:
+                tile = next(
+                    (
+                        candidate
+                        for candidate in plan.tile_layout
+                        if str(candidate.tile_tag) == str(item_key)
+                    ),
+                    None,
+                )
+                if tile is None or tile.shared_job is None:
+                    raise RuntimeError(
+                        f"CUDA-rendered PTA tile {plan.tag}/{item_key} has no canonical tile job"
+                    )
+                item_mask = (
+                    shared_geometry.render_categorical_dense_tile_for_job(
+                        mask,
+                        plan.view.shared_view,
+                        tile.shared_job,
+                        int(frame_idx),
+                    )
+                    if source_mask_required
+                    else _zero_mask_view(int(tile.out_h), int(tile.out_w))
+                )
+                output_size = (int(tile.out_h), int(tile.out_w))
+            return (
+                _GpuItemWork(
+                    candidates=tuple(candidates),
+                    image=gpu_image,
+                    mask=(
+                        np.ascontiguousarray((np.asarray(item_mask) > 0).astype(np.uint8))
+                        if source_mask_required
+                        else item_mask
+                    ),
+                    output_size=output_size,
+                    channel_kind=str(candidates[0].channel_kind),
+                    context=f"{plan.tag}/{item_key}/frame={int(frame_idx) + 1:04d}",
+                    channel_count=plan_channel_count,
+                    ready_event=gpu_ready_event,
+                ),
+            )
     if len(items) == 1 and str(items[0][0]) != "full":
         item_key, candidates = items[0]
         tile = tile_by_tag[str(item_key)]
@@ -8039,20 +8875,29 @@ def _render_gpu_item_group(
                 tile=tile,
                 idx=int(frame_idx),
             )
-            tile_mask = shared_geometry.render_categorical_dense_tile_for_job(
-                mask,
-                plan.view.shared_view,
-                tile.shared_job,
-                int(frame_idx),
+            tile_mask = (
+                shared_geometry.render_categorical_dense_tile_for_job(
+                    mask,
+                    plan.view.shared_view,
+                    tile.shared_job,
+                    int(frame_idx),
+                )
+                if source_mask_required
+                else _zero_mask_view(int(tile_image.shape[0]), int(tile_image.shape[1]))
             )
             return (
                 _GpuItemWork(
                     candidates=tuple(candidates),
                     image=np.ascontiguousarray(tile_image, dtype=np.uint8),
-                    mask=np.ascontiguousarray((np.asarray(tile_mask) > 0).astype(np.uint8)),
+                    mask=(
+                        np.ascontiguousarray((np.asarray(tile_mask) > 0).astype(np.uint8))
+                        if source_mask_required
+                        else tile_mask
+                    ),
                     output_size=(int(tile.out_h), int(tile.out_w)),
                     channel_kind=str(candidates[0].channel_kind),
                     context=f"{plan.tag}/{item_key}/frame={int(frame_idx) + 1:04d}",
+                    channel_count=plan_channel_count,
                 ),
             )
 
@@ -8063,12 +8908,20 @@ def _render_gpu_item_group(
         idx=int(frame_idx),
         need_canvas=need_canvas,
     )
-    mask_full, mask_canvas = render_plan_frame_mask_source(
-        mask=mask,
-        plan=plan,
-        idx=int(frame_idx),
-        need_canvas=need_canvas,
-    )
+    if source_mask_required:
+        mask_full, mask_canvas = render_plan_frame_mask_source(
+            mask=mask,
+            plan=plan,
+            idx=int(frame_idx),
+            need_canvas=need_canvas,
+        )
+    else:
+        mask_full = _zero_mask_view(int(image_full.shape[0]), int(image_full.shape[1]))
+        mask_canvas = (
+            _zero_mask_view(int(image_canvas.shape[0]), int(image_canvas.shape[1]))
+            if image_canvas is not None
+            else None
+        )
     rendered: List[_GpuItemWork] = []
     for item_key, candidates in items:
         if str(item_key) == "full":
@@ -8100,6 +8953,7 @@ def _render_gpu_item_group(
                 output_size=output_size,
                 channel_kind=str(candidates[0].channel_kind),
                 context=f"{plan.tag}/{item_key}/frame={int(frame_idx) + 1:04d}",
+                channel_count=plan_channel_count,
             )
         )
     return tuple(rendered)
@@ -8114,6 +8968,7 @@ def _publish_gpu_policy_batch(
     output_size: Tuple[int, int],
     channel_kind: str,
     local_warnings: WarningLog,
+    channel_count: Optional[int] = None,
 ) -> Tuple[int, Dict[str, int]]:
     """Validate and publish one flat CUDA policy result batch."""
 
@@ -8125,10 +8980,28 @@ def _publish_gpu_policy_batch(
         raise TypeError("GPU policy outputs must remain CUDA tensors")
     if getattr(batch_images, "dtype", None) != torch.uint8 or getattr(batch_masks, "dtype", None) != torch.uint8:
         raise TypeError("GPU policy outputs must be torch.uint8")
+    expected_device = torch.device(f"cuda:{int(runtime['device_id'])}")
+    image_device = torch.device(getattr(batch_images, "device", None))
+    mask_device = torch.device(getattr(batch_masks, "device", None))
+    if image_device != expected_device or mask_device != expected_device:
+        raise ValueError(
+            "GPU policy outputs must remain on their assigned device: "
+            f"expected {expected_device}, got images={image_device}, masks={mask_device}"
+        )
     if int(batch_images.ndim) != 4 or int(batch_images.shape[0]) != expected:
         raise ValueError(f"GPU image batch must be NCHW with N={expected}, got {tuple(batch_images.shape)}")
     expected_h, expected_w = int(output_size[0]), int(output_size[1])
-    expected_channels = 1 if str(channel_kind) == "gray" else 3
+    expected_channels = int(
+        channel_count
+        if channel_count is not None
+        else (1 if str(channel_kind) == "gray" else 3)
+    )
+    if str(channel_kind) == "gray" and expected_channels != 1:
+        raise ValueError(f"Gray GPU output requires one channel, got {expected_channels}")
+    if str(channel_kind) == "rgb" and expected_channels != 3:
+        raise ValueError(f"RGB GPU output requires three channels, got {expected_channels}")
+    if str(channel_kind) == "custom" and expected_channels < 1:
+        raise ValueError("Custom GPU output requires at least one channel")
     expected_image_shape = (expected, expected_channels, expected_h, expected_w)
     if tuple(int(x) for x in batch_images.shape) != expected_image_shape:
         raise ValueError(
@@ -8153,13 +9026,22 @@ def _publish_gpu_policy_batch(
     save_labels = bool(static.get("save_labels", True))
     # A device-side reduction is enough for background/flip decisions. Full
     # masks cross PCIe only when labels were explicitly requested.
-    mask_nonempty = (
-        batch_masks.reshape(expected, -1)
-        .any(dim=1)
-        .detach()
-        .to("cpu")
-        .tolist()
+    mask_semantics_required = any(
+        bool(candidate.label_enabled) or not bool(candidate.foreground)
+        for candidate in candidates
     )
+    if mask_semantics_required:
+        mask_nonempty = (
+            batch_masks.reshape(expected, -1)
+            .any(dim=1)
+            .detach()
+            .to("cpu")
+            .tolist()
+        )
+    else:
+        # Unlabeled candidates carry no mask-dependent keep/drop semantics.
+        # Avoid launching a reduction over the expanded zero-mask view.
+        mask_nonempty = [False] * expected
     label_indices = [
         index
         for index, candidate in enumerate(candidates)
@@ -8246,7 +9128,15 @@ def _publish_gpu_policy_batch(
             jpeg_quality=int(static["jpeg_quality"]),
         )
     if fallback_note and not _WORKER_GPU_CODEC_WARNING_EMITTED:
-        local_warnings.add("nvjpeg_encode_fallback_to_opencv", fallback_note)
+        local_warnings.add(
+            (
+                "nvtiff_encode_fallback_to_opencv"
+                if parse_output_image_format(image_format) == "tif"
+                and str(channel_kind) == "custom"
+                else "nvjpeg_encode_fallback_to_opencv"
+            ),
+            fallback_note,
+        )
         _WORKER_GPU_CODEC_WARNING_EMITTED = True
     for lbl_path, label_lines in label_payloads:
         write_yolo_lines(label_lines, lbl_path)
@@ -8263,6 +9153,12 @@ def execute_gpu_frame_batch_task(
 
     global _WORKER_GPU_BATCH_CAP_WARNING_EMITTED
     runtime = _gpu_runtime_for_worker()
+    if isinstance(runtime, dict):
+        runtime["radial_texture_required"] = any(
+            plan.view.shared_view is not None
+            and shared_geometry.is_radial_view(plan.view.shared_view)
+            for plan in plans
+        )
     policy = runtime["policy"]
     apply_batch_many = getattr(policy, "apply_batch_many", None)
     if not callable(apply_batch_many):
@@ -8345,12 +9241,38 @@ def execute_gpu_frame_batch_task(
                     for item in batch
                 )
                 try:
-                    result = apply_batch_many(
-                        images=tuple(item.image for item in batch),
-                        masks=tuple(item.mask for item in batch),
-                        seeds=seeds,
-                        output_size=batch[0].output_size,
-                    )
+                    _wait_for_gpu_work_ready(runtime, batch)
+                    if _gpu_identity_fast_path_eligible(batch, seeds):
+                        result = _apply_gpu_identity_batch_many(runtime, batch)
+                    else:
+                        policy_images, zero_copy_cuda_sources = _gpu_policy_source_images(
+                            policy,
+                            batch,
+                        )
+                        if (
+                            any(bool(getattr(item.image, "is_cuda", False)) for item in batch)
+                            and not zero_copy_cuda_sources
+                            and not bool(runtime.get("cuda_source_policy_fallback_announced"))
+                        ):
+                            local_warnings.add(
+                                "gpu_policy_cuda_source_fallback",
+                                "external policy lacks supports_cuda_sources; projected images cross CUDA->CPU->CUDA",
+                            )
+                            if isinstance(runtime, dict):
+                                runtime["cuda_source_policy_fallback_announced"] = True
+                        result = apply_batch_many(
+                            images=policy_images,
+                            # API-v2 policies historically receive writable,
+                            # contiguous masks.  Preserve that contract here;
+                            # the internal originals-only fast path can safely
+                            # retain zero-strided blank views end to end.
+                            masks=tuple(
+                                np.ascontiguousarray(item.mask, dtype=np.uint8)
+                                for item in batch
+                            ),
+                            seeds=seeds,
+                            output_size=batch[0].output_size,
+                        )
                 except Exception as exc:
                     if _is_cuda_out_of_memory(exc) and len(flat_candidates) > 1:
                         try:
@@ -8380,6 +9302,7 @@ def execute_gpu_frame_batch_task(
                     candidates=flat_candidates,
                     output_size=batch[0].output_size,
                     channel_kind=batch[0].channel_kind,
+                    channel_count=int(batch[0].channel_count),
                     local_warnings=local_warnings,
                 )
                 total_written += int(batch_written)
@@ -8434,6 +9357,7 @@ def execute_gpu_frame_batch_task(
                     plan,
                     frame_idx,
                     items,
+                    runtime,
                 )
                 pending[future] = int(next_job)
                 next_job += 1
@@ -8451,12 +9375,44 @@ def execute_gpu_frame_batch_task(
                 requested_limit=requested_batch_size,
             )
             ready_candidates = sum(len(item.candidates) for item in ready)
-            if ready_candidates >= effective * 2 or (
-                next_job >= len(render_jobs) and not pending
+            if _should_flush_ready_gpu_work(
+                ready_candidates=ready_candidates,
+                effective_candidate_limit=effective,
+                producer_drained=(next_job >= len(render_jobs) and not pending),
             ):
                 _consume_rendered_work(tuple(ready))
                 ready.clear()
 
+    if (
+        bool(runtime.get("cartesian_renderer_announced"))
+        and not bool(runtime.get("cartesian_renderer_manifest_announced"))
+    ):
+        local_warnings.add(
+            "pta_cuda_cartesian_projection_active",
+            "TTA resident Cartesian intensity projector; categorical masks retain CPU nearest sampling",
+        )
+        if isinstance(runtime, dict):
+            runtime["cartesian_renderer_manifest_announced"] = True
+    if (
+        bool(runtime.get("radial_renderer_announced"))
+        and not bool(runtime.get("radial_renderer_manifest_announced"))
+    ):
+        local_warnings.add(
+            "pta_cuda_radial_projection_active",
+            "TTA resident CUDA intensity projector; categorical masks retain CPU nearest sampling",
+        )
+        if isinstance(runtime, dict):
+            runtime["radial_renderer_manifest_announced"] = True
+    if (
+        bool(runtime.get("tilted_renderer_announced"))
+        and not bool(runtime.get("tilted_renderer_manifest_announced"))
+    ):
+        local_warnings.add(
+            "pta_cuda_tilted_projection_active",
+            "TTA fused Tilted Cartesian intensity projector; categorical masks retain CPU nearest sampling",
+        )
+        if isinstance(runtime, dict):
+            runtime["tilted_renderer_manifest_announced"] = True
     return (
         total_written,
         total_flips,
@@ -8606,7 +9562,15 @@ def execute_gpu_render_task(
                     jpeg_quality=jpeg_quality,
                 )
             if fallback_note and not _WORKER_GPU_CODEC_WARNING_EMITTED:
-                local_warnings.add("nvjpeg_encode_fallback_to_opencv", fallback_note)
+                local_warnings.add(
+                    (
+                        "nvtiff_encode_fallback_to_opencv"
+                        if parse_output_image_format(image_format) == "tif"
+                        and str(chunk[0].channel_kind) == "custom"
+                        else "nvjpeg_encode_fallback_to_opencv"
+                    ),
+                    fallback_note,
+                )
                 _WORKER_GPU_CODEC_WARNING_EMITTED = True
             for lbl_path, label_lines in label_payloads:
                 write_yolo_lines(label_lines, lbl_path)
@@ -8709,6 +9673,7 @@ def execute_render_task(volume: np.ndarray, mask: np.ndarray, plans: Sequence[Re
 # so eviction keeps the newest two.
 _WORKER_PAYLOAD_CACHE: Dict[str, Dict[str, object]] = {}
 _WORKER_GEN_CACHE: Dict[int, Dict[str, object]] = {}
+_WORKER_VOLUME_IDENTITY_BY_POINTER: Dict[int, str] = {}
 
 
 def _worker_load_payload(payload_name: str, payload_nbytes: int) -> Dict[str, object]:
@@ -8739,9 +9704,18 @@ def _worker_volume_arrays(payload: Mapping[str, object]) -> Tuple[np.ndarray, np
         volume = np.ndarray(tuple(int(x) for x in payload["volume_shape"]), dtype=np.uint8, buffer=volume_shm.buf)  # type: ignore[arg-type]
         mask = np.ndarray(tuple(int(x) for x in payload["mask_shape"]), dtype=np.uint8, buffer=mask_shm.buf)  # type: ignore[arg-type]
         state = {"volume": volume, "mask": mask, "shms": [volume_shm, mask_shm]}
+        _WORKER_VOLUME_IDENTITY_BY_POINTER[
+            int(volume.__array_interface__["data"][0])
+        ] = f"shm:{payload['volume_shm']}"
         _WORKER_GEN_CACHE[gen] = state
         for stale_gen in [g for g in _WORKER_GEN_CACHE if int(g) < gen - 1]:
             stale = _WORKER_GEN_CACHE.pop(stale_gen)
+            stale_volume = stale.get("volume")
+            if isinstance(stale_volume, np.ndarray):
+                _WORKER_VOLUME_IDENTITY_BY_POINTER.pop(
+                    int(stale_volume.__array_interface__["data"][0]),
+                    None,
+                )
             stale["volume"] = None
             stale["mask"] = None
             for stale_shm in stale["shms"]:  # type: ignore[union-attr]
@@ -9283,6 +10257,7 @@ def write_pta_summary(
     gpu_batch_size: int,
     image_format: str,
     png_compression: int,
+    tiff_encode_backend: str = "auto",
 ) -> Path:
     normalized_image_format = parse_output_image_format(image_format)
     lines: List[str] = []
@@ -9302,6 +10277,7 @@ def write_pta_summary(
     )
     lines.append(f"Requested output image format: {parse_output_image_format(requested_output_format)}")
     lines.append(f"Output image format: {normalized_image_format}")
+    lines.append(f"Multipage TIFF output encoder request: {tiff_encode_backend}")
     if normalized_image_format == "png":
         lines.append(f"Image encoding: PNG (lossless; compression level {int(png_compression)})")
     elif normalized_image_format == "jpg":
@@ -9632,7 +10608,7 @@ def main(
     if args is None:
         raise TypeError(
             "PTA requires a resolved runtime configuration; launch through "
-            "GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py --mode pta"
+            "GPT-5.6-Sol-Ultra_v18.0.1_SLURM.py --mode pta"
         )
     warnings = WarningLog()
     workers = choose_workers(int(args.workers))
@@ -9753,6 +10729,14 @@ def main(
         raise ValueError("--offline_augmentation_backend applies only with --augmentation_execution offline")
     if str(args.jpeg_encode_backend) == "nvjpeg" and str(args.output_format) != "jpg":
         raise ValueError("--jpeg_encode_backend nvjpeg requires --output_format jpg/jpeg")
+    tiff_encode_backend = str(getattr(args, "tiff_encode_backend", "auto"))
+    custom_channel_output = any(
+        str(variant.kind) == "custom" for variant in channel_variants
+    )
+    if tiff_encode_backend == "nvtiff" and not custom_channel_output:
+        raise ValueError(
+            "--tiff_encode_backend nvtiff currently applies to custom C...S... multipage TIFF output"
+        )
     gpu_runtime_probe = ""
     if gpu_offline_active:
         if not topology.cuda_device_ids:
@@ -9768,12 +10752,31 @@ def main(
                 "worker constraint and is unavailable on this host; CPU/no-augmentation process "
                 "rendering uses spawn"
             )
-        if any(variant.kind not in {"gray", "rgb"} for variant in channel_variants):
-            raise ValueError("GPU offline augmentation supports gray and RGB outputs; custom C...S... remains on the CPU/TIFF path")
         gpu_runtime_probe = probe_gpu_offline_runtime(
             require_nvjpeg=str(args.jpeg_encode_backend) == "nvjpeg",
             expected_device_count=len(topology.cuda_device_ids),
         )
+        if custom_channel_output and tiff_encode_backend in {"auto", "nvtiff"}:
+            nvtiff_module = importlib.import_module(".nvtiff_backend", package=__package__)
+            cuda_version_match = re.search(r"torch_cuda=(\d+)", gpu_runtime_probe)
+            capability = nvtiff_module.probe_nvtiff(
+                cuda_major=(
+                    int(cuda_version_match.group(1))
+                    if cuda_version_match is not None
+                    else None
+                )
+            )
+            if not bool(capability.available) and tiff_encode_backend == "nvtiff":
+                raise RuntimeError(
+                    "--tiff_encode_backend nvtiff requires nvTIFF 0.8 or newer; "
+                    "install nvidia-nvtiff-cu13 for CUDA 13 or nvidia-nvtiff-cu12 for CUDA 12; "
+                    f"probe={capability.diagnostic}"
+                )
+            if bool(capability.available):
+                version = ".".join(str(value) for value in capability.version)
+                gpu_runtime_probe += f"; nvtiff={version}"
+            else:
+                gpu_runtime_probe += "; nvtiff=unavailable(auto->opencv)"
         gpu_count = len(topology.cuda_device_ids)
         frame_workers, gpu_render_threads = resolve_gpu_worker_layout(
             worker_budget=int(workers),
@@ -9784,6 +10787,11 @@ def main(
         raise ValueError(
             "nvJPEG output encoding is integrated with build_gpu_augmentation; "
             "select the GPU policy or use --jpeg_encode_backend opencv"
+        )
+    elif tiff_encode_backend == "nvtiff":
+        raise ValueError(
+            "nvTIFF multipage encoding is integrated with build_gpu_augmentation; "
+            "select the GPU offline policy or use --tiff_encode_backend opencv"
         )
     if augmentation_definition is not None and float(args.augmentation_ratio) == 1.0:
         warnings.add(
@@ -9975,6 +10983,7 @@ def main(
             png_compression=int(args.png_compression),
             jpeg_quality=int(args.jpeg_quality),
             jpeg_encode_backend=str(args.jpeg_encode_backend),
+            tiff_encode_backend=str(args.tiff_encode_backend),
             gpu_batch_size=int(args.gpu_batch_size),
             gpu_render_threads=int(gpu_render_threads),
             gpu_device_ids=topology.cuda_device_ids if gpu_offline_active else (),
@@ -10003,6 +11012,7 @@ def main(
             f"shared_memory_volumes={'on' if use_shared_volumes else 'off'}, source_frame_grouping=on, "
             f"pipeline_depth={int(effective_pipeline_depth)}, "
             f"jpeg_output_backend={str(args.jpeg_encode_backend)}, "
+            f"tiff_output_backend={str(getattr(args, 'tiff_encode_backend', 'auto'))}, "
             f"gpu_batch_size={int(args.gpu_batch_size)}"
         )
         if len(pending_specs) > 1:
@@ -10232,28 +11242,65 @@ def main(
             progress = VolumeRenderProgress(stem=prep.src.stem, warnings=state["warnings"])  # type: ignore[arg-type]
             state["progress"] = progress
             progress_by_gen[gen] = progress
-            if not dataset_publication_selected:
+            volume_publication_selected = bool(
+                bool(getattr(args, "save_images", True))
+                or (
+                    bool(getattr(args, "save_labels", True))
+                    and bool(prep.label_enabled)
+                )
+            )
+            if not volume_publication_selected:
                 print(
                     f"{prep.src.stem}: skipping dataset render because neither "
-                    "images nor labels was selected"
+                    "images nor available labels was selected"
                 )
                 return
             retained = [c for c in physical if c.keep]
             if not retained:
                 print(f"{prep.src.stem}: no surviving candidates to render")
                 return
+            print(f"{prep.src.stem}: ordered projection phases:")
+            for family, family_count, cumulative_end in projection_phase_summary(
+                prep.plans,
+                retained,
+            ):
+                cuda_family = family in {
+                    "cartesian", "upright-radial", "tilted-cartesian", "tilted-radial",
+                }
+                backend_note = (
+                    "resident CUDA when admitted; CPU fallback"
+                    if gpu_offline_active and cuda_family
+                    else "CPU"
+                )
+                print(
+                    f"  {family}: candidates={family_count}, "
+                    f"cumulative_end={cumulative_end}, projection={backend_note}"
+                )
             tasks = build_phase_render_tasks(
                 prep.plans,
                 retained,
                 aug_chunk=int(args.aug_task_chunk),
                 gpu_batch_size=(int(args.gpu_batch_size) if gpu_offline_active else 0),
             )
+            task_description = (
+                f"{len(tasks)} coalesced GPU work unit(s), up to "
+                f"{max(1, int(args.gpu_batch_size)) * 2} candidates each"
+                if gpu_offline_active
+                else f"{len(tasks)} grouped source-frame task(s)"
+            )
             print(
                 f"{prep.src.stem}: rendering retained candidates={len(retained)} "
-                f"in {len(tasks)} grouped source-frame task(s), "
-                f"backend={render_backend}, workers={frame_workers}"
+                f"in {task_description}, backend={render_backend}, workers={frame_workers}"
             )
-            progress.pbar = tqdm(total=len(retained), desc=f"Rendering retained images/labels {prep.src.stem}")
+            publication_kinds: List[str] = []
+            if bool(getattr(args, "save_images", True)):
+                publication_kinds.append("images")
+            if bool(getattr(args, "save_labels", True)) and bool(prep.label_enabled):
+                publication_kinds.append("labels")
+            progress.pbar = tqdm(
+                total=len(retained),
+                desc=f"Rendering retained {'/'.join(publication_kinds)} {prep.src.stem}",
+            )
             if tasks:
                 handle = render_pool.install_phase(gen=gen, prep=prep, tasks=tasks)
                 state["handles"].append(handle)  # type: ignore[union-attr]
@@ -10293,6 +11340,8 @@ def main(
                 image_format=str(args.output_format),
                 background_stats=vol_background_stats,
                 warnings=vol_warnings,
+                images_selected=bool(getattr(args, "save_images", True)),
+                labels_selected=bool(getattr(args, "save_labels", True)),
             )
             if trimmed:
                 print(f"{spec.stem}: trimmed {trimmed} written background(s) to honor the realized --background_percent cap after flips")
@@ -10483,12 +11532,29 @@ def main(
             channels=int(dataset_channels),
         )
 
+    publication_integrity: Dict[str, object] = {
+        "selected": bool(getattr(args, "save_images", True)),
+        "verified_image_count": 0,
+        "verified_total_bytes": 0,
+    }
+    if v18_active and bool(getattr(args, "save_images", True)):
+        publication_integrity = verify_published_image_tree(
+            out_dir,
+            expected_count=int(total_written),
+            image_format=str(args.output_format),
+        )
+        print(
+            "PTA image publication verified: "
+            f"count={publication_integrity['verified_image_count']}, "
+            f"bytes={publication_integrity['verified_total_bytes']}"
+        )
+
     summary_path: Optional[Path] = None
     if bool(getattr(args, "save_summary", True)):
         summary_command = (
             shlex.join(
                 [
-                    "GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py",
+                    "GPT-5.6-Sol-Ultra_v18.0.1_SLURM.py",
                     "--mode",
                     "pta",
                     *(str(x) for x in cli_argv),
@@ -10524,6 +11590,7 @@ def main(
             gpu_batch_size=int(args.gpu_batch_size),
             image_format=str(args.output_format),
             png_compression=int(args.png_compression),
+            tiff_encode_backend=str(getattr(args, "tiff_encode_backend", "auto")),
         )
 
     manifest_path: Optional[Path] = None
@@ -10560,6 +11627,7 @@ def main(
             summary_path=summary_path,
             voxel_report_path=voxel_report_path,
             dataset_yaml_path=dataset_yaml_path,
+            publication_integrity=publication_integrity,
         )
 
     print("\nDone.")

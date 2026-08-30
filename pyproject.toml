@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "volume-tta"
-version = "18.0.0"
+version = "18.0.1"
 description = "YOLO segmentation pretraining and test-time augmentation for large volumes"
 requires-python = ">=3.10"
 dependencies = [
@@ -19,6 +19,9 @@ dependencies = [
 [project.optional-dependencies]
 openvino = ["openvino"]
 cuda12 = ["cupy-cuda12x>=13.0", "nvidia-ml-py"]
+cuda13 = ["cupy-cuda13x>=13.0", "nvidia-ml-py"]
+nvtiff12 = ["nvidia-nvtiff-cu12>=0.8"]
+nvtiff13 = ["nvidia-nvtiff-cu13>=0.8"]
 acceleration = ["numba", "deflate", "isal"]
 pta = ["pynrrd", "albumentations"]
 
@@ -31,5 +34,5 @@ include = ["XTA*"]
 [tool.setuptools.data-files]
 "share/volume-tta" = [
   "ARCHITECTURE.md",
-  "GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py",
+  "GPT-5.6-Sol-Ultra_v18.0.1_SLURM.py",
 ]

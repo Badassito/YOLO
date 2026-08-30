@@ -270,6 +270,9 @@ def _fused_direct_render_kernels() -> Optional[object]:
     __device__ __forceinline__ float norm_u8(float value) {
       return clamp_f(value, 0.0f, 255.0f) * (1.0f / 255.0f);
     }
+    __device__ __forceinline__ float quantize_u8(float value) {
+      return clamp_f(round_nearest_f(value), 0.0f, 255.0f);
+    }
 
     extern "C" __global__ void set_render_meta(int* render_meta, int frame_value) {
       if (blockIdx.x == 0 && threadIdx.x == 0) {
@@ -722,7 +725,8 @@ def _fused_direct_render_kernels() -> Optional[object]:
     __device__ __forceinline__ float tilted_direct_value(
         const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
         int src_h, int src_w, int stack_len, int base_id, int direction_id,
-        const int* render_meta, float tan_tilt, int inplane_linear, int oy, int ox,
+        const int* render_meta, float tan_tilt, int inplane_linear,
+        int quantize_native_taps, int oy, int ox,
         float m00, float m01, float m02, float m10, float m11, float m12) {
       int frame_center = render_meta[0];
       float sx = __fadd_rn(__fadd_rn(__fmul_rn(m00, (float)ox), __fmul_rn(m01, (float)oy)), m02);
@@ -760,6 +764,12 @@ def _fused_direct_render_kernels() -> Optional[object]:
       float v11 = tilted_native_value(volume, native_t, full_h, full_w, logical_t,
           src_h, src_w, stack_len, base_id, direction_id, frame_center, tan_tilt,
           x1, y1, direction_id == 0 ? (float)y1 : (float)x1);
+      if (quantize_native_taps) {
+        v00 = quantize_u8(v00);
+        v01 = quantize_u8(v01);
+        v10 = quantize_u8(v10);
+        v11 = quantize_u8(v11);
+      }
       float v_top = v00 + fx * (v01 - v00);
       float v_bottom = v10 + fx * (v11 - v10);
       return border * (v_top + fy * (v_bottom - v_top));
@@ -768,7 +778,8 @@ def _fused_direct_render_kernels() -> Optional[object]:
     extern "C" __global__ void tilted_direct_f32(
         const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
         int src_h, int src_w, int stack_len, int base_id, int direction_id,
-        const int* render_meta, float tan_tilt, int inplane_linear, int oh, int ow,
+        const int* render_meta, float tan_tilt, int inplane_linear,
+        int quantize_native_taps, int oh, int ow,
         float m00, float m01, float m02, float m10, float m11, float m12, float* out) {
       int ox = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
       int oy = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
@@ -776,13 +787,15 @@ def _fused_direct_render_kernels() -> Optional[object]:
       int q = oy * ow + ox;
       out[q] = norm_u8(tilted_direct_value(volume, native_t, full_h, full_w, logical_t,
           src_h, src_w, stack_len, base_id, direction_id, render_meta, tan_tilt,
-          inplane_linear, oy, ox, m00, m01, m02, m10, m11, m12));
+          inplane_linear, quantize_native_taps, oy, ox,
+          m00, m01, m02, m10, m11, m12));
     }
 
     extern "C" __global__ void tilted_direct_f16(
         const unsigned char* volume, int native_t, int full_h, int full_w, int logical_t,
         int src_h, int src_w, int stack_len, int base_id, int direction_id,
-        const int* render_meta, float tan_tilt, int inplane_linear, int oh, int ow,
+        const int* render_meta, float tan_tilt, int inplane_linear,
+        int quantize_native_taps, int oh, int ow,
         float m00, float m01, float m02, float m10, float m11, float m12, __half* out) {
       int ox = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
       int oy = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
@@ -790,7 +803,8 @@ def _fused_direct_render_kernels() -> Optional[object]:
       int q = oy * ow + ox;
       float value = norm_u8(tilted_direct_value(volume, native_t, full_h, full_w, logical_t,
           src_h, src_w, stack_len, base_id, direction_id, render_meta, tan_tilt,
-          inplane_linear, oy, ox, m00, m01, m02, m10, m11, m12));
+          inplane_linear, quantize_native_taps, oy, ox,
+          m00, m01, m02, m10, m11, m12));
       out[q] = __float2half_rn(value);
     }
     '''
@@ -1084,6 +1098,7 @@ class _GpuWorkerRenderEngine:
         self._fused_radial_taps: 'OrderedDict[object, object]' = OrderedDict()
         self._fused_volume_ref: Optional[object] = None
         self._radial_texture_ref: Optional[object] = None
+        self._radial_texture_admitted: Optional[bool] = None
         self._radial_texture_lock = threading.RLock()
         self._fused_disabled_families: set = set()
         self._fused_warned_families: set = set()
@@ -1094,11 +1109,14 @@ class _GpuWorkerRenderEngine:
         self._fused_validated_keys: set = set()
         self._fused_preflight_validated_families: set[str] = set()
         self._fused_preflight_volume_key: Optional[Tuple[str, Tuple[int, int, int], int]] = None
+        self._standalone_render_meta: Optional[object] = None
+        self._standalone_render_meta_ref: Optional[object] = None
         self._warned_fallback = False
         self._resident_runtime_disabled = False
         # Native planes reused within one angle-local tile source across batches and
         # contextual channel indices; no cross-tile canvas is retained.
         self._native_plane_cache: 'OrderedDict[Tuple[str, int], object]' = OrderedDict()
+        self._native_u8_plane_cache: 'OrderedDict[Tuple[str, int], object]' = OrderedDict()
         self._tilted_plan_cache_floor = 0
 
     # volume residency ----
@@ -1141,11 +1159,13 @@ class _GpuWorkerRenderEngine:
         self._logical_t = int(out_t)
         self._native_t_map_cache.clear()
         self._native_plane_cache.clear()
+        self._native_u8_plane_cache.clear()
         self._fold_cache.clear()
         self._tilted_plans.clear()
         self._fused_radial_taps.clear()
         self._fused_volume_ref = None
         self._radial_texture_ref = None
+        self._radial_texture_admitted = None
         self._fused_disabled_families.clear()
         self._fused_graph_rejected_keys.clear()
         self._fused_validated_keys.clear()
@@ -1215,6 +1235,135 @@ class _GpuWorkerRenderEngine:
             )
         return self._mode
 
+    def ensure_volume_array(
+        self,
+        volume: np.ndarray,
+        *,
+        identity: Optional[str] = None,
+        require_radial_texture: bool = False,
+    ) -> str:
+        """Admit an already-materialized uint8 cube to the resident renderer.
+
+        TTA normally opens a native-volume memmap and may defer cubic T-axis
+        scaling to CUDA. PTA has already built its canonical processing cube
+        in shared memory, so writing that cube to a second file merely to use
+        the same renderer would add a full-volume round trip. This entry point
+        preserves the resident renderer's admission, reserve, and cache rules
+        while uploading directly from the caller-owned array.
+        """
+
+        torch = self.torch
+        source = np.asarray(volume)
+        if source.ndim != 3 or source.dtype != np.uint8:
+            raise ValueError(
+                "GPU render source array must be uint8 (t,Y,X), got "
+                f"shape={tuple(source.shape)}, dtype={source.dtype}"
+            )
+        if not bool(source.flags["C_CONTIGUOUS"]):
+            raise ValueError("GPU render source array must be C-contiguous")
+        shape_t = tuple(int(value) for value in source.shape)
+        if min(shape_t) <= 0:
+            raise ValueError(f"GPU render source array has invalid shape {shape_t}")
+        data_ptr = int(source.__array_interface__["data"][0])
+        source_identity = str(identity or f"array:{data_ptr}")
+        key = (source_identity, shape_t, int(shape_t[0]))
+        if self._volume_key == key and self._mode != "unresolved":
+            return self._mode
+        if self._volume_key is not None and self._volume_key != key:
+            try:
+                self._stream.synchronize()
+            except Exception:
+                pass
+
+        self._volume_key = key
+        # PTA retains the shared-memory array in its generation cache. The
+        # render engine needs it only during this admission attempt; retaining
+        # another exported buffer would prevent the worker from closing an old
+        # shared-memory generation after a successful resident upload.
+        self._volume_mm = None
+        self._volume_gpu = None
+        self._volume_flat = None
+        self._logical_t = int(shape_t[0])
+        self._native_t_map_cache.clear()
+        self._native_plane_cache.clear()
+        self._native_u8_plane_cache.clear()
+        self._fold_cache.clear()
+        self._tilted_plans.clear()
+        self._fused_radial_taps.clear()
+        self._fused_volume_ref = None
+        self._radial_texture_ref = None
+        self._radial_texture_admitted = None
+        self._fused_disabled_families.clear()
+        self._fused_graph_rejected_keys.clear()
+        self._fused_validated_keys.clear()
+        self._fused_preflight_validated_families.clear()
+        self._fused_preflight_volume_key = None
+        self._mode = "stream"
+
+        nbytes = int(source.nbytes)
+        if gpu_worker_render_resident_enabled() and not self._resident_runtime_disabled:
+            try:
+                free_bytes, _total_bytes = torch.cuda.mem_get_info(self.device)
+                texture_copy_bytes = (
+                    nbytes
+                    if (
+                        bool(require_radial_texture)
+                        and radial_source_mode() == "texture_linear"
+                        and radial_texture_source_copy_reserve_enabled()
+                    )
+                    else 0
+                )
+                resident_need = nbytes + gpu_render_reserve_bytes()
+                preferred_need = resident_need + texture_copy_bytes
+                if int(free_bytes) >= int(resident_need):
+                    resident = torch.empty(shape_t, dtype=torch.uint8, device=self.device)
+                    chunk_slices = max(
+                        1,
+                        min(256, (512 * 1024 * 1024) // max(1, int(shape_t[1]) * int(shape_t[2]))),
+                    )
+                    for t0 in range(0, int(shape_t[0]), int(chunk_slices)):
+                        t1 = min(int(shape_t[0]), t0 + int(chunk_slices))
+                        resident[t0:t1].copy_(
+                            torch.from_numpy(source[t0:t1]),
+                            non_blocking=False,
+                        )
+                    self._volume_gpu = resident
+                    self._volume_flat = resident.view(-1)
+                    self._native_t_indices(int(shape_t[0]))
+                    self._mode = "resident"
+                    self._radial_texture_admitted = bool(
+                        int(free_bytes) >= int(preferred_need)
+                    )
+                    if int(free_bytes) < int(preferred_need):
+                        print(
+                            "PTA GPU view render: cube admitted without the optional "
+                            f"hardware texture ({preferred_need / GIB:.1f} GiB preferred > "
+                            f"{int(free_bytes) / GIB:.1f} GiB free); the exact resident "
+                            "Torch projector remains active."
+                        )
+                else:
+                    print(
+                        "PTA GPU view render: processing cube not resident "
+                        f"({nbytes / GIB:.1f} GiB cube + {texture_copy_bytes / GIB:.1f} GiB "
+                        f"optional texture + {gpu_render_reserve_bytes() / GIB:.1f} GiB reserve; "
+                        f"minimum={resident_need / GIB:.1f} GiB > "
+                        f"{int(free_bytes) / GIB:.1f} GiB free); using the CPU renderer."
+                    )
+            except Exception as exc:
+                self._volume_gpu = None
+                self._volume_flat = None
+                self._mode = "stream"
+                print(
+                    "PTA GPU view render: resident upload failed "
+                    f"({type(exc).__name__}: {exc}); using the CPU renderer."
+                )
+        if self._mode == "resident":
+            print(
+                f"PTA GPU view render: processing cube resident on {self.device} "
+                f"({nbytes / GIB:.1f} GiB); TTA CUDA projection kernels active."
+            )
+        return self._mode
+
     def disable_resident_after_runtime_failure(self) -> None:
         """Release residency and keep this worker on completed-cube fallbacks.
 
@@ -1232,11 +1381,14 @@ class _GpuWorkerRenderEngine:
         self._volume_key = None
         self._logical_t = 0
         self._native_t_map_cache.clear()
+        self._native_plane_cache.clear()
+        self._native_u8_plane_cache.clear()
         self._fold_cache.clear()
         self._tilted_plans.clear()
         self._fused_radial_taps.clear()
         self._fused_volume_ref = None
         self._radial_texture_ref = None
+        self._radial_texture_admitted = None
         self._fused_disabled_families.clear()
         self._fused_graph_rejected_keys.clear()
         self._fused_validated_keys.clear()
@@ -1664,6 +1816,7 @@ class _GpuWorkerRenderEngine:
                     ),
                     np.float32(math.tan(math.radians(float(view.tilt_angle_deg)))),
                     np.int32(1 if tilted_inplane_linear_enabled() else 0),
+                    np.int32(0),  # TTA ring retains its established float-native taps.
                     np.int32(out_size), np.int32(out_size),
                     *(np.float32(v) for v in matrix.reshape(-1)),
                     self._fused_slot_output(slot, kernels),
@@ -1683,6 +1836,144 @@ class _GpuWorkerRenderEngine:
                 raise
             self._fused_render_fallback('tilted', exc)
             return False
+
+    def _render_tilted_direct_grid(
+        self,
+        view: ViewInfo,
+        M_out_to_src: np.ndarray,
+        frame_index: int,
+        out_h: int,
+        out_w: int,
+    ) -> object:
+        """Run TTA's fused Tilted kernel into a standalone float32 raster.
+
+        The TensorRT ring path writes normalized values straight into a model
+        binding. PTA needs the same kernel without an inference slot so the
+        projected raster can flow into augmentation and image publication.
+        """
+
+        if not fused_tilted_render_enabled() or 'tilted' in self._fused_disabled_families:
+            raise RuntimeError('fused Tilted rendering is disabled')
+        if not is_tilted_view(view) or is_radial_view(view):
+            raise ValueError('standalone Tilted grid rendering requires a non-Radial Tilted view')
+        if self._volume_gpu is None or not bool(self._volume_gpu.is_contiguous()):
+            raise RuntimeError('resident uint8 source volume is unavailable or non-contiguous')
+        if self._volume_gpu.dtype != self.torch.uint8:
+            raise RuntimeError(f'expected uint8 source volume, got {self._volume_gpu.dtype}')
+        native_t, full_h, full_w = (int(value) for value in self._volume_gpu.shape)
+        if int(view.full_h) != full_h or int(view.full_w) != full_w:
+            raise RuntimeError('Tilted view/source-volume XY geometry mismatch')
+        base = str(tilted_base_view_name(view))
+        base_ids = {'transverse': 0, 'sagittal': 1, 'coronal': 2}
+        if base not in base_ids:
+            raise RuntimeError(f'unsupported Tilted base {base!r}')
+        direction = str(view.tilt_direction)
+        if direction not in ('vertical', 'horizontal'):
+            raise RuntimeError(f'unsupported Tilted direction {direction!r}')
+        expected = cartesian_view_axis_spec(base, int(self._logical_t), full_h, full_w)
+        if int(view.src_h) != int(expected['src_h']) or int(view.src_w) != int(expected['src_w']):
+            raise RuntimeError('Tilted source raster does not match its base-view geometry')
+        stack_len = int(tilted_stack_axis_length(view))
+        center = int(tilted_frame_center(view, int(frame_index)))
+        if stack_len <= 0 or center < 0 or center >= stack_len:
+            raise RuntimeError('Tilted frame center is outside the stack geometry')
+        height = int(out_h)
+        width = int(out_w)
+        if height <= 0 or width <= 0:
+            raise ValueError('Tilted output dimensions must be positive')
+        matrix = np.asarray(M_out_to_src, dtype=np.float32).reshape(2, 3)
+        if not bool(np.all(np.isfinite(matrix))):
+            raise RuntimeError('Tilted output-to-source affine is non-finite')
+        kernels = _fused_direct_render_kernels()
+        if kernels is None:
+            raise RuntimeError(
+                'CuPy/NVRTC direct renderer kernels are unavailable: '
+                + str(_FUSED_DIRECT_RENDER_KERNELS_ERROR or 'no diagnostic')
+            )
+        if self._standalone_render_meta is None:
+            self._standalone_render_meta = self.torch.empty(
+                (1,), dtype=self.torch.int32, device=self.device,
+            )
+            self._standalone_render_meta_ref = kernels.cp.asarray(
+                self._standalone_render_meta
+            )
+        self._standalone_render_meta.fill_(int(center))
+        output = self.torch.empty(
+            (height, width), dtype=self.torch.float32, device=self.device,
+        )
+        cp_output = kernels.cp.asarray(output)
+        render_block = (32, 8)
+        render_grid = (
+            (width + render_block[0] - 1) // render_block[0],
+            (height + render_block[1] - 1) // render_block[1],
+        )
+        kernels.tilted_direct_f32(
+            render_grid,
+            render_block,
+            (
+                self._fused_cupy_volume(kernels),
+                np.int32(native_t), np.int32(full_h), np.int32(full_w),
+                np.int32(self._logical_t), np.int32(view.src_h), np.int32(view.src_w),
+                np.int32(stack_len), np.int32(base_ids[base]),
+                np.int32(0 if direction == 'vertical' else 1),
+                self._standalone_render_meta_ref,
+                np.float32(math.tan(math.radians(float(view.tilt_angle_deg)))),
+                np.int32(1 if tilted_inplane_linear_enabled() else 0),
+                np.int32(1),  # PTA quantizes native tilted taps before the affine.
+                np.int32(height), np.int32(width),
+                *(np.float32(value) for value in matrix.reshape(-1)),
+                cp_output,
+            ),
+            stream=_cupy_external_stream(kernels.cp, self._stream),
+        )
+        if 'tilted' not in self._fused_announced_families:
+            self._fused_announced_families.add('tilted')
+            print(
+                'PTA fused Tilted renderer active: TTA affine/shear/gather kernel '
+                'writes standalone CUDA rasters.'
+            )
+        # The shared kernel writes normalized TensorRT-ready values.
+        return output.mul_(255.0)
+
+    def render_tilted_grid_resident(
+        self,
+        view: ViewInfo,
+        M_out_to_src: np.ndarray,
+        frame_index: int,
+        out_h: int,
+        out_w: int,
+    ) -> object:
+        """Prefer the fused Tilted kernel and retain the Torch CUDA fallback."""
+
+        if fused_tilted_render_enabled() and 'tilted' not in self._fused_disabled_families:
+            try:
+                return self._render_tilted_direct_grid(
+                    view, M_out_to_src, int(frame_index), int(out_h), int(out_w),
+                )
+            except Exception as exc:
+                self._fused_render_fallback('tilted', exc)
+        if tilted_inplane_linear_enabled():
+            native = self._render_tilted_frame(
+                view,
+                _TILTED_IDENTITY_M,
+                int(view.src_h),
+                int(view.src_w),
+                int(frame_index),
+            )
+            native_u8 = native.round().clamp_(0.0, 255.0).to(self.torch.uint8)
+            return self.warp_native_uint8_frame(
+                native_u8,
+                np.asarray(M_out_to_src, dtype=np.float32),
+                int(out_h),
+                int(out_w),
+            )
+        return self._render_tilted_frame(
+            view,
+            np.asarray(M_out_to_src, dtype=np.float32),
+            int(out_h),
+            int(out_w),
+            int(frame_index),
+        )
 
     def _try_fused_render_into_ring_slot(
         self,
@@ -2174,7 +2465,10 @@ class _GpuWorkerRenderEngine:
             raise RuntimeError(f'resident GPU Radial rendering is disabled for {view.name!r}')
         if is_tilted_radial_view(view):
             return self._render_tilted_radial_native_resident(view, int(frame_idx))
-        if _env_flag('YOLO_TTA_GPU_RADIAL_NATIVE_TEXTURE_KERNEL', True):
+        if (
+            self._radial_texture_admitted is not False
+            and _env_flag('YOLO_TTA_GPU_RADIAL_NATIVE_TEXTURE_KERNEL', True)
+        ):
             try:
                 return self._render_radial_native_texture(view, int(frame_idx))
             except Exception as exc:
@@ -2493,7 +2787,10 @@ class _GpuWorkerRenderEngine:
         """Render a tilted-Radial plane through the texture kernel, with Torch fallback."""
         if not is_tilted_radial_view(view):
             raise ValueError(f'{view.name!r} is not a tilted-Radial view')
-        native_kernel_enabled = _env_flag('YOLO_TTA_GPU_TILTED_RADIAL_NATIVE_KERNEL', True)
+        native_kernel_enabled = (
+            self._radial_texture_admitted is not False
+            and _env_flag('YOLO_TTA_GPU_TILTED_RADIAL_NATIVE_KERNEL', True)
+        )
         if native_kernel_enabled:
             try:
                 return self._render_radial_native_texture(view, int(frame_idx))
@@ -2774,6 +3071,63 @@ class _GpuWorkerRenderEngine:
             vals = v0 + alpha * (v1 - v0)
         return torch.where(valid, vals, torch.zeros((), dtype=torch.float32, device=self.device))
 
+    def warp_native_uint8_frame(
+        self,
+        native_u8: object,
+        M_out_to_src: np.ndarray,
+        out_h: int,
+        out_w: int,
+    ) -> object:
+        """Apply PTA's post-quantization affine on the resident render stream.
+
+        PTA historically quantizes the native Radial projection to uint8 before
+        its in-plane affine/resize. Keeping that boundary avoids the fused
+        float-stage semantic change while removing the native-raster D2H,
+        OpenCV warp, and subsequent H2D upload.
+        """
+
+        torch = self.torch
+        if getattr(native_u8, "dtype", None) != torch.uint8:
+            raise TypeError("post-quantization CUDA affine requires a uint8 source plane")
+        if int(native_u8.ndim) != 2:
+            raise ValueError(
+                "post-quantization CUDA affine requires one HxW plane, got "
+                f"shape={tuple(native_u8.shape)}"
+            )
+        height = int(out_h)
+        width = int(out_w)
+        if height <= 0 or width <= 0:
+            raise ValueError("post-quantization CUDA affine output dimensions must be positive")
+        matrix = np.asarray(M_out_to_src, dtype=np.float32).reshape(2, 3)
+        identity = np.asarray(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            dtype=np.float32,
+        )
+        if (
+            int(native_u8.shape[0]) == height
+            and int(native_u8.shape[1]) == width
+            and np.allclose(matrix, identity, rtol=0.0, atol=2e-6)
+        ):
+            return native_u8.contiguous()
+        theta = _affine_theta_from_dst_to_src(
+            matrix,
+            int(native_u8.shape[0]),
+            int(native_u8.shape[1]),
+            height,
+            width,
+        )
+        grid = _get_cached_affine_grid(theta, height, width, self.device)
+        warped = self.F.grid_sample(
+            native_u8.to(torch.float32).reshape(
+                1, 1, int(native_u8.shape[0]), int(native_u8.shape[1])
+            ),
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=False,
+        ).reshape(height, width)
+        return warped.round_().clamp_(0.0, 255.0).to(torch.uint8).contiguous()
+
     # cartesian / dispatch ----
 
     @staticmethod
@@ -2809,8 +3163,72 @@ class _GpuWorkerRenderEngine:
             cache.popitem(last=False)
         return plane
 
+    def _render_cartesian_native_u8_cached(
+        self,
+        view: ViewInfo,
+        frame_idx: int,
+    ) -> object:
+        """Return one resident ordinary-Cartesian plane without a float round trip."""
+
+        if is_radial_view(view) or is_tilted_view(view):
+            raise ValueError("ordinary Cartesian u8 rendering excludes Radial/Tilted views")
+        physical = str(physical_view_name(view))
+        if physical not in {"transverse", "sagittal", "coronal"}:
+            raise ValueError(f"unsupported ordinary Cartesian view {physical!r}")
+        index = int(frame_idx)
+        if index < 0 or index >= int(view.num_slices):
+            raise IndexError(
+                f"Cartesian frame index {index} is outside [0,{int(view.num_slices)})"
+            )
+        key = (str(view.name), index)
+        cache = self._native_u8_plane_cache
+        cached = cache.get(key)
+        if cached is not None:
+            cache.move_to_end(key)
+            return cached
+        volume = self._volume_gpu
+        if volume is None or volume.dtype != self.torch.uint8:
+            raise RuntimeError("resident uint8 processing cube is unavailable")
+        if int(volume.shape[0]) != int(self._logical_t):
+            native = self._render_native_plane(view, index)
+            plane = native.round().clamp_(0.0, 255.0).to(self.torch.uint8)
+        elif physical == "transverse":
+            plane = volume[index]
+        elif physical == "sagittal":
+            plane = volume[:, index, :]
+        else:
+            plane = volume[:, :, index]
+        plane = plane.contiguous()
+        cache[key] = plane
+        cache.move_to_end(key)
+        while len(cache) > self._native_plane_cache_entries():
+            cache.popitem(last=False)
+        return plane
+
+    def render_cartesian_grid_resident(
+        self,
+        view: ViewInfo,
+        M_out_to_src: np.ndarray,
+        frame_index: int,
+        out_h: int,
+        out_w: int,
+    ) -> object:
+        """Render one ordinary Cartesian PTA raster from the resident u8 cube."""
+
+        native_u8 = self._render_cartesian_native_u8_cached(
+            view,
+            int(frame_index),
+        )
+        return self.warp_native_uint8_frame(
+            native_u8,
+            np.asarray(M_out_to_src, dtype=np.float32),
+            int(out_h),
+            int(out_w),
+        )
+
     def clear_native_plane_cache(self) -> None:
         self._native_plane_cache.clear()
+        self._native_u8_plane_cache.clear()
 
     def _render_native_plane(self, view: ViewInfo, frame_idx: int) -> object:
         vol = self._volume_gpu
