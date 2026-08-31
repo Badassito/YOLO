@@ -102,7 +102,7 @@ def _header_available(relative: str) -> bool:
 
 
 def _requested_backends() -> tuple[set[str], bool]:
-    raw = os.environ.get("VOLUME_TTA_BUILD_INTEL", "auto").strip().lower()
+    raw = os.environ.get("XTA_BUILD_INTEL", "auto").strip().lower()
     explicit = raw != "auto"
     if raw in {"", "auto"}:
         selected: set[str] = set()
@@ -115,7 +115,7 @@ def _requested_backends() -> tuple[set[str], bool]:
         unknown = selected.difference(BACKENDS)
         if unknown:
             raise RuntimeError(
-                "VOLUME_TTA_BUILD_INTEL accepts auto, none, all, or a comma-separated "
+                "XTA_BUILD_INTEL accepts auto, none, all, or a comma-separated "
                 f"subset of {BACKENDS}; unknown values: {sorted(unknown)}"
             )
     return selected, explicit
@@ -164,7 +164,7 @@ def _intel_extensions() -> List[Extension]:
             )
         return []
 
-    auto = os.environ.get("VOLUME_TTA_BUILD_INTEL", "auto").strip().lower() in {"", "auto"}
+    auto = os.environ.get("XTA_BUILD_INTEL", "auto").strip().lower() in {"", "auto"}
     qat_config = (
         _pkg_config("qatzip", minimum_version="1.3.2")
         if auto and "qat" not in selected else None

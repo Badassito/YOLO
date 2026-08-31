@@ -270,7 +270,7 @@ class NativeGzipCompressor:
         # same executor thread. This also supplies preflight for the minimum interface,
         # which intentionally does not require a dedicated native hook.
         size = max(int(self.minimum_input_bytes), 128 * 1024)
-        seed = b'volume-tta-intel-hardware-preflight\x00'
+        seed = b'xta-intel-hardware-preflight\x00'
         payload = (seed * ((int(size) + len(seed) - 1) // len(seed)))[:int(size)]
         encoded = self(payload)
         if gzip.decompress(encoded) != payload:

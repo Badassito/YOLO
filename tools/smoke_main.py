@@ -17,7 +17,7 @@ def main() -> None:
     if missing.exists():
         raise RuntimeError(f"reserved smoke-test path unexpectedly exists: {missing}")
     sys.argv = [
-        "volume-tta",
+        "xta",
         "--input",
         str(missing),
         "--model",

@@ -6,7 +6,7 @@
 
 static const char *fake_mode(void)
 {
-    const char *value = getenv("VOLUME_TTA_FAKE_QAT_MODE");
+    const char *value = getenv("XTA_FAKE_QAT_MODE");
     return value == NULL ? "hardware" : value;
 }
 

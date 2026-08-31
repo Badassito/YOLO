@@ -17,6 +17,37 @@ from XTA.pta_config import parse_pta_args
 
 
 class CompleteManifestBoundaryTests(unittest.TestCase):
+    def test_tta_finalize_facade_preserves_private_callback_patch_seams(self) -> None:
+        manifest_path = Path("manifest.json")
+        manifest = {"status": "complete"}
+        identities = {"input": {}}
+        with (
+            mock.patch.object(pipeline, "_cleanup_tta_selected_run_scratch") as cleanup,
+            mock.patch.object(
+                pipeline,
+                "_publish_complete_tta_manifest",
+                return_value=manifest_path,
+            ) as publish,
+        ):
+            result = pipeline._finalize_tta_selected_run_and_publish(
+                temp_dir=Path("temp"),
+                out_dir=Path("output"),
+                keep_temp_artifacts=False,
+                manifest_path=manifest_path,
+                manifest=manifest,
+                artifact_identities=identities,
+            )
+
+        self.assertEqual(result, manifest_path)
+        cleanup.assert_called_once_with(
+            temp_dir=Path("temp"), out_dir=Path("output")
+        )
+        publish.assert_called_once_with(
+            path=manifest_path,
+            manifest=manifest,
+            artifact_identities=identities,
+        )
+
     def test_tta_cleanup_failure_prevents_revalidation_and_complete_write(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

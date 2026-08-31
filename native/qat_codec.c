@@ -27,12 +27,12 @@
 #error "XTA._qat_codec requires QATzip API 2.5 or newer (QATzip 1.3.2+)"
 #endif
 
-#define VOLUME_TTA_QAT_BINDING_VERSION "17.0.8-capi1"
-#define VOLUME_TTA_QAT_MIN_INPUT ((unsigned int)QZ_COMP_THRESHOLD_MINIMUM)
+#define XTA_QAT_BINDING_VERSION "17.0.8-capi1"
+#define XTA_QAT_MIN_INPUT ((unsigned int)QZ_COMP_THRESHOLD_MINIMUM)
 /* QATzip 1.3.2 can route level 9 to its software provider on QAT 1.x without
  * reliably setting qzCompressExt's SW bit.  Until upstream exposes dependable
  * generation/per-request proof, fail closed instead of advertising level 9. */
-#define VOLUME_TTA_QAT_LEVEL_MAX 8
+#define XTA_QAT_LEVEL_MAX 8
 
 typedef struct {
     QzSession_T session;
@@ -361,7 +361,7 @@ static void configure_hardware_deflate_params(
     params->common_params.sw_backup = 0;
     QZ_DISABLE_SOFTWARE_BACKUP(params->common_params.sw_backup);
     QZ_DISABLE_SOFTWARE_ONLY_EXECUTION(params->common_params.sw_backup);
-    params->common_params.input_sz_thrshold = VOLUME_TTA_QAT_MIN_INPUT;
+    params->common_params.input_sz_thrshold = XTA_QAT_MIN_INPUT;
     params->common_params.is_sensitive_mode = 0;
     params->data_fmt = QZ_DEFLATE_GZIP;
 }
@@ -390,12 +390,12 @@ static QatThreadState *ensure_thread_session(int level)
         return NULL;
     }
     if (level < QZ_DEFLATE_COMP_LVL_MINIMUM
-        || level > VOLUME_TTA_QAT_LEVEL_MAX) {
+        || level > XTA_QAT_LEVEL_MAX) {
         PyErr_Format(
             PyExc_ValueError,
             "QATzip deflate level must be in [%d, %d], got %d",
             QZ_DEFLATE_COMP_LVL_MINIMUM,
-            VOLUME_TTA_QAT_LEVEL_MAX,
+            XTA_QAT_LEVEL_MAX,
             level);
         return NULL;
     }
@@ -713,7 +713,7 @@ static PyObject *qat_capabilities(PyObject *self, PyObject *Py_UNUSED(args))
         || dict_set_owned(result, "standard_gzip", PyBool_FromLong(1)) != 0
         || dict_set_owned(result, "software_fallback_enabled", PyBool_FromLong(0)) != 0
         || dict_set_owned(result, "backend", PyUnicode_FromString("qat")) != 0
-        || dict_set_owned(result, "binding_version", PyUnicode_FromString(VOLUME_TTA_QAT_BINDING_VERSION)) != 0
+        || dict_set_owned(result, "binding_version", PyUnicode_FromString(XTA_QAT_BINDING_VERSION)) != 0
         || dict_set_owned(result, "library_version", PyUnicode_FromString(qatzip_version)) != 0
         || dict_set_owned(result, "driver_version", PyUnicode_FromString(driver_version)) != 0
         || dict_set_owned(result, "hardware_generation", PyUnicode_FromString("unknown")) != 0
@@ -724,7 +724,7 @@ static PyObject *qat_capabilities(PyObject *self, PyObject *Py_UNUSED(args))
                 : Py_NewRef(Py_None)) != 0
         || dict_set_owned(result, "instance_count", Py_NewRef(Py_None)) != 0
         || dict_set_owned(result, "max_concurrency", PyLong_FromUnsignedLong(capacity)) != 0
-        || dict_set_owned(result, "minimum_input_bytes", PyLong_FromUnsignedLong(VOLUME_TTA_QAT_MIN_INPUT)) != 0
+        || dict_set_owned(result, "minimum_input_bytes", PyLong_FromUnsignedLong(XTA_QAT_MIN_INPUT)) != 0
         || dict_set_owned(
             result, "supported_levels",
             Py_BuildValue("(iiiiiiii)", 1, 2, 3, 4, 5, 6, 7, 8)) != 0
@@ -881,11 +881,11 @@ static PyObject *qat_compress_gzip(
         PyErr_SetString(PyExc_BufferError, "QATzip input must be one-dimensional");
         goto error;
     }
-    if (input.len < (Py_ssize_t)VOLUME_TTA_QAT_MIN_INPUT) {
+    if (input.len < (Py_ssize_t)XTA_QAT_MIN_INPUT) {
         PyErr_Format(
             PyExc_ValueError,
             "QATzip hardware minimum input is %u bytes; received %zd",
-            VOLUME_TTA_QAT_MIN_INPUT,
+            XTA_QAT_MIN_INPUT,
             input.len);
         goto error;
     }
@@ -1172,7 +1172,7 @@ PyMODINIT_FUNC PyInit__qat_codec(void)
     }
     if (PyModule_AddObjectRef(module, "QATzipError", new_error) != 0
         || PyModule_AddStringConstant(
-            module, "__binding_version__", VOLUME_TTA_QAT_BINDING_VERSION) != 0) {
+            module, "__binding_version__", XTA_QAT_BINDING_VERSION) != 0) {
         Py_DECREF(new_error);
         Py_DECREF(module);
         return NULL;

@@ -29,7 +29,7 @@ class QatNativeSourceContractTests(unittest.TestCase):
         self.assertIn('QZ_DISABLE_SOFTWARE_ONLY_EXECUTION', self.source)
         self.assertIn('is_sensitive_mode = 0', self.source)
         self.assertIn('data_fmt = QZ_DEFLATE_GZIP', self.source)
-        self.assertIn('#define VOLUME_TTA_QAT_LEVEL_MAX 8', self.source)
+        self.assertIn('#define XTA_QAT_LEVEL_MAX 8', self.source)
 
     def test_request_proof_and_lifecycle_guards_are_present(self) -> None:
         self.assertIn('qzMaxCompressedLength', self.source)
@@ -82,7 +82,7 @@ class QatNativeBindingFakeProviderTests(unittest.TestCase):
             raise unittest.SkipTest(f'setuptools build_ext is unavailable: {exc}') from exc
 
         cls.build_directory = tempfile.TemporaryDirectory(
-            prefix='volume-tta-qatzip-fake-'
+            prefix='xta-qatzip-fake-'
         )
         build_root = Path(cls.build_directory.name)
         extension = Extension(
@@ -96,7 +96,7 @@ class QatNativeBindingFakeProviderTests(unittest.TestCase):
             extra_link_args=['-pthread'],
         )
         distribution = Distribution({
-            'name': 'volume-tta-qatzip-native-test',
+            'name': 'xta-qatzip-native-test',
             'ext_modules': [extension],
         })
         command = build_ext(distribution)
@@ -133,7 +133,7 @@ class QatNativeBindingFakeProviderTests(unittest.TestCase):
             spec.loader.exec_module(qat)
         '''
         environment = dict(os.environ)
-        environment['VOLUME_TTA_FAKE_QAT_MODE'] = str(mode)
+        environment['XTA_FAKE_QAT_MODE'] = str(mode)
         source = textwrap.dedent(bootstrap) + '\n' + textwrap.dedent(body)
         completed = subprocess.run(
             [sys.executable, '-c', source],

@@ -91,8 +91,8 @@ class RunContextManifestTests(unittest.TestCase):
     def test_launch_context_nests_and_restores(self) -> None:
         self.assertIsNone(current_unified_launch())
         with activate_unified_launch(
-            version="18.0.1",
-            launcher="GPT-5.6-Sol-Ultra_v18.0.1_SLURM.py",
+            version="18.0.2",
+            launcher="GPT-5.6-Sol-Ultra_v18.0.2_SLURM.py",
             mode="tta",
             mode_arguments=("--input", "volume.mkv"),
         ) as outer:
@@ -100,7 +100,7 @@ class RunContextManifestTests(unittest.TestCase):
             self.assertEqual(
                 outer.command,
                 (
-                    "GPT-5.6-Sol-Ultra_v18.0.1_SLURM.py",
+                    "GPT-5.6-Sol-Ultra_v18.0.2_SLURM.py",
                     "--mode",
                     "tta",
                     "--input",
@@ -108,8 +108,8 @@ class RunContextManifestTests(unittest.TestCase):
                 ),
             )
             with activate_unified_launch(
-                version="18.0.1",
-                launcher="GPT-5.6-Sol-Ultra_v18.0.1_SLURM.py",
+                version="18.0.2",
+                launcher="GPT-5.6-Sol-Ultra_v18.0.2_SLURM.py",
                 mode="pta",
                 mode_arguments=("--input", "dataset"),
             ) as inner:
@@ -155,14 +155,14 @@ class RunContextManifestTests(unittest.TestCase):
                 cpu_model_path=None,
             )
             with activate_unified_launch(
-                version="18.0.1",
-                launcher="GPT-5.6-Sol-Ultra_v18.0.1_SLURM.py",
+                version="18.0.2",
+                launcher="GPT-5.6-Sol-Ultra_v18.0.2_SLURM.py",
                 mode="tta",
                 mode_arguments=("--input", str(source)),
             ) as context:
                 payload = build_tta_run_manifest(
                     launch_context=context,
-                    pipeline_version="18.0.1",
+                    pipeline_version="18.0.2",
                     resolved_config={"imgsz": 7, "angle": [0.0, 120.0]},
                     artifact_identities=identities,
                     source_shape_tyx=(3, 5, 7),
@@ -218,7 +218,7 @@ class RunContextManifestTests(unittest.TestCase):
                     },
                     output_metadata={
                         "voxel_volume": {
-                            "schema": "volume_tta.v18.voxel_count/1",
+                            "schema": "xta.v18.voxel_count/1",
                             "voxel_count": 11,
                             "units": "foreground_voxels",
                             "shape_t_y_x": [3, 5, 7],

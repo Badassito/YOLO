@@ -37,6 +37,7 @@ if not HAS_NUMERICAL_RUNTIME:
 
 from XTA import pta
 from XTA import pta_scheduler
+from XTA import pta_workers
 
 
 class PtaSpawnSchedulerTests(unittest.TestCase):
@@ -161,10 +162,10 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             }
             with (
                 mock.patch.object(
-                    pta, "inspect_augmentation_definition", return_value=inspected
+                    pta_workers, "inspect_augmentation_definition", return_value=inspected
                 ) as inspect_definition,
                 mock.patch.object(
-                    pta, "load_augmentation_definition", return_value=loaded
+                    pta_workers, "load_augmentation_definition", return_value=loaded
                 ) as load_definition,
             ):
                 pta._initialize_spawned_worker_static_context(payload)
@@ -203,9 +204,11 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             )
             with (
                 mock.patch.object(
-                    pta, "inspect_augmentation_definition", return_value=changed
+                    pta_workers, "inspect_augmentation_definition", return_value=changed
                 ),
-                mock.patch.object(pta, "load_augmentation_definition") as load_definition,
+                mock.patch.object(
+                    pta_workers, "load_augmentation_definition"
+                ) as load_definition,
             ):
                 with self.assertRaisesRegex(RuntimeError, "changed after parent preflight"):
                     pta._initialize_spawned_worker_static_context(payload)
@@ -725,12 +728,12 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
         image = np.arange(64, dtype=np.uint8).reshape(8, 8)
         with (
             mock.patch.object(
-                pta,
+                pta_workers,
                 "render_channel_formatted_images",
                 return_value=(image, None),
             ),
             mock.patch.object(
-                pta,
+                pta_workers,
                 "render_plan_frame_mask_source",
                 side_effect=AssertionError("blank source mask must not be resliced"),
             ),
@@ -753,17 +756,17 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
         projected = np.arange(64, dtype=np.uint8).reshape(8, 8)
         with (
             mock.patch.object(
-                pta,
+                pta_workers,
                 "_gpu_projected_item_image",
                 return_value=(projected, None),
             ) as gpu_renderer,
             mock.patch.object(
-                pta,
+                pta_workers,
                 "render_channel_formatted_images",
                 side_effect=AssertionError("CPU intensity projection must be bypassed"),
             ),
             mock.patch.object(
-                pta,
+                pta_workers,
                 "render_plan_frame_mask_source",
                 side_effect=AssertionError("unlabeled masks must not be rendered"),
             ),
@@ -839,7 +842,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
         with (
             mock.patch.object(pta.shared_geometry, "is_radial_view", return_value=False),
             mock.patch.object(pta.shared_geometry, "is_tilted_view", return_value=True),
-            mock.patch.object(pta, "_require_pta_canonical_plan"),
+            mock.patch.object(pta_workers, "_require_pta_canonical_plan"),
             mock.patch("builtins.print"),
         ):
             actual, ready_event = pta._gpu_projected_item_image(
@@ -920,7 +923,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                 "physical_view_name",
                 return_value="sagittal",
             ),
-            mock.patch.object(pta, "_require_pta_canonical_plan"),
+            mock.patch.object(pta_workers, "_require_pta_canonical_plan"),
             mock.patch("builtins.print"),
         ):
             actual, ready_event = pta._gpu_projected_item_image(
@@ -1271,7 +1274,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                 "nvimgcodec": fake_nvimgcodec,
             }
             with mock.patch.object(
-                pta,
+                pta_workers,
                 "write_image",
                 side_effect=lambda output, *_args, **_kwargs: output.write_bytes(
                     b"\xff\xd8fallback\xff\xd9"

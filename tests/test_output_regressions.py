@@ -65,7 +65,7 @@ class SummaryTests(unittest.TestCase):
             root = Path(tmp)
             summary_path = outputs.write_summary_file(
                 root / 'sample_Summary.txt',
-                command='volume-tta --input sample.mkv',
+                command='xta --input sample.mkv',
                 input_path=Path('sample.mkv'),
                 out_dir=root,
                 scratch_dir=root / 'temp',

@@ -340,128 +340,45 @@ from .unification.sampling import (
     raster_plan_spawn_spec,
 )
 from .unification.tta_manifest import (
+    TTA_RUN_MANIFEST_SCHEMA,
+    TTA_VOXEL_COUNT_SCHEMA,
     assert_tta_artifacts_unchanged,
     build_tta_run_manifest,
     capture_tta_artifact_identities,
+)
+from .tta_lifecycle import (
+    PipelineRunResources as _PipelineRunResources,
+    cleanup_tta_selected_run_scratch as _cleanup_tta_selected_run_scratch_impl,
+    finalize_tta_selected_run_and_publish as _finalize_tta_selected_run_and_publish_impl,
+    publish_complete_tta_manifest as _publish_complete_tta_manifest_impl,
+)
+from .tta_outputs import (
+    TtaOutputArtifacts,
+    TtaOutputInputs,
+    TtaOutputOperations,
+    TtaOutputResult,
+)
+from .tta_prediction import (
+    PredictionSourceCoordinator,
+    PredictionSourceOperations,
+    ViewFrameCache,
+)
+from .tta_scheduler import (
+    TtaScheduler,
+    TtaSchedulerCallbacks,
+    TtaSchedulerInputs,
+    TtaSchedulerOperations,
+    TtaSchedulerState,
+)
+from .tta_terminal import (
+    finalize_physical_view_volume_group as _finalize_physical_view_volume_group_impl,
+    run_physical_view_finalization_with_handoff as _run_physical_view_finalization_with_handoff_impl,
 )
 from .workers import (
     _cpu_inference_worker_main,
     _gpu_inference_worker_main,
     _pin_cuda_visible_device_token,
 )
-
-class _PipelineRunResources:
-    """Last-resort ownership for resources created anywhere in one pipeline run.
-
-    The scheduler retains its detailed, phase-aware teardown.  This outer registry covers
-    construction failures before that ``try`` and failures in the final assembly/output
-    tail, where local executors and processes previously escaped their cleanup block.
-    """
-
-    def __init__(self) -> None:
-        self.executors: List[object] = []
-        self.output_managers: List[object] = []
-        self.sinks: List[object] = []
-        self.processes: List[object] = []
-        self.queues: List[object] = []
-        self.threads: List[Tuple[threading.Thread, Optional[threading.Event]]] = []
-        self._seen: set[int] = set()
-
-    def _add(self, collection: List[object], resource: object) -> object:
-        if resource is not None and id(resource) not in self._seen:
-            self._seen.add(id(resource))
-            collection.append(resource)
-        return resource
-
-    def track_executor(self, resource: object) -> object:
-        return self._add(self.executors, resource)
-
-    def track_output_manager(self, resource: object) -> object:
-        return self._add(self.output_managers, resource)
-
-    def track_sink(self, resource: object) -> object:
-        return self._add(self.sinks, resource)
-
-    def track_process(self, resource: object) -> object:
-        return self._add(self.processes, resource)
-
-    def track_queue(self, resource: object) -> object:
-        return self._add(self.queues, resource)
-
-    def track_thread(
-        self,
-        thread: threading.Thread,
-        stop_event: Optional[threading.Event] = None,
-    ) -> threading.Thread:
-        if id(thread) not in self._seen:
-            self._seen.add(id(thread))
-            self.threads.append((thread, stop_event))
-        return thread
-
-    def close(self, *, failed: bool) -> None:
-        for _thread, stop_event in self.threads:
-            if stop_event is not None:
-                stop_event.set()
-
-        # A process left here escaped the scheduler's cooperative sentinel path. Terminate
-        # it before closing queues or waiting on parent thread pools that may depend on it.
-        for proc in reversed(self.processes):
-            try:
-                proc.join(timeout=0.0 if failed else 0.25)  # type: ignore[attr-defined]
-                if proc.is_alive():  # type: ignore[attr-defined]
-                    proc.terminate()  # type: ignore[attr-defined]
-            except Exception:
-                pass
-        for proc in reversed(self.processes):
-            try:
-                proc.join(timeout=2.0)  # type: ignore[attr-defined]
-                if proc.is_alive() and hasattr(proc, 'kill'):  # type: ignore[attr-defined]
-                    proc.kill()  # type: ignore[attr-defined]
-                    proc.join(timeout=1.0)  # type: ignore[attr-defined]
-            except Exception:
-                pass
-
-        for manager in reversed(self.output_managers):
-            try:
-                manager.wait()  # type: ignore[attr-defined]
-            except Exception:
-                pass
-        for sink in reversed(self.sinks):
-            try:
-                sink.shutdown()  # type: ignore[attr-defined]
-            except Exception:
-                pass
-        for executor in reversed(self.executors):
-            try:
-                executor.shutdown(wait=True, cancel_futures=bool(failed))  # type: ignore[attr-defined]
-            except TypeError:
-                try:
-                    executor.shutdown(wait=True)  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-            except Exception:
-                pass
-        for thread, _stop_event in reversed(self.threads):
-            try:
-                if thread is not threading.current_thread():
-                    thread.join(timeout=5.0)
-            except Exception:
-                pass
-        for process_queue in reversed(self.queues):
-            if failed:
-                try:
-                    process_queue.cancel_join_thread()  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-            try:
-                process_queue.close()  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            if not failed:
-                try:
-                    process_queue.join_thread()  # type: ignore[attr-defined]
-                except Exception:
-                    pass
 
 _PIPELINE_RUN_LOCK = threading.Lock()
 
@@ -475,52 +392,14 @@ def _run_resources() -> _PipelineRunResources:
 
 
 def _cleanup_tta_selected_run_scratch(*, temp_dir: Path, out_dir: Path) -> None:
-    """Strictly retire scratch owned by the selected run.
+    """Facade for strict selected-run scratch retirement."""
 
-    A v18 complete manifest is a success commit, so cleanup cannot remain a
-    best-effort warning immediately before that commit.  Every owned path is
-    removed without ``ignore_errors``; any failure propagates and prevents
-    complete-manifest publication.
-    """
-
-    temp_dir = Path(temp_dir)
-    out_dir = Path(out_dir)
-    try:
-        released_memfd_files = release_memfd_owners_under(temp_dir)
-        if int(released_memfd_files) > 0:
-            print(f'Released {int(released_memfd_files)} memfd-backed scratch payload(s).')
-
-        for child in list(temp_dir.iterdir()):
-            if child.is_symlink() or child.is_file():
-                child.unlink(missing_ok=True)
-            elif child.is_dir():
-                shutil.rmtree(child)
-            else:
-                child.unlink(missing_ok=True)
-
-        default_temp_dir = out_dir / 'temp'
-        if temp_dir != default_temp_dir:
-            # The explicit --temp child is uniquely owned by this run.
-            temp_dir.rmdir()
-            temp_link = default_temp_dir
-            if temp_link.is_symlink():
-                temp_link.unlink()
-            elif temp_link.exists():
-                # ``expose_scratch_in_output`` uses this marker when directory
-                # symlinks are unavailable.  Refuse to remove an unowned path.
-                marker = temp_link / 'SCRATCH_LOCATION.txt'
-                if not marker.is_file() or marker.read_text(encoding='utf-8').strip() != str(temp_dir):
-                    raise RuntimeError(
-                        'scratch exposure path is not the selected run marker: '
-                        f'{temp_link}'
-                    )
-                marker.unlink()
-                temp_link.rmdir()
-    except Exception as exc:
-        raise RuntimeError(
-            'TTA selected-run scratch cleanup failed; refusing a complete manifest: '
-            f'{temp_dir}'
-        ) from exc
+    _cleanup_tta_selected_run_scratch_impl(
+        temp_dir=temp_dir,
+        out_dir=out_dir,
+        release_memfd_owners_under=release_memfd_owners_under,
+        remove_tree=shutil.rmtree,
+    )
 
 
 def _publish_complete_tta_manifest(
@@ -529,15 +408,15 @@ def _publish_complete_tta_manifest(
     manifest: Mapping[str, object],
     artifact_identities: Mapping[str, object],
 ) -> Path:
-    """Revalidate authoritative artifacts and atomically commit TTA success."""
+    """Facade for artifact revalidation and atomic success publication."""
 
-    if str(manifest.get('status', '')) != 'complete':
-        raise ValueError('TTA complete-manifest publisher requires status=complete')
-    # Keep this check immediately adjacent to the atomic write.  In particular,
-    # no cleanup, summary generation, or manifest construction may be inserted
-    # between the identity barrier and publication.
-    assert_tta_artifacts_unchanged(artifact_identities)
-    return write_json_manifest(path, manifest)
+    return _publish_complete_tta_manifest_impl(
+        path=path,
+        manifest=manifest,
+        artifact_identities=artifact_identities,
+        assert_artifacts_unchanged=assert_tta_artifacts_unchanged,
+        write_manifest=write_json_manifest,
+    )
 
 
 def _finalize_tta_selected_run_and_publish(
@@ -549,14 +428,17 @@ def _finalize_tta_selected_run_and_publish(
     manifest: Mapping[str, object],
     artifact_identities: Mapping[str, object],
 ) -> Path:
-    """Finish selected-run cleanup before publishing the complete manifest."""
+    """Facade preserving the selected-run cleanup/publication test seam."""
 
-    if not bool(keep_temp_artifacts):
-        _cleanup_tta_selected_run_scratch(temp_dir=temp_dir, out_dir=out_dir)
-    return _publish_complete_tta_manifest(
-        path=manifest_path,
+    return _finalize_tta_selected_run_and_publish_impl(
+        temp_dir=temp_dir,
+        out_dir=out_dir,
+        keep_temp_artifacts=keep_temp_artifacts,
+        manifest_path=manifest_path,
         manifest=manifest,
         artifact_identities=artifact_identities,
+        cleanup_scratch=_cleanup_tta_selected_run_scratch,
+        publish_manifest=_publish_complete_tta_manifest,
     )
 
 def _create_tracked_thread_pool(
@@ -582,79 +464,21 @@ def _finalize_physical_view_volume_group(
     out_shape_tyx: Tuple[int, int, int],
     workers: int,
 ) -> Tuple[str, str, np.ndarray]:
-    """Collapse one completed TTA group and perform its terminal projection.
+    """Facade for completed physical-view collapse and terminal projection."""
 
-    The scheduler calls this as soon as every runtime variant of one physical view is
-    terminal.  Keeping the operation independent of the scheduler's shared registries lets
-    it overlap remaining inference without exposing a half-collapsed group to result
-    handlers.  Radial/Tilted projection is an OR-homomorphism, so collapsing the native
-    variants first is equivalent to the retired project-each-variant-then-OR tail and avoids
-    repeated source-geometry allocations.
-    """
-    if not variant_volumes:
-        raise ValueError(
-            f'{model_name}/{physical_view_name(physical_view)} has no dense variant volumes'
-        )
-
-    runtime_views = [view for view, _volume in variant_volumes]
-    runtime_volumes = {
-        str(view.name): volume
-        for view, volume in variant_volumes
-    }
-    input_volumes = list(runtime_volumes.values())
-    try:
-        collapsed = collapse_tta_variant_volumes_to_physical_views(
-            {str(model_name): runtime_volumes},
-            runtime_views,
-            workers=max(1, int(workers)),
-        )
-        physical_name = str(physical_view_name(physical_view))
-        physical_volumes = collapsed.get(str(model_name), {})
-        native_volume = physical_volumes.get(physical_name)
-        if native_volume is None or len(physical_volumes) != 1:
-            raise RuntimeError(
-                f'{model_name}/{physical_name}: TTA collapse produced '
-                f'{sorted(physical_volumes)} instead of one physical volume'
-            )
-
-        if physical_view.family != 'radial' and not is_tilted_view(physical_view):
-            return str(model_name), physical_name, native_volume
-
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            queue_runner = HybridBackprojectionQueue(cpu_workers=max(1, int(workers)))
-            projected_results = queue_runner.run((ViewBackprojectionQueueJob(
-                model_name=str(model_name),
-                view=physical_view,
-                native_source=native_volume,
-                out_path=out_path,
-                desc=f'Backprojecting completed physical view {model_name}/{physical_name}',
-                min_radius=0.0,
-                workers=max(1, int(workers)),
-                out_shape_tyx=tuple(int(value) for value in out_shape_tyx),
-            ),))
-            if len(projected_results) != 1:
-                raise RuntimeError(
-                    f'{model_name}/{physical_name}: terminal backprojection returned '
-                    f'{len(projected_results)} result(s)'
-                )
-            result_model, result_view, projected = projected_results[0]
-            return str(result_model), str(result_view), projected
-        finally:
-            close_memmap_array(native_volume)
-    except BaseException:
-        # Collapse retires all but its first accumulator.  Error paths can stop before that
-        # ownership transfer completes, so close every distinct input defensively.
-        closed_ids: set[int] = set()
-        for volume in input_volumes:
-            if id(volume) in closed_ids:
-                continue
-            closed_ids.add(id(volume))
-            try:
-                close_memmap_array_without_flush(volume)
-            except Exception:
-                pass
-        raise
+    return _finalize_physical_view_volume_group_impl(
+        model_name=model_name,
+        physical_view=physical_view,
+        variant_volumes=variant_volumes,
+        out_path=out_path,
+        out_shape_tyx=out_shape_tyx,
+        workers=workers,
+        collapse_variants=collapse_tta_variant_volumes_to_physical_views,
+        queue_factory=HybridBackprojectionQueue,
+        queue_job_type=ViewBackprojectionQueueJob,
+        close_volume=close_memmap_array,
+        close_volume_without_flush=close_memmap_array_without_flush,
+    )
 
 
 def _run_physical_view_finalization_with_handoff(
@@ -664,37 +488,45 @@ def _run_physical_view_finalization_with_handoff(
     variant_volumes: Sequence[Tuple[ViewInfo, np.ndarray]],
     finalize: Callable[[], Tuple[str, str, np.ndarray]],
 ) -> Tuple[str, str, np.ndarray]:
-    """Run one dense finalizer while transferring exactly one reducer credit.
+    """Facade for dense-result handoff credit transfer."""
 
-    A successful return transfers the credit with the returned physical volume. Every
-    exceptional path retains ownership locally, releases the credit if acquired, and closes
-    the detached variants so scheduler teardown cannot strand registry-less workspaces.
-    """
-    credit_acquired = False
-    try:
-        while not handoff_credit.acquire(timeout=0.25):
-            if stop_event.is_set():
-                raise RuntimeError(
-                    'streaming physical-view finalization stopped while waiting '
-                    'for the dense union handoff credit'
-                )
-        credit_acquired = True
-        if stop_event.is_set():
-            raise RuntimeError('streaming physical-view finalization was stopped')
-        return finalize()
-    except BaseException:
-        if credit_acquired:
-            handoff_credit.release()
-        retired_ids: set[int] = set()
-        for _view, volume in variant_volumes:
-            if id(volume) in retired_ids:
-                continue
-            retired_ids.add(id(volume))
-            try:
-                close_memmap_array_without_flush(volume)
-            except Exception:
-                pass
-        raise
+    return _run_physical_view_finalization_with_handoff_impl(
+        handoff_credit=handoff_credit,
+        stop_event=stop_event,
+        variant_volumes=variant_volumes,
+        finalize=finalize,
+        close_volume_without_flush=close_memmap_array_without_flush,
+    )
+
+
+def _close_tta_output_artifacts(
+    artifacts: TtaOutputArtifacts,
+    *,
+    keep_temp_artifacts: bool,
+    tile_slice_workers: int,
+    after_close: Optional[Callable[[], object]] = None,
+) -> TtaOutputResult:
+    """Facade preserving pipeline teardown monkeypatch seams."""
+
+    result = artifacts.close(
+        inputs=TtaOutputInputs(
+            keep_temp_artifacts=bool(keep_temp_artifacts),
+            tile_slice_workers=int(tile_slice_workers),
+        ),
+        operations=TtaOutputOperations(
+            close_memmap_array=close_memmap_array,
+            close_raw_store_or_memmap_volume=close_raw_store_or_memmap_volume,
+            archive_or_delete_binary_volume_storage=(
+                archive_or_delete_binary_volume_storage
+            ),
+            unload_yolo_model=unload_yolo_model,
+            trim_cuda_memory=trim_cuda_memory,
+            collect_garbage=gc.collect,
+        ),
+    )
+    if after_close is not None:
+        after_close()
+    return result
 
 
 def main() -> None:
@@ -1343,7 +1175,7 @@ def _main_impl() -> None:
         write_json_manifest(
             out_dir / 'manifest.json',
             {
-                'schema': 'volume_tta.v18.run_manifest/1',
+                'schema': TTA_RUN_MANIFEST_SCHEMA,
                 'status': 'in_progress',
                 'launcher': {
                     'name': str(unified_launch_at_start.launcher),
@@ -2194,35 +2026,20 @@ def _main_impl() -> None:
                         str(model_name), str(view.name), str(config_id),
                     )] = int(len(config_jobs) * tile_result_factor)
 
-    view_frame_caches: Dict[str, np.ndarray] = {}
-    view_frame_cache_paths: Dict[str, Path] = {}
-    view_frame_cache_lock = threading.Lock()
-
-    def _get_view_frame_cache(view: ViewInfo) -> Optional[np.ndarray]:
-        if not should_cache_view_frames(view, dense_tiling_active):
-            return None
-        cache_key = physical_view_name(view)
-        cached = view_frame_caches.get(cache_key)
-        if cached is not None:
-            return cached
-        with view_frame_cache_lock:
-            cached = view_frame_caches.get(cache_key)
-            if cached is not None:
-                return cached
-            wait_for_volume_ready(volume_rgb)
-            cache_path = temp_dir / 'view_frames' / f'{cache_key}.gray8.dat'
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_mm = build_view_frame_cache(
-                volume_rgb=volume_rgb,
-                view=view,
-                out_path=cache_path,
-                desc=f'{view.name} native frame cache',
-                prefer_memory=True,
-                workers=max(1, int(augmentation_workers)),
-            )
-            view_frame_caches[cache_key] = cache_mm
-            view_frame_cache_paths[cache_key] = cache_path
-            return cache_mm
+    view_frame_cache = ViewFrameCache(
+        dense_tiling_active=bool(dense_tiling_active),
+        volume_rgb=volume_rgb,
+        temp_dir=temp_dir,
+        augmentation_workers=int(augmentation_workers),
+        cache_policy=should_cache_view_frames,
+        wait_for_volume=wait_for_volume_ready,
+        build_cache=build_view_frame_cache,
+    )
+    # Preserve the established local names consumed by final teardown while the cache
+    # object owns synchronization and lazy construction.
+    view_frame_caches = view_frame_cache.arrays
+    view_frame_cache_paths = view_frame_cache.paths
+    _get_view_frame_cache = view_frame_cache.get
 
     baseline_union_by_model_view: Dict[Tuple[str, str], np.ndarray] = {}
     baseline_confmap_by_model_view: Dict[Tuple[str, str], Optional[np.ndarray]] = {}
@@ -2310,6 +2127,79 @@ def _main_impl() -> None:
             # and dominate time-to-first-prediction. Allocate a view's union/confidence
             # workspaces only when its first full-frame prediction is about to run.
             fullframe_remaining[(model_name, view.name)] = int(len(aug_jobs_by_view[view.name]))
+
+    scheduler_state = TtaSchedulerState(
+        baseline_union_paths=baseline_union_paths,
+        baseline_confmap_paths=baseline_confmap_paths,
+        parent_mask_support_by_model=parent_mask_support_by_model,
+        fullframe_remaining=fullframe_remaining,
+        direct_union_inference_views=direct_union_inference_views,
+        direct_union_postprocess_views=direct_union_postprocess_views,
+        direct_union_inference_bytes=direct_union_inference_bytes,
+        direct_union_postprocess_bytes=direct_union_postprocess_bytes,
+        direct_union_backing_leases=direct_union_backing_leases,
+    )
+    # Container aliases deliberately preserve identity for the still-inline view/tile
+    # completion side. Mutable scalar scheduler state is accessed only through
+    # ``scheduler_state`` below.
+    cpu_task_queues = scheduler_state.cpu_task_queues
+    gpu_task_queues = scheduler_state.gpu_task_queues
+    cpu_worker_dispatched_by_id = scheduler_state.cpu_worker_dispatched_by_id
+    cpu_worker_results_by_id = scheduler_state.cpu_worker_results_by_id
+    cpu_worker_seconds_per_frame_ewma = scheduler_state.cpu_worker_seconds_per_frame_ewma
+    cpu_worker_predicted_load_by_id = scheduler_state.cpu_worker_predicted_load_by_id
+    cpu_worker_task_predicted_seconds_by_id = (
+        scheduler_state.cpu_worker_task_predicted_seconds_by_id
+    )
+    cpu_worker_ready_details_by_id = scheduler_state.cpu_worker_ready_details_by_id
+    gpu_worker_tasks_by_id = scheduler_state.gpu_worker_tasks_by_id
+    gpu_worker_dispatched_by_id = scheduler_state.gpu_worker_dispatched_by_id
+    gpu_worker_results_by_id = scheduler_state.gpu_worker_results_by_id
+    gpu_worker_compute_completed_by_id = scheduler_state.gpu_worker_compute_completed_by_id
+    gpu_worker_compute_released_task_ids = scheduler_state.gpu_worker_compute_released_task_ids
+    gpu_worker_seconds_per_frame_ewma = scheduler_state.gpu_worker_seconds_per_frame_ewma
+    gpu_worker_predicted_load_by_id = scheduler_state.gpu_worker_predicted_load_by_id
+    gpu_worker_task_predicted_seconds_by_id = (
+        scheduler_state.gpu_worker_task_predicted_seconds_by_id
+    )
+    gpu_worker_pending_task_ids = scheduler_state.gpu_worker_pending_task_ids
+    gpu_worker_tile_dense_result_reservations = (
+        scheduler_state.gpu_worker_tile_dense_result_reservations
+    )
+    gpu_worker_tile_dense_result_memfd_reservations = (
+        scheduler_state.gpu_worker_tile_dense_result_memfd_reservations
+    )
+    gpu_worker_tile_dense_result_reserved_at = (
+        scheduler_state.gpu_worker_tile_dense_result_reserved_at
+    )
+    gpu_worker_tile_dense_result_workspaces = (
+        scheduler_state.gpu_worker_tile_dense_result_workspaces
+    )
+    gpu_worker_tile_task_id_by_key = scheduler_state.gpu_worker_tile_task_id_by_key
+    gpu_worker_tile_pending_result_ids_by_task = (
+        scheduler_state.gpu_worker_tile_pending_result_ids_by_task
+    )
+    d1_owner_by_parent = scheduler_state.d1_owner_by_parent
+    d1_active_parent_by_worker = scheduler_state.d1_active_parent_by_worker
+    d1_layer_ref_by_parent = scheduler_state.d1_layer_ref_by_parent
+    d1_view_shadow_path_by_parent = scheduler_state.d1_view_shadow_path_by_parent
+    hybrid_view_mode_by_parent = scheduler_state.hybrid_view_mode_by_parent
+    fullframe_task_ids_by_parent = scheduler_state.fullframe_task_ids_by_parent
+    hybrid_cpu_reserved_parents = scheduler_state.hybrid_cpu_reserved_parents
+    hybrid_cpu_reserved_parent_set = scheduler_state.hybrid_cpu_reserved_parent_set
+    hybrid_cpu_reservation_rank_by_parent = (
+        scheduler_state.hybrid_cpu_reservation_rank_by_parent
+    )
+    gpu_worker_cpu_assist_inflight_task_ids = (
+        scheduler_state.gpu_worker_cpu_assist_inflight_task_ids
+    )
+    gpu_worker_cpu_assist_completed_task_ids = (
+        scheduler_state.gpu_worker_cpu_assist_completed_task_ids
+    )
+    hybrid_stealback_announced_parents = scheduler_state.hybrid_stealback_announced_parents
+    hybrid_cpu_idle_reason_counts = scheduler_state.hybrid_cpu_idle_reason_counts
+    hybrid_view_frames_by_backend = scheduler_state.hybrid_view_frames_by_backend
+    hybrid_view_tasks_by_backend = scheduler_state.hybrid_view_tasks_by_backend
 
     total_fullframe_jobs = sum(len(aug_jobs_by_view.get(view.name, [])) for view in inference_views)
     total_tile_prediction_jobs = sum(
@@ -2448,15 +2338,55 @@ def _main_impl() -> None:
             for tile_job in tile_jobs_by_aug.get((view.name, aug_job.aug_id), []):
                 pending_prediction_build_jobs.append(('tile', view, tile_job))
 
-    prediction_volume_futures: Dict[Future, Tuple[str, ViewInfo, object]] = {}
-    pending_prediction_volume_futures: set[Future] = set()
-    ready_fullframe: deque[Tuple[ViewInfo, AugJob, PredictionVolumeRef]] = deque()
-    # the ref is Optional because with several models only the first entry for a tile
-    # carries the source that was already built; the rest build their own at pop time.
-    ready_tile_infer: deque[Tuple[str, ViewInfo, DenseTileJob, Optional[PredictionVolumeRef]]] = deque()
+    prediction_sources = PredictionSourceCoordinator(
+        initial_build_jobs=pending_prediction_build_jobs,
+        prediction_volume_executor=prediction_volume_executor,
+        prediction_render_executor=prediction_render_executor,
+        prediction_volume_queue_slots=int(prediction_volume_queue_slots),
+        per_prediction_volume_workers=int(per_prediction_volume_workers),
+        eager_gpu_input_staging_ahead_sources=int(eager_gpu_input_staging_ahead_sources),
+        queued_streaming_cpu_warmup_sources=int(queued_streaming_cpu_warmup_sources),
+        gpu_worker_process_active=bool(gpu_worker_process_active),
+        cpu_worker_process_active=bool(cpu_worker_process_active),
+        temp_dir=temp_dir,
+        input_path=input_path,
+        canonical_images_stage_root=canonical_images_stage_root,
+        volume_rgb=volume_rgb,
+        channel_format=channel_format,
+        args=args,
+        pred_cfg=pred_cfg,
+        yolo_models=yolo_models,
+        keep_temp_artifacts=bool(keep_temp_artifacts),
+        get_view_frame_cache=_get_view_frame_cache,
+        operations=PredictionSourceOperations(
+            canonical_image_sink_type=CanonicalRenderImageSink,
+            write_aug_job_meta=write_aug_job_meta,
+            write_dense_tile_job_meta=write_dense_tile_job_meta,
+            build_fullframe_raster_plan=build_fullframe_raster_plan,
+            build_dense_tile_raster_plan=build_dense_tile_raster_plan,
+            streaming_source_workers=streaming_prediction_source_workers,
+            streaming_source_prefetch_frames=streaming_prediction_source_prefetch_frames,
+            streaming_source_autostart_enabled=streaming_prediction_source_autostart_enabled,
+            streaming_sources_enabled=streaming_prediction_sources_enabled,
+            make_fullframe_renderer=make_fullframe_channel_renderer,
+            make_dense_tile_renderer=make_dense_tile_channel_renderer,
+            streaming_source_type=StreamingYoloVolumeSource,
+            prediction_ref_type=PredictionVolumeRef,
+            materialize_fullframe=materialize_fullframe_prediction_volume_for_job,
+            materialize_dense_tile=materialize_dense_tile_prediction_volume_for_job,
+            prediction_ref_has_gpu_input_staging=_prediction_ref_has_gpu_input_staging,
+            eager_stage_prediction_ref=maybe_eager_stage_prediction_ref_on_gpu,
+            close_prediction_ref=close_prediction_volume_ref,
+        ),
+    )
+    pending_prediction_build_jobs = prediction_sources.pending_build_jobs
+    pending_prediction_volume_futures = (
+        prediction_sources.pending_prediction_volume_futures
+    )
+    ready_fullframe = prediction_sources.ready_fullframe
+    ready_tile_infer = prediction_sources.ready_tile_infer
     tile_inference_done: set[Tuple[str, str, str]] = set()
     prediction_accumulation_futures: Dict[Future, Dict[str, object]] = {}
-    streaming_cpu_warmup_started_refs: set[int] = set()
 
     view_processing_futures: Dict[Future, Tuple[str, str]] = {}
     view_processing_submitted: set[Tuple[str, str]] = set()
@@ -2491,282 +2421,19 @@ def _main_impl() -> None:
     tile_consolidation_submitted: set[Tuple[str, str, str]] = set()
     tile_consolidation_completed: set[Tuple[str, str, str]] = set()
     tile_parent_finalization_submitted: set[Tuple[str, str]] = set()
-    def _prediction_volume_queue_depth() -> int:
-        return int(len(pending_prediction_volume_futures) + len(ready_fullframe) + len(ready_tile_infer))
-
-    def _canonical_image_sink(
-        view: ViewInfo,
-        job: AugJob | DenseTileJob,
-        kind: str,
-        *,
-        model_name: str = 'shared',
-        backend: str = 'inprocess_cpu',
-    ) -> Optional[CanonicalRenderImageSink]:
-        if canonical_images_stage_root is None:
-            return None
-        tile_job = job if isinstance(job, DenseTileJob) else None
-        return CanonicalRenderImageSink(
-            stage_root=canonical_images_stage_root,
-            stem=input_path.stem,
-            model_name=str(model_name),
-            view_name=str(view.name),
-            kind=str(kind),
-            aug_id=str(job.aug_id),
-            channel_count=int(channel_format.channel_count),
-            config_id=(str(tile_job.config_id) if tile_job is not None else None),
-            tile_id=(str(tile_job.tile_id) if tile_job is not None else None),
-            backend=str(backend),
-        )
-
-    def _make_streaming_fullframe_ref(view: ViewInfo, aug_job: AugJob) -> PredictionVolumeRef:
-        write_aug_job_meta(aug_job, view, channel_format)
-        raster_plan = build_fullframe_raster_plan(view, aug_job, channel_format)
-        image_sink = _canonical_image_sink(view, aug_job, 'fullframe')
-        render_workers = streaming_prediction_source_workers(int(per_prediction_volume_workers), int(view.num_slices))
-        prefetch_frames = streaming_prediction_source_prefetch_frames(
-            max(1, int(max(args.gpu_batch if gpu_worker_process_active else 1, args.cpu_batch if cpu_worker_process_active else 1)))
-        )
-
-        renderer = make_fullframe_channel_renderer(
-            volume_rgb,
-            view,
-            aug_job,
-            channel_format=channel_format,
-            view_frames=_get_view_frame_cache(view),
-        )
-
-        name = f'Streaming full-frame prediction source {view.name}/{aug_job.aug_id}'
-        source = StreamingYoloVolumeSource(
-            renderer,
-            num_frames=int(view.num_slices),
-            name=name,
-            batch_size=max(1, int(args.batch)),
-            out_size=int(aug_job.aff.out_size),
-            render_workers=int(render_workers),
-            prefetch_frames=int(prefetch_frames),
-            autostart=bool(streaming_prediction_source_autostart_enabled()),
-            shared_executor=prediction_render_executor,
-            channel_format=channel_format,
-            view=view,
-            render_batch_sink=image_sink,
-            raster_plan=raster_plan,
-        )
-        return PredictionVolumeRef(
-            array=None,
-            path=None,
-            name=name,
-            view_name=str(view.name),
-            job_id=str(aug_job.aug_id),
-            kind='fullframe',
-            source=source,
-            channel_format=channel_format,
-            view=view,
-            render_batch_sink=image_sink,
-            raster_plan=raster_plan,
-        )
-
-    def _make_streaming_tile_ref(view: ViewInfo, tile_job: DenseTileJob) -> PredictionVolumeRef:
-        write_dense_tile_job_meta(tile_job, channel_format)
-        raster_plan = build_dense_tile_raster_plan(view, tile_job, channel_format)
-        image_sink = _canonical_image_sink(view, tile_job, 'tile')
-        render_workers = streaming_prediction_source_workers(int(per_prediction_volume_workers), int(view.num_slices))
-        prefetch_frames = streaming_prediction_source_prefetch_frames(max(1, int(args.batch)))
-
-        renderer = make_dense_tile_channel_renderer(
-            volume_rgb,
-            view,
-            tile_job,
-            channel_format=channel_format,
-            view_frames=_get_view_frame_cache(view),
-        )
-
-        name = f'Streaming tile prediction source {view.name}/{tile_job.tile_id}'
-        source = StreamingYoloVolumeSource(
-            renderer,
-            num_frames=int(view.num_slices),
-            name=name,
-            batch_size=max(1, int(args.batch)),
-            out_size=int(tile_job.out_size),
-            render_workers=int(render_workers),
-            prefetch_frames=int(prefetch_frames),
-            autostart=bool(streaming_prediction_source_autostart_enabled()),
-            shared_executor=prediction_render_executor,
-            channel_format=channel_format,
-            view=view,
-            render_batch_sink=image_sink,
-            raster_plan=raster_plan,
-        )
-        return PredictionVolumeRef(
-            array=None,
-            path=None,
-            name=name,
-            view_name=str(view.name),
-            job_id=str(tile_job.tile_id),
-            kind='tile',
-            source=source,
-            channel_format=channel_format,
-            view=view,
-            render_batch_sink=image_sink,
-            raster_plan=raster_plan,
-        )
-
-    def _submit_prediction_volume_build(kind: str, view: ViewInfo, job_obj: object) -> None:
-        if str(kind) == 'fullframe':
-            aug_job = job_obj
-            assert isinstance(aug_job, AugJob)
-            if streaming_prediction_sources_enabled():
-                fut = prediction_volume_executor.submit(_make_streaming_fullframe_ref, view, aug_job)
-            else:
-                out_path = temp_dir / 'prediction_volumes' / 'fullframe' / view.name / f'{view.name}_{aug_job.aug_id}.u8.dat'
-                fut = prediction_volume_executor.submit(
-                    materialize_fullframe_prediction_volume_for_job,
-                    volume_rgb,
-                    view,
-                    aug_job,
-                    out_path=out_path,
-                    view_frames=_get_view_frame_cache(view),
-                    workers=int(per_prediction_volume_workers),
-                    show_progress=False,
-                    channel_format=channel_format,
-                    render_batch_sink=_canonical_image_sink(view, aug_job, 'fullframe'),
-                )
-        elif str(kind) == 'tile':
-            tile_job = job_obj
-            assert isinstance(tile_job, DenseTileJob)
-            if streaming_prediction_sources_enabled():
-                fut = prediction_volume_executor.submit(_make_streaming_tile_ref, view, tile_job)
-            else:
-                out_path = temp_dir / 'prediction_volumes' / 'tiles' / view.name / str(tile_job.config_id) / f'{tile_job.tile_id}.u8.dat'
-                fut = prediction_volume_executor.submit(
-                    materialize_dense_tile_prediction_volume_for_job,
-                    volume_rgb,
-                    view,
-                    tile_job,
-                    out_path=out_path,
-                    view_frames=_get_view_frame_cache(view),
-                    workers=int(per_prediction_volume_workers),
-                    show_progress=False,
-                    channel_format=channel_format,
-                    render_batch_sink=_canonical_image_sink(view, tile_job, 'tile'),
-                )
-        else:  # pragma: no cover
-            raise ValueError(f'Unknown prediction volume build kind: {kind}')
-        prediction_volume_futures[fut] = (str(kind), view, job_obj)
-        pending_prediction_volume_futures.add(fut)
-
-    def _pump_prediction_volume_build_queue() -> None:
-        while pending_prediction_build_jobs and _prediction_volume_queue_depth() < int(prediction_volume_queue_slots):
-            kind, view, job_obj = pending_prediction_build_jobs.popleft()
-            _submit_prediction_volume_build(str(kind), view, job_obj)
-
-    def _queued_gpu_staging_ref_count() -> int:
-        seen: set[int] = set()
-        count = 0
-        for _view, _job, ref in list(ready_fullframe):
-            rid = id(ref)
-            if rid not in seen and _prediction_ref_has_gpu_input_staging(ref):
-                seen.add(rid)
-                count += 1
-        for _model_name, _view, _tile_job, ref in list(ready_tile_infer):
-            if ref is None:  # a queued tile whose source is not built yet
-                continue
-            rid = id(ref)
-            if rid not in seen and _prediction_ref_has_gpu_input_staging(ref):
-                seen.add(rid)
-                count += 1
-        return int(count)
-
-    def _maybe_eager_stage_prediction_ref(pred_ref: PredictionVolumeRef) -> PredictionVolumeRef:
-        if int(eager_gpu_input_staging_ahead_sources) <= 0:
-            return pred_ref
-        if _prediction_ref_has_gpu_input_staging(pred_ref):
-            return pred_ref
-        if _queued_gpu_staging_ref_count() >= int(eager_gpu_input_staging_ahead_sources):
-            return pred_ref
-        return maybe_eager_stage_prediction_ref_on_gpu(pred_ref, pred_cfg)
-
-    def _queued_cpu_warmup_ref_count() -> int:
-        seen: set[int] = set()
-        count = 0
-        for _view, _job, ref in list(ready_fullframe):
-            rid = id(ref)
-            if rid in seen:
-                continue
-            if rid in streaming_cpu_warmup_started_refs or _prediction_ref_has_gpu_input_staging(ref):
-                seen.add(rid)
-                count += 1
-        for _model_name, _view, _tile_job, ref in list(ready_tile_infer):
-            if ref is None:  # a queued tile whose source is not built yet
-                continue
-            rid = id(ref)
-            if rid in seen:
-                continue
-            if rid in streaming_cpu_warmup_started_refs or _prediction_ref_has_gpu_input_staging(ref):
-                seen.add(rid)
-                count += 1
-        return int(count)
-
-    def _maybe_start_cpu_warmup_prediction_ref(pred_ref: PredictionVolumeRef) -> None:
-        if int(queued_streaming_cpu_warmup_sources) <= 0:
-            return
-        if _prediction_ref_has_gpu_input_staging(pred_ref):
-            return
-        rid = id(pred_ref)
-        if rid in streaming_cpu_warmup_started_refs:
-            return
-        if _queued_cpu_warmup_ref_count() >= int(queued_streaming_cpu_warmup_sources):
-            return
-        source = getattr(pred_ref, 'source', None)
-        start_fn = getattr(source, 'start', None)
-        if not callable(start_fn):
-            return
-        try:
-            start_fn()
-            streaming_cpu_warmup_started_refs.add(rid)
-        except Exception as exc:
-            print(f'Warning: queued CPU render warmup could not start for {pred_ref.name} ({exc}); source will start on demand.')
-
-    def _warmup_ready_prediction_sources() -> None:
-        if int(queued_streaming_cpu_warmup_sources) <= 0:
-            return
-        for _view, _job, ref in list(ready_fullframe):
-            _maybe_start_cpu_warmup_prediction_ref(ref)
-            if _queued_cpu_warmup_ref_count() >= int(queued_streaming_cpu_warmup_sources):
-                return
-        for _model_name, _view, _tile_job, ref in list(ready_tile_infer):
-            if ref is None:  # a queued tile whose source is not built yet
-                continue
-            _maybe_start_cpu_warmup_prediction_ref(ref)
-            if _queued_cpu_warmup_ref_count() >= int(queued_streaming_cpu_warmup_sources):
-                return
-
-    def _drain_completed_prediction_volume_futures() -> None:
-        for fut in list(pending_prediction_volume_futures):
-            if not fut.done():
-                continue
-            pending_prediction_volume_futures.remove(fut)
-            kind, view, job_obj = prediction_volume_futures.pop(fut)
-            pred_ref = _maybe_eager_stage_prediction_ref(fut.result())
-            if str(kind) == 'fullframe':
-                assert isinstance(job_obj, AugJob)
-                ready_fullframe.append((view, job_obj, pred_ref))
-            else:
-                assert isinstance(job_obj, DenseTileJob)
-                # StreamingYoloVolumeSource is single-use — __next__ closes it on
-                # exhaustion and start then raises — and the in-process tile path also
-                # closes the ref in its finally. Queueing the SAME ref once per model
-                # therefore handed every model after the first a closed source. Each model
-                # now gets its own, built lazily at pop time so N models do not spin up N
-                # prefetch pipelines for a tile that is still sitting in the queue.
-                tile_model_names = [str(name) for name, _ in yolo_models]
-                for position, model_name in enumerate(tile_model_names):
-                    ready_tile_infer.append(
-                        (str(model_name), view, job_obj, pred_ref if position == 0 else None)
-                    )
-                if not tile_model_names:
-                    close_prediction_volume_ref(pred_ref, keep_temp=bool(keep_temp_artifacts))
-        _pump_prediction_volume_build_queue()
-        _warmup_ready_prediction_sources()
+    _make_streaming_tile_ref = prediction_sources.make_streaming_tile_ref
+    _pump_prediction_volume_build_queue = (
+        prediction_sources.pump_prediction_volume_build_queue
+    )
+    _maybe_eager_stage_prediction_ref = (
+        prediction_sources.maybe_eager_stage_prediction_ref
+    )
+    _warmup_ready_prediction_sources = (
+        prediction_sources.warmup_ready_prediction_sources
+    )
+    _drain_completed_prediction_volume_futures = (
+        prediction_sources.drain_completed_prediction_volume_futures
+    )
 
     def _ensure_baseline_workspaces(model_name: str, view: ViewInfo) -> None:
         key = (str(model_name), str(view.name))
@@ -4441,7 +4108,7 @@ def _main_impl() -> None:
             f'{sum(direct_union_postprocess_bytes.values()) / GIB:.1f}GiB, '
             f'tile_dense_results={len(gpu_worker_tile_dense_result_reservations)}/'
             f'{gpu_worker_tile_dense_result_task_limit} task(s), '
-            f'{gpu_worker_tile_dense_result_bytes_reserved / GIB:.1f}/'
+            f'{scheduler_state.gpu_worker_tile_dense_result_bytes_reserved / GIB:.1f}/'
             f'{gpu_worker_tile_dense_result_limit / GIB:.1f}GiB, '
             f'tile_cleanup={len(tile_cleanup_futures)}, '
             f'tile_parent_gate={len(tile_parent_gate_futures)}, '
@@ -4456,36 +4123,9 @@ def _main_impl() -> None:
     #
     # Process-per-GPU scheduler. This path is active for every CUDA run, including one GPU.
     #
-    gpu_worker_processes: List[object] = []
-    cpu_worker_processes: List[object] = []
+    gpu_worker_processes = scheduler_state.gpu_worker_processes
+    cpu_worker_processes = scheduler_state.cpu_worker_processes
     _reset_main_process_gpu_stage_coordinator()
-    gpu_task_queues: Dict[int, object] = {}
-    cpu_task_queues: Dict[int, object] = {}
-    cpu_worker_dispatched_by_id: Dict[int, int] = {}
-    cpu_worker_results_by_id: Dict[int, int] = {}
-    cpu_worker_seconds_per_frame_ewma: Dict[Tuple[object, ...], float] = {}
-    cpu_worker_predicted_load_by_id: Dict[int, float] = {}
-    cpu_worker_task_predicted_seconds_by_id: Dict[int, float] = {}
-    cpu_worker_ready_details_by_id: Dict[int, Dict[str, object]] = {}
-    cpu_worker_dispatch_cursor = 0
-    gpu_result_queue: object = None
-    gpu_worker_tasks_by_id: Dict[int, Dict[str, object]] = {}
-    gpu_worker_results_collected = 0
-    gpu_worker_total_tasks = 0
-    gpu_worker_dispatched_tasks = 0
-    gpu_worker_dispatched_by_id: Dict[int, int] = {}
-    gpu_worker_results_by_id: Dict[int, int] = {}
-    # Compute credits are released as soon as render/TRT/post kernels have handed the
-    # task to an asynchronous retirement lane. Final result publication is tracked
-    # independently so D2H/cvol bookkeeping cannot starve the next GPU lease.
-    gpu_worker_compute_completed_by_id: Dict[int, int] = {}
-    gpu_worker_compute_released_task_ids: set[int] = set()
-    gpu_worker_seconds_per_frame_ewma: Dict[Tuple[object, ...], float] = {}
-    gpu_worker_predicted_load_by_id: Dict[int, float] = {}
-    gpu_worker_task_predicted_seconds_by_id: Dict[int, float] = {}
-    gpu_worker_dispatch_cursor = 0
-    gpu_worker_next_dynamic_task_id = 0
-    gpu_worker_pending_task_ids: deque = deque()
     gpu_worker_result_dir = temp_dir / 'gpu_worker_results'
     if not bool(keep_temp_artifacts) and gpu_worker_result_dir.exists():
         # Worker-result files are never resumable inputs. Remove leftovers from an interrupted
@@ -4521,1660 +4161,147 @@ def _main_impl() -> None:
             int(gpu_worker_tile_dense_result_limit),
             int(gpu_worker_tile_dense_result_memory_safe_limit),
         )
-    gpu_worker_tile_dense_result_bytes_reserved = 0
-    gpu_worker_tile_dense_result_memfd_bytes_reserved = 0
-    gpu_worker_tile_dense_result_max_retention_seconds = 0.0
-    gpu_worker_tile_dense_result_reservations: Dict[int, int] = {}
-    gpu_worker_tile_dense_result_memfd_reservations: Dict[int, int] = {}
-    gpu_worker_tile_dense_result_reserved_at: Dict[int, float] = {}
-    gpu_worker_tile_dense_result_workspaces: Dict[
-        int, Tuple[Optional[np.ndarray], Optional[np.ndarray]]
-    ] = {}
-    gpu_worker_tile_task_id_by_key: Dict[Tuple[str, str, str], int] = {}
-    gpu_worker_tile_pending_result_ids_by_task: Dict[int, set[str]] = {}
-    gpu_inference_drained_at: Optional[float] = None
-    gpu_inference_drain_announced = False
-    # D1 source-space bitsets are deliberately view-owned. One worker may own exactly one
-    # unfinished view at a time; completed views release this compute ownership before their
-    # path-backed cvol publication finishes on the worker's CPU publication pool.
-    d1_owner_by_parent: Dict[Tuple[str, str], int] = {}
-    d1_active_parent_by_worker: Dict[int, Tuple[str, str]] = {}
-    d1_layer_ref_by_parent: Dict[Tuple[str, str], NrrdLayerRef] = {}
-    d1_view_shadow_path_by_parent: Dict[Tuple[str, str], Path] = {}
-    # Hybrid full-frame views are committed as a whole. A bounded, ordered parent list is
-    # reserved for sequential OpenVINO direct-union ownership; every other CPU-compatible
-    # parent remains immediately available to CUDA D1. Only the active CPU parent may be
-    # assisted by CUDA, and the next reserved parent can open after the prior one drains.
-    hybrid_view_mode_by_parent: Dict[Tuple[str, str], str] = {}
-    fullframe_task_ids_by_parent: Dict[Tuple[str, str], List[int]] = {}
-    hybrid_cpu_reserved_parents: List[Tuple[str, str]] = []
-    hybrid_cpu_reserved_parent_set: set[Tuple[str, str]] = set()
-    hybrid_cpu_reservation_rank_by_parent: Dict[Tuple[str, str], int] = {}
-    gpu_worker_cpu_assist_inflight_task_ids: set[int] = set()
-    gpu_worker_cpu_assist_completed_task_ids: set[int] = set()
-    hybrid_stealback_announced_parents: set[Tuple[str, str]] = set()
-    hybrid_cpu_idle_reason_counts: Counter[str] = Counter()
-    hybrid_cpu_idle_reason_last = ''
-    hybrid_cpu_idle_active = False
-    hybrid_cpu_idle_since: Optional[float] = None
-    gpu_frames_completed_total = 0
-    cpu_frames_completed_total = 0
-    hybrid_gpu_frames_completed_total = 0
-    hybrid_cpu_frames_completed_total = 0
-    hybrid_view_frames_by_backend: Dict[Tuple[str, str], Counter[str]] = {}
-    hybrid_view_tasks_by_backend: Dict[Tuple[str, str], Counter[str]] = {}
-    gpu_worker_seed_task_count = 0
 
-    def _tile_task_radial_padding_count(task: Dict[str, object]) -> int:
-        if str(task.get('kind', '')) != 'tile':
-            return 0
-        view_obj = task.get('view')
-        if not isinstance(view_obj, ViewInfo):
-            return 0
-        return radial_batch_padding_count(
-            view_obj,
-            int(task.get('slice_count', view_obj.num_slices)),
-            max(1, int(task.get('prediction_batch', args.batch))),
-            slice_offset=int(task.get('slice_start', 0)),
-        )
-
-    def _tile_dense_result_task_bytes(task: Dict[str, object]) -> int:
-        if str(task.get('kind', '')) != 'tile':
-            return 0
-        shape = tuple(int(v) for v in task.get('processing_shape', ()))
-        if len(shape) != 3:
-            return 0
-        planes = 2 if task.get('result_conf_path') else 1
-        main_bytes = int(array_nbytes(shape, np.uint8)) * int(planes)
-        padding_count = int(_tile_task_radial_padding_count(task))
-        if padding_count <= 0:
-            return int(main_bytes)
-        view_obj = task.get('view')
-        assert isinstance(view_obj, ViewInfo)
-        group_count = len(radial_batch_padding_mirror_groups(
-            view_obj,
-            int(task.get('slice_count', view_obj.num_slices)),
-            max(1, int(task.get('prediction_batch', args.batch))),
-            slice_offset=int(task.get('slice_start', 0)),
-        ))
-        plane_bytes = int(shape[1]) * int(shape[2]) * int(np.dtype(np.uint8).itemsize)
-        compact_padding_bytes = int(padding_count) * int(plane_bytes) * int(planes)
-        grouped_result_bytes = int(group_count) * int(main_bytes)
-        return int(main_bytes + compact_padding_bytes + grouped_result_bytes)
-
-    def _tile_dense_result_task_admissible(task: Dict[str, object]) -> bool:
-        if bool(keep_temp_artifacts) or str(task.get('kind', '')) != 'tile':
-            return True
-        task_id = int(task.get('task_id', -1))
-        if task_id in gpu_worker_tile_dense_result_reservations:
-            return True
-        need = int(_tile_dense_result_task_bytes(task))
-        if need <= 0:
-            return True
-        # Always admit one oversized tile when the live set is empty; otherwise a valid
-        # geometry whose crop exceeds the configured budget could deadlock forever.
-        if not gpu_worker_tile_dense_result_reservations:
-            return True
-        if len(gpu_worker_tile_dense_result_reservations) >= int(
-            gpu_worker_tile_dense_result_task_limit
-        ):
-            return False
-        return bool(
-            int(gpu_worker_tile_dense_result_bytes_reserved) + int(need)
-            <= int(gpu_worker_tile_dense_result_limit)
-        )
-
-    def _tile_parent_mask_ready_for_task(task: Dict[str, object]) -> bool:
-        if str(task.get('kind', '')) != 'tile':
-            return False
-        view_obj = task.get('view')
-        view_name = getattr(view_obj, 'name', None)
-        if view_name is None:
-            return False
-        return str(view_name) in parent_mask_support_by_model.get(
-            str(task.get('model_name', '')), {}
-        )
-
-    def _inference_storage_priority_rank(task: Dict[str, object]) -> int:
-        """Prefer parent work, then immediately gateable tiles, then early tiles."""
-        if str(task.get('kind', '')) != 'tile':
-            return 0
-        return 1 if _tile_parent_mask_ready_for_task(task) else 2
-
-    def _reserve_tile_dense_result_task(task: Dict[str, object]) -> bool:
-        nonlocal gpu_worker_tile_dense_result_bytes_reserved
-        if bool(keep_temp_artifacts) or str(task.get('kind', '')) != 'tile':
-            return False
-        task_id = int(task.get('task_id', -1))
-        if task_id < 0 or task_id in gpu_worker_tile_dense_result_reservations:
-            return False
-        if not _tile_dense_result_task_admissible(task):
-            raise RuntimeError(
-                f'array-backed tile-result admission raced its {gpu_worker_tile_dense_result_limit / GIB:.1f} GiB budget'
-            )
-        need = int(_tile_dense_result_task_bytes(task))
-        gpu_worker_tile_dense_result_reservations[task_id] = int(need)
-        gpu_worker_tile_dense_result_reserved_at[task_id] = float(time.monotonic())
-        gpu_worker_tile_dense_result_bytes_reserved += int(need)
-        runtime_telemetry().gauge(
-            'tile.dense_worker_result_bytes_reserved',
-            int(gpu_worker_tile_dense_result_bytes_reserved),
-        )
-        runtime_telemetry().gauge(
-            'tile.dense_worker_result_tasks_reserved',
-            int(len(gpu_worker_tile_dense_result_reservations)),
-        )
-        return True
-
-    def _prepare_tile_dense_result_workspaces(task: Dict[str, object]) -> None:
-        """Allocate one task's array-backed tile result in shared RAM when possible.
-
-        The parent owns each mapping and transfers duplicate memfd descriptors to the selected
-        CUDA worker. Pathname files remain a bounded fallback when cgroup/RAM headroom is too
-        small. A logical memfd reservation ledger covers not-yet-faulted pages, preventing a
-        burst of dispatches from all passing the same stale memory-headroom snapshot. Holding
-        the parent mapping until sparse retirement also prevents asynchronous D2H publication
-        from outliving its backing object.
-        """
-        nonlocal gpu_worker_tile_dense_result_memfd_bytes_reserved
-        if bool(keep_temp_artifacts) or str(task.get('kind', '')) != 'tile':
-            return
-        task_id = int(task.get('task_id', -1))
-        if task_id < 0:
-            raise ValueError('tile result workspace requires a nonnegative task_id')
-        if task_id in gpu_worker_tile_dense_result_workspaces:
-            return
-        shape = tuple(int(v) for v in task.get('processing_shape', ()))
-        if len(shape) != 3:
-            raise ValueError(f'tile task {task_id} has invalid processing_shape={shape}')
-        task.setdefault('result_mask_fallback_path', str(task['result_mask_path']))
-        task.setdefault('result_conf_fallback_path', task.get('result_conf_path'))
-        original_mask_path = Path(str(task['result_mask_fallback_path']))
-        original_conf_path = (
-            Path(str(task['result_conf_fallback_path']))
-            if task.get('result_conf_fallback_path') else None
-        )
-        mask_mm: Optional[np.ndarray] = None
-        conf_mm: Optional[np.ndarray] = None
-        total_need = int(_tile_dense_result_task_bytes(task))
-        anon_cap = int(workspace_anon_cap_bytes())
-        projected_memfd = int(gpu_worker_tile_dense_result_memfd_bytes_reserved) + int(total_need)
-        prefer_shared_memfd = bool(
-            memfd_workspace_enabled()
-            and int(available_anon_work_bytes()) >= int(projected_memfd) + 16 * GIB
-            and (int(anon_cap) <= 0 or int(projected_memfd) <= int(anon_cap))
-        )
-        try:
-            mask_mm = allocate_workspace_array(
-                shape=shape,
-                dtype=np.uint8,
-                path=original_mask_path,
-                desc=f'GPU-worker tile result mask task {task_id}',
-                prefer_memory=False,
-                prefer_memfd=bool(prefer_shared_memfd),
-                reserve_bytes=16 * GIB,
-                initialize_zero=True,
-            )
-            mask_backing = _memmap_backing_path(mask_mm)
-            if mask_backing is None:
-                raise RuntimeError(f'tile task {task_id} mask workspace has no reopenable backing')
-            task['result_mask_path'] = str(mask_backing)
-
-            if original_conf_path is not None:
-                conf_mm = allocate_workspace_array(
-                    shape=shape,
-                    dtype=np.uint8,
-                    path=original_conf_path,
-                    desc=f'GPU-worker tile result confidence task {task_id}',
-                    prefer_memory=False,
-                    prefer_memfd=bool(prefer_shared_memfd),
-                    reserve_bytes=16 * GIB,
-                    initialize_zero=True,
-                )
-                conf_backing = _memmap_backing_path(conf_mm)
-                if conf_backing is None:
-                    raise RuntimeError(
-                        f'tile task {task_id} confidence workspace has no reopenable backing'
-                    )
-                task['result_conf_path'] = str(conf_backing)
-
-            task['result_workspace_preallocated'] = True
-            gpu_worker_tile_dense_result_workspaces[task_id] = (mask_mm, conf_mm)
-            actual_memfd_bytes = sum(
-                int(np.asarray(mm).nbytes)
-                for mm in (mask_mm, conf_mm)
-                if mm is not None and _memfd_owner_key_from_array(mm) is not None
-            )
-            if int(actual_memfd_bytes) > 0:
-                gpu_worker_tile_dense_result_memfd_reservations[task_id] = int(actual_memfd_bytes)
-                gpu_worker_tile_dense_result_memfd_bytes_reserved += int(actual_memfd_bytes)
-                runtime_telemetry().add(
-                    'tile.dense_worker_result_memfd_bytes', int(actual_memfd_bytes),
-                )
-                runtime_telemetry().gauge(
-                    'tile.dense_worker_result_memfd_bytes_reserved',
-                    int(gpu_worker_tile_dense_result_memfd_bytes_reserved),
-                )
-            path_bytes = max(0, int(total_need) - int(actual_memfd_bytes))
-            if int(path_bytes) > 0:
-                runtime_telemetry().add(
-                    'tile.dense_worker_result_path_fallback_bytes', int(path_bytes),
-                )
-        except BaseException:
-            task['result_mask_path'] = str(original_mask_path)
-            task['result_conf_path'] = (
-                str(original_conf_path) if original_conf_path is not None else None
-            )
-            task.pop('result_workspace_preallocated', None)
-            for mm in (conf_mm, mask_mm):
-                if mm is None:
-                    continue
-                backing = _memmap_backing_path(mm)
-                is_memfd = _memfd_owner_key_from_array(mm) is not None
-                try:
-                    close_memmap_array_without_flush(mm)
-                except Exception:
-                    pass
-                if not is_memfd and backing is not None:
-                    try:
-                        Path(backing).unlink(missing_ok=True)
-                    except Exception:
-                        pass
-            raise
-
-    def _release_tile_dense_result_task_id(
-        task_id: int, *, reason: str = '', refill: bool = True,
-    ) -> bool:
-        nonlocal gpu_worker_tile_dense_result_bytes_reserved
-        nonlocal gpu_worker_tile_dense_result_memfd_bytes_reserved
-        nonlocal gpu_worker_tile_dense_result_max_retention_seconds
-        task_id_i = int(task_id)
-        gpu_worker_tile_pending_result_ids_by_task.pop(task_id_i, None)
-        for result_key, mapped_task_id in list(gpu_worker_tile_task_id_by_key.items()):
-            if int(mapped_task_id) == int(task_id_i):
-                gpu_worker_tile_task_id_by_key.pop(result_key, None)
-        released = gpu_worker_tile_dense_result_reservations.pop(task_id_i, None)
-        released_memfd = gpu_worker_tile_dense_result_memfd_reservations.pop(task_id_i, None)
-        reserved_at = gpu_worker_tile_dense_result_reserved_at.pop(task_id_i, None)
-        workspaces = gpu_worker_tile_dense_result_workspaces.pop(task_id_i, None)
-        task_obj = gpu_worker_tasks_by_id.get(task_id_i)
-        cleanup_paths: set[Path] = set()
-        if isinstance(task_obj, dict):
-            for field_name in (
-                'result_mask_path', 'result_conf_path',
-                'result_mask_fallback_path', 'result_conf_fallback_path',
-            ):
-                raw_path = task_obj.get(field_name)
-                if raw_path:
-                    try:
-                        cleanup_paths.add(Path(str(raw_path)))
-                    except Exception:
-                        pass
-        if workspaces is not None:
-            for mm in workspaces:
-                if mm is None:
-                    continue
-                backing = _memmap_backing_path(mm)
-                if backing is not None:
-                    cleanup_paths.add(Path(backing))
-                is_memfd = _memfd_owner_key_from_array(mm) is not None
-                try:
-                    close_memmap_array_without_flush(mm)
-                except Exception:
-                    pass
-                if not is_memfd and not bool(keep_temp_artifacts) and backing is not None:
-                    try:
-                        Path(backing).unlink(missing_ok=True)
-                    except Exception:
-                        pass
-        if not bool(keep_temp_artifacts):
-            # Also remove a fallback pathname that may have been created before a memfd
-            # handoff or survived a worker-side error. The guard keeps cleanup confined to
-            # this run's non-resumable GPU result directory.
-            for cleanup_path in cleanup_paths:
-                try:
-                    if (
-                        cleanup_path.suffix.lower() == '.dat'
-                        and _path_is_relative_to(cleanup_path, gpu_worker_result_dir)
-                    ):
-                        cleanup_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
-        if isinstance(task_obj, dict):
-            if task_obj.get('result_mask_fallback_path') is not None:
-                task_obj['result_mask_path'] = task_obj.get('result_mask_fallback_path')
-            task_obj['result_conf_path'] = task_obj.get('result_conf_fallback_path')
-            task_obj.pop('result_workspace_preallocated', None)
-        if released_memfd is not None:
-            gpu_worker_tile_dense_result_memfd_bytes_reserved = max(
-                0,
-                int(gpu_worker_tile_dense_result_memfd_bytes_reserved) - int(released_memfd),
-            )
-            runtime_telemetry().gauge(
-                'tile.dense_worker_result_memfd_bytes_reserved',
-                int(gpu_worker_tile_dense_result_memfd_bytes_reserved),
-            )
-        if (
-            released is None
-            and released_memfd is None
-            and reserved_at is None
-            and workspaces is None
-        ):
-            return False
-        if reserved_at is not None:
-            retention_seconds = max(0.0, float(time.monotonic()) - float(reserved_at))
-            gpu_worker_tile_dense_result_max_retention_seconds = max(
-                float(gpu_worker_tile_dense_result_max_retention_seconds),
-                float(retention_seconds),
-            )
-            runtime_telemetry().add(
-                'tile.dense_worker_result_retention_seconds_total',
-                float(retention_seconds),
-            )
-            runtime_telemetry().add('tile.dense_worker_result_retirements', 1)
-            runtime_telemetry().gauge(
-                'tile.dense_worker_result_last_retention_seconds',
-                float(retention_seconds),
-            )
-            runtime_telemetry().gauge(
-                'tile.dense_worker_result_max_retention_seconds',
-                float(gpu_worker_tile_dense_result_max_retention_seconds),
-            )
-            if reason:
-                runtime_telemetry().add(
-                    f'tile.dense_worker_result_retired_reason.'
-                    f'{_sanitize_filesystem_token(reason)}',
-                    1,
-                )
-            warn_seconds = float(tile_dense_worker_result_warn_seconds())
-            if warn_seconds > 0.0 and retention_seconds >= warn_seconds:
-                print(
-                    f'Warning: array-backed tile worker result task {task_id_i} remained live for '
-                    f'{retention_seconds:.1f}s before {reason or "retirement"}; '
-                    'the backing has now been closed and deleted. '
-                    'YOLO_TTA_TILE_DENSE_RESULT_WARN_SECONDS adjusts this diagnostic.'
-                )
-        if released is not None:
-            gpu_worker_tile_dense_result_bytes_reserved = max(
-                0, int(gpu_worker_tile_dense_result_bytes_reserved) - int(released),
-            )
-            runtime_telemetry().add('tile.dense_worker_result_bytes_retired', int(released))
-            runtime_telemetry().gauge(
-                'tile.dense_worker_result_bytes_reserved',
-                int(gpu_worker_tile_dense_result_bytes_reserved),
-            )
-            runtime_telemetry().gauge(
-                'tile.dense_worker_result_tasks_reserved',
-                int(len(gpu_worker_tile_dense_result_reservations)),
-            )
-        if bool(refill) and gpu_worker_pending_task_ids:
-            _dispatch_inference_windows()
-        return True
-
-    def _release_tile_dense_result_for_key(
-        model_name_s: str, view_name_s: str, tile_id_s: str, *, reason: str = '',
-    ) -> bool:
-        key = (str(model_name_s), str(view_name_s), str(tile_id_s))
-        task_id = gpu_worker_tile_task_id_by_key.get(key)
-        if task_id is None:
-            return False
-        pending_ids = gpu_worker_tile_pending_result_ids_by_task.get(int(task_id))
-        if pending_ids is not None:
-            pending_ids.discard(str(tile_id_s))
-            gpu_worker_tile_task_id_by_key.pop(key, None)
-            if pending_ids:
-                return False
-            gpu_worker_tile_pending_result_ids_by_task.pop(int(task_id), None)
-        did_release = _release_tile_dense_result_task_id(
-            int(task_id), reason=str(reason), refill=True,
-        )
-        return bool(did_release)
-
-    def _gpu_worker_task_seconds(task: Dict[str, object]) -> float:
-        view_obj = task.get('view')
-        count = max(1, int(task.get('slice_count', 1)))
-        key = gpu_worker_task_cost_key(task)
-        sec_per_frame = gpu_worker_seconds_per_frame_ewma.get(key)
-        if sec_per_frame is None:
-            sec_per_frame = (
-                gpu_worker_default_seconds_per_frame(view_obj)
-                if isinstance(view_obj, ViewInfo) else 0.05
-            )
-        return max(1e-4, float(sec_per_frame) * float(count))
-
-    def _update_gpu_worker_cost(task: Dict[str, object], stats: Dict[str, object]) -> None:
-        elapsed = float(stats.get('worker_compute_seconds', 0.0) or 0.0)
-        count = max(1, int(task.get('slice_count', 1)))
-        units = max(1, int(count))
-        if elapsed <= 0.0:
-            return
-        observed = max(1e-5, float(elapsed) / float(units))
-        key = gpu_worker_task_cost_key(task)
-        prior = gpu_worker_seconds_per_frame_ewma.get(key)
-        alpha = min(0.8, max(0.05, _env_float('YOLO_TTA_GPU_WORKER_COST_EWMA_ALPHA', 0.30)))
-        gpu_worker_seconds_per_frame_ewma[key] = (
-            observed if prior is None else (1.0 - alpha) * float(prior) + alpha * observed
-        )
-
-    def _split_gpu_worker_task_to_runtime_target(task_id: int) -> int:
-        """Repeatedly split the selected full-frame lease to the current measured target."""
-        nonlocal gpu_worker_total_tasks, gpu_worker_next_dynamic_task_id
-        current_id = int(task_id)
-        task = gpu_worker_tasks_by_id[current_id]
-        if str(task.get('kind', '')) != 'fullframe' or bool(task.get('disable_runtime_split', False)):
-            return current_id
-        min_slices = max(1, int(gpu_worker_min_lease_slices()))
-        align = max(1, int(args.gpu_batch))
-        while True:
-            count = int(task.get('slice_count', 0))
-            if count < 2 * min_slices:
-                break
-            view_obj = task.get('view')
-            key = gpu_worker_task_cost_key(task)
-            sec_per_frame = gpu_worker_seconds_per_frame_ewma.get(key)
-            if sec_per_frame is None:
-                sec_per_frame = (
-                    gpu_worker_default_seconds_per_frame(view_obj)
-                    if isinstance(view_obj, ViewInfo) else 0.05
-                )
-            target_count = int(round(gpu_worker_target_lease_seconds() / max(1e-5, float(sec_per_frame))))
-            target_count = max(min_slices, min(gpu_worker_max_lease_slices(), target_count))
-            target_count = max(align, (int(target_count) // align) * align)
-            if count <= max(2 * min_slices - 1, int(math.ceil(target_count * 1.25))):
-                break
-            start = int(task.get('slice_start', 0))
-            stop = int(start + count)
-            midpoint = min(stop - min_slices, start + max(min_slices, target_count))
-            midpoint = start + ((midpoint - start) // align) * align
-            if midpoint <= start or stop - midpoint < min_slices:
-                break
-            child_id = int(gpu_worker_next_dynamic_task_id)
-            gpu_worker_next_dynamic_task_id += 1
-            child = dict(task)
-            task['slice_count'] = int(midpoint - start)
-            task['render_workers'] = max(1, min(int(task.get('render_workers', 1)), int(midpoint - start)))
-            child['task_id'] = child_id
-            child['slice_start'] = int(midpoint)
-            child['slice_count'] = int(stop - midpoint)
-            child['render_workers'] = max(1, min(int(child.get('render_workers', 1)), int(stop - midpoint)))
-            child['runtime_split_parent_task_id'] = current_id
-            task['runtime_split_child_task_id'] = child_id
-            if str(child.get('result_mode', 'file')) != 'direct_union':
-                for field_name in ('result_mask_path', 'result_conf_path'):
-                    raw_path = child.get(field_name)
-                    if raw_path:
-                        path_obj = Path(str(raw_path))
-                        child[field_name] = str(path_obj.with_name(f'{path_obj.name}.rt{child_id}'))
-            gpu_worker_tasks_by_id[child_id] = child
-            gpu_worker_pending_task_ids.append(child_id)
-            gpu_worker_total_tasks += 1
-            parent_key = _gpu_worker_fullframe_parent_key(task)
-            if parent_key is not None:
-                fullframe_remaining[parent_key] = int(fullframe_remaining.get(parent_key, 0)) + 1
-                fullframe_task_ids_by_parent.setdefault(parent_key, []).append(int(child_id))
-            runtime_telemetry().add('scheduler.runtime_lease_splits', 1)
-            # The selected front lease is now target-sized; leave the remainder central so
-            # C3 can place it on the least-loaded eligible worker/owner.
-            break
-        return current_id
-
-    def _gpu_worker_fullframe_parent_key(task: Dict[str, object]) -> Optional[Tuple[str, str]]:
-        if str(task.get('kind', '')) != 'fullframe':
-            return None
-        view_obj = task.get('view')
-        view_name = getattr(view_obj, 'name', None)
-        if view_name is None:
-            return None
-        return (str(task.get('model_name', '')), str(view_name))
-
-    def _hybrid_task_parent_key(
-        task: Dict[str, object],
-    ) -> Optional[Tuple[str, str]]:
-        if not bool(task.get('hybrid_cpu_eligible_origin', False)):
-            return None
-        return _gpu_worker_fullframe_parent_key(task)
-
-    def _hybrid_parent_state(parent: Optional[Tuple[str, str]]) -> str:
-        if parent is None:
-            return 'not_hybrid'
-        return str(hybrid_view_mode_by_parent.get(parent, 'unclaimed'))
-
-    def _active_cpu_shared_parent() -> Optional[Tuple[str, str]]:
-        active = [
-            parent for parent, mode in hybrid_view_mode_by_parent.items()
-            if str(mode) == 'direct_union'
-            and int(fullframe_remaining.get(parent, 0)) > 0
-        ]
-        if len(active) > 1:
-            raise RuntimeError(
-                f'hybrid scheduler opened more than one CPU direct-union view: {active}'
-            )
-        return active[0] if active else None
-
-    def _hybrid_parent_is_cpu_reserved(
-        parent: Optional[Tuple[str, str]],
-    ) -> bool:
-        return bool(parent is not None and parent in hybrid_cpu_reserved_parent_set)
-
-    def _next_cpu_reserved_parent() -> Optional[Tuple[str, str]]:
-        """Return the first unfinished reserved parent that OpenVINO may still own."""
-        active = _active_cpu_shared_parent()
-        if active is not None:
-            return active
-        for parent in hybrid_cpu_reserved_parents:
-            if int(fullframe_remaining.get(parent, 0)) <= 0:
-                continue
-            state = _hybrid_parent_state(parent)
-            if state in {'unclaimed', 'direct_union'}:
-                return parent
-        return None
-
-    def _hybrid_task_is_active_cpu_assist(
-        task: Dict[str, object],
-        active_parent: Optional[Tuple[str, str]] = None,
-    ) -> bool:
-        parent = _hybrid_task_parent_key(task)
-        active = _active_cpu_shared_parent() if active_parent is None else active_parent
-        return bool(
-            parent is not None
-            and active is not None
-            and parent == active
-            and str(task.get('result_mode', 'file')) == 'direct_union'
-        )
-
-    def _hybrid_task_is_gpu_mandatory(task: Dict[str, object]) -> bool:
-        """True for ordinary GPU work and unreserved hybrid views assigned to CUDA D1."""
-        parent = _hybrid_task_parent_key(task)
-        if parent is None:
-            return True
-        state = _hybrid_parent_state(parent)
-        if state == 'd1_owner':
-            return True
-        if state == 'direct_union':
-            return False
-        if state == 'unclaimed':
-            return not _hybrid_parent_is_cpu_reserved(parent)
-        return True
-
-    def _set_hybrid_cpu_idle_reason(reason: str) -> None:
-        """Record OpenVINO idle-state transitions without repeating one reason every lease."""
-        nonlocal hybrid_cpu_idle_reason_last, hybrid_cpu_idle_active, hybrid_cpu_idle_since
-        normalized = str(reason).strip()
-        now = float(time.monotonic())
-        if not normalized:
-            if hybrid_cpu_idle_active:
-                elapsed = max(0.0, now - float(hybrid_cpu_idle_since or now))
-                runtime_telemetry().add('hybrid.cpu_idle_seconds', float(elapsed))
-            hybrid_cpu_idle_active = False
-            hybrid_cpu_idle_since = None
-            return
-        if hybrid_cpu_idle_active and normalized == hybrid_cpu_idle_reason_last:
-            return
-        if hybrid_cpu_idle_active:
-            elapsed = max(0.0, now - float(hybrid_cpu_idle_since or now))
-            runtime_telemetry().add('hybrid.cpu_idle_seconds', float(elapsed))
-        hybrid_cpu_idle_active = True
-        hybrid_cpu_idle_since = now
-        if normalized != hybrid_cpu_idle_reason_last:
-            hybrid_cpu_idle_reason_last = normalized
-            hybrid_cpu_idle_reason_counts[normalized] += 1
-            runtime_telemetry().add(
-                f'hybrid.cpu_idle_reason.{_sanitize_filesystem_token(normalized)}', 1,
-            )
-            print(f'[hybrid] OpenVINO idle: {normalized}.')
-
-    def _describe_hybrid_cpu_idle_reason() -> str:
-        active = _active_cpu_shared_parent()
-        pending_ids = [int(value) for value in gpu_worker_pending_task_ids]
-        if active is not None:
-            pending_active = [
-                task_id for task_id in pending_ids
-                if _hybrid_task_parent_key(gpu_worker_tasks_by_id[int(task_id)]) == active
-                and bool(gpu_worker_tasks_by_id[int(task_id)].get('cpu_eligible', False))
-                and str(gpu_worker_tasks_by_id[int(task_id)].get('result_mode', 'file')) == 'direct_union'
-            ]
-            if pending_active:
-                return (
-                    f'active reserved view {active[0]}/{active[1]} has no currently '
-                    'admissible CPU lease'
-                )
-            cpu_inflight = sum(_cpu_worker_inflight(worker_id) for worker_id in cpu_task_queues)
-            gpu_assist = sum(
-                1 for task_id in gpu_worker_cpu_assist_inflight_task_ids
-                if _hybrid_task_parent_key(gpu_worker_tasks_by_id.get(int(task_id), {})) == active
-            )
-            return (
-                f'waiting for active reserved view {active[0]}/{active[1]} to drain '
-                f'({cpu_inflight} CPU lease(s), {gpu_assist} CUDA assist lease(s) in flight)'
-            )
-        next_parent = _next_cpu_reserved_parent()
-        if next_parent is not None:
-            next_pending = [
-                task_id for task_id in pending_ids
-                if _hybrid_task_parent_key(gpu_worker_tasks_by_id[int(task_id)]) == next_parent
-                and bool(gpu_worker_tasks_by_id[int(task_id)].get('cpu_eligible', False))
-            ]
-            if next_pending:
-                return (
-                    f'next reserved view {next_parent[0]}/{next_parent[1]} is waiting '
-                    'for direct-union admission'
-                )
-            return (
-                f'next reserved view {next_parent[0]}/{next_parent[1]} has no central '
-                'CPU-claimable lease'
-            )
-        if any(
-            bool(gpu_worker_tasks_by_id[int(task_id)].get('hybrid_cpu_eligible_origin', False))
-            for task_id in pending_ids
-        ):
-            return (
-                'CPU reservation sequence exhausted; remaining CPU-compatible views are '
-                'assigned to CUDA D1'
-            )
-        if pending_ids:
-            return 'no CPU-compatible task remains in the central inference queue'
-        return 'central inference queue is empty'
-
-    def _record_backend_frame_completion(
-        task: Dict[str, object], backend: str,
-    ) -> None:
-        nonlocal gpu_frames_completed_total, cpu_frames_completed_total
-        nonlocal hybrid_gpu_frames_completed_total, hybrid_cpu_frames_completed_total
-        backend_name = str(backend).strip().lower()
-        count = max(0, int(task.get('slice_count', 0)))
-        if backend_name == 'cpu':
-            cpu_frames_completed_total += int(count)
-        else:
-            gpu_frames_completed_total += int(count)
-        parent = _hybrid_task_parent_key(task)
-        if parent is None:
-            return
-        if backend_name == 'cpu':
-            hybrid_cpu_frames_completed_total += int(count)
-        else:
-            hybrid_gpu_frames_completed_total += int(count)
-        holder = hybrid_view_frames_by_backend.get(parent)
-        if holder is None:
-            holder = Counter()
-            hybrid_view_frames_by_backend[parent] = holder
-        holder[backend_name] += int(count)
-        task_holder = hybrid_view_tasks_by_backend.get(parent)
-        if task_holder is None:
-            task_holder = Counter()
-            hybrid_view_tasks_by_backend[parent] = task_holder
-        task_holder[backend_name] += 1
-
-    def _commit_hybrid_fullframe_mode(
-        task: Dict[str, object], requested_mode: str, *, backend_label: str,
-    ) -> str:
-        """Commit every lease of one CPU-eligible view to one result contract."""
-        requested = str(requested_mode)
-        if requested not in {'d1_owner', 'direct_union'}:
-            raise ValueError(f'invalid hybrid result mode {requested!r}')
-        parent = _hybrid_task_parent_key(task)
-        if parent is None:
-            return str(task.get('result_mode', 'file'))
-        existing = hybrid_view_mode_by_parent.get(parent)
-        if existing is not None:
-            if str(existing) != requested:
-                raise RuntimeError(
-                    f'hybrid view {parent} was already committed to {existing}, '
-                    f'cannot recommit it to {requested}'
-                )
-            return str(existing)
-        if str(task.get('result_mode', 'file')) != HYBRID_DEFERRED_RESULT_MODE:
-            raise RuntimeError(
-                f'hybrid view {parent} reached first claim with result_mode='
-                f'{task.get("result_mode")!r}'
-            )
-        task_ids = list(fullframe_task_ids_by_parent.get(parent, ()))
-        if not task_ids:
-            raise RuntimeError(f'hybrid view {parent} has no indexed full-frame tasks')
-        if requested == 'direct_union' and not _hybrid_parent_is_cpu_reserved(parent):
-            raise RuntimeError(
-                f'OpenVINO attempted to claim unreserved hybrid view {parent}; '
-                'only the ordered CPU reservation sequence may open dense unions'
-            )
-        hybrid_view_mode_by_parent[parent] = requested
-        changed = 0
-        for indexed_task_id in task_ids:
-            candidate = gpu_worker_tasks_by_id[int(indexed_task_id)]
-            candidate_mode = str(candidate.get('result_mode', 'file'))
-            if candidate_mode == HYBRID_DEFERRED_RESULT_MODE:
-                candidate['result_mode'] = requested
-                candidate['hybrid_committed_backend'] = str(backend_label)
-                candidate['device_hole_fill'] = False
-                if requested == 'd1_owner':
-                    candidate['cpu_eligible'] = False
-                changed += 1
-            elif candidate_mode != requested:
-                raise RuntimeError(
-                    f'hybrid view {parent} contains mixed result contracts: '
-                    f'{candidate_mode} vs {requested}'
-                )
-        runtime_telemetry().add(f'hybrid.view_commits.{requested}', 1)
-        reservation_note = (
-            f', CPU reservation #{hybrid_cpu_reservation_rank_by_parent[parent] + 1}'
-            if parent in hybrid_cpu_reservation_rank_by_parent else
-            ', unreserved CUDA view'
-        )
-        print(
-            f'[hybrid] first claim committed {parent[0]}/{parent[1]} to {requested} '
-            f'via {backend_label}{reservation_note}; {changed} lease descriptor(s) updated.'
-        )
-        return requested
-
-    def _hybrid_gpu_selection_rank(task: Dict[str, object]) -> int:
-        parent = _hybrid_task_parent_key(task)
-        mode = str(task.get('result_mode', 'file'))
-        if parent is not None and mode == 'direct_union':
-            return 0
-        if mode == 'd1_owner' and _d1_task_parent_key(task) in d1_owner_by_parent:
-            return 1
-        if parent is None:
-            return 2
-        if mode == 'd1_owner':
-            return 3
-        if mode == HYBRID_DEFERRED_RESULT_MODE and not _hybrid_parent_is_cpu_reserved(parent):
-            return 4
-        if mode == HYBRID_DEFERRED_RESULT_MODE:
-            return 5
-        return 6
-
-    def _hybrid_gpu_stealback_quota(
-        mandatory_gpu_pairs: Sequence[Tuple[int, int]],
-        active_cpu_pairs: Sequence[Tuple[int, int]],
-    ) -> int:
-        """Return a proportional concurrent-task quota for the active CPU-owned view.
-
-        Unopened reserved views are excluded from the CPU ETA. Unreserved hybrid views are
-        mandatory CUDA D1 work. Only central leases from the one active direct-union view
-        are assistable. The quota is expressed as live assist tasks, which maps much more
-        closely to GPU-worker equivalents than multiplying by each worker's publication
-        overlap depth.
-        """
-        active_parent = _active_cpu_shared_parent()
-        if (
-            not hybrid_gpu_stealback_enabled()
-            or active_parent is None
-            or not active_cpu_pairs
-            or not cpu_task_queues
-            or not gpu_task_queues
-        ):
-            return 0
-        active_pairs = [
-            (int(position), int(task_id))
-            for position, task_id in active_cpu_pairs
-            if _hybrid_task_parent_key(gpu_worker_tasks_by_id[int(task_id)]) == active_parent
-            and str(gpu_worker_tasks_by_id[int(task_id)].get('result_mode', 'file')) == 'direct_union'
-        ]
-        if not active_pairs:
-            return 0
-
-        gpu_workers = max(1, len(gpu_task_queues))
-        cpu_workers = max(1, len(cpu_task_queues))
-        cpu_committed = float(sum(
-            float(predicted)
-            for task_id, predicted in cpu_worker_task_predicted_seconds_by_id.items()
-            if _hybrid_task_parent_key(gpu_worker_tasks_by_id.get(int(task_id), {})) == active_parent
-        ))
-        cpu_pending = float(sum(
-            _cpu_worker_task_seconds(gpu_worker_tasks_by_id[int(task_id)])
-            for _position, task_id in active_pairs
-        ))
-        cpu_work = max(0.0, float(cpu_committed) + float(cpu_pending))
-        cpu_eta = float(cpu_work) / float(cpu_workers)
-
-        # Count the complete central mandatory backlog, not only tasks feasible on the
-        # particular free worker subset used by this one dispatch iteration. Otherwise
-        # owner-affined D1 work can disappear from the horizon and trigger premature assist.
-        gpu_committed = float(sum(
-            float(predicted)
-            for task_id, predicted in gpu_worker_task_predicted_seconds_by_id.items()
-            if _hybrid_task_is_gpu_mandatory(gpu_worker_tasks_by_id.get(int(task_id), {}))
-        ))
-        gpu_pending = float(sum(
-            _gpu_worker_task_seconds(gpu_worker_tasks_by_id[int(task_id)])
-            for task_id in list(gpu_worker_pending_task_ids)
-            if bool(gpu_worker_tasks_by_id[int(task_id)].get('gpu_eligible', gpu_worker_process_active))
-            and _hybrid_task_is_gpu_mandatory(gpu_worker_tasks_by_id[int(task_id)])
-        ))
-        gpu_mandatory_work = max(0.0, float(gpu_committed) + float(gpu_pending))
-        gpu_horizon = float(gpu_mandatory_work) / float(gpu_workers)
-
-        completed_cpu_samples = int(
-            hybrid_view_tasks_by_backend.get(active_parent, Counter()).get('cpu', 0)
-        )
-        minimum_samples = int(hybrid_gpu_stealback_min_cpu_samples())
-        if gpu_mandatory_work > 0.0 and completed_cpu_samples < minimum_samples:
-            runtime_telemetry().gauge(
-                'hybrid.gpu_assist_waiting_for_cpu_samples',
-                {
-                    'parent': f'{active_parent[0]}/{active_parent[1]}',
-                    'completed': int(completed_cpu_samples),
-                    'required': int(minimum_samples),
-                },
-            )
-            return 0
-
-        ratio = float(hybrid_gpu_stealback_eta_ratio())
-        threshold = (
-            float(gpu_horizon) * float(ratio)
-            + float(hybrid_gpu_stealback_min_lead_seconds())
-        )
-        runtime_telemetry().gauge('hybrid.active_cpu_eta_seconds', float(cpu_eta))
-        runtime_telemetry().gauge('hybrid.mandatory_gpu_eta_seconds', float(gpu_horizon))
-        runtime_telemetry().gauge('hybrid.active_cpu_pending_seconds', float(cpu_pending))
-        runtime_telemetry().gauge('hybrid.active_cpu_committed_seconds', float(cpu_committed))
-        runtime_telemetry().gauge('hybrid.active_cpu_samples', int(completed_cpu_samples))
-        if cpu_eta <= threshold or cpu_pending <= 0.0:
-            runtime_telemetry().gauge('hybrid.gpu_assist_task_quota', 0)
-            return 0
-
-        # Transfer only the still-central CPU seconds needed to make the active view finish
-        # near the mandatory-GPU horizon. Already-running OpenVINO leases are non-preemptive.
-        target_cpu_eta = max(0.0, float(threshold))
-        excess_cpu_seconds = min(
-            float(cpu_pending),
-            max(0.0, float(cpu_work) - float(target_cpu_eta) * float(cpu_workers)),
-        )
-        if excess_cpu_seconds <= 0.0:
-            return 0
-        active_gpu_seconds = float(sum(
-            _gpu_worker_task_seconds(gpu_worker_tasks_by_id[int(task_id)])
-            for _position, task_id in active_pairs
-        ))
-        gpu_per_cpu_second = (
-            float(active_gpu_seconds) / float(cpu_pending)
-            if cpu_pending > 0.0 else 1.0
-        )
-        gpu_seconds_needed = max(
-            0.0, float(excess_cpu_seconds) * max(1e-6, float(gpu_per_cpu_second)),
-        )
-
-        max_fraction = float(hybrid_gpu_stealback_max_fraction())
-        if max_fraction <= 0.0:
-            return 0
-        # The fraction cap protects mandatory GPU throughput during early assistance. Once
-        # that backlog is empty, every otherwise-idle GPU may drain the active CPU view.
-        max_assist_tasks = (
-            int(gpu_workers)
-            if gpu_mandatory_work <= 0.0 else
-            max(1, min(
-                int(gpu_workers),
-                int(math.floor(float(gpu_workers) * float(max_fraction) + 1e-9)),
-            ))
-        )
-        capacity_per_gpu = max(
-            float(gpu_horizon),
-            float(gpu_worker_target_lease_seconds()),
-            1e-3,
-        )
-        required_gpu_workers = max(
-            1,
-            int(math.ceil(float(gpu_seconds_needed) / float(capacity_per_gpu))),
-        )
-        quota = max(1, min(int(max_assist_tasks), int(required_gpu_workers)))
-        runtime_telemetry().gauge('hybrid.gpu_assist_task_quota', int(quota))
-        runtime_telemetry().gauge('hybrid.gpu_assist_seconds_needed', float(gpu_seconds_needed))
-        if active_parent not in hybrid_stealback_announced_parents:
-            hybrid_stealback_announced_parents.add(active_parent)
-            print(
-                'v17.0.3 active-view ETA GPU assist enabled for '
-                f'{active_parent[0]}/{active_parent[1]}: active CPU ETA={cpu_eta:.1f}s, '
-                f'mandatory-GPU ETA={gpu_horizon:.1f}s, '
-                f'estimated GPU assist={gpu_seconds_needed:.1f}s, '
-                f'CUDA assist quota={quota}/{gpu_workers} concurrent task(s), '
-                f'CPU samples={completed_cpu_samples}.'
-            )
-        return int(quota)
-
-    def _d1_task_parent_key(task: Dict[str, object]) -> Optional[Tuple[str, str]]:
-        if not bool(v1613_d1_owner_active):
-            return None
-        if str(task.get('result_mode', 'file')) != 'd1_owner':
-            return None
-        return _gpu_worker_fullframe_parent_key(task)
-
-    def _d1_feasible_workers(
-        task: Dict[str, object], candidate_workers: Sequence[int],
-    ) -> List[int]:
-        workers = [int(value) for value in candidate_workers]
-        if not bool(v1613_d1_owner_active):
-            return workers
-        parent = _d1_task_parent_key(task)
-        if parent is None:
-            return [
-                worker for worker in workers
-                if int(worker) not in d1_active_parent_by_worker
-            ]
-        owner = d1_owner_by_parent.get(parent)
-        if owner is not None:
-            return [int(owner)] if int(owner) in workers else []
-        return [
-            worker for worker in workers
-            if int(worker) not in d1_active_parent_by_worker
-        ]
-
-    def _claim_d1_owner(task: Dict[str, object], worker_id: int) -> bool:
-        parent = _d1_task_parent_key(task)
-        if parent is None:
-            return False
-        worker = int(worker_id)
-        owner = d1_owner_by_parent.get(parent)
-        active = d1_active_parent_by_worker.get(worker)
-        if owner is not None:
-            if int(owner) != worker or active != parent:
-                raise RuntimeError(
-                    f'D1 owner registry mismatch for {parent}: owner={owner}, '
-                    f'worker={worker}, active={active}'
-                )
-            return False
-        if active is not None:
-            raise RuntimeError(
-                f'D1 worker {worker} cannot claim {parent}; it still owns {active}'
-            )
-        d1_owner_by_parent[parent] = worker
-        d1_active_parent_by_worker[worker] = parent
-        runtime_telemetry().add('d1.owner_claims', 1)
-        return True
-
-    def _release_d1_owner_if_complete(
-        task: Dict[str, object], worker_id: int, stats: Dict[str, object],
-    ) -> None:
-        if not bool(stats.get('d1_view_complete', False)):
-            return
-        parent = _d1_task_parent_key(task)
-        if parent is None:
-            return
-        worker = int(worker_id)
-        owner = d1_owner_by_parent.get(parent)
-        # A deferred publication sends compute_released first and the final result later.
-        # The second notification is intentionally idempotent.
-        if owner is None:
-            return
-        if int(owner) != worker or d1_active_parent_by_worker.get(worker) != parent:
-            raise RuntimeError(
-                f'D1 completion registry mismatch for {parent}: owner={owner}, '
-                f'worker={worker}, active={d1_active_parent_by_worker.get(worker)}'
-            )
-        d1_owner_by_parent.pop(parent, None)
-        d1_active_parent_by_worker.pop(worker, None)
-        runtime_telemetry().add('d1.owner_releases', 1)
-
-    def _split_one_gpu_worker_dispatch_tail(
-        issue_slots: int,
-        preferred_parent: Optional[Tuple[str, str]] = None,
-    ) -> bool:
-        """Split one still-central full-frame lease only when issue reaches the tail."""
-        nonlocal gpu_worker_total_tasks, gpu_worker_next_dynamic_task_id
-        if bool(v1613_d1_owner_active):
-            return False
-        if int(gpu_device_count) <= 1 or int(issue_slots) <= 0:
-            return False
-        pending_ids = [int(v) for v in gpu_worker_pending_task_ids]
-        # This is the actual central-queue tail, not a per-view construction-time guess:
-        # every pending descriptor would otherwise be issued by this refill.
-        if not pending_ids or len(pending_ids) > int(issue_slots):
-            return False
-        parent_pending_counts: Dict[Tuple[str, str], int] = {}
-        for task_id in pending_ids:
-            parent_key = _gpu_worker_fullframe_parent_key(gpu_worker_tasks_by_id[int(task_id)])
-            if parent_key is not None:
-                parent_pending_counts[parent_key] = int(parent_pending_counts.get(parent_key, 0)) + 1
-        eligible: List[Tuple[int, int, int, int, int]] = []
-        for position, task_id in enumerate(pending_ids):
-            task = gpu_worker_tasks_by_id[int(task_id)]
-            if str(task.get('kind', '')) != 'fullframe' or bool(task.get('tail_adapted', False)):
-                continue
-            midpoint = gpu_worker_tail_split_point(
-                int(task.get('slice_start', 0)),
-                int(task.get('slice_count', 0)),
-                int(args.gpu_batch),
-            )
-            if midpoint is None:
-                continue
-            parent_key = _gpu_worker_fullframe_parent_key(task)
-            remaining = int(fullframe_remaining.get(parent_key, 2 ** 31 - 1)) if parent_key is not None else 2 ** 31 - 1
-            # Preserve the lease most likely to unlock parent postprocessing. In
-            # particular, splitting preferred_parent here would turn its sole
-            # pending lease into two and make _pop_gpu_worker_pending_task_id skip it.
-            eligible.append((
-                1 if parent_key == preferred_parent else 0,
-                1 if parent_key is not None and int(parent_pending_counts.get(parent_key, 0)) == 1 else 0,
-                -int(remaining), int(position), int(midpoint),
-            ))
-        if not eligible:
-            return False
-        _preferred, _sole_pending, _negative_remaining, position, midpoint = min(eligible)
-        original_id = int(pending_ids[int(position)])
-        original = gpu_worker_tasks_by_id[original_id]
-        original_start = int(original.get('slice_start', 0))
-        original_stop = int(original_start) + int(original.get('slice_count', 0))
-        child_id = int(gpu_worker_next_dynamic_task_id)
-        gpu_worker_next_dynamic_task_id += 1
-        child = dict(original)
-        original['slice_count'] = int(midpoint - original_start)
-        original['render_workers'] = max(
-            1, min(int(original.get('render_workers', 1)), int(midpoint - original_start)),
-        )
-        original['tail_adapted'] = True
-        original['tail_child_task_id'] = int(child_id)
-        child['task_id'] = int(child_id)
-        child['slice_start'] = int(midpoint)
-        child['slice_count'] = int(original_stop - midpoint)
-        child['render_workers'] = max(
-            1, min(int(child.get('render_workers', 1)), int(original_stop - midpoint)),
-        )
-        child['tail_adapted'] = True
-        child['tail_parent_task_id'] = int(original_id)
-        if str(child.get('result_mode', 'file')) != 'direct_union':
-            for field_name in ('result_mask_path', 'result_conf_path'):
-                raw_path = child.get(field_name)
-                if raw_path:
-                    path_obj = Path(str(raw_path))
-                    child[field_name] = str(path_obj.with_name(
-                        f'{path_obj.name}.tail{int(child_id)}'
-                    ))
-        gpu_worker_tasks_by_id[int(child_id)] = child
-        pending_ids.insert(int(position) + 1, int(child_id))
-        gpu_worker_pending_task_ids.clear()
-        gpu_worker_pending_task_ids.extend(pending_ids)
-        gpu_worker_total_tasks += 1
-        parent_key = _gpu_worker_fullframe_parent_key(original)
-        if parent_key is not None:
-            fullframe_remaining[parent_key] = int(fullframe_remaining.get(parent_key, 0)) + 1
-            fullframe_task_ids_by_parent.setdefault(parent_key, []).append(int(child_id))
-        print(
-            f'v13.3.18 (C11): dispatch tail split task {original_id} '
-            f'[{original_start}:{original_stop}] -> [{original_start}:{midpoint}] + '
-            f'[{midpoint}:{original_stop}] as task {child_id}.'
-        )
-        return True
-
-    def _direct_union_task_key(task: Dict[str, object]) -> Optional[Tuple[str, str]]:
-        if str(task.get('kind', '')) != 'fullframe' or str(task.get('result_mode', 'file')) != 'direct_union':
-            return None
-        view_obj = task.get('view')
-        if view_obj is None:
-            return None
-        return (str(task.get('model_name', '')), str(getattr(view_obj, 'name', '')))
-
-    def _direct_union_task_bytes(task: Dict[str, object]) -> int:
-        shape = tuple(int(v) for v in task.get('processing_shape', ()))
-        if len(shape) != 3:
-            view_obj = task['view']
-            shape = view_processing_volume_shape(view_obj, int(task.get('out_size', args.imgsz)))
-        dense_volume_count = 2 if float(args.min_conf) > 0.0 else 1
-        if bool(dense_tiling_active):
-            dense_volume_count += 1
-            if bool(nrrd_layers_needed):
-                dense_volume_count += 2
-        return int(array_nbytes(shape, np.uint8)) * int(dense_volume_count)
-
-    def _direct_union_task_admissible(task: Dict[str, object]) -> bool:
-        key = _direct_union_task_key(task)
-        if key is None or not direct_union_sparse_retirement_active:
-            return True
-        if key in direct_union_inference_views:
-            lease = direct_union_backing_leases.get(key)
-            if lease is None or lease.phase != 'inference':
-                raise RuntimeError(f'direct-union inference registry is inconsistent for {key}')
-            return True
-        if key in direct_union_postprocess_views:
-            # A task for a view whose final chunk already handed ownership to postprocess is
-            # a scheduler lifecycle error; never write into a buffer now read by CPU/NRRD work.
-            raise RuntimeError(f'inference task targeted postprocess-owned direct union {key}')
-        if len(direct_union_inference_views) >= int(direct_union_inference_view_limit):
-            return False
-        need = int(_direct_union_task_bytes(task))
-        inference_active = int(sum(direct_union_inference_bytes.values()))
-        postprocess_active = int(sum(direct_union_postprocess_bytes.values()))
-        total_active = int(inference_active + postprocess_active)
-        inference_ok = bool(
-            not direct_union_inference_views
-            or int(inference_active) + int(need) <= int(direct_union_inference_byte_limit)
-        )
-        total_ok = bool(
-            not direct_union_backing_leases
-            or int(total_active) + int(need) <= int(direct_union_total_dense_byte_limit)
-        )
-        return bool(inference_ok and total_ok)
-
-    def _activate_direct_union_task(task: Dict[str, object]) -> None:
-        key = _direct_union_task_key(task)
-        if key is None:
-            return
-        view_obj = task['view']
-        _ensure_baseline_workspaces(str(key[0]), view_obj)
-        task['result_mask_path'] = str(baseline_union_paths[key])
-        conf_path = baseline_confmap_paths.get(key)
-        task['result_conf_path'] = str(conf_path) if conf_path is not None else None
-
-    def _pop_gpu_worker_pending_task_id(
-        preferred_parent: Optional[Tuple[str, str]] = None,
-        candidate_workers: Optional[Sequence[int]] = None,
-    ) -> Optional[Tuple[int, List[int]]]:
-        """Pick an admissible GPU task and the worker subset allowed to own it.
-
-        Unreserved hybrid parents are ordinary mandatory CUDA D1 work. Future CPU-reserved
-        parents remain protected. The one active direct-union parent enters the candidate
-        pool only when its active-view ETA quota has an open CUDA-assist slot.
-        """
-        pending_ids = [int(v) for v in gpu_worker_pending_task_ids]
-        candidates = [int(v) for v in (candidate_workers or tuple(gpu_task_queues))]
-        feasible_by_id: Dict[int, List[int]] = {}
-        eligible: List[Tuple[int, int]] = []
-        for position, task_id in enumerate(pending_ids):
-            task = gpu_worker_tasks_by_id[int(task_id)]
-            if not bool(task.get('gpu_eligible', gpu_worker_process_active)):
-                continue
-            if not _direct_union_task_admissible(task):
-                continue
-            if not _tile_dense_result_task_admissible(task):
-                continue
-            feasible = _d1_feasible_workers(task, candidates)
-            if not feasible:
-                continue
-            feasible_by_id[int(task_id)] = feasible
-            eligible.append((int(position), int(task_id)))
-        if not eligible:
-            return None
-
-        active_parent = _active_cpu_shared_parent()
-        mandatory_gpu: List[Tuple[int, int]] = []
-        active_cpu_assist: List[Tuple[int, int]] = []
-        for pair in eligible:
-            task = gpu_worker_tasks_by_id[int(pair[1])]
-            if _hybrid_task_is_active_cpu_assist(task, active_parent):
-                active_cpu_assist.append(pair)
-            elif _hybrid_task_is_gpu_mandatory(task):
-                mandatory_gpu.append(pair)
-
-        assist_ids: set[int] = set()
-        quota = _hybrid_gpu_stealback_quota(mandatory_gpu, active_cpu_assist)
-        assist_slots_open = max(
-            0,
-            int(quota) - int(len(gpu_worker_cpu_assist_inflight_task_ids)),
-        )
-        if assist_slots_open > 0 and active_cpu_assist:
-            selected_pool = list(active_cpu_assist)
-            assist_ids = {int(task_id) for _position, task_id in active_cpu_assist}
-        elif mandatory_gpu:
-            selected_pool = list(mandatory_gpu)
-        else:
-            return None
-
-        parent_pending_counts: Dict[Tuple[str, str], int] = {}
-        for _position, task_id in selected_pool:
-            parent_key = _gpu_worker_fullframe_parent_key(gpu_worker_tasks_by_id[int(task_id)])
-            if parent_key is not None:
-                parent_pending_counts[parent_key] = int(parent_pending_counts.get(parent_key, 0)) + 1
-        unlock_candidates: List[Tuple[int, int, int, int, int]] = []
-        for position, task_id in selected_pool:
-            task = gpu_worker_tasks_by_id[int(task_id)]
-            parent_key = _gpu_worker_fullframe_parent_key(task)
-            if parent_key is None or int(parent_pending_counts.get(parent_key, 0)) != 1:
-                continue
-            unlock_candidates.append((
-                _hybrid_gpu_selection_rank(task),
-                0 if parent_key == preferred_parent else 1,
-                int(fullframe_remaining.get(parent_key, 2 ** 31 - 1)),
-                int(position),
-                int(task_id),
-            ))
-        if unlock_candidates:
-            _hybrid_rank, _preferred, _remaining, _position, selected_id = min(unlock_candidates)
-        else:
-            parent_seconds: Dict[Optional[Tuple[str, str]], float] = {}
-            for _position_i, task_id_i in selected_pool:
-                task_i = gpu_worker_tasks_by_id[int(task_id_i)]
-                parent_i = _gpu_worker_fullframe_parent_key(task_i)
-                parent_seconds[parent_i] = float(parent_seconds.get(parent_i, 0.0)) + _gpu_worker_task_seconds(task_i)
-            selected_id = min(
-                selected_pool,
-                key=lambda pair: (
-                    _hybrid_gpu_selection_rank(gpu_worker_tasks_by_id[int(pair[1])]),
-                    0 if _d1_task_parent_key(gpu_worker_tasks_by_id[int(pair[1])]) in d1_owner_by_parent else 1,
-                    0 if (_direct_union_task_key(gpu_worker_tasks_by_id[int(pair[1])]) in direct_union_inference_views) else 1,
-                    _inference_storage_priority_rank(gpu_worker_tasks_by_id[int(pair[1])]),
-                    -float(parent_seconds.get(_gpu_worker_fullframe_parent_key(gpu_worker_tasks_by_id[int(pair[1])]), 0.0)),
-                    -float(_gpu_worker_task_seconds(gpu_worker_tasks_by_id[int(pair[1])])),
-                    int(pair[0]),
-                ),
-            )[1]
-        selected_task = gpu_worker_tasks_by_id[int(selected_id)]
-        selected_task['hybrid_gpu_assist_dispatch'] = bool(int(selected_id) in assist_ids)
-        gpu_worker_pending_task_ids.remove(int(selected_id))
-        return int(selected_id), list(feasible_by_id[int(selected_id)])
-
-    def _publish_gpu_worker_admissible_backlog() -> None:
-        """Keep D1 from winning a device while dispatchable inference remains central."""
-        admissible = False
-        for pending_task_id in list(gpu_worker_pending_task_ids):
-            pending_task = gpu_worker_tasks_by_id[int(pending_task_id)]
-            gpu_policy_eligible = bool(
-                _hybrid_task_is_gpu_mandatory(pending_task)
-                or _hybrid_task_is_active_cpu_assist(pending_task)
-            )
-            if (
-                gpu_policy_eligible
-                and _direct_union_task_admissible(pending_task)
-                and _tile_dense_result_task_admissible(pending_task)
-            ):
-                admissible = True
-                break
-        _set_main_process_gpu_pending_inference(bool(admissible))
-
-    def _gpu_worker_inflight(worker_id: int) -> int:
-        worker = int(worker_id)
-        return max(
-            0,
-            int(gpu_worker_dispatched_by_id.get(worker, 0))
-            - int(gpu_worker_compute_completed_by_id.get(worker, 0)),
-        )
-
-    def _refresh_gpu_aux_interpolation_leases() -> None:
-        """Lease warm CUDA worker interpreters only after global inference drain."""
-        aux_pool = gpu_worker_aux_interpolation_pool()
-        worker_ids = sorted(int(worker_id) for worker_id in gpu_task_queues)
-        if aux_pool is None or not worker_ids:
-            return
-        inference_tail_drained = bool(
-            int(gpu_worker_total_tasks) > 0
-            and int(gpu_worker_results_collected) >= int(gpu_worker_total_tasks)
-        )
-        if not inference_tail_drained:
-            for worker_id in worker_ids:
-                aux_pool.revoke_worker(worker_id)
-            return
-        for worker_id in worker_ids:
-            if (
-                _gpu_worker_inflight(worker_id) == 0
-                and _main_process_gpu_stage_can_dispatch_inference(worker_id)
-            ):
-                # Feeder exclusivity ends at global drain; post-inference interpolation may
-                # reclaim the worker's full inherited allocation.
-                aux_pool.enable_worker(worker_id, allow_full_cpu_affinity=True)
-            else:
-                aux_pool.revoke_worker(worker_id)
-
-    def _dispatch_gpu_worker_inference_window(
-        preferred_parent: Optional[Tuple[str, str]] = None,
-    ) -> None:
-        """Issue bounded, targeted worker leases with D1 owner affinity."""
-        nonlocal gpu_worker_dispatched_tasks, gpu_worker_dispatch_cursor
-        worker_ids = sorted(int(worker_id) for worker_id in gpu_task_queues)
-        if not worker_ids:
-            _set_main_process_gpu_pending_inference(False)
-            return
-        _publish_gpu_worker_admissible_backlog()
-        per_gpu = (
-            max(1, min(4, _env_int('YOLO_TTA_GPU_WORKER_DISPATCH_WINDOW_PER_GPU', 2)))
-            if bool(v1613_d1_owner_active) else max(
-                1, _env_int('YOLO_TTA_GPU_WORKER_DISPATCH_WINDOW_PER_GPU', 2),
-            )
-        )
-        aux_pool = gpu_worker_aux_interpolation_pool()
-        while gpu_worker_pending_task_ids:
-            candidates: List[int] = []
-            for worker_id in worker_ids:
-                if _gpu_worker_inflight(worker_id) >= int(per_gpu):
-                    continue
-                if not _main_process_gpu_stage_can_dispatch_inference(worker_id):
-                    continue
-                if aux_pool is not None and not aux_pool.revoke_worker(worker_id):
-                    continue
-                candidates.append(int(worker_id))
-            if not candidates:
-                break
-            issue_slots = sum(
-                max(0, int(per_gpu) - _gpu_worker_inflight(worker_id))
-                for worker_id in candidates
-            )
-            _split_one_gpu_worker_dispatch_tail(int(issue_slots), preferred_parent)
-            selected = _pop_gpu_worker_pending_task_id(preferred_parent, candidates)
-            if selected is None:
-                break
-            task_id, _precommit_feasible_workers = selected
-            task_to_dispatch = gpu_worker_tasks_by_id[int(task_id)]
-            cpu_assist_dispatch = bool(
-                task_to_dispatch.get('hybrid_gpu_assist_dispatch', False)
-            )
-            if (
-                bool(task_to_dispatch.get('hybrid_cpu_eligible_origin', False))
-                and str(task_to_dispatch.get('result_mode', 'file')) == HYBRID_DEFERRED_RESULT_MODE
-            ):
-                _commit_hybrid_fullframe_mode(
-                    task_to_dispatch, 'd1_owner', backend_label='CUDA',
-                )
-            task_id = _split_gpu_worker_task_to_runtime_target(int(task_id))
-            task_to_dispatch = gpu_worker_tasks_by_id[int(task_id)]
-            if str(task_to_dispatch.get('result_mode', 'file')) == HYBRID_DEFERRED_RESULT_MODE:
-                raise RuntimeError('GPU dispatch retained an unresolved hybrid result contract')
-            feasible_workers = _d1_feasible_workers(task_to_dispatch, candidates)
-            if not feasible_workers:
-                gpu_worker_pending_task_ids.appendleft(int(task_id))
-                break
-            start_rank = int(gpu_worker_dispatch_cursor) % len(worker_ids)
-            position = {
-                worker_id: (worker_ids.index(worker_id) - start_rank) % len(worker_ids)
-                for worker_id in feasible_workers
-            }
-            predicted_seconds = float(_gpu_worker_task_seconds(task_to_dispatch))
-            worker_id = min(
-                feasible_workers,
-                key=lambda value: (
-                    float(gpu_worker_predicted_load_by_id.get(int(value), 0.0)) + predicted_seconds,
-                    _gpu_worker_inflight(value),
-                    position[value],
-                ),
-            )
-            gpu_worker_dispatch_cursor = (worker_ids.index(worker_id) + 1) % len(worker_ids)
-            if not _main_process_gpu_stage_begin_inference(worker_id):
-                gpu_worker_pending_task_ids.appendleft(int(task_id))
-                continue
-            owner_claimed = False
-            tile_storage_reserved = False
-            try:
-                owner_claimed = _claim_d1_owner(task_to_dispatch, int(worker_id))
-                _activate_direct_union_task(task_to_dispatch)
-                tile_storage_reserved = _reserve_tile_dense_result_task(task_to_dispatch)
-                if tile_storage_reserved:
-                    _prepare_tile_dense_result_workspaces(task_to_dispatch)
-                dispatch_task = dict(task_to_dispatch)
-                dispatch_task.pop('hybrid_gpu_assist_dispatch', None)
-                _attach_memfd_transfers_to_task(dispatch_task)
-                preflight_multiprocessing_payload(dispatch_task)
-                gpu_task_queues[int(worker_id)].put(dispatch_task)
-            except BaseException:
-                if tile_storage_reserved:
-                    _release_tile_dense_result_task_id(
-                        int(task_id), reason='dispatch failure', refill=False,
-                    )
-                if owner_claimed:
-                    parent = _d1_task_parent_key(task_to_dispatch)
-                    if parent is not None:
-                        d1_owner_by_parent.pop(parent, None)
-                    d1_active_parent_by_worker.pop(int(worker_id), None)
-                gpu_worker_pending_task_ids.appendleft(int(task_id))
-                _main_process_gpu_stage_finish_inference(worker_id)
-                raise
-            task_to_dispatch.pop('hybrid_gpu_assist_dispatch', None)
-            if cpu_assist_dispatch:
-                task_to_dispatch['hybrid_gpu_assist_dispatched'] = True
-                gpu_worker_cpu_assist_inflight_task_ids.add(int(task_id))
-                runtime_telemetry().add('hybrid.gpu_assist_tasks_dispatched', 1)
-                runtime_telemetry().add(
-                    'hybrid.gpu_assist_frames_dispatched',
-                    int(task_to_dispatch.get('slice_count', 0)),
-                )
-            gpu_worker_dispatched_tasks += 1
-            gpu_worker_dispatched_by_id[int(worker_id)] = int(
-                gpu_worker_dispatched_by_id.get(int(worker_id), 0)
-            ) + 1
-            gpu_worker_task_predicted_seconds_by_id[int(task_id)] = float(predicted_seconds)
-            gpu_worker_predicted_load_by_id[int(worker_id)] = float(
-                gpu_worker_predicted_load_by_id.get(int(worker_id), 0.0)
-            ) + float(predicted_seconds)
-        _publish_gpu_worker_admissible_backlog()
-        _refresh_gpu_aux_interpolation_leases()
-
-    def _cpu_worker_task_seconds(task: Dict[str, object]) -> float:
-        view_obj = task.get('view')
-        count = max(1, int(task.get('slice_count', 1)))
-        key = ('cpu',) + tuple(gpu_worker_task_cost_key(task))
-        sec_per_frame = cpu_worker_seconds_per_frame_ewma.get(key)
-        if sec_per_frame is None:
-            sec_per_frame = (
-                cpu_worker_default_seconds_per_frame(view_obj)
-                if isinstance(view_obj, ViewInfo) else 0.25
-            )
-        return max(1e-4, float(sec_per_frame) * float(count))
-
-    def _update_cpu_worker_cost(task: Dict[str, object], stats: Dict[str, object]) -> None:
-        elapsed = float(stats.get('worker_compute_seconds', 0.0) or 0.0)
-        count = max(1, int(task.get('slice_count', 1)))
-        if elapsed <= 0.0:
-            return
-        observed = max(1e-5, float(elapsed) / float(count))
-        key = ('cpu',) + tuple(gpu_worker_task_cost_key(task))
-        prior = cpu_worker_seconds_per_frame_ewma.get(key)
-        alpha = min(0.8, max(0.05, _env_float('YOLO_TTA_CPU_WORKER_COST_EWMA_ALPHA', 0.30)))
-        cpu_worker_seconds_per_frame_ewma[key] = (
-            observed if prior is None else (1.0 - alpha) * float(prior) + alpha * observed
-        )
-
-    def _split_cpu_worker_task_to_runtime_target(task_id: int) -> int:
-        """Split an oversized seed only when OpenVINO actually claims it."""
-        nonlocal gpu_worker_total_tasks, gpu_worker_next_dynamic_task_id
-        current_id = int(task_id)
-        task = gpu_worker_tasks_by_id[current_id]
-        if str(task.get('kind', '')) != 'fullframe' or bool(task.get('disable_runtime_split', False)):
-            return current_id
-        count = int(task.get('slice_count', 0))
-        if count <= 1:
-            return current_id
-        view_obj = task.get('view')
-        key = ('cpu',) + tuple(gpu_worker_task_cost_key(task))
-        sec_per_frame = cpu_worker_seconds_per_frame_ewma.get(key)
-        if sec_per_frame is None:
-            sec_per_frame = (
-                cpu_worker_default_seconds_per_frame(view_obj)
-                if isinstance(view_obj, ViewInfo) else 0.25
-            )
-        align = max(1, int(args.cpu_batch))
-        target_count = int(round(cpu_worker_target_lease_seconds() / max(1e-5, float(sec_per_frame))))
-        target_count = max(
-            cpu_worker_min_lease_slices(),
-            min(cpu_worker_max_lease_slices(), int(target_count)),
-        )
-        target_count = max(align, int(math.ceil(float(target_count) / float(align))) * align)
-        if count <= target_count:
-            return current_id
-        remainder = int(count - target_count)
-        # Do not manufacture a tiny tail merely to hit the target exactly. The supplied
-        # workload's 57- and 44-frame GPU seeds therefore remain intact for OpenVINO,
-        # filling its 18/20 asynchronous request pools without recreating 7/10-slice tasks.
-        min_useful_remainder = max(
-            cpu_worker_min_lease_slices(),
-            int(math.ceil(float(target_count) * 0.50)),
-        )
-        if remainder < int(min_useful_remainder):
-            return current_id
-        start = int(task.get('slice_start', 0))
-        stop = int(start + count)
-        split_at = int(start + target_count)
-        child_id = int(gpu_worker_next_dynamic_task_id)
-        gpu_worker_next_dynamic_task_id += 1
-        child = dict(task)
-        task['slice_count'] = int(split_at - start)
-        task['render_workers'] = max(
-            1, min(int(task.get('render_workers', 1)), int(split_at - start)),
-        )
-        child['task_id'] = int(child_id)
-        child['slice_start'] = int(split_at)
-        child['slice_count'] = int(stop - split_at)
-        child['render_workers'] = max(
-            1, min(int(child.get('render_workers', 1)), int(stop - split_at)),
-        )
-        child['cpu_runtime_split_parent_task_id'] = int(current_id)
-        task['cpu_runtime_split_child_task_id'] = int(child_id)
-        if str(child.get('result_mode', 'file')) != 'direct_union':
-            for field_name in ('result_mask_path', 'result_conf_path'):
-                raw_path = child.get(field_name)
-                if raw_path:
-                    path_obj = Path(str(raw_path))
-                    child[field_name] = str(path_obj.with_name(f'{path_obj.name}.cpu{child_id}'))
-        gpu_worker_tasks_by_id[int(child_id)] = child
-        gpu_worker_pending_task_ids.append(int(child_id))
-        gpu_worker_total_tasks += 1
-        parent_key = _gpu_worker_fullframe_parent_key(task)
-        if parent_key is not None:
-            fullframe_remaining[parent_key] = int(fullframe_remaining.get(parent_key, 0)) + 1
-            fullframe_task_ids_by_parent.setdefault(parent_key, []).append(int(child_id))
-        runtime_telemetry().add('scheduler.cpu_claim_lease_splits', 1)
-        return current_id
-
-    def _cpu_worker_inflight(worker_id: int) -> int:
-        worker = int(worker_id)
-        return max(
-            0,
-            int(cpu_worker_dispatched_by_id.get(worker, 0))
-            - int(cpu_worker_results_by_id.get(worker, 0)),
-        )
-
-    def _pop_cpu_worker_pending_task_id(
-        preferred_parent: Optional[Tuple[str, str]] = None,
-    ) -> Optional[int]:
-        """Select work from the active or next ordered CPU reservation only."""
-        active_cpu_parent = _active_cpu_shared_parent()
-        next_reserved_parent = _next_cpu_reserved_parent()
-        reservation_policy_active = bool(hybrid_cpu_reserved_parents)
-        eligible: List[Tuple[int, int]] = []
-        for position, task_id in enumerate(list(gpu_worker_pending_task_ids)):
-            task = gpu_worker_tasks_by_id[int(task_id)]
-            if not bool(task.get('cpu_eligible', False)):
-                continue
-            if str(task.get('result_mode', 'file')) == 'd1_owner':
-                continue
-            hybrid_parent = _hybrid_task_parent_key(task)
-            hybrid_state = _hybrid_parent_state(hybrid_parent)
-            if hybrid_parent is not None:
-                if hybrid_state == 'd1_owner':
-                    continue
-                if active_cpu_parent is not None:
-                    if hybrid_parent != active_cpu_parent or hybrid_state != 'direct_union':
-                        continue
-                else:
-                    if not reservation_policy_active or next_reserved_parent is None:
-                        continue
-                    if hybrid_parent != next_reserved_parent:
-                        continue
-                    if hybrid_state not in {'unclaimed', 'direct_union'}:
-                        continue
-            elif active_cpu_parent is not None or next_reserved_parent is not None:
-                continue
-            if not _direct_union_task_admissible(task):
-                continue
-            if not _tile_dense_result_task_admissible(task):
-                continue
-            eligible.append((int(position), int(task_id)))
-        if not eligible:
-            return None
-        selected = min(
-            eligible,
-            key=lambda pair: (
-                0 if _hybrid_task_parent_key(
-                    gpu_worker_tasks_by_id[int(pair[1])]
-                ) == active_cpu_parent and active_cpu_parent is not None else 1,
-                hybrid_cpu_reservation_rank_by_parent.get(
-                    _hybrid_task_parent_key(gpu_worker_tasks_by_id[int(pair[1])]),
-                    2 ** 31 - 1,
-                ),
-                0 if _gpu_worker_fullframe_parent_key(
-                    gpu_worker_tasks_by_id[int(pair[1])]
-                ) == preferred_parent else 1,
-                cpu_inference_task_priority(gpu_worker_tasks_by_id[int(pair[1])]),
-                0 if _direct_union_task_key(
-                    gpu_worker_tasks_by_id[int(pair[1])]
-                ) in direct_union_inference_views else 1,
-                _inference_storage_priority_rank(gpu_worker_tasks_by_id[int(pair[1])]),
-                -int(gpu_worker_tasks_by_id[int(pair[1])].get('slice_count', 0)),
-                int(pair[0]),
+    scheduler = TtaScheduler(
+        inputs=TtaSchedulerInputs(
+            batch=int(args.batch),
+            conf=float(args.conf),
+            cpu_batch=int(args.cpu_batch),
+            cpu_precision=str(args.cpu_precision),
+            gpu_batch=int(args.gpu_batch),
+            gpu_quantize=args.gpu_quantize,
+            imgsz=int(args.imgsz),
+            interpolation_distance=int(args.interpolation_distance),
+            min_conf=float(args.min_conf),
+            min_radius=float(args.min_radius),
+            keep_temp_artifacts=bool(keep_temp_artifacts),
+            dense_tiling_active=bool(dense_tiling_active),
+            nrrd_layers_needed=bool(nrrd_layers_needed),
+            direct_union_sparse_retirement_active=bool(
+                direct_union_sparse_retirement_active
             ),
-        )[1]
-        gpu_worker_pending_task_ids.remove(int(selected))
-        return int(selected)
+            direct_union_inference_view_limit=int(direct_union_inference_view_limit),
+            direct_union_inference_byte_limit=int(direct_union_inference_byte_limit),
+            direct_union_total_dense_byte_limit=int(direct_union_total_dense_byte_limit),
+            gpu_worker_tile_dense_result_limit=int(gpu_worker_tile_dense_result_limit),
+            gpu_worker_tile_dense_result_task_limit=int(
+                gpu_worker_tile_dense_result_task_limit
+            ),
+            gpu_worker_process_active=bool(gpu_worker_process_active),
+            inference_worker_process_active=bool(inference_worker_process_active),
+            gpu_device_count=int(gpu_device_count),
+            v1613_d1_owner_active=bool(v1613_d1_owner_active),
+            gpu_worker_result_dir=gpu_worker_result_dir,
+            ensure_baseline_workspaces=_ensure_baseline_workspaces,
+            gib=int(GIB),
+            hybrid_deferred_result_mode=str(HYBRID_DEFERRED_RESULT_MODE),
+        ),
+        state=scheduler_state,
+        operations=TtaSchedulerOperations(
+            _attach_memfd_transfers_to_task=_attach_memfd_transfers_to_task,
+            _env_float=_env_float,
+            _env_int=_env_int,
+            _main_process_gpu_stage_begin_inference=(
+                _main_process_gpu_stage_begin_inference
+            ),
+            _main_process_gpu_stage_can_dispatch_inference=(
+                _main_process_gpu_stage_can_dispatch_inference
+            ),
+            _main_process_gpu_stage_finish_inference=(
+                _main_process_gpu_stage_finish_inference
+            ),
+            _memfd_owner_key_from_array=_memfd_owner_key_from_array,
+            _memmap_backing_path=_memmap_backing_path,
+            _path_is_relative_to=_path_is_relative_to,
+            _sanitize_filesystem_token=_sanitize_filesystem_token,
+            _set_main_process_gpu_pending_inference=(
+            _set_main_process_gpu_pending_inference
+            ),
+            _set_main_process_gpu_stage_wake_callback=(
+                _set_main_process_gpu_stage_wake_callback
+            ),
+            set_gpu_worker_aux_interpolation_pool=set_gpu_worker_aux_interpolation_pool,
+            allocate_workspace_array=allocate_workspace_array,
+            array_nbytes=array_nbytes,
+            available_anon_work_bytes=available_anon_work_bytes,
+            close_memmap_array_without_flush=close_memmap_array_without_flush,
+            cpu_inference_task_priority=cpu_inference_task_priority,
+            cpu_worker_default_seconds_per_frame=cpu_worker_default_seconds_per_frame,
+            cpu_worker_max_lease_slices=cpu_worker_max_lease_slices,
+            cpu_worker_min_lease_slices=cpu_worker_min_lease_slices,
+            cpu_worker_target_lease_seconds=cpu_worker_target_lease_seconds,
+            gpu_worker_aux_interpolation_pool=gpu_worker_aux_interpolation_pool,
+            gpu_worker_default_seconds_per_frame=gpu_worker_default_seconds_per_frame,
+            gpu_worker_max_lease_slices=gpu_worker_max_lease_slices,
+            gpu_worker_min_lease_slices=gpu_worker_min_lease_slices,
+            gpu_worker_tail_split_point=gpu_worker_tail_split_point,
+            gpu_worker_target_lease_seconds=gpu_worker_target_lease_seconds,
+            gpu_worker_task_cost_key=gpu_worker_task_cost_key,
+            hybrid_gpu_stealback_enabled=hybrid_gpu_stealback_enabled,
+            hybrid_gpu_stealback_eta_ratio=hybrid_gpu_stealback_eta_ratio,
+            hybrid_gpu_stealback_max_fraction=hybrid_gpu_stealback_max_fraction,
+            hybrid_gpu_stealback_min_cpu_samples=hybrid_gpu_stealback_min_cpu_samples,
+            hybrid_gpu_stealback_min_lead_seconds=(
+                hybrid_gpu_stealback_min_lead_seconds
+            ),
+            memfd_workspace_enabled=memfd_workspace_enabled,
+            preflight_multiprocessing_payload=preflight_multiprocessing_payload,
+            radial_batch_padding_count=radial_batch_padding_count,
+            radial_batch_padding_mirror_groups=radial_batch_padding_mirror_groups,
+            runtime_telemetry=runtime_telemetry,
+            tile_dense_worker_result_warn_seconds=tile_dense_worker_result_warn_seconds,
+            view_processing_volume_shape=view_processing_volume_shape,
+            workspace_anon_cap_bytes=workspace_anon_cap_bytes,
+        ),
+    )
 
-    def _dispatch_cpu_worker_inference_window(
-        preferred_parent: Optional[Tuple[str, str]] = None,
-    ) -> None:
-        """Issue one claim-time-sized range per socket from the CPU-opened view."""
-        nonlocal cpu_worker_dispatch_cursor
-        worker_ids = sorted(int(worker_id) for worker_id in cpu_task_queues)
-        if not worker_ids:
-            return
-        while gpu_worker_pending_task_ids:
-            available = [
-                worker_id for worker_id in worker_ids
-                if _cpu_worker_inflight(worker_id) < 1
-            ]
-            if not available:
-                _set_hybrid_cpu_idle_reason('')
-                break
-            task_id = _pop_cpu_worker_pending_task_id(preferred_parent)
-            if task_id is None:
-                _set_hybrid_cpu_idle_reason(_describe_hybrid_cpu_idle_reason())
-                break
-            task = gpu_worker_tasks_by_id[int(task_id)]
-            if (
-                bool(task.get('hybrid_cpu_eligible_origin', False))
-                and str(task.get('result_mode', 'file')) == HYBRID_DEFERRED_RESULT_MODE
-            ):
-                _commit_hybrid_fullframe_mode(
-                    task, 'direct_union', backend_label='OpenVINO',
-                )
-            task = gpu_worker_tasks_by_id[int(task_id)]
-            if str(task.get('result_mode', 'file')) == HYBRID_DEFERRED_RESULT_MODE:
-                raise RuntimeError('CPU dispatch retained an unresolved hybrid result contract')
-            if not _direct_union_task_admissible(task):
-                gpu_worker_pending_task_ids.appendleft(int(task_id))
-                _set_hybrid_cpu_idle_reason(_describe_hybrid_cpu_idle_reason())
-                break
-            task_id = _split_cpu_worker_task_to_runtime_target(int(task_id))
-            task = gpu_worker_tasks_by_id[int(task_id)]
-            start_rank = int(cpu_worker_dispatch_cursor) % len(worker_ids)
-            position = {
-                worker_id: (worker_ids.index(worker_id) - start_rank) % len(worker_ids)
-                for worker_id in available
-            }
-            predicted_seconds = float(_cpu_worker_task_seconds(task))
-            worker_id = min(
-                available,
-                key=lambda value: (
-                    float(cpu_worker_predicted_load_by_id.get(int(value), 0.0))
-                    + predicted_seconds,
-                    position[value],
-                ),
-            )
-            cpu_worker_dispatch_cursor = (worker_ids.index(worker_id) + 1) % len(worker_ids)
-            tile_storage_reserved = False
-            try:
-                _activate_direct_union_task(task)
-                tile_storage_reserved = _reserve_tile_dense_result_task(task)
-                if tile_storage_reserved:
-                    _prepare_tile_dense_result_workspaces(task)
-                dispatch_task = dict(task)
-                _attach_memfd_transfers_to_task(dispatch_task)
-                preflight_multiprocessing_payload(dispatch_task)
-                cpu_task_queues[int(worker_id)].put(dispatch_task)
-            except BaseException:
-                if tile_storage_reserved:
-                    _release_tile_dense_result_task_id(
-                        int(task_id), reason='CPU dispatch failure', refill=False,
-                    )
-                gpu_worker_pending_task_ids.appendleft(int(task_id))
-                raise
-            cpu_worker_dispatched_by_id[int(worker_id)] = int(
-                cpu_worker_dispatched_by_id.get(int(worker_id), 0)
-            ) + 1
-            cpu_worker_task_predicted_seconds_by_id[int(task_id)] = float(predicted_seconds)
-            cpu_worker_predicted_load_by_id[int(worker_id)] = float(
-                cpu_worker_predicted_load_by_id.get(int(worker_id), 0.0)
-            ) + float(predicted_seconds)
-            _set_hybrid_cpu_idle_reason('')
-
-    def _dispatch_inference_windows(
-        preferred_parent: Optional[Tuple[str, str]] = None,
-    ) -> None:
-        # Give each idle socket-local OpenVINO worker one claim-time-sized range from the
-        # active or next ordered CPU reservation. CUDA fills every remaining slot with
-        # mandatory GPU work and assists only the active direct-union view when its measured
-        # ETA exceeds the mandatory-GPU horizon.
-        # All ownership transitions and range claims run on this main thread.
-        _dispatch_cpu_worker_inference_window(preferred_parent)
-        _dispatch_gpu_worker_inference_window(preferred_parent)
+    _tile_task_radial_padding_count = scheduler.tile_task_radial_padding_count
+    _tile_dense_result_task_bytes = scheduler.tile_dense_result_task_bytes
+    _tile_dense_result_task_admissible = scheduler.tile_dense_result_task_admissible
+    _tile_parent_mask_ready_for_task = scheduler.tile_parent_mask_ready_for_task
+    _inference_storage_priority_rank = scheduler.inference_storage_priority_rank
+    _reserve_tile_dense_result_task = scheduler.reserve_tile_dense_result_task
+    _prepare_tile_dense_result_workspaces = scheduler.prepare_tile_dense_result_workspaces
+    _release_tile_dense_result_task_id = scheduler.release_tile_dense_result_task_id
+    _release_tile_dense_result_for_key = scheduler.release_tile_dense_result_for_key
+    _gpu_worker_task_seconds = scheduler.gpu_worker_task_seconds
+    _update_gpu_worker_cost = scheduler.update_gpu_worker_cost
+    _split_gpu_worker_task_to_runtime_target = scheduler.split_gpu_worker_task_to_runtime_target
+    _gpu_worker_fullframe_parent_key = scheduler.gpu_worker_fullframe_parent_key
+    _hybrid_task_parent_key = scheduler.hybrid_task_parent_key
+    _hybrid_parent_state = scheduler.hybrid_parent_state
+    _active_cpu_shared_parent = scheduler.active_cpu_shared_parent
+    _hybrid_parent_is_cpu_reserved = scheduler.hybrid_parent_is_cpu_reserved
+    _next_cpu_reserved_parent = scheduler.next_cpu_reserved_parent
+    _hybrid_task_is_active_cpu_assist = scheduler.hybrid_task_is_active_cpu_assist
+    _hybrid_task_is_gpu_mandatory = scheduler.hybrid_task_is_gpu_mandatory
+    _set_hybrid_cpu_idle_reason = scheduler.set_hybrid_cpu_idle_reason
+    _describe_hybrid_cpu_idle_reason = scheduler.describe_hybrid_cpu_idle_reason
+    _record_backend_frame_completion = scheduler.record_backend_frame_completion
+    _commit_hybrid_fullframe_mode = scheduler.commit_hybrid_fullframe_mode
+    _hybrid_gpu_selection_rank = scheduler.hybrid_gpu_selection_rank
+    _hybrid_gpu_stealback_quota = scheduler.hybrid_gpu_stealback_quota
+    _d1_task_parent_key = scheduler.d1_task_parent_key
+    _d1_feasible_workers = scheduler.d1_feasible_workers
+    _claim_d1_owner = scheduler.claim_d1_owner
+    _release_d1_owner_if_complete = scheduler.release_d1_owner_if_complete
+    _split_one_gpu_worker_dispatch_tail = scheduler.split_one_gpu_worker_dispatch_tail
+    _direct_union_task_key = scheduler.direct_union_task_key
+    _direct_union_task_bytes = scheduler.direct_union_task_bytes
+    _direct_union_task_admissible = scheduler.direct_union_task_admissible
+    _activate_direct_union_task = scheduler.activate_direct_union_task
+    _pop_gpu_worker_pending_task_id = scheduler.pop_gpu_worker_pending_task_id
+    _publish_gpu_worker_admissible_backlog = scheduler.publish_gpu_worker_admissible_backlog
+    _gpu_worker_inflight = scheduler.gpu_worker_inflight
+    _refresh_gpu_aux_interpolation_leases = scheduler.refresh_gpu_aux_interpolation_leases
+    _dispatch_gpu_worker_inference_window = scheduler.dispatch_gpu_worker_inference_window
+    _cpu_worker_task_seconds = scheduler.cpu_worker_task_seconds
+    _update_cpu_worker_cost = scheduler.update_cpu_worker_cost
+    _split_cpu_worker_task_to_runtime_target = scheduler.split_cpu_worker_task_to_runtime_target
+    _cpu_worker_inflight = scheduler.cpu_worker_inflight
+    _pop_cpu_worker_pending_task_id = scheduler.pop_cpu_worker_pending_task_id
+    _dispatch_cpu_worker_inference_window = scheduler.dispatch_cpu_worker_inference_window
+    _dispatch_inference_windows = scheduler.dispatch_inference_windows
 
     def _ensure_source_volume_file_backed() -> Tuple[str, Tuple[int, int, int], str]:
         wait_for_volume_ready(volume_rgb)
@@ -6303,8 +4430,8 @@ def _main_impl() -> None:
         # (~30-90 s each) overlaps the decode instead of running strictly after it. Tasks are
         # enqueued below once the shared source volume is ready.
         mp_ctx = mp.get_context('spawn')
-        gpu_result_queue = mp_ctx.Queue()
-        _run_resources().track_queue(gpu_result_queue)
+        scheduler_state.gpu_result_queue = mp_ctx.Queue()
+        _run_resources().track_queue(scheduler_state.gpu_result_queue)
         for worker_pos, gpu_index in enumerate(gpu_logical_indices):
             worker_id = int(gpu_index)
             worker_queue = mp_ctx.Queue()
@@ -6319,7 +4446,7 @@ def _main_impl() -> None:
                 target=_gpu_inference_worker_main,
                 args=(
                     worker_id, str(gpu_model_path), worker_init_i,
-                    worker_queue, gpu_result_queue,
+                    worker_queue, scheduler_state.gpu_result_queue,
                 ),
                 name=f'gpu-worker-{gpu_index}', daemon=True,
             )
@@ -6366,7 +4493,7 @@ def _main_impl() -> None:
                     target=_cpu_inference_worker_main,
                     args=(
                         instance_id, str(cpu_model_path), cpu_init,
-                        worker_queue, gpu_result_queue,
+                        worker_queue, scheduler_state.gpu_result_queue,
                     ),
                     name=f'openvino-worker-{instance_id}', daemon=True,
                 )
@@ -6722,9 +4849,9 @@ def _main_impl() -> None:
                         str(result_id) for result_id in result_ids
                     )
                 next_task_id += 1
-        gpu_worker_total_tasks = int(next_task_id)
-        gpu_worker_seed_task_count = int(next_task_id)
-        gpu_worker_next_dynamic_task_id = int(next_task_id)
+        scheduler_state.gpu_worker_total_tasks = int(next_task_id)
+        scheduler_state.gpu_worker_seed_task_count = int(next_task_id)
+        scheduler_state.gpu_worker_next_dynamic_task_id = int(next_task_id)
         # A full-frame view is finalized only after every (angle x slice-chunk) result for it has been
         # unioned, so override fullframe_remaining with the per-view sub-task count.
         for key_fv, cnt in fullframe_subtasks_per_view.items():
@@ -6843,7 +4970,9 @@ def _main_impl() -> None:
                     'YOLO_TTA_TILE_DENSE_RETIREMENT_WORKERS / _SLICE_WORKERS adjust retirement throughput.'
                 )
 
-        gpu_worker_pending_task_ids.extend(range(int(gpu_worker_total_tasks)))
+        gpu_worker_pending_task_ids.extend(
+            range(int(scheduler_state.gpu_worker_total_tasks))
+        )
         # Hybrid native-t GPU residency can defer the 25+ GiB host processing cube until a
         # CPU worker asks for it. Let that one-time resize use every NON-FEEDER CPU while the
         # OpenVINO workers are still waiting on the cube sentinel. Dedicated feeder cores are
@@ -6910,10 +5039,14 @@ def _main_impl() -> None:
             'workers may assist after mandatory GPU work drains.'
             if gpu_worker_process_active and cpu_worker_process_active else ''
         )
-        dynamic_splits = max(0, int(gpu_worker_total_tasks) - int(gpu_worker_seed_task_count))
+        dynamic_splits = max(
+            0,
+            int(scheduler_state.gpu_worker_total_tasks)
+            - int(scheduler_state.gpu_worker_seed_task_count),
+        )
         print(
-            f'v17 process-local leases: {gpu_worker_seed_task_count} seed inference task(s) retained '
-            f'in one bounded central dispatch window; {gpu_worker_total_tasks} task(s) currently '
+            f'v17 process-local leases: {scheduler_state.gpu_worker_seed_task_count} seed inference task(s) retained '
+            f'in one bounded central dispatch window; {scheduler_state.gpu_worker_total_tasks} task(s) currently '
             f'tracked after {dynamic_splits} claim-time split(s) (hard full-frame chunk cap={slice_chunk}; '
             f'{", ".join(lease_details)}).{hybrid_policy}'
         )
@@ -7302,16 +5435,17 @@ def _main_impl() -> None:
         tile_cleanup_futures[fut] = (model_name_s, str(view.name), str(tile_job.config_id), str(tile_job.tile_id))
 
     def _announce_process_inference_drain_if_complete() -> None:
-        nonlocal gpu_inference_drained_at, gpu_inference_drain_announced
-        if int(gpu_worker_results_collected) < int(gpu_worker_total_tasks):
+        if int(scheduler_state.gpu_worker_results_collected) < int(
+            scheduler_state.gpu_worker_total_tasks
+        ):
             return
         if gpu_worker_process_active:
             _set_main_process_gpu_inference_priority_active(False)
         _restore_parent_post_inference_affinity()
-        if bool(gpu_inference_drain_announced):
+        if bool(scheduler_state.gpu_inference_drain_announced):
             return
-        gpu_inference_drain_announced = True
-        gpu_inference_drained_at = time.perf_counter()
+        scheduler_state.gpu_inference_drain_announced = True
+        scheduler_state.gpu_inference_drained_at = time.perf_counter()
         runtime_telemetry().gauge('pipeline.phase', 'inference_drained_scheduler_tail')
         sink_now = nrrd_layer_sink()
         if sink_now is not None:
@@ -7360,19 +5494,19 @@ def _main_impl() -> None:
         if cpu_worker_process_active:
             drained_backend_notes.append('OpenVINO workers are idle until shutdown')
         print(
-            f'Inference tasks completed={int(gpu_worker_results_collected)}/'
-            f'{int(gpu_worker_total_tasks)} (GPU={gpu_done}, CPU={cpu_done}); '
-            f'frames completed={int(gpu_frames_completed_total + cpu_frames_completed_total)} '
-            f'(GPU={int(gpu_frames_completed_total)}, CPU={int(cpu_frames_completed_total)}; '
-            f'CPU-eligible GPU/CPU={int(hybrid_gpu_frames_completed_total)}/'
-            f'{int(hybrid_cpu_frames_completed_total)}; active-view CUDA assist='
+            f'Inference tasks completed={int(scheduler_state.gpu_worker_results_collected)}/'
+            f'{int(scheduler_state.gpu_worker_total_tasks)} (GPU={gpu_done}, CPU={cpu_done}); '
+            f'frames completed={int(scheduler_state.gpu_frames_completed_total + scheduler_state.cpu_frames_completed_total)} '
+            f'(GPU={int(scheduler_state.gpu_frames_completed_total)}, CPU={int(scheduler_state.cpu_frames_completed_total)}; '
+            f'CPU-eligible GPU/CPU={int(scheduler_state.hybrid_gpu_frames_completed_total)}/'
+            f'{int(scheduler_state.hybrid_cpu_frames_completed_total)}; active-view CUDA assist='
             f'{hybrid_gpu_done} task(s)/{hybrid_gpu_frames} frame(s)); '
             f'hybrid contracts D1={int(hybrid_contract_counts.get("d1_owner", 0))}, '
             f'direct_union={int(hybrid_contract_counts.get("direct_union", 0))}; '
             f'parent_postprocess={len(view_processing_futures)}, '
             f'tile_dense_results={len(gpu_worker_tile_dense_result_reservations)}/'
             f'{gpu_worker_tile_dense_result_task_limit} task(s), '
-            f'{gpu_worker_tile_dense_result_bytes_reserved / GIB:.1f}/'
+            f'{scheduler_state.gpu_worker_tile_dense_result_bytes_reserved / GIB:.1f}/'
             f'{gpu_worker_tile_dense_result_limit / GIB:.1f}GiB, '
             f'tile_cleanup={len(tile_cleanup_futures)}, '
             f'tile_parent_gate={len(tile_parent_gate_futures)}, '
@@ -7386,10 +5520,12 @@ def _main_impl() -> None:
         )
         if hybrid_parents:
             runtime_telemetry().gauge(
-                'hybrid.frames.gpu', int(hybrid_gpu_frames_completed_total),
+                'hybrid.frames.gpu',
+                int(scheduler_state.hybrid_gpu_frames_completed_total),
             )
             runtime_telemetry().gauge(
-                'hybrid.frames.cpu', int(hybrid_cpu_frames_completed_total),
+                'hybrid.frames.cpu',
+                int(scheduler_state.hybrid_cpu_frames_completed_total),
             )
             print('Hybrid CPU-eligible frame split by view:')
             ordered_hybrid_parents = list(hybrid_cpu_reserved_parents) + sorted(
@@ -7414,349 +5550,44 @@ def _main_impl() -> None:
                     f'contract={contract}, {reservation}'
                 )
         if cpu_worker_process_active:
-            final_idle_reason = hybrid_cpu_idle_reason_last or _describe_hybrid_cpu_idle_reason()
+            final_idle_reason = (
+                scheduler_state.hybrid_cpu_idle_reason_last
+                or _describe_hybrid_cpu_idle_reason()
+            )
             print(f'OpenVINO last idle reason: {final_idle_reason}.')
 
-    def _process_one_worker_result(msg: Dict[str, object]) -> None:
-        nonlocal gpu_worker_results_collected
-        nonlocal gpu_inference_drained_at, gpu_inference_drain_announced
-        mtype = str(msg.get('type'))
-        worker_kind = str(msg.get('worker_kind', 'gpu')).strip().lower()
-        if mtype == 'ready':
-            if worker_kind == 'cpu':
-                ready_cpu_index = int(msg.get('cpu_index', -1))
-                if ready_cpu_index not in cpu_worker_ready_details_by_id:
-                    ready_details = {
-                        'precision': str(msg.get('precision')),
-                        'requests': int(msg.get('requests', 0) or 0),
-                        'threads': int(msg.get('threads', 0) or 0),
-                        'input_element_type': str(msg.get('input_element_type')),
-                        'model_int8_quantized': bool(msg.get('model_int8_quantized')),
-                        'class_count': msg.get('class_count'),
-                        'amx_tile': bool(msg.get('amx_tile')),
-                        'amx_bf16': bool(msg.get('amx_bf16')),
-                        'amx_int8': bool(msg.get('amx_int8')),
-                        'openvino_capabilities': list(msg.get('openvino_capabilities') or ()),
-                        'model_xml': str(msg.get('model_xml')),
-                    }
-                    cpu_worker_ready_details_by_id[ready_cpu_index] = ready_details
-                    runtime_telemetry().gauge(
-                        f'inference.cpu_instance.{ready_cpu_index}.ready', ready_details,
-                    )
-                print(
-                    f"OpenVINO worker ready: instance {msg.get('cpu_index')} "
-                    f"(pid {msg.get('pid')}, precision={msg.get('precision')}, "
-                    f"requests={msg.get('requests')}, threads={msg.get('threads')}, "
-                    f"input={msg.get('input_element_type')}, INT8-export={msg.get('model_int8_quantized')}, "
-                    f"classes={msg.get('class_count')}, "
-                    f"AMX(tile/bf16/int8)={msg.get('amx_tile')}/{msg.get('amx_bf16')}/{msg.get('amx_int8')}, "
-                    f"OpenVINO capabilities={msg.get('openvino_capabilities')}, "
-                    f"model={msg.get('model_xml')})."
-                )
-            else:
-                print(f"GPU worker ready: device cuda:{msg.get('gpu_index')} (pid {msg.get('pid')}).")
-            return
-        if mtype == 'fatal':
-            backend_label = (
-                f"OpenVINO CPU instance {msg.get('cpu_index')}"
-                if worker_kind == 'cpu' else f"GPU device {msg.get('gpu_index')}"
-            )
-            raise RuntimeError(
-                f"{backend_label} failed to initialize: "
-                f"{msg.get('error')}\n{msg.get('traceback')}"
-            )
-        if worker_kind == 'cpu':
-            worker_id = int(msg.get('cpu_index', -1))
-            task_id = int(msg.get('task_id', -1))
-            predicted = float(cpu_worker_task_predicted_seconds_by_id.pop(task_id, 0.0))
-            cpu_worker_predicted_load_by_id[worker_id] = max(
-                0.0,
-                float(cpu_worker_predicted_load_by_id.get(worker_id, 0.0)) - predicted,
-            )
-            cpu_worker_results_by_id[worker_id] = int(
-                cpu_worker_results_by_id.get(worker_id, 0)
-            ) + 1
-            gpu_worker_results_collected += 1
-            if not bool(msg.get('ok')):
-                raise RuntimeError(
-                    f"OpenVINO worker task {task_id} failed on CPU instance {worker_id}: "
-                    f"{msg.get('error')}\n{msg.get('traceback')}"
-                )
-            task = gpu_worker_tasks_by_id[int(task_id)]
-            stats = dict(msg.get('stats') or {})
-            _update_cpu_worker_cost(task, stats)
-            _record_backend_frame_completion(task, 'cpu')
-            runtime_telemetry().add('inference.cpu_tasks_completed', 1)
-            runtime_telemetry().add(
-                'inference.cpu_frames_completed', int(task.get('slice_count', 0)),
-            )
-            # Apply the result first so the final lease can close this reservation and make
-            # the next reserved parent visible before the just-freed OpenVINO worker refills.
-            if str(task['kind']) == 'fullframe':
-                _handle_fullframe_worker_result(task, stats)
-            else:
-                _handle_tile_worker_result(task, stats)
-            _dispatch_inference_windows(_gpu_worker_fullframe_parent_key(task))
-            _announce_process_inference_drain_if_complete()
-            return
-
-        if mtype == 'compute_released':
-            worker_id = int(msg.get('gpu_index', -1))
-            task_id = int(msg.get('task_id', -1))
-            if task_id not in gpu_worker_compute_released_task_ids:
-                gpu_worker_compute_released_task_ids.add(task_id)
-                _main_process_gpu_stage_finish_inference(worker_id)
-                gpu_worker_compute_completed_by_id[worker_id] = int(
-                    gpu_worker_compute_completed_by_id.get(worker_id, 0)
-                ) + 1
-                predicted = float(gpu_worker_task_predicted_seconds_by_id.pop(task_id, 0.0))
-                gpu_worker_predicted_load_by_id[worker_id] = max(
-                    0.0, float(gpu_worker_predicted_load_by_id.get(worker_id, 0.0)) - predicted,
-                )
-                task_for_cost = gpu_worker_tasks_by_id.get(task_id)
-                if isinstance(task_for_cost, dict):
-                    release_stats = dict(msg.get('stats') or {})
-                    _update_gpu_worker_cost(task_for_cost, release_stats)
-                    _release_d1_owner_if_complete(task_for_cost, worker_id, release_stats)
-            gpu_worker_cpu_assist_inflight_task_ids.discard(int(task_id))
-            # Refill immediately; final result publication may still be copying several
-            # GiB over PCIe or committing metadata on a retirement lane.
-            task = gpu_worker_tasks_by_id.get(task_id)
-            preferred = _gpu_worker_fullframe_parent_key(task) if isinstance(task, dict) else None
-            _dispatch_inference_windows(preferred)
-            _refresh_gpu_aux_interpolation_leases()
-            return
-        if mtype == 'aux_result':
-            # Route the targeted worker result to its waiting interpolation caller.  Once the
-            # lease is free, newly ready inference can immediately revoke it and dispatch.
-            worker_id = int(msg.get('gpu_index', -1))
-            aux_pool = gpu_worker_aux_interpolation_pool()
-            if aux_pool is not None:
-                aux_pool.complete(
-                    int(msg.get('task_id', -1)),
-                    worker_id,
-                    bool(msg.get('ok')),
-                    msg.get('stats') if isinstance(msg.get('stats'), dict) else None,
-                    str(msg.get('error') or '') + ('\n' + str(msg.get('traceback')) if msg.get('traceback') else ''),
-                )
-            _dispatch_inference_windows()
-            _refresh_gpu_aux_interpolation_leases()
-            return
-        worker_id = int(msg.get('gpu_index', -1))
-        task_id = int(msg.get('task_id', -1))
-        if task_id not in gpu_worker_compute_released_task_ids:
-            gpu_worker_compute_released_task_ids.add(task_id)
-            _main_process_gpu_stage_finish_inference(worker_id)
-            gpu_worker_compute_completed_by_id[worker_id] = int(
-                gpu_worker_compute_completed_by_id.get(worker_id, 0)
-            ) + 1
-            predicted = float(gpu_worker_task_predicted_seconds_by_id.pop(task_id, 0.0))
-            gpu_worker_predicted_load_by_id[worker_id] = max(
-                0.0, float(gpu_worker_predicted_load_by_id.get(worker_id, 0.0)) - predicted,
-            )
-            task_for_cost = gpu_worker_tasks_by_id.get(task_id)
-            if isinstance(task_for_cost, dict):
-                _update_gpu_worker_cost(task_for_cost, dict(msg.get('stats') or {}))
-        gpu_worker_cpu_assist_inflight_task_ids.discard(int(task_id))
-        gpu_worker_results_collected += 1
-        gpu_worker_results_by_id[worker_id] = int(gpu_worker_results_by_id.get(worker_id, 0)) + 1
-        if not bool(msg.get('ok')):
-            raise RuntimeError(
-                f"GPU worker task {msg.get('task_id')} failed on device {msg.get('gpu_index')}: "
-                f"{msg.get('error')}\n{msg.get('traceback')}"
-            )
-        task = gpu_worker_tasks_by_id[int(task_id)]
-        stats = dict(msg.get('stats') or {})
-        _record_backend_frame_completion(task, 'gpu')
-        if bool(task.get('hybrid_gpu_assist_dispatched', False)):
-            gpu_worker_cpu_assist_completed_task_ids.add(int(task_id))
-            runtime_telemetry().add('hybrid.gpu_assist_tasks_completed', 1)
-            runtime_telemetry().add(
-                'hybrid.gpu_assist_frames_completed', int(task.get('slice_count', 0)),
-            )
-        _release_d1_owner_if_complete(task, worker_id, stats)
-        # Refill before scheduler-side memmap union/postprocess so a worker does not wait
-        # behind CPU handling of the result that just freed its window slot. Prefer the
-        # current parent when its last unissued lease can unlock postprocessing.
-        _dispatch_inference_windows(_gpu_worker_fullframe_parent_key(task))
-        if str(task['kind']) == 'fullframe':
-            _handle_fullframe_worker_result(task, stats)
-        else:
-            _handle_tile_worker_result(task, stats)
-        # A GPU may publish the final assisted direct-union lease. Refill once more after
-        # result handling so OpenVINO can immediately open the next reservation.
-        _dispatch_inference_windows(_gpu_worker_fullframe_parent_key(task))
-        _announce_process_inference_drain_if_complete()
-        _refresh_gpu_aux_interpolation_leases()
-
-    # push drain — a transport-only daemon thread blocks on the process
-    # result queue and hands messages to the main thread through a local deque + wake
-    # event. Handlers still run ONLY on the main thread (they mutate scheduler state and
-    # raise scheduler-fatal errors); completed futures set the same event through one-time
-    # done-callbacks, so one event wait covers both wake sources. In push mode the drainer
-    # thread OWNS the mp queue end (a second concurrent get would race it).
-    push_drain_active = bool(
-        inference_worker_process_active and gpu_result_queue is not None and scheduler_push_drain_enabled()
-    )
-    scheduler_wake = threading.Event()
-    _set_main_process_gpu_stage_wake_callback(scheduler_wake.set)
-    push_drain_stop = threading.Event()
-    pushed_worker_results: deque = deque()
-    _wake_hooked_futures: 'weakref.WeakSet' = weakref.WeakSet()
-
-    def _wake_scheduler(_fut: object = None) -> None:
-        scheduler_wake.set()
-
-    def _hook_scheduler_wake(futures_list: Sequence[Future]) -> None:
-        # add_done_callback on an already-done future fires synchronously, so hooking is
-        # race-free: a completion between collection and wait still sets the event.
-        for fut in futures_list:
-            if fut not in _wake_hooked_futures:
-                _wake_hooked_futures.add(fut)
-                fut.add_done_callback(_wake_scheduler)
-
-    def _push_drain_pump() -> None:
-        while not push_drain_stop.is_set():
-            try:
-                msg = gpu_result_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            except (EOFError, OSError):
-                break
-            pushed_worker_results.append(msg)
-            scheduler_wake.set()
-
-    if push_drain_active:
-        push_drain_thread = threading.Thread(
-            target=_push_drain_pump,
-            name='inference-result-push-drain',
-            daemon=True,
-        )
-        _run_resources().track_thread(push_drain_thread, push_drain_stop)
-        push_drain_thread.start()
-        print(
-            'Scheduler push drain active (v13.3.8 G1; results handled the instant they '
-            'arrive; YOLO_TTA_SCHEDULER_PUSH_DRAIN=0 restores polling).'
-        )
-
-    def _drain_process_inference_results() -> None:
-        if gpu_result_queue is None:
-            return
-        if push_drain_active:
-            while pushed_worker_results:
-                _process_one_worker_result(pushed_worker_results.popleft())
-            return
-        while True:
-            try:
-                msg = gpu_result_queue.get_nowait()
-            except queue.Empty:
-                break
-            _process_one_worker_result(msg)
-
-    def _wait_for_one_process_result(timeout: float) -> None:
-        if gpu_result_queue is None:
-            return
-        if push_drain_active:
-            if not pushed_worker_results:
-                scheduler_wake.wait(timeout=float(timeout))
-                scheduler_wake.clear()
-            _drain_process_inference_results()
-            return
-        try:
-            msg = gpu_result_queue.get(timeout=float(timeout))
-        except queue.Empty:
-            return
-        _process_one_worker_result(msg)
-
-    def _process_inference_outstanding() -> bool:
-        return bool(
-            inference_worker_process_active
-            and gpu_worker_results_collected < gpu_worker_total_tasks
-        )
-
-    def _check_inference_workers_alive() -> None:
-        """Fail fast when any selected backend process exits before global drain."""
+    def _check_parent_affinity_for_scheduler() -> None:
         if parent_affinity_monitor_errors:
             raise RuntimeError(
-                f'Parent/OpenVINO CPU-affinity isolation failed: {parent_affinity_monitor_errors[0]}'
+                'Parent/OpenVINO CPU-affinity isolation failed: '
+                f'{parent_affinity_monitor_errors[0]}'
             ) from parent_affinity_monitor_errors[0]
-        aux_pool = gpu_worker_aux_interpolation_pool()
-        aux_outstanding = int(aux_pool.outstanding()) if aux_pool is not None else 0
-        if not _process_inference_outstanding() and aux_outstanding <= 0:
-            return
 
-        remaining = max(0, int(gpu_worker_total_tasks - gpu_worker_results_collected))
-        for backend_label, processes in (
-            ('GPU', gpu_worker_processes),
-            ('OpenVINO CPU', cpu_worker_processes),
-        ):
-            for proc in processes:
-                if proc.is_alive():
-                    continue
-                reason = (
-                    f'{backend_label} worker {getattr(proc, "name", "?")} exited unexpectedly '
-                    f'(exitcode={getattr(proc, "exitcode", None)}) with '
-                    f'{remaining} inference result(s) and '
-                    f'{aux_outstanding} GPU-worker auxiliary interpolation pass(es) still outstanding.'
-                )
-                if aux_pool is not None:
-                    # Unblock parent-postprocess threads waiting on a GPU auxiliary pass
-                    # before raising, so shutdown cannot deadlock on their futures.
-                    aux_pool.mark_failed(reason)
-                raise RuntimeError(reason)
-
-    def _reap_inference_worker_process(proc: object, backend_label: str) -> None:
-        try:
-            proc.join(timeout=30)
-        except Exception:
-            pass
-        if not proc.is_alive():
-            return
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-        try:
-            proc.join(timeout=10)
-        except Exception:
-            pass
-        if not proc.is_alive() or not hasattr(proc, 'kill'):
-            return
-        try:
-            proc.kill()
-            # Never join unbounded after SIGKILL. A worker wedged in uninterruptible
-            # kernel sleep may not be reaped, and an unbounded join can escalate a job
-            # failure into a drained SLURM node.
-            proc.join(timeout=30)
-        except Exception:
-            pass
-        if proc.is_alive():
-            print(
-                f'WARNING: {backend_label} worker pid={getattr(proc, "pid", "?")} survived '
-                f'SIGKILL after 30s and is being abandoned. It is most likely stuck in '
-                f'D state; this node may need manual cleanup before it accepts another job.',
-                flush=True,
-            )
-
-    def _shutdown_inference_worker_processes() -> None:
-        processes = list(gpu_worker_processes) + list(cpu_worker_processes)
-        if not processes:
-            return
-        # On abnormal paths, fail any GPU-worker auxiliary interpolation waiters before
-        # stopping the backend processes. mark_failed also rejects racing submissions.
-        aux_pool = gpu_worker_aux_interpolation_pool()
-        if aux_pool is not None:
-            aux_pool.mark_failed('Inference worker processes are shutting down')
-            set_gpu_worker_aux_interpolation_pool(None)
-        for task_queue in list(gpu_task_queues.values()) + list(cpu_task_queues.values()):
-            try:
-                task_queue.put(None)
-            except Exception:
-                pass
-        for proc in gpu_worker_processes:
-            _reap_inference_worker_process(proc, 'GPU')
-        for proc in cpu_worker_processes:
-            _reap_inference_worker_process(proc, 'OpenVINO CPU')
+    scheduler.bind_result_callbacks(TtaSchedulerCallbacks(
+        handle_fullframe_worker_result=_handle_fullframe_worker_result,
+        handle_tile_worker_result=_handle_tile_worker_result,
+        announce_process_inference_drain_if_complete=(
+            _announce_process_inference_drain_if_complete
+        ),
+        check_parent_affinity=_check_parent_affinity_for_scheduler,
+    ))
+    scheduler.configure_result_transport(
+        push_drain_active=bool(
+            inference_worker_process_active
+            and scheduler_state.gpu_result_queue is not None
+            and scheduler_push_drain_enabled()
+        ),
+        track_thread=_run_resources().track_thread,
+    )
+    scheduler_wake = scheduler_state.scheduler_wake
+    push_drain_stop = scheduler_state.push_drain_stop
+    _hook_scheduler_wake = scheduler.hook_scheduler_wake
+    _drain_process_inference_results = scheduler.drain_process_inference_results
+    _wait_for_one_process_result = scheduler.wait_for_one_process_result
+    _process_inference_outstanding = scheduler.process_inference_outstanding
+    _check_inference_workers_alive = scheduler.check_inference_workers_alive
+    _reap_inference_worker_process = scheduler.reap_inference_worker_process
+    _shutdown_inference_worker_processes = scheduler.shutdown_inference_worker_processes
 
     try:
         _pump_prediction_volume_build_queue()
@@ -8207,9 +6038,11 @@ def _main_impl() -> None:
                     missing_physical_unions = sorted(
                         expected_physical_unions - physical_view_union_completed
                     )
+                    process_scheduler_issues = scheduler.process_quiescence_issues()
                     if (
                         waiting_parent or waiting_bridge or incomplete_tiles
                         or missing_terminal_variants or missing_physical_unions
+                        or process_scheduler_issues
                     ):
                         raise RuntimeError(
                             'Scheduler became quiescent with unresolved terminal dependencies: '
@@ -8217,12 +6050,13 @@ def _main_impl() -> None:
                             f'waiting_for_bridge={waiting_bridge}, '
                             f'incomplete_tiles={incomplete_tiles}, '
                             f'missing_terminal_variants={missing_terminal_variants}, '
-                            f'missing_physical_unions={missing_physical_unions}'
+                            f'missing_physical_unions={missing_physical_unions}, '
+                            f'process_scheduler={process_scheduler_issues}'
                         )
                     break
                 continue
             _log_scheduler_wait_state()
-            if push_drain_active:
+            if scheduler_state.push_drain_active:
                 # sleep on the shared wake event — worker results and future
                 # completions both set it, so the loop wakes the instant either happens.
                 # The heartbeat only bounds the worker-liveness re-check cadence.
@@ -8329,9 +6163,10 @@ def _main_impl() -> None:
     _drain_completed_prediction_accumulation_futures()
     _drain_completed_background_futures()
 
+    scheduler_result = scheduler.result()
     post_inference_tail_started = (
-        float(gpu_inference_drained_at)
-        if gpu_inference_drained_at is not None
+        float(scheduler_result.gpu_inference_drained_at)
+        if scheduler_result.gpu_inference_drained_at is not None
         else time.perf_counter()
     )
     runtime_telemetry().gauge('pipeline.phase', 'post_inference_final_assembly')
@@ -8342,7 +6177,8 @@ def _main_impl() -> None:
         nrrd_done_at_boundary, nrrd_total_at_boundary = 0, 0
     print('\n=== Scheduler and streamed physical-view finalization drained; entering global output tail ===')
     print(
-        f'Inference tasks completed={int(gpu_worker_results_collected)}/{int(gpu_worker_total_tasks)}; '
+        f'Inference tasks completed={int(scheduler_result.gpu_worker_results_collected)}/'
+        f'{int(scheduler_result.gpu_worker_total_tasks)}; '
         f'queued NRRD writes completed={int(nrrd_done_at_boundary)}/{int(nrrd_total_at_boundary)}. '
         'Subsequent phase banners and telemetry identify every remaining tail stage.'
     )
@@ -8427,7 +6263,9 @@ def _main_impl() -> None:
                 # This physical view's dense/ref contribution was already committed by the
                 # scheduler-time single-writer reducer.
                 continue
-            d1_base_ref = d1_layer_ref_by_parent.get((str(model_name), str(view.name)))
+            d1_base_ref = scheduler_result.artifacts.d1_layer_ref_by_parent.get(
+                (str(model_name), str(view.name))
+            )
             d1_dense_orthogonal_additions_present = bool(
                 str(view.name) in view_volumes_by_model.get(str(model_name), {})
             )
@@ -8739,7 +6577,7 @@ def _main_impl() -> None:
         voxel_volume_path = write_json_manifest(
             out_dir / f'{input_path.stem}_VoxelVolume.json',
             {
-                'schema': 'volume_tta.v18.voxel_count/1',
+                'schema': TTA_VOXEL_COUNT_SCHEMA,
                 'voxel_count': int(voxel_volume),
                 'source_stage': 'final_output_after_all_postprocessing',
                 'target': 'native_input_space_final_binary_prediction',
@@ -8869,25 +6707,33 @@ def _main_impl() -> None:
                 'cpu_worker_ready_details': {
                     str(instance_id): dict(details)
                     for instance_id, details in sorted(
-                        cpu_worker_ready_details_by_id.items()
+                        scheduler_result.cpu_worker_ready_details.items()
                     )
                 },
                 'worker_task_counts': {
                     'gpu_dispatched_by_worker': {
                         str(worker_id): int(count)
-                        for worker_id, count in sorted(gpu_worker_dispatched_by_id.items())
+                        for worker_id, count in sorted(
+                            scheduler_result.gpu_dispatched_by_worker.items()
+                        )
                     },
                     'gpu_completed_by_worker': {
                         str(worker_id): int(count)
-                        for worker_id, count in sorted(gpu_worker_results_by_id.items())
+                        for worker_id, count in sorted(
+                            scheduler_result.gpu_completed_by_worker.items()
+                        )
                     },
                     'cpu_dispatched_by_worker': {
                         str(worker_id): int(count)
-                        for worker_id, count in sorted(cpu_worker_dispatched_by_id.items())
+                        for worker_id, count in sorted(
+                            scheduler_result.cpu_dispatched_by_worker.items()
+                        )
                     },
                     'cpu_completed_by_worker': {
                         str(worker_id): int(count)
-                        for worker_id, count in sorted(cpu_worker_results_by_id.items())
+                        for worker_id, count in sorted(
+                            scheduler_result.cpu_completed_by_worker.items()
+                        )
                     },
                 },
                 'physical_view_backend_ownership': [
@@ -8895,25 +6741,31 @@ def _main_impl() -> None:
                         'model': str(parent[0]),
                         'physical_view': str(parent[1]),
                         'contract': str(
-                            hybrid_view_mode_by_parent.get(parent, 'single_backend')
+                            scheduler_result.hybrid_view_mode_by_parent.get(
+                                parent, 'single_backend'
+                            )
                         ),
                         'frames': {
                             str(backend_name): int(count)
                             for backend_name, count in sorted(
-                                hybrid_view_frames_by_backend.get(parent, Counter()).items()
+                                scheduler_result.hybrid_view_frames_by_backend.get(
+                                    parent, {}
+                                ).items()
                             )
                         },
                         'tasks': {
                             str(backend_name): int(count)
                             for backend_name, count in sorted(
-                                hybrid_view_tasks_by_backend.get(parent, Counter()).items()
+                                scheduler_result.hybrid_view_tasks_by_backend.get(
+                                    parent, {}
+                                ).items()
                             )
                         },
                     }
                     for parent in sorted(
-                        set(hybrid_view_frames_by_backend)
-                        | set(hybrid_view_tasks_by_backend)
-                        | set(hybrid_view_mode_by_parent)
+                        set(scheduler_result.hybrid_view_frames_by_backend)
+                        | set(scheduler_result.hybrid_view_tasks_by_backend)
+                        | set(scheduler_result.hybrid_view_mode_by_parent)
                     )
                 ],
             },
@@ -8971,7 +6823,7 @@ def _main_impl() -> None:
             output_metadata={
                 'voxel_volume': (
                     {
-                        'schema': 'volume_tta.v18.voxel_count/1',
+                        'schema': TTA_VOXEL_COUNT_SCHEMA,
                         'voxel_count': int(voxel_volume),
                         'source_stage': 'final_output_after_all_postprocessing',
                         'target': 'native_input_space_final_binary_prediction',
@@ -8996,85 +6848,47 @@ def _main_impl() -> None:
         )
 
 
-    if final_output_mask_mm is not final_union_mm:
-        close_memmap_array(final_output_mask_mm)
-    close_memmap_array(final_union_mm)
-    for model_support in native_view_support_by_model.values():
-        for mm in model_support.values():
-            close_memmap_array(mm)
-        model_support.clear()
-    for model_views in radial_native_output_by_model.values():
-        for mm in model_views.values():
-            close_memmap_array(mm)
-        model_views.clear()
-    for model_views in tilted_native_output_by_model.values():
-        for mm in model_views.values():
-            close_memmap_array(mm)
-        model_views.clear()
-    for model_views in view_volumes_by_model.values():
-        for mm in model_views.values():
-            close_memmap_array(mm)
-        model_views.clear()
-    for model_support in parent_mask_support_by_model.values():
-        for mm in model_support.values():
-            close_raw_store_or_memmap_volume(mm, keep_temp=bool(keep_temp_artifacts))
-        model_support.clear()
-    for model_support in parent_bridge_support_by_model.values():
-        for mm in model_support.values():
-            close_raw_store_or_memmap_volume(mm, keep_temp=bool(keep_temp_artifacts))
-        model_support.clear()
-    for mm in tile_accumulator_by_set.values():
-        archive_or_delete_binary_volume_storage(
-            mm,
-            keep_temp=bool(keep_temp_artifacts),
-            workers=int(tail_tile_slice_workers),
-            desc='remaining consolidated tile accumulator',
-        )
-    tile_accumulator_by_set.clear()
-    for mm in tile_parent_mask_accumulator_by_set.values():
-        archive_or_delete_binary_volume_storage(
-            mm,
-            keep_temp=bool(keep_temp_artifacts),
-            workers=int(tail_tile_slice_workers),
-            desc='remaining parent-mask tile category accumulator',
-        )
-    tile_parent_mask_accumulator_by_set.clear()
-    for mm in tile_parent_bridge_accumulator_by_set.values():
-        archive_or_delete_binary_volume_storage(
-            mm,
-            keep_temp=bool(keep_temp_artifacts),
-            workers=int(tail_tile_slice_workers),
-            desc='remaining parent-bridge tile category accumulator',
-        )
-    tile_parent_bridge_accumulator_by_set.clear()
-    for mm in baseline_union_by_model_view.values():
-        close_memmap_array(mm)
-    for mm in baseline_confmap_by_model_view.values():
-        close_memmap_array(mm)
-    for _, yolo in yolo_models:
-        if yolo is not None:
-            unload_yolo_model(yolo)
-    if volume_rgb is not input_volume_rgb:
-        close_memmap_array(volume_rgb)
-    close_memmap_array(input_volume_rgb)
-    trim_cuda_memory()
-    gc.collect()
+    output_artifacts = TtaOutputArtifacts(
+        final_output_mask_mm=final_output_mask_mm,
+        final_union_mm=final_union_mm,
+        native_view_support_by_model=native_view_support_by_model,
+        radial_native_output_by_model=radial_native_output_by_model,
+        tilted_native_output_by_model=tilted_native_output_by_model,
+        view_volumes_by_model=view_volumes_by_model,
+        parent_mask_support_by_model=parent_mask_support_by_model,
+        parent_bridge_support_by_model=parent_bridge_support_by_model,
+        tile_accumulator_by_set=tile_accumulator_by_set,
+        tile_parent_mask_accumulator_by_set=tile_parent_mask_accumulator_by_set,
+        tile_parent_bridge_accumulator_by_set=tile_parent_bridge_accumulator_by_set,
+        baseline_union_by_model_view=baseline_union_by_model_view,
+        baseline_confmap_by_model_view=baseline_confmap_by_model_view,
+        yolo_models=yolo_models,
+        volume_rgb=volume_rgb,
+        input_volume_rgb=input_volume_rgb,
+    )
+    def _finalize_selected_run_after_output_close() -> None:
+        if run_manifest_path is not None:
+            if run_manifest is None:  # pragma: no cover - paired construction invariant
+                raise RuntimeError('v18 TTA run manifest was not constructed')
+            if tta_artifact_identities is None:  # pragma: no cover - launch invariant
+                raise RuntimeError('v18 TTA artifact identities were not captured')
+            _finalize_tta_selected_run_and_publish(
+                temp_dir=temp_dir,
+                out_dir=out_dir,
+                keep_temp_artifacts=bool(keep_temp_artifacts),
+                manifest_path=run_manifest_path,
+                manifest=run_manifest,
+                artifact_identities=tta_artifact_identities,
+            )
+        elif not keep_temp_artifacts:
+            _cleanup_tta_selected_run_scratch(temp_dir=temp_dir, out_dir=out_dir)
 
-    if run_manifest_path is not None:
-        if run_manifest is None:  # pragma: no cover - paired construction invariant
-            raise RuntimeError('v18 TTA run manifest was not constructed')
-        if tta_artifact_identities is None:  # pragma: no cover - launch invariant
-            raise RuntimeError('v18 TTA artifact identities were not captured')
-        _finalize_tta_selected_run_and_publish(
-            temp_dir=temp_dir,
-            out_dir=out_dir,
-            keep_temp_artifacts=bool(keep_temp_artifacts),
-            manifest_path=run_manifest_path,
-            manifest=run_manifest,
-            artifact_identities=tta_artifact_identities,
-        )
-    elif not keep_temp_artifacts:
-        _cleanup_tta_selected_run_scratch(temp_dir=temp_dir, out_dir=out_dir)
+    _output_teardown_result = _close_tta_output_artifacts(
+        output_artifacts,
+        keep_temp_artifacts=bool(keep_temp_artifacts),
+        tile_slice_workers=int(tail_tile_slice_workers),
+        after_close=_finalize_selected_run_after_output_close,
+    )
 
     post_inference_tail_seconds = float(time.perf_counter() - post_inference_tail_started)
     runtime_telemetry().gauge('post_inference_tail.seconds', post_inference_tail_seconds)

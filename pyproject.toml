@@ -3,8 +3,8 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "volume-tta"
-version = "18.0.1"
+name = "xta"
+version = "18.0.2"
 description = "YOLO segmentation pretraining and test-time augmentation for large volumes"
 requires-python = ">=3.10"
 dependencies = [
@@ -26,13 +26,16 @@ acceleration = ["numba", "deflate", "isal"]
 pta = ["pynrrd", "albumentations"]
 
 [project.scripts]
-volume-tta = "XTA.cli:run"
+xta = "XTA.cli:run"
 
 [tool.setuptools.packages.find]
 include = ["XTA*"]
 
+[tool.setuptools.package-data]
+"XTA.examples.external_augmentations" = ["README.md"]
+
 [tool.setuptools.data-files]
-"share/volume-tta" = [
+"share/xta" = [
   "ARCHITECTURE.md",
-  "GPT-5.6-Sol-Ultra_v18.0.1_SLURM.py",
+  "GPT-5.6-Sol-Ultra_v18.0.2_SLURM.py",
 ]

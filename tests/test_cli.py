@@ -15,7 +15,7 @@ from XTA import cli
 
 
 ROOT = Path(__file__).resolve().parents[1]
-LAUNCHER = ROOT / "GPT-5.6-Sol-Ultra_v18.0.1_SLURM.py"
+LAUNCHER = ROOT / "GPT-5.6-Sol-Ultra_v18.0.2_SLURM.py"
 
 
 class CliTests(unittest.TestCase):
@@ -38,7 +38,7 @@ class CliTests(unittest.TestCase):
 
         completed = self.run_python(str(LAUNCHER), "--version")
         self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertIn("18.0.1", completed.stdout)
+        self.assertIn("18.0.2", completed.stdout)
 
         for mode in ("tta", "pta"):
             with self.subTest(mode_version=mode):
@@ -46,7 +46,7 @@ class CliTests(unittest.TestCase):
                     str(LAUNCHER), "--mode", mode, "--version"
                 )
                 self.assertEqual(completed.returncode, 0, completed.stdout)
-                self.assertIn("18.0.1", completed.stdout)
+                self.assertIn("18.0.2", completed.stdout)
 
         program = (
             "import sys; import XTA.cli; "

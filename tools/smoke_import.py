@@ -74,7 +74,7 @@ def install_stubs() -> None:
         "tifffile": tifffile,
         "tqdm": tqdm_module,
     }
-    if os.environ.get("VOLUME_TTA_SMOKE_NUMBA", "").strip() == "1":
+    if os.environ.get("XTA_SMOKE_NUMBA", "").strip() == "1":
         numba = _StubModule("numba")
 
         def njit(*args: object, **kwargs: object) -> object:
@@ -200,11 +200,21 @@ def main() -> None:
         "cuda_d1",
         "assembly",
         "outputs",
+        "tta_lifecycle",
+        "tta_outputs",
+        "tta_prediction",
+        "tta_scheduler",
+        "tta_terminal",
         "pipeline",
         "pta_config",
         "pta_mode",
         "pta_runtime",
         "pta_scheduler",
+        "pta_augmentation",
+        "pta_dataset",
+        "pta_rendering",
+        "pta_publication",
+        "pta_workers",
         "nvtiff_backend",
         "pta",
         "tta_mode",

@@ -1,5 +1,5 @@
-#ifndef VOLUME_TTA_TEST_FAKE_QATZIP_H
-#define VOLUME_TTA_TEST_FAKE_QATZIP_H
+#ifndef XTA_TEST_FAKE_QATZIP_H
+#define XTA_TEST_FAKE_QATZIP_H
 
 #include <stdint.h>
 

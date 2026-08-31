@@ -147,7 +147,7 @@ class DsaNativeSourceContractTests(unittest.TestCase):
 
     def test_setup_uses_the_owned_optional_source(self) -> None:
         setup_source = (ROOT / 'setup.py').read_text(encoding='utf-8')
-        self.assertIn('VOLUME_TTA_BUILD_INTEL', setup_source)
+        self.assertIn('XTA_BUILD_INTEL', setup_source)
         self.assertIn('native/dsa_copy.c', setup_source)
         self.assertIn('XTA._dsa_copy', setup_source)
         self.assertIn('extra_link_args=["-pthread"]', setup_source)

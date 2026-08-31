@@ -15,6 +15,7 @@ install_stubs()
 
 from XTA import geometry
 from XTA import pta
+from XTA import pta_publication
 from XTA.pta_config import parse_pta_args
 from XTA.unification.contracts import (
     DataRole,
@@ -753,7 +754,7 @@ class CrossModeGeometryMatrixTests(unittest.TestCase):
                 channel_kind="gray",
                 channel_offsets=(0,),
             )
-            with mock.patch.object(pta, "write_image") as writer:
+            with mock.patch.object(pta_publication, "write_image") as writer:
                 batch = pta.publish_pta_candidate_image_batch(
                     cand=candidate,
                     image=image,

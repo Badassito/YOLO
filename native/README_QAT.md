@@ -23,16 +23,16 @@ pkg-config --cflags --libs qatzip  # normally supplies -lqatzip
 Intel's supported distro packages are `qatzip qatzip-devel` on RHEL-family
 systems and `qatzip libqatzip3 libqatzip-dev` on Debian-family systems.
 
-Normal source builds use `VOLUME_TTA_BUILD_INTEL=auto`: QAT is included only
+Normal source builds use `XTA_BUILD_INTEL=auto`: QAT is included only
 when `pkg-config` discovers QATzip. A missing development package therefore
 still produces a CPU-capable wheel. To require QAT and fail the build if it
 cannot be compiled:
 
 ```bash
-VOLUME_TTA_BUILD_INTEL=qat python -m pip wheel . --no-deps
+XTA_BUILD_INTEL=qat python -m pip wheel . --no-deps
 ```
 
-`VOLUME_TTA_BUILD_INTEL=none` forces a build without this extension.
+`XTA_BUILD_INTEL=none` forces a build without this extension.
 
 ## Runtime contract
 
@@ -112,7 +112,7 @@ On the provisioned production host, force the extension build and run the
 hardware-gated smoke test/microbenchmark:
 
 ```bash
-VOLUME_TTA_BUILD_INTEL=qat python -m pip install .
+XTA_BUILD_INTEL=qat python -m pip install .
 python tools/intel_accelerator_selftest.py \
   --backend qat --qat-level 1 --size-mib 16 --iterations 5
 ```

@@ -33,11 +33,11 @@ To force a QPL build and fail if its development package is missing:
 
 ```bash
 pkg-config --atleast-version=1.9.0 qpl
-VOLUME_TTA_BUILD_INTEL=qpl python -m pip wheel . --no-deps
+XTA_BUILD_INTEL=qpl python -m pip wheel . --no-deps
 ```
 
 The normal `auto` build includes the extension only when pkg-config discovers
-QPL; `VOLUME_TTA_BUILD_INTEL=none` forces a pure-Python build.
+QPL; `XTA_BUILD_INTEL=none` forces a pure-Python build.
 
 ## Runtime contract
 
@@ -78,7 +78,7 @@ compression-ratio and throughput measurement remains a production release gate.
 On a configured IAA host, build/install the extension and run:
 
 ```bash
-VOLUME_TTA_TEST_IAA_HARDWARE=1 \
+XTA_TEST_IAA_HARDWARE=1 \
   python -m unittest tests.test_qpl_codec_contract.QplHardwareSmokeTests -v
 ```
 

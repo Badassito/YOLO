@@ -969,8 +969,8 @@ class CudaInterpolationRendererContractTests(unittest.TestCase):
         self.assertGreater(int(after_render['device_to_host_bytes']), 0)
 
     @unittest.skipUnless(
-        os.environ.get('VOLUME_TTA_TEST_CUDA', '').strip() == '1',
-        'set VOLUME_TTA_TEST_CUDA=1 on an NVIDIA CUDA host',
+        os.environ.get('XTA_TEST_CUDA', '').strip() == '1',
+        'set XTA_TEST_CUDA=1 on an NVIDIA CUDA host',
     )
     def test_real_cupy_backend_matches_the_numpy_device_oracle(self) -> None:
         sdf = np.full((7, 7), -2.0, dtype=np.float32)

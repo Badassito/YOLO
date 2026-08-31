@@ -86,8 +86,8 @@ class QplNativeSourceContractTests(unittest.TestCase):
 
 @unittest.skipUnless(
     sys.platform.startswith("linux")
-    and os.environ.get("VOLUME_TTA_TEST_IAA_HARDWARE", "").strip() == "1",
-    "set VOLUME_TTA_TEST_IAA_HARDWARE=1 on a configured IAA host",
+    and os.environ.get("XTA_TEST_IAA_HARDWARE", "").strip() == "1",
+    "set XTA_TEST_IAA_HARDWARE=1 on a configured IAA host",
 )
 class QplHardwareSmokeTests(unittest.TestCase):
     def test_hardware_only_gzip_round_trip_and_counters(self) -> None:
@@ -100,7 +100,7 @@ class QplHardwareSmokeTests(unittest.TestCase):
         self.assertEqual(tuple(capabilities.get("supported_levels", ())), (1,))
         self.assertGreater(int(capabilities.get("work_queue_count", 0)), 0)
 
-        seed = bytes(range(251)) + b"volume-tta-qpl-hardware-smoke\x00"
+        seed = bytes(range(251)) + b"xta-qpl-hardware-smoke\x00"
         payload_size = 3 * 1024 * 1024 + 257
         payload = (seed * ((payload_size + len(seed) - 1) // len(seed)))[:payload_size]
         _qpl_codec.stats(reset=True)

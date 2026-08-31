@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from collections import OrderedDict
+import importlib.util
 import inspect
 import os
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -13,7 +15,22 @@ import numpy as np
 
 from tools.smoke_import import install_stubs
 
-install_stubs()
+
+def _module_is_available(name: str) -> bool:
+    loaded = sys.modules.get(name)
+    if loaded is not None:
+        return getattr(loaded, "__spec__", None) is not None
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+if not all(
+    _module_is_available(name)
+    for name in ("cv2", "scipy", "tifffile", "tqdm")
+):
+    install_stubs()
 
 from XTA import backprojection, cuda_backend, cuda_d1, geometry, inference
 from XTA.geometry import AffineSpec, AugJob

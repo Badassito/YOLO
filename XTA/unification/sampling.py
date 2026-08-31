@@ -28,7 +28,7 @@ def forward_sampling_policy() -> ForwardSamplingPolicy:
     """Return the single policy object used by v18 built-in geometry."""
 
     return ForwardSamplingPolicy(
-        policy_id="volume_tta.forward_sampling",
+        policy_id="xta.forward_sampling",
         policy_version=18,
         coordinate_convention=(
             "gray8_t_y_x_frame_index; destination-pixel-center to source; "

@@ -1,1 +1,1 @@
-"""Regression tests for the volume TTA pipeline."""
+"""Regression tests for XTA."""

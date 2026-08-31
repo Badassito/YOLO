@@ -1,7 +1,7 @@
-# Volume TTA architecture
+# XTA architecture
 
-`GPT-5.6-Sol-Ultra_v18.0.1_SLURM.py` is the sole versioned launcher. It, the
-installed `volume-tta` console script, and `python -m XTA` all dispatch
+`GPT-5.6-Sol-Ultra_v18.0.2_SLURM.py` is the sole versioned launcher. It, the
+installed `xta` console script, and `python -m XTA` all dispatch
 through `XTA.cli.run()`.
 The implementation lives in the importable `XTA` package so spawned processes
 resolve worker functions and data types through canonical module paths.
@@ -36,12 +36,39 @@ resolve worker functions and data types through canonical module paths.
 | `pta_config` | strict PTA-only v18 grammar, grouped geometry and mode-specific defaults |
 | `pta_mode`, `pta_runtime` | dependency-light PTA validation followed by construction of the complete native runtime option contract |
 | `pta_scheduler` | independently tested CUDA-owner layout, compatible-work packing, VRAM admission and deterministic OOM splitting |
-| `pta` | PTA discovery, eligibility, splitting, rendering, external augmentation and publication around shared geometry |
+| `pta_augmentation` | external PTA policy inspection, loading, deterministic thread-local construction and paired image/mask execution |
+| `pta_dataset` | PTA candidate identity, deterministic augmentation-version planning, background policy and dataset splitting |
+| `pta_rendering` | canonical spawn-pickled PTA render-plan values, CPU geometry caches and frame/tile rendering primitives |
+| `pta_publication` | image/label encoding, atomic publication, canonical dataset image sink and candidate output paths |
+| `pta_workers` | sole PTA shared-memory, worker-global, CPU/GPU task-entry, result and persistent-pool process owner |
+| `pta` | PTA source discovery/preprocessing, geometry planning, dataset orchestration, reporting and manifest publication |
 | `tta_mode` | production TTA runner entered only after mode-specific CLI validation |
+| `tta_lifecycle` | outer TTA resource ownership, selected-run scratch cleanup and complete-manifest publication transaction |
+| `tta_outputs` | single-use identity-preserving ownership and ordered teardown of settled TTA output artifacts |
+| `tta_prediction` | lazy physical-view frame caching and bounded prediction-source build, staging and warmup queues |
+| `tta_scheduler` | stateful TTA process-inference admission, hybrid/D1 ownership, CPU/GPU dispatch, result transport and accounting |
+| `tta_terminal` | completed physical-view TTA collapse, one-time terminal backprojection and dense-union handoff credit |
 | `cli` | dependency-light strict `--mode tta|pta` dispatcher |
 | `intel_compression` | dependency-light policy/adapter for optional QATzip and QPL companion extensions |
 | `intel_dsa` | lazy policy, eligibility, drain transaction and lifecycle for optional Linux idxd workspace copy |
-| `pipeline` | production TTA orchestration, canonical render fan-out and complete-manifest-last lifecycle |
+| `pipeline` | production TTA preparation, completed-view assembly and output facade around the process scheduler |
+
+### Incremental orchestration decomposition
+
+v18.0.2 establishes explicit owners for TTA run resources/publication, prediction-source
+preparation, terminal physical-view fusion, and PTA external augmentation. It also adds the
+leaf PTA dataset-policy owner and a stateful `TtaScheduler` for process-inference admission,
+hybrid CPU/GPU and D1 ownership, dynamic lease splitting, dispatch, result transport,
+accounting, liveness checks, and worker shutdown. It also separates PTA's canonical render
+graph, publication primitives, and complete worker/pool process state, plus establishes a
+single-use TTA settled-artifact teardown owner. Compatibility names remain exact facade
+aliases, while spawned PTA targets resolve directly through `XTA.pta_workers`.
+
+The remaining TTA closure cluster now owns view preparation, P/B tile gates, consolidation,
+physical-view reduction, output scheduling, and manifest construction. Those paths can expand
+the existing `tta_outputs` boundary only after they produce settled assembly artifacts instead
+of cross-reading live registries. PTA's worker extraction retains its prior CUDA/start-method
+semantics verbatim and still requires physical-GPU qualification before release.
 
 `XTA.__init__` is deliberately inert. In particular, it does not import OpenCV,
 SciPy, Ultralytics, CUDA, OpenVINO or future accelerator runtimes. Every supported command
@@ -102,6 +129,13 @@ respective grammar.
 
 ## Backend boundary
 
+`TtaScheduler` is the sole mutable owner of TTA process-inference queues, dynamic task
+identities and totals, tile-result reservations, hybrid/D1 claims, backend cost estimates,
+result transport, and worker accounting. Its frozen inputs and injected operations keep
+lower layers unaware of orchestration, while synchronous main-thread callbacks return
+completed leases to the still-inline view/tile assembly owner. The pipeline consumes an
+immutable result snapshot for output metadata rather than reading live scheduler counters.
+
 `XTA.inference_backends` contains dependency-free control-plane contracts. The
 current CUDA/OpenVINO scheduler owns tuned leasing and hybrid policy. Future scheduler work
 should adapt those workers to `InferenceBackend` rather than adding another backend-specific
@@ -131,7 +165,7 @@ CUDA behavior.
 
 ## Multiprocessing rules
 
-- Launch work through the sole versioned script, installed `volume-tta` command, or
+- Launch work through the sole versioned script, installed `xta` command, or
   `python -m XTA`; all three use the same strict mode-aware dispatcher. Do not load
   modules under ad-hoc aliases.
 - Worker targets remain module-level importable functions in `XTA.workers`.

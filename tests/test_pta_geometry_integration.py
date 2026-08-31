@@ -15,6 +15,8 @@ from tools.smoke_import import install_stubs
 install_stubs()
 
 from XTA import pta
+from XTA import pta_publication
+from XTA import pta_rendering
 from XTA.pta_config import parse_pta_args
 from XTA.pta_runtime import build_runtime_options
 
@@ -289,17 +291,17 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
 
             with (
                 mock.patch.object(
-                    pta,
+                    pta_rendering,
                     "_shared_render_full_intensity",
                     return_value=full_image,
                 ),
                 mock.patch.object(
-                    pta,
+                    pta_rendering,
                     "_shared_render_full_mask",
                     return_value=full_mask,
                 ),
                 mock.patch.object(
-                    pta,
+                    pta_rendering,
                     "render_shared_tile_images",
                     side_effect=image_tile,
                 ) as image_tile_render,
@@ -309,12 +311,12 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
                     side_effect=mask_tile,
                 ) as mask_tile_render,
                 mock.patch.object(
-                    pta,
+                    pta_rendering,
                     "extract_padded_tile",
                     side_effect=AssertionError("canvas crop must not run"),
                 ),
                 mock.patch.object(
-                    pta,
+                    pta_rendering,
                     "resize_centered",
                     side_effect=AssertionError("second resize must not run"),
                 ),
@@ -394,7 +396,7 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
                 return np.full((_aff.out_h, _aff.out_w), value, dtype=np.uint8)
 
             with mock.patch.object(
-                pta,
+                pta_rendering,
                 "_shared_render_full_intensity",
                 side_effect=render_plane,
             ):
@@ -466,6 +468,153 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
             ],
             0,
         )
+
+    def test_diagnostics_only_positive_volume_skips_dataset_candidate_invariant(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_dir = root / "input"
+            output_dir = root / "output"
+            input_dir.mkdir()
+            image_path = input_dir / "sample_0001.png"
+            label_path = input_dir / "sample_0001.txt"
+            image_path.write_bytes(b"image")
+            label_path.write_text(
+                "0 0.25 0.25 0.75 0.25 0.75 0.75 0.25 0.75\n",
+                encoding="utf-8",
+            )
+
+            spec = pta.VolumeInputSpec(
+                input_dir=input_dir,
+                stem="sample",
+                kind="sequence",
+                image_paths_by_index={1: image_path},
+                video_path=None,
+                labels_by_index={1: label_path},
+                segmentation_nrrd_path=None,
+                volume_class="fully_labeled",
+                label_source="yolo",
+                input_start_index=1,
+                encoded_indices=(1,),
+            )
+            volume = np.zeros((1, 2, 2), dtype=np.uint8)
+            mask = np.ones_like(volume)
+            source = pta.SourceVolume(
+                input_dir=input_dir,
+                stem="sample",
+                kind="sequence",
+                image_paths=[image_path],
+                video_path=None,
+                labels_by_frame={0: label_path},
+                segmentation_nrrd_path=None,
+                mask_volume=None,
+                volume_class="fully_labeled",
+                label_source="yolo",
+                input_start_index=1,
+                encoded_indices=(1,),
+                volume=volume,
+                fps=1.0,
+            )
+            view = pta.ViewInfo(
+                name="transverse",
+                display_name="Transverse",
+                family="transverse",
+                num_slices=1,
+                src_h=2,
+                src_w=2,
+                pad_mode="clamp",
+                full_t=1,
+                full_h=2,
+                full_w=2,
+            )
+            plan = mock.Mock(
+                view=view,
+                tag="transverse",
+                stats={"tag": "transverse", "view": "Transverse"},
+            )
+            prepared = pta.PreparedVolume(
+                src=source,
+                source_shape=(1, 2, 2),
+                processing_shape=(1, 2, 2),
+                effective_volume_class="fully_labeled",
+                label_enabled=True,
+                annotation_states=(pta.ANNOTATION_FOREGROUND,),
+                save_overlay=False,
+                volume_for_render=volume,
+                mask_for_render=mask,
+                views=[view],
+                plans=[plan],
+                smoothing_stats=[],
+                nrrd_paths=[],
+                voxel_initial=None,
+                voxel_final=None,
+                foreground_preservation_stats={
+                    "input_foreground_transverse_slices": 1,
+                    "classified_output_foreground_transverse_slices": 0,
+                    "retained_output_foreground_transverse_slices": 0,
+                },
+                v18_mode=True,
+            )
+            arguments = [
+                "--input",
+                str(input_dir),
+                "--output",
+                str(output_dir),
+                "--enable_cartesian",
+                "transverse",
+                "--save",
+                "summary",
+                "--worker_backend",
+                "thread",
+                "--pipeline_depth",
+                "1",
+                "--workers",
+                "1",
+                "--frame_workers",
+                "1",
+            ]
+            _config, runtime_options = self._runtime_args(arguments)
+            topology = mock.Mock(
+                cuda_device_ids=(),
+                worker_cpu_order=(),
+                allowed_cpus=(0,),
+                summary="test topology",
+            )
+
+            with (
+                mock.patch.object(pta, "discover_topology", return_value=topology),
+                mock.patch.object(pta, "discover_volume_specs", return_value=[spec]),
+                mock.patch.object(
+                    pta,
+                    "load_source_volume_from_spec",
+                    return_value=source,
+                ),
+                mock.patch.object(
+                    pta,
+                    "prepare_loaded_source",
+                    return_value=prepared,
+                ),
+                mock.patch.object(
+                    pta,
+                    "validate_foreground_transverse_candidate_invariant",
+                    wraps=pta.validate_foreground_transverse_candidate_invariant,
+                ) as invariant,
+                mock.patch.object(
+                    pta,
+                    "write_pta_summary",
+                    return_value=output_dir / "summary.txt",
+                ),
+                mock.patch.object(
+                    pta,
+                    "write_v18_pta_manifest",
+                    return_value=output_dir / "manifest.json",
+                ),
+                mock.patch.object(pta, "assert_v18_pta_inputs_unchanged"),
+                mock.patch.object(pta, "_cleanup_v18_pta_selected_run_work"),
+                mock.patch("builtins.print"),
+            ):
+                pta.main(args=runtime_options, argv=arguments)
+
+            invariant.assert_not_called()
 
     def test_encoded_source_gaps_disable_all_3d_views_even_when_fully_labeled(self) -> None:
         config, runtime_options = self._runtime_args(
@@ -854,7 +1003,7 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
             )
             voxel = json.loads(voxel_path.read_text())
 
-        self.assertEqual(manifest["pipeline_version"], "18.0.1")
+        self.assertEqual(manifest["pipeline_version"], "18.0.2")
         self.assertEqual(manifest["mode"], "pta")
         self.assertEqual(manifest["resolved_configuration"]["in_plane_variants_deg"], [0.0])
         self.assertEqual(
@@ -1158,8 +1307,10 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as temp_dir:
             with (
-                mock.patch.object(pta, "write_image") as write_image,
-                mock.patch.object(pta, "write_yolo_lines") as write_labels,
+                mock.patch.object(pta_publication, "write_image") as write_image,
+                mock.patch.object(
+                    pta_publication, "write_yolo_lines"
+                ) as write_labels,
             ):
                 outcome = pta.write_selected_candidate_version(
                     cand=candidate,

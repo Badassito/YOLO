@@ -24,7 +24,7 @@ if str(ROOT) not in sys.path:
 
 
 def _payload(size: int) -> bytes:
-    seed = bytes(range(251)) + b"volume-tta-intel-selftest\x00"
+    seed = bytes(range(251)) + b"xta-intel-selftest\x00"
     return (seed * ((int(size) + len(seed) - 1) // len(seed)))[: int(size)]
 
 

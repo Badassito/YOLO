@@ -9,6 +9,10 @@ from typing import Any, Mapping, Sequence
 from .context import UnifiedLaunchContext
 
 
+TTA_RUN_MANIFEST_SCHEMA = "xta.v18.run_manifest/1"
+TTA_VOXEL_COUNT_SCHEMA = "xta.v18.voxel_count/1"
+
+
 _VIEW_FIELDS = (
     "name",
     "physical_view_name",
@@ -292,7 +296,7 @@ def build_tta_run_manifest(
     paths = {str(key): str(Path(value)) for key, value in output_paths.items()}
 
     return {
-        "schema": "volume_tta.v18.run_manifest/1",
+        "schema": TTA_RUN_MANIFEST_SCHEMA,
         "status": "complete",
         "launcher": {
             "name": str(launch_context.launcher),
@@ -357,6 +361,8 @@ def build_tta_run_manifest(
 
 
 __all__ = (
+    "TTA_RUN_MANIFEST_SCHEMA",
+    "TTA_VOXEL_COUNT_SCHEMA",
     "assert_tta_artifacts_unchanged",
     "build_tta_run_manifest",
     "capture_tta_artifact_identities",
