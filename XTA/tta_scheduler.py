@@ -121,6 +121,34 @@ class TtaSchedulerCallbacks:
 
 
 @dataclass
+class D1ParentGroup:
+    """Scheduler-owned transaction for one multi-worker D1 parent."""
+
+    parent: Tuple[str, str]
+    group_id: str
+    participants: Tuple[int, ...]
+    leader_worker_id: int
+    task_worker_by_id: Dict[int, int]
+    expected_ranges_by_worker: Dict[int, Tuple[Tuple[int, int], ...]]
+    claimed_workers: set[int] = field(default_factory=set)
+    completed_workers: set[int] = field(default_factory=set)
+    partial_artifacts_by_worker: Dict[int, Dict[str, object]] = field(
+        default_factory=dict
+    )
+    host_artifacts_by_worker: Dict[int, Dict[str, object]] = field(
+        default_factory=dict
+    )
+    reduction_dispatched: bool = False
+    host_fallback_requested: bool = False
+    held_result: Optional[Dict[str, object]] = None
+    release_pending_workers: set[int] = field(default_factory=set)
+    release_ack_workers: set[int] = field(default_factory=set)
+    admitted_at: float = field(default_factory=time.perf_counter)
+    reduction_started_at: Optional[float] = None
+    release_requested_at: Optional[float] = None
+
+
+@dataclass
 class TtaSchedulerState:
     """Sole mutable owner of process scheduler counters, registries, and queues."""
 
@@ -203,6 +231,21 @@ class TtaSchedulerState:
     d1_view_shadow_path_by_parent: Dict[Tuple[str, str], Path] = field(
         default_factory=dict
     )
+    d1_groups_by_parent: Dict[Tuple[str, str], D1ParentGroup] = field(
+        default_factory=dict
+    )
+    d1_group_parent_by_id: Dict[str, Tuple[str, str]] = field(default_factory=dict)
+    d1_group_fallback_parents: set[Tuple[str, str]] = field(default_factory=set)
+    d1_group_next_control_task_id: int = -1
+    d1_group_parents_admitted_total: int = 0
+    d1_group_parents_reduced_total: int = 0
+    d1_group_parents_released_total: int = 0
+    d1_group_host_fallbacks_total: int = 0
+    d1_group_peer_read_bytes_total: int = 0
+    d1_group_reduction_seconds_total: float = 0.0
+    d1_group_peer_or_seconds_total: float = 0.0
+    d1_group_d2h_seconds_total: float = 0.0
+    d1_group_release_seconds_total: float = 0.0
 
     hybrid_view_mode_by_parent: Dict[Tuple[str, str], str] = field(default_factory=dict)
     fullframe_task_ids_by_parent: Dict[Tuple[str, str], List[int]] = field(
@@ -993,21 +1036,24 @@ class TtaScheduler:
         return requested
 
     def hybrid_gpu_selection_rank(self, task: Dict[str, object]) -> int:
+        d1_parent = self.d1_task_parent_key(task)
+        if d1_parent is not None and d1_parent in self.state.d1_groups_by_parent:
+            return 0
         parent = self.hybrid_task_parent_key(task)
         mode = str(task.get('result_mode', 'file'))
         if parent is not None and mode == 'direct_union':
-            return 0
-        if mode == 'd1_owner' and self.d1_task_parent_key(task) in self.state.d1_owner_by_parent:
             return 1
-        if parent is None:
+        if mode == 'd1_owner' and self.d1_task_parent_key(task) in self.state.d1_owner_by_parent:
             return 2
-        if mode == 'd1_owner':
+        if parent is None:
             return 3
-        if mode == self.inputs.hybrid_deferred_result_mode and not self.hybrid_parent_is_cpu_reserved(parent):
+        if mode == 'd1_owner':
             return 4
-        if mode == self.inputs.hybrid_deferred_result_mode:
+        if mode == self.inputs.hybrid_deferred_result_mode and not self.hybrid_parent_is_cpu_reserved(parent):
             return 5
-        return 6
+        if mode == self.inputs.hybrid_deferred_result_mode:
+            return 6
+        return 7
 
     def hybrid_gpu_stealback_quota(self,
         mandatory_gpu_pairs: Sequence[Tuple[int, int]],
@@ -1164,6 +1210,314 @@ class TtaScheduler:
             return None
         return self.gpu_worker_fullframe_parent_key(task)
 
+    def d1_owner_groups_requested(self) -> bool:
+        """Keep the experiment dark unless the v18.0.3 gate is explicitly nonzero."""
+        return bool(
+            self.inputs.v1613_d1_owner_active
+            and int(self.inputs.gpu_device_count) > 1
+            and self.operations._env_int('YOLO_TTA_V1803_D1_OWNER_GROUPS', 0) != 0
+        )
+
+    def d1_owner_group_size_limit(self) -> int:
+        return max(
+            1,
+            min(
+                8,
+                int(self.inputs.gpu_device_count),
+                self.operations._env_int(
+                    'YOLO_TTA_V1803_D1_OWNER_GROUP_SIZE',
+                    int(self.inputs.gpu_device_count),
+                ),
+            ),
+        )
+
+    def d1_owner_group_mode_active(self) -> bool:
+        """Return whether the requested gate can form a real multi-worker group."""
+        return bool(
+            self.d1_owner_groups_requested()
+            and int(self.d1_owner_group_size_limit()) >= 2
+        )
+
+    @staticmethod
+    def _coalesce_d1_ranges(
+        ranges: Sequence[Tuple[int, int]],
+    ) -> Tuple[Tuple[int, int], ...]:
+        merged: List[Tuple[int, int]] = []
+        for start, stop in sorted((int(a), int(b)) for a, b in ranges):
+            if start < 0 or stop <= start:
+                raise ValueError(f'invalid D1 task range [{start},{stop})')
+            if merged and start < merged[-1][1]:
+                raise ValueError(
+                    f'overlapping D1 task ranges {merged[-1]} and {(start, stop)}'
+                )
+            if merged and start == merged[-1][1]:
+                merged[-1] = (merged[-1][0], stop)
+            else:
+                merged.append((start, stop))
+        return tuple(merged)
+
+    def _reject_d1_group_parent(
+        self, parent: Tuple[str, str], reason: str,
+    ) -> None:
+        if parent in self.state.d1_group_fallback_parents:
+            return
+        self.state.d1_group_fallback_parents.add(parent)
+        self.operations.runtime_telemetry().add('d1.group.admission_fallbacks', 1)
+        print(
+            f'v18.0.3 D1 owner group not admitted for {parent[0]}/{parent[1]} '
+            f'({reason}); preserving the one-owner path.'
+        )
+
+    def ensure_d1_parent_group(
+        self,
+        task: Dict[str, object],
+        candidate_workers: Sequence[int],
+    ) -> Optional[D1ParentGroup]:
+        """Atomically bind all existing parent leases to deterministic participants."""
+        parent = self.d1_task_parent_key(task)
+        if parent is None or not self.d1_owner_group_mode_active():
+            return None
+        existing = self.state.d1_groups_by_parent.get(parent)
+        if existing is not None:
+            return existing
+        if parent in self.state.d1_group_fallback_parents:
+            return None
+        # v18.0.3 intentionally runs at most one multi-owner parent at a time.  This
+        # preserves ordinary view-level parallelism on nonparticipants and, critically,
+        # prevents a feasibility scan from reserving the same not-yet-claimed worker for
+        # multiple parents.
+        if self.state.d1_groups_by_parent:
+            return None
+        if parent in self.state.d1_owner_by_parent:
+            # A one-owner task may already be queued/running because an earlier refill had
+            # fewer than two idle candidates. Never mutate the remaining descriptors into a
+            # group after that external dispatch boundary has been crossed.
+            self._reject_d1_group_parent(parent, 'one-owner dispatch already committed')
+            return None
+        view = task.get('view')
+        if not isinstance(view, ViewInfo):
+            self._reject_d1_group_parent(parent, 'missing ViewInfo')
+            return None
+        task_ids = sorted(
+            (int(value) for value in self.state.fullframe_task_ids_by_parent.get(parent, ())),
+            key=lambda task_id: (
+                int(self.state.gpu_worker_tasks_by_id[task_id].get('slice_start', 0)),
+                int(task_id),
+            ),
+        )
+        descriptors = [
+            self.state.gpu_worker_tasks_by_id[int(task_id)] for task_id in task_ids
+        ]
+        if len(descriptors) < 2:
+            self._reject_d1_group_parent(parent, 'fewer than two seed leases')
+            return None
+        if any(
+            str(descriptor.get('result_mode', 'file')) != 'd1_owner'
+            for descriptor in descriptors
+        ):
+            self._reject_d1_group_parent(parent, 'parent result contract is not fully committed')
+            return None
+        if any(
+            str(descriptor.get('d1_view_shadow_store_dir', '') or '').strip()
+            for descriptor in descriptors
+        ):
+            self._reject_d1_group_parent(
+                parent, 'view-shadow output still requires one process-local writer',
+            )
+            return None
+        task_ranges = [
+            (
+                int(descriptor.get('slice_start', 0)),
+                int(descriptor.get('slice_start', 0))
+                + int(descriptor.get('slice_count', 0)),
+            )
+            for descriptor in descriptors
+        ]
+        try:
+            complete_ranges = self._coalesce_d1_ranges(task_ranges)
+        except ValueError as exc:
+            self._reject_d1_group_parent(parent, str(exc))
+            return None
+        if complete_ranges != ((0, int(view.num_slices)),):
+            self._reject_d1_group_parent(
+                parent,
+                f'seed coverage {complete_ranges} is not exactly [0,{int(view.num_slices)})',
+            )
+            return None
+
+        available = sorted({int(value) for value in candidate_workers})
+        available = [
+            worker for worker in available
+            if (
+                worker not in self.state.d1_active_parent_by_worker
+                and self.gpu_worker_inflight(worker) == 0
+            )
+        ]
+        participant_count = min(
+            int(self.d1_owner_group_size_limit()), len(available), len(descriptors),
+        )
+        if participant_count < 2:
+            # This is a transient dispatch condition rather than a permanent parent defect.
+            # Leave it unmarked so a later refill with more idle workers may admit a group.
+            return None
+        ranked_workers = sorted(
+            available,
+            key=lambda worker: (
+                float(self.state.gpu_worker_predicted_load_by_id.get(worker, 0.0)),
+                int(self.gpu_worker_inflight(worker)),
+                int(worker),
+            ),
+        )
+        participants = tuple(ranked_workers[:participant_count])
+        assigned_slices = {int(worker): 0 for worker in participants}
+        task_worker_by_id: Dict[int, int] = {}
+        ranges_by_worker: Dict[int, List[Tuple[int, int]]] = {
+            int(worker): [] for worker in participants
+        }
+        for task_id, range_pair in zip(task_ids, task_ranges):
+            worker = min(
+                participants,
+                key=lambda candidate: (
+                    int(assigned_slices[int(candidate)]),
+                    participants.index(int(candidate)),
+                ),
+            )
+            task_worker_by_id[int(task_id)] = int(worker)
+            ranges_by_worker[int(worker)].append(range_pair)
+            assigned_slices[int(worker)] += int(range_pair[1] - range_pair[0])
+        expected_ranges_by_worker = {
+            int(worker): self._coalesce_d1_ranges(ranges)
+            for worker, ranges in ranges_by_worker.items()
+        }
+        if any(not ranges for ranges in expected_ranges_by_worker.values()):
+            raise RuntimeError('D1 group planner produced an empty participant')
+        group_id = 'd1g-' + self.operations._sanitize_filesystem_token(
+            f'{parent[0]}--{parent[1]}--task{int(task_ids[0])}'
+        )
+        group = D1ParentGroup(
+            parent=parent,
+            group_id=str(group_id),
+            participants=tuple(int(value) for value in participants),
+            leader_worker_id=int(participants[0]),
+            task_worker_by_id=task_worker_by_id,
+            expected_ranges_by_worker=expected_ranges_by_worker,
+        )
+        # Reservation is part of admission, not first dispatch.  Without this atomic
+        # transition, another parent inspected during the same central-queue scan can
+        # reuse a participant before its first lease reaches ``claim_d1_owner``.
+        for worker in participants:
+            reserved_parent = self.state.d1_active_parent_by_worker.get(int(worker))
+            if reserved_parent is not None:
+                raise RuntimeError(
+                    f'D1 group planner selected already-reserved worker {worker}: '
+                    f'{reserved_parent}'
+                )
+        fallback_root = (
+            Path(self.inputs.gpu_worker_result_dir)
+            / 'd1_group_fallback'
+            / str(group.group_id)
+        )
+        for task_id in task_ids:
+            descriptor = self.state.gpu_worker_tasks_by_id[int(task_id)]
+            worker = int(task_worker_by_id[int(task_id)])
+            rank = int(participants.index(worker))
+            descriptor.update({
+                'disable_runtime_split': True,
+                'd1_group_id': str(group.group_id),
+                'd1_group_rank': int(rank),
+                'd1_group_size': int(len(participants)),
+                'd1_group_worker_id': int(worker),
+                'd1_group_leader_worker_id': int(group.leader_worker_id),
+                'd1_group_participants': tuple(int(value) for value in participants),
+                'd1_group_expected_ranges': tuple(
+                    expected_ranges_by_worker[int(worker)]
+                ),
+                'd1_group_fallback_path': str(
+                    fallback_root / f'participant_{rank:02d}.u32'
+                ),
+            })
+        self.state.d1_groups_by_parent[parent] = group
+        self.state.d1_group_parent_by_id[str(group.group_id)] = parent
+        self.state.d1_group_parents_admitted_total += 1
+        self.state.d1_owner_by_parent[parent] = int(group.leader_worker_id)
+        for worker in participants:
+            self.state.d1_active_parent_by_worker[int(worker)] = parent
+        self.operations.runtime_telemetry().add('d1.group.parents_admitted', 1)
+        self.operations.runtime_telemetry().gauge(
+            'd1.group.last_participant_count', int(len(participants)),
+        )
+        print(
+            f'v18.0.3 D1 owner group admitted for {parent[0]}/{parent[1]}: '
+            f'workers={participants}, leases={len(task_ids)}, '
+            f'assigned_slices={assigned_slices}.'
+        )
+        return group
+
+    def plan_next_d1_parent_group(
+        self,
+        candidate_workers: Optional[Sequence[int]] = None,
+    ) -> Optional[D1ParentGroup]:
+        """Reserve one deterministic heavy D1 parent before any one-owner claim.
+
+        Planning is centralized at a dispatch boundary.  ``d1_feasible_workers`` is
+        deliberately read-only with respect to group creation because it is called while
+        scanning the complete pending queue.
+        """
+        if not self.d1_owner_group_mode_active():
+            return None
+        if self.state.d1_groups_by_parent:
+            return next(iter(self.state.d1_groups_by_parent.values()))
+        workers = tuple(sorted({
+            int(value) for value in (
+                candidate_workers
+                if candidate_workers is not None
+                else tuple(self.state.gpu_task_queues)
+            )
+        }))
+        idle_workers = tuple(
+            worker for worker in workers
+            if (
+                worker not in self.state.d1_active_parent_by_worker
+                and self.gpu_worker_inflight(worker) == 0
+            )
+        )
+        if min(int(self.d1_owner_group_size_limit()), len(idle_workers)) < 2:
+            self.operations.runtime_telemetry().gauge(
+                'd1.group.waiting_idle_workers', int(len(idle_workers)),
+            )
+            return None
+
+        pending_set = {int(value) for value in self.state.gpu_worker_pending_task_ids}
+        ranked: List[Tuple[float, str, str, Tuple[str, str], Dict[str, object]]] = []
+        for parent, indexed_ids in self.state.fullframe_task_ids_by_parent.items():
+            if (
+                parent in self.state.d1_owner_by_parent
+                or parent in self.state.d1_group_fallback_parents
+            ):
+                continue
+            descriptors = [
+                self.state.gpu_worker_tasks_by_id[int(task_id)]
+                for task_id in indexed_ids
+                if int(task_id) in pending_set
+            ]
+            if not descriptors:
+                continue
+            first = descriptors[0]
+            if self.d1_task_parent_key(first) != parent:
+                continue
+            predicted = float(sum(self.gpu_worker_task_seconds(task) for task in descriptors))
+            ranked.append((
+                -predicted, str(parent[0]), str(parent[1]), parent, first,
+            ))
+        for _negative_work, _model, _view, _parent, first in sorted(ranked):
+            group = self.ensure_d1_parent_group(first, idle_workers)
+            if group is not None:
+                self.operations.runtime_telemetry().gauge(
+                    'd1.group.active_planned_parents', 1,
+                )
+                return group
+        return None
+
     def d1_feasible_workers(self,
         task: Dict[str, object], candidate_workers: Sequence[int],
     ) -> List[int]:
@@ -1176,6 +1530,19 @@ class TtaScheduler:
                 worker for worker in workers
                 if int(worker) not in self.state.d1_active_parent_by_worker
             ]
+        group = self.state.d1_groups_by_parent.get(parent)
+        if group is None:
+            owner = self.state.d1_owner_by_parent.get(parent)
+            if owner is not None:
+                return [int(owner)] if int(owner) in workers else []
+        if group is not None:
+            task_id = int(task.get('task_id', -1))
+            assigned = group.task_worker_by_id.get(task_id)
+            if assigned is None:
+                raise RuntimeError(
+                    f'D1 group {group.group_id} has no assignment for task {task_id}'
+                )
+            return [int(assigned)] if int(assigned) in workers else []
         owner = self.state.d1_owner_by_parent.get(parent)
         if owner is not None:
             return [int(owner)] if int(owner) in workers else []
@@ -1189,6 +1556,25 @@ class TtaScheduler:
         if parent is None:
             return False
         worker = int(worker_id)
+        group = self.state.d1_groups_by_parent.get(parent)
+        if group is not None:
+            assigned = group.task_worker_by_id.get(int(task.get('task_id', -1)))
+            if assigned != worker:
+                raise RuntimeError(
+                    f'D1 group {group.group_id} task {task.get("task_id")} is bound to '
+                    f'worker {assigned}, not {worker}'
+                )
+            active = self.state.d1_active_parent_by_worker.get(worker)
+            if active != parent:
+                raise RuntimeError(
+                    f'D1 group worker {worker} lost its admission reservation for {parent}; '
+                    f'active={active}'
+                )
+            newly_claimed = worker not in group.claimed_workers
+            group.claimed_workers.add(worker)
+            if newly_claimed:
+                self.operations.runtime_telemetry().add('d1.group.participant_claims', 1)
+            return bool(newly_claimed)
         owner = self.state.d1_owner_by_parent.get(parent)
         active = self.state.d1_active_parent_by_worker.get(worker)
         if owner is not None:
@@ -1207,6 +1593,22 @@ class TtaScheduler:
         self.operations.runtime_telemetry().add('d1.owner_claims', 1)
         return True
 
+    def rollback_d1_owner_claim(
+        self, task: Dict[str, object], worker_id: int,
+    ) -> None:
+        parent = self.d1_task_parent_key(task)
+        if parent is None:
+            return
+        worker = int(worker_id)
+        group = self.state.d1_groups_by_parent.get(parent)
+        if group is not None:
+            group.claimed_workers.discard(worker)
+            # Admission reserved every participant atomically.  A queue-put rollback
+            # removes only the claim; the reservation must survive for the retried lease.
+            return
+        self.state.d1_owner_by_parent.pop(parent, None)
+        self.state.d1_active_parent_by_worker.pop(worker, None)
+
     def release_d1_owner_if_complete(self,
         task: Dict[str, object], worker_id: int, stats: Dict[str, object],
     ) -> None:
@@ -1216,6 +1618,11 @@ class TtaScheduler:
         if parent is None:
             return
         worker = int(worker_id)
+        group = self.state.d1_groups_by_parent.get(parent)
+        if group is not None:
+            # Participant allocations remain live through reduction and are released only
+            # after the final layer publication acknowledges every lease token.
+            return
         owner = self.state.d1_owner_by_parent.get(parent)
         # A deferred publication sends compute_released first and the final result later.
         # The second notification is intentionally idempotent.
@@ -1554,6 +1961,10 @@ class TtaScheduler:
                 candidates.append(int(worker_id))
             if not candidates:
                 break
+            # Group admission must precede the pending-task feasibility scan and the first
+            # one-owner claim.  It is repeated after each completed group so the same
+            # controlled one-group-at-a-time experiment can cover the full inference run.
+            self.plan_next_d1_parent_group(candidates)
             issue_slots = sum(
                 max(0, int(per_gpu) - self.gpu_worker_inflight(worker_id))
                 for worker_id in candidates
@@ -1619,10 +2030,7 @@ class TtaScheduler:
                         int(task_id), reason='dispatch failure', refill=False,
                     )
                 if owner_claimed:
-                    parent = self.d1_task_parent_key(task_to_dispatch)
-                    if parent is not None:
-                        self.state.d1_owner_by_parent.pop(parent, None)
-                    self.state.d1_active_parent_by_worker.pop(int(worker_id), None)
+                    self.rollback_d1_owner_claim(task_to_dispatch, int(worker_id))
                 self.state.gpu_worker_pending_task_ids.appendleft(int(task_id))
                 self.operations._main_process_gpu_stage_finish_inference(worker_id)
                 raise
@@ -1900,6 +2308,369 @@ class TtaScheduler:
         self.dispatch_cpu_worker_inference_window(preferred_parent)
         self.dispatch_gpu_worker_inference_window(preferred_parent)
 
+    def _next_d1_group_control_task_id(self) -> int:
+        task_id = int(self.state.d1_group_next_control_task_id)
+        self.state.d1_group_next_control_task_id = int(task_id - 1)
+        return int(task_id)
+
+    def _d1_group_from_id(self, group_id: str) -> D1ParentGroup:
+        parent = self.state.d1_group_parent_by_id.get(str(group_id))
+        if parent is None:
+            raise RuntimeError(f'unknown D1 owner group {group_id!r}')
+        group = self.state.d1_groups_by_parent.get(parent)
+        if group is None or str(group.group_id) != str(group_id):
+            raise RuntimeError(f'inconsistent D1 owner group registry for {group_id!r}')
+        return group
+
+    def _register_d1_group_partial(
+        self,
+        group: D1ParentGroup,
+        worker_id: int,
+        payload: Mapping[str, object],
+    ) -> None:
+        worker = int(worker_id)
+        if worker not in group.participants:
+            raise RuntimeError(
+                f'D1 group {group.group_id} received partial from foreign worker {worker}'
+            )
+        if str(payload.get('group_id', '')) != str(group.group_id):
+            raise RuntimeError(
+                f'D1 partial group {payload.get("group_id")!r} != {group.group_id!r}'
+            )
+        if int(payload.get('participant_worker_id', -1)) != worker:
+            raise RuntimeError(
+                f'D1 partial worker metadata {payload.get("participant_worker_id")} != {worker}'
+            )
+        expected_rank = int(group.participants.index(worker))
+        if int(payload.get('participant_rank', -1)) != expected_rank:
+            raise RuntimeError(
+                f'D1 partial rank {payload.get("participant_rank")} != {expected_rank}'
+            )
+        expected_ranges = tuple(group.expected_ranges_by_worker[worker])
+        actual_ranges = tuple(
+            (int(raw[0]), int(raw[1]))
+            for raw in payload.get('covered_ranges', ())  # type: ignore[union-attr]
+        )
+        if actual_ranges != expected_ranges:
+            raise RuntimeError(
+                f'D1 partial coverage {actual_ranges} != assigned {expected_ranges}'
+            )
+        prior = group.partial_artifacts_by_worker.get(worker)
+        if prior is not None:
+            if dict(prior) == dict(payload):
+                return
+            raise RuntimeError(
+                f'D1 group {group.group_id} worker {worker} exported two partial leases'
+            )
+        group.partial_artifacts_by_worker[worker] = dict(payload)
+        group.completed_workers.add(worker)
+        self.operations.runtime_telemetry().add('d1.group.partials_ready', 1)
+
+    def _dispatch_d1_group_reduction(
+        self, group: D1ParentGroup, *, force_host: bool,
+    ) -> None:
+        artifacts_by_worker = (
+            group.host_artifacts_by_worker if force_host
+            else group.partial_artifacts_by_worker
+        )
+        if set(artifacts_by_worker) != set(group.participants):
+            raise RuntimeError(
+                f'D1 group {group.group_id} reduction is missing participant artifacts: '
+                f'have={sorted(artifacts_by_worker)}, expected={group.participants}'
+            )
+        if group.reduction_dispatched:
+            return
+        control = {
+            'task_type': 'd1_group_reduce',
+            'task_id': self._next_d1_group_control_task_id(),
+            'd1_group_id': str(group.group_id),
+            'd1_group_leader_worker_id': int(group.leader_worker_id),
+            'd1_group_force_host': bool(force_host),
+            'd1_group_artifacts': tuple(
+                dict(artifacts_by_worker[int(worker)])
+                for worker in group.participants
+            ),
+        }
+        self.operations.preflight_multiprocessing_payload(control)
+        group.reduction_dispatched = True
+        group.reduction_started_at = time.perf_counter()
+        try:
+            self.state.gpu_task_queues[int(group.leader_worker_id)].put(control)
+        except BaseException:
+            group.reduction_dispatched = False
+            group.reduction_started_at = None
+            raise
+        self.operations.runtime_telemetry().add('d1.group.reductions_dispatched', 1)
+
+    def _request_d1_group_host_fallback(
+        self, group: D1ParentGroup, error: str,
+    ) -> None:
+        if group.host_fallback_requested:
+            raise RuntimeError(
+                f'D1 group {group.group_id} host fallback failed after IPC reduction: {error}'
+            )
+        group.host_fallback_requested = True
+        group.reduction_dispatched = False
+        group.reduction_started_at = None
+        self.state.d1_group_host_fallbacks_total += 1
+        self.operations.runtime_telemetry().add('d1.group.host_fallbacks', 1)
+        print(
+            f'Warning: D1 group {group.group_id} NVLink reduction failed ({error}); '
+            'materializing retained participant bitsets for deterministic D2H reduction.'
+        )
+        fallback_root = (
+            Path(self.inputs.gpu_worker_result_dir)
+            / 'd1_group_fallback'
+            / str(group.group_id)
+        )
+        for worker in group.participants:
+            partial = group.partial_artifacts_by_worker[int(worker)]
+            if str(partial.get('transport', '')) == 'host_path':
+                group.host_artifacts_by_worker[int(worker)] = dict(partial)
+                continue
+            control = {
+                'task_type': 'd1_group_export_host',
+                'task_id': self._next_d1_group_control_task_id(),
+                'd1_group_id': str(group.group_id),
+                'd1_group_lease_token': str(partial.get('lease_token', '')),
+                'd1_group_fallback_path': str(
+                    fallback_root
+                    / f'participant_{group.participants.index(int(worker)):02d}.u32'
+                ),
+            }
+            self.operations.preflight_multiprocessing_payload(control)
+            self.state.gpu_task_queues[int(worker)].put(control)
+        if set(group.host_artifacts_by_worker) == set(group.participants):
+            self._dispatch_d1_group_reduction(group, force_host=True)
+
+    def _request_d1_group_release(self, group: D1ParentGroup) -> None:
+        if group.release_pending_workers or group.release_ack_workers:
+            raise RuntimeError(f'D1 group {group.group_id} release was requested twice')
+        group.release_pending_workers.update(int(worker) for worker in group.participants)
+        group.release_requested_at = time.perf_counter()
+        for worker in group.participants:
+            artifact = (
+                group.host_artifacts_by_worker.get(int(worker))
+                or group.partial_artifacts_by_worker.get(int(worker))
+            )
+            if artifact is None:
+                raise RuntimeError(
+                    f'D1 group {group.group_id} has no lease for worker {worker}'
+                )
+            control = {
+                'task_type': 'd1_group_release',
+                'task_id': self._next_d1_group_control_task_id(),
+                'd1_group_id': str(group.group_id),
+                'd1_group_lease_token': str(artifact.get('lease_token', '')),
+            }
+            self.operations.preflight_multiprocessing_payload(control)
+            self.state.gpu_task_queues[int(worker)].put(control)
+
+    def _complete_d1_group_release(self, group: D1ParentGroup) -> Dict[str, object]:
+        if group.release_pending_workers:
+            raise RuntimeError(
+                f'D1 group {group.group_id} still awaits release acknowledgements from '
+                f'{sorted(group.release_pending_workers)}'
+            )
+        if set(group.release_ack_workers) != set(group.participants):
+            raise RuntimeError(
+                f'D1 group {group.group_id} release acknowledgements are incomplete: '
+                f'{sorted(group.release_ack_workers)}'
+            )
+        held = group.held_result
+        if held is None:
+            raise RuntimeError(
+                f'D1 group {group.group_id} released without a held final result'
+            )
+        group.held_result = None
+        release_seconds = max(
+            0.0,
+            time.perf_counter() - float(
+                group.release_requested_at
+                if group.release_requested_at is not None else time.perf_counter()
+            ),
+        )
+        for worker in group.participants:
+            active = self.state.d1_active_parent_by_worker.get(int(worker))
+            if active != group.parent:
+                raise RuntimeError(
+                    f'D1 group {group.group_id} release changed worker {worker} owner: '
+                    f'{active}'
+                )
+            self.state.d1_active_parent_by_worker.pop(int(worker), None)
+        self.state.d1_owner_by_parent.pop(group.parent, None)
+        self.state.d1_groups_by_parent.pop(group.parent, None)
+        self.state.d1_group_parent_by_id.pop(str(group.group_id), None)
+        self.state.d1_group_parents_released_total += 1
+        self.state.d1_group_release_seconds_total += float(release_seconds)
+        self.operations.runtime_telemetry().add('d1.group.parents_released', 1)
+        self.operations.runtime_telemetry().add(
+            'd1.group.partial_release_acks', int(len(group.release_ack_workers)),
+        )
+        self.operations.runtime_telemetry().gauge('d1.group.active_planned_parents', 0)
+        print(
+            f'v18.0.3 D1 owner group released for '
+            f'{group.parent[0]}/{group.parent[1]}: '
+            f'acks={len(group.release_ack_workers)}/{len(group.participants)}, '
+            f'release={release_seconds:.3f}s.'
+        )
+        return dict(held)
+
+    def _process_d1_group_control_result(self, msg: Dict[str, object]) -> None:
+        mtype = str(msg.get('type'))
+        group = self._d1_group_from_id(str(msg.get('group_id', '')))
+        if mtype == 'd1_group_released':
+            worker = int(msg.get('gpu_index', -1))
+            if worker not in group.participants:
+                raise RuntimeError(
+                    f'D1 group {group.group_id} received a release ack from foreign '
+                    f'worker {worker}'
+                )
+            if worker not in group.release_pending_workers:
+                raise RuntimeError(
+                    f'D1 group {group.group_id} received a duplicate/unrequested release '
+                    f'ack from worker {worker}'
+                )
+            artifact = (
+                group.host_artifacts_by_worker.get(worker)
+                or group.partial_artifacts_by_worker.get(worker)
+            )
+            expected_token = str((artifact or {}).get('lease_token', ''))
+            if str(msg.get('lease_token', '')) != expected_token:
+                raise RuntimeError(
+                    f'D1 group {group.group_id} release token changed for worker {worker}'
+                )
+            if not bool(msg.get('ok')):
+                raise RuntimeError(
+                    f'D1 group {group.group_id} worker {worker} failed to release its '
+                    f'partial: {msg.get("error")}\n{msg.get("traceback")}'
+                )
+            if (
+                worker != int(group.leader_worker_id)
+                and not bool(msg.get('allocation_released', False))
+            ):
+                raise RuntimeError(
+                    f'D1 group {group.group_id} nonleader worker {worker} acknowledged '
+                    'release without finding its live partial allocation'
+                )
+            group.release_pending_workers.remove(worker)
+            group.release_ack_workers.add(worker)
+            if not group.release_pending_workers:
+                held = self._complete_d1_group_release(group)
+                # Re-enter only after every participant confirms release.  This is the
+                # dispatch boundary that may reserve the same workers for the next group.
+                self.process_one_worker_result(held)
+            return
+        if mtype == 'd1_group_host_exported':
+            worker = int(msg.get('gpu_index', -1))
+            if not bool(msg.get('ok')):
+                raise RuntimeError(
+                    f'D1 group {group.group_id} participant {worker} D2H export failed: '
+                    f'{msg.get("error")}\n{msg.get("traceback")}'
+                )
+            payload = dict(msg.get('artifact') or {})
+            original = group.partial_artifacts_by_worker.get(worker)
+            if original is None:
+                raise RuntimeError(
+                    f'D1 group {group.group_id} received host artifact from unknown worker {worker}'
+                )
+            if (
+                str(payload.get('transport', '')) != 'host_path'
+                or str(payload.get('lease_token', '')) != str(original.get('lease_token', ''))
+            ):
+                raise RuntimeError(
+                    f'D1 group {group.group_id} host artifact changed its lease identity'
+                )
+            group.host_artifacts_by_worker[worker] = payload
+            if set(group.host_artifacts_by_worker) == set(group.participants):
+                self._dispatch_d1_group_reduction(group, force_host=True)
+            return
+        if mtype != 'd1_group_reduced':
+            raise RuntimeError(f'unsupported D1 group control result {mtype!r}')
+        group.reduction_dispatched = False
+        if not bool(msg.get('ok')):
+            if bool(msg.get('fallback_allowed', False)):
+                self._request_d1_group_host_fallback(
+                    group, str(msg.get('error') or 'unknown CUDA-IPC error'),
+                )
+                return
+            raise RuntimeError(
+                f'D1 group {group.group_id} reduction/publication failed: '
+                f'{msg.get("error")}\n{msg.get("traceback")}'
+            )
+        if group.held_result is None:
+            raise RuntimeError(
+                f'D1 group {group.group_id} completed without a held final logical result'
+            )
+        reduction_stats = dict(msg.get('stats') or {})
+        transaction_seconds = max(
+            0.0,
+            time.perf_counter() - float(
+                group.reduction_started_at
+                if group.reduction_started_at is not None else time.perf_counter()
+            ),
+        )
+        lifetime_seconds = max(0.0, time.perf_counter() - float(group.admitted_at))
+        expected_tokens = {
+            str(payload.get('lease_token', ''))
+            for payload in group.partial_artifacts_by_worker.values()
+        }
+        actual_tokens = {
+            str(value) for value in reduction_stats.get('d1_group_ack_tokens', ())
+        }
+        if actual_tokens != expected_tokens:
+            raise RuntimeError(
+                f'D1 group {group.group_id} acknowledgement tokens do not match exports'
+            )
+        held = dict(group.held_result)
+        held_stats = dict(held.get('stats') or {})
+        held_stats.update(reduction_stats)
+        held_stats['d1_view_complete'] = True
+        held['stats'] = held_stats
+        transport = str(reduction_stats.get("d1_group_reduction_transport", "unknown"))
+        bitset_words = int(reduction_stats.get("d1_bitset_words", 0) or 0)
+        peer_or_seconds = float(reduction_stats.get('d1_group_peer_or_seconds', 0.0) or 0.0)
+        d2h_seconds = float(reduction_stats.get('d1_group_d2h_seconds', 0.0) or 0.0)
+        peer_read_bytes = (
+            int(bitset_words) * 4 * max(0, len(group.participants) - 1)
+            if transport == 'cuda_ipc_nvlink' else 0
+        )
+        self.state.d1_group_parents_reduced_total += 1
+        self.state.d1_group_peer_read_bytes_total += int(peer_read_bytes)
+        self.state.d1_group_reduction_seconds_total += float(transaction_seconds)
+        self.state.d1_group_peer_or_seconds_total += float(peer_or_seconds)
+        self.state.d1_group_d2h_seconds_total += float(d2h_seconds)
+        print(
+            f'v18.0.3 D1 owner group reduced for '
+            f'{group.parent[0]}/{group.parent[1]}: '
+            f'participants={len(group.participants)}, '
+            f'transport={transport}, words={bitset_words or "unknown"}, '
+            f'peer_read={int(peer_read_bytes) / float(self.inputs.gib):.3f}GiB, '
+            f'peer_or={peer_or_seconds:.3f}s, d2h={d2h_seconds:.3f}s, '
+            f'transaction={transaction_seconds:.3f}s, to_reduced={lifetime_seconds:.3f}s.'
+        )
+        self.operations.runtime_telemetry().add('d1.group.transaction_seconds', transaction_seconds)
+        self.operations.runtime_telemetry().add('d1.group.peer_or_seconds', peer_or_seconds)
+        self.operations.runtime_telemetry().add('d1.group.d2h_seconds', d2h_seconds)
+        self.operations.runtime_telemetry().add('d1.group.lifetime_seconds', lifetime_seconds)
+        group.held_result = held
+        # The ordinary result stays held until all release controls are acknowledged.
+        # Compute credit was already released and remains idempotent when it re-enters.
+        self._request_d1_group_release(group)
+
+    def d1_group_summary(self) -> Dict[str, int | float]:
+        return {
+            'admitted': int(self.state.d1_group_parents_admitted_total),
+            'reduced': int(self.state.d1_group_parents_reduced_total),
+            'released': int(self.state.d1_group_parents_released_total),
+            'host_fallbacks': int(self.state.d1_group_host_fallbacks_total),
+            'peer_read_bytes': int(self.state.d1_group_peer_read_bytes_total),
+            'transaction_seconds': float(self.state.d1_group_reduction_seconds_total),
+            'peer_or_seconds': float(self.state.d1_group_peer_or_seconds_total),
+            'd2h_seconds': float(self.state.d1_group_d2h_seconds_total),
+            'release_seconds': float(self.state.d1_group_release_seconds_total),
+        }
+
     def process_one_worker_result(self, msg: Dict[str, object]) -> None:
         mtype = str(msg.get('type'))
         worker_kind = str(msg.get('worker_kind', 'gpu')).strip().lower()
@@ -1946,6 +2717,11 @@ class TtaScheduler:
                 f"{backend_label} failed to initialize: "
                 f"{msg.get('error')}\n{msg.get('traceback')}"
             )
+        if mtype in {
+            'd1_group_reduced', 'd1_group_host_exported', 'd1_group_released',
+        }:
+            self._process_d1_group_control_result(msg)
+            return
         if worker_kind == 'cpu':
             worker_id = int(msg.get('cpu_index', -1))
             task_id = int(msg.get('task_id', -1))
@@ -2039,8 +2815,6 @@ class TtaScheduler:
             if isinstance(task_for_cost, dict):
                 self.update_gpu_worker_cost(task_for_cost, dict(msg.get('stats') or {}))
         self.state.gpu_worker_cpu_assist_inflight_task_ids.discard(int(task_id))
-        self.state.gpu_worker_results_collected += 1
-        self.state.gpu_worker_results_by_id[worker_id] = int(self.state.gpu_worker_results_by_id.get(worker_id, 0)) + 1
         if not bool(msg.get('ok')):
             raise RuntimeError(
                 f"GPU worker task {msg.get('task_id')} failed on device {msg.get('gpu_index')}: "
@@ -2048,6 +2822,45 @@ class TtaScheduler:
             )
         task = self.state.gpu_worker_tasks_by_id[int(task_id)]
         stats = dict(msg.get('stats') or {})
+        parent = self.d1_task_parent_key(task)
+        group = self.state.d1_groups_by_parent.get(parent) if parent is not None else None
+        partial_payload = stats.get('d1_group_partial_artifact')
+        if group is not None and isinstance(partial_payload, Mapping):
+            self._register_d1_group_partial(group, worker_id, partial_payload)
+        if (
+            group is not None
+            and int(self.state.fullframe_remaining.get(group.parent, 0)) == 1
+            and not bool(stats.get('d1_view_complete', False))
+        ):
+            if group.held_result is not None:
+                raise RuntimeError(
+                    f'D1 group {group.group_id} attempted to hold two final results'
+                )
+            if set(group.partial_artifacts_by_worker) != set(group.participants):
+                raise RuntimeError(
+                    f'D1 group {group.group_id} reached its final logical result before all '
+                    f'participants exported: have={sorted(group.partial_artifacts_by_worker)}, '
+                    f'expected={group.participants}'
+                )
+            held = dict(msg)
+            held['stats'] = stats
+            group.held_result = held
+            if any(
+                str(payload.get('transport', '')) != 'cuda_ipc'
+                for payload in group.partial_artifacts_by_worker.values()
+            ):
+                self._request_d1_group_host_fallback(
+                    group, 'one or more participants selected D2H during IPC export',
+                )
+            else:
+                self._dispatch_d1_group_reduction(group, force_host=False)
+            self.dispatch_inference_windows(group.parent)
+            self.refresh_gpu_aux_interpolation_leases()
+            return
+        self.state.gpu_worker_results_collected += 1
+        self.state.gpu_worker_results_by_id[worker_id] = int(
+            self.state.gpu_worker_results_by_id.get(worker_id, 0)
+        ) + 1
         self.record_backend_frame_completion(task, 'gpu')
         if bool(task.get('hybrid_gpu_assist_dispatched', False)):
             self.state.gpu_worker_cpu_assist_completed_task_ids.add(int(task_id))
@@ -2308,6 +3121,29 @@ class TtaScheduler:
                 "by_parent": dict(state.d1_owner_by_parent),
                 "by_worker": dict(state.d1_active_parent_by_worker),
             }
+        if state.d1_groups_by_parent:
+            issues['d1_groups'] = {
+                str(group.group_id): {
+                    'parent': tuple(group.parent),
+                    'participants': tuple(group.participants),
+                    'claimed': sorted(group.claimed_workers),
+                    'completed': sorted(group.completed_workers),
+                    'exported': sorted(group.partial_artifacts_by_worker),
+                    'host_exported': sorted(group.host_artifacts_by_worker),
+                    'reduction_dispatched': bool(group.reduction_dispatched),
+                    'host_fallback_requested': bool(group.host_fallback_requested),
+                    'held_final_result': bool(group.held_result is not None),
+                    'release_pending': sorted(group.release_pending_workers),
+                    'release_acked': sorted(group.release_ack_workers),
+                }
+                for group in state.d1_groups_by_parent.values()
+            }
+        if not (
+            int(state.d1_group_parents_admitted_total)
+            == int(state.d1_group_parents_reduced_total)
+            == int(state.d1_group_parents_released_total)
+        ):
+            issues['d1_group_totals'] = self.d1_group_summary()
         if state.pushed_worker_results:
             issues["pushed_messages"] = int(len(state.pushed_worker_results))
         return issues
@@ -2353,6 +3189,7 @@ class TtaScheduler:
 
 __all__ = [
     "TtaScheduler",
+    "D1ParentGroup",
     "TtaSchedulerArtifacts",
     "TtaSchedulerCallbacks",
     "TtaSchedulerInputs",

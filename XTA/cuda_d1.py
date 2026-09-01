@@ -9,6 +9,7 @@ import re
 import sys
 import threading
 import time
+import uuid
 from concurrent.futures import (
     Future,
     ThreadPoolExecutor,
@@ -16,9 +17,13 @@ from concurrent.futures import (
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
+    Any,
     Dict,
+    Iterable,
     List,
+    Mapping,
     Optional,
+    Sequence,
     Tuple,
 )
 import numpy as np
@@ -86,6 +91,235 @@ def d1_publication_max_pending_per_worker() -> int:
 
 def d1_unpack_target_mib() -> int:
     return max(16, min(1024, _env_int('YOLO_TTA_D1_UNPACK_TARGET_MIB', 256)))
+
+def d1_owner_groups_requested() -> bool:
+    """Return whether the v18.0.3 multi-owner experiment was explicitly enabled."""
+    return bool(_env_flag('YOLO_TTA_V1803_D1_OWNER_GROUPS', False))
+
+def d1_owner_group_size_limit() -> int:
+    """Configured participant ceiling; the scheduler still clamps to its allocation."""
+    return max(1, min(8, _env_int('YOLO_TTA_V1803_D1_OWNER_GROUP_SIZE', 8)))
+
+
+_D1_PARTIAL_ARTIFACT_PROTOCOL = 'xta.d1.partial-bitset.v1'
+
+
+def _normalize_slice_ranges(
+    ranges: Iterable[Sequence[int]], *, total_slices: Optional[int] = None,
+) -> Tuple[Tuple[int, int], ...]:
+    """Validate, sort, and coalesce half-open slice ranges.
+
+    Group contracts use ranges instead of an implicit task count so uneven leases and
+    empty masks retain an exact, serializable ownership description.
+    """
+    normalized: List[Tuple[int, int]] = []
+    for raw in ranges:
+        if len(raw) != 2:
+            raise ValueError(f'D1 slice range must contain two values, got {raw!r}')
+        start, stop = int(raw[0]), int(raw[1])
+        if start < 0 or stop <= start:
+            raise ValueError(f'D1 slice range [{start},{stop}) is invalid')
+        if total_slices is not None and stop > int(total_slices):
+            raise ValueError(
+                f'D1 slice range [{start},{stop}) exceeds depth {int(total_slices)}'
+            )
+        normalized.append((start, stop))
+    normalized.sort()
+    merged: List[Tuple[int, int]] = []
+    for start, stop in normalized:
+        if merged and start < merged[-1][1]:
+            raise ValueError(
+                f'D1 slice ranges overlap: {merged[-1]} and {(start, stop)}'
+            )
+        if merged and start == merged[-1][1]:
+            merged[-1] = (merged[-1][0], stop)
+        else:
+            merged.append((start, stop))
+    return tuple(merged)
+
+
+@dataclass(frozen=True)
+class D1PartialBitsetArtifact:
+    """Serializable ownership token for one participant's resident partial union.
+
+    The allocation remains owned by the exporting worker until ``lease_token`` is
+    acknowledged.  ``ipc_handle`` is deliberately opaque to the scheduler; only a CUDA
+    transport backend interprets it.  A host-path artifact is the deterministic D2H
+    recovery form used after IPC/P2P failure.
+    """
+
+    group_id: str
+    model_name: str
+    view_name: str
+    participant_rank: int
+    participant_worker_id: int
+    output_shape: Tuple[int, int, int]
+    word_count: int
+    covered_ranges: Tuple[Tuple[int, int], ...]
+    lease_token: str
+    transport: str
+    ipc_handle: bytes = b''
+    host_path: str = ''
+    ready_kind: str = 'producer_stream_synchronized'
+    coordinate_space: str = 'source_tyx'
+    layout: str = 'flat_uint32_lsb0'
+    coverage_space: str = 'view_slice_index'
+    protocol: str = _D1_PARTIAL_ARTIFACT_PROTOCOL
+
+    def __post_init__(self) -> None:
+        if str(self.protocol) != _D1_PARTIAL_ARTIFACT_PROTOCOL:
+            raise ValueError(f'unsupported D1 partial protocol {self.protocol!r}')
+        if not str(self.group_id) or not str(self.lease_token):
+            raise ValueError('D1 partial artifact requires group_id and lease_token')
+        shape = tuple(int(value) for value in self.output_shape)
+        if len(shape) != 3 or any(value <= 0 for value in shape):
+            raise ValueError(f'invalid D1 partial output shape {shape}')
+        expected_words = (int(math.prod(shape)) + 31) // 32
+        if int(self.word_count) != int(expected_words):
+            raise ValueError(
+                f'D1 partial word count {self.word_count} != {expected_words} for {shape}'
+            )
+        _normalize_slice_ranges(self.covered_ranges)
+        if str(self.coordinate_space) != 'source_tyx':
+            raise ValueError(
+                f'unsupported D1 coordinate space {self.coordinate_space!r}'
+            )
+        if str(self.layout) != 'flat_uint32_lsb0':
+            raise ValueError(f'unsupported D1 partial layout {self.layout!r}')
+        if str(self.coverage_space) != 'view_slice_index':
+            raise ValueError(
+                f'unsupported D1 coverage space {self.coverage_space!r}'
+            )
+        if str(self.transport) == 'cuda_ipc':
+            if not bytes(self.ipc_handle):
+                raise ValueError('CUDA-IPC D1 partial is missing its memory handle')
+        elif str(self.transport) == 'host_path':
+            if not str(self.host_path):
+                raise ValueError('host-path D1 partial is missing its path')
+        else:
+            raise ValueError(f'unsupported D1 partial transport {self.transport!r}')
+
+    @property
+    def byte_count(self) -> int:
+        return int(self.word_count) * int(np.dtype(np.uint32).itemsize)
+
+    def to_payload(self) -> Dict[str, object]:
+        return {
+            'protocol': str(self.protocol),
+            'group_id': str(self.group_id),
+            'model_name': str(self.model_name),
+            'view_name': str(self.view_name),
+            'participant_rank': int(self.participant_rank),
+            'participant_worker_id': int(self.participant_worker_id),
+            'output_shape': tuple(int(value) for value in self.output_shape),
+            'word_count': int(self.word_count),
+            'covered_ranges': tuple(
+                (int(start), int(stop)) for start, stop in self.covered_ranges
+            ),
+            'lease_token': str(self.lease_token),
+            'transport': str(self.transport),
+            'ipc_handle': bytes(self.ipc_handle),
+            'host_path': str(self.host_path),
+            'ready_kind': str(self.ready_kind),
+            'coordinate_space': str(self.coordinate_space),
+            'layout': str(self.layout),
+            'coverage_space': str(self.coverage_space),
+            'logical_voxel_count': int(math.prod(self.output_shape)),
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> 'D1PartialBitsetArtifact':
+        artifact = cls(
+            protocol=str(payload.get('protocol', '')),
+            group_id=str(payload.get('group_id', '')),
+            model_name=str(payload.get('model_name', '')),
+            view_name=str(payload.get('view_name', '')),
+            participant_rank=int(payload.get('participant_rank', -1)),
+            participant_worker_id=int(payload.get('participant_worker_id', -1)),
+            output_shape=tuple(int(value) for value in payload.get('output_shape', ())),
+            word_count=int(payload.get('word_count', 0)),
+            covered_ranges=tuple(
+                (int(raw[0]), int(raw[1]))
+                for raw in payload.get('covered_ranges', ())  # type: ignore[union-attr]
+            ),
+            lease_token=str(payload.get('lease_token', '')),
+            transport=str(payload.get('transport', '')),
+            ipc_handle=bytes(payload.get('ipc_handle', b'')),
+            host_path=str(payload.get('host_path', '')),
+            ready_kind=str(payload.get('ready_kind', 'producer_stream_synchronized')),
+            coordinate_space=str(payload.get('coordinate_space', 'source_tyx')),
+            layout=str(payload.get('layout', 'flat_uint32_lsb0')),
+            coverage_space=str(payload.get('coverage_space', 'view_slice_index')),
+        )
+        declared_voxels = payload.get('logical_voxel_count')
+        if (
+            declared_voxels is not None
+            and int(declared_voxels) != int(math.prod(artifact.output_shape))
+        ):
+            raise ValueError(
+                f'D1 partial logical voxel count {declared_voxels} does not match '
+                f'{artifact.output_shape}'
+            )
+        return artifact
+
+
+def d1_reduce_word_arrays(
+    partials: Sequence[object], *, destination: Optional[object] = None,
+) -> object:
+    """Deterministically tree-reduce equal-length uint32 arrays with bitwise OR.
+
+    This is intentionally array-module agnostic.  NumPy exercises the complete reduction
+    contract in CPU-only tests; CuPy arrays use the same pairwise ordering on HGX.  Inputs
+    other than an explicitly supplied destination are never mutated.
+    """
+    if not partials:
+        raise ValueError('D1 partial reduction requires at least one input')
+    arrays = list(partials)
+    first_shape = tuple(int(value) for value in getattr(arrays[0], 'shape', ()))
+    if len(first_shape) != 1:
+        raise ValueError(f'D1 partial arrays must be one-dimensional, got {first_shape}')
+    for index, array in enumerate(arrays):
+        shape = tuple(int(value) for value in getattr(array, 'shape', ()))
+        if shape != first_shape:
+            raise ValueError(
+                f'D1 partial {index} shape {shape} != first partial {first_shape}'
+            )
+        if np.dtype(getattr(array, 'dtype', None)) != np.dtype(np.uint32):
+            raise TypeError(
+                f'D1 partial {index} dtype {getattr(array, "dtype", None)} is not uint32'
+            )
+    if destination is None:
+        work = []
+        for array in arrays:
+            copy_method = getattr(array, 'copy', None)
+            if not callable(copy_method):
+                raise TypeError('D1 partial array does not provide copy()')
+            work.append(copy_method())
+    else:
+        if tuple(int(value) for value in getattr(destination, 'shape', ())) != first_shape:
+            raise ValueError('D1 reduction destination shape does not match its inputs')
+        if np.dtype(getattr(destination, 'dtype', None)) != np.dtype(np.uint32):
+            raise TypeError('D1 reduction destination dtype is not uint32')
+        destination[...] = arrays[0]
+        work = [destination]
+        for array in arrays[1:]:
+            copy_method = getattr(array, 'copy', None)
+            if not callable(copy_method):
+                raise TypeError('D1 partial array does not provide copy()')
+            work.append(copy_method())
+    while len(work) > 1:
+        next_level: List[object] = []
+        for index in range(0, len(work), 2):
+            left = work[index]
+            if index + 1 >= len(work):
+                next_level.append(left)
+                continue
+            right = work[index + 1]
+            # ``|=`` is supported by both NumPy and CuPy and keeps the left allocation.
+            left |= right
+            next_level.append(left)
+        work = next_level
+    return work[0]
 
 _D1_BACKPROJECT_KERNELS: Optional[object] = None
 
@@ -260,6 +494,45 @@ def _d1_backproject_kernels() -> object:
             + str(_D1_BACKPROJECT_KERNELS_ERROR)
         ) from exc
 
+class _D1RawCudaAllocation:
+    """Dedicated cudaMalloc allocation suitable for inter-process IPC export.
+
+    Framework caching allocators may return a suballocation whose pointer is not a valid
+    ``cudaIpcGetMemHandle`` base. Group bitsets therefore bypass both Torch and CuPy pools.
+    """
+
+    def __init__(self, cp: object, byte_count: int) -> None:
+        self.cp = cp
+        self.byte_count = int(byte_count)
+        self.pointer = int(cp.cuda.runtime.malloc(int(byte_count)))  # type: ignore[attr-defined]
+        try:
+            self.memory = cp.cuda.UnownedMemory(  # type: ignore[attr-defined]
+                int(self.pointer), int(byte_count), self,
+            )
+            self.memory_pointer = cp.cuda.MemoryPointer(self.memory, 0)  # type: ignore[attr-defined]
+            self.array = cp.ndarray(  # type: ignore[attr-defined]
+                (int(byte_count) // np.dtype(np.uint32).itemsize,),
+                dtype=cp.uint32,
+                memptr=self.memory_pointer,
+            )
+            self.array.fill(0)
+        except BaseException:
+            pointer = int(self.pointer)
+            self.pointer = 0
+            if pointer:
+                cp.cuda.runtime.free(pointer)  # type: ignore[attr-defined]
+            raise
+
+    def close(self) -> None:
+        pointer = int(self.pointer)
+        self.pointer = 0
+        self.array = None
+        self.memory_pointer = None
+        self.memory = None
+        if pointer:
+            self.cp.cuda.runtime.free(pointer)  # type: ignore[attr-defined]
+
+
 @dataclass
 class _D1WorkerViewState:
     key: Tuple[str, str]
@@ -274,6 +547,15 @@ class _D1WorkerViewState:
     view_shadow_writer: Optional[IncrementalRawBBoxMaskStoreWriter] = None
     view_shadow_store_dir: Optional[Path] = None
     view_shadow_shape: Optional[Tuple[int, int, int]] = None
+    group_id: str = ''
+    group_rank: int = -1
+    group_size: int = 1
+    group_worker_id: int = -1
+    expected_coverage: Optional[np.ndarray] = None
+    expected_ranges: Tuple[Tuple[int, int], ...] = ()
+    exported_lease_token: str = ''
+    host_fallback_path: str = ''
+    bitset_owner: Optional[_D1RawCudaAllocation] = None
 
 _D1_WORKER_VIEW_STATES: Dict[Tuple[str, str], _D1WorkerViewState] = {}
 
@@ -308,11 +590,25 @@ def _shutdown_d1_worker_pipeline() -> None:
             state.bitset = None
         except Exception:
             pass
+        bitset_owner = state.bitset_owner
+        state.bitset_owner = None
+        if bitset_owner is not None:
+            try:
+                bitset_owner.close()
+            except Exception:
+                pass
         shadow_writer = state.view_shadow_writer
         state.view_shadow_writer = None
         if shadow_writer is not None:
             try:
                 shadow_writer.discard()
+            except Exception:
+                pass
+        fallback_path = str(state.host_fallback_path or '')
+        state.host_fallback_path = ''
+        if fallback_path:
+            try:
+                Path(fallback_path).unlink(missing_ok=True)
             except Exception:
                 pass
     executor = _D1_PUBLICATION_EXECUTOR
@@ -393,6 +689,34 @@ def _d1_get_or_create_state(task: Dict[str, object], accumulator: '_DeviceUnionA
             raise ValueError(
                 f'D1 view-shadow depth {shadow_shape[0]} != view depth {view.num_slices}'
             )
+    group_id = str(task.get('d1_group_id', '') or '').strip()
+    group_rank = int(task.get('d1_group_rank', -1))
+    group_size = int(task.get('d1_group_size', 1))
+    group_worker_id = int(task.get('d1_group_worker_id', -1))
+    expected_ranges: Tuple[Tuple[int, int], ...] = ()
+    expected_coverage: Optional[np.ndarray] = None
+    if group_id:
+        if shadow_store_dir is not None:
+            raise RuntimeError(
+                f'D1 owner group {group_id} cannot use the single-writer view-shadow '
+                'contract; the scheduler must select the one-owner fallback for this parent'
+            )
+        if group_rank < 0 or group_size < 2 or group_rank >= group_size:
+            raise ValueError(
+                f'D1 task {task.get("task_id")} has invalid participant '
+                f'rank/size {group_rank}/{group_size}'
+            )
+        expected_ranges = _normalize_slice_ranges(
+            task.get('d1_group_expected_ranges', ()),  # type: ignore[arg-type]
+            total_slices=int(view.num_slices),
+        )
+        if not expected_ranges:
+            raise ValueError(
+                f'D1 group participant {group_rank} has no expected slice coverage'
+            )
+        expected_coverage = np.zeros((int(view.num_slices),), dtype=bool)
+        for expected_start, expected_stop in expected_ranges:
+            expected_coverage[int(expected_start):int(expected_stop)] = True
 
     with _D1_WORKER_VIEW_LOCK:
         existing = _D1_WORKER_VIEW_STATES.get(key)
@@ -407,6 +731,19 @@ def _d1_get_or_create_state(task: Dict[str, object], accumulator: '_DeviceUnionA
                     f'D1 owner state {key} view-shadow contract changed '
                     f'{existing.view_shadow_store_dir}/{existing.view_shadow_shape} -> '
                     f'{shadow_store_dir}/{shadow_shape}'
+                )
+            if (
+                str(existing.group_id) != str(group_id)
+                or int(existing.group_rank) != int(group_rank)
+                or int(existing.group_size) != int(group_size)
+                or int(existing.group_worker_id) != int(group_worker_id)
+                or tuple(existing.expected_ranges) != tuple(expected_ranges)
+            ):
+                raise RuntimeError(
+                    f'D1 owner state {key} group contract changed from '
+                    f'{existing.group_id}/{existing.group_rank}/{existing.group_size}/'
+                    f'{existing.expected_ranges} to '
+                    f'{group_id}/{group_rank}/{group_size}/{expected_ranges}'
                 )
             return existing
         if _D1_WORKER_VIEW_STATES:
@@ -428,9 +765,16 @@ def _d1_get_or_create_state(task: Dict[str, object], accumulator: '_DeviceUnionA
                 f'{d1_owner_bitset_reserve_bytes() / GIB:.2f} GiB reserve, but only '
                 f'{int(free_bytes) / GIB:.2f} GiB is free'
             )
-        bitset = torch.zeros(
-            (int(word_count),), dtype=torch.int32, device=accumulator.device,
-        )
+        bitset_owner: Optional[_D1RawCudaAllocation] = None
+        if group_id:
+            # A dedicated base allocation makes the CUDA IPC contract independent of
+            # framework allocator internals.  The producer retains this owner until ack.
+            bitset_owner = _D1RawCudaAllocation(kernels.cp, int(bitset_bytes))
+            bitset = bitset_owner.array
+        else:
+            bitset = torch.zeros(
+                (int(word_count),), dtype=torch.int32, device=accumulator.device,
+            )
         if is_radial_view(view):
             radians = np.deg2rad(
                 np.ascontiguousarray(np.asarray(view.azimuths_deg, dtype=np.float32)).astype(np.float64)
@@ -474,6 +818,13 @@ def _d1_get_or_create_state(task: Dict[str, object], accumulator: '_DeviceUnionA
             view_shadow_writer=shadow_writer,
             view_shadow_store_dir=shadow_store_dir,
             view_shadow_shape=shadow_shape,
+            group_id=str(group_id),
+            group_rank=int(group_rank),
+            group_size=int(group_size),
+            group_worker_id=int(group_worker_id),
+            expected_coverage=expected_coverage,
+            expected_ranges=tuple(expected_ranges),
+            bitset_owner=bitset_owner,
         )
         _D1_WORKER_VIEW_STATES[key] = state
         if not _D1_PIPELINE_ANNOUNCED:
@@ -487,7 +838,12 @@ def _d1_get_or_create_state(task: Dict[str, object], accumulator: '_DeviceUnionA
             f'D1 owner state opened for {key[0]}/{key[1]} on {accumulator.device}: '
             f'{word_count:,} uint32 words ({bitset_bytes / GIB:.2f} GiB), '
             f'output_shape={output_shape}, '
-            f'view_shadow={str(shadow_store_dir) if shadow_store_dir is not None else "disabled"}.'
+            f'view_shadow={str(shadow_store_dir) if shadow_store_dir is not None else "disabled"}, '
+            f'group={group_id or "single-owner"}'
+            + (
+                f' participant={group_rank + 1}/{group_size} '
+                f'coverage={expected_ranges}.' if group_id else '.'
+            )
         )
         return state
 
@@ -638,6 +994,402 @@ def _d1_submit_publication(
         raise
 
 
+class D1GroupReductionFallbackRequired(RuntimeError):
+    """CUDA-IPC reduction failed while source leases are still valid for D2H retry."""
+
+
+def _d1_state_for_lease(lease_token: str) -> _D1WorkerViewState:
+    token = str(lease_token or '')
+    with _D1_WORKER_VIEW_LOCK:
+        matches = [
+            state for state in _D1_WORKER_VIEW_STATES.values()
+            if str(state.exported_lease_token) == token
+        ]
+    if len(matches) != 1:
+        raise KeyError(
+            f'D1 partial lease {token!r} resolved to {len(matches)} live state(s)'
+        )
+    return matches[0]
+
+
+def _d1_partial_artifact(
+    state: _D1WorkerViewState,
+    *, transport: str,
+    ipc_handle: bytes = b'',
+    host_path: str = '',
+) -> D1PartialBitsetArtifact:
+    word_count = (int(math.prod(state.output_shape)) + 31) // 32
+    return D1PartialBitsetArtifact(
+        group_id=str(state.group_id),
+        model_name=str(state.key[0]),
+        view_name=str(state.key[1]),
+        participant_rank=int(state.group_rank),
+        participant_worker_id=int(state.group_worker_id),
+        output_shape=tuple(int(value) for value in state.output_shape),
+        word_count=int(word_count),
+        covered_ranges=tuple(state.expected_ranges),
+        lease_token=str(state.exported_lease_token),
+        transport=str(transport),
+        ipc_handle=bytes(ipc_handle),
+        host_path=str(host_path),
+    )
+
+
+def _d1_bitset_pointer(state: _D1WorkerViewState) -> int:
+    owner = state.bitset_owner
+    if owner is not None:
+        return int(owner.pointer)
+    data_ptr = getattr(state.bitset, 'data_ptr', None)
+    if callable(data_ptr):
+        return int(data_ptr())
+    data = getattr(state.bitset, 'data', None)
+    pointer = getattr(data, 'ptr', None)
+    if pointer is not None:
+        return int(pointer)
+    raise TypeError('D1 bitset does not expose a CUDA allocation pointer')
+
+
+def _d1_bitset_to_host_words(state: _D1WorkerViewState) -> Tuple[object, np.ndarray]:
+    """Return an owner object and a zero-copy uint32 NumPy view where possible."""
+    if state.bitset_owner is not None:
+        cp = state.bitset_owner.cp
+        host = np.ascontiguousarray(cp.asnumpy(state.bitset), dtype=np.uint32)
+        return host, host
+    host_tensor = state.bitset.detach().cpu()
+    return host_tensor, host_tensor.numpy().view(np.uint32)
+
+
+def _d1_close_state_bitset(state: _D1WorkerViewState) -> None:
+    state.bitset = None
+    owner = state.bitset_owner
+    state.bitset_owner = None
+    if owner is not None:
+        owner.close()
+
+
+def _d1_export_group_partial_cuda(
+    state: _D1WorkerViewState,
+) -> D1PartialBitsetArtifact:
+    """Export the dedicated cudaMalloc allocation without transferring it to host."""
+    if not state.group_id or state.bitset is None:
+        raise RuntimeError('only a live D1 group participant can export a partial')
+    if state.exported_lease_token:
+        raise RuntimeError(
+            f'D1 group participant {state.group_id}/{state.group_rank} exported twice'
+        )
+    kernels = _d1_backproject_kernels()
+    cp = kernels.cp
+    state.exported_lease_token = uuid.uuid4().hex
+    try:
+        raw_handle = cp.cuda.runtime.ipcGetMemHandle(_d1_bitset_pointer(state))
+        handle = bytes(raw_handle)
+        artifact = _d1_partial_artifact(
+            state, transport='cuda_ipc', ipc_handle=handle,
+        )
+    except BaseException:
+        state.exported_lease_token = ''
+        raise
+    runtime_telemetry().add('d1.group.partial_ipc_exports', 1)
+    runtime_telemetry().add('d1.group.partial_resident_bytes', int(artifact.byte_count))
+    return artifact
+
+
+def _d1_materialize_group_partial_host(
+    lease_token: str,
+    path: object,
+) -> D1PartialBitsetArtifact:
+    """Materialize one retained partial for the transactional D2H recovery lane."""
+    state = _d1_state_for_lease(str(lease_token))
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    word_count = (int(math.prod(state.output_shape)) + 31) // 32
+    host_owner, source = _d1_bitset_to_host_words(state)
+    if int(source.size) != int(word_count):
+        raise RuntimeError(
+            f'D1 host fallback received {int(source.size)} words, expected {word_count}'
+        )
+    destination = np.memmap(
+        target, mode='w+', dtype=np.uint32, shape=(int(word_count),),
+    )
+    try:
+        destination[:] = source
+        destination.flush()
+    finally:
+        del destination, source, host_owner
+    state.host_fallback_path = str(target)
+    artifact = _d1_partial_artifact(
+        state, transport='host_path', host_path=str(target),
+    )
+    runtime_telemetry().add('d1.group.partial_host_exports', 1)
+    runtime_telemetry().add('d1.group.partial_host_bytes', int(artifact.byte_count))
+    return artifact
+
+
+def _d1_release_group_partial(lease_token: str) -> bool:
+    """Acknowledge a partial lease and release the exporting worker allocation."""
+    token = str(lease_token or '')
+    with _D1_WORKER_VIEW_LOCK:
+        match_key: Optional[Tuple[str, str]] = None
+        match_state: Optional[_D1WorkerViewState] = None
+        for key, state in _D1_WORKER_VIEW_STATES.items():
+            if str(state.exported_lease_token) == token:
+                if match_state is not None:
+                    raise RuntimeError(f'duplicate live D1 partial lease token {token!r}')
+                match_key, match_state = key, state
+        if match_state is None or match_key is None:
+            # The reducer consumes and removes its own local state before acknowledgement.
+            return False
+        _D1_WORKER_VIEW_STATES.pop(match_key, None)
+    _d1_close_state_bitset(match_state)
+    match_state.angle_cos = None
+    match_state.angle_sin = None
+    fallback_path = str(match_state.host_fallback_path or '')
+    match_state.host_fallback_path = ''
+    if fallback_path:
+        try:
+            Path(fallback_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+    runtime_telemetry().add('d1.group.partial_lease_releases', 1)
+    return True
+
+
+def _validate_d1_group_artifacts(
+    payloads: Sequence[Mapping[str, object]],
+    *, group_id: str,
+) -> List[D1PartialBitsetArtifact]:
+    artifacts = [D1PartialBitsetArtifact.from_payload(payload) for payload in payloads]
+    if len(artifacts) < 2:
+        raise ValueError('D1 group reduction requires at least two participant artifacts')
+    artifacts.sort(key=lambda artifact: int(artifact.participant_rank))
+    first = artifacts[0]
+    ranks = [int(artifact.participant_rank) for artifact in artifacts]
+    if ranks != list(range(len(artifacts))):
+        raise ValueError(f'D1 group participant ranks are incomplete: {ranks}')
+    worker_ids = [int(artifact.participant_worker_id) for artifact in artifacts]
+    if len(set(worker_ids)) != len(worker_ids):
+        raise ValueError(f'D1 group has duplicate participant workers: {worker_ids}')
+    for artifact in artifacts:
+        if str(artifact.group_id) != str(group_id):
+            raise ValueError(
+                f'D1 partial group {artifact.group_id!r} != requested {group_id!r}'
+            )
+        if (
+            artifact.output_shape != first.output_shape
+            or int(artifact.word_count) != int(first.word_count)
+            or str(artifact.model_name) != str(first.model_name)
+            or str(artifact.view_name) != str(first.view_name)
+        ):
+            raise ValueError('D1 group partial metadata is inconsistent')
+    flattened = sorted(
+        range_pair
+        for artifact in artifacts
+        for range_pair in artifact.covered_ranges
+    )
+    normalized = _normalize_slice_ranges(flattened, total_slices=None)
+    # Coalescing must yield one complete view-depth interval.  This catches gaps and
+    # duplicate ownership before any destructive reduction begins.
+    if normalized != ((0, int(first.output_shape[0])),):
+        # D1 view depth can differ from output/source depth for orthogonal and radial
+        # geometry.  Artifacts therefore cover view slices, whose maximum is encoded by
+        # their collectively contiguous range rather than output_shape[0].
+        if not normalized or normalized[0][0] != 0 or len(normalized) != 1:
+            raise ValueError(f'D1 group slice coverage is not contiguous: {flattened}')
+    return artifacts
+
+
+class _CudaIpcImportedWords:
+    """Own one ipcOpenMemHandle mapping until the reduction stream is synchronized."""
+
+    def __init__(self, cp: object, artifact: D1PartialBitsetArtifact) -> None:
+        self.cp = cp
+        runtime = cp.cuda.runtime  # type: ignore[attr-defined]
+        flags = int(getattr(runtime, 'cudaIpcMemLazyEnablePeerAccess', 1))
+        self.pointer = int(runtime.ipcOpenMemHandle(bytes(artifact.ipc_handle), flags))
+        self.memory = cp.cuda.UnownedMemory(  # type: ignore[attr-defined]
+            int(self.pointer), int(artifact.byte_count), self,
+        )
+        self.memory_pointer = cp.cuda.MemoryPointer(self.memory, 0)  # type: ignore[attr-defined]
+        self.array = cp.ndarray(  # type: ignore[attr-defined]
+            (int(artifact.word_count),), dtype=cp.uint32, memptr=self.memory_pointer,
+        )
+
+    def close(self) -> None:
+        pointer = int(self.pointer)
+        self.pointer = 0
+        self.array = None
+        self.memory_pointer = None
+        self.memory = None
+        if pointer:
+            self.cp.cuda.runtime.ipcCloseMemHandle(pointer)  # type: ignore[attr-defined]
+
+
+def _d1_reduce_cuda_ipc_partials(
+    artifacts: Sequence[D1PartialBitsetArtifact],
+    *, leader_worker_id: int,
+) -> Tuple[np.ndarray, _D1WorkerViewState, float, float]:
+    leader_matches = [
+        artifact for artifact in artifacts
+        if int(artifact.participant_worker_id) == int(leader_worker_id)
+    ]
+    if len(leader_matches) != 1:
+        raise RuntimeError(
+            f'D1 reducer worker {leader_worker_id} has {len(leader_matches)} local partial(s)'
+        )
+    leader_artifact = leader_matches[0]
+    state = _d1_state_for_lease(leader_artifact.lease_token)
+    if state.bitset is None:
+        raise RuntimeError('D1 reducer local bitset was already released')
+    kernels = _d1_backproject_kernels()
+    cp = kernels.cp
+    local = cp.asarray(state.bitset).view(cp.uint32)
+    imports: List[_CudaIpcImportedWords] = []
+    peer_or_started = time.perf_counter()
+    try:
+        # Keep the leader allocation as the root. Imported leaves are visited in stable
+        # participant-rank order while every write remains local to the reducer GPU.
+        remote_arrays: List[object] = []
+        for artifact in artifacts:
+            if artifact is leader_artifact:
+                continue
+            if str(artifact.transport) != 'cuda_ipc':
+                raise D1GroupReductionFallbackRequired(
+                    f'participant {artifact.participant_rank} is not CUDA-IPC resident'
+                )
+            imported = _CudaIpcImportedWords(cp, artifact)
+            imports.append(imported)
+            remote_arrays.append(imported.array)
+        for remote in remote_arrays:
+            cp.bitwise_or(local, remote, out=local)
+        cp.cuda.get_current_stream().synchronize()
+    except D1GroupReductionFallbackRequired:
+        raise
+    except BaseException as exc:
+        raise D1GroupReductionFallbackRequired(
+            f'CUDA-IPC/NVLink D1 reduction failed: {type(exc).__name__}: {exc}'
+        ) from exc
+    finally:
+        for imported in reversed(imports):
+            try:
+                imported.close()
+            except Exception:
+                pass
+    peer_or_seconds = max(0.0, time.perf_counter() - peer_or_started)
+    d2h_started = time.perf_counter()
+    host_owner, words = _d1_bitset_to_host_words(state)
+    d2h_seconds = max(0.0, time.perf_counter() - d2h_started)
+    # The returned words retain ``host_owner`` either directly (NumPy) or through the
+    # Torch-backed ndarray base. Keep an explicit local until the caller submits publication.
+    del host_owner
+    return words, state, float(peer_or_seconds), float(d2h_seconds)
+
+
+def _d1_reduce_host_path_partials(
+    artifacts: Sequence[D1PartialBitsetArtifact],
+) -> np.memmap:
+    if any(str(artifact.transport) != 'host_path' for artifact in artifacts):
+        raise ValueError('host D1 reduction requires a host-path artifact from every participant')
+    word_count = int(artifacts[0].word_count)
+    sources = [
+        np.memmap(
+            Path(artifact.host_path), mode='r+' if index == 0 else 'r',
+            dtype=np.uint32, shape=(word_count,),
+        )
+        for index, artifact in enumerate(artifacts)
+    ]
+    destination = sources[0]
+    # Bound recovery RAM independently of the potentially multi-GiB bitsets.
+    chunk_words = max(1, (64 * 1024 * 1024) // np.dtype(np.uint32).itemsize)
+    try:
+        for start in range(0, word_count, chunk_words):
+            stop = min(word_count, start + chunk_words)
+            block = np.array(destination[start:stop], dtype=np.uint32, copy=True)
+            for source in sources[1:]:
+                np.bitwise_or(block, source[start:stop], out=block)
+            destination[start:stop] = block
+        destination.flush()
+    finally:
+        for source in sources[1:]:
+            del source
+    return destination
+
+
+def _d1_reduce_group_partials(
+    task: Mapping[str, object],
+) -> Future:
+    """Reduce retained group partials and submit the existing sparse publication."""
+    group_id = str(task.get('d1_group_id', '') or '')
+    payloads = task.get('d1_group_artifacts', ())
+    artifacts = _validate_d1_group_artifacts(
+        payloads, group_id=group_id,  # type: ignore[arg-type]
+    )
+    leader_worker_id = int(task.get('d1_group_leader_worker_id', -1))
+    force_host = bool(task.get('d1_group_force_host', False))
+    state: Optional[_D1WorkerViewState] = None
+    peer_or_seconds = 0.0
+    d2h_seconds = 0.0
+    reduce_prepare_started = time.perf_counter()
+    if force_host:
+        words = _d1_reduce_host_path_partials(artifacts)
+        leader_artifact = next(
+            artifact for artifact in artifacts
+            if int(artifact.participant_worker_id) == int(leader_worker_id)
+        )
+        state = _d1_state_for_lease(leader_artifact.lease_token)
+    else:
+        if any(str(artifact.transport) != 'cuda_ipc' for artifact in artifacts):
+            raise D1GroupReductionFallbackRequired(
+                'at least one participant already selected host-path recovery'
+            )
+        words, state, peer_or_seconds, d2h_seconds = _d1_reduce_cuda_ipc_partials(
+            artifacts, leader_worker_id=leader_worker_id,
+        )
+    reduce_prepare_seconds = max(0.0, time.perf_counter() - reduce_prepare_started)
+    assert state is not None
+    with _D1_WORKER_VIEW_LOCK:
+        removed = _D1_WORKER_VIEW_STATES.pop(state.key, None)
+        if removed is not state:
+            raise RuntimeError(f'D1 group reducer state {state.key} changed during reduction')
+    _d1_close_state_bitset(state)
+    future = _d1_submit_publication(words=words, state=state)
+
+    def _decorate(done: Future) -> Dict[str, object]:
+        result = dict(done.result())
+        result.update({
+            'd1_view_complete': True,
+            'd1_group_id': str(group_id),
+            'd1_group_size': int(len(artifacts)),
+            'd1_group_reduction_transport': 'host_path' if force_host else 'cuda_ipc_nvlink',
+            'd1_bitset_words': int(artifacts[0].word_count),
+            'd1_group_peer_or_seconds': float(peer_or_seconds),
+            'd1_group_d2h_seconds': float(d2h_seconds),
+            'd1_group_reduce_prepare_seconds': float(reduce_prepare_seconds),
+            'd1_group_ack_tokens': tuple(
+                str(artifact.lease_token) for artifact in artifacts
+            ),
+        })
+        return result
+
+    decorated: Future = Future()
+
+    def _done(done: Future) -> None:
+        try:
+            decorated.set_result(_decorate(done))
+        except BaseException as exc:
+            decorated.set_exception(exc)
+        finally:
+            fallback_path = str(state.host_fallback_path or '')
+            state.host_fallback_path = ''
+            if fallback_path:
+                try:
+                    Path(fallback_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    future.add_done_callback(_done)
+    return decorated
+
+
 _D1_BACKPROJECT_THREADS = 256
 
 
@@ -734,6 +1486,14 @@ def _d1_consume_device_union(
     if bool(np.any(state.coverage[s0:s1])):
         duplicate = int(s0 + np.flatnonzero(state.coverage[s0:s1])[0])
         raise RuntimeError(f'D1 owner {state.key} received duplicate source slice {duplicate}')
+    if state.expected_coverage is not None and not bool(
+        np.all(state.expected_coverage[s0:s1])
+    ):
+        foreign = int(s0 + np.flatnonzero(~state.expected_coverage[s0:s1])[0])
+        raise RuntimeError(
+            f'D1 group participant {state.group_id}/{state.group_rank} received '
+            f'foreign source slice {foreign}; expected {state.expected_ranges}'
+        )
 
     kernels = _d1_backproject_kernels()
     cp = kernels.cp
@@ -862,8 +1622,13 @@ def _d1_consume_device_union(
         runtime_telemetry().add('d1.view_shadow_packed_d2h_bytes', int(packed_host.nbytes))
         del packed_host, crop_specs
     state.coverage[s0:s1] = True
-    covered = int(np.count_nonzero(state.coverage))
-    complete = bool(covered == int(view.num_slices))
+    if state.expected_coverage is None:
+        covered = int(np.count_nonzero(state.coverage))
+        expected_count = int(view.num_slices)
+    else:
+        covered = int(np.count_nonzero(state.coverage & state.expected_coverage))
+        expected_count = int(np.count_nonzero(state.expected_coverage))
+    complete = bool(covered == expected_count)
     runtime_telemetry().add('d1.backprojected_task_slices', int(count))
     runtime_telemetry().add('d1.nonempty_task_slices', int(nonempty_slices))
     runtime_telemetry().add('d1.scanned_bbox_pixels', int(scanned_bbox_pixels))
@@ -876,15 +1641,54 @@ def _d1_consume_device_union(
     accumulator.slice_bboxes_written = None
 
     result: Dict[str, object] = {
-        'd1_view_complete': bool(complete),
+        'd1_view_complete': bool(complete and not state.group_id),
         'd1_covered_slices': int(covered),
-        'd1_total_slices': int(view.num_slices),
+        'd1_total_slices': int(expected_count),
         'd1_backprojected_task_slices': int(count),
         'd1_nonempty_task_slices': int(nonempty_slices),
         'd1_scanned_bbox_pixels': int(scanned_bbox_pixels),
         'slice_meta': slice_meta,
     }
     if not complete:
+        return result
+
+    if state.group_id:
+        try:
+            artifact = _d1_export_group_partial_cuda(state)
+        except BaseException as ipc_exc:
+            fallback_path = str(task.get('d1_group_fallback_path', '') or '').strip()
+            if not fallback_path:
+                raise RuntimeError(
+                    f'D1 group {state.group_id} CUDA-IPC export failed and no D2H '
+                    f'fallback path was supplied: {type(ipc_exc).__name__}: {ipc_exc}'
+                ) from ipc_exc
+            # Establish the lease before creating its host recovery artifact.  No device
+            # allocation is released until the scheduler acknowledges the final union.
+            state.exported_lease_token = uuid.uuid4().hex
+            artifact = _d1_materialize_group_partial_host(
+                state.exported_lease_token, fallback_path,
+            )
+            result['d1_group_ipc_export_error'] = (
+                f'{type(ipc_exc).__name__}: {ipc_exc}'
+            )
+        result.update({
+            'd1_group_id': str(state.group_id),
+            'd1_group_rank': int(state.group_rank),
+            'd1_group_size': int(state.group_size),
+            'd1_group_worker_id': int(state.group_worker_id),
+            'd1_group_participant_complete': True,
+            'd1_group_partial_artifact': artifact.to_payload(),
+            'd1_bitset_words': int(artifact.word_count),
+            'd1_view_compute_seconds': max(
+                0.0, time.perf_counter() - state.created_at,
+            ),
+        })
+        print(
+            f'D1 group partial ready for {state.key[0]}/{state.key[1]}: '
+            f'participant {state.group_rank + 1}/{state.group_size}, '
+            f'{covered}/{expected_count} assigned slices, transport={artifact.transport}; '
+            'allocation retained until reduction acknowledgement.'
+        )
         return result
 
     if state.view_shadow_writer is not None:

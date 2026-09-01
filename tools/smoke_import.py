@@ -198,6 +198,7 @@ def main() -> None:
         "finalization",
         "interpolation",
         "cuda_d1",
+        "cuda_finalization",
         "assembly",
         "outputs",
         "tta_lifecycle",

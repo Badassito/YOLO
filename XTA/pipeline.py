@@ -269,6 +269,11 @@ from .cuda_d1 import (
     tile_intermediate_accumulator_reserve_bytes,
     tile_intermediate_accumulators_prefer_memory,
 )
+from .cuda_finalization import (
+    try_apply_keep_largest_objects_multi_gpu,
+    v1803_gpu_resident_tail_enabled,
+    v1803_gpu_resident_tail_required,
+)
 from .topology import (
     configure_gpu_slice_labeling_devices,
     discard_binary_volume_slice_metadata,
@@ -601,6 +606,7 @@ def main() -> None:
         _PIPELINE_RUN_LOCK.release()
 
 def _main_impl() -> None:
+    pipeline_wall_started = time.perf_counter()
     initialize_runtime_observability()
     parser = build_argparser()
     args = parser.parse_args()
@@ -4973,6 +4979,38 @@ def _main_impl() -> None:
         gpu_worker_pending_task_ids.extend(
             range(int(scheduler_state.gpu_worker_total_tasks))
         )
+        d1_env_requested = bool(
+            _env_int('YOLO_TTA_V1803_D1_OWNER_GROUPS', 0) != 0
+        )
+        d1_configured_size = int(_env_int(
+            'YOLO_TTA_V1803_D1_OWNER_GROUP_SIZE', int(gpu_device_count),
+        ))
+        d1_gate_requested = bool(scheduler.d1_owner_groups_requested())
+        d1_group_limit = int(scheduler.d1_owner_group_size_limit())
+        gpu_tail_requested = bool(v1803_gpu_resident_tail_enabled())
+        gpu_tail_required = bool(v1803_gpu_resident_tail_required())
+        print(
+            'v18.0.3 HGX feature gates resolved: '
+            f'D1 owner groups={"active" if scheduler.d1_owner_group_mode_active() else "inactive"} '
+            f'(env requested={d1_env_requested}, configured size={d1_configured_size}, '
+            f'effective max participants={d1_group_limit}, visible workers={len(gpu_task_queues)}); '
+            f'GPU-resident final keep_objects={"on" if gpu_tail_requested else "off"} '
+            f'(required={gpu_tail_required}).'
+        )
+        runtime_telemetry().gauge('features.v1803_resolved', {
+            'd1_owner_groups_requested': bool(d1_gate_requested),
+            'd1_owner_groups_env_requested': bool(d1_env_requested),
+            'd1_owner_group_configured_size': int(d1_configured_size),
+            'd1_owner_group_size_limit': int(d1_group_limit),
+            'd1_owner_group_mode_active': bool(scheduler.d1_owner_group_mode_active()),
+            'gpu_resident_tail_requested': bool(gpu_tail_requested),
+            'gpu_resident_tail_required': bool(gpu_tail_required),
+            'visible_gpu_workers': int(len(gpu_task_queues)),
+        })
+        # The complete seed queue is now authoritative and no one-owner dispatch has crossed
+        # the process boundary.  Reserve the first multi-owner parent here; later groups are
+        # planned at the same centralized dispatch boundary after the active group releases.
+        scheduler.plan_next_d1_parent_group(tuple(sorted(gpu_task_queues)))
         # Hybrid native-t GPU residency can defer the 25+ GiB host processing cube until a
         # CPU worker asks for it. Let that one-time resize use every NON-FEEDER CPU while the
         # OpenVINO workers are still waiting on the cube sentinel. Dedicated feeder cores are
@@ -6164,6 +6202,21 @@ def _main_impl() -> None:
     _drain_completed_background_futures()
 
     scheduler_result = scheduler.result()
+    if scheduler.d1_owner_groups_requested():
+        d1_summary = scheduler.d1_group_summary()
+        runtime_telemetry().gauge('d1.group.summary', dict(d1_summary))
+        print(
+            'v18.0.3 D1 owner-group summary: '
+            f'admitted={int(d1_summary["admitted"])}, '
+            f'reduced={int(d1_summary["reduced"])}, '
+            f'released={int(d1_summary["released"])}, '
+            f'host_fallbacks={int(d1_summary["host_fallbacks"])}, '
+            f'peer_read={int(d1_summary["peer_read_bytes"]) / GIB:.3f}GiB, '
+            f'peer_or={float(d1_summary["peer_or_seconds"]):.3f}s, '
+            f'd2h={float(d1_summary["d2h_seconds"]):.3f}s, '
+            f'transaction={float(d1_summary["transaction_seconds"]):.3f}s, '
+            f'release={float(d1_summary["release_seconds"]):.3f}s.'
+        )
     post_inference_tail_started = (
         float(scheduler_result.gpu_inference_drained_at)
         if scheduler_result.gpu_inference_drained_at is not None
@@ -6460,14 +6513,59 @@ def _main_impl() -> None:
     keep_objects_stats: Optional[Dict[str, int | float]] = None
     if int(args.keep_objects) > 0:
         print(f'\n=== Keeping largest {int(args.keep_objects)} final object(s) ===')
-        keep_objects_stats = apply_keep_largest_objects_inplace(
+        gpu_tail_call_started = time.perf_counter()
+        gpu_tail_result = try_apply_keep_largest_objects_multi_gpu(
             final_union_mm,
             int(args.keep_objects),
             temp_dir=temp_dir,
             keep_temp=bool(keep_temp_artifacts),
-            prefer_memory=True,
-            workers=tail_slice_workers,
         )
+        gpu_tail_call_seconds = max(0.0, time.perf_counter() - gpu_tail_call_started)
+        if gpu_tail_result is None:
+            keep_objects_stats = apply_keep_largest_objects_inplace(
+                final_union_mm,
+                int(args.keep_objects),
+                temp_dir=temp_dir,
+                keep_temp=bool(keep_temp_artifacts),
+                prefer_memory=True,
+                workers=tail_slice_workers,
+            )
+        else:
+            keep_objects_stats = dict(gpu_tail_result.stats)
+            keep_objects_stats['call_seconds'] = float(gpu_tail_call_seconds)
+            if gpu_tail_result.volume is not final_union_mm:
+                prior_final_union_mm = final_union_mm
+                final_union_mm = gpu_tail_result.volume
+                if streaming_final_union_holder.get(str(model_name)) is prior_final_union_mm:
+                    streaming_final_union_holder[str(model_name)] = final_union_mm
+                close_memmap_array(prior_final_union_mm)
+            print(
+                'v18.0.3 GPU-resident keep_objects committed: '
+                f'GPUs={int(keep_objects_stats.get("gpu_count", 0))}, '
+                f'objects={int(keep_objects_stats.get("num_objects", 0))}, '
+                f'kept={int(keep_objects_stats.get("kept_objects", 0))}, '
+                f'kept_voxels={int(keep_objects_stats.get("kept_voxels", 0))}, '
+                f'import={float(keep_objects_stats.get("import_seconds", 0.0)):.3f}s, '
+                f'discovery={float(keep_objects_stats.get("discovery_seconds", 0.0)):.3f}s, '
+                f'init_total={float(keep_objects_stats.get("runtime_init_seconds", 0.0)):.3f}s, '
+                f'metadata={float(keep_objects_stats.get("metadata_seconds", 0.0)):.3f}s, '
+                f'setup_max={float(keep_objects_stats.get("setup_seconds", 0.0)):.3f}s, '
+                f'label_max={float(keep_objects_stats.get("label_seconds", 0.0)):.3f}s, '
+                f'pairs_max={float(keep_objects_stats.get("pair_extraction_seconds", 0.0)):.3f}s, '
+                f'shard_wall={float(keep_objects_stats.get("shard_stage_seconds", 0.0)):.3f}s, '
+                f'ccl_blocks={int(keep_objects_stats.get("ccl_blocks", 0))}, '
+                f'block_slices={int(keep_objects_stats.get("block_slices_min", 0))}-'
+                f'{int(keep_objects_stats.get("block_slices_max", 0))}, '
+                f'pair_boundaries={int(keep_objects_stats.get("eligible_pair_boundaries", 0))}/'
+                f'{int(keep_objects_stats.get("pair_boundaries", 0))}, '
+                f'boundary={float(keep_objects_stats.get("boundary_merge_seconds", 0.0)):.3f}s, '
+                f'graph={float(keep_objects_stats.get("root_expansion_seconds", 0.0)):.3f}s, '
+                f'apply={float(keep_objects_stats.get("apply_seconds", 0.0)):.3f}s, '
+                f'peer={int(keep_objects_stats.get("peer_bytes", 0)) / GIB:.3f}GiB, '
+                f'host_bounces={int(keep_objects_stats.get("peer_host_bounces", 0))}, '
+                f'total_pre_cleanup={float(keep_objects_stats.get("total_seconds", 0.0)):.3f}s, '
+                f'call={float(keep_objects_stats.get("call_seconds", 0.0)):.3f}s.'
+            )
 
     final_output_mask_mm = final_union_mm
     output_volume_rgb = input_volume_rgb
@@ -6891,9 +6989,12 @@ def _main_impl() -> None:
     )
 
     post_inference_tail_seconds = float(time.perf_counter() - post_inference_tail_started)
+    pipeline_wall_seconds = float(time.perf_counter() - pipeline_wall_started)
     runtime_telemetry().gauge('post_inference_tail.seconds', post_inference_tail_seconds)
+    runtime_telemetry().gauge('pipeline.wall_seconds', pipeline_wall_seconds)
     runtime_telemetry().gauge('pipeline.phase', 'complete')
     print(f'\nPost-inference final assembly/output tail: {post_inference_tail_seconds:.1f}s.')
+    print(f'End-to-end pipeline walltime: {pipeline_wall_seconds:.1f}s.')
     print('\nDone.')
     print(f'Output dir: {out_dir}')
     print(f'Scratch dir: {temp_dir}')

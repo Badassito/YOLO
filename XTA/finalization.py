@@ -1713,7 +1713,10 @@ def apply_keep_largest_objects_inplace(
     """Keep only the largest N connected foreground components in the final 3D volume."""
     keep_n = int(keep_objects)
     if keep_n <= 0:
-        return {'enabled': 0, 'num_objects': 0, 'kept_objects': 0, 'removed_objects': 0, 'removed_voxels': 0}
+        return {
+            'enabled': 0, 'num_objects': 0, 'kept_objects': 0,
+            'removed_objects': 0, 'removed_voxels': 0, 'kept_voxels': 0,
+        }
 
     keep_started = time.perf_counter()
     runtime_telemetry().gauge('pipeline.phase', 'keep_objects_3d_connected_components')
@@ -1776,10 +1779,14 @@ def apply_keep_largest_objects_inplace(
     if int(num_objects) <= keep_n:
         total_seconds = float(time.perf_counter() - keep_started)
         topology_times = dict(comp_stats.get('topology_phase_seconds', {}))
+        kept_voxels = int(np.sum(
+            np.asarray(comp_stats.get('root_areas', ()), dtype=np.int64),
+            dtype=np.int64,
+        ))
         print(
             f'v16.0.2 keep_objects phases: no removal required; '
             f'topology={float(topology_times.get("topology_total", 0.0)):.3f}s, '
-            f'total={total_seconds:.3f}s.'
+            f'kept_voxels={kept_voxels}, total={total_seconds:.3f}s.'
         )
         close_memmap_array(labels_mm)
         if not bool(keep_temp):
@@ -1794,6 +1801,7 @@ def apply_keep_largest_objects_inplace(
             'kept_objects': int(num_objects),
             'removed_objects': 0,
             'removed_voxels': 0,
+            'kept_voxels': int(kept_voxels),
             'topology_slab_count': int(comp_stats.get('topology_slab_count', 0)),
             'topology_slab_workers': int(comp_stats.get('topology_slab_workers', 0)),
             'label_seconds': float(topology_times.get('slice_label', 0.0)),
@@ -1828,6 +1836,7 @@ def apply_keep_largest_objects_inplace(
     gid_keep[0] = False
     # removed_voxels falls out of the root area table — no per-slice count pass.
     removed_voxels = int(root_areas[unique_roots].sum() - root_areas[keep_roots].sum())
+    kept_voxels = int(root_areas[keep_roots].sum())
     decision_seconds = float(time.perf_counter() - decision_started)
 
     # Per-slice local->keep LUTs in one concatenated uint8 table; only slices that actually
@@ -1927,7 +1936,8 @@ def apply_keep_largest_objects_inplace(
         f'boundary/root={float(topology_times.get("boundary_merge", 0.0)) + float(topology_times.get("root_expansion", 0.0)):.3f}s, '
         f'area={float(topology_times.get("area_reduction", 0.0)):.3f}s, '
         f'decision={decision_seconds:.3f}s, keep_lut={keep_lut_seconds:.3f}s, '
-        f'apply={apply_seconds:.3f}s, total={total_seconds:.3f}s.'
+        f'apply={apply_seconds:.3f}s, kept_voxels={kept_voxels}, '
+        f'total={total_seconds:.3f}s.'
     )
     return {
         'enabled': 1,
@@ -1935,6 +1945,7 @@ def apply_keep_largest_objects_inplace(
         'kept_objects': int(min(keep_n, int(num_objects))),
         'removed_objects': int(max(0, int(num_objects) - keep_n)),
         'removed_voxels': int(removed_voxels),
+        'kept_voxels': int(kept_voxels),
         'topology_slab_count': int(comp_stats.get('topology_slab_count', 0)),
         'topology_slab_workers': int(comp_stats.get('topology_slab_workers', 0)),
         'label_seconds': float(topology_times.get('slice_label', 0.0)),

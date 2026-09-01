@@ -429,6 +429,19 @@ def _record_runtime_feature_gauges(telemetry: RuntimeTelemetry) -> None:
         'native_projected_layer_materializer': True,
         'memfd_workspace_compatibility': bool(memfd_workspace_enabled()),
         'native_persistent_trt_ring': True,
+        'v1803_d1_owner_groups': True,
+        'v1803_gpu_resident_tail': True,
+    })
+    telemetry.gauge('features.v1803_requested', {
+        'd1_owner_groups': os.environ.get(
+            'YOLO_TTA_V1803_D1_OWNER_GROUPS', '0'
+        ).strip().lower() not in {'', '0', 'false', 'no', 'off', 'disabled'},
+        'gpu_resident_tail': os.environ.get(
+            'YOLO_TTA_V1803_GPU_RESIDENT_TAIL', '0'
+        ).strip().lower() not in {'', '0', 'false', 'no', 'off', 'disabled'},
+        'gpu_resident_tail_required': os.environ.get(
+            'YOLO_TTA_V1803_GPU_RESIDENT_TAIL_REQUIRED', '0'
+        ).strip().lower() not in {'', '0', 'false', 'no', 'off', 'disabled'},
     })
 
 def initialize_runtime_observability() -> RuntimeTelemetry:

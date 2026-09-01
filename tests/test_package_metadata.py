@@ -8,8 +8,8 @@ from XTA import cli, config
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CURRENT_VERSION = "18.0.2"
-CURRENT_LAUNCHER = "GPT-5.6-Sol-Ultra_v18.0.2_SLURM.py"
+CURRENT_VERSION = "18.0.3"
+CURRENT_LAUNCHER = "GPT-5.6-Sol-Ultra_v18.0.3_SLURM.py"
 
 
 def _toml_section(source: str, name: str) -> str:
@@ -24,7 +24,7 @@ class PackageMetadataTests(unittest.TestCase):
     def test_runtime_version_constants_are_aligned(self) -> None:
         self.assertEqual(XTA.__version__, CURRENT_VERSION)
         self.assertEqual(config.SCRIPT_VERSION, CURRENT_VERSION)
-        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "1802")
+        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "1803")
         self.assertEqual(config.SCRIPT_BASENAME, CURRENT_LAUNCHER)
         self.assertEqual(cli.SCRIPT_VERSION, CURRENT_VERSION)
         self.assertEqual(cli.SCRIPT_BASENAME, CURRENT_LAUNCHER)
@@ -45,6 +45,8 @@ class PackageMetadataTests(unittest.TestCase):
             package_data,
         )
         self.assertIn(f'"{CURRENT_LAUNCHER}"', data_files)
+        self.assertIn('"tools/v1803_hgx_selftest.py"', data_files)
+        self.assertIn('"tools/v1803_d1_ipc_selftest.py"', data_files)
         self.assertNotIn('GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py', data_files)
         self.assertNotIn('"README.md"', data_files)
 
@@ -59,9 +61,12 @@ class PackageMetadataTests(unittest.TestCase):
         self.assertIn("include XTA/_package_inventory.json", manifest_lines)
         self.assertIn("recursive-include XTA/examples *.py *.md", manifest_lines)
         self.assertIn("recursive-include tools *.py", manifest_lines)
+        self.assertTrue((ROOT / "tools" / "v1803_hgx_selftest.py").is_file())
+        self.assertTrue((ROOT / "tools" / "v1803_d1_ipc_selftest.py").is_file())
         self.assertTrue((ROOT / CURRENT_LAUNCHER).is_file())
         self.assertFalse((ROOT / "GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py").exists())
         self.assertFalse((ROOT / "GPT-5.6-Sol-Ultra_v18.0.1_SLURM.py").exists())
+        self.assertFalse((ROOT / "GPT-5.6-Sol-Ultra_v18.0.2_SLURM.py").exists())
 
     def test_legacy_distribution_identity_is_absent_from_text_sources(self) -> None:
         forbidden = (

@@ -104,8 +104,12 @@ from .inference import (
     validate_yolo_model_input_channels,
 )
 from .cuda_d1 import (
+    D1GroupReductionFallbackRequired,
     _d1_backproject_kernels,
     _d1_consume_device_union,
+    _d1_materialize_group_partial_host,
+    _d1_reduce_group_partials,
+    _d1_release_group_partial,
     _shutdown_d1_worker_pipeline,
     d1_owner_pipeline_enabled,
 )
@@ -1727,6 +1731,9 @@ def run_prediction_volume_in_worker(
             'd1_publication_seconds', 'd1_nonempty_task_slices',
             'd1_scanned_bbox_pixels', 'd1_view_shadow_path',
             'd1_view_shadow_format', 'd1_view_shadow_stats',
+            'd1_group_id', 'd1_group_rank', 'd1_group_size',
+            'd1_group_worker_id', 'd1_group_participant_complete',
+            'd1_group_partial_artifact', 'd1_group_ipc_export_error',
         ):
             if d1_key in stats:
                 public_stats[d1_key] = stats[d1_key]
@@ -1932,13 +1939,121 @@ def _gpu_inference_worker_main(
             while pending_publications:
                 publication_condition.wait()
 
+    def _schedule_d1_group_reduction(
+        control_task: Dict[str, object], future: Future,
+    ) -> None:
+        """Publish a control-plane reduction result without charging an inference task."""
+        with publication_condition:
+            pending_publications.add(future)
+
+        def _done(done: Future) -> None:
+            try:
+                stats = dict(done.result())
+                result_queue.put({
+                    'type': 'd1_group_reduced',
+                    'task_id': int(control_task.get('task_id', -1)),
+                    'gpu_index': int(gpu_index),
+                    'group_id': str(control_task.get('d1_group_id', '')),
+                    'ok': True,
+                    'stats': stats,
+                })
+            except Exception as exc:  # pragma: no cover - surfaced to scheduler
+                import traceback
+                result_queue.put({
+                    'type': 'd1_group_reduced',
+                    'task_id': int(control_task.get('task_id', -1)),
+                    'gpu_index': int(gpu_index),
+                    'group_id': str(control_task.get('d1_group_id', '')),
+                    'ok': False,
+                    'error': repr(exc),
+                    'traceback': traceback.format_exc(),
+                    # Once reduction submitted its publication future, the leader has
+                    # committed the reduced D2H words and released its device state.
+                    'fallback_allowed': False,
+                })
+            finally:
+                with publication_condition:
+                    pending_publications.discard(done)
+                    publication_condition.notify_all()
+
+        future.add_done_callback(_done)
+
     try:
       while True:
         task = task_queue.get()
         if task is None:
             break
         task_id = int(task['task_id'])
-        if str(task.get('task_type', 'inference')) == 'interpolation_pass':
+        task_type = str(task.get('task_type', 'inference'))
+        if task_type == 'd1_group_reduce':
+            try:
+                reduction_future = _d1_reduce_group_partials(task)
+                _schedule_d1_group_reduction(task, reduction_future)
+            except D1GroupReductionFallbackRequired as exc:
+                # The producer allocations and lease tokens remain live. The scheduler can
+                # ask every participant for a host-path artifact and retry deterministically.
+                import traceback
+                result_queue.put({
+                    'type': 'd1_group_reduced', 'task_id': int(task_id),
+                    'gpu_index': int(gpu_index),
+                    'group_id': str(task.get('d1_group_id', '')), 'ok': False,
+                    'error': repr(exc), 'traceback': traceback.format_exc(),
+                    'fallback_allowed': True,
+                })
+            except Exception as exc:  # pragma: no cover - surfaced to scheduler
+                import traceback
+                result_queue.put({
+                    'type': 'd1_group_reduced', 'task_id': int(task_id),
+                    'gpu_index': int(gpu_index),
+                    'group_id': str(task.get('d1_group_id', '')), 'ok': False,
+                    'error': repr(exc), 'traceback': traceback.format_exc(),
+                    'fallback_allowed': False,
+                })
+            continue
+        if task_type == 'd1_group_export_host':
+            try:
+                artifact = _d1_materialize_group_partial_host(
+                    str(task.get('d1_group_lease_token', '')),
+                    task.get('d1_group_fallback_path', ''),
+                )
+                result_queue.put({
+                    'type': 'd1_group_host_exported', 'task_id': int(task_id),
+                    'gpu_index': int(gpu_index),
+                    'group_id': str(task.get('d1_group_id', '')), 'ok': True,
+                    'artifact': artifact.to_payload(),
+                })
+            except Exception as exc:  # pragma: no cover - surfaced to scheduler
+                import traceback
+                result_queue.put({
+                    'type': 'd1_group_host_exported', 'task_id': int(task_id),
+                    'gpu_index': int(gpu_index),
+                    'group_id': str(task.get('d1_group_id', '')), 'ok': False,
+                    'error': repr(exc), 'traceback': traceback.format_exc(),
+                })
+            continue
+        if task_type == 'd1_group_release':
+            try:
+                released = _d1_release_group_partial(
+                    str(task.get('d1_group_lease_token', '')),
+                )
+                result_queue.put({
+                    'type': 'd1_group_released', 'task_id': int(task_id),
+                    'gpu_index': int(gpu_index),
+                    'group_id': str(task.get('d1_group_id', '')), 'ok': True,
+                    'lease_token': str(task.get('d1_group_lease_token', '')),
+                    'allocation_released': bool(released),
+                })
+            except Exception as exc:
+                import traceback
+                result_queue.put({
+                    'type': 'd1_group_released', 'task_id': int(task_id),
+                    'gpu_index': int(gpu_index),
+                    'group_id': str(task.get('d1_group_id', '')), 'ok': False,
+                    'lease_token': str(task.get('d1_group_lease_token', '')),
+                    'error': repr(exc), 'traceback': traceback.format_exc(),
+                })
+            continue
+        if task_type == 'interpolation_pass':
             # The scheduler targets auxiliary work only to a worker with no assigned inference
             # lease.  Finish any asynchronous task retirement before reusing its interpreter.
             _wait_for_deferred_publications()

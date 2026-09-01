@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WRAPPER = ROOT / "GPT-5.6-Sol-Ultra_v18.0.2_SLURM.py"
+WRAPPER = ROOT / "GPT-5.6-Sol-Ultra_v18.0.3_SLURM.py"
 UNIFIED_MODULES = (
     "gaussian",
     "pta_config",
@@ -27,6 +27,7 @@ UNIFIED_MODULES = (
     "tta_prediction",
     "tta_scheduler",
     "tta_terminal",
+    "cuda_finalization",
     "render_batch",
     "cli",
     "unification",
@@ -72,7 +73,7 @@ class ImportSurfaceTests(unittest.TestCase):
     def test_module_version(self) -> None:
         completed = self.run_python("-m", "XTA", "--version")
         self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertIn("18.0.2", completed.stdout)
+        self.assertIn("18.0.3", completed.stdout)
 
     def test_cycle_safe_full_import_smoke(self) -> None:
         completed = self.run_python(str(ROOT / "tools" / "smoke_import.py"), "pipeline")

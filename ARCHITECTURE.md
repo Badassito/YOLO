@@ -1,6 +1,6 @@
 # XTA architecture
 
-`GPT-5.6-Sol-Ultra_v18.0.2_SLURM.py` is the sole versioned launcher. It, the
+`GPT-5.6-Sol-Ultra_v18.0.3_SLURM.py` is the sole versioned launcher. It, the
 installed `xta` console script, and `python -m XTA` all dispatch
 through `XTA.cli.run()`.
 The implementation lives in the importable `XTA` package so spawned processes
@@ -26,6 +26,7 @@ resolve worker functions and data types through canonical module paths.
 | `finalization` | source-volume fusion, object filtering and centerline processing |
 | `interpolation` | interpolation planning, execution and sparse continuation |
 | `cuda_d1` | D1 owner-GPU backprojection and packed source-space storage |
+| `cuda_finalization` | dependency-light distributed-binary contracts plus the opt-in v18.0.3 transactional multi-GPU keep tail |
 | `assembly` | completed-view preparation, tile gates and smoothing handoff |
 | `outputs` | NRRD, TIFF/MKV, summaries and low-quality derivatives |
 | `unification.contracts` | dependency-light `ForwardSamplingPolicy`, digest-addressed `RasterPlan`, logical `RenderItem`/`RenderRequestBatch`, channel/tile and data-role contracts |
@@ -55,7 +56,7 @@ resolve worker functions and data types through canonical module paths.
 
 ### Incremental orchestration decomposition
 
-v18.0.2 establishes explicit owners for TTA run resources/publication, prediction-source
+v18.0.3 establishes explicit owners for TTA run resources/publication, prediction-source
 preparation, terminal physical-view fusion, and PTA external augmentation. It also adds the
 leaf PTA dataset-policy owner and a stateful `TtaScheduler` for process-inference admission,
 hybrid CPU/GPU and D1 ownership, dynamic lease splitting, dispatch, result transport,
@@ -69,6 +70,46 @@ physical-view reduction, output scheduling, and manifest construction. Those pat
 the existing `tta_outputs` boundary only after they produce settled assembly artifacts instead
 of cross-reading live registries. PTA's worker extraction retains its prior CUDA/start-method
 semantics verbatim and still requires physical-GPU qualification before release.
+
+### v18.0.3 intra-node HGX experiments
+
+Two experimental paths are dark by default and retain the established reference behavior:
+
+- `YOLO_TTA_V1803_D1_OWNER_GROUPS=1` allows a D1 parent whose complete seed leases
+  need no view-shadow writer to bind deterministic slice coverage to several idle CUDA
+  workers. Admission is a centralized, atomic pre-dispatch reservation rather than a side
+  effect of pending-task feasibility scans. v18.0.3 keeps one group active at a time, chooses
+  the heaviest still-unclaimed eligible parent, and plans the next group after the prior
+  reduction releases its participants; nonparticipants retain ordinary view-level parallelism.
+  Each participant retains a dedicated IPC-exportable partial bitset until the scheduler
+  acknowledges either CUDA-IPC/NVLink reduction or bounded host-path recovery, then confirms
+  an explicit release acknowledgement from every participant before reusing the workers.
+  `YOLO_TTA_V1803_D1_OWNER_GROUP_SIZE` caps the participant count at the job-visible
+  device count. The one-owner path remains the admission and execution fallback.
+- `YOLO_TTA_V1803_GPU_RESIDENT_TAIL=1` tries the first Track-A transaction after the
+  inference workers have drained: the settled host final union is uploaded into contiguous
+  job-visible Z shards, exact 26-connected labels stay device-resident in memory-bounded
+  3-D CCL blocks, and compact equivalence pairs are needed only at block/shard boundaries.
+  Area and boundary metadata is resolved through the CPU union-find reference, and a separate filtered candidate is
+  committed only after every GPU succeeds. `YOLO_TTA_V1803_GPU_RESIDENT_TAIL_REQUIRED=1`
+  makes failure fatal for qualification; otherwise the untouched host union enters the
+  established CPU `keep_objects` path.
+
+`cuda_finalization.DistributedBinaryArtifact` is the common future handoff boundary for
+host uint8 volumes, D1 bitsets, resident final-union shards, and a later multi-GPU
+interpolation producer. The v18.0.3 Track-A implementation exercises the host-upload
+adapter and resident keep transaction; direct resident final-union ingestion and Track B
+interpolation remain incremental follow-on work. Every decomposition uses only devices
+selected by the job and is written generically for one through eight GPUs.
+
+Four-GPU HGX qualification established byte-exact output for both experiments but no
+reproducible end-to-end wall-time benefit on the 30-view production workload. Track A reduced
+its own `keep_objects` stage substantially, but cold parent CUDA startup and concurrent output
+variance absorbed the gain. Size-2 D1 groups exercised 29.1 GiB of CUDA-IPC peer reads across
+14 exact group transactions with zero host fallbacks, but the workload already had enough
+independent views to occupy all devices. Both paths therefore remain opt-in infrastructure.
+A future D1 revisit should promote only a genuine idle tail, and a future resident interpolation
+producer may feed the distributed Track-A boundary without the cold host-upload adapter.
 
 `XTA.__init__` is deliberately inert. In particular, it does not import OpenCV,
 SciPy, Ultralytics, CUDA, OpenVINO or future accelerator runtimes. Every supported command
@@ -238,6 +279,18 @@ Hardware-backed CUDA, TensorRT, OpenVINO, QAT, IAA, DSA and full data/model pari
 still require the production environment and representative artifacts. Intel accelerator
 build, provisioning, and admission instructions live in ``native/README.md``; run
 ``python tools/intel_accelerator_selftest.py --backend all`` on the target host.
+
+From a source checkout, the unprivileged HGX Track-A smoke test is
+``python tools/v1803_hgx_selftest.py --gpus 4`` (and ``--gpus 8`` for a full-node
+allocation). It creates boundary-crossing synthetic objects and requires a byte-identical
+GPU/CPU `keep_objects` result. ``--plan-only`` exercises partitioning and row packing on a
+host without CUDA. ``python tools/v1803_d1_ipc_selftest.py --gpus 4`` verifies that
+single-visible-device spawned ranks can export, import, NVLink-OR, and acknowledge the
+same dedicated CUDA allocations used by D1 groups; repeat with eight allocated GPUs.
+Wheels retain both scripts under ``share/xta/tools``. Four-GPU representative TTA
+qualification completed the full D1 lifetime across model workers, partial publication,
+release acknowledgement, and scheduler quiescence; the byte-exact but performance-neutral
+result is recorded in the HGX experiment section above.
 
 For v18 specifically, CPU tests cover policy/plan identity, categorical and intensity geometry,
 channel/tile primitives, spawn-worker contracts, manifest/ownership safety, and the implemented

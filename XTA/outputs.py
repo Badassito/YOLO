@@ -5501,6 +5501,13 @@ def write_summary_file(
             f"apply={float(keep_objects_stats.get('apply_seconds', 0.0)):.3f}, "
             f"total={float(keep_objects_stats.get('total_seconds', 0.0)):.3f}"
         )
+        if int(keep_objects_stats.get('gpu_resident_tail', 0)) > 0:
+            lines.append(
+                '  v18.0.3_gpu_resident_tail: '
+                f"gpus={int(keep_objects_stats.get('gpu_count', 0))}, "
+                f"peer_bytes={int(keep_objects_stats.get('peer_bytes', 0))}, "
+                f"peer_host_bounces={int(keep_objects_stats.get('peer_host_bounces', 0))}"
+            )
     else:
         lines.append('')
         lines.append('keep_objects: disabled')

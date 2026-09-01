@@ -78,7 +78,17 @@ class SummaryTests(unittest.TestCase):
                 interpolation_stats=[],
                 enable_3d_void_fill=False,
                 gaussian_smoothing_stats=None,
-                keep_objects_stats=None,
+                keep_objects_stats={
+                    'enabled': 1,
+                    'num_objects': 3,
+                    'kept_objects': 1,
+                    'removed_objects': 2,
+                    'removed_voxels': 9,
+                    'gpu_resident_tail': 1,
+                    'gpu_count': 4,
+                    'peer_bytes': 4096,
+                    'peer_host_bounces': 0,
+                },
                 voxel_volume=None,
                 final_paths={'binary': root / 'sample_binary.mkv'},
                 augmentation_workers=1,
@@ -90,6 +100,7 @@ class SummaryTests(unittest.TestCase):
             text = summary_path.read_text()
             self.assertIn('View statistics:', text)
             self.assertIn('Final outputs:', text)
+            self.assertIn('v18.0.3_gpu_resident_tail: gpus=4, peer_bytes=4096', text)
             self.assertNotIn('Specification notes:', text)
 
 
