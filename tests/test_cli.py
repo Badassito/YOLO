@@ -12,10 +12,11 @@ from pathlib import Path
 from unittest import mock
 
 from XTA import cli
+from XTA.unification.context import current_unified_launch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-LAUNCHER = ROOT / "GPT-5.6-Sol-Ultra_v18.0.3_SLURM.py"
+LAUNCHER = ROOT / "GPT-5.6-Sol-Ultra_v19.0.0_SLURM.py"
 
 
 class CliTests(unittest.TestCase):
@@ -33,20 +34,21 @@ class CliTests(unittest.TestCase):
     def test_top_help_and_version_are_dependency_light(self) -> None:
         completed = self.run_python(str(LAUNCHER), "--help")
         self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertIn("--mode {tta,pta}", completed.stdout)
+        self.assertIn("--mode {tta,pta,lta}", completed.stdout)
         self.assertIn("tta --help", completed.stdout)
+        self.assertIn("lta --help", completed.stdout)
 
         completed = self.run_python(str(LAUNCHER), "--version")
         self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertIn("18.0.3", completed.stdout)
+        self.assertIn("19.0.0", completed.stdout)
 
-        for mode in ("tta", "pta"):
+        for mode in ("tta", "pta", "lta"):
             with self.subTest(mode_version=mode):
                 completed = self.run_python(
                     str(LAUNCHER), "--mode", mode, "--version"
                 )
                 self.assertEqual(completed.returncode, 0, completed.stdout)
-                self.assertIn("18.0.3", completed.stdout)
+                self.assertIn("19.0.0", completed.stdout)
 
         program = (
             "import sys; import XTA.cli; "
@@ -79,6 +81,13 @@ class CliTests(unittest.TestCase):
         self.assertIn("--enable_radial", completed.stdout)
         self.assertIn("default: 3072", completed.stdout)
 
+    def test_mode_specific_lta_help_is_dependency_light(self) -> None:
+        completed = self.run_python(str(LAUNCHER), "--mode", "lta", "--help")
+        self.assertEqual(completed.returncode, 0, completed.stdout)
+        self.assertIn("label-time augmentation", completed.stdout)
+        self.assertIn("--sam_execution {image,video}", completed.stdout)
+        self.assertNotIn("--prompt", completed.stdout)
+
     def test_run_forwards_only_mode_local_arguments(self) -> None:
         tta_arguments = ["--input", "input.mkv", "--model", "gpu:model.engine"]
         with mock.patch.object(cli, "_run_tta") as run_tta:
@@ -89,6 +98,15 @@ class CliTests(unittest.TestCase):
         with mock.patch.object(cli, "_run_pta") as run_pta:
             cli.run(["--mode=pta", *pta_arguments])
         run_pta.assert_called_once_with(pta_arguments)
+
+        lta_arguments = [
+            "--input", "target", "--output", "published",
+            "--model", "sam-bundle", "--device", "0",
+            "--enable_cartesian", "transverse",
+        ]
+        with mock.patch.object(cli, "_run_lta") as run_lta:
+            cli.run(["--mode", "lta", *lta_arguments])
+        run_lta.assert_called_once_with(lta_arguments)
 
     def test_tta_foreign_flags_are_argparse_errors_before_pipeline_import(self) -> None:
         stderr = io.StringIO()
@@ -172,6 +190,29 @@ class CliTests(unittest.TestCase):
                     cli._run_pta(["--input", "volume.nrrd", "--tta-only-flag"])
         self.assertEqual(raised.exception.code, 2)
         self.assertIn("unrecognized arguments: --tta-only-flag", stderr.getvalue())
+
+    def test_lta_module_is_imported_only_by_lta_delegate(self) -> None:
+        fake_module = types.ModuleType("XTA.lta_mode")
+        observed_contexts: list[object] = []
+
+        def fake_run(arguments: list[str]) -> None:
+            observed_contexts.append(current_unified_launch())
+
+        fake_module.run = fake_run  # type: ignore[attr-defined]
+
+        previous = sys.modules.pop("XTA.lta_mode", None)
+        try:
+            self.assertNotIn("XTA.lta_mode", sys.modules)
+            with mock.patch.dict(sys.modules, {"XTA.lta_mode": fake_module}):
+                cli._run_lta(["--input", "target"])
+        finally:
+            if previous is not None:
+                sys.modules["XTA.lta_mode"] = previous
+        self.assertEqual(len(observed_contexts), 1)
+        context = observed_contexts[0]
+        self.assertEqual(context.mode, "lta")  # type: ignore[union-attr]
+        self.assertEqual(context.mode_arguments, ("--input", "target"))  # type: ignore[union-attr]
+        self.assertIsNone(current_unified_launch())
 
 
 if __name__ == "__main__":

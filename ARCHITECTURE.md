@@ -1,6 +1,6 @@
 # XTA architecture
 
-`GPT-5.6-Sol-Ultra_v18.0.3_SLURM.py` is the sole versioned launcher. It, the
+`GPT-5.6-Sol-Ultra_v19.0.0_SLURM.py` is the sole versioned launcher. It, the
 installed `xta` console script, and `python -m XTA` all dispatch
 through `XTA.cli.run()`.
 The implementation lives in the importable `XTA` package so spawned processes
@@ -34,7 +34,7 @@ resolve worker functions and data types through canonical module paths.
 | `unification.channels`, `unification.tiles` | shared single-channel-layout expansion and strict grouped tile parsing |
 | `unification.runtime`, `unification.views` | the shared TTA-authoritative physical-view compiler and dependency-light grouped view requests |
 | `unification.context`, `unification.manifest`, `unification.tta_manifest` | launch context, atomic JSON publication, artifact identities and mode-qualified v18 manifests |
-| `pta_config` | strict PTA-only v18 grammar, grouped geometry and mode-specific defaults |
+| `pta_config` | strict PTA-only grammar, grouped geometry and mode-specific defaults |
 | `pta_mode`, `pta_runtime` | dependency-light PTA validation followed by construction of the complete native runtime option contract |
 | `pta_scheduler` | independently tested CUDA-owner layout, compatible-work packing, VRAM admission and deterministic OOM splitting |
 | `pta_augmentation` | external PTA policy inspection, loading, deterministic thread-local construction and paired image/mask execution |
@@ -43,13 +43,19 @@ resolve worker functions and data types through canonical module paths.
 | `pta_publication` | image/label encoding, atomic publication, canonical dataset image sink and candidate output paths |
 | `pta_workers` | sole PTA shared-memory, worker-global, CPU/GPU task-entry, result and persistent-pool process owner |
 | `pta` | PTA source discovery/preprocessing, geometry planning, dataset orchestration, reporting and manifest publication |
+| `lta_config`, `lta_mode` | dependency-light v19 LTA grammar and deferred runtime dispatch |
+| `lta_inputs` | class-0 YOLO-seg target/exemplar discovery, full/partial annotation states and deterministic prompt ranking |
+| `lta_sam` | local-only SAM bundle boundary, fixed 30-frame leases and runtime-neutral image/video result contracts |
+| `lta_runtime` | fail-closed v19 LTA preflight plus physical-view/angle/session planning; SAM execution is the next prototype slice |
+| `lta_outputs` | role-aware LTA layer recomposition, unconditional terminal-union primitive and atomic complete-manifest writer |
+| `lta_rendering` | XTA-authoritative full-frame LTA raster rendering, implicit RGB conversion, inverse in-plane mask restore and source-space backprojection seam |
 | `tta_mode` | production TTA runner entered only after mode-specific CLI validation |
 | `tta_lifecycle` | outer TTA resource ownership, selected-run scratch cleanup and complete-manifest publication transaction |
 | `tta_outputs` | single-use identity-preserving ownership and ordered teardown of settled TTA output artifacts |
 | `tta_prediction` | lazy physical-view frame caching and bounded prediction-source build, staging and warmup queues |
 | `tta_scheduler` | stateful TTA process-inference admission, hybrid/D1 ownership, CPU/GPU dispatch, result transport and accounting |
 | `tta_terminal` | completed physical-view TTA collapse, one-time terminal backprojection and dense-union handoff credit |
-| `cli` | dependency-light strict `--mode tta|pta` dispatcher |
+| `cli` | dependency-light strict `--mode tta|pta|lta` dispatcher |
 | `intel_compression` | dependency-light policy/adapter for optional QATzip and QPL companion extensions |
 | `intel_dsa` | lazy policy, eligibility, drain transaction and lifecycle for optional Linux idxd workspace copy |
 | `pipeline` | production TTA preparation, completed-view assembly and output facade around the process scheduler |
@@ -280,6 +286,54 @@ still require the production environment and representative artifacts. Intel acc
 build, provisioning, and admission instructions live in ``native/README.md``; run
 ``python tools/intel_accelerator_selftest.py --backend all`` on the target host.
 
+The bounded v19 LTA hardware seam can be exercised from a source checkout with
+``python tools/v19_lta_gpu_smoke.py --model <local-sam3.1-bundle> --input-root <input> --exemplar-root <exemplars> --case m1``.
+It validates one fixed 30-frame visual-prompt/video-tracking session without publishing
+images or labels. The tool requires an existing local checkpoint and pinned local BPE asset;
+it never downloads model material. ``--case f1`` separately exercises cross-image composite
+conditioning, while ``--case both`` reuses one predictor for the two bounded sessions. The
+pinned SAM 3.1 adapter suppresses the upstream tracker-only load of the merged checkpoint,
+assigns one memory-mapped assembled state into a CPU parameter shell (or an explicit diagnostic
+meta shell), requires an exact state-dict audit, and transfers the completed FP32 predictor to
+CUDA once before inference.
+Large host-to-CUDA parameter copies are chunked to stay within a Windows/eGPU BAR1 aperture;
+the reusable builder remains full FP32 by default. The standalone smoke defaults to explicit
+``bfloat16_egpu`` storage for autocast-owned weights while retaining every decoder FFN linear
+layer in FP32 because upstream disables autocast there. This qualifies the constrained-device
+code path, not full-FP32 numerical parity; ``--weight-storage float32`` remains available for
+production-class devices. The constrained smoke also sets SAM grounding and postprocessing
+batches to one frame; its session boundary remains exactly 30 frames and Object Multiplex still
+fails closed at the builder's 128-object capacity. Its scoped SDPA policy tries Flash, then
+memory-efficient attention, then Math so a Windows Torch build without Flash does not abort;
+the original upstream backend function is restored during cleanup. F1 defaults to a prompt-only
+exemplar tile: the exemplar appears beside the target on the prompted frame and is neutral on the
+other 29 frames. ``--f1-exemplar-visibility all`` retains the repeated-exemplar diagnostic.
+
+The meta construction option exists for hosts whose commit/pagefile budget cannot hold the
+normal CPU shell. It permits exactly the two pinned ViT scalar `linspace(0, 0.1, 32)` schedules
+on CPU and rebuilds exactly one nonpersistent 32×32 text causal mask; any other constructor
+buffer absent from the checkpoint remains fatal. Meta construction rejects compile and warm-up
+until those operations are separately qualified after CUDA materialization. The exact state-dict
+and post-transfer device/dtype audits are unchanged.
+
+``python tools/v19_lta_point_smoke.py`` is a separate diagnostic experiment for
+SAM 3.1's per-instance point-interactivity path. It compares a distance-transform
+point set with a centerline/edge point set, refines only against one known prompt-frame
+YOLO polygon, and propagates the final revision through one fixed 30-frame M1 session.
+Its point-seeded score is interaction provenance, not detector confidence, and its
+artifacts are not LTA publication outputs. The pinned point-created propagation response
+is partial and does not expose Multiplex drop statistics; the diagnostic records that field
+as inapplicable while still rejecting any nonzero drop count if a future response supplies it.
+
+``python tools/v19_lta_tile_smoke.py`` compares box and point prompts on a fixed
+native-pixel 1008-square M1 crop. ``python tools/v19_lta_mask_seed_smoke.py`` then
+exercises a pinned private tracker experiment that seeds the authoritative YOLO mask
+directly and advances the shared SAM encoder/tracker one frame at a time. The latter
+is deliberately outside the public SAM request API; it is retained because labeled
+endpoint checks demonstrated coherent propagation, not as a stable runtime contract.
+Its default is the tracker-only branch, and its anchor-integrity and non-anchor-activity
+gates are explicitly diagnostic rather than quality or publication acceptance.
+
 From a source checkout, the unprivileged HGX Track-A smoke test is
 ``python tools/v1803_hgx_selftest.py --gpus 4`` (and ``--gpus 8`` for a full-node
 allocation). It creates boundary-crossing synthetic objects and requires a byte-identical
@@ -287,7 +341,9 @@ GPU/CPU `keep_objects` result. ``--plan-only`` exercises partitioning and row pa
 host without CUDA. ``python tools/v1803_d1_ipc_selftest.py --gpus 4`` verifies that
 single-visible-device spawned ranks can export, import, NVLink-OR, and acknowledge the
 same dedicated CUDA allocations used by D1 groups; repeat with eight allocated GPUs.
-Wheels retain both scripts under ``share/xta/tools``. Four-GPU representative TTA
+Wheels retain the two v18 scripts and the four v19 LTA experiment scripts under
+``share/xta/tools``.
+Four-GPU representative TTA
 qualification completed the full D1 lifetime across model workers, partial publication,
 release acknowledgement, and scheduler quiescence; the byte-exact but performance-neutral
 result is recorded in the HGX experiment section above.

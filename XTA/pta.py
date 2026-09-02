@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # The implementation has an ordinary unversioned package identity; release
 # constituent provenance is recorded outside the release package.
-"""Unified v18 pretraining augmentation and dataset-publication engine.
+"""Unified pretraining augmentation and dataset-publication engine.
 
 The public interface is defined by :mod:`XTA.pta_config`. Built-in physical
 views, frame addressing, channel assembly, tiles, and categorical rendering
@@ -347,20 +347,27 @@ def choose_workers(requested: int) -> int:
     return max(1, visible_cpu_count())
 
 
-def probe_gpu_offline_runtime(*, require_nvjpeg: bool, expected_device_count: int) -> str:
+def probe_gpu_offline_runtime(
+    *,
+    require_nvjpeg: bool,
+    selected_device_ids: Sequence[int],
+) -> str:
     """Fail before output cleanup when the requested CUDA runtime is unusable.
 
     The probe runs out-of-process so the parent remains CUDA-uninitialized and
     can safely fork one persistent rank per GPU afterwards.
     """
+    selected_ids = tuple(dict.fromkeys(int(value) for value in selected_device_ids))
     statements = [
         "import torch",
         "nvimgcodec_version = 'not-requested'",
         "assert torch.cuda.is_available(), 'torch.cuda.is_available() is false'",
         "count = int(torch.cuda.device_count())",
         "assert count > 0, 'torch.cuda.device_count() is zero'",
-        f"assert count == {int(expected_device_count)}, "
-        f"f'topology discovered {int(expected_device_count)} CUDA-visible GPU(s), but PyTorch sees {{count}}'",
+        f"selected = {selected_ids!r}",
+        "invalid = [idx for idx in selected if idx < 0 or idx >= count]",
+        "assert not invalid, "
+        "f'selected logical CUDA index(es) {invalid} are out of range for PyTorch device_count={count}'",
     ]
     if require_nvjpeg:
         statements.extend([
@@ -373,7 +380,7 @@ def probe_gpu_offline_runtime(*, require_nvjpeg: bool, expected_device_count: in
         ])
     statements.append(
         "print(f'torch={torch.__version__}; torch_cuda={torch.version.cuda}; "
-        "visible_gpus={count}; nvimgcodec={nvimgcodec_version}')"
+        "visible_gpus={count}; selected_gpus={selected}; nvimgcodec={nvimgcodec_version}')"
     )
     try:
         proc = subprocess.run(
@@ -526,7 +533,12 @@ def _partition_gpu_cpu_sets(raw_sets: Sequence[Sequence[int]], allowed: Sequence
     return tuple(result)
 
 
-def discover_topology(*, enabled: bool, warnings: WarningLog) -> TopologyPlan:
+def discover_topology(
+    *,
+    enabled: bool,
+    warnings: WarningLog,
+    device_ids: Optional[Sequence[int]] = None,
+) -> TopologyPlan:
     allowed = _allowed_cpu_tuple()
     # CUDA-visible device discovery is required even when NUMA binding is
     # disabled; --no-topology_aware suppresses locality decisions, not GPUs.
@@ -536,7 +548,21 @@ def discover_topology(*, enabled: bool, warnings: WarningLog) -> TopologyPlan:
         raw = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
         tokens = [part.strip() for part in raw.split(",") if part.strip() and part.strip() != "-1"]
         visible_records = [{"index": token, "uuid": token, "pci": ""} for token in tokens]
-    logical_ids = tuple(range(len(visible_records)))
+    if device_ids is None:
+        logical_ids = tuple(range(len(visible_records)))
+    else:
+        logical_ids = tuple(dict.fromkeys(int(value) for value in device_ids))
+        invalid = [
+            device_id
+            for device_id in logical_ids
+            if device_id < 0 or device_id >= len(visible_records)
+        ]
+        if invalid:
+            raise ValueError(
+                f"--device logical CUDA index(es) {invalid} are out of range for "
+                f"{len(visible_records)} CUDA-visible device(s)"
+            )
+        visible_records = [visible_records[device_id] for device_id in logical_ids]
     physical_ids = tuple(str(rec.get("index") or rec.get("uuid") or "unknown") for rec in visible_records)
     raw_cpu_sets = (
         tuple(_cpus_for_pci_device(str(rec.get("pci", "")), allowed) for rec in visible_records)
@@ -3422,7 +3448,7 @@ def write_v18_pta_manifest(
         "pipeline_version": SCRIPT_VERSION,
         "mode": "pta",
         "command": [SCRIPT_BASENAME, "--mode", "pta", *list(cli_argv)],
-        "determinism_contract": "same v18 version, command, and input identities",
+        "determinism_contract": "same pipeline version, command, and input identities",
         "coordinate_contract": {
             "source": "gray8_t_y_x",
             "t_axis": "frame_index",
@@ -3478,6 +3504,11 @@ def write_v18_pta_manifest(
             },
             "save": list(config.save.tokens),
             "execution": {
+                "device_ids": (
+                    None
+                    if config.device_ids is None
+                    else [int(value) for value in config.device_ids]
+                ),
                 "requested_worker_backend": str(config.args.worker_backend),
                 "resolved_render_backend": str(render_backend),
                 "workers": int(workers),
@@ -4253,7 +4284,7 @@ def prepare_loaded_source(
 
     v18_config = getattr(args, "_v18_config", None)
     if v18_config is None:
-        raise RuntimeError("PTA volume preparation requires a resolved v18 configuration")
+        raise RuntimeError("PTA volume preparation requires a resolved configuration")
     encoded_gaps = bool(source_encoded_gaps)
     native_only = bool(effective_volume_class == "partially_labeled" or encoded_gaps)
     effective_config = v18_config
@@ -4964,7 +4995,7 @@ def validate_fresh_output_safety(
         or _path_is_within(source_root, output)
     ):
         raise ValueError(
-            "PTA output and input directories must be disjoint for a fresh v18 publication; "
+            "PTA output and input directories must be disjoint for a fresh publication; "
             f"input={source_root}, output={output}"
         )
 
@@ -5251,7 +5282,7 @@ def write_pta_summary(
         "TTA tilted-stack threshold"
     )
     lines.append(f"NRRD export layout: {NRRD_AXIS_ORDER_NOTE}; space={NRRD_SPACE}; space_directions=identity")
-    lines.append("Built-in PTA in-plane variant: fixed internally at 0 degrees in v18; --angle is not a PTA flag")
+    lines.append("Built-in PTA in-plane variant: fixed internally at 0 degrees; --angle is not a PTA flag")
     lines.append("Implementation notes/conflicts:")
     lines.append("  - --force resolves Partially Labeled volumes to Fully Labeled for uniform type checking; without --force, mixed raw volume classes are rejected before processing.")
     lines.append("  - For unlabeled volumes, --background_percent is disabled because v3 defines background by the YOLO label export while label operations are excluded for unlabeled annotation outputs.")
@@ -5274,9 +5305,9 @@ def write_pta_summary(
     lines.append("  - Complete labeled volumes preserve at least the input count of foreground transverse slices through smoothing/cubic resize; --background_percent continues to govern background retention without a C1 override.")
     lines.append("  - Foreground classification runs on copy-0 originals only. Transverse YOLO candidates use predecoded polygon/ROI geometry; NRRD and general resliced views retain mask-only rendering. Offline augmented copies inherit their source class for budgeting.")
     lines.append("  - Source-frame scheduling is grouped and deterministic, while built-in view, affine, tile, and categorical rendering are delegated to the shared TTA geometry module.")
-    lines.append("  - CPU policies use the persistent CPU pool. A build_gpu_augmentation policy uses one persistent process per CUDA-visible GPU; tile resize and deterministic replay batches execute on that GPU (H2), while fused geometry/pointwise behavior is owned by the external policy (M1).")
+    lines.append("  - CPU policies use the persistent CPU pool. A build_gpu_augmentation policy uses one persistent process per selected CUDA GPU; tile resize and deterministic replay batches execute on that GPU (H2), while fused geometry/pointwise behavior is owned by the external policy (M1).")
     lines.append("  - JPEG GPU-policy outputs are batch encoded directly from CUDA tensors through nvImageCodec/nvJPEG when requested and available; explicit nvjpeg is fail-fast while auto records any OpenCV fallback.")
-    lines.append("  - Render/augment/encode work runs on one persistent pool per run (--worker_backend); all retained full/tile items and offline replays for a (plan, source frame) share one canonical render. Legacy queue/chunk tuning flags are not accepted by the v18 PTA interface.")
+    lines.append("  - Render/augment/encode work runs on one persistent pool per run (--worker_backend); all retained full/tile items and offline replays for a (plan, source frame) share one canonical render. Legacy queue/chunk tuning flags are not accepted by the PTA interface.")
     lines.append("  - Topology-aware mode maps CUDA-visible GPUs to observed PCI/NUMA-local allocated CPUs and binds persistent render workers plus nvJPEG decode threads; it falls back to an allocation-safe CPU partition when locality is unavailable.")
     lines.append("  - Overlay videos use the center image channel and remain original source-view diagnostics; they do not include filtered/split-specific augmented copies.")
     if dataset_yaml_path is not None:
@@ -5615,7 +5646,11 @@ def main(
             )
         dataset_channels = next(iter(split_channel_counts))
 
-    topology = discover_topology(enabled=bool(args.topology_aware), warnings=warnings)
+    topology = discover_topology(
+        enabled=bool(args.topology_aware),
+        warnings=warnings,
+        device_ids=getattr(args, "device_ids", None),
+    )
     requested_tilt_angles = resolve_tilt_angles(args.tilt_angle)
     requested_tilt_directions = resolve_tilt_directions(args.tilt_direction)
     v18_config = getattr(args, "_v18_config", None)
@@ -5681,7 +5716,7 @@ def main(
             )
         gpu_runtime_probe = probe_gpu_offline_runtime(
             require_nvjpeg=str(args.jpeg_encode_backend) == "nvjpeg",
-            expected_device_count=len(topology.cuda_device_ids),
+            selected_device_ids=topology.cuda_device_ids,
         )
         if custom_channel_output and tiff_encode_backend in {"auto", "nvtiff"}:
             nvtiff_module = importlib.import_module(".nvtiff_backend", package=__package__)
@@ -5934,7 +5969,7 @@ def main(
         print(
             f"Persistent render pool: backend={render_backend}, "
             f"start_method={render_pool.start_method}, "
-            f"ranks={frame_workers}{' (one CUDA owner per visible GPU)' if gpu_offline_active else ''}, "
+            f"ranks={frame_workers}{' (one CUDA owner per selected GPU)' if gpu_offline_active else ''}, "
             f"gpu_cpu_render_threads={int(gpu_render_threads) if gpu_offline_active else 'N/A'}, "
             f"shared_memory_volumes={'on' if use_shared_volumes else 'off'}, source_frame_grouping=on, "
             f"pipeline_depth={int(effective_pipeline_depth)}, "
@@ -6535,7 +6570,7 @@ def main(
             )
         _cleanup_v18_pta_selected_run_work(out_dir / ".v18_work")
         if v18_input_identities is None:  # pragma: no cover - launch invariant
-            raise RuntimeError("v18 PTA input identities were not captured")
+            raise RuntimeError("PTA input identities were not captured")
         assert_v18_pta_inputs_unchanged(v18_input_identities)
         assert_augmentation_definition_unchanged(augmentation_definition)
         # This is deliberately the final selected artifact: a complete manifest

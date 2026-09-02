@@ -99,6 +99,10 @@ class UnificationContractTests(unittest.TestCase):
         self.assertEqual(variants[0].direction, "ascending")
         self.assertEqual(variants[0].offsets, (-4, -2, 0, 2, 4))
 
+        lta_variants = resolve_channel_variants(PipelineMode.LTA, "C5S2")
+        self.assertEqual(len(lta_variants), 1)
+        self.assertEqual(lta_variants[0].direction, "ascending")
+
     def test_pta_adds_reversed_order_only_when_distinct(self) -> None:
         variants = resolve_channel_variants("pta", "C5S2")
         self.assertEqual([variant.direction for variant in variants], ["ascending", "reversed"])
@@ -136,6 +140,13 @@ class UnificationContractTests(unittest.TestCase):
         self.assertEqual([variant.in_plane_variant.angle_deg for variant in variants], [0.0, 120.0])
         self.assertEqual(
             [variant.runtime_view for variant in variants],
+            ["transverse__tta_a0", "transverse__tta_a120"],
+        )
+
+        with mock.patch.dict(sys.modules, {"XTA.geometry": fake_geometry}):
+            lta_variants = expand_view_variants("lta", ["transverse"], [0, 120])
+        self.assertEqual(
+            [variant.runtime_view for variant in lta_variants],
             ["transverse__tta_a0", "transverse__tta_a120"],
         )
 

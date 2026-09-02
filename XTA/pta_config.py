@@ -1,4 +1,4 @@
-"""Dependency-light configuration for the unified v18 PTA mode.
+"""Dependency-light configuration for the unified PTA mode.
 
 Geometry token validation reuses the current TTA grammar, while mode-specific
 defaults and output semantics remain here.
@@ -58,7 +58,7 @@ TileRequest = ResolvedTileGroup
 
 @dataclass(frozen=True)
 class PtaConfig:
-    """Strict, fully resolved v18 PTA configuration."""
+    """Strict, fully resolved PTA configuration."""
 
     args: argparse.Namespace
     channel_format: ChannelFormat
@@ -68,6 +68,7 @@ class PtaConfig:
     radial_requests: Tuple[RadialViewRequest, ...]
     tilted_groups: Tuple[TiltedViewGroup, ...]
     tiles: Tuple[TileRequest, ...]
+    device_ids: Optional[Tuple[int, ...]]
     requested_output_format: str
     effective_output_format: str
 
@@ -148,7 +149,7 @@ def resolve_pta_save_request(values: Sequence[str] | str | None) -> PtaSaveReque
 def resolve_preprocessing_options(
     values: Sequence[str] | str | None,
 ) -> PreprocessingRequest:
-    """Resolve the sole v18 PTA preprocessing operation.
+    """Resolve the sole PTA preprocessing operation.
 
     Absence disables smoothing. Once selected, omitted slots use the current
     TTA defaults of sigma 3 and one pass.
@@ -197,15 +198,55 @@ def resolve_tile_requests(values: Sequence[str] | str | None) -> Tuple[TileReque
     return tuple(resolve_tile_groups(values))
 
 
+def resolve_pta_device_ids(
+    values: Sequence[str] | str | None,
+) -> Optional[Tuple[int, ...]]:
+    """Resolve optional logical CUDA indexes without inventing a default.
+
+    ``None`` deliberately means every CUDA-visible device, preserving PTA's
+    existing behavior when ``--device`` is omitted.  An explicit value selects
+    a stable, de-duplicated subset of the inherited logical CUDA indexes.
+    """
+
+    if values is None:
+        return None
+    resolved: list[int] = []
+    for raw in _token_list(values):
+        token = str(raw).strip().lower()
+        if token.startswith("gpu:") or token.startswith("cuda:"):
+            token = token.split(":", 1)[1].strip()
+        if not token.isdigit():
+            raise ValueError(
+                "--device accepts non-negative logical CUDA indexes, for example "
+                "--device 0 or --device 0,2"
+            )
+        device_id = int(token)
+        if device_id not in resolved:
+            resolved.append(device_id)
+    if not resolved:
+        raise ValueError("--device must select at least one logical CUDA index")
+    return tuple(resolved)
+
+
 def build_pta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=prog,
-        description="v18 unified pretraining augmentation and dataset generation.",
+        description="Unified pretraining augmentation and dataset generation.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         allow_abbrev=False,
     )
     parser.add_argument("--input", required=True, help="PTA input directory")
     parser.add_argument("--output", default=None, help="Output directory")
+    parser.add_argument(
+        "--device",
+        nargs="+",
+        default=None,
+        metavar="GPU_INDEXES",
+        help=(
+            "Logical CUDA indexes into CUDA_VISIBLE_DEVICES. Omit this option to use "
+            "all visible GPUs; use values such as 0, 0,2, or cuda:0 cuda:2 to select a subset"
+        ),
+    )
     parser.add_argument(
         "--imgsz",
         default=0,
@@ -402,6 +443,7 @@ def resolve_pta_config(args: argparse.Namespace) -> PtaConfig:
         radial_requests=tuple(resolve_radial_view_requests(args.enable_radial)),
         tilted_groups=tuple(resolve_tilted_view_groups(args.enable_tilted)),
         tiles=resolve_tile_requests(args.enable_tile),
+        device_ids=resolve_pta_device_ids(args.device),
         requested_output_format=str(requested_output_format),
         effective_output_format=str(effective_output_format),
     )
@@ -431,6 +473,7 @@ __all__ = (
     "parse_output_image_format",
     "parse_pta_args",
     "resolve_preprocessing_options",
+    "resolve_pta_device_ids",
     "resolve_pta_config",
     "resolve_pta_save_request",
     "resolve_tile_requests",

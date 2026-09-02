@@ -1,4 +1,4 @@
-"""Resolved PTA configuration boundary for the v18 execution engine.
+"""Resolved PTA configuration boundary for the execution engine.
 
 The public parser produces :class:`PtaConfig`; this module converts that
 immutable configuration into the execution namespace consumed by the dataset
@@ -23,6 +23,8 @@ def build_runtime_options(config: PtaConfig) -> argparse.Namespace:
     return argparse.Namespace(
         input=public.input,
         output=public.output,
+        device=public.device,
+        device_ids=config.device_ids,
         imgsz=public.imgsz,
         output_format=str(config.effective_output_format),
         channel_format=[str(config.channel_format.token)],
@@ -65,7 +67,7 @@ def build_runtime_options(config: PtaConfig) -> argparse.Namespace:
         tiff_encode_backend=public.tiff_encode_backend,
         jpeg_quality=public.jpeg_quality,
         topology_aware=public.topology_aware,
-        # Resolved v18 geometry is authoritative. These neutral values satisfy
+        # Resolved unified geometry is authoritative. These neutral values satisfy
         # the engine's internal shape checks and are never CLI aliases.
         enable_sagittal=False,
         enable_coronal=False,

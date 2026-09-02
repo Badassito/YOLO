@@ -6,10 +6,15 @@ XTA PTA's offline GPU backend. `GPU_baseline.py` is the cleaned copy of the
 supplied GPU policy; references to the "standard" policy in the profile request
 mean this baseline.
 
-The four GPU profiles keep the same transform-selection probabilities and the
-same random draw order. Only sampled magnitudes change, so a fixed integer seed
-selects the same D4 element, scale branch, elastic/brightness/blur switches,
-noise family, and salt-and-pepper switch in every profile.
+Each corresponding `CPU_*.py` file exports `build_augmentation()` for PTA's
+offline CPU backend. The CPU policies use the same transform-selection graph,
+profile magnitudes, and integer-seed contract as their GPU counterparts.
+
+Both four-profile families keep the same transform-selection probabilities and
+the same random draw order. Only sampled magnitudes change, so a fixed integer
+seed selects the same D4 element, scale branch, elastic/brightness/blur
+switches, noise family, and salt-and-pepper switch in every profile and on both
+backends.
 
 | Parameter | Light | Baseline | Heavy | Super-heavy |
 | --- | ---: | ---: | ---: | ---: |
@@ -46,9 +51,10 @@ The hardware-gated contract test for all four profiles is:
 XTA_RUN_EXTERNAL_AUGMENTATION_CUDA=1 python -m unittest tests.test_external_augmentation_examples -v
 ```
 
-`CPU_baseline.py` provides the optional CPU counterpart through
-`build_augmentation()`. It matches the baseline probability graph, parameter
-ranges, affine composition, interpolation choices, and seed contract. It is
-distribution-compatible rather than pixel-identical because OpenCV/NumPy and
-CUDA use different resamplers and random-number streams. Select it with
-`--offline_augmentation_backend cpu`.
+The CPU policies are distribution-compatible rather than pixel-identical to
+their GPU counterparts because OpenCV/NumPy and CUDA use different resamplers
+and random-number streams. Select one with, for example:
+
+```text
+python -m XTA --mode pta --input INPUT_DIRECTORY --output OUTPUT_DIRECTORY --augmentation XTA/examples/external_augmentations/CPU_baseline.py --augmentation_ratio 4 --augmentation_execution offline --offline_augmentation_backend cpu
+```

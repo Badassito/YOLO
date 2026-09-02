@@ -8,6 +8,7 @@ from XTA.pta_config import (
     build_pta_argparser,
     parse_pta_args,
     resolve_preprocessing_options,
+    resolve_pta_device_ids,
     resolve_pta_save_request,
     resolve_tile_requests,
 )
@@ -21,6 +22,27 @@ class PtaConfigTests(unittest.TestCase):
         self.assertEqual(config.save.tokens, ())
         self.assertFalse(config.preprocessing.gaussian_smoothing_enabled)
         self.assertEqual(config.args.imgsz, 0)
+        self.assertIsNone(config.args.device)
+        self.assertIsNone(config.device_ids)
+
+    def test_device_selects_logical_cuda_subset_without_a_default(self) -> None:
+        self.assertEqual(
+            resolve_pta_device_ids(["2,0", "cuda:1", "gpu:2"]),
+            (2, 0, 1),
+        )
+        config = parse_pta_args(
+            ["--input", "dataset", "--device", "2,0", "cuda:1"]
+        )
+        self.assertEqual(config.args.device, ["2,0", "cuda:1"])
+        self.assertEqual(config.device_ids, (2, 0, 1))
+
+        for invalid in ("cpu", "-1", "cuda:x"):
+            with self.subTest(invalid=invalid):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        parse_pta_args(
+                            ["--input", "dataset", "--device", invalid]
+                        )
 
     def test_gaussian_is_opt_in_with_tta_defaults(self) -> None:
         disabled = resolve_preprocessing_options(None)

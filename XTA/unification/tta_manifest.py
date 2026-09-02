@@ -1,4 +1,4 @@
-"""Resolved TTA run-manifest construction for the unified v18 launcher."""
+"""Resolved TTA run-manifest construction for the unified launcher."""
 
 from __future__ import annotations
 

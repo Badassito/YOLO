@@ -1,4 +1,4 @@
-"""Process-local marker for execution through the strict v18 launcher."""
+"""Process-local marker for execution through the strict unified launcher."""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ def activate_unified_launch(
     mode_arguments: Sequence[str],
 ) -> Iterator[UnifiedLaunchContext]:
     resolved_mode = str(mode).strip().lower()
-    if resolved_mode not in {"tta", "pta"}:
+    if resolved_mode not in {"tta", "pta", "lta"}:
         raise ValueError(f"unsupported unified launch mode {mode!r}")
     context = UnifiedLaunchContext(
         version=str(version),

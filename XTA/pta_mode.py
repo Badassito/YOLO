@@ -16,7 +16,7 @@ def _load_runtime_module() -> ModuleType:
 
 
 def run(argv: Sequence[str] | None = None) -> None:
-    """Validate PTA arguments and execute the native v18 runtime."""
+    """Validate PTA arguments and execute the native runtime."""
 
     arguments = None if argv is None else [str(value) for value in argv]
     config = parse_pta_args(arguments)

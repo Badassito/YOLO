@@ -347,6 +347,83 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             (4, 16),
         )
 
+    def test_topology_preserves_selected_logical_cuda_ids_and_locality(self) -> None:
+        records = [
+            {"index": "4", "uuid": "GPU-4", "pci": "0000:04:00.0"},
+            {"index": "7", "uuid": "GPU-7", "pci": "0000:07:00.0"},
+            {"index": "8", "uuid": "GPU-8", "pci": "0000:08:00.0"},
+            {"index": "9", "uuid": "GPU-9", "pci": "0000:09:00.0"},
+        ]
+        local_cpus = {
+            "0000:07:00.0": (20, 21),
+            "0000:09:00.0": (40, 41),
+        }
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CUDA_VISIBLE_DEVICES": "4,7,8,9"},
+                clear=False,
+            ),
+            mock.patch.object(pta, "_allowed_cpu_tuple", return_value=tuple(range(64))),
+            mock.patch.object(pta, "_gpu_records_from_nvidia_smi", return_value=records),
+            mock.patch.object(
+                pta,
+                "_cpus_for_pci_device",
+                side_effect=lambda pci, _allowed: local_cpus[str(pci)],
+            ),
+        ):
+            topology = pta.discover_topology(
+                enabled=True,
+                warnings=pta.WarningLog(),
+                device_ids=(1, 3),
+            )
+
+        self.assertEqual(topology.cuda_device_ids, (1, 3))
+        self.assertEqual(topology.gpu_physical_ids, ("7", "9"))
+        self.assertEqual(topology.gpu_cpu_sets, ((20, 21), (40, 41)))
+        self.assertEqual(topology.worker_cpu_order, (20, 40, 21, 41))
+
+    def test_topology_rejects_out_of_range_explicit_device(self) -> None:
+        records = [
+            {"index": "4", "uuid": "GPU-4", "pci": ""},
+            {"index": "7", "uuid": "GPU-7", "pci": ""},
+        ]
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CUDA_VISIBLE_DEVICES": "4,7"},
+                clear=False,
+            ),
+            mock.patch.object(pta, "_allowed_cpu_tuple", return_value=(0, 1)),
+            mock.patch.object(pta, "_gpu_records_from_nvidia_smi", return_value=records),
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                r"--device logical CUDA index\(es\) \[2\].*2 CUDA-visible",
+            ):
+                pta.discover_topology(
+                    enabled=False,
+                    warnings=pta.WarningLog(),
+                    device_ids=(2,),
+                )
+
+    def test_gpu_runtime_probe_validates_selected_ids_not_selected_count(self) -> None:
+        def run_probe(command: list[str], **_kwargs: object) -> object:
+            program = str(command[2])
+            compile(program, "<pta-gpu-probe>", "exec")
+            self.assertIn("selected = (1, 3)", program)
+            self.assertIn("idx >= count", program)
+            self.assertNotIn("count == 2", program)
+            return types.SimpleNamespace(stdout="probe-ok\n")
+
+        with mock.patch.object(pta.subprocess, "run", side_effect=run_probe):
+            result = pta.probe_gpu_offline_runtime(
+                require_nvjpeg=False,
+                selected_device_ids=(1, 3),
+            )
+
+        self.assertEqual(result, "probe-ok")
+
     def test_multi_source_batches_preserve_candidate_order(self) -> None:
         candidates = [self._candidate(index) for index in range(7)]
 

@@ -23,6 +23,10 @@ GPU_PROFILES = (
     ("heavy", EXAMPLES / "GPU_heavy.py"),
     ("superheavy", EXAMPLES / "GPU_superheavy.py"),
 )
+CPU_PROFILES = tuple(
+    (profile, EXAMPLES / f"CPU_{profile}.py")
+    for profile, _path in GPU_PROFILES
+)
 
 
 def _tree(path: Path) -> ast.Module:
@@ -67,20 +71,22 @@ def _isolated_sample_function(
     return namespace["sample_parameters"]
 
 
-def _elastic_amplitude(path: Path) -> float:
-    function = _class_method(path, "GPUAugmentation", "_elastic_displacement")
+def _elastic_amplitude(path: Path, *, class_name: str) -> float:
+    function = _class_method(path, class_name, "_elastic_displacement")
     returns = [node for node in ast.walk(function) if isinstance(node, ast.Return)]
     if len(returns) != 1:
         raise AssertionError(f"{path}: expected one elastic-displacement return")
-    value = returns[0].value
-    if (
-        not isinstance(value, ast.BinOp)
-        or not isinstance(value.op, ast.Mult)
-        or not isinstance(value.right, ast.Constant)
-        or not isinstance(value.right.value, (int, float))
-    ):
+    multipliers = [
+        node
+        for node in ast.walk(returns[0].value)
+        if isinstance(node, ast.BinOp)
+        and isinstance(node.op, ast.Mult)
+        and isinstance(node.right, ast.Constant)
+        and isinstance(node.right.value, (int, float))
+    ]
+    if len(multipliers) != 1:
         raise AssertionError(f"{path}: elastic amplitude is not an explicit multiplier")
-    return float(value.right.value)
+    return float(multipliers[0].right.value)  # type: ignore[union-attr]
 
 
 def _multiplicative_noise_range(path: Path, *, class_name: str) -> tuple[float, float]:
@@ -182,7 +188,10 @@ class ExternalAugmentationExampleTests(unittest.TestCase):
             for _profile, path in GPU_PROFILES
         ]
         self.assertEqual(
-            [_elastic_amplitude(path) for _profile, path in GPU_PROFILES],
+            [
+                _elastic_amplitude(path, class_name="GPUAugmentation")
+                for _profile, path in GPU_PROFILES
+            ],
             [15.0, 20.0, 27.5, 35.0],
         )
         self.assertEqual(
@@ -216,29 +225,48 @@ class ExternalAugmentationExampleTests(unittest.TestCase):
                     (seed, field_values),
                 )
 
-    def test_cpu_baseline_uses_the_gpu_baseline_parameter_graph(self) -> None:
-        gpu_sample = _isolated_sample_function(
-            EXAMPLES / "GPU_baseline.py",
-            class_name="GPUAugmentation",
+    def test_cpu_profiles_match_their_gpu_parameter_graphs(self) -> None:
+        self.assertEqual(
+            [
+                _elastic_amplitude(path, class_name="CPUAugmentation")
+                for _profile, path in CPU_PROFILES
+            ],
+            [15.0, 20.0, 27.5, 35.0],
         )
-        cpu_sample = _isolated_sample_function(
-            EXAMPLES / "CPU_baseline.py",
-            class_name="CPUAugmentation",
+        self.assertEqual(
+            [
+                _multiplicative_noise_range(path, class_name="CPUAugmentation")
+                for _profile, path in CPU_PROFILES
+            ],
+            [(0.65, 1.35), (0.5, 1.5), (0.35, 1.65), (0.15, 1.85)],
         )
-        for seed in range(512):
-            self.assertEqual(
-                cpu_sample(seed, 257, 383),  # type: ignore[operator]
-                gpu_sample(seed, 257, 383),  # type: ignore[operator]
+
+        for (profile, gpu_path), (_cpu_profile, cpu_path) in zip(
+            GPU_PROFILES,
+            CPU_PROFILES,
+        ):
+            gpu_sample = _isolated_sample_function(
+                gpu_path,
+                class_name="GPUAugmentation",
+            )
+            cpu_sample = _isolated_sample_function(
+                cpu_path,
+                class_name="CPUAugmentation",
             )
 
-    def test_cpu_baseline_is_seeded_deterministic_and_preserves_empty_masks(self) -> None:
+            for seed in range(512):
+                with self.subTest(profile=profile, seed=seed):
+                    self.assertEqual(
+                        cpu_sample(seed, 257, 383),  # type: ignore[operator]
+                        gpu_sample(seed, 257, 383),  # type: ignore[operator]
+                    )
+
+    def test_cpu_profiles_are_seeded_deterministic_and_preserve_empty_masks(self) -> None:
         loaded_cv2 = sys.modules.get("cv2")
         if loaded_cv2 is not None and type(loaded_cv2).__name__ == "_StubModule":
             self.skipTest("CPU example execution requires real OpenCV, not import stubs")
         try:
-            from XTA.examples.external_augmentations.CPU_baseline import (
-                build_augmentation,
-            )
+            import cv2  # noqa: F401
         except ModuleNotFoundError as exc:  # pragma: no cover - dependency-gated host
             if exc.name != "cv2":
                 raise
@@ -248,18 +276,23 @@ class ExternalAugmentationExampleTests(unittest.TestCase):
         image = np.arange(height * width, dtype=np.uint16).reshape(height, width)
         image = np.asarray(image % 256, dtype=np.uint8)
         mask = np.zeros((height, width), dtype=np.uint8)
-        policy = build_augmentation()
-        policy.set_random_seed(12345)
-        first = policy(image=image, mask=mask)
-        policy.set_random_seed(12345)
-        second = policy(image=image, mask=mask)
+        for profile, path in CPU_PROFILES:
+            with self.subTest(profile=profile):
+                module = importlib.import_module(
+                    f"XTA.examples.external_augmentations.{path.stem}"
+                )
+                policy = module.build_augmentation()
+                policy.set_random_seed(12345)
+                first = policy(image=image, mask=mask)
+                policy.set_random_seed(12345)
+                second = policy(image=image, mask=mask)
 
-        np.testing.assert_array_equal(first["image"], second["image"])
-        np.testing.assert_array_equal(first["mask"], second["mask"])
-        self.assertEqual(first["image"].shape, image.shape)
-        self.assertEqual(first["image"].dtype, np.uint8)
-        self.assertEqual(first["mask"].dtype, np.uint8)
-        self.assertEqual(int(np.count_nonzero(first["mask"])), 0)
+                np.testing.assert_array_equal(first["image"], second["image"])
+                np.testing.assert_array_equal(first["mask"], second["mask"])
+                self.assertEqual(first["image"].shape, image.shape)
+                self.assertEqual(first["image"].dtype, np.uint8)
+                self.assertEqual(first["mask"].dtype, np.uint8)
+                self.assertEqual(int(np.count_nonzero(first["mask"])), 0)
 
     @unittest.skipUnless(
         os.environ.get("XTA_RUN_EXTERNAL_AUGMENTATION_CUDA", "").strip() == "1",

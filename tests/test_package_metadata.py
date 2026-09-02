@@ -8,8 +8,8 @@ from XTA import cli, config
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CURRENT_VERSION = "18.0.3"
-CURRENT_LAUNCHER = "GPT-5.6-Sol-Ultra_v18.0.3_SLURM.py"
+CURRENT_VERSION = "19.0.0"
+CURRENT_LAUNCHER = "GPT-5.6-Sol-Ultra_v19.0.0_SLURM.py"
 
 
 def _toml_section(source: str, name: str) -> str:
@@ -24,7 +24,7 @@ class PackageMetadataTests(unittest.TestCase):
     def test_runtime_version_constants_are_aligned(self) -> None:
         self.assertEqual(XTA.__version__, CURRENT_VERSION)
         self.assertEqual(config.SCRIPT_VERSION, CURRENT_VERSION)
-        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "1803")
+        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "1900")
         self.assertEqual(config.SCRIPT_BASENAME, CURRENT_LAUNCHER)
         self.assertEqual(cli.SCRIPT_VERSION, CURRENT_VERSION)
         self.assertEqual(cli.SCRIPT_BASENAME, CURRENT_LAUNCHER)
@@ -47,6 +47,11 @@ class PackageMetadataTests(unittest.TestCase):
         self.assertIn(f'"{CURRENT_LAUNCHER}"', data_files)
         self.assertIn('"tools/v1803_hgx_selftest.py"', data_files)
         self.assertIn('"tools/v1803_d1_ipc_selftest.py"', data_files)
+        self.assertIn('"tools/v19_lta_gpu_smoke.py"', data_files)
+        self.assertIn('"tools/v19_lta_point_smoke.py"', data_files)
+        self.assertIn('"tools/v19_lta_tile_smoke.py"', data_files)
+        self.assertIn('"tools/v19_lta_mask_seed_smoke.py"', data_files)
+        self.assertNotIn('GPT-5.6-Sol-Ultra_v18.0.3_SLURM.py', data_files)
         self.assertNotIn('GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py', data_files)
         self.assertNotIn('"README.md"', data_files)
 
@@ -56,6 +61,7 @@ class PackageMetadataTests(unittest.TestCase):
             for line in (ROOT / "MANIFEST.in").read_text(encoding="utf-8").splitlines()
         }
         self.assertIn(f"include {CURRENT_LAUNCHER}", manifest_lines)
+        self.assertNotIn("include GPT-5.6-Sol-Ultra_v18.0.3_SLURM.py", manifest_lines)
         self.assertNotIn("include GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py", manifest_lines)
         self.assertNotIn("include README.md", manifest_lines)
         self.assertIn("include XTA/_package_inventory.json", manifest_lines)
@@ -63,7 +69,12 @@ class PackageMetadataTests(unittest.TestCase):
         self.assertIn("recursive-include tools *.py", manifest_lines)
         self.assertTrue((ROOT / "tools" / "v1803_hgx_selftest.py").is_file())
         self.assertTrue((ROOT / "tools" / "v1803_d1_ipc_selftest.py").is_file())
+        self.assertTrue((ROOT / "tools" / "v19_lta_gpu_smoke.py").is_file())
+        self.assertTrue((ROOT / "tools" / "v19_lta_point_smoke.py").is_file())
+        self.assertTrue((ROOT / "tools" / "v19_lta_tile_smoke.py").is_file())
+        self.assertTrue((ROOT / "tools" / "v19_lta_mask_seed_smoke.py").is_file())
         self.assertTrue((ROOT / CURRENT_LAUNCHER).is_file())
+        self.assertFalse((ROOT / "GPT-5.6-Sol-Ultra_v18.0.3_SLURM.py").exists())
         self.assertFalse((ROOT / "GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py").exists())
         self.assertFalse((ROOT / "GPT-5.6-Sol-Ultra_v18.0.1_SLURM.py").exists())
         self.assertFalse((ROOT / "GPT-5.6-Sol-Ultra_v18.0.2_SLURM.py").exists())

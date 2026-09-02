@@ -1,4 +1,4 @@
-"""Dependency-light v18 contracts shared by PTA and TTA planning.
+"""Dependency-light contracts shared by TTA, PTA, and LTA planning.
 
 This module intentionally contains no NumPy, OpenCV, model-runtime, filesystem,
 or scheduler imports.  The contracts describe render work; execution backends
@@ -16,10 +16,11 @@ from typing import Any, Iterator, Mapping, Sequence, Tuple
 
 
 class PipelineMode(str, Enum):
-    """Top-level v18 workflow selected by ``--mode``."""
+    """Top-level workflow selected by ``--mode``."""
 
     TTA = "tta"
     PTA = "pta"
+    LTA = "lta"
 
     @classmethod
     def coerce(cls, value: "PipelineMode | str") -> "PipelineMode":
@@ -28,7 +29,10 @@ class PipelineMode(str, Enum):
         try:
             return cls(str(value).strip().lower())
         except ValueError as exc:
-            raise ValueError(f"unsupported pipeline mode {value!r}; use 'tta' or 'pta'") from exc
+            allowed = ", ".join(repr(mode.value) for mode in cls)
+            raise ValueError(
+                f"unsupported pipeline mode {value!r}; use one of: {allowed}"
+            ) from exc
 
 
 class DataRole(str, Enum):

@@ -13,7 +13,7 @@ def resolve_channel_layout(value: str | ChannelFormat | None) -> ChannelLayout:
     """Resolve exactly one value using the existing TTA ``ChannelFormat`` parser."""
 
     if isinstance(value, (list, tuple, set, frozenset, dict)):
-        raise ValueError("--channel_format accepts exactly one value in the v18 interface")
+        raise ValueError("--channel_format accepts exactly one value in the unified interface")
     resolved = resolve_channel_format(value)
     return ChannelLayout(
         token=resolved.token,
@@ -28,17 +28,17 @@ def expand_channel_variants(
     mode: PipelineMode | str,
     layout: ChannelLayout,
 ) -> Tuple[ChannelVariant, ...]:
-    """Apply the v18 mode contract to one canonical channel layout.
+    """Apply the unified mode contract to one canonical channel layout.
 
-    TTA supplies only the canonical ascending order.  PTA adds the reversed
-    channel order only when reversal changes the actual channel sequence.
+    TTA and LTA supply only the canonical ascending order. PTA adds the
+    reversed channel order only when reversal changes the actual sequence.
     """
 
     resolved_mode = PipelineMode.coerce(mode)
     if not isinstance(layout, ChannelLayout):
         raise TypeError("layout must be a ChannelLayout")
     ascending = ChannelVariant(layout=layout, direction="ascending")
-    if resolved_mode is PipelineMode.TTA:
+    if resolved_mode is not PipelineMode.PTA:
         return (ascending,)
     reversed_offsets = tuple(reversed(layout.offsets))
     if reversed_offsets == layout.offsets:

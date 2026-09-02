@@ -1,4 +1,4 @@
-"""Dependency-light public surface for the v18 PTA/TTA contract layer."""
+"""Dependency-light public surface for the unified TTA/PTA/LTA contract layer."""
 
 from .channels import (
     expand_channel_variants,

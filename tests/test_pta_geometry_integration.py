@@ -559,6 +559,8 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
                 str(input_dir),
                 "--output",
                 str(output_dir),
+                "--device",
+                "1,3",
                 "--enable_cartesian",
                 "transverse",
                 "--save",
@@ -574,20 +576,25 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
             ]
             _config, runtime_options = self._runtime_args(arguments)
             topology = mock.Mock(
-                cuda_device_ids=(),
+                cuda_device_ids=(1, 3),
+                gpu_cpu_sets=((1,), (3,)),
                 worker_cpu_order=(),
                 allowed_cpus=(0,),
                 summary="test topology",
             )
 
             with (
-                mock.patch.object(pta, "discover_topology", return_value=topology),
+                mock.patch.object(
+                    pta,
+                    "discover_topology",
+                    return_value=topology,
+                ) as topology_discovery,
                 mock.patch.object(pta, "discover_volume_specs", return_value=[spec]),
                 mock.patch.object(
                     pta,
                     "load_source_volume_from_spec",
                     return_value=source,
-                ),
+                ) as source_loader,
                 mock.patch.object(
                     pta,
                     "prepare_loaded_source",
@@ -615,6 +622,15 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
                 pta.main(args=runtime_options, argv=arguments)
 
             invariant.assert_not_called()
+            topology_discovery.assert_called_once_with(
+                enabled=True,
+                warnings=mock.ANY,
+                device_ids=(1, 3),
+            )
+            self.assertEqual(
+                source_loader.call_args.kwargs["jpeg_device_ids"],
+                (1, 3),
+            )
 
     def test_encoded_source_gaps_disable_all_3d_views_even_when_fully_labeled(self) -> None:
         config, runtime_options = self._runtime_args(
@@ -1003,8 +1019,15 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
             )
             voxel = json.loads(voxel_path.read_text())
 
-        self.assertEqual(manifest["pipeline_version"], "18.0.3")
+        self.assertEqual(manifest["pipeline_version"], "19.0.0")
         self.assertEqual(manifest["mode"], "pta")
+        self.assertEqual(
+            manifest["determinism_contract"],
+            "same pipeline version, command, and input identities",
+        )
+        self.assertIsNone(
+            manifest["resolved_configuration"]["execution"]["device_ids"]
+        )
         self.assertEqual(manifest["resolved_configuration"]["in_plane_variants_deg"], [0.0])
         self.assertEqual(
             [item["direction"] for item in manifest["resolved_configuration"]["channel_variants"]],
@@ -1190,6 +1213,7 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
         self.assertEqual(
             resolved["execution"],
             {
+                "device_ids": None,
                 "requested_worker_backend": "thread",
                 "resolved_render_backend": "thread",
                 "workers": 7,

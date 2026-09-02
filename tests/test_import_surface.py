@@ -8,9 +8,16 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WRAPPER = ROOT / "GPT-5.6-Sol-Ultra_v18.0.3_SLURM.py"
+WRAPPER = ROOT / "GPT-5.6-Sol-Ultra_v19.0.0_SLURM.py"
 UNIFIED_MODULES = (
     "gaussian",
+    "lta_config",
+    "lta_inputs",
+    "lta_mode",
+    "lta_outputs",
+    "lta_rendering",
+    "lta_runtime",
+    "lta_sam",
     "pta_config",
     "pta_mode",
     "pta_runtime",
@@ -68,12 +75,12 @@ class ImportSurfaceTests(unittest.TestCase):
     def test_unified_launcher_help_is_dependency_light(self) -> None:
         completed = self.run_python(str(WRAPPER), "--help")
         self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertIn("--mode {tta,pta}", completed.stdout)
+        self.assertIn("--mode {tta,pta,lta}", completed.stdout)
 
     def test_module_version(self) -> None:
         completed = self.run_python("-m", "XTA", "--version")
         self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertIn("18.0.3", completed.stdout)
+        self.assertIn("19.0.0", completed.stdout)
 
     def test_cycle_safe_full_import_smoke(self) -> None:
         completed = self.run_python(str(ROOT / "tools" / "smoke_import.py"), "pipeline")

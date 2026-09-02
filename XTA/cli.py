@@ -1,4 +1,4 @@
-"""Dependency-light mode dispatcher for the unified PTA/TTA launcher."""
+"""Dependency-light mode dispatcher for the unified TTA/PTA/LTA launcher."""
 
 from __future__ import annotations
 
@@ -10,13 +10,13 @@ from collections.abc import Iterator, Sequence
 from .unification.context import activate_unified_launch
 
 
-SCRIPT_VERSION = "18.0.3"
-SCRIPT_BASENAME = "GPT-5.6-Sol-Ultra_v18.0.3_SLURM.py"
-MODE_CHOICES = ("tta", "pta")
+SCRIPT_VERSION = "19.0.0"
+SCRIPT_BASENAME = "GPT-5.6-Sol-Ultra_v19.0.0_SLURM.py"
+MODE_CHOICES = ("tta", "pta", "lta")
 
 
 def build_argparser(*, dispatch_only: bool = False) -> argparse.ArgumentParser:
-    """Build the dependency-free v18 launcher parser.
+    """Build the dependency-free v19 launcher parser.
 
     The dispatch-only form deliberately omits ``-h/--help`` so help following a
     selected mode is handled by that mode's complete parser.
@@ -24,11 +24,12 @@ def build_argparser(*, dispatch_only: bool = False) -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog=SCRIPT_BASENAME,
-        usage=f"{SCRIPT_BASENAME} --mode {{tta,pta}} ...",
+        usage=f"{SCRIPT_BASENAME} --mode {{tta,pta,lta}} ...",
         description=(
-            "Mode-aware launcher for volume pretraining augmentation and test-time "
-            "augmentation. Select a mode, then supply only that mode's flags. Use "
-            "'--mode tta --help' or '--mode pta --help' for mode-specific help."
+            "Mode-aware launcher for volume test-time, pretraining, and the v19 "
+            "label-time planning prototype. Select a mode, then supply only that mode's flags. Use "
+            "'--mode tta --help', '--mode pta --help', or '--mode lta --help' "
+            "for mode-specific help."
         ),
         allow_abbrev=False,
         add_help=not bool(dispatch_only),
@@ -91,10 +92,10 @@ def _run_tta(arguments: Sequence[str]) -> None:
 
     parser = build_tta_argparser()
     if _option_argument_count(mode_arguments, "--channel_format") > 1:
-        parser.error("--channel_format may be provided only once in v18")
+        parser.error("--channel_format may be provided only once")
     parser.parse_args(mode_arguments)
 
-    # The established entry point and pipeline consume sys.argv. Remove the v18 mode
+    # The established entry point and pipeline consume sys.argv. Remove the unified mode
     # selector for the duration of the call rather than teaching the v17 parser a new flag.
     from .tta_mode import run as run_tta
 
@@ -123,8 +124,23 @@ def _run_pta(arguments: Sequence[str]) -> None:
         run_pta(mode_arguments)
 
 
+def _run_lta(arguments: Sequence[str]) -> None:
+    """Load and invoke the LTA boundary only after LTA mode is selected."""
+
+    from .lta_mode import run as run_lta
+
+    mode_arguments = [str(value) for value in arguments]
+    with activate_unified_launch(
+        version=SCRIPT_VERSION,
+        launcher=SCRIPT_BASENAME,
+        mode="lta",
+        mode_arguments=mode_arguments,
+    ):
+        run_lta(mode_arguments)
+
+
 def run(argv: Sequence[str] | None = None) -> None:
-    """Dispatch one v18 invocation.
+    """Dispatch one v19 invocation.
 
     ``argv`` excludes the program name. Passing it explicitly keeps dispatch tests
     independent from process-global command-line state.
@@ -151,6 +167,9 @@ def run(argv: Sequence[str] | None = None) -> None:
         return
     if namespace.mode == "pta":
         _run_pta(mode_arguments)
+        return
+    if namespace.mode == "lta":
+        _run_lta(mode_arguments)
         return
     raise AssertionError(f"unhandled mode {namespace.mode!r}")
 

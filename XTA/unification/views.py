@@ -1,4 +1,4 @@
-"""Mode-aware in-plane variant expansion for v18 planning."""
+"""Mode-aware in-plane variant expansion for unified planning."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ def resolve_in_plane_variants(
     mode: PipelineMode | str,
     angles: Sequence[str] | str | float | int | None = None,
 ) -> Tuple[InPlaneVariant, ...]:
-    """Resolve TTA angles or PTA's non-configurable internal identity variant."""
+    """Resolve TTA/LTA angles or PTA's non-configurable internal identity variant."""
 
     resolved_mode = PipelineMode.coerce(mode)
     if resolved_mode is PipelineMode.PTA:
@@ -43,10 +43,10 @@ def expand_view_variants(
 ) -> Tuple[ResolvedViewVariant[PhysicalViewT], ...]:
     """Cross physical views with mode-owned in-plane variants.
 
-    PTA uses an identity runtime view for every selected physical view.  An empty
+    PTA uses an identity runtime view for every selected physical view. An empty
     PTA physical-view sequence therefore yields zero variants even though its
-    internal angle sequence contains the identity.  TTA delegates runtime-view
-    construction to the existing, authoritative expansion implementation.
+    internal angle sequence contains the identity. TTA and LTA delegate
+    runtime-view construction to the authoritative expansion implementation.
     """
 
     resolved_mode = PipelineMode.coerce(mode)
@@ -67,7 +67,7 @@ def expand_view_variants(
         )
 
     # Lazy import preserves a dependency-light unification package import while
-    # retaining the existing TTA ViewInfo naming and metadata behavior verbatim.
+    # retaining the existing TTA/LTA ViewInfo naming and metadata behavior verbatim.
     from XTA.geometry import expand_views_into_tta_variants
 
     runtime_views = tuple(

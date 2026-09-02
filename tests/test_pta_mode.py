@@ -31,6 +31,7 @@ class PtaModeBoundaryTests(unittest.TestCase):
     def test_resolved_configuration_is_forwarded_to_native_runtime(self) -> None:
         arguments = [
             "--input", "dataset", "--output", "published", "--imgsz", "640",
+            "--device", "2,0",
             "--output_format", "jpeg", "--channel_format", "C5S2", "--force",
             "--preprocessing", "gaussian_smoothing:1.5:2",
             "--save", "images", "labels", "nrrd", "overlay", "voxel_volume", "summary",
@@ -61,6 +62,7 @@ class PtaModeBoundaryTests(unittest.TestCase):
 
         expected_direct = {
             "input": "dataset", "output": "published", "imgsz": 640,
+            "device": ["2,0"], "device_ids": (2, 0),
             "output_format": "tif", "force": True, "train_split": 0.7,
             "split_method": "slice", "background_percent": 0.25,
             "augmentation": "policy.py", "augmentation_ratio": 2.5,

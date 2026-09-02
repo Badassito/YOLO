@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xta"
-version = "18.0.3"
-description = "YOLO segmentation pretraining and test-time augmentation for large volumes"
+version = "19.0.0"
+description = "Volume test-time and pretraining augmentation with a v19 label-time planning prototype"
 requires-python = ">=3.10"
 dependencies = [
   "numpy",
@@ -24,6 +24,7 @@ nvtiff12 = ["nvidia-nvtiff-cu12>=0.8"]
 nvtiff13 = ["nvidia-nvtiff-cu13>=0.8"]
 acceleration = ["numba", "deflate", "isal"]
 pta = ["pynrrd", "albumentations"]
+lta = ["pynrrd"]
 
 [project.scripts]
 xta = "XTA.cli:run"
@@ -37,9 +38,13 @@ include = ["XTA*"]
 [tool.setuptools.data-files]
 "share/xta" = [
   "ARCHITECTURE.md",
-  "GPT-5.6-Sol-Ultra_v18.0.3_SLURM.py",
+  "GPT-5.6-Sol-Ultra_v19.0.0_SLURM.py",
 ]
 "share/xta/tools" = [
   "tools/v1803_hgx_selftest.py",
   "tools/v1803_d1_ipc_selftest.py",
+  "tools/v19_lta_gpu_smoke.py",
+  "tools/v19_lta_point_smoke.py",
+  "tools/v19_lta_tile_smoke.py",
+  "tools/v19_lta_mask_seed_smoke.py",
 ]
