@@ -1,4 +1,4 @@
-"""Role-aware output primitives for the v19 LTA prototype.
+"""Role-aware output primitives for LTA.
 
 The model and geometry layers produce native-space binary component volumes.
 This module owns their TTA-compatible recomposition operations and the final
@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
 
-LTA_MANIFEST_SCHEMA = "xta.lta.v19.manifest.1"
+LTA_MANIFEST_SCHEMA = "xta.lta.manifest/1"
 
 
 def _sha256_file(path: Path) -> str:

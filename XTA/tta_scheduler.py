@@ -22,6 +22,10 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .experimental_features import (
+    d1_owner_group_size_limit as configured_d1_owner_group_size_limit,
+    d1_owner_groups_requested as configured_d1_owner_groups_requested,
+)
 from .geometry import ViewInfo
 
 
@@ -1211,24 +1215,19 @@ class TtaScheduler:
         return self.gpu_worker_fullframe_parent_key(task)
 
     def d1_owner_groups_requested(self) -> bool:
-        """Keep the experiment dark unless the v18.0.3 gate is explicitly nonzero."""
+        """Keep the experiment dark unless its gate is explicitly nonzero."""
         return bool(
             self.inputs.v1613_d1_owner_active
             and int(self.inputs.gpu_device_count) > 1
-            and self.operations._env_int('YOLO_TTA_V1803_D1_OWNER_GROUPS', 0) != 0
+            and configured_d1_owner_groups_requested(
+                read_int=self.operations._env_int,
+            )
         )
 
     def d1_owner_group_size_limit(self) -> int:
-        return max(
-            1,
-            min(
-                8,
-                int(self.inputs.gpu_device_count),
-                self.operations._env_int(
-                    'YOLO_TTA_V1803_D1_OWNER_GROUP_SIZE',
-                    int(self.inputs.gpu_device_count),
-                ),
-            ),
+        return configured_d1_owner_group_size_limit(
+            device_count=int(self.inputs.gpu_device_count),
+            read_int=self.operations._env_int,
         )
 
     def d1_owner_group_mode_active(self) -> bool:
@@ -1264,7 +1263,7 @@ class TtaScheduler:
         self.state.d1_group_fallback_parents.add(parent)
         self.operations.runtime_telemetry().add('d1.group.admission_fallbacks', 1)
         print(
-            f'v18.0.3 D1 owner group not admitted for {parent[0]}/{parent[1]} '
+            f'D1 owner group not admitted for {parent[0]}/{parent[1]} '
             f'({reason}); preserving the one-owner path.'
         )
 
@@ -1282,7 +1281,7 @@ class TtaScheduler:
             return existing
         if parent in self.state.d1_group_fallback_parents:
             return None
-        # v18.0.3 intentionally runs at most one multi-owner parent at a time.  This
+        # The experiment intentionally runs at most one multi-owner parent at a time. This
         # preserves ordinary view-level parallelism on nonparticipants and, critically,
         # prevents a feasibility scan from reserving the same not-yet-claimed worker for
         # multiple parents.
@@ -1447,7 +1446,7 @@ class TtaScheduler:
             'd1.group.last_participant_count', int(len(participants)),
         )
         print(
-            f'v18.0.3 D1 owner group admitted for {parent[0]}/{parent[1]}: '
+            f'D1 owner group admitted for {parent[0]}/{parent[1]}: '
             f'workers={participants}, leases={len(task_ids)}, '
             f'assigned_slices={assigned_slices}.'
         )
@@ -2509,7 +2508,7 @@ class TtaScheduler:
         )
         self.operations.runtime_telemetry().gauge('d1.group.active_planned_parents', 0)
         print(
-            f'v18.0.3 D1 owner group released for '
+            f'D1 owner group released for '
             f'{group.parent[0]}/{group.parent[1]}: '
             f'acks={len(group.release_ack_workers)}/{len(group.participants)}, '
             f'release={release_seconds:.3f}s.'
@@ -2641,7 +2640,7 @@ class TtaScheduler:
         self.state.d1_group_peer_or_seconds_total += float(peer_or_seconds)
         self.state.d1_group_d2h_seconds_total += float(d2h_seconds)
         print(
-            f'v18.0.3 D1 owner group reduced for '
+            f'D1 owner group reduced for '
             f'{group.parent[0]}/{group.parent[1]}: '
             f'participants={len(group.participants)}, '
             f'transport={transport}, words={bitset_words or "unknown"}, '

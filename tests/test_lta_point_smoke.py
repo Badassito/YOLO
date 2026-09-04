@@ -8,11 +8,16 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TOOL_PATH = ROOT / "tools" / "v19_lta_point_smoke.py"
+TOOL_PATH = ROOT / "tools" / "lta_point_smoke.py"
+try:
+    CV2_AVAILABLE = importlib.util.find_spec("cv2") is not None
+except (ImportError, ValueError):
+    CV2_AVAILABLE = False
+requires_cv2 = unittest.skipUnless(CV2_AVAILABLE, "requires the OpenCV test dependency")
 
 
 def _load_tool():
-    spec = importlib.util.spec_from_file_location("v19_lta_point_smoke", TOOL_PATH)
+    spec = importlib.util.spec_from_file_location("lta_point_smoke", TOOL_PATH)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"could not load {TOOL_PATH}")
     module = importlib.util.module_from_spec(spec)
@@ -21,7 +26,7 @@ def _load_tool():
     return module
 
 
-class V19LtaPointSmokeTests(unittest.TestCase):
+class LtaPointSmokeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.tool = _load_tool()
@@ -35,6 +40,7 @@ class V19LtaPointSmokeTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "strict boolean"):
             self.tool.PointClick(0.5, 0.25, 1, "bad")
 
+    @requires_cv2
     def test_both_initial_strategies_keep_positive_and_negative_points_safe(self) -> None:
         import cv2
         import numpy as np
@@ -72,6 +78,7 @@ class V19LtaPointSmokeTests(unittest.TestCase):
         self.tool.validate_clicks(distance)
         self.tool.validate_clicks(centerline)
 
+    @requires_cv2
     def test_metrics_and_error_clicks_distinguish_false_negative_and_positive(self) -> None:
         import cv2
         import numpy as np
@@ -118,6 +125,7 @@ class V19LtaPointSmokeTests(unittest.TestCase):
             "inconclusive",
         )
 
+    @requires_cv2
     def test_partial_propagation_records_drop_stats_as_not_applicable(self) -> None:
         import cv2
         import numpy as np
@@ -176,6 +184,7 @@ class V19LtaPointSmokeTests(unittest.TestCase):
         self.assertFalse(result["drop_stats_applicable"])
         self.assertEqual(result["propagated_revision"]["selection"], "final")
 
+    @requires_cv2
     def test_zero_drop_propagation_covers_the_session(self) -> None:
         import cv2
         import numpy as np

@@ -1,4 +1,4 @@
-"""Production-geometry rendering seam for the v19 LTA prototype.
+"""Production-geometry rendering seam for LTA.
 
 This CPU/reference path proves that canonical XTA view/TTA rendering and native
 backprojection can surround a SAM mask without using YOLO.  CUDA tensor capture

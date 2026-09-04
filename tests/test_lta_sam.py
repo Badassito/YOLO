@@ -16,13 +16,14 @@ class LtaSamBoundaryTests(unittest.TestCase):
         previous = {
             name: sys.modules.pop(name)
             for name in tuple(sys.modules)
-            if name == "torch" or name == "sam3" or name.startswith("sam3.")
+            if name in {"torch", "sam3", "pkg_resources"} or name.startswith("sam3.")
         }
         try:
             sys.modules.pop("XTA.lta_sam", None)
             __import__("XTA.lta_sam")
             self.assertNotIn("torch", sys.modules)
             self.assertNotIn("sam3", sys.modules)
+            self.assertNotIn("pkg_resources", sys.modules)
         finally:
             sys.modules.update(previous)
 
@@ -219,6 +220,119 @@ class LtaSamBoundaryTests(unittest.TestCase):
                 resource_path="frames",
                 unexpected_keyword=True,
             )
+
+    def test_bpe_resolution_locates_package_without_executing_sam(self) -> None:
+        from XTA import lta_sam
+
+        previous = {
+            name: sys.modules.pop(name)
+            for name in tuple(sys.modules)
+            if name == "sam3" or name.startswith("sam3.")
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            package = root / "sam3"
+            package.mkdir()
+            (package / "__init__.py").write_text(
+                "raise RuntimeError('sam3 package executed')\n", encoding="utf-8"
+            )
+            bpe = package / "assets" / "bpe_simple_vocab_16e6.txt.gz"
+            bpe.parent.mkdir()
+            with gzip.open(bpe, "wb") as handle:
+                handle.write(b'"bpe_simple_vocab_16e6.txt#version: 0.2\nsynthetic\n')
+            digest = hashlib.sha256(bpe.read_bytes()).hexdigest()
+            sys.path.insert(0, str(root))
+            try:
+                with mock.patch.object(lta_sam, "_PINNED_SAM_BPE_SHA256", digest):
+                    resolved = lta_sam.resolve_installed_sam_bpe()
+                self.assertEqual(resolved, bpe.resolve())
+                self.assertNotIn("sam3", sys.modules)
+            finally:
+                sys.path.remove(str(root))
+                for name in tuple(sys.modules):
+                    if name == "sam3" or name.startswith("sam3."):
+                        sys.modules.pop(name, None)
+                sys.modules.update(previous)
+
+    def test_builder_import_uses_scoped_pkg_resources_shim_when_absent(self) -> None:
+        from XTA import lta_sam
+
+        previous = {
+            name: sys.modules.pop(name)
+            for name in tuple(sys.modules)
+            if name == "pkg_resources" or name == "sam3" or name.startswith("sam3.")
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            package = root / "sam3"
+            package.mkdir()
+            (package / "__init__.py").write_text("# synthetic sam3\n", encoding="utf-8")
+            (package / "model_builder.py").write_text(
+                "import pkg_resources\nBOUND_PKG_RESOURCES = pkg_resources\n",
+                encoding="utf-8",
+            )
+            expected_bpe = root / "validated-bpe.gz"
+            original_find_spec = lta_sam.importlib.util.find_spec
+
+            def find_spec(name, *args, **kwargs):
+                if name == "pkg_resources":
+                    return None
+                return original_find_spec(name, *args, **kwargs)
+
+            sys.path.insert(0, str(root))
+            try:
+                with (
+                    mock.patch.object(
+                        lta_sam.importlib.util, "find_spec", side_effect=find_spec
+                    ),
+                    mock.patch.object(
+                        lta_sam,
+                        "resolve_installed_sam_bpe",
+                        return_value=expected_bpe,
+                    ),
+                ):
+                    model_builder = lta_sam._import_sam_model_builder()
+                    shim = model_builder.BOUND_PKG_RESOURCES
+                    self.assertEqual(
+                        shim.resource_filename(
+                            "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
+                        ),
+                        str(expected_bpe),
+                    )
+                    with self.assertRaisesRegex(RuntimeError, "accepts only"):
+                        shim.resource_filename("other", "asset.bin")
+                self.assertNotIn("pkg_resources", sys.modules)
+                self.assertIs(model_builder.pkg_resources, shim)
+            finally:
+                sys.path.remove(str(root))
+                for name in tuple(sys.modules):
+                    if (
+                        name == "pkg_resources"
+                        or name == "sam3"
+                        or name.startswith("sam3.")
+                    ):
+                        sys.modules.pop(name, None)
+                sys.modules.update(previous)
+
+    def test_pkg_resources_compatibility_preserves_existing_module(self) -> None:
+        import types
+
+        from XTA import lta_sam
+
+        marker = object()
+        previous = sys.modules.get("pkg_resources", marker)
+        existing = types.ModuleType("pkg_resources")
+        sys.modules["pkg_resources"] = existing
+        try:
+            with lta_sam._sam_pkg_resources_import_compatibility() as installed:
+                self.assertFalse(installed)
+                self.assertIs(sys.modules["pkg_resources"], existing)
+            self.assertIs(sys.modules["pkg_resources"], existing)
+        finally:
+            if previous is marker:
+                sys.modules.pop("pkg_resources", None)
+            else:
+                sys.modules["pkg_resources"] = previous
 
     def test_init_state_signature_filter_survives_start_session_request_chain(self) -> None:
         from XTA.lta_sam import patch_sam_init_state_signature
@@ -827,7 +941,7 @@ class LtaSamBoundaryTests(unittest.TestCase):
                 "out_binary_masks": np.asarray([[[True]]], dtype=bool),
                 "frame_stats": None,
             },
-            sequence_id="m1__point_smoke",
+            sequence_id="lta__point_smoke",
             session_index=0,
             global_frame_index=379,
             require_drop_stats=False,

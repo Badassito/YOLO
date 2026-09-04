@@ -1,4 +1,4 @@
-"""Unprivileged CUDA-IPC/NVLink smoke test for v18.0.3 D1 owner groups.
+"""Unprivileged CUDA-IPC/NVLink smoke test for D1 owner groups.
 
 Every spawned child narrows CUDA_VISIBLE_DEVICES to one inherited token, allocates the
 same dedicated cudaMalloc-backed uint32 bitset used by D1 groups, and keeps it alive while
@@ -73,7 +73,7 @@ def _worker(
         cp.cuda.get_current_stream().synchronize()
         handle = bytes(cp.cuda.runtime.ipcGetMemHandle(int(allocation.pointer)))
         artifact = D1PartialBitsetArtifact(
-            group_id="v1803-ipc-selftest",
+            group_id="d1-ipc-selftest",
             model_name="selftest",
             view_name="selftest",
             participant_rank=int(rank),
@@ -144,7 +144,7 @@ def main() -> None:
         ctx.Process(
             target=_worker,
             args=(rank, tokens[rank], words, result_queue, command_queues[rank]),
-            name=f"v1803-d1-ipc-{rank}",
+            name=f"d1-ipc-{rank}",
         )
         for rank in range(world_size)
     ]

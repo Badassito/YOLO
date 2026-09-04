@@ -1,6 +1,6 @@
 # XTA architecture
 
-`GPT-5.6-Sol-Ultra_v19.0.0_SLURM.py` is the sole versioned launcher. It, the
+`GPT-5.6-Sol-Ultra_v19.0.1_SLURM.py` is the sole versioned launcher. It, the
 installed `xta` console script, and `python -m XTA` all dispatch
 through `XTA.cli.run()`.
 The implementation lives in the importable `XTA` package so spawned processes
@@ -26,7 +26,8 @@ resolve worker functions and data types through canonical module paths.
 | `finalization` | source-volume fusion, object filtering and centerline processing |
 | `interpolation` | interpolation planning, execution and sparse continuation |
 | `cuda_d1` | D1 owner-GPU backprojection and packed source-space storage |
-| `cuda_finalization` | dependency-light distributed-binary contracts plus the opt-in v18.0.3 transactional multi-GPU keep tail |
+| `experimental_features` | dependency-light, version-neutral feature gates for opt-in hardware experiments |
+| `cuda_finalization` | dependency-light distributed-binary contracts plus the opt-in transactional multi-GPU keep tail |
 | `assembly` | completed-view preparation, tile gates and smoothing handoff |
 | `outputs` | NRRD, TIFF/MKV, summaries and low-quality derivatives |
 | `unification.contracts` | dependency-light `ForwardSamplingPolicy`, digest-addressed `RasterPlan`, logical `RenderItem`/`RenderRequestBatch`, channel/tile and data-role contracts |
@@ -43,12 +44,16 @@ resolve worker functions and data types through canonical module paths.
 | `pta_publication` | image/label encoding, atomic publication, canonical dataset image sink and candidate output paths |
 | `pta_workers` | sole PTA shared-memory, worker-global, CPU/GPU task-entry, result and persistent-pool process owner |
 | `pta` | PTA source discovery/preprocessing, geometry planning, dataset orchestration, reporting and manifest publication |
-| `lta_config`, `lta_mode` | dependency-light v19 LTA grammar and deferred runtime dispatch |
+| `lta_config`, `lta_mode` | dependency-light LTA grammar and deferred runtime dispatch |
 | `lta_inputs` | class-0 YOLO-seg target/exemplar discovery, full/partial annotation states and deterministic prompt ranking |
 | `lta_sam` | local-only SAM bundle boundary, fixed 30-frame leases and runtime-neutral image/video result contracts |
-| `lta_runtime` | fail-closed v19 LTA preflight plus physical-view/angle/session planning; SAM execution is the next prototype slice |
+| `lta_runtime` | fail-closed LTA preflight plus physical-view/angle/tile/session/device planning; SAM execution remains gated |
 | `lta_outputs` | role-aware LTA layer recomposition, unconditional terminal-union primitive and atomic complete-manifest writer |
 | `lta_rendering` | XTA-authoritative full-frame LTA raster rendering, implicit RGB conversion, inverse in-plane mask restore and source-space backprojection seam |
+| `lta_tiles`, `lta_tile_tracking` | concrete edge-pinned grids, eight-neighbor overlap topology, bidirectional spatial relay and global-coordinate overlap evidence |
+| `lta_tracklets` | anchor-scoped matching, residual split/merge hypotheses and authoritative temporal handoff |
+| `lta_experimental` | narrow pinned adapter for authoritative-mask injection and direct tracker-only propagation |
+| `lta_scheduler` | physical-view GPU affinity, atomic session ownership, tail assistance and exactly-once backprojection admission |
 | `tta_mode` | production TTA runner entered only after mode-specific CLI validation |
 | `tta_lifecycle` | outer TTA resource ownership, selected-run scratch cleanup and complete-manifest publication transaction |
 | `tta_outputs` | single-use identity-preserving ownership and ordered teardown of settled TTA output artifacts |
@@ -62,7 +67,7 @@ resolve worker functions and data types through canonical module paths.
 
 ### Incremental orchestration decomposition
 
-v18.0.3 establishes explicit owners for TTA run resources/publication, prediction-source
+The current decomposition establishes explicit owners for TTA run resources/publication, prediction-source
 preparation, terminal physical-view fusion, and PTA external augmentation. It also adds the
 leaf PTA dataset-policy owner and a stateful `TtaScheduler` for process-inference admission,
 hybrid CPU/GPU and D1 ownership, dynamic lease splitting, dispatch, result transport,
@@ -77,33 +82,33 @@ the existing `tta_outputs` boundary only after they produce settled assembly art
 of cross-reading live registries. PTA's worker extraction retains its prior CUDA/start-method
 semantics verbatim and still requires physical-GPU qualification before release.
 
-### v18.0.3 intra-node HGX experiments
+### Intra-node HGX experiments
 
 Two experimental paths are dark by default and retain the established reference behavior:
 
-- `YOLO_TTA_V1803_D1_OWNER_GROUPS=1` allows a D1 parent whose complete seed leases
+- `YOLO_TTA_D1_OWNER_GROUPS=1` allows a D1 parent whose complete seed leases
   need no view-shadow writer to bind deterministic slice coverage to several idle CUDA
   workers. Admission is a centralized, atomic pre-dispatch reservation rather than a side
-  effect of pending-task feasibility scans. v18.0.3 keeps one group active at a time, chooses
+  effect of pending-task feasibility scans. The scheduler keeps one group active at a time, chooses
   the heaviest still-unclaimed eligible parent, and plans the next group after the prior
   reduction releases its participants; nonparticipants retain ordinary view-level parallelism.
   Each participant retains a dedicated IPC-exportable partial bitset until the scheduler
   acknowledges either CUDA-IPC/NVLink reduction or bounded host-path recovery, then confirms
   an explicit release acknowledgement from every participant before reusing the workers.
-  `YOLO_TTA_V1803_D1_OWNER_GROUP_SIZE` caps the participant count at the job-visible
+  `YOLO_TTA_D1_OWNER_GROUP_SIZE` caps the participant count at the job-visible
   device count. The one-owner path remains the admission and execution fallback.
-- `YOLO_TTA_V1803_GPU_RESIDENT_TAIL=1` tries the first Track-A transaction after the
+- `YOLO_TTA_GPU_RESIDENT_TAIL=1` tries the first Track-A transaction after the
   inference workers have drained: the settled host final union is uploaded into contiguous
   job-visible Z shards, exact 26-connected labels stay device-resident in memory-bounded
   3-D CCL blocks, and compact equivalence pairs are needed only at block/shard boundaries.
   Area and boundary metadata is resolved through the CPU union-find reference, and a separate filtered candidate is
-  committed only after every GPU succeeds. `YOLO_TTA_V1803_GPU_RESIDENT_TAIL_REQUIRED=1`
+  committed only after every GPU succeeds. `YOLO_TTA_GPU_RESIDENT_TAIL_REQUIRED=1`
   makes failure fatal for qualification; otherwise the untouched host union enters the
   established CPU `keep_objects` path.
 
 `cuda_finalization.DistributedBinaryArtifact` is the common future handoff boundary for
 host uint8 volumes, D1 bitsets, resident final-union shards, and a later multi-GPU
-interpolation producer. The v18.0.3 Track-A implementation exercises the host-upload
+interpolation producer. The Track-A implementation exercises the host-upload
 adapter and resident keep transaction; direct resident final-union ingestion and Track B
 interpolation remain incremental follow-on work. Every decomposition uses only devices
 selected by the job and is written generically for one through eight GPUs.
@@ -116,6 +121,25 @@ variance absorbed the gain. Size-2 D1 groups exercised 29.1 GiB of CUDA-IPC peer
 independent views to occupy all devices. Both paths therefore remain opt-in infrastructure.
 A future D1 revisit should promote only a genuine idle tail, and a future resident interpolation
 producer may feed the distributed Track-A boundary without the cold host-upload adapter.
+
+### LTA stabilization contracts
+
+LTA plans concrete edge-pinned tile grids and computes each tile's actual Moore-neighborhood
+overlap. A tracklet that reaches an overlap emits two symmetric spatial relays: its last shared
+active mask can continue forward into the neighbor, while its first shared active mask can
+continue backward to recover an object that entered the source tile. Relay masks are rebased in
+global view coordinates, carry globally scoped lineage identity, merge once when several neighbors
+reach the same destination, and include an idempotency key plus an acyclic tile path to prevent
+ping-pong. Spatial duplicate evidence remains separate from temporal anchor handoff.
+
+The device plan assigns each `(volume, physical view)` to one GPU owner. That owner publishes one
+immutable rendered-view cache and remains the sole backprojection owner across all angles, tiles,
+anchors, and sessions. After a GPU drains its own views, it may steal an unopened atomic session
+from the heaviest remaining owner queue and consume that existing cache. A live SAM session never
+migrates between devices, and completed work commits in plan order regardless of finish order.
+The public runtime still stops after this validated geometry/device plan until persistent
+one-process-per-GPU SAM workers and publication are connected; it does not publish a false complete
+manifest.
 
 `XTA.__init__` is deliberately inert. In particular, it does not import OpenCV,
 SciPy, Ultralytics, CUDA, OpenVINO or future accelerator runtimes. Every supported command
@@ -286,11 +310,11 @@ still require the production environment and representative artifacts. Intel acc
 build, provisioning, and admission instructions live in ``native/README.md``; run
 ``python tools/intel_accelerator_selftest.py --backend all`` on the target host.
 
-The bounded v19 LTA hardware seam can be exercised from a source checkout with
-``python tools/v19_lta_gpu_smoke.py --model <local-sam3.1-bundle> --input-root <input> --exemplar-root <exemplars> --case m1``.
+The bounded LTA hardware seam can be exercised from a source checkout with
+``python tools/lta_gpu_smoke.py --model <local-sam3.1-bundle> --input-root <input> --exemplar-root <exemplars> --case direct --start-frame <first> --prompt-frame <anchor> --exemplar-index <index> --label-row <row>``.
 It validates one fixed 30-frame visual-prompt/video-tracking session without publishing
 images or labels. The tool requires an existing local checkpoint and pinned local BPE asset;
-it never downloads model material. ``--case f1`` separately exercises cross-image composite
+it never downloads model material. ``--case composite`` separately exercises cross-image composite
 conditioning, while ``--case both`` reuses one predictor for the two bounded sessions. The
 pinned SAM 3.1 adapter suppresses the upstream tracker-only load of the merged checkpoint,
 assigns one memory-mapped assembled state into a CPU parameter shell (or an explicit diagnostic
@@ -305,9 +329,9 @@ production-class devices. The constrained smoke also sets SAM grounding and post
 batches to one frame; its session boundary remains exactly 30 frames and Object Multiplex still
 fails closed at the builder's 128-object capacity. Its scoped SDPA policy tries Flash, then
 memory-efficient attention, then Math so a Windows Torch build without Flash does not abort;
-the original upstream backend function is restored during cleanup. F1 defaults to a prompt-only
+the original upstream backend function is restored during cleanup. The composite arm defaults to a prompt-only
 exemplar tile: the exemplar appears beside the target on the prompted frame and is neutral on the
-other 29 frames. ``--f1-exemplar-visibility all`` retains the repeated-exemplar diagnostic.
+other 29 frames. ``--composite-exemplar-visibility all`` retains the repeated-exemplar diagnostic.
 
 The meta construction option exists for hosts whose commit/pagefile budget cannot hold the
 normal CPU shell. It permits exactly the two pinned ViT scalar `linspace(0, 0.1, 32)` schedules
@@ -316,17 +340,17 @@ buffer absent from the checkpoint remains fatal. Meta construction rejects compi
 until those operations are separately qualified after CUDA materialization. The exact state-dict
 and post-transfer device/dtype audits are unchanged.
 
-``python tools/v19_lta_point_smoke.py`` is a separate diagnostic experiment for
+``python tools/lta_point_smoke.py`` is a separate diagnostic experiment for
 SAM 3.1's per-instance point-interactivity path. It compares a distance-transform
 point set with a centerline/edge point set, refines only against one known prompt-frame
-YOLO polygon, and propagates the final revision through one fixed 30-frame M1 session.
+YOLO polygon, and propagates the final revision through one fixed 30-frame source session.
 Its point-seeded score is interaction provenance, not detector confidence, and its
 artifacts are not LTA publication outputs. The pinned point-created propagation response
 is partial and does not expose Multiplex drop statistics; the diagnostic records that field
 as inapplicable while still rejecting any nonzero drop count if a future response supplies it.
 
-``python tools/v19_lta_tile_smoke.py`` compares box and point prompts on a fixed
-native-pixel 1008-square M1 crop. ``python tools/v19_lta_mask_seed_smoke.py`` then
+``python tools/lta_tile_smoke.py`` compares box and point prompts on a fixed
+native-pixel 1008-square crop. ``python tools/lta_mask_seed_smoke.py`` then
 exercises a pinned private tracker experiment that seeds the authoritative YOLO mask
 directly and advances the shared SAM encoder/tracker one frame at a time. The latter
 is deliberately outside the public SAM request API; it is retained because labeled
@@ -335,13 +359,13 @@ Its default is the tracker-only branch, and its anchor-integrity and non-anchor-
 gates are explicitly diagnostic rather than quality or publication acceptance.
 
 From a source checkout, the unprivileged HGX Track-A smoke test is
-``python tools/v1803_hgx_selftest.py --gpus 4`` (and ``--gpus 8`` for a full-node
+``python tools/hgx_selftest.py --gpus 4`` (and ``--gpus 8`` for a full-node
 allocation). It creates boundary-crossing synthetic objects and requires a byte-identical
 GPU/CPU `keep_objects` result. ``--plan-only`` exercises partitioning and row packing on a
-host without CUDA. ``python tools/v1803_d1_ipc_selftest.py --gpus 4`` verifies that
+host without CUDA. ``python tools/d1_ipc_selftest.py --gpus 4`` verifies that
 single-visible-device spawned ranks can export, import, NVLink-OR, and acknowledge the
 same dedicated CUDA allocations used by D1 groups; repeat with eight allocated GPUs.
-Wheels retain the two v18 scripts and the four v19 LTA experiment scripts under
+Wheels retain the hardware and LTA diagnostic scripts under
 ``share/xta/tools``.
 Four-GPU representative TTA
 qualification completed the full D1 lifetime across model workers, partial publication,

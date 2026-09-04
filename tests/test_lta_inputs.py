@@ -23,13 +23,13 @@ def _write(path: Path, payload: bytes | str = b"media") -> Path:
 class LtaInputDiscoveryTests(unittest.TestCase):
     def test_roboflow_export_name_recovers_original_one_based_frame_index(self) -> None:
         image = Path(
-            "M1_20_5_1_2026_8bit_RGB_0380_png.rf.aa7c7a78ad83a955e91976bea8a83e06.jpg"
+            "specimen_scan_RGB_0380_png.rf.aa7c7a78ad83a955e91976bea8a83e06.jpg"
         )
         label = image.with_suffix(".txt")
 
         self.assertEqual(
             lta_inputs.split_indexed_stem(image),
-            ("M1_20_5_1_2026_8bit_RGB", 380),
+            ("specimen_scan_RGB", 380),
         )
         self.assertEqual(lta_inputs.split_indexed_stem(label), lta_inputs.split_indexed_stem(image))
 

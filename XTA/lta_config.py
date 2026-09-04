@@ -1,4 +1,4 @@
-"""Dependency-light configuration for the v19 label-time augmentation mode."""
+"""Dependency-light configuration for label-time augmentation."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ class LtaSaveRequest:
 
 @dataclass(frozen=True)
 class LtaConfig:
-    """Strict public configuration passed to the future LTA runtime."""
+    """Strict public configuration passed to the LTA runtime boundary."""
 
     args: argparse.Namespace
     device_ids: Tuple[int, ...]
@@ -127,8 +127,8 @@ def build_lta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
     parser = argparse.ArgumentParser(
         prog=prog,
         description=(
-            "v19 label-time augmentation planning prototype with local SAM visual "
-            "exemplars and TTA-compatible inference views; publication is not connected yet."
+            "label-time augmentation with local SAM visual exemplars and "
+            "TTA-compatible inference views; publication is not connected yet."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         allow_abbrev=False,

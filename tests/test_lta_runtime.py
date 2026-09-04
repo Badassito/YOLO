@@ -16,7 +16,12 @@ from XTA.lta_inputs import (
     SourceRole,
     VolumeClass,
 )
-from XTA.lta_runtime import LtaPrototypeExecutionPending, build_lta_run_plan, run
+from XTA.lta_runtime import (
+    LtaExecutionPending,
+    build_lta_run_plan,
+    build_lta_scheduler,
+    run,
+)
 
 
 class LtaRuntimePlanningTests(unittest.TestCase):
@@ -145,13 +150,22 @@ class LtaRuntimePlanningTests(unittest.TestCase):
             [(session.frame_start, session.frame_stop) for session in views[0].sessions],
             [(0, 30), (30, 60), (60, 65)],
         )
-        self.assertEqual(plan.manifest_record()["prototype_stage"], "preflight_and_geometry_plan")
+        self.assertEqual(
+            plan.manifest_record()["runtime_stage"],
+            "preflight_geometry_and_device_plan",
+        )
         self.assertEqual(plan.run_id, "run-a")
         self.assertEqual(plan.temp_root.name, "lta_run-a")
         self.assertTrue(views[0].sessions[0].sequence_id.startswith("input:sample::"))
         self.assertEqual(views[0].encoded_frame_indices, tuple(range(65)))
         self.assertIsNotNone(views[0].raster_plan_digest)
         self.assertEqual(plan.manifest_record()["channel_policy"], "implicit_rgb_v1")
+        self.assertEqual(len(plan.view_assignments), 1)
+        self.assertTrue(plan.session_work)
+        self.assertEqual(
+            {item.projection_key for item in plan.session_work},
+            {"input:sample::transverse::rendered"},
+        )
 
     def test_image_execution_plans_independent_one_frame_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -171,6 +185,77 @@ class LtaRuntimePlanningTests(unittest.TestCase):
         self.assertEqual(len(sessions), 65)
         self.assertTrue(all(session.frame_count == 1 for session in sessions))
 
+    def test_multiple_devices_own_whole_physical_views_and_plan_concrete_tiles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            checkpoint = root / "sam3.pt"
+            checkpoint.write_bytes(b"checkpoint")
+            config = parse_lta_args(
+                [
+                    "--input", str(root),
+                    "--output", str(root / "out"),
+                    "--model", str(checkpoint),
+                    "--device", "0", "1",
+                    "--enable_cartesian", "transverse", "sagittal",
+                    "--enable_tile", "32:24",
+                    "--angle", "0,120",
+                ]
+            )
+
+            def compiler(**_kwargs):
+                return types.SimpleNamespace(
+                    views=(
+                        types.SimpleNamespace(
+                            name="transverse", num_slices=65, src_h=64, src_w=80
+                        ),
+                        types.SimpleNamespace(
+                            name="sagittal", num_slices=80, src_h=64, src_w=65
+                        ),
+                    )
+                )
+
+            def expand(physical_views, angles):
+                return tuple(
+                    types.SimpleNamespace(
+                        physical_view=physical,
+                        runtime_view=types.SimpleNamespace(
+                            name=f"{physical.name}__tta_a{int(angle)}",
+                            num_slices=physical.num_slices,
+                            src_h=physical.src_h,
+                            src_w=physical.src_w,
+                        ),
+                        in_plane_variant=types.SimpleNamespace(angle_deg=float(angle)),
+                    )
+                    for physical in physical_views
+                    for angle in angles
+                )
+
+            plan = build_lta_run_plan(
+                config,
+                discovery_fn=mock.Mock(return_value=self._discovery(root)),
+                physical_compiler=compiler,
+                variant_expander=expand,
+                run_id="multi-device",
+            )
+
+        self.assertEqual(
+            {assignment.view.physical_view_id for assignment in plan.view_assignments},
+            {"transverse", "sagittal"},
+        )
+        self.assertEqual(
+            {assignment.owner_device_id for assignment in plan.view_assignments},
+            {0, 1},
+        )
+        self.assertTrue(all(view.tile_grids for view in plan.volumes[0].runtime_views))
+        self.assertTrue(any(item.tile_index is not None for item in plan.session_work))
+        scheduler = build_lta_scheduler(plan)
+        self.assertEqual(scheduler.assignments, plan.view_assignments)
+        manifest = plan.manifest_record()["device_schedule"]
+        self.assertEqual(
+            manifest["policy"],
+            "physical_view_affinity_with_atomic_tail_assist",
+        )
+
     def test_public_run_fails_loudly_before_false_complete_publication(self) -> None:
         fake_plan = types.SimpleNamespace(
             volumes=(),
@@ -178,7 +263,7 @@ class LtaRuntimePlanningTests(unittest.TestCase):
             device_ids=(0,),
         )
         with mock.patch("XTA.lta_runtime.build_lta_run_plan", return_value=fake_plan):
-            with self.assertRaisesRegex(LtaPrototypeExecutionPending, "no outputs"):
+            with self.assertRaisesRegex(LtaExecutionPending, "no outputs"):
                 run(mock.Mock(), argv=[])
 
 

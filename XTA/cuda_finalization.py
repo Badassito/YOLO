@@ -1,4 +1,4 @@
-"""Experimental v18.0.3 multi-GPU binary-tail primitives.
+"""Experimental multi-GPU binary-tail primitives.
 
 The production path remains host-authoritative unless explicitly enabled.  This
 module is dependency-light at import time: CuPy/Torch are imported only inside
@@ -24,7 +24,14 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .workspace import _cpu_count, _env_flag, _env_float, _env_int
+from .experimental_features import (
+    experimental_features_snapshot,
+    gpu_resident_tail_enabled,
+    gpu_resident_tail_required,
+    gpu_tail_block_slices,
+    gpu_tail_reserve_bytes,
+)
+from .workspace import _cpu_count
 
 
 GIB = 1024 ** 3
@@ -49,26 +56,6 @@ def _close_array(array: object) -> None:
                 mmap_obj.close()
             except Exception:
                 pass
-
-
-def v1803_gpu_resident_tail_enabled() -> bool:
-    """Return whether the qualified, default-off v18.0.3 resident-tail experiment is enabled."""
-
-    return _env_flag("YOLO_TTA_V1803_GPU_RESIDENT_TAIL", False)
-
-
-def v1803_gpu_resident_tail_required() -> bool:
-    """Make resident-tail admission/execution failure fatal instead of falling back."""
-
-    return _env_flag("YOLO_TTA_V1803_GPU_RESIDENT_TAIL_REQUIRED", False)
-
-
-def v1803_gpu_tail_reserve_bytes() -> int:
-    return int(max(1.0, _env_float("YOLO_TTA_V1803_GPU_TAIL_RESERVE_GIB", 8.0)) * GIB)
-
-
-def v1803_gpu_tail_block_slices() -> int:
-    return max(4, _env_int("YOLO_TTA_V1803_GPU_TAIL_BLOCK_SLICES", 32))
 
 
 def row_word_count(width: int) -> int:
@@ -313,7 +300,7 @@ def resolve_keep_graph(
             root_areas=np.zeros((1,), dtype=np.int64),
         )
     if total_components >= 2 ** 32:
-        raise RuntimeError("v18.0.3 GPU-tail component id space exceeded uint32")
+        raise RuntimeError("GPU-tail component id space exceeded uint32")
 
     uf = _UnionFind()
     uf.new_ids(int(total_components))
@@ -440,19 +427,20 @@ def try_apply_keep_largest_objects_multi_gpu(
     *,
     keep_temp: bool = False,
 ) -> Optional[GpuTailKeepResult]:
-    """Try the v18.0.3 resident multi-GPU keep path.
+    """Try the resident multi-GPU keep path.
 
     ``None`` means the caller must execute the established CPU implementation.
     The input is never mutated.  When REQUIRED is set, admission/execution errors
     propagate instead of returning ``None``.
     """
 
-    enabled = bool(v1803_gpu_resident_tail_enabled())
-    required = bool(v1803_gpu_resident_tail_required())
+    feature_config = experimental_features_snapshot()
+    enabled = bool(feature_config.gpu_resident_tail_enabled)
+    required = bool(feature_config.gpu_resident_tail_required)
     if required and not enabled:
         raise RuntimeError(
-            "YOLO_TTA_V1803_GPU_RESIDENT_TAIL_REQUIRED=1 requires "
-            "YOLO_TTA_V1803_GPU_RESIDENT_TAIL=1"
+            "YOLO_TTA_GPU_RESIDENT_TAIL_REQUIRED=1 requires "
+            "YOLO_TTA_GPU_RESIDENT_TAIL=1"
         )
     if not enabled:
         return None
@@ -461,15 +449,15 @@ def try_apply_keep_largest_objects_multi_gpu(
         return None
     source = np.asarray(mask_mm)
     print(
-        'v18.0.3 GPU-resident keep_objects requested: '
+        'GPU-resident keep_objects requested: '
         f'shape={tuple(int(value) for value in source.shape)}, keep={keep_n}, '
         f'required={required}.'
     )
     if source.ndim != 3 or source.dtype != np.dtype(np.uint8):
         exc = ValueError(
-            f"v18.0.3 GPU tail requires uint8 3D mask, got {source.shape}/{source.dtype}"
+            f"GPU tail requires uint8 3D mask, got {source.shape}/{source.dtype}"
         )
-        if v1803_gpu_resident_tail_required():
+        if required:
             raise exc
         print(f"Warning: {exc}; using CPU keep_objects.")
         return None
@@ -518,7 +506,7 @@ def try_apply_keep_largest_objects_multi_gpu(
             support = scan_binary_volume_slice_metadata(
                 mask_mm,
                 workers=int(_cpu_count()),
-                source="v18.0.3 GPU-resident keep_objects exact fallback scan",
+                source="GPU-resident keep_objects exact fallback scan",
             )
         metadata_seconds = max(0.0, time.perf_counter() - metadata_started)
         known_any = np.ascontiguousarray(
@@ -547,11 +535,11 @@ def try_apply_keep_largest_objects_multi_gpu(
                 with torch.cuda.device(int(device_index)), cp.cuda.Device(int(device_index)):
                     free_bytes, _total_bytes = torch.cuda.mem_get_info(int(device_index))
                     persistent_estimate = int(np.prod(local_shape, dtype=np.int64)) * 5
-                    if int(free_bytes) < int(persistent_estimate) + int(v1803_gpu_tail_reserve_bytes()):
+                    if int(free_bytes) < int(persistent_estimate) + int(feature_config.gpu_tail_reserve_bytes):
                         raise RuntimeError(
                             f"cuda:{device_index} needs approximately "
                             f"{persistent_estimate / GIB:.2f} GiB persistent + "
-                            f"{v1803_gpu_tail_reserve_bytes() / GIB:.2f} GiB reserve; "
+                            f"{feature_config.gpu_tail_reserve_bytes / GIB:.2f} GiB reserve; "
                             f"only {int(free_bytes) / GIB:.2f} GiB is free"
                         )
                     # CuPy host-to-device copies may be asynchronous.  Keep the exact
@@ -571,20 +559,20 @@ def try_apply_keep_largest_objects_multi_gpu(
                     # equivalence pairs when the block CCL itself is 26-connected.
                     structure = cp.zeros((3, 3, 3), dtype=cp.bool_)
                     structure[:, :, :] = True
-                    block = min(int(local_shape[0]), int(v1803_gpu_tail_block_slices()))
+                    block = min(int(local_shape[0]), int(feature_config.gpu_tail_block_slices))
                     plane_pixels = int(local_shape[1]) * int(local_shape[2])
                     while block > 4:
                         free_now, _total_now = torch.cuda.mem_get_info(int(device_index))
-                        if int(free_now) >= int(block) * int(plane_pixels) * 17 + int(v1803_gpu_tail_reserve_bytes()):
+                        if int(free_now) >= int(block) * int(plane_pixels) * 17 + int(feature_config.gpu_tail_reserve_bytes):
                             break
                         block = max(4, int(block) // 2)
                     free_now, _total_now = torch.cuda.mem_get_info(int(device_index))
                     scratch_need = int(block) * int(plane_pixels) * 17
-                    if int(free_now) < int(scratch_need) + int(v1803_gpu_tail_reserve_bytes()):
+                    if int(free_now) < int(scratch_need) + int(feature_config.gpu_tail_reserve_bytes):
                         raise RuntimeError(
                             f"cuda:{device_index} cannot admit even a {block}-slice 3-D CCL "
                             f"block ({scratch_need / GIB:.2f} GiB scratch + "
-                            f"{v1803_gpu_tail_reserve_bytes() / GIB:.2f} GiB reserve); "
+                            f"{feature_config.gpu_tail_reserve_bytes / GIB:.2f} GiB reserve); "
                             f"only {int(free_now) / GIB:.2f} GiB is free"
                         )
                     component_offset = 0
@@ -684,7 +672,7 @@ def try_apply_keep_largest_objects_multi_gpu(
 
         shard_stage_started = time.perf_counter()
         with ThreadPoolExecutor(
-            max_workers=len(plan.shards), thread_name_prefix="v1803-gpu-tail-label",
+            max_workers=len(plan.shards), thread_name_prefix="gpu-tail-label",
         ) as executor:
             futures = [
                 executor.submit(_process_shard, int(rank), shard)
@@ -839,7 +827,7 @@ def try_apply_keep_largest_objects_multi_gpu(
                     del out_dev, out_host
 
         with ThreadPoolExecutor(
-            max_workers=len(cuda_shards), thread_name_prefix="v1803-gpu-tail-apply",
+            max_workers=len(cuda_shards), thread_name_prefix="gpu-tail-apply",
         ) as executor:
             list(executor.map(_apply_shard, cuda_shards))
         _flush_array(candidate)
@@ -849,7 +837,7 @@ def try_apply_keep_largest_objects_multi_gpu(
 
             register_binary_volume_slice_metadata(
                 candidate, slice_any, slice_bboxes,
-                source="v18.0.3 GPU-resident multi-GPU keep_objects", exact=True,
+                source="GPU-resident multi-GPU keep_objects", exact=True,
             )
         except Exception:
             pass
@@ -896,10 +884,10 @@ def try_apply_keep_largest_objects_multi_gpu(
                 candidate_path.unlink(missing_ok=True)
             except Exception:
                 pass
-        if v1803_gpu_resident_tail_required():
-            raise RuntimeError("v18.0.3 GPU-resident tail failed") from exc
+        if required:
+            raise RuntimeError("GPU-resident tail failed") from exc
         print(
-            "Warning: v18.0.3 GPU-resident tail unavailable/failed "
+            "Warning: GPU-resident tail unavailable/failed "
             f"({type(exc).__name__}: {exc}); using CPU keep_objects."
         )
         return None
@@ -946,6 +934,8 @@ __all__ = [
     "row_word_count",
     "try_apply_keep_largest_objects_multi_gpu",
     "unpack_binary_rows",
-    "v1803_gpu_resident_tail_enabled",
-    "v1803_gpu_resident_tail_required",
+    "gpu_resident_tail_enabled",
+    "gpu_resident_tail_required",
+    "gpu_tail_block_slices",
+    "gpu_tail_reserve_bytes",
 ]

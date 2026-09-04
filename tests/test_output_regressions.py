@@ -100,7 +100,7 @@ class SummaryTests(unittest.TestCase):
             text = summary_path.read_text()
             self.assertIn('View statistics:', text)
             self.assertIn('Final outputs:', text)
-            self.assertIn('v18.0.3_gpu_resident_tail: gpus=4, peer_bytes=4096', text)
+            self.assertIn('gpu_resident_tail: gpus=4, peer_bytes=4096', text)
             self.assertNotIn('Specification notes:', text)
 
 

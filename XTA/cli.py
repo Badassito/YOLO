@@ -10,13 +10,13 @@ from collections.abc import Iterator, Sequence
 from .unification.context import activate_unified_launch
 
 
-SCRIPT_VERSION = "19.0.0"
-SCRIPT_BASENAME = "GPT-5.6-Sol-Ultra_v19.0.0_SLURM.py"
+SCRIPT_VERSION = "19.0.1"
+SCRIPT_BASENAME = "GPT-5.6-Sol-Ultra_v19.0.1_SLURM.py"
 MODE_CHOICES = ("tta", "pta", "lta")
 
 
 def build_argparser(*, dispatch_only: bool = False) -> argparse.ArgumentParser:
-    """Build the dependency-free v19 launcher parser.
+    """Build the dependency-free compatibility-launcher parser.
 
     The dispatch-only form deliberately omits ``-h/--help`` so help following a
     selected mode is handled by that mode's complete parser.
@@ -26,8 +26,8 @@ def build_argparser(*, dispatch_only: bool = False) -> argparse.ArgumentParser:
         prog=SCRIPT_BASENAME,
         usage=f"{SCRIPT_BASENAME} --mode {{tta,pta,lta}} ...",
         description=(
-            "Mode-aware launcher for volume test-time, pretraining, and the v19 "
-            "label-time planning prototype. Select a mode, then supply only that mode's flags. Use "
+            "Mode-aware launcher for volume test-time, pretraining, and label-time "
+            "augmentation. Select a mode, then supply only that mode's flags. Use "
             "'--mode tta --help', '--mode pta --help', or '--mode lta --help' "
             "for mode-specific help."
         ),
@@ -140,7 +140,7 @@ def _run_lta(arguments: Sequence[str]) -> None:
 
 
 def run(argv: Sequence[str] | None = None) -> None:
-    """Dispatch one v19 invocation.
+    """Dispatch one compatibility-launcher invocation.
 
     ``argv`` excludes the program name. Passing it explicitly keeps dispatch tests
     independent from process-global command-line state.

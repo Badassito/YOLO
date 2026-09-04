@@ -1,4 +1,4 @@
-"""Compare bounded SAM 3.1 prompts on a fixed native-resolution M1 tile.
+"""Compare bounded SAM 3.1 prompts on a fixed native-resolution source tile.
 
 The source video is cropped to one object-centered 1008x1008 tile before SAM,
 so no whole-frame downsampling occurs. One box baseline and four point strategies
@@ -11,9 +11,8 @@ import argparse
 import gc
 import json
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
 
@@ -23,12 +22,8 @@ for entry in (ROOT, TOOLS):
     if str(entry) not in sys.path:
         sys.path.insert(0, str(entry))
 
-from v19_lta_gpu_smoke import (
+from lta_gpu_smoke import (
     CANVAS_SIZE,
-    DEFAULT_EXEMPLAR_INDEX,
-    DEFAULT_LABEL_ROW,
-    DEFAULT_PROMPT_FRAME,
-    DEFAULT_START_FRAME,
     _MeasuredPredictor,
     configure_constrained_gpu_batches,
     cuda_snapshot,
@@ -39,7 +34,7 @@ from v19_lta_gpu_smoke import (
     validate_smoke_window,
     write_case_diagnostics,
 )
-from v19_lta_point_smoke import (
+from lta_point_smoke import (
     MAX_CLICKS,
     PointClick,
     _distance_peaks,
@@ -54,6 +49,12 @@ from v19_lta_point_smoke import (
     write_strategy_artifacts,
 )
 from XTA.lta_inputs import parse_yolo_segmentation_label
+from XTA.lta_tiles import (
+    TilePlan,
+    plan_object_tile,
+    select_polygon_row,
+    transform_polygon_to_tile,
+)
 from XTA.lta_sam import (
     LTA_SESSION_FRAMES,
     SamPromptBox,
@@ -64,17 +65,6 @@ from XTA.lta_sam import (
 )
 
 
-@dataclass(frozen=True)
-class TilePlan:
-    left: int
-    top: int
-    size: int
-    source_width: int
-    source_height: int
-
-    @property
-    def xyxy(self) -> tuple[int, int, int, int]:
-        return self.left, self.top, self.left + self.size, self.top + self.size
 
 
 def probe_video_dimensions(path: Path) -> tuple[int, int]:
@@ -93,71 +83,6 @@ def probe_video_dimensions(path: Path) -> tuple[int, int]:
     return width, height
 
 
-def plan_object_tile(
-    polygon: Any,
-    *,
-    source_width: int,
-    source_height: int,
-    size: int = CANVAS_SIZE,
-) -> TilePlan:
-    source_width = int(source_width)
-    source_height = int(source_height)
-    size = int(size)
-    if source_width <= 0 or source_height <= 0 or size <= 0:
-        raise ValueError("source dimensions and tile size must be positive")
-    if source_width < size or source_height < size:
-        raise ValueError(
-            f"source dimensions {source_width}x{source_height} cannot contain "
-            f"a {size}x{size} native tile"
-        )
-    x0, y0, x1, y1 = (float(value) for value in polygon.box_xyxy)
-    pixel_box = (
-        x0 * source_width,
-        y0 * source_height,
-        x1 * source_width,
-        y1 * source_height,
-    )
-    if pixel_box[2] - pixel_box[0] > size or pixel_box[3] - pixel_box[1] > size:
-        raise ValueError(f"selected polygon bbox does not fit a {size}x{size} source tile")
-    center_x = (pixel_box[0] + pixel_box[2]) * 0.5
-    center_y = (pixel_box[1] + pixel_box[3]) * 0.5
-    left = min(max(0, int(round(center_x - size * 0.5))), source_width - size)
-    top = min(max(0, int(round(center_y - size * 0.5))), source_height - size)
-    plan = TilePlan(left, top, size, source_width, source_height)
-    if plan.left > pixel_box[0] or plan.top > pixel_box[1] or plan.left + plan.size < pixel_box[2] or plan.top + plan.size < pixel_box[3]:
-        raise RuntimeError("object-centered tile does not contain the complete polygon bbox")
-    return plan
-
-
-def transform_polygon_to_tile(polygon: Any, plan: TilePlan) -> Any:
-    points = tuple(
-        (
-            (float(x) * plan.source_width - plan.left) / plan.size,
-            (float(y) * plan.source_height - plan.top) / plan.size,
-        )
-        for x, y in polygon.points
-    )
-    xs = tuple(point[0] for point in points)
-    ys = tuple(point[1] for point in points)
-    box = min(xs), min(ys), max(xs), max(ys)
-    return SimpleNamespace(
-        points=points,
-        box_xyxy=box,
-        row_index=getattr(polygon, "row_index", -1),
-    )
-
-
-def select_polygon_row(polygons: Sequence[Any], row_index: int) -> Any:
-    """Return the polygon with one source-row identity, not a compact-list offset."""
-
-    matches = [
-        polygon
-        for polygon in polygons
-        if int(getattr(polygon, "row_index", -1)) == int(row_index)
-    ]
-    if len(matches) != 1:
-        raise ValueError(f"selected polygon row {row_index} is not unique")
-    return matches[0]
 
 
 def decode_rgb_tile_frames(video_path: Path, start_frame: int, plan: TilePlan) -> list[Any]:
@@ -408,10 +333,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exemplar-root", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--start-frame", type=int, default=DEFAULT_START_FRAME)
-    parser.add_argument("--prompt-frame", type=int, default=DEFAULT_PROMPT_FRAME)
-    parser.add_argument("--exemplar-index", type=int, default=DEFAULT_EXEMPLAR_INDEX)
-    parser.add_argument("--label-row", type=int, default=DEFAULT_LABEL_ROW)
+    parser.add_argument("--start-frame", type=int, required=True)
+    parser.add_argument("--prompt-frame", type=int, required=True)
+    parser.add_argument("--exemplar-index", type=int, required=True)
+    parser.add_argument("--label-row", type=int, required=True)
     parser.add_argument("--conf", type=float, default=0.15)
     parser.add_argument(
         "--weight-storage",
@@ -434,7 +359,7 @@ def main() -> None:
     bundle = resolve_local_sam_bundle(args.model)
     input_root = Path(args.input_root).expanduser().resolve(strict=True)
     exemplar_root = Path(args.exemplar_root).expanduser().resolve(strict=True)
-    video = find_case_video(input_root, "m1")
+    video = find_case_video(input_root, "direct")
     _exemplar, label_path = find_indexed_exemplar(exemplar_root, args.exemplar_index)
     _digest, polygons = parse_yolo_segmentation_label(label_path)
     selected_polygon = select_polygon_row(polygons, int(args.label_row))
@@ -497,7 +422,7 @@ def main() -> None:
             "centerline": centerline,
         }
         session = SamSessionPlan(
-            sequence_id="m1__native_tile",
+            sequence_id="lta__native_tile",
             session_index=0,
             frame_start=args.start_frame,
             frame_stop=args.start_frame + LTA_SESSION_FRAMES,
@@ -593,7 +518,7 @@ def main() -> None:
             "passed": bool(accepted_strategies),
             "accepted_strategies": accepted_strategies,
         },
-        "experiment": "v19_lta_native_1008_tile",
+        "diagnostic_schema": "lta.native-tile-comparison/1",
         "runtime": runtime,
         "model": str(bundle.checkpoint_path),
         "video": str(video),

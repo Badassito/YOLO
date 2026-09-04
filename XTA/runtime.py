@@ -51,6 +51,7 @@ from .config import (
     SCRIPT_VERSION,
     SCRIPT_VERSION_COMPACT,
 )
+from .experimental_features import experimental_features_snapshot
 
 # Explicit lower-layer dependencies keep imports one-way.
 from .workspace import (
@@ -417,6 +418,7 @@ def _install_stdio_capture(telemetry: RuntimeTelemetry) -> Optional[object]:
         return None
 
 def _record_runtime_feature_gauges(telemetry: RuntimeTelemetry) -> None:
+    experimental = experimental_features_snapshot()
     telemetry.gauge('telemetry.decorated_symbols', sorted(_RUNTIME_TELEMETRY_DECORATED_SYMBOLS))
     # These are unconditional packaged contracts. Their owner modules depend on runtime,
     # so importing those modules here would invert the package dependency graph.
@@ -429,20 +431,11 @@ def _record_runtime_feature_gauges(telemetry: RuntimeTelemetry) -> None:
         'native_projected_layer_materializer': True,
         'memfd_workspace_compatibility': bool(memfd_workspace_enabled()),
         'native_persistent_trt_ring': True,
-        'v1803_d1_owner_groups': True,
-        'v1803_gpu_resident_tail': True,
+        'd1_owner_groups': True,
+        'gpu_resident_tail': True,
     })
-    telemetry.gauge('features.v1803_requested', {
-        'd1_owner_groups': os.environ.get(
-            'YOLO_TTA_V1803_D1_OWNER_GROUPS', '0'
-        ).strip().lower() not in {'', '0', 'false', 'no', 'off', 'disabled'},
-        'gpu_resident_tail': os.environ.get(
-            'YOLO_TTA_V1803_GPU_RESIDENT_TAIL', '0'
-        ).strip().lower() not in {'', '0', 'false', 'no', 'off', 'disabled'},
-        'gpu_resident_tail_required': os.environ.get(
-            'YOLO_TTA_V1803_GPU_RESIDENT_TAIL_REQUIRED', '0'
-        ).strip().lower() not in {'', '0', 'false', 'no', 'off', 'disabled'},
-    })
+    telemetry.gauge('features.experimental_requested', experimental.requested_dict())
+    telemetry.gauge('features.experimental_config', experimental.as_dict())
 
 def initialize_runtime_observability() -> RuntimeTelemetry:
     """Initialize process-local telemetry explicitly; safe to call repeatedly."""

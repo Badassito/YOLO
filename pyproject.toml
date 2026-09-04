@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xta"
-version = "19.0.0"
-description = "Volume test-time and pretraining augmentation with a v19 label-time planning prototype"
+version = "19.0.1"
+description = "Volume test-time, pretraining, and label-time augmentation"
 requires-python = ">=3.10"
 dependencies = [
   "numpy",
@@ -38,13 +38,15 @@ include = ["XTA*"]
 [tool.setuptools.data-files]
 "share/xta" = [
   "ARCHITECTURE.md",
-  "GPT-5.6-Sol-Ultra_v19.0.0_SLURM.py",
+  "GPT-5.6-Sol-Ultra_v19.0.1_SLURM.py",
 ]
 "share/xta/tools" = [
-  "tools/v1803_hgx_selftest.py",
-  "tools/v1803_d1_ipc_selftest.py",
-  "tools/v19_lta_gpu_smoke.py",
-  "tools/v19_lta_point_smoke.py",
-  "tools/v19_lta_tile_smoke.py",
-  "tools/v19_lta_mask_seed_smoke.py",
+  "tools/hgx_selftest.py",
+  "tools/d1_ipc_selftest.py",
+  "tools/lta_gpu_smoke.py",
+  "tools/lta_point_smoke.py",
+  "tools/lta_tile_smoke.py",
+  "tools/lta_mask_seed_smoke.py",
+  "tools/lta_full_volume.py",
+  "tools/lta_tracklet_pair.py",
 ]

@@ -59,6 +59,7 @@ from .config import (
     resolve_tta_angles,
     tilted_group_base_views,
 )
+from .experimental_features import experimental_features_snapshot
 from .workspace import (
     _cpu_count,
     _env_float,
@@ -271,8 +272,6 @@ from .cuda_d1 import (
 )
 from .cuda_finalization import (
     try_apply_keep_largest_objects_multi_gpu,
-    v1803_gpu_resident_tail_enabled,
-    v1803_gpu_resident_tail_required,
 )
 from .topology import (
     configure_gpu_slice_labeling_devices,
@@ -4979,25 +4978,24 @@ def _main_impl() -> None:
         gpu_worker_pending_task_ids.extend(
             range(int(scheduler_state.gpu_worker_total_tasks))
         )
-        d1_env_requested = bool(
-            _env_int('YOLO_TTA_V1803_D1_OWNER_GROUPS', 0) != 0
+        experimental = experimental_features_snapshot(
+            device_count=int(gpu_device_count),
         )
-        d1_configured_size = int(_env_int(
-            'YOLO_TTA_V1803_D1_OWNER_GROUP_SIZE', int(gpu_device_count),
-        ))
+        d1_env_requested = bool(experimental.d1_owner_groups_requested)
+        d1_configured_size = int(experimental.d1_owner_group_size_limit)
         d1_gate_requested = bool(scheduler.d1_owner_groups_requested())
         d1_group_limit = int(scheduler.d1_owner_group_size_limit())
-        gpu_tail_requested = bool(v1803_gpu_resident_tail_enabled())
-        gpu_tail_required = bool(v1803_gpu_resident_tail_required())
+        gpu_tail_requested = bool(experimental.gpu_resident_tail_enabled)
+        gpu_tail_required = bool(experimental.gpu_resident_tail_required)
         print(
-            'v18.0.3 HGX feature gates resolved: '
+            'Experimental HGX feature gates resolved: '
             f'D1 owner groups={"active" if scheduler.d1_owner_group_mode_active() else "inactive"} '
             f'(env requested={d1_env_requested}, configured size={d1_configured_size}, '
             f'effective max participants={d1_group_limit}, visible workers={len(gpu_task_queues)}); '
             f'GPU-resident final keep_objects={"on" if gpu_tail_requested else "off"} '
             f'(required={gpu_tail_required}).'
         )
-        runtime_telemetry().gauge('features.v1803_resolved', {
+        runtime_telemetry().gauge('features.experimental_resolved', {
             'd1_owner_groups_requested': bool(d1_gate_requested),
             'd1_owner_groups_env_requested': bool(d1_env_requested),
             'd1_owner_group_configured_size': int(d1_configured_size),
@@ -6206,7 +6204,7 @@ def _main_impl() -> None:
         d1_summary = scheduler.d1_group_summary()
         runtime_telemetry().gauge('d1.group.summary', dict(d1_summary))
         print(
-            'v18.0.3 D1 owner-group summary: '
+            'D1 owner-group summary: '
             f'admitted={int(d1_summary["admitted"])}, '
             f'reduced={int(d1_summary["reduced"])}, '
             f'released={int(d1_summary["released"])}, '
@@ -6540,7 +6538,7 @@ def _main_impl() -> None:
                     streaming_final_union_holder[str(model_name)] = final_union_mm
                 close_memmap_array(prior_final_union_mm)
             print(
-                'v18.0.3 GPU-resident keep_objects committed: '
+                'GPU-resident keep_objects committed: '
                 f'GPUs={int(keep_objects_stats.get("gpu_count", 0))}, '
                 f'objects={int(keep_objects_stats.get("num_objects", 0))}, '
                 f'kept={int(keep_objects_stats.get("kept_objects", 0))}, '

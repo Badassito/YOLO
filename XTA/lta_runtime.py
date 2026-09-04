@@ -1,4 +1,4 @@
-"""Planning and execution boundary for the v19 LTA prototype.
+"""Planning and execution boundary for LTA.
 
 The GPU-independent planner is complete and intentionally testable with fake
 geometry compilers.  The public :func:`run` currently stops after preflight and
@@ -29,10 +29,54 @@ from .lta_sam import (
     plan_sam_sessions,
     resolve_local_sam_bundle,
 )
+from .lta_scheduler import (
+    LtaSessionWork,
+    LtaViewAffinityScheduler,
+    LtaViewAssignment,
+    LtaViewKey,
+    assign_view_owners,
+    assignment_manifest,
+)
+from .lta_tiles import TilePlan, eight_neighbor_graph, plan_tile_grid
 
 
-class LtaPrototypeExecutionPending(RuntimeError):
+class LtaExecutionPending(RuntimeError):
     """Raised after a valid plan when GPU inference is not connected yet."""
+
+
+@dataclass(frozen=True)
+class LtaTileGridPlan:
+    """One concrete tile layout and its symmetric spatial relay graph."""
+
+    config_id: str
+    tile_size: int
+    tile_stride: int
+    tiles: Tuple[TilePlan, ...]
+
+    def manifest_record(self) -> dict[str, object]:
+        graph = eight_neighbor_graph(self.tiles)
+        return {
+            "config_id": self.config_id,
+            "tile_size": int(self.tile_size),
+            "tile_stride": int(self.tile_stride),
+            "tiles": [
+                {
+                    "tile_index": index,
+                    "row": tile.row,
+                    "column": tile.column,
+                    "xyxy": list(tile.xyxy),
+                    "neighbors": [
+                        {
+                            "tile_index": edge.destination_index,
+                            "direction": edge.direction,
+                            "overlap_xyxy": list(edge.overlap_xyxy),
+                        }
+                        for edge in graph[index]
+                    ],
+                }
+                for index, tile in enumerate(self.tiles)
+            ],
+        }
 
 
 @dataclass(frozen=True)
@@ -42,8 +86,11 @@ class LtaRuntimeViewPlan:
     runtime_view_id: str
     tta_angle_deg: float
     frame_count: int
+    frame_height: int
+    frame_width: int
     sessions: Tuple[SamSessionPlan, ...]
     tile_config_ids: Tuple[str, ...] = ()
+    tile_grids: Tuple[LtaTileGridPlan, ...] = ()
     encoded_frame_indices: Tuple[Optional[int], ...] = ()
     raster_plan_digest: Optional[str] = None
 
@@ -54,6 +101,8 @@ class LtaRuntimeViewPlan:
             "runtime_view_id": self.runtime_view_id,
             "tta_angle_deg": float(self.tta_angle_deg),
             "frame_count": int(self.frame_count),
+            "frame_height": int(self.frame_height),
+            "frame_width": int(self.frame_width),
             "sessions": [
                 {
                     "session_index": int(session.session_index),
@@ -63,6 +112,7 @@ class LtaRuntimeViewPlan:
                 for session in self.sessions
             ],
             "tile_config_ids": list(self.tile_config_ids),
+            "tile_grids": [grid.manifest_record() for grid in self.tile_grids],
             "encoded_frame_indices": [
                 None if value is None else int(value)
                 for value in self.encoded_frame_indices
@@ -101,6 +151,8 @@ class LtaRunPlan:
     command: Tuple[str, ...]
     postprocessing: Mapping[str, object]
     volumes: Tuple[LtaVolumePlan, ...]
+    session_work: Tuple[LtaSessionWork, ...] = ()
+    view_assignments: Tuple[LtaViewAssignment, ...] = ()
 
     def manifest_record(self) -> dict[str, object]:
         input_records = []
@@ -145,7 +197,7 @@ class LtaRunPlan:
         return {
             "mode": "lta",
             "run_id": self.run_id,
-            "prototype_stage": "preflight_and_geometry_plan",
+            "runtime_stage": "preflight_geometry_and_device_plan",
             "model": {
                 "bundle_root": str(self.bundle.root),
                 "checkpoint_path": str(self.bundle.checkpoint_path),
@@ -158,6 +210,28 @@ class LtaRunPlan:
             "output_root": str(self.output_root),
             "temp_root": str(self.temp_root),
             "device_ids": [int(value) for value in self.device_ids],
+            "device_schedule": {
+                "policy": "physical_view_affinity_with_atomic_tail_assist",
+                "projection_ownership": "one_cache_per_volume_and_physical_view",
+                "backprojection_ownership": "physical_view_owner_only",
+                "assignments": list(assignment_manifest(self.view_assignments)),
+                "work": [
+                    {
+                        "work_id": item.work_id,
+                        "volume_id": item.view.volume_id,
+                        "physical_view_id": item.view.physical_view_id,
+                        "runtime_view_id": item.runtime_view_id,
+                        "session_index": item.session_index,
+                        "frame_start": item.frame_start,
+                        "frame_stop": item.frame_stop,
+                        "tile_index": item.tile_index,
+                        "tile_config_id": item.tile_config_id,
+                        "projection_key": item.projection_key,
+                        "tail_eligible": item.tail_eligible,
+                    }
+                    for item in self.session_work
+                ],
+            },
             "sam_execution": self.sam_execution,
             "conf": float(self.conf),
             "channel_policy": LTA_CHANNEL_POLICY,
@@ -232,6 +306,40 @@ def _tile_config_ids(config: LtaConfig) -> Tuple[str, ...]:
     return tuple(values)
 
 
+def _tile_grid_plans(
+    config: LtaConfig,
+    *,
+    frame_height: int,
+    frame_width: int,
+) -> Tuple[LtaTileGridPlan, ...]:
+    grids = []
+    for request in config.tiles:
+        config_id = str(
+            getattr(
+                request,
+                "config_id",
+                f"s{int(request.tile_size)}_st{int(request.tile_stride)}",
+            )
+        )
+        tiles = plan_tile_grid(
+            source_width=int(frame_width),
+            source_height=int(frame_height),
+            tile_size=int(request.tile_size),
+            tile_stride=int(request.tile_stride),
+        )
+        # Construction validates symmetric, nonempty Moore-neighborhood overlaps.
+        eight_neighbor_graph(tiles)
+        grids.append(
+            LtaTileGridPlan(
+                config_id=config_id,
+                tile_size=int(request.tile_size),
+                tile_stride=int(request.tile_stride),
+                tiles=tiles,
+            )
+        )
+    return tuple(grids)
+
+
 def build_lta_run_plan(
     config: LtaConfig,
     *,
@@ -299,6 +407,8 @@ def build_lta_run_plan(
             runtime = getattr(variant, "runtime_view")
             angle = float(getattr(getattr(variant, "in_plane_variant"), "angle_deg"))
             frame_count = int(getattr(runtime, "num_slices"))
+            frame_height = int(getattr(runtime, "src_h", shape[1]))
+            frame_width = int(getattr(runtime, "src_w", shape[2]))
             if frame_count < 1:
                 raise RuntimeError(
                     f"LTA runtime view {getattr(runtime, 'name', '<unknown>')} has no frames"
@@ -342,8 +452,15 @@ def build_lta_run_plan(
                     runtime_view_id=runtime_name,
                     tta_angle_deg=angle,
                     frame_count=frame_count,
+                    frame_height=frame_height,
+                    frame_width=frame_width,
                     sessions=sessions,
                     tile_config_ids=tiles,
+                    tile_grids=_tile_grid_plans(
+                        config,
+                        frame_height=frame_height,
+                        frame_width=frame_width,
+                    ),
                     encoded_frame_indices=encoded_frame_indices,
                     raster_plan_digest=str(raster_plan.digest),
                 )
@@ -356,6 +473,51 @@ def build_lta_run_plan(
                 runtime_views=tuple(runtime_plans),
             )
         )
+
+    session_work: list[LtaSessionWork] = []
+    plan_order = 0
+    for volume in volume_plans:
+        for view in volume.runtime_views:
+            view_key = LtaViewKey(volume.volume_id, view.physical_view_id)
+            projection_key = f"{view_key.token}::rendered"
+            destinations: tuple[tuple[str, int | None, int], ...] = (
+                ("fullframe", None, view.frame_height * view.frame_width),
+            )
+            destinations += tuple(
+                (grid.config_id, tile_index, grid.tile_size * grid.tile_size)
+                for grid in view.tile_grids
+                for tile_index in range(len(grid.tiles))
+            )
+            for destination, tile_index, plane_pixels in destinations:
+                for session in view.sessions:
+                    suffix = (
+                        "fullframe"
+                        if tile_index is None
+                        else f"{destination}::tile-{int(tile_index):04d}"
+                    )
+                    session_work.append(
+                        LtaSessionWork(
+                            work_id=(
+                                f"{volume.volume_id}::{view.runtime_view_id}::{suffix}::"
+                                f"session-{int(session.session_index):04d}"
+                            ),
+                            view=view_key,
+                            runtime_view_id=view.runtime_view_id,
+                            session_index=session.session_index,
+                            frame_start=session.frame_start,
+                            frame_stop=session.frame_stop,
+                            plan_order=plan_order,
+                            estimated_cost=float(
+                                session.frame_count * plane_pixels
+                            ),
+                            projection_key=projection_key,
+                            tile_index=tile_index,
+                            tile_config_id=(None if tile_index is None else destination),
+                            tail_eligible=True,
+                        )
+                    )
+                    plan_order += 1
+    view_assignments = assign_view_owners(session_work, config.device_ids)
 
     output_root = Path(config.args.output).expanduser().resolve(strict=False)
     raw_temp = config.args.temp
@@ -386,11 +548,24 @@ def build_lta_run_plan(
             "gaussian_passes": int(config.postprocessing.gaussian_passes),
         },
         volumes=tuple(volume_plans),
+        session_work=tuple(session_work),
+        view_assignments=view_assignments,
     )
 
 
+def build_lta_scheduler(plan: LtaRunPlan) -> LtaViewAffinityScheduler:
+    """Create the execution state machine for an immutable run plan."""
+
+    if not isinstance(plan, LtaRunPlan):
+        raise TypeError("plan must be an LtaRunPlan")
+    scheduler = LtaViewAffinityScheduler(plan.session_work, plan.device_ids)
+    if scheduler.assignments != plan.view_assignments:
+        raise RuntimeError("run-plan view ownership is not reproducible")
+    return scheduler
+
+
 def run(config: LtaConfig, *, argv: Sequence[str] | None = None) -> LtaRunPlan:
-    """Run the GPU-independent v19 prototype preflight and geometry planner.
+    """Run the GPU-independent LTA preflight, geometry, and device planner.
 
     The returned plan is useful to tests and the upcoming SAM execution loop.
     A clear exception prevents users from mistaking successful planning for
@@ -405,22 +580,24 @@ def run(config: LtaConfig, *, argv: Sequence[str] | None = None) -> LtaRunPlan:
         for view in volume.runtime_views
     )
     print(
-        "v19 LTA prototype preflight complete: "
+        "LTA preflight complete: "
         f"volumes={len(plan.volumes)}, runtime_views={runtime_view_count}, "
         f"sessions={session_count}, positive_exemplars={len(plan.discovery.positive_pool)}, "
         f"devices={list(plan.device_ids)}"
     )
-    raise LtaPrototypeExecutionPending(
-        "v19 LTA prototype planning succeeded; SAM render/inference/backprojection "
+    raise LtaExecutionPending(
+        "LTA planning succeeded; SAM render/inference/backprojection "
         "execution is not connected yet, so no outputs or complete manifest were written"
     )
 
 
 __all__ = (
-    "LtaPrototypeExecutionPending",
+    "LtaExecutionPending",
     "LtaRunPlan",
     "LtaRuntimeViewPlan",
+    "LtaTileGridPlan",
     "LtaVolumePlan",
+    "build_lta_scheduler",
     "build_lta_run_plan",
     "probe_image_with_pillow",
     "run",

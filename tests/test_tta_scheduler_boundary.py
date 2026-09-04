@@ -222,8 +222,8 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
                 input_overrides={"v1613_d1_owner_active": True, "gpu_device_count": 4},
                 operation_overrides={
                     "_env_int": lambda name, default: (
-                        1 if name == "YOLO_TTA_V1803_D1_OWNER_GROUPS" else
-                        4 if name == "YOLO_TTA_V1803_D1_OWNER_GROUP_SIZE" else
+                        1 if name == "YOLO_TTA_D1_OWNER_GROUPS" else
+                        4 if name == "YOLO_TTA_D1_OWNER_GROUP_SIZE" else
                         int(default)
                     ),
                 },
@@ -281,8 +281,8 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
                 input_overrides={"v1613_d1_owner_active": True, "gpu_device_count": 4},
                 operation_overrides={
                     "_env_int": lambda name, default: (
-                        1 if name == "YOLO_TTA_V1803_D1_OWNER_GROUPS" else
-                        2 if name == "YOLO_TTA_V1803_D1_OWNER_GROUP_SIZE" else
+                        1 if name == "YOLO_TTA_D1_OWNER_GROUPS" else
+                        2 if name == "YOLO_TTA_D1_OWNER_GROUP_SIZE" else
                         int(default)
                     ),
                 },
@@ -328,8 +328,8 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
                 input_overrides={"v1613_d1_owner_active": True, "gpu_device_count": 8},
                 operation_overrides={
                     "_env_int": lambda name, default: (
-                        1 if name == "YOLO_TTA_V1803_D1_OWNER_GROUPS" else
-                        8 if name == "YOLO_TTA_V1803_D1_OWNER_GROUP_SIZE" else
+                        1 if name == "YOLO_TTA_D1_OWNER_GROUPS" else
+                        8 if name == "YOLO_TTA_D1_OWNER_GROUP_SIZE" else
                         int(default)
                     ),
                 },
@@ -349,8 +349,8 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
                 input_overrides={"v1613_d1_owner_active": True, "gpu_device_count": 4},
                 operation_overrides={
                     "_env_int": lambda name, default: (
-                        1 if name == "YOLO_TTA_V1803_D1_OWNER_GROUPS" else
-                        1 if name == "YOLO_TTA_V1803_D1_OWNER_GROUP_SIZE" else
+                        1 if name == "YOLO_TTA_D1_OWNER_GROUPS" else
+                        1 if name == "YOLO_TTA_D1_OWNER_GROUP_SIZE" else
                         int(default)
                     ),
                 },
@@ -381,7 +381,7 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
                         },
                         operation_overrides={
                             "_env_int": lambda name, default: (
-                                1 if name == "YOLO_TTA_V1803_D1_OWNER_GROUPS" else
+                                1 if name == "YOLO_TTA_D1_OWNER_GROUPS" else
                                 int(default)
                             ),
                         },
@@ -403,8 +403,8 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
                 input_overrides={"v1613_d1_owner_active": True, "gpu_device_count": 4},
                 operation_overrides={
                     "_env_int": lambda name, default: (
-                        1 if name == "YOLO_TTA_V1803_D1_OWNER_GROUPS" else
-                        2 if name == "YOLO_TTA_V1803_D1_OWNER_GROUP_SIZE" else
+                        1 if name == "YOLO_TTA_D1_OWNER_GROUPS" else
+                        2 if name == "YOLO_TTA_D1_OWNER_GROUP_SIZE" else
                         int(default)
                     ),
                 },
@@ -434,8 +434,8 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
                 input_overrides={"v1613_d1_owner_active": True, "gpu_device_count": 4},
                 operation_overrides={
                     "_env_int": lambda name, default: (
-                        1 if name == "YOLO_TTA_V1803_D1_OWNER_GROUPS" else
-                        4 if name == "YOLO_TTA_V1803_D1_OWNER_GROUP_SIZE" else
+                        1 if name == "YOLO_TTA_D1_OWNER_GROUPS" else
+                        4 if name == "YOLO_TTA_D1_OWNER_GROUP_SIZE" else
                         int(default)
                     ),
                 },
@@ -498,8 +498,8 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
 
                 def env_int(name: str, default: int) -> int:
                     return {
-                        "YOLO_TTA_V1803_D1_OWNER_GROUPS": 1,
-                        "YOLO_TTA_V1803_D1_OWNER_GROUP_SIZE": group_size,
+                        "YOLO_TTA_D1_OWNER_GROUPS": 1,
+                        "YOLO_TTA_D1_OWNER_GROUP_SIZE": group_size,
                         "YOLO_TTA_GPU_WORKER_DISPATCH_WINDOW_PER_GPU": 1,
                     }.get(name, int(default))
 
@@ -581,8 +581,8 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
 
                 def env_int(name: str, default: int) -> int:
                     return {
-                        "YOLO_TTA_V1803_D1_OWNER_GROUPS": 1,
-                        "YOLO_TTA_V1803_D1_OWNER_GROUP_SIZE": group_size,
+                        "YOLO_TTA_D1_OWNER_GROUPS": 1,
+                        "YOLO_TTA_D1_OWNER_GROUP_SIZE": group_size,
                         "YOLO_TTA_GPU_WORKER_DISPATCH_WINDOW_PER_GPU": 1,
                     }.get(name, int(default))
 
@@ -758,8 +758,8 @@ class TtaSchedulerBoundaryTests(unittest.TestCase):
 
         def env_int(name: str, default: int) -> int:
             return {
-                "YOLO_TTA_V1803_D1_OWNER_GROUPS": 1,
-                "YOLO_TTA_V1803_D1_OWNER_GROUP_SIZE": 2,
+                "YOLO_TTA_D1_OWNER_GROUPS": 1,
+                "YOLO_TTA_D1_OWNER_GROUP_SIZE": 2,
             }.get(name, int(default))
 
         with tempfile.TemporaryDirectory() as temp_dir:

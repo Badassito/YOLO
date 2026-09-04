@@ -8,8 +8,9 @@ from XTA import cli, config
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CURRENT_VERSION = "19.0.0"
-CURRENT_LAUNCHER = "GPT-5.6-Sol-Ultra_v19.0.0_SLURM.py"
+CURRENT_VERSION = "19.0.1"
+CURRENT_LAUNCHER = "GPT-5.6-Sol-Ultra_v19.0.1_SLURM.py"
+PREVIOUS_LAUNCHER = "GPT-5.6-Sol-Ultra_v19.0.0_SLURM.py"
 
 
 def _toml_section(source: str, name: str) -> str:
@@ -24,7 +25,7 @@ class PackageMetadataTests(unittest.TestCase):
     def test_runtime_version_constants_are_aligned(self) -> None:
         self.assertEqual(XTA.__version__, CURRENT_VERSION)
         self.assertEqual(config.SCRIPT_VERSION, CURRENT_VERSION)
-        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "1900")
+        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "1901")
         self.assertEqual(config.SCRIPT_BASENAME, CURRENT_LAUNCHER)
         self.assertEqual(cli.SCRIPT_VERSION, CURRENT_VERSION)
         self.assertEqual(cli.SCRIPT_BASENAME, CURRENT_LAUNCHER)
@@ -45,14 +46,17 @@ class PackageMetadataTests(unittest.TestCase):
             package_data,
         )
         self.assertIn(f'"{CURRENT_LAUNCHER}"', data_files)
-        self.assertIn('"tools/v1803_hgx_selftest.py"', data_files)
-        self.assertIn('"tools/v1803_d1_ipc_selftest.py"', data_files)
-        self.assertIn('"tools/v19_lta_gpu_smoke.py"', data_files)
-        self.assertIn('"tools/v19_lta_point_smoke.py"', data_files)
-        self.assertIn('"tools/v19_lta_tile_smoke.py"', data_files)
-        self.assertIn('"tools/v19_lta_mask_seed_smoke.py"', data_files)
+        self.assertIn('"tools/hgx_selftest.py"', data_files)
+        self.assertIn('"tools/d1_ipc_selftest.py"', data_files)
+        self.assertIn('"tools/lta_gpu_smoke.py"', data_files)
+        self.assertIn('"tools/lta_point_smoke.py"', data_files)
+        self.assertIn('"tools/lta_tile_smoke.py"', data_files)
+        self.assertIn('"tools/lta_mask_seed_smoke.py"', data_files)
+        self.assertIn('"tools/lta_full_volume.py"', data_files)
+        self.assertIn('"tools/lta_tracklet_pair.py"', data_files)
         self.assertNotIn('GPT-5.6-Sol-Ultra_v18.0.3_SLURM.py', data_files)
         self.assertNotIn('GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py', data_files)
+        self.assertNotIn(PREVIOUS_LAUNCHER, data_files)
         self.assertNotIn('"README.md"', data_files)
 
     def test_source_distribution_has_one_versioned_launcher(self) -> None:
@@ -63,21 +67,53 @@ class PackageMetadataTests(unittest.TestCase):
         self.assertIn(f"include {CURRENT_LAUNCHER}", manifest_lines)
         self.assertNotIn("include GPT-5.6-Sol-Ultra_v18.0.3_SLURM.py", manifest_lines)
         self.assertNotIn("include GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py", manifest_lines)
+        self.assertNotIn(f"include {PREVIOUS_LAUNCHER}", manifest_lines)
         self.assertNotIn("include README.md", manifest_lines)
         self.assertIn("include XTA/_package_inventory.json", manifest_lines)
         self.assertIn("recursive-include XTA/examples *.py *.md", manifest_lines)
         self.assertIn("recursive-include tools *.py", manifest_lines)
-        self.assertTrue((ROOT / "tools" / "v1803_hgx_selftest.py").is_file())
-        self.assertTrue((ROOT / "tools" / "v1803_d1_ipc_selftest.py").is_file())
-        self.assertTrue((ROOT / "tools" / "v19_lta_gpu_smoke.py").is_file())
-        self.assertTrue((ROOT / "tools" / "v19_lta_point_smoke.py").is_file())
-        self.assertTrue((ROOT / "tools" / "v19_lta_tile_smoke.py").is_file())
-        self.assertTrue((ROOT / "tools" / "v19_lta_mask_seed_smoke.py").is_file())
+        self.assertTrue((ROOT / "tools" / "hgx_selftest.py").is_file())
+        self.assertTrue((ROOT / "tools" / "d1_ipc_selftest.py").is_file())
+        self.assertTrue((ROOT / "tools" / "lta_gpu_smoke.py").is_file())
+        self.assertTrue((ROOT / "tools" / "lta_point_smoke.py").is_file())
+        self.assertTrue((ROOT / "tools" / "lta_tile_smoke.py").is_file())
+        self.assertTrue((ROOT / "tools" / "lta_mask_seed_smoke.py").is_file())
+        self.assertTrue((ROOT / "tools" / "lta_full_volume.py").is_file())
+        self.assertTrue((ROOT / "tools" / "lta_tracklet_pair.py").is_file())
         self.assertTrue((ROOT / CURRENT_LAUNCHER).is_file())
+        self.assertFalse((ROOT / PREVIOUS_LAUNCHER).exists())
         self.assertFalse((ROOT / "GPT-5.6-Sol-Ultra_v18.0.3_SLURM.py").exists())
         self.assertFalse((ROOT / "GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py").exists())
         self.assertFalse((ROOT / "GPT-5.6-Sol-Ultra_v18.0.1_SLURM.py").exists())
         self.assertFalse((ROOT / "GPT-5.6-Sol-Ultra_v18.0.2_SLURM.py").exists())
+
+    def test_tools_and_tests_do_not_use_release_or_sample_filenames(self) -> None:
+        import re
+
+        forbidden = re.compile(r"(?:^|[_-])(?:v\d+|m1)(?:[_-]|$)", re.IGNORECASE)
+        offenders = [
+            str(path.relative_to(ROOT))
+            for folder in (ROOT / "tools", ROOT / "tests")
+            for path in folder.glob("*.py")
+            if forbidden.search(path.stem)
+        ]
+        self.assertEqual(offenders, [])
+
+    def test_lta_and_experimental_sources_have_no_retired_identifiers(self) -> None:
+        paths = (
+            *sorted((ROOT / "tools").glob("*.py")),
+            *sorted((ROOT / "tests").glob("test_lta*.py")),
+            *sorted((ROOT / "XTA").glob("lta*.py")),
+            ROOT / "XTA" / "experimental_features.py",
+        )
+        forbidden = ("v19_lta_", "v1803", "YOLO_TTA_V1803", "M1_", '"m1"', "'m1'")
+        offenders = []
+        for path in paths:
+            source = path.read_text(encoding="utf-8")
+            for token in forbidden:
+                if token in source:
+                    offenders.append((str(path.relative_to(ROOT)), token))
+        self.assertEqual(offenders, [])
 
     def test_legacy_distribution_identity_is_absent_from_text_sources(self) -> None:
         forbidden = (

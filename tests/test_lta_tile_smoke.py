@@ -10,11 +10,11 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TOOL_PATH = ROOT / "tools" / "v19_lta_tile_smoke.py"
+TOOL_PATH = ROOT / "tools" / "lta_tile_smoke.py"
 
 
 def _load_tool():
-    spec = importlib.util.spec_from_file_location("v19_lta_tile_smoke", TOOL_PATH)
+    spec = importlib.util.spec_from_file_location("lta_tile_smoke", TOOL_PATH)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"could not load {TOOL_PATH}")
     module = importlib.util.module_from_spec(spec)
@@ -23,7 +23,7 @@ def _load_tool():
     return module
 
 
-class V19LtaTileSmokeTests(unittest.TestCase):
+class LtaTileSmokeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.tool = _load_tool()
@@ -39,6 +39,7 @@ class V19LtaTileSmokeTests(unittest.TestCase):
         )()
 
     def test_object_tile_is_fixed_native_size_and_contains_polygon(self) -> None:
+        self.assertEqual(self.tool.plan_object_tile.__module__, "XTA.lta_tiles")
         polygon = self.polygon(((0.6, 0.3), (0.9, 0.3), (0.9, 0.5), (0.6, 0.5)))
         plan = self.tool.plan_object_tile(
             polygon,

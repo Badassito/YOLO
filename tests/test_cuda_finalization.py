@@ -24,7 +24,7 @@ def _available(name: str) -> bool:
 if not all(_available(name) for name in ("cv2", "scipy", "tifffile", "tqdm")):
     install_stubs()
 
-from XTA import cuda_finalization, topology
+from XTA import cuda_finalization, experimental_features, topology
 
 
 def _pairs(*values: tuple[int, int]) -> np.ndarray:
@@ -333,10 +333,10 @@ class CudaFinalizationContractTests(unittest.TestCase):
             mock.patch.dict(
                 os.environ,
                 {
-                    "YOLO_TTA_V1803_GPU_RESIDENT_TAIL": "1",
-                    "YOLO_TTA_V1803_GPU_RESIDENT_TAIL_REQUIRED": "0",
-                    "YOLO_TTA_V1803_GPU_TAIL_RESERVE_GIB": "1",
-                    "YOLO_TTA_V1803_GPU_TAIL_BLOCK_SLICES": str(int(block_slices)),
+                    "YOLO_TTA_GPU_RESIDENT_TAIL": "1",
+                    "YOLO_TTA_GPU_RESIDENT_TAIL_REQUIRED": "0",
+                    "YOLO_TTA_GPU_TAIL_RESERVE_GIB": "1",
+                    "YOLO_TTA_GPU_TAIL_BLOCK_SLICES": str(int(block_slices)),
                 },
                 clear=False,
             ),
@@ -606,8 +606,8 @@ class CudaFinalizationContractTests(unittest.TestCase):
         with mock.patch.dict(
             os.environ,
             {
-                "YOLO_TTA_V1803_GPU_RESIDENT_TAIL": "0",
-                "YOLO_TTA_V1803_GPU_RESIDENT_TAIL_REQUIRED": "0",
+                "YOLO_TTA_GPU_RESIDENT_TAIL": "0",
+                "YOLO_TTA_GPU_RESIDENT_TAIL_REQUIRED": "0",
             },
         ):
             self.assertIsNone(
@@ -621,14 +621,42 @@ class CudaFinalizationContractTests(unittest.TestCase):
         with mock.patch.dict(
             os.environ,
             {
-                "YOLO_TTA_V1803_GPU_RESIDENT_TAIL": "0",
-                "YOLO_TTA_V1803_GPU_RESIDENT_TAIL_REQUIRED": "1",
+                "YOLO_TTA_GPU_RESIDENT_TAIL": "0",
+                "YOLO_TTA_GPU_RESIDENT_TAIL_REQUIRED": "1",
             },
         ):
             with self.assertRaisesRegex(RuntimeError, "REQUIRED=1 requires"):
                 cuda_finalization.try_apply_keep_largest_objects_multi_gpu(
                     mask, 1, os.getcwd(),
                 )
+
+    def test_experimental_feature_snapshot_normalizes_shared_gpu_config(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "YOLO_TTA_D1_OWNER_GROUPS": "1",
+                "YOLO_TTA_D1_OWNER_GROUP_SIZE": "99",
+                "YOLO_TTA_GPU_RESIDENT_TAIL": "yes",
+                "YOLO_TTA_GPU_RESIDENT_TAIL_REQUIRED": "off",
+                "YOLO_TTA_GPU_TAIL_RESERVE_GIB": "0.25",
+                "YOLO_TTA_GPU_TAIL_BLOCK_SLICES": "2",
+            },
+            clear=True,
+        ):
+            snapshot = experimental_features.experimental_features_snapshot(
+                device_count=4,
+            )
+
+        self.assertTrue(snapshot.d1_owner_groups_requested)
+        self.assertEqual(snapshot.d1_owner_group_size_limit, 4)
+        self.assertTrue(snapshot.gpu_resident_tail_enabled)
+        self.assertFalse(snapshot.gpu_resident_tail_required)
+        self.assertEqual(snapshot.gpu_tail_reserve_bytes, 1024 ** 3)
+        self.assertEqual(snapshot.gpu_tail_block_slices, 4)
+        self.assertIs(
+            cuda_finalization.gpu_resident_tail_enabled,
+            experimental_features.gpu_resident_tail_enabled,
+        )
 
 
 if __name__ == "__main__":

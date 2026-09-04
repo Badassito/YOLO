@@ -1,4 +1,4 @@
-"""Compare two deterministic SAM 3.1 point-prompt strategies on bounded M1.
+"""Compare two deterministic SAM 3.1 point-prompt strategies on a bounded source.
 
 Both strategies refine one point-seeded tracker object against the same known
 YOLO-seg polygon on the prompt frame, then propagate once through the same
@@ -24,12 +24,8 @@ for entry in (ROOT, TOOLS):
     if str(entry) not in sys.path:
         sys.path.insert(0, str(entry))
 
-from v19_lta_gpu_smoke import (
+from lta_gpu_smoke import (
     CANVAS_SIZE,
-    DEFAULT_EXEMPLAR_INDEX,
-    DEFAULT_LABEL_ROW,
-    DEFAULT_PROMPT_FRAME,
-    DEFAULT_START_FRAME,
     _MeasuredPredictor,
     configure_constrained_gpu_batches,
     cuda_snapshot,
@@ -42,6 +38,8 @@ from v19_lta_gpu_smoke import (
     validate_smoke_window,
 )
 from XTA.lta_inputs import parse_yolo_segmentation_label
+from XTA.lta_experimental import mask_metrics
+from XTA.lta_tiles import rasterize_polygons
 from XTA.lta_sam import (
     LTA_SESSION_FRAMES,
     SamFramePrediction,
@@ -96,18 +94,6 @@ def _pixel_center_normalized(x: int, y: int, size: int) -> tuple[float, float]:
     return (float(x) + 0.5) / int(size), (float(y) + 0.5) / int(size)
 
 
-def rasterize_polygons(polygons: Sequence[Any], size: int = CANVAS_SIZE):
-    import numpy as np
-    from PIL import Image, ImageDraw
-
-    image = Image.new("1", (int(size), int(size)), 0)
-    draw = ImageDraw.Draw(image)
-    for polygon in polygons:
-        draw.polygon(
-            [(float(x) * int(size), float(y) * int(size)) for x, y in polygon.points],
-            fill=1,
-        )
-    return np.asarray(image, dtype=bool)
 
 
 def _distance_peaks(mask: Any, count: int, *, separation: int = 60) -> list[tuple[int, int, float]]:
@@ -305,42 +291,6 @@ def validate_clicks(clicks: Sequence[PointClick], *, require_positive: bool = Tr
         seen[key] = click.positive
 
 
-def mask_metrics(ground_truth: Any, prediction: Any) -> dict[str, Any]:
-    import cv2
-    import numpy as np
-
-    gt = np.asarray(ground_truth, dtype=bool)
-    pred = np.asarray(prediction, dtype=bool)
-    if gt.shape != pred.shape:
-        raise ValueError(f"metric shape mismatch: {gt.shape} != {pred.shape}")
-    tp = int((gt & pred).sum())
-    fp = int((~gt & pred).sum())
-    fn = int((gt & ~pred).sum())
-    union = tp + fp + fn
-    gt_area = int(gt.sum())
-    pred_area = int(pred.sum())
-    precision = tp / (tp + fp) if tp + fp else 1.0
-    recall = tp / (tp + fn) if tp + fn else 1.0
-    iou = tp / union if union else 1.0
-    dice = 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 1.0
-    count, labels = cv2.connectedComponents(pred.astype(np.uint8), connectivity=8)
-    component_areas = [int((labels == index).sum()) for index in range(1, int(count))]
-    return {
-        "tp": tp,
-        "fp": fp,
-        "fn": fn,
-        "iou": iou,
-        "dice": dice,
-        "precision": precision,
-        "recall": recall,
-        "ground_truth_pixels": gt_area,
-        "prediction_pixels": pred_area,
-        "area_ratio": pred_area / gt_area if gt_area else None,
-        "component_count": len(component_areas),
-        "largest_component_fraction": (
-            max(component_areas) / pred_area if component_areas and pred_area else 0.0
-        ),
-    }
 
 
 def _success(metrics: Mapping[str, Any]) -> bool:
@@ -419,7 +369,7 @@ def _point_preview(
         raise RuntimeError("SAM point prompt returned no outputs (object cap or API failure)")
     predictions = normalize_video_frame_output(
         outputs,
-        sequence_id="m1__point_prompt",
+        sequence_id="lta__point_prompt",
         session_index=0,
         global_frame_index=int(global_frame),
         require_drop_stats=False,
@@ -594,7 +544,7 @@ def run_point_strategy(
                 raise RuntimeError("SAM point propagation response has no outputs")
             frame_predictions = normalize_video_frame_output(
                 outputs,
-                sequence_id=f"m1__point_{strategy}",
+                sequence_id=f"lta__point_{strategy}",
                 session_index=0,
                 global_frame_index=int(session.frame_start) + local_frame,
                 require_drop_stats=False,
@@ -884,10 +834,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exemplar-root", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--start-frame", type=int, default=DEFAULT_START_FRAME)
-    parser.add_argument("--prompt-frame", type=int, default=DEFAULT_PROMPT_FRAME)
-    parser.add_argument("--exemplar-index", type=int, default=DEFAULT_EXEMPLAR_INDEX)
-    parser.add_argument("--label-row", type=int, default=DEFAULT_LABEL_ROW)
+    parser.add_argument("--start-frame", type=int, required=True)
+    parser.add_argument("--prompt-frame", type=int, required=True)
+    parser.add_argument("--exemplar-index", type=int, required=True)
+    parser.add_argument("--label-row", type=int, required=True)
     parser.add_argument("--conf", type=float, default=0.15)
     parser.add_argument(
         "--weight-storage",
@@ -913,7 +863,7 @@ def main() -> None:
         raise ValueError("point comparison requires SAM 3.1")
     input_root = Path(args.input_root).expanduser().resolve(strict=True)
     exemplar_root = Path(args.exemplar_root).expanduser().resolve(strict=True)
-    video = find_case_video(input_root, "m1")
+    video = find_case_video(input_root, "direct")
     exemplar_path, label_path = find_indexed_exemplar(exemplar_root, args.exemplar_index)
     _label_digest, polygons = parse_yolo_segmentation_label(label_path)
     selected = [item for item in polygons if int(item.row_index) == int(args.label_row)]
@@ -966,7 +916,7 @@ def main() -> None:
             ),
         }
         session = SamSessionPlan(
-            sequence_id="m1__point_comparison",
+            sequence_id="lta__point_comparison",
             session_index=0,
             frame_start=args.start_frame,
             frame_stop=args.start_frame + LTA_SESSION_FRAMES,
@@ -1041,7 +991,7 @@ def main() -> None:
         )
     summary = {
         "status": "complete",
-        "experiment": "v19_lta_m1_point_comparison",
+        "diagnostic_schema": "lta.direct-point-comparison/1",
         "model": str(bundle.checkpoint_path),
         "sam_runtime": sam_runtime,
         "video": str(video),

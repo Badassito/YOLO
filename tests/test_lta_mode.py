@@ -59,7 +59,7 @@ class LtaModeBoundaryTests(unittest.TestCase):
 
         runtime = types.SimpleNamespace(
             run=mock.Mock(side_effect=Pending("execution is not connected")),
-            LtaPrototypeExecutionPending=Pending,
+            LtaExecutionPending=Pending,
         )
         arguments = [
             "--input", "target",
@@ -77,7 +77,7 @@ class LtaModeBoundaryTests(unittest.TestCase):
             self.lta_mode.run(arguments)
 
         self.assertEqual(raised.exception.code, 3)
-        self.assertIn("planning prototype", stderr.getvalue())
+        self.assertIn("LTA planning", stderr.getvalue())
         self.assertNotIn("Traceback", stderr.getvalue())
 
 

@@ -1,4 +1,4 @@
-"""Dependency-light entry point for the v19 LTA runtime boundary."""
+"""Dependency-light entry point for the LTA runtime boundary."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ def _load_runtime_module() -> ModuleType:
 
 
 def run(argv: Sequence[str] | None = None) -> None:
-    """Validate LTA arguments and enter the future runtime boundary."""
+    """Validate LTA arguments and enter the runtime boundary."""
 
     arguments = None if argv is None else [str(value) for value in argv]
     config = parse_lta_args(arguments)
@@ -25,9 +25,9 @@ def run(argv: Sequence[str] | None = None) -> None:
     try:
         runtime.run(config, argv=arguments)
     except Exception as exc:
-        pending_type = getattr(runtime, "LtaPrototypeExecutionPending", None)
+        pending_type = getattr(runtime, "LtaExecutionPending", None)
         if isinstance(pending_type, type) and isinstance(exc, pending_type):
-            print(f"LTA v19 planning prototype: {exc}", file=sys.stderr)
+            print(f"LTA planning: {exc}", file=sys.stderr)
             raise SystemExit(3) from None
         raise
 

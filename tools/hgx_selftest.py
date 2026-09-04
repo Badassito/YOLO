@@ -1,4 +1,4 @@
-"""Unprivileged v18.0.3 HGX smoke test for the resident keep backend.
+"""Unprivileged HGX smoke test for the resident keep backend.
 
 This test needs no model or production data.  It builds deterministic components that
 cross every contiguous GPU Z boundary, compares the opt-in GPU result byte-for-byte with
@@ -59,8 +59,8 @@ def _fixture(z_dim: int, height: int, width: int) -> np.ndarray:
 
 def main() -> None:
     args = _parser().parse_args()
-    os.environ["YOLO_TTA_V1803_GPU_RESIDENT_TAIL"] = "1"
-    os.environ["YOLO_TTA_V1803_GPU_RESIDENT_TAIL_REQUIRED"] = "1"
+    os.environ["YOLO_TTA_GPU_RESIDENT_TAIL"] = "1"
+    os.environ["YOLO_TTA_GPU_RESIDENT_TAIL_REQUIRED"] = "1"
 
     from XTA.cuda_finalization import (
         artifact_plan_from_host,
@@ -104,7 +104,7 @@ def main() -> None:
 
     from XTA.finalization import apply_keep_largest_objects_inplace
 
-    with tempfile.TemporaryDirectory(prefix="xta-v1803-hgx-") as raw_tmp:
+    with tempfile.TemporaryDirectory(prefix="xta-hgx-") as raw_tmp:
         root = Path(raw_tmp)
         gpu_input = np.memmap(root / "gpu_input.u8.dat", dtype=np.uint8, mode="w+", shape=fixture.shape)
         cpu_input = np.memmap(root / "cpu_input.u8.dat", dtype=np.uint8, mode="w+", shape=fixture.shape)
@@ -143,7 +143,7 @@ def main() -> None:
         }
         print(json.dumps(record, sort_keys=True))
         if not equal:
-            raise RuntimeError("v18.0.3 GPU/CPU keep_objects byte mismatch")
+            raise RuntimeError("GPU/CPU keep_objects byte mismatch")
 
 
 if __name__ == "__main__":

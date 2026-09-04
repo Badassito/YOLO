@@ -5503,7 +5503,7 @@ def write_summary_file(
         )
         if int(keep_objects_stats.get('gpu_resident_tail', 0)) > 0:
             lines.append(
-                '  v18.0.3_gpu_resident_tail: '
+                '  gpu_resident_tail: '
                 f"gpus={int(keep_objects_stats.get('gpu_count', 0))}, "
                 f"peer_bytes={int(keep_objects_stats.get('peer_bytes', 0))}, "
                 f"peer_host_bounces={int(keep_objects_stats.get('peer_host_bounces', 0))}"

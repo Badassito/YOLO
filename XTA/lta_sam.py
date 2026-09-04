@@ -1,4 +1,4 @@
-"""Dependency-light SAM boundary for the v19 LTA prototype.
+"""Dependency-light SAM boundary for LTA.
 
 The module deliberately imports neither PyTorch nor ``sam3`` at import time.
 Configuration/help, local-bundle preflight, and session planning therefore work
@@ -13,13 +13,18 @@ import functools
 import gc
 import gzip
 import hashlib
+import importlib
+import importlib.util
 import inspect
 import math
+import sys
 import threading
+import types
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Iterable, Mapping
-from typing import Callable, Optional, Tuple
+from typing import Callable, Iterator, Optional, Tuple
 
 
 LTA_SESSION_FRAMES = 30
@@ -38,10 +43,12 @@ _PINNED_SAM_BPE_SHA256 = (
 _PINNED_SAM_BPE_PREFIX = b'"bpe_simple_vocab_16e6.txt#version: 0.2\n'
 _SAM_REMOVED_OBJECT_SCORE = -1e4
 _SAM31_BUILD_PATCH_LOCK = threading.RLock()
+_SAM_PKG_RESOURCES_COMPAT_LOCK = threading.RLock()
+_SAM_BPE_RESOURCE = "assets/bpe_simple_vocab_16e6.txt.gz"
 
 
 def cuda_capability_supports_fa3(major: int, minor: int = 0) -> bool:
-    """Return the pinned v19 FA3 policy (Hopper+, not Ada/4090)."""
+    """Return the pinned FA3 policy (Hopper+, not Ada/4090)."""
 
     if isinstance(major, bool) or isinstance(minor, bool):
         raise TypeError("CUDA capability fields must be integers")
@@ -150,7 +157,7 @@ class SamPromptBox:
         if x + width > 1.0 + 1e-12 or y + height > 1.0 + 1e-12:
             raise ValueError("xywh must remain inside the normalized image")
         if not bool(self.positive):
-            raise ValueError("the v19 LTA prototype accepts positive exemplar boxes only")
+            raise ValueError("LTA accepts positive exemplar boxes only")
         object.__setattr__(self, "exemplar_id", exemplar_id)
         object.__setattr__(self, "frame_index", int(self.frame_index))
         object.__setattr__(self, "xywh", (x, y, width, height))
@@ -293,16 +300,34 @@ def revalidate_local_sam_bundle(bundle: LocalSamBundle) -> None:
         )
 
 
+def _resolve_installed_sam_package_root() -> Path:
+    """Locate the installed package without executing ``sam3.__init__``."""
+
+    try:
+        spec = importlib.util.find_spec("sam3")
+    except (ImportError, AttributeError, ValueError) as exc:
+        raise RuntimeError("the pinned local sam3 package is not locatable") from exc
+    locations = () if spec is None else tuple(spec.submodule_search_locations or ())
+    if len(locations) != 1:
+        raise RuntimeError(
+            "the pinned local sam3 package must have exactly one source root; "
+            f"found {len(locations)}"
+        )
+    try:
+        root = Path(locations[0]).resolve(strict=True)
+    except Exception as exc:
+        raise RuntimeError("the pinned local sam3 package source root is missing") from exc
+    if not root.is_dir():
+        raise RuntimeError(f"the pinned local sam3 package root is not a directory: {root}")
+    return root
+
+
 def resolve_installed_sam_bpe(*, package_root: Optional[Path] = None) -> Path:
     """Resolve the pinned SAM package's local BPE asset without network access."""
 
     if package_root is None:
-        try:
-            import sam3  # type: ignore
-        except Exception as exc:  # pragma: no cover - dependency gated
-            raise RuntimeError("the pinned local sam3 package is not importable") from exc
-        package_root = Path(sam3.__file__).resolve().parent
-    candidate = Path(package_root) / "assets" / "bpe_simple_vocab_16e6.txt.gz"
+        package_root = _resolve_installed_sam_package_root()
+    candidate = Path(package_root) / _SAM_BPE_RESOURCE
     try:
         resolved = candidate.resolve(strict=True)
     except Exception as exc:
@@ -310,6 +335,73 @@ def resolve_installed_sam_bpe(*, package_root: Optional[Path] = None) -> Path:
     if not resolved.is_file():
         raise RuntimeError(f"local SAM BPE asset is not a file: {resolved}")
     return _validate_pinned_sam_bpe(resolved)
+
+
+def _sam_pkg_resources_shim() -> types.ModuleType:
+    """Provide only the one legacy resource lookup used by pinned SAM 3.1."""
+
+    shim = types.ModuleType("pkg_resources")
+
+    def resource_filename(package: object, resource: object) -> str:
+        package_name = str(package)
+        resource_name = str(resource).replace("\\", "/")
+        if package_name != "sam3" or resource_name != _SAM_BPE_RESOURCE:
+            raise RuntimeError(
+                "the SAM pkg_resources compatibility shim accepts only the pinned "
+                f"BPE resource; got package={package_name!r}, resource={resource_name!r}"
+            )
+        return str(resolve_installed_sam_bpe())
+
+    shim.resource_filename = resource_filename  # type: ignore[attr-defined]
+    return shim
+
+
+@contextmanager
+def _sam_pkg_resources_import_compatibility() -> Iterator[bool]:
+    """Temporarily satisfy SAM's obsolete top-level import under Setuptools 82+.
+
+    The official builder retains its reference to the narrow module object. The
+    temporary ``sys.modules`` entry is removed immediately after the builder
+    import so unrelated libraries never observe a project-wide replacement for
+    ``pkg_resources``.
+    """
+
+    with _SAM_PKG_RESOURCES_COMPAT_LOCK:
+        if "pkg_resources" in sys.modules:
+            if sys.modules["pkg_resources"] is None:
+                raise RuntimeError("pkg_resources has an invalid null module entry")
+            yield False
+            return
+        try:
+            pkg_resources_spec = importlib.util.find_spec("pkg_resources")
+        except (ImportError, AttributeError, ValueError) as exc:
+            raise RuntimeError("could not inspect pkg_resources availability") from exc
+        if pkg_resources_spec is not None:
+            yield False
+            return
+        shim = _sam_pkg_resources_shim()
+        installed = sys.modules.setdefault("pkg_resources", shim)
+        if installed is not shim:
+            if installed is None:
+                raise RuntimeError("pkg_resources acquired an invalid null module entry")
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            if sys.modules.get("pkg_resources") is shim:
+                sys.modules.pop("pkg_resources", None)
+
+
+def _import_sam_model_builder() -> object:
+    """Import the pinned builder with a scoped Setuptools 82+ compatibility seam."""
+
+    with _SAM31_BUILD_PATCH_LOCK:
+        cached = sys.modules.get("sam3.model_builder")
+        if cached is not None:
+            return cached
+        with _sam_pkg_resources_import_compatibility():
+            return importlib.import_module("sam3.model_builder")
 
 
 def _validate_pinned_sam_bpe(path: Path) -> Path:
@@ -450,7 +542,7 @@ def _build_real_sam31_predictor_single_load_unlocked(
     """
 
     try:
-        import sam3.model_builder as sam_model_builder  # type: ignore
+        sam_model_builder = _import_sam_model_builder()
         from sam3.model.sam3_multiplex_tracking import (  # type: ignore
             Sam3MultiplexTrackingWithInteractivity,
         )
@@ -859,7 +951,12 @@ def build_local_sam_predictor(
         # Bind CUDA ownership before importing SAM: model_builder performs
         # import-time CUDA capability setup and must observe the worker device.
         try:
-            from sam3.model_builder import build_sam3_predictor  # type: ignore
+            sam_model_builder = _import_sam_model_builder()
+            build_sam3_predictor = getattr(
+                sam_model_builder, "build_sam3_predictor", None
+            )
+            if not callable(build_sam3_predictor):
+                raise AttributeError("sam3.model_builder has no build_sam3_predictor")
         except Exception as exc:  # pragma: no cover - dependency gated
             raise RuntimeError(
                 "LTA SAM runtime is unavailable; install the pinned local sam3 runtime"
@@ -1071,7 +1168,7 @@ def run_video_session(
         raise TypeError("prompt must be a SamPromptBox")
     if not isinstance(resource, list):
         raise TypeError(
-            "the v19 LTA prototype requires an explicit ordered list of decoded PIL frames"
+            "LTA requires an explicit ordered list of decoded PIL frames"
         )
     if len(resource) != int(session.frame_count):
         raise ValueError(

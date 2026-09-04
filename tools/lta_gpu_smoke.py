@@ -1,10 +1,10 @@
-"""Run a bounded, non-publishing SAM 3.1 smoke for the v19 LTA prototype.
+"""Run a bounded, non-publishing SAM 3.1 LTA hardware smoke.
 
 The tool accepts only an explicit local model bundle and exactly thirty decoded
 frames. It never downloads a checkpoint and writes nothing by default. An
 explicit ``--diagnostic-output`` may emit review-only overlays and masks; these
-are not LTA publication artifacts. M1 exercises a directly addressable visual
-exemplar; F1 exercises the cross-image composite conditioning seam.
+are not LTA publication artifacts. The ``direct`` case exercises a same-source
+visual exemplar; ``composite`` exercises the cross-image conditioning seam.
 """
 
 from __future__ import annotations
@@ -13,11 +13,12 @@ import argparse
 import gc
 import hashlib
 import importlib.metadata
+import importlib.util
 import json
 import sys
 import time
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,12 +38,18 @@ from XTA.lta_sam import (
 
 
 CANVAS_SIZE = 1008
-DEFAULT_START_FRAME = 360
-DEFAULT_PROMPT_FRAME = 379
-DEFAULT_EXEMPLAR_INDEX = 380
-DEFAULT_LABEL_ROW = 17
 PINNED_SAM_VERSION = "0.1.0"
 PINNED_SAM_COMMIT = "660a5e9e1b8b4c02c0ad97229b88a09a6e4ff5b7"
+PINNED_SAM_SOURCE_URL = "https://github.com/facebookresearch/sam3.git"
+# Canonical SHA-256 over every non-derived file under the installed ``sam3``
+# package at the pinned commit (152 Python sources plus the BPE asset). Python
+# newlines are normalized before each file hash, then hashes are folded with
+# POSIX-relative paths. This is stable across Windows/Linux wheels while
+# failing closed on missing, added, or modified runtime files.
+PINNED_SAM_PACKAGE_FILE_COUNT = 153
+PINNED_SAM_PACKAGE_TREE_SHA256 = (
+    "6addad49cab67f65895cea072512e7d9cd0f5cfb162e102a60c56a4299075aaf"
+)
 
 
 def _existing_directory(value: str | Path, *, name: str) -> Path:
@@ -66,46 +73,149 @@ def validate_smoke_window(start_frame: int, prompt_frame: int) -> None:
         )
 
 
+def _canonical_sam_package_fingerprint(distribution: Any) -> tuple[str, int, Path]:
+    """Fingerprint installed runtime files independently of wheel metadata."""
+
+    try:
+        package_root = Path(distribution.locate_file("sam3")).resolve(strict=True)
+    except Exception as exc:
+        raise RuntimeError("sam3 installation has no locatable package source tree") from exc
+    if not package_root.is_dir():
+        raise RuntimeError(f"sam3 package source root is not a directory: {package_root}")
+    files = sorted(
+        (
+            path
+            for path in package_root.rglob("*")
+            if path.is_file()
+            and "__pycache__" not in path.parts
+            and path.suffix.lower() != ".pyc"
+        ),
+        key=lambda path: path.relative_to(package_root).as_posix(),
+    )
+    digest = hashlib.sha256()
+    for path in files:
+        relative = path.relative_to(package_root).as_posix()
+        payload = path.read_bytes()
+        if path.suffix.lower() == ".py":
+            # Git/wheel installs may materialize LF or CRLF on different hosts.
+            # Python tokenization treats them equivalently, so provenance does too.
+            payload = payload.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(payload).digest())
+        digest.update(b"\n")
+    return digest.hexdigest(), len(files), package_root
+
+
 def resolve_pinned_sam_runtime_provenance() -> dict[str, Any]:
     try:
         distribution = importlib.metadata.distribution("sam3")
     except importlib.metadata.PackageNotFoundError as exc:
         raise RuntimeError("the pinned local sam3 distribution is not installed") from exc
     version = str(distribution.version)
-    direct_text = distribution.read_text("direct_url.json")
-    try:
-        direct = json.loads(direct_text or "")
-        commit = str(direct["vcs_info"]["commit_id"])
-    except (KeyError, TypeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("sam3 installation has no auditable VCS provenance") from exc
-    if version != PINNED_SAM_VERSION or commit != PINNED_SAM_COMMIT:
+    if version != PINNED_SAM_VERSION:
         raise RuntimeError(
-            "sam3 runtime does not match the pinned prototype: "
-            f"version={version!r}, commit={commit!r}"
+            "sam3 runtime does not match the pinned adapter: "
+            f"version={version!r}, expected={PINNED_SAM_VERSION!r}"
+        )
+    direct_text = distribution.read_text("direct_url.json")
+    direct: Mapping[str, Any] = {}
+    if direct_text:
+        try:
+            parsed = json.loads(direct_text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, Mapping):
+            direct = parsed
+    vcs_info = direct.get("vcs_info")
+    recorded_vcs = (
+        str(vcs_info.get("vcs", "")).strip().lower()
+        if isinstance(vcs_info, Mapping)
+        else ""
+    )
+    recorded_commit = (
+        str(vcs_info.get("commit_id", "")).strip()
+        if isinstance(vcs_info, Mapping)
+        else ""
+    )
+    if recorded_vcs and recorded_vcs != "git":
+        raise RuntimeError(f"sam3 installation records unsupported VCS {recorded_vcs!r}")
+    if recorded_commit and recorded_commit != PINNED_SAM_COMMIT:
+        raise RuntimeError(
+            "sam3 runtime does not match the pinned adapter: "
+            f"version={version!r}, commit={recorded_commit!r}"
+        )
+    tree_digest, package_file_count, package_root = _canonical_sam_package_fingerprint(
+        distribution
+    )
+    spec = importlib.util.find_spec("sam3")
+    if spec is None or spec.origin is None:
+        raise RuntimeError("the installed sam3 runtime is not importable")
+    try:
+        Path(spec.origin).resolve(strict=True).relative_to(package_root)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            "the importable sam3 runtime is outside the audited distribution package"
+        ) from exc
+    if (
+        package_file_count != PINNED_SAM_PACKAGE_FILE_COUNT
+        or tree_digest != PINNED_SAM_PACKAGE_TREE_SHA256
+    ):
+        raise RuntimeError(
+            "sam3 installed package tree does not match the pinned adapter: "
+            f"files={package_file_count}, sha256={tree_digest!r}"
         )
     bpe = resolve_installed_sam_bpe()
     return {
         "distribution_version": version,
-        "git_commit": commit,
-        "source_url": str(direct.get("url", "")),
+        "git_commit": recorded_commit or None,
+        "pinned_git_commit": PINNED_SAM_COMMIT,
+        "provenance_method": (
+            "pep610_vcs_plus_source_tree"
+            if recorded_commit
+            else "pinned_installed_source_tree"
+        ),
+        "source_url": str(direct.get("url") or "").strip() or None,
+        "pinned_source_url": PINNED_SAM_SOURCE_URL,
+        "direct_url_present": bool(direct_text),
+        "package_root": str(package_root),
+        "package_file_count": package_file_count,
+        "package_tree_sha256": tree_digest,
         "bpe_path": str(bpe),
         "bpe_sha256": hashlib.sha256(bpe.read_bytes()).hexdigest(),
     }
 
 
 def find_case_video(input_root: Path, case: str) -> Path:
-    prefix = {"m1": "M1_", "f1": "F1_"}[str(case).lower()]
-    matches = sorted(
+    """Resolve a sample-neutral source video for one diagnostic arm.
+
+    A file may be supplied directly.  A directory may contain one MKV, or one
+    file prefixed with the arm name when both diagnostic arms are staged.
+    """
+
+    arm = str(case).lower()
+    if arm not in {"direct", "composite"}:
+        raise ValueError(f"unknown smoke case: {case}")
+    root = Path(input_root)
+    if root.is_file():
+        if root.suffix.lower() != ".mkv":
+            raise ValueError(f"LTA smoke input must be an MKV: {root}")
+        return root.resolve()
+    all_matches = sorted(
         path.resolve()
-        for path in Path(input_root).iterdir()
+        for path in root.iterdir()
         if path.is_file()
-        and path.name.lower().startswith(prefix.lower())
         and path.suffix.lower() == ".mkv"
     )
+    if len(all_matches) == 1:
+        return all_matches[0]
+    matches = [
+        path for path in all_matches if path.name.lower().startswith(f"{arm}_")
+    ]
     if len(matches) != 1:
-        names = [path.name for path in matches]
+        names = [path.name for path in all_matches]
         raise ValueError(
-            f"expected exactly one {prefix}*.mkv under {input_root}; found {names}"
+            f"expected one MKV or one {arm}_*.mkv under {root}; found {names}"
         )
     return matches[0]
 
@@ -191,7 +301,7 @@ def resize_square(frames: Iterable[Any], size: int = CANVAS_SIZE) -> list[Any]:
     return [frame.convert("RGB").resize((int(size), int(size)), resampling) for frame in frames]
 
 
-def build_f1_composites(
+def build_composite_frames(
     target_frames: Sequence[Any],
     exemplar_image: Any,
     exemplar_xywh: Sequence[float],
@@ -199,7 +309,7 @@ def build_f1_composites(
     canvas_size: int = CANVAS_SIZE,
     exemplar_frame_offset: int | None = None,
 ) -> tuple[list[Any], tuple[float, float, float, float], tuple[int, int, int, int]]:
-    """Build the fixed exemplar-left, target-right F1 conditioning canvas."""
+    """Build the fixed exemplar-left, target-right conditioning canvas."""
 
     from PIL import Image
 
@@ -209,7 +319,7 @@ def build_f1_composites(
         raise ValueError("exemplar_xywh must contain four values")
     if len(target_frames) != LTA_SESSION_FRAMES:
         raise ValueError(
-            f"F1 composite requires {LTA_SESSION_FRAMES} frames; got {len(target_frames)}"
+            f"composite diagnostic requires {LTA_SESSION_FRAMES} frames; got {len(target_frames)}"
         )
     if exemplar_frame_offset is not None and not (
         0 <= int(exemplar_frame_offset) < LTA_SESSION_FRAMES
@@ -246,7 +356,7 @@ def build_f1_composites(
         if target_rect is None:
             target_rect = current_rect
         elif current_rect != target_rect:
-            raise RuntimeError("F1 target geometry changed inside one fixed session")
+            raise RuntimeError("composite target geometry changed inside one fixed session")
         canvas = Image.new("RGB", (canvas_size, canvas_size), (128, 128, 128))
         if exemplar_frame_offset is None or frame_offset == int(exemplar_frame_offset):
             canvas.paste(exemplar, (0, exemplar_top))
@@ -319,19 +429,19 @@ def summarize_predictions(
 
 def evaluate_case_acceptance(case: str, summary: dict[str, Any]) -> dict[str, Any]:
     case = str(case).lower()
-    if case == "m1":
+    if case == "direct":
         passed = int(summary.get("prediction_count", 0)) > 0
         reason = (
             "at least one active object-frame mask was produced"
             if passed
             else "no active object-frame mask was produced"
         )
-    elif case == "f1":
+    elif case == "composite":
         passed = int(summary.get("target_prediction_hits", 0)) > 0
         reason = (
-            "at least one prediction intersected the F1 target panel"
+            "at least one prediction intersected the composite target panel"
             if passed
-            else "no prediction intersected the F1 target panel"
+            else "no prediction intersected the composite target panel"
         )
     else:
         raise ValueError(f"unknown smoke case: {case}")
@@ -583,7 +693,7 @@ def run_case(
     start_frame: int,
     prompt_frame: int,
     conf: float,
-    f1_exemplar_visibility: str = "prompt-only",
+    composite_exemplar_visibility: str = "prompt-only",
     diagnostic_output: Path | None = None,
 ) -> dict[str, Any]:
     if not int(start_frame) <= int(prompt_frame) < int(start_frame) + LTA_SESSION_FRAMES:
@@ -592,15 +702,15 @@ def run_case(
     decoded = decode_rgb_frames(video_path, int(start_frame))
     target_rect = None
     mapped_xywh = exemplar_xywh
-    if str(case).lower() == "m1":
+    if str(case).lower() == "direct":
         resource = resize_square(decoded)
-    elif str(case).lower() == "f1":
+    elif str(case).lower() == "composite":
         exemplar_frame_offset = (
             int(prompt_frame) - int(start_frame)
-            if str(f1_exemplar_visibility) == "prompt-only"
+            if str(composite_exemplar_visibility) == "prompt-only"
             else None
         )
-        resource, mapped_xywh, target_rect = build_f1_composites(
+        resource, mapped_xywh, target_rect = build_composite_frames(
             decoded,
             exemplar_image,
             exemplar_xywh,
@@ -636,8 +746,10 @@ def run_case(
         "frame_stop": int(start_frame) + LTA_SESSION_FRAMES,
         "prompt_frame": int(prompt_frame),
         "prompt_xywh": list(prompt.xywh),
-        "f1_exemplar_visibility": (
-            str(f1_exemplar_visibility) if str(case).lower() == "f1" else None
+        "composite_exemplar_visibility": (
+            str(composite_exemplar_visibility)
+            if str(case).lower() == "composite"
+            else None
         ),
         "elapsed_seconds": time.perf_counter() - started,
         "predictions": summarize_predictions(predictions, target_rect=target_rect),
@@ -662,21 +774,21 @@ def run_case(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="Existing local SAM 3.1 file/directory")
-    parser.add_argument("--input-root", required=True, help="Directory containing M1/F1 MKVs")
+    parser.add_argument("--input-root", required=True, help="Source MKV or directory of diagnostic MKVs")
     parser.add_argument(
         "--exemplar-root",
         required=True,
         help="Directory containing indexed exemplar JPG/TXT pairs",
     )
-    parser.add_argument("--case", choices=("m1", "f1", "both"), default="m1")
+    parser.add_argument("--case", choices=("direct", "composite", "both"), default="direct")
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--start-frame", type=int, default=DEFAULT_START_FRAME)
-    parser.add_argument("--prompt-frame", type=int, default=DEFAULT_PROMPT_FRAME)
-    parser.add_argument("--exemplar-index", type=int, default=DEFAULT_EXEMPLAR_INDEX)
+    parser.add_argument("--start-frame", type=int, required=True)
+    parser.add_argument("--prompt-frame", type=int, required=True)
+    parser.add_argument("--exemplar-index", type=int, required=True)
     parser.add_argument(
         "--label-row",
         type=int,
-        default=DEFAULT_LABEL_ROW,
+        required=True,
         help="Zero-based YOLO-seg row within the selected exemplar label",
     )
     parser.add_argument("--conf", type=float, default=0.15)
@@ -686,10 +798,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional new/empty directory for review-only overlays, masks, and contact sheets",
     )
     parser.add_argument(
-        "--f1-exemplar-visibility",
+        "--composite-exemplar-visibility",
         choices=("prompt-only", "all"),
         default="prompt-only",
-        help="Show the left exemplar only on the prompt frame or on every F1 frame",
+        help="Show the left exemplar only on the prompt frame or on every composite frame",
     )
     parser.add_argument(
         "--weight-storage",
@@ -705,14 +817,18 @@ def main() -> None:
     validate_smoke_window(int(args.start_frame), int(args.prompt_frame))
     bundle = resolve_local_sam_bundle(args.model)
     if bundle.model_version != "sam3.1":
-        raise ValueError("the v19 GPU smoke requires a local SAM 3.1 bundle")
-    input_root = _existing_directory(args.input_root, name="--input-root")
+        raise ValueError("the LTA GPU smoke requires a local SAM 3.1 bundle")
+    input_root = Path(args.input_root).expanduser().resolve(strict=True)
+    if not (input_root.is_file() or input_root.is_dir()):
+        raise ValueError(f"--input-root is not a file or directory: {input_root}")
     exemplar_root = _existing_directory(args.exemplar_root, name="--exemplar-root")
     exemplar_path, label_path = find_indexed_exemplar(
         exemplar_root, int(args.exemplar_index)
     )
     exemplar_xywh = prompt_xywh_from_label(label_path, int(args.label_row))
-    selected_cases = ("m1", "f1") if args.case == "both" else (args.case,)
+    selected_cases = ("direct", "composite") if args.case == "both" else (args.case,)
+    if input_root.is_file() and len(selected_cases) != 1:
+        raise ValueError("--case both requires a directory with direct_ and composite_ MKVs")
     diagnostic_output = validate_diagnostic_output(args.diagnostic_output, selected_cases)
     videos = {case: find_case_video(input_root, case) for case in selected_cases}
     sam_runtime = resolve_pinned_sam_runtime_provenance()
@@ -768,7 +884,7 @@ def main() -> None:
                 start_frame=int(args.start_frame),
                 prompt_frame=int(args.prompt_frame),
                 conf=float(args.conf),
-                f1_exemplar_visibility=str(args.f1_exemplar_visibility),
+                composite_exemplar_visibility=str(args.composite_exemplar_visibility),
                 diagnostic_output=diagnostic_output,
             )
             torch.cuda.empty_cache()
@@ -792,7 +908,7 @@ def main() -> None:
     result = {
         "status": "ok" if accepted else "acceptance_failed",
         "execution_completed": True,
-        "prototype": "v19_lta_gpu_smoke",
+        "diagnostic_schema": "lta.gpu-smoke/1",
         "model": {
             "bundle": str(bundle.root),
             "checkpoint": str(bundle.checkpoint_path),
@@ -824,7 +940,7 @@ def main() -> None:
             "weight_storage": str(args.weight_storage),
             "constrained_batches": constrained_batches,
             "sdpa_backends": ["flash_attention", "efficient_attention", "math"],
-            "f1_exemplar_visibility": str(args.f1_exemplar_visibility),
+            "composite_exemplar_visibility": str(args.composite_exemplar_visibility),
         },
         "cases": case_results,
         "cuda_memory": memory_events,

@@ -43,6 +43,10 @@ from .geometry import (
 
 # Explicit lower-layer dependencies keep imports one-way.
 from .config import GIB
+from .experimental_features import (
+    d1_owner_group_size_limit,
+    d1_owner_groups_requested,
+)
 from .workspace import (
     _env_flag,
     _env_float,
@@ -91,15 +95,6 @@ def d1_publication_max_pending_per_worker() -> int:
 
 def d1_unpack_target_mib() -> int:
     return max(16, min(1024, _env_int('YOLO_TTA_D1_UNPACK_TARGET_MIB', 256)))
-
-def d1_owner_groups_requested() -> bool:
-    """Return whether the v18.0.3 multi-owner experiment was explicitly enabled."""
-    return bool(_env_flag('YOLO_TTA_V1803_D1_OWNER_GROUPS', False))
-
-def d1_owner_group_size_limit() -> int:
-    """Configured participant ceiling; the scheduler still clamps to its allocation."""
-    return max(1, min(8, _env_int('YOLO_TTA_V1803_D1_OWNER_GROUP_SIZE', 8)))
-
 
 _D1_PARTIAL_ARTIFACT_PROTOCOL = 'xta.d1.partial-bitset.v1'
 
