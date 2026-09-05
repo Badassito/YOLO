@@ -1,10 +1,37 @@
 # XTA architecture
 
-`GPT-5.6-Sol-Ultra_v19.0.2_SLURM.py` is the sole versioned launcher. It, the
+`GPT-6-Astra-Ultra_v19.0.3_SLURM.py` is the sole versioned launcher. It, the
 installed `xta` console script, and `python -m XTA` all dispatch
 through `XTA.cli.run()`.
 The implementation lives in the importable `XTA` package so spawned processes
 resolve worker functions and data types through canonical module paths.
+
+## Default sparse execution
+
+Full-frame, zero-angle Cartesian interpolation components retain sparse storage
+through publication. Transverse components reuse their immutable store;
+sagittal and coronal components transpose directly into packed orthogonal stores.
+Eligible D1 continuations publish component references without constructing a
+dense additions volume; their independently published source-space base remains
+part of the final union. Tiles, other geometries and consumers requiring dense
+arrays retain the ordinary continuation path.
+
+Sparse interpolation labels use validated foreground bounds to select cropped
+CPU labeling at low coverage. Touching component pairs use bounded compiled
+deduplication when Numba is available, with the NumPy implementation retained
+for unsupported inputs or unavailable acceleration. Final fusion directly ORs
+sparse crops when only temporal restoration is needed, preserving the existing
+source-index mapping. These paths need no experiment-specific environment flags.
+
+The GPU external augmentation examples use separable Gaussian operations.
+GPU bridge painting, interpolation radius experiments and existing hardware
+feature controls retain their separate policies. No additional dependencies are
+required beyond the existing optional acceleration dependencies.
+
+Linux scratch classification uses the kernel mount ID of an opened path, so a
+job-private bind mount takes precedence over covered host mounts. Missing paths
+are classified through their nearest existing ancestor. Filesystem type does
+not imply persistence: cluster `/tmp` remains disposable after the job ends.
 
 ## Runtime modules
 
@@ -289,7 +316,22 @@ persistent process owns each visible CUDA device. A bounded CPU producer pool in
 renders independent full/tile items while earlier work runs on the GPU; shape-compatible items
 fill multi-source policy calls subject to free-VRAM admission and deterministic OOM splitting.
 
+PTA accepts only the resolved mode configuration. Source discovery, geometry planning,
+publication and validation run through that contract; there is no separate legacy
+single-volume renderer or completion-marker resume path. The self-contained GPU example
+policies use separable one-dimensional Gaussian passes for blur and elastic-field smoothing.
+Their affine inversion and policy seed/selection rules remain independent of that filter.
+
 ## Output ownership and successful-run publication
+
+Ephemeral mapped scratch uses shared mappings and does not request synchronous writeback;
+same-host readers observe dirty pages through the mapping. Raw cvol payloads use ordinary
+pathname-backed files. This is separate from the active memfd workspace allocator used for
+shared source/result buffers, which retains explicit ownership and release accounting.
+
+Cluster outputs and diagnostic logs must use persistent storage when they are needed after
+job completion. A pathname-backed allocation on `/tmp` may be tmpfs or local SSD, depending
+on the allocation; neither implies post-job persistence.
 
 PTA has a fresh-publication lifecycle, not resume markers. Before cleanup it rejects drive or
 filesystem roots, home/workspace ancestors, any input/output containment in either direction, and
@@ -327,6 +369,14 @@ python tools/smoke_import.py
 python tools/verify_package_inventory.py
 ```
 
+Run the interpolation numerical corpus separately with the numerical dependencies installed;
+the aggregate dependency-light suite can replace those dependencies with stubs:
+
+```powershell
+python -m unittest discover -s tests -p test_interpolation_geometry.py -v
+python -m unittest discover -s tests -p test_external_augmentation_examples.py -v
+```
+
 Hardware-backed CUDA, TensorRT, OpenVINO, QAT, IAA, DSA and full data/model parity tests
 still require the production environment and representative artifacts. Intel accelerator
 build, provisioning, and admission instructions live in ``native/README.md``; run
@@ -337,7 +387,7 @@ one-versus-four-device scheduling and final bytes are covered by deterministic s
 representative H100 execution remains a hardware qualification step:
 
 ```bash
-python -u GPT-5.6-Sol-Ultra_v19.0.2_SLURM.py \
+python -u GPT-6-Astra-Ultra_v19.0.3_SLURM.py \
   --mode lta \
   --input <target-video> \
   --exemplar <aligned-image-yolo-directory> \
@@ -515,11 +565,22 @@ carry producer events for cross-stream dependencies, and every lease retains the
 objects it touched until its stream is quiescent so concurrent LRU eviction cannot recycle
 in-flight storage.
 
-The min-radius acceptance scan uses the existing no-GIL parallel CPU evaluator by default.
-Production evidence from v17.1.1 showed that issuing each plan's CuPyX labeling, hole fill,
-and EDT through one renderer lock serialized 128 planner threads and reduced throughput by
-roughly fourfold. `YOLO_TTA_GPU_INTERPOLATION_RADIUS=1` keeps that CUDA radius path as an
-explicit experiment, but opted-in planners now borrow independent streams and hold the
+Interpolation represents each endpoint in an odd, centered rectangular canvas with a
+background margin. Canvas extents follow the two local shapes; global endpoint travel is
+applied only by the world-coordinate painter. Packed component membership uses a compiled
+unsigned-word OR/count operation when Numba is available, with the NumPy path retained when
+that optional backend is unavailable.
+
+The min-radius acceptance evaluator runs on CPU by default. For a positive rejection
+threshold, the smaller endpoint-center SDF can certify a common foreground disk through
+every intermediate section. A floating-point margin guards near-threshold certificates;
+uncertified plans retain the full section-radius scan. The certificate returns an acceptance
+lower bound, while requests without a positive rejection threshold still compute the full
+radius. Shape-dependent floating-point EDT rounding can change boundary voxels; the
+rectangular implementation does not promise bit-identical output.
+
+`YOLO_TTA_GPU_INTERPOLATION_RADIUS=1` selects the experimental CUDA radius evaluator.
+Opted-in planners borrow independent streams and hold the
 renderer lock only for shared cache/telemetry mutations. Radius failure is isolated from
 painting: unless CUDA is required, the affected plan and remaining radius work return to CPU
 while an otherwise healthy renderer may continue painting. Rendering coalesces per-section
@@ -534,7 +595,8 @@ and withholds that amount when sizing its live SDF/section cache.
 `YOLO_TTA_GPU_INTERPOLATION_CACHE_MIB` (1024 by default) caps retained device payloads;
 temporary CuPy/CuPyX workspaces and allocator-pool blocks are outside that logical cache
 limit and are released when the lease closes. The default global interpolation-pass limit
-remains one because a production pass required about 117 GiB of host workspace. Per-pass
+remains one because the structural workspace estimate does not bound every topology-dependent
+planner allocation. Per-pass
 logs and runtime stats separately report radius/render backends, autotune timings, lock wait,
 execution time, transfer categories, crop/patch pixels, cache eviction, fallback, and the
 worker-visible physical CUDA token.

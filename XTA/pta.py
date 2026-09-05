@@ -47,7 +47,7 @@ Dependencies:
   pip install torch  # CUDA build; needed by the supplied GPU policy
   pip install nvidia-nvimgcodec-cu13[all]  # CUDA 13; use the cu12 package on CUDA 12
   pip install nvidia-nvtiff-cu13  # optional lossless multipage TIFF GPU encoder
-  pip install pynrrd     # needed for NRRD input or --save_nrrd
+  pip install pynrrd     # needed for NRRD input or --save nrrd
 System:
   ffmpeg + ffprobe on PATH for video input and overlay output.
 """
@@ -68,12 +68,11 @@ import shutil
 import subprocess
 import sys
 import threading
-import time
 from collections import Counter, defaultdict
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -92,7 +91,7 @@ try:
 except Exception as exc:  # pragma: no cover
     raise RuntimeError("tqdm is required: pip install tqdm") from exc
 
-# v18 routes built-in physical-view planning and forward rendering through the
+# Built-in physical-view planning and forward rendering use the
 # same implementation used by TTA.  PTA-owned discovery, eligibility, splitting,
 # augmentation, and dataset publication remain in this module.
 from . import geometry as shared_geometry
@@ -304,17 +303,11 @@ NRRD_AXIS_ORDER_NOTE = "internal mask (t,Y,X) is exported as Slicer spatial axes
 ANNOTATION_UNANNOTATED = 0
 ANNOTATION_BACKGROUND = 1
 ANNOTATION_FOREGROUND = 2
-ANNOTATION_STATE_NAMES = {
-    ANNOTATION_UNANNOTATED: "unannotated",
-    ANNOTATION_BACKGROUND: "annotated_background",
-    ANNOTATION_FOREGROUND: "annotated_foreground",
-}
 
 
 # ---------------------------------------------------------------------------
 # Warnings / small helpers
 # ---------------------------------------------------------------------------
-
 
 
 def _require_bin(name: str) -> None:
@@ -594,8 +587,6 @@ def discover_topology(
     )
 
 
-
-
 def available_memory_budget_bytes() -> Optional[int]:
     candidates: List[int] = []
     cgroup_pairs = [
@@ -670,7 +661,6 @@ def estimate_spec_resident_bytes(spec: object) -> Optional[int]:
 # ---------------------------------------------------------------------------
 
 
-
 def parallel_for_indices(
     count: int,
     func: Callable[[int], None],
@@ -724,47 +714,12 @@ def parse_token_list(values: Sequence[str] | str | None) -> List[str]:
     return out
 
 
-def parse_float_list(values: Sequence[str] | str | None, default: Optional[Sequence[float]] = None) -> List[float]:
-    tokens = parse_token_list(values)
-    if not tokens and default is not None:
-        return [float(x) for x in default]
-    return [float(x) for x in tokens]
-
-
-def parse_int_list(values: Sequence[str] | str | int | None) -> List[int]:
-    if values is None:
-        return []
-    if isinstance(values, int):
-        return [int(values)]
-    return [int(float(x)) for x in parse_token_list(values)]
-
-
-
-
-def format_float_token(v: float) -> str:
-    s = f"{float(v):g}".replace("-", "m").replace("+", "p").replace(".", "p")
-    return s
-
-
-def format_signed_token(v: float) -> str:
-    sign = "p" if float(v) >= 0 else "m"
-    return sign + f"{abs(float(v)):g}".replace(".", "p")
-
-
 def natural_index_key(path: Path) -> Tuple[str, int, str]:
     stem = path.stem
     m = re.search(r"(.*?)(\d+)$", stem)
     if m:
         return (m.group(1), int(m.group(2)), path.name)
     return (stem, -1, path.name)
-
-
-def split_stem_index(path: Path) -> Tuple[str, Optional[int]]:
-    m = re.match(r"^(.*?)(?:_)?(\d+)$", path.stem)
-    if not m:
-        return path.stem, None
-    base = m.group(1).rstrip("_")
-    return base, int(m.group(2))
 
 
 def to_gray8(img: np.ndarray) -> np.ndarray:
@@ -793,7 +748,6 @@ def to_gray8(img: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-
 
 
 _CUSTOM_CHANNEL_FORMAT_RE = re.compile(r"^C([1-9]\d*)S([1-9]\d*)$", re.IGNORECASE)
@@ -873,80 +827,9 @@ def make_channel_tag(base_tag: str, variant: ChannelVariant) -> str:
     return f"{base_tag}_{variant.tag_token}"
 
 
-def resolve_tilt_angles(values: Sequence[str] | str | None) -> List[float]:
-    out: List[float] = []
-    seen: set[float] = set()
-    for a in parse_float_list(values, default=[0.0]):
-        if float(a) == 0.0:
-            continue
-        mag = abs(float(a))
-        if not (0.0 < mag <= 45.0):
-            raise ValueError("--tilt_angle values must be greater than 0 and at most 45")
-        key = round(mag, 8)
-        if key not in seen:
-            out.append(mag)
-            seen.add(key)
-    return out
-
-
-def resolve_tilt_directions(values: Sequence[str] | str | None) -> List[str]:
-    raw = [str(x).lower() for x in parse_token_list(values or ["vertical"])]
-    out: List[str] = []
-    for tok in raw:
-        if tok == "both":
-            for expanded in ("vertical", "horizontal"):
-                if expanded not in out:
-                    out.append(expanded)
-            continue
-        if tok not in {"vertical", "horizontal"}:
-            raise ValueError("--tilt_direction must contain vertical, horizontal, or both")
-        if tok not in out:
-            out.append(tok)
-    return out or ["vertical"]
-
-
-def resolve_tile_configs(tile_sizes_raw: Sequence[str] | str | int | None, tile_strides_raw: Sequence[str] | str | int | None) -> List[TileConfig]:
-    sizes = parse_int_list(tile_sizes_raw)
-    if not sizes:
-        sizes = [0]
-    if len(sizes) == 1 and sizes[0] == 0:
-        strides = parse_int_list(tile_strides_raw)
-        if strides and any(int(s) != 0 for s in strides):
-            raise ValueError("--tile_stride must be omitted or 0 when --tile_size is 0")
-        return []
-    if any(int(s) <= 0 for s in sizes):
-        raise ValueError("All --tile_size values must be > 0 when tiling is enabled")
-
-    strides = parse_int_list(tile_strides_raw)
-    if not strides:
-        strides = list(sizes)
-    if len(strides) != len(sizes):
-        raise ValueError("--tile_size and --tile_stride must have the same number of values")
-    configs: List[TileConfig] = []
-    seen: set[str] = set()
-    for size, stride in zip(sizes, strides):
-        if int(stride) <= 0:
-            raise ValueError("--tile_stride must be > 0 when --tile_size is active")
-        cid = f"s{int(size)}_st{int(stride)}"
-        if cid in seen:
-            raise ValueError(f"Duplicate tile config: {cid}")
-        configs.append(TileConfig(int(size), int(stride), cid))
-        seen.add(cid)
-    # v3 canonical order: tile variants sorted by (tile_size ascending, tile_stride ascending).
-    return sorted(configs, key=lambda c: (int(c.tile_size), int(c.tile_stride), c.config_id))
-
-
 # ---------------------------------------------------------------------------
 # Input volume and label rasterization
 # ---------------------------------------------------------------------------
-
-@dataclass
-class IndexedFileReport:
-    paths_by_index: Dict[int, Path]
-    bases_by_index: Dict[int, str]
-    duplicate_indices: Dict[int, List[Path]]
-    unindexed_paths: List[Path]
-    indices: List[int]
 
 
 @dataclass
@@ -969,8 +852,6 @@ class SourceVolume:
     # empty tuple means an explicit background label file.
     yolo_polygons_by_frame: Dict[int, Tuple[Tuple[Tuple[float, float], ...], ...]] = field(default_factory=dict)
     volume_block: Optional[SharedBlock] = None  # backing block when the process pool is active
-
-
 
 
 def ffprobe_info(video_path: Path) -> Dict[str, object]:
@@ -1052,35 +933,6 @@ def decode_video_gray8_to_memory(video_path: Path, *, warnings: WarningLog, allo
     return arr, fps, block
 
 
-def analyze_indexed_files(paths: Sequence[Path], *, kind: str) -> IndexedFileReport:
-    paths_by_index: Dict[int, Path] = {}
-    bases_by_index: Dict[int, str] = {}
-    duplicate_indices: Dict[int, List[Path]] = {}
-    unindexed_paths: List[Path] = []
-    buckets: Dict[int, List[Path]] = defaultdict(list)
-    bases: Dict[int, str] = {}
-    for path in paths:
-        base, idx = split_stem_index(path)
-        if idx is None:
-            unindexed_paths.append(path)
-            continue
-        buckets[int(idx)].append(path)
-        bases[int(idx)] = base
-    for idx, bucket in buckets.items():
-        if len(bucket) > 1:
-            duplicate_indices[int(idx)] = list(bucket)
-        else:
-            paths_by_index[int(idx)] = bucket[0]
-            bases_by_index[int(idx)] = bases[int(idx)]
-    return IndexedFileReport(
-        paths_by_index=paths_by_index,
-        bases_by_index=bases_by_index,
-        duplicate_indices=duplicate_indices,
-        unindexed_paths=unindexed_paths,
-        indices=sorted(int(x) for x in buckets.keys()),
-    )
-
-
 def contiguous_start_0_or_1(indices: Sequence[int]) -> Optional[int]:
     idxs = sorted(int(x) for x in indices)
     n = len(idxs)
@@ -1138,15 +990,6 @@ def read_yolo_polygons_normalized(path: Path, *, warnings: WarningLog) -> YoloPo
             continue
         polygons.append(tuple(points))
     return tuple(polygons)
-
-
-def validate_no_unindexed_or_duplicate(report: IndexedFileReport, *, kind: str) -> None:
-    if report.unindexed_paths:
-        examples = ", ".join(p.name for p in report.unindexed_paths[:8])
-        raise ValueError(f"{kind} files must contain a numeric frame index in the filename; unindexed examples: {examples}")
-    if report.duplicate_indices:
-        examples = ", ".join(f"{idx}:" + "/".join(p.name for p in paths[:3]) for idx, paths in list(report.duplicate_indices.items())[:8])
-        raise ValueError(f"Duplicate {kind} frame indices are invalid: {examples}")
 
 
 def _read_gray_image_opencv(path: Path) -> np.ndarray:
@@ -1435,188 +1278,6 @@ def load_nrrd_mask_for_volume(nrrd_path: Path, expected_shape_tyx: Tuple[int, in
     return mask
 
 
-def most_common_stem(paths: Sequence[Path]) -> str:
-    if not paths:
-        return "Volume"
-    bases = [split_stem_index(p)[0] for p in paths]
-    return Counter(bases).most_common(1)[0][0] or paths[0].stem
-
-
-def classify_sequence_input(
-    *,
-    image_report: IndexedFileReport,
-    label_report: Optional[IndexedFileReport],
-    has_nrrd: bool,
-    num_frames: int,
-    warnings: WarningLog,
-) -> Tuple[str, Optional[int]]:
-    del num_frames
-    image_start = contiguous_start_0_or_1(image_report.indices)
-    if label_report is None and not has_nrrd:
-        if image_start is None:
-            warnings.add("unlabeled_sequence_noncontiguous_indices", describe_index_problem(image_report.indices))
-        return "unlabeled", image_start
-    if label_report is not None:
-        image_set = set(int(x) for x in image_report.indices)
-        label_set = set(int(x) for x in label_report.indices)
-        orphan_labels = sorted(label_set - image_set)
-        if orphan_labels:
-            raise ValueError(
-                "Every YOLO label index must have a matching image index; "
-                f"orphan label indices={orphan_labels[:24]}, "
-                f"image {describe_index_problem(image_report.indices)}, "
-                f"label {describe_index_problem(label_report.indices)}"
-            )
-        if image_start is not None and label_set == image_set:
-            return "fully_labeled", image_start
-        missing_labels = sorted(image_set - label_set)
-        reasons: List[str] = []
-        if image_start is None:
-            reasons.append("image indices are not contiguous from 0 or 1")
-        if missing_labels:
-            reasons.append(f"{len(missing_labels)} image slice(s) have no label file")
-        warnings.add("partial_volume_detected", "; ".join(reasons) or "partial YOLO label coverage")
-        return "partially_labeled", image_start
-    if has_nrrd:
-        if image_start is not None:
-            return "fully_labeled", image_start
-        warnings.add("partial_volume_detected", "NRRD segmentation exists, but image indices are not contiguous from 0 or 1")
-        return "partially_labeled", image_start
-    raise AssertionError("unreachable")
-
-
-def labels_by_frame_from_matching_indices(image_indices: Sequence[int], labels_by_index: Dict[int, Path]) -> Dict[int, Path]:
-    """Map only image positions that have an explicit YOLO label file."""
-    return {
-        frame_i0: labels_by_index[int(encoded_idx)]
-        for frame_i0, encoded_idx in enumerate(sorted(int(x) for x in image_indices))
-        if int(encoded_idx) in labels_by_index
-    }
-
-
-def labels_by_frame_from_video_indices(label_report: IndexedFileReport, frame_count: int) -> Tuple[Dict[int, Path], int]:
-    start = contiguous_start_0_or_1(label_report.indices)
-    if start is None:
-        raise ValueError(f"Video label indices must be contiguous and start at 0 or 1; {describe_index_problem(label_report.indices)}")
-    expected = list(range(start, start + int(frame_count)))
-    got = sorted(int(x) for x in label_report.indices)
-    if got != expected:
-        raise ValueError(
-            f"Video labels must map exactly to all video frame indices. Expected {expected[:3]}...{expected[-3:]} "
-            f"for {frame_count} frames with start {start}; got {describe_index_problem(got)}"
-        )
-    return {int(idx) - int(start): label_report.paths_by_index[int(idx)] for idx in got}, int(start)
-
-
-def collect_input(input_arg: str, *, warnings: WarningLog, workers: int) -> SourceVolume:
-    input_path = Path(input_arg).expanduser().resolve()
-    if not input_path.exists():
-        raise FileNotFoundError(input_path)
-    if not input_path.is_dir():
-        raise ValueError("--input must be a directory containing an accepted v3.0.0_SLURM input")
-
-    files = [p for p in input_path.iterdir() if p.is_file()]
-    videos = sorted([p for p in files if p.suffix.lower() in VIDEO_EXTS])
-    images_raw = sorted([p for p in files if p.suffix.lower() in IMAGE_EXTS], key=natural_index_key)
-    labels = sorted([p for p in files if p.suffix.lower() == ".txt"], key=natural_index_key)
-    nrrds = sorted([p for p in files if p.suffix.lower() in NRRD_EXTS])
-
-    if videos and images_raw:
-        raise ValueError("Input directory must contain either one video or one image sequence, not both")
-    if len(videos) > 1:
-        raise ValueError(f"Expected at most one video file, found {len(videos)}")
-    if len(nrrds) > 1:
-        raise ValueError(f"Expected at most one NRRD segmentation file, found {len(nrrds)}")
-    if labels and nrrds:
-        raise ValueError("Provide either YOLO txt labels or one NRRD segmentation, not both")
-    if not videos and not images_raw:
-        raise ValueError("No video or image sequence found in input directory")
-
-    label_report: Optional[IndexedFileReport] = None
-    if labels:
-        label_report = analyze_indexed_files(labels, kind="label")
-        validate_no_unindexed_or_duplicate(label_report, kind="label")
-
-    if videos:
-        video_path = videos[0]
-        stem = video_path.stem
-        volume, fps, _volume_block = decode_video_gray8_to_memory(video_path, warnings=warnings)
-        frame_count = int(volume.shape[0])
-        labels_by_frame: Dict[int, Path] = {}
-        mask_volume: Optional[np.ndarray] = None
-        input_start_index: Optional[int] = None
-        if label_report is not None:
-            if len(label_report.indices) != frame_count:
-                raise ValueError(f"Video Fully Labeled Volume requires label count to equal frame count; frames={frame_count}, labels={len(label_report.indices)}")
-            labels_by_frame, input_start_index = labels_by_frame_from_video_indices(label_report, frame_count)
-            volume_class = "fully_labeled"
-            label_source = "yolo"
-        elif nrrds:
-            mask_volume = load_nrrd_mask_for_volume(nrrds[0], tuple(volume.shape), warnings=warnings)
-            volume_class = "fully_labeled"
-            label_source = "nrrd"
-        else:
-            volume_class = "unlabeled"
-            label_source = "none"
-        return SourceVolume(
-            input_dir=input_path,
-            stem=stem,
-            kind="video",
-            image_paths=[],
-            video_path=video_path,
-            labels_by_frame=labels_by_frame,
-            segmentation_nrrd_path=nrrds[0] if nrrds else None,
-            mask_volume=mask_volume,
-            volume_class=volume_class,
-            label_source=label_source,
-            input_start_index=input_start_index,
-            encoded_indices=tuple(range(int(input_start_index or 0), int(input_start_index or 0) + frame_count)) if label_report is not None else tuple(range(frame_count)),
-            volume=volume,
-            fps=fps,
-        )
-
-    image_report = analyze_indexed_files(images_raw, kind="image")
-    validate_no_unindexed_or_duplicate(image_report, kind="image")
-    if not image_report.indices:
-        raise ValueError("Image sequence files must contain numeric frame indices")
-    ordered_images = [image_report.paths_by_index[int(idx)] for idx in sorted(image_report.indices)]
-    stem = most_common_stem(ordered_images)
-    volume, _volume_block = load_image_sequence_to_memory(ordered_images, warnings=warnings, workers=workers)
-    volume_class, input_start_index = classify_sequence_input(
-        image_report=image_report,
-        label_report=label_report,
-        has_nrrd=bool(nrrds),
-        num_frames=int(volume.shape[0]),
-        warnings=warnings,
-    )
-    labels_by_frame: Dict[int, Path] = {}
-    mask_volume: Optional[np.ndarray] = None
-    label_source = "none"
-    if label_report is not None:
-        labels_by_frame = labels_by_frame_from_matching_indices(image_report.indices, label_report.paths_by_index)
-        label_source = "yolo"
-    elif nrrds:
-        mask_volume = load_nrrd_mask_for_volume(nrrds[0], tuple(volume.shape), warnings=warnings)
-        label_source = "nrrd"
-
-    return SourceVolume(
-        input_dir=input_path,
-        stem=stem,
-        kind="sequence",
-        image_paths=ordered_images,
-        video_path=None,
-        labels_by_frame=labels_by_frame,
-        segmentation_nrrd_path=nrrds[0] if nrrds else None,
-        mask_volume=mask_volume,
-        volume_class=volume_class,
-        label_source=label_source,
-        input_start_index=input_start_index,
-        encoded_indices=tuple(sorted(int(x) for x in image_report.indices)),
-        volume=volume,
-        fps=1.0,
-    )
-
-
 def rasterize_yolo_labels(src: SourceVolume, *, warnings: WarningLog, workers: int, allocator: Optional[ArrayAllocator] = None) -> Tuple[np.ndarray, Optional[SharedBlock]]:
     volume = src.volume
     t, h, w = volume.shape
@@ -1901,11 +1562,10 @@ def apply_gaussian_smoothing(
     warnings: WarningLog,
     after_pass: Optional[Callable[[int, np.ndarray], None]] = None,
 ) -> List[Dict[str, int | float]]:
-    """Apply v3.0.0 Gaussian smoothing to the in-memory binary 3D mask.
+    """Apply shared TTA Gaussian smoothing to the in-memory binary 3D mask.
 
     The mask remains binary after every pass by thresholding the smoothed probability
-    volume at 0.5.  The operation is intentionally whole-volume because the v3.0.0
-    spec requires the full image and mask tensors to be resident before reslicing.
+    volume at 0.5. Each pass consumes the complete mask before view reslicing.
     """
     stats: List[Dict[str, int | float]] = []
     sigma_f = float(sigma)
@@ -1917,7 +1577,7 @@ def apply_gaussian_smoothing(
         before = np.asarray(mask_u8, dtype=np.uint8)
         before_count = int(np.count_nonzero(before))
         print(f"Gaussian smoothing pass {pass_idx}/{pass_count}: sigma={sigma_f:g} voxels")
-        # v18 deliberately uses the TTA numerical primitive: isotropic voxel
+        # The shared primitive uses isotropic voxel
         # sigma, constant-zero boundary, truncate=4, and threshold after every
         # pass so the following pass starts from the previous binary result.
         after = binary_gaussian_pass(
@@ -1945,28 +1605,6 @@ def cubic_target_shape(shape_tyx: Tuple[int, int, int]) -> Tuple[int, int, int]:
     longest = max(t_dim, h, w)
     min_allowed = int(math.ceil(float(longest) * 0.95))
     return tuple(max(int(dim), min_allowed) for dim in (t_dim, h, w))  # type: ignore[return-value]
-
-
-def resize_image_volume_to_shape(volume_u8: np.ndarray, target_shape: Tuple[int, int, int]) -> np.ndarray:
-    src_shape = tuple(int(x) for x in volume_u8.shape)
-    target = tuple(int(x) for x in target_shape)
-    if src_shape == target:
-        return np.ascontiguousarray(volume_u8, dtype=np.uint8)
-    zoom = tuple(float(t) / float(s) for t, s in zip(target, src_shape))
-    print(f"Cubic resizing image volume: {src_shape} -> {target} (zoom={tuple(round(z, 6) for z in zoom)})")
-    resized = ndi.zoom(volume_u8.astype(np.float32, copy=False), zoom=zoom, order=1, mode="nearest", prefilter=False)
-    return np.ascontiguousarray(np.clip(np.rint(resized), 0, 255).astype(np.uint8))
-
-
-def resize_mask_volume_to_shape(mask_u8: np.ndarray, target_shape: Tuple[int, int, int]) -> np.ndarray:
-    src_shape = tuple(int(x) for x in mask_u8.shape)
-    target = tuple(int(x) for x in target_shape)
-    if src_shape == target:
-        return np.ascontiguousarray(mask_u8, dtype=np.uint8)
-    zoom = tuple(float(t) / float(s) for t, s in zip(target, src_shape))
-    print(f"Cubic resizing mask volume: {src_shape} -> {target} (zoom={tuple(round(z, 6) for z in zoom)})")
-    resized = ndi.zoom(mask_u8.astype(np.float32, copy=False), zoom=zoom, order=1, mode="nearest", prefilter=False)
-    return np.ascontiguousarray((resized >= 0.5).astype(np.uint8))
 
 
 def resize_to_approximately_cube(
@@ -2009,103 +1647,6 @@ def resize_to_approximately_cube(
 # ---------------------------------------------------------------------------
 # Geometry: views, radial sampling, affine transforms, tilted sampling
 # ---------------------------------------------------------------------------
-
-
-
-def build_radial_azimuths(azimuth_angle: float) -> List[float]:
-    if float(azimuth_angle) <= 0.0:
-        return []
-    out: List[float] = []
-    a = 0.0
-    step = float(azimuth_angle)
-    while a < 180.0 - 1e-9:
-        out.append(float(a))
-        a += step
-    return out or [0.0]
-
-
-def default_radial_azimuth_angle(w: int, h: int) -> float:
-    """Coverage default from the v3.0.0 specification: 360 / (pi * D) degrees."""
-    diameter = max(1, int(min(int(w), int(h))))
-    return float(360.0 / (math.pi * float(diameter)))
-
-
-def resolve_radial_settings(enable_radial: bool, azimuth_angle_arg: Optional[float], *, w: int, h: int, warnings: WarningLog) -> Tuple[bool, float]:
-    """Resolve v3.0.0 radial activation and azimuth spacing."""
-    if azimuth_angle_arg is None:
-        if bool(enable_radial):
-            return True, default_radial_azimuth_angle(int(w), int(h))
-        return False, 0.0
-    spacing = float(azimuth_angle_arg)
-    if spacing < 0.0:
-        raise ValueError("--azimuth_angle must be >= 0")
-    if spacing == 0.0:
-        if bool(enable_radial):
-            warnings.add("radial_disabled_by_zero_azimuth_angle", "--enable_radial was set, but --azimuth_angle 0 disables radial views")
-        return False, 0.0
-    if not bool(enable_radial):
-        warnings.add("azimuth_angle_ignored_without_enable_radial", "--azimuth_angle > 0 was supplied without --enable_radial")
-        return False, 0.0
-    return True, spacing
-
-
-def build_views(t_dim: int, h: int, w: int, *, enable_sagittal: bool, enable_coronal: bool, enable_radial: bool, azimuth_angle: float, tilt_angles: Sequence[float], tilt_directions: Sequence[str]) -> List[ViewInfo]:
-    """Build active views in the v3 canonical order.
-
-    Canonical order matters for background filtering and splitting: Transverse,
-    Sagittal, Coronal, Radial, then Tilted Transverse variants sorted by
-    direction (horizontal before vertical) and signed angle ascending.
-    """
-    views: List[ViewInfo] = [
-        ViewInfo("transverse", "Transverse", "transverse", int(t_dim), int(h), int(w), "clamp", int(t_dim), int(h), int(w))
-    ]
-    if enable_sagittal:
-        views.append(ViewInfo("sagittal", "Sagittal", "sagittal", int(h), int(t_dim), int(w), "pad", int(t_dim), int(h), int(w)))
-    if enable_coronal:
-        views.append(ViewInfo("coronal", "Coronal", "coronal", int(w), int(t_dim), int(h), "pad", int(t_dim), int(h), int(w)))
-    if bool(enable_radial) and float(azimuth_angle) > 0.0:
-        azimuths = tuple(build_radial_azimuths(float(azimuth_angle)))
-        diameter = int(min(w, h))
-        views.append(ViewInfo(
-            name="radial",
-            display_name="Radial",
-            family="radial",
-            num_slices=len(azimuths),
-            src_h=int(t_dim),
-            src_w=int(diameter),
-            pad_mode="pad",
-            full_t=int(t_dim),
-            full_h=int(h),
-            full_w=int(w),
-            azimuths_deg=azimuths,
-            diameter=diameter,
-            center_x=float((w - 1) / 2.0),
-            center_y=float((h - 1) / 2.0),
-            roi_radius=float(max(0, (diameter - 1) / 2.0)),
-        ))
-
-    direction_order = {"horizontal": 0, "vertical": 1}
-    normalized_dirs = sorted({str(d).lower() for d in tilt_directions if str(d).lower() in direction_order}, key=lambda d: direction_order[d])
-    signed_angles = sorted({round(float(sign) * float(a), 8) for a in tilt_angles for sign in (-1.0, +1.0)})
-    for direction in normalized_dirs:
-        for signed in signed_angles:
-            if abs(float(signed)) < 1e-12:
-                continue
-            views.append(ViewInfo(
-                name=f"tilted_transverse_{direction}_{format_signed_token(float(signed))}",
-                display_name=f"TiltedTransverse_{direction}_{format_signed_token(float(signed))}",
-                family="tilted_transverse",
-                num_slices=int(t_dim),
-                src_h=int(h),
-                src_w=int(w),
-                pad_mode="clamp",
-                full_t=int(t_dim),
-                full_h=int(h),
-                full_w=int(w),
-                tilt_angle_deg=float(signed),
-                tilt_direction=direction,
-            ))
-    return views
 
 
 def adapt_shared_view(view: shared_geometry.ViewInfo) -> ViewInfo:
@@ -2268,8 +1809,6 @@ def build_affine(
     )
 
 
-
-
 def dense_tile_positions(length: int, tile_size: int, stride: int) -> List[int]:
     length = int(length)
     tile_size = int(tile_size)
@@ -2288,170 +1827,9 @@ def dense_tile_positions(length: int, tile_size: int, stride: int) -> List[int]:
 # ---------------------------------------------------------------------------
 
 
-def frame_path_from_pattern(pattern: str, idx_1: int) -> Path:
-    return Path(pattern % int(idx_1))
-
-
-def angle_tag(angle: float) -> str:
-    return f"a{format_float_token(float(angle))}"
-
-
-def make_tag(view: ViewInfo, angle: float = 0.0) -> str:
-    # v3.0.0 removes rotation-angle augmentation flags.  The angle parameter is
-    # retained internally only so the existing affine/render scheduler can emit
-    # the canonical unrotated view without changing its queue structure.
-    if abs(float(angle)) < 1e-9:
-        return view.display_name
-    return f"{view.display_name}_{angle_tag(angle)}"
-
-
-def render_variant(
-    *,
-    volume: np.ndarray,
-    mask: np.ndarray,
-    view: ViewInfo,
-    aff: AffineSpec,
-    tag: str,
-    out_dir: Path,
-    stem: str,
-    fps: float,
-    tile_configs: Sequence[TileConfig],
-    save_overlay: bool,
-    overlay_tile_writer_limit: int,
-    png_compression: int,
-    imgsz: int,
-    warnings: WarningLog,
-    workers: int,
-    image_format: str = "png",
-) -> Dict[str, object]:
-    images_dir = out_dir / "images"
-    labels_dir = out_dir / "labels"
-    overlays_dir = out_dir / "overlays"
-    image_suffix = output_image_suffix(image_format)
-    img_pattern = str(images_dir / f"{stem}_{tag}_%04d{image_suffix}")
-    lbl_pattern = str(labels_dir / f"{stem}_{tag}_%04d.txt")
-    overlay_path = overlays_dir / f"{stem}_{tag}_Overlay.mkv" if save_overlay else None
-    stats: Dict[str, object] = {
-        "tag": tag,
-        "view": view.name,
-        "angle": aff.angle_deg,
-        "frames": int(view.num_slices),
-        "image_format": parse_output_image_format(image_format),
-        "full_output_size": [int(aff.out_w), int(aff.out_h)],
-        "tiles": [],
-    }
-
-    tile_layout: List[Tuple[TileConfig, int, int, str, int, int, str, str, Optional[Path]]] = []
-    for cfg in tile_configs:
-        xs = dense_tile_positions(aff.canvas_w, cfg.tile_size, cfg.tile_stride)
-        ys = dense_tile_positions(aff.canvas_h, cfg.tile_size, cfg.tile_stride)
-        out_side = int(imgsz) if int(imgsz) > 0 else int(cfg.tile_size)
-        for y in ys:
-            for x in xs:
-                tile_tag = f"{tag}_tile_{cfg.config_id}_x{int(x):04d}_y{int(y):04d}"
-                tile_img_pattern = str(images_dir / f"{stem}_{tile_tag}_%04d{image_suffix}")
-                tile_lbl_pattern = str(labels_dir / f"{stem}_{tile_tag}_%04d.txt")
-                tile_overlay = overlays_dir / f"{stem}_{tile_tag}_Overlay.mkv" if save_overlay else None
-                tile_layout.append((cfg, int(x), int(y), tile_tag, int(out_side), int(out_side), tile_img_pattern, tile_lbl_pattern, tile_overlay))
-    stats["tiles"] = [
-        {"tag": item[3], "tile_size": item[0].tile_size, "tile_stride": item[0].tile_stride, "x": item[1], "y": item[2], "output_size": [item[4], item[5]]}
-        for item in tile_layout
-    ]
-    need_canvas = bool(tile_layout)
-
-    def _process_frame(idx: int) -> None:
-        img_full, mask_full, img_canvas, mask_canvas = render_full_and_optional_canvas(volume, mask, view, int(idx), aff, need_canvas)
-        write_image_gray(frame_path_from_pattern(img_pattern, int(idx) + 1), img_full, png_compression)
-        write_label_from_mask(mask_full, frame_path_from_pattern(lbl_pattern, int(idx) + 1), warnings=warnings, context=f"{tag} frame {int(idx)+1:04d}")
-        if need_canvas:
-            assert img_canvas is not None and mask_canvas is not None
-            for cfg, x, y, tile_tag, out_w, out_h, tile_img_pattern, tile_lbl_pattern, _tile_overlay in tile_layout:
-                tile_img = extract_padded_tile(img_canvas, x, y, cfg.tile_size)
-                tile_mask = extract_padded_tile(mask_canvas, x, y, cfg.tile_size)
-                tile_img_out = resize_centered(tile_img, out_w, out_h, cv2.INTER_LINEAR)
-                tile_mask_out = resize_centered(tile_mask, out_w, out_h, cv2.INTER_NEAREST)
-                write_image_gray(frame_path_from_pattern(tile_img_pattern, int(idx) + 1), tile_img_out, png_compression)
-                write_label_from_mask(tile_mask_out, frame_path_from_pattern(tile_lbl_pattern, int(idx) + 1), warnings=warnings, context=f"{tile_tag} frame {int(idx)+1:04d}")
-
-    if not save_overlay:
-        parallel_for_indices(int(view.num_slices), _process_frame, workers=workers, desc=f"Rendering {tag}")
-        return stats
-
-    full_writer = ffmpeg_ffv1_rgb_writer(overlay_path, aff.out_w, aff.out_h, fps) if overlay_path is not None else None
-    tile_writers: Dict[str, subprocess.Popen] = {}
-    immediate_tile_layout = tile_layout
-    deferred_tile_layout: List[Tuple[TileConfig, int, int, str, int, int, str, str, Optional[Path]]] = []
-    if tile_layout and int(overlay_tile_writer_limit) >= len(tile_layout):
-        for _cfg, _x, _y, tile_tag, out_w, out_h, _img_pat, _lbl_pat, tile_overlay in tile_layout:
-            if tile_overlay is not None:
-                tile_writers[tile_tag] = ffmpeg_ffv1_rgb_writer(tile_overlay, out_w, out_h, fps)
-    elif tile_layout:
-        # Avoid holding thousands of ffmpeg processes open simultaneously.  Images/labels and the
-        # full-frame overlay are written in the primary pass; tile overlays are generated below in
-        # bounded batches by recomputing the rotated canvas frames.
-        immediate_tile_layout = []
-        deferred_tile_layout = list(tile_layout)
-        warnings.add("tile_overlay_batched", f"{tag}: {len(tile_layout)} tile overlays generated in bounded batches")
-
-    try:
-        for idx in tqdm(range(int(view.num_slices)), desc=f"Rendering {tag} with overlays"):
-            img_full, mask_full, img_canvas, mask_canvas = render_full_and_optional_canvas(volume, mask, view, int(idx), aff, need_canvas)
-            write_image_gray(frame_path_from_pattern(img_pattern, int(idx) + 1), img_full, png_compression)
-            write_label_from_mask(mask_full, frame_path_from_pattern(lbl_pattern, int(idx) + 1), warnings=warnings, context=f"{tag} frame {int(idx)+1:04d}")
-            if full_writer is not None and full_writer.stdin is not None:
-                full_writer.stdin.write(overlay_rgb(img_full, mask_full).tobytes())
-            if need_canvas:
-                assert img_canvas is not None and mask_canvas is not None
-                for cfg, x, y, tile_tag, out_w, out_h, tile_img_pattern, tile_lbl_pattern, _tile_overlay in tile_layout:
-                    tile_img = extract_padded_tile(img_canvas, x, y, cfg.tile_size)
-                    tile_mask = extract_padded_tile(mask_canvas, x, y, cfg.tile_size)
-                    tile_img_out = resize_centered(tile_img, out_w, out_h, cv2.INTER_LINEAR)
-                    tile_mask_out = resize_centered(tile_mask, out_w, out_h, cv2.INTER_NEAREST)
-                    write_image_gray(frame_path_from_pattern(tile_img_pattern, int(idx) + 1), tile_img_out, png_compression)
-                    write_label_from_mask(tile_mask_out, frame_path_from_pattern(tile_lbl_pattern, int(idx) + 1), warnings=warnings, context=f"{tile_tag} frame {int(idx)+1:04d}")
-                    writer = tile_writers.get(tile_tag) if immediate_tile_layout else None
-                    if writer is not None and writer.stdin is not None:
-                        writer.stdin.write(overlay_rgb(tile_img_out, tile_mask_out).tobytes())
-    finally:
-        if full_writer is not None:
-            close_ffmpeg_writer(full_writer)
-        for writer in tile_writers.values():
-            close_ffmpeg_writer(writer)
-
-    if deferred_tile_layout:
-        batch_size = max(1, int(overlay_tile_writer_limit))
-        for batch_start in range(0, len(deferred_tile_layout), batch_size):
-            batch = deferred_tile_layout[batch_start:batch_start + batch_size]
-            batch_writers: Dict[str, subprocess.Popen] = {}
-            try:
-                for _cfg, _x, _y, tile_tag, out_w, out_h, _img_pat, _lbl_pat, tile_overlay in batch:
-                    if tile_overlay is not None:
-                        batch_writers[tile_tag] = ffmpeg_ffv1_rgb_writer(tile_overlay, out_w, out_h, fps)
-                batch_no = (batch_start // batch_size) + 1
-                batch_total = int(math.ceil(len(deferred_tile_layout) / float(batch_size)))
-                for idx in tqdm(range(int(view.num_slices)), desc=f"Rendering tile overlays {tag} batch {batch_no}/{batch_total}"):
-                    _img_full, _mask_full, img_canvas, mask_canvas = render_full_and_optional_canvas(volume, mask, view, int(idx), aff, True)
-                    assert img_canvas is not None and mask_canvas is not None
-                    for cfg, x, y, tile_tag, out_w, out_h, _tile_img_pattern, _tile_lbl_pattern, _tile_overlay in batch:
-                        writer = batch_writers.get(tile_tag)
-                        if writer is None or writer.stdin is None:
-                            continue
-                        tile_img = extract_padded_tile(img_canvas, x, y, cfg.tile_size)
-                        tile_mask = extract_padded_tile(mask_canvas, x, y, cfg.tile_size)
-                        tile_img_out = resize_centered(tile_img, out_w, out_h, cv2.INTER_LINEAR)
-                        tile_mask_out = resize_centered(tile_mask, out_w, out_h, cv2.INTER_NEAREST)
-                        writer.stdin.write(overlay_rgb(tile_img_out, tile_mask_out).tobytes())
-            finally:
-                for writer in batch_writers.values():
-                    close_ffmpeg_writer(writer)
-
-    return stats
-
-
 # ---------------------------------------------------------------------------
 # Throughput-first global render scheduler
 # ---------------------------------------------------------------------------
-
 
 
 def build_render_plan(
@@ -2700,176 +2078,6 @@ def iter_render_source_frame_jobs_round_robin(plans: Sequence[RenderPlan]) -> It
                 yield int(plan_idx), int(frame_idx)
 
 
-
-
-def write_full_render_output_from_source(*, plan: RenderPlan, idx: int, source: RenderFrameSource, png_compression: int, warnings: WarningLog) -> None:
-    idx_1 = int(idx) + 1
-    if plan.publish_images:
-        write_image(
-            frame_path_from_pattern(plan.img_pattern, idx_1),
-            source.img_full,
-            int(png_compression),
-            channel_kind=plan.channel_variant.kind,
-        )
-    if plan.label_enabled and plan.publish_labels:
-        write_label_from_mask(
-            source.mask_full,
-            frame_path_from_pattern(plan.lbl_pattern, idx_1),
-            warnings=warnings,
-            context=f"{plan.tag} frame {idx_1:04d}",
-        )
-
-
-def write_tile_render_output_from_source(*, tile: RenderTileItem, idx: int, source: RenderFrameSource, png_compression: int, warnings: WarningLog) -> None:
-    idx_1 = int(idx) + 1
-    shared_arrays = source.tile_arrays.get(str(tile.tile_tag))
-    if shared_arrays is not None:
-        tile_img_out, tile_mask_out = shared_arrays
-    else:
-        if source.img_canvas is None or source.mask_canvas is None:
-            raise RuntimeError(f"Tile output requested without a rendered canvas for {tile.tile_tag}")
-        tile_img = extract_padded_tile(source.img_canvas, tile.x, tile.y, tile.cfg.tile_size)
-        tile_mask = extract_padded_tile(source.mask_canvas, tile.x, tile.y, tile.cfg.tile_size)
-        tile_img_out = resize_centered(tile_img, tile.out_w, tile.out_h, cv2.INTER_LINEAR)
-        tile_mask_out = resize_centered(tile_mask, tile.out_w, tile.out_h, cv2.INTER_NEAREST)
-    if tile.publish_images:
-        write_image(
-            frame_path_from_pattern(tile.img_pattern, idx_1),
-            tile_img_out,
-            int(png_compression),
-            channel_kind=tile.channel_kind,
-        )
-    if tile.label_enabled and tile.publish_labels:
-        write_label_from_mask(
-            tile_mask_out,
-            frame_path_from_pattern(tile.lbl_pattern, idx_1),
-            warnings=warnings,
-            context=f"{tile.tile_tag} frame {idx_1:04d}",
-        )
-
-
-def write_tile_render_outputs_from_source(*, tiles: Sequence[RenderTileItem], idx: int, source: RenderFrameSource, png_compression: int, warnings: WarningLog) -> None:
-    """Write one scheduled tile-frame task, optionally containing a tile chunk.
-
-    ``--tile_task_chunk 1`` exposes every tile frame as its own independent task. Larger
-    chunks are an escape hatch if filesystem/open-file overhead becomes dominant.
-    """
-    for tile in tiles:
-        write_tile_render_output_from_source(tile=tile, idx=int(idx), source=source, png_compression=int(png_compression), warnings=warnings)
-
-
-def render_primary_outputs_global(*, volume: np.ndarray, mask: np.ndarray, plans: Sequence[RenderPlan], png_compression: int, warnings: WarningLog, workers: int, max_pending: int, tile_task_chunk: int = 1) -> None:
-    """Render images/labels with global source-frame and output-frame queues.
-
-    Source-frame jobs do the expensive reslice once for each (view/angle, frame). Full-frame
-    writes and tile writes are then separate output jobs sharing that source frame/canvas.
-    """
-    total_sources = int(sum(len(render_plan_frame_indices(plan)) for plan in plans))
-    tile_chunk = max(1, int(tile_task_chunk))
-    total_outputs = int(sum(len(render_plan_frame_indices(plan)) * (1 + len(plan.tile_layout)) for plan in plans))
-    scheduled_output_tasks = int(sum(
-        len(render_plan_frame_indices(plan))
-        * (1 + int(math.ceil(len(plan.tile_layout) / float(tile_chunk))) if plan.tile_layout else 1)
-        for plan in plans
-    ))
-    if total_sources <= 0 or total_outputs <= 0:
-        return
-
-    worker_budget = max(1, int(workers))
-    source_workers = max(1, min(worker_budget, total_sources))
-    output_workers = max(1, min(worker_budget, total_outputs))
-    requested_window = int(max_pending) if int(max_pending) > 0 else 0
-    source_pending_limit = max(source_workers, requested_window if requested_window > 0 else max(512, source_workers * 4))
-    source_pending_limit = min(max(1, source_pending_limit), total_sources)
-    output_pending_limit = requested_window * 2 if requested_window > 0 else max(1024, output_workers * 8)
-    max_dependents = max(1 + (int(math.ceil(len(plan.tile_layout) / float(tile_chunk))) if plan.tile_layout else 0) for plan in plans)
-    output_pending_limit = max(output_workers, max_dependents, int(output_pending_limit))
-
-    print(
-        f"Global frame scheduler: source_frame_tasks={total_sources}, output_frames={total_outputs}, "
-        f"scheduled_output_tasks={scheduled_output_tasks}, tile_task_chunk={tile_chunk}, "
-        f"source_workers={source_workers}, output_workers={output_workers}, "
-        f"source_window={source_pending_limit}, output_window={output_pending_limit}"
-    )
-
-    source_iter = iter(iter_render_source_frame_jobs_round_robin(plans))
-    pending_sources: Dict[Future, Tuple[int, int]] = {}
-    pending_outputs: set[Future] = set()
-    pending_output_units: Dict[Future, int] = {}
-    exhausted_sources = False
-
-    def _submit_more_sources(source_executor: ThreadPoolExecutor) -> None:
-        nonlocal exhausted_sources
-        while not exhausted_sources and len(pending_sources) < source_pending_limit:
-            try:
-                plan_idx, frame_idx = next(source_iter)
-            except StopIteration:
-                exhausted_sources = True
-                break
-            plan = plans[int(plan_idx)]
-            fut = source_executor.submit(render_plan_frame_source, volume=volume, mask=mask, plan=plan, idx=int(frame_idx))
-            pending_sources[fut] = (int(plan_idx), int(frame_idx))
-
-    def _drain_outputs(pbar: tqdm, *, block: bool) -> None:
-        if not pending_outputs:
-            return
-        if block:
-            done, _ = wait(pending_outputs, return_when=FIRST_COMPLETED)
-        else:
-            done = {fut for fut in pending_outputs if fut.done()}
-        for fut in done:
-            pending_outputs.remove(fut)
-            fut.result()
-            pbar.update(int(pending_output_units.pop(fut, 1)))
-
-    def _submit_output_future(fut: Future, pbar: tqdm, *, units: int = 1) -> None:
-        while len(pending_outputs) >= output_pending_limit:
-            _drain_outputs(pbar, block=True)
-        pending_outputs.add(fut)
-        pending_output_units[fut] = max(1, int(units))
-
-    with ThreadPoolExecutor(max_workers=source_workers, thread_name_prefix="pretrain-source-frame") as source_executor, \
-         ThreadPoolExecutor(max_workers=output_workers, thread_name_prefix="pretrain-output-frame") as output_executor, \
-         tqdm(total=total_outputs, desc=f"Rendering images/labels globally ({len(plans)} variants)") as pbar:
-        _submit_more_sources(source_executor)
-        while pending_sources:
-            done_sources, _ = wait(pending_sources, return_when=FIRST_COMPLETED)
-            for source_future in done_sources:
-                plan_idx, frame_idx = pending_sources.pop(source_future)
-                source = source_future.result()
-                plan = plans[int(plan_idx)]
-
-                _submit_output_future(
-                    output_executor.submit(
-                        write_full_render_output_from_source,
-                        plan=plan,
-                        idx=int(frame_idx),
-                        source=source,
-                        png_compression=int(png_compression),
-                        warnings=warnings,
-                    ),
-                    pbar,
-                )
-                for tile_start in range(0, len(plan.tile_layout), tile_chunk):
-                    tile_chunk_items = plan.tile_layout[tile_start:tile_start + tile_chunk]
-                    _submit_output_future(
-                        output_executor.submit(
-                            write_tile_render_outputs_from_source,
-                            tiles=tile_chunk_items,
-                            idx=int(frame_idx),
-                            source=source,
-                            png_compression=int(png_compression),
-                            warnings=warnings,
-                        ),
-                        pbar,
-                        units=len(tile_chunk_items),
-                    )
-                _drain_outputs(pbar, block=False)
-            _submit_more_sources(source_executor)
-        while pending_outputs:
-            _drain_outputs(pbar, block=True)
-
-
 def parallel_map_ordered_limited(count: int, func: Callable[[int], object], *, workers: int, max_pending: int, desc: str) -> Iterator[object]:
     """Compute frames concurrently but yield results in input order for video writers."""
     total = max(0, int(count))
@@ -3014,165 +2222,10 @@ def write_overlays_global(*, volume: np.ndarray, mask: np.ndarray, plans: Sequen
                 pbar.update(1)
 
 
-def render_all_variants_throughput(*, volume: np.ndarray, mask: np.ndarray, views: Sequence[ViewInfo], angles: Sequence[float], out_dir: Path, stem: str, fps: float, tile_configs: Sequence[TileConfig], save_overlay: bool, overlay_tile_writer_limit: int, png_compression: int, imgsz: int, warnings: WarningLog, workers: int, render_queue_depth: int, overlay_workers: int, overlay_pending_frames: int, tile_task_chunk: int = 1, label_enabled: bool = True, image_format: str = "png") -> List[Dict[str, object]]:
-    plans: List[RenderPlan] = []
-    for view in views:
-        for angle in angles:
-            aff = build_affine(view.src_w, view.src_h, float(angle), view.pad_mode, int(imgsz))
-            tag = make_tag(view, float(angle))
-            plan = build_render_plan(view=view, aff=aff, tag=tag, out_dir=out_dir, stem=stem, tile_configs=tile_configs, save_overlay=bool(save_overlay), imgsz=int(imgsz), label_enabled=bool(label_enabled), image_format=image_format)
-            plans.append(plan)
-
-    total_source_frames = int(sum(len(render_plan_frame_indices(plan)) for plan in plans))
-    total_output_frames = int(sum(len(render_plan_frame_indices(plan)) * (1 + len(plan.tile_layout)) for plan in plans))
-    total_tile_sets = int(sum(len(plan.tile_layout) for plan in plans))
-    tile_chunk = max(1, int(tile_task_chunk))
-    scheduled_output_tasks = int(sum(
-        len(render_plan_frame_indices(plan))
-        * (1 + int(math.ceil(len(plan.tile_layout) / float(tile_chunk))) if plan.tile_layout else 1)
-        for plan in plans
-    ))
-    queue_depth = int(render_queue_depth) if int(render_queue_depth) > 0 else max(512, max(1, int(workers)) * 4)
-
-    print("\n=== Throughput-first render scheduler ===")
-    print(f"Variants: {len(plans)}; source-frame jobs: {total_source_frames}; output-frame jobs: {total_output_frames}; scheduled output tasks: {scheduled_output_tasks}; tile streams: {total_tile_sets}; workers: {int(workers)}; pending source-frame window: {queue_depth}; tile_task_chunk={tile_chunk}")
-    for plan in plans:
-        print(f"  queued {plan.tag}: eligible_frames={len(render_plan_frame_indices(plan))}/{plan.view.num_slices}, canvas={plan.aff.canvas_w}x{plan.aff.canvas_h}, output={plan.aff.out_w}x{plan.aff.out_h}, tiles={len(plan.tile_layout)}")
-        plan.stats["tile_task_chunk"] = int(tile_chunk)
-        plan.stats["source_frame_workers"] = int(workers)
-        plan.stats["output_frame_workers"] = int(workers)
-
-    warnings.add("throughput_scheduler", f"variants={len(plans)}, source_frame_jobs={total_source_frames}, output_frame_jobs={total_output_frames}, scheduled_output_tasks={scheduled_output_tasks}, frame_workers={int(workers)}, queue_depth={queue_depth}, tile_streams={total_tile_sets}, tile_task_chunk={tile_chunk}")
-    render_primary_outputs_global(volume=volume, mask=mask, plans=plans, png_compression=int(png_compression), warnings=warnings, workers=max(1, int(workers)), max_pending=int(queue_depth), tile_task_chunk=int(tile_chunk))
-
-    if bool(save_overlay):
-        write_overlays_global(volume=volume, mask=mask, plans=plans, fps=float(fps), overlay_tile_writer_limit=int(overlay_tile_writer_limit), workers=max(1, int(workers)), overlay_workers=int(overlay_workers), overlay_pending_frames=int(overlay_pending_frames), warnings=warnings)
-
-    return [dict(plan.stats) for plan in plans]
-
-
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
-def write_summary(
-    path: Path,
-    *,
-    command: str,
-    src: SourceVolume,
-    out_dir: Path,
-    source_shape: Tuple[int, int, int],
-    processing_shape: Tuple[int, int, int],
-    effective_volume_class: str,
-    label_enabled: bool,
-    views: Sequence[ViewInfo],
-    tile_configs: Sequence[TileConfig],
-    smoothing_stats: Sequence[Dict[str, int | float]],
-    nrrd_paths: Sequence[Path],
-    voxel_initial: Optional[int],
-    voxel_final: Optional[int],
-    render_stats: Sequence[Dict[str, object]],
-    warnings: WarningLog,
-    workers: int,
-) -> Path:
-    t, h, w = source_shape
-    pt, ph, pw = processing_shape
-    lines: List[str] = []
-    lines.append(f"Specification version: {PIPELINE_SPEC_VERSION}")
-    lines.append(f"Command: {command}")
-    lines.append(f"Input directory: {src.input_dir}")
-    if src.video_path is not None:
-        lines.append(f"Input video: {src.video_path}")
-    if src.segmentation_nrrd_path is not None:
-        lines.append(f"Input NRRD segmentation: {src.segmentation_nrrd_path}")
-    lines.append(f"Output directory: {out_dir}")
-    lines.append(f"Source dimensions (X, Y, t) before cubic resizing: ({int(w)}, {int(h)}, {int(t)})")
-    lines.append(f"Processing dimensions (X, Y, t): ({int(pw)}, {int(ph)}, {int(pt)})")
-    lines.append(f"Source frame count: {int(t)}")
-    lines.append(f"Processing frame count: {int(pt)}")
-    lines.append(f"Input kind: {src.kind}")
-    lines.append(f"Detected volume class: {src.volume_class}")
-    lines.append(f"Effective volume class: {effective_volume_class}")
-    lines.append(f"Label source: {src.label_source}")
-    lines.append(f"Label operations enabled: {bool(label_enabled)}")
-    if src.input_start_index is not None:
-        lines.append(f"Detected input start index: {int(src.input_start_index)}")
-    if src.encoded_indices:
-        encoded = list(src.encoded_indices)
-        if len(encoded) <= 24:
-            lines.append(f"Encoded input indices: {encoded}")
-        else:
-            lines.append(f"Encoded input indices: count={len(encoded)}, first={encoded[:8]}, last={encoded[-8:]}")
-    lines.append(f"FPS for overlay videos: {src.fps}")
-    lines.append(f"Workers: {int(workers)} (0 defaults to the process CPU-affinity count)")
-    lines.append(
-        "Shared forward sampling: TTA hardware-linear radial/intensity policy and "
-        "TTA affine stage; categorical ground truth uses nearest sampling with the "
-        "TTA tilted-stack threshold"
-    )
-    lines.append(f"NRRD export layout: {NRRD_AXIS_ORDER_NOTE}; space={NRRD_SPACE}; space_directions=identity")
-    lines.append("Rotation-angle augmentation: removed in v3.0.0_SLURM")
-    lines.append("Active views:")
-    for v in views:
-        extra = ""
-        if v.family == "radial":
-            spacing = float(v.azimuths_deg[1] - v.azimuths_deg[0]) if len(v.azimuths_deg) > 1 else 0.0
-            extra = (
-                f", azimuth frames={len(v.azimuths_deg)}, azimuth_step={spacing:g}, "
-                f"diameter={v.diameter}, image_sampling={shared_geometry.RADIAL_FILTER_MODE}, "
-                "categorical_sampling=nearest"
-            )
-        if v.family == "tilted_transverse":
-            extra = f", direction={v.tilt_direction}, signed_tilt={v.tilt_angle_deg:g}"
-        lines.append(f"  {v.display_name}: frames={int(v.num_slices)}, source_plane=({int(v.src_w)}x{int(v.src_h)}){extra}")
-    if tile_configs:
-        lines.append("Tile configurations:")
-        for cfg in tile_configs:
-            lines.append(f"  {cfg.config_id}: tile_size={cfg.tile_size}, tile_stride={cfg.tile_stride}")
-    else:
-        lines.append("Tile configurations: disabled")
-
-    if voxel_initial is not None or voxel_final is not None:
-        lines.append("")
-        lines.append("--voxel_volume:")
-        if voxel_initial is not None:
-            lines.append(f"  initial_rasterized_transverse_mask: {int(voxel_initial)}")
-        if voxel_final is not None:
-            lines.append(f"  final_mask_after_gaussian_smoothing: {int(voxel_final)}")
-
-    lines.append("")
-    if smoothing_stats:
-        lines.append("Gaussian smoothing:")
-        for st in smoothing_stats:
-            lines.append(
-                f"  pass {int(st.get('pass_index', 0))}: sigma={float(st.get('sigma', 0.0)):g}, "
-                f"foreground_before={int(st.get('foreground_before', 0))}, "
-                f"foreground_after={int(st.get('foreground_after', 0))}, "
-                f"delta_voxels={int(st.get('delta_voxels', 0))}"
-            )
-    else:
-        lines.append("Gaussian smoothing: disabled, not requested, or unavailable for this input class")
-
-    if nrrd_paths:
-        lines.append("")
-        lines.append("NRRD outputs:")
-        for p in nrrd_paths:
-            lines.append(f"  {p}")
-
-    lines.append("")
-    lines.append("Rendered output sets:")
-    for st in render_stats:
-        lines.append(
-            f"  {st.get('tag')}: view={st.get('view')}, frames={st.get('frames')}, "
-            f"full_output_size={st.get('full_output_size')}, tiles={len(st.get('tiles', []))}, "
-            f"label_enabled={st.get('label_enabled')}"
-        )
-
-    lines.append("")
-    lines.extend(warnings.summary_lines())
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n")
-    return path
 
 # ---------------------------------------------------------------------------
 # Multi-volume planning, filtering, splitting, augmentation, and rendering
@@ -3221,7 +2274,6 @@ class PreparedVolume:
     volume_render_block: Optional[SharedBlock] = None
     mask_render_block: Optional[SharedBlock] = None
     shm_blocks: List[SharedBlock] = field(default_factory=list)
-    v18_mode: bool = False
 
 
 @dataclass
@@ -3981,7 +3033,7 @@ def build_plans_for_views(
             int(imgsz),
             shared_view=view.shared_view,
         )
-        base_tag = make_tag(view, 0.0)
+        base_tag = view.display_name
         is_transverse = view.family == "transverse"
         if is_transverse and normalized_base_centers is not None:
             if any(x < 0 or x >= int(view.num_slices) for x in normalized_base_centers):
@@ -4083,8 +3135,6 @@ def prepare_loaded_source(
     out_dir: Path,
     tile_configs: Sequence[TileConfig],
     channel_variants: Sequence[ChannelVariant],
-    requested_tilt_angles: Sequence[float],
-    requested_tilt_directions: Sequence[str],
     write_side_effects: bool,
     allocator: Optional[ArrayAllocator] = None,
 ) -> PreparedVolume:
@@ -4399,36 +3449,6 @@ def prepare_loaded_source(
         volume_render_block=volume_render_block,
         mask_render_block=mask_render_block,
         shm_blocks=owned_blocks,
-        v18_mode=True,
-    )
-
-
-def prepare_volume(
-    spec: VolumeInputSpec,
-    *,
-    args: argparse.Namespace,
-    warnings: WarningLog,
-    workers: int,
-    out_dir: Path,
-    tile_configs: Sequence[TileConfig],
-    channel_variants: Sequence[ChannelVariant],
-    requested_tilt_angles: Sequence[float],
-    requested_tilt_directions: Sequence[str],
-    write_side_effects: bool,
-) -> PreparedVolume:
-    """Compatibility wrapper for callers that do not use raw-volume prefetch."""
-    src = load_source_volume_from_spec(spec, warnings=warnings, workers=workers)
-    return prepare_loaded_source(
-        src,
-        args=args,
-        warnings=warnings,
-        workers=workers,
-        out_dir=out_dir,
-        tile_configs=tile_configs,
-        channel_variants=channel_variants,
-        requested_tilt_angles=requested_tilt_angles,
-        requested_tilt_directions=requested_tilt_directions,
-        write_side_effects=write_side_effects,
     )
 
 
@@ -4440,9 +3460,10 @@ def mask_has_yolo_polygon(mask01: np.ndarray) -> bool:
     nonzero = int(np.count_nonzero(m))
     if nonzero == 0:
         return False
-    # Masks with a healthy pixel count always survive the contour
-    # export; the full findContours/approxPolyDP check is reserved for the
-    # degenerate gray zone where a 1-2 px line could still be demoted.
+    # Larger masks are provisionally foreground for candidate budgeting.
+    # Publication still validates their contours; sparse or fragmented masks
+    # can be demoted there even when their total pixel count exceeds this cap.
+    # Check small masks here, where short lines often fail polygon export.
     if nonzero >= MASK_POLYGON_FAST_FOREGROUND_MIN_PIXELS:
         return True
     contours, hierarchy = cv2.findContours(m * 255, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
@@ -4458,8 +3479,6 @@ def mask_has_yolo_polygon(mask01: np.ndarray) -> bool:
         if approx is not None and len(approx) >= 3:
             return True
     return False
-
-
 
 
 def _source_frames_for_processed_transverse(prep: PreparedVolume, frame_idx: int) -> range:
@@ -4798,11 +3817,11 @@ def validate_foreground_transverse_candidate_invariant(
 ) -> int:
     """Verify full-frame foreground transverse outputs never shrink in count."""
     input_count = int(prep.foreground_preservation_stats.get("input_foreground_transverse_slices", 0))
-    # Transverse is no longer privileged in v18.  A zero-view PTA run, or a
+    # A zero-view PTA run, or a
     # run containing only non-transverse views, is valid and intentionally has
     # no transverse candidate against which this preservation invariant
     # can be evaluated.
-    if bool(prep.v18_mode) and not any(
+    if not any(
         plan.view.family == "transverse" for plan in prep.plans
     ):
         key = (
@@ -4933,8 +3952,6 @@ def trim_background_overage_after_flips(
             f"{subset_name}: flips={flips}, realized_foreground={realized_foreground}, deleted_backgrounds={excess}",
         )
     return total_deleted
-
-
 
 
 _GENERATED_OUTPUT_DIR_NAMES = (
@@ -5568,6 +4585,9 @@ def main(
             "PTA requires a resolved runtime configuration; launch through "
             f"{SCRIPT_BASENAME} --mode pta"
         )
+    v18_config = getattr(args, "_v18_config", None)
+    if v18_config is None:
+        raise TypeError("PTA requires a resolved PtaConfig")
     warnings = WarningLog()
     workers = choose_workers(int(args.workers))
     frame_workers = max(1, int(args.frame_workers) if int(args.frame_workers) > 0 else int(workers))
@@ -5594,8 +4614,6 @@ def main(
         print(f"WARNING: {force_message}", file=sys.stderr)
     if int(args.imgsz) < 0:
         raise ValueError("--imgsz must be >= 0")
-    if args.azimuth_angle is not None and float(args.azimuth_angle) < 0.0:
-        raise ValueError("--azimuth_angle must be >= 0")
     if float(args.gaussian_smoothing) < 0.0:
         raise ValueError("--gaussian_smoothing must be >= 0; use 0 to disable")
     if int(args.gaussian_smoothing_passes) < 0:
@@ -5651,20 +4669,14 @@ def main(
         warnings=warnings,
         device_ids=getattr(args, "device_ids", None),
     )
-    requested_tilt_angles = resolve_tilt_angles(args.tilt_angle)
-    requested_tilt_directions = resolve_tilt_directions(args.tilt_direction)
-    v18_config = getattr(args, "_v18_config", None)
-    if v18_config is not None:
-        tile_configs = [
-            TileConfig(
-                int(tile.tile_size),
-                int(tile.tile_stride),
-                str(tile.config_id),
-            )
-            for tile in v18_config.tiles
-        ]
-    else:
-        tile_configs = resolve_tile_configs(args.tile_size, args.tile_stride)
+    tile_configs = [
+        TileConfig(
+            int(tile.tile_size),
+            int(tile.tile_stride),
+            str(tile.config_id),
+        )
+        for tile in v18_config.tiles
+    ]
     augmentation_definition = inspect_augmentation_definition(args.augmentation) if args.augmentation else None
     augmentation = (
         load_offline_augmentation_definition(args.augmentation)
@@ -5807,27 +4819,19 @@ def main(
     input_dir = Path(args.input).expanduser().resolve()
     default_output = Path.cwd() / input_dir.name
     out_dir = Path(args.output).expanduser().resolve() if args.output else default_output
-    done_dir = out_dir / ".volume_done"
-    v18_active = getattr(args, "_v18_config", None) is not None
-    v18_input_identities: Optional[List[Dict[str, object]]] = None
-    if v18_active:
-        v18_input_identities = capture_v18_pta_input_identities(specs)
-        validate_fresh_output_safety(
-            out_dir,
-            input_dir=input_dir,
-            specs=specs,
-            augmentation_path=(
-                augmentation_definition.path
-                if augmentation_definition is not None
-                else None
-            ),
-        )
-    if bool(args.resume) and not v18_active:
-        out_dir.mkdir(parents=True, exist_ok=True)
-    else:
-        clean_generated_output_dirs(out_dir)
-        if v18_active:
-            write_v18_output_sentinel(out_dir)
+    v18_input_identities = capture_v18_pta_input_identities(specs)
+    validate_fresh_output_safety(
+        out_dir,
+        input_dir=input_dir,
+        specs=specs,
+        augmentation_path=(
+            augmentation_definition.path
+            if augmentation_definition is not None
+            else None
+        ),
+    )
+    clean_generated_output_dirs(out_dir)
+    write_v18_output_sentinel(out_dir)
 
     labels_available = all(spec.label_source in {"yolo", "nrrd"} and spec.volume_class != "unlabeled" for spec in specs)
     create_output_dirs(
@@ -5851,10 +4855,7 @@ def main(
             "A training-loader hook is required to consume it."
         )
 
-    completed_stems: set[str] = set()
-    if bool(args.resume) and not v18_active and done_dir.exists():
-        completed_stems = {p.stem for p in done_dir.glob("*.json")}
-    pending_specs = [spec for spec in specs if spec.stem not in completed_stems]
+    pending_specs = specs
     effective_pipeline_depth = int(args.pipeline_depth)
     if effective_pipeline_depth >= 2 and len(pending_specs) > 1:
         available_bytes = available_memory_budget_bytes()
@@ -5873,10 +4874,6 @@ def main(
             )
             warnings.add("pipeline_depth_reduced_for_memory", message)
             print(f"WARNING: {message}", file=sys.stderr)
-    skipped_completed = len(specs) - len(pending_specs)
-    if skipped_completed:
-        print(f"Resume: skipping {skipped_completed} completed volume(s); {len(pending_specs)} remaining")
-        warnings.add("resume_skipped_completed_volumes", f"{skipped_completed} volume(s) had {done_dir.name} markers")
 
     print(f"Discovered {len(specs)} volume(s): " + ", ".join(f"{s.stem}:{s.volume_class}/{s.kind}/{s.label_source}" for s in specs))
     print(
@@ -6071,8 +5068,6 @@ def main(
                 out_dir=out_dir,
                 tile_configs=tile_configs,
                 channel_variants=channel_variants,
-                requested_tilt_angles=requested_tilt_angles,
-                requested_tilt_directions=requested_tilt_directions,
                 write_side_effects=True,
                 allocator=volume_allocator,
             )
@@ -6381,23 +5376,8 @@ def main(
                 _accumulate_split_stats(total_split_stats, state["split_stats"])  # type: ignore[arg-type]
             warnings.merge_from(vol_warnings)
 
-            if not v18_active:
-                done_dir.mkdir(parents=True, exist_ok=True)
-                marker = {
-                    "stem": str(spec.stem),
-                    "pipeline_spec_version": PIPELINE_SPEC_VERSION,
-                    "candidates_total": len(cands),
-                    "candidates_retained": int(len(retained)),
-                    "candidates_written": int(written_effective),
-                    "flip_dropped": int(flip_dropped),
-                    "background_withheld_after_flips": int(withheld),
-                    "background_trimmed_after_flips": int(trimmed),
-                    "completed_at_unix": float(time.time()),
-                }
-                (done_dir / f"{spec.stem}.json").write_text(json.dumps(marker, indent=2) + "\n")
-            completion_metric = "processed" if v18_active else "written"
             print(
-                f"{spec.stem}: volume complete; {completion_metric}={written_effective}, "
+                f"{spec.stem}: volume complete; processed={written_effective}, "
                 f"flip_dropped={flip_dropped}, background_withheld={withheld}, "
                 f"background_trimmed={trimmed}"
             )
@@ -6459,10 +5439,7 @@ def main(
             if not load_executor_stopped:
                 load_executor.shutdown(wait=False, cancel_futures=True)
     else:
-        if v18_active:
-            print("No render items were scheduled; zero-view PTA completed successfully")
-        else:
-            print("All volumes already have completion markers; nothing to render")
+        print("No render items were scheduled; zero-view PTA completed successfully")
 
     if total_augmentation_stats.eligible_originals > 0:
         total_augmentation_stats.achieved_ratio = (
@@ -6504,7 +5481,7 @@ def main(
         "verified_image_count": 0,
         "verified_total_bytes": 0,
     }
-    if v18_active and bool(getattr(args, "save_images", True)):
+    if bool(getattr(args, "save_images", True)):
         publication_integrity = verify_published_image_tree(
             out_dir,
             expected_count=int(total_written),
@@ -6527,8 +5504,6 @@ def main(
                     *(str(x) for x in cli_argv),
                 ]
             )
-            if v18_active
-            else shlex.join([str(sys.argv[0]), *(str(x) for x in cli_argv)])
         )
         summary_path = write_pta_summary(
             out_dir / "summary.txt",
@@ -6560,70 +5535,54 @@ def main(
             tiff_encode_backend=str(getattr(args, "tiff_encode_backend", "auto")),
         )
 
-    manifest_path: Optional[Path] = None
     voxel_report_path: Optional[Path] = None
-    if v18_active:
-        if bool(getattr(args, "voxel_volume", False)):
-            voxel_report_path = write_v18_voxel_volume_report(
-                out_dir / "voxel_volume.json",
-                volume_records,
-            )
-        _cleanup_v18_pta_selected_run_work(out_dir / ".v18_work")
-        if v18_input_identities is None:  # pragma: no cover - launch invariant
-            raise RuntimeError("PTA input identities were not captured")
-        assert_v18_pta_inputs_unchanged(v18_input_identities)
-        assert_augmentation_definition_unchanged(augmentation_definition)
-        # This is deliberately the final selected artifact: a complete manifest
-        # can never describe a run whose summary/voxel publication or cleanup failed.
-        manifest_path = write_v18_pta_manifest(
-            out_dir / "manifest.json",
-            args=args,
-            cli_argv=cli_argv,
-            specs=specs,
-            records=volume_records,
-            channel_variants=channel_variants,
-            tile_configs=tile_configs,
-            augmentation_stats=total_augmentation_stats,
-            total_written=int(total_written),
-            input_identities=v18_input_identities,
-            render_backend=str(render_backend),
-            workers=int(workers),
-            frame_workers=int(frame_workers),
-            planning_workers=int(planning_workers),
-            topology_summary=str(topology.summary),
-            summary_path=summary_path,
-            voxel_report_path=voxel_report_path,
-            dataset_yaml_path=dataset_yaml_path,
-            publication_integrity=publication_integrity,
+    if bool(getattr(args, "voxel_volume", False)):
+        voxel_report_path = write_v18_voxel_volume_report(
+            out_dir / "voxel_volume.json",
+            volume_records,
         )
+    _cleanup_v18_pta_selected_run_work(out_dir / ".v18_work")
+    assert_v18_pta_inputs_unchanged(v18_input_identities)
+    assert_augmentation_definition_unchanged(augmentation_definition)
+    # This is deliberately the final selected artifact: a complete manifest
+    # can never describe a run whose summary/voxel publication or cleanup failed.
+    manifest_path = write_v18_pta_manifest(
+        out_dir / "manifest.json",
+        args=args,
+        cli_argv=cli_argv,
+        specs=specs,
+        records=volume_records,
+        channel_variants=channel_variants,
+        tile_configs=tile_configs,
+        augmentation_stats=total_augmentation_stats,
+        total_written=int(total_written),
+        input_identities=v18_input_identities,
+        render_backend=str(render_backend),
+        workers=int(workers),
+        frame_workers=int(frame_workers),
+        planning_workers=int(planning_workers),
+        topology_summary=str(topology.summary),
+        summary_path=summary_path,
+        voxel_report_path=voxel_report_path,
+        dataset_yaml_path=dataset_yaml_path,
+        publication_integrity=publication_integrity,
+    )
 
     print("\nDone.")
     print(f"Output directory: {out_dir}")
-    if v18_active:
-        print(
-            f"Candidate versions processed this run: {total_written} "
-            f"(flip-dropped augmented copies: {total_flip_dropped}, "
-            f"backgrounds withheld pre-render: {total_background_withheld})"
-        )
-        print(
-            "PTA publication tokens: "
-            + (", ".join(getattr(args._v18_config.save, "tokens", ())) or "none")
-        )
-    else:
-        print(
-            f"Dataset samples written this run: {total_written} "
-            f"(flip-dropped augmented copies: {total_flip_dropped}, "
-            f"backgrounds withheld pre-render: {total_background_withheld})"
-        )
+    print(
+        f"Candidate versions processed this run: {total_written} "
+        f"(flip-dropped augmented copies: {total_flip_dropped}, "
+        f"backgrounds withheld pre-render: {total_background_withheld})"
+    )
+    print(
+        "PTA publication tokens: "
+        + (", ".join(getattr(args._v18_config.save, "tokens", ())) or "none")
+    )
     if dataset_yaml_path is not None:
         print(f"Dataset YAML: {dataset_yaml_path}")
     if summary_path is not None:
         print(f"Summary: {summary_path}")
-    if manifest_path is not None:
-        print(f"Manifest: {manifest_path}")
+    print(f"Manifest: {manifest_path}")
     if voxel_report_path is not None:
         print(f"Voxel-count report: {voxel_report_path}")
-
-
-if __name__ == "__main__":
-    main()

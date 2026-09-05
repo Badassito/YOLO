@@ -8,9 +8,9 @@ from XTA import cli, config
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CURRENT_VERSION = "19.0.2"
-CURRENT_LAUNCHER = "GPT-5.6-Sol-Ultra_v19.0.2_SLURM.py"
-PREVIOUS_LAUNCHER = "GPT-5.6-Sol-Ultra_v19.0.1_SLURM.py"
+CURRENT_VERSION = "19.0.3"
+CURRENT_LAUNCHER = "GPT-6-Astra-Ultra_v19.0.3_SLURM.py"
+PREVIOUS_LAUNCHER = "GPT-5.6-Sol-Ultra_v19.0.2_SLURM.py"
 
 
 def _toml_section(source: str, name: str) -> str:
@@ -25,7 +25,7 @@ class PackageMetadataTests(unittest.TestCase):
     def test_runtime_version_constants_are_aligned(self) -> None:
         self.assertEqual(XTA.__version__, CURRENT_VERSION)
         self.assertEqual(config.SCRIPT_VERSION, CURRENT_VERSION)
-        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "1902")
+        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "1903")
         self.assertEqual(config.SCRIPT_BASENAME, CURRENT_LAUNCHER)
         self.assertEqual(cli.SCRIPT_VERSION, CURRENT_VERSION)
         self.assertEqual(cli.SCRIPT_BASENAME, CURRENT_LAUNCHER)
@@ -81,6 +81,10 @@ class PackageMetadataTests(unittest.TestCase):
         self.assertTrue((ROOT / "tools" / "lta_full_volume.py").is_file())
         self.assertTrue((ROOT / "tools" / "lta_tracklet_pair.py").is_file())
         self.assertTrue((ROOT / CURRENT_LAUNCHER).is_file())
+        self.assertEqual(
+            sorted(path.name for path in ROOT.glob('*_SLURM.py')),
+            [CURRENT_LAUNCHER],
+        )
         self.assertFalse((ROOT / PREVIOUS_LAUNCHER).exists())
         self.assertFalse((ROOT / "GPT-5.6-Sol-Ultra_v18.0.3_SLURM.py").exists())
         self.assertFalse((ROOT / "GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py").exists())

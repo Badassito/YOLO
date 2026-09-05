@@ -61,7 +61,6 @@ from .runtime import (
     choose_parallel_chunk_size,
     choose_slice_parallel_workers,
     close_memmap_array,
-    flush_array,
     parallel_for_indices,
     parallel_for_indices_chunked,
     runtime_telemetry,
@@ -4695,7 +4694,6 @@ def resize_gray_volume_to_shape(
     # downbin on an idle GPU when possible; the per-slice CPU path below is
     # the unchanged fallback (it rewrites every slice, so a failed GPU pass cannot leak).
     if _try_gpu_downbin_volume(volume_gray, out_mm, 'gray'):
-        flush_array(out_mm)
         return out_mm
 
     worker_count = choose_slice_parallel_workers(int(workers), int(out_t))
@@ -4727,7 +4725,6 @@ def resize_gray_volume_to_shape(
         chunk_size=chunk_size,
         show_progress=True,
     )
-    flush_array(out_mm)
     return out_mm
 
 def resize_binary_mask_volume_to_shape(
@@ -4755,7 +4752,6 @@ def resize_binary_mask_volume_to_shape(
     )
     # downbin on an idle GPU when possible; CPU fallback below is unchanged.
     if _try_gpu_downbin_volume(mask_u8, out_mm, 'mask'):
-        flush_array(out_mm)
         return out_mm
 
     worker_count = choose_slice_parallel_workers(int(workers), int(out_t))
@@ -4797,7 +4793,6 @@ def resize_binary_mask_volume_to_shape(
         chunk_size=chunk_size,
         show_progress=True,
     )
-    flush_array(out_mm)
     return out_mm
 
 def x264_preset() -> str:

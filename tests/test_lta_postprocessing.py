@@ -61,9 +61,6 @@ def _fake_operations(
             output.fill(0)
         return output
 
-    def flush(_volume: object, **_kwargs: object) -> None:
-        events.append("flush")
-
     def close(volume: object) -> None:
         closed.append(volume)
 
@@ -105,7 +102,6 @@ def _fake_operations(
 
     return subject.LtaFinalizationOperations(
         allocate_workspace_array=allocate,
-        flush_array=flush,
         close_volume=close,
         fill_3d_voids=void,
         apply_gaussian_smoothing=gaussian,

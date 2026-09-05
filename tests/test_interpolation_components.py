@@ -555,7 +555,6 @@ class InterpolationComponentDecompositionTests(unittest.TestCase):
                 store_dir=store_path,
                 format_name=interpolation.CVOL_FORMAT,
                 desc='empty test component',
-                force_path_backed=True,
             )
             writer.consume_empty_range(0, 3)
             writer.finalize()
@@ -566,6 +565,11 @@ class InterpolationComponentDecompositionTests(unittest.TestCase):
             view = types.SimpleNamespace(
                 name='transverse__tta_r000p000',
                 family='orthogonal',
+                src_h=5,
+                src_w=5,
+                full_t=3,
+                full_h=5,
+                full_w=5,
                 tta_aug_id='r000p000',
                 tta_angle_deg=0.0,
             )

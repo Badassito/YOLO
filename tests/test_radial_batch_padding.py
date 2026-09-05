@@ -172,7 +172,6 @@ class RadialBatchPaddingTests(unittest.TestCase):
             mock.patch.object(inference, '_direct_predict_applicable', return_value=False),
             mock.patch.object(inference, '_try_create_device_union_accumulator', return_value=None),
             mock.patch.object(inference, 'gpu_retina_flatten_enabled', return_value=False),
-            mock.patch.object(inference, 'prediction_hot_path_flush_enabled', return_value=False),
             mock.patch.object(inference.cv2, 'warpAffine', side_effect=fake_warp),
         ):
             stats = inference.predict_source_and_accumulate(

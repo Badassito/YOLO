@@ -18,7 +18,7 @@ from collections import Counter, deque
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -2908,8 +2908,8 @@ class TtaScheduler:
         track_thread(push_drain_thread, state.push_drain_stop)
         push_drain_thread.start()
         print(
-            "Scheduler push drain active (v13.3.8 G1; results handled the instant they "
-            "arrive; YOLO_TTA_SCHEDULER_PUSH_DRAIN=0 restores polling)."
+            "Scheduler push drain active: arriving results wake the scheduler, "
+            "which owns result handling; YOLO_TTA_SCHEDULER_PUSH_DRAIN=0 selects polling."
         )
 
     def wake_scheduler(self, _future: object = None) -> None:

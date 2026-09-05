@@ -68,10 +68,8 @@ from .runtime import (
     choose_slice_parallel_workers,
     close_memmap_array,
     close_memmap_array_without_flush,
-    flush_array,
     parallel_for_indices,
     parallel_for_indices_chunked,
-    prediction_volume_build_flush_enabled,
 )
 from .media import (
     wait_for_volume_ready,
@@ -4297,8 +4295,6 @@ def _materialize_prediction_volume_from_renderer(
         show_progress=bool(show_progress),
         chunk_size=chunk_size,
     )
-    if prediction_volume_build_flush_enabled():
-        flush_array(pred_volume)
     return PredictionVolumeRef(
         array=pred_volume,
         path=out_path if isinstance(pred_volume, np.memmap) else None,
@@ -4447,7 +4443,6 @@ def build_view_frame_cache(
         desc=f'Caching {view.name} native frames',
         show_progress=False,
     )
-    flush_array(cache_mm)
     return cache_mm
 
 _CORONAL_BLOCK_CACHE: 'OrderedDict[Tuple[int, Tuple[int, int, int], int], np.ndarray]' = OrderedDict()

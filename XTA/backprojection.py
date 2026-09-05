@@ -60,7 +60,6 @@ from .runtime import (
     choose_slice_parallel_workers,
     close_memmap_array,
     close_memmap_array_without_flush,
-    flush_array,
     gpu_worker_aux_interpolation_pool,
     parallel_for_indices,
     parallel_for_indices_chunked,
@@ -3268,7 +3267,6 @@ def _backproject_cartesian_radial_generic(
             required=bool(sink_only),
         )
         if out is not None:
-            flush_array(out)
             return out
         return SinkOnlyProjectionResult(tuple(int(v) for v in target_shape))
 
@@ -3299,7 +3297,6 @@ def _backproject_cartesian_radial_generic(
             show_progress=True,
             target_chunks_per_worker=4,
         )
-        flush_array(out)
         if projection_block_callback is not None:
             block = max(1, _env_int('YOLO_TTA_PROJECTION_CALLBACK_BLOCK', 64))
             for t0 in range(0, int(target_shape[0]), block):
@@ -3461,7 +3458,6 @@ def _backproject_tilted_radial_volume_to_volume(
             prefer_memfd=bool(prefer_memory),
             reserve_bytes=int(reserve_bytes),
         )
-        flush_array(destination)
         return destination
 
     plane_h, plane_w = (int(tilted_source.src_h), int(tilted_source.src_w))
@@ -3616,7 +3612,6 @@ def _backproject_tilted_radial_volume_to_volume(
             show_progress=True,
             target_chunks_per_worker=4,
         )
-        flush_array(destination)
         if projection_block_callback is not None:
             block = max(1, _env_int('YOLO_TTA_PROJECTION_CALLBACK_BLOCK', 64))
             for t0 in range(0, int(t_dim), int(block)):
@@ -3678,7 +3673,6 @@ def _backproject_tilted_radial_volume_to_volume(
                 out_h=int(out_h), packed_w=int(packed_w),
             )
 
-        flush_array(packed_destination)
         target_block_bytes = max(
             16 * 1024 * 1024,
             int(max(16.0, _env_float('YOLO_TTA_TILTED_RADIAL_SINK_BLOCK_MIB', 256.0)) * 1024 * 1024),
@@ -3815,7 +3809,6 @@ def backproject_radial_volume_to_volume(
             required=bool(sink_only),
         )
         if vol_mm is not None:
-            flush_array(vol_mm)
             return vol_mm
         return SinkOnlyProjectionResult((int(t_dim), int(out_h), int(out_w)))
 
@@ -3995,7 +3988,6 @@ def backproject_radial_volume_to_volume(
             _release_parallel_pool(stage_workers, stage_pool)
 
     if vol_mm is not None:
-        flush_array(vol_mm)
         return vol_mm
     return SinkOnlyProjectionResult((int(t_dim), int(out_h), int(out_w)))
 
@@ -4085,7 +4077,6 @@ def backproject_tilted_volume_to_volume(
                 show_progress=True,
                 target_chunks_per_worker=2,
             )
-            flush_array(restored_mm)
             restore_succeeded = True
             return restored_mm
         finally:
@@ -4241,7 +4232,6 @@ def backproject_tilted_volume_to_volume(
         target_chunks_per_worker=4,
     )
 
-    flush_array(vol_mm)
     return vol_mm
 
 @dataclass(frozen=True)

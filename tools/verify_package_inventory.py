@@ -16,6 +16,43 @@ MANIFEST = PACKAGE / "_package_inventory.json"
 
 # These definitions have reviewed, intentional implementation changes.
 INTENTIONALLY_CHANGED = {
+    ("assembly", "materialize_interpolation_component_nrrd_view_layer"),
+    ("assembly", "project_view_volume_to_orthogonal_volume"),
+    ("backprojection", "_backproject_cartesian_radial_generic"),
+    ("backprojection", "_backproject_tilted_radial_volume_to_volume"),
+    ("backprojection", "backproject_radial_volume_to_volume"),
+    ("cuda_backend", "union_conf_volume_into_volume_inplace"),
+    ("cuda_d1", "_d1_finalize_bitset_layer"),
+    ("finalization", "_v14_apply_component_removal_plan"),
+    ("finalization", "union_volume_into_volume"),
+    ("inference", "cleanup_view_volume_after_prediction_inplace"),
+    ("inference", "fill_view_volume_holes_2d_inplace"),
+    ("inference", "fused_slice_cleanup_inplace"),
+    ("interpolation", "IncrementalRawBBoxMaskStoreWriter"),
+    ("interpolation", "_build_linear_slice_bridge_plan"),
+    ("interpolation", "_component_record_mirrored_u"),
+    ("interpolation", "_drain_volume_to_mmap"),
+    ("interpolation", "_estimate_linear_slice_bridge_min_radius_from_plan"),
+    ("interpolation", "_write_raw_bbox_payload_store"),
+    ("interpolation", "materialize_raw_bbox_mask_store_workspace"),
+    ("interpolation", "write_raw_bbox_mask_store"),
+    ("media", "LazyProcessingCube"),
+    ("media", "decode_video_to_memmap_gray8"),
+    ("media", "resize_categorical_volume_to_processing_cube_uint8"),
+    ("media", "resize_volume_t_axis_only_gray8_slab"),
+    ("media", "resize_volume_to_processing_cube_gray8"),
+    ("media", "restore_mask_volume_to_original_shape"),
+    ("media", "should_resize_to_processing_cube"),
+    ("outputs", "resize_binary_mask_volume_to_shape"),
+    ("outputs", "resize_gray_volume_to_shape"),
+    ("pipeline", "_main_impl"),
+    ("runtime", "_ensure_process_backed_interpolation_volume"),
+    ("runtime", "_mount_fstype_for_path"),
+    ("runtime", "close_memmap_array"),
+    ("runtime", "open_raw_store_payload_writer"),
+    ("topology", "fill_3d_voids_inplace_streaming"),
+    ("topology", "_adjacent_gid_pair_codes"),
+    ("topology", "label_foreground_volume_streaming"),
     ("backprojection", "_MainProcessGpuStageCoordinator"),
     ("backprojection", "_ResidentTensorRTRingExecutor"),
     ("backprojection", "_radial_resident_backproject_kernel"),
@@ -110,9 +147,6 @@ INTENTIONALLY_CHANGED = {
     ("runtime", "interpolation_process_start_method"),
     ("runtime", "reset_runtime_state_for_new_run"),
     ("runtime", "RuntimeTelemetry"),
-    ("runtime", "prediction_hot_path_flush_enabled"),
-    ("runtime", "prediction_volume_build_flush_enabled"),
-    ("runtime", "raw_store_memfd_enabled"),
     ("workers", "run_prediction_volume_in_worker"),
     ("workers", "_gpu_inference_worker_main"),
     ("workers", "_OpenVinoCpuSegmenter"),
@@ -188,7 +222,7 @@ LOCAL_IMPORT_SEAM_MARKER = "# Local import keeps the package dependency graph ac
 # already-existing local import without review.
 REVIEWED_LOCAL_IMPORT_SEAMS = {
     ("assembly", "prepare_view_volume_after_fullframe"): (
-        "97fba54f3926ed644b98139bf880f6d37f711afd4f8b6ad2d15c064e394755fe",
+        "522ac34c3728f76e0f762fd8142c699f519b8d3f6d3820563c0d18a5267eb53b",
         "ef76a565816d431f18d15e145b7a2c42ffd316df45905e9daee00b8b5fd26477",
     ),
     ("assembly", "finalize_consolidated_tile_volume_for_parent"): (
@@ -196,7 +230,7 @@ REVIEWED_LOCAL_IMPORT_SEAMS = {
         "c955712cc1202c0be55b529d57026f25537c1d43e0e9c692ad6cdc85b3b913f5",
     ),
     ("backprojection", "backproject_tilted_volume_to_volume"): (
-        "7d3d558f67fad8df3dacb4fe385e7f4d2d600fe63a815c63cf414b9a8d66044a",
+        "ae645bd53d368d0216171d90afe0bef10b7b1dd1dee80499b0eca6f0c8d49a9c",
         "101a6fb2b4446cf0d71be4e025f1224cfecb863185f21e3482bfcfc9cf3a3231",
     ),
     ("cuda_backend", "_GpuWorkerRenderEngine"): (
@@ -224,7 +258,7 @@ REVIEWED_LOCAL_IMPORT_SEAMS = {
         "857b70aaccd5a89c0104cd8a7bb39fea7e92d30adc84025789fc7f03cfc81eb4",
     ),
     ("geometry", "_materialize_prediction_volume_from_renderer"): (
-        "f0200aabbc1545106e922801809d78c8a64b33135149f95303343f68551cfad5",
+        "bb7809a0a676d84e97740ae2a38de8732cab4cea0c6a2c3b9b74ad41e1f7bf01",
         "4a8cb9169fcfbc4bf1fa1658615d8f3ae1377e8ac32cc1aeaa65707f37e22cd3",
     ),
     ("inference", "infer_yolo_model_input_channels"): (
@@ -232,7 +266,7 @@ REVIEWED_LOCAL_IMPORT_SEAMS = {
         "d0e25f9ae060e0c7d74bece86ae3befb49f781d4a703061bb311fcb2c8d4f410",
     ),
     ("inference", "predict_source_and_accumulate"): (
-        "87ba0521c2b55f8f55f85eba1d77c0e654bfda5629f5d895a914709812708ea2",
+        "2289ccc6dda3e1fb044716f8385b98fe83d4e83f6256bab0f0a19570a591b52a",
         "ccf37e9656817910658d67d9c07dd114ce6eb29a820fda1bfa904ac246d955d8",
     ),
     ("inference", "predict_source_and_submit_accumulation"): (
@@ -252,11 +286,11 @@ REVIEWED_LOCAL_IMPORT_SEAMS = {
         "94740a539572d09297cb90016159014fc849ececb6d5c529e605783041542bfd",
     ),
     ("interpolation", "_build_slice_endpoint_seeds"): (
-        "fc5d6a613a8cd296ee5723e56650361859962addc085e130d3cb70d47946eb7e",
+        "395fce80fd60d367237ff7400ed4a8ff1f3d27774e9ccdec8e3f3bdab1e89757",
         "126545d0d25722c4df5918428643130e3c6a1eb639a0c61476fd7a259ad57cdf",
     ),
     ("interpolation", "interpolate_view_volume_pass_inplace"): (
-        "e3237a0bc75ac02db2fb5d0094087991e2e81bc0df6528329eb2d57f8ddfd771",
+        "9525852063bb43270d246291586dc3f1b62a20ede847518854a6df6fd9fb0d47",
         "0a585dbad86412327820dccb21e479e86057fa65bb0ae01a016b198238a3f661",
     ),
     ("interpolation", "RawBBoxMaskStore"): (
@@ -284,12 +318,12 @@ REVIEWED_LOCAL_IMPORT_SEAMS = {
         "50a97e164a4f6a098fbf7e773de161a7a1ad4a8ce05c9c37f286606a965df3bb",
     ),
     ("runtime", "_interpolation_process_entry"): (
-        "169ad5a655a0fa423b523db1b94d02980586180992f506701a56baa0848eaaf6",
+        "83c1a7c9b379a384e2d285231ec33dbc595870b09e793b62be7fc8baaf0bff91",
         "babab2eb1d231e00bab18c5e3d624b34d92401f4a0fadd98b03035b6d38e0775",
     ),
     ("runtime", "interpolate_view_volume_pass_maybe_process"): (
-        "c33d75c4f4bfa4ed742665fd1b66d68e2ef60026cfcf4432f336fe892dfea740",
-        "539803830c71cfc4b66cdf2c096504b9cf2d4e970aa94d8a5121c57ed15acd98",
+        "a2dcd962f43b127ff4e54748657b4c78e8f1b902239389ebcc33ff82d1fad5e8",
+        "fa8ba3a3af40efa0605c8b9e41e422281719adee141eeb6376b2e589eb88b213",
     ),
     ("topology", "_try_label_slices_stage_a_gpu"): (
         "6dce9807e442982e580688a8466cb4076b7cf5d22db2599d943ac51b915aceff",
@@ -311,6 +345,24 @@ INTENTIONALLY_RELOCATED = {
 # Keep the baseline inventory intact and account for each retired statement by its baseline
 # digest, so adding a similarly named definition later cannot silently satisfy this audit.
 INTENTIONALLY_REMOVED = {
+    ("interpolation", "3e5d65dbd592dcec65808a55789c42f16ae2685e2992c890415c1a049c8dd124"):
+        "_component_record_to_local_canvas",
+    ("interpolation", "512225d0daf2f7d71f236c27fae5effa7c0a410f1175366cabc0a1987718843d"):
+        "_local_half_width_for_component_records",
+    ("interpolation", "7a2a71d0dec9df268cbf9efe76cf84c6812c1c0d0ad5e5856838ae7a52196314"):
+        "_component_to_local_canvas",
+    ("interpolation", "bcf33c955845b6f1e36dcc21bb95ade865cd980493a2e2631b7e0245c8ab94ea"):
+        "_local_half_width_for_components",
+    ("runtime", "6f3557199f1b478a7f72c087dd15e2d28bdf5a49b6b4a8ff29707dc038b2cfb6"):
+        "raw_store_memfd_enabled",
+    ("runtime", "49fc4622c58ba272d947cb15e4790c1eca1ca8f3f0bed161ba4ef678137ee088"):
+        "_create_memfd_backed_payload_path",
+    ("runtime", "1bebc854b4c96d9f0f827c2d5df1b735fcd1ce404fe82841a2787ce01af879a5"):
+        "flush_array",
+    ("runtime", "1fcce8668dc1d71e4ea52d70cd57a9ab19eb0a97fc27b474cdf722be725b6a02"):
+        "prediction_volume_build_flush_enabled",
+    ("runtime", "dd953b74f4d66f1146464d5faa74a8e3ce2d664e7b7890f9071c9f6e21a9b003"):
+        "prediction_hot_path_flush_enabled",
     ("config", "0b77703bf375bcd802f74a77ca9009db17a87296bb829376ed2f30f368250243"):
         "OUTPUT_NRRD_PREFIX",
     ("config", "4b5b1cd71ab26699413794dc1b3b0a1b1a7b91dbb917f0321bd4fda5fe2b95d8"):
@@ -355,7 +407,7 @@ INTENTIONALLY_REMOVED = {
 INTENTIONALLY_PRUNED_REPLACEMENTS = {
     ("interpolation", "e2a3ab6f0b2bb8abfd8cb880317a197a446bd80d52fd49f7c4bc72608dbfe529"):
         (
-            "1ccb9d3b22d1623694a7d8a0ef561e5981771359c8c7b86dc34e5d2d7611ed14",
+            "4e01060dae0bb88826bf2b113bcb0f5e9d10f2ade407861176dd712774bb430e",
             "_numba_blocks_overlap_any_kernel",
         ),
 }

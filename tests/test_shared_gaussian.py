@@ -128,7 +128,6 @@ class SharedGaussianPrimitiveTests(unittest.TestCase):
                 side_effect=lambda **kwargs: np.empty(kwargs["shape"], dtype=kwargs["dtype"]),
             ),
             mock.patch.object(assembly, "close_memmap_array"),
-            mock.patch.object(assembly, "flush_array"),
             mock.patch.object(assembly, "choose_slice_parallel_workers", return_value=1),
             mock.patch.object(
                 assembly,

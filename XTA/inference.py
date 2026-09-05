@@ -51,9 +51,7 @@ from .runtime import (
     _settle_parallel_futures,
     choose_parallel_chunk_size,
     choose_slice_parallel_workers,
-    flush_array,
     parallel_for_indices_chunked,
-    prediction_hot_path_flush_enabled,
 )
 from .geometry import (
     BatchResultFrameSpec,
@@ -522,20 +520,10 @@ class PredictionAccumulationHandle:
     def wait(self) -> Dict[str, int]:
         prediction_count = int(self.precompleted_prediction_count)
         frames_with_predictions = int(self.precompleted_frames_with_predictions)
-        try:
-            for fut in as_completed(list(self.futures)):
-                pred_inc, frame_inc = fut.result()
-                prediction_count += int(pred_inc)
-                frames_with_predictions += int(frame_inc)
-        finally:
-            if prediction_hot_path_flush_enabled():
-                if self.view_confmap_mm is not None:
-                    flush_array(self.view_confmap_mm)
-                flush_array(self.view_union_mm)
-                if self.radial_padding_confmap_mm is not None:
-                    flush_array(self.radial_padding_confmap_mm)
-                if self.radial_padding_union_mm is not None:
-                    flush_array(self.radial_padding_union_mm)
+        for fut in as_completed(list(self.futures)):
+            pred_inc, frame_inc = fut.result()
+            prediction_count += int(pred_inc)
+            frames_with_predictions += int(frame_inc)
         return {
             'prediction_count': int(prediction_count),
             'frames_with_predictions': int(frames_with_predictions),
@@ -2273,7 +2261,11 @@ class _DeviceUnionAccumulator:
         self,
         retirement_lane: Optional[_GpuUnionRetirementLane] = None,
     ) -> None:
-        """Seal producers with events; use a whole-device barrier only in fallback/debug mode."""
+        """Fence producers on a retirement lane, or synchronize the device without one.
+
+        D1 currently uses the no-lane path at its lease boundary. Ordinary union
+        retirement uses producer events unless forced to use a device barrier.
+        """
         if self._retirement_sealed:
             return
         self._retirement_sealed = True
@@ -4176,14 +4168,6 @@ def predict_source_and_accumulate(
                             synchronize_device=False,
                             collect_slice_metadata=True,
                         )
-                        if prediction_hot_path_flush_enabled():
-                            if view_confmap_mm is not None:
-                                flush_array(view_confmap_mm)
-                            flush_array(view_union_mm)
-                            if radial_padding_confmap_mm is not None:
-                                flush_array(radial_padding_confmap_mm)
-                            if radial_padding_union_mm is not None:
-                                flush_array(radial_padding_union_mm)
                         return {
                             'prediction_count': int(base_prediction_count + compacted_predictions),
                             'frames_with_predictions': int(base_frames_with_predictions + compacted_frames),
@@ -4228,15 +4212,6 @@ def predict_source_and_accumulate(
                 finally:
                     if retirement_manager is not None and retirement_lane is not None:
                         retirement_manager.release(retirement_lane)
-
-        if prediction_hot_path_flush_enabled() and device_union_flush_future is None:
-            if view_confmap_mm is not None:
-                flush_array(view_confmap_mm)
-            flush_array(view_union_mm)
-            if radial_padding_confmap_mm is not None:
-                flush_array(radial_padding_confmap_mm)
-            if radial_padding_union_mm is not None:
-                flush_array(radial_padding_union_mm)
 
         return {
             'prediction_count': int(prediction_count),
@@ -4903,9 +4878,6 @@ def fused_slice_cleanup_inplace(
         desc=desc,
         chunk_size=chunk_size,
     )
-    flush_array(mask_mm)
-    if confmap_mm is not None:
-        flush_array(confmap_mm)
 
 def fill_view_volume_holes_2d_inplace(
     mask_mm: np.ndarray,
@@ -5006,7 +4978,6 @@ def fill_view_volume_holes_2d_inplace(
         desc=desc,
         chunk_size=chunk_size,
     )
-    flush_array(mask_mm)
 
 def cleanup_view_volume_after_prediction_inplace(
     mask_mm: np.ndarray,
@@ -5068,7 +5039,3 @@ def cleanup_view_volume_after_prediction_inplace(
             known_slice_any=known_slice_any,
             known_slice_bboxes=known_slice_bboxes,
         )
-
-    flush_array(mask_mm)
-    if confmap_mm is not None:
-        flush_array(confmap_mm)

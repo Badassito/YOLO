@@ -43,7 +43,6 @@ from .config import (
     GIB,
 )
 from .runtime import (
-    _create_memfd_backed_payload_path,
     allocate_workspace_array,
     array_nbytes,
     choose_slice_parallel_workers,
@@ -51,7 +50,6 @@ from .runtime import (
     close_memmap_array_without_flush,
     copy_workspace_array,
     estimate_interpolation_workspace_bytes,
-    flush_array,
     interpolation_process_worker_active,
     numa_interleave_memory,
     open_raw_store_payload_writer,
@@ -59,7 +57,6 @@ from .runtime import (
     parallel_for_indices_chunked,
     parallel_map_in_order,
     parallel_map_unordered,
-    raw_store_memfd_enabled,
     release_memfd_owners_under,
     runtime_telemetry,
     runtime_telemetry_phase,
@@ -96,9 +93,8 @@ if TYPE_CHECKING:
     )
 
 def _keep_center_component_2d(mask2d: np.ndarray) -> np.ndarray:
-    # cv2 connectedComponents + the cv2 hole fill replace scipy.ndimage,
-    # whose label/fill_holes hold the GIL and serialize the interpolation planner/render
-    # thread pools. Semantics are unchanged (8-connected components, 4-connected hole fill).
+    # Keep an 8-connected foreground component and fill its enclosed holes using
+    # 4-connected background. The compiled path combines both flood fills.
     mask2d = np.asarray(mask2d, dtype=bool)
     if not mask2d.any():
         return mask2d
@@ -131,9 +127,7 @@ def _keep_center_component_2d(mask2d: np.ndarray) -> np.ndarray:
     return _fill_holes_2d_opencv(kept)
 
 def _signed_distance_2d(mask2d: np.ndarray) -> np.ndarray:
-    # cv2.distanceTransform with DIST_MASK_PRECISE is the exact euclidean
-    # transform (Felzenszwalb), matching scipy.ndimage.distance_transform_edt while releasing
-    # the GIL so SDF construction parallelizes across planner threads.
+    # Float32 Euclidean distances are positive inside the mask and negative outside.
     mask_u8 = np.ascontiguousarray(np.asarray(mask2d, dtype=np.uint8))
     inside = cv2.distanceTransform(mask_u8, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
     outside = cv2.distanceTransform(np.uint8(1) - mask_u8, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
@@ -558,10 +552,10 @@ def _component_record_dilated_overlap_count(prev_record: SliceComponentRecord, c
 def _component_record_mirrored_u(record: SliceComponentRecord, width: int) -> SliceComponentRecord:
     """Mirror a component record along the u (x) axis of its full slice.
 
- /: the radial angular domain is [0°, 180°) over full-diameter
- frames, so the frame that continues across the 0°/180° wrap is the neighbor frame
- with u REVERSED (u -> width-1-u). Wrap-crossing comparisons mirror one side through
- this helper so overlap/continuation tests run in a common coordinate frame."""
+    The radial angular domain is [0°, 180°) over full-diameter frames, so crossing
+    the angular seam reverses u. Mirroring one side puts overlap and continuation
+    tests in a common coordinate frame.
+    """
     w = int(width)
     y0, x0, y1, x1 = record.bbox
     return SliceComponentRecord(
@@ -660,69 +654,12 @@ def _build_slice_component_table(
         z=int(z), shape=table_shape, components=components, by_label=by_label,
     )
 
-def _component_record_to_local_canvas(record: SliceComponentRecord, anchor_yx: Tuple[int, int], half_width: int) -> np.ndarray:
-    size = int(2 * int(half_width) + 1)
-    local = np.zeros((size, size), dtype=bool)
-    y0, x0, _y1, _x1 = record.bbox
-    y_off = int(y0) - int(anchor_yx[0]) + int(half_width)
-    x_off = int(x0) - int(anchor_yx[1]) + int(half_width)
-    if _planning_kernels_active():
-        try:
-            _numba_scatter_true_kernel(record.mask_crop, int(y_off), int(x_off), local)
-            return local
-        except Exception as exc:
-            _disable_planning_kernels(exc)
-    ys, xs = np.nonzero(record.mask_crop)
-    if ys.size == 0:
-        return local
-    yy = ys.astype(np.int64, copy=False) + int(y_off)
-    xx = xs.astype(np.int64, copy=False) + int(x_off)
-    valid = (yy >= 0) & (yy < size) & (xx >= 0) & (xx < size)
-    local[yy[valid], xx[valid]] = True
-    return local
-
-def _local_half_width_for_component_records(
-    source_record: SliceComponentRecord,
-    source_anchor: Tuple[int, int],
-    target_record: SliceComponentRecord,
-    target_anchor: Tuple[int, int],
-) -> int:
-    max_extent = 0.0
-    for record, anchor in ((source_record, source_anchor), (target_record, target_anchor)):
-        y0, x0, _y1, _x1 = record.bbox
-        if _planning_kernels_active():
-            try:
-                ext = int(_numba_max_abs_extent_kernel(
-                    record.mask_crop, int(anchor[0]) - int(y0), int(anchor[1]) - int(x0),
-                ))
-                if ext >= 0:
-                    max_extent = max(max_extent, float(ext))
-                continue
-            except Exception as exc:
-                _disable_planning_kernels(exc)
-        ys, xs = np.nonzero(record.mask_crop)
-        if ys.size == 0:
-            continue
-        gy = ys.astype(np.int64, copy=False) + int(y0)
-        gx = xs.astype(np.int64, copy=False) + int(x0)
-        max_extent = max(
-            max_extent,
-            float(np.max(np.abs(gy - int(anchor[0])))),
-            float(np.max(np.abs(gx - int(anchor[1])))),
-        )
-
-    max_extent = max(
-        max_extent,
-        float(abs(int(target_anchor[0]) - int(source_anchor[0]))),
-        float(abs(int(target_anchor[1]) - int(source_anchor[1]))),
-    )
-    return max(4, int(math.ceil(max_extent)) + 4)
 
 @dataclass(frozen=True)
 class SliceEndpointSeed:
     label: int
     point: Tuple[int, int, int]  # (slice, row, col)
-    direction_sign: int          # 1 or +1 along the slice axis
+    direction_sign: int          # -1 or +1 along the slice axis
     # Cheap scheduler hint captured while the source 2D component is already hot.
     # It never participates in candidate selection or bridge geometry.
     planning_cost: int = 1
@@ -829,7 +766,6 @@ def _component_centroid_anchor(mask2d: np.ndarray) -> Optional[Tuple[int, int]]:
     return int(ys[idx]), int(xs[idx])
 
 def _component_max_radius(mask2d: np.ndarray) -> float:
-    # exact cv2 distance transform (GIL-releasing) replaces scipy EDT.
     mask_u8 = np.ascontiguousarray(np.asarray(mask2d, dtype=np.uint8))
     if not np.any(mask_u8):
         return 0.0
@@ -879,26 +815,6 @@ def _follow_branch_component(
     comp = labels2d == best_lbl
     return comp.astype(bool), _nearest_point_in_mask(comp, prev_anchor)
 
-def _component_to_local_canvas(mask2d: np.ndarray, anchor_yx: Tuple[int, int], half_width: int) -> np.ndarray:
-    size = int(2 * half_width + 1)
-    local = np.zeros((size, size), dtype=bool)
-    y_off = -int(anchor_yx[0]) + int(half_width)
-    x_off = -int(anchor_yx[1]) + int(half_width)
-    if _planning_kernels_active():
-        try:
-            _numba_scatter_true_kernel(np.asarray(mask2d, dtype=bool), int(y_off), int(x_off), local)
-            return local
-        except Exception as exc:
-            _disable_planning_kernels(exc)
-    ys, xs = np.nonzero(mask2d)
-    if ys.size == 0:
-        return local
-
-    yy = ys.astype(np.int64) + int(y_off)
-    xx = xs.astype(np.int64) + int(x_off)
-    valid = (yy >= 0) & (yy < size) & (xx >= 0) & (xx < size)
-    local[yy[valid], xx[valid]] = True
-    return local
 
 def _paste_local_mask_onto_slice(
     dest_slice: np.ndarray,
@@ -909,7 +825,10 @@ def _paste_local_mask_onto_slice(
     paint_value: int = 1,
     binary_destination: bool = True,
 ) -> int:
-    """OR a local mask into one destination slice and update the caller-provided touched bbox."""
+    """OR a local mask into a slice and return the count with no prior value-bit overlap.
+
+    The touched bbox bounds the clipped canvas; it can include background pixels.
+    """
     if not np.any(local_mask):
         return 0
 
@@ -948,14 +867,23 @@ def _paste_local_mask_onto_slice(
         dst_bbox_union[2] = max(int(dst_bbox_union[2]), int(dst_y1))
         dst_bbox_union[3] = max(int(dst_bbox_union[3]), int(dst_x1))
 
-    if bool(binary_destination) and int(paint_value) == 1 and _planning_kernels_active():
+    dest_dtype = np.asarray(dest_slice).dtype
+    if _planning_kernels_active() and dest_dtype.isnative and dest_dtype.kind in ('b', 'u'):
         try:
-            # one nogil pass counts+writes only newly-set pixels (bridge slices
-            # hold 0/1) instead of two bool temporaries + a count + an OR store per paste.
-            return int(_numba_paste_masked_or_kernel(
+            if bool(binary_destination) and int(paint_value) == 1:
+                # Binary slices need only a zero test and a conditional store.
+                return int(_numba_paste_masked_or_kernel(
+                    np.asarray(dest_slice), np.asarray(local_mask, dtype=bool),
+                    int(dst_y0), int(dst_x0),
+                    int(src_y0), int(src_y1), int(src_x0), int(src_x1),
+                ))
+            # Keep unsigned values unsigned, including uint64's top membership bit.
+            value = np.asarray(int(paint_value), dtype=dest_dtype)[()]
+            return int(_numba_paste_packed_or_kernel(
                 np.asarray(dest_slice), np.asarray(local_mask, dtype=bool),
                 int(dst_y0), int(dst_x0),
                 int(src_y0), int(src_y1), int(src_x0), int(src_x1),
+                value,
             ))
         except Exception as exc:
             _disable_planning_kernels(exc)
@@ -967,29 +895,6 @@ def _paste_local_mask_onto_slice(
     np.bitwise_or(current, value, out=current, where=patch)
     return added
 
-def _local_half_width_for_components(
-    source_component: np.ndarray,
-    source_anchor: Tuple[int, int],
-    target_component: np.ndarray,
-    target_anchor: Tuple[int, int],
-) -> int:
-    max_extent = 0.0
-    for comp, anchor in ((source_component, source_anchor), (target_component, target_anchor)):
-        ys, xs = np.nonzero(comp)
-        if ys.size == 0:
-            continue
-        max_extent = max(
-            max_extent,
-            float(np.max(np.abs(ys.astype(np.int64) - int(anchor[0])))),
-            float(np.max(np.abs(xs.astype(np.int64) - int(anchor[1])))),
-        )
-
-    max_extent = max(
-        max_extent,
-        float(abs(int(target_anchor[0]) - int(source_anchor[0]))),
-        float(abs(int(target_anchor[1]) - int(source_anchor[1]))),
-    )
-    return max(4, int(math.ceil(max_extent)) + 4)
 
 _NUMBA_PROJECTION_KERNEL_RUNTIME_DISABLED = False
 
@@ -1023,37 +928,6 @@ if _numba is not None:
                     found = 1
         return best_y, best_x, found
 
-    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
-    def _numba_scatter_true_kernel(mask: np.ndarray, y_off: int, x_off: int, out: np.ndarray) -> None:
-        size_y = out.shape[0]
-        size_x = out.shape[1]
-        for y in range(mask.shape[0]):
-            yy = y + y_off
-            if yy < 0 or yy >= size_y:
-                continue
-            for x in range(mask.shape[1]):
-                if mask[y, x]:
-                    xx = x + x_off
-                    if 0 <= xx < size_x:
-                        out[yy, xx] = True
-
-    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
-    def _numba_max_abs_extent_kernel(mask: np.ndarray, ref_y: int, ref_x: int) -> int:
-        best = -1
-        for y in range(mask.shape[0]):
-            for x in range(mask.shape[1]):
-                if not mask[y, x]:
-                    continue
-                dy = y - ref_y
-                if dy < 0:
-                    dy = -dy
-                dx = x - ref_x
-                if dx < 0:
-                    dx = -dx
-                ext = dy if dy > dx else dx
-                if ext > best:
-                    best = ext
-        return best
 
     @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
     def _numba_dilated_overlap_count_kernel(
@@ -1220,13 +1094,33 @@ if _numba is not None:
                     dest[dy, dx] = 1
                     added += 1
         return added
+
+    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+    def _numba_paste_packed_or_kernel(
+        dest: np.ndarray, local_mask: np.ndarray,
+        dst_y0: int, dst_x0: int,
+        src_y0: int, src_y1: int, src_x0: int, src_x1: int,
+        value,
+    ) -> int:
+        added = 0
+        for sy in range(src_y0, src_y1):
+            dy = dst_y0 + sy - src_y0
+            for sx in range(src_x0, src_x1):
+                if local_mask[sy, sx]:
+                    dx = dst_x0 + sx - src_x0
+                    previous = dest[dy, dx]
+                    if (previous & value) == 0:
+                        added += 1
+                    # Composite values can partly overlap: old=1,value=3 counts
+                    # zero additions but must still set the second membership bit.
+                    dest[dy, dx] = previous | value
+        return added
 else:
     _numba_nearest_true_pixel_kernel = None
-    _numba_scatter_true_kernel = None
-    _numba_max_abs_extent_kernel = None
     _numba_dilated_overlap_count_kernel = None
     _numba_keep_center_fill_kernel = None
     _numba_paste_masked_or_kernel = None
+    _numba_paste_packed_or_kernel = None
 
 def _planning_kernels_active() -> bool:
     return bool(
@@ -1873,15 +1767,13 @@ class SliceBridgeRenderPlan:
     num_slices: int
     sdf0: np.ndarray
     sdf1: np.ndarray
-    # One-based output-decomposition coordinates. To preserve the historical bridge
-    # union while emitting exactly ``walk_back * candidates`` layers, index 1 combines
-    # the endpoint and first walked-back origin; indices 2..N are progressively earlier
-    # source slices. Candidate indices follow nearest-first projection-search ordering.
+    # One-based output-decomposition coordinates: index 1 combines the endpoint
+    # and first walked-back origin; indices 2..N are progressively earlier slices.
+    # Candidate indices follow nearest-first projection-search ordering.
     interpolation_walk_back_index: int = 1
     interpolation_candidate_index: int = 1
-    # the min-radius acceptance scan already constructs every
-    # intermediate bool section. Accepted plans retain those exact post-component-filter
-    # arrays by step index so painting does not repeat SDF lerp/threshold/component work.
+    # Radius checking can retain post-component-filter sections by step index so
+    # painting does not repeat SDF lerp, thresholding, and component cleanup.
     cached_sections: List[Optional[np.ndarray]] = field(default_factory=list, compare=False, repr=False)
 
 @dataclass
@@ -1941,11 +1833,11 @@ def _build_slice_endpoint_seeds(
 ) -> Tuple[List[SliceEndpointSeed], int]:
     """Build interpolation endpoint seeds with the per-slice component scan.
 
- Interpolation no longer uses skeletonization. Each labeled 3D object is scanned slice by
- slice; every 2D connected component is evaluated independently for overlap continuation
- into the previous and next slice. Components without continuation become endpoint seeds in
- the corresponding direction. Radial interpolation can wrap the slice/frame axis so frame 0
- and the final radial frame are considered adjacent."""
+    Each 2D connected component is evaluated independently for overlap continuation
+    into the previous and next slice. Components without continuation become endpoint
+    seeds in that direction. Radial interpolation treats frame 0 and the final frame
+    as adjacent, with the horizontal axis mirrored across the seam.
+    """
     # Local import keeps the package dependency graph acyclic.
     from .topology import build_slice_endpoint_seeds_from_label_volume
 
@@ -2003,26 +1895,47 @@ def _build_linear_slice_bridge_plan(
             target_record = _component_record_mirrored_u(target_record, slice_w)
             target_anchor = (int(target_anchor[0]), int(slice_w - 1 - int(target_anchor[1])))
 
-        half_width = _local_half_width_for_component_records(source_record, source_anchor, target_record, target_anchor)
-        source_local = _component_record_to_local_canvas(source_record, source_anchor, half_width)
-        target_local = _component_record_to_local_canvas(target_record, target_anchor, half_width)
+        endpoints = (
+            (source_record.bbox, source_record.mask_crop, source_anchor),
+            (target_record.bbox, target_record.mask_crop, target_anchor),
+        )
     else:
         source_component, source_anchor = _component_mask_and_anchor(labels_real[s0] == int(source_label), (y0, x0))
         target_component, target_anchor = _component_mask_and_anchor(labels_real[s1] == int(target_label), (y1, x1))
         if source_anchor is None or target_anchor is None:
             return None
-        if not np.any(source_component) or not np.any(target_component):
-            return None
         if wrap_crossed:
             target_component = target_component[:, ::-1]
             target_anchor = (int(target_anchor[0]), int(slice_w - 1 - int(target_anchor[1])))
 
-        half_width = _local_half_width_for_components(source_component, source_anchor, target_component, target_anchor)
-        source_local = _component_to_local_canvas(source_component, source_anchor, half_width)
-        target_local = _component_to_local_canvas(target_component, target_anchor, half_width)
+        endpoints = []
+        for component, anchor in (
+            (source_component, source_anchor), (target_component, target_anchor),
+        ):
+            rows = np.flatnonzero(np.any(component, axis=1))
+            columns = np.flatnonzero(np.any(component, axis=0))
+            if not rows.size or not columns.size:
+                return None
+            by0, by1 = int(rows[0]), int(rows[-1]) + 1
+            bx0, bx1 = int(columns[0]), int(columns[-1]) + 1
+            endpoints.append(((by0, bx0, by1, bx1), component[by0:by1, bx0:bx1], anchor))
 
-    if not np.any(source_local) or not np.any(target_local):
-        return None
+    # Endpoint shapes share an anchor-centered odd rectangle. Translation is
+    # applied when painting into the destination, so it needs no canvas space.
+    extent_y = extent_x = 0
+    for bbox, _mask, anchor in endpoints:
+        by0, bx0, by1, bx1 = map(int, bbox)
+        ay, ax = map(int, anchor)
+        extent_y = max(extent_y, abs(by0 - ay), abs(by1 - 1 - ay))
+        extent_x = max(extent_x, abs(bx0 - ax), abs(bx1 - 1 - ax))
+    half_y, half_x = extent_y + 4, extent_x + 4
+    local_masks = []
+    for bbox, mask, anchor in endpoints:
+        canvas = np.zeros((2 * half_y + 1, 2 * half_x + 1), dtype=bool)
+        oy = int(bbox[0]) - int(anchor[0]) + half_y
+        ox = int(bbox[1]) - int(anchor[1]) + half_x
+        canvas[oy:oy + mask.shape[0], ox:ox + mask.shape[1]] = mask
+        local_masks.append(canvas)
 
     return SliceBridgeRenderPlan(
         source_label=int(source_label),
@@ -2034,8 +1947,8 @@ def _build_linear_slice_bridge_plan(
         steps=int(steps),
         sign=int(sign),
         num_slices=int(num_slices),
-        sdf0=np.ascontiguousarray(_signed_distance_2d(source_local)),
-        sdf1=np.ascontiguousarray(_signed_distance_2d(target_local)),
+        sdf0=np.ascontiguousarray(_signed_distance_2d(local_masks[0])),
+        sdf1=np.ascontiguousarray(_signed_distance_2d(local_masks[1])),
     )
 
 def _estimate_linear_slice_bridge_min_radius_from_plan(
@@ -2044,14 +1957,38 @@ def _estimate_linear_slice_bridge_min_radius_from_plan(
     reject_at_or_below: float = 0.0,
     cache_sections: bool = False,
 ) -> float:
-    """Estimate the minimum accepted bridge radius from the plan's cached endpoint distance fields."""
+    """Return the minimum radius, or a sufficient lower bound above a positive threshold.
+
+    With no rejection threshold, evaluate every section for the actual radius.
+    """
+    threshold = float(reject_at_or_below)
+    witness = 0.0
+    if threshold > 0.0 and plan.sdf0.shape == plan.sdf1.shape and plan.sdf0.size:
+        cy, cx = plan.sdf0.shape[0] // 2, plan.sdf0.shape[1] // 2
+        witness = min(float(plan.sdf0[cy, cx]), float(plan.sdf1[cy, cx]))
+    # The disk common to both centered endpoint masks stays positive throughout
+    # SDF interpolation. It contains the retained center component's anchor and
+    # cannot be removed by cleanup, so its radius certifies every section.
+    # Leave a float32 EDT rounding margin; uncertain cases need the full scan.
+    margin = max(
+        1e-6,
+        4.0 * np.finfo(np.float32).eps * max(abs(witness), abs(threshold), 1.0),
+    )
+    if threshold > 0.0 and np.isfinite(witness) and witness > threshold + margin:
+        if bool(cache_sections):
+            plan.cached_sections[:] = [None] * (int(plan.steps) + 1)
+            for idx in range(1, int(plan.steps)):
+                alpha = float(idx) / float(plan.steps)
+                section = ((1.0 - alpha) * plan.sdf0 + alpha * plan.sdf1) >= 0.0
+                plan.cached_sections[idx] = _keep_center_component_2d(section)
+        return witness
+
     source_local = np.asarray(plan.sdf0 >= 0.0, dtype=bool)
     target_local = np.asarray(plan.sdf1 >= 0.0, dtype=bool)
     if not np.any(source_local) or not np.any(target_local):
         return 0.0
 
     min_radius = float(min(float(np.max(plan.sdf0)), float(np.max(plan.sdf1))))
-    threshold = float(reject_at_or_below)
     if threshold > 0.0 and min_radius <= threshold:
         return float(min_radius)
     section_cache = plan.cached_sections
@@ -2129,7 +2066,7 @@ def _plan_slice_seed_bridges(
 ) -> SliceSeedBridgePlanResult:
     result = SliceSeedBridgePlanResult()
 
-    # Keep the historical bridge set: the endpoint plus N additional source slices.
+    # Build bridges from the endpoint plus N additional source slices.
     # Layer 1 coalesces the endpoint and nearest walked-back origin so the externally
     # visible decomposition is still exactly N x C rather than (N + 1) x C.
     walk_back_count = max(0, int(interpolation_walk_back))
@@ -2375,7 +2312,6 @@ def interpolate_view_volume_pass_inplace(
                     'interpolation_candidate_index': int(_candidate_index),
                     'added_voxels': 0,
                 },
-                force_path_backed=True,
             )
             empty_writer.consume_empty_range(0, int(mask_mm.shape[0]))
             empty_writer.finalize()
@@ -3148,9 +3084,7 @@ def interpolate_view_volume_pass_inplace(
                 desc='Interpolation: merge bridges',
             )
             added_voxels = int(np.sum(merged_added_by_slice, dtype=np.int64))
-            flush_array(mask_mm)
             if delta_mm is not None:
-                flush_array(delta_mm)
                 close_memmap_array(delta_mm)
                 bridge_delta_written = True
     finally:
@@ -3164,19 +3098,14 @@ def interpolate_view_volume_pass_inplace(
                 gpu_renderer.close()
             except Exception:
                 pass
-        if isinstance(bridge_mm, np.memmap):
-            flush_array(bridge_mm)
         del bridge_mm
         for membership_mm in component_membership_mms:
-            flush_array(membership_mm)
             close_memmap_array(membership_mm)
         component_membership_mms.clear()
         try:
             del component_cache
         except Exception:
             pass
-        if isinstance(labels_mm, np.memmap):
-            flush_array(labels_mm)
         del labels_mm
         if not keep_temp:
             for p in label_paths:
@@ -3248,7 +3177,6 @@ def interpolate_view_volume_pass_inplace(
                         f'packed_{component_word_dtype.name}_membership_bitplane'
                     ),
                 },
-                force_path_backed=True,
             )
     except BaseException:
         if not bool(keep_temp):
@@ -3794,15 +3722,13 @@ def _drain_volume_to_mmap(
     *,
     workers: int = 1,
 ) -> np.ndarray:
-    drained = copy_workspace_array(
+    return copy_workspace_array(
         np.asarray(volume),
         path,
         desc=desc,
         prefer_memory=False,
         workers=int(workers),
     )
-    flush_array(drained)
-    return drained
 
 def _nrrd_empty_segment_extent() -> NrrdSegmentExtent:
     return (0, -1, 0, -1, 0, -1)
@@ -3858,7 +3784,6 @@ class IncrementalRawBBoxMaskStoreWriter:
         format_name: str,
         desc: str,
         extra_meta: Optional[Dict[str, object]] = None,
-        force_path_backed: bool = False,
     ) -> None:
         fmt = str(format_name)
         if fmt not in MASK_STORE_FORMATS:
@@ -3873,7 +3798,6 @@ class IncrementalRawBBoxMaskStoreWriter:
         self._packbits_payload = bool(fmt == INTERNAL_PACKED_CVOL_FORMAT)
         self.desc = str(desc)
         self.extra_meta = dict(extra_meta or {})
-        self.force_path_backed = bool(force_path_backed)
         self.chunks_path = self.store_dir / 'chunks.bin'
         self.index_path = self.store_dir / 'index.bin'
         self.meta_path = self.store_dir / 'meta.json'
@@ -3897,26 +3821,11 @@ class IncrementalRawBBoxMaskStoreWriter:
         if self.store_dir.exists():
             shutil.rmtree(self.store_dir, ignore_errors=True)
         self.store_dir.mkdir(parents=True, exist_ok=True)
-        self._fd: Optional[int]
-        if raw_store_memfd_enabled() and not self.force_path_backed:
-            try:
-                self._fd = _create_memfd_backed_payload_path(
-                    self.chunks_path, f'{self.desc} chunks',
-                )
-                runtime_telemetry().add('cvol.memfd_stores', 1)
-            except Exception as exc:
-                runtime_telemetry().fallback('cvol.memfd.incremental', exc)
-                self._fd = os.open(
-                    self.chunks_path,
-                    os.O_CREAT | os.O_TRUNC | os.O_RDWR,
-                    0o666,
-                )
-        else:
-            self._fd = os.open(
-                self.chunks_path,
-                os.O_CREAT | os.O_TRUNC | os.O_RDWR,
-                0o666,
-            )
+        self._fd: Optional[int] = os.open(
+            self.chunks_path,
+            os.O_CREAT | os.O_TRUNC | os.O_RDWR,
+            0o666,
+        )
 
     @property
     def failed(self) -> bool:
@@ -3967,8 +3876,6 @@ class IncrementalRawBBoxMaskStoreWriter:
         z_i = int(z)
         plane_arr = np.ascontiguousarray(np.asarray(plane, dtype=np.uint8))
         # OpenCV performs one compiled scan for both emptiness and the tight bbox.
-        # The previous two NumPy reductions read the entire plane twice and created two
-        # temporary boolean vectors before the sink normalized/copied the crop.
         x0, y0, bbox_w, bbox_h = (int(v) for v in cv2.boundingRect(plane_arr))
         if int(bbox_w) <= 0 or int(bbox_h) <= 0:
             with self._lock:
@@ -4725,7 +4632,6 @@ def materialize_raw_bbox_mask_store_workspace(
             show_progress=False,
             target_chunks_per_worker=2,
         )
-        flush_array(workspace)
         return workspace
     except BaseException:
         close_memmap_array_without_flush(workspace)
@@ -4777,8 +4683,6 @@ def _encode_bool_mask_slice_payload(
     )
 
 def _encode_ctile_slice(idx: int, tile_mask_mm: np.ndarray) -> RawBBoxSlicePayload:
-    # the encoder handles raw uint8 slices directly; the old `>0` here was
-    # another full-slice compare+copy per slice.
     return _encode_bool_mask_slice_payload(int(idx), tile_mask_mm[int(idx)])
 
 def _write_raw_bbox_payload_store(
@@ -4790,7 +4694,6 @@ def _write_raw_bbox_payload_store(
     desc: str,
     workers: int = 1,
     extra_meta: Optional[Dict[str, object]] = None,
-    force_path_backed: bool = False,
 ) -> Dict[str, object]:
     """Write a slice-chunked bbox binary mask store.
 
@@ -4835,11 +4738,7 @@ def _write_raw_bbox_payload_store(
         )
 
     offset = 0
-    with open_raw_store_payload_writer(
-        chunks_path,
-        f'{desc} chunks',
-        force_path_backed=bool(force_path_backed),
-    ) as chunks_fh:
+    with open_raw_store_payload_writer(chunks_path) as chunks_fh:
         for item in iterable:
             idx = int(item.idx)
             if idx < 0 or idx >= int(shape_i[0]):
@@ -4930,7 +4829,6 @@ def write_raw_bbox_mask_store(
     desc: str = 'Raw bbox mask store',
     workers: int = 1,
     extra_meta: Optional[Dict[str, object]] = None,
-    force_path_backed: bool = False,
 ) -> Dict[str, object]:
     """Write a raw bbox mask store."""
     arr = np.asarray(mask_volume)
@@ -4953,5 +4851,4 @@ def write_raw_bbox_mask_store(
         desc=str(desc),
         workers=int(workers),
         extra_meta=extra_meta,
-        force_path_backed=bool(force_path_backed),
     )

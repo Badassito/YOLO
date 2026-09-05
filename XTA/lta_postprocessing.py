@@ -349,7 +349,6 @@ class LtaFinalizationOperations:
     """Injectable operations used by the terminal-volume transaction."""
 
     allocate_workspace_array: Callable[..., np.ndarray]
-    flush_array: Callable[..., object]
     close_volume: Callable[[object], object]
     fill_3d_voids: Callable[..., object]
     apply_gaussian_smoothing: Callable[..., Mapping[str, object]]
@@ -363,12 +362,11 @@ class LtaFinalizationOperations:
         from .assembly import apply_gaussian_smoothing_inplace
         from .cuda_finalization import try_apply_keep_largest_objects_multi_gpu
         from .finalization import apply_keep_largest_objects_inplace
-        from .runtime import allocate_workspace_array, close_memmap_array, flush_array
+        from .runtime import allocate_workspace_array, close_memmap_array
         from .topology import fill_3d_voids_inplace_streaming
 
         return cls(
             allocate_workspace_array=allocate_workspace_array,
-            flush_array=flush_array,
             close_volume=close_memmap_array,
             fill_3d_voids=fill_3d_voids_inplace_streaming,
             apply_gaussian_smoothing=apply_gaussian_smoothing_inplace,
@@ -617,7 +615,6 @@ def finalize_lta_native_union(
                 workers=max(1, int(workers)),
                 layer_id=layer.layer_id,
             )
-        ops.flush_array(active_volume)
 
         if resolved.enable_3d_void_fill:
             void_dir = scratch / "final_global_void_fill"
@@ -705,7 +702,6 @@ def finalize_lta_native_union(
                 "restore_protected_foreground"
             )
 
-        ops.flush_array(active_volume)
         foreground = int(np.count_nonzero(np.asarray(active_volume)))
         return LtaFinalizationResult(
             terminal_union=active_volume,

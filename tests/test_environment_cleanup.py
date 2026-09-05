@@ -114,9 +114,6 @@ class EnvironmentCleanupTests(unittest.TestCase):
         ):
             self.assertEqual(workspace.available_anon_work_bytes(), 80)
 
-        self.assertFalse(runtime.raw_store_memfd_enabled())
-        self.assertFalse(runtime.prediction_volume_build_flush_enabled())
-        self.assertFalse(runtime.prediction_hot_path_flush_enabled())
         self.assertEqual(media.processing_volume_mode(), 'cube')
         self.assertEqual(media._cube_t_axis_resize_backend(), 'slab')
 

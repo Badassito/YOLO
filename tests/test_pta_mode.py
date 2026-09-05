@@ -83,8 +83,10 @@ class PtaModeBoundaryTests(unittest.TestCase):
         self.assertEqual(options.channel_format, ["C5S2"])
         self.assertEqual(options.gaussian_smoothing, 1.5)
         self.assertEqual(options.gaussian_smoothing_passes, 2)
-        self.assertEqual(options.tile_size, ["512", "128"])
-        self.assertEqual(options.tile_stride, ["256", "64"])
+        self.assertEqual(
+            [(tile.tile_size, tile.tile_stride) for tile in config.tiles],
+            [(512, 256), (128, 64)],
+        )
         self.assertTrue(options.save_images)
         self.assertTrue(options.save_labels)
         self.assertTrue(options.save_nrrd)
@@ -94,7 +96,6 @@ class PtaModeBoundaryTests(unittest.TestCase):
         self.assertEqual(options.max_pending_frames, 0)
         self.assertEqual(options.tile_task_chunk, 1)
         self.assertEqual(options.aug_task_chunk, 4)
-        self.assertFalse(options.resume)
         self.assertIs(options._v18_config, config)
 
     def test_output_format_aliases_are_case_insensitive_and_canonical(self) -> None:
@@ -123,8 +124,7 @@ class PtaModeBoundaryTests(unittest.TestCase):
         options = pta_runtime.build_runtime_options(self.pta_mode.parse_pta_args(["--input", "dataset"]))
         self.assertEqual(options.gaussian_smoothing, 0.0)
         self.assertEqual(options.gaussian_smoothing_passes, 0)
-        self.assertEqual(options.tile_size, ["0"])
-        self.assertIsNone(options.tile_stride)
+        self.assertEqual(options._v18_config.tiles, ())
         self.assertFalse(options.save_images)
         self.assertFalse(options.save_labels)
         self.assertFalse(options.save_nrrd)

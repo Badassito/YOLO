@@ -67,29 +67,10 @@ def build_runtime_options(config: PtaConfig) -> argparse.Namespace:
         tiff_encode_backend=public.tiff_encode_backend,
         jpeg_quality=public.jpeg_quality,
         topology_aware=public.topology_aware,
-        # Resolved unified geometry is authoritative. These neutral values satisfy
-        # the engine's internal shape checks and are never CLI aliases.
-        enable_sagittal=False,
-        enable_coronal=False,
-        enable_radial=False,
-        azimuth_angle=None,
-        tilt_angle=["0"],
-        tilt_direction=["vertical"],
-        tile_size=(
-            [str(tile.tile_size) for tile in config.tiles]
-            if config.tiles
-            else ["0"]
-        ),
-        tile_stride=(
-            [str(tile.tile_stride) for tile in config.tiles]
-            if config.tiles
-            else None
-        ),
         # Internal scheduler settings are not public flags.
         max_pending_frames=0,
         tile_task_chunk=1,
         aug_task_chunk=4,
-        resume=False,
         _v18_requested_output_format=str(config.requested_output_format),
         _v18_config=config,
     )

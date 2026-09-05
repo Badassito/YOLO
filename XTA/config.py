@@ -19,11 +19,11 @@ GIB = 1024 ** 3
 
 NRRD_SPACE = "left-posterior-superior"
 
-SCRIPT_VERSION = '19.0.2'
+SCRIPT_VERSION = '19.0.3'
 
-SCRIPT_VERSION_COMPACT = '1902'
+SCRIPT_VERSION_COMPACT = '1903'
 
-SCRIPT_BASENAME = f'GPT-5.6-Sol-Ultra_v{SCRIPT_VERSION}_SLURM.py'
+SCRIPT_BASENAME = f'GPT-6-Astra-Ultra_v{SCRIPT_VERSION}_SLURM.py'
 
 def _parse_angles(
     values: Sequence[str] | str | float | int | None,

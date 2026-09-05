@@ -272,8 +272,8 @@ class LtaRuntimePlanningTests(unittest.TestCase):
         arguments = ("--input", "target", "--device", "0")
         with (
             activate_unified_launch(
-                version="19.0.2",
-                launcher="GPT-5.6-Sol-Ultra_v19.0.2_SLURM.py",
+                version="19.0.3",
+                launcher="GPT-6-Astra-Ultra_v19.0.3_SLURM.py",
                 mode="lta",
                 mode_arguments=arguments,
             ),
@@ -285,7 +285,7 @@ class LtaRuntimePlanningTests(unittest.TestCase):
         self.assertEqual(
             build.call_args.kwargs["argv"],
             (
-                "GPT-5.6-Sol-Ultra_v19.0.2_SLURM.py",
+                "GPT-6-Astra-Ultra_v19.0.3_SLURM.py",
                 "--mode",
                 "lta",
                 *arguments,

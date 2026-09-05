@@ -4,6 +4,7 @@ import ast
 import copy
 import importlib
 import io
+import math
 import os
 import re
 import sys
@@ -355,6 +356,111 @@ class ExternalAugmentationExampleTests(unittest.TestCase):
             all(not torch.equal(left, right) for left, right in zip(outputs, outputs[1:])),
             "adjacent magnitude profiles unexpectedly produced identical seeded batches",
         )
+
+
+class GPUAugmentationGaussianMathTests(unittest.TestCase):
+    """Check GPU policy math on CPU without constructing a CUDA policy."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        loaded_torch = sys.modules.get("torch")
+        if loaded_torch is not None and type(loaded_torch).__name__ == "_StubModule":
+            raise unittest.SkipTest("Gaussian execution requires real PyTorch, not import stubs")
+        try:
+            import torch
+        except ModuleNotFoundError as exc:
+            if exc.name != "torch":
+                raise
+            raise unittest.SkipTest("Gaussian execution requires PyTorch") from exc
+
+        cls.torch = torch
+        cls.previous_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        cls.addClassCleanup(torch.set_num_threads, cls.previous_threads)
+        cls.modules = [
+            (
+                profile,
+                importlib.import_module(f"XTA.examples.external_augmentations.{path.stem}"),
+            )
+            for profile, path in GPU_PROFILES
+        ]
+
+    def _square_reference(self, sample: object, sigma: float) -> object:
+        # Build the isotropic 2D density independently of the policy's 1D kernel.
+        radius = max(1, int(math.ceil(3.0 * max(0.05, sigma))))
+        coords = np.arange(-radius, radius + 1, dtype=np.float64)
+        kernel = np.exp(
+            -(coords[:, None] ** 2 + coords[None, :] ** 2)
+            / (2.0 * max(0.05, sigma) ** 2)
+        )
+        kernel /= kernel.sum()
+        channels = int(sample.shape[1])
+        weight = self.torch.from_numpy(kernel.astype(np.float32))
+        weight = weight.view(1, 1, *weight.shape).repeat(channels, 1, 1, 1)
+        pad_mode = "reflect" if min(sample.shape[-2:]) > radius else "replicate"
+        padded = self.torch.nn.functional.pad(
+            sample, (radius, radius, radius, radius), mode=pad_mode
+        )
+        return self.torch.nn.functional.conv2d(padded, weight, groups=channels)
+
+    def test_blur_matches_square_gaussian_for_channels_and_boundary_modes(self) -> None:
+        cases = (
+            ((2, 3, 29, 31), 5.0),
+            ((1, 1, 9, 17), 1.25),
+            ((1, 3, 7, 31), 5.0),
+            ((1, 2, 31, 7), 5.0),
+            ((1, 3, 1, 2), 8.0),
+            ((1, 1, 49, 53), 8.0),
+            ((1, 3, 15, 17), 5.0),
+            ((1, 3, 3, 4), 0.1),
+        )
+        generator = self.torch.Generator(device="cpu").manual_seed(1729)
+        for shape, sigma in cases:
+            sample = self.torch.rand(shape, generator=generator)
+            expected = self._square_reference(sample, sigma)
+            for profile, module in self.modules:
+                with self.subTest(profile=profile, shape=shape, sigma=sigma):
+                    actual = module._blur_sample(sample, sigma)
+                    self.assertEqual(tuple(actual.shape), shape)
+                    self.torch.testing.assert_close(
+                        actual, expected, rtol=4e-6, atol=4e-6
+                    )
+
+    def test_disabled_blur_preserves_the_input_tensor(self) -> None:
+        sample = self.torch.arange(12, dtype=self.torch.float32).reshape(1, 1, 3, 4)
+        for profile, module in self.modules:
+            for sigma in (0.0, 0.05):
+                with self.subTest(profile=profile, sigma=sigma):
+                    self.assertIs(module._blur_sample(sample, sigma), sample)
+
+    def test_elastic_field_preserves_seed_and_profile_amplitude(self) -> None:
+        seed = 31891
+        for (profile, module), amplitude in zip(
+            self.modules, (15.0, 20.0, 27.5, 35.0)
+        ):
+            # Only the pure tensor helper is executed; no CUDA constructor,
+            # device probe, pinned staging, or optional compilation is needed.
+            policy = module.GPUAugmentation.__new__(module.GPUAugmentation)
+            policy.device = self.torch.device("cpu")
+            for height, width in ((27, 31), (7, 31), (31, 7), (1, 2)):
+                with self.subTest(profile=profile, shape=(height, width)):
+                    generator = self.torch.Generator(device="cpu")
+                    generator.manual_seed(module._subseed(seed, 101))
+                    noise = self.torch.rand(
+                        (1, 2, height, width),
+                        generator=generator,
+                        dtype=self.torch.float32,
+                    ) * 2.0 - 1.0
+                    expected = self._square_reference(noise, 5.0)[0] * amplitude
+                    actual = policy._elastic_displacement(seed, height, width)
+                    self.torch.testing.assert_close(
+                        actual, expected, rtol=4e-6, atol=2e-5
+                    )
+                    self.assertTrue(
+                        self.torch.equal(
+                            actual, policy._elastic_displacement(seed, height, width)
+                        )
+                    )
 
 
 if __name__ == "__main__":

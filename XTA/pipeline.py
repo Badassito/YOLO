@@ -100,7 +100,6 @@ from .runtime import (
     create_interpolation_process_executor,
     default_worker_budget,
     expose_scratch_in_output,
-    flush_array,
     gpu_feeder_reserved_physical_cores,
     gpu_worker_aux_interpolation_enabled,
     gpu_worker_aux_interpolation_pool,
@@ -4125,9 +4124,7 @@ def _main_impl() -> None:
             f'ready_fullframe={len(ready_fullframe)}, ready_tiles={len(ready_tile_infer)}'
         )
 
-    #
     # Process-per-GPU scheduler. This path is active for every CUDA run, including one GPU.
-    #
     gpu_worker_processes = scheduler_state.gpu_worker_processes
     cpu_worker_processes = scheduler_state.cpu_worker_processes
     _reset_main_process_gpu_stage_coordinator()
@@ -4313,7 +4310,6 @@ def _main_impl() -> None:
         shape = (int(volume_rgb.shape[0]), int(volume_rgb.shape[1]), int(volume_rgb.shape[2]))
         backing = _memmap_backing_path(volume_rgb)
         if backing is not None:
-            flush_array(volume_rgb)
             return str(backing), shape, str(np.asarray(volume_rgb).dtype)
         # both this copy and the decode target it usually replaces live under the scratch
         # root, so a memory-backed scratch dir puts the shared source volume in RAM with the
@@ -4324,7 +4320,6 @@ def _main_impl() -> None:
             desc='inference-worker shared source volume', prefer_memory=False, prefer_memfd=True,
             workers=int(worker_budget),
         )
-        flush_array(shared_mm)
         shared_backing = _memmap_backing_path(shared_mm)
         if shared_backing is None:
             raise RuntimeError('inference-worker shared source volume has no reopenable backing path')
@@ -4546,7 +4541,6 @@ def _main_impl() -> None:
             cube_backing = _memmap_backing_path(volume_rgb)
             if native_backing is not None and cube_backing is not None:
                 wait_for_volume_ready(input_volume_rgb)
-                flush_array(input_volume_rgb)
                 lazy_cube = volume_rgb if isinstance(volume_rgb, LazyProcessingCube) else None
                 cube_ready_sentinel = (
                     lazy_cube.ready_path
@@ -4577,7 +4571,6 @@ def _main_impl() -> None:
                     def _signal_cube_ready() -> None:
                         try:
                             wait_for_volume_ready(volume_rgb)
-                            flush_array(volume_rgb)
                             cube_ready_sentinel.touch()
                             print('Shared cube volume complete; sentinel written for file-backed worker fallbacks.')
                         except BaseException as exc:
@@ -6439,7 +6432,6 @@ def _main_impl() -> None:
         )
     else:
         final_union_mm = streamed_final_union_mm
-        flush_array(final_union_mm)
         print(
             '\n=== Final view union was assembled incrementally while inference was active ==='
         )

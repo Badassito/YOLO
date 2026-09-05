@@ -2,9 +2,8 @@
 
 Each GPU file is self-contained and exports the
 `build_gpu_augmentation(device=..., batch_size=...)` factory expected by
-XTA PTA's offline GPU backend. `GPU_baseline.py` is the cleaned copy of the
-supplied GPU policy; references to the "standard" policy in the profile request
-mean this baseline.
+XTA PTA's offline GPU backend. `GPU_baseline.py` provides the standard
+augmentation magnitudes.
 
 Each corresponding `CPU_*.py` file exports `build_augmentation()` for PTA's
 offline CPU backend. The CPU policies use the same transform-selection graph,
@@ -36,6 +35,12 @@ blur for 25%, and salt-and-pepper for 25%. One of the three primary noise
 families is selected uniformly for every augmented copy. The super-heavy shear
 limit stays below 45° to keep the composed two-axis shear away from its singular
 endpoint.
+
+All GPU profiles use horizontal and vertical Gaussian passes for image blur
+and elastic displacement smoothing. Channels are filtered independently with
+reflect padding, or replicate padding when either image dimension is too
+small for the kernel radius. These operations preserve the sampled transform
+graph; floating-point rounding can differ from a square convolution.
 
 For example:
 

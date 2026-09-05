@@ -17,7 +17,6 @@ from concurrent.futures import (
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
-    Any,
     Dict,
     Iterable,
     List,
@@ -791,7 +790,6 @@ def _d1_get_or_create_state(task: Dict[str, object], accumulator: '_DeviceUnionA
                 store_dir=shadow_store_dir,
                 format_name=INTERNAL_PACKED_CVOL_FORMAT,
                 desc=f'D1 view-native shadow {key[0]}/{key[1]}',
-                force_path_backed=True,
                 extra_meta={
                     'producer': 'v17.0.5_d1_sparse_view_shadow',
                     'purpose': 'interpolation_and_tile_parent_compatibility',
@@ -885,7 +883,6 @@ def _d1_finalize_bitset_layer(
         store_dir=Path(store_dir),
         format_name=CVOL_FORMAT,
         desc=f'D1 source-space layer {model_name}/{view.name}',
-        force_path_backed=True,
         extra_meta={
             'nrrd_layer_key': str(key),
             'producer': 'v16.1.3_d1_owner_gpu_bitset',
@@ -1554,6 +1551,8 @@ def _d1_consume_device_union(
     )
     shadow_writer = state.view_shadow_writer
     if shadow_writer is not None:
+        # The transfer concatenates uint8 crops. Row bit-packing happens later
+        # in the CPU writer; these device/host buffers still use one byte per voxel.
         crop_specs: Dict[int, Tuple[int, int, int, int, int, int]] = {}
         crop_device_parts: List[object] = []
         packed_size = 0
@@ -1698,8 +1697,8 @@ def _d1_consume_device_union(
             f'slice(s), payload={int(shadow_stats.get("raw_payload_bytes", 0)) / GIB:.3f} GiB.'
         )
 
-    # One D2H at view completion; sparse cvol construction proceeds on an independent CPU
-    # publication credit while this GPU immediately accepts the next owner view.
+    # The host bitset copy and publication-credit acquisition finish before this
+    # worker can accept its next view. Once submitted, cvol encoding runs asynchronously.
     # The CuPy backprojection stream was synchronized above. A direct Torch CPU copy is
     # therefore sufficient; retain the tensor-backed NumPy view for publication instead of
     # performing a second 2+ GiB host-to-host copy.

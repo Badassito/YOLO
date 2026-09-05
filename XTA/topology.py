@@ -32,7 +32,6 @@ from .runtime import (
     array_nbytes,
     choose_slice_parallel_workers,
     estimate_voidfill_workspace_bytes,
-    flush_array,
     interpolation_process_worker_active,
     numa_interleave_memory,
     parallel_for_indices_chunked,
@@ -229,14 +228,14 @@ def _slice_connectivity_for_3d_connectivity(connectivity: int) -> int:
         return 8
     raise ValueError('3D connectivity must be one of 6, 18, or 26')
 
-def _adjacent_gid_pair_codes(
+def _adjacent_gid_pair_codes_numpy(
     prev_gid: np.ndarray,
     curr_gid: np.ndarray,
     xy_offsets: Optional[Sequence[Tuple[int, int]]] = None,
     prev_offset: int = 0,
     curr_offset: int = 0,
 ) -> np.ndarray:
-    """Return unique touching component-id pairs encoded as uint64 values.
+    """NumPy reference and fallback for sorted, unique adjacent-slice pair codes.
 
  The upper 32 bits contain the previous-slice gid and the lower 32 bits contain the
  current-slice gid. ``prev_offset`` and ``curr_offset`` allow callers to pass per-slice
@@ -283,6 +282,261 @@ def _adjacent_gid_pair_codes(
     if len(code_parts) == 1:
         return np.asarray(code_parts[0], dtype=np.uint64)
     return np.unique(np.concatenate(code_parts).astype(np.uint64, copy=False))
+
+_ADJACENCY_INITIAL_CAPACITY = 1024
+_ADJACENCY_MAX_CAPACITY = 262144
+_NUMBA_ADJACENCY_RUNTIME_DISABLED = False
+
+if _numba is not None:
+    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+    def _numba_adjacency_hash_slot(code, mask):
+        value = code
+        value = (value ^ (value >> np.uint64(30))) * np.uint64(0xbf58476d1ce4e5b9)
+        value = (value ^ (value >> np.uint64(27))) * np.uint64(0x94d049bb133111eb)
+        value = value ^ (value >> np.uint64(31))
+        return np.int64(value & np.uint64(mask))
+
+    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+    def _numba_adjacency_scan_kernel(
+        prev, curr, offsets, prev_offset, curr_offset,
+        table, used, position, neighbor, last_code,
+    ):
+        height, width = prev.shape
+        total = height * width
+        capacity_mask = len(table) - 1
+        threshold = len(table) // 2
+        y, x = position // width, position % width
+        while y < height:
+            while x < width:
+                value = prev[y, x]
+                if value > 0:
+                    left = np.uint64(value) + prev_offset
+                    while neighbor < len(offsets):
+                        dy, dx = offsets[neighbor, 0], offsets[neighbor, 1]
+                        cy, cx = y + dy, x + dx
+                        neighbor += 1
+                        if cy < 0 or cy >= height or cx < 0 or cx >= width:
+                            continue
+                        other = curr[cy, cx]
+                        if other <= 0:
+                            continue
+                        code = (left << np.uint64(32)) | (np.uint64(other) + curr_offset)
+                        if code == last_code:
+                            continue
+                        last_code = code
+                        slot = _numba_adjacency_hash_slot(code, capacity_mask)
+                        while table[slot] != 0 and table[slot] != code:
+                            slot = (slot + 1) & capacity_mask
+                        if table[slot] == code:
+                            continue
+                        table[slot] = code
+                        used += 1
+                        if used >= threshold:
+                            return used, y * width + x, neighbor, last_code
+                x += 1
+                neighbor = 0
+            y += 1
+            x = 0
+        return used, total, 0, last_code
+
+    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+    def _numba_adjacency_rehash_kernel(source, destination):
+        mask = len(destination) - 1
+        for code in source:
+            if code == 0:
+                continue
+            slot = _numba_adjacency_hash_slot(code, mask)
+            while destination[slot] != 0:
+                slot = (slot + 1) & mask
+            destination[slot] = code
+
+    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+    def _numba_adjacency_extract_kernel(table, count):
+        result = np.empty(count, dtype=np.uint64)
+        index = 0
+        for code in table:
+            if code != 0:
+                result[index] = code
+                index += 1
+        return result
+
+    @_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+    def _numba_merge_sorted_pair_codes_kernel(a, b):
+        """Merge sorted unique batches, allocating exactly their union cardinality."""
+        if len(a) == 0:
+            return b
+        if len(b) == 0:
+            return a
+        i, j, count = 0, 0, 0
+        while i < len(a) and j < len(b):
+            if a[i] < b[j]:
+                i += 1
+            elif a[i] > b[j]:
+                j += 1
+            else:
+                i += 1
+                j += 1
+            count += 1
+        count += len(a) - i + len(b) - j
+        result = np.empty(count, dtype=np.uint64)
+        i, j, at = 0, 0, 0
+        while i < len(a) and j < len(b):
+            if a[i] < b[j]:
+                result[at] = a[i]
+                i += 1
+            elif a[i] > b[j]:
+                result[at] = b[j]
+                j += 1
+            else:
+                result[at] = a[i]
+                i += 1
+                j += 1
+            at += 1
+        while i < len(a):
+            result[at] = a[i]
+            i += 1
+            at += 1
+        while j < len(b):
+            result[at] = b[j]
+            j += 1
+            at += 1
+        return result
+else:
+    _numba_adjacency_hash_slot = None
+    _numba_adjacency_scan_kernel = None
+    _numba_adjacency_rehash_kernel = None
+    _numba_adjacency_extract_kernel = None
+    _numba_merge_sorted_pair_codes_kernel = None
+
+
+def _normalized_adjacency_offsets(
+    xy_offsets: Optional[Sequence[Tuple[int, int]]], shape: Tuple[int, int],
+) -> np.ndarray:
+    values = (
+        _adjacent_xy_offsets_for_3d_connectivity(26)
+        if xy_offsets is None else xy_offsets
+    )
+    height, width = (int(value) for value in shape)
+    # Repeated offsets do not change the set. Filter disjoint offsets before int64
+    # conversion so arbitrarily large Python integers retain the NumPy behavior.
+    offsets = tuple(dict.fromkeys((int(dy), int(dx)) for dy, dx in values))
+    offsets = tuple(
+        (dy, dx) for dy, dx in offsets
+        if -height < dy < height and -width < dx < width
+    )
+    return np.asarray(offsets, dtype=np.int64).reshape(-1, 2)
+
+
+def _compiled_adjacency_inputs_supported(
+    prev: np.ndarray, curr: np.ndarray, prev_offset: int, curr_offset: int,
+) -> bool:
+    valid_types = (np.dtype('uint16'), np.dtype('uint32'), np.dtype('int32'))
+    return bool(
+        isinstance(prev, np.ndarray) and isinstance(curr, np.ndarray)
+        and prev.ndim == curr.ndim == 2 and prev.shape == curr.shape
+        and prev.dtype in valid_types and curr.dtype in valid_types
+        and 0 <= int(prev_offset) <= 0xFFFFFFFF
+        and 0 <= int(curr_offset) <= 0xFFFFFFFF
+    )
+
+
+def _compiled_adjacent_gid_pair_codes(
+    prev_gid: np.ndarray,
+    curr_gid: np.ndarray,
+    xy_offsets: Optional[Sequence[Tuple[int, int]]] = None,
+    prev_offset: int = 0,
+    curr_offset: int = 0,
+    *,
+    initial_capacity: int = _ADJACENCY_INITIAL_CAPACITY,
+    max_capacity: int = _ADJACENCY_MAX_CAPACITY,
+) -> np.ndarray:
+    """Extract pairs with a bounded hash and exact sorted spill merges.
+
+    At the default cap the table occupies 2 MiB and each extracted batch at most
+    1 MiB. Growing the table transiently holds at most 3 MiB of table storage.
+    Old/new result arrays additionally scale with the required output cardinality;
+    unusually fragmented labels can require multiple sorted merges. Every call
+    owns its buffers, including when slab workers call this concurrently.
+    """
+    initial, maximum = int(initial_capacity), int(max_capacity)
+    if (
+        initial < 2 or initial & (initial - 1)
+        or maximum < 2 or maximum & (maximum - 1)
+        or initial > maximum
+    ):
+        raise ValueError('Adjacency hash capacities must be increasing powers of two >= 2')
+    if not _compiled_adjacency_inputs_supported(prev_gid, curr_gid, prev_offset, curr_offset):
+        raise TypeError('Compiled adjacency requires same-shaped uint16/uint32/int32 planes and uint32 offsets')
+    offsets = _normalized_adjacency_offsets(xy_offsets, prev_gid.shape)
+    if not prev_gid.size or not len(offsets):
+        return np.empty(0, dtype=np.uint64)
+    table = np.zeros(initial, dtype=np.uint64)
+    used, position, neighbor = 0, 0, 0
+    last_code = np.uint64(0)
+    merged = np.empty(0, dtype=np.uint64)
+    total = int(prev_gid.size)
+    while position < total:
+        used, position, neighbor, last_code = _numba_adjacency_scan_kernel(
+            prev_gid, curr_gid, offsets,
+            np.uint64(int(prev_offset)), np.uint64(int(curr_offset)),
+            table, used, position, neighbor, last_code,
+        )
+        # Numba boxes uint64 returns as Python ints. Preserve the unsigned type
+        # when resuming a scan whose last pair has its high bit set.
+        last_code = np.uint64(last_code)
+        if position < total and len(table) < maximum:
+            enlarged = np.zeros(min(maximum, len(table) * 2), dtype=np.uint64)
+            _numba_adjacency_rehash_kernel(table, enlarged)
+            table = enlarged
+            del enlarged
+            continue
+        batch = _numba_adjacency_extract_kernel(table, used)
+        batch.sort(kind='quicksort')
+        merged = _numba_merge_sorted_pair_codes_kernel(merged, batch)
+        del batch
+        if position >= total:
+            break
+        table.fill(0)
+        used = 0
+        # The last key is already in merged. Skipping consecutive repetitions
+        # across a spill is safe; key zero is reserved for background/vacant slots.
+    return merged
+
+
+def _adjacent_gid_pair_codes(
+    prev_gid: np.ndarray,
+    curr_gid: np.ndarray,
+    xy_offsets: Optional[Sequence[Tuple[int, int]]] = None,
+    prev_offset: int = 0,
+    curr_offset: int = 0,
+) -> np.ndarray:
+    """Return sorted unique touching pairs, previous gid high/current gid low.
+
+    The normal local-label types use one compiled scan and bounded deduplication.
+    Unsupported types and unavailable/disabled Numba retain the NumPy reference.
+    Inputs are read-only, so a compilation/execution failure can safely retry.
+    """
+    global _NUMBA_ADJACENCY_RUNTIME_DISABLED
+    if (
+        _numba_adjacency_scan_kernel is not None
+        and compiled_topology_kernels_enabled()
+        and not _NUMBA_ADJACENCY_RUNTIME_DISABLED
+        and _compiled_adjacency_inputs_supported(prev_gid, curr_gid, prev_offset, curr_offset)
+    ):
+        # Preserve iterable offsets if a native failure requires NumPy replay.
+        xy_offsets = None if xy_offsets is None else tuple(xy_offsets)
+        try:
+            return _compiled_adjacent_gid_pair_codes(
+                prev_gid, curr_gid, xy_offsets, prev_offset, curr_offset,
+            )
+        except Exception as exc:
+            if not _NUMBA_ADJACENCY_RUNTIME_DISABLED:
+                _NUMBA_ADJACENCY_RUNTIME_DISABLED = True
+                runtime_telemetry().fallback('topology.adjacency.compiled', exc)
+                print(f'Warning: compiled adjacency failed ({exc}); using NumPy pair extraction.')
+    return _adjacent_gid_pair_codes_numpy(
+        prev_gid, curr_gid, xy_offsets, prev_offset, curr_offset,
+    )
 
 def _mark_boundary_components_from_local_labels(
     uf: _UnionFind,
@@ -384,8 +638,6 @@ def fill_3d_voids_inplace_streaming(
         if np.any(enclosed):
             mask_mm[z, enclosed] = np.uint8(1)
 
-    flush_array(mask_mm)
-    flush_array(bg_gid_store)
     del bg_gid_store
     if bg_gid_path is not None and not keep_temp:
         try:
@@ -1554,6 +1806,39 @@ def _try_label_slices_stage_a_gpu(
         _free_admitted_device_pools()
         _release_stage_leases()
 
+def _slice_label_metadata_is_bounded(
+    volume: object,
+    slice_any: Optional[np.ndarray],
+    slice_bboxes: Optional[np.ndarray],
+) -> bool:
+    """Validate supplied support bounds without reading any mask pixels.
+
+    This only admits the automatic crop-CPU preference. The labeling API retains
+    its existing paired-metadata validation, normalization, and error behavior.
+    """
+    shape = tuple(int(value) for value in getattr(volume, 'shape', ()))
+    if len(shape) != 3 or slice_any is None or slice_bboxes is None:
+        return False
+    depth, height, width = shape
+    try:
+        present = np.asarray(slice_any)
+        boxes = np.asarray(slice_bboxes)
+        if present.shape != (depth,) or boxes.shape != (depth, 4):
+            return False
+        if present.dtype != np.dtype(bool) or boxes.dtype.kind not in 'iu':
+            return False
+        active = boxes[present]
+        if active.size == 0:
+            return True
+        y0, y1, x0, x1 = active.T
+        return bool(np.all(
+            (0 <= y0) & (y0 < y1) & (y1 <= height)
+            & (0 <= x0) & (x0 < x1) & (x1 <= width)
+        ))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def label_foreground_volume_streaming(
     mask_mm: np.ndarray,
     work_prefix: Path,
@@ -1571,6 +1856,14 @@ def label_foreground_volume_streaming(
     """Resolve 3D foreground topology from parallel per-slice labels and slab-local unions.
     
     The caller may request compact global labels or retain slice-local ids with lookup tables for sparse downstream work."""
+    prefer_crop_bounded_cpu_labeling = bool(
+        prefer_crop_bounded_cpu_labeling
+        or (
+            sparse_local_labels
+            and not compact_relabel
+            and _slice_label_metadata_is_bounded(mask_mm, known_slice_any, known_slice_bboxes)
+        )
+    )
     z_dim, h, w = (int(v) for v in mask_mm.shape)
     if (known_slice_any is None) != (known_slice_bboxes is None):
         raise ValueError('known_slice_any and known_slice_bboxes must be supplied together')
@@ -1624,7 +1917,6 @@ def label_foreground_volume_streaming(
         numa_interleave_memory(labels_store, desc='3D topology label store')  #
 
     if int(z_dim) <= 0:
-        flush_array(labels_store)
         return labels_store, 0, label_paths
 
     worker_count = choose_slice_parallel_workers(int(workers), int(z_dim))
@@ -1727,10 +2019,10 @@ def label_foreground_volume_streaming(
             labels_store[z_i, :, :] = np.asarray(labels2d, dtype=label_dtype)  # type: ignore[index]
         component_counts[z_i] = np.uint32(local_count)
 
-    # A source-space D1 union already carries conservative per-z bboxes. For sparse
-    # final topology, bounded CPU CCL avoids initializing the parent CuPy context and
-    # transferring/scanning the full dense 16+ GiB volume merely to recover the same
-    # slice-local labels. Dense or metadata-free callers retain the established GPU path.
+    # Known per-z support makes CPU crop labeling useful for both sparse interpolation
+    # and final topology: it avoids CUDA initialization and a dense H2D scan just to
+    # recover local labels. The coverage policy still selects GPU labeling for dense
+    # support, and callers without valid bounds retain their established preference.
     sparse_cpu_selected = False
     support_nonempty = 0
     support_bbox_pixels = 0
@@ -1815,7 +2107,6 @@ def label_foreground_volume_streaming(
 
     total_components = int(np.sum(component_counts, dtype=np.uint64))
     if total_components <= 0:
-        flush_array(labels_store)
         return labels_store, 0, label_paths
     if total_components >= 2 ** 32:
         raise RuntimeError('3D component id space exceeded uint32 capacity')
@@ -2129,7 +2420,6 @@ def label_foreground_volume_streaming(
         f'{float(topology_boundary_seconds) + float(topology_root_seconds):.3f}s.'
     )
     if root_map.shape[0] <= 1:
-        flush_array(labels_store)
         return labels_store, 0, label_paths
 
     unique_roots = np.unique(root_map[1:])
@@ -2198,7 +2488,6 @@ def label_foreground_volume_streaming(
     if not compact_relabel:
         # the caller consumes per-slice LOCAL ids through root LUTs — skip the
         # full-volume relabel write pass entirely.
-        flush_array(labels_store)
         return labels_store, int(unique_roots.size), label_paths
 
     kernel_done = False
@@ -2255,7 +2544,6 @@ def label_foreground_volume_streaming(
                 ):
                     pass
 
-    flush_array(labels_store)
     return labels_store, int(unique_roots.size), label_paths
 
 def build_slice_endpoint_seeds_from_label_volume(

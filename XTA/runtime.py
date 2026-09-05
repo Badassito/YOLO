@@ -135,7 +135,7 @@ class RuntimeTelemetry:
         else:
             base = os.environ.get('SLURM_JOB_ID') or str(os.getpid())
             self.path = Path(tempfile.gettempdir()) / (
-                f'gpt56-sol-ultra-v{SCRIPT_VERSION_COMPACT}-'
+                f'gpt6-astra-ultra-v{SCRIPT_VERSION_COMPACT}-'
                 f'telemetry-{base}-{os.getpid()}.jsonl'
             )
 
@@ -207,7 +207,7 @@ class RuntimeTelemetry:
                     'mean_ms': (seconds * 1000.0 / calls) if calls else 0.0,
                 }
             payload: Dict[str, object] = {
-                'schema': f'gpt-5.6-sol-ultra-v{SCRIPT_VERSION}.telemetry.v1',
+                'schema': f'gpt-6-astra-ultra-v{SCRIPT_VERSION}.telemetry.v1',
                 'pid': os.getpid(),
                 'monotonic_seconds': (now_ns - self.started_ns) / 1e9,
                 'wall_time': time.time(),
@@ -1608,9 +1608,6 @@ def memfd_workspace_enabled() -> bool:
         and _env_flag('YOLO_TTA_MEMFD_WORKSPACES', True)
     )
 
-def raw_store_memfd_enabled() -> bool:
-    """Keep cvol/ctile payloads in bounded pathname storage."""
-    return False
 
 def _memfd_label(value: object) -> str:
     token = re.sub(r'[^A-Za-z0-9_.+-]+', '-', str(value)).strip('-')
@@ -1908,79 +1905,14 @@ def _madvise_dontneed_array(arr: object) -> None:
             return
         current = getattr(current, 'base', None)
 
-def _create_memfd_backed_payload_path(path: Path, desc: str) -> int:
-    """Create ``path`` as a symlink to a parent-owned memfd and return a writer fd."""
-    if not raw_store_memfd_enabled():
-        raise OSError('memfd cvol payloads are disabled')
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _release_memfd_owner_key(str(path.absolute()))
-    try:
-        path.unlink(missing_ok=True)
-    except Exception:
-        pass
-    flags = int(getattr(os, 'MFD_CLOEXEC', 0)) | int(getattr(os, 'MFD_ALLOW_SEALING', 0))
-    owner_fd = os.memfd_create(_memfd_label(desc), flags=flags)
-    writer_fd: Optional[int] = None
-    target = _memfd_proc_path(int(owner_fd))
-    try:
-        writer_fd = int(os.dup(int(owner_fd)))
-        os.symlink(str(target), str(path))
-        _register_memfd_owner(str(path.absolute()), int(owner_fd), str(desc))
-        owner_fd = -1  # registry owns it now
-        return int(writer_fd)
-    except BaseException:
-        if writer_fd is not None:
-            try:
-                os.close(int(writer_fd))
-            except OSError:
-                pass
-        try:
-            path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        if int(owner_fd) >= 0:
-            try:
-                os.close(int(owner_fd))
-            except OSError:
-                pass
-        raise
 
 @contextlib.contextmanager
-def open_raw_store_payload_writer(
-    path: Path,
-    desc: str,
-    *,
-    force_path_backed: bool = False,
-) -> Iterator[object]:
-    """Open a cvol payload, using a path-compatible memfd only when explicitly enabled."""
-    writer_fd: Optional[int] = None
-    if raw_store_memfd_enabled() and not bool(force_path_backed):
-        try:
-            writer_fd = _create_memfd_backed_payload_path(Path(path), str(desc))
-        except Exception as exc:
-            runtime_telemetry().fallback('cvol.memfd', exc)
-            writer_fd = None
-    if writer_fd is not None:
-        try:
-            with os.fdopen(int(writer_fd), 'wb', buffering=0) as handle:
-                yield handle
-        finally:
-            # fdopen owns writer_fd.  The separately registered owner fd remains live.
-            pass
-        return
+def open_raw_store_payload_writer(path: Path) -> Iterator[object]:
+    """Open a pathname-backed cvol payload for publication."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with Path(path).open('wb') as handle:
         yield handle
 
-def flush_array(arr: object, *, force: bool = False) -> None:
-    """Compatibility no-op for ephemeral scratch mappings.
-
-    NumPy memmaps use shared mappings, so same-host readers observe dirty pages without
-    synchronous ``msync``. Scratch files are retired rather than used as durability records;
-    forcing writeback only adds I/O before cleanup.
-    """
-    return
 
 @runtime_telemetry_phase('workspace.allocate')
 def allocate_workspace_array(
@@ -2178,7 +2110,6 @@ def copy_workspace_array(
         telemetry.gauge('workspace.copy.requested_backend', 'cpu')
         telemetry.gauge('workspace.copy.selected_backend', 'cpu')
         _copy_workspace_array_cpu(dst, src, workers=int(workers), desc=desc)
-        flush_array(dst)
         return dst
 
     telemetry = runtime_telemetry()
@@ -2201,7 +2132,6 @@ def copy_workspace_array(
         telemetry.fallback('workspace.copy.dsa.ineligible', exc)
         telemetry.gauge('workspace.copy.selected_backend', 'cpu')
         _copy_workspace_array_cpu(dst, src, workers=int(workers), desc=desc)
-        flush_array(dst)
         return dst
 
     # Capability failures occur before native submission and are therefore safe initial
@@ -2217,7 +2147,6 @@ def copy_workspace_array(
         telemetry.fallback('workspace.copy.dsa.unavailable', exc)
         telemetry.gauge('workspace.copy.selected_backend', 'cpu')
         _copy_workspace_array_cpu(dst, src, workers=int(workers), desc=desc)
-        flush_array(dst)
         return dst
 
     try:
@@ -2268,7 +2197,6 @@ def copy_workspace_array(
         telemetry.gauge('workspace.copy.selected_backend', 'cpu_recopy_after_dsa')
         try:
             _copy_workspace_array_cpu(dst, src, workers=int(workers), desc=desc)
-            flush_array(dst)
             return dst
         except BaseException:
             _discard_failed_workspace_copy(dst, path)
@@ -2289,7 +2217,6 @@ def copy_workspace_array(
     )
     telemetry.gauge('workspace.copy.dsa.buffers_quarantined', False)
     telemetry.gauge('workspace.copy.selected_backend', 'dsa')
-    flush_array(dst)
     return dst
 
 _PARALLEL_POOL_CACHE: Dict[int, List[ThreadPoolExecutor]] = {}
@@ -2675,33 +2602,45 @@ def register_unique_run_scratch_cleanup(path: Path, *, keep_temp: bool) -> None:
             pass
 
 def _mount_fstype_for_path(path: Path) -> Optional[str]:
-    """Filesystem type of the longest mount point containing ``path``, or None if unknown."""
+    """Resolve the effective Linux mount, including bind mounts over existing mounts.
+
+    The descriptor's kernel mount ID avoids choosing a covered host mount or a
+    hidden descendant by pathname alone. Missing paths use the nearest existing
+    ancestor. Other platforms or unavailable proc metadata return None.
+    """
+    if not hasattr(os, 'O_PATH'):
+        return None
     try:
         target = Path(path).resolve()
     except Exception:
         target = Path(path)
-    try:
-        lines = Path('/proc/mounts').read_text().splitlines()
-    except Exception:
-        return None
-    best_depth = -1
-    best_fstype: Optional[str] = None
-    for line in lines:
-        parts = line.split()
-        if len(parts) < 3:
-            continue
+    descriptor: Optional[int] = None
+    while descriptor is None:
         try:
-            # proc/mounts octal-escapes spaces and friends in the mount point.
-            mount_point = Path(parts[1].replace('\\040', ' '))
-        except Exception:
-            continue
-        if target != mount_point and mount_point not in target.parents:
-            continue
-        depth = len(mount_point.parts)
-        if depth > best_depth:
-            best_depth = depth
-            best_fstype = str(parts[2])
-    return best_fstype
+            descriptor = os.open(str(target), os.O_PATH | getattr(os, 'O_CLOEXEC', 0))
+        except (FileNotFoundError, NotADirectoryError):
+            if target.parent == target:
+                return None
+            target = target.parent
+        except OSError:
+            return None
+    try:
+        fdinfo = Path(f'/proc/self/fdinfo/{descriptor}').read_text()
+        mount_id = next(
+            int(line.split(':', 1)[1].strip())
+            for line in fdinfo.splitlines() if line.startswith('mnt_id:')
+        )
+        for line in Path('/proc/self/mountinfo').read_text().splitlines():
+            before, separator, after = line.partition(' - ')
+            fields = before.split()
+            if separator and fields and fields[0] == str(mount_id):
+                filesystem = after.split()
+                return filesystem[0] if filesystem else None
+        return None
+    except (OSError, ValueError, StopIteration):
+        return None
+    finally:
+        os.close(descriptor)
 
 def path_is_memory_backed(path: Path) -> bool:
     """True when ``path`` lives on tmpfs/ramfs/hugetlbfs, i.e. its 'files' are RAM pages."""
@@ -2819,7 +2758,6 @@ def close_memmap_array(arr: object) -> None:
             except Exception:
                 pass
             return
-        flush_array(arr)
         if owner_key is not None:
             _madvise_dontneed_array(arr)
         root = _root_memmap_for_array(arr)
@@ -2853,14 +2791,6 @@ def close_memmap_array_without_flush(arr: object) -> None:
     finally:
         if owner_key is not None:
             _release_memfd_owner_key(owner_key)
-
-def prediction_volume_build_flush_enabled() -> bool:
-    """Return True to force flushing YOLO input volumes before inference."""
-    return False
-
-def prediction_hot_path_flush_enabled() -> bool:
-    """Return True to force per-source prediction accumulation memmap flushes."""
-    return False
 
 _INTERPOLATION_PROCESS_EXECUTOR: Optional[ProcessPoolExecutor] = None
 
@@ -3296,7 +3226,6 @@ def _ensure_process_backed_interpolation_volume(
 
     backing_path = _interpolation_array_backing_path(mask_mm)
     if backing_path is not None:
-        flush_array(mask_mm)
         return mask_mm, Path(backing_path), False
 
     work_dir = Path(work_dir)
@@ -3309,7 +3238,6 @@ def _ensure_process_backed_interpolation_volume(
         prefer_memory=False,
         workers=int(workers),
     )
-    flush_array(process_mm)
     return process_mm, process_path, True
 
 def _interpolation_process_entry(
@@ -3378,7 +3306,6 @@ def _interpolation_process_entry(
             'process_workers_inside_pass': int(workers),
             'process_memmap_path': str(mask_path),
         })
-        flush_array(mask_mm)
         return stats
     finally:
         close_memmap_array(mask_mm)
@@ -3490,9 +3417,6 @@ def interpolate_view_volume_pass_maybe_process(
 
     shape = tuple(int(x) for x in np.asarray(worker_mm).shape)
     dtype_str = str(np.asarray(worker_mm).dtype)
-    flush_array(process_mm)
-    if worker_mm is not process_mm:
-        flush_array(worker_mm)
 
     def _discard_speculative_worker_storage() -> None:
         if worker_mm is process_mm:
@@ -3526,7 +3450,6 @@ def interpolate_view_volume_pass_maybe_process(
                     desc=f'Committing interpolation transaction {pass_tag}',
                     show_progress=False,
                 )
-                flush_array(process_mm)
             if staged_bridge_path is not None and bridge_delta_path is not None:
                 if Path(staged_bridge_path).exists():
                     Path(bridge_delta_path).parent.mkdir(parents=True, exist_ok=True)
@@ -3640,7 +3563,6 @@ def interpolate_view_volume_pass_maybe_process(
                 stats['process_backend'] = 'gpu_worker_aux_process'
             stats['process_memmap_copied_from_anonymous_array'] = bool(copied_to_memmap)
             stats['process_pool_workers'] = int(_INTERPOLATION_PROCESS_MAX_WORKERS)
-            flush_array(result_mm)
             return result_mm, stats
 
     try:
@@ -3666,5 +3588,4 @@ def interpolate_view_volume_pass_maybe_process(
     stats.setdefault('process_backend', 'process_pool_memmap')
     stats['process_memmap_copied_from_anonymous_array'] = bool(copied_to_memmap)
     stats['process_pool_workers'] = int(_INTERPOLATION_PROCESS_MAX_WORKERS)
-    flush_array(result_mm)
     return result_mm, stats

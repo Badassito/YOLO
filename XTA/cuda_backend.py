@@ -41,7 +41,6 @@ from .workspace import (
 )
 from .runtime import (
     choose_slice_parallel_workers,
-    flush_array,
     parallel_for_indices,
 )
 from .geometry import (
@@ -147,9 +146,6 @@ def union_conf_volume_into_volume_inplace(
         desc=desc,
         show_progress=False,
     )
-    flush_array(dst_mask_mm)
-    if dst_conf_mm is not None:
-        flush_array(dst_conf_mm)
 
 def gpu_worker_render_enabled() -> bool:
     """Render eligible full-frame views on the worker GPU."""

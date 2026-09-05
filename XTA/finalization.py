@@ -41,7 +41,6 @@ from .runtime import (
     allocate_workspace_array,
     choose_slice_parallel_workers,
     close_memmap_array,
-    flush_array,
     parallel_for_indices,
     parallel_for_indices_chunked,
     runtime_telemetry,
@@ -181,12 +180,155 @@ def _union_projected_layer_refs_grouped_into_volume(
     workers: int = 1,
     desc: str = 'Grouped layer union',
 ) -> None:
-    """OR projected layers into an existing union, grouping equal restore geometry.
+    """OR sparse temporal restores directly, retaining grouped XY restoration."""
+    refs_i = tuple(refs)
+    if not refs_i:
+        return
+    try:
+        if _try_union_temporal_sparse_layer_refs_into_volume(
+            refs_i, vol_mm, workers=int(workers), desc=str(desc),
+        ):
+            return
+    except (ValueError, OSError, IndexError):
+        # Replay through the general reader's validation/error path. Every completed
+        # temporal write was normalized and is an idempotent subset of that union.
+        # The parallel helper settles all workers before propagating an exception.
+        pass
+    _union_projected_layer_refs_with_dense_restore_into_volume(
+        refs_i, vol_mm, workers=int(workers), desc=str(desc),
+    )
 
-    This is the incremental counterpart of the G5 final-fusion path.  Unlike G5 it
-    performs read/modify/write on an already-populated destination, while retaining the
-    important ``N layers -> one resize`` property for reduced component stores.
+
+def _array_backing_paths_for_sparse_union(array: np.ndarray) -> set[Path]:
+    """Find file mappings beneath ndarray views without reading their payload."""
+    seen: set[int] = set()
+    paths: set[Path] = set()
+    item: object = array
+    while item is not None and id(item) not in seen:
+        seen.add(id(item))
+        name = getattr(item, 'filename', None)
+        if name is not None:
+            try:
+                paths.add(Path(name).resolve())
+            except (TypeError, ValueError, OSError):
+                pass
+        item = getattr(item, 'base', None)
+    return paths
+
+
+def _try_union_temporal_sparse_layer_refs_into_volume(
+    refs: Sequence['NrrdLayerRef'],
+    destination: np.ndarray,
+    *,
+    workers: int,
+    desc: str,
+) -> bool:
+    """Union selected source-z crops when no XY resizing is required.
+
+    Native and temporal stores remain read-only. Each task owns one output slice;
+    its source indices use the same interval/nearest-index rule as grouped restore.
+    False retains the general path for unsupported geometry, ownership or data.
     """
+    if not refs or not isinstance(destination, np.ndarray) or destination.ndim != 3:
+        return False
+    if (
+        destination.dtype != np.uint8
+        or not destination.flags.writeable
+        or not destination.flags.c_contiguous
+    ):
+        return False
+    out_t, out_h, out_w = (int(value) for value in destination.shape)
+    if min(out_t, out_h, out_w) <= 0:
+        return False
+    if any(
+        str(getattr(ref, 'layer_role', 'additive_component')) != 'additive_component'
+        or str(getattr(ref, 'recomposition_op', 'union')) != 'union'
+        or not _nrrd_layer_ref_is_raw_bbox_store(ref)
+        for ref in refs
+    ):
+        return False
+
+    sources: List[RawBBoxMaskStore] = []
+    try:
+        destination_paths = _array_backing_paths_for_sparse_union(destination)
+        for ref in refs:
+            store = RawBBoxMaskStore.open(ref.path, mmap_payload=True)
+            sources.append(store)
+            if type(store) is not RawBBoxMaskStore:
+                return False
+            if tuple(int(value) for value in store.shape[1:]) != (out_h, out_w):
+                return False
+            if store.chunks_path.resolve() in destination_paths:
+                return False
+            if (
+                store.meta.get('logical_dtype_in_pipeline') != 'uint8_0_or_1'
+                or store.meta.get('dtype') != 'bool'
+            ):
+                return False
+        native = [store for store in sources if int(store.shape[0]) == out_t]
+        temporal = [store for store in sources if int(store.shape[0]) != out_t]
+        if not temporal:
+            return False
+        ordered_sources = tuple(native + temporal)
+        noncanonical_slices = np.zeros((out_t,), dtype=bool)
+
+        def _merge_slice(out_z: int) -> None:
+            target = destination[int(out_z)]
+            noncanonical = False
+            indices_by_depth = {out_t: [int(out_z)]}
+            for store in ordered_sources:
+                depth = int(store.shape[0])
+                indices = indices_by_depth.get(depth)
+                if indices is None:
+                    indices = _restore_source_indices_for_output_z(depth, out_t, int(out_z))
+                    indices_by_depth[depth] = indices
+                for source_z in indices:
+                    decoded = store.decode_slice_crop(int(source_z), dtype=np.uint8)
+                    if decoded is None:
+                        continue
+                    y0, x0, y1, x1, crop = decoded
+                    invalid_binary = bool(
+                        not store._packbits_payload and crop.size and int(crop.max()) > 1
+                    )
+                    noncanonical = noncanonical or invalid_binary
+                    if invalid_binary and depth != out_t:
+                        # Normalization distributes over binary OR. Preserve native
+                        # values as the general path does, but normalize temporal
+                        # crops before a possible replay of noncanonical input.
+                        crop = np.not_equal(crop, 0)
+                    window = target[int(y0):int(y1), int(x0):int(x1)]
+                    np.bitwise_or(window, crop, out=window)
+                    del decoded, crop, window
+            noncanonical_slices[int(out_z)] = noncanonical
+
+        worker_count = choose_slice_parallel_workers(int(workers), out_t)
+        band_slices = max(worker_count, min(256, out_t))
+        for band0 in range(0, out_t, band_slices):
+            band1 = min(out_t, band0 + band_slices)
+            parallel_for_indices_chunked(
+                band1 - band0,
+                lambda local_z, _start=band0: _merge_slice(_start + int(local_z)),
+                max_workers=min(worker_count, band1 - band0),
+                desc=desc,
+                show_progress=False,
+                target_chunks_per_worker=2,
+            )
+        # All writers are quiescent. Replaying noncanonical input through the
+        # general path is safe because the completed OR writes are idempotent.
+        return not bool(noncanonical_slices.any())
+    finally:
+        for store in reversed(sources):
+            store.close()
+
+
+def _union_projected_layer_refs_with_dense_restore_into_volume(
+    refs: Sequence['NrrdLayerRef'],
+    vol_mm: np.ndarray,
+    *,
+    workers: int = 1,
+    desc: str = 'Grouped layer union',
+) -> None:
+    """General grouped restore for XY resizing, generic sources and fallbacks."""
     refs_i = tuple(refs)
     if not refs_i:
         return
@@ -1443,11 +1585,9 @@ def assemble_view_volumes_and_projected_layers_fused(
             return True
 
         if _try_native_sparse_cpu_final_fusion():
-            flush_array(final_union_mm)
             return
 
         if _try_gpu_final_fusion():
-            flush_array(final_union_mm)
             return
 
         def _merge_out_slice(out_z: int) -> None:
@@ -1586,7 +1726,6 @@ def assemble_view_volumes_and_projected_layers_fused(
                     target_chunks_per_worker=4,
                 )
                 pbar.update(int(band_count))
-        flush_array(final_union_mm)
     finally:
         for _ref, src in opened:
             try:
@@ -1613,7 +1752,7 @@ def assemble_current_view_union_volume(
     uses source geometry when requested."""
     if len(view_volumes_by_model) != 1:
         raise ValueError(
-            f'GPT-5.6-Sol-Ultra v{SCRIPT_VERSION} expected one logical GPU/CPU model pair; '
+            f'GPT-6-Astra-Ultra v{SCRIPT_VERSION} expected one logical GPU/CPU model pair; '
             f'found {len(view_volumes_by_model)} result namespaces'
         )
 
@@ -1662,7 +1801,6 @@ def assemble_current_view_union_volume(
             _union_projected_layer_ref_into_volume(
                 ref, final_union_mm, workers=int(workers), desc=f'Fallback final union: OR {ref.key}',
             )
-    flush_array(final_union_mm)
     return final_union_mm
 
 def union_volume_into_volume(
@@ -1696,7 +1834,6 @@ def union_volume_into_volume(
         desc=desc,
         show_progress=False,
     )
-    flush_array(dst_mm)
     return int(np.sum(counts, dtype=np.int64)) if counts is not None else 0
 
 @runtime_telemetry_phase('post.keep_objects')
@@ -1915,7 +2052,6 @@ def apply_keep_largest_objects_inplace(
             desc=f'keep_objects: keep largest {keep_n}',
             show_progress=True,
         )
-    flush_array(mask_mm)
     apply_seconds = float(time.perf_counter() - apply_started)
 
     close_memmap_array(labels_mm)
@@ -3850,7 +3986,6 @@ def _v14_apply_component_removal_plan(
         desc='v14 centerline: applying safe 2D component removals',
         show_progress=True,
     )
-    flush_array(mask_mm)
     return int(np.sum(removed_counts, dtype=np.int64))
 
 def _v14_plan_components_and_write_sparse_audits(

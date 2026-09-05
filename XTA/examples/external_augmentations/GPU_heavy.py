@@ -11,7 +11,8 @@ The port is distribution-compatible rather than pixel-identical:
 * Optional elastic displacement is added to that grid, so image and mask each
   incur one geometric resampling pass.
 * Brightness and the selected noise family are applied on CUDA tensors.
-* Gaussian blur is executed only for selected samples.
+* Gaussian blur is executed only for selected samples; blur and elastic
+  smoothing use separable Gaussian passes.
 * ``None`` seeds identify unaugmented originals; integer seeds are deterministic
   across GPU count and batch size.
 """
@@ -38,25 +39,39 @@ def _subseed(seed: int, salt: int) -> int:
     return value or 1
 
 
-def _gaussian_kernel_2d(sigma: float, *, device: torch.device) -> torch.Tensor:
+def _gaussian_kernel_1d(sigma: float, *, device: torch.device) -> torch.Tensor:
     sigma_f = max(0.05, float(sigma))
     radius = max(1, int(math.ceil(3.0 * sigma_f)))
     coords = torch.arange(-radius, radius + 1, device=device, dtype=torch.float32)
-    kernel_1d = torch.exp(-(coords * coords) / (2.0 * sigma_f * sigma_f))
-    kernel_1d = kernel_1d / kernel_1d.sum()
-    return kernel_1d[:, None] * kernel_1d[None, :]
+    kernel = torch.exp(-(coords * coords) / (2.0 * sigma_f * sigma_f))
+    return kernel / kernel.sum()
+
+
+def _separable_gaussian(sample: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Filter NCHW tensors independently per channel using two 1D passes."""
+    channels = int(sample.shape[1])
+    kernel = _gaussian_kernel_1d(float(sigma), device=sample.device)
+    radius = int(kernel.shape[0]) // 2
+    # Use one boundary mode for both axes, including narrow source ROIs.
+    pad_mode = "reflect" if min(int(sample.shape[-2]), int(sample.shape[-1])) > radius else "replicate"
+    horizontal = kernel.view(1, 1, 1, -1).repeat(channels, 1, 1, 1)
+    vertical = kernel.view(1, 1, -1, 1).repeat(channels, 1, 1, 1)
+    intermediate = F.conv2d(
+        F.pad(sample, (radius, radius, 0, 0), mode=pad_mode),
+        horizontal,
+        groups=channels,
+    )
+    return F.conv2d(
+        F.pad(intermediate, (0, 0, radius, radius), mode=pad_mode),
+        vertical,
+        groups=channels,
+    )
 
 
 def _blur_sample(sample: torch.Tensor, sigma: float) -> torch.Tensor:
     if float(sigma) <= 0.05:
         return sample
-    channels = int(sample.shape[1])
-    kernel = _gaussian_kernel_2d(float(sigma), device=sample.device)
-    radius = int(kernel.shape[0]) // 2
-    weight = kernel.view(1, 1, *kernel.shape).repeat(channels, 1, 1, 1)
-    pad_mode = "reflect" if min(int(sample.shape[-2]), int(sample.shape[-1])) > radius else "replicate"
-    padded = F.pad(sample, (radius, radius, radius, radius), mode=pad_mode)
-    return F.conv2d(padded, weight, groups=channels)
+    return _separable_gaussian(sample, float(sigma))
 
 
 def _fused_pointwise(
@@ -198,12 +213,7 @@ class GPUAugmentation:
             dtype=torch.float32,
             generator=generator,
         ) * 2.0 - 1.0
-        kernel = _gaussian_kernel_2d(5.0, device=self.device)
-        radius = int(kernel.shape[0]) // 2
-        weight = kernel.view(1, 1, *kernel.shape).repeat(2, 1, 1, 1)
-        pad_mode = "reflect" if min(int(height), int(width)) > radius else "replicate"
-        padded = F.pad(noise, (radius, radius, radius, radius), mode=pad_mode)
-        return F.conv2d(padded, weight, groups=2)[0] * 27.5
+        return _separable_gaussian(noise, 5.0)[0] * 27.5
 
     def _apply_intensity_noise(
         self,
@@ -452,7 +462,7 @@ class GPUAugmentation:
         seeds: Sequence[Optional[int]],
         output_size: Tuple[int, int],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compatibility wrapper for one-source GPU policy callers."""
+        """Apply the batched policy to one source ROI."""
 
         return self.apply_batch_many(
             images=(image,),

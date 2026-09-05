@@ -76,7 +76,7 @@ class LtaOutputTests(unittest.TestCase):
             path = Path(temp_dir) / "manifest.json"
             written = write_complete_lta_manifest(
                 path,
-                version="19.0.2",
+                version="19.0.3",
                 command=("xta", "--mode", "lta"),
                 layers=(layer,),
                 publication_receipt=LtaPublicationReceipt(
@@ -101,7 +101,7 @@ class LtaOutputTests(unittest.TestCase):
         self.assertEqual(record["schema"], LTA_MANIFEST_SCHEMA)
         self.assertEqual(record["status"], "complete")
         self.assertEqual(record["mode"], "lta")
-        self.assertEqual(record["pipeline_version"], "19.0.2")
+        self.assertEqual(record["pipeline_version"], "19.0.3")
         self.assertEqual(record["layers"][0]["shape_tyx"], [1, 2, 3])
         self.assertEqual(record["custom"], 7)
         self.assertTrue(record["publication_integrity"]["source_revalidated"])
@@ -118,7 +118,7 @@ class LtaOutputTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "digest changed"):
                 write_complete_lta_manifest(
                     root / "manifest.json",
-                    version="19.0.2",
+                    version="19.0.3",
                     command=(),
                     layers=(layer,),
                     publication_receipt=LtaPublicationReceipt(

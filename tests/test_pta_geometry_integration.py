@@ -453,7 +453,6 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
             foreground_preservation_stats={
                 "input_foreground_transverse_slices": 3,
             },
-            v18_mode=True,
         )
 
         self.assertEqual(
@@ -552,7 +551,6 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
                     "classified_output_foreground_transverse_slices": 0,
                     "retained_output_foreground_transverse_slices": 0,
                 },
-                v18_mode=True,
             )
             arguments = [
                 "--input",
@@ -674,8 +672,6 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
                 out_dir=Path(temp_dir),
                 tile_configs=(),
                 channel_variants=channel_variants,
-                requested_tilt_angles=(),
-                requested_tilt_directions=(),
                 write_side_effects=False,
                 allocator=None,
             )
@@ -1019,7 +1015,7 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
             )
             voxel = json.loads(voxel_path.read_text())
 
-        self.assertEqual(manifest["pipeline_version"], "19.0.2")
+        self.assertEqual(manifest["pipeline_version"], "19.0.3")
         self.assertEqual(manifest["mode"], "pta")
         self.assertEqual(
             manifest["determinism_contract"],

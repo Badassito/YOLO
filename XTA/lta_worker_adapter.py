@@ -169,32 +169,6 @@ def _window_from_payload(record: Mapping[str, object]):
     )
 
 
-def _write_raw_union(path: Path, volume: object) -> dict[str, object]:
-    import numpy as np
-
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    stage = destination.with_name(f".{destination.name}.partial")
-    array = np.asarray(volume, dtype=np.uint8)
-    try:
-        with stage.open("wb") as handle:
-            for frame in array:
-                handle.write(np.ascontiguousarray(frame, dtype=np.uint8).tobytes(order="C"))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(stage, destination)
-    except BaseException:
-        stage.unlink(missing_ok=True)
-        raise
-    return {
-        "path": str(destination.resolve()),
-        "sha256": _sha256_file(destination),
-        "size_bytes": int(destination.stat().st_size),
-        "shape": [int(value) for value in array.shape],
-        "dtype": "uint8",
-    }
-
-
 def _half_open_frame_ranges(values: Sequence[int]) -> list[list[int]]:
     ordered = sorted(set(int(value) for value in values))
     if not ordered:

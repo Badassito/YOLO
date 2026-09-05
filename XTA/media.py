@@ -42,7 +42,6 @@ from .runtime import (
     choose_parallel_chunk_size,
     choose_slice_parallel_workers,
     close_memmap_array,
-    flush_array,
     parallel_for_indices_chunked,
 )
 
@@ -427,7 +426,6 @@ def decode_video_to_memmap_gray8(
                         raise RuntimeError(f'Unexpected EOF while decoding frames starting at {start}/{num_frames}')
                     filled += int(nread)
                 pbar.update(int(nframes))
-        flush_array(arr)
     finally:
         if proc.stdout:
             proc.stdout.close()
@@ -513,7 +511,6 @@ def decode_video_to_memmap_gray8_streaming(
                     for frame_idx in range(int(start), int(start) + int(nframes)):
                         readiness.mark_slice_ready(int(frame_idx))
                     pbar.update(int(nframes))
-            flush_array(arr)
             readiness.mark_all_ready()
         except BaseException as exc:
             # Loud failure: waking every waiter with the root cause is what turns a silent
@@ -571,9 +568,6 @@ def processing_volume_mode() -> str:
     return 'cube'
 
 def should_resize_to_processing_cube(input_shape: Tuple[int, int, int], cube_shape: Tuple[int, int, int]) -> bool:
-    mode = processing_volume_mode()
-    if mode != 'cube':
-        return False
     return tuple(int(x) for x in input_shape) != tuple(int(x) for x in cube_shape)
 
 def _linear_source_index(out_idx: int, out_count: int, in_count: int) -> float:
@@ -620,7 +614,7 @@ def _resize_gray_slice_nearest_or_linear(
 def _cube_t_axis_resize_backend() -> str:
     """Backend used when cubic resizing only changes the slice axis.
 
- ``slab`` is the default because the common 3072x3072x1930 -> approximately
+ ``slab`` is used because the common 3072x3072x1930 -> approximately
  cubic case does not need XY resampling. It processes row slabs through
  OpenCV's native vertical resize and fans the slabs out across Python worker
  threads."""
@@ -721,7 +715,6 @@ def resize_volume_t_axis_only_gray8_slab(
             except Exception:
                 pass
 
-    flush_array(out_mm)
     return out_mm
 
 def resize_volume_to_processing_cube_gray8(
@@ -739,7 +732,7 @@ def resize_volume_to_processing_cube_gray8(
     if (in_t, in_h, in_w) == (out_t, out_h, out_w):
         return volume_gray
 
-    if in_h == out_h and in_w == out_w and _cube_t_axis_resize_backend() == 'slab':
+    if in_h == out_h and in_w == out_w:
         return resize_volume_t_axis_only_gray8_slab(
             volume_gray,
             out_t,
@@ -789,7 +782,6 @@ def resize_volume_to_processing_cube_gray8(
         desc='Resizing orthogonal volume to v12.2.0 cube',
         chunk_size=chunk_size,
     )
-    flush_array(out_mm)
     return out_mm
 
 def resize_categorical_volume_to_processing_cube_uint8(
@@ -879,7 +871,6 @@ def resize_categorical_volume_to_processing_cube_uint8(
         desc='Resizing categorical volume to processing cube',
         chunk_size=chunk_size,
     )
-    flush_array(out_mm)
     return out_mm
 
 def resize_volume_to_processing_cube_gray8_streaming(
@@ -939,7 +930,6 @@ def resize_volume_to_processing_cube_gray8_streaming(
                 int(out_t), _render_target_slice, max_workers=worker_count,
                 desc='Streaming resize orthogonal volume to v12.2.0 cube', chunk_size=chunk_size,
             )
-            flush_array(out_mm)
             readiness.mark_all_ready()
         except BaseException as exc:
             readiness.mark_failed(exc)
@@ -1076,7 +1066,6 @@ class LazyProcessingCube:
                         workers=int(self.workers),
                         prefer_memory=False,
                     )
-                flush_array(built)
                 # The worker-visible sentinel is the transaction commit record. Publish it
                 # before exposing the local array so local and subprocess consumers cannot
                 # disagree about whether the shared cube is usable.
@@ -1135,11 +1124,6 @@ class LazyProcessingCube:
     def __getitem__(self, key):
         return self.materialize()[key]
 
-    def flush(self) -> None:
-        with self._lock:
-            arr = self._array
-        if arr is not None:
-            flush_array(arr)
 
     def close(self) -> None:
         self._stop.set()
@@ -1211,7 +1195,6 @@ def restore_mask_volume_to_original_shape(
         desc='Restoring final mask to original input geometry',
         chunk_size=chunk_size,
     )
-    flush_array(out_mm)
     return out_mm
 
 def resolve_radial_azimuth_angles(

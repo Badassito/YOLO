@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import math
 import shutil
 import threading
+import tempfile
+import time
 from dataclasses import replace as dataclasses_replace
 from pathlib import Path
 from typing import (
+    Iterator,
     Callable,
     Dict,
     List,
@@ -18,7 +22,7 @@ from typing import (
     Tuple,
 )
 import numpy as np
-from ._deps import cv2, ndi, tqdm
+from ._deps import _numba, cv2, ndi, tqdm
 from .gaussian import binary_gaussian_pass
 
 from .config import (
@@ -31,7 +35,6 @@ from .runtime import (
     close_memmap_array,
     close_memmap_array_without_flush,
     copy_workspace_array,
-    flush_array,
     interpolate_view_volume_pass_maybe_process,
     parallel_for_indices_chunked,
     parallel_map_in_order,
@@ -62,6 +65,7 @@ from .geometry import (
 from .inference import cleanup_view_volume_after_prediction_inplace
 from .interpolation import (
     CTILE_FORMAT,
+    CTILE_INDEX_DTYPE,
     CVOL_FORMAT,
     DeferredTilePostprocessResult,
     INTERNAL_PACKED_CVOL_FORMAT,
@@ -282,7 +286,6 @@ def project_view_volume_to_orthogonal_volume(
     else:  # pragma: no cover
         raise ValueError(f'Unsupported view for orthogonal NRRD projection: {view.name}/{view.family}')
 
-    flush_array(out)
     return out
 
 @runtime_telemetry_phase('projection.materialize')
@@ -388,7 +391,6 @@ def materialize_nrrd_view_layer(
                 format_name=bbox_store_format,
                 desc=f'NRRD layer {key}',
                 extra_meta=incremental_extra_meta,
-                force_path_backed=bool(force_path_backed_store),
             )
             projection_block_callback = incremental_writer
         except Exception as exc:
@@ -505,7 +507,6 @@ def materialize_nrrd_view_layer(
                     'source_raw_path': 'encoded_direct_from_view_volume' if projected_is_source else str(raw_path),
                     'source_raw_workspace': 'in_memory_when_available' if bool(transient_projection_in_memory) else 'disk_backed',
                 },
-                force_path_backed=bool(force_path_backed_store),
             )
         segment_extent = _coerce_segment_extent(layer_stats.get('segment_extent_ijk')) or _nrrd_empty_segment_extent()
         segment_extent_source = 'raw_bbox_cvol_index'
@@ -576,6 +577,312 @@ def materialize_nrrd_view_layer(
     return layer_ref
 
 
+if _numba is not None:
+    @_numba.njit(cache=True, nogil=True)
+    def _numba_sparse_component_accumulate_bounds(crop, source_slice, first_t, first_x, coronal, bounds):
+        count = 0
+        for row in range(crop.shape[0]):
+            left = crop.shape[1]
+            right = -1
+            for col in range(crop.shape[1]):
+                if crop[row, col] != 0:
+                    left = min(left, col)
+                    right = col
+                    count += 1
+            if right < 0:
+                continue
+            t = first_t + row
+            if coronal:
+                y0, y1 = first_x + left, first_x + right + 1
+                x0, x1 = source_slice, source_slice + 1
+            else:
+                y0, y1 = source_slice, source_slice + 1
+                x0, x1 = first_x + left, first_x + right + 1
+            bounds[t, 0] = min(bounds[t, 0], y0)
+            bounds[t, 1] = min(bounds[t, 1], x0)
+            bounds[t, 2] = max(bounds[t, 2], y1)
+            bounds[t, 3] = max(bounds[t, 3], x1)
+        return count
+
+    @_numba.njit(cache=True, nogil=True)
+    def _numba_sparse_component_scatter_crop(crop, source_slice, first_t, first_x, coronal, bounds, offsets, payload):
+        for row in range(crop.shape[0]):
+            t = first_t + row
+            out_width = bounds[t, 3] - bounds[t, 1]
+            for col in range(crop.shape[1]):
+                if crop[row, col] == 0:
+                    continue
+                if coronal:
+                    y = first_x + col
+                    x = source_slice
+                else:
+                    y = source_slice
+                    x = first_x + col
+                local_x = x - bounds[t, 1]
+                at = offsets[t] + (y - bounds[t, 0]) * ((out_width + 7) // 8) + local_x // 8
+                payload[at] |= np.uint8(1 << (local_x % 8))
+else:
+    _numba_sparse_component_accumulate_bounds = None
+    _numba_sparse_component_scatter_crop = None
+
+
+_SPARSE_COMPONENT_NUMBA_DISABLED = False
+
+
+class _SparseComponentKernelUnavailable(RuntimeError):
+    """A compiled sparse transpose failed before its backing store was published."""
+
+
+def _run_sparse_component_kernel(kernel: Callable[..., object], *args: object) -> object:
+    global _SPARSE_COMPONENT_NUMBA_DISABLED
+    try:
+        return kernel(*args)
+    except Exception as exc:
+        if not _SPARSE_COMPONENT_NUMBA_DISABLED:
+            print(f'Warning: sparse component kernel failed ({exc}); using dense component projection for remaining calls in this process.')
+        _SPARSE_COMPONENT_NUMBA_DISABLED = True
+        raise _SparseComponentKernelUnavailable(str(exc)) from exc
+
+
+def _iter_sparse_component_decoded_slabs(
+    store: RawBBoxMaskStore, source_slice: int, maximum_bytes: int = 8 * 1024 * 1024,
+) -> Iterator[Tuple[int, int, np.ndarray]]:
+    """Decode packed input in bounded row slabs; raw input remains a mapped view."""
+    record = store.index[int(source_slice)]
+    if int(record['kind']) != 1:
+        raise ValueError(f'{store.root}: unexpected source chunk marker {record["kind"]}')
+    y0, x0, y1, x1 = (int(record[name]) for name in ('y0', 'x0', 'y1', 'x1'))
+    if not (0 <= y0 < y1 <= int(store.shape[1]) and 0 <= x0 < x1 <= int(store.shape[2])):
+        raise ValueError(f'{store.root}: invalid source crop {(y0, x0, y1, x1)}')
+    rows, cols = y1 - y0, x1 - x0
+    packed = bool(store._packbits_payload)
+    stride = (cols + 7) // 8 if packed else cols
+    if int(record['payload_size']) != rows * stride or int(record['payload_nbytes']) != rows * cols:
+        raise ValueError(f'{store.root}: source payload size does not match bbox')
+    offset = int(record['offset'])
+    backing = store._chunks_bytes if store._chunks_bytes is not None else store._chunks_mmap
+    if backing is not None and offset + rows * stride > len(backing):
+        raise ValueError(f'{store.root}: source payload extends beyond chunks.bin')
+    rows_per_slab = max(1, int(maximum_bytes) // max(1, cols))
+    for row0 in range(0, rows, rows_per_slab):
+        row1 = min(rows, row0 + rows_per_slab)
+        start, count = offset + row0 * stride, (row1 - row0) * stride
+        if backing is not None:
+            encoded = np.frombuffer(backing, dtype=np.uint8, count=count, offset=start).reshape(row1 - row0, stride)
+        else:
+            with store.chunks_path.open('rb') as stream:
+                stream.seek(start)
+                data = stream.read(count)
+            if len(data) != count:
+                raise IOError(f'{store.root}: short source payload read')
+            encoded = np.frombuffer(data, dtype=np.uint8).reshape(row1 - row0, stride)
+        decoded = np.unpackbits(encoded, axis=1, count=cols, bitorder='little') if packed else encoded
+        yield y0 + row0, x0, decoded
+        del decoded, encoded
+
+def _sparse_component_orthogonal_shape(
+    shape: Tuple[int, int, int], view: ViewInfo,
+) -> Tuple[int, int, int]:
+    """Match the existing projection's reduced/native geometry validation exactly."""
+    q, plane_h, plane_w = map(int, shape)
+    orientation = physical_view_name(view)
+    permuted = {
+        'transverse': (q, plane_h, plane_w),
+        'sagittal': (plane_h, q, plane_w),
+        'coronal': (plane_h, plane_w, q),
+    }[orientation]
+    reduced = bool(
+        delayed_native_expansion_enabled()
+        and (plane_h, plane_w) != (int(view.src_h), int(view.src_w))
+    )
+    expected = permuted if reduced else (
+        int(view.full_t) if int(view.full_t) > 0 else q,
+        int(view.full_h) if int(view.full_h) > 0 else int(view.src_h),
+        int(view.full_w) if int(view.full_w) > 0 else int(view.src_w),
+    )
+    if permuted != expected:
+        raise ValueError(f'Sparse Cartesian component {view.name}: permuted {permuted} != working {expected}')
+    return permuted
+
+def _transpose_sparse_component_store(
+    store: RawBBoxMaskStore, destination: Path, orientation: str, shape: Tuple[int, int, int],
+) -> Dict[str, object]:
+    """Write exact orthogonal bbox payloads with no logical-volume allocation.
+
+    Two input passes touch decoded crops only. The first obtains exact bounds and
+    population counts. The second scatters nonzero voxels into the final payload
+    mmap. File truncation supplies zero-filled holes, and no full-payload zeroing
+    or foreground scan is performed. Decoded slabs are bounded to 8 MiB (or one
+    input row if wider); raw slabs are zero-copy memory views.
+    The mmap is the final sparse layer itself, never a dense temporary volume.
+    """
+    out_t, out_h, out_w = map(int, shape)
+    bounds = np.empty((out_t, 4), dtype=np.int64)
+    bounds[:, 0], bounds[:, 1], bounds[:, 2], bounds[:, 3] = out_h, out_w, 0, 0
+    active = np.flatnonzero(store.index['kind'] != 0)
+    foreground = 0
+    max_crop_bytes = 0
+    coronal = orientation == 'coronal'
+    for source_slice in active:
+        for y0, x0, crop in _iter_sparse_component_decoded_slabs(store, int(source_slice)):
+            max_crop_bytes = max(max_crop_bytes, int(crop.nbytes))
+            foreground += int(_run_sparse_component_kernel(_numba_sparse_component_accumulate_bounds, crop, int(source_slice), y0, x0, coronal, bounds))
+            del crop
+
+    index = np.zeros(out_t, dtype=CTILE_INDEX_DTYPE)
+    offsets = np.zeros(out_t, dtype=np.int64)
+    payload_bytes = 0
+    nonempty = np.flatnonzero((bounds[:, 2] > bounds[:, 0]) & (bounds[:, 3] > bounds[:, 1]))
+    for out_z in nonempty:
+        y0, x0, y1, x1 = map(int, bounds[out_z])
+        logical_size = (y1 - y0) * (x1 - x0)
+        size = (y1 - y0) * ((x1 - x0 + 7) // 8)
+        offsets[out_z] = payload_bytes
+        record = index[out_z]
+        record['kind'] = 1
+        record['offset'] = payload_bytes
+        record['payload_size'] = size
+        record['payload_nbytes'] = logical_size
+        record['y0'], record['x0'], record['y1'], record['x1'] = y0, x0, y1, x1
+        payload_bytes += size
+
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        raise FileExistsError(f'Sparse component backing already exists: {destination}')
+    staging = Path(tempfile.mkdtemp(prefix=f'.{destination.name}.', dir=destination.parent))
+    payload = None
+    try:
+        chunks = staging / 'chunks.bin'
+        with chunks.open('wb') as stream:
+            stream.truncate(payload_bytes)
+        if payload_bytes:
+            payload = np.memmap(chunks, mode='r+', dtype=np.uint8, shape=(payload_bytes,))
+            for source_slice in active:
+                for y0, x0, crop in _iter_sparse_component_decoded_slabs(store, int(source_slice)):
+                    _run_sparse_component_kernel(_numba_sparse_component_scatter_crop, crop, int(source_slice), y0, x0, coronal, bounds, offsets, payload)
+                    del crop
+            # Close mapping before rename (including on Windows). No durability
+            # barrier is necessary for this disposable same-node intermediate.
+            payload._mmap.close()
+            payload = None
+        index.tofile(staging / 'index.bin')
+        extent = (
+            tuple(map(int, (bounds[nonempty, 1].min(), bounds[nonempty, 3].max() - 1,
+                            bounds[nonempty, 0].min(), bounds[nonempty, 2].max() - 1,
+                            nonempty[0], nonempty[-1])))
+            if len(nonempty) else _nrrd_empty_segment_extent()
+        )
+        stats = {
+            'nonempty_slices': len(nonempty), 'empty_slices': out_t - len(nonempty),
+            'foreground_voxels': foreground, 'logical_raw_uint8_bytes': math.prod(shape),
+            'raw_payload_bytes': payload_bytes, 'index_bytes': int(index.nbytes),
+            'segment_extent_ijk': list(extent), 'segment_extent_shape_tyx': list(shape),
+            'maximum_decoded_slab_bytes': max_crop_bytes,
+        }
+        metadata = {
+            'format': INTERNAL_PACKED_CVOL_FORMAT,
+            'shape': list(shape), 'dtype': 'bool',
+            'logical_dtype_in_pipeline': 'uint8_0_or_1', 'chunking': 'slice',
+            'precodec': 'numpy_packbits_axis_x_little',
+            'compressor': 'none', 'bbox_per_chunk': True,
+            'zero_chunk_elision': True, 'index_dtype': 'ctile-index-v2-raw',
+            'index_record_bytes': CTILE_INDEX_DTYPE.itemsize,
+            'payload_shape_encoding': 'packbits_rows_ceil_width_div_8_bbox_shape_from_index',
+            'description': 'Sparse Cartesian component transpose',
+            'segment_extent_ijk': list(extent), 'segment_extent_shape_tyx': list(shape),
+            'segment_extent_axis_order': 'Slicer IJK inclusive extent: minX maxX minY maxY minT maxT for internal layer order (t,Y,X)',
+            'stats': stats, 'source_view_store': str(store.root), 'source_orientation': orientation,
+        }
+        (staging / 'meta.json').write_text(json.dumps(metadata, indent=2) + '\n')
+        staging.rename(destination)
+        return stats
+    except BaseException:
+        if payload is not None:
+            payload._mmap.close()
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+def _materialize_sparse_cartesian_component(
+    component_store_path: Path, *, added_voxels: int, model_name: str, view: ViewInfo,
+    source: str, pass_index: int, interpolation_walk_back_index: int,
+    interpolation_candidate_index: int, tile_config_id: str, tile_acceptance: str,
+    stage: str, description: str, temp_dir: Path, keep_temp: bool,
+) -> NrrdLayerRef:
+    """Publish one immutable component in orthogonal working geometry."""
+    started = time.perf_counter()
+    orientation = physical_view_name(view)
+    component_store_path = Path(component_store_path)
+    store = RawBBoxMaskStore.open(component_store_path, mmap_payload=True)
+    stage = (f"{stage}_walkback{int(interpolation_walk_back_index):02d}_"
+             f"candidate{int(interpolation_candidate_index):02d}")
+    common = dict(view_name=str(view.name), source=str(source), mask_kind='bridge',
+                  pass_index=int(pass_index), tile_config_id=str(tile_config_id),
+                  tile_acceptance=str(tile_acceptance), stage=stage)
+    key = _nrrd_layer_key(**common)
+    try:
+        shape = _sparse_component_orthogonal_shape(store.shape, view)
+        logical_bytes = math.prod(store.shape)
+        if orientation == 'transverse':
+            path = component_store_path
+            storage_format = str(store.meta['format'])
+            # Metadata is generated by the validated sparse writer. Preserve the
+            # actual format, including the internal packed variant the reader supports.
+            extent = _coerce_segment_extent(store.meta.get('segment_extent_ijk'))
+            if extent is None:
+                valid = store.index[store.index['kind'] == 1]
+                zs = np.flatnonzero(store.index['kind'] == 1)
+                extent = (int(valid['x0'].min()), int(valid['x1'].max()) - 1,
+                          int(valid['y0'].min()), int(valid['y1'].max()) - 1,
+                          int(zs[0]), int(zs[-1])) if len(zs) else _nrrd_empty_segment_extent()
+            maximum_crop_bytes = 0
+            payload_bytes = int(store.chunks_path.stat().st_size)
+        else:
+            path = Path(temp_dir) / 'nrrd_layers' / str(view.name) / f'{key}.orthogonal.cvol'
+            stats = _transpose_sparse_component_store(store, path, orientation, shape)
+            storage_format = INTERNAL_PACKED_CVOL_FORMAT
+            extent = tuple(stats['segment_extent_ijk'])
+            maximum_crop_bytes = int(stats['maximum_decoded_slab_bytes'])
+            payload_bytes = int(stats['raw_payload_bytes'])
+    finally:
+        store.close()
+
+    ref = NrrdLayerRef(
+        key=key, name=_nrrd_layer_name(view=view, **{k: v for k, v in common.items() if k != 'view_name'}),
+        path=path, shape=shape, dtype='uint8', storage_format=storage_format,
+        model_name=str(model_name), physical_view_name=orientation,
+        aug_id=str(view.tta_aug_id), angle_deg=float(view.tta_angle_deg), view_family=str(view.family),
+        interpolation_walk_back_index=int(interpolation_walk_back_index),
+        interpolation_candidate_index=int(interpolation_candidate_index),
+        description=str(description), segment_extent_ijk=extent,
+        segment_extent_shape_tyx=shape, segment_extent_source='sparse_cartesian_component', **common,
+    )
+    sink = nrrd_layer_sink()
+    if sink is not None:
+        sink.submit_layer(ref, nrrd_layer_output_suffix(
+            view_token=view_output_token(view),
+            interpolation_walk_back_index=int(interpolation_walk_back_index),
+            interpolation_candidate_index=int(interpolation_candidate_index),
+            **{k: v for k, v in common.items() if k != 'view_name'},
+        ))
+    if orientation != 'transverse' and not bool(keep_temp):
+        # The transposed store is now complete and immutable. Transverse keeps its
+        # original store alive for asynchronous NRRD writers and final fusion.
+        shutil.rmtree(component_store_path, ignore_errors=True)
+    telemetry = runtime_telemetry()
+    telemetry.add('projection.sparse_component.layers', 1)
+    # The reference already bypasses dense work for empty component combinations.
+    avoided_bytes = logical_bytes if int(added_voxels) > 0 else 0
+    telemetry.add('projection.sparse_component.dense_decode_bytes_avoided', avoided_bytes)
+    telemetry.add('projection.sparse_component.dense_projection_bytes_avoided', avoided_bytes if orientation != 'transverse' else 0)
+    telemetry.add('projection.sparse_component.payload_bytes', payload_bytes)
+    telemetry.gauge('projection.sparse_component.last_maximum_decoded_slab_bytes', maximum_crop_bytes)
+    elapsed = time.perf_counter() - started
+    print(f'Sparse component {view.name}: shape={shape}, payload={payload_bytes} bytes, '
+          f'decode_avoided={avoided_bytes} bytes, seconds={elapsed:.6f}', flush=True)
+    return ref
+
+
 def materialize_interpolation_component_nrrd_view_layer(
     component_store_path: Path,
     *,
@@ -596,9 +903,42 @@ def materialize_interpolation_component_nrrd_view_layer(
 ) -> NrrdLayerRef:
     """Project one sparse interpolation component and submit its deterministic NRRD.
 
-    Nonempty cvol inputs are expanded into only one reusable dense workspace at a time;
-    empty combinations bypass projection entirely and reuse their compact all-empty cvol.
+    Qualified Cartesian components retain sparse backing through publication. Other
+    geometries, or unavailable compiled transpose kernels, use a reusable dense
+    workspace; empty combinations bypass that fallback decode.
     """
+    sparse_cartesian = bool(
+        str(view.family) == 'orthogonal'
+        and not is_tilted_view(view)
+        and physical_view_name(view) in ('transverse', 'sagittal', 'coronal')
+        and float(view.tta_angle_deg) == 0.0
+        and str(source) == 'fullframe'
+        and (
+            physical_view_name(view) == 'transverse'
+            or (
+                _numba_sparse_component_accumulate_bounds is not None
+                and _numba_sparse_component_scatter_crop is not None
+                and not _SPARSE_COMPONENT_NUMBA_DISABLED
+            )
+        )
+    )
+    if sparse_cartesian:
+        try:
+            with runtime_telemetry().span('projection.sparse_component.materialize'):
+                return _materialize_sparse_cartesian_component(
+                    component_store_path, added_voxels=int(added_voxels),
+                    model_name=str(model_name), view=view, source=str(source),
+                    pass_index=int(pass_index),
+                    interpolation_walk_back_index=int(interpolation_walk_back_index),
+                    interpolation_candidate_index=int(interpolation_candidate_index),
+                    tile_config_id=str(tile_config_id), tile_acceptance=str(tile_acceptance),
+                    stage=str(stage), description=str(description), temp_dir=Path(temp_dir),
+                    keep_temp=bool(keep_temp),
+                )
+        except _SparseComponentKernelUnavailable:
+            # Failed transpose staging was discarded; the input store is intact.
+            pass
+
     component_store_path = Path(component_store_path)
     store = RawBBoxMaskStore.open(component_store_path, mmap_payload=True)
     combo_stage = (
@@ -703,7 +1043,6 @@ def materialize_interpolation_component_nrrd_view_layer(
             show_progress=False,
             target_chunks_per_worker=2,
         )
-        flush_array(decoded_mm)
         layer_ref = materialize_nrrd_view_layer(
             decoded_mm,
             model_name=str(model_name),
@@ -1015,6 +1354,26 @@ def prepare_view_volume_after_fullframe(
         )
     )
 
+    # The source-space D1 base is independently registered by the scheduler.
+    # Complete Cartesian component refs carry every addition directly
+    # into final fusion; a second dense continuation would be created only to discard it.
+    # Zero component axes may still produce default bridges, so retain their dense path.
+    # keep_temp retains its historical dense debug artifacts, and no-NRRD runs retain
+    # their private aggregate final-layer path. Tiles still need a mutable destination.
+    d1_component_refs_only = bool(
+        d1_delta_only
+        and not bool(dense_tiling_active)
+        and bool(nrrd_layers_enabled)
+        and not bool(keep_temp)
+        and str(view.family) == 'orthogonal'
+        and physical_view_name(view) in ('transverse', 'sagittal', 'coronal')
+        and float(view.tta_angle_deg) == 0.0
+        and (
+            not _view_uses_interpolation(view, int(interpolate))
+            or (int(interpolation_walk_back) > 0 and int(interpolation_candidates) > 0)
+        )
+    )
+
     # Device-union slice metadata is aggregated per view by the scheduler.
     # It remains valid through skipped cleanup and per-slice hole filling, which do not change
     # foreground presence/bounds/row occupancy; interpolation bridges invalidate it. It feeds
@@ -1068,7 +1427,7 @@ def prepare_view_volume_after_fullframe(
         except Exception:
             pass
 
-    if bool(d1_delta_only):
+    if bool(d1_delta_only) and not bool(d1_component_refs_only):
         d1_additions_path = (
             temp_dir / 'd1_view_additions' / str(model_name)
             / f'{str(view.name)}.u8.dat'
@@ -1151,7 +1510,11 @@ def prepare_view_volume_after_fullframe(
             # (bridge AND NOT pre-merge mask) to this path during its merge step, replacing
             # the old full-volume before-copy + subtract bookkeeping.
             pass_delta_path: Optional[Path] = None
-            if bool(d1_delta_only) and not bool(fused_radial_components):
+            if (
+                bool(d1_delta_only)
+                and not bool(fused_radial_components)
+                and not bool(d1_component_refs_only)
+            ):
                 pass_delta_path = temp_dir / 'nrrd_work' / view.name / f'fullframe_bridge_pass{int(pass_idx):02d}.u8.dat'
             pass_component_dir: Optional[Path] = None
             if (
@@ -1186,6 +1549,7 @@ def prepare_view_volume_after_fullframe(
                 known_slice_bboxes=(meta_slice_bboxes if (meta_valid and int(pass_idx) == 1) else None),
             )
             stats_local = dict(stats_local)
+            stats_local['component_refs_only'] = bool(d1_component_refs_only)
             stats_local.update({
                 'pass_index': int(pass_idx),
                 'model': str(model_name),
@@ -1239,6 +1603,30 @@ def prepare_view_volume_after_fullframe(
                         f'{int(interpolation_walk_back)} x {int(interpolation_candidates)} = '
                         f'{int(expected_components)}'
                     )
+                if bool(d1_component_refs_only):
+                    # Counts can overlap between combinations, but their OR is exactly
+                    # the pass delta: every membership bit excludes the same pre-pass
+                    # foreground before merge. Reject malformed coverage instead of
+                    # retiring the only dense continuation with missing components.
+                    component_keys = {
+                        (int(entry['walk_back_index']), int(entry['candidate_index']))
+                        for entry in component_entries
+                    }
+                    expected_keys = {
+                        (walk, candidate)
+                        for walk in range(1, int(interpolation_walk_back) + 1)
+                        for candidate in range(1, int(interpolation_candidates) + 1)
+                    }
+                    component_counts = [int(entry.get('added_voxels', 0)) for entry in component_entries]
+                    if (
+                        component_keys != expected_keys
+                        or any(count < 0 for count in component_counts)
+                        or sum(component_counts) < int(stats_local.get('added_voxels', 0))
+                    ):
+                        raise RuntimeError(
+                            f'{model_name}/{view.name}: incomplete D1 component-ref coverage '
+                            f'for interpolation pass {int(pass_idx)}'
+                        )
                 component_entries.sort(key=lambda entry: (
                     int(entry.get('walk_back_index', 0)),
                     int(entry.get('candidate_index', 0)),
@@ -1270,7 +1658,7 @@ def prepare_view_volume_after_fullframe(
 
             if int(stats_local.get('added_voxels', 0)) <= 0:
                 break
-    else:
+    elif not bool(d1_component_refs_only):
         # Direct-union CUDA workers already wrote this completed view into a root file-backed
         # memmap. Re-copying it to a second *.noninterpolated_native file read and rewrote the
         # entire multi-GiB view after inference, often as a low-CPU disk/page-cache tail. Retain
@@ -1366,7 +1754,11 @@ def prepare_view_volume_after_fullframe(
         else:
             parent_bridge_support_mm = RawBBoxMaskStore.open(parent_bridge_support_path, mmap_payload=True)
 
-    if bool(internal_final_layer_enabled) and not bool(dense_tiling_active):
+    if (
+        bool(internal_final_layer_enabled)
+        and not bool(dense_tiling_active)
+        and not bool(d1_component_refs_only)
+    ):
         internal_ref = materialize_internal_final_view_layer(
             (d1_additions_mm if d1_additions_mm is not None else baseline_native_volume),
             model_name=str(model_name),
@@ -1377,7 +1769,30 @@ def prepare_view_volume_after_fullframe(
         if internal_ref is not None:
             nrrd_layers.append(internal_ref)
 
-    if bool(d1_delta_only):
+    if bool(d1_component_refs_only):
+        base_bytes = int(np.asarray(baseline_native_volume).nbytes)
+        base_backing_path = _interpolation_array_backing_path(baseline_native_volume)
+        close_memmap_array_without_flush(baseline_native_volume)
+        baseline_native_volume = None
+        # The interpolation process can return a different final-pass backing. Retire
+        # both that mapping and the original shadow, preserving immutable cvol stores.
+        for retired_path in {base_backing_path, union_path}:
+            if retired_path is not None and not str(retired_path).startswith('/proc/'):
+                try:
+                    Path(retired_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+        runtime_telemetry().add('d1.component_refs_only_views', 1)
+        runtime_telemetry().add('d1.additions_allocation_avoided_bytes', base_bytes)
+        runtime_telemetry().add('d1.aggregate_bridge_delta_requests_avoided', len(interpolation_stats))
+        print(
+            f'D1 terminal component refs {model_name}/{view.name}: '
+            f'{len(nrrd_layers)} immutable addition ref(s); '
+            f'avoided {base_bytes / GIB:.2f} GiB dense additions allocation and '
+            f'{len(interpolation_stats)} aggregate bridge-delta request(s); '
+            'source-space D1 base remains independently registered for final fusion.'
+        )
+    elif bool(d1_delta_only):
         if d1_additions_mm is None:
             raise RuntimeError(
                 f'{model_name}/{view.name}: D1 continuation did not allocate its additions volume'
@@ -1401,42 +1816,11 @@ def prepare_view_volume_after_fullframe(
             'was already published.'
         )
 
-    # Return the dense angle variant to the scheduler. When immutable component NRRD
-    # references fully cover it, the scheduler may retire this canvas before physical-view
-    # finalization; otherwise the legacy dense TTA-collapse path remains authoritative.
-    sparse_retire_dense = False
-
-    if sparse_retire_dense:
-        retired_bytes = int(np.asarray(baseline_native_volume).nbytes)
-        close_memmap_array_without_flush(baseline_native_volume)
-        baseline_native_volume = None  # type: ignore[assignment]
-        try:
-            if not bool(keep_temp) and union_path is not None and not str(union_path).startswith('/proc/'):
-                Path(union_path).unlink(missing_ok=True)
-        except Exception:
-            pass
-        print(
-            f'v16.1.3 sparse retirement: {model_name}/{view.name} released '
-            f'{retired_bytes / GIB:.2f} GiB dense union after cvol materialization.'
-        )
-
-    final_view_volume: Optional[np.ndarray] = None
-    if sparse_retire_dense:
-        final_view_volume = None
-    elif bool(dense_tiling_active):
-        # The immutable parent-YOLO mask P and parent-bridge mask B now live in separate
-        # sparse support stores. Tile gates never read this dense array, so accepted tile
-        # masks can be ORed into it after both supports are frozen without a full-volume copy.
-        final_view_volume = baseline_native_volume
-    elif view.family == 'radial':
-        # Keep Radial masks view-native here. Final projection is orientation-aware and may
-        # stream directly into destination bands; transverse also has a GPU backprojection path.
-        final_view_volume = baseline_native_volume
-    elif is_tilted_view(view):
-        # Keep Tilted masks view-native here for the final CPU backprojection.
-        final_view_volume = baseline_native_volume
-    else:
-        final_view_volume = baseline_native_volume
+    # A refs-only result carries no mutable destination. PreparedViewResult already
+    # permits None here, and the scheduler publishes these refs before marking the
+    # variant terminal. Its physical-view reducer then selects refs as authoritative.
+    # Every other configuration retains the established dense continuation.
+    final_view_volume: Optional[np.ndarray] = baseline_native_volume
 
     returned_parent_mask_support = parent_mask_support_mm if bool(dense_tiling_active) else None
     returned_parent_bridge_support = parent_bridge_support_mm if bool(dense_tiling_active) else None
@@ -2680,7 +3064,6 @@ def _try_apply_gaussian_smoothing_gpu_chunked_inplace(
                 except Exception:
                     pass
 
-        flush_array(mask_mm)
         if nrrd_layers is not None:
             layer_ref = materialize_nrrd_global_layer(
                 mask_mm,
@@ -2804,8 +3187,6 @@ def apply_gaussian_smoothing_inplace(
                 slice_runner=_run_slices,
                 observe_slice=_observe_slice,
             )
-            flush_array(work_mm)
-            flush_array(mask_mm)
 
             if nrrd_layers is not None:
                 layer_ref = materialize_nrrd_global_layer(
