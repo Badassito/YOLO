@@ -1,14 +1,14 @@
 """Planning and execution boundary for LTA.
 
-The GPU-independent planner is complete and intentionally testable with fake
-geometry compilers.  The public :func:`run` currently stops after preflight and
-planning rather than publishing a false ``complete`` manifest before the SAM
-execution loop is connected.
+The GPU-independent planner remains testable with fake geometry compilers.
+The public :func:`run` hands a validated plan to the mask-injected production
+coordinator, which publishes a complete manifest only after execution,
+revalidation, output creation, and scratch cleanup succeed.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence, Tuple
 import uuid
@@ -38,10 +38,6 @@ from .lta_scheduler import (
     assignment_manifest,
 )
 from .lta_tiles import TilePlan, eight_neighbor_graph, plan_tile_grid
-
-
-class LtaExecutionPending(RuntimeError):
-    """Raised after a valid plan when GPU inference is not connected yet."""
 
 
 @dataclass(frozen=True)
@@ -93,6 +89,7 @@ class LtaRuntimeViewPlan:
     tile_grids: Tuple[LtaTileGridPlan, ...] = ()
     encoded_frame_indices: Tuple[Optional[int], ...] = ()
     raster_plan_digest: Optional[str] = None
+    runtime_view: object | None = field(default=None, repr=False, compare=False)
 
     def manifest_record(self) -> dict[str, object]:
         return {
@@ -151,6 +148,7 @@ class LtaRunPlan:
     command: Tuple[str, ...]
     postprocessing: Mapping[str, object]
     volumes: Tuple[LtaVolumePlan, ...]
+    exemplar_index_origin: int = 1
     session_work: Tuple[LtaSessionWork, ...] = ()
     view_assignments: Tuple[LtaViewAssignment, ...] = ()
 
@@ -207,6 +205,7 @@ class LtaRunPlan:
             },
             "input": str(self.discovery.input_path),
             "exemplar_roots": [str(path) for path in self.discovery.exemplar_roots],
+            "exemplar_index_origin": int(self.exemplar_index_origin),
             "output_root": str(self.output_root),
             "temp_root": str(self.temp_root),
             "device_ids": [int(value) for value in self.device_ids],
@@ -280,18 +279,6 @@ def probe_image_with_pillow(path: Path) -> ImageMetadata:
     except Exception as exc:
         raise RuntimeError(f"Could not inspect LTA image {path}: {exc}") from exc
     return ImageMetadata(width=int(width), height=int(height))
-
-
-def _one_frame_sessions(sequence_id: str, frame_count: int) -> Tuple[SamSessionPlan, ...]:
-    return tuple(
-        SamSessionPlan(
-            sequence_id=sequence_id,
-            session_index=index,
-            frame_start=index,
-            frame_stop=index + 1,
-        )
-        for index in range(int(frame_count))
-    )
 
 
 def _tile_config_ids(config: LtaConfig) -> Tuple[str, ...]:
@@ -416,11 +403,7 @@ def build_lta_run_plan(
             physical_name = str(getattr(physical, "name"))
             runtime_name = str(getattr(runtime, "name"))
             sequence_id = f"{volume.volume_id}::{runtime_name}"
-            sessions = (
-                plan_sam_sessions(sequence_id, frame_count)
-                if str(config.args.sam_execution) == "video"
-                else _one_frame_sessions(sequence_id, frame_count)
-            )
+            sessions = plan_sam_sessions(sequence_id, frame_count)
             encoded_frame_indices: Tuple[Optional[int], ...] = (
                 tuple(int(value) for value in volume.encoded_indices)
                 if physical_name == "transverse"
@@ -463,6 +446,7 @@ def build_lta_run_plan(
                     ),
                     encoded_frame_indices=encoded_frame_indices,
                     raster_plan_digest=str(raster_plan.digest),
+                    runtime_view=runtime,
                 )
             )
         volume_plans.append(
@@ -548,6 +532,7 @@ def build_lta_run_plan(
             "gaussian_passes": int(config.postprocessing.gaussian_passes),
         },
         volumes=tuple(volume_plans),
+        exemplar_index_origin=int(config.args.exemplar_index_origin),
         session_work=tuple(session_work),
         view_assignments=view_assignments,
     )
@@ -564,35 +549,34 @@ def build_lta_scheduler(plan: LtaRunPlan) -> LtaViewAffinityScheduler:
     return scheduler
 
 
-def run(config: LtaConfig, *, argv: Sequence[str] | None = None) -> LtaRunPlan:
-    """Run the GPU-independent LTA preflight, geometry, and device planner.
+def run(config: LtaConfig, *, argv: Sequence[str] | None = None) -> object:
+    """Plan and execute production authoritative-mask LTA."""
 
-    The returned plan is useful to tests and the upcoming SAM execution loop.
-    A clear exception prevents users from mistaking successful planning for
-    generated labels or a complete publication.
-    """
+    mode_arguments = tuple(str(value) for value in (argv or ()))
+    from .unification.context import current_unified_launch
 
-    plan = build_lta_run_plan(config, argv=tuple(argv or ()))
+    launch = current_unified_launch()
+    if launch is not None:
+        if launch.mode != "lta" or launch.mode_arguments != mode_arguments:
+            raise RuntimeError("active unified launch does not match the LTA runtime arguments")
+        command = launch.command
+    else:
+        command = mode_arguments
+    plan = build_lta_run_plan(config, argv=command)
     runtime_view_count = sum(len(volume.runtime_views) for volume in plan.volumes)
-    session_count = sum(
-        len(view.sessions)
-        for volume in plan.volumes
-        for view in volume.runtime_views
-    )
     print(
         "LTA preflight complete: "
         f"volumes={len(plan.volumes)}, runtime_views={runtime_view_count}, "
-        f"sessions={session_count}, positive_exemplars={len(plan.discovery.positive_pool)}, "
+        f"positive_exemplars={len(plan.discovery.positive_pool)}, "
         f"devices={list(plan.device_ids)}"
     )
-    raise LtaExecutionPending(
-        "LTA planning succeeded; SAM render/inference/backprojection "
-        "execution is not connected yet, so no outputs or complete manifest were written"
-    )
+    # Deferred import avoids a runtime/execution module cycle during CLI discovery.
+    from .lta_execution import execute_lta_plan
+
+    return execute_lta_plan(plan)
 
 
 __all__ = (
-    "LtaExecutionPending",
     "LtaRunPlan",
     "LtaRuntimeViewPlan",
     "LtaTileGridPlan",

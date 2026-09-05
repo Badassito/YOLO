@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 import operator
 from dataclasses import asdict
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .lta_sam import (
     LTA_MAX_NUM_OBJECTS,
@@ -21,6 +21,9 @@ from .lta_sam import (
 
 
 MASK_SEED_ANCHOR_IOU = 0.99
+MASK_SEED_EXACT_IOU = 0.999999
+MASK_SEED_MIN_EXCLUSIVE_FRACTION = 0.95
+_REMOVED_OBJECT_SCORE_LOGIT = -1e4
 
 
 def mask_metrics(expected: Any, actual: Any) -> dict[str, Any]:
@@ -127,8 +130,14 @@ def _sigmoid_tracker_score_logits(
     *,
     expected_count: int,
     torch_module: Any,
-) -> tuple[float, ...]:
-    """Normalize SAM's fifth tracker return, ``object_score_logits``, safely."""
+) -> tuple[float | None, ...]:
+    """Normalize tracker logits while filtering SAM's exact removal sentinel.
+
+    Pinned SAM 3.1 uses exactly ``-1e4`` as a bookkeeping marker for a newly
+    removed object. It is not a low-confidence observation and therefore must
+    not be converted to, or exposed as, a probability. Other finite logits
+    retain their ordinary sigmoid interpretation.
+    """
 
     if not isinstance(scores, torch_module.Tensor):
         raise RuntimeError(
@@ -153,10 +162,23 @@ def _sigmoid_tracker_score_logits(
     # The pinned SAM tracker names and stores this tensor as object_score_logits
     # (shape N x 1, with 10.0 documented as sigmoid(10) ~= 1).  Persist a
     # probability because SamFramePrediction deliberately accepts only [0, 1].
+    removed = flattened == float(_REMOVED_OBJECT_SCORE_LOGIT)
     probabilities = torch_module.sigmoid(flattened.to(dtype=torch_module.float64))
-    normalized = tuple(float(value) for value in probabilities.detach().cpu().tolist())
-    if len(normalized) != int(expected_count) or not all(
-        math.isfinite(value) and 0.0 <= value <= 1.0 for value in normalized
+    probability_values = tuple(
+        float(value) for value in probabilities.detach().cpu().tolist()
+    )
+    removed_values = tuple(bool(value) for value in removed.detach().cpu().tolist())
+    normalized = tuple(
+        None if is_removed else probability
+        for probability, is_removed in zip(probability_values, removed_values)
+    )
+    if (
+        len(normalized) != int(expected_count)
+        or len(removed_values) != int(expected_count)
+        or not all(
+            value is None or (math.isfinite(value) and 0.0 <= value <= 1.0)
+            for value in normalized
+        )
     ):
         raise RuntimeError("could not normalize tracker-only object_score_logits")
     return normalized
@@ -175,10 +197,31 @@ def run_mask_seed_session(
     conf: float,
     propagation_mode: str,
     empty_frame_limit: int | None = None,
+    propagation_direction: str = "both",
+    prediction_callback: Callable[[SamFramePrediction], None] | None = None,
+    retain_predictions: bool = True,
+    seed_roundtrip_policy: str = "exact",
 ) -> dict[str, Any]:
     resolved_empty_frame_limit = _resolve_empty_frame_limit(empty_frame_limit)
+    direction = str(propagation_direction).strip().lower()
+    if direction not in {"both", "forward", "backward"}:
+        raise ValueError(
+            "propagation_direction must be 'both', 'forward', or 'backward'"
+        )
+    if propagation_mode == "merged" and direction != "both":
+        raise ValueError("merged propagation supports only propagation_direction='both'")
     if resolved_empty_frame_limit is not None and propagation_mode != "tracker-only":
         raise ValueError("empty-frame termination is supported only by tracker-only propagation")
+    if prediction_callback is not None and not callable(prediction_callback):
+        raise TypeError("prediction_callback must be callable or None")
+    if not isinstance(retain_predictions, bool):
+        raise TypeError("retain_predictions must be a bool")
+    confidence_threshold = float(conf)
+    if not math.isfinite(confidence_threshold) or not 0.0 <= confidence_threshold <= 1.0:
+        raise ValueError("conf must be finite and in [0,1]")
+    roundtrip_policy = str(seed_roundtrip_policy).strip().lower()
+    if roundtrip_policy not in {"exact", "overlap-aware"}:
+        raise ValueError("seed_roundtrip_policy must be 'exact' or 'overlap-aware'")
     import numpy as np
     import torch
 
@@ -194,15 +237,41 @@ def run_mask_seed_session(
         raise RuntimeError("mask-seed start_session returned no session_id")
     session_id = str(started["session_id"])
     stream = None
-    predictions = []
+    predictions: list[SamFramePrediction] = []
+    prediction_count = 0
+    callback_prediction_count = 0
+    active_frame_values: set[int] = set()
+    anchor_masks_by_object: dict[int, Any] = {}
+    below_confidence_observation_count = 0
     seen = set()
     policy_zero_frames: set[int] = set()
     termination_receipts: list[dict[str, Any]] = []
+    removed_object_observations: list[dict[str, Any]] = []
     tracker_state = None
     inference_state = None
     feature = None
     video_masks = None
     active_error: BaseException | None = None
+
+    def publish_prediction(prediction: SamFramePrediction) -> None:
+        """Update bounded diagnostics and optionally retain/stream one raw mask."""
+
+        nonlocal prediction_count, callback_prediction_count
+        prediction_count += 1
+        mask = np.asarray(prediction.binary_mask, dtype=bool)
+        if bool(mask.any()):
+            active_frame_values.add(int(prediction.frame_index))
+        if int(prediction.frame_index) == int(prompt_frame):
+            # Anchor diagnostics require at most one mask per seeded object.
+            # Copy before invoking user code so callback mutation cannot alter
+            # the adapter's integrity receipt.
+            anchor_masks_by_object[int(prediction.object_id)] = mask.copy()
+        if retain_predictions:
+            predictions.append(prediction)
+        if prediction_callback is not None:
+            prediction_callback(prediction)
+            callback_prediction_count += 1
+
     try:
         registry = getattr(raw_predictor, "_all_inference_states", None)
         if not isinstance(registry, Mapping) or session_id not in registry:
@@ -281,6 +350,16 @@ def run_mask_seed_session(
             if object_masks is None
             else tuple(np.asarray(mask, dtype=bool) for mask in object_masks)
         )
+        empty_expected_ids = tuple(
+            expected_ids[index]
+            for index, expected_mask in enumerate(expected_seed_masks)
+            if not bool(expected_mask.any())
+        )
+        if empty_expected_ids:
+            raise ValueError(
+                "mask seeding requires every expected object mask to contain "
+                f"foreground; empty object ids={empty_expected_ids}"
+            )
         seeded_arrays = tuple(
             seeded_masks[index].squeeze().detach().cpu().numpy().astype(bool)
             for index in range(len(expected_ids))
@@ -292,16 +371,76 @@ def run_mask_seed_session(
         changed = [
             index
             for index, metrics in enumerate(seed_object_metrics)
-            if float(metrics["iou"]) < 0.999999
+            if float(metrics["iou"]) < MASK_SEED_EXACT_IOU
         ]
-        if changed:
-            details = {index: seed_object_metrics[index] for index in changed}
-            raise RuntimeError(f"private mask seed changed object mask(s): {details}")
+        if roundtrip_policy == "overlap-aware" and len(expected_seed_masks) > 1:
+            stacked_expected = np.stack(expected_seed_masks, axis=0)
+            coverage_count = stacked_expected.sum(axis=0)
+            seed_shared_domain = coverage_count > 1
+            roundtrip_expected_masks = tuple(
+                expected & (coverage_count == 1) for expected in expected_seed_masks
+            )
+        else:
+            seed_shared_domain = np.zeros_like(expected_seed_masks[0], dtype=bool)
+            roundtrip_expected_masks = expected_seed_masks
+        seed_object_shared_domains = tuple(
+            expected & seed_shared_domain for expected in expected_seed_masks
+        )
+        seed_roundtrip_object_audit = tuple(
+            {
+                "object_id": expected_ids[index],
+                "expected_pixels": int(np.count_nonzero(expected)),
+                "shared_pixels": int(np.count_nonzero(expected & ~representable)),
+                "exclusive_pixels": int(np.count_nonzero(representable)),
+                "exclusive_fraction": float(
+                    np.count_nonzero(representable) / np.count_nonzero(expected)
+                ),
+                "raw_metrics": seed_object_metrics[index],
+                "comparison_metrics": mask_metrics(representable, actual),
+                "exact_comparison_match": bool(np.array_equal(representable, actual)),
+            }
+            for index, (expected, representable, actual) in enumerate(
+                zip(expected_seed_masks, roundtrip_expected_masks, seeded_arrays)
+            )
+        )
+        insufficient_exclusive = [
+            audit
+            for audit in seed_roundtrip_object_audit
+            if int(audit["exclusive_pixels"]) < 1
+            or float(audit["exclusive_fraction"])
+            < MASK_SEED_MIN_EXCLUSIVE_FRACTION
+        ]
+        if insufficient_exclusive:
+            raise RuntimeError(
+                "overlapping session seed masks leave insufficient exclusive support "
+                f"for stable object identity (minimum fraction "
+                f"{MASK_SEED_MIN_EXCLUSIVE_FRACTION}); run conflicting lineages "
+                f"in separate tracker sessions: {insufficient_exclusive}"
+            )
+        failed_roundtrip = [
+            audit
+            for audit in seed_roundtrip_object_audit
+            if not bool(audit["exact_comparison_match"])
+        ]
+        if failed_roundtrip:
+            raise RuntimeError(
+                "private mask seed materially changed object mask(s) outside the "
+                f"pinned overlap-suppression contract: {failed_roundtrip}"
+            )
         seeded_mask = seeded_masks.any(dim=0)
         seeded_np = np.logical_or.reduce(seeded_arrays)
         seed_metrics = mask_metrics(ground_truth, seeded_np)
-        if float(seed_metrics["iou"]) < 0.999999:
-            raise RuntimeError(f"private mask seed changed the anchor mask: {seed_metrics}")
+        roundtrip_expected_union = np.logical_or.reduce(roundtrip_expected_masks)
+        seed_roundtrip_union_metrics = mask_metrics(
+            roundtrip_expected_union,
+            seeded_np,
+        )
+        if not bool(np.array_equal(roundtrip_expected_union, seeded_np)):
+            raise RuntimeError(
+                "private mask seed materially changed the representable anchor union "
+                f"outside the pinned overlap-suppression contract: "
+                f"{seed_roundtrip_union_metrics}"
+            )
         if object_masks is None:
             cache = getattr(model, "_cache_frame_outputs", None)
             if not callable(cache):
@@ -343,7 +482,9 @@ def run_mask_seed_session(
                     # that are present.
                     require_drop_stats=False,
                 )
-                predictions.extend(item for item in normalized if item.object_id == 0)
+                for item in normalized:
+                    if item.object_id == 0:
+                        publish_prediction(item)
         elif propagation_mode == "tracker-only":
             preflight = getattr(tracker, "propagate_in_video_preflight", None)
             propagate = getattr(tracker, "propagate_in_video", None)
@@ -353,11 +494,27 @@ def run_mask_seed_session(
             prepare_features = getattr(model, "_prepare_backbone_feats", None)
             if not callable(prepare_features):
                 raise RuntimeError("pinned SAM model exposes no shared feature bridge")
-            orders = (
+            # The prompt must be model-visited exactly once so its propagated
+            # mask can be audited.  In a two-leg run the forward leg owns it;
+            # in a backward-only run the backward leg must own it instead.
+            all_orders = (
                 ("forward", False, range(local_prompt, int(session.frame_count))),
-                ("backward", True, range(local_prompt - 1, -1, -1)),
+                (
+                    "backward",
+                    True,
+                    range(
+                        local_prompt if direction == "backward" else local_prompt - 1,
+                        -1,
+                        -1,
+                    ),
+                ),
             )
-            for direction, reverse, order in orders:
+            orders = tuple(
+                item
+                for item in all_orders
+                if direction == "both" or item[0] == direction
+            )
+            for propagation_leg, reverse, order in orders:
                 consecutive_empty = 0
                 empty_streak_start = None
                 for requested_frame in order:
@@ -412,10 +569,29 @@ def run_mask_seed_session(
                         .astype(bool)
                         for index in range(len(expected_ids))
                     )
+                    removed_ids = tuple(
+                        object_id
+                        for object_id, tracker_score in zip(expected_ids, tracker_scores)
+                        if tracker_score is None
+                    )
+                    if removed_ids:
+                        removed_object_observations.append(
+                            {
+                                "frame_index": int(session.frame_start) + local_frame,
+                                "object_ids": removed_ids,
+                                "source_value": float(_REMOVED_OBJECT_SCORE_LOGIT),
+                                "disposition": "filtered_bookkeeping_state",
+                            }
+                        )
                     for object_id, binary, tracker_score in zip(
                         expected_ids, frame_masks, tracker_scores
                     ):
-                        predictions.append(
+                        if tracker_score is None:
+                            continue
+                        if tracker_score < confidence_threshold:
+                            below_confidence_observation_count += 1
+                            continue
+                        publish_prediction(
                             SamFramePrediction(
                                 sequence_id=str(session.sequence_id),
                                 session_index=int(session.session_index),
@@ -433,7 +609,12 @@ def run_mask_seed_session(
                         resolved_empty_frame_limit is not None
                         and local_frame != local_prompt
                     ):
-                        all_objects_empty = not any(bool(mask.any()) for mask in frame_masks)
+                        all_objects_empty = not any(
+                            tracker_score is not None
+                            and tracker_score >= confidence_threshold
+                            and bool(mask.any())
+                            for mask, tracker_score in zip(frame_masks, tracker_scores)
+                        )
                         if all_objects_empty:
                             if consecutive_empty == 0:
                                 empty_streak_start = local_frame
@@ -460,7 +641,7 @@ def run_mask_seed_session(
                             global_start = int(session.frame_start)
                             termination_receipts.append(
                                 {
-                                    "direction": direction,
+                                    "direction": propagation_leg,
                                     "reason": "consecutive_all_object_empty_masks",
                                     "empty_frame_limit": int(resolved_empty_frame_limit),
                                     "empty_definition": (
@@ -487,7 +668,15 @@ def run_mask_seed_session(
                             break
         else:
             raise ValueError(f"unknown propagation_mode: {propagation_mode}")
-        expected = set(range(session.frame_count))
+        expected = (
+            set(range(session.frame_count))
+            if direction == "both"
+            else (
+                set(range(local_prompt, session.frame_count))
+                if direction == "forward"
+                else set(range(0, local_prompt + 1))
+            )
+        )
         overlap = seen & policy_zero_frames
         missing = expected - seen - policy_zero_frames
         extra = (seen | policy_zero_frames) - expected
@@ -499,6 +688,7 @@ def run_mask_seed_session(
     except BaseException as exc:
         active_error = exc
         predictions.clear()
+        anchor_masks_by_object.clear()
         raise
     finally:
         cleanup_errors: list[tuple[str, Exception]] = []
@@ -547,35 +737,49 @@ def run_mask_seed_session(
                     )
             raise cleanup_error
 
-    anchor = [item for item in predictions if item.frame_index == int(prompt_frame)]
     anchor_iou = None
     anchor_object_metrics = None
-    anchor_ids = tuple(sorted(item.object_id for item in anchor))
+    anchor_integrity_object_metrics = None
+    anchor_integrity_union_metrics = None
+    anchor_ids = tuple(sorted(anchor_masks_by_object))
     if anchor_ids == expected_ids:
-        by_id = {item.object_id: np.asarray(item.binary_mask, dtype=bool) for item in anchor}
-        anchor_masks = tuple(by_id[object_id] for object_id in expected_ids)
+        anchor_masks = tuple(
+            anchor_masks_by_object[object_id] for object_id in expected_ids
+        )
         anchor_union = np.logical_or.reduce(anchor_masks)
         anchor_iou = mask_metrics(ground_truth, anchor_union)["iou"]
         anchor_object_metrics = tuple(
             mask_metrics(expected_mask, actual_mask)
             for expected_mask, actual_mask in zip(expected_seed_masks, anchor_masks)
         )
+        anchor_integrity_masks = tuple(
+            np.asarray(actual_mask, dtype=bool) & ~object_shared_domain
+            for actual_mask, object_shared_domain in zip(
+                anchor_masks,
+                seed_object_shared_domains,
+            )
+        )
+        anchor_integrity_object_metrics = tuple(
+            mask_metrics(expected_mask, actual_mask)
+            for expected_mask, actual_mask in zip(
+                roundtrip_expected_masks,
+                anchor_integrity_masks,
+            )
+        )
+        anchor_integrity_union_metrics = mask_metrics(
+            np.logical_or.reduce(roundtrip_expected_masks),
+            np.logical_or.reduce(anchor_integrity_masks),
+        )
     passed = (
-        anchor_iou is not None
-        and float(anchor_iou) >= MASK_SEED_ANCHOR_IOU
-        and anchor_object_metrics is not None
+        anchor_integrity_union_metrics is not None
+        and float(anchor_integrity_union_metrics["iou"]) >= MASK_SEED_ANCHOR_IOU
+        and anchor_integrity_object_metrics is not None
         and all(
             float(metrics["iou"]) >= MASK_SEED_ANCHOR_IOU
-            for metrics in anchor_object_metrics
+            for metrics in anchor_integrity_object_metrics
         )
     )
-    active_frames = sorted(
-        {
-            item.frame_index
-            for item in predictions
-            if bool(np.asarray(item.binary_mask, dtype=bool).any())
-        }
-    )
+    active_frames = sorted(active_frame_values)
     non_anchor_active_frames = [
         frame_index for frame_index in active_frames if frame_index != int(prompt_frame)
     ]
@@ -611,6 +815,7 @@ def run_mask_seed_session(
             "non-anchor active frame; not a quality or publication claim"
         ),
         "anchor_integrity_passed": anchor_integrity_passed,
+        "anchor_integrity_policy": roundtrip_policy,
         "anchor_integrity_minimum_iou": MASK_SEED_ANCHOR_IOU,
         "diagnostic_propagation_gate_passed": diagnostic_propagation_gate_passed,
         "non_anchor_active_frames": non_anchor_active_frames,
@@ -624,6 +829,9 @@ def run_mask_seed_session(
         "propagation": tuple(
             sorted(predictions, key=lambda item: (item.frame_index, item.object_id))
         ),
+        "propagation_prediction_count": prediction_count,
+        "propagation_predictions_retained": retain_predictions,
+        "propagation_callback_prediction_count": callback_prediction_count,
         "propagation_response_count": len(seen),
         "model_visited_frame_ranges": _global_half_open_ranges(
             seen, frame_start=int(session.frame_start)
@@ -637,9 +845,12 @@ def run_mask_seed_session(
         "propagation_active_frames": active_frames,
         "anchor_preview_propagation_iou": anchor_iou,
         "anchor_propagation_object_metrics": anchor_object_metrics,
+        "anchor_integrity_object_metrics": anchor_integrity_object_metrics,
+        "anchor_integrity_union_metrics": anchor_integrity_union_metrics,
         "anchor_expected_object_ids": expected_ids,
         "anchor_returned_object_ids": anchor_ids,
         "propagation_mode": str(propagation_mode),
+        "propagation_direction": direction,
         "frame_tracker_score_semantics": {
             "source": (
                 "tracker.propagate_in_video fifth return value: object_score_logits"
@@ -653,13 +864,63 @@ def run_mask_seed_session(
                 "sigmoid_probability" if propagation_mode == "tracker-only" else None
             ),
             "raw_logits_persisted": False,
+            "removed_object_sentinel": (
+                float(_REMOVED_OBJECT_SCORE_LOGIT)
+                if propagation_mode == "tracker-only"
+                else None
+            ),
+            "removed_object_sentinel_disposition": (
+                "filtered_bookkeeping_state"
+                if propagation_mode == "tracker-only"
+                else None
+            ),
         },
+        "tracker_confidence_filter": {
+            "applied": propagation_mode == "tracker-only",
+            "threshold": confidence_threshold if propagation_mode == "tracker-only" else None,
+            "comparison": (
+                "sigmoid(object_score_logits) >= threshold"
+                if propagation_mode == "tracker-only"
+                else None
+            ),
+            "below_threshold_object_observation_count": (
+                below_confidence_observation_count
+                if propagation_mode == "tracker-only"
+                else 0
+            ),
+            "below_threshold_disposition": (
+                "not_published_and_inactive_for_empty_frame_policy"
+                if propagation_mode == "tracker-only"
+                else None
+            ),
+            "authoritative_prompt_policy": (
+                "production wrapper reinjects the filled hard-positive mask independently"
+                if propagation_mode == "tracker-only"
+                else None
+            ),
+        },
+        "removed_object_observations": tuple(removed_object_observations),
         "seeded_object_count": len(expected_ids),
         "seed_object_metrics": seed_object_metrics,
+        "seed_roundtrip_policy": roundtrip_policy,
+        "seed_roundtrip_minimum_exclusive_fraction": (
+            MASK_SEED_MIN_EXCLUSIVE_FRACTION
+            if roundtrip_policy == "overlap-aware"
+            else 1.0
+        ),
+        "seed_roundtrip_object_audit": seed_roundtrip_object_audit,
+        "seed_roundtrip_union_metrics": seed_roundtrip_union_metrics,
+        "seed_roundtrip_passed": True,
+        "seed_roundtrip_exact": not bool(changed),
+        "seed_roundtrip_changed_object_ids": tuple(
+            expected_ids[index] for index in changed
+        ),
     }
 
 __all__ = (
     "MASK_SEED_ANCHOR_IOU",
+    "MASK_SEED_EXACT_IOU",
+    "MASK_SEED_MIN_EXCLUSIVE_FRACTION",
     "mask_metrics",
     "resolve_mask_seed_capacity",
     "run_mask_seed_session",

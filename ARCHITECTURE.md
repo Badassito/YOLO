@@ -1,6 +1,6 @@
 # XTA architecture
 
-`GPT-5.6-Sol-Ultra_v19.0.1_SLURM.py` is the sole versioned launcher. It, the
+`GPT-5.6-Sol-Ultra_v19.0.2_SLURM.py` is the sole versioned launcher. It, the
 installed `xta` console script, and `python -m XTA` all dispatch
 through `XTA.cli.run()`.
 The implementation lives in the importable `XTA` package so spawned processes
@@ -46,9 +46,13 @@ resolve worker functions and data types through canonical module paths.
 | `pta` | PTA source discovery/preprocessing, geometry planning, dataset orchestration, reporting and manifest publication |
 | `lta_config`, `lta_mode` | dependency-light LTA grammar and deferred runtime dispatch |
 | `lta_inputs` | class-0 YOLO-seg target/exemplar discovery, full/partial annotation states and deterministic prompt ranking |
-| `lta_sam` | local-only SAM bundle boundary, fixed 30-frame leases and runtime-neutral image/video result contracts |
-| `lta_runtime` | fail-closed LTA preflight plus physical-view/angle/tile/session/device planning; SAM execution remains gated |
+| `lta_sam` | local-only SAM bundle boundary, exact installed SAM source-tree provenance, fixed 30-frame leases and runtime-neutral image/video result contracts |
+| `lta_runtime` | fail-closed LTA preflight plus physical-view/angle/tile/session/device planning and deferred production execution dispatch |
 | `lta_outputs` | role-aware LTA layer recomposition, unconditional terminal-union primitive and atomic complete-manifest writer |
+| `lta_postprocessing` | non-mutating prediction/dogfood hole filling, completed-view cleanup, scalable native-union postprocessing ownership and atomic final-union NRRD publication |
+| `lta_propagation`, `lta_windows` | stable authoritative-mask session contracts, hole-filled temporal dogfood and fixed 30-frame center-out chains |
+| `lta_workers`, `lta_worker_adapter` | spawn-isolated one-model-per-GPU execution, compact artifact transport and retry-safe worker lifecycle |
+| `lta_execution` | native Transverse production coordinator, monotone cross-tile mask fixed point, storage/watchdog admission, compact worker audit, one-time backprojection and complete publication transaction |
 | `lta_rendering` | XTA-authoritative full-frame LTA raster rendering, implicit RGB conversion, inverse in-plane mask restore and source-space backprojection seam |
 | `lta_tiles`, `lta_tile_tracking` | concrete edge-pinned grids, eight-neighbor overlap topology, bidirectional spatial relay and global-coordinate overlap evidence |
 | `lta_tracklets` | anchor-scoped matching, residual split/merge hypotheses and authoritative temporal handoff |
@@ -125,21 +129,39 @@ producer may feed the distributed Track-A boundary without the cold host-upload 
 ### LTA stabilization contracts
 
 LTA plans concrete edge-pinned tile grids and computes each tile's actual Moore-neighborhood
-overlap. A tracklet that reaches an overlap emits two symmetric spatial relays: its last shared
-active mask can continue forward into the neighbor, while its first shared active mask can
-continue backward to recover an object that entered the source tile. Relay masks are rebased in
-global view coordinates, carry globally scoped lineage identity, merge once when several neighbors
-reach the same destination, and include an idempotency key plus an acyclic tile path to prevent
-ping-pong. Spatial duplicate evidence remains separate from temporal anchor handoff.
+overlap. Every contiguous qualifying overlap episode emits a forward relay from its first shared
+frame and a backward relay from its last shared frame. Those two sessions cover both
+destination-only tails and the crossing interval itself; disjoint leave/re-entry episodes remain
+distinct. Relay masks are rebased in global view coordinates, carry globally scoped lineage
+identity, and merge when several neighbors reach the same destination event. The idempotency
+identity includes lineage, destination, frame, and temporal direction: an exact ping-pong event is
+suppressed, while complementary foreground from a longer route advances an accumulated mask
+revision and an object that leaves and later re-enters a previously visited tile is admitted. Tile
+ancestry remains audit evidence rather than a permanent exclusion rule. A polygon is injected in
+one strongest tile whenever that tile contains its complete mask; polygons larger than any tile
+retain every required authoritative fragment.
 
 The device plan assigns each `(volume, physical view)` to one GPU owner. That owner publishes one
 immutable rendered-view cache and remains the sole backprojection owner across all angles, tiles,
 anchors, and sessions. After a GPU drains its own views, it may steal an unopened atomic session
 from the heaviest remaining owner queue and consume that existing cache. A live SAM session never
 migrates between devices, and completed work commits in plan order regardless of finish order.
-The public runtime still stops after this validated geometry/device plan until persistent
-one-process-per-GPU SAM workers and publication are connected; it does not publish a false complete
-manifest.
+The public runtime now executes the native Transverse, angle-zero, overlapping 1008-pixel tile
+contract. One persistent spawned worker owns each selected GPU. Seed groups are deterministically
+batched at SAM's 128-object limit; filled predictions stream directly into file-backed union and
+bit-packed relay reducers; only boundary dogfood masks and compact audit state remain resident.
+The tracker confidence is applied to the sigmoid framewise score, while exact removal sentinels
+remain bookkeeping rather than zero-confidence predictions. Settled generations feed a bounded
+breadth-first eight-neighbor relay fixed point; a safety-cap hit with remaining mask growth fails
+instead of publishing a truncated result. Each worker verifies the exact pinned SAM distribution,
+commit/tree, and BPE before model construction. Compact per-device runtime/profile, relay-gate,
+confidence, hole-fill, dogfood, and termination evidence survives temporary artifact cleanup.
+Results collapse in physical-view space, receive a
+final 2-D hole fill, backproject exactly once, apply the structured TTA postprocessing order to
+the native union, restore immutable hard-positive foreground after destructive filters, and
+publish `Global_final_output` plus the complete manifest.
+Non-Transverse or nonzero-angle execution remains fail-closed until provisional-volume bootstrap
+is separately qualified; it never falls back to the inferior box/composite experiments.
 
 `XTA.__init__` is deliberately inert. In particular, it does not import OpenCV,
 SciPy, Ultralytics, CUDA, OpenVINO or future accelerator runtimes. Every supported command
@@ -310,6 +332,44 @@ still require the production environment and representative artifacts. Intel acc
 build, provisioning, and admission instructions live in ``native/README.md``; run
 ``python tools/intel_accelerator_selftest.py --backend all`` on the target host.
 
+The production four-GPU LTA interface is launched through the compatibility launcher. Its
+one-versus-four-device scheduling and final bytes are covered by deterministic software tests;
+representative H100 execution remains a hardware qualification step:
+
+```bash
+python -u GPT-5.6-Sol-Ultra_v19.0.2_SLURM.py \
+  --mode lta \
+  --input <target-video> \
+  --exemplar <aligned-image-yolo-directory> \
+  --exemplar_index_origin 1 \
+  --output <new-output-directory> \
+  --temp "$SLURM_TMPDIR" \
+  --model <local-sam3.1-bundle> \
+  --device 0 1 2 3 \
+  --enable_cartesian transverse \
+  --enable_tile 1008:756 \
+  --angle 0 \
+  --sam_execution video \
+  --postprocessing 3d_void_fill gaussian_smoothing:3:1 \
+  --save overlay voxel_volume summary
+```
+
+The aligned exemplar indexes address decoded target frames; they are not a cross-volume visual
+transfer request. `<input-stem>_Global_final_output.seg.nrrd` and `manifest.json` are
+unconditional. Omitting
+`--tile-index` is implicit in the production CLI: the complete overlapping grid is scheduled,
+and spatial relays may seed initially unannotated neighbors. Non-Transverse views and nonzero
+angles remain fail-closed pending provisional-volume bootstrap qualification.
+The representative 1929×3064×3024 volume with all three terminal filters needs roughly
+180–200 GiB of fast scratch; execution performs a filesystem-capacity preflight before decode,
+but relay growth and public output staging remain additional workload-dependent costs.
+Append `keep_objects:N` only when `N` is the intended number of connected 3-D objects; `N=1`
+deliberately removes every predicted component except the largest before hard-positive restoration.
+The representative aligned export resolves 237 polygon lineages into 281 direct tile seeds:
+231 lineages have one complete-mask owner, while six oversized polygons retain 4–13 clipped
+authoritative fragments. Explicit empty labels are audited against the final union as known
+background; they are not silently subtracted from model output.
+
 The bounded LTA hardware seam can be exercised from a source checkout with
 ``python tools/lta_gpu_smoke.py --model <local-sam3.1-bundle> --input-root <input> --exemplar-root <exemplars> --case direct --start-frame <first> --prompt-frame <anchor> --exemplar-index <index> --label-row <row>``.
 It validates one fixed 30-frame visual-prompt/video-tracking session without publishing
@@ -332,6 +392,45 @@ memory-efficient attention, then Math so a Windows Torch build without Flash doe
 the original upstream backend function is restored during cleanup. The composite arm defaults to a prompt-only
 exemplar tile: the exemplar appears beside the target on the prompted frame and is neutral on the
 other 29 frames. ``--composite-exemplar-visibility all`` retains the repeated-exemplar diagnostic.
+
+The 2026-09-04 RTX 4090 Laptop qualification exercised more than the legacy smoke. A spawned
+production worker built the exact 128-object-capacity `egpu` profile, verified the pinned SAM
+tree, streamed 30/30 active frames with no retained dense prediction population, and shut down
+without force. Its real `1008:756` east-neighbor relay produced forward/backward seeds; the
+forward destination session remained active for 30/30 frames and recovered 88,645 pixels outside
+the shared overlap. A separate 59-frame, two-window chain reused one worker/predictor, reinjected
+`temporal_dogfood` at the repeated boundary, retained zero prediction masks, and was active on all
+59 frames. The single-object golden retained anchor IoU 0.9967405 at 3,636 MiB peak allocation.
+Three-object multiplexing reproduced the two tiny-mask anchor diagnostics (81/106 pixels,
+IoU 0.8148/0.8396) even when each was run alone, while the 132,958-pixel mask retained 0.9967;
+this is small-mask tracker behavior rather than cross-object interference, and exact hard-positive
+prompt restoration remains mandatory.
+
+Pinned SAM removes pixels shared by simultaneously injected object masks from each returned
+per-object seed preview. Production seed validation therefore remains exact but overlap-aware:
+it computes each object's representable exclusive mask, requires at least 95% exclusive support,
+and accepts only a byte-exact return of that representable mask and union. Direct diagnostic tools
+retain the stricter full-mask-exact policy. Any non-shared erosion, expansion, identity swap, or
+high-overlap ambiguity remains fatal; the worker error records the retained seed artifact/hash and
+lineage context. The same per-object domain is audited again when propagation model-visits the
+prompt; the forward leg owns that visit in a two-leg session and the backward leg owns it in a
+backward-only session. That later IoU is diagnostic because qualified tiny masks can be eroded by
+the tracker even in isolated sessions. Production discards the model's prompt preview, reinjects
+the exact filled seed, and records the diagnostic disposition; original authoritative masks are
+also restored after terminal filters.
+
+Before initial, relay, or temporal-dogfood masks enter a multiplex session, production applies a
+deterministic first-fit partition over the aggregate shared-pixel domain. A candidate joins the
+first session in which every mask still has at least 95% exclusive support and the 128-object cap
+is respected; otherwise it opens another session. The worker repeats this check at every window
+boundary because independently tracked objects can converge later. Conflicting lineages remain
+distinct, retain their complete seed masks, and are unioned only after their separate tracker
+sessions; high mask overlap is never treated as proof that two semantic objects are identical.
+
+The local GPU environment currently has an unresolved package-metadata conflict: pinned SAM 3
+declares `numpy>=1.26,<2`, while OpenCV 5 and the installed environment use NumPy 2.5.2. The
+bounded CUDA runs succeed, but numerical qualification should use a compatible NumPy 1.26 plus
+OpenCV 4 environment and compare against H100 FP32 output.
 
 The meta construction option exists for hosts whose commit/pagefile budget cannot hold the
 normal CPU shell. It permits exactly the two pinned ViT scalar `linspace(0, 0.1, 32)` schedules

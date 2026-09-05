@@ -240,6 +240,34 @@ def rasterize_polygons(polygons: Sequence[Any], size: int = 1008):
     return np.asarray(image, dtype=bool)
 
 
+def rasterize_polygons_to_shape(
+    polygons: Sequence[Any],
+    *,
+    height: int,
+    width: int,
+):
+    """Rasterize normalized polygons directly in a rectangular source frame."""
+
+    import numpy as np
+    from PIL import Image, ImageDraw
+
+    resolved_height = int(height)
+    resolved_width = int(width)
+    if resolved_height < 1 or resolved_width < 1:
+        raise ValueError("raster dimensions must be positive")
+    image = Image.new("1", (resolved_width, resolved_height), 0)
+    draw = ImageDraw.Draw(image)
+    for polygon in polygons:
+        draw.polygon(
+            [
+                (float(x) * resolved_width, float(y) * resolved_height)
+                for x, y in polygon.points
+            ],
+            fill=1,
+        )
+    return np.asarray(image, dtype=bool)
+
+
 def polygon_intersects_tile(polygon: Any, tile: TilePlan) -> bool:
     x0, y0, x1, y1 = (float(value) for value in polygon.box_xyxy)
     source_x0 = x0 * tile.source_width
@@ -343,6 +371,7 @@ __all__ = (
     "plan_tile_grid",
     "polygon_intersects_tile",
     "rasterize_polygons",
+    "rasterize_polygons_to_shape",
     "select_polygon_row",
     "transform_polygon_to_tile",
 )

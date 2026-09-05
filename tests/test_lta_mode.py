@@ -33,7 +33,7 @@ class LtaModeBoundaryTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 2)
             import_module.assert_not_called()
 
-    def test_resolved_config_is_forwarded_to_future_runtime(self) -> None:
+    def test_resolved_config_is_forwarded_to_production_runtime(self) -> None:
         arguments = [
             "--input", "target",
             "--output", "published",
@@ -53,14 +53,8 @@ class LtaModeBoundaryTests(unittest.TestCase):
         self.assertEqual(config.cartesian_views, ("transverse",))
         self.assertEqual(config.save.tokens, ("images", "labels"))
 
-    def test_planning_only_runtime_uses_controlled_nonzero_exit(self) -> None:
-        class Pending(RuntimeError):
-            pass
-
-        runtime = types.SimpleNamespace(
-            run=mock.Mock(side_effect=Pending("execution is not connected")),
-            LtaExecutionPending=Pending,
-        )
+    def test_runtime_failures_propagate_without_being_reclassified(self) -> None:
+        runtime = types.SimpleNamespace(run=mock.Mock(side_effect=RuntimeError("failed")))
         arguments = [
             "--input", "target",
             "--output", "published",
@@ -68,17 +62,11 @@ class LtaModeBoundaryTests(unittest.TestCase):
             "--device", "0",
             "--enable_cartesian", "transverse",
         ]
-        stderr = io.StringIO()
         with (
             mock.patch.object(self.lta_mode, "_load_runtime_module", return_value=runtime),
-            contextlib.redirect_stderr(stderr),
-            self.assertRaises(SystemExit) as raised,
+            self.assertRaisesRegex(RuntimeError, "failed"),
         ):
             self.lta_mode.run(arguments)
-
-        self.assertEqual(raised.exception.code, 3)
-        self.assertIn("LTA planning", stderr.getvalue())
-        self.assertNotIn("Traceback", stderr.getvalue())
 
 
 if __name__ == "__main__":

@@ -11,14 +11,13 @@ from __future__ import annotations
 
 import argparse
 import gc
-import hashlib
 import importlib.metadata
 import importlib.util
 import json
 import sys
 import time
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Sequence
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,28 +27,25 @@ if str(ROOT) not in sys.path:
 from XTA.lta_inputs import parse_yolo_segmentation_label, split_indexed_stem
 from XTA.lta_sam import (
     LTA_SESSION_FRAMES,
+    PINNED_SAM_COMMIT,
+    PINNED_SAM_PACKAGE_FILE_COUNT,
+    PINNED_SAM_PACKAGE_TREE_SHA256,
+    PINNED_SAM_SOURCE_URL,
+    PINNED_SAM_VERSION,
     SamPromptBox,
     SamSessionPlan,
+    _canonical_sam_package_fingerprint as _shared_sam_package_fingerprint,
     build_local_sam_predictor,
+    configure_constrained_gpu_batches,
+    install_sdpa_fallback,
     resolve_installed_sam_bpe,
     resolve_local_sam_bundle,
+    resolve_pinned_sam_runtime_provenance as _shared_sam_runtime_provenance,
     run_video_session,
 )
 
 
 CANVAS_SIZE = 1008
-PINNED_SAM_VERSION = "0.1.0"
-PINNED_SAM_COMMIT = "660a5e9e1b8b4c02c0ad97229b88a09a6e4ff5b7"
-PINNED_SAM_SOURCE_URL = "https://github.com/facebookresearch/sam3.git"
-# Canonical SHA-256 over every non-derived file under the installed ``sam3``
-# package at the pinned commit (152 Python sources plus the BPE asset). Python
-# newlines are normalized before each file hash, then hashes are folded with
-# POSIX-relative paths. This is stable across Windows/Linux wheels while
-# failing closed on missing, added, or modified runtime files.
-PINNED_SAM_PACKAGE_FILE_COUNT = 153
-PINNED_SAM_PACKAGE_TREE_SHA256 = (
-    "6addad49cab67f65895cea072512e7d9cd0f5cfb162e102a60c56a4299075aaf"
-)
 
 
 def _existing_directory(value: str | Path, *, name: str) -> Path:
@@ -74,116 +70,18 @@ def validate_smoke_window(start_frame: int, prompt_frame: int) -> None:
 
 
 def _canonical_sam_package_fingerprint(distribution: Any) -> tuple[str, int, Path]:
-    """Fingerprint installed runtime files independently of wheel metadata."""
-
-    try:
-        package_root = Path(distribution.locate_file("sam3")).resolve(strict=True)
-    except Exception as exc:
-        raise RuntimeError("sam3 installation has no locatable package source tree") from exc
-    if not package_root.is_dir():
-        raise RuntimeError(f"sam3 package source root is not a directory: {package_root}")
-    files = sorted(
-        (
-            path
-            for path in package_root.rglob("*")
-            if path.is_file()
-            and "__pycache__" not in path.parts
-            and path.suffix.lower() != ".pyc"
-        ),
-        key=lambda path: path.relative_to(package_root).as_posix(),
-    )
-    digest = hashlib.sha256()
-    for path in files:
-        relative = path.relative_to(package_root).as_posix()
-        payload = path.read_bytes()
-        if path.suffix.lower() == ".py":
-            # Git/wheel installs may materialize LF or CRLF on different hosts.
-            # Python tokenization treats them equivalently, so provenance does too.
-            payload = payload.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-        digest.update(relative.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(hashlib.sha256(payload).digest())
-        digest.update(b"\n")
-    return digest.hexdigest(), len(files), package_root
+    return _shared_sam_package_fingerprint(distribution)
 
 
-def resolve_pinned_sam_runtime_provenance() -> dict[str, Any]:
-    try:
-        distribution = importlib.metadata.distribution("sam3")
-    except importlib.metadata.PackageNotFoundError as exc:
-        raise RuntimeError("the pinned local sam3 distribution is not installed") from exc
-    version = str(distribution.version)
-    if version != PINNED_SAM_VERSION:
-        raise RuntimeError(
-            "sam3 runtime does not match the pinned adapter: "
-            f"version={version!r}, expected={PINNED_SAM_VERSION!r}"
-        )
-    direct_text = distribution.read_text("direct_url.json")
-    direct: Mapping[str, Any] = {}
-    if direct_text:
-        try:
-            parsed = json.loads(direct_text)
-        except json.JSONDecodeError:
-            parsed = None
-        if isinstance(parsed, Mapping):
-            direct = parsed
-    vcs_info = direct.get("vcs_info")
-    recorded_vcs = (
-        str(vcs_info.get("vcs", "")).strip().lower()
-        if isinstance(vcs_info, Mapping)
-        else ""
+def resolve_pinned_sam_runtime_provenance() -> dict[str, object]:
+    return _shared_sam_runtime_provenance(
+        pinned_version=PINNED_SAM_VERSION,
+        pinned_commit=PINNED_SAM_COMMIT,
+        pinned_source_url=PINNED_SAM_SOURCE_URL,
+        pinned_package_file_count=PINNED_SAM_PACKAGE_FILE_COUNT,
+        pinned_package_tree_sha256=PINNED_SAM_PACKAGE_TREE_SHA256,
+        bpe_resolver=resolve_installed_sam_bpe,
     )
-    recorded_commit = (
-        str(vcs_info.get("commit_id", "")).strip()
-        if isinstance(vcs_info, Mapping)
-        else ""
-    )
-    if recorded_vcs and recorded_vcs != "git":
-        raise RuntimeError(f"sam3 installation records unsupported VCS {recorded_vcs!r}")
-    if recorded_commit and recorded_commit != PINNED_SAM_COMMIT:
-        raise RuntimeError(
-            "sam3 runtime does not match the pinned adapter: "
-            f"version={version!r}, commit={recorded_commit!r}"
-        )
-    tree_digest, package_file_count, package_root = _canonical_sam_package_fingerprint(
-        distribution
-    )
-    spec = importlib.util.find_spec("sam3")
-    if spec is None or spec.origin is None:
-        raise RuntimeError("the installed sam3 runtime is not importable")
-    try:
-        Path(spec.origin).resolve(strict=True).relative_to(package_root)
-    except (OSError, ValueError) as exc:
-        raise RuntimeError(
-            "the importable sam3 runtime is outside the audited distribution package"
-        ) from exc
-    if (
-        package_file_count != PINNED_SAM_PACKAGE_FILE_COUNT
-        or tree_digest != PINNED_SAM_PACKAGE_TREE_SHA256
-    ):
-        raise RuntimeError(
-            "sam3 installed package tree does not match the pinned adapter: "
-            f"files={package_file_count}, sha256={tree_digest!r}"
-        )
-    bpe = resolve_installed_sam_bpe()
-    return {
-        "distribution_version": version,
-        "git_commit": recorded_commit or None,
-        "pinned_git_commit": PINNED_SAM_COMMIT,
-        "provenance_method": (
-            "pep610_vcs_plus_source_tree"
-            if recorded_commit
-            else "pinned_installed_source_tree"
-        ),
-        "source_url": str(direct.get("url") or "").strip() or None,
-        "pinned_source_url": PINNED_SAM_SOURCE_URL,
-        "direct_url_present": bool(direct_text),
-        "package_root": str(package_root),
-        "package_file_count": package_file_count,
-        "package_tree_sha256": tree_digest,
-        "bpe_path": str(bpe),
-        "bpe_sha256": hashlib.sha256(bpe.read_bytes()).hexdigest(),
-    }
 
 
 def find_case_video(input_root: Path, case: str) -> Path:
@@ -609,55 +507,6 @@ def cuda_snapshot(torch_module: Any, device_id: int, phase: str) -> dict[str, An
     }
 
 
-def configure_constrained_gpu_batches(predictor: Any) -> dict[str, Any]:
-    """Disable multi-frame activation batching for the bounded eGPU smoke."""
-
-    model = getattr(predictor, "model", None)
-    required = (
-        "use_batched_grounding",
-        "batched_grounding_batch_size",
-        "postprocess_batch_size",
-    )
-    missing = [name for name in required if not hasattr(model, name)]
-    if missing:
-        raise RuntimeError(
-            f"the pinned SAM 3.1 model is missing constrained batch controls: {missing}"
-        )
-    model.use_batched_grounding = False
-    model.batched_grounding_batch_size = 1
-    model.postprocess_batch_size = 1
-    return {
-        "use_batched_grounding": False,
-        "batched_grounding_batch_size": 1,
-        "postprocess_batch_size": 1,
-    }
-
-
-def install_sdpa_fallback(decoder_module: Any = None):
-    """Replace the upstream Flash-only SDPA context with an ordered fallback."""
-
-    if decoder_module is None:
-        import sam3.model.decoder as decoder_module
-
-    original = getattr(decoder_module, "sdpa_kernel", None)
-    backend = getattr(decoder_module, "SDPBackend", None)
-    if not callable(original) or backend is None:
-        raise RuntimeError("the pinned SAM decoder exposes no SDPA backend boundary")
-    choices = [
-        backend.FLASH_ATTENTION,
-        backend.EFFICIENT_ATTENTION,
-        backend.MATH,
-    ]
-
-    def compatible_sdpa_kernel(_requested: Any):
-        return original(choices, set_priority=True)
-
-    decoder_module.sdpa_kernel = compatible_sdpa_kernel
-
-    def restore() -> None:
-        decoder_module.sdpa_kernel = original
-
-    return restore
 
 
 class _MeasuredPredictor:

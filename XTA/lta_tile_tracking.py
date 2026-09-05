@@ -39,9 +39,16 @@ class LtaLineageId:
     physical_view_id: str
     runtime_view_id: str
     lineage_id: str
+    tile_config_id: str = "fullframe"
 
     def __post_init__(self) -> None:
-        for name in ("volume_id", "physical_view_id", "runtime_view_id", "lineage_id"):
+        for name in (
+            "volume_id",
+            "physical_view_id",
+            "runtime_view_id",
+            "lineage_id",
+            "tile_config_id",
+        ):
             value = str(getattr(self, name)).strip()
             if not value:
                 raise ValueError(f"{name} must not be empty")
@@ -50,7 +57,13 @@ class LtaLineageId:
     @property
     def token(self) -> str:
         return "::".join(
-            (self.volume_id, self.physical_view_id, self.runtime_view_id, self.lineage_id)
+            (
+                self.volume_id,
+                self.physical_view_id,
+                self.runtime_view_id,
+                self.tile_config_id,
+                self.lineage_id,
+            )
         )
 
 

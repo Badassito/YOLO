@@ -127,8 +127,9 @@ def build_lta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
     parser = argparse.ArgumentParser(
         prog=prog,
         description=(
-            "label-time augmentation with local SAM visual exemplars and "
-            "TTA-compatible inference views; publication is not connected yet."
+            "Production label-time augmentation using local SAM 3.1 authoritative "
+            "mask injection, multi-GPU tracking, and native final publication. The "
+            "connected execution path is currently Transverse at angle 0."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         allow_abbrev=False,
@@ -153,7 +154,17 @@ def build_lta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         nargs="+",
         default=None,
         metavar="LABELED_EXEMPLAR_DIR",
-        help="Optional additional labeled exemplar directories",
+        help=(
+            "Optional directly aligned target-frame image/YOLO directories; "
+            "mask-injected production LTA does not perform cross-volume transfer"
+        ),
+    )
+    parser.add_argument(
+        "--exemplar_index_origin",
+        type=int,
+        choices=(0, 1),
+        default=1,
+        help="Index origin used to map aligned exemplar filenames to target frames",
     )
 
     parser.add_argument(
@@ -161,33 +172,39 @@ def build_lta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         nargs="+",
         default=None,
         metavar="VIEW",
-        help="Inference-only Cartesian views: transverse, sagittal, coronal",
+        help=(
+            "Inference-only Cartesian views: transverse, sagittal, coronal; the "
+            "connected production path currently requires exactly transverse"
+        ),
     )
     parser.add_argument(
         "--enable_radial",
         nargs="+",
         default=None,
         metavar="VIEWS[:AZIMUTH_ANGLE]",
-        help="Inference-only structured Radial view groups",
+        help="Planned structured Radial view groups; production execution is not yet connected",
     )
     parser.add_argument(
         "--enable_tilted",
         nargs="+",
         default=None,
         metavar="VIEW[:TILT_ANGLE[:TILT_DIRECTION]]",
-        help="Inference-only structured Tilted view groups",
+        help="Planned structured Tilted view groups; production execution is not yet connected",
     )
     parser.add_argument(
         "--enable_tile",
         nargs="+",
         default=None,
         metavar="TILE_SIZE:TILE_STRIDE",
-        help="Inference-only dense tile groups applied to selected parent views",
+        help=(
+            "Dense overlapping tile groups applied to selected parent views; production "
+            "currently requires 1008-pixel tiles"
+        ),
     )
     parser.add_argument(
         "--angle",
         nargs="+",
-        default=["0,120,240"],
+        default=["0"],
         metavar="DEG",
         help="TTA in-plane angles; comma-separated and whitespace-separated forms are accepted",
     )
@@ -195,14 +212,17 @@ def build_lta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
     parser.add_argument(
         "--sam_execution",
         default="video",
-        choices=("image", "video"),
-        help="SAM image ablation or fixed-session video tracking for every runtime view",
+        choices=("video",),
+        help="Authoritative mask-injected video tracking for the selected runtime view",
     )
     parser.add_argument(
         "--conf",
         default=0.15,
         type=float,
-        help="SAM instance-admission threshold with the existing XTA confidence semantics",
+        help=(
+            "Minimum sigmoid framewise tracker score for propagated masks; exact "
+            "authoritative prompt masks are preserved independently"
+        ),
     )
     parser.add_argument(
         "--save",
@@ -210,8 +230,10 @@ def build_lta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         default=None,
         metavar="OUTPUT",
         help=(
-            "Optional outputs: nrrd, images, labels, overlay, voxel_volume, summary. "
-            "The machine-readable manifest is always required by the runtime"
+            "Optional outputs: images, labels, overlay, voxel_volume, summary; "
+            "the nrrd token is accepted for compatibility. "
+            "<input-stem>_Global_final_output.seg.nrrd and the machine-readable "
+            "manifest are always written"
         ),
     )
     parser.add_argument(

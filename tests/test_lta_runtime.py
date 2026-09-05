@@ -6,6 +6,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from tools.smoke_import import install_stubs
+
+try:
+    import cv2  # noqa: F401
+except ModuleNotFoundError:
+    install_stubs()
+
 from XTA.lta_config import parse_lta_args
 from XTA.lta_inputs import (
     AnnotationState,
@@ -17,7 +24,6 @@ from XTA.lta_inputs import (
     VolumeClass,
 )
 from XTA.lta_runtime import (
-    LtaExecutionPending,
     build_lta_run_plan,
     build_lta_scheduler,
     run,
@@ -167,23 +173,6 @@ class LtaRuntimePlanningTests(unittest.TestCase):
             {"input:sample::transverse::rendered"},
         )
 
-    def test_image_execution_plans_independent_one_frame_sessions(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            checkpoint = root / "sam3.pt"
-            checkpoint.write_bytes(b"checkpoint")
-            config = self._config(root, checkpoint, execution="image")
-            plan = build_lta_run_plan(
-                config,
-                discovery_fn=mock.Mock(return_value=self._discovery(root)),
-                physical_compiler=self._physical_compiler,
-                variant_expander=self._variant_expander,
-                run_id="run-b",
-            )
-
-        sessions = plan.volumes[0].runtime_views[0].sessions
-        self.assertEqual(len(sessions), 65)
-        self.assertTrue(all(session.frame_count == 1 for session in sessions))
 
     def test_multiple_devices_own_whole_physical_views_and_plan_concrete_tiles(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -256,15 +245,52 @@ class LtaRuntimePlanningTests(unittest.TestCase):
             "physical_view_affinity_with_atomic_tail_assist",
         )
 
-    def test_public_run_fails_loudly_before_false_complete_publication(self) -> None:
+    def test_public_run_enters_the_production_executor(self) -> None:
         fake_plan = types.SimpleNamespace(
             volumes=(),
             discovery=types.SimpleNamespace(positive_pool=()),
             device_ids=(0,),
         )
-        with mock.patch("XTA.lta_runtime.build_lta_run_plan", return_value=fake_plan):
-            with self.assertRaisesRegex(LtaExecutionPending, "no outputs"):
-                run(mock.Mock(), argv=[])
+        sentinel = object()
+        with (
+            mock.patch("XTA.lta_runtime.build_lta_run_plan", return_value=fake_plan),
+            mock.patch("XTA.lta_execution.execute_lta_plan", return_value=sentinel) as execute,
+        ):
+            result = run(mock.Mock(), argv=[])
+
+        self.assertIs(result, sentinel)
+        execute.assert_called_once_with(fake_plan)
+
+    def test_public_run_records_the_complete_unified_launcher_command(self) -> None:
+        from XTA.unification.context import activate_unified_launch
+
+        fake_plan = types.SimpleNamespace(
+            volumes=(),
+            discovery=types.SimpleNamespace(positive_pool=()),
+            device_ids=(0,),
+        )
+        arguments = ("--input", "target", "--device", "0")
+        with (
+            activate_unified_launch(
+                version="19.0.2",
+                launcher="GPT-5.6-Sol-Ultra_v19.0.2_SLURM.py",
+                mode="lta",
+                mode_arguments=arguments,
+            ),
+            mock.patch("XTA.lta_runtime.build_lta_run_plan", return_value=fake_plan) as build,
+            mock.patch("XTA.lta_execution.execute_lta_plan"),
+        ):
+            run(mock.Mock(), argv=arguments)
+
+        self.assertEqual(
+            build.call_args.kwargs["argv"],
+            (
+                "GPT-5.6-Sol-Ultra_v19.0.2_SLURM.py",
+                "--mode",
+                "lta",
+                *arguments,
+            ),
+        )
 
 
 if __name__ == "__main__":

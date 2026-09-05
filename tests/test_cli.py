@@ -16,7 +16,7 @@ from XTA.unification.context import current_unified_launch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-LAUNCHER = ROOT / "GPT-5.6-Sol-Ultra_v19.0.1_SLURM.py"
+LAUNCHER = ROOT / "GPT-5.6-Sol-Ultra_v19.0.2_SLURM.py"
 
 
 class CliTests(unittest.TestCase):
@@ -40,7 +40,7 @@ class CliTests(unittest.TestCase):
 
         completed = self.run_python(str(LAUNCHER), "--version")
         self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertIn("19.0.1", completed.stdout)
+        self.assertIn("19.0.2", completed.stdout)
 
         for mode in ("tta", "pta", "lta"):
             with self.subTest(mode_version=mode):
@@ -48,7 +48,7 @@ class CliTests(unittest.TestCase):
                     str(LAUNCHER), "--mode", mode, "--version"
                 )
                 self.assertEqual(completed.returncode, 0, completed.stdout)
-                self.assertIn("19.0.1", completed.stdout)
+                self.assertIn("19.0.2", completed.stdout)
 
         program = (
             "import sys; import XTA.cli; "
@@ -85,7 +85,7 @@ class CliTests(unittest.TestCase):
         completed = self.run_python(str(LAUNCHER), "--mode", "lta", "--help")
         self.assertEqual(completed.returncode, 0, completed.stdout)
         self.assertIn("label-time augmentation", completed.stdout)
-        self.assertIn("--sam_execution {image,video}", completed.stdout)
+        self.assertIn("--sam_execution {video}", completed.stdout)
         self.assertNotIn("--prompt", completed.stdout)
 
     def test_run_forwards_only_mode_local_arguments(self) -> None:

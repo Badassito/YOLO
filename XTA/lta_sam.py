@@ -14,8 +14,10 @@ import gc
 import gzip
 import hashlib
 import importlib
+import importlib.metadata
 import importlib.util
 import inspect
+import json
 import math
 import sys
 import threading
@@ -31,6 +33,13 @@ LTA_SESSION_FRAMES = 30
 LTA_MAX_NUM_OBJECTS = 128
 LTA_MULTIPLEX_COUNT = 16
 LTA_CHANNEL_POLICY = "implicit_rgb_v1"
+PINNED_SAM_VERSION = "0.1.0"
+PINNED_SAM_COMMIT = "660a5e9e1b8b4c02c0ad97229b88a09a6e4ff5b7"
+PINNED_SAM_SOURCE_URL = "https://github.com/facebookresearch/sam3.git"
+PINNED_SAM_PACKAGE_FILE_COUNT = 153
+PINNED_SAM_PACKAGE_TREE_SHA256 = (
+    "6addad49cab67f65895cea072512e7d9cd0f5cfb162e102a60c56a4299075aaf"
+)
 
 _CHECKPOINT_SUFFIXES = frozenset({".pt", ".pth"})
 _PREFERRED_CHECKPOINT_NAMES = (
@@ -47,12 +56,241 @@ _SAM_PKG_RESOURCES_COMPAT_LOCK = threading.RLock()
 _SAM_BPE_RESOURCE = "assets/bpe_simple_vocab_16e6.txt.gz"
 
 
+def _canonical_sam_package_fingerprint(distribution: object) -> tuple[str, int, Path]:
+    """Fingerprint pinned runtime files independently of wheel metadata."""
+
+    try:
+        package_root = Path(distribution.locate_file("sam3")).resolve(strict=True)
+    except Exception as exc:
+        raise RuntimeError("sam3 installation has no locatable package source tree") from exc
+    if not package_root.is_dir():
+        raise RuntimeError(f"sam3 package source root is not a directory: {package_root}")
+    files = sorted(
+        (
+            path
+            for path in package_root.rglob("*")
+            if path.is_file()
+            and "__pycache__" not in path.parts
+            and path.suffix.lower() != ".pyc"
+        ),
+        key=lambda path: path.relative_to(package_root).as_posix(),
+    )
+    digest = hashlib.sha256()
+    for path in files:
+        relative = path.relative_to(package_root).as_posix()
+        payload = path.read_bytes()
+        if path.suffix.lower() == ".py":
+            payload = payload.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(payload).digest())
+        digest.update(b"\n")
+    return digest.hexdigest(), len(files), package_root
+
+
+def resolve_pinned_sam_runtime_provenance(
+    *,
+    pinned_version: str = PINNED_SAM_VERSION,
+    pinned_commit: str = PINNED_SAM_COMMIT,
+    pinned_source_url: str = PINNED_SAM_SOURCE_URL,
+    pinned_package_file_count: int = PINNED_SAM_PACKAGE_FILE_COUNT,
+    pinned_package_tree_sha256: str = PINNED_SAM_PACKAGE_TREE_SHA256,
+    bpe_resolver: Optional[Callable[[], Path]] = None,
+) -> dict[str, object]:
+    """Fail closed unless the installed private-API runtime is exactly pinned."""
+
+    try:
+        distribution = importlib.metadata.distribution("sam3")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise RuntimeError("the pinned local sam3 distribution is not installed") from exc
+    version = str(distribution.version)
+    if version != str(pinned_version):
+        raise RuntimeError(
+            "sam3 runtime does not match the pinned adapter: "
+            f"version={version!r}, expected={str(pinned_version)!r}"
+        )
+    direct_text = distribution.read_text("direct_url.json")
+    direct: Mapping[str, object] = {}
+    if direct_text:
+        try:
+            parsed = json.loads(direct_text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, Mapping):
+            direct = parsed
+    vcs_info = direct.get("vcs_info")
+    recorded_vcs = (
+        str(vcs_info.get("vcs", "")).strip().lower()
+        if isinstance(vcs_info, Mapping)
+        else ""
+    )
+    recorded_commit = (
+        str(vcs_info.get("commit_id", "")).strip()
+        if isinstance(vcs_info, Mapping)
+        else ""
+    )
+    if recorded_vcs and recorded_vcs != "git":
+        raise RuntimeError(f"sam3 installation records unsupported VCS {recorded_vcs!r}")
+    if recorded_commit and recorded_commit != str(pinned_commit):
+        raise RuntimeError(
+            "sam3 runtime does not match the pinned adapter: "
+            f"version={version!r}, commit={recorded_commit!r}"
+        )
+    tree_digest, package_file_count, package_root = _canonical_sam_package_fingerprint(
+        distribution
+    )
+    spec = importlib.util.find_spec("sam3")
+    if spec is None or spec.origin is None:
+        raise RuntimeError("the installed sam3 runtime is not importable")
+    try:
+        Path(spec.origin).resolve(strict=True).relative_to(package_root)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            "the importable sam3 runtime is outside the audited distribution package"
+        ) from exc
+    if (
+        package_file_count != int(pinned_package_file_count)
+        or tree_digest != str(pinned_package_tree_sha256)
+    ):
+        raise RuntimeError(
+            "sam3 installed package tree does not match the pinned adapter: "
+            f"files={package_file_count}, sha256={tree_digest!r}"
+        )
+    resolve_bpe = resolve_installed_sam_bpe if bpe_resolver is None else bpe_resolver
+    bpe = Path(resolve_bpe()).resolve(strict=True)
+    return {
+        "distribution_version": version,
+        "git_commit": recorded_commit or None,
+        "pinned_git_commit": str(pinned_commit),
+        "provenance_method": (
+            "pep610_vcs_plus_source_tree"
+            if recorded_commit
+            else "pinned_installed_source_tree"
+        ),
+        "source_url": str(direct.get("url") or "").strip() or None,
+        "pinned_source_url": str(pinned_source_url),
+        "direct_url_present": bool(direct_text),
+        "package_root": str(package_root),
+        "package_file_count": package_file_count,
+        "package_tree_sha256": tree_digest,
+        "bpe_path": str(bpe),
+        "bpe_sha256": hashlib.sha256(bpe.read_bytes()).hexdigest(),
+    }
+
+
 def cuda_capability_supports_fa3(major: int, minor: int = 0) -> bool:
     """Return the pinned FA3 policy (Hopper+, not Ada/4090)."""
 
     if isinstance(major, bool) or isinstance(minor, bool):
         raise TypeError("CUDA capability fields must be integers")
     return int(major) >= 9
+
+
+def configure_constrained_gpu_batches(predictor: object) -> dict[str, object]:
+    """Bound activation batching for the qualified constrained-device profile."""
+
+    model = getattr(predictor, "model", None)
+    required = (
+        "use_batched_grounding",
+        "batched_grounding_batch_size",
+        "postprocess_batch_size",
+    )
+    missing = [name for name in required if not hasattr(model, name)]
+    if missing:
+        raise RuntimeError(
+            f"the pinned SAM 3.1 model is missing constrained batch controls: {missing}"
+        )
+    model.use_batched_grounding = False
+    model.batched_grounding_batch_size = 1
+    model.postprocess_batch_size = 1
+    return {
+        "use_batched_grounding": False,
+        "batched_grounding_batch_size": 1,
+        "postprocess_batch_size": 1,
+    }
+
+
+def install_sdpa_fallback(decoder_module: object | None = None) -> Callable[[], None]:
+    """Use ordered Flash/efficient/math SDPA and return an exact restorer."""
+
+    if decoder_module is None:
+        decoder_module = importlib.import_module("sam3.model.decoder")
+    original = getattr(decoder_module, "sdpa_kernel", None)
+    backend = getattr(decoder_module, "SDPBackend", None)
+    if not callable(original) or backend is None:
+        raise RuntimeError("the pinned SAM decoder exposes no SDPA backend boundary")
+    choices = [
+        backend.FLASH_ATTENTION,
+        backend.EFFICIENT_ATTENTION,
+        backend.MATH,
+    ]
+
+    def compatible_sdpa_kernel(_requested: object):
+        return original(choices, set_priority=True)
+
+    decoder_module.sdpa_kernel = compatible_sdpa_kernel
+
+    def restore() -> None:
+        decoder_module.sdpa_kernel = original
+
+    return restore
+
+
+def resolve_sam_device_profile(
+    torch_module: object,
+    device_id: int,
+    *,
+    requested: str = "auto",
+) -> dict[str, object]:
+    """Resolve the production H100 or bounded eGPU storage/runtime profile."""
+
+    device = int(device_id)
+    name = str(torch_module.cuda.get_device_name(device))
+    capability = tuple(int(value) for value in torch_module.cuda.get_device_capability(device))
+    profile = str(requested).strip().lower()
+    if profile == "auto":
+        profile = "h100" if capability[0] >= 9 else "egpu"
+    if profile == "h100":
+        if capability[0] < 9:
+            raise ValueError(
+                f"the h100 profile requires Hopper or newer; cuda:{device} "
+                f"reports {capability[0]}.{capability[1]}"
+            )
+        return {
+            "name": "h100",
+            "device_name": name,
+            "capability": capability,
+            "weight_storage": "float32",
+            "construction_device": "meta",
+            "use_fa3": False,
+            "use_rope_real": False,
+            "compile": False,
+            "warm_up": False,
+            "async_loading_frames": False,
+            "constrained_batches": False,
+            "sdpa_fallback": True,
+        }
+    if profile == "egpu":
+        if "4090" not in name.lower():
+            raise ValueError(
+                "the constrained eGPU profile is qualified only for an RTX 4090-class "
+                f"device; cuda:{device} reports {name!r}"
+            )
+        return {
+            "name": "egpu",
+            "device_name": name,
+            "capability": capability,
+            "weight_storage": "bfloat16_egpu",
+            "construction_device": "meta",
+            "use_fa3": False,
+            "use_rope_real": False,
+            "compile": False,
+            "warm_up": False,
+            "async_loading_frames": False,
+            "constrained_batches": True,
+            "sdpa_fallback": True,
+        }
+    raise ValueError("requested SAM device profile must be auto, h100, or egpu")
 
 
 @dataclass(frozen=True)
@@ -1357,17 +1595,26 @@ __all__ = (
     "LTA_MAX_NUM_OBJECTS",
     "LTA_MULTIPLEX_COUNT",
     "LTA_SESSION_FRAMES",
+    "PINNED_SAM_COMMIT",
+    "PINNED_SAM_PACKAGE_FILE_COUNT",
+    "PINNED_SAM_PACKAGE_TREE_SHA256",
+    "PINNED_SAM_SOURCE_URL",
+    "PINNED_SAM_VERSION",
     "LocalSamBundle",
     "SamFramePrediction",
     "SamPromptBox",
     "SamSessionPlan",
     "build_local_sam_predictor",
+    "configure_constrained_gpu_batches",
     "configure_predictor_confidence",
     "cuda_capability_supports_fa3",
     "normalize_video_frame_output",
+    "install_sdpa_fallback",
     "plan_sam_sessions",
     "resolve_confidence",
     "resolve_local_sam_bundle",
+    "resolve_pinned_sam_runtime_provenance",
+    "resolve_sam_device_profile",
     "resolve_installed_sam_bpe",
     "revalidate_local_sam_bundle",
     "run_image_frame",

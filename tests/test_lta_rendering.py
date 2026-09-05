@@ -14,7 +14,13 @@ except ModuleNotFoundError:
     install_stubs()
 
 from XTA.geometry import expand_views_into_tta_variants, get_view_infos
-from XTA.lta_rendering import build_lta_rendered_view, implicit_rgb
+from XTA.lta_rendering import (
+    LtaPhysicalViewCacheRef,
+    build_lta_rendered_view,
+    implicit_rgb,
+    render_native_tile_window,
+    union_tile_chunk_into_view,
+)
 from XTA.runtime import close_memmap_array
 
 
@@ -29,6 +35,57 @@ class LtaRenderingTests(unittest.TestCase):
         np.testing.assert_array_equal(rgb[:, :, 2], gray)
         with self.assertRaisesRegex(ValueError, "uint8"):
             implicit_rgb(gray.astype(np.float32))
+
+    def test_file_backed_cache_ref_renders_native_tile_and_revalidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "cache.gray8.dat"
+            source = np.memmap(path, dtype=np.uint8, mode="w+", shape=(3, 5, 6))
+            source[:] = np.arange(source.size, dtype=np.uint8).reshape(source.shape)
+            source.flush()
+            stat = path.stat()
+            del source
+            cache = LtaPhysicalViewCacheRef(
+                path=path,
+                shape=(3, 5, 6),
+                dtype="uint8",
+                physical_view_id="transverse",
+                identity_sha256="a" * 64,
+                size_bytes=90,
+                mtime_ns=stat.st_mtime_ns,
+            )
+
+            frames = render_native_tile_window(
+                cache,
+                frame_start=1,
+                frame_stop=3,
+                tile_xyxy=(2, 1, 6, 5),
+            )
+
+            self.assertEqual([frame.size for frame in frames], [(4, 4), (4, 4)])
+            pixels = np.asarray(frames[0])
+            self.assertEqual(pixels.shape, (4, 4, 3))
+            np.testing.assert_array_equal(pixels[:, :, 0], pixels[:, :, 1])
+            with path.open("ab") as handle:
+                handle.write(b"x")
+            with self.assertRaisesRegex(RuntimeError, "changed"):
+                cache.revalidate()
+
+    def test_tile_chunk_union_uses_global_frame_and_xy_offsets(self) -> None:
+        destination = np.zeros((4, 6, 7), dtype=np.uint8)
+        chunk = np.zeros((2, 3, 4), dtype=np.uint8)
+        chunk[0, 1, 2] = 1
+        chunk[1, 2, 3] = 1
+
+        union_tile_chunk_into_view(
+            destination,
+            chunk,
+            frame_start=1,
+            tile_xyxy=(2, 2, 6, 5),
+        )
+
+        self.assertEqual(int(destination[1, 3, 4]), 1)
+        self.assertEqual(int(destination[2, 4, 5]), 1)
+        self.assertEqual(int(destination.sum()), 2)
 
     @unittest.skipIf(type(__import__("sys").modules.get("cv2")).__name__ == "_StubModule", "requires OpenCV")
     def test_transverse_identity_render_mask_restore_and_native_projection(self) -> None:

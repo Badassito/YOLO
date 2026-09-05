@@ -33,7 +33,7 @@ class LtaConfigTests(unittest.TestCase):
             "--enable_tilted", "coronal:15:horizontal",
             "--enable_tile", "512:256", "128:64",
             "--angle", "240,0",
-            "--sam_execution", "image",
+            "--sam_execution", "video",
             "--conf", "0.25",
             "--save", "nrrd", "images,labels", "overlay", "voxel_volume", "summary",
             "--postprocessing", "keep_objects:2", "3d_void_fill", "gaussian_smoothing::2",
@@ -41,6 +41,7 @@ class LtaConfigTests(unittest.TestCase):
 
         self.assertEqual(config.device_ids, (3, 1, 2))
         self.assertEqual(config.exemplar_dirs, ("positive-a", "positive-b"))
+        self.assertEqual(config.args.exemplar_index_origin, 1)
         self.assertEqual(config.cartesian_views, ("sagittal", "transverse"))
         self.assertEqual(
             [(request.view, request.azimuth_angle) for request in config.radial_requests],
@@ -49,7 +50,7 @@ class LtaConfigTests(unittest.TestCase):
         self.assertEqual(config.tilted_groups[0].views, ("coronal",))
         self.assertEqual(config.tiles[0].config_id, "s512_st256")
         self.assertEqual(config.angles, (240.0, 0.0))
-        self.assertEqual(config.args.sam_execution, "image")
+        self.assertEqual(config.args.sam_execution, "video")
         self.assertEqual(config.args.conf, 0.25)
         self.assertEqual(
             config.save.tokens,
@@ -64,7 +65,8 @@ class LtaConfigTests(unittest.TestCase):
         config = parse_lta_args(self.REQUIRED)
 
         self.assertEqual(config.exemplar_dirs, ())
-        self.assertEqual(config.angles, (0.0, 120.0, 240.0))
+        self.assertEqual(config.args.exemplar_index_origin, 1)
+        self.assertEqual(config.angles, (0.0,))
         self.assertEqual(config.args.sam_execution, "video")
         self.assertEqual(config.args.conf, 0.15)
         self.assertEqual(config.save.tokens, ())
@@ -113,7 +115,7 @@ class LtaConfigTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 parse_lta_args([*self.REQUIRED, "--exemplar", ""])
 
-    def test_v1_intentionally_absent_flags_are_rejected(self) -> None:
+    def test_intentionally_absent_flags_are_rejected(self) -> None:
         unavailable = (
             ("--prompt", "object"),
             ("--channel_format", "RGB"),
@@ -141,6 +143,10 @@ class LtaConfigTests(unittest.TestCase):
             with self.subTest(option=option, value=value), contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     parse_lta_args([*self.REQUIRED, option, value])
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parse_lta_args([*self.REQUIRED, "--sam_execution", "image"])
 
 
 if __name__ == "__main__":

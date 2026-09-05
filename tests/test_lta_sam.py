@@ -4,6 +4,7 @@ import sys
 import gzip
 import hashlib
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -174,6 +175,38 @@ class LtaSamBoundaryTests(unittest.TestCase):
         self.assertFalse(cuda_capability_supports_fa3(8, 9))
         self.assertTrue(cuda_capability_supports_fa3(9, 0))
         self.assertTrue(cuda_capability_supports_fa3(10, 0))
+
+    def test_production_device_profiles_are_explicit_and_fail_closed(self) -> None:
+        from XTA.lta_sam import resolve_sam_device_profile
+
+        class Cuda:
+            name = "NVIDIA H100 80GB HBM3"
+            capability = (9, 0)
+
+            @classmethod
+            def get_device_name(cls, _device):
+                return cls.name
+
+            @classmethod
+            def get_device_capability(cls, _device):
+                return cls.capability
+
+        torch = types.SimpleNamespace(cuda=Cuda)
+        h100 = resolve_sam_device_profile(torch, 0)
+        self.assertEqual(h100["name"], "h100")
+        self.assertEqual(h100["weight_storage"], "float32")
+        self.assertFalse(h100["use_fa3"])
+
+        Cuda.name = "NVIDIA GeForce RTX 4090 Laptop GPU"
+        Cuda.capability = (8, 9)
+        egpu = resolve_sam_device_profile(torch, 0)
+        self.assertEqual(egpu["name"], "egpu")
+        self.assertEqual(egpu["weight_storage"], "bfloat16_egpu")
+
+        Cuda.name = "NVIDIA A100-SXM4-80GB"
+        Cuda.capability = (8, 0)
+        with self.assertRaisesRegex(ValueError, "4090"):
+            resolve_sam_device_profile(torch, 0)
 
     def test_local_bpe_resolution_and_init_state_signature_filter(self) -> None:
         from XTA.lta_sam import (

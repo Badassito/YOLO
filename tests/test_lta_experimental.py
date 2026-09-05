@@ -44,12 +44,18 @@ class _Tracker:
         empty_propagation: bool = False,
         anchor_only: bool = False,
         score_logits=None,
+        seed_return_clear_pixels: int = 0,
+        suppress_seed_overlaps: bool = False,
+        inject_foreign_shared_into_object: int | None = None,
     ):
         self.swap_seed_masks = swap_seed_masks
         self.swap_propagation_masks = swap_propagation_masks
         self.empty_propagation = empty_propagation
         self.anchor_only = anchor_only
         self.score_logits = score_logits
+        self.seed_return_clear_pixels = int(seed_return_clear_pixels)
+        self.suppress_seed_overlaps = bool(suppress_seed_overlaps)
+        self.inject_foreign_shared_into_object = inject_foreign_shared_into_object
         self.states = []
 
     def add_new_masks(self, state, *, frame_idx, obj_ids, masks, reconditioning):
@@ -59,7 +65,25 @@ class _Tracker:
         state["authoritative_masks"] = stored
         state["anchor_frame"] = int(frame_idx)
         self.states.append(state)
-        returned = stored.flip(0) if self.swap_seed_masks else stored
+        returned = stored.flip(0) if self.swap_seed_masks else stored.clone()
+        if self.seed_return_clear_pixels:
+            returned = returned.clone()
+            for object_index in range(int(returned.shape[0])):
+                flat = returned[object_index].reshape(-1)
+                foreground = torch.nonzero(flat, as_tuple=False).reshape(-1)
+                flat[foreground[: self.seed_return_clear_pixels]] = False
+        if self.suppress_seed_overlaps and int(returned.shape[0]) > 1:
+            original = returned.clone()
+            for object_index in range(int(returned.shape[0])):
+                others = torch.cat(
+                    (
+                        original[:object_index],
+                        original[object_index + 1 :],
+                    ),
+                    dim=0,
+                ).any(dim=0)
+                returned[object_index][others] = False
+        state["tracker_masks"] = returned.clone()
         return frame_idx, obj_ids, None, returned[:, None]
 
     def propagate_in_video_preflight(self, _state, *, run_mem_encoder):
@@ -77,7 +101,12 @@ class _Tracker:
     ):
         import torch
 
-        masks = state["authoritative_masks"][:, None]
+        masks = state.get("tracker_masks", state["authoritative_masks"]).clone()[:, None]
+        if self.inject_foreign_shared_into_object is not None:
+            target = int(self.inject_foreign_shared_into_object)
+            expected = state["authoritative_masks"]
+            foreign_shared = (expected.sum(dim=0) > 1) & ~expected[target]
+            masks[target, 0][foreign_shared] = True
         if self.swap_propagation_masks:
             masks = masks.flip(0)
         if self.empty_propagation:
@@ -202,6 +231,78 @@ class LtaExperimentalTrackerTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             resolve(True)
 
+    def test_score_normalizer_filters_only_the_exact_removed_sentinel(self) -> None:
+        import numpy as np
+        from XTA import lta_experimental
+
+        class Scalar:
+            def __init__(self, value):
+                self.value = value
+
+            def item(self):
+                return self.value
+
+        class Tensor:
+            def __init__(self, values):
+                self.values = np.asarray(values)
+                self.dtype = self.values.dtype
+
+            @property
+            def shape(self):
+                return self.values.shape
+
+            def reshape(self, count):
+                return Tensor(self.values.reshape(count))
+
+            def to(self, *, dtype):
+                return Tensor(self.values.astype(dtype))
+
+            def detach(self):
+                return self
+
+            def cpu(self):
+                return self
+
+            def tolist(self):
+                return self.values.tolist()
+
+            def all(self):
+                return Scalar(bool(self.values.all()))
+
+            def __eq__(self, other):
+                return Tensor(self.values == other)
+
+        class Torch:
+            float64 = np.float64
+
+            @staticmethod
+            def is_floating_point(value):
+                return np.issubdtype(value.values.dtype, np.floating)
+
+            @staticmethod
+            def isfinite(value):
+                return Tensor(np.isfinite(value.values))
+
+            @staticmethod
+            def sigmoid(value):
+                output = np.zeros(value.values.shape, dtype=np.float64)
+                ordinary = value.values != -1e4
+                output[ordinary] = 1.0 / (1.0 + np.exp(-value.values[ordinary]))
+                return Tensor(output)
+
+        Torch.Tensor = Tensor
+
+        normalized = lta_experimental._sigmoid_tracker_score_logits(
+            Tensor(np.asarray([-1e4, -20.0, 0.0], dtype=np.float32)),
+            expected_count=3,
+            torch_module=Torch,
+        )
+
+        self.assertIsNone(normalized[0])
+        self.assertIsNotNone(normalized[1])
+        self.assertGreaterEqual(normalized[1], 0.0)
+        self.assertEqual(normalized[2], 0.5)
+
     @requires_tracker_dependencies
     def test_multi_mask_round_trip_is_validated_per_object(self) -> None:
         import cv2
@@ -231,6 +332,182 @@ class LtaExperimentalTrackerTests(unittest.TestCase):
             )
         self.assertTrue(measured.closed)
         self.assertEqual(tracker.states[0], {})
+
+    @requires_tracker_dependencies
+    def test_overlap_aware_seed_roundtrip_accepts_only_pinned_shared_suppression(self) -> None:
+        import cv2
+        import numpy as np
+
+        if getattr(cv2, "__file__", None) is None:
+            self.skipTest("mask metrics require real OpenCV, not import stubs")
+
+        # Reproduce the reported H100 metrics exactly.  The masks have 628 and
+        # 10,127 pixels with exactly 21 shared pixels; the pinned multiplex
+        # exclude-self behavior removes those 21 pixels from both objects.
+        first = np.zeros((110, 100), dtype=bool)
+        first.flat[:628] = True
+        second = np.zeros_like(first)
+        second.flat[607 : 607 + 10_127] = True
+        result = self.tool.run_mask_seed_session(
+            _Measured(),
+            _Predictor(_Tracker(suppress_seed_overlaps=True)),
+            resource=[object()],
+            session=self.tool.SamSessionPlan("overlap-seed-roundtrip", 0, 0, 1),
+            prompt_frame=0,
+            ground_truth=first | second,
+            seed=None,
+            object_masks=(first, second),
+            conf=0.15,
+            propagation_mode="tracker-only",
+            seed_roundtrip_policy="overlap-aware",
+        )
+
+        self.assertTrue(result["seed_roundtrip_passed"])
+        self.assertFalse(result["seed_roundtrip_exact"])
+        self.assertEqual(result["seed_roundtrip_changed_object_ids"], (0, 1))
+        self.assertEqual(result["seed_roundtrip_policy"], "overlap-aware")
+        self.assertEqual(result["seed_roundtrip_minimum_exclusive_fraction"], 0.95)
+        self.assertEqual(
+            [audit["shared_pixels"] for audit in result["seed_roundtrip_object_audit"]],
+            [21, 21],
+        )
+        self.assertEqual(
+            [metrics["tp"] for metrics in result["seed_object_metrics"]],
+            [607, 10_106],
+        )
+        self.assertEqual(
+            [metrics["fn"] for metrics in result["seed_object_metrics"]],
+            [21, 21],
+        )
+        self.assertEqual(
+            [metrics["fp"] for metrics in result["seed_object_metrics"]],
+            [0, 0],
+        )
+        self.assertAlmostEqual(
+            result["seed_object_metrics"][0]["iou"],
+            0.9665605095541401,
+        )
+        self.assertAlmostEqual(
+            result["seed_object_metrics"][1]["iou"],
+            0.9979263355386591,
+        )
+        self.assertTrue(
+            all(
+                audit["exact_comparison_match"]
+                for audit in result["seed_roundtrip_object_audit"]
+            )
+        )
+        self.assertEqual(result["seed_roundtrip_union_metrics"]["iou"], 1.0)
+        self.assertTrue(result["anchor_integrity_passed"])
+        self.assertLess(
+            result["anchor_propagation_object_metrics"][0]["iou"],
+            result["anchor_integrity_minimum_iou"],
+        )
+        self.assertTrue(
+            all(
+                metrics["iou"] == 1.0
+                for metrics in result["anchor_integrity_object_metrics"]
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "materially changed object mask"):
+            self.tool.run_mask_seed_session(
+                _Measured(),
+                _Predictor(_Tracker(seed_return_clear_pixels=21)),
+                resource=[object()],
+                session=self.tool.SamSessionPlan("material-seed-roundtrip", 0, 0, 1),
+                prompt_frame=0,
+                ground_truth=first,
+                seed=None,
+                object_masks=(first,),
+                conf=0.15,
+                propagation_mode="tracker-only",
+                seed_roundtrip_policy="overlap-aware",
+            )
+
+        ambiguous_first = np.zeros((30, 90), dtype=bool)
+        ambiguous_first[5:15, 2:42] = True
+        almost_same = np.zeros_like(ambiguous_first)
+        almost_same[5:15, 3:43] = True
+        with self.assertRaisesRegex(RuntimeError, "insufficient exclusive support"):
+            self.tool.run_mask_seed_session(
+                _Measured(),
+                _Predictor(_Tracker(suppress_seed_overlaps=True)),
+                resource=[object()],
+                session=self.tool.SamSessionPlan("ambiguous-overlap", 0, 0, 1),
+                prompt_frame=0,
+                ground_truth=ambiguous_first | almost_same,
+                seed=None,
+                object_masks=(ambiguous_first, almost_same),
+                conf=0.15,
+                propagation_mode="tracker-only",
+                seed_roundtrip_policy="overlap-aware",
+            )
+
+        empty = np.zeros_like(first)
+        with self.assertRaisesRegex(ValueError, "every expected object mask"):
+            self.tool.run_mask_seed_session(
+                _Measured(),
+                _Predictor(_Tracker()),
+                resource=[object()],
+                session=self.tool.SamSessionPlan("empty-object-mask", 0, 0, 1),
+                prompt_frame=0,
+                ground_truth=first,
+                seed=None,
+                object_masks=(first, empty),
+                conf=0.15,
+                propagation_mode="tracker-only",
+                seed_roundtrip_policy="overlap-aware",
+            )
+
+    @requires_tracker_dependencies
+    def test_anchor_gate_does_not_ignore_overlap_owned_by_other_objects(self) -> None:
+        import cv2
+        import numpy as np
+
+        if getattr(cv2, "__file__", None) is None:
+            self.skipTest("mask metrics require real OpenCV, not import stubs")
+
+        first = np.zeros((40, 90), dtype=bool)
+        first[2:12, 2:42] = True
+        second = np.zeros_like(first)
+        second[20:30, 2:42] = True
+        third = np.zeros_like(first)
+        third[20:30, 41:81] = True
+        result = self.tool.run_mask_seed_session(
+            _Measured(),
+            _Predictor(
+                _Tracker(
+                    suppress_seed_overlaps=True,
+                    inject_foreign_shared_into_object=0,
+                )
+            ),
+            resource=[object()],
+            session=self.tool.SamSessionPlan("foreign-shared-anchor", 0, 0, 1),
+            prompt_frame=0,
+            ground_truth=first | second | third,
+            seed=None,
+            object_masks=(first, second, third),
+            conf=0.15,
+            propagation_mode="tracker-only",
+            seed_roundtrip_policy="overlap-aware",
+        )
+
+        # The raw union remains perfect because the foreign pixels are
+        # authoritative for objects 1 and 2.  The integrity union also remains
+        # above its threshold, so only the per-object domain catches that they
+        # are false positives for object 0.
+        self.assertEqual(result["anchor_preview_propagation_iou"], 1.0)
+        self.assertGreaterEqual(
+            result["anchor_integrity_union_metrics"]["iou"],
+            result["anchor_integrity_minimum_iou"],
+        )
+        self.assertEqual(result["anchor_integrity_object_metrics"][0]["fp"], 10)
+        self.assertLess(
+            result["anchor_integrity_object_metrics"][0]["iou"],
+            result["anchor_integrity_minimum_iou"],
+        )
+        self.assertFalse(result["anchor_integrity_passed"])
 
     @requires_tracker_dependencies
     def test_tracker_only_retains_object_identity_and_passes_anchor(self) -> None:
@@ -291,8 +568,11 @@ class LtaExperimentalTrackerTests(unittest.TestCase):
                 "source_representation": "logit",
                 "stored_representation": "sigmoid_probability",
                 "raw_logits_persisted": False,
+                "removed_object_sentinel": -1e4,
+                "removed_object_sentinel_disposition": "filtered_bookkeeping_state",
             },
         )
+        self.assertEqual(result["removed_object_observations"], ())
         self.assertIsNone(result["empty_frame_limit"])
         self.assertEqual(result["empty_frame_termination_receipts"], ())
         self.assertEqual(result["model_visited_frame_ranges"], ((0, 2),))
@@ -427,6 +707,71 @@ class LtaExperimentalTrackerTests(unittest.TestCase):
         )
 
     @requires_tracker_dependencies
+    def test_backward_only_visits_prompt_once_then_reaches_first_frame(self) -> None:
+        import cv2
+        import numpy as np
+
+        if getattr(cv2, "__file__", None) is None:
+            self.skipTest("mask metrics require real OpenCV, not import stubs")
+
+        mask = np.zeros((8, 8), dtype=bool)
+        mask[2:6, 2:6] = True
+        tracker = _PatternTracker(active_frames={0, 1, 2})
+        result = self.tool.run_mask_seed_session(
+            _Measured(),
+            _Predictor(tracker),
+            resource=[object()] * 5,
+            session=self.tool.SamSessionPlan("backward", 0, 10, 15),
+            prompt_frame=12,
+            ground_truth=mask,
+            seed=None,
+            object_masks=(mask,),
+            conf=0.15,
+            propagation_mode="tracker-only",
+            propagation_direction="backward",
+        )
+
+        self.assertEqual(tracker.calls, [(2, True), (1, True), (0, True)])
+        self.assertEqual(result["propagation_response_count"], 3)
+        self.assertEqual(result["model_visited_frame_ranges"], ((10, 13),))
+        self.assertEqual(result["propagation_active_frames"], [10, 11, 12])
+        self.assertEqual(result["anchor_returned_object_ids"], (0,))
+        self.assertTrue(result["anchor_integrity_passed"])
+
+    @requires_tracker_dependencies
+    def test_backward_only_at_first_frame_still_audits_prompt(self) -> None:
+        import cv2
+        import numpy as np
+
+        if getattr(cv2, "__file__", None) is None:
+            self.skipTest("mask metrics require real OpenCV, not import stubs")
+
+        mask = np.zeros((8, 8), dtype=bool)
+        mask[2:6, 2:6] = True
+        tracker = _PatternTracker(active_frames={0})
+        result = self.tool.run_mask_seed_session(
+            _Measured(),
+            _Predictor(tracker),
+            resource=[object()] * 3,
+            session=self.tool.SamSessionPlan("backward-edge", 0, 40, 43),
+            prompt_frame=40,
+            ground_truth=mask,
+            seed=None,
+            object_masks=(mask,),
+            conf=0.15,
+            propagation_mode="tracker-only",
+            propagation_direction="backward",
+        )
+
+        self.assertEqual(tracker.calls, [(0, True)])
+        self.assertEqual(result["propagation_response_count"], 1)
+        self.assertEqual(result["model_visited_frame_ranges"], ((40, 41),))
+        self.assertEqual(result["propagation_active_frames"], [40])
+        self.assertEqual(result["non_anchor_active_frames"], [])
+        self.assertTrue(result["anchor_integrity_passed"])
+        self.assertFalse(result["diagnostic_propagation_gate_passed"])
+
+    @requires_tracker_dependencies
     def test_tracker_only_stops_each_direction_after_thirty_empty_frames(self) -> None:
         import cv2
         import numpy as np
@@ -459,6 +804,10 @@ class LtaExperimentalTrackerTests(unittest.TestCase):
         self.assertEqual(tracker.calls[30], (80, False))
         self.assertEqual(tracker.calls[31], (49, True))
         self.assertEqual(tracker.calls[-1], (20, True))
+        self.assertEqual(
+            [call for call in tracker.calls if call[0] == 50],
+            [(50, False)],
+        )
         self.assertNotIn((81, False), tracker.calls)
         self.assertNotIn((19, True), tracker.calls)
 
@@ -609,6 +958,124 @@ class LtaExperimentalTrackerTests(unittest.TestCase):
                         propagation_mode="tracker-only",
                     )
                 self.assertTrue(measured.closed)
+
+    @requires_tracker_dependencies
+    def test_exact_removed_object_sentinel_is_filtered_not_exposed_as_zero(self) -> None:
+        import cv2
+        import numpy as np
+
+        if getattr(cv2, "__file__", None) is None:
+            self.skipTest("mask metrics require real OpenCV, not import stubs")
+
+        mask = np.zeros((8, 8), dtype=bool)
+        mask[2:6, 2:6] = True
+        result = self.tool.run_mask_seed_session(
+            _Measured(),
+            _Predictor(_Tracker(score_logits=[-1e4])),
+            resource=[object()],
+            session=self.tool.SamSessionPlan("removed", 0, 0, 1),
+            prompt_frame=0,
+            ground_truth=mask,
+            seed=None,
+            object_masks=(mask,),
+            conf=0.15,
+            propagation_mode="tracker-only",
+        )
+
+        self.assertEqual(result["propagation"], ())
+        self.assertEqual(
+            result["removed_object_observations"],
+            (
+                {
+                    "frame_index": 0,
+                    "object_ids": (0,),
+                    "source_value": -1e4,
+                    "disposition": "filtered_bookkeeping_state",
+                },
+            ),
+        )
+
+    @requires_tracker_dependencies
+    def test_tracker_confidence_filter_is_inactive_for_empty_frame_policy(self) -> None:
+        import cv2
+        import numpy as np
+
+        if getattr(cv2, "__file__", None) is None:
+            self.skipTest("mask metrics require real OpenCV, not import stubs")
+
+        mask = np.zeros((8, 8), dtype=bool)
+        mask[2:6, 2:6] = True
+        tracker = _Tracker(score_logits=[0.0])  # sigmoid(0) == 0.5
+        result = self.tool.run_mask_seed_session(
+            _Measured(),
+            _Predictor(tracker),
+            resource=[object()] * 3,
+            session=self.tool.SamSessionPlan("low-confidence", 0, 0, 3),
+            prompt_frame=0,
+            ground_truth=mask,
+            seed=None,
+            object_masks=(mask,),
+            conf=0.75,
+            propagation_mode="tracker-only",
+            propagation_direction="forward",
+            empty_frame_limit=1,
+        )
+
+        self.assertEqual(result["propagation"], ())
+        self.assertEqual(result["propagation_active_frames"], [])
+        self.assertEqual(result["model_visited_frame_ranges"], ((0, 2),))
+        self.assertEqual(result["policy_zero_frame_ranges"], ((2, 3),))
+        self.assertEqual(
+            result["tracker_confidence_filter"],
+            {
+                "applied": True,
+                "threshold": 0.75,
+                "comparison": "sigmoid(object_score_logits) >= threshold",
+                "below_threshold_object_observation_count": 2,
+                "below_threshold_disposition": (
+                    "not_published_and_inactive_for_empty_frame_policy"
+                ),
+                "authoritative_prompt_policy": (
+                    "production wrapper reinjects the filled hard-positive mask "
+                    "independently"
+                ),
+            },
+        )
+
+    @requires_tracker_dependencies
+    def test_streaming_callback_failure_still_closes_private_session(self) -> None:
+        import cv2
+        import numpy as np
+
+        if getattr(cv2, "__file__", None) is None:
+            self.skipTest("mask metrics require real OpenCV, not import stubs")
+
+        mask = np.zeros((8, 8), dtype=bool)
+        mask[2:6, 2:6] = True
+        measured = _Measured()
+        tracker = _Tracker()
+
+        def fail(_prediction):
+            raise RuntimeError("stream reducer failed")
+
+        with self.assertRaisesRegex(RuntimeError, "stream reducer failed"):
+            self.tool.run_mask_seed_session(
+                measured,
+                _Predictor(tracker),
+                resource=[object()] * 2,
+                session=self.tool.SamSessionPlan("callback-error", 0, 0, 2),
+                prompt_frame=0,
+                ground_truth=mask,
+                seed=None,
+                object_masks=(mask,),
+                conf=0.15,
+                propagation_mode="tracker-only",
+                prediction_callback=fail,
+                retain_predictions=False,
+            )
+
+        self.assertTrue(measured.closed)
+        self.assertEqual(tracker.states[0], {})
 
     def test_empty_frame_limit_validation_and_merged_rejection(self) -> None:
         with self.assertRaises(TypeError):

@@ -8,6 +8,9 @@ the same raster-plan and restoration contracts.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional, Tuple
@@ -21,11 +24,228 @@ from .geometry import (
     AugJob,
     ViewInfo,
     build_aug_job_for_variant,
+    build_view_frame_cache,
     physical_view_name,
     render_fullframe_frame_for_job,
 )
 from .unification.contracts import RasterPlan
 from .unification.sampling import build_forward_raster_plan
+
+
+@dataclass(frozen=True)
+class LtaPhysicalViewCacheRef:
+    """File-backed immutable native frames shared by all workers for one view."""
+
+    path: Path
+    shape: Tuple[int, int, int]
+    dtype: str
+    physical_view_id: str
+    identity_sha256: str
+    size_bytes: int
+    mtime_ns: int
+
+    def __post_init__(self) -> None:
+        path = Path(self.path).resolve(strict=True)
+        shape = tuple(int(value) for value in self.shape)
+        if len(shape) != 3 or any(value < 1 for value in shape):
+            raise ValueError("physical-view cache shape must contain three positive values")
+        if str(self.dtype) != "uint8":
+            raise ValueError("physical-view caches must use uint8")
+        if path.stat().st_size != int(self.size_bytes):
+            raise ValueError("physical-view cache size changed before publication")
+        object.__setattr__(self, "path", path)
+        object.__setattr__(self, "shape", shape)
+
+    def revalidate(self) -> None:
+        stat = self.path.stat()
+        if int(stat.st_size) != self.size_bytes or int(stat.st_mtime_ns) != self.mtime_ns:
+            raise RuntimeError(f"physical-view cache changed after planning: {self.path}")
+
+    def open(self, *, mode: str = "r") -> np.memmap:
+        self.revalidate()
+        return np.memmap(
+            self.path,
+            dtype=np.uint8,
+            mode=str(mode),
+            shape=self.shape,
+        )
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "path": str(self.path),
+            "shape": list(self.shape),
+            "dtype": self.dtype,
+            "physical_view_id": self.physical_view_id,
+            "identity_sha256": self.identity_sha256,
+            "size_bytes": self.size_bytes,
+            "mtime_ns": self.mtime_ns,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> "LtaPhysicalViewCacheRef":
+        return cls(
+            path=Path(str(payload["path"])),
+            shape=tuple(int(value) for value in payload["shape"]),  # type: ignore[arg-type]
+            dtype=str(payload["dtype"]),
+            physical_view_id=str(payload["physical_view_id"]),
+            identity_sha256=str(payload["identity_sha256"]),
+            size_bytes=int(payload["size_bytes"]),
+            mtime_ns=int(payload["mtime_ns"]),
+        )
+
+
+def materialize_physical_view_cache(
+    volume_u8: np.ndarray,
+    view: ViewInfo,
+    *,
+    path: Path,
+    workers: int = 1,
+    source_identity: str = "",
+) -> LtaPhysicalViewCacheRef:
+    """Materialize exactly one file-backed native cache for a physical view."""
+
+    destination = Path(path).resolve(strict=False)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    cache = build_view_frame_cache(
+        volume_rgb=np.asarray(volume_u8),
+        view=view,
+        out_path=destination,
+        desc=f"LTA {physical_view_name(view)} immutable frame cache",
+        prefer_memory=False,
+        workers=max(1, int(workers)),
+    )
+    flush = getattr(cache, "flush", None)
+    if callable(flush):
+        flush()
+    stat = destination.stat()
+    mmap_obj = getattr(cache, "_mmap", None)
+    if mmap_obj is not None:
+        mmap_obj.close()
+    identity_payload = {
+        "source_identity": str(source_identity),
+        "physical_view_id": physical_view_name(view),
+        "shape": [int(view.num_slices), int(view.src_h), int(view.src_w)],
+        "dtype": "uint8",
+        "size_bytes": int(stat.st_size),
+    }
+    identity = hashlib.sha256(
+        json.dumps(identity_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return LtaPhysicalViewCacheRef(
+        path=destination,
+        shape=(int(view.num_slices), int(view.src_h), int(view.src_w)),
+        dtype="uint8",
+        physical_view_id=physical_view_name(view),
+        identity_sha256=identity,
+        size_bytes=int(stat.st_size),
+        mtime_ns=int(stat.st_mtime_ns),
+    )
+
+
+def reference_existing_physical_view_cache(
+    path: Path,
+    *,
+    shape: Sequence[int],
+    physical_view_id: str,
+    source_identity: str,
+) -> LtaPhysicalViewCacheRef:
+    """Adopt an existing file-backed identity view without copying it."""
+
+    resolved = Path(path).resolve(strict=True)
+    resolved_shape = tuple(int(value) for value in shape)
+    if len(resolved_shape) != 3 or any(value < 1 for value in resolved_shape):
+        raise ValueError("existing physical-view cache shape must be positive TYX")
+    expected_size = math.prod(resolved_shape)
+    stat = resolved.stat()
+    if int(stat.st_size) != int(expected_size):
+        raise ValueError(
+            f"existing uint8 cache size {stat.st_size} != expected {expected_size}"
+        )
+    identity = hashlib.sha256(
+        json.dumps(
+            {
+                "source_identity": str(source_identity),
+                "physical_view_id": str(physical_view_id),
+                "shape": list(resolved_shape),
+                "dtype": "uint8",
+                "size_bytes": int(stat.st_size),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return LtaPhysicalViewCacheRef(
+        path=resolved,
+        shape=resolved_shape,
+        dtype="uint8",
+        physical_view_id=str(physical_view_id),
+        identity_sha256=identity,
+        size_bytes=int(stat.st_size),
+        mtime_ns=int(stat.st_mtime_ns),
+    )
+
+
+def render_native_tile_window(
+    cache_ref: LtaPhysicalViewCacheRef,
+    *,
+    frame_start: int,
+    frame_stop: int,
+    tile_xyxy: Sequence[int],
+) -> list[object]:
+    """Read one native tile window from the shared cache as RGB PIL frames."""
+
+    from PIL import Image
+
+    start = int(frame_start)
+    stop = int(frame_stop)
+    if not 0 <= start < stop <= cache_ref.shape[0]:
+        raise ValueError("requested cache window is outside the physical view")
+    x0, y0, x1, y1 = (int(value) for value in tile_xyxy)
+    if not 0 <= x0 < x1 <= cache_ref.shape[2] or not 0 <= y0 < y1 <= cache_ref.shape[1]:
+        raise ValueError("tile_xyxy is outside the physical-view cache")
+    cache = cache_ref.open(mode="r")
+    try:
+        return [
+            Image.fromarray(
+                implicit_rgb(np.ascontiguousarray(cache[index, y0:y1, x0:x1])),
+                mode="RGB",
+            )
+            for index in range(start, stop)
+        ]
+    finally:
+        mmap_obj = getattr(cache, "_mmap", None)
+        if mmap_obj is not None:
+            mmap_obj.close()
+
+
+def union_tile_chunk_into_view(
+    destination: np.ndarray,
+    chunk: object,
+    *,
+    frame_start: int,
+    tile_xyxy: Sequence[int],
+) -> None:
+    """OR one settled tile-local chunk into a mutable physical-view volume."""
+
+    source = np.asarray(chunk, dtype=np.uint8)
+    if source.ndim != 3:
+        raise ValueError("tile chunk must have (frames,Y,X) shape")
+    x0, y0, x1, y1 = (int(value) for value in tile_xyxy)
+    if source.shape[1:] != (y1 - y0, x1 - x0):
+        raise ValueError("tile chunk shape does not match tile_xyxy")
+    start = int(frame_start)
+    stop = start + int(source.shape[0])
+    if not 0 <= start < stop <= int(destination.shape[0]):
+        raise ValueError("tile chunk frame range is outside the destination view")
+    if not 0 <= x0 < x1 <= int(destination.shape[2]):
+        raise ValueError("tile chunk X range is outside the destination view")
+    if not 0 <= y0 < y1 <= int(destination.shape[1]):
+        raise ValueError("tile chunk Y range is outside the destination view")
+    np.bitwise_or(
+        destination[start:stop, y0:y1, x0:x1],
+        source,
+        out=destination[start:stop, y0:y1, x0:x1],
+    )
 
 
 def implicit_rgb(frame: object) -> np.ndarray:
@@ -197,7 +417,12 @@ def build_lta_rendered_view(
 
 
 __all__ = (
+    "LtaPhysicalViewCacheRef",
     "LtaRenderedView",
     "build_lta_rendered_view",
     "implicit_rgb",
+    "materialize_physical_view_cache",
+    "render_native_tile_window",
+    "reference_existing_physical_view_cache",
+    "union_tile_chunk_into_view",
 )

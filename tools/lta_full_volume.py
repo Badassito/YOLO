@@ -75,7 +75,7 @@ IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".
 
 @dataclass(frozen=True)
 class ExperimentSessionPlan:
-    """An experiment-only session plan without the public v1 30-frame cap."""
+    """An experiment-only session plan without the production 30-frame cap."""
 
     sequence_id: str
     session_index: int

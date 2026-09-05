@@ -16,6 +16,12 @@ import operator
 from typing import Deque, Iterable, Mapping, Sequence
 
 
+# A concrete tile graph should pass ``tile_count - 1`` to the scheduler.  The
+# conservative default remains finite so a malformed coordinator cannot admit
+# an unbounded relay wave before concrete topology is connected.
+DEFAULT_MAX_RELAY_GENERATION = 1024
+
+
 def _nonnegative_index(value: object, *, name: str) -> int:
     if isinstance(value, bool):
         raise TypeError(f"{name} must be an integer")
@@ -43,6 +49,57 @@ class LtaViewKey:
     @property
     def token(self) -> str:
         return f"{self.volume_id}::{self.physical_view_id}"
+
+
+@dataclass(frozen=True, order=True)
+class LtaSpatialRelayKey:
+    """Idempotency key for one accumulated relay-mask revision.
+
+    Source tile and relay generation are deliberately absent so equivalent
+    arrivals can be merged. The frame distinguishes legitimate later re-entry;
+    the revision digest lets complementary masks discovered through a longer
+    route advance the same event monotonically while an exact ping-pong is
+    suppressed.
+    """
+
+    view: LtaViewKey
+    runtime_view_id: str
+    tile_config_id: str
+    lineage_id: str
+    destination_tile_index: int
+    frame_index: int
+    temporal_direction: str
+    mask_revision_sha256: str = "0" * 64
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.view, LtaViewKey):
+            raise TypeError("view must be an LtaViewKey")
+        for name in ("runtime_view_id", "tile_config_id", "lineage_id"):
+            value = str(getattr(self, name)).strip()
+            if not value:
+                raise ValueError(f"{name} must not be empty")
+            object.__setattr__(self, name, value)
+        object.__setattr__(
+            self,
+            "destination_tile_index",
+            _nonnegative_index(
+                self.destination_tile_index,
+                name="destination_tile_index",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "frame_index",
+            _nonnegative_index(self.frame_index, name="frame_index"),
+        )
+        direction = str(self.temporal_direction).strip().lower()
+        if direction not in {"forward", "backward"}:
+            raise ValueError("temporal_direction must be 'forward' or 'backward'")
+        object.__setattr__(self, "temporal_direction", direction)
+        revision = str(self.mask_revision_sha256).strip().lower()
+        if len(revision) != 64 or any(value not in "0123456789abcdef" for value in revision):
+            raise ValueError("mask_revision_sha256 must be a SHA256 hexadecimal digest")
+        object.__setattr__(self, "mask_revision_sha256", revision)
 
 
 @dataclass(frozen=True)
@@ -140,6 +197,9 @@ class LtaScheduleSnapshot:
     completed_work_ids: tuple[str, ...]
     projection_ready_views: tuple[LtaViewKey, ...]
     backprojected_views: tuple[LtaViewKey, ...]
+    sealed_generations: tuple[tuple[LtaViewKey, int], ...] = ()
+    sealed_views: tuple[LtaViewKey, ...] = ()
+    settled_spatial_relay_keys: tuple[LtaSpatialRelayKey, ...] = ()
 
 
 def assign_view_owners(
@@ -195,6 +255,7 @@ class LtaViewAffinityScheduler:
         device_ids: Sequence[int],
         *,
         allow_tail_assist: bool = True,
+        max_relay_generation: int = DEFAULT_MAX_RELAY_GENERATION,
     ) -> None:
         self.device_ids = tuple(
             _nonnegative_index(value, name="device_id") for value in device_ids
@@ -203,6 +264,10 @@ class LtaViewAffinityScheduler:
             raise ValueError("device_ids must contain CUDA indexes")
         if len(self.device_ids) != len(set(self.device_ids)):
             raise ValueError("device_ids must be unique")
+        self.max_relay_generation = _nonnegative_index(
+            max_relay_generation,
+            name="max_relay_generation",
+        )
         self.work = tuple(sorted(tuple(work), key=lambda item: item.plan_order))
         if not all(isinstance(item, LtaSessionWork) for item in self.work):
             raise TypeError("work must contain only LtaSessionWork instances")
@@ -225,10 +290,32 @@ class LtaViewAffinityScheduler:
                 raise ValueError(
                     f"relay generations for {view.token} must be contiguous from zero"
                 )
+            if max(generations) > self.max_relay_generation:
+                raise ValueError(
+                    f"relay generation {max(generations)} exceeds configured maximum "
+                    f"{self.max_relay_generation} for {view.token}"
+                )
         self.assignments = assign_view_owners(self.work, self.device_ids)
         self._owner_by_view = {
             assignment.view: assignment.owner_device_id for assignment in self.assignments
         }
+        self._projection_key_by_view = dict(projection_keys)
+        self._work_ids = set(ids)
+        self._plan_orders = set(orders)
+        self._generations_by_view = {
+            view: set(generations)
+            for view, generations in generations_by_view.items()
+        }
+        # Constructor-supplied generations are immutable complete batches and
+        # are therefore sealed immediately. Dynamically registered generations
+        # stay open until ``seal_generation`` is called.
+        self._sealed_generations: set[tuple[LtaViewKey, int]] = {
+            (view, generation)
+            for view, generations in self._generations_by_view.items()
+            for generation in generations
+        }
+        self._sealed_views: set[LtaViewKey] = set()
+        self._settled_spatial_relay_keys: set[LtaSpatialRelayKey] = set()
         self._queues: dict[int, Deque[LtaSessionWork]] = {
             device: deque(
                 item
@@ -254,6 +341,176 @@ class LtaViewAffinityScheduler:
         except KeyError as exc:
             raise ValueError(f"unknown LTA view {view}") from exc
 
+    def _require_view(self, view: LtaViewKey) -> LtaViewKey:
+        if not isinstance(view, LtaViewKey):
+            raise TypeError("view must be an LtaViewKey")
+        if view not in self._owner_by_view:
+            raise ValueError(f"unknown LTA view {view}")
+        return view
+
+    def _generation_work_ids(self, view: LtaViewKey, generation: int) -> set[str]:
+        return {
+            item.work_id
+            for item in self.work
+            if item.view == view and item.relay_generation == generation
+        }
+
+    def _generation_is_settled(self, view: LtaViewKey, generation: int) -> bool:
+        key = (view, int(generation))
+        if key not in self._sealed_generations:
+            return False
+        work_ids = self._generation_work_ids(view, int(generation))
+        return work_ids.issubset(self._committed_ids)
+
+    def register_generation(
+        self,
+        view: LtaViewKey,
+        generation: int,
+        work: Iterable[LtaSessionWork],
+    ) -> tuple[LtaSessionWork, ...]:
+        """Register one dynamic relay generation without changing view affinity.
+
+        The first call for a generation may occur only after the preceding
+        generation is sealed and committed. Multiple calls may append to the
+        same open generation; none of its work is claimable until
+        :meth:`seal_generation` closes that batch.
+        """
+
+        resolved_view = self._require_view(view)
+        resolved_generation = _nonnegative_index(
+            generation,
+            name="generation",
+        )
+        if resolved_generation > self.max_relay_generation:
+            raise ValueError(
+                f"relay generation {resolved_generation} exceeds configured maximum "
+                f"{self.max_relay_generation}"
+            )
+        if resolved_view in self._sealed_views:
+            raise RuntimeError(
+                f"cannot register late work after view {resolved_view.token} was sealed"
+            )
+        if (
+            resolved_view in self._backprojection_claimed
+            or resolved_view in self._backprojected
+        ):
+            raise RuntimeError("cannot register work after backprojection admission")
+        if (resolved_view, resolved_generation) in self._sealed_generations:
+            raise RuntimeError(
+                f"relay generation {resolved_generation} is already sealed for "
+                f"{resolved_view.token}"
+            )
+
+        registered = self._generations_by_view[resolved_view]
+        highest = max(registered)
+        if resolved_generation not in registered:
+            if resolved_generation != highest + 1:
+                raise ValueError(
+                    f"relay generations for {resolved_view.token} must be registered "
+                    f"contiguously; expected {highest + 1}, got {resolved_generation}"
+                )
+            if not self._generation_is_settled(resolved_view, highest):
+                raise RuntimeError(
+                    f"relay generation {highest} for {resolved_view.token} is not settled"
+                )
+
+        items = tuple(work)
+        if not all(isinstance(item, LtaSessionWork) for item in items):
+            raise TypeError("work must contain only LtaSessionWork instances")
+        expected_projection = self._projection_key_by_view[resolved_view]
+        for item in items:
+            if item.view != resolved_view:
+                raise ValueError("registered work belongs to a different physical view")
+            if item.relay_generation != resolved_generation:
+                raise ValueError("registered work has the wrong relay_generation")
+            if item.projection_key != expected_projection:
+                raise ValueError(
+                    "dynamic work must consume the view's immutable projection cache"
+                )
+
+        new_ids = [item.work_id for item in items]
+        new_orders = [item.plan_order for item in items]
+        if len(new_ids) != len(set(new_ids)) or any(
+            work_id in self._work_ids for work_id in new_ids
+        ):
+            raise ValueError("dynamic work ids must be globally unique")
+        if len(new_orders) != len(set(new_orders)) or any(
+            order in self._plan_orders for order in new_orders
+        ):
+            raise ValueError("dynamic plan_order values must be globally unique")
+        current_max_order = max(self._plan_orders, default=-1)
+        if new_orders and min(new_orders) <= current_max_order:
+            raise ValueError(
+                "dynamic plan_order values must follow all previously registered work"
+            )
+
+        # All validation precedes mutation so a rejected generation cannot
+        # partially alter queue or commit order.
+        registered.add(resolved_generation)
+        self.work = tuple(sorted((*self.work, *items), key=lambda item: item.plan_order))
+        self._work_ids.update(new_ids)
+        self._plan_orders.update(new_orders)
+        owner = self.owner_for_view(resolved_view)
+        self._queues[owner].extend(sorted(items, key=lambda item: item.plan_order))
+        return items
+
+    def seal_generation(self, view: LtaViewKey, generation: int) -> None:
+        """Declare that no more work will be added to a registered generation."""
+
+        resolved_view = self._require_view(view)
+        resolved_generation = _nonnegative_index(generation, name="generation")
+        if resolved_generation not in self._generations_by_view[resolved_view]:
+            raise ValueError(
+                f"relay generation {resolved_generation} is not registered for "
+                f"{resolved_view.token}"
+            )
+        self._sealed_generations.add((resolved_view, resolved_generation))
+
+    def generation_settled(self, view: LtaViewKey, generation: int) -> bool:
+        """Return whether a closed generation has been committed completely."""
+
+        resolved_view = self._require_view(view)
+        resolved_generation = _nonnegative_index(generation, name="generation")
+        if resolved_generation not in self._generations_by_view[resolved_view]:
+            raise ValueError(
+                f"relay generation {resolved_generation} is not registered for "
+                f"{resolved_view.token}"
+            )
+        return self._generation_is_settled(resolved_view, resolved_generation)
+
+    def admit_spatial_relay(self, key: LtaSpatialRelayKey) -> bool:
+        """Admit one generation-independent accumulated mask revision once."""
+
+        if not isinstance(key, LtaSpatialRelayKey):
+            raise TypeError("key must be an LtaSpatialRelayKey")
+        self._require_view(key.view)
+        if key.view in self._sealed_views:
+            raise RuntimeError(
+                f"cannot admit a relay after view {key.view.token} was sealed"
+            )
+        if key in self._settled_spatial_relay_keys:
+            return False
+        self._settled_spatial_relay_keys.add(key)
+        return True
+
+    def seal_view(self, view: LtaViewKey) -> None:
+        """Seal a view after its final relay generation reaches fixed point."""
+
+        resolved_view = self._require_view(view)
+        if resolved_view in self._sealed_views:
+            return
+        unsettled = [
+            generation
+            for generation in sorted(self._generations_by_view[resolved_view])
+            if not self._generation_is_settled(resolved_view, generation)
+        ]
+        if unsettled:
+            raise RuntimeError(
+                f"cannot seal view {resolved_view.token}; unsettled relay generations: "
+                f"{unsettled}"
+            )
+        self._sealed_views.add(resolved_view)
+
     def mark_projection_ready(self, view: LtaViewKey, *, device_id: int) -> None:
         """Publish the one immutable rendered-view cache from its affinity owner."""
 
@@ -266,15 +523,15 @@ class LtaViewAffinityScheduler:
     def _generation_ready(self, item: LtaSessionWork) -> bool:
         """Keep relay-derived work behind committed prior generations."""
 
-        if item.relay_generation == 0:
+        generation = int(item.relay_generation)
+        if (item.view, generation) not in self._sealed_generations:
+            return False
+        if generation == 0:
             return True
-        prerequisites = {
-            candidate.work_id
-            for candidate in self.work
-            if candidate.view == item.view
-            and candidate.relay_generation < item.relay_generation
-        }
-        return bool(prerequisites) and prerequisites.issubset(self._committed_ids)
+        return all(
+            self._generation_is_settled(item.view, prior)
+            for prior in range(generation)
+        )
 
     def _pop_owner_work(self, device_id: int) -> LtaSessionWork | None:
         queue = self._queues[device_id]
@@ -435,6 +692,8 @@ class LtaViewAffinityScheduler:
         for view in sorted(self._owner_by_view):
             if self._owner_by_view[view] != device:
                 continue
+            if view not in self._sealed_views:
+                continue
             if view in self._backprojection_claimed or view in self._backprojected:
                 continue
             view_ids = {item.work_id for item in self.work if item.view == view}
@@ -474,6 +733,7 @@ class LtaViewAffinityScheduler:
             and self._active_commit_claim is None
             and not self._active_by_device
             and not self._backprojection_by_device
+            and len(self._sealed_views) == len(self._owner_by_view)
             and len(self._backprojected) == len(self._owner_by_view)
         )
 
@@ -499,6 +759,11 @@ class LtaViewAffinityScheduler:
             completed_work_ids=tuple(sorted(self._completed)),
             projection_ready_views=tuple(sorted(self._projection_ready)),
             backprojected_views=tuple(sorted(self._backprojected)),
+            sealed_generations=tuple(sorted(self._sealed_generations)),
+            sealed_views=tuple(sorted(self._sealed_views)),
+            settled_spatial_relay_keys=tuple(
+                sorted(self._settled_spatial_relay_keys)
+            ),
         )
 
 
@@ -518,10 +783,12 @@ def assignment_manifest(
 
 
 __all__ = (
+    "DEFAULT_MAX_RELAY_GENERATION",
     "LtaScheduleSnapshot",
     "LtaBackprojectionClaim",
     "LtaCommitClaim",
     "LtaSessionWork",
+    "LtaSpatialRelayKey",
     "LtaViewAffinityScheduler",
     "LtaViewAssignment",
     "LtaViewKey",

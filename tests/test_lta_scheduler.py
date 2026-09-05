@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 
 from XTA.lta_scheduler import (
     LtaBackprojectionClaim,
     LtaSessionWork,
+    LtaSpatialRelayKey,
     LtaViewAffinityScheduler,
     LtaViewKey,
     assign_view_owners,
@@ -91,6 +93,8 @@ class LtaViewAffinitySchedulerTests(unittest.TestCase):
             [item.work_id for item, _result in scheduler.drain_committable()],
             ["a", "b"],
         )
+        scheduler.seal_view(LtaViewKey("volume", "alpha"))
+        scheduler.seal_view(LtaViewKey("volume", "beta"))
         alpha_claim = scheduler.claim_backprojection(5)
         assert alpha_claim is not None
         self.assertEqual(alpha_claim.view, LtaViewKey("volume", "alpha"))
@@ -289,6 +293,8 @@ class LtaViewAffinitySchedulerTests(unittest.TestCase):
         scheduler.complete(owner_claim, "head-result")
         self.assertIsNone(scheduler.claim_backprojection(0))
         scheduler.drain_committable()
+        self.assertIsNone(scheduler.claim_backprojection(0))
+        scheduler.seal_view(view)
         self.assertIsNone(scheduler.claim_backprojection(1))
         first_backprojection = scheduler.claim_backprojection(0)
         assert first_backprojection is not None
@@ -335,6 +341,7 @@ class LtaViewAffinitySchedulerTests(unittest.TestCase):
         self.assertIsNone(scheduler.claim_backprojection(scheduler.owner_for_view(beta)))
         scheduler.complete(alpha_claim, "alpha")
         scheduler.drain_committable()
+        scheduler.seal_view(beta)
         backprojection = scheduler.claim_backprojection(scheduler.owner_for_view(beta))
         assert backprojection is not None
         self.assertEqual(backprojection.view, beta)
@@ -376,6 +383,170 @@ class LtaViewAffinitySchedulerTests(unittest.TestCase):
         assert relay is not None
         self.assertEqual(relay.work.work_id, "relay")
         self.assertTrue(relay.tail_assist)
+
+    def test_dynamic_generation_waits_for_settlement_and_explicit_seal(self) -> None:
+        view = LtaViewKey("volume", "alpha")
+        scheduler = LtaViewAffinityScheduler(
+            (_work("authoritative", "alpha", 0, relay_generation=0),),
+            (0, 1),
+            max_relay_generation=3,
+        )
+        scheduler.mark_projection_ready(view, device_id=0)
+        authoritative = scheduler.claim(0)
+        assert authoritative is not None
+        scheduler.complete(authoritative, "generation-0")
+        self.assertFalse(scheduler.generation_settled(view, 0))
+        with self.assertRaisesRegex(RuntimeError, "not settled"):
+            scheduler.register_generation(
+                view,
+                1,
+                (_work("too-early", "alpha", 1, relay_generation=1),),
+            )
+
+        scheduler.drain_committable()
+        self.assertTrue(scheduler.generation_settled(view, 0))
+        registered = scheduler.register_generation(
+            view,
+            1,
+            (
+                _work("relay-a", "alpha", 1, relay_generation=1),
+                _work("relay-b", "alpha", 2, relay_generation=1),
+            ),
+        )
+        self.assertEqual([item.work_id for item in registered], ["relay-a", "relay-b"])
+        # An open generation cannot be observed half-built by a worker.
+        self.assertIsNone(scheduler.claim(0))
+        self.assertIsNone(scheduler.claim(1))
+        scheduler.seal_generation(view, 1)
+
+        first = scheduler.claim(0)
+        second = scheduler.claim(1)
+        assert first is not None and second is not None
+        self.assertEqual(
+            {first.work.work_id, second.work.work_id},
+            {"relay-a", "relay-b"},
+        )
+        scheduler.complete(first, first.work.work_id)
+        scheduler.complete(second, second.work.work_id)
+        scheduler.drain_committable()
+        self.assertTrue(scheduler.generation_settled(view, 1))
+
+        # Committed work is insufficient: the coordinator must explicitly
+        # declare that relay discovery reached fixed point.
+        self.assertIsNone(scheduler.claim_backprojection(0))
+        scheduler.seal_view(view)
+        backprojection = scheduler.claim_backprojection(0)
+        assert backprojection is not None
+        scheduler.complete_backprojection(backprojection)
+        self.assertTrue(scheduler.done)
+
+    def test_generation_and_view_seals_reject_late_or_unsettled_work(self) -> None:
+        view = LtaViewKey("volume", "alpha")
+        scheduler = LtaViewAffinityScheduler(
+            (_work("authoritative", "alpha", 0),),
+            (0,),
+            max_relay_generation=2,
+        )
+        scheduler.mark_projection_ready(view, device_id=0)
+        with self.assertRaisesRegex(RuntimeError, "unsettled"):
+            scheduler.seal_view(view)
+        claim = scheduler.claim(0)
+        assert claim is not None
+        scheduler.complete(claim, "done")
+        scheduler.drain_committable()
+
+        scheduler.register_generation(
+            view,
+            1,
+            (_work("relay", "alpha", 1, relay_generation=1),),
+        )
+        scheduler.seal_generation(view, 1)
+        with self.assertRaisesRegex(RuntimeError, "already sealed"):
+            scheduler.register_generation(
+                view,
+                1,
+                (_work("late-same-generation", "alpha", 2, relay_generation=1),),
+            )
+        with self.assertRaisesRegex(RuntimeError, "unsettled"):
+            scheduler.seal_view(view)
+
+        relay = scheduler.claim(0)
+        assert relay is not None
+        scheduler.complete(relay, "relay-done")
+        scheduler.drain_committable()
+        scheduler.seal_view(view)
+        with self.assertRaisesRegex(RuntimeError, "late work"):
+            scheduler.register_generation(
+                view,
+                2,
+                (_work("late-view", "alpha", 2, relay_generation=2),),
+            )
+
+    def test_relay_generation_bound_and_time_aware_destination_keys(self) -> None:
+        view = LtaViewKey("volume", "alpha")
+        scheduler = LtaViewAffinityScheduler(
+            (_work("authoritative", "alpha", 0),),
+            (0,),
+            max_relay_generation=1,
+        )
+        scheduler.mark_projection_ready(view, device_id=0)
+        key = LtaSpatialRelayKey(
+            view=view,
+            runtime_view_id="alpha::runtime",
+            tile_config_id="s1008_st756",
+            lineage_id="lineage-7",
+            destination_tile_index=4,
+            frame_index=20,
+            temporal_direction="forward",
+        )
+        self.assertTrue(scheduler.admit_spatial_relay(key))
+        self.assertFalse(scheduler.admit_spatial_relay(key))
+        self.assertTrue(
+            scheduler.admit_spatial_relay(
+                replace(key, mask_revision_sha256="a" * 64)
+            )
+        )
+        # A later arrival is a real re-entry, not a same-frame relay cycle.
+        self.assertTrue(
+            scheduler.admit_spatial_relay(
+                LtaSpatialRelayKey(
+                    view=view,
+                    runtime_view_id=key.runtime_view_id,
+                    tile_config_id=key.tile_config_id,
+                    lineage_id=key.lineage_id,
+                    destination_tile_index=key.destination_tile_index,
+                    frame_index=73,
+                    temporal_direction="forward",
+                )
+            )
+        )
+        self.assertTrue(
+            scheduler.admit_spatial_relay(
+                LtaSpatialRelayKey(
+                    view=view,
+                    runtime_view_id=key.runtime_view_id,
+                    tile_config_id=key.tile_config_id,
+                    lineage_id=key.lineage_id,
+                    destination_tile_index=key.destination_tile_index,
+                    frame_index=key.frame_index,
+                    temporal_direction="backward",
+                )
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "exceeds configured maximum"):
+            scheduler.register_generation(
+                view,
+                2,
+                (_work("unbounded", "alpha", 2, relay_generation=2),),
+            )
+
+        claim = scheduler.claim(0)
+        assert claim is not None
+        scheduler.complete(claim, "done")
+        scheduler.drain_committable()
+        scheduler.seal_view(view)
+        with self.assertRaisesRegex(RuntimeError, "after view"):
+            scheduler.admit_spatial_relay(key)
 
 
 if __name__ == "__main__":
